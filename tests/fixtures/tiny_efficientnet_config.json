@@ -1,0 +1,44 @@
+{
+ "model_type": "efficientnet",
+ "variant": "b0",
+ "image_size": 32,
+ "num_channels": 3,
+ "num_labels": 5,
+ "stem_width": 8,
+ "head_conv_width": 24,
+ "bn_eps": 0.001,
+ "blocks": [
+  {
+   "kernel": 3,
+   "exp": 8,
+   "out": 12,
+   "stride": 1,
+   "se": true,
+   "se_channels": 2
+  },
+  {
+   "kernel": 3,
+   "exp": 24,
+   "out": 16,
+   "stride": 2,
+   "se": false,
+   "se_channels": 0
+  },
+  {
+   "kernel": 5,
+   "exp": 32,
+   "out": 16,
+   "stride": 1,
+   "se": true,
+   "se_channels": 4
+  },
+  {
+   "kernel": 3,
+   "exp": 32,
+   "out": 20,
+   "stride": 1,
+   "se": true,
+   "se_channels": 4
+  }
+ ]
+}

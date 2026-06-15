@@ -57,6 +57,10 @@ type
     // A window whose every position is masked (final window [sep,0,0,0])
     // produces exactly zero weight deltas.
     procedure TestLossMaskAllMaskedZeroDeltas;
+    // GetSegmentIds marks document boundaries: each document (incl. its
+    // trailing separator) gets one id; the id increments after each separator;
+    // trailing pads share one distinct id.
+    procedure TestSegmentIdsMarkDocumentBoundaries;
   end;
 
 implementation
@@ -427,6 +431,66 @@ begin
     TargetV.Free;
     InputV.Free;
     NN.Free;
+    Packer.Free;
+  end;
+end;
+
+procedure TTestNeuralPacking.TestSegmentIdsMarkDocumentBoundaries;
+// docs [2,3,4],[5,6] ctx 4 -> windows [2,3,4,1],[5,6,1,0].
+// Window 0: tokens 2,3,4 are doc A, separator 1 ends doc A -> all id 0.
+// Window 1: tokens 5,6 doc B, separator 1 ends doc B -> id 0; pad -> distinct.
+const
+  ExpectedSeg0: array[0..3] of integer = (0, 0, 0, 0);
+var
+  Packer: TNNetSequencePacker;
+  Ids: TNeuralIntegerArray;
+  SegV: TNNetVolume;
+  P: integer;
+begin
+  Packer := TNNetSequencePacker.Create(4);
+  try
+    Packer.AddDocument([2, 3, 4]);
+    Packer.AddDocument([5, 6]);
+    Packer.Pack();
+    // Window 0: one document filling the whole window -> a single segment id.
+    Ids := Packer.GetSegmentIds(0);
+    AssertEquals('seg len', 4, Length(Ids));
+    for P := 0 to 3 do
+      AssertEquals('w0 seg ' + IntToStr(P), ExpectedSeg0[P], Ids[P]);
+    // Window 1: [5,6,1,0] -> doc B (5,6,sep) id 0, pad gets a DISTINCT id.
+    Ids := Packer.GetSegmentIds(1);
+    AssertEquals('w1 seg p0', 0, Ids[0]);
+    AssertEquals('w1 seg p1', 0, Ids[1]);
+    AssertEquals('w1 seg p2 (separator)', 0, Ids[2]);
+    AssertTrue('w1 pad distinct from doc', Ids[3] <> Ids[0]);
+    // GetSegmentVolume mirrors GetSegmentIds into a (Ctx,1,1) volume.
+    SegV := TNNetVolume.Create(4, 1, 1);
+    try
+      Packer.GetSegmentVolume(1, SegV);
+      for P := 0 to 3 do
+        AssertEquals('vol seg ' + IntToStr(P), Ids[P], Round(SegV[P, 0, 0]));
+    finally
+      SegV.Free;
+    end;
+  finally
+    Packer.Free;
+  end;
+  // Two documents packed into ONE window: [2,3,1,4,5,1] -> ids (0,0,0,1,1,1),
+  // an explicit intra-window document boundary between pos 2 and pos 3.
+  Packer := TNNetSequencePacker.Create(6);
+  try
+    Packer.AddDocument([2, 3]);
+    Packer.AddDocument([4, 5]);
+    Packer.Pack();
+    AssertEquals('one window', 1, Packer.WindowCount());
+    Ids := Packer.GetSegmentIds(0);
+    AssertEquals('seg p0', 0, Ids[0]);
+    AssertEquals('seg p1', 0, Ids[1]);
+    AssertEquals('seg p2 (sep ends doc A)', 0, Ids[2]);
+    AssertEquals('seg p3 (doc B begins)', 1, Ids[3]);
+    AssertEquals('seg p4', 1, Ids[4]);
+    AssertEquals('seg p5 (sep ends doc B)', 1, Ids[5]);
+  finally
     Packer.Free;
   end;
 end;

@@ -38,6 +38,20 @@ type
     procedure TestPolyPower2;
     procedure TestPolyValidation;
 
+    // TReduceLROnPlateau
+    procedure TestPlateauMinReduction;
+    procedure TestPlateauMaxReduction;
+    procedure TestPlateauValidation;
+
+    // TOneCycleLR
+    procedure TestOneCycleCurve;
+    procedure TestOneCycleValidation;
+
+    // TCyclicLR
+    procedure TestCyclicTriangularCurve;
+    procedure TestCyclicTriangular2;
+    procedure TestCyclicValidation;
+
     // General
     procedure TestEpochIgnored;
     procedure TestFiniteAcrossRange;
@@ -328,6 +342,217 @@ begin
   try
     TPolyLR.Create(1.0, 10, -1.0).Free;
     Fail('Poly power<0 must raise');
+  except
+    on E: Exception do ; // expected
+  end;
+end;
+
+{ TReduceLROnPlateau }
+
+procedure TTestNeuralScheduler.TestPlateauMinReduction;
+var
+  S: TReduceLROnPlateau;
+  Metrics: array[0..11] of TNeuralFloat;
+  Expected: array[0..11] of TNeuralFloat;
+  I: integer;
+  LR: TNeuralFloat;
+begin
+  // torch ReduceLROnPlateau(lr=1.0, mode='min', factor=0.5, patience=2,
+  //   threshold=1e-4, threshold_mode='rel', cooldown=1, min_lr=0.01)
+  // metrics: improve twice then plateau.
+  Metrics[0] := 1.0; Metrics[1] := 0.9; Metrics[2] := 0.8;
+  for I := 3 to 11 do Metrics[I] := 0.8;
+  // Pinned from torch get_last_lr() after each step().
+  Expected[0] := 1.0; Expected[1] := 1.0; Expected[2] := 1.0;
+  Expected[3] := 1.0; Expected[4] := 1.0; Expected[5] := 0.5;
+  Expected[6] := 0.5; Expected[7] := 0.5; Expected[8] := 0.5;
+  Expected[9] := 0.25; Expected[10] := 0.25; Expected[11] := 0.25;
+  S := TReduceLROnPlateau.Create(1.0, pmMin, 0.5, 2, 1e-4, ptRel, 1, 0.01);
+  try
+    for I := 0 to 11 do
+    begin
+      S.ReportMetric(Metrics[I]);
+      LR := S.NextLR(0, I);
+      AssertEquals('Plateau(min) step ' + IntToStr(I), Expected[I], LR, TOL);
+    end;
+  finally
+    S.Free;
+  end;
+end;
+
+procedure TTestNeuralScheduler.TestPlateauMaxReduction;
+var
+  S: TReduceLROnPlateau;
+  Metrics: array[0..11] of TNeuralFloat;
+  Expected: array[0..11] of TNeuralFloat;
+  I: integer;
+  LR: TNeuralFloat;
+begin
+  // torch ReduceLROnPlateau(lr=1.0, mode='max', factor=0.5, patience=2,
+  //   threshold=1e-4, threshold_mode='rel', cooldown=1, min_lr=0.01)
+  // metrics: accuracy improves twice then plateaus.
+  Metrics[0] := 0.1; Metrics[1] := 0.2; Metrics[2] := 0.3;
+  for I := 3 to 11 do Metrics[I] := 0.3;
+  Expected[0] := 1.0; Expected[1] := 1.0; Expected[2] := 1.0;
+  Expected[3] := 1.0; Expected[4] := 1.0; Expected[5] := 0.5;
+  Expected[6] := 0.5; Expected[7] := 0.5; Expected[8] := 0.5;
+  Expected[9] := 0.25; Expected[10] := 0.25; Expected[11] := 0.25;
+  S := TReduceLROnPlateau.Create(1.0, pmMax, 0.5, 2, 1e-4, ptRel, 1, 0.01);
+  try
+    for I := 0 to 11 do
+    begin
+      S.ReportMetric(Metrics[I]);
+      LR := S.NextLR(0, I);
+      AssertEquals('Plateau(max) step ' + IntToStr(I), Expected[I], LR, TOL);
+    end;
+  finally
+    S.Free;
+  end;
+end;
+
+procedure TTestNeuralScheduler.TestPlateauValidation;
+var
+  S: TReduceLROnPlateau;
+  I: integer;
+  LR: TNeuralFloat;
+begin
+  try
+    TReduceLROnPlateau.Create(1.0, pmMin, 0.0, 2, 1e-4, ptRel, 0, 0.0).Free;
+    Fail('Plateau factor<=0 must raise');
+  except
+    on E: Exception do ; // expected
+  end;
+  try
+    TReduceLROnPlateau.Create(1.0, pmMin, 1.0, 2, 1e-4, ptRel, 0, 0.0).Free;
+    Fail('Plateau factor>=1 must raise');
+  except
+    on E: Exception do ; // expected
+  end;
+  try
+    TReduceLROnPlateau.Create(1.0, pmMin, 0.5, -1, 1e-4, ptRel, 0, 0.0).Free;
+    Fail('Plateau patience<0 must raise');
+  except
+    on E: Exception do ; // expected
+  end;
+  // min_lr clamp: never drops below min_lr no matter how long the plateau.
+  S := TReduceLROnPlateau.Create(1.0, pmMin, 0.5, 0, 1e-4, ptRel, 0, 0.1);
+  try
+    for I := 0 to 30 do
+    begin
+      S.ReportMetric(5.0); // constant bad metric
+      LR := S.NextLR(0, I);
+    end;
+    AssertEquals('Plateau respects min_lr', 0.1, LR, TOL);
+  finally
+    S.Free;
+  end;
+end;
+
+{ TOneCycleLR }
+
+procedure TTestNeuralScheduler.TestOneCycleCurve;
+var
+  S: TOneCycleLR;
+  Expected: array[0..9] of TNeuralFloat;
+  I: integer;
+begin
+  // torch OneCycleLR(max_lr=1.0, total_steps=10, pct_start=0.3,
+  //   div_factor=25, final_div_factor=1e4, anneal_strategy='cos')
+  Expected[0] := 0.04;
+  Expected[1] := 0.52;
+  Expected[2] := 1.0;
+  Expected[3] := 0.9504846320134737;
+  Expected[4] := 0.8117456539497631;
+  Expected[5] := 0.6112620219362893;
+  Expected[6] := 0.38874197806371075;
+  Expected[7] := 0.18825834605023697;
+  Expected[8] := 0.049519367986526286;
+  Expected[9] := 4e-06;
+  S := TOneCycleLR.Create(1.0, 10, 0.3, 25.0, 1e4);
+  try
+    for I := 0 to 9 do
+      AssertEquals('OneCycle step ' + IntToStr(I), Expected[I], S.NextLR(0, I), TOL);
+    // peak exactly at pct_start boundary (step 2).
+    AssertEquals('OneCycle peak', 1.0, S.NextLR(0, 2), TOL);
+  finally
+    S.Free;
+  end;
+end;
+
+procedure TTestNeuralScheduler.TestOneCycleValidation;
+begin
+  try
+    TOneCycleLR.Create(1.0, 1, 0.3, 25.0, 1e4).Free;
+    Fail('OneCycle totalSteps<=1 must raise');
+  except
+    on E: Exception do ; // expected
+  end;
+  try
+    TOneCycleLR.Create(1.0, 10, 0.0, 25.0, 1e4).Free;
+    Fail('OneCycle pctStart<=0 must raise');
+  except
+    on E: Exception do ; // expected
+  end;
+  try
+    TOneCycleLR.Create(1.0, 10, 1.0, 25.0, 1e4).Free;
+    Fail('OneCycle pctStart>=1 must raise');
+  except
+    on E: Exception do ; // expected
+  end;
+end;
+
+{ TCyclicLR }
+
+procedure TTestNeuralScheduler.TestCyclicTriangularCurve;
+var
+  S: TCyclicLR;
+  Expected: array[0..16] of TNeuralFloat;
+  I: integer;
+begin
+  // torch CyclicLR(base_lr=0.1, max_lr=1.0, step_size_up=4, step_size_down=4,
+  //   mode='triangular') over 2 full cycles + 1.
+  Expected[0] := 0.1;  Expected[1] := 0.325; Expected[2] := 0.55;
+  Expected[3] := 0.775; Expected[4] := 1.0;  Expected[5] := 0.775;
+  Expected[6] := 0.55; Expected[7] := 0.325; Expected[8] := 0.1;
+  Expected[9] := 0.325; Expected[10] := 0.55; Expected[11] := 0.775;
+  Expected[12] := 1.0; Expected[13] := 0.775; Expected[14] := 0.55;
+  Expected[15] := 0.325; Expected[16] := 0.1;
+  S := TCyclicLR.Create(0.1, 1.0, 4, 4, clTriangular);
+  try
+    for I := 0 to 16 do
+      AssertEquals('Cyclic step ' + IntToStr(I), Expected[I], S.NextLR(0, I), TOL);
+  finally
+    S.Free;
+  end;
+end;
+
+procedure TTestNeuralScheduler.TestCyclicTriangular2;
+var
+  S: TCyclicLR;
+  Expected: array[0..16] of TNeuralFloat;
+  I: integer;
+begin
+  // torch CyclicLR(... mode='triangular2'): amplitude halves each full cycle.
+  Expected[0] := 0.1;  Expected[1] := 0.325; Expected[2] := 0.55;
+  Expected[3] := 0.775; Expected[4] := 1.0;  Expected[5] := 0.775;
+  Expected[6] := 0.55; Expected[7] := 0.325; Expected[8] := 0.1;
+  Expected[9] := 0.2125; Expected[10] := 0.325; Expected[11] := 0.4375;
+  Expected[12] := 0.55; Expected[13] := 0.4375; Expected[14] := 0.325;
+  Expected[15] := 0.2125; Expected[16] := 0.1;
+  S := TCyclicLR.Create(0.1, 1.0, 4, 4, clTriangular2);
+  try
+    for I := 0 to 16 do
+      AssertEquals('Cyclic2 step ' + IntToStr(I), Expected[I], S.NextLR(0, I), TOL);
+  finally
+    S.Free;
+  end;
+end;
+
+procedure TTestNeuralScheduler.TestCyclicValidation;
+begin
+  try
+    TCyclicLR.Create(0.1, 1.0, 0, 4, clTriangular).Free;
+    Fail('Cyclic stepSizeUp<=0 must raise');
   except
     on E: Exception do ; // expected
   end;

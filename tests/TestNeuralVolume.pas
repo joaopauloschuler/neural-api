@@ -22,6 +22,7 @@ type
     procedure TestVolumeResize;
     procedure TestVolumeStatistics;
     procedure TestVolumeMinMax;
+    procedure TestVolumeMaxAbsNegativeFirst;
     procedure TestVolumeFlip;
     procedure TestVolumeClassification;
     procedure TestVolumeSoftMax;
@@ -34,6 +35,7 @@ type
     procedure TestVolumeOneHotEncoding;
     procedure TestVolumePositionalEncoding;
     procedure TestVolumeColorConversions;
+    procedure TestVolumeLabRoundTrip;
     procedure TestVolumeGaussianNoise;
     procedure TestVolumeCopyResizing;
     procedure TestVolumeCopyCropping;
@@ -263,6 +265,28 @@ begin
     AssertEquals('Min should be -7.0', -7.0, MinVal, 0.0001);
     AssertEquals('Max should be 5.0', 5.0, MaxVal, 0.0001);
     AssertEquals('MaxAbs should be 7.0', 7.0, MaxAbsVal, 0.0001);
+  finally
+    V.Free;
+  end;
+end;
+
+// Regression: GetMaxAbs used to seed its running max with the SIGNED first
+// element, so a negative element 0 of largest magnitude was missed and the
+// returned max-abs was too small (it would have returned 2.0 below). The
+// pinned vector has element 0 = -8.0 as the unique largest magnitude. This
+// FAILS against the pre-fix code and passes after seeding with abs(FData[0]).
+procedure TTestNeuralVolume.TestVolumeMaxAbsNegativeFirst;
+var
+  V: TNNetVolume;
+begin
+  V := TNNetVolume.Create(4, 1, 1);
+  try
+    V.Raw[0] := -8.0; // largest magnitude AND negative AND first
+    V.Raw[1] := 2.0;
+    V.Raw[2] := -1.0;
+    V.Raw[3] := 0.5;
+    AssertEquals('MaxAbs must be 8.0 (negative element 0)', 8.0,
+      V.GetMaxAbs(), 0.0001);
   finally
     V.Free;
   end;
@@ -546,6 +570,47 @@ begin
     AssertEquals('R should be approximately 1.0', 1.0, V[0, 0, 0], 0.01);
     AssertEquals('G should be approximately 0.0', 0.0, V[0, 0, 1], 0.01);
     AssertEquals('B should be approximately 0.0', 0.0, V[0, 0, 2], 0.01);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeLabRoundTrip;
+// Regression cover for the CIELAB (sRGB<->Lab, D65) helper used by the
+// Colorization example. RGB channels are in the 0..255 range here.
+var
+  V: TNNetVolume;
+  R, G, B: array[0..6] of integer;
+  I: integer;
+  MaxDiff, Diff: TNeuralFloat;
+begin
+  // A spread of colors including the grays the in-gamut clamp can bite.
+  R[0]:=255; G[0]:=0;   B[0]:=0;     // red
+  R[1]:=0;   G[1]:=255; B[1]:=0;     // green
+  R[2]:=0;   G[2]:=0;   B[2]:=255;   // blue
+  R[3]:=128; G[3]:=128; B[3]:=128;   // mid gray
+  R[4]:=10;  G[4]:=200; B[4]:=90;    // arbitrary
+  R[5]:=240; G[5]:=130; B[5]:=40;    // orange
+  R[6]:=17;  G[6]:=17;  B[6]:=17;    // near black
+
+  V := TNNetVolume.Create(1, 1, 3);
+  try
+    MaxDiff := 0;
+    for I := 0 to 6 do
+    begin
+      V[0, 0, 0] := R[I];
+      V[0, 0, 1] := G[I];
+      V[0, 0, 2] := B[I];
+      V.RgbToLab();
+      // L in [0,100], a/b roughly [-128,127]: sanity on L.
+      AssertTrue('L within [0,100]', (V[0,0,0] >= -0.5) and (V[0,0,0] <= 100.5));
+      V.LabToRgb();
+      Diff := Max(Abs(V[0,0,0]-R[I]), Max(Abs(V[0,0,1]-G[I]), Abs(V[0,0,2]-B[I])));
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    // Round-trip error should be well under 1 of 255 (8-bit ulp territory).
+    AssertTrue('RGB->Lab->RGB max|diff| should be tiny: ' + FloatToStr(MaxDiff),
+      MaxDiff < 1.0);
   finally
     V.Free;
   end;

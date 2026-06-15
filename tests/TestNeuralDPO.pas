@@ -283,7 +283,14 @@ var
   W: TNNetVolume;
   Saved, LossPlus, LossMinus, FDGrad, ImplGrad, Best: TNeuralFloat;
 begin
-  RandSeed := 424242;
+  // FPC's mtwist Random only RE-initializes when RandSeed changes to a value
+  // different from the one it last seeded with; once the generator has been
+  // advanced by earlier tests, a bare "RandSeed := 424242" can be silently
+  // skipped (it reads back as 424242 yet keeps the stale stream), so this
+  // net's weights would depend on prior tests' RNG draws. Force a genuine
+  // re-init by seeding a DIFFERENT value, consuming one draw, then seeding the
+  // target - this makes BuildTinyLM deterministic regardless of test order.
+  RandSeed := 1; Random; RandSeed := 424242;
   Policy := BuildTinyLM(csContext, csVocab, csHidden);
   // Keep the net well-conditioned: shrink random weights so no softmax
   // probability is near 0/1 (FD of Ln(p) stays accurate).

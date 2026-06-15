@@ -153,6 +153,12 @@ with torch.no_grad():
     text_embeds = text_feats(model, ids)                         # UNnormalized
     image_embeds = image_feats(model, pixels)
     out = model(input_ids=ids, pixel_values=pixels)
+    # LLaVA's vision feature: penultimate vision hidden state with the CLS
+    # row dropped (output_hidden_states[-2][:, 1:]); no post_layernorm, no
+    # projection. Shape [num_patches][hidden].
+    vout = model.vision_model(pixel_values=pixels,
+                             output_hidden_states=True)
+    vision_features = vout.hidden_states[-2][0, 1:]              # [patches][H]
 with open('tests/fixtures/tiny_clip_embeds.json', 'w') as f:
     json.dump({
         'text_sequences': text_sequences,
@@ -161,6 +167,7 @@ with open('tests/fixtures/tiny_clip_embeds.json', 'w') as f:
         'image_embeds': image_embeds.tolist(),        # [1][PROJ]
         'logit_scale': model.logit_scale.item(),
         'logits_per_image': out.logits_per_image.tolist(),  # [1][N_TEXTS]
+        'vision_features': vision_features.tolist(),    # [num_patches][hidden]
     }, f)
 print(f'wrote tiny_clip.safetensors ({len(sd)} tensors) + config + oracle')
 for k in sorted(sd):

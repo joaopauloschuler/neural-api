@@ -1,0 +1,51 @@
+{
+  "model_type": "segformer",
+  "num_channels": 3,
+  "depths": [
+    1,
+    1,
+    1,
+    1
+  ],
+  "hidden_sizes": [
+    8,
+    16,
+    24,
+    32
+  ],
+  "sr_ratios": [
+    2,
+    2,
+    2,
+    1
+  ],
+  "num_attention_heads": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "patch_sizes": [
+    7,
+    3,
+    3,
+    3
+  ],
+  "strides": [
+    4,
+    2,
+    2,
+    2
+  ],
+  "mlp_ratios": [
+    4,
+    4,
+    4,
+    4
+  ],
+  "hidden_act": "gelu",
+  "decoder_hidden_size": 16,
+  "image_size": 64,
+  "num_labels": 5,
+  "layer_norm_eps": 1e-06
+}

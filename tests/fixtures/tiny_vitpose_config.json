@@ -1,0 +1,24 @@
+{
+  "model_type": "vitpose",
+  "num_labels": 4,
+  "scale_factor": 4,
+  "backbone_config": {
+    "model_type": "vitpose_backbone",
+    "hidden_size": 16,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 2,
+    "mlp_ratio": 2,
+    "image_size": [
+      24,
+      16
+    ],
+    "patch_size": [
+      8,
+      8
+    ],
+    "num_channels": 3,
+    "num_experts": 1,
+    "hidden_act": "gelu",
+    "layer_norm_eps": 1e-12
+  }
+}

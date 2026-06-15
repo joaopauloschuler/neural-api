@@ -2009,5 +2009,1491 @@
     "decoded": "hellonot first segment"
    }
   ]
+ },
+ "unigram": {
+  "tokenizer": "tiny_unigram_tokenizer.json",
+  "cases": [
+   {
+    "text": "the cat sat",
+    "ids": [
+     5,
+     13,
+     7,
+     12,
+     7
+    ],
+    "decoded": "the cat sat"
+   },
+   {
+    "text": "the cat sat on the mat",
+    "ids": [
+     5,
+     13,
+     7,
+     12,
+     7,
+     3,
+     8,
+     4,
+     5,
+     3,
+     18
+    ],
+    "decoded": "the cat sat on the mat"
+   },
+   {
+    "text": "running and jumping",
+    "ids": [
+     41,
+     35,
+     4,
+     9,
+     6,
+     20,
+     22,
+     3,
+     43,
+     37,
+     28,
+     30,
+     9,
+     6
+    ],
+    "decoded": "running and jumping"
+   },
+   {
+    "text": "the morning meeting",
+    "ids": [
+     5,
+     34,
+     47,
+     4,
+     9,
+     6,
+     34,
+     33,
+     11,
+     9,
+     6
+    ],
+    "decoded": "the morning meeting"
+   },
+   {
+    "text": "nation station",
+    "ids": [
+     3,
+     4,
+     16,
+     8,
+     4,
+     12,
+     11,
+     16,
+     8,
+     4
+    ],
+    "decoded": "nation station"
+   },
+   {
+    "text": "a fat cat",
+    "ids": [
+     20,
+     46,
+     7,
+     13,
+     7
+    ],
+    "decoded": "a fat cat"
+   },
+   {
+    "text": "Hello world",
+    "ids": [
+     3,
+     0,
+     19,
+     23,
+     23,
+     8,
+     3,
+     29,
+     47,
+     23,
+     17
+    ],
+    "decoded": "ello world"
+   },
+   {
+    "text": "the QXZ cat",
+    "ids": [
+     5,
+     3,
+     0,
+     13,
+     7
+    ],
+    "decoded": "the  cat"
+   },
+   {
+    "text": "eating sleeping",
+    "ids": [
+     3,
+     26,
+     4,
+     6,
+     12,
+     23,
+     33,
+     30,
+     9,
+     6
+    ],
+    "decoded": "eating sleeping"
+   },
+   {
+    "text": "the dog",
+    "ids": [
+     5,
+     3,
+     17,
+     8,
+     6
+    ],
+    "decoded": "the dog"
+   },
+   {
+    "text": "cat",
+    "ids": [
+     13,
+     7
+    ],
+    "decoded": "cat"
+   },
+   {
+    "text": "",
+    "ids": [],
+    "decoded": ""
+   }
+  ]
+ },
+ "spm_model": {
+  "tokenizer": "tiny_spm.model",
+  "cases": [
+   {
+    "text": "the cat sat",
+    "ids": [
+     4,
+     11,
+     8,
+     6
+    ],
+    "decoded": "the cat sat"
+   },
+   {
+    "text": "the cat sat on the mat",
+    "ids": [
+     4,
+     11,
+     8,
+     6,
+     3,
+     30,
+     4,
+     16
+    ],
+    "decoded": "the cat sat on the mat"
+   },
+   {
+    "text": "running and jumping",
+    "ids": [
+     15,
+     37,
+     9,
+     7,
+     5,
+     12,
+     3,
+     46,
+     36,
+     21,
+     23,
+     7
+    ],
+    "decoded": "running and jumping"
+   },
+   {
+    "text": "the morning meeting",
+    "ids": [
+     4,
+     28,
+     42,
+     9,
+     7,
+     28,
+     33
+    ],
+    "decoded": "the morning meeting"
+   },
+   {
+    "text": "nation station",
+    "ids": [
+     3,
+     9,
+     10,
+     8,
+     35,
+     10
+    ],
+    "decoded": "nation station"
+   },
+   {
+    "text": "a fat cat",
+    "ids": [
+     5,
+     40,
+     6,
+     11
+    ],
+    "decoded": "a fat cat"
+   },
+   {
+    "text": "eating sleeping",
+    "ids": [
+     25,
+     8,
+     14,
+     50,
+     23,
+     7
+    ],
+    "decoded": "eating sleeping"
+   },
+   {
+    "text": "the dog",
+    "ids": [
+     4,
+     3,
+     13,
+     27
+    ],
+    "decoded": "the dog"
+   },
+   {
+    "text": "cat",
+    "ids": [
+     11
+    ],
+    "decoded": "cat"
+   },
+   {
+    "text": "the qxz cat",
+    "ids": [
+     4,
+     3,
+     0,
+     11
+    ],
+    "decoded": "the  ⁇  cat"
+   },
+   {
+    "text": "",
+    "ids": [],
+    "decoded": ""
+   }
+  ]
+ },
+ "split_deepseek": {
+  "tokenizer": "tiny_bpe_split_deepseek_tokenizer.json",
+  "cases": [
+   {
+    "text": "Hello world",
+    "ids": [
+     41,
+     271,
+     80,
+     289,
+     267,
+     77,
+     69
+    ],
+    "decoded": "Hello world"
+   },
+   {
+    "text": "Hello, world!",
+    "ids": [
+     41,
+     271,
+     80,
+     13,
+     289,
+     267,
+     77,
+     69,
+     2
+    ],
+    "decoded": "Hello, world!"
+   },
+   {
+    "text": "the cat sat on the mat",
+    "ids": [
+     259,
+     70,
+     222,
+     68,
+     280,
+     222,
+     84,
+     280,
+     222,
+     265,
+     262,
+     70,
+     312,
+     280
+    ],
+    "decoded": "the cat sat on the mat"
+   },
+   {
+    "text": "  leading and  multiple   spaces",
+    "ids": [
+     222,
+     222,
+     77,
+     274,
+     69,
+     377,
+     72,
+     320,
+     222,
+     312,
+     86,
+     77,
+     85,
+     74,
+     81,
+     77,
+     70,
+     222,
+     222,
+     222,
+     84,
+     81,
+     66,
+     68,
+     363
+    ],
+    "decoded": "  leading and  multiple   spaces"
+   },
+   {
+    "text": "trailing space ",
+    "ids": [
+     85,
+     83,
+     66,
+     74,
+     299,
+     79,
+     72,
+     222,
+     84,
+     81,
+     66,
+     68,
+     70,
+     222
+    ],
+    "decoded": "trailing space "
+   },
+   {
+    "text": "tabs\tand\nnewlines",
+    "ids": [
+     85,
+     66,
+     67,
+     84,
+     199,
+     294,
+     200,
+     79,
+     70,
+     88,
+     299,
+     79,
+     363
+    ],
+    "decoded": "tabs\tand\nnewlines"
+   },
+   {
+    "text": "lines\n\n  with blanks\r\nand CRLF\n",
+    "ids": [
+     299,
+     79,
+     363,
+     200,
+     200,
+     222,
+     321,
+     259,
+     288,
+     77,
+     66,
+     79,
+     76,
+     84,
+     203,
+     200,
+     294,
+     222,
+     36,
+     51,
+     45,
+     39,
+     200
+    ],
+    "decoded": "lines\n\n  with blanks\r\nand CRLF\n"
+   },
+   {
+    "text": "Don't stop, DON'T ever STOP!",
+    "ids": [
+     340,
+     8,
+     85,
+     222,
+     84,
+     85,
+     80,
+     81,
+     13,
+     222,
+     37,
+     48,
+     47,
+     8,
+     53,
+     222,
+     366,
+     222,
+     52,
+     53,
+     48,
+     49,
+     2
+    ],
+    "decoded": "Don't stop, DON'T ever STOP!"
+   },
+   {
+    "text": "numbers 12345 and 3.14",
+    "ids": [
+     388,
+     387,
+     84,
+     222,
+     18,
+     19,
+     20,
+     21,
+     22,
+     320,
+     222,
+     20,
+     15,
+     18,
+     21
+    ],
+    "decoded": "numbers 12345 and 3.14"
+   },
+   {
+    "text": "100,000 and 9 9 99",
+    "ids": [
+     18,
+     17,
+     17,
+     13,
+     17,
+     17,
+     17,
+     320,
+     222,
+     26,
+     222,
+     26,
+     222,
+     26,
+     26
+    ],
+    "decoded": "100,000 and 9 9 99"
+   },
+   {
+    "text": "a1b2 word123word",
+    "ids": [
+     66,
+     18,
+     67,
+     19,
+     289,
+     267,
+     69,
+     18,
+     19,
+     20,
+     88,
+     267,
+     69
+    ],
+    "decoded": "a1b2 word123word"
+   },
+   {
+    "text": "punct!!?\n\nthen text",
+    "ids": [
+     81,
+     86,
+     79,
+     68,
+     85,
+     2,
+     2,
+     32,
+     200,
+     200,
+     259,
+     361,
+     222,
+     85,
+     364,
+     85
+    ],
+    "decoded": "punct!!?\n\nthen text"
+   },
+   {
+    "text": "a !!! b  .  c",
+    "ids": [
+     66,
+     222,
+     2,
+     2,
+     2,
+     288,
+     222,
+     222,
+     15,
+     222,
+     222,
+     68
+    ],
+    "decoded": "a !!! b  .  c"
+   },
+   {
+    "text": "你好 world 5",
+    "ids": [
+     162,
+     123,
+     256,
+     163,
+     100,
+     123,
+     289,
+     267,
+     77,
+     69,
+     222,
+     22
+    ],
+    "decoded": "你好 world 5"
+   },
+   {
+    "text": "word你好world",
+    "ids": [
+     88,
+     267,
+     69,
+     162,
+     123,
+     256,
+     163,
+     100,
+     123,
+     88,
+     267,
+     77,
+     69
+    ],
+    "decoded": "word你好world"
+   },
+   {
+    "text": "",
+    "ids": [],
+    "decoded": ""
+   },
+   {
+    "text": "x<|im_end|>y",
+    "ids": [
+     89,
+     1,
+     90
+    ],
+    "decoded": "xy"
+   }
+  ]
+ },
+ "bytelevel_noregex": {
+  "tokenizer": "tiny_bpe_bytelevel_noregex_tokenizer.json",
+  "cases": [
+   {
+    "text": "Hello world",
+    "ids": [
+     221,
+     40,
+     270,
+     79,
+     289,
+     266,
+     76,
+     68
+    ],
+    "decoded": " Hello world"
+   },
+   {
+    "text": "Hello, world!",
+    "ids": [
+     221,
+     40,
+     270,
+     79,
+     277,
+     87,
+     266,
+     76,
+     68,
+     1
+    ],
+    "decoded": " Hello, world!"
+   },
+   {
+    "text": "  leading spaces",
+    "ids": [
+     221,
+     221,
+     76,
+     273,
+     68,
+     377,
+     374,
+     83,
+     80,
+     65,
+     67,
+     363
+    ],
+    "decoded": "  leading spaces"
+   },
+   {
+    "text": "trailing ",
+    "ids": [
+     221,
+     84,
+     82,
+     65,
+     73,
+     299,
+     78,
+     374
+    ],
+    "decoded": " trailing "
+   },
+   {
+    "text": "tabs\tand\nnewlines",
+    "ids": [
+     221,
+     84,
+     65,
+     66,
+     83,
+     198,
+     294,
+     199,
+     78,
+     69,
+     87,
+     299,
+     78,
+     363
+    ],
+    "decoded": " tabs\tand\nnewlines"
+   },
+   {
+    "text": "Don't stop!",
+    "ids": [
+     221,
+     338,
+     323,
+     83,
+     84,
+     79,
+     80,
+     1
+    ],
+    "decoded": " Don't stop!"
+   },
+   {
+    "text": "numbers 12345 and 3.14",
+    "ids": [
+     288,
+     85,
+     385,
+     259,
+     326,
+     19,
+     20,
+     21,
+     317,
+     221,
+     19,
+     14,
+     17,
+     20
+    ],
+    "decoded": " numbers 12345 and 3.14"
+   },
+   {
+    "text": "café 42!",
+    "ids": [
+     221,
+     357,
+     128,
+     103,
+     221,
+     20,
+     18,
+     1
+    ],
+    "decoded": " café 42!"
+   },
+   {
+    "text": "你好 world",
+    "ids": [
+     221,
+     161,
+     122,
+     255,
+     162,
+     99,
+     122,
+     289,
+     266,
+     76,
+     68
+    ],
+    "decoded": " 你好 world"
+   },
+   {
+    "text": "",
+    "ids": [],
+    "decoded": ""
+   },
+   {
+    "text": "x<|endoftext|>y",
+    "ids": [
+     221,
+     88,
+     0,
+     221,
+     89
+    ],
+    "decoded": " x y"
+   }
+  ]
+ },
+ "split_o200k": {
+  "tokenizer": "tiny_bpe_split_o200k_tokenizer.json",
+  "cases": [
+   {
+    "text": "Hello world",
+    "ids": [
+     41,
+     70,
+     267,
+     80,
+     278,
+     283,
+     77,
+     69
+    ],
+    "decoded": "Hello world"
+   },
+   {
+    "text": "HelloWorld and ABCdef",
+    "ids": [
+     41,
+     70,
+     267,
+     80,
+     56,
+     283,
+     77,
+     69,
+     279,
+     222,
+     34,
+     35,
+     36,
+     69,
+     70,
+     71
+    ],
+    "decoded": "HelloWorld and ABCdef"
+   },
+   {
+    "text": "iPhone XMLParser HTTPSConnection",
+    "ids": [
+     74,
+     49,
+     73,
+     265,
+     70,
+     222,
+     57,
+     46,
+     45,
+     328,
+     364,
+     70,
+     83,
+     222,
+     41,
+     53,
+     53,
+     49,
+     52,
+     36,
+     265,
+     79,
+     70,
+     68,
+     370
+    ],
+    "decoded": "iPhone XMLParser HTTPSConnection"
+   },
+   {
+    "text": "the cat SAT on the MAT",
+    "ids": [
+     368,
+     269,
+     264,
+     222,
+     52,
+     34,
+     53,
+     307,
+     262,
+     222,
+     46,
+     34,
+     53
+    ],
+    "decoded": "the cat SAT on the MAT"
+   },
+   {
+    "text": "Don't stop, DON'T ever STOP! it'LL be",
+    "ids": [
+     325,
+     318,
+     259,
+     367,
+     81,
+     13,
+     222,
+     37,
+     48,
+     47,
+     8,
+     53,
+     222,
+     341,
+     222,
+     52,
+     53,
+     48,
+     49,
+     2,
+     390,
+     8,
+     45,
+     45,
+     290
+    ],
+    "decoded": "Don't stop, DON'T ever STOP! it'LL be"
+   },
+   {
+    "text": "numbers 12345 and 3.14 and 1000000",
+    "ids": [
+     357,
+     355,
+     364,
+     222,
+     320,
+     20,
+     21,
+     22,
+     279,
+     222,
+     20,
+     15,
+     18,
+     21,
+     279,
+     222,
+     18,
+     17,
+     17,
+     17,
+     17,
+     17,
+     17
+    ],
+    "decoded": "numbers 12345 and 3.14 and 1000000"
+   },
+   {
+    "text": "path/to/file and a/b/c/d",
+    "ids": [
+     362,
+     73,
+     16,
+     367,
+     16,
+     71,
+     74,
+     354,
+     279,
+     263,
+     16,
+     67,
+     16,
+     68,
+     16,
+     69
+    ],
+    "decoded": "path/to/file and a/b/c/d"
+   },
+   {
+    "text": "  leading and  multiple   spaces",
+    "ids": [
+     222,
+     277,
+     70,
+     66,
+     69,
+     350,
+     72,
+     279,
+     222,
+     285,
+     86,
+     77,
+     85,
+     74,
+     81,
+     354,
+     222,
+     222,
+     259,
+     81,
+     66,
+     68,
+     340
+    ],
+    "decoded": "  leading and  multiple   spaces"
+   },
+   {
+    "text": "trailing space ",
+    "ids": [
+     85,
+     83,
+     66,
+     74,
+     77,
+     350,
+     72,
+     259,
+     81,
+     66,
+     68,
+     70,
+     222
+    ],
+    "decoded": "trailing space "
+   },
+   {
+    "text": "tabs\tand\nnewlines",
+    "ids": [
+     85,
+     66,
+     67,
+     84,
+     199,
+     66,
+     275,
+     200,
+     79,
+     70,
+     88,
+     77,
+     350,
+     340
+    ],
+    "decoded": "tabs\tand\nnewlines"
+   },
+   {
+    "text": "lines\n\n  with blanks\r\nand CRLF\n",
+    "ids": [
+     77,
+     350,
+     340,
+     200,
+     200,
+     222,
+     278,
+     300,
+     73,
+     266,
+     77,
+     66,
+     79,
+     353,
+     203,
+     200,
+     66,
+     275,
+     222,
+     36,
+     51,
+     45,
+     39,
+     200
+    ],
+    "decoded": "lines\n\n  with blanks\r\nand CRLF\n"
+   },
+   {
+    "text": "punct!!?\n\nthen text",
+    "ids": [
+     81,
+     86,
+     79,
+     68,
+     85,
+     2,
+     2,
+     32,
+     200,
+     200,
+     368,
+     79,
+     260,
+     70,
+     89,
+     85
+    ],
+    "decoded": "punct!!?\n\nthen text"
+   },
+   {
+    "text": "slash//then/text and ///",
+    "ids": [
+     84,
+     77,
+     273,
+     73,
+     16,
+     16,
+     368,
+     79,
+     16,
+     85,
+     70,
+     89,
+     85,
+     279,
+     222,
+     16,
+     16,
+     16
+    ],
+    "decoded": "slash//then/text and ///"
+   },
+   {
+    "text": "a !!! b  .  c",
+    "ids": [
+     66,
+     222,
+     2,
+     2,
+     2,
+     266,
+     222,
+     222,
+     15,
+     222,
+     269
+    ],
+    "decoded": "a !!! b  .  c"
+   },
+   {
+    "text": "MixedCASE123and456Words",
+    "ids": [
+     46,
+     74,
+     89,
+     70,
+     69,
+     36,
+     34,
+     52,
+     38,
+     320,
+     20,
+     66,
+     275,
+     21,
+     22,
+     23,
+     56,
+     283,
+     69,
+     84
+    ],
+    "decoded": "MixedCASE123and456Words"
+   },
+   {
+    "text": "ALLCAPS then lower then Title Case",
+    "ids": [
+     34,
+     45,
+     45,
+     36,
+     34,
+     49,
+     52,
+     262,
+     79,
+     277,
+     304,
+     70,
+     83,
+     262,
+     79,
+     222,
+     53,
+     300,
+     354,
+     222,
+     36,
+     273,
+     70
+    ],
+    "decoded": "ALLCAPS then lower then Title Case"
+   },
+   {
+    "text": "",
+    "ids": [],
+    "decoded": ""
+   },
+   {
+    "text": "x<|im_end|>y",
+    "ids": [
+     89,
+     1,
+     90
+    ],
+    "decoded": "xy"
+   }
+  ]
+ },
+ "spm_bytefallback": {
+  "tokenizer": "tiny_spm_bytefallback.model",
+  "cases": [
+   {
+    "text": "the cat sat",
+    "ids": [
+     260,
+     267,
+     264,
+     262
+    ],
+    "decoded": "the cat sat"
+   },
+   {
+    "text": "café",
+    "ids": [
+     259,
+     297,
+     294,
+     296,
+     198,
+     172
+    ],
+    "decoded": "café"
+   },
+   {
+    "text": "the 你好 cat",
+    "ids": [
+     260,
+     259,
+     231,
+     192,
+     163,
+     232,
+     168,
+     192,
+     267
+    ],
+    "decoded": "the 你好 cat"
+   },
+   {
+    "text": "smile 😀 now",
+    "ids": [
+     264,
+     277,
+     299,
+     270,
+     288,
+     259,
+     243,
+     162,
+     155,
+     131,
+     259,
+     265,
+     276,
+     295
+    ],
+    "decoded": "smile 😀 now"
+   },
+   {
+    "text": "bell\u0007ring",
+    "ids": [
+     259,
+     290,
+     288,
+     270,
+     270,
+     10,
+     285,
+     263
+    ],
+    "decoded": "bell\u0007ring"
+   },
+   {
+    "text": "naïve résumé café",
+    "ids": [
+     259,
+     265,
+     294,
+     198,
+     178,
+     292,
+     288,
+     271,
+     198,
+     172,
+     275,
+     287,
+     277,
+     198,
+     172,
+     259,
+     297,
+     294,
+     296,
+     198,
+     172
+    ],
+    "decoded": "naïve résumé café"
+   },
+   {
+    "text": "the dog",
+    "ids": [
+     260,
+     259,
+     269,
+     283
+    ],
+    "decoded": "the dog"
+   },
+   {
+    "text": "",
+    "ids": [],
+    "decoded": ""
+   }
+  ]
+ },
+ "spm_bpe_model": {
+  "tokenizer": "tiny_spm_bpe.model",
+  "cases": [
+   {
+    "text": "the cat sat",
+    "ids": [
+     264,
+     275,
+     282
+    ],
+    "decoded": "the cat sat"
+   },
+   {
+    "text": "the cat sat on the mat",
+    "ids": [
+     264,
+     275,
+     282,
+     292,
+     264,
+     281
+    ],
+    "decoded": "the cat sat on the mat"
+   },
+   {
+    "text": "running and jumping",
+    "ids": [
+     267,
+     313,
+     300,
+     280,
+     276,
+     297,
+     317,
+     313,
+     309,
+     294
+    ],
+    "decoded": "running and jumping"
+   },
+   {
+    "text": "the morning meeting",
+    "ids": [
+     264,
+     273,
+     305,
+     306,
+     280,
+     273,
+     277,
+     274
+    ],
+    "decoded": "the morning meeting"
+   },
+   {
+    "text": "nation station",
+    "ids": [
+     297,
+     300,
+     271,
+     268,
+     298,
+     271
+    ],
+    "decoded": "nation station"
+   },
+   {
+    "text": "a fat cat",
+    "ids": [
+     265,
+     297,
+     311,
+     259,
+     275
+    ],
+    "decoded": "a fat cat"
+   },
+   {
+    "text": "the dog",
+    "ids": [
+     264,
+     297,
+     308,
+     287
+    ],
+    "decoded": "the dog"
+   },
+   {
+    "text": "cat",
+    "ids": [
+     275
+    ],
+    "decoded": "cat"
+   },
+   {
+    "text": "the qxz cat",
+    "ids": [
+     264,
+     297,
+     116,
+     123,
+     125,
+     275
+    ],
+    "decoded": "the qxz cat"
+   },
+   {
+    "text": "café",
+    "ids": [
+     269,
+     299,
+     311,
+     198,
+     172
+    ],
+    "decoded": "café"
+   },
+   {
+    "text": "the 你好 cat",
+    "ids": [
+     264,
+     297,
+     231,
+     192,
+     163,
+     232,
+     168,
+     192,
+     275
+    ],
+    "decoded": "the 你好 cat"
+   },
+   {
+    "text": "smile 😀 now",
+    "ids": [
+     268,
+     309,
+     302,
+     312,
+     301,
+     297,
+     243,
+     162,
+     155,
+     131,
+     297,
+     300,
+     305,
+     315
+    ],
+    "decoded": "smile 😀 now"
+   },
+   {
+    "text": "bell\u0007ring",
+    "ids": [
+     297,
+     316,
+     301,
+     312,
+     312,
+     10,
+     306,
+     263
+    ],
+    "decoded": "bell\u0007ring"
+   },
+   {
+    "text": "",
+    "ids": [],
+    "decoded": ""
+   }
+  ]
  }
 }

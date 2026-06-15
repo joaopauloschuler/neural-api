@@ -1,0 +1,26 @@
+{
+ "model_type": "yolov8",
+ "widths": [
+  4,
+  6,
+  8,
+  12,
+  16
+ ],
+ "depths": [
+  1,
+  2
+ ],
+ "num_classes": 3,
+ "reg_max": 8,
+ "box_hidden": 8,
+ "cls_hidden": 8,
+ "num_channels": 3,
+ "image_size": 96,
+ "bn_eps": 0.001,
+ "strides": [
+  8,
+  16,
+  32
+ ]
+}

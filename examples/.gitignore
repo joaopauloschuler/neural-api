@@ -20,3 +20,106 @@ QuantileRegression/QuantileRegression
 RandomLabelMemorization/RandomLabelMemorization
 RetentionDualForm/RetentionDualForm
 SpeculativeDecoding/SpeculativeDecoding
+
+# DiffusionMNIST: generated sample grid, MNIST data, compiled binary
+DiffusionMNIST/DiffusionMNIST
+DiffusionMNIST/*.png
+DiffusionMNIST/*-ubyte
+DiffusionMNIST/*.idx*-ubyte
+DiffusionMNIST/*.nn
+
+# SemanticSegmentation: compiled SegFormer demo binary
+SemanticSegmentation/SemanticSegmentation
+
+# DepthEstimation: compiled DPT / Depth-Anything demo binary
+DepthEstimation/DepthEstimation
+
+# PoseEstimation: compiled ViTPose demo binary
+PoseEstimation/PoseEstimation
+
+# ObjectDetection: compiled DETR demo binary, build artifacts, annotated image
+ObjectDetection/ObjectDetection
+ObjectDetection/*.o
+ObjectDetection/*.ppu
+ObjectDetection/object_detection.ppm
+
+# Pix2Pix: compiled conditional-GAN demo binary, build artifacts, sample image
+Pix2Pix/Pix2Pix
+Pix2Pix/*.o
+Pix2Pix/*.ppr
+Pix2Pix/pix2pix_sample.ppm
+
+# CycleGAN: compiled unpaired-translation demo binary, build artifacts, sample image
+CycleGAN/CycleGAN
+CycleGAN/*.o
+CycleGAN/*.ppr
+CycleGAN/cyclegan_sample.ppm
+
+# VideoPrediction: compiled ConvLSTM next-frame demo binary, build artifacts, sample image
+VideoPrediction/VideoPrediction
+VideoPrediction/*.o
+VideoPrediction/*.ppu
+VideoPrediction/*.ppr
+VideoPrediction/videoprediction_sample.ppm
+
+# VQGAN: compiled VQ-GAN demo binary, build artifacts, sample image, run logs
+VQGAN/VQGAN
+VQGAN/*.o
+VQGAN/*.ppr
+VQGAN/vqgan_sample.ppm
+VQGAN/run*.txt
+
+# OCRTranscribe: compiled TrOCR OCR demo binary + build artifacts
+OCRTranscribe/OCRTranscribe
+OCRTranscribe/*.o
+OCRTranscribe/*.ppu
+OCRTranscribe/*.ppr
+
+# ConsistencyDistill: compiled few-step consistency-distillation demo binary,
+# build artifacts, generated sample grid, MNIST data symlinks, run logs
+ConsistencyDistill/ConsistencyDistill
+ConsistencyDistill/*.o
+ConsistencyDistill/*.ppu
+ConsistencyDistill/*.ppr
+ConsistencyDistill/*.png
+ConsistencyDistill/*.ppm
+ConsistencyDistill/*-ubyte
+ConsistencyDistill/*.idx*-ubyte
+ConsistencyDistill/run*.log
+ConsistencyDistill/run*.time
+ConsistencyDistill/time.log
+ConsistencyDistill/*.nn
+
+# MaskGIT: compiled non-autoregressive masked-token image-generation demo
+# binary, build artifacts, generated sample grids, MNIST data symlinks, logs
+MaskGIT/MaskGIT
+MaskGIT/*.o
+MaskGIT/*.ppu
+MaskGIT/*.ppr
+MaskGIT/*.png
+MaskGIT/*.ppm
+MaskGIT/*.pgm
+MaskGIT/*-ubyte
+MaskGIT/*.idx*-ubyte
+MaskGIT/run*.log
+MaskGIT/run.log
+MaskGIT/time.txt
+MaskGIT/*.nn
+
+# StyleGAN2Generate: compiled style-based generator synthesis demo binary,
+# build artifacts, and generated sample image
+StyleGAN2Generate/StyleGAN2Generate
+StyleGAN2Generate/*.o
+StyleGAN2Generate/*.ppu
+StyleGAN2Generate/*.ppr
+StyleGAN2Generate/*.ppm
+StyleGAN2Generate/*.png
+
+# OpticalFlow: RAFT optical-flow demo binary, build artifacts, and the
+# generated flow-field / warp PPM visualisations.
+OpticalFlow/OpticalFlow
+OpticalFlow/*.o
+OpticalFlow/*.ppu
+OpticalFlow/*.ppr
+OpticalFlow/*.ppm
+OpticalFlow/lib

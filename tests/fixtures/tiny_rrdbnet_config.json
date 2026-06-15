@@ -1,0 +1,10 @@
+{
+ "model_type": "rrdbnet",
+ "num_in_ch": 3,
+ "num_out_ch": 3,
+ "num_feat": 8,
+ "num_block": 1,
+ "num_grow_ch": 4,
+ "scale": 4,
+ "input_size": 6
+}

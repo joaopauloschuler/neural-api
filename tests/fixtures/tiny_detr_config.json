@@ -1,0 +1,29 @@
+{
+  "model_type": "detr",
+  "num_labels": 4,
+  "num_queries": 5,
+  "d_model": 16,
+  "encoder_layers": 1,
+  "decoder_layers": 1,
+  "encoder_attention_heads": 2,
+  "decoder_attention_heads": 2,
+  "encoder_ffn_dim": 32,
+  "decoder_ffn_dim": 32,
+  "num_channels": 3,
+  "image_size": 32,
+  "backbone_config": {
+    "model_type": "resnet",
+    "num_channels": 3,
+    "embedding_size": 8,
+    "hidden_sizes": [
+      8,
+      16
+    ],
+    "depths": [
+      1,
+      1
+    ],
+    "layer_type": "bottleneck",
+    "hidden_act": "relu"
+  }
+}

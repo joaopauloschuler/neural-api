@@ -1,0 +1,26 @@
+{
+  "model_type": "owlvit",
+  "projection_dim": 24,
+  "text_config": {
+    "vocab_size": 50,
+    "hidden_size": 24,
+    "intermediate_size": 48,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 3,
+    "max_position_embeddings": 8,
+    "hidden_act": "quick_gelu",
+    "layer_norm_eps": 1e-05,
+    "eos_token_id": 49
+  },
+  "vision_config": {
+    "hidden_size": 24,
+    "intermediate_size": 48,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 3,
+    "image_size": 16,
+    "patch_size": 8,
+    "num_channels": 3,
+    "hidden_act": "quick_gelu",
+    "layer_norm_eps": 1e-05
+  }
+}

@@ -1,0 +1,30 @@
+{
+ "model_type": "vgg",
+ "architectures": [
+  "VGG"
+ ],
+ "depth": 16,
+ "image_size": 64,
+ "num_channels": 3,
+ "num_labels": 5,
+ "batch_norm": false,
+ "stage_convs": [
+  2,
+  2,
+  3,
+  3,
+  3
+ ],
+ "stage_widths": [
+  4,
+  6,
+  8,
+  8,
+  8
+ ],
+ "fc_hidden": [
+  10,
+  10
+ ],
+ "adaptive_pool": 1
+}

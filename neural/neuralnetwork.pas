@@ -258,6 +258,11 @@ type
       FCanNormalizeDelta: boolean;
       FCanSetNumWeightsForAllNeurons: boolean;
       FNN: TNNet;
+      // Persistent magnitude-pruning mask: one volume per neuron (parallel to
+      // FNeurons), each element 1.0 = keep, 0.0 = pruned. nil = no mask on this
+      // layer. Built by BuildPruneMaskFromMagnitude and re-enforced after every
+      // weight update via ApplyPruneMask. (Coded by Claude (AI).)
+      FPruneMask: TNNetVolumeList;
 
       procedure InitStruct();
     private
@@ -275,6 +280,9 @@ type
       procedure ApplyActivationFunctionToOutput(); virtual;
       procedure BuildArrNeurons();
       procedure AfterWeightUpdate(); virtual;
+      // Zeroes weights (and their gradient/inertia) flagged by FPruneMask,
+      // WITHOUT calling AfterWeightUpdate (so it can be called FROM it).
+      procedure ZeroPrunedWeights(); // Coded by Claude (AI).
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -349,6 +357,25 @@ type
       // the pretrained-checkpoint importer in neuralpretrained.pas.
       // (Coded by Claude (AI).)
       procedure FlushWeightCache();
+      // --- Persistent magnitude pruning (torch.nn.utils.prune style). ----------
+      // Builds a binary keep/prune mask for this layer's neuron weights: the
+      // smallest-magnitude weights are flagged for pruning. Threshold is
+      // |w| <= aThreshold -> pruned (set 0). The mask is STORED so that
+      // ApplyPruneMask can re-enforce it after every training step. Returns the
+      // number of weights pruned. Biases are never pruned. (Coded by Claude (AI).)
+      function BuildPruneMaskFromThreshold(aThreshold: TNeuralFloat): integer;
+      // Re-applies the stored prune mask: zeroes every pruned weight, and (so
+      // momentum/inertia can't slowly regrow them) zeroes the matching delta /
+      // inertia entries. No-op when no mask is set. (Coded by Claude (AI).)
+      procedure ApplyPruneMask();
+      // True when a persistent prune mask is set on this layer.
+      function HasPruneMask(): boolean;
+      // Frees the stored prune mask (weights keep their current, possibly-zero,
+      // values but are no longer held at zero). (Coded by Claude (AI).)
+      procedure ClearPruneMask();
+      // Counts weights flagged as pruned (mask = 0) in the stored mask; 0 when
+      // no mask. (Coded by Claude (AI).)
+      function CountPrunedWeights(): integer;
       procedure ClearTimes(); {$IFDEF Release} inline; {$ENDIF}
       procedure AddTimes(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure CopyTimes(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
@@ -510,6 +537,14 @@ type
       // Bytes held by the int8 container (codes + scales).
       // Coded by Claude (AI).
       function Int8QuantizedSizeBytes(): int64;
+      // Copies the int8 weight-only storage out for direct re-export (e.g.
+      // the GGUF writer's Q8_0-from-int8 path) without dequantizing: pCodes
+      // receives NumRows*VS row-major symmetric codes, pScales the NumRows
+      // per-output-row FP32 scales (dequant value = code * scale). Returns
+      // false (and leaves the args empty) when the layer is not int8
+      // quantized. // Coded by Claude (AI).
+      function GetInt8QuantData(out pCodes: TInt8DynArr;
+        out pScales: TNeuralFloatDynArr; out NumRows, VS: integer): boolean;
       property WeightsQuantizedInt8: boolean read FQuantInt8;
       {$IFDEF OpenCL}
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
@@ -829,6 +864,16 @@ type
     procedure Compute(); override;
   end;
 
+  /// Hard Sigmoid activation: HardSigmoid(x) = clamp((x + 3) / 6, 0, 1).
+  // The piecewise-linear approximation of the logistic sigmoid used by
+  // MobileNetV3 / EfficientNet-lite squeeze-excite gating (torch.nn.Hardsigmoid).
+  // Cheaper than the exp-based sigmoid and the gate that pairs with HardSwish.
+  // Coded by Claude (AI).
+  TNNetHardSigmoid = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// Gaussian Error Linear Unit (GELU) activation function.
   // A smooth activation function popular in transformer models like BERT and GPT.
   // Uses the tanh approximation formula: GELU(x) = 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
@@ -837,6 +882,19 @@ type
   // class (e.g. TNNetPhish reuses its derivative).
   // https://arxiv.org/abs/1606.08415
   TNNetGELU = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
+  /// GELU with the EXACT erf form (no tanh approximation):
+  //   GELU_erf(x) = x * Phi(x), Phi(x) = 0.5 * (1 + erf(x / sqrt(2)))
+  // This is the activation HF transformers calls "gelu" (e.g. ConvNeXt, BERT),
+  // as opposed to "gelu_new"/"gelu_pytorch_tanh" which is the tanh approximation
+  // implemented by TNNetGELU. erf is evaluated via pcr_erff. Derivative:
+  //   GELU_erf'(x) = Phi(x) + x * phi(x), phi(x) = exp(-x^2/2)/sqrt(2*pi)
+  // Coded by Claude (AI).
+  TNNetGELUErf = class(TNNetReLUBase)
   public
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -1414,6 +1472,28 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// gpt-oss clamped gated SwiGLU activation - This is an experimental layer.
+  // The gated activation used by the gpt-oss MoE experts. The input depth is
+  // split INTERLEAVED along the channel (depth) axis (gate = even channels,
+  // up = odd channels - i.e. gate[d] = in[2d], up[d] = in[2d+1]), then:
+  //   gate := min(gate, limit)            { upper-clamp only, no lower clamp }
+  //   up   := clamp(up, -limit, +limit)
+  //   glu  := gate * sigmoid(alpha * gate)
+  //   out  := (up + 1) * glu
+  // Output depth = input depth / 2. alpha (default 1.702) lives in FFloatSt[0],
+  // limit (default 7.0) in FFloatSt[1]. No trainable parameter; input depth
+  // must be even. Matches transformers' GptOssExperts._apply_gate.
+  // Coded by Claude (AI).
+  TNNetGptOssGatedSwiGLU = class(TNNetLayer)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); overload; override;
+    constructor Create(pAlpha, pLimit: TNeuralFloat); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// GLU (Gated Linear Unit) gated activation - This is an experimental layer.
   // Splits the input along the channel (depth) axis into two equal halves
   // A and B and outputs A * sigmoid(B). Output depth = input depth / 2.
@@ -1436,6 +1516,25 @@ type
   // https://arxiv.org/abs/2002.05202
   // Coded by Claude (AI).
   TNNetReGLU = class(TNNetLayer)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
+  /// ReGLU gated activation with a SQUARED ReLU gate - experimental layer.
+  // Splits the input along the channel (depth) axis into two equal halves
+  // A (first half) and B (second half) and outputs A * ReLU(B)^2 (the gate is
+  // the squared ReLU activation, ACT2FN "relu2"). Output depth = input depth
+  // / 2. Parameter-free; the input depth must be even. This is the BitNet
+  // b1.58 SwiGLU-slot activation: down(ffn_sub_norm(relu2(gate(x)) * up(x)))
+  // with the Llama fused-projection convention (first half = up, second half =
+  // gate), so the layer reproduces relu2(gate) * up = A_up * ReLU(B_gate)^2.
+  // d/dB (ReLU(B)^2) = 2*ReLU(B) (0 for B <= 0).
+  // Coded by Claude (AI).
+  TNNetReGLUSquared = class(TNNetLayer)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
@@ -1779,6 +1878,70 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Connectionist Temporal Classification (CTC) loss output head — the
+  // alignment-free sequence loss (Graves et al. 2006) used for speech / OCR /
+  // handwriting where the input frame count T is much larger than, and not
+  // aligned to, the target label length L.
+  //
+  // INPUT LAYOUT: per-frame LOG-probabilities over the vocabulary, packed as a
+  // volume of shape (SizeX = T frames, SizeY = 1, Depth = vocab). Like
+  // TNNetNLLLoss this head is the companion of TNNetLogSoftMax: stack
+  //   ... -> TNNetLogSoftMax -> TNNetCTCLoss
+  // so the input is already in log-space and this head's -occupancy gradient,
+  // composed with LogSoftMax's backward, yields the textbook CTC logit gradient
+  //   dL/d(logit_{t,k}) = y_{t,k} - gamma_{t,k}
+  // where y = softmax(logits) and gamma_{t,k} = sum over label positions whose
+  // symbol is k of the forward-backward posterior occupancy.
+  //
+  // BLANK label: index stored in FStruct[0]. The default (-1) means "last
+  // vocabulary index" (vocab-1), the convention HF/CTC ASR heads use; pass an
+  // explicit index to Create(Blank) otherwise.
+  //
+  // TARGET (label sequence): CTC targets are VARIABLE-LENGTH integer label
+  // sequences, which do not fit the framework's fixed-shape (output - target)
+  // seeding directly. They are therefore encoded into the SAME-SHAPE target
+  // volume the framework subtracts, in frame 0 only:
+  //   target[0,0,0]     = L            (number of labels, an integer >= 0)
+  //   target[0,0,1+i]   = label_i      (i = 0 .. L-1, an integer in [0,vocab))
+  // all other entries 0. Build it with the class method EncodeTarget (and read
+  // it back with DecodeTarget). Because the framework seeds
+  //   FOutputError := FOutput - target,
+  // Backpropagate recovers the labels as (FOutput - FOutputError) at frame 0,
+  // runs the log-space forward-backward over the blank-interleaved extended
+  // label sequence l' = (blank, l_0, blank, l_1, ..., l_{L-1}, blank), and
+  // OVERWRITES every FOutputError element with the +gradient w.r.t. the input
+  // log-prob: dL/d(logy_{t,k}) = -gamma_{t,k} (negated occupancy, exactly the
+  // -target convention of TNNetNLLLoss). The whole lattice is computed in
+  // log-space with a numerically-stable log-sum-exp, so very long sequences do
+  // not underflow. When L = 0, or when L*2+1 > T makes the target unalignable,
+  // the gradient is left at zero for that sample (the loss is +inf / undefined).
+  //
+  // The scalar CTC loss itself (-log p(l|x)) is exposed by the class method
+  // ForwardBackwardLogLoss for diagnostics / the numerical-gradient test.
+  // No trainable parameters; output shape equals input shape.
+  // Coded by Claude (AI).
+  TNNetCTCLoss = class(TNNetIdentity)
+  public
+    constructor Create(); overload; override;
+    constructor Create(Blank: integer); overload;
+    procedure Backpropagate(); override;
+    // Returns the configured blank index resolved against the input depth
+    // (i.e. vocab-1 when the stored FStruct[0] sentinel is -1).
+    function BlankIndex(): integer;
+    // Builds the (T,1,Vocab) target volume encoding label sequence Labels for
+    // the CTC backward (see the layout above). T and Vocab must match the head.
+    class procedure EncodeTarget(ATarget: TNNetVolume; const Labels: array of integer;
+      T, Vocab: integer);
+    // Recovers the label sequence encoded by EncodeTarget from a target volume.
+    class procedure DecodeTarget(ATarget: TNNetVolume; out Labels: TNeuralIntegerArray);
+    // Stand-alone log-space forward-backward. ALogProbs is (T,1,Vocab) per-frame
+    // LOG-probabilities; returns the CTC loss -log p(Labels|ALogProbs) and, when
+    // AGrad <> nil, fills it (same shape) with dL/d(logp) = -gamma_{t,k}. Returns
+    // a large positive sentinel (and zero grad) when the target is unalignable.
+    class function ForwardBackwardLogLoss(ALogProbs: TNNetVolume;
+      const Labels: array of integer; Blank: integer; AGrad: TNNetVolume): TNeuralFloat;
+  end;
+
   /// Kullback-Leibler divergence loss output layer.
   // Operates on probability-space inputs: the layer's input q is the model's
   // predicted distribution (e.g. the output of a SoftMax) and the supplied
@@ -2082,6 +2245,11 @@ type
     procedure ResetCodebookUsage(); // zero every per-code selection counter
     function ActiveCodeCount(): integer; // # distinct codes selected >= once
     function CodebookUsageCount(Index: integer): integer; // wins for one code
+    // Discrete code index chosen at spatial position (X,Y) on the LAST Compute()
+    // call (the argmin cached in FChosenIdx). This is what turns the continuous
+    // encoder output into the DISCRETE token grid a VQ-VAE autoregressive prior
+    // is fitted over. Returns 0 if (X,Y) is out of range or before any Compute().
+    function ChosenCodeIndex(X, Y: integer): integer;
   end;
 
   /// ArcFace additive angular-margin softmax output layer (Deng et al. 2019,
@@ -2595,6 +2763,13 @@ type
     FBidirectionalWindow: boolean; // symmetric (encoder) window: |i-j| < W
     FScoreSoftCap: TNeuralFloat;    // 0 = off; c>0 = c*tanh(score/c) pre-softmax
     FInvScoreSoftCap: TNeuralFloat; // 1/FScoreSoftCap when on (0 otherwise)
+    // Optional PER-SAMPLE segment-id (document-id) side channel. nil (default)
+    // = no segment masking (full backward compat). When set it points at a
+    // layer of shape (SeqLen,1,1) whose value at position j is the integer
+    // document id of token j; query i may only attend key j when seg[i]=seg[j]
+    // (intersected with the static causal/window masks). The ids carry NO
+    // gradient (discrete labels) so no error is pushed back into this source.
+    FSegLayer: TNNetLayer;
     FAttn: TNNetVolume; // attention weights [SizeX=key, SizeY=query, 1]
     // --- KV-cache incremental-decode state (inference only, not serialized) ---
     FCacheEnabled: boolean;
@@ -2603,6 +2778,48 @@ type
     FKCache: TNNetVolume;        // cached keys   [MaxContext x 1 x d_k]
     FVCache: TNNetVolume;        // cached values [MaxContext x 1 x d_k]
     FCacheScores: array of TNeuralFloat; // per-step softmax scratch row
+    // --- int8 KV-cache quantization (opt-in, inference only) ---------------
+    // OFF by default (FKVQuantInt8 = false) => the FP32 FKCache/FVCache above
+    // are the live storage and the cached path is BIT-EXACT. When EnableInt8KV
+    // is called (after BeginIncrementalDecode) each appended K and V row is
+    // quantized to int8 with a PER-ROW (per-token-block) scale and the FP32
+    // rows are NOT retained: the persistent cache is the int8 codes plus one
+    // scale per position, so a long context costs ~1/4 the FP32 cache memory.
+    // Convention (mirrors the int8 WEIGHT path QuantizeWeightsInt8): for a row
+    // r, scale = maxabs(r)/127 (or 1 if the row is all zero), code =
+    // round(value/scale) clamped to [-127,127]; dequant = code*scale. The
+    // attention math (scores and the value sum) dequantizes each cached row
+    // into FKDeqRow/FVDeqRow on read. Quantization is lossy, so the logits are
+    // NOT bit-exact vs the FP32 cache (see EnableInt8KV's tolerance note).
+    FKVQuantInt8: boolean;
+    FKCacheCodes: array of ShortInt;     // [MaxContext * d_k] quantized keys
+    FVCacheCodes: array of ShortInt;     // [MaxContext * d_k] quantized values
+    FKCacheScale: array of TNeuralFloat; // [MaxContext] per-row key scale
+    FVCacheScale: array of TNeuralFloat; // [MaxContext] per-row value scale
+    FKDeqRow: TNNetVolume;               // [1 x 1 x d_k] dequant scratch (key)
+    FVDeqRow: TNNetVolume;               // [1 x 1 x d_k] dequant scratch (value)
+    // --- StreamingLLM attention-sink + rolling-window eviction (opt-in) ---
+    // FEvictSinks = 0 (default) => eviction OFF, the cache grows to MaxContext
+    // and overflowing it is an error (the original unbounded behavior). When
+    // FEvictSinks > 0 the cache holds at most FEvictSinks + FEvictWindow live
+    // tokens forever: after each append, if FCacheLen exceeds that cap, the
+    // OLDEST window key (slot FEvictSinks) is dropped and the rest of the
+    // window is shifted left by one, leaving the first FEvictSinks tokens
+    // (the attention "sinks") untouched. The retained keys keep their ORIGINAL
+    // post-RoPE rotation (this layer caches K already position-encoded) and the
+    // query keeps its true absolute rotation (StreamingDecoder sets RoPE
+    // PositionOffset := AbsPos), so every retained query/key pair attends at
+    // its EXACT relative distance regardless of which positional scheme fed the
+    // layer (RoPE/ALiBi/absolute/learned). See EnableEviction for the full note.
+    FEvictSinks: integer;        // 0 = eviction off; >0 = number of sink slots
+    FEvictWindow: integer;       // rolling window of most-recent tokens kept
+    // Quantize Src[0..d_k-1] into the int8 cache row Slot (Codes/Scale arrays).
+    procedure QuantizeCacheRow(Src: TNeuralFloatArrPtr;
+      var Codes: array of ShortInt; var Scale: array of TNeuralFloat;
+      Slot: integer);
+    // Dequantize int8 cache row Slot into Dst[0..d_k-1].
+    procedure DequantizeCacheRow(const Codes: array of ShortInt;
+      const Scale: array of TNeuralFloat; Slot: integer; Dst: TNeuralFloatArrPtr);
     procedure ComputeIncremental();
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
@@ -2643,10 +2860,33 @@ type
     // saved models load with 0 = one-sided, bit-identical). The KV-cache
     // incremental decode path is causal by construction and therefore
     // REJECTS the bidirectional window.
+    //
+    // pSegmentSource = nil (default) keeps the original behavior bit-identical
+    // (no per-sample masking; the layer has only its single PrevLayer source).
+    // pSegmentSource <> nil enables the PER-SAMPLE block-diagonal / document-id
+    // mask for PACKED training windows: it must be a layer of shape
+    // (SeqLen,1,1) whose value at position j is the integer document/segment id
+    // of token j (e.g. fed by a TNNetInput(SeqLen,1,1) carrying the ids emitted
+    // by TNNetSequencePacker.GetSegmentIds). Query position i may then only
+    // attend key position j when seg[i] = seg[j] (rounded to the nearest
+    // integer) -- INTERSECTED with the static causal and sliding-window masks
+    // (a key is attendable iff causal-allowed AND window-allowed AND
+    // same-document). This lets a single window pack several concatenated
+    // documents without attention bleeding across document boundaries (the
+    // GPT-2/3 cross-document attention that ships by default). The mask varies
+    // ACROSS the batch (unlike the static causal/window flags) because the ids
+    // are read per-sample from the source's current Output. The segment ids
+    // are discrete labels and receive NO gradient. The source layer index is
+    // serialized in the (otherwise empty) layer-index slot (like
+    // TNNetCrossAttention), so the net round-trips through Save/LoadFromString.
+    // The KV-cache incremental-decode path does NOT support segment masking
+    // (single-stream decoding has one document by construction).
     constructor Create(d_k: integer; CausalMask: boolean = false;
       pWindow: integer = 0; pScoreSoftCap: TNeuralFloat = 0;
-      pBidirectionalWindow: boolean = false); overload;
+      pBidirectionalWindow: boolean = false;
+      pSegmentSource: TNNetLayer = nil); overload;
     destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     // Enable the KV-cache incremental-decode path. Preallocates the K and V
@@ -2666,6 +2906,68 @@ type
     // and must be discarded before verification continues from the last
     // committed token. TruncateCache(0) is equivalent to ResetCache().
     procedure TruncateCache(NewLength: integer);
+    // StreamingLLM-style KV-cache eviction for UNBOUNDED streaming (Xiao et al.
+    // 2023; transformers SinkCache). With eviction OFF (the default) the cache
+    // grows to MaxContext and overflowing it is an error. EnableEviction(S, W)
+    // turns on the "attention sink + rolling window" policy: the cache keeps the
+    // first S tokens (the sinks - a handful of initial tokens that absorb a
+    // disproportionate share of attention mass; evicting them collapses the
+    // softmax and wrecks quality) PLUS the W most-recent tokens, and evicts the
+    // MIDDLE. Total live tokens never exceed S + W, so a stream can run forever
+    // in constant memory. Requires the cached path (call after
+    // BeginIncrementalDecode) and S + W <= MaxContext. S = 0 disables eviction
+    // (back to the unbounded cache). Combining with the sliding Window mask is
+    // rejected (both bound the attended span; pick one). DisableEviction() turns
+    // it back off.
+    //   RoPE-AFTER-EVICTION CHOICE. This layer caches K AFTER positional
+    // encoding (the SDPA positional contract: Q|K|V arrive already encoded), and
+    // the StreamingDecoder rotates the query at its TRUE absolute position. The
+    // eviction here therefore does NOT re-rotate: it keeps each retained key's
+    // ORIGINAL absolute rotation and simply drops the middle slots. Because both
+    // the query and every retained key were rotated at consistent absolute
+    // positions, each surviving query/key pair attends at its EXACT relative
+    // distance - so the result is correct for RoPE AND ALiBi AND absolute AND
+    // learned encodings uniformly, with no SDPA<->RoPE coupling. This is the
+    // simplest correct StreamingLLM variant ("keep original positions"); the
+    // paper's optional extra of RE-INDEXING positions inside the cache to close
+    // the sink<->window gap is a perplexity refinement, not a correctness
+    // requirement, and is deliberately NOT done here.
+    //   While the total streamed length stays <= S + W eviction never triggers,
+    // so the cached path is BIT-IDENTICAL to the unbounded cache; only PAST that
+    // length do generated tokens diverge (by design - the middle is gone).
+    procedure EnableEviction(SinkTokens, RecentWindow: integer);
+    procedure DisableEviction();
+    // int8 KV-cache quantization (opt-in, inference only). OFF by default: the
+    // FP32 cache is the live storage and the cached path is BIT-EXACT.
+    // EnableInt8KV (call AFTER BeginIncrementalDecode, on an EMPTY cache)
+    // switches the cache to int8 storage: each appended K/V row is quantized to
+    // int8 with a per-row (per-token-block) scale = maxabs/127, round-to-
+    // nearest, clamped to [-127,127], and dequantized on read in the attention
+    // math. The persistent cache is then int8 codes + one scale per position
+    // (~1/4 the FP32 K/V memory) - the win for LONG-CONTEXT decode where the KV
+    // cache, not the weights, dominates memory. Quantization is LOSSY: the
+    // decoded logits are NOT bit-exact vs the FP32 cache, but per-row scaling
+    // keeps the drift small (empirically a few e-2 on the logits with argmax
+    // stable on a pinned prompt; see TestKVCacheInt8 / the tasklist tolerance).
+    // DisableInt8KV reverts to FP32 storage (also on an empty cache). Requires
+    // the cached path; must be called while the cache is empty (length 0) so no
+    // already-appended FP32 rows are silently dropped. Coded by Claude (AI).
+    procedure EnableInt8KV();
+    procedure DisableInt8KV();
+    // Session snapshot / fork support. CaptureCacheState copies the layer's
+    // full live KV-cache state (the cached keys/values, the live length, and
+    // the eviction config) into the supplied destination volumes / out params
+    // so a caller can save a prefilled session; RestoreCacheState copies that
+    // state back in, so continuation resumes EXACTLY where the snapshot was
+    // taken (the next appended token lands at slot Len, the eviction policy is
+    // re-armed). Both require the cached path (call after BeginIncrementalDecode)
+    // and the destination/source K/V volumes are sized to MaxContext x 1 x Dk.
+    // The fork is a deep copy: the snapshot is independent of the live layer,
+    // so the same snapshot can be restored into many sessions. Coded by Claude (AI).
+    procedure CaptureCacheState(DstK, DstV: TNNetVolume;
+      out Len, Sinks, Window: integer);
+    procedure RestoreCacheState(SrcK, SrcV: TNNetVolume;
+      Len, Sinks, Window: integer);
     // Read-only access to the post-softmax attention map populated by
     // Compute(). Layout: X=key index j, Y=query index i, attn[j,i,0]; rows
     // (fixed i) sum to 1. Used by TNNet.AttentionEntropyReport.
@@ -2675,9 +2977,15 @@ type
     property Window: integer read FWindow;
     property BidirectionalWindow: boolean read FBidirectionalWindow;
     property ScoreSoftCap: TNeuralFloat read FScoreSoftCap;
+    property SegmentSource: TNNetLayer read FSegLayer;
     property CacheEnabled: boolean read FCacheEnabled;
     property CacheLength: integer read FCacheLen;
     property MaxContext: integer read FCacheMax;
+    property Int8KVCache: boolean read FKVQuantInt8;
+    // Eviction config (0 sinks = eviction off). EvictionCap is the steady-state
+    // upper bound on CacheLength once eviction is on (SinkTokens + RecentWindow).
+    property EvictionSinks: integer read FEvictSinks;
+    property EvictionWindow: integer read FEvictWindow;
   end;
 
   /// Cross-Attention (single head, parameter-free) with SEPARATE query and
@@ -2802,6 +3110,154 @@ type
     procedure Compute(); override;
     procedure Backpropagate(); override;
     property ThetaSource: TNNetLayer read FThetaLayer;
+  end;
+
+  /// Dense per-pixel backward-warp sampler. Given a feature map (the main
+  // PrevLayer) and a two-channel (dx, dy) DENSE flow field of the SAME spatial
+  // size (a SECOND input source), produces the bilinearly-sampled backward-warp
+  //   out(x, y, c) = in(x + dx(x,y), y + dy(x,y), c)
+  // with BORDER-CLAMP edge handling (out-of-range sample coords are clamped to
+  // the valid [0..W-1] x [0..H-1] range, i.e. edge pixels are replicated). This
+  // is the dense-field sibling of the PARAMETRIC TNNetAffineGridSample (one
+  // global 2x3 theta) and of TNNetDeformableConv's per-tap bilinear sampler:
+  // here every output pixel carries its OWN learned (dx, dy) displacement, which
+  // is exactly what optical-flow warping (RAFT / RIFE / FILM frame
+  // interpolation, video stabilization) needs.
+  //   Flow-field source layout: depth-2 map, SAME SizeX/SizeY as the features.
+  //     channel 0 = dx (horizontal displacement, in pixels)
+  //     channel 1 = dy (vertical   displacement, in pixels)
+  // No trainable parameters (pure differentiable resampling).
+  // Forward: bilinear gather at the clamped sample position.
+  // Backward writes BOTH gradients (the whole point):
+  //   (a) dL/d(features): the bilinear weights scatter the output gradient back
+  //       onto the four (clamped) source neighbours, exactly like
+  //       TNNetAffineGridSample / TNNetDeformableConv.
+  //   (b) dL/d(flow): the bilinear weights are differentiable in (dx, dy) via
+  //       d(sampled)/d(sx), d(sampled)/d(sy) (and d(sx)/d(dx)=d(sy)/d(dy)=1, so
+  //       the chain rule sends the per-pixel image-space derivative straight to
+  //       the flow channels) — summed over depth into the (dx, dy) channels.
+  //   Border-clamp note: where a sample saturates against a border the clamped
+  //   coordinate stops moving, so its contribution to the flow gradient is 0 on
+  //   that axis (the clamp is locally constant). Interior samples carry the full
+  //   differentiable bilinear gradient.
+  // TWO sources (wired exactly like TNNetCrossAttention / TNNetAffineGridSample):
+  //   PrevLayer  (features): SizeX x SizeY x Depth, any depth.
+  //   FlowSource (dx, dy)  : SizeX x SizeY x 2, same SizeX/SizeY as features.
+  // Coded by Claude (AI).
+  TNNetFlowWarp = class(TNNetLayer)
+  private
+    FFlowLayer: TNNetLayer; // dense two-channel (dx, dy) flow-field source
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(FlowSource: TNNetLayer); overload;
+    destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property FlowSource: TNNetLayer read FFlowLayer;
+  end;
+
+  /// TNNetCorrelationVolume: the all-pairs 4-D CORRELATION volume that is the
+  // signature primitive of RAFT (Teed & Deng 2020, "RAFT: Recurrent All-Pairs
+  // Field Transforms for Optical Flow", arXiv:2003.12039). Given TWO feature
+  // maps f1 (PrevLayer) and f2 (the second source), both (W, H, C) and of the
+  // SAME shape, it produces the dot-product between EVERY pair of feature
+  // locations:
+  //   corr(i, j) = < f1(i), f2(j) > / sqrt(C)
+  // for source pixel i = (ix, iy) and target pixel j = (jx, jy). The output is
+  // (W, H, H*W): output pixel i carries the H*W correlations against every
+  // target j, packed in the depth axis row-major as channel = jy*W + jx (so
+  // the depth axis re-interpreted as a (W, H) map is exactly the target grid,
+  // which TNNetCorrelationLookup samples). This is the genuinely new operation
+  // among the landed layers: a quadratic-in-pixels similarity tensor rather
+  // than a local convolution. v1 is FORWARD-ONLY (RAFT inference): the
+  // correlation volume is precomputed once and consumed by the iterative
+  // update operator; Backpropagate is a no-op (documented inference-only path).
+  // No trainable parameters. TWO sources (wired like TNNetFlowWarp /
+  // TNNetCrossAttention): PrevLayer = f1, second source = f2.
+  // Coded by Claude (AI).
+  TNNetCorrelationVolume = class(TNNetLayer)
+  private
+    FF2Layer: TNNetLayer; // second feature map f2
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(F2Source: TNNetLayer); overload;
+    destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property F2Source: TNNetLayer read FF2Layer;
+  end;
+
+  /// TNNetCorrelationLookup: the local lookup of a RAFT all-pairs correlation
+  // volume around each pixel's CURRENT flow estimate (Teed & Deng 2020). Given
+  // a correlation volume V (PrevLayer, shape (W, H, H*W) as produced by
+  // TNNetCorrelationVolume, depth channel = jy*W + jx) and a dense two-channel
+  // (dx, dy) flow field (the second source, (W, H, 2)), it emits for every
+  // source pixel i = (ix, iy) the (2r+1)^2 window of correlations
+  //   out(i, k) = V( i, ix + dx + dxoff, iy + dy + dyoff )
+  // bilinearly interpolated over the target grid, where (dxoff, dyoff) sweep
+  // [-r..r] x [-r..r] row-major (k = (dyoff+r)*(2r+1) + (dxoff+r)). Targets are
+  // sampled with PyTorch grid_sample(align_corners=True, padding_mode='zeros')
+  // semantics: the target grid is mapped to [-1,1] via 2*g/(dim-1)-1, bilinear,
+  // out-of-range neighbours contribute zero. Output (W, H, (2r+1)^2) feeds the
+  // motion encoder of the update operator. v1 is FORWARD-ONLY (inference).
+  // No trainable parameters. TWO sources: PrevLayer = volume, second = flow.
+  // Coded by Claude (AI).
+  TNNetCorrelationLookup = class(TNNetLayer)
+  private
+    FFlowLayer: TNNetLayer; // dense (dx, dy) flow source
+    FRadius, FW, FH: integer;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pRadius: integer; FlowSource: TNNetLayer); overload;
+    destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property Radius: integer read FRadius;
+    property FlowSource: TNNetLayer read FFlowLayer;
+  end;
+
+  /// TNNetConvGRUCell: a SINGLE-STEP convolutional GRU cell over an (W, H, C)
+  // hidden state - the recurrent update primitive of the RAFT flow update
+  // operator (Teed & Deng 2020) and the spatial GRU sibling of the dense
+  // TNNetMinGRU / TNNetSLSTMCell and of TNNetConvLSTMCell. Unlike
+  // TNNetConvLSTMCell (which scans a packed length-T sequence in one layer),
+  // this is ONE timestep: it takes the channel-concatenation z = [h ; x] of the
+  // previous hidden map h (the first HiddenC channels of PrevLayer) and the
+  // step input x (the remaining channels) and applies SAME-padding KxK convs:
+  //   z_g = sigmoid(Wz * [h ; x] + bz)        (update gate)
+  //   r_g = sigmoid(Wr * [h ; x] + br)        (reset gate)
+  //   q   = tanh   (Wq * [r_g*h ; x] + bq)    (candidate)
+  //   h'  = (1 - z_g) * h + z_g * q            (new hidden map)
+  // so the layer's input depth is HiddenC + InC and its output depth is HiddenC.
+  // The importer drives the iterative refinement by re-feeding the new hidden
+  // map (concatenated with the next step input) to the NEXT cell instance. Each
+  // gate kernel lives in one neuron as (HiddenC, K*K, inChannels) with a
+  // (1,1,HiddenC) bias; convz/convr see HiddenC+InC input channels, convq sees
+  // HiddenC+InC as well (the reset is applied to h before the concat is rebuilt
+  // internally). FStruct[0]=HiddenC, FStruct[1]=InC, FStruct[2]=K. v1 is
+  // FORWARD-ONLY (RAFT inference); Backpropagate is a no-op (documented).
+  // Coded by Claude (AI).
+  TNNetConvGRUCell = class(TNNetLayer)
+  private
+    FHiddenC, FInC, FFeature, FPad, FW, FH: integer;
+    FZg, FRg, FQ, FRH: TNNetVolume; // gate scratch maps
+    FZcat: TNNetVolume;            // [r*h ; x] scratch for the candidate conv
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure GateConv(NeuronBase: integer; Src: TNNetVolume; Dst: TNNetVolume);
+  public
+    constructor Create(pHiddenChannels, pInputChannels: integer;
+      pFeatureSize: integer = 3); reintroduce; overload;
+    destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    procedure InitDefault(); override;
+    property HiddenChannels: integer read FHiddenC;
+    property InputChannels: integer read FInC;
+    property FeatureSize: integer read FFeature;
   end;
 
   /// Scale + translate ONLY affine assembler for a "hard" visual-attention
@@ -2930,6 +3386,65 @@ type
     property InChannels: integer read FInChannels;
     property UseBias: boolean read FUseBias;
     property WeightsSource: TNNetLayer read FWeightsLayer;
+  end;
+
+  /// StyleGAN2 weight-modulated / demodulated 2-D convolution (Karras et al.
+  // 2020, "Analyzing and Improving the Image Quality of StyleGAN",
+  // arXiv:1912.04958). This is the genuinely-new style-synthesis PRIMITIVE: a
+  // WEIGHT-SPACE operation, not an activation. Unlike TNNetHyperConv (whose
+  // whole kernel is generated upstream) this layer OWNS a trainable base
+  // convolution kernel and merely SCALES then RENORMALIZES it per forward pass
+  // using a per-input-channel style vector read from a SECOND input source.
+  // TWO sources (wired like TNNetHyperConv / TNNetHyperLinear):
+  //   PrevLayer (main features): a (SizeX, SizeY, InChannels) image tensor.
+  //   StyleSource (style vector s): a flat (1,1,InChannels) per-input-channel
+  //     scale. (StyleGAN2's affine layer "A" maps the w latent -> s; build that
+  //     affine with a stock TNNetPointwiseConvLinear / TNNetFullConnectLinear.)
+  // The owned base kernel w[o,ky,kx,i] lives in FNeurons (one neuron per output
+  // channel o, holding K*K*InChannels weights laid out
+  //   w[o,ky,kx,i] at FNeurons[o].Weights flat offset (ky*K + kx)*InChannels + i)
+  // plus, when not suppressed, a trailing bias neuron FNeurons[OutChannels]
+  // (OutChannels weights b[o]).
+  // Forward (SAME padding, stride 1):
+  //   modulate:   w'[o,ky,kx,i] = s[i] * w[o,ky,kx,i]
+  //   demodulate (Demodulate=true): d[o] = 1/sqrt(sum_{ky,kx,i} w'^2 + eps)
+  //               w''[o,ky,kx,i] = w'[o,ky,kx,i] * d[o]
+  //               (Demodulate=false -> w'' = w', e.g. the toRGB conv)
+  //   y[ox,oy,o] = sum_{ky,kx,i} w''[o,ky,kx,i]*x[ox+kx-pad, oy+ky-pad, i] (+b[o])
+  // Backward routes gradient to THREE places: the owned kernel (FNeurons.Delta,
+  // through the demod normalization), the main feature input (dL/dx), and the
+  // style vector (dL/ds, into the second source, so the mapping/affine trains
+  // end-to-end). The demod backward uses the chain rule through
+  // d[o]=(g[o]+eps)^(-1/2), g[o]=sum w'^2: d d[o]/d w'[o,t] = -d[o]^3 * w'[o,t].
+  // FStruct[0]=OutChannels, FStruct[1]=FeatureSize, FStruct[2]=SuppressBias,
+  // FStruct[3]=Demodulate persist; the StyleSource index is injected into the
+  // source slot (like TNNetConcat) so it round-trips through SaveToString.
+  // SCOPE NOTE (v1): inference-oriented synthesis primitive -- no fused
+  // up/downsampling (use a separate TNNetUpsample), no grouped/minibatch-std.
+  // Coded by Claude (AI).
+  TNNetModulatedConv2D = class(TNNetLayer)
+  private
+    FOutChannels: integer;
+    FFeatureSize: integer;
+    FInChannels: integer;
+    FDemodulate: boolean;
+    FStyleLayer: TNNetLayer;     // explicit per-input-channel style source
+    FModWeights: TNNetVolume;    // cached modulated+demodulated kernel (forward)
+    FDemodScale: TNNetVolume;    // cached per-output-channel demod factor d[o]
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pNumFeatures, pFeatureSize, pSuppressBias,
+      pDemodulate: integer; StyleSource: TNNetLayer); overload;
+    destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
+    procedure InitDefault(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property OutChannels: integer read FOutChannels;
+    property FeatureSize: integer read FFeatureSize;
+    property InChannels: integer read FInChannels;
+    property Demodulate: boolean read FDemodulate;
+    property StyleSource: TNNetLayer read FStyleLayer;
   end;
 
   /// Modern (continuous) Hopfield associative-memory layer (Ramsauer et al.
@@ -3089,6 +3604,41 @@ type
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
       property NumSeeds: integer read FK;
+      property Dim: integer read FDim;
+  end;
+
+  /// Soft-prompt / prompt-tuning layer (Lester et al. 2021, "The Power of
+  // Scale for Parameter-Efficient Prompt Tuning"; the P-tuning / prefix-tuning
+  // family). Holds a learnable bank of NumVirtualTokens d-vectors (the "soft
+  // prompt") and PREPENDS them along the sequence axis to the (SeqLen,1,d)
+  // output of the (typically frozen) token-embedding layer below it. With an
+  // input of shape (SeqLen,1,d) the output is (NumVirtualTokens+SeqLen,1,d):
+  // the first NumVirtualTokens rows are the trainable virtual-token embeddings,
+  // the remaining rows are the unchanged real token embeddings (forwarded
+  // verbatim, gradient passed straight through). The ONLY trainable parameters
+  // are the NumVirtualTokens*d soft-prompt weights -- the cheapest fine-tune of
+  // an imported checkpoint: freeze the base model (LearningRate := 0 on every
+  // other layer) and only this bank updates.
+  //
+  // DECODE SIDE: detokenization must SKIP the first NumVirtualTokens output
+  // positions -- they are virtual tokens with no vocabulary id. The
+  // NumVirtualTokens property exposes that offset to the caller.
+  //
+  // Backward scatters the upstream sequence-row gradient: rows
+  // 0..NumVirtualTokens-1 accumulate into the soft-prompt delta, rows
+  // NumVirtualTokens.. flow back unchanged into the previous (embedding) layer.
+  // Coded by Claude (AI).
+  TNNetSoftPrompt = class(TNNetLayer)
+    private
+      FNumVirtual: integer;  // K learnable virtual tokens
+      FDim: integer;         // feature width d
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(NumVirtualTokens, d: integer); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+      property NumVirtualTokens: integer read FNumVirtual;
       property Dim: integer read FDim;
   end;
 
@@ -3348,6 +3898,76 @@ type
     property MaxDistance: integer read FMaxDistance;
   end;
 
+  /// Disentangled self-attention (He et al. 2021, "DeBERTa: Decoding-enhanced
+  // BERT with Disentangled Attention", https://arxiv.org/abs/2006.03654, and
+  // the DeBERTa-v3 / DeBERTaV2 implementation in HF transformers
+  // DisentangledSelfAttention). This is a NEW attention MECHANISM, not just a
+  // bias-on-the-logits variant: the pre-softmax score is the SUM of three
+  // terms, content-to-content PLUS content-to-position PLUS position-to-content
+  //   score[i,j] = ( Q^c_i . K^c_j                                  (c2c)
+  //               +  Q^c_i . K^r_{c2p_pos(i,j)}                     (c2p)
+  //               +  K^c_j . Q^r_{p2c_pos(j,i)} ) / sqrt(d_k * 3)   (p2c)
+  // where Q^c|K^c|V^c are the ordinary content projections fed in the input
+  // (depth 3*d_k, the same Q|K|V slab as TNNetScaledDotProductAttention) and
+  // K^r / Q^r are SEPARATE relative-position projections looked up by the
+  // CLAMPED, optionally log-BUCKETED relative distance of the (query i, key j)
+  // pair. Unlike avT5RelPosBias (which adds a learned SCALAR bias per bucket)
+  // this projects whole position EMBEDDINGS and dots them with the content
+  // query / key, so it carries a (2*att_span)*d_k position-KEY table and a
+  // (2*att_span)*d_k position-QUERY table (this is genuinely different math).
+  // The relative position is r = i - j; the two gathers follow HF EXACTLY:
+  //   c2p_pos(i,j) = clamp(r + att_span, 0, 2*att_span-1)
+  //   p2c_pos(j,i) = clamp(-r + att_span, 0, 2*att_span-1)  (note the swap +
+  //     the negation; the p2c term reads the bucketed distance from the KEY's
+  //     point of view and transposes it back onto [i,j]).
+  // When PosBuckets > 0 the raw relative distance is first mapped through
+  // DeBERTa's log-bucket function make_log_bucket_position (att_span =
+  // PosBuckets); when PosBuckets = 0 the distance is used directly (att_span =
+  // MaxRelPos) and only the clamp applies. Scale uses scale_factor = 3 (both
+  // c2p and p2c present, the DeBERTa-v3 default) baked into 1/sqrt(d_k*3).
+  // Input layout (same as SDPA): SizeY = 1, SizeX = sequence length,
+  // Depth = 3 * d_k. Output shape: SizeX x 1 x d_k. Bidirectional (encoder)
+  // by default; CausalMask honoured (masked logits keep the -1e9 sentinel).
+  // Trainable parameters: the two position tables live in FNeurons[0] (K^r,
+  // 2*att_span rows of d_k) and FNeurons[1] (Q^r), so they round-trip through
+  // the base per-neuron save/load and step with the optimizer. The DeBERTa
+  // importer loads them by projecting the shared rel_embeddings through the
+  // attention key/query weights (share_att_key). att_span is stored in
+  // FStruct[3], PosBuckets in FStruct[4], MaxRelPos in FStruct[5]
+  // (FStruct[0..2] = d_k / causal / window as in the parent). KV-cache
+  // incremental decode is NOT supported (encoder layer). The backward pass is
+  // the exact adjoint of all three score terms: it scatters dScore into dQ^c,
+  // dK^c (the c2c + c2p + p2c contributions) and into the two position tables.
+  // Coded by Claude (AI).
+  TNNetDisentangledAttention = class(TNNetScaledDotProductAttention)
+  private
+    FAttSpan: integer;     // pos_ebd_size: position table half-width
+    FPosBuckets: integer;  // 0 = no log bucketing; >0 = bucket size
+    FMaxRelPos: integer;   // max_relative_positions for the log bucket
+    FInvSqrtScaled: TNeuralFloat; // 1 / sqrt(d_k * 3) (scale_factor=3)
+    // Precomputed gather indices per (i,j) pair, built in SetPrevLayer
+    // (FC2P[i*SeqLen+j] and FP2C[i*SeqLen+j]). Both already clamped to
+    // 0..2*att_span-1, so Compute is a flat lookup.
+    FC2P: array of integer;
+    FP2C: array of integer;
+    FSeqLen: integer;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(d_k: integer; pCausalMask: boolean = false;
+      pAttSpan: integer = 256; pPosBuckets: integer = 256;
+      pMaxRelPos: integer = 512); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    procedure InitDefault(); override;
+    // EXACT port of DeBERTa-v2's make_log_bucket_position (HF reference).
+    // Maps a raw relative position to its bucketed value (still signed).
+    class function LogBucketPosition(RelativePosition, BucketSize,
+      MaxPosition: integer): integer;
+    property AttSpan: integer read FAttSpan;
+    property PosBuckets: integer read FPosBuckets;
+    property MaxRelPos: integer read FMaxRelPos;
+  end;
+
   /// ALiBi attention (Press et al. 2022, "Train Short, Test Long: Attention
   // with Linear Biases Enables Input Length Extrapolation",
   // https://arxiv.org/abs/2108.12409).
@@ -3400,6 +4020,54 @@ type
     property Slope: TNeuralFloat read FSlope;
   end;
 
+  /// Window self-attention with an additive per-(query,key) score bias, the
+  // core attention block of the Swin Transformer (Liu et al. 2021,
+  // "Swin Transformer: Hierarchical Vision Transformer using Shifted Windows",
+  // https://arxiv.org/abs/2103.14030). A drop-in variant of
+  // TNNetScaledDotProductAttention over ONE window of SeqLen = window*window
+  // tokens that ADDS a FIXED (non-trainable) bias matrix to every pre-softmax
+  // logit:
+  //   scores[i,j] = (Q[i].K[j]) / sqrt(d_k) + Bias[i,j]
+  // where Bias is a SeqLen x SeqLen matrix supplied by the caller after the
+  // layer is built (SetBiasMatrix). In a Swin layer Bias[i,j] is the SUM of
+  //   - the per-head relative_position_bias (gathered from the learned
+  //     relative_position_bias_table via the fixed relative_position_index),
+  //     identical for every window in the layer; and
+  //   - the cyclic-shift attention mask (0 for an allowed (i,j) pair, -100 in
+  //     HF / our -1e9 sentinel for a pair whose two tokens come from different
+  //     image regions after the roll), which DIFFERS per window position. Since
+  //     the mask depends on the window, the per-window bias matrices differ;
+  //     this layer therefore attends ONE window and a Swin layer instantiates
+  //     one TNNetWindowAttention per (head, window) with its own bias matrix.
+  // The bias is a CONSTANT added to the score, so - exactly as for ALiBi - the
+  // backward pass is the parent's unchanged: d(const)/dscore vanishes and the
+  // softmax Jacobian already accounts for the post-softmax weights. The bias
+  // matrix is stored flattened in the single neuron FNeurons[0] (SeqLen*SeqLen
+  // weights) so it round-trips through the standard weight save/load; it is
+  // marked non-trainable (its gradient is never accumulated). There is NO
+  // causal mask and NO KV-cache (Swin is a bidirectional encoder). Input
+  // layout (same as SDPA): SizeY = 1, SizeX = SeqLen, Depth = 3 * d_k
+  // (Q | K | V). Output shape: SeqLen x 1 x d_k. SeqLen is stored in
+  // FStruct[5] (FStruct[0..2] = d_k / causal / window as in the parent).
+  // Coded by Claude (AI).
+  TNNetWindowAttention = class(TNNetScaledDotProductAttention)
+  private
+    FSeqLen: integer;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(d_k: integer; pSeqLen: integer); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    procedure InitDefault(); override;
+    // Copy a SeqLen x SeqLen bias matrix (row i = query, col j = key) into the
+    // layer's storage neuron. Bias must already include both the
+    // relative-position bias and (when applicable) the cyclic-shift mask.
+    procedure SetBiasMatrix(const Bias: TNNetVolume);
+    // Read-only accessor: Bias[i,j] = FNeurons[0].Weights[i*SeqLen + j].
+    function BiasAt(QueryI, KeyJ: integer): TNeuralFloat;
+    property SeqLen: integer read FSeqLen;
+  end;
+
   /// Attention with learnable "attention sink" slots (StreamingLLM,
   // Xiao et al. 2023, https://arxiv.org/abs/2309.17453).
   // A drop-in variant of TNNetScaledDotProductAttention that prepends K
@@ -3445,6 +4113,39 @@ type
     // X = augmented key index (0..K-1 = sink slots, K..K+SeqLen-1 = real keys),
     // Y = query index i, [X,Y,0]; rows sum to 1.
     property SinkAttentionWeights: TNNetVolume read FSinkAttn;
+  end;
+
+  /// GPT-OSS attention sink (OpenAI gpt-oss, openai/gpt-oss-20b/120b).
+  // A drop-in variant of TNNetScaledDotProductAttention that appends ONE
+  // learnable SCALAR sink LOGIT to every query's softmax denominator. Unlike
+  // TNNetSinkAttention (whose sink score is a Q.SinkKey dot product and whose
+  // sink slot adds a learnable VALUE to the output), gpt-oss's sink is a fixed
+  // per-head scalar s that is independent of the query AND contributes NOTHING
+  // to the value mix (transformers modeling_gpt_oss.eager_attention_forward
+  // appends `sinks` to the logits, softmaxes, then DROPS the sink column:
+  // scores = probs[..., :-1]). For each query i over the real keys j:
+  //   score[j] = (Q[i].K[j]) / sqrt(d_k)   (masked if causal/window and j>i)
+  //   w[j]     = exp(score[j]) / (exp(s) + sum_k exp(score[k]))
+  //   out[i]   = sum_j w[j] * V[j]
+  // so the sink only leaks softmax mass off the real keys (smaller weights,
+  // never an explicit output term). The sink logit s is a single trainable
+  // scalar held as ONE neuron with ONE weight, so it round-trips through the
+  // base neuron save/load and is stepped by the optimizer. Causal mask and the
+  // sliding window are the parent's (FStruct), so this layer slots straight
+  // into the alternating sliding/full attention stack the gpt-oss importer
+  // builds. Input layout (same as SDPA): SizeY=1, SizeX=seqlen, Depth=3*d_k
+  // (Q|K|V). Output: SizeX x 1 x d_k.
+  // Coded by Claude (AI).
+  TNNetGptOssSinkAttention = class(TNNetScaledDotProductAttention)
+  public
+    constructor Create(d_k: integer; pCausalMask: boolean = true;
+      pWindow: integer = 0); overload;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    // The learnable per-head sink logit s (the single trainable scalar).
+    function SinkLogit(): TNeuralFloat;
+    procedure SetSinkLogit(const Value: TNeuralFloat);
   end;
 
   /// Differential Attention (Differential Transformer, Ye et al., Microsoft
@@ -3747,9 +4448,22 @@ type
   //     default 1) are fully interpolated, and in between the same blend is
   //     LINEAR IN r_i (the smooth_factor). No attention-temperature output
   //     scale (HF sets attention_factor = 1.0 for rope_type "llama3").
+  //   rsmLongRoPE              - Phi-3 LongRoPE (Ding et al. 2024, HF
+  //     Phi3LongRoPEScaledRotaryEmbedding): a PER-FREQUENCY factor table
+  //     (head_dim/2 entries) DIVIDES each inverse frequency,
+  //     theta'_i = theta_i / factor_i, and the rotated output is multiplied by
+  //     a single attention scaling. Unlike PI/NTK/YaRN/Llama3 the factors are
+  //     not derived from a scalar - they are imported verbatim from the
+  //     checkpoint's long_factor (used for the long-context import). The
+  //     factor table is stored in the single neuron FNeurons[0] (head_dim/2
+  //     weights, round-trips through Save/LoadDataFromString) and the
+  //     attention scaling in FFloatSt[4]. For a static long-context import the
+  //     long_factor table and the long attention scaling
+  //     sqrt(1 + ln(max_pos/orig_max_pos)/ln(orig_max_pos)) (or an explicit
+  //     long_mscale) are used.
   // Coded by Claude (AI).
   TNNetRoPEScalingMode = (rsmNone, rsmPositionInterpolation, rsmNTKAware,
-    rsmYaRN, rsmLlama3);
+    rsmYaRN, rsmLlama3, rsmLongRoPE);
 
   /// Rotary Positional Embedding (RoPE, Su et al. 2021).
   // Parameter-free, applies a fixed position-dependent 2D rotation to
@@ -3787,6 +4501,12 @@ type
     // BuildThetaCache whenever the depth changes.
     FTheta: array of TNeuralFloat;
     FOutScale: TNeuralFloat;
+    // rsmLongRoPE per-frequency factor table supplied by the importer
+    // constructor (verbatim long_factor). It is mirrored into FNeurons[0] so
+    // it round-trips through Save/LoadDataFromString; on a load-from-string the
+    // factors arrive via FNeurons[0] instead (this array stays empty until
+    // BuildThetaCache copies them out).
+    FLongFactors: array of TNeuralFloat;
     procedure BuildThetaCache(pDepth: integer);
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
@@ -3796,7 +4516,21 @@ type
       pScaleFactor: TNeuralFloat = 1.0;
       pOriginalContextLen: integer = 0;
       pYarnAlpha: TNeuralFloat = 1.0;
-      pYarnBeta: TNeuralFloat = 32.0); overload;
+      pYarnBeta: TNeuralFloat = 32.0;
+      // pLongAttnFactor (FFloatSt[4]) is the EXPLICIT attention scaling for
+      // LongRoPE (long_mscale) AND for DeepSeek-style YaRN mscale/mscale_all_dim
+      // overrides. The 0 default is the "no explicit override" sentinel: YaRN
+      // then uses its 0.1*ln(s)+1 temperature and LongRoPE its 1.0. A POSITIVE
+      // value overrides FOutScale in BuildThetaCache.
+      pLongAttnFactor: TNeuralFloat = 0.0;
+      pYarnTruncate: boolean = true); overload;
+    // LongRoPE (rsmLongRoPE) constructor: pLongFactors is the per-frequency
+    // factor table (length head_dim/2, divides each inverse frequency) and
+    // pAttnFactor multiplies the rotated output (long_mscale).
+    constructor CreateLongRoPE(pBase: TNeuralFloat;
+      const pLongFactors: array of TNeuralFloat;
+      pAttnFactor: TNeuralFloat); overload;
+    procedure LoadDataFromString(strData: string); override;
     function GetScalingMode(): TNNetRoPEScalingMode;
     function GetScaleFactor(): TNeuralFloat;
     function GetOriginalContextLen(): integer;
@@ -3844,8 +4578,13 @@ type
       FAlpha: TNeuralFloat;
       FThreshold: TNeuralFloat;
     public
-      constructor Create(); override;
+      constructor Create(); overload; override;
+      // Creates a LeakyReLU with a user-configurable negative slope `pAlpha`
+      // (e.g. 0.2 for ESRGAN/Real-ESRGAN). The slope is stored in FFloatSt[0]
+      // for serialization so the layer round-trips through Save/LoadFromString.
+      constructor Create(pAlpha: TNeuralFloat); overload;
       procedure Compute(); override;
+      property Alpha: TNeuralFloat read FAlpha;
   end;
 
   /// Very Leaky Rectified Linear Unit (ReLU) layer.
@@ -4180,6 +4919,24 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// NEFTune noisy embedding fine-tuning (Jain et al. 2023, "NEFTune: Noisy
+  // Embeddings Improve Instruction Finetuning"). During TRAINING ONLY
+  // (FEnabled = true) it adds uniform noise to the (embedding) layer output,
+  // scaled by alpha/sqrt(L*d) where L is the token/sequence axis (SizeX) and
+  // d is the embedding dimension (Depth): each element gets
+  // + (alpha/sqrt(L*d)) * Uniform(-1,+1). L and d are read from the actual
+  // input shape at forward time. At inference (FEnabled = false) the layer is
+  // a pure pass-through (identity). The noise is additive and
+  // input-independent, so the Jacobian is the identity and the backward pass
+  // forwards OutputError unchanged (inherited identity Backpropagate). alpha is
+  // stored in FFloatSt[0] (round-trips via Save/Load). No trainable params.
+  // Coded by Claude (AI).
+  TNNetNEFTune = class(TNNetAddNoiseBase)
+    public
+      constructor Create(pAlpha: TNeuralFloat = 5.0); overload;
+      procedure Compute(); override;
+  end;
+
   /// Spatial dropout (2D). Drops entire feature-map channels rather than
   // individual elements. With probability p (FFloatSt[0]) each channel
   // (depth slice covering the full SizeX*SizeY spatial extent) is zeroed;
@@ -4435,6 +5192,33 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// Llama-4 NoPE attention temperature tuning (arXiv:2501.19399, "Scaling
+  /// Stable Llama"). On the NoPE (no-RoPE) layers Llama-4 multiplies every
+  /// query vector by a per-POSITION scalar before SDPA so that very long
+  /// contexts keep stable attention temperature:
+  ///   f(pos) = log1p( floor( (pos + 1) / floor_scale ) ) * attn_scale + 1
+  /// (HF Llama4TextAttention.forward, attn_temperature_tuning branch). The
+  /// scalar is the SAME for every channel of a token, so this is a weightless
+  /// per-row rescale of the (SeqLen,1,head_dim) query slice; the backward
+  /// multiplies the incoming gradient by the same f(pos). floor_scale lives in
+  /// FFloatSt[0] and attn_scale in FFloatSt[1]. PositionOffset (default 0, NOT
+  /// serialized) shifts pos for KV-cache incremental decode exactly like
+  /// TNNetRotaryEmbedding (a streamed length-1 token must use its ABSOLUTE
+  /// position). No trainable parameters; output shape equals input shape.
+  // Coded by Claude (AI).
+  TNNetLlama4AttnTemperature = class(TNNetIdentity)
+    private
+      FFloorScale: TNeuralFloat;
+      FAttnScale: TNeuralFloat;
+      FPositionOffset: integer;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pFloorScale, pAttnScale: TNeuralFloat); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      property PositionOffset: integer read FPositionOffset write FPositionOffset;
+  end;
+
   /// Unparameterised per-sample z-score normalization — the core of
   // TNNetLayerNorm without the learnable gamma/beta. Each input sample
   // (all elements across SizeX*SizeY*Depth) is shifted to zero mean and
@@ -4506,6 +5290,9 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+      // Normalization epsilon (default 1e-5; e.g. diffusers GroupNorm uses 1e-6).
+      property GroupNormEpsilon: TNeuralFloat read FGroupNormEpsilon
+        write FGroupNormEpsilon;
   end;
 
   /// Instance normalization: per-sample, per-channel normalization. This is
@@ -5186,12 +5973,38 @@ type
   // Coded by Claude (AI).
   TNNetTokenShift = class(TNNetChannelTransformBase)
     private
+      // --- incremental-decode state (inference only, not serialized) ---
+      FDecodeEnabled: boolean;
+      FDecodeSteps: integer;    // tokens consumed since Begin/ResetState
+      FDecPrev: TNNetVolume;    // persisted previous token x_{t-1}, Depth-long
+      procedure ComputeIncremental();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
+      destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+      // Enable the O(1)-per-step incremental-decode path. The carried state is a
+      // single Depth-long buffer holding the PREVIOUS token x_{t-1} (the only
+      // history a one-token causal shift needs), so there is no MaxContext budget
+      // (contrast the attention KV cache). The sequence starts fresh (x_{-1}=0).
+      // Mirrors TNNetWKV / TNNetSelectiveSSM Begin/End/Reset so a decoder can
+      // drive every recurrent layer type uniformly.
+      procedure BeginIncrementalDecode();
+      // Disable the incremental path; return to the normal full-sequence forward.
+      procedure EndIncrementalDecode();
+      // Start a fresh sequence (x_{-1}=0).
+      procedure ResetState();
+      // Alias for ResetState() to match the SDPA cache vocabulary.
+      procedure ResetCache();
+      // Session snapshot / fork support (mirrors TNNetWKV): CaptureState copies
+      // the persisted previous-token vector and step count out; RestoreState
+      // copies them back so a continuation resumes from the snapshot. Dst is
+      // (1,1,Depth). A deep copy, so one snapshot forks many sessions.
+      procedure CaptureState(Dst: TNNetVolume; out Steps: integer);
+      procedure RestoreState(Src: TNNetVolume; Steps: integer);
+      property DecodeEnabled: boolean read FDecodeEnabled;
   end;
 
   /// TNNetCausalConv1D: a learnable 1D convolution along the SizeX (time) axis
@@ -5262,6 +6075,61 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+  end;
+
+  /// TNNetConvolution3D: a learnable 3-D (spatiotemporal / volumetric)
+  // convolution. The repo's TNNetVolume has only three axes (SizeX, SizeY,
+  // Depth); to express a (T, H, W, C) tensor with a single volume the T time
+  // (or Z) FRAMES are PACKED contiguously along the Depth axis as T blocks of
+  // C channels each, i.e. input Depth = T * C with frame t occupying depth
+  // range [t*C .. t*C+C). SizeX = W, SizeY = H. Because the C channels of any
+  // one frame are contiguous in memory, each spatial+temporal kernel tap is a
+  // contiguous C-float vector and the forward/backward inner products use the
+  // AVX TNNetVolume.DotProduct / MulAdd primitives over C (exactly the
+  // contiguous-depth rule the 2-D conv and TNNetCausalConv1D follow).
+  //
+  // The kernel is FeatureSizeT (temporal extent, in frames) x FeatureSizeXY x
+  // FeatureSizeXY (spatial). For each output feature f, output spatial position
+  // (ox, oy) (with spatial zero-padding Padding and stride Stride like the 2-D
+  // conv) and output frame ot:
+  //   y[ox,oy, ot*NumFeatures + f] = bias[f]
+  //     + sum_{kt=0..T-1} sum_{ky,kx} sum_{c} W[f][kx,ky, kt*C+c]
+  //                                          * x[ix, iy, (ot+kt)*C + c]
+  // Time is a VALID (no-pad) convolution -- output frame count
+  // OutputSizeT = InT - FeatureSizeT + 1 -- so the output Depth is
+  // OutputSizeT * NumFeatures, frames packed the same way. Spatial uses the
+  // standard padded/strided convolution geometry; padded positions contribute
+  // zero. Setting FeatureSizeXY = 1 yields a purely TEMPORAL (Conv1D-over-time)
+  // convolution; FeatureSizeT = 1 reduces to a per-frame 2-D convolution shared
+  // across frames. One neuron per output feature f holds a
+  // (FeatureSizeXY, FeatureSizeXY, FeatureSizeT*C) weight volume plus a scalar
+  // bias, so weights/bias serialize automatically via the base neuron
+  // save/load. FStruct round-trips the geometry: [0]=NumFeatures,
+  // [1]=FeatureSizeXY, [2]=Padding, [3]=Stride, [4]=SuppressBias,
+  // [5]=FeatureSizeT, [6]=InChannelsPerFrame (C). Linear (Identity) activation.
+  // Coded by Claude (AI).
+  TNNetConvolution3D = class(TNNetLayer)
+    private
+      FFeatureSizeT: integer;   // temporal kernel extent (frames)
+      FFeatureSizeXY: integer;  // spatial (square) kernel extent
+      FPadding: integer;        // spatial zero-padding
+      FStride: integer;         // spatial stride
+      FChannels: integer;       // C: channels per frame (input Depth = InT*C)
+      FInputT: integer;         // input frame count
+      FOutputT: integer;        // output frame count = InputT-FeatureSizeT+1
+      FInputW, FInputH: integer;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pNumFeatures, pFeatureSizeT, pFeatureSizeXY,
+        pInputPadding, pStride, pInputChannels: integer;
+        pSuppressBias: integer = 0); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+      property FeatureSizeT: integer read FFeatureSizeT;
+      property FeatureSizeXY: integer read FFeatureSizeXY;
+      property Channels: integer read FChannels;
+      property OutputT: integer read FOutputT;
   end;
 
   /// TNNetDiagonalSSM: a diagonal-state linear-recurrence ("SSM-lite")
@@ -5337,6 +6205,13 @@ type
       procedure EndIncrementalDecode();
       // Start a fresh sequence: zeroes the persisted state h.
       procedure ResetState();
+      // Session snapshot / fork support (mirrors the SDPA cache capture/restore):
+      // CaptureState copies the persisted recurrent state h and the step count
+      // into Dst / out param; RestoreState copies them back so continuation
+      // resumes from the snapshot. A deep copy, so one snapshot forks many
+      // sessions. Coded by Claude (AI).
+      procedure CaptureState(Dst: TNNetVolume; out Steps: integer);
+      procedure RestoreState(Src: TNNetVolume; Steps: integer);
       property DecodeEnabled: boolean read FDecodeEnabled;
       property DecodeSteps: integer read FDecodeSteps;
   end;
@@ -5587,6 +6462,56 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
+  /// TNNetConvLSTMCell: a CONVOLUTIONAL LSTM cell (Shi, Chen, Wang, Yeung, Wong &
+  // Woo 2015, "Convolutional LSTM Network", arXiv:1506.04214). The spatial,
+  // image-state analogue of the dense recurrent cells (TNNetMinLSTM /
+  // TNNetSLSTMCell / TNNetMLSTMCell): instead of vector hidden/cell states it
+  // carries (H,W,HiddenC) feature MAPS and replaces every gate matrix-multiply
+  // with a SAME-padding KxK convolution over the channel-concatenation of the
+  // current input frame x_t and the previous hidden map h_{t-1}. This is the
+  // canonical spatiotemporal recurrence for next-frame video prediction.
+  //
+  // The input packs a length-T frame sequence along the X axis:
+  //   input  shape (T*H, W, InC)   (SizeX = T*H; H = SizeX div T, must divide)
+  //   output shape (T*H, W, HiddenC)   (the per-step hidden maps h_t)
+  // Per timestep t, at every spatial position, with z = [x_t ; h_{t-1}]
+  // (InC+HiddenC channels) and KxK same-padding convolutions Wi/Wf/Wo/Wg:
+  //   i_t = sigmoid(Wi * z + bi)      (input gate)
+  //   f_t = sigmoid(Wf * z + bf)      (forget gate, bf init +1 -> pass-through)
+  //   o_t = sigmoid(Wo * z + bo)      (output gate)
+  //   g_t = tanh   (Wg * z + bg)      (candidate cell)
+  //   c_t = f_t * c_{t-1} + i_t * g_t        (cell map,   c_{-1}=0)
+  //   h_t = o_t * tanh(c_t)                  (hidden map, h_{-1}=0)
+  // Each gate kernel is stored in one neuron as (HiddenC, K*K, InC+HiddenC)
+  // ([outChannel, spatialTap, inChannel]) with a (1,1,HiddenC) bias:
+  //   [0]=Wi [1]=Wf [2]=Wo [3]=Wg   (kernels)
+  //   [4]=bi [5]=bf [6]=bo [7]=bg   (biases)
+  // Forward is the explicit per-timestep spatial-conv scan; backward is exact
+  // BPTT carrying BOTH dL/dc_t and dL/dh_t spatial maps right-to-left (h_{t-1}
+  // feeds the gate convs, so its gradient must NOT be truncated - the classic
+  // ConvLSTM BPTT bug). FStruct[0]=T, FStruct[1]=HiddenC, FStruct[2]=K.
+  // Coded by Claude (AI).
+  TNNetConvLSTMCell = class(TNNetLayer)
+    private
+      FTimeSteps, FHiddenC, FFeature, FInC, FH, FW, FPad: integer;
+      FI, FFg, FO, FG: TNNetVolume;   // cached gates, (T*H, W, HiddenC)
+      FC, FTanhC: TNNetVolume;        // cached cell map c_t and tanh(c_t)
+      FHprev: TNNetVolume;            // h_{t-1} map scratch, (H, W, HiddenC)
+      FZ: TNNetVolume;               // concat [x_t ; h_{t-1}] scratch, (H,W,InC+HiddenC)
+      FGc, FGcNext, FGh: TNNetVolume; // backward dL/dc_t, carry, dL/dh_t maps
+      FGz: TNNetVolume;              // dL/dz_t scratch
+      FGradW: array[0..3] of TNNetVolume; // kernel grad accumulators
+      FGradB: array[0..3] of TNNetVolume; // bias grad accumulators
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pTimeSteps, pHiddenChannels: integer;
+        pFeatureSize: integer = 3); reintroduce; overload;
       destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -5965,6 +6890,13 @@ type
       FA: TNNetVolume;          // cached true accumulator a_t, (SeqLen,1,C)
       FB: TNNetVolume;          // cached true accumulator b_t, (SeqLen,1,C)
       FGradW, FGradU: TNNetVolume; // C-long grad accumulators
+      // --- incremental-decode state (inference only, not serialized) ---
+      FDecodeEnabled: boolean;
+      FDecodeSteps: integer;    // tokens consumed since Begin/ResetState
+      FDecAA: TNNetVolume;      // persisted stabilised numerator A, C-long
+      FDecBB: TNNetVolume;      // persisted stabilised denominator B, C-long
+      FDecPP: TNNetVolume;      // persisted log-space running max Q, C-long
+      procedure ComputeIncremental();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
@@ -5972,6 +6904,27 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+      // Enable the O(1)-per-step incremental-decode path. The running RWKV-v4
+      // numerator/denominator state (A,B,Q) is a fixed C-long triple, so there
+      // is no MaxContext budget (contrast the attention KV cache). The sequence
+      // starts fresh (A=B=0, Q=-inf). Mirrors TNNetDiagonalSSM /
+      // TNNetScaledDotProductAttention Begin/End/Reset so a decoder can drive
+      // every recurrent layer type uniformly.
+      procedure BeginIncrementalDecode();
+      // Disable the incremental path; return to the normal full-sequence forward.
+      procedure EndIncrementalDecode();
+      // Start a fresh sequence (A=B=0, Q=-inf).
+      procedure ResetState();
+      // Alias for ResetState() to match the SDPA cache vocabulary.
+      procedure ResetCache();
+      // Session snapshot / fork support (mirrors TNNetDiagonalSSM): CaptureState
+      // copies the persisted (A,B,Q) triple and step count out; RestoreState
+      // copies them back so a continuation resumes from the snapshot. Dst must
+      // be (1,1,3*C) (A|B|Q concatenated on Depth). A deep copy, so one snapshot
+      // forks many sessions.
+      procedure CaptureState(Dst: TNNetVolume; out Steps: integer);
+      procedure RestoreState(Src: TNNetVolume; Steps: integer);
+      property DecodeEnabled: boolean read FDecodeEnabled;
   end;
 
   /// TNNetCrossWKV: a TWO-SOURCE key/value variant of the RWKV-4 WKV
@@ -6118,6 +7071,76 @@ type
       FHre: TNNetVolume;        // cached real part of h_t, (SeqLen,1,Depth)
       FHim: TNNetVolume;        // cached imag part of h_t, (SeqLen,1,Depth)
       FGradNu, FGradTheta, FGradB, FGradCre, FGradCim, FGradD: TNNetVolume;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
+  /// TNNetRGLRU: the Real-Gated Linear Recurrent Unit (RG-LRU) of the Griffin /
+  // Hawk family (De, Smith, Fernando, Botev, Cristian-Muraru, Gu, Haroun,
+  // Berrada, Chen, Srinivasan, Desjardins, Doucet, Budden, Teh, Pascanu, De
+  // Freitas, Gulcehre 2024, "Griffin: Mixing Gated Linear Recurrences with Local
+  // Attention for Efficient Language Models", arXiv:2402.19427). It is the
+  // recurrent core of google/recurrentgemma. Operates over a (SeqLen,1,Depth)
+  // sequence laid out along SizeX exactly like the attention / TNNetDiagonalSSM /
+  // TNNetLRU layers (SizeY must be 1); output shape == input shape.
+  //
+  // NOT a duplicate of TNNetLRU: TNNetLRU is the COMPLEX-diagonal, UNGATED Orvieto
+  // LRU (lambda in C, fixed per channel, gamma = sqrt(1-|lambda|^2) a constant).
+  // The RG-LRU is REAL-valued and INPUT-GATED: both the recurrence decay a_t and
+  // the input drive are modulated per timestep by sigmoid gates computed from the
+  // input, and the input-normalisation factor sqrt(1-a_t^2) is therefore also
+  // time-varying. There is no oscillation/rotation (real state only).
+  //
+  // This layer is self-contained: its single PrevLayer output packs THREE
+  // Depth-blocks along the depth axis (total input depth = 3*Depth):
+  //   block 0 = x        : the value stream to be gated and recurred
+  //   block 1 = i_logits : input-gate pre-activations (W_x x + b_x, computed by
+  //                        upstream projection layers)
+  //   block 2 = a_logits : recurrence-gate pre-activations (W_a x + b_a)
+  // Packing the externally-projected gate logits (rather than owning W_x/W_a)
+  // lets the recurrentgemma importer realise the per-head block-diagonal gate
+  // matrices as ordinary upstream Pointwise projections, exactly as the Mamba /
+  // RWKV importers fold their input-dependent projections outside the recurrent
+  // leaf. The only trainable weight the layer itself owns is the per-channel
+  // recurrent parameter Lambda.
+  //
+  // Per channel d, with c = 8.0 the fixed log-space decay constant:
+  //   i_t = sigmoid(i_logits_t)                         (input gate)
+  //   r_t = sigmoid(a_logits_t)                         (recurrence gate)
+  //   log_a_t = -c * r_t * softplus(Lambda_d)           (<= 0, so a_t in (0,1])
+  //   a_t = exp(log_a_t)                                (per-step decay)
+  //   nx_t = sqrt(1 - a_t^2) * (i_t * x_t)              (gamma-normalised drive)
+  //   h_t = a_t * h_{t-1} + nx_t          (h_{-1}=0)    (REAL state)
+  //   y_t = h_t
+  // SEQUENCE-START RESET (HF Griffin position-0 reset): at t=0 the recurrence
+  // gate is masked to 0 and the input multiplier is 1 (not sqrt(1-a_0^2)), so
+  // h_0 = i_0 * x_0; h_{-1}=0 makes the masked gate moot, only the multiplier
+  // matters. (v1 resets at SizeX position 0 only - one document per sweep.)
+  // This matches HF RecurrentGemmaRglru exactly (softplus(Lambda), c=8, a^2 via
+  // exp(2 log_a), sqrt(1-a^2) input normaliser). Storage in Neurons[] (1 tensor):
+  //   [0]=Lambda (Depth)   recurrent_param (init so softplus(Lambda)~=0.5)
+  // FStruct[0]=Depth (3*Depth input -> Depth output, resolved in SetPrevLayer).
+  // The real state h re-inits per sweep (NOT persisted). FORWARD is a
+  // left-to-right scan caching h_t, a_t, the gates and the multiplier. BACKWARD
+  // is the EXACT BPTT adjoint scan (right-to-left, carrying dL/dh_t), folding the
+  // input gradients into the x / i_logits / a_logits blocks and the per-channel
+  // Lambda gradient (chaining through sigmoid, softplus, exp and the
+  // sqrt(1-a^2) normaliser). Per-channel scalar scan -> scalar, no AVX.
+  // Coded by Claude (AI).
+  TNNetRGLRU = class(TNNetLayer)
+    private
+      FDepth: integer;          // resolved in SetPrevLayer (output depth)
+      FH: TNNetVolume;          // cached state h_t, (SeqLen,1,Depth)
+      FA: TNNetVolume;          // cached per-step decay a_t
+      FIg: TNNetVolume;         // cached input gate sigmoid(i_logits)
+      FRg: TNNetVolume;         // cached recurrence gate sigmoid(a_logits)
+      FMult: TNNetVolume;       // cached sqrt(1 - a_t^2)
+      FGradLambda: TNNetVolume;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
@@ -6551,9 +7574,30 @@ type
   // delta_t stays the per-channel softplus projection, so an importer can fold
   // HF's low-rank dt_proj@x_proj_dt product into W_d and dt_proj.bias into b_d.
   // Init for DState>1 uses the HF/S4D-real A_log: A_raw[d,s] = ln(1+s).
+  //
+  // JAMBA INNER-NORM MODE (FStruct[1]=1, FStruct[2]=dt_rank, FFloatSt[0]=eps):
+  // the hybrid Jamba mixer (HF JambaMambaMixer) inserts a per-vector RMSNorm
+  // on the dt / B / C selection vectors BETWEEN x_proj and dt_proj/scan, which
+  // is nonlinear and so cannot be folded into the constant W_d/W_B/W_C the
+  // legacy path uses. In this mode the layer keeps the dt path UNFOLDED and,
+  // per timestep, computes
+  //   ts   = x_proj_dt . x_conv                    (dt_rank-long)
+  //   dt   = softplus( dt_proj . rms(ts)*dt_gain + b_d )
+  //   b_t  = rms(W_B . x_conv)*b_gain   (NS-long, rms over the NS axis)
+  //   c_t  = rms(W_C . x_conv)*c_gain
+  // then runs the same multi-state recurrence. Neuron layout differs:
+  //   [0]=dt_proj.weight (Depth,1,dt_rank)  [1]=W_B (NS,1,Depth)
+  //   [2]=W_C (NS,1,Depth)  [3]=b_d=dt_proj.bias (Depth)  [4]=A_raw (Depth,1,NS)
+  //   [5]=e=D (Depth)  [6]=x_proj_dt (dt_rank,1,Depth)  [7]=dt_gain (dt_rank)
+  //   [8]=b_gain (NS)  [9]=c_gain (NS)
+  // FORWARD-ONLY: backward raises a clear error in this mode (the importer
+  // builds the net inference-only; training the inner norms is not wired).
+  // Coded by Claude (AI).
   TNNetSelectiveSSM = class(TNNetLayer)
     private
       FDState: integer;      // states per channel N (FStruct[0]); 1 = legacy
+      FJambaInner: integer;  // FStruct[1]: 1 = Jamba inner dt/B/C RMSNorm mode
+      FDtRank: integer;      // FStruct[2]: dt_rank (Jamba inner-norm mode only)
       FState: TNNetVolume;   // forward state cache h_t, (SeqLen,1,Depth*N)
       FDelta: TNNetVolume;   // cached delta_t, (SeqLen,1,Depth)
       FBt: TNNetVolume;      // cached b_t, (SeqLen,1,Depth) or (SeqLen,1,N)
@@ -6562,14 +7606,116 @@ type
       FH: TNNetVolume;       // running state vector h, Depth*N-long scratch
       FGh: TNNetVolume;      // backward state-gradient gh, Depth*N-long scratch
       FExpA: TNNetVolume;    // exp(A_raw), Depth*N-long scratch
+      FTsBuf: TNNetVolume;   // dt_rank-long scratch (Jamba inner-norm forward)
       FGbT, FGcT: TNNetVolume; // per-timestep dL/db_t, dL/dc_t (DState>1 only)
       FGradWd, FGradWB, FGradWC: TNNetVolume; // projection grad accumulators
       FGradBd, FGradA, FGradE: TNNetVolume;   // per-channel(-state) grad accums
+      // --- incremental-decode state (inference only, not serialized) ---
+      FDecodeEnabled: boolean;
+      FDecodeSteps: integer;  // tokens consumed since Begin/ResetState
+      FDecH: TNNetVolume;     // persisted running state h, Depth*N-long
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
-      procedure ComputeMultiState();
+      // pResetState=true zeroes the running state h before the scan (the normal
+      // full-sequence forward); pResetState=false resumes h from FH (incremental
+      // decode). The arithmetic per token is otherwise identical.
+      procedure ComputeLegacy(pResetState: boolean = true);
+      procedure ComputeMultiState(pResetState: boolean = true);
+      procedure ComputeJambaInner(pResetState: boolean = true);
       procedure BackpropagateMultiState();
+      procedure ComputeIncremental();
     public
       constructor Create(pDState: integer = 1); reintroduce; overload;
+      // Jamba hybrid mixer: DState states, an unfolded dt path of rank pDtRank
+      // and an inner RMSNorm (eps pEps) on dt / B / C. Forward-only.
+      constructor CreateJambaInner(pDState, pDtRank: integer;
+        pEps: TNeuralFloat = 1e-6); reintroduce; overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+      // Enable the O(1)-per-step incremental-decode path. The carried SSM state
+      // is the fixed [d_inner x d_state] hidden matrix h (Depth*N floats),
+      // INDEPENDENT of position, so there is no MaxContext budget (contrast the
+      // attention KV cache). The sequence starts fresh (h = 0). Mirrors
+      // TNNetWKV / TNNetDiagonalSSM / TNNetScaledDotProductAttention
+      // Begin/End/Reset so a decoder can drive every recurrent layer uniformly.
+      procedure BeginIncrementalDecode();
+      // Disable the incremental path; return to the normal full-sequence forward.
+      procedure EndIncrementalDecode();
+      // Start a fresh sequence (h = 0).
+      procedure ResetState();
+      // Alias for ResetState() to match the SDPA cache vocabulary.
+      procedure ResetCache();
+      // Session snapshot / fork support (mirrors TNNetWKV / TNNetDiagonalSSM):
+      // CaptureState copies the persisted h matrix and step count out;
+      // RestoreState copies them back so a continuation resumes from the
+      // snapshot. Dst is sized (1,1,Depth*N). A deep copy, so one snapshot forks
+      // many sessions.
+      procedure CaptureState(Dst: TNNetVolume; out Steps: integer);
+      procedure RestoreState(Src: TNNetVolume; Steps: integer);
+      property DecodeEnabled: boolean read FDecodeEnabled;
+  end;
+
+  /// TNNetMamba2: the Mamba-2 / State-Space Duality (SSD) sequence mixer
+  // (Dao & Gu 2024, "Transformers are SSMs: Generalized Models and Efficient
+  // Algorithms Through Structured State Space Duality", arXiv:2405.21060) - the
+  // architecturally DISTINCT successor to TNNetSelectiveSSM (Mamba-1). Operates
+  // over a (SeqLen,1,InDepth) sequence (SizeY must be 1).
+  //
+  // Mamba-2 is a MULTI-HEAD SSM. The d_inner = NumHeads*HeadDim intermediate
+  // channels are partitioned into NumHeads heads of HeadDim channels each. The
+  // state transition A is a single SCALAR per head (a_t = exp(dt*A), A =
+  // -exp(A_log), A_log a per-HEAD scalar - NOT the per-(channel,state) matrix
+  // of Mamba-1) and B/C are SHARED across the heads of a group (GQA-like: there
+  // are NGroups groups, head h belongs to group h div (NumHeads div NGroups)).
+  // An extra GROUPED gated RMSNorm (over the d_inner axis, modulated by a
+  // SiLU(gate)) is applied to the scan output BEFORE the out_proj.
+  //
+  // RESPONSIBILITY BOUNDARY (mirrors how TNNetSelectiveSSM takes conv'd x): the
+  // in_proj, the depthwise causal conv1d over (x|B|C) + SiLU, and the out_proj
+  // live in surrounding layers (the importer / builder wire them). This leaf
+  // takes the already-split, already-conv'd-and-SiLU'd stream laid out on the
+  // depth axis as
+  //   [ x (d_inner) | B (NGroups*N) | C (NGroups*N) | dt (NumHeads) | gate (d_inner) ]
+  // (InDepth = 2*d_inner + 2*NGroups*N + NumHeads) and emits the gated-normed
+  // scan output of width d_inner. Per timestep t, head h (channels c=0..P-1,
+  // P=HeadDim), group g = h div (NumHeads div NGroups), state s=0..N-1:
+  //   dt_h    = softplus(dt_in[h] + dt_bias[h])          (per-head positive step)
+  //   a_h     = exp(dt_h * (-exp(A_log[h])))             (scalar decay in (0,1))
+  //   h_t[h,c,s] = a_h * h_{t-1}[h,c,s] + dt_h * B_t[g,s] * x_t[h,c]
+  //   y_t[h,c]   = sum_s C_t[g,s] * h_t[h,c,s] + D[h] * x_t[h,c]
+  // then the gated RMSNorm over the full d_inner vector y_t:
+  //   z_t   = y_t * silu(gate_t)
+  //   out_t = (z_t / sqrt(mean(z_t^2) + eps)) * norm_weight    (HF MambaRMSNormGated)
+  // Storage in Neurons[]:
+  //   [0]=A_log (NumHeads)  [1]=D (NumHeads)  [2]=dt_bias (NumHeads)
+  //   [3]=norm_weight (d_inner)
+  // FStruct[0]=NumHeads [1]=HeadDim [2]=StateSize(N) [3]=NGroups; FFloatSt[0]=eps.
+  // Forward is the direct O(SeqLen*d_inner*N) head-wise causal scan (the chunked
+  // SSD scan is a stretch goal - this is the v1, mirroring how Mamba-1 landed
+  // the recurrent scan before any chunking); backward is exact BPTT.
+  // Coded by Claude (AI).
+  TNNetMamba2 = class(TNNetLayer)
+    private
+      FNumHeads: integer;    // FStruct[0]
+      FHeadDim: integer;     // FStruct[1] (P)
+      FStateSize: integer;   // FStruct[2] (N)
+      FNGroups: integer;     // FStruct[3]
+      FDInner: integer;      // NumHeads*HeadDim (cached)
+      FState: TNNetVolume;   // forward state cache h_t, (SeqLen,1,DInner*N)
+      FDt: TNNetVolume;      // cached dt_h per timestep, (SeqLen,1,NumHeads)
+      FAt: TNNetVolume;      // cached a_h per timestep, (SeqLen,1,NumHeads)
+      FY: TNNetVolume;       // cached pre-norm scan output y_t, (SeqLen,1,DInner)
+      FZ: TNNetVolume;       // cached gated z_t = y*silu(gate), (SeqLen,1,DInner)
+      FRStd: TNNetVolume;    // cached 1/sqrt(mean(z^2)+eps), (SeqLen,1,1)
+      FH: TNNetVolume;       // running state h, DInner*N-long scratch
+      FGh: TNNetVolume;      // backward state-gradient gh, DInner*N-long scratch
+      FGradA, FGradD, FGradDtB, FGradNorm: TNNetVolume; // weight grad accums
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pNumHeads: integer = 1; pHeadDim: integer = 1;
+        pStateSize: integer = 16; pNGroups: integer = 1;
+        pEps: TNeuralFloat = 1e-5); reintroduce; overload;
       destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -6751,6 +7897,39 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// TNNetAdaIN: Adaptive Instance Normalization (Huang & Belongie 2017).
+  // A TWO-SOURCE layer with NO learnable parameters. The first source is the
+  // CONTENT feature map and the second source is the STYLE feature map (both
+  // must have the same Depth; the spatial sizes may differ). For every sample
+  // and every channel c the content map is instance-normalized over its spatial
+  // positions and then re-scaled / re-shifted by the per-channel statistics of
+  // the style map:
+  //   out = style_std[c] * (content - content_mean[c]) / content_std[c]
+  //         + style_mean[c]
+  // An epsilon stabilizes both standard deviations. The full input gradient is
+  // propagated to BOTH sources: the content gradient is the instance-norm
+  // Jacobian scaled by style_std per channel, and the style gradient flows
+  // through style_mean (uniform 1/M spread) and style_std
+  // ( (s-style_mean)/(M*style_std) reduction ).
+  // Coded by Claude (AI).
+  TNNetAdaIN = class(TNNetIdentityWithoutL2)
+    private
+      FContentIdx, FStyleIdx: integer;
+      FContentLayer, FStyleLayer: TNNetLayer;
+      // Per-sample-per-channel statistics cached for the backward pass.
+      FContentMean, FContentInvStd: TNNetVolume; // (1,1,Depth)
+      FStyleMean, FStyleStd: TNNetVolume;         // (1,1,Depth)
+      FNormContent: TNNetVolume;                  // normalized content (xhat)
+      FAdaEpsilon: TNeuralFloat;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(ContentLayer, StyleLayer: TNNetLayer); overload;
+      constructor Create(ContentIdx, StyleIdx: integer); overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// This layer adds a trainable bias to each output cell. Placing
   // this layer before and after convolutions can speed up learning.
   // It's useless placing this layer after fully connected layers with bias.
@@ -6900,6 +8079,35 @@ type
     public
       constructor Create(); overload; override;
       constructor Create(pChannels: array of integer); overload;
+      destructor Destroy(); override;
+
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+
+      function SaveStructureToString(): string; override;
+  end;
+
+  /// Token-axis gather/reorder layer. The X-axis analogue of
+  // TNNetGatherChannels: selects an ORDERED SUBSET of positions along the SizeX
+  // (token/sequence) axis of a (SizeX, 1, Depth) sequence, producing an output
+  // of shape (N, 1, Depth) where N = number of indices:
+  //   Output[k, 0, d] := Input[Tokens[k], 0, d].
+  // This is the token-reordering primitive behind the Swin Transformer's
+  // window-partition / window-reverse and cyclic-shift: a fixed permutation of
+  // the (H*W,1,C) token grid into window-contiguous order (and its inverse) is
+  // just a TNNetGatherTokens with the right index list. Backward SCATTERS each
+  // output position's error back to its source position with Add (so repeated
+  // indices accumulate correctly). The index list lives in its own
+  // structure-string segment (no fixed cap). Requires SizeY = 1 and every index
+  // in 0 <= idx < Input.SizeX. The parameterless constructor selects position 0.
+  // Coded by Claude (AI).
+  TNNetGatherTokens = class(TNNetIdentity)
+    private
+      FTokens: TNeuralIntegerArray;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pTokens: array of integer); overload;
       destructor Destroy(); override;
 
       procedure Compute(); override;
@@ -8579,8 +9787,15 @@ type
       procedure RefreshCalculatePrevLayerError();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure RefreshPrevSizeXDepthBytes();
+    protected
+      // Sets a rectangular (asymmetric) kernel. Must be called by a leaf
+      // constructor BEFORE SetPrevLayer is ever invoked, otherwise the neuron
+      // weight count and output geometry are already locked to the square size.
+      procedure SetFeatureSizeXY(pFeatureSizeX, pFeatureSizeY: integer);
     public
       constructor Create(pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload;
+      property FeatureSizeX: integer read FFeatureSizeX;
+      property FeatureSizeY: integer read FFeatureSizeY;
       destructor Destroy(); override;
       procedure InitDefault(); override;
   end;
@@ -8753,6 +9968,34 @@ type
   TNNetConvolutionLinear = class(TNNetConvolution)
   public
     constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
+  end;
+
+  /// RECTANGULAR (asymmetric) kernel convolution -- the spatially-factorized
+  /// sibling of the square TNNetConvolution. The square conv exposes a single
+  /// FeatureSize that drives BOTH spatial axes; this layer takes independent
+  /// pFeatureSizeX (kernel width) and pFeatureSizeY (kernel height), enabling
+  /// the 1xN / Nx1 factorized convolutions used across modern CNNs (e.g.
+  /// Inception-v3's InceptionC 1x7 + 7x1 branches, SegFormer/Mix-FFN depthwise
+  /// variants, and cheap large-receptive-field stems). The forward im2col
+  /// (PrepareInputForConvolutionFast) and backward gradient loops in the shared
+  /// TNNetConvolution base already index the X and Y kernel extents separately
+  /// via FFeatureSizeX/FFeatureSizeY, so this class only has to override the
+  /// square constraint at construction time and restore both extents on
+  /// load (FStruct[1]=FeatureSizeX, FStruct[5]=FeatureSizeY). The AVX
+  /// dot-product path operates on the flattened (FeatureSizeX*FeatureSizeY*
+  /// InDepth) channel vector exactly as the square case, so vectorization is
+  /// preserved. This variant has Linear (Identity) activation.
+  // Coded by Claude (AI).
+  TNNetConvolutionRectangular = class(TNNetConvolution)
+  public
+    constructor Create(pNumFeatures, pFeatureSizeX, pFeatureSizeY, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload; virtual;
+  end;
+
+  /// Rectangular (asymmetric) kernel convolution with ReLU activation.
+  // Coded by Claude (AI).
+  TNNetConvolutionRectangularReLU = class(TNNetConvolutionRectangular)
+  public
+    constructor Create(pNumFeatures, pFeatureSizeX, pFeatureSizeY, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
   end;
 
   /// QUATERNION CONVOLUTION layer -- the spatial sibling of the dense
@@ -10707,6 +11950,52 @@ type
 
   TNNetDeAvgPool = class(TNNetDeMaxPool);
 
+  /// Spatial BILINEAR upsample by an INTEGER factor, matching PyTorch's
+  // nn.functional.interpolate(mode='bilinear', align_corners=False). Given an
+  // input (W,H,C) and factor s it produces (W*s, H*s, C). For an output pixel
+  // (ox,oy) the source coordinate (align_corners=False) is
+  //   sx = (ox + 0.5)/s - 0.5,   sy = (oy + 0.5)/s - 0.5
+  // clamped to [0, W-1] / [0, H-1] (PyTorch clamps NEGATIVE source coords to 0
+  // before sampling; the upper edge is handled by clamping the integer corner
+  // index). The output is the bilinear blend of the 4 surrounding source pixels,
+  // applied independently per channel. No trainable parameters. The factor is
+  // serialized in FStruct[0] so the layer round-trips through Save/LoadFromString.
+  // Backward scatters each output error back to its 4 source corners weighted by
+  // the same bilinear weights (the exact adjoint).
+  // Coded by Claude (AI).
+  TNNetBilinearUpsample = class(TNNetLayer)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pFactor: integer = 2); reintroduce; overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
+  /// Spatial BILINEAR resize to an ABSOLUTE target (W,H), matching PyTorch's
+  // nn.functional.interpolate(mode='bilinear', size=(H,W), align_corners=...).
+  // Unlike TNNetBilinearUpsample (integer up-only factor, align_corners=False),
+  // this targets an arbitrary output grid (up- OR down-sample) and supports BOTH
+  // align_corners conventions, as required by the DPT / Depth-Anything fusion and
+  // depth-estimation head:
+  //   align_corners=True  : src = o * (InSize-1)/(OutSize-1)
+  //   align_corners=False : src = (o+0.5)*InSize/OutSize - 0.5  (clamped >= 0)
+  // (When OutSize=1 the source coord is 0.) Applied independently per channel; no
+  // trainable parameters. Target W/H go in FStruct[0]/FStruct[1] and the
+  // align_corners flag in FStruct[2] so the layer round-trips through Save/Load.
+  // Backward scatters each output error back to its 4 source corners by the same
+  // bilinear weights (the exact adjoint).
+  // Coded by Claude (AI).
+  TNNetBilinearResize = class(TNNetLayer)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pOutW: integer = 2; pOutH: integer = 2;
+        pAlignCorners: integer = 0); reintroduce; overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// neural network
   TNNet = class(TMObject)
     protected
@@ -10716,6 +12005,9 @@ type
       FBackwardTime: double;
       //Layer with Max Delta. You can read after calling GetMaxAbsoluteDelta.
       FMaxDeltaLayer: integer;
+      // When True, anomaly detection scans each layer's Output (forward) and
+      // OutputError (backward) for NaN/Inf and raises on the first offender.
+      FDetectAnomaly: boolean;
       {$IFDEF OpenCL}
       FDotProductKernel: TDotProductKernel;
       {$ENDIF}
@@ -10836,6 +12128,31 @@ type
       // CHANNEL branch's TNNetMaxChannel assumes square maps (SizeX=SizeY).
       function AddCBAM(InputLayer: TNNetLayer; ReductionRatio: integer = 16;
         SpatialKernelSize: integer = 7): TNNetLayer;
+      // Symmetric convolutional encoder-decoder U-Net (Ronneberger et al. 2015)
+      // built from existing tested layers; it is SHAPE-PRESERVING in space
+      // (output SizeX,SizeY = input SizeX,SizeY) with OutputChannels depth.
+      // Structure (Depth stages):
+      //   encoder stage i = 2x [ Conv3x3(pad1) -> Norm -> ReLU ] then a
+      //     2x2 stride-2 MaxPool downsample; feature count DOUBLES each stage
+      //     (BaseFeatures, 2*BaseFeatures, ...). The pre-pool feature map of
+      //     every stage is recorded as a SKIP tap.
+      //   bottleneck = 2x [ Conv3x3(pad1) -> NormLayer -> ReLU ].
+      //   decoder stage i = 2x nearest upsample (TNNetDeMaxPool) -> TNNetDeepConcat
+      //     with the matching encoder tap (the skip; depth-axis concat) -> 2x
+      //     [ Conv3x3 -> Norm ->
+      //     ReLU ]; feature count HALVES each stage.
+      //   head = 1x1 ConvolutionLinear -> OutputChannels (a per-pixel logit map;
+      //     wire a Sigmoid + TNNetDiceLoss after it for binary segmentation).
+      // EncoderTaps (out) returns the layer INDICES of the recorded skip taps,
+      // shallow->deep, so callers can inspect/re-wire the skip connections.
+      // CONSTRAINT: the incoming SizeX and SizeY must each be divisible by
+      // 2^Depth so every downsample/upsample round-trips exactly.
+      // UseNorm (default true) inserts a TNNetMovingStdNormalization after each
+      // conv; set false for a plain conv->ReLU U-Net.
+      // Coded by Claude (AI).
+      function AddUNet(Depth, BaseFeatures, OutputChannels: integer;
+        out EncoderTaps: TNeuralIntegerArray;
+        UseNorm: boolean = true): TNNetLayer;
       // SwiGLU feed-forward block: FullConnectLinear(2*D_hidden) -> SwiGLU -> FullConnectLinear(D_out).
       // D_in is informational only; the first FullConnect infers its input from the previous layer.
       function AddSwiGLUFeedForward(D_in, D_hidden, D_out: integer): TNNetLayer;
@@ -11014,6 +12331,21 @@ type
       // (the sandwich-norm convention in Gemma-2 and friends; pass
       // TNNetLayerNorm for the LayerNorm variant).
       function AddSandwichNormResidual(pSublayers: array of TNNetLayer;
+        NormClass: TNNetLayerClass = nil): TNNetLayer;
+      // Output-norm residual block (OLMo-2-style reordered post-norm):
+      //   y = x + Norm(Sublayer(x))
+      // i.e. the sublayer runs on the RAW input (no pre-norm at all) and its
+      // output is normalized BEFORE the residual add - the third placement
+      // beside AddPreNormResidual (y = x + Sublayer(Norm(x))) and
+      // AddPostNormResidual (y = Norm(Sublayer(x) + x)); it is
+      // AddSandwichNormResidual minus the entry norm. This is the OLMo-2
+      // decoder convention (HF post_attention_layernorm /
+      // post_feedforward_layernorm with NO input_layernorm). pSublayers is
+      // the caller-provided sublayer stack; its output shape MUST match the
+      // block input shape so the residual sum is valid. Returns the
+      // residual-sum layer. NormClass selects the normalization layer class;
+      // nil defaults to TNNetRMSNorm (OLMo-2 uses RMSNorm).
+      function AddOutputNormResidual(pSublayers: array of TNNetLayer;
         NormClass: TNNetLayerClass = nil): TNNetLayer;
       // Gated residual block:  y = x + GatedResidual(Sublayer(x)).
       // Unlike the norm-based siblings above, this block applies NO
@@ -11264,6 +12596,22 @@ type
       // at AddLayer time: the base randomly, B at zero).
       function AddLoRAAdapter(FrozenLayer: TNNetLayer; Rank: integer;
         Alpha: TNeuralFloat = 1.0): TNNetLayer;
+      // Folds a trained LoRA bypass (the A=down and B=up pointwise projections
+      // built by AddLoRAAdapter) into the frozen base layer's weights so the
+      // adapter can be DELETED for zero-overhead inference:
+      //   W_base[j][i] += (Alpha/Rank) * sum_k B[j][k]*A[k][i]
+      // (the standard LoRA merge -- the low-rank update B*A scaled by Alpha/Rank
+      // is added to the base weight matrix). Any A/B bias (A keeps its random
+      // bias init; B is normally zero) is folded into the base BIAS the same
+      // way, so the fold is exact regardless of the adapter's biases.
+      // BaseLayer, ADown and BUp must be pointwise-linear
+      // projections with matching dims (BaseLayer/BUp: d_out neurons; ADown:
+      // Rank neurons; ADown weights: d_in; BUp weights: Rank). After the call
+      // BaseLayer alone reproduces base(x) + (Alpha/Rank)*B*A*x, so a forward
+      // through BaseLayer equals the wrapped adapter forward to within
+      // floating-point tolerance. Rank is read from ADown's neuron count.
+      procedure MergeLoRA(BaseLayer, ADown, BUp: TNNetLayer;
+        Alpha: TNeuralFloat = 1.0);
       // Convenience wrapper around TNNetGatherChannels: appends a learnable-free
       // depth-channel gather that selects an ORDERED SUBSET (and/or reorders or
       // duplicates) the previous layer's channels, yielding an output of shape
@@ -11338,6 +12686,15 @@ type
       // from avQKNorm, which L2-normalises q/k with a single learnable
       // temperature inside the attention layer: QKRMSNorm carries a gain
       // VECTOR of d_k weights per norm and keeps plain SDPA scaling.
+      // SegmentSource (default nil) threads a per-sample key-padding /
+      // block-diagonal segment mask into EVERY per-head plain-SDPA leaf (the
+      // pSegmentSource argument of TNNetScaledDotProductAttention): a
+      // (SeqLen,1,1) layer whose value at position j is the integer segment id
+      // of token j; query i then attends key j only when seg[i]=seg[j] (a key
+      // at a [PAD] position carrying a distinct segment id is excluded from
+      // every real query's softmax). Only honored for Variant=avSDPA (the
+      // other drop-in variants do not implement segment masking); passing it
+      // with another variant is rejected.
       function AddMultiHeadSDPAConcat(Heads: integer;
         CausalMask: boolean = false; SourceLayer: TNNetLayer = nil;
         UseRoPE: boolean = false;
@@ -11346,7 +12703,8 @@ type
         Window: integer = 0;
         RelPosNumBuckets: integer = 32;
         RelPosMaxDistance: integer = 128;
-        QKRMSNorm: boolean = false): TNNetLayer;
+        QKRMSNorm: boolean = false;
+        SegmentSource: TNNetLayer = nil): TNNetLayer;
       // Full multi-head self-attention block over a (SeqLen,1,3*d_model) Q|K|V
       // slab: per-head split -> per-head SDPA -> concat -> token-wise linear
       // out-projection to depth d_model. Returns the out-projection layer.
@@ -11388,6 +12746,9 @@ type
       // QKRMSNorm=True inserts a learnable-scale per-head RMSNorm on each
       // head's Q and K slices BEFORE RoPE (Gemma-3 / Qwen3 per-head QK-norm;
       // see AddMultiHeadSDPAConcat).
+      // SegmentSource (default nil) threads a per-sample key-padding /
+      // block-diagonal segment mask into every per-head plain SDPA leaf (see
+      // AddMultiHeadSDPAConcat); only honored for Variant=avSDPA.
       function AddMultiHeadSelfAttention(Heads: integer;
         CausalMask: boolean = false; UseRoPE: boolean = false;
         Variant: TNNetAttentionVariant = avSDPA;
@@ -11395,7 +12756,8 @@ type
         Window: integer = 0;
         RelPosNumBuckets: integer = 32;
         RelPosMaxDistance: integer = 128;
-        QKRMSNorm: boolean = false): TNNetLayer;
+        QKRMSNorm: boolean = false;
+        SegmentSource: TNNetLayer = nil): TNNetLayer;
       // Multi-head LINFORMER self-attention (Wang et al. 2020, arXiv:2006.04768)
       // over a (SeqLen,1,3*d_model) Q|K|V slab. Linformer keeps the softmax but
       // projects K and V DOWN the sequence axis to a fixed rank k (k << SeqLen)
@@ -12022,6 +13384,25 @@ type
       // the trunk depth. Returns the concatenated output layer. (Coded by Claude (AI).)
       function AddMultiTokenPrediction(NumFuture, VocabSize: integer;
         ProjHidden: boolean = false; pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
+      // TOKEN-CLASSIFICATION head (HF *ForTokenClassification port): a per-token
+      // linear projection of the (SeqLen,1,d_model) hidden state to NumLabels
+      // logits per position, i.e. output (SeqLen,1,NumLabels). The projection is a
+      // token-wise 1x1 conv (TNNetPointwiseConvLinear) so the sequence axis is kept
+      // and each token is classified INDEPENDENTLY (a FullConnect would flatten/mix
+      // tokens). d_model is inferred from the trunk depth. The framework seeds the
+      // per-token cross-entropy gradient at the last layer; for inference, read the
+      // per-position argmax over the NumLabels depth axis (BIO/IOB2 tag id). Returns
+      // the logits layer. (Coded by Claude (AI).)
+      function AddTokenClassificationHead(NumLabels: integer): TNNetLayer;
+      // QA SPAN-EXTRACTION head (HF *ForQuestionAnswering port): TWO parallel
+      // per-token logit projections (start, end) of the (SeqLen,1,d_model) hidden
+      // state, each a token-wise 1x1 conv (TNNetPointwiseConvLinear) to 1 channel,
+      // concatenated along depth into output (SeqLen,1,2): channel 0 = start logit,
+      // channel 1 = end logit per position. Pure composition over per-token
+      // projections; pairs with neuralnlpmetrics.ExtractQASpans + the tokenizer
+      // offset-mapping to map the best (start,end) span back to text. Returns the
+      // concatenated output layer. (Coded by Claude (AI).)
+      function AddQuestionAnsweringHead(): TNNetLayer;
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
       // Single-head SINKHORN attention: a drop-in, DOUBLY-STOCHASTIC contrast to
       // softmax self-attention. Standard attention row-normalizes the scaled QK^T
@@ -12344,9 +13725,43 @@ type
       // untouched. Returns the embedding layer (nil on error).
       function ResizeTokenEmbeddings(NewVocabSize: integer): TNNetEmbedding; // Coded by Claude (AI).
       procedure ResetBackpropCallCurrCnt(); {$IFDEF Release} inline; {$ENDIF}
+      // Net-wide recurrent incremental-decode broadcast. Loops every layer and
+      // switches the zero-arg recurrent leaves (TNNetTokenShift, TNNetWKV,
+      // TNNetSelectiveSSM, TNNetDiagonalSSM) onto their O(1)-per-step state-carry
+      // forward, so a FULL recurrent block (e.g. AddRWKVBlock: TokenShift ->
+      // projections -> WKV, plus the channel-mix TokenShifts) decodes
+      // token-by-token with every stateful layer advancing in lockstep. The
+      // stateless per-token layers (pointwise projections, sums, concats,
+      // activations) need no state. ATTENTION KV-cache layers
+      // (TNNetScaledDotProductAttention) take a MaxContext budget and are driven
+      // by TNNetStreamingDecoder instead, so they are intentionally NOT touched
+      // here. Returns the number of recurrent layers switched on.
+      function BeginIncrementalDecode(): integer;
+      // Switch the recurrent leaves back onto the normal full-sequence forward.
+      procedure EndIncrementalDecode();
+      // Start a fresh sequence on every recurrent leaf (state := initial).
+      procedure ResetIncrementalDecode();
       procedure SetL2Decay(pL2Decay: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure SetL2DecayToConvolutionalLayers(pL2Decay: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
-      procedure ComputeL2Decay(); {$IFDEF Release} inline; {$ENDIF}
+      procedure ComputeL2Decay(); overload;
+      // Parameter-group-aware L2 weight decay (a PyTorch-style param_groups
+      // port). Behaves like ComputeL2Decay() but, when ExcludeBias is true,
+      // the per-neuron bias term is left untouched (only the weight tensor is
+      // shrunk). Normalization layers (TNNetIdentityWithoutL2 descendants such
+      // as TNNetLayerNorm/RMSNorm/GroupNorm) are skipped exactly as in
+      // ComputeL2Decay() because their ComputeL2Decay() override is a no-op, so
+      // norm gains are never decayed. With ExcludeBias = false this is
+      // bit-identical to ComputeL2Decay(). Used by TNeuralFitBase when
+      // ExcludeBiasAndNormFromWeightDecay is enabled.
+      procedure ComputeL2Decay(ExcludeBias: boolean); overload;
+      // Multiplies the per-layer LearningRate of every normalization layer
+      // (TNNetIdentityWithoutL2 descendant carrying trainable gain/bias neurons,
+      // e.g. TNNetLayerNorm / TNNetRMSNorm / TNNetGroupNorm) by Mul, implementing
+      // the per-group learning-rate multiplier of a PyTorch-style param_group.
+      // Mul = 1 is a no-op. Call AFTER SetLearningRate(), which resets every
+      // layer to the base rate, so the multiplier is reapplied each step.
+      // Returns the number of layers whose rate was scaled.
+      function ScaleNormLayerLearningRate(Mul: TNeuralFloat): integer;
       procedure SetSmoothErrorPropagation(p:boolean); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearTime(); {$IFDEF Release} inline; {$ENDIF}
       procedure Clear();
@@ -12634,6 +14049,31 @@ type
         NN: TNNet;
         Sample: TNNetVolume;
         Iterations: integer = 50
+      ): string;
+      // ProfileReport is a torch.profiler-lite: a single per-layer table that
+      // fuses LayerTimingReport's wall-clock timing with
+      // MemoryFootprintReport's parameter/activation accounting. It runs
+      // Iterations forward passes of Sample (and, when Target<>nil, the same
+      // number of full Backpropagate(Target) passes) through NN, reusing the
+      // framework's per-layer FForwardTime / FBackwardTime accumulators
+      // (zeroed first via NN.ClearTime, a TDateTime span in days converted to
+      // microseconds). Per layer it reports: index, class name, output shape,
+      // mean us/forward, mean us/backward (blank "-" when no Target is given),
+      // parameter element count + bytes (sum of every neuron's Weights.Size
+      // plus one bias/neuron for layers that own their weights, matching
+      // MemoryFootprintReport), and activation element count + bytes
+      // (Output.Size * SizeOf(TNeuralFloat), single-sample batch=1). A TOTAL
+      // row sums the timing, parameter and activation columns. Wall-clock
+      // numbers are inherently machine/run dependent; the param/activation
+      // byte counts are exact and deterministic. Pure diagnostic that leaves
+      // no training state behind (gradients computed during the optional
+      // backward pass are not applied). Returns a short message (never
+      // crashes) when NN is nil, has no layers, or Sample is nil.
+      class function ProfileReport(
+        NN: TNNet;
+        Sample: TNNetVolume;
+        Target: TNNetVolume = nil;
+        Iterations: integer = 20
       ): string;
       // Diagonal (empirical) Fisher-information importance diagnostic. Given a
       // trained classifier NN and a labelled probe batch Samples (input volume
@@ -13873,6 +15313,30 @@ type
         PerLayer: boolean = False;
         MaxSamples: integer = 256
       ): string;
+      // --- Persistent magnitude pruning (torch.nn.utils.prune port). -----------
+      // Builds and APPLIES persistent prune masks so the smallest-magnitude
+      // weights are zeroed AND HELD at zero through subsequent training (unlike
+      // MagnitudePruningReport, which restores the weights). Sparsity in [0,1)
+      // is the fraction of weights to prune. When PerLayer = False (default) the
+      // threshold is a GLOBAL magnitude percentile pooled over the whole network;
+      // when True each trainable layer is pruned to Sparsity independently.
+      // Biases are never pruned. Re-enforced automatically after each weight
+      // update (see ApplyPruneMasks, called from UpdateWeights/UpdateWeightsAdam).
+      // Returns the number of weights pruned. (Coded by Claude (AI).)
+      function PruneWeightsByMagnitude(Sparsity: TNeuralFloat;
+        PerLayer: boolean = False): integer;
+      // Re-applies every layer's persistent prune mask (zeroes pruned weights and
+      // their gradients/inertia). Called for you after each weight update; you
+      // only need it if you mutate weights by hand. (Coded by Claude (AI).)
+      procedure ApplyPruneMasks();
+      // True when any layer carries a persistent prune mask.
+      function HasPruneMasks(): boolean;
+      // Frees all persistent prune masks (weights keep current values).
+      procedure ClearPruneMasks();
+      // Total number of weights held at zero by persistent masks, and that count
+      // as a fraction of all trainable weights. (Coded by Claude (AI).)
+      function CountPrunedWeights(): integer;
+      function GetPruneSparsity(): TNeuralFloat;
       // Monte-Carlo-Dropout *epistemic* uncertainty diagnostic (Gal &
       // Ghahramani 2016). Unlike the rest of the report family this one
       // deliberately KEEPS the stochastic (dropout / noise) layers ACTIVE at
@@ -14387,12 +15851,26 @@ type
       // custom layers support
       function ShouldIncDepartingBranchesCnt(pLayer: TNNetLayer):boolean; virtual;
 
+      // Anomaly detection (port of torch.autograd.set_detect_anomaly).
+      // When DetectAnomaly is True, Compute scans every layer's Output for
+      // NaN/Inf right after that layer runs (forward), and Backpropagate scans
+      // every layer's OutputError for NaN/Inf after the backward pass. On the
+      // FIRST offending layer it raises an exception (via FErrorProc) naming the
+      // layer index, the layer class and the phase, e.g.:
+      //   'Anomaly detected: NaN/Inf in OUTPUT of layer 7 (TNNetSwiGLU) during FORWARD pass'
+      // The per-element scan is O(size) per layer per pass and is only paid when
+      // the flag is enabled; it is OFF by default.
+      procedure CheckForwardAnomaly(LayerCnt: integer);
+      procedure CheckBackwardAnomaly();
+
     published
       property BackwardTime: double read FBackwardTime write FBackwardTime;
       property ForwardTime: double read FForwardTime write FForwardTime;
       property Layers: TNNetLayerList read FLayers;
       property LearningRate: TNeuralFloat read FLearningRate;
       property MaxDeltaLayer: integer read FMaxDeltaLayer;
+      // Enables anomaly detection. See CheckForwardAnomaly/CheckBackwardAnomaly.
+      property DetectAnomaly: boolean read FDetectAnomaly write FDetectAnomaly;
   end;
 
   { TNNetSWAWrapper }
@@ -16061,6 +17539,59 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
+{ TNNetHardSigmoid }
+
+procedure TNNetHardSigmoid.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 3 then
+      begin
+        FOutput.FData[OutputCnt] := 1;
+        FOutputErrorDeriv.FData[OutputCnt] := 0;
+      end
+      else if x < -3 then
+      begin
+        FOutput.FData[OutputCnt] := 0;
+        FOutputErrorDeriv.FData[OutputCnt] := 0;
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := (x + 3)/6;
+        FOutputErrorDeriv.FData[OutputCnt] := 1/6;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 3 then
+        FOutput.FData[OutputCnt] := 1
+      else if x < -3 then
+        FOutput.FData[OutputCnt] := 0
+      else
+        FOutput.FData[OutputCnt] := (x + 3)/6;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
 { TNNetConvolutionHardSwish }
 
 constructor TNNetConvolutionHardSwish.Create(pNumFeatures, pFeatureSize,
@@ -17044,6 +18575,62 @@ begin
   inherited BackpropagateNoTest();
 end;
 
+{ TNNetGELUErf }
+
+procedure TNNetGELUErf.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, cdf, pdf: TNeuralFloat;
+const
+  // 1/sqrt(2) and 1/sqrt(2*pi)
+  INV_SQRT_2 = 0.70710678118654752;
+  INV_SQRT_2PI = 0.39894228040143268;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      cdf := 0.5 * (1 + pcr_erff(x * INV_SQRT_2));
+      FOutput.FData[OutputCnt] := x * cdf;
+      // GELU_erf'(x) = Phi(x) + x * phi(x)
+      pdf := INV_SQRT_2PI * pcr_expf(-0.5 * x * x);
+      FOutputErrorDeriv.FData[OutputCnt] := cdf + x * pdf;
+    end;
+  end
+  else
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := x * 0.5 * (1 + pcr_erff(x * INV_SQRT_2));
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGELUErf.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    FOutputError.Mul(FOutputErrorDeriv);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
 { TNNetGEGLU }
 
 constructor TNNetGEGLU.Create();
@@ -17416,6 +19003,115 @@ begin
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
+{ TNNetGptOssGatedSwiGLU }
+
+constructor TNNetGptOssGatedSwiGLU.Create();
+begin
+  Create(1.702, 7.0);
+end;
+
+constructor TNNetGptOssGatedSwiGLU.Create(pAlpha, pLimit: TNeuralFloat);
+begin
+  inherited Create();
+  FFloatSt[0] := pAlpha;
+  FFloatSt[1] := pLimit;
+end;
+
+procedure TNNetGptOssGatedSwiGLU.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (pPrevLayer.FOutput.Depth mod 2) <> 0 then
+  begin
+    FErrorProc('TNNetGptOssGatedSwiGLU requires an even input depth. ' +
+      'Input depth: ' + IntToStr(pPrevLayer.FOutput.Depth));
+  end;
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
+    pPrevLayer.FOutput.Depth div 2);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetGptOssGatedSwiGLU.Compute();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  alpha, limit, gate, up, sigmoidVal, glu: TNeuralFloat;
+begin
+  StartTime := Now();
+  alpha := FFloatSt[0];
+  limit := FFloatSt[1];
+  HalfDepth := FOutput.Depth;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := HalfDepth - 1;
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+      for D := 0 to MaxD do
+      begin
+        // Interleaved: gate = even channel 2D, up = odd channel 2D+1.
+        gate := FPrevLayer.FOutput[X, Y, 2 * D];
+        up   := FPrevLayer.FOutput[X, Y, 2 * D + 1];
+        if gate > limit then gate := limit;          // upper-clamp only
+        if up >  limit then up :=  limit;
+        if up < -limit then up := -limit;
+        sigmoidVal := 1 / (1 + pcr_expf(-alpha * gate));
+        glu := gate * sigmoidVal;
+        FOutput[X, Y, D] := (up + 1) * glu;
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGptOssGatedSwiGLU.Backpropagate();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  alpha, limit, gateRaw, upRaw, gate, up: TNeuralFloat;
+  sigmoidVal, glu, gluDeriv, err: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    alpha := FFloatSt[0];
+    limit := FFloatSt[1];
+    HalfDepth := FOutput.Depth;
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := HalfDepth - 1;
+    for X := 0 to MaxX do
+      for Y := 0 to MaxY do
+        for D := 0 to MaxD do
+        begin
+          gateRaw := FPrevLayer.FOutput[X, Y, 2 * D];
+          upRaw   := FPrevLayer.FOutput[X, Y, 2 * D + 1];
+          gate := gateRaw;
+          up   := upRaw;
+          if gate > limit then gate := limit;
+          if up >  limit then up :=  limit;
+          if up < -limit then up := -limit;
+          sigmoidVal := 1 / (1 + pcr_expf(-alpha * gate));
+          glu := gate * sigmoidVal;
+          // d glu / d gate = sigmoid + gate*alpha*sigmoid*(1-sigmoid).
+          gluDeriv := sigmoidVal +
+            gate * alpha * sigmoidVal * (1 - sigmoidVal);
+          err := FOutputError[X, Y, D];
+          // out = (up+1)*glu. Clamp regions have zero local derivative.
+          if (gateRaw <= limit) then
+            FPrevLayer.FOutputError.Add(X, Y, 2 * D,
+              err * (up + 1) * gluDeriv);
+          if (upRaw >= -limit) and (upRaw <= limit) then
+            FPrevLayer.FOutputError.Add(X, Y, 2 * D + 1, err * glu);
+        end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
 { TNNetGLU }
 
 constructor TNNetGLU.Create();
@@ -17581,6 +19277,89 @@ begin
           FPrevLayer.FOutputError.Add(X, Y, D, err * reluDeriv * b);
           // dL/db = ReLU(a) * dL/dy
           FPrevLayer.FOutputError.Add(X, Y, D + HalfDepth, err * reluA);
+        end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetReGLUSquared }
+
+constructor TNNetReGLUSquared.Create();
+begin
+  inherited Create();
+end;
+
+procedure TNNetReGLUSquared.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (pPrevLayer.FOutput.Depth mod 2) <> 0 then
+  begin
+    FErrorProc('TNNetReGLUSquared requires an even input depth. Input depth: ' +
+      IntToStr(pPrevLayer.FOutput.Depth));
+  end;
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
+    pPrevLayer.FOutput.Depth div 2);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetReGLUSquared.Compute();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  a, b, reluB: TNeuralFloat;
+begin
+  StartTime := Now();
+  HalfDepth := FOutput.Depth;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := HalfDepth - 1;
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+      for D := 0 to MaxD do
+      begin
+        a := FPrevLayer.FOutput[X, Y, D];
+        b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
+        if b > 0 then reluB := b else reluB := 0;
+        FOutput[X, Y, D] := a * reluB * reluB;
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetReGLUSquared.Backpropagate();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  a, b, reluB, err: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    HalfDepth := FOutput.Depth;
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := HalfDepth - 1;
+    for X := 0 to MaxX do
+      for Y := 0 to MaxY do
+        for D := 0 to MaxD do
+        begin
+          a := FPrevLayer.FOutput[X, Y, D];
+          b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
+          if b > 0 then reluB := b else reluB := 0;
+          err := FOutputError[X, Y, D];
+          // y = a * ReLU(b)^2
+          // dL/da = ReLU(b)^2 * dL/dy
+          FPrevLayer.FOutputError.Add(X, Y, D, err * reluB * reluB);
+          // dL/db = a * 2*ReLU(b) * dL/dy
+          FPrevLayer.FOutputError.Add(X, Y, D + HalfDepth,
+            err * a * 2.0 * reluB);
         end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
@@ -18468,6 +20247,211 @@ begin
   inherited BackpropagateNoTest();
 end;
 
+{ TNNetCTCLoss }
+
+constructor TNNetCTCLoss.Create();
+begin
+  Create(-1);
+end;
+
+constructor TNNetCTCLoss.Create(Blank: integer);
+begin
+  inherited Create();
+  // -1 is the sentinel meaning "last vocabulary index" (resolved at runtime).
+  FStruct[0] := Blank;
+end;
+
+function TNNetCTCLoss.BlankIndex(): integer;
+begin
+  Result := FStruct[0];
+  if Result < 0 then Result := FOutput.Depth - 1;
+end;
+
+class procedure TNNetCTCLoss.EncodeTarget(ATarget: TNNetVolume;
+  const Labels: array of integer; T, Vocab: integer);
+var
+  L, i: integer;
+begin
+  L := Length(Labels);
+  ATarget.ReSize(T, 1, Vocab);
+  ATarget.Fill(0);
+  // Frame 0 carries L then the labels. There must be room for L+1 entries.
+  if (L + 1) > Vocab then
+    raise Exception.Create('TNNetCTCLoss.EncodeTarget: vocab too small to hold label header.');
+  ATarget[0, 0, 0] := L;
+  for i := 0 to L - 1 do
+    ATarget[0, 0, 1 + i] := Labels[i];
+end;
+
+class procedure TNNetCTCLoss.DecodeTarget(ATarget: TNNetVolume;
+  out Labels: TNeuralIntegerArray);
+var
+  L, i: integer;
+begin
+  L := Round(ATarget[0, 0, 0]);
+  if L < 0 then L := 0;
+  SetLength(Labels, L);
+  for i := 0 to L - 1 do
+    Labels[i] := Round(ATarget[0, 0, 1 + i]);
+end;
+
+class function TNNetCTCLoss.ForwardBackwardLogLoss(ALogProbs: TNNetVolume;
+  const Labels: array of integer; Blank: integer; AGrad: TNNetVolume): TNeuralFloat;
+const
+  cCTCUnalignable = 1e30; // returned when L*2+1 > T (target cannot be aligned)
+  cNegInf = -1e30;
+var
+  NT, Vocab, L, NS, ti, si, i, k: integer;
+  Ext: array of integer;          // extended label l' (blank-interleaved), length NS
+  Alpha, Beta: array of array of double; // [ti][si] log-space lattice
+  LogLike, av, bv, occ, lse: double;
+  Gamma: array of array of double; // [ti][si] = exp(alpha+beta-LogLike)
+  function LP(tt, kk: integer): double; inline;
+  begin
+    Result := ALogProbs[tt, 0, kk];
+  end;
+  function LogAdd(x, y: double): double; inline;
+  begin
+    if x <= cNegInf then Result := y
+    else if y <= cNegInf then Result := x
+    else if x > y then Result := x + Ln(1 + Exp(y - x))
+    else Result := y + Ln(1 + Exp(x - y));
+  end;
+begin
+  NT := ALogProbs.SizeX;
+  Vocab := ALogProbs.Depth;
+  L := Length(Labels);
+  if Assigned(AGrad) then
+  begin
+    AGrad.ReSize(ALogProbs);
+    AGrad.Fill(0);
+  end;
+  // Build extended label sequence: blank l_0 blank l_1 ... l_{L-1} blank.
+  NS := 2 * L + 1;
+  if NS > NT then
+  begin
+    Result := cCTCUnalignable;
+    Exit;
+  end;
+  SetLength(Ext, NS);
+  for i := 0 to L - 1 do
+  begin
+    Ext[2 * i] := Blank;
+    Ext[2 * i + 1] := Labels[i];
+  end;
+  Ext[NS - 1] := Blank;
+
+  SetLength(Alpha, NT, NS);
+  SetLength(Beta, NT, NS);
+  for ti := 0 to NT - 1 do
+    for si := 0 to NS - 1 do
+    begin
+      Alpha[ti][si] := cNegInf;
+      Beta[ti][si] := cNegInf;
+    end;
+
+  // Forward (alpha). Init: at ti=0 only the first blank or first label.
+  Alpha[0][0] := LP(0, Ext[0]);
+  if NS > 1 then Alpha[0][1] := LP(0, Ext[1]);
+  for ti := 1 to NT - 1 do
+    for si := 0 to NS - 1 do
+    begin
+      av := Alpha[ti - 1][si];
+      if si >= 1 then av := LogAdd(av, Alpha[ti - 1][si - 1]);
+      // Skip transition allowed only between two DISTINCT non-blank labels.
+      if (si >= 2) and (Ext[si] <> Blank) and (Ext[si] <> Ext[si - 2]) then
+        av := LogAdd(av, Alpha[ti - 1][si - 2]);
+      Alpha[ti][si] := av + LP(ti, Ext[si]);
+    end;
+
+  // Backward (beta). Init: at ti=NT-1 only the last blank or last label.
+  Beta[NT - 1][NS - 1] := 0;
+  if NS > 1 then Beta[NT - 1][NS - 2] := 0;
+  for ti := NT - 2 downto 0 do
+    for si := NS - 1 downto 0 do
+    begin
+      bv := Beta[ti + 1][si] + LP(ti + 1, Ext[si]);
+      if si + 1 <= NS - 1 then
+        bv := LogAdd(bv, Beta[ti + 1][si + 1] + LP(ti + 1, Ext[si + 1]));
+      if (si + 2 <= NS - 1) and (Ext[si] <> Blank) and (Ext[si] <> Ext[si + 2]) then
+        bv := LogAdd(bv, Beta[ti + 1][si + 2] + LP(ti + 1, Ext[si + 2]));
+      Beta[ti][si] := bv;
+    end;
+
+  // Total log-likelihood = LogAdd of the two valid end states (last blank and
+  // last label) at ti=NT-1 via alpha.
+  LogLike := Alpha[NT - 1][NS - 1];
+  if NS > 1 then LogLike := LogAdd(LogLike, Alpha[NT - 1][NS - 2]);
+
+  Result := -LogLike;
+
+  if not Assigned(AGrad) then Exit;
+  if LogLike <= cNegInf then Exit; // degenerate, leave grad at zero
+
+  // Posterior occupancy gamma[ti][si] = exp(alpha+beta-LogLike); per symbol k,
+  // dL/d(logp_{ti,k}) = -sum_{si: Ext[si]=k} gamma[ti][si].
+  SetLength(Gamma, NT, NS);
+  for ti := 0 to NT - 1 do
+    for si := 0 to NS - 1 do
+    begin
+      occ := Alpha[ti][si] + Beta[ti][si] - LogLike;
+      if occ <= cNegInf then Gamma[ti][si] := 0
+      else Gamma[ti][si] := Exp(occ);
+    end;
+
+  for ti := 0 to NT - 1 do
+    for k := 0 to Vocab - 1 do
+    begin
+      lse := 0;
+      for si := 0 to NS - 1 do
+        if Ext[si] = k then lse := lse + Gamma[ti][si];
+      AGrad[ti, 0, k] := -lse;
+    end;
+end;
+
+procedure TNNetCTCLoss.Backpropagate();
+var
+  StartTime: double;
+  Labels: TNeuralIntegerArray;
+  Target, Grad: TNNetVolume;
+  Idx, SizeM1: integer;
+  LogP, Seeded: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  // Recover the target volume (target = output - seeded error), then the labels
+  // from its frame-0 header.
+  Target := TNNetVolume.Create(FOutput);
+  try
+    SizeM1 := FOutputError.Size - 1;
+    for Idx := 0 to SizeM1 do
+    begin
+      LogP := FOutput.FData[Idx];
+      Seeded := FOutputError.FData[Idx];
+      Target.FData[Idx] := LogP - Seeded;
+    end;
+    TNNetCTCLoss.DecodeTarget(Target, Labels);
+  finally
+    Target.Free;
+  end;
+
+  // Run the log-space forward-backward and write -gamma into FOutputError.
+  Grad := TNNetVolume.Create(FOutput);
+  try
+    TNNetCTCLoss.ForwardBackwardLogLoss(FOutput, Labels, BlankIndex(), Grad);
+    SizeM1 := FOutputError.Size - 1;
+    for Idx := 0 to SizeM1 do
+      FOutputError.FData[Idx] := Grad.FData[Idx];
+  finally
+    Grad.Free;
+  end;
+
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
 { TNNetKLDivergence }
 
 constructor TNNetKLDivergence.Create();
@@ -19290,6 +21274,18 @@ begin
     Result := FUsageCount[Index]
   else
     Result := 0;
+end;
+
+function TNNetVectorQuantizer.ChosenCodeIndex(X, Y: integer): integer;
+var
+  PosIdx: integer;
+begin
+  Result := 0;
+  if (X < 0) or (X > FOutput.SizeX - 1) or (Y < 0) or (Y > FOutput.SizeY - 1) then
+    Exit;
+  PosIdx := X * FOutput.SizeY + Y;
+  if (PosIdx >= 0) and (PosIdx < Length(FChosenIdx)) then
+    Result := FChosenIdx[PosIdx];
 end;
 
 { TNNetArcFace }
@@ -21384,7 +23380,8 @@ end;
 { TNNetScaledDotProductAttention }
 
 constructor TNNetScaledDotProductAttention.Create(d_k: integer; CausalMask: boolean;
-  pWindow: integer; pScoreSoftCap: TNeuralFloat; pBidirectionalWindow: boolean);
+  pWindow: integer; pScoreSoftCap: TNeuralFloat; pBidirectionalWindow: boolean;
+  pSegmentSource: TNNetLayer);
 begin
   inherited Create();
   FDk := d_k;
@@ -21392,6 +23389,7 @@ begin
   FWindow := pWindow;
   FBidirectionalWindow := pBidirectionalWindow;
   FScoreSoftCap := pScoreSoftCap;
+  FSegLayer := pSegmentSource;
   if FDk < 1 then
     FErrorProc('TNNetScaledDotProductAttention requires d_k >= 1. d_k=' + IntToStr(FDk));
   if FWindow < 0 then
@@ -21415,14 +23413,36 @@ begin
   if FBidirectionalWindow then FStruct[3] := 1 else FStruct[3] := 0;
   FFloatSt[0] := FScoreSoftCap;
   FAttn := TNNetVolume.Create();
+  if Assigned(FSegLayer) then
+  begin
+    // Optional second source carrying per-token document/segment ids. It is a
+    // read-only side channel (discrete ids, no gradient) but it IS a graph
+    // branch, so register a departing branch on it for backprop
+    // reference-counting balance (same convention as TNNetCrossAttention).
+    FSegLayer.IncDepartingBranchesCnt();
+  end;
 end;
 
 destructor TNNetScaledDotProductAttention.Destroy();
 begin
   FKCache.Free;
   FVCache.Free;
+  FKDeqRow.Free;
+  FVDeqRow.Free;
   FAttn.Free;
   inherited Destroy();
+end;
+
+function TNNetScaledDotProductAttention.SaveStructureToString(): string;
+begin
+  if Assigned(FSegLayer) then
+    // Inject the segment-id source layer index into the (otherwise empty)
+    // third ':'-delimited slot, exactly as TNNetCrossAttention does, so
+    // CreateLayer / LoadFromString can reconnect the second source.
+    Result := StringReplace(inherited SaveStructureToString,
+      '::', ':' + IntToStr(FSegLayer.FLayerIdx) + ':', [rfReplaceAll])
+  else
+    Result := inherited SaveStructureToString;
 end;
 
 procedure TNNetScaledDotProductAttention.BeginIncrementalDecode(MaxContext: integer);
@@ -21452,12 +23472,27 @@ begin
   FCacheMax := MaxContext;
   FCacheLen := 0;
   FCacheEnabled := true;
+  // Eviction is opt-in and starts OFF (unbounded cache); EnableEviction turns
+  // it on after this.
+  FEvictSinks := 0;
+  FEvictWindow := 0;
+  // int8 KV quantization is opt-in and starts OFF (bit-exact FP32 cache);
+  // EnableInt8KV turns it on after this. The dequant scratch rows are sized
+  // once here so the int8 read path never allocates.
+  FKVQuantInt8 := false;
+  if not Assigned(FKDeqRow) then FKDeqRow := TNNetVolume.Create();
+  if not Assigned(FVDeqRow) then FVDeqRow := TNNetVolume.Create();
+  FKDeqRow.ReSize(1, 1, FDk);
+  FVDeqRow.ReSize(1, 1, FDk);
 end;
 
 procedure TNNetScaledDotProductAttention.EndIncrementalDecode();
 begin
   FCacheEnabled := false;
   FCacheLen := 0;
+  FEvictSinks := 0;
+  FEvictWindow := 0;
+  FKVQuantInt8 := false;
 end;
 
 procedure TNNetScaledDotProductAttention.ResetCache();
@@ -21485,6 +23520,184 @@ begin
   FCacheLen := NewLength;
 end;
 
+procedure TNNetScaledDotProductAttention.EnableEviction(SinkTokens, RecentWindow: integer);
+begin
+  if not FCacheEnabled then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.EnableEviction requires the ' +
+      'cached path. Call BeginIncrementalDecode first.');
+    exit;
+  end;
+  if SinkTokens <= 0 then
+  begin
+    // S <= 0 means "no eviction": revert to the unbounded cache.
+    DisableEviction();
+    exit;
+  end;
+  if RecentWindow < 1 then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.EnableEviction requires ' +
+      'RecentWindow >= 1. Got ' + IntToStr(RecentWindow));
+    exit;
+  end;
+  if SinkTokens + RecentWindow > FCacheMax then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.EnableEviction: SinkTokens (' +
+      IntToStr(SinkTokens) + ') + RecentWindow (' + IntToStr(RecentWindow) +
+      ') = ' + IntToStr(SinkTokens + RecentWindow) + ' must be <= MaxContext (' +
+      IntToStr(FCacheMax) + ').');
+    exit;
+  end;
+  if FWindow > 0 then
+  begin
+    // The sliding-window mask and the eviction window both bound the attended
+    // span; honoring both at once is ambiguous, so it is rejected.
+    FErrorProc('TNNetScaledDotProductAttention.EnableEviction is incompatible ' +
+      'with the sliding-window attention mask (Window > 0). Use one or the ' +
+      'other.');
+    exit;
+  end;
+  FEvictSinks := SinkTokens;
+  FEvictWindow := RecentWindow;
+end;
+
+procedure TNNetScaledDotProductAttention.DisableEviction();
+begin
+  FEvictSinks := 0;
+  FEvictWindow := 0;
+end;
+
+procedure TNNetScaledDotProductAttention.EnableInt8KV();
+begin
+  if not FCacheEnabled then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.EnableInt8KV requires the ' +
+      'cached path. Call BeginIncrementalDecode first.');
+    exit;
+  end;
+  if FCacheLen <> 0 then
+  begin
+    // Switching storage mode mid-sequence would silently drop the FP32 rows
+    // already appended; require an empty cache (call right after Begin/Reset).
+    FErrorProc('TNNetScaledDotProductAttention.EnableInt8KV requires an EMPTY ' +
+      'cache (length 0). Call it right after BeginIncrementalDecode/ResetCache. ' +
+      'CacheLength=' + IntToStr(FCacheLen));
+    exit;
+  end;
+  // Allocate the int8 code + per-row scale arrays once (MaxContext rows).
+  SetLength(FKCacheCodes, FCacheMax * FDk);
+  SetLength(FVCacheCodes, FCacheMax * FDk);
+  SetLength(FKCacheScale, FCacheMax);
+  SetLength(FVCacheScale, FCacheMax);
+  FKVQuantInt8 := true;
+end;
+
+procedure TNNetScaledDotProductAttention.DisableInt8KV();
+begin
+  if FCacheLen <> 0 then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.DisableInt8KV requires an EMPTY ' +
+      'cache (length 0). CacheLength=' + IntToStr(FCacheLen));
+    exit;
+  end;
+  FKVQuantInt8 := false;
+end;
+
+// Quantize the d_k-element row Src into int8 cache row Slot, with a per-row
+// scale (mirrors the int8 WEIGHT path QuantizeWeightsInt8): scale = maxabs/127
+// (or 1 if the row is all zero), code = round(value/scale) clamped to
+// [-127,127]. maxabs is computed inline because TVolume.GetMaxAbs seeds its
+// running max with the SIGNED first element (the documented GetMaxAbs bug) and
+// would miss a negative max-magnitude element 0.
+procedure TNNetScaledDotProductAttention.QuantizeCacheRow(Src: TNeuralFloatArrPtr;
+  var Codes: array of ShortInt; var Scale: array of TNeuralFloat; Slot: integer);
+var
+  d, RowBase, Code: integer;
+  MaxAbs, RowScale, InvScale: TNeuralFloat;
+begin
+  MaxAbs := 0;
+  for d := 0 to FDk - 1 do
+    if Abs(Src^[d]) > MaxAbs then MaxAbs := Abs(Src^[d]);
+  if MaxAbs > 0
+    then RowScale := MaxAbs / 127
+    else RowScale := 1;
+  Scale[Slot] := RowScale;
+  InvScale := 1 / RowScale;
+  RowBase := Slot * FDk;
+  for d := 0 to FDk - 1 do
+  begin
+    Code := Round(Src^[d] * InvScale);
+    if Code > 127 then Code := 127;
+    if Code < -127 then Code := -127;
+    Codes[RowBase + d] := Code;
+  end;
+end;
+
+// Dequantize int8 cache row Slot into Dst[0..d_k-1]: Dst[d] = code * scale.
+procedure TNNetScaledDotProductAttention.DequantizeCacheRow(
+  const Codes: array of ShortInt; const Scale: array of TNeuralFloat;
+  Slot: integer; Dst: TNeuralFloatArrPtr);
+var
+  d, RowBase: integer;
+  RowScale: TNeuralFloat;
+begin
+  RowBase := Slot * FDk;
+  RowScale := Scale[Slot];
+  for d := 0 to FDk - 1 do
+    Dst^[d] := Codes[RowBase + d] * RowScale;
+end;
+
+procedure TNNetScaledDotProductAttention.CaptureCacheState(DstK, DstV: TNNetVolume;
+  out Len, Sinks, Window: integer);
+begin
+  if not FCacheEnabled then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.CaptureCacheState requires the ' +
+      'cached path. Call BeginIncrementalDecode first.');
+    exit;
+  end;
+  if FKVQuantInt8 then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.CaptureCacheState does not ' +
+      'support the int8 KV cache (snapshot is FP32 only).');
+    exit;
+  end;
+  DstK.Copy(FKCache);
+  DstV.Copy(FVCache);
+  Len := FCacheLen;
+  Sinks := FEvictSinks;
+  Window := FEvictWindow;
+end;
+
+procedure TNNetScaledDotProductAttention.RestoreCacheState(SrcK, SrcV: TNNetVolume;
+  Len, Sinks, Window: integer);
+begin
+  if not FCacheEnabled then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.RestoreCacheState requires the ' +
+      'cached path. Call BeginIncrementalDecode first.');
+    exit;
+  end;
+  if FKVQuantInt8 then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.RestoreCacheState does not ' +
+      'support the int8 KV cache (snapshot is FP32 only).');
+    exit;
+  end;
+  if (Len < 0) or (Len > FCacheMax) then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.RestoreCacheState: snapshot ' +
+      'length ' + IntToStr(Len) + ' exceeds this session''s MaxContext (' +
+      IntToStr(FCacheMax) + ').');
+    exit;
+  end;
+  FKCache.Copy(SrcK);
+  FVCache.Copy(SrcV);
+  FCacheLen := Len;
+  FEvictSinks := Sinks;
+  FEvictWindow := Window;
+end;
+
 // Inference-only cached forward. Appends each input token's K and V slice to
 // the persistent cache and attends its query over ALL cached positions
 // [0..t]. Works for a one-token decode step (the headline O(1)-per-step use)
@@ -21501,7 +23714,14 @@ begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
-  if FCacheLen + SeqLen > FCacheMax then
+  // Eviction OFF: the cache must hold the whole prefix, so overflowing the
+  // preallocation is a hard error (unchanged unbounded behavior). Eviction ON:
+  // the cap is FEvictSinks + FEvictWindow and the middle is dropped per token,
+  // so the cache never exceeds the cap and there is nothing to overflow (the
+  // append below uses one transient extra slot, always < MaxContext since the
+  // cap itself is <= MaxContext - 1 is NOT required because we evict BEFORE
+  // appending the next token).
+  if (FEvictSinks = 0) and (FCacheLen + SeqLen > FCacheMax) then
   begin
     FErrorProc('TNNetScaledDotProductAttention KV cache overflow: ' +
       IntToStr(FCacheLen) + ' cached + ' + IntToStr(SeqLen) + ' new > MaxContext=' +
@@ -21510,12 +23730,55 @@ begin
   end;
   for p := 0 to SeqLen - 1 do
   begin
+    // StreamingLLM eviction (opt-in). Before appending token p, if the cache is
+    // already at its cap (sinks + window), drop the OLDEST window key to make
+    // room: shift slots [FEvictSinks+1 .. FCacheLen-1] left by one over slot
+    // FEvictSinks. The first FEvictSinks (sink) slots are never touched. After
+    // this the live length is cap-1, the append below brings it back to cap, so
+    // CacheLength is pinned at sinks + window forever. Retained keys keep their
+    // original post-RoPE rotation (see EnableEviction's RoPE note).
+    if (FEvictSinks > 0) and (FCacheLen >= FEvictSinks + FEvictWindow) then
+    begin
+      for j := FEvictSinks to FCacheLen - 2 do
+      begin
+        if FKVQuantInt8 then
+        begin
+          // int8 storage: shift the codes + per-row scales instead of FP32.
+          Move(FKCacheCodes[(j + 1) * FDk], FKCacheCodes[j * FDk],
+            FDk * SizeOf(ShortInt));
+          Move(FVCacheCodes[(j + 1) * FDk], FVCacheCodes[j * FDk],
+            FDk * SizeOf(ShortInt));
+          FKCacheScale[j] := FKCacheScale[j + 1];
+          FVCacheScale[j] := FVCacheScale[j + 1];
+        end
+        else
+        begin
+          Move(FKCache.GetRawPtr(j + 1, 0, 0)^, FKCache.GetRawPtr(j, 0, 0)^,
+            FDk * SizeOf(TNeuralFloat));
+          Move(FVCache.GetRawPtr(j + 1, 0, 0)^, FVCache.GetRawPtr(j, 0, 0)^,
+            FDk * SizeOf(TNeuralFloat));
+        end;
+      end;
+      Dec(FCacheLen);
+    end;
     // Append this token's K and V to the cache; its global position is the
-    // running cache length. Depth is contiguous, so each slice is one Move.
-    Move(Prev.GetRawPtr(p, 0, FDk)^, FKCache.GetRawPtr(FCacheLen, 0, 0)^,
-      FDk * SizeOf(TNeuralFloat));
-    Move(Prev.GetRawPtr(p, 0, 2 * FDk)^, FVCache.GetRawPtr(FCacheLen, 0, 0)^,
-      FDk * SizeOf(TNeuralFloat));
+    // running cache length. With int8 KV on, quantize the slice to int8 codes +
+    // a per-row scale (no FP32 row retained); otherwise copy the FP32 slice
+    // (depth is contiguous, so each slice is one Move).
+    if FKVQuantInt8 then
+    begin
+      QuantizeCacheRow(Prev.GetRawPtr(p, 0, FDk),
+        FKCacheCodes, FKCacheScale, FCacheLen);
+      QuantizeCacheRow(Prev.GetRawPtr(p, 0, 2 * FDk),
+        FVCacheCodes, FVCacheScale, FCacheLen);
+    end
+    else
+    begin
+      Move(Prev.GetRawPtr(p, 0, FDk)^, FKCache.GetRawPtr(FCacheLen, 0, 0)^,
+        FDk * SizeOf(TNeuralFloat));
+      Move(Prev.GetRawPtr(p, 0, 2 * FDk)^, FVCache.GetRawPtr(FCacheLen, 0, 0)^,
+        FDk * SizeOf(TNeuralFloat));
+    end;
     Inc(FCacheLen);
     // Scaled scores of this query against every cached key [jStart..FCacheLen-1].
     // Full attention starts at 0; a sliding window (FWindow > 0) attends only
@@ -21528,6 +23791,14 @@ begin
     MaxScore := -1e30;
     for j := jStart to FCacheLen - 1 do
     begin
+      // With int8 KV on, dequantize the cached key row into scratch first.
+      if FKVQuantInt8 then
+      begin
+        DequantizeCacheRow(FKCacheCodes, FKCacheScale, j, FKDeqRow.GetRawPtr(0, 0, 0));
+        Score := TNNetVolume.DotProduct(
+          Prev.GetRawPtr(p, 0, 0), FKDeqRow.GetRawPtr(0, 0, 0), FDk) * FInvSqrtDk;
+      end
+      else
       Score := TNNetVolume.DotProduct(
         Prev.GetRawPtr(p, 0, 0), FKCache.GetRawPtr(j, 0, 0), FDk) * FInvSqrtDk;
       // Same attention-logit soft-cap as the full forward (opt-in).
@@ -21551,6 +23822,14 @@ begin
       OutPtr^[d] := 0;
     if SumExp > 0 then
       for j := jStart to FCacheLen - 1 do
+        if FKVQuantInt8 then
+        begin
+          // int8 KV: dequantize the cached value row before accumulating.
+          DequantizeCacheRow(FVCacheCodes, FVCacheScale, j, FVDeqRow.GetRawPtr(0, 0, 0));
+          TNNetVolume.MulAdd(OutPtr, FVDeqRow.GetRawPtr(0, 0, 0),
+            FCacheScores[j] / SumExp, FDk);
+        end
+        else
         TNNetVolume.MulAdd(OutPtr, FVCache.GetRawPtr(j, 0, 0),
           FCacheScores[j] / SumExp, FDk);
   end;
@@ -21571,6 +23850,22 @@ begin
   FOutputErrorDeriv.ReSize(FOutput);
   // Attention weights: rows = queries (i), cols = keys (j). Use X=key, Y=query.
   FAttn.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeX, 1);
+  if Assigned(FSegLayer) then
+  begin
+    if FSegLayer.FOutput.SizeY <> 1 then
+      FErrorProc('TNNetScaledDotProductAttention segment-id source requires ' +
+        'SizeY=1. SizeY=' + IntToStr(FSegLayer.FOutput.SizeY));
+    if FSegLayer.FOutput.Depth <> 1 then
+      FErrorProc('TNNetScaledDotProductAttention segment-id source requires ' +
+        'Depth=1. Depth=' + IntToStr(FSegLayer.FOutput.Depth));
+    if FSegLayer.FOutput.SizeX <> pPrevLayer.FOutput.SizeX then
+      FErrorProc('TNNetScaledDotProductAttention segment-id source SeqLen (' +
+        IntToStr(FSegLayer.FOutput.SizeX) + ') must match the query SeqLen (' +
+        IntToStr(pPrevLayer.FOutput.SizeX) + ').');
+    if FCacheEnabled then
+      FErrorProc('TNNetScaledDotProductAttention: segment masking is not ' +
+        'supported on the KV-cache incremental-decode path.');
+  end;
 end;
 
 procedure TNNetScaledDotProductAttention.Compute();
@@ -21584,8 +23879,10 @@ var
   StartTime: double;
   SeqLen, i, j, d: integer;
   Score, MaxScore, SumExp: TNeuralFloat;
-  Prev: TNNetVolume;
+  Prev, Seg: TNNetVolume;
   OutPtr: TNeuralFloatArrPtr;
+  SegI: integer;
+  HasSeg: boolean;
 begin
   if FCacheEnabled then
   begin
@@ -21595,23 +23892,32 @@ begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
+  HasSeg := Assigned(FSegLayer);
+  Seg := nil;
+  SegI := 0;
+  if HasSeg then Seg := FSegLayer.FOutput;
   // For each query row i: compute scores, softmax, then weighted sum of V.
   for i := 0 to SeqLen - 1 do
   begin
     // 1) Scaled scores into FAttn[*, i, 0]. The depth axis is contiguous, so
     //    score = Q[i] . K[j] is an AVX dot product over FDk floats:
     //    Q at GetRawPtr(i,0,0), K at GetRawPtr(j,0,FDk).
+    if HasSeg then SegI := Round(Seg[i, 0, 0]);
     MaxScore := -1e30;
     for j := 0 to SeqLen - 1 do
     begin
       if (FCausal and (j > i)) or
          ((FWindow > 0) and ((i - j >= FWindow) or
-          (FBidirectionalWindow and (j - i >= FWindow)))) then
+          (FBidirectionalWindow and (j - i >= FWindow)))) or
+         (HasSeg and (Round(Seg[j, 0, 0]) <> SegI)) then
       begin
         // Masked: strict future (causal), a key beyond the sliding window
-        // (more than Window-1 positions in the past), or - bidirectional
-        // window only - more than Window-1 positions in the FUTURE (the
-        // symmetric encoder band). Same -1e9 sentinel.
+        // (more than Window-1 positions in the past), - bidirectional window
+        // only - more than Window-1 positions in the FUTURE (the symmetric
+        // encoder band), OR (per-sample segment mask) a key that belongs to a
+        // DIFFERENT document than this query (seg[j] <> seg[i]). The three
+        // masks INTERSECT: a key is attendable only if every active mask
+        // permits it. Same -1e9 sentinel.
         FAttn[j, i, 0] := -1e9;
       end
       else
@@ -21748,6 +24054,13 @@ begin
     end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
+  // The per-sample segment-id mask only forces FAttn rows to 0 (the softmax
+  // Jacobian backward above is mask-agnostic), so no gradient math changes.
+  // The segment ids are discrete labels and receive NO gradient, but the
+  // source is still a graph branch: call its Backpropagate to keep the
+  // backprop reference-counting balanced (same convention as
+  // TNNetCrossAttention's K|V source).
+  if Assigned(FSegLayer) then FSegLayer.Backpropagate();
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
@@ -22938,6 +25251,123 @@ begin
   AfterWeightUpdate();
 end;
 
+{ TNNetSoftPrompt }
+
+constructor TNNetSoftPrompt.Create(NumVirtualTokens, d: integer);
+begin
+  inherited Create();
+  FNumVirtual := NumVirtualTokens;
+  FDim := d;
+  if FNumVirtual < 1 then
+    FErrorProc('TNNetSoftPrompt requires NumVirtualTokens >= 1. Got ' +
+      IntToStr(FNumVirtual));
+  if FDim < 1 then
+    FErrorProc('TNNetSoftPrompt requires d >= 1. Got ' + IntToStr(FDim));
+  FStruct[0] := FNumVirtual;
+  FStruct[1] := FDim;
+  AddMissingNeurons(1);
+end;
+
+procedure TNNetSoftPrompt.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  SeqLen: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetSoftPrompt requires SizeY=1. SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  if pPrevLayer.FOutput.Depth <> FDim then
+    FErrorProc('TNNetSoftPrompt requires input depth = d. Got depth=' +
+      IntToStr(pPrevLayer.FOutput.Depth) + ', d=' + IntToStr(FDim));
+  SeqLen := pPrevLayer.FOutput.SizeX;
+  // Output prepends K virtual tokens: (K+SeqLen, 1, d).
+  FOutput.ReSize(FNumVirtual + SeqLen, 1, FDim);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  // Soft-prompt bank P: (K, 1, d) -- each virtual-token d-vector is
+  // depth-contiguous, exactly like an embedding row.
+  FNeurons[0].FWeights.ReSize(FNumVirtual, 1, FDim);
+  FNeurons[0].FDelta.ReSize(FNeurons[0].FWeights);
+  FNeurons[0].FBackInertia.ReSize(FNeurons[0].FWeights);
+  InitDefault();
+end;
+
+procedure TNNetSoftPrompt.Compute();
+var
+  StartTime: double;
+  X, P: TNNetVolume;
+  SeqLen, ni: integer;
+begin
+  StartTime := Now();
+  X := FPrevLayer.FOutput;
+  P := FNeurons[0].FWeights;
+  SeqLen := X.SizeX;
+  // Rows 0..K-1: the learnable virtual tokens.
+  for ni := 0 to FNumVirtual - 1 do
+    Move(P.GetRawPtr(ni, 0, 0)^, FOutput.GetRawPtr(ni, 0, 0)^,
+      FDim * SizeOf(TNeuralFloat));
+  // Rows K..K+SeqLen-1: the real token embeddings, forwarded verbatim.
+  for ni := 0 to SeqLen - 1 do
+    Move(X.GetRawPtr(ni, 0, 0)^, FOutput.GetRawPtr(FNumVirtual + ni, 0, 0)^,
+      FDim * SizeOf(TNeuralFloat));
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSoftPrompt.Backpropagate();
+var
+  StartTime: double;
+  X, P, Xerr: TNNetVolume;
+  SeqLen, ni: integer;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  X := FPrevLayer.FOutput;
+  P := FNeurons[0].FWeights;
+  SeqLen := X.SizeX;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
+  Xerr := nil;
+  if hasInputGrad then Xerr := FPrevLayer.FOutputError;
+  // Virtual-token rows -> soft-prompt delta (-LearningRate scaled, like the
+  // other learnable-bank layers).
+  for ni := 0 to FNumVirtual - 1 do
+    TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(ni, 0, 0),
+      FOutputError.GetRawPtr(ni, 0, 0), -FLearningRate, FDim);
+  // Real-token rows -> straight-through into the previous layer.
+  if hasInputGrad then
+    for ni := 0 to SeqLen - 1 do
+      TNNetVolume.Add(Xerr.GetRawPtr(ni, 0, 0),
+        FOutputError.GetRawPtr(FNumVirtual + ni, 0, 0), FDim);
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetSoftPrompt.InitDefault();
+var
+  q, d, oldSeed: integer;
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  // Small Gaussian init (Lester et al. init the soft prompt from a random
+  // normal); a fixed seed keeps the eval forward deterministic across builds.
+  oldSeed := RandSeed;
+  RandSeed := 271828;
+  for q := 0 to FNumVirtual - 1 do
+    for d := 0 to FDim - 1 do
+      FNeurons[0].FWeights[q, 0, d] :=
+        FNeurons[0].FWeights.RandomGaussianValue() * 0.1;
+  RandSeed := oldSeed;
+  AfterWeightUpdate();
+end;
+
 { TNNetRetention }
 
 constructor TNNetRetention.Create(d_k: integer; pGamma: TNeuralFloat;
@@ -23503,6 +25933,537 @@ begin
      (FThetaLayer.OutputError.Size = FThetaLayer.Output.Size) then
     FThetaLayer.Backpropagate();
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetFlowWarp }
+
+constructor TNNetFlowWarp.Create(FlowSource: TNNetLayer);
+begin
+  inherited Create();
+  if FlowSource = nil then
+    FErrorProc('TNNetFlowWarp requires a non-nil FlowSource.');
+  FFlowLayer := FlowSource;
+  if FFlowLayer is TNNetInput then TNNetInput(FFlowLayer).EnableErrorCollection;
+  // Two-source layer: register the extra departing branch on the flow source
+  // (the image branch is incremented the usual way by AddLayer/AddLayerAfter).
+  FFlowLayer.IncDepartingBranchesCnt();
+end;
+
+destructor TNNetFlowWarp.Destroy();
+begin
+  inherited Destroy();
+end;
+
+function TNNetFlowWarp.SaveStructureToString(): string;
+begin
+  // Inject the flow source layer index into the (otherwise empty) third
+  // ':'-delimited slot, exactly as TNNetAffineGridSample / TNNetConcatBase do,
+  // so CreateLayer / LoadFromString can reconnect the second source.
+  Result := StringReplace(inherited SaveStructureToString,
+    '::', ':' + IntToStr(FFlowLayer.FLayerIdx) + ':', [rfReplaceAll]);
+end;
+
+procedure TNNetFlowWarp.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (FFlowLayer.FOutput.Depth <> 2) then
+    FErrorProc('TNNetFlowWarp requires a flow source of Depth=2 (dx, dy). Got '
+      + 'Depth=' + IntToStr(FFlowLayer.FOutput.Depth));
+  if (FFlowLayer.FOutput.SizeX <> pPrevLayer.FOutput.SizeX) or
+     (FFlowLayer.FOutput.SizeY <> pPrevLayer.FOutput.SizeY) then
+    FErrorProc('TNNetFlowWarp requires the flow field to match the feature map '
+      + 'spatial size. Features=' + IntToStr(pPrevLayer.FOutput.SizeX) + 'x'
+      + IntToStr(pPrevLayer.FOutput.SizeY) + ', Flow='
+      + IntToStr(FFlowLayer.FOutput.SizeX) + 'x'
+      + IntToStr(FFlowLayer.FOutput.SizeY));
+  FOutput.ReSize(pPrevLayer.FOutput);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetFlowWarp.Compute();
+var
+  StartTime: double;
+  W, H, D, ox, oy, dd: integer;
+  x0, y0, x1, y1: integer;
+  Flow, Src: TNNetVolume;
+  sx, sy, fx, fy, w00, w01, w10, w11, acc: TNeuralFloat;
+begin
+  StartTime := Now();
+  Src := FPrevLayer.FOutput;
+  Flow := FFlowLayer.FOutput;
+  W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
+  for oy := 0 to H - 1 do
+  for ox := 0 to W - 1 do
+  begin
+    // Backward warp: out(x,y) = in(x+dx, y+dy).
+    sx := ox + Flow.Get(ox, oy, 0);
+    sy := oy + Flow.Get(ox, oy, 1);
+    x0 := Floor(sx); y0 := Floor(sy);
+    x1 := x0 + 1;    y1 := y0 + 1;
+    fx := sx - x0;   fy := sy - y0;
+    w00 := (1 - fx) * (1 - fy);
+    w10 := fx * (1 - fy);
+    w01 := (1 - fx) * fy;
+    w11 := fx * fy;
+    // Border-clamp: replicate edge pixels (clamp each neighbour index to range).
+    if x0 < 0 then x0 := 0 else if x0 > W - 1 then x0 := W - 1;
+    if x1 < 0 then x1 := 0 else if x1 > W - 1 then x1 := W - 1;
+    if y0 < 0 then y0 := 0 else if y0 > H - 1 then y0 := H - 1;
+    if y1 < 0 then y1 := 0 else if y1 > H - 1 then y1 := H - 1;
+    for dd := 0 to D - 1 do
+    begin
+      acc := w00 * Src.Get(x0, y0, dd)
+           + w10 * Src.Get(x1, y0, dd)
+           + w01 * Src.Get(x0, y1, dd)
+           + w11 * Src.Get(x1, y1, dd);
+      FOutput.Store(ox, oy, dd, acc);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetFlowWarp.Backpropagate();
+var
+  StartTime: double;
+  W, H, D, ox, oy, dd: integer;
+  x0, y0, x1, y1: integer;
+  Flow, FlowErr, Src, SrcErr: TNNetVolume;
+  sx, sy, fx, fy, w00, w01, w10, w11: TNeuralFloat;
+  gOut, dSdx, dSdy, dLdx, dLdy: TNeuralFloat;
+  v00, v01, v10, v11: TNeuralFloat;
+  HasSrcErr, HasFlowErr: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Src := FPrevLayer.FOutput;
+  SrcErr := FPrevLayer.FOutputError;
+  Flow := FFlowLayer.FOutput;
+  FlowErr := FFlowLayer.FOutputError;
+  W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
+  HasSrcErr := (SrcErr.Size = Src.Size);
+  HasFlowErr := (FlowErr.Size = Flow.Size);
+  for oy := 0 to H - 1 do
+  for ox := 0 to W - 1 do
+  begin
+    sx := ox + Flow.Get(ox, oy, 0);
+    sy := oy + Flow.Get(ox, oy, 1);
+    x0 := Floor(sx); y0 := Floor(sy);
+    x1 := x0 + 1;    y1 := y0 + 1;
+    fx := sx - x0;   fy := sy - y0;
+    w00 := (1 - fx) * (1 - fy);
+    w10 := fx * (1 - fy);
+    w01 := (1 - fx) * fy;
+    w11 := fx * fy;
+    // Border-clamp the four neighbour indices, exactly as in Compute(). On the
+    // axes where a neighbour saturates the clamp is locally constant, so the
+    // flow gradient on that axis correctly drops out (d(clamped)/d(flow)=0).
+    if x0 < 0 then x0 := 0 else if x0 > W - 1 then x0 := W - 1;
+    if x1 < 0 then x1 := 0 else if x1 > W - 1 then x1 := W - 1;
+    if y0 < 0 then y0 := 0 else if y0 > H - 1 then y0 := H - 1;
+    if y1 < 0 then y1 := 0 else if y1 > H - 1 then y1 := H - 1;
+    dLdx := 0; dLdy := 0;
+    for dd := 0 to D - 1 do
+    begin
+      gOut := FOutputError.Get(ox, oy, dd);
+      if gOut = 0 then continue;
+      // (a) dL/d(features): scatter the output gradient to the 4 (clamped)
+      //     source neighbours by the bilinear weights.
+      if HasSrcErr then
+      begin
+        SrcErr.Add(x0, y0, dd, w00 * gOut);
+        SrcErr.Add(x1, y0, dd, w10 * gOut);
+        SrcErr.Add(x0, y1, dd, w01 * gOut);
+        SrcErr.Add(x1, y1, dd, w11 * gOut);
+      end;
+      // (b) dL/d(flow): bilinear sampler partials. Reuses the clamped neighbour
+      //     values so the math matches the forward gather exactly.
+      v00 := Src.Get(x0, y0, dd);
+      v10 := Src.Get(x1, y0, dd);
+      v01 := Src.Get(x0, y1, dd);
+      v11 := Src.Get(x1, y1, dd);
+      dSdx := (1 - fy) * (v10 - v00) + fy * (v11 - v01);
+      dSdy := (1 - fx) * (v01 - v00) + fx * (v11 - v10);
+      // sx = ox + dx, sy = oy + dy  =>  d(sx)/d(dx) = d(sy)/d(dy) = 1.
+      dLdx := dLdx + gOut * dSdx;
+      dLdy := dLdy + gOut * dSdy;
+    end;
+    if HasFlowErr then
+    begin
+      FlowErr.Add(ox, oy, 0, dLdx);
+      FlowErr.Add(ox, oy, 1, dLdy);
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  // Propagate into BOTH sources (flow branch then the image chain).
+  if Assigned(FFlowLayer) and
+     (FFlowLayer.OutputError.Size = FFlowLayer.Output.Size) then
+    FFlowLayer.Backpropagate();
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetCorrelationVolume }
+
+constructor TNNetCorrelationVolume.Create(F2Source: TNNetLayer);
+begin
+  inherited Create();
+  if F2Source = nil then
+    FErrorProc('TNNetCorrelationVolume requires a non-nil F2Source.');
+  FF2Layer := F2Source;
+  if FF2Layer is TNNetInput then TNNetInput(FF2Layer).EnableErrorCollection;
+  FF2Layer.IncDepartingBranchesCnt();
+end;
+
+destructor TNNetCorrelationVolume.Destroy();
+begin
+  inherited Destroy();
+end;
+
+function TNNetCorrelationVolume.SaveStructureToString(): string;
+begin
+  Result := StringReplace(inherited SaveStructureToString,
+    '::', ':' + IntToStr(FF2Layer.FLayerIdx) + ':', [rfReplaceAll]);
+end;
+
+procedure TNNetCorrelationVolume.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (FF2Layer.FOutput.SizeX <> pPrevLayer.FOutput.SizeX) or
+     (FF2Layer.FOutput.SizeY <> pPrevLayer.FOutput.SizeY) or
+     (FF2Layer.FOutput.Depth <> pPrevLayer.FOutput.Depth) then
+    FErrorProc('TNNetCorrelationVolume requires f1 and f2 to share shape. f1='
+      + IntToStr(pPrevLayer.FOutput.SizeX) + 'x'
+      + IntToStr(pPrevLayer.FOutput.SizeY) + 'x'
+      + IntToStr(pPrevLayer.FOutput.Depth) + ', f2='
+      + IntToStr(FF2Layer.FOutput.SizeX) + 'x'
+      + IntToStr(FF2Layer.FOutput.SizeY) + 'x'
+      + IntToStr(FF2Layer.FOutput.Depth));
+  // Output depth = H*W (one correlation per target pixel), channel = jy*W + jx.
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
+    pPrevLayer.FOutput.SizeX * pPrevLayer.FOutput.SizeY);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetCorrelationVolume.Compute();
+var
+  StartTime: double;
+  W, H, C, ix, iy, jx, jy, dd, ch: integer;
+  f1, f2: TNNetVolume;
+  acc, invSqrtC: TNeuralFloat;
+begin
+  StartTime := Now();
+  f1 := FPrevLayer.FOutput;
+  f2 := FF2Layer.FOutput;
+  W := f1.SizeX; H := f1.SizeY; C := f1.Depth;
+  if C > 0 then invSqrtC := 1.0 / Sqrt(C) else invSqrtC := 1.0;
+  for iy := 0 to H - 1 do
+  for ix := 0 to W - 1 do
+    for jy := 0 to H - 1 do
+    for jx := 0 to W - 1 do
+    begin
+      acc := 0;
+      for dd := 0 to C - 1 do
+        acc := acc + f1.Get(ix, iy, dd) * f2.Get(jx, jy, dd);
+      ch := jy * W + jx;
+      FOutput.Store(ix, iy, ch, acc * invSqrtC);
+    end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetCorrelationVolume.Backpropagate();
+begin
+  // v1 is inference-only (RAFT forward). The all-pairs volume is consumed by
+  // the iterative update operator; no training path is wired.
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetCorrelationLookup }
+
+constructor TNNetCorrelationLookup.Create(pRadius: integer;
+  FlowSource: TNNetLayer);
+begin
+  inherited Create();
+  if pRadius < 0 then
+    FErrorProc('TNNetCorrelationLookup requires Radius >= 0.');
+  if FlowSource = nil then
+    FErrorProc('TNNetCorrelationLookup requires a non-nil FlowSource.');
+  FRadius := pRadius;
+  FStruct[0] := pRadius;
+  FFlowLayer := FlowSource;
+  if FFlowLayer is TNNetInput then TNNetInput(FFlowLayer).EnableErrorCollection;
+  FFlowLayer.IncDepartingBranchesCnt();
+end;
+
+destructor TNNetCorrelationLookup.Destroy();
+begin
+  inherited Destroy();
+end;
+
+function TNNetCorrelationLookup.SaveStructureToString(): string;
+begin
+  Result := StringReplace(inherited SaveStructureToString,
+    '::', ':' + IntToStr(FFlowLayer.FLayerIdx) + ':', [rfReplaceAll]);
+end;
+
+procedure TNNetCorrelationLookup.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FW := pPrevLayer.FOutput.SizeX;
+  FH := pPrevLayer.FOutput.SizeY;
+  if pPrevLayer.FOutput.Depth <> FW * FH then
+    FErrorProc('TNNetCorrelationLookup expects a (W,H,H*W) volume. Got depth='
+      + IntToStr(pPrevLayer.FOutput.Depth) + ' for ' + IntToStr(FW) + 'x'
+      + IntToStr(FH));
+  if (FFlowLayer.FOutput.Depth <> 2) or
+     (FFlowLayer.FOutput.SizeX <> FW) or (FFlowLayer.FOutput.SizeY <> FH) then
+    FErrorProc('TNNetCorrelationLookup requires a (W,H,2) flow field matching '
+      + 'the volume spatial size.');
+  FOutput.ReSize(FW, FH, (2 * FRadius + 1) * (2 * FRadius + 1));
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetCorrelationLookup.Compute();
+var
+  StartTime: double;
+  Vol, Flow: TNNetVolume;
+  ix, iy, dxoff, dyoff, k: integer;
+  x0, y0, x1, y1: integer;
+  gx, gy, nx, ny, sgx, sgy, fx, fy: TNeuralFloat;
+  w00, w01, w10, w11, acc: TNeuralFloat;
+
+  function VolAt(srcx, srcy, tgtx, tgty: integer): TNeuralFloat;
+  begin
+    // zero padding outside the target grid (grid_sample padding_mode='zeros')
+    if (tgtx < 0) or (tgtx >= FW) or (tgty < 0) or (tgty >= FH) then
+      Result := 0
+    else
+      Result := Vol.Get(srcx, srcy, tgty * FW + tgtx);
+  end;
+
+begin
+  StartTime := Now();
+  Vol := FPrevLayer.FOutput;
+  Flow := FFlowLayer.FOutput;
+  for iy := 0 to FH - 1 do
+  for ix := 0 to FW - 1 do
+  begin
+    for dyoff := -FRadius to FRadius do
+    for dxoff := -FRadius to FRadius do
+    begin
+      k := (dyoff + FRadius) * (2 * FRadius + 1) + (dxoff + FRadius);
+      // target = i + flow(i) + delta, then grid_sample(align_corners=True):
+      // the [-1,1] normalisation maps integer grid coords back to themselves,
+      // so we sample bilinearly directly in target-pixel coordinates.
+      gx := ix + Flow.Get(ix, iy, 0) + dxoff;
+      gy := iy + Flow.Get(ix, iy, 1) + dyoff;
+      // align_corners=True identity round-trip (kept explicit to mirror the
+      // torch oracle: nx = 2*gx/(W-1)-1 then back to gx).
+      if FW > 1 then nx := 2.0 * gx / (FW - 1) - 1.0 else nx := 0;
+      if FH > 1 then ny := 2.0 * gy / (FH - 1) - 1.0 else ny := 0;
+      if FW > 1 then sgx := (nx + 1.0) * (FW - 1) / 2.0 else sgx := 0;
+      if FH > 1 then sgy := (ny + 1.0) * (FH - 1) / 2.0 else sgy := 0;
+      x0 := Floor(sgx); y0 := Floor(sgy);
+      x1 := x0 + 1;     y1 := y0 + 1;
+      fx := sgx - x0;   fy := sgy - y0;
+      w00 := (1 - fx) * (1 - fy); w10 := fx * (1 - fy);
+      w01 := (1 - fx) * fy;       w11 := fx * fy;
+      acc := w00 * VolAt(ix, iy, x0, y0)
+           + w10 * VolAt(ix, iy, x1, y0)
+           + w01 * VolAt(ix, iy, x0, y1)
+           + w11 * VolAt(ix, iy, x1, y1);
+      FOutput.Store(ix, iy, k, acc);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetCorrelationLookup.Backpropagate();
+begin
+  // v1 inference-only (see TNNetCorrelationVolume).
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetConvGRUCell }
+
+constructor TNNetConvGRUCell.Create(pHiddenChannels, pInputChannels: integer;
+  pFeatureSize: integer);
+begin
+  inherited Create();
+  if pHiddenChannels < 1 then
+    FErrorProc('TNNetConvGRUCell requires HiddenChannels >= 1.');
+  if pInputChannels < 1 then
+    FErrorProc('TNNetConvGRUCell requires InputChannels >= 1.');
+  if (pFeatureSize < 1) or ((pFeatureSize and 1) = 0) then
+    FErrorProc('TNNetConvGRUCell requires an odd FeatureSize >= 1.');
+  FHiddenC := pHiddenChannels;
+  FInC := pInputChannels;
+  FFeature := pFeatureSize;
+  FPad := pFeatureSize div 2;
+  FStruct[0] := FHiddenC;
+  FStruct[1] := FInC;
+  FStruct[2] := FFeature;
+  FZg := TNNetVolume.Create;
+  FRg := TNNetVolume.Create;
+  FQ := TNNetVolume.Create;
+  FRH := TNNetVolume.Create;
+  FZcat := TNNetVolume.Create;
+end;
+
+destructor TNNetConvGRUCell.Destroy();
+begin
+  FZg.Free; FRg.Free; FQ.Free; FRH.Free; FZcat.Free;
+  inherited Destroy();
+end;
+
+function TNNetConvGRUCell.SaveStructureToString(): string;
+begin
+  Result := inherited SaveStructureToString;
+end;
+
+procedure TNNetConvGRUCell.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  ZC: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.Depth <> FHiddenC + FInC then
+    FErrorProc('TNNetConvGRUCell expects input depth HiddenC+InC=' +
+      IntToStr(FHiddenC + FInC) + '. Got ' +
+      IntToStr(pPrevLayer.FOutput.Depth));
+  FW := pPrevLayer.FOutput.SizeX;
+  FH := pPrevLayer.FOutput.SizeY;
+  ZC := FHiddenC + FInC;
+  // Neurons: [0]=Wz [1]=Wr [2]=Wq (kernels (HiddenC,K*K,ZC)),
+  //          [3]=bz [4]=br [5]=bq (biases (1,1,HiddenC)).
+  if FNeurons.Count < 6 then AddMissingNeurons(6);
+  FNeurons[0].FWeights.ReSize(FHiddenC, FFeature * FFeature, ZC);
+  FNeurons[1].FWeights.ReSize(FHiddenC, FFeature * FFeature, ZC);
+  FNeurons[2].FWeights.ReSize(FHiddenC, FFeature * FFeature, ZC);
+  FNeurons[3].FWeights.ReSize(1, 1, FHiddenC);
+  FNeurons[4].FWeights.ReSize(1, 1, FHiddenC);
+  FNeurons[5].FWeights.ReSize(1, 1, FHiddenC);
+  FZg.ReSize(FW, FH, FHiddenC);
+  FRg.ReSize(FW, FH, FHiddenC);
+  FQ.ReSize(FW, FH, FHiddenC);
+  FRH.ReSize(FW, FH, ZC);   // [r*h ; x]
+  FZcat.ReSize(FW, FH, ZC);
+  FOutput.ReSize(FW, FH, FHiddenC);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  InitDefault();
+end;
+
+procedure TNNetConvGRUCell.GateConv(NeuronBase: integer; Src: TNNetVolume;
+  Dst: TNNetVolume);
+var
+  W, KW, Bias: TNNetVolume;
+  x, y, oc, ky, kx, sy, sx, tap, zi, ZC, ocBase: integer;
+  acc: TNeuralFloat;
+  WR, SPtr: TNeuralFloatArrPtr;
+begin
+  KW := FNeurons[NeuronBase].FWeights;
+  Bias := FNeurons[NeuronBase + 3].FWeights;
+  ZC := Src.Depth;
+  WR := KW.GetRawPtr(); // flat: neuron oc owns the contiguous (K*K*ZC) block at oc*K*K*ZC
+  for y := 0 to FH - 1 do
+  for x := 0 to FW - 1 do
+    for oc := 0 to FHiddenC - 1 do
+    begin
+      ocBase := oc * (FFeature * FFeature * ZC);
+      acc := Bias.FData[oc];
+      for ky := 0 to FFeature - 1 do
+      begin
+        sy := y + ky - FPad;
+        if (sy < 0) or (sy >= FH) then continue;
+        for kx := 0 to FFeature - 1 do
+        begin
+          sx := x + kx - FPad;
+          if (sx < 0) or (sx >= FW) then continue;
+          tap := ocBase + (ky * FFeature + kx) * ZC;
+          SPtr := Src.GetRawPtr(sx, sy, 0); // GetRawPtr(x=col, y=row, d)
+          for zi := 0 to ZC - 1 do
+            acc := acc + WR^[tap + zi] * SPtr^[zi];
+        end;
+      end;
+      Dst.Store(x, y, oc, acc); // Store(x, y, d) - x is the FIRST index
+    end;
+end;
+
+procedure TNNetConvGRUCell.Compute();
+var
+  StartTime: double;
+  Prev: TNNetVolume;
+  x, y, oc: integer;
+  zv, qv, hv: TNeuralFloat;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  // z = sigmoid(Wz*[h;x]+bz); r = sigmoid(Wr*[h;x]+br) over the raw input.
+  GateConv(0, Prev, FZg);
+  GateConv(1, Prev, FRg);
+  for y := 0 to FH - 1 do
+  for x := 0 to FW - 1 do
+    for oc := 0 to FHiddenC - 1 do
+    begin
+      FZg.Store(x, y, oc, Sigmoid(FZg.Get(x, y, oc)));
+      FRg.Store(x, y, oc, Sigmoid(FRg.Get(x, y, oc)));
+    end;
+  // Build [r*h ; x] then q = tanh(Wq*[r*h;x]+bq).
+  for y := 0 to FH - 1 do
+  for x := 0 to FW - 1 do
+  begin
+    for oc := 0 to FHiddenC - 1 do
+      FRH.Store(x, y, oc, FRg.Get(x, y, oc) * Prev.Get(x, y, oc));
+    for oc := 0 to FInC - 1 do
+      FRH.Store(x, y, FHiddenC + oc, Prev.Get(x, y, FHiddenC + oc));
+  end;
+  GateConv(2, FRH, FQ);
+  for y := 0 to FH - 1 do
+  for x := 0 to FW - 1 do
+    for oc := 0 to FHiddenC - 1 do
+    begin
+      zv := FZg.Get(x, y, oc);
+      qv := TanH(FQ.Get(x, y, oc));
+      hv := Prev.Get(x, y, oc);
+      FOutput.Store(x, y, oc, (1 - zv) * hv + zv * qv);
+    end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetConvGRUCell.Backpropagate();
+begin
+  // v1 inference-only (RAFT forward). No BPTT path is wired.
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetConvGRUCell.InitDefault();
+var
+  d, j, ZC: integer;
+begin
+  if FNeurons.Count < 6 then exit;
+  ZC := FHiddenC + FInC;
+  for d := 0 to FHiddenC - 1 do
+    for j := 0 to FFeature * FFeature * ZC - 1 do
+    begin
+      FNeurons[0].FWeights.FData[d * FFeature * FFeature * ZC + j] :=
+        FNeurons[0].FWeights.RandomGaussianValue() * 0.05;
+      FNeurons[1].FWeights.FData[d * FFeature * FFeature * ZC + j] :=
+        FNeurons[1].FWeights.RandomGaussianValue() * 0.05;
+      FNeurons[2].FWeights.FData[d * FFeature * FFeature * ZC + j] :=
+        FNeurons[2].FWeights.RandomGaussianValue() * 0.05;
+    end;
+  FNeurons[3].FWeights.Fill(0);
+  FNeurons[4].FWeights.Fill(0);
+  FNeurons[5].FWeights.Fill(0);
 end;
 
 { TNNetScatterToAffine }
@@ -24539,6 +27500,301 @@ begin
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
+{ TNNetModulatedConv2D }
+
+constructor TNNetModulatedConv2D.Create(pNumFeatures, pFeatureSize,
+  pSuppressBias, pDemodulate: integer; StyleSource: TNNetLayer);
+begin
+  inherited Create();
+  FOutChannels := pNumFeatures;
+  FFeatureSize := pFeatureSize;
+  FSuppressBias := pSuppressBias;
+  FDemodulate := (pDemodulate <> 0);
+  if FOutChannels < 1 then
+    FErrorProc('TNNetModulatedConv2D requires NumFeatures >= 1. Got ' +
+      IntToStr(FOutChannels));
+  if FFeatureSize < 1 then
+    FErrorProc('TNNetModulatedConv2D requires FeatureSize >= 1. Got ' +
+      IntToStr(FFeatureSize));
+  if (FFeatureSize mod 2) <> 1 then
+    FErrorProc('TNNetModulatedConv2D requires an ODD FeatureSize (SAME ' +
+      'padding). Got ' + IntToStr(FFeatureSize));
+  if StyleSource = nil then
+    FErrorProc('TNNetModulatedConv2D requires a non-nil StyleSource.');
+  FStruct[0] := FOutChannels;
+  FStruct[1] := FFeatureSize;
+  FStruct[2] := FSuppressBias;
+  if FDemodulate then FStruct[3] := 1 else FStruct[3] := 0;
+  FStyleLayer := StyleSource;
+  if FStyleLayer is TNNetInput then TNNetInput(FStyleLayer).EnableErrorCollection;
+  // Two-source layer: register the extra departing branch on the style source
+  // (the main-features branch is incremented the usual way by AddLayer).
+  FStyleLayer.IncDepartingBranchesCnt();
+  FModWeights := TNNetVolume.Create();
+  FDemodScale := TNNetVolume.Create();
+  FActivationFn := @Identity;
+  FActivationFnDerivative := @IdentityDerivative;
+end;
+
+destructor TNNetModulatedConv2D.Destroy();
+begin
+  FModWeights.Free;
+  FDemodScale.Free;
+  inherited Destroy();
+end;
+
+function TNNetModulatedConv2D.SaveStructureToString(): string;
+begin
+  // Inject the style source layer index into the (otherwise empty) third
+  // ':'-delimited slot, exactly as TNNetHyperConv / TNNetConcatBase do, so
+  // CreateLayer / LoadFromString can reconnect the second source.
+  Result := StringReplace(inherited SaveStructureToString,
+    '::', ':' + IntToStr(FStyleLayer.FLayerIdx) + ':', [rfReplaceAll]);
+end;
+
+procedure TNNetModulatedConv2D.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  o, tapsPerOut: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FInChannels := pPrevLayer.FOutput.Depth;
+  if FStyleLayer.FOutput.Size <> FInChannels then
+    FErrorProc('TNNetModulatedConv2D requires a StyleSource of size InChannels'+
+      ' = ' + IntToStr(FInChannels) + '. Got size=' +
+      IntToStr(FStyleLayer.FOutput.Size));
+  tapsPerOut := FFeatureSize * FFeatureSize * FInChannels;
+  // One neuron per output channel (K*K*InChannels weights), laid out
+  // w[o,ky,kx,i] at offset (ky*K + kx)*InChannels + i, plus a trailing bias
+  // neuron (OutChannels weights b[o]) unless suppressed.
+  while FNeurons.Count > 0 do FNeurons.Delete(FNeurons.Count - 1);
+  for o := 0 to FOutChannels - 1 do
+  begin
+    FNeurons.Add(TNNetNeuron.Create());
+    FNeurons[o].Weights.ReSize(tapsPerOut, 1, 1);
+    FNeurons[o].BackInertia.ReSize(tapsPerOut, 1, 1);
+    FNeurons[o].Delta.ReSize(tapsPerOut, 1, 1);
+  end;
+  // Bias neuron (always present so the layer round-trips; zeroed and ignored
+  // when SuppressBias).
+  FNeurons.Add(TNNetNeuron.Create());
+  FNeurons[FOutChannels].Weights.ReSize(FOutChannels, 1, 1);
+  FNeurons[FOutChannels].BackInertia.ReSize(FOutChannels, 1, 1);
+  FNeurons[FOutChannels].Delta.ReSize(FOutChannels, 1, 1);
+  FNeurons[FOutChannels].Weights.Fill(0);
+  BuildArrNeurons();
+  InitDefault();
+  // SAME padding, stride 1 -> output keeps the spatial size.
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
+    FOutChannels);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  FModWeights.ReSize(tapsPerOut, 1, FOutChannels);
+  FDemodScale.ReSize(FOutChannels, 1, 1);
+end;
+
+procedure TNNetModulatedConv2D.InitDefault();
+var
+  o, t, tapsPerOut: integer;
+  scale: TNeuralFloat;
+begin
+  if FOutChannels <= 0 then exit;
+  if FNeurons.Count < FOutChannels + 1 then exit;
+  tapsPerOut := FFeatureSize * FFeatureSize * FInChannels;
+  scale := Sqrt(2.0 / (tapsPerOut + 1));
+  for o := 0 to FOutChannels - 1 do
+    for t := 0 to tapsPerOut - 1 do
+      FArrNeurons[o].FWeights.FData[t] := scale * (Random - 0.5) * 2;
+  FNeurons[FOutChannels].Weights.Fill(0);
+end;
+
+procedure TNNetModulatedConv2D.Compute();
+var
+  StartTime: double;
+  X, Style: TNNetVolume;
+  o, ox, oy, ky, kx, i, Base, pad, prevX, prevY: integer;
+  tapsPerOut: integer;
+  Acc, g, wm: TNeuralFloat;
+const
+  cDemodEps = 1e-8;
+begin
+  StartTime := Now();
+  X := FPrevLayer.FOutput;
+  Style := FStyleLayer.FOutput;
+  pad := FFeatureSize div 2;
+  tapsPerOut := FFeatureSize * FFeatureSize * FInChannels;
+  // ---- modulate (+ optional demodulate) the owned base kernel ----
+  for o := 0 to FOutChannels - 1 do
+  begin
+    g := 0;
+    for ky := 0 to FFeatureSize - 1 do
+      for kx := 0 to FFeatureSize - 1 do
+      begin
+        Base := (ky * FFeatureSize + kx) * FInChannels;
+        for i := 0 to FInChannels - 1 do
+        begin
+          wm := Style.FData[i] * FArrNeurons[o].FWeights.FData[Base + i];
+          FModWeights.FData[o * tapsPerOut + Base + i] := wm;
+          g := g + wm * wm;
+        end;
+      end;
+    if FDemodulate then FDemodScale.FData[o] := 1.0 / Sqrt(g + cDemodEps)
+    else FDemodScale.FData[o] := 1.0;
+    if FDemodulate then
+      for i := 0 to tapsPerOut - 1 do
+        FModWeights.FData[o * tapsPerOut + i] :=
+          FModWeights.FData[o * tapsPerOut + i] * FDemodScale.FData[o];
+  end;
+  // ---- SAME-padding stride-1 convolution with the modulated kernel ----
+  FOutput.Fill(0);
+  for o := 0 to FOutChannels - 1 do
+    for oy := 0 to FOutput.SizeY - 1 do
+      for ox := 0 to FOutput.SizeX - 1 do
+      begin
+        Acc := 0;
+        for ky := 0 to FFeatureSize - 1 do
+        begin
+          prevY := oy + ky - pad;
+          if (prevY < 0) or (prevY >= X.SizeY) then continue;
+          for kx := 0 to FFeatureSize - 1 do
+          begin
+            prevX := ox + kx - pad;
+            if (prevX < 0) or (prevX >= X.SizeX) then continue;
+            Base := o * tapsPerOut + (ky * FFeatureSize + kx) * FInChannels;
+            for i := 0 to FInChannels - 1 do
+              Acc := Acc + FModWeights.FData[Base + i] * X.Get(prevX, prevY, i);
+          end;
+        end;
+        if FSuppressBias = 0 then Acc := Acc + FNeurons[FOutChannels].FWeights.FData[o];
+        FOutput.Add(ox, oy, o, Acc);
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetModulatedConv2D.Backpropagate();
+var
+  StartTime: double;
+  X, Style, XErr, StyleErr: TNNetVolume;
+  o, ox, oy, ky, kx, i, Base, pad, prevX, prevY, tapsPerOut: integer;
+  Dy, Xv, lr, dwm, dot, wbase, sv: TNeuralFloat;
+  PropMain, PropStyle, PropW: boolean;
+  GModW, GBias: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  X := FPrevLayer.FOutput;
+  Style := FStyleLayer.FOutput;
+  XErr := FPrevLayer.FOutputError;
+  StyleErr := FStyleLayer.FOutputError;
+  pad := FFeatureSize div 2;
+  tapsPerOut := FFeatureSize * FFeatureSize * FInChannels;
+  lr := -FLearningRate;
+  PropMain := (X.Size > 0) and (X.Size = XErr.Size);
+  PropStyle := (StyleErr.Size = Style.Size);
+  PropW := (FLearningRate <> 0.0);
+  StartTime := Now();
+  // GModW[o,t] = dL/d(modulated-and-demodulated weight w''[o,t]) accumulated
+  // from the convolution; then chained back through demod -> modulate to reach
+  // dL/d(base weight) and dL/d(style[i]).
+  GModW := TNNetVolume.Create(tapsPerOut, 1, FOutChannels);
+  GBias := TNNetVolume.Create(FOutChannels, 1, 1);
+  try
+    GModW.Fill(0); GBias.Fill(0);
+    // ---- conv backward: dL/dx and dL/dw'' ----
+    for o := 0 to FOutChannels - 1 do
+      for oy := 0 to FOutput.SizeY - 1 do
+        for ox := 0 to FOutput.SizeX - 1 do
+        begin
+          Dy := FOutputError.Get(ox, oy, o);
+          if FSuppressBias = 0 then GBias.FData[o] := GBias.FData[o] + Dy;
+          if Dy = 0 then continue;
+          for ky := 0 to FFeatureSize - 1 do
+          begin
+            prevY := oy + ky - pad;
+            if (prevY < 0) or (prevY >= X.SizeY) then continue;
+            for kx := 0 to FFeatureSize - 1 do
+            begin
+              prevX := ox + kx - pad;
+              if (prevX < 0) or (prevX >= X.SizeX) then continue;
+              Base := (ky * FFeatureSize + kx) * FInChannels;
+              for i := 0 to FInChannels - 1 do
+              begin
+                // dL/dx += w''[o,t] * dy
+                if PropMain then
+                  XErr.Add(prevX, prevY, i,
+                    FModWeights.FData[o * tapsPerOut + Base + i] * Dy);
+                // dL/dw''[o,t] += x * dy
+                Xv := X.Get(prevX, prevY, i);
+                GModW.FData[o * tapsPerOut + Base + i] :=
+                  GModW.FData[o * tapsPerOut + Base + i] + Xv * Dy;
+              end;
+            end;
+          end;
+        end;
+    // ---- chain through demod + modulate, per output channel ----
+    // Let s=style, w=base, w'=s_i*w (modulate), d=(sum w'^2 + eps)^-1/2,
+    // w''=d*w' (when demod). Then for any modulated tap w'[o,t]:
+    //   dL/dw'[o,t] = d*GModW[o,t] + (dd/dw'[o,t]) * sum_u (GModW[o,u]*w'[o,u])
+    //   dd/dw'[o,t] = -d^3 * w'[o,t]
+    //   => dL/dw'[o,t] = d*GModW[o,t] - d^3 * w'[o,t] * dot,  dot=sum GModW*w'
+    // (demod=false: d=1, dot term drops, dL/dw'=GModW.)
+    // Then dL/dw[o,t] = s_i * dL/dw'[o,t]; dL/ds_i += w[o,t] * dL/dw'[o,t].
+    if PropW or PropStyle then
+      for o := 0 to FOutChannels - 1 do
+      begin
+        dot := 0;
+        if FDemodulate then
+          for i := 0 to tapsPerOut - 1 do
+            dot := dot + GModW.FData[o * tapsPerOut + i] *
+              (FModWeights.FData[o * tapsPerOut + i] / FDemodScale.FData[o]);
+        // note: FModWeights holds w''=d*w'; recover w'=w''/d via /FDemodScale.
+        for ky := 0 to FFeatureSize - 1 do
+          for kx := 0 to FFeatureSize - 1 do
+          begin
+            Base := (ky * FFeatureSize + kx) * FInChannels;
+            for i := 0 to FInChannels - 1 do
+            begin
+              sv := Style.FData[i];
+              wbase := FArrNeurons[o].FWeights.FData[Base + i];
+              // dL/dw'[o,t]
+              if FDemodulate then
+                dwm := FDemodScale.FData[o] * GModW.FData[o * tapsPerOut + Base + i]
+                  - FDemodScale.FData[o] * FDemodScale.FData[o] * FDemodScale.FData[o]
+                    * (sv * wbase) * dot
+              else
+                dwm := GModW.FData[o * tapsPerOut + Base + i];
+              // dL/d(base weight) = s_i * dwm  -> Delta (LR-scaled, negated)
+              if PropW then
+                FArrNeurons[o].FDelta.FData[Base + i] :=
+                  FArrNeurons[o].FDelta.FData[Base + i] + lr * (sv * dwm);
+              // dL/d(style[i]) += w_base * dwm
+              if PropStyle then
+                StyleErr.FData[i] := StyleErr.FData[i] + wbase * dwm;
+            end;
+          end;
+        // bias delta
+        if PropW and (FSuppressBias = 0) then
+          FArrNeurons[FOutChannels].FDelta.FData[o] :=
+            FArrNeurons[FOutChannels].FDelta.FData[o] + lr * GBias.FData[o];
+      end;
+  finally
+    GModW.Free;
+    GBias.Free;
+  end;
+  if (PropW) and (not FBatchUpdate) then
+  begin
+    for o := 0 to FOutChannels do
+      FArrNeurons[o].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  // Propagate into BOTH sources (style branch then main features).
+  if Assigned(FStyleLayer) and
+     (FStyleLayer.OutputError.Size = FStyleLayer.Output.Size) then
+    FStyleLayer.Backpropagate();
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
 { TNNetCosineSimilarityAttention }
 
 constructor TNNetCosineSimilarityAttention.Create(d_k: integer;
@@ -25144,6 +28400,281 @@ begin
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
+{ TNNetDisentangledAttention }
+
+constructor TNNetDisentangledAttention.Create(d_k: integer;
+  pCausalMask: boolean; pAttSpan: integer; pPosBuckets: integer;
+  pMaxRelPos: integer);
+begin
+  inherited Create(d_k, pCausalMask);
+  FAttSpan := pAttSpan;
+  FPosBuckets := pPosBuckets;
+  FMaxRelPos := pMaxRelPos;
+  if FAttSpan < 1 then
+    FErrorProc('TNNetDisentangledAttention requires AttSpan >= 1. AttSpan=' +
+      IntToStr(FAttSpan));
+  if FPosBuckets < 0 then
+    FErrorProc('TNNetDisentangledAttention requires PosBuckets >= 0 ' +
+      '(0 = no log bucketing). PosBuckets=' + IntToStr(FPosBuckets));
+  // scale_factor = 3 (c2c + c2p + p2c, the DeBERTa-v3 default): scale is
+  // sqrt(d_k * scale_factor). HF applies the SAME scale to all three terms.
+  FInvSqrtScaled := pcr_rsqrtf(FDk * 3);
+  // FStruct[0..2] taken by the parent (d_k, causal flag, window).
+  FStruct[3] := FAttSpan;
+  FStruct[4] := FPosBuckets;
+  FStruct[5] := FMaxRelPos;
+end;
+
+// EXACT port of DeBERTa-v2 make_log_bucket_position (HF reference).
+class function TNNetDisentangledAttention.LogBucketPosition(
+  RelativePosition, BucketSize, MaxPosition: integer): integer;
+var
+  Sign, Mid, AbsPos, LogPos: integer;
+  Ratio: double;
+begin
+  if RelativePosition > 0 then Sign := 1
+  else if RelativePosition < 0 then Sign := -1
+  else Sign := 0;
+  Mid := BucketSize div 2;
+  // abs_pos = (|rp| in the exact middle band) ? mid-1 : |rp|
+  if (RelativePosition < Mid) and (RelativePosition > -Mid) then
+    AbsPos := Mid - 1
+  else
+    AbsPos := Abs(RelativePosition);
+  if AbsPos <= Mid then
+  begin
+    // |rp| in the exact region: bucket = rp itself (the where(abs_pos<=mid)).
+    Result := RelativePosition;
+  end
+  else
+  begin
+    // log_pos = ceil( ln(abs_pos/mid) / ln((max-1)/mid) * (mid-1) ) + mid
+    Ratio := Ln(AbsPos / Mid) / Ln((MaxPosition - 1) / Mid) * (Mid - 1);
+    LogPos := Ceil(Ratio) + Mid;
+    Result := LogPos * Sign;
+  end;
+end;
+
+procedure TNNetDisentangledAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  i, j, r, rb, c2p, p2c, twoSpan: integer;
+
+  // Bucketed (or raw) signed relative position for distance `rel`.
+  function Bucketed(rel: integer): integer;
+  begin
+    if FPosBuckets > 0 then
+      Result := LogBucketPosition(rel, FPosBuckets, FMaxRelPos)
+    else
+      Result := rel;
+  end;
+
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FSeqLen := pPrevLayer.FOutput.SizeX;
+  twoSpan := 2 * FAttSpan;
+  // TWO neurons, each a (2*att_span) x d_k position table: neuron 0 = K^r
+  // (the content->position key table), neuron 1 = Q^r (the position->content
+  // query table). Storing them as neuron weights round-trips them through the
+  // base per-neuron save/load and steps them with the optimizer.
+  if FNeurons.Count < 2 then AddMissingNeurons(2 - FNeurons.Count);
+  SetNumWeightsForAllNeurons(twoSpan, 1, FDk);
+  AfterWeightUpdate();
+  // Precompute the two gather indices per (i,j) pair (HF gather math). r=i-j.
+  //   c2p_pos(i,j) = clamp( bucket(i-j) + att_span, 0, 2*att_span-1)
+  //   p2c_pos(j,i) = clamp(-bucket(j-i) + att_span, 0, 2*att_span-1)
+  // HF clamps -r_pos + att_span where r_pos = bucket(query-key) (from the
+  // KEY's row that is bucket(j-i)), then TRANSPOSES the result onto [i,j], so
+  // the p2c (i,j) entry reads clamp(-bucket(j-i) + att_span). The DeBERTa
+  // log-bucket function is ODD (bucket(-x) = -bucket(x)), so
+  // -bucket(j-i) = bucket(i-j) = bucket(r): the c2p and p2c gather indices
+  // COINCIDE for the symmetric (query==key) encoder case. Computed
+  // independently here so the math is explicit and a future asymmetric
+  // variant can diverge them.
+  SetLength(FC2P, FSeqLen * FSeqLen);
+  SetLength(FP2C, FSeqLen * FSeqLen);
+  for i := 0 to FSeqLen - 1 do
+    for j := 0 to FSeqLen - 1 do
+    begin
+      r := i - j;
+      rb := Bucketed(r) + FAttSpan;            // c2p_pos
+      if rb < 0 then rb := 0;
+      if rb > twoSpan - 1 then rb := twoSpan - 1;
+      c2p := rb;
+      rb := -Bucketed(-r) + FAttSpan;          // p2c_pos = -bucket(j-i)+span
+      if rb < 0 then rb := 0;
+      if rb > twoSpan - 1 then rb := twoSpan - 1;
+      p2c := rb;
+      FC2P[i * FSeqLen + j] := c2p;
+      FP2C[i * FSeqLen + j] := p2c;
+    end;
+end;
+
+procedure TNNetDisentangledAttention.InitDefault();
+begin
+  // Small Gaussian init for the position tables (they are real projections,
+  // unlike the T5 bias table which starts at zero). The DeBERTa importer
+  // overwrites them with the projected rel_embeddings anyway.
+  if FNeurons.Count >= 2 then
+  begin
+    FNeurons[0].InitGaussian(0.02);
+    FNeurons[1].InitGaussian(0.02);
+    AfterWeightUpdate();
+  end;
+end;
+
+procedure TNNetDisentangledAttention.Compute();
+const
+  cMaskFloor = -1e8; // same all-masked-row floor as the parent
+var
+  StartTime: double;
+  SeqLen, i, j, d: integer;
+  Score, MaxScore, SumExp, c2c, c2p, p2c: TNeuralFloat;
+  Prev: TNNetVolume;
+  OutPtr, Krow, Qrow: TNeuralFloatArrPtr;
+  PosK, PosQ: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  PosK := FNeurons[0].FWeights; // K^r table, row a at GetRawPtr(a,0,0)
+  PosQ := FNeurons[1].FWeights; // Q^r table
+  for i := 0 to SeqLen - 1 do
+  begin
+    MaxScore := -1e30;
+    for j := 0 to SeqLen - 1 do
+    begin
+      if FCausal and (j > i) then
+      begin
+        FAttn[j, i, 0] := -1e9;
+      end
+      else
+      begin
+        // Content-to-content: Q^c_i . K^c_j (depth contiguous AVX dot).
+        c2c := TNNetVolume.DotProduct(
+          Prev.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, FDk), FDk);
+        // Content-to-position: Q^c_i . K^r_{c2p_pos(i,j)}.
+        Krow := PosK.GetRawPtr(FC2P[i * SeqLen + j], 0, 0);
+        c2p := TNNetVolume.DotProduct(Prev.GetRawPtr(i, 0, 0), Krow, FDk);
+        // Position-to-content: K^c_j . Q^r_{p2c_pos(i,j)}.
+        Qrow := PosQ.GetRawPtr(FP2C[i * SeqLen + j], 0, 0);
+        p2c := TNNetVolume.DotProduct(Prev.GetRawPtr(j, 0, FDk), Qrow, FDk);
+        Score := (c2c + c2p + p2c) * FInvSqrtScaled;
+        FAttn[j, i, 0] := Score;
+      end;
+      if FAttn[j, i, 0] > MaxScore then MaxScore := FAttn[j, i, 0];
+    end;
+    if MaxScore <= cMaskFloor then
+    begin
+      for j := 0 to SeqLen - 1 do
+        FAttn[j, i, 0] := 0;
+    end
+    else
+    begin
+      SumExp := 0;
+      for j := 0 to SeqLen - 1 do
+      begin
+        Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
+        FAttn[j, i, 0] := Score;
+        SumExp := SumExp + Score;
+      end;
+      if SumExp > 0 then
+        for j := 0 to SeqLen - 1 do
+          FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
+    end;
+    OutPtr := FOutput.GetRawPtr(i, 0, 0);
+    for d := 0 to FDk - 1 do
+      OutPtr^[d] := 0;
+    for j := 0 to SeqLen - 1 do
+      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
+        FAttn[j, i, 0], FDk);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetDisentangledAttention.Backpropagate();
+var
+  StartTime: double;
+  SeqLen, i, j, kk: integer;
+  Prev, PrevErr, PosK, PosQ, dPosK, dPosQ: TNNetVolume;
+  dAttn, dScore: array of TNeuralFloat;
+  SumDAttnAttn, A, dS, g: TNeuralFloat;
+  Krow, Qrow: TNeuralFloatArrPtr;
+  a_idx, b_idx: integer;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  PrevErr := FPrevLayer.FOutputError;
+  PosK := FNeurons[0].FWeights;
+  PosQ := FNeurons[1].FWeights;
+  dPosK := FNeurons[0].FDelta;
+  dPosQ := FNeurons[1].FDelta;
+  SeqLen := Prev.SizeX;
+  SetLength(dAttn, SeqLen);
+  SetLength(dScore, SeqLen);
+  for i := 0 to SeqLen - 1 do
+  begin
+    // ---- dV and dAttn (identical to the parent) ----
+    for j := 0 to SeqLen - 1 do
+    begin
+      A := FAttn[j, i, 0];
+      if (FPrevLayer.Output.Size > 0) and
+         (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, 2 * FDk),
+          FOutputError.GetRawPtr(i, 0, 0), A, FDk);
+      dAttn[j] := TNNetVolume.DotProduct(
+        FOutputError.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, 2 * FDk), FDk);
+    end;
+    // ---- softmax Jacobian -> dScore ----
+    SumDAttnAttn := 0;
+    for kk := 0 to SeqLen - 1 do
+      SumDAttnAttn := SumDAttnAttn + dAttn[kk] * FAttn[kk, i, 0];
+    for j := 0 to SeqLen - 1 do
+      dScore[j] := FAttn[j, i, 0] * (dAttn[j] - SumDAttnAttn);
+    // ---- scatter dScore into Q^c, K^c, K^r, Q^r ----
+    // score[i,j] = (Qc_i.Kc_j + Qc_i.Kr_a + Kc_j.Qr_b) * FInvSqrtScaled.
+    //   dQc_i += g*(Kc_j + Kr_a);  dKc_j += g*(Qc_i + Qr_b);
+    //   dKr_a += g*Qc_i;           dQr_b += g*Kc_j.   (g = dScore*FInvSqrtScaled)
+    for j := 0 to SeqLen - 1 do
+    begin
+      g := dScore[j] * FInvSqrtScaled;
+      if g = 0 then continue;
+      a_idx := FC2P[i * SeqLen + j];
+      b_idx := FP2C[i * SeqLen + j];
+      Krow := PosK.GetRawPtr(a_idx, 0, 0);
+      Qrow := PosQ.GetRawPtr(b_idx, 0, 0);
+      // Position-table grads (delta convention: += -lr * grad).
+      TNNetVolume.MulAdd(dPosK.GetRawPtr(a_idx, 0, 0),
+        Prev.GetRawPtr(i, 0, 0), -FLearningRate * g, FDk);
+      TNNetVolume.MulAdd(dPosQ.GetRawPtr(b_idx, 0, 0),
+        Prev.GetRawPtr(j, 0, FDk), -FLearningRate * g, FDk);
+      // Content grads into Q^c_i and K^c_j.
+      if (FPrevLayer.Output.Size > 0) and
+         (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+      begin
+        // dQc_i += g*Kc_j + g*Kr_a
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(i, 0, 0),
+          Prev.GetRawPtr(j, 0, FDk), g, FDk);
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(i, 0, 0), Krow, g, FDk);
+        // dKc_j += g*Qc_i + g*Qr_b
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, FDk),
+          Prev.GetRawPtr(i, 0, 0), g, FDk);
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, FDk), Qrow, g, FDk);
+      end;
+    end;
+  end;
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    FNeurons[1].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
 { TNNetALiBiAttention }
 
 constructor TNNetALiBiAttention.Create(d_k: integer; pCausalMask: boolean;
@@ -25317,6 +28848,137 @@ begin
           FCacheScores[j] / SumExp, FDk);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetWindowAttention }
+
+constructor TNNetWindowAttention.Create(d_k: integer; pSeqLen: integer);
+begin
+  // No causal mask, no sliding window: Swin window attention is bidirectional
+  // over the SeqLen tokens of one window. The (query,key) bias matrix (and any
+  // cyclic-shift mask) is supplied via SetBiasMatrix after the net is built.
+  inherited Create(d_k, {CausalMask=}false, {pWindow=}0);
+  FSeqLen := pSeqLen;
+  if FSeqLen < 1 then
+    FErrorProc('TNNetWindowAttention requires SeqLen >= 1. SeqLen=' +
+      IntToStr(FSeqLen));
+  FStruct[5] := FSeqLen;
+end;
+
+procedure TNNetWindowAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeX <> FSeqLen then
+    FErrorProc('TNNetWindowAttention: previous layer SizeX=' +
+      IntToStr(pPrevLayer.FOutput.SizeX) + ' does not match SeqLen=' +
+      IntToStr(FSeqLen) + '.');
+  // One neuron holding the flattened SeqLen x SeqLen bias matrix
+  // (row-major: Bias[i,j] = weight[i*SeqLen + j]); storing it as neuron
+  // weights makes it round-trip through the standard weight save/load. The
+  // bias is a constant (zero gradient), so it is never stepped by the
+  // optimizer.
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  SetNumWeightsForAllNeurons(1, 1, FSeqLen * FSeqLen);
+  FNeurons[0].FWeights.Fill(0); // zero bias = bit-for-bit plain SDPA
+  AfterWeightUpdate();
+end;
+
+procedure TNNetWindowAttention.InitDefault();
+begin
+  // The bias matrix starts at ZERO (an untrained layer scores exactly like a
+  // plain SDPA); do NOT randomize like the base InitDefault would.
+  if FNeurons.Count > 0 then
+  begin
+    FNeurons[0].FWeights.Fill(0);
+    AfterWeightUpdate();
+  end;
+end;
+
+procedure TNNetWindowAttention.SetBiasMatrix(const Bias: TNNetVolume);
+var
+  i: integer;
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  SetNumWeightsForAllNeurons(1, 1, FSeqLen * FSeqLen);
+  if Bias.Size <> FSeqLen * FSeqLen then
+    FErrorProc('TNNetWindowAttention.SetBiasMatrix expects ' +
+      IntToStr(FSeqLen * FSeqLen) + ' values, got ' + IntToStr(Bias.Size) +
+      '.');
+  for i := 0 to FSeqLen * FSeqLen - 1 do
+    FNeurons[0].FWeights.FData[i] := Bias.FData[i];
+  AfterWeightUpdate();
+end;
+
+function TNNetWindowAttention.BiasAt(QueryI, KeyJ: integer): TNeuralFloat;
+begin
+  Result := FNeurons[0].FWeights.FData[QueryI * FSeqLen + KeyJ];
+end;
+
+procedure TNNetWindowAttention.Compute();
+const
+  cMaskFloor = -1e8; // same all-masked-row floor as the parent
+var
+  StartTime: double;
+  SeqN, i, j, d: integer;
+  Score, MaxScore, SumExp: TNeuralFloat;
+  Prev: TNNetVolume;
+  OutPtr, Bias, BiasRow: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqN := Prev.SizeX;
+  Bias := FNeurons[0].FWeights.GetRawPtr(0, 0, 0);
+  // Same forward as the parent except that the fixed (query,key) bias matrix
+  // (relative-position bias plus optional cyclic-shift mask) is ADDED to every
+  // scaled logit. The shift mask is baked into Bias as a large negative value
+  // for cross-region pairs, so masked positions are handled by the bias itself
+  // (and the parent's all-masked-row policy still applies).
+  for i := 0 to SeqN - 1 do
+  begin
+    BiasRow := @Bias^[i * SeqN];
+    MaxScore := -1e30;
+    for j := 0 to SeqN - 1 do
+    begin
+      Score := TNNetVolume.DotProduct(
+        Prev.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, FDk), FDk);
+      Score := Score * FInvSqrtDk + BiasRow^[j];
+      FAttn[j, i, 0] := Score;
+      if Score > MaxScore then MaxScore := Score;
+    end;
+    if MaxScore <= cMaskFloor then
+    begin
+      for j := 0 to SeqN - 1 do
+        FAttn[j, i, 0] := 0;
+    end
+    else
+    begin
+      SumExp := 0;
+      for j := 0 to SeqN - 1 do
+      begin
+        Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
+        FAttn[j, i, 0] := Score;
+        SumExp := SumExp + Score;
+      end;
+      if SumExp > 0 then
+        for j := 0 to SeqN - 1 do
+          FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
+    end;
+    OutPtr := FOutput.GetRawPtr(i, 0, 0);
+    for d := 0 to FDk - 1 do
+      OutPtr^[d] := 0;
+    for j := 0 to SeqN - 1 do
+      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
+        FAttn[j, i, 0], FDk);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetWindowAttention.Backpropagate();
+begin
+  // The additive bias matrix is a CONSTANT (zero self-gradient) and the
+  // post-softmax weights FAttn are already cached, so the score/Q/K/V backward
+  // is byte-identical to the parent SDPA. The bias neuron is never stepped.
+  inherited Backpropagate();
 end;
 
 { TNNetSinkAttention }
@@ -25555,6 +29217,167 @@ begin
   begin
     for s := 0 to 2 * FNumSinks - 1 do
       FNeurons[s].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetGptOssSinkAttention }
+
+constructor TNNetGptOssSinkAttention.Create(d_k: integer; pCausalMask: boolean;
+  pWindow: integer);
+begin
+  inherited Create(d_k, pCausalMask, pWindow);
+end;
+
+procedure TNNetGptOssSinkAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // ONE trainable scalar: the per-head sink logit, held as a single neuron
+  // with a single weight so it round-trips through the base neuron save/load.
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  SetNumWeightsForAllNeurons(1, 1, 1);
+  FNeurons[0].FWeights.Raw[0] := 0;
+  AfterWeightUpdate();
+end;
+
+function TNNetGptOssSinkAttention.SinkLogit(): TNeuralFloat;
+begin
+  Result := FNeurons[0].FWeights.Raw[0];
+end;
+
+procedure TNNetGptOssSinkAttention.SetSinkLogit(const Value: TNeuralFloat);
+begin
+  FNeurons[0].FWeights.Raw[0] := Value;
+  AfterWeightUpdate();
+end;
+
+procedure TNNetGptOssSinkAttention.Compute();
+var
+  StartTime: double;
+  SeqLen, i, j, d: integer;
+  Score, MaxScore, SumExp, Sink: TNeuralFloat;
+  Prev: TNNetVolume;
+  OutPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  Sink := FNeurons[0].FWeights.Raw[0];
+  for i := 0 to SeqLen - 1 do
+  begin
+    // 1) Scaled scores into FAttn[*, i, 0] over the real keys, then fold the
+    //    sink logit into the running max for a numerically stable softmax.
+    MaxScore := Sink;
+    for j := 0 to SeqLen - 1 do
+    begin
+      if (FCausal and (j > i)) or
+         ((FWindow > 0) and (i - j >= FWindow)) then
+      begin
+        FAttn[j, i, 0] := -1e9;
+      end
+      else
+      begin
+        Score := TNNetVolume.DotProduct(
+          Prev.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, FDk), FDk);
+        Score := Score * FInvSqrtDk;
+        FAttn[j, i, 0] := Score;
+      end;
+      if FAttn[j, i, 0] > MaxScore then MaxScore := FAttn[j, i, 0];
+    end;
+    // 2) Softmax with the sink term in the denominator only (the sink column is
+    //    never written into FAttn and contributes nothing to the output).
+    SumExp := pcr_expf(Sink - MaxScore);
+    for j := 0 to SeqLen - 1 do
+    begin
+      Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
+      FAttn[j, i, 0] := Score;
+      SumExp := SumExp + Score;
+    end;
+    if SumExp > 0 then
+      for j := 0 to SeqLen - 1 do
+        FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
+    // 3) Output[i, d] = sum_j Attn[i,j] * V[j,d] (V contiguous along depth).
+    OutPtr := FOutput.GetRawPtr(i, 0, 0);
+    for d := 0 to FDk - 1 do
+      OutPtr^[d] := 0;
+    for j := 0 to SeqLen - 1 do
+      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
+        FAttn[j, i, 0], FDk);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGptOssSinkAttention.Backpropagate();
+var
+  StartTime: double;
+  SeqLen, i, j, k: integer;
+  Prev, PrevErr: TNNetVolume;
+  dAttn: array of TNeuralFloat;
+  dScore: array of TNeuralFloat;
+  SumDAttnAttn, A, dS, gSink, wSink: TNeuralFloat;
+  hasInputGrad: boolean;
+  OutErrPtr: TNeuralFloatArrPtr;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  PrevErr := FPrevLayer.FOutputError;
+  hasInputGrad := (Prev.Size > 0) and (Prev.Size = PrevErr.Size);
+  SeqLen := Prev.SizeX;
+  SetLength(dAttn, SeqLen);
+  SetLength(dScore, SeqLen);
+  gSink := 0;
+  for i := 0 to SeqLen - 1 do
+  begin
+    OutErrPtr := FOutputError.GetRawPtr(i, 0, 0);
+    // dV[j] += Attn[i,j]*dOut[i];  dAttn[j] = dOut[i] . V[j]
+    for j := 0 to SeqLen - 1 do
+    begin
+      A := FAttn[j, i, 0];
+      if hasInputGrad then
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, 2 * FDk), OutErrPtr, A, FDk);
+      dAttn[j] := TNNetVolume.DotProduct(
+        OutErrPtr, Prev.GetRawPtr(j, 0, 2 * FDk), FDk);
+    end;
+    // Softmax Jacobian over the AUGMENTED row (real keys + the sink column).
+    // The sink has dAttn_sink = 0 (it contributes nothing to the output) but
+    // its post-softmax weight wSink = 1 - sum_j Attn[i,j] still enters the
+    // shared subtraction term and yields the sink-logit gradient.
+    wSink := 1;
+    SumDAttnAttn := 0;
+    for k := 0 to SeqLen - 1 do
+    begin
+      SumDAttnAttn := SumDAttnAttn + dAttn[k] * FAttn[k, i, 0];
+      wSink := wSink - FAttn[k, i, 0];
+    end;
+    if wSink < 0 then wSink := 0;
+    for j := 0 to SeqLen - 1 do
+      dScore[j] := FAttn[j, i, 0] * (dAttn[j] - SumDAttnAttn);
+    // dL/ds for the sink column: w_sink * (0 - SumDAttnAttn).
+    gSink := gSink + wSink * (-SumDAttnAttn);
+    // dQ[i] / dK[j] from the real-key scores.
+    if hasInputGrad then
+      for j := 0 to SeqLen - 1 do
+      begin
+        dS := dScore[j] * FInvSqrtDk;
+        if dS <> 0 then
+        begin
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(i, 0, 0),
+            Prev.GetRawPtr(j, 0, FDk), dS, FDk);
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, FDk),
+            Prev.GetRawPtr(i, 0, 0), dS, FDk);
+        end;
+      end;
+  end;
+  // Flush the sink-logit gradient (delta += -LR*grad, the layer convention).
+  FNeurons[0].FDelta.Raw[0] := FNeurons[0].FDelta.Raw[0] + (-FLearningRate) * gSink;
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
     AfterWeightUpdate();
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -26044,7 +29867,8 @@ end;
 constructor TNNetRotaryEmbedding.Create(pBase: TNeuralFloat;
   pScalingMode: TNNetRoPEScalingMode; pScaleFactor: TNeuralFloat;
   pOriginalContextLen: integer; pYarnAlpha: TNeuralFloat;
-  pYarnBeta: TNeuralFloat);
+  pYarnBeta: TNeuralFloat; pLongAttnFactor: TNeuralFloat;
+  pYarnTruncate: boolean);
 begin
   inherited Create();
   if pBase <= 0 then
@@ -26057,7 +29881,9 @@ begin
   // slots load as "no scaling").
   if pScalingMode <> rsmNone then
   begin
-    if pScaleFactor < 1 then
+    // LongRoPE's "factor" is a per-frequency table, not a scalar >= 1, so the
+    // scalar-factor guard does not apply to it.
+    if (pScalingMode <> rsmLongRoPE) and (pScaleFactor < 1) then
       FErrorProc('TNNetRotaryEmbedding scaling requires ScaleFactor >= 1. ' +
         'Got ScaleFactor=' + FloatToStr(pScaleFactor));
     if pScalingMode in [rsmYaRN, rsmLlama3] then
@@ -26071,9 +29897,53 @@ begin
     end;
     FStruct[0] := Ord(pScalingMode);
     FStruct[1] := pOriginalContextLen;
+    // FStruct[2]: YaRN correction-range truncation. Stored INVERTED (0 =
+    // truncate, the paper/HF default; 1 = no truncation, gpt-oss's
+    // rope_parameters "truncate": false) so existing serialized YaRN layers
+    // (FStruct[2]=0) keep the original floor/ceil behaviour on reload.
+    if pYarnTruncate then FStruct[2] := 0 else FStruct[2] := 1;
     FFloatSt[1] := pScaleFactor;
     FFloatSt[2] := pYarnAlpha;
     FFloatSt[3] := pYarnBeta;
+    // FFloatSt[4] is the LongRoPE attention scaling (long_mscale); it stays 0
+    // for every other mode, which BuildThetaCache treats as "no extra scale".
+    FFloatSt[4] := pLongAttnFactor;
+  end;
+end;
+
+constructor TNNetRotaryEmbedding.CreateLongRoPE(pBase: TNeuralFloat;
+  const pLongFactors: array of TNeuralFloat; pAttnFactor: TNeuralFloat);
+var
+  I: integer;
+begin
+  // pScaleFactor / alpha / beta are unused by rsmLongRoPE; pass 1.0 so the
+  // shared scalar slots stay benign.
+  Create(pBase, rsmLongRoPE, 1.0, 0, 1.0, 32.0, pAttnFactor);
+  if Length(pLongFactors) < 1 then
+    FErrorProc('TNNetRotaryEmbedding LongRoPE requires a non-empty ' +
+      'long_factor table.');
+  SetLength(FLongFactors, Length(pLongFactors));
+  for I := 0 to Length(pLongFactors) - 1 do
+  begin
+    if pLongFactors[I] <= 0 then
+      FErrorProc('TNNetRotaryEmbedding LongRoPE factors must be positive, ' +
+        'got ' + FloatToStr(pLongFactors[I]) + ' at index ' + IntToStr(I) + '.');
+    FLongFactors[I] := pLongFactors[I];
+  end;
+end;
+
+procedure TNNetRotaryEmbedding.LoadDataFromString(strData: string);
+begin
+  inherited LoadDataFromString(strData);
+  // For rsmLongRoPE the per-frequency factor table just arrived in
+  // FNeurons[0]; drop any stale FLongFactors and theta cache so the next
+  // BuildThetaCache copies the loaded factors back out.
+  if TNNetRoPEScalingMode(FStruct[0]) = rsmLongRoPE then
+  begin
+    SetLength(FLongFactors, 0);
+    SetLength(FTheta, 0);
+    if Assigned(FPrevLayer) and (FPrevLayer.Output.Depth > 0) then
+      BuildThetaCache(FPrevLayer.Output.Depth);
   end;
 end;
 
@@ -26119,12 +29989,48 @@ var
       (2.0 * pcr_logf(Base));
   end;
 
+var
+  LongFactor: TNeuralFloat;
 begin
   HalfD := pDepth div 2;
   SetLength(FTheta, HalfD);
   Base := FFloatSt[0];
   if Base <= 0 then Base := 10000.0;
   Mode := TNNetRoPEScalingMode(FStruct[0]);
+  // rsmLongRoPE: synchronise the per-frequency factor table with FNeurons[0]
+  // (the serialized home of the table). On the importer path FLongFactors is
+  // already populated, so MIRROR it into FNeurons[0]; on a load-from-string
+  // FLongFactors is empty, so COPY OUT of FNeurons[0] (filled by
+  // LoadDataFromString). Either way FLongFactors holds the live table below.
+  if Mode = rsmLongRoPE then
+  begin
+    if Length(FLongFactors) = HalfD then
+    begin
+      if FNeurons.Count < 1 then AddNeurons(1);
+      FNeurons[0].Weights.ReSize(HalfD, 1, 1);
+      for pairIdx := 0 to HalfD - 1 do
+        FNeurons[0].Weights.FData[pairIdx] := FLongFactors[pairIdx];
+    end
+    else if (FNeurons.Count >= 1) and (FNeurons[0].Weights.Size = HalfD) then
+    begin
+      // Load path (post LoadDataFromString): copy the table out of FNeurons[0].
+      SetLength(FLongFactors, HalfD);
+      for pairIdx := 0 to HalfD - 1 do
+        FLongFactors[pairIdx] := FNeurons[0].Weights.FData[pairIdx];
+    end
+    else
+    begin
+      // Structure-load path BEFORE LoadDataFromString fills the table: create a
+      // placeholder neuron of the right length (so LoadDataFromString's
+      // neuron-count check passes) and use factor 1 for now -
+      // LoadDataFromString rebuilds the cache with the real factors.
+      if FNeurons.Count < 1 then AddNeurons(1);
+      FNeurons[0].Weights.ReSize(HalfD, 1, 1);
+      SetLength(FLongFactors, HalfD);
+      for pairIdx := 0 to HalfD - 1 do
+        FLongFactors[pairIdx] := 1.0;
+    end;
+  end;
   Scale := GetScaleFactor();
   Alpha := FFloatSt[2];
   Beta := FFloatSt[3];
@@ -26148,8 +30054,19 @@ begin
   YarnHigh := 0;
   if (Mode = rsmYaRN) and (TrainLen > 0) then
   begin
-    YarnLow := Floor(CorrectionDim(Beta));   // beta_fast edge (high freq)
-    YarnHigh := Ceil(CorrectionDim(Alpha));  // beta_slow edge (low freq)
+    // FStruct[2]=1 (gpt-oss "truncate": false) skips the floor/ceil rounding
+    // of the band edges; the default (FStruct[2]=0) floors/ceils them as HF's
+    // truncate=true does.
+    if FStruct[2] = 1 then
+    begin
+      YarnLow := CorrectionDim(Beta);   // beta_fast edge (high freq)
+      YarnHigh := CorrectionDim(Alpha); // beta_slow edge (low freq)
+    end
+    else
+    begin
+      YarnLow := Floor(CorrectionDim(Beta));   // beta_fast edge (high freq)
+      YarnHigh := Ceil(CorrectionDim(Alpha));  // beta_slow edge (low freq)
+    end;
     if YarnLow < 0 then YarnLow := 0;
     if YarnHigh > pDepth - 1 then YarnHigh := pDepth - 1;
     if YarnHigh = YarnLow then YarnHigh := YarnLow + 0.001; // HF guard
@@ -26161,6 +30078,15 @@ begin
     case Mode of
       // Position Interpolation: angle uses m/s, i.e. theta' = theta/s.
       rsmPositionInterpolation: Theta := Theta / Scale;
+      // LongRoPE: divide each inverse frequency by its per-pair factor
+      // (theta'_i = theta_i / long_factor_i), matching HF
+      // Phi3LongRoPEScaledRotaryEmbedding (inv_freq = 1/(factor*base^(2i/d))).
+      rsmLongRoPE:
+        begin
+          LongFactor := FLongFactors[pairIdx];
+          if LongFactor <= 0 then LongFactor := 1.0;
+          Theta := Theta / LongFactor;
+        end;
       rsmYaRN:
         begin
           // gamma=1 (below the low band edge, short wavelength) keeps
@@ -26194,11 +30120,25 @@ begin
   // Applied to BOTH q and k (the builders insert this layer on both
   // streams), attention logits gain the full 1/t = mscale^2.
   // rsmLlama3 deliberately skips this (HF attention_factor = 1.0).
+  // DeepSeek-V2/-V3 carry explicit "mscale"/"mscale_all_dim" rope_scaling
+  // fields; the importer folds them into the single attention scaling
+  //   _yarn_get_mscale(s,mscale)/_yarn_get_mscale(s,mscale_all_dim)
+  // and passes it through FFloatSt[4] (>0). When present it OVERRIDES the
+  // 0.1*ln(s)+1 default; absent (FFloatSt[4]<=0) keeps the default bit-for-bit.
   if Mode = rsmYaRN then
   begin
-    Temperature := 0.1 * pcr_logf(Scale) + 1.0;
-    FOutScale := Temperature;
+    if FFloatSt[4] > 0 then
+      FOutScale := FFloatSt[4]
+    else
+    begin
+      Temperature := 0.1 * pcr_logf(Scale) + 1.0;
+      FOutScale := Temperature;
+    end;
   end;
+  // LongRoPE attention scaling (long_mscale): multiply the rotated output by
+  // the imported factor, applied to BOTH q and k by the builders.
+  if (Mode = rsmLongRoPE) and (FFloatSt[4] > 0) then
+    FOutScale := FFloatSt[4];
 end;
 
 procedure TNNetRotaryEmbedding.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -28546,6 +32486,117 @@ begin
   Result := StringReplace(inherited SaveStructureToString,'::',':'+ChannelsStr+':',[rfReplaceAll]);
 end;
 
+{ TNNetGatherTokens }
+
+constructor TNNetGatherTokens.Create();
+begin
+  Create([0]);
+end;
+
+constructor TNNetGatherTokens.Create(pTokens: array of integer);
+var
+  I: integer;
+begin
+  inherited Create();
+  SetLength(FTokens, Length(pTokens));
+  for I := 0 to High(pTokens) do
+    FTokens[I] := pTokens[I];
+end;
+
+destructor TNNetGatherTokens.Destroy();
+begin
+  SetLength(FTokens, 0);
+  inherited Destroy();
+end;
+
+procedure TNNetGatherTokens.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  I, Tok, SeqLen, OutLen: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  SeqLen := pPrevLayer.Output.SizeX;
+  OutLen := Length(FTokens);
+  if OutLen = 0 then
+  begin
+    FErrorProc('TNNetGatherTokens requires a non-empty index list');
+    Exit;
+  end;
+  if pPrevLayer.Output.SizeY <> 1 then
+    FErrorProc('TNNetGatherTokens requires a (SizeX,1,Depth) sequence, got ' +
+      'SizeY=' + IntToStr(pPrevLayer.Output.SizeY));
+  for I := 0 to OutLen - 1 do
+  begin
+    Tok := FTokens[I];
+    if (Tok < 0) or (Tok >= SeqLen) then
+    begin
+      FErrorProc('TNNetGatherTokens requires 0 <= idx < Input.SizeX, got idx=' +
+        IntToStr(Tok) + ' SizeX=' + IntToStr(SeqLen));
+      Exit;
+    end;
+  end;
+  FOutput.ReSize(OutLen, 1, pPrevLayer.Output.Depth);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetGatherTokens.Compute();
+var
+  StartTime: double;
+  X, D, MaxX, MaxD: integer;
+  Prev: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.Output;
+  MaxX := Length(FTokens) - 1;
+  MaxD := Prev.Depth - 1;
+  for X := 0 to MaxX do
+    for D := 0 to MaxD do
+      FOutput[X, 0, D] := Prev[FTokens[X], 0, D];
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGatherTokens.Backpropagate();
+var
+  StartTime: double;
+  X, D, MaxX, MaxD: integer;
+  PrevErr: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    PrevErr := FPrevLayer.OutputError;
+    MaxX := FOutput.SizeX - 1;
+    MaxD := FOutput.Depth - 1;
+    // Scatter each output position's error back to its source position. Add (not
+    // assign) so repeated indices correctly accumulate onto the shared source.
+    for X := 0 to MaxX do
+      for D := 0 to MaxD do
+        PrevErr.Add(FTokens[X], 0, D, FOutputError[X, 0, D]);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+function TNNetGatherTokens.SaveStructureToString(): string;
+var
+  I, MaxTokens: integer;
+  TokensStr: string;
+begin
+  TokensStr := '';
+  MaxTokens := Length(FTokens) - 1;
+  for I := 0 to MaxTokens do
+  begin
+    if I > 0 then TokensStr := TokensStr + ';';
+    TokensStr := TokensStr + IntToStr(FTokens[I]);
+  end;
+  Result := StringReplace(inherited SaveStructureToString,'::',':'+TokensStr+':',[rfReplaceAll]);
+end;
+
 { TNNetChannelShuffle }
 
 procedure TNNetChannelShuffle.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -30004,6 +34055,186 @@ begin
   FLayerB.Backpropagate();
 end;
 
+{ TNNetAdaIN }
+constructor TNNetAdaIN.Create(ContentLayer, StyleLayer: TNNetLayer);
+begin
+  Self.Create(ContentLayer.LayerIdx, StyleLayer.LayerIdx);
+end;
+
+constructor TNNetAdaIN.Create(ContentIdx, StyleIdx: integer);
+begin
+  inherited Create();
+  FContentIdx := ContentIdx;
+  FStyleIdx := StyleIdx;
+  FStruct[0] := ContentIdx;
+  FStruct[1] := StyleIdx;
+  FAdaEpsilon := 1e-5;
+  FContentMean := TNNetVolume.Create();
+  FContentInvStd := TNNetVolume.Create();
+  FStyleMean := TNNetVolume.Create();
+  FStyleStd := TNNetVolume.Create();
+  FNormContent := TNNetVolume.Create();
+end;
+
+destructor TNNetAdaIN.Destroy();
+begin
+  FContentMean.Free;
+  FContentInvStd.Free;
+  FStyleMean.Free;
+  FStyleStd.Free;
+  FNormContent.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetAdaIN.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  FContentLayer := pPrevLayer.NN.Layers[FContentIdx];
+  FStyleLayer := pPrevLayer.NN.Layers[FStyleIdx];
+  FContentLayer.IncDepartingBranchesCnt();
+  FStyleLayer.IncDepartingBranchesCnt();
+  // The content layer drives the output shape.
+  inherited SetPrevLayer(FContentLayer);
+  if FContentLayer.Output.Depth <> FStyleLayer.Output.Depth then
+  begin
+    FErrorProc('TNNetAdaIN - content channels ' +
+      IntToStr(FContentLayer.Output.Depth) +
+      ' do not match style channels ' + IntToStr(FStyleLayer.Output.Depth)
+    );
+  end;
+  FContentMean.ReSize(1, 1, FContentLayer.Output.Depth);
+  FContentInvStd.ReSize(1, 1, FContentLayer.Output.Depth);
+  FStyleMean.ReSize(1, 1, FContentLayer.Output.Depth);
+  FStyleStd.ReSize(1, 1, FContentLayer.Output.Depth);
+  FNormContent.ReSize(FContentLayer.Output);
+  FOutputError.ReSize(FContentLayer.Output);
+  FOutputErrorDeriv.ReSize(FContentLayer.Output);
+end;
+
+procedure TNNetAdaIN.Compute();
+var
+  StartTime: double;
+  C, ContentN, StyleM: integer;
+  CntX, CntY: integer;
+  Mean, Variance, InvStd, StyleMean, StyleVar: TNeuralFloat;
+  Depth: integer;
+  ContentOut, StyleOut: TNNetVolume;
+begin
+  StartTime := Now();
+  // inherited Compute copies the content layer output into FOutput.
+  inherited Compute;
+  ContentOut := FContentLayer.Output;
+  StyleOut := FStyleLayer.Output;
+  Depth := ContentOut.Depth;
+  ContentN := ContentOut.SizeX * ContentOut.SizeY;
+  StyleM := StyleOut.SizeX * StyleOut.SizeY;
+  for C := 0 to Depth - 1 do
+  begin
+    // Content statistics over its spatial positions.
+    Mean := 0;
+    for CntX := 0 to ContentOut.SizeX - 1 do
+      for CntY := 0 to ContentOut.SizeY - 1 do
+        Mean := Mean + ContentOut[CntX, CntY, C];
+    Mean := Mean / ContentN;
+    Variance := 0;
+    for CntX := 0 to ContentOut.SizeX - 1 do
+      for CntY := 0 to ContentOut.SizeY - 1 do
+        Variance := Variance +
+          Sqr(ContentOut[CntX, CntY, C] - Mean);
+    Variance := Variance / ContentN;
+    InvStd := 1 / Sqrt(Variance + FAdaEpsilon);
+    FContentMean.FData[C] := Mean;
+    FContentInvStd.FData[C] := InvStd;
+    // Style statistics over its (possibly different size) spatial positions.
+    StyleMean := 0;
+    for CntX := 0 to StyleOut.SizeX - 1 do
+      for CntY := 0 to StyleOut.SizeY - 1 do
+        StyleMean := StyleMean + StyleOut[CntX, CntY, C];
+    StyleMean := StyleMean / StyleM;
+    StyleVar := 0;
+    for CntX := 0 to StyleOut.SizeX - 1 do
+      for CntY := 0 to StyleOut.SizeY - 1 do
+        StyleVar := StyleVar + Sqr(StyleOut[CntX, CntY, C] - StyleMean);
+    StyleVar := StyleVar / StyleM;
+    FStyleMean.FData[C] := StyleMean;
+    FStyleStd.FData[C] := Sqrt(StyleVar + FAdaEpsilon);
+    // out = style_std * (content - content_mean) * inv_content_std + style_mean
+    for CntX := 0 to ContentOut.SizeX - 1 do
+      for CntY := 0 to ContentOut.SizeY - 1 do
+      begin
+        FNormContent[CntX, CntY, C] :=
+          (ContentOut[CntX, CntY, C] - Mean) * InvStd;
+        FOutput[CntX, CntY, C] :=
+          FStyleStd.FData[C] * FNormContent[CntX, CntY, C] + StyleMean;
+      end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetAdaIN.Backpropagate();
+var
+  StartTime: double;
+  C, ContentN, StyleM, Depth: integer;
+  CntX, CntY: integer;
+  G, XHat, SHat: TNeuralFloat;
+  SumG, SumGXHat: TNeuralFloat;
+  StyleMean, StyleStd, ContentInvStd: TNeuralFloat;
+  ContentErr, StyleErr: TNNetVolume;
+  ContentOut, StyleOut: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  ContentErr := FContentLayer.OutputError;
+  StyleErr := FStyleLayer.OutputError;
+  ContentOut := FContentLayer.Output;
+  StyleOut := FStyleLayer.Output;
+  Depth := ContentOut.Depth;
+  ContentN := ContentOut.SizeX * ContentOut.SizeY;
+  StyleM := StyleOut.SizeX * StyleOut.SizeY;
+  for C := 0 to Depth - 1 do
+  begin
+    StyleMean := FStyleMean.FData[C];
+    StyleStd := FStyleStd.FData[C];
+    ContentInvStd := FContentInvStd.FData[C];
+    // Reductions of the upstream gradient over the CONTENT spatial positions.
+    SumG := 0;
+    SumGXHat := 0;
+    for CntX := 0 to ContentOut.SizeX - 1 do
+      for CntY := 0 to ContentOut.SizeY - 1 do
+      begin
+        G := FOutputError[CntX, CntY, C];
+        SumG := SumG + G;
+        SumGXHat := SumGXHat + G * FNormContent[CntX, CntY, C];
+      end;
+    // d out / d content : instance-norm Jacobian scaled by style_std/content_std.
+    //   dx_i = (style_std * inv_content_std / N) *
+    //          ( N*g_i - sum(g) - xhat_i * sum(g*xhat) )
+    for CntX := 0 to ContentOut.SizeX - 1 do
+      for CntY := 0 to ContentOut.SizeY - 1 do
+      begin
+        G := FOutputError[CntX, CntY, C];
+        XHat := FNormContent[CntX, CntY, C];
+        ContentErr[CntX, CntY, C] := ContentErr[CntX, CntY, C] +
+          (StyleStd * ContentInvStd / ContentN) *
+          (ContentN * G - SumG - XHat * SumGXHat);
+      end;
+    // d out / d style : flows through style_mean (1/M spread) and style_std.
+    //   ds_j = sum(g)/M + sum(g*xhat) * shat_j / M
+    //   where shat_j = (s_j - style_mean) / style_std.
+    for CntX := 0 to StyleOut.SizeX - 1 do
+      for CntY := 0 to StyleOut.SizeY - 1 do
+      begin
+        SHat := (StyleOut[CntX, CntY, C] - StyleMean) / StyleStd;
+        StyleErr[CntX, CntY, C] := StyleErr[CntX, CntY, C] +
+          (SumG / StyleM) + (SumGXHat * SHat / StyleM);
+      end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FContentLayer.Backpropagate();
+  FStyleLayer.Backpropagate();
+end;
+
 { TNNetForByteProcessing }
 constructor TNNetForByteProcessing.Create();
 begin
@@ -31443,6 +35674,217 @@ begin
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
+{ TNNetBilinearUpsample }
+constructor TNNetBilinearUpsample.Create(pFactor: integer);
+begin
+  inherited Create();
+  if pFactor < 1 then pFactor := 1;
+  FStruct[0] := pFactor;
+end;
+
+procedure TNNetBilinearUpsample.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  s: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  s := FStruct[0];
+  if s < 1 then s := 1;
+  FOutput.ReSize(pPrevLayer.Output.SizeX * s,
+                 pPrevLayer.Output.SizeY * s,
+                 pPrevLayer.Output.Depth);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+// Bilinear sampling shared geometry: for output index o on an axis of input
+// size InSize, returns the two source corner indices i0,i1 and the weight w1 of
+// the FAR (i1) corner (the near corner i0 weight is 1-w1). align_corners=False.
+procedure BilinearMap(o, s, InSize: integer; out i0, i1: integer;
+  out w1: TNeuralFloat); inline;
+var
+  src, ff: TNeuralFloat;
+begin
+  src := (o + 0.5) / s - 0.5;
+  if src < 0 then src := 0;
+  i0 := Trunc(src);
+  ff := src - i0;
+  i1 := i0 + 1;
+  if i1 > InSize - 1 then i1 := InSize - 1;
+  if i0 > InSize - 1 then i0 := InSize - 1;
+  w1 := ff;
+end;
+
+procedure TNNetBilinearUpsample.Compute();
+var
+  s, OutX, OutY, D, ox, oy, c: integer;
+  ix0, ix1, iy0, iy1: integer;
+  wx1, wy1, v: TNeuralFloat;
+  StartTime: double;
+begin
+  StartTime := Now();
+  s := FStruct[0];
+  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
+  for oy := 0 to OutY - 1 do
+  begin
+    BilinearMap(oy, s, FPrevLayer.Output.SizeY, iy0, iy1, wy1);
+    for ox := 0 to OutX - 1 do
+    begin
+      BilinearMap(ox, s, FPrevLayer.Output.SizeX, ix0, ix1, wx1);
+      for c := 0 to D - 1 do
+      begin
+        v := (1 - wy1) * ((1 - wx1) * FPrevLayer.Output[ix0, iy0, c] +
+                          wx1 * FPrevLayer.Output[ix1, iy0, c]) +
+             wy1 * ((1 - wx1) * FPrevLayer.Output[ix0, iy1, c] +
+                    wx1 * FPrevLayer.Output[ix1, iy1, c]);
+        FOutput[ox, oy, c] := v;
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetBilinearUpsample.Backpropagate();
+var
+  s, OutX, OutY, D, ox, oy, c: integer;
+  ix0, ix1, iy0, iy1: integer;
+  wx1, wy1, g: TNeuralFloat;
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  s := FStruct[0];
+  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
+  for oy := 0 to OutY - 1 do
+  begin
+    BilinearMap(oy, s, FPrevLayer.Output.SizeY, iy0, iy1, wy1);
+    for ox := 0 to OutX - 1 do
+    begin
+      BilinearMap(ox, s, FPrevLayer.Output.SizeX, ix0, ix1, wx1);
+      for c := 0 to D - 1 do
+      begin
+        g := FOutputError[ox, oy, c];
+        FPrevLayer.OutputError.Add(ix0, iy0, c, (1 - wy1) * (1 - wx1) * g);
+        FPrevLayer.OutputError.Add(ix1, iy0, c, (1 - wy1) * wx1 * g);
+        FPrevLayer.OutputError.Add(ix0, iy1, c, wy1 * (1 - wx1) * g);
+        FPrevLayer.OutputError.Add(ix1, iy1, c, wy1 * wx1 * g);
+      end;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetBilinearResize }
+constructor TNNetBilinearResize.Create(pOutW, pOutH, pAlignCorners: integer);
+begin
+  inherited Create();
+  if pOutW < 1 then pOutW := 1;
+  if pOutH < 1 then pOutH := 1;
+  FStruct[0] := pOutW;
+  FStruct[1] := pOutH;
+  if pAlignCorners <> 0 then FStruct[2] := 1 else FStruct[2] := 0;
+end;
+
+procedure TNNetBilinearResize.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FOutput.ReSize(FStruct[0], FStruct[1], pPrevLayer.Output.Depth);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+// Resize sampling geometry: for output index o on an axis of input size InSize
+// resized to OutSize, returns the two source corner indices i0,i1 and the FAR
+// (i1) corner weight w1 (near corner i0 weight is 1-w1).
+procedure BilinearResizeMap(o, OutSize, InSize, AlignCorners: integer;
+  out i0, i1: integer; out w1: TNeuralFloat); inline;
+var
+  src, ff: TNeuralFloat;
+begin
+  if AlignCorners <> 0 then
+  begin
+    if OutSize > 1 then src := o * (InSize - 1) / (OutSize - 1)
+    else src := 0;
+  end
+  else
+  begin
+    src := (o + 0.5) * InSize / OutSize - 0.5;
+    if src < 0 then src := 0;
+  end;
+  i0 := Trunc(src);
+  ff := src - i0;
+  i1 := i0 + 1;
+  if i1 > InSize - 1 then i1 := InSize - 1;
+  if i0 > InSize - 1 then i0 := InSize - 1;
+  w1 := ff;
+end;
+
+procedure TNNetBilinearResize.Compute();
+var
+  OutX, OutY, D, InX, InY, AC, ox, oy, c: integer;
+  ix0, ix1, iy0, iy1: integer;
+  wx1, wy1, v: TNeuralFloat;
+  StartTime: double;
+begin
+  StartTime := Now();
+  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
+  InX := FPrevLayer.Output.SizeX; InY := FPrevLayer.Output.SizeY;
+  AC := FStruct[2];
+  for oy := 0 to OutY - 1 do
+  begin
+    BilinearResizeMap(oy, OutY, InY, AC, iy0, iy1, wy1);
+    for ox := 0 to OutX - 1 do
+    begin
+      BilinearResizeMap(ox, OutX, InX, AC, ix0, ix1, wx1);
+      for c := 0 to D - 1 do
+      begin
+        v := (1 - wy1) * ((1 - wx1) * FPrevLayer.Output[ix0, iy0, c] +
+                          wx1 * FPrevLayer.Output[ix1, iy0, c]) +
+             wy1 * ((1 - wx1) * FPrevLayer.Output[ix0, iy1, c] +
+                    wx1 * FPrevLayer.Output[ix1, iy1, c]);
+        FOutput[ox, oy, c] := v;
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetBilinearResize.Backpropagate();
+var
+  OutX, OutY, D, InX, InY, AC, ox, oy, c: integer;
+  ix0, ix1, iy0, iy1: integer;
+  wx1, wy1, g: TNeuralFloat;
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
+  InX := FPrevLayer.Output.SizeX; InY := FPrevLayer.Output.SizeY;
+  AC := FStruct[2];
+  for oy := 0 to OutY - 1 do
+  begin
+    BilinearResizeMap(oy, OutY, InY, AC, iy0, iy1, wy1);
+    for ox := 0 to OutX - 1 do
+    begin
+      BilinearResizeMap(ox, OutX, InX, AC, ix0, ix1, wx1);
+      for c := 0 to D - 1 do
+      begin
+        g := FOutputError[ox, oy, c];
+        FPrevLayer.OutputError.Add(ix0, iy0, c, (1 - wy1) * (1 - wx1) * g);
+        FPrevLayer.OutputError.Add(ix1, iy0, c, (1 - wy1) * wx1 * g);
+        FPrevLayer.OutputError.Add(ix0, iy1, c, wy1 * (1 - wx1) * g);
+        FPrevLayer.OutputError.Add(ix1, iy1, c, wy1 * wx1 * g);
+      end;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
 constructor TNNetHyperbolicTangent.Create();
 begin
   inherited Create();
@@ -31787,6 +36229,7 @@ constructor TNNetVeryLeakyReLU.Create();
 begin
   inherited Create();
   FAlpha := 1/3;
+  FFloatSt[0] := FAlpha;
 end;
 
 { TNNetRReLU }
@@ -31874,6 +36317,15 @@ begin
   inherited Create();
   FAlpha := 0.01;
   FThreshold := 0.0;
+  FFloatSt[0] := FAlpha;
+end;
+
+constructor TNNetLeakyReLU.Create(pAlpha: TNeuralFloat);
+begin
+  inherited Create();
+  FAlpha := pAlpha;
+  FThreshold := 0.0;
+  FFloatSt[0] := FAlpha;
 end;
 
 procedure TNNetLeakyReLU.Compute();
@@ -34859,7 +39311,16 @@ end;
 constructor TNNetTokenShift.Create();
 begin
   inherited Create();
+  FDecPrev := TNNetVolume.Create();
+  FDecodeEnabled := false;
+  FDecodeSteps := 0;
   InitDefault();
+end;
+
+destructor TNNetTokenShift.Destroy();
+begin
+  FDecPrev.Free;
+  inherited Destroy();
 end;
 
 procedure TNNetTokenShift.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -34870,6 +39331,7 @@ begin
       IntToStr(pPrevLayer.FOutput.SizeY));
   // The base class already calls SetNumWeightsForAllNeurons(1,1,Depth)
   // and InitDefault().
+  FDecPrev.ReSize(1, 1, pPrevLayer.FOutput.Depth);
 end;
 
 procedure TNNetTokenShift.Compute();
@@ -34880,6 +39342,11 @@ var
   mix, one_minus_mix, xt, xtm1: TNeuralFloat;
   W: TNNetVolume;
 begin
+  if FDecodeEnabled then
+  begin
+    ComputeIncremental();
+    exit;
+  end;
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
@@ -34908,6 +39375,88 @@ begin
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Inference-only stateful forward. The per-token output is ALGEBRAICALLY
+// IDENTICAL to one step of Compute()'s full-sequence shift
+//   y[t,c] = mix[c]*x[t,c] + (1-mix[c])*x[t-1,c]   (x[-1,c]=0),
+// but the "previous token" x[t-1] resumes from the PERSISTED FDecPrev (carried
+// across calls) instead of being re-read from a re-scanned sequence. At a fresh
+// start FDecPrev is zero, so the t=0 zero-padding is reproduced exactly. The
+// loop is O(1) in past context (it only sweeps the SeqLen supplied this call -
+// one token for a decode step, many for a prompt prefill). Driving the whole
+// sequence token-by-token through this path reproduces the full-scan output
+// bit-for-bit. No gradient cache is written (inference-only).
+procedure TNNetTokenShift.ComputeIncremental();
+var
+  StartTime: double;
+  SeqLen, Depth, t, d: integer;
+  Prev: TNNetVolume;
+  mix, one_minus_mix, xt, xtm1: TNeuralFloat;
+  W: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  Depth := Prev.Depth;
+  W := FNeurons[0].FWeights;
+  for t := 0 to SeqLen - 1 do
+  begin
+    for d := 0 to Depth - 1 do
+    begin
+      mix := W.Raw[d];
+      one_minus_mix := 1.0 - mix;
+      xt := Prev[t, 0, d];
+      // x_{t-1}: the persisted previous token for the first row in this call,
+      // then the row just consumed for subsequent rows in a multi-token prefill.
+      xtm1 := FDecPrev.FData[d];
+      FOutput[t, 0, d] := mix * xt + one_minus_mix * xtm1;
+      // Persist the current token as the new "previous".
+      FDecPrev.FData[d] := xt;
+    end;
+  end;
+  Inc(FDecodeSteps, SeqLen);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetTokenShift.BeginIncrementalDecode();
+begin
+  // The carried state is one Depth-long previous-token buffer; no MaxContext
+  // budget is needed (contrast the attention KV cache). The buffer is already
+  // sized by SetPrevLayer; ReSize is a safety net for layers wired manually.
+  FDecPrev.ReSize(1, 1, FOutput.Depth);
+  ResetState();
+  FDecodeEnabled := true;
+end;
+
+procedure TNNetTokenShift.EndIncrementalDecode();
+begin
+  FDecodeEnabled := false;
+  FDecodeSteps := 0;
+end;
+
+procedure TNNetTokenShift.ResetState();
+begin
+  FDecPrev.Fill(0);          // x_{-1} = 0 (the full-scan left zero-padding)
+  FDecodeSteps := 0;
+end;
+
+procedure TNNetTokenShift.ResetCache();
+begin
+  ResetState();
+end;
+
+procedure TNNetTokenShift.CaptureState(Dst: TNNetVolume; out Steps: integer);
+begin
+  Dst.ReSize(1, 1, FDecPrev.Size);
+  Dst.Copy(FDecPrev);
+  Steps := FDecodeSteps;
+end;
+
+procedure TNNetTokenShift.RestoreState(Src: TNNetVolume; Steps: integer);
+begin
+  FDecPrev.Copy(Src);
+  FDecodeSteps := Steps;
 end;
 
 procedure TNNetTokenShift.Backpropagate();
@@ -35264,6 +39813,185 @@ begin
   InitHeUniform(1);
 end;
 
+{ TNNetConvolution3D }
+constructor TNNetConvolution3D.Create(pNumFeatures, pFeatureSizeT,
+  pFeatureSizeXY, pInputPadding, pStride, pInputChannels: integer;
+  pSuppressBias: integer = 0);
+begin
+  inherited Create();
+  FFeatureSizeT := Max(pFeatureSizeT, 1);
+  FFeatureSizeXY := Max(pFeatureSizeXY, 1);
+  FPadding := Max(pInputPadding, 0);
+  FStride := Max(pStride, 1);
+  FChannels := Max(pInputChannels, 1);
+  FSuppressBias := pSuppressBias;
+  AddNeurons(pNumFeatures);
+  FStruct[0] := pNumFeatures;
+  FStruct[1] := FFeatureSizeXY;
+  FStruct[2] := FPadding;
+  FStruct[3] := FStride;
+  FStruct[4] := FSuppressBias;
+  FStruct[5] := FFeatureSizeT;
+  FStruct[6] := FChannels;
+end;
+
+procedure TNNetConvolution3D.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  OutW, OutH: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (pPrevLayer.FOutput.Depth mod FChannels) <> 0 then
+    FErrorProc('TNNetConvolution3D requires input Depth to be a multiple of '+
+      'InChannelsPerFrame=' + IntToStr(FChannels) + ', got Depth=' +
+      IntToStr(pPrevLayer.FOutput.Depth));
+  FInputW := pPrevLayer.FOutput.SizeX;
+  FInputH := pPrevLayer.FOutput.SizeY;
+  FInputT := pPrevLayer.FOutput.Depth div FChannels;
+  if FInputT < FFeatureSizeT then
+    FErrorProc('TNNetConvolution3D requires input frames (' +
+      IntToStr(FInputT) + ') >= temporal kernel (' +
+      IntToStr(FFeatureSizeT) + ')');
+  // Spatial: padded/strided VALID conv (same as the 2-D conv geometry).
+  OutW := (FInputW + 2*FPadding - FFeatureSizeXY) div FStride + 1;
+  OutH := (FInputH + 2*FPadding - FFeatureSizeXY) div FStride + 1;
+  if (OutW < 1) or (OutH < 1) then
+    FErrorProc('TNNetConvolution3D produced empty spatial output.');
+  // Temporal: VALID conv (no temporal padding).
+  FOutputT := FInputT - FFeatureSizeT + 1;
+  FOutput.ReSize(OutW, OutH, FOutputT * FNeurons.Count);
+  FOutputError.ReSize(OutW, OutH, FOutputT * FNeurons.Count);
+  FOutputErrorDeriv.ReSize(OutW, OutH, FOutputT * FNeurons.Count);
+  // Each feature reads a (FeatureSizeXY, FeatureSizeXY, FeatureSizeT*C) window.
+  SetNumWeightsForAllNeurons(FFeatureSizeXY, FFeatureSizeXY,
+    FFeatureSizeT * FChannels);
+  InitDefault();
+  AfterWeightUpdate();
+end;
+
+procedure TNNetConvolution3D.Compute();
+var
+  StartTime: double;
+  Prev: TNNetVolume;
+  NumFeat, ot, oy, ox, f, kt, ky, kx, ix, iy: integer;
+  inDepthBase, wDepthBase: integer;
+  sum: TNeuralFloat;
+  localNeuron: TNNetNeuron;
+  W: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  NumFeat := FNeurons.Count;
+  for f := 0 to NumFeat - 1 do
+  begin
+    localNeuron := FNeurons[f];
+    W := localNeuron.FWeights;
+    for ot := 0 to FOutputT - 1 do
+    for oy := 0 to FOutput.SizeY - 1 do
+    for ox := 0 to FOutput.SizeX - 1 do
+    begin
+      if FSuppressBias = 0
+        then sum := localNeuron.FBiasWeight
+        else sum := 0;
+      for kt := 0 to FFeatureSizeT - 1 do
+      begin
+        inDepthBase := (ot + kt) * FChannels;     // input frame ot+kt
+        wDepthBase := kt * FChannels;             // weight tap kt
+        for ky := 0 to FFeatureSizeXY - 1 do
+        begin
+          iy := oy * FStride - FPadding + ky;
+          if (iy < 0) or (iy >= FInputH) then continue;
+          for kx := 0 to FFeatureSizeXY - 1 do
+          begin
+            ix := ox * FStride - FPadding + kx;
+            if (ix < 0) or (ix >= FInputW) then continue;
+            // Contiguous C-channel dot product (AVX).
+            sum := sum + TNNetVolume.DotProduct(
+              W.GetRawPtr(kx, ky, wDepthBase),
+              Prev.GetRawPtr(ix, iy, inDepthBase), FChannels);
+          end;
+        end;
+      end;
+      FOutput[ox, oy, ot * NumFeat + f] := sum;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetConvolution3D.Backpropagate();
+var
+  StartTime: double;
+  Prev, PrevErr: TNNetVolume;
+  NumFeat, ot, oy, ox, f, kt, ky, kx, ix, iy: integer;
+  inDepthBase, wDepthBase: integer;
+  gy: TNeuralFloat;
+  localNeuron: TNNetNeuron;
+  W, GW: TNNetVolume;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  NumFeat := FNeurons.Count;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = Prev.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+
+  // Standard conv backward (over the contiguous C axis with AVX MulAdd):
+  //   dL/dW[f][kx,ky,kt*C+c] += OutErr[ox,oy,ot] * x[ix,iy,(ot+kt)*C+c]
+  //   dL/dx[ix,iy,(ot+kt)*C+c] += OutErr[ox,oy,ot] * W[f][kx,ky,kt*C+c]
+  //   dL/dbias[f] += OutErr[ox,oy,ot]
+  // -FLearningRate convention on the accumulated weight/bias deltas.
+  for f := 0 to NumFeat - 1 do
+  begin
+    localNeuron := FNeurons[f];
+    W := localNeuron.FWeights;
+    GW := localNeuron.FDelta;
+    for ot := 0 to FOutputT - 1 do
+    for oy := 0 to FOutput.SizeY - 1 do
+    for ox := 0 to FOutput.SizeX - 1 do
+    begin
+      gy := FOutputError[ox, oy, ot * NumFeat + f];
+      if gy = 0 then continue;
+      if FSuppressBias = 0 then
+        localNeuron.FBiasDelta := localNeuron.FBiasDelta + (-FLearningRate) * gy;
+      for kt := 0 to FFeatureSizeT - 1 do
+      begin
+        inDepthBase := (ot + kt) * FChannels;
+        wDepthBase := kt * FChannels;
+        for ky := 0 to FFeatureSizeXY - 1 do
+        begin
+          iy := oy * FStride - FPadding + ky;
+          if (iy < 0) or (iy >= FInputH) then continue;
+          for kx := 0 to FFeatureSizeXY - 1 do
+          begin
+            ix := ox * FStride - FPadding + kx;
+            if (ix < 0) or (ix >= FInputW) then continue;
+            TNNetVolume.MulAdd(GW.GetRawPtr(kx, ky, wDepthBase),
+              Prev.GetRawPtr(ix, iy, inDepthBase),
+              (-FLearningRate) * gy, FChannels);
+            if hasInputGrad then
+              TNNetVolume.MulAdd(PrevErr.GetRawPtr(ix, iy, inDepthBase),
+                W.GetRawPtr(kx, ky, wDepthBase), gy, FChannels);
+          end;
+        end;
+      end;
+    end;
+    if (not FBatchUpdate) then localNeuron.UpdateWeights(FInertia);
+  end;
+  if (not FBatchUpdate) then AfterWeightUpdate();
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetConvolution3D.InitDefault();
+begin
+  // He init, like the convolution layers.
+  InitHeUniform(1);
+end;
+
 { TNNetDiagonalSSM }
 constructor TNNetDiagonalSSM.Create();
 begin
@@ -35458,6 +40186,18 @@ procedure TNNetDiagonalSSM.ResetState();
 begin
   FDecodeH.Fill(0);
   FDecodeSteps := 0;
+end;
+
+procedure TNNetDiagonalSSM.CaptureState(Dst: TNNetVolume; out Steps: integer);
+begin
+  Dst.Copy(FDecodeH);
+  Steps := FDecodeSteps;
+end;
+
+procedure TNNetDiagonalSSM.RestoreState(Src: TNNetVolume; Steps: integer);
+begin
+  FDecodeH.Copy(Src);
+  FDecodeSteps := Steps;
 end;
 
 procedure TNNetDiagonalSSM.Backpropagate();
@@ -35864,12 +40604,20 @@ begin
   FB := TNNetVolume.Create();
   FGradW := TNNetVolume.Create();
   FGradU := TNNetVolume.Create();
+  FDecAA := TNNetVolume.Create();
+  FDecBB := TNNetVolume.Create();
+  FDecPP := TNNetVolume.Create();
+  FDecodeEnabled := false;
+  FDecodeSteps := 0;
   // [0]=w_raw [1]=u
   AddMissingNeurons(2);
 end;
 
 destructor TNNetWKV.Destroy();
 begin
+  FDecPP.Free;
+  FDecBB.Free;
+  FDecAA.Free;
   FGradU.Free;
   FGradW.Free;
   FB.Free;
@@ -35907,6 +40655,9 @@ begin
   FB.ReSize(FOutput.SizeX, 1, FChannels);
   FGradW.ReSize(1, 1, FChannels);
   FGradU.ReSize(1, 1, FChannels);
+  FDecAA.ReSize(1, 1, FChannels);
+  FDecBB.ReSize(1, 1, FChannels);
+  FDecPP.ReSize(1, 1, FChannels);
   InitDefault();
 end;
 
@@ -35920,6 +40671,11 @@ var
   ww2, qmax2, e3, e4: TNeuralFloat;
   anew, bnew: TNeuralFloat;
 begin
+  if FDecodeEnabled then
+  begin
+    ComputeIncremental();
+    exit;
+  end;
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   Ww := FNeurons[0].FWeights;
@@ -35976,6 +40732,139 @@ begin
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Inference-only stateful forward. The per-token recurrence is ALGEBRAICALLY
+// IDENTICAL to one step of Compute()'s full-sequence scan (same RWKV-v4
+// running-max stabiliser), but the running stabilised state (A,B,Q) resumes
+// from the PERSISTED FDecAA/FDecBB/FDecPP (carried across calls) instead of
+// starting at (0,0,-inf), the true-accumulator BPTT cache FA/FB is NOT written,
+// and the loop is O(1) in past context (it only sweeps the SeqLen supplied this
+// call - one token for a decode step, many for a prompt prefill). Driving the
+// whole sequence token-by-token through this path reproduces the full-scan
+// output bit-for-bit.
+procedure TNNetWKV.ComputeIncremental();
+var
+  StartTime: double;
+  Ww, Wu, Prev: TNNetVolume;
+  SeqLen, C, t, d: integer;
+  wv, uv, kt, vt, aprev, bprev: TNeuralFloat;
+  qprev, ww1, qmax, e1, e2, num, den: TNeuralFloat;
+  ww2, qmax2, e3, e4, anew, bnew: TNeuralFloat;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  Ww := FNeurons[0].FWeights;
+  Wu := FNeurons[1].FWeights;
+  SeqLen := FOutput.SizeX;
+  C := FChannels;
+  // Per-channel positive decay w = softplus(w_raw) (same as Compute()).
+  for d := 0 to C - 1 do
+  begin
+    if Ww.FData[d] > 30 then FW.FData[d] := Ww.FData[d]
+    else FW.FData[d] := Ln(1 + Exp(Ww.FData[d]));
+  end;
+  for d := 0 to C - 1 do
+  begin
+    wv := FW.FData[d];
+    uv := Wu.FData[d];
+    // Resume the stabilised state from the persisted triple (NOT zero).
+    aprev := FDecAA.FData[d];
+    bprev := FDecBB.FData[d];
+    qprev := FDecPP.FData[d];
+    for t := 0 to SeqLen - 1 do
+    begin
+      kt := Prev.FData[Prev.GetRawPos(t, 0, d)];          // key channel d
+      vt := Prev.FData[Prev.GetRawPos(t, 0, C + d)];      // value channel d
+      // OUTPUT step: bonus path weights the current token by e^{u+k}.
+      ww1 := uv + kt;
+      qmax := qprev;
+      if ww1 > qmax then qmax := ww1;
+      e1 := Exp(qprev - qmax);
+      e2 := Exp(ww1 - qmax);
+      num := e1 * aprev + e2 * vt;
+      den := e1 * bprev + e2;
+      FOutput.FData[FOutput.GetRawPos(t, 0, d)] := num / den;
+      // STATE step: decay path. a_t = e^{-w} a_{t-1} + e^{k} v.
+      ww2 := (-wv) + qprev;
+      qmax2 := ww2;
+      if kt > qmax2 then qmax2 := kt;
+      e3 := Exp(ww2 - qmax2);
+      e4 := Exp(kt - qmax2);
+      anew := e3 * aprev + e4 * vt;
+      bnew := e3 * bprev + e4;
+      aprev := anew;
+      bprev := bnew;
+      qprev := qmax2;
+    end;
+    // Persist the advanced stabilised state for the next call.
+    FDecAA.FData[d] := aprev;
+    FDecBB.FData[d] := bprev;
+    FDecPP.FData[d] := qprev;
+  end;
+  Inc(FDecodeSteps, SeqLen);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetWKV.BeginIncrementalDecode();
+begin
+  // The persisted state is one C-long (A,B,Q) triple; no MaxContext budget is
+  // needed (contrast the attention KV cache). The buffers are already sized by
+  // SetPrevLayer; ReSize is a safety net for layers wired manually.
+  FDecAA.ReSize(1, 1, FChannels);
+  FDecBB.ReSize(1, 1, FChannels);
+  FDecPP.ReSize(1, 1, FChannels);
+  ResetState();
+  FDecodeEnabled := true;
+end;
+
+procedure TNNetWKV.EndIncrementalDecode();
+begin
+  FDecodeEnabled := false;
+  FDecodeSteps := 0;
+end;
+
+procedure TNNetWKV.ResetState();
+var
+  d: integer;
+begin
+  FDecAA.Fill(0);            // A_{-1} = 0
+  FDecBB.Fill(0);            // B_{-1} = 0
+  for d := 0 to FChannels - 1 do
+    FDecPP.FData[d] := -1e30;  // Q_{-1} = -inf (log-space running max)
+  FDecodeSteps := 0;
+end;
+
+procedure TNNetWKV.ResetCache();
+begin
+  ResetState();
+end;
+
+procedure TNNetWKV.CaptureState(Dst: TNNetVolume; out Steps: integer);
+var
+  d: integer;
+begin
+  Dst.ReSize(1, 1, 3 * FChannels);
+  for d := 0 to FChannels - 1 do
+  begin
+    Dst.FData[d]                := FDecAA.FData[d];
+    Dst.FData[FChannels + d]    := FDecBB.FData[d];
+    Dst.FData[2 * FChannels + d]:= FDecPP.FData[d];
+  end;
+  Steps := FDecodeSteps;
+end;
+
+procedure TNNetWKV.RestoreState(Src: TNNetVolume; Steps: integer);
+var
+  d: integer;
+begin
+  for d := 0 to FChannels - 1 do
+  begin
+    FDecAA.FData[d] := Src.FData[d];
+    FDecBB.FData[d] := Src.FData[FChannels + d];
+    FDecPP.FData[d] := Src.FData[2 * FChannels + d];
+  end;
+  FDecodeSteps := Steps;
 end;
 
 procedure TNNetWKV.Backpropagate();
@@ -36365,6 +41254,222 @@ begin
   FNeurons[3].FWeights.Fill(1);          // Cre = 1
   FNeurons[4].FWeights.Fill(0);          // Cim = 0
   FNeurons[5].FWeights.Fill(0);          // D = 0
+  AfterWeightUpdate();
+end;
+
+{ TNNetRGLRU }
+constructor TNNetRGLRU.Create();
+begin
+  inherited Create();
+  FDepth := 0;
+  FStruct[0] := 0;
+  FH := TNNetVolume.Create();
+  FA := TNNetVolume.Create();
+  FIg := TNNetVolume.Create();
+  FRg := TNNetVolume.Create();
+  FMult := TNNetVolume.Create();
+  FGradLambda := TNNetVolume.Create();
+  // [0]=Lambda (recurrent_param)
+  AddMissingNeurons(1);
+end;
+
+destructor TNNetRGLRU.Destroy();
+begin
+  FGradLambda.Free;
+  FMult.Free;
+  FRg.Free;
+  FIg.Free;
+  FA.Free;
+  FH.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetRGLRU.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetRGLRU requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  if (pPrevLayer.FOutput.Depth mod 3) <> 0 then
+    FErrorProc('TNNetRGLRU requires input depth = 3*Depth (x|i_logits|a_logits), got Depth=' +
+      IntToStr(pPrevLayer.FOutput.Depth));
+  FDepth := pPrevLayer.FOutput.Depth div 3;
+  FStruct[0] := FDepth;
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FDepth);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  SetNumWeightsForAllNeurons(1, 1, FDepth);
+  FNeurons[0].FDelta.ReSize(FNeurons[0].FWeights);
+  FNeurons[0].FBackInertia.ReSize(FNeurons[0].FWeights);
+  FH.ReSize(FOutput.SizeX, 1, FDepth);
+  FA.ReSize(FOutput.SizeX, 1, FDepth);
+  FIg.ReSize(FOutput.SizeX, 1, FDepth);
+  FRg.ReSize(FOutput.SizeX, 1, FDepth);
+  FMult.ReSize(FOutput.SizeX, 1, FDepth);
+  FGradLambda.ReSize(1, 1, FDepth);
+  InitDefault();
+end;
+
+procedure TNNetRGLRU.Compute();
+const
+  cDecay = 8.0;             // fixed log-space decay constant c
+var
+  StartTime: double;
+  Prev, WLam: TNNetVolume;
+  SeqLen, Dn, t, d: integer;
+  sp, lam, igl, agl, ig, rg, loga, a, a2, mult, xt, hPrev, hNew: TNeuralFloat;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  WLam := FNeurons[0].FWeights;
+  SeqLen := FOutput.SizeX;
+  Dn := FDepth;
+  for d := 0 to Dn - 1 do
+  begin
+    lam := WLam.FData[d];
+    // softplus(Lambda) with the usual large-x shortcut.
+    if lam > 30 then sp := lam else sp := Ln(1 + Exp(lam));
+    hPrev := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      xt  := Prev.FData[Prev.GetRawPos(t, 0, d)];
+      igl := Prev.FData[Prev.GetRawPos(t, 0, Dn + d)];
+      agl := Prev.FData[Prev.GetRawPos(t, 0, 2 * Dn + d)];
+      ig := 1 / (1 + Exp(-igl));
+      rg := 1 / (1 + Exp(-agl));
+      loga := -cDecay * rg * sp;
+      a := Exp(loga);
+      a2 := Exp(2 * loga);
+      // Sequence-start reset (HF Griffin: at position 0 the recurrence gate is
+      // masked to 0 and the input multiplier is 1 instead of sqrt(1-a^2);
+      // h_{-1}=0 so the masked gate is moot, only the multiplier matters).
+      if t = 0 then
+      begin
+        a := 0;
+        mult := 1;
+      end
+      else
+        mult := Sqrt(1 - a2);
+      hNew := a * hPrev + mult * (ig * xt);
+      FA.FData[FA.GetRawPos(t, 0, d)] := a;
+      FIg.FData[FIg.GetRawPos(t, 0, d)] := ig;
+      FRg.FData[FRg.GetRawPos(t, 0, d)] := rg;
+      FMult.FData[FMult.GetRawPos(t, 0, d)] := mult;
+      FH.FData[FH.GetRawPos(t, 0, d)] := hNew;
+      FOutput.FData[FOutput.GetRawPos(t, 0, d)] := hNew;
+      hPrev := hNew;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetRGLRU.Backpropagate();
+const
+  cDecay = 8.0;
+var
+  StartTime: double;
+  Prev, PrevErr, WLam: TNNetVolume;
+  SeqLen, Dn, t, d: integer;
+  sp, dSpdLam, lam, ig, rg, a, a2, mult, xt, hPrev: TNeuralFloat;
+  ph, dh, dnx, dmult, da2, da, dloga, drg, dig, dxt, gLam: TNeuralFloat;
+  dLoga_dRg, dLoga_dSp: TNeuralFloat;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  WLam := FNeurons[0].FWeights;
+  SeqLen := FOutput.SizeX;
+  Dn := FDepth;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  FGradLambda.Fill(0);
+  // Exact BPTT carrying ph = dL/dh_t right-to-left. Forward per step:
+  //   loga = -c * rg * sp;  a = exp(loga);  mult = sqrt(1 - exp(2 loga))
+  //   h_t  = a * h_{t-1} + mult * ig * x_t;   y_t = h_t
+  for d := 0 to Dn - 1 do
+  begin
+    lam := WLam.FData[d];
+    if lam > 30 then
+    begin
+      sp := lam;
+      dSpdLam := 1;                   // sigmoid(lam) -> 1
+    end
+    else
+    begin
+      sp := Ln(1 + Exp(lam));
+      dSpdLam := 1 / (1 + Exp(-lam)); // d/dlam softplus = sigmoid(lam)
+    end;
+    ph := 0;
+    gLam := 0;
+    for t := SeqLen - 1 downto 0 do
+    begin
+      xt := Prev.FData[Prev.GetRawPos(t, 0, d)];
+      ig := FIg.FData[FIg.GetRawPos(t, 0, d)];
+      rg := FRg.FData[FRg.GetRawPos(t, 0, d)];
+      a  := FA.FData[FA.GetRawPos(t, 0, d)];
+      a2 := a * a;
+      mult := FMult.FData[FMult.GetRawPos(t, 0, d)];
+      if t > 0 then hPrev := FH.FData[FH.GetRawPos(t - 1, 0, d)]
+      else hPrev := 0;
+      // dL/dh_t = carried adjoint + read-out (y_t = h_t).
+      dh := ph + FOutputError.FData[FOutputError.GetRawPos(t, 0, d)];
+      // h_t = a*h_{t-1} + nx;  nx = mult * ig * x_t.
+      dnx := dh;
+      // Propagate to h_{t-1}: appears as a*h_{t-1} AND inside a via nothing else.
+      ph := dh * a;
+      // ---- nx = mult * (ig * x_t) ----
+      dmult := dnx * (ig * xt);
+      dig   := dnx * mult * xt;
+      dxt   := dnx * mult * ig;
+      // ---- a-path: a affects h via a*h_{t-1}, and via mult = sqrt(1-a^2). ----
+      // da from the a*h_{t-1} term:
+      da := dh * hPrev;
+      // da from mult = sqrt(1 - a^2):  dmult/da = -a / sqrt(1-a^2).
+      if mult > 1e-12 then
+        da := da + dmult * (-a / mult);
+      // a = exp(loga) -> da/dloga = a.
+      dloga := da * a;
+      // loga = -c * rg * sp.
+      dLoga_dRg := -cDecay * sp;
+      dLoga_dSp := -cDecay * rg;
+      drg := dloga * dLoga_dRg;
+      gLam := gLam + dloga * dLoga_dSp * dSpdLam;
+      // ---- gate sigmoids: ig = sigmoid(igl), rg = sigmoid(agl) ----
+      if hasInputGrad then
+      begin
+        PrevErr.FData[PrevErr.GetRawPos(t, 0, d)] :=
+          PrevErr.FData[PrevErr.GetRawPos(t, 0, d)] + dxt;
+        PrevErr.FData[PrevErr.GetRawPos(t, 0, Dn + d)] :=
+          PrevErr.FData[PrevErr.GetRawPos(t, 0, Dn + d)] + dig * ig * (1 - ig);
+        PrevErr.FData[PrevErr.GetRawPos(t, 0, 2 * Dn + d)] :=
+          PrevErr.FData[PrevErr.GetRawPos(t, 0, 2 * Dn + d)] + drg * rg * (1 - rg);
+      end;
+    end;
+    FGradLambda.FData[d] := gLam;
+  end;
+  TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(), FGradLambda.GetRawPtr(), -FLearningRate, Dn);
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetRGLRU.InitDefault();
+const
+  // softplus(Lambda) = 0.5 -> exp(Lambda) = exp(0.5)-1 -> Lambda = ln(exp(0.5)-1).
+  cLambdaInit = -0.4327;
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  FNeurons[0].FWeights.Fill(cLambdaInit);
   AfterWeightUpdate();
 end;
 
@@ -39525,6 +44630,322 @@ begin
   AfterWeightUpdate();
 end;
 
+{ TNNetConvLSTMCell }
+constructor TNNetConvLSTMCell.Create(pTimeSteps, pHiddenChannels: integer;
+  pFeatureSize: integer);
+var ii: integer;
+begin
+  inherited Create();
+  if pTimeSteps < 1 then
+    FErrorProc('TNNetConvLSTMCell requires TimeSteps >= 1. Got ' +
+      IntToStr(pTimeSteps));
+  if pHiddenChannels < 1 then
+    FErrorProc('TNNetConvLSTMCell requires HiddenChannels >= 1. Got ' +
+      IntToStr(pHiddenChannels));
+  if (pFeatureSize < 1) or (pFeatureSize mod 2 = 0) then
+    FErrorProc('TNNetConvLSTMCell requires an odd FeatureSize >= 1. Got ' +
+      IntToStr(pFeatureSize));
+  FTimeSteps := pTimeSteps;
+  FHiddenC := pHiddenChannels;
+  FFeature := pFeatureSize;
+  FPad := pFeatureSize div 2;
+  FStruct[0] := FTimeSteps;
+  FStruct[1] := FHiddenC;
+  FStruct[2] := FFeature;
+  FI := TNNetVolume.Create();  FFg := TNNetVolume.Create();
+  FO := TNNetVolume.Create();  FG := TNNetVolume.Create();
+  FC := TNNetVolume.Create();  FTanhC := TNNetVolume.Create();
+  FHprev := TNNetVolume.Create(); FZ := TNNetVolume.Create();
+  FGc := TNNetVolume.Create();  FGcNext := TNNetVolume.Create();
+  FGh := TNNetVolume.Create();  FGz := TNNetVolume.Create();
+  for ii := 0 to 3 do FGradW[ii] := TNNetVolume.Create();
+  for ii := 0 to 3 do FGradB[ii] := TNNetVolume.Create();
+  AddMissingNeurons(8);
+end;
+
+destructor TNNetConvLSTMCell.Destroy();
+var ii: integer;
+begin
+  for ii := 0 to 3 do FGradB[ii].Free;
+  for ii := 0 to 3 do FGradW[ii].Free;
+  FGz.Free; FGh.Free; FGcNext.Free; FGc.Free;
+  FZ.Free; FHprev.Free; FTanhC.Free; FC.Free;
+  FG.Free; FO.Free; FFg.Free; FI.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetConvLSTMCell.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  ZC, ii: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (pPrevLayer.FOutput.SizeX mod FTimeSteps) <> 0 then
+    FErrorProc('TNNetConvLSTMCell requires SizeX divisible by TimeSteps=' +
+      IntToStr(FTimeSteps) + ', got SizeX=' + IntToStr(pPrevLayer.FOutput.SizeX));
+  FInC := pPrevLayer.FOutput.Depth;
+  FH := pPrevLayer.FOutput.SizeX div FTimeSteps;
+  FW := pPrevLayer.FOutput.SizeY;
+  ZC := FInC + FHiddenC;       // concatenated channel count [x_t ; h_{t-1}]
+  FOutput.ReSize(FTimeSteps * FH, FW, FHiddenC);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FNeurons.Count < 8 then AddMissingNeurons(8);
+  // [0..3] kernels (HiddenC, K*K, ZC); [4..7] biases (1,1,HiddenC).
+  for ii := 0 to 3 do
+    FNeurons[ii].FWeights.ReSize(FHiddenC, FFeature * FFeature, ZC);
+  for ii := 4 to 7 do FNeurons[ii].FWeights.ReSize(1, 1, FHiddenC);
+  for ii := 0 to 7 do
+  begin
+    FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
+    FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
+  end;
+  FI.ReSize(FOutput);  FFg.ReSize(FOutput);
+  FO.ReSize(FOutput);  FG.ReSize(FOutput);
+  FC.ReSize(FOutput);  FTanhC.ReSize(FOutput);
+  FHprev.ReSize(FH, FW, FHiddenC);
+  FZ.ReSize(FH, FW, ZC);
+  FGc.ReSize(FH, FW, FHiddenC);  FGcNext.ReSize(FH, FW, FHiddenC);
+  FGh.ReSize(FH, FW, FHiddenC);
+  FGz.ReSize(FH, FW, ZC);
+  for ii := 0 to 3 do FGradW[ii].ReSize(FHiddenC, FFeature * FFeature, ZC);
+  for ii := 0 to 3 do FGradB[ii].ReSize(1, 1, FHiddenC);
+  InitDefault();
+end;
+
+procedure TNNetConvLSTMCell.Compute();
+var
+  StartTime: double;
+  Wi, Wf, Wo, Wg, Bi, Bf, Bo, Bg: TNNetVolume;
+  Prev: TNNetVolume;
+  t, y, x, oc, ky, kx, sy, sx, tap, oy, zi, ZCnt: integer;
+  accI, accF, accO, accG, fv, iv, ov, gv, cv, hp, tc: TNeuralFloat;
+  WiR, WfR, WoR, WgR, ZPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  Wi := FNeurons[0].FWeights; Wf := FNeurons[1].FWeights;
+  Wo := FNeurons[2].FWeights; Wg := FNeurons[3].FWeights;
+  Bi := FNeurons[4].FWeights; Bf := FNeurons[5].FWeights;
+  Bo := FNeurons[6].FWeights; Bg := FNeurons[7].FWeights;
+  ZCnt := FInC + FHiddenC;
+  FHprev.Fill(0);
+  for t := 0 to FTimeSteps - 1 do
+  begin
+    oy := t * FH;   // row offset of frame t in the packed X axis
+    // Build z_t = [x_t ; h_{t-1}] for the whole frame (channels: InC then HiddenC).
+    for y := 0 to FH - 1 do
+      for x := 0 to FW - 1 do
+      begin
+        ZPtr := FZ.GetRawPtr(y, x, 0);
+        for oc := 0 to FInC - 1 do ZPtr^[oc] := Prev.Data[oy + y, x, oc];
+        for oc := 0 to FHiddenC - 1 do
+          ZPtr^[FInC + oc] := FHprev.Data[y, x, oc];
+      end;
+    // Convolve each gate over z_t (SAME padding), then update c_t and h_t.
+    for y := 0 to FH - 1 do
+      for x := 0 to FW - 1 do
+      begin
+        for oc := 0 to FHiddenC - 1 do
+        begin
+          WiR := Wi.GetRawPtr(oc, 0, 0); WfR := Wf.GetRawPtr(oc, 0, 0);
+          WoR := Wo.GetRawPtr(oc, 0, 0); WgR := Wg.GetRawPtr(oc, 0, 0);
+          accI := Bi.FData[oc]; accF := Bf.FData[oc];
+          accO := Bo.FData[oc]; accG := Bg.FData[oc];
+          for ky := 0 to FFeature - 1 do
+          begin
+            sy := y + ky - FPad;
+            if (sy < 0) or (sy >= FH) then continue;
+            for kx := 0 to FFeature - 1 do
+            begin
+              sx := x + kx - FPad;
+              if (sx < 0) or (sx >= FW) then continue;
+              tap := (ky * FFeature + kx) * ZCnt;
+              ZPtr := FZ.GetRawPtr(sy, sx, 0);
+              for zi := 0 to ZCnt - 1 do
+              begin
+                accI := accI + WiR^[tap + zi] * ZPtr^[zi];
+                accF := accF + WfR^[tap + zi] * ZPtr^[zi];
+                accO := accO + WoR^[tap + zi] * ZPtr^[zi];
+                accG := accG + WgR^[tap + zi] * ZPtr^[zi];
+              end;
+            end;
+          end;
+          iv := Sigmoid(accI); fv := Sigmoid(accF);
+          ov := Sigmoid(accO); gv := TanH(accG);
+          if t > 0 then hp := FC.Data[(t - 1) * FH + y, x, oc] else hp := 0;
+          cv := fv * hp + iv * gv;
+          tc := TanH(cv);
+          FI.Data[oy + y, x, oc] := iv;  FFg.Data[oy + y, x, oc] := fv;
+          FO.Data[oy + y, x, oc] := ov;  FG.Data[oy + y, x, oc] := gv;
+          FC.Data[oy + y, x, oc] := cv;  FTanhC.Data[oy + y, x, oc] := tc;
+          FOutput.Data[oy + y, x, oc] := ov * tc;
+        end;
+      end;
+    // Carry h_t forward as h_{t-1} for the next step.
+    for y := 0 to FH - 1 do
+      for x := 0 to FW - 1 do
+        for oc := 0 to FHiddenC - 1 do
+          FHprev.Data[y, x, oc] := FOutput.Data[oy + y, x, oc];
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetConvLSTMCell.Backpropagate();
+var
+  StartTime: double;
+  Wi, Wf, Wo, Wg, Prev, PrevErr: TNNetVolume;
+  t, y, x, oc, ky, kx, sy, sx, tap, zc, oy, j, ZCnt: integer;
+  hasInputGrad: boolean;
+  iv, fv, ov, gv, tc, hp, gh, gc, gtc, gcv: TNeuralFloat;
+  gpreI, gpreF, gpreO, gpreG, zval: TNeuralFloat;
+  WiR, WfR, WoR, WgR, ZPtr, GzPtr: TNeuralFloatArrPtr;
+  GWiR, GWfR, GWoR, GWgR: TNeuralFloatArrPtr;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  Wi := FNeurons[0].FWeights; Wf := FNeurons[1].FWeights;
+  Wo := FNeurons[2].FWeights; Wg := FNeurons[3].FWeights;
+  ZCnt := FInC + FHiddenC;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  for j := 0 to 3 do FGradW[j].Fill(0);
+  for j := 0 to 3 do FGradB[j].Fill(0);
+  FGcNext.Fill(0);  // dL/dc_t arriving from step t+1 (via the f_{t+1} carry)
+  FGh.Fill(0);      // dL/dh_t arriving from step t+1 (via h_{t-1} gate feed)
+  // Right-to-left BPTT over the time-packed X axis.
+  for t := FTimeSteps - 1 downto 0 do
+  begin
+    oy := t * FH;
+    // Rebuild z_t = [x_t ; h_{t-1}] (same construction as forward).
+    for y := 0 to FH - 1 do
+      for x := 0 to FW - 1 do
+      begin
+        ZPtr := FZ.GetRawPtr(y, x, 0);
+        for oc := 0 to FInC - 1 do ZPtr^[oc] := Prev.Data[oy + y, x, oc];
+        if t > 0 then
+          for oc := 0 to FHiddenC - 1 do
+            ZPtr^[FInC + oc] := FOutput.Data[(t - 1) * FH + y, x, oc]
+        else
+          for oc := 0 to FHiddenC - 1 do ZPtr^[FInC + oc] := 0;
+      end;
+    FGz.Fill(0);
+    for y := 0 to FH - 1 do
+      for x := 0 to FW - 1 do
+      begin
+        for oc := 0 to FHiddenC - 1 do
+        begin
+          iv := FI.Data[oy + y, x, oc]; fv := FFg.Data[oy + y, x, oc];
+          ov := FO.Data[oy + y, x, oc]; gv := FG.Data[oy + y, x, oc];
+          tc := FTanhC.Data[oy + y, x, oc];
+          if t > 0 then hp := FC.Data[(t - 1) * FH + y, x, oc] else hp := 0;
+          // dL/dh_t = upstream + carry from step t+1's gate convs.
+          gh := FOutputError.Data[oy + y, x, oc] + FGh.Data[y, x, oc];
+          // h_t = o_t * tanh(c_t).
+          gtc := gh * ov;                         // dL/d tanh(c_t)
+          gpreO := gh * tc * ov * (1 - ov);       // dL/d preO (sigmoid)
+          // dL/dc_t = this-step path + carry from step t+1 (f_{t+1} memory path).
+          gc := gtc * (1 - tc * tc) + FGcNext.Data[y, x, oc];
+          // c_t = f_t*hp + i_t*g_t.
+          gpreF := gc * hp * fv * (1 - fv);        // dL/d preF
+          gpreI := gc * gv * iv * (1 - iv);        // dL/d preI
+          gpreG := gc * iv * (1 - gv * gv);        // dL/d preG (tanh)
+          // Carry dL/dc_{t-1} = f_t * dL/dc_t into the next (earlier) step.
+          FGc.Data[y, x, oc] := gc * fv;
+          FGradB[0].FData[oc] := FGradB[0].FData[oc] + gpreI;
+          FGradB[1].FData[oc] := FGradB[1].FData[oc] + gpreF;
+          FGradB[2].FData[oc] := FGradB[2].FData[oc] + gpreO;
+          FGradB[3].FData[oc] := FGradB[3].FData[oc] + gpreG;
+          WiR := Wi.GetRawPtr(oc, 0, 0); WfR := Wf.GetRawPtr(oc, 0, 0);
+          WoR := Wo.GetRawPtr(oc, 0, 0); WgR := Wg.GetRawPtr(oc, 0, 0);
+          GWiR := FGradW[0].GetRawPtr(oc, 0, 0); GWfR := FGradW[1].GetRawPtr(oc, 0, 0);
+          GWoR := FGradW[2].GetRawPtr(oc, 0, 0); GWgR := FGradW[3].GetRawPtr(oc, 0, 0);
+          for ky := 0 to FFeature - 1 do
+          begin
+            sy := y + ky - FPad;
+            if (sy < 0) or (sy >= FH) then continue;
+            for kx := 0 to FFeature - 1 do
+            begin
+              sx := x + kx - FPad;
+              if (sx < 0) or (sx >= FW) then continue;
+              tap := (ky * FFeature + kx) * ZCnt;
+              ZPtr := FZ.GetRawPtr(sy, sx, 0);
+              GzPtr := FGz.GetRawPtr(sy, sx, 0);
+              for zc := 0 to ZCnt - 1 do
+              begin
+                zval := ZPtr^[zc];
+                GWiR^[tap + zc] := GWiR^[tap + zc] + gpreI * zval;
+                GWfR^[tap + zc] := GWfR^[tap + zc] + gpreF * zval;
+                GWoR^[tap + zc] := GWoR^[tap + zc] + gpreO * zval;
+                GWgR^[tap + zc] := GWgR^[tap + zc] + gpreG * zval;
+                GzPtr^[zc] := GzPtr^[zc] + gpreI * WiR^[tap + zc] +
+                  gpreF * WfR^[tap + zc] + gpreO * WoR^[tap + zc] +
+                  gpreG * WgR^[tap + zc];
+              end;
+            end;
+          end;
+        end;
+      end;
+    // Scatter dL/dz_t: the x_t part -> previous-layer error; the h_{t-1} part ->
+    // FGh for the next (earlier) step. Also move dL/dc_{t-1} carry into FGcNext.
+    for y := 0 to FH - 1 do
+      for x := 0 to FW - 1 do
+      begin
+        GzPtr := FGz.GetRawPtr(y, x, 0);
+        if hasInputGrad then
+          for oc := 0 to FInC - 1 do
+            PrevErr.Data[oy + y, x, oc] :=
+              PrevErr.Data[oy + y, x, oc] + GzPtr^[oc];
+        for oc := 0 to FHiddenC - 1 do
+        begin
+          FGh.Data[y, x, oc] := GzPtr^[FInC + oc];
+          FGcNext.Data[y, x, oc] := FGc.Data[y, x, oc];
+        end;
+      end;
+  end;
+  for j := 0 to 3 do
+    TNNetVolume.MulAdd(FNeurons[j].FDelta.GetRawPtr(), FGradW[j].GetRawPtr(),
+      -FLearningRate, FNeurons[j].FWeights.Size);
+  for j := 0 to 3 do
+    TNNetVolume.MulAdd(FNeurons[4 + j].FDelta.GetRawPtr(), FGradB[j].GetRawPtr(),
+      -FLearningRate, FHiddenC);
+  if (not FBatchUpdate) then
+  begin
+    for j := 0 to 7 do FNeurons[j].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetConvLSTMCell.InitDefault();
+var
+  ii, oc, k, ZC, oldSeed: integer;
+  WR: TNeuralFloatArrPtr;
+begin
+  if FNeurons.Count < 8 then AddMissingNeurons(8);
+  ZC := FNeurons[0].FWeights.Depth;
+  oldSeed := RandSeed;
+  RandSeed := 141421;
+  for ii := 0 to 3 do
+    for oc := 0 to FHiddenC - 1 do
+    begin
+      WR := FNeurons[ii].FWeights.GetRawPtr(oc, 0, 0);
+      for k := 0 to FFeature * FFeature * ZC - 1 do
+        WR^[k] := FNeurons[ii].FWeights.RandomGaussianValue() * 0.08;
+    end;
+  FNeurons[4].FWeights.Fill(0);    // b_i
+  FNeurons[5].FWeights.Fill(1.0);  // b_f (forget-bias -> near pass-through)
+  FNeurons[6].FWeights.Fill(0);    // b_o
+  FNeurons[7].FWeights.Fill(0);    // b_g
+  RandSeed := oldSeed;
+  AfterWeightUpdate();
+end;
+
 { TNNetDeltaNet }
 constructor TNNetDeltaNet.Create();
 begin
@@ -41777,7 +47198,11 @@ constructor TNNetSelectiveSSM.Create(pDState: integer = 1);
 begin
   inherited Create();
   FDState := Max(pDState, 1);
+  FJambaInner := 0;
+  FDtRank := 0;
   FStruct[0] := FDState;
+  FStruct[1] := 0;
+  FStruct[2] := 0;
   FState := TNNetVolume.Create();
   FDelta := TNNetVolume.Create();
   FBt := TNNetVolume.Create();
@@ -41786,6 +47211,7 @@ begin
   FH := TNNetVolume.Create();
   FGh := TNNetVolume.Create();
   FExpA := TNNetVolume.Create();
+  FTsBuf := TNNetVolume.Create();
   FGbT := TNNetVolume.Create();
   FGcT := TNNetVolume.Create();
   FGradWd := TNNetVolume.Create();
@@ -41794,12 +47220,29 @@ begin
   FGradBd := TNNetVolume.Create();
   FGradA := TNNetVolume.Create();
   FGradE := TNNetVolume.Create();
+  FDecH := TNNetVolume.Create();
+  FDecodeEnabled := false;
+  FDecodeSteps := 0;
   // Depth-dependent weight buffers are (re)allocated in SetPrevLayer.
   AddMissingNeurons(6);
 end;
 
+constructor TNNetSelectiveSSM.CreateJambaInner(pDState, pDtRank: integer;
+  pEps: TNeuralFloat = 1e-6);
+begin
+  Create(Max(pDState, 1));
+  FJambaInner := 1;
+  FDtRank := Max(pDtRank, 1);
+  FStruct[1] := 1;
+  FStruct[2] := FDtRank;
+  FFloatSt[0] := pEps;
+  // Jamba mode adds four neurons: [6]=x_proj_dt [7..9]=dt/b/c inner gains.
+  AddMissingNeurons(10);
+end;
+
 destructor TNNetSelectiveSSM.Destroy();
 begin
+  FDecH.Free;
   FGcT.Free;
   FGbT.Free;
   FGradE.Free;
@@ -41808,6 +47251,7 @@ begin
   FGradWC.Free;
   FGradWB.Free;
   FGradWd.Free;
+  FTsBuf.Free;
   FExpA.Free;
   FGh.Free;
   FH.Free;
@@ -41831,6 +47275,9 @@ begin
   // FStruct[0] (not the constructor argument) is authoritative so loading a
   // saved net (which restores FStruct before wiring layers) round-trips DState.
   FDState := Max(FStruct[0], 1);
+  // FStruct[1]/[2] round-trip the Jamba inner-norm mode and its dt_rank.
+  FJambaInner := FStruct[1];
+  if FJambaInner = 1 then FDtRank := Max(FStruct[2], 1);
   NS := FDState;
   // Selective SSM preserves the sequence layout.
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, Depth);
@@ -41842,23 +47289,40 @@ begin
   // DState=N>1 (Mamba): W_B/W_C become (N,1,Depth) shared-across-channel
   // projections and A_raw becomes per-(channel,state) (Depth,1,N).
   if NS = 1 then BCRows := Depth else BCRows := NS;
-  FNeurons[0].FWeights.ReSize(Depth, 1, Depth);
+  if FJambaInner = 1 then
+  begin
+    // Jamba: [0]=dt_proj.weight (Depth,1,dt_rank). The remaining slots match
+    // the multi-state layout; [6..9] hold the unfolded x_proj_dt + inner gains.
+    if FNeurons.Count < 10 then AddMissingNeurons(10);
+    FNeurons[0].FWeights.ReSize(Depth, 1, FDtRank);
+  end
+  else
+    FNeurons[0].FWeights.ReSize(Depth, 1, Depth);
   FNeurons[1].FWeights.ReSize(BCRows, 1, Depth);
   FNeurons[2].FWeights.ReSize(BCRows, 1, Depth);
   FNeurons[3].FWeights.ReSize(Depth, 1, 1);
   FNeurons[4].FWeights.ReSize(Depth, 1, NS);
   FNeurons[5].FWeights.ReSize(Depth, 1, 1);
-  for ii := 0 to 5 do
+  if FJambaInner = 1 then
+  begin
+    FNeurons[6].FWeights.ReSize(FDtRank, 1, Depth); // x_proj_dt
+    FNeurons[7].FWeights.ReSize(FDtRank, 1, 1);     // dt_gain
+    FNeurons[8].FWeights.ReSize(NS, 1, 1);          // b_gain
+    FNeurons[9].FWeights.ReSize(NS, 1, 1);          // c_gain
+  end;
+  for ii := 0 to FNeurons.Count - 1 do
   begin
     FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
     FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
   end;
+  FTsBuf.ReSize(1, 1, Max(FDtRank, 1));
   FState.ReSize(FOutput.SizeX, 1, Depth * NS);
   FDelta.ReSize(FOutput.SizeX, 1, Depth);
   FBt.ReSize(FOutput.SizeX, 1, BCRows);
   FCt.ReSize(FOutput.SizeX, 1, BCRows);
   FAt.ReSize(FOutput.SizeX, 1, Depth * NS);
   FH.ReSize(1, 1, Depth * NS);
+  FDecH.ReSize(1, 1, Depth * NS);
   FGh.ReSize(1, 1, Depth * NS);
   FExpA.ReSize(1, 1, Depth * NS);
   FGbT.ReSize(1, 1, BCRows);
@@ -41873,6 +47337,28 @@ begin
 end;
 
 procedure TNNetSelectiveSSM.Compute();
+begin
+  if FDecodeEnabled then
+  begin
+    ComputeIncremental();
+    exit;
+  end;
+  if FJambaInner = 1 then
+  begin
+    ComputeJambaInner();
+    exit;
+  end;
+  if FDState > 1 then
+  begin
+    ComputeMultiState();
+    exit;
+  end;
+  ComputeLegacy();
+end;
+
+// DState=1 (legacy per-channel-scalar) forward. pResetState=false resumes the
+// running state h from FH for incremental decode (see ComputeIncremental).
+procedure TNNetSelectiveSSM.ComputeLegacy(pResetState: boolean = true);
 var
   StartTime: double;
   Wd, WB, WC, Bd, Ar, Ee, Prev: TNNetVolume;
@@ -41881,11 +47367,6 @@ var
   XtPtr, OutPtr: TNeuralFloatArrPtr;
   WdRow, WBRow, WCRow: TNeuralFloatArrPtr;
 begin
-  if FDState > 1 then
-  begin
-    ComputeMultiState();
-    exit;
-  end;
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   Wd := FNeurons[0].FWeights;
@@ -41900,7 +47381,7 @@ begin
   // overflow if A_raw drifts large during training.
   for d := 0 to Depth - 1 do
     FExpA.FData[d] := Exp(Min(Ar.FData[d], 10));
-  FH.Fill(0);
+  if pResetState then FH.Fill(0);
   for t := 0 to SeqLen - 1 do
   begin
     XtPtr := Prev.GetRawPtr(t, 0, 0);
@@ -41947,7 +47428,7 @@ end;
 
 // DState=N>1 forward (HF MambaMixer semantics): B_t/C_t in R^N shared across
 // channels, per-(channel,state) decay. See the class comment for the formulas.
-procedure TNNetSelectiveSSM.ComputeMultiState();
+procedure TNNetSelectiveSSM.ComputeMultiState(pResetState: boolean = true);
 var
   StartTime: double;
   Wd, WB, WC, Bd, Ar, Ee, Prev: TNNetVolume;
@@ -41969,7 +47450,7 @@ begin
   // Precompute exp(A_raw[d,s]), clamped against overflow during training.
   for j := 0 to Ar.Size - 1 do
     FExpA.FData[j] := Exp(Min(Ar.FData[j], 10));
-  FH.Fill(0);
+  if pResetState then FH.Fill(0);
   for t := 0 to SeqLen - 1 do
   begin
     XtPtr := Prev.GetRawPtr(t, 0, 0);
@@ -42018,6 +47499,183 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
+procedure TNNetSelectiveSSM.ComputeJambaInner(pResetState: boolean = true);
+// HF JambaMambaMixer slow_forward (the recurrence part). The conv1d + SiLU
+// gating live in surrounding layers (the importer wires them); this layer
+// takes the conv'd hidden_states x_conv (Depth-long per timestep) and runs:
+//   ts   = x_proj_dt . x_conv        (FDtRank-long)
+//   dt   = softplus( dt_proj . (rms(ts)*dt_gain) + b_d )
+//   b_t  = rms(W_B . x_conv) * b_gain     (NS-long, rms over the NS axis)
+//   c_t  = rms(W_C . x_conv) * c_gain
+//   h_t[d,s] = exp(-dt[d]*exp(A_raw[d,s]))*h_{t-1}[d,s] + dt[d]*b_t[s]*x[d]
+//   y_t[d]   = sum_s c_t[s]*h_t[d,s] + D[d]*x[d]
+// rms(v) = v / sqrt(mean(v^2) + eps).  Forward-only (see Backpropagate).
+var
+  StartTime: double;
+  WdtProj, WB, WC, Bd, Ar, Ee, WxProj, GDt, GB, GC, Prev: TNNetVolume;
+  SeqLen, Depth, NS, RK, t, d, s, r, hbase, ebase: integer;
+  pre, sp, ad, hnew, accY, xd, ss, inv, eps: TNeuralFloat;
+  XtPtr, OutPtr, WdtRow: TNeuralFloatArrPtr;
+
+  function RmsScale(V: TNNetVolume; Cnt: integer): TNeuralFloat;
+  var k: integer; acc: TNeuralFloat;
+  begin
+    acc := 0;
+    for k := 0 to Cnt - 1 do acc := acc + V.FData[k] * V.FData[k];
+    Result := 1.0 / Sqrt(acc / Cnt + eps);
+  end;
+
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  WdtProj := FNeurons[0].FWeights;   // dt_proj.weight (Depth,1,RK)
+  WB := FNeurons[1].FWeights;        // W_B (NS,1,Depth)
+  WC := FNeurons[2].FWeights;        // W_C (NS,1,Depth)
+  Bd := FNeurons[3].FWeights;        // dt_proj.bias (Depth)
+  Ar := FNeurons[4].FWeights;        // A_log (Depth,1,NS)
+  Ee := FNeurons[5].FWeights;        // D (Depth)
+  WxProj := FNeurons[6].FWeights;    // x_proj_dt (RK,1,Depth)
+  GDt := FNeurons[7].FWeights;       // dt_gain (RK)
+  GB := FNeurons[8].FWeights;        // b_gain (NS)
+  GC := FNeurons[9].FWeights;        // c_gain (NS)
+  SeqLen := FOutput.SizeX;
+  Depth := FOutput.Depth;
+  NS := FDState;
+  RK := FDtRank;
+  eps := FFloatSt[0];
+  if eps <= 0 then eps := 1e-6;
+  for s := 0 to Ar.Size - 1 do
+    FExpA.FData[s] := Exp(Min(Ar.FData[s], 10));
+  if pResetState then FH.Fill(0);
+  for t := 0 to SeqLen - 1 do
+  begin
+    XtPtr := Prev.GetRawPtr(t, 0, 0);
+    OutPtr := FOutput.GetRawPtr(t, 0, 0);
+    // ts = x_proj_dt . x_conv, then RMSNorm(ts)*dt_gain.
+    for r := 0 to RK - 1 do
+      FTsBuf.FData[r] := TNNetVolume.DotProduct(
+        WxProj.GetRawPtr(r, 0, 0), XtPtr, Depth);
+    inv := RmsScale(FTsBuf, RK);
+    for r := 0 to RK - 1 do
+      FTsBuf.FData[r] := FTsBuf.FData[r] * inv * GDt.FData[r];
+    // dt[d] = softplus(dt_proj[d,:].ts_norm + b_d[d]).
+    for d := 0 to Depth - 1 do
+    begin
+      pre := Bd.FData[d];
+      WdtRow := WdtProj.GetRawPtr(d, 0, 0);
+      for r := 0 to RK - 1 do
+        pre := pre + WdtRow^[r] * FTsBuf.FData[r];
+      if pre > 30 then sp := pre
+      else if pre < -30 then sp := Exp(pre)
+      else sp := Ln(1 + Exp(pre));
+      FDelta.FData[(t * Depth) + d] := sp;
+    end;
+    // b_t / c_t = RMSNorm(W_{B,C} . x_conv) * gain, rms over the NS axis.
+    for s := 0 to NS - 1 do
+    begin
+      FBt.FData[(t * NS) + s] := TNNetVolume.DotProduct(
+        WB.GetRawPtr(s, 0, 0), XtPtr, Depth);
+      FCt.FData[(t * NS) + s] := TNNetVolume.DotProduct(
+        WC.GetRawPtr(s, 0, 0), XtPtr, Depth);
+    end;
+    ss := 0;
+    for s := 0 to NS - 1 do ss := ss + FBt.FData[(t * NS) + s] * FBt.FData[(t * NS) + s];
+    inv := 1.0 / Sqrt(ss / NS + eps);
+    for s := 0 to NS - 1 do
+      FBt.FData[(t * NS) + s] := FBt.FData[(t * NS) + s] * inv * GB.FData[s];
+    ss := 0;
+    for s := 0 to NS - 1 do ss := ss + FCt.FData[(t * NS) + s] * FCt.FData[(t * NS) + s];
+    inv := 1.0 / Sqrt(ss / NS + eps);
+    for s := 0 to NS - 1 do
+      FCt.FData[(t * NS) + s] := FCt.FData[(t * NS) + s] * inv * GC.FData[s];
+    // Recurrence + output sum over states.
+    for d := 0 to Depth - 1 do
+    begin
+      sp := FDelta.FData[(t * Depth) + d];
+      xd := XtPtr^[d];
+      hbase := ((t * Depth) + d) * NS;
+      ebase := d * NS;
+      accY := 0;
+      for s := 0 to NS - 1 do
+      begin
+        ad := Exp(-sp * FExpA.FData[ebase + s]);
+        FAt.FData[hbase + s] := ad;
+        hnew := ad * FH.FData[ebase + s] + sp * FBt.FData[(t * NS) + s] * xd;
+        FH.FData[ebase + s] := hnew;
+        FState.FData[hbase + s] := hnew;
+        accY := accY + FCt.FData[(t * NS) + s] * hnew;
+      end;
+      OutPtr^[d] := accY + Ee.FData[d] * xd;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Inference-only stateful forward. The per-token recurrence is ALGEBRAICALLY
+// IDENTICAL to one step of the normal full-sequence scan: the SSM carries the
+// fixed [d_inner x d_state] hidden matrix h (Depth*N floats). Here h RESUMES
+// from the PERSISTED FDecH (carried across calls) instead of restarting at 0,
+// the BPTT caches (FState/FAt/FDelta) hold only this call's tokens, and the
+// loop is O(1) in past context (it sweeps just the SeqLen supplied this call -
+// one token for a decode step, many for a prompt prefill). Driving the whole
+// sequence token-by-token through this path reproduces the full-scan output
+// bit-for-bit. Dispatches by mode exactly as Compute() does, but with the
+// state-reset suppressed so each call continues the recurrence.
+procedure TNNetSelectiveSSM.ComputeIncremental();
+begin
+  // Resume the running state h from the persisted snapshot, then run one of the
+  // shared scans with pResetState=false (h is NOT re-zeroed) and persist the
+  // advanced h back. The arithmetic per token is identical to Compute()'s.
+  FH.Copy(FDecH);
+  if FJambaInner = 1 then
+    ComputeJambaInner(false)
+  else if FDState > 1 then
+    ComputeMultiState(false)
+  else
+    ComputeLegacy(false);
+  FDecH.Copy(FH);
+  Inc(FDecodeSteps, FOutput.SizeX);
+end;
+
+procedure TNNetSelectiveSSM.BeginIncrementalDecode();
+begin
+  // The carried state is one Depth*N matrix; no MaxContext budget is needed
+  // (contrast the attention KV cache). FDecH is already sized by SetPrevLayer;
+  // ReSize is a safety net for layers wired manually.
+  FDecH.ReSize(FH);
+  ResetState();
+  FDecodeEnabled := true;
+end;
+
+procedure TNNetSelectiveSSM.EndIncrementalDecode();
+begin
+  FDecodeEnabled := false;
+  FDecodeSteps := 0;
+end;
+
+procedure TNNetSelectiveSSM.ResetState();
+begin
+  FDecH.Fill(0);            // h_{-1} = 0
+  FDecodeSteps := 0;
+end;
+
+procedure TNNetSelectiveSSM.ResetCache();
+begin
+  ResetState();
+end;
+
+procedure TNNetSelectiveSSM.CaptureState(Dst: TNNetVolume; out Steps: integer);
+begin
+  Dst.Copy(FDecH);
+  Steps := FDecodeSteps;
+end;
+
+procedure TNNetSelectiveSSM.RestoreState(Src: TNNetVolume; Steps: integer);
+begin
+  FDecH.Copy(Src);
+  FDecodeSteps := Steps;
+end;
+
 procedure TNNetSelectiveSSM.Backpropagate();
 var
   StartTime: double;
@@ -42034,6 +47692,9 @@ begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
+  if FJambaInner = 1 then
+    FErrorProc('TNNetSelectiveSSM Jamba inner-norm mode is forward-only ' +
+      '(used by the Jamba importer for inference); training it is not wired.');
   if FDState > 1 then
   begin
     BackpropagateMultiState();
@@ -42283,6 +47944,27 @@ begin
   // default (leaky accumulator + feedthrough).
   oldSeed := RandSeed;
   RandSeed := 314159;
+  if FStruct[1] = 1 then
+  begin
+    // Jamba inner-norm mode: weights are filled by the importer. Seed benign
+    // defaults so an un-loaded layer is still well-formed (gains = 1, identity
+    // feedthrough, S4D-real A_log, zero projections/bias).
+    FNeurons[0].FWeights.Fill(0);                 // dt_proj.weight
+    FNeurons[1].FWeights.Fill(0);                 // W_B
+    FNeurons[2].FWeights.Fill(0);                 // W_C
+    FNeurons[3].FWeights.Fill(0);                 // dt_proj.bias
+    for d := 0 to Depth - 1 do
+      for s := 0 to NS - 1 do
+        FNeurons[4].FWeights[d, 0, s] := Ln(1 + s);
+    FNeurons[5].FWeights.Fill(1);                 // D
+    FNeurons[6].FWeights.Fill(0);                 // x_proj_dt
+    FNeurons[7].FWeights.Fill(1);                 // dt_gain
+    FNeurons[8].FWeights.Fill(1);                 // b_gain
+    FNeurons[9].FWeights.Fill(1);                 // c_gain
+    RandSeed := oldSeed;
+    AfterWeightUpdate();
+    exit;
+  end;
   if NS = 1 then
   begin
     for d := 0 to Depth - 1 do
@@ -42313,6 +47995,349 @@ begin
   end;
   FNeurons[3].FWeights.Fill(0);   // b_d
   FNeurons[5].FWeights.Fill(1);   // e (feedthrough / Mamba D skip)
+  RandSeed := oldSeed;
+  AfterWeightUpdate();
+end;
+
+{ TNNetMamba2 }
+constructor TNNetMamba2.Create(pNumHeads: integer = 1; pHeadDim: integer = 1;
+  pStateSize: integer = 16; pNGroups: integer = 1;
+  pEps: TNeuralFloat = 1e-5);
+begin
+  inherited Create();
+  FNumHeads := Max(pNumHeads, 1);
+  FHeadDim := Max(pHeadDim, 1);
+  FStateSize := Max(pStateSize, 1);
+  FNGroups := Max(pNGroups, 1);
+  FStruct[0] := FNumHeads;
+  FStruct[1] := FHeadDim;
+  FStruct[2] := FStateSize;
+  FStruct[3] := FNGroups;
+  FFloatSt[0] := pEps;
+  FDInner := FNumHeads * FHeadDim;
+  FState := TNNetVolume.Create();
+  FDt := TNNetVolume.Create();
+  FAt := TNNetVolume.Create();
+  FY := TNNetVolume.Create();
+  FZ := TNNetVolume.Create();
+  FRStd := TNNetVolume.Create();
+  FH := TNNetVolume.Create();
+  FGh := TNNetVolume.Create();
+  FGradA := TNNetVolume.Create();
+  FGradD := TNNetVolume.Create();
+  FGradDtB := TNNetVolume.Create();
+  FGradNorm := TNNetVolume.Create();
+  AddMissingNeurons(4);
+end;
+
+destructor TNNetMamba2.Destroy();
+begin
+  FGradNorm.Free;
+  FGradDtB.Free;
+  FGradD.Free;
+  FGradA.Free;
+  FGh.Free;
+  FH.Free;
+  FRStd.Free;
+  FZ.Free;
+  FY.Free;
+  FAt.Free;
+  FDt.Free;
+  FState.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetMamba2.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  ExpectedIn, ii: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetMamba2 requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  // FStruct/FFloatSt are authoritative so a loaded net round-trips the config.
+  FNumHeads := Max(FStruct[0], 1);
+  FHeadDim := Max(FStruct[1], 1);
+  FStateSize := Max(FStruct[2], 1);
+  FNGroups := Max(FStruct[3], 1);
+  FDInner := FNumHeads * FHeadDim;
+  ExpectedIn := 2 * FDInner + 2 * FNGroups * FStateSize + FNumHeads;
+  if pPrevLayer.FOutput.Depth <> ExpectedIn then
+    FErrorProc('TNNetMamba2 expects input depth ' + IntToStr(ExpectedIn) +
+      ' ([x|B|C|dt|gate]), got ' + IntToStr(pPrevLayer.FOutput.Depth));
+  // Output is the gated-normed scan output of width d_inner.
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FDInner);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FNeurons.Count < 4 then AddMissingNeurons(4);
+  FNeurons[0].FWeights.ReSize(FNumHeads, 1, 1);  // A_log
+  FNeurons[1].FWeights.ReSize(FNumHeads, 1, 1);  // D
+  FNeurons[2].FWeights.ReSize(FNumHeads, 1, 1);  // dt_bias
+  FNeurons[3].FWeights.ReSize(FDInner, 1, 1);    // norm_weight
+  for ii := 0 to FNeurons.Count - 1 do
+  begin
+    FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
+    FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
+  end;
+  FState.ReSize(FOutput.SizeX, 1, FDInner * FStateSize);
+  FDt.ReSize(FOutput.SizeX, 1, FNumHeads);
+  FAt.ReSize(FOutput.SizeX, 1, FNumHeads);
+  FY.ReSize(FOutput.SizeX, 1, FDInner);
+  FZ.ReSize(FOutput.SizeX, 1, FDInner);
+  FRStd.ReSize(FOutput.SizeX, 1, 1);
+  FH.ReSize(1, 1, FDInner * FStateSize);
+  FGh.ReSize(1, 1, FDInner * FStateSize);
+  FGradA.ReSize(1, 1, FNumHeads);
+  FGradD.ReSize(1, 1, FNumHeads);
+  FGradDtB.ReSize(1, 1, FNumHeads);
+  FGradNorm.ReSize(1, 1, FDInner);
+  InitDefault();
+end;
+
+procedure TNNetMamba2.Compute();
+var
+  StartTime: double;
+  Alog, Dd, DtB, NormW, Prev: TNNetVolume;
+  SeqLen, t, h, c, s, g, hpg, bOff, cOff, dtOff, gateOff: integer;
+  dInner, P, N, NG, gw, hbase, ebase, xbase: integer;
+  pre, dth, ah, xv, hnew, accY, ar, zsq, gate, msq, rstd: TNeuralFloat;
+  XtPtr, OutPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  Alog := FNeurons[0].FWeights;
+  Dd := FNeurons[1].FWeights;
+  DtB := FNeurons[2].FWeights;
+  NormW := FNeurons[3].FWeights;
+  SeqLen := FOutput.SizeX;
+  P := FHeadDim; N := FStateSize; NG := FNGroups;
+  dInner := FDInner;
+  gw := FNumHeads div NG;            // heads per group
+  bOff := dInner;                    // B starts after x
+  cOff := dInner + NG * N;           // C starts after B
+  dtOff := dInner + 2 * NG * N;      // dt starts after C
+  gateOff := dtOff + FNumHeads;      // gate starts after dt
+  FH.Fill(0);
+  for t := 0 to SeqLen - 1 do
+  begin
+    XtPtr := Prev.GetRawPtr(t, 0, 0);
+    // Per-head dt and decay a.
+    for h := 0 to FNumHeads - 1 do
+    begin
+      pre := XtPtr^[dtOff + h] + DtB.FData[h];
+      if pre > 30 then dth := pre
+      else if pre < -30 then dth := Exp(pre)
+      else dth := Ln(1 + Exp(pre));
+      FDt.FData[(t * FNumHeads) + h] := dth;
+      ar := -Exp(Min(Alog.FData[h], 30));   // A = -exp(A_log)
+      ah := Exp(dth * ar);
+      FAt.FData[(t * FNumHeads) + h] := ah;
+    end;
+    // Head-wise recurrence + per-head output (pre-norm y_t).
+    for h := 0 to FNumHeads - 1 do
+    begin
+      g := h div gw;
+      hpg := g * N;
+      dth := FDt.FData[(t * FNumHeads) + h];
+      ah := FAt.FData[(t * FNumHeads) + h];
+      for c := 0 to P - 1 do
+      begin
+        xbase := h * P + c;
+        xv := XtPtr^[xbase];
+        ebase := xbase * N;
+        hbase := ((t * dInner) + xbase) * N;
+        accY := 0;
+        for s := 0 to N - 1 do
+        begin
+          hnew := ah * FH.FData[ebase + s] +
+            dth * XtPtr^[bOff + hpg + s] * xv;
+          FH.FData[ebase + s] := hnew;
+          FState.FData[hbase + s] := hnew;
+          accY := accY + XtPtr^[cOff + hpg + s] * hnew;
+        end;
+        FY.FData[(t * dInner) + xbase] := accY + Dd.FData[h] * xv;
+      end;
+    end;
+    // Gated RMSNorm over the d_inner axis: z = y*silu(gate); out = rms(z)*w.
+    msq := 0;
+    for c := 0 to dInner - 1 do
+    begin
+      gate := XtPtr^[gateOff + c];
+      gate := gate / (1 + Exp(-gate));   // silu(gate)
+      zsq := FY.FData[(t * dInner) + c] * gate;
+      FZ.FData[(t * dInner) + c] := zsq;
+      msq := msq + zsq * zsq;
+    end;
+    msq := msq / dInner;
+    rstd := 1 / Sqrt(msq + FFloatSt[0]);
+    FRStd.FData[t] := rstd;
+    OutPtr := FOutput.GetRawPtr(t, 0, 0);
+    for c := 0 to dInner - 1 do
+      OutPtr^[c] := FZ.FData[(t * dInner) + c] * rstd * NormW.FData[c];
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMamba2.Backpropagate();
+var
+  StartTime: double;
+  NA, ND, NDtB, NNorm: TNNetNeuron;
+  Alog, Dd, NormW, Prev, PrevErr: TNNetVolume;
+  SeqLen, t, h, c, s, g, hpg, bOff, cOff, dtOff, gateOff: integer;
+  dInner, P, N, NG, gw, hbase, ebase, xbase: integer;
+  hasInputGrad: boolean;
+  GyPtr, XtPtr, PrevErrPtr: TNeuralFloatArrPtr;
+  rstd, gy, z, dotzg, gz, gate, sig, silu, dsilu, gdth, ght, gAlog: TNeuralFloat;
+  dth, ah, ar, xv, htm1, gy_y, gpre, gxv, yval: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  NA := FNeurons[0]; ND := FNeurons[1]; NDtB := FNeurons[2]; NNorm := FNeurons[3];
+  Alog := NA.FWeights; Dd := ND.FWeights; NormW := NNorm.FWeights;
+  Prev := FPrevLayer.FOutput;
+  SeqLen := FOutput.SizeX;
+  P := FHeadDim; N := FStateSize; NG := FNGroups;
+  dInner := FDInner;
+  gw := FNumHeads div NG;
+  bOff := dInner;
+  cOff := dInner + NG * N;
+  dtOff := dInner + 2 * NG * N;
+  gateOff := dtOff + FNumHeads;
+  // Mamba2 changes depth (in = 2*d_inner+2*NG*N+heads, out = d_inner) so the
+  // prev error buffer is NOT the same size as ours; only require that prev
+  // carries an error buffer matching ITS OWN output (training is wired).
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
+    (FPrevLayer.FOutput.Size > 0);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  FGh.Fill(0);
+  FGradA.Fill(0); FGradD.Fill(0); FGradDtB.Fill(0); FGradNorm.Fill(0);
+  // Right-to-left BPTT. Gradients flow: out_t -> (gated RMSNorm) -> y_t & gate,
+  // then y_t -> the head-wise recurrence (gh carries dL/dh across timesteps).
+  for t := SeqLen - 1 downto 0 do
+  begin
+    GyPtr := FOutputError.GetRawPtr(t, 0, 0);
+    XtPtr := Prev.GetRawPtr(t, 0, 0);
+    if hasInputGrad
+      then PrevErrPtr := PrevErr.GetRawPtr(t, 0, 0)
+      else PrevErrPtr := nil;
+    rstd := FRStd.FData[t];
+    // --- Gated RMSNorm backward: out = z*rstd*w, rstd=1/sqrt(mean(z^2)+eps),
+    // z = y*silu(gate). gz_c = w_c*rstd*gy_c - z_c*rstd^3/dInner*sum_k(w_k*gy_k*z_k).
+    dotzg := 0;
+    for c := 0 to dInner - 1 do
+    begin
+      z := FZ.FData[(t * dInner) + c];
+      FGradNorm.FData[c] := FGradNorm.FData[c] +
+        GyPtr^[c] * z * rstd;                    // dL/dnorm_weight
+      dotzg := dotzg + NormW.FData[c] * GyPtr^[c] * z;
+    end;
+    // dL/dy_c and dL/dgate_c. Overwrite FY in place with dL/dy_c for the
+    // recurrence pass (the forward y_t is no longer needed).
+    for c := 0 to dInner - 1 do
+    begin
+      gy := GyPtr^[c];
+      gz := NormW.FData[c] * rstd * gy
+        - FZ.FData[(t * dInner) + c] * rstd * rstd * rstd / dInner * dotzg;
+      gate := XtPtr^[gateOff + c];
+      sig := 1 / (1 + Exp(-gate));
+      silu := gate * sig;
+      dsilu := sig * (1 + gate * (1 - sig));        // d silu / d gate
+      yval := FY.FData[(t * dInner) + c];           // forward pre-norm y_c
+      FY.FData[(t * dInner) + c] := gz * silu;      // dL/dy_c = gz*silu(gate)
+      if hasInputGrad then
+        PrevErrPtr^[gateOff + c] := PrevErrPtr^[gateOff + c] +
+          gz * yval * dsilu;                        // dL/dgate_c = gz*y*dsilu
+    end;
+    // --- Recurrence backward, per head/channel/state.
+    for h := 0 to FNumHeads - 1 do
+    begin
+      g := h div gw;
+      hpg := g * N;
+      dth := FDt.FData[(t * FNumHeads) + h];
+      ah := FAt.FData[(t * FNumHeads) + h];
+      ar := -Exp(Min(Alog.FData[h], 30));   // A = -exp(A_log)
+      gdth := 0;
+      gAlog := 0;
+      for c := 0 to P - 1 do
+      begin
+        xbase := h * P + c;
+        xv := XtPtr^[xbase];
+        ebase := xbase * N;
+        hbase := ((t * dInner) + xbase) * N;
+        gy_y := FY.FData[(t * dInner) + xbase];   // dL/dy_c (set above)
+        // D skip: y_c += D[h]*x_c.
+        FGradD.FData[h] := FGradD.FData[h] + gy_y * xv;
+        gxv := gy_y * Dd.FData[h];
+        for s := 0 to N - 1 do
+        begin
+          if t > 0
+            then htm1 := FState.FData[hbase - (dInner * N) + s]
+            else htm1 := 0;
+          // gh_t[c,s] = gh-from-(t+1) (in FGh) + direct y-path C*gy_y.
+          ght := FGh.FData[ebase + s] + XtPtr^[cOff + hpg + s] * gy_y;
+          // dL/dC[g,s] += gy_y * h_t[c,s]  -> input-grad on C channel.
+          if hasInputGrad then
+            PrevErrPtr^[cOff + hpg + s] := PrevErrPtr^[cOff + hpg + s] +
+              gy_y * FState.FData[hbase + s];
+          // h_t = a*h_{t-1} + dt*B*x ; a = exp(dt*ar).
+          // dt path: dh/ddt = ar*a*h_{t-1} + B*x.
+          gdth := gdth + ght * (ar * ah * htm1 +
+            XtPtr^[bOff + hpg + s] * xv);
+          // A_log path: da/dA_log = a*dt*ar (ar=-exp(A_log)); dh/da = h_{t-1}.
+          gAlog := gAlog + ght * htm1;
+          // B path (input grad): dh/dB = dt*x.
+          if hasInputGrad then
+            PrevErrPtr^[bOff + hpg + s] := PrevErrPtr^[bOff + hpg + s] +
+              ght * dth * xv;
+          // x path through dt*B*x.
+          gxv := gxv + ght * dth * XtPtr^[bOff + hpg + s];
+          // Propagate to t-1: gh_{t-1}[c,s] = a*gh_t[c,s].
+          FGh.FData[ebase + s] := ah * ght;
+        end;
+        if hasInputGrad then
+          PrevErrPtr^[xbase] := PrevErrPtr^[xbase] + gxv;
+      end;
+      // dL/dA_log via the per-head accumulated gAlog (= sum ght*h_{t-1}).
+      FGradA.FData[h] := FGradA.FData[h] + gAlog * (ah * dth * ar);
+      // dt backward: dt = softplus(dt_in + dt_bias); dsoftplus = 1 - exp(-dt).
+      gpre := gdth * (1 - Exp(-dth));
+      FGradDtB.FData[h] := FGradDtB.FData[h] + gpre;     // dL/d dt_bias
+      if hasInputGrad then
+        PrevErrPtr^[dtOff + h] := PrevErrPtr^[dtOff + h] + gpre;
+    end;
+  end;
+  // Flush -FLearningRate-scaled grads.
+  TNNetVolume.MulAdd(NA.FDelta.GetRawPtr(), FGradA.GetRawPtr(), -FLearningRate, FNumHeads);
+  TNNetVolume.MulAdd(ND.FDelta.GetRawPtr(), FGradD.GetRawPtr(), -FLearningRate, FNumHeads);
+  TNNetVolume.MulAdd(NDtB.FDelta.GetRawPtr(), FGradDtB.GetRawPtr(), -FLearningRate, FNumHeads);
+  TNNetVolume.MulAdd(NNorm.FDelta.GetRawPtr(), FGradNorm.GetRawPtr(), -FLearningRate, dInner);
+  if (not FBatchUpdate) then
+  begin
+    NA.UpdateWeights(FInertia);  ND.UpdateWeights(FInertia);
+    NDtB.UpdateWeights(FInertia); NNorm.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetMamba2.InitDefault();
+var
+  oldSeed: integer;
+begin
+  if FNeurons.Count < 4 then AddMissingNeurons(4);
+  oldSeed := RandSeed;
+  RandSeed := 314159;
+  // Benign defaults; the importer overwrites them. A_log small (A=-exp(A_log)
+  // ~ -1), D = 1 (identity skip), dt_bias = 0, norm_weight = 1.
+  FNeurons[0].FWeights.Fill(0);   // A_log -> A = -1
+  FNeurons[1].FWeights.Fill(1);   // D
+  FNeurons[2].FWeights.Fill(0);   // dt_bias
+  FNeurons[3].FWeights.Fill(1);   // norm_weight
   RandSeed := oldSeed;
   AfterWeightUpdate();
 end;
@@ -44041,6 +50066,78 @@ begin
   AfterWeightUpdate();
 end;
 
+{ TNNetLlama4AttnTemperature }
+constructor TNNetLlama4AttnTemperature.Create();
+begin
+  inherited Create();
+  FFloorScale := 8192;
+  FAttnScale := 0.1;
+  FPositionOffset := 0;
+  FFloatSt[0] := FFloorScale;
+  FFloatSt[1] := FAttnScale;
+end;
+
+constructor TNNetLlama4AttnTemperature.Create(pFloorScale, pAttnScale: TNeuralFloat);
+begin
+  Create();
+  if pFloorScale > 0 then FFloorScale := pFloorScale;
+  FAttnScale := pAttnScale;
+  FFloatSt[0] := FFloorScale;
+  FFloatSt[1] := FAttnScale;
+end;
+
+procedure TNNetLlama4AttnTemperature.Compute();
+var
+  StartTime: double;
+  SeqLen, Depth, pos, k, BaseIdx: integer;
+  Scale: TNeuralFloat;
+begin
+  StartTime := Now();
+  inherited Compute; // copies FPrevLayer.FOutput into FOutput
+  SeqLen := FOutput.SizeX;
+  Depth := FOutput.Depth;
+  for pos := 0 to SeqLen - 1 do
+  begin
+    // f(pos) = log1p(floor((pos+1)/floor_scale))*attn_scale + 1.
+    Scale := Ln(1 + Floor((pos + FPositionOffset + 1) / FFloorScale)) *
+      FAttnScale + 1;
+    BaseIdx := pos * Depth;
+    for k := 0 to Depth - 1 do
+      FOutput.FData[BaseIdx + k] := FOutput.FData[BaseIdx + k] * Scale;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetLlama4AttnTemperature.Backpropagate();
+var
+  StartTime: double;
+  SeqLen, Depth, pos, k, BaseIdx: integer;
+  Scale: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if Assigned(FPrevLayer) and
+     (FPrevLayer.OutputError.Size > 0) and
+     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    StartTime := Now();
+    SeqLen := FOutput.SizeX;
+    Depth := FOutput.Depth;
+    for pos := 0 to SeqLen - 1 do
+    begin
+      Scale := Ln(1 + Floor((pos + FPositionOffset + 1) / FFloorScale)) *
+        FAttnScale + 1;
+      BaseIdx := pos * Depth;
+      for k := 0 to Depth - 1 do
+        FPrevLayer.FOutputError.FData[BaseIdx + k] :=
+          FPrevLayer.FOutputError.FData[BaseIdx + k] +
+          Scale * FOutputError.FData[BaseIdx + k];
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+end;
+
 { TNNetRMSNormGated }
 constructor TNNetRMSNormGated.Create();
 begin
@@ -45021,6 +51118,25 @@ function TNNetLayerConcatedWeights.Int8QuantizedSizeBytes(): int64;
 begin
   Result := int64(Length(FQuantCodes)) * SizeOf(ShortInt) +
     int64(Length(FQuantScales)) * SizeOf(TNeuralFloat);
+end;
+
+function TNNetLayerConcatedWeights.GetInt8QuantData(out pCodes: TInt8DynArr;
+  out pScales: TNeuralFloatDynArr; out NumRows, VS: integer): boolean;
+var
+  i: integer;
+begin
+  SetLength(pCodes, 0);
+  SetLength(pScales, 0);
+  NumRows := 0;
+  VS := 0;
+  Result := FQuantInt8;
+  if not Result then exit;
+  NumRows := FNeurons.Count;
+  VS := FQuantVectorSize;
+  SetLength(pCodes, Length(FQuantCodes));
+  for i := 0 to Length(FQuantCodes) - 1 do pCodes[i] := FQuantCodes[i];
+  SetLength(pScales, Length(FQuantScales));
+  for i := 0 to Length(FQuantScales) - 1 do pScales[i] := FQuantScales[i];
 end;
 
 procedure TNNetLayerConcatedWeights.BuildBiasOutput();
@@ -46236,6 +52352,35 @@ begin
   FActivationFnDerivative := @IdentityDerivative;
 end;
 
+{ TNNetConvolutionRectangular }
+constructor TNNetConvolutionRectangular.Create(pNumFeatures, pFeatureSizeX,
+  pFeatureSizeY, pInputPadding, pStride: integer; pSuppressBias: integer = 0);
+begin
+  // Build through the square base using the LARGER spatial extent so that the
+  // base never mistakes a 1xN / Nx1 kernel for a pointwise (1x1) convolution
+  // (which would skip the im2col step). Then override both extents with the
+  // true asymmetric values before the layer is wired to a previous layer.
+  inherited Create(pNumFeatures, Max(pFeatureSizeX, pFeatureSizeY), pInputPadding, pStride, pSuppressBias);
+  SetFeatureSizeXY(pFeatureSizeX, pFeatureSizeY);
+  FPointwise := (FFeatureSizeX = 1) and (FFeatureSizeY = 1) and
+    (FPadding = 0) and (FStride = 1);
+  // Serialize the X extent in the usual feature-size slot and the Y extent in
+  // a free slot so a saved rectangular conv round-trips with X <> Y.
+  FStruct[1] := FFeatureSizeX;
+  FStruct[5] := FFeatureSizeY;
+  FActivationFn := @Identity;
+  FActivationFnDerivative := @IdentityDerivative;
+end;
+
+{ TNNetConvolutionRectangularReLU }
+constructor TNNetConvolutionRectangularReLU.Create(pNumFeatures, pFeatureSizeX,
+  pFeatureSizeY, pInputPadding, pStride: integer; pSuppressBias: integer = 0);
+begin
+  inherited Create(pNumFeatures, pFeatureSizeX, pFeatureSizeY, pInputPadding, pStride, pSuppressBias);
+  FActivationFn := @RectifiedLinearUnit;
+  FActivationFnDerivative := @RectifiedLinearUnitDerivative;
+end;
+
 { THistoricalNets }
 procedure THistoricalNets.AddLeCunLeNet5(IncludeInput: boolean);
 begin
@@ -46783,6 +52928,67 @@ begin
   Result := AddLayer( TNNetCellMulByCell.Create(ChannelRefined, SpatialMask) );
 end;
 
+function TNNet.AddUNet(Depth, BaseFeatures, OutputChannels: integer;
+  out EncoderTaps: TNeuralIntegerArray;
+  UseNorm: boolean): TNNetLayer;
+var
+  Stage, Features: integer;
+  Tap: TNNetLayer;
+
+  // 2x [ Conv3x3(pad1,stride1) -> (optional Norm) -> ReLU ], shape-preserving
+  // in space.
+  procedure DoubleConv(F: integer);
+  begin
+    AddLayer( TNNetConvolutionLinear.Create(F, 3, 1, 1) );
+    if UseNorm then AddLayer( TNNetMovingStdNormalization.Create() );
+    AddLayer( TNNetReLU.Create() );
+    AddLayer( TNNetConvolutionLinear.Create(F, 3, 1, 1) );
+    if UseNorm then AddLayer( TNNetMovingStdNormalization.Create() );
+    AddLayer( TNNetReLU.Create() );
+  end;
+
+begin
+  if Depth < 1 then
+    FErrorProc('AddUNet requires Depth >= 1. Depth=' + IntToStr(Depth));
+  if BaseFeatures < 1 then
+    FErrorProc('AddUNet requires BaseFeatures >= 1. BaseFeatures=' + IntToStr(BaseFeatures));
+  if OutputChannels < 1 then
+    FErrorProc('AddUNet requires OutputChannels >= 1. OutputChannels=' + IntToStr(OutputChannels));
+
+  SetLength(EncoderTaps, Depth);
+
+  // ---- ENCODER: Depth stages, each doubling features, each pooling x2 ------
+  Features := BaseFeatures;
+  for Stage := 0 to Depth - 1 do
+  begin
+    DoubleConv(Features);
+    // Record the PRE-pool feature map as the skip tap for this resolution.
+    Tap := GetLastLayer();
+    EncoderTaps[Stage] := Tap.LayerIdx;
+    AddLayer( TNNetMaxPool.Create(2) ); // 2x2 stride-2 downsample.
+    Features := Features * 2;
+  end;
+
+  // ---- BOTTLENECK ---------------------------------------------------------
+  DoubleConv(Features);
+
+  // ---- DECODER: Depth stages, each halving features, each upsampling x2 ----
+  for Stage := Depth - 1 downto 0 do
+  begin
+    Features := Features div 2;
+    // TNNetDeMaxPool(2) with default spacing replicates each cell into a 2x2
+    // block: a nearest-neighbour x2 spatial upsample that PRESERVES depth
+    // (unlike TNNetUpsample, which is a depth->space pixel-shuffle).
+    AddLayer( TNNetDeMaxPool.Create(2) );
+    // Skip connection: concatenate the matching encoder tap on the depth axis.
+    AddLayer( TNNetDeepConcat.Create([ GetLastLayer(), FLayers[EncoderTaps[Stage]] ]) );
+    DoubleConv(Features);
+  end;
+
+  // ---- HEAD: 1x1 conv to the requested output-channel logit map -----------
+  Result := AddLayer( TNNetConvolutionLinear.Create(OutputChannels, 1, 0, 1) );
+end;
+
 function TNNet.AddLoRAAdapter(FrozenLayer: TNNetLayer; Rank: integer;
   Alpha: TNeuralFloat): TNNetLayer;
 var
@@ -46816,6 +53022,63 @@ begin
   Scaled := AddLayer(TNNetMulByConstant.Create(Alpha / Rank));
   // Residual add: adapted = base + (Alpha/Rank) * B*A.
   Result := AddLayer(TNNetSum.Create([FrozenLayer, Scaled]));
+end;
+
+procedure TNNet.MergeLoRA(BaseLayer, ADown, BUp: TNNetLayer;
+  Alpha: TNeuralFloat);
+var
+  Rank, d_in, d_out, i, j, k: integer;
+  Scale, Acc: TNeuralFloat;
+begin
+  if (BaseLayer = nil) or (ADown = nil) or (BUp = nil) then
+    FErrorProc('MergeLoRA requires non-nil BaseLayer, ADown and BUp layers.');
+  Rank := ADown.Neurons.Count;
+  if Rank < 1 then
+    FErrorProc('MergeLoRA: ADown has no neurons (Rank=' + IntToStr(Rank) + ').');
+  d_out := BaseLayer.Neurons.Count;
+  if d_out < 1 then
+    FErrorProc('MergeLoRA: BaseLayer has no neurons.');
+  if BUp.Neurons.Count <> d_out then
+    FErrorProc('MergeLoRA: BUp neuron count (' + IntToStr(BUp.Neurons.Count) +
+      ') must equal BaseLayer neuron count (' + IntToStr(d_out) + ').');
+  // A maps d_in -> Rank: every A neuron carries d_in weights. B maps Rank ->
+  // d_out: every B neuron carries Rank weights.
+  d_in := ADown.Neurons[0].Weights.Size;
+  if BaseLayer.Neurons[0].Weights.Size <> d_in then
+    FErrorProc('MergeLoRA: BaseLayer in-dim (' +
+      IntToStr(BaseLayer.Neurons[0].Weights.Size) + ') must equal ADown in-dim ('
+      + IntToStr(d_in) + ').');
+  if BUp.Neurons[0].Weights.Size <> Rank then
+    FErrorProc('MergeLoRA: BUp in-dim (' + IntToStr(BUp.Neurons[0].Weights.Size) +
+      ') must equal Rank (' + IntToStr(Rank) + ').');
+  Scale := Alpha / Rank;
+  // The bypass output is bypass[j] = Scale*( sum_k B[j][k]*(A[k].x + biasA[k])
+  // + biasB[j] ). The x-dependent part folds into the base WEIGHTS and the
+  // constant part (the A/B biases threaded through B) folds into the base
+  // BIAS, so the merged base reproduces base(x)+bypass(x) exactly:
+  //   W_base[j][i] += Scale * sum_k B[j][k] * A[k][i]
+  //   bias_base[j] += Scale * ( sum_k B[j][k] * biasA[k] + biasB[j] )
+  // (AddLoRAAdapter zero-inits biasB, but a general PEFT-imported adapter may
+  // carry one, so both terms are folded.)
+  for j := 0 to d_out - 1 do
+  begin
+    for i := 0 to d_in - 1 do
+    begin
+      Acc := 0;
+      for k := 0 to Rank - 1 do
+        Acc := Acc +
+          BUp.Neurons[j].Weights.FData[k] * ADown.Neurons[k].Weights.FData[i];
+      BaseLayer.Neurons[j].Weights.FData[i] :=
+        BaseLayer.Neurons[j].Weights.FData[i] + Scale * Acc;
+    end;
+    Acc := BUp.Neurons[j].BiasWeight;
+    for k := 0 to Rank - 1 do
+      Acc := Acc + BUp.Neurons[j].Weights.FData[k] * ADown.Neurons[k].BiasWeight;
+    BaseLayer.Neurons[j].BiasWeight :=
+      BaseLayer.Neurons[j].BiasWeight + Scale * Acc;
+  end;
+  // Refresh the concatenated-weight caches after the in-place mutation.
+  BaseLayer.AfterWeightUpdate();
 end;
 
 procedure TNNet.AddSplitQKVHeads(d_model, Heads: integer;
@@ -46862,7 +53125,8 @@ function TNNet.AddMultiHeadSDPAConcat(Heads: integer;
   Window: integer = 0;
   RelPosNumBuckets: integer = 32;
   RelPosMaxDistance: integer = 128;
-  QKRMSNorm: boolean = false): TNNetLayer;
+  QKRMSNorm: boolean = false;
+  SegmentSource: TNNetLayer = nil): TNNetLayer;
 var
   d_model, d_k, HeadCnt, d: integer;
   SliceLayers, HeadOutputs: array of TNNetLayer;
@@ -46903,13 +53167,18 @@ var
           AfterLayer);
     else
       Result := AddLayerAfter(
-        TNNetScaledDotProductAttention.Create(d_k, CausalMask, Window),
+        TNNetScaledDotProductAttention.Create(d_k, CausalMask, Window,
+          0, false, SegmentSource),
         AfterLayer);
     end;
   end;
 
 begin
   if SourceLayer = nil then SourceLayer := GetLastLayer();
+  if (SegmentSource <> nil) and (Variant <> avSDPA) then
+    FErrorProc('AddMultiHeadSDPAConcat with SegmentSource requires ' +
+      'Variant = avSDPA (the drop-in variants do not implement segment ' +
+      'masking).');
   // Source is the Q|K|V slab, so its depth is 3*d_model.
   d_model := SourceLayer.Output.Depth div 3;
   d_k := d_model div Heads;
@@ -46988,7 +53257,8 @@ function TNNet.AddMultiHeadSelfAttention(Heads: integer;
   Window: integer = 0;
   RelPosNumBuckets: integer = 32;
   RelPosMaxDistance: integer = 128;
-  QKRMSNorm: boolean = false): TNNetLayer;
+  QKRMSNorm: boolean = false;
+  SegmentSource: TNNetLayer = nil): TNNetLayer;
 var
   d_model: integer;
 begin
@@ -46996,7 +53266,7 @@ begin
   d_model := GetLastLayer().Output.Depth div 3;
   AddMultiHeadSDPAConcat(Heads, CausalMask, GetLastLayer(), UseRoPE,
     Variant, NumSinks, Window, RelPosNumBuckets, RelPosMaxDistance,
-    QKRMSNorm);
+    QKRMSNorm, SegmentSource);
   // Token-wise linear out-projection (see header note: FullConnectLinear would
   // flatten the sequence axis; PointwiseConvLinear projects each token).
   Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
@@ -48309,6 +54579,29 @@ begin
   // slab [h*VocabSize .. (h+1)*VocabSize-1]. Output (SeqLen,1,NumFuture*VocabSize).
   Result := AddLayer(TNNetDeepConcat.Create(HeadOutputs));
   SetLength(HeadOutputs, 0);
+end;
+
+function TNNet.AddTokenClassificationHead(NumLabels: integer): TNNetLayer;
+begin
+  if NumLabels < 1 then
+    FErrorProc('AddTokenClassificationHead requires NumLabels >= 1. NumLabels=' +
+      IntToStr(NumLabels));
+  // Token-wise 1x1 conv keeps the (SeqLen,1,*) sequence axis: every token gets its
+  // own NumLabels-wide logit vector (a FullConnect would flatten/mix the tokens).
+  Result := AddLayer(TNNetPointwiseConvLinear.Create(NumLabels));
+end;
+
+function TNNet.AddQuestionAnsweringHead(): TNNetLayer;
+var
+  Trunk, StartLogit, EndLogit: TNNetLayer;
+begin
+  Trunk := GetLastLayer();           // shared (SeqLen,1,d_model) hidden state
+  // Two parallel per-token 1-channel projections off the SAME trunk. Token-wise
+  // 1x1 convs keep the sequence axis (FullConnect would mix tokens).
+  StartLogit := AddLayerAfter(TNNetPointwiseConvLinear.Create(1), Trunk);
+  EndLogit   := AddLayerAfter(TNNetPointwiseConvLinear.Create(1), Trunk);
+  // Concatenate along depth -> (SeqLen,1,2): channel 0 = start, channel 1 = end.
+  Result := AddLayer(TNNetDeepConcat.Create([StartLogit, EndLogit]));
 end;
 
 // Ported code from:
@@ -61556,6 +67849,46 @@ begin
   BackpropagateNoTest();
 end;
 
+{ TNNetNEFTune }
+constructor TNNetNEFTune.Create(pAlpha: TNeuralFloat);
+begin
+  inherited Create();
+  if pAlpha < 0 then pAlpha := 0;
+  FFloatSt[0] := pAlpha;
+  if pAlpha > 0 then FEnabled := true;
+end;
+
+procedure TNNetNEFTune.Compute();
+var
+  StartTime: double;
+  Alpha, Scale: TNeuralFloat;
+  L, D: integer;
+  CntOut, MaxOutput: integer;
+begin
+  StartTime := Now();
+  // Identity copy (used at inference and as the base path).
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  Alpha := FFloatSt[0];
+  if FEnabled and (Alpha > 0) then
+  begin
+    // L = sequence/token axis (SizeX); d = embedding dimension (Depth).
+    L := FOutput.SizeX;
+    D := FOutput.Depth;
+    if (L > 0) and (D > 0) then
+    begin
+      Scale := Alpha / Sqrt(L * D);
+      MaxOutput := FOutput.Size - 1;
+      for CntOut := 0 to MaxOutput do
+      begin
+        // Uniform(-1,+1): 2*Random - 1.
+        FOutput.FData[CntOut] := FOutput.FData[CntOut] +
+          Scale * (2 * Random - 1);
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
 { TNNetSpatialDropout2D }
 constructor TNNetSpatialDropout2D.Create(pDropProb: TNeuralFloat);
 begin
@@ -66169,6 +72502,14 @@ begin
   FPrevLayerErrorPadded := TNNetVolume.Create;
 end;
 
+procedure TNNetConvolutionAbstract.SetFeatureSizeXY(pFeatureSizeX, pFeatureSizeY: integer);
+begin
+  FFeatureSizeX := Max(pFeatureSizeX, 1);
+  FFeatureSizeY := Max(pFeatureSizeY, 1);
+  FFeatureSizeXMinus1 := FFeatureSizeX - 1;
+  FFeatureSizeYMinus1 := FFeatureSizeY - 1;
+end;
+
 destructor TNNetConvolutionAbstract.Destroy();
 begin
   if FPadding > 0 then
@@ -67022,11 +73363,62 @@ begin
   end;
 end;
 
+procedure TNNet.ComputeL2Decay(ExcludeBias: boolean);
+var
+  LayerCnt, NeuronCnt: integer;
+  CurrentLayer: TNNetLayer;
+  Factor: TNeuralFloat;
+begin
+  if not ExcludeBias then
+  begin
+    // Bit-identical to the default uniform path.
+    ComputeL2Decay();
+    Exit;
+  end;
+  // Parameter-group path: shrink weights but never the bias term. Norm layers
+  // (TNNetIdentityWithoutL2 descendants) override ComputeL2Decay() to a no-op,
+  // so their gains are skipped here too - we honour that by skipping any layer
+  // whose ComputeL2Decay() does nothing, i.e. TNNetIdentityWithoutL2.
+  for LayerCnt := 1 to GetLastLayerIdx() do
+  begin
+    CurrentLayer := FLayers[LayerCnt];
+    if CurrentLayer is TNNetIdentityWithoutL2 then Continue;
+    if (CurrentLayer.Neurons.Count = 0) or (CurrentLayer.L2Decay <= 0) then Continue;
+    Factor := 1 - (CurrentLayer.L2Decay * CurrentLayer.LearningRate);
+    for NeuronCnt := 0 to CurrentLayer.Neurons.Count - 1 do
+    begin
+      CurrentLayer.Neurons[NeuronCnt].Weights.Mul(Factor);
+      // Bias deliberately untouched (excluded from weight decay).
+    end;
+    CurrentLayer.AfterWeightUpdate();
+  end;
+end;
+
+function TNNet.ScaleNormLayerLearningRate(Mul: TNeuralFloat): integer;
+var
+  LayerCnt: integer;
+  CurrentLayer: TNNetLayer;
+begin
+  Result := 0;
+  if Mul = 1 then Exit;
+  for LayerCnt := 0 to GetLastLayerIdx() do
+  begin
+    CurrentLayer := FLayers[LayerCnt];
+    if (CurrentLayer is TNNetIdentityWithoutL2) and
+       (CurrentLayer.Neurons.Count > 0) then
+    begin
+      CurrentLayer.LearningRate := CurrentLayer.LearningRate * Mul;
+      Inc(Result);
+    end;
+  end;
+end;
+
 constructor TNNet.Create();
 begin
   inherited Create();
   FLayers := TNNetLayerList.Create();
   ClearTime();
+  FDetectAnomaly := false;
   {$IFDEF OpenCL}
   FDotProductKernel := nil;
   {$ENDIF}
@@ -68385,6 +74777,140 @@ begin
     Lines.Add(StringOfChar('-', 70));
     Lines.Add(Format('TOTAL: %.2f us/forward across %d layer(s)',
       [TotalUs / Iterations, NN.GetLastLayerIdx() + 1]));
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.ProfileReport(
+  NN: TNNet;
+  Sample: TNNetVolume;
+  Target: TNNetVolume = nil;
+  Iterations: integer = 20
+): string;
+var
+  Lines: TStringList;
+  LayerCnt, NeuronIdx, IterCnt: integer;
+  Layer: TNNetLayer;
+  FwdUs, BwdUs, BwdStr: string;
+  MeanFwdUs, MeanBwdUs: double;
+  ParamElements, ActElements: Int64;
+  TotalParamElements, TotalActElements: Int64;
+  TotalFwdUs, TotalBwdUs: double;
+  DoBackward: boolean;
+  BytesPerElem: integer;
+  ShapeStr, PassStr: string;
+const
+  // FForwardTime / FBackwardTime are TDateTime spans measured in days; this
+  // converts to microseconds.
+  cUsPerDay = 24.0 * 60.0 * 60.0 * 1000.0 * 1000.0;
+begin
+  Result := '';
+  if NN = nil then
+  begin
+    Result := 'ProfileReport: NN is nil.' + sLineBreak;
+    Exit;
+  end;
+  if NN.GetLastLayerIdx() < 0 then
+  begin
+    Result := 'ProfileReport: NN has no layers.' + sLineBreak;
+    Exit;
+  end;
+  if Sample = nil then
+  begin
+    Result := 'ProfileReport: Sample is nil.' + sLineBreak;
+    Exit;
+  end;
+  if Iterations < 1 then Iterations := 1;
+  DoBackward := (Target <> nil);
+
+  BytesPerElem := SizeOf(TNeuralFloat);
+
+  // Zero the per-layer FForwardTime / FBackwardTime accumulators, then run
+  // Iterations full forward (and optional backward) passes so each layer
+  // sums its own Compute / Backpropagate cost.
+  NN.ClearTime();
+  for IterCnt := 1 to Iterations do
+  begin
+    NN.Compute(Sample);
+    if DoBackward then NN.Backpropagate(Target);
+  end;
+
+  TotalParamElements := 0;
+  TotalActElements := 0;
+  TotalFwdUs := 0;
+  TotalBwdUs := 0;
+
+  Lines := TStringList.Create;
+  try
+    Lines.Add('Profile Report (torch.profiler-lite)');
+    Lines.Add(StringOfChar('=', 36));
+    if DoBackward then
+      PassStr := ' + backward'
+    else
+      PassStr := ' (no backward: Target=nil)';
+    Lines.Add(Format(
+      'Passes: %d forward%s, single-sample (batch=1), %d bytes/elem',
+      [Iterations, PassStr, BytesPerElem]));
+    Lines.Add(Format('%-4s %-22s %-14s %10s %10s %10s %12s %10s %12s',
+      ['Idx', 'Layer', 'Output', 'us/fwd', 'us/bwd',
+       'Params', 'ParamBytes', 'ActElem', 'ActBytes']));
+    Lines.Add(StringOfChar('-', 116));
+    for LayerCnt := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerCnt];
+
+      // Activation tensor size in elements (single sample, batch=1).
+      if Layer.Output <> nil then
+        ActElements := Int64(Layer.Output.SizeX) * Layer.Output.SizeY *
+          Layer.Output.Depth
+      else
+        ActElements := 0;
+
+      // Parameter tensor size in elements: weights + biases. Per neuron one
+      // bias (FBiasWeight) is allocated even if unused; count it only for
+      // layers that own their weights so parameter-free / weight-linked
+      // layers stay at 0 (matches MemoryFootprintReport).
+      ParamElements := 0;
+      if Layer.Neurons.Count > 0 then
+      begin
+        for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+          ParamElements := ParamElements +
+            Layer.Neurons[NeuronIdx].Weights.Size;
+        if (ParamElements > 0) and (not Layer.LinkedNeurons) then
+          ParamElements := ParamElements + Layer.Neurons.Count;
+      end;
+
+      MeanFwdUs := (Layer.ForwardTime * cUsPerDay) / Iterations;
+      MeanBwdUs := (Layer.BackwardTime * cUsPerDay) / Iterations;
+
+      TotalParamElements := TotalParamElements + ParamElements;
+      TotalActElements := TotalActElements + ActElements;
+      TotalFwdUs := TotalFwdUs + Layer.ForwardTime * cUsPerDay;
+      TotalBwdUs := TotalBwdUs + Layer.BackwardTime * cUsPerDay;
+
+      ShapeStr := Format('%dx%dx%d',
+        [Layer.Output.SizeX, Layer.Output.SizeY, Layer.Output.Depth]);
+      FwdUs := Format('%10.2f', [MeanFwdUs]);
+      if DoBackward then
+        BwdStr := Format('%10.2f', [MeanBwdUs])
+      else
+        BwdStr := Format('%10s', ['-']);
+      Lines.Add(Format('%-4d %-22s %-14s %s %s %10d %12d %10d %12d',
+        [LayerCnt, Layer.ClassName, ShapeStr, FwdUs, BwdStr,
+         ParamElements, ParamElements * BytesPerElem,
+         ActElements, ActElements * BytesPerElem]));
+    end;
+    Lines.Add(StringOfChar('-', 116));
+    if DoBackward then
+      BwdStr := Format('%10.2f', [TotalBwdUs / Iterations])
+    else
+      BwdStr := Format('%10s', ['-']);
+    Lines.Add(Format('%-4s %-22s %-14s %10.2f %s %10d %12d %10d %12d',
+      ['TOT', '', '', TotalFwdUs / Iterations, BwdStr,
+       TotalParamElements, TotalParamElements * BytesPerElem,
+       TotalActElements, TotalActElements * BytesPerElem]));
     Result := Lines.Text;
   finally
     Lines.Free;
@@ -78655,6 +85181,170 @@ begin
   end;
 end;
 
+function TNNet.PruneWeightsByMagnitude(Sparsity: TNeuralFloat;
+  PerLayer: boolean = False): integer;
+var
+  LayerCnt, NeuronCnt, WeightCnt, K, CutIdx, TotalWeights: integer;
+  Layer: TNNetLayer;
+  Neuron: TNNetNeuron;
+  AllAbs: array of TNeuralFloat;
+  Threshold: TNeuralFloat;
+
+  procedure SortAsc(var Arr: array of TNeuralFloat; N: integer);
+  var A, B: integer; SwapF: TNeuralFloat;
+  begin
+    for A := 0 to N - 2 do
+      for B := 0 to N - 2 - A do
+        if Arr[B] > Arr[B + 1] then
+        begin
+          SwapF := Arr[B]; Arr[B] := Arr[B + 1]; Arr[B + 1] := SwapF;
+        end;
+  end;
+
+begin
+  Result := 0;
+  if Sparsity <= 0 then
+  begin
+    ClearPruneMasks();
+    Exit;
+  end;
+  if Sparsity >= 1 then Sparsity := 0.999999;
+
+  if not PerLayer then
+  begin
+    // GLOBAL: pool |w| over the whole net, threshold at the Sparsity percentile.
+    TotalWeights := 0;
+    for LayerCnt := 0 to GetLastLayerIdx() do
+    begin
+      Layer := FLayers[LayerCnt];
+      if Layer.Neurons.Count = 0 then Continue;
+      if (Layer.Neurons[0].Weights = nil) or (Layer.Neurons[0].Weights.Size = 0)
+        then Continue;
+      for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+        TotalWeights := TotalWeights + Layer.Neurons[NeuronCnt].Weights.Size;
+    end;
+    if TotalWeights = 0 then Exit;
+    SetLength(AllAbs, TotalWeights);
+    K := 0;
+    for LayerCnt := 0 to GetLastLayerIdx() do
+    begin
+      Layer := FLayers[LayerCnt];
+      if Layer.Neurons.Count = 0 then Continue;
+      if (Layer.Neurons[0].Weights = nil) or (Layer.Neurons[0].Weights.Size = 0)
+        then Continue;
+      for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+      begin
+        Neuron := Layer.Neurons[NeuronCnt];
+        for WeightCnt := 0 to Neuron.Weights.Size - 1 do
+        begin
+          AllAbs[K] := Abs(Neuron.Weights.FData[WeightCnt]);
+          Inc(K);
+        end;
+      end;
+    end;
+    SortAsc(AllAbs, TotalWeights);
+    CutIdx := Trunc(Sparsity * TotalWeights);
+    if CutIdx < 1 then CutIdx := 1;
+    if CutIdx > TotalWeights then CutIdx := TotalWeights;
+    // Threshold = magnitude of the largest weight we still prune.
+    Threshold := AllAbs[CutIdx - 1];
+    for LayerCnt := 0 to GetLastLayerIdx() do
+      Result := Result +
+        FLayers[LayerCnt].BuildPruneMaskFromThreshold(Threshold);
+  end
+  else
+  begin
+    // PER-LAYER: each trainable layer pruned to Sparsity independently.
+    for LayerCnt := 0 to GetLastLayerIdx() do
+    begin
+      Layer := FLayers[LayerCnt];
+      if Layer.Neurons.Count = 0 then Continue;
+      if (Layer.Neurons[0].Weights = nil) or (Layer.Neurons[0].Weights.Size = 0)
+        then Continue;
+      TotalWeights := 0;
+      for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+        TotalWeights := TotalWeights + Layer.Neurons[NeuronCnt].Weights.Size;
+      if TotalWeights = 0 then Continue;
+      SetLength(AllAbs, TotalWeights);
+      K := 0;
+      for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+      begin
+        Neuron := Layer.Neurons[NeuronCnt];
+        for WeightCnt := 0 to Neuron.Weights.Size - 1 do
+        begin
+          AllAbs[K] := Abs(Neuron.Weights.FData[WeightCnt]);
+          Inc(K);
+        end;
+      end;
+      SortAsc(AllAbs, TotalWeights);
+      CutIdx := Trunc(Sparsity * TotalWeights);
+      if CutIdx < 1 then CutIdx := 1;
+      if CutIdx > TotalWeights then CutIdx := TotalWeights;
+      Threshold := AllAbs[CutIdx - 1];
+      Result := Result + Layer.BuildPruneMaskFromThreshold(Threshold);
+    end;
+  end;
+end;
+
+procedure TNNet.ApplyPruneMasks();
+var
+  LayerCnt: integer;
+begin
+  for LayerCnt := 0 to GetLastLayerIdx() do
+    if FLayers[LayerCnt].HasPruneMask() then
+      FLayers[LayerCnt].ApplyPruneMask();
+end;
+
+function TNNet.HasPruneMasks(): boolean;
+var
+  LayerCnt: integer;
+begin
+  Result := False;
+  for LayerCnt := 0 to GetLastLayerIdx() do
+    if FLayers[LayerCnt].HasPruneMask() then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+procedure TNNet.ClearPruneMasks();
+var
+  LayerCnt: integer;
+begin
+  for LayerCnt := 0 to GetLastLayerIdx() do
+    FLayers[LayerCnt].ClearPruneMask();
+end;
+
+function TNNet.CountPrunedWeights(): integer;
+var
+  LayerCnt: integer;
+begin
+  Result := 0;
+  for LayerCnt := 0 to GetLastLayerIdx() do
+    Result := Result + FLayers[LayerCnt].CountPrunedWeights();
+end;
+
+function TNNet.GetPruneSparsity(): TNeuralFloat;
+var
+  LayerCnt, NeuronCnt, TotalWeights: integer;
+  Layer: TNNetLayer;
+begin
+  Result := 0;
+  TotalWeights := 0;
+  for LayerCnt := 0 to GetLastLayerIdx() do
+  begin
+    Layer := FLayers[LayerCnt];
+    if Layer.Neurons.Count = 0 then Continue;
+    if (Layer.Neurons[0].Weights = nil) or (Layer.Neurons[0].Weights.Size = 0)
+      then Continue;
+    for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+      TotalWeights := TotalWeights + Layer.Neurons[NeuronCnt].Weights.Size;
+  end;
+  if TotalWeights > 0 then
+    Result := CountPrunedWeights() / TotalWeights;
+end;
+
 class function TNNet.MagnitudePruningReport(
   NN: TNNet;
   Samples: TNNetVolumeList;
@@ -83308,8 +89998,10 @@ var
   ClassNameStr: string;
   SCount: integer;
   StructCount: integer;
+  SegSrc: TNNetLayer;
 begin
   Result := nil;
+  SegSrc := nil;
   S := CreateTokenizedStringList(strData,':');
   S2 := CreateTokenizedStringList(strData,';');
 
@@ -83345,10 +90037,11 @@ begin
           aIdx[IdxCnt] := StrToInt(S2[IdxCnt]);
         end;
 
-        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetCrossWKV') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') ) then
+        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetCrossWKV') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetFlowWarp') or (S[0] = 'TNNetCorrelationVolume') or (S[0] = 'TNNetCorrelationLookup') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') or (S[0] = 'TNNetModulatedConv2D') or (S[0] = 'TNNetScaledDotProductAttention') ) then
         begin
           IdxsToLayers(aIdx, aL);
         end;
+        if Length(aL) > 0 then SegSrc := aL[0];
       end;
     end;
 
@@ -83389,7 +90082,9 @@ begin
       'TNNetISRU' :                 Result := TNNetISRU.Create(Ft[0]);
       'TNNetISRLU' :                Result := TNNetISRLU.Create(Ft[0]);
       'TNNetHardSwish' :            Result := TNNetHardSwish.Create();
+      'TNNetHardSigmoid' :          Result := TNNetHardSigmoid.Create();
       'TNNetGELU' :                 Result := TNNetGELU.Create();
+      'TNNetGELUErf' :              Result := TNNetGELUErf.Create();
       'TNNetMish' :                 Result := TNNetMish.Create();
       'TNNetPhish' :                Result := TNNetPhish.Create();
       'TNNetSerf' :                 Result := TNNetSerf.Create();
@@ -83430,8 +90125,10 @@ begin
       'TNNetGEGLU' :                Result := TNNetGEGLU.Create();
       'TNNetGEGLUErf' :             Result := TNNetGEGLUErf.Create();
       'TNNetSwiGLU' :               Result := TNNetSwiGLU.Create();
+      'TNNetGptOssGatedSwiGLU' :    Result := TNNetGptOssGatedSwiGLU.Create(Ft[0], Ft[1]);
       'TNNetGLU' :                  Result := TNNetGLU.Create();
       'TNNetReGLU' :                Result := TNNetReGLU.Create();
+      'TNNetReGLUSquared' :         Result := TNNetReGLUSquared.Create();
       'TNNetTanhGLU' :              Result := TNNetTanhGLU.Create();
       'TNNetCosineSimilarity' :     Result := TNNetCosineSimilarity.Create();
       'TNNetSquaredReLU' :          Result := TNNetSquaredReLU.Create();
@@ -83451,6 +90148,7 @@ begin
       'TNNetMultiQuantileLoss' :    Result := BuildMultiQuantileLoss(St[0], Ft);
       'TNNetFocalLoss' :            Result := TNNetFocalLoss.Create(Ft[0], Ft[1]);
       'TNNetNLLLoss' :              Result := TNNetNLLLoss.Create();
+      'TNNetCTCLoss' :              Result := TNNetCTCLoss.Create(St[0]);
       'TNNetKLDivergence' :         Result := TNNetKLDivergence.Create();
       'TNNetPonderCostLoss' :       Result := TNNetPonderCostLoss.Create(Ft[0]);
       'TNNetTverskyLoss' :          Result := TNNetTverskyLoss.Create(Ft[0], Ft[1], Ft[2]);
@@ -83478,28 +90176,37 @@ begin
       'TNNetFourierMix' :           Result := TNNetFourierMix.Create(St[0]);
       'TNNetLogitNormalize' :       Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
-      'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0], St[3] = 1);
+      'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0], St[3] = 1, SegSrc);
       'TNNetCrossAttention' :       Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]);
       'TNNetAffineGridSample' :     Result := TNNetAffineGridSample.Create(aL[0]);
+      'TNNetFlowWarp' :             Result := TNNetFlowWarp.Create(aL[0]);
+      'TNNetCorrelationVolume' :    Result := TNNetCorrelationVolume.Create(aL[0]);
+      'TNNetCorrelationLookup' :    Result := TNNetCorrelationLookup.Create(St[0], aL[0]);
+      'TNNetConvGRUCell' :          Result := TNNetConvGRUCell.Create(St[0], St[1], St[2]);
       'TNNetHyperLinear' :          Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]);
       'TNNetHyperConv' :            Result := TNNetHyperConv.Create(St[0], St[1], St[2] = 1, aL[0]);
+      'TNNetModulatedConv2D' :      Result := TNNetModulatedConv2D.Create(St[0], St[1], St[2], St[3], aL[0]);
       'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1);
       'TNNetQKNormAttention' :      Result := TNNetQKNormAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetT5RelPosBiasAttention' : Result := TNNetT5RelPosBiasAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]);
+      'TNNetDisentangledAttention' : Result := TNNetDisentangledAttention.Create(St[0], St[1] = 1, St[3], St[4], St[5]);
       'TNNetALiBiAttention' :       Result := TNNetALiBiAttention.Create(St[0], St[1] = 1, Ft[1], St[2]);
+      'TNNetWindowAttention' :      Result := TNNetWindowAttention.Create(St[0], St[5]);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
+      'TNNetGptOssSinkAttention' :  Result := TNNetGptOssSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetRetention' :            Result := TNNetRetention.Create(St[0], Ft[0], St[1] = 1);
       'TNNetForgetGateBias' :       Result := TNNetForgetGateBias.Create();
       'TNNetModernHopfield' :       Result := TNNetModernHopfield.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetInducedSetAttention' :  Result := TNNetInducedSetAttention.Create(St[0], St[1]);
       'TNNetAttentionPooling' :     Result := TNNetAttentionPooling.Create(St[0], St[1]);
+      'TNNetSoftPrompt' :           Result := TNNetSoftPrompt.Create(St[0], St[1]);
       'TNNetProductKeyMemory' :     Result := TNNetProductKeyMemory.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetLinearAttention' :      Result := TNNetLinearAttention.Create(St[0]);
       'TNNetPerformerAttention' :   Result := TNNetPerformerAttention.Create(St[0], St[1], St[5]);
       'TNNetCausalLinearAttention' : Result := TNNetCausalLinearAttention.Create(St[0]);
       'TNNetLinformerAttention' :   Result := TNNetLinformerAttention.Create(St[0], St[1]);
-      'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3]);
+      'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0);
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
       'TNNetReLU6' :                Result := TNNetReLU6.Create(St[2]);
@@ -83512,7 +90219,7 @@ begin
       'TNNetSignedSquareRoot' :     Result := TNNetSignedSquareRoot.Create();
       'TNNetSignedSquareRoot1' :    Result := TNNetSignedSquareRoot1.Create();
       'TNNetSignedSquareRootN' :    Result := TNNetSignedSquareRootN.Create(Ft[0]);
-      'TNNetLeakyReLU' :            Result := TNNetLeakyReLU.Create();
+      'TNNetLeakyReLU' :            Result := TNNetLeakyReLU.Create(Ft[0]);
       'TNNetVeryLeakyReLU' :        Result := TNNetVeryLeakyReLU.Create();
       'TNNetSigmoid' :              Result := TNNetSigmoid.Create();
       'TNNetPonderHalting' :        Result := TNNetPonderHalting.Create(St[0], Ft[0]);
@@ -83521,6 +90228,7 @@ begin
       'TNNetLogCoshActivation' :    Result := TNNetLogCoshActivation.Create();
       'TNNetDropout' :              Result := TNNetDropout.Create(1/St[0], St[1]);
       'TNNetDropPath' :             Result := TNNetDropPath.Create(Ft[0]);
+      'TNNetNEFTune' :              Result := TNNetNEFTune.Create(Ft[0]);
       'TNNetSpatialDropout1D' :     Result := TNNetSpatialDropout1D.Create(Ft[0]);
       'TNNetSpatialDropout2D' :     Result := TNNetSpatialDropout2D.Create(Ft[0]);
       'TNNetDropBlock' :            Result := TNNetDropBlock.Create(St[0], Ft[0]);
@@ -83528,6 +90236,7 @@ begin
       'TNNetCapsuleRouting' :       Result := TNNetCapsuleRouting.Create(St[1], St[2], St[3], St[4], St[0]);
       'TNNetCausalConv1D' :         Result := TNNetCausalConv1D.Create(St[0], St[1], St[4], Max(St[5], 1));
       'TNNetDepthwiseConv1D' :      Result := TNNetDepthwiseConv1D.Create(St[1], St[2] = 1, St[4]);
+      'TNNetConvolution3D' :        Result := TNNetConvolution3D.Create(St[0], St[5], St[1], St[2], St[3], St[6], St[4]);
       'TNNetGaussianNoise' :        Result := TNNetGaussianNoise.Create(Ft[0]);
       'TNNetGaussianDropout' :      Result := TNNetGaussianDropout.Create(Ft[0]);
       'TNNetReshape' :              Result := TNNetReshape.Create(St[0], St[1], St[2]);
@@ -83602,6 +90311,8 @@ begin
       'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionReLU' :      Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionLinear' :    Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]);
+      'TNNetConvolutionRectangular' :     Result := TNNetConvolutionRectangular.Create(St[0], St[1], St[5], St[2], St[3], St[4]);
+      'TNNetConvolutionRectangularReLU' : Result := TNNetConvolutionRectangularReLU.Create(St[0], St[1], St[5], St[2], St[3], St[4]);
       'TNNetComplexConv' :          Result := TNNetComplexConv.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetQuaternionConv' :       Result := TNNetQuaternionConv.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetOctonionConv' :         Result := TNNetOctonionConv.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -83641,10 +90352,11 @@ begin
       'TNNetMaskedMean':            Result := TNNetMaskedMean.Create();
       'TNNetMaskedMax':             Result := TNNetMaskedMax.Create();
       'TNNetMinChannel':            Result := TNNetMinChannel.Create();
-      'TNNetConcat' :               Result := TNNetConcat.Create(aL);
+      'TNNetConcat' :               Result := TNNetConcat.Create(St[0], St[1], St[2], aL);
       'TNNetDeepConcat' :           Result := TNNetDeepConcat.Create(aL);
       'TNNetGather' :               Result := TNNetGather.Create(St[0]);
       'TNNetGatherChannels' :       Result := TNNetGatherChannels.Create(aIdx);
+      'TNNetGatherTokens' :         Result := TNNetGatherTokens.Create(aIdx);
       'TNNetInterleaveChannels' :   Result := TNNetInterleaveChannels.Create(St[0]);
       'TNNetSpaceToDepth' :         Result := TNNetSpaceToDepth.Create(St[0]);
       'TNNetDepthToSpace' :         Result := TNNetDepthToSpace.Create(St[0]);
@@ -83676,6 +90388,8 @@ begin
       'TNNetDeAvgPool' :            Result := TNNetDeAvgPool.Create(St[0]);
       'TNNetUpsample' :             Result := TNNetUpsample.Create();
       'TNNetPixelShuffle' :         Result := TNNetPixelShuffle.Create(St[0]);
+      'TNNetBilinearUpsample' :     Result := TNNetBilinearUpsample.Create(St[0]);
+      'TNNetBilinearResize' :       Result := TNNetBilinearResize.Create(St[0], St[1], St[2]);
       'TNNetLayerMaxNormalization': Result := TNNetLayerMaxNormalization.Create();
       'TNNetLayerStdNormalization': Result := TNNetLayerStdNormalization.Create();
       'TNNetMovingStdNormalization': Result := TNNetMovingStdNormalization.Create();
@@ -83683,6 +90397,7 @@ begin
       'TNNetTokenLayerNorm':        Result := TNNetTokenLayerNorm.Create(Ft[0]);
       'TNNetRMSNorm':               Result := TNNetRMSNorm.Create();
       'TNNetTokenRMSNorm':          Result := TNNetTokenRMSNorm.Create(Ft[0]);
+      'TNNetLlama4AttnTemperature': Result := TNNetLlama4AttnTemperature.Create(Ft[0], Ft[1]);
       'TNNetRMSNormGated':          Result := TNNetRMSNormGated.Create();
       'TNNetSwitchableNorm':        Result := TNNetSwitchableNorm.Create();
       'TNNetZScore':                Result := TNNetZScore.Create();
@@ -83714,11 +90429,13 @@ begin
       'TNNetMLSTMCell':             Result := TNNetMLSTMCell.Create();
       'TNNetMinGRU':                Result := TNNetMinGRU.Create();
       'TNNetMinLSTM':               Result := TNNetMinLSTM.Create();
+      'TNNetConvLSTMCell':          Result := TNNetConvLSTMCell.Create(St[0], St[1], St[2]);
       'TNNetDeltaNet':              Result := TNNetDeltaNet.Create();
       'TNNetLegendreMemoryUnit':    Result := TNNetLegendreMemoryUnit.Create(St[0], Ft[0]);
       'TNNetGatedLinearAttention':  Result := TNNetGatedLinearAttention.Create();
       'TNNetWKV':                   Result := TNNetWKV.Create();
       'TNNetLRU':                   Result := TNNetLRU.Create();
+      'TNNetRGLRU':                 Result := TNNetRGLRU.Create();
       'TNNetCrossWKV':              Result := TNNetCrossWKV.Create(aL[0], St[1] = 1);
       'TNNetAffineCoupling':        Result := TNNetAffineCoupling.Create(St[0] = 1, St[1] = 1, Ft[0]);
       'TNNetInvertible1x1Conv':     Result := TNNetInvertible1x1Conv.Create(St[2] = 1, St[1]);
@@ -83729,6 +90446,7 @@ begin
       'TNNetKalmanFilterCell':      Result := TNNetKalmanFilterCell.Create();
       'TNNetHamiltonianCell':       Result := TNNetHamiltonianCell.Create(Max(St[2], 1), Ft[0], St[1], St[3] <> 0);
       'TNNetSelectiveSSM':          Result := TNNetSelectiveSSM.Create(Max(St[0], 1));
+      'TNNetMamba2':                Result := TNNetMamba2.Create(Max(St[0], 1), Max(St[1], 1), Max(St[2], 1), Max(St[3], 1), Ft[0]);
       'TNNetImplicitLongConv':      Result := TNNetImplicitLongConv.Create(Max(St[0], 1));
       'TNNetSpatialGatingUnit':     Result := TNNetSpatialGatingUnit.Create(St[0]);
       'TNNetPolynomialActivation':  Result := TNNetPolynomialActivation.Create();
@@ -83736,6 +90454,7 @@ begin
       'TNNetCellBias':              Result := TNNetCellBias.Create();
       'TNNetCellMul':               Result := TNNetCellMul.Create();
       'TNNetCellMulByCell':         Result := TNNetCellMulByCell.Create(St[0], St[1]);
+      'TNNetAdaIN':                 Result := TNNetAdaIN.Create(St[0], St[1]);
       'TNNetRandomMulAdd':          Result := TNNetRandomMulAdd.Create(St[0], St[1]);
       'TNNetChannelRandomMulAdd':   Result := TNNetChannelRandomMulAdd.Create(St[0], St[1]);
       'TNNetChannelZeroCenter':     Result := TNNetChannelZeroCenter.Create();
@@ -83771,7 +90490,9 @@ begin
       if S[0] = 'TNNetISRU' then Result := TNNetISRU.Create(Ft[0]) else
       if S[0] = 'TNNetISRLU' then Result := TNNetISRLU.Create(Ft[0]) else
       if S[0] = 'TNNetHardSwish' then Result := TNNetHardSwish.Create() else
+      if S[0] = 'TNNetHardSigmoid' then Result := TNNetHardSigmoid.Create() else
       if S[0] = 'TNNetGELU' then Result := TNNetGELU.Create() else
+      if S[0] = 'TNNetGELUErf' then Result := TNNetGELUErf.Create() else
       if S[0] = 'TNNetMish' then Result := TNNetMish.Create() else
       if S[0] = 'TNNetPhish' then Result := TNNetPhish.Create() else
       if S[0] = 'TNNetSerf' then Result := TNNetSerf.Create() else
@@ -83812,8 +90533,10 @@ begin
       if S[0] = 'TNNetGEGLU' then Result := TNNetGEGLU.Create() else
       if S[0] = 'TNNetGEGLUErf' then Result := TNNetGEGLUErf.Create() else
       if S[0] = 'TNNetSwiGLU' then Result := TNNetSwiGLU.Create() else
+      if S[0] = 'TNNetGptOssGatedSwiGLU' then Result := TNNetGptOssGatedSwiGLU.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetGLU' then Result := TNNetGLU.Create() else
       if S[0] = 'TNNetReGLU' then Result := TNNetReGLU.Create() else
+      if S[0] = 'TNNetReGLUSquared' then Result := TNNetReGLUSquared.Create() else
       if S[0] = 'TNNetTanhGLU' then Result := TNNetTanhGLU.Create() else
       if S[0] = 'TNNetCosineSimilarity' then Result := TNNetCosineSimilarity.Create() else
       if S[0] = 'TNNetSquaredReLU' then Result := TNNetSquaredReLU.Create() else
@@ -83833,6 +90556,7 @@ begin
       if S[0] = 'TNNetMultiQuantileLoss' then Result := BuildMultiQuantileLoss(St[0], Ft) else
       if S[0] = 'TNNetFocalLoss' then Result := TNNetFocalLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetNLLLoss' then Result := TNNetNLLLoss.Create() else
+      if S[0] = 'TNNetCTCLoss' then Result := TNNetCTCLoss.Create(St[0]) else
       if S[0] = 'TNNetKLDivergence' then Result := TNNetKLDivergence.Create() else
       if S[0] = 'TNNetPonderCostLoss' then Result := TNNetPonderCostLoss.Create(Ft[0]) else
       if S[0] = 'TNNetTverskyLoss' then Result := TNNetTverskyLoss.Create(Ft[0], Ft[1], Ft[2]) else
@@ -83860,28 +90584,37 @@ begin
       if S[0] = 'TNNetFourierMix' then Result := TNNetFourierMix.Create(St[0]) else
       if S[0] = 'TNNetLogitNormalize' then Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
-      if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0], St[3] = 1) else
+      if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0], St[3] = 1, SegSrc) else
       if S[0] = 'TNNetCrossAttention' then Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetAffineGridSample' then Result := TNNetAffineGridSample.Create(aL[0]) else
+      if S[0] = 'TNNetFlowWarp' then Result := TNNetFlowWarp.Create(aL[0]) else
+      if S[0] = 'TNNetCorrelationVolume' then Result := TNNetCorrelationVolume.Create(aL[0]) else
+      if S[0] = 'TNNetCorrelationLookup' then Result := TNNetCorrelationLookup.Create(St[0], aL[0]) else
+      if S[0] = 'TNNetConvGRUCell' then Result := TNNetConvGRUCell.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetHyperLinear' then Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetHyperConv' then Result := TNNetHyperConv.Create(St[0], St[1], St[2] = 1, aL[0]) else
+      if S[0] = 'TNNetModulatedConv2D' then Result := TNNetModulatedConv2D.Create(St[0], St[1], St[2], St[3], aL[0]) else
       if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1) else
       if S[0] = 'TNNetQKNormAttention' then Result := TNNetQKNormAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetT5RelPosBiasAttention' then Result := TNNetT5RelPosBiasAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]) else
+      if S[0] = 'TNNetDisentangledAttention' then Result := TNNetDisentangledAttention.Create(St[0], St[1] = 1, St[3], St[4], St[5]) else
       if S[0] = 'TNNetALiBiAttention' then Result := TNNetALiBiAttention.Create(St[0], St[1] = 1, Ft[1], St[2]) else
+      if S[0] = 'TNNetWindowAttention' then Result := TNNetWindowAttention.Create(St[0], St[5]) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
+      if S[0] = 'TNNetGptOssSinkAttention' then Result := TNNetGptOssSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetRetention' then Result := TNNetRetention.Create(St[0], Ft[0], St[1] = 1) else
       if S[0] = 'TNNetForgetGateBias' then Result := TNNetForgetGateBias.Create() else
       if S[0] = 'TNNetModernHopfield' then Result := TNNetModernHopfield.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetInducedSetAttention' then Result := TNNetInducedSetAttention.Create(St[0], St[1]) else
       if S[0] = 'TNNetAttentionPooling' then Result := TNNetAttentionPooling.Create(St[0], St[1]) else
+      if S[0] = 'TNNetSoftPrompt' then Result := TNNetSoftPrompt.Create(St[0], St[1]) else
       if S[0] = 'TNNetProductKeyMemory' then Result := TNNetProductKeyMemory.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetLinearAttention' then Result := TNNetLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetPerformerAttention' then Result := TNNetPerformerAttention.Create(St[0], St[1], St[5]) else
       if S[0] = 'TNNetCausalLinearAttention' then Result := TNNetCausalLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetLinformerAttention' then Result := TNNetLinformerAttention.Create(St[0], St[1]) else
-      if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3]) else
+      if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0) else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetReLU6' then Result := TNNetReLU6.Create(St[2]) else
@@ -83894,7 +90627,7 @@ begin
       if S[0] = 'TNNetSignedSquareRoot' then Result := TNNetSignedSquareRoot.Create() else
       if S[0] = 'TNNetSignedSquareRoot1' then Result := TNNetSignedSquareRoot1.Create() else
       if S[0] = 'TNNetSignedSquareRootN' then Result := TNNetSignedSquareRootN.Create(Ft[0]) else
-      if S[0] = 'TNNetLeakyReLU' then Result := TNNetLeakyReLU.Create() else
+      if S[0] = 'TNNetLeakyReLU' then Result := TNNetLeakyReLU.Create(Ft[0]) else
       if S[0] = 'TNNetVeryLeakyReLU' then Result := TNNetVeryLeakyReLU.Create() else
       if S[0] = 'TNNetSigmoid' then Result := TNNetSigmoid.Create() else
       if S[0] = 'TNNetPonderHalting' then Result := TNNetPonderHalting.Create(St[0], Ft[0]) else
@@ -83903,6 +90636,7 @@ begin
       if S[0] = 'TNNetLogCoshActivation' then Result := TNNetLogCoshActivation.Create() else
       if S[0] = 'TNNetDropout' then Result := TNNetDropout.Create(1/St[0], St[1]) else
       if S[0] = 'TNNetDropPath' then Result := TNNetDropPath.Create(Ft[0]) else
+      if S[0] = 'TNNetNEFTune' then Result := TNNetNEFTune.Create(Ft[0]) else
       if S[0] = 'TNNetSpatialDropout1D' then Result := TNNetSpatialDropout1D.Create(Ft[0]) else
       if S[0] = 'TNNetSpatialDropout2D' then Result := TNNetSpatialDropout2D.Create(Ft[0]) else
       if S[0] = 'TNNetDropBlock' then Result := TNNetDropBlock.Create(St[0], Ft[0]) else
@@ -83910,6 +90644,7 @@ begin
       if S[0] = 'TNNetCapsuleRouting' then Result := TNNetCapsuleRouting.Create(St[1], St[2], St[3], St[4], St[0]) else
       if S[0] = 'TNNetCausalConv1D' then Result := TNNetCausalConv1D.Create(St[0], St[1], St[4], Max(St[5], 1)) else
       if S[0] = 'TNNetDepthwiseConv1D' then Result := TNNetDepthwiseConv1D.Create(St[1], St[2] = 1, St[4]) else
+      if S[0] = 'TNNetConvolution3D' then Result := TNNetConvolution3D.Create(St[0], St[5], St[1], St[2], St[3], St[6], St[4]) else
       if S[0] = 'TNNetGaussianNoise' then Result := TNNetGaussianNoise.Create(Ft[0]) else
       if S[0] = 'TNNetGaussianDropout' then Result := TNNetGaussianDropout.Create(Ft[0]) else
       if S[0] = 'TNNetReshape' then Result := TNNetReshape.Create(St[0], St[1], St[2]) else
@@ -83986,6 +90721,8 @@ begin
       if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionReLU' then Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionLinear' then Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetConvolutionRectangular' then Result := TNNetConvolutionRectangular.Create(St[0], St[1], St[5], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetConvolutionRectangularReLU' then Result := TNNetConvolutionRectangularReLU.Create(St[0], St[1], St[5], St[2], St[3], St[4]) else
       if S[0] = 'TNNetComplexConv' then Result := TNNetComplexConv.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetQuaternionConv' then Result := TNNetQuaternionConv.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetOctonionConv' then Result := TNNetOctonionConv.Create(St[0], St[1], St[2], St[3], St[4]) else
@@ -84025,9 +90762,10 @@ begin
       if S[0] = 'TNNetMaskedMean' then Result := TNNetMaskedMean.Create() else
       if S[0] = 'TNNetMaskedMax' then Result := TNNetMaskedMax.Create() else
       if S[0] = 'TNNetMinChannel' then Result := TNNetMinChannel.Create() else
-      if S[0] = 'TNNetConcat' then Result := TNNetConcat.Create(aL) else
+      if S[0] = 'TNNetConcat' then Result := TNNetConcat.Create(St[0], St[1], St[2], aL) else
       if S[0] = 'TNNetGather' then Result := TNNetGather.Create(St[0]) else
       if S[0] = 'TNNetGatherChannels' then Result := TNNetGatherChannels.Create(aIdx) else
+      if S[0] = 'TNNetGatherTokens' then Result := TNNetGatherTokens.Create(aIdx) else
       if S[0] = 'TNNetInterleaveChannels' then Result := TNNetInterleaveChannels.Create(St[0]) else
       if S[0] = 'TNNetSpaceToDepth' then Result := TNNetSpaceToDepth.Create(St[0]) else
       if S[0] = 'TNNetDepthToSpace' then Result := TNNetDepthToSpace.Create(St[0]) else
@@ -84060,6 +90798,8 @@ begin
       if S[0] = 'TNNetDeAvgPool' then Result := TNNetDeAvgPool.Create(St[0]) else
       if S[0] = 'TNNetUpsample' then Result := TNNetUpsample.Create() else
       if S[0] = 'TNNetPixelShuffle' then Result := TNNetPixelShuffle.Create(St[0]) else
+      if S[0] = 'TNNetBilinearUpsample' then Result := TNNetBilinearUpsample.Create(St[0]) else
+      if S[0] = 'TNNetBilinearResize' then Result := TNNetBilinearResize.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetLayerMaxNormalization' then Result := TNNetLayerMaxNormalization.Create() else
       if S[0] = 'TNNetLayerStdNormalization' then Result := TNNetLayerStdNormalization.Create() else
       if S[0] = 'TNNetMovingStdNormalization' then Result := TNNetMovingStdNormalization.Create() else
@@ -84067,6 +90807,7 @@ begin
       if S[0] = 'TNNetTokenLayerNorm' then Result := TNNetTokenLayerNorm.Create(Ft[0]) else
       if S[0] = 'TNNetRMSNorm' then Result := TNNetRMSNorm.Create() else
       if S[0] = 'TNNetTokenRMSNorm' then Result := TNNetTokenRMSNorm.Create(Ft[0]) else
+      if S[0] = 'TNNetLlama4AttnTemperature' then Result := TNNetLlama4AttnTemperature.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetRMSNormGated' then Result := TNNetRMSNormGated.Create() else
       if S[0] = 'TNNetSwitchableNorm' then Result := TNNetSwitchableNorm.Create() else
       if S[0] = 'TNNetZScore' then Result := TNNetZScore.Create() else
@@ -84098,11 +90839,13 @@ begin
       if S[0] = 'TNNetMLSTMCell' then Result := TNNetMLSTMCell.Create() else
       if S[0] = 'TNNetMinGRU' then Result := TNNetMinGRU.Create() else
       if S[0] = 'TNNetMinLSTM' then Result := TNNetMinLSTM.Create() else
+      if S[0] = 'TNNetConvLSTMCell' then Result := TNNetConvLSTMCell.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetDeltaNet' then Result := TNNetDeltaNet.Create() else
       if S[0] = 'TNNetLegendreMemoryUnit' then Result := TNNetLegendreMemoryUnit.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetGatedLinearAttention' then Result := TNNetGatedLinearAttention.Create() else
       if S[0] = 'TNNetWKV' then Result := TNNetWKV.Create() else
       if S[0] = 'TNNetLRU' then Result := TNNetLRU.Create() else
+      if S[0] = 'TNNetRGLRU' then Result := TNNetRGLRU.Create() else
       if S[0] = 'TNNetCrossWKV' then Result := TNNetCrossWKV.Create(aL[0], St[1] = 1) else
       if S[0] = 'TNNetAffineCoupling' then Result := TNNetAffineCoupling.Create(St[0] = 1, St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetInvertible1x1Conv' then Result := TNNetInvertible1x1Conv.Create(St[2] = 1, St[1]) else
@@ -84113,6 +90856,7 @@ begin
       if S[0] = 'TNNetKalmanFilterCell' then Result := TNNetKalmanFilterCell.Create() else
       if S[0] = 'TNNetHamiltonianCell' then Result := TNNetHamiltonianCell.Create(Max(St[2], 1), Ft[0], St[1], St[3] <> 0) else
       if S[0] = 'TNNetSelectiveSSM' then Result := TNNetSelectiveSSM.Create(Max(St[0], 1)) else
+      if S[0] = 'TNNetMamba2' then Result := TNNetMamba2.Create(Max(St[0], 1), Max(St[1], 1), Max(St[2], 1), Max(St[3], 1), Ft[0]) else
       if S[0] = 'TNNetImplicitLongConv' then Result := TNNetImplicitLongConv.Create(Max(St[0], 1)) else
       if S[0] = 'TNNetSpatialGatingUnit' then Result := TNNetSpatialGatingUnit.Create(St[0]) else
       if S[0] = 'TNNetPolynomialActivation' then Result := TNNetPolynomialActivation.Create() else
@@ -84120,6 +90864,7 @@ begin
       if S[0] = 'TNNetCellBias' then Result := TNNetCellBias.Create() else
       if S[0] = 'TNNetCellMul' then Result := TNNetCellMul.Create() else
       if S[0] = 'TNNetCellMulByCell' then Result := TNNetCellMulByCell.Create(St[0], St[1]) else
+      if S[0] = 'TNNetAdaIN' then Result := TNNetAdaIN.Create(St[0], St[1]) else
       if S[0] = 'TNNetRandomMulAdd' then Result := TNNetRandomMulAdd.Create(St[0], St[1]) else
       if S[0] = 'TNNetChannelRandomMulAdd' then Result := TNNetChannelRandomMulAdd.Create(St[0], St[1]) else
       if S[0] = 'TNNetChannelZeroCenter' then Result := TNNetChannelZeroCenter.Create() else
@@ -84946,6 +91691,20 @@ begin
   Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
 end;
 
+function TNNet.AddOutputNormResidual(pSublayers: array of TNNetLayer;
+  NormClass: TNNetLayerClass = nil): TNNetLayer;
+var
+  BranchInput: TNNetLayer;
+begin
+  // y = x + Norm(Sublayer(x))  (OLMo-2-style reordered post-norm: NO entry
+  // norm; the sublayer output is normalized BEFORE the residual add).
+  if NormClass = nil then NormClass := TNNetRMSNorm;
+  BranchInput := GetLastLayer();
+  AddLayer(pSublayers);
+  AddLayer( NormClass.Create() );
+  Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+end;
+
 function TNNet.AddGatedResidual(pSublayers: array of TNNetLayer): TNNetLayer;
 var
   BranchInput: TNNetLayer;
@@ -85634,6 +92393,44 @@ begin
   end;
 end;
 
+procedure TNNet.CheckForwardAnomaly(LayerCnt: integer);
+var
+  Msg: string;
+begin
+  if Assigned(FLayers[LayerCnt].FOutput) and
+     FLayers[LayerCnt].FOutput.HasNonFinite() then
+  begin
+    Msg :=
+      'Anomaly detected: NaN/Inf in OUTPUT of layer ' + IntToStr(LayerCnt) +
+      ' (' + FLayers[LayerCnt].ClassName + ') during FORWARD pass';
+    FErrorProc(Msg);
+    raise Exception.Create(Msg);
+  end;
+end;
+
+procedure TNNet.CheckBackwardAnomaly();
+var
+  LayerCnt: integer;
+  Msg: string;
+begin
+  // Backpropagation runs from the output layer towards the input layer, so the
+  // FIRST offending layer (in computation order) is the one with the highest
+  // index. Scan from output to input and raise on the first non-finite
+  // OutputError found.
+  for LayerCnt := GetLastLayerIdx() downto 0 do
+  begin
+    if Assigned(FLayers[LayerCnt].FOutputError) and
+       FLayers[LayerCnt].FOutputError.HasNonFinite() then
+    begin
+      Msg :=
+        'Anomaly detected: NaN/Inf in OUTPUTERROR of layer ' + IntToStr(LayerCnt) +
+        ' (' + FLayers[LayerCnt].ClassName + ') during BACKWARD pass';
+      FErrorProc(Msg);
+      raise Exception.Create(Msg);
+    end;
+  end;
+end;
+
 procedure TNNet.Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0);
 var
   LayerCnt: integer;
@@ -85650,6 +92447,7 @@ begin
       for LayerCnt := FromLayerIdx to LastLayer do
       begin
         FLayers[LayerCnt].Compute();
+        if FDetectAnomaly then CheckForwardAnomaly(LayerCnt);
       end;
     end else
     begin
@@ -85793,6 +92591,7 @@ begin
     FLayers[LastLayer].ComputeOutputErrorWith(pOutput);
     FLayers[LastLayer].Backpropagate();
     ComputeL2Decay();
+    if FDetectAnomaly then CheckBackwardAnomaly();
     {$IFDEF Debug}
     DebugBackpropagation();
     {$ENDIF}
@@ -86797,6 +93596,56 @@ begin
   for LayerCnt := 0 to GetLastLayerIdx() do
   begin
     FLayers[LayerCnt].ResetBackpropCallCurrCnt();
+  end;
+end;
+
+function TNNet.BeginIncrementalDecode(): integer;
+var
+  LayerCnt: integer;
+  L: TNNetLayer;
+begin
+  Result := 0;
+  for LayerCnt := 0 to GetLastLayerIdx() do
+  begin
+    L := FLayers[LayerCnt];
+    if L is TNNetTokenShift then
+    begin TNNetTokenShift(L).BeginIncrementalDecode(); Inc(Result); end
+    else if L is TNNetWKV then
+    begin TNNetWKV(L).BeginIncrementalDecode(); Inc(Result); end
+    else if L is TNNetSelectiveSSM then
+    begin TNNetSelectiveSSM(L).BeginIncrementalDecode(); Inc(Result); end
+    else if L is TNNetDiagonalSSM then
+    begin TNNetDiagonalSSM(L).BeginIncrementalDecode(); Inc(Result); end;
+  end;
+end;
+
+procedure TNNet.EndIncrementalDecode();
+var
+  LayerCnt: integer;
+  L: TNNetLayer;
+begin
+  for LayerCnt := 0 to GetLastLayerIdx() do
+  begin
+    L := FLayers[LayerCnt];
+    if L is TNNetTokenShift then TNNetTokenShift(L).EndIncrementalDecode()
+    else if L is TNNetWKV then TNNetWKV(L).EndIncrementalDecode()
+    else if L is TNNetSelectiveSSM then TNNetSelectiveSSM(L).EndIncrementalDecode()
+    else if L is TNNetDiagonalSSM then TNNetDiagonalSSM(L).EndIncrementalDecode();
+  end;
+end;
+
+procedure TNNet.ResetIncrementalDecode();
+var
+  LayerCnt: integer;
+  L: TNNetLayer;
+begin
+  for LayerCnt := 0 to GetLastLayerIdx() do
+  begin
+    L := FLayers[LayerCnt];
+    if L is TNNetTokenShift then TNNetTokenShift(L).ResetState()
+    else if L is TNNetWKV then TNNetWKV(L).ResetState()
+    else if L is TNNetSelectiveSSM then TNNetSelectiveSSM(L).ResetState()
+    else if L is TNNetDiagonalSSM then TNNetDiagonalSSM(L).ResetState();
   end;
 end;
 
@@ -87841,6 +94690,7 @@ constructor TNNetLayer.Create();
 begin
   inherited Create();
   InitStruct();
+  FPruneMask := nil;
   FOutput := TNNetVolume.Create(1,1,1);
   FOutputRaw := TNNetGroupedVolume.Create(1,1,1);
   FOutputError := TNNetVolume.Create(1,1,1);
@@ -87884,6 +94734,7 @@ begin
   FOutputRaw.Free;
   FOutput.Free;
   FNeurons.Free;
+  if Assigned(FPruneMask) then FPruneMask.Free;
   inherited Destroy();
 end;
 
@@ -89279,7 +96130,120 @@ end;
 
 procedure TNNetLayer.AfterWeightUpdate();
 begin
-  // to be implemented in descending classes.
+  // Persistent magnitude pruning: zero the pruned weights on EVERY weight
+  // update. Subclasses that override AfterWeightUpdate (e.g. the concatenated-
+  // weight full-connect/conv cache rebuild) call inherited AfterWeightUpdate
+  // FIRST, so the weights are re-zeroed before any cache is rebuilt from them.
+  // This is the single hook that covers both the batch path (TNNet.UpdateWeights)
+  // and the inline online path (TNNetFullConnect.BackpropagateCPU). Re-zeroing
+  // is idempotent and does NOT recurse (it never calls AfterWeightUpdate).
+  // (Coded by Claude (AI).)
+  if Assigned(FPruneMask) then ZeroPrunedWeights();
+end;
+
+function TNNetLayer.BuildPruneMaskFromThreshold(aThreshold: TNeuralFloat): integer;
+var
+  NeuronCnt, WeightCnt, WSize: integer;
+  Neuron: TNNetNeuron;
+  Mask: TNNetVolume;
+begin
+  Result := 0;
+  if FNeurons.Count = 0 then Exit;
+  if (FNeurons[0].Weights = nil) or (FNeurons[0].Weights.Size = 0) then Exit;
+  if not Assigned(FPruneMask) then
+    FPruneMask := TNNetVolumeList.Create();
+  // (re)size the mask list to one volume per neuron.
+  while FPruneMask.Count < FNeurons.Count do
+    FPruneMask.Add(TNNetVolume.Create(1, 1, 1));
+  while FPruneMask.Count > FNeurons.Count do
+    FPruneMask.Delete(FPruneMask.Count - 1);
+  for NeuronCnt := 0 to FNeurons.Count - 1 do
+  begin
+    Neuron := FNeurons[NeuronCnt];
+    Mask := FPruneMask[NeuronCnt];
+    WSize := Neuron.Weights.Size;
+    Mask.ReSize(Neuron.Weights);
+    for WeightCnt := 0 to WSize - 1 do
+    begin
+      if Abs(Neuron.Weights.FData[WeightCnt]) <= aThreshold then
+      begin
+        Mask.FData[WeightCnt] := 0;
+        Inc(Result);
+      end
+      else
+        Mask.FData[WeightCnt] := 1;
+    end;
+  end;
+  ApplyPruneMask();
+end;
+
+procedure TNNetLayer.ZeroPrunedWeights();
+var
+  NeuronCnt, WeightCnt, WSize: integer;
+  Neuron: TNNetNeuron;
+  Mask: TNNetVolume;
+begin
+  if not Assigned(FPruneMask) then Exit;
+  for NeuronCnt := 0 to FNeurons.Count - 1 do
+  begin
+    if NeuronCnt >= FPruneMask.Count then Break;
+    Neuron := FNeurons[NeuronCnt];
+    Mask := FPruneMask[NeuronCnt];
+    WSize := Neuron.Weights.Size;
+    if Mask.Size <> WSize then Continue;
+    for WeightCnt := 0 to WSize - 1 do
+    begin
+      if Mask.FData[WeightCnt] = 0 then
+      begin
+        Neuron.Weights.FData[WeightCnt] := 0;
+        // Hold the gradient / momentum at zero too so inertia and Adam moment
+        // estimates cannot slowly regrow a pruned weight.
+        if Neuron.FDelta.Size = WSize then Neuron.FDelta.FData[WeightCnt] := 0;
+        if Neuron.FBackInertia.Size = WSize then
+          Neuron.FBackInertia.FData[WeightCnt] := 0;
+        if Neuron.FBackInertia2.Size = WSize then
+          Neuron.FBackInertia2.FData[WeightCnt] := 0;
+      end;
+    end;
+  end;
+end;
+
+procedure TNNetLayer.ApplyPruneMask();
+begin
+  if not Assigned(FPruneMask) then Exit;
+  ZeroPrunedWeights();
+  // Rebuild any weight caches (e.g. concatenated conv/full-connect copies) so
+  // the forward pass reads the zeroed weights.
+  AfterWeightUpdate();
+end;
+
+function TNNetLayer.HasPruneMask(): boolean;
+begin
+  Result := Assigned(FPruneMask) and (FPruneMask.Count > 0);
+end;
+
+procedure TNNetLayer.ClearPruneMask();
+begin
+  if Assigned(FPruneMask) then
+  begin
+    FPruneMask.Free;
+    FPruneMask := nil;
+  end;
+end;
+
+function TNNetLayer.CountPrunedWeights(): integer;
+var
+  NeuronCnt, WeightCnt: integer;
+  Mask: TNNetVolume;
+begin
+  Result := 0;
+  if not Assigned(FPruneMask) then Exit;
+  for NeuronCnt := 0 to FPruneMask.Count - 1 do
+  begin
+    Mask := FPruneMask[NeuronCnt];
+    for WeightCnt := 0 to Mask.Size - 1 do
+      if Mask.FData[WeightCnt] = 0 then Inc(Result);
+  end;
 end;
 
 { TNNetNeuron }

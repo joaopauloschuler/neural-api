@@ -1,0 +1,12 @@
+{
+  "model_type": "raft_small",
+  "image_height": 32,
+  "image_width": 32,
+  "stride": 4,
+  "feature_dim": 16,
+  "hidden_dim": 12,
+  "context_dim": 8,
+  "corr_radius": 2,
+  "num_iters": 4,
+  "norm_eps": 1e-05
+}

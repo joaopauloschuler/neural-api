@@ -1,0 +1,107 @@
+{
+ "transformers_version": "5.11.0",
+ "architectures": null,
+ "output_hidden_states": false,
+ "return_dict": true,
+ "dtype": null,
+ "chunk_size_feed_forward": 0,
+ "is_encoder_decoder": false,
+ "id2label": {
+  "0": "LABEL_0",
+  "1": "LABEL_1"
+ },
+ "label2id": {
+  "LABEL_0": 0,
+  "LABEL_1": 1
+ },
+ "problem_type": null,
+ "vision_config": {
+  "architectures": null,
+  "output_hidden_states": false,
+  "return_dict": true,
+  "dtype": null,
+  "chunk_size_feed_forward": 0,
+  "is_encoder_decoder": false,
+  "id2label": {
+   "0": "LABEL_0",
+   "1": "LABEL_1"
+  },
+  "label2id": {
+   "LABEL_0": 0,
+   "LABEL_1": 1
+  },
+  "problem_type": null,
+  "hidden_size": 24,
+  "intermediate_size": 48,
+  "num_hidden_layers": 2,
+  "num_attention_heads": 4,
+  "num_channels": 3,
+  "image_size": 12,
+  "patch_size": 4,
+  "hidden_act": "gelu_pytorch_tanh",
+  "layer_norm_eps": 1e-06,
+  "attention_dropout": 0.0,
+  "_name_or_path": "",
+  "model_type": "siglip_vision_model",
+  "vision_use_head": false,
+  "output_attentions": false
+ },
+ "text_config": {
+  "architectures": null,
+  "output_hidden_states": false,
+  "return_dict": true,
+  "dtype": null,
+  "chunk_size_feed_forward": 0,
+  "is_encoder_decoder": false,
+  "id2label": {
+   "0": "LABEL_0",
+   "1": "LABEL_1"
+  },
+  "label2id": {
+   "LABEL_0": 0,
+   "LABEL_1": 1
+  },
+  "problem_type": null,
+  "vocab_size": 50,
+  "hidden_size": 32,
+  "intermediate_size": 64,
+  "num_hidden_layers": 2,
+  "num_attention_heads": 4,
+  "num_key_value_heads": 2,
+  "hidden_act": "silu",
+  "max_position_embeddings": 64,
+  "initializer_range": 0.02,
+  "rms_norm_eps": 1e-06,
+  "use_cache": true,
+  "tie_word_embeddings": false,
+  "rope_parameters": {
+   "rope_theta": 10000.0,
+   "rope_type": "default"
+  },
+  "use_sliding_window": false,
+  "sliding_window": null,
+  "max_window_layers": 28,
+  "layer_types": [
+   "full_attention",
+   "full_attention"
+  ],
+  "attention_dropout": 0.0,
+  "pad_token_id": null,
+  "bos_token_id": null,
+  "eos_token_id": null,
+  "_name_or_path": "",
+  "model_type": "qwen2",
+  "output_attentions": false,
+  "rope_theta": 10000.0
+ },
+ "image_token_index": 49,
+ "image_seq_length": 576,
+ "projector_hidden_act": "gelu",
+ "vision_feature_select_strategy": "full",
+ "vision_feature_layer": -1,
+ "multimodal_projector_bias": true,
+ "tie_word_embeddings": false,
+ "_name_or_path": "",
+ "model_type": "llava",
+ "output_attentions": false
+}

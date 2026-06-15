@@ -1,0 +1,19 @@
+{
+ "model_type": "inception",
+ "architectures": [
+  "InceptionV3"
+ ],
+ "image_size": 8,
+ "num_channels": 3,
+ "num_labels": 5,
+ "stem_width": 4,
+ "num_modules": 2,
+ "bn_eps": 0.001,
+ "branch1x1": 3,
+ "branch5x5_reduce": 2,
+ "branch5x5": 3,
+ "branch3x3dbl_reduce": 2,
+ "branch3x3dbl_mid": 3,
+ "branch3x3dbl": 4,
+ "branch_pool": 3
+}

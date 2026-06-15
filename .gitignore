@@ -13,18 +13,49 @@ bin/
 backup/
 lib/
 tests/RunTests
+examples/YoloDetect/YoloDetect
+examples/YoloDetect/*.ppm
 examples/ActivationBakeoff/ActivationBakeoff
+examples/AdaINStyleTransfer/AdaINStyleTransfer
 examples/GumbelAnnealingAutoencoder/GumbelAnnealingAutoencoder
 examples/BeamSearchDecode/BeamSearchDecode
+examples/ColBERTSearch/ColBERTSearch
+examples/EmbeddingSearch/EmbeddingSearch
+examples/EnCodecRoundTrip/EnCodecRoundTrip
+examples/MusicGenSmoke/MusicGenSmoke
 examples/LotteryTicketIMP/LotteryTicketIMP
 examples/VQCodebookUsage/VQCodebookUsage
 examples/FourierMix/FourierMix
+examples/SpanCorruptionPretrain/SpanCorruptionPretrain
+examples/VQVAE/VQVAE
+examples/VQVAE/diag
+examples/ConditionalDiffusion/ConditionalDiffusion
+examples/VideoActionTiny/VideoActionTiny
+examples/VideoAction/VideoAction
 link*.res
 autosave.csv
 autosave.nn
 
 # Generated diagram images (e.g. reliability diagrams from example runs)
 *.pgm
+
+# MNIST idx data (symlinks/downloads) + generated images in the VQVAE example
+examples/VQVAE/*-ubyte
+examples/VQVAE/*.png
+
+# MNIST idx data (symlinks) + generated images/logs in ConditionalDiffusion
+examples/ConditionalDiffusion/*-ubyte
+examples/ConditionalDiffusion/*.png
+examples/ConditionalDiffusion/*.log
+examples/ConditionalDiffusion/*.o
+examples/ConditionalDiffusion/*.ppu
+
+# UNetSegmentation example: binary + generated visualization/build artifacts
+examples/UNetSegmentation/UNetSegmentation
+examples/UNetSegmentation/*.png
+examples/UNetSegmentation/*.ppm
+examples/UNetSegmentation/*.o
+examples/UNetSegmentation/*.ppu
 
 # Claude Code (created at repo root)
 .claude/
@@ -34,3 +65,24 @@ examples/SimpleNLP/datasets/
 examples/SimpleNLP/temp.csv
 examples/SimpleNLP/*.nn
 examples/SimpleNLP/decode_bakeoff_phase*.log
+
+# Downloaded HF model checkpoints (large binaries, never commit)
+.olmo2_1b/
+
+# ImageToImage (SDEdit) example: compiled binary + generated before/after images
+examples/ImageToImage/ImageToImage
+examples/ImageToImage/*.ppm
+examples/ImageToImage/*.png
+examples/ImageToImage/*.o
+examples/ImageToImage/*.ppu
+examples/FrameInterpolation/FrameInterpolation
+examples/FrameInterpolation/*.ppm
+examples/FrameInterpolation/*.png
+examples/FrameInterpolation/*.o
+examples/FrameInterpolation/*.ppu
+# Inpainting (context-encoder) example: compiled binary + generated triplets
+examples/Inpainting/Inpainting
+examples/Inpainting/*.ppm
+examples/Inpainting/*.png
+examples/Inpainting/*.o
+examples/Inpainting/*.ppu

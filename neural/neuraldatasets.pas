@@ -202,6 +202,61 @@ type
     ImageFileName:string; V:TNNetVolume; SizeX, SizeY: integer;
     EncodeNeuronalInput: integer = -1):boolean; overload;
 
+// ---------------------------------------------------------------------------
+// Standard vision-model image preprocessing (the timm/torchvision/CLIP
+// inference transform). Plain LoadImageFromFileIntoVolume only does a stretch
+// resize to (SizeX,SizeY); the helpers below do the canonical pipeline every
+// vision importer expects:
+//   (1) aspect-ratio-preserving resize of the SHORTER side to ResizeShorterSide
+//   (2) center-crop to (CropSize x CropSize)
+//   (3) per-channel normalization (x/255 - mean)/std.
+// Mean/Std are 3-element RGB arrays; the published defaults are below.
+// ---------------------------------------------------------------------------
+const
+  // torchvision/timm ImageNet normalization (the classifier default).
+  csImageNetMean: array[0..2] of TNeuralFloat = (0.485, 0.456, 0.406);
+  csImageNetStd:  array[0..2] of TNeuralFloat = (0.229, 0.224, 0.225);
+  // OpenAI CLIP normalization.
+  csClipMean: array[0..2] of TNeuralFloat =
+    (0.48145466, 0.4578275, 0.40821073);
+  csClipStd:  array[0..2] of TNeuralFloat =
+    (0.26862954, 0.26130258, 0.27577711);
+
+type
+  // Scalars read straight from a HuggingFace preprocessor_config.json so the
+  // transform drops into the importers (image classifiers, CLIP, ViT, ...).
+  TNNetImagePreprocess = record
+    ResizeShorterSide: integer;     // size.shortest_edge (resize target)
+    CropSize: integer;              // crop_size (square)
+    Mean: array[0..2] of TNeuralFloat;  // image_mean (RGB)
+    Std: array[0..2] of TNeuralFloat;   // image_std (RGB)
+  end;
+
+// Applies the standard inference transform to Src (an (W,H,3) RGB volume with
+// 0..255 byte-valued channels, the layout LoadImageFromFileIntoVolume yields)
+// and writes the (CropSize,CropSize,3) normalized result into Dst:
+//   shorter-side resize to ResizeShorterSide (aspect preserved, bilinear) ->
+//   center-crop to CropSize -> (x/255 - Mean[c])/Std[c] per channel.
+// Mean/Std are RGB triples (e.g. csImageNetMean / csImageNetStd). Src and Dst
+// may NOT be the same volume.
+procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
+  ResizeShorterSide, CropSize: integer;
+  const Mean, Std: array of TNeuralFloat);
+
+// Reads the standard inference transform straight into a TNNetImagePreprocess
+// from a HuggingFace preprocessor_config.json. Handles size as an int, as
+// {"shortest_edge":N} or as {"height":..,"width":..}, and crop_size as an int
+// or {"height":..,"width":..}. Defaults follow CLIPImageProcessor (shortest
+// edge / crop 224, the OpenAI image_mean/image_std) when a field is absent.
+function ReadImagePreprocessConfig(
+  const FileName: string): TNNetImagePreprocess;
+
+// Convenience: load an image file straight to a vision-model-ready normalized
+// volume (LoadImageFromFileIntoVolume + PreprocessImageForVisionModel).
+function LoadImageForVisionModel(const ImageFileName: string; V: TNNetVolume;
+  ResizeShorterSide, CropSize: integer;
+  const Mean, Std: array of TNeuralFloat): boolean;
+
 // Writes the header of a confusion matrix into a CSV file
 procedure ConfusionWriteCSVHeader(var CSVConfusion: TextFile; Labels: array of string);
 
@@ -381,11 +436,12 @@ type
   // window, the target for position P is the token at position P+1, so the
   // last position of every window never has a target.
   //
-  // Cross-document attention masking is intentionally NOT implemented:
-  // TNNetScaledDotProductAttention only supports a static causal flag (plus
-  // a static sliding window), not per-sample dynamic masks, so attention may
-  // cross document boundaries inside a packed window. This is the standard
-  // GPT-2/GPT-3 packing behaviour and works fine in practice.
+  // By default attention may cross document boundaries inside a packed window
+  // (the standard GPT-2/GPT-3 packing behaviour, which works fine in practice).
+  // To PREVENT cross-document attention, call GetSegmentIds / GetSegmentVolume
+  // to obtain the per-token document ids and feed them as the segment source of
+  // a TNNetScaledDotProductAttention layer (its optional per-sample
+  // block-diagonal mask: query i attends key j only when seg[i] = seg[j]).
   //
   // Typical use (per-position causal LM with a TNNetPointwiseSoftMax head):
   //   Packer.AddDocument(...); ...; Packer.Pack();
@@ -425,6 +481,21 @@ type
       // Returns a copy of window WindowIdx (always ContextLen tokens).
       function GetWindow(WindowIdx: integer): TNeuralIntegerArray;
       function GetToken(WindowIdx, Pos: integer): integer;
+      // Per-token DOCUMENT/SEGMENT ids for window WindowIdx (length ContextLen),
+      // for feeding TNNetScaledDotProductAttention's per-sample segment mask so
+      // attention does NOT cross document boundaries inside the packed window.
+      // A new document begins immediately after each end-of-document separator,
+      // so the id is incremented every time the PREVIOUS token was a separator;
+      // the separator itself shares its document's id (it is that document's
+      // last token). Every trailing pad position is given one shared id that is
+      // distinct from all real-document ids (their outputs are loss-masked, so
+      // attending among themselves is harmless, while they never see a real
+      // document). Returns a TNeuralIntegerArray of length ContextLen.
+      function GetSegmentIds(WindowIdx: integer): TNeuralIntegerArray;
+      // Fills pSegment (SizeX=ContextLen, SizeY=1, Depth=1) with the per-token
+      // segment ids from GetSegmentIds, ready to be the segment source of a
+      // TNNetScaledDotProductAttention layer.
+      procedure GetSegmentVolume(WindowIdx: integer; pSegment: TNNetVolume);
       // True when position Pos of window WindowIdx carries a loss: the target
       // (next token in the window) exists and is not the pad token.
       function IsTargetPredictable(WindowIdx, Pos: integer): boolean;
@@ -450,11 +521,303 @@ type
       property DocumentCount: integer read FDocCount;
   end;
 
+const
+  // Ignore-label convention for masked-LM training: a label of -1 means
+  // "this position is NOT a loss target" (BERT/HuggingFace use -100, but this
+  // repo's token ids are non-negative and any negative sentinel works; -1 is
+  // used throughout TNNetMaskedLMCollator). Use BuildTrainingPair to turn the
+  // integer label array into a one-hot target volume with all-zero rows at the
+  // ignored positions (then ApplyLossMask after Compute, exactly like
+  // TNNetSequencePacker, so e = Output - Desired is zero off the masked set).
+  csMaskedLMIgnoreLabel = -1;
+
+type
+  { TNNetMaskedLMCollator }
+  // BERT-style dynamic masked-language-model collator (a port of the
+  // HuggingFace transformers DataCollatorForLanguageModeling, MLM mode).
+  // Given a batch of token-id sequences, it independently corrupts each
+  // sequence: a fraction MaskProb (default 0.15) of the non-special tokens is
+  // selected for prediction; of the selected tokens 80% are replaced with the
+  // [MASK] id, 10% with a uniformly random real token, and 10% are left
+  // unchanged. Only the selected positions carry a loss; every other position
+  // gets the ignore label csMaskedLMIgnoreLabel in the labels array, and the
+  // selected positions carry the ORIGINAL (pre-corruption) token id.
+  //
+  // This unlocks encoder pretraining on top of the existing
+  // AddTransformerEncoderBlock with no new layer types: feed CorruptedIds to
+  // the encoder (token ids on the X axis when the input Depth = 1, one-hot on
+  // the depth axis otherwise) and train a TNNetPointwiseSoftMax head against
+  // the one-hot targets built by BuildTrainingPair; call ApplyLossMask after
+  // Compute so the ignored positions backpropagate no gradient.
+  //
+  // Special tokens (pad/cls/sep/mask and anything passed to
+  // AddSpecialTokenId) are NEVER selected for masking and never used as the
+  // random replacement token.
+  //
+  // The masking RNG is seeded via Reseed so tests / runs are reproducible;
+  // it uses an internal LCG independent of the global RandSeed so collation
+  // does not perturb (or get perturbed by) weight-init randomness.
+  // Coded by Claude (AI).
+  TNNetMaskedLMCollator = class(TObject)
+    private
+      FMaskProb: TNeuralFloat;
+      FReplaceMaskProb: TNeuralFloat;  // P(replace with [MASK]) within selected
+      FRandomTokenProb: TNeuralFloat;  // P(replace with random token) within selected
+      FMaskTokenId: integer;
+      FVocabSize: integer;
+      FSpecials: TNeuralIntegerArray;
+      FSpecialCount: integer;
+      FRngState: cardinal;
+      function NextRandom(): TNeuralFloat;          // uniform [0,1)
+      function NextRandomInt(N: integer): integer;  // uniform 0..N-1
+      function IsSpecial(TokenId: integer): boolean;
+      function RandomRealToken(): integer;          // a real (non-special) id
+    public
+      // pMaskTokenId: the [MASK] token id. pVocabSize: number of token ids
+      // (random replacement draws from 0..pVocabSize-1, skipping specials).
+      // The pad/cls/sep/mask ids and any AddSpecialTokenId id are never masked.
+      constructor Create(pMaskTokenId, pVocabSize: integer;
+        pMaskProb: TNeuralFloat = 0.15);
+      destructor Destroy; override;
+      // Registers a token id that must never be masked nor used as a random
+      // replacement (the mask id itself is registered automatically).
+      procedure AddSpecialTokenId(TokenId: integer);
+      // Reseeds the internal RNG for reproducible masking.
+      procedure Reseed(Seed: cardinal);
+      // Corrupts one sequence in place of a copy. CorruptedIds receives the
+      // masked input ids (same length as Tokens); Labels receives the original
+      // id at each selected position and csMaskedLMIgnoreLabel everywhere else.
+      procedure Collate(const Tokens: array of integer;
+        out CorruptedIds, Labels: TNeuralIntegerArray);
+      // Whole-word masking variant (a port of HuggingFace transformers
+      // DataCollatorForWholeWordMask). WordIds is a per-token grouping array
+      // parallel to Tokens: tokens carrying the SAME WordIds value are the
+      // subword pieces of one word and the masking DECISION is taken once per
+      // word -- if a word is selected, all of its pieces become loss targets
+      // together (no partial-word masking). Within a selected word the existing
+      // 80/10/10 mask/random/keep policy is applied INDEPENDENTLY per piece,
+      // exactly as the HF reference does. A piece whose token is special is
+      // never selected and never anchors a word (its WordIds value is ignored
+      // for grouping of real pieces). Use any monotone-or-not integer scheme to
+      // tag words; equal adjacent-or-not values are grouped. A common caller
+      // convention is to give every special token its own unique WordIds value
+      // (e.g. a decreasing counter) so specials never join a real word.
+      procedure CollateWholeWord(const Tokens, WordIds: array of integer;
+        out CorruptedIds, Labels: TNeuralIntegerArray);
+      // Fills network volumes from one already-collated pair. pInput: corrupted
+      // token ids on the X axis when pInput.Depth = 1 (embedding pipelines),
+      // one-hot across the depth axis otherwise. pTarget: per-position one-hot
+      // of the ORIGINAL token at selected positions, all-zero rows elsewhere
+      // (so a softmax head with ApplyLossMask trains only on the masked set).
+      procedure BuildTrainingPair(const CorruptedIds, Labels: TNeuralIntegerArray;
+        pInput, pTarget: TNNetVolume);
+      // Copies the network output into Desired at every ignored position so
+      // that with e = Output - Desired the error there is exactly zero (same
+      // contract as TNNetSequencePacker.ApplyLossMask). SeqLen rows are read
+      // from Labels.
+      procedure ApplyLossMask(const Labels: TNeuralIntegerArray;
+        Desired, Actual: TNNetVolume);
+      property MaskProb: TNeuralFloat read FMaskProb write FMaskProb;
+      // The 80/10/10 split. ReplaceMaskProb + RandomTokenProb must be <= 1;
+      // the remainder is the "leave unchanged" probability.
+      property ReplaceMaskProb: TNeuralFloat read FReplaceMaskProb write FReplaceMaskProb;
+      property RandomTokenProb: TNeuralFloat read FRandomTokenProb write FRandomTokenProb;
+      property MaskTokenId: integer read FMaskTokenId;
+      property VocabSize: integer read FVocabSize;
+  end;
+
+  { TNNetSpanCorruptionCollator }
+  // T5 / SpanBERT-style span-corruption collator (a port of the T5
+  // span_corruption objective, the BERT-relative sibling of
+  // TNNetMaskedLMCollator). Instead of masking individual tokens in place it
+  // masks CONTIGUOUS SPANS and produces a reshaped encoder-decoder pair:
+  //
+  //   * The INPUT is the original sequence with each masked span collapsed to a
+  //     single unique sentinel token. Sentinels descend from a configurable
+  //     base id: <extra_id_0> = SentinelBaseId, <extra_id_1> = SentinelBaseId-1,
+  //     ... (the T5 convention puts <extra_id_0> at the top of the vocabulary).
+  //   * The TARGET is the sentinel/span stream
+  //       sentinel_0, span0_tokens, sentinel_1, span1_tokens, ..., final_sentinel
+  //     i.e. each dropped span prefixed by the sentinel that replaced it, with a
+  //     trailing sentinel (the T5 end marker) after the last span.
+  //
+  // Spans are sampled so that ~CorruptionRate of the (non-special) tokens are
+  // masked, with span lengths drawn around MeanSpanLength (T5 defaults: 0.15
+  // rate, mean length 3). Special tokens (anything passed to AddSpecialTokenId)
+  // are never masked and break spans. Because the target is a RESHAPED, shorter
+  // sequence than the input, this is a sibling class rather than a flag on
+  // TNNetMaskedLMCollator. The (corrupted input, target) pair is exactly
+  // round-trippable: the original sequence can be rebuilt by walking the input
+  // and substituting, at each sentinel, the span that follows the matching
+  // sentinel in the target.
+  //
+  // The RNG is an internal LCG seeded via Reseed, identical to and independent
+  // of TNNetMaskedLMCollator's, so collation is reproducible and never perturbs
+  // weight-init randomness.
+  // Coded by Claude (AI).
+  TNNetSpanCorruptionCollator = class(TObject)
+    private
+      FCorruptionRate: TNeuralFloat;
+      FMeanSpanLength: TNeuralFloat;
+      FSentinelBaseId: integer;
+      FVocabSize: integer;
+      FSpecials: TNeuralIntegerArray;
+      FSpecialCount: integer;
+      FRngState: cardinal;
+      function NextRandom(): TNeuralFloat;
+      function NextRandomInt(N: integer): integer;
+      function IsSpecial(TokenId: integer): boolean;
+      function SampleSpanLength(): integer;
+    public
+      // pSentinelBaseId: id of <extra_id_0> (sentinels count DOWN from here).
+      // pVocabSize: number of token ids (sentinels are assumed to live at the
+      // top of the vocabulary, so SentinelBaseId is typically VocabSize-1).
+      // pCorruptionRate: target fraction of non-special tokens to mask.
+      // pMeanSpanLength: mean masked-span length (>= 1).
+      constructor Create(pSentinelBaseId, pVocabSize: integer;
+        pCorruptionRate: TNeuralFloat = 0.15;
+        pMeanSpanLength: TNeuralFloat = 3.0);
+      destructor Destroy; override;
+      // Registers a token id that must never be masked and that breaks spans.
+      procedure AddSpecialTokenId(TokenId: integer);
+      // Reseeds the internal RNG for reproducible span sampling.
+      procedure Reseed(Seed: cardinal);
+      // Returns the id of the I-th sentinel (<extra_id_I>): SentinelBaseId - I.
+      function SentinelId(I: integer): integer;
+      // Corrupts one sequence into a T5 (input, target) pair. SourceIds receives
+      // the original sequence with each masked span replaced by one descending
+      // sentinel; TargetIds receives the sentinel/span stream terminated by the
+      // next (final) sentinel. NumSpans returns how many spans were masked.
+      procedure Collate(const Tokens: array of integer;
+        out SourceIds, TargetIds: TNeuralIntegerArray; out NumSpans: integer);
+      // Fills network volumes from an already-collated pair (token ids on the X
+      // axis when Depth = 1, one-hot on the depth axis otherwise). The encoder
+      // is fed pSource; an autoregressive decoder is trained on pTarget.
+      procedure BuildTrainingPair(const SourceIds, TargetIds: TNeuralIntegerArray;
+        pSource, pTarget: TNNetVolume);
+      property CorruptionRate: TNeuralFloat read FCorruptionRate write FCorruptionRate;
+      property MeanSpanLength: TNeuralFloat read FMeanSpanLength write FMeanSpanLength;
+      property SentinelBaseId: integer read FSentinelBaseId;
+      property VocabSize: integer read FVocabSize;
+  end;
+
+  { TNNetLengthGroupedBatcher }
+  // Length-grouped batching with dynamic (per-batch) padding for variable-length
+  // sequence training. A port of HuggingFace transformers LengthGroupedSampler
+  // plus DataCollatorWithPadding: it is the TRAINING data-side throughput
+  // optimization (distinct from per-sample attention masks or left-padded
+  // generation). Instead of padding every sample to the GLOBAL maximum length,
+  // it batches samples of SIMILAR length together and pads each emitted batch
+  // only to THAT batch's own maximum length, which sharply reduces the wasted
+  // pad-token compute on a length-skewed corpus.
+  //
+  // Ordering is the transformers "megabatch" shuffle, which keeps the data
+  // stochastic across epochs while still grouping by length:
+  //   1. shuffle all sample indices,
+  //   2. cut the shuffled stream into mega-batches of MegaBatchMult * BatchSize,
+  //   3. sort each mega-batch by sample length (descending), and
+  //   4. (transformers detail) swap the single longest sample into the first
+  //      mega-batch so the very first emitted batch contains the global longest
+  //      sample (surfaces an out-of-memory early rather than mid-epoch),
+  //   5. yield consecutive BatchSize chunks of the resulting index order.
+  // A fresh Reseed reproduces the order bit-for-bit; the internal LCG is the
+  // same one the sibling collators use, independent of the global RandSeed so
+  // batching never perturbs weight-init randomness.
+  //
+  // The token-id convention matches the rest of the NLP pipeline (pad = 0 by
+  // default; real corpus tokens carry their own ids). Each stored sample is one
+  // variable-length token sequence; GetBatchPair emits a per-position causal-LM
+  // training pair for the whole batch: every sample padded (on the right) to the
+  // batch's BatchSeqLen, input = token ids, target = per-position one-hot of the
+  // next token, with pad-target rows left all-zero for ApplyLossMask.
+  // Coded by Claude (AI).
+  TNNetLengthGroupedBatcher = class(TObject)
+    private
+      FSamples: array of TNeuralIntegerArray;
+      FSampleCount: integer;
+      FPadToken: integer;
+      FVocabSize: integer;
+      FBatchSize: integer;
+      FMegaBatchMult: integer;
+      FRngState: cardinal;
+      FOrder: TNeuralIntegerArray;   // sample indices in emission order
+      FBatchCount: integer;
+      FIsBuilt: boolean;
+      function NextRandom(): TNeuralFloat;
+      function NextRandomInt(N: integer): integer;
+      procedure RequireBuilt();
+      procedure ShuffleOrder();
+      procedure SortRangeByLenDesc(Lo, Hi: integer);
+    public
+      // pVocabSize: number of token ids (only used to size one-hot targets).
+      // pBatchSize: samples per emitted batch. pMegaBatchMult: mega-batch size
+      // is pMegaBatchMult * pBatchSize (transformers default 50); a larger
+      // multiplier groups lengths more tightly but reduces shuffle randomness.
+      constructor Create(pVocabSize: integer; pBatchSize: integer;
+        pMegaBatchMult: integer = 50; pPadToken: integer = 0);
+      destructor Destroy; override;
+      // Removes all samples and any built batch order.
+      procedure Clear();
+      // Adds one variable-length token sequence (stored as-is; no separator is
+      // appended). At least one token is required.
+      procedure AddSample(const Tokens: array of integer);
+      // Char-level convenience: sample tokens are Ord() of each character.
+      procedure AddSampleFromString(const Str: string);
+      // Reseeds the internal RNG for a reproducible megabatch shuffle.
+      procedure Reseed(Seed: cardinal);
+      // Builds the megabatch-shuffled emission order and the batch partition.
+      // Call once per epoch (Reseed first for a different shuffle each epoch).
+      procedure BuildBatches();
+      function BatchCount(): integer;
+      // Number of samples in batch BatchIdx (BatchSize, except possibly the
+      // last batch when SampleCount is not a multiple of BatchSize).
+      function BatchSize(BatchIdx: integer): integer;
+      // Pad length of batch BatchIdx: the maximum sample length in that batch
+      // (every sample in the batch is right-padded to this length).
+      function BatchSeqLen(BatchIdx: integer): integer;
+      // Original sample index of the WithinIdx-th member of batch BatchIdx.
+      function SampleIndexOf(BatchIdx, WithinIdx: integer): integer;
+      // Length (real token count, no padding) of the WithinIdx-th sample of
+      // batch BatchIdx.
+      function SampleLenOf(BatchIdx, WithinIdx: integer): integer;
+      // Fills a per-position causal-LM training pair for ONE sample (the
+      // WithinIdx-th member of batch BatchIdx), padded to the batch's
+      // BatchSeqLen. Same volume layout as TNNetSequencePacker.GetTrainingPair:
+      // pInput/pTarget have SizeX = BatchSeqLen, SizeY = 1. Input carries token
+      // ids on the X axis when pInput.Depth = 1 (embedding pipelines) or one-hot
+      // across the depth axis otherwise; pad positions hold the pad token.
+      // Target: per-position one-hot of the next token within the sample, with
+      // pad-target rows (everything from the sample's last real token onward)
+      // left all-zero so a softmax head with ApplyLossMask trains only on the
+      // real next-token targets.
+      procedure GetTrainingPair(BatchIdx, WithinIdx: integer;
+        pInput, pTarget: TNNetVolume);
+      // Copies the network output into Desired at every non-predictable position
+      // of the WithinIdx-th sample of batch BatchIdx (positions at/after the
+      // sample's last real token), so e = Output - Desired is zero there (same
+      // contract as TNNetSequencePacker.ApplyLossMask).
+      procedure ApplyLossMask(BatchIdx, WithinIdx: integer;
+        Desired, Actual: TNNetVolume);
+      // Total pad tokens emitted across all batches with the current dynamic
+      // (per-batch) padding: sum over batches of
+      // (BatchSeqLen * BatchSize - real tokens in the batch).
+      function TotalPadTokens(): int64;
+      // Pad tokens that NAIVE global padding would emit on the same corpus:
+      // (global max length) * SampleCount - total real tokens. The dynamic
+      // batching above is guaranteed <= this (and strictly less whenever the
+      // corpus has any length variation across batches).
+      function NaiveTotalPadTokens(): int64;
+      property SampleCount: integer read FSampleCount;
+      property PadToken: integer read FPadToken;
+      property VocabSize: integer read FVocabSize;
+      property MegaBatchMult: integer read FMegaBatchMult;
+  end;
+
 implementation
 
 uses
   math, neuralthread,
-  {$IFDEF FPC}SysUtils,fileutil{$ELSE}
+  {$IFDEF FPC}Classes,SysUtils,fileutil,fpjson,jsonparser{$ELSE}
   SysUtils,
   IOUtils,
   Types
@@ -946,6 +1309,53 @@ begin
   Result := FWindows[WindowIdx][Pos];
 end;
 
+function TNNetSequencePacker.GetSegmentIds(WindowIdx: integer): TNeuralIntegerArray;
+var
+  Pos, SegId, PadId: integer;
+begin
+  RequirePacked();
+  SetLength(Result, FContextLen);
+  // First pass: real/separator tokens get an incrementing document id; a new
+  // document opens right after each separator. Pad positions are tagged -1 and
+  // reassigned a single shared id below.
+  SegId := 0;
+  for Pos := 0 to FContextLen - 1 do
+  begin
+    if FWindows[WindowIdx][Pos] = FPadToken then
+    begin
+      Result[Pos] := -1;
+    end
+    else
+    begin
+      Result[Pos] := SegId;
+      if FWindows[WindowIdx][Pos] = FSeparatorToken then Inc(SegId);
+    end;
+  end;
+  // Pads share one id distinct from every real-document id (= SegId, the next
+  // unused value), so a pad never matches any real document.
+  PadId := SegId;
+  for Pos := 0 to FContextLen - 1 do
+    if Result[Pos] = -1 then Result[Pos] := PadId;
+end;
+
+procedure TNNetSequencePacker.GetSegmentVolume(WindowIdx: integer;
+  pSegment: TNNetVolume);
+var
+  Ids: TNeuralIntegerArray;
+  Pos: integer;
+begin
+  RequirePacked();
+  if (pSegment.SizeX <> FContextLen) or (pSegment.SizeY <> 1) or
+     (pSegment.Depth <> 1) then
+    raise Exception.Create('TNNetSequencePacker.GetSegmentVolume: pSegment ' +
+      'must be (ContextLen,1,1). Got (' + IntToStr(pSegment.SizeX) + ',' +
+      IntToStr(pSegment.SizeY) + ',' + IntToStr(pSegment.Depth) + ').');
+  Ids := GetSegmentIds(WindowIdx);
+  for Pos := 0 to FContextLen - 1 do
+    pSegment[Pos, 0, 0] := Ids[Pos];
+  SetLength(Ids, 0);
+end;
+
 function TNNetSequencePacker.IsTargetPredictable(WindowIdx, Pos: integer): boolean;
 begin
   RequirePacked();
@@ -1022,6 +1432,704 @@ begin
         Desired[Pos, 0, D] := Actual[Pos, 0, D];
     end;
   end;
+end;
+
+{ TNNetMaskedLMCollator }
+
+constructor TNNetMaskedLMCollator.Create(pMaskTokenId, pVocabSize: integer;
+  pMaskProb: TNeuralFloat);
+begin
+  inherited Create();
+  if pVocabSize < 2 then
+    raise Exception.Create('TNNetMaskedLMCollator: VocabSize must be >= 2.');
+  if (pMaskTokenId < 0) or (pMaskTokenId >= pVocabSize) then
+    raise Exception.Create(
+      'TNNetMaskedLMCollator: MaskTokenId must be in 0..VocabSize-1.');
+  if (pMaskProb < 0) or (pMaskProb > 1) then
+    raise Exception.Create(
+      'TNNetMaskedLMCollator: MaskProb must be in [0,1].');
+  FMaskTokenId := pMaskTokenId;
+  FVocabSize := pVocabSize;
+  FMaskProb := pMaskProb;
+  FReplaceMaskProb := 0.8;
+  FRandomTokenProb := 0.1;
+  FSpecialCount := 0;
+  SetLength(FSpecials, 0);
+  FRngState := 305419896; // arbitrary non-zero default seed
+  // The mask token is special: never selected, never a random replacement.
+  AddSpecialTokenId(pMaskTokenId);
+end;
+
+destructor TNNetMaskedLMCollator.Destroy;
+begin
+  SetLength(FSpecials, 0);
+  inherited Destroy;
+end;
+
+procedure TNNetMaskedLMCollator.AddSpecialTokenId(TokenId: integer);
+begin
+  if IsSpecial(TokenId) then exit;
+  if FSpecialCount >= Length(FSpecials) then
+    SetLength(FSpecials, 8 + FSpecialCount * 2);
+  FSpecials[FSpecialCount] := TokenId;
+  Inc(FSpecialCount);
+end;
+
+procedure TNNetMaskedLMCollator.Reseed(Seed: cardinal);
+begin
+  if Seed = 0 then Seed := 1; // a zero state would stick at zero
+  FRngState := Seed;
+end;
+
+function TNNetMaskedLMCollator.NextRandom(): TNeuralFloat;
+begin
+  // Numerical Recipes LCG; the high bits are well-mixed, so use them for the
+  // [0,1) draw. Independent of the global RandSeed.
+  FRngState := FRngState * 1664525 + 1013904223;
+  Result := (FRngState shr 8) / 16777216.0; // top 24 bits / 2^24
+end;
+
+function TNNetMaskedLMCollator.NextRandomInt(N: integer): integer;
+begin
+  if N <= 1 then begin Result := 0; exit; end;
+  Result := Trunc(NextRandom() * N);
+  if Result >= N then Result := N - 1; // guard the (vanishingly rare) edge
+end;
+
+function TNNetMaskedLMCollator.IsSpecial(TokenId: integer): boolean;
+var
+  I: integer;
+begin
+  Result := false;
+  for I := 0 to FSpecialCount - 1 do
+    if FSpecials[I] = TokenId then begin Result := true; exit; end;
+end;
+
+function TNNetMaskedLMCollator.RandomRealToken(): integer;
+begin
+  // Rejection-sample a non-special id in 0..VocabSize-1.
+  repeat
+    Result := NextRandomInt(FVocabSize);
+  until not IsSpecial(Result);
+end;
+
+procedure TNNetMaskedLMCollator.Collate(const Tokens: array of integer;
+  out CorruptedIds, Labels: TNeuralIntegerArray);
+var
+  Len, I: integer;
+  Roll: TNeuralFloat;
+begin
+  Len := Length(Tokens);
+  SetLength(CorruptedIds, Len);
+  SetLength(Labels, Len);
+  for I := 0 to Len - 1 do
+  begin
+    CorruptedIds[I] := Tokens[I];
+    Labels[I] := csMaskedLMIgnoreLabel;
+    if IsSpecial(Tokens[I]) then continue;
+    if NextRandom() >= FMaskProb then continue; // not selected for prediction
+    // Selected: this position carries the loss; remember the original id.
+    Labels[I] := Tokens[I];
+    Roll := NextRandom();
+    if Roll < FReplaceMaskProb then
+      CorruptedIds[I] := FMaskTokenId                    // 80%: [MASK]
+    else if Roll < FReplaceMaskProb + FRandomTokenProb then
+      CorruptedIds[I] := RandomRealToken()               // 10%: random token
+    // else 10%: leave CorruptedIds[I] unchanged.
+    ;
+  end;
+end;
+
+procedure TNNetMaskedLMCollator.CollateWholeWord(
+  const Tokens, WordIds: array of integer;
+  out CorruptedIds, Labels: TNeuralIntegerArray);
+var
+  Len, I, J: integer;
+  Roll: TNeuralFloat;
+  WordSelected: boolean;
+begin
+  Len := Length(Tokens);
+  if Length(WordIds) <> Len then
+    raise Exception.Create(
+      'TNNetMaskedLMCollator.CollateWholeWord: Tokens and WordIds lengths ' +
+      'differ.');
+  SetLength(CorruptedIds, Len);
+  SetLength(Labels, Len);
+  for I := 0 to Len - 1 do
+  begin
+    CorruptedIds[I] := Tokens[I];
+    Labels[I] := csMaskedLMIgnoreLabel;
+  end;
+  // Walk contiguous runs of equal WordIds (one word = one run of pieces). The
+  // mask/keep DECISION is taken once per word; special pieces are skipped and
+  // break the run so they never join a real word.
+  I := 0;
+  while I < Len do
+  begin
+    if IsSpecial(Tokens[I]) then
+    begin
+      Inc(I);
+      continue;
+    end;
+    // Extent of this word: pieces sharing WordIds[I], stopping at a special.
+    J := I + 1;
+    while (J < Len) and (WordIds[J] = WordIds[I]) and (not IsSpecial(Tokens[J])) do
+      Inc(J);
+    // One selection draw for the whole word [I, J).
+    WordSelected := NextRandom() < FMaskProb;
+    if WordSelected then
+    begin
+      while I < J do
+      begin
+        Labels[I] := Tokens[I];
+        // HF applies the 80/10/10 split independently to each piece.
+        Roll := NextRandom();
+        if Roll < FReplaceMaskProb then
+          CorruptedIds[I] := FMaskTokenId
+        else if Roll < FReplaceMaskProb + FRandomTokenProb then
+          CorruptedIds[I] := RandomRealToken()
+        ;
+        Inc(I);
+      end;
+    end
+    else
+      I := J;
+  end;
+end;
+
+procedure TNNetMaskedLMCollator.BuildTrainingPair(
+  const CorruptedIds, Labels: TNeuralIntegerArray; pInput, pTarget: TNNetVolume);
+var
+  Len, P: integer;
+begin
+  Len := Length(CorruptedIds);
+  if Length(Labels) <> Len then
+    raise Exception.Create(
+      'TNNetMaskedLMCollator.BuildTrainingPair: CorruptedIds and Labels ' +
+      'lengths differ.');
+  if pInput.SizeX < Len then
+    raise Exception.Create(
+      'TNNetMaskedLMCollator.BuildTrainingPair: input SizeX (' +
+      IntToStr(pInput.SizeX) + ') < sequence length (' + IntToStr(Len) + ').');
+  if pTarget.SizeX < Len then
+    raise Exception.Create(
+      'TNNetMaskedLMCollator.BuildTrainingPair: target SizeX (' +
+      IntToStr(pTarget.SizeX) + ') < sequence length (' + IntToStr(Len) + ').');
+  pInput.Fill(0);
+  pTarget.Fill(0);
+  for P := 0 to Len - 1 do
+  begin
+    if pInput.Depth = 1 then
+      pInput[P, 0, 0] := CorruptedIds[P]            // token ids on the X axis
+    else
+      pInput[P, 0, CorruptedIds[P]] := 1;           // one-hot on the depth axis
+    // Target: one-hot of the ORIGINAL id only at selected positions; ignored
+    // rows stay all-zero (no loss with ApplyLossMask).
+    if Labels[P] <> csMaskedLMIgnoreLabel then
+      pTarget[P, 0, Labels[P]] := 1;
+  end;
+end;
+
+procedure TNNetMaskedLMCollator.ApplyLossMask(const Labels: TNeuralIntegerArray;
+  Desired, Actual: TNNetVolume);
+var
+  P, D: integer;
+begin
+  for P := 0 to Length(Labels) - 1 do
+    if Labels[P] = csMaskedLMIgnoreLabel then
+      for D := 0 to Desired.Depth - 1 do
+        Desired[P, 0, D] := Actual[P, 0, D];
+end;
+
+{ TNNetSpanCorruptionCollator }
+
+constructor TNNetSpanCorruptionCollator.Create(
+  pSentinelBaseId, pVocabSize: integer;
+  pCorruptionRate, pMeanSpanLength: TNeuralFloat);
+begin
+  inherited Create();
+  if pVocabSize < 2 then
+    raise Exception.Create('TNNetSpanCorruptionCollator: VocabSize must be >= 2.');
+  if (pSentinelBaseId < 0) or (pSentinelBaseId >= pVocabSize) then
+    raise Exception.Create(
+      'TNNetSpanCorruptionCollator: SentinelBaseId must be in 0..VocabSize-1.');
+  if (pCorruptionRate < 0) or (pCorruptionRate > 1) then
+    raise Exception.Create(
+      'TNNetSpanCorruptionCollator: CorruptionRate must be in [0,1].');
+  if pMeanSpanLength < 1 then
+    raise Exception.Create(
+      'TNNetSpanCorruptionCollator: MeanSpanLength must be >= 1.');
+  FSentinelBaseId := pSentinelBaseId;
+  FVocabSize := pVocabSize;
+  FCorruptionRate := pCorruptionRate;
+  FMeanSpanLength := pMeanSpanLength;
+  FSpecialCount := 0;
+  SetLength(FSpecials, 0);
+  FRngState := 305419896;
+end;
+
+destructor TNNetSpanCorruptionCollator.Destroy;
+begin
+  SetLength(FSpecials, 0);
+  inherited Destroy;
+end;
+
+procedure TNNetSpanCorruptionCollator.AddSpecialTokenId(TokenId: integer);
+begin
+  if IsSpecial(TokenId) then exit;
+  if FSpecialCount >= Length(FSpecials) then
+    SetLength(FSpecials, 8 + FSpecialCount * 2);
+  FSpecials[FSpecialCount] := TokenId;
+  Inc(FSpecialCount);
+end;
+
+procedure TNNetSpanCorruptionCollator.Reseed(Seed: cardinal);
+begin
+  if Seed = 0 then Seed := 1;
+  FRngState := Seed;
+end;
+
+function TNNetSpanCorruptionCollator.NextRandom(): TNeuralFloat;
+begin
+  FRngState := FRngState * 1664525 + 1013904223;
+  Result := (FRngState shr 8) / 16777216.0;
+end;
+
+function TNNetSpanCorruptionCollator.NextRandomInt(N: integer): integer;
+begin
+  if N <= 1 then begin Result := 0; exit; end;
+  Result := Trunc(NextRandom() * N);
+  if Result >= N then Result := N - 1;
+end;
+
+function TNNetSpanCorruptionCollator.IsSpecial(TokenId: integer): boolean;
+var
+  I: integer;
+begin
+  Result := false;
+  for I := 0 to FSpecialCount - 1 do
+    if FSpecials[I] = TokenId then begin Result := true; exit; end;
+end;
+
+function TNNetSpanCorruptionCollator.SampleSpanLength(): integer;
+begin
+  // Geometric-ish span length with the requested mean, clamped to >= 1. A
+  // geometric distribution with success p = 1/mean has mean 1/p = MeanSpanLength.
+  Result := 1;
+  while (NextRandom() > (1.0 / FMeanSpanLength)) do
+  begin
+    Inc(Result);
+    if Result >= 256 then break; // safety clamp
+  end;
+end;
+
+function TNNetSpanCorruptionCollator.SentinelId(I: integer): integer;
+begin
+  Result := FSentinelBaseId - I;
+end;
+
+procedure TNNetSpanCorruptionCollator.Collate(const Tokens: array of integer;
+  out SourceIds, TargetIds: TNeuralIntegerArray; out NumSpans: integer);
+var
+  Len, I, Budget, SpanLen, SrcLen, TgtLen, SpanEnd: integer;
+  Masked: array of boolean;
+begin
+  Len := Length(Tokens);
+  NumSpans := 0;
+  SetLength(Masked, Len);
+  for I := 0 to Len - 1 do Masked[I] := false;
+  // Token budget to mask (~CorruptionRate of non-special tokens).
+  Budget := 0;
+  for I := 0 to Len - 1 do
+    if not IsSpecial(Tokens[I]) then Inc(Budget);
+  Budget := Round(Budget * FCorruptionRate);
+
+  // Greedily sample spans left-to-right until the budget is spent. A coin per
+  // start position keeps spans spread out; an accepted span is the next run of
+  // SampleSpanLength() non-special tokens.
+  I := 0;
+  while (I < Len) and (Budget > 0) do
+  begin
+    if IsSpecial(Tokens[I]) then begin Inc(I); continue; end;
+    // Probability of starting a span here, tuned so spans cover ~the budget.
+    if NextRandom() < (1.0 / FMeanSpanLength) then
+    begin
+      SpanLen := SampleSpanLength();
+      if SpanLen > Budget then SpanLen := Budget;
+      SpanEnd := I;
+      while (SpanEnd < Len) and (SpanLen > 0) and (not IsSpecial(Tokens[SpanEnd])) do
+      begin
+        Masked[SpanEnd] := true;
+        Dec(Budget);
+        Dec(SpanLen);
+        Inc(SpanEnd);
+      end;
+      Inc(NumSpans);
+      // Leave at least one unmasked token before the next span may start.
+      I := SpanEnd + 1;
+    end
+    else
+      Inc(I);
+  end;
+
+  // Build the source (sentinel-collapsed) and target (sentinel/span) streams.
+  SetLength(SourceIds, Len);     // upper bound; trimmed below
+  SetLength(TargetIds, Len + NumSpans + 1); // spans + leading/trailing sentinels
+  SrcLen := 0;
+  TgtLen := 0;
+  NumSpans := 0;
+  I := 0;
+  while I < Len do
+  begin
+    if Masked[I] then
+    begin
+      // Emit one sentinel into source; open the span in target.
+      SourceIds[SrcLen] := SentinelId(NumSpans); Inc(SrcLen);
+      TargetIds[TgtLen] := SentinelId(NumSpans); Inc(TgtLen);
+      while (I < Len) and Masked[I] do
+      begin
+        TargetIds[TgtLen] := Tokens[I]; Inc(TgtLen);
+        Inc(I);
+      end;
+      Inc(NumSpans);
+    end
+    else
+    begin
+      SourceIds[SrcLen] := Tokens[I]; Inc(SrcLen);
+      Inc(I);
+    end;
+  end;
+  // Trailing (final) sentinel after the last span, per the T5 target format.
+  TargetIds[TgtLen] := SentinelId(NumSpans); Inc(TgtLen);
+  SetLength(SourceIds, SrcLen);
+  SetLength(TargetIds, TgtLen);
+end;
+
+procedure TNNetSpanCorruptionCollator.BuildTrainingPair(
+  const SourceIds, TargetIds: TNeuralIntegerArray; pSource, pTarget: TNNetVolume);
+var
+  P: integer;
+begin
+  if pSource.SizeX < Length(SourceIds) then
+    raise Exception.Create(
+      'TNNetSpanCorruptionCollator.BuildTrainingPair: source SizeX (' +
+      IntToStr(pSource.SizeX) + ') < source length (' +
+      IntToStr(Length(SourceIds)) + ').');
+  if pTarget.SizeX < Length(TargetIds) then
+    raise Exception.Create(
+      'TNNetSpanCorruptionCollator.BuildTrainingPair: target SizeX (' +
+      IntToStr(pTarget.SizeX) + ') < target length (' +
+      IntToStr(Length(TargetIds)) + ').');
+  pSource.Fill(0);
+  pTarget.Fill(0);
+  for P := 0 to Length(SourceIds) - 1 do
+    if pSource.Depth = 1 then
+      pSource[P, 0, 0] := SourceIds[P]
+    else
+      pSource[P, 0, SourceIds[P]] := 1;
+  for P := 0 to Length(TargetIds) - 1 do
+    if pTarget.Depth = 1 then
+      pTarget[P, 0, 0] := TargetIds[P]
+    else
+      pTarget[P, 0, TargetIds[P]] := 1;
+end;
+
+{ TNNetLengthGroupedBatcher }
+
+constructor TNNetLengthGroupedBatcher.Create(pVocabSize: integer;
+  pBatchSize: integer; pMegaBatchMult: integer; pPadToken: integer);
+begin
+  inherited Create();
+  if pVocabSize < 2 then
+    raise Exception.Create('TNNetLengthGroupedBatcher: VocabSize must be >= 2.');
+  if pBatchSize < 1 then
+    raise Exception.Create('TNNetLengthGroupedBatcher: BatchSize must be >= 1.');
+  if pMegaBatchMult < 1 then
+    raise Exception.Create(
+      'TNNetLengthGroupedBatcher: MegaBatchMult must be >= 1.');
+  FVocabSize := pVocabSize;
+  FBatchSize := pBatchSize;
+  FMegaBatchMult := pMegaBatchMult;
+  FPadToken := pPadToken;
+  FSampleCount := 0;
+  FBatchCount := 0;
+  FIsBuilt := false;
+  FRngState := 314159265;
+  SetLength(FSamples, 0);
+  SetLength(FOrder, 0);
+end;
+
+destructor TNNetLengthGroupedBatcher.Destroy;
+begin
+  Clear();
+  inherited Destroy;
+end;
+
+procedure TNNetLengthGroupedBatcher.Clear();
+begin
+  SetLength(FSamples, 0);
+  SetLength(FOrder, 0);
+  FSampleCount := 0;
+  FBatchCount := 0;
+  FIsBuilt := false;
+end;
+
+procedure TNNetLengthGroupedBatcher.AddSample(const Tokens: array of integer);
+var
+  I: integer;
+begin
+  if Length(Tokens) < 1 then
+    raise Exception.Create(
+      'TNNetLengthGroupedBatcher.AddSample: a sample must have >= 1 token.');
+  if FSampleCount >= Length(FSamples) then
+    SetLength(FSamples, (FSampleCount + 1) * 2);
+  SetLength(FSamples[FSampleCount], Length(Tokens));
+  for I := 0 to Length(Tokens) - 1 do
+    FSamples[FSampleCount][I] := Tokens[I];
+  Inc(FSampleCount);
+  FIsBuilt := false;
+end;
+
+procedure TNNetLengthGroupedBatcher.AddSampleFromString(const Str: string);
+var
+  Tokens: TNeuralIntegerArray;
+  I: integer;
+begin
+  SetLength(Tokens, Length(Str));
+  for I := 1 to Length(Str) do
+    Tokens[I - 1] := Ord(Str[I]);
+  AddSample(Tokens);
+end;
+
+procedure TNNetLengthGroupedBatcher.Reseed(Seed: cardinal);
+begin
+  FRngState := Seed;
+  FIsBuilt := false;
+end;
+
+function TNNetLengthGroupedBatcher.NextRandom(): TNeuralFloat;
+begin
+  // Same Numerical Recipes LCG as the sibling collators; independent of the
+  // global RandSeed so the shuffle never perturbs weight-init randomness.
+  FRngState := FRngState * 1664525 + 1013904223;
+  Result := (FRngState shr 8) / 16777216.0; // top 24 bits / 2^24
+end;
+
+function TNNetLengthGroupedBatcher.NextRandomInt(N: integer): integer;
+begin
+  if N <= 1 then begin Result := 0; exit; end;
+  Result := Trunc(NextRandom() * N);
+  if Result >= N then Result := N - 1;
+end;
+
+procedure TNNetLengthGroupedBatcher.RequireBuilt();
+begin
+  if not FIsBuilt then
+    raise Exception.Create('TNNetLengthGroupedBatcher: call BuildBatches first.');
+end;
+
+procedure TNNetLengthGroupedBatcher.ShuffleOrder();
+var
+  I, J, Tmp: integer;
+begin
+  // Fisher-Yates over the sample indices using the internal LCG.
+  for I := 0 to FSampleCount - 1 do FOrder[I] := I;
+  for I := FSampleCount - 1 downto 1 do
+  begin
+    J := NextRandomInt(I + 1);
+    Tmp := FOrder[I]; FOrder[I] := FOrder[J]; FOrder[J] := Tmp;
+  end;
+end;
+
+procedure TNNetLengthGroupedBatcher.SortRangeByLenDesc(Lo, Hi: integer);
+var
+  I, J, PivotLen, Tmp: integer;
+begin
+  // Plain quicksort on FOrder[Lo..Hi] keyed by descending sample length.
+  if Lo >= Hi then exit;
+  PivotLen := Length(FSamples[FOrder[(Lo + Hi) div 2]]);
+  I := Lo; J := Hi;
+  repeat
+    while Length(FSamples[FOrder[I]]) > PivotLen do Inc(I);
+    while Length(FSamples[FOrder[J]]) < PivotLen do Dec(J);
+    if I <= J then
+    begin
+      Tmp := FOrder[I]; FOrder[I] := FOrder[J]; FOrder[J] := Tmp;
+      Inc(I); Dec(J);
+    end;
+  until I > J;
+  SortRangeByLenDesc(Lo, J);
+  SortRangeByLenDesc(I, Hi);
+end;
+
+procedure TNNetLengthGroupedBatcher.BuildBatches();
+var
+  Mega, Lo, Hi, I, LongestPos, Tmp: integer;
+begin
+  if FSampleCount < 1 then
+    raise Exception.Create(
+      'TNNetLengthGroupedBatcher.BuildBatches: no samples added.');
+  SetLength(FOrder, FSampleCount);
+  // 1. shuffle all indices.
+  ShuffleOrder();
+  // 2-3. cut into mega-batches and sort each by length (descending).
+  Mega := FMegaBatchMult * FBatchSize;
+  Lo := 0;
+  while Lo < FSampleCount do
+  begin
+    Hi := Lo + Mega - 1;
+    if Hi > FSampleCount - 1 then Hi := FSampleCount - 1;
+    SortRangeByLenDesc(Lo, Hi);
+    Lo := Lo + Mega;
+  end;
+  // 4. transformers detail: ensure the GLOBAL longest sample sits in the first
+  //    mega-batch (now at FOrder[0], since each mega-batch is length-sorted) so
+  //    the very first emitted batch surfaces a worst-case OOM immediately.
+  if FSampleCount > 1 then
+  begin
+    LongestPos := 0;
+    for I := 1 to FSampleCount - 1 do
+      if Length(FSamples[FOrder[I]]) > Length(FSamples[FOrder[LongestPos]]) then
+        LongestPos := I;
+    if LongestPos <> 0 then
+    begin
+      Tmp := FOrder[0]; FOrder[0] := FOrder[LongestPos]; FOrder[LongestPos] := Tmp;
+    end;
+  end;
+  // 5. partition into BatchSize chunks.
+  FBatchCount := (FSampleCount + FBatchSize - 1) div FBatchSize;
+  FIsBuilt := true;
+end;
+
+function TNNetLengthGroupedBatcher.BatchCount(): integer;
+begin
+  RequireBuilt();
+  Result := FBatchCount;
+end;
+
+function TNNetLengthGroupedBatcher.BatchSize(BatchIdx: integer): integer;
+begin
+  RequireBuilt();
+  if (BatchIdx < 0) or (BatchIdx >= FBatchCount) then
+    raise Exception.Create('TNNetLengthGroupedBatcher.BatchSize: bad batch index.');
+  Result := FBatchSize;
+  if (BatchIdx = FBatchCount - 1) and (FSampleCount mod FBatchSize <> 0) then
+    Result := FSampleCount mod FBatchSize;
+end;
+
+function TNNetLengthGroupedBatcher.SampleIndexOf(BatchIdx, WithinIdx: integer): integer;
+var
+  Flat: integer;
+begin
+  RequireBuilt();
+  if (WithinIdx < 0) or (WithinIdx >= BatchSize(BatchIdx)) then
+    raise Exception.Create(
+      'TNNetLengthGroupedBatcher.SampleIndexOf: bad within-batch index.');
+  Flat := BatchIdx * FBatchSize + WithinIdx;
+  Result := FOrder[Flat];
+end;
+
+function TNNetLengthGroupedBatcher.SampleLenOf(BatchIdx, WithinIdx: integer): integer;
+begin
+  Result := Length(FSamples[SampleIndexOf(BatchIdx, WithinIdx)]);
+end;
+
+function TNNetLengthGroupedBatcher.BatchSeqLen(BatchIdx: integer): integer;
+var
+  W, L: integer;
+begin
+  RequireBuilt();
+  Result := 0;
+  for W := 0 to BatchSize(BatchIdx) - 1 do
+  begin
+    L := SampleLenOf(BatchIdx, W);
+    if L > Result then Result := L;
+  end;
+end;
+
+procedure TNNetLengthGroupedBatcher.GetTrainingPair(BatchIdx, WithinIdx: integer;
+  pInput, pTarget: TNNetVolume);
+var
+  Sample: TNeuralIntegerArray;
+  SeqLen, Len, Pos, Token: integer;
+begin
+  RequireBuilt();
+  SeqLen := BatchSeqLen(BatchIdx);
+  if pInput.SizeX < SeqLen then
+    raise Exception.Create(
+      'TNNetLengthGroupedBatcher.GetTrainingPair: input SizeX (' +
+      IntToStr(pInput.SizeX) + ') < batch seq len (' + IntToStr(SeqLen) + ').');
+  if pTarget.SizeX < SeqLen then
+    raise Exception.Create(
+      'TNNetLengthGroupedBatcher.GetTrainingPair: target SizeX (' +
+      IntToStr(pTarget.SizeX) + ') < batch seq len (' + IntToStr(SeqLen) + ').');
+  Sample := FSamples[SampleIndexOf(BatchIdx, WithinIdx)];
+  Len := Length(Sample);
+  // Input: real tokens then right-padding to the batch's seq len.
+  pInput.Fill(0);
+  for Pos := 0 to SeqLen - 1 do
+  begin
+    if Pos < Len then Token := Sample[Pos] else Token := FPadToken;
+    if pInput.Depth = 1
+    then pInput[Pos, 0, 0] := Token
+    else if (Token >= 0) and (Token < pInput.Depth)
+    then pInput[Pos, 0, Token] := 1;
+  end;
+  // Target: per-position one-hot of the NEXT real token (positions 0..Len-2);
+  // every padded position and the sample's last real token carry no target.
+  pTarget.Fill(0);
+  for Pos := 0 to Len - 2 do
+  begin
+    Token := Sample[Pos + 1];
+    if (Token >= 0) and (Token < pTarget.Depth) then pTarget[Pos, 0, Token] := 1;
+  end;
+end;
+
+procedure TNNetLengthGroupedBatcher.ApplyLossMask(BatchIdx, WithinIdx: integer;
+  Desired, Actual: TNNetVolume);
+var
+  SeqLen, Len, Pos, D: integer;
+begin
+  RequireBuilt();
+  SeqLen := BatchSeqLen(BatchIdx);
+  Len := SampleLenOf(BatchIdx, WithinIdx);
+  for Pos := 0 to SeqLen - 1 do
+  begin
+    // Predictable iff a next real token exists: Pos in 0..Len-2.
+    if Pos > Len - 2 then
+      for D := 0 to Desired.Depth - 1 do
+        Desired[Pos, 0, D] := Actual[Pos, 0, D];
+  end;
+end;
+
+function TNNetLengthGroupedBatcher.TotalPadTokens(): int64;
+var
+  B, W, SeqLen: integer;
+begin
+  RequireBuilt();
+  Result := 0;
+  for B := 0 to FBatchCount - 1 do
+  begin
+    SeqLen := BatchSeqLen(B);
+    for W := 0 to BatchSize(B) - 1 do
+      Result := Result + (SeqLen - SampleLenOf(B, W));
+  end;
+end;
+
+function TNNetLengthGroupedBatcher.NaiveTotalPadTokens(): int64;
+var
+  I, GlobalMax, L: integer;
+  RealTokens: int64;
+begin
+  GlobalMax := 0;
+  RealTokens := 0;
+  for I := 0 to FSampleCount - 1 do
+  begin
+    L := Length(FSamples[I]);
+    if L > GlobalMax then GlobalMax := L;
+    RealTokens := RealTokens + L;
+  end;
+  Result := int64(GlobalMax) * FSampleCount - RealTokens;
 end;
 
 procedure CreateVolumesFromImagesFromFolder(out ImgTrainingVolumes, ImgValidationVolumes,
@@ -2020,6 +3128,196 @@ begin
   else
   begin
     Result := false;
+  end;
+end;
+
+procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
+  ResizeShorterSide, CropSize: integer;
+  const Mean, Std: array of TNeuralFloat);
+var
+  Work: TNNetVolume;
+  ResizeW, ResizeH, OffX, OffY, X, Y, C, SrcX, SrcY: integer;
+  Scale, Fx, Fy, V: TNeuralFloat;
+begin
+  if (Src = nil) or (Dst = nil) then
+    raise Exception.Create('PreprocessImageForVisionModel: nil volume.');
+  if Src = Dst then
+    raise Exception.Create(
+      'PreprocessImageForVisionModel: Src and Dst must differ.');
+  if Src.Depth <> 3 then
+    raise Exception.Create(
+      'PreprocessImageForVisionModel: source must have depth 3 (RGB), got ' +
+      IntToStr(Src.Depth) + '.');
+  if (Length(Mean) < 3) or (Length(Std) < 3) then
+    raise Exception.Create(
+      'PreprocessImageForVisionModel: Mean/Std need 3 elements.');
+
+  Work := TNNetVolume.Create;
+  try
+    // ---- (1) resize: shorter edge -> ResizeShorterSide, aspect preserved.
+    // PIL/torchvision default is bicubic; this is bilinear (identity when the
+    // source is already at the target size, so a pre-resized Src is exact).
+    if (Src.SizeX <> ResizeShorterSide) or (Src.SizeY <> ResizeShorterSide) then
+    begin
+      if Src.SizeX <= Src.SizeY then
+      begin
+        Scale := ResizeShorterSide / Src.SizeX;
+        ResizeW := ResizeShorterSide;
+        ResizeH := Round(Src.SizeY * Scale);
+      end
+      else
+      begin
+        Scale := ResizeShorterSide / Src.SizeY;
+        ResizeH := ResizeShorterSide;
+        ResizeW := Round(Src.SizeX * Scale);
+      end;
+      if ResizeW < 1 then ResizeW := 1;
+      if ResizeH < 1 then ResizeH := 1;
+      Work.ReSize(ResizeW, ResizeH, 3);
+      for Y := 0 to ResizeH - 1 do
+        for X := 0 to ResizeW - 1 do
+        begin
+          // bilinear sample location (align_corners = false convention)
+          Fx := (X + 0.5) * Src.SizeX / ResizeW - 0.5;
+          Fy := (Y + 0.5) * Src.SizeY / ResizeH - 0.5;
+          if Fx < 0 then Fx := 0;
+          if Fy < 0 then Fy := 0;
+          SrcX := Trunc(Fx); SrcY := Trunc(Fy);
+          if SrcX > Src.SizeX - 1 then SrcX := Src.SizeX - 1;
+          if SrcY > Src.SizeY - 1 then SrcY := Src.SizeY - 1;
+          for C := 0 to 2 do
+            Work[X, Y, C] := Src[SrcX, SrcY, C];
+        end;
+    end
+    else
+      Work.Copy(Src);
+
+    // ---- (2) center crop to (CropSize, CropSize).
+    OffX := (Work.SizeX - CropSize) div 2;
+    OffY := (Work.SizeY - CropSize) div 2;
+    Dst.ReSize(CropSize, CropSize, 3);
+    for Y := 0 to CropSize - 1 do
+      for X := 0 to CropSize - 1 do
+      begin
+        SrcX := OffX + X;
+        SrcY := OffY + Y;
+        // pad with zeros if the crop window exceeds the resized image
+        if (SrcX < 0) or (SrcY < 0) or
+           (SrcX > Work.SizeX - 1) or (SrcY > Work.SizeY - 1) then
+        begin
+          for C := 0 to 2 do Dst[X, Y, C] := 0;
+          continue;
+        end;
+        // ---- (3) rescale by 1/255 then per-channel normalize.
+        for C := 0 to 2 do
+        begin
+          V := Work[SrcX, SrcY, C] / 255.0;
+          Dst[X, Y, C] := (V - Mean[C]) / Std[C];
+        end;
+      end;
+  finally
+    Work.Free;
+  end;
+end;
+
+function LoadImageForVisionModel(const ImageFileName: string; V: TNNetVolume;
+  ResizeShorterSide, CropSize: integer;
+  const Mean, Std: array of TNeuralFloat): boolean;
+var
+  Raw: TNNetVolume;
+begin
+  Raw := TNNetVolume.Create;
+  try
+    Result := LoadImageFromFileIntoVolume(ImageFileName, Raw);
+    if Result then
+      PreprocessImageForVisionModel(Raw, V, ResizeShorterSide, CropSize,
+        Mean, Std);
+  finally
+    Raw.Free;
+  end;
+end;
+
+function ReadImagePreprocessConfig(
+  const FileName: string): TNNetImagePreprocess;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+
+  // Reads a size-like field that may be an int (square) or an object with
+  // shortest_edge / height / width. Returns the resolved edge length.
+  function ReadEdge(const FieldName: string; DefaultEdge: integer): integer;
+  var
+    Data: TJSONData;
+    O: TJSONObject;
+  begin
+    Result := DefaultEdge;
+    Data := Obj.Find(FieldName);
+    if Data = nil then Exit;
+    if Data is TJSONObject then
+    begin
+      O := TJSONObject(Data);
+      if O.IndexOfName('shortest_edge') >= 0 then
+        Result := O.Get('shortest_edge', DefaultEdge)
+      else if O.IndexOfName('height') >= 0 then
+        Result := O.Get('height', DefaultEdge)
+      else if O.IndexOfName('width') >= 0 then
+        Result := O.Get('width', DefaultEdge);
+    end
+    else if Data.JSONType = jtNumber then
+      Result := Data.AsInteger;
+  end;
+
+  procedure ReadTriple(const FieldName: string; var Arr: array of TNeuralFloat;
+    D0, D1, D2: TNeuralFloat);
+  var
+    Data: TJSONData;
+    A: TJSONArray;
+  begin
+    Arr[0] := D0; Arr[1] := D1; Arr[2] := D2;
+    Data := Obj.Find(FieldName);
+    if (Data <> nil) and (Data is TJSONArray) then
+    begin
+      A := TJSONArray(Data);
+      if A.Count >= 3 then
+      begin
+        Arr[0] := A.Items[0].AsFloat;
+        Arr[1] := A.Items[1].AsFloat;
+        Arr[2] := A.Items[2].AsFloat;
+      end;
+    end;
+  end;
+
+begin
+  if not FileExists(FileName) then
+    raise Exception.Create(
+      'ReadImagePreprocessConfig: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        raise Exception.Create('ReadImagePreprocessConfig: config "' +
+          FileName + '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      raise Exception.Create('ReadImagePreprocessConfig: config "' +
+        FileName + '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+
+    Result.ResizeShorterSide := ReadEdge('size', 224);
+    Result.CropSize := ReadEdge('crop_size', Result.ResizeShorterSide);
+    // Defaults follow CLIPImageProcessor (the OpenAI image_mean/image_std).
+    ReadTriple('image_mean', Result.Mean,
+      csClipMean[0], csClipMean[1], csClipMean[2]);
+    ReadTriple('image_std', Result.Std,
+      csClipStd[0], csClipStd[1], csClipStd[2]);
+  finally
+    Root.Free;
+    JsonText.Free;
   end;
 end;
 

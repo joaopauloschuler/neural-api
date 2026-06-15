@@ -1,0 +1,25 @@
+{
+ "architectures": [
+  "Mamba2ForCausalLM"
+ ],
+ "model_type": "mamba2",
+ "vocab_size": 13,
+ "hidden_size": 8,
+ "num_hidden_layers": 2,
+ "state_size": 4,
+ "num_heads": 2,
+ "head_dim": 4,
+ "n_groups": 1,
+ "expand": 1,
+ "conv_kernel": 4,
+ "chunk_size": 8,
+ "use_bias": false,
+ "use_conv_bias": true,
+ "layer_norm_epsilon": 1e-05,
+ "rms_norm": true,
+ "tie_word_embeddings": true,
+ "use_cache": true,
+ "bos_token_id": 0,
+ "eos_token_id": 0,
+ "pad_token_id": 0
+}

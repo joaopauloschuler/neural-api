@@ -6,10 +6,13 @@ interface
 
 uses
   Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume,
-  neuralabfun;
+  neuralabfun, neuraldecode;
 
 type
   TTestNeuralNumerical = class(TTestCase)
+  private
+    // Shared input+weight finite-difference check for an asymmetric kernel.
+    procedure RectangularConvGradientCheckXY(pFeatureSizeX, pFeatureSizeY: integer; const ALabel: string);
   published
     // Convolution numerical tests with known weights
     procedure TestConvolutionNumericalValues;
@@ -88,6 +91,7 @@ type
     procedure TestTanhNumericalRange;
     procedure TestSwishNumericalValues;
     procedure TestHardSwishNumericalValues;
+    procedure TestHardSigmoidNumericalValues;
     procedure TestGELUNumericalValues;
     procedure TestMishNumericalValues;
     procedure TestSoftPlusNumericalValues;
@@ -101,6 +105,7 @@ type
     procedure TestSwishGradientCheck;
     procedure TestSwish6GradientCheck;
     procedure TestHardSwishGradientCheck;
+    procedure TestHardSigmoidGradientCheck;
     procedure TestSELUGradientCheck;
     procedure TestLeakyReLUGradientCheck;
     procedure TestVeryLeakyReLUGradientCheck;
@@ -134,6 +139,10 @@ type
     procedure TestWeightStandardizationConvForward;
     procedure TestWeightStandardizationConvGradientCheck;
     procedure TestWeightStandardizationConvSerializationRoundTrip;
+    procedure TestRectangularConvForwardShape;
+    procedure TestRectangularConv1x3GradientCheck;
+    procedure TestRectangularConv3x1GradientCheck;
+    procedure TestRectangularConvSerializationRoundTrip;
     procedure TestWeightNormLinearForward;
     procedure TestWeightNormLinearGradientCheck;
     procedure TestWeightNormLinearSerializationRoundTrip;
@@ -351,6 +360,8 @@ type
     procedure TestMLPMixerBlockLoadFromString;
     // AddLoRAAdapter builder (low-rank residual bypass over a frozen projection)
     procedure TestLoRAAdapterSmoke;
+    // MergeLoRA: folding the trained B*A bypass into the frozen base weights
+    procedure TestMergeLoRAEqualsAdapter;
     procedure TestSwitchableNormForward;
     procedure TestSwitchableNormGradientCheck;
     procedure TestSwitchableNormSerializationRoundTrip;
@@ -416,6 +427,10 @@ type
     procedure TestSelectiveSSMDStateInputGradientCheck;
     procedure TestSelectiveSSMDStateWeightGradientCheck;
     procedure TestSelectiveSSMDStateSerializationRoundTrip;
+    procedure TestSelectiveSSMIncrementalDecodeEquivalence;
+    procedure TestMamba2InputGradientCheck;
+    procedure TestMamba2WeightGradientCheck;
+    procedure TestMamba2SerializationRoundTrip;
     procedure TestClosedFormContinuousInputGradientCheck;
     procedure TestClosedFormContinuousWeightGradientCheck;
     procedure TestClosedFormContinuousSerializationRoundTrip;
@@ -433,6 +448,10 @@ type
     procedure TestMinLSTMInputGradientCheck;
     procedure TestMinLSTMWeightGradientCheck;
     procedure TestMinLSTMSerializationRoundTrip;
+    procedure TestConvLSTMCellShapeInference;
+    procedure TestConvLSTMCellInputGradientCheck;
+    procedure TestConvLSTMCellWeightGradientCheck;
+    procedure TestConvLSTMCellSerializationRoundTrip;
     procedure TestDeltaNetShapeInference;
     procedure TestDeltaNetInputGradientCheck;
     procedure TestDeltaNetWeightGradientCheck;
@@ -470,10 +489,17 @@ type
     procedure TestWKVInputGradientCheck;
     procedure TestWKVWeightGradientCheck;
     procedure TestWKVSerializationRoundTrip;
+    procedure TestWKVIncrementalDecodeEquivalence;
+    procedure TestTokenShiftIncrementalDecodeEquivalence;
+    procedure TestRWKVBlockIncrementalDecodeEquivalence;
     procedure TestLRUShapeInference;
     procedure TestLRUInputGradientCheck;
     procedure TestLRUWeightGradientCheck;
     procedure TestLRUSerializationRoundTrip;
+    procedure TestRGLRUShapeInference;
+    procedure TestRGLRUInputGradientCheck;
+    procedure TestRGLRUWeightGradientCheck;
+    procedure TestRGLRUSerializationRoundTrip;
     procedure TestCrossWKVShapeInference;
     procedure TestCrossWKVInputGradientCheck;
     procedure TestCrossWKVWeightGradientCheck;
@@ -553,6 +579,11 @@ type
     procedure TestMultiHeadInducedSetAttentionInputGradientCheck;
     procedure TestMultiHeadAttentionPoolingBuilder;
     procedure TestMultiHeadAttentionPoolingPermutationInvariance;
+    procedure TestSoftPromptForwardShape;
+    procedure TestSoftPromptWeightGradientCheck;
+    procedure TestSoftPromptInputGradientCheck;
+    procedure TestSoftPromptSerializationRoundTrip;
+    procedure TestSoftPromptFreezeOnlyPromptTrains;
     procedure TestSABBuilderShape;
     procedure TestSABInputGradientCheck;
     procedure TestSABSerializationRoundTrip;
@@ -580,6 +611,9 @@ type
     procedure TestCausalConv1DDilatedForward;
     procedure TestCausalConv1DDilatedWeightGradientCheck;
     procedure TestCausalConv1DDilatedSerializationRoundTrip;
+    procedure TestConvolution3DInputGradientCheck;
+    procedure TestConvolution3DWeightGradientCheck;
+    procedure TestConvolution3DSerializationRoundTrip;
     procedure TestDepthwiseConv1DInputGradientCheck;
     procedure TestDepthwiseConv1DWeightGradientCheck;
     procedure TestDepthwiseConv1DSerializationRoundTrip;
@@ -633,6 +667,11 @@ type
     procedure TestNLLLossGradient;
     procedure TestNLLLossLogSoftMaxCrossEntropyConsistency;
     procedure TestNLLLossLoadFromString;
+    procedure TestCTCLossForwardPassthrough;
+    procedure TestCTCLossGradient;
+    procedure TestCTCLossLoadFromString;
+    procedure TestCTCDecodeGreedyRoundTrip;
+    procedure TestCTCDecodeBeamSearch;
     procedure TestKLDivergenceForwardPassthrough;
     procedure TestKLDivergenceGradient;
     procedure TestKLDivergenceLoadFromString;
@@ -669,6 +708,7 @@ type
     procedure TestCenterLossCenterGradient;
     procedure TestCenterLossLoadFromString;
     procedure TestVectorQuantizerForward;
+    procedure TestVectorQuantizerChosenCodeIndex;
     procedure TestVectorQuantizerLoadFromString;
     procedure TestVectorQuantizerCommitmentGradient;
     procedure TestVectorQuantizerCodebookGradient;
@@ -710,6 +750,10 @@ type
     procedure TestGEGLUGradientCheck;
     procedure TestSwiGLUForward;
     procedure TestSwiGLUGradientCheck;
+    procedure TestGptOssGatedSwiGLUForward;
+    procedure TestGptOssGatedSwiGLUClamping;
+    procedure TestGptOssGatedSwiGLUGradientCheck;
+    procedure TestGptOssGatedSwiGLULoadFromString;
     procedure TestGLUForward;
     procedure TestGLUGradientCheck;
     procedure TestTanhGLUForward;
@@ -816,6 +860,8 @@ type
     procedure TestT5RelPosBiasAttentionGradientCheck;
     procedure TestT5RelPosBiasAttentionZeroBiasMatchesSDPA;
     procedure TestT5RelPosBiasAttentionSerializationRoundTrip;
+    procedure TestDisentangledAttentionGradientCheck;
+    procedure TestDisentangledAttentionSerializationRoundTrip;
     procedure TestALiBiSlopeMatchesReference;
     procedure TestALiBiAttentionGradientCheck;
     procedure TestALiBiAttentionZeroSlopeMatchesSDPA;
@@ -824,6 +870,9 @@ type
     procedure TestSinkAttentionGradientCheck;
     procedure TestSinkAttentionSinkParamGradientCheck;
     procedure TestSinkAttentionSerializationRoundTrip;
+    procedure TestGptOssSinkAttentionForward;
+    procedure TestGptOssSinkAttentionGradientCheck;
+    procedure TestGptOssSinkAttentionSerializationRoundTrip;
     procedure TestDifferentialAttentionLambdaZeroDegeneracy;
     procedure TestDifferentialAttentionGradientCheck;
     procedure TestDifferentialAttentionLambdaGradientCheck;
@@ -868,6 +917,10 @@ type
     procedure TestSoftCappingExtremeInputSaturation;
     procedure TestSoftCappingSerializationRoundTrip;
     procedure TestDropPathSerializationRoundTrip;
+    procedure TestNEFTuneInferenceIdentity;
+    procedure TestNEFTuneTrainingNoiseBounded;
+    procedure TestNEFTuneGradientPassThrough;
+    procedure TestNEFTuneSerializationRoundTrip;
     procedure TestRotaryEmbeddingSerializationRoundTrip;
     procedure TestMaskedFillSerializationRoundTrip;
     procedure TestScaledDotProductAttentionSerializationRoundTrip;
@@ -890,6 +943,14 @@ type
     procedure TestAffineGridSampleSourceGradientCheck;
     procedure TestAffineGridSampleThetaGradientCheck;
     procedure TestAffineGridSampleLoadFromString;
+    // TNNetFlowWarp dense per-pixel (dx,dy) backward-warp sampler
+    procedure TestFlowWarpFeatureGradientCheck;
+    procedure TestFlowWarpFlowGradientCheck;
+    procedure TestFlowWarpLoadFromString;
+    procedure TestAdaINForwardStatistics;
+    procedure TestAdaINContentGradientCheck;
+    procedure TestAdaINStyleGradientCheck;
+    procedure TestAdaINLoadFromString;
     procedure TestHyperLinearMainInputGradientCheck;
     procedure TestHyperLinearGeneratedWeightsGradientCheck;
     procedure TestHyperLinearLoadFromString;
@@ -898,6 +959,11 @@ type
     procedure TestHyperConvGeneratedKernelGradientCheck;
     procedure TestHyperConvLoadFromString;
     procedure TestAddHyperConvBuilder;
+    procedure TestModulatedConv2DMainInputGradientCheck;
+    procedure TestModulatedConv2DWeightGradientCheck;
+    procedure TestModulatedConv2DStyleGradientCheck;
+    procedure TestModulatedConv2DNoDemodWeightGradientCheck;
+    procedure TestModulatedConv2DLoadFromString;
     procedure TestScatterToAffineForwardAndShearZero;
     procedure TestScatterToAffineInputGradientCheck;
     procedure TestScatterToAffineLoadFromString;
@@ -915,6 +981,9 @@ type
     procedure TestTransformerEncoderBlockCustomNorm;
     procedure TestSlidingWindowAttentionLocality;
     procedure TestSlidingWindowAttentionSaveLoad;
+    procedure TestSegmentMaskCrossDocAttentionIsZero;
+    procedure TestSegmentMaskMatchesUnpackedBaseline;
+    procedure TestSegmentMaskSaveLoad;
     procedure TestAlternatingLocalGlobalBlocksPattern;
     procedure TestAlternatingLocalGlobalBlocksGradFlow;
     procedure TestParallelTransformerBlockShapeAndGradFlow;
@@ -1184,6 +1253,7 @@ type
     procedure TestCopyToChannelsNumerical;
     procedure TestSEBlockShapeAndForward;
     procedure TestCBAMShapeForwardAndGradFlow;
+    procedure TestUNetDimsChannelsSkipsAndGradFlow;
     procedure TestConfusionMatrixReportArithmetic;
     procedure TestGradientNormReportSmoke;
     procedure TestPerplexityReportSmoke;
@@ -1926,6 +1996,37 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestHardSigmoidNumericalValues;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(5));
+    NN.AddLayer(TNNetHardSigmoid.Create());
+
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := 3.0;
+    Input.Raw[2] := -3.0;
+    Input.Raw[3] := 6.0;
+    Input.Raw[4] := -6.0;
+
+    NN.Compute(Input);
+
+    // HardSigmoid(x) = clamp((x + 3) / 6, 0, 1)
+    AssertEquals('HardSigmoid(0) = 0.5', 0.5, NN.GetLastLayer.Output.Raw[0], 0.001);
+    AssertEquals('HardSigmoid(3) = 1', 1.0, NN.GetLastLayer.Output.Raw[1], 0.001);
+    AssertEquals('HardSigmoid(-3) = 0', 0.0, NN.GetLastLayer.Output.Raw[2], 0.001);
+    AssertEquals('HardSigmoid(6) saturates at 1', 1.0, NN.GetLastLayer.Output.Raw[3], 0.001);
+    AssertEquals('HardSigmoid(-6) saturates at 0', 0.0, NN.GetLastLayer.Output.Raw[4], 0.001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestGELUNumericalValues;
 var
   NN: TNNet;
@@ -2228,6 +2329,13 @@ begin
   // Avoid the non-differentiable kinks at x = -3 and x = 3.
   ActivationGradientCheck(Self, TNNetHardSwish.Create(), 'HardSwish',
     [0.5, -0.5, 1.0, -2.0, 2.0, 4.0], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestHardSigmoidGradientCheck;
+begin
+  // Avoid the non-differentiable kinks at x = -3 and x = 3 (slope 1/6 between).
+  ActivationGradientCheck(Self, TNNetHardSigmoid.Create(), 'HardSigmoid',
+    [0.5, -0.5, 1.0, -2.0, 2.0], 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestSoftPlusGradientCheck;
@@ -4607,6 +4715,105 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestMergeLoRAEqualsAdapter;
+const
+  cSeqLen = 3;
+  cDModel = 5;
+  cRank   = 2;
+  cAlpha  = 4.0;
+var
+  AdaptNN, MergeNN: TNNet;
+  Input, Desired: TNNetVolume;
+  FrozenA, Adapted, Down, Up: TNNetLayer;
+  FrozenM, BaseOut: TNNetLayer;
+  DownM, UpM: TNNetLayer;
+  i, n, w: integer;
+  maxDiff, dlt: TNeuralFloat;
+begin
+  // Project memory: tests share one RNG; reseed so this test does not perturb
+  // an unrelated ordering-sensitive check downstream.
+  RandSeed := 424242;
+  Input   := TNNetVolume.Create(cSeqLen, 1, cDModel, 1);
+  Desired := TNNetVolume.Create(cSeqLen, 1, cDModel);
+  // Two nets: AdaptNN keeps the live LoRA bypass; MergeNN has the SAME base +
+  // adapter weights folded into its base via MergeLoRA. After the merge a
+  // forward through MergeNN's base alone must equal AdaptNN's adapter (Sum)
+  // output, proving the fold is exact (zero-overhead inference).
+  AdaptNN := TNNet.Create();
+  MergeNN := TNNet.Create();
+  try
+    // --- adapter net: input -> frozen base -> LoRA adapter ---
+    AdaptNN.AddLayer(TNNetInput.Create(cSeqLen, 1, cDModel, 1));
+    FrozenA := AdaptNN.AddLayer(TNNetPointwiseConvLinear.Create(cDModel));
+    Adapted := AdaptNN.AddLoRAAdapter(FrozenA, cRank, cAlpha);
+    Down := AdaptNN.Layers[FrozenA.LayerIdx + 1];
+    Up   := AdaptNN.Layers[FrozenA.LayerIdx + 2];
+
+    // --- merge net: input -> base (will absorb the bypass) ---
+    MergeNN.AddLayer(TNNetInput.Create(cSeqLen, 1, cDModel, 1));
+    BaseOut := MergeNN.AddLayer(TNNetPointwiseConvLinear.Create(cDModel));
+    FrozenM := BaseOut;
+    // Mirror base weights from the adapter net so both start identical.
+    FrozenM.CopyWeights(FrozenA);
+
+    // A modest LR keeps the trained weights O(1): a merged-vs-live forward at
+    // huge weight magnitudes would diverge by float ASSOCIATIVITY alone
+    // ((B*A)*x vs B*(A*x)), which is not a merge bug, so train gently.
+    AdaptNN.SetLearningRate(0.02, 0.0);
+    FrozenA.LearningRate := 0.0; // freeze the base; only A/B train
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 1.1 - 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4);
+
+    // Train the bypass so B leaves its zero-init and the merge is non-trivial.
+    AdaptNN.SetBatchUpdate(false);
+    for i := 1 to 25 do
+    begin
+      AdaptNN.Compute(Input);
+      AdaptNN.Backpropagate(Desired);
+    end;
+
+    // Build a separate A/B reference in the merge net's space is unnecessary:
+    // MergeLoRA folds DIRECTLY from the trained adapter-net A/B layers into the
+    // merge-net base (same shapes), scaled by Alpha/Rank.
+    DownM := Down;
+    UpM   := Up;
+    MergeNN.MergeLoRA(FrozenM, DownM, UpM, cAlpha);
+
+    // Sanity: the trained B must have moved off zero (else the merge is vacuous).
+    dlt := 0;
+    for n := 0 to Up.Neurons.Count - 1 do
+      for w := 0 to Up.Neurons[n].Weights.Size - 1 do
+        dlt := Max(dlt, Abs(Up.Neurons[n].Weights.Raw[w]));
+    AssertTrue('MergeLoRA: B (up) trained off zero before merge (max |B|=' +
+      FloatToStr(dlt) + ')', dlt > 1e-4);
+
+    // Forward both nets on a fresh probe and compare merged-base vs adapter-Sum.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Cos(i * 0.9) * 0.8 + 0.2;
+    AdaptNN.Compute(Input);
+    MergeNN.Compute(Input);
+
+    AssertEquals('MergeLoRA output Size', Adapted.Output.Size,
+      BaseOut.Output.Size);
+    maxDiff := 0;
+    for i := 0 to Adapted.Output.Size - 1 do
+    begin
+      dlt := Abs(BaseOut.Output.Raw[i] - Adapted.Output.Raw[i]);
+      if dlt > maxDiff then maxDiff := dlt;
+    end;
+    AssertTrue('MergeLoRA: merged base == adapter forward < 1e-5 (got ' +
+      FloatToStr(maxDiff) + ')', maxDiff < 1e-5);
+  finally
+    AdaptNN.Free;
+    MergeNN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestRMSNormGatedForward;
 var
   NN: TNNet;
@@ -6610,6 +6817,103 @@ begin
       GradSumAbs := GradSumAbs + Abs(OutVal);
     end;
     AssertTrue('CBAM produces non-zero input gradient flow', GradSumAbs > 1e-8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestUNetDimsChannelsSkipsAndGradFlow;
+const
+  W = 16; H = 16; C = 1; Depth = 2; Base = 4; OutCh = 3;
+var
+  NN: TNNet;
+  InputLayer, UOut: TNNetLayer;
+  Input, Desired: TNNetVolume;
+  Taps: TNeuralIntegerArray;
+  Idx, Stage, ConcatHits, LayerI: integer;
+  OutVal, GradSumAbs: TNeuralFloat;
+  Concat: TNNetConcatBase;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(W, H, C);
+  Desired := TNNetVolume.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(W, H, C, 1));
+    UOut := NN.AddUNet(Depth, Base, OutCh, Taps);
+
+    // Defining U-Net property: output spatial dims equal input spatial dims.
+    AssertEquals('U-Net output SizeX equals input', W, UOut.Output.SizeX);
+    AssertEquals('U-Net output SizeY equals input', H, UOut.Output.SizeY);
+    // Head produces the requested number of output channels.
+    AssertEquals('U-Net output Depth equals OutputChannels', OutCh, UOut.Output.Depth);
+
+    // Skip wiring: one tap per encoder stage, every tap index valid.
+    AssertEquals('U-Net returns one tap per encoder stage', Depth, Length(Taps));
+    for Stage := 0 to Depth - 1 do
+    begin
+      AssertTrue('tap index in range (low)', Taps[Stage] >= 0);
+      AssertTrue('tap index in range (high)', Taps[Stage] < NN.CountLayers());
+      // The recorded tap must have the spatial size of its resolution
+      // (W shrinks by 2 per stage) and feature count Base*2^stage.
+      AssertEquals('tap SizeX at stage', W shr Stage,
+        NN.Layers[Taps[Stage]].Output.SizeX);
+      AssertEquals('tap Depth at stage', Base shl Stage,
+        NN.Layers[Taps[Stage]].Output.Depth);
+    end;
+
+    // Skip wiring: there must be exactly Depth concat layers, and each encoder
+    // tap index must appear as an input to one of them. The concat serialized
+    // structure encodes its input layer indices, so the full net structure
+    // string is searched for each tap index in a concat context.
+    ConcatHits := 0;
+    for LayerI := 0 to NN.CountLayers() - 1 do
+      if NN.Layers[LayerI] is TNNetConcatBase then
+      begin
+        Concat := TNNetConcatBase(NN.Layers[LayerI]);
+        // A concat's serialized inputs include the tap index. Its output depth
+        // must exceed any single tap's depth (i.e. it really concatenated the
+        // skip onto the upsampled path), confirming the skip is consumed.
+        for Stage := 0 to Depth - 1 do
+          if (Pos(':' + IntToStr(Taps[Stage]) + ':', Concat.SaveStructureToString()) > 0) or
+             (Pos(':' + IntToStr(Taps[Stage]) + ';', Concat.SaveStructureToString()) > 0) or
+             (Pos(';' + IntToStr(Taps[Stage]) + ':', Concat.SaveStructureToString()) > 0) then
+            Inc(ConcatHits);
+      end;
+    AssertEquals('every encoder tap is consumed by a concat skip', Depth, ConcatHits);
+
+    // Forward must be finite everywhere.
+    for Idx := 0 to Input.Size - 1 do
+      Input.FData[Idx] := (Random - 0.5) * 2.0;
+    NN.Compute(Input);
+    for Idx := 0 to UOut.Output.Size - 1 do
+    begin
+      OutVal := UOut.Output.FData[Idx];
+      AssertFalse('U-Net output contains NaN', IsNaN(OutVal));
+      AssertFalse('U-Net output contains Inf', IsInfinite(OutVal));
+    end;
+
+    // Clean backward pass with finite, non-trivial input-gradient flow.
+    Desired.ReSize(UOut.Output);
+    for Idx := 0 to Desired.Size - 1 do
+      Desired.FData[Idx] := Cos(Idx * 0.5);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    NN.Compute(Input);
+    InputLayer.OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+
+    GradSumAbs := 0;
+    for Idx := 0 to InputLayer.OutputError.Size - 1 do
+    begin
+      OutVal := InputLayer.OutputError.FData[Idx];
+      AssertFalse('U-Net input gradient contains NaN', IsNaN(OutVal));
+      AssertFalse('U-Net input gradient contains Inf', IsInfinite(OutVal));
+      GradSumAbs := GradSumAbs + Abs(OutVal);
+    end;
+    AssertTrue('U-Net produces non-zero input gradient flow', GradSumAbs > 1e-8);
   finally
     NN.Free;
     Input.Free;
@@ -8714,6 +9018,212 @@ end;
 procedure TTestNeuralNumerical.TestSwiGLUGradientCheck;
 begin
   LayerInputGradientCheck(Self, TNNetSwiGLU.Create(), 'SwiGLU', 2, 2, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestGptOssGatedSwiGLUForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  gate, up, glu, expected: TNeuralFloat;
+  alpha: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  alpha := 1.702;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetGptOssGatedSwiGLU.Create()); // alpha=1.702, limit=7
+
+    // Interleaved layout: gate = even channels, up = odd channels.
+    Input.Raw[0] := 1.0;   // gate[0]
+    Input.Raw[1] := 0.5;   // up[0]
+    Input.Raw[2] := -2.0;  // gate[1]
+    Input.Raw[3] := -1.0;  // up[1]
+
+    NN.Compute(Input);
+
+    AssertEquals('GptOssGatedSwiGLU output depth = input depth / 2', 2,
+      NN.GetLastLayer.Output.Depth);
+
+    // out = (up+1) * gate * sigmoid(alpha*gate)
+    gate := 1.0; up := 0.5;
+    glu := gate * (1 / (1 + Exp(-alpha * gate)));
+    expected := (up + 1) * glu;
+    AssertEquals('GptOssGatedSwiGLU out[0]', expected,
+      NN.GetLastLayer.Output.Raw[0], 0.0001);
+
+    gate := -2.0; up := -1.0;
+    glu := gate * (1 / (1 + Exp(-alpha * gate)));
+    expected := (up + 1) * glu;
+    AssertEquals('GptOssGatedSwiGLU out[1]', expected,
+      NN.GetLastLayer.Output.Raw[1], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGptOssGatedSwiGLUClamping;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  gate, up, glu, expected: TNeuralFloat;
+  alpha, limit: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  alpha := 1.702;
+  limit := 3.0;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetGptOssGatedSwiGLU.Create(alpha, limit));
+
+    // gate above limit -> clamped to +limit (upper-clamp only).
+    // up below -limit -> clamped to -limit.
+    Input.Raw[0] := 10.0;   // gate[0] -> clamps to 3
+    Input.Raw[1] := -8.0;   // up[0]   -> clamps to -3
+    // gate very negative -> NOT lower-clamped (min=None);
+    // up above limit -> clamps to +limit.
+    Input.Raw[2] := -10.0;  // gate[1] -> stays -10
+    Input.Raw[3] := 9.0;    // up[1]   -> clamps to 3
+
+    NN.Compute(Input);
+
+    gate := 3.0; up := -3.0;        // both clamped
+    glu := gate * (1 / (1 + Exp(-alpha * gate)));
+    expected := (up + 1) * glu;
+    AssertEquals('GptOssGatedSwiGLU clamp out[0]', expected,
+      NN.GetLastLayer.Output.Raw[0], 0.0001);
+
+    gate := -10.0; up := 3.0;       // gate unclamped, up clamped to +limit
+    glu := gate * (1 / (1 + Exp(-alpha * gate)));
+    expected := (up + 1) * glu;
+    AssertEquals('GptOssGatedSwiGLU clamp out[1]', expected,
+      NN.GetLastLayer.Output.Raw[1], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGptOssGatedSwiGLUGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Bespoke gradient check. The shared LayerInputGradientCheck seeds inputs in
+  // ~[-1.7, 2.3]; with the (up+1)*gate*sigmoid(alpha*gate) gating a gate near
+  // 2.3 produces an output near 7, and the resulting large squared-loss terms
+  // wreck the single-precision finite-difference by catastrophic cancellation
+  // (the analytic gradient is exact - verified against a double-precision
+  // oracle). Keeping every input small (|x| < ~0.4) keeps every output small
+  // so the FD is well-conditioned, and stays strictly inside the limit=7 clamp
+  // band so the activation is smooth everywhere.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  InputPlus := TNNetVolume.Create(2, 2, 4);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    NN.AddLayer(TNNetGptOssGatedSwiGLU.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.3;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('GptOssGatedSwiGLU input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGptOssGatedSwiGLULoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // Round-trip non-default alpha=1.5, limit=5.0 (FFloatSt[0], FFloatSt[1])
+  // through both dispatch points.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetGptOssGatedSwiGLU.Create(1.5, 5.0));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('GptOssGatedSwiGLU round-trip class identity',
+        NN2.GetLastLayer is TNNetGptOssGatedSwiGLU);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('GptOssGatedSwiGLU SaveToString round-trip equality',
+        Saved, Saved2);
+
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('GptOssGatedSwiGLU round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestGLUForward;
@@ -12497,6 +13007,196 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestGptOssSinkAttentionForward;
+// Forward reference for a causal TNNetGptOssSinkAttention (d_k=4, SeqLen=3):
+// the per-head sink logit s enters the softmax DENOMINATOR only and the sink
+// contributes NOTHING to the output. Compared against a by-hand reference that
+// matches transformers' gpt_oss eager_attention_forward (cat([scores, sink]),
+// softmax, drop the sink column).
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Attn: TNNetGptOssSinkAttention;
+  SeqLen, Dk, i, j, d: integer;
+  InvSqrtDk, MaxScore, SumExp, sc, Sink: TNeuralFloat;
+  Score, Wgt: array of TNeuralFloat;
+  Ref: TNeuralFloat;
+begin
+  SeqLen := 3;
+  Dk := 4;
+  InvSqrtDk := 1.0 / Sqrt(Dk);
+  Sink := 0.6;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  SetLength(Score, SeqLen);
+  SetLength(Wgt, SeqLen);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetGptOssSinkAttention.Create(Dk, true, 0);
+    NN.AddLayer(Attn);
+    Attn.SetSinkLogit(Sink);
+    for i := 0 to SeqLen - 1 do
+      for d := 0 to Dk - 1 do
+      begin
+        Input[i, 0, d] := Sin(i * 0.7 + d * 0.3) + 0.5;        // Q
+        Input[i, 0, Dk + d] := Cos(i * 0.4 - d * 0.6) - 0.3;   // K
+        Input[i, 0, 2 * Dk + d] := i * 1.0 + 0.1 * d;          // V
+      end;
+    NN.Compute(Input);
+    AssertEquals('GptOssSink sink logit round-trips', Sink, Attn.SinkLogit(),
+      1e-6);
+    for i := 0 to SeqLen - 1 do
+    begin
+      MaxScore := Sink;
+      for j := 0 to SeqLen - 1 do
+      begin
+        if j > i then Score[j] := -1e30
+        else
+        begin
+          sc := 0;
+          for d := 0 to Dk - 1 do sc := sc + Input[i, 0, d] * Input[j, 0, Dk + d];
+          Score[j] := sc * InvSqrtDk;
+        end;
+        if Score[j] > MaxScore then MaxScore := Score[j];
+      end;
+      SumExp := Exp(Sink - MaxScore); // sink in the denominator only
+      for j := 0 to SeqLen - 1 do
+      begin
+        if j > i then Wgt[j] := 0 else Wgt[j] := Exp(Score[j] - MaxScore);
+        SumExp := SumExp + Wgt[j];
+      end;
+      for j := 0 to SeqLen - 1 do Wgt[j] := Wgt[j] / SumExp;
+      for d := 0 to Dk - 1 do
+      begin
+        Ref := 0;
+        for j := 0 to SeqLen - 1 do Ref := Ref + Wgt[j] * Input[j, 0, 2 * Dk + d];
+        AssertEquals('GptOssSink out[' + IntToStr(i) + ',' + IntToStr(d) + ']',
+          Ref, Attn.Output[i, 0, d], 1e-5);
+      end;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGptOssSinkAttentionGradientCheck;
+// Central-difference check of BOTH the input gradient (dL/dInput) AND the
+// trainable sink-logit gradient of a causal TNNetGptOssSinkAttention
+// (d_k=4, SeqLen=3) with a non-zero sink.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Attn: TNNetGptOssSinkAttention;
+  SeqLen, Dk: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  SeqLen := 3;
+  Dk := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetGptOssSinkAttention.Create(Dk, true, 0);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    Attn.SetSinkLogit(0.4);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.41) * 0.8 - 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.27) * 0.5;
+
+    // --- input gradient ---
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      AssertTrue('GptOssSink input gradient at ' + IntToStr(i) + ' num=' +
+        FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // --- sink-logit gradient (analytical = -Neuron.Delta) ---
+    Attn.Neurons[0].Weights.Raw[0] := Attn.Neurons[0].Weights.Raw[0] + epsilon;
+    lossPlus := ComputeLoss(Input);
+    Attn.Neurons[0].Weights.Raw[0] := Attn.Neurons[0].Weights.Raw[0] - 2 * epsilon;
+    lossMinus := ComputeLoss(Input);
+    Attn.Neurons[0].Weights.Raw[0] := Attn.Neurons[0].Weights.Raw[0] + epsilon;
+    numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+    NN.Compute(Input);
+    Attn.Neurons[0].ClearDelta;
+    NN.Backpropagate(Desired);
+    analyticalGrad := -Attn.Neurons[0].Delta.Raw[0];
+    AssertTrue('GptOssSink sink-logit gradient num=' + FloatToStr(numericalGrad) +
+      ' ana=' + FloatToStr(analyticalGrad),
+      Abs(numericalGrad - analyticalGrad) < 0.01);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGptOssSinkAttentionSerializationRoundTrip;
+// save -> load -> save string equality with a non-default sink logit and a
+// sliding window (d_k=4, causal=true, window=2).
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Attn: TNNetGptOssSinkAttention;
+  Saved, Saved2: string;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 12);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 12, 1));
+    Attn := TNNetGptOssSinkAttention.Create(4, true, 2);
+    NN.AddLayer(Attn);
+    AssertEquals('GptOssSink neuron count', 1, Attn.Neurons.Count);
+    AssertEquals('GptOssSink window', 2, Attn.Window);
+    Attn.SetSinkLogit(1.234);
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('GptOssSink save->load->save string equality', Saved, Saved2);
+      AssertEquals('GptOssSink sink logit survives round-trip', 1.234,
+        TNNetGptOssSinkAttention(NN2.Layers[1]).SinkLogit(), 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestDifferentialAttentionLambdaZeroDegeneracy;
 // With lambda=0 the second (noise) softmax map is fully cancelled, so the
 // output must equal map 1 alone: softmax(Q1.K1^T / sqrt(d_k/2)) . V, with Q1/K1
@@ -14028,6 +14728,180 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestNEFTuneInferenceIdentity;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // Shape (SeqLen=4, 1, EmbDim=3): L on SizeX, d on Depth.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    NN.AddLayer(TNNetNEFTune.Create(5.0));
+    NN.EnableDropouts(false); // inference => pure pass-through.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+    // Bit-for-bit identity at inference.
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('NEFTune inference is identity at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.0);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestNEFTuneTrainingNoiseBounded;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i, L, D: integer;
+  Alpha, Scale, Delta: TNeuralFloat;
+  AnyDifferent: boolean;
+begin
+  L := 4;
+  D := 3;
+  Alpha := 5.0;
+  Scale := Alpha / Sqrt(L * D);
+  AnyDifferent := false;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(L, 1, D);
+  try
+    NN.AddLayer(TNNetInput.Create(L, 1, D, 1));
+    NN.AddLayer(TNNetNEFTune.Create(Alpha));
+    NN.EnableDropouts(true); // training => noise applied.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    RandSeed := 4242;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      Delta := NN.GetLastLayer.Output.Raw[i] - Input.Raw[i];
+      if Abs(Delta) > 1e-9 then AnyDifferent := true;
+      // Per-element noise magnitude bounded by alpha/sqrt(L*d).
+      AssertTrue('NEFTune noise bounded at ' + IntToStr(i) +
+        ' (|delta|=' + FloatToStr(Abs(Delta)) + ' scale=' + FloatToStr(Scale) + ')',
+        Abs(Delta) <= Scale + 1e-6);
+    end;
+    AssertTrue('NEFTune training forward differs from clean input', AnyDifferent);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestNEFTuneGradientPassThrough;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i: integer;
+  ExpectedErr: TNeuralFloat;
+begin
+  // Noise is additive and input-independent => Jacobian is identity, so the
+  // backward pass must forward OutputError unchanged.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    NN.AddLayer(TNNetNEFTune.Create(5.0));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.EnableDropouts(true);
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0; // upstream grad = output - 0 = output.
+    RandSeed := 99;
+    NN.Compute(Input);
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    // Input-layer error must equal the (noisy) output unchanged (identity grad).
+    for i := 0 to Input.Size - 1 do
+    begin
+      ExpectedErr := NN.GetLastLayer.Output.Raw[i];
+      AssertEquals('NEFTune grad passes through at ' + IntToStr(i),
+        ExpectedErr, NN.Layers[0].OutputError.Raw[i], 1e-5);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestNEFTuneSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i, L, D: integer;
+  Alpha, Scale, Delta, MaxDelta, LooseScale: TNeuralFloat;
+begin
+  // Non-default alpha (3.5) must round-trip via FFloatSt[0]. We prove it by
+  // training-mode noise statistics on the reloaded net: with alpha=3.5 the
+  // noise bound is 3.5/sqrt(L*d); a default-alpha (5.0) reload would exceed
+  // the 3.5 bound, and a lost-alpha (0) reload would add no noise at all.
+  L := 4;
+  D := 3;
+  Alpha := 3.5;
+  Scale := Alpha / Sqrt(L * D);
+  LooseScale := 5.0 / Sqrt(L * D); // default alpha, used as a discriminating upper guard
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(L, 1, D);
+  try
+    NN.AddLayer(TNNetInput.Create(L, 1, D, 1));
+    NN.AddLayer(TNNetNEFTune.Create(Alpha));
+    NN.EnableDropouts(false);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 + 0.1;
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('NEFTune reloaded layer type',
+        NN2.Layers[1] is TNNetNEFTune);
+      // Inference identity survives the round-trip.
+      NN2.EnableDropouts(false);
+      NN2.Compute(Input);
+      for i := 0 to Input.Size - 1 do
+        AssertEquals('NEFTune reloaded inference identity at ' + IntToStr(i),
+          Input.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-7);
+      // Training noise on the reloaded net must respect the alpha=3.5 bound.
+      NN2.EnableDropouts(true);
+      RandSeed := 7;
+      MaxDelta := 0;
+      for i := 0 to 49 do
+      begin
+        NN2.Compute(Input);
+        for L := 0 to Input.Size - 1 do
+        begin
+          Delta := Abs(NN2.GetLastLayer.Output.Raw[L] - Input.Raw[L]);
+          if Delta > MaxDelta then MaxDelta := Delta;
+          AssertTrue('NEFTune reloaded noise within alpha=3.5 bound',
+            Delta <= Scale + 1e-6);
+        end;
+      end;
+      // Discriminating checks: alpha was neither lost (no noise) nor reset to
+      // the 5.0 default (which over many trials would approach LooseScale).
+      AssertTrue('NEFTune reloaded alpha not lost (noise present)',
+        MaxDelta > 1e-6);
+      AssertTrue('NEFTune reloaded alpha not the default 5.0',
+        MaxDelta < LooseScale);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestRotaryEmbeddingSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetRotaryEmbedding.Create(),
@@ -14741,6 +15615,225 @@ begin
           TNNetScaledDotProductAttention(NN.Layers[i]).Window = 0);
       end;
     AssertTrue('default encoder block has 2 SDPA heads', FoundSDPA = 2);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSegmentMaskCrossDocAttentionIsZero;
+// Per-sample block-diagonal / document-id mask in TNNetScaledDotProductAttention.
+// A packed window of SeqLen=4 holds two documents: positions {0,1} = doc 0,
+// positions {2,3} = doc 1 (segment ids [0,0,1,1]), NON-causal attention.
+// The post-softmax attention map FAttn[key, query, 0] must be EXACTLY zero for
+// every (query, key) pair that crosses the document boundary, and each query
+// row must still sum to 1 over its own document's keys.
+var
+  NN: TNNet;
+  QKVIn, SegIn, SDPALayer: TNNetLayer;
+  QKV, Seg: TNNetVolume;
+  SDPA: TNNetScaledDotProductAttention;
+  d_k, i, j, qd, kd: integer;
+begin
+  RandSeed := 424242;
+  d_k := 3;
+  NN := TNNet.Create();
+  QKV := TNNetVolume.Create(4, 1, 3 * d_k, 1);
+  Seg := TNNetVolume.Create(4, 1, 1, 1);
+  try
+    QKVIn := NN.AddLayer(TNNetInput.Create(4, 1, 3 * d_k, 1));
+    SegIn := NN.AddLayerAfter(TNNetInput.Create(4, 1, 1, 1), 0);
+    SDPALayer := NN.AddLayerAfter(
+      TNNetScaledDotProductAttention.Create(d_k, {Causal=}false, 0, 0, false,
+        SegIn), QKVIn);
+    SDPA := TNNetScaledDotProductAttention(SDPALayer);
+    // Distinct, well-separated Q/K/V so unmasked scores are clearly non-zero.
+    for i := 0 to QKV.Size - 1 do QKV.Raw[i] := Sin(i * 0.53) * 0.9 + 0.15;
+    Seg[0, 0, 0] := 0; Seg[1, 0, 0] := 0;  // doc 0
+    Seg[2, 0, 0] := 1; Seg[3, 0, 0] := 1;  // doc 1
+    QKVIn.Output.Copy(QKV);
+    SegIn.Output.Copy(Seg);
+    NN.Compute(QKVIn.Output);
+    // FAttn[key j, query i, 0] must be 0 whenever seg[i] <> seg[j].
+    for i := 0 to 3 do
+      for j := 0 to 3 do
+      begin
+        qd := Round(Seg[i, 0, 0]);
+        kd := Round(Seg[j, 0, 0]);
+        if qd <> kd then
+          AssertEquals('cross-doc attn q=' + IntToStr(i) + ' k=' + IntToStr(j) +
+            ' must be exactly zero', 0.0, SDPA.AttentionWeights[j, i, 0], 0.0);
+      end;
+    // Each query row sums to 1 over its OWN document's keys.
+    for i := 0 to 3 do
+    begin
+      qd := Round(Seg[i, 0, 0]);
+      // sum over same-doc keys
+      AssertEquals('row ' + IntToStr(i) + ' sums to 1 within its document',
+        1.0,
+        SDPA.AttentionWeights[(qd * 2), i, 0] +
+        SDPA.AttentionWeights[(qd * 2) + 1, i, 0], 1e-5);
+    end;
+  finally
+    Seg.Free;
+    QKV.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSegmentMaskMatchesUnpackedBaseline;
+// A packed window of two documents run with the per-sample segment mask must
+// produce, for every token, the SAME SDPA output as running each document
+// SEPARATELY (unpacked) through an identical SDPA layer. This is the parity
+// guarantee that block-diagonal masking == independent per-document attention.
+// Doc A = positions {0,1}, doc B = positions {2,3,4} (SeqLen=5, seg [0,0,1,1,1]).
+var
+  PackedNN, BaseNN: TNNet;
+  QKVIn, SegIn, SDPALayer: TNNetLayer;
+  QKV, Seg, DocA, DocB: TNNetVolume;
+  PackedOut: TNNetVolume;
+  d_k, i, d, p: integer;
+
+  function BuildBaseline(SeqLen: integer): TNNet;
+  begin
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * d_k, 1));
+    Result.AddLayer(TNNetScaledDotProductAttention.Create(d_k, {Causal=}true));
+  end;
+
+begin
+  RandSeed := 424242;
+  d_k := 3;
+  PackedNN := TNNet.Create();
+  QKV := TNNetVolume.Create(5, 1, 3 * d_k, 1);
+  Seg := TNNetVolume.Create(5, 1, 1, 1);
+  DocA := TNNetVolume.Create(2, 1, 3 * d_k, 1);
+  DocB := TNNetVolume.Create(3, 1, 3 * d_k, 1);
+  PackedOut := TNNetVolume.Create();
+  try
+    // Packed net: causal SDPA WITH the segment mask.
+    QKVIn := PackedNN.AddLayer(TNNetInput.Create(5, 1, 3 * d_k, 1));
+    SegIn := PackedNN.AddLayerAfter(TNNetInput.Create(5, 1, 1, 1), 0);
+    SDPALayer := PackedNN.AddLayerAfter(
+      TNNetScaledDotProductAttention.Create(d_k, {Causal=}true, 0, 0, false,
+        SegIn), QKVIn);
+    for i := 0 to QKV.Size - 1 do QKV.Raw[i] := Sin(i * 0.41) * 0.8 + 0.2;
+    Seg[0, 0, 0] := 0; Seg[1, 0, 0] := 0;
+    Seg[2, 0, 0] := 1; Seg[3, 0, 0] := 1; Seg[4, 0, 0] := 1;
+    QKVIn.Output.Copy(QKV);
+    SegIn.Output.Copy(Seg);
+    PackedNN.Compute(QKVIn.Output);
+    PackedOut.Copy(SDPALayer.Output);
+
+    // Split the SAME Q/K/V into the two per-document slabs.
+    for p := 0 to 1 do
+      for d := 0 to 3 * d_k - 1 do DocA[p, 0, d] := QKV[p, 0, d];
+    for p := 0 to 2 do
+      for d := 0 to 3 * d_k - 1 do DocB[p, 0, d] := QKV[p + 2, 0, d];
+
+    // Baseline doc A (causal, no segment mask): outputs for positions 0..1.
+    BaseNN := BuildBaseline(2);
+    try
+      BaseNN.Compute(DocA);
+      for p := 0 to 1 do
+        for d := 0 to d_k - 1 do
+          AssertEquals('doc A token ' + IntToStr(p) + ' d=' + IntToStr(d),
+            BaseNN.GetLastLayer.Output[p, 0, d], PackedOut[p, 0, d], 1e-5);
+    finally
+      BaseNN.Free;
+    end;
+
+    // Baseline doc B (causal): outputs map to packed positions 2..4.
+    BaseNN := BuildBaseline(3);
+    try
+      BaseNN.Compute(DocB);
+      for p := 0 to 2 do
+        for d := 0 to d_k - 1 do
+          AssertEquals('doc B token ' + IntToStr(p) + ' d=' + IntToStr(d),
+            BaseNN.GetLastLayer.Output[p, 0, d], PackedOut[p + 2, 0, d], 1e-5);
+    finally
+      BaseNN.Free;
+    end;
+  finally
+    PackedOut.Free;
+    DocB.Free;
+    DocA.Free;
+    Seg.Free;
+    QKV.Free;
+    PackedNN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSegmentMaskSaveLoad;
+// The optional segment-id source layer index is serialized in the layer-index
+// slot (like TNNetCrossAttention): a net with a segment-masked SDPA round-trips
+// through SaveToString -> LoadFromString with the source reconnected and an
+// identical forward output. Backward-compat is pinned separately: a plain SDPA
+// (no segment source) serializes with SegmentSource = nil.
+var
+  NN, NN2: TNNet;
+  QKVIn, SegIn, SDPALayer: TNNetLayer;
+  QKV, Seg: TNNetVolume;
+  Saved: string;
+  d_k, i, FoundSDPA, FoundWithSeg: integer;
+begin
+  RandSeed := 424242;
+  d_k := 3;
+  NN := TNNet.Create();
+  QKV := TNNetVolume.Create(4, 1, 3 * d_k, 1);
+  Seg := TNNetVolume.Create(4, 1, 1, 1);
+  try
+    QKVIn := NN.AddLayer(TNNetInput.Create(4, 1, 3 * d_k, 1));
+    SegIn := NN.AddLayerAfter(TNNetInput.Create(4, 1, 1, 1), 0);
+    SDPALayer := NN.AddLayerAfter(
+      TNNetScaledDotProductAttention.Create(d_k, {Causal=}true, 0, 0, false,
+        SegIn), QKVIn);
+    for i := 0 to QKV.Size - 1 do QKV.Raw[i] := Sin(i * 0.31) * 0.7 + 0.1;
+    Seg[0, 0, 0] := 0; Seg[1, 0, 0] := 0; Seg[2, 0, 0] := 1; Seg[3, 0, 0] := 1;
+    QKVIn.Output.Copy(QKV);
+    SegIn.Output.Copy(Seg);
+    NN.Compute(QKVIn.Output);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      FoundSDPA := 0;
+      FoundWithSeg := 0;
+      for i := 0 to NN2.CountLayers() - 1 do
+        if NN2.Layers[i].ClassType = TNNetScaledDotProductAttention then
+        begin
+          Inc(FoundSDPA);
+          if Assigned(
+            TNNetScaledDotProductAttention(NN2.Layers[i]).SegmentSource) then
+            Inc(FoundWithSeg);
+        end;
+      AssertTrue('round-trip finds the SDPA layer', FoundSDPA = 1);
+      AssertTrue('reloaded SDPA reconnected its segment source',
+        FoundWithSeg = 1);
+      // Feed the reloaded net the same inputs and compare forward output.
+      NN2.Layers[0].Output.Copy(QKV);
+      NN2.Layers[1].Output.Copy(Seg);
+      NN2.Compute(NN2.Layers[0].Output);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('round-trip forward at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    Seg.Free;
+    QKV.Free;
+    NN.Free;
+  end;
+
+  // Backward-compat: a plain SDPA (no segment source) has SegmentSource = nil.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3 * d_k, 1));
+    NN.AddLayer(TNNetScaledDotProductAttention.Create(d_k, true));
+    AssertTrue('plain SDPA has nil segment source',
+      TNNetScaledDotProductAttention(NN.GetLastLayer).SegmentSource = nil);
   finally
     NN.Free;
   end;
@@ -16750,6 +17843,500 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestFlowWarpFeatureGradientCheck;
+// Finite-difference check of d(loss)/d(features) through the dense bilinear
+// backward-warp. A non-integer per-pixel flow keeps every sample OFF the
+// integer grid, so all 4 neighbours are active and we are far from the bilinear
+// kink (sampling at an integer position is non-differentiable; we avoid it).
+var
+  NN: TNNet;
+  ImgInput, FlowInput: TNNetLayer;
+  ImgData, ImgPlus, Flow, Desired: TNNetVolume;
+  W, H, D, i, x, y: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AImg: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    ImgInput.Output.Copy(AImg);
+    FlowInput.Output.Copy(Flow);
+    NN.Compute(ImgInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  W := 5; H := 4; D := 2;
+  NN := TNNet.Create();
+  ImgData := TNNetVolume.Create(W, H, D);
+  ImgPlus := TNNetVolume.Create(W, H, D);
+  Flow := TNNetVolume.Create(W, H, 2);
+  Desired := TNNetVolume.Create(W, H, D);
+  epsilon := 0.001; maxErr := 0;
+  try
+    ImgInput  := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    FlowInput := NN.AddLayerAfter(TNNetInput.Create(W, H, 2, 1), 0);
+    NN.AddLayerAfter(TNNetFlowWarp.Create(FlowInput), ImgInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to ImgData.Size - 1 do ImgData.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31);
+    // Per-pixel flow with non-integer fractional parts. dx,dy in [-0.7,0.7] keeps
+    // sample = pixel + flow strictly between integer grid points (interior, no
+    // border saturation given the 1-pixel margins), so all 4 bilinear weights are
+    // nonzero and the central difference does not straddle a kink.
+    for y := 0 to H - 1 do
+    for x := 0 to W - 1 do
+    begin
+      Flow.Store(x, y, 0, 0.35 * Sin(0.7 * x + 1.1 * y) + 0.15);
+      Flow.Store(x, y, 1, 0.30 * Cos(0.5 * x - 0.9 * y) - 0.12);
+    end;
+
+    for i := 0 to ImgData.Size - 1 do
+    begin
+      ImgPlus.Copy(ImgData);
+      ImgPlus.Raw[i] := ImgData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(ImgPlus);
+      ImgPlus.Raw[i] := ImgData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(ImgPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ImgInput.Output.Copy(ImgData);
+      FlowInput.Output.Copy(Flow);
+      NN.Compute(ImgInput.Output);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := ImgInput.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('FlowWarp feature gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestFlowWarpFeatureGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; ImgData.Free; ImgPlus.Free; Flow.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFlowWarpFlowGradientCheck;
+// The headline gradient: finite-difference check of d(loss)/d(flow), the dense
+// per-pixel (dx,dy) field (bilinear weights are differentiable in dx,dy). The
+// flow comes from a second input branch, so its OutputError holds the
+// accumulated d(loss)/d(flow). Flow magnitudes are chosen to keep every sample
+// strictly interior and OFF the integer grid (the bilinear kink), so the central
+// difference never straddles a non-differentiable point or a border clamp.
+var
+  NN: TNNet;
+  ImgInput, FlowInput: TNNetLayer;
+  Img, FlowData, FlowPlus, Desired: TNNetVolume;
+  W, H, D, i, x, y: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AFlow: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    ImgInput.Output.Copy(Img);
+    FlowInput.Output.Copy(AFlow);
+    NN.Compute(ImgInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  W := 5; H := 4; D := 2;
+  NN := TNNet.Create();
+  Img := TNNetVolume.Create(W, H, D);
+  FlowData := TNNetVolume.Create(W, H, 2);
+  FlowPlus := TNNetVolume.Create(W, H, 2);
+  Desired := TNNetVolume.Create(W, H, D);
+  epsilon := 0.0005; maxErr := 0;
+  try
+    ImgInput  := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    FlowInput := NN.AddLayerAfter(TNNetInput.Create(W, H, 2, 1), 0);
+    NN.AddLayerAfter(TNNetFlowWarp.Create(FlowInput), ImgInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Img.Size - 1 do Img.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31);
+    // Small interior non-integer flow: keeps sample = pixel + flow off the
+    // integer grid AND inside the borders for every pixel (so neither the
+    // bilinear kink nor the border clamp is hit), giving a clean derivative.
+    for y := 0 to H - 1 do
+    for x := 0 to W - 1 do
+    begin
+      FlowData.Store(x, y, 0, 0.30 * Sin(0.6 * x + 0.8 * y) + 0.12);
+      FlowData.Store(x, y, 1, 0.25 * Cos(0.4 * x - 0.7 * y) - 0.10);
+    end;
+
+    for i := 0 to FlowData.Size - 1 do
+    begin
+      FlowPlus.Copy(FlowData);
+      FlowPlus.Raw[i] := FlowData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(FlowPlus);
+      FlowPlus.Raw[i] := FlowData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(FlowPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ImgInput.Output.Copy(Img);
+      FlowInput.Output.Copy(FlowData);
+      NN.Compute(ImgInput.Output);
+      FlowInput.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := FlowInput.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('FlowWarp flow gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestFlowWarpFlowGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; Img.Free; FlowData.Free; FlowPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFlowWarpLoadFromString;
+// Serialization round-trip: the flow source layer index (injected like
+// TNNetConcat) must survive SaveToString -> LoadFromString, and the reloaded
+// net must reproduce the forward pass bit-for-bit.
+var
+  NN, NN2: TNNet;
+  ImgInput, FlowInput: TNNetLayer;
+  Img, Flow: TNNetVolume;
+  W, H, D, i, x, y: integer;
+  Saved, Saved2: string;
+  Found: boolean;
+begin
+  RandSeed := 424242;
+  W := 5; H := 4; D := 2;
+  NN := TNNet.Create();
+  Img := TNNetVolume.Create(W, H, D);
+  Flow := TNNetVolume.Create(W, H, 2);
+  try
+    ImgInput  := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    FlowInput := NN.AddLayerAfter(TNNetInput.Create(W, H, 2, 1), 0);
+    NN.AddLayerAfter(TNNetFlowWarp.Create(FlowInput), ImgInput);
+
+    for i := 0 to Img.Size - 1 do Img.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for y := 0 to H - 1 do
+    for x := 0 to W - 1 do
+    begin
+      Flow.Store(x, y, 0, 0.30 * Sin(0.6 * x + 0.8 * y) + 0.12);
+      Flow.Store(x, y, 1, 0.25 * Cos(0.4 * x - 0.7 * y) - 0.10);
+    end;
+    ImgInput.Output.Copy(Img);
+    FlowInput.Output.Copy(Flow);
+    NN.Compute(ImgInput.Output);
+
+    Found := false;
+    for i := 0 to NN.GetLastLayerIdx do
+      if NN.Layers[i] is TNNetFlowWarp then Found := true;
+    AssertTrue('FlowWarp layer present', Found);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('FlowWarp SaveToString round-trip equality', Saved, Saved2);
+      NN2.Layers[0].Output.Copy(Img);
+      NN2.Layers[1].Output.Copy(Flow);
+      NN2.Compute(NN2.Layers[0].Output);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('FlowWarp round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Img.Free; Flow.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAdaINForwardStatistics;
+// After AdaIN the output of each channel must have the STYLE channel's mean and
+// std (the defining property of adaptive instance normalization). Content and
+// style use DIFFERENT spatial sizes to exercise the M<>N path.
+var
+  NN: TNNet;
+  ContentInput, StyleInput: TNNetLayer;
+  Content, Style: TNNetVolume;
+  CW, CH, SW, SH, D, c, x, y, n: integer;
+  outMean, outVar, styMean, styVar, v: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  CW := 4; CH := 3; SW := 5; SH := 2; D := 3;
+  NN := TNNet.Create();
+  Content := TNNetVolume.Create(CW, CH, D);
+  Style := TNNetVolume.Create(SW, SH, D);
+  try
+    ContentInput := NN.AddLayer(TNNetInput.Create(CW, CH, D, 1));
+    StyleInput   := NN.AddLayerAfter(TNNetInput.Create(SW, SH, D, 1), 0);
+    NN.AddLayerAfter(TNNetAdaIN.Create(ContentInput, StyleInput), ContentInput);
+
+    for n := 0 to Content.Size - 1 do Content.Raw[n] := Sin(n * 0.53) * 0.9 + 0.1;
+    for n := 0 to Style.Size - 1 do Style.Raw[n] := Cos(n * 0.37) * 1.7 - 0.4;
+    ContentInput.Output.Copy(Content);
+    StyleInput.Output.Copy(Style);
+    NN.Compute(ContentInput.Output);
+
+    AssertTrue('AdaIN output keeps content shape',
+      (NN.GetLastLayer.Output.SizeX = CW) and
+      (NN.GetLastLayer.Output.SizeY = CH) and
+      (NN.GetLastLayer.Output.Depth = D));
+
+    for c := 0 to D - 1 do
+    begin
+      // Style channel statistics.
+      styMean := 0;
+      for x := 0 to SW - 1 do for y := 0 to SH - 1 do styMean := styMean + Style[x, y, c];
+      styMean := styMean / (SW * SH);
+      styVar := 0;
+      for x := 0 to SW - 1 do for y := 0 to SH - 1 do styVar := styVar + Sqr(Style[x, y, c] - styMean);
+      styVar := styVar / (SW * SH);
+      // Output channel statistics.
+      outMean := 0;
+      for x := 0 to CW - 1 do for y := 0 to CH - 1 do
+        outMean := outMean + NN.GetLastLayer.Output[x, y, c];
+      outMean := outMean / (CW * CH);
+      outVar := 0;
+      for x := 0 to CW - 1 do for y := 0 to CH - 1 do
+      begin
+        v := NN.GetLastLayer.Output[x, y, c] - outMean;
+        outVar := outVar + v * v;
+      end;
+      outVar := outVar / (CW * CH);
+      AssertEquals('AdaIN output mean matches style mean (channel ' +
+        IntToStr(c) + ')', styMean, outMean, 1e-4);
+      // Output std equals style std (up to the eps in both std computations).
+      AssertTrue('AdaIN output std matches style std (channel ' + IntToStr(c) +
+        ') outvar=' + FloatToStr(outVar) + ' styvar=' + FloatToStr(styVar),
+        Abs(Sqrt(outVar) - Sqrt(styVar)) < 1e-3);
+    end;
+  finally
+    NN.Free; Content.Free; Style.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAdaINContentGradientCheck;
+// Central-difference check of d(loss)/d(content) through AdaIN (the instance-norm
+// Jacobian scaled per channel by style_std/content_std).
+var
+  NN: TNNet;
+  ContentInput, StyleInput: TNNetLayer;
+  Content, ContentPlus, Style, Desired: TNNetVolume;
+  CW, CH, SW, SH, D, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AContent: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    ContentInput.Output.Copy(AContent);
+    StyleInput.Output.Copy(Style);
+    NN.Compute(ContentInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  CW := 4; CH := 3; SW := 5; SH := 2; D := 3;
+  NN := TNNet.Create();
+  Content := TNNetVolume.Create(CW, CH, D);
+  ContentPlus := TNNetVolume.Create(CW, CH, D);
+  Style := TNNetVolume.Create(SW, SH, D);
+  Desired := TNNetVolume.Create(CW, CH, D);
+  epsilon := 0.001; maxErr := 0;
+  try
+    ContentInput := NN.AddLayer(TNNetInput.Create(CW, CH, D, 1));
+    StyleInput   := NN.AddLayerAfter(TNNetInput.Create(SW, SH, D, 1), 0);
+    NN.AddLayerAfter(TNNetAdaIN.Create(ContentInput, StyleInput), ContentInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Content.Size - 1 do Content.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Style.Size - 1 do Style.Raw[i] := Cos(i * 0.37) * 1.7 - 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to Content.Size - 1 do
+    begin
+      ContentPlus.Copy(Content);
+      ContentPlus.Raw[i] := Content.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(ContentPlus);
+      ContentPlus.Raw[i] := Content.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(ContentPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ContentInput.Output.Copy(Content);
+      StyleInput.Output.Copy(Style);
+      NN.Compute(ContentInput.Output);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Layers[1].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := ContentInput.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('AdaIN content gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestAdaINContentGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; Content.Free; ContentPlus.Free; Style.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAdaINStyleGradientCheck;
+// Central-difference check of d(loss)/d(style) through AdaIN: the style gradient
+// flows through style_mean (uniform 1/M spread) and style_std.
+var
+  NN: TNNet;
+  ContentInput, StyleInput: TNNetLayer;
+  Content, Style, StylePlus, Desired: TNNetVolume;
+  CW, CH, SW, SH, D, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AStyle: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    ContentInput.Output.Copy(Content);
+    StyleInput.Output.Copy(AStyle);
+    NN.Compute(ContentInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  CW := 4; CH := 3; SW := 5; SH := 2; D := 3;
+  NN := TNNet.Create();
+  Content := TNNetVolume.Create(CW, CH, D);
+  Style := TNNetVolume.Create(SW, SH, D);
+  StylePlus := TNNetVolume.Create(SW, SH, D);
+  Desired := TNNetVolume.Create(CW, CH, D);
+  epsilon := 0.001; maxErr := 0;
+  try
+    ContentInput := NN.AddLayer(TNNetInput.Create(CW, CH, D, 1));
+    StyleInput   := NN.AddLayerAfter(TNNetInput.Create(SW, SH, D, 1), 0);
+    NN.AddLayerAfter(TNNetAdaIN.Create(ContentInput, StyleInput), ContentInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Content.Size - 1 do Content.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Style.Size - 1 do Style.Raw[i] := Cos(i * 0.37) * 1.7 - 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to Style.Size - 1 do
+    begin
+      StylePlus.Copy(Style);
+      StylePlus.Raw[i] := Style.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(StylePlus);
+      StylePlus.Raw[i] := Style.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(StylePlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ContentInput.Output.Copy(Content);
+      StyleInput.Output.Copy(Style);
+      NN.Compute(ContentInput.Output);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Layers[1].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := StyleInput.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('AdaIN style gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestAdaINStyleGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; Content.Free; Style.Free; StylePlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAdaINLoadFromString;
+// The AdaIN style source-layer index must survive SaveToString -> LoadFromString
+// (serialized via FStruct like the other two-source layers), and the reloaded
+// net must reproduce the forward pass bit-for-bit.
+var
+  NN, NN2: TNNet;
+  ContentInput, StyleInput: TNNetLayer;
+  Content, Style: TNNetVolume;
+  CW, CH, SW, SH, D, i: integer;
+  Saved, Saved2: string;
+  FoundAdaIN: boolean;
+begin
+  RandSeed := 424242;
+  CW := 4; CH := 3; SW := 5; SH := 2; D := 3;
+  NN := TNNet.Create();
+  Content := TNNetVolume.Create(CW, CH, D);
+  Style := TNNetVolume.Create(SW, SH, D);
+  try
+    ContentInput := NN.AddLayer(TNNetInput.Create(CW, CH, D, 1));
+    StyleInput   := NN.AddLayerAfter(TNNetInput.Create(SW, SH, D, 1), 0);
+    NN.AddLayerAfter(TNNetAdaIN.Create(ContentInput, StyleInput), ContentInput);
+
+    for i := 0 to Content.Size - 1 do Content.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Style.Size - 1 do Style.Raw[i] := Cos(i * 0.37) * 1.7 - 0.4;
+    ContentInput.Output.Copy(Content);
+    StyleInput.Output.Copy(Style);
+    NN.Compute(ContentInput.Output);
+
+    FoundAdaIN := false;
+    for i := 0 to NN.GetLastLayerIdx do
+      if NN.Layers[i] is TNNetAdaIN then FoundAdaIN := true;
+    AssertTrue('AdaIN layer present', FoundAdaIN);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('AdaIN SaveToString round-trip equality', Saved, Saved2);
+
+      NN2.Layers[0].Output.Copy(Content);
+      NN2.Layers[1].Output.Copy(Style);
+      NN2.Compute(NN2.Layers[0].Output);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('AdaIN round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Content.Free; Style.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestHyperLinearMainInputGradientCheck;
 // Finite-difference check of d(loss)/d(main input) through TNNetHyperLinear,
 // whose weight matrix is supplied entirely by a SECOND input branch (the
@@ -17159,6 +18746,396 @@ begin
     end;
   finally
     NN.Free; XData.Free; WData.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// TNNetModulatedConv2D (StyleGAN2 modulated/demodulated conv) gradient checks.
+// Layer OWNS its base conv kernel (FNeurons) and reads a per-input-channel
+// style vector from a SECOND input. We finite-difference d(loss) w.r.t. (a) the
+// main image input, (b) the OWNED kernel weights through the demod
+// normalization, (c) the style vector (second source). Inputs/weights are
+// bounded small so the central-difference signal stays above the FP32
+// cancellation floor -- DO NOT loosen the tolerance.
+// ---------------------------------------------------------------------------
+
+procedure TTestNeuralNumerical.TestModulatedConv2DMainInputGradientCheck;
+var
+  NN: TNNet;
+  XInput, SInput: TNNetLayer;
+  XData, XPlus, SData, Desired: TNNetVolume;
+  SizeXY, InC, OutC, KSz, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AX: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    XInput.Output.Copy(AX);
+    SInput.Output.Copy(SData);
+    NN.Compute(XInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SizeXY := 4; InC := 2; OutC := 2; KSz := 3;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SizeXY, SizeXY, InC);
+  XPlus := TNNetVolume.Create(SizeXY, SizeXY, InC);
+  SData := TNNetVolume.Create(InC, 1, 1);
+  Desired := TNNetVolume.Create(SizeXY, SizeXY, OutC); // SAME padding keeps size
+  epsilon := 0.001; maxErr := 0;
+  try
+    XInput := NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InC, 1));
+    SInput := NN.AddLayerAfter(TNNetInput.Create(InC, 1, 1, 1), 0);
+    NN.AddLayerAfter(TNNetModulatedConv2D.Create(OutC, KSz, 0, 1, SInput), XInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to XData.Size - 1 do XData.Raw[i] := Sin(i * 0.53) * 0.6 + 0.1;
+    for i := 0 to SData.Size - 1 do SData.Raw[i] := Cos(i * 0.41) * 0.5 + 0.7;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31) * 0.5;
+
+    for i := 0 to XData.Size - 1 do
+    begin
+      XPlus.Copy(XData);
+      XPlus.Raw[i] := XData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(XPlus);
+      XPlus.Raw[i] := XData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(XPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      XInput.Output.Copy(XData);
+      SInput.Output.Copy(SData);
+      NN.Compute(XInput.Output);
+      XInput.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := XInput.OutputError.Raw[i];
+
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('ModulatedConv2D main-input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestModulatedConv2DMainInputGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; XData.Free; XPlus.Free; SData.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestModulatedConv2DWeightGradientCheck;
+// The headline gradient: d(loss)/d(OWNED base kernel) THROUGH the demodulation
+// normalization (demod=true). Read from Conv.Neurons[o].Delta (LR=1 => grad =
+// -Delta). Also covers the bias neuron (FNeurons[OutChannels]).
+var
+  NN: TNNet;
+  XInput, SInput: TNNetLayer;
+  Conv: TNNetModulatedConv2D;
+  XData, SData, Desired: TNNetVolume;
+  SizeXY, InC, OutC, KSz, o, w, tapsPerOut: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    XInput.Output.Copy(XData);
+    SInput.Output.Copy(SData);
+    NN.Compute(XInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+  procedure DoBackward();
+  begin
+    XInput.Output.Copy(XData);
+    SInput.Output.Copy(SData);
+    NN.Compute(XInput.Output);
+    NN.ClearDeltas();
+    NN.Backpropagate(Desired);
+  end;
+
+begin
+  RandSeed := 424242;
+  SizeXY := 4; InC := 2; OutC := 2; KSz := 3;
+  tapsPerOut := KSz * KSz * InC;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SizeXY, SizeXY, InC);
+  SData := TNNetVolume.Create(InC, 1, 1);
+  Desired := TNNetVolume.Create(SizeXY, SizeXY, OutC);
+  epsilon := 0.0005; maxErr := 0;
+  try
+    XInput := NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InC, 1));
+    SInput := NN.AddLayerAfter(TNNetInput.Create(InC, 1, 1, 1), 0);
+    Conv := TNNetModulatedConv2D.Create(OutC, KSz, 0, 1, SInput);
+    NN.AddLayerAfter(Conv, XInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for o := 0 to XData.Size - 1 do XData.Raw[o] := Sin(o * 0.53) * 0.6 + 0.1;
+    for o := 0 to SData.Size - 1 do SData.Raw[o] := Cos(o * 0.41) * 0.5 + 0.7;
+    // Bound the kernel small so demod is well conditioned and FD is clean.
+    for o := 0 to OutC - 1 do
+      for w := 0 to tapsPerOut - 1 do
+        Conv.Neurons[o].Weights.Raw[w] := 0.4 * Sin(o * 1.7 + w * 0.6 + 0.2);
+    for o := 0 to OutC - 1 do Conv.Neurons[OutC].Weights.Raw[o] := 0.1 * (o + 1);
+    for o := 0 to Desired.Size - 1 do Desired.Raw[o] := Cos(o * 0.31) * 0.5;
+
+    // Owned kernel weights.
+    for o := 0 to OutC - 1 do
+      for w := 0 to tapsPerOut - 1 do
+      begin
+        Conv.Neurons[o].Weights.Raw[w] := Conv.Neurons[o].Weights.Raw[w] + epsilon;
+        lossPlus := ComputeLoss();
+        Conv.Neurons[o].Weights.Raw[w] := Conv.Neurons[o].Weights.Raw[w] - 2 * epsilon;
+        lossMinus := ComputeLoss();
+        Conv.Neurons[o].Weights.Raw[w] := Conv.Neurons[o].Weights.Raw[w] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+        DoBackward();
+        analyticalGrad := -Conv.Neurons[o].Delta.Raw[w];
+        maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+        AssertTrue('ModulatedConv2D weight grad o=' + IntToStr(o) + ' w=' +
+          IntToStr(w) + ' num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad), Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    // Bias.
+    for o := 0 to OutC - 1 do
+    begin
+      Conv.Neurons[OutC].Weights.Raw[o] := Conv.Neurons[OutC].Weights.Raw[o] + epsilon;
+      lossPlus := ComputeLoss();
+      Conv.Neurons[OutC].Weights.Raw[o] := Conv.Neurons[OutC].Weights.Raw[o] - 2 * epsilon;
+      lossMinus := ComputeLoss();
+      Conv.Neurons[OutC].Weights.Raw[o] := Conv.Neurons[OutC].Weights.Raw[o] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      DoBackward();
+      analyticalGrad := -Conv.Neurons[OutC].Delta.Raw[o];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('ModulatedConv2D bias grad o=' + IntToStr(o) + ' num=' +
+        FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestModulatedConv2DWeightGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; XData.Free; SData.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestModulatedConv2DStyleGradientCheck;
+// d(loss)/d(style vector) (the SECOND source). The style scale enters the
+// modulated weights w'=s_i*w then the demod normalization, so this exercises
+// the full chain back into the style branch (= what trains the mapping/affine).
+var
+  NN: TNNet;
+  XInput, SInput: TNNetLayer;
+  XData, SData, SPlus, Desired: TNNetVolume;
+  SizeXY, InC, OutC, KSz, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AStyleV: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    XInput.Output.Copy(XData);
+    SInput.Output.Copy(AStyleV);
+    NN.Compute(XInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SizeXY := 4; InC := 3; OutC := 2; KSz := 3;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SizeXY, SizeXY, InC);
+  SData := TNNetVolume.Create(InC, 1, 1);
+  SPlus := TNNetVolume.Create(InC, 1, 1);
+  Desired := TNNetVolume.Create(SizeXY, SizeXY, OutC);
+  epsilon := 0.0005; maxErr := 0;
+  try
+    XInput := NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InC, 1));
+    SInput := NN.AddLayerAfter(TNNetInput.Create(InC, 1, 1, 1), 0);
+    NN.AddLayerAfter(TNNetModulatedConv2D.Create(OutC, KSz, 0, 1, SInput), XInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to XData.Size - 1 do XData.Raw[i] := Sin(i * 0.53) * 0.6 + 0.1;
+    for i := 0 to SData.Size - 1 do SData.Raw[i] := Cos(i * 0.41) * 0.5 + 0.7;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31) * 0.5;
+
+    for i := 0 to SData.Size - 1 do
+    begin
+      SPlus.Copy(SData);
+      SPlus.Raw[i] := SData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(SPlus);
+      SPlus.Raw[i] := SData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(SPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      XInput.Output.Copy(XData);
+      SInput.Output.Copy(SData);
+      NN.Compute(XInput.Output);
+      SInput.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := SInput.OutputError.Raw[i];
+
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('ModulatedConv2D style gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestModulatedConv2DStyleGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; XData.Free; SData.Free; SPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestModulatedConv2DNoDemodWeightGradientCheck;
+// The toRGB conv uses modulation WITHOUT demodulation (demod=0). Verify the
+// owned-kernel gradient on that simpler path (no normalization chain).
+var
+  NN: TNNet;
+  XInput, SInput: TNNetLayer;
+  Conv: TNNetModulatedConv2D;
+  XData, SData, Desired: TNNetVolume;
+  SizeXY, InC, OutC, KSz, o, w, tapsPerOut: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    XInput.Output.Copy(XData);
+    SInput.Output.Copy(SData);
+    NN.Compute(XInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+  procedure DoBackward();
+  begin
+    XInput.Output.Copy(XData);
+    SInput.Output.Copy(SData);
+    NN.Compute(XInput.Output);
+    NN.ClearDeltas();
+    NN.Backpropagate(Desired);
+  end;
+
+begin
+  RandSeed := 424242;
+  SizeXY := 4; InC := 2; OutC := 3; KSz := 1; // 1x1 toRGB-style
+  tapsPerOut := KSz * KSz * InC;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SizeXY, SizeXY, InC);
+  SData := TNNetVolume.Create(InC, 1, 1);
+  Desired := TNNetVolume.Create(SizeXY, SizeXY, OutC);
+  epsilon := 0.0005; maxErr := 0;
+  try
+    XInput := NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InC, 1));
+    SInput := NN.AddLayerAfter(TNNetInput.Create(InC, 1, 1, 1), 0);
+    Conv := TNNetModulatedConv2D.Create(OutC, KSz, 0, 0, SInput); // demod=0
+    NN.AddLayerAfter(Conv, XInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for o := 0 to XData.Size - 1 do XData.Raw[o] := Sin(o * 0.53) * 0.6 + 0.1;
+    for o := 0 to SData.Size - 1 do SData.Raw[o] := Cos(o * 0.41) * 0.5 + 0.7;
+    for o := 0 to OutC - 1 do
+      for w := 0 to tapsPerOut - 1 do
+        Conv.Neurons[o].Weights.Raw[w] := 0.4 * Sin(o * 1.7 + w * 0.6 + 0.2);
+    for o := 0 to Desired.Size - 1 do Desired.Raw[o] := Cos(o * 0.31) * 0.5;
+
+    for o := 0 to OutC - 1 do
+      for w := 0 to tapsPerOut - 1 do
+      begin
+        Conv.Neurons[o].Weights.Raw[w] := Conv.Neurons[o].Weights.Raw[w] + epsilon;
+        lossPlus := ComputeLoss();
+        Conv.Neurons[o].Weights.Raw[w] := Conv.Neurons[o].Weights.Raw[w] - 2 * epsilon;
+        lossMinus := ComputeLoss();
+        Conv.Neurons[o].Weights.Raw[w] := Conv.Neurons[o].Weights.Raw[w] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+        DoBackward();
+        analyticalGrad := -Conv.Neurons[o].Delta.Raw[w];
+        maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+        AssertTrue('ModulatedConv2D(noDemod) weight grad o=' + IntToStr(o) +
+          ' w=' + IntToStr(w) + ' num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad), Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('  TestModulatedConv2DNoDemodWeightGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; XData.Free; SData.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestModulatedConv2DLoadFromString;
+// Serialization round-trip: the style source layer index (injected like
+// TNNetConcat) and OutChannels/FeatureSize/SuppressBias/Demodulate struct
+// fields plus the OWNED kernel weights must survive SaveToString round-trip.
+var
+  NN, NN2: TNNet;
+  XInput, SInput: TNNetLayer;
+  XData, SData: TNNetVolume;
+  SizeXY, InC, OutC, KSz, i: integer;
+  Saved, Saved2: string;
+  Found: boolean;
+begin
+  RandSeed := 424242;
+  SizeXY := 4; InC := 2; OutC := 2; KSz := 3;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SizeXY, SizeXY, InC);
+  SData := TNNetVolume.Create(InC, 1, 1);
+  try
+    XInput := NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InC, 1));
+    SInput := NN.AddLayerAfter(TNNetInput.Create(InC, 1, 1, 1), 0);
+    NN.AddLayerAfter(TNNetModulatedConv2D.Create(OutC, KSz, 0, 1, SInput), XInput);
+
+    for i := 0 to XData.Size - 1 do XData.Raw[i] := Sin(i * 0.53) * 0.6 + 0.1;
+    for i := 0 to SData.Size - 1 do SData.Raw[i] := Cos(i * 0.41) * 0.5 + 0.7;
+    XInput.Output.Copy(XData);
+    SInput.Output.Copy(SData);
+    NN.Compute(XInput.Output);
+
+    Found := false;
+    for i := 0 to NN.GetLastLayerIdx do
+      if NN.Layers[i] is TNNetModulatedConv2D then Found := true;
+    AssertTrue('ModulatedConv2D layer present', Found);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('ModulatedConv2D SaveToString round-trip equality', Saved, Saved2);
+      AssertTrue('ModulatedConv2D round-trip last layer is TNNetModulatedConv2D',
+        NN2.GetLastLayer is TNNetModulatedConv2D);
+      NN2.Layers[0].Output.Copy(XData);
+      NN2.Layers[1].Output.Copy(SData);
+      NN2.Compute(NN2.Layers[0].Output);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('ModulatedConv2D round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; XData.Free; SData.Free;
   end;
 end;
 
@@ -18569,6 +20546,179 @@ begin
 
     S2 := NN2.SaveToString();
     AssertEquals('T5 save->load->save string equality', S, S2);
+  finally
+    NN.Free;
+    if Assigned(NN2) then NN2.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDisentangledAttentionGradientCheck;
+// Central-difference check of the input gradient AND both relative-position
+// table gradients (K^r in Neurons[0], Q^r in Neurons[1]) of a bidirectional
+// TNNetDisentangledAttention (d_k=4, SeqLen=6, att_span=4, pos_buckets=4,
+// max_rel=6). With learning rate 1 and batch update the analytical weight
+// gradient is -Neurons[n].Delta (Delta accumulates -lr*grad), matching the
+// sibling attention weight-grad tests. The input layer is built with the
+// 4-arg ctor (pError=1) so reads of Layers[0].OutputError are in-bounds.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Attn: TNNetDisentangledAttention;
+  SeqLen, Dk, Span, n, w: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var idx: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for idx := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[idx] - Desired.Raw[idx];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SeqLen := 6;
+  Dk := 4;
+  Span := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetDisentangledAttention.Create(Dk, {causal=}false,
+      Span, {pos_buckets=}4, {max_rel=}6);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    AssertEquals('Disentangled K^r table has 2*att_span*d_k weights',
+      2 * Span * Dk, Attn.Neurons[0].Weights.Size);
+    AssertEquals('Disentangled Q^r table has 2*att_span*d_k weights',
+      2 * Span * Dk, Attn.Neurons[1].Weights.Size);
+
+    // Deterministic, O(1)-scale tables and input so all three score terms
+    // genuinely shape the softmax (away from any degenerate near-zero floor).
+    for w := 0 to Attn.Neurons[0].Weights.Size - 1 do
+    begin
+      Attn.Neurons[0].Weights.Raw[w] := Sin((w + 1) * 0.53) * 0.6;
+      Attn.Neurons[1].Weights.Raw[w] := Cos((w + 1) * 0.47) * 0.6;
+    end;
+    Attn.FlushWeightCache;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.8 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.27) * 0.5;
+
+    // ---- Position-table gradients (both neurons; rows unused by this SeqLen
+    // legitimately get zero gradient on both sides). ----
+    for n := 0 to 1 do
+      for w := 0 to Attn.Neurons[n].Weights.Size - 1 do
+      begin
+        Attn.Neurons[n].Weights.Raw[w] := Attn.Neurons[n].Weights.Raw[w] + epsilon;
+        Attn.FlushWeightCache;
+        lossPlus := ComputeLoss;
+        Attn.Neurons[n].Weights.Raw[w] := Attn.Neurons[n].Weights.Raw[w] - 2 * epsilon;
+        Attn.FlushWeightCache;
+        lossMinus := ComputeLoss;
+        Attn.Neurons[n].Weights.Raw[w] := Attn.Neurons[n].Weights.Raw[w] + epsilon;
+        Attn.FlushWeightCache;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        Attn.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -Attn.Neurons[n].Delta.Raw[w];
+
+        AssertTrue('Disentangled pos-table[' + IntToStr(n) + '] grad[' +
+          IntToStr(w) + '] num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+
+    // ---- Input gradient ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      Input.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss;
+      Input.Raw[i] := Input.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      Input.Raw[i] := Input.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('Disentangled input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDisentangledAttentionSerializationRoundTrip;
+// SaveToString/LoadFromString must reconstruct a TNNetDisentangledAttention
+// (registered in BOTH dispatch tables) with NON-default hyperparams, round-trip
+// the two position tables and reproduce Compute exactly.
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Attn, Attn2: TNNetDisentangledAttention;
+  S, S2: string;
+  i, n, w: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := nil;
+  Input := TNNetVolume.Create(6, 1, 12);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 12, 1));
+    Attn := TNNetDisentangledAttention.Create(4, false, 5, 5, 8);
+    NN.AddLayer(Attn);
+    for n := 0 to 1 do
+      for w := 0 to Attn.Neurons[n].Weights.Size - 1 do
+        Attn.Neurons[n].Weights.Raw[w] := Sin((w + 1 + n * 7) * 0.43) * 0.7;
+    Attn.FlushWeightCache;
+
+    S := NN.SaveToString();
+    NN2 := TNNet.Create();
+    NN2.LoadFromString(S);
+
+    AssertTrue('Loaded layer is TNNetDisentangledAttention',
+      NN2.Layers[1] is TNNetDisentangledAttention);
+    Attn2 := NN2.Layers[1] as TNNetDisentangledAttention;
+    AssertEquals('Disentangled att_span round-trips', 5, Attn2.AttSpan);
+    AssertEquals('Disentangled pos_buckets round-trips', 5, Attn2.PosBuckets);
+    AssertEquals('Disentangled max_rel round-trips', 8, Attn2.MaxRelPos);
+    AssertEquals('Disentangled d_k round-trips', 4, Attn2.Dk);
+    for n := 0 to 1 do
+      for w := 0 to Attn.Neurons[n].Weights.Size - 1 do
+        AssertEquals('Disentangled table[' + IntToStr(n) + '] round-trips at ' +
+          IntToStr(w),
+          Attn.Neurons[n].Weights.Raw[w], Attn2.Neurons[n].Weights.Raw[w], 1e-5);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.29) * 0.8 - 0.1;
+    NN.Compute(Input);
+    NN2.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('Disentangled save/load Compute match at ' + IntToStr(i),
+        NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+
+    S2 := NN2.SaveToString();
+    AssertEquals('Disentangled save->load->save string equality', S, S2);
   finally
     NN.Free;
     if Assigned(NN2) then NN2.Free;
@@ -27257,6 +29407,288 @@ begin
     TNNetWKV.Create(), 'WKV', 4, 1, 4, 1e-5);
 end;
 
+// Headline correctness for the O(1)-per-step incremental decode path: feeding a
+// sequence token-by-token through ComputeIncremental() must reproduce the full
+// parallel-scan Compute() output BIT-CLOSE. This is the exact-vs-fast
+// equivalence assert used across the chunked-forward family.
+procedure TTestNeuralNumerical.TestWKVIncrementalDecodeEquivalence;
+var
+  NNFull, NNInc: TNNet;
+  InFull, InInc: TNNetInput;
+  LFull, LInc: TNNetWKV;
+  SeqLen, C, t, d, n: integer;
+  v, maxErr, e: TNeuralFloat;
+  Snap: TNNetVolume;
+  Steps: integer;
+begin
+  RandSeed := 424242;
+  SeqLen := 12;
+  C := 4;                       // input depth = 2*C = 8 (k|v split)
+  NNFull := TNNet.Create();
+  NNInc := TNNet.Create();
+  Snap := TNNetVolume.Create();
+  try
+    InFull := TNNetInput.Create(SeqLen, 1, 2 * C, 1);
+    NNFull.AddLayer(InFull);
+    LFull := TNNetWKV.Create();
+    NNFull.AddLayer(LFull);
+
+    // Second net with a SINGLE-token input (the decode-step shape) sharing the
+    // same weights so the two paths are weight-identical.
+    InInc := TNNetInput.Create(1, 1, 2 * C, 1);
+    NNInc.AddLayer(InInc);
+    LInc := TNNetWKV.Create();
+    NNInc.AddLayer(LInc);
+    // Perturb weights away from defaults, then copy into the incremental net.
+    for n := 0 to 1 do
+      for d := 0 to C - 1 do
+        LFull.Neurons[n].Weights.FData[d] :=
+          LFull.Neurons[n].Weights.FData[d] + 0.7 * (Random - 0.5);
+    LInc.Neurons[0].Weights.Copy(LFull.Neurons[0].Weights);
+    LInc.Neurons[1].Weights.Copy(LFull.Neurons[1].Weights);
+
+    // Random k|v input sequence; the same rows feed both paths.
+    for t := 0 to SeqLen - 1 do
+      for d := 0 to 2 * C - 1 do
+        InFull.Output[t, 0, d] := 1.5 * (Random - 0.5);
+
+    // Parallel/prefill path: full-sequence scan in one Compute().
+    NNFull.Compute(InFull.Output);
+
+    // Incremental path: one token at a time, state carried across calls.
+    LInc.BeginIncrementalDecode();
+    maxErr := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      for d := 0 to 2 * C - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+      for d := 0 to C - 1 do
+      begin
+        e := Abs(LInc.Output[0, 0, d] - LFull.Output[t, 0, d]);
+        if e > maxErr then maxErr := e;
+      end;
+    end;
+    WriteLn('WKV incremental-decode vs full-scan max abs error: ', maxErr:0:10);
+    AssertTrue('WKV incremental decode matches full scan (< 1e-5)',
+      maxErr < 1e-5);
+
+    // CaptureState/RestoreState fork: snapshot mid-way, advance, restore, and
+    // re-advance must reproduce the same outputs.
+    LInc.ResetState();
+    for t := 0 to 5 do
+    begin
+      for d := 0 to 2 * C - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+    end;
+    LInc.CaptureState(Snap, Steps);
+    AssertEquals('CaptureState step count', 6, Steps);
+    // Advance to the end from the snapshot, recording outputs.
+    for t := 6 to SeqLen - 1 do
+    begin
+      for d := 0 to 2 * C - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+    end;
+    // Restore the snapshot and re-run the tail; outputs must match full scan.
+    LInc.RestoreState(Snap, Steps);
+    maxErr := 0;
+    for t := 6 to SeqLen - 1 do
+    begin
+      for d := 0 to 2 * C - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+      for d := 0 to C - 1 do
+      begin
+        e := Abs(LInc.Output[0, 0, d] - LFull.Output[t, 0, d]);
+        if e > maxErr then maxErr := e;
+      end;
+    end;
+    AssertTrue('WKV restored-state tail matches full scan (< 1e-5)',
+      maxErr < 1e-5);
+    LInc.EndIncrementalDecode();
+    // Suppress unused-var warnings on v / n.
+    v := 0; v := v;
+  finally
+    Snap.Free;
+    NNInc.Free;
+    NNFull.Free;
+  end;
+end;
+
+// Headline correctness for the TNNetTokenShift O(1)-per-step incremental decode
+// path: feeding a sequence token-by-token through ComputeIncremental() must
+// reproduce the full-sequence Compute() shift BIT-CLOSE. Mirrors
+// TestWKVIncrementalDecodeEquivalence (token-shift is the second RWKV recurrent
+// leaf needed for true block-level decode).
+procedure TTestNeuralNumerical.TestTokenShiftIncrementalDecodeEquivalence;
+var
+  NNFull, NNInc: TNNet;
+  InFull, InInc: TNNetInput;
+  LFull, LInc: TNNetTokenShift;
+  SeqLen, Dim, t, d, n: integer;
+  maxErr, e: TNeuralFloat;
+  Snap: TNNetVolume;
+  Steps: integer;
+begin
+  RandSeed := 424242;
+  SeqLen := 12;
+  Dim := 5;
+  NNFull := TNNet.Create();
+  NNInc := TNNet.Create();
+  Snap := TNNetVolume.Create();
+  try
+    InFull := TNNetInput.Create(SeqLen, 1, Dim, 1);
+    NNFull.AddLayer(InFull);
+    LFull := TNNetTokenShift.Create();
+    NNFull.AddLayer(LFull);
+
+    // Second net with a SINGLE-token input (the decode-step shape) sharing the
+    // same weights so the two paths are weight-identical.
+    InInc := TNNetInput.Create(1, 1, Dim, 1);
+    NNInc.AddLayer(InInc);
+    LInc := TNNetTokenShift.Create();
+    NNInc.AddLayer(LInc);
+    // Perturb the per-channel mix away from the 0.5 default, then copy across.
+    for d := 0 to Dim - 1 do
+      LFull.Neurons[0].Weights.FData[d] :=
+        LFull.Neurons[0].Weights.FData[d] + 0.6 * (Random - 0.5);
+    LInc.Neurons[0].Weights.Copy(LFull.Neurons[0].Weights);
+
+    // Random input sequence; the same rows feed both paths.
+    for t := 0 to SeqLen - 1 do
+      for d := 0 to Dim - 1 do
+        InFull.Output[t, 0, d] := 1.5 * (Random - 0.5);
+
+    // Parallel/prefill path: full-sequence shift in one Compute().
+    NNFull.Compute(InFull.Output);
+
+    // Incremental path: one token at a time, x_{t-1} carried across calls.
+    LInc.BeginIncrementalDecode();
+    maxErr := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      for d := 0 to Dim - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+      for d := 0 to Dim - 1 do
+      begin
+        e := Abs(LInc.Output[0, 0, d] - LFull.Output[t, 0, d]);
+        if e > maxErr then maxErr := e;
+      end;
+    end;
+    WriteLn('TokenShift incremental-decode vs full-scan max abs error: ', maxErr:0:10);
+    AssertTrue('TokenShift incremental decode matches full scan (< 1e-5)',
+      maxErr < 1e-5);
+
+    // CaptureState/RestoreState fork: snapshot mid-way, advance, restore, and
+    // re-advance must reproduce the same outputs.
+    LInc.ResetState();
+    for t := 0 to 5 do
+    begin
+      for d := 0 to Dim - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+    end;
+    LInc.CaptureState(Snap, Steps);
+    AssertEquals('CaptureState step count', 6, Steps);
+    for t := 6 to SeqLen - 1 do
+    begin
+      for d := 0 to Dim - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+    end;
+    LInc.RestoreState(Snap, Steps);
+    maxErr := 0;
+    for t := 6 to SeqLen - 1 do
+    begin
+      for d := 0 to Dim - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+      for d := 0 to Dim - 1 do
+      begin
+        e := Abs(LInc.Output[0, 0, d] - LFull.Output[t, 0, d]);
+        if e > maxErr then maxErr := e;
+      end;
+    end;
+    AssertTrue('TokenShift restored-state tail matches full scan (< 1e-5)',
+      maxErr < 1e-5);
+    LInc.EndIncrementalDecode();
+    n := 0; n := n;   // suppress unused-var warning
+  finally
+    Snap.Free;
+    NNInc.Free;
+    NNFull.Free;
+  end;
+end;
+
+// THE HEADLINE: a full RWKV time-mix BLOCK (AddRWKVTimeMix: TokenShift ->
+// receptance/key/value projections -> WKV -> gate -> out-proj) decoded
+// token-by-token with the net-wide driver TNNet.BeginIncrementalDecode must
+// reproduce the full-sequence forward BIT-CLOSE. This proves end-to-end RWKV
+// recurrent decode is exact with EVERY stateful layer (TokenShift + WKV)
+// advancing in lockstep.
+procedure TTestNeuralNumerical.TestRWKVBlockIncrementalDecodeEquivalence;
+var
+  NNFull, NNInc: TNNet;
+  InFull, InInc: TNNetInput;
+  SeqLen, Dim, t, d, switched: integer;
+  maxErr, e: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  SeqLen := 10;
+  Dim := 6;
+  NNFull := TNNet.Create();
+  NNInc := TNNet.Create();
+  try
+    InFull := TNNetInput.Create(SeqLen, 1, Dim, 1);
+    NNFull.AddLayer(InFull);
+    NNFull.AddRWKVTimeMix();
+    NNFull.AddLayer(TNNetTokenLayerNorm.Create());
+
+    InInc := TNNetInput.Create(1, 1, Dim, 1);
+    NNInc.AddLayer(InInc);
+    NNInc.AddRWKVTimeMix();
+    NNInc.AddLayer(TNNetTokenLayerNorm.Create());
+
+    // Make the two nets weight-identical (perturb full, copy into inc).
+    NNFull.InitWeights();
+    NNInc.CopyWeights(NNFull);
+
+    // Random input sequence.
+    for t := 0 to SeqLen - 1 do
+      for d := 0 to Dim - 1 do
+        InFull.Output[t, 0, d] := 1.2 * (Random - 0.5);
+
+    NNFull.Compute(InFull.Output);
+
+    switched := NNInc.BeginIncrementalDecode();
+    // The block has TWO recurrent leaves: one TokenShift + one WKV.
+    AssertEquals('RWKV time-mix block recurrent layers switched on', 2, switched);
+    maxErr := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      for d := 0 to Dim - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+      for d := 0 to Dim - 1 do
+      begin
+        e := Abs(NNInc.GetLastLayer().Output[0, 0, d] -
+                 NNFull.GetLastLayer().Output[t, 0, d]);
+        if e > maxErr then maxErr := e;
+      end;
+    end;
+    WriteLn('RWKV block incremental-decode vs full-scan max abs error: ', maxErr:0:10);
+    AssertTrue('RWKV block incremental decode matches full scan (< 1e-5)',
+      maxErr < 1e-5);
+    NNInc.EndIncrementalDecode();
+  finally
+    NNInc.Free;
+    NNFull.Free;
+  end;
+end;
+
 // --- TNNetLRU (Linear Recurrent Unit, Orvieto et al. 2023) -------------------
 
 procedure TTestNeuralNumerical.TestLRUShapeInference;
@@ -27469,6 +29901,194 @@ begin
   // complex state h re-inits per sweep (not persisted); FStruct[0]=Depth.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetLRU.Create(), 'LRU', 4, 1, 3, 1e-5);
+end;
+
+// --- TNNetRGLRU (Real-Gated Linear Recurrent Unit, Griffin/Hawk 2024) --------
+
+procedure TTestNeuralNumerical.TestRGLRUShapeInference;
+var
+  NN: TNNet;
+  L: TNNetRGLRU;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    // Input packs x|i_logits|a_logits along depth: 3*Depth=9 -> output Depth=3.
+    NN.AddLayer(TNNetInput.Create(5, 1, 9, 1));
+    L := TNNetRGLRU.Create();
+    NN.AddLayer(L);
+    AssertEquals('RGLRU output SizeX = SeqLen', 5, L.Output.SizeX);
+    AssertEquals('RGLRU output SizeY', 1, L.Output.SizeY);
+    AssertEquals('RGLRU output Depth = input Depth/3', 3, L.Output.Depth);
+    AssertEquals('RGLRU neuron count (Lambda)', 1, L.Neurons.Count);
+    AssertEquals('RGLRU Lambda size = Depth', 3, L.Neurons[0].Weights.Size);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRGLRUInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LL: TNNetRGLRU;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;  // shared-RNG ordering requirement
+  NN := TNNet.Create();
+  // SeqLen=4, input Depth=6 (x|i_logits|a_logits, output Depth=2).
+  Input := TNNetVolume.Create(4, 1, 6);
+  InputPlus := TNNetVolume.Create(4, 1, 6);
+  Desired := TNNetVolume.Create(4, 1, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 6, 1));  // pError=1 for input-grad read
+    LL := TNNetRGLRU.Create();
+    NN.AddLayer(LL);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Bounded inputs/targets (FD-truncation control). Gate logits kept moderate
+    // so the sigmoids stay off their flat tails.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.5;
+
+    // Non-trivial per-channel Lambda so softplus/decay paths are live.
+    LL.Neurons[0].Weights.Raw[0] := -0.5;
+    LL.Neurons[0].Weights.Raw[1] :=  0.7;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('RGLRU input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('RGLRU input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRGLRUWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LL: TNNetRGLRU;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;  // shared-RNG ordering requirement
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 6);
+  Desired := TNNetVolume.Create(4, 1, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 6, 1));
+    LL := TNNetRGLRU.Create();
+    NN.AddLayer(LL);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.55) * 0.6 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.35) * 0.5;
+
+    // Bounded raw Lambda so softplus/exp stay in smooth regions.
+    LL.Neurons[0].Weights.Raw[0] := -0.5;
+    LL.Neurons[0].Weights.Raw[1] :=  0.7;
+
+    for i := 0 to LL.Neurons[0].Weights.Size - 1 do
+    begin
+      LL.Neurons[0].Weights.Raw[i] := LL.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss;
+      LL.Neurons[0].Weights.Raw[i] := LL.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      LL.Neurons[0].Weights.Raw[i] := LL.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      LL.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      // With LearningRate = 1 and batch update on, analytical = -Delta.
+      analyticalGrad := -LL.Neurons[0].Delta.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('RGLRU weight gradient check Lambda[' + IntToStr(i) +
+        '] num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('RGLRU weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRGLRUSerializationRoundTrip;
+begin
+  RandSeed := 424242;
+  // TNNetRGLRU stores one per-channel raw vector (Lambda). Input depth 3*Depth.
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetRGLRU.Create(), 'RGLRU', 4, 1, 9, 1e-5);
 end;
 
 // --- TNNetCrossWKV (two-source RWKV WKV: receptance src + key|value src) -----
@@ -30134,6 +32754,356 @@ begin
     TNNetSelectiveSSM.Create(4), 'SelectiveSSM-DState4', 4, 1, 3, 1e-5);
 end;
 
+// Headline correctness for the O(1)-per-step incremental decode path: feeding a
+// sequence token-by-token through ComputeIncremental() (the carried
+// [d_inner x d_state] hidden state h resuming across calls) must reproduce the
+// full causal-scan Compute() output BIT-CLOSE. This is the exact-vs-fast
+// equivalence assert mirroring TestWKVIncrementalDecodeEquivalence. Both the
+// DState=1 legacy and DState>1 (real Mamba) recurrences are checked, plus a
+// CaptureState/RestoreState session fork.
+procedure TTestNeuralNumerical.TestSelectiveSSMIncrementalDecodeEquivalence;
+
+  // Run the full-scan vs token-by-token equivalence for one DState setting and
+  // return the max abs output error.
+  function ScanError(NS: integer): TNeuralFloat;
+  var
+    NNFull, NNInc: TNNet;
+    InFull, InInc: TNNetInput;
+    LFull, LInc: TNNetSelectiveSSM;
+    SeqLen, Depth, t, d, nn: integer;
+    e: TNeuralFloat;
+  begin
+    SeqLen := 12;
+    Depth := 4;
+    Result := 0;
+    NNFull := TNNet.Create();
+    NNInc := TNNet.Create();
+    try
+      InFull := TNNetInput.Create(SeqLen, 1, Depth, 1);
+      NNFull.AddLayer(InFull);
+      LFull := TNNetSelectiveSSM.Create(NS);
+      NNFull.AddLayer(LFull);
+
+      // A second net with a SINGLE-token input (the decode-step shape) sharing
+      // the same weights so the two paths are weight-identical.
+      InInc := TNNetInput.Create(1, 1, Depth, 1);
+      NNInc.AddLayer(InInc);
+      LInc := TNNetSelectiveSSM.Create(NS);
+      NNInc.AddLayer(LInc);
+
+      if NS = 1 then SeedSelectiveSSM(LFull, Depth)
+      else SeedSelectiveSSMDState(LFull, Depth, NS);
+      for nn := 0 to LFull.Neurons.Count - 1 do
+        LInc.Neurons[nn].Weights.Copy(LFull.Neurons[nn].Weights);
+
+      // Random input sequence; the same rows feed both paths.
+      for t := 0 to SeqLen - 1 do
+        for d := 0 to Depth - 1 do
+          InFull.Output[t, 0, d] := 1.5 * (Random - 0.5);
+
+      // Full-sequence parallel/prefill scan in one Compute().
+      NNFull.Compute(InFull.Output);
+
+      // Incremental path: one token at a time, state carried across calls.
+      LInc.BeginIncrementalDecode();
+      for t := 0 to SeqLen - 1 do
+      begin
+        for d := 0 to Depth - 1 do
+          InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+        NNInc.Compute(InInc.Output);
+        for d := 0 to Depth - 1 do
+        begin
+          e := Abs(LInc.Output[0, 0, d] - LFull.Output[t, 0, d]);
+          if e > Result then Result := e;
+        end;
+      end;
+      LInc.EndIncrementalDecode();
+    finally
+      NNInc.Free;
+      NNFull.Free;
+    end;
+  end;
+
+var
+  NN: TNNet;
+  In1: TNNetInput;
+  L: TNNetSelectiveSSM;
+  SeqLen, Depth, NS, t, d: integer;
+  e, maxErr: TNeuralFloat;
+  Seq, RefOut: TNNetVolume;
+  Snap: TNNetVolume;
+  Steps: integer;
+begin
+  RandSeed := 424242;
+  // (A) DState=1 legacy recurrence.
+  e := ScanError(1);
+  WriteLn('SelectiveSSM (DState=1) incremental-decode vs full-scan max abs error: ',
+    e:0:10);
+  AssertTrue('SelectiveSSM DState=1 incremental decode matches full scan (< 1e-5)',
+    e < 1e-5);
+  // (B) DState>1 real-Mamba per-(channel,state) recurrence.
+  e := ScanError(4);
+  WriteLn('SelectiveSSM (DState=4) incremental-decode vs full-scan max abs error: ',
+    e:0:10);
+  AssertTrue('SelectiveSSM DState=4 incremental decode matches full scan (< 1e-5)',
+    e < 1e-5);
+
+  // (C) CaptureState/RestoreState fork: snapshot the carried h mid-stream,
+  // advance to the end, restore the snapshot and re-advance the tail; the
+  // re-run outputs must match the recorded reference (state forking is exact).
+  SeqLen := 10;
+  Depth := 4;
+  NS := 4;
+  NN := TNNet.Create();
+  Seq := TNNetVolume.Create();
+  RefOut := TNNetVolume.Create();
+  Snap := TNNetVolume.Create();
+  try
+    In1 := TNNetInput.Create(1, 1, Depth, 1);
+    NN.AddLayer(In1);
+    L := TNNetSelectiveSSM.Create(NS);
+    NN.AddLayer(L);
+    SeedSelectiveSSMDState(L, Depth, NS);
+    Seq.ReSize(SeqLen, 1, Depth);
+    RefOut.ReSize(SeqLen, 1, Depth);
+    for t := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        Seq.Raw[(t * Depth) + d] := 1.5 * (Random - 0.5);
+
+    L.BeginIncrementalDecode();
+    // Decode the whole stream once, recording the reference tail outputs.
+    for t := 0 to SeqLen - 1 do
+    begin
+      for d := 0 to Depth - 1 do
+        In1.Output[0, 0, d] := Seq.Raw[(t * Depth) + d];
+      NN.Compute(In1.Output);
+      for d := 0 to Depth - 1 do
+        RefOut.Raw[(t * Depth) + d] := L.Output[0, 0, d];
+    end;
+
+    // Re-run the prefix, snapshot at t=5, advance to the end (perturbing the
+    // live state), then restore the snapshot and re-decode the tail.
+    L.ResetState();
+    for t := 0 to 4 do
+    begin
+      for d := 0 to Depth - 1 do
+        In1.Output[0, 0, d] := Seq.Raw[(t * Depth) + d];
+      NN.Compute(In1.Output);
+    end;
+    L.CaptureState(Snap, Steps);
+    AssertEquals('SelectiveSSM CaptureState step count', 5, Steps);
+    // Burn the live state by running the tail once.
+    for t := 5 to SeqLen - 1 do
+    begin
+      for d := 0 to Depth - 1 do
+        In1.Output[0, 0, d] := Seq.Raw[(t * Depth) + d];
+      NN.Compute(In1.Output);
+    end;
+    // Restore and re-decode the tail; outputs must match the reference.
+    L.RestoreState(Snap, Steps);
+    maxErr := 0;
+    for t := 5 to SeqLen - 1 do
+    begin
+      for d := 0 to Depth - 1 do
+        In1.Output[0, 0, d] := Seq.Raw[(t * Depth) + d];
+      NN.Compute(In1.Output);
+      for d := 0 to Depth - 1 do
+      begin
+        e := Abs(L.Output[0, 0, d] - RefOut.Raw[(t * Depth) + d]);
+        if e > maxErr then maxErr := e;
+      end;
+    end;
+    L.EndIncrementalDecode();
+    AssertTrue('SelectiveSSM restored-state tail matches reference (< 1e-5)',
+      maxErr < 1e-5);
+  finally
+    Snap.Free;
+    RefOut.Free;
+    Seq.Free;
+    NN.Free;
+  end;
+end;
+
+// --- TNNetMamba2 (Mamba-2 / SSD multi-head state-space mixer) ---------------
+
+// Fill the four Mamba-2 weight sets (A_log, D, dt_bias, norm_weight) with
+// deterministic non-trivial values so every BPTT term is exercised: a real
+// per-head decay spread, a non-one D head skip, a dt_bias straddling zero
+// (softplus is neither identity nor ReLU there) and non-one RMSNorm gains.
+procedure SeedMamba2(LM2: TNNetLayer; NumHeads, DInner: integer);
+var h, c: integer;
+begin
+  for h := 0 to NumHeads - 1 do
+  begin
+    LM2.Neurons[0].Weights.Raw[h] := Sin(h * 0.7) * 0.6;        // A_log
+    LM2.Neurons[1].Weights.Raw[h] := 0.3 + h * 0.25;           // D
+    LM2.Neurons[2].Weights.Raw[h] := Cos(h * 0.9) * 0.5 - 0.1; // dt_bias
+  end;
+  for c := 0 to DInner - 1 do
+    LM2.Neurons[3].Weights.Raw[c] := 1.0 + Sin(c * 0.6) * 0.3; // norm_weight
+end;
+
+procedure TTestNeuralNumerical.TestMamba2InputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LM2: TNNetMamba2;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+  // 2 heads x head_dim 2 -> d_inner 4; state 3, groups 1.
+  // InDepth = 2*4 + 2*1*3 + 2 = 16.
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var kk: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 16);
+  InputPlus := TNNetVolume.Create(4, 1, 16);
+  Desired := TNNetVolume.Create(4, 1, 4);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 16, 1));
+    LM2 := TNNetMamba2.Create(2, 2, 3, 1, 1e-5);
+    NN.AddLayer(LM2);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.37) * 1.1 + 0.15;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.43) * 0.8;
+    SeedMamba2(LM2, 2, 4);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      // The Mamba-2 head-wise scan stacks softplus, exp-decay and a divisive
+      // RMSNorm, so the single-precision central-difference is noisier than a
+      // plain linear layer; gate on abs 0.02 OR 3% relative (the analytic grad
+      // is float64-verified exact in tools/make_pico_mamba2_fixture.py-style
+      // cross-checks).
+      AssertTrue('Mamba2 input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        (Abs(numericalGrad - analyticalGrad) < 0.02) or
+        (Abs(numericalGrad - analyticalGrad) <
+          0.03 * (Abs(analyticalGrad) + 1e-6)));
+    end;
+    WriteLn('Mamba2 input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMamba2WeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LM2: TNNetMamba2;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..3] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var kk: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 16);
+  Desired := TNNetVolume.Create(4, 1, 4);
+  epsilon := 0.0001;
+  maxErr := 0;
+  Names[0] := 'A_log'; Names[1] := 'D'; Names[2] := 'dt_bias';
+  Names[3] := 'norm_weight';
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 16, 1));
+    LM2 := TNNetMamba2.Create(2, 2, 3, 1, 1e-5);
+    NN.AddLayer(LM2);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.29) * 1.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31) * 0.7;
+    SeedMamba2(LM2, 2, 4);
+
+    // Covers all four learnable tensors of the Mamba-2 BPTT: the per-head
+    // scalar A_log/D/dt_bias and the d_inner gated-RMSNorm gain.
+    for n := 0 to 3 do
+      for i := 0 to LM2.Neurons[n].Weights.Size - 1 do
+      begin
+        LM2.Neurons[n].Weights.Raw[i] := LM2.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        LM2.Neurons[n].Weights.Raw[i] := LM2.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        LM2.Neurons[n].Weights.Raw[i] := LM2.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LM2.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -LM2.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        // Abs 0.02 OR 3% relative: the FP32 central-difference is noisy across
+        // the softplus/exp/RMSNorm stack (see the input-gradient note above).
+        AssertTrue('Mamba2 weight gradient check ' + Names[n] + '[' +
+          IntToStr(i) + '] num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad),
+          (Abs(numericalGrad - analyticalGrad) < 0.02) or
+          (Abs(numericalGrad - analyticalGrad) <
+            0.03 * (Abs(analyticalGrad) + 1e-6)));
+      end;
+    WriteLn('Mamba2 weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMamba2SerializationRoundTrip;
+begin
+  // FStruct[0..3] (heads/head_dim/state/groups) and FFloatSt[0] (eps) must
+  // survive save/load so the loaded layer rebuilds the same shapes/output.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetMamba2.Create(2, 2, 3, 1, 1e-5), 'Mamba2', 4, 1, 16, 1e-5);
+end;
+
 // --- TNNetClosedFormContinuous (CfC liquid recurrent cell) ------------------
 
 // Fill the CfC weight sets with deterministic, non-trivial values so every term
@@ -31134,6 +34104,199 @@ begin
   RandSeed := 424242;
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetMinLSTM.Create(), 'MinLSTM', 4, 1, 3, 1e-5);
+end;
+
+// --- TNNetConvLSTMCell (convolutional LSTM spatiotemporal recurrent cell) -----
+
+// Deterministic, BOUNDED gate kernels + biases so every gate (i/f/o sigmoid,
+// g tanh), the f_t*c_{t-1} memory carry AND the h_{t-1} gate feed are exercised,
+// while staying inside the small-magnitude regime where the FD truncation of
+// tanh/sigmoid stays under the gradient tolerance.
+procedure SeedConvLSTMCell(L: TNNetConvLSTMCell);
+var n, i: integer;
+begin
+  // Kernels [0..3], then biases [4..7].
+  for n := 0 to 3 do
+    for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      L.Neurons[n].Weights.Raw[i] := Sin(n * 1.3 + i * 0.21) * 0.15;
+  for n := 4 to 7 do
+    for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      L.Neurons[n].Weights.Raw[i] := Cos(n * 0.9 + i * 0.5) * 0.2;
+end;
+
+procedure TTestNeuralNumerical.TestConvLSTMCellShapeInference;
+var
+  NN: TNNet;
+  L: TNNetConvLSTMCell;
+begin
+  // T=2, H=SizeX/T=2, W=2, InC=2; HiddenC=3, K=3 -> ZC=InC+HiddenC=5.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 2, 2)); // (T*H=4, W=2, InC=2)
+    L := TNNetConvLSTMCell.Create(2, 3, 3);
+    NN.AddLayer(L);
+    AssertEquals('ConvLSTM output SizeX = T*H', 4, L.Output.SizeX);
+    AssertEquals('ConvLSTM output SizeY = W', 2, L.Output.SizeY);
+    AssertEquals('ConvLSTM output Depth = HiddenC', 3, L.Output.Depth);
+    AssertEquals('ConvLSTM neuron count', 8, L.Neurons.Count);
+    // Kernel = HiddenC * K*K * (InC+HiddenC) = 3*9*5 = 135.
+    AssertEquals('ConvLSTM Wi size', 135, L.Neurons[0].Weights.Size);
+    AssertEquals('ConvLSTM bi size', 3, L.Neurons[4].Weights.Size);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConvLSTMCellInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  L: TNNetConvLSTMCell;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  // T=2, H=2, W=2, InC=2; HiddenC=2, K=3.
+  Input := TNNetVolume.Create(4, 2, 2);
+  InputPlus := TNNetVolume.Create(4, 2, 2);
+  Desired := TNNetVolume.Create(4, 2, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    // 4-arg input (pError=1) so the input-grad buffer is sized -> no OOB flake.
+    NN.AddLayer(TNNetInput.Create(4, 2, 2, 1));
+    L := TNNetConvLSTMCell.Create(2, 2, 3);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.55) * 1.1 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.37) * 0.6;
+    SeedConvLSTMCell(L);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('ConvLSTM input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('ConvLSTM input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConvLSTMCellWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  L: TNNetConvLSTMCell;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..7] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 2, 2);
+  Desired := TNNetVolume.Create(4, 2, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  Names[0] := 'Wi'; Names[1] := 'Wf'; Names[2] := 'Wo'; Names[3] := 'Wg';
+  Names[4] := 'bi'; Names[5] := 'bf'; Names[6] := 'bo'; Names[7] := 'bg';
+  try
+    NN.AddLayer(TNNetInput.Create(4, 2, 2, 1));
+    L := TNNetConvLSTMCell.Create(2, 2, 3);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.43) * 1.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31) * 0.6;
+    SeedConvLSTMCell(L);
+
+    // Cover all eight tensors. The h_{t-1} gate feed couples adjacent timesteps,
+    // a classic place for a silent ConvLSTM BPTT truncation.
+    for n := 0 to 7 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('ConvLSTM weight gradient check ' + Names[n] +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('ConvLSTM weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConvLSTMCellSerializationRoundTrip;
+begin
+  // ConvLSTM stores eight learnable tensors (four KxK gate kernels + four
+  // HiddenC biases) plus T/HiddenC/K in FStruct; the perturbed-weights helper
+  // exercises the kernel round-trip and the constructor-arg reconstruction.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetConvLSTMCell.Create(2, 2, 3), 'ConvLSTMCell', 4, 2, 2, 1e-5);
 end;
 
 procedure SeedDeltaNet(L: TNNetDeltaNet; Depth: integer);
@@ -34746,6 +37909,260 @@ begin
     TNNetAttentionPooling.Create(2, 3), 'AttentionPooling', 5, 1, 3, 1e-5);
 end;
 
+procedure TTestNeuralNumerical.TestSoftPromptForwardShape;
+// (K=3 virtual tokens) prepended to (SeqLen=4, d=2) -> (7, 1, 2). The first
+// K rows are the learnable bank verbatim; the trailing rows echo the input.
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LH: TNNetSoftPrompt;
+  i, d: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 2, 1));
+    LH := TNNetSoftPrompt.Create(3, 2);
+    NN.AddLayer(LH);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.5) + 0.2;
+    NN.Compute(Input);
+    AssertEquals('SoftPrompt output SizeX = K+SeqLen', 7, LH.Output.SizeX);
+    AssertEquals('SoftPrompt output Depth preserved', 2, LH.Output.Depth);
+    AssertEquals('SoftPrompt NumVirtualTokens', 3, LH.NumVirtualTokens);
+    // First K rows == bank.
+    for i := 0 to 2 do
+      for d := 0 to 1 do
+        AssertEquals('SoftPrompt virtual row ' + IntToStr(i),
+          LH.Neurons[0].Weights[i, 0, d], LH.Output[i, 0, d], 1e-6);
+    // Trailing rows == input (straight-through), offset by K.
+    for i := 0 to 3 do
+      for d := 0 to 1 do
+        AssertEquals('SoftPrompt echo row ' + IntToStr(i),
+          Input[i, 0, d], LH.Output[3 + i, 0, d], 1e-6);
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftPromptWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LH: TNNetSoftPrompt;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(6, 1, 3); // (K=2)+4 rows
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    LH := TNNetSoftPrompt.Create(2, 3);
+    NN.AddLayer(LH);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 0.9 + 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.6;
+
+    for i := 0 to LH.Neurons[0].Weights.Size - 1 do
+    begin
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss;
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      LH.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -LH.Neurons[0].Delta.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('SoftPrompt weight gradient P[' + IntToStr(i) +
+        '] num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    // Soft-prompt gradient must be NONZERO (it is the only trainable signal).
+    AssertTrue('SoftPrompt gradient is nonzero', maxErr >= 0);
+    AssertTrue('SoftPrompt delta has a nonzero entry',
+      LH.Neurons[0].Delta.GetSumAbs() > 0);
+    WriteLn('SoftPrompt weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftPromptInputGradientCheck;
+// The trailing (real-token) rows pass gradient straight through to the input.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LH: TNNetSoftPrompt;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  InputPlus := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(6, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    LH := TNNetSoftPrompt.Create(2, 3);
+    NN.AddLayer(LH);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.1 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.7;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('SoftPrompt input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('SoftPrompt input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftPromptSerializationRoundTrip;
+begin
+  // The learnable virtual-token bank (K x d) must survive Save/LoadFromString
+  // along with the K/d hyperparameters.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetSoftPrompt.Create(3, 4), 'SoftPrompt', 5, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSoftPromptFreezeOnlyPromptTrains;
+// Prompt-tuning contract: freeze the base model (LearningRate := 0 on every
+// layer except the soft prompt), run one training step, and assert (1) the
+// frozen embedding weights are BIT-unchanged, (2) the soft-prompt weights DID
+// change, and (3) the eval (no-backprop) forward is deterministic.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Emb: TNNetEmbedding;
+  SP: TNNetSoftPrompt;
+  EmbBefore: TNNetVolume;
+  PromptBefore: TNNetVolume;
+  i: integer;
+  embChanged, promptChanged: boolean;
+  out1, out2: TNNetVolume;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  EmbBefore := TNNetVolume.Create();
+  PromptBefore := TNNetVolume.Create();
+  out1 := TNNetVolume.Create();
+  out2 := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));
+    Emb := TNNetEmbedding.Create(8, 5) as TNNetEmbedding; // vocab 8, d=5
+    NN.AddLayer(Emb);
+    SP := TNNetSoftPrompt.Create(2, 5);
+    NN.AddLayer(SP);
+    NN.AddLayer(TNNetFullConnectLinear.Create(8)); // a tiny head
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output);
+
+    // Freeze EVERYTHING except the soft prompt (LR := 0 on the others).
+    for i := 0 to NN.CountLayers - 1 do
+      NN.Layers[i].LearningRate := 0;
+    SP.LearningRate := 1.0;
+    NN.SetBatchUpdate(false);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := i mod 8;
+    NN.Compute(Input);
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Sin(i * 0.3) * 0.5;
+
+    EmbBefore.Copy(Emb.Neurons[0].Weights);
+    PromptBefore.Copy(SP.Neurons[0].Weights);
+
+    NN.Compute(Input);
+    NN.Backpropagate(Desired);
+
+    // (1) Frozen embedding bit-unchanged.
+    embChanged := false;
+    for i := 0 to Emb.Neurons[0].Weights.Size - 1 do
+      if Emb.Neurons[0].Weights.Raw[i] <> EmbBefore.Raw[i] then embChanged := true;
+    AssertFalse('Frozen embedding weights must be bit-unchanged', embChanged);
+
+    // (2) Soft prompt changed.
+    promptChanged := false;
+    for i := 0 to SP.Neurons[0].Weights.Size - 1 do
+      if SP.Neurons[0].Weights.Raw[i] <> PromptBefore.Raw[i] then promptChanged := true;
+    AssertTrue('Soft-prompt weights must update', promptChanged);
+
+    // (3) Eval forward deterministic (two forwards, no backprop, identical).
+    NN.Compute(Input);
+    out1.Copy(NN.GetLastLayer.Output);
+    NN.Compute(Input);
+    out2.Copy(NN.GetLastLayer.Output);
+    for i := 0 to out1.Size - 1 do
+      AssertEquals('Eval forward deterministic at ' + IntToStr(i),
+        out1.Raw[i], out2.Raw[i], 0.0);
+    Desired.Free;
+  finally
+    NN.Free; Input.Free; EmbBefore.Free; PromptBefore.Free;
+    out1.Free; out2.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestAddAttentionPoolingBuilder;
 var
   NN, NN2: TNNet;
@@ -36665,6 +40082,201 @@ begin
       NN2.Compute(Input);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('CausalConv1D dilated round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConvolution3DInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LConv: TNNetConvolution3D;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+  W, H, InT, C, NumFeat, KT, KXY: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k2: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k2 := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k2] - Desired.Raw[k2];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  // (W,H,InT,C)=(4,4,3,2); kernel KT=2 temporal, KXY=3 spatial, pad=1 stride=1.
+  W := 4; H := 4; InT := 3; C := 2; NumFeat := 2; KT := 2; KXY := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(W, H, InT * C);
+  InputPlus := TNNetVolume.Create(W, H, InT * C);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(W, H, InT * C, 1));
+    LConv := TNNetConvolution3D.Create(NumFeat, KT, KXY, 1, 1, C);
+    NN.AddLayer(LConv);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 1.1 + 0.2;
+    Desired := TNNetVolume.Create(LConv.Output.SizeX, LConv.Output.SizeY,
+      LConv.Output.Depth);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.7;
+    for i := 0 to LConv.Neurons.Count - 1 do
+      LConv.Neurons[i].Weights.Raw[0] := LConv.Neurons[i].Weights.Raw[0] + 0.3;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('Convolution3D input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConvolution3DWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LConv: TNNetConvolution3D;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, n: integer;
+  W, H, InT, C, NumFeat, KT, KXY: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k2: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k2 := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k2] - Desired.Raw[k2];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  W := 4; H := 4; InT := 3; C := 2; NumFeat := 2; KT := 2; KXY := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(W, H, InT * C);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(W, H, InT * C, 1));
+    LConv := TNNetConvolution3D.Create(NumFeat, KT, KXY, 1, 1, C);
+    NN.AddLayer(LConv);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.45) * 1.0 + 0.3;
+    Desired := TNNetVolume.Create(LConv.Output.SizeX, LConv.Output.SizeY,
+      LConv.Output.Depth);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.35) * 0.6;
+    for i := 0 to LConv.Neurons.Count - 1 do
+      LConv.Neurons[i].Weights.Raw[0] := LConv.Neurons[i].Weights.Raw[0] + 0.25;
+
+    for n := 0 to LConv.Neurons.Count - 1 do
+      for i := 0 to LConv.Neurons[n].Weights.Size - 1 do
+      begin
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LConv.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -LConv.Neurons[n].Delta.Raw[i];
+
+        AssertTrue('Convolution3D weight gradient n=' + IntToStr(n) +
+          ' w=' + IntToStr(i) + ' num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConvolution3DSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  LConv: TNNetConvolution3D;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 5, 3 * 2); // W=5,H=5,InT=3,C=2
+  try
+    NN.AddLayer(TNNetInput.Create(5, 5, 3 * 2, 1));
+    LConv := TNNetConvolution3D.Create(3, 2, 3, 1, 1, 2);
+    NN.AddLayer(LConv);
+    for i := 0 to LConv.Neurons.Count - 1 do
+    begin
+      LConv.Neurons[i].Weights.Raw[0] := LConv.Neurons[i].Weights.Raw[0] + 0.37;
+      LConv.Neurons[i].Weights.Raw[1] := LConv.Neurons[i].Weights.Raw[1] - 0.21;
+    end;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 + 0.1;
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('Convolution3D round-trip class identity',
+        NN2.GetLastLayer is TNNetConvolution3D);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('Convolution3D save->load->save string equality', Saved, Saved2);
+      AssertEquals('Convolution3D round-trip structure',
+        NN.GetLastLayer.SaveStructureToString(),
+        NN2.GetLastLayer.SaveStructureToString());
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('Convolution3D round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally
@@ -39032,6 +42644,270 @@ begin
   end;
 end;
 
+// Reference float64 forward-backward returning ONLY the CTC scalar loss, used
+// by the numerical-gradient test to central-difference the loss w.r.t. each
+// input logit. Independent re-implementation (not the layer's) so the test is a
+// genuine oracle; LogProbs is (T,1,Vocab) per-frame log-probabilities.
+function CTCRefLoss(LogProbs: TNNetVolume; const Labels: array of integer;
+  Blank: integer): double;
+const
+  cNegInf = -1e30;
+var
+  NT, NS, L, ti, si, i: integer;
+  Ext: array of integer;
+  Alpha: array of array of double;
+  av, ll: double;
+  function LogAdd(x, y: double): double;
+  begin
+    if x <= cNegInf then Result := y
+    else if y <= cNegInf then Result := x
+    else if x > y then Result := x + Ln(1 + Exp(y - x))
+    else Result := y + Ln(1 + Exp(x - y));
+  end;
+begin
+  NT := LogProbs.SizeX;
+  L := Length(Labels);
+  NS := 2 * L + 1;
+  SetLength(Ext, NS);
+  for i := 0 to L - 1 do begin Ext[2*i] := Blank; Ext[2*i+1] := Labels[i]; end;
+  Ext[NS-1] := Blank;
+  SetLength(Alpha, NT, NS);
+  for ti := 0 to NT - 1 do for si := 0 to NS - 1 do Alpha[ti][si] := cNegInf;
+  Alpha[0][0] := LogProbs[0,0,Ext[0]];
+  if NS > 1 then Alpha[0][1] := LogProbs[0,0,Ext[1]];
+  for ti := 1 to NT - 1 do
+    for si := 0 to NS - 1 do
+    begin
+      av := Alpha[ti-1][si];
+      if si >= 1 then av := LogAdd(av, Alpha[ti-1][si-1]);
+      if (si >= 2) and (Ext[si] <> Blank) and (Ext[si] <> Ext[si-2]) then
+        av := LogAdd(av, Alpha[ti-1][si-2]);
+      Alpha[ti][si] := av + LogProbs[ti,0,Ext[si]];
+    end;
+  ll := Alpha[NT-1][NS-1];
+  if NS > 1 then ll := LogAdd(ll, Alpha[NT-1][NS-2]);
+  Result := -ll;
+end;
+
+// Helper: fill a (T,1,Vocab) log-prob volume from a logit grid via softmax.
+procedure CTCLogitsToLogProbs(Logits, LogProbs: TNNetVolume);
+var
+  ti, k, T, Vocab: integer;
+  MaxV, SumExp: double;
+begin
+  T := Logits.SizeX; Vocab := Logits.Depth;
+  LogProbs.ReSize(Logits);
+  for ti := 0 to T - 1 do
+  begin
+    MaxV := Logits[ti,0,0];
+    for k := 1 to Vocab - 1 do if Logits[ti,0,k] > MaxV then MaxV := Logits[ti,0,k];
+    SumExp := 0;
+    for k := 0 to Vocab - 1 do SumExp := SumExp + Exp(Logits[ti,0,k] - MaxV);
+    for k := 0 to Vocab - 1 do
+      LogProbs[ti,0,k] := (Logits[ti,0,k] - MaxV) - Ln(SumExp);
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCTCLossForwardPassthrough;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetCTCLoss forward is an identity passthrough of the input log-probs.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetCTCLoss.Create());
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := -0.5 - 0.1 * i;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('CTCLoss forward passthrough at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCTCLossGradient;
+const
+  cT = 8;         // need T >= 2*L+1 = 7 for labels [0,1,2] to be alignable
+  cVocab = 4;     // labels 0..2, blank = 3
+  cBlank = 3;
+  cEps = 1e-3;
+var
+  NN: TNNet;
+  Input, Target, Logits, LPPlus, LPMinus: TNNetVolume;
+  LLogits: TNNetIdentity;
+  Labels: array[0..2] of integer;
+  ti, k, idx: integer;
+  AnalyticGrad, NumGrad, LPlus, LMinus, saved: double;
+begin
+  // Numerical-gradient gate: build Input -> LogSoftMax -> CTCLoss on a small
+  // logit grid, then verify the error flowing into the LOGITS layer equals the
+  // central-difference of the CTC scalar loss w.r.t. each logit (oracle =
+  // independent float64 forward-backward CTCRefLoss). Target = labels [0,1,2].
+  Labels[0] := 0; Labels[1] := 1; Labels[2] := 2;
+
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input  := TNNetVolume.Create(cT, 1, cVocab);
+  Target := TNNetVolume.Create(cT, 1, cVocab);
+  Logits := TNNetVolume.Create(cT, 1, cVocab);
+  LPPlus := TNNetVolume.Create(cT, 1, cVocab);
+  LPMinus := TNNetVolume.Create(cT, 1, cVocab);
+  try
+    NN.AddLayer(TNNetInput.Create(cT, 1, cVocab, 1));
+    LLogits := TNNetIdentity.Create();
+    NN.AddLayer(LLogits);
+    NN.AddLayer(TNNetLogSoftMax.Create());
+    NN.AddLayer(TNNetCTCLoss.Create(cBlank));
+
+    // A fixed, well-separated logit grid (deterministic).
+    for ti := 0 to cT - 1 do
+      for k := 0 to cVocab - 1 do
+        Logits[ti, 0, k] := 0.3 * (ti + 1) - 0.7 * k + 0.15 * ((ti * 7 + k * 3) mod 5);
+
+    for idx := 0 to Input.Size - 1 do Input.Raw[idx] := Logits.Raw[idx];
+
+    // Encode the CTC target into the (T,1,Vocab) target volume.
+    TNNetCTCLoss.EncodeTarget(Target, Labels, cT, cVocab);
+
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    // Central-difference the scalar loss w.r.t. each logit and compare to the
+    // analytic error sitting in the logits layer (= softmax - gamma).
+    for idx := 0 to Logits.Size - 1 do
+    begin
+      AnalyticGrad := LLogits.OutputError.Raw[idx];
+
+      saved := Logits.Raw[idx];
+      Logits.Raw[idx] := saved + cEps;
+      CTCLogitsToLogProbs(Logits, LPPlus);
+      LPlus := CTCRefLoss(LPPlus, Labels, cBlank);
+
+      Logits.Raw[idx] := saved - cEps;
+      CTCLogitsToLogProbs(Logits, LPMinus);
+      LMinus := CTCRefLoss(LPMinus, Labels, cBlank);
+
+      Logits.Raw[idx] := saved;
+      NumGrad := (LPlus - LMinus) / (2 * cEps);
+
+      AssertEquals('CTC logit gradient at ' + IntToStr(idx),
+        NumGrad, AnalyticGrad, 2e-3);
+    end;
+  finally
+    NN.Free;
+    Input.Free; Target.Free; Logits.Free;
+    LPPlus.Free; LPMinus.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCTCLossLoadFromString;
+var
+  NN, NN2: TNNet;
+  Saved: string;
+  CTC: TNNetCTCLoss;
+begin
+  // SaveStructureToString -> LoadFromString round-trip must preserve the layer
+  // type AND the configured blank index (FStruct[0]).
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 5, 1));
+    NN.AddLayer(TNNetLogSoftMax.Create());
+    NN.AddLayer(TNNetCTCLoss.Create(2)); // explicit non-default blank index
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetCTCLoss',
+      NN2.GetLastLayer is TNNetCTCLoss);
+    CTC := NN2.GetLastLayer as TNNetCTCLoss;
+    AssertEquals('CTCLoss blank index round-trips', 2, CTC.BlankIndex());
+  finally
+    NN.Free;
+    NN2.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCTCDecodeGreedyRoundTrip;
+const
+  cT = 7;
+  cVocab = 4;   // labels 0..2, blank = 3
+  cBlank = 3;
+var
+  Scores: TNNetVolume;
+  Path: array[0..6] of integer;
+  Decoded: TNeuralIntegerArray;
+  Expected: array[0..2] of integer;
+  ti, k: integer;
+begin
+  // Alignment round-trip: plant a clean argmax path that, under the CTC collapse
+  // rule (merge repeats, drop blank), must decode to the planted label sequence.
+  // Path: 0 0 blank 1 1 2 blank  ->  collapse -> 0 1 2.
+  Path[0] := 0; Path[1] := 0; Path[2] := cBlank;
+  Path[3] := 1; Path[4] := 1; Path[5] := 2; Path[6] := cBlank;
+  Expected[0] := 0; Expected[1] := 1; Expected[2] := 2;
+
+  Scores := TNNetVolume.Create(cT, 1, cVocab);
+  try
+    // Make each frame's argmax exactly the planted symbol.
+    Scores.Fill(-5.0);
+    for ti := 0 to cT - 1 do
+      Scores[ti, 0, Path[ti]] := 5.0;
+
+    Decoded := DecodeCTCGreedy(Scores, cBlank);
+    AssertEquals('Greedy CTC decode length', 3, Length(Decoded));
+    for k := 0 to 2 do
+      AssertEquals('Greedy CTC decode label ' + IntToStr(k),
+        Expected[k], Decoded[k]);
+
+    // Default blank (-1 -> vocab-1 = 3) must give the same result.
+    Decoded := DecodeCTCGreedy(Scores);
+    AssertEquals('Greedy CTC decode (default blank) length', 3, Length(Decoded));
+  finally
+    Scores.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCTCDecodeBeamSearch;
+const
+  cT = 7;
+  cVocab = 4;
+  cBlank = 3;
+var
+  Scores, LP: TNNetVolume;
+  Path: array[0..6] of integer;
+  Decoded: TNeuralIntegerArray;
+  ti: integer;
+begin
+  // On a near-deterministic distribution the prefix-beam search must agree with
+  // greedy (and the planted target 0 1 2). Beam search consumes log-probs.
+  Path[0] := 0; Path[1] := 0; Path[2] := cBlank;
+  Path[3] := 1; Path[4] := 1; Path[5] := 2; Path[6] := cBlank;
+
+  Scores := TNNetVolume.Create(cT, 1, cVocab);
+  LP := TNNetVolume.Create(cT, 1, cVocab);
+  try
+    Scores.Fill(-5.0);
+    for ti := 0 to cT - 1 do Scores[ti, 0, Path[ti]] := 5.0;
+    CTCLogitsToLogProbs(Scores, LP);
+
+    Decoded := DecodeCTCBeamSearch(LP, 8, cBlank, true);
+    AssertEquals('Beam CTC decode length', 3, Length(Decoded));
+    AssertEquals('Beam CTC label 0', 0, Decoded[0]);
+    AssertEquals('Beam CTC label 1', 1, Decoded[1]);
+    AssertEquals('Beam CTC label 2', 2, Decoded[2]);
+  finally
+    Scores.Free;
+    LP.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestKLDivergenceForwardPassthrough;
 var
   NN: TNNet;
@@ -41207,6 +45083,61 @@ begin
             LVQ.Neurons[ExpectedCode].Weights.Raw[j],
             NN.GetLastLayer.Output[x, y, j], 1e-6);
       end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestVectorQuantizerChosenCodeIndex;
+const
+  cK     = 3;
+  cD     = 2;
+  cSizeX = 2;
+  cSizeY = 2;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LVQ: TNNetVectorQuantizer;
+  x, y, ExpectedCode: integer;
+begin
+  // ChosenCodeIndex(X,Y) must read back the discrete argmin token chosen at
+  // each spatial position on the last Compute() (the VQ-VAE token grid), and
+  // return 0 for out-of-range coordinates. Same hand-set codebook as the
+  // forward test so the expected codes are known.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cSizeX, cSizeY, cD);
+  try
+    NN.AddLayer(TNNetInput.Create(cSizeX, cSizeY, cD, 1));
+    LVQ := TNNetVectorQuantizer.Create(cK, 0.25);
+    NN.AddLayer(LVQ);
+
+    LVQ.Neurons[0].Weights.Raw[0] :=  0.0; LVQ.Neurons[0].Weights.Raw[1] :=  0.0;
+    LVQ.Neurons[1].Weights.Raw[0] :=  5.0; LVQ.Neurons[1].Weights.Raw[1] :=  5.0;
+    LVQ.Neurons[2].Weights.Raw[0] := -5.0; LVQ.Neurons[2].Weights.Raw[1] := -5.0;
+
+    Input[0, 0, 0] :=  0.1; Input[0, 0, 1] := -0.2; // -> code 0
+    Input[1, 0, 0] :=  4.7; Input[1, 0, 1] :=  5.3; // -> code 1
+    Input[0, 1, 0] := -4.4; Input[0, 1, 1] := -5.1; // -> code 2
+    Input[1, 1, 0] :=  0.3; Input[1, 1, 1] :=  0.4; // -> code 0
+
+    NN.Compute(Input);
+
+    for x := 0 to cSizeX - 1 do
+      for y := 0 to cSizeY - 1 do
+      begin
+        if (x = 1) and (y = 0) then ExpectedCode := 1
+        else if (x = 0) and (y = 1) then ExpectedCode := 2
+        else ExpectedCode := 0;
+        AssertEquals('ChosenCodeIndex at (' + IntToStr(x) + ',' + IntToStr(y) + ')',
+          ExpectedCode, LVQ.ChosenCodeIndex(x, y));
+      end;
+
+    // Out-of-range coordinates return 0 (safe sentinel), not a crash.
+    AssertEquals('ChosenCodeIndex out-of-range X', 0, LVQ.ChosenCodeIndex(cSizeX, 0));
+    AssertEquals('ChosenCodeIndex out-of-range Y', 0, LVQ.ChosenCodeIndex(0, cSizeY));
+    AssertEquals('ChosenCodeIndex negative', 0, LVQ.ChosenCodeIndex(-1, -1));
   finally
     NN.Free;
     Input.Free;
@@ -44571,6 +48502,205 @@ begin
       AssertEquals('WeightStandardizationConv SaveToString round-trip', Saved, Saved2);
       AssertTrue('WeightStandardizationConv class token present in serialized string',
         Pos('TNNetWeightStandardizationConv', Saved) > 0);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRectangularConvForwardShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Conv1x3, Conv3x1: TNNetConvolutionRectangular;
+begin
+  // A 1x3 (width=3,height=1) kernel over a 5x4 input (no padding, stride 1)
+  // must shrink only the X axis: 5-3+1=3 wide, 4 tall. A 3x1 kernel must shrink
+  // only the Y axis. This pins the asymmetric output geometry.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 4, 2));
+    // pFeatureSizeX=3, pFeatureSizeY=1 -> 1x3 horizontal kernel.
+    Conv1x3 := TNNetConvolutionRectangular.Create(6, 3, 1, 0, 1);
+    NN.AddLayer(Conv1x3);
+    AssertEquals('1x3 conv output SizeX', 3, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('1x3 conv output SizeY', 4, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('1x3 conv output Depth', 6, NN.GetLastLayer.Output.Depth);
+    AssertEquals('1x3 conv weights/filter = X*Y*InDepth', 3 * 1 * 2,
+      Conv1x3.Neurons[0].Weights.Size);
+
+    // pFeatureSizeX=1, pFeatureSizeY=3 -> 3x1 vertical kernel on the 3x4x6 map.
+    Conv3x1 := TNNetConvolutionRectangular.Create(5, 1, 3, 0, 1);
+    NN.AddLayer(Conv3x1);
+    AssertEquals('3x1 conv output SizeX', 3, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('3x1 conv output SizeY', 2, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('3x1 conv output Depth', 5, NN.GetLastLayer.Output.Depth);
+    AssertEquals('3x1 conv weights/filter = X*Y*InDepth', 1 * 3 * 6,
+      Conv3x1.Neurons[0].Weights.Size);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.RectangularConvGradientCheckXY(
+  pFeatureSizeX, pFeatureSizeY: integer; const ALabel: string);
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Conv: TNNetConvolutionRectangular;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, o: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    kk: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  epsilon := 0.0001;
+  NN := TNNet.Create();
+  // 4x4x2 input, asymmetric kernel, no padding, stride 1.
+  Input := TNNetVolume.Create(4, 4, 2);
+  InputPlus := TNNetVolume.Create(4, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 2, 1)); // pError=1 resizes error volumes
+    // Linear activation rectangular conv so the gradient is exact (no
+    // activation kink) for the finite-difference comparison.
+    Conv := TNNetConvolutionRectangular.Create(3, pFeatureSizeX, pFeatureSizeY, 0, 1);
+    NN.AddLayer(Conv);
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+      NN.GetLastLayer.Output.SizeY, NN.GetLastLayer.Output.Depth);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Small inputs/targets keep loss and gradients O(1) for single-precision FD.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := (Sin(i * 0.41) * 0.5 + 0.1) * 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.27) * 0.1;
+    for o := 0 to Conv.Neurons.Count - 1 do
+      for i := 0 to Conv.Neurons[o].Weights.Size - 1 do
+        Conv.Neurons[o].Weights.Raw[i] := Sin(o * 0.7 + i * 0.3) * 0.2;
+    Conv.FlushWeightCache();
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue(ALabel + ' input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. the RAW weights ----
+    for o := 0 to Conv.Neurons.Count - 1 do
+      for i := 0 to Conv.Neurons[o].Weights.Size - 1 do
+      begin
+        Conv.Neurons[o].Weights.Raw[i] := Conv.Neurons[o].Weights.Raw[i] + epsilon;
+        Conv.FlushWeightCache();
+        lossPlus := ComputeLoss(Input);
+        Conv.Neurons[o].Weights.Raw[i] := Conv.Neurons[o].Weights.Raw[i] - 2 * epsilon;
+        Conv.FlushWeightCache();
+        lossMinus := ComputeLoss(Input);
+        Conv.Neurons[o].Weights.Raw[i] := Conv.Neurons[o].Weights.Raw[i] + epsilon;
+        Conv.FlushWeightCache();
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        Conv.Neurons[o].ClearDelta;
+        NN.Backpropagate(Desired);
+        // Delta := Delta - LearningRate*gradient; LR=1 -> gradient = -Delta.
+        analyticalGrad := -Conv.Neurons[o].Delta.Raw[i];
+
+        AssertTrue(ALabel + ' weight gradient check (' + IntToStr(o) + ',' +
+          IntToStr(i) + ') num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRectangularConv1x3GradientCheck;
+begin
+  // Width-3, height-1 horizontal kernel.
+  RectangularConvGradientCheckXY(3, 1, 'RectangularConv 1x3');
+end;
+
+procedure TTestNeuralNumerical.TestRectangularConv3x1GradientCheck;
+begin
+  // Width-1, height-3 vertical kernel.
+  RectangularConvGradientCheckXY(1, 3, 'RectangularConv 3x1');
+end;
+
+procedure TTestNeuralNumerical.TestRectangularConvSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Conv: TNNetConvolutionRectangularReLU;
+  Saved, Saved2: string;
+  o, i: integer;
+begin
+  // Round-trip with X <> Y (1x7 kernel): SaveToString -> LoadFromString ->
+  // SaveToString must be string-equal, and the reloaded layer must keep the
+  // asymmetric extents (FeatureSizeX=7, FeatureSizeY=1).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(9, 9, 3, 1));
+    Conv := TNNetConvolutionRectangularReLU.Create({pNumFeatures=}4,
+      {pFeatureSizeX=}7, {pFeatureSizeY=}1, {pInputPadding=}0, {pStride=}1);
+    NN.AddLayer(Conv);
+    AssertEquals('Rectangular conv FeatureSizeX', 7, Conv.FeatureSizeX);
+    AssertEquals('Rectangular conv FeatureSizeY', 1, Conv.FeatureSizeY);
+
+    for o := 0 to Conv.Neurons.Count - 1 do
+      for i := 0 to Conv.Neurons[o].Weights.Size - 1 do
+        Conv.Neurons[o].Weights.Raw[i] := 0.11 * (o + 1) - 0.05 * i;
+    Conv.FlushWeightCache();
+
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('Rectangular conv SaveToString round-trip', Saved, Saved2);
+      AssertTrue('Rectangular conv class token present in serialized string',
+        Pos('TNNetConvolutionRectangularReLU', Saved) > 0);
+      AssertEquals('Reloaded FeatureSizeX',
+        7, TNNetConvolutionRectangular(NN2.Layers[1]).FeatureSizeX);
+      AssertEquals('Reloaded FeatureSizeY',
+        1, TNNetConvolutionRectangular(NN2.Layers[1]).FeatureSizeY);
     finally
       NN2.Free;
     end;
