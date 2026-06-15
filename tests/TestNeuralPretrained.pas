@@ -336,6 +336,8 @@ type
     procedure TestPaliGemmaLogitParity;
     procedure TestQwen2VLMRoPEPositionIds;
     procedure TestQwen2VLLogitParity;
+    procedure TestQwen2AudioConfigFromJSONFile;
+    procedure TestQwen2AudioParity;
     procedure TestViTConfigFromJSONFile;
     procedure TestViTImageClassificationParity;
     procedure TestResNetConfigFromJSONFile;
@@ -14356,6 +14358,143 @@ begin
     ImageInput.Free;
     RefJson.Free;
     VisionNet.Free;
+    ProjectorNet.Free;
+    TextNet.Free;
+  end;
+end;
+
+// Verifies ReadQwen2AudioConfigFromJSONFile on the committed pico Qwen2-Audio
+// config: a Whisper audio encoder + Qwen2 text decoder + single-linear
+// projector. model_type "qwen2_audio".
+procedure TTestNeuralPretrained.TestQwen2AudioConfigFromJSONFile;
+var
+  Config: TQwen2AudioConfig;
+begin
+  Config := ReadQwen2AudioConfigFromJSONFile(
+    FixturePath('tiny_qwen2audio_config.json'));
+  AssertEquals('model_type', 'qwen2_audio', Config.ModelType);
+  AssertEquals('text model_type', 'qwen2', Config.Text.ModelType);
+  AssertEquals('text hidden', 32, Config.Text.HiddenSize);
+  AssertEquals('text layers', 2, Config.Text.NumLayers);
+  AssertEquals('text vocab', 50, Config.Text.VocabSize);
+  AssertTrue('Qwen2 q/k/v biased', Config.Text.QKVBias);
+  AssertEquals('audio d_model', 24, Config.Audio.DModel);
+  AssertEquals('audio encoder layers', 2, Config.Audio.EncoderLayers);
+  AssertEquals('audio encoder heads', 4, Config.Audio.EncoderHeads);
+  AssertEquals('audio num_mel_bins', 16, Config.Audio.NumMelBins);
+  AssertEquals('audio max_source_positions', 6, Config.Audio.MaxSourcePositions);
+  AssertEquals('num audio tokens (max_src/2)', 3, Config.NumAudioTokens);
+  AssertEquals('audio_token_index', 49, Config.AudioTokenIndex);
+end;
+
+// Qwen2-Audio end-to-end parity: runs the Whisper audio tower + avg_pooler +
+// final LayerNorm + single-linear projector on the pinned log-mel input, then
+// Qwen2AudioRunLogits splices the projected audio frames into the Qwen2
+// decoder's embedding sequence at the <|AUDIO|> slots and runs the decoder
+// causally. Checks BOTH the (3,1,text_hidden) projected audio tokens AND the
+// (seq,vocab) next-token logits < 1e-4 vs the HF float64 oracle
+// (Qwen2AudioForConditionalGeneration forward). The fixture generator asserts
+// the projector bias, the encoder pool/norm tail, and the splice all matter.
+procedure TTestNeuralPretrained.TestQwen2AudioParity;
+var
+  TowerNet, PoolNormNet, ProjectorNet, TextNet: TNNet;
+  Config: TQwen2AudioConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  MelArr, RowArr, IdsArr, ATArr, RowAT, LogitsArr, RowL: TJSONArray;
+  Mel, MelInput, AudioTokens, Logits: TNNetVolume;
+  TokenIds: array of integer;
+  b, t, j, v, SeqLen, Vocab, MelBins, MelLen: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  Mel := TNNetVolume.Create;
+  MelInput := TNNetVolume.Create;
+  AudioTokens := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  TowerNet := nil; PoolNormNet := nil; ProjectorNet := nil; TextNet := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwen2audio_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    MelBins := TJSONObject(RefRoot).Get('num_mel_bins', 0);
+    MelLen := TJSONObject(RefRoot).Get('mel_len', 0);
+    IdsArr := TJSONArray(TJSONObject(RefRoot).Find('token_ids'));
+    SeqLen := IdsArr.Count;
+    SetLength(TokenIds, SeqLen);
+    for t := 0 to SeqLen - 1 do TokenIds[t] := IdsArr.Items[t].AsInteger;
+
+    BuildQwen2AudioFromSafeTensors(FixturePath('tiny_qwen2audio.safetensors'),
+      TowerNet, PoolNormNet, ProjectorNet, TextNet, Config, {pSeqLen=}SeqLen,
+      {pInferenceOnly=}false, FixturePath('tiny_qwen2audio_config.json'));
+    AssertTrue('tower net built', TowerNet <> nil);
+    AssertTrue('pool/norm net built', PoolNormNet <> nil);
+    AssertTrue('projector net built', ProjectorNet <> nil);
+    AssertTrue('text net built', TextNet <> nil);
+
+    // ---- load the (num_mel_bins, mel_len) mel and transpose to the tower
+    // input layout (mel_len frames, 1, num_mel_bins). ----
+    MelArr := TJSONArray(TJSONObject(RefRoot).Find('mel'));   // [MelBins][MelLen]
+    Mel.ReSize(MelBins, 1, MelLen);     // store as (b, 0, t) = Mel[b*MelLen+t]
+    for b := 0 to MelBins - 1 do
+    begin
+      RowArr := TJSONArray(MelArr.Items[b]);
+      for t := 0 to MelLen - 1 do
+        Mel.FData[b * MelLen + t] := RowArr.Items[t].AsFloat;
+    end;
+    Qwen2AudioMelToInput(Mel, MelInput, MelBins, MelLen);
+
+    // ---- projected audio tokens parity ----
+    Qwen2AudioProjectAudio(TowerNet, PoolNormNet, ProjectorNet,
+      MelInput, AudioTokens, Config.NumAudioTokens);
+    AssertEquals('audio token rows', Config.NumAudioTokens, AudioTokens.SizeX);
+    AssertEquals('audio token depth = text hidden', Config.Text.HiddenSize,
+      AudioTokens.Depth);
+    ATArr := TJSONArray(TJSONObject(RefRoot).Find('audio_tokens'));
+    MaxDiff := 0;
+    for t := 0 to Config.NumAudioTokens - 1 do
+    begin
+      RowAT := TJSONArray(ATArr.Items[t]);
+      for j := 0 to Config.Text.HiddenSize - 1 do
+      begin
+        Diff := Abs(AudioTokens.FData[t * Config.Text.HiddenSize + j] -
+          RowAT.Items[j].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('projected audio tokens: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // ---- next-token logits parity (full forward with the splice) ----
+    Qwen2AudioRunLogits(TowerNet, PoolNormNet, ProjectorNet, TextNet,
+      MelInput, TokenIds, Config.AudioTokenIndex, Config.NumAudioTokens,
+      Logits);
+    AssertEquals('logits rows = seq len', SeqLen, Logits.SizeX);
+    AssertEquals('logits depth = vocab', Config.Text.VocabSize, Logits.Depth);
+    LogitsArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    Vocab := Config.Text.VocabSize;
+    MaxDiff := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      RowL := TJSONArray(LogitsArr.Items[t]);
+      for v := 0 to Vocab - 1 do
+      begin
+        Diff := Abs(Logits.FData[t * Vocab + v] - RowL.Items[v].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('next-token logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Logits.Free;
+    AudioTokens.Free;
+    MelInput.Free;
+    Mel.Free;
+    RefJson.Free;
+    TowerNet.Free;
+    PoolNormNet.Free;
     ProjectorNet.Free;
     TextNet.Free;
   end;

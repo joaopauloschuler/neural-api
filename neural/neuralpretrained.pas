@@ -6508,6 +6508,123 @@ procedure PaliGemmaRunLogits(VisionNet, ProjectorNet, TextNet: TNNet;
   ImageTokenIndex, NumPatches, PrefixLen: integer; Logits: TNNetVolume);
 
 // ===========================================================================
+// QWEN2-AUDIO AUDIO-UNDERSTANDING IMPORT (model_type "qwen2_audio", e.g.
+// Qwen/Qwen2-Audio-7B-Instruct) - the AUDIO analogue of the landed
+// vision-language importers (LLaVA / PaliGemma). The pipeline:
+//   log-mel spectrogram -> a Whisper-style conv+transformer audio ENCODER
+//   (audio_tower.*) -> a single biased Linear multimodal projector
+//   (audio d_model -> text hidden_size) -> the projected audio frames SPLICED
+//   into the language decoder's token-embedding sequence at the <|AUDIO|>
+//   placeholder positions (audio_token_index) -> ordinary CAUSAL decoding
+//   through a Qwen2 LM -> next-token logits.
+// Almost everything is REUSED: the audio tower is the Whisper encoder
+// (BuildWhisperStackBlocks / LoadWhisperStack / LoadWhisperConv1D machinery,
+// the audio_tower. key spelling) and the text side is the stock Qwen2 path
+// (BuildLlamaFromTensorReaderWithConfig). The genuinely NEW pieces are:
+// (a) the Qwen2-Audio ENCODER TAIL - after the encoder blocks HF does
+// permute -> AvgPool1d(2, stride 2) over the frame axis (halves the frames a
+// second time) -> permute -> a final LayerNorm; so the mel input length
+// 2*max_source_positions becomes max_source_positions frames after conv2 and
+// max_source_positions//2 audio tokens after the avg_pooler; (b) the single
+// biased Linear connector (Qwen2AudioBuildProjector); and (c) the embed
+// SPLICE that replaces the <|AUDIO|> rows with the projected audio frames -
+// the SAME splice the vision-LLM importers use (LlavaAssembleEmbeddings is
+// reused verbatim, audio frames in place of visual tokens).
+// v1 scope: a SINGLE full-length audio clip + text, single-turn, greedy /
+// sampled decode. Padded/batched audio (feature_attention_mask, the legacy
+// per-audio expand) is a follow-up; v1 takes the full-length clip so the
+// audio attention mask is all-attend (a no-op).
+// ---------------------------------------------------------------------------
+type
+  TQwen2AudioConfig = record
+    Text: TLlamaConfig;            // text_config (the Qwen2 decoder)
+    Audio: TWhisperConfig;         // audio_config (the Whisper encoder shape;
+                                   // only the encoder fields are used)
+    AudioTokenIndex: integer;      // audio_token_index (the <|AUDIO|> id the
+                                   // projected audio frames replace)
+    NumAudioTokens: integer;       // max_source_positions div 2 (frames out of
+                                   // the avg_pooler for a full-length clip)
+    ModelType: string;             // 'qwen2_audio'
+  end;
+
+// Reads a HF Qwen2-Audio config.json (model_type "qwen2_audio"). The
+// text_config sub-object is parsed by the Llama/Qwen2 config reader; the
+// audio_config sub-object supplies the Whisper encoder shape (d_model,
+// encoder_layers, encoder_attention_heads, encoder_ffn_dim, num_mel_bins,
+// max_source_positions). audio_token_index defaults to 151646.
+function ReadQwen2AudioConfigFromJSONFile(const FileName: string): TQwen2AudioConfig;
+
+function Qwen2AudioConfigToString(const Config: TQwen2AudioConfig): string;
+
+// Builds the Qwen2-Audio AUDIO TOWER net: the Whisper encoder (conv frontend
+// + encoder blocks) ending at the LAST encoder block (raw frames; the
+// avg_pooler + final LayerNorm tail is applied by Qwen2AudioProjectAudio,
+// which also runs the projector). The net's input is the log-mel volume
+// (2*max_source_positions frames along SizeX, num_mel_bins along Depth - the
+// layout Qwen2AudioMelToInput produces). Prefix is 'model.audio_tower.' (5.x)
+// or 'audio_tower.'. The PoolNormNet (out) is a tiny 2-layer net
+// [Input -> TNNetTokenLayerNorm] holding the post-avgpool final LayerNorm.
+// Both nets are owned by the caller. Coded by Claude (AI).
+procedure Qwen2AudioBuildTower(Reader: TNNetSafeTensorsReader;
+  const Config: TQwen2AudioConfig; const Prefix: string;
+  out TowerNet, PoolNormNet: TNNet; pInferenceOnly: boolean = false);
+
+// Builds the Qwen2-Audio PROJECTOR net: a single biased Linear
+// (multi_modal_projector.linear) mapping the (NumAudioTokens,1,d_model) audio
+// feature to (NumAudioTokens,1,text_hidden) audio tokens. Prefix is
+// 'model.multi_modal_projector.' (5.x) or 'multi_modal_projector.'. Owned by
+// the caller. Coded by Claude (AI).
+function Qwen2AudioBuildProjector(Reader: TNNetSafeTensorsReader;
+  NumAudioTokens, AudioHidden, TextHidden: integer;
+  const Prefix: string; pInferenceOnly: boolean = false): TNNet;
+
+// Builds the three Qwen2-Audio nets from the checkpoint at FileName: the audio
+// tower (TowerNet + PoolNormNet, see Qwen2AudioBuildTower), the ProjectorNet
+// (single linear), and TextNet (the stock Qwen2 decoder, its TNNetEmbedding
+// fed externally by Qwen2AudioRunLogits). All owned by the caller. pSeqLen<=0
+// uses the text max_position_embeddings; the assembled prompt length must not
+// exceed it. pInferenceOnly frees training volumes during construction.
+procedure Qwen2AudioBuildFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TQwen2AudioConfig;
+  out TowerNet, PoolNormNet, ProjectorNet, TextNet: TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+procedure BuildQwen2AudioFromSafeTensors(const FileName: string;
+  out TowerNet, PoolNormNet, ProjectorNet, TextNet: TNNet;
+  out Config: TQwen2AudioConfig;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+
+// Transposes a (num_mel_bins, mel_len) log-mel spectrogram Mel (mel bins along
+// SizeX, frames along Depth or vice-versa) into the (mel_len, 1, num_mel_bins)
+// volume the audio tower expects (frames along SizeX, mel bins along Depth).
+// Mel must be a (NumMelBins, 1, MelLen) OR (MelLen, 1, NumMelBins)-shaped
+// volume; pass MelBins/MelLen to disambiguate. Dst is resized. The HF
+// input_features layout is (num_mel_bins, mel_len). Coded by Claude (AI).
+procedure Qwen2AudioMelToInput(Mel, Dst: TNNetVolume;
+  MelBins, MelLen: integer);
+
+// Runs the audio tower + avg_pooler + final LayerNorm + projector on the
+// (mel_len,1,num_mel_bins) input volume MelInput (from Qwen2AudioMelToInput)
+// and returns the projected audio tokens in AudioTokens (resized to
+// (NumAudioTokens,1,text_hidden)). Coded by Claude (AI).
+procedure Qwen2AudioProjectAudio(TowerNet, PoolNormNet, ProjectorNet: TNNet;
+  MelInput, AudioTokens: TNNetVolume; NumAudioTokens: integer);
+
+// Full Qwen2-Audio forward: projects the audio, assembles the spliced
+// embedding sequence (reusing LlavaAssembleEmbeddings, audio frames in place
+// of visual tokens), injects it into TextNet's TNNetEmbedding output, runs the
+// decoder from the embedding onward, and returns the (SeqLen,1,vocab)
+// next-token logits in Logits. TokenIds is the full id sequence WITH
+// AudioTokenIndex at the NumAudioTokens audio-placeholder slots. Coded by
+// Claude (AI).
+procedure Qwen2AudioRunLogits(TowerNet, PoolNormNet, ProjectorNet,
+  TextNet: TNNet; MelInput: TNNetVolume; const TokenIds: array of integer;
+  AudioTokenIndex, NumAudioTokens: integer; Logits: TNNetVolume);
+
+// ===========================================================================
 // QWEN2-VL / QWEN2.5-VL VISION-LANGUAGE IMPORT (model_type "qwen2_vl" /
 // "qwen2_5_vl", e.g. Qwen/Qwen2-VL-2B-Instruct). The text backbone is a stock
 // Qwen2 decoder (RMSNorm + RoPE + SwiGLU, GQA, q/k/v BIASES); the GENUINELY
@@ -53910,6 +54027,437 @@ begin
   finally
     Embeds.Free;
     VisualTokens.Free;
+  end;
+end;
+
+// ===========================================================================
+// QWEN2-AUDIO audio-understanding importer (implementation). See the interface
+// section for the architecture summary. Coded by Claude (AI).
+// ===========================================================================
+
+function ReadQwen2AudioConfigFromJSONFile(
+  const FileName: string): TQwen2AudioConfig;
+var
+  JsonText, TextCfgText: TStringList;
+  Root: TJSONData;
+  Obj, TextObj, AudioObj: TJSONObject;
+  TempTextCfg, ActFn: string;
+
+  function RequiredSubObject(const FieldName: string): TJSONObject;
+  var
+    D: TJSONData;
+  begin
+    D := Obj.Find(FieldName);
+    if (D = nil) or not (D is TJSONObject) then
+      ImportError('Qwen2-Audio import: config "' + FileName +
+        '" is missing the required sub-object "' + FieldName + '".');
+    Result := TJSONObject(D);
+  end;
+
+  function RequiredInt(O: TJSONObject; const FieldName: string): integer;
+  begin
+    if O.IndexOfName(FieldName) < 0 then
+      ImportError('Qwen2-Audio import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := O.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Qwen2-Audio import: config field "' + FieldName +
+        '" must be a positive integer, got ' + O.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Qwen2-Audio import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  TempTextCfg := '';
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Qwen2-Audio import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Qwen2-Audio import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    if Obj.Get('model_type', 'qwen2_audio') <> 'qwen2_audio' then
+      ImportError('Qwen2-Audio import: config model_type is "' +
+        Obj.Get('model_type', '') +
+        '" - only "qwen2_audio" is supported here.');
+    Result.ModelType := 'qwen2_audio';
+
+    // ---- text_config: hand the sub-object to the Llama/Qwen2 config reader
+    // by writing it to a temp file (it expects a top-level config). ----
+    TextObj := RequiredSubObject('text_config');
+    TextCfgText := TStringList.Create;
+    try
+      TextCfgText.Text := TextObj.AsJSON;
+      TempTextCfg := GetTempFileName('', 'q2a_txt') + '.json';
+      TextCfgText.SaveToFile(TempTextCfg);
+    finally
+      TextCfgText.Free;
+    end;
+    Result.Text := ReadLlamaConfigFromJSONFile(TempTextCfg);
+
+    // ---- audio_config: a Whisper ENCODER. Only the encoder fields exist
+    // (there is no decoder), so the fields are parsed directly into the
+    // TWhisperConfig encoder slots (the decoder slots stay unused). ----
+    AudioObj := RequiredSubObject('audio_config');
+    Result.Audio.ModelType := 'whisper';
+    Result.Audio.DModel := RequiredInt(AudioObj, 'd_model');
+    Result.Audio.EncoderLayers := RequiredInt(AudioObj, 'encoder_layers');
+    Result.Audio.EncoderHeads := RequiredInt(AudioObj,
+      'encoder_attention_heads');
+    Result.Audio.EncoderFFNDim := RequiredInt(AudioObj, 'encoder_ffn_dim');
+    Result.Audio.NumMelBins := RequiredInt(AudioObj, 'num_mel_bins');
+    Result.Audio.MaxSourcePositions := RequiredInt(AudioObj,
+      'max_source_positions');
+    Result.Audio.VocabSize := AudioObj.Get('vocab_size', 51865);
+    Result.Audio.ScaleEmbedding := AudioObj.Get('scale_embedding', False);
+    // Unused decoder slots (no Whisper decoder in Qwen2-Audio).
+    Result.Audio.DecoderLayers := 0;
+    Result.Audio.DecoderHeads := Result.Audio.EncoderHeads;
+    Result.Audio.DecoderFFNDim := Result.Audio.EncoderFFNDim;
+    Result.Audio.MaxTargetPositions := 0;
+    ActFn := AudioObj.Get('activation_function', 'gelu');
+    if ActFn <> 'gelu' then
+      ImportError('Qwen2-Audio import: audio activation_function "' + ActFn +
+        '" is not supported - Qwen2-Audio uses the exact erf "gelu".');
+    if Odd(Result.Audio.MaxSourcePositions) then
+      ImportError('Qwen2-Audio import: max_source_positions must be EVEN ' +
+        '(the avg_pooler halves the encoder frames), got ' +
+        IntToStr(Result.Audio.MaxSourcePositions) + '.');
+    Result.NumAudioTokens := Result.Audio.MaxSourcePositions div 2;
+
+    // ---- multimodal knob. audio_token_index default is the Qwen2-Audio
+    // <|AUDIO|> id 151646. ----
+    Result.AudioTokenIndex := Obj.Get('audio_token_index', 151646);
+  finally
+    if (TempTextCfg <> '') and FileExists(TempTextCfg) then
+      DeleteFile(TempTextCfg);
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function Qwen2AudioConfigToString(const Config: TQwen2AudioConfig): string;
+begin
+  Result := 'qwen2_audio: text(' + Config.Text.ModelType +
+    ', d=' + IntToStr(Config.Text.HiddenSize) +
+    ', layers=' + IntToStr(Config.Text.NumLayers) +
+    ', vocab=' + IntToStr(Config.Text.VocabSize) +
+    '), audio(d=' + IntToStr(Config.Audio.DModel) +
+    ', enc_layers=' + IntToStr(Config.Audio.EncoderLayers) +
+    ', heads=' + IntToStr(Config.Audio.EncoderHeads) +
+    ', mel_bins=' + IntToStr(Config.Audio.NumMelBins) +
+    ', max_src=' + IntToStr(Config.Audio.MaxSourcePositions) +
+    '), audio_tokens=' + IntToStr(Config.NumAudioTokens) +
+    ', audio_token=' + IntToStr(Config.AudioTokenIndex);
+end;
+
+procedure Qwen2AudioBuildTower(Reader: TNNetSafeTensorsReader;
+  const Config: TQwen2AudioConfig; const Prefix: string;
+  out TowerNet, PoolNormNet: TNNet; pInferenceOnly: boolean = false);
+var
+  Tower, PoolNorm: TNNet;
+  Conv1, Conv2, EncPos, FinalNorm: TNNetLayer;
+  EncBlocks: TMarianBlockArray;
+  Tmp: TNNetVolume;
+  Consumed: TStringList;
+  i, NumInputFrames: integer;
+begin
+  TowerNet := nil;
+  PoolNormNet := nil;
+  NumInputFrames := 2 * Config.Audio.MaxSourcePositions;
+  Tower := nil;
+  PoolNorm := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    // ---- audio tower net: conv frontend + encoder blocks (raw frames). The
+    // avg_pooler + final LayerNorm tail lives in PoolNorm (the pooling has to
+    // happen between this net and the norm). The conv frontend matches
+    // Whisper exactly (k3,p1 conv1; k3,p1,stride2 conv2; exact erf GELU). ----
+    Tower := TNNet.Create();
+    Tower.AddLayer( TNNetInput.Create(NumInputFrames, 1,
+      Config.Audio.NumMelBins, 1) );
+    Tower.AddLayer( TNNetPadXY.Create(1, 0) );
+    Conv1 := Tower.AddLayer( TNNetConvolutionLinear.Create(
+      Config.Audio.DModel, 3, {Padding=}0, {Stride=}1) );
+    AddWhisperExactGelu(Tower);
+    Tower.AddLayer( TNNetPadXY.Create(1, 0) );
+    Conv2 := Tower.AddLayer( TNNetConvolutionLinear.Create(
+      Config.Audio.DModel, 3, {Padding=}0, {Stride=}2) );
+    AddWhisperExactGelu(Tower);
+    EncPos := Tower.AddLayer(
+      TNNetLearnedPositionalEmbedding.Create(Config.Audio.MaxSourcePositions) );
+    if pInferenceOnly then Tower.MakeInferenceOnly();
+    BuildWhisperStackBlocks(Tower, Config.Audio, Config.Audio.EncoderLayers,
+      Config.Audio.EncoderHeads, Config.Audio.EncoderFFNDim,
+      {IsDecoder=}false, nil, EncBlocks, pInferenceOnly);
+    if pInferenceOnly then Tower.MakeInferenceOnly();
+
+    // ---- pool-norm tail net: the post-avg_pooler final LayerNorm. Input is
+    // the pooled frame grid (NumAudioTokens,1,d_model). ----
+    PoolNorm := TNNet.Create();
+    PoolNorm.AddLayer( TNNetInput.Create(Config.NumAudioTokens, 1,
+      Config.Audio.DModel) );
+    FinalNorm := PoolNorm.AddLayer(
+      TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
+    if pInferenceOnly then PoolNorm.MakeInferenceOnly();
+
+    // ---- weights ----
+    LoadWhisperConv1D(Reader, Conv1, Prefix + 'conv1.weight',
+      Prefix + 'conv1.bias', Config.Audio.NumMelBins, Config.Audio.DModel,
+      Consumed);
+    LoadWhisperConv1D(Reader, Conv2, Prefix + 'conv2.weight',
+      Prefix + 'conv2.bias', Config.Audio.DModel, Config.Audio.DModel,
+      Consumed);
+    // embed_positions: the [max_source_positions, d_model] (learned/fixed)
+    // table. Qwen2-Audio always saves it; load verbatim.
+    if not Reader.HasTensor(Prefix + 'embed_positions.weight') then
+      ImportError('Qwen2-Audio import: "' + Prefix +
+        'embed_positions.weight" not found.');
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(Prefix + 'embed_positions.weight', Tmp);
+      if Tmp.Size <> Config.Audio.MaxSourcePositions * Config.Audio.DModel then
+        ImportError('Qwen2-Audio import: ' + Prefix +
+          'embed_positions.weight element count mismatch.');
+      for i := 0 to Tmp.Size - 1 do
+        EncPos.Neurons[0].Weights.FData[i] := Tmp.FData[i];
+      EncPos.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    // encoder blocks (Whisper self-attention + FFN, the audio_tower.layers.*
+    // names match the Whisper model.encoder.layers.* names).
+    LoadWhisperStack(Reader, EncBlocks, Prefix + 'layers.', Config.Audio,
+      Config.Audio.EncoderFFNDim, {IsDecoder=}false, Consumed);
+    // post-avg_pooler final LayerNorm.
+    LoadLayerNormWeights(Reader, FinalNorm, Prefix + 'layer_norm.weight',
+      Prefix + 'layer_norm.bias', Config.Audio.DModel);
+
+    TowerNet := Tower;
+    PoolNormNet := PoolNorm;
+    Tower := nil;
+    PoolNorm := nil;
+  finally
+    Tower.Free;
+    PoolNorm.Free;
+    Consumed.Free;
+  end;
+end;
+
+function Qwen2AudioBuildProjector(Reader: TNNetSafeTensorsReader;
+  NumAudioTokens, AudioHidden, TextHidden: integer;
+  const Prefix: string; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  Lin: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer( TNNetInput.Create(NumAudioTokens, 1, AudioHidden) );
+    // linear: AudioHidden -> TextHidden (biased), per token.
+    Lin := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    LoadLlamaLinearWeights(Reader, Lin, Prefix + 'linear.weight',
+      AudioHidden, TextHidden, 0, -1, 0, Prefix + 'linear.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+procedure Qwen2AudioBuildFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TQwen2AudioConfig;
+  out TowerNet, PoolNormNet, ProjectorNet, TextNet: TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  AudioPrefix, ProjPrefix: string;
+begin
+  TowerNet := nil;
+  PoolNormNet := nil;
+  ProjectorNet := nil;
+  TextNet := nil;
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    // ---- tensor-name prefix detection (transformers 5.x adds "model.") ----
+    if Reader.HasTensor('model.audio_tower.conv1.weight') then
+      AudioPrefix := 'model.audio_tower.'
+    else if Reader.HasTensor('audio_tower.conv1.weight') then
+      AudioPrefix := 'audio_tower.'
+    else
+      ImportError('Qwen2-Audio import: audio tower conv1 not found ' +
+        '(looked under model.audio_tower. and audio_tower.) in ' +
+        Reader.FileName + '.');
+    if Reader.HasTensor('model.multi_modal_projector.linear.weight') then
+      ProjPrefix := 'model.multi_modal_projector.'
+    else if Reader.HasTensor('multi_modal_projector.linear.weight') then
+      ProjPrefix := 'multi_modal_projector.'
+    else
+      ImportError('Qwen2-Audio import: multi_modal_projector.linear not ' +
+        'found in ' + Reader.FileName + '.');
+    // Language model: alias model.language_model.* -> model.* so the stock
+    // Qwen2 builder's prefix auto-detection fires. lm_head.weight is already
+    // top-level.
+    if Reader.HasTensor('model.language_model.embed_tokens.weight') then
+      Reader.RenameTensorPrefix('model.language_model.', 'model.')
+    else if Reader.HasTensor('language_model.model.embed_tokens.weight') then
+    begin
+      Reader.RenameTensorPrefix('language_model.model.', 'model.');
+      if Reader.HasTensor('language_model.lm_head.weight') then
+        Reader.RenameTensor('language_model.lm_head.weight', 'lm_head.weight');
+    end
+    else if not Reader.HasTensor('model.embed_tokens.weight') then
+      ImportError('Qwen2-Audio import: language-model embed_tokens not found ' +
+        '(looked under model.language_model., language_model.model. and ' +
+        'model.) in ' + Reader.FileName + '.');
+
+    // ---- audio tower (+ pool/norm tail) and projector ----
+    Qwen2AudioBuildTower(Reader, Config, AudioPrefix,
+      TowerNet, PoolNormNet, pInferenceOnly);
+    ProjectorNet := Qwen2AudioBuildProjector(Reader, Config.NumAudioTokens,
+      Config.Audio.DModel, Config.Text.HiddenSize, ProjPrefix,
+      pInferenceOnly);
+
+    // Drop the audio-tower + projector tensors so the stock Qwen2 builder's
+    // strict all-tensors-consumed check sees only the language-model tensors.
+    Reader.RemoveTensorsWithPrefix(AudioPrefix);
+    Reader.RemoveTensorsWithPrefix(ProjPrefix);
+
+    // ---- language model (stock Qwen2 path; embedding fed externally by
+    // Qwen2AudioRunLogits). The reader is consumed (freed) by the core
+    // builder, so this MUST be last. ----
+    TextNet := BuildLlamaFromTensorReaderWithConfig(Reader, FileName,
+      Config.Text, pSeqLen, pInferenceOnly, {pQuantizeInt8=}false);
+    Reader := nil;  // ownership transferred to the Llama builder
+  except
+    TowerNet.Free;
+    PoolNormNet.Free;
+    ProjectorNet.Free;
+    TextNet.Free;
+    Reader.Free;
+    raise;
+  end;
+end;
+
+procedure BuildQwen2AudioFromSafeTensors(const FileName: string;
+  out TowerNet, PoolNormNet, ProjectorNet, TextNet: TNNet;
+  out Config: TQwen2AudioConfig;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+var
+  CfgPath: string;
+begin
+  if ConfigFileName <> '' then CfgPath := ConfigFileName
+  else CfgPath := IncludeTrailingPathDelimiter(ExtractFilePath(FileName)) +
+    'config.json';
+  Config := ReadQwen2AudioConfigFromJSONFile(CfgPath);
+  Qwen2AudioBuildFromSafeTensorsWithConfig(FileName, Config,
+    TowerNet, PoolNormNet, ProjectorNet, TextNet, pSeqLen, pInferenceOnly);
+end;
+
+procedure Qwen2AudioMelToInput(Mel, Dst: TNNetVolume;
+  MelBins, MelLen: integer);
+var
+  b, t: integer;
+begin
+  if Mel.Size <> MelBins * MelLen then
+    ImportError('Qwen2AudioMelToInput: mel element count ' +
+      IntToStr(Mel.Size) + ' <> num_mel_bins*mel_len = ' +
+      IntToStr(MelBins * MelLen) + '.');
+  // HF input_features layout is (num_mel_bins, mel_len): row b, column t. The
+  // audio tower expects (mel_len frames along SizeX, 1, num_mel_bins along
+  // Depth). Transpose: Dst[t,0,b] = Mel[b*mel_len + t].
+  Dst.ReSize(MelLen, 1, MelBins);
+  for t := 0 to MelLen - 1 do
+    for b := 0 to MelBins - 1 do
+      Dst.FData[t * MelBins + b] := Mel.FData[b * MelLen + t];
+end;
+
+procedure Qwen2AudioProjectAudio(TowerNet, PoolNormNet, ProjectorNet: TNNet;
+  MelInput, AudioTokens: TNNetVolume; NumAudioTokens: integer);
+var
+  Raw, Pooled: TNNetVolume;
+  d, srcFrames, t, c: integer;
+begin
+  // 1. run the audio tower -> raw encoder frames (srcFrames,1,d_model).
+  TowerNet.Compute(MelInput);
+  Raw := TowerNet.GetLastLayer().Output;
+  d := Raw.Depth;
+  srcFrames := Raw.SizeX;
+  if srcFrames <> 2 * NumAudioTokens then
+    ImportError('Qwen2AudioProjectAudio: encoder produced ' +
+      IntToStr(srcFrames) + ' frames but expected ' +
+      IntToStr(2 * NumAudioTokens) + ' (= 2*num_audio_tokens for the ' +
+      'avg_pooler).');
+  // 2. avg_pooler: AvgPool1d(2, stride 2) over the frame axis - average each
+  // consecutive frame PAIR (divide by exactly 2). This is the Qwen2-Audio
+  // encoder tail; TNNetAvgPool's 2-D divisor is wrong for a (X,1,D) grid, so
+  // the pooling is done here explicitly.
+  Pooled := TNNetVolume.Create;
+  try
+    Pooled.ReSize(NumAudioTokens, 1, d);
+    for t := 0 to NumAudioTokens - 1 do
+      for c := 0 to d - 1 do
+        Pooled.FData[t * d + c] :=
+          0.5 * (Raw.FData[(2 * t) * d + c] +
+                 Raw.FData[(2 * t + 1) * d + c]);
+    // 3. final LayerNorm (the pool-norm tail net).
+    PoolNormNet.Compute(Pooled);
+    // 4. projector (single biased linear).
+    ProjectorNet.Compute(PoolNormNet.GetLastLayer().Output);
+    AudioTokens.Copy(ProjectorNet.GetLastLayer().Output);
+  finally
+    Pooled.Free;
+  end;
+end;
+
+procedure Qwen2AudioRunLogits(TowerNet, PoolNormNet, ProjectorNet,
+  TextNet: TNNet; MelInput: TNNetVolume; const TokenIds: array of integer;
+  AudioTokenIndex, NumAudioTokens: integer; Logits: TNNetVolume);
+var
+  AudioTokens, Embeds: TNNetVolume;
+  EmbeddingLayer: TNNetLayer;
+  i, SeqLen: integer;
+begin
+  if (TextNet.Layers.Count <= 2) or
+     not (TextNet.Layers[1] is TNNetEmbedding) then
+    ImportError('Qwen2AudioRunLogits: TextNet is not a ' +
+      'BuildQwen2AudioFromSafeTensors language model (layer 1 must be a ' +
+      'TNNetEmbedding).');
+  EmbeddingLayer := TextNet.Layers[1];
+  SeqLen := Length(TokenIds);
+  if SeqLen <> EmbeddingLayer.Output.SizeX then
+    ImportError('Qwen2AudioRunLogits: prompt length ' + IntToStr(SeqLen) +
+      ' must equal the decoder''s SeqLen ' +
+      IntToStr(EmbeddingLayer.Output.SizeX) +
+      ' (rebuild with pSeqLen = assembled prompt length).');
+  AudioTokens := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  try
+    Qwen2AudioProjectAudio(TowerNet, PoolNormNet, ProjectorNet,
+      MelInput, AudioTokens, NumAudioTokens);
+    // Reuse the LLaVA splice verbatim: text ids look up their embedding rows;
+    // the <|AUDIO|> slots receive the projected audio frames in order.
+    LlavaAssembleEmbeddings(TextNet, TokenIds, AudioTokenIndex,
+      NumAudioTokens, AudioTokens, Embeds);
+    EmbeddingLayer.Output.Copy(Embeds);
+    for i := 2 to TextNet.GetLastLayerIdx() do
+      TextNet.Layers[i].Compute();
+    TextNet.GetOutput(Logits);
+  finally
+    Embeds.Free;
+    AudioTokens.Free;
   end;
 end;
 
