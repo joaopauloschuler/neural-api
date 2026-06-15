@@ -295,6 +295,8 @@ type
     procedure TestBlipConfigFromJSONFile;
     procedure TestBlipCaptioningParity;
     procedure TestBlipCaptionGreedy;
+    procedure TestTrOCRConfigFromJSONFile;
+    procedure TestTrOCRParity;
     procedure TestInceptionV3ConfigFromJSONFile;
     procedure TestInceptionV3ImageClassificationParity;
     procedure TestMobileNetV3ConfigFromJSONFile;
@@ -13652,6 +13654,109 @@ begin
     RefJson.Free;
     VisionNet.Free;
     TextNet.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestTrOCRConfigFromJSONFile;
+var
+  Config: TTrOCRConfig;
+begin
+  Config := ReadTrOCRConfigFromJSONFile(FixturePath('tiny_trocr_config.json'));
+  AssertEquals('model_type', 'vision-encoder-decoder', Config.ModelType);
+  AssertEquals('enc hidden', 24, Config.EncHiddenSize);
+  AssertEquals('enc layers', 2, Config.EncLayers);
+  AssertEquals('enc heads', 3, Config.EncHeads);
+  AssertEquals('image size', 16, Config.ImageSize);
+  AssertEquals('patch size', 8, Config.PatchSize);
+  AssertEquals('d_model', 24, Config.DModel);
+  AssertEquals('dec layers', 2, Config.DecLayers);
+  AssertEquals('dec heads', 3, Config.DecHeads);
+  AssertEquals('dec ffn', 48, Config.DecFFNDim);
+  AssertEquals('vocab', 40, Config.VocabSize);
+  AssertEquals('max pos', 32, Config.MaxPositions);
+  AssertTrue('scale_embedding', Config.ScaleEmbedding);
+  AssertEquals('eos', 2, Config.EosTokenId);
+  AssertEquals('pad', 1, Config.PadTokenId);
+  AssertEquals('decoder_start', 2, Config.DecoderStartTokenId);
+end;
+
+// Float64 parity of the TrOCR OCR decoder against real HF transformers (the
+// FIRST optical-character-recognition / image-to-text importer): a fixed image
+// + a short decoder prefix; the per-position next-token logits over the vocab
+// must match within 1e-4. tests/fixtures/tiny_trocr.* is a pico
+// VisionEncoderDecoder (DeiT encoder + TrOCR/BART decoder); see
+// tools/make_pico_trocr_fixture.py.
+procedure TTestNeuralPretrained.TestTrOCRParity;
+var
+  EncoderNet, DecoderNet: TNNet;
+  Config: TTrOCRConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  PxArr, DecArr, LogArr, RowArr: TJSONArray;
+  Img, DecToks, Logits: TNNetVolume;
+  RefVal, GotVal, Diff, MaxDiff: double;
+  W, H, NumCh, x, yy, ch, SeqLen, Vocab, Pos, v, PreLen: integer;
+begin
+  RandSeed := 424242;
+  BuildTrOCRFromSafeTensors(FixturePath('tiny_trocr.safetensors'),
+    EncoderNet, DecoderNet, Config, {DecSeqLen=}8, {pInferenceOnly=}false,
+    FixturePath('tiny_trocr_config.json'));
+  RefJson := TStringList.Create;
+  Img := TNNetVolume.Create;
+  DecToks := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  W := Config.ImageSize; H := Config.ImageSize; NumCh := Config.NumChannels;
+  try
+    AssertTrue('encoder net built', EncoderNet <> nil);
+    AssertTrue('decoder net built', DecoderNet <> nil);
+    RefJson.LoadFromFile(FixturePath('tiny_trocr_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    // pixel_values stored as (C, H, W); CAI input is (x, y, depth=c).
+    PxArr := TJSONArray(TJSONObject(RefRoot).Find('pixel_values'));
+    DecArr := TJSONArray(TJSONObject(RefRoot).Find('dec_ids'));
+    LogArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    AssertTrue('pixel_values present', PxArr <> nil);
+    PreLen := DecArr.Count;
+    SeqLen := PreLen;
+    Vocab := Config.VocabSize;
+    Img.ReSize(W, H, NumCh);
+    for ch := 0 to NumCh - 1 do
+      for yy := 0 to H - 1 do
+        for x := 0 to W - 1 do
+          Img[x, yy, ch] :=
+            TJSONArray(TJSONArray(PxArr.Items[ch]).Items[yy]).Items[x].AsFloat;
+    // decoder token prefix padded with pad past the prefix (causal mask makes
+    // those positions invisible to the rows we read).
+    DecToks.ReSize(8, 1, 1);
+    for Pos := 0 to 7 do
+      if Pos < PreLen then DecToks.FData[Pos] := DecArr.Items[Pos].AsInteger
+      else DecToks.FData[Pos] := Config.PadTokenId;
+    RunTrOCRLogits(EncoderNet, DecoderNet, Img, DecToks, Logits);
+    AssertEquals('logits vocab', Vocab, Logits.Depth);
+    // oracle logits flat-by-row: logits[pos] is a vocab-length array.
+    for Pos := 0 to SeqLen - 1 do
+    begin
+      RowArr := TJSONArray(LogArr.Items[Pos]);
+      for v := 0 to Vocab - 1 do
+      begin
+        RefVal := RowArr.Items[v].AsFloat;
+        GotVal := Logits[Pos, 0, v];
+        Diff := Abs(GotVal - RefVal);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('TrOCR logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Logits.Free;
+    DecToks.Free;
+    Img.Free;
+    RefJson.Free;
+    EncoderNet.Free;
+    DecoderNet.Free;
   end;
 end;
 

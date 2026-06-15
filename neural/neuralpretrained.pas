@@ -4802,6 +4802,120 @@ function DecodeBlipCaptionGreedy(VisionNet, TextNet: TNNet;
   PixelValues: TNNetVolume; const Config: TBlipConfig;
   MaxNewTokens: integer): TNeuralIntegerArray;
 
+// ---------------------------------------------------------------------------
+// TrOCR IMPORT (microsoft/trocr-small-printed / trocr-small-handwritten and the
+// other VisionEncoderDecoder OCR checkpoints) - the FIRST optical-character-
+// recognition / image-to-text vertical: a cropped text-line image -> a
+// transcribed string (Li et al. 2021, arXiv:2109.10282). Structurally an
+// encoder-decoder seq2seq with a VISION encoder, riding the same two-net +
+// RunT5/DecodeSeq2Seq* convention as T5/Marian/Pegasus/BART/BLIP.
+//
+// Two nets are returned: EncoderNet (image -> patch hidden states) and
+// DecoderNet (a BART-style POST-LN causal decoder whose SECOND TNNetInput
+// holds the image hidden states - the T5EncoderStatesInput convention).
+//
+//   - ENCODER (DeiT/ViT): a BIASED patch conv, a class token AND a
+//     distillation token prepended (position_embeddings has num_patches + 2
+//     rows; both special tokens fold into the learned position table), PRE-LN
+//     encoder blocks (layernorm_before / layernorm_after, separate q/k/v/o
+//     Linears, mlp.fc1/fc2, exact-erf GELU), then a FINAL layernorm over all
+//     tokens. The decoder cross-attends to ALL num_patches + 2 tokens (cls +
+//     distillation + patches; NO CLS pooling).
+//   - DECODER (TrOCR / BART): learned ABSOLUTE position embeddings with BART's
+//     +2 padding offset, a layernorm_embedding, POST-norm blocks (residual add
+//     THEN biased LayerNorm), exact-erf GELU FFN, all q/k/v/out/fc Linears
+//     biased, scale_embedding (sqrt(d_model) on the token embeddings), and the
+//     output_projection TIED to the token embeddings with NO final_logits_bias.
+//
+// Run a SINGLE forward step (the parity contract) with RunTrOCRLogits: it
+// computes the image features once, copies them into the decoder's encoder-
+// states input, and runs the decoder over a (DecSeqLen,1,1) token prefix ->
+// (DecSeqLen,1,vocab) next-token logits. Autoregressive transcription reuses
+// the generic DecodeSeq2Seq* helpers (RunT5 fills the encoder-states input).
+// The decoder tokenizer is GPT-2 byte-level BPE (TNeuralHFTokenizer); the
+// importer covers the MODEL only. BuildFromPretrained does NOT dispatch a
+// vision-encoder-decoder (it returns ONE net); it raises an error pointing
+// here instead.
+// ---------------------------------------------------------------------------
+type
+  TTrOCRConfig = record
+    // encoder (DeiT/ViT)
+    EncHiddenSize: integer;     // encoder hidden_size
+    EncLayers: integer;         // encoder num_hidden_layers
+    EncHeads: integer;          // encoder num_attention_heads
+    EncIntermediate: integer;   // encoder intermediate_size
+    EncLayerNormEps: TNeuralFloat; // encoder layer_norm_eps
+    EncHiddenAct: TClipHiddenAct;  // encoder hidden_act (GELU family)
+    ImageSize: integer;         // encoder image_size
+    PatchSize: integer;         // encoder patch_size
+    NumChannels: integer;       // encoder num_channels (3)
+    // decoder (TrOCR / BART)
+    DModel: integer;            // decoder d_model (== encoder hidden_size)
+    DecLayers: integer;         // decoder_layers
+    DecHeads: integer;          // decoder_attention_heads
+    DecFFNDim: integer;         // decoder_ffn_dim
+    VocabSize: integer;         // decoder vocab_size
+    MaxPositions: integer;      // decoder max_position_embeddings
+    DecLayerNormEps: TNeuralFloat; // decoder layer-norm eps (1e-5)
+    ScaleEmbedding: boolean;    // decoder scale_embedding
+    BosTokenId: integer;        // decoder bos_token_id
+    EosTokenId: integer;        // decoder eos_token_id
+    PadTokenId: integer;        // decoder pad_token_id
+    DecoderStartTokenId: integer; // decoder_start_token_id
+    ModelType: string;          // 'vision-encoder-decoder' / 'trocr'
+  end;
+
+// Reads a HF VisionEncoderDecoder TrOCR config.json (model_type
+// "vision-encoder-decoder"). Required per sub-object: encoder.{hidden_size,
+// num_hidden_layers, num_attention_heads, intermediate_size, image_size,
+// patch_size} and decoder.{d_model, decoder_layers, decoder_attention_heads,
+// decoder_ffn_dim, vocab_size, max_position_embeddings}. Defaults follow
+// DeiT/TrOCR: encoder layer_norm_eps 1e-12, decoder layer-norm eps 1e-5,
+// num_channels 3, scale_embedding true, bos 0, eos 2, pad 1,
+// decoder_start_token_id = eos. activation_function must be the GELU family.
+function ReadTrOCRConfigFromJSONFile(const FileName: string): TTrOCRConfig;
+
+function TrOCRConfigToString(const Config: TTrOCRConfig): string;
+
+// Builds the TrOCR ENCODER and DECODER nets described by Config and loads
+// every weight from the checkpoint at FileName (.safetensors / sharded index /
+// pytorch_model.bin via CreatePretrainedTensorReader). DecSeqLen <= 0 uses the
+// full decoder max_position_embeddings context. Both nets are owned by the
+// caller. Run the pair with RunTrOCRLogits / RunT5 (the T5EncoderStatesInput
+// two-net convention).
+procedure BuildTrOCRFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TTrOCRConfig; out EncoderNet, DecoderNet: TNNet;
+  DecSeqLen: integer = 0; pInferenceOnly: boolean = false);
+
+// Same, but takes the already-read Config by value (the ...Ex naming).
+procedure BuildTrOCRFromSafeTensorsEx(const FileName: string;
+  Config: TTrOCRConfig; out EncoderNet, DecoderNet: TNNet;
+  DecSeqLen: integer = 0; pInferenceOnly: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+procedure BuildTrOCRFromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TTrOCRConfig;
+  DecSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+
+// Runs ONE forward step of the TrOCR decoder: computes the image patch hidden
+// states from PixelValues ((ImageSize,ImageSize,NumChannels), the EncoderNet
+// input), copies them into the decoder's encoder-states input, then runs the
+// decoder over DecoderTokens ((DecSeqLen,1,1)) -> Logits, the
+// (DecSeqLen,1,vocab) next-token logits at every prefix position.
+procedure RunTrOCRLogits(EncoderNet, DecoderNet: TNNet;
+  PixelValues, DecoderTokens: TNNetVolume; Logits: TNNetVolume);
+
+// Autoregressive greedy transcription: computes the image features once, then
+// runs the standard argmax decode loop from Config.DecoderStartTokenId,
+// stopping at the EOS token or after MaxNewTokens (or when DecSeqLen is
+// exhausted). Returns the GENERATED ids (the start token excluded; the emitted
+// EOS is included). PixelValues is the EncoderNet input volume.
+function DecodeTrOCRGreedy(EncoderNet, DecoderNet: TNNet;
+  PixelValues: TNNetVolume; const Config: TTrOCRConfig;
+  MaxNewTokens: integer): TNeuralIntegerArray;
+
 type
   TOwlViTConfig = record
     Text: TClipTowerConfig;     // text_config (encoder block shape)
@@ -32384,6 +32498,572 @@ begin
         if Pos < CurLen then DecToks.FData[Pos] := Targets[Pos]
         else DecToks.FData[Pos] := Config.BosTokenId;
       TextNet.Compute(DecToks);
+      Next := Logits.GetClassOnPixel(CurLen - 1, 0);
+      SetLength(Result, Length(Result) + 1);
+      Result[High(Result)] := Next;
+      if Next = Config.EosTokenId then break;
+      if Length(Result) >= MaxNewTokens then break;
+      if CurLen >= DecSeqLen then break;
+      Targets[CurLen] := Next;
+      Inc(CurLen);
+    end;
+  finally
+    DecToks.Free;
+  end;
+end;
+
+// ===========================================================================
+// TrOCR IMPORT implementation (see the TrOCR IMPORT section in the interface).
+// ===========================================================================
+
+function ReadTrOCRConfigFromJSONFile(const FileName: string): TTrOCRConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, EncObj, DecObj: TJSONObject;
+  ModelType: string;
+
+  function RequiredSubObject(const FieldName: string): TJSONObject;
+  var
+    Data: TJSONData;
+  begin
+    Data := Obj.Find(FieldName);
+    if (Data = nil) or not (Data is TJSONObject) then
+      ImportError('TrOCR import: config "' + FileName +
+        '" is missing the required sub-object "' + FieldName + '".');
+    Result := TJSONObject(Data);
+  end;
+
+  function RequiredInt(O: TJSONObject; const FieldName: string): integer;
+  begin
+    if O.IndexOfName(FieldName) < 0 then
+      ImportError('TrOCR import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := O.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('TrOCR import: config field "' + FieldName +
+        '" must be a positive integer, got ' + O.Find(FieldName).AsJSON + '.');
+  end;
+
+  function ReadGeluAct(O: TJSONObject; const Key: string): TClipHiddenAct;
+  var
+    ActStr: string;
+  begin
+    ActStr := O.Get(Key, 'gelu');
+    if ActStr = 'gelu' then Result := chaGeluExact
+    else if (ActStr = 'gelu_new') or (ActStr = 'gelu_pytorch_tanh') then
+      Result := chaGeluTanh
+    else
+      ImportError('TrOCR import: hidden_act "' + ActStr + '" is not ' +
+        'supported - TrOCR uses "gelu" (exact erf); "gelu_new"/' +
+        '"gelu_pytorch_tanh" also accepted.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('TrOCR import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('TrOCR import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('TrOCR import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'vision-encoder-decoder');
+    if (ModelType <> 'vision-encoder-decoder') and (ModelType <> 'trocr') then
+      ImportError('TrOCR import: config model_type is "' + ModelType +
+        '" - expected "vision-encoder-decoder" (TrOCR ' +
+        'VisionEncoderDecoderModel).');
+    Result.ModelType := ModelType;
+
+    EncObj := RequiredSubObject('encoder');
+    Result.EncHiddenSize := RequiredInt(EncObj, 'hidden_size');
+    Result.EncLayers := RequiredInt(EncObj, 'num_hidden_layers');
+    Result.EncHeads := RequiredInt(EncObj, 'num_attention_heads');
+    Result.EncIntermediate := RequiredInt(EncObj, 'intermediate_size');
+    Result.EncLayerNormEps := EncObj.Get('layer_norm_eps', 1e-12);
+    Result.EncHiddenAct := ReadGeluAct(EncObj, 'hidden_act');
+    Result.ImageSize := RequiredInt(EncObj, 'image_size');
+    Result.PatchSize := RequiredInt(EncObj, 'patch_size');
+    Result.NumChannels := EncObj.Get('num_channels', 3);
+
+    DecObj := RequiredSubObject('decoder');
+    Result.DModel := RequiredInt(DecObj, 'd_model');
+    Result.DecLayers := RequiredInt(DecObj, 'decoder_layers');
+    Result.DecHeads := RequiredInt(DecObj, 'decoder_attention_heads');
+    Result.DecFFNDim := RequiredInt(DecObj, 'decoder_ffn_dim');
+    Result.VocabSize := RequiredInt(DecObj, 'vocab_size');
+    Result.MaxPositions := RequiredInt(DecObj, 'max_position_embeddings');
+    Result.DecLayerNormEps := DecObj.Get('layer_norm_eps', 1e-5);
+    Result.ScaleEmbedding := DecObj.Get('scale_embedding', True);
+    Result.BosTokenId := DecObj.Get('bos_token_id', 0);
+    Result.EosTokenId := DecObj.Get('eos_token_id', 2);
+    Result.PadTokenId := DecObj.Get('pad_token_id', 1);
+    Result.DecoderStartTokenId := DecObj.Get('decoder_start_token_id',
+      Result.EosTokenId);
+    // decoder activation_function must also be the GELU family.
+    ReadGeluAct(DecObj, 'activation_function');
+    if Result.DModel <> Result.EncHiddenSize then
+      ImportError('TrOCR import: decoder d_model=' + IntToStr(Result.DModel) +
+        ' must equal encoder hidden_size=' + IntToStr(Result.EncHiddenSize) +
+        ' (cross-attention reads the encoder states directly).');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function TrOCRConfigToString(const Config: TTrOCRConfig): string;
+begin
+  Result := 'trocr config: enc(hidden=' + IntToStr(Config.EncHiddenSize) +
+    ', layers=' + IntToStr(Config.EncLayers) +
+    ', heads=' + IntToStr(Config.EncHeads) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', patch=' + IntToStr(Config.PatchSize) +
+    ') dec(d_model=' + IntToStr(Config.DModel) +
+    ', layers=' + IntToStr(Config.DecLayers) +
+    ', heads=' + IntToStr(Config.DecHeads) +
+    ', ffn=' + IntToStr(Config.DecFFNDim) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', scale_emb=' + BoolToStr(Config.ScaleEmbedding, True) +
+    ', bos=' + IntToStr(Config.BosTokenId) +
+    ', eos=' + IntToStr(Config.EosTokenId) +
+    ', start=' + IntToStr(Config.DecoderStartTokenId) + ')';
+end;
+
+// Loads one TrOCR/DeiT VISION encoder block (a TClipBlockLayers built by
+// AddClipEncoderBlock). DeiT names the attention SEPARATELY (q_proj / k_proj /
+// v_proj / o_proj, all biased) - they load into the fused Q|K|V slab the
+// per-head slicing reads (query -> 0..d-1, key -> d..2d-1, value -> 2d..3d-1).
+// The pre-LNs are layernorm_before / layernorm_after; the MLP is mlp.fc1/fc2.
+procedure LoadTrOCREncoderBlock(Reader: TNNetSafeTensorsReader;
+  const Block: TClipBlockLayers; const Prefix: string;
+  const Tower: TClipTowerConfig);
+var
+  d: integer;
+begin
+  d := Tower.HiddenSize;
+  LoadLayerNormWeights(Reader, Block.LN1, Prefix + 'layernorm_before.weight',
+    Prefix + 'layernorm_before.bias', d);
+  LoadLlamaLinearWeights(Reader, Block.QKV,
+    Prefix + 'attention.q_proj.weight', d, d, 0, 3 * d, 0,
+    Prefix + 'attention.q_proj.bias');
+  LoadLlamaLinearWeights(Reader, Block.QKV,
+    Prefix + 'attention.k_proj.weight', d, d, d, 3 * d, 0,
+    Prefix + 'attention.k_proj.bias');
+  LoadLlamaLinearWeights(Reader, Block.QKV,
+    Prefix + 'attention.v_proj.weight', d, d, 2 * d, 3 * d, 0,
+    Prefix + 'attention.v_proj.bias');
+  LoadLlamaLinearWeights(Reader, Block.AttnDense,
+    Prefix + 'attention.o_proj.weight', d, d, 0, -1, 0,
+    Prefix + 'attention.o_proj.bias');
+  LoadLayerNormWeights(Reader, Block.LN2, Prefix + 'layernorm_after.weight',
+    Prefix + 'layernorm_after.bias', d);
+  LoadLlamaLinearWeights(Reader, Block.Inter, Prefix + 'mlp.fc1.weight',
+    d, Tower.IntermediateSize, 0, -1, 0, Prefix + 'mlp.fc1.bias');
+  LoadLlamaLinearWeights(Reader, Block.OutDense, Prefix + 'mlp.fc2.weight',
+    Tower.IntermediateSize, d, 0, -1, 0, Prefix + 'mlp.fc2.bias');
+end;
+
+// Builds the TrOCR DeiT image encoder. ViT tower: a BIASED patch conv, a class
+// token AND a distillation token folded into position rows 0 and 1, pre-LN
+// encoder blocks (AddClipEncoderBlock) and a FINAL layernorm. Outputs ALL
+// (num_patches+2, 1, hidden) post-LN hidden states (cross-attention reads every
+// row - NO CLS crop, NO projection, NO pooling).
+function BuildTrOCREncoder(Reader: TNNetSafeTensorsReader;
+  const Config: TTrOCRConfig; Consumed: TStringList;
+  pInferenceOnly: boolean): TNNet;
+var
+  NN: TNNet;
+  PatchConv, PosEmb, FinalLN: TNNetLayer;
+  Blocks: TClipBlockLayersArray;
+  Tmp: TNNetVolume;
+  Tower: TClipTowerConfig;
+  Grid, NumPatches, NumTokens, BlockCnt, ci: integer;
+  Prefix: string;
+begin
+  Tower.HiddenSize := Config.EncHiddenSize;
+  Tower.IntermediateSize := Config.EncIntermediate;
+  Tower.NumLayers := Config.EncLayers;
+  Tower.NumHeads := Config.EncHeads;
+  Tower.LayerNormEps := Config.EncLayerNormEps;
+  Tower.HiddenAct := Config.EncHiddenAct;
+  if (Tower.NumHeads < 1) or ((Tower.HiddenSize mod Tower.NumHeads) <> 0) then
+    ImportError('TrOCR import: encoder hidden_size=' +
+      IntToStr(Tower.HiddenSize) + ' is not divisible by ' +
+      'num_attention_heads=' + IntToStr(Tower.NumHeads) + '.');
+  if (Config.PatchSize < 1) or ((Config.ImageSize mod Config.PatchSize) <> 0)
+  then
+    ImportError('TrOCR import: image_size=' + IntToStr(Config.ImageSize) +
+      ' is not a multiple of patch_size=' + IntToStr(Config.PatchSize) + '.');
+  Grid := Config.ImageSize div Config.PatchSize;
+  NumPatches := Grid * Grid;
+  NumTokens := NumPatches + 2;          // cls + distillation + patches
+  NN := TNNet.Create();
+  try
+    NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels) );
+    // BIASED patch embedding: kernel = stride = patch_size, no padding.
+    PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      Tower.HiddenSize, Config.PatchSize, {pInputPadding=}0,
+      {pStride=}Config.PatchSize, {pSuppressBias=}0) );
+    NN.AddLayer( TNNetReshape.Create(NumPatches, 1, Tower.HiddenSize) );
+    // Prepend TWO zero slots (cls + distillation); both fold into position
+    // rows 0 and 1 - exact, since the pre-position content of those slots is
+    // identically zero. PadXY pads both ends; Crop drops the right pad.
+    NN.AddLayer( TNNetPadXY.Create(2, 0) );
+    NN.AddLayer( TNNetCrop.Create(0, 0, NumTokens, 1) );
+    PosEmb := NN.AddLayer(
+      TNNetLearnedPositionalEmbedding.Create(NumTokens) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    SetLength(Blocks, Tower.NumLayers);
+    for BlockCnt := 0 to Tower.NumLayers - 1 do
+      AddClipEncoderBlock(NN, Tower, {CausalMask=}false, Blocks[BlockCnt],
+        pInferenceOnly);
+    // final layernorm over every token (HF applies it to last_hidden_state).
+    FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // -------- weights --------
+    LoadClipPatchConv(Reader, PatchConv,
+      'encoder.embeddings.patch_embeddings.projection.weight',
+      Config.NumChannels, Config.PatchSize, Tower.HiddenSize);
+    Consumed.Add('encoder.embeddings.patch_embeddings.projection.weight');
+    // patch conv IS biased (LoadClipPatchConv zeroes the bias above).
+    if not Reader.HasTensor(
+      'encoder.embeddings.patch_embeddings.projection.bias') then
+      ImportError('TrOCR import: missing tensor ' +
+        '"encoder.embeddings.patch_embeddings.projection.bias".');
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(
+        'encoder.embeddings.patch_embeddings.projection.bias', Tmp);
+      if Tmp.Size <> Tower.HiddenSize then
+        ImportError('TrOCR import: patch projection bias must have ' +
+          IntToStr(Tower.HiddenSize) + ' elements, got ' +
+          IntToStr(Tmp.Size) + '.');
+      for ci := 0 to Tower.HiddenSize - 1 do
+        PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+      PatchConv.FlushWeightCache();
+      Consumed.Add('encoder.embeddings.patch_embeddings.projection.bias');
+      // position_embeddings [1, num_patches+2, hidden] -> the table.
+      if not Reader.HasTensor('encoder.embeddings.position_embeddings') then
+        ImportError('TrOCR import: missing tensor ' +
+          '"encoder.embeddings.position_embeddings".');
+      Reader.LoadTensorFlat('encoder.embeddings.position_embeddings', Tmp);
+      if Tmp.Size <> NumTokens * Tower.HiddenSize then
+        ImportError('TrOCR import: position_embeddings must have ' +
+          IntToStr(NumTokens * Tower.HiddenSize) + ' elements, got ' +
+          IntToStr(Tmp.Size) + '.');
+      PosEmb.Neurons[0].Weights.Copy(Tmp);
+      PosEmb.FlushWeightCache();
+      Consumed.Add('encoder.embeddings.position_embeddings');
+      // cls_token [1,1,hidden] folded into position row 0.
+      if not Reader.HasTensor('encoder.embeddings.cls_token') then
+        ImportError('TrOCR import: missing tensor ' +
+          '"encoder.embeddings.cls_token".');
+      Reader.LoadTensorFlat('encoder.embeddings.cls_token', Tmp);
+      if Tmp.Size <> Tower.HiddenSize then
+        ImportError('TrOCR import: cls_token must have ' +
+          IntToStr(Tower.HiddenSize) + ' elements, got ' +
+          IntToStr(Tmp.Size) + '.');
+      for ci := 0 to Tower.HiddenSize - 1 do
+        PosEmb.Neurons[0].Weights.FData[ci] :=
+          PosEmb.Neurons[0].Weights.FData[ci] + Tmp.FData[ci];
+      Consumed.Add('encoder.embeddings.cls_token');
+      // distillation_token [1,1,hidden] folded into position row 1.
+      if not Reader.HasTensor('encoder.embeddings.distillation_token') then
+        ImportError('TrOCR import: missing tensor ' +
+          '"encoder.embeddings.distillation_token".');
+      Reader.LoadTensorFlat('encoder.embeddings.distillation_token', Tmp);
+      if Tmp.Size <> Tower.HiddenSize then
+        ImportError('TrOCR import: distillation_token must have ' +
+          IntToStr(Tower.HiddenSize) + ' elements, got ' +
+          IntToStr(Tmp.Size) + '.');
+      for ci := 0 to Tower.HiddenSize - 1 do
+        PosEmb.Neurons[0].Weights.FData[Tower.HiddenSize + ci] :=
+          PosEmb.Neurons[0].Weights.FData[Tower.HiddenSize + ci] +
+          Tmp.FData[ci];
+      PosEmb.FlushWeightCache();
+      Consumed.Add('encoder.embeddings.distillation_token');
+    finally
+      Tmp.Free;
+    end;
+    for BlockCnt := 0 to Tower.NumLayers - 1 do
+    begin
+      Prefix := 'encoder.layers.' + IntToStr(BlockCnt) + '.';
+      LoadTrOCREncoderBlock(Reader, Blocks[BlockCnt], Prefix, Tower);
+      Consumed.Add(Prefix + 'layernorm_before.weight');
+      Consumed.Add(Prefix + 'layernorm_before.bias');
+      Consumed.Add(Prefix + 'attention.q_proj.weight');
+      Consumed.Add(Prefix + 'attention.q_proj.bias');
+      Consumed.Add(Prefix + 'attention.k_proj.weight');
+      Consumed.Add(Prefix + 'attention.k_proj.bias');
+      Consumed.Add(Prefix + 'attention.v_proj.weight');
+      Consumed.Add(Prefix + 'attention.v_proj.bias');
+      Consumed.Add(Prefix + 'attention.o_proj.weight');
+      Consumed.Add(Prefix + 'attention.o_proj.bias');
+      Consumed.Add(Prefix + 'layernorm_after.weight');
+      Consumed.Add(Prefix + 'layernorm_after.bias');
+      Consumed.Add(Prefix + 'mlp.fc1.weight');
+      Consumed.Add(Prefix + 'mlp.fc1.bias');
+      Consumed.Add(Prefix + 'mlp.fc2.weight');
+      Consumed.Add(Prefix + 'mlp.fc2.bias');
+    end;
+    LoadLayerNormWeights(Reader, FinalLN, 'encoder.layernorm.weight',
+      'encoder.layernorm.bias', Tower.HiddenSize);
+    Consumed.Add('encoder.layernorm.weight');
+    Consumed.Add('encoder.layernorm.bias');
+    // The HF DeiT pooler is unused by the decoder; tolerate it if present.
+    if Reader.HasTensor('encoder.pooler.dense.weight') then
+    begin
+      Consumed.Add('encoder.pooler.dense.weight');
+      Consumed.Add('encoder.pooler.dense.bias');
+    end;
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+procedure BuildTrOCRFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TTrOCRConfig; out EncoderNet, DecoderNet: TNNet;
+  DecSeqLen: integer = 0; pInferenceOnly: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  Enc, Dec: TNNet;
+  DecBlocks: TMarianBlockArray;
+  DecTokenInput, EncStates, DecEmbed, DecPos, DecEmbLN, LMHead: TNNetLayer;
+  Consumed: TStringList;
+  Tmp: TNNetVolume;
+  SeqLen, NumTokens, Grid, i, j, PosCnt, ElementCnt: integer;
+  EmbedScale: TNeuralFloat;
+  TensorNameStr: string;
+  BartShim: TBartConfig;
+  MarianShim: TMarianConfig;
+const
+  TrOCRPosOffset = 2;             // BART's learned-position padding offset
+begin
+  EncoderNet := nil;
+  DecoderNet := nil;
+  if (Config.DecHeads < 1) or ((Config.DModel mod Config.DecHeads) <> 0) then
+    ImportError('TrOCR import: decoder_attention_heads must divide d_model, ' +
+      'got ' + IntToStr(Config.DecHeads) + ' heads for d_model ' +
+      IntToStr(Config.DModel) + '.');
+  if DecSeqLen <= 0 then SeqLen := Config.MaxPositions
+  else SeqLen := DecSeqLen;
+  if SeqLen > Config.MaxPositions then
+    ImportError('TrOCR import: requested DecSeqLen=' + IntToStr(SeqLen) +
+      ' exceeds max_position_embeddings=' + IntToStr(Config.MaxPositions) +
+      '.');
+  Grid := Config.ImageSize div Config.PatchSize;
+  NumTokens := Grid * Grid + 2;
+  Reader := CreatePretrainedTensorReader(FileName);
+  Enc := nil;
+  Dec := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- ENCODER ----------------
+      Enc := BuildTrOCREncoder(Reader, Config, Consumed, pInferenceOnly);
+
+      // ---------------- DECODER architecture (BART decoder) ----------------
+      // BuildBartStackBlocks / LoadMarianStack only read .DModel; carry it.
+      BartShim.DModel := Config.DModel;
+      MarianShim.DModel := Config.DModel;
+      Dec := TNNet.Create();
+      DecTokenInput := Dec.AddLayer( TNNetInput.Create(SeqLen, 1, 1) );
+      // SECOND input: the image hidden states (T5EncoderStatesInput).
+      EncStates := Dec.AddLayerAfter(
+        TNNetInput.Create(NumTokens, 1, Config.DModel, 1), 0);
+      DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
+        Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
+      DecPos := Dec.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(SeqLen) );
+      DecEmbLN := Dec.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.DecLayerNormEps) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+      BuildBartStackBlocks(Dec, BartShim, Config.DecLayers, Config.DecHeads,
+        Config.DecFFNDim, {IsDecoder=}true, EncStates, DecBlocks,
+        pInferenceOnly);
+      LMHead := Dec.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+
+      // ---------------- DECODER weights ----------------
+      if not Reader.HasTensor(
+        'decoder.model.decoder.embed_tokens.weight') then
+        ImportError('TrOCR import: missing tensor ' +
+          '"decoder.model.decoder.embed_tokens.weight" - not a TrOCR ' +
+          'VisionEncoderDecoder checkpoint?');
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(
+          'decoder.model.decoder.embed_tokens.weight', Tmp);
+        if Tmp.Size <> Config.VocabSize * Config.DModel then
+          ImportError('TrOCR import: embed_tokens size mismatch (got ' +
+            IntToStr(Tmp.Size) + ', expected ' +
+            IntToStr(Config.VocabSize * Config.DModel) + ').');
+        if Config.ScaleEmbedding then EmbedScale := Sqrt(Config.DModel)
+        else EmbedScale := 1.0;
+        for i := 0 to Tmp.Size - 1 do
+          DecEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+        DecEmbed.FlushWeightCache();
+        Consumed.Add('decoder.model.decoder.embed_tokens.weight');
+        // Tied head: logits = h . embed_tokens^T, NO final_logits_bias.
+        EnsureWritableImportWeights(LMHead);
+        for j := 0 to Config.VocabSize - 1 do
+        begin
+          for i := 0 to Config.DModel - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.DModel + i];
+          LMHead.Neurons[j].BiasWeight := 0;
+        end;
+        LMHead.FlushWeightCache();
+        // output_projection aliases embed_tokens (tie_word_embeddings); some
+        // exports serialize it explicitly - tolerate it.
+        if Reader.HasTensor('decoder.output_projection.weight') then
+          Consumed.Add('decoder.output_projection.weight');
+        // Learned positions (BART's +2-offset window).
+        if not Reader.HasTensor(
+          'decoder.model.decoder.embed_positions.weight') then
+          ImportError('TrOCR import: missing tensor ' +
+            '"decoder.model.decoder.embed_positions.weight".');
+        Reader.LoadTensorFlat(
+          'decoder.model.decoder.embed_positions.weight', Tmp);
+        if Tmp.Size <>
+           (Config.MaxPositions + TrOCRPosOffset) * Config.DModel then
+          ImportError('TrOCR import: embed_positions must have ' +
+            IntToStr((Config.MaxPositions + TrOCRPosOffset) * Config.DModel) +
+            ' elements, got ' + IntToStr(Tmp.Size) + '.');
+        for PosCnt := 0 to SeqLen - 1 do
+          for ElementCnt := 0 to Config.DModel - 1 do
+            DecPos.Neurons[0].Weights.FData[PosCnt * Config.DModel +
+              ElementCnt] := Tmp.FData[(PosCnt + TrOCRPosOffset) *
+                Config.DModel + ElementCnt];
+        DecPos.FlushWeightCache();
+        Consumed.Add('decoder.model.decoder.embed_positions.weight');
+      finally
+        Tmp.Free;
+      end;
+      // layernorm_embedding (after token + position embeddings).
+      LoadLayerNormWeights(Reader, DecEmbLN,
+        'decoder.model.decoder.layernorm_embedding.weight',
+        'decoder.model.decoder.layernorm_embedding.bias', Config.DModel);
+      Consumed.Add('decoder.model.decoder.layernorm_embedding.weight');
+      Consumed.Add('decoder.model.decoder.layernorm_embedding.bias');
+      // Per-block weights (BART/Marian names; loader needs only d_model).
+      LoadMarianStack(Reader, DecBlocks, 'decoder.model.decoder.layers.',
+        MarianShim, Config.DecFFNDim, {IsDecoder=}true, Consumed);
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('TrOCR import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      EncoderNet := Enc;
+      DecoderNet := Dec;
+      Enc := nil;
+      Dec := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    Enc.Free;
+    Dec.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+procedure BuildTrOCRFromSafeTensorsEx(const FileName: string;
+  Config: TTrOCRConfig; out EncoderNet, DecoderNet: TNNet;
+  DecSeqLen: integer = 0; pInferenceOnly: boolean = false);
+begin
+  BuildTrOCRFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, DecSeqLen, pInferenceOnly);
+end;
+
+procedure BuildTrOCRFromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TTrOCRConfig;
+  DecSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+var
+  CfgFile: string;
+begin
+  if ConfigFileName <> '' then CfgFile := ConfigFileName
+  else CfgFile := IncludeTrailingPathDelimiter(ExtractFilePath(FileName)) +
+    'config.json';
+  Config := ReadTrOCRConfigFromJSONFile(CfgFile);
+  BuildTrOCRFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, DecSeqLen, pInferenceOnly);
+end;
+
+procedure RunTrOCRLogits(EncoderNet, DecoderNet: TNNet;
+  PixelValues, DecoderTokens: TNNetVolume; Logits: TNNetVolume);
+var
+  EncStates: TNNetLayer;
+begin
+  EncStates := T5EncoderStatesInput(DecoderNet);
+  EncoderNet.Compute(PixelValues);
+  if EncoderNet.GetLastLayer().Output.Size <> EncStates.Output.Size then
+    ImportError('RunTrOCRLogits: encoder output size ' +
+      IntToStr(EncoderNet.GetLastLayer().Output.Size) +
+      ' does not match the decoder''s image-states input size ' +
+      IntToStr(EncStates.Output.Size) + '.');
+  EncStates.Output.Copy(EncoderNet.GetLastLayer().Output);
+  DecoderNet.Compute(DecoderTokens);
+  DecoderNet.GetOutput(Logits);
+end;
+
+function DecodeTrOCRGreedy(EncoderNet, DecoderNet: TNNet;
+  PixelValues: TNNetVolume; const Config: TTrOCRConfig;
+  MaxNewTokens: integer): TNeuralIntegerArray;
+var
+  EncStates: TNNetLayer;
+  DecToks, Logits: TNNetVolume;
+  Targets: TNeuralIntegerArray;
+  DecSeqLen, CurLen, Pos, Next: integer;
+begin
+  SetLength(Result, 0);
+  if MaxNewTokens < 1 then exit;
+  EncStates := T5EncoderStatesInput(DecoderNet);
+  // Encode the image ONCE; the hidden states are constant across decode steps.
+  EncoderNet.Compute(PixelValues);
+  if EncoderNet.GetLastLayer().Output.Size <> EncStates.Output.Size then
+    ImportError('DecodeTrOCRGreedy: encoder/decoder image-states size ' +
+      'mismatch.');
+  EncStates.Output.Copy(EncoderNet.GetLastLayer().Output);
+  DecSeqLen := DecoderNet.GetFirstLayer().Output.Size;
+  Logits := DecoderNet.GetLastLayer().Output;
+  DecToks := TNNetVolume.Create(DecSeqLen, 1, 1);
+  try
+    SetLength(Targets, DecSeqLen);
+    Targets[0] := Config.DecoderStartTokenId;
+    CurLen := 1;
+    while True do
+    begin
+      for Pos := 0 to DecSeqLen - 1 do
+        if Pos < CurLen then DecToks.FData[Pos] := Targets[Pos]
+        else DecToks.FData[Pos] := Config.PadTokenId;
+      DecoderNet.Compute(DecToks);
       Next := Logits.GetClassOnPixel(CurLen - 1, 0);
       SetLength(Result, Length(Result) + 1);
       Result[High(Result)] := Next;

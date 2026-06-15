@@ -55,3 +55,9 @@ VQGAN/*.o
 VQGAN/*.ppr
 VQGAN/vqgan_sample.ppm
 VQGAN/run*.txt
+
+# OCRTranscribe: compiled TrOCR OCR demo binary + build artifacts
+OCRTranscribe/OCRTranscribe
+OCRTranscribe/*.o
+OCRTranscribe/*.ppu
+OCRTranscribe/*.ppr
