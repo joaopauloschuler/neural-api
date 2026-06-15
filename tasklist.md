@@ -822,6 +822,33 @@ rather than acted on.
         produces the 1024x64 mel (depends on freq_ratio=4); wire `neuralaudio.pas`
         log-mel -> `ClapBatchNormMelImage` end-to-end and verify against a downloaded
         `clap-htsat-unfused`. (The RoBERTa BPE tokenizer is already importable.)
+- [ ] Qwen2-Audio audio-understanding LLM importer (`BuildQwen2AudioFromSafeTensors[Ex]`
+      + `TQwen2AudioConfig`/`ReadQwen2AudioConfigFromJSONFile`, model_type
+      "qwen2_audio") + examples/Qwen2AudioChat — the AUDIO analogue of the landed
+      VISION-LLM importers (Llava / PaliGemma): a frozen audio encoder feeds audio
+      embeddings into a causal text LLM so the model can TRANSCRIBE, CAPTION and
+      ANSWER QUESTIONS about a clip (ASR + audio QA), not just embed it (CLAP) or
+      generate it (MusicGen). This is squarely in the voice/model-import priority and
+      is NOT a near-duplicate of anything: it is the first audio->text generative
+      *understanding* model. Almost pure REUSE of two already-landed importers — the
+      audio tower is the Whisper-style log-mel conv+transformer ENCODER
+      (`BuildWhisperFromSafeTensors` machinery, the `audio_tower` key spelling) and the
+      language model is the Qwen2 decoder (`BuildQwen2FromSafeTensors`). The genuinely
+      NEW building block is the multimodal CONNECTOR: a `Qwen2AudioMultiModalProjector`
+      (a Linear over the encoder's `d_model`->LLM `hidden_size`, after an
+      avgpool/stride over the 1500-frame Whisper output) plus the embed-SPLICE that
+      replaces the `<|AUDIO|>` placeholder token rows in the LLM input-embedding stream
+      with the projected audio frames (the same splice pattern the vision-LLM importers
+      use for `<image>` tokens — factor a shared `SpliceModalEmbeddings` helper if one
+      is not already extractable). Scope v1 as a single-audio, single-turn forward:
+      log-mel (neuralaudio frontend) -> audio encoder -> projector -> splice into the
+      chat-templated prompt -> greedy/sampled decode of the answer. Pico parity
+      `< 1e-4` on the pre-softmax logits vs the float64 HF `Qwen2AudioForConditionalGeneration`
+      oracle (`TestQwen2AudioParity`, generator `tools/qwen2audio_tiny_fixture.py`,
+      committed `tests/fixtures/tiny_qwen2audio.*`). Follow-ups: multi-audio /
+      multi-turn interleaving; the real `Qwen2-Audio-7B-Instruct` checkpoint + its chat
+      template (already addable via the hardcoded-format table) + KV-cache decode reuse;
+      the 16 kHz resampler / non-30 s clip handling shared with the SpeechCommands task.
 - [ ] AudioLDM 2 / Stable Audio latent text-to-audio (music & sound) capstone —
       text-prompt -> audio via LATENT diffusion, the audio analogue of the landed
       LatentTextToImage (PixArt/DiT + VAE) pipeline and the natural home for the
