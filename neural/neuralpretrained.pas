@@ -4117,6 +4117,51 @@ type
     WaveNet: TVitsWaveNet;
   end;
 
+  { TNNetVitsTokenizer }
+  // The CHARACTER-level tokenizer that turns a STRING into the token-id
+  // sequence a TNNetVits consumes (the HF VitsTokenizer; facebook/mms-tts-*,
+  // kakao-enterprise/vits-ljs). VITS uses NO BPE/Unigram: it loads a char->id
+  // map ("vocab.json", the HF `encoder` dict), normalizes (lowercases each
+  // char that is not part of a multi-char vocab key, then drops chars outside
+  // the vocab), and - when add_blank=true (the MMS-TTS default) - inserts the
+  // blank/pad token (always id 0) between every char and around the whole
+  // sequence. The uroman romanization and the espeak phonemizer FRONT-ENDS are
+  // OUT OF SCOPE: this tokenizer assumes already-romanized text (the HF default
+  // for non-uroman, non-phonemize models such as mms-tts-eng) and REJECTS
+  // is_uroman=true / phonemize=true configs loudly. Caller-owned.
+  // Coded by Claude (AI).
+  TNNetVitsTokenizer = class
+  private
+    FChars: TStringList;            // char (key) -> Objects[i] holds id
+    FAddBlank: boolean;
+    FNormalize: boolean;
+    FBlankId: integer;             // the interspersed blank id (HF: always 0)
+    FUnkId: integer;               // unk_token_id (-1 = no unk: drop instead)
+    FMaxKeyLen: integer;           // longest vocab key (multi-char scan bound)
+    function LookupId(const Token: string): integer;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    // Loads the char vocab from VocabFile ("vocab.json": a flat JSON object
+    // mapping each char to its integer id) and the flags add_blank / normalize
+    // / is_uroman / phonemize from ConfigFile ("tokenizer_config.json"; ''
+    // keeps the defaults add_blank=true, normalize=true). is_uroman=true or
+    // phonemize=true raise loudly (front-ends not implemented).
+    procedure LoadFromFiles(const VocabFile: string;
+      const ConfigFile: string = '');
+    // Convenience: load from a HF tokenizer DIRECTORY (expects vocab.json and,
+    // optionally, tokenizer_config.json inside it).
+    procedure LoadFromDir(const Dir: string);
+    // Encodes Text into the exact id sequence HF VitsTokenizer(Text) returns
+    // (incl. the blank-id interleaving when add_blank=true).
+    function Encode(const Text: string): TNeuralIntegerArray;
+    property AddBlank: boolean read FAddBlank write FAddBlank;
+    property Normalize: boolean read FNormalize write FNormalize;
+    property BlankId: integer read FBlankId write FBlankId;
+    // Number of char entries in the vocab.
+    function VocabSize: integer;
+  end;
+
   { TNNetVits }
   // Holds an imported VITS model and runs the full text -> waveform inference
   // synthesis. Built by BuildVitsFromSafeTensors[Ex]; caller-owned. The HiFi-
@@ -31733,6 +31778,223 @@ begin
       Result[c][tt] := Tanh(InActs[c][tt]) *
         (1.0 / (1.0 + Exp(-InActs[H + c][tt])));
   end;
+end;
+
+{ TNNetVitsTokenizer }
+
+constructor TNNetVitsTokenizer.Create;
+begin
+  inherited Create;
+  FChars := TStringList.Create;
+  FChars.CaseSensitive := True;
+  FChars.UseLocale := False;
+  FChars.Sorted := False;
+  FAddBlank := True;
+  FNormalize := True;
+  FBlankId := 0;
+  FUnkId := -1;
+  FMaxKeyLen := 1;
+end;
+
+destructor TNNetVitsTokenizer.Destroy;
+begin
+  FChars.Free;
+  inherited Destroy;
+end;
+
+function TNNetVitsTokenizer.VocabSize: integer;
+begin
+  Result := FChars.Count;
+end;
+
+function TNNetVitsTokenizer.LookupId(const Token: string): integer;
+var
+  Idx: integer;
+begin
+  Idx := FChars.IndexOf(Token);
+  if Idx >= 0 then
+    Result := PtrInt(FChars.Objects[Idx])
+  else
+    Result := FUnkId;      // -1 => caller drops the char
+end;
+
+procedure TNNetVitsTokenizer.LoadFromFiles(const VocabFile: string;
+  const ConfigFile: string = '');
+var
+  JsonText: TStringList;
+  Root, CfgRoot, IdNode: TJSONData;
+  Obj, CfgObj: TJSONObject;
+  i, Id: integer;
+  Key: string;
+begin
+  if not FileExists(VocabFile) then
+    ImportError('VITS tokenizer: vocab file not found: ' + VocabFile);
+  FChars.Clear;
+  FMaxKeyLen := 1;
+  JsonText := TStringList.Create;
+  Root := nil;
+  CfgRoot := nil;
+  try
+    JsonText.LoadFromFile(VocabFile);
+    // Parse WITHOUT joUTF8 so multibyte char keys (e.g. the en-dash in
+    // mms-tts-eng) survive as raw UTF-8 bytes.
+    try
+      Root := HFParseJSONRaw(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('VITS tokenizer: vocab "' + VocabFile +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('VITS tokenizer: vocab "' + VocabFile +
+        '" must be a flat JSON object mapping each char to its id.');
+    Obj := TJSONObject(Root);
+    for i := 0 to Obj.Count - 1 do
+    begin
+      Key := Obj.Names[i];
+      IdNode := Obj.Items[i];
+      if not (IdNode.JSONType = jtNumber) then
+        ImportError('VITS tokenizer: vocab entry "' + Key +
+          '" must map to an integer id.');
+      Id := IdNode.AsInteger;
+      FChars.AddObject(Key, TObject(PtrInt(Id)));
+      if Length(Key) > FMaxKeyLen then FMaxKeyLen := Length(Key);
+    end;
+    if FChars.Count = 0 then
+      ImportError('VITS tokenizer: vocab "' + VocabFile + '" is empty.');
+
+    // ---- the flags from tokenizer_config.json (optional).
+    if ConfigFile <> '' then
+    begin
+      if not FileExists(ConfigFile) then
+        ImportError('VITS tokenizer: config file not found: ' + ConfigFile);
+      JsonText.LoadFromFile(ConfigFile);
+      try
+        CfgRoot := HFParseJSONRaw(JsonText.Text);
+      except
+        on E: Exception do
+          ImportError('VITS tokenizer: config "' + ConfigFile +
+            '" is not valid JSON (' + E.Message + ').');
+      end;
+      if not (CfgRoot is TJSONObject) then
+        ImportError('VITS tokenizer: config "' + ConfigFile +
+          '" is not a JSON object.');
+      CfgObj := TJSONObject(CfgRoot);
+      FAddBlank := CfgObj.Get('add_blank', True);
+      FNormalize := CfgObj.Get('normalize', True);
+      if CfgObj.Get('is_uroman', False) then
+        ImportError('VITS tokenizer: is_uroman=true requires the uroman ' +
+          'romanization front-end, which is NOT implemented. Romanize the ' +
+          'text manually first (https://github.com/isi-nlp/uroman), then feed ' +
+          'the romanized lowercase string.');
+      if CfgObj.Get('phonemize', False) then
+        ImportError('VITS tokenizer: phonemize=true requires the espeak ' +
+          'phonemizer front-end, which is NOT implemented.');
+    end;
+  finally
+    Root.Free;
+    CfgRoot.Free;
+    JsonText.Free;
+  end;
+end;
+
+procedure TNNetVitsTokenizer.LoadFromDir(const Dir: string);
+var
+  Base, Cfg: string;
+begin
+  Base := IncludeTrailingPathDelimiter(Dir);
+  Cfg := Base + 'tokenizer_config.json';
+  if not FileExists(Cfg) then Cfg := '';
+  LoadFromFiles(Base + 'vocab.json', Cfg);
+end;
+
+function TNNetVitsTokenizer.Encode(const Text: string): TNeuralIntegerArray;
+var
+  Src, Filtered: string;
+  i, L, KeyLen, Cnt, Id: integer;
+  Matched: boolean;
+  Cand, Ch: string;
+  Ids: TNeuralIntegerArray;
+begin
+  // --- normalize: scan char by char; if a (possibly multi-char) vocab key
+  // matches at this position keep it verbatim, otherwise lowercase the single
+  // (byte) char (HF VitsTokenizer.normalize_text). Then drop chars outside the
+  // vocab. With normalize=false the raw text is kept and unknown chars map to
+  // unk (or are dropped when there is no unk id).
+  Src := Text;
+  if FNormalize then
+  begin
+    Filtered := '';
+    i := 1;
+    L := Length(Src);
+    while i <= L do
+    begin
+      Matched := False;
+      // longest-key-first scan keeps multi-byte keys atomic.
+      for KeyLen := FMaxKeyLen downto 1 do
+      begin
+        if i + KeyLen - 1 > L then Continue;
+        Cand := Copy(Src, i, KeyLen);
+        if FChars.IndexOf(Cand) >= 0 then
+        begin
+          Filtered := Filtered + Cand;
+          Inc(i, KeyLen);
+          Matched := True;
+          Break;
+        end;
+      end;
+      if not Matched then
+      begin
+        Filtered := Filtered + LowerCase(Src[i]);
+        Inc(i);
+      end;
+    end;
+    Src := Filtered;
+  end;
+
+  // --- tokenize: split into 1-char tokens; a token outside the vocab is
+  // unk'd (FUnkId>=0) or dropped (FUnkId<0). Multi-char vocab keys were kept
+  // atomic by the normalize scan; re-scan to honor them here too.
+  SetLength(Ids, 0);
+  Cnt := 0;
+  i := 1;
+  L := Length(Src);
+  while i <= L do
+  begin
+    Matched := False;
+    for KeyLen := FMaxKeyLen downto 1 do
+    begin
+      if i + KeyLen - 1 > L then Continue;
+      Cand := Copy(Src, i, KeyLen);
+      if FChars.IndexOf(Cand) >= 0 then
+      begin
+        Ch := Cand;
+        Inc(i, KeyLen);
+        Matched := True;
+        Break;
+      end;
+    end;
+    if not Matched then
+    begin
+      Ch := Copy(Src, i, 1);
+      Inc(i);
+    end;
+    Id := LookupId(Ch);
+    if Id < 0 then Continue;        // no unk id: drop the char
+    SetLength(Ids, Cnt + 1);
+    Ids[Cnt] := Id;
+    Inc(Cnt);
+  end;
+
+  // --- intersperse the blank id between/around every char (add_blank).
+  if FAddBlank then
+  begin
+    SetLength(Result, Cnt * 2 + 1);
+    for i := 0 to High(Result) do Result[i] := FBlankId;
+    for i := 0 to Cnt - 1 do Result[i * 2 + 1] := Ids[i];
+  end
+  else
+    Result := Copy(Ids, 0, Cnt);
 end;
 
 { TNNetVits }

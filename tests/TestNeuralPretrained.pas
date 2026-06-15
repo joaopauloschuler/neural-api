@@ -289,6 +289,12 @@ type
     // flow reverse, end-to-end waveform) vs the HF VitsModel float64 oracle,
     // with the prior noise z fed explicitly for a deterministic result < 1e-4.
     procedure TestVitsSynthesisParity;
+    // VITS char-level tokenizer (TNNetVitsTokenizer): a STRING -> the exact
+    // token-id sequence HF VitsTokenizer(text) returns (normalize lowercasing,
+    // out-of-vocab drop, multibyte vocab key, blank-id interleaving) on a tiny
+    // committed char-vocab fixture; the expected ids come from the real HF
+    // VitsTokenizer (cross-checked offline).
+    procedure TestVitsTokenizerParity;
     // Demucs: separates two pinned mixed waveforms through the imported
     // time-domain U-Net (strided conv + GLU + bi-LSTM + transpose conv with
     // U-Net skips) and asserts the four stems match the self-contained numpy
@@ -12683,6 +12689,52 @@ begin
     Model.Free;
     RefRoot.Free;
     RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestVitsTokenizerParity;
+var
+  Tok: TNNetVitsTokenizer;
+  Got: TNeuralIntegerArray;
+
+  procedure CheckCase(const Text: string; const Expected: array of integer);
+  var
+    j: integer;
+    Msg: string;
+  begin
+    Got := Tok.Encode(Text);
+    AssertEquals('VITS tokenizer "' + Text + '" length',
+      Length(Expected), Length(Got));
+    Msg := '';
+    for j := 0 to High(Got) do Msg := Msg + ' ' + IntToStr(Got[j]);
+    for j := 0 to High(Expected) do
+      AssertEquals('VITS tokenizer "' + Text + '" id[' + IntToStr(j) +
+        '] (got:' + Msg + ')', Expected[j], Got[j]);
+  end;
+
+begin
+  // Expected ids are the EXACT output of the real HF VitsTokenizer on the
+  // committed tiny char-vocab fixture (cross-checked offline against
+  // transformers.VitsTokenizer). Blank/pad id = 0, interleaved around/between
+  // every char (add_blank=true). normalize=true lowercases and drops chars
+  // outside the vocab; the en-dash exercises a MULTIBYTE (UTF-8) vocab key.
+  Tok := TNNetVitsTokenizer.Create;
+  try
+    Tok.LoadFromFiles(FixturePath('tiny_vits_tokenizer_vocab.json'),
+      FixturePath('tiny_vits_tokenizer_config.json'));
+    AssertEquals('VITS tokenizer vocab size', 10, Tok.VocabSize);
+    AssertTrue('VITS tokenizer add_blank', Tok.AddBlank);
+    AssertTrue('VITS tokenizer normalize', Tok.Normalize);
+
+    // h e l l o   w o r l d  (the space is in vocab; uppercase folds to lower)
+    CheckCase('Hello World',
+      [0, 6, 0, 7, 0, 21, 0, 21, 0, 22, 0, 19, 0, 9, 0, 22, 0, 25, 0, 21, 0, 5, 0]);
+    CheckCase('hello', [0, 6, 0, 7, 0, 21, 0, 21, 0, 22, 0]);
+    // 'he–lo' - the en-dash (U+2013, multibyte key, id 10) is preserved.
+    CheckCase('he'#$E2#$80#$93'lo', [0, 6, 0, 7, 0, 10, 0, 21, 0, 22, 0]);
+    CheckCase('HELLO', [0, 6, 0, 7, 0, 21, 0, 21, 0, 22, 0]);
+  finally
+    Tok.Free;
   end;
 end;
 

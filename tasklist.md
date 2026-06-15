@@ -740,8 +740,17 @@ rather than acted on.
   - [ ] MULTI-SPEAKER models (`num_speakers>1` / `speaker_embedding_size!=0`, the
         global-conditioning `cond` convs into the WaveNet/duration/decoder) —
         rejected loudly.
-  - [ ] the `VitsTokenizer` (uroman/phonemizer + char vocab) so a STRING can be
-        synthesized; text is supplied as token ids for now.
+  - [X] the `VitsTokenizer` (char vocab) so a STRING can be synthesized -
+        LANDED. `TNNetVitsTokenizer` (neuralpretrained.pas) loads the char->id
+        `vocab.json` + `add_blank`/`normalize` flags and `Encode(text)`
+        reproduces HF `VitsTokenizer(text)` exactly (per-char lowercasing,
+        out-of-vocab drop, blank/pad id 0 interleaved when add_blank=true);
+        TextToSpeech accepts a STRING arg. Parity vs the real
+        transformers.VitsTokenizer in `TestVitsTokenizerParity` (tiny committed
+        char-vocab fixture, incl. a multibyte vocab key). uroman/phonemizer
+        front-ends are OUT OF SCOPE (is_uroman/phonemize=true rejected loudly) -
+        feed already-romanized lowercase text; those front-ends are the only
+        remaining follow-up.
   - [ ] real-checkpoint smoke: synthesize a sentence with a downloaded
         `facebook/mms-tts-eng` / `kakao-enterprise/vits-ljs` and write it via
         `SaveVolumeToWav16` (offline + RAM-gated here, so deferred).

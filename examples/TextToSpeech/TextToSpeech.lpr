@@ -42,8 +42,21 @@ Coded by Claude (AI).
 // synthesis end to end. The ~5 min / ulimit budget note in the README applies
 // to real downloaded checkpoints (this smoke is a fraction of a second).
 //
+// STRING input: instead of supplying token ids by hand you can tokenize a
+// STRING with the char-level VITS tokenizer (TNNetVitsTokenizer, the HF
+// VitsTokenizer: a char->id vocab.json + add_blank/normalize flags). With a
+// text argument this runs the same pipeline but derives the ids from the text:
+//
+//   TextToSpeech "hello world"   # tokenize the string, then synthesize
+//
+// (the pico tokenizer fixture only covers the chars in "hello world"; for a
+// real model point TNNetVitsTokenizer.LoadFromDir at the downloaded model's
+// tokenizer directory, e.g. facebook/mms-tts-eng). uroman / phonemizer
+// front-ends are NOT implemented - feed already-romanized lowercase text.
+//
 // Usage:
-//   TextToSpeech                 # pico smoke test (no download)
+//   TextToSpeech                 # pico smoke test (no download), fixed ids
+//   TextToSpeech "hello world"   # tokenize the STRING, then synthesize
 
 {$mode objfpc}{$H+}
 
@@ -59,7 +72,8 @@ const
 var
   Model: TNNetVits;
   Config: TVitsConfig;
-  SafePath, CfgPath: string;
+  Tok: TNNetVitsTokenizer;
+  SafePath, CfgPath, InputText: string;
   Ids: array of integer;
   Z: array of TNeuralFloatDynArr;
   Wave: TNeuralFloatDynArr;
@@ -92,9 +106,39 @@ begin
     WriteLn(VitsConfigToString(Config));
     WriteLn;
 
-    // A short fixed token sequence (vocab is pico-sized).
-    SetLength(Ids, 6);
-    Ids[0] := 2; Ids[1] := 5; Ids[2] := 7; Ids[3] := 3; Ids[4] := 9; Ids[5] := 1;
+    InputText := '';
+    if ParamCount >= 1 then InputText := ParamStr(1);
+
+    if InputText <> '' then
+    begin
+      // STRING path: tokenize the text with the char-level VITS tokenizer.
+      // The pico tokenizer fixture is a 10-char vocab (enough for the chars in
+      // "hello world"); point LoadFromDir at a real model's tokenizer dir for
+      // full coverage.
+      Tok := TNNetVitsTokenizer.Create;
+      try
+        Tok.LoadFromFiles(
+          PicoFixtureDir + 'tiny_vits_example_tokenizer_vocab.json',
+          PicoFixtureDir + 'tiny_vits_example_tokenizer_config.json');
+        Ids := Tok.Encode(InputText);
+      finally
+        Tok.Free;
+      end;
+      if Length(Ids) = 0 then
+      begin
+        WriteLn('Text "', InputText, '" produced no in-vocab tokens.');
+        Halt(1);
+      end;
+      Write('Tokenized "', InputText, '" -> ', Length(Ids), ' ids:');
+      for i := 0 to High(Ids) do Write(' ', Ids[i]);
+      WriteLn;
+    end
+    else
+    begin
+      // A short fixed token sequence (vocab is pico-sized).
+      SetLength(Ids, 6);
+      Ids[0] := 2; Ids[1] := 5; Ids[2] := 7; Ids[3] := 3; Ids[4] := 9; Ids[5] := 1;
+    end;
 
     // Inspect the alignment the duration predictor chose.
     SetLength(Durations, Length(Ids));
