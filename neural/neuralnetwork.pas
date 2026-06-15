@@ -2770,6 +2770,16 @@ type
     // (intersected with the static causal/window masks). The ids carry NO
     // gradient (discrete labels) so no error is pushed back into this source.
     FSegLayer: TNNetLayer;
+    // Optional PREFIX-LM bidirectional block (inference-only, NOT serialized).
+    // 0 (default) = pure causal/segment behavior (bit-identical to before).
+    // P > 0 makes the first P positions (the "prefix": image tokens + prompt)
+    // attend BIDIRECTIONALLY to all prefix positions, while positions >= P (the
+    // generated suffix) stay causal. Concretely a key j is attendable for query
+    // i iff causal-allowed (j <= i, when FCausal) OR (i < P AND j < P). This is
+    // the PaliGemma / PrefixLM mask. Set per-forward via the PrefixLen property
+    // (or TNNet.SetAttentionPrefixLen); it is a transient runtime knob, so it is
+    // NOT written by SaveStructureToString. Coded by Claude (AI).
+    FPrefixLen: integer;
     FAttn: TNNetVolume; // attention weights [SizeX=key, SizeY=query, 1]
     // --- KV-cache incremental-decode state (inference only, not serialized) ---
     FCacheEnabled: boolean;
@@ -2978,6 +2988,8 @@ type
     property BidirectionalWindow: boolean read FBidirectionalWindow;
     property ScoreSoftCap: TNeuralFloat read FScoreSoftCap;
     property SegmentSource: TNNetLayer read FSegLayer;
+    // Prefix-LM bidirectional block length (0 = off; transient, not serialized).
+    property PrefixLen: integer read FPrefixLen write FPrefixLen;
     property CacheEnabled: boolean read FCacheEnabled;
     property CacheLength: integer read FCacheLen;
     property MaxContext: integer read FCacheMax;
@@ -13870,6 +13882,9 @@ type
       procedure EndIncrementalDecode();
       // Start a fresh sequence on every recurrent leaf (state := initial).
       procedure ResetIncrementalDecode();
+      // Set the prefix-LM bidirectional block length on every SDPA layer (the
+      // PaliGemma / PrefixLM mask). 0 = pure causal. Coded by Claude (AI).
+      procedure SetAttentionPrefixLen(PrefixLen: integer);
       procedure SetL2Decay(pL2Decay: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure SetL2DecayToConvolutionalLayers(pL2Decay: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure ComputeL2Decay(); overload;
@@ -23519,6 +23534,7 @@ begin
   FBidirectionalWindow := pBidirectionalWindow;
   FScoreSoftCap := pScoreSoftCap;
   FSegLayer := pSegmentSource;
+  FPrefixLen := 0; // prefix-LM bidirectional block off by default
   if FDk < 1 then
     FErrorProc('TNNetScaledDotProductAttention requires d_k >= 1. d_k=' + IntToStr(FDk));
   if FWindow < 0 then
@@ -24035,12 +24051,16 @@ begin
     MaxScore := -1e30;
     for j := 0 to SeqLen - 1 do
     begin
-      if (FCausal and (j > i)) or
+      if (FCausal and (j > i) and
+            not ((FPrefixLen > 0) and (i < FPrefixLen) and (j < FPrefixLen))) or
          ((FWindow > 0) and ((i - j >= FWindow) or
           (FBidirectionalWindow and (j - i >= FWindow)))) or
          (HasSeg and (Round(Seg[j, 0, 0]) <> SegI)) then
       begin
-        // Masked: strict future (causal), a key beyond the sliding window
+        // Masked: strict future (causal) - EXCEPT when both query and key are in
+        // the prefix-LM bidirectional block ([0..FPrefixLen-1] attend to each
+        // other regardless of order, the PaliGemma PrefixLM mask) -, a key
+        // beyond the sliding window
         // (more than Window-1 positions in the past), - bidirectional window
         // only - more than Window-1 positions in the FUTURE (the symmetric
         // encoder band), OR (per-sample segment mask) a key that belongs to a
@@ -94383,6 +94403,22 @@ begin
     else if L is TNNetWKV then TNNetWKV(L).ResetState()
     else if L is TNNetSelectiveSSM then TNNetSelectiveSSM(L).ResetState()
     else if L is TNNetDiagonalSSM then TNNetDiagonalSSM(L).ResetState();
+  end;
+end;
+
+procedure TNNet.SetAttentionPrefixLen(PrefixLen: integer);
+var
+  LayerCnt: integer;
+  L: TNNetLayer;
+begin
+  // Sets the prefix-LM bidirectional block length on EVERY scaled-dot-product
+  // attention layer (PaliGemma / PrefixLM mask). 0 = pure causal. Transient
+  // inference-time knob (not serialized). Coded by Claude (AI).
+  for LayerCnt := 0 to GetLastLayerIdx() do
+  begin
+    L := FLayers[LayerCnt];
+    if L is TNNetScaledDotProductAttention then
+      TNNetScaledDotProductAttention(L).PrefixLen := PrefixLen;
   end;
 end;
 

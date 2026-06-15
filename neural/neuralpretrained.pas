@@ -6122,6 +6122,94 @@ procedure LlavaRunLogits(VisionNet, ProjectorNet, TextNet: TNNet;
   ImageTokenIndex, NumPatches: integer; Logits: TNNetVolume);
 
 // ===========================================================================
+// PALIGEMMA VISION-LANGUAGE IMPORT (model_type "paligemma":
+// google/paligemma-3b-mix-224 and siblings) - the FIRST PREFIX-LM vision-
+// language importer. Structurally PaliGemma is LLaVA-with-a-twist:
+//   pixel tensor -> a SigLIP ViT vision tower (last_hidden_state, WITH
+//   post_layernorm) -> a SINGLE linear multimodal projector (vision_hidden ->
+//   text_hidden) -> the projected visual tokens SPLICED into the GEMMA
+//   decoder's token-embedding sequence at the <image> placeholder positions ->
+//   a PREFIX-LM forward -> next-token logits.
+// What is GENUINELY DIFFERENT from LLaVA is the attention mask: PaliGemma is a
+// PREFIX-LM. The image tokens AND the prompt tokens (the "prefix",
+// token_type_id 0, the first PrefixLen positions) attend to ALL prefix
+// positions with FULL BIDIRECTIONAL attention; ONLY the generated suffix
+// (token_type_id 1) is causal. This is wired with the transient
+// TNNetScaledDotProductAttention.PrefixLen knob (TNNet.SetAttentionPrefixLen):
+// for query i and key j, j is attendable iff causal-allowed (j <= i) OR both
+// i,j are in the prefix block ([0..PrefixLen-1]). A causal-everywhere mask
+// (LLaVA's) gives DIFFERENT logits and fails parity (the parity test proves it).
+// Everything else is REUSED: BuildSigLIPVisionTower for the tower (with
+// post_layernorm, SelectHiddenLayer=0), the LLaVA splice helper
+// (LlavaAssembleEmbeddings), and the stock Gemma decoder
+// (BuildLlamaFromTensorReaderWithConfig with the gemma model_type, which sets
+// the sqrt(hidden) embedding scale, +1 RMSNorm gain and head_dim quirks). The
+// genuinely NEW pieces are: (a) the single-linear projector
+// (BuildPaliGemmaProjector), and (b) the PrefixLen-driven prefix-LM forward
+// (PaliGemmaRunLogits). v1 is inference-only, single image, one resolution.
+// ---------------------------------------------------------------------------
+type
+  TPaliGemmaConfig = record
+    Text: TLlamaConfig;            // text_config (the Gemma decoder)
+    Vision: TClipTowerConfig;      // vision_config (SigLIP tower shape)
+    ImageSize: integer;            // vision_config.image_size
+    PatchSize: integer;            // vision_config.patch_size
+    NumChannels: integer;          // vision_config.num_channels (3)
+    NumPatches: integer;           // (image_size/patch_size)^2 (no CLS)
+    ProjectionDim: integer;        // projection_dim (= text hidden_size)
+    ImageTokenIndex: integer;      // image_token_index (the <image> id the
+                                   // projected visual tokens replace)
+    ModelType: string;             // 'paligemma'
+  end;
+
+// Reads a HF PaliGemma config.json (model_type "paligemma"). text_config is a
+// Gemma sub-config (parsed by the Llama/Gemma config reader); vision_config is
+// a siglip_vision_model sub-config. projection_dim (top level, falling back to
+// vision_config.projection_dim) must equal the text hidden_size.
+function ReadPaliGemmaConfigFromJSONFile(const FileName: string): TPaliGemmaConfig;
+
+function PaliGemmaConfigToString(const Config: TPaliGemmaConfig): string;
+
+// Builds the PaliGemma single-linear PROJECTOR net
+// (multi_modal_projector.linear, biased) mapping the (NumPatches,1,VisionHidden)
+// SigLIP feature to (NumPatches,1,TextHidden) visual tokens. Prefix is the
+// tensor-name prefix ('model.multi_modal_projector.' for transformers 5.x,
+// 'multi_modal_projector.' for older checkpoints). Owned by the caller.
+// Coded by Claude (AI).
+function BuildPaliGemmaProjector(Reader: TNNetSafeTensorsReader;
+  NumPatches, VisionHidden, TextHidden: integer;
+  const Prefix: string; pInferenceOnly: boolean = false): TNNet;
+
+// Builds the three PaliGemma nets from the checkpoint at FileName: VisionNet
+// (the SigLIP tower in feature mode WITH post_layernorm), ProjectorNet (the
+// single linear), and TextNet (the stock Gemma decoder, its TNNetEmbedding fed
+// externally by PaliGemmaRunLogits). All three owned by the caller. pSeqLen<=0
+// uses the text max_position_embeddings; the assembled prompt length must not
+// exceed it. pInferenceOnly frees training volumes during construction.
+procedure BuildPaliGemmaFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TPaliGemmaConfig; out VisionNet, ProjectorNet, TextNet: TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+procedure BuildPaliGemmaFromSafeTensors(const FileName: string;
+  out VisionNet, ProjectorNet, TextNet: TNNet; out Config: TPaliGemmaConfig;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+
+// Full PaliGemma PREFIX-LM forward: projects the image, assembles the spliced
+// embedding sequence (reusing the LLaVA splice), injects it into TextNet's
+// TNNetEmbedding output, sets the prefix-LM bidirectional block to PrefixLen
+// on every SDPA layer, runs the decoder from the embedding onward, and returns
+// the (SeqLen,1,vocab) next-token logits in Logits. PrefixLen is the number of
+// leading prefix tokens (image tokens + prompt, token_type_id 0); positions
+// >= PrefixLen are the causal suffix. PrefixLen <= 0 falls back to pure causal
+// (the LLaVA behaviour). Coded by Claude (AI).
+procedure PaliGemmaRunLogits(VisionNet, ProjectorNet, TextNet: TNNet;
+  Pixels: TNNetVolume; const TokenIds: array of integer;
+  ImageTokenIndex, NumPatches, PrefixLen: integer; Logits: TNNetVolume);
+
+// ===========================================================================
 // RAFT OPTICAL-FLOW IMPORT (model_type "raft_small", the torchvision
 // raft_small architecture, Teed & Deng 2020 "RAFT", arXiv:2003.12039) - the
 // FIRST optical-flow vertical and the first TWO-image-in / dense-2-channel-out
@@ -50554,6 +50642,304 @@ begin
     for i := 2 to TextNet.GetLastLayerIdx() do
       TextNet.Layers[i].Compute();
     TextNet.GetOutput(Logits);
+  finally
+    Embeds.Free;
+    VisualTokens.Free;
+  end;
+end;
+
+// ===========================================================================
+// PALIGEMMA VISION-LANGUAGE IMPORT (implementation). See the interface header.
+// ===========================================================================
+
+function ReadPaliGemmaConfigFromJSONFile(
+  const FileName: string): TPaliGemmaConfig;
+var
+  JsonText, TextCfgText: TStringList;
+  Root: TJSONData;
+  Obj, TextObj, VisionObj: TJSONObject;
+  TempTextCfg, VisModelType: string;
+  Grid, ProjDim: integer;
+
+  function RequiredSubObject(const FieldName: string): TJSONObject;
+  var
+    D: TJSONData;
+  begin
+    D := Obj.Find(FieldName);
+    if (D = nil) or not (D is TJSONObject) then
+      ImportError('PaliGemma import: config "' + FileName +
+        '" is missing the required sub-object "' + FieldName + '".');
+    Result := TJSONObject(D);
+  end;
+
+  function RequiredInt(O: TJSONObject; const FieldName: string): integer;
+  begin
+    if O.IndexOfName(FieldName) < 0 then
+      ImportError('PaliGemma import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := O.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('PaliGemma import: config field "' + FieldName +
+        '" must be a positive integer, got ' + O.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('PaliGemma import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  TempTextCfg := '';
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('PaliGemma import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('PaliGemma import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    if Obj.Get('model_type', 'paligemma') <> 'paligemma' then
+      ImportError('PaliGemma import: config model_type is "' +
+        Obj.Get('model_type', '') + '" - only "paligemma" is supported here.');
+    Result.ModelType := 'paligemma';
+
+    // ---- text_config: a Gemma sub-config. Hand it to the Llama/Gemma config
+    // reader by writing it to a temp file (it expects a top-level config). ----
+    TextObj := RequiredSubObject('text_config');
+    TextCfgText := TStringList.Create;
+    try
+      TextCfgText.Text := TextObj.AsJSON;
+      TempTextCfg := GetTempFileName('', 'paligemma_txt') + '.json';
+      TextCfgText.SaveToFile(TempTextCfg);
+    finally
+      TextCfgText.Free;
+    end;
+    Result.Text := ReadLlamaConfigFromJSONFile(TempTextCfg);
+    if (Result.Text.ModelType <> 'gemma') and
+       (Result.Text.ModelType <> 'gemma2') then
+      ImportError('PaliGemma import: text_config.model_type is "' +
+        Result.Text.ModelType + '" - PaliGemma uses a Gemma decoder ' +
+        '("gemma"/"gemma2").');
+
+    // ---- vision_config: a siglip_vision_model tower + image geometry. ----
+    VisionObj := RequiredSubObject('vision_config');
+    VisModelType := VisionObj.Get('model_type', 'siglip_vision_model');
+    if (VisModelType <> 'siglip_vision_model') and
+       (VisModelType <> 'siglip') then
+      ImportError('PaliGemma import: vision_config.model_type is "' +
+        VisModelType + '" - PaliGemma uses a SigLIP vision tower.');
+    Result.Vision.HiddenSize := RequiredInt(VisionObj, 'hidden_size');
+    Result.Vision.IntermediateSize := RequiredInt(VisionObj,
+      'intermediate_size');
+    Result.Vision.NumLayers := RequiredInt(VisionObj, 'num_hidden_layers');
+    Result.Vision.NumHeads := RequiredInt(VisionObj, 'num_attention_heads');
+    Result.Vision.LayerNormEps := VisionObj.Get('layer_norm_eps', 0.000001);
+    Result.Vision.HiddenAct := SigLIPHiddenActFromString(
+      VisionObj.Get('hidden_act', 'gelu_pytorch_tanh'));
+    Result.ImageSize := RequiredInt(VisionObj, 'image_size');
+    Result.PatchSize := RequiredInt(VisionObj, 'patch_size');
+    Result.NumChannels := VisionObj.Get('num_channels', 3);
+    Grid := Result.ImageSize div Result.PatchSize;
+    Result.NumPatches := Grid * Grid;   // SigLIP: no CLS token
+
+    // ---- projection_dim: top-level wins, falls back to vision_config. It is
+    // the projector output width and MUST equal the text hidden_size. ----
+    ProjDim := Obj.Get('projection_dim', 0);
+    if ProjDim <= 0 then ProjDim := VisionObj.Get('projection_dim', 0);
+    if ProjDim <= 0 then ProjDim := Result.Text.HiddenSize;
+    Result.ProjectionDim := ProjDim;
+    if Result.ProjectionDim <> Result.Text.HiddenSize then
+      ImportError('PaliGemma import: projection_dim (' +
+        IntToStr(Result.ProjectionDim) + ') must equal text hidden_size (' +
+        IntToStr(Result.Text.HiddenSize) + ').');
+
+    Result.ImageTokenIndex := Obj.Get('image_token_index', 257152);
+  finally
+    if (TempTextCfg <> '') and FileExists(TempTextCfg) then
+      DeleteFile(TempTextCfg);
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function PaliGemmaConfigToString(const Config: TPaliGemmaConfig): string;
+begin
+  Result := 'paligemma(siglip-vision): text(' + Config.Text.ModelType +
+    ', d=' + IntToStr(Config.Text.HiddenSize) +
+    ', layers=' + IntToStr(Config.Text.NumLayers) +
+    ', vocab=' + IntToStr(Config.Text.VocabSize) +
+    '), vision(d=' + IntToStr(Config.Vision.HiddenSize) +
+    ', layers=' + IntToStr(Config.Vision.NumLayers) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', patch=' + IntToStr(Config.PatchSize) +
+    ', patches=' + IntToStr(Config.NumPatches) +
+    '), proj_dim=' + IntToStr(Config.ProjectionDim) +
+    ', image_token=' + IntToStr(Config.ImageTokenIndex) +
+    ', mask=prefix-lm';
+end;
+
+function BuildPaliGemmaProjector(Reader: TNNetSafeTensorsReader;
+  NumPatches, VisionHidden, TextHidden: integer;
+  const Prefix: string; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  Lin: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer( TNNetInput.Create(NumPatches, 1, VisionHidden) );
+    // SINGLE biased linear: VisionHidden -> TextHidden, per token (NO gelu,
+    // NO second layer - unlike LLaVA's 2-layer MLP).
+    Lin := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    LoadLlamaLinearWeights(Reader, Lin, Prefix + 'linear.weight',
+      VisionHidden, TextHidden, 0, -1, 0, Prefix + 'linear.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+procedure BuildPaliGemmaFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TPaliGemmaConfig; out VisionNet, ProjectorNet, TextNet: TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  VisionPrefix, ProjPrefix: string;
+begin
+  VisionNet := nil;
+  ProjectorNet := nil;
+  TextNet := nil;
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    // ---- tensor-name prefix detection (transformers 5.x adds "model.") ----
+    if Reader.HasTensor('model.vision_tower.embeddings.patch_embedding.weight')
+    then VisionPrefix := 'model.vision_tower.'
+    else if Reader.HasTensor(
+      'vision_tower.embeddings.patch_embedding.weight') then
+      VisionPrefix := 'vision_tower.'
+    else
+      ImportError('PaliGemma import: vision tower patch_embedding not found ' +
+        '(looked under model.vision_tower. and vision_tower.) in ' +
+        Reader.FileName + '.');
+    // Projector (single linear).
+    if Reader.HasTensor('model.multi_modal_projector.linear.weight') then
+      ProjPrefix := 'model.multi_modal_projector.'
+    else if Reader.HasTensor('multi_modal_projector.linear.weight') then
+      ProjPrefix := 'multi_modal_projector.'
+    else
+      ImportError('PaliGemma import: multi_modal_projector.linear not found in '
+        + Reader.FileName + '.');
+    // Language model: alias model.language_model.* -> model.* so the Gemma
+    // builder's prefix auto-detection fires (same as LLaVA).
+    if Reader.HasTensor('model.language_model.embed_tokens.weight') then
+      Reader.RenameTensorPrefix('model.language_model.', 'model.')
+    else if Reader.HasTensor('language_model.model.embed_tokens.weight') then
+    begin
+      Reader.RenameTensorPrefix('language_model.model.', 'model.');
+      if Reader.HasTensor('language_model.lm_head.weight') then
+        Reader.RenameTensor('language_model.lm_head.weight', 'lm_head.weight');
+    end
+    else if not Reader.HasTensor('model.embed_tokens.weight') then
+      ImportError('PaliGemma import: language-model embed_tokens not found ' +
+        '(looked under model.language_model., language_model.model. and ' +
+        'model.) in ' + Reader.FileName + '.');
+
+    // ---- vision tower (feature mode). PaliGemma's vision feature is the
+    // SigLIP last_hidden_state WITH post_layernorm, so SelectHiddenLayer = 0
+    // runs the FULL stack and applies post_layernorm (the opposite of LLaVA's
+    // vision_feature_layer = -1, which SKIPS it). ----
+    VisionNet := BuildSigLIPVisionTower(Reader, Config.Vision,
+      Config.ImageSize, Config.PatchSize, Config.NumChannels,
+      VisionPrefix, pInferenceOnly, {pVisionFeatures=}true,
+      {SelectHiddenLayer=}0);
+
+    // ---- projector (single linear) ----
+    ProjectorNet := BuildPaliGemmaProjector(Reader, Config.NumPatches,
+      Config.Vision.HiddenSize, Config.Text.HiddenSize, ProjPrefix,
+      pInferenceOnly);
+
+    // Drop the vision-tower + projector tensors so the Gemma builder's strict
+    // all-tensors-consumed check sees only the language-model tensors.
+    Reader.RemoveTensorsWithPrefix(VisionPrefix);
+    Reader.RemoveTensorsWithPrefix(ProjPrefix);
+
+    // ---- language model (stock Gemma path; embedding fed externally by
+    // PaliGemmaRunLogits). The reader is consumed (freed) by the builder, so
+    // this MUST be last. ----
+    TextNet := BuildLlamaFromTensorReaderWithConfig(Reader, FileName,
+      Config.Text, pSeqLen, pInferenceOnly, {pQuantizeInt8=}false);
+    Reader := nil;  // ownership transferred
+  except
+    VisionNet.Free;
+    ProjectorNet.Free;
+    TextNet.Free;
+    Reader.Free;
+    raise;
+  end;
+end;
+
+procedure BuildPaliGemmaFromSafeTensors(const FileName: string;
+  out VisionNet, ProjectorNet, TextNet: TNNet; out Config: TPaliGemmaConfig;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+var
+  CfgPath: string;
+begin
+  if ConfigFileName <> '' then CfgPath := ConfigFileName
+  else CfgPath := IncludeTrailingPathDelimiter(ExtractFilePath(FileName)) +
+    'config.json';
+  Config := ReadPaliGemmaConfigFromJSONFile(CfgPath);
+  BuildPaliGemmaFromSafeTensorsWithConfig(FileName, Config,
+    VisionNet, ProjectorNet, TextNet, pSeqLen, pInferenceOnly);
+end;
+
+procedure PaliGemmaRunLogits(VisionNet, ProjectorNet, TextNet: TNNet;
+  Pixels: TNNetVolume; const TokenIds: array of integer;
+  ImageTokenIndex, NumPatches, PrefixLen: integer; Logits: TNNetVolume);
+var
+  VisualTokens, Embeds: TNNetVolume;
+  EmbeddingLayer: TNNetLayer;
+  i, SeqLen: integer;
+begin
+  if (TextNet.Layers.Count <= 2) or
+     not (TextNet.Layers[1] is TNNetEmbedding) then
+    ImportError('PaliGemmaRunLogits: TextNet is not a ' +
+      'BuildPaliGemmaFromSafeTensors language model (layer 1 must be a ' +
+      'TNNetEmbedding).');
+  EmbeddingLayer := TextNet.Layers[1];
+  SeqLen := Length(TokenIds);
+  if SeqLen <> EmbeddingLayer.Output.SizeX then
+    ImportError('PaliGemmaRunLogits: prompt length ' + IntToStr(SeqLen) +
+      ' must equal the decoder''s SeqLen ' +
+      IntToStr(EmbeddingLayer.Output.SizeX) +
+      ' (rebuild with pSeqLen = assembled prompt length).');
+  VisualTokens := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  try
+    LlavaProjectImage(VisionNet, ProjectorNet, Pixels, VisualTokens);
+    // Reuse the LLaVA splice: text ids look up the (sqrt(d)-scaled) Gemma
+    // embedding rows; image slots receive the raw projected visual tokens.
+    LlavaAssembleEmbeddings(TextNet, TokenIds, ImageTokenIndex, NumPatches,
+      VisualTokens, Embeds);
+    // PREFIX-LM: the first PrefixLen positions attend BIDIRECTIONALLY; the
+    // suffix stays causal. Set the transient knob on every SDPA layer before
+    // running the decoder (PrefixLen <= 0 => pure causal = LLaVA behaviour).
+    TextNet.SetAttentionPrefixLen(PrefixLen);
+    try
+      EmbeddingLayer.Output.Copy(Embeds);
+      for i := 2 to TextNet.GetLastLayerIdx() do
+        TextNet.Layers[i].Compute();
+      TextNet.GetOutput(Logits);
+    finally
+      // Reset so a subsequent ordinary causal forward is not affected.
+      TextNet.SetAttentionPrefixLen(0);
+    end;
   finally
     Embeds.Free;
     VisualTokens.Free;

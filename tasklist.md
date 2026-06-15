@@ -1002,19 +1002,35 @@ rather than acted on.
       second route (besides the tracked PixArt) to the LatentTextToImage capstone with
       NO SD UNet. Pico parity vs a diffusers float64 oracle on one block's joint-attention
       output + reuse make_pico_*_fixture.py.
-- [ ] PaliGemma vision-language importer (BuildPaliGemmaFromSafeTensors, e.g.
-      google/paligemma-3b-mix-224) — a VLM follow-up that exercises a genuinely
-      DIFFERENT attention regime from the tracked causal LLaVA path: PaliGemma is a
-      PREFIX-LM, the image tokens AND the prompt tokens see each other with FULL
-      BIDIRECTIONAL attention (a block-bidirectional mask over the prefix) and only the
-      generated suffix is causal. The new code is that prefix-LM attention-mask wiring
-      threaded through the decoder; nearly everything else is landed — the SigLIP tower
-      (BuildSigLIPVisionTower), the Gemma decoder (BuildGemmaFromSafeTensors), and the
-      linear multimodal projector + image-token splice are exactly the LLaVA
-      prompt-assembly helper (so this depends on / shares that helper). Distinct from
-      LLaVA's causal-everywhere mask and from the open Qwen2-VL M-RoPE path. Pico parity
-      vs HF float64 on next-token logits for a mixed image+text prompt + an
-      examples/PaliGemmaCaption that captions a tiny image on CPU (ulimit-bounded).
+- [X] PaliGemma vision-language importer (BuildPaliGemmaFromSafeTensors[Ex] +
+      TPaliGemmaConfig + ReadPaliGemmaConfigFromJSONFile/PaliGemmaConfigToString,
+      neuralpretrained.pas) — LANDED the first PREFIX-LM vision-language importer. The
+      genuinely NEW code is the block-bidirectional prefix mask: added a transient
+      TNNetScaledDotProductAttention.PrefixLen property (NOT serialized) + the net-wide
+      TNNet.SetAttentionPrefixLen driver (neuralnetwork.pas). In the SDPA score loop a
+      key j is attendable for query i iff causal-allowed (j<=i) OR both i,j are in the
+      prefix block [0..PrefixLen-1] — so the image tokens + prompt (token_type_id 0)
+      attend bidirectionally and only the generated suffix (token_type_id 1) is causal.
+      PrefixLen=0 default is bit-identical to the old pure-causal path (all SDPA
+      numerical regressions pass). EVERYTHING else is reused: SigLIP tower
+      (BuildSigLIPVisionTower in feature mode, SelectHiddenLayer=0 so post_layernorm IS
+      applied — PaliGemma uses last_hidden_state, the OPPOSITE of LLaVA's -1 feature),
+      the LLaVA splice (LlavaAssembleEmbeddings), and the stock Gemma decoder
+      (BuildLlamaFromTensorReaderWithConfig, gemma model_type). NEW pieces:
+      BuildPaliGemmaProjector (a SINGLE biased linear, no gelu / no 2nd layer unlike
+      LLaVA) and PaliGemmaRunLogits (the prefix-LM forward, sets/restores PrefixLen).
+      Pico parity TestPaliGemmaLogitParity: next-token logits < 1e-4 vs HF float64
+      (PaliGemmaForConditionalGeneration with token_type_ids) AND a negative control that
+      re-runs with PrefixLen=0 (causal-everywhere = LLaVA mask) and asserts the logits
+      DIFFER (>1e-3) — proving the bidirectional mask is load-bearing (fixture self-check
+      shows max|diff|=6.7). tools/make_pico_paligemma_fixture.py + committed
+      tests/fixtures/tiny_paligemma.{safetensors,_config.json,_logits.json}.
+      examples/PaliGemmaCaption (.lpr/.lpi + examples/README.md) smoke-captions the pico
+      image. OPEN FOLLOW-UPS: (a) multi-image prompts (one prefix block per image);
+      (b) a real-checkpoint slicer (tools/make_pico_*_fixture slice precedent) + the
+      Gemma SentencePiece tokenizer's <image>-token expansion to NumPatches ids (the demo
+      hardcodes the id layout); (c) 448/896 resolutions (more patches, larger pos table);
+      (d) the M-RoPE Qwen2-VL path (a THIRD distinct VLM attention regime, still open).
 - [ ] AnimateDiff text-to-VIDEO motion-module importer (BuildAnimateDiffFromSafeTensors,
       e.g. guoyww/animatediff-motion-adapter-v1-5-2) — the FIRST video-GENERATIVE
       importer (a sequence of frames from a text prompt), a brand-new generative

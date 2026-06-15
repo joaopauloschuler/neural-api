@@ -304,6 +304,8 @@ type
     procedure TestLlavaConfigFromJSONFile;
     procedure TestLlavaVisualTokenParity;
     procedure TestLlavaNextTokenLogitsParity;
+    procedure TestPaliGemmaConfigFromJSONFile;
+    procedure TestPaliGemmaLogitParity;
     procedure TestViTConfigFromJSONFile;
     procedure TestViTImageClassificationParity;
     procedure TestResNetConfigFromJSONFile;
@@ -13565,6 +13567,134 @@ begin
     end;
     AssertTrue('next-token logits: max |diff| = ' + FloatToStr(MaxDiff) +
       ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Logits.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    VisionNet.Free;
+    ProjectorNet.Free;
+    TextNet.Free;
+  end;
+end;
+
+// Verifies ReadPaliGemmaConfigFromJSONFile on the committed pico PaliGemma
+// config: a SigLIP vision tower + Gemma text decoder + single-linear projector.
+procedure TTestNeuralPretrained.TestPaliGemmaConfigFromJSONFile;
+var
+  Config: TPaliGemmaConfig;
+begin
+  Config := ReadPaliGemmaConfigFromJSONFile(
+    FixturePath('tiny_paligemma_config.json'));
+  AssertEquals('model_type', 'paligemma', Config.ModelType);
+  AssertEquals('text model_type', 'gemma', Config.Text.ModelType);
+  AssertEquals('text hidden', 32, Config.Text.HiddenSize);
+  AssertEquals('text layers', 2, Config.Text.NumLayers);
+  AssertEquals('text vocab', 50, Config.Text.VocabSize);
+  AssertEquals('vision hidden', 24, Config.Vision.HiddenSize);
+  AssertEquals('vision layers', 2, Config.Vision.NumLayers);
+  AssertEquals('image size', 12, Config.ImageSize);
+  AssertEquals('patch size', 4, Config.PatchSize);
+  AssertEquals('num patches (3x3)', 9, Config.NumPatches);
+  AssertEquals('projection_dim = text hidden', 32, Config.ProjectionDim);
+  AssertEquals('image_token_index', 49, Config.ImageTokenIndex);
+end;
+
+// PaliGemma NEXT-TOKEN LOGIT parity for a mixed image+text PREFIX-LM prompt.
+// PaliGemmaRunLogits runs the SigLIP tower (WITH post_layernorm) + the single
+// linear projector, splices the visual tokens into the Gemma decoder's
+// embedding sequence at the image_token slots, and runs the decoder with the
+// PREFIX-LM bidirectional mask over the first PrefixLen positions (image +
+// prompt). Compares the (seq,vocab) logits < 1e-4 vs the HF float64 oracle
+// (PaliGemmaForConditionalGeneration forward with token_type_ids).
+// CRITICAL: re-runs the SAME forward with PrefixLen=0 (causal-everywhere, the
+// LLaVA mask) and asserts parity BREAKS - proving the bidirectional prefix
+// block is the load-bearing distinction (a wrong causal mask fails the gate).
+procedure TTestNeuralPretrained.TestPaliGemmaLogitParity;
+var
+  VisionNet, ProjectorNet, TextNet: TNNet;
+  Config: TPaliGemmaConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, IdsArr, LogitsArr, RowL: TJSONArray;
+  ImageInput, Logits: TNNetVolume;
+  TokenIds: array of integer;
+  C, Y, X, t, v, SeqLen, Vocab, PrefixLen: integer;
+  Diff, MaxDiff, CausalMaxDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  VisionNet := nil; ProjectorNet := nil; TextNet := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_paligemma_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    IdsArr := TJSONArray(TJSONObject(RefRoot).Find('token_ids'));
+    SeqLen := IdsArr.Count;
+    SetLength(TokenIds, SeqLen);
+    for t := 0 to SeqLen - 1 do TokenIds[t] := IdsArr.Items[t].AsInteger;
+    PrefixLen := TJSONObject(RefRoot).Get('prefix_len', 0);
+
+    BuildPaliGemmaFromSafeTensors(FixturePath('tiny_paligemma.safetensors'),
+      VisionNet, ProjectorNet, TextNet, Config, {pSeqLen=}SeqLen,
+      {pInferenceOnly=}false, FixturePath('tiny_paligemma_config.json'));
+
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for C := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[C]);
+      for Y := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[Y]);
+        for X := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[(Y * Config.ImageSize + X) * Config.NumChannels + C]
+            := ChanArr.Items[X].AsFloat;
+      end;
+    end;
+
+    // --- the real PREFIX-LM forward ---
+    PaliGemmaRunLogits(VisionNet, ProjectorNet, TextNet, ImageInput, TokenIds,
+      Config.ImageTokenIndex, Config.NumPatches, PrefixLen, Logits);
+    AssertEquals('logits rows = seq len', SeqLen, Logits.SizeX);
+    AssertEquals('logits depth = vocab', Config.Text.VocabSize, Logits.Depth);
+
+    LogitsArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    Vocab := Config.Text.VocabSize;
+    MaxDiff := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      RowL := TJSONArray(LogitsArr.Items[t]);
+      for v := 0 to Vocab - 1 do
+      begin
+        Diff := Abs(Logits.FData[t * Vocab + v] - RowL.Items[v].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('PREFIX-LM next-token logits: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // --- CRITICAL negative control: causal-everywhere (PrefixLen=0) MUST NOT
+    // match the prefix-LM oracle (otherwise the test would pass with a wrong,
+    // LLaVA-style mask). ---
+    PaliGemmaRunLogits(VisionNet, ProjectorNet, TextNet, ImageInput, TokenIds,
+      Config.ImageTokenIndex, Config.NumPatches, {PrefixLen=}0, Logits);
+    CausalMaxDiff := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      RowL := TJSONArray(LogitsArr.Items[t]);
+      for v := 0 to Vocab - 1 do
+      begin
+        Diff := Abs(Logits.FData[t * Vocab + v] - RowL.Items[v].AsFloat);
+        if Diff > CausalMaxDiff then CausalMaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('causal-everywhere mask must DIFFER from the prefix-LM oracle ' +
+      '(max |diff| = ' + FloatToStr(CausalMaxDiff) + ' must be > 1e-3) - ' +
+      'proves the bidirectional prefix mask is load-bearing',
+      CausalMaxDiff > 1e-3);
   finally
     RefRoot.Free;
     Logits.Free;
