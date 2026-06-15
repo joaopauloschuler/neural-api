@@ -118,7 +118,12 @@ type
     cfMistral,  // Mistral-7B-Instruct [INST] without system
     cfDeepSeek, // DeepSeek-V2/V3-Chat <｜begin▁of▁sentence｜>User: ...
     cfPhi4Mini, // Phi-4-mini-instruct ChatML-style (no-newline tags)
-    cfQwen      // Qwen2.5/Qwen-style ChatML + default-system injection
+    cfQwen,     // Qwen2.5/Qwen-style ChatML + default-system injection
+    cfLlava     // LLaVA-1.5 vicuna-style multimodal: a system preamble then
+                // "USER: <content> ASSISTANT: <content></s>" turns. The user
+                // turn carries the "<image>\n" placeholder (the importer's
+                // image_token); EncodeChat / the demo expand it to the
+                // projected visual tokens. Coded by Claude (AI).
   );
 
   TChatMessage = record
@@ -311,6 +316,15 @@ const
   csQwenDefaultSystem =
     'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.';
 
+// The LLaVA-1.5 (vicuna v1) default system preamble, emitted before the first
+// turn when the conversation has no leading system message (llava_v1
+// conv_template parity).
+const
+  csLlavaDefaultSystem =
+    'A chat between a curious human and an artificial intelligence ' +
+    'assistant. The assistant gives helpful, detailed, and polite answers ' +
+    'to the human''s questions.';
+
 function ChatFormatName(ChatFormat: TNeuralChatFormat): string;
 begin
   case ChatFormat of
@@ -324,6 +338,7 @@ begin
     cfDeepSeek: Result := 'deepseek';
     cfPhi4Mini: Result := 'phi4mini';
     cfQwen: Result := 'qwen';
+    cfLlava: Result := 'llava';
     else Result := 'unknown';
   end;
 end;
@@ -343,6 +358,7 @@ begin
   else if Lowered = 'deepseek' then Result := cfDeepSeek
   else if Lowered = 'phi4mini' then Result := cfPhi4Mini
   else if Lowered = 'qwen' then Result := cfQwen
+  else if Lowered = 'llava' then Result := cfLlava
   else Result := cfUnknown;
 end;
 
@@ -689,6 +705,37 @@ begin
   end;
   if AddGenerationPrompt then
     Result := Result + '<|assistant|>';
+end;
+
+// LLaVA-1.5 vicuna-style multimodal template. A system preamble (the supplied
+// system turn, else the default) then alternating "USER: <content>" /
+// " ASSISTANT: <content></s>" turns, space-separated (the llava_v1
+// conv_template: sep ' ', sep2 '</s>'). The user content carries the
+// "<image>\n" placeholder verbatim; EncodeChat / the LLaVA demo expand it to
+// the projected visual tokens. Coded by Claude (AI).
+function RenderLlava(const Messages: array of TChatMessage;
+  AddGenerationPrompt: boolean): string;
+var
+  Cnt: integer;
+  Role, SystemMsg: string;
+  HaveSystem: boolean;
+begin
+  // Leading system preamble: the supplied system turn, or the default.
+  HaveSystem := (Length(Messages) > 0) and (Messages[0].Role = 'system');
+  if HaveSystem then SystemMsg := Messages[0].Content
+  else SystemMsg := csLlavaDefaultSystem;
+  Result := SystemMsg;
+  for Cnt := 0 to High(Messages) do
+  begin
+    Role := Messages[Cnt].Role;
+    if Role = 'system' then continue;  // already emitted as the preamble
+    if Role = 'user' then
+      Result := Result + ' USER: ' + Messages[Cnt].Content
+    else if Role = 'assistant' then
+      Result := Result + ' ASSISTANT: ' + Messages[Cnt].Content + '</s>';
+  end;
+  if AddGenerationPrompt then
+    Result := Result + ' ASSISTANT:';
 end;
 
 // ===================================================================
@@ -1643,10 +1690,11 @@ begin
     cfMistral: Result := RenderMistral(Messages);
     cfDeepSeek: Result := RenderDeepSeek(Messages, AddGenerationPrompt);
     cfPhi4Mini: Result := RenderPhi4Mini(Messages, AddGenerationPrompt);
+    cfLlava: Result := RenderLlava(Messages, AddGenerationPrompt);
     else
       raise ENeuralChatError.Create('Unknown chat format. Pass one of ' +
         'cfChatML/cfLlama2/cfLlama3/cfZephyr/cfGemma/cfPhi3/cfMistral/' +
-        'cfDeepSeek/cfPhi4Mini/cfQwen ' +
+        'cfDeepSeek/cfPhi4Mini/cfQwen/cfLlava ' +
         '(auto-detection via DetectChatFormat did not recognize the ' +
         'model''s chat_template).');
   end;

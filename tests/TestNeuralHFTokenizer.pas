@@ -138,6 +138,7 @@ type
     procedure TestApplyChatTemplateStringFallback;
     // chat templates v2 follow-ups
     procedure TestQwenDefaultSystemInjection;
+    procedure TestLlavaMultimodalTemplate;
     procedure TestContinueFinalMessage;
     procedure TestReturnAssistantTokensMask;
   end;
@@ -2185,6 +2186,48 @@ begin
       '<|im_start|>system' + #10 +
       'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.' +
       '<|im_end|>{%- endif %}') = cfQwen);
+end;
+
+// cfLlava reproduces the LLaVA-1.5 (vicuna v1) multimodal conv_template: a
+// system preamble (the supplied system turn, else the llava_v1 default) then
+// space-separated " USER: <content>" / " ASSISTANT: <content></s>" turns,
+// ending with " ASSISTANT:" when a generation prompt is requested. The user
+// turn carries the "<image>\n" placeholder verbatim (the LLaVA demo splices
+// the projected visual tokens at that position).
+procedure TTestNeuralChat.TestLlavaMultimodalTemplate;
+const
+  DefSys =
+    'A chat between a curious human and an artificial intelligence ' +
+    'assistant. The assistant gives helpful, detailed, and polite answers ' +
+    'to the human''s questions.';
+var
+  Messages: TChatMessages;
+  Rendered: string;
+begin
+  // NO system -> the default llava_v1 preamble; user turn carries <image>\n.
+  SetLength(Messages, 1);
+  Messages[0] := ChatMessage('user', '<image>' + #10 + 'What is in the image?');
+  Rendered := ApplyChatTemplate(cfLlava, Messages, true);
+  AssertEquals('llava default preamble + USER + gen prompt',
+    DefSys + ' USER: <image>' + #10 + 'What is in the image?' +
+    ' ASSISTANT:',
+    Rendered);
+
+  // explicit system + a completed assistant turn (</s> closer, no gen prompt).
+  SetLength(Messages, 3);
+  Messages[0] := ChatMessage('system', 'Be concise.');
+  Messages[1] := ChatMessage('user', '<image>' + #10 + 'Caption.');
+  Messages[2] := ChatMessage('assistant', 'A cat.');
+  Rendered := ApplyChatTemplate(cfLlava, Messages, false);
+  AssertEquals('llava explicit system + assistant turn',
+    'Be concise. USER: <image>' + #10 + 'Caption. ASSISTANT: A cat.</s>',
+    Rendered);
+  AssertEquals('explicit system suppresses the default preamble',
+    0, Pos('curious human', Rendered));
+
+  // name round-trips.
+  AssertTrue('llava name round-trips',
+    ChatFormatFromName(ChatFormatName(cfLlava)) = cfLlava);
 end;
 
 // continue_final_message: the final (assistant) message is a PREFIX to be
