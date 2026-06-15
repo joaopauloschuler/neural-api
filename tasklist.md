@@ -909,20 +909,15 @@ rather than acted on.
       examples/TextToVideo that writes a short animated GIF/PPM sequence on CPU once the
       base UNet lands. Note: the cheaper no-UNet route to video is bolting the same
       temporal block onto the landed PixArt DiT — worth scoping if SD UNet stays blocked.
-- [ ] SDEdit image-to-image / real-image EDITING example (examples/ImageToImage) that
-      reuses ALREADY-LANDED pieces with NO new importer and NO SD UNet: the VAE ENCODER
-      (BuildVaeEncoderFromSafeTensors, landed) maps a real input image -> latent, the
-      DDIM/DPM-Solver++ scheduler (TNNetDiffusionScheduler) adds noise to an intermediate
-      timestep (strength in 0..1), the landed PixArt denoiser (BuildPixArtFromSafeTensors)
-      re-denoises conditioned on a NEW prompt, and the VAE DECODER returns the edited RGB.
-      Structurally distinct from the tracked LatentTextToImage capstone (text->image from
-      PURE noise): here the start latent is a real encoded image partially noised, so it
-      preserves layout while changing content — the SDEdit / img2img workflow. The only
-      new code is the encode->partial-noise->denoise->decode driver + the strength knob;
-      every model and sampler step is landed. CPU/ulimit-bounded smoke run writing a
-      before/after pair. Also unblocks diffusion INPAINTING (re-noise only the masked
-      latent region each step) as a one-flag follow-up — the diffusion-based sibling of
-      the tracked GAN context-encoder examples/Inpainting. Edit examples/README.md.
+- [ ] Diffusion INPAINTING example (examples/ImageToImage --inpaint, or a sibling) — the
+      one-flag follow-up unblocked by the landed SDEdit examples/ImageToImage driver: reuse
+      the exact same encode->partial-noise->denoise->decode pipeline but, BEFORE each
+      reverse step, overwrite the UNMASKED latent region with the (re-noised to that
+      timestep) clean encoded latent, so only the masked region is regenerated while the
+      rest stays pixel-faithful (the RePaint / SD-inpaint resample trick). No new model:
+      it adds a mask volume + a per-step composite to the existing ImageToImage loop. The
+      diffusion-based sibling of the tracked GAN context-encoder examples/Inpainting.
+      CPU/ulimit-bounded smoke run on the same tiny fixtures, writing before/masked/after.
 - [ ] Structured-vision accuracy eval harness for the imported DETECTION and DENSE-
       prediction backbones (EvaluateDetectionMAP / EvaluateSegmentationMIoU + reports in
       neuralimagemetrics.pas, plus examples/VisionEval) — the verification backstop that

@@ -64,3 +64,10 @@ examples/SimpleNLP/decode_bakeoff_phase*.log
 
 # Downloaded HF model checkpoints (large binaries, never commit)
 .olmo2_1b/
+
+# ImageToImage (SDEdit) example: compiled binary + generated before/after images
+examples/ImageToImage/ImageToImage
+examples/ImageToImage/*.ppm
+examples/ImageToImage/*.png
+examples/ImageToImage/*.o
+examples/ImageToImage/*.ppu
