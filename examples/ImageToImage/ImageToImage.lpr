@@ -31,6 +31,19 @@ driver and the `strength` knob. No new importer, no SD UNet, no hand-rolled
 noising/sampling math (every noise/step call goes through the reusable
 scheduler).
 
+INPAINTING (--inpaint). A one-flag follow-up that reuses the EXACT same
+encode -> partial-noise -> denoise -> decode pipeline but regenerates ONLY a
+masked region while the rest stays pixel-faithful (the RePaint / SD-inpaint
+resample trick, Lugmayr et al. 2022 "RePaint", arXiv:2201.09865). A binary
+mask over the latent grid marks the region to regenerate (1) vs keep (0).
+BEFORE each reverse step the UNMASKED latent is OVERWRITTEN with the clean
+encoded latent z0 RE-NOISED (scheduler AddNoise) to that step's timestep, so
+the kept region always carries the correct amount of noise for the current
+step while only the masked region is driven by the denoiser. No new model: it
+adds a mask volume + a per-step composite to the existing loop. The smoke run
+asserts the UNMASKED output latent matches the source within tolerance and the
+MASKED region differs, and writes edit_mask.ppm alongside before/after.
+
 OFFLINE SMOKE RUN. Real Stable-Diffusion / PixArt checkpoints are far too large
 for this environment, so by default the example runs a SELF-CONTAINED smoke
 test on the committed tiny RANDOM fixtures the importer parity tests use
@@ -58,6 +71,7 @@ RUN
   ./ImageToImage                       smoke run on the tiny fixtures
   ./ImageToImage --strength 0.6        stronger edit (more noise added)
   ./ImageToImage --steps 8             more reverse steps
+  ./ImageToImage --inpaint             regenerate only a masked latent region
   ./ImageToImage --vae-encoder enc.safetensors --vae-encoder-config enc.json \
                  --vae-decoder dec.safetensors --vae-decoder-config dec.json \
                  --pixart pix.safetensors --pixart-config pix.json
@@ -164,6 +178,7 @@ var
 
   Strength: TNeuralFloat;
   Steps: integer;
+  Inpaint: boolean;
 
   EncPath, EncCfgPath, DecPath, DecCfgPath, PixPath, PixCfgPath, ImgPath: string;
   UseFixtures: boolean;
@@ -188,6 +203,7 @@ var
   begin
     Strength := cDefaultStrength;
     Steps := cDefaultSteps;
+    Inpaint := false;
     EncPath := ''; EncCfgPath := ''; DecPath := ''; DecCfgPath := '';
     PixPath := ''; PixCfgPath := ''; ImgPath := '';
     i := 1;
@@ -202,7 +218,8 @@ var
       else if (s = '--vae-decoder-config') and (i < ParamCount) then begin Inc(i); DecCfgPath := ParamStr(i); end
       else if (s = '--pixart') and (i < ParamCount) then begin Inc(i); PixPath := ParamStr(i); end
       else if (s = '--pixart-config') and (i < ParamCount) then begin Inc(i); PixCfgPath := ParamStr(i); end
-      else if (s = '--image') and (i < ParamCount) then begin Inc(i); ImgPath := ParamStr(i); end;
+      else if (s = '--image') and (i < ParamCount) then begin Inc(i); ImgPath := ParamStr(i); end
+      else if (s = '--inpaint') then Inpaint := true;
       Inc(i);
     end;
     if Strength < 0 then Strength := 0;
@@ -235,6 +252,33 @@ begin
         Dst[ox + x, oy + y, c] := Patch[x, y, c];
 end;
 
+// Build the inpainting MASK over a (Sx,Sy,Depth) latent: 1 = REGENERATE this
+// voxel, 0 = KEEP it pixel-faithful. The smoke mask is the right half of the
+// grid (all channels) -- a simple, deterministic region so the assertions are
+// unambiguous. With a real run you would load an alpha matte here instead.
+procedure MakeInpaintMask(Mask: TNNetVolume; Sx, Sy, Depth: integer);
+var x, y, c: integer;
+begin
+  Mask.ReSize(Sx, Sy, Depth);
+  for y := 0 to Sy - 1 do
+    for x := 0 to Sx - 1 do
+      for c := 0 to Depth - 1 do
+        if x >= (Sx div 2) then Mask[x, y, c] := 1.0    // right half: regenerate
+        else Mask[x, y, c] := 0.0;                      // left half: keep
+end;
+
+// Composite: Dst := Mask*Dst + (1-Mask)*Known, in place on Dst. Used to overwrite
+// the UNMASKED region of the working latent with the (re-noised) known latent.
+procedure CompositeMasked(Dst, Known, Mask: TNNetVolume);
+var i: integer; m: TNeuralFloat;
+begin
+  for i := 0 to Dst.Size - 1 do
+  begin
+    m := Mask.FData[i];
+    Dst.FData[i] := m * Dst.FData[i] + (1.0 - m) * Known.FData[i];
+  end;
+end;
+
 // Fill V (W,H,3) with a smooth synthetic color ramp in [-1,1] (the stand-in
 // source image when no --image is given).
 procedure MakeSyntheticImage(V: TNNetVolume);
@@ -251,11 +295,13 @@ end;
 
 var
   ImgIn, Z0, ZEdit, ZCrop, Recon: TNNetVolume;
+  Mask, KnownNoised: TNNetVolume;   // inpainting: mask + re-noised known latent
   ImgGrid, LatGrid, PixGrid: integer;
   tStart, sIdx: integer;
   Schedule: TNeuralIntegerArray;
   NumNan, i: integer;
   outv: TNNetVolume;
+  maxKeepErr, maskedDiff, m, d: TNeuralFloat;
 begin
   SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide,
                     exOverflow, exUnderflow, exPrecision]);
@@ -311,6 +357,8 @@ begin
   ZEdit := TNNetVolume.Create();
   ZCrop := TNNetVolume.Create();
   Recon := TNNetVolume.Create();
+  Mask := TNNetVolume.Create();
+  KnownNoised := TNNetVolume.Create();
   gTextStates := TNNetVolume.Create(gPixCfg.TextSeqLen, 1, gPixCfg.CaptionChannels);
   gScratch := TNNetVolume.Create();
   Schedule := nil;
@@ -348,7 +396,18 @@ begin
     // center-crop the latent to the PixArt grid (no-op when grids match).
     CenterCrop(Z0, ZCrop, PixGrid);
 
-    // partial forward noising to t_start (the SDEdit start latent).
+    // INPAINT: build the binary regenerate/keep mask over the PixArt-grid latent.
+    if Inpaint then
+    begin
+      MakeInpaintMask(Mask, ZCrop.SizeX, ZCrop.SizeY, ZCrop.Depth);
+      WriteLn(Format('[INPAINT] mask %dx%dx%d: regenerate right half, keep left half.',
+        [Mask.SizeX, Mask.SizeY, Mask.Depth]));
+    end;
+
+    // partial forward noising to t_start (the SDEdit start latent). AddNoise
+    // writes into ZEdit element-wise WITHOUT resizing it, so size it to the
+    // (cropped) latent first.
+    ZEdit.ReSize(ZCrop);
     Sched.AddNoise(ZCrop, ZEdit, tStart);
     WriteLn(Format('Added noise up to t_start = %d (strength %.2f).', [tStart, Strength]));
 
@@ -365,11 +424,25 @@ begin
     for sIdx := 0 to Length(Schedule) - 2 do
     begin
       if Schedule[sIdx] < 1 then Continue;          // skip degenerate t=0 steps
+      // INPAINT (RePaint trick): BEFORE the reverse step, overwrite the UNMASKED
+      // latent with the known clean latent RE-NOISED to THIS timestep, so the
+      // kept region always carries the right noise level for the current step
+      // and only the masked region is driven by the denoiser.
+      if Inpaint then
+      begin
+        Sched.AddNoise(ZCrop, KnownNoised, Schedule[sIdx]);
+        CompositeMasked(ZEdit, KnownNoised, Mask);
+      end;
       Denoiser.Denoise(ZEdit, gScratch, Schedule[sIdx]);
       Sched.Step(ZEdit, gScratch, Schedule[sIdx], Schedule[sIdx + 1], smDDIM, 0.0);
       WriteLn(Format('  step %d: denoised at t = %d -> %d',
         [sIdx + 1, Schedule[sIdx], Schedule[sIdx + 1]]));
     end;
+
+    // INPAINT: final composite at t=0 -- the kept region is exactly the clean
+    // known latent so the unmasked output is pixel-faithful by construction.
+    if Inpaint then
+      CompositeMasked(ZEdit, ZCrop, Mask);
 
     // 4. write the denoised crop back into the full latent and DECODE.
     PasteCenter(ZEdit, Z0);
@@ -387,10 +460,47 @@ begin
     if NumNan = 0
       then WriteLn('OK: decoded edit has no NaN/Inf pixels.')
       else WriteLn('WARNING: ', NumNan, ' NaN/Inf pixels in the decoded edit.');
+
+    // INPAINT regression check (latent space, exact): the UNMASKED region of the
+    // final latent must equal the known clean latent (pixel-faithful), and the
+    // MASKED region must have been changed by the denoiser (it was regenerated).
+    if Inpaint then
+    begin
+      maxKeepErr := 0;          // worst |ZEdit - ZCrop| over KEPT (mask=0) voxels
+      maskedDiff := 0;          // total |ZEdit - ZCrop| over MASKED (mask=1) voxels
+      for i := 0 to ZEdit.Size - 1 do
+      begin
+        m := Mask.FData[i];
+        d := Abs(ZEdit.FData[i] - ZCrop.FData[i]);
+        if m < 0.5 then begin if d > maxKeepErr then maxKeepErr := d; end
+        else maskedDiff := maskedDiff + d;
+      end;
+      // Write the mask as a grayscale-ish PPM (1->white regenerate, 0->black keep).
+      Recon.Copy(Mask);
+      for i := 0 to Recon.Size - 1 do Recon.FData[i] := Recon.FData[i] * 2.0 - 1.0;
+      if WritePPM(Recon, 'edit_mask.ppm')
+        then WriteLn('Wrote edit_mask.ppm (white = regenerated region).')
+        else WriteLn('FAILED writing edit_mask.ppm');
+      WriteLn(Format('[INPAINT] kept-region max error = %.6g ; masked-region total change = %.6g',
+        [maxKeepErr, maskedDiff]));
+      if maxKeepErr > 1e-4 then
+      begin
+        WriteLn('FAIL: unmasked latent region drifted from the source.');
+        Halt(1);
+      end;
+      if maskedDiff <= 1e-6 then
+      begin
+        WriteLn('FAIL: masked latent region was not regenerated (unchanged).');
+        Halt(1);
+      end;
+      WriteLn('OK: unmasked region pixel-faithful, masked region regenerated.');
+    end;
+
     WriteLn('Done. Compare edit_before.ppm (source round-trip) vs edit_after.ppm (edit).');
   finally
     SetLength(Schedule, 0);
     ImgIn.Free; Z0.Free; ZEdit.Free; ZCrop.Free; Recon.Free;
+    Mask.Free; KnownNoised.Free;
     gTextStates.Free; gScratch.Free;
     Enc.Free; Dec.Free; gPixArt.Free;
     Sched.Free; Denoiser.Free;

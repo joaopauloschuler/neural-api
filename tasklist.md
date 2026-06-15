@@ -1046,7 +1046,7 @@ rather than acted on.
         first-principles float64 oracle on a random pico config; verify against a sliced
         real checkpoint once weights are available (the make_pico_*_fixture slicer
         pattern).
-- [ ] Diffusion INPAINTING example (examples/ImageToImage --inpaint, or a sibling) — the
+- [X] Diffusion INPAINTING example (examples/ImageToImage --inpaint, or a sibling) — the
       one-flag follow-up unblocked by the landed SDEdit examples/ImageToImage driver: reuse
       the exact same encode->partial-noise->denoise->decode pipeline but, BEFORE each
       reverse step, overwrite the UNMASKED latent region with the (re-noised to that
