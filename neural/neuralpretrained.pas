@@ -6755,6 +6755,55 @@ function BuildSwinFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet; overload;
 
 // ---------------------------------------------------------------------------
+// SEGMENT ANYTHING (SAM) IMAGE-ENCODER IMPORT (facebook/sam-vit-base) — the
+// first PROMPTABLE-segmentation importer. v1 lands the ViT-det image encoder
+// (windowed + global decomposed-rel-pos attention + the 1x1/3x3 conv neck) to
+// a 256-channel image embedding; the lightweight two-way mask decoder is a
+// documented follow-up.
+type
+  TSAMConfig = record
+    ModelType: string;     // 'sam' (uses vision_config sub-block)
+    ImageSize: integer;    // 1024 canonical (32 in pico fixtures)
+    PatchSize: integer;    // 16
+    NumChannels: integer;  // 3
+    HiddenSize: integer;   // 768 (vit-b)
+    NumLayers: integer;    // 12
+    NumHeads: integer;     // 12
+    MlpDim: integer;       // 3072 (4*hidden); 0 => 4*hidden
+    WindowSize: integer;   // 14 (local blocks); global blocks use 0
+    OutputChannels: integer; // 256 neck output
+    GlobalAttnIndexes: array of integer; // blocks that use GLOBAL attention
+    HiddenAct: string;     // 'gelu'
+    LayerNormEps: TNeuralFloat; // 1e-6
+  end;
+
+// Reads a HF "sam" config.json (the vision_config sub-block). Required keys:
+// vision_config.{hidden_size, num_hidden_layers, num_attention_heads,
+// image_size, patch_size, num_channels, mlp_dim, window_size,
+// global_attn_indexes, output_channels, layer_norm_eps}.
+function ReadSAMConfigFromJSONFile(const FileName: string): TSAMConfig;
+
+function SAMConfigToString(const Config: TSAMConfig): string;
+
+// Builds the SAM ViT image-encoder tower described by Config and loads every
+// weight from Reader under the given Prefix (caller owns Reader). The net takes
+// an (ImageSize, ImageSize, NumChannels) normalized RGB volume and returns the
+// (Grid, Grid, OutputChannels) image embedding (Grid = ImageSize/PatchSize).
+// Mirrors BuildClipVisionTower as a reusable vision tower.
+function BuildSAMVisionTower(Reader: TNNetSafeTensorsReader;
+  const Config: TSAMConfig; const Prefix: string = 'vision_encoder.';
+  pInferenceOnly: boolean = false): TNNet;
+
+// Builds + loads the SAM image encoder from a checkpoint file. Config supplied
+// by the caller (Ex) or read from ConfigFileName ('' = "config.json" beside it).
+function BuildSAMFromSafeTensorsEx(const FileName: string;
+  const Config: TSAMConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildSAMFromSafeTensors(const FileName: string;
+  out Config: TSAMConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet; overload;
+
+// ---------------------------------------------------------------------------
 // VGG-16 / VGG-19 IMPORT (torchvision / timm "vgg", the canonical perceptual-
 // feature backbone and the prerequisite for LPIPS + neural style transfer).
 // The architecture is a STRAIGHT stack with NO residuals or norm bookkeeping:
@@ -47029,6 +47078,333 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadDINOv2ConfigFromJSONFile(ConfigPath);
   Result := BuildDINOv2FromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// SEGMENT ANYTHING (SAM) IMAGE-ENCODER IMPORT (facebook/sam-vit-base).
+// The ViT-det image encoder: a bias-free? (HF: biased) patch conv to a
+// (Grid, Grid, hidden) feature grid, a learned 2-D absolute pos_embed added
+// directly, NumLayers transformer blocks (each pre-LN attention with windowed
+// or global decomposed-rel-pos self-attention via TNNetSAMVisionAttention, then
+// pre-LN MLP), and a neck of conv1 1x1 (no bias) -> LayerNorm2d -> conv2 3x3
+// pad1 (no bias) -> LayerNorm2d to OutputChannels. The mask decoder (v2) is a
+// documented follow-up.
+// ===========================================================================
+
+function ReadSAMConfigFromJSONFile(const FileName: string): TSAMConfig;
+var
+  JsonText: TStringList;
+  Root, VData, ArrData: TJSONData;
+  Obj, V: TJSONObject;
+  Arr: TJSONArray;
+  i: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('SAM import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('SAM import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('SAM import: config "' + FileName + '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'sam');
+    // The vision sub-block lives under "vision_config"; fall back to the root
+    // object so a flattened vision-only config also works.
+    VData := Obj.Find('vision_config');
+    if (VData <> nil) and (VData is TJSONObject) then V := TJSONObject(VData)
+    else V := Obj;
+    Result.ImageSize := V.Get('image_size', 1024);
+    Result.PatchSize := V.Get('patch_size', 16);
+    Result.NumChannels := V.Get('num_channels', 3);
+    Result.HiddenSize := V.Get('hidden_size', 768);
+    Result.NumLayers := V.Get('num_hidden_layers', 12);
+    Result.NumHeads := V.Get('num_attention_heads', 12);
+    Result.MlpDim := V.Get('mlp_dim', 0);
+    Result.WindowSize := V.Get('window_size', 14);
+    Result.OutputChannels := V.Get('output_channels', 256);
+    Result.HiddenAct := V.Get('hidden_act', 'gelu');
+    Result.LayerNormEps := V.Get('layer_norm_eps', TJSONFloat(1e-6));
+    ArrData := V.Find('global_attn_indexes');
+    SetLength(Result.GlobalAttnIndexes, 0);
+    if (ArrData <> nil) and (ArrData is TJSONArray) then
+    begin
+      Arr := TJSONArray(ArrData);
+      SetLength(Result.GlobalAttnIndexes, Arr.Count);
+      for i := 0 to Arr.Count - 1 do
+        Result.GlobalAttnIndexes[i] := Arr.Integers[i];
+    end;
+    if Result.MlpDim <= 0 then Result.MlpDim := 4 * Result.HiddenSize;
+    if LowerCase(Result.HiddenAct) <> 'gelu' then
+      ImportError('SAM import: only hidden_act="gelu" is supported (got "' +
+        Result.HiddenAct + '").');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function SAMConfigToString(const Config: TSAMConfig): string;
+var
+  i: integer;
+  GA: string;
+begin
+  GA := '';
+  for i := 0 to High(Config.GlobalAttnIndexes) do
+  begin
+    if i > 0 then GA := GA + ',';
+    GA := GA + IntToStr(Config.GlobalAttnIndexes[i]);
+  end;
+  Result := 'SAM(' + Config.ModelType + '): image=' +
+    IntToStr(Config.ImageSize) + ' patch=' + IntToStr(Config.PatchSize) +
+    ' hidden=' + IntToStr(Config.HiddenSize) + ' layers=' +
+    IntToStr(Config.NumLayers) + ' heads=' + IntToStr(Config.NumHeads) +
+    ' mlp=' + IntToStr(Config.MlpDim) + ' window=' +
+    IntToStr(Config.WindowSize) + ' out=' + IntToStr(Config.OutputChannels) +
+    ' global=[' + GA + '] eps=' + FloatToStr(Config.LayerNormEps);
+end;
+
+// Loads the BIASED patch-embedding conv (SAM's projection has a bias, unlike
+// CLIP's). Weight [hidden, in, P, P], bias [hidden].
+procedure LoadSAMPatchConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string;
+  NumChannels, Patch, Hidden: integer);
+var
+  W, B: TNNetVolume;
+  o, c, ky, kx: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('SAM import: missing tensor "' + WName + '".');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    for o := 0 to Hidden - 1 do
+    begin
+      for ky := 0 to Patch - 1 do
+        for kx := 0 to Patch - 1 do
+          for c := 0 to NumChannels - 1 do
+            Layer.Neurons[o].Weights.FData[
+              (ky * Patch + kx) * NumChannels + c] :=
+              W.FData[((o * NumChannels + c) * Patch + ky) * Patch + kx];
+      Layer.Neurons[o].BiasWeight := 0;
+    end;
+    if Reader.HasTensor(BName) then
+    begin
+      Reader.LoadTensorFlat(BName, B);
+      for o := 0 to Hidden - 1 do Layer.Neurons[o].BiasWeight := B.FData[o];
+    end;
+  finally
+    B.Free;
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+// Loads a bias-free KxK conv [out, in, K, K] into a TNNetConvolutionLinear
+// (neuron o weight layout (ky*K+kx)*in + c). Bias zeroed.
+procedure LoadSAMNeckConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string; InCh, K, OutCh: integer);
+var
+  W: TNNetVolume;
+  o, c, ky, kx: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('SAM import: missing tensor "' + WName + '".');
+  W := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    for o := 0 to OutCh - 1 do
+    begin
+      for ky := 0 to K - 1 do
+        for kx := 0 to K - 1 do
+          for c := 0 to InCh - 1 do
+            Layer.Neurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
+              W.FData[((o * InCh + c) * K + ky) * K + kx];
+      Layer.Neurons[o].BiasWeight := 0;
+    end;
+  finally
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+function BuildSAMVisionTower(Reader: TNNetSafeTensorsReader;
+  const Config: TSAMConfig; const Prefix: string;
+  pInferenceOnly: boolean): TNNet;
+var
+  NN: TNNet;
+  PatchConv, PosEmb: TNNetLayer;
+  Grid, BlockIdx, HeadDim, ws, MlpHidden, ci, k: integer;
+  IsGlobal: boolean;
+  ShortcutA, Norm1, Attn, AttnRes, Norm2, Fc1, Fc2, MlpRes: TNNetLayer;
+  AttnLayers: array of TNNetSAMVisionAttention;
+  Norm1Layers, Norm2Layers, Fc1Layers, Fc2Layers: array of TNNetLayer;
+  Conv1, NeckLN1, Conv2, NeckLN2: TNNetLayer;
+  BPrefix: string;
+  QkvW, QkvB, ProjW, ProjB, RelH, RelW, Pos: TNNetVolume;
+begin
+  if (Config.HiddenSize < 1) or (Config.NumHeads < 1) or
+     ((Config.HiddenSize mod Config.NumHeads) <> 0) then
+    ImportError('SAM import: hidden_size must be divisible by num_heads.');
+  if (Config.PatchSize < 1) or ((Config.ImageSize mod Config.PatchSize) <> 0) then
+    ImportError('SAM import: image_size not a multiple of patch_size.');
+  HeadDim := Config.HiddenSize div Config.NumHeads;
+  Grid := Config.ImageSize div Config.PatchSize;
+  MlpHidden := Config.MlpDim;
+  NN := TNNet.Create();
+  SetLength(AttnLayers, Config.NumLayers);
+  SetLength(Norm1Layers, Config.NumLayers);
+  SetLength(Norm2Layers, Config.NumLayers);
+  SetLength(Fc1Layers, Config.NumLayers);
+  SetLength(Fc2Layers, Config.NumLayers);
+  try
+    // ---------------- Patch embedding ----------------
+    NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels) );
+    PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      Config.HiddenSize, Config.PatchSize, 0, Config.PatchSize, 0) );
+    // Output is (Grid, Grid, hidden). Add the learned 2-D pos_embed directly.
+    PosEmb := NN.AddLayer( TNNetCellBias.Create() );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Transformer blocks ----------------
+    for BlockIdx := 0 to Config.NumLayers - 1 do
+    begin
+      IsGlobal := false;
+      for k := 0 to High(Config.GlobalAttnIndexes) do
+        if Config.GlobalAttnIndexes[k] = BlockIdx then IsGlobal := true;
+      if IsGlobal then ws := 0 else ws := Config.WindowSize;
+
+      ShortcutA := NN.GetLastLayer();
+      Norm1 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      Attn := NN.AddLayer( TNNetSAMVisionAttention.Create(
+        Config.NumHeads, ws, HeadDim, Config.HiddenSize) );
+      AttnRes := NN.AddLayer( TNNetSum.Create([Attn, ShortcutA]) );
+      Norm2 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden) );
+      // SAM hidden_act='gelu' is the EXACT erf GELU (not the tanh approximation).
+      NN.AddLayer( TNNetGELUErf.Create() );
+      Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+      MlpRes := NN.AddLayer( TNNetSum.Create([Fc2, AttnRes]) );
+      AttnLayers[BlockIdx] := TNNetSAMVisionAttention(Attn);
+      Norm1Layers[BlockIdx] := Norm1;
+      Norm2Layers[BlockIdx] := Norm2;
+      Fc1Layers[BlockIdx] := Fc1;
+      Fc2Layers[BlockIdx] := Fc2;
+    end;
+
+    // ---------------- Neck ----------------
+    Conv1 := NN.AddLayer( TNNetConvolutionLinear.Create(
+      Config.OutputChannels, 1, 0, 1, 1) );
+    NeckLN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-6) );
+    Conv2 := NN.AddLayer( TNNetConvolutionLinear.Create(
+      Config.OutputChannels, 3, 1, 1, 1) );
+    NeckLN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-6) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    LoadSAMPatchConv(Reader, PatchConv,
+      Prefix + 'patch_embed.projection.weight',
+      Prefix + 'patch_embed.projection.bias',
+      Config.NumChannels, Config.PatchSize, Config.HiddenSize);
+    // pos_embed: HF shape (1, Grid, Grid, hidden) -> CellBias (Grid, Grid, hid).
+    Pos := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(Prefix + 'pos_embed', Pos);
+      if Pos.Size <> Grid * Grid * Config.HiddenSize then
+        ImportError('SAM import: pos_embed size mismatch.');
+      for ci := 0 to Pos.Size - 1 do
+        PosEmb.Neurons[0].Weights.FData[ci] := Pos.FData[ci];
+      PosEmb.FlushWeightCache();
+    finally
+      Pos.Free;
+    end;
+
+    QkvW := TNNetVolume.Create; QkvB := TNNetVolume.Create;
+    ProjW := TNNetVolume.Create; ProjB := TNNetVolume.Create;
+    RelH := TNNetVolume.Create; RelW := TNNetVolume.Create;
+    try
+      for BlockIdx := 0 to Config.NumLayers - 1 do
+      begin
+        BPrefix := Prefix + 'layers.' + IntToStr(BlockIdx) + '.';
+        LoadLayerNormWeights(Reader, Norm1Layers[BlockIdx],
+          BPrefix + 'layer_norm1.weight', BPrefix + 'layer_norm1.bias',
+          Config.HiddenSize);
+        LoadLayerNormWeights(Reader, Norm2Layers[BlockIdx],
+          BPrefix + 'layer_norm2.weight', BPrefix + 'layer_norm2.bias',
+          Config.HiddenSize);
+        Reader.LoadTensorFlat(BPrefix + 'attn.qkv.weight', QkvW);
+        Reader.LoadTensorFlat(BPrefix + 'attn.qkv.bias', QkvB);
+        Reader.LoadTensorFlat(BPrefix + 'attn.proj.weight', ProjW);
+        Reader.LoadTensorFlat(BPrefix + 'attn.proj.bias', ProjB);
+        Reader.LoadTensorFlat(BPrefix + 'attn.rel_pos_h', RelH);
+        Reader.LoadTensorFlat(BPrefix + 'attn.rel_pos_w', RelW);
+        AttnLayers[BlockIdx].SetQkvWeight(QkvW);
+        AttnLayers[BlockIdx].SetQkvBias(QkvB);
+        AttnLayers[BlockIdx].SetProjWeight(ProjW);
+        AttnLayers[BlockIdx].SetProjBias(ProjB);
+        AttnLayers[BlockIdx].SetRelPos(RelH, RelW);
+        // MLP (HF lin1/lin2 are biased nn.Linear; LoadLlamaLinearWeights loads
+        // weight + optional bias).
+        LoadLlamaLinearWeights(Reader, Fc1Layers[BlockIdx],
+          BPrefix + 'mlp.lin1.weight', Config.HiddenSize, MlpHidden,
+          0, -1, 0, BPrefix + 'mlp.lin1.bias');
+        LoadLlamaLinearWeights(Reader, Fc2Layers[BlockIdx],
+          BPrefix + 'mlp.lin2.weight', MlpHidden, Config.HiddenSize,
+          0, -1, 0, BPrefix + 'mlp.lin2.bias');
+      end;
+    finally
+      QkvW.Free; QkvB.Free; ProjW.Free; ProjB.Free; RelH.Free; RelW.Free;
+    end;
+
+    // Neck: conv1 1x1 no-bias, LN over channels, conv2 3x3 pad1 no-bias, LN.
+    LoadSAMNeckConv(Reader, Conv1, Prefix + 'neck.conv1.weight',
+      Config.HiddenSize, 1, Config.OutputChannels);
+    LoadLayerNormWeights(Reader, NeckLN1, Prefix + 'neck.layer_norm1.weight',
+      Prefix + 'neck.layer_norm1.bias', Config.OutputChannels);
+    LoadSAMNeckConv(Reader, Conv2, Prefix + 'neck.conv2.weight',
+      Config.OutputChannels, 3, Config.OutputChannels);
+    LoadLayerNormWeights(Reader, NeckLN2, Prefix + 'neck.layer_norm2.weight',
+      Prefix + 'neck.layer_norm2.bias', Config.OutputChannels);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildSAMFromSafeTensorsEx(const FileName: string;
+  const Config: TSAMConfig; pInferenceOnly: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildSAMVisionTower(Reader, Config, 'vision_encoder.',
+      pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildSAMFromSafeTensors(const FileName: string;
+  out Config: TSAMConfig; pInferenceOnly: boolean;
+  const ConfigFileName: string): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadSAMConfigFromJSONFile(ConfigPath);
+  Result := BuildSAMFromSafeTensorsEx(FileName, Config, pInferenceOnly);
 end;
 
 // ===========================================================================

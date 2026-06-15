@@ -253,17 +253,33 @@ rather than acted on.
   - [ ] real-checkpoint (stabilityai/sd-vae-ft-mse) parity once diffusers is
         installable; SDXL VAE uses different group counts / multi-head attention.
   - [ ] the SD UNet itself (the remaining piece for end-to-end latent text-to-image).
-- [ ] Segment Anything (SAM) image-encoder + mask-decoder importer
-      (facebook/sam-vit-base) — first PROMPTABLE-segmentation importer, a new
-      output modality (dense binary masks, not class logits or embeddings).
-      Two pieces: (a) the ViT-H/L/B image encoder (windowed attention + a few
-      global-attention blocks + the neck 1x1+3x3 conv to a 256-ch image
-      embedding) reusing the landed BuildClipVisionTower ViT path; (b) the
-      lightweight two-way mask decoder (point/box prompt embeddings -> a couple
-      of cross-attention blocks -> upscaled mask). Scope v1 to a single point
-      prompt + single mask output to keep the decoder small. Pico parity vs HF
-      float64 on the encoder embedding first (decoder is the stretch); demo:
-      examples/SegmentAnything segments an object from one click on a tiny image.
+- [X] Segment Anything (SAM) image-ENCODER importer LANDED (facebook/sam-vit-base)
+      — the repo's first PROMPTABLE-segmentation importer. BuildSAMFromSafeTensors
+      [Ex] + the reusable BuildSAMVisionTower + TSAMConfig + ReadSAMConfigFromJSON
+      File/SAMConfigToString (neuralpretrained.pas). The ViT-det image encoder:
+      biased patch conv -> learned 2-D absolute pos_embed (TNNetCellBias, no CLS,
+      no flatten) -> num_hidden_layers pre-LN blocks via the NEW self-contained
+      leaf TNNetSAMVisionAttention (windowed attention with the SAM zero-padding
+      window partition + global attention for global_attn_indexes blocks + the
+      MViTv2 DECOMPOSED query-dependent rel-pos bias Q.rel_pos_h + Q.rel_pos_w,
+      distinct from Swin's query-INdependent table) -> neck (conv1 1x1 no-bias ->
+      LayerNorm2d-over-channels -> conv2 3x3 pad1 no-bias -> LayerNorm2d). MLP uses
+      the exact-erf GELU (TNNetGELUErf). Pico parity < 1e-4 vs HF SamModel float64
+      image embedding (TestSAMEncoderParity; tools/make_pico_sam_fixture.py ->
+      tests/fixtures/tiny_sam.*). Example examples/SegmentAnything: encoder forward
+      on a synthetic image + a one-click cosine-similarity mask PPM (encoder-only
+      proxy). Gotchas baked in: CAI volume X axis is the FAST axis so the SAM grid
+      maps gridW->X, gridH->Y (GetRawPtr(col,row)); rel_pos tensors arrive FLAT
+      from LoadTensorFlat so the row count is Size div HeadDim (not SizeX);
+      hidden_act='gelu' is exact-erf (NOT tanh). Follow-ups DEFERRED:
+      (a) the lightweight TWO-WAY MASK DECODER (point/box prompt embeddings ->
+          cross-attention blocks -> upscaled mask) — the stretch goal, reuse
+          TNNetCrossAttention two-source wiring; the example's click->mask is a
+          cosine proxy until it lands;
+      (b) ViT-L / ViT-H variants (config-driven; only block count/width differ);
+      (c) a real-checkpoint slicer (make_pico_sam_fixture style) for
+          facebook/sam-vit-base parity from the real download;
+      (d) multi-mask output + box/multi-point prompts (v1 is single-point intent).
   (DPT / Depth-Anything monocular-depth importer LANDED: BuildDPTFromSafeTensors
    + ReadDPTConfigFromJSONFile/DPTConfigToString, DINOv2 backbone reuse + DPT
    reassemble/RefineNet-fusion neck, pico parity < 1e-4 via tiny_dpt.* fixtures

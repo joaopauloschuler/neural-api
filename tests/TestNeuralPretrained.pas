@@ -374,6 +374,7 @@ type
     procedure TestDINOv2Parity;
     procedure TestBeitConfigFromJSONFile;
     procedure TestBeitParity;
+    procedure TestSAMEncoderParity;
     procedure TestWhisperLogMelFrontend;
     procedure TestWavReaderRoundTrip;
     procedure TestBertSeqClsLogitParity;
@@ -17586,6 +17587,83 @@ begin
       end;
     end;
     AssertTrue('cls+patch hidden states: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestSAMEncoderParity;
+var
+  NN: TNNet;
+  Config: TSAMConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, EmbArr, EmbRow, EmbCell: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt, Grid, OutCh, RowCnt, ColCnt, DCnt: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildSAMFromSafeTensors(
+    FixturePath('tiny_sam.safetensors'),
+    Config, {pInferenceOnly=}true, FixturePath('tiny_sam_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output depth = output_channels', Config.OutputChannels,
+      NN.GetLastLayer().Output.Depth);
+
+    RefJson.LoadFromFile(FixturePath('tiny_sam_embed.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    EmbArr := TJSONArray(TJSONObject(RefRoot).Find('embed'));
+    Grid := TJSONObject(RefRoot).Get('grid', 0);
+    OutCh := TJSONObject(RefRoot).Get('out_channels', 0);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('oracle out channels', Config.OutputChannels, OutCh);
+    AssertEquals('output grid rows', Grid, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output grid cols', Grid, NN.GetLastLayer().Output.SizeY);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    // Oracle embed is (grid_row, grid_col, out_chan); output volume FData is
+    // (row*SizeY + col)*Depth + chan with SizeX=row, SizeY=col.
+    MaxDiff := 0;
+    for RowCnt := 0 to Grid - 1 do
+    begin
+      EmbRow := TJSONArray(EmbArr.Items[RowCnt]);
+      for ColCnt := 0 to Grid - 1 do
+      begin
+        EmbCell := TJSONArray(EmbRow.Items[ColCnt]);
+        for DCnt := 0 to OutCh - 1 do
+        begin
+          Diff := Abs(NN.GetLastLayer().Output.FData[
+            (RowCnt * Grid + ColCnt) * OutCh + DCnt] -
+            EmbCell.Items[DCnt].AsFloat);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('SAM image embedding: max |diff| = ' + FloatToStr(MaxDiff) +
       ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     RefRoot.Free;

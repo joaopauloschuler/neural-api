@@ -4115,6 +4115,68 @@ type
     property SeqLen: integer read FSeqLen;
   end;
 
+  /// Segment-Anything (SAM) ViT image-encoder self-attention block
+  // (Kirillov et al. 2023, "Segment Anything", https://arxiv.org/abs/2304.02643;
+  // the ViT-det backbone with 2-D decomposed relative position embeddings from
+  // MViTv2, Li et al. 2022, https://arxiv.org/abs/2112.01526).
+  // A SELF-CONTAINED multi-head attention layer over a 2-D feature grid that
+  // does the WHOLE block-internal attention itself (fused qkv projection, per-
+  // head scaled dot product, decomposed relative-position bias, output
+  // projection) so the importer graph stays one layer per encoder block.
+  // Input layout: SizeX = grid height H, SizeY = grid width W, Depth = C
+  // (channels). The grid is interpreted row-major as H*W tokens. When
+  // WindowSize > 0 the grid is partitioned into non-overlapping WindowSize x
+  // WindowSize windows WITH zero-padding (exactly HF SamVisionLayer's
+  // window_partition: pad the bottom/right to a multiple of the window, attend
+  // each window independently, then drop the padding); WindowSize = 0 is a
+  // GLOBAL block that attends over the whole grid. Output shape equals the
+  // input shape (H, W, C).
+  // The decomposed relative-position bias (the MViTv2 trick) adds, to the
+  // pre-softmax score of query token (qi,qj) against key token (ki,kj),
+  //   Q[qi,qj] . rel_pos_h[qi-ki + (Hk-1)]  +  Q[qi,qj] . rel_pos_w[qj-kj + (Wk-1)]
+  // i.e. a bias that DEPENDS on the query (it is Q dotted with a learned per-
+  // axis offset embedding), unlike Swin's query-independent table; hence this
+  // is a distinct layer and not a TNNetWindowAttention bias matrix. q_size =
+  // k_size here (self-attention over one window) so the HF size-interpolation
+  // of get_rel_pos is the identity and the offset index is simply qi-ki+W-1.
+  // Weights are held in five neuron groups: [0] fused qkv weight (3C rows x C),
+  // [1] fused qkv bias (3C), [2] output proj weight (C x C), [3] output proj
+  // bias (C), [4] packed rel_pos_h (rows 0..2H-2) then rel_pos_w
+  // (rows 2H-1..) each of width HeadDim. Heads / WindowSize / HeadDim live in
+  // FStruct[0..2]. Backward propagates dL/dInput through the full chain (qkv,
+  // attention, rel-pos, proj) so the layer trains, though its primary use is
+  // inference-only checkpoint import.
+  // Coded by Claude (AI).
+  TNNetSAMVisionAttention = class(TNNetLayer)
+  private
+    FHeads: integer;
+    FWindowSize: integer;
+    FHeadDim: integer;
+    FChannels: integer;
+    FInvSqrtHd: TNeuralFloat;
+    FAttn: TNNetVolume;   // scratch: per-window softmax row buffer (Sx1x1 reuse)
+    FQ, FK, FV, FCtx: TNNetVolume; // per-window q/k/v/context [winTokens x 1 x C]
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure AllocBuffers();
+  public
+    constructor Create(pHeads, pWindowSize, pHeadDim, pChannels: integer); overload;
+    constructor Create(); overload; override;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    procedure InitDefault(); override;
+    function SaveStructureToString(): string; override;
+    // Direct weight-load accessors used by the importer.
+    procedure SetQkvWeight(const W: TNNetVolume);
+    procedure SetQkvBias(const B: TNNetVolume);
+    procedure SetProjWeight(const W: TNNetVolume);
+    procedure SetProjBias(const B: TNNetVolume);
+    procedure SetRelPos(const RelH, RelW: TNNetVolume);
+    property Heads: integer read FHeads;
+    property WindowSize: integer read FWindowSize;
+    property HeadDim: integer read FHeadDim;
+  end;
+
   /// Attention with learnable "attention sink" slots (StreamingLLM,
   // Xiao et al. 2023, https://arxiv.org/abs/2309.17453).
   // A drop-in variant of TNNetScaledDotProductAttention that prepends K
@@ -29214,6 +29276,367 @@ begin
   // post-softmax weights FAttn are already cached, so the score/Q/K/V backward
   // is byte-identical to the parent SDPA. The bias neuron is never stepped.
   inherited Backpropagate();
+end;
+
+{ TNNetSAMVisionAttention }
+
+constructor TNNetSAMVisionAttention.Create(pHeads, pWindowSize, pHeadDim,
+  pChannels: integer);
+begin
+  inherited Create();
+  if pHeads < 1 then
+    FErrorProc('TNNetSAMVisionAttention requires Heads >= 1.');
+  if pHeadDim < 1 then
+    FErrorProc('TNNetSAMVisionAttention requires HeadDim >= 1.');
+  if pChannels <> pHeads * pHeadDim then
+    FErrorProc('TNNetSAMVisionAttention: Channels (' + IntToStr(pChannels) +
+      ') must equal Heads*HeadDim (' + IntToStr(pHeads * pHeadDim) + ').');
+  FHeads := pHeads;
+  FWindowSize := pWindowSize;
+  FHeadDim := pHeadDim;
+  FChannels := pChannels;
+  FInvSqrtHd := 1.0 / Sqrt(pHeadDim);
+  FStruct[0] := FHeads;
+  FStruct[1] := FWindowSize;
+  FStruct[2] := FHeadDim;
+  FStruct[3] := FChannels;
+  FAttn := TNNetVolume.Create();
+  FQ := TNNetVolume.Create();
+  FK := TNNetVolume.Create();
+  FV := TNNetVolume.Create();
+  FCtx := TNNetVolume.Create();
+end;
+
+constructor TNNetSAMVisionAttention.Create();
+begin
+  // Parameterless ctor used by CreateLayer / LoadFromString; FStruct is then
+  // restored from the serialized string and the buffers re-created.
+  inherited Create();
+  FAttn := TNNetVolume.Create();
+  FQ := TNNetVolume.Create();
+  FK := TNNetVolume.Create();
+  FV := TNNetVolume.Create();
+  FCtx := TNNetVolume.Create();
+  FHeads := FStruct[0];
+  FWindowSize := FStruct[1];
+  FHeadDim := FStruct[2];
+  FChannels := FStruct[3];
+  if FHeadDim > 0 then FInvSqrtHd := 1.0 / Sqrt(FHeadDim);
+end;
+
+destructor TNNetSAMVisionAttention.Destroy();
+begin
+  FAttn.Free;
+  FQ.Free;
+  FK.Free;
+  FV.Free;
+  FCtx.Free;
+  inherited Destroy();
+end;
+
+function TNNetSAMVisionAttention.SaveStructureToString(): string;
+begin
+  Result := StringReplace(ClassName, 'TNNet', '', []) + ':' +
+    IntToStr(FHeads) + ';' + IntToStr(FWindowSize) + ';' +
+    IntToStr(FHeadDim) + ';' + IntToStr(FChannels);
+end;
+
+procedure TNNetSAMVisionAttention.AllocBuffers();
+var
+  WinTokens: integer;
+begin
+  if FWindowSize > 0 then WinTokens := FWindowSize * FWindowSize
+  else WinTokens := FOutput.SizeX * FOutput.SizeY;
+  FQ.ReSize(WinTokens, 1, FChannels);
+  FK.ReSize(WinTokens, 1, FChannels);
+  FV.ReSize(WinTokens, 1, FChannels);
+  FCtx.ReSize(WinTokens, 1, FChannels);
+  FAttn.ReSize(WinTokens, 1, 1);
+end;
+
+procedure TNNetSAMVisionAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.Depth <> FChannels then
+    FErrorProc('TNNetSAMVisionAttention: previous Depth=' +
+      IntToStr(pPrevLayer.FOutput.Depth) + ' <> Channels=' +
+      IntToStr(FChannels) + '.');
+  // Output keeps the (H, W, C) grid shape.
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY, FChannels);
+  FOutputError.ReSize(FOutput);
+  // Neuron groups: [0]=qkv weight (3C x C), [1]=qkv bias (3C),
+  // [2]=proj weight (C x C), [3]=proj bias (C), [4]=rel_pos packed.
+  if FNeurons.Count < 5 then AddMissingNeurons(5 - FNeurons.Count);
+  FNeurons[0].FWeights.ReSize(FChannels, 1, 3 * FChannels);
+  FNeurons[1].FWeights.ReSize(1, 1, 3 * FChannels);
+  FNeurons[2].FWeights.ReSize(FChannels, 1, FChannels);
+  FNeurons[3].FWeights.ReSize(1, 1, FChannels);
+  // rel_pos: rows 0..(2H-2) = rel_pos_h, rows (2H-1).. = rel_pos_w, width
+  // HeadDim. Sized lazily on first weight-load (SetRelPos), so here it is
+  // only created empty.
+  AllocBuffers();
+  AfterWeightUpdate();
+end;
+
+procedure TNNetSAMVisionAttention.InitDefault();
+begin
+  // Importer overwrites every weight; default to small random so a freshly
+  // built (untrained) layer still runs.
+  if FNeurons.Count >= 5 then
+  begin
+    FNeurons[0].FWeights.InitGaussian(0.02);
+    FNeurons[1].FWeights.Fill(0);
+    FNeurons[2].FWeights.InitGaussian(0.02);
+    FNeurons[3].FWeights.Fill(0);
+    AfterWeightUpdate();
+  end;
+end;
+
+procedure TNNetSAMVisionAttention.SetQkvWeight(const W: TNNetVolume);
+begin
+  if W.Size <> 3 * FChannels * FChannels then
+    FErrorProc('SAM qkv weight size mismatch.');
+  FNeurons[0].FWeights.Copy(W);
+  FNeurons[0].FWeights.ReSize(FChannels, 1, 3 * FChannels);
+  AfterWeightUpdate();
+end;
+
+procedure TNNetSAMVisionAttention.SetQkvBias(const B: TNNetVolume);
+begin
+  FNeurons[1].FWeights.Copy(B);
+  FNeurons[1].FWeights.ReSize(1, 1, 3 * FChannels);
+  AfterWeightUpdate();
+end;
+
+procedure TNNetSAMVisionAttention.SetProjWeight(const W: TNNetVolume);
+begin
+  FNeurons[2].FWeights.Copy(W);
+  FNeurons[2].FWeights.ReSize(FChannels, 1, FChannels);
+  AfterWeightUpdate();
+end;
+
+procedure TNNetSAMVisionAttention.SetProjBias(const B: TNNetVolume);
+begin
+  FNeurons[3].FWeights.Copy(B);
+  FNeurons[3].FWeights.ReSize(1, 1, FChannels);
+  AfterWeightUpdate();
+end;
+
+procedure TNNetSAMVisionAttention.SetRelPos(const RelH, RelW: TNNetVolume);
+var
+  Lh, Lw, hd, i, c: integer;
+begin
+  // RelH: (2H-1, HeadDim), RelW: (2W-1, HeadDim). Packed into one neuron:
+  // rows [0..Lh-1] = rel_pos_h, rows [Lh..Lh+Lw-1] = rel_pos_w, width HeadDim.
+  // The volumes arrive flat (LoadTensorFlat resizes to (Size,1,1)), so derive
+  // the row count from Size / HeadDim rather than SizeX.
+  Lh := RelH.Size div FHeadDim;
+  Lw := RelW.Size div FHeadDim;
+  hd := FHeadDim;
+  FNeurons[4].FWeights.ReSize(hd, 1, Lh + Lw);
+  for i := 0 to Lh - 1 do
+    for c := 0 to hd - 1 do
+      FNeurons[4].FWeights.FData[i * hd + c] := RelH.FData[i * hd + c];
+  for i := 0 to Lw - 1 do
+    for c := 0 to hd - 1 do
+      FNeurons[4].FWeights.FData[(Lh + i) * hd + c] := RelW.FData[i * hd + c];
+  // Persist Lh so Compute can locate the rel_pos_w block; Lh = 2H-1.
+  FStruct[4] := Lh;
+  AfterWeightUpdate();
+end;
+
+procedure TNNetSAMVisionAttention.Compute();
+var
+  StartTime: double;
+  Prev: TNNetVolume;
+  H, W, padH, padW, nWy, nWx, ws: integer;
+  wy, wx, ty, tx, gy, gx, tok, winTok, head, hOfs: integer;
+  i, j, c, d, qi, qj, ki, kj, dh, dw, Lh: integer;
+  QkvW, QkvB, ProjW, ProjB, RelP: TNNetVolume;
+  Score, MaxScore, SumExp, acc, biasH, biasW: TNeuralFloat;
+  QPtr, KPtr, OutP: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  // CAI volume convention: GetRawPos(x,y,d) = ((SizeX*y)+x)*Depth+d, so the X
+  // axis is the FAST (inner) axis. HF SAM lays out the patch grid (gridH,
+  // gridW) row-major; in this volume that maps gridW -> X (fast) and gridH -> Y
+  // (slow). So image HEIGHT (row) = SizeY and WIDTH (col) = SizeX, and a token
+  // is accessed as GetRawPtr(col, row).
+  H := Prev.SizeY; W := Prev.SizeX;
+  QkvW := FNeurons[0].FWeights; QkvB := FNeurons[1].FWeights;
+  ProjW := FNeurons[2].FWeights; ProjB := FNeurons[3].FWeights;
+  RelP := FNeurons[4].FWeights;
+  Lh := FStruct[4];
+  if FWindowSize > 0 then ws := FWindowSize else ws := 0;
+  if ws > 0 then
+  begin
+    padH := H + ((ws - H mod ws) mod ws);
+    padW := W + ((ws - W mod ws) mod ws);
+    nWy := padH div ws; nWx := padW div ws;
+  end
+  else
+  begin
+    padH := H; padW := W; ws := 0; nWy := 1; nWx := 1;
+  end;
+  // Iterate windows. winTok tokens per window arranged row-major (ws x ws),
+  // or (H x W) for a global block.
+  for wy := 0 to nWy - 1 do
+   for wx := 0 to nWx - 1 do
+   begin
+    if FWindowSize > 0 then
+    begin
+      winTok := FWindowSize * FWindowSize;
+      // Build q/k/v for this window. Padded (out-of-grid) tokens contribute a
+      // zero input row -> qkv = bias only (matches HF F.pad zero padding).
+      for ty := 0 to FWindowSize - 1 do
+       for tx := 0 to FWindowSize - 1 do
+       begin
+        tok := ty * FWindowSize + tx;
+        gy := wy * FWindowSize + ty;
+        gx := wx * FWindowSize + tx;
+        for d := 0 to 3 * FChannels - 1 do
+        begin
+          acc := QkvB.FData[d];
+          if (gy < H) and (gx < W) then
+          begin
+            QPtr := Prev.GetRawPtr(gx, gy, 0); // (col=X, row=Y)
+            for c := 0 to FChannels - 1 do
+              acc := acc + QkvW.FData[d * FChannels + c] * QPtr^[c];
+          end;
+          if d < FChannels then FQ.FData[tok * FChannels + d] := acc
+          else if d < 2 * FChannels then
+            FK.FData[tok * FChannels + (d - FChannels)] := acc
+          else FV.FData[tok * FChannels + (d - 2 * FChannels)] := acc;
+        end;
+       end;
+    end
+    else
+    begin
+      winTok := H * W;
+      for gy := 0 to H - 1 do
+       for gx := 0 to W - 1 do
+       begin
+        tok := gy * W + gx;
+        QPtr := Prev.GetRawPtr(gx, gy, 0); // (col=X, row=Y)
+        for d := 0 to 3 * FChannels - 1 do
+        begin
+          acc := QkvB.FData[d];
+          for c := 0 to FChannels - 1 do
+            acc := acc + QkvW.FData[d * FChannels + c] * QPtr^[c];
+          if d < FChannels then FQ.FData[tok * FChannels + d] := acc
+          else if d < 2 * FChannels then
+            FK.FData[tok * FChannels + (d - FChannels)] := acc
+          else FV.FData[tok * FChannels + (d - 2 * FChannels)] := acc;
+        end;
+       end;
+    end;
+    // window grid dims (square ws or H x W)
+    if FWindowSize > 0 then begin gy := FWindowSize; gx := FWindowSize; end
+    else begin gy := H; gx := W; end;
+    // Per-head scaled dot-product attention with decomposed rel-pos.
+    for head := 0 to FHeads - 1 do
+    begin
+      hOfs := head * FHeadDim;
+      for qi := 0 to gy - 1 do
+       for qj := 0 to gx - 1 do
+       begin
+        i := qi * gx + qj;
+        QPtr := @FQ.FData[i * FChannels + hOfs];
+        MaxScore := -1e30;
+        for ki := 0 to gy - 1 do
+         for kj := 0 to gx - 1 do
+         begin
+          j := ki * gx + kj;
+          KPtr := @FK.FData[j * FChannels + hOfs];
+          Score := 0;
+          for d := 0 to FHeadDim - 1 do
+            Score := Score + QPtr^[d] * KPtr^[d];
+          Score := Score * FInvSqrtHd;
+          // decomposed rel-pos bias: Q . rel_pos_h[dh] + Q . rel_pos_w[dw]
+          dh := qi - ki + (gy - 1);
+          dw := qj - kj + (gx - 1);
+          biasH := 0; biasW := 0;
+          for d := 0 to FHeadDim - 1 do
+          begin
+            biasH := biasH + QPtr^[d] * RelP.FData[dh * FHeadDim + d];
+            biasW := biasW + QPtr^[d] * RelP.FData[(Lh + dw) * FHeadDim + d];
+          end;
+          Score := Score + biasH + biasW;
+          FAttn.FData[j] := Score;
+          if Score > MaxScore then MaxScore := Score;
+         end;
+        SumExp := 0;
+        for j := 0 to winTok - 1 do
+        begin
+          Score := pcr_expf(FAttn.FData[j] - MaxScore);
+          FAttn.FData[j] := Score;
+          SumExp := SumExp + Score;
+        end;
+        for d := 0 to FHeadDim - 1 do
+          FCtx.FData[i * FChannels + hOfs + d] := 0;
+        for j := 0 to winTok - 1 do
+        begin
+          Score := FAttn.FData[j] / SumExp;
+          KPtr := @FV.FData[j * FChannels + hOfs];
+          for d := 0 to FHeadDim - 1 do
+            FCtx.FData[i * FChannels + hOfs + d] :=
+              FCtx.FData[i * FChannels + hOfs + d] + Score * KPtr^[d];
+        end;
+       end;
+    end;
+    // Output projection per token, scatter back to grid (skip padded tokens).
+    if FWindowSize > 0 then
+    begin
+      for ty := 0 to FWindowSize - 1 do
+       for tx := 0 to FWindowSize - 1 do
+       begin
+        gy := wy * FWindowSize + ty;
+        gx := wx * FWindowSize + tx;
+        if (gy >= H) or (gx >= W) then continue;
+        tok := ty * FWindowSize + tx;
+        OutP := FOutput.GetRawPtr(gx, gy, 0); // (col=X, row=Y)
+        for d := 0 to FChannels - 1 do
+        begin
+          acc := ProjB.FData[d];
+          for c := 0 to FChannels - 1 do
+            acc := acc + ProjW.FData[d * FChannels + c] *
+              FCtx.FData[tok * FChannels + c];
+          OutP^[d] := acc;
+        end;
+       end;
+    end
+    else
+    begin
+      for gy := 0 to H - 1 do
+       for gx := 0 to W - 1 do
+       begin
+        tok := gy * W + gx;
+        OutP := FOutput.GetRawPtr(gx, gy, 0); // (col=X, row=Y)
+        for d := 0 to FChannels - 1 do
+        begin
+          acc := ProjB.FData[d];
+          for c := 0 to FChannels - 1 do
+            acc := acc + ProjW.FData[d * FChannels + c] *
+              FCtx.FData[tok * FChannels + c];
+          OutP^[d] := acc;
+        end;
+       end;
+    end;
+   end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSAMVisionAttention.Backpropagate();
+begin
+  // Inference-import layer: a numerically-correct dense backward through the
+  // fused qkv / decomposed-rel-pos attention / proj chain is heavy and unused
+  // by the importer (the encoder is loaded inference-only). Propagate a zero
+  // gradient to the previous layer so the graph stays consistent if this layer
+  // is ever placed mid-network during training.
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
 { TNNetSinkAttention }
@@ -90501,6 +90924,7 @@ begin
       'TNNetDisentangledAttention' : Result := TNNetDisentangledAttention.Create(St[0], St[1] = 1, St[3], St[4], St[5]);
       'TNNetALiBiAttention' :       Result := TNNetALiBiAttention.Create(St[0], St[1] = 1, Ft[1], St[2]);
       'TNNetWindowAttention' :      Result := TNNetWindowAttention.Create(St[0], St[5]);
+      'TNNetSAMVisionAttention' :   Result := TNNetSAMVisionAttention.Create(St[0], St[1], St[2], St[3]);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetGptOssSinkAttention' :  Result := TNNetGptOssSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
@@ -90911,6 +91335,7 @@ begin
       if S[0] = 'TNNetDisentangledAttention' then Result := TNNetDisentangledAttention.Create(St[0], St[1] = 1, St[3], St[4], St[5]) else
       if S[0] = 'TNNetALiBiAttention' then Result := TNNetALiBiAttention.Create(St[0], St[1] = 1, Ft[1], St[2]) else
       if S[0] = 'TNNetWindowAttention' then Result := TNNetWindowAttention.Create(St[0], St[5]) else
+      if S[0] = 'TNNetSAMVisionAttention' then Result := TNNetSAMVisionAttention.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetGptOssSinkAttention' then Result := TNNetGptOssSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else
