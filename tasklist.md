@@ -320,16 +320,31 @@ rather than acted on.
           no PNG decoder in-tree).
       [ ] NAFBlock dropout + the wider official width/block configs are wired by
           config but only the small pico shape is parity-pinned.
-- [ ] SwinIR transformer image-restoration importer (BuildSwinIRFromSafeTensors[Ex])
-      — classical/lightweight super-resolution + denoising + JPEG-artifact removal
-      built on the LANDED Swin window/shifted-window attention
-      (BuildSwinFromSafeTensors). The new code is only the shallow-feature conv stem,
-      the Residual Swin Transformer Blocks (RSTB = a few Swin layers + a conv +
-      residual) and the pixel-shuffle (TNNetDepthToSpace) upsample tail; the
-      window-attention core is reuse. Architecturally distinct from the CNN-only
-      RRDBNet SR and the SimpleGate-CNN NAFNet (transformer restoration). Pico parity
-      vs a float64 oracle on a tiny SR net; folds into examples/SuperResolution as a
-      real pretrained option.
+- [X] SwinIR transformer image-restoration importer (BuildSwinIRFromSafeTensors[Ex])
+      — classical/lightweight super-resolution built on the LANDED Swin
+      window/shifted-window attention (reused TNNetWindowAttention + rel-pos bias +
+      cyclic-shift mask + TNNetGatherTokens partition/reverse). New code = the
+      shallow-feature conv stem, the Residual Swin Transformer Blocks (RSTB = depth
+      Swin layers + a 3x3 conv + residual over the block) and the pixel-shuffle
+      (TNNetDepthToSpace) upsample tail. Architecturally distinct from the CNN-only
+      RRDBNet SR and the SimpleGate-CNN NAFNet (transformer restoration). NO new
+      leaf layers.
+      [X] TSwinIRConfig + BuildSwinIRFromSafeTensors[Ex] (+ out-Config overload) in
+          neuralpretrained.pas; AddSwinIRLayer/LoadSwinIRLayer reuse the landed Swin
+          attention blocks (packed attn.qkv sliced into q/k/v at load).
+      [X] Pico parity vs a self-contained float64 numpy oracle
+          (tools/swinir_tiny_fixture.py -> tests/fixtures/tiny_swinir.*): 1 RSTB of
+          2 Swin layers (W-MSA + SW-MSA), window 2, embed 6, 2 heads, upscale 2;
+          TestSwinIRParity + TestSwinIRConfigFromJSONFile assert max|diff| < 1e-4.
+      [X] examples/SwinIRRestore end-to-end 2x SR smoke (pico fixture, ulimit-bounded)
+          + examples/README.md entry.
+      [ ] Pinned the classical-SR (pixel-shuffle upscale) variant; the
+          same-resolution denoise tail (upscale=1, single conv reconstruction) is
+          wired by config but only the SR shape is parity-pinned.
+      [ ] Real-checkpoint parity deferred (official SwinIR .safetensors are large /
+          not obtainable offline); the importer accepts a real checkpoint path.
+      [ ] Lightweight-SR (no conv_after_body / single shared upsample) and the
+          nearest+conv "real-world" SR upsampler variants not yet wired.
 - [ ] RIFE real-time video frame-interpolation importer (BuildRIFEFromSafeTensors[Ex],
       the IFNet of hzwer/Practical-RIFE) — fills the VIDEO-generative importer gap:
       synthesises an intermediate frame between two input frames (the landed RAFT

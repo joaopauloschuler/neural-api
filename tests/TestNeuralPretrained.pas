@@ -342,6 +342,8 @@ type
     procedure TestRRDBNetParity;
     procedure TestNAFNetConfigFromJSONFile;
     procedure TestNAFNetParity;
+    procedure TestSwinIRConfigFromJSONFile;
+    procedure TestSwinIRParity;
     procedure TestStyleGAN2ConfigFromJSONFile;
     procedure TestStyleGAN2GeneratorParity;
     procedure TestDINOv2ConfigFromJSONFile;
@@ -16309,6 +16311,114 @@ begin
           RefVal := ChanArr.Items[XCnt].AsFloat;
           GotVal := NN.GetLastLayer().Output.FData[
             (YCnt * ImgSize + XCnt) * Config.ImgChannel + ChanCnt];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('restored RGB: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImgInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadSwinIRConfigFromJSONFile on the committed pico config.
+procedure TTestNeuralPretrained.TestSwinIRConfigFromJSONFile;
+var
+  Config: TSwinIRConfig;
+begin
+  Config := ReadSwinIRConfigFromJSONFile(
+    FixturePath('tiny_swinir_config.json'));
+  AssertEquals('model_type', 'swinir', Config.ModelType);
+  AssertEquals('upscale', 2, Config.Upscale);
+  AssertEquals('in_chans', 3, Config.InChans);
+  AssertEquals('img_size', 4, Config.ImgSize);
+  AssertEquals('window_size', 2, Config.WindowSize);
+  AssertEquals('embed_dim', 6, Config.EmbedDim);
+  AssertEquals('rstb count (depths)', 1, Length(Config.Depths));
+  AssertEquals('depth[0]', 2, Config.Depths[0]);
+  AssertEquals('num_heads[0]', 2, Config.NumHeads[0]);
+  AssertEquals('num_feat', 4, Config.NumFeat);
+end;
+
+// SwinIR transformer image-restoration (classical SR) parity test.
+// tests/fixtures/tiny_swinir.* is a pico random-init SwinIR (img 4, window 2,
+// embed_dim 6, 1 RSTB of 2 Swin layers, 2 heads, upscale 2). The fixture
+// (tools/swinir_tiny_fixture.py) is a self-contained float64 numpy oracle that
+// mirrors the importer's forward path EXACTLY. The 2-layer RSTB exercises the
+// full shifted-window path: layer 0 is W-MSA, layer 1 is SW-MSA (cyclic shift +
+// attention mask). Asserts the upscaled (img*upscale, img*upscale, in_chans)
+// restored image matches the oracle < 1e-4 - exercising TNNetWindowAttention
+// (rel-pos bias + shift mask), TNNetGatherTokens (window partition/reverse),
+// the RSTB residual conv, and the TNNetDepthToSpace pixel-shuffle tail.
+procedure TTestNeuralPretrained.TestSwinIRParity;
+var
+  NN: TNNet;
+  Config: TSwinIRConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  InputArr, ChanArr, RowArr, ImgArr: TJSONArray;
+  ImgInput: TNNetVolume;
+  ImgSize, OutGrid: integer;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildSwinIRFromSafeTensors(
+    FixturePath('tiny_swinir.safetensors'), Config,
+    {pInferenceOnly=}false, FixturePath('tiny_swinir_config.json'));
+  RefJson := TStringList.Create;
+  ImgInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImgSize, NN.Layers[0].Output.SizeX);
+    OutGrid := Config.ImgSize * Config.Upscale;
+    RefJson.LoadFromFile(FixturePath('tiny_swinir_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    InputArr := TJSONArray(TJSONObject(RefRoot).Find('input'));
+    ImgArr := TJSONArray(TJSONObject(RefRoot).Find('image'));
+    ImgSize := TJSONObject(RefRoot).Get('image_size', 0);
+    AssertTrue('input present', InputArr <> nil);
+    AssertEquals('output grid = img*upscale', OutGrid,
+      NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output grid vs oracle', ImgSize,
+      NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output channels', Config.InChans,
+      NN.GetLastLayer().Output.Depth);
+
+    // Load the (C,H,W) input into the CAI (x,y,depth)-indexed volume.
+    ImgInput.ReSize(Config.ImgSize, Config.ImgSize, Config.InChans);
+    for ChanCnt := 0 to Config.InChans - 1 do
+    begin
+      RowArr := TJSONArray(InputArr.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImgSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImgSize - 1 do
+          ImgInput.FData[
+            (YCnt * Config.ImgSize + XCnt) * Config.InChans + ChanCnt] :=
+            ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImgInput);
+    // Compare the (C,H,W) oracle vs the CAI (x,y,depth) output volume.
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.InChans - 1 do
+    begin
+      RowArr := TJSONArray(ImgArr.Items[ChanCnt]);
+      for YCnt := 0 to ImgSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to ImgSize - 1 do
+        begin
+          RefVal := ChanArr.Items[XCnt].AsFloat;
+          GotVal := NN.GetLastLayer().Output.FData[
+            (YCnt * ImgSize + XCnt) * Config.InChans + ChanCnt];
           Diff := Abs(GotVal - RefVal);
           if Diff > MaxDiff then MaxDiff := Diff;
         end;

@@ -6890,6 +6890,62 @@ function BuildNAFNetFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// SwinIR IMAGE-RESTORATION IMPORT (model_type "swinir") -- the repo's FIRST
+// TRANSFORMER restoration importer (Liang et al. 2021, arXiv:2108.10257):
+// classical super-resolution. REUSES the landed Swin window/shifted-window
+// attention (TNNetWindowAttention + TNNetGatherTokens partition/reverse + the
+// per-head relative_position_bias_table and cyclic-shift mask). The genuinely
+// new pieces are the shallow conv stem, the Residual Swin Transformer Blocks
+// (RSTB = depth Swin layers + a 3x3 conv + a residual over the block) and the
+// pixel-shuffle (TNNetDepthToSpace) upsample tail.
+//
+// Pipeline:  conv_first 3x3 -> token seq over the HxW grid
+//   RSTB[L]: depth Swin layers (W-MSA/SW-MSA + MLP) -> map -> conv 3x3 ->
+//            tokens, + RSTB input (residual)
+//   token LayerNorm (norm) -> map -> conv_after_body 3x3, + conv_first map
+//   conv_before_upsample 3x3 -> LeakyReLU(0.2)
+//   upsample.0 3x3 (Eup -> 4*Eup) -> DepthToSpace(upscale) -> conv_last 3x3
+// Keys follow the official SwinIR repo state_dict (single packed attn.qkv +
+// attn.proj, layers.L.residual_group.blocks.M.*, layers.L.conv.*).
+// ---------------------------------------------------------------------------
+type
+  TSwinIRConfig = record
+    ModelType: string;            // 'swinir'
+    Upscale: integer;             // SR factor (>=1; 1 = same-resolution denoise)
+    InChans: integer;             // input/output channels (3)
+    ImgSize: integer;             // input grid H=W (multiple of window_size)
+    WindowSize: integer;          // Swin window size
+    EmbedDim: integer;            // transformer feature width (div by num_heads)
+    Depths: TNeuralIntegerArray;  // Swin layers per RSTB (one entry per RSTB)
+    NumHeads: TNeuralIntegerArray;// heads per RSTB
+    MlpRatio: TNeuralFloat;       // MLP hidden = round(embed_dim * mlp_ratio)
+    NumFeat: integer;             // conv_before_upsample / upsample channels
+    LayerNormEps: TNeuralFloat;   // 1e-5
+  end;
+
+// Reads a SwinIR config. Required: embed_dim, window_size, img_size. Optional:
+// upscale (2), in_chans (3), depths ([6]), num_heads ([6]), mlp_ratio (2.0),
+// num_feat (64), layer_norm_eps (1e-5), model_type. depths and num_heads must
+// have the same length (one entry per RSTB).
+function ReadSwinIRConfigFromJSONFile(
+  const FileName: string): TSwinIRConfig;
+
+function SwinIRConfigToString(const Config: TSwinIRConfig): string;
+
+// Builds the SwinIR restorer described by Config and loads every weight from
+// Reader (caller owns Reader). Takes an (ImgSize, ImgSize, InChans) image and
+// outputs an (ImgSize*Upscale, ImgSize*Upscale, InChans) restored image (raw).
+function BuildSwinIRFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TSwinIRConfig; pInferenceOnly: boolean = false): TNNet; overload;
+
+function BuildSwinIRFromSafeTensorsEx(const FileName: string;
+  const Config: TSwinIRConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildSwinIRFromSafeTensors(const FileName: string;
+  out Config: TSwinIRConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet; overload;
+
+// ---------------------------------------------------------------------------
 // StyleGAN2 GENERATOR IMPORT (model_type "stylegan2") -- the repo's FIRST
 // STYLE-BASED generative synthesis importer (Karras et al. 2020,
 // arXiv:1912.04958). INFERENCE-ONLY synthesis: an 8-layer mapping MLP turns a
@@ -41281,6 +41337,417 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadNAFNetConfigFromJSONFile(ConfigPath);
   Result := BuildNAFNetFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// SwinIR IMAGE-RESTORATION IMPORT (model_type "swinir")
+// ===========================================================================
+
+function ReadSwinIRConfigFromJSONFile(
+  const FileName: string): TSwinIRConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+
+  function ReadIntArray(const FieldName: string;
+    const Default: array of integer): TNeuralIntegerArray;
+  var
+    Arr: TJSONArray;
+    i: integer;
+  begin
+    if (Obj.IndexOfName(FieldName) < 0) or
+       not (Obj.Find(FieldName) is TJSONArray) then
+    begin
+      SetLength(Result, Length(Default));
+      for i := 0 to Length(Default) - 1 do Result[i] := Default[i];
+      Exit;
+    end;
+    Arr := TJSONArray(Obj.Find(FieldName));
+    SetLength(Result, Arr.Count);
+    for i := 0 to Arr.Count - 1 do Result[i] := Arr.Items[i].AsInteger;
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('SwinIR import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('SwinIR import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('SwinIR import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'swinir');
+    Result.Upscale := Obj.Get('upscale', 2);
+    Result.InChans := Obj.Get('in_chans', 3);
+    Result.ImgSize := Obj.Get('img_size', 0);
+    if Result.ImgSize <= 0 then
+      ImportError('SwinIR import: config "' + FileName +
+        '" is missing the required positive field "img_size".');
+    Result.WindowSize := Obj.Get('window_size', 0);
+    if Result.WindowSize <= 0 then
+      ImportError('SwinIR import: config "' + FileName +
+        '" is missing the required positive field "window_size".');
+    Result.EmbedDim := Obj.Get('embed_dim', 0);
+    if Result.EmbedDim <= 0 then
+      ImportError('SwinIR import: config "' + FileName +
+        '" is missing the required positive field "embed_dim".');
+    Result.Depths := ReadIntArray('depths', [6]);
+    Result.NumHeads := ReadIntArray('num_heads', [6]);
+    Result.MlpRatio := Obj.Get('mlp_ratio', 2.0);
+    Result.NumFeat := Obj.Get('num_feat', 64);
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1e-5);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function SwinIRConfigToString(const Config: TSwinIRConfig): string;
+var
+  i: integer;
+  DepthStr, HeadStr: string;
+begin
+  DepthStr := '';
+  HeadStr := '';
+  for i := 0 to Length(Config.Depths) - 1 do
+  begin
+    if i > 0 then DepthStr := DepthStr + ',';
+    DepthStr := DepthStr + IntToStr(Config.Depths[i]);
+  end;
+  for i := 0 to Length(Config.NumHeads) - 1 do
+  begin
+    if i > 0 then HeadStr := HeadStr + ',';
+    HeadStr := HeadStr + IntToStr(Config.NumHeads[i]);
+  end;
+  Result := Config.ModelType + ' config: upscale=' + IntToStr(Config.Upscale) +
+    ', in_chans=' + IntToStr(Config.InChans) + ', img_size=' +
+    IntToStr(Config.ImgSize) + ', window_size=' + IntToStr(Config.WindowSize) +
+    ', embed_dim=' + IntToStr(Config.EmbedDim) + ', depths=[' + DepthStr +
+    '], num_heads=[' + HeadStr + '], mlp_ratio=' +
+    FloatToStr(Config.MlpRatio) + ', num_feat=' + IntToStr(Config.NumFeat);
+end;
+
+type
+  // Layer refs needed to load one SwinIR Swin layer's weights.
+  TSwinIRLayerRefs = record
+    Norm1, Norm2, Fc1, Fc2: TNNetLayer;
+    // q/k/v/o projections (one per window; the SAME checkpoint tensors load
+    // into every window's projections because Swin shares them across windows).
+    QProj, KProj, VProj, OProj: array of TNNetLayer;
+    // window-attention layers, appended (outer window, inner head).
+    Attn: array of TNNetLayer;
+    // window layout needed to set the per-(window,head) bias matrix.
+    RelPosIndex, RegionId: TNeuralIntegerArray;
+    NumWindows, Heads, EffWindow: integer;
+  end;
+
+// Appends ONE Swin transformer layer (W-MSA / SW-MSA + MLP) over the
+// (Grid*Grid, 1, Dim) token sequence feeding `inp`. Mirrors the inline body of
+// BuildSwinFromSafeTensors EXACTLY (TNNetGatherTokens partition/reverse, per
+// (head,window) TNNetWindowAttention, residual sums, GELU MLP). The SwinIR key
+// layout packs q/k/v in a single attn.qkv linear, so the projections are loaded
+// later by slicing that slab. Returns the layer output and the weight-load refs.
+function AddSwinIRLayer(NN: TNNet; inp: TNNetLayer;
+  Grid, Dim, Heads, EffWindow, EffShift: integer; Shifted: boolean;
+  MlpRatio, LayerNormEps: TNeuralFloat; out Refs: TSwinIRLayerRefs): TNNetLayer;
+var
+  HeadDim, ws2, NumWindows, wIdx, h, ci, MlpHidden: integer;
+  TokenPerm, InvPerm, RelPosIndex, RegionId, Channels: TNeuralIntegerArray;
+  ShortcutA, NormBefore, Reordered, WinSlice, QProj, KProj, VProj: TNNetLayer;
+  QSlice, KSlice, VSlice, QKV, HeadAttn, AttnConcat, OProj: TNNetLayer;
+  WindowOuts, HeadOuts: array of TNNetLayer;
+  AllWindowConcat, ReorderBack, AttnResidual: TNNetLayer;
+  NormAfter, Fc1, Fc2, MlpResidual: TNNetLayer;
+begin
+  HeadDim := Dim div Heads;
+  ws2 := EffWindow * EffWindow;
+  SwinBuildWindowLayout(Grid, EffWindow, EffShift, Shifted,
+    TokenPerm, InvPerm, RelPosIndex, RegionId, NumWindows);
+  Refs.NumWindows := NumWindows;
+  Refs.Heads := Heads;
+  Refs.EffWindow := EffWindow;
+  Refs.RelPosIndex := RelPosIndex;
+  Refs.RegionId := RegionId;
+  SetLength(Refs.QProj, NumWindows);
+  SetLength(Refs.KProj, NumWindows);
+  SetLength(Refs.VProj, NumWindows);
+  SetLength(Refs.OProj, NumWindows);
+  SetLength(Refs.Attn, NumWindows * Heads);
+
+  ShortcutA := inp;
+  // --- W-MSA / SW-MSA ---
+  NormBefore := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(LayerNormEps), inp);
+  Refs.Norm1 := NormBefore;
+  Reordered := NN.AddLayer( TNNetGatherTokens.Create(TokenPerm) );
+  SetLength(WindowOuts, NumWindows);
+  for wIdx := 0 to NumWindows - 1 do
+  begin
+    WinSlice := NN.AddLayerAfter(
+      TNNetCrop.Create(wIdx * ws2, 0, ws2, 1), Reordered);
+    QProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim) );
+    KProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim), WinSlice);
+    VProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim), WinSlice);
+    Refs.QProj[wIdx] := QProj;
+    Refs.KProj[wIdx] := KProj;
+    Refs.VProj[wIdx] := VProj;
+    SetLength(HeadOuts, Heads);
+    SetLength(Channels, HeadDim);
+    for h := 0 to Heads - 1 do
+    begin
+      for ci := 0 to HeadDim - 1 do Channels[ci] := h * HeadDim + ci;
+      QSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), QProj);
+      KSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), KProj);
+      VSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), VProj);
+      QKV := NN.AddLayer( TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
+      HeadAttn := NN.AddLayer( TNNetWindowAttention.Create(HeadDim, ws2) );
+      Refs.Attn[wIdx * Heads + h] := HeadAttn;
+      HeadOuts[h] := HeadAttn;
+    end;
+    AttnConcat := NN.AddLayer( TNNetDeepConcat.Create(HeadOuts) );
+    OProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim) );
+    Refs.OProj[wIdx] := OProj;
+    WindowOuts[wIdx] := OProj;
+  end;
+  AllWindowConcat := NN.AddLayer(
+    TNNetConcat.Create(NumWindows * ws2, 1, Dim, WindowOuts) );
+  ReorderBack := NN.AddLayer( TNNetGatherTokens.Create(InvPerm) );
+  AttnResidual := NN.AddLayer( TNNetSum.Create([ReorderBack, ShortcutA]) );
+
+  // --- MLP ---
+  NormAfter := NN.AddLayer( TNNetTokenLayerNorm.Create(LayerNormEps) );
+  Refs.Norm2 := NormAfter;
+  MlpHidden := Round(Dim * MlpRatio);
+  Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden) );
+  Refs.Fc1 := Fc1;
+  NN.AddLayer( TNNetGELU.Create() );
+  Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim) );
+  Refs.Fc2 := Fc2;
+  MlpResidual := NN.AddLayer( TNNetSum.Create([Fc2, AttnResidual]) );
+  if AllWindowConcat = nil then ; // silence unused
+  Result := MlpResidual;
+end;
+
+// Loads one SwinIR Swin layer's weights. SwinIR packs q/k/v in a single
+// attn.qkv linear ([3*Dim, Dim], +bias [3*Dim]); we slice rows 0/Dim/2Dim into
+// the q/k/v projections. The relative_position_bias_table + cyclic-shift mask
+// are set per (window, head) via SwinSetWindowBias.
+procedure LoadSwinIRLayer(Reader: TNNetSafeTensorsReader;
+  const Refs: TSwinIRLayerRefs; const BPrefix: string; Dim: integer;
+  MlpRatio: TNeuralFloat);
+var
+  wIdx, h, ci, MlpHidden: integer;
+  BiasTable: TNNetVolume;
+begin
+  // q/k/v from the packed slab (3*Dim rows): q=[0..Dim), k=[Dim..2Dim),
+  // v=[2Dim..3Dim).  bias sliced the same way.  o_proj is plain.
+  for wIdx := 0 to Refs.NumWindows - 1 do
+  begin
+    LoadLlamaLinearWeights(Reader, Refs.QProj[wIdx], BPrefix + 'attn.qkv.weight',
+      Dim, Dim, 0, -1, 0, BPrefix + 'attn.qkv.bias', 1.0, 0, 0, 3 * Dim);
+    LoadLlamaLinearWeights(Reader, Refs.KProj[wIdx], BPrefix + 'attn.qkv.weight',
+      Dim, Dim, 0, -1, 0, BPrefix + 'attn.qkv.bias', 1.0, 0, Dim, 3 * Dim);
+    LoadLlamaLinearWeights(Reader, Refs.VProj[wIdx], BPrefix + 'attn.qkv.weight',
+      Dim, Dim, 0, -1, 0, BPrefix + 'attn.qkv.bias', 1.0, 0, 2 * Dim, 3 * Dim);
+    LoadLlamaLinearWeights(Reader, Refs.OProj[wIdx], BPrefix + 'attn.proj.weight',
+      Dim, Dim, 0, -1, 0, BPrefix + 'attn.proj.bias');
+  end;
+  // relative position bias + shift mask per (window, head), using the window
+  // layout captured when the layer was built.
+  BiasTable := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(BPrefix +
+      'attn.relative_position_bias_table', BiasTable);
+    for wIdx := 0 to Refs.NumWindows - 1 do
+      for h := 0 to Refs.Heads - 1 do
+      begin
+        ci := wIdx * Refs.Heads + h;
+        SwinSetWindowBias(Refs.Attn[ci], BiasTable,
+          Refs.RelPosIndex, Refs.RegionId, h, Refs.Heads, Refs.EffWindow, wIdx);
+      end;
+  finally
+    BiasTable.Free;
+  end;
+  LoadLayerNormWeights(Reader, Refs.Norm1,
+    BPrefix + 'norm1.weight', BPrefix + 'norm1.bias', Dim);
+  LoadLayerNormWeights(Reader, Refs.Norm2,
+    BPrefix + 'norm2.weight', BPrefix + 'norm2.bias', Dim);
+  MlpHidden := Round(Dim * MlpRatio);
+  LoadLlamaLinearWeights(Reader, Refs.Fc1, BPrefix + 'mlp.fc1.weight',
+    Dim, MlpHidden, 0, -1, 0, BPrefix + 'mlp.fc1.bias');
+  LoadLlamaLinearWeights(Reader, Refs.Fc2, BPrefix + 'mlp.fc2.weight',
+    MlpHidden, Dim, 0, -1, 0, BPrefix + 'mlp.fc2.bias');
+end;
+
+function BuildSwinIRFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TSwinIRConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  ConvFirst, ConvAfterBody, ConvBeforeUp, UpConv, ConvLast: TNNetLayer;
+  RSTBConv: array of TNNetLayer;
+  LayerRefs: array of array of TSwinIRLayerRefs;
+  FinalNorm: TNNetLayer;
+  F0Map, Cur, RSTBIn: TNNetLayer;
+  NumRSTB, li, bi, Grid, Dim, Heads, ws, EffWindow, EffShift: integer;
+  Shifted: boolean;
+  Prefix, BPrefix: string;
+begin
+  Dim := Config.EmbedDim;
+  if (Config.EmbedDim < 1) or (Config.NumHeads[0] < 1) or
+     ((Config.EmbedDim mod Config.NumHeads[0]) <> 0) then
+    ImportError('SwinIR import: embed_dim=' + IntToStr(Config.EmbedDim) +
+      ' must be divisible by num_heads[0].');
+  if (Config.WindowSize < 1) or ((Config.ImgSize mod Config.WindowSize) <> 0) then
+    ImportError('SwinIR import: img_size must be a multiple of window_size.');
+  if Length(Config.Depths) <> Length(Config.NumHeads) then
+    ImportError('SwinIR import: depths and num_heads must have the same ' +
+      'length (one entry per RSTB).');
+  if Config.Upscale < 1 then
+    ImportError('SwinIR import: upscale must be >= 1.');
+  if (Config.Upscale > 1) and (Config.NumFeat < 1) then
+    ImportError('SwinIR import: num_feat must be >= 1 for upscale > 1.');
+  NumRSTB := Length(Config.Depths);
+  Grid := Config.ImgSize;
+  ws := Config.WindowSize;
+  SetLength(RSTBConv, NumRSTB);
+  SetLength(LayerRefs, NumRSTB);
+
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer( TNNetInput.Create(Config.ImgSize, Config.ImgSize,
+      Config.InChans) );
+    // Shallow feature conv stem (3x3 -> embed_dim).
+    ConvFirst := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Config.EmbedDim, 3, 1, 1, 0) );
+    F0Map := ConvFirst;
+    // Flatten the (W,H,C) map to a (W*H, 1, C) token sequence in row-major
+    // (y*Grid + x) order (the same convention as the landed Swin importer).
+    Cur := NN.AddLayer( TNNetReshape.Create(Grid * Grid, 1, Config.EmbedDim) );
+
+    // HF clamps window (and zeroes shift) when the grid <= window.
+    if Grid <= ws then EffWindow := Grid else EffWindow := ws;
+
+    for li := 0 to NumRSTB - 1 do
+    begin
+      Heads := Config.NumHeads[li];
+      RSTBIn := Cur;
+      SetLength(LayerRefs[li], Config.Depths[li]);
+      for bi := 0 to Config.Depths[li] - 1 do
+      begin
+        Shifted := Odd(bi) and (Grid > ws);
+        if Shifted then EffShift := EffWindow div 2 else EffShift := 0;
+        Cur := AddSwinIRLayer(NN, Cur, Grid, Dim, Heads, EffWindow, EffShift,
+          Shifted, Config.MlpRatio, Config.LayerNormEps, LayerRefs[li][bi]);
+      end;
+      // RSTB conv: tokens -> (Grid,Grid,Dim) map -> 3x3 conv -> tokens, then
+      // residual-add the RSTB input.
+      NN.AddLayer( TNNetReshape.Create(Grid, Grid, Dim) );
+      RSTBConv[li] := NN.AddLayer(
+        TNNetConvolutionLinear.Create(Dim, 3, 1, 1, 0) );
+      NN.AddLayer( TNNetReshape.Create(Grid * Grid, 1, Dim) );
+      Cur := NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), RSTBIn]) );
+    end;
+
+    // Token LayerNorm -> map -> conv_after_body 3x3, + conv_first map.
+    FinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+    NN.AddLayer( TNNetReshape.Create(Grid, Grid, Dim) );
+    ConvAfterBody := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Dim, 3, 1, 1, 0) );
+    Cur := NN.AddLayer( TNNetSum.Create([ConvAfterBody, F0Map]) );
+
+    // ---------------- Reconstruction / upsample tail ----------------
+    ConvBeforeUp := nil;
+    UpConv := nil;
+    if Config.Upscale > 1 then
+    begin
+      ConvBeforeUp := NN.AddLayer(
+        TNNetConvolutionLinear.Create(Config.NumFeat, 3, 1, 1, 0) );
+      NN.AddLayer( TNNetLeakyReLU.Create(0.2) );
+      // pixel-shuffle upsample: 3x3 conv -> upscale^2 * num_feat, DepthToSpace.
+      UpConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+        Config.Upscale * Config.Upscale * Config.NumFeat, 3, 1, 1, 0) );
+      NN.AddLayer( TNNetDepthToSpace.Create(Config.Upscale) );
+      ConvLast := NN.AddLayer(
+        TNNetConvolutionLinear.Create(Config.InChans, 3, 1, 1, 0) );
+    end
+    else
+      // Same-resolution denoise tail: single conv reconstruction.
+      ConvLast := NN.AddLayer(
+        TNNetConvolutionLinear.Create(Config.InChans, 3, 1, 1, 0) );
+
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    LoadVaeConv(Reader, ConvFirst, 'conv_first.weight', 'conv_first.bias',
+      Config.EmbedDim, Config.InChans, 3);
+    for li := 0 to NumRSTB - 1 do
+    begin
+      Prefix := 'layers.' + IntToStr(li) + '.';
+      for bi := 0 to Config.Depths[li] - 1 do
+      begin
+        BPrefix := Prefix + 'residual_group.blocks.' + IntToStr(bi) + '.';
+        LoadSwinIRLayer(Reader, LayerRefs[li][bi], BPrefix, Dim, Config.MlpRatio);
+      end;
+      LoadVaeConv(Reader, RSTBConv[li], Prefix + 'conv.weight',
+        Prefix + 'conv.bias', Dim, Dim, 3);
+    end;
+    LoadLayerNormWeights(Reader, FinalNorm, 'norm.weight', 'norm.bias', Dim);
+    LoadVaeConv(Reader, ConvAfterBody, 'conv_after_body.weight',
+      'conv_after_body.bias', Dim, Dim, 3);
+    if Config.Upscale > 1 then
+    begin
+      LoadVaeConv(Reader, ConvBeforeUp, 'conv_before_upsample.0.weight',
+        'conv_before_upsample.0.bias', Config.NumFeat, Dim, 3);
+      LoadVaeConv(Reader, UpConv, 'upsample.0.weight', 'upsample.0.bias',
+        Config.Upscale * Config.Upscale * Config.NumFeat, Config.NumFeat, 3);
+      LoadVaeConv(Reader, ConvLast, 'conv_last.weight', 'conv_last.bias',
+        Config.InChans, Config.NumFeat, 3);
+    end
+    else
+      LoadVaeConv(Reader, ConvLast, 'conv_last.weight', 'conv_last.bias',
+        Config.InChans, Dim, 3);
+
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildSwinIRFromSafeTensorsEx(const FileName: string;
+  const Config: TSwinIRConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildSwinIRFromSafeTensors(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildSwinIRFromSafeTensors(const FileName: string;
+  out Config: TSwinIRConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadSwinIRConfigFromJSONFile(ConfigPath);
+  Result := BuildSwinIRFromSafeTensorsEx(FileName, Config, pInferenceOnly);
 end;
 
 // ===========================================================================
