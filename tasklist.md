@@ -218,62 +218,6 @@ rather than acted on.
       additionally shares a small set of transformer blocks across depth with a
       per-invocation LoRA adapter; needs a shared-block + LoRA wiring helper
       (larger than Nemotron-H, distinct from the per-layer-independent schedule).
-- [X] LLaVA-style GENERATIVE vision-language import — LANDED (commits 5cec79d/e01bd61):
-      Steps 3/4/5 done. BuildLlavaFromSafeTensors[WithConfig] + TLlavaConfig, BuildLlavaProjector +
-      LlavaProjectImage/LlavaAssembleEmbeddings (visual-token splice), LlavaRunLogits
-      embedding-injection decode, cfLlava chat format, examples/LlavaDescribe. Two pico parity
-      tests < 1e-4 (visual tokens + next-token logits). SigLIP path parity-tested;
-      vision_feature_layer=-1 = hidden_states BEFORE post_layernorm. Open follow-ups:
-      KV-cache fast decode; real-checkpoint tokenizer+preprocess wiring into the demo;
-      CLIP-vision (lvkClip CLS-crop) path coded but not parity-tested. Original detail below:
-      image-conditioned text
-      generation, the capability step past the landed CLIP dual encoder
-      (which only scores image/text similarity and cannot generate).
-      Prefer the SigLIP vision tower (BuildSigLIPVisionTower with a
-      pVisionFeatures skip-pooling/select-hidden-layer mode — exactly the
-      LLaVA select-hidden mode) for Step 4's checkpoint: most modern open VLMs
-      (PaliGemma/SmolVLM/Idefics) use SigLIP, not CLIP, as the tower.
-      Target a small open checkpoint on the classic LLaVA recipe (e.g.
-      llava-hf/llava-interleave-qwen-0.5b-hf or a SmolVLM-class model —
-      whichever config maps cleanest onto existing paths): ViT vision
-      tower -> 2-layer MLP projector (gelu) -> visual tokens SPLICED into
-      the decoder's token-embedding sequence at the <image> placeholder
-      position, then ordinary causal decoding. Nearly everything exists:
-      BuildClipVisionTower is the reusable ViT (LLaVA uses the
-      penultimate-layer patch tokens WITHOUT the CLS row and WITHOUT the
-      projection head — needs a select-hidden-layer/skip-pooling mode),
-      the language side is the stock Llama/Qwen2 path, and decode/chat
-      infra (KV cache, samplers, ApplyChatTemplate) is landed. The genuinely
-      new pieces: (a) the projector import + a prompt-assembly helper that
-      runs the vision tower once and concatenates [text-embeds | projected
-      image tokens | text-embeds] as a TNNetInput-fed embedding sequence
-      (in-repo precedent: T5EncoderStatesInput external-states convention),
-      (b) image preprocessing to the processor's normalized RGB tensor
-      (CLIP-style resize/center-crop, mean/std from preprocessor_config.json
-      — also unblocks the ClipZeroShot real-image follow-up), (c) the
-      multimodal chat template ("USER: <image>\n...ASSISTANT:" or
-      ChatML-with-image variant) wired into neuralchat.pas. Deliverables:
-      BuildLlavaFromSafeTensors[Ex] (two nets + projector, multi-shard
-      index.json support), pico parity fixture via the make_pico_*_fixture.py
-      recipe asserting projected visual tokens AND next-token logits for a
-      mixed image+text prompt vs HF float64, and an examples/LlavaDescribe
-      demo that captions a small image on CPU. First image-in/text-out
-      model in the repo; opens the door to Qwen-VL/PaliGemma later.
-  Suggested incremental breakdown (each step independently buildable + committable):
-  - [ ] Step 3 — projector import + prompt-assembly helper: load the 2-layer MLP
-        (gelu) projector, run the vision tower once, and concatenate
-        [text-embeds | projected image tokens | text-embeds] as a TNNetInput-fed
-        embedding sequence at the <image> placeholder (precedent:
-        T5EncoderStatesInput). Test: projected visual tokens match HF float64 < 1e-4.
-  - [ ] Step 4 — BuildLlavaFromSafeTensors[Ex] (two nets + projector, multi-shard
-        index.json) on a small checkpoint (llava-interleave-qwen-0.5b-hf or a
-        SmolVLM-class config); language side is the stock Llama/Qwen2 path. Pico
-        parity fixture asserting next-token logits for a mixed image+text prompt
-        vs HF float64 < 1e-4.
-  - [ ] Step 5 — multimodal chat template ("USER: <image>\\n...ASSISTANT:" /
-        ChatML-with-image) in neuralchat.pas + examples/LlavaDescribe demo that
-        captions a small image on CPU (ulimit-bounded). Edit examples/README.md
-        (NOT the main README) for the new example.
 - [ ] SigLIP follow-up: NaFlex / variable-resolution siglip2 (the landed
       BuildSigLIPFromSafeTensors scopes to the FIXED-resolution siglip/siglip2
       base configs: square image_size, learned position table over a fixed
@@ -379,54 +323,6 @@ rather than acted on.
       offline here); (b) expose LPIPS as a backprop TRAINING LOSS head so the SR
       examples can opt into perceptual fine-tuning (the VGG build already enables
       input/error collection, so the gradient path exists).
-- [X] YOLO single-shot object-detection importer (ultralytics YOLOv8 safetensors)
-      — LANDED: BuildYolo / BuildYoloFromSafeTensors[Ex] + TYoloConfig /
-      ReadYoloConfigFromJSONFile / YoloConfigToString in neuralpretrained.pas.
-      Anchor-free fully-conv one-stage detector (no transformer): CSP/C2f backbone
-      (YoloAddC2f: 1x1 -> channel SplitChannels into two halves -> n chained
-      Bottlenecks kept -> DeepConcat -> 1x1) + SPPF (YoloAddSPPF: 1x1 -> 3 chained
-      k5 s1 TNNetMaxPoolPortable kept -> concat -> 1x1) + PANet top-down
-      (TNNetDeMaxPool nearest-2x + DeepConcat + C2f) / bottom-up (stride-2 conv +
-      concat + C2f) neck + decoupled DFL detect head (box branch 4*reg_max dist
-      logits + cls branch num_classes, 3 strides), flattened to a
-      (sum Hi*Wi, 1, 4*reg_max+nc) per-cell raw head. Every ultralytics Conv =
-      conv2d(no bias)->BN->SiLU loaded via LoadResNetConvFoldBN; head final Conv2d
-      via LoadMobileNetSEConv. DFL decode + greedy IoU NMS = DecodeYoloDetections
-      (TYoloDetection). Pico parity vs a numpy float64 oracle on the raw head
-      (TestYoloObjectDetectionParity, max|diff| < 1e-4) + decode unit test
-      (TestYoloDetectionDecode) + config test; fixture tools/yolo_tiny_fixture.py
-      (INPUT 96 so /32=3 avoids CAI's Min(K, prev.SizeX) kernel clamp; maxpool
-      zero-PADs like CAI, not -inf). examples/YoloDetect draws boxes -> PPM.
-      OPEN FOLLOW-UPS: (a) wire model_type 'yolov8' into BuildFromPretrained
-      dispatch; (b) real ultralytics yolov8n weight-name parity (the .pt -> .pth
-      key scheme is identical "model.{i}.*" but verify against a real export + the
-      DFL conv bin buffer ultralytics bakes in); (c) yolov8 segmentation /
-      pose / OBB heads; (d) letterbox preprocessing helper for arbitrary-size
-      images (the importer assumes a square ImageSize input).
-- [X] RAFT optical-flow importer (BuildRaftFromSafeTensors / ...Ex + TRaftConfig +
-      ReadRaftConfigFromJSONFile + RaftConfigToString + RaftPredictFlow, in
-      neuralpretrained.pas) — the FIRST optical-flow vertical and first TWO-image-in
-      / dense-(dx,dy)-out model. New layers (neuralnetwork.pas, all FORWARD-ONLY per
-      v1 inference scope): TNNetCorrelationVolume (all-pairs corr(i,j)=<f1(i),f2(j)>/
-      sqrt(C), depth=H*W, channel=jy*W+jx), TNNetCorrelationLookup (local (2r+1)^2
-      window around i+flow, bilinear grid_sample align_corners/zeros), TNNetConvGRUCell
-      (single-step conv GRU over (W,H,C); GOTCHA: Data[x,y,d] is x-FIRST, do NOT copy
-      ConvLSTM's Data[row,col] packing — caused a transposed-output border bug). Net
-      built as one TNNet, three TNNetInput sources (frame1,frame2,zero-flow seed) at
-      fixed indices 0,1,2 (TNNet.Compute([f1,f2,seed])), update loop UNROLLED NumIters
-      with SHARED menc/gru/flow_head weights loaded into each instance; fnet weights
-      shared across both frame branches. Pico parity vs a torch float64 oracle
-      (tools/raft_small_tiny_fixture.py reimplements raft_small math directly since
-      torchvision is NOT in the venv): max|diff| 5.5e-6 < 1e-4
-      (TestRaftOpticalFlowParity). examples/OpticalFlow warps frame1->frame2 via the
-      landed TNNetFlowWarp and writes a Middlebury color-coded flow map.
-      NOTE: float32 runtime vs float64 oracle forced the fixture into the
-      NON-SATURATING GRU regime (small weights) to stay under 1e-4 over the iterations.
-      OPEN FOLLOW-UPS: (a) real torchvision raft_small key parity + wire model_type
-      'raft_small' into BuildFromPretrained dispatch; (b) multi-level correlation
-      pyramid (v1 is single-level) + /8 stride; (c) convex-upsampling mask head to
-      full resolution; (d) backward path for the new layers (v1 forward-only);
-      (e) the big SepConvGRU + residual-flow-head of full raft_large.
 - [ ] ControlNet spatial-conditioning importer (BuildControlNetFromSafeTensors, e.g.
       lllyasviel/sd-controlnet-canny) — adds spatial control (edge / depth / pose
       map -> image) to latent diffusion: a trainable COPY of the SD UNet encoder +
@@ -1016,24 +912,6 @@ rather than acted on.
       ulimit/time-bounded smoke run; no importer, no external download. Establishes the
       ray-marching + alpha-compositing primitive that any future 3-D / view-synthesis
       work (instant-NGP hash grids, 3D Gaussian splatting) would build on.
-- [X] CLIPScore text-image-alignment metric — LANDED in neuralpretrained.pas as
-      ClipScore / ClipScoreFromEmbeddings / RefCLIPScore (w=2.5 rescale, harmonic-mean
-      RefCLIPScore) reusing BuildClipFromSafeTensors, plus examples/ClipScore demo.
-      (Original entry placed it in neuralimagemetrics.pas; implemented alongside the
-      CLIP importer instead.) FID
-      / Inception Score / KID (all landed) measure sample QUALITY and DIVERSITY but NONE
-      measure whether a generated image actually MATCHES its text prompt (prompt
-      faithfulness), which is the headline eval for every text-to-image model the tree
-      now imports (PixArt, DiT, the tracked SD-UNet/MMDiT stack). Reuses the landed CLIP
-      dual encoder (BuildClipFromSafeTensors): embed the image with the vision tower and
-      the prompt with the text tower, L2-normalize both, and report the cosine-similarity
-      CLIPScore = w * max(cos(img, txt), 0) with the standard w=2.5 rescale (Hessel et al.
-      2021), plus a RefCLIPScore variant (harmonic mean with reference-caption similarity)
-      for captioning eval. Pure CPU post-process on CLIP embeddings; pin parity vs a
-      transformers/open_clip float64 oracle on a fixed (image, caption) pair and assert
-      CLIPScore rises for a matching caption vs a mismatched one. The text-to-image
-      verification backstop that the tracked ImageNet top-1 / detection-mAP harnesses are
-      for classifiers and detectors; the natural scorer for the LatentTextToImage capstone.
 
 ## Layer follow-ups that fix real limitations
 
