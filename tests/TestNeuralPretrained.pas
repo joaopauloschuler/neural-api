@@ -292,6 +292,13 @@ type
     // match HF build_delay_pattern_mask exactly.
     procedure TestMusicGenDecoderParity;
     procedure TestMusicGenDelayPattern;
+    // End-to-end TEXT-CONDITIONED wiring (examples/MusicGenText): a fixed
+    // prompt id sequence runs through the REAL T5 text encoder, conditions the
+    // MusicGen decoder's delay-pattern generation, and the resulting code stack
+    // is synthesized by the EnCodec decoder. Asserts the pipeline runs and is
+    // DETERMINISTIC (same prompt -> identical codes + waveform), and that a
+    // DIFFERENT prompt steers the output (the text conditioning is live).
+    procedure TestMusicGenTextWiring;
     procedure TestClipConfigFromJSONFile;
     procedure TestClipParity;
     procedure TestClapParity;
@@ -12462,6 +12469,107 @@ begin
     RefRoot.Free;
     RefJson.Free;
   end;
+end;
+
+procedure TTestNeuralPretrained.TestMusicGenTextWiring;
+
+  // Runs the full text->audio pipeline for a prompt id sequence and returns
+  // the generated code stack and the synthesized waveform.
+  procedure RunPipeline(const Ids: array of integer; NumFrames: integer;
+    out Codes: TNNetIntArr2D; out Waveform: TNeuralFloatDynArr);
+  var
+    T5Enc, T5Dec: TNNet;
+    T5Cfg: TT5Config;
+    Model: TMusicGenModel;
+    Config: TMusicGenConfig;
+    Codec: TEnCodecModel;
+    CodecCfg: TEnCodecConfig;
+    Tokens, EncStates: TNNetVolume;
+    EncSeq, DecSeq, i: integer;
+  begin
+    EncSeq := Length(Ids);
+    T5Enc := nil; T5Dec := nil; Model := nil; Codec := nil;
+    Tokens := TNNetVolume.Create;
+    EncStates := TNNetVolume.Create;
+    try
+      BuildT5FromSafeTensors(FixturePath('tiny_musicgen_t5enc.safetensors'),
+        T5Enc, T5Dec, T5Cfg, EncSeq, 1, {pInferenceOnly=}true,
+        FixturePath('tiny_musicgen_t5enc_config.json'));
+      Tokens.ReSize(EncSeq, 1, 1);
+      for i := 0 to EncSeq - 1 do Tokens.FData[i] := Ids[i];
+      T5Enc.Compute(Tokens);
+      EncStates.Copy(T5Enc.GetLastLayer.Output);
+
+      Config := ReadMusicGenConfigFromJSONFile(
+        FixturePath('tiny_musicgen_config.json'));
+      AssertEquals('T5 d_model == MusicGen text_d_model',
+        Config.TextDModel, EncStates.Depth);
+      DecSeq := NumFrames + Config.NumCodebooks - 1 + 1;
+      Model := BuildMusicGenFromSafeTensors(
+        FixturePath('tiny_musicgen.safetensors'), Config, EncSeq, DecSeq,
+        {pInferenceOnly=}true, FixturePath('tiny_musicgen_config.json'));
+      Model.Generate(EncStates, NumFrames, Codes);
+
+      Codec := BuildEnCodecFromSafeTensors(
+        FixturePath('tiny_musicgen_encodec.safetensors'), CodecCfg,
+        FixturePath('tiny_musicgen_encodec_config.json'));
+      AssertTrue('EnCodec has >= K quantizers for the code stack',
+        Codec.NumCodebooks >= Config.NumCodebooks);
+      Codec.DecodeCodesToAudio(Codes, Waveform, Config.NumCodebooks);
+    finally
+      T5Enc.Free;
+      T5Dec.Free;
+      Model.Free;
+      Codec.Free;
+      Tokens.Free;
+      EncStates.Free;
+    end;
+  end;
+
+const
+  NumFrames = 6;
+var
+  PromptA, PromptB: array of integer;
+  CodesA, CodesA2, CodesB: TNNetIntArr2D;
+  WaveA, WaveA2, WaveB: TNeuralFloatDynArr;
+  k_i, t, diff: integer;
+  WaveDiff: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  PromptA := [3, 8, 1, 5, 2];
+  PromptB := [9, 0, 4, 7, 6];
+
+  RunPipeline(PromptA, NumFrames, CodesA, WaveA);
+  AssertTrue('generated a non-empty code stack', Length(CodesA) > 0);
+  AssertTrue('generated a non-empty waveform', Length(WaveA) > 0);
+  AssertEquals('code stack has NumFrames columns', NumFrames,
+    Length(CodesA[0]));
+
+  // Determinism: same prompt -> identical codes and identical waveform.
+  RunPipeline(PromptA, NumFrames, CodesA2, WaveA2);
+  diff := 0;
+  for k_i := 0 to Length(CodesA) - 1 do
+    for t := 0 to NumFrames - 1 do
+      if CodesA[k_i][t] <> CodesA2[k_i][t] then Inc(diff);
+  AssertEquals('text-conditioned generation is deterministic (codes)',
+    0, diff);
+  WaveDiff := 0;
+  AssertEquals('waveform length is deterministic', Length(WaveA),
+    Length(WaveA2));
+  for t := 0 to Length(WaveA) - 1 do
+    if Abs(WaveA[t] - WaveA2[t]) > WaveDiff then
+      WaveDiff := Abs(WaveA[t] - WaveA2[t]);
+  AssertTrue('text-conditioned generation is deterministic (waveform): ' +
+    'max |diff| = ' + FloatToStr(WaveDiff), WaveDiff < 1e-6);
+
+  // The text conditioning is LIVE: a different prompt steers the codes.
+  RunPipeline(PromptB, NumFrames, CodesB, WaveB);
+  diff := 0;
+  for k_i := 0 to Length(CodesA) - 1 do
+    for t := 0 to NumFrames - 1 do
+      if CodesA[k_i][t] <> CodesB[k_i][t] then Inc(diff);
+  AssertTrue('a different prompt steers the generated codes (diff > 0)',
+    diff > 0);
 end;
 
 // Verifies the log-mel FRONTEND (neural/neuralaudio.pas) against HF

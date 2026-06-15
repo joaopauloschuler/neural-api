@@ -799,18 +799,32 @@ rather than acted on.
       sequence; defer the g2p/phonemizer front-end (document feeding pre-phonemized
       ids) and multi-voice blending to a follow-up. The new pieces are the
       style-conditioned duration predictor and the iSTFT decoder tail.
-- [ ] End-to-end TEXT-CONDITIONED MusicGen generation example
+- [X] End-to-end TEXT-CONDITIONED MusicGen generation example
       (examples/MusicGenText, successor to the landed MusicGenSmoke). The smoke
       explicitly stubs the text encoder ("T5 text ENCODER … external; not in
       smoke"); this wires the real `BuildT5FromSafeTensors` text encoder ->
       enc_to_dec_proj -> cross-attention conditioning so a free-text prompt
-      ("upbeat 80s synth-pop") actually steers the generated music, then decodes
-      the delay-pattern code stack through the landed EnCodec decoder to a WAV.
-      Music priority and a contained value-add on top of fully-landed parts
-      (BuildMusicGenFromSafeTensors + BuildEnCodecFromSafeTensors + the T5
-      importer); the new work is the example wiring + a committed tiny T5-encoder
-      fixture and a reproducible short clip. Defer classifier-free guidance and
-      the stereo/large checkpoints to a follow-up.
+      actually steers the generated music, then decodes the delay-pattern code
+      stack through the landed EnCodec decoder to a WAV via SaveVolumeToWav16.
+      LANDED: examples/MusicGenText/{MusicGenText.lpr,.lpi,README.md}; the
+      extended tools/musicgen_tiny_fixture.py now ALSO emits a matched T5
+      encoder fixture (tiny_musicgen_t5enc.*) and a matched EnCodec decoder
+      fixture (tiny_musicgen_encodec.*, codebook_size = MusicGen vocab, >=K
+      quantizers); regression test TestMusicGenTextWiring (deterministic codes
+      + waveform, and a different prompt steers the codes). NOTE: the pico
+      fixture amplifies the conditioning path (enc_to_dec_proj + decoder
+      cross-attention projections) so the prompt visibly steers a 16-way greedy
+      argmax over untrained random weights (the "re-randomize pico weights to a
+      useful scale" trick); the decoder logit-parity oracle is recomputed from
+      the SAME scaled state dict so TestMusicGenDecoderParity stays < 1e-4.
+  - [ ] Classifier-free guidance for MusicGen generation: the
+        unconditional/null-prompt branch + a guidance-scale blend of
+        conditional vs. unconditional logits, wired into
+        TMusicGenModel.Generate.
+  - [ ] Stereo MusicGen (audio_channels=2, the 2K-codebook layout) and a real
+        large downloaded musicgen-small checkpoint + a real tokenizer for the
+        text prompt; plus KV-cache incremental decode and top-k/temperature
+        sampling for the generation loop.
 - [ ] SeamlessM4T (v2) speech-to-text TRANSLATION importer
       (`BuildSeamlessM4TFromSafeTensors[Ex]`, `facebook/seamless-m4t-v2-large` /
       `hf-audio/…`) — multilingual speech translation, a capability the repo has
