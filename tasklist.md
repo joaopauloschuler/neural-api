@@ -394,16 +394,6 @@ rather than acted on.
       path needed). Pico parity vs a torchvision float64 oracle on the predicted
       flow + an examples/OpticalFlow that warps one tiny frame toward the next and
       writes a color-coded flow map. Unblocks video-stabilization / frame-interp work.
-- [ ] Image inpainting example (examples/Inpainting) — the repo has unconditional
-      (VisualGAN) and paired (Pix2Pix) image translation, but
-      NO free-form mask completion (fill a hole in an image from its surroundings).
-      Train a small context-encoder / partial-convolution U-Net that takes a masked
-      image + binary mask and reconstructs the missing region, supervised by
-      reconstruction loss (L1 + the landed SSIM loss) plus an optional adversarial
-      term reusing the VisualGAN discriminator wiring. New code is the random
-      rectangular-mask generator and the masked-region-weighted loss; the network is
-      stock conv encoder-decoder + skip connections. CPU-friendly on CIFAR-10 /
-      Tiny ImageNet; writes before/after triplets. Edit examples/README.md.
 - [ ] ControlNet spatial-conditioning importer (BuildControlNetFromSafeTensors, e.g.
       lllyasviel/sd-controlnet-canny) — adds spatial control (edge / depth / pose
       map -> image) to latent diffusion: a trainable COPY of the SD UNet encoder +
