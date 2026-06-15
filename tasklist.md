@@ -808,10 +808,16 @@ rather than acted on.
       sequence; defer the g2p/phonemizer front-end (document feeding pre-phonemized
       ids) and multi-voice blending to a follow-up. The new pieces are the
       style-conditioned duration predictor and the iSTFT decoder tail.
-- [ ] Classifier-free guidance for MusicGen generation (follow-up to the landed
+- [X] Classifier-free guidance for MusicGen generation (follow-up to the landed
       text-conditioned examples/MusicGenText): the unconditional/null-prompt
       branch + a guidance-scale blend of conditional vs. unconditional logits,
-      wired into TMusicGenModel.Generate.
+      wired into TMusicGenModel.Generate. DONE: TMusicGenModel.GenerateCFG
+      (EncStates, UncondStates, NumFrames, GuidanceScale, out Codes) runs the
+      decoder twice/step and blends guided = uncond + scale*(cond - uncond)
+      before argmax; Generate delegates to it (scale 1.0, nil uncond = plain
+      greedy, bit-identical). null branch = zeroed text condition (HF). Test
+      TestMusicGenCFG (scale-1.0/nil/zero-uncond == plain; scale-3.0 shifts a
+      code) + examples/MusicGenText --guidance N flag + examples/README.md.
 - [ ] Stereo MusicGen (audio_channels=2, the 2K-codebook layout) and a real
       large downloaded musicgen-small checkpoint + a real tokenizer for the
       text prompt; plus KV-cache incremental decode and top-k/temperature

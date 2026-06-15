@@ -313,6 +313,11 @@ type
     // DETERMINISTIC (same prompt -> identical codes + waveform), and that a
     // DIFFERENT prompt steers the output (the text conditioning is live).
     procedure TestMusicGenTextWiring;
+    // Classifier-free guidance (TMusicGenModel.GenerateCFG): asserts that
+    // GuidanceScale=1.0 (and nil uncond) reproduces plain Generate
+    // bit-identically, and that a guidance pass with a different uncond
+    // condition shifts at least one emitted code (the blend is wired).
+    procedure TestMusicGenCFG;
     procedure TestClipConfigFromJSONFile;
     procedure TestClipParity;
     procedure TestClapParity;
@@ -13064,6 +13069,111 @@ begin
       if CodesA[k_i][t] <> CodesB[k_i][t] then Inc(diff);
   AssertTrue('a different prompt steers the generated codes (diff > 0)',
     diff > 0);
+end;
+
+procedure TTestNeuralPretrained.TestMusicGenCFG;
+
+  // Encodes Ids through the real T5 text encoder into EncStates.
+  procedure EncodePrompt(const Ids: array of integer; EncStates: TNNetVolume;
+    out Config: TMusicGenConfig);
+  var
+    T5Enc, T5Dec: TNNet;
+    T5Cfg: TT5Config;
+    Tokens: TNNetVolume;
+    EncSeq, i: integer;
+  begin
+    EncSeq := Length(Ids);
+    T5Enc := nil; T5Dec := nil;
+    Tokens := TNNetVolume.Create;
+    try
+      BuildT5FromSafeTensors(FixturePath('tiny_musicgen_t5enc.safetensors'),
+        T5Enc, T5Dec, T5Cfg, EncSeq, 1, {pInferenceOnly=}true,
+        FixturePath('tiny_musicgen_t5enc_config.json'));
+      Tokens.ReSize(EncSeq, 1, 1);
+      for i := 0 to EncSeq - 1 do Tokens.FData[i] := Ids[i];
+      T5Enc.Compute(Tokens);
+      EncStates.Copy(T5Enc.GetLastLayer.Output);
+      Config := ReadMusicGenConfigFromJSONFile(
+        FixturePath('tiny_musicgen_config.json'));
+    finally
+      T5Enc.Free;
+      T5Dec.Free;
+      Tokens.Free;
+    end;
+  end;
+
+const
+  NumFrames = 6;
+var
+  Cond, Uncond, Zero: TNNetVolume;
+  Config, Cfg2: TMusicGenConfig;
+  Model: TMusicGenModel;
+  DecSeq, k_i, t, diff: integer;
+  CodesPlain, CodesScale1, CodesZeroUncond, CodesNilUncond,
+    CodesGuided: TNNetIntArr2D;
+begin
+  RandSeed := 424242;
+  Cond := TNNetVolume.Create;
+  Uncond := TNNetVolume.Create;
+  Zero := TNNetVolume.Create;
+  Model := nil;
+  try
+    EncodePrompt([3, 8, 1, 5, 2], Cond, Config);
+    // A DIFFERENT prompt provides a non-trivial unconditional condition so the
+    // blend demonstrably shifts the argmax.
+    EncodePrompt([9, 0, 4, 7, 6], Uncond, Cfg2);
+    Zero.ReSize(Cond.SizeX, Cond.SizeY, Cond.Depth);
+    Zero.Fill(0);
+
+    DecSeq := NumFrames + Config.NumCodebooks - 1 + 1;
+    Model := BuildMusicGenFromSafeTensors(
+      FixturePath('tiny_musicgen.safetensors'), Config, Length([3, 8, 1, 5, 2]),
+      DecSeq, {pInferenceOnly=}true, FixturePath('tiny_musicgen_config.json'));
+
+    Model.Generate(Cond, NumFrames, CodesPlain);
+
+    // (a) GuidanceScale=1.0 reproduces plain Generate bit-identically.
+    Model.GenerateCFG(Cond, Uncond, NumFrames, 1.0, CodesScale1);
+    diff := 0;
+    for k_i := 0 to Length(CodesPlain) - 1 do
+      for t := 0 to NumFrames - 1 do
+        if CodesPlain[k_i][t] <> CodesScale1[k_i][t] then Inc(diff);
+    AssertEquals('GuidanceScale=1.0 == plain Generate (codes)', 0, diff);
+
+    // nil uncond states also fall back to the plain path bit-identically,
+    // even at a high scale.
+    Model.GenerateCFG(Cond, nil, NumFrames, 3.0, CodesNilUncond);
+    diff := 0;
+    for k_i := 0 to Length(CodesPlain) - 1 do
+      for t := 0 to NumFrames - 1 do
+        if CodesPlain[k_i][t] <> CodesNilUncond[k_i][t] then Inc(diff);
+    AssertEquals('nil uncond == plain Generate (codes)', 0, diff);
+
+    // A zeroed (null) uncond condition at scale 1.0 is also identical to plain
+    // (scale 1 cancels the uncond term regardless of its value).
+    Model.GenerateCFG(Cond, Zero, NumFrames, 1.0, CodesZeroUncond);
+    diff := 0;
+    for k_i := 0 to Length(CodesPlain) - 1 do
+      for t := 0 to NumFrames - 1 do
+        if CodesPlain[k_i][t] <> CodesZeroUncond[k_i][t] then Inc(diff);
+    AssertEquals('zero uncond at scale 1.0 == plain Generate (codes)',
+      0, diff);
+
+    // (b) A guidance pass (scale 3.0) with a DIFFERENT uncond condition shifts
+    // at least one emitted code: the blend is wired and moves the argmax.
+    Model.GenerateCFG(Cond, Uncond, NumFrames, 3.0, CodesGuided);
+    diff := 0;
+    for k_i := 0 to Length(CodesPlain) - 1 do
+      for t := 0 to NumFrames - 1 do
+        if CodesPlain[k_i][t] <> CodesGuided[k_i][t] then Inc(diff);
+    AssertTrue('CFG (scale 3.0) shifts at least one code (diff > 0)',
+      diff > 0);
+  finally
+    Cond.Free;
+    Uncond.Free;
+    Zero.Free;
+    Model.Free;
+  end;
 end;
 
 // Verifies the log-mel FRONTEND (neural/neuralaudio.pas) against HF

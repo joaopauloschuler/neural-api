@@ -4420,6 +4420,17 @@ type
     // [0,NumFrames-1]). Coded by Claude (AI).
     procedure Generate(EncStates: TNNetVolume; NumFrames: integer;
       out Codes: TNNetIntArr2D);
+    // Classifier-free-guidance variant of Generate. At each decode step the
+    // decoder is run TWICE - once with the real conditional EncStates and once
+    // with the unconditional UncondStates (HF feeds a zeroed text condition) -
+    // and the per-codebook logits are blended as
+    //   guided = uncond + GuidanceScale * (cond - uncond)
+    // before the argmax. When GuidanceScale <= 1.0 or UncondStates is nil this
+    // is bit-identical to plain Generate (the uncond branch is skipped). A
+    // typical MusicGen GuidanceScale is 3.0. Coded by Claude (AI).
+    procedure GenerateCFG(EncStates, UncondStates: TNNetVolume;
+      NumFrames: integer; GuidanceScale: TNeuralFloat;
+      out Codes: TNNetIntArr2D);
   end;
 
 // Applies the MusicGen delay pattern to a raw code stack: Raw[k][t] (K rows,
@@ -25393,13 +25404,26 @@ end;
 
 procedure TMusicGenModel.Generate(EncStates: TNNetVolume; NumFrames: integer;
   out Codes: TNNetIntArr2D);
+begin
+  // Plain greedy decode is GenerateCFG with no guidance (uncond branch off).
+  GenerateCFG(EncStates, nil, NumFrames, 1.0, Codes);
+end;
+
+procedure TMusicGenModel.GenerateCFG(EncStates, UncondStates: TNNetVolume;
+  NumFrames: integer; GuidanceScale: TNeuralFloat;
+  out Codes: TNNetIntArr2D);
 var
-  EncHidden, Logits: TNNetVolume;
+  EncHidden, UncondHidden, Logits, UncondLogits: TNNetVolume;
   Delayed: TNNetIntArr2D;
-  PadId, Steps, step, k_i, v, best, t, base: integer;
-  bestVal, vv: TNeuralFloat;
+  PadId, Steps, step, k_i, v, best, t, base, idx: integer;
+  bestVal, vv, condVal, uncondVal: TNeuralFloat;
+  UseGuidance: boolean;
 begin
   PadId := FConfig.VocabSize;
+  // Guidance is active only when scaled above 1.0 AND an uncond prompt was
+  // supplied; otherwise the loop is the plain greedy path (no second decode,
+  // bit-identical output).
+  UseGuidance := (GuidanceScale > 1.0) and (UncondStates <> nil);
   // Delayed column 0 is the shared BOS prompt; real frames occupy columns
   // 1..NumFrames+K-1 (codebook k's frame f at column f+k+1). The decode runs
   // Steps = NumFrames + K - 1 steps to fill them all (predicting column s+1
@@ -25410,9 +25434,13 @@ begin
       ' exceeds DecSeqLen ' + IntToStr(FDecSeqLen) +
       ' (rebuild the model with a larger DecSeqLen).');
   EncHidden := TNNetVolume.Create;
+  UncondHidden := TNNetVolume.Create;
   Logits := TNNetVolume.Create;
+  UncondLogits := TNNetVolume.Create;
   try
     ProjectEncoderStates(EncStates, EncHidden);
+    if UseGuidance then
+      ProjectEncoderStates(UncondStates, UncondHidden);
     // Delayed[k][s] holds the (delay-shifted) decoder input id at step s;
     // initialise every slot to PadId (the start-of-sequence pad).
     SetLength(Delayed, FConfig.NumCodebooks);
@@ -25430,6 +25458,8 @@ begin
     for step := 0 to Steps - 1 do
     begin
       ComputeLogits(Delayed, EncHidden, Logits);
+      if UseGuidance then
+        ComputeLogits(Delayed, UncondHidden, UncondLogits);
       t := step + 1; // the delayed column being predicted this step
       for k_i := 0 to FConfig.NumCodebooks - 1 do
       begin
@@ -25439,14 +25469,30 @@ begin
         if (t < FDecSeqLen) and (t >= k_i + 1) and
            (t - k_i - 1 < NumFrames) then
         begin
-          base := k_i * FConfig.VocabSize;
+          base := step * (FConfig.NumCodebooks * FConfig.VocabSize) +
+            k_i * FConfig.VocabSize;
           best := 0;
-          bestVal := Logits.FData[step * (FConfig.NumCodebooks *
-            FConfig.VocabSize) + base];
+          // The guided logit for token v is
+          //   uncond[v] + scale * (cond[v] - uncond[v]).
+          condVal := Logits.FData[base];
+          if UseGuidance then
+          begin
+            uncondVal := UncondLogits.FData[base];
+            bestVal := uncondVal + GuidanceScale * (condVal - uncondVal);
+          end
+          else
+            bestVal := condVal;
           for v := 1 to FConfig.VocabSize - 1 do
           begin
-            vv := Logits.FData[step * (FConfig.NumCodebooks *
-              FConfig.VocabSize) + base + v];
+            idx := base + v;
+            condVal := Logits.FData[idx];
+            if UseGuidance then
+            begin
+              uncondVal := UncondLogits.FData[idx];
+              vv := uncondVal + GuidanceScale * (condVal - uncondVal);
+            end
+            else
+              vv := condVal;
             if vv > bestVal then begin bestVal := vv; best := v; end;
           end;
           Delayed[k_i][t] := best;
@@ -25464,7 +25510,9 @@ begin
     end;
   finally
     EncHidden.Free;
+    UncondHidden.Free;
     Logits.Free;
+    UncondLogits.Free;
   end;
 end;
 

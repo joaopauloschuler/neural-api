@@ -70,12 +70,27 @@ var
   Config: TMusicGenConfig;
   Codec: TEnCodecModel;
   CodecCfg: TEnCodecConfig;
-  Tokens, EncStates, Wave: TNNetVolume;
+  Tokens, EncStates, NullStates, Wave: TNNetVolume;
   Codes: TNNetIntArr2D;
   Waveform: TNeuralFloatDynArr;
   EncSeq, DecSeq, NumFrames, k_i, t, i: integer;
   MgSafe, MgCfg, T5Safe, T5CfgPath, EcSafe, EcCfg: string;
   Ids: array of integer;
+  GuidanceScale: TNeuralFloat;
+
+  // Reads an optional "--guidance N" CLI flag (classifier-free-guidance scale,
+  // MusicGen's default is 3.0). Returns 1.0 (no guidance) when absent.
+  function ParseGuidance: TNeuralFloat;
+  var
+    a: integer;
+    v: TNeuralFloat;
+  begin
+    Result := 1.0;
+    for a := 1 to ParamCount - 1 do
+      if (ParamStr(a) = '--guidance') and TryStrToFloat(ParamStr(a + 1), v) then
+        Result := v;
+  end;
+
 begin
   // A fixed pseudo-prompt: a short list of token ids standing in for a real
   // tokenizer's encoding of a text prompt. Any ids in [0, T5 vocab) are valid.
@@ -109,7 +124,9 @@ begin
   T5Enc := nil; T5Dec := nil; Model := nil; Codec := nil;
   Tokens := TNNetVolume.Create;
   EncStates := TNNetVolume.Create;
+  NullStates := TNNetVolume.Create;
   Wave := TNNetVolume.Create;
+  GuidanceScale := ParseGuidance;
   try
     // --- 1. Build the REAL T5 text encoder and run it on the prompt ids. ---
     BuildT5FromSafeTensors(T5Safe, T5Enc, T5Dec, T5Cfg, EncSeq, 1,
@@ -148,7 +165,19 @@ begin
 
     WriteLn('Generating ', NumFrames, ' frames over ', Config.NumCodebooks,
       ' codebooks via the delay pattern (conditioned on the T5 prompt)...');
-    Model.Generate(EncStates, NumFrames, Codes);
+    if GuidanceScale > 1.0 then
+    begin
+      // Classifier-free guidance: the unconditional branch is a ZEROED text
+      // condition of the same shape (HF feeds an empty/zeroed prompt with its
+      // attention mask zeroed). Blend: uncond + scale*(cond - uncond).
+      NullStates.ReSize(EncStates.SizeX, EncStates.SizeY, EncStates.Depth);
+      NullStates.Fill(0);
+      WriteLn('Classifier-free guidance ON (scale = ',
+        GuidanceScale:0:2, ', null = zeroed text condition).');
+      Model.GenerateCFG(EncStates, NullStates, NumFrames, GuidanceScale, Codes);
+    end
+    else
+      Model.Generate(EncStates, NumFrames, Codes);
     WriteLn('Generated code stack (codebook x frame):');
     for k_i := 0 to Config.NumCodebooks - 1 do
     begin
@@ -188,6 +217,7 @@ begin
     Codec.Free;
     Tokens.Free;
     EncStates.Free;
+    NullStates.Free;
     Wave.Free;
   end;
 end.
