@@ -1188,7 +1188,7 @@ rather than acted on.
       first sharp, boundary-accurate, metric-depth model in the tree. Pico-fixture
       smoke + a real-checkpoint parity follow-up.
 
-- [ ] Latent Consistency Model (LCM) few-step sampler in neuraldiffusion.pas
+- [X] Latent Consistency Model (LCM) few-step sampler in neuraldiffusion.pas
       (TNNetLCMScheduler / LCMSample). The landed diffusion samplers (DDIM,
       DPM-Solver++(2M), Euler/Euler-ancestral, Karras spacing) are all ITERATIVE
       noise-prediction integrators needing ~20-50 steps and CFG-in-the-loop; an LCM
