@@ -27,6 +27,7 @@ examples/VQVAE/VQVAE
 examples/VQVAE/diag
 examples/ConditionalDiffusion/ConditionalDiffusion
 examples/VideoActionTiny/VideoActionTiny
+examples/VideoAction/VideoAction
 link*.res
 autosave.csv
 autosave.nn

@@ -421,7 +421,18 @@ rather than acted on.
       rectangular-mask generator and the masked-region-weighted loss; the network is
       stock conv encoder-decoder + skip connections. CPU-friendly on CIFAR-10 /
       Tiny ImageNet; writes before/after triplets. Edit examples/README.md.
-- [ ] VideoMAE / TimeSformer spatiotemporal-transformer importer
+- [X] VideoMAE / TimeSformer spatiotemporal-transformer importer
+      (LANDED: BuildVideoMAEFromSafeTensors[Ex/WithConfig] +
+      ReadVideoMAEConfigFromJSONFile + RunVideoMAELogits in neuralpretrained.pas;
+      tubelet 3-D conv (TNNetConvolution3D, non-overlapping temporal stride via
+      SplitChannels+DeepConcat) + fixed sin-cos 3-D position table + stock CLIP
+      pre-LN encoder (joint space-time attention) + mean-pool/fc_norm/classifier
+      head; use_mean_pooling=True finetuned head only. Pico float64 parity
+      TestVideoMAEClassificationParity (max|diff| < 1e-4) + tools/
+      make_pico_videomae_fixture.py + examples/VideoAction. Open follow-ups:
+      use_mean_pooling=False CLS-token head; DIVIDED space-time attention
+      (TimeSformer); the masked-pretraining VideoMAEModel/decoder path.)
+  OLD: VideoMAE / TimeSformer spatiotemporal-transformer importer
       (BuildVideoMAEFromSafeTensors, e.g. MCG-NJU/videomae-base-finetuned-kinetics)
       — the FIRST video-classification importer (a clip of T frames -> an action
       label), the natural pay-off of the landed TNNetConvolution3D layer. Tubelet

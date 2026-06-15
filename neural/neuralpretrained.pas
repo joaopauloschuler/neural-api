@@ -6714,6 +6714,90 @@ function LoadPEFTLoRAModule(Reader: TNNetSafeTensorsReader;
   ADown, BUp: TNNetLayer; const ModuleName: string;
   Scale: TNeuralFloat = 1.0): string;
 
+// ===========================================================================
+// VideoMAE / TimeSformer VIDEO-CLASSIFICATION IMPORT (model_type "videomae":
+// MCG-NJU/videomae-base-finetuned-kinetics and siblings) - the repo's FIRST
+// video-classification importer (a clip of T frames -> an action label) and
+// the pay-off of the landed TNNetConvolution3D layer. A clip is patchified
+// into non-overlapping T x P x P space-time TUBELETS by a 3-D conv (kernel =
+// stride = (tubelet_size, patch, patch), no pad), producing a
+// (T' x H' x W') grid of hidden-dim tokens (T' = T/tubelet_size,
+// H' = W' = image_size/patch_size). A FIXED sin-cos 3-D position table (NOT
+// learned, NOT in the checkpoint) is ADDED, then the STOCK pre-LN transformer
+// encoder (the CLIP/BERT path: separate biased q/k/v, 1/sqrt(head_dim) JOINT
+// space-time attention over ALL tokens, biased out/fc1/fc2, exact-erf GELU,
+// layernorm_before/after) runs, and the finetuned model MEAN-POOLS the tokens
+// -> fc_norm (LayerNorm) -> a biased Linear classifier -> action logits.
+//
+// VideoMAE-base-finetuned uses use_mean_pooling=True: there is NO final
+// encoder LayerNorm; the only post-encoder norm is fc_norm over the pooled
+// vector (use_mean_pooling=False / a CLS-token head is NOT supported - those
+// checkpoints carry a "videomae.layernorm" tensor and no "fc_norm").
+//
+// FRAME PACKING (TNNetConvolution3D convention): the (T, H, W, C) clip is the
+// (W, H, T*C) input volume with the C channels of frame t contiguous at depth
+// [t*C .. t*C+C). The Conv3D output is (W', H', T'*hidden); a Reshape gives
+// the token sequence in the NATIVE (h, w, t) order (token (h*W'+w)*T'+t). HF
+// flattens its conv as flatten(2).transpose(1,2) -> token order (t, h, w)
+// (token t*H'*W' + h*W' + w). Because attention is FULLY JOINT and the head
+// MEAN-POOLS, the ordering only matters for the per-token position add: the
+// importer fills the position table so native row (h*W'+w)*T'+t carries the
+// sin-cos row for HF index t*H'*W'+h*W'+w (exact match, no transpose layer).
+//
+// Output modality: (1, 1, num_labels) action-class logits. Run one forward
+// with RunVideoMAELogits(Net, ClipInput) (a thin Compute wrapper).
+// ---------------------------------------------------------------------------
+type
+  TVideoMAEConfig = record
+    ImageSize: integer;         // image_size (square)
+    PatchSize: integer;         // patch_size (spatial)
+    NumChannels: integer;       // num_channels (3)
+    NumFrames: integer;         // num_frames (clip length T)
+    TubeletSize: integer;       // tubelet_size (temporal patch)
+    HiddenSize: integer;        // hidden_size
+    IntermediateSize: integer;  // intermediate_size (fc1 width)
+    NumLayers: integer;         // num_hidden_layers
+    NumHeads: integer;          // num_attention_heads
+    NumLabels: integer;         // num_labels (action classes)
+    LayerNormEps: TNeuralFloat; // layer_norm_eps (1e-12 default; -kinetics 1e-6)
+    ModelType: string;          // 'videomae'
+  end;
+
+// Reads a HF VideoMAE config.json (model_type "videomae"). Required:
+// hidden_size, intermediate_size, num_hidden_layers, num_attention_heads,
+// image_size, patch_size, num_frames. Defaults follow VideoMAEConfig:
+// num_channels 3, tubelet_size 2, layer_norm_eps 1e-12, num_labels 0
+// (num_labels also inferred from len(id2label) when present). qkv_bias is
+// assumed true (every published VideoMAE). use_mean_pooling=False is rejected.
+function ReadVideoMAEConfigFromJSONFile(const FileName: string): TVideoMAEConfig;
+
+function VideoMAEConfigToString(const Config: TVideoMAEConfig): string;
+
+// Builds the VideoMAE video-classification net described by Config and loads
+// every weight from the checkpoint at FileName (.safetensors / sharded index /
+// pytorch_model.bin via CreatePretrainedTensorReader). The net consumes a
+// (image_size, image_size, num_frames*num_channels) clip volume (frame t's C
+// channels contiguous at depth [t*C..t*C+C)) and outputs (1, 1, num_labels)
+// action logits. The caller owns the net. pInferenceOnly frees training
+// volumes during construction.
+function BuildVideoMAEFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TVideoMAEConfig; pInferenceOnly: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+function BuildVideoMAEFromSafeTensorsEx(const FileName: string;
+  out Config: TVideoMAEConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// Same, discarding the config.
+function BuildVideoMAEFromSafeTensors(const FileName: string;
+  pInferenceOnly: boolean = false): TNNet;
+
+// Runs one forward pass of a BuildVideoMAEFromSafeTensors net over the clip
+// volume ClipInput ((image_size,image_size,num_frames*num_channels)) and
+// copies the (1,1,num_labels) action logits into Logits. Forward only.
+procedure RunVideoMAELogits(Net: TNNet; ClipInput, Logits: TNNetVolume);
+
 implementation
 
 procedure ImportError(const Msg: string);
@@ -42368,6 +42452,376 @@ begin
     for y := 0 to Config.LatentSize - 1 do
       for c := 0 to Config.InChannels - 1 do
         EpsOut[x, y, c] := Output[x, y, c];
+end;
+
+// ============================ VideoMAE IMPORT ==============================
+// Coded by Claude (AI).
+
+function ReadVideoMAEConfigFromJSONFile(
+  const FileName: string): TVideoMAEConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, Id2Label: TJSONObject;
+  ModelType, HiddenAct: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('VideoMAE import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('VideoMAE import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('VideoMAE import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('VideoMAE import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('VideoMAE import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'videomae');
+    if ModelType <> 'videomae' then
+      ImportError('VideoMAE import: config model_type is "' + ModelType +
+        '" - expected "videomae".');
+    if not Obj.Get('use_mean_pooling', True) then
+      ImportError('VideoMAE import: use_mean_pooling=False (a CLS-token ' +
+        'head) is not supported - only the mean-pool + fc_norm finetuned ' +
+        'head is wired here.');
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.ImageSize := RequiredInt('image_size');
+    Result.PatchSize := RequiredInt('patch_size');
+    Result.NumFrames := RequiredInt('num_frames');
+    Result.NumChannels := Obj.Get('num_channels', 3);
+    Result.TubeletSize := Obj.Get('tubelet_size', 2);
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1.0e-12);
+    HiddenAct := Obj.Get('hidden_act', 'gelu');
+    if (HiddenAct <> 'gelu') then
+      ImportError('VideoMAE import: config hidden_act "' + HiddenAct +
+        '" is not supported - only the exact-erf "gelu" is wired here.');
+    // num_labels: explicit field, else len(id2label).
+    Result.NumLabels := Obj.Get('num_labels', 0);
+    if (Result.NumLabels <= 0) and
+       (Obj.Find('id2label') is TJSONObject) then
+    begin
+      Id2Label := TJSONObject(Obj.Find('id2label'));
+      Result.NumLabels := Id2Label.Count;
+    end;
+    if Result.NumLabels <= 0 then
+      ImportError('VideoMAE import: config has neither a positive ' +
+        '"num_labels" nor an "id2label" map.');
+    if (Result.TubeletSize < 1) or
+       ((Result.NumFrames mod Result.TubeletSize) <> 0) then
+      ImportError('VideoMAE import: num_frames=' +
+        IntToStr(Result.NumFrames) + ' is not a multiple of tubelet_size=' +
+        IntToStr(Result.TubeletSize) + '.');
+    if (Result.PatchSize < 1) or
+       ((Result.ImageSize mod Result.PatchSize) <> 0) then
+      ImportError('VideoMAE import: image_size=' +
+        IntToStr(Result.ImageSize) + ' is not a multiple of patch_size=' +
+        IntToStr(Result.PatchSize) + '.');
+    if (Result.NumHeads < 1) or
+       ((Result.HiddenSize mod Result.NumHeads) <> 0) then
+      ImportError('VideoMAE import: hidden_size=' +
+        IntToStr(Result.HiddenSize) + ' is not divisible by ' +
+        'num_attention_heads=' + IntToStr(Result.NumHeads) + '.');
+    Result.ModelType := ModelType;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function VideoMAEConfigToString(const Config: TVideoMAEConfig): string;
+begin
+  Result :=
+    'VideoMAE(' + Config.ModelType +
+    ' image=' + IntToStr(Config.ImageSize) +
+    ' patch=' + IntToStr(Config.PatchSize) +
+    ' channels=' + IntToStr(Config.NumChannels) +
+    ' frames=' + IntToStr(Config.NumFrames) +
+    ' tubelet=' + IntToStr(Config.TubeletSize) +
+    ' hidden=' + IntToStr(Config.HiddenSize) +
+    ' inter=' + IntToStr(Config.IntermediateSize) +
+    ' layers=' + IntToStr(Config.NumLayers) +
+    ' heads=' + IntToStr(Config.NumHeads) +
+    ' labels=' + IntToStr(Config.NumLabels) +
+    ' eps=' + FloatToStr(Config.LayerNormEps) + ')';
+end;
+
+// Loads the tubelet 3-D conv weight (HF nn.Conv3d, [hidden, C, tubelet, P, P])
+// into a TNNetConvolution3D built with kernel (tubelet, P, P) on the
+// (image, image, frames*C) clip. CAI neuron weights are
+// (kx, ky, kt*C+c)-indexed -> flat (ky*P+kx)*(tubelet*C) + kt*C + c; HF
+// kernels [o, c, kt, ky, kx]-indexed.
+procedure LoadVideoMAETubeletConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string;
+  NumChannels, Tubelet, Patch, Hidden: integer);
+var
+  W, B: TNNetVolume;
+  o, c, kt, ky, kx: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('VideoMAE import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 5) or
+     (Reader.DimSize(WName, 0) <> Hidden) or
+     (Reader.DimSize(WName, 1) <> NumChannels) or
+     (Reader.DimSize(WName, 2) <> Tubelet) or
+     (Reader.DimSize(WName, 3) <> Patch) or
+     (Reader.DimSize(WName, 4) <> Patch) then
+    ImportError('VideoMAE import: "' + WName + '" must have shape [' +
+      IntToStr(Hidden) + ', ' + IntToStr(NumChannels) + ', ' +
+      IntToStr(Tubelet) + ', ' + IntToStr(Patch) + ', ' + IntToStr(Patch) +
+      '] (nn.Conv3d [out, in, kt, kh, kw]), got ' +
+      Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> Hidden then
+    ImportError('VideoMAE import: internal error - tubelet conv has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(Hidden) + '.');
+  if Layer.Neurons[0].Weights.Size <> Tubelet * Patch * Patch * NumChannels then
+    ImportError('VideoMAE import: internal error - tubelet conv neuron has ' +
+      IntToStr(Layer.Neurons[0].Weights.Size) + ' weights, expected ' +
+      IntToStr(Tubelet * Patch * Patch * NumChannels) + '.');
+  if not Reader.HasTensor(BName) then
+    ImportError('VideoMAE import: missing tensor "' + BName + '".');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    Reader.LoadTensorFlat(BName, B);
+    if B.Size <> Hidden then
+      ImportError('VideoMAE import: "' + BName + '" must have ' +
+        IntToStr(Hidden) + ' elements, got ' + IntToStr(B.Size) + '.');
+    for o := 0 to Hidden - 1 do
+    begin
+      for kt := 0 to Tubelet - 1 do
+        for ky := 0 to Patch - 1 do
+          for kx := 0 to Patch - 1 do
+            for c := 0 to NumChannels - 1 do
+              Layer.Neurons[o].Weights.FData[
+                (ky * Patch + kx) * (Tubelet * NumChannels) +
+                kt * NumChannels + c] :=
+                W.FData[(((o * NumChannels + c) * Tubelet + kt) * Patch + ky)
+                  * Patch + kx];
+      Layer.Neurons[o].BiasWeight := B.FData[o];
+    end;
+  finally
+    W.Free;
+    B.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+// Fills PosEmb's single-neuron table with the FIXED sin-cos 3-D position
+// table (HF get_sinusoid_encoding_table(num_tokens, hidden)) in the NATIVE
+// (h, w, t) token order: native row (h*W'+w)*T'+t gets the sin-cos row for
+// HF index t*H'*W' + h*W' + w. sinusoid[pos][j] = sin(angle) for even j,
+// cos(angle) for odd j, angle = pos / 10000^(2*(j div 2)/hidden).
+procedure FillVideoMAEPosTable(PosEmb: TNNetLayer;
+  TGrid, HGrid, WGrid, Hidden: integer);
+var
+  tt, hh, ww, j, NativeRow, HFPos: integer;
+  Angle, Power: double;
+  Tbl: TNNetVolume;
+begin
+  Tbl := PosEmb.Neurons[0].Weights;
+  for tt := 0 to TGrid - 1 do
+    for hh := 0 to HGrid - 1 do
+      for ww := 0 to WGrid - 1 do
+      begin
+        NativeRow := (hh * WGrid + ww) * TGrid + tt;
+        HFPos := (tt * HGrid + hh) * WGrid + ww;
+        for j := 0 to Hidden - 1 do
+        begin
+          Power := Exp((2 * (j div 2) / Hidden) * Ln(10000.0));
+          Angle := HFPos / Power;
+          if (j and 1) = 0 then
+            Tbl.FData[NativeRow * Hidden + j] := Sin(Angle)
+          else
+            Tbl.FData[NativeRow * Hidden + j] := Cos(Angle);
+        end;
+      end;
+  PosEmb.FlushWeightCache();
+end;
+
+function BuildVideoMAEFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TVideoMAEConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  TubeletConv, PosEmb, FcNorm, Classifier: TNNetLayer;
+  TubeletSlices: array of TNNetLayer;
+  Blocks: TClipBlockLayersArray;
+  Tower: TClipTowerConfig;
+  HGrid, WGrid, TGrid, NumTokens, BlockCnt: integer;
+  Prefix, BP: string;
+  d: integer;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  try
+    try
+      HGrid := Config.ImageSize div Config.PatchSize;
+      WGrid := HGrid;
+      TGrid := Config.NumFrames div Config.TubeletSize;
+      NumTokens := TGrid * HGrid * WGrid;
+      d := Config.HiddenSize;
+      Prefix := 'videomae.';
+
+      // Reuse the CLIP/BERT pre-LN encoder block (exact-erf GELU joint attn).
+      Tower.HiddenSize := Config.HiddenSize;
+      Tower.IntermediateSize := Config.IntermediateSize;
+      Tower.NumLayers := Config.NumLayers;
+      Tower.NumHeads := Config.NumHeads;
+      Tower.LayerNormEps := Config.LayerNormEps;
+      Tower.HiddenAct := chaGeluExact;
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      // Clip volume: (W, H, T*C), frame t's C channels at depth [t*C..t*C+C).
+      NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+        Config.NumFrames * Config.NumChannels) );
+      // Tubelet 3-D conv: spatial kernel = stride = patch (no pad), temporal
+      // kernel = tubelet. The Conv3D has no temporal STRIDE - it emits every
+      // overlapping output frame OutT = T - tubelet + 1, output volume
+      // (W', H', OutT*hidden) with frame ot's hidden channels at depth
+      // [ot*hidden .. ot*hidden+hidden). VideoMAE's tubelets are
+      // NON-overlapping (temporal stride = tubelet), so we select only the
+      // T' = T/tubelet frames {0, tubelet, 2*tubelet, ...}: frame k's depth
+      // slab is [k*tubelet*hidden .. +hidden). T' depth-slices concatenated
+      // give the (W', H', T'*hidden) tubelet grid (last slice ot = T-tubelet
+      // = OutT-1 exists exactly).
+      TubeletConv := NN.AddLayer( TNNetConvolution3D.Create(
+        Config.HiddenSize, Config.TubeletSize, Config.PatchSize,
+        {pInputPadding=}0, {pStride=}Config.PatchSize, Config.NumChannels) );
+      if TGrid = 1 then
+        // Single tubelet: keep the first (and only) output frame's hidden slab.
+        NN.AddLayer( TNNetSplitChannels.Create(0, Config.HiddenSize) )
+      else
+      begin
+        SetLength(TubeletSlices, TGrid);
+        for BlockCnt := 0 to TGrid - 1 do
+          TubeletSlices[BlockCnt] := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(
+              BlockCnt * Config.TubeletSize * Config.HiddenSize,
+              Config.HiddenSize), TubeletConv);
+        NN.AddLayer( TNNetDeepConcat.Create(TubeletSlices) );
+      end;
+      // Now (W', H', T'*hidden); reshape to the token sequence
+      // (W'*H'*T', 1, hidden) in native (h, w, t) order (token (h*W'+w)*T'+t).
+      NN.AddLayer( TNNetReshape.Create(NumTokens, 1, Config.HiddenSize) );
+      PosEmb := NN.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(NumTokens) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      SetLength(Blocks, Config.NumLayers);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+        AddClipEncoderBlock(NN, Tower, {CausalMask=}false,
+          Blocks[BlockCnt], pInferenceOnly);
+
+      // Mean-pool over all tokens -> (1,1,hidden). TNNetAvgChannel averages
+      // the SizeX*SizeY=NumTokens cells per hidden channel (SizeY=1).
+      NN.AddLayer( TNNetAvgChannel.Create() );
+      FcNorm := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      Classifier := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.NumLabels) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      LoadVideoMAETubeletConv(Reader, TubeletConv,
+        Prefix + 'embeddings.patch_embeddings.projection.weight',
+        Prefix + 'embeddings.patch_embeddings.projection.bias',
+        Config.NumChannels, Config.TubeletSize, Config.PatchSize,
+        Config.HiddenSize);
+      FillVideoMAEPosTable(PosEmb, TGrid, HGrid, WGrid, Config.HiddenSize);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BP := Prefix + 'encoder.layer.' + IntToStr(BlockCnt) + '.';
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].LN1,
+          BP + 'layernorm_before.weight', BP + 'layernorm_before.bias', d);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV,
+          BP + 'attention.attention.query.weight', d, d, 0, 3 * d, 0,
+          BP + 'attention.attention.query.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV,
+          BP + 'attention.attention.key.weight', d, d, d, 3 * d, 0,
+          BP + 'attention.attention.key.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV,
+          BP + 'attention.attention.value.weight', d, d, 2 * d, 3 * d, 0,
+          BP + 'attention.attention.value.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttnDense,
+          BP + 'attention.output.dense.weight', d, d, 0, -1, 0,
+          BP + 'attention.output.dense.bias');
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].LN2,
+          BP + 'layernorm_after.weight', BP + 'layernorm_after.bias', d);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Inter,
+          BP + 'intermediate.dense.weight', d, Config.IntermediateSize,
+          0, -1, 0, BP + 'intermediate.dense.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OutDense,
+          BP + 'output.dense.weight', Config.IntermediateSize, d, 0, -1, 0,
+          BP + 'output.dense.bias');
+      end;
+      LoadLayerNormWeights(Reader, FcNorm,
+        'fc_norm.weight', 'fc_norm.bias', d);
+      LoadLlamaLinearWeights(Reader, Classifier, 'classifier.weight',
+        d, Config.NumLabels, 0, -1, 0, 'classifier.bias');
+
+      Result := NN;
+      NN := nil;
+    except
+      NN.Free;
+      raise;
+    end;
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildVideoMAEFromSafeTensorsEx(const FileName: string;
+  out Config: TVideoMAEConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadVideoMAEConfigFromJSONFile(ConfigPath);
+  Result := BuildVideoMAEFromSafeTensorsWithConfig(FileName, Config,
+    pInferenceOnly);
+end;
+
+function BuildVideoMAEFromSafeTensors(const FileName: string;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  IgnoredConfig: TVideoMAEConfig;
+begin
+  Result := BuildVideoMAEFromSafeTensorsEx(FileName, IgnoredConfig,
+    pInferenceOnly);
+end;
+
+procedure RunVideoMAELogits(Net: TNNet; ClipInput, Logits: TNNetVolume);
+begin
+  Net.Compute(ClipInput);
+  Logits.Copy(Net.GetLastLayer().Output);
 end;
 
 end.

@@ -283,6 +283,8 @@ type
     procedure TestSegformerSemanticSegmentationParity;
     procedure TestDPTConfigFromJSONFile;
     procedure TestDPTDepthEstimationParity;
+    procedure TestVideoMAEConfigFromJSONFile;
+    procedure TestVideoMAEClassificationParity;
     procedure TestViTPoseConfigFromJSONFile;
     procedure TestViTPosePoseEstimationParity;
     procedure TestViTPoseKeypointDecode;
@@ -13133,6 +13135,95 @@ begin
   finally
     RefRoot.Free;
     Img.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadVideoMAEConfigFromJSONFile on the committed pico VideoMAE config.
+procedure TTestNeuralPretrained.TestVideoMAEConfigFromJSONFile;
+var
+  Config: TVideoMAEConfig;
+begin
+  Config := ReadVideoMAEConfigFromJSONFile(
+    FixturePath('tiny_videomae_config.json'));
+  AssertEquals('model_type', 'videomae', Config.ModelType);
+  AssertEquals('image_size', 8, Config.ImageSize);
+  AssertEquals('patch_size', 4, Config.PatchSize);
+  AssertEquals('channels', 3, Config.NumChannels);
+  AssertEquals('num_frames', 4, Config.NumFrames);
+  AssertEquals('tubelet', 2, Config.TubeletSize);
+  AssertEquals('hidden', 16, Config.HiddenSize);
+  AssertEquals('inter', 32, Config.IntermediateSize);
+  AssertEquals('layers', 2, Config.NumLayers);
+  AssertEquals('heads', 2, Config.NumHeads);
+  AssertEquals('labels', 5, Config.NumLabels);
+end;
+
+// HF VideoMAE video-classification parity (the repo's FIRST video-classification
+// importer - a clip of T frames -> an action label, the pay-off of the landed
+// TNNetConvolution3D layer). tiny_videomae.* is a pico
+// VideoMAEForVideoClassification (tubelet 3-D conv + fixed sin-cos 3-D position
+// table + stock pre-LN transformer encoder + mean-pool -> fc_norm -> classifier)
+// with re-randomized O(1) weights; the reference action logits come from the
+// REAL transformers float64 forward. Asserts max |diff| < 1e-4 over the
+// num_labels logits - exercising the tubelet patchifier (Conv3D + temporal
+// tubelet selection), the fixed sin-cos position add, the joint space-time
+// encoder, and the mean-pool classification head.
+procedure TTestNeuralPretrained.TestVideoMAEClassificationParity;
+var
+  NN: TNNet;
+  Config: TVideoMAEConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, OutArr, InArr: TJSONArray;
+  CaseObj: TJSONObject;
+  Clip, Logits: TNNetVolume;
+  RefVal, GotVal, Diff, MaxDiff: double;
+  CaseCnt, i, InW, InDepth: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildVideoMAEFromSafeTensorsEx(
+    FixturePath('tiny_videomae.safetensors'), Config, {pInferenceOnly=}false,
+    FixturePath('tiny_videomae_config.json'));
+  RefJson := TStringList.Create;
+  Clip := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  InW := Config.ImageSize;
+  InDepth := Config.NumFrames * Config.NumChannels;
+  try
+    AssertTrue('net built', NN <> nil);
+    RefJson.LoadFromFile(FixturePath('tiny_videomae_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertTrue('cases present', CasesArr <> nil);
+    for CaseCnt := 0 to CasesArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(CasesArr.Items[CaseCnt]);
+      InArr := TJSONArray(CaseObj.Find('input'));
+      OutArr := TJSONArray(CaseObj.Find('output'));
+      // Clip volume (W, H, T*C), flat (y*W+x)*(T*C) + t*C + c (fixture order).
+      Clip.ReSize(InW, Config.ImageSize, InDepth);
+      for i := 0 to Clip.Size - 1 do
+        Clip.FData[i] := InArr.Items[i].AsFloat;
+      RunVideoMAELogits(NN, Clip, Logits);
+      AssertEquals('num_labels', Config.NumLabels, Logits.Size);
+      for i := 0 to OutArr.Count - 1 do
+      begin
+        RefVal := OutArr.Items[i].AsFloat;
+        GotVal := Logits.FData[i];
+        Diff := Abs(GotVal - RefVal);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('VideoMAE logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Clip.Free;
+    Logits.Free;
     RefJson.Free;
     NN.Free;
   end;
