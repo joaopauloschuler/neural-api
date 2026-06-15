@@ -1100,25 +1100,42 @@ rather than acted on.
       HF float64 on the decoder logits for a fixed image+task token + an examples/
       Florence2 that captions and box-detects one tiny CPU image. First "spatial-output-
       as-text" importer; complements the box/mask importers (DETR/SAM/Mask2Former).
-- [ ] Qwen2-VL / Qwen2.5-VL vision-language importer (BuildQwen2VLFromSafeTensors, e.g.
-      Qwen/Qwen2-VL-2B-Instruct or Qwen/Qwen2.5-VL-3B-Instruct) — referenced today only
-      as "the open Qwen2-VL M-RoPE path" in the PaliGemma task but never tracked as a
-      deliverable. The genuinely NEW piece, distinct from every landed/tracked VLM
+- [X] Qwen2-VL / Qwen2.5-VL vision-language importer — M-RoPE v1 LANDED
+      (BuildQwen2VLFromSafeTensors[Ex] + TQwen2VLConfig + ReadQwen2VLConfigFromJSONFile
+      + Qwen2VLRunLogits). The genuinely NEW piece, distinct from every landed VLM
       (LLaVA causal-everywhere, PaliGemma prefix-LM bidirectional), is **M-RoPE
-      (Multimodal Rotary Position Embedding)**: the RoPE position index is split into
-      three sections (temporal, height, width) so image/video tokens carry a 3-D grid
-      position while text tokens fall back to the scalar 1-D index — a new rotary-index
-      assignment threaded through the decoder's RoPE, NOT a new attention math. The
-      vision side is a native-dynamic-resolution ViT (window attention over a variable
-      patch grid + a small patch-merger MLP that 2x2-pools spatial tokens), reusing the
-      landed BuildClipVisionTower/SigLIP ViT path and the LLaVA prompt-assembly splice
-      (so it shares that open helper). Scope v1 to a SINGLE still image + text, greedy
-      decode on CPU. Genuinely new code: the M-RoPE 3-D position builder (reuse the
-      existing rotary tables, only the per-token index changes) + the spatial patch
-      merger + the variable-grid window-attention mask. Pico parity vs HF float64 on
-      next-token logits for a mixed image+text prompt (reuse make_pico_*_fixture.py) +
-      an examples/Qwen2VLDescribe that captions a tiny image (ulimit-bounded). The
-      M-RoPE index builder also unblocks Qwen2.5-VL video (the temporal section) later.
+      (Multimodal Rotary Position Embedding)**: the new TNNetMRotaryEmbedding layer (a
+      TNNetRotaryEmbedding subclass that REUSES the parent theta cache; only the
+      per-token rotary INDEX changes) splits the head_dim/2 channel-pairs into three
+      contiguous mrope_section chunks (temporal/height/width). Vision tokens carry the
+      patch grid's (t,h,w); text tokens carry the same scalar in all three sections (1-D
+      RoPE fallback). The Qwen2 decoder is built by the shared Llama path with a new
+      Config.MRoPEEnabled flag (CreateRoPELayerForConfig swaps in M-RoPE on the per-head
+      Q/K rotary slices). The M-RoPE 3-D position builder
+      (BuildQwen2VLMRoPEPositionIds, the HF get_rope_index port for one still image,
+      T=1) + Qwen2VLSetMRoPEPositions thread the per-token index. The merged visual
+      tokens are spliced into the decoder's embedding sequence at the image_token_id
+      slots via the LLaVA splice (LlavaAssembleEmbeddings) — the embedding-injection
+      convention. Tests: TestQwen2VLMRoPEPositionIds (position ids match the HF oracle
+      EXACTLY) + TestQwen2VLLogitParity (next-token logits max|diff| ~7e-8 < 1e-4 vs the
+      REAL HF Qwen2VLForConditionalGeneration float64 oracle for a mixed image+text
+      prompt; a scalar-1D negative control breaks parity, proving the 3-D index is
+      load-bearing). Pico fixtures + tools/make_pico_qwen2vl_fixture.py committed. Also
+      fixed a latent bug: ReadLlamaConfigFromJSONFile left new optional record fields as
+      stack garbage (it never zeroed Result) — now the M-RoPE flags are zero-initialized.
+      Follow-ups:
+  - [ ] The native-dynamic-resolution VISION TOWER (Conv3d patch embed + window
+        attention over a variable patch grid + the 2x2 spatial patch-merger MLP) — v1
+        takes the MERGED visual tokens as input (precomputed). Reuse the landed
+        BuildClipVisionTower/SigLIP ViT path; build the variable-grid window-attention
+        mask + the patch merger. Then drop the precomputed-embeds shortcut.
+  - [ ] Qwen2.5-VL specifics (the temporal M-RoPE section for VIDEO, the per-frame
+        time_interval, the windowed full-attention layer pattern, MRoPE rope_deltas for
+        incremental decode) — the M-RoPE index builder already has the temporal slot.
+  - [ ] Multi-image / multi-modality prompts (the v1 position builder assumes ONE
+        contiguous still-image block); generalize the get_rope_index grouping.
+  - [ ] Real-checkpoint parity (Qwen/Qwen2-VL-2B-Instruct) + an examples/Qwen2VLDescribe
+        that captions a tiny CPU image (ulimit-bounded).
 - [ ] CLIPSeg text-prompted zero-shot segmentation importer follow-ups
       (BuildCLIPSegFromSafeTensors[WithConfig] + TCLIPSegConfig + RunCLIPSeg LANDED —
       frozen CLIP dual encoder + a FiLM-conditioned transposed-conv decoder emitting a

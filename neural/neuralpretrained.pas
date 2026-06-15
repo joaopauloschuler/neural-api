@@ -892,6 +892,16 @@ type
                                // SwiGLU width (Llama-4's dense FFN is wider than
                                // an MoE expert, whose width is IntermediateSize);
                                // 0 = use IntermediateSize.
+    // Qwen2-VL M-RoPE (Multimodal Rotary Position Embedding): when
+    // MRoPEEnabled the per-head Q/K rotary layers are TNNetMRotaryEmbedding
+    // (the 3-D temporal/height/width index variant) instead of the scalar
+    // TNNetRotaryEmbedding. MRoPESectionT/H/W are the channel-pair counts
+    // (mrope_section) summing to head_dim/2. The per-token 3-D positions are
+    // supplied at run time by Qwen2VLRunLogits (text tokens get the same
+    // scalar in all three sections, so they fall back to 1-D RoPE). Every
+    // other family leaves MRoPEEnabled false (ordinary 1-D RoPE).
+    MRoPEEnabled: boolean;
+    MRoPESectionT, MRoPESectionH, MRoPESectionW: integer;
     Prefix: string;            // tensor-name prefix ('model.' or '')
   end;
 
@@ -6437,6 +6447,92 @@ procedure PaliGemmaRunLogits(VisionNet, ProjectorNet, TextNet: TNNet;
   ImageTokenIndex, NumPatches, PrefixLen: integer; Logits: TNNetVolume);
 
 // ===========================================================================
+// QWEN2-VL / QWEN2.5-VL VISION-LANGUAGE IMPORT (model_type "qwen2_vl" /
+// "qwen2_5_vl", e.g. Qwen/Qwen2-VL-2B-Instruct). The text backbone is a stock
+// Qwen2 decoder (RMSNorm + RoPE + SwiGLU, GQA, q/k/v BIASES); the GENUINELY
+// NEW piece - distinct from LLaVA (causal-everywhere) and PaliGemma (prefix-LM
+// bidirectional) - is M-RoPE (Multimodal Rotary Position Embedding): each
+// token's rotary INDEX is a 3-D (temporal, height, width) grid position rather
+// than the scalar sequence index. The head_dim/2 channel-pairs are split into
+// three contiguous SECTIONS (mrope_section); vision tokens carry the patch
+// grid's (t,h,w) in the matching section while TEXT tokens carry the SAME
+// scalar in all three (so they fall back to ordinary 1-D RoPE). This is a new
+// rotary-INDEX assignment threaded into the decoder's RoPE (TNNetMRotaryEmbedding),
+// NOT new attention math.
+//
+// v1 scope: a SINGLE still image (T=1) + text, greedy decode on CPU. The
+// vision tower (native-dynamic-resolution Conv3d ViT + window attention + the
+// 2x2 spatial patch merger) is a clear follow-up; v1 takes the merged visual
+// tokens as input (precomputed) and splices them into the decoder's embedding
+// sequence at the image_token_id placeholders (reusing the LLaVA splice). The
+// genuinely-new, tested code here is: (a) the M-RoPE 3-D position builder
+// (BuildQwen2VLMRoPEPositionIds, the HF get_rope_index port for one image) and
+// (b) the M-RoPE rotary layer + its end-to-end next-token-logit parity.
+// ---------------------------------------------------------------------------
+type
+  TQwen2VLConfig = record
+    Text: TLlamaConfig;            // the Qwen2 decoder sub-config (with MRoPE)
+    ImageTokenId: integer;         // image_token_id placeholder id
+    SpatialMergeSize: integer;     // vision spatial_merge_size (2)
+    MRoPESectionT, MRoPESectionH, MRoPESectionW: integer; // mrope_section
+    ModelType: string;             // 'qwen2_vl' / 'qwen2_5_vl'
+  end;
+
+// Reads a HF Qwen2-VL config.json (model_type 'qwen2_vl' / 'qwen2_5_vl'). The
+// text_config is a Qwen2 sub-config (parsed by the Llama/Qwen2 reader, QKVBias
+// forced on); rope_scaling.mrope_section gives the [T,H,W] channel split.
+// vision_config.spatial_merge_size (default 2) is read for the position
+// builder. Coded by Claude (AI).
+function ReadQwen2VLConfigFromJSONFile(const FileName: string): TQwen2VLConfig;
+
+function Qwen2VLConfigToString(const Config: TQwen2VLConfig): string;
+
+// Builds the Qwen2-VL TEXT decoder (a Qwen2 decoder whose per-head Q/K rotary
+// layers are TNNetMRotaryEmbedding) from the checkpoint at FileName. The
+// decoder reads the standard Qwen2 weight names (model.embed_tokens /
+// model.layers.* / model.norm / lm_head). Its TNNetEmbedding is fed externally
+// by Qwen2VLRunLogits (the embedding-injection convention). Owned by the
+// caller. pSeqLen <= 0 uses max_position_embeddings. Coded by Claude (AI).
+function BuildQwen2VLFromSafeTensorsEx(const FileName: string;
+  out Config: TQwen2VLConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildQwen2VLFromSafeTensors(const FileName: string;
+  out Config: TQwen2VLConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// Builds the M-RoPE 3-D position indices for a SINGLE-image+text prompt, the
+// HF Qwen2VLModel.get_rope_index port (T=1). TokenIds is the full id sequence
+// with ImageTokenId at the merged-image placeholder slots; ImageGridH/W are the
+// MERGED grid dimensions (= patch grid / spatial_merge_size). Fills PosT/PosH/
+// PosW (each resized to SeqLen): text runs advance all three positions by 1
+// from the running max+1; the image block lays out temporal=const, height=row,
+// width=col offset by the running position, and the next text run resumes at
+// max(H,W)+running. Raises if the image-token count <> ImageGridH*ImageGridW.
+// Coded by Claude (AI).
+procedure BuildQwen2VLMRoPEPositionIds(const TokenIds: array of integer;
+  ImageTokenId, ImageGridH, ImageGridW: integer;
+  var PosT, PosH, PosW: array of integer);
+
+// Sets the per-token 3-D M-RoPE positions on EVERY TNNetMRotaryEmbedding layer
+// in the decoder (all per-head Q/K rotary layers share the same positions).
+// Coded by Claude (AI).
+procedure Qwen2VLSetMRoPEPositions(TextNet: TNNet;
+  const PosT, PosH, PosW: array of integer);
+
+// Full Qwen2-VL v1 forward: splices the precomputed merged VisualTokens
+// (SeqImg,1,text_hidden) into the decoder's embedding sequence at the
+// ImageTokenId slots (LlavaAssembleEmbeddings), builds + sets the M-RoPE 3-D
+// positions for the (ImageGridH x ImageGridW) merged image grid, injects the
+// embeddings, runs the decoder, and returns the (SeqLen,1,vocab) next-token
+// logits. Coded by Claude (AI).
+procedure Qwen2VLRunLogits(TextNet: TNNet; const Config: TQwen2VLConfig;
+  const TokenIds: array of integer; VisualTokens: TNNetVolume;
+  ImageGridH, ImageGridW: integer; Logits: TNNetVolume);
+
+// ===========================================================================
 // RAFT OPTICAL-FLOW IMPORT (model_type "raft_small", the torchvision
 // raft_small architecture, Teed & Deng 2020 "RAFT", arXiv:2003.12039) - the
 // FIRST optical-flow vertical and the first TWO-image-in / dense-2-channel-out
@@ -9789,6 +9885,28 @@ begin
       S.YarnTruncate);
 end;
 
+// Returns the per-head Q/K rotary layer for the decoder block: an ordinary
+// TNNetRotaryEmbedding, or - when Config.MRoPEEnabled (Qwen2-VL) - the 3-D
+// TNNetMRotaryEmbedding carrying the mrope_section split. The frequency
+// schedule / scaling is identical either way; only the per-token rotary index
+// differs. Coded by Claude (AI).
+function CreateRoPELayerForConfig(const Config: TLlamaConfig;
+  Base: TNeuralFloat; const S: TRoPEScalingConfig): TNNetRotaryEmbedding;
+begin
+  if Config.MRoPEEnabled then
+  begin
+    if S.Mode = rsmLongRoPE then
+      ImportError('CreateRoPELayerForConfig: M-RoPE + LongRoPE is not ' +
+        'supported (no Qwen2-VL config combines them).');
+    Result := TNNetMRotaryEmbedding.Create(Base, Config.MRoPESectionT,
+      Config.MRoPESectionH, Config.MRoPESectionW, S.Mode, S.Factor,
+      S.OriginalContextLen, S.YarnAlpha, S.YarnBeta, S.YarnAttnFactor,
+      S.YarnTruncate);
+  end
+  else
+    Result := CreateRoPEFromScaling(Base, S);
+end;
+
 // ============================ LLAMA IMPORT =================================
 
 function ReadLlamaConfigFromJSONFile(const FileName: string): TLlamaConfig;
@@ -9817,6 +9935,15 @@ var
 begin
   if not FileExists(FileName) then
     ImportError('Llama import: config file not found: ' + FileName);
+  // A function-result record is NOT auto-zeroed, and this reader sets fields
+  // individually - so any field a config.json omits would otherwise read stack
+  // garbage. Zero the optional M-RoPE flags up front (BuildQwen2VLFromSafeTensors
+  // stamps them on AFTER reading); a garbage-true MRoPEEnabled would wrongly
+  // wire TNNetMRotaryEmbedding into every Llama-family decoder.
+  Result.MRoPEEnabled := false;
+  Result.MRoPESectionT := 0;
+  Result.MRoPESectionH := 0;
+  Result.MRoPESectionW := 0;
   JsonText := TStringList.Create;
   Root := nil;
   try
@@ -11671,7 +11798,7 @@ begin
             RotSlice := NN.AddLayerAfter(
               TNNetSplitChannels.Create(RotChannels), KSource);
             RotSlice := NN.AddLayerAfter(
-              CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), RotSlice);
+              CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling), RotSlice);
             PassSlice := NN.AddLayerAfter(
               TNNetSplitChannels.Create(PassChannels), KSource);
             KRotated[KVHeadCnt] := NN.AddLayer(
@@ -11693,7 +11820,7 @@ begin
             // loads q/k straight - no rotate_half permutation).
             if LayerUseRoPE then
               KSlice := NN.AddLayerAfter(
-                CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), KSlice);
+                CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling), KSlice);
             // Config.Llama4QKL2Norm (use_qk_norm): UNWEIGHTED L2 RMS-norm over
             // the head AFTER RoPE, on the RoPE layers only (Llama4TextL2Norm).
             // A gain=1 TNNetTokenRMSNorm = x*rsqrt(mean(x^2)+eps).
@@ -11720,7 +11847,7 @@ begin
             RotSlice := NN.AddLayerAfter(
               TNNetSplitChannels.Create(RotChannels), QSource);
             RotSlice := NN.AddLayerAfter(
-              CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), RotSlice);
+              CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling), RotSlice);
             PassSlice := NN.AddLayerAfter(
               TNNetSplitChannels.Create(PassChannels), QSource);
             QSlice := NN.AddLayer(
@@ -11739,7 +11866,7 @@ begin
             // Llama-4 iRoPE: RoPE only on the RoPE layers (see the K path).
             if LayerUseRoPE then
               QSlice := NN.AddLayerAfter(
-                CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), QSlice);
+                CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling), QSlice);
             if Config.Llama4QKL2Norm and LayerUseRoPE then
               QSlice := NN.AddLayerAfter(
                 TNNetTokenRMSNorm.Create(Config.RmsNormEps), QSlice);
@@ -53317,6 +53444,259 @@ begin
   finally
     Embeds.Free;
     VisualTokens.Free;
+  end;
+end;
+
+// ===========================================================================
+// QWEN2-VL / QWEN2.5-VL vision-language importer (implementation). See the
+// interface section for the architecture summary. Coded by Claude (AI).
+// ===========================================================================
+
+function ReadQwen2VLConfigFromJSONFile(const FileName: string): TQwen2VLConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, TextObj, VisObj, RopeObj: TJSONObject;
+  SecArr: TJSONArray;
+  MType: string;
+begin
+  if not FileExists(FileName) then
+    ImportError('Qwen2-VL import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError('Qwen2-VL import: config root is not a JSON object.');
+    Obj := TJSONObject(Root);
+    MType := Obj.Get('model_type', '');
+    if (MType <> 'qwen2_vl') and (MType <> 'qwen2_5_vl') and
+       (MType <> 'qwen2') then
+      ImportError('Qwen2-VL import: model_type "' + MType +
+        '" is not "qwen2_vl"/"qwen2_5_vl" (the fixture may use a flat ' +
+        '"qwen2" text config with extra Qwen2-VL keys).');
+    Result.ModelType := MType;
+    Result.ImageTokenId := Obj.Get('image_token_id', 0);
+    Result.SpatialMergeSize := Obj.Get('spatial_merge_size', 2);
+
+    // The text decoder sub-config: a nested "text_config" (real HF Qwen2-VL)
+    // or the top-level object itself (flat fixture). The Llama/Qwen2 reader
+    // is reused on whichever the family lives in; the file path is the same
+    // for the flat case, but for a nested text_config we parse it inline.
+    if (Obj.Find('text_config') <> nil) and
+       (Obj.Find('text_config') is TJSONObject) then
+      TextObj := TJSONObject(Obj.Find('text_config'))
+    else
+      TextObj := Obj;
+
+    // Parse mrope_section from rope_parameters / rope_scaling (text or top).
+    RopeObj := nil;
+    if (TextObj.Find('rope_parameters') <> nil) and
+       (TextObj.Find('rope_parameters') is TJSONObject) then
+      RopeObj := TJSONObject(TextObj.Find('rope_parameters'))
+    else if (TextObj.Find('rope_scaling') <> nil) and
+            (TextObj.Find('rope_scaling') is TJSONObject) then
+      RopeObj := TJSONObject(TextObj.Find('rope_scaling'))
+    else if (Obj.Find('mrope_section') <> nil) then
+      RopeObj := Obj;  // flat fixture: mrope_section at top level
+    if RopeObj = nil then
+      ImportError('Qwen2-VL import: no rope_parameters/rope_scaling with ' +
+        'mrope_section found.');
+    SecArr := nil;
+    if RopeObj.Find('mrope_section') is TJSONArray then
+      SecArr := TJSONArray(RopeObj.Find('mrope_section'));
+    if (SecArr = nil) or (SecArr.Count <> 3) then
+      ImportError('Qwen2-VL import: mrope_section must be a 3-element array ' +
+        '[temporal, height, width].');
+    Result.MRoPESectionT := SecArr.Items[0].AsInteger;
+    Result.MRoPESectionH := SecArr.Items[1].AsInteger;
+    Result.MRoPESectionW := SecArr.Items[2].AsInteger;
+    // The vision_config (when present) carries spatial_merge_size.
+    if (Obj.Find('vision_config') <> nil) and
+       (Obj.Find('vision_config') is TJSONObject) then
+    begin
+      VisObj := TJSONObject(Obj.Find('vision_config'));
+      Result.SpatialMergeSize := VisObj.Get('spatial_merge_size',
+        Result.SpatialMergeSize);
+    end;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+  // The text decoder shape is read by the standard Llama/Qwen2 reader on the
+  // SAME file (it picks up text_config when nested, else the flat object); the
+  // M-RoPE flags are stamped on afterward by the builder.
+  Result.Text := ReadLlamaConfigFromJSONFile(FileName);
+  // Qwen2-VL's text backbone is Qwen2: q/k/v carry biases.
+  Result.Text.QKVBias := true;
+end;
+
+function Qwen2VLConfigToString(const Config: TQwen2VLConfig): string;
+begin
+  Result := 'Qwen2-VL{model_type=' + Config.ModelType +
+    ', image_token_id=' + IntToStr(Config.ImageTokenId) +
+    ', spatial_merge_size=' + IntToStr(Config.SpatialMergeSize) +
+    ', mrope_section=[' + IntToStr(Config.MRoPESectionT) + ',' +
+    IntToStr(Config.MRoPESectionH) + ',' + IntToStr(Config.MRoPESectionW) +
+    '], text=' + LlamaConfigToString(Config.Text) + '}';
+end;
+
+function BuildQwen2VLFromSafeTensorsEx(const FileName: string;
+  out Config: TQwen2VLConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadQwen2VLConfigFromJSONFile(ConfigPath);
+  // Stamp the M-RoPE flags onto the text config so the shared Llama builder
+  // wires TNNetMRotaryEmbedding on the per-head Q/K rotary slices.
+  Config.Text.MRoPEEnabled := true;
+  Config.Text.MRoPESectionT := Config.MRoPESectionT;
+  Config.Text.MRoPESectionH := Config.MRoPESectionH;
+  Config.Text.MRoPESectionW := Config.MRoPESectionW;
+  Result := BuildLlamaFromSafeTensorsWithConfig(FileName, Config.Text, pSeqLen,
+    pInferenceOnly);
+end;
+
+function BuildQwen2VLFromSafeTensors(const FileName: string;
+  out Config: TQwen2VLConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+begin
+  Result := BuildQwen2VLFromSafeTensorsEx(FileName, Config, pSeqLen,
+    pInferenceOnly, ConfigFileName);
+end;
+
+procedure BuildQwen2VLMRoPEPositionIds(const TokenIds: array of integer;
+  ImageTokenId, ImageGridH, ImageGridW: integer;
+  var PosT, PosH, PosW: array of integer);
+var
+  SeqLen, t, ImageSlots, CurPos, h, w, MaxHW, FirstImg, i: integer;
+begin
+  SeqLen := Length(TokenIds);
+  if (Length(PosT) <> SeqLen) or (Length(PosH) <> SeqLen) or
+     (Length(PosW) <> SeqLen) then
+    ImportError('BuildQwen2VLMRoPEPositionIds: PosT/PosH/PosW must each have ' +
+      'length SeqLen (' + IntToStr(SeqLen) + ').');
+  ImageSlots := 0;
+  FirstImg := -1;
+  for t := 0 to SeqLen - 1 do
+    if TokenIds[t] = ImageTokenId then
+    begin
+      Inc(ImageSlots);
+      if FirstImg < 0 then FirstImg := t;
+    end;
+  if ImageSlots <> ImageGridH * ImageGridW then
+    ImportError('BuildQwen2VLMRoPEPositionIds: prompt has ' +
+      IntToStr(ImageSlots) + ' image placeholder tokens but the merged grid ' +
+      'is ' + IntToStr(ImageGridH) + 'x' + IntToStr(ImageGridW) + ' = ' +
+      IntToStr(ImageGridH * ImageGridW) + ' (they must match).');
+  // The image tokens are assumed CONTIGUOUS (a single still image, T=1) - the
+  // v1 scope. The HF get_rope_index groups by modality; for one image that is
+  // [text prefix][image block][text suffix].
+  if ImageSlots > 0 then
+    for i := 1 to ImageSlots - 1 do
+      if TokenIds[FirstImg + i] <> ImageTokenId then
+        ImportError('BuildQwen2VLMRoPEPositionIds: the ' +
+          IntToStr(ImageSlots) + ' image tokens must be contiguous (v1 ' +
+          'single-image scope).');
+  CurPos := 0;
+  t := 0;
+  while t < SeqLen do
+  begin
+    if TokenIds[t] = ImageTokenId then
+    begin
+      // Image block (T=1): temporal = CurPos for every token; height/width =
+      // CurPos + row / CurPos + col over the merged grid (HF get_rope_index /
+      // get_vision_position_ids with start_position = CurPos, T=1).
+      for h := 0 to ImageGridH - 1 do
+        for w := 0 to ImageGridW - 1 do
+        begin
+          PosT[t] := CurPos;
+          PosH[t] := CurPos + h;
+          PosW[t] := CurPos + w;
+          Inc(t);
+        end;
+      // The next run resumes at CurPos + max(H, W) (HF advances current_pos by
+      // max(llm_grid_h, llm_grid_w)).
+      MaxHW := ImageGridH;
+      if ImageGridW > MaxHW then MaxHW := ImageGridW;
+      CurPos := CurPos + MaxHW;
+    end
+    else
+    begin
+      // Text token: all three sections share the scalar CurPos (1-D RoPE).
+      PosT[t] := CurPos;
+      PosH[t] := CurPos;
+      PosW[t] := CurPos;
+      Inc(CurPos);
+      Inc(t);
+    end;
+  end;
+end;
+
+procedure Qwen2VLSetMRoPEPositions(TextNet: TNNet;
+  const PosT, PosH, PosW: array of integer);
+var
+  i, Found: integer;
+begin
+  Found := 0;
+  for i := 0 to TextNet.GetLastLayerIdx() do
+    if TextNet.Layers[i] is TNNetMRotaryEmbedding then
+    begin
+      TNNetMRotaryEmbedding(TextNet.Layers[i]).SetPositions(PosT, PosH, PosW);
+      Inc(Found);
+    end;
+  if Found = 0 then
+    ImportError('Qwen2VLSetMRoPEPositions: no TNNetMRotaryEmbedding layers ' +
+      'found (not a BuildQwen2VLFromSafeTensors decoder?).');
+end;
+
+procedure Qwen2VLRunLogits(TextNet: TNNet; const Config: TQwen2VLConfig;
+  const TokenIds: array of integer; VisualTokens: TNNetVolume;
+  ImageGridH, ImageGridW: integer; Logits: TNNetVolume);
+var
+  Embeds: TNNetVolume;
+  EmbeddingLayer: TNNetLayer;
+  PosT, PosH, PosW: array of integer;
+  i, SeqLen, NumImg: integer;
+begin
+  if (TextNet.Layers.Count <= 2) or
+     not (TextNet.Layers[1] is TNNetEmbedding) then
+    ImportError('Qwen2VLRunLogits: TextNet is not a BuildQwen2VLFromSafeTensors ' +
+      'decoder (layer 1 must be a TNNetEmbedding).');
+  EmbeddingLayer := TextNet.Layers[1];
+  SeqLen := Length(TokenIds);
+  if SeqLen <> EmbeddingLayer.Output.SizeX then
+    ImportError('Qwen2VLRunLogits: prompt length ' + IntToStr(SeqLen) +
+      ' must equal the decoder''s SeqLen ' +
+      IntToStr(EmbeddingLayer.Output.SizeX) +
+      ' (rebuild with pSeqLen = assembled prompt length).');
+  NumImg := ImageGridH * ImageGridW;
+  Embeds := TNNetVolume.Create;
+  SetLength(PosT, SeqLen);
+  SetLength(PosH, SeqLen);
+  SetLength(PosW, SeqLen);
+  try
+    // Splice the merged visual tokens into the text embedding sequence at the
+    // image_token_id slots (reuse the LLaVA splice).
+    LlavaAssembleEmbeddings(TextNet, TokenIds, Config.ImageTokenId, NumImg,
+      VisualTokens, Embeds);
+    // Build + set the M-RoPE 3-D positions for the merged image grid.
+    BuildQwen2VLMRoPEPositionIds(TokenIds, Config.ImageTokenId,
+      ImageGridH, ImageGridW, PosT, PosH, PosW);
+    Qwen2VLSetMRoPEPositions(TextNet, PosT, PosH, PosW);
+    // Inject + run from the embedding onward (skip the token lookup).
+    EmbeddingLayer.Output.Copy(Embeds);
+    for i := 2 to TextNet.GetLastLayerIdx() do
+      TextNet.Layers[i].Compute();
+    TextNet.GetOutput(Logits);
+  finally
+    Embeds.Free;
   end;
 end;
 

@@ -321,6 +321,8 @@ type
     procedure TestLlavaNextTokenLogitsParity;
     procedure TestPaliGemmaConfigFromJSONFile;
     procedure TestPaliGemmaLogitParity;
+    procedure TestQwen2VLMRoPEPositionIds;
+    procedure TestQwen2VLLogitParity;
     procedure TestViTConfigFromJSONFile;
     procedure TestViTImageClassificationParity;
     procedure TestResNetConfigFromJSONFile;
@@ -14248,6 +14250,181 @@ begin
     RefJson.Free;
     VisionNet.Free;
     ProjectorNet.Free;
+    TextNet.Free;
+  end;
+end;
+
+// Verifies the M-RoPE 3-D position builder (BuildQwen2VLMRoPEPositionIds, the
+// HF Qwen2VLModel.get_rope_index port for a single still image, T=1) matches
+// the HF float64 oracle position_ids EXACTLY (integer indices). Image tokens
+// carry distinct (t,h,w) over the merged grid; text tokens carry the same
+// scalar in all three sections.
+procedure TTestNeuralPretrained.TestQwen2VLMRoPEPositionIds;
+var
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  IdsArr, PosArr, RowArr: TJSONArray;
+  TokenIds, PosT, PosH, PosW: array of integer;
+  SeqLen, t, ImageTokenId, MergedH, MergedW: integer;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwen2vl_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    IdsArr := TJSONArray(TJSONObject(RefRoot).Find('token_ids'));
+    SeqLen := IdsArr.Count;
+    SetLength(TokenIds, SeqLen);
+    for t := 0 to SeqLen - 1 do TokenIds[t] := IdsArr.Items[t].AsInteger;
+    ImageTokenId := TJSONObject(RefRoot).Get('image_token_id', 0);
+    MergedH := TJSONObject(RefRoot).Get('merged_h', 0);
+    MergedW := TJSONObject(RefRoot).Get('merged_w', 0);
+
+    SetLength(PosT, SeqLen);
+    SetLength(PosH, SeqLen);
+    SetLength(PosW, SeqLen);
+    BuildQwen2VLMRoPEPositionIds(TokenIds, ImageTokenId, MergedH, MergedW,
+      PosT, PosH, PosW);
+
+    PosArr := TJSONArray(TJSONObject(RefRoot).Find('position_ids'));
+    // row 0 = temporal, 1 = height, 2 = width
+    RowArr := TJSONArray(PosArr.Items[0]);
+    for t := 0 to SeqLen - 1 do
+      AssertEquals('M-RoPE temporal pos[' + IntToStr(t) + ']',
+        RowArr.Items[t].AsInteger, PosT[t]);
+    RowArr := TJSONArray(PosArr.Items[1]);
+    for t := 0 to SeqLen - 1 do
+      AssertEquals('M-RoPE height pos[' + IntToStr(t) + ']',
+        RowArr.Items[t].AsInteger, PosH[t]);
+    RowArr := TJSONArray(PosArr.Items[2]);
+    for t := 0 to SeqLen - 1 do
+      AssertEquals('M-RoPE width pos[' + IntToStr(t) + ']',
+        RowArr.Items[t].AsInteger, PosW[t]);
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Qwen2-VL NEXT-TOKEN LOGIT parity for a mixed image+text prompt. The Qwen2-VL
+// text decoder uses M-RoPE: the per-head Q/K rotary layers are
+// TNNetMRotaryEmbedding indexed by the 3-D (t,h,w) grid position. Qwen2VLRunLogits
+// splices the precomputed MERGED visual tokens (the HF get_image_features
+// output) into the decoder's embedding sequence at the image_token_id slots,
+// sets the M-RoPE positions, and runs the decoder. Compares the (seq,vocab)
+// logits < 1e-4 vs the HF float64 oracle (Qwen2VLForConditionalGeneration
+// forward with mm_token_type_ids). v1 scope = single still image, the merged
+// visual tokens supplied (the Conv3d vision tower is a follow-up).
+// CRITICAL: re-runs the SAME forward with SCALAR 1-D positions (text-style,
+// ignoring the grid) and asserts parity BREAKS - proving the 3-D M-RoPE index
+// is the load-bearing distinction (a plain-RoPE index fails the gate).
+procedure TTestNeuralPretrained.TestQwen2VLLogitParity;
+var
+  TextNet: TNNet;
+  Config: TQwen2VLConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  IdsArr, EmbArr, RowE, LogitsArr, RowL: TJSONArray;
+  VisualTokens, VisualScratch, Logits: TNNetVolume;
+  TokenIds: array of integer;
+  PosT, PosH, PosW: array of integer;
+  t, v, c, SeqLen, Vocab, MergedH, MergedW, NumImg, HiddenT: integer;
+  Diff, MaxDiff, ScalarMaxDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  VisualTokens := TNNetVolume.Create;
+  VisualScratch := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  TextNet := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwen2vl_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    IdsArr := TJSONArray(TJSONObject(RefRoot).Find('token_ids'));
+    SeqLen := IdsArr.Count;
+    SetLength(TokenIds, SeqLen);
+    for t := 0 to SeqLen - 1 do TokenIds[t] := IdsArr.Items[t].AsInteger;
+    MergedH := TJSONObject(RefRoot).Get('merged_h', 0);
+    MergedW := TJSONObject(RefRoot).Get('merged_w', 0);
+    NumImg := MergedH * MergedW;
+
+    TextNet := BuildQwen2VLFromSafeTensors(
+      FixturePath('tiny_qwen2vl.safetensors'), Config, {pSeqLen=}SeqLen,
+      {pInferenceOnly=}false, FixturePath('tiny_qwen2vl_config.json'));
+    HiddenT := Config.Text.HiddenSize;
+
+    // load the merged image embeds [NumImg][hidden] into (NumImg,1,hidden)
+    EmbArr := TJSONArray(TJSONObject(RefRoot).Find('image_embeds'));
+    AssertEquals('merged image token count', NumImg, EmbArr.Count);
+    VisualTokens.ReSize(NumImg, 1, HiddenT);
+    for t := 0 to NumImg - 1 do
+    begin
+      RowE := TJSONArray(EmbArr.Items[t]);
+      for c := 0 to HiddenT - 1 do
+        VisualTokens.FData[t * HiddenT + c] := RowE.Items[c].AsFloat;
+    end;
+
+    // --- the real M-RoPE forward ---
+    Qwen2VLRunLogits(TextNet, Config, TokenIds, VisualTokens,
+      MergedH, MergedW, Logits);
+    AssertEquals('logits rows = seq len', SeqLen, Logits.SizeX);
+    AssertEquals('logits depth = vocab', Config.Text.VocabSize, Logits.Depth);
+
+    LogitsArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    Vocab := Config.Text.VocabSize;
+    MaxDiff := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      RowL := TJSONArray(LogitsArr.Items[t]);
+      for v := 0 to Vocab - 1 do
+      begin
+        Diff := Abs(Logits.FData[t * Vocab + v] - RowL.Items[v].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('M-RoPE next-token logits: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // --- CRITICAL negative control: SCALAR 1-D positions (ignore the grid)
+    // MUST NOT match the M-RoPE oracle (otherwise the test would pass with a
+    // wrong, plain-RoPE index). ---
+    SetLength(PosT, SeqLen);
+    SetLength(PosH, SeqLen);
+    SetLength(PosW, SeqLen);
+    for t := 0 to SeqLen - 1 do
+    begin
+      PosT[t] := t; PosH[t] := t; PosW[t] := t;
+    end;
+    // Re-splice the embeddings, set the SCALAR positions, inject + run by hand
+    // (mirroring Qwen2VLRunLogits but without its M-RoPE position build).
+    LlavaAssembleEmbeddings(TextNet, TokenIds, Config.ImageTokenId, NumImg,
+      VisualTokens, VisualScratch);
+    Qwen2VLSetMRoPEPositions(TextNet, PosT, PosH, PosW);
+    TextNet.Layers[1].Output.Copy(VisualScratch);
+    for v := 2 to TextNet.GetLastLayerIdx() do
+      TextNet.Layers[v].Compute();
+    TextNet.GetOutput(Logits);
+    ScalarMaxDiff := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      RowL := TJSONArray(LogitsArr.Items[t]);
+      for v := 0 to Vocab - 1 do
+      begin
+        Diff := Abs(Logits.FData[t * Vocab + v] - RowL.Items[v].AsFloat);
+        if Diff > ScalarMaxDiff then ScalarMaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('scalar 1-D positions must DIFFER from the M-RoPE oracle ' +
+      '(max |diff| = ' + FloatToStr(ScalarMaxDiff) + ' must be > 1e-3) - ' +
+      'proves the 3-D M-RoPE index is load-bearing',
+      ScalarMaxDiff > 1e-3);
+  finally
+    RefRoot.Free;
+    Logits.Free;
+    VisualTokens.Free;
+    VisualScratch.Free;
+    RefJson.Free;
     TextNet.Free;
   end;
 end;

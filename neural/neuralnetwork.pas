@@ -4615,7 +4615,7 @@ type
   // OLD files (zeros in the slots) load as "no scaling".
   // Coded by Claude (AI).
   TNNetRotaryEmbedding = class(TNNetIdentity)
-  private
+  protected
     FPositionOffset: integer;
     // Cached per-pair effective theta values (FTheta[pairIdx]) and the YaRN
     // output scale sqrt(1/t); rebuilt from FStruct/FFloatSt by
@@ -4660,6 +4660,52 @@ type
     procedure Compute(); override;
     procedure Backpropagate(); override;
     property PositionOffset: integer read FPositionOffset write FPositionOffset;
+  end;
+
+  /// Multimodal Rotary Position Embedding (M-RoPE, Qwen2-VL, Wang et al. 2024).
+  // A drop-in TNNetRotaryEmbedding variant whose per-token rotary INDEX is no
+  // longer the scalar sequence position X, but a 3-D (temporal, height, width)
+  // grid position. The head_dim/2 channel-pairs are split into three contiguous
+  // SECTIONS (FMSection[0..2], summing to Depth/2): pair k in the temporal
+  // section rotates by FPosT[token], the height section by FPosH[token], the
+  // width section by FPosW[token]. Text tokens carry the SAME scalar value in
+  // all three position arrays, so they fall back to ordinary 1-D RoPE - the
+  // attention math is byte-for-byte the parent's, only the index per pair
+  // changes. This matches HF apply_multimodal_rotary_pos_emb exactly: HF
+  // doubles mrope_section (cos = [freqs, freqs]) and selects section i mod 3
+  // per half; in TNNetRotaryEmbedding's interleaved (2k, 2k+1) layout (the
+  // importer permutes q/k rows to it) the duplication collapses, so pair k
+  // simply belongs to the section it falls in over [0, Depth/2).
+  // Positions are NOT serialized (they are per-prompt run-time state set by
+  // SetPositions); mrope_section IS, in FStruct[8..10]. The frequency schedule
+  // (FFloatSt[0]=base, scaling slots) is inherited unchanged, so a saved
+  // M-RoPE layer reloads with the right theta cache and an EMPTY position set
+  // (the caller re-supplies positions before the next forward).
+  // Coded by Claude (AI).
+  TNNetMRotaryEmbedding = class(TNNetRotaryEmbedding)
+  protected
+    // Per-token 3-D positions (length = SeqLen, re-supplied per prompt).
+    FPosT, FPosH, FPosW: array of integer;
+    // mrope_section: channel-pair counts for the temporal/height/width
+    // sections; FMSection[0]+[1]+[2] = Depth div 2.
+    FMSection: array[0..2] of integer;
+    // Returns the section (0=T,1=H,2=W) that channel-pair k belongs to.
+    function SectionOfPair(k: integer): integer;
+  public
+    constructor Create(pBase: TNeuralFloat;
+      pSectionT, pSectionH, pSectionW: integer;
+      pScalingMode: TNNetRoPEScalingMode = rsmNone;
+      pScaleFactor: TNeuralFloat = 1.0;
+      pOriginalContextLen: integer = 0;
+      pYarnAlpha: TNeuralFloat = 1.0;
+      pYarnBeta: TNeuralFloat = 32.0;
+      pLongAttnFactor: TNeuralFloat = 0.0;
+      pYarnTruncate: boolean = true); overload;
+    // Supplies the per-token 3-D rotary index (each array length = SeqLen).
+    procedure SetPositions(const pPosT, pPosH, pPosW: array of integer);
+    procedure LoadDataFromString(strData: string); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
   end;
 
   // Calculates Power(LocalPrevOutput.FData[OutputCnt], iPower).
@@ -30896,6 +30942,157 @@ begin
         // exactly 1.0 outside YaRN mode):
         //   gx0 = FOutScale * ( c*gy0 + s*gy1)
         //   gx1 = FOutScale * (-s*gy0 + c*gy1)
+        PrevErr.Add(pos, 0, 2 * k,      FOutScale * (c * gy0 + s * gy1));
+        PrevErr.Add(pos, 0, 2 * k + 1,  FOutScale * (-s * gy0 + c * gy1));
+      end;
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetMRotaryEmbedding }
+
+constructor TNNetMRotaryEmbedding.Create(pBase: TNeuralFloat;
+  pSectionT, pSectionH, pSectionW: integer;
+  pScalingMode: TNNetRoPEScalingMode; pScaleFactor: TNeuralFloat;
+  pOriginalContextLen: integer; pYarnAlpha: TNeuralFloat;
+  pYarnBeta: TNeuralFloat; pLongAttnFactor: TNeuralFloat;
+  pYarnTruncate: boolean);
+begin
+  inherited Create(pBase, pScalingMode, pScaleFactor, pOriginalContextLen,
+    pYarnAlpha, pYarnBeta, pLongAttnFactor, pYarnTruncate);
+  if (pSectionT < 0) or (pSectionH < 0) or (pSectionW < 0) or
+     ((pSectionT + pSectionH + pSectionW) <= 0) then
+    FErrorProc('TNNetMRotaryEmbedding requires non-negative mrope_section ' +
+      'counts that sum to a positive value. Got (' + IntToStr(pSectionT) +
+      ',' + IntToStr(pSectionH) + ',' + IntToStr(pSectionW) + ').');
+  FMSection[0] := pSectionT;
+  FMSection[1] := pSectionH;
+  FMSection[2] := pSectionW;
+  // Serialize the section split (positions stay run-time state).
+  FStruct[3] := pSectionT;
+  FStruct[4] := pSectionH;
+  FStruct[5] := pSectionW;
+end;
+
+procedure TNNetMRotaryEmbedding.LoadDataFromString(strData: string);
+begin
+  inherited LoadDataFromString(strData);
+  FMSection[0] := FStruct[3];
+  FMSection[1] := FStruct[4];
+  FMSection[2] := FStruct[5];
+end;
+
+function TNNetMRotaryEmbedding.SectionOfPair(k: integer): integer;
+begin
+  // Sections are contiguous over [0, Depth/2): [0,T) temporal, [T,T+H) height,
+  // [T+H, T+H+W) width.
+  if k < FMSection[0] then Result := 0
+  else if k < FMSection[0] + FMSection[1] then Result := 1
+  else Result := 2;
+end;
+
+procedure TNNetMRotaryEmbedding.SetPositions(
+  const pPosT, pPosH, pPosW: array of integer);
+var
+  i, n: integer;
+begin
+  n := Length(pPosT);
+  if (Length(pPosH) <> n) or (Length(pPosW) <> n) then
+    FErrorProc('TNNetMRotaryEmbedding.SetPositions: the three position ' +
+      'arrays must have equal length.');
+  SetLength(FPosT, n);
+  SetLength(FPosH, n);
+  SetLength(FPosW, n);
+  for i := 0 to n - 1 do
+  begin
+    FPosT[i] := pPosT[i];
+    FPosH[i] := pPosH[i];
+    FPosW[i] := pPosW[i];
+  end;
+end;
+
+procedure TNNetMRotaryEmbedding.Compute();
+var
+  StartTime: double;
+  SeqLen, Depth, HalfD: integer;
+  pos, k, sec, idx: integer;
+  Angle, c, s, x0, x1: TNeuralFloat;
+  Prev: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  Depth := Prev.Depth;
+  HalfD := Depth div 2;
+  if Length(FTheta) <> HalfD then BuildThetaCache(Depth);
+  if Length(FPosT) <> SeqLen then
+    FErrorProc('TNNetMRotaryEmbedding: positions (' + IntToStr(Length(FPosT)) +
+      ') do not match SeqLen (' + IntToStr(SeqLen) +
+      '). Call SetPositions before the forward pass.');
+  if (FMSection[0] + FMSection[1] + FMSection[2]) <> HalfD then
+    FErrorProc('TNNetMRotaryEmbedding: mrope_section sum (' +
+      IntToStr(FMSection[0] + FMSection[1] + FMSection[2]) +
+      ') must equal Depth/2 (' + IntToStr(HalfD) + ').');
+  for pos := 0 to SeqLen - 1 do
+  begin
+    for k := 0 to HalfD - 1 do
+    begin
+      sec := SectionOfPair(k);
+      case sec of
+        0: idx := FPosT[pos];
+        1: idx := FPosH[pos];
+      else
+        idx := FPosW[pos];
+      end;
+      Angle := (idx + FPositionOffset) * FTheta[k];
+      pcr_sincosf(Angle, s, c);
+      x0 := Prev[pos, 0, 2 * k];
+      x1 := Prev[pos, 0, 2 * k + 1];
+      FOutput[pos, 0, 2 * k]     := FOutScale * (c * x0 - s * x1);
+      FOutput[pos, 0, 2 * k + 1] := FOutScale * (s * x0 + c * x1);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMRotaryEmbedding.Backpropagate();
+var
+  StartTime: double;
+  SeqLen, Depth, HalfD: integer;
+  pos, k, sec, idx: integer;
+  Angle, c, s, gy0, gy1: TNeuralFloat;
+  PrevErr: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if Assigned(FPrevLayer) and
+     (FPrevLayer.OutputError.Size > 0) and
+     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    StartTime := Now();
+    PrevErr := FPrevLayer.FOutputError;
+    SeqLen := FOutput.SizeX;
+    Depth := FOutput.Depth;
+    HalfD := Depth div 2;
+    if Length(FTheta) <> HalfD then BuildThetaCache(Depth);
+    for pos := 0 to SeqLen - 1 do
+    begin
+      for k := 0 to HalfD - 1 do
+      begin
+        sec := SectionOfPair(k);
+        case sec of
+          0: idx := FPosT[pos];
+          1: idx := FPosH[pos];
+        else
+          idx := FPosW[pos];
+        end;
+        Angle := (idx + FPositionOffset) * FTheta[k];
+        pcr_sincosf(Angle, s, c);
+        gy0 := FOutputError[pos, 0, 2 * k];
+        gy1 := FOutputError[pos, 0, 2 * k + 1];
         PrevErr.Add(pos, 0, 2 * k,      FOutScale * (c * gy0 + s * gy1));
         PrevErr.Add(pos, 0, 2 * k + 1,  FOutScale * (-s * gy0 + c * gy1));
       end;
@@ -90960,6 +91157,7 @@ begin
       'TNNetCausalLinearAttention' : Result := TNNetCausalLinearAttention.Create(St[0]);
       'TNNetLinformerAttention' :   Result := TNNetLinformerAttention.Create(St[0], St[1]);
       'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0);
+      'TNNetMRotaryEmbedding' :     Result := TNNetMRotaryEmbedding.Create(Ft[0], St[3], St[4], St[5], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0);
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
       'TNNetReLU6' :                Result := TNNetReLU6.Create(St[2]);
@@ -91371,6 +91569,7 @@ begin
       if S[0] = 'TNNetCausalLinearAttention' then Result := TNNetCausalLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetLinformerAttention' then Result := TNNetLinformerAttention.Create(St[0], St[1]) else
       if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0) else
+      if S[0] = 'TNNetMRotaryEmbedding' then Result := TNNetMRotaryEmbedding.Create(Ft[0], St[3], St[4], St[5], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0) else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetReLU6' then Result := TNNetReLU6.Create(St[2]) else
