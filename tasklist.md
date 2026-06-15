@@ -673,15 +673,30 @@ rather than acted on.
       compresses and reconstructs a tiny WAV on CPU. Unblocks the MusicGen / Bark
       text-to-audio follow-up below (those generate EnCodec codes with a transformer LM,
       then decode through this codec) — the audio analogue of the VQModel->image-LM path.
-  - [ ] MusicGen text-to-music follow-up (BuildMusicGenFromSafeTensors, e.g.
+  - [X] MusicGen text-to-music follow-up (BuildMusicGenFromSafeTensors, e.g.
         facebook/musicgen-small) once EnCodec lands: a T5 text encoder
         (BuildT5FromSafeTensors) conditioning a single-stage transformer decoder that
         autoregressively predicts the EnCodec code stack with the **delay-pattern**
         codebook interleaving (each of the K codebooks is offset by one step so a single
         LM head predicts them causally), decoded back to audio through the landed EnCodec
-        decoder. Reuses the seq2seq enc-dec convention + KV-cache decode; new code is only
-        the delay-pattern (de)interleaving. examples/MusicGenSmoke generates a one-second
-        clip on CPU (ulimit-bounded).
+        decoder. DONE: TMusicGenModel holder + BuildMusicGenFromSafeTensors[Ex]; the
+        decoder is the PRE-norm cross-attention Pegasus block skeleton (NOT post-norm
+        BART) with K summed code-embedding tables, HF cat([cos,sin]) half-split sinusoidal
+        positions, bias-free q/k/v/out + fc, a final decoder LayerNorm, and K untied LM
+        heads, plus a biased enc_to_dec_proj. The genuinely new code is the delay-pattern
+        (de)interleave helpers (MusicGenDelayInterleave/Deinterleave) matching HF
+        build_delay_pattern_mask + a greedy Generate loop. Parity: TestMusicGenDecoderParity
+        (next-token logits K x T x vocab vs HF float64 oracle, max |diff| = 0.0 < 1e-4) +
+        TestMusicGenDelayPattern (interleave matches HF exactly + round-trip). Fixture:
+        tools/musicgen_tiny_fixture.py -> tests/fixtures/tiny_musicgen.{safetensors,
+        _config.json,_ref.json} (~16 KB). examples/MusicGenSmoke runs the importer +
+        delay-pattern greedy generation on the pico fixture (CPU, ulimit-bounded).
+        REMAINING FOLLOW-UPS (deferred): (a) stereo audio_channels=2 (the interleaved
+        2*K-codebook delay layout, currently rejected); (b) wire the FULL pipeline
+        end-to-end with a real T5 encoder + EnCodec decoder (RunT5-style helper) to emit
+        an actual waveform from a text prompt (v1's Generate stops at the code stack);
+        (c) KV-cache incremental decode in Generate (v1 recomputes the whole prefix each
+        step); (d) sampling (top-k/temperature) instead of greedy.
 - [ ] Medusa / EAGLE tree-attention speculative decoding — a follow-up that is
       genuinely distinct from the landed SEQUENTIAL self-speculative paths
       (MTP-draft SelfSpeculativeDecoding + LayerSkip/CALM EarlyExitSelfSpeculative,

@@ -22,6 +22,7 @@ examples/BeamSearchDecode/BeamSearchDecode
 examples/ColBERTSearch/ColBERTSearch
 examples/EmbeddingSearch/EmbeddingSearch
 examples/EnCodecRoundTrip/EnCodecRoundTrip
+examples/MusicGenSmoke/MusicGenSmoke
 examples/LotteryTicketIMP/LotteryTicketIMP
 examples/VQCodebookUsage/VQCodebookUsage
 examples/FourierMix/FourierMix

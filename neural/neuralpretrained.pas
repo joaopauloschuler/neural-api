@@ -3597,6 +3597,141 @@ function BuildEnCodecFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TEnCodecModel;
 
 // ---------------------------------------------------------------------------
+// MUSICGEN IMPORT (model_type "musicgen": facebook/musicgen-small and
+// siblings, architectures ["MusicgenForConditionalGeneration"]) - the FIRST
+// text-to-AUDIO generative importer (Copet et al. 2023, arXiv:2306.05284). It
+// composes three landed pieces: a T5 text ENCODER
+// (BuildT5FromSafeTensors), a single-stage transformer DECODER that
+// autoregressively predicts the EnCodec code stack, and the EnCodec audio
+// DECODER (BuildEnCodecFromSafeTensors) that turns the predicted codes back
+// into a waveform. The genuinely NEW code here is the DELAY-PATTERN codebook
+// interleaving: each of the K codebooks is offset by one step so the K LM
+// heads predict them causally from a single shared transformer (a code at
+// (codebook k, frame t) is emitted at sequence position t+k, padded with a
+// special token before it appears).
+//
+// The DECODER itself rides the Pegasus PRE-norm cross-attention block
+// skeleton (BuildMarianStackBlocks) with these MusicGen specifics:
+//   - K = num_codebooks SEPARATE embedding tables (embed_tokens.{0..K-1}),
+//     each (vocab_size+1, hidden) - the extra row is the delay-pattern pad
+//     token id = vocab_size - SUMMED per frame;
+//   - SINUSOIDAL position embeddings in HF's cat([cos, sin]) HALF-SPLIT
+//     layout (cos in the FIRST hidden/2 columns, sin in the second), base
+//     log(10000)/(half-1), NO position offset (a non-persistent buffer the
+//     importer regenerates);
+//   - BIAS-FREE q/k/v/out and fc1/fc2 Linears (Marian/BART are biased);
+//   - a FINAL decoder LayerNorm (model.decoder.layer_norm) closing the
+//     post-norm stack;
+//   - K SEPARATE LM heads (lm_heads.{0..K-1}, untied, no bias);
+//   - an enc_to_dec_proj Linear (biased) mapping the T5 encoder hidden states
+//     (text d_model) to the decoder hidden size before cross-attention.
+//
+// v1 is INFERENCE-only and holds the K embedding tables + sinusoidal table +
+// enc_to_dec_proj in the TMusicGenModel holder (which precomputes the input
+// hidden states per frame, the embedding-injection convention shared with
+// LLaVA); the decoder TNNet runs the blocks and emits the K*vocab logits as a
+// depth-concatenated tensor. The pure delay-pattern (de)interleave helpers
+// MusicGenDelayInterleave / MusicGenDelayDeinterleave are standalone and
+// match HF build_delay_pattern_mask / apply_delay_pattern_mask exactly.
+// ---------------------------------------------------------------------------
+type
+  TMusicGenConfig = record
+    TextDModel: integer;        // text_encoder.d_model (enc_to_dec_proj in)
+    Hidden: integer;            // decoder.hidden_size
+    NumLayers: integer;         // decoder.num_hidden_layers
+    NumHeads: integer;          // decoder.num_attention_heads
+    FFNDim: integer;            // decoder.ffn_dim
+    VocabSize: integer;         // decoder.vocab_size (codebook_size)
+    NumCodebooks: integer;      // decoder.num_codebooks (K)
+    MaxPositionEmbeddings: integer; // decoder.max_position_embeddings
+    ModelType: string;          // 'musicgen'
+  end;
+
+  { TMusicGenModel }
+  // Holds the imported MusicGen decoder: the K embedding tables, the
+  // sinusoidal position table, enc_to_dec_proj, and the transformer-block
+  // TNNet (input = precomputed frame embeddings, second input = projected
+  // encoder states, output = K*vocab depth-concatenated logits). Built by
+  // BuildMusicGenFromSafeTensors[Ex]; caller-owned. Coded by Claude (AI).
+  TMusicGenModel = class
+  private
+    FConfig: TMusicGenConfig;
+    FDecoder: TNNet;                       // the transformer-block net
+    FEmbed: array of TNNetVolume;          // [K] each (vocab+1)*hidden flat
+    FPosTable: TNNetVolume;                // MaxPos*hidden sinusoids
+    FEncToDecW: TNNetVolume;               // hidden*textDModel row-major
+    FEncToDecB: TNNetVolume;               // hidden
+    FDecSeqLen, FEncSeqLen: integer;
+  public
+    constructor Create(const pConfig: TMusicGenConfig;
+      EncSeqLen, DecSeqLen: integer);
+    destructor Destroy; override;
+    property Config: TMusicGenConfig read FConfig;
+    property Decoder: TNNet read FDecoder;
+    property DecSeqLen: integer read FDecSeqLen;
+    property EncSeqLen: integer read FEncSeqLen;
+    // Projects raw T5 encoder hidden states (EncSeqLen x TextDModel) through
+    // enc_to_dec_proj into Dst (EncSeqLen,1,Hidden).
+    procedure ProjectEncoderStates(EncStates, Dst: TNNetVolume);
+    // Computes the decoder logits for a code stack Codes[k][t] (k in
+    // [0,K-1], t in [0,DecSeqLen-1], ids in [0,VocabSize]; VocabSize is the
+    // pad token). EncHidden is the projected encoder states (from
+    // ProjectEncoderStates). Logits is filled (DecSeqLen,1,K*VocabSize):
+    // codebook k's vocab-vector at frame t lives in depth slot
+    // k*VocabSize..k*VocabSize+VocabSize-1.
+    procedure ComputeLogits(const Codes: TNNetIntArr2D;
+      EncHidden, Logits: TNNetVolume);
+    // Greedy autoregressive generation of NumFrames audio frames using the
+    // delay pattern. EncStates are the RAW T5 encoder hidden states. Returns
+    // the UNDELAYED code stack Codes[k][t] (k in [0,K-1], t in
+    // [0,NumFrames-1]). Coded by Claude (AI).
+    procedure Generate(EncStates: TNNetVolume; NumFrames: integer;
+      out Codes: TNNetIntArr2D);
+  end;
+
+// Applies the MusicGen delay pattern to a raw code stack: Raw[k][t] (K rows,
+// each Len long) becomes Delayed[k][t] where codebook k is shifted RIGHT by k
+// positions, the leading k slots filled with PadId, truncated back to Len
+// columns (matches HF build_delay_pattern_mask's delayed input ids). Coded by
+// Claude (AI).
+procedure MusicGenDelayInterleave(const Raw: TNNetIntArr2D; PadId: integer;
+  out Delayed: TNNetIntArr2D);
+
+// Inverse of MusicGenDelayInterleave: recovers the raw code stack from the
+// delayed form by shifting codebook k LEFT by k positions (the last k columns
+// of each row, which held future/pad entries, are dropped). The output rows
+// are OutLen long; OutLen must be <= Len(Delayed[0]) - (K-1) for every
+// codebook to have a valid entry. Coded by Claude (AI).
+procedure MusicGenDelayDeinterleave(const Delayed: TNNetIntArr2D;
+  OutLen: integer; out Raw: TNNetIntArr2D);
+
+// Reads a HF MusicGen config.json (model_type "musicgen"). Pulls the decoder
+// sub-config (hidden_size, num_hidden_layers, num_attention_heads, ffn_dim,
+// vocab_size, num_codebooks, max_position_embeddings) and text_encoder.d_model
+// (for enc_to_dec_proj). The pico fixture flattens these to a small object;
+// real checkpoints nest them under "decoder" / "text_encoder". audio_channels
+// must be 1 (stereo's 2K-codebook layout is a documented follow-up);
+// activation_function must be "gelu" (exact erf). Coded by Claude (AI).
+function ReadMusicGenConfigFromJSONFile(const FileName: string): TMusicGenConfig;
+
+function MusicGenConfigToString(const Config: TMusicGenConfig): string;
+
+// Builds a TMusicGenModel (the decoder side) from Reader (caller owns Reader).
+// EncSeqLen/DecSeqLen fix the cross-attention and decoder sequence lengths.
+// pInferenceOnly frees training volumes during construction. Coded by Claude
+// (AI).
+function BuildMusicGenFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  const Config: TMusicGenConfig; EncSeqLen, DecSeqLen: integer;
+  pInferenceOnly: boolean = false): TMusicGenModel;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+function BuildMusicGenFromSafeTensors(const FileName: string;
+  out Config: TMusicGenConfig; EncSeqLen, DecSeqLen: integer;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TMusicGenModel;
+
+// ---------------------------------------------------------------------------
 // RWKV-4 IMPORT (model_type "rwkv": RWKV/rwkv-4-169m-pile and siblings,
 // architectures ["RwkvForCausalLM"]) - the FIRST NON-TRANSFORMER importer:
 // a recurrent WKV mixer (Peng et al. 2023, arXiv:2305.13048) that decodes
@@ -23283,6 +23418,537 @@ begin
   end;
   SetLength(SliceChannels, 0);
   SetLength(Heads, 0);
+end;
+
+// ===========================================================================
+// MUSICGEN IMPLEMENTATION (see the MUSICGEN IMPORT section above).
+// ===========================================================================
+
+procedure MusicGenDelayInterleave(const Raw: TNNetIntArr2D; PadId: integer;
+  out Delayed: TNNetIntArr2D);
+var
+  K, Len, k_i, t: integer;
+begin
+  K := Length(Raw);
+  if K = 0 then begin SetLength(Delayed, 0); exit; end;
+  Len := Length(Raw[0]);
+  SetLength(Delayed, K);
+  for k_i := 0 to K - 1 do
+  begin
+    SetLength(Delayed[k_i], Len);
+    for t := 0 to Len - 1 do
+      // HF build_delay_pattern_mask: codebook k is placed at shifted columns
+      // [k .. seq_len+k) then the lower-triangular BOS mask pads columns
+      // [0 .. k] (k+1 leading slots), so the truncated delayed form is
+      // Delayed[k][t] = pad for t <= k, else raw[k][t-k] (raw[k][0] is the
+      // dropped BOS slot - the model generates it, it is not an input id).
+      if t <= k_i then
+        Delayed[k_i][t] := PadId
+      else
+        Delayed[k_i][t] := Raw[k_i][t - k_i];
+  end;
+end;
+
+procedure MusicGenDelayDeinterleave(const Delayed: TNNetIntArr2D;
+  OutLen: integer; out Raw: TNNetIntArr2D);
+var
+  K, k_i, t: integer;
+begin
+  K := Length(Delayed);
+  if K = 0 then begin SetLength(Raw, 0); exit; end;
+  SetLength(Raw, K);
+  for k_i := 0 to K - 1 do
+  begin
+    SetLength(Raw[k_i], OutLen);
+    for t := 0 to OutLen - 1 do
+      // Inverse shift: raw[k][t] (for t >= 1) was placed at delayed column
+      // t + k by the interleave above; raw[k][0] is the dropped BOS slot, so
+      // index 0 reads back the leading pad (callers ignore it / overwrite it).
+      Raw[k_i][t] := Delayed[k_i][t + k_i];
+  end;
+end;
+
+function ReadMusicGenConfigFromJSONFile(const FileName: string): TMusicGenConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, DecObj, TextObj: TJSONObject;
+  Node: TJSONData;
+  ModelType, ActFn: string;
+  AudioChannels: integer;
+
+  function GetInt(O: TJSONObject; const Name: string; Def: integer): integer;
+  begin
+    if (O <> nil) and (O.IndexOfName(Name) >= 0) then Result := O.Get(Name, Def)
+    else Result := Def;
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('MusicGen import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError('MusicGen import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', '');
+    if (ModelType <> '') and (ModelType <> 'musicgen') then
+      ImportError('MusicGen import: config model_type is "' + ModelType +
+        '", expected "musicgen".');
+    Result.ModelType := 'musicgen';
+    // Decoder sub-config: nested under "decoder" on real HF checkpoints; the
+    // pico fixture nests it too. Fall back to the top object if absent.
+    DecObj := Obj;
+    Node := Obj.Find('decoder');
+    if (Node <> nil) and (Node is TJSONObject) then DecObj := TJSONObject(Node);
+    // text_encoder.d_model (for enc_to_dec_proj). Pico fixture flattens this
+    // to "text_d_model" at the top level.
+    TextObj := nil;
+    Node := Obj.Find('text_encoder');
+    if (Node <> nil) and (Node is TJSONObject) then TextObj := TJSONObject(Node);
+    Result.TextDModel := GetInt(TextObj, 'd_model',
+      GetInt(Obj, 'text_d_model', 0));
+    Result.Hidden := GetInt(DecObj, 'hidden_size', 0);
+    Result.NumLayers := GetInt(DecObj, 'num_hidden_layers', 0);
+    Result.NumHeads := GetInt(DecObj, 'num_attention_heads', 0);
+    Result.FFNDim := GetInt(DecObj, 'ffn_dim', 0);
+    Result.VocabSize := GetInt(DecObj, 'vocab_size', 0);
+    Result.NumCodebooks := GetInt(DecObj, 'num_codebooks', 0);
+    Result.MaxPositionEmbeddings :=
+      GetInt(DecObj, 'max_position_embeddings', 2048);
+    AudioChannels := GetInt(DecObj, 'audio_channels', 1);
+    ActFn := DecObj.Get('activation_function', 'gelu');
+    if (Result.TextDModel <= 0) or (Result.Hidden <= 0) or
+       (Result.NumLayers <= 0) or (Result.NumHeads <= 0) or
+       (Result.FFNDim <= 0) or (Result.VocabSize <= 0) or
+       (Result.NumCodebooks <= 0) then
+      ImportError('MusicGen import: config "' + FileName + '" is missing a ' +
+        'required field (text_d_model/d_model, hidden_size, ' +
+        'num_hidden_layers, num_attention_heads, ffn_dim, vocab_size, ' +
+        'num_codebooks).');
+    if AudioChannels <> 1 then
+      ImportError('MusicGen import: audio_channels=' +
+        IntToStr(AudioChannels) + ' (stereo uses 2*K codebooks) is a ' +
+        'documented follow-up; only mono (1) is supported.');
+    if ActFn <> 'gelu' then
+      ImportError('MusicGen import: activation_function "' + ActFn +
+        '" is not supported (only the exact-erf "gelu"; every published ' +
+        'MusicGen pins it).');
+    if Odd(Result.Hidden) then
+      ImportError('MusicGen import: hidden_size must be EVEN (the half-split ' +
+        'sinusoidal table), got ' + IntToStr(Result.Hidden) + '.');
+    if (Result.Hidden mod Result.NumHeads) <> 0 then
+      ImportError('MusicGen import: num_attention_heads must divide ' +
+        'hidden_size.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function MusicGenConfigToString(const Config: TMusicGenConfig): string;
+begin
+  Result := 'musicgen config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', hidden=' + IntToStr(Config.Hidden) +
+    ', ffn=' + IntToStr(Config.FFNDim) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', codebooks=' + IntToStr(Config.NumCodebooks) +
+    ', text_d_model=' + IntToStr(Config.TextDModel) +
+    ', max_pos=' + IntToStr(Config.MaxPositionEmbeddings);
+end;
+
+{ TMusicGenModel }
+
+constructor TMusicGenModel.Create(const pConfig: TMusicGenConfig;
+  EncSeqLen, DecSeqLen: integer);
+var
+  k_i: integer;
+begin
+  inherited Create;
+  FConfig := pConfig;
+  FEncSeqLen := EncSeqLen;
+  FDecSeqLen := DecSeqLen;
+  SetLength(FEmbed, FConfig.NumCodebooks);
+  for k_i := 0 to FConfig.NumCodebooks - 1 do
+    FEmbed[k_i] := TNNetVolume.Create;
+  FPosTable := TNNetVolume.Create;
+  FEncToDecW := TNNetVolume.Create;
+  FEncToDecB := TNNetVolume.Create;
+  FDecoder := nil;
+end;
+
+destructor TMusicGenModel.Destroy;
+var
+  k_i: integer;
+begin
+  for k_i := 0 to High(FEmbed) do FEmbed[k_i].Free;
+  SetLength(FEmbed, 0);
+  FPosTable.Free;
+  FEncToDecW.Free;
+  FEncToDecB.Free;
+  FDecoder.Free;
+  inherited Destroy;
+end;
+
+procedure TMusicGenModel.ProjectEncoderStates(EncStates, Dst: TNNetVolume);
+var
+  t, o, i: integer;
+  Acc: TNeuralFloat;
+begin
+  // EncStates is (EncSeqLen, 1, TextDModel); Dst becomes (EncSeqLen,1,Hidden):
+  // Dst[t][o] = sum_i EncToDecW[o][i] * EncStates[t][i] + EncToDecB[o].
+  Dst.ReSize(FEncSeqLen, 1, FConfig.Hidden);
+  for t := 0 to FEncSeqLen - 1 do
+    for o := 0 to FConfig.Hidden - 1 do
+    begin
+      Acc := FEncToDecB.FData[o];
+      for i := 0 to FConfig.TextDModel - 1 do
+        Acc := Acc + FEncToDecW.FData[o * FConfig.TextDModel + i] *
+          EncStates.FData[t * FConfig.TextDModel + i];
+      Dst.FData[t * FConfig.Hidden + o] := Acc;
+    end;
+end;
+
+procedure TMusicGenModel.ComputeLogits(const Codes: TNNetIntArr2D;
+  EncHidden, Logits: TNNetVolume);
+var
+  InEmb: TNNetVolume;
+  EncStatesInput: TNNetLayer;
+  t, k_i, c, tok: integer;
+begin
+  if Length(Codes) <> FConfig.NumCodebooks then
+    ImportError('MusicGen ComputeLogits: code stack has ' +
+      IntToStr(Length(Codes)) + ' codebooks, expected ' +
+      IntToStr(FConfig.NumCodebooks) + '.');
+  // Precompute the decoder input embeddings: sum of the K codebook lookups
+  // plus the sinusoidal position vector, per frame.
+  InEmb := TNNetVolume.Create;
+  try
+    InEmb.ReSize(FDecSeqLen, 1, FConfig.Hidden);
+    InEmb.Fill(0);
+    for t := 0 to FDecSeqLen - 1 do
+    begin
+      for k_i := 0 to FConfig.NumCodebooks - 1 do
+      begin
+        tok := Codes[k_i][t];
+        if (tok < 0) or (tok > FConfig.VocabSize) then
+          ImportError('MusicGen ComputeLogits: code ' + IntToStr(tok) +
+            ' out of range [0, ' + IntToStr(FConfig.VocabSize) + '].');
+        for c := 0 to FConfig.Hidden - 1 do
+          InEmb.FData[t * FConfig.Hidden + c] :=
+            InEmb.FData[t * FConfig.Hidden + c] +
+            FEmbed[k_i].FData[tok * FConfig.Hidden + c];
+      end;
+      for c := 0 to FConfig.Hidden - 1 do
+        InEmb.FData[t * FConfig.Hidden + c] :=
+          InEmb.FData[t * FConfig.Hidden + c] +
+          FPosTable.FData[t * FConfig.Hidden + c];
+    end;
+    // Feed the projected encoder states into the decoder's second input.
+    EncStatesInput := T5EncoderStatesInput(FDecoder);
+    if EncStatesInput.Output.Size <> EncHidden.Size then
+      ImportError('MusicGen ComputeLogits: encoder-states size mismatch.');
+    EncStatesInput.Output.Copy(EncHidden);
+    // Run the transformer blocks from the precomputed embedding. The net's
+    // output already depth-concatenates the K LM heads, so the result is
+    // (DecSeqLen,1,K*VocabSize): codebook k's vocab vector at frame t lives at
+    // depth k*VocabSize..k*VocabSize+VocabSize-1.
+    FDecoder.Compute(InEmb);
+    Logits.Copy(FDecoder.GetLastLayer().Output);
+  finally
+    InEmb.Free;
+  end;
+end;
+
+procedure TMusicGenModel.Generate(EncStates: TNNetVolume; NumFrames: integer;
+  out Codes: TNNetIntArr2D);
+var
+  EncHidden, Logits: TNNetVolume;
+  Delayed: TNNetIntArr2D;
+  PadId, Steps, step, k_i, v, best, t, base: integer;
+  bestVal, vv: TNeuralFloat;
+begin
+  PadId := FConfig.VocabSize;
+  // Delayed column 0 is the shared BOS prompt; real frames occupy columns
+  // 1..NumFrames+K-1 (codebook k's frame f at column f+k+1). The decode runs
+  // Steps = NumFrames + K - 1 steps to fill them all (predicting column s+1
+  // from the logits at position s).
+  Steps := NumFrames + FConfig.NumCodebooks - 1;
+  if Steps >= FDecSeqLen then
+    ImportError('MusicGen Generate: NumFrames + K = ' + IntToStr(Steps + 1) +
+      ' exceeds DecSeqLen ' + IntToStr(FDecSeqLen) +
+      ' (rebuild the model with a larger DecSeqLen).');
+  EncHidden := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  try
+    ProjectEncoderStates(EncStates, EncHidden);
+    // Delayed[k][s] holds the (delay-shifted) decoder input id at step s;
+    // initialise every slot to PadId (the start-of-sequence pad).
+    SetLength(Delayed, FConfig.NumCodebooks);
+    for k_i := 0 to FConfig.NumCodebooks - 1 do
+    begin
+      SetLength(Delayed[k_i], FDecSeqLen);
+      for step := 0 to FDecSeqLen - 1 do
+        Delayed[k_i][step] := PadId;
+    end;
+    // Greedy autoregressive loop. At step s we run the decoder on the codes
+    // emitted so far and read the argmax for every codebook whose delay slot
+    // becomes valid (codebook k predicts the token at position s+1 for slot
+    // s+1-k, mirroring the delay pattern). We fill StepCodes[k][s+1] for the
+    // codebooks active at the NEXT step, then copy into Delayed.
+    for step := 0 to Steps - 1 do
+    begin
+      ComputeLogits(Delayed, EncHidden, Logits);
+      t := step + 1; // the delayed column being predicted this step
+      for k_i := 0 to FConfig.NumCodebooks - 1 do
+      begin
+        // Codebook k_i fills delayed column t only once its delay has started
+        // (t >= k_i + 1) and the column still maps to a real frame
+        // (frame f = t - k_i - 1 in [0, NumFrames)).
+        if (t < FDecSeqLen) and (t >= k_i + 1) and
+           (t - k_i - 1 < NumFrames) then
+        begin
+          base := k_i * FConfig.VocabSize;
+          best := 0;
+          bestVal := Logits.FData[step * (FConfig.NumCodebooks *
+            FConfig.VocabSize) + base];
+          for v := 1 to FConfig.VocabSize - 1 do
+          begin
+            vv := Logits.FData[step * (FConfig.NumCodebooks *
+              FConfig.VocabSize) + base + v];
+            if vv > bestVal then begin bestVal := vv; best := v; end;
+          end;
+          Delayed[k_i][t] := best;
+        end;
+      end;
+    end;
+    // Undelay: code (k, frame f) lives at delayed column f + k + 1 (column 0
+    // is the shared BOS prompt).
+    SetLength(Codes, FConfig.NumCodebooks);
+    for k_i := 0 to FConfig.NumCodebooks - 1 do
+    begin
+      SetLength(Codes[k_i], NumFrames);
+      for t := 0 to NumFrames - 1 do
+        Codes[k_i][t] := Delayed[k_i][t + k_i + 1];
+    end;
+  finally
+    EncHidden.Free;
+    Logits.Free;
+  end;
+end;
+
+function BuildMusicGenFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  const Config: TMusicGenConfig; EncSeqLen, DecSeqLen: integer;
+  pInferenceOnly: boolean = false): TMusicGenModel;
+var
+  Model: TMusicGenModel;
+  Dec: TNNet;
+  DecInput, EncStates, FinalLN: TNNetLayer;
+  Blocks: TMarianBlockArray;
+  HeadLayers: array of TNNetLayer;
+  PegShim: TPegasusConfig;
+  Tmp: TNNetVolume;
+  Consumed: TStringList;
+  k_i, j, i, BlockCnt, Half, PosCnt, ChCnt: integer;
+  EmbConst, Angle: double;
+  TName, BP: string;
+begin
+  if EncSeqLen < 1 then
+    ImportError('MusicGen import: EncSeqLen must be >= 1.');
+  if DecSeqLen < 1 then
+    ImportError('MusicGen import: DecSeqLen must be >= 1.');
+  if DecSeqLen > Config.MaxPositionEmbeddings then
+    ImportError('MusicGen import: DecSeqLen must not exceed ' +
+      'max_position_embeddings = ' +
+      IntToStr(Config.MaxPositionEmbeddings) + '.');
+
+  Model := TMusicGenModel.Create(Config, EncSeqLen, DecSeqLen);
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  Dec := nil;
+  try
+    // ----- decoder net: input embeddings + enc states -> blocks -> heads ---
+    Dec := TNNet.Create();
+    DecInput := Dec.AddLayer( TNNetInput.Create(DecSeqLen, 1, Config.Hidden) );
+    EncStates := Dec.AddLayerAfter(
+      TNNetInput.Create(EncSeqLen, 1, Config.Hidden, 1), 0);
+    // Keep the embedding stream as the active layer for the block builder.
+    Dec.AddLayerAfter( TNNetIdentity.Create(), DecInput );
+    // MusicGen decoder blocks are PRE-norm (LN, sublayer, add raw) with exact-
+    // erf GELU and cross-attention - the Pegasus block skeleton exactly. The
+    // shim only carries DModel into the loader.
+    PegShim.DModel := Config.Hidden;
+    PegShim.VocabSize := Config.VocabSize;
+    BuildPegasusStackBlocks(Dec, PegShim, Config.NumLayers, Config.NumHeads,
+      Config.FFNDim, {IsDecoder=}true, EncStates, Blocks, pInferenceOnly,
+      {pQuantizeInt8=}false, {UseReluFFN=}false);
+    // Final decoder LayerNorm (closes the pre-norm stack).
+    FinalLN := Dec.AddLayer( TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+    // K LM heads over the final hidden, depth-concatenated into K*vocab.
+    SetLength(HeadLayers, Config.NumCodebooks);
+    for k_i := 0 to Config.NumCodebooks - 1 do
+      HeadLayers[k_i] := Dec.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize), FinalLN);
+    Dec.AddLayer( TNNetDeepConcat.Create(HeadLayers) );
+    if pInferenceOnly then Dec.MakeInferenceOnly();
+    Model.FDecoder := Dec;
+
+    Tmp := TNNetVolume.Create;
+    try
+      // ----- K embedding tables (vocab+1 rows x hidden) -----
+      for k_i := 0 to Config.NumCodebooks - 1 do
+      begin
+        TName := 'decoder.model.decoder.embed_tokens.' + IntToStr(k_i) +
+          '.weight';
+        if not Reader.HasTensor(TName) then
+          ImportError('MusicGen import: missing tensor "' + TName +
+            '" - not a MusicgenForConditionalGeneration checkpoint?');
+        if (Reader.DimCount(TName) <> 2) or
+           (Reader.DimSize(TName, 0) <> Config.VocabSize + 1) or
+           (Reader.DimSize(TName, 1) <> Config.Hidden) then
+          ImportError('MusicGen import: "' + TName + '" must have shape [' +
+            IntToStr(Config.VocabSize + 1) + ', ' + IntToStr(Config.Hidden) +
+            '], got ' + Reader.ShapeAsString(TName));
+        Reader.LoadTensorFlat(TName, Model.FEmbed[k_i]);
+        Consumed.Add(TName);
+      end;
+
+      // ----- enc_to_dec_proj (Linear with bias: hidden x text_d_model) -----
+      TName := 'enc_to_dec_proj.weight';
+      if not Reader.HasTensor(TName) then
+        ImportError('MusicGen import: missing tensor "' + TName + '".');
+      if (Reader.DimCount(TName) <> 2) or
+         (Reader.DimSize(TName, 0) <> Config.Hidden) or
+         (Reader.DimSize(TName, 1) <> Config.TextDModel) then
+        ImportError('MusicGen import: "' + TName + '" must have shape [' +
+          IntToStr(Config.Hidden) + ', ' + IntToStr(Config.TextDModel) +
+          '], got ' + Reader.ShapeAsString(TName));
+      Reader.LoadTensorFlat(TName, Model.FEncToDecW);
+      Consumed.Add(TName);
+      TName := 'enc_to_dec_proj.bias';
+      if not Reader.HasTensor(TName) then
+        ImportError('MusicGen import: missing tensor "' + TName + '".');
+      Reader.LoadTensorFlat(TName, Model.FEncToDecB);
+      Consumed.Add(TName);
+
+      // ----- K LM heads (untied, no bias: vocab x hidden) -----
+      for k_i := 0 to Config.NumCodebooks - 1 do
+      begin
+        TName := 'decoder.lm_heads.' + IntToStr(k_i) + '.weight';
+        if not Reader.HasTensor(TName) then
+          ImportError('MusicGen import: missing tensor "' + TName + '".');
+        if (Reader.DimCount(TName) <> 2) or
+           (Reader.DimSize(TName, 0) <> Config.VocabSize) or
+           (Reader.DimSize(TName, 1) <> Config.Hidden) then
+          ImportError('MusicGen import: "' + TName + '" must have shape [' +
+            IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.Hidden) +
+            '], got ' + Reader.ShapeAsString(TName));
+        Reader.LoadTensorFlat(TName, Tmp);
+        EnsureWritableImportWeights(HeadLayers[k_i]);
+        for j := 0 to Config.VocabSize - 1 do
+        begin
+          for i := 0 to Config.Hidden - 1 do
+            HeadLayers[k_i].Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.Hidden + i];
+          HeadLayers[k_i].Neurons[j].BiasWeight := 0;
+        end;
+        HeadLayers[k_i].FlushWeightCache();
+        Consumed.Add(TName);
+      end;
+    finally
+      Tmp.Free;
+    end;
+
+    // ----- sinusoidal position table (HF cat([cos, sin]) half-split) -----
+    Model.FPosTable.ReSize(DecSeqLen, 1, Config.Hidden);
+    Half := Config.Hidden div 2;
+    EmbConst := Ln(10000.0) / (Half - 1);
+    for PosCnt := 0 to DecSeqLen - 1 do
+      for ChCnt := 0 to Half - 1 do
+      begin
+        Angle := PosCnt * Exp(-ChCnt * EmbConst);
+        // cos in the FIRST half, sin in the second (HF MusicGen layout).
+        Model.FPosTable.FData[PosCnt * Config.Hidden + ChCnt] := Cos(Angle);
+        Model.FPosTable.FData[PosCnt * Config.Hidden + Half + ChCnt] :=
+          Sin(Angle);
+      end;
+
+    // ----- per-block weights (BIAS-FREE q/k/v/out and fc1/fc2) -----
+    for BlockCnt := 0 to High(Blocks) do
+    begin
+      BP := 'decoder.model.decoder.layers.' + IntToStr(BlockCnt) + '.';
+      // self-attention (bias-free)
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SelfAttn.QProj,
+        BP + 'self_attn.q_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SelfAttn.KProj,
+        BP + 'self_attn.k_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SelfAttn.VProj,
+        BP + 'self_attn.v_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SelfAttn.OProj,
+        BP + 'self_attn.out_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLayerNormWeights(Reader, Blocks[BlockCnt].SelfAttn.Norm,
+        BP + 'self_attn_layer_norm.weight', BP + 'self_attn_layer_norm.bias',
+        Config.Hidden);
+      // cross-attention (bias-free)
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].CrossAttn.QProj,
+        BP + 'encoder_attn.q_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].CrossAttn.KProj,
+        BP + 'encoder_attn.k_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].CrossAttn.VProj,
+        BP + 'encoder_attn.v_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].CrossAttn.OProj,
+        BP + 'encoder_attn.out_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLayerNormWeights(Reader, Blocks[BlockCnt].CrossAttn.Norm,
+        BP + 'encoder_attn_layer_norm.weight',
+        BP + 'encoder_attn_layer_norm.bias', Config.Hidden);
+      // FFN (bias-free)
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc1,
+        BP + 'fc1.weight', Config.Hidden, Config.FFNDim);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc2,
+        BP + 'fc2.weight', Config.FFNDim, Config.Hidden);
+      LoadLayerNormWeights(Reader, Blocks[BlockCnt].FFNNorm,
+        BP + 'final_layer_norm.weight', BP + 'final_layer_norm.bias',
+        Config.Hidden);
+    end;
+
+    // ----- final decoder LayerNorm -----
+    LoadLayerNormWeights(Reader, FinalLN,
+      'decoder.model.decoder.layer_norm.weight',
+      'decoder.model.decoder.layer_norm.bias', Config.Hidden);
+
+    Result := Model;
+  except
+    Model.Free;
+    Consumed.Free;
+    raise;
+  end;
+  Consumed.Free;
+end;
+
+function BuildMusicGenFromSafeTensors(const FileName: string;
+  out Config: TMusicGenConfig; EncSeqLen, DecSeqLen: integer;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TMusicGenModel;
+var
+  Reader: TNNetSafeTensorsReader;
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadMusicGenConfigFromJSONFile(ConfigPath);
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildMusicGenFromSafeTensorsEx(Reader, Config, EncSeqLen,
+      DecSeqLen, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
 end;
 
 procedure BuildPegasusFromSafeTensorsWithConfig(const FileName: string;
