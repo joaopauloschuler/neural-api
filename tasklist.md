@@ -1002,29 +1002,23 @@ rather than acted on.
       ray-marching + alpha-compositing primitive that any future 3-D / view-synthesis
       work (instant-NGP hash grids, 3D Gaussian splatting) would build on.
 
-- [X] BEiT / data2vec-vision ViT importer (BuildBeitFromSafeTensors[Ex], e.g.
-      microsoft/beit-base-patch16-224, facebook/data2vec-vision-base). DONE:
-      BuildBeitFromSafeTensors[Ex]/WithConfig + TBeitConfig + ReadBeitConfig
-      FromJSONFile/BeitConfigToString in neural/neuralpretrained.pas. Full global
-      attention with a per-LAYER learned relative_position_bias (cls-aware index,
-      the last 3 table rows for cls<->token interactions) added to every block's
-      scores; LayerScale (lambda_1/2, gamma_1/2 fallback) on both branches; NO
-      absolute positions; learnable cls token; query/value biased + KEY bias-free.
-      REUSED TNNetWindowAttention (the Swin relative-position layer) with the FULL
-      seq x seq bias matrix per head (no new leaf layer) + DINOv2's LayerScale
-      (TNNetChannelMul) + patch-embed scaffolding. The cls-aware relative-position
-      index BeitBuildRelPosIndex matches HF generate_relative_position_index
-      exactly. Parity < 1e-4 vs HF float64 oracle: tools/beit_tiny_fixture.py +
-      tests/fixtures/tiny_beit.* + TestBeitParity/TestBeitConfigFromJSONFile.
-      Deferred follow-ups:
-      - [ ] use_shared_relative_position_bias=true (one model-level table shared by
-            all layers) is rejected; only the per-layer table is wired.
-      - [ ] use_absolute_position_embeddings=true and use_relative_position_bias=
-            false variants rejected (the published checkpoints don't use them).
-      - [ ] No top-level BuildFromPretrained dispatch entry / classifier head /
-            ForImageClassification wrapper yet (builder returns token hidden states;
-            use_mean_pooling pooler LayerNorm + patch mean left to the caller).
-      - [ ] BEiTv2 (vector-quantized) not validated.
+- [ ] BEiT / data2vec-vision ViT importer follow-ups (BuildBeitFromSafeTensors[Ex]
+      /WithConfig + TBeitConfig + ReadBeitConfigFromJSONFile/BeitConfigToString
+      LANDED, e.g. microsoft/beit-base-patch16-224, facebook/data2vec-vision-base —
+      full global attention with a per-LAYER learned cls-aware relative_position_bias
+      reusing TNNetWindowAttention (no new leaf layer) + LayerScale (TNNetChannelMul)
+      on both branches, learnable cls token, query/value biased + KEY bias-free, no
+      absolute positions; BeitBuildRelPosIndex matches HF generate_relative_position_index
+      exactly; pico parity TestBeitParity/TestBeitConfigFromJSONFile < 1e-4 vs HF
+      float64 oracle via tools/beit_tiny_fixture.py + tests/fixtures/tiny_beit.*):
+  - [ ] use_shared_relative_position_bias=true (one model-level table shared by
+        all layers) is rejected; only the per-layer table is wired.
+  - [ ] use_absolute_position_embeddings=true and use_relative_position_bias=
+        false variants rejected (the published checkpoints don't use them).
+  - [ ] No top-level BuildFromPretrained dispatch entry / classifier head /
+        ForImageClassification wrapper yet (builder returns token hidden states;
+        use_mean_pooling pooler LayerNorm + patch mean left to the caller).
+  - [ ] BEiTv2 (vector-quantized) not validated.
 
 - [ ] BLIP-2 Q-Former vision-language importer (BuildBlip2QFormerFromSafeTensors[Ex]
       + BuildBlip2FromSafeTensors, e.g. Salesforce/blip2-opt-2.7b). The landed VLM
