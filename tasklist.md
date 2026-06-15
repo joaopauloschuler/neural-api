@@ -656,7 +656,7 @@ rather than acted on.
       (do_stable_layer_norm), and the final encoder LayerNorm placement that
       pre-norm implies. Then wav2vec2 SELF-SUPERVISED pretraining (the quantizer /
       contrastive masked-prediction heads currently dropped as ignorable tensors).
-- [ ] EnCodec neural audio codec importer (BuildEnCodecFromSafeTensors, e.g.
+- [X] EnCodec neural audio codec importer (BuildEnCodecFromSafeTensors, e.g.
       facebook/encodec_24khz) — the FIRST audio-GENERATIVE importer and the foundational
       decoder for neural audio synthesis. Every landed audio model (Wav2Vec2/HuBERT) is
       analysis-only (audio -> CTC text); EnCodec is the inverse — a streaming

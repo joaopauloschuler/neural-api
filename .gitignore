@@ -21,6 +21,7 @@ examples/GumbelAnnealingAutoencoder/GumbelAnnealingAutoencoder
 examples/BeamSearchDecode/BeamSearchDecode
 examples/ColBERTSearch/ColBERTSearch
 examples/EmbeddingSearch/EmbeddingSearch
+examples/EnCodecRoundTrip/EnCodecRoundTrip
 examples/LotteryTicketIMP/LotteryTicketIMP
 examples/VQCodebookUsage/VQCodebookUsage
 examples/FourierMix/FourierMix

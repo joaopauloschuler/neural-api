@@ -3425,6 +3425,178 @@ function BuildWav2Vec2FromSafeTensors(const FileName: string;
   NumSamples: integer; pInferenceOnly: boolean = false): TNNet;
 
 // ---------------------------------------------------------------------------
+// EnCodec NEURAL AUDIO CODEC IMPORT (model_type "encodec", e.g.
+// facebook/encodec_24khz, architectures ["EncodecModel"]) - the FIRST
+// audio-GENERATIVE importer. Every landed audio model (Wav2Vec2 / HuBERT /
+// Whisper) is analysis-only (audio -> text); EnCodec is a CODEC: a streaming
+// convolutional ENCODER turns a waveform into a stack of discrete codes, and
+// a mirror DECODER turns codes back into a waveform. The genuinely NEW
+// primitive is RESIDUAL VECTOR QUANTIZATION (RVQ): a cascade of N codebooks
+// where each successive codebook quantizes the RESIDUAL left by the previous
+// one (the repo's single-codebook TNNetVectorQuantizer is the one-stage
+// special case). v1 is INFERENCE-ONLY reconstruction (waveform -> codes ->
+// waveform) of the causal, weight-norm, normalize=False encodec_24khz family.
+//
+// The codec is implemented as a self-contained holder (TEnCodecModel) doing
+// the conv / LSTM / RVQ math directly on channel-major arrays, NOT as a TNNet
+// layer graph: EnCodec's causal Conv1d uses REFLECT left-padding of
+// (kernel-1)*dilation plus an extra ceil-to-stride right pad, the
+// ConvTranspose1d trims the right tail by trim_right_ratio, and the LSTM
+// bottleneck is a RESIDUAL 2-layer recurrence - semantics that do not map
+// cleanly onto the existing strided-conv layers, so a direct implementation
+// is both simpler and exactly HF-faithful.
+//
+// Pipeline (HF EncodecModel, use_causal_conv True, norm_type weight_norm,
+// normalize False - the encodec_24khz topology):
+//   ENCODER:
+//     Conv1d(audio_channels -> num_filters, kernel_size)
+//     for ratio in reversed(upsampling_ratios):
+//       ResnetBlock(dim)                      // ELU,Conv(k=residual_kernel,
+//                                             //   dim->dim/compress),ELU,
+//                                             //   Conv(k=1,->dim) + shortcut
+//                                             //   Conv(k=1); dilation grows
+//                                             //   by dilation_growth_rate**j
+//       ELU; Conv1d(dim -> 2*dim, k=2*ratio, stride=ratio)   // downsample
+//     LSTM(num_lstm_layers, residual: out = lstm(x) + x)
+//     ELU; Conv1d(dim -> hidden_size, last_kernel_size)
+//   RVQ.encode: residual := z; for each codebook: idx := argmin_k
+//     ||residual - embed[k]||^2 (HF stores embed [codebook_size, hidden_size]
+//     and selects via the squared-distance argmax of -dist, identical to an
+//     argmin); quantized := embed[idx]; residual := residual - quantized.
+//   RVQ.decode: sum over stages of embed[code] -> latent z_q.
+//   DECODER (mirror): Conv1d(hidden -> 2^L*num_filters, k); LSTM(residual);
+//     for ratio in upsampling_ratios: ELU; ConvTranspose1d(dim -> dim/2,
+//     k=2*ratio, stride=ratio, causal right-trim); ResnetBlock(dim/2);
+//     final ELU; Conv1d(num_filters -> audio_channels, last_kernel_size).
+// Conv weights are weight_norm-parametrized: the checkpoint stores
+// original0 (g, [O,1,1]) + original1 (v, [O,in,k]); the effective weight is
+// w[o] = g[o] * v[o] / ||v[o]||_F (weight_norm dim=0). normalize=True (the
+// per-clip RMS scale of the 48 kHz stereo model) and chunked streaming are
+// documented follow-ups. Coded by Claude (AI).
+// ---------------------------------------------------------------------------
+type
+  // Channel-major signal (one TNeuralFloatDynArr per channel) and a code
+  // stack (one TNeuralIntegerArray per RVQ stage), used by TEnCodecModel.
+  TNNetFloatDynArr2D = array of TNeuralFloatDynArr;
+  TNNetIntArr2D = array of TNeuralIntegerArray;
+
+  TEnCodecConfig = record
+    SamplingRate: integer;      // sampling_rate (24000)
+    AudioChannels: integer;     // audio_channels (1)
+    HiddenSize: integer;        // hidden_size (RVQ latent dim, 128)
+    NumFilters: integer;        // num_filters (32)
+    NumResidualLayers: integer; // num_residual_layers (1)
+    UpsamplingRatios: array of integer; // upsampling_ratios ([8,5,4,2])
+    KernelSize: integer;        // kernel_size (7)
+    LastKernelSize: integer;    // last_kernel_size (7)
+    ResidualKernelSize: integer;// residual_kernel_size (3)
+    DilationGrowthRate: integer;// dilation_growth_rate (2)
+    Compress: integer;          // compress (2)
+    NumLSTMLayers: integer;     // num_lstm_layers (2)
+    TrimRightRatio: TNeuralFloat; // trim_right_ratio (1.0)
+    CodebookSize: integer;      // codebook_size (1024)
+    CodebookDim: integer;       // codebook_dim (== hidden_size, 128)
+    NumQuantizers: integer;     // RVQ codebooks present in the checkpoint
+    UseConvShortcut: boolean;   // use_conv_shortcut (true)
+    UseCausalConv: boolean;     // use_causal_conv (true; only supported value)
+    Normalize: boolean;         // normalize (false; only supported value)
+    NormType: string;           // norm_type ('weight_norm')
+    PadMode: string;            // pad_mode ('reflect')
+    ModelType: string;          // 'encodec'
+  end;
+
+  // A single weight-norm Conv1d (or, when FTranspose, ConvTranspose1d) stage:
+  // effective weight FW[o][i][k] already folded from g/v, plus bias FB[o].
+  TEnCodecConv = record
+    InCh, OutCh, Kernel, Stride, Dilation: integer;
+    Transpose: boolean;
+    W: array of TNeuralFloat;   // flat [OutCh, InCh, Kernel] row-major
+    B: array of TNeuralFloat;   // [OutCh]
+  end;
+
+  // One residual block: ELU -> Conv1 -> ELU -> Conv2 (+ shortcut Conv).
+  TEnCodecResnet = record
+    Conv1, Conv2, Shortcut: TEnCodecConv;
+    HasShortcut: boolean;
+  end;
+
+  // A 2D weight matrix [rows, cols] held flat, row-major.
+  TEnCodecMat = record
+    Rows, Cols: integer;
+    Data: array of TNeuralFloat;
+  end;
+
+  // A residual multi-layer LSTM (out = lstm(x) + x). Per layer: Wih [4H,in],
+  // Whh [4H,H], bih/bhh [4H]; PyTorch gate order i,f,g,o.
+  TEnCodecLSTM = record
+    NumLayers, Hidden: integer;
+    Wih, Whh: array of TEnCodecMat;          // one per layer
+    Bih, Bhh: array of array of TNeuralFloat;// one per layer
+  end;
+
+  // One conv encoder/decoder stage in execution order: exactly one kind is
+  // populated (Conv, Resnet or LSTM), the rest are inert.
+  TEnCodecStageKind = (eskConv, eskResnet, eskLSTM, eskELU);
+  TEnCodecStage = record
+    Kind: TEnCodecStageKind;
+    Conv: TEnCodecConv;
+    Resnet: TEnCodecResnet;
+  end;
+
+  { TEnCodecModel }
+  // Holds the imported EnCodec weights and runs the full waveform <-> codes
+  // round trip in inference. Built by BuildEnCodecFromSafeTensors[Ex];
+  // caller-owned. Coded by Claude (AI).
+  TEnCodecModel = class
+  private
+    FConfig: TEnCodecConfig;
+    FEncStages, FDecStages: array of TEnCodecStage;
+    FEncLSTM, FDecLSTM: TEnCodecLSTM;
+    FCodebooks: array of TEnCodecMat;   // [NumQuantizers] each [size, dim]
+    // Applies one stage to a channel-major signal (Channels x Time arrays).
+    procedure RunStage(const Stage: TEnCodecStage;
+      const InSig: array of TNeuralFloatDynArr; out OutSig: TNNetFloatDynArr2D);
+  public
+    constructor Create(const pConfig: TEnCodecConfig);
+    destructor Destroy; override;
+    property Config: TEnCodecConfig read FConfig;
+    // Number of RVQ codebooks loaded.
+    function NumCodebooks: integer;
+    // Runs the conv encoder + RVQ on a mono waveform of NumSamples samples,
+    // returning Codes[q][t] (q = codebook stage, t = latent frame) and the
+    // number of latent frames in FrameCount.
+    procedure EncodeAudioToCodes(const Waveform: array of TNeuralFloat;
+      out Codes: TNNetIntArr2D; out FrameCount: integer);
+    // Inverse: RVQ-decodes Codes (UseQuantizers stages, <=0 = all) and runs
+    // the conv decoder, writing the reconstructed mono waveform to Waveform.
+    procedure DecodeCodesToAudio(const Codes: TNNetIntArr2D;
+      out Waveform: TNeuralFloatDynArr; UseQuantizers: integer = 0);
+    // Convenience full round trip waveform -> codes -> waveform.
+    procedure Reconstruct(const Waveform: array of TNeuralFloat;
+      out ReconOut: TNeuralFloatDynArr);
+  end;
+
+// Reads a HF EnCodec config.json (model_type "encodec"). Required:
+// hidden_size, num_filters, upsampling_ratios, codebook_size. Defaults follow
+// EncodecConfig. Rejects use_causal_conv=false, normalize=true and a
+// norm_type other than "weight_norm" loudly (documented follow-ups).
+function ReadEnCodecConfigFromJSONFile(const FileName: string): TEnCodecConfig;
+
+function EnCodecConfigToString(const Config: TEnCodecConfig): string;
+
+// Builds a TEnCodecModel from Reader (the caller owns Reader). Config.
+// NumQuantizers is detected from the checkpoint (the number of
+// quantizer.layers.N.codebook.embed tensors present). Coded by Claude (AI).
+function BuildEnCodecFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  var Config: TEnCodecConfig): TEnCodecModel;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+function BuildEnCodecFromSafeTensors(const FileName: string;
+  out Config: TEnCodecConfig;
+  const ConfigFileName: string = ''): TEnCodecModel;
+
+// ---------------------------------------------------------------------------
 // RWKV-4 IMPORT (model_type "rwkv": RWKV/rwkv-4-169m-pile and siblings,
 // architectures ["RwkvForCausalLM"]) - the FIRST NON-TRANSFORMER importer:
 // a recurrent WKV mixer (Peng et al. 2023, arXiv:2305.13048) that decodes
@@ -25329,6 +25501,803 @@ var
 begin
   Result := BuildWav2Vec2FromSafeTensorsEx(FileName, Config, NumSamples,
     pInferenceOnly);
+end;
+
+// ===========================================================================
+// EnCodec NEURAL AUDIO CODEC IMPORT - see the interface header.
+// ===========================================================================
+
+function ReadEnCodecConfigFromJSONFile(const FileName: string): TEnCodecConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, NormType: string;
+  RatiosArr: TJSONData;
+  Arr: TJSONArray;
+  I: integer;
+
+  function OptInt(const Name: string; Def: integer): integer;
+  begin
+    if Obj.IndexOfName(Name) >= 0 then Result := Obj.Get(Name, Def)
+    else Result := Def;
+  end;
+  function OptBool(const Name: string; Def: boolean): boolean;
+  begin
+    if Obj.IndexOfName(Name) >= 0 then Result := Obj.Get(Name, Def)
+    else Result := Def;
+  end;
+  function OptFloat(const Name: string; Def: double): double;
+  begin
+    if Obj.IndexOfName(Name) >= 0 then Result := Obj.Get(Name, Def)
+    else Result := Def;
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('EnCodec import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError('EnCodec import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', '');
+    if (ModelType <> '') and (ModelType <> 'encodec') then
+      ImportError('EnCodec import: config model_type is "' + ModelType +
+        '", expected "encodec".');
+    Result.ModelType := 'encodec';
+    Result.SamplingRate := OptInt('sampling_rate', 24000);
+    Result.AudioChannels := OptInt('audio_channels', 1);
+    Result.HiddenSize := OptInt('hidden_size', 128);
+    Result.NumFilters := OptInt('num_filters', 32);
+    Result.NumResidualLayers := OptInt('num_residual_layers', 1);
+    Result.KernelSize := OptInt('kernel_size', 7);
+    Result.LastKernelSize := OptInt('last_kernel_size', 7);
+    Result.ResidualKernelSize := OptInt('residual_kernel_size', 3);
+    Result.DilationGrowthRate := OptInt('dilation_growth_rate', 2);
+    Result.Compress := OptInt('compress', 2);
+    Result.NumLSTMLayers := OptInt('num_lstm_layers', 2);
+    Result.TrimRightRatio := OptFloat('trim_right_ratio', 1.0);
+    Result.CodebookSize := OptInt('codebook_size', 1024);
+    Result.CodebookDim := OptInt('codebook_dim', Result.HiddenSize);
+    Result.UseConvShortcut := OptBool('use_conv_shortcut', True);
+    Result.UseCausalConv := OptBool('use_causal_conv', True);
+    Result.Normalize := OptBool('normalize', False);
+    NormType := Obj.Get('norm_type', 'weight_norm');
+    Result.NormType := NormType;
+    Result.PadMode := Obj.Get('pad_mode', 'reflect');
+    // NumQuantizers is detected from the checkpoint, not the config (HF's
+    // config field is derived from the frame rate / bandwidth).
+    Result.NumQuantizers := 0;
+    RatiosArr := Obj.Find('upsampling_ratios');
+    if (RatiosArr = nil) or RatiosArr.IsNull or not (RatiosArr is TJSONArray) then
+      ImportError('EnCodec import: config "' + FileName +
+        '" requires an "upsampling_ratios" array.');
+    Arr := TJSONArray(RatiosArr);
+    if Arr.Count < 1 then
+      ImportError('EnCodec import: "upsampling_ratios" array is empty.');
+    SetLength(Result.UpsamplingRatios, Arr.Count);
+    for I := 0 to Arr.Count - 1 do
+      Result.UpsamplingRatios[I] := Arr.Integers[I];
+    // Supported-variant guards (documented follow-ups otherwise).
+    if not Result.UseCausalConv then
+      ImportError('EnCodec import: use_causal_conv=false is not supported ' +
+        '(the non-causal symmetric-pad variant is a documented follow-up).');
+    if Result.Normalize then
+      ImportError('EnCodec import: normalize=true (the per-clip RMS scale ' +
+        'of the 48 kHz stereo model) is not supported yet.');
+    if NormType <> 'weight_norm' then
+      ImportError('EnCodec import: norm_type "' + NormType + '" is not ' +
+        'supported (only "weight_norm"; time_group_norm is a follow-up).');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function EnCodecConfigToString(const Config: TEnCodecConfig): string;
+var
+  I: integer;
+  Ratios: string;
+begin
+  Ratios := '[';
+  for I := 0 to Length(Config.UpsamplingRatios) - 1 do
+  begin
+    if I > 0 then Ratios := Ratios + ',';
+    Ratios := Ratios + IntToStr(Config.UpsamplingRatios[I]);
+  end;
+  Ratios := Ratios + ']';
+  Result :=
+    'EnCodec(' + Config.ModelType + '): sampling_rate=' +
+    IntToStr(Config.SamplingRate) + ' channels=' +
+    IntToStr(Config.AudioChannels) + ' hidden=' +
+    IntToStr(Config.HiddenSize) + ' filters=' +
+    IntToStr(Config.NumFilters) + ' residual_layers=' +
+    IntToStr(Config.NumResidualLayers) + ' ratios=' + Ratios +
+    ' kernel=' + IntToStr(Config.KernelSize) + ' last_kernel=' +
+    IntToStr(Config.LastKernelSize) + ' residual_kernel=' +
+    IntToStr(Config.ResidualKernelSize) + ' dilation_growth=' +
+    IntToStr(Config.DilationGrowthRate) + ' compress=' +
+    IntToStr(Config.Compress) + ' lstm_layers=' +
+    IntToStr(Config.NumLSTMLayers) + ' codebook_size=' +
+    IntToStr(Config.CodebookSize) + ' codebook_dim=' +
+    IntToStr(Config.CodebookDim) + ' num_quantizers=' +
+    IntToStr(Config.NumQuantizers) + ' causal=' +
+    BoolToStr(Config.UseCausalConv, True) + ' norm=' + Config.NormType;
+end;
+
+// --- ELU activation (alpha = 1), elementwise. ---
+function EnCodecELU(X: TNeuralFloat): TNeuralFloat;
+begin
+  if X > 0 then Result := X else Result := Exp(X) - 1;
+end;
+
+// Loads one weight-norm Conv1d (or ConvTranspose1d) stage from Reader,
+// reconstructing the effective weight w[o] = g[o]*v[o]/||v[o]||_F (weight_norm
+// dim=0). HF's safetensors store v as [Out,In,K] for Conv1d and [In,Out,K]
+// for ConvTranspose1d; the flat row-major layout is preserved verbatim into
+// Conv.W (the run-time forward indexes it accordingly).
+procedure LoadEnCodecConv(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; var Conv: TEnCodecConv; pTranspose: boolean;
+  pStride, pDilation: integer; Consumed: TStrings);
+var
+  G, V: TNNetVolume;
+  OutDim, InDim, K, o, i, k2, Base, Cnt: integer;
+  Norm: TNeuralFloat;
+begin
+  G := TNNetVolume.Create;
+  V := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Prefix + '.parametrizations.weight.original0', G);
+    Reader.LoadTensorFlat(Prefix + '.parametrizations.weight.original1', V);
+    Consumed.Add(Prefix + '.parametrizations.weight.original0');
+    Consumed.Add(Prefix + '.parametrizations.weight.original1');
+    // v shape: dim0 is the weight_norm group axis (= G's length).
+    OutDim := Reader.DimSize(Prefix + '.parametrizations.weight.original1', 0);
+    InDim := Reader.DimSize(Prefix + '.parametrizations.weight.original1', 1);
+    K := Reader.DimSize(Prefix + '.parametrizations.weight.original1', 2);
+    Conv.Transpose := pTranspose;
+    Conv.Stride := pStride;
+    Conv.Dilation := pDilation;
+    Conv.Kernel := K;
+    if pTranspose then
+    begin
+      // ConvTranspose1d weight is [In, Out, K]; the group axis (dim0) is In.
+      Conv.InCh := OutDim;
+      Conv.OutCh := InDim;
+    end
+    else
+    begin
+      Conv.InCh := InDim;
+      Conv.OutCh := OutDim;
+    end;
+    Cnt := OutDim * InDim * K;
+    SetLength(Conv.W, Cnt);
+    // weight_norm dim=0: per group-row o, w = g[o] * v[o,:,:] / ||v[o,:,:]||.
+    for o := 0 to OutDim - 1 do
+    begin
+      Base := o * InDim * K;
+      Norm := 0;
+      for i := 0 to InDim - 1 do
+        for k2 := 0 to K - 1 do
+          Norm := Norm + Sqr(V.FData[Base + i * K + k2]);
+      Norm := Sqrt(Norm);
+      if Norm = 0 then Norm := 1;
+      for i := 0 to InDim - 1 do
+        for k2 := 0 to K - 1 do
+          Conv.W[Base + i * K + k2] :=
+            G.FData[o] * V.FData[Base + i * K + k2] / Norm;
+    end;
+    Reader.LoadTensorFlat(Prefix + '.bias', G);
+    Consumed.Add(Prefix + '.bias');
+    SetLength(Conv.B, G.Size);
+    for o := 0 to G.Size - 1 do Conv.B[o] := G.FData[o];
+  finally
+    V.Free;
+    G.Free;
+  end;
+end;
+
+// Loads a 2-D matrix tensor [Rows,Cols] into Mat.
+procedure LoadEnCodecMat(Reader: TNNetSafeTensorsReader;
+  const Name: string; var Mat: TEnCodecMat; Consumed: TStrings);
+var
+  T: TNNetVolume;
+  I: integer;
+begin
+  T := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Name, T);
+    Mat.Rows := Reader.DimSize(Name, 0);
+    Mat.Cols := Reader.DimSize(Name, 1);
+    SetLength(Mat.Data, T.Size);
+    for I := 0 to T.Size - 1 do Mat.Data[I] := T.FData[I];
+    Consumed.Add(Name);
+  finally
+    T.Free;
+  end;
+end;
+
+procedure LoadEnCodecVec(Reader: TNNetSafeTensorsReader;
+  const Name: string; out Vec: TNeuralFloatDynArr; Consumed: TStrings);
+var
+  T: TNNetVolume;
+  I: integer;
+begin
+  T := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Name, T);
+    SetLength(Vec, T.Size);
+    for I := 0 to T.Size - 1 do Vec[I] := T.FData[I];
+    Consumed.Add(Name);
+  finally
+    T.Free;
+  end;
+end;
+
+procedure LoadEnCodecLSTM(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; var LSTM: TEnCodecLSTM; NumLayers: integer;
+  Consumed: TStrings);
+var
+  L: integer;
+  S: string;
+begin
+  LSTM.NumLayers := NumLayers;
+  SetLength(LSTM.Wih, NumLayers);
+  SetLength(LSTM.Whh, NumLayers);
+  SetLength(LSTM.Bih, NumLayers);
+  SetLength(LSTM.Bhh, NumLayers);
+  for L := 0 to NumLayers - 1 do
+  begin
+    S := IntToStr(L);
+    LoadEnCodecMat(Reader, Prefix + '.weight_ih_l' + S,
+      LSTM.Wih[L], Consumed);
+    LoadEnCodecMat(Reader, Prefix + '.weight_hh_l' + IntToStr(L),
+      LSTM.Whh[L], Consumed);
+    LoadEnCodecVec(Reader, Prefix + '.bias_ih_l' + IntToStr(L),
+      LSTM.Bih[L], Consumed);
+    LoadEnCodecVec(Reader, Prefix + '.bias_hh_l' + IntToStr(L),
+      LSTM.Bhh[L], Consumed);
+    LSTM.Hidden := LSTM.Whh[L].Cols;
+  end;
+end;
+
+{ TEnCodecModel }
+
+constructor TEnCodecModel.Create(const pConfig: TEnCodecConfig);
+begin
+  inherited Create();
+  FConfig := pConfig;
+end;
+
+destructor TEnCodecModel.Destroy;
+begin
+  inherited Destroy;
+end;
+
+function TEnCodecModel.NumCodebooks: integer;
+begin
+  Result := Length(FCodebooks);
+end;
+
+// Causal Conv1d / ConvTranspose1d on a channel-major signal. Reflect
+// left-padding for Conv1d (pad = (k-1)*dilation + extra ceil-to-stride);
+// ConvTranspose1d upsamples by stride then right-trims (k - stride) frames
+// (trim_right_ratio 1.0 in the supported family). InSig[c][t], OutSig[c][t].
+procedure RunEnCodecConv(const Conv: TEnCodecConv;
+  const InSig: array of TNeuralFloatDynArr; out OutSig: TNNetFloatDynArr2D);
+var
+  InCh, OutCh, K, Stride, Dil, InLen, o, i, t, k2, src, PadTotal, Extra: integer;
+  NFrames, OutLen, idx, FullLen, PadRight, EffK: integer;
+  Acc: TNeuralFloat;
+  Padded: array of TNeuralFloatDynArr;
+  Full: array of TNeuralFloatDynArr;
+  RefIdx: integer;
+begin
+  InCh := Conv.InCh;
+  OutCh := Conv.OutCh;
+  K := Conv.Kernel;
+  Stride := Conv.Stride;
+  Dil := Conv.Dilation;
+  InLen := Length(InSig[0]);
+  if not Conv.Transpose then
+  begin
+    // HF buffers: effective kernel = (K-1)*dilation + 1; total causal
+    // padding = effective_kernel - stride.
+    EffK := (K - 1) * Dil + 1;
+    PadTotal := EffK - Stride;
+    // Extra ceil-to-stride right pad (HF _get_extra_padding_for_conv1d, which
+    // uses the EFFECTIVE kernel and padding_total).
+    NFrames := Ceil((InLen - EffK + PadTotal) / Stride + 1) - 1;
+    Extra := NFrames * Stride + EffK - PadTotal - InLen;
+    if Extra < 0 then Extra := 0;
+    // Build the reflect-left-padded + extra-right-padded signal per channel.
+    SetLength(Padded, InCh);
+    for i := 0 to InCh - 1 do
+    begin
+      SetLength(Padded[i], PadTotal + InLen + Extra);
+      // Left reflect pad: mirror around index 0 WITHOUT repeating sample 0
+      // (PyTorch 'reflect': padded[PadTotal-1-j] = x[1+j]).
+      for t := 0 to PadTotal - 1 do
+      begin
+        RefIdx := PadTotal - t; // distance from the first real sample
+        if RefIdx >= InLen then RefIdx := InLen - 1;
+        Padded[i][t] := InSig[i][RefIdx];
+      end;
+      for t := 0 to InLen - 1 do Padded[i][PadTotal + t] := InSig[i][t];
+      // Right extra pad: HF pads with reflect too, but the extra padding sits
+      // past the last real sample; reflect around the last index.
+      for t := 0 to Extra - 1 do
+      begin
+        RefIdx := InLen - 2 - t;
+        if RefIdx < 0 then RefIdx := 0;
+        Padded[i][PadTotal + InLen + t] := InSig[i][RefIdx];
+      end;
+    end;
+    OutLen := (Length(Padded[0]) - EffK) div Stride + 1;
+    if OutLen < 0 then OutLen := 0;
+    SetLength(OutSig, OutCh);
+    for o := 0 to OutCh - 1 do
+    begin
+      SetLength(OutSig[o], OutLen);
+      for t := 0 to OutLen - 1 do
+      begin
+        Acc := Conv.B[o];
+        for i := 0 to InCh - 1 do
+          for k2 := 0 to K - 1 do
+          begin
+            src := t * Stride + k2 * Dil;
+            Acc := Acc + Conv.W[o * InCh * K + i * K + k2] * Padded[i][src];
+          end;
+        OutSig[o][t] := Acc;
+      end;
+    end;
+  end
+  else
+  begin
+    // ConvTranspose1d: full length = (InLen-1)*stride + K. Weight is
+    // [In,Out,K] flat: W[i*OutCh*K + o*K + k2]. Then right-trim (K-stride).
+    FullLen := (InLen - 1) * Stride + K;
+    SetLength(Full, OutCh);
+    for o := 0 to OutCh - 1 do
+    begin
+      SetLength(Full[o], FullLen);
+      for t := 0 to FullLen - 1 do Full[o][t] := 0;
+    end;
+    for i := 0 to InCh - 1 do
+      for t := 0 to InLen - 1 do
+        for o := 0 to OutCh - 1 do
+          for k2 := 0 to K - 1 do
+          begin
+            idx := t * Stride + k2;
+            Full[o][idx] := Full[o][idx] +
+              Conv.W[i * OutCh * K + o * K + k2] * InSig[i][t];
+          end;
+    // Add bias across the whole (untrimmed) output.
+    for o := 0 to OutCh - 1 do
+      for t := 0 to FullLen - 1 do Full[o][t] := Full[o][t] + Conv.B[o];
+    // Causal right-trim: padding_total = K - stride, padding_right =
+    // ceil(padding_total * trim_right_ratio) = padding_total (ratio 1.0),
+    // padding_left = 0; keep [0 .. FullLen - padding_right).
+    PadRight := K - Stride;
+    OutLen := FullLen - PadRight;
+    if OutLen < 0 then OutLen := 0;
+    SetLength(OutSig, OutCh);
+    for o := 0 to OutCh - 1 do
+    begin
+      SetLength(OutSig[o], OutLen);
+      for t := 0 to OutLen - 1 do OutSig[o][t] := Full[o][t];
+    end;
+  end;
+end;
+
+// Residual multi-layer LSTM over a channel-major signal: PyTorch packs the
+// sequence as time-major [T, features]; we run the recurrence per time step.
+// out = LSTM(x) + x. Gate order in the [4H] rows is i, f, g, o.
+procedure RunEnCodecLSTM(const LSTM: TEnCodecLSTM;
+  var Sig: TNNetFloatDynArr2D);
+var
+  H, T, L, t2, ch, g, j: integer;
+  hPrev, cPrev, xIn: TNeuralFloatDynArr;
+  gates: TNeuralFloatDynArr;
+  ig, fg, gg, og, cNew, hNew: TNeuralFloat;
+  Inp: TNNetFloatDynArr2D;
+begin
+  H := LSTM.Hidden;
+  T := Length(Sig[0]);
+  // Keep the input copy for the final residual add.
+  SetLength(Inp, H);
+  for ch := 0 to H - 1 do
+  begin
+    SetLength(Inp[ch], T);
+    for t2 := 0 to T - 1 do Inp[ch][t2] := Sig[ch][t2];
+  end;
+  SetLength(xIn, H);
+  SetLength(gates, 4 * H);
+  for L := 0 to LSTM.NumLayers - 1 do
+  begin
+    SetLength(hPrev, H);
+    SetLength(cPrev, H);
+    for j := 0 to H - 1 do begin hPrev[j] := 0; cPrev[j] := 0; end;
+    for t2 := 0 to T - 1 do
+    begin
+      for ch := 0 to H - 1 do xIn[ch] := Sig[ch][t2];
+      // gates = Wih*x + bih + Whh*hPrev + bhh
+      for g := 0 to 4 * H - 1 do
+      begin
+        gates[g] := LSTM.Bih[L][g] + LSTM.Bhh[L][g];
+        for ch := 0 to H - 1 do
+          gates[g] := gates[g] + LSTM.Wih[L].Data[g * H + ch] * xIn[ch];
+        for ch := 0 to H - 1 do
+          gates[g] := gates[g] + LSTM.Whh[L].Data[g * H + ch] * hPrev[ch];
+      end;
+      for ch := 0 to H - 1 do
+      begin
+        ig := 1 / (1 + Exp(-gates[ch]));
+        fg := 1 / (1 + Exp(-gates[H + ch]));
+        gg := Tanh(gates[2 * H + ch]);
+        og := 1 / (1 + Exp(-gates[3 * H + ch]));
+        cNew := fg * cPrev[ch] + ig * gg;
+        hNew := og * Tanh(cNew);
+        cPrev[ch] := cNew;
+        hPrev[ch] := hNew;
+        Sig[ch][t2] := hNew; // this layer's output feeds the next layer
+      end;
+    end;
+  end;
+  // Residual add of the ORIGINAL pre-LSTM input.
+  for ch := 0 to H - 1 do
+    for t2 := 0 to T - 1 do Sig[ch][t2] := Sig[ch][t2] + Inp[ch][t2];
+end;
+
+procedure ApplyEnCodecELU(var Sig: TNNetFloatDynArr2D);
+var
+  c, t: integer;
+begin
+  for c := 0 to Length(Sig) - 1 do
+    for t := 0 to Length(Sig[c]) - 1 do
+      Sig[c][t] := EnCodecELU(Sig[c][t]);
+end;
+
+procedure TEnCodecModel.RunStage(const Stage: TEnCodecStage;
+  const InSig: array of TNeuralFloatDynArr; out OutSig: TNNetFloatDynArr2D);
+var
+  Tmp, Shr_, Res: TNNetFloatDynArr2D;
+  c, t: integer;
+begin
+  case Stage.Kind of
+    eskConv: RunEnCodecConv(Stage.Conv, InSig, OutSig);
+    eskELU:
+      begin
+        SetLength(OutSig, Length(InSig));
+        for c := 0 to Length(InSig) - 1 do
+        begin
+          SetLength(OutSig[c], Length(InSig[c]));
+          for t := 0 to Length(InSig[c]) - 1 do
+            OutSig[c][t] := EnCodecELU(InSig[c][t]);
+        end;
+      end;
+    eskResnet:
+      begin
+        // block: ELU -> Conv1 -> ELU -> Conv2; output = shortcut(x) + block.
+        SetLength(Tmp, Length(InSig));
+        for c := 0 to Length(InSig) - 1 do
+        begin
+          SetLength(Tmp[c], Length(InSig[c]));
+          for t := 0 to Length(InSig[c]) - 1 do
+            Tmp[c][t] := EnCodecELU(InSig[c][t]);
+        end;
+        RunEnCodecConv(Stage.Resnet.Conv1, Tmp, Res);
+        ApplyEnCodecELU(Res);
+        RunEnCodecConv(Stage.Resnet.Conv2, Res, Tmp);
+        if Stage.Resnet.HasShortcut then
+          RunEnCodecConv(Stage.Resnet.Shortcut, InSig, Shr_)
+        else
+        begin
+          SetLength(Shr_, Length(InSig));
+          for c := 0 to Length(InSig) - 1 do Shr_[c] := InSig[c];
+        end;
+        SetLength(OutSig, Length(Tmp));
+        for c := 0 to Length(Tmp) - 1 do
+        begin
+          SetLength(OutSig[c], Length(Tmp[c]));
+          for t := 0 to Length(Tmp[c]) - 1 do
+            OutSig[c][t] := Shr_[c][t] + Tmp[c][t];
+        end;
+      end;
+    eskLSTM: ; // handled inline in Encode/Decode (uses FEncLSTM/FDecLSTM)
+  end;
+end;
+
+procedure TEnCodecModel.EncodeAudioToCodes(
+  const Waveform: array of TNeuralFloat;
+  out Codes: TNNetIntArr2D; out FrameCount: integer);
+var
+  Sig, Nxt: TNNetFloatDynArr2D;
+  s, q, t, d, best, K, Dm, Frames: integer;
+  Dist, BestDist, Diff: TNeuralFloat;
+  Residual, Vec: TNeuralFloatDynArr;
+begin
+  // Channel-major input (mono): Sig[0][t] = waveform.
+  SetLength(Sig, FConfig.AudioChannels);
+  SetLength(Sig[0], Length(Waveform));
+  for t := 0 to Length(Waveform) - 1 do Sig[0][t] := Waveform[t];
+  // Run the encoder stages in order; the LSTM stage is applied in place.
+  for s := 0 to Length(FEncStages) - 1 do
+  begin
+    if FEncStages[s].Kind = eskLSTM then
+      RunEnCodecLSTM(FEncLSTM, Sig)
+    else
+    begin
+      RunStage(FEncStages[s], Sig, Nxt);
+      Sig := Nxt;
+    end;
+  end;
+  // Sig is now [hidden][frames]. RVQ: per stage argmin-L2 over the residual.
+  Dm := FConfig.HiddenSize;
+  K := FConfig.CodebookSize;
+  Frames := Length(Sig[0]);
+  FrameCount := Frames;
+  SetLength(Codes, Length(FCodebooks));
+  SetLength(Residual, Dm);
+  SetLength(Vec, Dm);
+  for q := 0 to Length(FCodebooks) - 1 do SetLength(Codes[q], Frames);
+  for t := 0 to Frames - 1 do
+  begin
+    for d := 0 to Dm - 1 do Residual[d] := Sig[d][t];
+    for q := 0 to Length(FCodebooks) - 1 do
+    begin
+      best := 0; BestDist := -1;
+      for s := 0 to K - 1 do
+      begin
+        Dist := 0;
+        for d := 0 to Dm - 1 do
+        begin
+          Diff := Residual[d] - FCodebooks[q].Data[s * Dm + d];
+          Dist := Dist + Diff * Diff;
+        end;
+        if (BestDist < 0) or (Dist < BestDist) then
+        begin BestDist := Dist; best := s; end;
+      end;
+      Codes[q][t] := best;
+      // Subtract the chosen code from the residual for the next stage.
+      for d := 0 to Dm - 1 do
+        Residual[d] := Residual[d] - FCodebooks[q].Data[best * Dm + d];
+    end;
+  end;
+end;
+
+procedure TEnCodecModel.DecodeCodesToAudio(const Codes: TNNetIntArr2D;
+  out Waveform: TNeuralFloatDynArr; UseQuantizers: integer = 0);
+var
+  Sig, Nxt: TNNetFloatDynArr2D;
+  s, q, t, d, Dm, Frames, NQ, code: integer;
+begin
+  Dm := FConfig.HiddenSize;
+  NQ := Length(Codes);
+  if (UseQuantizers > 0) and (UseQuantizers < NQ) then NQ := UseQuantizers;
+  if NQ > Length(FCodebooks) then NQ := Length(FCodebooks);
+  Frames := 0;
+  if Length(Codes) > 0 then Frames := Length(Codes[0]);
+  // RVQ decode: latent = sum over stages of embed[code].
+  SetLength(Sig, Dm);
+  for d := 0 to Dm - 1 do
+  begin
+    SetLength(Sig[d], Frames);
+    for t := 0 to Frames - 1 do Sig[d][t] := 0;
+  end;
+  for q := 0 to NQ - 1 do
+    for t := 0 to Frames - 1 do
+    begin
+      code := Codes[q][t];
+      for d := 0 to Dm - 1 do
+        Sig[d][t] := Sig[d][t] + FCodebooks[q].Data[code * Dm + d];
+    end;
+  // Run the decoder stages.
+  for s := 0 to Length(FDecStages) - 1 do
+  begin
+    if FDecStages[s].Kind = eskLSTM then
+      RunEnCodecLSTM(FDecLSTM, Sig)
+    else
+    begin
+      RunStage(FDecStages[s], Sig, Nxt);
+      Sig := Nxt;
+    end;
+  end;
+  // Mono output.
+  SetLength(Waveform, Length(Sig[0]));
+  for t := 0 to Length(Sig[0]) - 1 do Waveform[t] := Sig[0][t];
+end;
+
+procedure TEnCodecModel.Reconstruct(const Waveform: array of TNeuralFloat;
+  out ReconOut: TNeuralFloatDynArr);
+var
+  Codes: TNNetIntArr2D;
+  Frames: integer;
+begin
+  EncodeAudioToCodes(Waveform, Codes, Frames);
+  DecodeCodesToAudio(Codes, ReconOut, 0);
+end;
+
+function BuildEnCodecFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  var Config: TEnCodecConfig): TEnCodecModel;
+var
+  Model: TEnCodecModel;
+  Consumed: TStringList;
+  Idx, r, j, dim, NumRatios, ratio, dil, NQ, ScalePow: integer;
+  EncStages, DecStages: array of TEnCodecStage;
+  EncCnt, DecCnt: integer;
+  Pref: string;
+
+  procedure PushEnc(const St: TEnCodecStage);
+  begin
+    if EncCnt >= Length(EncStages) then SetLength(EncStages, EncCnt + 8);
+    EncStages[EncCnt] := St; Inc(EncCnt);
+  end;
+  procedure PushDec(const St: TEnCodecStage);
+  begin
+    if DecCnt >= Length(DecStages) then SetLength(DecStages, DecCnt + 8);
+    DecStages[DecCnt] := St; Inc(DecCnt);
+  end;
+
+  function MakeConvStage(const P: string; pTr: boolean;
+    pStride, pDil: integer): TEnCodecStage;
+  begin
+    Result.Kind := eskConv;
+    LoadEnCodecConv(Reader, P, Result.Conv, pTr, pStride, pDil, Consumed);
+  end;
+  function MakeELU: TEnCodecStage;
+  begin
+    Result.Kind := eskELU;
+  end;
+  function MakeResnetStage(const Base: string; pDim, pResK,
+    pDil: integer): TEnCodecStage;
+  begin
+    Result.Kind := eskResnet;
+    // block.1 = Conv(dim->dim/compress, k=residual_kernel, dilation), block.3
+    // = Conv(dim/compress->dim, k=1). shortcut present iff use_conv_shortcut.
+    LoadEnCodecConv(Reader, Base + '.block.1.conv', Result.Resnet.Conv1,
+      False, 1, pDil, Consumed);
+    LoadEnCodecConv(Reader, Base + '.block.3.conv', Result.Resnet.Conv2,
+      False, 1, 1, Consumed);
+    Result.Resnet.HasShortcut := Config.UseConvShortcut and
+      Reader.HasTensor(Base + '.shortcut.conv.bias');
+    if Result.Resnet.HasShortcut then
+      LoadEnCodecConv(Reader, Base + '.shortcut.conv', Result.Resnet.Shortcut,
+        False, 1, 1, Consumed);
+  end;
+
+begin
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  Model := nil;
+  try
+    // Detect the number of RVQ codebooks present in the checkpoint.
+    NQ := 0;
+    while Reader.HasTensor('quantizer.layers.' + IntToStr(NQ) +
+      '.codebook.embed') do Inc(NQ);
+    if NQ < 1 then
+      ImportError('EnCodec import: no quantizer.layers.N.codebook.embed ' +
+        'tensors found in ' + Reader.FileName + ' - not an EnCodec ' +
+        'checkpoint?');
+    Config.NumQuantizers := NQ;
+
+    Model := TEnCodecModel.Create(Config);
+    EncCnt := 0; DecCnt := 0;
+    NumRatios := Length(Config.UpsamplingRatios);
+
+    // ---------------- ENCODER stage list (matching HF nn.ModuleList) ------
+    // layer 0: Conv(audio_channels -> num_filters, kernel_size)
+    Idx := 0;
+    PushEnc(MakeConvStage('encoder.layers.0.conv', False, 1, 1));
+    Idx := 1;
+    dim := Config.NumFilters;
+    // reversed(upsampling_ratios): each adds [Resnet]*num_residual_layers,
+    // ELU, downsample Conv.
+    for r := NumRatios - 1 downto 0 do
+    begin
+      ratio := Config.UpsamplingRatios[r];
+      for j := 0 to Config.NumResidualLayers - 1 do
+      begin
+        dil := Round(IntPower(Config.DilationGrowthRate, j));
+        PushEnc(MakeResnetStage('encoder.layers.' + IntToStr(Idx), dim,
+          Config.ResidualKernelSize, dil));
+        Inc(Idx);
+      end;
+      PushEnc(MakeELU); Inc(Idx); // nn.ELU (no params)
+      PushEnc(MakeConvStage('encoder.layers.' + IntToStr(Idx) + '.conv',
+        False, ratio, 1));
+      Inc(Idx);
+      dim := dim * 2;
+    end;
+    // LSTM stage
+    LoadEnCodecLSTM(Reader, 'encoder.layers.' + IntToStr(Idx) + '.lstm',
+      Model.FEncLSTM, Config.NumLSTMLayers, Consumed);
+    PushEnc(MakeELU); EncStages[EncCnt - 1].Kind := eskLSTM; // mark LSTM stage
+    Inc(Idx);
+    PushEnc(MakeELU); Inc(Idx);
+    PushEnc(MakeConvStage('encoder.layers.' + IntToStr(Idx) + '.conv',
+      False, 1, 1));
+
+    // ---------------- DECODER stage list ----------------------------------
+    // layer 0: Conv(hidden -> 2^L * num_filters, kernel_size)
+    PushDec(MakeConvStage('decoder.layers.0.conv', False, 1, 1));
+    Idx := 1;
+    ScalePow := 1;
+    for j := 0 to NumRatios - 1 do ScalePow := ScalePow * 2;
+    dim := ScalePow * Config.NumFilters;
+    // LSTM stage (decoder layer 1)
+    LoadEnCodecLSTM(Reader, 'decoder.layers.' + IntToStr(Idx) + '.lstm',
+      Model.FDecLSTM, Config.NumLSTMLayers, Consumed);
+    PushDec(MakeELU); DecStages[DecCnt - 1].Kind := eskLSTM;
+    Inc(Idx);
+    for r := 0 to NumRatios - 1 do
+    begin
+      ratio := Config.UpsamplingRatios[r];
+      PushDec(MakeELU); Inc(Idx);
+      // ConvTranspose1d(dim -> dim/2, k=2*ratio, stride=ratio)
+      PushDec(MakeConvStage('decoder.layers.' + IntToStr(Idx) + '.conv',
+        True, ratio, 1));
+      Inc(Idx);
+      dim := dim div 2;
+      for j := 0 to Config.NumResidualLayers - 1 do
+      begin
+        dil := Round(IntPower(Config.DilationGrowthRate, j));
+        PushDec(MakeResnetStage('decoder.layers.' + IntToStr(Idx), dim,
+          Config.ResidualKernelSize, dil));
+        Inc(Idx);
+      end;
+    end;
+    PushDec(MakeELU); Inc(Idx);
+    PushDec(MakeConvStage('decoder.layers.' + IntToStr(Idx) + '.conv',
+      False, 1, 1));
+
+    SetLength(EncStages, EncCnt);
+    SetLength(DecStages, DecCnt);
+    Model.FEncStages := EncStages;
+    Model.FDecStages := DecStages;
+
+    // ---------------- RVQ codebooks ----------------
+    SetLength(Model.FCodebooks, NQ);
+    for j := 0 to NQ - 1 do
+    begin
+      Pref := 'quantizer.layers.' + IntToStr(j) + '.codebook.';
+      LoadEnCodecMat(Reader, Pref + 'embed', Model.FCodebooks[j], Consumed);
+      // Drop the non-inference EMA bookkeeping tensors if present.
+      if Reader.HasTensor(Pref + 'embed_avg') then Consumed.Add(Pref + 'embed_avg');
+      if Reader.HasTensor(Pref + 'cluster_size') then Consumed.Add(Pref + 'cluster_size');
+      if Reader.HasTensor(Pref + 'inited') then Consumed.Add(Pref + 'inited');
+    end;
+
+    Result := Model;
+    Model := nil;
+  finally
+    Model.Free;
+    Consumed.Free;
+  end;
+end;
+
+function BuildEnCodecFromSafeTensors(const FileName: string;
+  out Config: TEnCodecConfig;
+  const ConfigFileName: string = ''): TEnCodecModel;
+var
+  Reader: TNNetSafeTensorsReader;
+  CfgPath: string;
+begin
+  if ConfigFileName <> '' then CfgPath := ConfigFileName
+  else CfgPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadEnCodecConfigFromJSONFile(CfgPath);
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildEnCodecFromSafeTensorsEx(Reader, Config);
+  finally
+    Reader.Free;
+  end;
 end;
 
 function ReadRWKVConfigFromJSONFile(const FileName: string): TRWKVConfig;
