@@ -378,7 +378,10 @@ rather than acted on.
       offline here); (b) expose LPIPS as a backprop TRAINING LOSS head so the SR
       examples can opt into perceptual fine-tuning (the VGG build already enables
       input/error collection, so the gradient path exists).
-- [ ] Pix2Pix conditional image-to-image translation example (examples/Pix2Pix) —
+- [X] Pix2Pix conditional image-to-image translation example (examples/Pix2Pix) —
+      DONE: U-Net generator (TNNet.AddUNet) + PatchGAN discriminator, L1+adversarial
+      loss, synthetic grayscale->color task; smoke run drives held-out L1 0.69->0.13,
+      colorAcc->0.88 in ~3.5 min CPU. No new layer class. (Original task below.)
       the repo's only GAN (VisualGAN) is UNCONDITIONAL (noise -> CIFAR image); there
       is no PAIRED image-to-image translation. Train a conditional GAN that maps an
       input image to an output image (edges->shapes, grayscale->color, or a synthetic

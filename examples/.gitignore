@@ -36,3 +36,9 @@ DepthEstimation/DepthEstimation
 
 # PoseEstimation: compiled ViTPose demo binary
 PoseEstimation/PoseEstimation
+
+# Pix2Pix: compiled conditional-GAN demo binary, build artifacts, sample image
+Pix2Pix/Pix2Pix
+Pix2Pix/*.o
+Pix2Pix/*.ppr
+Pix2Pix/pix2pix_sample.ppm
