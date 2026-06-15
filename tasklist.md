@@ -898,6 +898,34 @@ rather than acted on.
       DecodeSeq2SeqGreedy/BeamSearch) + the GQA encoder_num_key_value_heads != heads
       path (wired but only exercised at full multi-head in the pico) + the
       MoonshineTokenizer for end-to-end WAV -> text transcription.
+- [ ] Moonshine DECODER + end-to-end transcription (successor to the landed
+      encoder above). The encoder importer (BuildMoonshineFromSafeTensors) and its
+      hidden-state parity are DONE; this adds the RoPE + SwiGLU decoder so a waveform
+      goes all the way to text. Scope: (a) build the decoder stack (self-attn causal
+      RoPE + cross-attn over the encoder states via the landed T5EncoderStatesInput
+      two-net convention + SwiGLU MLP) onto the existing config; (b) wire greedy/beam
+      via the landed DecodeSeq2SeqGreedy/BeamSearch; (c) extend make_pico_moonshine_fixture.py
+      to ALSO dump decoder next-token logits for a fixed (waveform, prefix-token) pair
+      and add TestMoonshineDecoderLogitParity < 1e-4 vs the HF MoonshineForConditionalGeneration
+      float64 oracle; (d) the MoonshineTokenizer (it ships a tokenizer.json — likely
+      already loadable via TNeuralHFTokenizer) so examples/MoonshineTranscribe emits
+      real text instead of the encoder smoke. Reuse Whisper's seq2seq decode loop as
+      the template. Also close the GQA encoder_num_key_value_heads != heads path with
+      a pico fixture that actually sets kv_heads < heads.
+- [ ] SAM two-way MASK DECODER (successor to the landed SAM image-encoder above).
+      The ViT-B encoder + neck (BuildSAMVisionTower) and its embedding parity are DONE;
+      this adds the lightweight promptable mask decoder so one point click -> one binary
+      mask end-to-end. Scope v1 to a SINGLE point prompt + SINGLE mask output: (a) the
+      prompt encoder (point coords -> positional encoding + learned point/not-a-point
+      embeddings; the dense no-mask embedding); (b) the two-way transformer decoder
+      block (token->image and image->token cross-attention, reuse the landed
+      TNNetCrossAttention two-source wiring) over the learned IoU + mask-output tokens;
+      (c) the output upscaling (2x transposed-conv) + the per-mask hypernetwork-MLP dot
+      with the upscaled embedding -> mask logits. Extend make_pico_sam_fixture.py to
+      build a tiny HF SamModel WITH the mask decoder, feed a fixed point, and dump the
+      low-res mask logits; add TestSAMMaskDecoderParity < 1e-4. Then make
+      examples/SegmentAnything produce a REAL click->mask PPM (replacing the encoder
+      cosine proxy). Watch the CAI fast-X-axis grid mapping the encoder work documented.
 - [ ] Medusa / EAGLE tree-attention speculative decoding — a follow-up that is
       genuinely distinct from the landed SEQUENTIAL self-speculative paths
       (MTP-draft SelfSpeculativeDecoding + LayerSkip/CALM EarlyExitSelfSpeculative,
