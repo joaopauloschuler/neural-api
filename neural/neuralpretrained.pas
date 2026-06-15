@@ -3708,6 +3708,161 @@ function BuildHiFiGANFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNetHiFiGAN;
 
 // ---------------------------------------------------------------------------
+// VITS / MMS-TTS END-TO-END TEXT-TO-SPEECH IMPORT (model_type "vits":
+// facebook/mms-tts-* and kakao-enterprise/vits-ljs; Kim et al. 2021,
+// arXiv:2106.06103) - the FIRST text-to-speech model in the library. Like the
+// HiFi-GAN vocoder above it is implemented as a self-contained channel-major
+// holder (TNNetVits) doing the inference math directly, because the whole
+// pipeline is conv1d / relative-position attention / WaveNet residual stacks
+// that are exactly faithful in direct conv math.
+//
+// INFERENCE pipeline (HF VitsModel.forward; the ONLY path imported - the
+// posterior encoder and the stochastic-duration-predictor training branches
+// are dropped, the DETERMINISTIC duration readout is used, single speaker /
+// no global conditioning):
+//   text_encoder: embed_tokens * sqrt(hidden) -> N relative-position
+//       transformer layers (VitsAttention with emb_rel_k/emb_rel_v window
+//       bias; conv FFN k=ffn_kernel_size relu) -> project Conv1d
+//       (hidden -> 2*flow_size) -> split into prior_means / prior_log_var.
+//   duration_predictor: conv_1(relu)->LayerNorm->conv_2(relu)->LayerNorm
+//       ->proj -> log_duration; duration = ceil(exp(log_dur) * length_scale).
+//   length regulator: expand prior_means / prior_log_var along time, each
+//       token repeated `duration[token]` frames (the monotonic alignment).
+//   prior_latents = expanded_mean + z * exp(expanded_logvar) * noise_scale
+//       where z is the standard-normal prior noise (an EXPLICIT input here so
+//       the parity test is deterministic - no RNG matching).
+//   flow (VitsResidualCouplingBlock run in REVERSE): for each of the
+//       prior_encoder_num_flows coupling layers (reversed order), flip the
+//       channel halves then run a residual-coupling layer in reverse:
+//       second_half := (second_half - mean) where mean = conv_post(WaveNet(
+//       conv_pre(first_half))) (log_stddev is identically zero in VITS, so the
+//       affine reduces to an additive shift - exactly RealNVP/Glow additive
+//       coupling). The WaveNet is the gated dilated residual stack with
+//       weight_norm-folded convs.
+//   decoder: the HiFi-GAN generator (SHARED with TNNetHiFiGAN: conv_pre ->
+//       per-stage LeakyReLU -> ConvTranspose1d upsample -> MRF average of
+//       resblocks -> LeakyReLU -> conv_post (no bias) -> tanh -> waveform).
+//
+// WaveNet / coupling conv weights load weight_norm g/v folded
+// (".parametrizations.weight.original0/1", dim=0) exactly like the HiFi-GAN
+// importer; the text encoder, duration predictor and decoder load plain
+// ".weight" tensors. Coded by Claude (AI).
+// ---------------------------------------------------------------------------
+type
+  TVitsConfig = record
+    VocabSize: integer;             // vocab_size
+    HiddenSize: integer;            // hidden_size
+    NumHiddenLayers: integer;       // num_hidden_layers
+    NumAttentionHeads: integer;     // num_attention_heads
+    FfnDim: integer;                // ffn_dim
+    FfnKernelSize: integer;         // ffn_kernel_size
+    FlowSize: integer;              // flow_size
+    WindowSize: integer;            // window_size (relative-position window)
+    PriorNumFlows: integer;         // prior_encoder_num_flows
+    PriorNumWaveNetLayers: integer; // prior_encoder_num_wavenet_layers
+    WaveNetKernelSize: integer;     // wavenet_kernel_size
+    WaveNetDilationRate: integer;   // wavenet_dilation_rate
+    DurFilterChannels: integer;     // duration_predictor_filter_channels
+    DurKernelSize: integer;         // duration_predictor_kernel_size
+    LayerNormEps: TNeuralFloat;     // layer_norm_eps
+    NoiseScale: TNeuralFloat;       // noise_scale
+    SpeakingRate: TNeuralFloat;     // speaking_rate
+    SamplingRate: integer;          // sampling_rate
+    // The HiFi-GAN decoder sub-config (filled from the same JSON).
+    Decoder: THiFiGANConfig;
+    ModelType: string;              // 'vits'
+  end;
+
+  // One relative-position transformer encoder layer.
+  TVitsAttn = record
+    QW, QB, KW, KB, VW, VB, OW, OB: TNeuralFloatDynArr; // [out,in]/[out] dense
+    RelK, RelV: TNeuralFloatDynArr;  // emb_rel_k/v flat [window*2+1, head_dim]
+  end;
+
+  TVitsEncLayer = record
+    Attn: TVitsAttn;
+    LnW, LnB, FlnW, FlnB: TNeuralFloatDynArr;        // layer_norm/final_ln
+    FF1, FF2: THiFiGANConv;                          // feed_forward conv_1/2
+  end;
+
+  // One WaveNet (gated dilated residual stack) as used by a coupling layer.
+  TVitsWaveNet = record
+    InLayers: array of THiFiGANConv;       // in_layers[i] (2H out, dilated)
+    ResSkip: array of THiFiGANConv;        // res_skip_layers[i]
+  end;
+
+  // One residual-coupling flow layer (additive coupling, log_stddev == 0).
+  TVitsFlow = record
+    ConvPre, ConvPost: THiFiGANConv;
+    WaveNet: TVitsWaveNet;
+  end;
+
+  { TNNetVits }
+  // Holds an imported VITS model and runs the full text -> waveform inference
+  // synthesis. Built by BuildVitsFromSafeTensors[Ex]; caller-owned. The HiFi-
+  // GAN decoder is held as a nested TNNetHiFiGAN (shared synthesis code).
+  // Coded by Claude (AI).
+  TNNetVits = class
+  private
+    FConfig: TVitsConfig;
+    FEmbed: TNeuralFloatDynArr;                      // embed_tokens [V, H]
+    FLayers: array of TVitsEncLayer;
+    FProject: THiFiGANConv;                          // project (H -> 2*flow)
+    FDurConv1, FDurConv2, FDurProj: THiFiGANConv;
+    FDurNorm1W, FDurNorm1B, FDurNorm2W, FDurNorm2B: TNeuralFloatDynArr;
+    FFlows: array of TVitsFlow;
+    FDecoder: TNNetHiFiGAN;                          // HiFi-GAN generator (owned)
+    procedure RunTextEncoder(const Ids: array of integer;
+      out PriorMean, PriorLogVar: TNNetFloatDynArr2D;
+      out Hidden: TNNetFloatDynArr2D);
+    procedure RunDuration(const Hidden: TNNetFloatDynArr2D;
+      out LogDur: TNeuralFloatDynArr);
+    procedure RunWaveNet(const WN: TVitsWaveNet;
+      const Inp: TNNetFloatDynArr2D; out Outp: TNNetFloatDynArr2D);
+    procedure RunFlowReverse(var Latent: TNNetFloatDynArr2D);
+  public
+    constructor Create(const pConfig: TVitsConfig);
+    destructor Destroy; override;
+    property Config: TVitsConfig read FConfig;
+    property Decoder: TNNetHiFiGAN read FDecoder;
+    // Runs the text encoder + deterministic duration predictor and returns the
+    // per-token prior stats (PriorMean/PriorLogVar are [token][flow]) and the
+    // integer per-token durations. Exposed for stage parity testing.
+    procedure Analyze(const Ids: array of integer;
+      out PriorMean, PriorLogVar: TNNetFloatDynArr2D;
+      out Durations: array of integer);
+    // Length-regulator expansion: repeats column `t` of the per-token stats
+    // Durations[t] times along the time axis. Out arrays are [flow][out_len].
+    procedure ExpandPrior(const PriorMean, PriorLogVar: TNNetFloatDynArr2D;
+      const Durations: array of integer;
+      out ExpMean, ExpLogVar: TNNetFloatDynArr2D);
+    // Runs the normalizing flow IN REVERSE on a channel-major latent
+    // [flow][out_len]; returns the spectrogram latent the decoder consumes.
+    procedure FlowReverse(const PriorLatents: TNNetFloatDynArr2D;
+      out Spectrogram: TNNetFloatDynArr2D);
+    // Full inference: token ids -> waveform. Z is the standard-normal prior
+    // noise as [flow][out_len]; pass it explicitly for a deterministic result.
+    // If Z is empty (Length(Z)=0) zero noise is used (the prior mean path).
+    procedure Synthesize(const Ids: array of integer;
+      const Z: TNNetFloatDynArr2D; out Waveform: TNeuralFloatDynArr);
+  end;
+
+// Reads a HF VITS config.json (model_type "vits"). Coded by Claude (AI).
+function ReadVitsConfigFromJSONFile(const FileName: string): TVitsConfig;
+
+function VitsConfigToString(const Config: TVitsConfig): string;
+
+// Builds a TNNetVits from Reader (the caller owns Reader). Coded by Claude (AI).
+function BuildVitsFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  var Config: TVitsConfig): TNNetVits;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+function BuildVitsFromSafeTensors(const FileName: string;
+  out Config: TVitsConfig;
+  const ConfigFileName: string = ''): TNNetVits;
+
+// ---------------------------------------------------------------------------
 // MUSICGEN IMPORT (model_type "musicgen": facebook/musicgen-small and
 // siblings, architectures ["MusicgenForConditionalGeneration"]) - the FIRST
 // text-to-AUDIO generative importer (Copet et al. 2023, arXiv:2306.05284). It
@@ -28144,6 +28299,957 @@ begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
     Result := BuildHiFiGANFromSafeTensorsEx(Reader, Config);
+  finally
+    Reader.Free;
+  end;
+end;
+
+// ===========================================================================
+// VITS / MMS-TTS implementation. Coded by Claude (AI).
+// ===========================================================================
+
+// Loads a plain dense weight [out,in] + bias into flat arrays.
+procedure LoadVitsDense(Reader: TNNetSafeTensorsReader; const Prefix: string;
+  var W, B: TNeuralFloatDynArr; Consumed: TStrings);
+var
+  V: TNNetVolume;
+  i: integer;
+begin
+  V := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Prefix + '.weight', V);
+    Consumed.Add(Prefix + '.weight');
+    SetLength(W, V.Size);
+    for i := 0 to V.Size - 1 do W[i] := V.FData[i];
+    Reader.LoadTensorFlat(Prefix + '.bias', V);
+    Consumed.Add(Prefix + '.bias');
+    SetLength(B, V.Size);
+    for i := 0 to V.Size - 1 do B[i] := V.FData[i];
+  finally
+    V.Free;
+  end;
+end;
+
+// Loads a 1-D vector tensor into Dst.
+procedure LoadVitsVec(Reader: TNNetSafeTensorsReader; const Name: string;
+  var Dst: TNeuralFloatDynArr; Consumed: TStrings);
+var
+  V: TNNetVolume;
+  i: integer;
+begin
+  V := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Name, V);
+    Consumed.Add(Name);
+    SetLength(Dst, V.Size);
+    for i := 0 to V.Size - 1 do Dst[i] := V.FData[i];
+  finally
+    V.Free;
+  end;
+end;
+
+// y[o] = sum_i W[o*InDim+i] * X[i] + B[o]   (row-major [out,in] dense).
+procedure VitsDense(const W, B: TNeuralFloatDynArr; OutDim, InDim: integer;
+  const X: TNeuralFloatDynArr; out Y: TNeuralFloatDynArr);
+var
+  o, i: integer;
+  Acc: TNeuralFloat;
+begin
+  SetLength(Y, OutDim);
+  for o := 0 to OutDim - 1 do
+  begin
+    Acc := B[o];
+    for i := 0 to InDim - 1 do Acc := Acc + W[o * InDim + i] * X[i];
+    Y[o] := Acc;
+  end;
+end;
+
+// LayerNorm over the C-dim of a single (length-C) vector, gain/bias per
+// channel. Matches torch.nn.LayerNorm(eps) (biased variance).
+procedure VitsLayerNormVec(var X: TNeuralFloatDynArr;
+  const Gain, Bias: TNeuralFloatDynArr; Eps: TNeuralFloat);
+var
+  i, C: integer;
+  Mean, Vari, D: TNeuralFloat;
+begin
+  C := Length(X);
+  Mean := 0;
+  for i := 0 to C - 1 do Mean := Mean + X[i];
+  Mean := Mean / C;
+  Vari := 0;
+  for i := 0 to C - 1 do
+  begin
+    D := X[i] - Mean;
+    Vari := Vari + D * D;
+  end;
+  Vari := Vari / C;
+  D := 1.0 / Sqrt(Vari + Eps);
+  for i := 0 to C - 1 do X[i] := (X[i] - Mean) * D * Gain[i] + Bias[i];
+end;
+
+// VitsWaveNet fused activation: given a 2H-channel signal, returns an
+// H-channel signal acts[c] = tanh(in[c]) * sigmoid(in[H+c]).
+function VitsFusedActs(const InActs: TNNetFloatDynArr2D;
+  H, T: integer): TNNetFloatDynArr2D;
+var
+  c, tt: integer;
+begin
+  SetLength(Result, H);
+  for c := 0 to H - 1 do
+  begin
+    SetLength(Result[c], T);
+    for tt := 0 to T - 1 do
+      Result[c][tt] := Tanh(InActs[c][tt]) *
+        (1.0 / (1.0 + Exp(-InActs[H + c][tt])));
+  end;
+end;
+
+{ TNNetVits }
+
+constructor TNNetVits.Create(const pConfig: TVitsConfig);
+begin
+  inherited Create();
+  FConfig := pConfig;
+  FDecoder := nil;
+end;
+
+destructor TNNetVits.Destroy;
+begin
+  FDecoder.Free;
+  inherited Destroy;
+end;
+
+// Token-major hidden states: returns Hidden as [token][hidden]. The relative-
+// position attention (HF VitsAttention) over the full token sequence (no
+// padding here - we synthesize one un-padded sentence at a time).
+procedure TNNetVits.RunTextEncoder(const Ids: array of integer;
+  out PriorMean, PriorLogVar: TNNetFloatDynArr2D;
+  out Hidden: TNNetFloatDynArr2D);
+var
+  T, H, NH, HD, Win, L, i, j, hh, t1, t2, d, RelLen: integer;
+  Scale, SqrtH, Acc: TNeuralFloat;
+  Q, K, Vv: TNNetFloatDynArr2D;        // [token][hidden] projections
+  Qh, Kh, Vh: TNNetFloatDynArr2D;      // current head [token][head_dim]
+  Scores: TNNetFloatDynArr2D;          // [t1][t2]
+  RelEmb: TNNetFloatDynArr2D;          // gathered rel embeddings [2T-1][hd]
+  RelLogits: TNNetFloatDynArr2D;       // [t1][2T-1]
+  AbsBias: TNNetFloatDynArr2D;         // [t1][t2]
+  HeadOut: TNNetFloatDynArr2D;         // [token][head_dim]
+  AttnOut: TNNetFloatDynArr2D;         // [token][hidden]
+  Tmp, Y: TNeuralFloatDynArr;
+  FfIn, FfMid, FfOut: TNNetFloatDynArr2D;
+  MaxV, SumE: TNeuralFloat;
+  RelAbs: TNNetFloatDynArr2D;          // abs->rel weights [t1][2T]
+
+  // Gather emb_rel (flat [RelLen, HD]) for a sequence of length T into a
+  // [2T-1, HD] window, replicating HF _get_relative_embeddings.
+  procedure GatherRel(const Flat: TNeuralFloatDynArr; out Dst: TNNetFloatDynArr2D);
+  var
+    padlen, startp, endp, r, c, srcidx: integer;
+  begin
+    // Flat is RelLen = 2*Win+1 rows of HD. Pad with zero rows by padlen on
+    // each side, then slice [startp .. startp+2T-2].
+    padlen := T - (Win + 1);
+    if padlen < 0 then padlen := 0;
+    startp := (Win + 1) - T;
+    if startp < 0 then startp := 0;
+    endp := startp + 2 * T - 1;        // exclusive
+    SetLength(Dst, 2 * T - 1);
+    for r := 0 to 2 * T - 2 do
+    begin
+      SetLength(Dst[r], HD);
+      // The padded array index for output row r is (startp + r); subtract
+      // padlen to map back into the original RelLen rows.
+      srcidx := (startp + r) - padlen;
+      for c := 0 to HD - 1 do
+      begin
+        if (srcidx >= 0) and (srcidx < RelLen) then
+          Dst[r][c] := Flat[srcidx * HD + c]
+        else
+          Dst[r][c] := 0;
+      end;
+    end;
+    if endp = 0 then ;
+  end;
+
+begin
+  T := Length(Ids);
+  H := FConfig.HiddenSize;
+  NH := FConfig.NumAttentionHeads;
+  HD := H div NH;
+  Win := FConfig.WindowSize;
+  RelLen := 2 * Win + 1;
+  Scale := 1.0 / Sqrt(HD * 1.0);
+  SqrtH := Sqrt(H * 1.0);
+
+  // Embedding * sqrt(hidden).
+  SetLength(Hidden, T);
+  for i := 0 to T - 1 do
+  begin
+    SetLength(Hidden[i], H);
+    for j := 0 to H - 1 do Hidden[i][j] := FEmbed[Ids[i] * H + j] * SqrtH;
+  end;
+
+  for L := 0 to FConfig.NumHiddenLayers - 1 do
+  begin
+    // ---- projections (per token dense).
+    SetLength(Q, T); SetLength(K, T); SetLength(Vv, T);
+    for i := 0 to T - 1 do
+    begin
+      VitsDense(FLayers[L].Attn.QW, FLayers[L].Attn.QB, H, H, Hidden[i], Y);
+      for j := 0 to H - 1 do Y[j] := Y[j] * Scale;  // query * scaling
+      Q[i] := Copy(Y);
+      VitsDense(FLayers[L].Attn.KW, FLayers[L].Attn.KB, H, H, Hidden[i], Y);
+      K[i] := Copy(Y);
+      VitsDense(FLayers[L].Attn.VW, FLayers[L].Attn.VB, H, H, Hidden[i], Y);
+      Vv[i] := Copy(Y);
+    end;
+
+    SetLength(AttnOut, T);
+    for i := 0 to T - 1 do SetLength(AttnOut[i], H);
+
+    for hh := 0 to NH - 1 do
+    begin
+      // Slice this head.
+      SetLength(Qh, T); SetLength(Kh, T); SetLength(Vh, T);
+      for i := 0 to T - 1 do
+      begin
+        SetLength(Qh[i], HD); SetLength(Kh[i], HD); SetLength(Vh[i], HD);
+        for d := 0 to HD - 1 do
+        begin
+          Qh[i][d] := Q[i][hh * HD + d];
+          Kh[i][d] := K[i][hh * HD + d];
+          Vh[i][d] := Vv[i][hh * HD + d];
+        end;
+      end;
+      // Content scores Q*K^T.
+      SetLength(Scores, T);
+      for t1 := 0 to T - 1 do
+      begin
+        SetLength(Scores[t1], T);
+        for t2 := 0 to T - 1 do
+        begin
+          Acc := 0;
+          for d := 0 to HD - 1 do Acc := Acc + Qh[t1][d] * Kh[t2][d];
+          Scores[t1][t2] := Acc;
+        end;
+      end;
+      // Relative key bias: rel_logits[t1][r] = Q[t1] . RelEmb[r];
+      // then relative_position_to_absolute_position -> [t1][t2].
+      GatherRel(FLayers[L].Attn.RelK, RelEmb);   // [2T-1][HD]
+      SetLength(RelLogits, T);
+      for t1 := 0 to T - 1 do
+      begin
+        SetLength(RelLogits[t1], 2 * T - 1);
+        for j := 0 to 2 * T - 2 do
+        begin
+          Acc := 0;
+          for d := 0 to HD - 1 do Acc := Acc + Qh[t1][d] * RelEmb[j][d];
+          RelLogits[t1][j] := Acc;
+        end;
+      end;
+      // _relative_position_to_absolute_position: pad each row by 1 on the
+      // right -> width 2T; flatten T*2T; pad T-1 at end; reshape (T+1, 2T-1);
+      // take rows [0..T-1], cols [T-1 ..]. Implemented directly: the absolute
+      // bias AbsBias[t1][t2] = RelLogits[t1][ t2 - t1 + (T-1) ].
+      SetLength(AbsBias, T);
+      for t1 := 0 to T - 1 do
+      begin
+        SetLength(AbsBias[t1], T);
+        for t2 := 0 to T - 1 do
+          AbsBias[t1][t2] := RelLogits[t1][t2 - t1 + (T - 1)];
+      end;
+      for t1 := 0 to T - 1 do
+        for t2 := 0 to T - 1 do
+          Scores[t1][t2] := Scores[t1][t2] + AbsBias[t1][t2];
+      // Softmax over t2.
+      for t1 := 0 to T - 1 do
+      begin
+        MaxV := Scores[t1][0];
+        for t2 := 1 to T - 1 do if Scores[t1][t2] > MaxV then MaxV := Scores[t1][t2];
+        SumE := 0;
+        for t2 := 0 to T - 1 do
+        begin
+          Scores[t1][t2] := Exp(Scores[t1][t2] - MaxV);
+          SumE := SumE + Scores[t1][t2];
+        end;
+        for t2 := 0 to T - 1 do Scores[t1][t2] := Scores[t1][t2] / SumE;
+      end;
+      // Head output = Scores * Vh.
+      SetLength(HeadOut, T);
+      for t1 := 0 to T - 1 do
+      begin
+        SetLength(HeadOut[t1], HD);
+        for d := 0 to HD - 1 do
+        begin
+          Acc := 0;
+          for t2 := 0 to T - 1 do Acc := Acc + Scores[t1][t2] * Vh[t2][d];
+          HeadOut[t1][d] := Acc;
+        end;
+      end;
+      // Relative value bias: absolute_position_to_relative_position(Scores)
+      // gives [t1][2T] weights; drop col 0 -> [t1][2T-1]; matmul RelEmbV.
+      // Direct form: rel_weights[t1][r] = Scores[t1][ r - (T-1) + t1 ] when
+      // the col index is in [0,T-1], else 0; with r in [0..2T-2].
+      GatherRel(FLayers[L].Attn.RelV, RelEmb);
+      SetLength(RelAbs, T);
+      for t1 := 0 to T - 1 do
+      begin
+        SetLength(RelAbs[t1], 2 * T - 1);
+        for j := 0 to 2 * T - 2 do
+        begin
+          t2 := j - (T - 1) + t1;
+          if (t2 >= 0) and (t2 < T) then RelAbs[t1][j] := Scores[t1][t2]
+          else RelAbs[t1][j] := 0;
+        end;
+      end;
+      for t1 := 0 to T - 1 do
+        for d := 0 to HD - 1 do
+        begin
+          Acc := 0;
+          for j := 0 to 2 * T - 2 do Acc := Acc + RelAbs[t1][j] * RelEmb[j][d];
+          HeadOut[t1][d] := HeadOut[t1][d] + Acc;
+        end;
+      // Scatter head output back.
+      for i := 0 to T - 1 do
+        for d := 0 to HD - 1 do AttnOut[i][hh * HD + d] := HeadOut[i][d];
+    end;
+
+    // out_proj.
+    for i := 0 to T - 1 do
+    begin
+      VitsDense(FLayers[L].Attn.OW, FLayers[L].Attn.OB, H, H, AttnOut[i], Y);
+      AttnOut[i] := Copy(Y);
+    end;
+    // residual + layer_norm.
+    for i := 0 to T - 1 do
+    begin
+      SetLength(Tmp, H);
+      for j := 0 to H - 1 do Tmp[j] := Hidden[i][j] + AttnOut[i][j];
+      VitsLayerNormVec(Tmp, FLayers[L].LnW, FLayers[L].LnB, FConfig.LayerNormEps);
+      Hidden[i] := Tmp;
+    end;
+
+    // ---- feed forward: channel-major conv FFN (relu) over the token axis.
+    // conv_1 (H -> ffn_dim, k), relu, conv_2 (ffn_dim -> H, k); "same" pad.
+    SetLength(FfIn, H);
+    for j := 0 to H - 1 do
+    begin
+      SetLength(FfIn[j], T);
+      for i := 0 to T - 1 do FfIn[j][i] := Hidden[i][j];
+    end;
+    RunHiFiGANConv(FLayers[L].FF1, FfIn, FfMid);
+    for j := 0 to Length(FfMid) - 1 do
+      for i := 0 to T - 1 do
+        if FfMid[j][i] < 0 then FfMid[j][i] := 0;
+    RunHiFiGANConv(FLayers[L].FF2, FfMid, FfOut);
+    // residual + final_layer_norm (token-major).
+    for i := 0 to T - 1 do
+    begin
+      SetLength(Tmp, H);
+      for j := 0 to H - 1 do Tmp[j] := Hidden[i][j] + FfOut[j][i];
+      VitsLayerNormVec(Tmp, FLayers[L].FlnW, FLayers[L].FlnB, FConfig.LayerNormEps);
+      Hidden[i] := Tmp;
+    end;
+  end;
+
+  // project: Conv1d(H -> 2*flow, k=1) channel-major -> split.
+  SetLength(FfIn, H);
+  for j := 0 to H - 1 do
+  begin
+    SetLength(FfIn[j], T);
+    for i := 0 to T - 1 do FfIn[j][i] := Hidden[i][j];
+  end;
+  RunHiFiGANConv(FProject, FfIn, FfOut);   // [2*flow][T]
+  SetLength(PriorMean, T);
+  SetLength(PriorLogVar, T);
+  for i := 0 to T - 1 do
+  begin
+    SetLength(PriorMean[i], FConfig.FlowSize);
+    SetLength(PriorLogVar[i], FConfig.FlowSize);
+    for j := 0 to FConfig.FlowSize - 1 do
+    begin
+      PriorMean[i][j] := FfOut[j][i];
+      PriorLogVar[i][j] := FfOut[FConfig.FlowSize + j][i];
+    end;
+  end;
+end;
+
+// Deterministic duration predictor -> log_duration[token].
+procedure TNNetVits.RunDuration(const Hidden: TNNetFloatDynArr2D;
+  out LogDur: TNeuralFloatDynArr);
+var
+  H, Tlen, i, t, c, F: integer;
+  Inp, C1, C2, Pr: TNNetFloatDynArr2D;
+  Col: TNeuralFloatDynArr;
+begin
+  Tlen := Length(Hidden);
+  H := FConfig.HiddenSize;
+  F := FConfig.DurFilterChannels;
+  // channel-major input [H][Tlen].
+  SetLength(Inp, H);
+  for c := 0 to H - 1 do
+  begin
+    SetLength(Inp[c], Tlen);
+    for t := 0 to Tlen - 1 do Inp[c][t] := Hidden[t][c];
+  end;
+  // conv_1 (k, "same" pad k//2), relu, LayerNorm over channels per time.
+  RunHiFiGANConv(FDurConv1, Inp, C1);
+  for c := 0 to F - 1 do
+    for t := 0 to Tlen - 1 do if C1[c][t] < 0 then C1[c][t] := 0;
+  SetLength(Col, F);
+  for t := 0 to Tlen - 1 do
+  begin
+    for c := 0 to F - 1 do Col[c] := C1[c][t];
+    VitsLayerNormVec(Col, FDurNorm1W, FDurNorm1B, FConfig.LayerNormEps);
+    for c := 0 to F - 1 do C1[c][t] := Col[c];
+  end;
+  // conv_2, relu, LayerNorm.
+  RunHiFiGANConv(FDurConv2, C1, C2);
+  for c := 0 to F - 1 do
+    for t := 0 to Tlen - 1 do if C2[c][t] < 0 then C2[c][t] := 0;
+  for t := 0 to Tlen - 1 do
+  begin
+    for c := 0 to F - 1 do Col[c] := C2[c][t];
+    VitsLayerNormVec(Col, FDurNorm2W, FDurNorm2B, FConfig.LayerNormEps);
+    for c := 0 to F - 1 do C2[c][t] := Col[c];
+  end;
+  // proj (F -> 1, k=1).
+  RunHiFiGANConv(FDurProj, C2, Pr);
+  SetLength(LogDur, Tlen);
+  for i := 0 to Tlen - 1 do LogDur[i] := Pr[0][i];
+end;
+
+// VitsWaveNet forward (no global conditioning): gated dilated residual stack.
+procedure TNNetVits.RunWaveNet(const WN: TVitsWaveNet;
+  const Inp: TNNetFloatDynArr2D; out Outp: TNNetFloatDynArr2D);
+var
+  H, Tlen, L, c, t, NumLayers: integer;
+  Cur, InActs, ResSkip: TNNetFloatDynArr2D;
+begin
+  H := FConfig.HiddenSize;
+  Tlen := Length(Inp[0]);
+  NumLayers := Length(WN.InLayers);
+  // outputs accumulator (H channels) starts at zero.
+  SetLength(Outp, H);
+  for c := 0 to H - 1 do
+  begin
+    SetLength(Outp[c], Tlen);
+    for t := 0 to Tlen - 1 do Outp[c][t] := 0;
+  end;
+  // current input (H channels).
+  SetLength(Cur, H);
+  for c := 0 to H - 1 do Cur[c] := Copy(Inp[c]);
+
+  for L := 0 to NumLayers - 1 do
+  begin
+    RunHiFiGANConv(WN.InLayers[L], Cur, InActs);   // 2H channels
+    // fused tanh-sigmoid: acts[c] = tanh(in[c]) * sigmoid(in[H+c]), c in 0..H-1.
+    RunHiFiGANConv(WN.ResSkip[L], VitsFusedActs(InActs, H, Tlen), ResSkip);
+    if L < NumLayers - 1 then
+    begin
+      // res_acts = ResSkip[0..H-1]; CUR += res_acts; outputs += ResSkip[H..].
+      for c := 0 to H - 1 do
+        for t := 0 to Tlen - 1 do Cur[c][t] := Cur[c][t] + ResSkip[c][t];
+      for c := 0 to H - 1 do
+        for t := 0 to Tlen - 1 do Outp[c][t] := Outp[c][t] + ResSkip[H + c][t];
+    end
+    else
+      for c := 0 to H - 1 do
+        for t := 0 to Tlen - 1 do Outp[c][t] := Outp[c][t] + ResSkip[c][t];
+  end;
+end;
+
+procedure TNNetVits.RunFlowReverse(var Latent: TNNetFloatDynArr2D);
+var
+  fi, half, c, t, Tlen, Flow: integer;
+  FirstHalf, Pre, WNOut, Mean, Tmp: TNNetFloatDynArr2D;
+begin
+  Flow := FConfig.FlowSize;
+  half := Flow div 2;
+  Tlen := Length(Latent[0]);
+  // reversed(flows): for each flow (from last to first): flip channels, then
+  // reverse coupling (second_half -= mean(first_half)).
+  for fi := FConfig.PriorNumFlows - 1 downto 0 do
+  begin
+    // flip channels [1]: reverse the channel order.
+    SetLength(Tmp, Flow);
+    for c := 0 to Flow - 1 do Tmp[c] := Latent[Flow - 1 - c];
+    Latent := Tmp;
+    // first_half = channels [0..half-1].
+    SetLength(FirstHalf, half);
+    for c := 0 to half - 1 do FirstHalf[c] := Latent[c];
+    RunHiFiGANConv(FFlows[fi].ConvPre, FirstHalf, Pre);
+    RunWaveNet(FFlows[fi].WaveNet, Pre, WNOut);
+    RunHiFiGANConv(FFlows[fi].ConvPost, WNOut, Mean);   // half channels
+    // reverse: second_half := second_half - mean (log_stddev == 0).
+    for c := 0 to half - 1 do
+      for t := 0 to Tlen - 1 do
+        Latent[half + c][t] := Latent[half + c][t] - Mean[c][t];
+  end;
+end;
+
+procedure TNNetVits.Analyze(const Ids: array of integer;
+  out PriorMean, PriorLogVar: TNNetFloatDynArr2D;
+  out Durations: array of integer);
+var
+  Hidden: TNNetFloatDynArr2D;
+  LogDur: TNeuralFloatDynArr;
+  i: integer;
+  LengthScale, Dur: TNeuralFloat;
+begin
+  RunTextEncoder(Ids, PriorMean, PriorLogVar, Hidden);
+  RunDuration(Hidden, LogDur);
+  LengthScale := 1.0 / FConfig.SpeakingRate;
+  for i := 0 to Length(Ids) - 1 do
+  begin
+    Dur := Ceil(Exp(LogDur[i]) * LengthScale);
+    if Dur < 0 then Dur := 0;
+    Durations[i] := Round(Dur);
+  end;
+end;
+
+procedure TNNetVits.ExpandPrior(const PriorMean, PriorLogVar: TNNetFloatDynArr2D;
+  const Durations: array of integer;
+  out ExpMean, ExpLogVar: TNNetFloatDynArr2D);
+var
+  T, Flow, OutLen, tok, rep, col, c: integer;
+begin
+  T := Length(PriorMean);
+  Flow := FConfig.FlowSize;
+  OutLen := 0;
+  for tok := 0 to T - 1 do OutLen := OutLen + Durations[tok];
+  if OutLen < 1 then OutLen := 1;
+  SetLength(ExpMean, Flow);
+  SetLength(ExpLogVar, Flow);
+  for c := 0 to Flow - 1 do
+  begin
+    SetLength(ExpMean[c], OutLen);
+    SetLength(ExpLogVar[c], OutLen);
+  end;
+  col := 0;
+  for tok := 0 to T - 1 do
+    for rep := 0 to Durations[tok] - 1 do
+    begin
+      if col >= OutLen then Break;
+      for c := 0 to Flow - 1 do
+      begin
+        ExpMean[c][col] := PriorMean[tok][c];
+        ExpLogVar[c][col] := PriorLogVar[tok][c];
+      end;
+      Inc(col);
+    end;
+end;
+
+procedure TNNetVits.FlowReverse(const PriorLatents: TNNetFloatDynArr2D;
+  out Spectrogram: TNNetFloatDynArr2D);
+var
+  c: integer;
+begin
+  SetLength(Spectrogram, Length(PriorLatents));
+  for c := 0 to Length(PriorLatents) - 1 do Spectrogram[c] := Copy(PriorLatents[c]);
+  RunFlowReverse(Spectrogram);
+end;
+
+procedure TNNetVits.Synthesize(const Ids: array of integer;
+  const Z: TNNetFloatDynArr2D; out Waveform: TNeuralFloatDynArr);
+var
+  PriorMean, PriorLogVar, ExpMean, ExpLogVar, Latent, Spec: TNNetFloatDynArr2D;
+  Durations: array of integer;
+  Flow, OutLen, c, t: integer;
+  ZVal: TNeuralFloat;
+begin
+  SetLength(Durations, Length(Ids));
+  Analyze(Ids, PriorMean, PriorLogVar, Durations);
+  ExpandPrior(PriorMean, PriorLogVar, Durations, ExpMean, ExpLogVar);
+  Flow := FConfig.FlowSize;
+  OutLen := Length(ExpMean[0]);
+  // prior_latents = mean + z * exp(logvar) * noise_scale.
+  SetLength(Latent, Flow);
+  for c := 0 to Flow - 1 do
+  begin
+    SetLength(Latent[c], OutLen);
+    for t := 0 to OutLen - 1 do
+    begin
+      if (Length(Z) > c) and (Length(Z[c]) > t) then ZVal := Z[c][t]
+      else ZVal := 0;
+      Latent[c][t] := ExpMean[c][t] +
+        ZVal * Exp(ExpLogVar[c][t]) * FConfig.NoiseScale;
+    end;
+  end;
+  FlowReverse(Latent, Spec);
+  FDecoder.Synthesize(Spec, Waveform);
+end;
+
+function ReadVitsConfigFromJSONFile(const FileName: string): TVitsConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, ResType: string;
+  Arr, Inner: TJSONArray;
+  k, j: integer;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('VITS import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('VITS import: config field "' + FieldName +
+        '" must be a positive integer.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('VITS import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('VITS import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('VITS import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'vits');
+    if ModelType <> 'vits' then
+      ImportError('VITS import: config model_type is "' + ModelType +
+        '" - only "vits" is supported.');
+    Result.ModelType := 'vits';
+
+    // The inference path drops the posterior encoder and the stochastic
+    // duration predictor; require the DETERMINISTIC duration readout.
+    if Obj.Get('use_stochastic_duration_prediction', True) then
+      ImportError('VITS import: use_stochastic_duration_prediction=true is ' +
+        'not supported - only the deterministic duration predictor ' +
+        '(use_stochastic_duration_prediction=false, the MMS-TTS default) is ' +
+        'implemented (a documented follow-up).');
+    if Obj.Get('num_speakers', 1) > 1 then
+      ImportError('VITS import: multi-speaker models (num_speakers>1) are ' +
+        'not supported - single-speaker only (a documented follow-up).');
+    if Obj.Get('speaker_embedding_size', 0) <> 0 then
+      ImportError('VITS import: speaker_embedding_size<>0 (global ' +
+        'conditioning) is not supported (a documented follow-up).');
+
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.NumHiddenLayers := RequiredInt('num_hidden_layers');
+    Result.NumAttentionHeads := RequiredInt('num_attention_heads');
+    Result.FfnDim := RequiredInt('ffn_dim');
+    Result.FfnKernelSize := Obj.Get('ffn_kernel_size', 3);
+    Result.FlowSize := RequiredInt('flow_size');
+    Result.WindowSize := Obj.Get('window_size', 4);
+    Result.PriorNumFlows := Obj.Get('prior_encoder_num_flows', 4);
+    Result.PriorNumWaveNetLayers :=
+      Obj.Get('prior_encoder_num_wavenet_layers', 4);
+    Result.WaveNetKernelSize := Obj.Get('wavenet_kernel_size', 5);
+    Result.WaveNetDilationRate := Obj.Get('wavenet_dilation_rate', 1);
+    Result.DurFilterChannels :=
+      Obj.Get('duration_predictor_filter_channels', 256);
+    Result.DurKernelSize := Obj.Get('duration_predictor_kernel_size', 3);
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1.0e-5);
+    Result.NoiseScale := Obj.Get('noise_scale', 0.667);
+    Result.SpeakingRate := Obj.Get('speaking_rate', 1.0);
+    Result.SamplingRate := Obj.Get('sampling_rate', 16000);
+
+    // ---- the HiFi-GAN decoder sub-config (same JSON, decoder.* fields are at
+    // the top level of a VitsConfig).
+    Result.Decoder.ModelType := 'hifigan';
+    Result.Decoder.ModelInDim := Result.FlowSize;   // decoder conv_pre in = flow
+    Result.Decoder.UpsampleInitialChannel :=
+      RequiredInt('upsample_initial_channel');
+    ResType := '1';
+    if ResType <> '1' then ;
+
+    if not (Obj.Find('upsample_rates') is TJSONArray) then
+      ImportError('VITS import: "upsample_rates" must be an array.');
+    Arr := TJSONArray(Obj.Find('upsample_rates'));
+    SetLength(Result.Decoder.UpsampleRates, Arr.Count);
+    for k := 0 to Arr.Count - 1 do
+      Result.Decoder.UpsampleRates[k] := Arr.Items[k].AsInteger;
+
+    if not (Obj.Find('upsample_kernel_sizes') is TJSONArray) then
+      ImportError('VITS import: "upsample_kernel_sizes" must be an array.');
+    Arr := TJSONArray(Obj.Find('upsample_kernel_sizes'));
+    SetLength(Result.Decoder.UpsampleKernelSizes, Arr.Count);
+    for k := 0 to Arr.Count - 1 do
+      Result.Decoder.UpsampleKernelSizes[k] := Arr.Items[k].AsInteger;
+
+    if not (Obj.Find('resblock_kernel_sizes') is TJSONArray) then
+      ImportError('VITS import: "resblock_kernel_sizes" must be an array.');
+    Arr := TJSONArray(Obj.Find('resblock_kernel_sizes'));
+    SetLength(Result.Decoder.ResblockKernelSizes, Arr.Count);
+    for k := 0 to Arr.Count - 1 do
+      Result.Decoder.ResblockKernelSizes[k] := Arr.Items[k].AsInteger;
+
+    if not (Obj.Find('resblock_dilation_sizes') is TJSONArray) then
+      ImportError('VITS import: "resblock_dilation_sizes" must be an array.');
+    Arr := TJSONArray(Obj.Find('resblock_dilation_sizes'));
+    SetLength(Result.Decoder.ResblockDilationSizes, Arr.Count);
+    for k := 0 to Arr.Count - 1 do
+    begin
+      Inner := TJSONArray(Arr.Items[k]);
+      SetLength(Result.Decoder.ResblockDilationSizes[k], Inner.Count);
+      for j := 0 to Inner.Count - 1 do
+        Result.Decoder.ResblockDilationSizes[k][j] := Inner.Items[j].AsInteger;
+    end;
+
+    Result.Decoder.LeakyReluSlope := Obj.Get('leaky_relu_slope', 0.1);
+    Result.Decoder.NormalizeBefore := False;
+    Result.Decoder.SamplingRate := Result.SamplingRate;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function VitsConfigToString(const Config: TVitsConfig): string;
+begin
+  Result := 'vits config: vocab=' + IntToStr(Config.VocabSize) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', layers=' + IntToStr(Config.NumHiddenLayers) +
+    ', heads=' + IntToStr(Config.NumAttentionHeads) +
+    ', flow=' + IntToStr(Config.FlowSize) +
+    ', flows=' + IntToStr(Config.PriorNumFlows) +
+    ', wn_layers=' + IntToStr(Config.PriorNumWaveNetLayers) +
+    ', win=' + IntToStr(Config.WindowSize) +
+    ', sr=' + IntToStr(Config.SamplingRate);
+end;
+
+// Loads one VitsWaveNet (num_layers gated dilated residual layers). in_layers
+// use weight_norm-folded convs with dilation rate**i and "same" pad; res_skip
+// layers are k=1 convs (last has H out, the rest 2H).
+procedure LoadVitsWaveNet(Reader: TNNetSafeTensorsReader; const Prefix: string;
+  var WN: TVitsWaveNet; NumLayers, KernelSize, DilationRate: integer;
+  Consumed: TStrings);
+var
+  i, dil, pad: integer;
+begin
+  SetLength(WN.InLayers, NumLayers);
+  SetLength(WN.ResSkip, NumLayers);
+  for i := 0 to NumLayers - 1 do
+  begin
+    dil := Round(IntPower(DilationRate, i));
+    if dil < 1 then dil := 1;
+    pad := (KernelSize * dil - dil) div 2;
+    LoadHiFiGANConv(Reader, Prefix + '.in_layers.' + IntToStr(i),
+      WN.InLayers[i], False, 1, dil, pad, Consumed);
+    LoadHiFiGANConv(Reader, Prefix + '.res_skip_layers.' + IntToStr(i),
+      WN.ResSkip[i], False, 1, 1, 0, Consumed);
+  end;
+end;
+
+// Loads a plain Conv1d weight with NO bias tensor (VITS's decoder.conv_post
+// is bias=False) into a THiFiGANConv, zeroing the bias.
+procedure LoadHiFiGANConvNoBias(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; var Conv: THiFiGANConv;
+  pStride, pDilation, pPad: integer; Consumed: TStrings);
+var
+  W: TNNetVolume;
+  OutDim, InDim, K, i, Cnt: integer;
+begin
+  W := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Prefix + '.weight', W);
+    Consumed.Add(Prefix + '.weight');
+    OutDim := Reader.DimSize(Prefix + '.weight', 0);
+    InDim := Reader.DimSize(Prefix + '.weight', 1);
+    K := Reader.DimSize(Prefix + '.weight', 2);
+    Cnt := OutDim * InDim * K;
+    SetLength(Conv.W, Cnt);
+    for i := 0 to Cnt - 1 do Conv.W[i] := W.FData[i];
+    Conv.Transpose := False;
+    Conv.Stride := pStride;
+    Conv.Dilation := pDilation;
+    Conv.Pad := pPad;
+    Conv.Kernel := K;
+    Conv.InCh := InDim;
+    Conv.OutCh := OutDim;
+    SetLength(Conv.B, OutDim);
+    for i := 0 to OutDim - 1 do Conv.B[i] := 0;
+  finally
+    W.Free;
+  end;
+end;
+
+// Loads the HiFi-GAN generator weights into an already-created TNNetHiFiGAN
+// using key Prefix (VITS ships them under "decoder."). Mirrors the wiring of
+// BuildHiFiGANFromSafeTensorsEx (VITS's decoder IS the HiFi-GAN generator).
+procedure BuildVitsDecoderInto(Reader: TNNetSafeTensorsReader;
+  const Config: THiFiGANConfig; Model: TNNetHiFiGAN; const Prefix: string;
+  Consumed: TStrings);
+var
+  NumUp, NumKernels, s, j, d, rb, ch, pad, kk, st: integer;
+  Base: string;
+begin
+  NumUp := Length(Config.UpsampleRates);
+  NumKernels := Length(Config.ResblockKernelSizes);
+  LoadHiFiGANConv(Reader, Prefix + 'conv_pre', Model.FConvPre, False,
+    1, 1, 3, Consumed);
+  SetLength(Model.FUpsamplers, NumUp);
+  for s := 0 to NumUp - 1 do
+  begin
+    st := Config.UpsampleRates[s];
+    kk := Config.UpsampleKernelSizes[s];
+    pad := (kk - st) div 2;
+    LoadHiFiGANConv(Reader, Prefix + 'upsampler.' + IntToStr(s),
+      Model.FUpsamplers[s], True, st, 1, pad, Consumed);
+  end;
+  SetLength(Model.FResBlocks, NumUp * NumKernels);
+  for s := 0 to NumUp - 1 do
+  begin
+    ch := Config.UpsampleInitialChannel;
+    for d := 0 to s do ch := ch div 2;
+    for j := 0 to NumKernels - 1 do
+    begin
+      rb := s * NumKernels + j;
+      kk := Config.ResblockKernelSizes[j];
+      SetLength(Model.FResBlocks[rb].Convs1,
+        Length(Config.ResblockDilationSizes[j]));
+      SetLength(Model.FResBlocks[rb].Convs2,
+        Length(Config.ResblockDilationSizes[j]));
+      Base := Prefix + 'resblocks.' + IntToStr(rb);
+      for d := 0 to Length(Config.ResblockDilationSizes[j]) - 1 do
+      begin
+        LoadHiFiGANConv(Reader, Base + '.convs1.' + IntToStr(d),
+          Model.FResBlocks[rb].Convs1[d], False, 1,
+          Config.ResblockDilationSizes[j][d],
+          (kk * Config.ResblockDilationSizes[j][d] -
+           Config.ResblockDilationSizes[j][d]) div 2, Consumed);
+        LoadHiFiGANConv(Reader, Base + '.convs2.' + IntToStr(d),
+          Model.FResBlocks[rb].Convs2[d], False, 1, 1, (kk - 1) div 2,
+          Consumed);
+        if ch = 0 then ;
+      end;
+    end;
+  end;
+  // conv_post in VITS has NO bias; LoadHiFiGANConv requires a .bias tensor, so
+  // load the weight ourselves and zero the bias.
+  LoadHiFiGANConvNoBias(Reader, Prefix + 'conv_post', Model.FConvPost,
+    1, 1, 3, Consumed);
+end;
+
+function BuildVitsFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  var Config: TVitsConfig): TNNetVits;
+var
+  Model: TNNetVits;
+  Consumed: TStringList;
+  Li: integer;
+  LP, FP: string;
+begin
+  Model := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    Model := TNNetVits.Create(Config);
+
+    // ---- text encoder embeddings.
+    LoadVitsVec(Reader, 'text_encoder.embed_tokens.weight', Model.FEmbed,
+      Consumed);
+
+    SetLength(Model.FLayers, Config.NumHiddenLayers);
+    for Li := 0 to Config.NumHiddenLayers - 1 do
+    begin
+      LP := 'text_encoder.encoder.layers.' + IntToStr(Li);
+      LoadVitsDense(Reader, LP + '.attention.q_proj',
+        Model.FLayers[Li].Attn.QW, Model.FLayers[Li].Attn.QB, Consumed);
+      LoadVitsDense(Reader, LP + '.attention.k_proj',
+        Model.FLayers[Li].Attn.KW, Model.FLayers[Li].Attn.KB, Consumed);
+      LoadVitsDense(Reader, LP + '.attention.v_proj',
+        Model.FLayers[Li].Attn.VW, Model.FLayers[Li].Attn.VB, Consumed);
+      LoadVitsDense(Reader, LP + '.attention.out_proj',
+        Model.FLayers[Li].Attn.OW, Model.FLayers[Li].Attn.OB, Consumed);
+      LoadVitsVec(Reader, LP + '.attention.emb_rel_k',
+        Model.FLayers[Li].Attn.RelK, Consumed);
+      LoadVitsVec(Reader, LP + '.attention.emb_rel_v',
+        Model.FLayers[Li].Attn.RelV, Consumed);
+      LoadVitsVec(Reader, LP + '.layer_norm.weight',
+        Model.FLayers[Li].LnW, Consumed);
+      LoadVitsVec(Reader, LP + '.layer_norm.bias',
+        Model.FLayers[Li].LnB, Consumed);
+      LoadVitsVec(Reader, LP + '.final_layer_norm.weight',
+        Model.FLayers[Li].FlnW, Consumed);
+      LoadVitsVec(Reader, LP + '.final_layer_norm.bias',
+        Model.FLayers[Li].FlnB, Consumed);
+      // feed_forward convs: ffn_kernel_size is odd (default 3), so HF's
+      // (k-1)//2 left + k//2 right padding is symmetric = (k-1) div 2.
+      LoadHiFiGANConv(Reader, LP + '.feed_forward.conv_1',
+        Model.FLayers[Li].FF1, False, 1, 1,
+        (Config.FfnKernelSize - 1) div 2, Consumed);
+      LoadHiFiGANConv(Reader, LP + '.feed_forward.conv_2',
+        Model.FLayers[Li].FF2, False, 1, 1,
+        (Config.FfnKernelSize - 1) div 2, Consumed);
+    end;
+
+    // project: Conv1d(H -> 2*flow, k=1).
+    LoadHiFiGANConv(Reader, 'text_encoder.project', Model.FProject,
+      False, 1, 1, 0, Consumed);
+
+    // ---- duration predictor (deterministic).
+    LoadHiFiGANConv(Reader, 'duration_predictor.conv_1', Model.FDurConv1,
+      False, 1, 1, Config.DurKernelSize div 2, Consumed);
+    LoadHiFiGANConv(Reader, 'duration_predictor.conv_2', Model.FDurConv2,
+      False, 1, 1, Config.DurKernelSize div 2, Consumed);
+    LoadHiFiGANConv(Reader, 'duration_predictor.proj', Model.FDurProj,
+      False, 1, 1, 0, Consumed);
+    LoadVitsVec(Reader, 'duration_predictor.norm_1.weight',
+      Model.FDurNorm1W, Consumed);
+    LoadVitsVec(Reader, 'duration_predictor.norm_1.bias',
+      Model.FDurNorm1B, Consumed);
+    LoadVitsVec(Reader, 'duration_predictor.norm_2.weight',
+      Model.FDurNorm2W, Consumed);
+    LoadVitsVec(Reader, 'duration_predictor.norm_2.bias',
+      Model.FDurNorm2B, Consumed);
+
+    // ---- flow (prior_encoder_num_flows residual coupling layers).
+    SetLength(Model.FFlows, Config.PriorNumFlows);
+    for Li := 0 to Config.PriorNumFlows - 1 do
+    begin
+      FP := 'flow.flows.' + IntToStr(Li);
+      LoadHiFiGANConv(Reader, FP + '.conv_pre', Model.FFlows[Li].ConvPre,
+        False, 1, 1, 0, Consumed);
+      LoadHiFiGANConv(Reader, FP + '.conv_post', Model.FFlows[Li].ConvPost,
+        False, 1, 1, 0, Consumed);
+      LoadVitsWaveNet(Reader, FP + '.wavenet', Model.FFlows[Li].WaveNet,
+        Config.PriorNumWaveNetLayers, Config.WaveNetKernelSize,
+        Config.WaveNetDilationRate, Consumed);
+    end;
+
+    // ---- HiFi-GAN decoder (shared synthesis holder), under "decoder.".
+    Model.FDecoder := TNNetHiFiGAN.Create(Config.Decoder);
+    BuildVitsDecoderInto(Reader, Config.Decoder, Model.FDecoder,
+      'decoder.', Consumed);
+
+    Result := Model;
+    Model := nil;
+  finally
+    Model.Free;
+    Consumed.Free;
+  end;
+end;
+
+function BuildVitsFromSafeTensors(const FileName: string;
+  out Config: TVitsConfig;
+  const ConfigFileName: string = ''): TNNetVits;
+var
+  Reader: TNNetSafeTensorsReader;
+  CfgPath: string;
+begin
+  if ConfigFileName <> '' then CfgPath := ConfigFileName
+  else CfgPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadVitsConfigFromJSONFile(CfgPath);
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildVitsFromSafeTensorsEx(Reader, Config);
   finally
     Reader.Free;
   end;

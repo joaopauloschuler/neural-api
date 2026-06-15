@@ -734,19 +734,43 @@ rather than acted on.
         SpeechT5HifiGan generator (weight_norm fold path) and write it via
         SaveVolumeToWav16 (offline + RAM-gated here, so deferred).
   - [ ] consume from the VITS / MMS-TTS importer (decoder is shared with this).
-- [ ] VITS / MMS-TTS end-to-end text-to-speech importer (`BuildVitsFromSafeTensors[Ex]`,
-      e.g. `facebook/mms-tts-eng` or `kakao-enterprise/vits-ljs`) + an
-      examples/TextToSpeech demo — the FIRST text-to-speech model in the library and
-      a strong fit because the conditional-prior flow can REUSE the landed
-      `TNNetAffineCoupling` + `TNNetInvertible1x1Conv` (Glow) layers directly. At
-      inference VITS is: phoneme/char text encoder (relative-position transformer) ->
-      duration predictor -> length regulator that expands the latent sequence ->
-      normalizing-flow prior -> HiFi-GAN decoder (shared with the importer above) ->
-      waveform. Only the inference path is needed (drop the posterior encoder and the
-      stochastic-duration-predictor training branch; use the deterministic duration
-      readout). New pieces: the monotonic length-regulator expansion and the text
-      encoder's relative-position attention. Parity-check the flow + decoder on a pico
-      fixture, then synthesize a sentence to a WAV and report it in the README.
+- [ ] VITS / MMS-TTS end-to-end text-to-speech importer (`BuildVitsFromSafeTensors[Ex]`
+      LANDED + `ReadVitsConfigFromJSONFile`/`VitsConfigToString` + the `TVitsConfig`
+      record + the `TNNetVits` channel-major holder (Analyze / ExpandPrior /
+      FlowReverse / Synthesize) + examples/TextToSpeech) — the FIRST text-to-speech
+      model in the library (model_type `vits`: facebook/mms-tts-* and
+      kakao-enterprise/vits-ljs; Kim et al. 2021). Like the HiFi-GAN vocoder it is a
+      self-contained channel-major holder doing the INFERENCE math directly (conv1d /
+      relative-position attention / WaveNet residual stacks). All four stages landed
+      and parity-gated `< 1e-4` vs the HF `VitsModel` float64 oracle
+      (`TestVitsSynthesisParity`, `tools/make_pico_vits_fixture.py` ->
+      `tests/fixtures/tiny_vits*`): (1) the conditional-prior normalizing FLOW run in
+      reverse — VITS's residual coupling is RealNVP/Glow ADDITIVE coupling
+      (`log_stddev≡0`, so `second_half -= mean(first_half)` with the mean from a
+      `conv_pre`->WaveNet->`conv_post` stack, weight_norm g/v folded) — note this
+      REUSES the WaveNet/coupling math directly rather than the generic
+      `TNNetAffineCoupling`/`TNNetInvertible1x1Conv` Glow layers (VITS's coupling is
+      its own WaveNet-conditioned variant, not a layer-graph fit); (2) the HiFi-GAN
+      DECODER reused from `TNNetHiFiGAN` via a shared `BuildVitsDecoderInto` (loaded
+      under the `decoder.` key prefix, bias-free `conv_post`); (3) the
+      relative-position text encoder + the DETERMINISTIC duration predictor + the
+      monotonic length-regulator expansion; (4) the full text->waveform graph (the
+      prior noise `z` is an EXPLICIT input so the parity test is deterministic). The
+      posterior encoder (training-only) is dropped from the committed fixture and
+      never required. Example writes a smoke WAV via `SaveVolumeToWav16`. Open
+      follow-ups:
+  - [ ] the STOCHASTIC duration predictor (`VitsStochasticDurationPredictor`, the
+        spline-flow `use_stochastic_duration_prediction=true` path) — currently
+        rejected loudly in `ReadVitsConfigFromJSONFile`; the deterministic readout is
+        implemented (the MMS-TTS default).
+  - [ ] MULTI-SPEAKER models (`num_speakers>1` / `speaker_embedding_size!=0`, the
+        global-conditioning `cond` convs into the WaveNet/duration/decoder) —
+        rejected loudly.
+  - [ ] the `VitsTokenizer` (uroman/phonemizer + char vocab) so a STRING can be
+        synthesized; text is supplied as token ids for now.
+  - [ ] real-checkpoint smoke: synthesize a sentence with a downloaded
+        `facebook/mms-tts-eng` / `kakao-enterprise/vits-ljs` and write it via
+        `SaveVolumeToWav16` (offline + RAM-gated here, so deferred).
 - [X] CLAP audio-text contrastive importer (`BuildClapFromSafeTensors[Ex]` +
       `BuildClapFromSafeTensorsWithConfig`, `TClapConfig`/`ReadClapConfigFromJSONFile`)
       + examples/ZeroShotAudioTag — LANDED. Audio-domain analogue of the CLIP

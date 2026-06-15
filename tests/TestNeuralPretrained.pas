@@ -272,6 +272,10 @@ type
     // vocoder (mel -> waveform) and asserts the waveform matches the HF
     // SpeechT5HifiGan float64 oracle < 1e-4.
     procedure TestHiFiGANSynthesisParity;
+    // VITS / MMS-TTS: per-stage parity (text-encoder prior stats, durations,
+    // flow reverse, end-to-end waveform) vs the HF VitsModel float64 oracle,
+    // with the prior noise z fed explicitly for a deterministic result < 1e-4.
+    procedure TestVitsSynthesisParity;
     // MusicGen: asserts the imported text-to-music DECODER's next-token
     // logits (K codebooks x T frames x vocab) match the HF float64 oracle <
     // 1e-4, and the pure delay-pattern (de)interleave helpers round-trip and
@@ -12018,6 +12022,127 @@ begin
     // 1e-4 importer-parity gate (the committed-fixture convention). NEVER
     // loosen - fix the model instead.
     AssertTrue('HiFi-GAN synthesis waveform parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Model.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestVitsSynthesisParity;
+var
+  Model: TNNetVits;
+  Config: TVitsConfig;
+  RefRoot: TJSONData;
+  RefObj: TJSONObject;
+  RefJson: TStringList;
+  IdArr, PMArr, PLArr, RowArr, DurArr, ZArr, FlowArr, WavArr: TJSONArray;
+  Ids: array of integer;
+  Durations: array of integer;
+  PriorMean, PriorLogVar, Z, Spec, PriorLatents: TNNetFloatDynArr2D;
+  Wave: TNeuralFloatDynArr;
+  T, Flow, OutLen, i, j, c, t2: integer;
+  Diff, MaxDiff, RefV: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_vits_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefObj := TJSONObject(RefRoot);
+    Flow := RefObj.Get('flow_size', 0);
+    OutLen := RefObj.Get('out_len', 0);
+
+    Model := BuildVitsFromSafeTensors(FixturePath('tiny_vits.safetensors'),
+      Config, FixturePath('tiny_vits_config.json'));
+    AssertTrue('vits built', Model <> nil);
+    AssertEquals('flow_size from config', Flow, Config.FlowSize);
+
+    // ---- token ids.
+    IdArr := TJSONArray(RefObj.Find('input_ids'));
+    T := IdArr.Count;
+    SetLength(Ids, T);
+    for i := 0 to T - 1 do Ids[i] := IdArr.Items[i].AsInteger;
+
+    // ---- Stage 3: text encoder prior stats + deterministic durations.
+    SetLength(Durations, T);
+    Model.Analyze(Ids, PriorMean, PriorLogVar, Durations);
+
+    PMArr := TJSONArray(RefObj.Find('prior_means'));         // [T][flow]
+    PLArr := TJSONArray(RefObj.Find('prior_log_variances')); // [T][flow]
+    MaxDiff := 0;
+    for i := 0 to T - 1 do
+    begin
+      RowArr := TJSONArray(PMArr.Items[i]);
+      for j := 0 to Flow - 1 do
+      begin
+        Diff := Abs(PriorMean[i][j] - RowArr.Items[j].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      RowArr := TJSONArray(PLArr.Items[i]);
+      for j := 0 to Flow - 1 do
+      begin
+        Diff := Abs(PriorLogVar[i][j] - RowArr.Items[j].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('VITS text-encoder prior parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    DurArr := TJSONArray(RefObj.Find('durations'));
+    for i := 0 to T - 1 do
+      AssertEquals('VITS duration token ' + IntToStr(i),
+        Round(DurArr.Items[i].AsFloat), Durations[i]);
+
+    // ---- Stage 1: flow reverse on the oracle's prior_latents -> flow_out.
+    ZArr := TJSONArray(RefObj.Find('prior_latents'));        // [flow][out]
+    SetLength(PriorLatents, Flow);
+    for c := 0 to Flow - 1 do
+    begin
+      RowArr := TJSONArray(ZArr.Items[c]);
+      SetLength(PriorLatents[c], OutLen);
+      for t2 := 0 to OutLen - 1 do
+        PriorLatents[c][t2] := RowArr.Items[t2].AsFloat;
+    end;
+    Model.FlowReverse(PriorLatents, Spec);
+    FlowArr := TJSONArray(RefObj.Find('flow_out'));          // [flow][out]
+    MaxDiff := 0;
+    for c := 0 to Flow - 1 do
+    begin
+      RowArr := TJSONArray(FlowArr.Items[c]);
+      for t2 := 0 to OutLen - 1 do
+      begin
+        Diff := Abs(Spec[c][t2] - RowArr.Items[t2].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('VITS flow-reverse parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // ---- End-to-end: ids + pinned z -> waveform.
+    ZArr := TJSONArray(RefObj.Find('z'));                    // [flow][out]
+    SetLength(Z, Flow);
+    for c := 0 to Flow - 1 do
+    begin
+      RowArr := TJSONArray(ZArr.Items[c]);
+      SetLength(Z[c], OutLen);
+      for t2 := 0 to OutLen - 1 do Z[c][t2] := RowArr.Items[t2].AsFloat;
+    end;
+    Model.Synthesize(Ids, Z, Wave);
+    WavArr := TJSONArray(RefObj.Find('waveform'));
+    AssertEquals('VITS waveform length', WavArr.Count, Length(Wave));
+    MaxDiff := 0;
+    for i := 0 to WavArr.Count - 1 do
+    begin
+      RefV := WavArr.Items[i].AsFloat;
+      Diff := Abs(Wave[i] - RefV);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    // 1e-4 importer-parity gate. NEVER loosen - fix the model instead.
+    AssertTrue('VITS end-to-end waveform parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     Model.Free;
