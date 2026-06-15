@@ -549,12 +549,14 @@ rather than acted on.
       registered on TNeuralFitBase. Early stopping, custom logging, and the
       EMA/SWA tasks become small callbacks instead of ever more
       TNeuralFitBase fields.
-- [ ] CutMix training augmentation (torchvision transforms-v2 staple;
+- [X] CutMix training augmentation (torchvision transforms-v2 staple;
       Mixup itself is landed: CreateMixedVolumePairList in neuralvolume +
       examples/Mixup): patch a random rectangle from a second sample into
       the input and mix the targets by area fraction (Beta-distributed
-      lambda). The CIFAR image-classification examples give an instant
-      bake-off harness.
+      lambda). LANDED: CreateCutMixVolumePairList + ComputeCutMixBox in
+      neuralvolume.pas (shares the Mixup Beta/Gamma sampler), tests in
+      TestNeuralVolumePairs (box geometry + paste/target area-fraction +
+      length/no-mutation), examples/CutMix bake-off.
 - [ ] True single-kernel batched forward (real batch axis + attention padding
       mask for left-pad) — the lockstep DecodeBatchGreedy orchestration landed,
       but NN.Compute has no SIMD batch axis on the char path, so each step still

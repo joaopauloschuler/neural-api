@@ -33,6 +33,11 @@ type
     procedure TestMixupLambdaOneReproducesFirst;
     procedure TestMixupLengthAndNoMutation;
     procedure TestRandomBetaUniformRange;
+
+    // CutMix data augmentation tests
+    procedure TestCutMixBoxGeometry;
+    procedure TestCutMixPasteAndTargetMix;
+    procedure TestCutMixLengthAndNoMutation;
   end;
 
 implementation
@@ -448,6 +453,175 @@ begin
     V := RandomBetaValue(2.0);
     AssertTrue('Beta(2,2) in [0,1] lower', V >= 0.0);
     AssertTrue('Beta(2,2) in [0,1] upper', V <= 1.0);
+  end;
+end;
+
+procedure TTestNeuralVolumePairs.TestCutMixBoxGeometry;
+var
+  X0, Y0, BoxW, BoxH: integer;
+begin
+  // Lambda=1 -> cut ratio 0 -> empty box (pure first image).
+  ComputeCutMixBox(8, 8, 1.0, 0.5, 0.5, X0, Y0, BoxW, BoxH);
+  AssertEquals('lambda=1 -> zero box width', 0, BoxW);
+  AssertEquals('lambda=1 -> zero box height', 0, BoxH);
+
+  // Lambda=0 -> cut ratio 1 -> full image box.
+  ComputeCutMixBox(8, 8, 0.0, 0.5, 0.5, X0, Y0, BoxW, BoxH);
+  AssertEquals('lambda=0 -> full box width', 8, BoxW);
+  AssertEquals('lambda=0 -> full box height', 8, BoxH);
+
+  // Centered box of half the area (r = sqrt(0.75)): stays inside bounds.
+  ComputeCutMixBox(8, 8, 0.25, 0.5, 0.5, X0, Y0, BoxW, BoxH);
+  AssertTrue('box within X', (X0 >= 0) and (X0 + BoxW <= 8));
+  AssertTrue('box within Y', (Y0 >= 0) and (Y0 + BoxH <= 8));
+  AssertTrue('box has positive area', (BoxW > 0) and (BoxH > 0));
+
+  // Center at a corner: box must still be clamped to the image.
+  ComputeCutMixBox(8, 8, 0.0, 0.0, 0.0, X0, Y0, BoxW, BoxH);
+  AssertTrue('corner box within X', (X0 >= 0) and (X0 + BoxW <= 8));
+  AssertTrue('corner box within Y', (Y0 >= 0) and (Y0 + BoxH <= 8));
+end;
+
+procedure TTestNeuralVolumePairs.TestCutMixPasteAndTargetMix;
+var
+  PL, Cut: TNNetVolumePairList;
+  Pair: TNNetVolumePair;
+  I, X, Y, D, Inside, Outside, ExpectInside: integer;
+  W, H, Depth: integer;
+  WA, WB, LambdaAdj: TNeuralFloat;
+begin
+  W := 4; H := 4; Depth := 2;
+  PL := TNNetVolumePairList.Create();
+  try
+    // Two solid-color image pairs with distinct, known fills.
+    for I := 0 to 1 do
+    begin
+      Pair := TNNetVolumePair.Create();
+      Pair.A.ReSize(W, H, Depth);
+      Pair.B.ReSize(2, 1, 1);
+      if I = 0 then
+      begin
+        Pair.A.Fill(1.0);                 // image A solid 1.0
+        Pair.B.Raw[0] := 1.0; Pair.B.Raw[1] := 0.0;  // one-hot class 0
+      end
+      else
+      begin
+        Pair.A.Fill(7.0);                 // image B solid 7.0
+        Pair.B.Raw[0] := 0.0; Pair.B.Raw[1] := 1.0;  // one-hot class 1
+      end;
+      PL.Add(Pair);
+    end;
+
+    // The two source images are SOLID colors, so regardless of where the
+    // random box lands: every pasted pixel equals the partner's color and
+    // every other pixel keeps the self color. With RandSeed:=9 the Fisher-
+    // Yates step swaps the pair (out0's partner is image B = 7.0, class 1;
+    // out1's partner is image A = 1.0, class 0) AND the box center lands near
+    // the middle so a non-empty rectangle is actually pasted. The mixed target
+    // must weight the partner by the TRUE pasted-area fraction we count from
+    // the pixels themselves.
+    RandSeed := 9;
+    Cut := CreateCutMixVolumePairList(PL, 1.0, 0.5);
+    try
+      AssertEquals('length preserved', PL.Count, Cut.Count);
+
+      // ---- output 0: self=image A (1.0/class0), partner=image B (7.0/class1)
+      Inside := 0; Outside := 0;
+      for X := 0 to W - 1 do
+        for Y := 0 to H - 1 do
+          for D := 0 to Depth - 1 do
+            if Cut[0].A[X, Y, D] = 7.0 then Inc(Inside)         // pasted partner
+            else if Cut[0].A[X, Y, D] = 1.0 then Inc(Outside)   // kept self
+            else AssertTrue('out0 pixel is one of the two solid colors', False);
+      AssertEquals('out0 every pixel accounted for', W * H * Depth, Inside + Outside);
+      AssertTrue('out0 actually pasted a non-empty box', Inside > 0);
+      AssertTrue('out0 kept some of its own pixels', Outside > 0);
+      // True partner-area fraction from the pixels themselves.
+      WB := Inside / (W * H * Depth);            // partner weight (class 1)
+      WA := 1.0 - WB;                            // self weight   (class 0)
+      AssertEquals('out0 target class0 = self area', WA, Cut[0].B.Raw[0], 0.0001);
+      AssertEquals('out0 target class1 = partner area', WB, Cut[0].B.Raw[1], 0.0001);
+      AssertEquals('out0 target weights sum to 1',
+        1.0, Cut[0].B.Raw[0] + Cut[0].B.Raw[1], 0.0001);
+
+      // ---- output 1: self=image B (7.0/class1), partner=image A (1.0/class0)
+      Inside := 0; Outside := 0;
+      for X := 0 to W - 1 do
+        for Y := 0 to H - 1 do
+          for D := 0 to Depth - 1 do
+            if Cut[1].A[X, Y, D] = 1.0 then Inc(Inside)         // pasted partner
+            else if Cut[1].A[X, Y, D] = 7.0 then Inc(Outside)   // kept self
+            else AssertTrue('out1 pixel is one of the two solid colors', False);
+      AssertEquals('out1 every pixel accounted for', W * H * Depth, Inside + Outside);
+      WB := Inside / (W * H * Depth);            // partner weight (class 0)
+      WA := 1.0 - WB;                            // self weight   (class 1)
+      AssertEquals('out1 target class1 = self area', WA, Cut[1].B.Raw[1], 0.0001);
+      AssertEquals('out1 target class0 = partner area', WB, Cut[1].B.Raw[0], 0.0001);
+    finally
+      Cut.Free;
+    end;
+
+    // Partial paste via the deterministic box helper: lambda=0.75 -> r=0.5 ->
+    // 2x2 box centered in a 4x4 image, fully in-bounds. Pasted area = 4 of 16
+    // pixels, so the area fraction (1 - LambdaAdj) = 4/16 = 0.25 exactly.
+    ComputeCutMixBox(W, H, 0.75, 0.5, 0.5, X, Y, Inside, Outside);
+    AssertEquals('2x2 box width', 2, Inside);
+    AssertEquals('2x2 box height', 2, Outside);
+    ExpectInside := Inside * Outside;  // box area in pixels
+    LambdaAdj := 1.0 - ExpectInside / (W * H);
+    AssertEquals('area-fraction LambdaAdj = 0.75', 0.75, LambdaAdj, 0.0001);
+    WA := LambdaAdj;            // weight on self target
+    WB := 1.0 - LambdaAdj;     // weight on partner target
+    AssertEquals('partner-area weight = 0.25', 0.25, WB, 0.0001);
+    AssertEquals('target weights sum to 1', 1.0, WA + WB, 0.0001);
+  finally
+    PL.Free;
+  end;
+end;
+
+procedure TTestNeuralVolumePairs.TestCutMixLengthAndNoMutation;
+var
+  PL, Cut: TNNetVolumePairList;
+  Pair: TNNetVolumePair;
+  I: integer;
+begin
+  PL := TNNetVolumePairList.Create();
+  try
+    for I := 0 to 9 do
+    begin
+      Pair := TNNetVolumePair.Create();
+      Pair.A.ReSize(4, 4, 3);
+      Pair.B.ReSize(2, 1, 1);
+      Pair.A.Fill(I * 1.0);
+      Pair.B.Raw[0] := I * 1.0; Pair.B.Raw[1] := I * 2.0;
+      PL.Add(Pair);
+    end;
+
+    RandSeed := 99;
+    Cut := CreateCutMixVolumePairList(PL, 0.4);
+    try
+      // Output list has the expected length.
+      AssertEquals('CutMix length', 10, Cut.Count);
+      // Inputs are not mutated: original values intact (owns its own copies).
+      for I := 0 to 9 do
+      begin
+        AssertEquals('orig A unchanged', I * 1.0, PL[I].A[0, 0, 0], 0.0);
+        AssertEquals('orig B unchanged', I * 2.0, PL[I].B.Raw[1], 0.0);
+      end;
+      // Output shapes match the input geometry.
+      AssertEquals('Cut A SizeX', 4, Cut[0].A.SizeX);
+      AssertEquals('Cut A SizeY', 4, Cut[0].A.SizeY);
+      AssertEquals('Cut A Depth', 3, Cut[0].A.Depth);
+      AssertEquals('Cut B size', 2, Cut[0].B.Size);
+      // Mutating the output must not touch the input copies.
+      Cut[0].A.Fill(-123.0);
+      AssertEquals('input still intact after output mutate',
+        0.0, PL[0].A[0, 0, 0], 0.0);
+    finally
+      Cut.Free;
+    end;
+  finally
+    PL.Free;
   end;
 end;
 

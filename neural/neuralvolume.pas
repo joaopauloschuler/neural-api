@@ -1076,6 +1076,29 @@ type
   function CreateMixedVolumePairList(Original: TNNetVolumePairList;
     Alpha: TNeuralFloat = 1.0; FixedLambda: TNeuralFloat = -1.0): TNNetVolumePairList;
 
+  { ComputeCutMixBox computes the standard CutMix rand_bbox for an image of
+    size W x H. The cut ratio is r = sqrt(1 - Lambda); the box has size
+    (r*W) x (r*H) centered at (CenterFracX*W, CenterFracY*H) and is clamped to
+    the image bounds. CenterFracX/Y are in [0,1] (the caller draws them
+    uniformly; exposing them keeps the geometry deterministic for tests).
+    Returns the top-left corner (X0,Y0) and the clamped box size (BoxW,BoxH). }
+  procedure ComputeCutMixBox(W, H: integer;
+    Lambda, CenterFracX, CenterFracY: TNeuralFloat;
+    out X0, Y0, BoxW, BoxH: integer);
+
+  { CreateCutMixVolumePairList returns a NEW TNNetVolumePairList (owning copies)
+    implementing CutMix (Yun et al. 2019): for each pair, a random rectangle of
+    a randomly-permuted partner's input is pasted into a copy of this input
+    (across the full depth), and the targets are mixed by the TRUE pasted-area
+    fraction: target := LambdaAdj*target_a + (1-LambdaAdj)*target_b, where
+    LambdaAdj = 1 - PastedArea/(W*H). Lambda ~ Beta(Alpha,Alpha) per pair; the
+    box center is drawn uniformly. The input list is NOT mutated; the caller
+    owns the result and must Free it. Pass FixedLambda >= 0 to override the Beta
+    draw (handy for tests / deterministic runs); FixedLambda < 0 (default) uses
+    the Beta sampler. }
+  function CreateCutMixVolumePairList(Original: TNNetVolumePairList;
+    Alpha: TNeuralFloat = 1.0; FixedLambda: TNeuralFloat = -1.0): TNNetVolumePairList;
+
   function GetLastChars(const InputStr: string; LenStr: Integer): string;
 
   procedure TestTNNetVolume();
@@ -1878,6 +1901,103 @@ begin
     MixVolumes(MixedB, Original[I].B, PartnerPair.B, Lambda);
     // TNNetVolumePair.Create takes ownership of the volumes.
     Result.Add(TNNetVolumePair.Create(MixedA, MixedB));
+  end;
+end;
+
+procedure ComputeCutMixBox(W, H: integer;
+  Lambda, CenterFracX, CenterFracY: TNeuralFloat;
+  out X0, Y0, BoxW, BoxH: integer);
+var
+  CutRatio: TNeuralFloat;
+  CutW, CutH, Cx, Cy, X1, Y1: integer;
+begin
+  X0 := 0; Y0 := 0; BoxW := 0; BoxH := 0;
+  if (W <= 0) or (H <= 0) then Exit;
+  // Standard CutMix rand_bbox: cut size proportional to sqrt(1 - lambda).
+  if Lambda < 0 then Lambda := 0;
+  if Lambda > 1 then Lambda := 1;
+  CutRatio := Sqrt(1.0 - Lambda);
+  CutW := Round(CutRatio * W);
+  CutH := Round(CutRatio * H);
+  // Uniform center, then clamp the corners to the image bounds.
+  Cx := Round(CenterFracX * W);
+  Cy := Round(CenterFracY * H);
+  X0 := Cx - CutW div 2;
+  Y0 := Cy - CutH div 2;
+  X1 := Cx + (CutW - CutW div 2);
+  Y1 := Cy + (CutH - CutH div 2);
+  if X0 < 0 then X0 := 0;
+  if Y0 < 0 then Y0 := 0;
+  if X1 > W then X1 := W;
+  if Y1 > H then Y1 := H;
+  if X1 < X0 then X1 := X0;
+  if Y1 < Y0 then Y1 := Y0;
+  BoxW := X1 - X0;
+  BoxH := Y1 - Y0;
+end;
+
+function CreateCutMixVolumePairList(Original: TNNetVolumePairList;
+  Alpha: TNeuralFloat; FixedLambda: TNeuralFloat): TNNetVolumePairList;
+var
+  Cnt, I, J, Tmp, Partner: integer;
+  Perm: array of integer;
+  Lambda, LambdaAdj: TNeuralFloat;
+  X0, Y0, BoxW, BoxH, X, Y, D, W, H: integer;
+  CutA, MixedB: TNNetVolume;
+  SrcA, SrcB: TNNetVolume;
+  PartnerPair: TNNetVolumePair;
+begin
+  Result := TNNetVolumePairList.Create();
+  if Original = nil then Exit;
+  Cnt := Original.Count;
+  if Cnt = 0 then Exit;
+
+  // Random partner permutation (Fisher-Yates) -> minibatch CutMix.
+  SetLength(Perm, Cnt);
+  for I := 0 to Cnt - 1 do Perm[I] := I;
+  for I := Cnt - 1 downto 1 do
+  begin
+    J := Random(I + 1);
+    Tmp := Perm[I]; Perm[I] := Perm[J]; Perm[J] := Tmp;
+  end;
+
+  for I := 0 to Cnt - 1 do
+  begin
+    Partner := Perm[I];
+    PartnerPair := Original[Partner];
+    SrcA := Original[I].A;
+    SrcB := PartnerPair.A;
+    if FixedLambda >= 0
+    then Lambda := FixedLambda
+    else Lambda := RandomBetaValue(Alpha);
+
+    W := SrcA.SizeX;
+    H := SrcA.SizeY;
+    ComputeCutMixBox(W, H, Lambda, Random(), Random(), X0, Y0, BoxW, BoxH);
+
+    // Start from a copy of this sample's input, then paste the partner's box.
+    CutA := TNNetVolume.Create();
+    CutA.Copy(SrcA);
+    // Only paste when the partner shares the same XY/depth geometry; otherwise
+    // fall back to lambda=1 (no paste) so mismatched shapes are still safe.
+    if (SrcB.SizeX = W) and (SrcB.SizeY = H) and (SrcB.Depth = SrcA.Depth) then
+    begin
+      for X := X0 to X0 + BoxW - 1 do
+        for Y := Y0 to Y0 + BoxH - 1 do
+          for D := 0 to SrcA.Depth - 1 do
+            CutA[X, Y, D] := SrcB[X, Y, D];
+      // True pasted-area fraction after clamping.
+      LambdaAdj := 1.0 - (BoxW * BoxH) / (W * H);
+    end
+    else
+      LambdaAdj := 1.0;
+
+    // Mix targets by the actual pasted-area fraction.
+    MixedB := TNNetVolume.Create();
+    MixVolumes(MixedB, Original[I].B, PartnerPair.B, LambdaAdj);
+
+    // TNNetVolumePair.Create takes ownership of the volumes.
+    Result.Add(TNNetVolumePair.Create(CutA, MixedB));
   end;
 end;
 
