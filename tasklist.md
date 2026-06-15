@@ -715,17 +715,25 @@ rather than acted on.
       TNNetVolume in [-1,1] -> canonical 16-bit PCM WAV (RIFF header + sample
       clamping/dither), round-trip tested against `LoadWav16ToVolume` to <=1 LSB.
       Prerequisite enabler for the speech/music tasks below.
-- [ ] HiFi-GAN neural vocoder importer (`BuildHiFiGANFromSafeTensors[Ex]`,
-      e.g. the `hifigan` generator shipped with most TTS stacks) — mel-spectrogram
-      -> waveform, the reusable synthesis backend shared by Tacotron2 / FastSpeech2 /
-      SpeechT5 / Bark / VITS-style models. The generator is purely convolutional:
-      transposed-Conv1d upsampling stages interleaved with Multi-Receptive-Field
-      (MRF) residual blocks (parallel dilated Conv1d sums). New pieces: a 1-D
-      transposed-conv upsampler and the MRF residual builder; the discriminators are
-      training-only and can be skipped for an inference importer. Verify a log-mel ->
-      audio pass against a diffusers/HF HiFi-GAN float oracle to ~1e-4 on a pico
-      fixture, then resynthesize a real clip and write it with the WAV writer above.
-      Reuses the weight-norm Conv1d already needed by the Wav2Vec2 feature extractor.
+- [ ] HiFi-GAN neural vocoder importer follow-ups (`BuildHiFiGANFromSafeTensors[Ex]`
+      LANDED + `ReadHiFiGANConfigFromJSONFile`/`HiFiGANConfigToString` +
+      `THiFiGANConfig` + the `TNNetHiFiGAN` channel-major holder
+      (Synthesize / SynthesizeVolume); mel-spectrogram -> waveform, the reusable
+      synthesis backend shared by Tacotron2 / FastSpeech2 / SpeechT5 / Bark /
+      VITS-style models). The generator is implemented as a self-contained
+      convolutional holder (like TEnCodecModel) doing the conv_pre ->
+      ConvTranspose1d-upsample + MRF (AVERAGE of num_kernels dilated ResBlocks) ->
+      conv_post -> tanh math directly on channel-major arrays; conv weights fold
+      weight_norm g/v at import (or load plain folded `.weight` as SpeechT5HifiGan
+      ships). Discriminators skipped (training-only). Parity-gated < 1e-4 against an
+      HF SpeechT5HifiGan float64 oracle (tools/make_pico_hifigan_fixture.py ->
+      tests/fixtures/tiny_hifigan*, TestHiFiGANSynthesisParity). Open follow-ups:
+  - [ ] resblock type "2" (the alternative MRF wiring) — currently rejected loudly
+        in ReadHiFiGANConfigFromJSONFile.
+  - [ ] real-checkpoint smoke: resynthesize a clip with a downloaded `hifigan` /
+        SpeechT5HifiGan generator (weight_norm fold path) and write it via
+        SaveVolumeToWav16 (offline + RAM-gated here, so deferred).
+  - [ ] consume from the VITS / MMS-TTS importer (decoder is shared with this).
 - [ ] VITS / MMS-TTS end-to-end text-to-speech importer (`BuildVitsFromSafeTensors[Ex]`,
       e.g. `facebook/mms-tts-eng` or `kakao-enterprise/vits-ljs`) + an
       examples/TextToSpeech demo — the FIRST text-to-speech model in the library and

@@ -3597,6 +3597,117 @@ function BuildEnCodecFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TEnCodecModel;
 
 // ---------------------------------------------------------------------------
+// HIFI-GAN NEURAL VOCODER IMPORT (model_type "hifigan" / the SpeechT5HifiGan
+// generator shipped with most TTS stacks - Tacotron2 / FastSpeech2 / SpeechT5
+// / Bark / VITS). Maps a log-mel spectrogram (model_in_dim mel bands over
+// time) to a raw mono waveform. The generator is PURELY convolutional and is
+// implemented here as a self-contained channel-major holder (TNNetHiFiGAN),
+// matching the EnCodec vocoder convention rather than a TNNet layer graph,
+// because HiFi-GAN's per-conv "same" padding ((k*dilation-dilation) div 2)
+// and transposed-conv upsampling are exactly faithful in direct conv math.
+//
+// Pipeline (HF SpeechT5HifiGan.forward):
+//   if normalize_before: x := (x - mean) / scale   (per mel band)
+//   conv_pre: Conv1d(model_in_dim -> upsample_initial_channel, k=7, pad=3)
+//   for i in 0..num_upsamples-1:
+//     LeakyReLU(leaky_relu_slope=0.1)
+//     upsampler[i]: ConvTranspose1d(C -> C/2, k=upsample_kernel_sizes[i],
+//                   stride=upsample_rates[i], pad=(k-stride) div 2)
+//     MRF: AVERAGE (not sum) of num_kernels ResBlocks; ResBlock r covers
+//          resblock_kernel_sizes[r] with the dilation list
+//          resblock_dilation_sizes[r]; resblocks is a FLAT list, stage i
+//          uses resblocks[i*num_kernels .. i*num_kernels+num_kernels-1].
+//     ResBlock: for each dilation d: residual := x;
+//          x := x + Conv2(LeakyReLU0.1(Conv1(LeakyReLU0.1(x)))) where Conv1
+//          has dilation d ("same" pad) and Conv2 has dilation 1.
+//   LeakyReLU(0.01 - the FINAL relu uses PyTorch's DEFAULT slope, not 0.1)
+//   conv_post: Conv1d(C -> 1, k=7, pad=3); tanh -> waveform.
+//
+// Conv weights load either as a plain ".weight" (SpeechT5HifiGan ships the
+// folded weight - it removes weight_norm at save) OR, for the bare upstream
+// "hifigan" generator that keeps weight_norm, as g/v pairs folded at import
+// (".parametrizations.weight.original0/1" or legacy ".weight_g"/".weight_v",
+// weight_norm dim=0: w[o] = g[o] * v[o] / ||v[o]||_F). resblock type "2" is
+// rejected loudly (a documented follow-up). Coded by Claude (AI).
+// ---------------------------------------------------------------------------
+type
+  TIntArray2D = array of array of integer;
+
+  THiFiGANConfig = record
+    ModelInDim: integer;          // model_in_dim (n_mels)
+    UpsampleInitialChannel: integer; // upsample_initial_channel
+    UpsampleRates: array of integer; // upsample_rates
+    UpsampleKernelSizes: array of integer; // upsample_kernel_sizes
+    ResblockKernelSizes: array of integer; // resblock_kernel_sizes
+    ResblockDilationSizes: TIntArray2D;    // resblock_dilation_sizes[r][j]
+    LeakyReluSlope: TNeuralFloat;  // leaky_relu_slope (0.1)
+    NormalizeBefore: boolean;      // normalize_before (SpeechT5 mean/scale)
+    SamplingRate: integer;         // sampling_rate (for the WAV writer)
+    ModelType: string;             // 'hifigan'
+  end;
+
+  // One plain Conv1d (or ConvTranspose1d when Transpose) stage with the
+  // effective (weight-norm-folded if needed) weight FW[o][i][k] and bias.
+  THiFiGANConv = record
+    InCh, OutCh, Kernel, Stride, Dilation, Pad: integer;
+    Transpose: boolean;
+    W: array of TNeuralFloat;   // flat [OutCh, InCh, Kernel] (conv) /
+                                // [InCh, OutCh, Kernel] (transpose), row-major
+    B: array of TNeuralFloat;   // [OutCh]
+  end;
+
+  // One HiFi-GAN ResBlock: per dilation tap, a (Conv1 dilated, Conv2 d=1) pair.
+  THiFiGANResBlock = record
+    Convs1, Convs2: array of THiFiGANConv;
+  end;
+
+  { TNNetHiFiGAN }
+  // Holds the imported HiFi-GAN generator and runs the full mel -> waveform
+  // synthesis in inference. Built by BuildHiFiGANFromSafeTensors[Ex];
+  // caller-owned. Coded by Claude (AI).
+  TNNetHiFiGAN = class
+  private
+    FConfig: THiFiGANConfig;
+    FConvPre, FConvPost: THiFiGANConv;
+    FUpsamplers: array of THiFiGANConv;          // [num_upsamples]
+    FResBlocks: array of THiFiGANResBlock;       // FLAT list
+    FMean, FScale: TNeuralFloatDynArr;           // SpeechT5 normalize_before
+  public
+    constructor Create(const pConfig: THiFiGANConfig);
+    destructor Destroy; override;
+    property Config: THiFiGANConfig read FConfig;
+    // Synthesizes a mono waveform from a log-mel spectrogram given as
+    // Mel[band][frame] (ModelInDim bands). Returns the waveform in Waveform.
+    procedure Synthesize(const Mel: array of TNeuralFloatDynArr;
+      out Waveform: TNeuralFloatDynArr);
+    // Convenience: Mel given as a (Frames, 1, Bands) TNNetVolume (the layout
+    // the log-mel frontend in neuralaudio.pas produces).
+    procedure SynthesizeVolume(Mel: TNNetVolume;
+      out Waveform: TNeuralFloatDynArr);
+  end;
+
+// Reads a HF HiFi-GAN config.json (model_type "hifigan"; SpeechT5HifiGan
+// configs have no explicit model_type, so an absent/empty model_type with the
+// HiFi-GAN keys present is accepted). Required: model_in_dim,
+// upsample_initial_channel, upsample_rates, upsample_kernel_sizes,
+// resblock_kernel_sizes, resblock_dilation_sizes. Rejects resblock_type "2"
+// loudly (a documented follow-up). Coded by Claude (AI).
+function ReadHiFiGANConfigFromJSONFile(const FileName: string): THiFiGANConfig;
+
+function HiFiGANConfigToString(const Config: THiFiGANConfig): string;
+
+// Builds a TNNetHiFiGAN from Reader (the caller owns Reader). Coded by
+// Claude (AI).
+function BuildHiFiGANFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  var Config: THiFiGANConfig): TNNetHiFiGAN;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+function BuildHiFiGANFromSafeTensors(const FileName: string;
+  out Config: THiFiGANConfig;
+  const ConfigFileName: string = ''): TNNetHiFiGAN;
+
+// ---------------------------------------------------------------------------
 // MUSICGEN IMPORT (model_type "musicgen": facebook/musicgen-small and
 // siblings, architectures ["MusicgenForConditionalGeneration"]) - the FIRST
 // text-to-AUDIO generative importer (Copet et al. 2023, arXiv:2306.05284). It
@@ -27298,6 +27409,611 @@ begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
     Result := BuildEnCodecFromSafeTensorsEx(Reader, Config);
+  finally
+    Reader.Free;
+  end;
+end;
+
+// ============================ HIFI-GAN VOCODER IMPORT ======================
+
+function ReadHiFiGANConfigFromJSONFile(const FileName: string): THiFiGANConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, ResType: string;
+  Arr, Inner: TJSONArray;
+  k, j: integer;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('HiFi-GAN import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('HiFi-GAN import: config field "' + FieldName +
+        '" must be a positive integer.');
+  end;
+
+  // Reads a required non-empty JSON int array into Dst (length inferred).
+  procedure RequiredIntArray(const FieldName: string;
+    var Dst: array of integer);
+  var
+    A: TJSONArray;
+    i: integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('HiFi-GAN import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    if not (Obj.Find(FieldName) is TJSONArray) then
+      ImportError('HiFi-GAN import: config field "' + FieldName +
+        '" must be an array.');
+    A := TJSONArray(Obj.Find(FieldName));
+    if A.Count <> Length(Dst) then
+      ImportError('HiFi-GAN import: config field "' + FieldName +
+        '" must have ' + IntToStr(Length(Dst)) + ' entries, got ' +
+        IntToStr(A.Count) + '.');
+    for i := 0 to A.Count - 1 do Dst[i] := A.Items[i].AsInteger;
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('HiFi-GAN import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('HiFi-GAN import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('HiFi-GAN import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    // SpeechT5HifiGan configs carry no explicit model_type; accept an
+    // empty/absent model_type, or "hifigan".
+    ModelType := Obj.Get('model_type', '');
+    if (ModelType <> '') and (ModelType <> 'hifigan') and
+       (ModelType <> 'speecht5_hifigan') then
+      ImportError('HiFi-GAN import: config model_type is "' + ModelType +
+        '" - only "hifigan" / "speecht5_hifigan" (or a generator with no ' +
+        'model_type) is supported here.');
+    Result.ModelType := 'hifigan';
+    // resblock type "2" (the alternative MRF wiring) is a documented follow-up.
+    ResType := Obj.Get('resblock', '1');
+    if (ResType <> '1') and (ResType <> '') then
+      ImportError('HiFi-GAN import: resblock type "' + ResType +
+        '" is not supported - only the common type "1" is implemented ' +
+        '(type "2" is a documented follow-up).');
+
+    Result.ModelInDim := RequiredInt('model_in_dim');
+    Result.UpsampleInitialChannel := RequiredInt('upsample_initial_channel');
+
+    // upsample_rates is the spine: upsample_kernel_sizes must match its length.
+    if Obj.IndexOfName('upsample_rates') < 0 then
+      ImportError('HiFi-GAN import: config "' + FileName +
+        '" is missing the required field "upsample_rates".');
+    if not (Obj.Find('upsample_rates') is TJSONArray) then
+      ImportError('HiFi-GAN import: "upsample_rates" must be an array.');
+    Arr := TJSONArray(Obj.Find('upsample_rates'));
+    if Arr.Count < 1 then
+      ImportError('HiFi-GAN import: upsample_rates must be non-empty.');
+    SetLength(Result.UpsampleRates, Arr.Count);
+    SetLength(Result.UpsampleKernelSizes, Arr.Count);
+    for k := 0 to Arr.Count - 1 do
+    begin
+      Result.UpsampleRates[k] := Arr.Items[k].AsInteger;
+      if Result.UpsampleRates[k] <= 0 then
+        ImportError('HiFi-GAN import: upsample_rates[' + IntToStr(k) +
+          '] must be positive.');
+    end;
+    RequiredIntArray('upsample_kernel_sizes', Result.UpsampleKernelSizes);
+
+    // resblock_kernel_sizes is the MRF spine; resblock_dilation_sizes is a
+    // matching array-of-arrays.
+    if Obj.IndexOfName('resblock_kernel_sizes') < 0 then
+      ImportError('HiFi-GAN import: config "' + FileName +
+        '" is missing the required field "resblock_kernel_sizes".');
+    if not (Obj.Find('resblock_kernel_sizes') is TJSONArray) then
+      ImportError('HiFi-GAN import: "resblock_kernel_sizes" must be an array.');
+    Arr := TJSONArray(Obj.Find('resblock_kernel_sizes'));
+    if Arr.Count < 1 then
+      ImportError('HiFi-GAN import: resblock_kernel_sizes must be non-empty.');
+    SetLength(Result.ResblockKernelSizes, Arr.Count);
+    for k := 0 to Arr.Count - 1 do
+      Result.ResblockKernelSizes[k] := Arr.Items[k].AsInteger;
+
+    if Obj.IndexOfName('resblock_dilation_sizes') < 0 then
+      ImportError('HiFi-GAN import: config "' + FileName +
+        '" is missing the required field "resblock_dilation_sizes".');
+    if not (Obj.Find('resblock_dilation_sizes') is TJSONArray) then
+      ImportError('HiFi-GAN import: "resblock_dilation_sizes" must be ' +
+        'an array of arrays.');
+    Arr := TJSONArray(Obj.Find('resblock_dilation_sizes'));
+    if Arr.Count <> Length(Result.ResblockKernelSizes) then
+      ImportError('HiFi-GAN import: resblock_dilation_sizes must have the ' +
+        'same length as resblock_kernel_sizes (' +
+        IntToStr(Length(Result.ResblockKernelSizes)) + '), got ' +
+        IntToStr(Arr.Count) + '.');
+    SetLength(Result.ResblockDilationSizes, Arr.Count);
+    for k := 0 to Arr.Count - 1 do
+    begin
+      if not (Arr.Items[k] is TJSONArray) then
+        ImportError('HiFi-GAN import: resblock_dilation_sizes[' +
+          IntToStr(k) + '] must be an array.');
+      Inner := TJSONArray(Arr.Items[k]);
+      SetLength(Result.ResblockDilationSizes[k], Inner.Count);
+      for j := 0 to Inner.Count - 1 do
+        Result.ResblockDilationSizes[k][j] := Inner.Items[j].AsInteger;
+    end;
+
+    Result.LeakyReluSlope := Obj.Get('leaky_relu_slope', 0.1);
+    Result.NormalizeBefore := Obj.Get('normalize_before', False);
+    Result.SamplingRate := Obj.Get('sampling_rate', 22050);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function HiFiGANConfigToString(const Config: THiFiGANConfig): string;
+var
+  k, j: integer;
+  Rates, UKernels, RKernels, Dils: string;
+begin
+  Rates := ''; UKernels := '';
+  for k := 0 to Length(Config.UpsampleRates) - 1 do
+  begin
+    if k > 0 then begin Rates := Rates + ','; UKernels := UKernels + ','; end;
+    Rates := Rates + IntToStr(Config.UpsampleRates[k]);
+    UKernels := UKernels + IntToStr(Config.UpsampleKernelSizes[k]);
+  end;
+  RKernels := ''; Dils := '';
+  for k := 0 to Length(Config.ResblockKernelSizes) - 1 do
+  begin
+    if k > 0 then begin RKernels := RKernels + ','; Dils := Dils + ';'; end;
+    RKernels := RKernels + IntToStr(Config.ResblockKernelSizes[k]);
+    for j := 0 to Length(Config.ResblockDilationSizes[k]) - 1 do
+    begin
+      if j > 0 then Dils := Dils + ',';
+      Dils := Dils + IntToStr(Config.ResblockDilationSizes[k][j]);
+    end;
+  end;
+  Result := 'HiFiGANConfig(model_type=' + Config.ModelType +
+    ', in_dim=' + IntToStr(Config.ModelInDim) +
+    ', init_ch=' + IntToStr(Config.UpsampleInitialChannel) +
+    ', up_rates=[' + Rates + ']' +
+    ', up_kernels=[' + UKernels + ']' +
+    ', rb_kernels=[' + RKernels + ']' +
+    ', rb_dilations=[' + Dils + ']' +
+    ', lrelu=' + FloatToStr(Config.LeakyReluSlope) +
+    ', normalize_before=' + BoolToStr(Config.NormalizeBefore, True) +
+    ', sr=' + IntToStr(Config.SamplingRate) + ')';
+end;
+
+// Loads a plain Conv1d/ConvTranspose1d (folding weight_norm g/v at import if
+// the checkpoint keeps it). pTranspose selects the [In,Out,K] weight layout.
+procedure LoadHiFiGANConv(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; var Conv: THiFiGANConv; pTranspose: boolean;
+  pStride, pDilation, pPad: integer; Consumed: TStrings);
+var
+  G, V, W: TNNetVolume;
+  OutDim, InDim, K, o, i, k2, Base, Cnt: integer;
+  Norm: TNeuralFloat;
+  WName, GName, VName: string;
+begin
+  G := TNNetVolume.Create;
+  V := TNNetVolume.Create;
+  W := TNNetVolume.Create;
+  try
+    WName := Prefix + '.weight';
+    Conv.Transpose := pTranspose;
+    Conv.Stride := pStride;
+    Conv.Dilation := pDilation;
+    Conv.Pad := pPad;
+    if Reader.HasTensor(WName) then
+    begin
+      // Plain (already folded) weight - the SpeechT5HifiGan layout.
+      Reader.LoadTensorFlat(WName, W);
+      Consumed.Add(WName);
+      OutDim := Reader.DimSize(WName, 0);
+      InDim := Reader.DimSize(WName, 1);
+      K := Reader.DimSize(WName, 2);
+      Cnt := OutDim * InDim * K;
+      SetLength(Conv.W, Cnt);
+      for i := 0 to Cnt - 1 do Conv.W[i] := W.FData[i];
+    end
+    else
+    begin
+      // weight_norm-parametrized: g = original0, v = original1 (dim=0).
+      // Also accept the legacy ".weight_g"/".weight_v" spelling.
+      if Reader.HasTensor(Prefix + '.parametrizations.weight.original1') then
+      begin
+        GName := Prefix + '.parametrizations.weight.original0';
+        VName := Prefix + '.parametrizations.weight.original1';
+      end
+      else
+      begin
+        GName := Prefix + '.weight_g';
+        VName := Prefix + '.weight_v';
+      end;
+      if not Reader.HasTensor(VName) then
+        ImportError('HiFi-GAN import: conv "' + Prefix + '" has neither a ' +
+          'plain .weight nor weight_norm g/v tensors.');
+      Reader.LoadTensorFlat(GName, G);
+      Reader.LoadTensorFlat(VName, V);
+      Consumed.Add(GName);
+      Consumed.Add(VName);
+      OutDim := Reader.DimSize(VName, 0);
+      InDim := Reader.DimSize(VName, 1);
+      K := Reader.DimSize(VName, 2);
+      Cnt := OutDim * InDim * K;
+      SetLength(Conv.W, Cnt);
+      // weight_norm dim=0: per group-row o, w = g[o] * v[o] / ||v[o]||_F.
+      for o := 0 to OutDim - 1 do
+      begin
+        Base := o * InDim * K;
+        Norm := 0;
+        for i := 0 to InDim - 1 do
+          for k2 := 0 to K - 1 do
+            Norm := Norm + Sqr(V.FData[Base + i * K + k2]);
+        Norm := Sqrt(Norm);
+        if Norm = 0 then Norm := 1;
+        for i := 0 to InDim - 1 do
+          for k2 := 0 to K - 1 do
+            Conv.W[Base + i * K + k2] :=
+              G.FData[o] * V.FData[Base + i * K + k2] / Norm;
+      end;
+    end;
+    Conv.Kernel := K;
+    if pTranspose then
+    begin
+      // ConvTranspose1d weight is [In, Out, K]; dim0 is In.
+      Conv.InCh := OutDim;
+      Conv.OutCh := InDim;
+    end
+    else
+    begin
+      Conv.InCh := InDim;
+      Conv.OutCh := OutDim;
+    end;
+    Reader.LoadTensorFlat(Prefix + '.bias', G);
+    Consumed.Add(Prefix + '.bias');
+    SetLength(Conv.B, G.Size);
+    for o := 0 to G.Size - 1 do Conv.B[o] := G.FData[o];
+  finally
+    W.Free;
+    V.Free;
+    G.Free;
+  end;
+end;
+
+function HiFiGANLeakyReLU(X, Slope: TNeuralFloat): TNeuralFloat; inline;
+begin
+  if X >= 0 then Result := X else Result := Slope * X;
+end;
+
+procedure ApplyHiFiGANLeakyReLU(var Sig: TNNetFloatDynArr2D; Slope: TNeuralFloat);
+var
+  c, t: integer;
+begin
+  for c := 0 to Length(Sig) - 1 do
+    for t := 0 to Length(Sig[c]) - 1 do
+      Sig[c][t] := HiFiGANLeakyReLU(Sig[c][t], Slope);
+end;
+
+// Conv1d ("same"-padded) / ConvTranspose1d on a channel-major signal. For a
+// normal conv the output length is InLen+2*Pad-(K-1)*Dil-1)/Stride+1; for a
+// transpose conv it is (InLen-1)*Stride-2*Pad+K (no output_padding).
+procedure RunHiFiGANConv(const Conv: THiFiGANConv;
+  const InSig: array of TNeuralFloatDynArr; out OutSig: TNNetFloatDynArr2D);
+var
+  InCh, OutCh, K, Stride, Dil, Pad, InLen, o, i, t, k2, src: integer;
+  OutLen, FullLen, idx, val: integer;
+  Acc: TNeuralFloat;
+begin
+  InCh := Conv.InCh;
+  OutCh := Conv.OutCh;
+  K := Conv.Kernel;
+  Stride := Conv.Stride;
+  Dil := Conv.Dilation;
+  Pad := Conv.Pad;
+  InLen := Length(InSig[0]);
+  if not Conv.Transpose then
+  begin
+    OutLen := (InLen + 2 * Pad - ((K - 1) * Dil + 1)) div Stride + 1;
+    if OutLen < 0 then OutLen := 0;
+    SetLength(OutSig, OutCh);
+    for o := 0 to OutCh - 1 do
+    begin
+      SetLength(OutSig[o], OutLen);
+      for t := 0 to OutLen - 1 do
+      begin
+        Acc := Conv.B[o];
+        for k2 := 0 to K - 1 do
+        begin
+          src := t * Stride + k2 * Dil - Pad; // implicit zero pad
+          if (src >= 0) and (src < InLen) then
+            for i := 0 to InCh - 1 do
+              Acc := Acc + Conv.W[o * InCh * K + i * K + k2] * InSig[i][src];
+        end;
+        OutSig[o][t] := Acc;
+      end;
+    end;
+  end
+  else
+  begin
+    // ConvTranspose1d: scatter into a (InLen-1)*Stride+K buffer, then trim Pad
+    // off each side. Weight layout [In,Out,K]: W[i*OutCh*K + o*K + k2].
+    FullLen := (InLen - 1) * Stride + K;
+    OutLen := FullLen - 2 * Pad;
+    if OutLen < 0 then OutLen := 0;
+    SetLength(OutSig, OutCh);
+    for o := 0 to OutCh - 1 do
+    begin
+      SetLength(OutSig[o], OutLen);
+      for t := 0 to OutLen - 1 do OutSig[o][t] := Conv.B[o];
+    end;
+    for i := 0 to InCh - 1 do
+      for t := 0 to InLen - 1 do
+        for k2 := 0 to K - 1 do
+        begin
+          idx := t * Stride + k2;       // index into the FullLen buffer
+          val := idx - Pad;             // index into the trimmed output
+          if (val >= 0) and (val < OutLen) then
+            for o := 0 to OutCh - 1 do
+              OutSig[o][val] := OutSig[o][val] +
+                Conv.W[i * OutCh * K + o * K + k2] * InSig[i][t];
+        end;
+  end;
+end;
+
+{ TNNetHiFiGAN }
+
+constructor TNNetHiFiGAN.Create(const pConfig: THiFiGANConfig);
+begin
+  inherited Create();
+  FConfig := pConfig;
+end;
+
+destructor TNNetHiFiGAN.Destroy;
+begin
+  inherited Destroy;
+end;
+
+procedure TNNetHiFiGAN.Synthesize(const Mel: array of TNeuralFloatDynArr;
+  out Waveform: TNeuralFloatDynArr);
+var
+  Sig, Nxt, ResSum, ResOne, Tmp1, Tmp2: TNNetFloatDynArr2D;
+  NumUp, NumKernels, s, j, d, c, t, dil, rb: integer;
+  Slope, InvK: TNeuralFloat;
+begin
+  NumUp := Length(FConfig.UpsampleRates);
+  NumKernels := Length(FConfig.ResblockKernelSizes);
+  Slope := FConfig.LeakyReluSlope;
+  // ---- Channel-major mel: Sig[band][frame]. Optional normalize_before.
+  SetLength(Sig, FConfig.ModelInDim);
+  for c := 0 to FConfig.ModelInDim - 1 do
+  begin
+    SetLength(Sig[c], Length(Mel[c]));
+    for t := 0 to Length(Mel[c]) - 1 do
+    begin
+      if FConfig.NormalizeBefore then
+        Sig[c][t] := (Mel[c][t] - FMean[c]) / FScale[c]
+      else
+        Sig[c][t] := Mel[c][t];
+    end;
+  end;
+  // ---- conv_pre.
+  RunHiFiGANConv(FConvPre, Sig, Nxt);
+  Sig := Nxt;
+  // ---- upsample stages, each with its MRF (AVERAGE of NumKernels resblocks).
+  for s := 0 to NumUp - 1 do
+  begin
+    ApplyHiFiGANLeakyReLU(Sig, Slope);
+    RunHiFiGANConv(FUpsamplers[s], Sig, Nxt);
+    Sig := Nxt;
+    // MRF: res_state = mean over resblocks[s*NumKernels + j].
+    ResSum := nil;
+    for j := 0 to NumKernels - 1 do
+    begin
+      rb := s * NumKernels + j;
+      // ResBlock rb: for each dilation tap, x := x + Conv2(LReLU(Conv1(LReLU(x)))).
+      SetLength(ResOne, Length(Sig));
+      for c := 0 to Length(Sig) - 1 do
+      begin
+        SetLength(ResOne[c], Length(Sig[c]));
+        for t := 0 to Length(Sig[c]) - 1 do ResOne[c][t] := Sig[c][t];
+      end;
+      for d := 0 to Length(FResBlocks[rb].Convs1) - 1 do
+      begin
+        dil := FResBlocks[rb].Convs1[d].Dilation;
+        // Tmp1 = LeakyReLU(ResOne)
+        SetLength(Tmp1, Length(ResOne));
+        for c := 0 to Length(ResOne) - 1 do
+        begin
+          SetLength(Tmp1[c], Length(ResOne[c]));
+          for t := 0 to Length(ResOne[c]) - 1 do
+            Tmp1[c][t] := HiFiGANLeakyReLU(ResOne[c][t], Slope);
+        end;
+        RunHiFiGANConv(FResBlocks[rb].Convs1[d], Tmp1, Tmp2);
+        ApplyHiFiGANLeakyReLU(Tmp2, Slope);
+        RunHiFiGANConv(FResBlocks[rb].Convs2[d], Tmp2, Tmp1);
+        // ResOne := ResOne + Tmp1
+        for c := 0 to Length(ResOne) - 1 do
+          for t := 0 to Length(ResOne[c]) - 1 do
+            ResOne[c][t] := ResOne[c][t] + Tmp1[c][t];
+        if dil = 0 then ; // (silence "unused" hint when no dilations)
+      end;
+      // Accumulate into ResSum.
+      if ResSum = nil then
+      begin
+        SetLength(ResSum, Length(ResOne));
+        for c := 0 to Length(ResOne) - 1 do
+        begin
+          SetLength(ResSum[c], Length(ResOne[c]));
+          for t := 0 to Length(ResOne[c]) - 1 do ResSum[c][t] := ResOne[c][t];
+        end;
+      end
+      else
+        for c := 0 to Length(ResOne) - 1 do
+          for t := 0 to Length(ResOne[c]) - 1 do
+            ResSum[c][t] := ResSum[c][t] + ResOne[c][t];
+    end;
+    InvK := 1.0 / NumKernels;
+    for c := 0 to Length(ResSum) - 1 do
+      for t := 0 to Length(ResSum[c]) - 1 do
+        ResSum[c][t] := ResSum[c][t] * InvK;
+    Sig := ResSum;
+  end;
+  // ---- final LeakyReLU uses PyTorch's DEFAULT slope (0.01), not the config.
+  ApplyHiFiGANLeakyReLU(Sig, 0.01);
+  RunHiFiGANConv(FConvPost, Sig, Nxt);
+  Sig := Nxt;
+  // conv_post emits a single channel; tanh -> waveform.
+  SetLength(Waveform, Length(Sig[0]));
+  for t := 0 to Length(Sig[0]) - 1 do
+    Waveform[t] := Tanh(Sig[0][t]);
+end;
+
+procedure TNNetHiFiGAN.SynthesizeVolume(Mel: TNNetVolume;
+  out Waveform: TNeuralFloatDynArr);
+var
+  Mel2D: TNNetFloatDynArr2D;
+  Frames, Bands, c, t: integer;
+begin
+  // The log-mel frontend produces (Frames, 1, Bands): SizeX=frames, Depth=bands.
+  Frames := Mel.SizeX;
+  Bands := Mel.Depth;
+  if Bands <> FConfig.ModelInDim then
+    ImportError('HiFi-GAN synth: mel volume Depth=' + IntToStr(Bands) +
+      ' does not match model_in_dim=' + IntToStr(FConfig.ModelInDim) + '.');
+  SetLength(Mel2D, Bands);
+  for c := 0 to Bands - 1 do
+  begin
+    SetLength(Mel2D[c], Frames);
+    for t := 0 to Frames - 1 do Mel2D[c][t] := Mel[t, 0, c];
+  end;
+  Synthesize(Mel2D, Waveform);
+end;
+
+function BuildHiFiGANFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  var Config: THiFiGANConfig): TNNetHiFiGAN;
+var
+  Model: TNNetHiFiGAN;
+  Consumed: TStringList;
+  T: TNNetVolume;
+  NumUp, NumKernels, s, j, d, rb, ch, pad, kk, st: integer;
+  Base: string;
+begin
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  Model := nil;
+  T := TNNetVolume.Create;
+  try
+    NumUp := Length(Config.UpsampleRates);
+    NumKernels := Length(Config.ResblockKernelSizes);
+    Model := TNNetHiFiGAN.Create(Config);
+
+    // conv_pre: Conv1d(model_in_dim -> init_ch, k=7, pad=3).
+    LoadHiFiGANConv(Reader, 'conv_pre', Model.FConvPre, False, 1, 1, 3,
+      Consumed);
+
+    // upsamplers: ConvTranspose1d(C -> C/2, k=upsample_kernel_sizes[i],
+    // stride=upsample_rates[i], pad=(k-stride) div 2).
+    SetLength(Model.FUpsamplers, NumUp);
+    for s := 0 to NumUp - 1 do
+    begin
+      st := Config.UpsampleRates[s];
+      kk := Config.UpsampleKernelSizes[s];
+      pad := (kk - st) div 2;
+      LoadHiFiGANConv(Reader, 'upsampler.' + IntToStr(s), Model.FUpsamplers[s],
+        True, st, 1, pad, Consumed);
+    end;
+
+    // resblocks: FLAT list of NumUp*NumKernels blocks. Block (s*NumKernels+j)
+    // operates at channels init_ch div 2^(s+1), kernel resblock_kernel_sizes[j]
+    // with dilation list resblock_dilation_sizes[j].
+    SetLength(Model.FResBlocks, NumUp * NumKernels);
+    for s := 0 to NumUp - 1 do
+    begin
+      ch := Config.UpsampleInitialChannel;
+      for d := 0 to s do ch := ch div 2;     // div 2^(s+1)
+      for j := 0 to NumKernels - 1 do
+      begin
+        rb := s * NumKernels + j;
+        kk := Config.ResblockKernelSizes[j];
+        SetLength(Model.FResBlocks[rb].Convs1,
+          Length(Config.ResblockDilationSizes[j]));
+        SetLength(Model.FResBlocks[rb].Convs2,
+          Length(Config.ResblockDilationSizes[j]));
+        Base := 'resblocks.' + IntToStr(rb);
+        for d := 0 to Length(Config.ResblockDilationSizes[j]) - 1 do
+        begin
+          // convs1[d]: dilation resblock_dilation_sizes[j][d], "same" pad
+          // = (k*dil - dil) div 2.
+          LoadHiFiGANConv(Reader, Base + '.convs1.' + IntToStr(d),
+            Model.FResBlocks[rb].Convs1[d], False, 1,
+            Config.ResblockDilationSizes[j][d],
+            (kk * Config.ResblockDilationSizes[j][d] -
+             Config.ResblockDilationSizes[j][d]) div 2, Consumed);
+          // convs2[d]: dilation 1, "same" pad = (k-1) div 2.
+          LoadHiFiGANConv(Reader, Base + '.convs2.' + IntToStr(d),
+            Model.FResBlocks[rb].Convs2[d], False, 1, 1, (kk - 1) div 2,
+            Consumed);
+          if ch = 0 then ;
+        end;
+      end;
+    end;
+
+    // conv_post: Conv1d(C -> 1, k=7, pad=3).
+    LoadHiFiGANConv(Reader, 'conv_post', Model.FConvPost, False, 1, 1, 3,
+      Consumed);
+
+    // Optional SpeechT5 mean/scale (normalize_before).
+    if Reader.HasTensor('mean') then
+    begin
+      Reader.LoadTensorFlat('mean', T);
+      SetLength(Model.FMean, T.Size);
+      for j := 0 to T.Size - 1 do Model.FMean[j] := T.FData[j];
+      Consumed.Add('mean');
+    end;
+    if Reader.HasTensor('scale') then
+    begin
+      Reader.LoadTensorFlat('scale', T);
+      SetLength(Model.FScale, T.Size);
+      for j := 0 to T.Size - 1 do Model.FScale[j] := T.FData[j];
+      Consumed.Add('scale');
+    end;
+
+    Result := Model;
+    Model := nil;
+  finally
+    T.Free;
+    Model.Free;
+    Consumed.Free;
+  end;
+end;
+
+function BuildHiFiGANFromSafeTensors(const FileName: string;
+  out Config: THiFiGANConfig;
+  const ConfigFileName: string = ''): TNNetHiFiGAN;
+var
+  Reader: TNNetSafeTensorsReader;
+  CfgPath: string;
+begin
+  if ConfigFileName <> '' then CfgPath := ConfigFileName
+  else CfgPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadHiFiGANConfigFromJSONFile(CfgPath);
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildHiFiGANFromSafeTensorsEx(Reader, Config);
   finally
     Reader.Free;
   end;

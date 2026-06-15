@@ -1,0 +1,49 @@
+{
+ "transformers_version": "5.11.0",
+ "architectures": null,
+ "output_hidden_states": false,
+ "return_dict": true,
+ "dtype": null,
+ "chunk_size_feed_forward": 0,
+ "is_encoder_decoder": false,
+ "id2label": {
+  "0": "LABEL_0",
+  "1": "LABEL_1"
+ },
+ "label2id": {
+  "LABEL_0": 0,
+  "LABEL_1": 1
+ },
+ "problem_type": null,
+ "model_in_dim": 4,
+ "sampling_rate": 8000,
+ "upsample_initial_channel": 8,
+ "upsample_rates": [
+  2,
+  2
+ ],
+ "upsample_kernel_sizes": [
+  4,
+  4
+ ],
+ "resblock_kernel_sizes": [
+  3,
+  5
+ ],
+ "resblock_dilation_sizes": [
+  [
+   1,
+   2
+  ],
+  [
+   2,
+   4
+  ]
+ ],
+ "initializer_range": 0.01,
+ "leaky_relu_slope": 0.1,
+ "normalize_before": false,
+ "_name_or_path": "",
+ "model_type": "speecht5_hifigan",
+ "output_attentions": false
+}
