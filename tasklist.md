@@ -218,7 +218,15 @@ rather than acted on.
       additionally shares a small set of transformer blocks across depth with a
       per-invocation LoRA adapter; needs a shared-block + LoRA wiring helper
       (larger than Nemotron-H, distinct from the per-layer-independent schedule).
-- [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
+- [X] LLaVA-style GENERATIVE vision-language import — LANDED (commits 5cec79d/e01bd61):
+      Steps 3/4/5 done. BuildLlavaFromSafeTensors[WithConfig] + TLlavaConfig, BuildLlavaProjector +
+      LlavaProjectImage/LlavaAssembleEmbeddings (visual-token splice), LlavaRunLogits
+      embedding-injection decode, cfLlava chat format, examples/LlavaDescribe. Two pico parity
+      tests < 1e-4 (visual tokens + next-token logits). SigLIP path parity-tested;
+      vision_feature_layer=-1 = hidden_states BEFORE post_layernorm. Open follow-ups:
+      KV-cache fast decode; real-checkpoint tokenizer+preprocess wiring into the demo;
+      CLIP-vision (lvkClip CLS-crop) path coded but not parity-tested. Original detail below:
+      image-conditioned text
       generation, the capability step past the landed CLIP dual encoder
       (which only scores image/text similarity and cannot generate).
       Prefer the SigLIP vision tower (BuildSigLIPVisionTower with a
