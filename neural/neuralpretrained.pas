@@ -5959,6 +5959,57 @@ function BuildDINOv2FromSafeTensorsWithConfig(const FileName: string;
   out Config: TDINOv2Config; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
 
+type
+  // DPT / Depth-Anything monocular depth-estimation config. The DINOv2 (or ViT)
+  // backbone is described by Backbone; the rest is the DPT reassemble/fusion neck
+  // + depth head. The repo's FIRST dense per-pixel REGRESSION vision importer.
+  TDPTConfig = record
+    Backbone: TDINOv2Config;          // backbone_config (model_type dinov2)
+    PatchSize: integer;               // patch_size (top-level; = Backbone.PatchSize)
+    ReassembleHiddenSize: integer;    // reassemble_hidden_size (= backbone hidden)
+    NeckHiddenSizes: array[0..3] of integer;   // neck_hidden_sizes (4 levels)
+    ReassembleFactors: array[0..3] of double;  // reassemble_factors [4,2,1,0.5]
+    FusionHiddenSize: integer;        // fusion_hidden_size
+    HeadHiddenSize: integer;          // head_hidden_size
+    HeadInIndex: integer;             // head_in_index (-1 = last fused level)
+    DepthEstimationType: string;      // 'relative' (ReLU) or 'metric' (Sigmoid)
+    MaxDepth: double;                 // max_depth (scales the metric output)
+    ModelType: string;                // 'depth_anything' or 'dpt'
+  end;
+
+// Reads a HF Depth-Anything / DPT config.json (model_type "depth_anything" or
+// "dpt"). The backbone is read from the nested "backbone_config" object (must be
+// model_type "dinov2"); out_features there select the hooked stages (all N layers
+// for the pico fixture). Required neck fields: neck_hidden_sizes (4 entries),
+// reassemble_factors (4), fusion_hidden_size, head_hidden_size. Defaults follow
+// DepthAnythingConfig: head_in_index -1, depth_estimation_type "relative",
+// max_depth 1, reassemble_hidden_size = backbone hidden_size.
+function ReadDPTConfigFromJSONFile(const FileName: string): TDPTConfig;
+
+function DPTConfigToString(const Config: TDPTConfig): string;
+
+// Builds the DPT / Depth-Anything depth-estimation net described by Config and
+// loads every weight from Reader (the caller owns Reader). The net takes an
+// (ImageSize, ImageSize, NumChannels) normalized RGB volume and outputs a
+// (ImageSize, ImageSize, 1) per-pixel depth map (full input resolution), exactly
+// HF's predicted_depth. The DINOv2 encoder is reused (inline blocks tapped at
+// each hooked stage, shared final LayerNorm); the genuinely new code is the
+// convolutional reassemble/fusion neck + 3-conv depth head. pInferenceOnly frees
+// training volumes during build.
+function BuildDPTFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TDPTConfig; pInferenceOnly: boolean = false): TNNet; overload;
+
+// Builds + loads the DPT net from the checkpoint at FileName. Config is supplied
+// by the caller (Ex) or read from ConfigFileName ('' = "config.json" beside
+// FileName) and returned. The net is owned by the caller. Output:
+// (ImageSize, ImageSize, 1) depth map.
+function BuildDPTFromSafeTensorsEx(const FileName: string;
+  const Config: TDPTConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildDPTFromSafeTensors(const FileName: string;
+  out Config: TDPTConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet; overload;
+
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
 //   - a checkpoint DIRECTORY (uses Path/config.json and
@@ -36702,6 +36753,585 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadDINOv2ConfigFromJSONFile(ConfigPath);
   Result := BuildDINOv2FromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// DPT / DEPTH-ANYTHING IMPORT (monocular depth estimation; DINOv2 backbone +
+// reassemble/fusion neck + depth head). The repo's FIRST dense per-pixel
+// REGRESSION vision importer.
+// ===========================================================================
+
+// Reads the DINOv2 backbone fields out of an already-parsed "backbone_config"
+// JSON object (the DPT config nests the backbone). Same defaults as
+// ReadDINOv2ConfigFromJSONFile. out_features there are honored implicitly: the
+// pico fixture hooks all N layers, which is what the builder taps.
+function ReadDINOv2ConfigFromObject(Obj: TJSONObject;
+  const Ctx: string): TDINOv2Config;
+  function ReqInt(const F: string): integer;
+  begin
+    if Obj.IndexOfName(F) < 0 then
+      ImportError(Ctx + ': backbone_config is missing required field "' + F + '".');
+    Result := Obj.Get(F, 0);
+    if Result <= 0 then
+      ImportError(Ctx + ': backbone_config field "' + F +
+        '" must be a positive integer.');
+  end;
+begin
+  Result.ModelType := Obj.Get('model_type', 'dinov2');
+  if Result.ModelType <> 'dinov2' then
+    ImportError(Ctx + ': backbone model_type is "' + Result.ModelType +
+      '" - only "dinov2" is supported.');
+  Result.HiddenSize := ReqInt('hidden_size');
+  Result.NumLayers := ReqInt('num_hidden_layers');
+  Result.NumHeads := ReqInt('num_attention_heads');
+  Result.ImageSize := ReqInt('image_size');
+  Result.PatchSize := ReqInt('patch_size');
+  Result.NumChannels := Obj.Get('num_channels', 3);
+  Result.LayerNormEps := Obj.Get('layer_norm_eps', 0.000001);
+  Result.HiddenAct := ClipHiddenActFromString(Obj.Get('hidden_act', 'gelu'));
+  Result.MlpRatio := Obj.Get('mlp_ratio', 4);
+  if Result.MlpRatio <= 0 then
+    ImportError(Ctx + ': backbone mlp_ratio must be positive.');
+  Result.IntermediateSize := Result.MlpRatio * Result.HiddenSize;
+  Result.NumRegisterTokens := Obj.Get('num_register_tokens', 0);
+  Result.UseSwiGLUFFN := Obj.Get('use_swiglu_ffn', false);
+end;
+
+function ReadDPTConfigFromJSONFile(const FileName: string): TDPTConfig;
+var
+  JsonText: TStringList;
+  Root, BcData, FacData: TJSONData;
+  Obj, Bc: TJSONObject;
+  Arr: TJSONArray;
+  i: integer;
+
+  procedure ReadIntArray4(const Key: string; var Dst: array of integer);
+  var d: TJSONData; a: TJSONArray; k: integer;
+  begin
+    d := Obj.Find(Key);
+    if (d <> nil) and (d is TJSONArray) then
+    begin
+      a := TJSONArray(d);
+      if a.Count <> 4 then
+        ImportError('DPT import: "' + Key + '" must have 4 entries, got ' +
+          IntToStr(a.Count) + '.');
+      for k := 0 to 3 do Dst[k] := a.Integers[k];
+    end
+    else
+      ImportError('DPT import: required array "' + Key + '" missing.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('DPT import: config file "' + FileName + '" not found.');
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('DPT import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('DPT import: config "' + FileName + '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'depth_anything');
+    if (Result.ModelType <> 'depth_anything') and (Result.ModelType <> 'dpt') then
+      ImportError('DPT import: model_type "' + Result.ModelType +
+        '" unsupported (only "depth_anything" / "dpt").');
+    BcData := Obj.Find('backbone_config');
+    if (BcData = nil) or not (BcData is TJSONObject) then
+      ImportError('DPT import: config is missing the "backbone_config" object.');
+    Bc := TJSONObject(BcData);
+    Result.Backbone := ReadDINOv2ConfigFromObject(Bc, 'DPT import');
+    Result.PatchSize := Obj.Get('patch_size', Result.Backbone.PatchSize);
+    Result.ReassembleHiddenSize :=
+      Obj.Get('reassemble_hidden_size', Result.Backbone.HiddenSize);
+    ReadIntArray4('neck_hidden_sizes', Result.NeckHiddenSizes);
+    FacData := Obj.Find('reassemble_factors');
+    if (FacData = nil) or not (FacData is TJSONArray) then
+      ImportError('DPT import: required array "reassemble_factors" missing.');
+    Arr := TJSONArray(FacData);
+    if Arr.Count <> 4 then
+      ImportError('DPT import: "reassemble_factors" must have 4 entries.');
+    for i := 0 to 3 do Result.ReassembleFactors[i] := Arr.Floats[i];
+    Result.FusionHiddenSize := Obj.Get('fusion_hidden_size', 0);
+    if Result.FusionHiddenSize <= 0 then
+      ImportError('DPT import: fusion_hidden_size must be a positive integer.');
+    Result.HeadHiddenSize := Obj.Get('head_hidden_size', 0);
+    if Result.HeadHiddenSize <= 0 then
+      ImportError('DPT import: head_hidden_size must be a positive integer.');
+    Result.HeadInIndex := Obj.Get('head_in_index', -1);
+    Result.DepthEstimationType := Obj.Get('depth_estimation_type', 'relative');
+    Result.MaxDepth := Obj.Get('max_depth', double(1));
+  finally
+    if Root <> nil then Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function DPTConfigToString(const Config: TDPTConfig): string;
+begin
+  Result := Config.ModelType + ' config: backbone(' +
+    DINOv2ConfigToString(Config.Backbone) + ')' +
+    ', patch=' + IntToStr(Config.PatchSize) +
+    ', reassemble_hidden=' + IntToStr(Config.ReassembleHiddenSize) +
+    ', neck=[' + IntToStr(Config.NeckHiddenSizes[0]) + ',' +
+    IntToStr(Config.NeckHiddenSizes[1]) + ',' +
+    IntToStr(Config.NeckHiddenSizes[2]) + ',' +
+    IntToStr(Config.NeckHiddenSizes[3]) + ']' +
+    ', fusion=' + IntToStr(Config.FusionHiddenSize) +
+    ', head_hidden=' + IntToStr(Config.HeadHiddenSize) +
+    ', head_in_index=' + IntToStr(Config.HeadInIndex) +
+    ', type=' + Config.DepthEstimationType +
+    ', max_depth=' + FloatToStr(Config.MaxDepth);
+end;
+
+// Loads a bias-FREE nn.Conv2d (weight [OutCh,InCh,K,K]) into a CAI conv layer
+// (the neck 3x3 fuse convs have bias=False). Same element layout as
+// LoadConvNeXtConv but no bias tensor; the per-neuron BiasWeight stays 0.
+procedure LoadDPTConvNoBias(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string; OutCh, InCh, K: integer);
+var
+  W: TNNetVolume;
+  o, c, ky, kx: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('DPT import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 4) or
+     (Reader.DimSize(WName, 0) <> OutCh) or
+     (Reader.DimSize(WName, 1) <> InCh) or
+     (Reader.DimSize(WName, 2) <> K) or (Reader.DimSize(WName, 3) <> K) then
+    ImportError('DPT import: "' + WName + '" must have shape [' +
+      IntToStr(OutCh) + ', ' + IntToStr(InCh) + ', ' + IntToStr(K) + ', ' +
+      IntToStr(K) + '], got ' + Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> OutCh then
+    ImportError('DPT import: internal error - conv "' + WName + '" target has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutCh) + '.');
+  W := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    for o := 0 to OutCh - 1 do
+    begin
+      for ky := 0 to K - 1 do
+        for kx := 0 to K - 1 do
+          for c := 0 to InCh - 1 do
+            Layer.Neurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
+              W.FData[((o * InCh + c) * K + ky) * K + kx];
+      Layer.Neurons[o].BiasWeight := 0;
+    end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free;
+  end;
+end;
+
+// Loads a ConvTranspose2d resize (kernel = stride = factor K, pad 0) -
+// implemented as a TNNetPointwiseConvLinear (InCh -> K*K*OutCh) feeding a
+// TNNetPixelShuffle(K). For an input pixel and ConvTranspose weight
+// W[InCh, OutCh, ky, kx] + bias[OutCh], the output block is
+//   out[K*ix+kx, K*iy+ky, oc] = sum_ic in[ix,iy,ic]*W[ic,oc,ky,kx] + b[oc].
+// PixelShuffle reads pointwise channel p = oc*K*K + kx*K + ky for output
+// (kx,ky,oc), so neuron p gets weights W[:,oc,ky,kx] and bias b[oc].
+procedure LoadDPTTransposeResize(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string; InCh, OutCh, K: integer);
+var
+  W, B: TNNetVolume;
+  ic, oc, ky, kx, p: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('DPT import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 4) or
+     (Reader.DimSize(WName, 0) <> InCh) or
+     (Reader.DimSize(WName, 1) <> OutCh) or
+     (Reader.DimSize(WName, 2) <> K) or (Reader.DimSize(WName, 3) <> K) then
+    ImportError('DPT import: transpose "' + WName + '" must have shape [' +
+      IntToStr(InCh) + ', ' + IntToStr(OutCh) + ', ' + IntToStr(K) + ', ' +
+      IntToStr(K) + '], got ' + Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> K * K * OutCh then
+    ImportError('DPT import: internal error - transpose target has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(K * K * OutCh) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    Reader.LoadTensorFlat(BName, B);
+    if B.Size <> OutCh then
+      ImportError('DPT import: transpose "' + BName + '" must have ' +
+        IntToStr(OutCh) + ' elements.');
+    for oc := 0 to OutCh - 1 do
+      for kx := 0 to K - 1 do
+        for ky := 0 to K - 1 do
+        begin
+          p := oc * K * K + kx * K + ky;
+          for ic := 0 to InCh - 1 do
+            Layer.Neurons[p].Weights.FData[ic] :=
+              W.FData[((ic * OutCh + oc) * K + ky) * K + kx];
+          Layer.Neurons[p].BiasWeight := B.FData[oc];
+        end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free; B.Free;
+  end;
+end;
+
+type
+  // The two convs of one DPT pre-act residual unit (ReLU -> conv1 -> ReLU ->
+  // conv2, + residual). Both are 3x3 pad-1 BIASED, fusion_hidden -> fusion_hidden.
+  TDPTResidualRefs = record
+    Conv1, Conv2: TNNetLayer;
+  end;
+
+// Appends one DPTPreActResidualLayer onto NN over the current (W,H,fusion) map:
+//   y = x + conv2(relu(conv1(relu(x))))
+// Each 3x3 conv is explicitly PadXY(1,1)-padded then a pad-0 ConvolutionLinear
+// (CAI clamps a built-in 3x3 to the input size on a small grid; explicit padding
+// keeps the full 3x3 at any resolution).
+procedure AddDPTResidualUnit(NN: TNNet; Fusion: integer;
+  var Refs: TDPTResidualRefs);
+var
+  ResIn: TNNetLayer;
+begin
+  ResIn := NN.GetLastLayer();
+  NN.AddLayer(TNNetReLU.Create());
+  NN.AddLayer(TNNetPadXY.Create(1, 1));
+  Refs.Conv1 := NN.AddLayer(TNNetConvolutionLinear.Create(Fusion, 3, 0, 1, 0));
+  NN.AddLayer(TNNetReLU.Create());
+  NN.AddLayer(TNNetPadXY.Create(1, 1));
+  Refs.Conv2 := NN.AddLayer(TNNetConvolutionLinear.Create(Fusion, 3, 0, 1, 0));
+  NN.AddLayer(TNNetSum.Create([NN.GetLastLayer(), ResIn]));
+end;
+
+type
+  TDPTFusionRefs = record
+    Projection: TNNetLayer;          // 1x1 conv (fusion -> fusion, biased)
+    Res1, Res2: TDPTResidualRefs;    // residual_layer1 (skip), residual_layer2
+  end;
+
+function BuildDPT(Reader: TNNetSafeTensorsReader;
+  const Config: TDPTConfig; pInferenceOnly: boolean): TNNet;
+var
+  NN: TNNet;
+  Bk: TDINOv2Config;
+  Blocks: TDINOv2BlockLayersArray;
+  PatchConv, PosEmb: TNNetLayer;
+  BlockOut: array of TNNetLayer;            // each encoder block's sequence output
+  StageLN: array[0..3] of TNNetLayer;       // shared final-LN copies (one per hook)
+  Reassembled: array[0..3] of TNNetLayer;   // (Wr,Hr,fusion) after neck conv
+  Fusion: array[0..3] of TDPTFusionRefs;
+  Proj: array[0..3] of TNNetLayer;          // reassemble projection (1x1)
+  ResizeUp: array[0..3] of TNNetLayer;      // transpose-conv pointwise (factor>1)
+  ResizeDown: array[0..3] of TNNetLayer;    // 3x3 downsample (factor<1)
+  NeckConv: array[0..3] of TNNetLayer;
+  HeadConv1, HeadConv2, HeadConv3: TNNetLayer;
+  Tmp: TNNetVolume;
+  Grid, NumPatches, BlockCnt, ci, d, i, K, Wr, Hr, Fus: integer;
+  GW, GH: array[0..3] of integer;
+  Fac: double;
+  Pfx, BkPfx, Nm: string;
+  Cur, Residual: TNNetLayer;
+  TargetW, TargetH: integer;
+
+  // shared LN load into one of the StageLN copies.
+  procedure LoadSharedLN(Layer: TNNetLayer);
+  begin
+    LoadLayerNormWeights(Reader, Layer, BkPfx + 'layernorm.weight',
+      BkPfx + 'layernorm.bias', d);
+  end;
+
+begin
+  Bk := Config.Backbone;
+  d := Bk.HiddenSize;
+  if Config.ReassembleHiddenSize <> d then
+    ImportError('DPT import: reassemble_hidden_size=' +
+      IntToStr(Config.ReassembleHiddenSize) +
+      ' must equal backbone hidden_size=' + IntToStr(d) + '.');
+  if (Bk.NumHeads < 1) or ((d mod Bk.NumHeads) <> 0) then
+    ImportError('DPT import: hidden_size not divisible by num_attention_heads.');
+  if (Bk.PatchSize < 1) or ((Bk.ImageSize mod Bk.PatchSize) <> 0) then
+    ImportError('DPT import: image_size not a multiple of patch_size.');
+  if Bk.UseSwiGLUFFN then
+    ImportError('DPT import: use_swiglu_ffn backbone not supported.');
+  if Bk.NumRegisterTokens > 0 then
+    ImportError('DPT import: register-token backbone not supported.');
+  if Bk.NumLayers < 4 then
+    ImportError('DPT import: backbone needs >= 4 layers (4 hooked stages).');
+  if (LowerCase(Config.DepthEstimationType) <> 'relative') and
+     (LowerCase(Config.DepthEstimationType) <> 'metric') then
+    ImportError('DPT import: depth_estimation_type "' +
+      Config.DepthEstimationType + '" unsupported.');
+  Grid := Bk.ImageSize div Bk.PatchSize;
+  NumPatches := Grid * Grid;
+  Fus := Config.FusionHiddenSize;
+  // reassemble grids per level.
+  for i := 0 to 3 do
+  begin
+    Fac := Config.ReassembleFactors[i];
+    if Fac >= 1 then
+    begin
+      GW[i] := Round(Grid * Fac); GH[i] := Round(Grid * Fac);
+    end
+    else
+    begin
+      GW[i] := Round(Grid / Round(1 / Fac)); GH[i] := GW[i];
+    end;
+  end;
+  NN := TNNet.Create();
+  try
+    // ---------------- DINOv2 backbone (tapped at all 4 hooked stages) -------
+    NN.AddLayer(TNNetInput.Create(Bk.ImageSize, Bk.ImageSize, Bk.NumChannels));
+    PatchConv := NN.AddLayer(TNNetConvolutionLinear.Create(
+      d, Bk.PatchSize, 0, Bk.PatchSize, 0));
+    NN.AddLayer(TNNetReshape.Create(NumPatches, 1, d));
+    NN.AddLayer(TNNetPadXY.Create(1, 0));
+    NN.AddLayer(TNNetCrop.Create(0, 0, NumPatches + 1, 1));
+    PosEmb := NN.AddLayer(TNNetLearnedPositionalEmbedding.Create(NumPatches + 1));
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    SetLength(Blocks, Bk.NumLayers);
+    SetLength(BlockOut, Bk.NumLayers);
+    // Build every encoder block first (each continues from the previous block's
+    // SEQUENCE output), recording the block output layers; the hooks are added
+    // afterwards as SIDE BRANCHES so they don't redirect the encoder backbone.
+    for BlockCnt := 0 to Bk.NumLayers - 1 do
+    begin
+      AddDINOv2EncoderBlock(NN, Bk, Blocks[BlockCnt], pInferenceOnly);
+      BlockOut[BlockCnt] := NN.GetLastLayer();
+    end;
+    // Hook the last 4 blocks (out_features stage_{N-3..N}): shared final
+    // LayerNorm on the hooked sequence, drop the CLS row, reshape to (Grid,Grid).
+    for i := 0 to 3 do
+    begin
+      StageLN[i] := NN.AddLayerAfter(
+        TNNetTokenLayerNorm.Create(Bk.LayerNormEps),
+        BlockOut[Bk.NumLayers - 4 + i]);
+      // drop the CLS row (sequence index 0 along X), keep patch rows 1..N.
+      NN.AddLayer(TNNetCrop.Create(1, 0, NumPatches, 1));
+      Reassembled[i] := NN.AddLayer(TNNetReshape.Create(Grid, Grid, d));
+    end;
+    // ---------------- reassemble stage -------------------------------------
+    for i := 0 to 3 do
+    begin
+      Fac := Config.ReassembleFactors[i];
+      // 1x1 projection backbone-hidden -> neck_hidden_sizes[i] (biased).
+      Proj[i] := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Config.NeckHiddenSizes[i]),
+        Reassembled[i]);
+      ResizeUp[i] := nil; ResizeDown[i] := nil;
+      if Fac > 1 then
+      begin
+        K := Round(Fac);
+        // ConvTranspose kernel=stride=K -> pointwise(K*K*neck) + PixelShuffle(K).
+        ResizeUp[i] := NN.AddLayer(TNNetPointwiseConvLinear.Create(
+          K * K * Config.NeckHiddenSizes[i]));
+        NN.AddLayer(TNNetPixelShuffle.Create(K));
+      end
+      else if Fac < 1 then
+      begin
+        // 3x3 stride-2 pad-1 downsample (explicit pad to dodge kernel clamp).
+        NN.AddLayer(TNNetPadXY.Create(1, 1));
+        ResizeDown[i] := NN.AddLayer(TNNetConvolutionLinear.Create(
+          Config.NeckHiddenSizes[i], 3, 0, Round(1 / Fac), 0));
+      end;
+      // neck 3x3 pad-1 bias-free conv -> fusion_hidden.
+      NN.AddLayer(TNNetPadXY.Create(1, 1));
+      NeckConv[i] := NN.AddLayer(TNNetConvolutionLinear.Create(Fus, 3, 0, 1, 0));
+      Reassembled[i] := NN.GetLastLayer();
+    end;
+    // ---------------- fusion stage (reversed: coarse -> fine) --------------
+    // levels reversed: idx 0 = level 3 (coarsest, GW[3]) .. idx 3 = level 0.
+    Cur := nil;
+    for i := 0 to 3 do
+    begin
+      Residual := Reassembled[3 - i];  // level (3-i): 3,2,1,0
+      if i = 0 then
+      begin
+        // start from the coarsest feature directly.
+        NN.AddLayerAfter(TNNetIdentity.Create(), Residual);
+        Cur := NN.GetLastLayer();
+      end
+      else
+      begin
+        // fused so far is at the PREVIOUS (coarser) grid; the current residual
+        // is at this (finer) grid. residual_layer1 refines the residual then it
+        // is added to the (already up-sampled) fused state. Here fused was
+        // up-sampled at the END of the previous iteration to THIS grid, so the
+        // shapes match and no residual interpolate is needed.
+        NN.AddLayerAfter(TNNetIdentity.Create(), Residual);
+        AddDPTResidualUnit(NN, Fus, Fusion[i].Res1);
+        NN.AddLayer(TNNetSum.Create([NN.GetLastLayer(), Cur]));
+        Cur := NN.GetLastLayer();
+      end;
+      // residual_layer2 refine.
+      AddDPTResidualUnit(NN, Fus, Fusion[i].Res2);
+      Cur := NN.GetLastLayer();
+      // upsample (align_corners=True): to next finer level's grid, or x2 for the
+      // last layer (idx 3 -> 2x the finest reassemble grid).
+      if i < 3 then
+      begin
+        TargetW := GW[3 - (i + 1)]; TargetH := GH[3 - (i + 1)];
+      end
+      else
+      begin
+        TargetW := Cur.Output.SizeX * 2; TargetH := Cur.Output.SizeY * 2;
+      end;
+      NN.AddLayer(TNNetBilinearResize.Create(TargetW, TargetH, 1));
+      // 1x1 projection (biased).
+      Fusion[i].Projection := NN.AddLayer(TNNetPointwiseConvLinear.Create(Fus));
+      Cur := NN.GetLastLayer();
+    end;
+    // ---------------- depth head -------------------------------------------
+    // conv1 3x3 pad1 (fusion -> fusion/2, biased).
+    NN.AddLayer(TNNetPadXY.Create(1, 1));
+    HeadConv1 := NN.AddLayer(TNNetConvolutionLinear.Create(Fus div 2, 3, 0, 1, 0));
+    // bilinear upsample to (Grid*patch, Grid*patch) = input resolution (a-c True).
+    NN.AddLayer(TNNetBilinearResize.Create(
+      Grid * Bk.PatchSize, Grid * Bk.PatchSize, 1));
+    // conv2 3x3 pad1 (fusion/2 -> head_hidden, biased) -> ReLU.
+    NN.AddLayer(TNNetPadXY.Create(1, 1));
+    HeadConv2 := NN.AddLayer(TNNetConvolutionLinear.Create(
+      Config.HeadHiddenSize, 3, 0, 1, 0));
+    NN.AddLayer(TNNetReLU.Create());
+    // conv3 1x1 (head_hidden -> 1, biased).
+    HeadConv3 := NN.AddLayer(TNNetPointwiseConvLinear.Create(1));
+    // relative -> ReLU; metric -> Sigmoid (then * max_depth folded as a mul).
+    if LowerCase(Config.DepthEstimationType) = 'metric' then
+      NN.AddLayer(TNNetSigmoid.Create())
+    else
+      NN.AddLayer(TNNetReLU.Create());
+    // HF scales the activated depth by max_depth (no-op for relative max_depth=1).
+    if Abs(Config.MaxDepth - 1) > 1e-12 then
+      NN.AddLayer(TNNetMulByConstant.Create(Config.MaxDepth));
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------------------------------------
+    if Reader.HasTensor('backbone.embeddings.cls_token') then Pfx := 'backbone.'
+    else if Reader.HasTensor('dinov2.embeddings.cls_token') then Pfx := 'dinov2.'
+    else Pfx := '';
+    BkPfx := Pfx;
+    LoadClipPatchConv(Reader, PatchConv,
+      Pfx + 'embeddings.patch_embeddings.projection.weight',
+      Bk.NumChannels, Bk.PatchSize, d);
+    Nm := Pfx + 'embeddings.patch_embeddings.projection.bias';
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(Nm, Tmp);
+      for ci := 0 to d - 1 do PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+      PatchConv.FlushWeightCache();
+    finally Tmp.Free; end;
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(Pfx + 'embeddings.position_embeddings', Tmp);
+      if Tmp.Size <> (NumPatches + 1) * d then
+        ImportError('DPT import: position_embeddings size mismatch (native ' +
+          'resolution only).');
+      PosEmb.Neurons[0].Weights.Copy(Tmp);
+      Reader.LoadTensorFlat(Pfx + 'embeddings.cls_token', Tmp);
+      for ci := 0 to d - 1 do
+        PosEmb.Neurons[0].Weights.FData[ci] :=
+          PosEmb.Neurons[0].Weights.FData[ci] + Tmp.FData[ci];
+      PosEmb.FlushWeightCache();
+    finally Tmp.Free; end;
+    for BlockCnt := 0 to Bk.NumLayers - 1 do
+      LoadDINOv2EncoderBlockWeights(Reader, Blocks[BlockCnt],
+        Pfx + 'encoder.layer.' + IntToStr(BlockCnt) + '.', Bk);
+    for i := 0 to 3 do LoadSharedLN(StageLN[i]);
+    // reassemble projections + resize.
+    for i := 0 to 3 do
+    begin
+      Fac := Config.ReassembleFactors[i];
+      LoadSegformer1x1(Reader, Proj[i],
+        'neck.reassemble_stage.layers.' + IntToStr(i) + '.projection.weight',
+        Config.NeckHiddenSizes[i], d,
+        'neck.reassemble_stage.layers.' + IntToStr(i) + '.projection.bias');
+      if Fac > 1 then
+      begin
+        K := Round(Fac);
+        LoadDPTTransposeResize(Reader, ResizeUp[i],
+          'neck.reassemble_stage.layers.' + IntToStr(i) + '.resize.weight',
+          'neck.reassemble_stage.layers.' + IntToStr(i) + '.resize.bias',
+          Config.NeckHiddenSizes[i], Config.NeckHiddenSizes[i], K);
+      end
+      else if Fac < 1 then
+        LoadConvNeXtConv(Reader, ResizeDown[i],
+          'neck.reassemble_stage.layers.' + IntToStr(i) + '.resize.weight',
+          'neck.reassemble_stage.layers.' + IntToStr(i) + '.resize.bias',
+          Config.NeckHiddenSizes[i], Config.NeckHiddenSizes[i], 3);
+      LoadDPTConvNoBias(Reader, NeckConv[i],
+        'neck.convs.' + IntToStr(i) + '.weight',
+        Fus, Config.NeckHiddenSizes[i], 3);
+    end;
+    // fusion stage weights.
+    for i := 0 to 3 do
+    begin
+      Nm := 'neck.fusion_stage.layers.' + IntToStr(i) + '.';
+      LoadSegformer1x1(Reader, Fusion[i].Projection, Nm + 'projection.weight',
+        Fus, Fus, Nm + 'projection.bias');
+      if i > 0 then
+      begin
+        LoadConvNeXtConv(Reader, Fusion[i].Res1.Conv1,
+          Nm + 'residual_layer1.convolution1.weight',
+          Nm + 'residual_layer1.convolution1.bias', Fus, Fus, 3);
+        LoadConvNeXtConv(Reader, Fusion[i].Res1.Conv2,
+          Nm + 'residual_layer1.convolution2.weight',
+          Nm + 'residual_layer1.convolution2.bias', Fus, Fus, 3);
+      end;
+      LoadConvNeXtConv(Reader, Fusion[i].Res2.Conv1,
+        Nm + 'residual_layer2.convolution1.weight',
+        Nm + 'residual_layer2.convolution1.bias', Fus, Fus, 3);
+      LoadConvNeXtConv(Reader, Fusion[i].Res2.Conv2,
+        Nm + 'residual_layer2.convolution2.weight',
+        Nm + 'residual_layer2.convolution2.bias', Fus, Fus, 3);
+    end;
+    // depth head.
+    LoadConvNeXtConv(Reader, HeadConv1, 'head.conv1.weight', 'head.conv1.bias',
+      Fus div 2, Fus, 3);
+    LoadConvNeXtConv(Reader, HeadConv2, 'head.conv2.weight', 'head.conv2.bias',
+      Config.HeadHiddenSize, Fus div 2, 3);
+    LoadSegformer1x1(Reader, HeadConv3, 'head.conv3.weight', 1,
+      Config.HeadHiddenSize, 'head.conv3.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildDPTFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TDPTConfig; pInferenceOnly: boolean): TNNet;
+begin
+  Result := BuildDPT(Reader, Config, pInferenceOnly);
+end;
+
+function BuildDPTFromSafeTensorsEx(const FileName: string;
+  const Config: TDPTConfig; pInferenceOnly: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildDPT(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildDPTFromSafeTensors(const FileName: string;
+  out Config: TDPTConfig; pInferenceOnly: boolean;
+  const ConfigFileName: string): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadDPTConfigFromJSONFile(ConfigPath);
+  Result := BuildDPTFromSafeTensorsEx(FileName, Config, pInferenceOnly);
 end;
 
 function ReadClipImageProcessorConfig(

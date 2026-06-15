@@ -281,6 +281,8 @@ type
     procedure TestConvNeXtV2ImageClassificationParity;
     procedure TestSegformerConfigFromJSONFile;
     procedure TestSegformerSemanticSegmentationParity;
+    procedure TestDPTConfigFromJSONFile;
+    procedure TestDPTDepthEstimationParity;
     procedure TestInceptionV3ConfigFromJSONFile;
     procedure TestInceptionV3ImageClassificationParity;
     procedure TestMobileNetV3ConfigFromJSONFile;
@@ -13004,6 +13006,111 @@ begin
     end;
     OneCaseArr := nil; // silence hint
     AssertTrue('SegFormer output: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Img.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadDPTConfigFromJSONFile on the committed pico Depth-Anything config
+// (nested dinov2 backbone_config + DPT neck/head fields).
+procedure TTestNeuralPretrained.TestDPTConfigFromJSONFile;
+var
+  Config: TDPTConfig;
+begin
+  Config := ReadDPTConfigFromJSONFile(FixturePath('tiny_dpt_config.json'));
+  AssertEquals('model_type', 'depth_anything', Config.ModelType);
+  AssertEquals('patch_size', 2, Config.PatchSize);
+  AssertEquals('reassemble_hidden', 16, Config.ReassembleHiddenSize);
+  AssertEquals('fusion_hidden', 8, Config.FusionHiddenSize);
+  AssertEquals('head_hidden', 4, Config.HeadHiddenSize);
+  AssertEquals('head_in_index', -1, Config.HeadInIndex);
+  AssertEquals('depth_type', 'relative', Config.DepthEstimationType);
+  AssertEquals('neck[0]', 4, Config.NeckHiddenSizes[0]);
+  AssertEquals('neck[3]', 16, Config.NeckHiddenSizes[3]);
+  AssertEquals('factor[0]', 4, Round(Config.ReassembleFactors[0]));
+  AssertEquals('factor[2]', 1, Round(Config.ReassembleFactors[2]));
+  // backbone
+  AssertEquals('bk model', 'dinov2', Config.Backbone.ModelType);
+  AssertEquals('bk hidden', 16, Config.Backbone.HiddenSize);
+  AssertEquals('bk layers', 4, Config.Backbone.NumLayers);
+  AssertEquals('bk heads', 2, Config.Backbone.NumHeads);
+  AssertEquals('bk image', 12, Config.Backbone.ImageSize);
+  AssertEquals('bk patch', 2, Config.Backbone.PatchSize);
+end;
+
+// HF Depth-Anything monocular-depth parity (the FIRST dense per-pixel REGRESSION
+// vision importer). tiny_dpt.* is a pico DepthAnythingForDepthEstimation (DINOv2
+// ViT backbone + DPT reassemble/fusion neck + 3-conv depth head) with
+// re-randomized O(1) weights; the reference per-pixel depth map at full input
+// resolution comes from the REAL transformers float64 forward. Asserts max |diff|
+// < 1e-4 over the whole (H, W) depth map - exercising the tapped DINOv2 encoder
+// (shared final LayerNorm on 4 hooked stages), the reassemble stage (1x1
+// projection + ConvTranspose-as-PixelShuffle upsample / 3x3 stride-2 downsample),
+// the bias-free neck convs, the RefineNet-style additive fusion blocks (pre-act
+// residual units + align-corners bilinear upsample), and the depth head.
+procedure TTestNeuralPretrained.TestDPTDepthEstimationParity;
+var
+  NN: TNNet;
+  Config: TDPTConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, OutArr, InArr: TJSONArray;
+  CaseObj: TJSONObject;
+  Img: TNNetVolume;
+  Output: TNNetVolume;
+  RefVal, GotVal, Diff, MaxDiff: double;
+  CaseCnt, x, yy, c, FlatIdx, GW, GH, W, H, NumCh: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildDPTFromSafeTensors(FixturePath('tiny_dpt.safetensors'),
+    Config, {pInferenceOnly=}false, FixturePath('tiny_dpt_config.json'));
+  RefJson := TStringList.Create;
+  Img := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  W := Config.Backbone.ImageSize; H := Config.Backbone.ImageSize;
+  NumCh := Config.Backbone.NumChannels;
+  try
+    AssertTrue('net built', NN <> nil);
+    RefJson.LoadFromFile(FixturePath('tiny_dpt_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertTrue('cases present', CasesArr <> nil);
+    for CaseCnt := 0 to CasesArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(CasesArr.Items[CaseCnt]);
+      InArr := TJSONArray(CaseObj.Find('input'));
+      OutArr := TJSONArray(CaseObj.Find('output'));
+      GW := CaseObj.Get('out_grid_w', 0);
+      GH := CaseObj.Get('out_grid_h', 0);
+      Img.ReSize(W, H, NumCh);
+      for yy := 0 to H - 1 do
+        for x := 0 to W - 1 do
+          for c := 0 to NumCh - 1 do
+          begin
+            FlatIdx := (yy * W + x) * NumCh + c;
+            Img.FData[(yy * W + x) * NumCh + c] := InArr.Items[FlatIdx].AsFloat;
+          end;
+      NN.Compute(Img);
+      Output := NN.GetLastLayer().Output;
+      AssertEquals('depth grid w', GW, Output.SizeX);
+      AssertEquals('depth grid h', GH, Output.SizeY);
+      AssertEquals('depth channels', 1, Output.Depth);
+      for yy := 0 to GH - 1 do
+        for x := 0 to GW - 1 do
+        begin
+          FlatIdx := yy * GW + x;
+          RefVal := OutArr.Items[FlatIdx].AsFloat;
+          GotVal := Output.FData[(yy * GW + x)];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+    end;
+    AssertTrue('DPT depth: max |diff| = ' + FloatToStr(MaxDiff) +
       ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     RefRoot.Free;

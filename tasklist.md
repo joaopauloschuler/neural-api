@@ -312,7 +312,7 @@ rather than acted on.
       prompt + single mask output to keep the decoder small. Pico parity vs HF
       float64 on the encoder embedding first (decoder is the stretch); demo:
       examples/SegmentAnything segments an object from one click on a tiny image.
-- [ ] Monocular depth importer (DPT / Depth-Anything, e.g. Intel/dpt-hybrid-midas
+- [X] Monocular depth importer (DPT / Depth-Anything, e.g. Intel/dpt-hybrid-midas
       or depth-anything/Depth-Anything-V2-Small) — first DENSE-REGRESSION vision
       importer (per-pixel depth, not classification). ViT/DINOv2 backbone (both
       already importable) + the DPT reassemble/fusion neck (4 hooked stages ->
@@ -320,6 +320,20 @@ rather than acted on.
       the ViT encoder path; the new code is the convolutional fusion decoder.
       Pico parity vs HF float64 + a real-image relative-depth sanity check;
       demo: examples/DepthEstimation writes a depth map for one CPU image.
+      DONE (this commit): BuildDPTFromSafeTensors[Ex]/(file overload) +
+      TDPTConfig + ReadDPTConfigFromJSONFile + DPTConfigToString in
+      neuralpretrained.pas (depth_anything DINOv2 backbone tapped at 4 stages w/
+      shared final LN; reassemble = 1x1 proj + ConvTranspose-as-PixelShuffle up /
+      3x3 stride-2 down; bias-free neck convs; pre-act residual RefineNet fusion;
+      3-conv head). New layer TNNetBilinearResize (absolute-target bilinear resize
+      w/ align_corners True/False) in neuralnetwork.pas; PixelShuffle reused.
+      Tests TestDPTConfigFromJSONFile + TestDPTDepthEstimationParity (max |diff|
+      ~1.5e-8 < 1e-4 vs transformers float64); fixtures tests/fixtures/tiny_dpt.*
+      (gen tools/make_pico_dpt_fixture.py); demo examples/DepthEstimation.
+      Follow-ups: dpt-hybrid (ViT-hybrid ResNet stem + readout-project reassemble)
+      and metric-depth (Sigmoid head) paths are wired in code but only the
+      depth_anything/relative DINOv2 path is parity-tested; a real-checkpoint
+      relative-depth sanity check on Depth-Anything-V2-Small is still open.
 - [ ] Real-ESRGAN / ESRGAN importer follow-ups (BuildRRDBNet[FromSafeTensors][Ex]
       + TRRDBNetConfig LANDED in neuralpretrained.pas; RRDBNet x4 with
       NEAREST-interpolate conv upsampling via TNNetDeMaxPool(2), parametrized

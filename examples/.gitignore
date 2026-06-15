@@ -30,3 +30,6 @@ DiffusionMNIST/*.nn
 
 # SemanticSegmentation: compiled SegFormer demo binary
 SemanticSegmentation/SemanticSegmentation
+
+# DepthEstimation: compiled DPT / Depth-Anything demo binary
+DepthEstimation/DepthEstimation
