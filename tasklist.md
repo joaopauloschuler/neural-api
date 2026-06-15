@@ -818,6 +818,43 @@ rather than acted on.
       latent, decoded to a short (~5 s) clip written via the WAV writer; defer
       classifier-free-guidance tuning and long-form generation to a follow-up.
       DEPENDS ON the WAV writer + HiFi-GAN vocoder tasks above.
+- [ ] Kokoro-82M text-to-speech importer (`BuildKokoroFromSafeTensors[Ex]`,
+      `hexgrad/Kokoro-82M`) — the most popular *lightweight* open TTS model and a
+      genuinely DIFFERENT architecture from the landed VITS importer (no
+      normalizing flow, no stochastic duration). Kokoro is a StyleTTS2 derivative:
+      an embedding/text encoder + a duration/prosody predictor conditioned on a
+      fixed per-voice STYLE VECTOR, length-regulated, then an iSTFTNet decoder
+      (HiFi-GAN-style upsampling whose final block predicts magnitude+phase fed
+      through an inverse STFT instead of a transposed conv). Voice priority; reuses
+      the landed log-mel/STFT frontend, `SaveVolumeToWav16`, and the HiFi-GAN
+      generator blocks. Scope v1 to ONE built-in voice (one style vector baked in
+      from a committed pico fixture) producing a short clip from a phoneme-id
+      sequence; defer the g2p/phonemizer front-end (document feeding pre-phonemized
+      ids) and multi-voice blending to a follow-up. The new pieces are the
+      style-conditioned duration predictor and the iSTFT decoder tail.
+- [ ] End-to-end TEXT-CONDITIONED MusicGen generation example
+      (examples/MusicGenText, successor to the landed MusicGenSmoke). The smoke
+      explicitly stubs the text encoder ("T5 text ENCODER … external; not in
+      smoke"); this wires the real `BuildT5FromSafeTensors` text encoder ->
+      enc_to_dec_proj -> cross-attention conditioning so a free-text prompt
+      ("upbeat 80s synth-pop") actually steers the generated music, then decodes
+      the delay-pattern code stack through the landed EnCodec decoder to a WAV.
+      Music priority and a contained value-add on top of fully-landed parts
+      (BuildMusicGenFromSafeTensors + BuildEnCodecFromSafeTensors + the T5
+      importer); the new work is the example wiring + a committed tiny T5-encoder
+      fixture and a reproducible short clip. Defer classifier-free guidance and
+      the stereo/large checkpoints to a follow-up.
+- [ ] SeamlessM4T (v2) speech-to-text TRANSLATION importer
+      (`BuildSeamlessM4TFromSafeTensors[Ex]`, `facebook/seamless-m4t-v2-large` /
+      `hf-audio/…`) — multilingual speech translation, a capability the repo has
+      no analogue for (the landed Whisper/Wav2Vec2/Moonshine all TRANSCRIBE in one
+      language; SeamlessM4T TRANSLATES across languages). Scope v1 to the
+      speech-to-TEXT (S2TT) path only: the wav2vec2-style conformer SPEECH encoder
+      (reuse the landed Wav2Vec2 conformer blocks) + a length adapter +
+      the NLLB-style text DECODER (reuse the landed mBART/NLLB enc-dec seq2seq
+      decode path and SentencePiece tokenizer). Defer the text-to-speech (T2ST)
+      unit-vocoder path and the v2's UnitY2 two-pass decoding to a follow-up.
+      Verify against HF on a pico-sliced fixture. Voice priority.
 - [ ] examples/SpeechCommands keyword-spotting trainer — the audio analogue of
       SimpleImageClassifier and the first FROM-SCRATCH (no-import) audio training
       example. Feed the existing log-mel frontend (neuralaudio.pas) into a small
@@ -1077,6 +1114,22 @@ rather than acted on.
       examples/TextToVideo that writes a short animated GIF/PPM sequence on CPU once the
       base UNet lands. Note: the cheaper no-UNet route to video is bolting the same
       temporal block onto the landed PixArt DiT — worth scoping if SD UNet stays blocked.
+- [ ] VAR (Visual AutoRegressive, next-SCALE prediction) image generation importer
+      (`BuildVARFromSafeTensors[Ex]`, e.g. `FoundationVision/var`) + an
+      examples/VARGenerate demo — a fundamentally DIFFERENT generative paradigm from
+      every landed image generator (diffusion DiT/PixArt, GAN, MaskGIT's masked
+      parallel decode): VAR predicts a coarse-to-fine pyramid of token maps, one
+      whole RESOLUTION at a time, with a GPT-style causal transformer over the
+      flattened multi-scale token sequence. The image priority and a clean reuse of
+      landed parts: the multi-scale VQ tokenizer is the landed `BuildVqModelFromSafeTensors`
+      family (residual quantization over scales) and the backbone is a standard
+      pre-norm causal transformer (landed). The genuinely new code is (a) the
+      next-scale embedding/interpolation between pyramid levels, (b) the AdaLN-style
+      class-conditioning (single class token, like DiT's timestep cond), and (c) the
+      scale-block-causal attention mask (tokens attend to all earlier scales + their
+      own scale). Scope v1 to class-conditional 256px generation from a committed
+      pico fixture; defer the text-conditioned (Infinity-style) variant. Pico parity
+      vs a torch float64 oracle on one scale's logits.
 - [ ] Diffusion INPAINTING example (examples/ImageToImage --inpaint, or a sibling) — the
       one-flag follow-up unblocked by the landed SDEdit examples/ImageToImage driver: reuse
       the exact same encode->partial-noise->denoise->decode pipeline but, BEFORE each
