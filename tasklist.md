@@ -438,17 +438,6 @@ rather than acted on.
       augmentation path so existing CIFAR examples can opt in. New code is the op
       bank + the two sampling policies; reuses existing volume rotate/shear/color
       primitives where present. Adds a measurable top-1 lift on the SimpleImageClassifier.
-- [ ] Euler-ancestral + Karras-sigma noise-schedule follow-up for
-      TNNetDiffusionScheduler (neuraldiffusion.pas) — the landed sampler covers
-      DDPM/DDIM/DPM-Solver++(2M) on the linear/cosine beta schedule, but the de-facto
-      default of most diffusion UIs (Karras sigma spacing + the stochastic
-      Euler-ancestral step) is absent. Add the Karras sigma rescaling (rho=7 spacing
-      between sigma_min/sigma_max) as a schedule option and an Euler-ancestral
-      sampler step (deterministic Euler drift + per-step ancestral noise injection),
-      both reusing the existing TNNetDenoiseCallback interface. Small, self-contained,
-      and a real quality/few-step-sampling lift for every diffusion example and the
-      tracked PixArt/LatentTextToImage importers. Verify a 20-step Karras+Euler-a run
-      on DiffusionMNIST matches the existing DDIM FID within tolerance.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
       for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
       parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful

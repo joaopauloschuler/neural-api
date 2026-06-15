@@ -16,6 +16,11 @@ Tests for neuraldiffusion.pas: the reusable diffusion noise-scheduler / sampler.
    forward-process identity.
  - DDPM and DPM-Solver++(2M) trajectories run without NaN and land near the
    deterministic DDIM result for the same toy model.
+ - Euler-ancestral with Eta=0 reduces ANALYTICALLY to deterministic DDIM (eta=0)
+   and matches it to single-precision tolerance (the exact deterministic anchor).
+ - The Karras sigma table sigma_t = sqrt((1-ab_t)/ab_t) is strictly increasing,
+   and a full Karras-spaced stochastic Euler-ancestral run is finite and stays
+   near the DDIM baseline.
 Coded by Claude (AI).
 *)
 
@@ -42,6 +47,9 @@ type
     procedure TestDDIMTrajectoryVsOracle;
     procedure TestDPMSolverVsOracle;
     procedure TestDDPMRunsNoNaN;
+    procedure TestEulerAncestralZeroEtaMatchesDDIM;
+    procedure TestKarrasSpacingSigmaMonotone;
+    procedure TestKarrasEulerAncestralRunsNoNaN;
   end;
 
 implementation
@@ -297,6 +305,98 @@ begin
         IsNan(X.FData[i]) or IsInfinite(X.FData[i]));
   finally
     Sched.Free; X.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestEulerAncestralZeroEtaMatchesDDIM;
+var
+  SchedA, SchedD: TNNetDiffusionScheduler;
+  XA, XD: TNNetVolume;
+  i: integer;
+begin
+  // With Eta=0 the ancestral noise term vanishes (sigma_up=0) and the Euler step
+  // reduces ANALYTICALLY to deterministic DDIM (eta=0). They must match to
+  // single-precision tolerance on the SAME toy model and start vector. This is
+  // the exact deterministic reduction (Euler-a -> Euler -> DDIM) used as the
+  // numerical anchor for the new sampler.
+  SchedA := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  SchedD := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  XA := TNNetVolume.Create(cN, 1, 1);
+  XD := TNNetVolume.Create(cN, 1, 1);
+  try
+    for i := 0 to cN - 1 do
+    begin
+      XA.FData[i] := (i - cN / 2) * 0.3;
+      XD.FData[i] := XA.FData[i];
+    end;
+    SchedA.Sample(XA, @ToyModel, cSteps, smEulerAncestral, 0.0, tsUniform);
+    SchedD.Sample(XD, @ToyModel, cSteps, smDDIM, 0.0, tsUniform);
+    for i := 0 to cN - 1 do
+    begin
+      AssertFalse('euler-a no NaN @ ' + IntToStr(i),
+        IsNan(XA.FData[i]) or IsInfinite(XA.FData[i]));
+      AssertEquals('euler-a(eta=0) == ddim(eta=0) @ ' + IntToStr(i),
+        XD.FData[i], XA.FData[i], 1e-4);
+    end;
+  finally
+    SchedA.Free; SchedD.Free; XA.Free; XD.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestKarrasSpacingSigmaMonotone;
+var
+  Sched: TNNetDiffusionScheduler;
+  t: integer;
+begin
+  // sigma_t = sqrt((1-ab_t)/ab_t) must be strictly increasing in t (it is the
+  // per-step noise level), which is what makes SigmaToTimestep well defined and
+  // the Karras rho-spacing meaningful. sigma_1 ~ small, sigma_T large.
+  Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  try
+    AssertEquals('sigma[0]=0', 0.0, Sched.SigmaAt[0], 1e-7);
+    for t := 2 to cT do
+      AssertTrue('sigma increasing @ ' + IntToStr(t),
+        Sched.SigmaAt[t] > Sched.SigmaAt[t - 1]);
+    AssertTrue('sigma_T > sigma_1', Sched.SigmaAt[cT] > Sched.SigmaAt[1]);
+  finally
+    Sched.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestKarrasEulerAncestralRunsNoNaN;
+var
+  Sched: TNNetDiffusionScheduler;
+  X, XBase: TNNetVolume;
+  i: integer;
+  drift: TNeuralFloat;
+begin
+  // A full Karras-spaced Euler-ancestral trajectory (Eta=1, stochastic) must
+  // produce finite output and stay in the same neighbourhood as the DDIM
+  // baseline for the same toy model (the ancestral noise is small at the toy
+  // scale). RandSeed fixed so the run is reproducible.
+  RandSeed := 424242;
+  Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  X     := TNNetVolume.Create(cN, 1, 1);
+  XBase := TNNetVolume.Create(cN, 1, 1);
+  try
+    for i := 0 to cN - 1 do
+    begin
+      X.FData[i] := (i - cN / 2) * 0.3;
+      XBase.FData[i] := X.FData[i];
+    end;
+    Sched.Sample(X, @ToyModel, cSteps, smEulerAncestral, 1.0, tsKarras);
+    // DDIM baseline on the SAME start (deterministic).
+    Sched.Sample(XBase, @ToyModel, cSteps, smDDIM, 0.0, tsKarras);
+    for i := 0 to cN - 1 do
+    begin
+      AssertFalse('karras euler-a no NaN @ ' + IntToStr(i),
+        IsNan(X.FData[i]) or IsInfinite(X.FData[i]));
+      drift := Abs(X.FData[i] - XBase.FData[i]);
+      AssertTrue('karras euler-a near ddim baseline @ ' + IntToStr(i),
+        drift < 1.0);
+    end;
+  finally
+    Sched.Free; X.Free; XBase.Free;
   end;
 end;
 

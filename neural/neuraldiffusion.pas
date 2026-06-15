@@ -13,11 +13,17 @@ WHAT IT PROVIDES
     Convention matches the existing examples: 1-BASED timesteps 1..T, with index
     0 reserved as the "clean image" anchor (alpha_bar_0 = 1).
   * The forward process q_sample (AddNoise): x_t = sqrt(ab_t)*x0 + sqrt(1-ab_t)*eps.
-  * The three standard REVERSE updates, each one step:
+  * The REVERSE updates, each one step:
       - DDPM ancestral (stochastic),
       - DDIM (deterministic for eta=0; eta>0 adds the calibrated stochastic term),
       - DPM-Solver++(2M) (a 2nd-order multistep update that keeps the previous
-        model output for its correction term).
+        model output for its correction term),
+      - Euler-ancestral ("Euler a", Karras 2022): deterministic Euler drift in
+        the sigma parameterisation plus per-step ancestral noise (Eta scales the
+        injection; Eta=0 reduces exactly to deterministic Euler == DDIM eta=0).
+  * Two timestep SPACINGS for the Sample() driver: the original uniform stride
+    and Karras et al. (2022) rho=7 sigma spacing (sigma_t = sqrt((1-ab_t)/ab_t),
+    geometrically warped between sigma_min/sigma_max, snapped back to timesteps).
   * PREDICTION TYPES eps and v. A v-prediction model output is converted to the
     equivalent eps internally so all the updates share one code path.
   * A classifier-free-guidance (CFG) MIXER: given eps_cond and eps_uncond and a
@@ -65,7 +71,17 @@ type
   TNNetPredictionType = (dpEps, dpV);
 
   // Reverse-process update family.
-  TNNetSamplerMethod = (smDDPM, smDDIM, smDPMSolverPP2M);
+  //   smEulerAncestral : deterministic Euler drift in sigma-space + per-step
+  //     ancestral Gaussian noise injection (Karras et al. 2022 "Euler a").
+  TNNetSamplerMethod = (smDDPM, smDDIM, smDPMSolverPP2M, smEulerAncestral);
+
+  // Timestep SPACING for the Sample() driver.
+  //   tsUniform : evenly strided timesteps in 1..T (the original behaviour).
+  //   tsKarras  : Karras et al. (2022) rho=7 sigma spacing. The sampling sigmas
+  //     are placed geometrically-warped between sigma_min and sigma_max and then
+  //     mapped back to the nearest schedule timestep. Pairs naturally with the
+  //     Euler-ancestral sampler but works with any method.
+  TNNetTimestepSpacing = (tsUniform, tsKarras);
 
   // Caller-supplied denoiser. Given noisy Xt at integer timestep Tt (1..T) it
   // must write the model prediction (eps or v, per the scheduler's
@@ -94,6 +110,16 @@ type
     function GetAlphaBar(Tt: integer): TNeuralFloat;
     // log(sqrt(ab/(1-ab))) half-log-SNR lambda used by DPM-Solver++.
     function Lambda(Tt: integer): TNeuralFloat;
+    // Karras sigma_t = sqrt((1-ab_t)/ab_t) for timestep Tt (the per-step noise
+    // level in the variance-exploding parameterisation Euler/Karras use).
+    function SigmaOf(Tt: integer): TNeuralFloat;
+    // Map a (continuous) target sigma back to the nearest schedule timestep in
+    // 1..T whose Sigma() is closest. Used by the Karras spacing.
+    function SigmaToTimestep(TargetSigma: TNeuralFloat): integer;
+    // Build a list of NumSteps+1 timesteps (descending, last entry 0 = clean
+    // image) using the requested spacing. Caller-owned dynamic array.
+    function BuildTimestepSchedule(NumSteps: integer;
+      Spacing: TNNetTimestepSpacing): TNeuralIntegerArray;
     // Convert a raw model prediction (eps or v) at timestep Tt into eps.
     procedure ToEps(Xt, RawPred, EpsOut: TNNetVolume; Tt: integer);
   public
@@ -132,16 +158,21 @@ type
     // place on Xt. RawPred is the model's raw prediction (eps or v) at Tt.
     // Method selects the update rule; Eta is the DDIM stochasticity (0 = the
     // deterministic DDIM used by the examples; ignored by DDPM/DPM++). For DDPM
-    // TtPrev is ignored (it uses Tt-1 by construction).
+    // TtPrev is ignored (it uses Tt-1 by construction). For smEulerAncestral Eta
+    // scales the injected ancestral noise (Eta=1 = the standard "Euler a";
+    // Eta=0 reduces it to a deterministic Euler step).
     procedure Step(Xt, RawPred: TNNetVolume; Tt, TtPrev: integer;
       Method: TNNetSamplerMethod = smDDIM; Eta: TNeuralFloat = 0.0);
+
+    // Per-timestep noise level sigma_t = sqrt((1-ab_t)/ab_t) (Karras VE form).
+    property SigmaAt[Tt: integer]: TNeuralFloat read SigmaOf;
 
     // High-level driver: run a complete reverse trajectory in place on X
     // (which should start as N(0,I) noise) over NumSteps evenly-strided
     // timesteps using the supplied Denoise callback. Leaves the sampled x0 in X.
     procedure Sample(X: TNNetVolume; Denoise: TNNetDenoiseCallback;
       NumSteps: integer; Method: TNNetSamplerMethod = smDDIM;
-      Eta: TNeuralFloat = 0.0);
+      Eta: TNeuralFloat = 0.0; Spacing: TNNetTimestepSpacing = tsUniform);
   end;
 
 implementation
@@ -256,6 +287,78 @@ begin
   Result := 0.5 * (Ln(ab) - Ln(1.0 - ab));
 end;
 
+function TNNetDiffusionScheduler.SigmaOf(Tt: integer): TNeuralFloat;
+var ab: double;
+begin
+  // sigma_t = sqrt((1-ab_t)/ab_t). At Tt=0 (clean anchor) this is 0.
+  ab := FAlphaBar[Tt];
+  if ab >= 1.0 then Result := 0
+  else Result := Sqrt((1.0 - ab) / ab);
+end;
+
+function TNNetDiffusionScheduler.SigmaToTimestep(TargetSigma: TNeuralFloat): integer;
+var
+  t, best: integer;
+  d, bestD: double;
+begin
+  // The schedule's Sigma() is monotone increasing in Tt, so the nearest match
+  // is well defined. Linear scan keeps this dependency-free and exact.
+  best := 1; bestD := Abs(SigmaOf(1) - TargetSigma);
+  for t := 2 to FT do
+  begin
+    d := Abs(SigmaOf(t) - TargetSigma);
+    if d < bestD then begin bestD := d; best := t; end;
+  end;
+  Result := best;
+end;
+
+function TNNetDiffusionScheduler.BuildTimestepSchedule(NumSteps: integer;
+  Spacing: TNNetTimestepSpacing): TNeuralIntegerArray;
+var
+  k, Tt: integer;
+  sigMin, sigMax, invRho, frac, targetSigma: double;
+const
+  cRho = 7.0; // Karras et al. (2022) recommended rho.
+begin
+  if NumSteps < 1 then NumSteps := 1;
+  SetLength(Result, NumSteps + 1);
+  case Spacing of
+    tsKarras:
+      begin
+        // Geometrically warped sigmas between sigma_min (Tt=1) and sigma_max
+        // (Tt=T):  sigma_i = (sig_max^(1/rho) + i/(n-1)*(sig_min^(1/rho)
+        //          - sig_max^(1/rho)))^rho,  i = 0..n-1 (descending),
+        // then snapped back to the nearest schedule timestep.
+        sigMin := SigmaOf(1);
+        sigMax := SigmaOf(FT);
+        invRho := 1.0 / cRho;
+        for k := 0 to NumSteps - 1 do
+        begin
+          if NumSteps = 1 then frac := 0.0
+          else frac := k / (NumSteps - 1);
+          // k=0 -> sigma_max (most noise, highest Tt); k=n-1 -> sigma_min.
+          targetSigma := Power(Power(sigMax, invRho) +
+            frac * (Power(sigMin, invRho) - Power(sigMax, invRho)), cRho);
+          Tt := SigmaToTimestep(targetSigma);
+          // Index 0 of Result is the FIRST (highest-noise) step.
+          Result[k] := Tt;
+        end;
+        Result[NumSteps] := 0; // clean-image anchor.
+      end;
+    else // tsUniform
+      begin
+        for k := 0 to NumSteps - 1 do
+        begin
+          // Descending: Result[0] is the highest timestep.
+          if NumSteps = 1 then Tt := FT
+          else Tt := 1 + Round((NumSteps - 1 - k) * (FT - 1) / (NumSteps - 1));
+          Result[k] := Tt;
+        end;
+        Result[NumSteps] := 0;
+      end;
+  end;
+end;
+
 procedure TNNetDiffusionScheduler.ToEps(Xt, RawPred, EpsOut: TNNetVolume; Tt: integer);
 var
   i: integer;
@@ -356,6 +459,53 @@ begin
             Xt.FData[i] := sqrtAbPrev * x0 + dirCoef * Eps.FData[i] + sigma * z;
           end;
         end;
+      smEulerAncestral:
+        begin
+          // Euler-ancestral ("Euler a", Karras et al. 2022). Work in the VE
+          // sigma parameterisation: sigma = sqrt((1-ab)/ab). The denoised
+          // estimate is x0 = (x_t - somab_t*eps)/sqrt(ab_t). The ancestral split
+          // of the remaining noise sigma_next = Sigma(TtPrev):
+          //   sigma_up   = eta * sqrt( (s2^2*(s1^2 - s2^2)) / s1^2 )   (injected)
+          //   sigma_down = sqrt( max(0, s2^2 - sigma_up^2) )          (Euler drift)
+          // with s1 = Sigma(Tt), s2 = Sigma(TtPrev). The Euler drift along the
+          // probability-flow ODE from sigma=s1 to sigma=sigma_down is, in terms
+          // of the denoised x0:  x = x0 + sigma_down*((x_t/sqrt(ab_t) - x0)/s1)
+          //                        = x0 + (sigma_down/s1)*(x_t/sqrt(ab_t) - x0).
+          // Finally re-noise to VP scale at TtPrev: multiply by sqrt(ab_prev)
+          // and add the ancestral term sqrt(ab_prev)*sigma_up*z.
+          abT := FAlphaBar[Tt];
+          if TtPrev = 0 then
+          begin
+            // Final hop: emit the denoised x0 directly.
+            for i := 0 to Xt.Size - 1 do
+              Xt.FData[i] :=
+                (Xt.FData[i] - FSqrtOneMinusAlphaBar[Tt] * Eps.FData[i]) / Sqrt(abT);
+            Exit;
+          end;
+          abPrev := FAlphaBar[TtPrev];
+          sqrtAbPrev := Sqrt(abPrev);
+          begin
+            // Reuse DPM locals as scratch for the sigma split.
+            lamT := SigmaOf(Tt);                       // s1
+            lamPrev := SigmaOf(TtPrev);                // s2
+            if (Eta > 0) and (lamT > 0) then
+              sigma := Eta * Sqrt((lamPrev * lamPrev *
+                Max(0.0, lamT * lamT - lamPrev * lamPrev)) / (lamT * lamT))
+            else
+              sigma := 0;                            // sigma_up
+            h := Sqrt(Max(0.0, lamPrev * lamPrev - sigma * sigma)); // sigma_down
+            if lamT > 0 then r0 := h / lamT else r0 := 0;           // drift ratio
+            for i := 0 to Xt.Size - 1 do
+            begin
+              if sigma > 0 then z := RandG(0, 1) else z := 0;
+              x0 := (Xt.FData[i] - FSqrtOneMinusAlphaBar[Tt] * Eps.FData[i]) / Sqrt(abT);
+              // VE sample at sigma=s1 is x_t/sqrt(ab_t); Euler drift to sigma_down.
+              curX0 := x0 + r0 * (Xt.FData[i] / Sqrt(abT) - x0);
+              // Re-noise back to VP scale at TtPrev, add ancestral noise.
+              Xt.FData[i] := sqrtAbPrev * (curX0 + sigma * z);
+            end;
+          end;
+        end;
       smDPMSolverPP2M:
         begin
           // DPM-Solver++(2M) in the data-prediction (x0) form (Lu et al. 2022,
@@ -427,26 +577,22 @@ end;
 
 procedure TNNetDiffusionScheduler.Sample(X: TNNetVolume;
   Denoise: TNNetDenoiseCallback; NumSteps: integer;
-  Method: TNNetSamplerMethod; Eta: TNeuralFloat);
+  Method: TNNetSamplerMethod; Eta: TNeuralFloat; Spacing: TNNetTimestepSpacing);
 var
   k, Tt, TtPrev: integer;
   Pred: TNNetVolume;
+  Schedule: TNeuralIntegerArray;
 begin
   if NumSteps < 1 then NumSteps := 1;
   ResetMultistep;
+  // Schedule[0..NumSteps]: descending timesteps, Schedule[NumSteps]=0 (clean).
+  Schedule := BuildTimestepSchedule(NumSteps, Spacing);
   Pred := TNNetVolume.Create(X);
   try
-    for k := NumSteps - 1 downto 0 do
+    for k := 0 to NumSteps - 1 do
     begin
-      // Map subsequence index k -> actual timestep in 1..T (evenly strided).
-      if NumSteps = 1 then Tt := FT
-      else Tt := 1 + Round(k * (FT - 1) / (NumSteps - 1));
-      if k > 0 then
-      begin
-        if NumSteps = 1 then TtPrev := 0
-        else TtPrev := 1 + Round((k - 1) * (FT - 1) / (NumSteps - 1));
-      end
-      else TtPrev := 0;
+      Tt := Schedule[k];
+      TtPrev := Schedule[k + 1];
       Denoise(X, Pred, Tt);
       Step(X, Pred, Tt, TtPrev, Method, Eta);
     end;
