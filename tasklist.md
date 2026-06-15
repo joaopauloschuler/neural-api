@@ -444,7 +444,7 @@ rather than acted on.
       everything else is landed. Pico parity vs
       HF float64 on the logits + an examples/VideoAction that classifies a short
       Moving-MNIST-tubelet or a tiny clip on CPU. First image-sequence-in importer.
-- [ ] PixArt-alpha text-to-image importer (BuildPixArtFromSafeTensors, e.g.
+- [X] PixArt-alpha text-to-image importer (BuildPixArtFromSafeTensors, e.g.
       PixArt-alpha/PixArt-XL-2-512x512) — the TEXT-conditioned DiT variant that the
       landed class-conditional DiT importer (BuildDiTFromSafeTensors) explicitly
       defers (see the neuralpretrained.pas DiT header note). The ONLY structurally

@@ -321,6 +321,8 @@ type
     procedure TestDiTConfigFromJSONFile;
     procedure TestDiTParity;
     procedure TestDiTSchedulerSmoke;
+    procedure TestPixArtConfigFromJSONFile;
+    procedure TestPixArtParity;
     procedure TestRRDBNetParity;
     procedure TestStyleGAN2ConfigFromJSONFile;
     procedure TestStyleGAN2GeneratorParity;
@@ -15420,6 +15422,114 @@ begin
     Eps.Free;
     Latent.Free;
     Scheduler.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestPixArtConfigFromJSONFile;
+var
+  Config: TPixArtConfig;
+begin
+  Config := ReadPixArtConfigFromJSONFile(
+    FixturePath('tiny_pixart_config.json'), {TextSeqLen=}5);
+  AssertEquals('hidden', 16, Config.HiddenSize);
+  AssertEquals('layers', 2, Config.NumLayers);
+  AssertEquals('heads', 2, Config.NumHeads);
+  AssertEquals('patch', 2, Config.PatchSize);
+  AssertEquals('in_ch', 4, Config.InChannels);
+  AssertEquals('out_ch', 8, Config.OutChannels);
+  AssertEquals('sample', 6, Config.SampleSize);
+  AssertEquals('t5_dim', 12, Config.CaptionChannels);
+  AssertEquals('text_len', 5, Config.TextSeqLen);
+  AssertEquals('mlp_hidden', 64, Config.MlpHidden);
+end;
+
+// Parity test for the PixArt-alpha text-conditioned DiT importer
+// (BuildPixArtFromSafeTensors) against the committed tiny float64 numpy oracle
+// (tools/make_pico_pixart_fixture.py: hidden 16, layers 2, heads 2, patch 2,
+// in_ch 4, out_ch 8, 6x6 latent -> 3x3 grid, t5_dim 12, 5 text tokens).
+// diffusers is NOT installed; the oracle exactly mirrors the diffusers
+// PixArtTransformer2DModel forward (caption_projection, shared adaln-single +
+// per-block scale_shift_table, self-attn / unmodulated cross-attn / GEGLU-erf
+// FFN, final adaLN + unpatchify). The T5 encoder states are a fixed random
+// (TextSeqLen, t5_dim) array fed as the third input. Asserts < 1e-4 on the FULL
+// out_channels output.
+procedure TTestNeuralPretrained.TestPixArtParity;
+var
+  NN: TNNet;
+  Config: TPixArtConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, LatArr, TxtArr, OutArr: TJSONArray;
+  CaseObj: TJSONObject;
+  LatentInput, TextStates: TNNetVolume;
+  t, RefVal, GotVal, Diff, MaxDiff: double;
+  CaseCnt, x, yy, c, FlatIdx, HW, L, T5, s: integer;
+  Output: TNNetVolume;
+begin
+  RandSeed := 424242;
+  NN := BuildPixArtFromSafeTensors(FixturePath('tiny_pixart.safetensors'),
+    {TextSeqLen=}5, Config, {pInferenceOnly=}false,
+    FixturePath('tiny_pixart_config.json'));
+  RefJson := TStringList.Create;
+  LatentInput := TNNetVolume.Create;
+  TextStates := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  try
+    AssertTrue('net built', NN <> nil);
+    RefJson.LoadFromFile(FixturePath('tiny_pixart_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertTrue('cases present', CasesArr <> nil);
+    HW := Config.SampleSize;
+    L := Config.TextSeqLen;
+    T5 := Config.CaptionChannels;
+    for CaseCnt := 0 to CasesArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(CasesArr.Items[CaseCnt]);
+      LatArr := TJSONArray(CaseObj.Find('latent'));   // flat (C,H,W)
+      TxtArr := TJSONArray(CaseObj.Find('text'));      // flat (L,t5_dim)
+      OutArr := TJSONArray(CaseObj.Find('output'));    // flat (out_ch,H,W)
+      t := CaseObj.Get('t', double(0));
+      // latent (C,H,W) -> CAI (x,y,depth).
+      LatentInput.ReSize(HW, HW, Config.InChannels);
+      for c := 0 to Config.InChannels - 1 do
+        for yy := 0 to HW - 1 do
+          for x := 0 to HW - 1 do
+          begin
+            FlatIdx := c * HW * HW + yy * HW + x;
+            LatentInput.FData[(yy * HW + x) * Config.InChannels + c] :=
+              LatArr.Items[FlatIdx].AsFloat;
+          end;
+      // text (L,t5_dim) -> CAI (SeqLen=x, 1, depth=t5_dim).
+      TextStates.ReSize(L, 1, T5);
+      for s := 0 to L - 1 do
+        for c := 0 to T5 - 1 do
+          TextStates.FData[s * T5 + c] := TxtArr.Items[s * T5 + c].AsFloat;
+      PixArtConditioning(NN, t, TextStates);
+      NN.Compute(LatentInput);
+      Output := NN.GetLastLayer().Output;
+      AssertEquals('output grid', HW, Output.SizeX);
+      AssertEquals('output channels', Config.OutChannels, Output.Depth);
+      for c := 0 to Config.OutChannels - 1 do
+        for yy := 0 to HW - 1 do
+          for x := 0 to HW - 1 do
+          begin
+            FlatIdx := c * HW * HW + yy * HW + x;
+            RefVal := OutArr.Items[FlatIdx].AsFloat;
+            GotVal := Output.FData[(yy * HW + x) * Config.OutChannels + c];
+            Diff := Abs(GotVal - RefVal);
+            if Diff > MaxDiff then MaxDiff := Diff;
+          end;
+    end;
+    AssertTrue('PixArt output: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    TextStates.Free;
+    LatentInput.Free;
+    RefJson.Free;
     NN.Free;
   end;
 end;

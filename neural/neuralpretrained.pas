@@ -6085,6 +6085,110 @@ procedure DiTConditioning(Net: TNNet; t: TNeuralFloat; ClassId: integer);
 procedure DiTDenoise(Net: TNNet; const Config: TDiTConfig;
   Latent: TNNetVolume; t: TNeuralFloat; ClassId: integer; EpsOut: TNNetVolume);
 
+// ===========================================================================
+// PixArt-alpha IMPORT (text-conditioned Diffusion Transformer, Chen et al.
+// 2023, "PixArt-alpha: Fast Training of Diffusion Transformer for
+// Photorealistic Text-to-Image Synthesis", arXiv:2310.00426 - the diffusers
+// PixArtTransformer2DModel behind PixArt-alpha/PixArt-XL-2-512x512). This is
+// the TEXT-conditioned DiT variant the landed class-conditional
+// BuildDiTFromSafeTensors explicitly defers. It REUSES the entire DiT recipe
+// (patch embed, fixed 2-D sin-cos pos embed, the self-attention block, the
+// timestep MLP, the final adaLN + unpatchify) and adds exactly three pieces:
+//
+//   (a) CONDITIONING SOURCE: NO class-label table. The model is conditioned on
+//       caller-supplied T5 encoder_hidden_states (TextSeqLen, t5_dim) fed into
+//       the net's THIRD TNNetInput (the T5EncoderStatesInput convention - the
+//       T5 prompt tower is a separate net; build it with BuildT5FromSafeTensors
+//       and copy its last hidden state into PixArtTextInput before Compute). A
+//       caption_projection (Linear -> GELU(tanh) -> Linear) maps the T5 width
+//       to the transformer width INSIDE the net.
+//   (b) CROSS-ATTENTION per block, inserted between the self-attention and the
+//       FFN: image tokens (query) attend to the projected text tokens
+//       (key/value). PixArt's cross-attention is NOT adaLN-modulated, has NO
+//       preceding LayerNorm (diffusers ada_norm_single feeds hidden_states
+//       straight in) and NO output gate - just x = x + attn2(x, enc).
+//   (c) SHARED adaLN-single: ONE global timestep-modulation MLP (adaln_single)
+//       emits a 6*hidden vector; each block ADDS its own learnable
+//       scale_shift_table[6, hidden] (a TNNetChannelBias over the shared
+//       adaln) before chunking into shift/scale/gate. The final layer adds a
+//       top-level scale_shift_table[2, hidden] to embedded_timestep (the
+//       hidden-width vector BEFORE the 6*hidden linear).
+//
+// Exact diffusers details replicated: timestep = get_timestep_embedding(t,256,
+// flip_sin_to_cos=True, downscale_freq_shift=0) -> TimestepEmbedder(256->hidden,
+// SiLU, hidden->hidden) = embedded_timestep; self/cross attention use separate
+// to_q/to_k/to_v/to_out.0 (NOT a fused qkv slab); the FFN is a GEGLU (net.0.proj
+// hidden->2*mlp, ERF-gelu gate, net.2 mlp->hidden); norm1/norm2/norm_out are
+// elementwise_affine=False. v1 scopes to plain PixArt-alpha 512 (NO
+// micro-conditioning: use_additional_conditions must be false; a config that
+// needs resolution/aspect-ratio embeddings is REJECTED loudly).
+//
+// The net has THREE TNNetInput layers (all filled manually before Compute):
+// input0 = the (SampleSize,SampleSize,InChannels) latent; input1 = the (1,1,1)
+// scalar timestep t; input2 = the (TextSeqLen,1,CaptionChannels) T5 encoder
+// states. PixArtTimestepInput / PixArtTextInput return inputs 1/2;
+// PixArtDenoise fills all three, Computes, and copies the EPS half.
+// ---------------------------------------------------------------------------
+type
+  TPixArtConfig = record
+    HiddenSize: integer;        // num_attention_heads * attention_head_dim
+    NumLayers: integer;         // num_layers (number of transformer blocks)
+    NumHeads: integer;          // num_attention_heads
+    PatchSize: integer;         // patch_size (2)
+    InChannels: integer;        // in_channels of the latent (4)
+    OutChannels: integer;       // out_channels (2*in_channels if learn_sigma)
+    SampleSize: integer;        // sample_size (latent grid H=W)
+    CaptionChannels: integer;   // caption_channels (T5 hidden width)
+    TextSeqLen: integer;        // number of T5 text tokens (built-in length)
+    MlpHidden: integer;         // FFN inner width (ff_dim, default 4*hidden)
+    LayerNormEps: TNeuralFloat; // norm_eps (1e-6)
+    ModelType: string;          // 'PixArtTransformer2DModel'
+  end;
+
+// Reads a PixArt config.json. Required: num_attention_heads,
+// attention_head_dim, num_layers, patch_size, in_channels, sample_size,
+// caption_channels. Optional: out_channels (2*in_channels default),
+// cross_attention_dim (== hidden), norm_eps (1e-6). TextSeqLen is NOT in the
+// HF config (it is a runtime sequence length) - pass it via the importer.
+// REJECTS use_additional_conditions=true (micro-conditioning unsupported in v1).
+function ReadPixArtConfigFromJSONFile(const FileName: string;
+  TextSeqLen: integer): TPixArtConfig;
+
+function PixArtConfigToString(const Config: TPixArtConfig): string;
+
+// Builds the PixArt transformer described by Config and loads every weight from
+// Reader (caller owns Reader). THREE inputs (latent / scalar t / T5 states); it
+// outputs the (SampleSize,SampleSize,OutChannels) raw prediction. pInferenceOnly
+// frees training volumes during construction.
+function BuildPixArt(Reader: TNNetSafeTensorsReader; const Config: TPixArtConfig;
+  pInferenceOnly: boolean = false): TNNet;
+
+function BuildPixArtFromSafeTensorsEx(const FileName: string;
+  const Config: TPixArtConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildPixArtFromSafeTensors(const FileName: string; TextSeqLen: integer;
+  out Config: TPixArtConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// Returns the PixArt net's timestep input (the (1,1,1) scalar t, the SECOND
+// TNNetInput) and T5 encoder-states input (the (TextSeqLen,1,CaptionChannels)
+// states, the THIRD TNNetInput).
+function PixArtTimestepInput(Net: TNNet): TNNetLayer;
+function PixArtTextInput(Net: TNNet): TNNetLayer;
+
+// Fills the timestep input with t and copies TextStates ((TextSeqLen,1,
+// CaptionChannels)) into the T5 encoder-states input. Call before
+// PixArtDenoise / Net.Compute.
+procedure PixArtConditioning(Net: TNNet; t: TNeuralFloat;
+  TextStates: TNNetVolume);
+
+// Full PixArt forward: fills input0 with Latent, the timestep, and the T5
+// states, Net.Compute, and copies the EPS half (first InChannels channels) of
+// the output into EpsOut (resized to (SampleSize,SampleSize,InChannels)).
+procedure PixArtDenoise(Net: TNNet; const Config: TPixArtConfig;
+  Latent: TNNetVolume; t: TNeuralFloat; TextStates: TNNetVolume;
+  EpsOut: TNNetVolume);
+
 // ---------------------------------------------------------------------------
 // VQGAN / DISCRETE IMAGE-TOKENIZER IMPORT (diffusers VQModel, the encoder used
 // by autoregressive / masked image generators - MaskGIT, Parti, LlamaGen - to
@@ -42450,6 +42554,498 @@ begin
   EpsOut.Resize(Config.LatentSize, Config.LatentSize, Config.InChannels);
   for x := 0 to Config.LatentSize - 1 do
     for y := 0 to Config.LatentSize - 1 do
+      for c := 0 to Config.InChannels - 1 do
+        EpsOut[x, y, c] := Output[x, y, c];
+end;
+
+// ============================ PixArt-alpha IMPORT ==========================
+// Coded by Claude (AI).
+
+// Swaps the two input-column halves of a Linear's weight rows: the framework
+// TNNetSinusoidalTimeEmbedding emits [sin|cos] but diffusers/DiT
+// get_timestep_embedding(flip_sin_to_cos=True) emits [cos|sin]; swapping the
+// halves makes the loaded Linear consume the framework's [sin|cos] order.
+procedure SwapSinCosInputColumns(Layer: TNNetLayer; InDim: integer);
+var
+  WVol: TNNetVolume;
+  i, ci, half: integer;
+  SwapTmp: TNeuralFloat;
+begin
+  half := InDim div 2;
+  for i := 0 to Layer.Neurons.Count - 1 do
+  begin
+    WVol := Layer.Neurons[i].Weights;
+    for ci := 0 to half - 1 do
+    begin
+      SwapTmp := WVol.FData[ci];
+      WVol.FData[ci] := WVol.FData[half + ci];
+      WVol.FData[half + ci] := SwapTmp;
+    end;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+function ReadPixArtConfigFromJSONFile(const FileName: string;
+  TextSeqLen: integer): TPixArtConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  HeadDim: integer;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  Result.LayerNormEps := 1e-6;
+  Result.ModelType := 'PixArtTransformer2DModel';
+  Result.TextSeqLen := TextSeqLen;
+  if not FileExists(FileName) then
+    ImportError('PixArt import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError('PixArt import: ' + FileName + ' is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.NumHeads := Obj.Get('num_attention_heads', 0);
+    HeadDim := Obj.Get('attention_head_dim', 0);
+    Result.HiddenSize := Result.NumHeads * HeadDim;
+    // cross_attention_dim equals the transformer width in PixArt-alpha.
+    Result.NumLayers := Obj.Get('num_layers', 0);
+    Result.PatchSize := Obj.Get('patch_size', 0);
+    Result.InChannels := Obj.Get('in_channels', 0);
+    Result.OutChannels := Obj.Get('out_channels', 0);
+    if Result.OutChannels <= 0 then Result.OutChannels := 2 * Result.InChannels;
+    Result.SampleSize := Obj.Get('sample_size', 0);
+    Result.CaptionChannels := Obj.Get('caption_channels', 0);
+    Result.LayerNormEps := Obj.Get('norm_eps', double(Result.LayerNormEps));
+    if Obj.Find('_class_name') <> nil then
+      Result.ModelType := Obj.Get('_class_name', Result.ModelType);
+    if Obj.Get('use_additional_conditions', false) then
+      ImportError('PixArt import: use_additional_conditions=true ' +
+        '(resolution/aspect-ratio micro-conditioning) is not supported in v1; ' +
+        'only the plain PixArt-alpha 512 transformer is supported.');
+    // PixArt-alpha FFN is the diffusers default ff_dim = 4 * hidden (GEGLU).
+    Result.MlpHidden := 4 * Result.HiddenSize;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+  if (Result.HiddenSize <= 0) or (Result.NumLayers <= 0) or
+     (Result.NumHeads <= 0) or (Result.PatchSize <= 0) or
+     (Result.InChannels <= 0) or (Result.SampleSize <= 0) or
+     (Result.CaptionChannels <= 0) then
+    ImportError('PixArt import: ' + FileName + ' is missing one of the ' +
+      'required keys num_attention_heads/attention_head_dim/num_layers/' +
+      'patch_size/in_channels/sample_size/caption_channels.');
+  if Result.TextSeqLen <= 0 then
+    ImportError('PixArt import: TextSeqLen must be a positive integer.');
+end;
+
+function PixArtConfigToString(const Config: TPixArtConfig): string;
+begin
+  Result := Config.ModelType + ' config: d=' + IntToStr(Config.HiddenSize) +
+    ', layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', patch=' + IntToStr(Config.PatchSize) +
+    ', in_ch=' + IntToStr(Config.InChannels) +
+    ', out_ch=' + IntToStr(Config.OutChannels) +
+    ', sample=' + IntToStr(Config.SampleSize) +
+    ', t5_dim=' + IntToStr(Config.CaptionChannels) +
+    ', text_len=' + IntToStr(Config.TextSeqLen) +
+    ', mlp_hidden=' + IntToStr(Config.MlpHidden);
+end;
+
+// Records the projection layers of one PixArt attention (separate to_q/to_k/
+// to_v + the out-projection to_out.0), so the importer can load HF's
+// unfused-qkv weights. Works for self-attention (QuerySource = KVSource) and
+// cross-attention (KVSource is the projected caption stream).
+type
+  TPixArtAttnLayers = record
+    QProj, KProj, VProj, OutProj: TNNetLayer;
+  end;
+
+// Builds a multi-head attention from explicit Q-source and K|V-source. Mirrors
+// TNNet.AddMultiHeadCrossAttention but captures the four projection refs (HF's
+// to_q/to_k/to_v/to_out.0). For self-attention pass QuerySource=KeyValueSource.
+// Returns the (SeqLen,1,d_model) out-projection layer.
+function AddPixArtAttention(NN: TNNet; d_model, Heads: integer;
+  QuerySource, KeyValueSource: TNNetLayer;
+  var Attn: TPixArtAttnLayers): TNNetLayer;
+var
+  d_k, HeadCnt, d: integer;
+  QSlice, KSlice, VSlice, KVPack: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  QChannels, KVChannels: array of integer;
+begin
+  d_k := d_model div Heads;
+  Attn.QProj := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(d_model), QuerySource);
+  Attn.KProj := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(d_model), KeyValueSource);
+  Attn.VProj := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(d_model), KeyValueSource);
+  SetLength(HeadOutputs, Heads);
+  SetLength(QChannels, d_k);
+  SetLength(KVChannels, d_k);
+  for HeadCnt := 0 to Heads - 1 do
+  begin
+    for d := 0 to d_k - 1 do
+    begin
+      QChannels[d]  := HeadCnt * d_k + d;
+      KVChannels[d] := HeadCnt * d_k + d;
+    end;
+    QSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), Attn.QProj);
+    KSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(KVChannels), Attn.KProj);
+    VSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(KVChannels), Attn.VProj);
+    KVPack := NN.AddLayer(TNNetDeepConcat.Create([KSlice, VSlice]));
+    HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+      TNNetCrossAttention.Create(d_k, {CausalMask=}false, KVPack), QSlice);
+  end;
+  NN.AddLayer(TNNetDeepConcat.Create(HeadOutputs));
+  Attn.OutProj := NN.AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+  Result := Attn.OutProj;
+  SetLength(HeadOutputs, 0);
+  SetLength(QChannels, 0);
+  SetLength(KVChannels, 0);
+end;
+
+// One PixArt transformer block (adaLN-single self-attn, unmodulated cross-attn,
+// adaLN-single FFN). AdalnLayer is the (1,1,6*hidden) shared timestep
+// modulation; EncLayer is the projected caption stream (TextSeqLen,1,hidden).
+// XInput is the block's input tokens (NumPatches,1,hidden). Records the leaf
+// layers that need weights loaded; returns the block-output layer.
+type
+  TPixArtBlockLayers = record
+    ScaleShift: TNNetLayer;   // per-block scale_shift_table (ChannelBias, 6*hidden)
+    SelfAttn: TPixArtAttnLayers;
+    CrossAttn: TPixArtAttnLayers;
+    Ff0: TNNetLayer;          // ff.net.0.proj (hidden -> 2*mlp_hidden)
+    Ff2: TNNetLayer;          // ff.net.2     (mlp_hidden -> hidden)
+  end;
+
+function AddPixArtBlock(NN: TNNet; XInput, AdalnLayer, EncLayer: TNNetLayer;
+  const Config: TPixArtConfig; var Block: TPixArtBlockLayers;
+  pInferenceOnly: boolean): TNNetLayer;
+var
+  d: integer;
+  Mod6, LN1, FiLM1, SelfOut, Gate1Slice, Gated1, Res1: TNNetLayer;
+  CrossOut, Res2, LN2, FiLM2, Geglu, FfOut, Gate2Slice, Gated2: TNNetLayer;
+begin
+  d := Config.HiddenSize;
+  // per-block modulation: scale_shift_table + shared adaln -> (1,1,6*hidden).
+  Block.ScaleShift := NN.AddLayerAfter(TNNetChannelBias.Create(), AdalnLayer);
+  Mod6 := Block.ScaleShift;
+  // chunk layout (diffusers): [shift_msa, scale_msa, gate_msa, shift_mlp,
+  // scale_mlp, gate_mlp], each width d.
+  // ---- self-attention sub-block (adaLN-modulated) ----
+  LN1 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps), XInput);
+  FiLM1 := NN.AddLayer( TNNetFiLM.Create(
+    [LN1, DiTModCond(NN, Mod6, {scale}1 * d, {shift}0 * d, d)]) );
+  SelfOut := AddPixArtAttention(NN, d, Config.NumHeads, FiLM1, FiLM1,
+    Block.SelfAttn);
+  Gate1Slice := NN.AddLayerAfter(TNNetSplitChannels.Create(2 * d, d), Mod6);
+  Gated1 := NN.AddLayer( TNNetChannelMulByLayer.Create(SelfOut, Gate1Slice) );
+  Res1 := NN.AddLayer( TNNetSum.Create([Gated1, XInput]) );
+  // ---- cross-attention sub-block (NO norm, NO modulation, NO gate) ----
+  CrossOut := AddPixArtAttention(NN, d, Config.NumHeads, Res1, EncLayer,
+    Block.CrossAttn);
+  Res2 := NN.AddLayer( TNNetSum.Create([CrossOut, Res1]) );
+  // ---- feed-forward sub-block (adaLN-modulated, GEGLU/erf) ----
+  LN2 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps), Res2);
+  FiLM2 := NN.AddLayer( TNNetFiLM.Create(
+    [LN2, DiTModCond(NN, Mod6, {scale}4 * d, {shift}3 * d, d)]) );
+  // GEGLU: net.0.proj -> (2*mlp); split a|gate; a * erf_gelu(gate); net.2.
+  Block.Ff0 := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(2 * Config.MlpHidden), FiLM2);
+  Geglu := NN.AddLayer( TNNetGEGLUErf.Create() ); // erf-gelu gated linear unit
+  Block.Ff2 := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(d), Geglu);
+  FfOut := Block.Ff2;
+  Gate2Slice := NN.AddLayerAfter(TNNetSplitChannels.Create(5 * d, d), Mod6);
+  Gated2 := NN.AddLayer( TNNetChannelMulByLayer.Create(FfOut, Gate2Slice) );
+  Result := NN.AddLayer( TNNetSum.Create([Gated2, Res2]) );
+  if pInferenceOnly then NN.MakeInferenceOnly();
+end;
+
+// Loads one PixArt attention's HF weights: to_q/to_k/to_v (each hidden->hidden,
+// biased) and to_out.0 (hidden->hidden, biased). QIn/KVIn are the projection
+// input widths (= hidden for self-attn; KVIn = caption width-after-projection =
+// hidden for cross-attn too, since caption_projection maps to hidden first).
+procedure LoadPixArtAttn(Reader: TNNetSafeTensorsReader;
+  const Attn: TPixArtAttnLayers; const Prefix: string; d: integer);
+begin
+  LoadLlamaLinearWeights(Reader, Attn.QProj, Prefix + 'to_q.weight',
+    d, d, 0, -1, 0, Prefix + 'to_q.bias');
+  LoadLlamaLinearWeights(Reader, Attn.KProj, Prefix + 'to_k.weight',
+    d, d, 0, -1, 0, Prefix + 'to_k.bias');
+  LoadLlamaLinearWeights(Reader, Attn.VProj, Prefix + 'to_v.weight',
+    d, d, 0, -1, 0, Prefix + 'to_v.bias');
+  LoadLlamaLinearWeights(Reader, Attn.OutProj, Prefix + 'to_out.0.weight',
+    d, d, 0, -1, 0, Prefix + 'to_out.0.bias');
+end;
+
+function BuildPixArt(Reader: TNNetSafeTensorsReader;
+  const Config: TPixArtConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  LatentInput, TInput, TextInput, PatchConv, PosEmb: TNNetLayer;
+  TSin, TFc0, TSilu0, TFc2, AdalnSilu, AdalnLin: TNNetLayer;
+  CapFc1, CapGelu, CapFc2, EncLayer: TNNetLayer;
+  FinalLN, FinalScaleShift, FinalFiLM, FinalLin: TNNetLayer;
+  XLayer: TNNetLayer;
+  Blocks: array of TPixArtBlockLayers;
+  Tmp, SST: TNNetVolume;
+  d, Grid, NumPatches, MlpHidden, ci, BlockCnt, k: integer;
+  PatchBiasName, p: string;
+begin
+  d := Config.HiddenSize;
+  MlpHidden := Config.MlpHidden;
+  if (Config.NumHeads < 1) or ((d mod Config.NumHeads) <> 0) then
+    ImportError('PixArt import: hidden_size=' + IntToStr(d) +
+      ' not divisible by num_heads=' + IntToStr(Config.NumHeads) + '.');
+  if (Config.PatchSize < 1) or ((Config.SampleSize mod Config.PatchSize) <> 0)
+  then
+    ImportError('PixArt import: sample_size=' + IntToStr(Config.SampleSize) +
+      ' not a multiple of patch_size=' + IntToStr(Config.PatchSize) + '.');
+  Grid := Config.SampleSize div Config.PatchSize;
+  NumPatches := Grid * Grid;
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    // input0: the (SampleSize, SampleSize, in_channels) latent.
+    LatentInput := NN.AddLayer( TNNetInput.Create(
+      Config.SampleSize, Config.SampleSize, Config.InChannels) );
+    PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      d, Config.PatchSize, 0, Config.PatchSize, {pSuppressBias=}0) );
+    NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
+    PosEmb := NN.AddLayer( TNNetLearnedPositionalEmbedding.Create(NumPatches) );
+    XLayer := PosEmb;
+
+    // input1: scalar timestep t -> 256-d sinusoid -> TimestepEmbedder ->
+    // adaln_single.linear (6*hidden).
+    TInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
+    TSin := NN.AddLayerAfter(
+      TNNetSinusoidalTimeEmbedding.Create(256), TInput );
+    TFc0 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+    TSilu0 := NN.AddLayer( TNNetSiLU.Create() );
+    TFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) ); // embedded_timestep
+    AdalnSilu := NN.AddLayerAfter( TNNetSiLU.Create(), TFc2 );
+    AdalnLin := NN.AddLayer( TNNetPointwiseConvLinear.Create(6 * d) ); // shared adaln
+
+    // input2: T5 encoder states -> caption_projection (Linear->gelu_tanh->Linear).
+    TextInput := NN.AddLayer( TNNetInput.Create(
+      Config.TextSeqLen, 1, Config.CaptionChannels) );
+    CapFc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+    CapGelu := NN.AddLayer( TNNetGELU.Create() ); // gelu approximate='tanh'
+    CapFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+    EncLayer := CapFc2;
+
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---- transformer blocks ----
+    SetLength(Blocks, Config.NumLayers);
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+      XLayer := AddPixArtBlock(NN, XLayer, AdalnLin, EncLayer, Config,
+        Blocks[BlockCnt], pInferenceOnly);
+
+    // ---- final layer: (scale_shift_table[2,d] + embedded_timestep) ----
+    // embedded_timestep is TFc2; build [shift|scale] = table + embedded_t via a
+    // ChannelBias over a 2*d broadcast of TFc2. We broadcast TFc2 to 2*d by
+    // concatenating it with itself, then add the [2,d] table as a ChannelBias.
+    FinalScaleShift := NN.AddLayerAfter(
+      TNNetChannelBias.Create(),
+      NN.AddLayer( TNNetDeepConcat.Create([TFc2, TFc2]) ) );
+    FinalLN := NN.AddLayerAfter(
+      TNNetTokenLayerNorm.Create(Config.LayerNormEps), XLayer);
+    // diffusers chunk order is [shift, scale]; DiTModCond reads scale at
+    // ScaleStart, shift at ShiftStart.
+    FinalFiLM := NN.AddLayer( TNNetFiLM.Create(
+      [FinalLN, DiTModCond(NN, FinalScaleShift, {scale}1 * d, {shift}0 * d, d)]) );
+    FinalLin := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(
+        Config.PatchSize * Config.PatchSize * Config.OutChannels), FinalFiLM);
+    NN.AddLayer( TNNetReshape.Create(Grid, Grid,
+      Config.PatchSize * Config.PatchSize * Config.OutChannels) );
+    NN.AddLayer( TNNetDepthToSpace.Create(Config.PatchSize) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    // patch conv (biased): HF key 'pos_embed.proj.weight'.
+    LoadClipPatchConv(Reader, PatchConv, 'pos_embed.proj.weight',
+      Config.InChannels, Config.PatchSize, d);
+    PatchBiasName := 'pos_embed.proj.bias';
+    if not Reader.HasTensor(PatchBiasName) then
+      ImportError('PixArt import: missing tensor "' + PatchBiasName + '".');
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(PatchBiasName, Tmp);
+      for ci := 0 to d - 1 do PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+      PatchConv.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    // fixed 2-D sin-cos pos embed buffer 'pos_embed.pos_embed' [1, N, d].
+    if not Reader.HasTensor('pos_embed.pos_embed') then
+      ImportError('PixArt import: missing tensor "pos_embed.pos_embed".');
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat('pos_embed.pos_embed', Tmp);
+      if Tmp.Size <> NumPatches * d then
+        ImportError('PixArt import: "pos_embed.pos_embed" must have ' +
+          IntToStr(NumPatches * d) + ' elements, got ' +
+          IntToStr(Tmp.Size) + '.');
+      PosEmb.Neurons[0].Weights.Copy(Tmp);
+      PosEmb.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    // timestep embedder: linear_1 (256->d), linear_2 (d->d). The framework
+    // TNNetSinusoidalTimeEmbedding emits [sin|cos]; diffusers
+    // get_timestep_embedding with flip_sin_to_cos=True emits [cos|sin]. We swap
+    // the input-column halves of linear_1 so the loaded weights consume [sin|cos].
+    LoadLlamaLinearWeights(Reader, TFc0,
+      'adaln_single.emb.timestep_embedder.linear_1.weight', 256, d, 0, -1, 0,
+      'adaln_single.emb.timestep_embedder.linear_1.bias');
+    SwapSinCosInputColumns(TFc0, 256);
+    LoadLlamaLinearWeights(Reader, TFc2,
+      'adaln_single.emb.timestep_embedder.linear_2.weight', d, d, 0, -1, 0,
+      'adaln_single.emb.timestep_embedder.linear_2.bias');
+    // shared adaln_single.linear (d -> 6*d).
+    LoadLlamaLinearWeights(Reader, AdalnLin, 'adaln_single.linear.weight',
+      d, 6 * d, 0, -1, 0, 'adaln_single.linear.bias');
+    // caption_projection: linear_1 (t5 -> d), linear_2 (d -> d).
+    LoadLlamaLinearWeights(Reader, CapFc1, 'caption_projection.linear_1.weight',
+      Config.CaptionChannels, d, 0, -1, 0, 'caption_projection.linear_1.bias');
+    LoadLlamaLinearWeights(Reader, CapFc2, 'caption_projection.linear_2.weight',
+      d, d, 0, -1, 0, 'caption_projection.linear_2.bias');
+    // blocks.
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+    begin
+      p := 'transformer_blocks.' + IntToStr(BlockCnt) + '.';
+      // per-block scale_shift_table [6, d] -> the ChannelBias (1,1,6*d).
+      if not Reader.HasTensor(p + 'scale_shift_table') then
+        ImportError('PixArt import: missing tensor "' +
+          p + 'scale_shift_table".');
+      SST := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(p + 'scale_shift_table', SST);
+        if SST.Size <> 6 * d then
+          ImportError('PixArt import: "' + p + 'scale_shift_table" must have ' +
+            IntToStr(6 * d) + ' elements, got ' + IntToStr(SST.Size) + '.');
+        for k := 0 to 6 * d - 1 do
+          Blocks[BlockCnt].ScaleShift.Neurons[0].Weights.FData[k] := SST.FData[k];
+        Blocks[BlockCnt].ScaleShift.FlushWeightCache();
+      finally
+        SST.Free;
+      end;
+      LoadPixArtAttn(Reader, Blocks[BlockCnt].SelfAttn, p + 'attn1.', d);
+      LoadPixArtAttn(Reader, Blocks[BlockCnt].CrossAttn, p + 'attn2.', d);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Ff0,
+        p + 'ff.net.0.proj.weight', d, 2 * MlpHidden, 0, -1, 0,
+        p + 'ff.net.0.proj.bias');
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Ff2,
+        p + 'ff.net.2.weight', MlpHidden, d, 0, -1, 0, p + 'ff.net.2.bias');
+    end;
+    // final scale_shift_table [2, d] -> the ChannelBias (1,1,2*d).
+    if not Reader.HasTensor('scale_shift_table') then
+      ImportError('PixArt import: missing tensor "scale_shift_table".');
+    SST := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat('scale_shift_table', SST);
+      if SST.Size <> 2 * d then
+        ImportError('PixArt import: "scale_shift_table" must have ' +
+          IntToStr(2 * d) + ' elements, got ' + IntToStr(SST.Size) + '.');
+      for k := 0 to 2 * d - 1 do
+        FinalScaleShift.Neurons[0].Weights.FData[k] := SST.FData[k];
+      FinalScaleShift.FlushWeightCache();
+    finally
+      SST.Free;
+    end;
+    LoadLlamaLinearWeights(Reader, FinalLin, 'proj_out.weight',
+      d, Config.PatchSize * Config.PatchSize * Config.OutChannels,
+      0, -1, 0, 'proj_out.bias');
+    PermuteFinalLinPatchAxes(FinalLin, Config.PatchSize, Config.OutChannels);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildPixArtFromSafeTensorsEx(const FileName: string;
+  const Config: TPixArtConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildPixArt(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildPixArtFromSafeTensors(const FileName: string; TextSeqLen: integer;
+  out Config: TPixArtConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadPixArtConfigFromJSONFile(ConfigPath, TextSeqLen);
+  Result := BuildPixArtFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+function PixArtNthInput(Net: TNNet; N: integer): TNNetLayer;
+var
+  i, Cnt: integer;
+begin
+  Result := nil;
+  Cnt := 0;
+  for i := 0 to Net.CountLayers() - 1 do
+    if Net.Layers[i] is TNNetInput then
+    begin
+      if Cnt = N then begin Result := Net.Layers[i]; Exit; end;
+      Inc(Cnt);
+    end;
+  ImportError('PixArt: net has no TNNetInput #' + IntToStr(N) + '.');
+end;
+
+function PixArtTimestepInput(Net: TNNet): TNNetLayer;
+begin
+  Result := PixArtNthInput(Net, 1);
+end;
+
+function PixArtTextInput(Net: TNNet): TNNetLayer;
+begin
+  Result := PixArtNthInput(Net, 2);
+end;
+
+procedure PixArtConditioning(Net: TNNet; t: TNeuralFloat;
+  TextStates: TNNetVolume);
+begin
+  PixArtTimestepInput(Net).Output.FData[0] := t;
+  PixArtTextInput(Net).Output.CopyNoChecks(TextStates);
+end;
+
+procedure PixArtDenoise(Net: TNNet; const Config: TPixArtConfig;
+  Latent: TNNetVolume; t: TNeuralFloat; TextStates: TNNetVolume;
+  EpsOut: TNNetVolume);
+var
+  Output: TNNetVolume;
+  x, y, c: integer;
+begin
+  PixArtNthInput(Net, 0).Output.CopyNoChecks(Latent);
+  PixArtConditioning(Net, t, TextStates);
+  Net.Compute(PixArtNthInput(Net, 0).Output);
+  Output := Net.GetLastLayer().Output;
+  EpsOut.Resize(Config.SampleSize, Config.SampleSize, Config.InChannels);
+  for x := 0 to Config.SampleSize - 1 do
+    for y := 0 to Config.SampleSize - 1 do
       for c := 0 to Config.InChannels - 1 do
         EpsOut[x, y, c] := Output[x, y, c];
 end;
