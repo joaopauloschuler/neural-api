@@ -418,6 +418,99 @@ function EvaluateMMLU(NN: TNNet;
 function MMLUReport(const Stats: TNNetMMLUStats;
   const SubjectNames: array of string; ShotsK: integer): string;
 
+// ---------------------------------------------------------------------------
+// ARC / PIQA / WinoGrande - answer-letter / full-continuation scoring core
+// ---------------------------------------------------------------------------
+//
+// These three benchmarks are plain multiple-choice tasks scored EXACTLY like
+// HellaSwag/MMLU above: each item is a shared context plus N candidate answer
+// CONTINUATIONS, every candidate is scored with ScoreCompletion (per-choice
+// sequence log-likelihood), and the highest-scoring candidate is the
+// prediction. They therefore reuse TNNetMultipleChoiceItem /
+// EvaluateMultipleChoice wholesale - the only thing that differs per benchmark
+// is the candidate count and WHICH accuracy field is the lm-eval-harness
+// headline number:
+//
+//   * PIQA       - 2 choices (sol1 / sol2); headline = acc_norm (length-
+//                  normalized; goal+solution continuations vary in length).
+//   * WinoGrande - 2 choices (option1 / option2 substituted for the "_" blank);
+//                  headline = acc (lm-eval scores the SUFFIX after the blank,
+//                  so the continuations are equal length and acc == acc_norm in
+//                  practice; acc is reported as the canonical number).
+//   * ARC        - 4 labeled choices typically (some questions have 3 or 5);
+//                  headline = acc_norm. Each item just supplies its own
+//                  Candidates[] (variable length is fine - EvaluateMultipleChoice
+//                  scores per item, so a 3- or 5-choice item works unchanged).
+//
+// The caller tokenizes the context + each candidate continuation following the
+// benchmark's prompt convention (PIQA: "Goal: <goal>\nSolution: <sol>";
+// WinoGrande: the sentence with option substituted, scored over the suffix
+// after the blank; ARC: "Question: <q>\nAnswer: <choice text>"). These thin
+// wrappers forward to EvaluateMultipleChoice and exist so call sites read as
+// the benchmark they evaluate; the per-benchmark headline accuracy is the
+// documented field of the returned TNNetMultipleChoiceStats. Coded by Claude (AI).
+function EvaluateARC(NN: TNNet;
+  const Items: array of TNNetMultipleChoiceItem): TNNetMultipleChoiceStats;
+function EvaluatePIQA(NN: TNNet;
+  const Items: array of TNNetMultipleChoiceItem): TNNetMultipleChoiceStats;
+function EvaluateWinoGrande(NN: TNNet;
+  const Items: array of TNNetMultipleChoiceItem): TNNetMultipleChoiceStats;
+
+// Formats a TNNetMultipleChoiceStats into a small report (the *Report idiom).
+// Title heads the block (e.g. 'PIQA', 'ARC-Challenge'); HeadlineNorm selects
+// which line is annotated as the headline number (true = acc_norm, the
+// ARC/PIQA convention; false = acc, the WinoGrande convention).
+function MultipleChoiceReport(const Stats: TNNetMultipleChoiceStats;
+  const Title: string; HeadlineNorm: boolean): string;
+
+// ---------------------------------------------------------------------------
+// LAMBADA - last-word prediction accuracy (greedy reproduction)
+// ---------------------------------------------------------------------------
+//
+// LAMBADA (Paperno et al. 2016) measures whether a model, given a passage,
+// predicts the EXACT final word. This is NOT a likelihood ranking task: the
+// metric is greedy (argmax) reproduction of the target word token-by-token -
+// every token of the final word must be the model's argmax continuation of the
+// gold prefix (the standard lm-eval "acc" for lambada). FinalWordTokens is the
+// tokenization of the final word (one or more tokens); ContextTokens is the
+// passage up to but excluding the final word and MUST be non-empty (the first
+// final-word token is predicted from the last context position). Both the
+// argmax prediction path and the log-prob path go through the SAME forward used
+// by ScoreSequence, so the next-token-head reversed-prefix encoding is matched
+// automatically (a mismatch would pin accuracy at chance).
+type
+  TNNetLambadaExample = record
+    ContextTokens: TNeuralIntegerArray;   // passage minus the final word
+    FinalWordTokens: TNeuralIntegerArray; // tokens of the target final word
+  end;
+
+  // Aggregate LAMBADA result. Accuracy is the fraction of examples whose ENTIRE
+  // final word was reproduced greedily (all final-word tokens argmax-correct).
+  // Perplexity / MeanNLL are over the final-word tokens (teacher-forced), the
+  // commonly co-reported lambada perplexity.
+  TNNetLambadaStats = record
+    Accuracy: TNeuralFloat;      // CorrectCount / ItemCount
+    ItemCount: integer;
+    CorrectCount: integer;       // whole final word greedily reproduced
+    MeanNLL: TNeuralFloat;       // mean -ln p over final-word tokens
+    Perplexity: TNeuralFloat;    // exp(MeanNLL)
+    TokenCount: integer;         // final-word tokens scored (for perplexity)
+  end;
+
+// LAMBADA last-word accuracy harness. For every example the final word is
+// predicted token-by-token greedily (teacher-forced on the gold tokens): an
+// example counts correct only if EVERY final-word token is the model's argmax
+// next token. Also accumulates the teacher-forced NLL of the final-word tokens
+// for the co-reported last-word perplexity. LastWindow forwards to the scorer
+// (over-context passages score over the trailing window instead of raising).
+// Coded by Claude (AI).
+function EvaluateLAMBADA(NN: TNNet;
+  const Examples: array of TNNetLambadaExample;
+  LastWindow: boolean = false): TNNetLambadaStats;
+
+// Formats a TNNetLambadaStats into a small report (the *Report idiom).
+function LambadaReport(const Stats: TNNetLambadaStats): string;
+
 // Corpus-level BLEU (one reference per candidate; Candidates[i] is scored
 // against References[i]; both arrays must have the same length).
 function CorpusBLEU(const Candidates, References: array of TNeuralIntegerArray;
@@ -1170,6 +1263,236 @@ begin
       [Stats.MacroAccuracy, Stats.SubjectCount]));
     SL.Add(Format('  micro-average    : %.4f  (%d / %d pooled)',
       [Stats.MicroAccuracy, Stats.CorrectCount, Stats.ItemCount]));
+    Result := SL.Text;
+  finally
+    SL.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// ARC / PIQA / WinoGrande (multiple-choice wrappers over EvaluateMultipleChoice)
+// ---------------------------------------------------------------------------
+
+function EvaluateARC(NN: TNNet;
+  const Items: array of TNNetMultipleChoiceItem): TNNetMultipleChoiceStats;
+begin
+  // ARC: per-choice full-continuation log-likelihood; headline = acc_norm.
+  Result := EvaluateMultipleChoice(NN, Items);
+end;
+
+function EvaluatePIQA(NN: TNNet;
+  const Items: array of TNNetMultipleChoiceItem): TNNetMultipleChoiceStats;
+begin
+  // PIQA: 2 candidate solutions; headline = acc_norm (length-normalized).
+  Result := EvaluateMultipleChoice(NN, Items);
+end;
+
+function EvaluateWinoGrande(NN: TNNet;
+  const Items: array of TNNetMultipleChoiceItem): TNNetMultipleChoiceStats;
+begin
+  // WinoGrande: 2 substituted options scored over the suffix; headline = acc.
+  Result := EvaluateMultipleChoice(NN, Items);
+end;
+
+function MultipleChoiceReport(const Stats: TNNetMultipleChoiceStats;
+  const Title: string; HeadlineNorm: boolean): string;
+var
+  SL: TStringList;
+  AccLine, NormLine: string;
+begin
+  SL := TStringList.Create();
+  try
+    SL.Add(Format('%s multiple-choice accuracy', [Title]));
+    SL.Add(Format('  items scored : %d', [Stats.ItemCount]));
+    AccLine := Format('  acc          : %.4f  (%d / %d)',
+      [Stats.Accuracy, Stats.CorrectCount, Stats.ItemCount]);
+    NormLine := Format('  acc_norm     : %.4f  (%d / %d)',
+      [Stats.AccuracyNorm, Stats.CorrectNormCount, Stats.ItemCount]);
+    if HeadlineNorm then NormLine := NormLine + '  <- headline'
+    else AccLine := AccLine + '  <- headline';
+    SL.Add(AccLine);
+    SL.Add(NormLine);
+    Result := SL.Text;
+  finally
+    SL.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// LAMBADA last-word accuracy
+// ---------------------------------------------------------------------------
+
+// Internal: model's argmax next-token prediction for position Pos of Tokens
+// (conditioned on Tokens[0..Pos-1]). Mirrors the forward in ScoreSequenceFrom
+// EXACTLY - including the reversed-prefix encoding for single next-token heads -
+// so the greedy LAMBADA prediction matches the scorer's conditioning. Returns
+// -1 on a degenerate model / out-of-range Pos.
+function PredictArgmaxAt(NN: TNNet;
+  const Tokens: TNeuralIntegerArray; Pos: integer;
+  LastWindow: boolean): integer;
+var
+  InV: TNNetVolume;
+  Last: TNNetLayer;
+  Prefix: TNeuralIntegerArray;
+  ContextLen, InDepth, VocabSize, WinStart, WinLen, Row, D, Best: integer;
+  PerPosition, Overflows: boolean;
+  BestVal, V: TNeuralFloat;
+begin
+  Result := -1;
+  if NN = nil then Exit;
+  if NN.CountLayers() < 2 then Exit;
+  if (Pos < 1) or (Pos > High(Tokens)) then Exit;
+  ContextLen := NN.GetFirstLayer().Output.SizeX;
+  InDepth := NN.GetFirstLayer().Output.Depth;
+  Last := NN.GetLastLayer();
+  PerPosition := (ContextLen > 1) and (Last.Output.SizeX = ContextLen) and
+    (Last.Output.Depth >= 2);
+  if PerPosition
+  then VocabSize := Last.Output.Depth
+  else VocabSize := Last.Output.Size;
+  if VocabSize < 2 then Exit;
+  InV := TNNetVolume.Create(NN.GetFirstLayer().Output);
+  try
+    if PerPosition then
+    begin
+      // Window of context tokens [WinStart..Pos-1]; the row predicting Pos is
+      // the last row of that window (length-1). Over-context: trailing window.
+      WinStart := 0;
+      if Pos > ContextLen then
+      begin
+        if not LastWindow then
+          raise EArgumentException.CreateFmt(
+            'EvaluateLAMBADA: position %d exceeds the model context window %d',
+            [Pos, ContextLen]);
+        WinStart := Pos - ContextLen;
+      end;
+      WinLen := Pos - WinStart;                 // tokens [WinStart..Pos-1]
+      Prefix := Copy(Tokens, WinStart, WinLen);
+      InV.Fill(0);
+      if InDepth = 1
+      then InV.CopyNoChecksIntArr(Prefix)
+      else InV.OneHotEncoding(Prefix);
+      NN.Compute(InV);
+      Row := WinLen - 1;                         // row predicting token at Pos
+      Best := 0;
+      BestVal := Last.Output[Row, 0, 0];
+      for D := 1 to VocabSize - 1 do
+      begin
+        V := Last.Output[Row, 0, D];
+        if V > BestVal then begin BestVal := V; Best := D; end;
+      end;
+      Result := Best;
+    end
+    else
+    begin
+      // Single next-token head: reversed right-aligned prefix [WinStart..Pos-1].
+      WinStart := 0;
+      if Pos > ContextLen then
+      begin
+        if not LastWindow then
+          raise EArgumentException.CreateFmt(
+            'EvaluateLAMBADA: position %d exceeds the model context window %d',
+            [Pos, ContextLen]);
+        WinStart := Pos - ContextLen;
+      end;
+      Prefix := Copy(Tokens, WinStart, Pos - WinStart);
+      if InDepth = 1 then
+      begin
+        InV.Fill(0);
+        InV.CopyReversedNoChecksIntArr(Prefix);
+      end
+      else InV.OneHotEncodingReversed(Prefix);
+      NN.Compute(InV);
+      Best := 0;
+      BestVal := Last.Output.FData[0];
+      for D := 1 to VocabSize - 1 do
+      begin
+        V := Last.Output.FData[D];
+        if V > BestVal then begin BestVal := V; Best := D; end;
+      end;
+      Result := Best;
+    end;
+  finally
+    InV.Free;
+  end;
+  SetLength(Prefix, 0);
+end;
+
+function EvaluateLAMBADA(NN: TNNet;
+  const Examples: array of TNNetLambadaExample;
+  LastWindow: boolean): TNNetLambadaStats;
+var
+  ExIdx, CtxLen, WordLen, I, Pos, Pred: integer;
+  Full: TNeuralIntegerArray;
+  LogProbs: TNeuralFloatDynArr;
+  AllCorrect: boolean;
+  SumNLL: TNeuralFloat;
+begin
+  Result.Accuracy := 0;
+  Result.ItemCount := 0;
+  Result.CorrectCount := 0;
+  Result.MeanNLL := 0;
+  Result.Perplexity := 0;
+  Result.TokenCount := 0;
+  if NN = nil then Exit;
+  SumNLL := 0;
+  for ExIdx := 0 to High(Examples) do
+  begin
+    CtxLen := Length(Examples[ExIdx].ContextTokens);
+    WordLen := Length(Examples[ExIdx].FinalWordTokens);
+    if (CtxLen < 1) or (WordLen < 1) then continue;
+    // Build the full passage (context + gold final word). Greedy prediction is
+    // teacher-forced on the gold tokens: position CtxLen+i predicts the i-th
+    // final-word token from Full[0..CtxLen+i-1].
+    SetLength(Full, CtxLen + WordLen);
+    for I := 0 to CtxLen - 1 do Full[I] := Examples[ExIdx].ContextTokens[I];
+    for I := 0 to WordLen - 1 do
+      Full[CtxLen + I] := Examples[ExIdx].FinalWordTokens[I];
+    AllCorrect := true;
+    for I := 0 to WordLen - 1 do
+    begin
+      Pos := CtxLen + I;
+      Pred := PredictArgmaxAt(NN, Full, Pos, LastWindow);
+      if Pred <> Full[Pos] then
+      begin
+        AllCorrect := false;
+        break; // word is already wrong; remaining argmaxes don't matter
+      end;
+    end;
+    // Teacher-forced final-word NLL for the co-reported perplexity.
+    LogProbs := ScoreSequenceFrom(NN, Full, CtxLen, LastWindow);
+    if Length(LogProbs) = CtxLen + WordLen then
+      for I := CtxLen to CtxLen + WordLen - 1 do
+      begin
+        SumNLL := SumNLL - LogProbs[I];
+        Inc(Result.TokenCount);
+      end;
+    Inc(Result.ItemCount);
+    if AllCorrect then Inc(Result.CorrectCount);
+  end;
+  if Result.ItemCount > 0 then
+    Result.Accuracy := Result.CorrectCount / Result.ItemCount;
+  if Result.TokenCount > 0 then
+  begin
+    Result.MeanNLL := SumNLL / Result.TokenCount;
+    Result.Perplexity := Exp(Result.MeanNLL);
+  end;
+  SetLength(Full, 0);
+  SetLength(LogProbs, 0);
+end;
+
+function LambadaReport(const Stats: TNNetLambadaStats): string;
+var
+  SL: TStringList;
+begin
+  SL := TStringList.Create();
+  try
+    SL.Add('LAMBADA last-word accuracy (greedy reproduction)');
+    SL.Add(Format('  examples     : %d', [Stats.ItemCount]));
+    SL.Add(Format('  accuracy     : %.4f  (%d / %d)',
+      [Stats.Accuracy, Stats.CorrectCount, Stats.ItemCount]));
+    SL.Add(Format('  last-word PPL : %.4f  (mean NLL %.4f over %d tokens)',
+      [Stats.Perplexity, Stats.MeanNLL, Stats.TokenCount]));
     Result := SL.Text;
   finally
     SL.Free;

@@ -682,9 +682,6 @@ rather than acted on.
         KV-cache batch scoring instead of the per-question per-letter
         ScoreCompletion loop (acceptable for the smoke subset, slow at the full
         14k-question x 57-subject scale).
-  - [ ] LAMBADA last-word accuracy + ARC/PIQA/WinoGrande on the answer-letter
-        scoring core (separate benchmarks, same EvaluateMMLU /
-        EvaluateMultipleChoice machinery).
 - [ ] TinyStories reference-vs-from-scratch perplexity bake-off (follow-up
       to the landed, parity-verified roneneldan/TinyStories-1M import on
       the GPT-Neo route; the published pytorch_model.bin-only checkpoints

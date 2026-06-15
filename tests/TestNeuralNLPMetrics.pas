@@ -39,6 +39,13 @@ type
     // Analytic softmax log-prob of target Tgt in the row conditioned on
     // PrevId under SetLinearScorerWeights.
     function ExpectedRowLogProb(PrevId, Tgt: integer): TNeuralFloat;
+    // Deterministic "copy the previous token" next-token head for a char LM:
+    // neuron J reads ONLY input slot (X=0, depth=J) with a large weight. Under
+    // the reversed one-hot encoding slot 0 holds the MOST RECENT prefix token,
+    // so the argmax next token equals the last prefix token. If the prefix were
+    // NOT reversed the most-recent token would land at the wrong slot and the
+    // prediction would be constant - this pins the reversed-prefix encoding.
+    procedure SetCopyPreviousWeights(NN: TNNet);
   published
     // Identical candidate/reference -> BLEU exactly 1.0, smoothed or not.
     procedure TestBLEUIdenticalIsOne;
@@ -133,6 +140,13 @@ type
     procedure TestMMLUAnswerLetterArgmaxAndAggregation;
     // MMLUReport formatting contains the headline macro/micro lines.
     procedure TestMMLUReportFormatting;
+    // ARC/PIQA/WinoGrande reuse EvaluateMultipleChoice (acc vs acc_norm).
+    procedure TestARCPIQAWinoGrandeReuseMultipleChoiceCore;
+    procedure TestMultipleChoiceReportFormatting;
+    // LAMBADA greedy last-word reproduction (next-token-head reversed prefix).
+    procedure TestLambadaGreedyLastWordAccuracy;
+    procedure TestLambadaPerPositionHeadAndPerplexity;
+    procedure TestLambadaReportFormatting;
   end;
 
 implementation
@@ -217,6 +231,23 @@ begin
   for J := 0 to csVocab - 1 do
     SumExp := SumExp + Exp(0.02 * J * PrevId + 0.03 * J);
   Result := (0.02 * Tgt * PrevId + 0.03 * Tgt) - Ln(SumExp);
+end;
+
+procedure TTestNeuralNLPMetrics.SetCopyPreviousWeights(NN: TNNet);
+var
+  J: integer;
+  Head: TNNetLayer;
+begin
+  Head := NN.Layers[1]; // FullConnectLinear(Vocab) over (Context,1,Vocab) one-hot
+  for J := 0 to Head.Neurons.Count - 1 do
+  begin
+    Head.Neurons[J].Weights.Fill(0);
+    // Read only the most-recent (reversed slot 0) one-hot of token J.
+    Head.Neurons[J].Weights[0, 0, J] := 10.0;
+    Head.Neurons[J].BiasWeight := 0;
+  end;
+  NN.ClearDeltas();
+  NN.UpdateWeights();
 end;
 
 procedure TTestNeuralNLPMetrics.TestBLEUIdenticalIsOne;
@@ -1270,6 +1301,189 @@ begin
   AssertTrue('lists named subject', Pos('algebra', Report) > 0);
   AssertTrue('has macro-average line', Pos('macro-average', Report) > 0);
   AssertTrue('has micro-average line', Pos('micro-average', Report) > 0);
+end;
+
+procedure TTestNeuralNLPMetrics.TestARCPIQAWinoGrandeReuseMultipleChoiceCore;
+var
+  NN: TNNet;
+  Dict: TStringListInt;
+  Items: array of TNNetMultipleChoiceItem;
+  MCStats, ArcStats, PiqaStats, WinoStats: TNNetMultipleChoiceStats;
+  Head: TNNetLayer;
+  CatId, DogId, HatId: integer;
+  SumExp, LpCat, LpDog: TNeuralFloat;
+begin
+  // Same length-confounded fixture as TestMultipleChoiceAccVsAccNorm: the long
+  // gold candidate loses on acc (sum logprob) but wins on acc_norm (mean). This
+  // exercises the ARC/PIQA acc_norm headline vs the WinoGrande acc headline.
+  NN := BuildPerPositionLM(csCtx, csVocab);
+  Dict := BuildDict();
+  try
+    SetUniformBiases(NN, 0.0);
+    Head := NN.Layers[1];
+    CatId := Dict.WordToInteger('cat');
+    DogId := Dict.WordToInteger('dog');
+    HatId := Dict.WordToInteger('hat');
+    Head.Neurons[CatId].BiasWeight := 3.0;
+    Head.Neurons[DogId].BiasWeight := 2.6;
+    NN.ClearDeltas();
+    NN.UpdateWeights();
+    SumExp := Exp(3.0) + Exp(2.6) + (csVocab - 2) * Exp(0.0);
+    LpCat := 3.0 - Ln(SumExp);
+    LpDog := 2.6 - Ln(SumExp);
+    AssertTrue('fixture is length-confounded', (2 * LpCat < LpDog) and (LpDog < LpCat));
+    SetLength(Items, 2);
+    // ARC-style 3-choice item (variable choice count is fine per item).
+    Items[0].ContextTokens := TNeuralIntegerArray.Create(HatId);
+    SetLength(Items[0].Candidates, 3);
+    Items[0].Candidates[0] := TNeuralIntegerArray.Create(CatId, CatId); // gold (long)
+    Items[0].Candidates[1] := TNeuralIntegerArray.Create(DogId);
+    Items[0].Candidates[2] := TNeuralIntegerArray.Create(DogId, DogId);
+    Items[0].GoldIndex := 0;
+    // 2-choice item where gold wins both ways (PIQA/WinoGrande shape).
+    Items[1].ContextTokens := TNeuralIntegerArray.Create(HatId);
+    SetLength(Items[1].Candidates, 2);
+    Items[1].Candidates[0] := TNeuralIntegerArray.Create(CatId);
+    Items[1].Candidates[1] := TNeuralIntegerArray.Create(DogId);
+    Items[1].GoldIndex := 0;
+
+    MCStats := EvaluateMultipleChoice(NN, Items);
+    ArcStats := EvaluateARC(NN, Items);
+    PiqaStats := EvaluatePIQA(NN, Items);
+    WinoStats := EvaluateWinoGrande(NN, Items);
+
+    // The benchmark wrappers are EXACT pass-throughs to the shared core.
+    AssertEquals('ARC acc == core acc', MCStats.Accuracy, ArcStats.Accuracy, 1e-12);
+    AssertEquals('ARC acc_norm == core', MCStats.AccuracyNorm, ArcStats.AccuracyNorm, 1e-12);
+    AssertEquals('PIQA acc == core', MCStats.Accuracy, PiqaStats.Accuracy, 1e-12);
+    AssertEquals('PIQA acc_norm == core', MCStats.AccuracyNorm, PiqaStats.AccuracyNorm, 1e-12);
+    AssertEquals('Wino acc == core', MCStats.Accuracy, WinoStats.Accuracy, 1e-12);
+    AssertEquals('Wino acc_norm == core', MCStats.AccuracyNorm, WinoStats.AccuracyNorm, 1e-12);
+
+    // Headline semantics: acc misses the confounded item (0.5) but acc_norm hits
+    // both (1.0) - ARC/PIQA report acc_norm, WinoGrande reports acc.
+    AssertEquals('acc = 0.5 (confounded item missed)', 0.5, ArcStats.Accuracy, 1e-9);
+    AssertEquals('acc_norm = 1.0 (gold wins normalized)', 1.0, ArcStats.AccuracyNorm, 1e-9);
+    AssertEquals('two items scored', 2, ArcStats.ItemCount);
+  finally
+    Dict.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNLPMetrics.TestMultipleChoiceReportFormatting;
+var
+  Stats: TNNetMultipleChoiceStats;
+  ArcReport, WinoReport: string;
+begin
+  Stats.Accuracy := 0.4;
+  Stats.AccuracyNorm := 0.6;
+  Stats.ItemCount := 5;
+  Stats.CorrectCount := 2;
+  Stats.CorrectNormCount := 3;
+  ArcReport := MultipleChoiceReport(Stats, 'ARC-Challenge', true);
+  WinoReport := MultipleChoiceReport(Stats, 'WinoGrande', false);
+  AssertTrue('ARC report names benchmark', Pos('ARC-Challenge', ArcReport) > 0);
+  AssertTrue('ARC report has acc_norm line', Pos('acc_norm', ArcReport) > 0);
+  // The headline annotation tracks the convention (acc_norm for ARC, acc for Wino).
+  AssertTrue('ARC headline is on acc_norm',
+    Pos('acc_norm', ArcReport) < Pos('headline', ArcReport));
+  AssertTrue('Wino names benchmark', Pos('WinoGrande', WinoReport) > 0);
+  AssertTrue('Wino headline is on acc',
+    (Pos('headline', WinoReport) > 0) and
+    (Pos('headline', WinoReport) < Pos('acc_norm', WinoReport)));
+end;
+
+procedure TTestNeuralNLPMetrics.TestLambadaGreedyLastWordAccuracy;
+var
+  CharNN: TNNet;
+  Examples: array of TNNetLambadaExample;
+  Stats: TNNetLambadaStats;
+begin
+  // Single next-token head that COPIES the most-recent prefix token (via the
+  // reversed one-hot slot 0). So the greedy final-word prediction equals the
+  // last context token - LAMBADA is correct iff every final-word token equals
+  // the token immediately before it. This pins the reversed-prefix encoding:
+  // were it not reversed the prediction would be constant and accuracy chance.
+  CharNN := BuildCharLM(csCtx, csVocab);
+  try
+    SetCopyPreviousWeights(CharNN);
+    SetLength(Examples, 3);
+    // Ex0: context ends in token 7; final word [7] -> copy reproduces it (HIT).
+    Examples[0].ContextTokens := TNeuralIntegerArray.Create(2, 3, 7);
+    Examples[0].FinalWordTokens := TNeuralIntegerArray.Create(7);
+    // Ex1: context ends in 5; final word [9] -> copy predicts 5 != 9 (MISS).
+    Examples[1].ContextTokens := TNeuralIntegerArray.Create(4, 5);
+    Examples[1].FinalWordTokens := TNeuralIntegerArray.Create(9);
+    // Ex2: multi-token final word [8,8]: pos1 copies ctx-last 8 (ok), pos2 copies
+    // the gold 8 just placed (ok) -> whole word reproduced (HIT).
+    Examples[2].ContextTokens := TNeuralIntegerArray.Create(2, 8);
+    Examples[2].FinalWordTokens := TNeuralIntegerArray.Create(8, 8);
+
+    Stats := EvaluateLAMBADA(CharNN, Examples);
+    AssertEquals('three examples scored', 3, Stats.ItemCount);
+    AssertEquals('two greedy hits (ex0, ex2)', 2, Stats.CorrectCount);
+    AssertEquals('accuracy = 2/3', 2.0 / 3.0, Stats.Accuracy, 1e-9);
+    AssertTrue('not pinned at chance (reversed prefix matched)',
+      Stats.Accuracy > 0.5);
+  finally
+    CharNN.Free;
+  end;
+end;
+
+procedure TTestNeuralNLPMetrics.TestLambadaPerPositionHeadAndPerplexity;
+var
+  NN: TNNet;
+  Examples: array of TNNetLambadaExample;
+  Stats: TNNetLambadaStats;
+  ExpNLL: TNeuralFloat;
+begin
+  // Per-position monotone scorer: argmax next token is always the LARGEST id
+  // (csVocab-1 = 11) for a non-negative previous token. So a final word [11]
+  // is reproduced; any other final token misses. Perplexity is the analytic
+  // teacher-forced last-word NLL.
+  NN := BuildPerPositionLM(csCtx, csVocab);
+  try
+    SetLinearScorerWeights(NN);
+    SetLength(Examples, 2);
+    // Ex0: ctx ends in 6; final word [11] -> argmax is 11 (HIT).
+    Examples[0].ContextTokens := TNeuralIntegerArray.Create(2, 6);
+    Examples[0].FinalWordTokens := TNeuralIntegerArray.Create(csVocab - 1);
+    // Ex1: ctx ends in 7; final word [4] -> argmax is 11 != 4 (MISS).
+    Examples[1].ContextTokens := TNeuralIntegerArray.Create(2, 7);
+    Examples[1].FinalWordTokens := TNeuralIntegerArray.Create(4);
+
+    Stats := EvaluateLAMBADA(NN, Examples);
+    AssertEquals('two examples', 2, Stats.ItemCount);
+    AssertEquals('one greedy hit (the id-11 word)', 1, Stats.CorrectCount);
+    AssertEquals('accuracy = 0.5', 0.5, Stats.Accuracy, 1e-9);
+    AssertEquals('final-word tokens scored', 2, Stats.TokenCount);
+
+    // Perplexity: mean of -logprob over the two final tokens, analytic.
+    // Ex0 final token 11 conditioned on PrevId=6; Ex1 final token 4 on PrevId=7.
+    ExpNLL := (-ExpectedRowLogProb(6, csVocab - 1) - ExpectedRowLogProb(7, 4)) / 2;
+    AssertEquals('last-word mean NLL is analytic', ExpNLL, Stats.MeanNLL, 1e-4);
+    AssertEquals('perplexity = exp(meanNLL)', Exp(ExpNLL), Stats.Perplexity, 1e-3);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNLPMetrics.TestLambadaReportFormatting;
+var
+  Stats: TNNetLambadaStats;
+  Report: string;
+begin
+  Stats.Accuracy := 0.42;
+  Stats.ItemCount := 50;
+  Stats.CorrectCount := 21;
+  Stats.MeanNLL := 1.5;
+  Stats.Perplexity := Exp(1.5);
+  Stats.TokenCount := 70;
+  Report := LambadaReport(Stats);
+  AssertTrue('header mentions LAMBADA', Pos('LAMBADA', Report) > 0);
+  AssertTrue('has accuracy line', Pos('accuracy', Report) > 0);
+  AssertTrue('reports last-word perplexity', Pos('PPL', Report) > 0);
 end;
 
 initialization
