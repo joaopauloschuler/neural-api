@@ -48,3 +48,10 @@ CycleGAN/CycleGAN
 CycleGAN/*.o
 CycleGAN/*.ppr
 CycleGAN/cyclegan_sample.ppm
+
+# VQGAN: compiled VQ-GAN demo binary, build artifacts, sample image, run logs
+VQGAN/VQGAN
+VQGAN/*.o
+VQGAN/*.ppr
+VQGAN/vqgan_sample.ppm
+VQGAN/run*.txt
