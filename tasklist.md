@@ -1010,6 +1010,86 @@ rather than acted on.
       ray-marching + alpha-compositing primitive that any future 3-D / view-synthesis
       work (instant-NGP hash grids, 3D Gaussian splatting) would build on.
 
+- [ ] BEiT / data2vec-vision ViT importer (BuildBeitFromSafeTensors[Ex], e.g.
+      microsoft/beit-base-patch16-224, facebook/data2vec-vision-base). A genuinely
+      DISTINCT ViT backbone family from the landed plain ViT (absolute sin/learned
+      pos) and the landed Swin (windowed + cyclic-shift relative-position-bias):
+      BEiT uses FULL global attention with a SHARED per-head
+      `relative_position_bias_table` + relative-position index (no windowing, no
+      shift) added to every block's scores, PLUS LayerScale (`gamma_1`/`gamma_2`,
+      a.k.a. `lambda_1`) gating both residual branches, and pools via the cls token
+      (or mean) — there is NO absolute position embedding. The
+      relative-position-bias plumbing already exists for Swin and the LayerScale
+      loader already exists for ConvNeXt/DiT, so the new work is mainly the
+      non-windowed full-attention index table + the BEiT key remapping
+      (`beit.encoder.layer.N.attention.attention.{q,k,v}`,
+      `lambda_1`/`lambda_2`, `relative_position_bias.relative_position_bias_table`).
+      Unlocks a whole class of self-supervised image feature extractors (BEiT,
+      BEiTv2, data2vec-vision) that today cannot be loaded. Reuse the
+      preprocessor_config (image_mean/std, crop) path already in neuralpretrained;
+      pico-fixture parity per the established slicer pattern.
+
+- [ ] BLIP-2 Q-Former vision-language importer (BuildBlip2QFormerFromSafeTensors[Ex]
+      + BuildBlip2FromSafeTensors, e.g. Salesforce/blip2-opt-2.7b). The landed VLM
+      bridges (LLaVA `BuildLlavaProjector`, the SigLIP/CLIP towers) are simple
+      linear/MLP projectors from a frozen vision tower into an LLM; BLIP-2's
+      Q-Former is a genuinely DIFFERENT bridging module worth its own builder: a
+      small BERT-style transformer fed a fixed set of LEARNED query tokens
+      (`query_tokens`, e.g. 32) that, in each block, self-attend among themselves
+      AND cross-attend (`crossattention`) into the frozen ViT patch features, then
+      project the resulting query embeddings into the LLM token space. New code is
+      the query-token soft-prompt (reuse TNNetSoftPrompt) + the interleaved
+      self/cross-attention Q-Former block (reuse the landed two-source
+      cross-attention wiring) + the OPT/LLM decode tail (Build* already exists).
+      Establishes the querying-transformer primitive shared by InstructBLIP and
+      many later VLMs. Scope v1 to image-conditioned text generation on a pico
+      fixture; keep the ViT + LLM frozen.
+
+- [ ] DepthPro (Apple ml-depth-pro) sharp metric monocular-depth importer
+      (BuildDepthProFromSafeTensors[Ex], apple/DepthPro). DISTINCT from the landed
+      DPT and Depth-Anything importers, which produce RELATIVE/affine-invariant
+      depth at a single patch scale: DepthPro is a MULTI-SCALE patch-ViT that runs a
+      shared ViT (reuse the landed DINOv2/ViT tower) over the image at several
+      resolutions, splits each into overlapping 384px patches, then fuses the
+      per-scale patch features through a DPT-style convolutional decoder to emit a
+      high-resolution METRIC depth map (plus a focal-length head for true scale).
+      The genuinely new code is the image->patch tiling + per-scale feature
+      stitching/merge and the metric (not normalized) depth head; the ViT encoder
+      and the DPT fusion-block decoder are already landed and reusable. Real value:
+      first sharp, boundary-accurate, metric-depth model in the tree. Pico-fixture
+      smoke + a real-checkpoint parity follow-up.
+
+- [ ] Latent Consistency Model (LCM) few-step sampler in neuraldiffusion.pas
+      (TNNetLCMScheduler / LCMSample). The landed diffusion samplers (DDIM,
+      DPM-Solver++(2M), Euler/Euler-ancestral, Karras spacing) are all ITERATIVE
+      noise-prediction integrators needing ~20-50 steps and CFG-in-the-loop; an LCM
+      sampler is a genuinely different inference rule — it evaluates a learned
+      CONSISTENCY function f(x_t, t) that maps any noised latent directly toward the
+      solution, so generation is 1-4 steps with guidance baked in (no
+      cond/uncond double pass per step). New code is the consistency
+      parameterization (c_skip/c_out boundary scalings) + the multistep LCM loop
+      (predict x0, re-noise to the next, fewer timesteps from the
+      already-landed TNNetDiffusionScheduler timestep table). Wire it as an opt-in
+      sampler into the LatentTextToImage pipeline so the landed PixArt/DiT + VAE can
+      render in a handful of steps. A short note on the matching LCM-distillation
+      objective (consistency loss to a teacher) is enough for v1 — sampler first.
+
+- [ ] RT-DETR real-time detection-transformer importer
+      (BuildRtDetrFromSafeTensors[Ex], e.g. PekingU/rtdetr_r50vd). A DISTINCT
+      detection model family from the landed DETR (ResNet+sinusoidal+vanilla
+      transformer decoder, the slow NMS-free baseline): RT-DETR is the real-time
+      redesign — a CNN backbone (reuse the landed ResNet) feeding an EFFICIENT
+      HYBRID ENCODER (intra-scale single-layer self-attention "AIFI" on the top
+      feature map only + a CNN cross-scale fusion / PANet-style neck) and an
+      IoU-AWARE / uncertainty-minimal QUERY SELECTION that seeds the decoder from
+      the top-K encoder proposals instead of fixed learned object queries. The new
+      code is the hybrid-encoder neck (AIFI block + CCFM up/down conv fusion) and
+      the top-K query-selection head; the transformer decoder, box/class heads, and
+      the DETR-style post-process can be reused from the landed DETR. Real value:
+      the first real-time / production-grade detector importer (DETR is reference,
+      not deployable speed). Pico-fixture smoke + a real-checkpoint top-1/box
+      parity follow-up via the structured-vision detection eval harness.
+
 ## Layer follow-ups that fix real limitations
 
 (The sub-quadratic / chunked-forward family below is one coherent systems effort:
