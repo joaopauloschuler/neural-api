@@ -894,6 +894,62 @@ rather than acted on.
         per-pixel broadcast noise for real stochastic synthesis).
   - [ ] real stylegan2 checkpoint (NVIDIA .pkl / a rosinality safetensors) parity once
         obtainable; the training path (discriminator + path-length reg) and StyleGAN3.
+- [ ] TNNetFlowWarp dense flow-field backward-warp primitive — the repo has
+      TNNetAffineGridSample (a single global 2x3 affine theta -> sampling grid) but
+      NO per-pixel DENSE flow warp: given a feature map and a two-channel (dx, dy)
+      flow field of the same spatial size, produce the bilinearly-sampled
+      backward-warped output `out(x,y) = in(x+dx, y+dy)`. This is the genuinely new
+      sampling layer that the open RAFT optical-flow task names ("warps one tiny
+      frame toward the next") and that the FrameInterpolation example below needs;
+      it is the dense-field sibling of the landed DeformableConv bilinear sampler
+      and the parametric TNNetAffineGridSample. Two sources (main features +
+      flow-field source, wired like TNNetCrossAttention/TNNetAffineGridSample),
+      full input numerical-gradient coverage in TestNeuralNumerical.pas for BOTH the
+      sampled-features gradient and the flow-field gradient (the bilinear weights are
+      differentiable in dx/dy), edge handling = border-clamp. Unblocks frame
+      interpolation, optical-flow warping, and any future video-stabilization work.
+- [ ] examples/FrameInterpolation — video FRAME INTERPOLATION (predict the MIDDLE
+      frame between two given frames), structurally distinct from the landed
+      examples/VideoPrediction (next-frame EXTRAPOLATION via TNNetConvLSTMCell) and
+      from every image-generation example: the input is two endpoint frames and the
+      target is the unseen in-between frame (the RIFE/FILM task). Scope v1 to the
+      same self-contained synthetic Moving-MNIST-style blob data already used by
+      VideoPrediction (no download): feed frames t and t+2, supervise on t+1 with an
+      L1 + landed-SSIM reconstruction loss. Two CPU-friendly model variants worth
+      comparing: (a) a direct conv encoder-decoder that synthesizes the middle frame,
+      and (b) a flow-based path that predicts a mid->endpoints flow field and warps
+      both frames via the new TNNetFlowWarp primitive, then blends — the textbook
+      illustration of why warping beats direct synthesis for motion. Writes
+      before/predicted/after triplets; edit examples/README.md (NOT the main README).
+- [ ] MMDiT (Stable Diffusion 3 / FLUX.1) text-to-image transformer importer
+      (BuildMMDiTFromSafeTensors, e.g. stabilityai/stable-diffusion-3-medium or a
+      small Flux-schnell config) — the DUAL-STREAM joint-attention DiT, architecturally
+      DISTINCT from the landed class-conditional DiT (BuildDiTFromSafeTensors) and the
+      tracked single-stream cross-attention PixArt-alpha. The genuinely new piece is the
+      MMDiT block: image tokens and text tokens carry SEPARATE per-stream
+      projections/MLPs/adaLN modulations but are CONCATENATED for ONE JOINT
+      self-attention pass (text and image attend to each other symmetrically), then
+      split back — not the image->text CROSS-attention of PixArt. Everything else is
+      landed: patch embed, the T5 + CLIP prompt towers (BuildT5/BuildClip), the VAE
+      decoder (BuildVaeDecoderFromSafeTensors), and a RECTIFIED-FLOW Euler sampler
+      (the examples/FlowMatching velocity-field loop). Scope v1 to inference on one
+      denoise step. The cheapest path to a REAL modern text-to-image checkpoint and a
+      second route (besides the tracked PixArt) to the LatentTextToImage capstone with
+      NO SD UNet. Pico parity vs a diffusers float64 oracle on one block's joint-attention
+      output + reuse make_pico_*_fixture.py.
+- [ ] PaliGemma vision-language importer (BuildPaliGemmaFromSafeTensors, e.g.
+      google/paligemma-3b-mix-224) — a VLM follow-up that exercises a genuinely
+      DIFFERENT attention regime from the tracked causal LLaVA path: PaliGemma is a
+      PREFIX-LM, the image tokens AND the prompt tokens see each other with FULL
+      BIDIRECTIONAL attention (a block-bidirectional mask over the prefix) and only the
+      generated suffix is causal. The new code is that prefix-LM attention-mask wiring
+      threaded through the decoder; nearly everything else is landed — the SigLIP tower
+      (BuildSigLIPVisionTower), the Gemma decoder (BuildGemmaFromSafeTensors), and the
+      linear multimodal projector + image-token splice are exactly the LLaVA
+      prompt-assembly helper (so this depends on / shares that helper). Distinct from
+      LLaVA's causal-everywhere mask and from the open Qwen2-VL M-RoPE path. Pico parity
+      vs HF float64 on next-token logits for a mixed image+text prompt + an
+      examples/PaliGemmaCaption that captions a tiny image on CPU (ulimit-bounded).
 
 ## Layer follow-ups that fix real limitations
 
