@@ -50,7 +50,7 @@ uses
   {$ENDIF}
   Classes, SysUtils, math, syncobjs, neuralvolume, neuralgeneric,
   neuralbyteprediction, neuralcache, neuralab,
-  pascoremath32;
+  pascoremath32, pascoremathhelperfuncs;
 
 const
   csMaxInterleavedSize: integer = 95;
@@ -18367,7 +18367,7 @@ begin
         sp := pcr_expf(ax)
       else
         sp := Ln(1 + pcr_expf(ax));
-      FOutput.FData[i] := x * Tanh(sp);
+      FOutput.FData[i] := x * pcr_tanhf(sp);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -18607,8 +18607,8 @@ begin
         s := 1 / (1 + Exp(-x))
       else
         s := Exp(x) / (1 + Exp(x));
-      L := Ln(1 + s);
-      t := Tanh(L);
+      L := pcr_logf(1 + s);
+      t := pcr_tanhf(L);
       FOutput.FData[OutputCnt] := x * t;
       dL := s * (1 - s) / (1 + s);
       FOutputErrorDeriv.FData[OutputCnt] := t + x * (1 - t * t) * dL;
@@ -18624,7 +18624,7 @@ begin
         s := 1 / (1 + Exp(-x))
       else
         s := Exp(x) / (1 + Exp(x));
-      FOutput.FData[OutputCnt] := x * Tanh(Ln(1 + s));
+      FOutput.FData[OutputCnt] := x * pcr_tanhf(pcr_logf(1 + s));
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -18682,7 +18682,7 @@ begin
       else
       begin
         expX := Exp(x);
-        tanhExpX := Tanh(expX);
+        tanhExpX := pcr_tanhf(expX);
         FOutput.FData[OutputCnt] := x * tanhExpX;
         FOutputErrorDeriv.FData[OutputCnt] :=
           tanhExpX + x * (1 - tanhExpX * tanhExpX) * expX;
@@ -18700,7 +18700,7 @@ begin
       else if x < -20 then
         FOutput.FData[OutputCnt] := 0
       else
-        FOutput.FData[OutputCnt] := x * Tanh(Exp(x));
+        FOutput.FData[OutputCnt] := x * pcr_tanhf(Exp(x));
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -20180,7 +20180,7 @@ begin
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
-      TanhVal := Tanh(LocalPrevOutput.FData[OutputCnt] * InvCap);
+      TanhVal := pcr_tanhf(LocalPrevOutput.FData[OutputCnt] * InvCap);
       OutVal := Cap * TanhVal;
       FOutput.FData[OutputCnt] := OutVal;
       // dy/dx = 1 - tanh(x/c)^2
@@ -20191,7 +20191,7 @@ begin
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
-      TanhVal := Tanh(LocalPrevOutput.FData[OutputCnt] * InvCap);
+      TanhVal := pcr_tanhf(LocalPrevOutput.FData[OutputCnt] * InvCap);
       FOutput.FData[OutputCnt] := Cap * TanhVal;
     end;
   end;
@@ -20281,7 +20281,7 @@ begin
   for Idx := 0 to SizeM1 do
   begin
     V := FOutputError.FData[Idx];
-    FOutputError.FData[Idx] := Tanh(V);
+    FOutputError.FData[Idx] := pcr_tanhf(V);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
@@ -20319,7 +20319,7 @@ begin
   for Idx := 0 to SizeM1 do
   begin
     V := FOutputError.FData[Idx];
-    FOutputError.FData[Idx] := V / Sqrt(V * V + EpsSq);
+    FOutputError.FData[Idx] := V / pcr_sqrtf(V * V + EpsSq);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
@@ -20863,7 +20863,7 @@ begin
     else if P > 1.0 then P := 1.0;
     PNorm := Gn / GeoSum;            // renormalised geometric prior at step Idx
     if PNorm < cEps then PNorm := cEps;
-    FOutputError.FData[Idx] := Ln(P) - Ln(PNorm) + 1.0;
+    FOutputError.FData[Idx] := pcr_logf(P) - pcr_logf(PNorm) + 1.0;
     Gn := Gn * (1.0 - Prior);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -28137,7 +28137,7 @@ begin
           g := g + wm * wm;
         end;
       end;
-    if FDemodulate then FDemodScale.FData[o] := 1.0 / Sqrt(g + cDemodEps)
+    if FDemodulate then FDemodScale.FData[o] := 1.0 / pcr_sqrtf(g + cDemodEps)
     else FDemodScale.FData[o] := 1.0;
     if FDemodulate then
       for i := 0 to tapsPerOut - 1 do
@@ -31890,7 +31890,7 @@ begin
       begin
         x := LocalPrevOutput.FData[OutputCnt];
         // y = -ln(1 - alpha*(x + alpha)) / alpha; argument must stay > 0.
-        FOutput.FData[OutputCnt] := -Ln(1 - Alpha * (x + Alpha)) * InvAlpha;
+        FOutput.FData[OutputCnt] := -pcr_logf(1 - Alpha * (x + Alpha)) * InvAlpha;
         FOutputErrorDeriv.FData[OutputCnt] := 1 / (1 - Alpha * (Alpha + x));
       end;
     end
@@ -32301,7 +32301,7 @@ begin
     begin
       x := LocalPrevOutput.FData[OutputCnt];
       if x < SQRT_EPS then x := SQRT_EPS;
-      FOutput.FData[OutputCnt] := Sqrt(x);
+      FOutput.FData[OutputCnt] := pcr_sqrtf(x);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -35241,7 +35241,7 @@ begin
         StyleVar := StyleVar + Sqr(StyleOut[CntX, CntY, C] - StyleMean);
     StyleVar := StyleVar / StyleM;
     FStyleMean.FData[C] := StyleMean;
-    FStyleStd.FData[C] := Sqrt(StyleVar + FAdaEpsilon);
+    FStyleStd.FData[C] := pcr_sqrtf(StyleVar + FAdaEpsilon);
     // out = style_std * (content - content_mean) * inv_content_std + style_mean
     for CntX := 0 to ContentOut.SizeX - 1 do
       for CntY := 0 to ContentOut.SizeY - 1 do
@@ -36151,8 +36151,8 @@ begin
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
-      FOutput.FData[OutputCnt] := Power(LocalPrevOutput.FData[OutputCnt], FPower);
-      FOutputErrorDeriv.FData[OutputCnt] := FPower*Power(LocalPrevOutput.FData[OutputCnt], FPower-1);
+      FOutput.FData[OutputCnt] := pcr_powf(LocalPrevOutput.FData[OutputCnt], FPower);
+      FOutputErrorDeriv.FData[OutputCnt] := FPower*pcr_powf(LocalPrevOutput.FData[OutputCnt], FPower-1);
     end;
   end
   else
@@ -36160,7 +36160,7 @@ begin
     // can't calculate error on input layers.
     for OutputCnt := 0 to SizeM1 do
     begin
-      FOutput.FData[OutputCnt] := Power(LocalPrevOutput.FData[OutputCnt], FPower);
+      FOutput.FData[OutputCnt] := pcr_powf(LocalPrevOutput.FData[OutputCnt], FPower);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -36315,7 +36315,7 @@ begin
     begin
       if LocalPrevOutput.FData[OutputCnt] > 0 then
       begin
-        VSqrt := Sqrt(LocalPrevOutput.FData[OutputCnt]);
+        VSqrt := pcr_sqrtf(LocalPrevOutput.FData[OutputCnt]);
         FOutput.FData[OutputCnt] := VSqrt;
         FOutputErrorDeriv.FData[OutputCnt] := 1/(2*VSqrt);
       end
@@ -36333,7 +36333,7 @@ begin
     begin
       if LocalPrevOutput.FData[OutputCnt]>0 then
       begin
-        FOutput.FData[OutputCnt] := Sqrt(LocalPrevOutput.FData[OutputCnt]);
+        FOutput.FData[OutputCnt] := pcr_sqrtf(LocalPrevOutput.FData[OutputCnt]);
       end
       else
       begin
@@ -41500,11 +41500,11 @@ begin
   // Q,R = softplus(raw) > 0 (numerically stable form via Ln(1+Exp)).
   for d := 0 to Depth - 1 do
   begin
-    FA.FData[d] := TanH(Wa.FData[d]);
+    FA.FData[d] := pcr_tanhf(Wa.FData[d]);
     raw := Wq.FData[d];
-    if raw > 30 then FQ.FData[d] := raw else FQ.FData[d] := Ln(1 + Exp(raw));
+    if raw > 30 then FQ.FData[d] := raw else FQ.FData[d] := pcr_logf(1 + Exp(raw));
     raw := Wr.FData[d];
-    if raw > 30 then FR.FData[d] := raw else FR.FData[d] := Ln(1 + Exp(raw));
+    if raw > 30 then FR.FData[d] := raw else FR.FData[d] := pcr_logf(1 + Exp(raw));
   end;
   // Per-channel scalar two-phase Kalman recurrence. x_0=0, P_0=1.
   for d := 0 to Depth - 1 do
@@ -41567,11 +41567,11 @@ begin
   // Recompute constrained params (same map as Compute).
   for d := 0 to Depth - 1 do
   begin
-    FA.FData[d] := TanH(Wa.FData[d]);
+    FA.FData[d] := pcr_tanhf(Wa.FData[d]);
     if Wq.FData[d] > 30 then FQ.FData[d] := Wq.FData[d]
-    else FQ.FData[d] := Ln(1 + Exp(Wq.FData[d]));
+    else FQ.FData[d] := pcr_logf(1 + Exp(Wq.FData[d]));
     if Wr.FData[d] > 30 then FR.FData[d] := Wr.FData[d]
-    else FR.FData[d] := Ln(1 + Exp(Wr.FData[d]));
+    else FR.FData[d] := pcr_logf(1 + Exp(Wr.FData[d]));
   end;
   FGradA.Fill(0);
   FGradQ.Fill(0);
@@ -41771,7 +41771,7 @@ begin
   for d := 0 to C - 1 do
   begin
     raw := Ww.FData[d];
-    if raw > 30 then FW.FData[d] := raw else FW.FData[d] := Ln(1 + Exp(raw));
+    if raw > 30 then FW.FData[d] := raw else FW.FData[d] := pcr_logf(1 + Exp(raw));
   end;
   // Numerically-stabilised RWKV-v4 WKV recurrence per channel (a_-1=b_-1=0).
   // Stabilised state (A,B,Q): true a = A*e^Q, b = B*e^Q. We additionally cache
@@ -41847,7 +41847,7 @@ begin
   for d := 0 to C - 1 do
   begin
     if Ww.FData[d] > 30 then FW.FData[d] := Ww.FData[d]
-    else FW.FData[d] := Ln(1 + Exp(Ww.FData[d]));
+    else FW.FData[d] := pcr_logf(1 + Exp(Ww.FData[d]));
   end;
   for d := 0 to C - 1 do
   begin
@@ -41983,7 +41983,7 @@ begin
   for d := 0 to C - 1 do
   begin
     if Ww.FData[d] > 30 then FW.FData[d] := Ww.FData[d]
-    else FW.FData[d] := Ln(1 + Exp(Ww.FData[d]));
+    else FW.FData[d] := pcr_logf(1 + Exp(Ww.FData[d]));
   end;
   FGradW.Fill(0);
   FGradU.Fill(0);
@@ -42700,7 +42700,7 @@ begin
   for d := 0 to C - 1 do
   begin
     raw := Ww.FData[d];
-    if raw > 30 then FW.FData[d] := raw else FW.FData[d] := Ln(1 + Exp(raw));
+    if raw > 30 then FW.FData[d] := raw else FW.FData[d] := pcr_logf(1 + Exp(raw));
   end;
   // Numerically-stabilised RWKV-v4 WKV recurrence per channel (a_-1=b_-1=0),
   // k|v read from source B, then receptance-gated by sigmoid(r) from source A.
@@ -42773,7 +42773,7 @@ begin
   for d := 0 to C - 1 do
   begin
     raw := Ww.FData[d];
-    if raw > 30 then FW.FData[d] := raw else FW.FData[d] := Ln(1 + Exp(raw));
+    if raw > 30 then FW.FData[d] := raw else FW.FData[d] := pcr_logf(1 + Exp(raw));
   end;
   for d := 0 to C - 1 do
   begin
@@ -42853,7 +42853,7 @@ begin
   for d := 0 to C - 1 do
   begin
     if Ww.FData[d] > 30 then FW.FData[d] := Ww.FData[d]
-    else FW.FData[d] := Ln(1 + Exp(Ww.FData[d]));
+    else FW.FData[d] := pcr_logf(1 + Exp(Ww.FData[d]));
   end;
   FGradW.Fill(0);
   FGradU.Fill(0);
@@ -42988,7 +42988,7 @@ begin
   for d := 0 to C - 1 do
   begin
     if Ww.FData[d] > 30 then FW.FData[d] := Ww.FData[d]
-    else FW.FData[d] := Ln(1 + Exp(Ww.FData[d]));
+    else FW.FData[d] := pcr_logf(1 + Exp(Ww.FData[d]));
   end;
   FGradW.Fill(0);
   for d := 0 to C - 1 do
@@ -49815,7 +49815,7 @@ begin
       for j := 0 to FHidden - 1 do
         s := s + W2[c, 0, j] * FAct[p, 0, j];
       FBaseV[p, 0, c] := s;
-      sp := Ln(1 + Exp(-Abs(WLog.FData[c]))) + Max(WLog.FData[c], 0); // softplus, stable
+      sp := pcr_logf(1 + Exp(-Abs(WLog.FData[c]))) + Max(WLog.FData[c], 0); // softplus, stable
       dec := Exp(-sp * pn);
       FDecayV[p, 0, c] := dec;
       FFilter[p, 0, c] := s * dec;
@@ -63500,8 +63500,8 @@ begin
     for j := 0 to Din - 1 do
       acc := acc + W.FData[base + j] * PrevOut.FData[j];
     FCacheProj.FData[k] := acc;
-    FOutput.FData[k]     := FScale * Cos(acc);  // cos channels 0..D-1
-    FOutput.FData[D + k] := FScale * Sin(acc);  // sin channels D..2D-1
+    FOutput.FData[k]     := FScale * pcr_cosf(acc);  // cos channels 0..D-1
+    FOutput.FData[D + k] := FScale * pcr_sinf(acc);  // sin channels D..2D-1
   end;
 end;
 
@@ -63544,7 +63544,7 @@ begin
   for k := 0 to D - 1 do
   begin
     z := FCacheProj.FData[k];
-    dz := sc * (-Sin(z) * FOutputError.FData[k] + Cos(z) * FOutputError.FData[D + k]);
+    dz := sc * (-pcr_sinf(z) * FOutputError.FData[k] + pcr_cosf(z) * FOutputError.FData[D + k]);
     base := k * Din;
     if HasPrevError then
       for j := 0 to Din - 1 do
@@ -65684,7 +65684,7 @@ begin
     acc := 0;
     for i := 0 to FInDim - 1 do
     begin
-      u := Tanh(PrevOut.FData[i]);
+      u := pcr_tanhf(PrevOut.FData[i]);
       // Chebyshev T_k(u) recurrence.
       FT[0] := 1;
       if FDegree >= 1 then FT[1] := u;
@@ -65732,7 +65732,7 @@ begin
     Delta := FArrNeurons[j].FDelta;
     for i := 0 to FInDim - 1 do
     begin
-      u := Tanh(PrevOut.FData[i]);
+      u := pcr_tanhf(PrevOut.FData[i]);
       FT[0] := 1;
       if FDegree >= 1 then FT[1] := u;
       for k := 2 to FDegree do FT[k] := 2 * u * FT[k - 1] - FT[k - 2];
@@ -65763,7 +65763,7 @@ begin
   SetLength(Tderiv, FDegree + 1);
   for i := 0 to FInDim - 1 do
   begin
-    u := Tanh(PrevOut.FData[i]);
+    u := pcr_tanhf(PrevOut.FData[i]);
     dudx := 1 - u * u;
     // T_k'(u) = k * U_{k-1}(u). FU2 holds U_0..U_{K-1}; U_{-1}=0 so T_0'=0.
     FU2[0] := 1;

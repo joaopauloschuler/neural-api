@@ -41,7 +41,7 @@ unit neuralvolume;
 
 interface
 
-uses {$IFDEF FPC}fgl,{$ELSE}Contnrs,Generics.Collections,{$ENDIF} classes, sysutils, pascoremath32;
+uses {$IFDEF FPC}fgl,{$ELSE}Contnrs,Generics.Collections,{$ENDIF} classes, sysutils, pascoremath32, pascoremathhelperfuncs;
 
 {$include neuralnetwork.inc}
 
@@ -5220,7 +5220,7 @@ var
 begin
   vHigh := High(FData);
   for I := 0 to vHigh do
-    FData[I] := Sqrt(FData[I]);
+    FData[I] := pcr_sqrtf(FData[I]);
 end;
 
 procedure TVolume.MulAdd(Value: T; Original: TVolume);
@@ -6670,7 +6670,7 @@ begin
     for I := 0 to vHigh do
     begin
       if FData[I] > 0 then // To avoid log(0) which is undefined
-        vSum := vSum + (FData[i] * log2(FData[i]));
+        vSum := vSum + (FData[i] * pcr_log2f(FData[i]));
     end;
   end;
   Result := -vSum;
