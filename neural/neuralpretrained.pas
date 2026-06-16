@@ -4018,6 +4018,8 @@ type
   TEnCodecConv = record
     InCh, OutCh, Kernel, Stride, Dilation: integer;
     Transpose: boolean;
+    Groups: integer;            // conv groups (1 unless Mimi grouped up/down)
+    PadMode: string;            // 'reflect' (EnCodec) / 'constant' / 'replicate'
     W: array of TNeuralFloat;   // flat [OutCh, InCh, Kernel] row-major
     B: array of TNeuralFloat;   // [OutCh]
   end;
@@ -4103,6 +4105,141 @@ function BuildEnCodecFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
 function BuildEnCodecFromSafeTensors(const FileName: string;
   out Config: TEnCodecConfig;
   const ConfigFileName: string = ''): TEnCodecModel;
+
+// ---------------------------------------------------------------------------
+// MIMI STREAMING NEURAL CODEC IMPORT (model_type "mimi", e.g. kyutai/mimi) -
+// the 12.5 Hz neural audio tokenizer behind Moshi / Kyutai-TTS / Sesame CSM.
+// Mimi extends the EnCodec convolutional SEANet + RVQ topology (reused here
+// verbatim: causal Conv1d, ConvTranspose1d, ELU residual blocks, codebook
+// lookup/residual) with TWO genuinely new pieces:
+//
+//  1. a small CAUSAL TRANSFORMER bottleneck (RoPE self-attention + GELU MLP,
+//     pre-norm with per-channel LayerScale residuals) inserted AFTER the conv
+//     encoder and BEFORE the conv decoder, plus a strided downsample Conv1d /
+//     grouped ConvTranspose1d upsample to step the 2*frame_rate "encodec"
+//     frame rate down to the 12.5 Hz Mimi frame rate and back;
+//  2. a SPLIT residual vector quantizer: a "semantic" RVQ (the first
+//     num_semantic_quantizers codebooks, distilled at train time, here just a
+//     nearest-centroid lookup) concatenated with an "acoustic" RVQ (the rest).
+//     Each RVQ owns its 1x1 input_proj / output_proj convs, and each codebook
+//     stores embed_sum + cluster_usage; the effective centroid is
+//     embed_sum / clamp(cluster_usage, eps).
+//
+// Differences from EnCodec the importer must honour: pad_mode is "constant"
+// (zero left-pad, not reflect), conv weights are PLAIN .conv.weight (no
+// weight_norm parametrization), there is NO LSTM, the downsample conv pads in
+// "replicate" mode, and the codebook is the embed_sum/cluster_usage pair.
+// v1 is INFERENCE-ONLY (waveform -> codes -> waveform); real-checkpoint parity
+// and the streaming chunk-at-a-time padding cache are documented follow-ups.
+// Implemented as a self-contained channel-major holder (TNNetMimi) doing the
+// conv / transformer / RVQ math directly, mirroring TEnCodecModel.
+// Coded by Claude (AI).
+// ---------------------------------------------------------------------------
+type
+  // Mimi carries its channel-major signal in DOUBLE precision (the conv +
+  // high-gain transformer + conv pipeline is deep enough that the library's
+  // single-precision storage would drift past the 1e-4 parity gate). Weights
+  // stay single (exact F32 checkpoint values); only accumulation is double.
+  TMimiDblArr = array of double;
+  TMimiDblArr2D = array of TMimiDblArr;
+
+  TMimiConfig = record
+    SamplingRate: integer;       // sampling_rate (24000)
+    FrameRate: TNeuralFloat;     // frame_rate (12.5)
+    EncodecFrameRate: TNeuralFloat; // encodec_frame_rate (= sr / prod(ratios))
+    AudioChannels: integer;      // audio_channels (1)
+    HiddenSize: integer;         // hidden_size (512)
+    NumFilters: integer;         // num_filters (64)
+    NumResidualLayers: integer;  // num_residual_layers (1)
+    UpsamplingRatios: array of integer; // upsampling_ratios ([8,6,5,4])
+    KernelSize: integer;         // kernel_size (7)
+    LastKernelSize: integer;     // last_kernel_size (3)
+    ResidualKernelSize: integer; // residual_kernel_size (3)
+    DilationGrowthRate: integer; // dilation_growth_rate (2)
+    Compress: integer;           // compress (2)
+    TrimRightRatio: TNeuralFloat;// trim_right_ratio (1.0)
+    CodebookSize: integer;       // codebook_size (2048)
+    CodebookDim: integer;        // codebook_dim (256)
+    VqHiddenDim: integer;        // vector_quantization_hidden_dimension (256)
+    NumQuantizers: integer;      // num_quantizers (32, total semantic+acoustic)
+    NumSemanticQuantizers: integer; // num_semantic_quantizers (1)
+    UseConvShortcut: boolean;    // use_conv_shortcut (false)
+    UseCausalConv: boolean;      // use_causal_conv (true)
+    PadMode: string;             // pad_mode ('constant')
+    UpsampleGroups: integer;     // upsample_groups (= hidden_size)
+    // transformer bottleneck
+    NumHiddenLayers: integer;    // num_hidden_layers (8)
+    NumAttentionHeads: integer;  // num_attention_heads (8)
+    NumKeyValueHeads: integer;   // num_key_value_heads (8)
+    HeadDim: integer;            // head_dim (64)
+    IntermediateSize: integer;   // intermediate_size (2048)
+    HiddenAct: string;           // hidden_act ('gelu', exact erf form)
+    RopeTheta: TNeuralFloat;     // rope_parameters.rope_theta (10000)
+    SlidingWindow: integer;      // sliding_window (250; <=0 = full causal)
+    NormEps: TNeuralFloat;       // norm_eps (1e-5)
+    LayerScaleInitialScale: TNeuralFloat; // layer_scale_initial_scale (0.01)
+    AttentionBias: boolean;      // attention_bias (false)
+    ModelType: string;           // 'mimi'
+  end;
+
+  // One Mimi transformer layer (pre-norm RoPE attention + GELU MLP, with
+  // per-channel LayerScale on both residual adds). All projections are
+  // bias-free unless AttentionBias.
+  TMimiTransformerLayer = record
+    LnInG, LnInB, LnPostG, LnPostB: TNeuralFloatDynArr; // LayerNorm gain/bias
+    Wq, Wk, Wv, Wo: TEnCodecMat;       // attention projections [out,in]
+    Bq, Bk, Bv, Bo: TNeuralFloatDynArr;// optional attention biases
+    Fc1, Fc2: TEnCodecMat;             // MLP [out,in]
+    AttnScale, MlpScale: TNeuralFloatDynArr; // LayerScale diagonals
+  end;
+
+  { TNNetMimi }
+  // Holds the imported Mimi weights and runs the full waveform <-> codes round
+  // trip in inference. Built by BuildMimiFromSafeTensors[Ex]; caller-owned.
+  // Coded by Claude (AI).
+  TNNetMimi = class
+  private
+    FConfig: TMimiConfig;
+    FEncStages, FDecStages: array of TEnCodecStage;
+    FDownsample, FUpsample: TEnCodecConv;
+    FEncTransformer, FDecTransformer: array of TMimiTransformerLayer;
+    // semantic + acoustic RVQ codebooks (effective embed), one TEnCodecMat per
+    // stage [codebook_size, codebook_dim], plus the 1x1 in/out projections.
+    FSemCodebooks, FAcoCodebooks: array of TEnCodecMat;
+    FSemInProj, FSemOutProj, FAcoInProj, FAcoOutProj: TEnCodecConv;
+    procedure RunTransformer(const Layers: array of TMimiTransformerLayer;
+      var Sig: TMimiDblArr2D);
+  public
+    constructor Create(const pConfig: TMimiConfig);
+    destructor Destroy; override;
+    property Config: TMimiConfig read FConfig;
+    function NumCodebooks: integer;
+    // Waveform -> discrete codes (semantic stages first, then acoustic).
+    // Codes[q][t], q in 0..NumQuantizers-1, t = latent frame.
+    procedure Encode(const Waveform: array of TNeuralFloat;
+      out Codes: TNNetIntArr2D; out FrameCount: integer);
+    // Codes -> reconstructed mono waveform.
+    procedure Decode(const Codes: TNNetIntArr2D;
+      out Waveform: TNeuralFloatDynArr);
+    // Convenience full round trip.
+    procedure Reconstruct(const Waveform: array of TNeuralFloat;
+      out ReconOut: TNeuralFloatDynArr);
+  end;
+
+// Reads a HF Mimi config.json (model_type "mimi").
+function ReadMimiConfigFromJSONFile(const FileName: string): TMimiConfig;
+
+function MimiConfigToString(const Config: TMimiConfig): string;
+
+// Builds a TNNetMimi from Reader (caller owns Reader).
+function BuildMimiFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  var Config: TMimiConfig): TNNetMimi;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+function BuildMimiFromSafeTensors(const FileName: string;
+  out Config: TMimiConfig;
+  const ConfigFileName: string = ''): TNNetMimi;
 
 // ---------------------------------------------------------------------------
 // HIFI-GAN NEURAL VOCODER IMPORT (model_type "hifigan" / the SpeechT5HifiGan
@@ -32341,6 +32478,1132 @@ begin
   end;
 end;
 
+// ===========================================================================
+// MIMI STREAMING NEURAL CODEC IMPORT - see the interface header.
+// ===========================================================================
+
+function ReadMimiConfigFromJSONFile(const FileName: string): TMimiConfig;
+var
+  JsonText: TStringList;
+  Root, RopeObj, RatiosArr: TJSONData;
+  Obj: TJSONObject;
+  ModelType: string;
+  Arr: TJSONArray;
+  I, RatiosProd: integer;
+
+  function OptInt(const Name: string; Def: integer): integer;
+  begin
+    if Obj.IndexOfName(Name) >= 0 then Result := Obj.Get(Name, Def)
+    else Result := Def;
+  end;
+  function OptBool(const Name: string; Def: boolean): boolean;
+  begin
+    if Obj.IndexOfName(Name) >= 0 then Result := Obj.Get(Name, Def)
+    else Result := Def;
+  end;
+  function OptFloat(const Name: string; Def: double): double;
+  begin
+    if Obj.IndexOfName(Name) >= 0 then Result := Obj.Get(Name, Def)
+    else Result := Def;
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Mimi import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError('Mimi import: config "' + FileName + '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', '');
+    if (ModelType <> '') and (ModelType <> 'mimi') then
+      ImportError('Mimi import: config model_type is "' + ModelType +
+        '", expected "mimi".');
+    Result.ModelType := 'mimi';
+    Result.SamplingRate := OptInt('sampling_rate', 24000);
+    Result.FrameRate := OptFloat('frame_rate', 12.5);
+    Result.AudioChannels := OptInt('audio_channels', 1);
+    Result.HiddenSize := OptInt('hidden_size', 512);
+    Result.NumFilters := OptInt('num_filters', 64);
+    Result.NumResidualLayers := OptInt('num_residual_layers', 1);
+    Result.KernelSize := OptInt('kernel_size', 7);
+    Result.LastKernelSize := OptInt('last_kernel_size', 3);
+    Result.ResidualKernelSize := OptInt('residual_kernel_size', 3);
+    Result.DilationGrowthRate := OptInt('dilation_growth_rate', 2);
+    Result.Compress := OptInt('compress', 2);
+    Result.TrimRightRatio := OptFloat('trim_right_ratio', 1.0);
+    Result.CodebookSize := OptInt('codebook_size', 2048);
+    Result.CodebookDim := OptInt('codebook_dim', 256);
+    Result.VqHiddenDim := OptInt('vector_quantization_hidden_dimension',
+      Result.CodebookDim);
+    Result.NumQuantizers := OptInt('num_quantizers', 32);
+    Result.NumSemanticQuantizers := OptInt('num_semantic_quantizers', 1);
+    Result.UseConvShortcut := OptBool('use_conv_shortcut', False);
+    Result.UseCausalConv := OptBool('use_causal_conv', True);
+    Result.PadMode := Obj.Get('pad_mode', 'constant');
+    Result.UpsampleGroups := OptInt('upsample_groups', Result.HiddenSize);
+    Result.NumHiddenLayers := OptInt('num_hidden_layers', 8);
+    Result.NumAttentionHeads := OptInt('num_attention_heads', 8);
+    Result.NumKeyValueHeads := OptInt('num_key_value_heads',
+      Result.NumAttentionHeads);
+    Result.HeadDim := OptInt('head_dim',
+      Result.HiddenSize div Result.NumAttentionHeads);
+    Result.IntermediateSize := OptInt('intermediate_size', 2048);
+    Result.HiddenAct := Obj.Get('hidden_act', 'gelu');
+    Result.SlidingWindow := OptInt('sliding_window', 250);
+    Result.NormEps := OptFloat('norm_eps', 1e-5);
+    Result.LayerScaleInitialScale := OptFloat('layer_scale_initial_scale', 0.01);
+    Result.AttentionBias := OptBool('attention_bias', False);
+    // rope_theta lives under rope_parameters in newer configs, or as a flat
+    // rope_theta key in older ones.
+    Result.RopeTheta := OptFloat('rope_theta', 10000.0);
+    RopeObj := Obj.Find('rope_parameters');
+    if (RopeObj <> nil) and (RopeObj is TJSONObject) then
+      if TJSONObject(RopeObj).IndexOfName('rope_theta') >= 0 then
+        Result.RopeTheta := TJSONObject(RopeObj).Get('rope_theta',
+          double(Result.RopeTheta));
+    RatiosArr := Obj.Find('upsampling_ratios');
+    if (RatiosArr = nil) or RatiosArr.IsNull or not (RatiosArr is TJSONArray) then
+      ImportError('Mimi import: config "' + FileName +
+        '" requires an "upsampling_ratios" array.');
+    Arr := TJSONArray(RatiosArr);
+    if Arr.Count < 1 then
+      ImportError('Mimi import: "upsampling_ratios" array is empty.');
+    SetLength(Result.UpsamplingRatios, Arr.Count);
+    for I := 0 to Arr.Count - 1 do
+      Result.UpsamplingRatios[I] := Arr.Integers[I];
+    // encodec_frame_rate = sampling_rate / prod(ratios).
+    RatiosProd := 1;
+    for I := 0 to Length(Result.UpsamplingRatios) - 1 do
+      RatiosProd := RatiosProd * Result.UpsamplingRatios[I];
+    Result.EncodecFrameRate := Result.SamplingRate / RatiosProd;
+    if not Result.UseCausalConv then
+      ImportError('Mimi import: use_causal_conv=false is not supported.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function MimiConfigToString(const Config: TMimiConfig): string;
+var
+  I: integer;
+  Ratios: string;
+begin
+  Ratios := '[';
+  for I := 0 to Length(Config.UpsamplingRatios) - 1 do
+  begin
+    if I > 0 then Ratios := Ratios + ',';
+    Ratios := Ratios + IntToStr(Config.UpsamplingRatios[I]);
+  end;
+  Ratios := Ratios + ']';
+  Result :=
+    'Mimi(' + Config.ModelType + '): sampling_rate=' +
+    IntToStr(Config.SamplingRate) + ' frame_rate=' +
+    FloatToStr(Config.FrameRate) + ' channels=' +
+    IntToStr(Config.AudioChannels) + ' hidden=' +
+    IntToStr(Config.HiddenSize) + ' filters=' +
+    IntToStr(Config.NumFilters) + ' ratios=' + Ratios +
+    ' kernel=' + IntToStr(Config.KernelSize) + ' last_kernel=' +
+    IntToStr(Config.LastKernelSize) + ' vq_dim=' +
+    IntToStr(Config.VqHiddenDim) + ' codebook_size=' +
+    IntToStr(Config.CodebookSize) + ' num_quantizers=' +
+    IntToStr(Config.NumQuantizers) + ' semantic=' +
+    IntToStr(Config.NumSemanticQuantizers) + ' layers=' +
+    IntToStr(Config.NumHiddenLayers) + ' heads=' +
+    IntToStr(Config.NumAttentionHeads) + ' head_dim=' +
+    IntToStr(Config.HeadDim) + ' ffn=' +
+    IntToStr(Config.IntermediateSize) + ' rope_theta=' +
+    FloatToStr(Config.RopeTheta) + ' pad=' + Config.PadMode;
+end;
+
+// Near-machine-precision erf (W. J. Cody rational Chebyshev approximation, the
+// algorithm behind glibc/SciPy erf, ~1e-16) -> the exact erf-GELU used by HF
+// hidden_act "gelu". A cheaper ~1e-7 approximation amplifies through the deep
+// high-gain transformer past the 1e-4 parity gate, so full precision is needed.
+function MimiErf(x: double): double;
+var
+  y, z, num, den, res: double;
+const
+  A: array[0..4] of double = (3.16112374387056560e00, 1.13864154151050156e02,
+    3.77485237685302021e02, 3.20937758913846947e03, 1.85777706184603153e-1);
+  B: array[0..3] of double = (2.36012909523441209e01, 2.44024637934444173e02,
+    1.28261652607737228e03, 2.84423683343917062e03);
+  C: array[0..8] of double = (5.64188496988670089e-1, 8.88314979438837594e00,
+    6.61191906371416295e01, 2.98635138197400131e02, 8.81952221241769090e02,
+    1.71204761263407058e03, 2.05107837782607147e03, 1.23033935479799725e03,
+    2.15311535474403846e-8);
+  D: array[0..7] of double = (1.57449261107098347e01, 1.17693950891312499e02,
+    5.37181101862009858e02, 1.62138957456669019e03, 3.29079923573345963e03,
+    4.36261909014324716e03, 3.43936767414372164e03, 1.23033935480374942e03);
+  P: array[0..5] of double = (3.05326634961232344e-1, 3.60344899949804439e-1,
+    1.25781726111229246e-1, 1.60837851487422766e-2, 6.58749161529837803e-4,
+    1.63153871373020978e-2);
+  Q: array[0..4] of double = (2.56852019228982242e00, 1.87295284992346047e00,
+    5.27905102951428412e-1, 6.05183413124413191e-2, 2.33520497626869185e-3);
+  SQRPI = 5.6418958354775628695e-1; THRESH = 0.46875;
+var
+  i: integer;
+begin
+  y := Abs(x);
+  if y <= THRESH then
+  begin
+    z := 0;
+    if y > 1.11e-16 then z := y * y;
+    num := A[4] * z; den := z;
+    for i := 0 to 2 do
+    begin num := (num + A[i]) * z; den := (den + B[i]) * z; end;
+    Result := x * (num + A[3]) / (den + B[3]);
+    Exit;
+  end
+  else if y <= 4.0 then
+  begin
+    num := C[8] * y; den := y;
+    for i := 0 to 6 do
+    begin num := (num + C[i]) * y; den := (den + D[i]) * y; end;
+    res := (num + C[7]) / (den + D[7]);
+    z := Trunc(y * 16.0) / 16.0;
+    den := (y - z) * (y + z);
+    res := Exp(-z * z) * Exp(-den) * res;
+  end
+  else
+  begin
+    z := 1.0 / (y * y);
+    num := P[5] * z; den := z;
+    for i := 0 to 3 do
+    begin num := (num + P[i]) * z; den := (den + Q[i]) * z; end;
+    res := z * (num + P[4]) / (den + Q[4]);
+    res := (SQRPI - res) / y;
+    z := Trunc(y * 16.0) / 16.0;
+    den := (y - z) * (y + z);
+    res := Exp(-z * z) * Exp(-den) * res;
+  end;
+  // res now holds erfc(y); convert to erf with the sign of x.
+  res := 1.0 - res;
+  if x < 0 then res := -res;
+  Result := res;
+end;
+
+function MimiGELU(x: double): double;
+begin
+  Result := 0.5 * x * (1.0 + MimiErf(x / Sqrt(2.0)));
+end;
+
+// Loads a PLAIN Conv1d / ConvTranspose1d (no weight_norm). HF stores the
+// weight as [Out,In,K] for Conv1d, [In,Out/groups,K] for grouped
+// ConvTranspose1d. The flat row-major layout is preserved into Conv.W; the
+// run-time forward (RunMimiConv) indexes it per groups.
+procedure LoadMimiConv(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; var Conv: TEnCodecConv; pTranspose: boolean;
+  pStride, pDilation, pGroups: integer; pPadMode: string; Consumed: TStrings);
+var
+  W: TNNetVolume;
+  D0, D1, K, o, i: integer;
+begin
+  W := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Prefix + '.weight', W);
+    Consumed.Add(Prefix + '.weight');
+    D0 := Reader.DimSize(Prefix + '.weight', 0);
+    D1 := Reader.DimSize(Prefix + '.weight', 1);
+    K := Reader.DimSize(Prefix + '.weight', 2);
+    Conv.Transpose := pTranspose;
+    Conv.Stride := pStride;
+    Conv.Dilation := pDilation;
+    Conv.Groups := pGroups;
+    Conv.PadMode := pPadMode;
+    Conv.Kernel := K;
+    if pTranspose then
+    begin
+      // ConvTranspose1d weight [In, Out/groups, K]; total Out = D1 * groups.
+      Conv.InCh := D0;
+      Conv.OutCh := D1 * pGroups;
+    end
+    else
+    begin
+      // Conv1d weight [Out, In/groups, K]; total In = D1 * groups.
+      Conv.InCh := D1 * pGroups;
+      Conv.OutCh := D0;
+    end;
+    SetLength(Conv.W, W.Size);
+    for o := 0 to W.Size - 1 do Conv.W[o] := W.FData[o];
+    // Optional bias.
+    if Reader.HasTensor(Prefix + '.bias') then
+    begin
+      Reader.LoadTensorFlat(Prefix + '.bias', W);
+      Consumed.Add(Prefix + '.bias');
+      SetLength(Conv.B, W.Size);
+      for o := 0 to W.Size - 1 do Conv.B[o] := W.FData[o];
+    end
+    else
+    begin
+      SetLength(Conv.B, Conv.OutCh);
+      for o := 0 to Conv.OutCh - 1 do Conv.B[o] := 0;
+    end;
+    i := i; // silence unused
+  finally
+    W.Free;
+  end;
+end;
+
+// Causal Conv1d / grouped ConvTranspose1d on a channel-major signal, honoring
+// pad_mode 'constant' (zero left-pad) or 'replicate' (repeat first/last) and
+// arbitrary groups. Mirrors HF MimiConv1d / MimiConvTranspose1d forward.
+procedure RunMimiConv(const Conv: TEnCodecConv;
+  const InSig: TMimiDblArr2D; out OutSig: TMimiDblArr2D);
+var
+  InCh, OutCh, K, Stride, Dil, InLen, o, i, t, k2, src, EffK: integer;
+  PadTotal, Extra, NFrames, OutLen, idx, FullLen, PadRight, G: integer;
+  IPG, OPG, gi, ci, co, grp: integer;
+  Acc: double;
+  Padded, Full: TMimiDblArr2D;
+begin
+  InCh := Conv.InCh;
+  OutCh := Conv.OutCh;
+  K := Conv.Kernel;
+  Stride := Conv.Stride;
+  Dil := Conv.Dilation;
+  G := Conv.Groups;
+  if G < 1 then G := 1;
+  InLen := Length(InSig[0]);
+  if not Conv.Transpose then
+  begin
+    EffK := (K - 1) * Dil + 1;
+    PadTotal := EffK - Stride;
+    NFrames := Ceil((InLen - EffK + PadTotal) / Stride + 1) - 1;
+    Extra := NFrames * Stride + EffK - PadTotal - InLen;
+    if Extra < 0 then Extra := 0;
+    SetLength(Padded, InCh);
+    for i := 0 to InCh - 1 do
+    begin
+      SetLength(Padded[i], PadTotal + InLen + Extra);
+      // Causal left pad (PadTotal frames) + extra right pad.
+      for t := 0 to PadTotal - 1 do
+      begin
+        if Conv.PadMode = 'replicate' then Padded[i][t] := InSig[i][0]
+        else Padded[i][t] := 0; // 'constant'
+      end;
+      for t := 0 to InLen - 1 do Padded[i][PadTotal + t] := InSig[i][t];
+      for t := 0 to Extra - 1 do
+      begin
+        if Conv.PadMode = 'replicate' then
+          Padded[i][PadTotal + InLen + t] := InSig[i][InLen - 1]
+        else
+          Padded[i][PadTotal + InLen + t] := 0;
+      end;
+    end;
+    OutLen := (Length(Padded[0]) - EffK) div Stride + 1;
+    if OutLen < 0 then OutLen := 0;
+    IPG := InCh div G;
+    OPG := OutCh div G;
+    SetLength(OutSig, OutCh);
+    for o := 0 to OutCh - 1 do
+    begin
+      SetLength(OutSig[o], OutLen);
+      grp := o div OPG;
+      for t := 0 to OutLen - 1 do
+      begin
+        Acc := Conv.B[o];
+        for gi := 0 to IPG - 1 do
+        begin
+          i := grp * IPG + gi;
+          for k2 := 0 to K - 1 do
+          begin
+            src := t * Stride + k2 * Dil;
+            // Conv1d weight [Out, In/groups, K]: W[o*IPG*K + gi*K + k2].
+            Acc := Acc + Conv.W[o * IPG * K + gi * K + k2] * Padded[i][src];
+          end;
+        end;
+        OutSig[o][t] := Acc;
+      end;
+    end;
+  end
+  else
+  begin
+    // Grouped ConvTranspose1d. Weight [In, Out/groups, K]: per group g,
+    // input channels [g*IPG..] map to output channels [g*OPG..].
+    FullLen := (InLen - 1) * Stride + K;
+    IPG := InCh div G;
+    OPG := OutCh div G;
+    SetLength(Full, OutCh);
+    for o := 0 to OutCh - 1 do
+    begin
+      SetLength(Full[o], FullLen);
+      for t := 0 to FullLen - 1 do Full[o][t] := 0;
+    end;
+    for grp := 0 to G - 1 do
+      for gi := 0 to IPG - 1 do
+      begin
+        ci := grp * IPG + gi;
+        for t := 0 to InLen - 1 do
+          for o := 0 to OPG - 1 do
+          begin
+            co := grp * OPG + o;
+            for k2 := 0 to K - 1 do
+            begin
+              idx := t * Stride + k2;
+              // W[ci, o, k2] = W[ci*OPG*K + o*K + k2].
+              Full[co][idx] := Full[co][idx] +
+                Conv.W[ci * OPG * K + o * K + k2] * InSig[ci][t];
+            end;
+          end;
+      end;
+    for o := 0 to OutCh - 1 do
+      for t := 0 to FullLen - 1 do Full[o][t] := Full[o][t] + Conv.B[o];
+    // Causal right-trim: padding_right = K - stride (trim_right_ratio 1.0),
+    // padding_left = 0.
+    PadRight := K - Stride;
+    OutLen := FullLen - PadRight;
+    if OutLen < 0 then OutLen := 0;
+    SetLength(OutSig, OutCh);
+    for o := 0 to OutCh - 1 do
+    begin
+      SetLength(OutSig[o], OutLen);
+      for t := 0 to OutLen - 1 do OutSig[o][t] := Full[o][t];
+    end;
+  end;
+end;
+
+procedure LoadMimiMat(Reader: TNNetSafeTensorsReader;
+  const Name: string; var Mat: TEnCodecMat; Consumed: TStrings);
+var
+  T: TNNetVolume;
+  I: integer;
+begin
+  T := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Name, T);
+    Mat.Rows := Reader.DimSize(Name, 0);
+    Mat.Cols := Reader.DimSize(Name, 1);
+    SetLength(Mat.Data, T.Size);
+    for I := 0 to T.Size - 1 do Mat.Data[I] := T.FData[I];
+    Consumed.Add(Name);
+  finally
+    T.Free;
+  end;
+end;
+
+procedure LoadMimiVec(Reader: TNNetSafeTensorsReader;
+  const Name: string; out Vec: TNeuralFloatDynArr; Consumed: TStrings);
+var
+  T: TNNetVolume;
+  I: integer;
+begin
+  T := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Name, T);
+    SetLength(Vec, T.Size);
+    for I := 0 to T.Size - 1 do Vec[I] := T.FData[I];
+    Consumed.Add(Name);
+  finally
+    T.Free;
+  end;
+end;
+
+// Loads a codebook's effective centroid table embed_sum/clamp(cluster_usage).
+procedure LoadMimiCodebook(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; var Mat: TEnCodecMat; Eps: TNeuralFloat;
+  Consumed: TStrings);
+var
+  ES, CU: TNNetVolume;
+  K, D, r, c: integer;
+  denom: TNeuralFloat;
+begin
+  ES := TNNetVolume.Create;
+  CU := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Prefix + 'embed_sum', ES);
+    Reader.LoadTensorFlat(Prefix + 'cluster_usage', CU);
+    Consumed.Add(Prefix + 'embed_sum');
+    Consumed.Add(Prefix + 'cluster_usage');
+    if Reader.HasTensor(Prefix + 'initialized') then
+      Consumed.Add(Prefix + 'initialized');
+    if Reader.HasTensor(Prefix + 'embed') then Consumed.Add(Prefix + 'embed');
+    K := Reader.DimSize(Prefix + 'embed_sum', 0);
+    D := Reader.DimSize(Prefix + 'embed_sum', 1);
+    Mat.Rows := K;
+    Mat.Cols := D;
+    SetLength(Mat.Data, K * D);
+    for r := 0 to K - 1 do
+    begin
+      denom := CU.FData[r];
+      if denom < Eps then denom := Eps;
+      for c := 0 to D - 1 do
+        Mat.Data[r * D + c] := ES.FData[r * D + c] / denom;
+    end;
+  finally
+    CU.Free;
+    ES.Free;
+  end;
+end;
+
+{ TNNetMimi }
+
+constructor TNNetMimi.Create(const pConfig: TMimiConfig);
+begin
+  inherited Create();
+  FConfig := pConfig;
+end;
+
+destructor TNNetMimi.Destroy;
+begin
+  inherited Destroy;
+end;
+
+function TNNetMimi.NumCodebooks: integer;
+begin
+  Result := Length(FSemCodebooks) + Length(FAcoCodebooks);
+end;
+
+procedure ApplyMimiELU(var Sig: TMimiDblArr2D);
+var
+  c, t: integer;
+begin
+  for c := 0 to Length(Sig) - 1 do
+    for t := 0 to Length(Sig[c]) - 1 do
+      if Sig[c][t] <= 0 then Sig[c][t] := Exp(Sig[c][t]) - 1;
+end;
+
+// Pre-norm RoPE causal-attention + GELU MLP transformer over a channel-major
+// (HiddenSize x Time) signal, in place. Matches HF MimiTransformerModel.
+procedure TNNetMimi.RunTransformer(
+  const Layers: array of TMimiTransformerLayer; var Sig: TMimiDblArr2D);
+var
+  D, T, NH, NKV, Dh, FFN, L, h, t1, t2, dd, gidx, kvh, NRep, half: integer;
+  Theta, Scaling, eps, m, v, e, denom, sc, mx, qr, kr: double;
+  X, Hn, Q, Kk, Vv, Attn, Mlp1: array of array of double; // [T][feature]
+  cosv, sinv, invfreq: array of double;
+  AccVec, Orig: array of double;
+begin
+  D := FConfig.HiddenSize;
+  T := Length(Sig[0]);
+  if T = 0 then Exit;
+  NH := FConfig.NumAttentionHeads;
+  NKV := FConfig.NumKeyValueHeads;
+  Dh := FConfig.HeadDim;
+  FFN := FConfig.IntermediateSize;
+  Theta := FConfig.RopeTheta;
+  eps := FConfig.NormEps;
+  Scaling := 1.0 / Sqrt(Dh);
+  NRep := NH div NKV;
+  half := Dh div 2;
+  // X[t][d] row-major copy of the signal.
+  SetLength(X, T);
+  for t1 := 0 to T - 1 do
+  begin
+    SetLength(X[t1], D);
+    for dd := 0 to D - 1 do X[t1][dd] := Sig[dd][t1];
+  end;
+  // Precompute inv_freq for RoPE (head_dim).
+  SetLength(invfreq, half);
+  for dd := 0 to half - 1 do
+    invfreq[dd] := 1.0 / Power(Theta, (2.0 * dd) / Dh);
+
+  for L := 0 to Length(Layers) - 1 do
+  begin
+    // ---- input LayerNorm ----
+    SetLength(Hn, T);
+    for t1 := 0 to T - 1 do
+    begin
+      SetLength(Hn[t1], D);
+      m := 0;
+      for dd := 0 to D - 1 do m := m + X[t1][dd];
+      m := m / D;
+      v := 0;
+      for dd := 0 to D - 1 do v := v + Sqr(X[t1][dd] - m);
+      v := v / D;
+      denom := Sqrt(v + eps);
+      for dd := 0 to D - 1 do
+        Hn[t1][dd] := (X[t1][dd] - m) / denom * Layers[L].LnInG[dd] +
+          Layers[L].LnInB[dd];
+    end;
+    // ---- Q,K,V projections (rows = out, cols = in) ----
+    SetLength(Q, T); SetLength(Kk, T); SetLength(Vv, T);
+    for t1 := 0 to T - 1 do
+    begin
+      SetLength(Q[t1], NH * Dh);
+      SetLength(Kk[t1], NKV * Dh);
+      SetLength(Vv[t1], NKV * Dh);
+      for gidx := 0 to NH * Dh - 1 do
+      begin
+        sc := 0;
+        for dd := 0 to D - 1 do sc := sc + Layers[L].Wq.Data[gidx * D + dd] * Hn[t1][dd];
+        if Length(Layers[L].Bq) > 0 then sc := sc + Layers[L].Bq[gidx];
+        Q[t1][gidx] := sc;
+      end;
+      for gidx := 0 to NKV * Dh - 1 do
+      begin
+        sc := 0;
+        for dd := 0 to D - 1 do sc := sc + Layers[L].Wk.Data[gidx * D + dd] * Hn[t1][dd];
+        if Length(Layers[L].Bk) > 0 then sc := sc + Layers[L].Bk[gidx];
+        Kk[t1][gidx] := sc;
+        sc := 0;
+        for dd := 0 to D - 1 do sc := sc + Layers[L].Wv.Data[gidx * D + dd] * Hn[t1][dd];
+        if Length(Layers[L].Bv) > 0 then sc := sc + Layers[L].Bv[gidx];
+        Vv[t1][gidx] := sc;
+      end;
+    end;
+    // ---- apply RoPE to Q and K (per head, rotate_half convention) ----
+    for t1 := 0 to T - 1 do
+    begin
+      SetLength(cosv, Dh); SetLength(sinv, Dh);
+      for dd := 0 to half - 1 do
+      begin
+        cosv[dd] := Cos(t1 * invfreq[dd]);
+        cosv[dd + half] := cosv[dd];
+        sinv[dd] := Sin(t1 * invfreq[dd]);
+        sinv[dd + half] := sinv[dd];
+      end;
+      // rotate_half needs the ORIGINAL head values, so snapshot per head into
+      // Orig before writing back (an in-place rotation would feed the already
+      // rotated first half into the second half).
+      SetLength(Orig, Dh);
+      for h := 0 to NH - 1 do
+      begin
+        for dd := 0 to Dh - 1 do Orig[dd] := Q[t1][h * Dh + dd];
+        for dd := 0 to Dh - 1 do
+        begin
+          if dd < half then qr := -Orig[dd + half] else qr := Orig[dd - half];
+          Q[t1][h * Dh + dd] := Orig[dd] * cosv[dd] + qr * sinv[dd];
+        end;
+      end;
+      for h := 0 to NKV - 1 do
+      begin
+        for dd := 0 to Dh - 1 do Orig[dd] := Kk[t1][h * Dh + dd];
+        for dd := 0 to Dh - 1 do
+        begin
+          if dd < half then kr := -Orig[dd + half] else kr := Orig[dd - half];
+          Kk[t1][h * Dh + dd] := Orig[dd] * cosv[dd] + kr * sinv[dd];
+        end;
+      end;
+    end;
+    // ---- causal attention per head (GQA: head h uses kv head h div NRep) ----
+    SetLength(Attn, T);
+    for t1 := 0 to T - 1 do SetLength(Attn[t1], NH * Dh);
+    SetLength(AccVec, Dh);
+    for h := 0 to NH - 1 do
+    begin
+      kvh := h div NRep;
+      for t1 := 0 to T - 1 do
+      begin
+        // scores over keys 0..t1 (causal); sliding window optional.
+        mx := -1e30;
+        for t2 := 0 to t1 do
+        begin
+          if (FConfig.SlidingWindow > 0) and (t1 - t2 >= FConfig.SlidingWindow) then
+            Continue;
+          sc := 0;
+          for dd := 0 to Dh - 1 do
+            sc := sc + Q[t1][h * Dh + dd] * Kk[t2][kvh * Dh + dd];
+          sc := sc * Scaling;
+          if sc > mx then mx := sc;
+        end;
+        denom := 0;
+        for dd := 0 to Dh - 1 do AccVec[dd] := 0;
+        for t2 := 0 to t1 do
+        begin
+          if (FConfig.SlidingWindow > 0) and (t1 - t2 >= FConfig.SlidingWindow) then
+            Continue;
+          sc := 0;
+          for dd := 0 to Dh - 1 do
+            sc := sc + Q[t1][h * Dh + dd] * Kk[t2][kvh * Dh + dd];
+          sc := sc * Scaling;
+          e := Exp(sc - mx);
+          denom := denom + e;
+          for dd := 0 to Dh - 1 do
+            AccVec[dd] := AccVec[dd] + e * Vv[t2][kvh * Dh + dd];
+        end;
+        for dd := 0 to Dh - 1 do
+          Attn[t1][h * Dh + dd] := AccVec[dd] / denom;
+      end;
+    end;
+    // ---- output projection + LayerScale residual ----
+    for t1 := 0 to T - 1 do
+    begin
+      for dd := 0 to D - 1 do
+      begin
+        sc := 0;
+        for gidx := 0 to NH * Dh - 1 do
+          sc := sc + Layers[L].Wo.Data[dd * (NH * Dh) + gidx] * Attn[t1][gidx];
+        if Length(Layers[L].Bo) > 0 then sc := sc + Layers[L].Bo[dd];
+        X[t1][dd] := X[t1][dd] + Layers[L].AttnScale[dd] * sc;
+      end;
+    end;
+    // ---- post-attention LayerNorm + GELU MLP + LayerScale residual ----
+    SetLength(Mlp1, T);
+    for t1 := 0 to T - 1 do
+    begin
+      // post LN
+      m := 0;
+      for dd := 0 to D - 1 do m := m + X[t1][dd];
+      m := m / D;
+      v := 0;
+      for dd := 0 to D - 1 do v := v + Sqr(X[t1][dd] - m);
+      v := v / D;
+      denom := Sqrt(v + eps);
+      SetLength(Hn[t1], D);
+      for dd := 0 to D - 1 do
+        Hn[t1][dd] := (X[t1][dd] - m) / denom * Layers[L].LnPostG[dd] +
+          Layers[L].LnPostB[dd];
+      // fc1 -> GELU
+      SetLength(Mlp1[t1], FFN);
+      for gidx := 0 to FFN - 1 do
+      begin
+        sc := 0;
+        for dd := 0 to D - 1 do sc := sc + Layers[L].Fc1.Data[gidx * D + dd] * Hn[t1][dd];
+        Mlp1[t1][gidx] := MimiGELU(sc);
+      end;
+      // fc2 -> residual
+      for dd := 0 to D - 1 do
+      begin
+        sc := 0;
+        for gidx := 0 to FFN - 1 do
+          sc := sc + Layers[L].Fc2.Data[dd * FFN + gidx] * Mlp1[t1][gidx];
+        X[t1][dd] := X[t1][dd] + Layers[L].MlpScale[dd] * sc;
+      end;
+    end;
+  end;
+  // write back channel-major.
+  for dd := 0 to D - 1 do
+    for t1 := 0 to T - 1 do Sig[dd][t1] := X[t1][dd];
+end;
+
+// One conv encoder/decoder stage (eskConv / eskELU / eskResnet) using the
+// Mimi conv math (zero/replicate causal padding, grouped conv).
+function MimiELUf(x: double): double; inline;
+begin
+  if x > 0 then Result := x else Result := Exp(x) - 1;
+end;
+
+procedure RunStageMimi(const Stage: TEnCodecStage;
+  const InSig: TMimiDblArr2D; out OutSig: TMimiDblArr2D);
+var
+  Tmp, Shr_, Res: TMimiDblArr2D;
+  c, t: integer;
+begin
+  case Stage.Kind of
+    eskConv: RunMimiConv(Stage.Conv, InSig, OutSig);
+    eskELU:
+      begin
+        SetLength(OutSig, Length(InSig));
+        for c := 0 to Length(InSig) - 1 do
+        begin
+          SetLength(OutSig[c], Length(InSig[c]));
+          for t := 0 to Length(InSig[c]) - 1 do
+            OutSig[c][t] := MimiELUf(InSig[c][t]);
+        end;
+      end;
+    eskResnet:
+      begin
+        SetLength(Tmp, Length(InSig));
+        for c := 0 to Length(InSig) - 1 do
+        begin
+          SetLength(Tmp[c], Length(InSig[c]));
+          for t := 0 to Length(InSig[c]) - 1 do
+            Tmp[c][t] := MimiELUf(InSig[c][t]);
+        end;
+        RunMimiConv(Stage.Resnet.Conv1, Tmp, Res);
+        ApplyMimiELU(Res);
+        RunMimiConv(Stage.Resnet.Conv2, Res, Tmp);
+        if Stage.Resnet.HasShortcut then
+          RunMimiConv(Stage.Resnet.Shortcut, InSig, Shr_)
+        else
+        begin
+          SetLength(Shr_, Length(InSig));
+          for c := 0 to Length(InSig) - 1 do Shr_[c] := InSig[c];
+        end;
+        SetLength(OutSig, Length(Tmp));
+        for c := 0 to Length(Tmp) - 1 do
+        begin
+          SetLength(OutSig[c], Length(Tmp[c]));
+          for t := 0 to Length(Tmp[c]) - 1 do
+            OutSig[c][t] := Shr_[c][t] + Tmp[c][t];
+        end;
+      end;
+    eskLSTM: ; // Mimi has no LSTM
+  end;
+end;
+
+procedure TNNetMimi.Encode(const Waveform: array of TNeuralFloat;
+  out Codes: TNNetIntArr2D; out FrameCount: integer);
+var
+  Sig, Nxt, Proj: TMimiDblArr2D;
+  s, q, t, d, best, Dm, Frames, K, NSem, NAco: integer;
+  Dist, BestDist, Diff: double;
+  Residual: TMimiDblArr;
+begin
+  SetLength(Sig, FConfig.AudioChannels);
+  SetLength(Sig[0], Length(Waveform));
+  for t := 0 to Length(Waveform) - 1 do Sig[0][t] := Waveform[t];
+  // conv encoder
+  for s := 0 to Length(FEncStages) - 1 do
+  begin
+    RunStageMimi(FEncStages[s], Sig, Nxt);
+    Sig := Nxt;
+  end;
+  // encoder transformer
+  RunTransformer(FEncTransformer, Sig);
+  // downsample conv
+  RunMimiConv(FDownsample, Sig, Nxt);
+  Sig := Nxt;
+  Frames := Length(Sig[0]);
+  FrameCount := Frames;
+  NSem := Length(FSemCodebooks);
+  NAco := Length(FAcoCodebooks);
+  SetLength(Codes, NSem + NAco);
+  for q := 0 to NSem + NAco - 1 do SetLength(Codes[q], Frames);
+  K := FConfig.CodebookSize;
+
+  // ---- semantic RVQ ----
+  RunMimiConv(FSemInProj, Sig, Proj);
+  Dm := FConfig.VqHiddenDim;
+  SetLength(Residual, Dm);
+  for t := 0 to Frames - 1 do
+  begin
+    for d := 0 to Dm - 1 do Residual[d] := Proj[d][t];
+    for q := 0 to NSem - 1 do
+    begin
+      best := 0; BestDist := -1;
+      for s := 0 to K - 1 do
+      begin
+        Dist := 0;
+        for d := 0 to Dm - 1 do
+        begin
+          Diff := Residual[d] - FSemCodebooks[q].Data[s * Dm + d];
+          Dist := Dist + Diff * Diff;
+        end;
+        if (BestDist < 0) or (Dist < BestDist) then
+        begin BestDist := Dist; best := s; end;
+      end;
+      Codes[q][t] := best;
+      for d := 0 to Dm - 1 do
+        Residual[d] := Residual[d] - FSemCodebooks[q].Data[best * Dm + d];
+    end;
+  end;
+
+  // ---- acoustic RVQ ----
+  RunMimiConv(FAcoInProj, Sig, Proj);
+  for t := 0 to Frames - 1 do
+  begin
+    for d := 0 to Dm - 1 do Residual[d] := Proj[d][t];
+    for q := 0 to NAco - 1 do
+    begin
+      best := 0; BestDist := -1;
+      for s := 0 to K - 1 do
+      begin
+        Dist := 0;
+        for d := 0 to Dm - 1 do
+        begin
+          Diff := Residual[d] - FAcoCodebooks[q].Data[s * Dm + d];
+          Dist := Dist + Diff * Diff;
+        end;
+        if (BestDist < 0) or (Dist < BestDist) then
+        begin BestDist := Dist; best := s; end;
+      end;
+      Codes[NSem + q][t] := best;
+      for d := 0 to Dm - 1 do
+        Residual[d] := Residual[d] - FAcoCodebooks[q].Data[best * Dm + d];
+    end;
+  end;
+end;
+
+procedure TNNetMimi.Decode(const Codes: TNNetIntArr2D;
+  out Waveform: TNeuralFloatDynArr);
+var
+  Sig, Nxt, Zsem, Zaco, Zh: TMimiDblArr2D;
+  s, q, t, d, Dm, Frames, NSem, NAco, code, code2: integer;
+begin
+  Dm := FConfig.VqHiddenDim;
+  NSem := Length(FSemCodebooks);
+  NAco := Length(FAcoCodebooks);
+  Frames := 0;
+  if Length(Codes) > 0 then Frames := Length(Codes[0]);
+  // semantic RVQ decode -> vq dim -> output proj -> hidden
+  SetLength(Zsem, Dm);
+  for d := 0 to Dm - 1 do
+  begin
+    SetLength(Zsem[d], Frames);
+    for t := 0 to Frames - 1 do Zsem[d][t] := 0;
+  end;
+  for q := 0 to NSem - 1 do
+    for t := 0 to Frames - 1 do
+    begin
+      code := Codes[q][t];
+      for d := 0 to Dm - 1 do
+        Zsem[d][t] := Zsem[d][t] + FSemCodebooks[q].Data[code * Dm + d];
+    end;
+  RunMimiConv(FSemOutProj, Zsem, Sig); // Sig now [hidden][frames]
+  // acoustic RVQ decode
+  if NAco > 0 then
+  begin
+    SetLength(Zaco, Dm);
+    for d := 0 to Dm - 1 do
+    begin
+      SetLength(Zaco[d], Frames);
+      for t := 0 to Frames - 1 do Zaco[d][t] := 0;
+    end;
+    for q := 0 to NAco - 1 do
+      for t := 0 to Frames - 1 do
+      begin
+        code2 := Codes[NSem + q][t];
+        for d := 0 to Dm - 1 do
+          Zaco[d][t] := Zaco[d][t] + FAcoCodebooks[q].Data[code2 * Dm + d];
+      end;
+    RunMimiConv(FAcoOutProj, Zaco, Zh);
+    for d := 0 to Length(Sig) - 1 do
+      for t := 0 to Frames - 1 do Sig[d][t] := Sig[d][t] + Zh[d][t];
+  end;
+  // upsample (grouped transpose conv)
+  RunMimiConv(FUpsample, Sig, Nxt);
+  Sig := Nxt;
+  // decoder transformer
+  RunTransformer(FDecTransformer, Sig);
+  // conv decoder
+  for s := 0 to Length(FDecStages) - 1 do
+  begin
+    RunStageMimi(FDecStages[s], Sig, Nxt);
+    Sig := Nxt;
+  end;
+  SetLength(Waveform, Length(Sig[0]));
+  for t := 0 to Length(Sig[0]) - 1 do Waveform[t] := Sig[0][t];
+end;
+
+procedure TNNetMimi.Reconstruct(const Waveform: array of TNeuralFloat;
+  out ReconOut: TNeuralFloatDynArr);
+var
+  Codes: TNNetIntArr2D;
+  Frames: integer;
+begin
+  Encode(Waveform, Codes, Frames);
+  Decode(Codes, ReconOut);
+end;
+
+function BuildMimiFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  var Config: TMimiConfig): TNNetMimi;
+var
+  Model: TNNetMimi;
+  Consumed: TStringList;
+  Idx, r, j, dim, NumRatios, ratio, dil, NSem, NAco, L, DownK: integer;
+  ScalePow: integer;
+  EncStages, DecStages: array of TEnCodecStage;
+  EncCnt, DecCnt: integer;
+  Pref, TPref: string;
+
+  procedure PushEnc(const St: TEnCodecStage);
+  begin
+    if EncCnt >= Length(EncStages) then SetLength(EncStages, EncCnt + 8);
+    EncStages[EncCnt] := St; Inc(EncCnt);
+  end;
+  procedure PushDec(const St: TEnCodecStage);
+  begin
+    if DecCnt >= Length(DecStages) then SetLength(DecStages, DecCnt + 8);
+    DecStages[DecCnt] := St; Inc(DecCnt);
+  end;
+  function MakeConvStage(const P: string; pStride, pDil: integer): TEnCodecStage;
+  begin
+    Result.Kind := eskConv;
+    LoadMimiConv(Reader, P, Result.Conv, False, pStride, pDil, 1,
+      Config.PadMode, Consumed);
+  end;
+  function MakeTConvStage(const P: string; pStride: integer): TEnCodecStage;
+  begin
+    Result.Kind := eskConv;
+    Result.Conv.Transpose := True;
+    LoadMimiConv(Reader, P, Result.Conv, True, pStride, 1, 1,
+      Config.PadMode, Consumed);
+  end;
+  function MakeELU: TEnCodecStage;
+  begin
+    Result.Kind := eskELU;
+  end;
+  function MakeResnetStage(const Base: string; pDim, pDil: integer): TEnCodecStage;
+  begin
+    Result.Kind := eskResnet;
+    LoadMimiConv(Reader, Base + '.block.1.conv', Result.Resnet.Conv1,
+      False, 1, pDil, 1, Config.PadMode, Consumed);
+    LoadMimiConv(Reader, Base + '.block.3.conv', Result.Resnet.Conv2,
+      False, 1, 1, 1, Config.PadMode, Consumed);
+    Result.Resnet.HasShortcut := Config.UseConvShortcut and
+      Reader.HasTensor(Base + '.shortcut.conv.weight');
+    if Result.Resnet.HasShortcut then
+      LoadMimiConv(Reader, Base + '.shortcut.conv', Result.Resnet.Shortcut,
+        False, 1, 1, 1, Config.PadMode, Consumed);
+  end;
+
+  procedure LoadTransformer(const Prefix: string;
+    var Layers: array of TMimiTransformerLayer);
+  var
+    li: integer;
+    P: string;
+  begin
+    for li := 0 to Config.NumHiddenLayers - 1 do
+    begin
+      P := Prefix + '.layers.' + IntToStr(li) + '.';
+      LoadMimiVec(Reader, P + 'input_layernorm.weight', Layers[li].LnInG, Consumed);
+      LoadMimiVec(Reader, P + 'input_layernorm.bias', Layers[li].LnInB, Consumed);
+      LoadMimiVec(Reader, P + 'post_attention_layernorm.weight',
+        Layers[li].LnPostG, Consumed);
+      LoadMimiVec(Reader, P + 'post_attention_layernorm.bias',
+        Layers[li].LnPostB, Consumed);
+      LoadMimiMat(Reader, P + 'self_attn.q_proj.weight', Layers[li].Wq, Consumed);
+      LoadMimiMat(Reader, P + 'self_attn.k_proj.weight', Layers[li].Wk, Consumed);
+      LoadMimiMat(Reader, P + 'self_attn.v_proj.weight', Layers[li].Wv, Consumed);
+      LoadMimiMat(Reader, P + 'self_attn.o_proj.weight', Layers[li].Wo, Consumed);
+      if Config.AttentionBias then
+      begin
+        LoadMimiVec(Reader, P + 'self_attn.q_proj.bias', Layers[li].Bq, Consumed);
+        LoadMimiVec(Reader, P + 'self_attn.k_proj.bias', Layers[li].Bk, Consumed);
+        LoadMimiVec(Reader, P + 'self_attn.v_proj.bias', Layers[li].Bv, Consumed);
+        LoadMimiVec(Reader, P + 'self_attn.o_proj.bias', Layers[li].Bo, Consumed);
+      end;
+      LoadMimiMat(Reader, P + 'mlp.fc1.weight', Layers[li].Fc1, Consumed);
+      LoadMimiMat(Reader, P + 'mlp.fc2.weight', Layers[li].Fc2, Consumed);
+      LoadMimiVec(Reader, P + 'self_attn_layer_scale.scale',
+        Layers[li].AttnScale, Consumed);
+      LoadMimiVec(Reader, P + 'mlp_layer_scale.scale',
+        Layers[li].MlpScale, Consumed);
+    end;
+  end;
+
+begin
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  Model := nil;
+  try
+    Model := TNNetMimi.Create(Config);
+    EncCnt := 0; DecCnt := 0;
+    NumRatios := Length(Config.UpsamplingRatios);
+
+    // ---------------- ENCODER conv stage list ----------------
+    PushEnc(MakeConvStage('encoder.layers.0.conv', 1, 1));
+    Idx := 1;
+    dim := Config.NumFilters;
+    for r := NumRatios - 1 downto 0 do
+    begin
+      ratio := Config.UpsamplingRatios[r];
+      for j := 0 to Config.NumResidualLayers - 1 do
+      begin
+        dil := Round(IntPower(Config.DilationGrowthRate, j));
+        PushEnc(MakeResnetStage('encoder.layers.' + IntToStr(Idx), dim, dil));
+        Inc(Idx);
+      end;
+      PushEnc(MakeELU); Inc(Idx);
+      PushEnc(MakeConvStage('encoder.layers.' + IntToStr(Idx) + '.conv', ratio, 1));
+      Inc(Idx);
+      dim := dim * 2;
+    end;
+    PushEnc(MakeELU); Inc(Idx);
+    PushEnc(MakeConvStage('encoder.layers.' + IntToStr(Idx) + '.conv', 1, 1));
+
+    // ---------------- DECODER conv stage list ----------------
+    ScalePow := 1;
+    for j := 0 to NumRatios - 1 do ScalePow := ScalePow * 2;
+    PushDec(MakeConvStage('decoder.layers.0.conv', 1, 1));
+    Idx := 1;
+    dim := ScalePow * Config.NumFilters;
+    for r := 0 to NumRatios - 1 do
+    begin
+      ratio := Config.UpsamplingRatios[r];
+      PushDec(MakeELU); Inc(Idx);
+      PushDec(MakeTConvStage('decoder.layers.' + IntToStr(Idx) + '.conv', ratio));
+      Inc(Idx);
+      dim := dim div 2;
+      for j := 0 to Config.NumResidualLayers - 1 do
+      begin
+        dil := Round(IntPower(Config.DilationGrowthRate, j));
+        PushDec(MakeResnetStage('decoder.layers.' + IntToStr(Idx), dim, dil));
+        Inc(Idx);
+      end;
+    end;
+    PushDec(MakeELU); Inc(Idx);
+    PushDec(MakeConvStage('decoder.layers.' + IntToStr(Idx) + '.conv', 1, 1));
+
+    SetLength(EncStages, EncCnt);
+    SetLength(DecStages, DecCnt);
+    Model.FEncStages := EncStages;
+    Model.FDecStages := DecStages;
+
+    // ---------------- transformers ----------------
+    SetLength(Model.FEncTransformer, Config.NumHiddenLayers);
+    SetLength(Model.FDecTransformer, Config.NumHiddenLayers);
+    LoadTransformer('encoder_transformer', Model.FEncTransformer);
+    LoadTransformer('decoder_transformer', Model.FDecTransformer);
+
+    // ---------------- downsample / upsample ----------------
+    DownK := 2 * Round(Config.EncodecFrameRate / Config.FrameRate);
+    LoadMimiConv(Reader, 'downsample.conv', Model.FDownsample, False, 2, 1, 1,
+      'replicate', Consumed);
+    LoadMimiConv(Reader, 'upsample.conv', Model.FUpsample, True, 2, 1,
+      Config.UpsampleGroups, Config.PadMode, Consumed);
+    if DownK <> Model.FDownsample.Kernel then
+      ; // kernel comes from the tensor; DownK is informational only
+
+    // ---------------- split RVQ codebooks + projections ----------------
+    NSem := Config.NumSemanticQuantizers;
+    NAco := Config.NumQuantizers - Config.NumSemanticQuantizers;
+    SetLength(Model.FSemCodebooks, NSem);
+    SetLength(Model.FAcoCodebooks, NAco);
+    for j := 0 to NSem - 1 do
+    begin
+      Pref := 'quantizer.semantic_residual_vector_quantizer.layers.' +
+        IntToStr(j) + '.codebook.';
+      LoadMimiCodebook(Reader, Pref, Model.FSemCodebooks[j], 1e-5, Consumed);
+    end;
+    for j := 0 to NAco - 1 do
+    begin
+      Pref := 'quantizer.acoustic_residual_vector_quantizer.layers.' +
+        IntToStr(j) + '.codebook.';
+      LoadMimiCodebook(Reader, Pref, Model.FAcoCodebooks[j], 1e-5, Consumed);
+    end;
+    // 1x1 in/out projections (present iff vq dim != hidden).
+    TPref := 'quantizer.semantic_residual_vector_quantizer.';
+    if Reader.HasTensor(TPref + 'input_proj.weight') then
+    begin
+      LoadMimiConv(Reader, TPref + 'input_proj', Model.FSemInProj, False, 1, 1, 1,
+        Config.PadMode, Consumed);
+      LoadMimiConv(Reader, TPref + 'output_proj', Model.FSemOutProj, False, 1, 1, 1,
+        Config.PadMode, Consumed);
+    end;
+    TPref := 'quantizer.acoustic_residual_vector_quantizer.';
+    if Reader.HasTensor(TPref + 'input_proj.weight') then
+    begin
+      LoadMimiConv(Reader, TPref + 'input_proj', Model.FAcoInProj, False, 1, 1, 1,
+        Config.PadMode, Consumed);
+      LoadMimiConv(Reader, TPref + 'output_proj', Model.FAcoOutProj, False, 1, 1, 1,
+        Config.PadMode, Consumed);
+    end;
+
+    L := L; // silence
+    Result := Model;
+    Model := nil;
+  finally
+    Model.Free;
+    Consumed.Free;
+  end;
+end;
+
+function BuildMimiFromSafeTensors(const FileName: string;
+  out Config: TMimiConfig;
+  const ConfigFileName: string = ''): TNNetMimi;
+var
+  Reader: TNNetSafeTensorsReader;
+  CfgPath: string;
+begin
+  if ConfigFileName <> '' then CfgPath := ConfigFileName
+  else CfgPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadMimiConfigFromJSONFile(CfgPath);
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildMimiFromSafeTensorsEx(Reader, Config);
+  finally
+    Reader.Free;
+  end;
+end;
+
 // ============================ HIFI-GAN VOCODER IMPORT ======================
 
 function ReadHiFiGANConfigFromJSONFile(const FileName: string): THiFiGANConfig;
@@ -57220,6 +58483,16 @@ begin
       'BuildSigLIPFromSafeTensors (returns both nets; pool with ' +
       'ClipExtractEmbedding - text row SeqLen-1, image row 0 - and score ' +
       'with SigLIPLogit) instead of this single-net dispatch.');
+  end
+  else if ModelType = 'mimi' then
+  begin
+    // Mimi is a streaming neural audio CODEC: the import builds a
+    // channel-major TNNetMimi holder (Encode/Decode), not a TNNet graph.
+    Result := nil;
+    ImportError('BuildFromPretrained: model_type "mimi" builds a NEURAL ' +
+      'AUDIO CODEC holder - call BuildMimiFromSafeTensors (returns a ' +
+      'TNNetMimi; round-trip waveform <-> codes with Encode / Decode) ' +
+      'instead of this single-net dispatch.');
   end
   else
   begin

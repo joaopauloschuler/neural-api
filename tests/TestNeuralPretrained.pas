@@ -284,6 +284,12 @@ type
     // (waveform -> RVQ codes -> waveform) and asserts the codes match the HF
     // oracle EXACTLY and the reconstructed waveform matches < 1e-4.
     procedure TestEnCodecRoundTripParity;
+    // Mimi: round-trips three pinned waveforms through the imported Mimi codec
+    // (waveform -> conv encoder -> RoPE transformer -> downsample -> split
+    // semantic/acoustic RVQ -> codes -> ... -> waveform) and asserts the codes
+    // match the HF MimiModel float64 oracle EXACTLY and the reconstructed
+    // waveform matches < 1e-4.
+    procedure TestMimiParity;
     // HiFi-GAN: synthesizes three pinned log-mel clips through the imported
     // vocoder (mel -> waveform) and asserts the waveform matches the HF
     // SpeechT5HifiGan float64 oracle < 1e-4.
@@ -12578,6 +12584,87 @@ begin
     // 1e-4 importer-parity gate (the committed-fixture convention). NEVER
     // loosen - fix the model instead.
     AssertTrue('EnCodec round-trip waveform parity: max |diff| = ' +
+      FloatToStr(MaxReconDiff) + ' must be < 1e-4', MaxReconDiff < 1e-4);
+  finally
+    Model.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMimiParity;
+var
+  Model: TNNetMimi;
+  Config: TMimiConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Clips, Clip, InArr, ReconArr, CodeStack, CodeRow: TJSONArray;
+  Wave, Recon: TNeuralFloatDynArr;
+  Codes: TNNetIntArr2D;
+  Frames, ci, i, q, t, MaxCodeDiff: integer;
+  Diff, MaxReconDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_mimi_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Clips := TJSONArray(TJSONObject(RefRoot).Find('clips'));
+    AssertTrue('clips present', Clips <> nil);
+    AssertTrue('at least 3 clips', Clips.Count >= 3);
+
+    Model := BuildMimiFromSafeTensors(
+      FixturePath('tiny_mimi.safetensors'), Config,
+      FixturePath('tiny_mimi_config.json'));
+    AssertTrue('codec built', Model <> nil);
+    AssertEquals('total quantizers from config',
+      TJSONObject(RefRoot).Get('num_quantizers', 0), Model.NumCodebooks);
+    AssertTrue('split RVQ exercised (semantic + acoustic)',
+      Model.NumCodebooks >= 2);
+    AssertEquals('hidden size from config',
+      TJSONObject(RefRoot).Get('hidden_size', 0), Config.HiddenSize);
+
+    MaxCodeDiff := 0;
+    MaxReconDiff := 0;
+    for ci := 0 to Clips.Count - 1 do
+    begin
+      Clip := TJSONArray(Clips.Items[ci]);
+      InArr := TJSONArray(TJSONObject(Clip).Find('input'));
+      ReconArr := TJSONArray(TJSONObject(Clip).Find('recon'));
+      CodeStack := TJSONArray(TJSONObject(Clip).Find('codes'));
+      SetLength(Wave, InArr.Count);
+      for i := 0 to InArr.Count - 1 do Wave[i] := InArr.Items[i].AsFloat;
+
+      // Encode: the split-VQ code stack must match the oracle EXACTLY.
+      Model.Encode(Wave, Codes, Frames);
+      AssertEquals('RVQ stages', CodeStack.Count, Length(Codes));
+      AssertEquals('latent frame count',
+        TJSONArray(CodeStack.Items[0]).Count, Frames);
+      for q := 0 to CodeStack.Count - 1 do
+      begin
+        CodeRow := TJSONArray(CodeStack.Items[q]);
+        for t := 0 to CodeRow.Count - 1 do
+        begin
+          Diff := Abs(Codes[q][t] - CodeRow.Items[t].AsInteger);
+          if Diff > MaxCodeDiff then MaxCodeDiff := Round(Diff);
+        end;
+      end;
+
+      // Decode and compare to the float64 oracle.
+      Model.Decode(Codes, Recon);
+      AssertEquals('reconstructed length', ReconArr.Count, Length(Recon));
+      for i := 0 to ReconArr.Count - 1 do
+      begin
+        Diff := Abs(Recon[i] - ReconArr.Items[i].AsFloat);
+        if Diff > MaxReconDiff then MaxReconDiff := Diff;
+      end;
+    end;
+    AssertEquals('Mimi split-VQ codes must match the oracle exactly',
+      0, MaxCodeDiff);
+    // 1e-4 importer-parity gate. NEVER loosen - fix the model instead.
+    AssertTrue('Mimi round-trip waveform parity: max |diff| = ' +
       FloatToStr(MaxReconDiff) + ' must be < 1e-4', MaxReconDiff < 1e-4);
   finally
     Model.Free;

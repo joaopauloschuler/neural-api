@@ -747,10 +747,10 @@ rather than acted on.
       feed pre-phonemized input and reject `language`/g2p config loudly, exactly as the
       VITS uroman/phonemizer front-ends are deferred. Unlocks the missing inverse-STFT
       vocoding rung shared with any spectral-domain generator.
-- [ ] Mimi streaming neural-codec importer (`BuildMimiFromSafeTensors[Ex]` +
+- [X] Mimi streaming neural-codec importer (`BuildMimiFromSafeTensors[Ex]` +
       `ReadMimiConfigFromJSONFile`/`MimiConfigToString` + `TMimiConfig` + a
       channel-major `TNNetMimi` holder with `Encode`/`Decode` like the landed
-      `TEnCodecModel`; model_type "mimi", e.g. `kyutai/mimi`). The neural audio
+      `TEnCodecModel`; model_type "mimi", e.g. `kyutai/mimi`) — LANDED. The neural audio
       tokenizer behind the current wave of speech LMs (Moshi, Kyutai-TTS, Sesame
       CSM), so importing it is the prerequisite codec for that whole family — the
       audio analogue of the role EnCodec plays for MusicGen. DISTINCT from the
@@ -770,8 +770,27 @@ rather than acted on.
       `MimiModel` oracle (`tools/make_pico_mimi_fixture.py` -> committed
       `tests/fixtures/tiny_mimi.*`, re-randomized O(1)-scale weights), plus an
       examples/MimiCodec round-trip smoke that encodes and resynthesizes a short
-      clip via `SaveVolumeToWav16`. Real-checkpoint parity + a streaming
-      (chunk-at-a-time) encode/decode path are follow-ups.
+      clip via `SaveVolumeToWav16`. LANDED: split-VQ codes match the HF `MimiModel`
+      float64 oracle EXACTLY and the round-trip waveform to max|diff| ~1e-12
+      (`TestMimiParity`, generator `tools/mimi_tiny_fixture.py` -> committed
+      `tests/fixtures/tiny_mimi.*`); the holder carries its signal in double
+      precision (weights F32). model_type "mimi" wired into `BuildFromPretrained`
+      (helpful "call BuildMimiFromSafeTensors" error, like whisper/clip).
+      Implementation notes: Mimi pad_mode is "constant" (zero left-pad, NOT
+      EnCodec's reflect); conv weights are plain `.conv.weight` (no weight_norm);
+      codebook is `embed_sum`/`clamp(cluster_usage, eps)`; RoPE uses the Llama
+      `rotate_half` convention (snapshot the head's original values — an in-place
+      rotation silently feeds the rotated first half into the second half, a
+      position-dependent bug that argmin-quantization masks on the codes but
+      corrupts the decoded waveform); downsample conv uses "replicate" pad; upsample
+      is a GROUPED `ConvTranspose1d` (groups = hidden_size).
+      Remaining follow-ups (sub-bullets):
+  - [ ] Mimi REAL-checkpoint parity vs the downloaded `kyutai/mimi` (encode codes +
+        decode waveform) — the pico fixture pins the wiring; a real run pins widths,
+        the GELU/erf path at scale, and the F32-storage budget on a trained model.
+  - [ ] Mimi STREAMING chunk-at-a-time encode/decode (HF `MimiConv1dPaddingCache`
+        per-conv padding cache + KV-cache transformer decode via the landed SDPA
+        Begin/EndIncrementalDecode) for O(1) per-frame Moshi-style inference.
 - [ ] CLAP audio-text contrastive importer (`BuildClapFromSafeTensors[Ex]` +
       `BuildClapFromSafeTensorsWithConfig`, `TClapConfig`/`ReadClapConfigFromJSONFile`)
       + examples/ZeroShotAudioTag — LANDED. Audio-domain analogue of the CLIP
