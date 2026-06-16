@@ -19,7 +19,8 @@ uses
   TestNeuralMaskedLM,
   TestNeuralHFTokenizer, TestNeuralHFHub, TestNeuralNumpy,
   TestNeuralTokenizer, TestNeuralImagePreprocess,
-  TestNeuralDiffusion, TestNeuralImageMetrics, TestNeuralAudio;
+  TestNeuralDiffusion, TestNeuralImageMetrics, TestNeuralAudio,
+  TestNeuralAugment;
 
 type
   TMyTestRunner = class(TTestRunner)

@@ -342,6 +342,12 @@ type
       property ShouldQuit: boolean read FShouldQuit write FShouldQuit;
   end;
 
+  // Optional in-place single-image augmentation hook (pInput, ThreadId).
+  // Declared here so TNeuralFitWithImageBase descendants (e.g. TNeuralImageFit)
+  // can opt into a custom policy such as RandAugment / TrivialAugment from
+  // neuraldatasets, layered on top of the built-in flip+crop pipeline.
+  TNNetImageAugmentationFn = procedure(pInput: TNNetVolume; ThreadId: integer) of object;
+
   { TNeuralFitWithImageBase }
 
   TNeuralFitWithImageBase = class(TNeuralFitBase)
@@ -354,6 +360,7 @@ type
       FHasResizing: boolean;
       FColorEncoding: integer;
       FChannelShiftRate: TNeuralFloat;
+      FImageAugmentationFn: TNNetImageAugmentationFn;
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -370,6 +377,9 @@ type
       property HasFlipY: boolean read FHasFlipY write FHasFlipY;
       property HasResizing: boolean read FHasResizing write FHasResizing;
       property MaxCropSize: integer read FMaxCropSize write FMaxCropSize;
+      // Optional opt-in single-image augmentation policy applied AFTER the
+      // built-in flip/crop pipeline (nil = disabled, the default).
+      property ImageAugmentationFn: TNNetImageAugmentationFn read FImageAugmentationFn write FImageAugmentationFn;
   end;
 
   TNNetDataAugmentationFn = procedure(pInput: TNNetVolume; ThreadId: integer) of object;
@@ -913,6 +923,7 @@ begin
   FColorEncoding := 0;
   FMultipleSamplesAtValidation := false;
   FChannelShiftRate := 0;
+  FImageAugmentationFn := nil;
 end;
 
 destructor TNeuralFitWithImageBase.Destroy();
@@ -2988,6 +2999,12 @@ begin
       begin
         ImgInput.FlipY();
       end;
+
+      // Optional opt-in single-image augmentation policy (e.g. RandAugment /
+      // TrivialAugment from neuraldatasets), applied in place on top of the
+      // built-in flip/crop pipeline. Disabled (nil) by default.
+      if Assigned(FImageAugmentationFn) then
+        FImageAugmentationFn(ImgInput, index);
     end
     else
     begin

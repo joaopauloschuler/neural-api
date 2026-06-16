@@ -366,7 +366,7 @@ rather than acted on.
       diffusers float64 oracle on the down/mid residual tensors for a fixed control
       image; an examples/ControlNetCanny that conditions generation on a hand-drawn
       edge map once the base UNet lands. First conditioning-by-feature-injection model.
-- [ ] RandAugment / TrivialAugment automatic augmentation policy in
+- [X] RandAugment / TrivialAugment automatic augmentation policy in
       neuraldatasets.pas — the repo has Mixup and CutMix (both landed) but NO
       single-image geometric/photometric augmentation policy; CV training augmentation
       is currently just flips + pad-crop. Port the torchvision transforms-v2 staple:

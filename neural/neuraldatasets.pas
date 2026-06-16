@@ -338,6 +338,103 @@ procedure TestBatch
 // This function translates the original CIFAR10 labels to Animal/Machine labels.
 procedure TranslateCifar10VolumesToMachineAnimal(VolumeList: TNNetVolumeList);
 
+// ----------------------------------------------------------------------------
+//  RandAugment / TrivialAugment automatic augmentation policy
+// ----------------------------------------------------------------------------
+//  Single-image geometric/photometric augmentation, ported from the
+//  torchvision transforms-v2 staple. The op bank and both selection policies
+//  operate IN PLACE on a TNNetVolume holding an RGB(/gray) image in this
+//  library's neuronal input domain ([-2..2], i.e. (pixel-128)/64). All ops
+//  keep the result clamped to that domain.
+//
+//  Magnitude convention follows torchvision RandAugment: an integer M in
+//  0..NeuralAugMaxMagnitude (default 10), 0 being (close to) identity. Each
+//  op maps M onto its torchvision _AUGMENTATION_SPACE range.
+// ----------------------------------------------------------------------------
+
+const
+  // Maximum magnitude value (torchvision uses num_magnitude_bins=31 -> M in
+  // 0..30 by default; RandAugment's default magnitude is 9 on that scale.
+  // We keep the same 0..30 scale).
+  NeuralAugMaxMagnitude: integer = 30;
+
+type
+  // Identifiers for the single-image augmentation op bank. csaIdentity is a
+  // genuine no-op; the geometric/photometric ops map magnitude M as described
+  // above.
+  TNeuralAugOp = (
+    csaIdentity,
+    csaAutoContrast,
+    csaEqualize,
+    csaRotate,
+    csaShearX,
+    csaShearY,
+    csaTranslateX,
+    csaTranslateY,
+    csaPosterize,
+    csaSolarize,
+    csaColor,
+    csaContrast,
+    csaBrightness,
+    csaSharpness
+  );
+
+// Applies a single augmentation op IN PLACE on V (neuronal [-2..2] image).
+// Magnitude is the integer M on the 0..NeuralAugMaxMagnitude scale. For
+// signed geometric ops (rotate/shear/translate) the sign is chosen randomly
+// (torchvision behaviour) unless pSignedNeg is supplied. Photometric ops are
+// clamped to the valid image domain.
+procedure NeuralAugApplyOp(V: TNNetVolume; Op: TNeuralAugOp; Magnitude: integer);
+
+// RandAugment (Cubuk et al. 2020): apply N ops drawn uniformly from the bank,
+// each at the SAME fixed magnitude M. Operates IN PLACE on V. Deterministic
+// for a fixed RandSeed.
+procedure NeuralRandAugment(V: TNNetVolume; N: integer = 2; Magnitude: integer = 9);
+
+// TrivialAugment (Muller & Hutter 2021): apply exactly ONE op drawn uniformly
+// from the bank, with its magnitude drawn uniformly from 0..NeuralAugMaxMagnitude.
+// Parameter-free. Operates IN PLACE on V. Deterministic for a fixed RandSeed.
+procedure NeuralTrivialAugment(V: TNNetVolume);
+
+// RandomErasing / Cutout (Zhong et al. 2020 / DeVries & Taylor 2017): with
+// probability pProb, erase a random rectangle whose area is a fraction in
+// [pAreaLow,pAreaHigh] of the image (aspect in [pAspectLow,1/pAspectLow]) by
+// filling it with pFill (in the neuronal domain; default 0 = neutral gray).
+// Operates IN PLACE. Deterministic for a fixed RandSeed.
+procedure NeuralRandomErasing(V: TNNetVolume;
+  pProb: TNeuralFloat = 0.5;
+  pAreaLow: TNeuralFloat = 0.02; pAreaHigh: TNeuralFloat = 0.33;
+  pAspectLow: TNeuralFloat = 0.3; pFill: TNeuralFloat = 0.0);
+
+type
+  // Selection policy for the optional TNeuralImageFit augmentation hook.
+  TNeuralAugPolicy = (napNone, napRandAugment, napTrivialAugment);
+
+  // TNeuralAugmentationPolicy is a tiny, stateless-per-call helper that bundles
+  // a chosen policy (RandAugment / TrivialAugment) plus an optional
+  // RandomErasing pass into a single procedure-of-object compatible with
+  // TNNetDataAugmentationFn (see neuralfit.pas). Assign its Augment method to
+  // TNeuralImageFit.DataAugmentationFn to opt CIFAR examples into the policy
+  // WITHOUT disturbing the default flip+crop pipeline.
+  // Coded by Claude (AI).
+  TNeuralAugmentationPolicy = class(TObject)
+  private
+    FPolicy: TNeuralAugPolicy;
+    FNumOps: integer;
+    FMagnitude: integer;
+    FErasingProb: TNeuralFloat;
+  public
+    constructor Create(pPolicy: TNeuralAugPolicy = napTrivialAugment;
+      pNumOps: integer = 2; pMagnitude: integer = 9;
+      pErasingProb: TNeuralFloat = 0.25);
+    // Signature matches TNNetDataAugmentationFn (pInput, ThreadId).
+    procedure Augment(pInput: TNNetVolume; ThreadId: integer);
+    property Policy: TNeuralAugPolicy read FPolicy write FPolicy;
+    property NumOps: integer read FNumOps write FNumOps;
+    property Magnitude: integer read FMagnitude write FMagnitude;
+    property ErasingProb: TNeuralFloat read FErasingProb write FErasingProb;
+  end;
+
 {
   RandomSubstring:
   This NLP function takes a string as input and returns a substring that starts
@@ -3821,6 +3918,500 @@ begin
     SpacePositions.Free;
   end
   else Result := '';
+end;
+
+// ----------------------------------------------------------------------------
+//  RandAugment / TrivialAugment automatic augmentation policy - implementation
+// ----------------------------------------------------------------------------
+
+// Neuronal domain <-> 0..255 pixel helpers. RGB neuronal input uses
+// p = (px - 128)/64, so px = p*64 + 128 and the valid neuronal range is
+// [-2 .. (255-128)/64 = 1.984375]. We treat [-2..2] as the clamp domain to
+// match the rest of the library (RgbImgToNeuronalInput comment).
+const
+  cAugNeuronMin: TNeuralFloat = -2.0;
+  cAugNeuronMax: TNeuralFloat =  2.0;
+
+function AugNeuronToPixel(v: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+begin
+  Result := v * 64.0 + 128.0;
+end;
+
+function AugPixelToNeuron(p: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+begin
+  Result := (p - 128.0) / 64.0;
+end;
+
+function AugClampNeuron(v: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+begin
+  if v < cAugNeuronMin then Result := cAugNeuronMin
+  else if v > cAugNeuronMax then Result := cAugNeuronMax
+  else Result := v;
+end;
+
+function AugClampPixel(p: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+begin
+  if p < 0 then Result := 0
+  else if p > 255 then Result := 255
+  else Result := p;
+end;
+
+// Linearly interpolate every pixel toward a per-channel "degenerate" image:
+//   out = blend*degenerate + (1-blend)*original   (torchvision _blend).
+// Here we blend toward a scalar gray value per the photometric op.
+procedure AugBlendTowardScalar(V: TNNetVolume; GrayPixel, Factor: TNeuralFloat);
+var
+  I: integer;
+  p: TNeuralFloat;
+begin
+  // out_px = Factor*orig_px + (1-Factor)*gray  (torchvision uses
+  //   img2 = (1-ratio)*degenerate + ratio*img). Factor>1 enhances.
+  for I := 0 to V.Size - 1 do
+  begin
+    p := AugNeuronToPixel(V.FData[I]);
+    p := Factor * p + (1.0 - Factor) * GrayPixel;
+    V.FData[I] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
+  end;
+end;
+
+// Bilinear-free nearest geometric warp helper. Maps each destination pixel
+// (dx,dy) back to a source pixel via an affine transform around the image
+// center; out-of-bounds samples are filled with neutral gray (neuronal 0).
+// Mat is [a,b,c, d,e,f] s.t. src = Mat * (dst_centered) + center.
+procedure AugAffineWarp(V: TNNetVolume; const Mat: array of TNeuralFloat);
+var
+  W, H, Dep, dx, dy, d, sx, sy: integer;
+  cx, cy, ox, oy, fx, fy: TNeuralFloat;
+  Src: TNNetVolume;
+begin
+  W := V.SizeX; H := V.SizeY; Dep := V.Depth;
+  if (W <= 0) or (H <= 0) then Exit;
+  Src := TNNetVolume.Create;
+  Src.Copy(V);
+  cx := (W - 1) / 2.0;
+  cy := (H - 1) / 2.0;
+  for dy := 0 to H - 1 do
+    for dx := 0 to W - 1 do
+    begin
+      ox := dx - cx;
+      oy := dy - cy;
+      fx := Mat[0] * ox + Mat[1] * oy + Mat[2] + cx;
+      fy := Mat[3] * ox + Mat[4] * oy + Mat[5] + cy;
+      sx := Round(fx);
+      sy := Round(fy);
+      for d := 0 to Dep - 1 do
+      begin
+        if (sx >= 0) and (sx < W) and (sy >= 0) and (sy < H)
+          then V[dx, dy, d] := Src[sx, sy, d]
+          else V[dx, dy, d] := 0.0; // neutral gray fill (pixel 128)
+      end;
+    end;
+  Src.Free;
+end;
+
+// --- Photometric ops -------------------------------------------------------
+
+procedure AugAutoContrast(V: TNNetVolume);
+var
+  d, x, y: integer;
+  lo, hi, p, scale: TNeuralFloat;
+begin
+  // Per-channel min/max stretch to full 0..255 range (torchvision autocontrast).
+  for d := 0 to V.Depth - 1 do
+  begin
+    lo := 255; hi := 0;
+    for y := 0 to V.SizeY - 1 do
+      for x := 0 to V.SizeX - 1 do
+      begin
+        p := AugClampPixel(AugNeuronToPixel(V[x, y, d]));
+        if p < lo then lo := p;
+        if p > hi then hi := p;
+      end;
+    if hi <= lo then continue;
+    scale := 255.0 / (hi - lo);
+    for y := 0 to V.SizeY - 1 do
+      for x := 0 to V.SizeX - 1 do
+      begin
+        p := AugClampPixel(AugNeuronToPixel(V[x, y, d]));
+        p := (p - lo) * scale;
+        V[x, y, d] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
+      end;
+  end;
+end;
+
+procedure AugEqualize(V: TNNetVolume);
+var
+  d, x, y, i, b, total: integer;
+  hist: array[0..255] of integer;
+  cdf: array[0..255] of integer;
+  lut: array[0..255] of TNeuralFloat;
+  cdfMin, denom, p: TNeuralFloat;
+  acc: integer;
+begin
+  // Per-channel histogram equalization (torchvision equalize).
+  for d := 0 to V.Depth - 1 do
+  begin
+    for i := 0 to 255 do hist[i] := 0;
+    for y := 0 to V.SizeY - 1 do
+      for x := 0 to V.SizeX - 1 do
+      begin
+        b := Round(AugClampPixel(AugNeuronToPixel(V[x, y, d])));
+        if b < 0 then b := 0; if b > 255 then b := 255;
+        Inc(hist[b]);
+      end;
+    acc := 0;
+    cdfMin := -1;
+    for i := 0 to 255 do
+    begin
+      Inc(acc, hist[i]);
+      cdf[i] := acc;
+      if (cdfMin < 0) and (hist[i] > 0) then cdfMin := acc;
+    end;
+    total := V.SizeX * V.SizeY;
+    denom := total - cdfMin;
+    if denom <= 0 then
+    begin
+      // Flat channel: identity LUT.
+      for i := 0 to 255 do lut[i] := i;
+    end
+    else
+      for i := 0 to 255 do
+        lut[i] := AugClampPixel(((cdf[i] - cdfMin) / denom) * 255.0);
+    for y := 0 to V.SizeY - 1 do
+      for x := 0 to V.SizeX - 1 do
+      begin
+        b := Round(AugClampPixel(AugNeuronToPixel(V[x, y, d])));
+        if b < 0 then b := 0; if b > 255 then b := 255;
+        p := lut[b];
+        V[x, y, d] := AugClampNeuron(AugPixelToNeuron(p));
+      end;
+  end;
+end;
+
+function AugChannelMeanGray(V: TNNetVolume): TNeuralFloat;
+var
+  I: integer;
+  s: TNeuralFloat;
+begin
+  // Luminance-ish mean over all pixels (used by Color/Contrast degenerate).
+  s := 0;
+  for I := 0 to V.Size - 1 do
+    s := s + AugClampPixel(AugNeuronToPixel(V.FData[I]));
+  if V.Size > 0 then Result := s / V.Size else Result := 128;
+end;
+
+procedure AugColor(V: TNNetVolume; Factor: TNeuralFloat);
+var
+  W, H, Dep, x, y, d: integer;
+  gray, p: TNeuralFloat;
+begin
+  // Saturation adjustment: blend each pixel toward its per-pixel grayscale.
+  W := V.SizeX; H := V.SizeY; Dep := V.Depth;
+  if Dep < 2 then
+  begin
+    // Single channel: color has no effect.
+    Exit;
+  end;
+  for y := 0 to H - 1 do
+    for x := 0 to W - 1 do
+    begin
+      gray := 0;
+      for d := 0 to Dep - 1 do
+        gray := gray + AugClampPixel(AugNeuronToPixel(V[x, y, d]));
+      gray := gray / Dep;
+      for d := 0 to Dep - 1 do
+      begin
+        p := AugClampPixel(AugNeuronToPixel(V[x, y, d]));
+        p := Factor * p + (1.0 - Factor) * gray;
+        V[x, y, d] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
+      end;
+    end;
+end;
+
+procedure AugContrast(V: TNNetVolume; Factor: TNeuralFloat);
+begin
+  // Blend toward the global mean gray.
+  AugBlendTowardScalar(V, AugChannelMeanGray(V), Factor);
+end;
+
+procedure AugBrightness(V: TNNetVolume; Factor: TNeuralFloat);
+begin
+  // Blend toward black (pixel 0).
+  AugBlendTowardScalar(V, 0.0, Factor);
+end;
+
+procedure AugSharpness(V: TNNetVolume; Factor: TNeuralFloat);
+var
+  W, H, Dep, x, y, d, ix, iy: integer;
+  Src: TNNetVolume;
+  acc, wsum, p, smooth: TNeuralFloat;
+  kw: TNeuralFloat;
+begin
+  // Blend toward a 3x3 box-blurred image (torchvision uses a smoothing kernel;
+  // a box blur is a close, dependency-free stand-in). Factor>1 sharpens.
+  W := V.SizeX; H := V.SizeY; Dep := V.Depth;
+  if (W < 3) or (H < 3) then Exit;
+  Src := TNNetVolume.Create;
+  Src.Copy(V);
+  for d := 0 to Dep - 1 do
+    for y := 0 to H - 1 do
+      for x := 0 to W - 1 do
+      begin
+        // Interior pixels get blurred; the 1px border is left unchanged
+        // (matches torchvision which keeps the border).
+        if (x = 0) or (y = 0) or (x = W - 1) or (y = H - 1) then continue;
+        acc := 0; wsum := 0;
+        for iy := -1 to 1 do
+          for ix := -1 to 1 do
+          begin
+            if (ix = 0) and (iy = 0) then kw := 5 else kw := 1;
+            acc := acc + kw * AugClampPixel(AugNeuronToPixel(Src[x + ix, y + iy, d]));
+            wsum := wsum + kw;
+          end;
+        smooth := acc / wsum;
+        p := AugClampPixel(AugNeuronToPixel(Src[x, y, d]));
+        p := Factor * p + (1.0 - Factor) * smooth;
+        V[x, y, d] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
+      end;
+  Src.Free;
+end;
+
+procedure AugPosterize(V: TNNetVolume; Bits: integer);
+var
+  mask, I, b: integer;
+begin
+  if Bits < 1 then Bits := 1;
+  if Bits > 8 then Bits := 8;
+  if Bits = 8 then Exit; // identity
+  mask := (255 shl (8 - Bits)) and 255;
+  for I := 0 to V.Size - 1 do
+  begin
+    b := Round(AugClampPixel(AugNeuronToPixel(V.FData[I])));
+    if b < 0 then b := 0; if b > 255 then b := 255;
+    b := b and mask;
+    V.FData[I] := AugClampNeuron(AugPixelToNeuron(b));
+  end;
+end;
+
+procedure AugSolarize(V: TNNetVolume; Threshold: TNeuralFloat);
+var
+  I: integer;
+  p: TNeuralFloat;
+begin
+  for I := 0 to V.Size - 1 do
+  begin
+    p := AugClampPixel(AugNeuronToPixel(V.FData[I]));
+    if p >= Threshold then p := 255 - p;
+    V.FData[I] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
+  end;
+end;
+
+// --- Geometric ops ---------------------------------------------------------
+
+procedure AugRotate(V: TNNetVolume; DegAngle: TNeuralFloat);
+var
+  rad, c, s: TNeuralFloat;
+  Mat: array[0..5] of TNeuralFloat;
+begin
+  if DegAngle = 0 then Exit; // bit-identity
+  rad := DegAngle * Pi / 180.0;
+  c := Cos(rad); s := Sin(rad);
+  // Inverse rotation (dst -> src) so we sample. Rotating image by +theta uses
+  // src = R(-theta)*dst.
+  Mat[0] := c;  Mat[1] := s;  Mat[2] := 0;
+  Mat[3] := -s; Mat[4] := c;  Mat[5] := 0;
+  AugAffineWarp(V, Mat);
+end;
+
+procedure AugShearX(V: TNNetVolume; ShearFactor: TNeuralFloat);
+var
+  Mat: array[0..5] of TNeuralFloat;
+begin
+  if ShearFactor = 0 then Exit; // bit-identity
+  // src_x = dst_x - shear*dst_y (inverse of x' = x + shear*y).
+  Mat[0] := 1; Mat[1] := -ShearFactor; Mat[2] := 0;
+  Mat[3] := 0; Mat[4] := 1;            Mat[5] := 0;
+  AugAffineWarp(V, Mat);
+end;
+
+procedure AugShearY(V: TNNetVolume; ShearFactor: TNeuralFloat);
+var
+  Mat: array[0..5] of TNeuralFloat;
+begin
+  if ShearFactor = 0 then Exit; // bit-identity
+  Mat[0] := 1;            Mat[1] := 0; Mat[2] := 0;
+  Mat[3] := -ShearFactor; Mat[4] := 1; Mat[5] := 0;
+  AugAffineWarp(V, Mat);
+end;
+
+procedure AugTranslateX(V: TNNetVolume; Pixels: TNeuralFloat);
+var
+  Mat: array[0..5] of TNeuralFloat;
+begin
+  if Pixels = 0 then Exit; // bit-identity
+  // Shift content by +Pixels -> sample from src_x = dst_x - Pixels.
+  Mat[0] := 1; Mat[1] := 0; Mat[2] := -Pixels;
+  Mat[3] := 0; Mat[4] := 1; Mat[5] := 0;
+  AugAffineWarp(V, Mat);
+end;
+
+procedure AugTranslateY(V: TNNetVolume; Pixels: TNeuralFloat);
+var
+  Mat: array[0..5] of TNeuralFloat;
+begin
+  if Pixels = 0 then Exit; // bit-identity
+  Mat[0] := 1; Mat[1] := 0; Mat[2] := 0;
+  Mat[3] := 0; Mat[4] := 1; Mat[5] := -Pixels;
+  AugAffineWarp(V, Mat);
+end;
+
+// --- Magnitude mapping (torchvision _AUGMENTATION_SPACE) --------------------
+
+function AugMagFrac(Magnitude: integer): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+begin
+  // Maps M in 0..NeuralAugMaxMagnitude to t in 0..1.
+  if NeuralAugMaxMagnitude <= 0 then Result := 0
+  else Result := Magnitude / NeuralAugMaxMagnitude;
+  if Result < 0 then Result := 0;
+  if Result > 1 then Result := 1;
+end;
+
+function AugRandSign: TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+begin
+  if Random(2) = 0 then Result := 1.0 else Result := -1.0;
+end;
+
+procedure NeuralAugApplyOp(V: TNNetVolume; Op: TNeuralAugOp; Magnitude: integer);
+var
+  t, sgn: TNeuralFloat;
+  W, H: integer;
+begin
+  if (V = nil) or (V.Size = 0) then Exit;
+  W := V.SizeX; H := V.SizeY;
+  t := AugMagFrac(Magnitude);
+  case Op of
+    csaIdentity: ; // no-op
+    csaAutoContrast: AugAutoContrast(V);   // parameter-free
+    csaEqualize:     AugEqualize(V);       // parameter-free
+    csaRotate:
+      begin
+        sgn := AugRandSign;
+        AugRotate(V, sgn * t * 30.0);      // up to +/-30 deg
+      end;
+    csaShearX:
+      begin
+        sgn := AugRandSign;
+        AugShearX(V, sgn * t * 0.3);       // up to +/-0.3
+      end;
+    csaShearY:
+      begin
+        sgn := AugRandSign;
+        AugShearY(V, sgn * t * 0.3);
+      end;
+    csaTranslateX:
+      begin
+        sgn := AugRandSign;
+        AugTranslateX(V, sgn * t * (W * 0.45));
+      end;
+    csaTranslateY:
+      begin
+        sgn := AugRandSign;
+        AugTranslateY(V, sgn * t * (H * 0.45));
+      end;
+    csaPosterize:
+      // torchvision: bits = 8 - round(t*4); M=0 -> 8 bits (identity).
+      AugPosterize(V, 8 - Round(t * 4));
+    csaSolarize:
+      // threshold = 255*(1-t); M=0 -> 255 (identity).
+      AugSolarize(V, 255.0 * (1.0 - t));
+    csaColor:
+      AugColor(V, 1.0 + AugRandSign * t * 0.9);
+    csaContrast:
+      AugContrast(V, 1.0 + AugRandSign * t * 0.9);
+    csaBrightness:
+      AugBrightness(V, 1.0 + AugRandSign * t * 0.9);
+    csaSharpness:
+      AugSharpness(V, 1.0 + AugRandSign * t * 0.9);
+  end;
+end;
+
+procedure NeuralRandAugment(V: TNNetVolume; N: integer; Magnitude: integer);
+var
+  i, opIdx, opCount: integer;
+begin
+  if (V = nil) or (V.Size = 0) or (N <= 0) then Exit;
+  opCount := Ord(High(TNeuralAugOp)) + 1;
+  for i := 1 to N do
+  begin
+    // Uniform over the WHOLE bank including identity (torchvision includes it).
+    opIdx := Random(opCount);
+    NeuralAugApplyOp(V, TNeuralAugOp(opIdx), Magnitude);
+  end;
+end;
+
+procedure NeuralTrivialAugment(V: TNNetVolume);
+var
+  opIdx, opCount, mag: integer;
+begin
+  if (V = nil) or (V.Size = 0) then Exit;
+  opCount := Ord(High(TNeuralAugOp)) + 1;
+  opIdx := Random(opCount);
+  mag := Random(NeuralAugMaxMagnitude + 1); // uniform 0..max inclusive
+  NeuralAugApplyOp(V, TNeuralAugOp(opIdx), mag);
+end;
+
+procedure NeuralRandomErasing(V: TNNetVolume;
+  pProb: TNeuralFloat; pAreaLow, pAreaHigh, pAspectLow, pFill: TNeuralFloat);
+var
+  W, H, Dep, area, x0, y0, ew, eh, x, y, d, attempt: integer;
+  targetArea, aspect, logLo, logHi: TNeuralFloat;
+begin
+  if (V = nil) or (V.Size = 0) then Exit;
+  if Random >= pProb then Exit;
+  W := V.SizeX; H := V.SizeY; Dep := V.Depth;
+  if (W <= 0) or (H <= 0) then Exit;
+  area := W * H;
+  logLo := Ln(pAspectLow);
+  logHi := Ln(1.0 / pAspectLow);
+  for attempt := 1 to 10 do
+  begin
+    targetArea := (pAreaLow + Random * (pAreaHigh - pAreaLow)) * area;
+    aspect := Exp(logLo + Random * (logHi - logLo));
+    ew := Round(Sqrt(targetArea / aspect));
+    eh := Round(Sqrt(targetArea * aspect));
+    if (ew > 0) and (ew < W) and (eh > 0) and (eh < H) then
+    begin
+      x0 := Random(W - ew + 1);
+      y0 := Random(H - eh + 1);
+      for y := y0 to y0 + eh - 1 do
+        for x := x0 to x0 + ew - 1 do
+          for d := 0 to Dep - 1 do
+            V[x, y, d] := pFill;
+      Exit;
+    end;
+  end;
+end;
+
+{ TNeuralAugmentationPolicy }
+
+constructor TNeuralAugmentationPolicy.Create(pPolicy: TNeuralAugPolicy;
+  pNumOps: integer; pMagnitude: integer; pErasingProb: TNeuralFloat);
+begin
+  inherited Create;
+  FPolicy := pPolicy;
+  FNumOps := pNumOps;
+  FMagnitude := pMagnitude;
+  FErasingProb := pErasingProb;
+end;
+
+procedure TNeuralAugmentationPolicy.Augment(pInput: TNNetVolume; ThreadId: integer);
+begin
+  case FPolicy of
+    napRandAugment:    NeuralRandAugment(pInput, FNumOps, FMagnitude);
+    napTrivialAugment: NeuralTrivialAugment(pInput);
+  end;
+  if FErasingProb > 0 then
+    NeuralRandomErasing(pInput, FErasingProb);
 end;
 
 end.
