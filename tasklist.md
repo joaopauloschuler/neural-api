@@ -786,11 +786,18 @@ rather than acted on.
       embeddings vs the float64 HF `ClapModel` oracle (`TestClapParity`, generator
       `tools/clap_tiny_fixture.py`, committed `tests/fixtures/tiny_clap.*`).
       Follow-ups:
-  - [ ] freq_ratio > 1 (the real laion 1024-frame/64-mel `freq_ratio = 4` layout):
+  - [X] freq_ratio > 1 (the real laion 1024-frame/64-mel `freq_ratio = 4` layout):
         the `reshape_mel2img` mel-crop reorganization + the final group-2D-CNN reshape
-        before the avgpool are currently identity-only and loudly REJECTED. Add the
-        general mel2img + group-CNN glue (a reshape/permute composition or a minimal
-        helper) and a freq_ratio=4 pico fixture.
+        before the avgpool were identity-only and loudly REJECTED. LANDED: the general
+        `reshape_mel2img` indexing is folded into `ClapBatchNormMelImage` (square
+        spec_size x spec_size image; pixel (W,H) reads mel[(H div mel)*spec_size + W]
+        [H mod mel]); the HF group-2D-CNN reshape is a permutation of the final feature
+        map followed by a mean over ALL of it, so it is permutation-invariant and the
+        existing token mean-pool reproduces it for any freq_ratio. Any integral
+        freq_ratio >= 1 now accepted (freq_ratio = 1 transpose path unchanged). Gated
+        by a freq_ratio=4 pico fixture (`tools/clap_tiny_fixture_fr4.py` ->
+        `tests/fixtures/tiny_clap_fr4.*`) + `TestClapFreqRatio4Parity` (< 1e-4 on BOTH
+        embeddings vs the float64 HF `ClapModel` oracle).
   - [ ] "fused" CLAP (`enable_fusion = true`, clap-htsat-FUSED): the local/global
         mel-fusion patch-embed (`mel_conv2d` + the attention-feature-fusion block) is
         rejected. Distinct windowing — own importer branch + fixture.

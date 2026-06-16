@@ -6244,15 +6244,18 @@ function RefClipScoreFromEmbeddings(ImageEmb, TextEmb, RefTextEmb: TNNetVolume;
 // exp(logit_scale_a) * cosine(audio, text) - see ClapSimilarityMatrix.
 //
 // AUDIO FRONTEND CONTRACT: the HF encoder prefixes a BatchNorm2d over the
-// mel axis and a "reshape mel to image" step (a freq<->time transpose at
-// freq_ratio = spec_size / num_mel_bins). v1 supports freq_ratio = 1 only
-// (the unfused laion checkpoint's canonical 1024-frame / 64-mel layout uses
-// freq_ratio = 4 and is REJECTED - see the tasklist follow-up). At
-// freq_ratio = 1 the reshape is a plain transpose and the final group-CNN
-// reshape is identity, so the AUDIO net's Input is the ALREADY batch-normed
-// + transposed mel image of shape (mel_bins, time, 1) - a fixed affine the
-// caller applies up front (ClapBatchNormMelImage), exactly as CLIP supplies
-// already-normalized pixels. enable_fusion = true is also REJECTED.
+// mel axis and a "reshape mel to image" step (reshape_mel2img, controlled by
+// freq_ratio = spec_size / num_mel_bins). Both freq_ratio = 1 (the plain
+// freq<->time transpose) and freq_ratio > 1 (the canonical laion 1024-frame /
+// 64-mel / freq_ratio = 4 layout: the long time axis is split into freq_ratio
+// chunks stacked along frequency into a square spec_size x spec_size image)
+// are supported - the caller folds the full BatchNorm + reshape_mel2img into
+// the AUDIO net's (spec_size, spec_size, 1) Input image via
+// ClapBatchNormMelImage, exactly as CLIP supplies already-normalized pixels.
+// The HF group-2D-CNN reshape before the avgpool is a permutation of the
+// final feature map followed by a mean over ALL of it, so it is
+// permutation-invariant and reproduced by the token mean-pool for any
+// freq_ratio. enable_fusion = true (the "fused" windowing) is still REJECTED.
 //
 // Tensor names: audio_model.audio_encoder.{batch_norm.*, patch_embed.proj.
 // {weight,bias}, patch_embed.norm.{weight,bias}, layers.N.blocks.M.*,
@@ -6301,8 +6304,9 @@ type
 // Reads a HF CLAP config.json (model_type "clap"). Pulls audio_config /
 // text_config sub-objects + projection_dim. Defaults follow ClapConfig:
 // projection_hidden_act = 'relu', text layer_norm_eps = 1e-12, audio
-// layer_norm_eps = 1e-5, pad_token_id = 1. freq_ratio != 1 and
-// enable_fusion = true are accepted by the reader but REJECTED at build.
+// layer_norm_eps = 1e-5, pad_token_id = 1. Any integral freq_ratio >= 1 is
+// supported; enable_fusion = true is accepted by the reader but REJECTED at
+// build.
 function ReadClapConfigFromJSONFile(const FileName: string): TClapConfig;
 
 function ClapConfigToString(const Config: TClapConfig): string;
@@ -6329,11 +6333,13 @@ procedure BuildClapFromSafeTensors(const FileName: string;
   const ConfigFileName: string = '');
 
 // Applies the HF ClapAudioEncoder front affine to a raw (time, mel_bins)
-// log-mel spectrogram and lays the result out as the (mel_bins, time, 1)
-// image the AUDIO net expects: per-mel-bin BatchNorm (using the loaded
-// running stats + gamma/beta) then the freq<->time transpose of the
-// freq_ratio = 1 reshape_mel2img. RawMel is (time,1,mel_bins) (X=time,
-// depth=mel); the result Image is (mel_bins,time,1) (X=mel,Y=time). The
+// log-mel spectrogram and lays the result out as the (spec_size, spec_size,
+// 1) image the AUDIO net expects: per-mel-bin BatchNorm (using the loaded
+// running stats + gamma/beta) then the full reshape_mel2img for the config's
+// freq_ratio = spec_size / num_mel_bins. RawMel is (time,1,mel_bins)
+// (X=time, depth=mel) with time = spec_size * freq_ratio; the result Image is
+// (spec_size, spec_size, 1) (X = time//freq_ratio axis, Y = freq*freq_ratio
+// axis). At freq_ratio = 1 this is the plain freq<->time transpose. The
 // BatchNorm params come straight from the checkpoint via the Reader.
 procedure ClapBatchNormMelImage(Reader: TNNetSafeTensorsReader;
   RawMel: TNNetVolume; Image: TNNetVolume; const Config: TClapAudioConfig);
@@ -49077,11 +49083,18 @@ begin
   if Config.Audio.EnableFusion then
     ImportError('CLAP import: enable_fusion=true (the "fused" windowing) is ' +
       'not supported in v1 - use a clap-htsat-UNfused checkpoint.');
-  if FreqRatio <> 1 then
-    ImportError('CLAP import: spec_size/num_mel_bins (freq_ratio) = ' +
-      IntToStr(FreqRatio) + ' is not supported in v1 (only freq_ratio = 1, ' +
-      'i.e. spec_size = num_mel_bins). The mel2img reshape + group-CNN ' +
-      'glue for freq_ratio > 1 is a tasklist follow-up.');
+  if FreqRatio < 1 then
+    ImportError('CLAP import: spec_size (' + IntToStr(Config.Audio.SpecSize) +
+      ') must be >= num_mel_bins (' + IntToStr(Config.Audio.NumMelBins) + ').');
+  if Config.Audio.SpecSize mod Config.Audio.NumMelBins <> 0 then
+    ImportError('CLAP import: spec_size must be a multiple of num_mel_bins ' +
+      '(freq_ratio = spec_size / num_mel_bins must be integral).');
+  // freq_ratio > 1: the only output-affecting change is the reshape_mel2img
+  // lay-out, which the caller folds into the square (spec_size, spec_size, 1)
+  // input image (see ClapBatchNormMelImage). The HF group-2D-CNN reshape
+  // before the avgpool is a pure permutation of the final feature map and the
+  // avgpool means over ALL of it, so it is permutation-invariant - the
+  // token mean-pool (TNNetAvgChannel) below reproduces it for any freq_ratio.
   if (Config.Audio.SpecSize mod Config.Audio.PatchSize) <> 0 then
     ImportError('CLAP import: spec_size not a multiple of patch_size.');
   PatchGrid := Config.Audio.SpecSize div Config.Audio.PatchSize;
@@ -49448,16 +49461,25 @@ procedure ClapBatchNormMelImage(Reader: TNNetSafeTensorsReader;
   RawMel: TNNetVolume; Image: TNNetVolume; const Config: TClapAudioConfig);
 var
   Gamma, Beta, Mean, Var_: TNNetVolume;
-  t, f, Time, Mel: integer;
+  f, Time, Mel, FreqRatio, Spec, hh, ww, c2, srcT: integer;
   Eps, Normed: TNeuralFloat;
   EncPrefix: string;
 begin
   Mel := Config.NumMelBins;
+  Spec := Config.SpecSize;
   Time := RawMel.SizeX;
+  FreqRatio := Spec div Mel;
   if RawMel.Depth <> Mel then
     ImportError('ClapBatchNormMelImage: RawMel depth (' +
       IntToStr(RawMel.Depth) + ') must equal num_mel_bins (' +
       IntToStr(Mel) + ').');
+  // HF reshape_mel2img expects time_length == spec_size * freq_ratio (no
+  // bicubic resize at exact size); the importer requires the caller to feed
+  // the already-resized mel so the reshape is index-exact.
+  if Time <> Spec * FreqRatio then
+    ImportError('ClapBatchNormMelImage: RawMel time (' + IntToStr(Time) +
+      ') must equal spec_size * freq_ratio (' + IntToStr(Spec * FreqRatio) +
+      '). Resize/crop the mel to the swin input size before calling.');
   EncPrefix := 'audio_model.audio_encoder.batch_norm.';
   Eps := 1e-5;  // nn.BatchNorm2d default
   Gamma := TNNetVolume.Create; Beta := TNNetVolume.Create;
@@ -49467,20 +49489,30 @@ begin
     Reader.LoadTensorFlat(EncPrefix + 'bias', Beta);
     Reader.LoadTensorFlat(EncPrefix + 'running_mean', Mean);
     Reader.LoadTensorFlat(EncPrefix + 'running_var', Var_);
-    // Image is (time, mel, 1): X = time frame, Y = mel/freq bin, depth 1.
-    // HF flattens the conv output row-major over (H=freq, W=time) - freq
-    // OUTER - so the (time,1,depth) token sequence after the patch reshape
-    // matches HF only when freq is the Y (outer) axis. The freq<->time
-    // transpose of the freq_ratio = 1 reshape_mel2img is therefore already
-    // expressed by putting freq on Y and time on X.
-    Image.ReSize(Time, Mel, 1);
-    for t := 0 to Time - 1 do
-      for f := 0 to Mel - 1 do
+    // The swin image is square (spec_size, spec_size, 1): X = the time-ish
+    // width axis (W = HF time // freq_ratio), Y = the freq-ish height axis
+    // (H = HF freq * freq_ratio, freq OUTER), depth 1. HF flattens the conv
+    // output row-major over (H=freq, W=time), so the (token,1,depth) sequence
+    // after the patch reshape matches HF only with freq on Y.
+    //
+    // HF reshape_mel2img (input (1,1,time,mel), freq_ratio = fr):
+    //   reshape (fr, time//fr, mel) -> permute(0,2,1) -> (mel*fr, time//fr).
+    // Inverting the row-major indexing, image pixel (W, H) reads
+    //   m  = H mod mel             (mel bin)
+    //   c2 = H div mel             (which of the fr time-chunks, 0..fr-1)
+    //   t  = c2 * spec_size + W    (source time frame)
+    // At fr = 1 this is the plain freq<->time transpose (Image[W=t, H=f]).
+    Image.ReSize(Spec, Spec, 1);
+    for ww := 0 to Spec - 1 do          // W = time // fr axis
+      for hh := 0 to Spec - 1 do        // H = freq * fr axis
       begin
-        Normed := (RawMel.FData[t * Mel + f] - Mean.FData[f]) /
+        f := hh mod Mel;                // mel bin
+        c2 := hh div Mel;               // time chunk
+        srcT := c2 * Spec + ww;         // source time frame
+        Normed := (RawMel.FData[srcT * Mel + f] - Mean.FData[f]) /
           Sqrt(Var_.FData[f] + Eps);
         Normed := Normed * Gamma.FData[f] + Beta.FData[f];
-        Image[t, f, 0] := Normed;
+        Image[ww, hh, 0] := Normed;
       end;
   finally
     Gamma.Free; Beta.Free; Mean.Free; Var_.Free;
