@@ -279,6 +279,11 @@ begin
     EncStates.Copy(T5Enc.GetLastLayer.Output);
     WriteLn('Encoder hidden states: ', EncStates.SizeX, 'x', EncStates.Depth,
       ' (seq x d_model)');
+    // The conditioning is now captured in EncStates; we never run the T5
+    // DECODER (BuildT5FromSafeTensors builds both towers). Free it BEFORE
+    // loading the much larger MusicGen decoder so the peak RAM never carries
+    // both. (FreeAndNil keeps the finally-block T5Dec.Free harmless.)
+    FreeAndNil(T5Dec);
     WriteLn;
 
     // ---- 2. Build the MusicGen decoder and generate the code stack. --------
