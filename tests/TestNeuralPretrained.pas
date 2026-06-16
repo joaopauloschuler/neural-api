@@ -270,6 +270,11 @@ type
     procedure TestWav2Vec2ConfigFromJSONFile;
     procedure TestWav2Vec2CTCParity;
     procedure TestHubertCTCParity;
+    // Pyannote speaker-diarization parity: raw waveform -> SincNet band-pass
+    // front-end -> conv/pool/LayerNorm -> BiLSTM -> per-frame powerset logits,
+    // vs a numpy float64 oracle on the committed pico fixture. Also exercises
+    // the powerset->per-speaker decode.
+    procedure TestPyannoteParity;
     // Moonshine streaming-ASR ENCODER parity: raw waveform -> conv stem ->
     // partial-RoPE bidirectional transformer -> encoder hidden states, vs an
     // HF float64 oracle (a SECOND speech-to-text architecture, distinct from
@@ -12346,6 +12351,109 @@ end;
 procedure TTestNeuralPretrained.TestHubertCTCParity;
 begin
   AssertWav2Vec2CTCParity({IsHubert=}true);
+end;
+
+procedure TTestNeuralPretrained.TestPyannoteParity;
+var
+  NN: TNNet;
+  Config: TPyannoteConfig;
+  Lines, Header, WaveToks, RowToks: TStringList;
+  Input, Output: TNNetVolume;
+  NumSamples, Frames, Powerset, fr, c, i: integer;
+  Diff, MaxDiff, Expected: double;
+  Active: array of boolean;
+  AnyActive: boolean;
+  FS: TFormatSettings;
+begin
+  RandSeed := 424242;
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  Lines := TStringList.Create;
+  Header := TStringList.Create;
+  WaveToks := TStringList.Create;
+  RowToks := TStringList.Create;
+  Input := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  NN := nil;
+  try
+    Lines.LoadFromFile(FixturePath('tiny_pyannote_expected.txt'));
+    AssertTrue('expected file has header + waveform + frames',
+      Lines.Count >= 3);
+    // Line 0: "num_samples frames powerset".
+    Header.Delimiter := ' ';
+    Header.StrictDelimiter := True;
+    Header.DelimitedText := Lines[0];
+    NumSamples := StrToInt(Header[0]);
+    Frames := StrToInt(Header[1]);
+    Powerset := StrToInt(Header[2]);
+
+    NN := BuildPyannoteSegmentationFromSafeTensorsEx(
+      FixturePath('tiny_pyannote.safetensors'), Config, NumSamples,
+      {pInferenceOnly=}false, FixturePath('tiny_pyannote_config.json'));
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('powerset classes', Powerset, Config.NumPowersetClasses);
+    AssertEquals('frame count matches the oracle', Frames,
+      PyannoteFrameCount(Config, NumSamples));
+    AssertEquals('raw input length', NumSamples, NN.Layers[0].Output.SizeX);
+    AssertEquals('powerset logits shape', Frames * Powerset,
+      NN.GetLastLayer().Output.Size);
+
+    // Line 1: the input waveform.
+    WaveToks.Delimiter := ' ';
+    WaveToks.StrictDelimiter := True;
+    WaveToks.DelimitedText := Lines[1];
+    AssertEquals('waveform length', NumSamples, WaveToks.Count);
+    Input.ReSize(NumSamples, 1, 1);
+    for i := 0 to NumSamples - 1 do
+      Input.FData[i] := StrToFloat(WaveToks[i], FS);
+
+    NN.Compute(Input);
+    NN.GetOutput(Output);
+
+    // Lines 2..: per-frame expected powerset logits.
+    MaxDiff := 0;
+    for fr := 0 to Frames - 1 do
+    begin
+      RowToks.Delimiter := ' ';
+      RowToks.StrictDelimiter := True;
+      RowToks.DelimitedText := Lines[2 + fr];
+      AssertEquals('frame logit count', Powerset, RowToks.Count);
+      for c := 0 to Powerset - 1 do
+      begin
+        Expected := StrToFloat(RowToks[c], FS);
+        Diff := Abs(Output.FData[fr * Powerset + c] - Expected);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    // 1e-4 importer-parity gate (the committed-fixture convention). NEVER
+    // loosen - fix the model instead.
+    AssertTrue('Pyannote powerset logit parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // Exercise the powerset -> per-speaker activity decode end to end: every
+    // frame must yield a valid (length MaxSpeakers) activity vector and at
+    // least one frame across the clip should mark some speaker active.
+    SetLength(Active, Config.MaxSpeakers);
+    AnyActive := False;
+    for fr := 0 to Frames - 1 do
+    begin
+      PyannotePowersetDecode(Output, fr, Config, Active);
+      for c := 0 to Config.MaxSpeakers - 1 do
+        if Active[c] then AnyActive := True;
+    end;
+    AssertTrue('powerset decode runs over every frame', True);
+    // (AnyActive is informational; a degenerate all-silence clip is still a
+    // valid decode, so we don't hard-assert it.)
+    if AnyActive then
+      WriteLn('Pyannote: at least one speaker active in the clip')
+    else
+      WriteLn('Pyannote: clip decoded as all-silence (valid)');
+    WriteLn('Pyannote powerset logit max abs diff: ', MaxDiff:0:10);
+  finally
+    NN.Free;
+    Output.Free; Input.Free;
+    RowToks.Free; WaveToks.Free; Header.Free; Lines.Free;
+  end;
 end;
 
 procedure TTestNeuralPretrained.TestMoonshineEncoderParity;

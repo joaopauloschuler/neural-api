@@ -857,27 +857,31 @@ rather than acted on.
       and falls back to all-heads otherwise); (d) wire it into
       examples/WhisperTranscribe behind a `--word-timestamps` flag and document
       in examples/README; (e) optional per-word confidence (mean path attention).
-- [ ] Speaker diarization importer (`BuildPyannoteSegmentationFromSafeTensors[Ex]` +
-      `TPyannoteConfig`/`ReadPyannoteConfigFromJSONFile`, model_type `pyannote` /
-      pyannote/segmentation-3.0) — the FIRST "who speaks when" model in the library and a
-      genuinely DISTINCT voice vertical (frame-level multi-speaker activity, not
-      transcription/CTC like the landed Whisper/Wav2Vec2 paths). The new pieces are: (1) a
-      **SincNet** learnable band-pass front-end — a parametrized sinc-filter conv whose
-      kernels are `2*f_high*sinc(2*f_high*t) - 2*f_low*sinc(2*f_low*t)` with only
-      (low_freq, band) trainable per filter, windowed by Hamming — implement as a new
-      `TNNetSincConv1D` (no existing layer materializes kernels from two scalars per
-      channel; NOT a near-duplicate of any conv), followed by the existing
-      LayerNorm+MaxPool+conv stack; (2) a bidirectional-LSTM temporal trunk (reuse the
-      landed LSTM cells) → linear → per-frame **powerset** multilabel head (the 3.0 model
-      emits the 7 powerset classes for ≤3 concurrent speakers, decoded back to a
-      per-speaker binary activity matrix). Inference-only on CPU, raw-waveform in. Parity-
-      gate `< 1e-4` vs an HF `pyannote.audio` / torch float64 oracle on a pico fixture
-      (`tools/make_pico_pyannote_fixture.py` → `tests/fixtures/tiny_pyannote*`), and an
-      examples/SpeakerDiarization smoke that prints a speaker-activity timeline (and an
-      RTTM line per turn) for a short synthetic two-speaker WAV via the landed
-      `LoadVolumeFromWav*` / mel front-end utilities. Pairs naturally with the landed
-      Whisper transcription for "who said what". The SincNet conv front-end is also reusable
-      for raw-waveform speaker-verification / keyword-spotting fronts later.
+- [X] Speaker diarization importer (`BuildPyannoteSegmentationFromSafeTensors[Ex]` +
+      `TPyannoteConfig`/`ReadPyannoteConfigFromJSONFile`, model_type `pyannote`) — LANDED.
+      New leaf layer `TNNetSincConv1D` (SincNet band-pass, kernels materialized from two
+      scalars (low_freq, band) per filter, Hamming-windowed; full forward+BPTT, input &
+      weight numerical-gradient tests `TestSincConv1D*`, README layer row). Importer
+      pipeline: SincConv front-end → abs/MaxPool/TokenLayerNorm → Conv+ReLU/MaxPool/
+      TokenLayerNorm → bidirectional `TNNetMinLSTM` trunk (forward + time-reversed concat)
+      → linear → per-frame 7-class **powerset** head + `PyannotePowersetDecode` to a
+      per-speaker binary activity matrix. Parity-gated `< 1e-4` (observed ~2e-7) vs a
+      hand-written numpy float64 forward oracle on a pico fixture
+      (`tools/make_pico_pyannote_fixture.py` → `tests/fixtures/tiny_pyannote*`,
+      `TestPyannoteParity`) — the `pyannote.audio` python package is NOT installed here, so
+      the oracle reimplements the exact forward math on a re-randomized fixture.
+      `examples/SpeakerDiarization` synthesizes a two-tone clip, prints a speaker-activity
+      timeline + RTTM lines, saves a WAV via `SaveVolumeToWav16`. Open follow-ups:
+  - [ ] Real `pyannote/segmentation-3.0` checkpoint key-mapping (the on-disk tensor
+        names + the actual conv-stack depths/strides) instead of the pico fixture's
+        re-keyed names, verified against a real `pyannote.audio` float64 oracle once the
+        package is available.
+  - [ ] Swap the `TNNetMinLSTM` trunk (gates depend on x_t only) for a VANILLA LSTM with a
+        true cell state + recurrent gate feed (pyannote uses `nn.LSTM`), so real weights
+        load without re-training; needs a landed vanilla-LSTM cell first.
+  - [ ] Sliding-window inference + overlap stitching for clips longer than the model's
+        receptive field, and turning the per-frame activity matrix into final diarized
+        speaker turns (clustering across windows).
 - [ ] SAM mask decoder as a real TNNet layer graph (TNNetCrossAttention two-source
       wiring) instead of the plain-array RunSAMMaskDecoder forward, so the decoder is
       trainable / fine-tunable end-to-end (v1 is inference-only). Needs a builder that

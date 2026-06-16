@@ -6613,6 +6613,54 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// TNNetSincConv1D: the parametrized band-pass front-end of SincNet
+  // (Ravanelli & Bengio 2018, "Speaker Recognition from Raw Waveform with
+  // SincNet", arXiv:1808.00158), the raw-waveform front-end of
+  // pyannote/segmentation-3.0. Unlike a standard conv (TNNetConvolution* whose
+  // every kernel tap is an independent free weight), each output filter is
+  // MATERIALIZED from only TWO trainable scalars (low_freq, band): the kernel is
+  // the time-domain difference of two ideal low-pass filters (a band-pass),
+  //   g[n] = 2*f_high*sinc(2*pi*f_high*n) - 2*f_low*sinc(2*pi*f_low*n)
+  // with sinc(x)=sin(x)/x, f_low = |low_freq|/sr, f_high = f_low + |band|/sr
+  // (both in cycles/sample), Hamming-windowed and laid out symmetrically about
+  // the center tap n in [-(K-1)/2 .. (K-1)/2]. So the materialized KxNumFilters
+  // kernel bank is a deterministic function of the 2*NumFilters scalars, and the
+  // gradient flows from the conv output through the sinc/Hamming materialization
+  // back to (low_freq, band). No existing layer builds kernels from two scalars
+  // per channel.
+  //
+  // I/O: a raw mono waveform packed as (T,1,1) (SizeY=1, Depth=1). The valid
+  // (no-pad) 1-D conv with odd KernelSize K and stride S yields
+  //   T_out = (T - K) div S + 1   and output shape (T_out, 1, NumFilters).
+  // Storage (Neurons[0].Weights, shape (NumFilters,1,2)):
+  //   [f,0,0] = low_freq_raw   [f,0,1] = band_raw     (|.| taken at use)
+  // FStruct[0]=NumFilters FStruct[1]=KernelSize FStruct[2]=Stride
+  // FFloatSt[0]=SampleRate. Forward materializes the bank then convolves;
+  // backward differentiates the conv (input + per-filter kernel grad) then the
+  // sinc/Hamming materialization, reducing the per-tap kernel grad to the two
+  // scalar grads d g[n]/d f_low and d g[n]/d f_high (chain through f_high =
+  // f_low + band). |.| contributes a sign factor (sub-gradient 0 at exactly 0).
+  // Coded by Claude (AI).
+  TNNetSincConv1D = class(TNNetLayer)
+    private
+      FNumFilters, FKernelSize, FStride: integer;
+      FSampleRate: TNeuralFloat;
+      FBank: TNNetVolume;     // materialized kernels, (KernelSize,1,NumFilters)
+      FWindow: TNNetVolume;   // Hamming window, (KernelSize,1,1)
+      FGradS: TNNetVolume;    // (NumFilters,1,2) scalar grad accumulator
+      procedure MaterializeBank();
+    public
+      constructor Create(pNumFilters, pKernelSize: integer; pStride: integer = 1;
+        pSampleRate: TNeuralFloat = 16000); reintroduce; overload;
+      destructor Destroy(); override;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+      // Exposed so the importer / parity test can read the materialized bank.
+      property Bank: TNNetVolume read FBank;
+  end;
+
   /// TNNetMinLSTM: the minimal, FULLY PARALLELIZABLE LSTM cell of Feng, Tung,
   // Hassani, Hamarneh & Ravanbakhsh 2024 ("Were RNNs all we needed?",
   // arXiv:2410.01201). Sibling of TNNetMinGRU: a stripped LSTM whose forget/input
@@ -45437,6 +45485,273 @@ begin
     end;
   FNeurons[2].FWeights.Fill(0);  // b_z (z starts at 0.5)
   FNeurons[3].FWeights.Fill(0);  // b_h
+  RandSeed := oldSeed;
+  AfterWeightUpdate();
+end;
+
+{ TNNetSincConv1D }
+constructor TNNetSincConv1D.Create(pNumFilters, pKernelSize: integer;
+  pStride: integer = 1; pSampleRate: TNeuralFloat = 16000);
+begin
+  inherited Create();
+  if pNumFilters < 1 then
+    FErrorProc('TNNetSincConv1D requires NumFilters >= 1. Got ' +
+      IntToStr(pNumFilters));
+  if (pKernelSize < 3) or (pKernelSize mod 2 = 0) then
+    FErrorProc('TNNetSincConv1D requires an ODD KernelSize >= 3. Got ' +
+      IntToStr(pKernelSize));
+  if pStride < 1 then
+    FErrorProc('TNNetSincConv1D requires Stride >= 1. Got ' + IntToStr(pStride));
+  if pSampleRate <= 0 then
+    FErrorProc('TNNetSincConv1D requires SampleRate > 0.');
+  FNumFilters := pNumFilters;
+  FKernelSize := pKernelSize;
+  FStride := pStride;
+  FSampleRate := pSampleRate;
+  FStruct[0] := FNumFilters;
+  FStruct[1] := FKernelSize;
+  FStruct[2] := FStride;
+  FFloatSt[0] := FSampleRate;
+  FBank := TNNetVolume.Create();
+  FWindow := TNNetVolume.Create();
+  FGradS := TNNetVolume.Create();
+  AddMissingNeurons(1);
+end;
+
+destructor TNNetSincConv1D.Destroy();
+begin
+  FGradS.Free;
+  FWindow.Free;
+  FBank.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetSincConv1D.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  T, TOut, half, n: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (pPrevLayer.FOutput.SizeY <> 1) or (pPrevLayer.FOutput.Depth <> 1) then
+    FErrorProc('TNNetSincConv1D requires a (T,1,1) raw waveform (SizeY=1, ' +
+      'Depth=1). Got SizeY=' + IntToStr(pPrevLayer.FOutput.SizeY) +
+      ' Depth=' + IntToStr(pPrevLayer.FOutput.Depth));
+  T := pPrevLayer.FOutput.SizeX;
+  if T < FKernelSize then
+    FErrorProc('TNNetSincConv1D input length ' + IntToStr(T) +
+      ' shorter than KernelSize ' + IntToStr(FKernelSize));
+  TOut := (T - FKernelSize) div FStride + 1;
+  FOutput.ReSize(TOut, 1, FNumFilters);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  // Two scalars per filter: [f,0,0]=low_freq_raw [f,0,1]=band_raw.
+  FNeurons[0].FWeights.ReSize(FNumFilters, 1, 2);
+  FNeurons[0].FDelta.ReSize(FNeurons[0].FWeights);
+  FNeurons[0].FBackInertia.ReSize(FNeurons[0].FWeights);
+  FBank.ReSize(FKernelSize, 1, FNumFilters);
+  FWindow.ReSize(FKernelSize, 1, 1);
+  FGradS.ReSize(FNumFilters, 1, 2);
+  // Hamming window over n = 0..K-1: 0.54 - 0.46*cos(2*pi*n/(K-1)).
+  half := (FKernelSize - 1) div 2;
+  for n := 0 to FKernelSize - 1 do
+    FWindow.FData[n] := 0.54 - 0.46 * Cos(2 * Pi * n / (FKernelSize - 1));
+  if half < 0 then half := 0; // half is re-derived where needed
+  InitDefault();
+end;
+
+// SincFn(x) = sin(x)/x with the removable singularity sinc(0)=1.
+function SincConvSinc(x: TNeuralFloat): TNeuralFloat;
+begin
+  if Abs(x) < 1e-12 then Result := 1.0 else Result := Sin(x) / x;
+end;
+
+procedure TNNetSincConv1D.MaterializeBank();
+var
+  f, n, half: integer;
+  fLow, fHigh, tap, gv: TNeuralFloat;
+  WPtr: TNeuralFloatArrPtr;
+begin
+  half := (FKernelSize - 1) div 2;
+  for f := 0 to FNumFilters - 1 do
+  begin
+    WPtr := FNeurons[0].FWeights.GetRawPtr(f, 0, 0);
+    fLow  := Abs(WPtr^[0]) / FSampleRate;            // cycles/sample
+    fHigh := fLow + Abs(WPtr^[1]) / FSampleRate;     // f_high = f_low + band
+    for n := 0 to FKernelSize - 1 do
+    begin
+      tap := n - half;  // symmetric tap index
+      // g[n] = 2*f_high*sinc(2*pi*f_high*tap) - 2*f_low*sinc(2*pi*f_low*tap)
+      gv := 2 * fHigh * SincConvSinc(2 * Pi * fHigh * tap)
+          - 2 * fLow  * SincConvSinc(2 * Pi * fLow  * tap);
+      FBank[n, 0, f] := gv * FWindow.FData[n];
+    end;
+  end;
+end;
+
+procedure TNNetSincConv1D.Compute();
+var
+  StartTime: double;
+  Prev: TNNetVolume;
+  TOut, f, ot, k, baseIn: integer;
+  acc: TNeuralFloat;
+  XPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  MaterializeBank();
+  Prev := FPrevLayer.FOutput;
+  XPtr := Prev.GetRawPtr(0, 0, 0);
+  TOut := FOutput.SizeX;
+  for ot := 0 to TOut - 1 do
+  begin
+    baseIn := ot * FStride;
+    for f := 0 to FNumFilters - 1 do
+    begin
+      acc := 0;
+      for k := 0 to FKernelSize - 1 do
+        acc := acc + FBank[k, 0, f] * XPtr^[baseIn + k];
+      FOutput[ot, 0, f] := acc;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSincConv1D.Backpropagate();
+var
+  StartTime: double;
+  Prev, PrevErr: TNNetVolume;
+  TOut, f, ot, k, n, half, baseIn: integer;
+  hasInputGrad: boolean;
+  gy, gk, tap, fLow, fHigh, win: TNeuralFloat;
+  dLow, dHigh, dgdLowN, dgdHighN: TNeuralFloat;
+  signLow, signBand: TNeuralFloat;
+  XPtr, PrevErrPtr, WPtr: TNeuralFloatArrPtr;
+  GBank: TNNetVolume;
+
+  // d/df [ 2*f*sinc(2*pi*f*tap) ] w.r.t. f, evaluated at tap (samples).
+  // Let a = 2*pi*tap. term = 2*f*sin(a*f)/(a*f) = 2*sin(a*f)/a   (for tap<>0)
+  //   d/df = 2*cos(a*f)               (tap<>0)
+  // For tap=0: term = 2*f*1 = 2*f  -> d/df = 2.
+  function DTermDf(fval, tapv: TNeuralFloat): TNeuralFloat;
+  var a: TNeuralFloat;
+  begin
+    if Abs(tapv) < 1e-12 then Result := 2.0
+    else begin a := 2 * Pi * tapv; Result := 2 * Cos(a * fval); end;
+  end;
+
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  TOut := FOutput.SizeX;
+  half := (FKernelSize - 1) div 2;
+  FGradS.Fill(0);
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  XPtr := Prev.GetRawPtr(0, 0, 0);
+  if hasInputGrad then PrevErrPtr := PrevErr.GetRawPtr(0, 0, 0)
+  else PrevErrPtr := nil;
+
+  // Accumulate per-tap kernel gradient dL/dBank[k,f] over the conv, plus the
+  // input gradient (transpose of the conv) using the CURRENT materialized bank.
+  GBank := TNNetVolume.Create();
+  try
+    GBank.ReSize(FKernelSize, 1, FNumFilters);
+    GBank.Fill(0);
+    for ot := 0 to TOut - 1 do
+    begin
+      baseIn := ot * FStride;
+      for f := 0 to FNumFilters - 1 do
+      begin
+        gy := FOutputError[ot, 0, f];
+        if gy = 0 then continue;
+        for k := 0 to FKernelSize - 1 do
+        begin
+          GBank[k, 0, f] := GBank[k, 0, f] + gy * XPtr^[baseIn + k];
+          if hasInputGrad then
+            PrevErrPtr^[baseIn + k] := PrevErrPtr^[baseIn + k] +
+              gy * FBank[k, 0, f];
+        end;
+      end;
+    end;
+
+    // Reduce the per-tap kernel grad through the sinc/Hamming materialization to
+    // the two scalar grads per filter (chain f_high = f_low + band).
+    for f := 0 to FNumFilters - 1 do
+    begin
+      WPtr := FNeurons[0].FWeights.GetRawPtr(f, 0, 0);
+      fLow  := Abs(WPtr^[0]) / FSampleRate;
+      fHigh := fLow + Abs(WPtr^[1]) / FSampleRate;
+      dLow := 0; dHigh := 0;
+      for n := 0 to FKernelSize - 1 do
+      begin
+        tap := n - half;
+        win := FWindow.FData[n];
+        // Bank is laid out (KernelSize,1,NumFilters): element [n,0,f].
+        gk := GBank[n, 0, f] * win;
+        // g[n] = high_term(f_high) - low_term(f_low) (each = 2*f*sinc(2*pi*f*tap))
+        dgdHighN := DTermDf(fHigh, tap);    // d g / d f_high
+        dgdLowN  := -DTermDf(fLow, tap);    // d g / d f_low (negative term)
+        dHigh := dHigh + gk * dgdHighN;
+        dLow  := dLow  + gk * dgdLowN;
+      end;
+      // f_high = f_low + band: dL/df_low gets BOTH paths; dL/dband only via high.
+      // Both f_low and band enter as (1/sr)*|raw|, so chain 1/sr and the sign.
+      if WPtr^[0] > 0 then signLow := 1 else if WPtr^[0] < 0 then signLow := -1
+      else signLow := 0;
+      if WPtr^[1] > 0 then signBand := 1 else if WPtr^[1] < 0 then signBand := -1
+      else signBand := 0;
+      // dL/d(low_raw) = (dLow + dHigh) * (1/sr) * signLow
+      FGradS[f, 0, 0] := (dLow + dHigh) * (1.0 / FSampleRate) * signLow;
+      // dL/d(band_raw) = dHigh * (1/sr) * signBand
+      FGradS[f, 0, 1] := dHigh * (1.0 / FSampleRate) * signBand;
+    end;
+  finally
+    GBank.Free;
+  end;
+
+  // SGD step into the single neuron's delta (gradient descent: subtract).
+  TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(), FGradS.GetRawPtr(),
+    -FLearningRate, FNeurons[0].FWeights.Size);
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetSincConv1D.InitDefault();
+var
+  f, oldSeed: integer;
+  melLo, melHi, melStep, hzLo, hzHi: TNeuralFloat;
+
+  function HzToMel(hz: TNeuralFloat): TNeuralFloat;
+  begin Result := 2595 * Ln(1 + hz / 700) / Ln(10); end;
+  function MelToHz(m: TNeuralFloat): TNeuralFloat;
+  begin Result := 700 * (Exp(m * Ln(10) / 2595) - 1); end;
+
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  if FNeurons[0].FWeights.Size < 2 * FNumFilters then exit;
+  oldSeed := RandSeed;
+  RandSeed := 141421;
+  // Mel-spaced initial band edges across (0, sr/2), like SincNet's default init.
+  melLo := HzToMel(30);
+  melHi := HzToMel(FSampleRate / 2 - 100);
+  if FNumFilters > 1 then melStep := (melHi - melLo) / FNumFilters
+  else melStep := (melHi - melLo);
+  for f := 0 to FNumFilters - 1 do
+  begin
+    hzLo := MelToHz(melLo + melStep * f);
+    hzHi := MelToHz(melLo + melStep * (f + 1));
+    FNeurons[0].FWeights[f, 0, 0] := hzLo;            // low_freq (Hz)
+    FNeurons[0].FWeights[f, 0, 1] := hzHi - hzLo;     // band (Hz)
+  end;
   RandSeed := oldSeed;
   AfterWeightUpdate();
 end;
@@ -91690,6 +92005,7 @@ begin
       'TNNetMLSTMCell':             Result := TNNetMLSTMCell.Create();
       'TNNetMinGRU':                Result := TNNetMinGRU.Create();
       'TNNetMinLSTM':               Result := TNNetMinLSTM.Create();
+      'TNNetSincConv1D':            Result := TNNetSincConv1D.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetConvLSTMCell':          Result := TNNetConvLSTMCell.Create(St[0], St[1], St[2]);
       'TNNetDeltaNet':              Result := TNNetDeltaNet.Create();
       'TNNetLegendreMemoryUnit':    Result := TNNetLegendreMemoryUnit.Create(St[0], Ft[0]);
@@ -92105,6 +92421,7 @@ begin
       if S[0] = 'TNNetMLSTMCell' then Result := TNNetMLSTMCell.Create() else
       if S[0] = 'TNNetMinGRU' then Result := TNNetMinGRU.Create() else
       if S[0] = 'TNNetMinLSTM' then Result := TNNetMinLSTM.Create() else
+      if S[0] = 'TNNetSincConv1D' then Result := TNNetSincConv1D.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetConvLSTMCell' then Result := TNNetConvLSTMCell.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetDeltaNet' then Result := TNNetDeltaNet.Create() else
       if S[0] = 'TNNetLegendreMemoryUnit' then Result := TNNetLegendreMemoryUnit.Create(St[0], Ft[0]) else

@@ -452,6 +452,9 @@ type
     procedure TestMinLSTMInputGradientCheck;
     procedure TestMinLSTMWeightGradientCheck;
     procedure TestMinLSTMSerializationRoundTrip;
+    procedure TestSincConv1DInputGradientCheck;
+    procedure TestSincConv1DWeightGradientCheck;
+    procedure TestSincConv1DSerializationRoundTrip;
     procedure TestConvLSTMCellShapeInference;
     procedure TestConvLSTMCellInputGradientCheck;
     procedure TestConvLSTMCellWeightGradientCheck;
@@ -34372,6 +34375,176 @@ begin
   RandSeed := 424242;
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetMinLSTM.Create(), 'MinLSTM', 4, 1, 3, 1e-5);
+end;
+
+// --- TNNetSincConv1D (parametrized SincNet band-pass front-end) --------------
+
+// Deterministic (low_freq, band) scalars per filter, in a regime where every
+// filter is a genuine band-pass (f_low > 0, band > 0) so the sinc/Hamming
+// materialization and the |.| sign factor are exercised. Frequencies are in Hz
+// at a small synthetic sample rate so the band edges land well inside Nyquist.
+procedure SeedSincConv1D(L: TNNetSincConv1D; NumFilters: integer);
+var f: integer;
+begin
+  for f := 0 to NumFilters - 1 do
+  begin
+    // low_freq_raw (Hz), strictly positive and spread across the band
+    L.Neurons[0].Weights[f, 0, 0] := 30 + f * 17 + Sin(f * 1.3) * 5;
+    // band_raw (Hz), strictly positive
+    L.Neurons[0].Weights[f, 0, 1] := 20 + f * 9  + Cos(f * 0.7) * 4;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSincConv1DInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  L: TNNetSincConv1D;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, T, NF, K: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k2: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k2 := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k2] - Desired.Raw[k2];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  T := 16; NF := 3; K := 5;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(T, 1, 1);
+  InputPlus := TNNetVolume.Create(T, 1, 1);
+  Desired := nil;
+  // SincNet filters have small gain (output O(1e-2)); to keep the single-
+  // precision finite-difference well conditioned the target must be of the same
+  // small magnitude (else the O(1) loss baseline swamps the O(eps) FD signal).
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(T, 1, 1, 1));
+    L := TNNetSincConv1D.Create(NF, K, 2, 4000);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    Desired := TNNetVolume.Create(L.Output.SizeX, 1, NF);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.55) * 1.2 + 0.1;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.37) * 0.01;
+    SeedSincConv1D(L, NF);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('SincConv1D input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.001);
+    end;
+    WriteLn('SincConv1D input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSincConv1DWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  L: TNNetSincConv1D;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, T, NF, K: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k2: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k2 := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k2] - Desired.Raw[k2];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  T := 16; NF := 3; K := 5;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(T, 1, 1);
+  Desired := nil;
+  epsilon := 0.01;  // Hz-scale params: larger step for a stable FD ratio
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(T, 1, 1, 1));
+    L := TNNetSincConv1D.Create(NF, K, 2, 4000);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    Desired := TNNetVolume.Create(L.Output.SizeX, 1, NF);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 1.1 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.33) * 0.5;
+    SeedSincConv1D(L, NF);
+
+    // Cover all 2*NumFilters scalars (low_freq + band per filter): the place a
+    // silent sinc-derivative or |.|-sign slip would hide.
+    for i := 0 to L.Neurons[0].Weights.Size - 1 do
+    begin
+      L.Neurons[0].Weights.Raw[i] := L.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss;
+      L.Neurons[0].Weights.Raw[i] := L.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      L.Neurons[0].Weights.Raw[i] := L.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      L.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -L.Neurons[0].Delta.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('SincConv1D weight gradient check [' + IntToStr(i) +
+        '] num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.001);
+    end;
+    WriteLn('SincConv1D weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSincConv1DSerializationRoundTrip;
+begin
+  // SincConv1D stores one neuron of 2*NumFilters scalars; FStruct[0..2] +
+  // FFloatSt[0] must reconstruct the (NumFilters,KernelSize,Stride,SampleRate)
+  // hyperparameters. Input (16,1,1) raw waveform, kernel 5.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetSincConv1D.Create(3, 5, 2, 4000), 'SincConv1D', 16, 1, 1, 1e-5);
 end;
 
 // --- TNNetConvLSTMCell (convolutional LSTM spatiotemporal recurrent cell) -----

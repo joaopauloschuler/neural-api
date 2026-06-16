@@ -3823,6 +3823,75 @@ function BuildWav2Vec2FromSafeTensors(const FileName: string;
   NumSamples: integer; pInferenceOnly: boolean = false): TNNet;
 
 // ---------------------------------------------------------------------------
+// PYANNOTE SPEAKER-DIARIZATION IMPORT (model_type "pyannote", e.g.
+// pyannote/segmentation-3.0) - the FIRST "who speaks when" model: frame-level
+// MULTI-speaker activity, deliberately distinct from the transcription / CTC
+// paths (Whisper, Wav2Vec2). A SincNet learnable band-pass front-end
+// (TNNetSincConv1D) feeds a small conv stack, a bidirectional-LSTM temporal
+// trunk (TNNetMinLSTM forward + reverse, concatenated) and a per-frame POWERSET
+// multilabel head (the 3.0 model emits the 7 powerset classes covering all
+// subsets of <=3 concurrent speakers; decode back to a per-speaker binary
+// activity matrix with PyannotePowersetDecode).
+//
+// v1 SCOPE: inference-only, CPU, raw mono waveform in. The architecture is the
+// pyannote/segmentation-3.0 SHAPE (SincNet -> MaxPool/LayerNorm -> conv block ->
+// BiLSTM -> Linear -> powerset). The temporal trunk uses the landed minimal
+// LSTM cell (TNNetMinLSTM) rather than a vanilla LSTM; the parity oracle
+// reimplements this exact forward math. ----------------------------------------
+type
+  TPyannoteConfig = record
+    SampleRate: TNeuralFloat;   // sample_rate (e.g. 16000)
+    SincFilters: integer;       // SincNet out filters (sincnet.conv1d.0)
+    SincKernel: integer;        // SincNet kernel (odd, e.g. 251)
+    SincStride: integer;        // SincNet stride (e.g. 5 -> /5 downsample)
+    Pool1: integer;             // first max-pool size/stride (e.g. 3)
+    ConvChannels: integer;      // second conv block out channels
+    ConvKernel: integer;        // second conv block kernel (e.g. 5)
+    Pool2: integer;             // second max-pool size/stride (e.g. 3)
+    LSTMHidden: integer;        // per-direction LSTM hidden size
+    NumPowersetClasses: integer; // powerset head width (7 for <=3 speakers)
+    MaxSpeakers: integer;       // max concurrent speakers (3)
+    LayerNormEps: TNeuralFloat; // layer_norm eps (1e-5)
+  end;
+
+// Reads a pyannote config.json. Required: sample_rate. Everything else has a
+// segmentation-3.0-shaped default but is overridden when present (the pico
+// fixture ships a tiny config). MaxSpeakers/NumPowersetClasses are derived:
+// NumPowersetClasses = 1 + MaxSpeakers + C(MaxSpeakers,2) for MaxSpeakers<=3
+// (=> 7 for 3). Coded by Claude (AI).
+function ReadPyannoteConfigFromJSONFile(
+  const FileName: string): TPyannoteConfig;
+
+function PyannoteConfigToString(const Config: TPyannoteConfig): string;
+
+// Frames the SincNet+pool feature extractor produces for NumSamples samples.
+function PyannoteFrameCount(const Config: TPyannoteConfig;
+  NumSamples: integer): integer;
+
+// Builds the pyannote diarization net: TNNetInput (NumSamples,1,1) raw waveform
+// in, (Frames,1,NumPowersetClasses) per-frame powerset LOGITS out, loading
+// every weight from FileName. Coded by Claude (AI).
+function BuildPyannoteSegmentationFromSafeTensorsWithConfig(
+  const FileName: string; var Config: TPyannoteConfig; NumSamples: integer;
+  pInferenceOnly: boolean = false): TNNet;
+
+function BuildPyannoteSegmentationFromSafeTensorsEx(const FileName: string;
+  out Config: TPyannoteConfig; NumSamples: integer;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildPyannoteSegmentationFromSafeTensors(const FileName: string;
+  NumSamples: integer; pInferenceOnly: boolean = false): TNNet;
+
+// Decodes one frame of NumPowersetClasses powerset logits into a per-speaker
+// binary activity vector (length MaxSpeakers): argmax over the powerset classes
+// then the (precomputed) class->speaker-subset mapping. Mapping order matches
+// pyannote's Powerset: class 0 = silence, classes 1..K = single speaker k,
+// classes K+1.. = the C(K,2) speaker pairs (lexicographic). Coded by Claude(AI).
+procedure PyannotePowersetDecode(const Logits: TNNetVolume; FrameIdx: integer;
+  const Config: TPyannoteConfig; out Active: array of boolean);
+
+// ---------------------------------------------------------------------------
 // MOONSHINE STREAMING-ASR ENCODER IMPORT (model_type "moonshine", e.g.
 // UsefulSensors/moonshine-tiny | moonshine-base) - a SECOND speech-to-text
 // architecture, deliberately distinct from the landed Whisper importer.
@@ -30772,6 +30841,363 @@ var
 begin
   Result := BuildWav2Vec2FromSafeTensorsEx(FileName, Config, NumSamples,
     pInferenceOnly);
+end;
+
+// ===========================================================================
+// PYANNOTE SPEAKER-DIARIZATION IMPORT - see the interface header.
+// ===========================================================================
+
+function PyannotePowersetClasses(MaxSpeakers: integer): integer;
+begin
+  // 1 (silence) + MaxSpeakers singletons + C(MaxSpeakers,2) pairs.
+  case MaxSpeakers of
+    1: Result := 2;
+    2: Result := 4;
+    3: Result := 7;
+  else
+    ImportError('Pyannote import: only max_speakers in {1,2,3} supported.');
+    Result := 0;
+  end;
+end;
+
+function ReadPyannoteConfigFromJSONFile(
+  const FileName: string): TPyannoteConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+begin
+  if not FileExists(FileName) then
+    ImportError('Pyannote import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Pyannote import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Pyannote import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    if Obj.IndexOfName('sample_rate') < 0 then
+      ImportError('Pyannote import: config "' + FileName +
+        '" is missing the required field "sample_rate".');
+    Result.SampleRate := Obj.Get('sample_rate', 16000);
+    // segmentation-3.0-shaped defaults; the pico fixture overrides them.
+    Result.SincFilters := Obj.Get('sinc_filters', 80);
+    Result.SincKernel  := Obj.Get('sinc_kernel', 251);
+    Result.SincStride  := Obj.Get('sinc_stride', 5);
+    Result.Pool1       := Obj.Get('pool1', 3);
+    Result.ConvChannels := Obj.Get('conv_channels', 60);
+    Result.ConvKernel  := Obj.Get('conv_kernel', 5);
+    Result.Pool2       := Obj.Get('pool2', 3);
+    Result.LSTMHidden  := Obj.Get('lstm_hidden', 128);
+    Result.MaxSpeakers := Obj.Get('max_speakers', 3);
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1e-5);
+    if Odd(Result.SincKernel) = False then
+      ImportError('Pyannote import: sinc_kernel must be ODD.');
+    Result.NumPowersetClasses := PyannotePowersetClasses(Result.MaxSpeakers);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function PyannoteConfigToString(const Config: TPyannoteConfig): string;
+begin
+  Result :=
+    'sample_rate=' + FloatToStr(Config.SampleRate) +
+    ' sinc_filters=' + IntToStr(Config.SincFilters) +
+    ' sinc_kernel=' + IntToStr(Config.SincKernel) +
+    ' sinc_stride=' + IntToStr(Config.SincStride) +
+    ' pool1=' + IntToStr(Config.Pool1) +
+    ' conv_channels=' + IntToStr(Config.ConvChannels) +
+    ' conv_kernel=' + IntToStr(Config.ConvKernel) +
+    ' pool2=' + IntToStr(Config.Pool2) +
+    ' lstm_hidden=' + IntToStr(Config.LSTMHidden) +
+    ' max_speakers=' + IntToStr(Config.MaxSpeakers) +
+    ' powerset_classes=' + IntToStr(Config.NumPowersetClasses);
+end;
+
+function PyannoteFrameCount(const Config: TPyannoteConfig;
+  NumSamples: integer): integer;
+var
+  L: integer;
+begin
+  // SincConv (valid, stride SincStride) -> MaxPool1 -> Conv2 (valid, stride 1)
+  // -> MaxPool2. Valid conv: (n - k) div s + 1. MaxPool (size=stride=p,pad=0):
+  // (n - p) div p + 1 (TNNetMaxPool's exact output-size formula).
+  L := (NumSamples - Config.SincKernel) div Config.SincStride + 1;
+  L := (L - Config.Pool1) div Config.Pool1 + 1;
+  L := (L - Config.ConvKernel) div 1 + 1;
+  L := (L - Config.Pool2) div Config.Pool2 + 1;
+  Result := L;
+end;
+
+// Loads the SincConv1D two-scalars-per-filter parameters: low_hz [F] and
+// band_hz [F] (Hz), stored in Neurons[0].Weights as (F,1,2) [low,band].
+procedure LoadPyannoteSincConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetSincConv1D; const LowName, BandName: string; NumFilters: integer;
+  Consumed: TStringList);
+var
+  Lo, Ba: TNNetVolume;
+  f: integer;
+begin
+  if not Reader.HasTensor(LowName) then
+    ImportError('Pyannote import: missing tensor "' + LowName + '".');
+  if not Reader.HasTensor(BandName) then
+    ImportError('Pyannote import: missing tensor "' + BandName + '".');
+  if Reader.ElementCount(LowName) <> NumFilters then
+    ImportError('Pyannote import: "' + LowName + '" must have ' +
+      IntToStr(NumFilters) + ' elements, got ' + Reader.ShapeAsString(LowName));
+  Lo := TNNetVolume.Create;
+  Ba := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(LowName, Lo);
+    Reader.LoadTensorFlat(BandName, Ba);
+    for f := 0 to NumFilters - 1 do
+    begin
+      Layer.Neurons[0].Weights[f, 0, 0] := Lo.FData[f];
+      Layer.Neurons[0].Weights[f, 0, 1] := Ba.FData[f];
+    end;
+  finally
+    Ba.Free; Lo.Free;
+  end;
+  Layer.FlushWeightCache();
+  Consumed.Add(LowName);
+  Consumed.Add(BandName);
+end;
+
+// Loads a [OutDim] conv bias into the per-neuron BiasWeight.
+procedure LoadPyannoteConvBias(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const BName: string; OutDim: integer);
+var
+  B: TNNetVolume;
+  o: integer;
+begin
+  if Reader.ElementCount(BName) <> OutDim then
+    ImportError('Pyannote import: "' + BName + '" must have ' +
+      IntToStr(OutDim) + ' elements, got ' + Reader.ShapeAsString(BName));
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(BName, B);
+    for o := 0 to OutDim - 1 do
+      Layer.Neurons[o].BiasWeight := B.FData[o];
+  finally
+    B.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+// Loads a TNNetMinLSTM direction from x-only gate weights. The checkpoint
+// stores W_f/W_i/W_h as [Hidden,Hidden] (out,in) and b_f/b_i/b_h as [Hidden].
+procedure LoadPyannoteMinLSTM(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const Prefix: string; Hidden, InDim: integer;
+  Consumed: TStringList);
+var
+  W: TNNetVolume;
+  GateNames: array[0..2] of string;
+  BiasNames: array[0..2] of string;
+  g, o, i: integer;
+  WName, BName: string;
+begin
+  GateNames[0] := 'W_f'; GateNames[1] := 'W_i'; GateNames[2] := 'W_h';
+  BiasNames[0] := 'b_f'; BiasNames[1] := 'b_i'; BiasNames[2] := 'b_h';
+  W := TNNetVolume.Create;
+  try
+    for g := 0 to 2 do
+    begin
+      WName := Prefix + GateNames[g];
+      BName := Prefix + BiasNames[g];
+      if not Reader.HasTensor(WName) then
+        ImportError('Pyannote import: missing tensor "' + WName + '".');
+      if (Reader.DimSize(WName, 0) <> Hidden) or
+         (Reader.DimSize(WName, 1) <> InDim) then
+        ImportError('Pyannote import: "' + WName + '" must be [' +
+          IntToStr(Hidden) + ',' + IntToStr(InDim) + '], got ' +
+          Reader.ShapeAsString(WName));
+      Reader.LoadTensorFlat(WName, W);   // row-major [out,in]
+      // TNNetMinLSTM stores gate g in Neurons[g] as (InDim,1,Hidden) [out,0,in].
+      for o := 0 to Hidden - 1 do
+        for i := 0 to InDim - 1 do
+          Layer.Neurons[g].Weights[o, 0, i] := W.FData[o * InDim + i];
+      Consumed.Add(WName);
+      // Bias.
+      Reader.LoadTensorFlat(BName, W);
+      for o := 0 to Hidden - 1 do
+        Layer.Neurons[3 + g].Weights.FData[o] := W.FData[o];
+      Consumed.Add(BName);
+    end;
+  finally
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+procedure PyannotePowersetDecode(const Logits: TNNetVolume; FrameIdx: integer;
+  const Config: TPyannoteConfig; out Active: array of boolean);
+var
+  c, best, sp, ii, jj, pairIdx: integer;
+  bestVal, v: TNeuralFloat;
+  K: integer;
+begin
+  K := Config.MaxSpeakers;
+  for sp := 0 to K - 1 do Active[sp] := False;
+  // argmax over the NumPowersetClasses logits at this frame.
+  best := 0;
+  bestVal := Logits[FrameIdx, 0, 0];
+  for c := 1 to Config.NumPowersetClasses - 1 do
+  begin
+    v := Logits[FrameIdx, 0, c];
+    if v > bestVal then begin bestVal := v; best := c; end;
+  end;
+  // Class layout: 0 silence; 1..K single speaker (best-1); K+1.. pairs.
+  if best = 0 then exit;                 // silence
+  if best <= K then begin Active[best - 1] := True; exit; end;
+  // Pair classes in lexicographic (i<j) order.
+  c := best - K - 1;  // 0-based pair index
+  pairIdx := 0;
+  for ii := 0 to K - 2 do
+    for jj := ii + 1 to K - 1 do
+    begin
+      if pairIdx = c then begin Active[ii] := True; Active[jj] := True; exit; end;
+      Inc(pairIdx);
+    end;
+end;
+
+function BuildPyannoteSegmentationFromSafeTensorsWithConfig(
+  const FileName: string; var Config: TPyannoteConfig; NumSamples: integer;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Sinc: TNNetSincConv1D;
+  Conv2, LN1, LN2, Head: TNNetLayer;
+  FwdCell, RevCell, Source: TNNetLayer;
+  Frames: integer;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin Consumed.Add(TName); end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      Config.NumPowersetClasses := PyannotePowersetClasses(Config.MaxSpeakers);
+      if not Reader.HasTensor('sincnet.low_hz') then
+        ImportError('Pyannote import: "sincnet.low_hz" not found in ' +
+          Reader.FileName + ' - not a pyannote pico checkpoint?');
+      Frames := PyannoteFrameCount(Config, NumSamples);
+      if Frames < 1 then
+        ImportError('Pyannote import: NumSamples=' + IntToStr(NumSamples) +
+          ' too short - feature extractor produced ' + IntToStr(Frames) +
+          ' frames.');
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(NumSamples, 1, 1) );
+      // SincNet learnable band-pass front-end -> abs -> maxpool -> layernorm.
+      Sinc := TNNetSincConv1D.Create(Config.SincFilters, Config.SincKernel,
+        Config.SincStride, Config.SampleRate);
+      NN.AddLayer(Sinc);
+      NN.AddLayer( TNNetAbs.Create() );
+      NN.AddLayer( TNNetMaxPool.Create(Config.Pool1, Config.Pool1, 0) );
+      LN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      // Second conv block (valid conv, stride 1) -> relu -> maxpool -> layernorm.
+      Conv2 := NN.AddLayer( TNNetConvolutionLinear.Create(
+        Config.ConvChannels, Config.ConvKernel, 0, 1, 0) );
+      NN.AddLayer( TNNetReLU.Create() );
+      NN.AddLayer( TNNetMaxPool.Create(Config.Pool2, Config.Pool2, 0) );
+      LN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      // Bidirectional minimal-LSTM temporal trunk (forward + time-reversed),
+      // concatenated along Depth -> 2*LSTMHidden channels per frame.
+      Source := NN.GetLastLayer();
+      FwdCell := NN.AddLayerAfter(TNNetMinLSTM.Create(), Source);
+      NN.AddLayerAfter( TNNetFlipX.Create(), Source );
+      NN.AddLayer( TNNetMinLSTM.Create() );
+      RevCell := NN.AddLayer( TNNetFlipX.Create() );
+      NN.AddLayer( TNNetDeepConcat.Create([FwdCell, RevCell]) );
+      // Per-frame powerset head: Linear (2*Hidden -> NumPowersetClasses).
+      Head := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.NumPowersetClasses) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      LoadPyannoteSincConv(Reader, Sinc, 'sincnet.low_hz', 'sincnet.band_hz',
+        Config.SincFilters, Consumed);
+      LoadLayerNormWeights(Reader, LN1, 'ln1.weight', 'ln1.bias',
+        Config.SincFilters);
+      MarkConsumed('ln1.weight'); MarkConsumed('ln1.bias');
+      LoadWav2Vec2FeatureConv(Reader, Conv2, 'conv.weight',
+        Config.SincFilters, Config.ConvChannels, Config.ConvKernel, Consumed);
+      // conv bias (LoadWav2Vec2FeatureConv zeroes bias; load it explicitly).
+      if Reader.HasTensor('conv.bias') then
+      begin
+        LoadPyannoteConvBias(Reader, Conv2, 'conv.bias', Config.ConvChannels);
+        MarkConsumed('conv.bias');
+      end;
+      LoadLayerNormWeights(Reader, LN2, 'ln2.weight', 'ln2.bias',
+        Config.ConvChannels);
+      MarkConsumed('ln2.weight'); MarkConsumed('ln2.bias');
+      // TNNetMinLSTM is a SAME-SHAPE recurrence: its hidden size equals the
+      // input depth (ConvChannels). Each gate matrix is therefore
+      // ConvChannels x ConvChannels and the BiLSTM trunk emits 2*ConvChannels.
+      LoadPyannoteMinLSTM(Reader, FwdCell, 'lstm.fwd.', Config.ConvChannels,
+        Config.ConvChannels, Consumed);
+      // Reverse cell layer = the TNNetMinLSTM before the final FlipX. It is the
+      // PrevLayer of RevCell (RevCell is the FlipX).
+      LoadPyannoteMinLSTM(Reader, RevCell.PrevLayer, 'lstm.rev.',
+        Config.ConvChannels, Config.ConvChannels, Consumed);
+      LoadLlamaLinearWeights(Reader, Head, 'head.weight',
+        2 * Config.ConvChannels, Config.NumPowersetClasses, 0, -1, 0,
+        'head.bias');
+      MarkConsumed('head.weight'); MarkConsumed('head.bias');
+
+      Result := NN;
+    except
+      on E: Exception do
+      begin
+        if Assigned(NN) then NN.Free;
+        raise;
+      end;
+    end;
+  finally
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildPyannoteSegmentationFromSafeTensorsEx(const FileName: string;
+  out Config: TPyannoteConfig; NumSamples: integer;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  CfgFile: string;
+begin
+  if ConfigFileName <> '' then CfgFile := ConfigFileName
+  else CfgFile := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadPyannoteConfigFromJSONFile(CfgFile);
+  Result := BuildPyannoteSegmentationFromSafeTensorsWithConfig(FileName,
+    Config, NumSamples, pInferenceOnly);
+end;
+
+function BuildPyannoteSegmentationFromSafeTensors(const FileName: string;
+  NumSamples: integer; pInferenceOnly: boolean = false): TNNet;
+var
+  Config: TPyannoteConfig;
+begin
+  Result := BuildPyannoteSegmentationFromSafeTensorsEx(FileName, Config,
+    NumSamples, pInferenceOnly);
 end;
 
 // ===========================================================================
