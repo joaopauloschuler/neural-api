@@ -832,6 +832,20 @@ rather than acted on.
       <1e-4) alongside the unchanged causal TestEnCodecRoundTripParity. NOT yet
       run end-to-end on the real full-size model (host RAM-limited; see
       memory).
+- [ ] Read generation_config.json for decode defaults (MusicGen + general).
+      examples/MusicGenText currently HARDCODES MusicGen's intended sampling
+      recipe in --download mode (top_k=250, temperature=1.0, guidance_scale=3.0,
+      do_sample=true) -- these match facebook/musicgen-small's
+      generation_config.json exactly, but a non-standard MusicGen variant with
+      different generation defaults would not be picked up. Add a small
+      generation_config.json reader (top_k / top_p / temperature / do_sample /
+      guidance_scale / max_length) and have the example seed its defaults from
+      it when present (explicit --flags still override). NOTE: the greedy-vs-
+      sampling distinction matters a LOT here -- greedy argmax collapses MusicGen
+      into a repetitive drone; top_k sampling is what actually produces music
+      (root cause of the "not music" bug, fixed by defaulting --download to
+      top_k=250 in commit 882a75b). Generalizes beyond MusicGen to any imported
+      generative LM that ships a generation_config.json.
 - [ ] Stereo MusicGen (audio_channels=2, the 2K-codebook layout) -- the
       ReadMusicGenConfigFromJSONFile importer currently REJECTS audio_channels=2
       (the 2*K interleaved-codebook delay layout is a documented follow-up).
