@@ -152,17 +152,44 @@ def build(use_causal, suffix):
         sd[k] = v.to(torch.float32).contiguous()
     save_file(sd, os.path.join(FIX, "tiny_encodec%s.safetensors" % suffix))
 
+    cfg_obj = {
+        "num_codebooks": len(model.quantizer.layers),
+        "codebook_size": cfg.codebook_size,
+        "codebook_dim": cfg.codebook_dim,
+        "hidden_size": cfg.hidden_size,
+        "clips": refs,
+    }
     with open(os.path.join(FIX, "tiny_encodec%s_config.json" % suffix), "w") as f:
         json.dump(cfg.to_dict(), f, indent=1, default=str)
 
     with open(os.path.join(FIX, "tiny_encodec%s_ref.json" % suffix), "w") as f:
-        json.dump({
-            "num_codebooks": len(model.quantizer.layers),
-            "codebook_size": cfg.codebook_size,
-            "codebook_dim": cfg.codebook_dim,
-            "hidden_size": cfg.hidden_size,
-            "clips": refs,
-        }, f)
+        json.dump(cfg_obj, f)
+
+    # The torch we generate with uses the NEW parametrization weight_norm API
+    # (.parametrizations.weight.original0/1). The real facebook/encodec_32khz
+    # checkpoint uses the LEGACY torch.nn.utils.weight_norm naming
+    # (.weight_g / .weight_v) for the SAME w = g*v/||v||. For the causal
+    # variant, also emit a legacy-RENAMED twin (identical tensors, renamed
+    # keys) + copied config/ref so a Pascal parity test can pin the importer's
+    # legacy-naming branch (which the real 32 kHz codec needs).
+    if suffix == "":
+        legacy = {}
+        for k, v in sd.items():
+            if k.endswith(".parametrizations.weight.original0"):
+                legacy[k[:-len(".parametrizations.weight.original0")]
+                       + ".weight_g"] = v
+            elif k.endswith(".parametrizations.weight.original1"):
+                legacy[k[:-len(".parametrizations.weight.original1")]
+                       + ".weight_v"] = v
+            else:
+                legacy[k] = v
+        save_file(legacy, os.path.join(FIX, "tiny_encodec_legacynorm.safetensors"))
+        with open(os.path.join(FIX, "tiny_encodec_legacynorm_config.json"),
+                  "w") as f:
+            json.dump(cfg.to_dict(), f, indent=1, default=str)
+        with open(os.path.join(FIX, "tiny_encodec_legacynorm_ref.json"),
+                  "w") as f:
+            json.dump(cfg_obj, f)
 
     # report sizes
     st = os.path.getsize(os.path.join(FIX, "tiny_encodec%s.safetensors" % suffix))

@@ -292,6 +292,11 @@ type
     // Same round-trip parity gate for the NON-CAUSAL (32 kHz / MusicGen)
     // EnCodec topology: symmetric conv padding + symmetric ConvTranspose trim.
     procedure TestEnCodecNonCausalRoundTripParity;
+    // Same parity gate on a fixture whose weight_norm is stored under the
+    // LEGACY torch naming (.weight_g / .weight_v, as real facebook/encodec_32khz
+    // ships) instead of the new .parametrizations.weight.original0/1; pins the
+    // importer's legacy-naming branch (same w = g*v/||v||, identical oracle).
+    procedure TestEnCodecLegacyWeightNormParity;
     // Shared body for both EnCodec round-trip parity tests (parameterized, so
     // FPCUnit does not auto-run it as a test).
     procedure CheckEnCodecParity(const BaseName: string);
@@ -12639,6 +12644,11 @@ end;
 procedure TTestNeuralPretrained.TestEnCodecNonCausalRoundTripParity;
 begin
   CheckEnCodecParity('tiny_encodec_noncausal'); // non-causal 32 kHz / MusicGen
+end;
+
+procedure TTestNeuralPretrained.TestEnCodecLegacyWeightNormParity;
+begin
+  CheckEnCodecParity('tiny_encodec_legacynorm'); // legacy weight_g/weight_v
 end;
 
 procedure TTestNeuralPretrained.CheckEnCodecParity(const BaseName: string);

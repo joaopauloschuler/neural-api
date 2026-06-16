@@ -32328,18 +32328,34 @@ var
   G, V: TNNetVolume;
   OutDim, InDim, K, o, i, k2, Base, Cnt: integer;
   Norm: TNeuralFloat;
+  GName, VName: string;
 begin
   G := TNNetVolume.Create;
   V := TNNetVolume.Create;
   try
-    Reader.LoadTensorFlat(Prefix + '.parametrizations.weight.original0', G);
-    Reader.LoadTensorFlat(Prefix + '.parametrizations.weight.original1', V);
-    Consumed.Add(Prefix + '.parametrizations.weight.original0');
-    Consumed.Add(Prefix + '.parametrizations.weight.original1');
+    // weight_norm is stored under two naming conventions: the NEW PyTorch
+    // parametrization API (.parametrizations.weight.original0 = g magnitude,
+    // .original1 = v direction; e.g. the encodec_24khz tiny fixture) and the
+    // LEGACY torch.nn.utils.weight_norm (.weight_g / .weight_v; e.g. the real
+    // facebook/encodec_32khz checkpoint). Both encode the same w = g*v/||v||.
+    if Reader.HasTensor(Prefix + '.parametrizations.weight.original1') then
+    begin
+      GName := Prefix + '.parametrizations.weight.original0';
+      VName := Prefix + '.parametrizations.weight.original1';
+    end
+    else
+    begin
+      GName := Prefix + '.weight_g';
+      VName := Prefix + '.weight_v';
+    end;
+    Reader.LoadTensorFlat(GName, G);
+    Reader.LoadTensorFlat(VName, V);
+    Consumed.Add(GName);
+    Consumed.Add(VName);
     // v shape: dim0 is the weight_norm group axis (= G's length).
-    OutDim := Reader.DimSize(Prefix + '.parametrizations.weight.original1', 0);
-    InDim := Reader.DimSize(Prefix + '.parametrizations.weight.original1', 1);
-    K := Reader.DimSize(Prefix + '.parametrizations.weight.original1', 2);
+    OutDim := Reader.DimSize(VName, 0);
+    InDim := Reader.DimSize(VName, 1);
+    K := Reader.DimSize(VName, 2);
     Conv.Transpose := pTranspose;
     Conv.Stride := pStride;
     Conv.Dilation := pDilation;
