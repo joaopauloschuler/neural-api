@@ -1128,7 +1128,7 @@ rather than acted on.
         IMAGE (conditional_pixel_values -> clip.get_image_features pooled embedding)
         instead of text; v1 does text only. Add a RunCLIPSegImagePrompt path reusing
         the vision tower's pooled class-token embedding as the conditional vector.
-- [ ] TinyNeRF novel-view-synthesis example (examples/TinyNeRF) — a brand-new
+- [X] TinyNeRF novel-view-synthesis example (examples/TinyNeRF) — a brand-new
       output modality for the tree: a learned implicit 3-D scene that renders an image
       from an arbitrary camera pose, the first differentiable VOLUME RENDERER in the
       repo. Distinct from every landed image generator (DiT/PixArt diffusion,
