@@ -104,6 +104,17 @@ var
   GuidanceScale, Temperature, Seconds: TNeuralFloat;
   UseCache, RealMode: boolean;
   Sampler: TNNetSamplerBase;
+  TickStart: QWord;   // captured before each timed model load / pipeline step
+
+  // Milliseconds elapsed since TickStart, formatted as a human-readable string
+  // (e.g. "1234 ms" or "12.34 s"). GetTickCount64 is a monotonic ms clock.
+  function Elapsed(const StartTick: QWord): string;
+  var ms: QWord;
+  begin
+    ms := GetTickCount64 - StartTick;
+    if ms >= 1000 then Result := FormatFloat('0.00', ms / 1000.0) + ' s'
+    else Result := IntToStr(ms) + ' ms';
+  end;
 
   // Returns the value following a "--name" flag, or Def if the flag is absent.
   function ParseStrArg(const Name, Def: string): string;
@@ -171,12 +182,21 @@ begin
     // offline) with config.json + model.safetensors (+ tokenizer for t5).
     WriteLn('Downloading checkpoints via HuggingFace Hub (cache: ',
       HubGetCacheDir, ')...');
+    TickStart := GetTickCount64;
     MgDir := IncludeTrailingPathDelimiter(
       HubFetchModel(ParseStrArg('--musicgen-repo', DefaultMusicGenRepo)));
+    WriteLn('[time] fetch ', ParseStrArg('--musicgen-repo', DefaultMusicGenRepo),
+      ': ', Elapsed(TickStart));
+    TickStart := GetTickCount64;
     T5Dir := IncludeTrailingPathDelimiter(
       HubFetchModel(ParseStrArg('--t5-repo', DefaultT5Repo)));
+    WriteLn('[time] fetch ', ParseStrArg('--t5-repo', DefaultT5Repo),
+      ': ', Elapsed(TickStart));
+    TickStart := GetTickCount64;
     EcDir := IncludeTrailingPathDelimiter(
       HubFetchModel(ParseStrArg('--encodec-repo', DefaultEnCodecRepo)));
+    WriteLn('[time] fetch ', ParseStrArg('--encodec-repo', DefaultEnCodecRepo),
+      ': ', Elapsed(TickStart));
     MgSafe := MgDir + 'model.safetensors';  MgCfg := MgDir + 'config.json';
     T5Safe := T5Dir + 'model.safetensors';  T5CfgPath := T5Dir + 'config.json';
     EcSafe := EcDir + 'model.safetensors';  EcCfg := EcDir + 'config.json';
@@ -224,7 +244,9 @@ begin
     if RealMode then
     begin
       Tok := TNeuralHFTokenizer.Create;
+      TickStart := GetTickCount64;
       Tok.LoadFromFile(TokPath);
+      WriteLn('[time] T5 tokenizer load: ', Elapsed(TickStart));
       // T5 encodes content ids then appends </s> (eos), no BOS.
       Ids := Tok.Encode(ParseStrArg('--prompt', DefaultPrompt));
       if (Tok.EosId >= 0) and
@@ -263,8 +285,10 @@ begin
       NumFrames := ParseIntArg('--frames', 6);
 
     // ---- 1. Build the T5 text encoder and run it on the prompt ids. --------
+    TickStart := GetTickCount64;
     BuildT5FromSafeTensors(T5Safe, T5Enc, T5Dec, T5Cfg, EncSeq, 1,
       {pInferenceOnly=}true, T5CfgPath);
+    WriteLn('[time] T5 model load (', T5Safe, '): ', Elapsed(TickStart));
     WriteLn('T5 text encoder: ', T5ConfigToString(T5Cfg));
 
     Tokens.ReSize(EncSeq, 1, 1);
@@ -275,7 +299,9 @@ begin
       Write(' ', Ids[i]);
     end;
     WriteLn;
+    TickStart := GetTickCount64;
     T5Enc.Compute(Tokens);
+    WriteLn('[time] T5 encoder forward pass: ', Elapsed(TickStart));
     EncStates.Copy(T5Enc.GetLastLayer.Output);
     WriteLn('Encoder hidden states: ', EncStates.SizeX, 'x', EncStates.Depth,
       ' (seq x d_model)');
@@ -296,8 +322,10 @@ begin
     end;
     // The decoder needs room for NumFrames + (K - 1) delay steps (+1 headroom).
     DecSeq := NumFrames + Config.NumCodebooks - 1 + 1;
+    TickStart := GetTickCount64;
     Model := BuildMusicGenFromSafeTensors(MgSafe, Config, EncSeq, DecSeq,
       {pInferenceOnly=}true, MgCfg);
+    WriteLn('[time] MusicGen decoder load (', MgSafe, '): ', Elapsed(TickStart));
     WriteLn(MusicGenConfigToString(Config));
 
     WriteLn('Generating ', NumFrames, ' frames over ', Config.NumCodebooks,
@@ -308,6 +336,7 @@ begin
       WriteLn('Sampling: weighted top-k = ', TopK, ', temperature = ',
         Temperature:0:2, '.');
     end;
+    TickStart := GetTickCount64;
     if GuidanceScale > 1.0 then
     begin
       // Classifier-free guidance: the unconditional branch is a ZEROED text
@@ -332,6 +361,8 @@ begin
       Model.GenerateEx(EncStates, nil, NumFrames, 1.0, UseCache, Sampler,
         Temperature, Codes);
     end;
+    WriteLn('[time] MusicGen decode (', NumFrames, ' frames): ',
+      Elapsed(TickStart));
     if NumFrames <= 16 then
     begin
       WriteLn('Generated code stack (codebook x frame):');
@@ -347,7 +378,9 @@ begin
     WriteLn;
 
     // ---- 3. Decode the code stack to a waveform with the EnCodec decoder. --
+    TickStart := GetTickCount64;
     Codec := BuildEnCodecFromSafeTensors(EcSafe, CodecCfg, EcCfg);
+    WriteLn('[time] EnCodec decoder load (', EcSafe, '): ', Elapsed(TickStart));
     WriteLn('EnCodec decoder: ', EnCodecConfigToString(CodecCfg));
     if Codec.NumCodebooks < Config.NumCodebooks then
     begin
@@ -355,7 +388,9 @@ begin
         ' quantizers, fewer than MusicGen K=', Config.NumCodebooks);
       Halt(1);
     end;
+    TickStart := GetTickCount64;
     Codec.DecodeCodesToAudio(Codes, Waveform, Config.NumCodebooks);
+    WriteLn('[time] EnCodec waveform synthesis: ', Elapsed(TickStart));
     WriteLn('Decoded waveform: ', Length(Waveform), ' samples at ',
       CodecCfg.SamplingRate, ' Hz');
 
