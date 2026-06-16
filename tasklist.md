@@ -747,44 +747,11 @@ rather than acted on.
       feed pre-phonemized input and reject `language`/g2p config loudly, exactly as the
       VITS uroman/phonemizer front-ends are deferred. Unlocks the missing inverse-STFT
       vocoding rung shared with any spectral-domain generator.
-- [X] Mimi streaming neural-codec importer (`BuildMimiFromSafeTensors[Ex]` +
-      `ReadMimiConfigFromJSONFile`/`MimiConfigToString` + `TMimiConfig` + a
-      channel-major `TNNetMimi` holder with `Encode`/`Decode` like the landed
-      `TEnCodecModel`; model_type "mimi", e.g. `kyutai/mimi`) — LANDED. The neural audio
-      tokenizer behind the current wave of speech LMs (Moshi, Kyutai-TTS, Sesame
-      CSM), so importing it is the prerequisite codec for that whole family — the
-      audio analogue of the role EnCodec plays for MusicGen. DISTINCT from the
-      landed EnCodec codec (which is purely convolutional SEANet + plain RVQ): Mimi
-      adds (a) a TRANSFORMER bottleneck (a small causal self-attention stack with
-      RoPE, reusing the landed SDPA + KV-cache machinery) inserted between the
-      conv encoder/decoder and the quantizer, and (b) a SPLIT quantizer — one
-      "semantic" VQ codebook (distilled from a self-supervised teacher at train
-      time; inference-only here) concatenated with an acoustic RVQ stack — running
-      at a 12.5 Hz frame rate with fully causal streaming. Genuinely new code is
-      the conv<->transformer bottleneck wiring and the semantic+acoustic split-VQ
-      decode glue; the SEANet conv blocks, causal Conv1d reflect-padding, and the
-      RVQ codebook lookup/residual math are PURE REUSE of the landed EnCodec
-      primitives in `neuralpretrained.pas`. Scope v1 as inference-only
-      encode (waveform -> discrete codes) and decode (codes -> waveform), gated by
-      a pico-fixture parity test `TestMimiParity` `< 1e-4` vs a float64 HF
-      `MimiModel` oracle (`tools/make_pico_mimi_fixture.py` -> committed
-      `tests/fixtures/tiny_mimi.*`, re-randomized O(1)-scale weights), plus an
-      examples/MimiCodec round-trip smoke that encodes and resynthesizes a short
-      clip via `SaveVolumeToWav16`. LANDED: split-VQ codes match the HF `MimiModel`
-      float64 oracle EXACTLY and the round-trip waveform to max|diff| ~1e-12
-      (`TestMimiParity`, generator `tools/mimi_tiny_fixture.py` -> committed
-      `tests/fixtures/tiny_mimi.*`); the holder carries its signal in double
-      precision (weights F32). model_type "mimi" wired into `BuildFromPretrained`
-      (helpful "call BuildMimiFromSafeTensors" error, like whisper/clip).
-      Implementation notes: Mimi pad_mode is "constant" (zero left-pad, NOT
-      EnCodec's reflect); conv weights are plain `.conv.weight` (no weight_norm);
-      codebook is `embed_sum`/`clamp(cluster_usage, eps)`; RoPE uses the Llama
-      `rotate_half` convention (snapshot the head's original values — an in-place
-      rotation silently feeds the rotated first half into the second half, a
-      position-dependent bug that argmin-quantization masks on the codes but
-      corrupts the decoded waveform); downsample conv uses "replicate" pad; upsample
-      is a GROUPED `ConvTranspose1d` (groups = hidden_size).
-      Remaining follow-ups (sub-bullets):
+- [ ] Mimi streaming neural-codec importer (`BuildMimiFromSafeTensors[Ex]`,
+      model_type "mimi", e.g. `kyutai/mimi`) — LANDED (conv encoder/decoder +
+      RoPE transformer bottleneck + semantic/acoustic split-VQ; codes match the
+      HF `MimiModel` float64 oracle exactly, round-trip waveform max|diff| ~1e-12,
+      `TestMimiParity`; examples/MimiCodec round-trip smoke). Open follow-ups:
   - [ ] Mimi REAL-checkpoint parity vs the downloaded `kyutai/mimi` (encode codes +
         decode waveform) — the pico fixture pins the wiring; a real run pins widths,
         the GELU/erf path at scale, and the F32-storage budget on a trained model.
@@ -1178,23 +1145,11 @@ rather than acted on.
         use_mean_pooling pooler LayerNorm + patch mean left to the caller).
   - [ ] BEiTv2 (vector-quantized) not validated.
 
-- [X] OPT decoder importer (BuildOPTFromSafeTensors[Ex], model_type "opt", e.g.
-      facebook/opt-125m..2.7b) — a plain learned-absolute-position decoder LLM
-      (LayerNorm not RMSNorm, ReLU FFN, learned position embeddings with the
-      +2 offset, optional final LayerNorm `final_layer_norm`, no rotary). Small
-      and mostly reuse of the existing GPT2-style decode plumbing (FullConnect
-      q/k/v + biases, post-LN or pre-LN per do_layer_norm_before). Genuinely
-      UNBLOCKS the deferred blip2-opt tail above (the most common BLIP-2 weights
-      ship with OPT, not FLAN-T5) and is a prerequisite for any OPT-based VLM.
-      Pico parity < 1e-4 vs the float64 HF OPTForCausalLM oracle on next-token
-      logits (tools/opt_tiny_fixture.py + tests/fixtures/tiny_opt.*).
-      DONE: TOPTConfig + ReadOPTConfigFromJSONFile + OPTConfigToString +
-      BuildOPTFromSafeTensors[Ex]/WithConfig in neuralpretrained.pas; +2-offset
-      position loader (LoadOPTPositionWeights), separate biased q/k/v into the
-      fused slab, ReLU FFN, pre-/post-LN per do_layer_norm_before, optional
-      decoder final_layer_norm, BuildFromPretrained dispatch. Parity tests
-      TestOPTConfigFromJSONFile + TestOPTNextTokenLogitsParity green
-      (whole-sequence logits, < 1e-4 vs float64 oracle).
+- [ ] OPT decoder importer (BuildOPTFromSafeTensors[Ex], model_type "opt", e.g.
+      facebook/opt-125m..2.7b) — LANDED (learned-absolute +2-offset positions,
+      LayerNorm + ReLU FFN, pre-/post-LN per do_layer_norm_before, optional
+      final_layer_norm, BuildFromPretrained dispatch; TestOPTNextTokenLogitsParity
+      < 1e-4 vs float64 HF OPTForCausalLM). Open follow-ups:
   - [ ] word_embed_proj_dim real-checkpoint parity: the equal-dims pico
         fixture leaves the project_in/project_out path (opt-350m) UNTESTED.
         Add an opt-350m-shaped pico fixture (hidden != word_embed_proj_dim) to
