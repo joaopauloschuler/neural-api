@@ -58,17 +58,21 @@ Coded by Claude (AI).
 //   MusicGenText --download --prompt "lo-fi hip hop beat to relax to"
 //   MusicGenText --download --prompt "..." --seconds 8 --guidance 3.0
 //   MusicGenText --download --prompt "..." --topk 250 --temperature 1.0
+//   MusicGenText --download --prompt "..." --topk 0    # force greedy (drone!)
 //   MusicGenText --frames 6 --no-cache            # explicit pico frame count
 // Repo overrides: --musicgen-repo / --t5-repo / --encodec-repo. Gated repos:
 // set HF_TOKEN in the environment.
 //
-// The default greedy decode runs the KV-CACHE incremental-decode fast path
-// (TMusicGenModel.GenerateEx with UseCache): each step feeds only the newest
-// delayed frame and the self-attention heads reuse their cached K/V. It is
-// BIT-IDENTICAL to the un-cached greedy loop. --topk / --temperature switch the
-// per-codebook pick to a weighted top-k draw over softmax(logits/temperature);
-// --guidance enables classifier-free guidance (two passes per step, KV-cache
-// off). In --download mode --guidance defaults to MusicGen's 3.0 when not given.
+// DECODE DEFAULTS (--download mode): MusicGen is trained for top-k SAMPLING, so
+// --download defaults to MusicGen's top_k=250 / temperature 1.0 and classifier-
+// free guidance 3.0 -- the recipe that actually produces music. Greedy argmax
+// (--topk 0) collapses into a repetitive drone and is for diagnostics only.
+// --topk / --temperature set the per-codebook weighted top-k draw over
+// softmax(logits/temperature); --guidance sets the CFG scale (two passes per
+// step, KV-cache off). The KV-CACHE incremental-decode fast path
+// (TMusicGenModel.GenerateEx with UseCache) is used when guidance = 1.0: each
+// step feeds only the newest delayed frame and the self-attention heads reuse
+// their cached K/V (bit-identical to the un-cached loop).
 
 {$mode objfpc}{$H+}
 
@@ -81,6 +85,7 @@ const
   PicoFixtureDir = '../../tests/fixtures/';
   OutWavName = 'musicgen_text_demo.wav';
   DefaultSeconds = 5.0;     // real-checkpoint default clip length
+  DefaultRealTopK = 250;    // MusicGen's intended top-k sampling (NOT greedy)
   DefaultPrompt = 'lo-fi hip hop beat to relax to';
   DefaultMusicGenRepo = 'facebook/musicgen-small';
   DefaultT5Repo = 't5-base';
@@ -210,6 +215,10 @@ begin
     end;
     // Default classifier-free guidance to MusicGen's 3.0 unless overridden.
     if not HasFlag('--guidance') then GuidanceScale := 3.0;
+    // MusicGen is trained for top-k SAMPLING; greedy argmax (--topk 0) collapses
+    // into a repetitive drone. Default to MusicGen's top_k=250 unless overridden
+    // (pass --topk 0 to force the greedy path explicitly).
+    if not HasFlag('--topk') then TopK := DefaultRealTopK;
     WriteLn('Prompt: "', ParseStrArg('--prompt', DefaultPrompt), '"');
     WriteLn;
   end
