@@ -366,18 +366,6 @@ rather than acted on.
       diffusers float64 oracle on the down/mid residual tensors for a fixed control
       image; an examples/ControlNetCanny that conditions generation on a hand-drawn
       edge map once the base UNet lands. First conditioning-by-feature-injection model.
-- [X] RandAugment / TrivialAugment automatic augmentation policy in
-      neuraldatasets.pas — the repo has Mixup and CutMix (both landed) but NO
-      single-image geometric/photometric augmentation policy; CV training augmentation
-      is currently just flips + pad-crop. Port the torchvision transforms-v2 staple:
-      a fixed op bank (autocontrast, equalize, rotate, shear-x/y, translate-x/y,
-      posterize, solarize, color/contrast/brightness/sharpness) over a TNNetVolume,
-      with RandAugment (N ops at fixed magnitude M) and the parameter-free
-      TrivialAugment (one op, magnitude drawn uniformly) selection policies, plus
-      RandomErasing/Cutout. Wire it as an optional hook in the TNeuralImageFit
-      augmentation path so existing CIFAR examples can opt in. New code is the op
-      bank + the two sampling policies; reuses existing volume rotate/shear/color
-      primitives where present. Adds a measurable top-1 lift on the SimpleImageClassifier.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
       for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
       parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful
@@ -813,30 +801,6 @@ rather than acted on.
         produces the 1024x64 mel (depends on freq_ratio=4); wire `neuralaudio.pas`
         log-mel -> `ClapBatchNormMelImage` end-to-end and verify against a downloaded
         `clap-htsat-unfused`. (The RoBERTa BPE tokenizer is already importable.)
-- [X] Qwen2-Audio audio-understanding LLM importer (`BuildQwen2AudioFromSafeTensors` +
-      `Qwen2AudioBuildFromSafeTensorsWithConfig`, `TQwen2AudioConfig`/
-      `ReadQwen2AudioConfigFromJSONFile`, model_type "qwen2_audio") +
-      examples/Qwen2AudioChat — LANDED. The AUDIO analogue of the VISION-LLM importers:
-      a frozen Whisper-style audio encoder feeds projected audio frames into a causal
-      Qwen2 LLM. Almost pure REUSE — the audio tower is the Whisper encoder
-      (`BuildWhisperStackBlocks`/`LoadWhisperStack`/`LoadWhisperConv1D`, the
-      `audio_tower.` key spelling) and the language model is the stock Qwen2 path
-      (`BuildLlamaFromTensorReaderWithConfig`). The genuinely NEW pieces landed: (a) the
-      Qwen2-Audio encoder TAIL — `AvgPool1d(2, stride 2)` over the frame axis then a
-      final LayerNorm (`Qwen2AudioProjectAudio` does the frame-pair average explicitly
-      because `TNNetAvgPool`'s `poolsize²` divisor is wrong on a `(frames,1,d)` grid);
-      (b) the single biased linear connector (`Qwen2AudioBuildProjector`); and (c) the
-      embed SPLICE — `LlavaAssembleEmbeddings` REUSED VERBATIM (audio frames in place of
-      visual tokens), so no separate `SpliceModalEmbeddings` helper was needed.
-      `Qwen2AudioRunLogits` = tower+pool+norm+projector -> splice -> inject into the
-      decoder -> causal forward. Pico parity `< 1e-4` on BOTH the projected audio tokens
-      AND the pre-softmax logits vs the float64 HF `Qwen2AudioForConditionalGeneration`
-      oracle (`TestQwen2AudioParity` + `TestQwen2AudioConfigFromJSONFile`, generator
-      `tools/qwen2audio_tiny_fixture.py`, committed `tests/fixtures/tiny_qwen2audio.*`).
-      Open follow-ups: padded/batched audio (`feature_attention_mask`, the legacy
-      per-audio expand); the real `Qwen2-Audio-7B-Instruct` checkpoint + its chat
-      template + KV-cache decode reuse; the real log-mel-from-waveform frontend
-      (neuralaudio) + 16 kHz resampler / non-30 s clip handling.
 - [ ] AudioLDM 2 / Stable Audio latent text-to-audio (music & sound) capstone —
       text-prompt -> audio via LATENT diffusion, the audio analogue of the landed
       LatentTextToImage (PixArt/DiT + VAE) pipeline and the natural home for the
@@ -848,21 +812,6 @@ rather than acted on.
       latent, decoded to a short (~5 s) clip written via the WAV writer; defer
       classifier-free-guidance tuning and long-form generation to a follow-up.
       DEPENDS ON the WAV writer + HiFi-GAN vocoder tasks above.
-- [X] KV-cache incremental decode + top-k/temperature sampling for the MusicGen
-      generation loop (follow-up to the landed examples/MusicGenText).
-      TMusicGenModel.GenerateEx adds (a) a KV-cache fast path: every self-attn
-      head (TNNetScaledDotProductAttention) is armed via BeginIncrementalDecode
-      and driven on a lazily-built WIDTH-1 twin decoder (FStepDecoder, weights
-      CopyWeights'd from the full decoder) one frame at a time — bit-identical to
-      the full re-encode greedy loop (cross-attn re-reads the fixed encoder
-      states; the per-frame sinusoidal position is baked into the fed embedding,
-      so the SDPA positional contract holds with no internal pos layer); and
-      (b) top-k/temperature sampling reusing the neuralvolume TNNetSampler family
-      over softmax(logits/temperature) per codebook (Sampler=nil = exact argmax).
-      CFG runs two passes per step so it stays on the un-cached loop. Verified by
-      tests/TestNeuralPretrained TestMusicGenGenerateEx (cached==full greedy;
-      weighted top-k=1==greedy on both paths; seeded reproducibility) and the
-      examples/MusicGenText smoke (default decode now uses the KV-cache path).
 - [ ] Stereo MusicGen (audio_channels=2, the 2K-codebook layout) and a real
       large downloaded musicgen-small checkpoint + a real tokenizer for the
       text prompt (the network/RAM-gated remainder of the MusicGenText
@@ -922,12 +871,6 @@ rather than acted on.
       and falls back to all-heads otherwise); (d) wire it into
       examples/WhisperTranscribe behind a `--word-timestamps` flag and document
       in examples/README; (e) optional per-word confidence (mean path attention).
-- [X] SAM mask decoder v2: MULTI-point / box prompts + MULTI-mask output + IoU head.
-      v1 hardcodes a single positive point (+ pad) and emits only mask-token 0
-      (multimask_output=False). Extend the prompt encoder to N points / a box (two
-      corner tokens with point_embed[2]/[3]), return all 3 multimask masks, and expose
-      the iou_prediction_head scores for mask ranking. Reuse the validated RunSAMMaskDecoder
-      math (the token layout + hypernetwork loop already generalize).
 - [ ] SAM mask decoder as a real TNNet layer graph (TNNetCrossAttention two-source
       wiring) instead of the plain-array RunSAMMaskDecoder forward, so the decoder is
       trainable / fine-tunable end-to-end (v1 is inference-only). Needs a builder that
@@ -1195,27 +1138,6 @@ rather than acted on.
         use_mean_pooling pooler LayerNorm + patch mean left to the caller).
   - [ ] BEiTv2 (vector-quantized) not validated.
 
-- [X] BLIP-2 Q-Former vision-language importer (BuildBlip2QFormerFromSafeTensors[Ex]
-      + BuildBlip2FromSafeTensors, neuralpretrained.pas). The Q-Former is a
-      BERT-style transformer fed a fixed set of LEARNED query tokens that, in each
-      POST-LN block, self-attend among themselves AND cross-attend into the FROZEN
-      ViT patch features (fed as the net's SECOND TNNetInput, the
-      T5EncoderStatesInput two-source convention; RECTANGULAR NumQuery x NumPatches
-      cross-attention via TNNetCrossAttention, encoder_hidden may differ from
-      hidden), then a query-specific FFN (intermediate_query/output_query) in
-      exact-erf gelu. A model-level layernorm normalizes the query embeddings first.
-      BuildBlip2FromSafeTensors returns the Q-Former net + the learned query_tokens
-      (input0) + the language_projection net (Q-Former hidden -> LLM token width);
-      it DETECTS the 'qformer.' prefix in a full blip2 checkpoint. LANDED: Q-Former
-      parity < 1e-4 vs the float64 HF Blip2QFormerModel oracle (TestBlip2QFormer-
-      Parity, measured ~2.5e-7; generator tools/blip2_qformer_tiny_fixture.py,
-      fixtures tests/fixtures/tiny_blip2_qformer.* + tiny_blip2_full.*) + the
-      full-bridge projection parity (TestBlip2FullBridgeParity) + examples/
-      Blip2Caption smoke. The FROZEN ViT (BuildClipVisionTower) and the FLAN-T5
-      decode tail (BuildT5FromSafeTensors via T5EncoderStatesInput) are REUSE,
-      documented not re-built. DEFERRED: the text-grounded use_qformer_text_input
-      ITC/ITM path, blip2-opt (no OPT importer in-tree), InstructBLIP, the full
-      ViT->Q-Former->FLAN-T5 caption on a real download.
 - [ ] OPT decoder importer (BuildOPTFromSafeTensors[Ex], model_type "opt", e.g.
       facebook/opt-125m..2.7b) — a plain learned-absolute-position decoder LLM
       (LayerNorm not RMSNorm, ReLU FFN, learned position embeddings with the
