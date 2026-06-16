@@ -24432,6 +24432,17 @@ begin
     'relative_attention_bias.weight', Config);
   Consumed.Add(StackPrefix + 'block.0.layer.0.SelfAttention.' +
     'relative_attention_bias.weight');
+  // Original google-t5 checkpoints (t5-base/large/...) also ship a VESTIGIAL
+  // block.0.layer.1.EncDecAttention.relative_attention_bias for the decoder
+  // cross-attention. T5 cross-attention is position-agnostic and NEVER reads
+  // it (has_relative_attention_bias=False in HF), so consume-and-ignore it.
+  // (Freshly instantiated T5 checkpoints omit it -- which is why the pico
+  // fixture lacks it -- but the real downloaded checkpoints carry it.) The
+  // unexpected-tensor sweep iterates ACTUAL tensors, so adding a name absent
+  // from the checkpoint is harmless.
+  if IsDecoder then
+    Consumed.Add(StackPrefix + 'block.0.layer.1.EncDecAttention.' +
+      'relative_attention_bias.weight');
 end;
 
 procedure BuildT5FromSafeTensorsWithConfig(const FileName: string;
