@@ -25,7 +25,7 @@ y_t[d]    = h_t[d]
 
 `tnorm_t = (t+1)/SeqLen` is the elapsed continuous time. The per-channel learned
 rate `tau`, computed from the **current input**, decides how fast each channel
-forgets — the defining "liquid" behaviour. This is genuinely distinct from the
+forgets — the defining "liquid" behaviour. This is distinct from the
 other sequence mixers in the library:
 
 | Layer | Mechanism | Decay |

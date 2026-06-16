@@ -39,7 +39,7 @@ sigmoid LSTM (forget gate bounded in `(0,1)`, decays only gradually) lacks. The
 running-max `m_t` (treated as a stop-gradient constant in backward) is the paper's
 key trick that makes exp gating numerically trainable.
 
-This is genuinely distinct from the other recurrent/sequence mixers in tree —
+This is distinct from the other recurrent/sequence mixers in tree —
 all of which are **linear-state or decay-based** and have no multiplicative
 input/forget/output gates:
 

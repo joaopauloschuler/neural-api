@@ -9,8 +9,8 @@ placeholder — then the model decodes text **causally**, exactly like a normal
 LLM. No cross-attention; the image is "just more tokens".
 
 This example drives `BuildLlavaFromSafeTensors`
-(`neural/neuralpretrained.pas`), the repo's **first image-in / text-out
-importer of the decoder-only-with-projector kind** (model_type `llava`:
+(`neural/neuralpretrained.pas`), an image-in / text-out
+importer of the decoder-only-with-projector kind (model_type `llava`:
 llava-hf/llava-interleave-qwen-0.5b-hf and siblings). It is distinct from the
 contrastive **dual encoders** (CLIP/SigLIP — score image/text, cannot
 generate) and from the **encoder-decoder** captioners (BLIP/TrOCR —

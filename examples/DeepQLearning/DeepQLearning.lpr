@@ -1,4 +1,4 @@
-// DeepQLearning example -- the suite's first REINFORCEMENT-LEARNING demo.
+// DeepQLearning example -- a REINFORCEMENT-LEARNING demo.
 //
 // A minimal Deep Q-Network (DQN; Mnih et al. 2015, "Human-level control through
 // deep reinforcement learning") that learns an optimal navigation policy on a

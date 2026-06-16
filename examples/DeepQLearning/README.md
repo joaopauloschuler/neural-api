@@ -1,6 +1,6 @@
 # Deep Q-Learning (DQN) on a grid-world
 
-The suite's **first reinforcement-learning example**: a minimal but complete
+A reinforcement-learning example: a minimal but complete
 **Deep Q-Network** (DQN; Mnih et al. 2015, *Human-level control through deep
 reinforcement learning*) that learns an optimal navigation policy on a tiny,
 fully self-contained, deterministic grid-world. The agent, the environment and

@@ -28,7 +28,7 @@ VP-equivalent noise level sigma(t) = sqrt((1-alpha_bar_t)/alpha_bar_t) on the
 "x0 + sigma*eps" scaled view (x_t / sqrt(alpha_bar_t)). c_skip/c_out are plain
 example-side arithmetic -- NO new layer is needed.
 
-CONSISTENCY DISTILLATION LOSS (the genuinely new code). With a PRETRAINED
+CONSISTENCY DISTILLATION LOSS (the new code). With a PRETRAINED
 teacher eps_phi we:
   1. draw clean x_0, pick adjacent timesteps t_{n+1} > t_n on a sub-grid;
   2. forward-noise x_0 to x_{t_{n+1}};

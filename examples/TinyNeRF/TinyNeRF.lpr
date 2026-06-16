@@ -1,6 +1,6 @@
 program TinyNeRF;
 (*
-TinyNeRF: the repo's first differentiable VOLUME RENDERER.
+TinyNeRF: a differentiable VOLUME RENDERER.
 
 A tiny Neural Radiance Field (Mildenhall et al. 2020, "NeRF") learns an
 implicit 3-D scene as a coordinate MLP
@@ -15,7 +15,7 @@ into a single pixel colour:
     T_i = exp( -sum_{j<i} sigma_j * delta_j )            (transmittance)
 
 This compositing step -- and its hand-derived backward, so the WHOLE render is
-trainable end-to-end -- is the genuinely new code here. It is implemented as
+trainable end-to-end -- is the new code here. It is implemented as
 plain-array math in this driver around the MLP's per-sample outputs: the
 composite gradient w.r.t. each sample's (r,g,b,sigma) is computed by hand and
 fed to the MLP's last (linear) layer as its OutputError, then Backpropagate().

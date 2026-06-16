@@ -11,7 +11,7 @@ hzwer/Practical-RIFE) estimates a bidirectional intermediate flow with a coarse-
 to-fine stack of IFBlocks, BACKWARD-WARPS both frames, and blends them with a
 learned soft fusion mask.
 
-The genuinely-new primitive is the differentiable backward-warp TNNetBackwardWarp
+The new primitive is the differentiable backward-warp TNNetBackwardWarp
 (RIFE convention: pixel-unit flow, bilinear, border-clamp -- the integer-pixel
 equivalent of grid_sample(padding_mode='border', align_corners=True)). Everything
 else (3x3 conv, per-channel PReLU, sigmoid, channel-broadcast multiply, residual

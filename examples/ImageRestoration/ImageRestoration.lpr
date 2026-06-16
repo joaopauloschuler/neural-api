@@ -8,7 +8,7 @@ upscaling only). NAFNet (Chen et al. 2022, "Simple Baselines for Image
 Restoration", arXiv:2204.04676) is a symmetric U-Net of NAFBlocks; it restores
 at the SAME resolution.
 
-The genuinely-new primitive the importer needs is the parameter-free SimpleGate
+The new primitive the importer needs is the parameter-free SimpleGate
 (TNNetSimpleGate): split the channel axis in half and multiply the two halves --
 a GLU with no activation. Simplified Channel Attention (SCA) reuses landed
 global pooling + a 1x1 conv + a channelwise multiply. Everything else (1x1/3x3

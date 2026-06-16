@@ -2,7 +2,7 @@
 
 Tracks a 1-D constant-velocity signal corrupted by additive Gaussian
 measurement noise and recovers the latent track with a
-`TNNetKalmanFilterCell` — the first layer in the suite that propagates
+`TNNetKalmanFilterCell` — a layer that propagates
 **uncertainty** (a per-channel state covariance `P`) rather than just a
 deterministic state.
 

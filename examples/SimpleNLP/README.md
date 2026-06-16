@@ -224,7 +224,7 @@ in the middle, the Jamba/Zamba interleaving default: the first recurrent block h
 the lone attention layer globally-mixed inputs, and a constant-state recurrence (not
 a second cache-growing attention) closes the trunk. Trained at lr=0.001 (phase-2/4
 reasoning: the 3-block step is costlier than phase 3's 2-block step, so fewer
-examples fit in the box). Its decode benchmark is the novel part — no other example
+examples fit in the box). Its decode benchmark
 streams BOTH mixer families in one loop: greedy full re-encode per token vs ONE
 streamed single-token step per token driving SIMULTANEOUSLY the DiagonalSSM layers'
 O(1) incremental state AND the MLA heads' SDPA caches + rope `PositionOffset`. Plain

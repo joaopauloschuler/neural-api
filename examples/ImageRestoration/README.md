@@ -2,8 +2,8 @@
 
 Denoises a small image end-to-end on the CPU with the repo's **NAFNet**
 image-restoration importer (`BuildNAFNetFromSafeTensors`, `neuralpretrained.pas`)
-— the repo's **first non-diffusion image-to-image restoration import that is NOT
-super-resolution** (the RRDBNet/ESRGAN path is x4 upscaling only). NAFNet
+— a non-diffusion image-to-image restoration import that is NOT
+super-resolution (the RRDBNet/ESRGAN path is x4 upscaling only). NAFNet
 restores (denoise / deblur / dejpeg) at the **same resolution** (Chen et al.
 2022, [*Simple Baselines for Image Restoration*](https://arxiv.org/abs/2204.04676)).
 

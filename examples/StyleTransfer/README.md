@@ -23,7 +23,7 @@ net's own logits.
 2. **Content loss** — MSE between the canvas and content activations at one deep
    tap (`relu4_3`). Gradient `dL/dF = 2·(F − F_target)`.
 3. **Style loss** — MSE between the **Gram matrices** of the canvas and style
-   activations at all five taps. The Gram matrix is the genuinely new piece of
+   activations at all five taps. The Gram matrix is the new piece of
    code, a plain helper (no new layer class):
 
    ```

@@ -15,7 +15,7 @@ language_projection linear then maps those query embeddings into the LLM token
 space, where they are spliced ahead of the prompt and the LLM (FLAN-T5) decodes
 a caption.
 
-The genuinely NEW piece this demo exercises is the Q-Former: the interleaved
+The NEW piece this demo exercises is the Q-Former: the interleaved
 self/cross-attention querying transformer (the soft-prompt query tokens + the
 two-source cross-attention into the ViT features + the BERT post-LN FFN). The
 vision tower (BuildClipVisionTower) and the FLAN-T5 decode tail
