@@ -759,6 +759,31 @@ rather than acted on.
       feed pre-phonemized input and reject `language`/g2p config loudly, exactly as the
       VITS uroman/phonemizer front-ends are deferred. Unlocks the missing inverse-STFT
       vocoding rung shared with any spectral-domain generator.
+- [ ] Mimi streaming neural-codec importer (`BuildMimiFromSafeTensors[Ex]` +
+      `ReadMimiConfigFromJSONFile`/`MimiConfigToString` + `TMimiConfig` + a
+      channel-major `TNNetMimi` holder with `Encode`/`Decode` like the landed
+      `TEnCodecModel`; model_type "mimi", e.g. `kyutai/mimi`). The neural audio
+      tokenizer behind the current wave of speech LMs (Moshi, Kyutai-TTS, Sesame
+      CSM), so importing it is the prerequisite codec for that whole family — the
+      audio analogue of the role EnCodec plays for MusicGen. DISTINCT from the
+      landed EnCodec codec (which is purely convolutional SEANet + plain RVQ): Mimi
+      adds (a) a TRANSFORMER bottleneck (a small causal self-attention stack with
+      RoPE, reusing the landed SDPA + KV-cache machinery) inserted between the
+      conv encoder/decoder and the quantizer, and (b) a SPLIT quantizer — one
+      "semantic" VQ codebook (distilled from a self-supervised teacher at train
+      time; inference-only here) concatenated with an acoustic RVQ stack — running
+      at a 12.5 Hz frame rate with fully causal streaming. Genuinely new code is
+      the conv<->transformer bottleneck wiring and the semantic+acoustic split-VQ
+      decode glue; the SEANet conv blocks, causal Conv1d reflect-padding, and the
+      RVQ codebook lookup/residual math are PURE REUSE of the landed EnCodec
+      primitives in `neuralpretrained.pas`. Scope v1 as inference-only
+      encode (waveform -> discrete codes) and decode (codes -> waveform), gated by
+      a pico-fixture parity test `TestMimiParity` `< 1e-4` vs a float64 HF
+      `MimiModel` oracle (`tools/make_pico_mimi_fixture.py` -> committed
+      `tests/fixtures/tiny_mimi.*`, re-randomized O(1)-scale weights), plus an
+      examples/MimiCodec round-trip smoke that encodes and resynthesizes a short
+      clip via `SaveVolumeToWav16`. Real-checkpoint parity + a streaming
+      (chunk-at-a-time) encode/decode path are follow-ups.
 - [ ] CLAP audio-text contrastive importer (`BuildClapFromSafeTensors[Ex]` +
       `BuildClapFromSafeTensorsWithConfig`, `TClapConfig`/`ReadClapConfigFromJSONFile`)
       + examples/ZeroShotAudioTag — LANDED. Audio-domain analogue of the CLIP
