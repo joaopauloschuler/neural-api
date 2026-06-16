@@ -212,6 +212,8 @@ type
     procedure TestGPTNeoXConfigFromJSONFile;
     procedure TestGPTNeoXLogitParity;
     procedure TestGPTNeoXSequentialLogitParity;
+    procedure TestOPTConfigFromJSONFile;
+    procedure TestOPTNextTokenLogitsParity;
     procedure TestFalconConfigFromJSONFile;
     procedure TestFalconMultiQueryLogitParity;
     procedure TestFalconNewArchLogitParity;
@@ -8050,6 +8052,64 @@ begin
     AssertFalse('sequential residual', Config.UseParallelResidual);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_gptneox_seq_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestOPTConfigFromJSONFile;
+var
+  Config: TOPTConfig;
+begin
+  RandSeed := 424242;
+  Config := ReadOPTConfigFromJSONFile(FixturePath('tiny_opt_config.json'));
+  AssertEquals('hidden_size', 16, Config.HiddenSize);
+  // word_embed_proj_dim == hidden_size in the pico fixture (no project_in/out).
+  AssertEquals('word_embed_proj_dim', 16, Config.WordEmbedProjDim);
+  // ffn_dim 24, deliberately NOT 4*hidden.
+  AssertEquals('ffn_dim', 24, Config.IntermediateSize);
+  AssertEquals('num_hidden_layers', 2, Config.NumLayers);
+  AssertEquals('num_attention_heads', 2, Config.NumHeads);
+  AssertEquals('vocab_size', 11, Config.VocabSize);
+  AssertEquals('max_position_embeddings', 16, Config.MaxPositions);
+  AssertEquals('layer_norm_eps', 1e-5, Config.LayerNormEps, 1e-9);
+  AssertTrue('do_layer_norm_before', Config.DoLayerNormBefore);
+  AssertTrue('enable_bias', Config.EnableBias);
+  AssertTrue('layer_norm_elementwise_affine', Config.AffineLayerNorm);
+  // do_layer_norm_before and not _remove_final_layer_norm -> final LN present.
+  AssertTrue('has final_layer_norm', Config.HasFinalLayerNorm);
+  AssertTrue('tie_word_embeddings', Config.TieWordEmbeddings);
+end;
+
+// Verifies the OPT import on the pico fixture: tests/fixtures/tiny_opt.* is a
+// randomly-initialized HF OPTForCausalLM (2 layers, 2 heads x 8 dims, hidden
+// 16, ffn 24 deliberately != 4*hidden, vocab 11) covering the OPT quirks -
+// the +2 LEARNED-position offset, ReLU FFN, biased pre-LN blocks (separate
+// biased q/k/v + out_proj), a decoder-level final_layer_norm, and the tied LM
+// head. The fixture generator boosts q/k so attention genuinely matters and
+// asserts both the +2 offset and ReLU (vs gelu) move the logits, so this
+// parity run pins each ingredient. Whole-sequence logits (every position, of
+// which the last row IS the next-token logits) must match the float64 oracle
+// to < 1e-4.
+procedure TTestNeuralPretrained.TestOPTNextTokenLogitsParity;
+var
+  NN: TNNet;
+  Config: TOPTConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildOPTFromSafeTensorsEx(
+    FixturePath('tiny_opt.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_opt_config.json'));
+  try
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('vocab', 11, Config.VocabSize);
+    AssertTrue('do_layer_norm_before', Config.DoLayerNormBefore);
+    AssertEquals('prefix', 'model.decoder.', Config.Prefix);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_opt_logits.json'), Config.MaxPositions,
       Config.VocabSize);
   finally
     NN.Free;

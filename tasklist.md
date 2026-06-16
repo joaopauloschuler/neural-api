@@ -1138,7 +1138,7 @@ rather than acted on.
         use_mean_pooling pooler LayerNorm + patch mean left to the caller).
   - [ ] BEiTv2 (vector-quantized) not validated.
 
-- [ ] OPT decoder importer (BuildOPTFromSafeTensors[Ex], model_type "opt", e.g.
+- [X] OPT decoder importer (BuildOPTFromSafeTensors[Ex], model_type "opt", e.g.
       facebook/opt-125m..2.7b) — a plain learned-absolute-position decoder LLM
       (LayerNorm not RMSNorm, ReLU FFN, learned position embeddings with the
       +2 offset, optional final LayerNorm `final_layer_norm`, no rotary). Small
@@ -1147,8 +1147,24 @@ rather than acted on.
       UNBLOCKS the deferred blip2-opt tail above (the most common BLIP-2 weights
       ship with OPT, not FLAN-T5) and is a prerequisite for any OPT-based VLM.
       Pico parity < 1e-4 vs the float64 HF OPTForCausalLM oracle on next-token
-      logits (tools/opt_tiny_fixture.py + tests/fixtures/tiny_opt.*). Then wire
-      it as the blip2-opt decode tail.
+      logits (tools/opt_tiny_fixture.py + tests/fixtures/tiny_opt.*).
+      DONE: TOPTConfig + ReadOPTConfigFromJSONFile + OPTConfigToString +
+      BuildOPTFromSafeTensors[Ex]/WithConfig in neuralpretrained.pas; +2-offset
+      position loader (LoadOPTPositionWeights), separate biased q/k/v into the
+      fused slab, ReLU FFN, pre-/post-LN per do_layer_norm_before, optional
+      decoder final_layer_norm, BuildFromPretrained dispatch. Parity tests
+      TestOPTConfigFromJSONFile + TestOPTNextTokenLogitsParity green
+      (whole-sequence logits, < 1e-4 vs float64 oracle).
+  - [ ] word_embed_proj_dim real-checkpoint parity: the equal-dims pico
+        fixture leaves the project_in/project_out path (opt-350m) UNTESTED.
+        Add an opt-350m-shaped pico fixture (hidden != word_embed_proj_dim) to
+        exercise the two bias-free projections end-to-end.
+  - [ ] do_layer_norm_before=false (POST-LN, opt-350m) pico parity: the build
+        path is wired but only the PRE-LN (125m) wiring is covered by a
+        fixture. Add a post-LN pico fixture.
+  - [ ] Wire OPT as the blip2-opt decode tail (the original motivation): feed
+        the Q-Former query/text states into BuildOPTFromSafeTensors and verify
+        a BLIP-2-OPT generation path.
 
 - [ ] DepthPro (Apple ml-depth-pro) sharp metric monocular-depth importer
       (BuildDepthProFromSafeTensors[Ex], apple/DepthPro). DISTINCT from the landed

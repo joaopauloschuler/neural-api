@@ -1761,6 +1761,76 @@ function BuildGPTNeoXFromSafeTensors(const FileName: string;
   pQuantizeInt8: boolean = false): TNNet;
 
 type
+  // HF OPTConfig (model_type "opt", facebook/opt-125m..opt-2.7b/6.7b/...).
+  // A plain LEARNED-absolute-position decoder LLM - the pre-/post-LN GPT-2
+  // skeleton with the OPT-specific quirks:
+  //  - LEARNED positions with the +2 OFFSET (OPTLearnedPositionalEmbedding:
+  //    token position p reads embed_positions row p + 2; the table has
+  //    max_position_embeddings + 2 rows);
+  //  - biased nn.LayerNorm norms (NOT RMSNorm) and bias=True (enable_bias)
+  //    on every linear (separate q/k/v + out_proj, fc1/fc2);
+  //  - ReLU FFN (activation_function 'relu'), NOT gelu;
+  //  - do_layer_norm_before chooses PRE-LN (125m..175B) vs POST-LN (350m);
+  //  - an optional decoder-level final_layer_norm (present iff
+  //    do_layer_norm_before and not _remove_final_layer_norm);
+  //  - word_embed_proj_dim may differ from hidden_size (opt-350m): an extra
+  //    bias-free project_in (embed -> hidden) and project_out (hidden ->
+  //    embed) wrap the stack; the LM head ties to embed_tokens
+  //    (word_embed_proj_dim wide);
+  //  - NO rotary; standard 1/sqrt(head_dim) attention scaling.
+  TOPTConfig = record
+    HiddenSize: integer;         // d_model (hidden_size)
+    WordEmbedProjDim: integer;   // word_embed_proj_dim (== HiddenSize unless
+                                 // project_in/out present, e.g. opt-350m)
+    IntermediateSize: integer;   // FFN width (ffn_dim)
+    NumLayers: integer;          // decoder blocks (num_hidden_layers)
+    NumHeads: integer;           // attention heads (num_attention_heads)
+    VocabSize: integer;          // vocab_size
+    MaxPositions: integer;       // max_position_embeddings (usable positions;
+                                 // the table itself has MaxPositions + 2 rows)
+    LayerNormEps: TNeuralFloat;  // LayerNorm eps (OPT default 1e-5)
+    DoLayerNormBefore: boolean;  // do_layer_norm_before (PRE-LN if true)
+    EnableBias: boolean;         // enable_bias (bias on all linears)
+    AffineLayerNorm: boolean;    // layer_norm_elementwise_affine
+    HasFinalLayerNorm: boolean;  // do_layer_norm_before and not
+                                 // _remove_final_layer_norm
+    TieWordEmbeddings: boolean;  // tie_word_embeddings (OPT default true)
+    Prefix: string;              // tensor-name prefix ('model.decoder.' or '')
+  end;
+
+// Reads a HF OPT config.json (model_type 'opt'). Required: hidden_size,
+// ffn_dim, num_hidden_layers, num_attention_heads, vocab_size,
+// max_position_embeddings. Defaults: word_embed_proj_dim = hidden_size,
+// layer_norm_eps not in HF OPTConfig so fixed at 1e-5, do_layer_norm_before =
+// true, enable_bias = true, layer_norm_elementwise_affine = true,
+// _remove_final_layer_norm = false, tie_word_embeddings = true,
+// activation_function 'relu' (the OPT default; anything else is rejected -
+// OPT is a ReLU-FFN family). Prefix is left '' - the builder detects it.
+function ReadOPTConfigFromJSONFile(const FileName: string): TOPTConfig;
+
+function OPTConfigToString(const Config: TOPTConfig): string;
+
+// Builds a TNNet with the OPT architecture described by Config and loads
+// every weight from the safetensors/.bin checkpoint at FileName. The net
+// takes a (SeqLen,1,1) volume of token ids and outputs (SeqLen,1,vocab)
+// logits. pSeqLen = 0 uses the full max_position_embeddings context.
+// Config.Prefix is detected from the checkpoint and written back.
+function BuildOPTFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TOPTConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildOPTFromSafeTensorsEx(const FileName: string;
+  out Config: TOPTConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildOPTFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+type
   // HF Starcoder2Config (model_type "starcoder2", bigcode/starcoder2-3b/7b/15b).
   // The first CODE-specialised decoder: RoPE + GQA + (optional) sliding-window
   // attention pinned to three GPT-2-flavoured pieces the RMSNorm/SwiGLU Llama
@@ -16168,6 +16238,481 @@ var
   IgnoredConfig: TGPTNeoXConfig;
 begin
   Result := BuildGPTNeoXFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+// =============================== OPT IMPORT ===============================
+// OPT (model_type "opt", facebook/opt-125m..opt-66b; the Meta "Open
+// Pre-trained Transformer" family) is a plain LEARNED-absolute-position
+// decoder LLM - structurally the GPT-2 skeleton (learned positions, biased
+// LayerNorm norms, separate biased q/k/v + out_proj, two-matrix FFN) with a
+// handful of OPT-specific quirks the GPT-2 path does NOT cover:
+//
+//  - LEARNED positions with the +2 OFFSET. OPTLearnedPositionalEmbedding is
+//    an nn.Embedding(max_position_embeddings + 2, hidden) whose forward adds
+//    a fixed offset of 2 to the position ids: token position p reads table
+//    row p + 2 (rows 0/1 are the pad_token_id slots OPT never reads). The
+//    importer loads embed_positions rows 2..SeqLen+1 into a
+//    TNNetLearnedPositionalEmbedding(SeqLen) table (its rows 0..SeqLen-1).
+//  - ReLU FFN (activation_function 'relu'), NOT gelu.
+//  - do_layer_norm_before selects PRE-LN (125m..175B, the default) vs
+//    POST-LN (350m): in POST-LN each residual closes BEFORE its norm
+//    (x := norm(x + sublayer(x))), so the per-block norms move to the other
+//    side of the residual add.
+//  - an optional decoder-level final_layer_norm, present iff
+//    do_layer_norm_before and not _remove_final_layer_norm.
+//  - word_embed_proj_dim may differ from hidden_size (opt-350m: 512 vs 1024).
+//    When they differ, a bias-free project_in (embed -> hidden) follows the
+//    token embedding and a bias-free project_out (hidden -> embed) precedes
+//    the LM head; embed_tokens / lm_head are word_embed_proj_dim wide.
+//  - NO rotary; standard 1/sqrt(head_dim) attention scaling (HF folds
+//    self.scaling = head_dim^-0.5 into the queries, which equals SDPA's
+//    structural 1/sqrt(head_dim) - the queries load straight, no fold).
+//
+// Per block (HF OPTDecoderLayer), with N1 = self_attn_layer_norm and
+// N2 = final_layer_norm (the BLOCK's, distinct from the decoder's final one):
+//   PRE-LN  (do_layer_norm_before):
+//     x := x + out_proj(MHA(N1(x)));   x := x + fc2(ReLU(fc1(N2(x))))
+//   POST-LN (not do_layer_norm_before):
+//     x := N1(x + out_proj(MHA(x)));   x := N2(x + fc2(ReLU(fc1(x))))
+//
+// Net contract: (SeqLen,1,1) token ids -> (SeqLen,1,vocab) logits, like the
+// other decoder importers. The LM head ties to embed_tokens (logits =
+// h . embed_tokens^T over the word_embed_proj_dim axis), copied into an
+// untied PointwiseConvLinear(vocab) like the GPT-2 path; an explicit
+// lm_head.weight in the checkpoint is consumed if present (identical to the
+// tied table). Coded by Claude (AI).
+
+function ReadOPTConfigFromJSONFile(const FileName: string): TOPTConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, ActFn: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('OPT import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('OPT import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('OPT import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('OPT import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('OPT import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'opt');
+    if ModelType <> 'opt' then
+      ImportError('OPT import: config model_type is "' + ModelType +
+        '" - expected "opt" (see BuildFromPretrained for the full dispatch).');
+    Result.HiddenSize := RequiredInt('hidden_size');
+    // word_embed_proj_dim defaults to hidden_size (no project_in/out).
+    Result.WordEmbedProjDim := Obj.Get('word_embed_proj_dim',
+      Result.HiddenSize);
+    if Result.WordEmbedProjDim <= 0 then
+      ImportError('OPT import: word_embed_proj_dim must be positive.');
+    Result.IntermediateSize := RequiredInt('ffn_dim');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositions := RequiredInt('max_position_embeddings');
+    // OPTConfig carries no layer_norm_eps - HF's nn.LayerNorm uses its 1e-5
+    // default throughout the OPT decoder.
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1.0e-5);
+    Result.DoLayerNormBefore := Obj.Get('do_layer_norm_before', True);
+    Result.EnableBias := Obj.Get('enable_bias', True);
+    Result.AffineLayerNorm :=
+      Obj.Get('layer_norm_elementwise_affine', True);
+    if not Result.AffineLayerNorm then
+      ImportError('OPT import: layer_norm_elementwise_affine=false is not ' +
+        'supported (the importer always loads LayerNorm gains/biases).');
+    // The decoder-level final_layer_norm exists iff do_layer_norm_before and
+    // not _remove_final_layer_norm (the v4.20.1 backward-compat switch).
+    Result.HasFinalLayerNorm := Result.DoLayerNormBefore and
+      (not Obj.Get('_remove_final_layer_norm', False));
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', True);
+    ActFn := Obj.Get('activation_function', 'relu');
+    if ActFn <> 'relu' then
+      ImportError('OPT import: config activation_function "' + ActFn +
+        '" is not supported - OPT is a ReLU-FFN family ("relu" only).');
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function OPTConfigToString(const Config: TOPTConfig): string;
+begin
+  Result := 'opt config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', embed_proj=' + IntToStr(Config.WordEmbedProjDim) +
+    ', ffn=' + IntToStr(Config.IntermediateSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', ln_before=' + BoolToStr(Config.DoLayerNormBefore, true) +
+    ', bias=' + BoolToStr(Config.EnableBias, true) +
+    ', final_ln=' + BoolToStr(Config.HasFinalLayerNorm, true) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true) +
+    ', act=relu';
+  if Config.WordEmbedProjDim <> Config.HiddenSize then
+    Result := Result + ', project_in/out';
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TOPTBlockLayers = record
+    N1, QKV, AttnProj, N2, Fc1, Fc2: TNNetLayer;
+  end;
+
+// Loads OPT's learned-position table with the +2 offset: source rows
+// 2..SeqLen+1 of embed_positions.weight (shape [MaxPositions + 2, Hidden])
+// drop into the TNNetLearnedPositionalEmbedding's rows 0..SeqLen-1 (each row
+// Hidden floats). Rows 0/1 (the OPT pad-offset slots) are never read.
+procedure LoadOPTPositionWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string; SeqLen, Hidden, TableRows: integer);
+var
+  W: TNNetVolume;
+  p, i: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('OPT import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 2) or
+     (Reader.DimSize(WName, 0) <> TableRows) or
+     (Reader.DimSize(WName, 1) <> Hidden) then
+    ImportError('OPT import: "' + WName + '" must have shape [' +
+      IntToStr(TableRows) + ', ' + IntToStr(Hidden) + '] (max_position_' +
+      'embeddings + 2 rows), got ' + Reader.ShapeAsString(WName));
+  W := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    for p := 0 to SeqLen - 1 do
+      for i := 0 to Hidden - 1 do
+        // +2 OFFSET: target row p reads source row p + 2.
+        Layer.Neurons[0].Weights.FData[p * Hidden + i] :=
+          W.FData[(p + 2) * Hidden + i];
+  finally
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+function BuildOPTFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TOPTConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TOPTBlockLayers;
+  EmbeddingLayer, PosLayer, ProjIn, ProjOut, FinalLN, LMHead: TNNetLayer;
+  BranchInput: TNNetLayer;
+  BlockCnt, SeqLen, HeadDim, i, j, TableRows: integer;
+  Tmp: TNNetVolume;
+  BlockPrefix, AttnPrefix, TensorNameStr, QB, KB, VB, OB, F1B, F2B: string;
+  Consumed: TStringList;
+  HasProj: boolean;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumHeads < 1 then
+        ImportError('OPT import: num_attention_heads must be >= 1.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('OPT import: hidden_size=' + IntToStr(Config.HiddenSize) +
+          ' is not divisible by num_attention_heads=' +
+          IntToStr(Config.NumHeads) + '.');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+      if Reader.HasTensor('model.decoder.embed_tokens.weight') then
+        Config.Prefix := 'model.decoder.'
+      else if Reader.HasTensor('decoder.embed_tokens.weight') then
+        Config.Prefix := 'decoder.'
+      else if Reader.HasTensor('embed_tokens.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('OPT import: no embed_tokens.weight found in ' +
+          Reader.FileName + ' (tried "model.decoder.", "decoder.", "") ' +
+          '- not an OPT checkpoint?');
+      HasProj := Config.WordEmbedProjDim <> Config.HiddenSize;
+      if (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 1) <>
+          Config.WordEmbedProjDim) then
+        ImportError('OPT import: embed_tokens.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' +
+          IntToStr(Config.WordEmbedProjDim) + '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'embed_tokens.weight'));
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+      if SeqLen > Config.MaxPositions then
+        ImportError('OPT import: requested SeqLen=' + IntToStr(SeqLen) +
+          ' exceeds max_position_embeddings=' +
+          IntToStr(Config.MaxPositions) + '.');
+      TableRows := Config.MaxPositions + 2; // OPT's +2 offset slots
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      // EncodeZero=1: token id 0 is a real token, not padding.
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.WordEmbedProjDim, {EncodeZero=}1) );
+      ProjIn := nil;
+      if HasProj then
+        // project_in: bias-free [hidden, word_embed_proj_dim] nn.Linear.
+        ProjIn := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+      // Learned positions with the +2 offset are added AFTER project_in
+      // (HF: hidden_states = project_in(inputs_embeds) + pos_embeds).
+      PosLayer := NN.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(SeqLen) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      SetLength(Blocks, Config.NumLayers);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // Attention sub-block. PRE-LN: x := x + out_proj(MHA(N1(x))).
+        // POST-LN: x := N1(x + out_proj(MHA(x))).
+        BranchInput := NN.GetLastLayer();
+        if Config.DoLayerNormBefore then
+          Blocks[BlockCnt].N1 := NN.AddLayer(
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        Blocks[BlockCnt].QKV := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+        // Per-head causal SDPA (standard 1/sqrt(head_dim) scale); the
+        // returned layer IS the out-projection and receives out_proj.
+        Blocks[BlockCnt].AttnProj := NN.AddMultiHeadSelfAttention(
+          Config.NumHeads, {CausalMask=}true);
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if not Config.DoLayerNormBefore then
+          Blocks[BlockCnt].N1 := NN.AddLayer(
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        // FFN sub-block. PRE-LN: x := x + fc2(ReLU(fc1(N2(x)))).
+        // POST-LN: x := N2(x + fc2(ReLU(fc1(x)))).
+        BranchInput := NN.GetLastLayer();
+        if Config.DoLayerNormBefore then
+          Blocks[BlockCnt].N2 := NN.AddLayer(
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        Blocks[BlockCnt].Fc1 := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+        NN.AddLayer( TNNetReLU.Create() );
+        Blocks[BlockCnt].Fc2 := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if not Config.DoLayerNormBefore then
+          Blocks[BlockCnt].N2 := NN.AddLayer(
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      FinalLN := nil;
+      if Config.HasFinalLayerNorm then
+        FinalLN := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      ProjOut := nil;
+      if HasProj then
+        // project_out: bias-free [word_embed_proj_dim, hidden] nn.Linear.
+        ProjOut := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.WordEmbedProjDim) );
+      // LM head tied to embed_tokens (word_embed_proj_dim wide), bias-free.
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        // embed_tokens -> embedding table (vocab rows of word_embed_proj_dim).
+        Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('OPT import: embed_tokens.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
+            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+        EmbeddingLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'embed_tokens.weight');
+        // LM head tied to embed_tokens (row t -> neuron t, bias-free).
+        EnsureWritableImportWeights(LMHead);
+        for j := 0 to Config.VocabSize - 1 do
+        begin
+          for i := 0 to Config.WordEmbedProjDim - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.WordEmbedProjDim + i];
+          LMHead.Neurons[j].BiasWeight := 0;
+        end;
+        LMHead.FlushWeightCache();
+        if Reader.HasTensor('lm_head.weight') then
+          MarkConsumed('lm_head.weight');
+      finally
+        Tmp.Free;
+      end;
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      // embed_positions -> learned table with the +2 offset.
+      LoadOPTPositionWeights(Reader, PosLayer,
+        Config.Prefix + 'embed_positions.weight', SeqLen,
+        Config.HiddenSize, TableRows);
+      MarkConsumed(Config.Prefix + 'embed_positions.weight');
+      if HasProj then
+      begin
+        // project_in / project_out: bias-free nn.Linear, rows load straight.
+        LoadLlamaLinearWeights(Reader, ProjIn,
+          Config.Prefix + 'project_in.weight',
+          Config.WordEmbedProjDim, Config.HiddenSize);
+        MarkConsumed(Config.Prefix + 'project_in.weight');
+        LoadLlamaLinearWeights(Reader, ProjOut,
+          Config.Prefix + 'project_out.weight',
+          Config.HiddenSize, Config.WordEmbedProjDim);
+        MarkConsumed(Config.Prefix + 'project_out.weight');
+      end;
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+        AttnPrefix := BlockPrefix + 'self_attn.';
+        // Bias names only when enable_bias; '' = bias-free load.
+        if Config.EnableBias then
+        begin
+          QB := AttnPrefix + 'q_proj.bias';
+          KB := AttnPrefix + 'k_proj.bias';
+          VB := AttnPrefix + 'v_proj.bias';
+          OB := AttnPrefix + 'out_proj.bias';
+          F1B := BlockPrefix + 'fc1.bias';
+          F2B := BlockPrefix + 'fc2.bias';
+        end
+        else
+        begin
+          QB := ''; KB := ''; VB := ''; OB := ''; F1B := ''; F2B := '';
+        end;
+        // Separate q/k/v load into the fused Q|K|V slab thirds (q -> rows
+        // 0..h-1, k -> h..2h-1, v -> 2h..3h-1); no rotary, rows load
+        // straight. The query 1/sqrt(head_dim) scaling is provided by SDPA.
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV,
+          AttnPrefix + 'q_proj.weight', Config.HiddenSize, Config.HiddenSize,
+          0, 3 * Config.HiddenSize, 0, QB);
+        MarkConsumed(AttnPrefix + 'q_proj.weight');
+        if QB <> '' then MarkConsumed(QB);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV,
+          AttnPrefix + 'k_proj.weight', Config.HiddenSize, Config.HiddenSize,
+          Config.HiddenSize, 3 * Config.HiddenSize, 0, KB);
+        MarkConsumed(AttnPrefix + 'k_proj.weight');
+        if KB <> '' then MarkConsumed(KB);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV,
+          AttnPrefix + 'v_proj.weight', Config.HiddenSize, Config.HiddenSize,
+          2 * Config.HiddenSize, 3 * Config.HiddenSize, 0, VB);
+        MarkConsumed(AttnPrefix + 'v_proj.weight');
+        if VB <> '' then MarkConsumed(VB);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttnProj,
+          AttnPrefix + 'out_proj.weight', Config.HiddenSize,
+          Config.HiddenSize, 0, -1, 0, OB);
+        MarkConsumed(AttnPrefix + 'out_proj.weight');
+        if OB <> '' then MarkConsumed(OB);
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].N1,
+          BlockPrefix + 'self_attn_layer_norm.weight',
+          BlockPrefix + 'self_attn_layer_norm.bias', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'self_attn_layer_norm.weight');
+        MarkConsumed(BlockPrefix + 'self_attn_layer_norm.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc1,
+          BlockPrefix + 'fc1.weight', Config.HiddenSize,
+          Config.IntermediateSize, 0, -1, 0, F1B);
+        MarkConsumed(BlockPrefix + 'fc1.weight');
+        if F1B <> '' then MarkConsumed(F1B);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc2,
+          BlockPrefix + 'fc2.weight', Config.IntermediateSize,
+          Config.HiddenSize, 0, -1, 0, F2B);
+        MarkConsumed(BlockPrefix + 'fc2.weight');
+        if F2B <> '' then MarkConsumed(F2B);
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].N2,
+          BlockPrefix + 'final_layer_norm.weight',
+          BlockPrefix + 'final_layer_norm.bias', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'final_layer_norm.weight');
+        MarkConsumed(BlockPrefix + 'final_layer_norm.bias');
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      if Config.HasFinalLayerNorm then
+      begin
+        LoadLayerNormWeights(Reader, FinalLN,
+          Config.Prefix + 'final_layer_norm.weight',
+          Config.Prefix + 'final_layer_norm.bias', Config.HiddenSize);
+        MarkConsumed(Config.Prefix + 'final_layer_norm.weight');
+        MarkConsumed(Config.Prefix + 'final_layer_norm.bias');
+      end;
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('OPT import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free; // non-nil only if an exception unwound the build
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildOPTFromSafeTensorsEx(const FileName: string;
+  out Config: TOPTConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadOPTConfigFromJSONFile(ConfigPath);
+  Result := BuildOPTFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildOPTFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TOPTConfig;
+begin
+  Result := BuildOPTFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, '', pQuantizeInt8);
 end;
 
@@ -56228,6 +56773,7 @@ var
   IgnoredLlamaConfig: TLlamaConfig;
   IgnoredGPTNeoConfig: TGPTNeoConfig;
   IgnoredGPTNeoXConfig: TGPTNeoXConfig;
+  IgnoredOPTConfig: TOPTConfig;
   IgnoredGPTJConfig: TGPTJConfig;
   IgnoredStarCoder2Config: TStarCoder2Config;
   IgnoredGptBigCodeConfig: TGptBigCodeConfig;
@@ -56350,6 +56896,14 @@ begin
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if ModelType = 'gptj' then
     Result := BuildGPTJFromSafeTensorsEx(WeightsPath, IgnoredGPTJConfig,
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+  else if ModelType = 'opt' then
+    // OPT (architectures ["OPTForCausalLM"], facebook/opt-125m..opt-66b): a
+    // plain learned-absolute-position decoder - biased pre-/post-LN GPT-2
+    // skeleton with the +2 position offset, ReLU FFN, separate biased q/k/v +
+    // out_proj, an optional decoder-level final_layer_norm and optional
+    // word_embed_proj_dim project_in/out. See the OPT IMPORT section.
+    Result := BuildOPTFromSafeTensorsEx(WeightsPath, IgnoredOPTConfig,
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if ModelType = 'starcoder2' then
     // Starcoder2 (architectures ["Starcoder2ForCausalLM"],
