@@ -289,6 +289,12 @@ type
     // (waveform -> RVQ codes -> waveform) and asserts the codes match the HF
     // oracle EXACTLY and the reconstructed waveform matches < 1e-4.
     procedure TestEnCodecRoundTripParity;
+    // Same round-trip parity gate for the NON-CAUSAL (32 kHz / MusicGen)
+    // EnCodec topology: symmetric conv padding + symmetric ConvTranspose trim.
+    procedure TestEnCodecNonCausalRoundTripParity;
+    // Shared body for both EnCodec round-trip parity tests (parameterized, so
+    // FPCUnit does not auto-run it as a test).
+    procedure CheckEnCodecParity(const BaseName: string);
     // Mimi: round-trips three pinned waveforms through the imported Mimi codec
     // (waveform -> conv encoder -> RoPE transformer -> downsample -> split
     // semantic/acoustic RVQ -> codes -> ... -> waveform) and asserts the codes
@@ -12626,6 +12632,16 @@ begin
 end;
 
 procedure TTestNeuralPretrained.TestEnCodecRoundTripParity;
+begin
+  CheckEnCodecParity('tiny_encodec');           // causal 24 kHz topology
+end;
+
+procedure TTestNeuralPretrained.TestEnCodecNonCausalRoundTripParity;
+begin
+  CheckEnCodecParity('tiny_encodec_noncausal'); // non-causal 32 kHz / MusicGen
+end;
+
+procedure TTestNeuralPretrained.CheckEnCodecParity(const BaseName: string);
 var
   Model: TEnCodecModel;
   Config: TEnCodecConfig;
@@ -12642,15 +12658,15 @@ begin
   RefRoot := nil;
   Model := nil;
   try
-    RefJson.LoadFromFile(FixturePath('tiny_encodec_ref.json'));
+    RefJson.LoadFromFile(FixturePath(BaseName + '_ref.json'));
     RefRoot := GetJSON(RefJson.Text);
     Clips := TJSONArray(TJSONObject(RefRoot).Find('clips'));
     AssertTrue('clips present', Clips <> nil);
     AssertTrue('at least 3 clips', Clips.Count >= 3);
 
     Model := BuildEnCodecFromSafeTensors(
-      FixturePath('tiny_encodec.safetensors'), Config,
-      FixturePath('tiny_encodec_config.json'));
+      FixturePath(BaseName + '.safetensors'), Config,
+      FixturePath(BaseName + '_config.json'));
     AssertTrue('codec built', Model <> nil);
     AssertEquals('codebooks detected from checkpoint',
       TJSONObject(RefRoot).Get('num_codebooks', 0), Model.NumCodebooks);

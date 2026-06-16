@@ -2,30 +2,31 @@
 
 The successor to [`MusicGenSmoke`](../MusicGenSmoke). The smoke test **stubbed**
 the text encoder (it fed a hand-built ramp tensor in place of the T5 output);
-this example wires the **REAL T5 text encoder**, so a free-text prompt (its
-token ids) genuinely **steers** the generated music.
+this example wires the **REAL T5 text encoder**, so a free-text prompt
+genuinely **steers** the generated music.
 
 ```
-text token ids
-  -> T5 text ENCODER (BuildT5FromSafeTensors)            [REAL, not stubbed]
+prompt text
+  -> T5 SentencePiece tokenizer (real) OR fixed ids (pico demo)
+  -> T5 text ENCODER (BuildT5FromSafeTensors)
   -> the encoder's final hidden states (EncSeq x text_d_model)
   -> MusicGen enc_to_dec_proj -> cross-attention conditioning
-  -> MusicGen DECODER greedy delay-pattern decode -> [K][frames] code stack
+  -> MusicGen DECODER greedy/sampled delay-pattern decode -> [K][frames]
   -> EnCodec audio DECODER (BuildEnCodecFromSafeTensors) -> mono waveform
-  -> SaveVolumeToWav16 -> a SHORT .wav clip
+  -> SaveVolumeToWav16 -> a .wav clip
 ```
 
-The T5 encoder hidden states feed the **exact slot** `MusicGenSmoke` filled by
-hand. The only difference is they now come from a genuine encoder run, so
-changing the prompt ids changes the music. **No new layer types** are added —
-this is pure example wiring composing three fully-landed importers
-(`BuildT5FromSafeTensors`, `BuildMusicGenFromSafeTensors`,
-`BuildEnCodecFromSafeTensors`).
+**No new layer types** are added — this is pure example wiring composing three
+fully-landed importers (`BuildT5FromSafeTensors`,
+`BuildMusicGenFromSafeTensors`, `BuildEnCodecFromSafeTensors`) plus the
+`TNeuralHFTokenizer` and the native `neuralhfhub` Hub downloader.
 
 ## Running
 
+### Pico demo (default, no network)
+
 With no arguments it runs a **self-contained pico demo** on the committed
-random fixtures (no download, pure CPU, a fraction of a second):
+random fixtures (pure CPU, a fraction of a second):
 
 ```
 cd examples/MusicGenText
@@ -34,6 +35,31 @@ cd examples/MusicGenText
 
 The weights are **untrained random**, so the clip is noise, not music — this
 only exercises the full text→audio wiring end to end.
+
+### Real music (`--download`)
+
+`--download` fetches three **standard public HF repos** through the native
+Pascal Hub helper (`neuralhfhub` — **no Python**) and imports each directly
+from its own snapshot, with **no split/convert step**:
+
+| repo | role | note |
+|------|------|------|
+| `facebook/musicgen-small` | LM decoder | the importer reads only the `decoder.*` / `enc_to_dec_proj.*` keys and ignores the bundled text/audio encoders |
+| `t5-base` | text encoder + SentencePiece tokenizer | MusicGen's frozen text encoder *is* t5-base |
+| `facebook/encodec_32khz` | 32 kHz audio codec | `normalize=false`, imports cleanly |
+
+```
+cd examples/MusicGenText
+./MusicGenText --download --prompt "warm lo-fi hip hop beat with mellow piano"
+./MusicGenText --download --prompt "..." --seconds 8 --guidance 3.0
+./MusicGenText --download --prompt "..." --topk 250 --temperature 1.0
+```
+
+Downloads (~3.5 GB total) are cached under `~/.cache/neural-api/hub`, so
+re-runs are **offline**. Repo overrides: `--musicgen-repo` / `--t5-repo` /
+`--encodec-repo`. For gated repos set `HF_TOKEN` in the environment.
+`--seconds N` sets the clip length (converted to EnCodec frames via the codec
+frame rate); `--guidance` defaults to MusicGen's 3.0 in `--download` mode.
 
 ## Fixtures
 
@@ -54,10 +80,14 @@ pipeline runs, is **deterministic** (same prompt → identical codes + waveform)
 and that the text conditioning is **live** (a different prompt steers the
 codes).
 
+## Landed
+
+* **Classifier-free guidance** (`--guidance`), **top-k / temperature sampling**
+  (`--topk` / `--temperature`), and **KV-cache incremental decode** (greedy
+  default; `--no-cache` forces the full re-encode loop).
+* **Real tokenizer + real downloaded checkpoint** via `--download` (above).
+
 ## Follow-ups (deferred)
 
-* **Classifier-free guidance** — the unconditional/null-prompt branch and the
-  guidance-scale blend of conditional vs. unconditional logits.
-* **Stereo** — the `audio_channels = 2` (2K-codebook) layout.
-* KV-cache incremental decode and top-k / temperature sampling.
-* A real tokenizer for the prompt and a real large downloaded checkpoint.
+* **Stereo** — the `audio_channels = 2` (2K-codebook) layout (the importer
+  currently rejects `audio_channels=2`).

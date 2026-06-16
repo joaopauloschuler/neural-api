@@ -816,10 +816,25 @@ rather than acted on.
       latent, decoded to a short (~5 s) clip written via the WAV writer; defer
       classifier-free-guidance tuning and long-form generation to a follow-up.
       DEPENDS ON the WAV writer + HiFi-GAN vocoder tasks above.
-- [ ] Stereo MusicGen (audio_channels=2, the 2K-codebook layout) and a real
-      large downloaded musicgen-small checkpoint + a real tokenizer for the
-      text prompt (the network/RAM-gated remainder of the MusicGenText
-      follow-up; KV-cache + sampling above are done).
+- [X] LANDED: real downloaded musicgen-small checkpoint + real tokenizer for
+      examples/MusicGenText. The example's --download mode fetches three
+      STANDARD public repos through the native Pascal Hub helper (neuralhfhub
+      HubFetchModel, no Python) and imports each directly with no split step:
+      facebook/musicgen-small (decoder; importer ignores the bundled
+      text/audio-encoder keys), t5-base (T5 encoder + SentencePiece tokenizer
+      via TNeuralHFTokenizer), facebook/encodec_32khz (32 kHz codec).
+      --prompt/--seconds/--guidance/--topk/--temperature wired; downloads
+      cached under ~/.cache/neural-api/hub. Also LANDED as part of this: the
+      EnCodec importer now supports use_causal_conv=false (the non-causal
+      32 kHz symmetric-pad variant) -- RunEnCodecConv branches on
+      Config.UseCausalConv (symmetric Conv1d pad + symmetric ConvTranspose
+      trim); verified by TestEnCodecNonCausalRoundTripParity (tiny HF oracle,
+      <1e-4) alongside the unchanged causal TestEnCodecRoundTripParity. NOT yet
+      run end-to-end on the real full-size model (host RAM-limited; see
+      memory).
+- [ ] Stereo MusicGen (audio_channels=2, the 2K-codebook layout) -- the
+      ReadMusicGenConfigFromJSONFile importer currently REJECTS audio_channels=2
+      (the 2*K interleaved-codebook delay layout is a documented follow-up).
 - [ ] SeamlessM4T-v2 follow-ups deferred from the landed S2TT v1:
       (1) position_embeddings_type="relative_key" — the v2 conformer self-attn
       distance-embedding attention bias (einsum("bhld,lrd->bhlr") added to the

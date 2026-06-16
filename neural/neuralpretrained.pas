@@ -4075,7 +4075,7 @@ type
     CodebookDim: integer;       // codebook_dim (== hidden_size, 128)
     NumQuantizers: integer;     // RVQ codebooks present in the checkpoint
     UseConvShortcut: boolean;   // use_conv_shortcut (true)
-    UseCausalConv: boolean;     // use_causal_conv (true; only supported value)
+    UseCausalConv: boolean;     // use_causal_conv (true 24 kHz / false 32 kHz)
     Normalize: boolean;         // normalize (false; only supported value)
     NormType: string;           // norm_type ('weight_norm')
     PadMode: string;            // pad_mode ('reflect')
@@ -4157,7 +4157,8 @@ type
 
 // Reads a HF EnCodec config.json (model_type "encodec"). Required:
 // hidden_size, num_filters, upsampling_ratios, codebook_size. Defaults follow
-// EncodecConfig. Rejects use_causal_conv=false, normalize=true and a
+// EncodecConfig. Supports both use_causal_conv true (24 kHz) and false (the
+// 32 kHz non-causal symmetric-pad variant); rejects normalize=true and a
 // norm_type other than "weight_norm" loudly (documented follow-ups).
 function ReadEnCodecConfigFromJSONFile(const FileName: string): TEnCodecConfig;
 
@@ -32252,10 +32253,9 @@ begin
     SetLength(Result.UpsamplingRatios, Arr.Count);
     for I := 0 to Arr.Count - 1 do
       Result.UpsamplingRatios[I] := Arr.Integers[I];
-    // Supported-variant guards (documented follow-ups otherwise).
-    if not Result.UseCausalConv then
-      ImportError('EnCodec import: use_causal_conv=false is not supported ' +
-        '(the non-causal symmetric-pad variant is a documented follow-up).');
+    // Supported-variant guards (documented follow-ups otherwise). Both the
+    // causal (24 kHz) and non-causal (32 kHz, MusicGen) symmetric-pad variants
+    // are supported; RunEnCodecConv branches on UseCausalConv.
     if Result.Normalize then
       ImportError('EnCodec import: normalize=true (the per-clip RMS scale ' +
         'of the 48 kHz stereo model) is not supported yet.');
@@ -32458,10 +32458,11 @@ end;
 // ConvTranspose1d upsamples by stride then right-trims (k - stride) frames
 // (trim_right_ratio 1.0 in the supported family). InSig[c][t], OutSig[c][t].
 procedure RunEnCodecConv(const Conv: TEnCodecConv;
-  const InSig: array of TNeuralFloatDynArr; out OutSig: TNNetFloatDynArr2D);
+  const InSig: array of TNeuralFloatDynArr; out OutSig: TNNetFloatDynArr2D;
+  Causal: boolean = true);
 var
   InCh, OutCh, K, Stride, Dil, InLen, o, i, t, k2, src, PadTotal, Extra: integer;
-  NFrames, OutLen, idx, FullLen, PadRight, EffK: integer;
+  NFrames, OutLen, idx, FullLen, PadLeft, PadRight, EffK: integer;
   Acc: TNeuralFloat;
   Padded: array of TNeuralFloatDynArr;
   Full: array of TNeuralFloatDynArr;
@@ -32484,27 +32485,41 @@ begin
     NFrames := Ceil((InLen - EffK + PadTotal) / Stride + 1) - 1;
     Extra := NFrames * Stride + EffK - PadTotal - InLen;
     if Extra < 0 then Extra := 0;
-    // Build the reflect-left-padded + extra-right-padded signal per channel.
+    // HF EncodecConv1d pad split (the ceil-to-stride Extra always rides the
+    // right): causal puts ALL of padding_total on the left; non-causal splits
+    // it symmetrically (padding_right = padding_total div 2, the remainder on
+    // the left).
+    if Causal then
+    begin
+      PadLeft := PadTotal;
+      PadRight := Extra;
+    end
+    else
+    begin
+      PadRight := PadTotal div 2;
+      PadLeft := PadTotal - PadRight;
+      PadRight := PadRight + Extra;
+    end;
+    // Build the reflect-padded signal per channel.
     SetLength(Padded, InCh);
     for i := 0 to InCh - 1 do
     begin
-      SetLength(Padded[i], PadTotal + InLen + Extra);
+      SetLength(Padded[i], PadLeft + InLen + PadRight);
       // Left reflect pad: mirror around index 0 WITHOUT repeating sample 0
-      // (PyTorch 'reflect': padded[PadTotal-1-j] = x[1+j]).
-      for t := 0 to PadTotal - 1 do
+      // (PyTorch 'reflect': padded[PadLeft-1-j] = x[1+j]).
+      for t := 0 to PadLeft - 1 do
       begin
-        RefIdx := PadTotal - t; // distance from the first real sample
+        RefIdx := PadLeft - t; // distance from the first real sample
         if RefIdx >= InLen then RefIdx := InLen - 1;
         Padded[i][t] := InSig[i][RefIdx];
       end;
-      for t := 0 to InLen - 1 do Padded[i][PadTotal + t] := InSig[i][t];
-      // Right extra pad: HF pads with reflect too, but the extra padding sits
-      // past the last real sample; reflect around the last index.
-      for t := 0 to Extra - 1 do
+      for t := 0 to InLen - 1 do Padded[i][PadLeft + t] := InSig[i][t];
+      // Right reflect pad around the last index.
+      for t := 0 to PadRight - 1 do
       begin
         RefIdx := InLen - 2 - t;
         if RefIdx < 0 then RefIdx := 0;
-        Padded[i][PadTotal + InLen + t] := InSig[i][RefIdx];
+        Padded[i][PadLeft + InLen + t] := InSig[i][RefIdx];
       end;
     end;
     OutLen := (Length(Padded[0]) - EffK) div Stride + 1;
@@ -32549,17 +32564,27 @@ begin
     // Add bias across the whole (untrimmed) output.
     for o := 0 to OutCh - 1 do
       for t := 0 to FullLen - 1 do Full[o][t] := Full[o][t] + Conv.B[o];
-    // Causal right-trim: padding_total = K - stride, padding_right =
-    // ceil(padding_total * trim_right_ratio) = padding_total (ratio 1.0),
-    // padding_left = 0; keep [0 .. FullLen - padding_right).
-    PadRight := K - Stride;
-    OutLen := FullLen - PadRight;
+    // Un-pad: padding_total = K - stride. Causal trims it all on the RIGHT
+    // (trim_right_ratio 1.0, padding_left = 0); non-causal trims symmetrically
+    // (padding_right = padding_total div 2, the remainder on the left).
+    PadTotal := K - Stride;
+    if Causal then
+    begin
+      PadLeft := 0;
+      PadRight := PadTotal;
+    end
+    else
+    begin
+      PadRight := PadTotal div 2;
+      PadLeft := PadTotal - PadRight;
+    end;
+    OutLen := FullLen - PadLeft - PadRight;
     if OutLen < 0 then OutLen := 0;
     SetLength(OutSig, OutCh);
     for o := 0 to OutCh - 1 do
     begin
       SetLength(OutSig[o], OutLen);
-      for t := 0 to OutLen - 1 do OutSig[o][t] := Full[o][t];
+      for t := 0 to OutLen - 1 do OutSig[o][t] := Full[o][PadLeft + t];
     end;
   end;
 end;
@@ -32639,7 +32664,7 @@ var
   c, t: integer;
 begin
   case Stage.Kind of
-    eskConv: RunEnCodecConv(Stage.Conv, InSig, OutSig);
+    eskConv: RunEnCodecConv(Stage.Conv, InSig, OutSig, FConfig.UseCausalConv);
     eskELU:
       begin
         SetLength(OutSig, Length(InSig));
@@ -32660,11 +32685,11 @@ begin
           for t := 0 to Length(InSig[c]) - 1 do
             Tmp[c][t] := EnCodecELU(InSig[c][t]);
         end;
-        RunEnCodecConv(Stage.Resnet.Conv1, Tmp, Res);
+        RunEnCodecConv(Stage.Resnet.Conv1, Tmp, Res, FConfig.UseCausalConv);
         ApplyEnCodecELU(Res);
-        RunEnCodecConv(Stage.Resnet.Conv2, Res, Tmp);
+        RunEnCodecConv(Stage.Resnet.Conv2, Res, Tmp, FConfig.UseCausalConv);
         if Stage.Resnet.HasShortcut then
-          RunEnCodecConv(Stage.Resnet.Shortcut, InSig, Shr_)
+          RunEnCodecConv(Stage.Resnet.Shortcut, InSig, Shr_, FConfig.UseCausalConv)
         else
         begin
           SetLength(Shr_, Length(InSig));

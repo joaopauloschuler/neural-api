@@ -59,7 +59,7 @@ FIX = os.path.join(HERE, "..", "tests", "fixtures")
 SEED = 1234
 
 
-def pico_config():
+def pico_config(use_causal=True):
     return EncodecConfig(
         # 8 kHz with a x4 total downsample (ratios [2,2]) gives frame_rate
         # 2000 Hz, which makes the HF config derive exactly num_quantizers=4
@@ -76,7 +76,7 @@ def pico_config():
         last_kernel_size=7,
         residual_kernel_size=3,
         dilation_growth_rate=2,
-        use_causal_conv=True,
+        use_causal_conv=use_causal,
         pad_mode="reflect",
         compress=2,
         num_lstm_layers=2,
@@ -87,10 +87,12 @@ def pico_config():
     )
 
 
-def main():
+def build(use_causal, suffix):
+    # Re-seed per variant so the causal (suffix="") fixture is byte-identical to
+    # the committed one regardless of the non-causal sibling generated after it.
     torch.manual_seed(SEED)
     np.random.seed(SEED)
-    cfg = pico_config()
+    cfg = pico_config(use_causal=use_causal)
     model = EncodecModel(cfg).eval()  # cfg yields num_quantizers == 4 here
 
     # Re-randomize the RVQ codebooks to be well separated (the default
@@ -148,12 +150,12 @@ def main():
     sd = {}
     for k, v in model.state_dict().items():
         sd[k] = v.to(torch.float32).contiguous()
-    save_file(sd, os.path.join(FIX, "tiny_encodec.safetensors"))
+    save_file(sd, os.path.join(FIX, "tiny_encodec%s.safetensors" % suffix))
 
-    with open(os.path.join(FIX, "tiny_encodec_config.json"), "w") as f:
+    with open(os.path.join(FIX, "tiny_encodec%s_config.json" % suffix), "w") as f:
         json.dump(cfg.to_dict(), f, indent=1, default=str)
 
-    with open(os.path.join(FIX, "tiny_encodec_ref.json"), "w") as f:
+    with open(os.path.join(FIX, "tiny_encodec%s_ref.json" % suffix), "w") as f:
         json.dump({
             "num_codebooks": len(model.quantizer.layers),
             "codebook_size": cfg.codebook_size,
@@ -163,11 +165,19 @@ def main():
         }, f)
 
     # report sizes
-    st = os.path.getsize(os.path.join(FIX, "tiny_encodec.safetensors"))
-    print("wrote tiny_encodec.safetensors %d bytes" % st)
-    print("num codebooks", len(model.quantizer.layers),
+    st = os.path.getsize(os.path.join(FIX, "tiny_encodec%s.safetensors" % suffix))
+    print("wrote tiny_encodec%s.safetensors %d bytes (causal=%s)"
+          % (suffix, st, use_causal))
+    print("  num codebooks", len(model.quantizer.layers),
           "frames", len(refs[0]["codes"][0]),
           "recon len", len(refs[0]["recon"]))
+
+
+def main():
+    # Causal (24 kHz topology) + non-causal (the 32 kHz / MusicGen topology,
+    # symmetric conv padding + symmetric ConvTranspose trim) sibling fixtures.
+    build(use_causal=True, suffix="")
+    build(use_causal=False, suffix="_noncausal")
 
 
 if __name__ == "__main__":
