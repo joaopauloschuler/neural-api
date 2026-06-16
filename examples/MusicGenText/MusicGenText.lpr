@@ -73,7 +73,7 @@ Coded by Claude (AI).
 {$mode objfpc}{$H+}
 
 uses
-  SysUtils, Math,
+  SysUtils, Math, StrUtils,
   neuralvolume, neuralnetwork, neuralsafetensors, neuralpretrained,
   neuralaudio, neuralhftokenizer, neuralhfhub;
 
@@ -98,6 +98,8 @@ var
   Codes: TNNetIntArr2D;
   Waveform: TNeuralFloatDynArr;
   EncSeq, DecSeq, NumFrames, k_i, t, i, TopK: integer;
+  cmin, cmax, distinct, modeCount, modeId, cid: integer;
+  CodeHist: array of integer;   // per-codebook id frequency (collapse check)
   MgSafe, MgCfg, T5Safe, T5CfgPath, EcSafe, EcCfg, TokPath: string;
   MgDir, T5Dir, EcDir: string;
   Ids: array of integer;
@@ -363,6 +365,38 @@ begin
     end;
     WriteLn('[time] MusicGen decode (', NumFrames, ' frames): ',
       Elapsed(TickStart));
+    // Always print a compact per-codebook health summary: the range, the
+    // number of DISTINCT ids used, and the single most-repeated id with its
+    // share of frames. A healthy delay-pattern decode uses many distinct ids;
+    // a near-constant codebook (distinct=1, or one id dominating) means the
+    // greedy/sampled decode COLLAPSED - the conditioning is not steering it -
+    // and the audio will be a drone/noise regardless of the codec.
+    WriteLn('Code-stack health (', Config.NumCodebooks, ' codebooks x ',
+      NumFrames, ' frames, vocab=', Config.VocabSize, '):');
+    SetLength(CodeHist, Config.VocabSize);
+    for k_i := 0 to Config.NumCodebooks - 1 do
+    begin
+      cmin := MaxInt; cmax := -MaxInt; distinct := 0; modeCount := 0; modeId := 0;
+      for i := 0 to Config.VocabSize - 1 do CodeHist[i] := 0;
+      for t := 0 to NumFrames - 1 do
+      begin
+        cid := Codes[k_i][t];
+        if (cid >= 0) and (cid < Config.VocabSize) then
+        begin
+          if CodeHist[cid] = 0 then Inc(distinct);
+          Inc(CodeHist[cid]);
+          if CodeHist[cid] > modeCount then
+          begin modeCount := CodeHist[cid]; modeId := cid; end;
+        end;
+        if cid < cmin then cmin := cid;
+        if cid > cmax then cmax := cid;
+      end;
+      WriteLn('  cb', k_i, ': range [', cmin, '..', cmax, '], distinct=',
+        distinct, '/', NumFrames, ', top id ', modeId, ' x', modeCount,
+        ' (', (100.0 * modeCount / NumFrames):0:0, '%)',
+        IfThen((distinct <= 2) or (modeCount > NumFrames div 2),
+          '  <-- COLLAPSED?', ''));
+    end;
     if NumFrames <= 16 then
     begin
       WriteLn('Generated code stack (codebook x frame):');
@@ -372,9 +406,7 @@ begin
         for t := 0 to NumFrames - 1 do Write(' ', Codes[k_i][t]:3);
         WriteLn;
       end;
-    end
-    else
-      WriteLn('Generated ', Config.NumCodebooks, 'x', NumFrames, ' code stack.');
+    end;
     WriteLn;
 
     // ---- 3. Decode the code stack to a waveform with the EnCodec decoder. --
