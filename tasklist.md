@@ -890,6 +890,27 @@ rather than acted on.
       and falls back to all-heads otherwise); (d) wire it into
       examples/WhisperTranscribe behind a `--word-timestamps` flag and document
       in examples/README; (e) optional per-word confidence (mean path attention).
+- [ ] Speaker diarization importer (`BuildPyannoteSegmentationFromSafeTensors[Ex]` +
+      `TPyannoteConfig`/`ReadPyannoteConfigFromJSONFile`, model_type `pyannote` /
+      pyannote/segmentation-3.0) — the FIRST "who speaks when" model in the library and a
+      genuinely DISTINCT voice vertical (frame-level multi-speaker activity, not
+      transcription/CTC like the landed Whisper/Wav2Vec2 paths). The new pieces are: (1) a
+      **SincNet** learnable band-pass front-end — a parametrized sinc-filter conv whose
+      kernels are `2*f_high*sinc(2*f_high*t) - 2*f_low*sinc(2*f_low*t)` with only
+      (low_freq, band) trainable per filter, windowed by Hamming — implement as a new
+      `TNNetSincConv1D` (no existing layer materializes kernels from two scalars per
+      channel; NOT a near-duplicate of any conv), followed by the existing
+      LayerNorm+MaxPool+conv stack; (2) a bidirectional-LSTM temporal trunk (reuse the
+      landed LSTM cells) → linear → per-frame **powerset** multilabel head (the 3.0 model
+      emits the 7 powerset classes for ≤3 concurrent speakers, decoded back to a
+      per-speaker binary activity matrix). Inference-only on CPU, raw-waveform in. Parity-
+      gate `< 1e-4` vs an HF `pyannote.audio` / torch float64 oracle on a pico fixture
+      (`tools/make_pico_pyannote_fixture.py` → `tests/fixtures/tiny_pyannote*`), and an
+      examples/SpeakerDiarization smoke that prints a speaker-activity timeline (and an
+      RTTM line per turn) for a short synthetic two-speaker WAV via the landed
+      `LoadVolumeFromWav*` / mel front-end utilities. Pairs naturally with the landed
+      Whisper transcription for "who said what". The SincNet conv front-end is also reusable
+      for raw-waveform speaker-verification / keyword-spotting fronts later.
 - [ ] SAM mask decoder as a real TNNet layer graph (TNNetCrossAttention two-source
       wiring) instead of the plain-array RunSAMMaskDecoder forward, so the decoder is
       trainable / fine-tunable end-to-end (v1 is inference-only). Needs a builder that
