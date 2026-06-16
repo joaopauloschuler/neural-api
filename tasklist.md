@@ -1191,6 +1191,17 @@ rather than acted on.
       documented not re-built. DEFERRED: the text-grounded use_qformer_text_input
       ITC/ITM path, blip2-opt (no OPT importer in-tree), InstructBLIP, the full
       ViT->Q-Former->FLAN-T5 caption on a real download.
+- [ ] OPT decoder importer (BuildOPTFromSafeTensors[Ex], model_type "opt", e.g.
+      facebook/opt-125m..2.7b) — a plain learned-absolute-position decoder LLM
+      (LayerNorm not RMSNorm, ReLU FFN, learned position embeddings with the
+      +2 offset, optional final LayerNorm `final_layer_norm`, no rotary). Small
+      and mostly reuse of the existing GPT2-style decode plumbing (FullConnect
+      q/k/v + biases, post-LN or pre-LN per do_layer_norm_before). Genuinely
+      UNBLOCKS the deferred blip2-opt tail above (the most common BLIP-2 weights
+      ship with OPT, not FLAN-T5) and is a prerequisite for any OPT-based VLM.
+      Pico parity < 1e-4 vs the float64 HF OPTForCausalLM oracle on next-token
+      logits (tools/opt_tiny_fixture.py + tests/fixtures/tiny_opt.*). Then wire
+      it as the blip2-opt decode tail.
 
 - [ ] DepthPro (Apple ml-depth-pro) sharp metric monocular-depth importer
       (BuildDepthProFromSafeTensors[Ex], apple/DepthPro). DISTINCT from the landed
