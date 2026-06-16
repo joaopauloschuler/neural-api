@@ -4852,6 +4852,12 @@ type
     // Lazily-built WIDTH-1 twin of FDecoder (DecSeqLen=1 input), weights copied
     // from FDecoder, used by the KV-cache incremental-decode path in GenerateEx.
     FStepDecoder: TNNet;
+    // A SECOND width-1 twin, used only by the cached classifier-free-guidance
+    // path: the conditional pass runs on FStepDecoder and the unconditional pass
+    // on this one, so the two passes keep INDEPENDENT self-attention KV-caches
+    // (their hidden states diverge after the cross-attention layer, which sees
+    // different encoder states). Lazily built; doubles the step-net weights.
+    FStepDecoderUncond: TNNet;
     FEmbed: array of TNNetVolume;          // [K] each (vocab+1)*hidden flat
     FPosTable: TNNetVolume;                // MaxPos*hidden sinusoids
     FEncToDecW: TNNetVolume;               // hidden*textDModel row-major
@@ -4860,6 +4866,9 @@ type
     // Builds FStepDecoder (the width-1 twin) on first use and copies weights
     // from FDecoder. No-op once built. Coded by Claude (AI).
     procedure EnsureStepDecoder;
+    // Builds FStepDecoderUncond (the second width-1 twin for cached CFG) on
+    // first use and copies weights from FDecoder. No-op once built.
+    procedure EnsureStepDecoderUncond;
   public
     constructor Create(const pConfig: TMusicGenConfig;
       EncSeqLen, DecSeqLen: integer);
@@ -4908,10 +4917,14 @@ type
     // states every step (no caching needed) and the per-frame sinusoidal
     // position is baked into the fed embedding (the decoder carries no internal
     // positional layer), so the cached path is BIT-IDENTICAL to the full
-    // re-encode loop under greedy decoding. Classifier-free guidance is NOT
-    // available on the cached path (the two conditional/unconditional passes
-    // would double-append to one cache); when GuidanceScale>1.0 with a non-nil
-    // UncondStates, UseCache is ignored and the full GenerateCFG loop runs.
+    // re-encode loop under greedy decoding. Classifier-free guidance IS cached:
+    // when GuidanceScale>1.0 with a non-nil UncondStates and UseCache=true, the
+    // conditional and unconditional passes run on TWO independent width-1 twins
+    // (FStepDecoder / FStepDecoderUncond), each with its own self-attention
+    // KV-cache, and the guided logit uncond+scale*(cond-uncond) is selected per
+    // step - the O(steps) analogue of GenerateCFG, numerically equivalent to it
+    // (this doubles the step-net weight memory). With UseCache=false, guidance
+    // falls back to the O(steps^2) GenerateCFG re-encode loop.
     //
     // Sampler selects the per-codebook token: nil (the default) keeps the exact
     // argmax / greedy behavior of Generate (bit-identical). Any non-nil sampler
@@ -26944,6 +26957,7 @@ begin
   FEncToDecB := TNNetVolume.Create;
   FDecoder := nil;
   FStepDecoder := nil;
+  FStepDecoderUncond := nil;
 end;
 
 destructor TMusicGenModel.Destroy;
@@ -26957,6 +26971,7 @@ begin
   FEncToDecB.Free;
   FDecoder.Free;
   FStepDecoder.Free;
+  FStepDecoderUncond.Free;
   inherited Destroy;
 end;
 
@@ -26976,6 +26991,21 @@ begin
   // Layer-by-layer weight copy: the two nets have identical layer topology
   // (only the input SizeX differs), so every neuron weight transfers exactly.
   FStepDecoder.CopyWeights(FDecoder);
+end;
+
+procedure TMusicGenModel.EnsureStepDecoderUncond;
+var
+  StepBlocks: TMarianBlockArray;
+  StepHeads: array of TNNetLayer;
+  StepFinalLN: TNNetLayer;
+begin
+  if Assigned(FStepDecoderUncond) then exit;
+  // A second width-1 twin, identical to FStepDecoder, so the cached CFG path can
+  // run the unconditional pass with its own self-attention KV-cache.
+  SetLength(StepHeads, FConfig.NumCodebooks);
+  FStepDecoderUncond := BuildMusicGenDecoderNet(FConfig, FEncSeqLen, 1,
+    {pInferenceOnly=}true, StepBlocks, StepHeads, StepFinalLN);
+  FStepDecoderUncond.CopyWeights(FDecoder);
 end;
 
 procedure TMusicGenModel.ProjectEncoderStates(EncStates, Dst: TNNetVolume);
@@ -27175,6 +27205,12 @@ var
   StepLogits: TNNetVolume;
   PadId, Steps, step, k_i, c, tok, t, base, vbest: integer;
   i, n: integer;
+  // Cached classifier-free-guidance extras (the dual-twin path).
+  UncondHidden, UncondLogits, GuidedLogits: TNNetVolume;
+  SDPAsU: array of TNNetScaledDotProductAttention;
+  EncStatesInputU: TNNetLayer;
+  UseGuidance: boolean;
+  gv: integer;
 
   // Selects codebook k_i's token from its logit row (StepLogits starts at
   // offset Off). nil Sampler -> exact argmax; else softmax(./Temperature) draw.
@@ -27215,23 +27251,9 @@ var
   end;
 
 begin
-  // Classifier-free guidance runs two decoder passes per step and is therefore
-  // incompatible with a single shared KV-cache; fall back to the full
-  // (re-encode) GenerateCFG path whenever guidance is actually active. When the
-  // caller also wants sampling under guidance, the un-cached path below is used
-  // instead (UseCache forced off).
-  if (GuidanceScale > 1.0) and (UncondStates <> nil) then
-    UseCache := false;
+  UseGuidance := (GuidanceScale > 1.0) and (UncondStates <> nil);
   if Temperature <= 0 then
     ImportError('MusicGen GenerateEx: Temperature must be > 0.');
-
-  // No cache requested AND no custom sampler -> the existing greedy/CFG loop is
-  // already the exact behavior; delegate so there is one source of truth.
-  if (not UseCache) and (Sampler = nil) then
-  begin
-    GenerateCFG(EncStates, UncondStates, NumFrames, GuidanceScale, Codes);
-    exit;
-  end;
 
   PadId := FConfig.VocabSize;
   Steps := NumFrames + FConfig.NumCodebooks - 1;
@@ -27239,6 +27261,138 @@ begin
     ImportError('MusicGen GenerateEx: NumFrames + K = ' + IntToStr(Steps + 1) +
       ' exceeds DecSeqLen ' + IntToStr(FDecSeqLen) +
       ' (rebuild the model with a larger DecSeqLen).');
+
+  // ---- cached classifier-free-guidance path (two width-1 twins) -------------
+  // CFG needs two decoder passes per step (conditional + unconditional). Rather
+  // than recompute the whole prefix each step (GenerateCFG), run the conditional
+  // pass on FStepDecoder and the unconditional pass on FStepDecoderUncond, each
+  // with its OWN self-attention KV-cache. The two twins are fed the SAME frame
+  // embedding each step but carry different encoder states into cross-attention,
+  // so their hidden states (and thus self-attn K/V) diverge - hence two caches.
+  // The per-token guided logit is uncond + scale*(cond - uncond), then argmax /
+  // sampled exactly as the single-pass paths. This is the O(T) analogue of the
+  // O(T^2) GenerateCFG loop and is numerically equivalent to it.
+  if UseGuidance and UseCache then
+  begin
+    EnsureStepDecoder;
+    EnsureStepDecoderUncond;
+    EncHidden := TNNetVolume.Create;
+    UncondHidden := TNNetVolume.Create;
+    FrameEmb := TNNetVolume.Create;
+    StepLogits := TNNetVolume.Create;
+    UncondLogits := TNNetVolume.Create;
+    GuidedLogits := TNNetVolume.Create;
+    Probs := TNNetVolume.Create;
+    SetLength(SDPAs, 0);
+    SetLength(SDPAsU, 0);
+    try
+      Probs.ReSize(FConfig.VocabSize, 1, 1);
+      ProjectEncoderStates(EncStates, EncHidden);
+      ProjectEncoderStates(UncondStates, UncondHidden);
+
+      // Seed each twin's encoder-states input and arm its self-attention caches.
+      EncStatesInput := T5EncoderStatesInput(FStepDecoder);
+      EncStatesInputU := T5EncoderStatesInput(FStepDecoderUncond);
+      if (EncStatesInput.Output.Size <> EncHidden.Size) or
+         (EncStatesInputU.Output.Size <> UncondHidden.Size) then
+        ImportError('MusicGen GenerateEx: encoder-states size mismatch.');
+      EncStatesInput.Output.Copy(EncHidden);
+      EncStatesInputU.Output.Copy(UncondHidden);
+      for i := 0 to FStepDecoder.Layers.Count - 1 do
+      begin
+        Lay := FStepDecoder.Layers[i];
+        if Lay is TNNetScaledDotProductAttention then
+        begin
+          n := Length(SDPAs); SetLength(SDPAs, n + 1);
+          SDPAs[n] := TNNetScaledDotProductAttention(Lay);
+          SDPAs[n].BeginIncrementalDecode(FDecSeqLen);
+        end;
+      end;
+      for i := 0 to FStepDecoderUncond.Layers.Count - 1 do
+      begin
+        Lay := FStepDecoderUncond.Layers[i];
+        if Lay is TNNetScaledDotProductAttention then
+        begin
+          n := Length(SDPAsU); SetLength(SDPAsU, n + 1);
+          SDPAsU[n] := TNNetScaledDotProductAttention(Lay);
+          SDPAsU[n].BeginIncrementalDecode(FDecSeqLen);
+        end;
+      end;
+
+      SetLength(Delayed, FConfig.NumCodebooks);
+      for k_i := 0 to FConfig.NumCodebooks - 1 do
+      begin
+        SetLength(Delayed[k_i], FDecSeqLen);
+        for step := 0 to FDecSeqLen - 1 do Delayed[k_i][step] := PadId;
+      end;
+
+      FrameEmb.ReSize(1, 1, FConfig.Hidden);
+      GuidedLogits.ReSize(1, 1, FConfig.NumCodebooks * FConfig.VocabSize);
+      for step := 0 to Steps - 1 do
+      begin
+        // One frame embedding (codes-so-far + position), fed to BOTH twins.
+        for c := 0 to FConfig.Hidden - 1 do
+          FrameEmb.FData[c] := FPosTable.FData[step * FConfig.Hidden + c];
+        for k_i := 0 to FConfig.NumCodebooks - 1 do
+        begin
+          tok := Delayed[k_i][step];
+          if (tok < 0) or (tok > FConfig.VocabSize) then
+            ImportError('MusicGen GenerateEx: code ' + IntToStr(tok) +
+              ' out of range [0, ' + IntToStr(FConfig.VocabSize) + '].');
+          for c := 0 to FConfig.Hidden - 1 do
+            FrameEmb.FData[c] := FrameEmb.FData[c] +
+              FEmbed[k_i].FData[tok * FConfig.Hidden + c];
+        end;
+        FStepDecoder.Compute(FrameEmb);
+        StepLogits.Copy(FStepDecoder.GetLastLayer().Output);
+        FStepDecoderUncond.Compute(FrameEmb);
+        UncondLogits.Copy(FStepDecoderUncond.GetLastLayer().Output);
+        // Blend: guided = uncond + scale*(cond - uncond).
+        for gv := 0 to FConfig.NumCodebooks * FConfig.VocabSize - 1 do
+          GuidedLogits.FData[gv] := UncondLogits.FData[gv] +
+            GuidanceScale * (StepLogits.FData[gv] - UncondLogits.FData[gv]);
+
+        t := step + 1;
+        for k_i := 0 to FConfig.NumCodebooks - 1 do
+          if (t < FDecSeqLen) and (t >= k_i + 1) and
+             (t - k_i - 1 < NumFrames) then
+          begin
+            base := k_i * FConfig.VocabSize;
+            Delayed[k_i][t] := SelectToken(GuidedLogits, base);
+          end;
+      end;
+
+      SetLength(Codes, FConfig.NumCodebooks);
+      for k_i := 0 to FConfig.NumCodebooks - 1 do
+      begin
+        SetLength(Codes[k_i], NumFrames);
+        for t := 0 to NumFrames - 1 do
+          Codes[k_i][t] := Delayed[k_i][t + k_i + 1];
+      end;
+    finally
+      for i := 0 to High(SDPAs) do SDPAs[i].EndIncrementalDecode();
+      for i := 0 to High(SDPAsU) do SDPAsU[i].EndIncrementalDecode();
+      EncHidden.Free;
+      UncondHidden.Free;
+      FrameEmb.Free;
+      StepLogits.Free;
+      UncondLogits.Free;
+      GuidedLogits.Free;
+      Probs.Free;
+    end;
+    exit;
+  end;
+
+  // Classifier-free guidance otherwise runs the un-cached two-pass loop (the
+  // single shared KV-cache below cannot serve two passes). When no custom
+  // sampler is requested either, delegate to GenerateCFG (one source of truth).
+  if UseGuidance then
+    UseCache := false;
+  if (not UseCache) and (Sampler = nil) then
+  begin
+    GenerateCFG(EncStates, UncondStates, NumFrames, GuidanceScale, Codes);
+    exit;
+  end;
 
   // ---- un-cached path (sampling, optionally with guidance) ------------------
   // Re-uses the full-prefix ComputeLogits; only the token SELECTION changes

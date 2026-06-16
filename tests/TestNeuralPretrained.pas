@@ -356,6 +356,11 @@ type
     // equals greedy, and that the temperature/top-k path is reproducible at a
     // fixed RandSeed.
     procedure TestMusicGenGenerateEx;
+    // Cached classifier-free guidance (TMusicGenModel.GenerateEx with
+    // GuidanceScale>1 and UseCache=true): asserts the dual-twin KV-cache CFG
+    // path is BIT-IDENTICAL to the un-cached GenerateCFG re-encode loop, for
+    // both a distinct and a zeroed (null) unconditional condition.
+    procedure TestMusicGenGuidedCache;
     procedure TestBlip2QFormerConfigFromJSONFile;
     procedure TestBlip2QFormerParity;
     procedure TestBlip2FullBridgeParity;
@@ -13780,6 +13785,93 @@ begin
     Model.Free;
     SampK1.Free;
     SampTemp.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMusicGenGuidedCache;
+
+  procedure EncodePrompt(const Ids: array of integer; EncStates: TNNetVolume;
+    out Config: TMusicGenConfig);
+  var
+    T5Enc, T5Dec: TNNet;
+    T5Cfg: TT5Config;
+    Tokens: TNNetVolume;
+    EncSeq, i: integer;
+  begin
+    EncSeq := Length(Ids);
+    T5Enc := nil; T5Dec := nil;
+    Tokens := TNNetVolume.Create;
+    try
+      BuildT5FromSafeTensors(FixturePath('tiny_musicgen_t5enc.safetensors'),
+        T5Enc, T5Dec, T5Cfg, EncSeq, 1, {pInferenceOnly=}true,
+        FixturePath('tiny_musicgen_t5enc_config.json'));
+      Tokens.ReSize(EncSeq, 1, 1);
+      for i := 0 to EncSeq - 1 do Tokens.FData[i] := Ids[i];
+      T5Enc.Compute(Tokens);
+      EncStates.Copy(T5Enc.GetLastLayer.Output);
+      Config := ReadMusicGenConfigFromJSONFile(
+        FixturePath('tiny_musicgen_config.json'));
+    finally
+      T5Enc.Free;
+      T5Dec.Free;
+      Tokens.Free;
+    end;
+  end;
+
+const
+  NumFrames = 6;
+var
+  Cond, Uncond, Zero: TNNetVolume;
+  Config, Cfg2: TMusicGenConfig;
+  Model: TMusicGenModel;
+  DecSeq, k_i, t, diff: integer;
+  CodesUncached, CodesCached: TNNetIntArr2D;
+begin
+  RandSeed := 424242;
+  Cond := TNNetVolume.Create;
+  Uncond := TNNetVolume.Create;
+  Zero := TNNetVolume.Create;
+  Model := nil;
+  try
+    EncodePrompt([3, 8, 1, 5, 2], Cond, Config);
+    EncodePrompt([9, 0, 4, 7, 6], Uncond, Cfg2);
+    Zero.ReSize(Cond.SizeX, Cond.SizeY, Cond.Depth);
+    Zero.Fill(0);
+
+    DecSeq := NumFrames + Config.NumCodebooks - 1 + 1;
+    Model := BuildMusicGenFromSafeTensors(
+      FixturePath('tiny_musicgen.safetensors'), Config, Length([3, 8, 1, 5, 2]),
+      DecSeq, {pInferenceOnly=}true, FixturePath('tiny_musicgen_config.json'));
+
+    // (a) Distinct uncond condition at scale 3.0: the dual-twin cached CFG path
+    // (GenerateEx, UseCache=true) must match the un-cached GenerateCFG loop
+    // bit-for-bit (greedy => Sampler=nil, fully deterministic).
+    Model.GenerateCFG(Cond, Uncond, NumFrames, 3.0, CodesUncached);
+    Model.GenerateEx(Cond, Uncond, NumFrames, 3.0, {UseCache=}true,
+      {Sampler=}nil, {Temperature=}1.0, CodesCached);
+    diff := 0;
+    for k_i := 0 to Length(CodesUncached) - 1 do
+      for t := 0 to NumFrames - 1 do
+        if CodesUncached[k_i][t] <> CodesCached[k_i][t] then Inc(diff);
+    AssertEquals('cached CFG (distinct uncond) is bit-identical to GenerateCFG',
+      0, diff);
+
+    // (b) Zeroed (null) uncond condition at scale 3.0 -- the configuration the
+    // MusicGenText example actually uses -- must also match exactly.
+    Model.GenerateCFG(Cond, Zero, NumFrames, 3.0, CodesUncached);
+    Model.GenerateEx(Cond, Zero, NumFrames, 3.0, {UseCache=}true,
+      {Sampler=}nil, {Temperature=}1.0, CodesCached);
+    diff := 0;
+    for k_i := 0 to Length(CodesUncached) - 1 do
+      for t := 0 to NumFrames - 1 do
+        if CodesUncached[k_i][t] <> CodesCached[k_i][t] then Inc(diff);
+    AssertEquals('cached CFG (zeroed uncond) is bit-identical to GenerateCFG',
+      0, diff);
+  finally
+    Cond.Free;
+    Uncond.Free;
+    Zero.Free;
+    Model.Free;
   end;
 end;
 

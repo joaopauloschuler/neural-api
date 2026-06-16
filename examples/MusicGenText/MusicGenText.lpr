@@ -352,14 +352,16 @@ begin
     begin
       // Classifier-free guidance: the unconditional branch is a ZEROED text
       // condition of the same shape. Blend uncond + scale*(cond - uncond).
-      // Guidance runs two decoder passes per step, so the KV-cache path is
-      // unavailable (GenerateEx falls back to the un-cached loop).
+      // Guidance runs two decoder passes per step; with the cache on, each pass
+      // has its own KV-cache (dual-twin path) -- O(frames) instead of the
+      // O(frames^2) re-encode loop. --no-cache forces the re-encode loop.
       NullStates.ReSize(EncStates.SizeX, EncStates.SizeY, EncStates.Depth);
       NullStates.Fill(0);
-      WriteLn('Classifier-free guidance ON (scale = ',
-        GuidanceScale:0:2, ', null = zeroed text condition; KV-cache off).');
+      WriteLn('Classifier-free guidance ON (scale = ', GuidanceScale:0:2,
+        ', null = zeroed text condition; KV-cache ',
+        IfThen(UseCache, 'on (dual-twin)', 'off'), ').');
       Model.GenerateEx(EncStates, NullStates, NumFrames, GuidanceScale,
-        {UseCache=}False, Sampler, Temperature, Codes);
+        UseCache, Sampler, Temperature, Codes);
     end
     else
     begin
