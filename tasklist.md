@@ -897,7 +897,7 @@ rather than acted on.
       and falls back to all-heads otherwise); (d) wire it into
       examples/WhisperTranscribe behind a `--word-timestamps` flag and document
       in examples/README; (e) optional per-word confidence (mean path attention).
-- [ ] SAM mask decoder v2: MULTI-point / box prompts + MULTI-mask output + IoU head.
+- [X] SAM mask decoder v2: MULTI-point / box prompts + MULTI-mask output + IoU head.
       v1 hardcodes a single positive point (+ pad) and emits only mask-token 0
       (multimask_output=False). Extend the prompt encoder to N points / a box (two
       corner tokens with point_embed[2]/[3]), return all 3 multimask masks, and expose

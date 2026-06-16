@@ -217,6 +217,64 @@ with open('tests/fixtures/tiny_sam_mask.json', 'w') as f:
 print(f'wrote tiny_sam_mask.json: mask logits shape = ({mh},{mw}); '
       f'range [{float(mlogits.min()):.4f}, {float(mlogits.max()):.4f}]')
 
+# ---------------------------------------------------------------------------
+# MASK-DECODER v2 ORACLE: multi-point prompt, box prompt, and the full
+# multi-mask (3 masks) + IoU-head scores. Same precomputed image embedding.
+# A box is [x0,y0,x1,y1] in image pixels; HF reshapes it to two corner points
+# (point_embed[2] top-left, point_embed[3] bottom-right) and appends NO pad.
+# ---------------------------------------------------------------------------
+v2 = {'grid': grid, 'hidden': OUT_CH, 'mask_h': mh, 'mask_w': mw}
+
+# (a) MULTI-point prompt: one positive + one negative click, single mask.
+MP_PTS = [[19.0, 11.0], [5.0, 27.0]]
+MP_LAB = [1, 0]
+with torch.no_grad():
+    seg_mp = model(
+        image_embeddings=img_emb,
+        input_points=torch.tensor([[MP_PTS]], dtype=torch.float64),  # (B,pbs,n,2)
+        input_labels=torch.tensor([[MP_LAB]], dtype=torch.long),
+        multimask_output=False)
+mp_log = seg_mp.pred_masks[0, 0, 0]  # [H, W]
+v2['multipoint'] = {'points': MP_PTS, 'labels': MP_LAB,
+                    'mask_logits': mp_log.tolist()}
+
+# (b) BOX prompt (no points), single mask. input_boxes is (B, nb, 4).
+BOX = [6.0, 4.0, 26.0, 22.0]   # x0,y0,x1,y1 in image pixels
+with torch.no_grad():
+    seg_bx = model(
+        image_embeddings=img_emb,
+        input_boxes=torch.tensor([[BOX]], dtype=torch.float64),
+        multimask_output=False)
+bx_log = seg_bx.pred_masks[0, 0, 0]  # [H, W]
+v2['box'] = {'box': BOX, 'mask_logits': bx_log.tolist()}
+
+# (c) MULTI-MASK output (3 masks) + IoU scores for the single positive click.
+with torch.no_grad():
+    seg_mm = model(
+        image_embeddings=img_emb,
+        input_points=torch.tensor([[[[PT_X, PT_Y]]]], dtype=torch.float64),
+        input_labels=torch.tensor([[[1]]], dtype=torch.long),
+        multimask_output=True)
+mm_masks = seg_mm.pred_masks[0, 0]      # [3, H, W]
+mm_iou = seg_mm.iou_scores[0, 0]        # [3]
+v2['multimask'] = {'point': [PT_X, PT_Y], 'label': 1,
+                   'num_masks': int(mm_masks.shape[0]),
+                   'mask_logits': mm_masks.tolist(),  # [3][H][W]
+                   'iou_scores': mm_iou.tolist()}      # [3]
+
+with open('tests/fixtures/tiny_sam_mask_v2.json', 'w') as f:
+    json.dump(v2, f)
+print(f'wrote tiny_sam_mask_v2.json: multipoint range '
+      f'[{float(mp_log.min()):.4f},{float(mp_log.max()):.4f}]; '
+      f'box range [{float(bx_log.min()):.4f},{float(bx_log.max()):.4f}]; '
+      f'multimask {list(mm_masks.shape)}; iou {[round(float(v),4) for v in mm_iou]}')
+
+# v2 self-checks: each prompt mode must give a DISTINCT result.
+assert (mp_log - mlogits).abs().max() > 1e-3, 'multi-point == single-point'
+assert (bx_log - mlogits).abs().max() > 1e-3, 'box == single-point'
+assert (mm_masks[0] - mlogits).abs().max() > 1e-3, 'multimask[0] == single'
+assert mm_masks.shape[0] == 3, 'multimask must emit 3 masks'
+
 # mask-decoder fixture self-checks: the click must matter.
 with torch.no_grad():
     seg2 = model(image_embeddings=img_emb,

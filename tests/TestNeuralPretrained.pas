@@ -425,6 +425,7 @@ type
     procedure TestBeitParity;
     procedure TestSAMEncoderParity;
     procedure TestSAMMaskDecoderParity;
+    procedure TestSAMMaskDecoderV2Parity;
     procedure TestWhisperLogMelFrontend;
     procedure TestWavReaderRoundTrip;
     procedure TestBertSeqClsLogitParity;
@@ -19583,6 +19584,163 @@ begin
     ImgEmb.Free;
     RefJson.Free;
     Reader.Free;
+  end;
+end;
+
+// SAM mask-decoder v2 parity: multi-point prompt, box prompt, and full
+// multi-mask (3 masks) + IoU-head scores must each reproduce the HF float64
+// oracle (tiny_sam_mask_v2.json) to < 1e-4. Reuses the same oracle image
+// embedding (tiny_sam_embed.json) as v1 so the decoder is exercised
+// independently of the encoder path.
+procedure TTestNeuralPretrained.TestSAMMaskDecoderV2Parity;
+var
+  VisCfg: TSAMConfig;
+  MDCfg: TSAMMaskDecoderConfig;
+  Reader: TNNetSafeTensorsReader;
+  RefRoot, V2Root: TJSONData;
+  RefJson: TStringList;
+  EmbArr, EmbRow, EmbCell: TJSONArray;
+  MPObj, BoxObj, MMObj: TJSONObject;
+  MaskArr, MaskRow, MaskPlane, Arr: TJSONArray;
+  ImgEmb, MaskLogits, IoUScores: TNNetVolume;
+  Grid, OutCh, MaskH, MaskW, RowCnt, ColCnt, DCnt, Mk: integer;
+  Diff, MaxDiff: double;
+  Pts: array of TNeuralFloat;
+  Labels: array of integer;
+  Box: array of TNeuralFloat;
+  NoBox: array of TNeuralFloat;
+begin
+  RandSeed := 424242;
+  VisCfg := ReadSAMConfigFromJSONFile(FixturePath('tiny_sam_config.json'));
+  MDCfg := ReadSAMMaskDecoderConfig(FixturePath('tiny_sam_config.json'), VisCfg);
+  Reader := TNNetSafeTensorsReader.Create(FixturePath('tiny_sam.safetensors'));
+  RefJson := TStringList.Create;
+  ImgEmb := TNNetVolume.Create;
+  MaskLogits := TNNetVolume.Create;
+  IoUScores := TNNetVolume.Create;
+  RefRoot := nil; V2Root := nil;
+  try
+    // Load the oracle image embedding (grid, grid, out).
+    RefJson.LoadFromFile(FixturePath('tiny_sam_embed.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    EmbArr := TJSONArray(TJSONObject(RefRoot).Find('embed'));
+    Grid := TJSONObject(RefRoot).Get('grid', 0);
+    OutCh := TJSONObject(RefRoot).Get('out_channels', 0);
+    ImgEmb.ReSize(Grid, Grid, OutCh);
+    for RowCnt := 0 to Grid - 1 do
+    begin
+      EmbRow := TJSONArray(EmbArr.Items[RowCnt]);
+      for ColCnt := 0 to Grid - 1 do
+      begin
+        EmbCell := TJSONArray(EmbRow.Items[ColCnt]);
+        for DCnt := 0 to OutCh - 1 do
+          ImgEmb.FData[(RowCnt * Grid + ColCnt) * OutCh + DCnt] :=
+            EmbCell.Items[DCnt].AsFloat;
+      end;
+    end;
+    RefRoot.Free; RefRoot := nil;
+
+    RefJson.LoadFromFile(FixturePath('tiny_sam_mask_v2.json'));
+    V2Root := GetJSON(RefJson.Text);
+    MaskH := TJSONObject(V2Root).Get('mask_h', 0);
+    MaskW := TJSONObject(V2Root).Get('mask_w', 0);
+
+    // (a) MULTI-point prompt: positive + negative click, single mask.
+    MPObj := TJSONObject(TJSONObject(V2Root).Find('multipoint'));
+    Arr := TJSONArray(MPObj.Find('points'));
+    SetLength(Pts, Arr.Count * 2);
+    SetLength(Labels, Arr.Count);
+    for RowCnt := 0 to Arr.Count - 1 do
+    begin
+      Pts[RowCnt * 2 + 0] := TJSONArray(Arr.Items[RowCnt]).Items[0].AsFloat;
+      Pts[RowCnt * 2 + 1] := TJSONArray(Arr.Items[RowCnt]).Items[1].AsFloat;
+    end;
+    Arr := TJSONArray(MPObj.Find('labels'));
+    for RowCnt := 0 to Arr.Count - 1 do Labels[RowCnt] := Arr.Items[RowCnt].AsInteger;
+    SetLength(NoBox, 0);
+    RunSAMMaskDecoderEx(Reader, MDCfg, ImgEmb, Pts, Labels, NoBox,
+      {MultiMaskOutput=}false, MaskLogits, nil);
+    AssertEquals('multipoint mask depth', 1, MaskLogits.Depth);
+    MaskArr := TJSONArray(MPObj.Find('mask_logits'));
+    MaxDiff := 0;
+    for RowCnt := 0 to MaskH - 1 do
+    begin
+      MaskRow := TJSONArray(MaskArr.Items[RowCnt]);
+      for ColCnt := 0 to MaskW - 1 do
+      begin
+        Diff := Abs(MaskLogits.FData[(RowCnt * MaskW + ColCnt) * 1 + 0] -
+          MaskRow.Items[ColCnt].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('SAM multi-point mask: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // (b) BOX prompt (no points), single mask.
+    BoxObj := TJSONObject(TJSONObject(V2Root).Find('box'));
+    Arr := TJSONArray(BoxObj.Find('box'));
+    SetLength(Box, 4);
+    for RowCnt := 0 to 3 do Box[RowCnt] := Arr.Items[RowCnt].AsFloat;
+    SetLength(Pts, 0); SetLength(Labels, 0);
+    RunSAMMaskDecoderEx(Reader, MDCfg, ImgEmb, Pts, Labels, Box,
+      {MultiMaskOutput=}false, MaskLogits, nil);
+    AssertEquals('box mask depth', 1, MaskLogits.Depth);
+    MaskArr := TJSONArray(BoxObj.Find('mask_logits'));
+    MaxDiff := 0;
+    for RowCnt := 0 to MaskH - 1 do
+    begin
+      MaskRow := TJSONArray(MaskArr.Items[RowCnt]);
+      for ColCnt := 0 to MaskW - 1 do
+      begin
+        Diff := Abs(MaskLogits.FData[(RowCnt * MaskW + ColCnt) * 1 + 0] -
+          MaskRow.Items[ColCnt].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('SAM box mask: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // (c) MULTI-MASK output (3 masks) + IoU scores for one positive click.
+    MMObj := TJSONObject(TJSONObject(V2Root).Find('multimask'));
+    Arr := TJSONArray(MMObj.Find('point'));
+    SetLength(Pts, 2);
+    Pts[0] := Arr.Items[0].AsFloat; Pts[1] := Arr.Items[1].AsFloat;
+    SetLength(Labels, 1); Labels[0] := MMObj.Get('label', 1);
+    SetLength(NoBox, 0);
+    RunSAMMaskDecoderEx(Reader, MDCfg, ImgEmb, Pts, Labels, NoBox,
+      {MultiMaskOutput=}true, MaskLogits, IoUScores);
+    AssertEquals('multimask depth', 3, MaskLogits.Depth);
+    AssertEquals('multimask iou count', 3, IoUScores.Size);
+    MaskArr := TJSONArray(MMObj.Find('mask_logits'));  // [3][H][W]
+    MaxDiff := 0;
+    for Mk := 0 to 2 do
+    begin
+      MaskPlane := TJSONArray(MaskArr.Items[Mk]);
+      for RowCnt := 0 to MaskH - 1 do
+      begin
+        MaskRow := TJSONArray(MaskPlane.Items[RowCnt]);
+        for ColCnt := 0 to MaskW - 1 do
+        begin
+          Diff := Abs(MaskLogits.FData[(RowCnt * MaskW + ColCnt) * 3 + Mk] -
+            MaskRow.Items[ColCnt].AsFloat);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('SAM multimask logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+    Arr := TJSONArray(MMObj.Find('iou_scores'));
+    MaxDiff := 0;
+    for Mk := 0 to 2 do
+    begin
+      Diff := Abs(IoUScores.FData[Mk] - Arr.Items[Mk].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('SAM IoU scores: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free; V2Root.Free;
+    IoUScores.Free; MaskLogits.Free; ImgEmb.Free; RefJson.Free; Reader.Free;
   end;
 end;
 

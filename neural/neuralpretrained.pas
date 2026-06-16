@@ -7604,6 +7604,31 @@ procedure RunSAMMaskDecoder(Reader: TNNetSafeTensorsReader;
   PointX, PointY: TNeuralFloat; IsPositive: boolean;
   MaskLogits: TNNetVolume; const Prefix: string = '');
 
+// Generalized SAM mask decoder (v2): N point prompts and/or a box prompt,
+// optional multi-mask output, plus the IoU-prediction-head quality scores.
+//   PointsXY:    flat [NumPoints*2] of (x,y) clicks in ORIGINAL image pixels
+//                (x = horizontal, y = vertical). May be empty.
+//   PointLabels: [NumPoints] click labels: 1 = foreground (point_embed[1]),
+//                0 = background (point_embed[0]). Length must equal NumPoints.
+//   Box:         either empty (no box) or [x0,y0,x1,y1] (top-left / bottom-right
+//                in image pixels). The two corners become tokens using
+//                point_embed[2] (top-left) and point_embed[3] (bottom-right).
+//                When a box is given HF appends NO padding/not-a-point token.
+//   MultiMaskOutput: True -> the 3 multimask masks (mask tokens 1..3, HF's
+//                slice(1,None)); False -> the single mask token 0.
+//   MaskLogits:  OUT (4*Grid, 4*Grid, NumMasks) low-res mask logits (SizeX=row,
+//                Depth indexes the masks, in HF order).
+//   IoUScores:   OUT (NumMasks, 1, 1) iou_prediction_head scores, one scalar per
+//                emitted mask, aligned with MaskLogits' depth axis. Pass nil to
+//                skip. (No sigmoid: SAM's iou head has sigmoid_output=False.)
+// At least one prompt (a point or a box) must be supplied. The legacy
+// single-point RunSAMMaskDecoder above is a thin wrapper over this routine.
+procedure RunSAMMaskDecoderEx(Reader: TNNetSafeTensorsReader;
+  const Config: TSAMMaskDecoderConfig; ImageEmbedding: TNNetVolume;
+  const PointsXY: array of TNeuralFloat; const PointLabels: array of integer;
+  const Box: array of TNeuralFloat; MultiMaskOutput: boolean;
+  MaskLogits: TNNetVolume; IoUScores: TNNetVolume; const Prefix: string = '');
+
 // ---------------------------------------------------------------------------
 // VGG-16 / VGG-19 IMPORT (torchvision / timm "vgg", the canonical perceptual-
 // feature backbone and the prerequisite for LPIPS + neural style transfer).
@@ -51194,10 +51219,11 @@ begin
     end;
 end;
 
-procedure RunSAMMaskDecoder(Reader: TNNetSafeTensorsReader;
+procedure RunSAMMaskDecoderEx(Reader: TNNetSafeTensorsReader;
   const Config: TSAMMaskDecoderConfig; ImageEmbedding: TNNetVolume;
-  PointX, PointY: TNeuralFloat; IsPositive: boolean;
-  MaskLogits: TNNetVolume; const Prefix: string);
+  const PointsXY: array of TNeuralFloat; const PointLabels: array of integer;
+  const Box: array of TNeuralFloat; MultiMaskOutput: boolean;
+  MaskLogits: TNNetVolume; IoUScores: TNNetVolume; const Prefix: string);
 const
   INV_SQRT_2 = 0.70710678118654752;
 var
@@ -51206,10 +51232,16 @@ var
   PEPos, SharedPE, T1, T2: TNNetVolume;
   Coords, SparseRaw, Sparse, ImgPE, PointEmb: TSAMMat;
   Keys, Queries, Qinp, Kinp, AttnOut, Mlp1, Mlp2, Hbuf: TSAMMat;
-  NotAPoint, PointE: TNNetVolume;
+  PE0, PE1, PE2, PE3: TNNetVolume;
+  NotAPoint: TNNetVolume;
   NoMask: TNNetVolume;
   Pfx, BPfx: string;
   Eps, acc, x, cdf: TNeuralFloat;
+  // prompt bookkeeping
+  NumPoints, HasBox, NSparse, NSparseRows, srow, mi: integer;
+  HasPad: boolean;
+  // mask-output selection
+  FirstMask, NumMasks, mt: integer;
   // upscale
   ImgCHW, U1, U2: TSAMMat;
   C1w, C1b, C2w, C2b: TNNetVolume;
@@ -51226,8 +51258,23 @@ begin
   Eps := Config.LayerNormEps;
   NImg := Grid * Grid;
   MaskTokenCount := Config.NumMaskTokens;     // iou(1) excluded count below
-  // tokens = [iou(1)] + [mask_tokens(MaskTokenCount)] + [point + pad] (2)
-  NTok := 1 + MaskTokenCount + 2;
+
+  NumPoints := Length(PointsXY) div 2;
+  if Length(PointLabels) <> NumPoints then
+    ImportError('SAM mask decoder: PointLabels length (' +
+      IntToStr(Length(PointLabels)) + ') must equal NumPoints (' +
+      IntToStr(NumPoints) + ').');
+  if not ((Length(Box) = 0) or (Length(Box) = 4)) then
+    ImportError('SAM mask decoder: Box must be empty or [x0,y0,x1,y1].');
+  if Length(Box) = 4 then HasBox := 1 else HasBox := 0;
+  if (NumPoints = 0) and (HasBox = 0) then
+    ImportError('SAM mask decoder: at least one point or a box is required.');
+  // HF pads the point list with a not-a-point token ONLY when no box is given.
+  HasPad := (NumPoints > 0) and (HasBox = 0);
+  // sparse prompt rows = points (+ optional pad) + 2 box corners.
+  NSparseRows := NumPoints + Ord(HasPad) + 2 * HasBox;
+  // tokens = [iou(1)] + [mask_tokens] + [sparse prompt rows]
+  NTok := 1 + MaskTokenCount + NSparseRows;
 
   if (ImageEmbedding.Depth <> H) or (ImageEmbedding.SizeX <> Grid) or
      (ImageEmbedding.SizeY <> Grid) then
@@ -51237,31 +51284,77 @@ begin
   PEPos := TNNetVolume.Create;       // shared_embedding.positional_embedding
   SharedPE := TNNetVolume.Create;    // shared_image_embedding (grid pos-enc)
   NotAPoint := TNNetVolume.Create;
-  PointE := TNNetVolume.Create;
+  PE0 := TNNetVolume.Create; PE1 := TNNetVolume.Create;
+  PE2 := TNNetVolume.Create; PE3 := TNNetVolume.Create;
   NoMask := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(Pfx + 'prompt_encoder.shared_embedding.positional_embedding', PEPos);
     Reader.LoadTensorFlat(Pfx + 'shared_image_embedding.positional_embedding', SharedPE);
-
-    // ----- prompt encoder: point + pad -----
-    SetLength(Coords, 2 * 2);
-    // HF shifts coords by +0.5 (pixel center) then normalizes by input_image_size.
-    Coords[0] := (PointX + 0.5) / Config.InputImageSize;
-    Coords[1] := (PointY + 0.5) / Config.InputImageSize;
-    Coords[2] := (0.0 + 0.5) / Config.InputImageSize;   // pad point (0,0)
-    Coords[3] := (0.0 + 0.5) / Config.InputImageSize;
-    SAMPosEnc(PEPos, Coords, 2, Config.NumPosFeats, SparseRaw);
-    SetLength(Sparse, 2 * H);
-    for i := 0 to 2 * H - 1 do Sparse[i] := SparseRaw[i];
-    // point row 0: positive -> + point_embed[1], negative -> + point_embed[0].
     Reader.LoadTensorFlat(Pfx + 'prompt_encoder.not_a_point_embed.weight', NotAPoint);
-    if IsPositive then
-      Reader.LoadTensorFlat(Pfx + 'prompt_encoder.point_embed.1.weight', PointE)
-    else
-      Reader.LoadTensorFlat(Pfx + 'prompt_encoder.point_embed.0.weight', PointE);
-    for d := 0 to H - 1 do Sparse[0 * H + d] := Sparse[0 * H + d] + PointE.FData[d];
-    // pad row 1 has label -1 -> REPLACED by not_a_point_embed.
-    for d := 0 to H - 1 do Sparse[1 * H + d] := NotAPoint.FData[d];
+    Reader.LoadTensorFlat(Pfx + 'prompt_encoder.point_embed.0.weight', PE0);
+    Reader.LoadTensorFlat(Pfx + 'prompt_encoder.point_embed.1.weight', PE1);
+    Reader.LoadTensorFlat(Pfx + 'prompt_encoder.point_embed.2.weight', PE2);
+    Reader.LoadTensorFlat(Pfx + 'prompt_encoder.point_embed.3.weight', PE3);
+
+    // ----- prompt encoder: N points (+ optional pad) + box corners -----
+    // Coords order: NumPoints clicks, then pad (0,0) if HasPad, then box
+    // corners (x0,y0),(x1,y1) if HasBox. All shifted +0.5 then /InputImageSize.
+    NSparse := NSparseRows;
+    SetLength(Coords, NSparse * 2);
+    srow := 0;
+    for i := 0 to NumPoints - 1 do
+    begin
+      Coords[srow * 2 + 0] := (PointsXY[i * 2 + 0] + 0.5) / Config.InputImageSize;
+      Coords[srow * 2 + 1] := (PointsXY[i * 2 + 1] + 0.5) / Config.InputImageSize;
+      Inc(srow);
+    end;
+    if HasPad then
+    begin
+      Coords[srow * 2 + 0] := (0.0 + 0.5) / Config.InputImageSize;  // pad (0,0)
+      Coords[srow * 2 + 1] := (0.0 + 0.5) / Config.InputImageSize;
+      Inc(srow);
+    end;
+    if HasBox = 1 then
+    begin
+      Coords[srow * 2 + 0] := (Box[0] + 0.5) / Config.InputImageSize;  // x0
+      Coords[srow * 2 + 1] := (Box[1] + 0.5) / Config.InputImageSize;  // y0
+      Inc(srow);
+      Coords[srow * 2 + 0] := (Box[2] + 0.5) / Config.InputImageSize;  // x1
+      Coords[srow * 2 + 1] := (Box[3] + 0.5) / Config.InputImageSize;  // y1
+      Inc(srow);
+    end;
+
+    SAMPosEnc(PEPos, Coords, NSparse, Config.NumPosFeats, SparseRaw);
+    SetLength(Sparse, NSparse * H);
+    for i := 0 to NSparse * H - 1 do Sparse[i] := SparseRaw[i];
+
+    // Per-row label embedding addition, mirroring HF _embed_points/_embed_boxes:
+    //   label 1 -> + point_embed[1], label 0 -> + point_embed[0],
+    //   pad (label -1) -> REPLACED by not_a_point_embed; box corner 0 -> +pe[2],
+    //   box corner 1 -> +pe[3].
+    srow := 0;
+    for i := 0 to NumPoints - 1 do
+    begin
+      if PointLabels[i] = 1 then
+        for d := 0 to H - 1 do Sparse[srow * H + d] := Sparse[srow * H + d] + PE1.FData[d]
+      else if PointLabels[i] = 0 then
+        for d := 0 to H - 1 do Sparse[srow * H + d] := Sparse[srow * H + d] + PE0.FData[d]
+      else
+        ImportError('SAM mask decoder: point label must be 0 or 1.');
+      Inc(srow);
+    end;
+    if HasPad then
+    begin
+      for d := 0 to H - 1 do Sparse[srow * H + d] := NotAPoint.FData[d];
+      Inc(srow);
+    end;
+    if HasBox = 1 then
+    begin
+      for d := 0 to H - 1 do Sparse[srow * H + d] := Sparse[srow * H + d] + PE2.FData[d];
+      Inc(srow);
+      for d := 0 to H - 1 do Sparse[srow * H + d] := Sparse[srow * H + d] + PE3.FData[d];
+      Inc(srow);
+    end;
 
     // dense no-mask embedding broadcast over the grid, ADDED to the image emb.
     Reader.LoadTensorFlat(Pfx + 'prompt_encoder.no_mask_embed.weight', NoMask);
@@ -51290,7 +51383,7 @@ begin
       for d := 0 to H - 1 do PointEmb[d] := T1.FData[d];
       for i := 0 to MaskTokenCount - 1 do
         for d := 0 to H - 1 do PointEmb[(1 + i) * H + d] := T2.FData[i * H + d];
-      for i := 0 to 1 do
+      for i := 0 to NSparseRows - 1 do
         for d := 0 to H - 1 do
           PointEmb[(1 + MaskTokenCount + i) * H + d] := Sparse[i * H + d];
     finally
@@ -51467,15 +51560,36 @@ begin
       U2[i] := x * cdf;
     end;
 
-    // ----- hypernetwork MLP for the SINGLE mask (mask token index 0) -----
-    // hyper_in[oc] = MLP_0( mask_tokens_out[0] ), oc in [0, Cu).
-    // MLP: proj_in (H->H) relu, layers.0 (H->H) relu, proj_out (H->Cu).
-    SetLength(HyperIn, Cu);
+    // ----- mask-output selection -----
+    // HF: multimask -> mask tokens 1..num_mask_tokens-1 (slice(1,None));
+    //     single -> mask token 0 (slice(0,1)). The hypernetwork + IoU head run
+    //     over ALL mask tokens; only the slice is returned.
+    if MultiMaskOutput then
     begin
-      // mask_tokens_out[0] = Queries[(1+0)*H .. ]
+      FirstMask := 1;
+      NumMasks := MaskTokenCount - 1;
+    end
+    else
+    begin
+      FirstMask := 0;
+      NumMasks := 1;
+    end;
+
+    // ----- hypernetwork MLP per emitted mask -> mask logits -----
+    // For each mask token mt: hyper_in[oc] = MLP_mt( mask_tokens_out[mt] ),
+    // then mask logits = hyper_in . upscaled_embedding over the Cu channels.
+    // MLP: proj_in (H->H) relu, layers.0 (H->H) relu, proj_out (H->Cu).
+    MaskLogits.ReSize(Hu, Wu, NumMasks);
+    SetLength(HyperIn, Cu);
+    for mi := 0 to NumMasks - 1 do
+    begin
+      mt := FirstMask + mi;
+      // mask_tokens_out[mt] = Queries[(1+mt)*H .. ]. Re-alloc Hbuf to H each
+      // pass: SAMLinear resizes its OUTPUT array, so reusing one buffer for an
+      // (H->Cu) projection would shrink it and OOB the next (H-wide) read.
       SetLength(Hbuf, H);
-      for d := 0 to H - 1 do Hbuf[d] := Queries[(1 + 0) * H + d];
-      BPfx := Pfx + 'mask_decoder.output_hypernetworks_mlps.0.';
+      for d := 0 to H - 1 do Hbuf[d] := Queries[(1 + mt) * H + d];
+      BPfx := Pfx + 'mask_decoder.output_hypernetworks_mlps.' + IntToStr(mt) + '.';
       SAMLinear(Reader, BPfx + 'proj_in.weight', BPfx + 'proj_in.bias',
         H, H, 1, Hbuf, Mlp1);
       for i := 0 to H - 1 do if Mlp1[i] < 0 then Mlp1[i] := 0;
@@ -51483,23 +51597,62 @@ begin
         H, H, 1, Mlp1, Mlp2);
       for i := 0 to H - 1 do if Mlp2[i] < 0 then Mlp2[i] := 0;
       SAMLinear(Reader, BPfx + 'proj_out.weight', BPfx + 'proj_out.bias',
-        H, Cu, 1, Mlp2, Hbuf);
-      for oc := 0 to Cu - 1 do HyperIn[oc] := Hbuf[oc];
+        H, Cu, 1, Mlp2, HyperIn);
+      // HyperIn now holds the per-channel hypernetwork output (length Cu).
+
+      for r := 0 to Hu - 1 do
+        for c := 0 to Wu - 1 do
+        begin
+          acc := 0;
+          for oc := 0 to Cu - 1 do
+            acc := acc + HyperIn[oc] * U2[oc * Hu * Wu + r * Wu + c];
+          // depth axis indexes the emitted masks (HF order).
+          MaskLogits.FData[(r * Wu + c) * NumMasks + mi] := acc;
+        end;
     end;
 
-    // mask logits = hyper_in . upscaled_embedding over the Cu channels.
-    MaskLogits.ReSize(Hu, Wu, 1);
-    for r := 0 to Hu - 1 do
-      for c := 0 to Wu - 1 do
-      begin
-        acc := 0;
-        for oc := 0 to Cu - 1 do
-          acc := acc + HyperIn[oc] * U2[oc * Hu * Wu + r * Wu + c];
-        MaskLogits.FData[(r * Wu + c) * 1 + 0] := acc;
-      end;
+    // ----- IoU prediction head: one scalar per emitted mask -----
+    // iou_token_out = Queries[0]; iou_prediction_head is a SamFeedForward
+    // (iou_head_depth=3): proj_in (H->H) relu, layers.0 (H->H) relu,
+    // proj_out (H->MaskTokenCount). sigmoid_output=False. Slice to emitted masks.
+    if IoUScores <> nil then
+    begin
+      SetLength(Hbuf, H);
+      for d := 0 to H - 1 do Hbuf[d] := Queries[0 * H + d];
+      BPfx := Pfx + 'mask_decoder.iou_prediction_head.';
+      SAMLinear(Reader, BPfx + 'proj_in.weight', BPfx + 'proj_in.bias',
+        H, H, 1, Hbuf, Mlp1);
+      for i := 0 to H - 1 do if Mlp1[i] < 0 then Mlp1[i] := 0;
+      SAMLinear(Reader, BPfx + 'layers.0.weight', BPfx + 'layers.0.bias',
+        H, H, 1, Mlp1, Mlp2);
+      for i := 0 to H - 1 do if Mlp2[i] < 0 then Mlp2[i] := 0;
+      SAMLinear(Reader, BPfx + 'proj_out.weight', BPfx + 'proj_out.bias',
+        H, MaskTokenCount, 1, Mlp2, Hbuf);
+      IoUScores.ReSize(NumMasks, 1, 1);
+      for mi := 0 to NumMasks - 1 do
+        IoUScores.FData[mi] := Hbuf[FirstMask + mi];
+    end;
   finally
-    PEPos.Free; SharedPE.Free; NotAPoint.Free; PointE.Free; NoMask.Free;
+    PEPos.Free; SharedPE.Free; NotAPoint.Free;
+    PE0.Free; PE1.Free; PE2.Free; PE3.Free; NoMask.Free;
   end;
+end;
+
+// Legacy single-point / single-mask wrapper over RunSAMMaskDecoderEx (v1 API).
+procedure RunSAMMaskDecoder(Reader: TNNetSafeTensorsReader;
+  const Config: TSAMMaskDecoderConfig; ImageEmbedding: TNNetVolume;
+  PointX, PointY: TNeuralFloat; IsPositive: boolean;
+  MaskLogits: TNNetVolume; const Prefix: string);
+var
+  Pts: array[0..1] of TNeuralFloat;
+  Labels: array[0..0] of integer;
+  NoBox: array of TNeuralFloat;
+begin
+  Pts[0] := PointX; Pts[1] := PointY;
+  if IsPositive then Labels[0] := 1 else Labels[0] := 0;
+  SetLength(NoBox, 0);
+  RunSAMMaskDecoderEx(Reader, Config, ImageEmbedding, Pts, Labels, NoBox,
+    {MultiMaskOutput=}false, MaskLogits, {IoUScores=}nil, Prefix);
 end;
 
 // ===========================================================================
