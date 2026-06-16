@@ -304,6 +304,12 @@ type
     // flow reverse, end-to-end waveform) vs the HF VitsModel float64 oracle,
     // with the prior noise z fed explicitly for a deterministic result < 1e-4.
     procedure TestVitsSynthesisParity;
+    // VITS stochastic duration predictor (use_stochastic_duration_prediction=
+    // true, the kakao-enterprise/vits-ljs path): the spline-flow duration
+    // predictor run in reverse, with the duration noise z_dur AND the prior
+    // noise z fed explicitly. Per-stage + end-to-end parity < 1e-4 vs the HF
+    // VitsModel float64 oracle.
+    procedure TestVitsStochasticDurationParity;
     // VITS char-level tokenizer (TNNetVitsTokenizer): a STRING -> the exact
     // token-id sequence HF VitsTokenizer(text) returns (normalize lowercasing,
     // out-of-vocab drop, multibyte vocab key, blank-id interleaving) on a tiny
@@ -13027,6 +13033,135 @@ begin
     end;
     // 1e-4 importer-parity gate. NEVER loosen - fix the model instead.
     AssertTrue('VITS end-to-end waveform parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Model.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestVitsStochasticDurationParity;
+var
+  Model: TNNetVits;
+  Config: TVitsConfig;
+  RefRoot: TJSONData;
+  RefObj: TJSONObject;
+  RefJson: TStringList;
+  IdArr, PMArr, RowArr, DurArr, ZdArr, LdArr, ZArr, WavArr: TJSONArray;
+  Ids: array of integer;
+  Durations: array of integer;
+  PriorMean, PriorLogVar, ZDur, Z: TNNetFloatDynArr2D;
+  Hidden: TNNetFloatDynArr2D;
+  LogDur: TNeuralFloatDynArr;
+  Wave: TNeuralFloatDynArr;
+  T, Flow, OutLen, i, c, t2: integer;
+  Diff, MaxDiff, RefV: double;
+
+  // Replays the text encoder to get the channel-major hidden states the
+  // stochastic duration predictor conditions on (the importer exposes Analyze,
+  // which folds this in; here we re-derive via RunTextEncoder indirectly by
+  // reading the oracle's prior stats is not enough, so we use the public
+  // StochasticDurationReverse with the hidden states we reconstruct from the
+  // model). We instead test the whole Analyze path for durations and the
+  // end-to-end synth, plus a direct SDP stage check via Synthesize's noise.
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_vits_sdp_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefObj := TJSONObject(RefRoot);
+    Flow := RefObj.Get('flow_size', 0);
+    OutLen := RefObj.Get('out_len', 0);
+
+    Model := BuildVitsFromSafeTensors(FixturePath('tiny_vits_sdp.safetensors'),
+      Config, FixturePath('tiny_vits_sdp_config.json'));
+    AssertTrue('vits sdp built', Model <> nil);
+    AssertTrue('config is stochastic', Config.UseStochasticDuration);
+
+    IdArr := TJSONArray(RefObj.Find('input_ids'));
+    T := IdArr.Count;
+    SetLength(Ids, T);
+    for i := 0 to T - 1 do Ids[i] := IdArr.Items[i].AsInteger;
+
+    // ---- pinned stochastic-duration noise z_dur [2][T] (already scaled).
+    ZdArr := TJSONArray(RefObj.Find('z_dur'));
+    SetLength(ZDur, ZdArr.Count);
+    for c := 0 to ZdArr.Count - 1 do
+    begin
+      RowArr := TJSONArray(ZdArr.Items[c]);
+      SetLength(ZDur[c], T);
+      for t2 := 0 to T - 1 do ZDur[c][t2] := RowArr.Items[t2].AsFloat;
+    end;
+    Model.SetStochasticDurationNoise(ZDur);
+
+    // ---- Stage: stochastic-duration reverse log-durations. Reconstruct the
+    // hidden states from the prior stats is not possible, so drive the public
+    // StochasticDurationReverse via the same hidden the model computes. We use
+    // Analyze to get prior stats + durations, and separately check the raw
+    // log-durations against the oracle by re-running the text encoder.
+    SetLength(Durations, T);
+    Model.Analyze(Ids, PriorMean, PriorLogVar, Durations);
+
+    // text-encoder prior parity (sanity that the shared encoder still matches).
+    PMArr := TJSONArray(RefObj.Find('prior_means'));
+    MaxDiff := 0;
+    for i := 0 to T - 1 do
+    begin
+      RowArr := TJSONArray(PMArr.Items[i]);
+      for c := 0 to Flow - 1 do
+      begin
+        Diff := Abs(PriorMean[i][c] - RowArr.Items[c].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('VITS SDP prior parity: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // durations from the reverse stochastic flow.
+    DurArr := TJSONArray(RefObj.Find('durations'));
+    for i := 0 to T - 1 do
+      AssertEquals('VITS SDP duration token ' + IntToStr(i),
+        Round(DurArr.Items[i].AsFloat), Durations[i]);
+
+    // direct log-duration parity: replay the text encoder, then the SDP.
+    Model.RunTextEncoderPublic(Ids, Hidden);
+    Model.StochasticDurationReverse(Hidden, ZDur, LogDur);
+    LdArr := TJSONArray(RefObj.Find('log_duration'));
+    MaxDiff := 0;
+    for i := 0 to T - 1 do
+    begin
+      Diff := Abs(LogDur[i] - LdArr.Items[i].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('VITS SDP log-duration parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // ---- End-to-end: ids + pinned z_dur + pinned z -> waveform.
+    ZArr := TJSONArray(RefObj.Find('z'));
+    SetLength(Z, Flow);
+    for c := 0 to Flow - 1 do
+    begin
+      RowArr := TJSONArray(ZArr.Items[c]);
+      SetLength(Z[c], OutLen);
+      for t2 := 0 to OutLen - 1 do Z[c][t2] := RowArr.Items[t2].AsFloat;
+    end;
+    Model.SetStochasticDurationNoise(ZDur);
+    Model.Synthesize(Ids, Z, Wave);
+    WavArr := TJSONArray(RefObj.Find('waveform'));
+    AssertEquals('VITS SDP waveform length', WavArr.Count, Length(Wave));
+    MaxDiff := 0;
+    for i := 0 to WavArr.Count - 1 do
+    begin
+      RefV := WavArr.Items[i].AsFloat;
+      Diff := Abs(Wave[i] - RefV);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    // 1e-4 importer-parity gate. NEVER loosen - fix the model instead.
+    AssertTrue('VITS SDP end-to-end waveform parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     Model.Free;

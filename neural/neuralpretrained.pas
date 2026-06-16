@@ -4483,6 +4483,16 @@ type
     WaveNetDilationRate: integer;   // wavenet_dilation_rate
     DurFilterChannels: integer;     // duration_predictor_filter_channels
     DurKernelSize: integer;         // duration_predictor_kernel_size
+    // Stochastic duration predictor (use_stochastic_duration_prediction=true,
+    // the kakao-enterprise/vits-ljs path). When UseStochasticDuration is false
+    // (the MMS-TTS default) the fields below are unused.
+    UseStochasticDuration: boolean; // use_stochastic_duration_prediction
+    DurFlowBins: integer;           // duration_predictor_flow_bins
+    DurTailBound: TNeuralFloat;     // duration_predictor_tail_bound
+    DurNumFlows: integer;           // duration_predictor_num_flows
+    DSepChannels: integer;          // depth_separable_channels
+    DSepNumLayers: integer;         // depth_separable_num_layers
+    NoiseScaleDuration: TNeuralFloat; // noise_scale_duration
     LayerNormEps: TNeuralFloat;     // layer_norm_eps
     NoiseScale: TNeuralFloat;       // noise_scale
     SpeakingRate: TNeuralFloat;     // speaking_rate
@@ -4514,6 +4524,27 @@ type
   TVitsFlow = record
     ConvPre, ConvPost: THiFiGANConv;
     WaveNet: TVitsWaveNet;
+  end;
+
+  // --- Stochastic-duration-predictor sub-modules (use_stochastic_duration_
+  // prediction=true). Coded by Claude (AI).
+  // One VitsDilatedDepthSeparableConv layer (grouped dilated conv + LayerNorm +
+  // GELU + pointwise conv + LayerNorm + GELU, residual).
+  TVitsDDSLayer = record
+    Dilated: THiFiGANConv;          // groups=channels grouped dilated conv
+    Pointwise: THiFiGANConv;        // 1x1 conv
+    Norm1W, Norm1B, Norm2W, Norm2B: TNeuralFloatDynArr;
+  end;
+  TVitsDDS = array of TVitsDDSLayer;
+
+  // One stochastic-duration flow step. Either an elementwise affine
+  // (IsAffine=true: translate / log_scale, channels = depth_separable_channels)
+  // or a rational-quadratic-spline conv flow (conv_pre -> DDS -> conv_proj).
+  TVitsSDPFlow = record
+    IsAffine: boolean;
+    Translate, LogScale: TNeuralFloatDynArr;  // affine: [channels]
+    ConvPre, ConvProj: THiFiGANConv;          // conv flow
+    DDS: TVitsDDS;
   end;
 
   { TNNetVitsTokenizer }
@@ -4574,6 +4605,11 @@ type
     FProject: THiFiGANConv;                          // project (H -> 2*flow)
     FDurConv1, FDurConv2, FDurProj: THiFiGANConv;
     FDurNorm1W, FDurNorm1B, FDurNorm2W, FDurNorm2B: TNeuralFloatDynArr;
+    // Stochastic duration predictor (only when Config.UseStochasticDuration).
+    FSDPConvPre, FSDPConvProj: THiFiGANConv;
+    FSDPDDS: TVitsDDS;
+    FSDPFlows: array of TVitsSDPFlow;                // flows[0]=affine, rest CF
+    FSDPNoise: TNNetFloatDynArr2D;                   // explicit z_dur [2][T]
     FFlows: array of TVitsFlow;
     FDecoder: TNNetHiFiGAN;                          // HiFi-GAN generator (owned)
     procedure RunTextEncoder(const Ids: array of integer;
@@ -4581,6 +4617,12 @@ type
       out Hidden: TNNetFloatDynArr2D);
     procedure RunDuration(const Hidden: TNNetFloatDynArr2D;
       out LogDur: TNeuralFloatDynArr);
+    // Runs a VitsDilatedDepthSeparableConv stack on a channel-major signal.
+    procedure RunVitsDDS(const DDS: TVitsDDS; var Sig: TNNetFloatDynArr2D);
+    // Applies one stochastic-duration flow step in REVERSE on a 2-channel
+    // [2][T] latent, conditioned on Cond ([hidden][T], the conv_proj output).
+    procedure RunSDPFlowReverse(const Flow: TVitsSDPFlow;
+      var Latent: TNNetFloatDynArr2D; const Cond: TNNetFloatDynArr2D);
     procedure RunWaveNet(const WN: TVitsWaveNet;
       const Inp: TNNetFloatDynArr2D; out Outp: TNNetFloatDynArr2D);
     procedure RunFlowReverse(var Latent: TNNetFloatDynArr2D);
@@ -4589,9 +4631,26 @@ type
     destructor Destroy; override;
     property Config: TVitsConfig read FConfig;
     property Decoder: TNNetHiFiGAN read FDecoder;
-    // Runs the text encoder + deterministic duration predictor and returns the
-    // per-token prior stats (PriorMean/PriorLogVar are [token][flow]) and the
-    // integer per-token durations. Exposed for stage parity testing.
+    // Runs the STOCHASTIC duration predictor (use_stochastic_duration_
+    // prediction=true) IN REVERSE: maps the explicit 2-channel noise ZDur
+    // ([2][numTokens], already scaled by noise_scale_duration) to per-token
+    // log-durations, conditioned on the text-encoder Hidden ([token][hidden]).
+    // Exposed for stage parity testing. Raises if the model is deterministic.
+    procedure StochasticDurationReverse(const Hidden: TNNetFloatDynArr2D;
+      const ZDur: TNNetFloatDynArr2D; out LogDur: TNeuralFloatDynArr);
+    // Runs only the text encoder and returns the per-token hidden states
+    // ([token][hidden]). Exposed for stage parity testing.
+    procedure RunTextEncoderPublic(const Ids: array of integer;
+      out Hidden: TNNetFloatDynArr2D);
+    // Sets the explicit stochastic-duration noise z_dur ([2][numTokens],
+    // already scaled by noise_scale_duration) used by Analyze/Synthesize when
+    // Config.UseStochasticDuration is true. If unset (or empty) zero noise is
+    // used. Ignored for the deterministic path.
+    procedure SetStochasticDurationNoise(const ZDur: TNNetFloatDynArr2D);
+    // Runs the text encoder + duration predictor (deterministic or stochastic
+    // per Config.UseStochasticDuration) and returns the per-token prior stats
+    // (PriorMean/PriorLogVar are [token][flow]) and the integer per-token
+    // durations. Exposed for stage parity testing.
     procedure Analyze(const Ids: array of integer;
       out PriorMean, PriorLogVar: TNNetFloatDynArr2D;
       out Durations: array of integer);
@@ -35179,6 +35238,155 @@ begin
   end;
 end;
 
+// erf via the Abramowitz & Stegun 7.1.26 polynomial (|err| < 1.5e-7), well
+// within the 1e-4 importer-parity gate.
+function VitsErf(X: TNeuralFloat): TNeuralFloat;
+const
+  A1 = 0.254829592; A2 = -0.284496736; A3 = 1.421413741;
+  A4 = -1.453152027; A5 = 1.061405429; P = 0.3275911;
+var
+  Sgn, T, Y: TNeuralFloat;
+begin
+  if X < 0 then Sgn := -1 else Sgn := 1;
+  X := Abs(X);
+  T := 1.0 / (1.0 + P * X);
+  Y := 1.0 - (((((A5 * T + A4) * T) + A3) * T + A2) * T + A1) * T * Exp(-X * X);
+  Result := Sgn * Y;
+end;
+
+// torch GELU (the exact erf form nn.functional.gelu uses by default).
+function VitsGELU(X: TNeuralFloat): TNeuralFloat; inline;
+begin
+  // 0.5 * x * (1 + erf(x / sqrt(2)))
+  Result := 0.5 * X * (1.0 + VitsErf(X * 0.70710678118654752440));
+end;
+
+// Numerically stable softplus: log(1 + exp(x)).
+function VitsSoftplus(X: TNeuralFloat): TNeuralFloat; inline;
+begin
+  if X > 30 then Result := X
+  else if X < -30 then Result := Exp(X)
+  else Result := Ln(1.0 + Exp(X));
+end;
+
+// In-place softmax over a vector.
+procedure VitsSoftmax(var V: TNeuralFloatDynArr);
+var
+  i, n: integer;
+  M, S: TNeuralFloat;
+begin
+  n := Length(V);
+  M := V[0];
+  for i := 1 to n - 1 do if V[i] > M then M := V[i];
+  S := 0;
+  for i := 0 to n - 1 do
+  begin
+    V[i] := Exp(V[i] - M);
+    S := S + V[i];
+  end;
+  for i := 0 to n - 1 do V[i] := V[i] / S;
+end;
+
+// Inverse (reverse=True) unconstrained rational-quadratic spline at a SINGLE
+// scalar input, exactly mirroring HF _unconstrained_rational_quadratic_spline /
+// _rational_quadratic_spline. UW/UH are NumBins-vectors, UD is (NumBins-1)
+// derivatives (the two endpoint constants are appended internally). Outside the
+// [-TailBound, TailBound] interval the transform is the identity.
+// Coded by Claude (AI).
+function VitsRQSplineInverse(InputVal: TNeuralFloat;
+  const UW, UH, UD: TNeuralFloatDynArr; NumBins: integer;
+  TailBound: TNeuralFloat): TNeuralFloat;
+const
+  MinBinWidth = 1.0e-3;
+  MinBinHeight = 1.0e-3;
+  MinDerivative = 1.0e-3;
+var
+  i, BinIdx: integer;
+  Widths, Heights, CumWidths, CumHeights, Derivatives: TNeuralFloatDynArr;
+  ConstantD, LowerBound, UpperBound: TNeuralFloat;
+  InCumW, InBinW, InCumH, InDelta, InDeriv, InDerivP1, InHeight: TNeuralFloat;
+  Inter1, Inter2, Inter3, A, B, C, Discr, Root: TNeuralFloat;
+begin
+  LowerBound := -TailBound;
+  UpperBound := TailBound;
+  // Outside-interval mask: identity.
+  if (InputVal < LowerBound) or (InputVal > UpperBound) then
+  begin
+    Result := InputVal;
+    Exit;
+  end;
+  ConstantD := Ln(Exp(1.0 - MinDerivative) - 1.0);
+
+  // widths = min_bin_width + (1 - min_bin_width*num_bins) * softmax(UW).
+  SetLength(Widths, NumBins);
+  for i := 0 to NumBins - 1 do Widths[i] := UW[i];
+  VitsSoftmax(Widths);
+  for i := 0 to NumBins - 1 do
+    Widths[i] := MinBinWidth + (1.0 - MinBinWidth * NumBins) * Widths[i];
+  // cumwidths padded with a leading 0, scaled into [lower, upper], endpoints set.
+  SetLength(CumWidths, NumBins + 1);
+  CumWidths[0] := 0;
+  for i := 0 to NumBins - 1 do CumWidths[i + 1] := CumWidths[i] + Widths[i];
+  for i := 0 to NumBins do
+    CumWidths[i] := (UpperBound - LowerBound) * CumWidths[i] + LowerBound;
+  CumWidths[0] := LowerBound;
+  CumWidths[NumBins] := UpperBound;
+  for i := 0 to NumBins - 1 do Widths[i] := CumWidths[i + 1] - CumWidths[i];
+
+  // derivatives = min_derivative + softplus(UD padded with the two endpoint
+  // constants) -> length NumBins+1.
+  SetLength(Derivatives, NumBins + 1);
+  Derivatives[0] := MinDerivative + VitsSoftplus(ConstantD);
+  Derivatives[NumBins] := MinDerivative + VitsSoftplus(ConstantD);
+  for i := 1 to NumBins - 1 do
+    Derivatives[i] := MinDerivative + VitsSoftplus(UD[i - 1]);
+
+  // heights = min_bin_height + (1 - min_bin_height*num_bins) * softmax(UH).
+  SetLength(Heights, NumBins);
+  for i := 0 to NumBins - 1 do Heights[i] := UH[i];
+  VitsSoftmax(Heights);
+  for i := 0 to NumBins - 1 do
+    Heights[i] := MinBinHeight + (1.0 - MinBinHeight * NumBins) * Heights[i];
+  SetLength(CumHeights, NumBins + 1);
+  CumHeights[0] := 0;
+  for i := 0 to NumBins - 1 do CumHeights[i + 1] := CumHeights[i] + Heights[i];
+  for i := 0 to NumBins do
+    CumHeights[i] := (UpperBound - LowerBound) * CumHeights[i] + LowerBound;
+  CumHeights[0] := LowerBound;
+  CumHeights[NumBins] := UpperBound;
+  for i := 0 to NumBins - 1 do Heights[i] := CumHeights[i + 1] - CumHeights[i];
+
+  // reverse=True: bin_locations = cumheights, last += 1e-6;
+  // bin_idx = sum(input >= bin_locations) - 1.
+  CumHeights[NumBins] := CumHeights[NumBins] + 1.0e-6;
+  BinIdx := -1;
+  for i := 0 to NumBins do
+    if InputVal >= CumHeights[i] then Inc(BinIdx);
+  CumHeights[NumBins] := CumHeights[NumBins] - 1.0e-6; // restore (unused after)
+  if BinIdx < 0 then BinIdx := 0;
+  if BinIdx > NumBins - 1 then BinIdx := NumBins - 1;
+
+  InCumW := CumWidths[BinIdx];
+  InBinW := Widths[BinIdx];
+  InCumH := CumHeights[BinIdx];
+  InDelta := Heights[BinIdx] / Widths[BinIdx];
+  InDeriv := Derivatives[BinIdx];
+  InDerivP1 := Derivatives[BinIdx + 1];
+  InHeight := Heights[BinIdx];
+
+  Inter1 := InDeriv + InDerivP1 - 2.0 * InDelta;
+  // reverse: solve quadratic for theta = root.
+  Inter2 := InputVal - InCumH;
+  Inter3 := Inter2 * Inter1;
+  A := InHeight * (InDelta - InDeriv) + Inter3;
+  B := InHeight * InDeriv - Inter3;
+  C := -InDelta * Inter2;
+  Discr := B * B - 4.0 * A * C;
+  if Discr < 0 then Discr := 0;
+  Root := (2.0 * C) / (-B - Sqrt(Discr));
+  Result := Root * InBinW + InCumW;
+end;
+
 { TNNetVitsTokenizer }
 
 constructor TNNetVitsTokenizer.Create;
@@ -35781,6 +35989,199 @@ begin
   end;
 end;
 
+// Depthwise (groups=channels) 1-D conv with "same" pad/dilation. Weight is
+// [channels, 1, K]; output channel c convolves ONLY input channel c.
+procedure VitsDepthwiseConv(const Conv: THiFiGANConv;
+  const InSig: TNNetFloatDynArr2D; out OutSig: TNNetFloatDynArr2D);
+var
+  Ch, K, Dil, Pad, InLen, c, t, k2, src: integer;
+  Acc: TNeuralFloat;
+begin
+  Ch := Conv.OutCh;
+  K := Conv.Kernel;
+  Dil := Conv.Dilation;
+  Pad := Conv.Pad;
+  InLen := Length(InSig[0]);
+  SetLength(OutSig, Ch);
+  for c := 0 to Ch - 1 do
+  begin
+    SetLength(OutSig[c], InLen);
+    for t := 0 to InLen - 1 do
+    begin
+      Acc := Conv.B[c];
+      for k2 := 0 to K - 1 do
+      begin
+        src := t + k2 * Dil - Pad;
+        if (src >= 0) and (src < InLen) then
+          Acc := Acc + Conv.W[c * K + k2] * InSig[c][src];
+      end;
+      OutSig[c][t] := Acc;
+    end;
+  end;
+end;
+
+procedure TNNetVits.RunVitsDDS(const DDS: TVitsDDS;
+  var Sig: TNNetFloatDynArr2D);
+var
+  L, c, t, Ch, Tlen: integer;
+  H, Tmp: TNNetFloatDynArr2D;
+  Col: TNeuralFloatDynArr;
+begin
+  Ch := Length(Sig);
+  Tlen := Length(Sig[0]);
+  SetLength(Col, Ch);
+  for L := 0 to Length(DDS) - 1 do
+  begin
+    // grouped dilated conv (padding_mask is all-ones here).
+    VitsDepthwiseConv(DDS[L].Dilated, Sig, H);
+    // norms_1 (LayerNorm over channels per time), then GELU.
+    for t := 0 to Tlen - 1 do
+    begin
+      for c := 0 to Ch - 1 do Col[c] := H[c][t];
+      VitsLayerNormVec(Col, DDS[L].Norm1W, DDS[L].Norm1B, FConfig.LayerNormEps);
+      for c := 0 to Ch - 1 do H[c][t] := VitsGELU(Col[c]);
+    end;
+    // pointwise 1x1 conv, then norms_2, then GELU.
+    RunHiFiGANConv(DDS[L].Pointwise, H, Tmp);
+    for t := 0 to Tlen - 1 do
+    begin
+      for c := 0 to Ch - 1 do Col[c] := Tmp[c][t];
+      VitsLayerNormVec(Col, DDS[L].Norm2W, DDS[L].Norm2B, FConfig.LayerNormEps);
+      for c := 0 to Ch - 1 do Tmp[c][t] := VitsGELU(Col[c]);
+    end;
+    // residual: inputs = inputs + hidden_states.
+    for c := 0 to Ch - 1 do
+      for t := 0 to Tlen - 1 do Sig[c][t] := Sig[c][t] + Tmp[c][t];
+  end;
+end;
+
+procedure TNNetVits.RunSDPFlowReverse(const Flow: TVitsSDPFlow;
+  var Latent: TNNetFloatDynArr2D; const Cond: TNNetFloatDynArr2D);
+var
+  Half, Filt, NumBins, Tlen, c, t, b, o: integer;
+  FirstHalf, Hid, Proj: TNNetFloatDynArr2D;
+  UW, UH, UD: TNeuralFloatDynArr;
+  InvSqrtFilt, V: TNeuralFloat;
+begin
+  Tlen := Length(Latent[0]);
+  if Flow.IsAffine then
+  begin
+    // reverse: out = (in - translate) * exp(-log_scale).
+    for c := 0 to Length(Latent) - 1 do
+      for t := 0 to Tlen - 1 do
+        Latent[c][t] := (Latent[c][t] - Flow.Translate[c]) * Exp(-Flow.LogScale[c]);
+    Exit;
+  end;
+  // VitsConvFlow reverse. half_channels = depth_separable_channels div 2.
+  Half := FConfig.DSepChannels div 2;
+  Filt := FConfig.HiddenSize;
+  NumBins := FConfig.DurFlowBins;
+  InvSqrtFilt := 1.0 / Sqrt(Filt);
+  // first_half = channels [0..Half-1]; the spline transforms second_half.
+  SetLength(FirstHalf, Half);
+  for c := 0 to Half - 1 do FirstHalf[c] := Latent[c];
+  RunHiFiGANConv(Flow.ConvPre, FirstHalf, Hid);     // -> Filt channels
+  // global_conditioning is ADDED at the start of the DDS (inputs+cond).
+  for c := 0 to Filt - 1 do
+    for t := 0 to Tlen - 1 do Hid[c][t] := Hid[c][t] + Cond[c][t];
+  RunVitsDDS(Flow.DDS, Hid);
+  RunHiFiGANConv(Flow.ConvProj, Hid, Proj);         // -> Half*(3*NumBins-1) ch
+  // reshape (channels=Half, bins-per-channel = 3*NumBins-1) per (half, time).
+  SetLength(UW, NumBins);
+  SetLength(UH, NumBins);
+  SetLength(UD, NumBins - 1);
+  for c := 0 to Half - 1 do
+    for t := 0 to Tlen - 1 do
+    begin
+      o := c * (3 * NumBins - 1);
+      for b := 0 to NumBins - 1 do
+      begin
+        UW[b] := Proj[o + b][t] * InvSqrtFilt;
+        UH[b] := Proj[o + NumBins + b][t] * InvSqrtFilt;
+      end;
+      for b := 0 to NumBins - 2 do
+        UD[b] := Proj[o + 2 * NumBins + b][t];
+      V := VitsRQSplineInverse(Latent[Half + c][t], UW, UH, UD, NumBins,
+        FConfig.DurTailBound);
+      Latent[Half + c][t] := V;
+    end;
+end;
+
+procedure TNNetVits.StochasticDurationReverse(const Hidden: TNNetFloatDynArr2D;
+  const ZDur: TNNetFloatDynArr2D; out LogDur: TNeuralFloatDynArr);
+var
+  Tlen, H, c, t, fi, NumApplied: integer;
+  Inp, Cond, Latent, Tmp: TNNetFloatDynArr2D;
+  Order: array of integer;
+begin
+  if not FConfig.UseStochasticDuration then
+    ImportError('VITS: StochasticDurationReverse called on a deterministic ' +
+      'duration model.');
+  Tlen := Length(Hidden);
+  H := FConfig.HiddenSize;
+  // channel-major hidden [H][T].
+  SetLength(Inp, H);
+  for c := 0 to H - 1 do
+  begin
+    SetLength(Inp[c], Tlen);
+    for t := 0 to Tlen - 1 do Inp[c][t] := Hidden[t][c];
+  end;
+  // conv_pre (1x1) -> conv_dds -> conv_proj (1x1). This is the conditioner.
+  RunHiFiGANConv(FSDPConvPre, Inp, Cond);
+  RunVitsDDS(FSDPDDS, Cond);
+  RunHiFiGANConv(FSDPConvProj, Cond, Tmp);
+  Cond := Tmp;
+  // latents = z_dur (already noise-scaled), [2][T].
+  SetLength(Latent, 2);
+  for c := 0 to 1 do
+  begin
+    SetLength(Latent[c], Tlen);
+    for t := 0 to Tlen - 1 do
+      if (Length(ZDur) > c) and (Length(ZDur[c]) > t) then Latent[c][t] := ZDur[c][t]
+      else Latent[c][t] := 0;
+  end;
+  // flows = reversed(self.flows); flows = flows[:-2] + [flows[-1]] - i.e. apply
+  // the conv flows in reverse order then the elementwise affine, DROPPING the
+  // first conv flow (self.flows[1]). self.flows = [affine, CF_0 .. CF_{n-1}].
+  SetLength(Order, FConfig.DurNumFlows);   // = (num conv flows - 1) + 1 affine
+  NumApplied := 0;
+  for fi := FConfig.DurNumFlows downto 2 do   // conv flows CF_{n-1} .. CF_1
+  begin
+    Order[NumApplied] := fi;                   // FSDPFlows index (affine=0)
+    Inc(NumApplied);
+  end;
+  Order[NumApplied] := 0;                       // the elementwise affine last
+  Inc(NumApplied);
+  for fi := 0 to NumApplied - 1 do
+  begin
+    // flip the 2 channels.
+    SetLength(Tmp, 2);
+    Tmp[0] := Latent[1];
+    Tmp[1] := Latent[0];
+    Latent := Tmp;
+    RunSDPFlowReverse(FSDPFlows[Order[fi]], Latent, Cond);
+  end;
+  // log_duration = channel 0.
+  SetLength(LogDur, Tlen);
+  for t := 0 to Tlen - 1 do LogDur[t] := Latent[0][t];
+end;
+
+procedure TNNetVits.RunTextEncoderPublic(const Ids: array of integer;
+  out Hidden: TNNetFloatDynArr2D);
+var
+  PM, PLV: TNNetFloatDynArr2D;
+begin
+  RunTextEncoder(Ids, PM, PLV, Hidden);
+end;
+
+procedure TNNetVits.SetStochasticDurationNoise(const ZDur: TNNetFloatDynArr2D);
+var
+  c: integer;
+begin
+  SetLength(FSDPNoise, Length(ZDur));
+  for c := 0 to Length(ZDur) - 1 do FSDPNoise[c] := Copy(ZDur[c]);
+end;
+
 procedure TNNetVits.Analyze(const Ids: array of integer;
   out PriorMean, PriorLogVar: TNNetFloatDynArr2D;
   out Durations: array of integer);
@@ -35791,7 +36192,10 @@ var
   LengthScale, Dur: TNeuralFloat;
 begin
   RunTextEncoder(Ids, PriorMean, PriorLogVar, Hidden);
-  RunDuration(Hidden, LogDur);
+  if FConfig.UseStochasticDuration then
+    StochasticDurationReverse(Hidden, FSDPNoise, LogDur)
+  else
+    RunDuration(Hidden, LogDur);
   LengthScale := 1.0 / FConfig.SpeakingRate;
   for i := 0 to Length(Ids) - 1 do
   begin
@@ -35917,13 +36321,12 @@ begin
         '" - only "vits" is supported.');
     Result.ModelType := 'vits';
 
-    // The inference path drops the posterior encoder and the stochastic
-    // duration predictor; require the DETERMINISTIC duration readout.
-    if Obj.Get('use_stochastic_duration_prediction', True) then
-      ImportError('VITS import: use_stochastic_duration_prediction=true is ' +
-        'not supported - only the deterministic duration predictor ' +
-        '(use_stochastic_duration_prediction=false, the MMS-TTS default) is ' +
-        'implemented (a documented follow-up).');
+    // Both the DETERMINISTIC duration readout (the MMS-TTS default) and the
+    // STOCHASTIC duration predictor (the spline-flow path used by
+    // kakao-enterprise/vits-ljs) are supported. The posterior encoder remains
+    // dropped (training-only).
+    Result.UseStochasticDuration :=
+      Obj.Get('use_stochastic_duration_prediction', True);
     if Obj.Get('num_speakers', 1) > 1 then
       ImportError('VITS import: multi-speaker models (num_speakers>1) are ' +
         'not supported - single-speaker only (a documented follow-up).');
@@ -35947,6 +36350,12 @@ begin
     Result.DurFilterChannels :=
       Obj.Get('duration_predictor_filter_channels', 256);
     Result.DurKernelSize := Obj.Get('duration_predictor_kernel_size', 3);
+    Result.DurFlowBins := Obj.Get('duration_predictor_flow_bins', 10);
+    Result.DurTailBound := Obj.Get('duration_predictor_tail_bound', 5.0);
+    Result.DurNumFlows := Obj.Get('duration_predictor_num_flows', 4);
+    Result.DSepChannels := Obj.Get('depth_separable_channels', 2);
+    Result.DSepNumLayers := Obj.Get('depth_separable_num_layers', 3);
+    Result.NoiseScaleDuration := Obj.Get('noise_scale_duration', 0.8);
     Result.LayerNormEps := Obj.Get('layer_norm_eps', 1.0e-5);
     Result.NoiseScale := Obj.Get('noise_scale', 0.667);
     Result.SpeakingRate := Obj.Get('speaking_rate', 1.0);
@@ -36037,6 +36446,105 @@ begin
       WN.InLayers[i], False, 1, dil, pad, Consumed);
     LoadHiFiGANConv(Reader, Prefix + '.res_skip_layers.' + IntToStr(i),
       WN.ResSkip[i], False, 1, 1, 0, Consumed);
+  end;
+end;
+
+// Loads a plain Conv1d weight+bias (NO weight_norm) into a THiFiGANConv with
+// the given stride/dilation/pad. Used by the stochastic duration predictor.
+procedure LoadVitsPlainConv(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; var Conv: THiFiGANConv;
+  pStride, pDilation, pPad: integer; Consumed: TStrings);
+var
+  W: TNNetVolume;
+  OutDim, InDim, K, i, Cnt: integer;
+begin
+  W := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Prefix + '.weight', W);
+    Consumed.Add(Prefix + '.weight');
+    OutDim := Reader.DimSize(Prefix + '.weight', 0);
+    InDim := Reader.DimSize(Prefix + '.weight', 1);
+    K := Reader.DimSize(Prefix + '.weight', 2);
+    Cnt := OutDim * InDim * K;
+    SetLength(Conv.W, Cnt);
+    for i := 0 to Cnt - 1 do Conv.W[i] := W.FData[i];
+    Conv.Transpose := False;
+    Conv.Stride := pStride;
+    Conv.Dilation := pDilation;
+    Conv.Pad := pPad;
+    Conv.Kernel := K;
+    Conv.InCh := InDim;
+    Conv.OutCh := OutDim;
+    Reader.LoadTensorFlat(Prefix + '.bias', W);
+    Consumed.Add(Prefix + '.bias');
+    SetLength(Conv.B, W.Size);
+    for i := 0 to W.Size - 1 do Conv.B[i] := W.FData[i];
+  finally
+    W.Free;
+  end;
+end;
+
+// Loads one VitsDilatedDepthSeparableConv stack (DSepNumLayers layers). The
+// dilated convs are GROUPED (groups=channels, weight [C,1,K]) with dilation
+// kernel_size**i and "same" pad; the pointwise convs are 1x1.
+procedure LoadVitsDDS(Reader: TNNetSafeTensorsReader; const Prefix: string;
+  var DDS: TVitsDDS; NumLayers, KernelSize: integer; Consumed: TStrings);
+var
+  i, dil, pad: integer;
+begin
+  SetLength(DDS, NumLayers);
+  for i := 0 to NumLayers - 1 do
+  begin
+    dil := Round(IntPower(KernelSize, i));
+    if dil < 1 then dil := 1;
+    pad := (KernelSize * dil - dil) div 2;
+    LoadVitsPlainConv(Reader, Prefix + '.convs_dilated.' + IntToStr(i),
+      DDS[i].Dilated, 1, dil, pad, Consumed);
+    LoadVitsPlainConv(Reader, Prefix + '.convs_pointwise.' + IntToStr(i),
+      DDS[i].Pointwise, 1, 1, 0, Consumed);
+    LoadVitsVec(Reader, Prefix + '.norms_1.' + IntToStr(i) + '.weight',
+      DDS[i].Norm1W, Consumed);
+    LoadVitsVec(Reader, Prefix + '.norms_1.' + IntToStr(i) + '.bias',
+      DDS[i].Norm1B, Consumed);
+    LoadVitsVec(Reader, Prefix + '.norms_2.' + IntToStr(i) + '.weight',
+      DDS[i].Norm2W, Consumed);
+    LoadVitsVec(Reader, Prefix + '.norms_2.' + IntToStr(i) + '.bias',
+      DDS[i].Norm2B, Consumed);
+  end;
+end;
+
+// Loads the stochastic duration predictor (conv_pre -> conv_dds -> conv_proj
+// conditioner + the self.flows = [elementwise affine, num_flows conv flows]).
+// Coded by Claude (AI).
+procedure LoadVitsSDP(Reader: TNNetSafeTensorsReader; Model: TNNetVits;
+  const Config: TVitsConfig; Consumed: TStrings);
+var
+  fi: integer;
+  FP: string;
+begin
+  LoadVitsPlainConv(Reader, 'duration_predictor.conv_pre',
+    Model.FSDPConvPre, 1, 1, 0, Consumed);
+  LoadVitsPlainConv(Reader, 'duration_predictor.conv_proj',
+    Model.FSDPConvProj, 1, 1, 0, Consumed);
+  LoadVitsDDS(Reader, 'duration_predictor.conv_dds', Model.FSDPDDS,
+    Config.DSepNumLayers, Config.DurKernelSize, Consumed);
+  // self.flows[0] = VitsElementwiseAffine; flows[1..num_flows] = VitsConvFlow.
+  SetLength(Model.FSDPFlows, Config.DurNumFlows + 1);
+  LoadVitsVec(Reader, 'duration_predictor.flows.0.translate',
+    Model.FSDPFlows[0].Translate, Consumed);
+  LoadVitsVec(Reader, 'duration_predictor.flows.0.log_scale',
+    Model.FSDPFlows[0].LogScale, Consumed);
+  Model.FSDPFlows[0].IsAffine := True;
+  for fi := 1 to Config.DurNumFlows do
+  begin
+    FP := 'duration_predictor.flows.' + IntToStr(fi);
+    Model.FSDPFlows[fi].IsAffine := False;
+    LoadVitsPlainConv(Reader, FP + '.conv_pre',
+      Model.FSDPFlows[fi].ConvPre, 1, 1, 0, Consumed);
+    LoadVitsPlainConv(Reader, FP + '.conv_proj',
+      Model.FSDPFlows[fi].ConvProj, 1, 1, 0, Consumed);
+    LoadVitsDDS(Reader, FP + '.conv_dds', Model.FSDPFlows[fi].DDS,
+      Config.DSepNumLayers, Config.DurKernelSize, Consumed);
   end;
 end;
 
@@ -36187,21 +36695,26 @@ begin
     LoadHiFiGANConv(Reader, 'text_encoder.project', Model.FProject,
       False, 1, 1, 0, Consumed);
 
-    // ---- duration predictor (deterministic).
-    LoadHiFiGANConv(Reader, 'duration_predictor.conv_1', Model.FDurConv1,
-      False, 1, 1, Config.DurKernelSize div 2, Consumed);
-    LoadHiFiGANConv(Reader, 'duration_predictor.conv_2', Model.FDurConv2,
-      False, 1, 1, Config.DurKernelSize div 2, Consumed);
-    LoadHiFiGANConv(Reader, 'duration_predictor.proj', Model.FDurProj,
-      False, 1, 1, 0, Consumed);
-    LoadVitsVec(Reader, 'duration_predictor.norm_1.weight',
-      Model.FDurNorm1W, Consumed);
-    LoadVitsVec(Reader, 'duration_predictor.norm_1.bias',
-      Model.FDurNorm1B, Consumed);
-    LoadVitsVec(Reader, 'duration_predictor.norm_2.weight',
-      Model.FDurNorm2W, Consumed);
-    LoadVitsVec(Reader, 'duration_predictor.norm_2.bias',
-      Model.FDurNorm2B, Consumed);
+    // ---- duration predictor (stochastic flow OR deterministic conv stack).
+    if Config.UseStochasticDuration then
+      LoadVitsSDP(Reader, Model, Config, Consumed)
+    else
+    begin
+      LoadHiFiGANConv(Reader, 'duration_predictor.conv_1', Model.FDurConv1,
+        False, 1, 1, Config.DurKernelSize div 2, Consumed);
+      LoadHiFiGANConv(Reader, 'duration_predictor.conv_2', Model.FDurConv2,
+        False, 1, 1, Config.DurKernelSize div 2, Consumed);
+      LoadHiFiGANConv(Reader, 'duration_predictor.proj', Model.FDurProj,
+        False, 1, 1, 0, Consumed);
+      LoadVitsVec(Reader, 'duration_predictor.norm_1.weight',
+        Model.FDurNorm1W, Consumed);
+      LoadVitsVec(Reader, 'duration_predictor.norm_1.bias',
+        Model.FDurNorm1B, Consumed);
+      LoadVitsVec(Reader, 'duration_predictor.norm_2.weight',
+        Model.FDurNorm2W, Consumed);
+      LoadVitsVec(Reader, 'duration_predictor.norm_2.bias',
+        Model.FDurNorm2B, Consumed);
+    end;
 
     // ---- flow (prior_encoder_num_flows residual coupling layers).
     SetLength(Model.FFlows, Config.PriorNumFlows);

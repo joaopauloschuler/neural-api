@@ -702,10 +702,21 @@ rather than acted on.
       posterior encoder (training-only) is dropped from the committed fixture and
       never required. Example writes a smoke WAV via `SaveVolumeToWav16`. Open
       follow-ups:
-  - [ ] the STOCHASTIC duration predictor (`VitsStochasticDurationPredictor`, the
-        spline-flow `use_stochastic_duration_prediction=true` path) — currently
-        rejected loudly in `ReadVitsConfigFromJSONFile`; the deterministic readout is
-        implemented (the MMS-TTS default).
+  - [X] the STOCHASTIC duration predictor (`VitsStochasticDurationPredictor`, the
+        spline-flow `use_stochastic_duration_prediction=true` path used by
+        `kakao-enterprise/vits-ljs`) — `TNNetVits.StochasticDurationReverse` ports the
+        HF reverse path EXACTLY: the `VitsDilatedDepthSeparableConv` conditioner
+        (grouped dilated conv + LayerNorm + erf-GELU + pointwise + LayerNorm + GELU,
+        residual), the `[:-2]+[-1]` flow reversal (drop the first conv flow), per-step
+        channel flip, the `VitsElementwiseAffine` reverse and the unconstrained
+        rational-quadratic spline (`_unconstrained_rational_quadratic_spline`,
+        reverse=True: cumwidth/cumheight bin search, quadratic-root inverse). The
+        duration noise `z_dur` is an EXPLICIT input (`SetStochasticDurationNoise`) like
+        the prior noise `z`. `ReadVitsConfigFromJSONFile` now ACCEPTS
+        `use_stochastic_duration_prediction=true`; the deterministic readout (the
+        MMS-TTS default) is unchanged. Parity-gated `< 1e-4` vs the HF `VitsModel`
+        float64 oracle (`TestVitsStochasticDurationParity`,
+        `tools/make_pico_vits_sdp_fixture.py` -> `tests/fixtures/tiny_vits_sdp*`).
   - [ ] MULTI-SPEAKER models (`num_speakers>1` / `speaker_embedding_size!=0`, the
         global-conditioning `cond` convs into the WaveNet/duration/decoder) —
         rejected loudly.
