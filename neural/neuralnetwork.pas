@@ -65498,6 +65498,7 @@ end;
 procedure TNNetHyperbolicLinear.ComputeCPU();
 var
   nIn, nOut, i, jOut: integer;
+  nInMax, nOutMax: integer;
   nx, nv, alpha, beta: TNeuralFloat;
   c, A, nz2, nb2, p, qq, Den: TNeuralFloat;
   PrevOut, V, Z, B: TNNetVolume;
@@ -65506,37 +65507,39 @@ begin
   PrevOut := FPrevLayer.FOutput;
   nIn := PrevOut.Size;
   nOut := FOutput.Size;
+  nInMax := nIn - 1;
+  nOutMax := nOut - 1;
 
   // Cache the raw input x.
   FCacheX.ReSize(nIn, 1, 1);
-  for i := 0 to nIn - 1 do FCacheX.FData[i] := PrevOut.FData[i];
+  for i := 0 to nInMax do FCacheX.FData[i] := PrevOut.FData[i];
 
   // u = log_0(x) = alpha(||x||) * x.
   nx := 0;
-  for i := 0 to nIn - 1 do nx := nx + FCacheX.FData[i] * FCacheX.FData[i];
+  for i := 0 to nInMax do nx := nx + FCacheX.FData[i] * FCacheX.FData[i];
   nx := Sqrt(nx);
   alpha := LogCoef(nx);
   FCacheU.ReSize(nIn, 1, 1);
-  for i := 0 to nIn - 1 do FCacheU.FData[i] := alpha * FCacheX.FData[i];
+  for i := 0 to nInMax do FCacheU.FData[i] := alpha * FCacheX.FData[i];
 
   // v = M.u (one neuron per output dim; weights of length nIn).
   FCacheV.ReSize(nOut, 1, 1);
-  for jOut := 0 to nOut - 1 do
+  for jOut := 0 to nOutMax do
     FCacheV.FData[jOut] := FArrNeurons[jOut].FWeights.DotProduct(FCacheU);
 
   // z = exp_0(v) = beta(||v||) * v.
   V := FCacheV;
   nv := 0;
-  for jOut := 0 to nOut - 1 do nv := nv + V.FData[jOut] * V.FData[jOut];
+  for jOut := 0 to nOutMax do nv := nv + V.FData[jOut] * V.FData[jOut];
   nv := Sqrt(nv);
   beta := ExpCoef(nv);
   FCacheZ.ReSize(nOut, 1, 1);
-  for jOut := 0 to nOut - 1 do FCacheZ.FData[jOut] := beta * V.FData[jOut];
+  for jOut := 0 to nOutMax do FCacheZ.FData[jOut] := beta * V.FData[jOut];
 
   // Gather the Mobius bias b (b[j] = neuron j bias weight); zero if suppressed.
   FCacheB.ReSize(nOut, 1, 1);
   if FSuppressBias = 0 then
-    for jOut := 0 to nOut - 1 do FCacheB.FData[jOut] := FArrNeurons[jOut].FBiasWeight
+    for jOut := 0 to nOutMax do FCacheB.FData[jOut] := FArrNeurons[jOut].FBiasWeight
   else
     FCacheB.Fill(0);
 
@@ -65545,7 +65548,7 @@ begin
   Z := FCacheZ;
   B := FCacheB;
   A := 0; nz2 := 0; nb2 := 0;
-  for jOut := 0 to nOut - 1 do
+  for jOut := 0 to nOutMax do
   begin
     A := A + Z.FData[jOut] * B.FData[jOut];
     nz2 := nz2 + Z.FData[jOut] * Z.FData[jOut];
@@ -65556,7 +65559,7 @@ begin
   Den := 1.0 + 2.0 * c * A + c * c * nz2 * nb2;
   if Abs(Den) < HYPERBOLIC_EPS then
     Den := HYPERBOLIC_EPS * Sign(Den + HYPERBOLIC_EPS);
-  for jOut := 0 to nOut - 1 do
+  for jOut := 0 to nOutMax do
     FOutput.FData[jOut] := (p * Z.FData[jOut] + qq * B.FData[jOut]) / Den;
 end;
 
@@ -65567,6 +65570,7 @@ end;
 procedure TNNetHyperbolicLinear.AccumulateCurvatureGradient();
 var
   nIn, nOut, i, jOut: integer;
+  nInMax, nOutMax: integer;
   c, nx, nv, alpha, beta, dalpha_dc, dnv, dbeta_dc: TNeuralFloat;
   Acoef, nz2, nb2, p, qq, Den: TNeuralFloat;
   dA, dnz2, dp, dq, dDen, Numj, dNumj, dydc: TNeuralFloat;
@@ -65580,29 +65584,31 @@ begin
   X := FCacheX; U := FCacheU; V := FCacheV; Z := FCacheZ; B := FCacheB;
   nIn := U.Size;
   nOut := FOutput.Size;
+  nInMax := nIn - 1;
+  nOutMax := nOut - 1;
 
   // du = dalpha/dc * x  (u = alpha(||x||,c)*x; x fixed w.r.t. c).
   nx := 0;
-  for i := 0 to nIn - 1 do nx := nx + X.FData[i] * X.FData[i];
+  for i := 0 to nInMax do nx := nx + X.FData[i] * X.FData[i];
   nx := Sqrt(nx);
   alpha := LogCoef(nx);
   dalpha_dc := LogCoefDc(nx);
   SetLength(du, nIn);
-  for i := 0 to nIn - 1 do du[i] := dalpha_dc * X.FData[i];
+  for i := 0 to nInMax do du[i] := dalpha_dc * X.FData[i];
 
   // dv = M.du  (v = M.u, M fixed w.r.t. c).
   SetLength(dv, nOut);
-  for jOut := 0 to nOut - 1 do
+  for jOut := 0 to nOutMax do
   begin
     WRow := FArrNeurons[jOut].FWeights;
     dv[jOut] := 0;
-    for i := 0 to nIn - 1 do dv[jOut] := dv[jOut] + WRow.FData[i] * du[i];
+    for i := 0 to nInMax do dv[jOut] := dv[jOut] + WRow.FData[i] * du[i];
   end;
 
   // beta total derivative: dbeta/dc = ExpCoefDc(nv) + (dbeta/dn)*dnv/dc, with
   // dbeta/dn = ExpGamma(nv)*nv and dnv/dc = <v,dv>/nv.
   nv := 0;
-  for jOut := 0 to nOut - 1 do nv := nv + V.FData[jOut] * V.FData[jOut];
+  for jOut := 0 to nOutMax do nv := nv + V.FData[jOut] * V.FData[jOut];
   nv := Sqrt(nv);
   beta := ExpCoef(nv);
   if nv < HYPERBOLIC_EPS then
@@ -65610,20 +65616,20 @@ begin
   else
   begin
     dnv := 0;
-    for jOut := 0 to nOut - 1 do dnv := dnv + V.FData[jOut] * dv[jOut];
+    for jOut := 0 to nOutMax do dnv := dnv + V.FData[jOut] * dv[jOut];
     dnv := dnv / nv;
   end;
   dbeta_dc := ExpCoefDc(nv) + ExpGamma(nv) * nv * dnv;
 
   // dz = dbeta/dc * v + beta * dv.
   SetLength(dz, nOut);
-  for jOut := 0 to nOut - 1 do
+  for jOut := 0 to nOutMax do
     dz[jOut] := dbeta_dc * V.FData[jOut] + beta * dv[jOut];
 
   // Mobius forward tangent. y_j = (p z_j + q b_j)/Den. b is constant w.r.t. c,
   // but z, and the explicit c in p,q,Den, all vary.
   Acoef := 0; nz2 := 0; nb2 := 0;
-  for jOut := 0 to nOut - 1 do
+  for jOut := 0 to nOutMax do
   begin
     Acoef := Acoef + Z.FData[jOut] * B.FData[jOut];
     nz2 := nz2 + Z.FData[jOut] * Z.FData[jOut];
@@ -65636,7 +65642,7 @@ begin
     Den := HYPERBOLIC_EPS * Sign(Den + HYPERBOLIC_EPS);
   // dA/dc = <dz,b>, dnz2/dc = 2<z,dz>, dnb2/dc = 0.
   dA := 0; dnz2 := 0;
-  for jOut := 0 to nOut - 1 do
+  for jOut := 0 to nOutMax do
   begin
     dA := dA + dz[jOut] * B.FData[jOut];
     dnz2 := dnz2 + Z.FData[jOut] * dz[jOut];
@@ -65647,7 +65653,7 @@ begin
   dDen := 2.0 * Acoef + 2.0 * c * dA + 2.0 * c * nz2 * nb2 + c * c * dnz2 * nb2;
 
   dLdc := 0;
-  for jOut := 0 to nOut - 1 do
+  for jOut := 0 to nOutMax do
   begin
     Numj := p * Z.FData[jOut] + qq * B.FData[jOut];
     dNumj := dp * Z.FData[jOut] + p * dz[jOut] + dq * B.FData[jOut];
@@ -65703,14 +65709,16 @@ procedure ComputeHyperbolicMobiusBack(
   var dLdv, dLdb: array of TNeuralFloat);
 var
   nOut, jOut: integer;
+  nOutMax: integer;
   A, nz2, nb2, p, qq, Den, Gy: TNeuralFloat;
   gz, gb, hv: TNeuralFloat;
   dLdz: array of TNeuralFloat;
 begin
   nOut := Z.Size;
+  nOutMax := nOut - 1;
   SetLength(dLdz, nOut);
   A := 0; nz2 := 0; nb2 := 0;
-  for jOut := 0 to nOut - 1 do
+  for jOut := 0 to nOutMax do
   begin
     A := A + Z.FData[jOut] * B.FData[jOut];
     nz2 := nz2 + Z.FData[jOut] * Z.FData[jOut];
@@ -65723,7 +65731,7 @@ begin
     Den := HYPERBOLIC_EPS * Sign(Den + HYPERBOLIC_EPS);
   // Num_k = p*z_k + q*b_k ; Gy = <g,Num> = Den*<g,y>.
   gz := 0; gb := 0; Gy := 0;
-  for jOut := 0 to nOut - 1 do
+  for jOut := 0 to nOutMax do
   begin
     gz := gz + g[jOut] * Z.FData[jOut];
     gb := gb + g[jOut] * B.FData[jOut];
@@ -65733,7 +65741,7 @@ begin
   //           - (Gy/Den^2)[2c b_l + 2c^2 nb2 z_l].
   // dL/db_l = (1/Den)[(2c z_l + 2c b_l) gz + q g_l]
   //           - (Gy/Den^2)[2c z_l + 2c^2 nz2 b_l].
-  for jOut := 0 to nOut - 1 do
+  for jOut := 0 to nOutMax do
   begin
     dLdz[jOut] :=
       ( 2.0*c*B.FData[jOut]*gz + p*g[jOut] - 2.0*c*Z.FData[jOut]*gb ) / Den
@@ -65748,8 +65756,8 @@ begin
   // fold it via hv = <dLdz, z> (since v = z/beta). dL/dv_l = beta*dLdz_l +
   // gamma*(z_l/beta)*<dLdz, z/beta> = beta*dLdz_l + (gamma/beta^2)*z_l*<dLdz,z>.
   hv := 0;
-  for jOut := 0 to nOut - 1 do hv := hv + dLdz[jOut] * Z.FData[jOut];
-  for jOut := 0 to nOut - 1 do
+  for jOut := 0 to nOutMax do hv := hv + dLdz[jOut] * Z.FData[jOut];
+  for jOut := 0 to nOutMax do
     dLdv[jOut] := ExpBetaVal * dLdz[jOut]
       + (ExpGammaVal / (ExpBetaVal * ExpBetaVal)) * Z.FData[jOut] * hv;
 end;
@@ -65759,31 +65767,34 @@ end;
 procedure TNNetHyperbolicLinear.BackpropagateCPU();
 var
   nIn, nOut, i, jOut: integer;
+  nInMax, nOutMax: integer;
   nv, beta, gammaExp, ld: TNeuralFloat;
   V, Z, B, U, WDelta: TNNetVolume;
   g, dLdv, dLdb: array of TNeuralFloat;
 begin
   nIn := FCacheU.Size;
   nOut := FOutput.Size;
+  nInMax := nIn - 1;
+  nOutMax := nOut - 1;
   Z := FCacheZ; B := FCacheB; V := FCacheV; U := FCacheU;
 
   nv := 0;
-  for jOut := 0 to nOut - 1 do nv := nv + V.FData[jOut] * V.FData[jOut];
+  for jOut := 0 to nOutMax do nv := nv + V.FData[jOut] * V.FData[jOut];
   nv := Sqrt(nv);
   beta := ExpCoef(nv);
   gammaExp := ExpGamma(nv);
 
   SetLength(g, nOut); SetLength(dLdv, nOut); SetLength(dLdb, nOut);
-  for jOut := 0 to nOut - 1 do g[jOut] := FOutputError.FData[jOut];
+  for jOut := 0 to nOutMax do g[jOut] := FOutputError.FData[jOut];
   ComputeHyperbolicMobiusBack(FCurvature, Z, B, g, gammaExp, beta, dLdv, dLdb);
 
   // Weight deltas: dL/dW[j][i] = dLdv_j * u_i.
-  for jOut := 0 to nOut - 1 do
+  for jOut := 0 to nOutMax do
   begin
     WDelta := FArrNeurons[jOut].FDelta;
     ld := -FLearningRate * dLdv[jOut];
     if ld <> 0.0 then
-      for i := 0 to nIn - 1 do
+      for i := 0 to nInMax do
         WDelta.FData[i] := WDelta.FData[i] + ld * U.FData[i];
     if FSuppressBias = 0 then
       FArrNeurons[jOut].FBiasDelta :=
@@ -65792,7 +65803,7 @@ begin
 
   if not FBatchUpdate then
   begin
-    for jOut := 0 to nOut - 1 do
+    for jOut := 0 to nOutMax do
       FArrNeurons[jOut].UpdateWeightsWithoutInertia();
     AfterWeightUpdate();
   end;
@@ -65804,45 +65815,48 @@ end;
 procedure TNNetHyperbolicLinear.ComputePreviousLayerErrorCPU();
 var
   nIn, nOut, i, jOut: integer;
+  nInMax, nOutMax: integer;
   nx, nv, alpha, beta, gammaExp, gammaLog, dotUX: TNeuralFloat;
   Z, B, V, X, WRow, LocalPrevError: TNNetVolume;
   g, dLdv, dLdb, dLdu: array of TNeuralFloat;
 begin
   nIn := FCacheU.Size;
   nOut := FOutput.Size;
+  nInMax := nIn - 1;
+  nOutMax := nOut - 1;
   Z := FCacheZ; B := FCacheB; V := FCacheV; X := FCacheX;
   LocalPrevError := FPrevLayer.OutputError;
 
   nv := 0;
-  for jOut := 0 to nOut - 1 do nv := nv + V.FData[jOut] * V.FData[jOut];
+  for jOut := 0 to nOutMax do nv := nv + V.FData[jOut] * V.FData[jOut];
   nv := Sqrt(nv);
   beta := ExpCoef(nv);
   gammaExp := ExpGamma(nv);
 
   SetLength(g, nOut); SetLength(dLdv, nOut); SetLength(dLdb, nOut);
-  for jOut := 0 to nOut - 1 do g[jOut] := FOutputError.FData[jOut];
+  for jOut := 0 to nOutMax do g[jOut] := FOutputError.FData[jOut];
   ComputeHyperbolicMobiusBack(FCurvature, Z, B, g, gammaExp, beta, dLdv, dLdb);
 
   // dL/du = M^T (dL/dv).
   SetLength(dLdu, nIn);
-  for i := 0 to nIn - 1 do dLdu[i] := 0;
-  for jOut := 0 to nOut - 1 do
+  for i := 0 to nInMax do dLdu[i] := 0;
+  for jOut := 0 to nOutMax do
   begin
     if dLdv[jOut] = 0.0 then continue;
     WRow := FArrNeurons[jOut].FWeights;
-    for i := 0 to nIn - 1 do
+    for i := 0 to nInMax do
       dLdu[i] := dLdu[i] + dLdv[jOut] * WRow.FData[i];
   end;
 
   // log_0 radial Jacobian.
   nx := 0;
-  for i := 0 to nIn - 1 do nx := nx + X.FData[i] * X.FData[i];
+  for i := 0 to nInMax do nx := nx + X.FData[i] * X.FData[i];
   nx := Sqrt(nx);
   alpha := LogCoef(nx);
   gammaLog := LogGamma(nx);
   dotUX := 0;
-  for i := 0 to nIn - 1 do dotUX := dotUX + dLdu[i] * X.FData[i];
-  for i := 0 to nIn - 1 do
+  for i := 0 to nInMax do dotUX := dotUX + dLdu[i] * X.FData[i];
+  for i := 0 to nInMax do
     LocalPrevError.FData[i] := LocalPrevError.FData[i]
       + alpha * dLdu[i] + gammaLog * X.FData[i] * dotUX;
 end;
@@ -65890,6 +65904,7 @@ end;
 procedure TNNetHyperbolicDistance.ComputeCPU();
 var
   nIn, nProto, i, kk: integer;
+  nInMax, nProtoMax: integer;
   c, s, na2, Acoef, nb2, pco, qco, Den, r, t, dist: TNeuralFloat;
   PrevOut, Pk: TNNetVolume;
 begin
@@ -65898,10 +65913,12 @@ begin
   PrevOut := FPrevLayer.FOutput;
   nIn := PrevOut.Size;
   nProto := FOutput.Size;
+  nInMax := nIn - 1;
+  nProtoMax := nProto - 1;
 
   // Cache the raw input x.
   FCacheX.ReSize(nIn, 1, 1);
-  for i := 0 to nIn - 1 do FCacheX.FData[i] := PrevOut.FData[i];
+  for i := 0 to nInMax do FCacheX.FData[i] := PrevOut.FData[i];
 
   FCacheM.ReSize(nProto, 1, nIn);   // one row of length nIn per prototype
   FCacheR.ReSize(nProto, 1, 1);
@@ -65909,14 +65926,14 @@ begin
 
   // ||x||^2 (= ||a||^2 with a = -x) is shared across prototypes.
   na2 := 0;
-  for i := 0 to nIn - 1 do na2 := na2 + FCacheX.FData[i] * FCacheX.FData[i];
+  for i := 0 to nInMax do na2 := na2 + FCacheX.FData[i] * FCacheX.FData[i];
 
-  for kk := 0 to nProto - 1 do
+  for kk := 0 to nProtoMax do
   begin
     Pk := FArrNeurons[kk].FWeights;  // prototype p_k, length nIn
     // a = -x, b = p_k. A=<a,b>=-<x,p_k>; nb2=||p_k||^2.
     Acoef := 0; nb2 := 0;
-    for i := 0 to nIn - 1 do
+    for i := 0 to nInMax do
     begin
       Acoef := Acoef - FCacheX.FData[i] * Pk.FData[i];
       nb2 := nb2 + Pk.FData[i] * Pk.FData[i];
@@ -65929,7 +65946,7 @@ begin
     FCacheDen.FData[kk] := Den;
     // m_k[i] = (pco*(-x_i) + qco*p_k_i)/Den.
     r := 0;
-    for i := 0 to nIn - 1 do
+    for i := 0 to nInMax do
     begin
       FCacheM.FData[kk * nIn + i] :=
         (pco * (-FCacheX.FData[i]) + qco * Pk.FData[i]) / Den;
@@ -65976,11 +65993,13 @@ procedure TNNetHyperbolicDistance.MobiusAddBack(const c: TNeuralFloat;
   var dLda, dLdb: array of TNeuralFloat);
 var
   nIn, i: integer;
+  nInMax: integer;
   Acoef, na2, nb2, pco, qco, Den, ha, hb, Gm: TNeuralFloat;
 begin
   nIn := A.Size;
+  nInMax := nIn - 1;
   Acoef := 0; na2 := 0; nb2 := 0;
-  for i := 0 to nIn - 1 do
+  for i := 0 to nInMax do
   begin
     Acoef := Acoef + A.FData[i] * Bvec.FData[i];
     na2 := na2 + A.FData[i] * A.FData[i];
@@ -65991,7 +66010,7 @@ begin
   Den := FCacheDen.FData[kk];
   // ha=<dLdm,a>, hb=<dLdm,b>, Gm=<dLdm,Num>=Den*<dLdm,m>.
   ha := 0; hb := 0; Gm := 0;
-  for i := 0 to nIn - 1 do
+  for i := 0 to nInMax do
   begin
     ha := ha + dLdm[i] * A.FData[i];
     hb := hb + dLdm[i] * Bvec.FData[i];
@@ -66001,7 +66020,7 @@ begin
   //           - (Gm/Den^2)[2c b_l + 2c^2 nb2 a_l].
   // dL/db_l = (1/Den)[(2c a_l + 2c b_l) ha + qco dLdm_l]
   //           - (Gm/Den^2)[2c a_l + 2c^2 na2 b_l].
-  for i := 0 to nIn - 1 do
+  for i := 0 to nInMax do
   begin
     dLda[i] := dLda[i]
       + ( 2.0*c*Bvec.FData[i]*ha + pco*dLdm[i] - 2.0*c*A.FData[i]*hb ) / Den
@@ -66016,6 +66035,7 @@ end;
 procedure TNNetHyperbolicDistance.BackpropagateCPU();
 var
   nIn, nProto, i, kk: integer;
+  nInMax, nProtoMax: integer;
   c, s, r, t, ddr, rscale: TNeuralFloat;
   Avec, Mk, WDelta: TNNetVolume;
   dLdm, dLda, dLdb: array of TNeuralFloat;
@@ -66024,15 +66044,17 @@ begin
   s := Sqrt(c);
   nIn := FCacheX.Size;
   nProto := FOutput.Size;
+  nInMax := nIn - 1;
+  nProtoMax := nProto - 1;
 
   // a = -x.
   Avec := TNNetVolume.Create(nIn, 1, 1);
   Mk := TNNetVolume.Create(nIn, 1, 1);
   try
-    for i := 0 to nIn - 1 do Avec.FData[i] := -FCacheX.FData[i];
+    for i := 0 to nInMax do Avec.FData[i] := -FCacheX.FData[i];
     SetLength(dLdm, nIn); SetLength(dLda, nIn); SetLength(dLdb, nIn);
 
-    for kk := 0 to nProto - 1 do
+    for kk := 0 to nProtoMax do
     begin
       r := FCacheR.FData[kk];
       // dd_k/dr = 2/(1 - c r^2); dL/dr = g_k * that. dL/dm = (dL/dr / r)*m_k.
@@ -66043,7 +66065,7 @@ begin
         rscale := 0    // m_k ~ 0; radial direction vanishes, gradient -> 0
       else
         rscale := FOutputError.FData[kk] * ddr / r;
-      for i := 0 to nIn - 1 do
+      for i := 0 to nInMax do
       begin
         Mk.FData[i] := FCacheM.FData[kk * nIn + i];
         dLdm[i] := rscale * Mk.FData[i];
@@ -66052,13 +66074,13 @@ begin
       MobiusAddBack(c, Avec, FArrNeurons[kk].FWeights, Mk, kk, dLdm, dLda, dLdb);
       // dL/dp_k = dLdb. Accumulate into neuron delta scaled by -LearningRate.
       WDelta := FArrNeurons[kk].FDelta;
-      for i := 0 to nIn - 1 do
+      for i := 0 to nInMax do
         WDelta.FData[i] := WDelta.FData[i] - FLearningRate * dLdb[i];
     end;
 
     if not FBatchUpdate then
     begin
-      for kk := 0 to nProto - 1 do
+      for kk := 0 to nProtoMax do
         FArrNeurons[kk].UpdateWeightsWithoutInertia();
       AfterWeightUpdate();
     end;
@@ -66072,6 +66094,7 @@ end;
 procedure TNNetHyperbolicDistance.ComputePreviousLayerErrorCPU();
 var
   nIn, nProto, i, kk: integer;
+  nInMax, nProtoMax: integer;
   c, s, r, t, ddr, rscale: TNeuralFloat;
   Avec, Mk, LocalPrevError: TNNetVolume;
   dLdm, dLda, dLdb: array of TNeuralFloat;
@@ -66080,15 +66103,17 @@ begin
   s := Sqrt(c);
   nIn := FCacheX.Size;
   nProto := FOutput.Size;
+  nInMax := nIn - 1;
+  nProtoMax := nProto - 1;
   LocalPrevError := FPrevLayer.OutputError;
 
   Avec := TNNetVolume.Create(nIn, 1, 1);
   Mk := TNNetVolume.Create(nIn, 1, 1);
   try
-    for i := 0 to nIn - 1 do Avec.FData[i] := -FCacheX.FData[i];
+    for i := 0 to nInMax do Avec.FData[i] := -FCacheX.FData[i];
     SetLength(dLdm, nIn); SetLength(dLda, nIn); SetLength(dLdb, nIn);
 
-    for kk := 0 to nProto - 1 do
+    for kk := 0 to nProtoMax do
     begin
       r := FCacheR.FData[kk];
       t := s * r;
@@ -66098,7 +66123,7 @@ begin
         rscale := 0
       else
         rscale := FOutputError.FData[kk] * ddr / r;
-      for i := 0 to nIn - 1 do
+      for i := 0 to nInMax do
       begin
         Mk.FData[i] := FCacheM.FData[kk * nIn + i];
         dLdm[i] := rscale * Mk.FData[i];
@@ -66106,7 +66131,7 @@ begin
       end;
       MobiusAddBack(c, Avec, FArrNeurons[kk].FWeights, Mk, kk, dLdm, dLda, dLdb);
       // x = -a => dL/dx = -dL/da. Accumulate across prototypes.
-      for i := 0 to nIn - 1 do
+      for i := 0 to nInMax do
         LocalPrevError.FData[i] := LocalPrevError.FData[i] - dLda[i];
     end;
   finally
@@ -66129,6 +66154,7 @@ end;
 procedure TNNetQuaternionConv.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
   InDepth, OutDepth, oq, taps: integer;
+  outQMax: integer;
 begin
   InDepth := pPrevLayer.Output.Depth;
   OutDepth := FNeurons.Count; // numFeatures requested in Create
@@ -66149,6 +66175,7 @@ begin
 
   FInQuaternions := InDepth div 4;
   FOutQuaternions := OutDepth div 4;
+  outQMax := FOutQuaternions - 1;
   // Each block-row neuron oq holds (FeatureSizeX*FeatureSizeY*InQ) quaternion
   // taps of 4 reals each, laid out contiguously as (r,x,y,z).
   taps := FFeatureSizeX * FFeatureSizeY * FInQuaternions * 4;
@@ -66158,7 +66185,7 @@ begin
   while FNeurons.Count < FOutQuaternions + 1 do
     FNeurons.Add(TNNetNeuron.Create());
 
-  for oq := 0 to FOutQuaternions - 1 do
+  for oq := 0 to outQMax do
   begin
     FNeurons[oq].Weights.ReSize(taps, 1, 1);
     FNeurons[oq].BackInertia.ReSize(taps, 1, 1);
@@ -66187,16 +66214,19 @@ end;
 procedure TNNetQuaternionConv.InitDefault();
 var
   oq, t, base, numTaps: integer;
+  outQMax, numTapsMax: integer;
   scale: TNeuralFloat;
   W: TNNetVolume;
 begin
   if FOutQuaternions <= 0 then exit;
   numTaps := FFeatureSizeX * FFeatureSizeY * FInQuaternions;
   scale := Sqrt(2.0 / (numTaps * 4 + 1));
-  for oq := 0 to FOutQuaternions - 1 do
+  outQMax := FOutQuaternions - 1;
+  numTapsMax := numTaps - 1;
+  for oq := 0 to outQMax do
   begin
     W := FArrNeurons[oq].FWeights;
-    for t := 0 to numTaps - 1 do
+    for t := 0 to numTapsMax do
     begin
       base := t * 4;
       W.FData[base + 0] := scale * (Random - 0.5) * 2;        // r
@@ -66223,6 +66253,7 @@ procedure TNNetQuaternionConv.ComputeCPU();
 var
   ox, oy, oq, fx, fy, iq, tapBase, oBase: integer;
   prevX, prevY: integer;
+  outSizeXMax, outSizeYMax, outQMax, featSizeXMax, featSizeYMax, inQMax: integer;
   r, qx, qy, qz, a, b, c, d: TNeuralFloat;
   y0, y1, y2, y3: TNeuralFloat;
   W, PrevOut, Bias: TNNetVolume;
@@ -66232,22 +66263,28 @@ begin
   Bias := FArrNeurons[FOutQuaternions].FWeights;
   prevSizeX := PrevOut.SizeX;
   prevSizeY := PrevOut.SizeY;
-  for oy := 0 to FOutputSizeY - 1 do
-  for ox := 0 to FOutputSizeX - 1 do
+  outSizeXMax := FOutputSizeX - 1;
+  outSizeYMax := FOutputSizeY - 1;
+  outQMax := FOutQuaternions - 1;
+  featSizeXMax := FFeatureSizeX - 1;
+  featSizeYMax := FFeatureSizeY - 1;
+  inQMax := FInQuaternions - 1;
+  for oy := 0 to outSizeYMax do
+  for ox := 0 to outSizeXMax do
   begin
-    for oq := 0 to FOutQuaternions - 1 do
+    for oq := 0 to outQMax do
     begin
       W := FArrNeurons[oq].FWeights;
       y0 := 0; y1 := 0; y2 := 0; y3 := 0;
-      for fy := 0 to FFeatureSizeY - 1 do
+      for fy := 0 to featSizeYMax do
       begin
         prevY := oy * FStride + fy - FPadding;
         if (prevY < 0) or (prevY >= prevSizeY) then continue;
-        for fx := 0 to FFeatureSizeX - 1 do
+        for fx := 0 to featSizeXMax do
         begin
           prevX := ox * FStride + fx - FPadding;
           if (prevX < 0) or (prevX >= prevSizeX) then continue;
-          for iq := 0 to FInQuaternions - 1 do
+          for iq := 0 to inQMax do
           begin
             tapBase := ((fy * FFeatureSizeX + fx) * FInQuaternions + iq) * 4;
             r  := W.FData[tapBase + 0];
@@ -66305,6 +66342,7 @@ procedure TNNetQuaternionConv.ComputePreviousLayerErrorCPU();
 var
   ox, oy, oq, fx, fy, iq, tapBase, oBase: integer;
   prevX, prevY: integer;
+  outSizeXMax, outSizeYMax, outQMax, featSizeXMax, featSizeYMax, inQMax: integer;
   r, qx, qy, qz: TNeuralFloat;
   e0, e1, e2, e3: TNeuralFloat;
   W, LocalPrevError: TNNetVolume;
@@ -66314,10 +66352,16 @@ begin
   LocalPrevError := FPrevLayer.OutputError;
   prevSizeX := FPrevLayer.FOutput.SizeX;
   prevSizeY := FPrevLayer.FOutput.SizeY;
-  for oy := 0 to FOutputSizeY - 1 do
-  for ox := 0 to FOutputSizeX - 1 do
+  outSizeXMax := FOutputSizeX - 1;
+  outSizeYMax := FOutputSizeY - 1;
+  outQMax := FOutQuaternions - 1;
+  featSizeXMax := FFeatureSizeX - 1;
+  featSizeYMax := FFeatureSizeY - 1;
+  inQMax := FInQuaternions - 1;
+  for oy := 0 to outSizeYMax do
+  for ox := 0 to outSizeXMax do
   begin
-    for oq := 0 to FOutQuaternions - 1 do
+    for oq := 0 to outQMax do
     begin
       oBase := oq * 4;
       e0 := FOutputError.Get(ox, oy, oBase + 0);
@@ -66326,15 +66370,15 @@ begin
       e3 := FOutputError.Get(ox, oy, oBase + 3);
       if (e0 = 0) and (e1 = 0) and (e2 = 0) and (e3 = 0) then continue;
       W := FArrNeurons[oq].FWeights;
-      for fy := 0 to FFeatureSizeY - 1 do
+      for fy := 0 to featSizeYMax do
       begin
         prevY := oy * FStride + fy - FPadding;
         if (prevY < 0) or (prevY >= prevSizeY) then continue;
-        for fx := 0 to FFeatureSizeX - 1 do
+        for fx := 0 to featSizeXMax do
         begin
           prevX := ox * FStride + fx - FPadding;
           if (prevX < 0) or (prevX >= prevSizeX) then continue;
-          for iq := 0 to FInQuaternions - 1 do
+          for iq := 0 to inQMax do
           begin
             tapBase := ((fy * FFeatureSizeX + fx) * FInQuaternions + iq) * 4;
             r  := W.FData[tapBase + 0];
@@ -66363,6 +66407,7 @@ procedure TNNetQuaternionConv.BackpropagateCPU();
 var
   ox, oy, oq, fx, fy, iq, tapBase, oBase: integer;
   prevX, prevY: integer;
+  outSizeXMax, outSizeYMax, outQMax, featSizeXMax, featSizeYMax, inQMax: integer;
   a, b, c, d: TNeuralFloat;
   e0, e1, e2, e3, lr: TNeuralFloat;
   WDelta, BiasDelta, PrevOut: TNNetVolume;
@@ -66373,10 +66418,16 @@ begin
   prevSizeX := PrevOut.SizeX;
   prevSizeY := PrevOut.SizeY;
   lr := -FLearningRate;
-  for oy := 0 to FOutputSizeY - 1 do
-  for ox := 0 to FOutputSizeX - 1 do
+  outSizeXMax := FOutputSizeX - 1;
+  outSizeYMax := FOutputSizeY - 1;
+  outQMax := FOutQuaternions - 1;
+  featSizeXMax := FFeatureSizeX - 1;
+  featSizeYMax := FFeatureSizeY - 1;
+  inQMax := FInQuaternions - 1;
+  for oy := 0 to outSizeYMax do
+  for ox := 0 to outSizeXMax do
   begin
-    for oq := 0 to FOutQuaternions - 1 do
+    for oq := 0 to outQMax do
     begin
       oBase := oq * 4;
       e0 := lr * FOutputError.Get(ox, oy, oBase + 0);
@@ -66392,15 +66443,15 @@ begin
       end;
       if (e0 = 0) and (e1 = 0) and (e2 = 0) and (e3 = 0) then continue;
       WDelta := FArrNeurons[oq].FDelta;
-      for fy := 0 to FFeatureSizeY - 1 do
+      for fy := 0 to featSizeYMax do
       begin
         prevY := oy * FStride + fy - FPadding;
         if (prevY < 0) or (prevY >= prevSizeY) then continue;
-        for fx := 0 to FFeatureSizeX - 1 do
+        for fx := 0 to featSizeXMax do
         begin
           prevX := ox * FStride + fx - FPadding;
           if (prevX < 0) or (prevX >= prevSizeX) then continue;
-          for iq := 0 to FInQuaternions - 1 do
+          for iq := 0 to inQMax do
           begin
             tapBase := ((fy * FFeatureSizeX + fx) * FInQuaternions + iq) * 4;
             a := PrevOut.Get(prevX, prevY, iq*4 + 0);
@@ -66448,6 +66499,7 @@ end;
 procedure TNNetComplexConv.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
   InDepth, OutDepth, oc, taps: integer;
+  outCMax: integer;
 begin
   InDepth := pPrevLayer.Output.Depth;
   OutDepth := FNeurons.Count; // numFeatures requested in Create
@@ -66468,6 +66520,7 @@ begin
 
   FInComplex := InDepth div 2;
   FOutComplex := OutDepth div 2;
+  outCMax := FOutComplex - 1;
   // Each block-row neuron oc holds (FeatureSizeX*FeatureSizeY*InC) complex
   // taps of 2 reals each, laid out contiguously.
   taps := FFeatureSizeX * FFeatureSizeY * FInComplex * 2;
@@ -66477,7 +66530,7 @@ begin
   while FNeurons.Count < FOutComplex + 1 do
     FNeurons.Add(TNNetNeuron.Create());
 
-  for oc := 0 to FOutComplex - 1 do
+  for oc := 0 to outCMax do
   begin
     FNeurons[oc].Weights.ReSize(taps, 1, 1);
     FNeurons[oc].BackInertia.ReSize(taps, 1, 1);
@@ -66506,16 +66559,19 @@ end;
 procedure TNNetComplexConv.InitDefault();
 var
   oc, t, base, numTaps: integer;
+  outCMax, numTapsMax: integer;
   scale: TNeuralFloat;
   W: TNNetVolume;
 begin
   if FOutComplex <= 0 then exit;
   numTaps := FFeatureSizeX * FFeatureSizeY * FInComplex;
   scale := Sqrt(2.0 / (numTaps * 2 + 1));
-  for oc := 0 to FOutComplex - 1 do
+  outCMax := FOutComplex - 1;
+  numTapsMax := numTaps - 1;
+  for oc := 0 to outCMax do
   begin
     W := FArrNeurons[oc].FWeights;
-    for t := 0 to numTaps - 1 do
+    for t := 0 to numTapsMax do
     begin
       base := t * 2;
       W.FData[base + 0] := scale * (Random - 0.5) * 2;          // real part a
@@ -66541,6 +66597,7 @@ procedure TNNetComplexConv.ComputeCPU();
 var
   ox, oy, oc, fx, fy, ic, tapBase, oBase, i, j: integer;
   prevX, prevY: integer;
+  outSizeXMax, outSizeYMax, outCMax, featSizeXMax, featSizeYMax, inCMax: integer;
   acc: TNeuralFloat;
   x: array[0..1] of TNeuralFloat;
   y: array[0..1] of TNeuralFloat;
@@ -66551,22 +66608,28 @@ begin
   Bias := FArrNeurons[FOutComplex].FWeights;
   prevSizeX := PrevOut.SizeX;
   prevSizeY := PrevOut.SizeY;
-  for oy := 0 to FOutputSizeY - 1 do
-  for ox := 0 to FOutputSizeX - 1 do
+  outSizeXMax := FOutputSizeX - 1;
+  outSizeYMax := FOutputSizeY - 1;
+  outCMax := FOutComplex - 1;
+  featSizeXMax := FFeatureSizeX - 1;
+  featSizeYMax := FFeatureSizeY - 1;
+  inCMax := FInComplex - 1;
+  for oy := 0 to outSizeYMax do
+  for ox := 0 to outSizeXMax do
   begin
-    for oc := 0 to FOutComplex - 1 do
+    for oc := 0 to outCMax do
     begin
       W := FArrNeurons[oc].FWeights;
       for i := 0 to 1 do y[i] := 0;
-      for fy := 0 to FFeatureSizeY - 1 do
+      for fy := 0 to featSizeYMax do
       begin
         prevY := oy * FStride + fy - FPadding;
         if (prevY < 0) or (prevY >= prevSizeY) then continue;
-        for fx := 0 to FFeatureSizeX - 1 do
+        for fx := 0 to featSizeXMax do
         begin
           prevX := ox * FStride + fx - FPadding;
           if (prevX < 0) or (prevX >= prevSizeX) then continue;
-          for ic := 0 to FInComplex - 1 do
+          for ic := 0 to inCMax do
           begin
             tapBase := ((fy * FFeatureSizeX + fx) * FInComplex + ic) * 2;
             for j := 0 to 1 do
@@ -66615,6 +66678,7 @@ procedure TNNetComplexConv.ComputePreviousLayerErrorCPU();
 var
   ox, oy, oc, fx, fy, ic, tapBase, oBase, i, j: integer;
   prevX, prevY: integer;
+  outSizeXMax, outSizeYMax, outCMax, featSizeXMax, featSizeYMax, inCMax: integer;
   e: array[0..1] of TNeuralFloat;
   allZero: boolean;
   contrib: TNeuralFloat;
@@ -66625,10 +66689,16 @@ begin
   LocalPrevError := FPrevLayer.OutputError;
   prevSizeX := FPrevLayer.FOutput.SizeX;
   prevSizeY := FPrevLayer.FOutput.SizeY;
-  for oy := 0 to FOutputSizeY - 1 do
-  for ox := 0 to FOutputSizeX - 1 do
+  outSizeXMax := FOutputSizeX - 1;
+  outSizeYMax := FOutputSizeY - 1;
+  outCMax := FOutComplex - 1;
+  featSizeXMax := FFeatureSizeX - 1;
+  featSizeYMax := FFeatureSizeY - 1;
+  inCMax := FInComplex - 1;
+  for oy := 0 to outSizeYMax do
+  for ox := 0 to outSizeXMax do
   begin
-    for oc := 0 to FOutComplex - 1 do
+    for oc := 0 to outCMax do
     begin
       oBase := oc * 2;
       allZero := True;
@@ -66639,15 +66709,15 @@ begin
       end;
       if allZero then continue;
       W := FArrNeurons[oc].FWeights;
-      for fy := 0 to FFeatureSizeY - 1 do
+      for fy := 0 to featSizeYMax do
       begin
         prevY := oy * FStride + fy - FPadding;
         if (prevY < 0) or (prevY >= prevSizeY) then continue;
-        for fx := 0 to FFeatureSizeX - 1 do
+        for fx := 0 to featSizeXMax do
         begin
           prevX := ox * FStride + fx - FPadding;
           if (prevX < 0) or (prevX >= prevSizeX) then continue;
-          for ic := 0 to FInComplex - 1 do
+          for ic := 0 to inCMax do
           begin
             tapBase := ((fy * FFeatureSizeX + fx) * FInComplex + ic) * 2;
             for j := 0 to 1 do
@@ -66671,6 +66741,7 @@ procedure TNNetComplexConv.BackpropagateCPU();
 var
   ox, oy, oc, fx, fy, ic, tapBase, oBase, i, j: integer;
   prevX, prevY: integer;
+  outSizeXMax, outSizeYMax, outCMax, featSizeXMax, featSizeYMax, inCMax: integer;
   x: array[0..1] of TNeuralFloat;
   e: array[0..1] of TNeuralFloat;
   allZero: boolean;
@@ -66683,10 +66754,16 @@ begin
   prevSizeX := PrevOut.SizeX;
   prevSizeY := PrevOut.SizeY;
   lr := -FLearningRate;
-  for oy := 0 to FOutputSizeY - 1 do
-  for ox := 0 to FOutputSizeX - 1 do
+  outSizeXMax := FOutputSizeX - 1;
+  outSizeYMax := FOutputSizeY - 1;
+  outCMax := FOutComplex - 1;
+  featSizeXMax := FFeatureSizeX - 1;
+  featSizeYMax := FFeatureSizeY - 1;
+  inCMax := FInComplex - 1;
+  for oy := 0 to outSizeYMax do
+  for ox := 0 to outSizeXMax do
   begin
-    for oc := 0 to FOutComplex - 1 do
+    for oc := 0 to outCMax do
     begin
       oBase := oc * 2;
       allZero := True;
@@ -66700,15 +66777,15 @@ begin
           BiasDelta.FData[oBase + i] := BiasDelta.FData[oBase + i] + e[i];
       if allZero then continue;
       WDelta := FArrNeurons[oc].FDelta;
-      for fy := 0 to FFeatureSizeY - 1 do
+      for fy := 0 to featSizeYMax do
       begin
         prevY := oy * FStride + fy - FPadding;
         if (prevY < 0) or (prevY >= prevSizeY) then continue;
-        for fx := 0 to FFeatureSizeX - 1 do
+        for fx := 0 to featSizeXMax do
         begin
           prevX := ox * FStride + fx - FPadding;
           if (prevX < 0) or (prevX >= prevSizeX) then continue;
-          for ic := 0 to FInComplex - 1 do
+          for ic := 0 to inCMax do
           begin
             tapBase := ((fy * FFeatureSizeX + fx) * FInComplex + ic) * 2;
             for j := 0 to 1 do
@@ -66750,6 +66827,7 @@ end;
 procedure TNNetOctonionConv.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
   InDepth, OutDepth, oo, taps: integer;
+  outOMax: integer;
 begin
   InDepth := pPrevLayer.Output.Depth;
   OutDepth := FNeurons.Count; // numFeatures requested in Create
@@ -66770,6 +66848,7 @@ begin
 
   FInOctonions := InDepth div 8;
   FOutOctonions := OutDepth div 8;
+  outOMax := FOutOctonions - 1;
   // Each block-row neuron oo holds (FeatureSizeX*FeatureSizeY*InO) octonion
   // taps of 8 reals each, laid out contiguously.
   taps := FFeatureSizeX * FFeatureSizeY * FInOctonions * 8;
@@ -66779,7 +66858,7 @@ begin
   while FNeurons.Count < FOutOctonions + 1 do
     FNeurons.Add(TNNetNeuron.Create());
 
-  for oo := 0 to FOutOctonions - 1 do
+  for oo := 0 to outOMax do
   begin
     FNeurons[oo].Weights.ReSize(taps, 1, 1);
     FNeurons[oo].BackInertia.ReSize(taps, 1, 1);
@@ -66808,16 +66887,19 @@ end;
 procedure TNNetOctonionConv.InitDefault();
 var
   oo, t, base, c, numTaps: integer;
+  outOMax, numTapsMax: integer;
   scale: TNeuralFloat;
   W: TNNetVolume;
 begin
   if FOutOctonions <= 0 then exit;
   numTaps := FFeatureSizeX * FFeatureSizeY * FInOctonions;
   scale := Sqrt(2.0 / (numTaps * 8 + 1));
-  for oo := 0 to FOutOctonions - 1 do
+  outOMax := FOutOctonions - 1;
+  numTapsMax := numTaps - 1;
+  for oo := 0 to outOMax do
   begin
     W := FArrNeurons[oo].FWeights;
-    for t := 0 to numTaps - 1 do
+    for t := 0 to numTapsMax do
     begin
       base := t * 8;
       W.FData[base + 0] := scale * (Random - 0.5) * 2;          // real part o0
@@ -66844,6 +66926,7 @@ procedure TNNetOctonionConv.ComputeCPU();
 var
   ox, oy, oo, fx, fy, io, tapBase, oBase, i, j: integer;
   prevX, prevY: integer;
+  outSizeYMax: integer;
   acc: TNeuralFloat;
   x: array[0..7] of TNeuralFloat;
   y: array[0..7] of TNeuralFloat;
@@ -66854,7 +66937,8 @@ begin
   Bias := FArrNeurons[FOutOctonions].FWeights;
   prevSizeX := PrevOut.SizeX;
   prevSizeY := PrevOut.SizeY;
-  for oy := 0 to FOutputSizeY - 1 do
+  outSizeYMax := FOutputSizeY - 1;
+  for oy := 0 to outSizeYMax do
   for ox := 0 to FOutputSizeX - 1 do
   begin
     for oo := 0 to FOutOctonions - 1 do
