@@ -29385,7 +29385,7 @@ begin
     OutPtr := FOutput.GetRawPtr(i, 0, 0);
     for d := 0 to DkM1 do
       OutPtr^[d] := 0;
-    for j := 0 to SeqLen - 1 do
+    for j := 0 to SeqLenM1 do
       TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
         FAttn[j, i, 0], FDk);
   end;
@@ -29396,6 +29396,7 @@ procedure TNNetDisentangledAttention.Backpropagate();
 var
   StartTime: double;
   SeqLen, i, j, kk: integer;
+  SeqLenM1: integer;
   Prev, PrevErr, PosK, PosQ, dPosK, dPosQ: TNNetVolume;
   dAttn, dScore: array of TNeuralFloat;
   SumDAttnAttn, A, dS, g: TNeuralFloat;
@@ -29413,12 +29414,13 @@ begin
   dPosK := FNeurons[0].FDelta;
   dPosQ := FNeurons[1].FDelta;
   SeqLen := Prev.SizeX;
+  SeqLenM1 := SeqLen - 1;
   SetLength(dAttn, SeqLen);
   SetLength(dScore, SeqLen);
-  for i := 0 to SeqLen - 1 do
+  for i := 0 to SeqLenM1 do
   begin
     // ---- dV and dAttn (identical to the parent) ----
-    for j := 0 to SeqLen - 1 do
+    for j := 0 to SeqLenM1 do
     begin
       A := FAttn[j, i, 0];
       if (FPrevLayer.Output.Size > 0) and
@@ -29430,15 +29432,15 @@ begin
     end;
     // ---- softmax Jacobian -> dScore ----
     SumDAttnAttn := 0;
-    for kk := 0 to SeqLen - 1 do
+    for kk := 0 to SeqLenM1 do
       SumDAttnAttn := SumDAttnAttn + dAttn[kk] * FAttn[kk, i, 0];
-    for j := 0 to SeqLen - 1 do
+    for j := 0 to SeqLenM1 do
       dScore[j] := FAttn[j, i, 0] * (dAttn[j] - SumDAttnAttn);
     // ---- scatter dScore into Q^c, K^c, K^r, Q^r ----
     // score[i,j] = (Qc_i.Kc_j + Qc_i.Kr_a + Kc_j.Qr_b) * FInvSqrtScaled.
     //   dQc_i += g*(Kc_j + Kr_a);  dKc_j += g*(Qc_i + Qr_b);
     //   dKr_a += g*Qc_i;           dQr_b += g*Kc_j.   (g = dScore*FInvSqrtScaled)
-    for j := 0 to SeqLen - 1 do
+    for j := 0 to SeqLenM1 do
     begin
       g := dScore[j] * FInvSqrtScaled;
       if g = 0 then continue;
@@ -29526,6 +29528,7 @@ const
 var
   StartTime: double;
   SeqLen, i, j, d: integer;
+  SeqLenM1, FDkM1: integer;
   Score, MaxScore, SumExp: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr: TNeuralFloatArrPtr;
@@ -29538,13 +29541,15 @@ begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
+  SeqLenM1 := SeqLen - 1;
+  FDkM1 := FDk - 1;
   // Same forward as the parent except that the fixed linear position bias
   // Slope*(j-i) is ADDED to every unmasked scaled logit (masked logits keep
   // the -1e9 sentinel so masked positions stay masked).
-  for i := 0 to SeqLen - 1 do
+  for i := 0 to SeqLenM1 do
   begin
     MaxScore := -1e30;
-    for j := 0 to SeqLen - 1 do
+    for j := 0 to SeqLenM1 do
     begin
       if (FCausal and (j > i)) or ((FWindow > 0) and (i - j >= FWindow)) then
       begin
@@ -29562,26 +29567,26 @@ begin
     // Softmax with the parent's all-masked-row policy (zero row, no NaN).
     if MaxScore <= cMaskFloor then
     begin
-      for j := 0 to SeqLen - 1 do
+      for j := 0 to SeqLenM1 do
         FAttn[j, i, 0] := 0;
     end
     else
     begin
       SumExp := 0;
-      for j := 0 to SeqLen - 1 do
+      for j := 0 to SeqLenM1 do
       begin
         Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
         FAttn[j, i, 0] := Score;
         SumExp := SumExp + Score;
       end;
       if SumExp > 0 then
-        for j := 0 to SeqLen - 1 do
+        for j := 0 to SeqLenM1 do
           FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
     end;
     OutPtr := FOutput.GetRawPtr(i, 0, 0);
-    for d := 0 to FDk - 1 do
+    for d := 0 to FDkM1 do
       OutPtr^[d] := 0;
-    for j := 0 to SeqLen - 1 do
+    for j := 0 to SeqLenM1 do
       TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
         FAttn[j, i, 0], FDk);
   end;
@@ -29596,6 +29601,7 @@ procedure TNNetALiBiAttention.ComputeIncrementalALiBi();
 var
   StartTime: double;
   SeqLen, p, j, d, jStart, QPos: integer;
+  SeqLenM1, FDkM1, CacheLenM1: integer;
   Score, MaxScore, SumExp: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr: TNeuralFloatArrPtr;
@@ -29603,6 +29609,8 @@ begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
+  SeqLenM1 := SeqLen - 1;
+  FDkM1 := FDk - 1;
   if FCacheLen + SeqLen > FCacheMax then
   begin
     FErrorProc('TNNetALiBiAttention KV cache overflow: ' +
@@ -29610,7 +29618,7 @@ begin
       IntToStr(FCacheMax) + '. Call ResetCache or raise MaxContext.');
     exit;
   end;
-  for p := 0 to SeqLen - 1 do
+  for p := 0 to SeqLenM1 do
   begin
     Move(Prev.GetRawPtr(p, 0, FDk)^, FKCache.GetRawPtr(FCacheLen, 0, 0)^,
       FDk * SizeOf(TNeuralFloat));
@@ -29622,8 +29630,9 @@ begin
       jStart := FCacheLen - FWindow
     else
       jStart := 0;
+    CacheLenM1 := FCacheLen - 1;
     MaxScore := -1e30;
-    for j := jStart to FCacheLen - 1 do
+    for j := jStart to CacheLenM1 do
     begin
       // Cached keys are all at or before the query (j <= QPos), exactly the
       // pairs the full forward leaves unmasked.
@@ -29634,17 +29643,17 @@ begin
       if Score > MaxScore then MaxScore := Score;
     end;
     SumExp := 0;
-    for j := jStart to FCacheLen - 1 do
+    for j := jStart to CacheLenM1 do
     begin
       Score := pcr_expf(FCacheScores[j] - MaxScore);
       FCacheScores[j] := Score;
       SumExp := SumExp + Score;
     end;
     OutPtr := FOutput.GetRawPtr(p, 0, 0);
-    for d := 0 to FDk - 1 do
+    for d := 0 to FDkM1 do
       OutPtr^[d] := 0;
     if SumExp > 0 then
-      for j := jStart to FCacheLen - 1 do
+      for j := jStart to CacheLenM1 do
         TNNetVolume.MulAdd(OutPtr, FVCache.GetRawPtr(j, 0, 0),
           FCacheScores[j] / SumExp, FDk);
   end;
@@ -29698,6 +29707,7 @@ end;
 procedure TNNetWindowAttention.SetBiasMatrix(const Bias: TNNetVolume);
 var
   i: integer;
+  BiasMaxIdx: integer;
 begin
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   SetNumWeightsForAllNeurons(1, 1, FSeqLen * FSeqLen);
@@ -29705,7 +29715,8 @@ begin
     FErrorProc('TNNetWindowAttention.SetBiasMatrix expects ' +
       IntToStr(FSeqLen * FSeqLen) + ' values, got ' + IntToStr(Bias.Size) +
       '.');
-  for i := 0 to FSeqLen * FSeqLen - 1 do
+  BiasMaxIdx := FSeqLen * FSeqLen - 1;
+  for i := 0 to BiasMaxIdx do
     FNeurons[0].FWeights.FData[i] := Bias.FData[i];
   AfterWeightUpdate();
 end;
@@ -29721,6 +29732,7 @@ const
 var
   StartTime: double;
   SeqN, i, j, d: integer;
+  SeqNM1, FDkM1: integer;
   Score, MaxScore, SumExp: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr, Bias, BiasRow: TNeuralFloatArrPtr;
@@ -29728,17 +29740,19 @@ begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqN := Prev.SizeX;
+  SeqNM1 := SeqN - 1;
+  FDkM1 := FDk - 1;
   Bias := FNeurons[0].FWeights.GetRawPtr(0, 0, 0);
   // Same forward as the parent except that the fixed (query,key) bias matrix
   // (relative-position bias plus optional cyclic-shift mask) is ADDED to every
   // scaled logit. The shift mask is baked into Bias as a large negative value
   // for cross-region pairs, so masked positions are handled by the bias itself
   // (and the parent's all-masked-row policy still applies).
-  for i := 0 to SeqN - 1 do
+  for i := 0 to SeqNM1 do
   begin
     BiasRow := @Bias^[i * SeqN];
     MaxScore := -1e30;
-    for j := 0 to SeqN - 1 do
+    for j := 0 to SeqNM1 do
     begin
       Score := TNNetVolume.DotProduct(
         Prev.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, FDk), FDk);
@@ -29748,26 +29762,26 @@ begin
     end;
     if MaxScore <= cMaskFloor then
     begin
-      for j := 0 to SeqN - 1 do
+      for j := 0 to SeqNM1 do
         FAttn[j, i, 0] := 0;
     end
     else
     begin
       SumExp := 0;
-      for j := 0 to SeqN - 1 do
+      for j := 0 to SeqNM1 do
       begin
         Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
         FAttn[j, i, 0] := Score;
         SumExp := SumExp + Score;
       end;
       if SumExp > 0 then
-        for j := 0 to SeqN - 1 do
+        for j := 0 to SeqNM1 do
           FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
     end;
     OutPtr := FOutput.GetRawPtr(i, 0, 0);
-    for d := 0 to FDk - 1 do
+    for d := 0 to FDkM1 do
       OutPtr^[d] := 0;
-    for j := 0 to SeqN - 1 do
+    for j := 0 to SeqNM1 do
       TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
         FAttn[j, i, 0], FDk);
   end;
@@ -29929,6 +29943,7 @@ end;
 procedure TNNetSAMVisionAttention.SetRelPos(const RelH, RelW: TNNetVolume);
 var
   Lh, Lw, hd, i, c: integer;
+  LhM1, LwM1, hdM1: integer;
 begin
   // RelH: (2H-1, HeadDim), RelW: (2W-1, HeadDim). Packed into one neuron:
   // rows [0..Lh-1] = rel_pos_h, rows [Lh..Lh+Lw-1] = rel_pos_w, width HeadDim.
@@ -29937,12 +29952,15 @@ begin
   Lh := RelH.Size div FHeadDim;
   Lw := RelW.Size div FHeadDim;
   hd := FHeadDim;
+  LhM1 := Lh - 1;
+  LwM1 := Lw - 1;
+  hdM1 := hd - 1;
   FNeurons[4].FWeights.ReSize(hd, 1, Lh + Lw);
-  for i := 0 to Lh - 1 do
-    for c := 0 to hd - 1 do
+  for i := 0 to LhM1 do
+    for c := 0 to hdM1 do
       FNeurons[4].FWeights.FData[i * hd + c] := RelH.FData[i * hd + c];
-  for i := 0 to Lw - 1 do
-    for c := 0 to hd - 1 do
+  for i := 0 to LwM1 do
+    for c := 0 to hdM1 do
       FNeurons[4].FWeights.FData[(Lh + i) * hd + c] := RelW.FData[i * hd + c];
   // Persist Lh so Compute can locate the rel_pos_w block; Lh = 2H-1.
   FStruct[4] := Lh;
@@ -29956,6 +29974,8 @@ var
   H, W, padH, padW, nWy, nWx, ws: integer;
   wy, wx, ty, tx, gy, gx, tok, winTok, head, hOfs: integer;
   i, j, c, d, qi, qj, ki, kj, dh, dw, Lh: integer;
+  HM1, WM1, FChannelsM1, ThreeChanM1, FHeadDimM1: integer;
+  FWindowSizeM1, FHeadsM1, nWyM1, nWxM1, gyM1, gxM1, winTokM1: integer;
   QkvW, QkvB, ProjW, ProjB, RelP: TNNetVolume;
   Score, MaxScore, SumExp, acc, biasH, biasW: TNeuralFloat;
   QPtr, KPtr, OutP: TNeuralFloatArrPtr;
@@ -29968,6 +29988,12 @@ begin
   // (slow). So image HEIGHT (row) = SizeY and WIDTH (col) = SizeX, and a token
   // is accessed as GetRawPtr(col, row).
   H := Prev.SizeY; W := Prev.SizeX;
+  HM1 := H - 1; WM1 := W - 1;
+  FChannelsM1 := FChannels - 1;
+  ThreeChanM1 := 3 * FChannels - 1;
+  FHeadDimM1 := FHeadDim - 1;
+  FWindowSizeM1 := FWindowSize - 1;
+  FHeadsM1 := FHeads - 1;
   QkvW := FNeurons[0].FWeights; QkvB := FNeurons[1].FWeights;
   ProjW := FNeurons[2].FWeights; ProjB := FNeurons[3].FWeights;
   RelP := FNeurons[4].FWeights;
@@ -29983,29 +30009,30 @@ begin
   begin
     padH := H; padW := W; ws := 0; nWy := 1; nWx := 1;
   end;
+  nWyM1 := nWy - 1; nWxM1 := nWx - 1;
   // Iterate windows. winTok tokens per window arranged row-major (ws x ws),
   // or (H x W) for a global block.
-  for wy := 0 to nWy - 1 do
-   for wx := 0 to nWx - 1 do
+  for wy := 0 to nWyM1 do
+   for wx := 0 to nWxM1 do
    begin
     if FWindowSize > 0 then
     begin
       winTok := FWindowSize * FWindowSize;
       // Build q/k/v for this window. Padded (out-of-grid) tokens contribute a
       // zero input row -> qkv = bias only (matches HF F.pad zero padding).
-      for ty := 0 to FWindowSize - 1 do
-       for tx := 0 to FWindowSize - 1 do
+      for ty := 0 to FWindowSizeM1 do
+       for tx := 0 to FWindowSizeM1 do
        begin
         tok := ty * FWindowSize + tx;
         gy := wy * FWindowSize + ty;
         gx := wx * FWindowSize + tx;
-        for d := 0 to 3 * FChannels - 1 do
+        for d := 0 to ThreeChanM1 do
         begin
           acc := QkvB.FData[d];
           if (gy < H) and (gx < W) then
           begin
             QPtr := Prev.GetRawPtr(gx, gy, 0); // (col=X, row=Y)
-            for c := 0 to FChannels - 1 do
+            for c := 0 to FChannelsM1 do
               acc := acc + QkvW.FData[d * FChannels + c] * QPtr^[c];
           end;
           if d < FChannels then FQ.FData[tok * FChannels + d] := acc
@@ -30018,15 +30045,15 @@ begin
     else
     begin
       winTok := H * W;
-      for gy := 0 to H - 1 do
-       for gx := 0 to W - 1 do
+      for gy := 0 to HM1 do
+       for gx := 0 to WM1 do
        begin
         tok := gy * W + gx;
         QPtr := Prev.GetRawPtr(gx, gy, 0); // (col=X, row=Y)
-        for d := 0 to 3 * FChannels - 1 do
+        for d := 0 to ThreeChanM1 do
         begin
           acc := QkvB.FData[d];
-          for c := 0 to FChannels - 1 do
+          for c := 0 to FChannelsM1 do
             acc := acc + QkvW.FData[d * FChannels + c] * QPtr^[c];
           if d < FChannels then FQ.FData[tok * FChannels + d] := acc
           else if d < 2 * FChannels then
@@ -30038,30 +30065,32 @@ begin
     // window grid dims (square ws or H x W)
     if FWindowSize > 0 then begin gy := FWindowSize; gx := FWindowSize; end
     else begin gy := H; gx := W; end;
+    winTokM1 := winTok - 1;
+    gyM1 := gy - 1; gxM1 := gx - 1;
     // Per-head scaled dot-product attention with decomposed rel-pos.
-    for head := 0 to FHeads - 1 do
+    for head := 0 to FHeadsM1 do
     begin
       hOfs := head * FHeadDim;
-      for qi := 0 to gy - 1 do
-       for qj := 0 to gx - 1 do
+      for qi := 0 to gyM1 do
+       for qj := 0 to gxM1 do
        begin
         i := qi * gx + qj;
         QPtr := @FQ.FData[i * FChannels + hOfs];
         MaxScore := -1e30;
-        for ki := 0 to gy - 1 do
-         for kj := 0 to gx - 1 do
+        for ki := 0 to gyM1 do
+         for kj := 0 to gxM1 do
          begin
           j := ki * gx + kj;
           KPtr := @FK.FData[j * FChannels + hOfs];
           Score := 0;
-          for d := 0 to FHeadDim - 1 do
+          for d := 0 to FHeadDimM1 do
             Score := Score + QPtr^[d] * KPtr^[d];
           Score := Score * FInvSqrtHd;
           // decomposed rel-pos bias: Q . rel_pos_h[dh] + Q . rel_pos_w[dw]
           dh := qi - ki + (gy - 1);
           dw := qj - kj + (gx - 1);
           biasH := 0; biasW := 0;
-          for d := 0 to FHeadDim - 1 do
+          for d := 0 to FHeadDimM1 do
           begin
             biasH := biasH + QPtr^[d] * RelP.FData[dh * FHeadDim + d];
             biasW := biasW + QPtr^[d] * RelP.FData[(Lh + dw) * FHeadDim + d];
@@ -30071,19 +30100,19 @@ begin
           if Score > MaxScore then MaxScore := Score;
          end;
         SumExp := 0;
-        for j := 0 to winTok - 1 do
+        for j := 0 to winTokM1 do
         begin
           Score := pcr_expf(FAttn.FData[j] - MaxScore);
           FAttn.FData[j] := Score;
           SumExp := SumExp + Score;
         end;
-        for d := 0 to FHeadDim - 1 do
+        for d := 0 to FHeadDimM1 do
           FCtx.FData[i * FChannels + hOfs + d] := 0;
-        for j := 0 to winTok - 1 do
+        for j := 0 to winTokM1 do
         begin
           Score := FAttn.FData[j] / SumExp;
           KPtr := @FV.FData[j * FChannels + hOfs];
-          for d := 0 to FHeadDim - 1 do
+          for d := 0 to FHeadDimM1 do
             FCtx.FData[i * FChannels + hOfs + d] :=
               FCtx.FData[i * FChannels + hOfs + d] + Score * KPtr^[d];
         end;
@@ -30092,18 +30121,18 @@ begin
     // Output projection per token, scatter back to grid (skip padded tokens).
     if FWindowSize > 0 then
     begin
-      for ty := 0 to FWindowSize - 1 do
-       for tx := 0 to FWindowSize - 1 do
+      for ty := 0 to FWindowSizeM1 do
+       for tx := 0 to FWindowSizeM1 do
        begin
         gy := wy * FWindowSize + ty;
         gx := wx * FWindowSize + tx;
         if (gy >= H) or (gx >= W) then continue;
         tok := ty * FWindowSize + tx;
         OutP := FOutput.GetRawPtr(gx, gy, 0); // (col=X, row=Y)
-        for d := 0 to FChannels - 1 do
+        for d := 0 to FChannelsM1 do
         begin
           acc := ProjB.FData[d];
-          for c := 0 to FChannels - 1 do
+          for c := 0 to FChannelsM1 do
             acc := acc + ProjW.FData[d * FChannels + c] *
               FCtx.FData[tok * FChannels + c];
           OutP^[d] := acc;
@@ -30112,15 +30141,15 @@ begin
     end
     else
     begin
-      for gy := 0 to H - 1 do
-       for gx := 0 to W - 1 do
+      for gy := 0 to HM1 do
+       for gx := 0 to WM1 do
        begin
         tok := gy * W + gx;
         OutP := FOutput.GetRawPtr(gx, gy, 0); // (col=X, row=Y)
-        for d := 0 to FChannels - 1 do
+        for d := 0 to FChannelsM1 do
         begin
           acc := ProjB.FData[d];
-          for c := 0 to FChannels - 1 do
+          for c := 0 to FChannelsM1 do
             acc := acc + ProjW.FData[d * FChannels + c] *
               FCtx.FData[tok * FChannels + c];
           OutP^[d] := acc;
@@ -30167,6 +30196,7 @@ end;
 procedure TNNetSinkAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
   s, d: integer;
+  FNumSinksM1, FDkM1: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
   // 2*K trainable sink slots: neurons 0..K-1 = sink keys, K..2K-1 = sink
@@ -30175,9 +30205,11 @@ begin
   if FNeurons.Count < 2 * FNumSinks then AddMissingNeurons(2 * FNumSinks);
   SetNumWeightsForAllNeurons(1, 1, FDk);
   // Initialise sink keys to small random values and sink values to zeros.
-  for s := 0 to FNumSinks - 1 do
+  FNumSinksM1 := FNumSinks - 1;
+  FDkM1 := FDk - 1;
+  for s := 0 to FNumSinksM1 do
   begin
-    for d := 0 to FDk - 1 do
+    for d := 0 to FDkM1 do
       FNeurons[s].FWeights.Raw[d] := (Random - 0.5) * 0.02;     // sink key
     FNeurons[FNumSinks + s].FWeights.Fill(0);                   // sink value
   end;
@@ -30191,6 +30223,7 @@ procedure TNNetSinkAttention.Compute();
 var
   StartTime: double;
   SeqLen, AugLen, i, j, s, d: integer;
+  SeqLenM1, AugLenM1, FNumSinksM1, FDkM1: integer;
   Score, MaxScore, SumExp: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr: TNeuralFloatArrPtr;
@@ -30199,15 +30232,19 @@ begin
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   AugLen := FNumSinks + SeqLen;
+  SeqLenM1 := SeqLen - 1;
+  AugLenM1 := AugLen - 1;
+  FNumSinksM1 := FNumSinks - 1;
+  FDkM1 := FDk - 1;
   // For each query row i: scores over [sinks ++ real keys], softmax, then a
   // weighted sum over [sink values ++ real V].
-  for i := 0 to SeqLen - 1 do
+  for i := 0 to SeqLenM1 do
   begin
     MaxScore := -1e30;
     // 1a) Sink scores (never masked): FSinkAttn[s, i, 0], s in 0..K-1. Depth is
     // contiguous (Q at GetRawPtr(i,0,0), sink key in FWeights), so each score is
     // an AVX dot product over FDk floats.
-    for s := 0 to FNumSinks - 1 do
+    for s := 0 to FNumSinksM1 do
     begin
       Score := TNNetVolume.DotProduct(
         Prev.GetRawPtr(i, 0, 0), FNeurons[s].FWeights.GetRawPtr(0, 0, 0), FDk);
@@ -30217,7 +30254,7 @@ begin
     end;
     // 1b) Real-key scores into FSinkAttn[K + j, i, 0], with causal mask.
     // score = Q[i] . K[j] is an AVX dot product (K at GetRawPtr(j,0,FDk)).
-    for j := 0 to SeqLen - 1 do
+    for j := 0 to SeqLenM1 do
     begin
       if FCausal and (j > i) then
       begin
@@ -30235,26 +30272,26 @@ begin
     end;
     // 2) Softmax over the augmented row (numerically stable).
     SumExp := 0;
-    for j := 0 to AugLen - 1 do
+    for j := 0 to AugLenM1 do
     begin
       Score := pcr_expf(FSinkAttn[j, i, 0] - MaxScore);
       FSinkAttn[j, i, 0] := Score;
       SumExp := SumExp + Score;
     end;
     if SumExp > 0 then
-      for j := 0 to AugLen - 1 do
+      for j := 0 to AugLenM1 do
         FSinkAttn[j, i, 0] := FSinkAttn[j, i, 0] / SumExp;
     // 3) Output[i, d] = sum_s w_sink[s]*SinkValue[s,d] + sum_j w_real[j]*V[j,d].
     // Sink values and V are contiguous along depth, so accumulate s-outer then
     // j-outer with AVX MulAdd over FDk floats into the zeroed output row (the
     // old d-outer order was strided over the value source and not vectorizable).
     OutPtr := FOutput.GetRawPtr(i, 0, 0);
-    for d := 0 to FDk - 1 do
+    for d := 0 to FDkM1 do
       OutPtr^[d] := 0;
-    for s := 0 to FNumSinks - 1 do
+    for s := 0 to FNumSinksM1 do
       TNNetVolume.MulAdd(OutPtr, FNeurons[FNumSinks + s].FWeights.GetRawPtr(0, 0, 0),
         FSinkAttn[s, i, 0], FDk);
-    for j := 0 to SeqLen - 1 do
+    for j := 0 to SeqLenM1 do
       TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
         FSinkAttn[FNumSinks + j, i, 0], FDk);
   end;
@@ -30265,6 +30302,7 @@ procedure TNNetSinkAttention.Backpropagate();
 var
   StartTime: double;
   SeqLen, AugLen, i, j, k, s, d: integer;
+  SeqLenM1, AugLenM1, FNumSinksM1, FDkM1, TwoNumSinksM1: integer;
   Prev, PrevErr: TNNetVolume;
   dAttn: array of TNeuralFloat;     // dL/dw over the augmented key set
   dScore: array of TNeuralFloat;
@@ -30286,6 +30324,11 @@ begin
   hasInputGrad := (Prev.Size > 0) and (Prev.Size = PrevErr.Size);
   SeqLen := Prev.SizeX;
   AugLen := FNumSinks + SeqLen;
+  SeqLenM1 := SeqLen - 1;
+  AugLenM1 := AugLen - 1;
+  FNumSinksM1 := FNumSinks - 1;
+  FDkM1 := FDk - 1;
+  TwoNumSinksM1 := 2 * FNumSinks - 1;
   SetLength(dAttn, AugLen);
   SetLength(dScore, AugLen);
   gSinkKey := TNNetVolume.Create(FNumSinks, 1, FDk);
@@ -30293,7 +30336,7 @@ begin
   try
     gSinkKey.Fill(0);
     gSinkVal.Fill(0);
-    for i := 0 to SeqLen - 1 do
+    for i := 0 to SeqLenM1 do
     begin
       // ---- Gradients w.r.t the values (sink + real) and the weights w ----
       // Depth is contiguous: each dVal accumulation is an AVX MulAdd and each
@@ -30301,7 +30344,7 @@ begin
       OutErrPtr := FOutputError.GetRawPtr(i, 0, 0);
       // For sinks s: dSinkVal[s,d] += w_sink[s]*dOut[i,d];
       //              dAttn[s]      = sum_d dOut[i,d]*SinkVal[s,d]
-      for s := 0 to FNumSinks - 1 do
+      for s := 0 to FNumSinksM1 do
       begin
         A := FSinkAttn[s, i, 0];
         TNNetVolume.MulAdd(gSinkVal.GetRawPtr(s, 0, 0), OutErrPtr, A, FDk);
@@ -30310,7 +30353,7 @@ begin
       end;
       // For real keys j: dV[j,d] += w_real[j]*dOut[i,d];
       //                  dAttn[K+j] = sum_d dOut[i,d]*V[j,d]
-      for j := 0 to SeqLen - 1 do
+      for j := 0 to SeqLenM1 do
       begin
         A := FSinkAttn[FNumSinks + j, i, 0];
         if hasInputGrad then
@@ -30321,9 +30364,9 @@ begin
       // ---- Softmax Jacobian over the augmented row ----
       // dScore[m] = w[m] * (dAttn[m] - sum_k dAttn[k]*w[k])
       SumDAttnAttn := 0;
-      for k := 0 to AugLen - 1 do
+      for k := 0 to AugLenM1 do
         SumDAttnAttn := SumDAttnAttn + dAttn[k] * FSinkAttn[k, i, 0];
-      for j := 0 to AugLen - 1 do
+      for j := 0 to AugLenM1 do
         dScore[j] := FSinkAttn[j, i, 0] * (dAttn[j] - SumDAttnAttn);
       // Causal-masked real positions (j > i) have w ~ 0, so dScore ~ 0 there
       // already; no special handling needed.
@@ -30333,7 +30376,7 @@ begin
       //   dSinkKey[s,d]+= invSqrtDk * dScore[s] * Q[i,d]
       // Depth is contiguous: dQ[i] += dS*SinkKey[s] and dSinkKey[s] += dS*Q[i]
       // are AVX MulAdd over FDk floats.
-      for s := 0 to FNumSinks - 1 do
+      for s := 0 to FNumSinksM1 do
       begin
         dS := dScore[s] * FInvSqrtDk;
         if dS <> 0 then
@@ -30349,7 +30392,7 @@ begin
       //   dQ[i,d] += invSqrtDk * dScore[K+j] * K[j,d]
       //   dK[j,d] += invSqrtDk * dScore[K+j] * Q[i,d]
       // Both are AVX MulAdd over the contiguous FDk depth runs.
-      for j := 0 to SeqLen - 1 do
+      for j := 0 to SeqLenM1 do
       begin
         dS := dScore[FNumSinks + j] * FInvSqrtDk;
         if (dS <> 0) and hasInputGrad then
@@ -30363,8 +30406,8 @@ begin
     end;
     // ---- Flush sink-param gradients into neuron deltas (LR sign convention,
     // matching the other trainable layers: delta += -FLearningRate * grad). ----
-    for s := 0 to FNumSinks - 1 do
-      for d := 0 to FDk - 1 do
+    for s := 0 to FNumSinksM1 do
+      for d := 0 to FDkM1 do
       begin
         FNeurons[s].FDelta.Raw[d] :=
           FNeurons[s].FDelta.Raw[d] + (-FLearningRate) * gSinkKey[s, 0, d];
@@ -30377,7 +30420,7 @@ begin
   end;
   if (not FBatchUpdate) then
   begin
-    for s := 0 to 2 * FNumSinks - 1 do
+    for s := 0 to TwoNumSinksM1 do
       FNeurons[s].UpdateWeights(FInertia);
     AfterWeightUpdate();
   end;
@@ -30419,6 +30462,7 @@ procedure TNNetGptOssSinkAttention.Compute();
 var
   StartTime: double;
   SeqLen, i, j, d: integer;
+  SeqLenM1, FDkM1: integer;
   Score, MaxScore, SumExp, Sink: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr: TNeuralFloatArrPtr;
@@ -30426,13 +30470,15 @@ begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
+  SeqLenM1 := SeqLen - 1;
+  FDkM1 := FDk - 1;
   Sink := FNeurons[0].FWeights.Raw[0];
-  for i := 0 to SeqLen - 1 do
+  for i := 0 to SeqLenM1 do
   begin
     // 1) Scaled scores into FAttn[*, i, 0] over the real keys, then fold the
     //    sink logit into the running max for a numerically stable softmax.
     MaxScore := Sink;
-    for j := 0 to SeqLen - 1 do
+    for j := 0 to SeqLenM1 do
     begin
       if (FCausal and (j > i)) or
          ((FWindow > 0) and (i - j >= FWindow)) then
@@ -30451,20 +30497,20 @@ begin
     // 2) Softmax with the sink term in the denominator only (the sink column is
     //    never written into FAttn and contributes nothing to the output).
     SumExp := pcr_expf(Sink - MaxScore);
-    for j := 0 to SeqLen - 1 do
+    for j := 0 to SeqLenM1 do
     begin
       Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
       FAttn[j, i, 0] := Score;
       SumExp := SumExp + Score;
     end;
     if SumExp > 0 then
-      for j := 0 to SeqLen - 1 do
+      for j := 0 to SeqLenM1 do
         FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
     // 3) Output[i, d] = sum_j Attn[i,j] * V[j,d] (V contiguous along depth).
     OutPtr := FOutput.GetRawPtr(i, 0, 0);
-    for d := 0 to FDk - 1 do
+    for d := 0 to FDkM1 do
       OutPtr^[d] := 0;
-    for j := 0 to SeqLen - 1 do
+    for j := 0 to SeqLenM1 do
       TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
         FAttn[j, i, 0], FDk);
   end;
@@ -30475,6 +30521,7 @@ procedure TNNetGptOssSinkAttention.Backpropagate();
 var
   StartTime: double;
   SeqLen, i, j, k: integer;
+  SeqLenM1: integer;
   Prev, PrevErr: TNNetVolume;
   dAttn: array of TNeuralFloat;
   dScore: array of TNeuralFloat;
@@ -30490,14 +30537,15 @@ begin
   PrevErr := FPrevLayer.FOutputError;
   hasInputGrad := (Prev.Size > 0) and (Prev.Size = PrevErr.Size);
   SeqLen := Prev.SizeX;
+  SeqLenM1 := SeqLen - 1;
   SetLength(dAttn, SeqLen);
   SetLength(dScore, SeqLen);
   gSink := 0;
-  for i := 0 to SeqLen - 1 do
+  for i := 0 to SeqLenM1 do
   begin
     OutErrPtr := FOutputError.GetRawPtr(i, 0, 0);
     // dV[j] += Attn[i,j]*dOut[i];  dAttn[j] = dOut[i] . V[j]
-    for j := 0 to SeqLen - 1 do
+    for j := 0 to SeqLenM1 do
     begin
       A := FAttn[j, i, 0];
       if hasInputGrad then
@@ -30511,19 +30559,19 @@ begin
     // shared subtraction term and yields the sink-logit gradient.
     wSink := 1;
     SumDAttnAttn := 0;
-    for k := 0 to SeqLen - 1 do
+    for k := 0 to SeqLenM1 do
     begin
       SumDAttnAttn := SumDAttnAttn + dAttn[k] * FAttn[k, i, 0];
       wSink := wSink - FAttn[k, i, 0];
     end;
     if wSink < 0 then wSink := 0;
-    for j := 0 to SeqLen - 1 do
+    for j := 0 to SeqLenM1 do
       dScore[j] := FAttn[j, i, 0] * (dAttn[j] - SumDAttnAttn);
     // dL/ds for the sink column: w_sink * (0 - SumDAttnAttn).
     gSink := gSink + wSink * (-SumDAttnAttn);
     // dQ[i] / dK[j] from the real-key scores.
     if hasInputGrad then
-      for j := 0 to SeqLen - 1 do
+      for j := 0 to SeqLenM1 do
       begin
         dS := dScore[j] * FInvSqrtDk;
         if dS <> 0 then
@@ -30593,6 +30641,7 @@ procedure TNNetDifferentialAttention.Compute();
 var
   StartTime: double;
   SeqLen, i, j: integer;
+  SeqLenM1, FDkM1: integer;
   Score1, Score2, Max1, Max2, Sum1, Sum2, lambdaVal: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr: TNeuralFloatArrPtr;
@@ -30600,10 +30649,12 @@ begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
+  SeqLenM1 := SeqLen - 1;
+  FDkM1 := FDk - 1;
   lambdaVal := FNeurons[0].FWeights.Raw[0];
   // For each query row i: two scaled-score maps over the half-width sub-heads,
   // two softmaxes, then a weighted sum of the SHARED (full-width) V.
-  for i := 0 to SeqLen - 1 do
+  for i := 0 to SeqLenM1 do
   begin
     // 1) Scaled sub-head scores into FAttn[*,i,0] (map 1: Q1.K1) and
     //    FAttn2[*,i,0] (map 2: Q2.K2). Q1=Q[0..h-1], Q2=Q[h..d_k-1]; likewise K.
@@ -30613,7 +30664,7 @@ begin
     //    GetRawPtr(j,0,FDk+FHalfDk).
     Max1 := -1e30;
     Max2 := -1e30;
-    for j := 0 to SeqLen - 1 do
+    for j := 0 to SeqLenM1 do
     begin
       if FCausal and (j > i) then
       begin
@@ -30636,7 +30687,7 @@ begin
     // 2) Two numerically-stable softmaxes.
     Sum1 := 0;
     Sum2 := 0;
-    for j := 0 to SeqLen - 1 do
+    for j := 0 to SeqLenM1 do
     begin
       Score1 := pcr_expf(FAttn[j, i, 0] - Max1);
       FAttn[j, i, 0] := Score1;
@@ -30646,16 +30697,16 @@ begin
       Sum2 := Sum2 + Score2;
     end;
     if Sum1 > 0 then
-      for j := 0 to SeqLen - 1 do FAttn[j, i, 0] := FAttn[j, i, 0] / Sum1;
+      for j := 0 to SeqLenM1 do FAttn[j, i, 0] := FAttn[j, i, 0] / Sum1;
     if Sum2 > 0 then
-      for j := 0 to SeqLen - 1 do FAttn2[j, i, 0] := FAttn2[j, i, 0] / Sum2;
+      for j := 0 to SeqLenM1 do FAttn2[j, i, 0] := FAttn2[j, i, 0] / Sum2;
     // 3) Output[i,d] = sum_j (Attn1[i,j] - lambdaVal*Attn2[i,j]) * V[j,d]. V is
     //    contiguous along depth, so accumulate j-outer with AVX MulAdd over FDk
     //    floats (the old d-outer / j-inner order was strided over j).
     OutPtr := FOutput.GetRawPtr(i, 0, 0);
-    for j := 0 to FDk - 1 do
+    for j := 0 to FDkM1 do
       OutPtr^[j] := 0;
-    for j := 0 to SeqLen - 1 do
+    for j := 0 to SeqLenM1 do
       TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
         FAttn[j, i, 0] - lambdaVal * FAttn2[j, i, 0], FDk);
   end;
@@ -30666,6 +30717,7 @@ procedure TNNetDifferentialAttention.Backpropagate();
 var
   StartTime: double;
   SeqLen, i, j, k: integer;
+  SeqLenM1: integer;
   Prev, PrevErr: TNNetVolume;
   dAttn1, dAttn2: array of TNeuralFloat;
   dScore1, dScore2: array of TNeuralFloat;
@@ -30685,12 +30737,13 @@ begin
   // previous layer actually has a matching error buffer to receive them.
   hasInputGrad := (Prev.Size > 0) and (Prev.Size = PrevErr.Size);
   SeqLen := Prev.SizeX;
+  SeqLenM1 := SeqLen - 1;
   SetLength(dAttn1, SeqLen);
   SetLength(dAttn2, SeqLen);
   SetLength(dScore1, SeqLen);
   SetLength(dScore2, SeqLen);
   gradLambda := 0;
-  for i := 0 to SeqLen - 1 do
+  for i := 0 to SeqLenM1 do
   begin
     // ---- Gradients w.r.t the SHARED V[j], the two attention maps, and lambdaVal.
     // out[i,d] = sum_j (Attn1[j] - lambdaVal*Attn2[j]) * V[j,d]
@@ -30700,7 +30753,7 @@ begin
     //   dLambda   += -sum_d (sum_j Attn2[j]*V[j,d]) * dOut[i,d]
     // Depth is contiguous: dV accumulation is an AVX MulAdd and dotV (= dAttn1)
     // is an AVX dot product (dOut[i] . V[j]) over FDk floats.
-    for j := 0 to SeqLen - 1 do
+    for j := 0 to SeqLenM1 do
     begin
       dV := FAttn[j, i, 0] - lambdaVal * FAttn2[j, i, 0];
       if hasInputGrad then
@@ -30716,7 +30769,7 @@ begin
     // ---- Softmax Jacobian for each map: dScore[j] = A[j]*(dAttn[j] - sum_k dAttn[k]*A[k]).
     SumDA1 := 0;
     SumDA2 := 0;
-    for k := 0 to SeqLen - 1 do
+    for k := 0 to SeqLenM1 do
     begin
       SumDA1 := SumDA1 + dAttn1[k] * FAttn[k, i, 0];
       SumDA2 := SumDA2 + dAttn2[k] * FAttn2[k, i, 0];
