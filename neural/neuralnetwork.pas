@@ -83556,7 +83556,7 @@ var
   MinStd, MaxStd, StdRange: TNeuralFloat;
   MaxStdBin, BarLen: integer;
   BinLo, BinHi: TNeuralFloat;
-  LastLayerIdx, LayerCountM1, UnitsM1, cHistBinsM1: integer;
+  LastLayerIdx, LayerCountM1, UnitsM1, cHistBinsM1, cStdBinsM1: integer;
 begin
   Result := '';
   Lines := TStringList.Create();
@@ -83582,6 +83582,7 @@ begin
     LayerCountM1 := LayerCount - 1;
     LastLayerIdx := NN.GetLastLayerIdx();
     cHistBinsM1 := cHistBins - 1;
+    cStdBinsM1 := cStdBins - 1;
     SetLength(PerLayerStd, LayerCount);
     SetLength(PerLayerHasData, LayerCount);
     for LayerIdx := 0 to LayerCountM1 do
@@ -83730,7 +83731,7 @@ begin
       for BinIdx := 0 to cHistBinsM1 do
         if HistBins[BinIdx] > MaxHistBin then MaxHistBin := HistBins[BinIdx];
       HistLine := '';
-      for BinIdx := 0 to cHistBins - 1 do
+      for BinIdx := 0 to cHistBinsM1 do
       begin
         if (MaxHistBin > 0) and (HistBins[BinIdx] > 0) then
           BarLen := 1 + Round((HistBins[BinIdx] / MaxHistBin) * 3)
@@ -83771,7 +83772,7 @@ begin
     // Network-level 10-bin ASCII histogram of per-layer std.
     MinStd := 0; MaxStd := 0;
     Reported := 0;
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       if not PerLayerHasData[LayerIdx] then Continue;
       if Reported = 0 then
@@ -83788,9 +83789,9 @@ begin
     end;
 
     SetLength(StdBins, cStdBins);
-    for BinIdx := 0 to cStdBins - 1 do StdBins[BinIdx] := 0;
+    for BinIdx := 0 to cStdBinsM1 do StdBins[BinIdx] := 0;
     StdRange := MaxStd - MinStd;
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       if not PerLayerHasData[LayerIdx] then Continue;
       if StdRange > 1e-30 then
@@ -83802,13 +83803,13 @@ begin
       Inc(StdBins[BinIdx]);
     end;
     MaxStdBin := 0;
-    for BinIdx := 0 to cStdBins - 1 do
+    for BinIdx := 0 to cStdBinsM1 do
       if StdBins[BinIdx] > MaxStdBin then MaxStdBin := StdBins[BinIdx];
 
     Lines.Add(Format(
       'Per-layer std histogram across %d layer(s) [min=%.4g, max=%.4g]:',
       [Reported, MinStd, MaxStd]));
-    for BinIdx := 0 to cStdBins - 1 do
+    for BinIdx := 0 to cStdBinsM1 do
     begin
       if StdRange > 1e-30 then
       begin
@@ -83849,6 +83850,7 @@ class function TNNet.EstimateSpectralNorm(
 ): TNeuralFloat;
 var
   FanOut, FanIn, N, K, Iter: integer;
+  FanInM1, FanOutM1: integer;
   V, U: array of TNeuralFloat;
   Acc, NormV, Sigma: TNeuralFloat;
   RngState: longword;
@@ -83863,6 +83865,8 @@ begin
   FanIn  := Layer.Neurons[0].Weights.Size; // cols of W (weights per neuron)
   if (FanOut = 0) or (FanIn = 0) then Exit;
   if Iters < 1 then Iters := 1;
+  FanInM1 := FanIn - 1;
+  FanOutM1 := FanOut - 1;
 
   SetLength(V, FanIn);
   SetLength(U, FanOut);
@@ -83871,7 +83875,7 @@ begin
   // global RandSeed so the report is fully reproducible).
   RngState := Seed;
   NormV := 0;
-  for K := 0 to FanIn - 1 do
+  for K := 0 to FanInM1 do
   begin
     RngState := (RngState * 1664525 + 1013904223) and $FFFFFFFF;
     // Map to (-1, 1).
@@ -83882,45 +83886,45 @@ begin
   if NormV <= 1e-30 then
   begin
     // Degenerate start; fall back to a flat vector.
-    for K := 0 to FanIn - 1 do V[K] := 1.0;
+    for K := 0 to FanInM1 do V[K] := 1.0;
     NormV := Sqrt(FanIn);
   end;
-  for K := 0 to FanIn - 1 do V[K] := V[K] / NormV;
+  for K := 0 to FanInM1 do V[K] := V[K] / NormV;
 
   Sigma := 0;
   for Iter := 1 to Iters do
   begin
     // u = W v   (row n = Neurons[n].Weights)
-    for N := 0 to FanOut - 1 do
+    for N := 0 to FanOutM1 do
     begin
       Neuron := Layer.Neurons[N];
       Acc := 0;
-      for K := 0 to FanIn - 1 do
+      for K := 0 to FanInM1 do
         Acc := Acc + Neuron.Weights.FData[K] * V[K];
       U[N] := Acc;
     end;
 
     // sigma_1 ~= ||W v|| = ||u||
     Sigma := 0;
-    for N := 0 to FanOut - 1 do Sigma := Sigma + U[N] * U[N];
+    for N := 0 to FanOutM1 do Sigma := Sigma + U[N] * U[N];
     Sigma := Sqrt(Sigma);
 
     // v = W^T u
-    for K := 0 to FanIn - 1 do V[K] := 0;
-    for N := 0 to FanOut - 1 do
+    for K := 0 to FanInM1 do V[K] := 0;
+    for N := 0 to FanOutM1 do
     begin
       Neuron := Layer.Neurons[N];
       Acc := U[N];
-      for K := 0 to FanIn - 1 do
+      for K := 0 to FanInM1 do
         V[K] := V[K] + Neuron.Weights.FData[K] * Acc;
     end;
 
     // v := v / ||v||
     NormV := 0;
-    for K := 0 to FanIn - 1 do NormV := NormV + V[K] * V[K];
+    for K := 0 to FanInM1 do NormV := NormV + V[K] * V[K];
     NormV := Sqrt(NormV);
     if NormV <= 1e-30 then Break; // all-zero matrix => sigma_1 = 0
-    for K := 0 to FanIn - 1 do V[K] := V[K] / NormV;
+    for K := 0 to FanInM1 do V[K] := V[K] / NormV;
   end;
 
   Result := Sigma;
@@ -83933,6 +83937,7 @@ class function TNNet.EstimateSpectralRadius(
 ): TNeuralFloat;
 var
   FanOut, FanIn, N, Col, Iter: integer;
+  FanInM1, FanOutM1: integer;
   V, U: array of TNeuralFloat;
   Acc, NormV, NormU, Rho: TNeuralFloat;
   RngState: longword;
@@ -83950,6 +83955,8 @@ begin
   // N x N; anything else has no spectral radius — bail out (return 0).
   if FanOut <> FanIn then Exit;
   if Iters < 1 then Iters := 1;
+  FanInM1 := FanIn - 1;
+  FanOutM1 := FanOut - 1;
 
   SetLength(V, FanIn);
   SetLength(U, FanOut);
@@ -83958,7 +83965,7 @@ begin
   // global RandSeed so the estimate is fully reproducible).
   RngState := Seed;
   NormV := 0;
-  for Col := 0 to FanIn - 1 do
+  for Col := 0 to FanInM1 do
   begin
     RngState := (RngState * 1664525 + 1013904223) and $FFFFFFFF;
     // Map to (-1, 1).
@@ -83969,10 +83976,10 @@ begin
   if NormV <= 1e-30 then
   begin
     // Degenerate start; fall back to a flat vector.
-    for Col := 0 to FanIn - 1 do V[Col] := 1.0;
+    for Col := 0 to FanInM1 do V[Col] := 1.0;
     NormV := Sqrt(FanIn);
   end;
-  for Col := 0 to FanIn - 1 do V[Col] := V[Col] / NormV;
+  for Col := 0 to FanInM1 do V[Col] := V[Col] / NormV;
 
   Rho := 0;
   for Iter := 1 to Iters do
@@ -83980,11 +83987,11 @@ begin
     // u = W v   (row n = Neurons[n].Weights). NO transpose step — this is the
     // eigenvector recurrence, not the singular-vector one.
     NormU := 0;
-    for N := 0 to FanOut - 1 do
+    for N := 0 to FanOutM1 do
     begin
       Neuron := Layer.Neurons[N];
       Acc := 0;
-      for Col := 0 to FanIn - 1 do
+      for Col := 0 to FanInM1 do
         Acc := Acc + Neuron.Weights.FData[Col] * V[Col];
       U[N] := Acc;
       NormU := NormU + Acc * Acc;
@@ -83995,7 +84002,7 @@ begin
     Rho := NormU;
     if NormU <= 1e-30 then Break; // nilpotent / all-zero direction => rho = 0
     // v := u / ||u||  (re-normalise the new dominant-eigenvector estimate).
-    for Col := 0 to FanIn - 1 do V[Col] := U[Col] / NormU;
+    for Col := 0 to FanInM1 do V[Col] := U[Col] / NormU;
   end;
 
   Result := Rho;
@@ -84013,6 +84020,7 @@ const
 var
   LpBnd161: integer;
   LpBnd162: integer;
+  LastLayerIdx, cBinsM1, RatioCountM1: integer;
   Lines: TStringList;
   Flags: TStringList;
   LayerIdx, NeuronIdx, K, BinIdx: integer;
@@ -84039,6 +84047,8 @@ begin
       Exit;
     end;
     if PowerIters < 1 then PowerIters := 1;
+    LastLayerIdx := NN.GetLastLayerIdx();
+    cBinsM1 := cBins - 1;
 
     TrainableLayers := 0;
     RatioCount := 0;
@@ -84053,7 +84063,7 @@ begin
        'sigma_1', '||W||_F', 'sr-ratio', 'MP-ratio']));
     Lines.Add(StringOfChar('-', 110));
 
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LayerIdx];
       if Layer.Neurons.Count = 0 then Continue;
@@ -84143,15 +84153,16 @@ begin
     // (e) 10-bin ASCII histogram of per-layer sigma_1 / fan-in baseline.
     MinR := RatioVals[0];
     MaxR := RatioVals[0];
-    for BinIdx := 1 to RatioCount - 1 do
+    RatioCountM1 := RatioCount - 1;
+    for BinIdx := 1 to RatioCountM1 do
     begin
       if RatioVals[BinIdx] < MinR then MinR := RatioVals[BinIdx];
       if RatioVals[BinIdx] > MaxR then MaxR := RatioVals[BinIdx];
     end;
     SetLength(HistBins, cBins);
-    for BinIdx := 0 to cBins - 1 do HistBins[BinIdx] := 0;
+    for BinIdx := 0 to cBinsM1 do HistBins[BinIdx] := 0;
     RRange := MaxR - MinR;
-    for BinIdx := 0 to RatioCount - 1 do
+    for BinIdx := 0 to RatioCountM1 do
     begin
       if RRange > 1e-30 then
         K := Trunc(((RatioVals[BinIdx] - MinR) / RRange) * cBins)
@@ -84162,13 +84173,13 @@ begin
       Inc(HistBins[K]);
     end;
     MaxBin := 0;
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
       if HistBins[BinIdx] > MaxBin then MaxBin := HistBins[BinIdx];
 
     Lines.Add(Format(
       'Per-layer sigma_1 / fan-in baseline (sigma_1 / (sqrt(in)*std)) ' +
       'across %d layer(s) [min=%.4g, max=%.4g]:', [RatioCount, MinR, MaxR]));
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
     begin
       if RRange > 1e-30 then
       begin
@@ -84229,6 +84240,7 @@ var
   LpBnd164: integer;
   LpBnd165: integer;
   LpBnd166: integer;
+  LastLayerIdx, DimM1, FanInM1, FanOutM1, AlphaCountM1, cBinsM1: integer;
   Lines: TStringList;
   Flags: TStringList;
   LayerIdx, NeuronIdx, K, BinIdx, I, J: integer;
@@ -84269,19 +84281,22 @@ var
     out OutEig: TDoubleArray);
   var
     Sweep, P, Q, R: integer;
+    Dm1, Dm2: integer;
     Off, Theta, T, C, S, Tau, Apq, App, Aqq, Aip, Aiq: Double;
   begin
+    Dm1 := D - 1;
+    Dm2 := D - 2;
     for Sweep := 1 to cJacobiSweeps do
     begin
       // sum of squared off-diagonal entries (convergence measure)
       Off := 0;
-      for P := 0 to D - 2 do
-        for Q := P + 1 to D - 1 do
+      for P := 0 to Dm2 do
+        for Q := P + 1 to Dm1 do
           Off := Off + A[P][Q] * A[P][Q];
       if Off <= cJacobiTol then Break;
 
-      for P := 0 to D - 2 do
-        for Q := P + 1 to D - 1 do
+      for P := 0 to Dm2 do
+        for Q := P + 1 to Dm1 do
         begin
           Apq := A[P][Q];
           if Abs(Apq) <= 1e-300 then Continue;
@@ -84302,7 +84317,7 @@ var
           A[P][Q] := 0.0;
           A[Q][P] := 0.0;
           // rotate the remaining entries of rows/cols P and Q
-          for R := 0 to D - 1 do
+          for R := 0 to Dm1 do
           begin
             if (R = P) or (R = Q) then Continue;
             Aip := A[R][P];
@@ -84315,7 +84330,7 @@ var
         end;
     end;
     SetLength(OutEig, D);
-    for P := 0 to D - 1 do OutEig[P] := A[P][P];
+    for P := 0 to Dm1 do OutEig[P] := A[P][P];
   end;
 
 begin
@@ -84329,6 +84344,8 @@ begin
       Exit;
     end;
     if MaxMatrixDim < 2 then MaxMatrixDim := 2;
+    LastLayerIdx := NN.GetLastLayerIdx();
+    cBinsM1 := cBins - 1;
 
     TrainableLayers := 0;
     AlphaCount := 0;
@@ -84350,7 +84367,7 @@ begin
        'lambda_max', 'MP-edge']));
     Lines.Add(StringOfChar('-', 100));
 
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LayerIdx];
       if Layer.Neurons.Count = 0 then Continue;
@@ -84358,6 +84375,8 @@ begin
 
       FanOut := Layer.Neurons.Count;          // rows of W
       FanIn  := Layer.Neurons[0].Weights.Size; // cols of W
+      FanInM1 := FanIn - 1;
+      FanOutM1 := FanOut - 1;
 
       // Frobenius norm (= sqrt of sum of squared singular values = sqrt of the
       // Gram trace) plus the weight std for the Marchenko-Pastur bulk edge.
@@ -84403,6 +84422,7 @@ begin
       // Cap the Gram dimension at MaxMatrixDim to bound the O(d^3) Jacobi cost
       // (we simply skip the eigen-decomposition for over-wide layers).
       if FanIn <= FanOut then Dim := FanIn else Dim := FanOut;
+      DimM1 := Dim - 1;
       Capped := Dim > MaxMatrixDim;
 
       ShapeStr := Format('(%d,%d)', [FanOut, FanIn]);
@@ -84418,19 +84438,19 @@ begin
 
       // Build the smaller Gram matrix in Double precision.
       SetLength(Gram, Dim);
-      for I := 0 to Dim - 1 do
+      for I := 0 to DimM1 do
       begin
         SetLength(Gram[I], Dim);
-        for J := 0 to Dim - 1 do Gram[I][J] := 0;
+        for J := 0 to DimM1 do Gram[I][J] := 0;
       end;
       if FanIn <= FanOut then
       begin
         // W^T W : (i,j) = sum_n W[n,i] * W[n,j]  (Dim = FanIn)
-        for NeuronIdx := 0 to FanOut - 1 do
+        for NeuronIdx := 0 to FanOutM1 do
         begin
           Neuron := Layer.Neurons[NeuronIdx];
-          for I := 0 to Dim - 1 do
-            for J := I to Dim - 1 do
+          for I := 0 to DimM1 do
+            for J := I to DimM1 do
               Gram[I][J] := Gram[I][J] +
                 Neuron.Weights.FData[I] * Neuron.Weights.FData[J];
         end;
@@ -84438,25 +84458,25 @@ begin
       else
       begin
         // W W^T : (i,j) = sum_k W[i,k] * W[j,k]  (Dim = FanOut)
-        for I := 0 to Dim - 1 do
-          for J := I to Dim - 1 do
+        for I := 0 to DimM1 do
+          for J := I to DimM1 do
           begin
             Acc := 0;
-            for K := 0 to FanIn - 1 do
+            for K := 0 to FanInM1 do
               Acc := Acc + Layer.Neurons[I].Weights.FData[K] *
                            Layer.Neurons[J].Weights.FData[K];
             Gram[I][J] := Acc;
           end;
       end;
       // mirror to lower triangle (Jacobi expects a full symmetric matrix)
-      for I := 0 to Dim - 1 do
-        for J := I + 1 to Dim - 1 do
+      for I := 0 to DimM1 do
+        for J := I + 1 to DimM1 do
           Gram[J][I] := Gram[I][J];
 
       // trace BEFORE the decomposition (= ||W||_F^2, for the trace-invariance
       // correctness check).
       TraceSum := 0;
-      for I := 0 to Dim - 1 do TraceSum := TraceSum + Gram[I][I];
+      for I := 0 to DimM1 do TraceSum := TraceSum + Gram[I][I];
 
       JacobiEigenvalues(Gram, Dim, Eig);
 
@@ -84464,7 +84484,7 @@ begin
       // invariance: sum(eig) must equal the pre-decomposition trace = ||W||_F^2.
       EigSum := 0;
       LambdaMax := 0;
-      for I := 0 to Dim - 1 do
+      for I := 0 to DimM1 do
       begin
         if Eig[I] < 0 then
         begin
@@ -84496,7 +84516,7 @@ begin
 
       // Sort the eigenvalues ascending (simple insertion sort — Dim is small
       // and capped; the tail fit needs an ordered spectrum).
-      for I := 1 to Dim - 1 do
+      for I := 1 to DimM1 do
       begin
         Key := Eig[I];
         J := I - 1;
@@ -84541,13 +84561,13 @@ begin
           if LMin <= 1e-20 then Continue;
           NTail := Dim - Cut; // tail = Eig[Cut..Dim-1]
           SumLn := 0;
-          for I := Cut to Dim - 1 do
+          for I := Cut to DimM1 do
             SumLn := SumLn + pcr_logf(Eig[I] / LMin);
           if SumLn <= 1e-12 then Continue;
           AFit := 1.0 + NTail / SumLn;
           // KS distance: empirical tail CDF vs fitted power-law CDF.
           DKS := 0;
-          for I := Cut to Dim - 1 do
+          for I := Cut to DimM1 do
           begin
             Emp := (I - Cut + 1) / NTail; // 1/n .. 1
             FitV := 1.0 - pcr_powf(Eig[I] / LMin, 1.0 - AFit);
@@ -84604,7 +84624,7 @@ begin
       // --- Per-layer 10-bin log10(lambda) histogram. ---
       MinL := 0; MaxL := 0;
       HaveLg := False;
-      for I := 0 to Dim - 1 do
+      for I := 0 to DimM1 do
         if Eig[I] > 1e-20 then
         begin
           Lg := pcr_log10f(Eig[I]);
@@ -84621,9 +84641,9 @@ begin
       if HaveLg then
       begin
           SetLength(HistBins, cBins);
-          for BinIdx := 0 to cBins - 1 do HistBins[BinIdx] := 0;
+          for BinIdx := 0 to cBinsM1 do HistBins[BinIdx] := 0;
           LRange := MaxL - MinL;
-          for I := 0 to Dim - 1 do
+          for I := 0 to DimM1 do
             if Eig[I] > 1e-20 then
             begin
               Lg := pcr_log10f(Eig[I]);
@@ -84636,12 +84656,12 @@ begin
               Inc(HistBins[K]);
             end;
           MaxBin := 0;
-          for BinIdx := 0 to cBins - 1 do
+          for BinIdx := 0 to cBinsM1 do
             if HistBins[BinIdx] > MaxBin then MaxBin := HistBins[BinIdx];
           Lines.Add(Format(
             '     log10(lambda) spectrum [%d eigenvalues, log10 in %.3f..%.3f]:',
             [Dim, MinL, MaxL]));
-          for BinIdx := 0 to cBins - 1 do
+          for BinIdx := 0 to cBinsM1 do
           begin
             if LRange > 1e-30 then
             begin
@@ -84689,10 +84709,11 @@ begin
 
     // alpha-across-depth bar chart (each row scaled to cMaxBarWidth).
     MaxAlphaForChart := 0;
-    for I := 0 to AlphaCount - 1 do
+    AlphaCountM1 := AlphaCount - 1;
+    for I := 0 to AlphaCountM1 do
       if AlphaVals[I] > MaxAlphaForChart then MaxAlphaForChart := AlphaVals[I];
     Lines.Add('alpha across depth (well-trained band alpha in [2,4]):');
-    for I := 0 to AlphaCount - 1 do
+    for I := 0 to AlphaCountM1 do
     begin
       if MaxAlphaForChart > 1e-30 then
         BarLen := Round((AlphaVals[I] / MaxAlphaForChart) * cMaxBarWidth)
@@ -84779,6 +84800,8 @@ var
   ChartLayerIdx: array of integer;
   ChartLayerName: array of string;
   ChartCount: integer;
+  LastLayerIdx, MaxFeatDimM1, NumProbedM1, Nm1: integer;
+  FeatDM1, GramDimM1, NMuM1, NMuM2, ChartCountM1: integer;
   SavedSeed: longword;
 
   // Fill FeatRow (length FeatDim) from a probed layer Output, applying the
@@ -84786,15 +84809,17 @@ var
   procedure ReadFeatures(const Pr: TLayerProbe; OutVol: TNNetVolume);
   var
     F: integer;
+    FeatDimM1: integer;
   begin
+    FeatDimM1 := Pr.FeatDim - 1;
     if Pr.Projected then
     begin
-      for F := 0 to Pr.FeatDim - 1 do
+      for F := 0 to FeatDimM1 do
         FeatRow[F] := Pr.ProjSign[F] * OutVol.FData[Pr.ProjSrc[F]];
     end
     else
     begin
-      for F := 0 to Pr.FeatDim - 1 do
+      for F := 0 to FeatDimM1 do
         FeatRow[F] := OutVol.FData[F];
     end;
   end;
@@ -84806,17 +84831,20 @@ var
     out OutEig: TDoubleArray);
   var
     Sweep, P, Q, R: integer;
+    Dm1, Dm2: integer;
     Off, Theta, T, C, S, Tau, Apq, App, Aqq, Aip, Aiq: Double;
   begin
+    Dm1 := Dm - 1;
+    Dm2 := Dm - 2;
     for Sweep := 1 to cJacobiSweeps do
     begin
       Off := 0;
-      for P := 0 to Dm - 2 do
-        for Q := P + 1 to Dm - 1 do
+      for P := 0 to Dm2 do
+        for Q := P + 1 to Dm1 do
           Off := Off + A[P][Q] * A[P][Q];
       if Off <= cJacobiTol then Break;
-      for P := 0 to Dm - 2 do
-        for Q := P + 1 to Dm - 1 do
+      for P := 0 to Dm2 do
+        for Q := P + 1 to Dm1 do
         begin
           Apq := A[P][Q];
           if Abs(Apq) <= 1e-300 then Continue;
@@ -84834,7 +84862,7 @@ var
           A[Q][Q] := Aqq + T * Apq;
           A[P][Q] := 0.0;
           A[Q][P] := 0.0;
-          for R := 0 to Dm - 1 do
+          for R := 0 to Dm1 do
           begin
             if (R = P) or (R = Q) then Continue;
             Aip := A[R][P];
@@ -84847,7 +84875,7 @@ var
         end;
     end;
     SetLength(OutEig, Dm);
-    for P := 0 to Dm - 1 do OutEig[P] := A[P][P];
+    for P := 0 to Dm1 do OutEig[P] := A[P][P];
   end;
 
 begin
@@ -84867,13 +84895,16 @@ begin
     end;
     if MaxFeatDim < 1 then MaxFeatDim := 1;
     N := Probes.Count;
+    Nm1 := N - 1;
+    MaxFeatDimM1 := MaxFeatDim - 1;
+    LastLayerIdx := NN.GetLastLayerIdx();
 
     // --- Catalogue trainable layers to probe, building a deterministic
     //     sign-random projection for over-wide layers (cost bound). ---
     SavedSeed := RandSeed;
     SetLength(Probes2, NN.CountLayers());
     NumProbed := 0;
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LayerIdx];
       if Layer.Neurons.Count = 0 then Continue;
@@ -84889,7 +84920,7 @@ begin
         SetLength(Probes2[NumProbed].ProjSrc, MaxFeatDim);
         SetLength(Probes2[NumProbed].ProjSign, MaxFeatDim);
         RandSeed := cProjSeed + LayerIdx;
-        for J := 0 to MaxFeatDim - 1 do
+        for J := 0 to MaxFeatDimM1 do
         begin
           Probes2[NumProbed].ProjSrc[J] := Random(FlatSz);
           if Random(2) = 0 then
@@ -84932,55 +84963,58 @@ begin
     SetLength(ChartLayerIdx, NumProbed);
     SetLength(ChartLayerName, NumProbed);
     ChartCount := 0;
+    NumProbedM1 := NumProbed - 1;
 
-    for ProbeIdx := 0 to NumProbed - 1 do
+    for ProbeIdx := 0 to NumProbedM1 do
     begin
       LayerIdx := Probes2[ProbeIdx].LayerIdx;
       Layer := NN.Layers[LayerIdx];
       D := Probes2[ProbeIdx].FeatDim;
+      FeatDM1 := D - 1;
       ShapeStr := Probes2[ProbeIdx].Name;
 
       // --- Forward pass: build the N x D activation matrix. ---
       SetLength(FeatRow, D);
       SetLength(Feats, N);
-      for SampleIdx := 0 to N - 1 do
+      for SampleIdx := 0 to Nm1 do
       begin
         SetLength(Feats[SampleIdx], D);
         NN.Compute(Probes[SampleIdx]);
         ReadFeatures(Probes2[ProbeIdx], Layer.Output);
-        for I := 0 to D - 1 do Feats[SampleIdx][I] := FeatRow[I];
+        for I := 0 to FeatDM1 do Feats[SampleIdx][I] := FeatRow[I];
       end;
 
       // ===================== (1) Linear / PCA ID ======================
       // Centre the columns, then form the SMALLER of the (D x D) covariance
       // or the (N x N) Gram of centred rows (same non-zero eigenspectrum).
       SetLength(ColMean, D);
-      for I := 0 to D - 1 do ColMean[I] := 0;
-      for SampleIdx := 0 to N - 1 do
-        for I := 0 to D - 1 do
+      for I := 0 to FeatDM1 do ColMean[I] := 0;
+      for SampleIdx := 0 to Nm1 do
+        for I := 0 to FeatDM1 do
           ColMean[I] := ColMean[I] + Feats[SampleIdx][I];
-      for I := 0 to D - 1 do ColMean[I] := ColMean[I] / N;
-      for SampleIdx := 0 to N - 1 do
-        for I := 0 to D - 1 do
+      for I := 0 to FeatDM1 do ColMean[I] := ColMean[I] / N;
+      for SampleIdx := 0 to Nm1 do
+        for I := 0 to FeatDM1 do
           Feats[SampleIdx][I] := Feats[SampleIdx][I] - ColMean[I];
 
       if D <= N then GramDim := D else GramDim := N;
+      GramDimM1 := GramDim - 1;
       SetLength(Gram, GramDim);
-      for I := 0 to GramDim - 1 do
+      for I := 0 to GramDimM1 do
       begin
         SetLength(Gram[I], GramDim);
-        for J := 0 to GramDim - 1 do Gram[I][J] := 0;
+        for J := 0 to GramDimM1 do Gram[I][J] := 0;
       end;
       if D <= N then
       begin
         // covariance C[i][j] = (1/N) sum_n Xc[n,i]*Xc[n,j]   (D x D)
-        for SampleIdx := 0 to N - 1 do
-          for I := 0 to D - 1 do
-            for J := I to D - 1 do
+        for SampleIdx := 0 to Nm1 do
+          for I := 0 to FeatDM1 do
+            for J := I to FeatDM1 do
               Gram[I][J] := Gram[I][J] +
                 Feats[SampleIdx][I] * Feats[SampleIdx][J];
-        for I := 0 to D - 1 do
-          for J := I to D - 1 do
+        for I := 0 to FeatDM1 do
+          for J := I to FeatDM1 do
           begin
             Gram[I][J] := Gram[I][J] / N;
             Gram[J][I] := Gram[I][J];
@@ -84990,11 +85024,11 @@ begin
       begin
         // Gram G[a][b] = (1/N) sum_i Xc[a,i]*Xc[b,i]   (N x N); shares the
         // same non-zero eigenvalues as the D x D covariance.
-        for I := 0 to N - 1 do
-          for J := I to N - 1 do
+        for I := 0 to Nm1 do
+          for J := I to Nm1 do
           begin
             Tmp := 0;
-            for K := 0 to D - 1 do
+            for K := 0 to FeatDM1 do
               Tmp := Tmp + Feats[I][K] * Feats[J][K];
             Gram[I][J] := Tmp / N;
             Gram[J][I] := Gram[I][J];
@@ -85006,7 +85040,7 @@ begin
       // PSD: clamp tiny-negative numerical noise; participation ratio.
       EigSum := 0;
       EigSqSum := 0;
-      for I := 0 to GramDim - 1 do
+      for I := 0 to GramDimM1 do
       begin
         if Eig[I] < 0 then
         begin
@@ -85033,15 +85067,15 @@ begin
       NMu := 0;
       if N >= 3 then
       begin
-        for I := 0 to N - 1 do
+        for I := 0 to Nm1 do
         begin
           R1 := 1e300;
           R2 := 1e300;
-          for J := 0 to N - 1 do
+          for J := 0 to Nm1 do
           begin
             if J = I then Continue;
             Dist := 0;
-            for K := 0 to D - 1 do
+            for K := 0 to FeatDM1 do
             begin
               // un-centre: add the column mean back (centering shifts all rows
               // equally, so distances are identical — recompute from raw).
@@ -85071,8 +85105,10 @@ begin
 
       if NMu >= 2 then
       begin
+        NMuM1 := NMu - 1;
+        NMuM2 := NMu - 2;
         // sort mu ascending (insertion sort; NMu small for capped probe batches)
-        for I := 1 to NMu - 1 do
+        for I := 1 to NMuM1 do
         begin
           MuI := Mu[I];
           J := I - 1;
@@ -85086,7 +85122,7 @@ begin
         // empirical CDF F(mu_i) = (i+1)/NMu (skip the last point where F=1).
         SumXY := 0;
         SumXX := 0;
-        for I := 0 to NMu - 2 do
+        for I := 0 to NMuM2 do
         begin
           FcdfV := (I + 1) / NMu;
           X := pcr_logf(Mu[I]);
@@ -85135,10 +85171,11 @@ begin
     Lines.Add('');
     Lines.Add('TwoNN_ID across depth (the expand-then-contract "hunchback"):');
     MaxBar := 0;
-    for I := 0 to ChartCount - 1 do
+    ChartCountM1 := ChartCount - 1;
+    for I := 0 to ChartCountM1 do
       if TwoNNVals[I] > MaxBar then MaxBar := TwoNNVals[I];
     if MaxBar <= 1e-30 then MaxBar := 1;
-    for I := 0 to ChartCount - 1 do
+    for I := 0 to ChartCountM1 do
     begin
       BarLen := Round((TwoNNVals[I] / MaxBar) * cMaxBarWidth);
       Bar := StringOfChar('#', BarLen);
@@ -85245,6 +85282,7 @@ var
     out aGrads: array of TFloatArray): integer;
   var
     si, li, ni, kk, pp, cu: integer;
+    Nm1, LastIdxA: integer;
     sq, lr2, gg: TNeuralFloat;
     lay: TNNetLayer;
     neu: TNNetNeuron;
@@ -85254,8 +85292,10 @@ var
     aNet.SetBatchUpdate(true);
     tgt := TNNetVolume.Create(aNet.GetLastLayer().Output.Size, 1, 1);
     filled := 0;
+    Nm1 := N - 1;
+    LastIdxA := aNet.GetLastLayerIdx();
     try
-      for si := 0 to N - 1 do
+      for si := 0 to Nm1 do
       begin
         aGrads[si] := nil;
         Probe := Samples[SampleOrigIdx[si]];
@@ -85271,7 +85311,7 @@ var
         aNet.Backpropagate(tgt);
         SetLength(aGrads[si], NetParamCnt);
         sq := 0;
-        for li := 0 to aNet.GetLastLayerIdx() do
+        for li := 0 to LastIdxA do
         begin
           if not LayerHasParams[li] then Continue;
           lay := aNet.Layers[li];
@@ -85312,16 +85352,19 @@ var
     out OutEig: TDoubleArray);
   var
     Sweep, P, Q, R: integer;
+    Dm1, Dm2: integer;
     Off, Theta, T, C, S, Tau, Apq, App, Aqq, Aip, Aiq: Double;
   begin
+    Dm1 := Dm - 1;
+    Dm2 := Dm - 2;
     for Sweep := 1 to cJacobiSweeps do
     begin
       Off := 0;
-      for P := 0 to Dm - 2 do
-        for Q := P + 1 to Dm - 1 do
+      for P := 0 to Dm2 do
+        for Q := P + 1 to Dm1 do
           Off := Off + A[P][Q] * A[P][Q];
       if Off <= cJacobiTol then Break;
-      for P := 0 to Dm - 2 do
+      for P := 0 to Dm2 do
         for Q := P + 1 to Dm - 1 do
         begin
           Apq := A[P][Q];
