@@ -10011,6 +10011,7 @@ var
   EmbeddingLayer, PosLayer, FinalLN, LMHead: TNNetLayer;
   BranchInput: TNNetLayer;
   BlockCnt, SeqLen, NumLabels, i, j: integer;
+  ReaderMax: integer;
   Tmp: TNNetVolume;
   BlockPrefix, TensorNameStr: string;
   Consumed: TStringList;
@@ -10235,7 +10236,8 @@ begin
       //  - h.N.attn.bias / h.N.attn.masked_bias: the causal-mask buffers
       //    PyTorch serializes (the mask is structural here);
       //  - lm_head.weight: the tied LM head (identical to wte by definition).
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -10529,6 +10531,7 @@ var
     F: TJSONData;
     Arr: TJSONArray;
     I: integer;
+    ArrMax: integer;
     V: TNeuralFloat;
   begin
     F := Scaling.Find(KeyName);
@@ -10540,7 +10543,8 @@ var
       ImportError(ImporterName + ': rope_scaling longrope "' + KeyName +
         '" array is empty.');
     SetLength(Result, Arr.Count);
-    for I := 0 to Arr.Count - 1 do
+    ArrMax := Arr.Count - 1;
+    for I := 0 to ArrMax do
     begin
       V := Arr.Items[I].AsFloat;
       if V <= 0 then
@@ -10731,6 +10735,7 @@ var
   HeadDimField, SlidingWindowField, FloatField: TJSONData;
   MoEMlpOnlyArr, ClipQKVField: TJSONData;
   i: integer;
+  MoEMax: integer;
   DimModelBase: integer;
 
   function RequiredInt(const FieldName: string): integer;
@@ -10986,7 +10991,8 @@ begin
       begin
         SetLength(Result.MoEMlpOnlyLayers,
           TJSONArray(MoEMlpOnlyArr).Count);
-        for i := 0 to TJSONArray(MoEMlpOnlyArr).Count - 1 do
+        MoEMax := TJSONArray(MoEMlpOnlyArr).Count - 1;
+        for i := 0 to MoEMax do
           Result.MoEMlpOnlyLayers[i] := TJSONArray(MoEMlpOnlyArr).Integers[i];
       end;
       // Qwen3-MoE sliding window: HF Qwen3MoeConfig sets
@@ -12336,6 +12342,7 @@ var
   BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
   HeadDim, QWidth, KVWidth, RotaryDims, LayerWindow, i, j, d: integer;
   RotaryHeadDimArg: integer;
+  ReaderMax: integer;
   LayerIsLocal, LayerUseRoPE: boolean;
   NormGainOffset, QScale, QProjScale, LayerTheta: TNeuralFloat;
   LogitScaleFold: TNeuralFloat;
@@ -13298,7 +13305,8 @@ begin
       // Every tensor must be consumed or be a known ignorable buffer:
       // older HF exports serialize the per-layer "rotary_emb.inv_freq"
       // buffers (RoPE is structural here, rebuilt from rope_theta).
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -14236,6 +14244,7 @@ end;
 function BuildLlamaMemTensorReader(Net: TNNet;
   const Config: TLlamaConfig): TNNetMemTensorReader;
 var
+  LpMax: integer;
   Reader: TNNetMemTensorReader;
   HeadDim, QWidth, KVWidth, b, j, c: integer;
   HalfDim, h, k, IntSize: integer;
@@ -14342,7 +14351,8 @@ begin
   Embed := nil;
   SetLength(Linears, 0);
   SetLength(Norms, 0);
-  for i := 0 to Net.Layers.Count - 1 do
+  LpMax := Net.Layers.Count - 1;
+  for i := 0 to LpMax do
   begin
     Lay := Net.Layers[i];
     if Lay is TNNetEmbedding then
@@ -14531,6 +14541,7 @@ end;
 procedure SaveLlamaToSafeTensors(Net: TNNet; const Config: TLlamaConfig;
   const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
 var
+  ReaderMax: integer;
   Reader: TNNetMemTensorReader;
   Writer: TNNetSafeTensorsWriter;
   V: TNNetVolume;
@@ -14546,7 +14557,8 @@ begin
       Writer.SetMetadata('format', 'pt');
       Writer.SetMetadata('exporter', 'cai-neural-api/llama');
       // Drain every HF-named tensor the walk produced, preserving its shape.
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TName := Reader.TensorName(i);
         Dims := Reader.DimCount(TName);
@@ -14580,6 +14592,7 @@ end;
 function BuildQwen3MemTensorReader(Net: TNNet;
   const Config: TLlamaConfig): TNNetMemTensorReader;
 var
+  LpMax: integer;
   Reader: TNNetMemTensorReader;
   HeadDim, QWidth, KVWidth, HalfDim, IntSize: integer;
   b, j, c, h, k, i: integer;
@@ -14706,7 +14719,8 @@ begin
   Embed := nil;
   SetLength(Linears, 0);
   SetLength(Norms, 0);
-  for i := 0 to Net.Layers.Count - 1 do
+  LpMax := Net.Layers.Count - 1;
+  for i := 0 to LpMax do
   begin
     Lay := Net.Layers[i];
     if Lay is TNNetEmbedding then
@@ -14861,6 +14875,7 @@ end;
 procedure SaveQwen3ToSafeTensors(Net: TNNet; const Config: TLlamaConfig;
   const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
 var
+  ReaderMax: integer;
   Reader: TNNetMemTensorReader;
   Writer: TNNetSafeTensorsWriter;
   V: TNNetVolume;
@@ -14875,7 +14890,8 @@ begin
     try
       Writer.SetMetadata('format', 'pt');
       Writer.SetMetadata('exporter', 'cai-neural-api/qwen3');
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TName := Reader.TensorName(i);
         Dims := Reader.DimCount(TName);
@@ -15559,6 +15575,7 @@ var
   Field, TypesField: TJSONData;
   LayersArr, TypesArr, PairArr, NamesArr: TJSONArray;
   i, i2, j, RepeatCnt, LayerCnt: integer;
+  LpMax: integer;
 
   function RequiredInt(const FieldName: string): integer;
   begin
@@ -15633,7 +15650,8 @@ begin
     if (Field <> nil) and (Field is TJSONArray) then
     begin
       LayersArr := TJSONArray(Field);
-      for i := 0 to LayersArr.Count - 1 do
+      LpMax := LayersArr.Count - 1;
+      for i := 0 to LpMax do
         AddLayerType(LayersArr.Items[i].AsString);
     end
     else
@@ -15643,7 +15661,8 @@ begin
         ImportError('GPT-Neo import: config "' + FileName + '" carries ' +
           'neither "attention_layers" nor "attention_types".');
       TypesArr := TJSONArray(TypesField);
-      for i := 0 to TypesArr.Count - 1 do
+      LpMax := TypesArr.Count - 1;
+      for i := 0 to LpMax do
       begin
         if not (TypesArr.Items[i] is TJSONArray) or
            (TJSONArray(TypesArr.Items[i]).Count <> 2) then
@@ -15658,8 +15677,9 @@ begin
         if RepeatCnt < 1 then
           ImportError('GPT-Neo import: attention_types repeat count must ' +
             'be >= 1, got ' + PairArr.Items[1].AsJSON + '.');
+        LpMax := NamesArr.Count - 1;
         for i2 := 1 to RepeatCnt do
-          for j := 0 to NamesArr.Count - 1 do
+          for j := 0 to LpMax do
             AddLayerType(NamesArr.Items[j].AsString);
       end;
     end;
@@ -15708,6 +15728,7 @@ function BuildGPTNeoFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGPTNeoConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TGPTNeoBlockLayers;
@@ -15936,7 +15957,8 @@ begin
       // Every tensor must be consumed or be a known ignorable buffer:
       // h.N.attn.attention.bias / .masked_bias are the causal/banded mask
       // buffers older PyTorch exports serialize (structural here).
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -16175,6 +16197,7 @@ function BuildGPTNeoXFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGPTNeoXConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TGPTNeoXBlockLayers;
@@ -16483,7 +16506,8 @@ begin
       //    older PyTorch exports serialize (the mask is structural here);
       //  - rotary_emb.inv_freq: RoPE buffers (structural, rebuilt from the
       //    config's base).
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -16715,6 +16739,7 @@ function BuildOPTFromSafeTensorsWithConfig(const FileName: string;
   var Config: TOPTConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TOPTBlockLayers;
@@ -16962,7 +16987,8 @@ begin
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -17142,6 +17168,7 @@ function BuildStarCoder2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TStarCoder2Config; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TStarCoder2BlockLayers;
@@ -17415,7 +17442,8 @@ begin
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -17577,6 +17605,7 @@ function BuildGptBigCodeFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGptBigCodeConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TGptBigCodeBlockLayers;
@@ -17798,7 +17827,8 @@ begin
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -17957,6 +17987,7 @@ function BuildGPTJFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGPTJConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TGPTJBlockLayers;
@@ -18239,7 +18270,8 @@ begin
       //  - attn.embed_positions: the sinusoidal RoPE table some
       //    transformers versions persist (structural, rebuilt from
       //    rotary_dim + the base).
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -18547,6 +18579,7 @@ function BuildCohereFromSafeTensorsWithConfig(const FileName: string;
   var Config: TCohereConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TCohereBlockLayers;
@@ -18846,7 +18879,8 @@ begin
 
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -19087,6 +19121,7 @@ function BuildPhiFromSafeTensorsWithConfig(const FileName: string;
   var Config: TPhiConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TPhiBlockLayers;
@@ -19375,7 +19410,8 @@ begin
       // Every tensor must be consumed or be a known ignorable buffer:
       //  - rotary_emb.inv_freq: RoPE buffers some transformers versions
       //    persist (structural, rebuilt from the config's base).
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -19570,6 +19606,7 @@ function BuildBertFromSafeTensorsWithConfig(const FileName: string;
   pSeqClsHead: boolean = false; pQuantizeInt8: boolean = false;
   pPaddingMask: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TBertBlockLayers;
@@ -19991,7 +20028,8 @@ begin
       //    transformers versions serialize (positions are structural here);
       //  - pooler.dense.*: the pooler head when pIncludePooler=false (a
       //    real weight this net deliberately does not carry).
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -20151,6 +20189,7 @@ function BuildBlip2QFormerFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBlip2QFormerConfig; NumPatches: integer = 0;
   pInferenceOnly: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   QueryInput, VisionInput, EmbLN, QKV, BranchInput, HiddenAct, PhiBranch: TNNetLayer;
@@ -20398,7 +20437,8 @@ begin
       if pInferenceOnly then NN.SetInferenceOnly();
 
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -20455,11 +20495,13 @@ end;
 
 function Blip2QFormerVisionInput(QFormerNet: TNNet): TNNetLayer;
 var
+  LpMax: integer;
   LayerCnt, InputCnt: integer;
 begin
   Result := nil;
   InputCnt := 0;
-  for LayerCnt := 0 to QFormerNet.Layers.Count - 1 do
+  LpMax := QFormerNet.Layers.Count - 1;
+  for LayerCnt := 0 to LpMax do
     if QFormerNet.Layers[LayerCnt] is TNNetInput then
     begin
       Inc(InputCnt);
@@ -20724,6 +20766,7 @@ end;
 
 function CosineSimilarity(A, B: TNNetVolume): TNeuralFloat;
 var
+  LpMax: integer;
   Dot, NormA, NormB: TNeuralFloat;
   Cnt: integer;
 begin
@@ -20731,7 +20774,8 @@ begin
     ImportError('CosineSimilarity: vector size mismatch ' +
       IntToStr(A.Size) + ' vs ' + IntToStr(B.Size) + '.');
   Dot := 0; NormA := 0; NormB := 0;
-  for Cnt := 0 to A.Size - 1 do
+  LpMax := A.Size - 1;
+  for Cnt := 0 to LpMax do
   begin
     Dot   := Dot   + A.FData[Cnt] * B.FData[Cnt];
     NormA := NormA + A.FData[Cnt] * A.FData[Cnt];
@@ -21432,6 +21476,7 @@ end;
 
 function ReadId2LabelFromJSONFile(const FileName: string): TStringList;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root, MapData: TJSONData;
   MapObj: TJSONObject;
@@ -21463,8 +21508,10 @@ begin
       MapObj := TJSONObject(MapData);
       // Pre-size, then place each label at its integer key: the JSON map
       // {"0": ..} must cover exactly 0..Count-1 (HF's contiguous ids).
-      for EntryCnt := 0 to MapObj.Count - 1 do Result.Add('');
-      for EntryCnt := 0 to MapObj.Count - 1 do
+      LpMax := MapObj.Count - 1;
+      for EntryCnt := 0 to LpMax do Result.Add('');
+      LpMax := MapObj.Count - 1;
+      for EntryCnt := 0 to LpMax do
       begin
         ClassId := StrToIntDef(MapObj.Names[EntryCnt], -1);
         if (ClassId < 0) or (ClassId >= MapObj.Count) then
@@ -21995,6 +22042,7 @@ end;
 
 function NormalizeSquadAnswer(const S: string): string;
 var
+  LpMax: integer;
   Lower, Tmp, Word: string;
   i: integer;
   Words: TStringList;
@@ -22018,7 +22066,8 @@ begin
     Words.StrictDelimiter := False; // collapse runs of spaces
     Words.DelimitedText := Tmp;
     Result := '';
-    for i := 0 to Words.Count - 1 do
+    LpMax := Words.Count - 1;
+    for i := 0 to LpMax do
     begin
       Word := Words[i];
       if (Word = '') or (Word = 'a') or (Word = 'an') or (Word = 'the') then
@@ -22035,6 +22084,7 @@ function SquadTokenF1(const Pred, Gold: string): TNeuralFloat;
 var
   PredToks, GoldToks: TStringList;
   i, j, Same: integer;
+  PredMax, GoldMax: integer;
   Used: array of boolean;
   Prec, Rec: TNeuralFloat;
 begin
@@ -22054,10 +22104,12 @@ begin
     end;
     // Multiset intersection (bag-of-words overlap).
     SetLength(Used, GoldToks.Count);
-    for j := 0 to GoldToks.Count - 1 do Used[j] := False;
+    GoldMax := GoldToks.Count - 1;
+    PredMax := PredToks.Count - 1;
+    for j := 0 to GoldMax do Used[j] := False;
     Same := 0;
-    for i := 0 to PredToks.Count - 1 do
-      for j := 0 to GoldToks.Count - 1 do
+    for i := 0 to PredMax do
+      for j := 0 to GoldMax do
         if (not Used[j]) and (PredToks[i] = GoldToks[j]) then
         begin
           Used[j] := True; Inc(Same); Break;
@@ -22109,6 +22161,7 @@ end;
 function ReadDebertaV2ConfigFromJSONFile(
   const FileName: string): TDebertaV2Config;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
@@ -22178,7 +22231,8 @@ begin
     if Obj.Find('pos_att_type') is TJSONArray then
     begin
       PosAtt := TJSONArray(Obj.Find('pos_att_type'));
-      for i := 0 to PosAtt.Count - 1 do
+      LpMax := PosAtt.Count - 1;
+      for i := 0 to LpMax do
       begin
         if PosAtt.Strings[i] = 'c2p' then HasC2P := true;
         if PosAtt.Strings[i] = 'p2c' then HasP2C := true;
@@ -22310,6 +22364,7 @@ function BuildDebertaV2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TDebertaV2Config; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pSeqClsHead: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TDebertaBlock;
@@ -22586,7 +22641,8 @@ begin
       end;
 
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -22739,6 +22795,7 @@ end;
 
 function ReadLlama4ConfigFromJSONFile(const FileName: string): TLlamaConfig;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root, TextRoot: TJSONData;
   Obj, Outer: TJSONObject;
@@ -22870,7 +22927,8 @@ begin
       for i := 0 to Result.NumLayers - 1 do
       begin
         IsMoELayer := False;
-        for Step := 0 to TJSONArray(Field).Count - 1 do
+        LpMax := TJSONArray(Field).Count - 1;
+        for Step := 0 to LpMax do
           if TJSONArray(Field).Integers[Step] = i then IsMoELayer := True;
         if not IsMoELayer then
         begin
@@ -24478,6 +24536,7 @@ procedure BuildT5FromSafeTensorsWithConfig(const FileName: string;
   EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false);
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   Enc, Dec: TNNet;
   EncBlocks, DecBlocks: TT5BlockArray;
@@ -24634,7 +24693,8 @@ begin
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -24674,11 +24734,13 @@ end;
 
 function T5EncoderStatesInput(DecoderNet: TNNet): TNNetLayer;
 var
+  LpMax: integer;
   LayerCnt, InputCnt: integer;
 begin
   Result := nil;
   InputCnt := 0;
-  for LayerCnt := 0 to DecoderNet.Layers.Count - 1 do
+  LpMax := DecoderNet.Layers.Count - 1;
+  for LayerCnt := 0 to LpMax do
     if DecoderNet.Layers[LayerCnt] is TNNetInput then
     begin
       Inc(InputCnt);
@@ -25087,6 +25149,8 @@ procedure BuildMarianFromSafeTensorsWithConfig(const FileName: string;
   EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false);
 var
+  LpMax: integer;
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   Enc, Dec: TNNet;
   EncBlocks, DecBlocks: TMarianBlockArray;
@@ -25207,7 +25271,8 @@ begin
           EmbedScale := Sqrt(Config.DModel)
         else
           EmbedScale := 1.0;
-        for i := 0 to Tmp.Size - 1 do
+        LpMax := Tmp.Size - 1;
+        for i := 0 to LpMax do
         begin
           EncEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
           DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
@@ -25257,7 +25322,8 @@ begin
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -25563,6 +25629,7 @@ procedure SaveMarianToSafeTensors(EncoderNet, DecoderNet: TNNet;
   const Config: TMarianConfig; const FileName: string;
   pDType: TSafeTensorsWriteDType = stwF32);
 var
+  LpMax: integer;
   Writer: TNNetSafeTensorsWriter;
   EncEmbed, DecEmbed, LMHead: TNNetLayer;
   Shared, FinalBias: TNNetVolume;
@@ -25713,7 +25780,8 @@ begin
     if EncEmbed.FArrNeurons[0].Weights.Size <> Config.VocabSize * Config.DModel then
       ImportError('Marian export: embedding size mismatch.');
     Shared.ReSize(Config.VocabSize * Config.DModel, 1, 1);
-    for i := 0 to Shared.Size - 1 do
+    LpMax := Shared.Size - 1;
+    for i := 0 to LpMax do
       Shared.FData[i] := EncEmbed.FArrNeurons[0].Weights.FData[i] * InvEmbedScale;
     Writer.AddTensorFlat('model.shared.weight',
       [Config.VocabSize, Config.DModel], Shared, pDType);
@@ -25763,6 +25831,7 @@ procedure SaveBartFamilyToSafeTensors(EncoderNet, DecoderNet: TNNet;
   ScaleEmbedding, HasEmbLN, HasFinalLN: boolean; PosOffset: integer;
   pDType: TSafeTensorsWriteDType);
 var
+  LpMax: integer;
   Writer: TNNetSafeTensorsWriter;
   EncEmbed, DecEmbed, LMHead: TNNetLayer;
   Shared, FinalBias: TNNetVolume;
@@ -25960,7 +26029,8 @@ begin
     if EncEmbed.FArrNeurons[0].Weights.Size <> VocabSize * DModel then
       ImportError(ExporterTag + ' export: embedding size mismatch.');
     Shared.ReSize(VocabSize * DModel, 1, 1);
-    for i := 0 to Shared.Size - 1 do
+    LpMax := Shared.Size - 1;
+    for i := 0 to LpMax do
       Shared.FData[i] := EncEmbed.FArrNeurons[0].Weights.FData[i] * InvEmbedScale;
     Writer.AddTensorFlat('model.shared.weight',
       [VocabSize, DModel], Shared, pDType);
@@ -26307,6 +26377,8 @@ procedure BuildBartFromSafeTensorsWithConfig(const FileName: string;
   EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false);
 var
+  LpMax: integer;
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   Enc, Dec: TNNet;
   EncBlocks, DecBlocks: TMarianBlockArray;
@@ -26449,7 +26521,8 @@ begin
           EmbedScale := Sqrt(Config.DModel)
         else
           EmbedScale := 1.0;
-        for i := 0 to Tmp.Size - 1 do
+        LpMax := Tmp.Size - 1;
+        for i := 0 to LpMax do
         begin
           EncEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
           DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
@@ -26509,7 +26582,8 @@ begin
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -27214,6 +27288,7 @@ procedure TMusicGenModel.GenerateEx(EncStates, UncondStates: TNNetVolume;
   Sampler: TNNetSamplerBase; Temperature: TNeuralFloat;
   out Codes: TNNetIntArr2D);
 var
+  LpMax: integer;
   EncHidden, FrameEmb, Probs: TNNetVolume;
   Delayed: TNNetIntArr2D;
   SDPAs: array of TNNetScaledDotProductAttention;
@@ -27315,7 +27390,8 @@ begin
         ImportError('MusicGen GenerateEx: encoder-states size mismatch.');
       EncStatesInput.Output.Copy(EncHidden);
       EncStatesInputU.Output.Copy(UncondHidden);
-      for i := 0 to FStepDecoder.Layers.Count - 1 do
+      LpMax := FStepDecoder.Layers.Count - 1;
+      for i := 0 to LpMax do
       begin
         Lay := FStepDecoder.Layers[i];
         if Lay is TNNetScaledDotProductAttention then
@@ -27325,7 +27401,8 @@ begin
           SDPAs[n].BeginIncrementalDecode(FDecSeqLen);
         end;
       end;
-      for i := 0 to FStepDecoderUncond.Layers.Count - 1 do
+      LpMax := FStepDecoderUncond.Layers.Count - 1;
+      for i := 0 to LpMax do
       begin
         Lay := FStepDecoderUncond.Layers[i];
         if Lay is TNNetScaledDotProductAttention then
@@ -27487,7 +27564,8 @@ begin
     // distinct class) and are intentionally left on the full-sequence path so
     // each step re-attends the fixed encoder states. Mirrors
     // TNNetStreamingDecoder's class scan inline (no neuraldecode dependency).
-    for i := 0 to FStepDecoder.Layers.Count - 1 do
+    LpMax := FStepDecoder.Layers.Count - 1;
+    for i := 0 to LpMax do
     begin
       Lay := FStepDecoder.Layers[i];
       if Lay is TNNetScaledDotProductAttention then
@@ -27801,6 +27879,8 @@ procedure BuildPegasusFromSafeTensorsWithConfig(const FileName: string;
   EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false);
 var
+  LpMax: integer;
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   Enc, Dec: TNNet;
   EncBlocks, DecBlocks: TMarianBlockArray;
@@ -27926,7 +28006,8 @@ begin
           EmbedScale := Sqrt(Config.DModel)
         else
           EmbedScale := 1.0;
-        for i := 0 to Tmp.Size - 1 do
+        LpMax := Tmp.Size - 1;
+        for i := 0 to LpMax do
         begin
           EncEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
           DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
@@ -27988,7 +28069,8 @@ begin
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -28121,6 +28203,8 @@ procedure BuildMBartFromSafeTensorsWithConfig(const FileName: string;
   EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false);
 var
+  LpMax: integer;
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   Enc, Dec: TNNet;
   EncBlocks, DecBlocks: TMarianBlockArray;
@@ -28276,7 +28360,8 @@ begin
           EmbedScale := Sqrt(Config.DModel)
         else
           EmbedScale := 1.0;
-        for i := 0 to Tmp.Size - 1 do
+        LpMax := Tmp.Size - 1;
+        for i := 0 to LpMax do
         begin
           EncEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
           DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
@@ -28345,7 +28430,8 @@ begin
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -28518,6 +28604,8 @@ procedure BuildM2M100FromSafeTensorsWithConfig(const FileName: string;
   EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false);
 var
+  LpMax: integer;
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   Enc, Dec: TNNet;
   EncBlocks, DecBlocks: TMarianBlockArray;
@@ -28646,7 +28734,8 @@ begin
           EmbedScale := Sqrt(Config.DModel)
         else
           EmbedScale := 1.0;
-        for i := 0 to Tmp.Size - 1 do
+        LpMax := Tmp.Size - 1;
+        for i := 0 to LpMax do
         begin
           EncEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
           DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
@@ -28716,7 +28805,8 @@ begin
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -29036,6 +29126,8 @@ procedure BuildSeamlessM4TFromSafeTensorsWithConfig(const FileName: string;
   SpeechFrames, DecSeqLen: integer; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false);
 var
+  LpMax: integer;
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   Enc, Dec: TNNet;
   Consumed: TStringList;
@@ -29427,7 +29519,8 @@ begin
         Reader.LoadTensorFlat('shared.weight', Tmp);
         if Config.ScaleEmbedding then EmbedScale := Sqrt(Hidden)
         else EmbedScale := 1.0;
-        for i := 0 to Tmp.Size - 1 do
+        LpMax := Tmp.Size - 1;
+        for i := 0 to LpMax do
           DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
         DecEmbed.FlushWeightCache();
         Consumed.Add('shared.weight');
@@ -29482,7 +29575,8 @@ begin
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
 
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -29924,6 +30018,8 @@ procedure BuildWhisperFromSafeTensorsWithConfig(const FileName: string;
   var Config: TWhisperConfig; out EncoderNet, DecoderNet: TNNet;
   DecSeqLen: integer; pInferenceOnly: boolean = false);
 var
+  LpMax: integer;
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   Enc, Dec: TNNet;
   EncBlocks, DecBlocks: TMarianBlockArray;
@@ -30071,7 +30167,8 @@ begin
           EmbedScale := Sqrt(Config.DModel)
         else
           EmbedScale := 1.0;
-        for i := 0 to Tmp.Size - 1 do
+        LpMax := Tmp.Size - 1;
+        for i := 0 to LpMax do
           DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
         DecEmbed.FlushWeightCache();
         Consumed.Add('model.decoder.embed_tokens.weight');
@@ -30137,7 +30234,8 @@ begin
       Consumed.Add('model.decoder.layer_norm.bias');
 
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -30385,6 +30483,7 @@ var
   Score: TNNetVolume;
   PathTok, PathFrame: array of integer;
   PathLen, NText, t, k, WordCnt: integer;
+  ScoreXMax: integer;
   TokStartFrame, TokEndFrame: array of integer;
   Surface: string;
   CurStart, CurEnd: integer;
@@ -30408,8 +30507,9 @@ begin
     if TextStart > 0 then
     begin
       // Re-pack rows [TextStart..] to the top.
+      ScoreXMax := Score.SizeX - 1;
       for t := 0 to NText - 1 do
-        for k := 0 to Score.SizeX - 1 do
+        for k := 0 to ScoreXMax do
           Score[k, t, 0] := Score[k, t + TextStart, 0];
     end;
     // DTW on just the text rows.
@@ -30812,6 +30912,7 @@ function BuildWav2Vec2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TWav2Vec2Config; NumSamples: integer;
   pInferenceOnly: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   QKV, AttnDense, AttnLN, Inter, OutDense, OutLN: array of TNNetLayer;
@@ -31044,7 +31145,8 @@ begin
       MarkConsumed('lm_head.bias');
 
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -31686,6 +31788,7 @@ function BuildMoonshineFromSafeTensorsWithConfig(const FileName: string;
   var Config: TMoonshineConfig; NumSamples: integer;
   pInferenceOnly: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Conv1, Conv2, Conv3, ConvGN, FinalLN: TNNetLayer;
@@ -31943,7 +32046,8 @@ begin
         'encoder.layer_norm.weight', Config.HiddenSize, Consumed);
 
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -32004,6 +32108,8 @@ procedure BuildMoonshineEncoderDecoderFromSafeTensorsWithConfig(
   NumSamples, DecSeqLen: integer; out Enc, Dec: TNNet;
   pInferenceOnly: boolean = false);
 var
+  LpMax: integer;
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   EncStates, DecTokenInput, DecEmbed, LMHead, FinalNorm: TNNetLayer;
   SelfNorm, SQ, SK, SV, SO, CrossNorm, CQ, CK, CV, CO: array of TNNetLayer;
@@ -32223,7 +32329,8 @@ begin
           'count ' + IntToStr(EmbedTmp.Size) + ' does not match the ' +
           'embedding table size ' +
           IntToStr(DecEmbed.FArrNeurons[0].Weights.Size) + '.');
-      for i := 0 to EmbedTmp.Size - 1 do
+      LpMax := EmbedTmp.Size - 1;
+      for i := 0 to LpMax do
         DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedTmp.FData[i];
       DecEmbed.FlushWeightCache();
       Consumed.Add('decoder.embed_tokens.weight');
@@ -32310,7 +32417,8 @@ begin
       end;
 
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -32363,6 +32471,7 @@ end;
 
 function ReadEnCodecConfigFromJSONFile(const FileName: string): TEnCodecConfig;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
@@ -32435,7 +32544,8 @@ begin
     if Arr.Count < 1 then
       ImportError('EnCodec import: "upsampling_ratios" array is empty.');
     SetLength(Result.UpsamplingRatios, Arr.Count);
-    for I := 0 to Arr.Count - 1 do
+    LpMax := Arr.Count - 1;
+    for I := 0 to LpMax do
       Result.UpsamplingRatios[I] := Arr.Integers[I];
     // Supported-variant guards (documented follow-ups otherwise). Both the
     // causal (24 kHz) and non-causal (32 kHz, MusicGen) symmetric-pad variants
@@ -32498,6 +32608,7 @@ procedure LoadEnCodecConv(Reader: TNNetSafeTensorsReader;
   const Prefix: string; var Conv: TEnCodecConv; pTranspose: boolean;
   pStride, pDilation: integer; Consumed: TStrings);
 var
+  LpMax: integer;
   G, V: TNNetVolume;
   OutDim, InDim, K, o, i, k2, Base, Cnt: integer;
   Norm: TNeuralFloat;
@@ -32564,7 +32675,8 @@ begin
     Reader.LoadTensorFlat(Prefix + '.bias', G);
     Consumed.Add(Prefix + '.bias');
     SetLength(Conv.B, G.Size);
-    for o := 0 to G.Size - 1 do Conv.B[o] := G.FData[o];
+    LpMax := G.Size - 1;
+    for o := 0 to LpMax do Conv.B[o] := G.FData[o];
   finally
     V.Free;
     G.Free;
@@ -32575,6 +32687,7 @@ end;
 procedure LoadEnCodecMat(Reader: TNNetSafeTensorsReader;
   const Name: string; var Mat: TEnCodecMat; Consumed: TStrings);
 var
+  LpMax: integer;
   T: TNNetVolume;
   I: integer;
 begin
@@ -32584,7 +32697,8 @@ begin
     Mat.Rows := Reader.DimSize(Name, 0);
     Mat.Cols := Reader.DimSize(Name, 1);
     SetLength(Mat.Data, T.Size);
-    for I := 0 to T.Size - 1 do Mat.Data[I] := T.FData[I];
+    LpMax := T.Size - 1;
+    for I := 0 to LpMax do Mat.Data[I] := T.FData[I];
     Consumed.Add(Name);
   finally
     T.Free;
@@ -32594,6 +32708,7 @@ end;
 procedure LoadEnCodecVec(Reader: TNNetSafeTensorsReader;
   const Name: string; out Vec: TNeuralFloatDynArr; Consumed: TStrings);
 var
+  LpMax: integer;
   T: TNNetVolume;
   I: integer;
 begin
@@ -32601,7 +32716,8 @@ begin
   try
     Reader.LoadTensorFlat(Name, T);
     SetLength(Vec, T.Size);
-    for I := 0 to T.Size - 1 do Vec[I] := T.FData[I];
+    LpMax := T.Size - 1;
+    for I := 0 to LpMax do Vec[I] := T.FData[I];
     Consumed.Add(Name);
   finally
     T.Free;
@@ -33200,6 +33316,7 @@ end;
 
 function ReadMimiConfigFromJSONFile(const FileName: string): TMimiConfig;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root, RopeObj, RatiosArr: TJSONData;
   Obj: TJSONObject;
@@ -33289,7 +33406,8 @@ begin
     if Arr.Count < 1 then
       ImportError('Mimi import: "upsampling_ratios" array is empty.');
     SetLength(Result.UpsamplingRatios, Arr.Count);
-    for I := 0 to Arr.Count - 1 do
+    LpMax := Arr.Count - 1;
+    for I := 0 to LpMax do
       Result.UpsamplingRatios[I] := Arr.Integers[I];
     // encodec_frame_rate = sampling_rate / prod(ratios).
     RatiosProd := 1;
@@ -33416,6 +33534,7 @@ procedure LoadMimiConv(Reader: TNNetSafeTensorsReader;
   const Prefix: string; var Conv: TEnCodecConv; pTranspose: boolean;
   pStride, pDilation, pGroups: integer; pPadMode: string; Consumed: TStrings);
 var
+  LpMax: integer;
   W: TNNetVolume;
   D0, D1, K, o, i: integer;
 begin
@@ -33445,14 +33564,16 @@ begin
       Conv.OutCh := D0;
     end;
     SetLength(Conv.W, W.Size);
-    for o := 0 to W.Size - 1 do Conv.W[o] := W.FData[o];
+    LpMax := W.Size - 1;
+    for o := 0 to LpMax do Conv.W[o] := W.FData[o];
     // Optional bias.
     if Reader.HasTensor(Prefix + '.bias') then
     begin
       Reader.LoadTensorFlat(Prefix + '.bias', W);
       Consumed.Add(Prefix + '.bias');
       SetLength(Conv.B, W.Size);
-      for o := 0 to W.Size - 1 do Conv.B[o] := W.FData[o];
+      LpMax := W.Size - 1;
+      for o := 0 to LpMax do Conv.B[o] := W.FData[o];
     end
     else
     begin
@@ -33586,6 +33707,7 @@ end;
 procedure LoadMimiMat(Reader: TNNetSafeTensorsReader;
   const Name: string; var Mat: TEnCodecMat; Consumed: TStrings);
 var
+  LpMax: integer;
   T: TNNetVolume;
   I: integer;
 begin
@@ -33595,7 +33717,8 @@ begin
     Mat.Rows := Reader.DimSize(Name, 0);
     Mat.Cols := Reader.DimSize(Name, 1);
     SetLength(Mat.Data, T.Size);
-    for I := 0 to T.Size - 1 do Mat.Data[I] := T.FData[I];
+    LpMax := T.Size - 1;
+    for I := 0 to LpMax do Mat.Data[I] := T.FData[I];
     Consumed.Add(Name);
   finally
     T.Free;
@@ -33605,6 +33728,7 @@ end;
 procedure LoadMimiVec(Reader: TNNetSafeTensorsReader;
   const Name: string; out Vec: TNeuralFloatDynArr; Consumed: TStrings);
 var
+  LpMax: integer;
   T: TNNetVolume;
   I: integer;
 begin
@@ -33612,7 +33736,8 @@ begin
   try
     Reader.LoadTensorFlat(Name, T);
     SetLength(Vec, T.Size);
-    for I := 0 to T.Size - 1 do Vec[I] := T.FData[I];
+    LpMax := T.Size - 1;
+    for I := 0 to LpMax do Vec[I] := T.FData[I];
     Consumed.Add(Name);
   finally
     T.Free;
@@ -34324,6 +34449,7 @@ end;
 
 function ReadHiFiGANConfigFromJSONFile(const FileName: string): THiFiGANConfig;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
@@ -34360,7 +34486,8 @@ var
       ImportError('HiFi-GAN import: config field "' + FieldName +
         '" must have ' + IntToStr(Length(Dst)) + ' entries, got ' +
         IntToStr(A.Count) + '.');
-    for i := 0 to A.Count - 1 do Dst[i] := A.Items[i].AsInteger;
+    LpMax := A.Count - 1;
+    for i := 0 to LpMax do Dst[i] := A.Items[i].AsInteger;
   end;
 
 begin
@@ -34416,7 +34543,8 @@ begin
       ImportError('HiFi-GAN import: upsample_rates must be non-empty.');
     SetLength(Result.UpsampleRates, Arr.Count);
     SetLength(Result.UpsampleKernelSizes, Arr.Count);
-    for k := 0 to Arr.Count - 1 do
+    LpMax := Arr.Count - 1;
+    for k := 0 to LpMax do
     begin
       Result.UpsampleRates[k] := Arr.Items[k].AsInteger;
       if Result.UpsampleRates[k] <= 0 then
@@ -34436,7 +34564,8 @@ begin
     if Arr.Count < 1 then
       ImportError('HiFi-GAN import: resblock_kernel_sizes must be non-empty.');
     SetLength(Result.ResblockKernelSizes, Arr.Count);
-    for k := 0 to Arr.Count - 1 do
+    LpMax := Arr.Count - 1;
+    for k := 0 to LpMax do
       Result.ResblockKernelSizes[k] := Arr.Items[k].AsInteger;
 
     if Obj.IndexOfName('resblock_dilation_sizes') < 0 then
@@ -34452,14 +34581,16 @@ begin
         IntToStr(Length(Result.ResblockKernelSizes)) + '), got ' +
         IntToStr(Arr.Count) + '.');
     SetLength(Result.ResblockDilationSizes, Arr.Count);
-    for k := 0 to Arr.Count - 1 do
+    LpMax := Arr.Count - 1;
+    for k := 0 to LpMax do
     begin
       if not (Arr.Items[k] is TJSONArray) then
         ImportError('HiFi-GAN import: resblock_dilation_sizes[' +
           IntToStr(k) + '] must be an array.');
       Inner := TJSONArray(Arr.Items[k]);
       SetLength(Result.ResblockDilationSizes[k], Inner.Count);
-      for j := 0 to Inner.Count - 1 do
+      LpMax := Inner.Count - 1;
+      for j := 0 to LpMax do
         Result.ResblockDilationSizes[k][j] := Inner.Items[j].AsInteger;
     end;
 
@@ -34514,6 +34645,7 @@ procedure LoadHiFiGANConv(Reader: TNNetSafeTensorsReader;
   const Prefix: string; var Conv: THiFiGANConv; pTranspose: boolean;
   pStride, pDilation, pPad: integer; Consumed: TStrings);
 var
+  LpMax: integer;
   G, V, W: TNNetVolume;
   OutDim, InDim, K, o, i, k2, Base, Cnt: integer;
   Norm: TNeuralFloat;
@@ -34597,7 +34729,8 @@ begin
     Reader.LoadTensorFlat(Prefix + '.bias', G);
     Consumed.Add(Prefix + '.bias');
     SetLength(Conv.B, G.Size);
-    for o := 0 to G.Size - 1 do Conv.B[o] := G.FData[o];
+    LpMax := G.Size - 1;
+    for o := 0 to LpMax do Conv.B[o] := G.FData[o];
   finally
     W.Free;
     V.Free;
@@ -34840,6 +34973,7 @@ end;
 function BuildHiFiGANFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
   var Config: THiFiGANConfig): TNNetHiFiGAN;
 var
+  LpMax: integer;
   Model: TNNetHiFiGAN;
   Consumed: TStringList;
   T: TNNetVolume;
@@ -34934,14 +35068,16 @@ begin
     begin
       Reader.LoadTensorFlat('mean', T);
       SetLength(Model.FMean, T.Size);
-      for j := 0 to T.Size - 1 do Model.FMean[j] := T.FData[j];
+      LpMax := T.Size - 1;
+      for j := 0 to LpMax do Model.FMean[j] := T.FData[j];
       Consumed.Add('mean');
     end;
     if Reader.HasTensor('scale') then
     begin
       Reader.LoadTensorFlat('scale', T);
       SetLength(Model.FScale, T.Size);
-      for j := 0 to T.Size - 1 do Model.FScale[j] := T.FData[j];
+      LpMax := T.Size - 1;
+      for j := 0 to LpMax do Model.FScale[j] := T.FData[j];
       Consumed.Add('scale');
     end;
 
@@ -35147,6 +35283,7 @@ end;
 procedure TNNetDemucs.Separate(const Mix: array of TNeuralFloatDynArr;
   out Stems: array of TNNetFloatDynArr2D);
 var
+  LpMax: integer;
   Sig, Nxt, Gout: TNNetFloatDynArr2D;
   Skips: array of TNNetFloatDynArr2D;
   i, j, c, t, Tlen, InLen, L, src, ch: integer;
@@ -35165,7 +35302,8 @@ begin
 
   // ---- encoder: depth blocks, saving each GLU output as a skip.
   SetLength(Skips, FConfig.Depth);
-  for i := 0 to FConfig.Depth - 1 do
+  LpMax := FConfig.Depth - 1;
+  for i := 0 to LpMax do
   begin
     RunHiFiGANConv(FEncConv1[i], Sig, Nxt);   // strided Conv1d
     Sig := Nxt;
@@ -35214,7 +35352,8 @@ begin
   Sig := Lin;
 
   // ---- decoder: reverse order, U-Net skip add then GLU conv + transpose conv.
-  for j := 0 to FConfig.Depth - 1 do
+  LpMax := FConfig.Depth - 1;
+  for j := 0 to LpMax do
   begin
     L := Length(Sig[0]);
     // skip from encoder block (depth-1-j), center-trimmed to len(Sig).
@@ -35254,13 +35393,15 @@ procedure LoadDemucsLSTMLayer(Reader: TNNetSafeTensorsReader;
   var
     V: TNNetVolume;
     k: integer;
+    LpMax: integer;
   begin
     V := TNNetVolume.Create;
     try
       Reader.LoadTensorFlat(Name, V);
       Consumed.Add(Name);
       SetLength(Dst, V.Size);
-      for k := 0 to V.Size - 1 do Dst[k] := V.FData[k];
+      LpMax := V.Size - 1;
+      for k := 0 to LpMax do Dst[k] := V.FData[k];
     finally
       V.Free;
     end;
@@ -35287,6 +35428,7 @@ end;
 function BuildDemucsFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
   var Config: TDemucsConfig): TNNetDemucs;
 var
+  LpMax: integer;
   Model: TNNetDemucs;
   Consumed: TStringList;
   V: TNNetVolume;
@@ -35303,7 +35445,8 @@ begin
     // ---- encoder convs.
     SetLength(Model.FEncConv1, Config.Depth);
     SetLength(Model.FEncConv2, Config.Depth);
-    for i := 0 to Config.Depth - 1 do
+    LpMax := Config.Depth - 1;
+    for i := 0 to LpMax do
     begin
       // encoder.i.0: Conv1d(in -> out, k=kernel_size, stride=stride).
       LoadHiFiGANConv(Reader, 'encoder.' + IntToStr(i) + '.0',
@@ -35322,17 +35465,20 @@ begin
     Model.FLinOut := Reader.DimSize('lstm_linear.weight', 0);
     Model.FLinIn := Reader.DimSize('lstm_linear.weight', 1);
     SetLength(Model.FLinW, V.Size);
-    for k := 0 to V.Size - 1 do Model.FLinW[k] := V.FData[k];
+    LpMax := V.Size - 1;
+    for k := 0 to LpMax do Model.FLinW[k] := V.FData[k];
     Reader.LoadTensorFlat('lstm_linear.bias', V);
     Consumed.Add('lstm_linear.bias');
     SetLength(Model.FLinB, V.Size);
-    for k := 0 to V.Size - 1 do Model.FLinB[k] := V.FData[k];
+    LpMax := V.Size - 1;
+    for k := 0 to LpMax do Model.FLinB[k] := V.FData[k];
 
     // ---- decoder convs.
     pad := Config.Context div 2;
     SetLength(Model.FDecConv1, Config.Depth);
     SetLength(Model.FDecTConv, Config.Depth);
-    for i := 0 to Config.Depth - 1 do
+    LpMax := Config.Depth - 1;
+    for i := 0 to LpMax do
     begin
       // decoder.i.0: Conv1d(in -> 2*in, k=context, stride=1, pad=context div 2).
       LoadHiFiGANConv(Reader, 'decoder.' + IntToStr(i) + '.0',
@@ -35377,6 +35523,7 @@ end;
 procedure LoadVitsDense(Reader: TNNetSafeTensorsReader; const Prefix: string;
   var W, B: TNeuralFloatDynArr; Consumed: TStrings);
 var
+  LpMax: integer;
   V: TNNetVolume;
   i: integer;
 begin
@@ -35385,11 +35532,13 @@ begin
     Reader.LoadTensorFlat(Prefix + '.weight', V);
     Consumed.Add(Prefix + '.weight');
     SetLength(W, V.Size);
-    for i := 0 to V.Size - 1 do W[i] := V.FData[i];
+    LpMax := V.Size - 1;
+    for i := 0 to LpMax do W[i] := V.FData[i];
     Reader.LoadTensorFlat(Prefix + '.bias', V);
     Consumed.Add(Prefix + '.bias');
     SetLength(B, V.Size);
-    for i := 0 to V.Size - 1 do B[i] := V.FData[i];
+    LpMax := V.Size - 1;
+    for i := 0 to LpMax do B[i] := V.FData[i];
   finally
     V.Free;
   end;
@@ -35399,6 +35548,7 @@ end;
 procedure LoadVitsVec(Reader: TNNetSafeTensorsReader; const Name: string;
   var Dst: TNeuralFloatDynArr; Consumed: TStrings);
 var
+  LpMax: integer;
   V: TNNetVolume;
   i: integer;
 begin
@@ -35407,7 +35557,8 @@ begin
     Reader.LoadTensorFlat(Name, V);
     Consumed.Add(Name);
     SetLength(Dst, V.Size);
-    for i := 0 to V.Size - 1 do Dst[i] := V.FData[i];
+    LpMax := V.Size - 1;
+    for i := 0 to LpMax do Dst[i] := V.FData[i];
   finally
     V.Free;
   end;
@@ -35659,6 +35810,7 @@ end;
 procedure TNNetVitsTokenizer.LoadFromFiles(const VocabFile: string;
   const ConfigFile: string = '');
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root, CfgRoot, IdNode: TJSONData;
   Obj, CfgObj: TJSONObject;
@@ -35687,7 +35839,8 @@ begin
       ImportError('VITS tokenizer: vocab "' + VocabFile +
         '" must be a flat JSON object mapping each char to its id.');
     Obj := TJSONObject(Root);
-    for i := 0 to Obj.Count - 1 do
+    LpMax := Obj.Count - 1;
+    for i := 0 to LpMax do
     begin
       Key := Obj.Names[i];
       IdNode := Obj.Items[i];
@@ -36510,6 +36663,7 @@ end;
 
 function ReadVitsConfigFromJSONFile(const FileName: string): TVitsConfig;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
@@ -36605,32 +36759,37 @@ begin
       ImportError('VITS import: "upsample_rates" must be an array.');
     Arr := TJSONArray(Obj.Find('upsample_rates'));
     SetLength(Result.Decoder.UpsampleRates, Arr.Count);
-    for k := 0 to Arr.Count - 1 do
+    LpMax := Arr.Count - 1;
+    for k := 0 to LpMax do
       Result.Decoder.UpsampleRates[k] := Arr.Items[k].AsInteger;
 
     if not (Obj.Find('upsample_kernel_sizes') is TJSONArray) then
       ImportError('VITS import: "upsample_kernel_sizes" must be an array.');
     Arr := TJSONArray(Obj.Find('upsample_kernel_sizes'));
     SetLength(Result.Decoder.UpsampleKernelSizes, Arr.Count);
-    for k := 0 to Arr.Count - 1 do
+    LpMax := Arr.Count - 1;
+    for k := 0 to LpMax do
       Result.Decoder.UpsampleKernelSizes[k] := Arr.Items[k].AsInteger;
 
     if not (Obj.Find('resblock_kernel_sizes') is TJSONArray) then
       ImportError('VITS import: "resblock_kernel_sizes" must be an array.');
     Arr := TJSONArray(Obj.Find('resblock_kernel_sizes'));
     SetLength(Result.Decoder.ResblockKernelSizes, Arr.Count);
-    for k := 0 to Arr.Count - 1 do
+    LpMax := Arr.Count - 1;
+    for k := 0 to LpMax do
       Result.Decoder.ResblockKernelSizes[k] := Arr.Items[k].AsInteger;
 
     if not (Obj.Find('resblock_dilation_sizes') is TJSONArray) then
       ImportError('VITS import: "resblock_dilation_sizes" must be an array.');
     Arr := TJSONArray(Obj.Find('resblock_dilation_sizes'));
     SetLength(Result.Decoder.ResblockDilationSizes, Arr.Count);
-    for k := 0 to Arr.Count - 1 do
+    LpMax := Arr.Count - 1;
+    for k := 0 to LpMax do
     begin
       Inner := TJSONArray(Arr.Items[k]);
       SetLength(Result.Decoder.ResblockDilationSizes[k], Inner.Count);
-      for j := 0 to Inner.Count - 1 do
+      LpMax := Inner.Count - 1;
+      for j := 0 to LpMax do
         Result.Decoder.ResblockDilationSizes[k][j] := Inner.Items[j].AsInteger;
     end;
 
@@ -36686,6 +36845,7 @@ procedure LoadVitsPlainConv(Reader: TNNetSafeTensorsReader;
   const Prefix: string; var Conv: THiFiGANConv;
   pStride, pDilation, pPad: integer; Consumed: TStrings);
 var
+  LpMax: integer;
   W: TNNetVolume;
   OutDim, InDim, K, i, Cnt: integer;
 begin
@@ -36709,7 +36869,8 @@ begin
     Reader.LoadTensorFlat(Prefix + '.bias', W);
     Consumed.Add(Prefix + '.bias');
     SetLength(Conv.B, W.Size);
-    for i := 0 to W.Size - 1 do Conv.B[i] := W.FData[i];
+    LpMax := W.Size - 1;
+    for i := 0 to LpMax do Conv.B[i] := W.FData[i];
   finally
     W.Free;
   end;
@@ -37093,6 +37254,7 @@ function BuildRWKVFromSafeTensorsWithConfig(const FileName: string;
   var Config: TRWKVConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TRWKVBlockLayers;
@@ -37380,7 +37542,8 @@ begin
       // Final sweep: everything refilled above ends int8-quantized.
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -37537,6 +37700,7 @@ function BuildMambaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TMambaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TMambaBlockLayers;
@@ -37841,7 +38005,8 @@ begin
       // Final sweep: everything refilled above ends int8-quantized.
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -38545,6 +38710,7 @@ function BuildMamba2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TMamba2Config; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TMamba2BlockLayers;
@@ -38769,7 +38935,8 @@ begin
       MarkConsumed(Config.Prefix + 'norm_f.weight');
 
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -38971,6 +39138,7 @@ function BuildRecurrentGemmaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TRecurrentGemmaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TRecGemmaBlock;
@@ -39353,7 +39521,8 @@ begin
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -39542,6 +39711,7 @@ function BuildJambaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TJambaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TJambaBlockLayers;
@@ -39920,7 +40090,8 @@ begin
 
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -39985,6 +40156,7 @@ end;
 function ReadNemotronHConfigFromJSONFile(
   const FileName: string): TNemotronHConfig;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
@@ -40041,7 +40213,8 @@ begin
       if (ListData <> nil) and (ListData.JSONType = jtArray) then
       begin
         Arr := TJSONArray(ListData);
-        for i := 0 to Arr.Count - 1 do
+        LpMax := Arr.Count - 1;
+        for i := 0 to LpMax do
         begin
           sb := LowerCase(Arr.Strings[i]);
           if sb = 'mamba' then Pattern := Pattern + 'M'
@@ -40218,6 +40391,7 @@ function BuildNemotronHFromSafeTensorsWithConfig(const FileName: string;
   var Config: TNemotronHConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TNemotronHBlockLayers;
@@ -40688,7 +40862,8 @@ begin
       MarkConsumed(Config.Prefix + 'norm_f.weight');
 
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -40913,6 +41088,7 @@ function BuildBloomFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBloomConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TBloomBlockLayers;
@@ -41129,7 +41305,8 @@ begin
       // Final sweep: everything refilled above ends int8-quantized.
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -41441,6 +41618,7 @@ function BuildFalconFromSafeTensorsWithConfig(const FileName: string;
   var Config: TFalconConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TFalconBlockLayers;
@@ -41745,7 +41923,8 @@ begin
 
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -42134,6 +42313,7 @@ function BuildModernBertFromSafeTensorsWithConfig(const FileName: string;
   var Config: TModernBertConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TModernBertBlockLayers;
@@ -42426,7 +42606,8 @@ begin
       // Final sweep: everything refilled above ends int8-quantized.
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -42677,6 +42858,7 @@ function BuildDeepSeekV2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TDeepSeekV2Config; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TDeepSeekV2BlockLayers;
@@ -43149,7 +43331,8 @@ begin
       // Final sweep: everything refilled above ends int8-quantized.
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -43767,6 +43950,7 @@ end;
 function ClipTextEosPosition(TokenIds: TNNetVolume;
   EosTokenId: integer): integer;
 var
+  LpMax: integer;
   PosCnt, TokenId, BestId: integer;
 begin
   Result := 0;
@@ -43781,7 +43965,8 @@ begin
     // input_ids.argmax(-1) - the FIRST occurrence of the highest id
     // (the eot token carries the top id in the CLIP vocab).
     BestId := Round(TokenIds.FData[0]);
-    for PosCnt := 1 to TokenIds.SizeX - 1 do
+    LpMax := TokenIds.SizeX - 1;
+    for PosCnt := 1 to LpMax do
     begin
       TokenId := Round(TokenIds.FData[PosCnt]);
       if TokenId > BestId then
@@ -43795,7 +43980,8 @@ begin
   begin
     // The fixed branch: the FIRST position equal to eos_token_id.
     Result := -1;
-    for PosCnt := 0 to TokenIds.SizeX - 1 do
+    LpMax := TokenIds.SizeX - 1;
+    for PosCnt := 0 to LpMax do
       if Round(TokenIds.FData[PosCnt]) = EosTokenId then
       begin
         Result := PosCnt;
@@ -43837,13 +44023,15 @@ end;
 
 function ClipSimilarity(EmbA, EmbB: TNNetVolume): TNeuralFloat;
 var
+  LpMax: integer;
   ChanCnt: integer;
 begin
   Result := 0;
   if EmbA.Size <> EmbB.Size then
     ImportError('ClipSimilarity: embedding sizes differ (' +
       IntToStr(EmbA.Size) + ' vs ' + IntToStr(EmbB.Size) + ').');
-  for ChanCnt := 0 to EmbA.Size - 1 do
+  LpMax := EmbA.Size - 1;
+  for ChanCnt := 0 to LpMax do
     Result := Result + EmbA.FData[ChanCnt] * EmbB.FData[ChanCnt];
 end;
 
@@ -44575,11 +44763,13 @@ end;
 // Returns the decoder's SECOND TNNetInput (the image hidden-states input).
 function BlipEncoderStatesInput(TextNet: TNNet): TNNetLayer;
 var
+  LpMax: integer;
   LayerCnt, InputCnt: integer;
 begin
   Result := nil;
   InputCnt := 0;
-  for LayerCnt := 0 to TextNet.Layers.Count - 1 do
+  LpMax := TextNet.Layers.Count - 1;
+  for LayerCnt := 0 to LpMax do
     if TextNet.Layers[LayerCnt] is TNNetInput then
     begin
       Inc(InputCnt);
@@ -44983,6 +45173,8 @@ procedure BuildTrOCRFromSafeTensorsWithConfig(const FileName: string;
   var Config: TTrOCRConfig; out EncoderNet, DecoderNet: TNNet;
   DecSeqLen: integer = 0; pInferenceOnly: boolean = false);
 var
+  LpMax: integer;
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   Enc, Dec: TNNet;
   DecBlocks: TMarianBlockArray;
@@ -45061,7 +45253,8 @@ begin
             IntToStr(Config.VocabSize * Config.DModel) + ').');
         if Config.ScaleEmbedding then EmbedScale := Sqrt(Config.DModel)
         else EmbedScale := 1.0;
-        for i := 0 to Tmp.Size - 1 do
+        LpMax := Tmp.Size - 1;
+        for i := 0 to LpMax do
           DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
         DecEmbed.FlushWeightCache();
         Consumed.Add('decoder.model.decoder.embed_tokens.weight');
@@ -45112,7 +45305,8 @@ begin
         MarianShim, Config.DecFFNDim, {IsDecoder=}true, Consumed);
 
       // ---------------- Unexpected-tensor check ----------------
-      for i := 0 to Reader.Count - 1 do
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
       begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
@@ -45385,6 +45579,7 @@ end;
 procedure OwlViTQueryEmbedding(TextNet: TNNet; TokenIds: TNNetVolume;
   QueryEmb: TNNetVolume);
 var
+  LpMax: integer;
   Output: TNNetVolume;
   Depth, ChanCnt, Pos, BestPos, BestId, TokId: integer;
   Norm: TNeuralFloat;
@@ -45394,7 +45589,8 @@ begin
   // OWL-ViT pools at input_ids.argmax(-1): the FIRST position with the max id.
   BestPos := 0;
   BestId := Round(TokenIds.FData[0]);
-  for Pos := 1 to TokenIds.SizeX - 1 do
+  LpMax := TokenIds.SizeX - 1;
+  for Pos := 1 to LpMax do
   begin
     TokId := Round(TokenIds.FData[Pos]);
     if TokId > BestId then begin BestId := TokId; BestPos := Pos; end;
@@ -47938,6 +48134,7 @@ end;
 function ReadMobileNetV3ConfigFromJSONFile(
   const FileName: string): TMobileNetV3Config;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root, BlockData, LabelObj: TJSONData;
   Obj, BObj: TJSONObject;
@@ -47975,7 +48172,8 @@ begin
     if BlocksArr.Count < 1 then
       ImportError('MobileNetV3 import: "blocks" must have >= 1 entry.');
     SetLength(Result.Blocks, BlocksArr.Count);
-    for i := 0 to BlocksArr.Count - 1 do
+    LpMax := BlocksArr.Count - 1;
+    for i := 0 to LpMax do
     begin
       if not (BlocksArr.Items[i] is TJSONObject) then
         ImportError('MobileNetV3 import: blocks[' + IntToStr(i) +
@@ -48101,6 +48299,7 @@ end;
 // neuron, weight depth == channels). Shift is consumed (freed) here.
 procedure LoadChannelBiasFromShift(BiasLayer: TNNetLayer; Shift: TNNetVolume);
 var
+  LpMax: integer;
   c: integer;
 begin
   EnsureWritableImportWeights(BiasLayer);
@@ -48109,7 +48308,8 @@ begin
       ImportError('MobileNetV3 import: internal error - ChannelBias has ' +
         IntToStr(BiasLayer.FArrNeurons[0].Weights.Size) + ' weights, expected ' +
         IntToStr(Shift.Size) + '.');
-    for c := 0 to Shift.Size - 1 do
+    LpMax := Shift.Size - 1;
+    for c := 0 to LpMax do
       BiasLayer.FArrNeurons[0].Weights.FData[c] := Shift.FData[c];
     BiasLayer.FlushWeightCache();
   finally
@@ -48352,6 +48552,7 @@ end;
 function ReadEfficientNetConfigFromJSONFile(
   const FileName: string): TEfficientNetConfig;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root, BlockData, LabelObj: TJSONData;
   Obj, BObj: TJSONObject;
@@ -48389,7 +48590,8 @@ begin
     if BlocksArr.Count < 1 then
       ImportError('EfficientNet import: "blocks" must have >= 1 entry.');
     SetLength(Result.Blocks, BlocksArr.Count);
-    for i := 0 to BlocksArr.Count - 1 do
+    LpMax := BlocksArr.Count - 1;
+    for i := 0 to LpMax do
     begin
       if not (BlocksArr.Items[i] is TJSONObject) then
         ImportError('EfficientNet import: blocks[' + IntToStr(i) +
@@ -48638,6 +48840,7 @@ end;
 
 function ReadSwinConfigFromJSONFile(const FileName: string): TSwinConfig;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root, ArrData, LabelObj: TJSONData;
   Obj: TJSONObject;
@@ -48677,7 +48880,8 @@ begin
     Arr := TJSONArray(ArrData);
     if Arr.Count < 1 then ImportError('Swin import: "depths" must be non-empty.');
     SetLength(Result.Depths, Arr.Count);
-    for i := 0 to Arr.Count - 1 do Result.Depths[i] := Arr.Integers[i];
+    LpMax := Arr.Count - 1;
+    for i := 0 to LpMax do Result.Depths[i] := Arr.Integers[i];
     // num_heads
     ArrData := Obj.Find('num_heads');
     if (ArrData = nil) or not (ArrData is TJSONArray) then
@@ -48686,7 +48890,8 @@ begin
     if Arr.Count <> Length(Result.Depths) then
       ImportError('Swin import: "num_heads" length must match "depths".');
     SetLength(Result.NumHeads, Arr.Count);
-    for i := 0 to Arr.Count - 1 do Result.NumHeads[i] := Arr.Integers[i];
+    LpMax := Arr.Count - 1;
+    for i := 0 to LpMax do Result.NumHeads[i] := Arr.Integers[i];
     // num_labels
     Result.NumLabels := 0;
     if Obj.IndexOfName('num_labels') >= 0 then
@@ -49163,6 +49368,7 @@ end;
 
 function ReadClapConfigFromJSONFile(const FileName: string): TClapConfig;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root, ArrData: TJSONData;
   Obj, AudioObj, TextObj: TJSONObject;
@@ -49219,7 +49425,8 @@ begin
     Arr := TJSONArray(ArrData);
     if Arr.Count < 1 then ImportError('CLAP import: "depths" must be non-empty.');
     SetLength(Result.Audio.Depths, Arr.Count);
-    for i := 0 to Arr.Count - 1 do Result.Audio.Depths[i] := Arr.Integers[i];
+    LpMax := Arr.Count - 1;
+    for i := 0 to LpMax do Result.Audio.Depths[i] := Arr.Integers[i];
     ArrData := AudioObj.Find('num_attention_heads');
     if (ArrData = nil) or not (ArrData is TJSONArray) then
       ImportError('CLAP import: audio_config missing "num_attention_heads".');
@@ -49227,7 +49434,8 @@ begin
     if Arr.Count <> Length(Result.Audio.Depths) then
       ImportError('CLAP import: audio num_attention_heads length must match depths.');
     SetLength(Result.Audio.NumHeads, Arr.Count);
-    for i := 0 to Arr.Count - 1 do Result.Audio.NumHeads[i] := Arr.Integers[i];
+    LpMax := Arr.Count - 1;
+    for i := 0 to LpMax do Result.Audio.NumHeads[i] := Arr.Integers[i];
 
     TextObj := ReqSub(Obj, 'text_config');
     Result.Text.HiddenSize := TextObj.Get('hidden_size', 768);
@@ -50195,6 +50403,7 @@ end;
 function ReadVaeDecoderConfigFromJSONFile(
   const FileName: string): TVaeDecoderConfig;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
@@ -50237,7 +50446,8 @@ begin
       ImportError('VAE import: "block_out_channels" must have 1..8 entries, ' +
         'got ' + IntToStr(Arr.Count) + '.');
     Result.NumBlockOut := Arr.Count;
-    for i := 0 to Arr.Count - 1 do Result.BlockOutChannels[i] := Arr.Integers[i];
+    LpMax := Arr.Count - 1;
+    for i := 0 to LpMax do Result.BlockOutChannels[i] := Arr.Integers[i];
     if Obj.IndexOfName('layers_per_block') < 0 then
       ImportError('VAE import: config "' + FileName +
         '" is missing the required field "layers_per_block".');
@@ -50783,6 +50993,7 @@ end;
 
 function ReadVqModelConfigFromJSONFile(const FileName: string): TVqModelConfig;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
@@ -50823,7 +51034,8 @@ begin
       ImportError('VQModel import: "block_out_channels" must have 1..8 ' +
         'entries, got ' + IntToStr(Arr.Count) + '.');
     Result.NumBlockOut := Arr.Count;
-    for i := 0 to Arr.Count - 1 do Result.BlockOutChannels[i] := Arr.Integers[i];
+    LpMax := Arr.Count - 1;
+    for i := 0 to LpMax do Result.BlockOutChannels[i] := Arr.Integers[i];
     if Obj.IndexOfName('layers_per_block') < 0 then
       ImportError('VQModel import: config "' + FileName +
         '" is missing the required field "layers_per_block".');
@@ -51750,6 +51962,7 @@ end;
 function ReadNAFNetConfigFromJSONFile(
   const FileName: string): TNAFNetConfig;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
@@ -51769,7 +51982,8 @@ var
     end;
     Arr := TJSONArray(Obj.Find(FieldName));
     SetLength(Result, Arr.Count);
-    for i := 0 to Arr.Count - 1 do Result[i] := Arr.Items[i].AsInteger;
+    LpMax := Arr.Count - 1;
+    for i := 0 to LpMax do Result[i] := Arr.Items[i].AsInteger;
   end;
 
 begin
@@ -52050,6 +52264,7 @@ end;
 function ReadSwinIRConfigFromJSONFile(
   const FileName: string): TSwinIRConfig;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
@@ -52069,7 +52284,8 @@ var
     end;
     Arr := TJSONArray(Obj.Find(FieldName));
     SetLength(Result, Arr.Count);
-    for i := 0 to Arr.Count - 1 do Result[i] := Arr.Items[i].AsInteger;
+    LpMax := Arr.Count - 1;
+    for i := 0 to LpMax do Result[i] := Arr.Items[i].AsInteger;
   end;
 
 begin
@@ -52461,6 +52677,7 @@ end;
 function ReadCLIPSegConfigFromJSONFile(
   const FileName: string): TCLIPSegConfig;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root: TJSONData;
   Obj, TowerObj: TJSONObject;
@@ -52549,7 +52766,8 @@ begin
     begin
       ExtractArr := TJSONArray(Obj.Find('extract_layers'));
       SetLength(Result.ExtractLayers, ExtractArr.Count);
-      for i := 0 to ExtractArr.Count - 1 do
+      LpMax := ExtractArr.Count - 1;
+      for i := 0 to LpMax do
         Result.ExtractLayers[i] := ExtractArr.Items[i].AsInteger;
     end
     else
@@ -53708,6 +53926,7 @@ end;
 
 function ReadSAMConfigFromJSONFile(const FileName: string): TSAMConfig;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root, VData, ArrData: TJSONData;
   Obj, V: TJSONObject;
@@ -53753,7 +53972,8 @@ begin
     begin
       Arr := TJSONArray(ArrData);
       SetLength(Result.GlobalAttnIndexes, Arr.Count);
-      for i := 0 to Arr.Count - 1 do
+      LpMax := Arr.Count - 1;
+      for i := 0 to LpMax do
         Result.GlobalAttnIndexes[i] := Arr.Integers[i];
     end;
     if Result.MlpDim <= 0 then Result.MlpDim := 4 * Result.HiddenSize;
@@ -53855,6 +54075,7 @@ function BuildSAMVisionTower(Reader: TNNetSafeTensorsReader;
   const Config: TSAMConfig; const Prefix: string;
   pInferenceOnly: boolean): TNNet;
 var
+  LpMax: integer;
   NN: TNNet;
   PatchConv, PosEmb: TNNetLayer;
   Grid, BlockIdx, HeadDim, ws, MlpHidden, ci, k: integer;
@@ -53936,7 +54157,8 @@ begin
       Reader.LoadTensorFlat(Prefix + 'pos_embed', Pos);
       if Pos.Size <> Grid * Grid * Config.HiddenSize then
         ImportError('SAM import: pos_embed size mismatch.');
-      for ci := 0 to Pos.Size - 1 do
+      LpMax := Pos.Size - 1;
+      for ci := 0 to LpMax do
         PosEmb.FArrNeurons[0].Weights.FData[ci] := Pos.FData[ci];
       PosEmb.FlushWeightCache();
     finally
@@ -55982,6 +56204,7 @@ function DecodeViTPoseKeypoints(
   Heatmaps: TNNetVolume): TViTPoseKeypointArray;
 var
   c, x, y, K: integer;
+  HeatXMax, HeatYMax: integer;
   Val, Best: TNeuralFloat;
 begin
   K := Heatmaps.Depth;
@@ -55992,8 +56215,10 @@ begin
     Result[c].X := 0;
     Result[c].Y := 0;
     Result[c].Score := Best;
-    for y := 0 to Heatmaps.SizeY - 1 do
-      for x := 0 to Heatmaps.SizeX - 1 do
+    HeatYMax := Heatmaps.SizeY - 1;
+    HeatXMax := Heatmaps.SizeX - 1;
+    for y := 0 to HeatYMax do
+      for x := 0 to HeatXMax do
       begin
         Val := Heatmaps[x, y, c];
         if Val > Best then
@@ -56013,6 +56238,7 @@ end;
 
 function ReadDetrConfigFromJSONFile(const FileName: string): TDetrConfig;
 var
+  LpMax: integer;
   JsonText: TStringList;
   Root: TJSONData;
   Obj, BObj: TJSONObject;
@@ -56091,14 +56317,16 @@ begin
       ImportError('DETR import: backbone_config is missing "hidden_sizes".');
     Arr := TJSONArray(ArrData);
     SetLength(Result.BackboneHiddenSizes, Arr.Count);
-    for i := 0 to Arr.Count - 1 do
+    LpMax := Arr.Count - 1;
+    for i := 0 to LpMax do
       Result.BackboneHiddenSizes[i] := Arr.Integers[i];
     ArrData := BObj.Find('depths');
     if (ArrData = nil) or (not (ArrData is TJSONArray)) then
       ImportError('DETR import: backbone_config is missing "depths".');
     Arr := TJSONArray(ArrData);
     SetLength(Result.BackboneDepths, Arr.Count);
-    for i := 0 to Arr.Count - 1 do
+    LpMax := Arr.Count - 1;
+    for i := 0 to LpMax do
       Result.BackboneDepths[i] := Arr.Integers[i];
     if Length(Result.BackboneDepths) <> Length(Result.BackboneHiddenSizes) then
       ImportError('DETR import: backbone hidden_sizes / depths length ' +
@@ -56341,6 +56569,7 @@ end;
 function BuildDetr(Reader: TNNetSafeTensorsReader;
   const Config: TDetrConfig; pInferenceOnly: boolean): TNNet;
 var
+  LpMax: integer;
   NN: TNNet;
   StemConv, InputProj, EncStates, QueryInput: TNNetLayer;
   SpatialPos, BranchIn, Normed, Plain, AttnOut, QPos: TNNetLayer;
@@ -56665,7 +56894,8 @@ begin
     // Fill every TNNetLearnedPositionalEmbedding that holds the SPATIAL table
     // (those sized NumTokens). The query-pos layers (sized NumQueries) were
     // already loaded above; do not overwrite them.
-    for L := 0 to NN.Layers.Count - 1 do
+    LpMax := NN.Layers.Count - 1;
+    for L := 0 to LpMax do
       if (NN.Layers[L] is TNNetLearnedPositionalEmbedding) and
          (NN.Layers[L].Output.SizeX = NumTokens) then
         FillDetrSpatialPosEmbed(NN.Layers[L], GridDim, GridDim, Config.DModel);
@@ -56727,6 +56957,7 @@ end;
 function DecodeDetrDetections(Output: TNNetVolume; NumLabels: integer;
   Threshold: TNeuralFloat): TDetrDetectionArray;
 var
+  LpMax: integer;
   q, c, BestCls, Cnt: integer;
   Logit, MaxLogit, SumExp, Prob, BestProb: TNeuralFloat;
   BoxBase: integer;
@@ -56734,7 +56965,8 @@ begin
   SetLength(Result, Output.SizeX);
   Cnt := 0;
   BoxBase := NumLabels + 1;  // first box channel
-  for q := 0 to Output.SizeX - 1 do
+  LpMax := Output.SizeX - 1;
+  for q := 0 to LpMax do
   begin
     // softmax over the NumLabels+1 class logits.
     MaxLogit := Output[q, 0, 0];
@@ -58243,6 +58475,7 @@ procedure Qwen2AudioBuildTower(Reader: TNNetSafeTensorsReader;
   const Config: TQwen2AudioConfig; const Prefix: string;
   out TowerNet, PoolNormNet: TNNet; pInferenceOnly: boolean = false);
 var
+  LpMax: integer;
   Tower, PoolNorm: TNNet;
   Conv1, Conv2, EncPos, FinalNorm: TNNetLayer;
   EncBlocks: TMarianBlockArray;
@@ -58309,7 +58542,8 @@ begin
       if Tmp.Size <> Config.Audio.MaxSourcePositions * Config.Audio.DModel then
         ImportError('Qwen2-Audio import: ' + Prefix +
           'embed_positions.weight element count mismatch.');
-      for i := 0 to Tmp.Size - 1 do
+      LpMax := Tmp.Size - 1;
+      for i := 0 to LpMax do
         EncPos.FArrNeurons[0].Weights.FData[i] := Tmp.FData[i];
       EncPos.FlushWeightCache();
     finally
@@ -60454,12 +60688,14 @@ end;
 // halves makes the loaded Linear consume the framework's [sin|cos] order.
 procedure SwapSinCosInputColumns(Layer: TNNetLayer; InDim: integer);
 var
+  LpMax: integer;
   WVol: TNNetVolume;
   i, ci, half: integer;
   SwapTmp: TNeuralFloat;
 begin
   half := InDim div 2;
-  for i := 0 to Layer.Neurons.Count - 1 do
+  LpMax := Layer.Neurons.Count - 1;
+  for i := 0 to LpMax do
   begin
     WVol := Layer.FArrNeurons[i].Weights;
     for ci := 0 to half - 1 do
