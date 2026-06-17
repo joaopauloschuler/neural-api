@@ -85272,6 +85272,7 @@ var
   OffMeanA, OffMeanB, OffCovAB, OffVarA, OffVarB, OffCorr: Double;
   OffCnt: integer;
   CanDrift: boolean;
+  Nm1, NetParamCntM1, OutSizeM1, cBinsM1, LastLayerIdx: integer;
 
   // Collect index-aligned per-sample gradient vectors from aNet over exactly
   // the UsableCount original samples in SampleOrigIdx (same flat layout as the
@@ -85365,7 +85366,7 @@ var
           Off := Off + A[P][Q] * A[P][Q];
       if Off <= cJacobiTol then Break;
       for P := 0 to Dm2 do
-        for Q := P + 1 to Dm - 1 do
+        for Q := P + 1 to Dm1 do
         begin
           Apq := A[P][Q];
           if Abs(Apq) <= 1e-300 then Continue;
@@ -85383,7 +85384,7 @@ var
           A[Q][Q] := Aqq + T * Apq;
           A[P][Q] := 0.0;
           A[Q][P] := 0.0;
-          for R := 0 to Dm - 1 do
+          for R := 0 to Dm1 do
           begin
             if (R = P) or (R = Q) then Continue;
             Aip := A[R][P];
@@ -85396,7 +85397,7 @@ var
         end;
     end;
     SetLength(OutEig, Dm);
-    for P := 0 to Dm - 1 do OutEig[P] := A[P][P];
+    for P := 0 to Dm1 do OutEig[P] := A[P][P];
   end;
 
 begin
@@ -85428,7 +85429,9 @@ begin
 
     NetParamCnt := 0;
     TrainableLayers := 0;
-    for LIdx := 0 to NN.GetLastLayerIdx() do
+    cBinsM1 := cBins - 1;
+    LastLayerIdx := NN.GetLastLayerIdx();
+    for LIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LIdx];
       LayerHasParams[LIdx] := false;
@@ -85464,6 +85467,8 @@ begin
 
     LastLayer := NN.GetLastLayer();
     OutSize := LastLayer.Output.Size;
+    OutSizeM1 := OutSize - 1;
+    NetParamCntM1 := NetParamCnt - 1;
     Target := TNNetVolume.Create(OutSize, 1, 1);
 
     SetLength(Grads, Samples.Count);
@@ -85496,7 +85501,7 @@ begin
         // Flatten this sample's per-parameter weight-gradient vector g_i.
         SetLength(Grads[UsableCount], NetParamCnt);
         SumSq := 0;
-        for LIdx := 0 to NN.GetLastLayerIdx() do
+        for LIdx := 0 to LastLayerIdx do
         begin
           if not LayerHasParams[LIdx] then Continue;
           Layer := NN.Layers[LIdx];
@@ -85545,16 +85550,17 @@ begin
     end;
 
     N := UsableCount;
+    Nm1 := N - 1;
 
     // --- Empirical NTK Gram matrix K_ij = <g_i, g_j> (N x N, Double). ---
     SetLength(Gram, N);
-    for I := 0 to N - 1 do SetLength(Gram[I], N);
-    for I := 0 to N - 1 do
+    for I := 0 to Nm1 do SetLength(Gram[I], N);
+    for I := 0 to Nm1 do
     begin
-      for J := I to N - 1 do
+      for J := I to Nm1 do
       begin
         Dot := 0;
-        for K := 0 to NetParamCnt - 1 do
+        for K := 0 to NetParamCntM1 do
           Dot := Dot + Double(Grads[I][K]) * Double(Grads[J][K]);
         Gram[I][J] := Dot;
         Gram[J][I] := Dot;
@@ -85565,10 +85571,10 @@ begin
     // diagonal entry K_ii = ||g_i||^2 (must be > 0 for every usable sample).
     SymOK := 0;
     DiagMin := Gram[0][0];
-    for I := 0 to N - 1 do
+    for I := 0 to Nm1 do
     begin
       if Gram[I][I] < DiagMin then DiagMin := Gram[I][I];
-      for J := 0 to N - 1 do
+      for J := 0 to Nm1 do
         if Abs(Gram[I][J] - Gram[J][I]) > SymOK then
           SymOK := Abs(Gram[I][J] - Gram[J][I]);
     end;
@@ -85578,10 +85584,10 @@ begin
     if SnapshotB <> '' then
     begin
       SetLength(GramSelf, N);
-      for I := 0 to N - 1 do
+      for I := 0 to Nm1 do
       begin
         SetLength(GramSelf[I], N);
-        for J := 0 to N - 1 do GramSelf[I][J] := Gram[I][J];
+        for J := 0 to Nm1 do GramSelf[I][J] := Gram[I][J];
       end;
     end;
 
@@ -85601,19 +85607,19 @@ begin
 
     // --- Glyph-shaded ASCII heatmap of the normalised |K_ij|. ---
     MaxAbs := 0;
-    for I := 0 to N - 1 do
-      for J := 0 to N - 1 do
+    for I := 0 to Nm1 do
+      for J := 0 to Nm1 do
         if Abs(Gram[I][J]) > MaxAbs then MaxAbs := Abs(Gram[I][J]);
     Lines.Add('Kernel heatmap (rows/cols = probe index, ramp ''' + cGlyphs +
       ''' from 0 to |K|max):');
     Bar := '      ';
-    for J := 0 to N - 1 do
+    for J := 0 to Nm1 do
       Bar := Bar + Format('%2d', [J mod 100]);
     Lines.Add(Bar);
-    for I := 0 to N - 1 do
+    for I := 0 to Nm1 do
     begin
       RowStr := Format('  [%2d] ', [I]);
-      for J := 0 to N - 1 do
+      for J := 0 to Nm1 do
       begin
         if MaxAbs > 0 then
           CellVal := Abs(Gram[I][J]) / MaxAbs
@@ -85636,7 +85642,7 @@ begin
     EigSqSum := 0;
     LambdaMax := 0;
     LambdaMin := 0;
-    for I := 0 to N - 1 do
+    for I := 0 to Nm1 do
     begin
       if Eig[I] < 0 then Eig[I] := 0;
       EigSum := EigSum + Eig[I];
@@ -85645,7 +85651,7 @@ begin
     end;
     // smallest eigenvalue (for the condition number)
     LambdaMin := LambdaMax;
-    for I := 0 to N - 1 do
+    for I := 0 to Nm1 do
       if Eig[I] < LambdaMin then LambdaMin := Eig[I];
 
     if LambdaMin > 1e-30 then
@@ -85668,7 +85674,7 @@ begin
     // argmax equals the class used for the kernel target; else 0. This makes the
     // alignment meaningful for both the fixed and the per-sample-argmax modes.
     InClass := 0;
-    for I := 0 to N - 1 do
+    for I := 0 to Nm1 do
     begin
       if (TargetClass >= 0) and (TargetClass < OutSize) then
       begin
@@ -85692,22 +85698,22 @@ begin
       // pick the most frequent class id as the positive class
       // (simple mode-of-array via a bounded scan over OutSize buckets).
       BinIdx := -1; MaxBin := -1;
-      for K := 0 to OutSize - 1 do
+      for K := 0 to OutSizeM1 do
       begin
         J := 0;
-        for I := 0 to N - 1 do
+        for I := 0 to Nm1 do
           if Trunc(Yvec[I]) = K then Inc(J);
         if J > MaxBin then begin MaxBin := J; BinIdx := K; end;
       end;
       InClass := 0;
-      for I := 0 to N - 1 do
+      for I := 0 to Nm1 do
       begin
         if Trunc(Yvec[I]) = BinIdx then Yvec[I] := 1.0 else Yvec[I] := 0.0;
         InClass := InClass + Yvec[I];
       end;
     end;
     InClass := InClass / N; // mean membership
-    for I := 0 to N - 1 do
+    for I := 0 to Nm1 do
       Yvec[I] := Yvec[I] - InClass; // centered indicator
 
     // Recompute the Gram (the Jacobi pass destroyed it) for the Frobenius
@@ -85715,11 +85721,11 @@ begin
     DotKY := 0;
     FrobK := 0;
     FrobYY := 0;
-    for I := 0 to N - 1 do
-      for J := 0 to N - 1 do
+    for I := 0 to Nm1 do
+      for J := 0 to Nm1 do
       begin
         Dot := 0;
-        for K := 0 to NetParamCnt - 1 do
+        for K := 0 to NetParamCntM1 do
           Dot := Dot + Double(Grads[I][K]) * Double(Grads[J][K]);
         FrobK := FrobK + Dot * Dot;
         NormVal := Yvec[I] * Yvec[J];
@@ -85749,7 +85755,7 @@ begin
 
     // --- log10(lambda) histogram. ---
     MinL := 0; MaxL := 0; HaveLg := 0;
-    for I := 0 to N - 1 do
+    for I := 0 to Nm1 do
       if Eig[I] > 1e-20 then
       begin
         Lg := pcr_log10f(Eig[I]);
@@ -85769,9 +85775,9 @@ begin
     else
     begin
       SetLength(HistBins, cBins);
-      for BinIdx := 0 to cBins - 1 do HistBins[BinIdx] := 0;
+      for BinIdx := 0 to cBinsM1 do HistBins[BinIdx] := 0;
       LRange := MaxL - MinL;
-      for I := 0 to N - 1 do
+      for I := 0 to Nm1 do
         if Eig[I] > 1e-20 then
         begin
           Lg := pcr_log10f(Eig[I]);
@@ -85784,9 +85790,9 @@ begin
           Inc(HistBins[K]);
         end;
       MaxBin := 0;
-      for BinIdx := 0 to cBins - 1 do
+      for BinIdx := 0 to cBinsM1 do
         if HistBins[BinIdx] > MaxBin then MaxBin := HistBins[BinIdx];
-      for BinIdx := 0 to cBins - 1 do
+      for BinIdx := 0 to cBinsM1 do
       begin
         if LRange > 1e-30 then
         begin
@@ -85842,21 +85848,21 @@ begin
           BUsable := CollectGradsAligned(NetB, GradsB);
           // Build B's Gram on the same index layout (zero rows for nil slots).
           SetLength(GramB, N);
-          for I := 0 to N - 1 do SetLength(GramB[I], N);
-          for I := 0 to N - 1 do
-            for J := I to N - 1 do
+          for I := 0 to Nm1 do SetLength(GramB[I], N);
+          for I := 0 to Nm1 do
+            for J := I to Nm1 do
             begin
               Dot := 0;
               if (GradsB[I] <> nil) and (GradsB[J] <> nil) then
-                for K := 0 to NetParamCnt - 1 do
+                for K := 0 to NetParamCntM1 do
                   Dot := Dot + Double(GradsB[I][K]) * Double(GradsB[J][K]);
               GramB[I][J] := Dot;
               GramB[J][I] := Dot;
             end;
           // Relative Frobenius drift ||K_self - K_B||_F / ||K_self||_F.
           DriftNum := 0; DriftDen := 0;
-          for I := 0 to N - 1 do
-            for J := 0 to N - 1 do
+          for I := 0 to Nm1 do
+            for J := 0 to Nm1 do
             begin
               DriftNum := DriftNum +
                 (GramSelf[I][J] - GramB[I][J]) * (GramSelf[I][J] - GramB[I][J]);
@@ -85866,8 +85872,8 @@ begin
           else Drift := 0;
           // Pearson correlation of the strictly-upper off-diagonal entries.
           OffMeanA := 0; OffMeanB := 0; OffCnt := 0;
-          for I := 0 to N - 1 do
-            for J := I + 1 to N - 1 do
+          for I := 0 to Nm1 do
+            for J := I + 1 to Nm1 do
             begin
               OffMeanA := OffMeanA + GramSelf[I][J];
               OffMeanB := OffMeanB + GramB[I][J];
@@ -85879,8 +85885,8 @@ begin
             OffMeanA := OffMeanA / OffCnt;
             OffMeanB := OffMeanB / OffCnt;
             OffCovAB := 0; OffVarA := 0; OffVarB := 0;
-            for I := 0 to N - 1 do
-              for J := I + 1 to N - 1 do
+            for I := 0 to Nm1 do
+              for J := I + 1 to Nm1 do
               begin
                 OffCovAB := OffCovAB +
                   (GramSelf[I][J] - OffMeanA) * (GramB[I][J] - OffMeanB);
@@ -85979,6 +85985,8 @@ var
   MaxLayerBIdx, SignalLayers, NoiseLayers: integer;
   FlagStr: string;
   BTab: array[0..6] of integer;
+  LastLayerIdx, LayerCntM1, ScopeParamCntM1, UsableCountM1: integer;
+  cBinsM1, BTabHigh, LayerParamCntM1: integer;
 begin
   Result := '';
   Lines := TStringList.Create();
@@ -86001,6 +86009,11 @@ begin
       Exit;
     end;
 
+    LastLayerIdx := NN.GetLastLayerIdx();
+    LayerCntM1 := NN.CountLayers() - 1;
+    cBinsM1 := cBins - 1;
+    BTabHigh := High(BTab);
+
     // --- Catalogue trainable layers and lay out a flat parameter index. ---
     SetLength(LayerHasParams, NN.CountLayers());
     SetLength(LayerInScope, NN.CountLayers());
@@ -86009,7 +86022,7 @@ begin
 
     NetParamCnt := 0;
     TrainableLayers := 0;
-    for LIdx := 0 to NN.GetLastLayerIdx() do
+    for LIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LIdx];
       LayerHasParams[LIdx] := false;
@@ -86047,7 +86060,7 @@ begin
     end
     else
     begin
-      for LIdx := 0 to NN.GetLastLayerIdx() do
+      for LIdx := 0 to LastLayerIdx do
         LayerInScope[LIdx] := LayerHasParams[LIdx];
       if LayerIdx >= 0 then
         RestrictName := Format('requested layer %d has no params; ' +
@@ -86061,11 +86074,12 @@ begin
     SetLength(ScopeMap, NetParamCnt);
     SetLength(ParamLayer, NetParamCnt);
     ScopeFlat := 0;
-    for LIdx := 0 to NN.GetLastLayerIdx() do
+    for LIdx := 0 to LastLayerIdx do
     begin
       if not LayerHasParams[LIdx] then Continue;
       P := FlatBase[LIdx];
-      for K := 0 to LayerParamCnt[LIdx] - 1 do
+      LayerParamCntM1 := LayerParamCnt[LIdx] - 1;
+      for K := 0 to LayerParamCntM1 do
       begin
         if LayerInScope[LIdx] then
         begin
@@ -86079,6 +86093,7 @@ begin
       end;
     end;
     ScopeParamCnt := ScopeFlat;
+    ScopeParamCntM1 := ScopeParamCnt - 1;
 
     if ScopeParamCnt = 0 then
     begin
@@ -86122,7 +86137,7 @@ begin
 
         // Flatten this sample's in-scope per-parameter gradient vector.
         SetLength(Grads[UsableCount], ScopeParamCnt);
-        for LIdx := 0 to NN.GetLastLayerIdx() do
+        for LIdx := 0 to LastLayerIdx do
         begin
           if not LayerInScope[LIdx] then Continue;
           Layer := NN.Layers[LIdx];
@@ -86158,6 +86173,7 @@ begin
         '(no division by zero performed).', [UsableCount]) + sLineBreak;
       Exit;
     end;
+    UsableCountM1 := UsableCount - 1;
 
     // --- Per-parameter mean, variance and SNR over the batch. ---
     SetLength(GBar, ScopeParamCnt);
@@ -86165,15 +86181,15 @@ begin
     SetLength(GSnr, ScopeParamCnt);
     TrSigma := 0;
     GBarSq := 0;
-    for K := 0 to ScopeParamCnt - 1 do
+    for K := 0 to ScopeParamCntM1 do
     begin
       Mean := 0;
-      for I := 0 to UsableCount - 1 do
+      for I := 0 to UsableCountM1 do
         Mean := Mean + Grads[I][K];
       Mean := Mean / UsableCount;
       // unbiased per-parameter variance across samples
       Var_ := 0;
-      for I := 0 to UsableCount - 1 do
+      for I := 0 to UsableCountM1 do
       begin
         V := Grads[I][K] - Mean;
         Var_ := Var_ + V * V;
@@ -86191,10 +86207,10 @@ begin
     // mean_i ||g_i||^2 (a second, independent estimator of tr(Sigma) via
     // tr(Sigma) = mean_i||g_i||^2 - ||g_bar||^2, reported as a cross-check).
     MeanGiSq := 0;
-    for I := 0 to UsableCount - 1 do
+    for I := 0 to UsableCountM1 do
     begin
       GiSq := 0;
-      for K := 0 to ScopeParamCnt - 1 do
+      for K := 0 to ScopeParamCntM1 do
         GiSq := GiSq + Grads[I][K] * Grads[I][K];
       MeanGiSq := MeanGiSq + GiSq;
     end;
@@ -86212,7 +86228,7 @@ begin
     SetLength(LayerGBarSq, NN.CountLayers());
     SetLength(LayerScopeCnt, NN.CountLayers());
     SetLength(LayerName, NN.CountLayers());
-    for LIdx := 0 to NN.CountLayers() - 1 do
+    for LIdx := 0 to LayerCntM1 do
     begin
       LayerSnrSum[LIdx] := 0;
       LayerTrSigma[LIdx] := 0;
@@ -86220,7 +86236,7 @@ begin
       LayerScopeCnt[LIdx] := 0;
       LayerName[LIdx] := '';
     end;
-    for K := 0 to ScopeParamCnt - 1 do
+    for K := 0 to ScopeParamCntM1 do
     begin
       LIdx := ParamLayer[K];
       LayerSnrSum[LIdx] := LayerSnrSum[LIdx] + GSnr[K];
@@ -86233,15 +86249,15 @@ begin
     // --- SNR histogram bin edges (over the actual SNR range). ---
     HistMin := GSnr[0];
     HistMax := GSnr[0];
-    for K := 1 to ScopeParamCnt - 1 do
+    for K := 1 to ScopeParamCntM1 do
     begin
       if GSnr[K] < HistMin then HistMin := GSnr[K];
       if GSnr[K] > HistMax then HistMax := GSnr[K];
     end;
     SetLength(Bins, cBins);
-    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+    for BinIdx := 0 to cBinsM1 do Bins[BinIdx] := 0;
     Span := HistMax - HistMin;
-    for K := 0 to ScopeParamCnt - 1 do
+    for K := 0 to ScopeParamCntM1 do
     begin
       if Span > cEps then
         BinIdx := Trunc(((GSnr[K] - HistMin) / Span) * cBins)
@@ -86267,9 +86283,9 @@ begin
     Lines.Add(Format('SNR histogram (%d bins over [%8.4f, %8.4f]):',
       [cBins, HistMin, HistMax]));
     MaxBin := 0;
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
       if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
     begin
       if Span > cEps then
       begin
@@ -86310,7 +86326,7 @@ begin
     BTab[4] := 16; BTab[5] := 32; BTab[6] := 64;
     Lines.Add('Effective-batch curve noise(B) = B_simple / B ' +
       '(noise ~1 marks the sweet-spot batch):');
-    for I := 0 to High(BTab) do
+    for I := 0 to BTabHigh do
     begin
       if BSimple > cEps then
         NoiseB := BSimple / BTab[I]
@@ -86331,7 +86347,7 @@ begin
     NoiseLayers := 0;
     MaxLayerB := -1;
     MaxLayerBIdx := -1;
-    for LIdx := 0 to NN.CountLayers() - 1 do
+    for LIdx := 0 to LayerCntM1 do
     begin
       if LayerScopeCnt[LIdx] = 0 then Continue;
       LMean := LayerSnrSum[LIdx] / LayerScopeCnt[LIdx];
@@ -86443,6 +86459,8 @@ var
   MaxBin, BarLen: integer;
   Bar, Verdict: string;
   PsdOk, NonFinite: boolean;
+  LastLayerIdx, NetParamCntM1, LayerCntM1, NumProbesM1: integer;
+  cBinsM1, LayerParamCntM1: integer;
 
   // Add 'Scale * v_k' to every trainable weight (k walks the net-flat axis).
   procedure PerturbWeights(const V: TFloatArray; Scale: TNeuralFloat);
@@ -86451,7 +86469,7 @@ var
     Lay: TNNetLayer;
     Neu: TNNetNeuron;
   begin
-    for LL := 0 to NN.GetLastLayerIdx() do
+    for LL := 0 to LastLayerIdx do
     begin
       if not LayerHasParams[LL] then Continue;
       Lay := NN.Layers[LL];
@@ -86487,7 +86505,7 @@ var
     Neu: TNNetNeuron;
     Lr2: TNeuralFloat;
   begin
-    for KK := 0 to NetParamCnt - 1 do G[KK] := 0;
+    for KK := 0 to NetParamCntM1 do G[KK] := 0;
     LpBnd179 := Samples.Count - 1;
     for SI := 0 to LpBnd179 do
     begin
@@ -86502,7 +86520,7 @@ var
       NN.Backpropagate(Target);
       // Accumulate this sample's per-parameter gradient into G (the loss is the
       // batch sum; the trace/eigen scale uniformly with the batch size).
-      for LL := 0 to NN.GetLastLayerIdx() do
+      for LL := 0 to LastLayerIdx do
       begin
         if not LayerHasParams[LL] then Continue;
         Lay := NN.Layers[LL];
@@ -86541,7 +86559,7 @@ var
     ComputeGradient(GradMinus);
     NN.LoadDataFromString(Snapshot);
 
-    for KK := 0 to NetParamCnt - 1 do
+    for KK := 0 to NetParamCntM1 do
       OutHv[KK] := (GradPlus[KK] - GradMinus[KK]) / (2.0 * Eps);
   end;
 
@@ -86569,6 +86587,10 @@ begin
     end;
     if NumProbes < 1 then NumProbes := 1;
     if Eps <= 0 then Eps := 1e-3;
+    LastLayerIdx := NN.GetLastLayerIdx();
+    LayerCntM1 := NN.CountLayers() - 1;
+    NumProbesM1 := NumProbes - 1;
+    cBinsM1 := cBins - 1;
 
     // --- Catalogue trainable layers and lay out a flat parameter index. ---
     SetLength(LayerHasParams, NN.CountLayers());
@@ -86577,7 +86599,7 @@ begin
 
     NetParamCnt := 0;
     TrainableLayers := 0;
-    for LIdx := 0 to NN.GetLastLayerIdx() do
+    for LIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LIdx];
       LayerHasParams[LIdx] := false;
@@ -86605,17 +86627,19 @@ begin
         sLineBreak;
       Exit;
     end;
+    NetParamCntM1 := NetParamCnt - 1;
 
     // Map each net-flat parameter to its owning trainable-layer index.
     SetLength(ParamLayer, NetParamCnt);
     SetLength(LayerName, NN.CountLayers());
-    for LIdx := 0 to NN.CountLayers() - 1 do LayerName[LIdx] := '';
-    for LIdx := 0 to NN.GetLastLayerIdx() do
+    for LIdx := 0 to LayerCntM1 do LayerName[LIdx] := '';
+    for LIdx := 0 to LastLayerIdx do
     begin
       if not LayerHasParams[LIdx] then Continue;
       LayerName[LIdx] := NN.Layers[LIdx].ClassName;
       P := FlatBase[LIdx];
-      for K := 0 to LayerParamCnt[LIdx] - 1 do
+      LayerParamCntM1 := LayerParamCnt[LIdx] - 1;
+      for K := 0 to LayerParamCntM1 do
       begin
         ParamLayer[P] := LIdx;
         Inc(P);
@@ -86641,7 +86665,7 @@ begin
     SetLength(Vprobe, NetParamCnt);
     SetLength(Quad, NumProbes);
     SetLength(LayerQuadAcc, NN.CountLayers());
-    for LIdx := 0 to NN.CountLayers() - 1 do LayerQuadAcc[LIdx] := 0;
+    for LIdx := 0 to LayerCntM1 do LayerQuadAcc[LIdx] := 0;
 
     try
       // Guardrail: a diverged net (NaN/Inf weights) makes every HVP non-finite
@@ -86649,7 +86673,7 @@ begin
       // and bail out cleanly if it is not finite rather than emitting "Nan".
       ComputeGradient(GradPlus);
       NonFinite := false;
-      for K := 0 to NetParamCnt - 1 do
+      for K := 0 to NetParamCntM1 do
         if IsNan(GradPlus[K]) or IsInfinite(GradPlus[K]) then
         begin
           NonFinite := true;
@@ -86667,16 +86691,16 @@ begin
       // --- (1) Hutchinson trace tr(H) = E_v[v^T H v] over Rademacher probes. -
       RandSeed := 1234567;
       TrAcc := 0;
-      for Probe := 0 to NumProbes - 1 do
+      for Probe := 0 to NumProbesM1 do
       begin
         // Rademacher probe v_k in {-1, +1}.
-        for K := 0 to NetParamCnt - 1 do
+        for K := 0 to NetParamCntM1 do
           if Random(2) = 0 then Vprobe[K] := -1.0 else Vprobe[K] := 1.0;
 
         HessianVectorProduct(Vprobe, Hv);
 
         VHv := 0;
-        for K := 0 to NetParamCnt - 1 do
+        for K := 0 to NetParamCntM1 do
           VHv := VHv + Vprobe[K] * Hv[K];
         Quad[Probe] := VHv;
         TrAcc := TrAcc + VHv;
@@ -86684,27 +86708,27 @@ begin
         // Per-layer trace contribution: restrict the v^T H v dot to one layer's
         // parameter slab (Rademacher v^2 = 1, so this estimates that slab's
         // diagonal Hessian sum, i.e. its share of the trace).
-        for K := 0 to NetParamCnt - 1 do
+        for K := 0 to NetParamCntM1 do
         begin
           LIdx := ParamLayer[K];
           LayerQuadAcc[LIdx] := LayerQuadAcc[LIdx] + Vprobe[K] * Hv[K];
         end;
       end;
       TraceMean := TrAcc / NumProbes;
-      for LIdx := 0 to NN.CountLayers() - 1 do
+      for LIdx := 0 to LayerCntM1 do
         LayerQuadAcc[LIdx] := LayerQuadAcc[LIdx] / NumProbes;
 
       // --- (2) Top eigenvalue lambda_max via power iteration on the HVP. ---
       // Deterministic unit start vector (independent of the Hutchinson RNG).
       NormV := 0;
-      for K := 0 to NetParamCnt - 1 do
+      for K := 0 to NetParamCntM1 do
       begin
         if (K and 1) = 0 then Vprobe[K] := 1.0 else Vprobe[K] := -0.5;
         NormV := NormV + Vprobe[K] * Vprobe[K];
       end;
       NormV := Sqrt(NormV);
       if NormV <= cNormEps then NormV := 1.0;
-      for K := 0 to NetParamCnt - 1 do Vprobe[K] := Vprobe[K] / NormV;
+      for K := 0 to NetParamCntM1 do Vprobe[K] := Vprobe[K] / NormV;
 
       LambdaMax := 0;
       for Iter := 1 to cPowerIters do
@@ -86712,14 +86736,14 @@ begin
         HessianVectorProduct(Vprobe, Hv);
         // Rayleigh quotient (v is unit): lambda ~= v^T H v.
         Dot := 0;
-        for K := 0 to NetParamCnt - 1 do Dot := Dot + Vprobe[K] * Hv[K];
+        for K := 0 to NetParamCntM1 do Dot := Dot + Vprobe[K] * Hv[K];
         LambdaMax := Dot;
         // v <- Hv / ||Hv||.
         NormV := 0;
-        for K := 0 to NetParamCnt - 1 do NormV := NormV + Hv[K] * Hv[K];
+        for K := 0 to NetParamCntM1 do NormV := NormV + Hv[K] * Hv[K];
         NormV := Sqrt(NormV);
         if NormV <= cNormEps then Break;   // flat direction -> H v = 0
-        for K := 0 to NetParamCnt - 1 do Vprobe[K] := Hv[K] / NormV;
+        for K := 0 to NetParamCntM1 do Vprobe[K] := Hv[K] / NormV;
       end;
     finally
       // Restore exact weights (also done after every probe inside the HVP).
@@ -86739,15 +86763,15 @@ begin
     // --- per-probe v^T H v histogram bin edges. ---
     HistMin := Quad[0];
     HistMax := Quad[0];
-    for Probe := 1 to NumProbes - 1 do
+    for Probe := 1 to NumProbesM1 do
     begin
       if Quad[Probe] < HistMin then HistMin := Quad[Probe];
       if Quad[Probe] > HistMax then HistMax := Quad[Probe];
     end;
     SetLength(Bins, cBins);
-    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+    for BinIdx := 0 to cBinsM1 do Bins[BinIdx] := 0;
     Span := HistMax - HistMin;
-    for Probe := 0 to NumProbes - 1 do
+    for Probe := 0 to NumProbesM1 do
     begin
       if Span > cNormEps then
         BinIdx := Trunc(((Quad[Probe] - HistMin) / Span) * cBins)
@@ -86784,9 +86808,9 @@ begin
     Lines.Add(Format('Per-probe v^T H v histogram (%d bins over [%g, %g]) ' +
       '- the Hutchinson estimator spread:', [cBins, HistMin, HistMax]));
     MaxBin := 0;
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
       if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
     begin
       if Span > cNormEps then
       begin
@@ -86810,7 +86834,7 @@ begin
     // --- per-layer trace breakdown. ---
     Lines.Add('Per-layer trace breakdown (which layers carry the curvature):');
     Lines.Add('  layer  class                        layer-tr(H)   %of-total');
-    for LIdx := 0 to NN.CountLayers() - 1 do
+    for LIdx := 0 to LayerCntM1 do
     begin
       if not LayerHasParams[LIdx] then Continue;
       LayerVHv := LayerQuadAcc[LIdx];
@@ -86898,6 +86922,7 @@ var
   ParamCntCheck: integer;
   NonFinite: boolean;
   Verdict: string;
+  LastLayerIdx, NetParamCntM1: integer;
 
   // Average training NLL L(w) over Samples on the CURRENT weights (forward
   // only). Cross-entropy of the target class: L = -mean_s ln(p_{s, class_s}),
@@ -86943,7 +86968,7 @@ var
     Neu: TNNetNeuron;
     Lr2: TNeuralFloat;
   begin
-    for KK := 0 to NetParamCnt - 1 do G[KK] := 0;
+    for KK := 0 to NetParamCntM1 do G[KK] := 0;
     UsedCnt := 0;
     LpBnd184 := Samples.Count - 1;
     for SI := 0 to LpBnd184 do
@@ -86957,7 +86982,7 @@ var
       Target.Fill(0);
       Target.FData[Cls] := 1.0;
       NN.Backpropagate(Target);
-      for LL := 0 to NN.GetLastLayerIdx() do
+      for LL := 0 to LastLayerIdx do
       begin
         if not LayerHasParams[LL] then Continue;
         Lay := NN.Layers[LL];
@@ -86981,7 +87006,7 @@ var
       Inc(UsedCnt);
     end;
     if UsedCnt > 1 then
-      for KK := 0 to NetParamCnt - 1 do G[KK] := G[KK] / UsedCnt;
+      for KK := 0 to NetParamCntM1 do G[KK] := G[KK] / UsedCnt;
   end;
 
   // Standard-normal sample via polar Box-Muller on the global RNG.
@@ -87012,7 +87037,7 @@ var
     ComputeGradient(Grad);
     NoiseSd := Sqrt(Eps);
     PP := 0;
-    for LL := 0 to NN.GetLastLayerIdx() do
+    for LL := 0 to LastLayerIdx do
     begin
       if not LayerHasParams[LL] then Continue;
       Lay := NN.Layers[LL];
@@ -87066,6 +87091,7 @@ begin
     if ChainLen < 2 then ChainLen := 2;
     if Eps <= 0 then Eps := 1e-5;
     if Gamma < 0 then Gamma := 1.0;
+    LastLayerIdx := NN.GetLastLayerIdx();
 
     // --- Catalogue trainable layers and lay out a flat parameter index. ---
     SetLength(LayerHasParams, NN.CountLayers());
@@ -87073,7 +87099,7 @@ begin
     SetLength(LayerParamCnt, NN.CountLayers());
     NetParamCnt := 0;
     TrainableLayers := 0;
-    for LIdx := 0 to NN.GetLastLayerIdx() do
+    for LIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LIdx];
       LayerHasParams[LIdx] := false;
@@ -87101,6 +87127,7 @@ begin
         'parameters.' + sLineBreak;
       Exit;
     end;
+    NetParamCntM1 := NetParamCnt - 1;
 
     // Why batch update: Delta accumulates -LR*gradient only with batch update
     // on; the live SGLD step is applied by hand here, never by UpdateWeights.
@@ -87134,7 +87161,7 @@ begin
     SetLength(WStar, NetParamCnt);
     SetLength(Grad, NetParamCnt);
     P := 0;
-    for LIdx := 0 to NN.GetLastLayerIdx() do
+    for LIdx := 0 to LastLayerIdx do
     begin
       if not LayerHasParams[LIdx] then Continue;
       Layer := NN.Layers[LIdx];
@@ -87294,6 +87321,7 @@ var
   L0Direct, L1Direct, EndpointMismatch: TNeuralFloat;
   Restored: boolean;
   Bar, Verdict, MarkStr: string;
+  LastLayerIdx, NumAlphaM1, TrainableIdxsHigh: integer;
 
   // Whole-batch mean MSE loss + top-1 argmax accuracy on the CURRENT weights.
   procedure EvalBatch(out OutLoss, OutAcc: TNeuralFloat);
@@ -87360,6 +87388,8 @@ begin
     end;
     if K < 1 then K := 1;
     NumAlpha := K + 1;
+    NumAlphaM1 := NumAlpha - 1;
+    LastLayerIdx := NN.GetLastLayerIdx();
 
     // Endpoint A snapshot (data only) — used both to read A's weights on the
     // interpolation path and to restore the live net bit-for-bit on exit.
@@ -87382,7 +87412,7 @@ begin
     end;
 
     // Catalogue trainable layers (neurons owning a non-empty weight tensor).
-    for LIdx := 0 to NN.GetLastLayerIdx() do
+    for LIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LIdx];
       if Layer.Neurons.Count = 0 then Continue;
@@ -87397,11 +87427,12 @@ begin
         sLineBreak;
       Exit;
     end;
+    TrainableIdxsHigh := High(TrainableIdxs);
 
     SetLength(Alphas, NumAlpha);
     SetLength(Losses, NumAlpha);
     SetLength(Accs, NumAlpha);
-    for I := 0 to NumAlpha - 1 do
+    for I := 0 to NumAlphaM1 do
       Alphas[I] := I / (NumAlpha - 1);
     Alphas[0] := 0;
     Alphas[NumAlpha - 1] := 1;
@@ -87409,12 +87440,12 @@ begin
     // Sweep alpha. For each: restore A, blend in B with whole-net snapshot
     // arithmetic theta = (1-alpha)*A + alpha*B (no per-scalar hot loop), then
     // evaluate the whole probe batch.
-    for I := 0 to NumAlpha - 1 do
+    for I := 0 to NumAlphaM1 do
     begin
       Alpha := Alphas[I];
       OneMinus := 1.0 - Alpha;
       NN.LoadDataFromString(aSnap);   // live weights := A
-      for LIdx := 0 to High(TrainableIdxs) do
+      for LIdx := 0 to TrainableIdxsHigh do
       begin
         Layer := NN.Layers[TrainableIdxs[LIdx]];
         LayerB := NetB.Layers[TrainableIdxs[LIdx]];
@@ -87457,7 +87488,7 @@ begin
     MaxL := Losses[0];
     ArgMaxIdx := 0;
     MinL := Losses[0];
-    for I := 1 to NumAlpha - 1 do
+    for I := 1 to NumAlphaM1 do
     begin
       if Losses[I] > MaxL then begin MaxL := Losses[I]; ArgMaxIdx := I; end;
       if Losses[I] < MinL then MinL := Losses[I];
@@ -87477,7 +87508,7 @@ begin
       ['alpha', 'loss', 'acc', 'L(alpha)']));
     Lines.Add('  ' + StringOfChar('-', 60));
     Span := MaxL - MinL;
-    for I := 0 to NumAlpha - 1 do
+    for I := 0 to NumAlphaM1 do
     begin
       if Span > cEps then
         BarLen := Round(((Losses[I] - MinL) / Span) * cBarWidth)
@@ -87631,7 +87662,7 @@ var
   // Perm[i]) — moving each neuron's full weight ROW and its bias together.
   procedure ReorderLayerOutputNeurons(Lay: TNNetLayer; const P: array of integer);
   var
-    n, w, sz: integer;
+    n, w, sz, szM1: integer;
     oldW: array of array of TNeuralFloat;
     oldB: array of TNeuralFloat;
   begin
@@ -87641,15 +87672,17 @@ var
     for n := 0 to LpBnd198 do
     begin
       sz := Lay.Neurons[n].Weights.Size;
+      szM1 := sz - 1;
       SetLength(oldW[n], sz);
-      for w := 0 to sz - 1 do oldW[n][w] := Lay.Neurons[n].Weights.FData[w];
+      for w := 0 to szM1 do oldW[n][w] := Lay.Neurons[n].Weights.FData[w];
       oldB[n] := Lay.Neurons[n].FBiasWeight;
     end;
     LpBnd199 := Lay.Neurons.Count - 1;
     for n := 0 to LpBnd199 do
     begin
       sz := Lay.Neurons[n].Weights.Size;
-      for w := 0 to sz - 1 do
+      szM1 := sz - 1;
+      for w := 0 to szM1 do
         Lay.Neurons[n].Weights.FData[w] := oldW[P[n]][w];
       Lay.Neurons[n].FBiasWeight := oldB[P[n]];
     end;
