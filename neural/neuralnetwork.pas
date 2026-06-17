@@ -257,6 +257,12 @@ type
       FLinkedNeurons: boolean;
       FCanNormalizeDelta: boolean;
       FCanSetNumWeightsForAllNeurons: boolean;
+      // When True, SetNumWeightsForAllNeurons skips allocating the per-neuron
+      // training-only buffers (BackInertia/Delta) so an inference-only net is
+      // never built at the full ~5x weight footprint. Set by MakeInferenceOnly
+      // BEFORE the layer is attached (SetPrevLayer). Default False (trainable).
+      // Coded by Claude (AI).
+      FInferenceOnly: boolean;
       FNN: TNNet;
       // Persistent magnitude-pruning mask: one volume per neuron (parallel to
       // FNeurons), each element 1.0 = keep, 0.0 = pruned. nil = no mask on this
@@ -449,15 +455,26 @@ type
       function InitSELU(Value: TNeuralFloat = 1): TNNetLayer;
       // Memory Initializer for Adam optimizer
       function InitAdam(Beta1, Beta2, Epsilon: TNeuralFloat): TNNetLayer;
-      // Frees every neuron's training-only volumes (see
-      // TNNetNeuron.MakeInferenceOnly). Forward-only contract afterwards.
-      function MakeInferenceOnly(): TNNetLayer; // Coded by Claude (AI).
+      // Marks the layer inference-only (forward-only contract afterwards) and
+      // frees every neuron's training-only volumes (see
+      // TNNetNeuron.MakeInferenceOnly). Idempotent: it both sets FInferenceOnly
+      // - so a subsequent SetNumWeightsForAllNeurons never allocates the
+      // BackInertia/Delta buffers in the first place - and shrinks any buffers
+      // that were already allocated (layers that size weights in their
+      // constructor, before this is chained). Chain it on a freshly-created
+      // layer BEFORE AddLayer to skip the allocation entirely:
+      //   NN.AddLayer( TNNetXxx.Create(...).MakeInferenceOnly(pInferenceOnly) )
+      // pInferenceOnly=False is a strict no-op (the layer stays trainable), so
+      // importer code can chain it unconditionally. Coded by Claude (AI).
+      function MakeInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer;
 
       procedure InitDefault(); virtual;
 
       property ActivationFn: TNeuralActivationFunction read FActivationFn write FActivationFn;
       property ActivationFnDerivative: TNeuralActivationFunction read FActivationFnDerivative write FActivationFnDerivative;
       property Neurons: TNNetNeuronList read FNeurons;
+      // True once MakeInferenceOnly(True) has marked the layer forward-only.
+      property InferenceOnly: boolean read FInferenceOnly;
       property NN:TNNet read FNN write FNN;
       property Output: TNNetVolume read FOutput;
       property OutputRaw: TNNetGroupedVolume read FOutputRaw;
@@ -96304,6 +96321,7 @@ begin
   FLinkedNeurons := false;
   FCanNormalizeDelta := true;
   FCanSetNumWeightsForAllNeurons := True;
+  FInferenceOnly := False;
   FActivationFn := @Identity;
   FActivationFnDerivative := @IdentityDerivative;
   FLearningRate := 0.01;
@@ -96579,6 +96597,14 @@ function TNNetLayer.InitGlorotBengioUniform(Value: TNeuralFloat): TNNetLayer;
 var
   FanIn, FanOut, MulAux: TNeuralFloat;
 begin
+  Result := Self;
+  // Inference-only: the weights are about to be overwritten by a checkpoint
+  // loader, so skip the (wasted) per-weight random initialization. The weights
+  // were already sized and the cache refreshed by SetNumWeightsForAllNeurons,
+  // so a forward pass stays valid (zero weights) even before any load. This is
+  // the default init path (InitDefault) for the dense/conv layers that dominate
+  // an imported model. Coded by Claude (AI).
+  if FInferenceOnly then exit;
   if (FNeurons.Count > 0) then
   begin
     InitUniform(Value);
@@ -96628,15 +96654,22 @@ begin
   Result := Self;
 end;
 
-function TNNetLayer.MakeInferenceOnly(): TNNetLayer;
+function TNNetLayer.MakeInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
 var
   Cnt: integer;
 begin
+  Result := Self;
+  // pInferenceOnly=False keeps the layer trainable: strict no-op so callers
+  // can chain .MakeInferenceOnly(flag) on every layer unconditionally.
+  if not pInferenceOnly then exit;
+  FInferenceOnly := True;
+  // Shrink any training buffers already allocated (e.g. a layer that sized its
+  // weights in the constructor, before this was chained). When the layer is
+  // attached later, the FInferenceOnly flag stops them being re-allocated.
   for Cnt := 0 to FNeurons.Count - 1 do
   begin
     FNeurons[Cnt].MakeInferenceOnly();
   end;
-  Result := Self;
 end;
 
 procedure TNNetLayer.InitDefault();
@@ -96700,8 +96733,13 @@ begin
     for Cnt := 0 to FNeurons.Count-1 do
     begin
       FNeurons[Cnt].Weights.ReSize(NumWeights,1,1);
-      FNeurons[Cnt].BackInertia.ReSize(NumWeights,1,1);
-      FNeurons[Cnt].Delta.ReSize(NumWeights,1,1);
+      // Inference-only layers skip the training-only buffers (see
+      // MakeInferenceOnly), avoiding the ~5x weight-footprint allocation.
+      if not FInferenceOnly then
+      begin
+        FNeurons[Cnt].BackInertia.ReSize(NumWeights,1,1);
+        FNeurons[Cnt].Delta.ReSize(NumWeights,1,1);
+      end;
     end;
     AfterWeightUpdate();
   end;
@@ -96716,8 +96754,13 @@ begin
     for Cnt := 0 to FNeurons.Count-1 do
     begin
       FNeurons[Cnt].Weights.ReSize(x,y,d);
-      FNeurons[Cnt].BackInertia.ReSize(x,y,d);
-      FNeurons[Cnt].Delta.ReSize(x,y,d);
+      // Inference-only layers skip the training-only buffers (see
+      // MakeInferenceOnly), avoiding the ~5x weight-footprint allocation.
+      if not FInferenceOnly then
+      begin
+        FNeurons[Cnt].BackInertia.ReSize(x,y,d);
+        FNeurons[Cnt].Delta.ReSize(x,y,d);
+      end;
     end;
     AfterWeightUpdate();
   end;

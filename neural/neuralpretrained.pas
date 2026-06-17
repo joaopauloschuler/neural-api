@@ -26684,14 +26684,14 @@ begin
     // ---- self-attention sub-block (PRE-norm: LN, sublayer, add raw) ----
     ResidualInput := NN.GetLastLayer();
     Blocks[BlockCnt].SelfAttn.Norm := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+      TNNetTokenLayerNorm.Create(PegasusLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     NormedInput := NN.GetLastLayer();
     Blocks[BlockCnt].SelfAttn.QProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel), NormedInput);
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), NormedInput);
     Blocks[BlockCnt].SelfAttn.KProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel), NormedInput);
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), NormedInput);
     Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel), NormedInput);
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), NormedInput);
     for HeadCnt := 0 to NumHeads - 1 do
     begin
       for d := 0 to HeadDim - 1 do
@@ -26713,7 +26713,7 @@ begin
     end;
     NN.AddLayer( TNNetDeepConcat.Create(Heads) );
     Blocks[BlockCnt].SelfAttn.OProj := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), ResidualInput]) );
 
     // ---- cross-attention sub-block (decoder only, PRE-norm) ----
@@ -26721,15 +26721,15 @@ begin
     begin
       ResidualInput := NN.GetLastLayer();
       Blocks[BlockCnt].CrossAttn.Norm := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+        TNNetTokenLayerNorm.Create(PegasusLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       NormedInput := NN.GetLastLayer();
       Blocks[BlockCnt].CrossAttn.QProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel), NormedInput);
+        TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), NormedInput);
       // Keys|Values come from the (already final-normed) encoder states.
       Blocks[BlockCnt].CrossAttn.KProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel), EncStates);
+        TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), EncStates);
       Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel), EncStates);
+        TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), EncStates);
       for HeadCnt := 0 to NumHeads - 1 do
       begin
         for d := 0 to HeadDim - 1 do
@@ -26750,16 +26750,16 @@ begin
       end;
       NN.AddLayer( TNNetDeepConcat.Create(Heads) );
       Blocks[BlockCnt].CrossAttn.OProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.DModel) );
+        TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), ResidualInput]) );
     end;
 
     // ---- FFN sub-block (PRE-norm): fc2(act(fc1(LN(x)))) + x ----
     ResidualInput := NN.GetLastLayer();
     Blocks[BlockCnt].FFNNorm := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+      TNNetTokenLayerNorm.Create(PegasusLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     Blocks[BlockCnt].Fc1 := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(FFNDim) );
+      TNNetPointwiseConvLinear.Create(FFNDim).MakeInferenceOnly(pInferenceOnly) );
     if UseReluFFN then
     begin
       // Plain ReLU FFN (M2M100/NLLB use activation_function="relu").
@@ -26780,8 +26780,10 @@ begin
       NN.AddLayer( TNNetReGLU.Create() );
     end;
     Blocks[BlockCnt].Fc2 := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), ResidualInput]) );
+    // Backstop: demote any non-weight-bearing stragglers (the weight layers
+    // above are already built inference-only via the chained MakeInferenceOnly).
     if pInferenceOnly then NN.MakeInferenceOnly();
     if pQuantizeInt8 then NN.QuantizeWeightsInt8();
   end;
@@ -27578,11 +27580,13 @@ begin
     Config.FFNDim, {IsDecoder=}true, EncStates, Blocks, pInferenceOnly,
     {pQuantizeInt8=}false, {UseReluFFN=}false);
   // Final decoder LayerNorm (closes the pre-norm stack).
-  FinalLN := Dec.AddLayer( TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+  FinalLN := Dec.AddLayer(
+    TNNetTokenLayerNorm.Create(PegasusLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
   // K LM heads over the final hidden, depth-concatenated into K*vocab.
   for k_i := 0 to Config.NumCodebooks - 1 do
     HeadLayers[k_i] := Dec.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.VocabSize), FinalLN);
+      TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly),
+      FinalLN);
   Dec.AddLayer( TNNetDeepConcat.Create(HeadLayers) );
   if pInferenceOnly then Dec.MakeInferenceOnly();
   Result := Dec;
