@@ -60314,15 +60314,16 @@ begin
     // --- walk steps in reverse, transposing each ---
     for st := Length(FStepKind) - 1 downto 0 do
     begin
+      TapMaxSt := FStepTapCnt[st] - 1;
       if FStepKind[st] = 0 then
       begin
         // forward: d[i] -= sum_t tap*s[refl(i+off)]
         // wrt taps: dL/dtap += sum_i gd[i]*(-s_pre[refl(i+off)])
         // wrt s   : gs[refl(i+off)] += gd[i]*(-tap)   (gd unchanged for d row)
-        for i := 0 to FHalf - 1 do
+        for i := 0 to HalfM1 do
         begin
           g := gd[i];
-          for t := 0 to FStepTapCnt[st] - 1 do
+          for t := 0 to TapMaxSt do
           begin
             tap := GetTap(FStepTapOfs[st] + t);
             jj := DWT1DReflect(i + FStepOffs[st][t], FHalf);
@@ -60337,10 +60338,10 @@ begin
       else
       begin
         // forward: s[i] += sum_t tap*d[refl(i+off)]
-        for i := 0 to FHalf - 1 do
+        for i := 0 to HalfM1 do
         begin
           g := gs[i];
-          for t := 0 to FStepTapCnt[st] - 1 do
+          for t := 0 to TapMaxSt do
           begin
             tap := GetTap(FStepTapOfs[st] + t);
             jj := DWT1DReflect(i + FStepOffs[st][t], FHalf);
@@ -60357,7 +60358,7 @@ begin
     // --- scatter gs (even), gd (odd) back to the input error ---
     if havePrev then
     begin
-      for i := 0 to FHalf - 1 do
+      for i := 0 to HalfM1 do
       begin
         LocalPrevError.FData[(2 * i) * FDepth + c] :=
           LocalPrevError.FData[(2 * i) * FDepth + c] + gs[i];
@@ -60422,20 +60423,23 @@ end;
 procedure TNNetSpectralConv2D.FFT2D(var Re, Im: TSpectralConv2DMatrix; Inverse: boolean);
 var
   ix, iy: integer;
+  SizeXM1, SizeYM1: integer;
   rowRe, rowIm, colRe, colIm: array of Double;
 begin
+  SizeXM1 := FSizeX - 1;
+  SizeYM1 := FSizeY - 1;
   // FFT along X for each y.
   SetLength(rowRe, FSizeX);
   SetLength(rowIm, FSizeX);
-  for iy := 0 to FSizeY - 1 do
+  for iy := 0 to SizeYM1 do
   begin
-    for ix := 0 to FSizeX - 1 do
+    for ix := 0 to SizeXM1 do
     begin
       rowRe[ix] := Re[ix][iy];
       rowIm[ix] := Im[ix][iy];
     end;
     FourierMixFFT(rowRe, rowIm, FSizeX, Inverse);
-    for ix := 0 to FSizeX - 1 do
+    for ix := 0 to SizeXM1 do
     begin
       Re[ix][iy] := rowRe[ix];
       Im[ix][iy] := rowIm[ix];
@@ -60444,15 +60448,15 @@ begin
   // FFT along Y for each x.
   SetLength(colRe, FSizeY);
   SetLength(colIm, FSizeY);
-  for ix := 0 to FSizeX - 1 do
+  for ix := 0 to SizeXM1 do
   begin
-    for iy := 0 to FSizeY - 1 do
+    for iy := 0 to SizeYM1 do
     begin
       colRe[iy] := Re[ix][iy];
       colIm[iy] := Im[ix][iy];
     end;
     FourierMixFFT(colRe, colIm, FSizeY, Inverse);
-    for iy := 0 to FSizeY - 1 do
+    for iy := 0 to SizeYM1 do
     begin
       Re[ix][iy] := colRe[iy];
       Im[ix][iy] := colIm[iy];
@@ -60502,15 +60506,16 @@ end;
 // Glorot-style init scaled by 1/(InDepth+OutDepth) (the FNO convention).
 procedure TNNetSpectralConv2D.InitDefault();
 var
-  i, WeightCount: integer;
+  i, WeightCount, WeightMax: integer;
   scale: TNeuralFloat;
   W: TNNetVolume;
 begin
   if FInDepth <= 0 then exit;
   W := FArrNeurons[0].FWeights;
   WeightCount := W.Size;
+  WeightMax := WeightCount - 1;
   scale := Sqrt(2.0 / (FInDepth + FOutDepth));
-  for i := 0 to WeightCount - 1 do
+  for i := 0 to WeightMax do
     W.FData[i] := scale * (Random - 0.5) * 2;
 end;
 
@@ -60526,6 +60531,7 @@ end;
 procedure TNNetSpectralConv2D.ComputeCPU();
 var
   ci, co, mx, my, ix, iy: integer;
+  InDepthM1, OutDepthM1, SizeXM1, SizeYM1, ModesXM1, ModesYM1: integer;
   PrevOut, W: TNNetVolume;
   Sre, Sim: TSpectralConv2DMatrix;
   a, bb, xr, xi, yr, yi: Double;
@@ -60533,11 +60539,17 @@ var
 begin
   PrevOut := FPrevLayer.FOutput;
   W := FArrNeurons[0].FWeights;
+  InDepthM1 := FInDepth - 1;
+  OutDepthM1 := FOutDepth - 1;
+  SizeXM1 := FSizeX - 1;
+  SizeYM1 := FSizeY - 1;
+  ModesXM1 := FModesX - 1;
+  ModesYM1 := FModesY - 1;
   // 1. 2-D FFT of every input channel.
-  for ci := 0 to FInDepth - 1 do
+  for ci := 0 to InDepthM1 do
   begin
-    for ix := 0 to FSizeX - 1 do
-      for iy := 0 to FSizeY - 1 do
+    for ix := 0 to SizeXM1 do
+      for iy := 0 to SizeYM1 do
       begin
         FXre[ci][ix][iy] := PrevOut.FData[((FSizeX * iy) + ix) * FInDepth + ci];
         FXim[ci][ix][iy] := 0;
@@ -60547,20 +60559,20 @@ begin
   // 2./3./4. Per output channel: spectral matmul over kept 2-D modes, then IFFT.
   SetLength(Sre, FSizeX, FSizeY);
   SetLength(Sim, FSizeX, FSizeY);
-  for co := 0 to FOutDepth - 1 do
+  for co := 0 to OutDepthM1 do
   begin
-    for ix := 0 to FSizeX - 1 do
-      for iy := 0 to FSizeY - 1 do
+    for ix := 0 to SizeXM1 do
+      for iy := 0 to SizeYM1 do
       begin
         Sre[ix][iy] := 0;
         Sim[ix][iy] := 0;
       end;
-    for mx := 0 to FModesX - 1 do
-      for my := 0 to FModesY - 1 do
+    for mx := 0 to ModesXM1 do
+      for my := 0 to ModesYM1 do
       begin
         yr := 0;
         yi := 0;
-        for ci := 0 to FInDepth - 1 do
+        for ci := 0 to InDepthM1 do
         begin
           b := WBase(mx, my, ci, co);
           a := W.FData[b];        // Re R
@@ -60575,8 +60587,8 @@ begin
         Sim[mx][my] := yi;
       end;
     FFT2D(Sre, Sim, true);  // inverse 2-D FFT (includes 1/(FSizeX*FSizeY))
-    for ix := 0 to FSizeX - 1 do
-      for iy := 0 to FSizeY - 1 do
+    for ix := 0 to SizeXM1 do
+      for iy := 0 to SizeYM1 do
         FOutput.FData[((FSizeX * iy) + ix) * FOutDepth + co] := Sre[ix][iy];  // real part
   end;
 end;
@@ -60601,6 +60613,7 @@ end;
 procedure TNNetSpectralConv2D.BackpropagateCPU();
 var
   ci, co, mx, my, ix, iy: integer;
+  InDepthM1, OutDepthM1, SizeXM1, SizeYM1, ModesXM1, ModesYM1: integer;
   W, WDelta, LocalPrevError: TNNetVolume;
   Gre, Gim: TSpectralConv2DMatrix;           // (1/(L)) * FFT2D(g[co]) over modes
   dXre, dXim: array of TSpectralConv2DMatrix; // input-spectrum grad [ci][mx][my]
@@ -60611,12 +60624,18 @@ begin
   WDelta := FArrNeurons[0].FDelta;
   L := FSizeX * FSizeY;
   invL := 1.0 / L;
+  InDepthM1 := FInDepth - 1;
+  OutDepthM1 := FOutDepth - 1;
+  SizeXM1 := FSizeX - 1;
+  SizeYM1 := FSizeY - 1;
+  ModesXM1 := FModesX - 1;
+  ModesYM1 := FModesY - 1;
 
   SetLength(dXre, FInDepth, FModesX, FModesY);
   SetLength(dXim, FInDepth, FModesX, FModesY);
-  for ci := 0 to FInDepth - 1 do
-    for mx := 0 to FModesX - 1 do
-      for my := 0 to FModesY - 1 do
+  for ci := 0 to InDepthM1 do
+    for mx := 0 to ModesXM1 do
+      for my := 0 to ModesYM1 do
       begin
         dXre[ci][mx][my] := 0;
         dXim[ci][mx][my] := 0;
@@ -60624,22 +60643,22 @@ begin
 
   SetLength(Gre, FSizeX, FSizeY);
   SetLength(Gim, FSizeX, FSizeY);
-  for co := 0 to FOutDepth - 1 do
+  for co := 0 to OutDepthM1 do
   begin
     // dL/dYhat[co][mx,my] = (1/L) * FFT2D(g[co])[mx,my].
-    for ix := 0 to FSizeX - 1 do
-      for iy := 0 to FSizeY - 1 do
+    for ix := 0 to SizeXM1 do
+      for iy := 0 to SizeYM1 do
       begin
         Gre[ix][iy] := FOutputError.FData[((FSizeX * iy) + ix) * FOutDepth + co];
         Gim[ix][iy] := 0;
       end;
     FFT2D(Gre, Gim, false);
-    for mx := 0 to FModesX - 1 do
-      for my := 0 to FModesY - 1 do
+    for mx := 0 to ModesXM1 do
+      for my := 0 to ModesYM1 do
       begin
         gyr := invL * Gre[mx][my];
         gyi := invL * Gim[mx][my];
-        for ci := 0 to FInDepth - 1 do
+        for ci := 0 to InDepthM1 do
         begin
           b := WBase(mx, my, ci, co);
           a := W.FData[b];        // Re R
@@ -60663,23 +60682,23 @@ begin
   if (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
   begin
     LocalPrevError := FPrevLayer.OutputError;
-    for ci := 0 to FInDepth - 1 do
+    for ci := 0 to InDepthM1 do
     begin
-      for ix := 0 to FSizeX - 1 do
-        for iy := 0 to FSizeY - 1 do
+      for ix := 0 to SizeXM1 do
+        for iy := 0 to SizeYM1 do
         begin
           Gre[ix][iy] := 0;
           Gim[ix][iy] := 0;
         end;
-      for mx := 0 to FModesX - 1 do
-        for my := 0 to FModesY - 1 do
+      for mx := 0 to ModesXM1 do
+        for my := 0 to ModesYM1 do
         begin
           Gre[mx][my] := dXre[ci][mx][my];
           Gim[mx][my] := dXim[ci][mx][my];
         end;
       FFT2D(Gre, Gim, true);  // IFFT2D (includes 1/L)
-      for ix := 0 to FSizeX - 1 do
-        for iy := 0 to FSizeY - 1 do
+      for ix := 0 to SizeXM1 do
+        for iy := 0 to SizeYM1 do
         begin
           contrib := L * Gre[ix][iy];  // undo the IFFT's 1/L -> real adjoint
           LocalPrevError.FData[((FSizeX * iy) + ix) * FInDepth + ci] :=
@@ -60750,13 +60769,14 @@ end;
 // the initial output is a mild perturbation of max_j x_j / min_j x_j.
 procedure TNNetTropicalLinear.InitDefault();
 var
-  i, WeightCount: integer;
+  i, WeightCount, WeightMax: integer;
   W: TNNetVolume;
 begin
   if FInDepth <= 0 then exit;
   W := FArrNeurons[0].FWeights;
   WeightCount := W.Size;
-  for i := 0 to WeightCount - 1 do
+  WeightMax := WeightCount - 1;
+  for i := 0 to WeightMax do
     W.FData[i] := 0.1 * (Random - 0.5) * 2;
 end;
 
@@ -60772,17 +60792,20 @@ end;
 procedure TNNetTropicalLinear.ComputeCPU();
 var
   i, j, jbase, best: integer;
+  OutDepthM1, InDepthM1: integer;
   PrevOut, W: TNNetVolume;
   cand, bestVal: TNeuralFloat;
 begin
   PrevOut := FPrevLayer.FOutput;
   W := FArrNeurons[0].FWeights;
-  for i := 0 to FOutDepth - 1 do
+  OutDepthM1 := FOutDepth - 1;
+  InDepthM1 := FInDepth - 1;
+  for i := 0 to OutDepthM1 do
   begin
     jbase := i * FInDepth;
     best := 0;
     bestVal := PrevOut.FData[0] + W.FData[jbase];
-    for j := 1 to FInDepth - 1 do
+    for j := 1 to InDepthM1 do
     begin
       cand := PrevOut.FData[j] + W.FData[jbase + j];
       if FErode = 0 then
@@ -60820,6 +60843,7 @@ end;
 procedure TNNetTropicalLinear.BackpropagateCPU();
 var
   i, jstar: integer;
+  OutDepthM1: integer;
   W, WDelta, LocalPrevError: TNNetVolume;
   dy: TNeuralFloat;
   HasPrevError: boolean;
@@ -60828,8 +60852,9 @@ begin
   WDelta := FArrNeurons[0].FDelta;
   HasPrevError := (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size);
   LocalPrevError := FPrevLayer.OutputError;
+  OutDepthM1 := FOutDepth - 1;
 
-  for i := 0 to FOutDepth - 1 do
+  for i := 0 to OutDepthM1 do
   begin
     dy := FOutputError.FData[i];
     jstar := FWinner[i];
@@ -60874,9 +60899,10 @@ end;
 
 destructor TNNetSinkhorn.Destroy();
 var
-  iStep: integer;
+  iStep, TapeMax: integer;
 begin
-  for iStep := 0 to Length(FLogTape) - 1 do
+  TapeMax := Length(FLogTape) - 1;
+  for iStep := 0 to TapeMax do
     if Assigned(FLogTape[iStep]) then FLogTape[iStep].Free;
   SetLength(FLogTape, 0);
   inherited Destroy();
@@ -60884,7 +60910,7 @@ end;
 
 procedure TNNetSinkhorn.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  iStep: integer;
+  iStep, TapeMax, TapeLenM1: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
   if pPrevLayer.Output.SizeX <> pPrevLayer.Output.Depth then
@@ -60901,11 +60927,13 @@ begin
   FOutputErrorDeriv.ReSize(FN, 1, FN);
 
   // (Re)allocate the unroll tape: one cached log-matrix per normalization step.
-  for iStep := 0 to Length(FLogTape) - 1 do
+  TapeMax := Length(FLogTape) - 1;
+  for iStep := 0 to TapeMax do
     if Assigned(FLogTape[iStep]) then FLogTape[iStep].Free;
   FTapeLen := 2 * FKIter;
   SetLength(FLogTape, FTapeLen);
-  for iStep := 0 to FTapeLen - 1 do
+  TapeLenM1 := FTapeLen - 1;
+  for iStep := 0 to TapeLenM1 do
     FLogTape[iStep] := TNNetVolume.Create(FN, 1, FN);
 end;
 
@@ -60928,52 +60956,56 @@ end;
 procedure TNNetSinkhorn.ComputeCPU();
 var
   ri, cj, iter, step: integer;
+  NNm1, FNm1, KIterM1: integer;
   L: TNNetVolume;
   maxVal, sumExp, lse: TNeuralFloat;
 begin
   L := FOutput;
+  NNm1 := FN * FN - 1;
+  FNm1 := FN - 1;
+  KIterM1 := FKIter - 1;
   // L := score / tau
-  for ri := 0 to FN * FN - 1 do
+  for ri := 0 to NNm1 do
     L.FData[ri] := FPrevLayer.FOutput.FData[ri] / FTau;
 
   step := 0;
-  for iter := 0 to FKIter - 1 do
+  for iter := 0 to KIterM1 do
   begin
     // ---- ROW normalize: each row i is a log-simplex over columns j ----
     FLogTape[step].Copy(L);  // cache input of this step
-    for ri := 0 to FN - 1 do
+    for ri := 0 to FNm1 do
     begin
       maxVal := L.FData[ri * FN];
-      for cj := 1 to FN - 1 do
+      for cj := 1 to FNm1 do
         if L.FData[ri * FN + cj] > maxVal then maxVal := L.FData[ri * FN + cj];
       sumExp := 0;
-      for cj := 0 to FN - 1 do
+      for cj := 0 to FNm1 do
         sumExp := sumExp + Exp(L.FData[ri * FN + cj] - maxVal);
       lse := maxVal + Ln(sumExp);
-      for cj := 0 to FN - 1 do
+      for cj := 0 to FNm1 do
         L.FData[ri * FN + cj] := L.FData[ri * FN + cj] - lse;
     end;
     Inc(step);
 
     // ---- COLUMN normalize: each column j is a log-simplex over rows i ----
     FLogTape[step].Copy(L);
-    for cj := 0 to FN - 1 do
+    for cj := 0 to FNm1 do
     begin
       maxVal := L.FData[cj];
-      for ri := 1 to FN - 1 do
+      for ri := 1 to FNm1 do
         if L.FData[ri * FN + cj] > maxVal then maxVal := L.FData[ri * FN + cj];
       sumExp := 0;
-      for ri := 0 to FN - 1 do
+      for ri := 0 to FNm1 do
         sumExp := sumExp + Exp(L.FData[ri * FN + cj] - maxVal);
       lse := maxVal + Ln(sumExp);
-      for ri := 0 to FN - 1 do
+      for ri := 0 to FNm1 do
         L.FData[ri * FN + cj] := L.FData[ri * FN + cj] - lse;
     end;
     Inc(step);
   end;
 
   // Output := exp(L)
-  for ri := 0 to FN * FN - 1 do
+  for ri := 0 to NNm1 do
     L.FData[ri] := Exp(L.FData[ri]);
 end;
 
@@ -61003,13 +61035,16 @@ end;
 procedure TNNetSinkhorn.BackpropagateCPU();
 var
   ri, cj, iter, step: integer;
+  NNm1, FNm1: integer;
   g, Lin: TNNetVolume;
   maxVal, sumExp, dotG, sm: TNeuralFloat;
   softrow, softcol: array of TNeuralFloat;
 begin
   g := FOutputErrorDeriv;
+  NNm1 := FN * FN - 1;
+  FNm1 := FN - 1;
   // dL/dL_final = gradOut * Output  (exp derivative; Output still holds exp(L)).
-  for ri := 0 to FN * FN - 1 do
+  for ri := 0 to NNm1 do
     g.FData[ri] := FOutputError.FData[ri] * FOutput.FData[ri];
 
   SetLength(softrow, FN);
@@ -61021,48 +61056,48 @@ begin
     // ---- adjoint of the COLUMN normalize (the later step) ----
     step := 2 * iter + 1;
     Lin := FLogTape[step];
-    for cj := 0 to FN - 1 do
+    for cj := 0 to FNm1 do
     begin
       maxVal := Lin.FData[cj];
-      for ri := 1 to FN - 1 do
+      for ri := 1 to FNm1 do
         if Lin.FData[ri * FN + cj] > maxVal then maxVal := Lin.FData[ri * FN + cj];
       sumExp := 0;
-      for ri := 0 to FN - 1 do
+      for ri := 0 to FNm1 do
       begin
         softcol[ri] := Exp(Lin.FData[ri * FN + cj] - maxVal);
         sumExp := sumExp + softcol[ri];
       end;
       dotG := 0;
-      for ri := 0 to FN - 1 do
+      for ri := 0 to FNm1 do
       begin
         softcol[ri] := softcol[ri] / sumExp;
         dotG := dotG + g.FData[ri * FN + cj];
       end;
-      for ri := 0 to FN - 1 do
+      for ri := 0 to FNm1 do
         g.FData[ri * FN + cj] := g.FData[ri * FN + cj] - softcol[ri] * dotG;
     end;
 
     // ---- adjoint of the ROW normalize (the earlier step) ----
     step := 2 * iter;
     Lin := FLogTape[step];
-    for ri := 0 to FN - 1 do
+    for ri := 0 to FNm1 do
     begin
       maxVal := Lin.FData[ri * FN];
-      for cj := 1 to FN - 1 do
+      for cj := 1 to FNm1 do
         if Lin.FData[ri * FN + cj] > maxVal then maxVal := Lin.FData[ri * FN + cj];
       sumExp := 0;
-      for cj := 0 to FN - 1 do
+      for cj := 0 to FNm1 do
       begin
         softrow[cj] := Exp(Lin.FData[ri * FN + cj] - maxVal);
         sumExp := sumExp + softrow[cj];
       end;
       dotG := 0;
-      for cj := 0 to FN - 1 do
+      for cj := 0 to FNm1 do
       begin
         softrow[cj] := softrow[cj] / sumExp;
         dotG := dotG + g.FData[ri * FN + cj];
       end;
-      for cj := 0 to FN - 1 do
+      for cj := 0 to FNm1 do
       begin
         sm := softrow[cj];
         g.FData[ri * FN + cj] := g.FData[ri * FN + cj] - sm * dotG;
@@ -61072,7 +61107,7 @@ begin
 
   // dL/dscore = (1/tau) * g, routed into the previous layer's error tensor.
   if (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
-    for ri := 0 to FN * FN - 1 do
+    for ri := 0 to NNm1 do
       FPrevLayer.OutputError.FData[ri] :=
         FPrevLayer.OutputError.FData[ri] + g.FData[ri] / FTau;
 end;
@@ -61159,14 +61194,18 @@ var
   Merged: array of boolean;           // A token chosen for merge
   // input token idx -> output token idx; built after we know which A merge
   t, a, b, d, i, oIdx, picks, bestA: integer;
+  SeqLenM1, DepthM1, OutSizeMax: integer;
   dot, sim, denom, eps, curBest: TNeuralFloat;
   isA: boolean;
 begin
   Inp := FPrevLayer.FOutput;
   eps := 1e-8;
+  SeqLenM1 := FSeqLen - 1;
+  DepthM1 := FDepth - 1;
+  OutSizeMax := Length(FOutSize) - 1;
 
   SetLength(Norm, FSeqLen);
-  for t := 0 to FSeqLen - 1 do
+  for t := 0 to SeqLenM1 do
     Norm[t] := Sqrt(TNNetVolume.DotProduct(
       Inp.GetRawPtr(t, 0, 0), Inp.GetRawPtr(t, 0, 0), FDepth)) + eps;
 
@@ -61174,18 +61213,18 @@ begin
   SetLength(BestB, FSeqLen);
   SetLength(BestSim, FSeqLen);
   SetLength(Merged, FSeqLen);
-  for t := 0 to FSeqLen - 1 do
+  for t := 0 to SeqLenM1 do
   begin
     BestB[t] := -1;
     BestSim[t] := -1e30;
     Merged[t] := False;
   end;
 
-  for a := 0 to FSeqLen - 1 do
+  for a := 0 to SeqLenM1 do
   begin
     isA := (a mod 2) = FParity;
     if not isA then continue;
-    for b := 0 to FSeqLen - 1 do
+    for b := 0 to SeqLenM1 do
     begin
       if (b mod 2) = FParity then continue; // b must be in B set
       dot := TNNetVolume.DotProduct(
@@ -61206,7 +61245,7 @@ begin
   begin
     bestA := -1;
     curBest := -1e30;
-    for a := 0 to FSeqLen - 1 do
+    for a := 0 to SeqLenM1 do
     begin
       if (a mod 2) <> FParity then continue;
       if Merged[a] then continue;
@@ -61225,32 +61264,32 @@ begin
   // ---- Build the input->output token map in original index order ----
   // Tokens that are NOT merged-away A tokens keep their own output slot, in
   // ascending index order. Merged A tokens map to their B partner's slot.
-  for i := 0 to FSeqLen - 1 do FSrcToOut[i] := -1;
+  for i := 0 to SeqLenM1 do FSrcToOut[i] := -1;
   oIdx := 0;
-  for t := 0 to FSeqLen - 1 do
+  for t := 0 to SeqLenM1 do
   begin
     if Merged[t] then continue; // merged-away A token: no slot of its own
     FSrcToOut[t] := oIdx;
     Inc(oIdx);
   end;
   // Map each merged A token to its B partner's output slot.
-  for a := 0 to FSeqLen - 1 do
+  for a := 0 to SeqLenM1 do
     if Merged[a] then
       FSrcToOut[a] := FSrcToOut[BestB[a]];
 
   // ---- Count fused tokens per output slot (size) ----
-  for i := 0 to Length(FOutSize) - 1 do FOutSize[i] := 0;
-  for i := 0 to FSeqLen - 1 do
+  for i := 0 to OutSizeMax do FOutSize[i] := 0;
+  for i := 0 to SeqLenM1 do
     Inc(FOutSize[FSrcToOut[i]]);
 
   // ---- Size-weighted average into the output, record backward weights ----
   FOutput.Fill(0);
-  for i := 0 to FSeqLen - 1 do
+  for i := 0 to SeqLenM1 do
   begin
     oIdx := FSrcToOut[i];
     denom := FOutSize[oIdx];
     FSrcWeight[i] := 1.0 / denom;
-    for d := 0 to FDepth - 1 do
+    for d := 0 to DepthM1 do
       FOutput.FData[oIdx * FDepth + d] :=
         FOutput.FData[oIdx * FDepth + d] +
         Inp.FData[i * FDepth + d] * FSrcWeight[i];
@@ -61279,16 +61318,19 @@ end;
 procedure TNNetTokenMerging.BackpropagateCPU();
 var
   i, d, oIdx: integer;
+  SeqLenM1, DepthM1: integer;
   w: TNeuralFloat;
   PrevErr: TNNetVolume;
 begin
   if FPrevLayer.OutputError.Size <> FPrevLayer.Output.Size then exit;
   PrevErr := FPrevLayer.FOutputError;
-  for i := 0 to FSeqLen - 1 do
+  SeqLenM1 := FSeqLen - 1;
+  DepthM1 := FDepth - 1;
+  for i := 0 to SeqLenM1 do
   begin
     oIdx := FSrcToOut[i];
     w := FSrcWeight[i];
-    for d := 0 to FDepth - 1 do
+    for d := 0 to DepthM1 do
       PrevErr.FData[i * FDepth + d] :=
         PrevErr.FData[i * FDepth + d] +
         w * FOutputError.FData[oIdx * FDepth + d];
@@ -61361,11 +61403,12 @@ end;
 // then moves these unconstrained scalars (beta stays in (0,1) via sigmoid).
 procedure TNNetLIFNeuron.InitDefault();
 var
-  d: integer;
+  d, DepthM1: integer;
 begin
   if not FLearnDynamics then exit;
   if FNeurons.Count < 2 then exit;
-  for d := 0 to FDepth - 1 do
+  DepthM1 := FDepth - 1;
+  for d := 0 to DepthM1 do
   begin
     FNeurons[0].FWeights.FData[d] := FVth;
     FNeurons[1].FWeights.FData[d] := Ln(FBeta / (1.0 - FBeta));
@@ -61424,17 +61467,20 @@ end;
 procedure TNNetLIFNeuron.ComputeCPU();
 var
   t, d, idx: integer;
+  DepthM1, SeqLenM1: integer;
   vPrev, sPrev, vt, current, betaD, vthD: TNeuralFloat;
   Prev: TNNetVolume;
 begin
   Prev := FPrevLayer.FOutput;
-  for d := 0 to FDepth - 1 do
+  DepthM1 := FDepth - 1;
+  SeqLenM1 := FSeqLen - 1;
+  for d := 0 to DepthM1 do
   begin
     betaD := EffBeta(d);
     vthD := EffVth(d);
     vPrev := 0;
     sPrev := 0;
-    for t := 0 to FSeqLen - 1 do
+    for t := 0 to SeqLenM1 do
     begin
       idx := t * FDepth + d;
       current := Prev.FData[idx];
@@ -61472,18 +61518,21 @@ end;
 procedure TNNetLIFNeuron.ComputeSurrogate(ADst: TNNetVolume);
 var
   t, d, idx: integer;
+  DepthM1, SeqLenM1: integer;
   vPrev, sPrev, vt, current, u, denom, gate, betaD, vthD: TNeuralFloat;
   Prev: TNNetVolume;
 begin
   Prev := FPrevLayer.FOutput;
   ADst.ReSize(FSeqLen, 1, FDepth);
-  for d := 0 to FDepth - 1 do
+  DepthM1 := FDepth - 1;
+  SeqLenM1 := FSeqLen - 1;
+  for d := 0 to DepthM1 do
   begin
     betaD := EffBeta(d);
     vthD := EffVth(d);
     vPrev := 0;
     sPrev := 0;
-    for t := 0 to FSeqLen - 1 do
+    for t := 0 to SeqLenM1 do
     begin
       idx := t * FDepth + d;
       current := Prev.FData[idx];
@@ -61546,6 +61595,7 @@ end;
 procedure TNNetLIFNeuron.BackpropagateCPU();
 var
   t, d, idx: integer;
+  DepthM1: integer;
   gVnext, gO, gS, gV, sgPrime, vt, st, denom, betaD, vthD: TNeuralFloat;
   vPrevTm1, sPrevTm1, gradVth, gradBeta: TNeuralFloat;
   hasInputGrad, learn: boolean;
@@ -61557,7 +61607,8 @@ begin
   if (not hasInputGrad) and (not learn) then exit;
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
-  for d := 0 to FDepth - 1 do
+  DepthM1 := FDepth - 1;
+  for d := 0 to DepthM1 do
   begin
     betaD := EffBeta(d);
     vthD := EffVth(d);
@@ -61682,11 +61733,12 @@ end;
 // Seed the per-channel raw dynamics at the scalar (V_th, beta) requested.
 procedure TNNetALIFNeuron.InitDefault();
 var
-  d: integer;
+  d, DepthM1: integer;
 begin
   if not FLearnDynamics then exit;
   if FNeurons.Count < 2 then exit;
-  for d := 0 to FDepth - 1 do
+  DepthM1 := FDepth - 1;
+  for d := 0 to DepthM1 do
   begin
     FNeurons[0].FWeights.FData[d] := FVth;
     FNeurons[1].FWeights.FData[d] := Ln(FBeta / (1.0 - FBeta));
@@ -61743,17 +61795,20 @@ end;
 procedure TNNetALIFNeuron.ComputeCPU();
 var
   ti, d, idx: integer;
+  DepthM1, SeqLenM1: integer;
   vPrev, sPrev, aPrev, vt, at, current, betaD, vthEff: TNeuralFloat;
   Prev: TNNetVolume;
 begin
   Prev := FPrevLayer.FOutput;
-  for d := 0 to FDepth - 1 do
+  DepthM1 := FDepth - 1;
+  SeqLenM1 := FSeqLen - 1;
+  for d := 0 to DepthM1 do
   begin
     betaD := EffBeta(d);
     vPrev := 0;
     sPrev := 0;
     aPrev := 0;
-    for ti := 0 to FSeqLen - 1 do
+    for ti := 0 to SeqLenM1 do
     begin
       idx := ti * FDepth + d;
       current := Prev.FData[idx];
@@ -61787,19 +61842,22 @@ end;
 procedure TNNetALIFNeuron.ComputeSurrogate(ADst: TNNetVolume);
 var
   ti, d, idx: integer;
+  DepthM1, SeqLenM1: integer;
   vPrev, sPrev, aPrev, vt, at, current, u, denom, gate, betaD,
     vthEff: TNeuralFloat;
   Prev: TNNetVolume;
 begin
   Prev := FPrevLayer.FOutput;
   ADst.ReSize(FSeqLen, 1, FDepth);
-  for d := 0 to FDepth - 1 do
+  DepthM1 := FDepth - 1;
+  SeqLenM1 := FSeqLen - 1;
+  for d := 0 to DepthM1 do
   begin
     betaD := EffBeta(d);
     vPrev := 0;
     sPrev := 0;
     aPrev := 0;
-    for ti := 0 to FSeqLen - 1 do
+    for ti := 0 to SeqLenM1 do
     begin
       idx := ti * FDepth + d;
       current := Prev.FData[idx];
@@ -61858,6 +61916,7 @@ end;
 procedure TNNetALIFNeuron.BackpropagateCPU();
 var
   ti, d, idx: integer;
+  DepthM1: integer;
   gVnext, gAnext, gO, gS, gV, gA, sgPrime, vt, st, at, u, denom,
     betaD, vthD, vthEff: TNeuralFloat;
   vPrevTm1, sPrevTm1, gradVth, gradBeta: TNeuralFloat;
@@ -61870,7 +61929,8 @@ begin
   if (not hasInputGrad) and (not learn) then exit;
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
-  for d := 0 to FDepth - 1 do
+  DepthM1 := FDepth - 1;
+  for d := 0 to DepthM1 do
   begin
     betaD := EffBeta(d);
     vthD := EffVth(d);
@@ -61984,13 +62044,14 @@ end;
 // a mild perturbation of the plain morphological dilation/erosion of the patch.
 procedure TNNetTropicalConv.InitDefault();
 var
-  i, WeightCount: integer;
+  i, WeightCount, WeightMax: integer;
   W: TNNetVolume;
 begin
   if FInDepth <= 0 then exit;
   W := FArrNeurons[0].FWeights;
   WeightCount := W.Size;
-  for i := 0 to WeightCount - 1 do
+  WeightMax := WeightCount - 1;
+  for i := 0 to WeightMax do
     W.FData[i] := 0.1 * (Random - 0.5) * 2;
 end;
 
@@ -62006,6 +62067,7 @@ end;
 procedure TNNetTropicalConv.ComputeCPU();
 var
   ox, oy, co, fx, fy, ci, tap, best, outIdx: integer;
+  OutputSizeYM1, OutputSizeXM1, OutDepthM1, FeatureSizeYM1, FeatureSizeXM1, InDepthM1: integer;
   prevX, prevY: integer;
   prevSizeX, prevSizeY: integer;
   PrevOut, W: TNNetVolume;
@@ -62016,25 +62078,31 @@ begin
   W := FArrNeurons[0].FWeights;
   prevSizeX := PrevOut.SizeX;
   prevSizeY := PrevOut.SizeY;
+  OutputSizeYM1 := FOutputSizeY - 1;
+  OutputSizeXM1 := FOutputSizeX - 1;
+  OutDepthM1 := FOutDepth - 1;
+  FeatureSizeYM1 := FFeatureSizeY - 1;
+  FeatureSizeXM1 := FFeatureSizeX - 1;
+  InDepthM1 := FInDepth - 1;
   // Erosion uses x - SE (sgn = -1); dilation uses x + SE (sgn = +1).
   if FErode = 0 then sgn := 1 else sgn := -1;
-  for oy := 0 to FOutputSizeY - 1 do
-  for ox := 0 to FOutputSizeX - 1 do
+  for oy := 0 to OutputSizeYM1 do
+  for ox := 0 to OutputSizeXM1 do
   begin
-    for co := 0 to FOutDepth - 1 do
+    for co := 0 to OutDepthM1 do
     begin
       best := 0;
       bestVal := 0;
       hasCand := false;
-      for fy := 0 to FFeatureSizeY - 1 do
+      for fy := 0 to FeatureSizeYM1 do
       begin
         prevY := oy * FStride + fy - FPadding;
         if (prevY < 0) or (prevY >= prevSizeY) then continue;
-        for fx := 0 to FFeatureSizeX - 1 do
+        for fx := 0 to FeatureSizeXM1 do
         begin
           prevX := ox * FStride + fx - FPadding;
           if (prevX < 0) or (prevX >= prevSizeX) then continue;
-          for ci := 0 to FInDepth - 1 do
+          for ci := 0 to InDepthM1 do
           begin
             tap := ((fy * FFeatureSizeX + fx) * FInDepth + ci) * FOutDepth + co;
             cand := PrevOut.Get(prevX, prevY, ci) + sgn * W.FData[tap];
