@@ -87600,6 +87600,7 @@ var
   LpBnd208: integer;
   LpBnd209: integer;
   LpBnd210: integer;
+  LastLayerIdx, NumAlphaM1, TrIdxsHigh, TrIdxsHighM1, HiddenPosHigh, WidthM1: integer;
   Lines: TStringList;
   NetB: TNNet;
   aSnap, StructStr, DiffStr, Verdict, ScoreName: string;
@@ -87694,16 +87695,17 @@ var
   // from the previous layer's output position i, which now holds old unit P[i].
   procedure PermuteNextLayerInputColumns(Lay: TNNetLayer; const P: array of integer);
   var
-    n, c, sz: integer;
+    n, c, sz, szM1: integer;
     oldCol: array of TNeuralFloat;
   begin
     LpBnd200 := Lay.Neurons.Count - 1;
     for n := 0 to LpBnd200 do
     begin
       sz := Lay.Neurons[n].Weights.Size;
+      szM1 := sz - 1;
       SetLength(oldCol, sz);
-      for c := 0 to sz - 1 do oldCol[c] := Lay.Neurons[n].Weights.FData[c];
-      for c := 0 to sz - 1 do
+      for c := 0 to szM1 do oldCol[c] := Lay.Neurons[n].Weights.FData[c];
+      for c := 0 to szM1 do
         if (P[c] >= 0) and (P[c] < sz) then
           Lay.Neurons[n].Weights.FData[c] := oldCol[P[c]];
     end;
@@ -87719,12 +87721,12 @@ var
     Al, OneMin: TNeuralFloat;
     LayA, LayBb: TNNetLayer;
   begin
-    for AI := 0 to NumAlpha - 1 do
+    for AI := 0 to NumAlphaM1 do
     begin
       Al := AlphasArr[AI];
       OneMin := 1.0 - Al;
       NN.LoadDataFromString(aSnap);   // live weights := A
-      for TI := 0 to High(TrainableIdxs) do
+      for TI := 0 to TrIdxsHigh do
       begin
         LayA := NN.Layers[TrainableIdxs[TI]];
         LayBb := NetB.Layers[TrainableIdxs[TI]];
@@ -87742,7 +87744,7 @@ var
       Losses[AI] := EvalLoss();
     end;
     MaxL := Losses[0]; MinL := Losses[0];
-    for AI := 1 to NumAlpha - 1 do
+    for AI := 1 to NumAlphaM1 do
     begin
       if Losses[AI] > MaxL then MaxL := Losses[AI];
       if Losses[AI] < MinL then MinL := Losses[AI];
@@ -87778,6 +87780,7 @@ begin
     end;
     if K < 1 then K := 1;
     NumAlpha := K + 1;
+    NumAlphaM1 := NumAlpha - 1;
     if ScoreMode = 1 then ScoreName := 'activation' else ScoreName := 'weight';
 
     // Endpoint A snapshot (data only) — used to read A on the path and restore.
@@ -87800,7 +87803,8 @@ begin
     SelfMode := (SnapshotB = aSnap);
 
     // Catalogue trainable layers (neurons owning a non-empty weight tensor).
-    for LIdx := 0 to NN.GetLastLayerIdx() do
+    LastLayerIdx := NN.GetLastLayerIdx();
+    for LIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LIdx];
       if Layer.Neurons.Count = 0 then Continue;
@@ -87815,6 +87819,8 @@ begin
         sLineBreak;
       Exit;
     end;
+    TrIdxsHigh := High(TrainableIdxs);
+    TrIdxsHighM1 := TrIdxsHigh - 1;
 
     // Hidden permutable layers: a trainable layer that is FOLLOWED by another
     // trainable layer whose per-neuron input-weight tensor has exactly one
@@ -87822,7 +87828,7 @@ begin
     // neurons and can be compensated). Last trainable layer is the read-out head
     // (its output ordering is fixed by the targets) — never permuted.
     SetLength(HiddenPos, 0);
-    for I := 0 to High(TrainableIdxs) - 1 do
+    for I := 0 to TrIdxsHighM1 do
     begin
       Layer := NetB.Layers[TrainableIdxs[I]];
       NextLayerB := NetB.Layers[TrainableIdxs[I + 1]];
@@ -87841,10 +87847,11 @@ begin
         'FullConnect). Nothing to permute.' + sLineBreak;
       Exit;
     end;
+    HiddenPosHigh := High(HiddenPos);
 
     SetLength(AlphasArr, NumAlpha);
     SetLength(Losses, NumAlpha);
-    for I := 0 to NumAlpha - 1 do AlphasArr[I] := I / (NumAlpha - 1);
+    for I := 0 to NumAlphaM1 do AlphasArr[I] := I / (NumAlpha - 1);
     AlphasArr[0] := 0;
     AlphasArr[NumAlpha - 1] := 1;
 
@@ -87874,26 +87881,27 @@ begin
     SetLength(Perm, Length(HiddenPos));
     SetLength(Churn, Length(HiddenPos));
     AllIdentity := true;
-    for HCount := 0 to High(HiddenPos) do
+    for HCount := 0 to HiddenPosHigh do
     begin
       TIdx := TrainableIdxs[HiddenPos[HCount]];
       NextTIdx := TrainableIdxs[HiddenPos[HCount] + 1];
       Layer := NN.Layers[TIdx];        // endpoint A (live = A here)
       LayerB := NetB.Layers[TIdx];     // endpoint B
       Width := LayerB.Neurons.Count;   // B units == A units (same arch)
+      WidthM1 := Width - 1;
       SetLength(Perm[HCount], Width);
 
       // Build the WidthxWidth score matrix: score[a][b] = similarity of A-unit a
       // to B-unit b. Higher is better; greedy picks the global best repeatedly.
       SetLength(ScoreMat, Width);
-      for I := 0 to Width - 1 do SetLength(ScoreMat[I], Width);
+      for I := 0 to WidthM1 do SetLength(ScoreMat[I], Width);
 
       if ScoreMode = 1 then
       begin
         // ACTIVATION matching: correlate per-unit activations over Samples.
         AWidth := Layer.Output.Size;
         SetLength(ActA, Width); SetLength(ActB, Width);
-        for I := 0 to Width - 1 do
+        for I := 0 to WidthM1 do
         begin
           SetLength(ActA[I], Samples.Count);
           SetLength(ActB[I], Samples.Count);
@@ -87905,7 +87913,7 @@ begin
           pr := Samples[I];
           if (pr = nil) or (pr.I = nil) then Continue;
           NN.Compute(pr.I);
-          for J := 0 to Width - 1 do
+          for J := 0 to WidthM1 do
             if J < AWidth then ActA[J][I] := Layer.Output.FData[J]
             else ActA[J][I] := 0;
         end;
@@ -87917,14 +87925,14 @@ begin
           pr := Samples[I];
           if (pr = nil) or (pr.I = nil) then Continue;
           NN.Compute(pr.I);
-          for J := 0 to Width - 1 do
+          for J := 0 to WidthM1 do
             if J < AWidth then ActB[J][I] := Layer.Output.FData[J]
             else ActB[J][I] := 0;
         end;
         NN.LoadDataFromString(aSnap);
         // Cosine over the sample axis.
         SetLength(ANorm, Width); SetLength(BNorm, Width);
-        for I := 0 to Width - 1 do
+        for I := 0 to WidthM1 do
         begin
           sVal := 0;
           LpBnd206 := Samples.Count - 1;
@@ -87935,8 +87943,8 @@ begin
           for J := 0 to LpBnd207 do sVal := sVal + ActB[I][J]*ActB[I][J];
           BNorm[I] := Sqrt(sVal);
         end;
-        for I := 0 to Width - 1 do
-          for J := 0 to Width - 1 do
+        for I := 0 to WidthM1 do
+          for J := 0 to WidthM1 do
           begin
             dotv := 0;
             LpBnd208 := Samples.Count - 1;
@@ -87949,15 +87957,15 @@ begin
       begin
         // WEIGHT matching: cosine between A-unit a's weight row and B-unit b's.
         SetLength(ANorm, Width); SetLength(BNorm, Width);
-        for I := 0 to Width - 1 do
+        for I := 0 to WidthM1 do
         begin
           sVal := Layer.Neurons[I].Weights.GetSumSqr();
           ANorm[I] := Sqrt(sVal);
           sVal := LayerB.Neurons[I].Weights.GetSumSqr();
           BNorm[I] := Sqrt(sVal);
         end;
-        for I := 0 to Width - 1 do
-          for J := 0 to Width - 1 do
+        for I := 0 to WidthM1 do
+          for J := 0 to WidthM1 do
           begin
             dotv := Layer.Neurons[I].Weights.DotProduct(LayerB.Neurons[J].Weights);
             ScoreMat[I][J] := dotv / (ANorm[I]*BNorm[J] + cEps);
@@ -87966,14 +87974,14 @@ begin
 
       // Greedy correlation-descent: repeatedly take the best unmatched pair.
       SetLength(UsedA, Width); SetLength(UsedB, Width);
-      for I := 0 to Width - 1 do begin UsedA[I] := false; UsedB[I] := false; Perm[HCount][I] := -1; end;
-      for mI := 0 to Width - 1 do
+      for I := 0 to WidthM1 do begin UsedA[I] := false; UsedB[I] := false; Perm[HCount][I] := -1; end;
+      for mI := 0 to WidthM1 do
       begin
         bestScore := -1e30; bestI := -1; bestJ := -1;
-        for I := 0 to Width - 1 do
+        for I := 0 to WidthM1 do
         begin
           if UsedA[I] then Continue;
-          for J := 0 to Width - 1 do
+          for J := 0 to WidthM1 do
           begin
             if UsedB[J] then Continue;
             if ScoreMat[I][J] > bestScore then
@@ -87992,7 +88000,7 @@ begin
 
       // Churn = fraction of positions whose B-unit changed.
       mJ := 0;
-      for I := 0 to Width - 1 do
+      for I := 0 to WidthM1 do
         if Perm[HCount][I] <> I then Inc(mJ);
       Churn[HCount] := mJ / Width;
       if mJ <> 0 then AllIdentity := false;
@@ -88045,7 +88053,7 @@ begin
     Lines.Add('');
 
     Lines.Add('Per-hidden-layer permutation churn (fraction of units moved):');
-    for HCount := 0 to High(HiddenPos) do
+    for HCount := 0 to HiddenPosHigh do
       Lines.Add(Format('  layer[%d] (net layer %d, width %d): churn = %.3f',
         [HCount, TrainableIdxs[HiddenPos[HCount]],
          NN.Layers[TrainableIdxs[HiddenPos[HCount]]].Neurons.Count,
@@ -88156,6 +88164,7 @@ var
   LayerIdx, I, J, SampleIdx, BinIdx, K: integer;
   Layer: TNNetLayer;
   N, UsedSamples, TrainableLayers: integer;
+  LastLayerIdxNC, NM1, cBinsM1, UsedSamplesM1, TopPairsM1, FilledM1, FilledM2: integer;
   // single-pass accumulators (per layer)
   Sum: array of TNeuralFloat;        // sum of each neuron's activation
   SumSq: array of TNeuralFloat;      // sum of squares
@@ -88212,7 +88221,11 @@ begin
 
     TrainableLayers := 0;
 
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    cBinsM1 := cBins - 1;
+    UsedSamplesM1 := UsedSamples - 1;
+    TopPairsM1 := TopPairsPerLayer - 1;
+    LastLayerIdxNC := NN.GetLastLayerIdx();
+    for LayerIdx := 0 to LastLayerIdxNC do
     begin
       Layer := NN.Layers[LayerIdx];
       if Layer.Neurons.Count = 0 then Continue;
@@ -88220,6 +88233,7 @@ begin
 
       Inc(TrainableLayers);
       N := Layer.Output.Size;
+      NM1 := N - 1;
       ShapeStr := Format('(%d,%d,%d)',
         [Layer.Output.SizeX, Layer.Output.SizeY, Layer.Output.Depth]);
 
@@ -88246,23 +88260,23 @@ begin
       SetLength(Sum, N);
       SetLength(SumSq, N);
       SetLength(Cross, N);
-      for I := 0 to N - 1 do
+      for I := 0 to NM1 do
       begin
         Sum[I] := 0;
         SumSq[I] := 0;
         SetLength(Cross[I], N);
-        for J := I to N - 1 do Cross[I][J] := 0;
+        for J := I to NM1 do Cross[I][J] := 0;
       end;
 
-      for SampleIdx := 0 to UsedSamples - 1 do
+      for SampleIdx := 0 to UsedSamplesM1 do
       begin
         NN.Compute(Samples[SampleIdx]);
-        for I := 0 to N - 1 do
+        for I := 0 to NM1 do
         begin
           V := Layer.Output.Raw[I];
           Sum[I] := Sum[I] + V;
           SumSq[I] := SumSq[I] + V * V;
-          for J := I to N - 1 do
+          for J := I to NM1 do
             Cross[I][J] := Cross[I][J] + V * Layer.Output.Raw[J];
         end;
       end;
@@ -88271,7 +88285,7 @@ begin
       SetLength(Mean, N);
       SetLength(Std, N);
       ConstCount := 0;
-      for I := 0 to N - 1 do
+      for I := 0 to NM1 do
       begin
         Mean[I] := Sum[I] / UsedSamples;
         V := SumSq[I] / UsedSamples - Mean[I] * Mean[I];
@@ -88285,7 +88299,7 @@ begin
       //   * top-K most-correlated pairs,
       //   * Frobenius energy sum_ij rho_ij^2 (full matrix, diag rho_ii=1). ----
       SetLength(Bins, cBins);
-      for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+      for BinIdx := 0 to cBinsM1 do Bins[BinIdx] := 0;
       SetLength(TopI, TopPairsPerLayer);
       SetLength(TopJ, TopPairsPerLayer);
       SetLength(TopRho, TopPairsPerLayer);
@@ -88295,11 +88309,11 @@ begin
       FrobSq := 0;
       HasNearDup := False;
 
-      for I := 0 to N - 1 do
+      for I := 0 to NM1 do
       begin
         // diagonal: rho_ii = 1 for a varying neuron, 0 for a constant one.
         if Std[I] >= cConstStd then FrobSq := FrobSq + 1.0;
-        for J := I + 1 to N - 1 do
+        for J := I + 1 to NM1 do
         begin
           if (Std[I] < cConstStd) or (Std[J] < cConstStd) then
             Rho := 0
@@ -88345,7 +88359,7 @@ begin
               // replace the current smallest-|rho| entry if this is larger.
               MinPos := 0;
               SmallestAbs := TopAbs[0];
-              for K := 1 to TopPairsPerLayer - 1 do
+              for K := 1 to TopPairsM1 do
                 if TopAbs[K] < SmallestAbs then
                 begin
                   SmallestAbs := TopAbs[K];
@@ -88373,11 +88387,11 @@ begin
 
       // (a) |rho_ij| histogram over the i<j pairs.
       MaxBin := 0;
-      for BinIdx := 0 to cBins - 1 do
+      for BinIdx := 0 to cBinsM1 do
         if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
       Lines.Add(Format('  |rho| histogram over %d pair(s) (10 bins, [0,1]):',
         [PairCount]));
-      for BinIdx := 0 to cBins - 1 do
+      for BinIdx := 0 to cBinsM1 do
       begin
         if MaxBin > 0 then
           BarLen := Round((Bins[BinIdx] / MaxBin) * cMaxBarWidth)
@@ -88391,10 +88405,12 @@ begin
       // (b) top-K most-correlated pairs (sorted desc by |rho|, selection sort).
       if TopPairsPerLayer > 0 then
       begin
-        for I := 0 to Filled - 2 do
+        FilledM1 := Filled - 1;
+        FilledM2 := Filled - 2;
+        for I := 0 to FilledM2 do
         begin
           MinPos := I;
-          for J := I + 1 to Filled - 1 do
+          for J := I + 1 to FilledM1 do
             if TopAbs[J] > TopAbs[MinPos] then MinPos := J;
           if MinPos <> I then
           begin
@@ -88410,7 +88426,7 @@ begin
         if Filled = 0 then
           Lines.Add('    (none)')
         else
-          for I := 0 to Filled - 1 do
+          for I := 0 to FilledM1 do
             Lines.Add(Format('    neurons %5d & %5d   rho=%8.4f',
               [TopI[I], TopJ[I], TopRho[I]]));
       end;
@@ -88483,6 +88499,7 @@ var
   LayerIdx, TrIdx, SampleIdx, I, J, K, BinIdx: integer;
   Layer: TNNetLayer;
   UsedSamples, TrainableLayers: integer;
+  LSLastLayerIdx, LSUsedSamplesM1, LSTrainM1, LSTrainM2, LSTrialsM1, LScBinsM1, LSBaselineHigh: integer;
   HasTargets: boolean;
   Snapshot: string;
   SavedRandSeed: longword;
@@ -88591,10 +88608,14 @@ begin
     // Whole-net snapshot for exact restore between perturbations.
     Snapshot := NN.SaveDataToString();
 
+    LSUsedSamplesM1 := UsedSamples - 1;
+    LSTrialsM1 := Trials - 1;
+    LScBinsM1 := cBins - 1;
+
     // ---- baseline: cache final-layer output (and MSE loss) per sample. ----
     SetLength(Baseline, UsedSamples);
     SetLength(BaseLoss, UsedSamples);
-    for SampleIdx := 0 to UsedSamples - 1 do
+    for SampleIdx := 0 to LSUsedSamplesM1 do
     begin
       NN.Compute(Samples[SampleIdx]);
       Output := NN.GetLastLayer.Output;
@@ -88619,7 +88640,8 @@ begin
 
     // ---- collect trainable layers. ----
     SetLength(TrLayerIdx, 0);
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    LSLastLayerIdx := NN.GetLastLayerIdx();
+    for LayerIdx := 0 to LSLastLayerIdx do
     begin
       Layer := NN.Layers[LayerIdx];
       if Layer.Neurons.Count = 0 then Continue;
@@ -88629,6 +88651,8 @@ begin
       TrLayerIdx[High(TrLayerIdx)] := LayerIdx;
     end;
     TrainableLayers := Length(TrLayerIdx);
+    LSTrainM1 := TrainableLayers - 1;
+    LSTrainM2 := TrainableLayers - 2;
 
     if TrainableLayers = 0 then
     begin
@@ -88643,7 +88667,7 @@ begin
     SetLength(MeanLossDelta, TrainableLayers);
 
     // ---- per trainable layer: perturb -> measure -> restore, Trials times. --
-    for TrIdx := 0 to TrainableLayers - 1 do
+    for TrIdx := 0 to LSTrainM1 do
     begin
       Layer := NN.Layers[TrLayerIdx[TrIdx]];
       // param count = sum of weight sizes + one bias per neuron.
@@ -88656,7 +88680,7 @@ begin
       AccLoss := 0;
       MaxDelta[TrIdx] := 0;
 
-      for K := 0 to Trials - 1 do
+      for K := 0 to LSTrialsM1 do
       begin
         // Perturb ONE layer's weights and biases: W *= 1 + eta.
         LpBnd213 := Layer.Neurons.Count - 1;
@@ -88677,7 +88701,7 @@ begin
 
         // Measure output-delta L2 (and loss-delta) over the probe batch.
         TrialDelta := 0;
-        for SampleIdx := 0 to UsedSamples - 1 do
+        for SampleIdx := 0 to LSUsedSamplesM1 do
         begin
           NN.Compute(Samples[SampleIdx]);
           Output := NN.GetLastLayer.Output;
@@ -88727,7 +88751,7 @@ begin
       ['idx', 'class', 'out(X,Y,D)', 'mean-dL2', 'max-dL2',
        'norm(/param)', 'mean-dLoss']));
     Lines.Add('  ' + StringOfChar('-', 102));
-    for TrIdx := 0 to TrainableLayers - 1 do
+    for TrIdx := 0 to LSTrainM1 do
     begin
       Layer := NN.Layers[TrLayerIdx[TrIdx]];
       ShapeStr := Format('(%d,%d,%d)',
@@ -88748,15 +88772,15 @@ begin
     // ---- (d) histogram of per-layer mean output-delta. ----
     MinMean := MeanDelta[0];
     MaxMean := MeanDelta[0];
-    for TrIdx := 1 to TrainableLayers - 1 do
+    for TrIdx := 1 to LSTrainM1 do
     begin
       if MeanDelta[TrIdx] < MinMean then MinMean := MeanDelta[TrIdx];
       if MeanDelta[TrIdx] > MaxMean then MaxMean := MeanDelta[TrIdx];
     end;
     Width := MaxMean - MinMean;
     SetLength(Bins, cBins);
-    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
-    for TrIdx := 0 to TrainableLayers - 1 do
+    for BinIdx := 0 to LScBinsM1 do Bins[BinIdx] := 0;
+    for TrIdx := 0 to LSTrainM1 do
     begin
       if Width > 1e-30 then
         BinIdx := Trunc((MeanDelta[TrIdx] - MinMean) / Width * cBins)
@@ -88770,9 +88794,9 @@ begin
       'Per-layer mean output-delta histogram (10 bins over [%.6f, %.6f]):',
       [MinMean, MaxMean]));
     MaxBin := 0;
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to LScBinsM1 do
       if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to LScBinsM1 do
     begin
       if MaxBin > 0 then
         BarLen := Round((Bins[BinIdx] / MaxBin) * cMaxBarWidth)
@@ -88787,8 +88811,8 @@ begin
 
     // ---- (e) high/low-impact flags via top/bottom-10% thresholds. ----
     SetLength(Sorted, TrainableLayers);
-    for TrIdx := 0 to TrainableLayers - 1 do Sorted[TrIdx] := MeanDelta[TrIdx];
-    for I := 0 to TrainableLayers - 2 do
+    for TrIdx := 0 to LSTrainM1 do Sorted[TrIdx] := MeanDelta[TrIdx];
+    for I := 0 to LSTrainM2 do
       for J := 0 to TrainableLayers - 2 - I do
         if Sorted[J] > Sorted[J + 1] then
         begin
@@ -88807,13 +88831,13 @@ begin
     LowThr := Sorted[K - 1];                        // <= this -> low impact
 
     Flags.Add('High-impact layers (top 10% by mean output-delta):');
-    for TrIdx := 0 to TrainableLayers - 1 do
+    for TrIdx := 0 to LSTrainM1 do
       if MeanDelta[TrIdx] >= HighThr then
         Flags.Add(Format('  Layer %3d %s: mean-dL2=%.6f',
           [TrLayerIdx[TrIdx], NN.Layers[TrLayerIdx[TrIdx]].ClassName,
            MeanDelta[TrIdx]]));
     Flags.Add('Low-impact layers (bottom 10% by mean output-delta):');
-    for TrIdx := 0 to TrainableLayers - 1 do
+    for TrIdx := 0 to LSTrainM1 do
       if MeanDelta[TrIdx] <= LowThr then
         Flags.Add(Format('  Layer %3d %s: mean-dL2=%.6f',
           [TrLayerIdx[TrIdx], NN.Layers[TrLayerIdx[TrIdx]].ClassName,
@@ -88841,7 +88865,8 @@ begin
   finally
     // Defensive exact restore (covers any early-exit path after the snapshot).
     if Snapshot <> '' then NN.LoadDataFromString(Snapshot);
-    for I := 0 to High(Baseline) do
+    LSBaselineHigh := High(Baseline);
+    for I := 0 to LSBaselineHigh do
       if Baseline[I] <> nil then Baseline[I].Free;
     RandSeed := SavedRandSeed;
     Flags.Free;
@@ -88859,15 +88884,17 @@ var
   LpBnd221: integer;
   LpBnd222: integer;
   LayerCnt, NeuronCnt, WeightCnt, K, CutIdx, TotalWeights: integer;
+  PruneLastLayerIdx: integer;
   Layer: TNNetLayer;
   Neuron: TNNetNeuron;
   AllAbs: array of TNeuralFloat;
   Threshold: TNeuralFloat;
 
   procedure SortAsc(var Arr: array of TNeuralFloat; N: integer);
-  var A, B: integer; SwapF: TNeuralFloat;
+  var A, B, NM2: integer; SwapF: TNeuralFloat;
   begin
-    for A := 0 to N - 2 do
+    NM2 := N - 2;
+    for A := 0 to NM2 do
       for B := 0 to N - 2 - A do
         if Arr[B] > Arr[B + 1] then
         begin
@@ -88883,12 +88910,13 @@ begin
     Exit;
   end;
   if Sparsity >= 1 then Sparsity := 0.999999;
+  PruneLastLayerIdx := GetLastLayerIdx();
 
   if not PerLayer then
   begin
     // GLOBAL: pool |w| over the whole net, threshold at the Sparsity percentile.
     TotalWeights := 0;
-    for LayerCnt := 0 to GetLastLayerIdx() do
+    for LayerCnt := 0 to PruneLastLayerIdx do
     begin
       Layer := FLayers[LayerCnt];
       if Layer.Neurons.Count = 0 then Continue;
@@ -88901,7 +88929,7 @@ begin
     if TotalWeights = 0 then Exit;
     SetLength(AllAbs, TotalWeights);
     K := 0;
-    for LayerCnt := 0 to GetLastLayerIdx() do
+    for LayerCnt := 0 to PruneLastLayerIdx do
     begin
       Layer := FLayers[LayerCnt];
       if Layer.Neurons.Count = 0 then Continue;
@@ -88925,14 +88953,14 @@ begin
     if CutIdx > TotalWeights then CutIdx := TotalWeights;
     // Threshold = magnitude of the largest weight we still prune.
     Threshold := AllAbs[CutIdx - 1];
-    for LayerCnt := 0 to GetLastLayerIdx() do
+    for LayerCnt := 0 to PruneLastLayerIdx do
       Result := Result +
         FLayers[LayerCnt].BuildPruneMaskFromThreshold(Threshold);
   end
   else
   begin
     // PER-LAYER: each trainable layer pruned to Sparsity independently.
-    for LayerCnt := 0 to GetLastLayerIdx() do
+    for LayerCnt := 0 to PruneLastLayerIdx do
     begin
       Layer := FLayers[LayerCnt];
       if Layer.Neurons.Count = 0 then Continue;
@@ -88968,19 +88996,21 @@ end;
 
 procedure TNNet.ApplyPruneMasks();
 var
-  LayerCnt: integer;
+  LayerCnt, LastIdx: integer;
 begin
-  for LayerCnt := 0 to GetLastLayerIdx() do
+  LastIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastIdx do
     if FLayers[LayerCnt].HasPruneMask() then
       FLayers[LayerCnt].ApplyPruneMask();
 end;
 
 function TNNet.HasPruneMasks(): boolean;
 var
-  LayerCnt: integer;
+  LayerCnt, LastIdx: integer;
 begin
   Result := False;
-  for LayerCnt := 0 to GetLastLayerIdx() do
+  LastIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastIdx do
     if FLayers[LayerCnt].HasPruneMask() then
     begin
       Result := True;
@@ -88990,30 +89020,33 @@ end;
 
 procedure TNNet.ClearPruneMasks();
 var
-  LayerCnt: integer;
+  LayerCnt, LastIdx: integer;
 begin
-  for LayerCnt := 0 to GetLastLayerIdx() do
+  LastIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastIdx do
     FLayers[LayerCnt].ClearPruneMask();
 end;
 
 function TNNet.CountPrunedWeights(): integer;
 var
-  LayerCnt: integer;
+  LayerCnt, LastIdx: integer;
 begin
   Result := 0;
-  for LayerCnt := 0 to GetLastLayerIdx() do
+  LastIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastIdx do
     Result := Result + FLayers[LayerCnt].CountPrunedWeights();
 end;
 
 function TNNet.GetPruneSparsity(): TNeuralFloat;
 var
   LpBnd223: integer;
-  LayerCnt, NeuronCnt, TotalWeights: integer;
+  LayerCnt, NeuronCnt, TotalWeights, LastIdx: integer;
   Layer: TNNetLayer;
 begin
   Result := 0;
   TotalWeights := 0;
-  for LayerCnt := 0 to GetLastLayerIdx() do
+  LastIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastIdx do
   begin
     Layer := FLayers[LayerCnt];
     if Layer.Neurons.Count = 0 then Continue;
@@ -89069,6 +89102,7 @@ var
   LayerIdx, NeuronIdx, K, I, LvIdx, TrainableLayers, TotalWeights: integer;
   UsedSamples, SampleIdx, NumLevels, ZeroedTotal, CutIdx, KneeIdx: integer;
   PerLayerCount, PerLayerCut: integer;
+  MPLastLayerIdx, MPUsedSamplesM1, MPNumLevelsM1, MPTrainM1, MPBaselineHigh: integer;
   Layer: TNNetLayer;
   Neuron: TNNetNeuron;
   W, AbsW, Threshold, S, AccLoss, AccAcc, SampleLoss, Tgt, Diff: TNeuralFloat;
@@ -89084,9 +89118,10 @@ var
 
   // Quickselect-free: collect |w| of a slice into Buf then sort ascending.
   procedure SortAsc(var Arr: array of TNeuralFloat; N: integer);
-  var A, B: integer;
+  var A, B, NM2: integer;
   begin
-    for A := 0 to N - 2 do
+    NM2 := N - 2;
+    for A := 0 to NM2 do
       for B := 0 to N - 2 - A do
         if Arr[B] > Arr[B + 1] then
         begin
@@ -89123,7 +89158,8 @@ begin
     // ---- collect trainable layers (Neurons with a non-empty weight tensor). --
     SetLength(TrLayerIdx, 0);
     TotalWeights := 0;
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    MPLastLayerIdx := NN.GetLastLayerIdx();
+    for LayerIdx := 0 to MPLastLayerIdx do
     begin
       Layer := NN.Layers[LayerIdx];
       if Layer.Neurons.Count = 0 then Continue;
@@ -89170,6 +89206,9 @@ begin
     Levels[4] := 40;  Levels[5] := 50;  Levels[6] := 60;  Levels[7] := 70;
     Levels[8] := 80;  Levels[9] := 90;  Levels[10] := 95; Levels[11] := 99;
     NumLevels := Length(Levels);
+    MPNumLevelsM1 := NumLevels - 1;
+    MPTrainM1 := TrainableLayers - 1;
+    MPUsedSamplesM1 := UsedSamples - 1;
     SetLength(LevelLoss, NumLevels);
     SetLength(LevelAcc, NumLevels);
     SetLength(LevelRealised, NumLevels);
@@ -89180,7 +89219,7 @@ begin
 
     // ---- baseline (s=0) outputs: cached so a label-free run still has a loss. -
     SetLength(Baseline, UsedSamples);
-    for SampleIdx := 0 to UsedSamples - 1 do
+    for SampleIdx := 0 to MPUsedSamplesM1 do
     begin
       NN.Compute(Samples[SampleIdx]);
       Output := NN.GetLastLayer.Output;
@@ -89193,7 +89232,7 @@ begin
     SetLength(KneeZeroed, TrainableLayers);
     SetLength(AllAbs, TotalWeights);
 
-    for LvIdx := 0 to NumLevels - 1 do
+    for LvIdx := 0 to MPNumLevelsM1 do
     begin
       S := Levels[LvIdx] / 100.0;
       ZeroedTotal := 0;
@@ -89203,7 +89242,7 @@ begin
       begin
         // GLOBAL: pool all |w|, sort, cut at s-percentile.
         K := 0;
-        for I := 0 to TrainableLayers - 1 do
+        for I := 0 to MPTrainM1 do
         begin
           Layer := NN.Layers[TrLayerIdx[I]];
           LpBnd225 := Layer.Neurons.Count - 1;
@@ -89231,7 +89270,7 @@ begin
       else
         Threshold := 0; // unused; per-layer threshold computed inside loop
 
-      for I := 0 to TrainableLayers - 1 do
+      for I := 0 to MPTrainM1 do
       begin
         Layer := NN.Layers[TrLayerIdx[I]];
         KneeWeights[I] := 0;
@@ -89293,7 +89332,7 @@ begin
       // ---- one forward pass per probe sample -> loss (+ accuracy). ----
       AccLoss := 0;
       AccAcc := 0;
-      for SampleIdx := 0 to UsedSamples - 1 do
+      for SampleIdx := 0 to MPUsedSamplesM1 do
       begin
         NN.Compute(Samples[SampleIdx]);
         Output := NN.GetLastLayer.Output;
@@ -89349,10 +89388,10 @@ begin
     if HasLabels then
       MaxBarVal := 1.0
     else
-      for LvIdx := 0 to NumLevels - 1 do
+      for LvIdx := 0 to MPNumLevelsM1 do
         if LevelLoss[LvIdx] > MaxBarVal then MaxBarVal := LevelLoss[LvIdx];
     if MaxBarVal <= 0 then MaxBarVal := 1.0;
-    for LvIdx := 0 to NumLevels - 1 do
+    for LvIdx := 0 to MPNumLevelsM1 do
     begin
       if HasLabels then BarVal := LevelAcc[LvIdx]
       else BarVal := LevelLoss[LvIdx];
@@ -89367,7 +89406,7 @@ begin
     Lines.Add('Realised-vs-requested global sparsity (built-in threshold ' +
       'check, |delta| should be < 1 weight ~ ' +
       Format('%.4f%%):', [(1.0 / TotalWeights) * 100.0]));
-    for LvIdx := 0 to NumLevels - 1 do
+    for LvIdx := 0 to MPNumLevelsM1 do
       Lines.Add(Format('  req %5.1f%% -> realised %6.2f%% (delta %8.4f%%)',
         [Levels[LvIdx], LevelRealised[LvIdx] * 100.0,
          (LevelRealised[LvIdx] * 100.0) - Levels[LvIdx]]));
@@ -89375,7 +89414,7 @@ begin
 
     // ---- (b) prunability knee: deepest level within Tolerance of baseline. --
     KneeIdx := 0;
-    for LvIdx := 0 to NumLevels - 1 do
+    for LvIdx := 0 to MPNumLevelsM1 do
     begin
       if HasLabels then
       begin
@@ -89406,7 +89445,7 @@ begin
     // ---- (c) per-layer pruned fraction AT THE KNEE. ----
     // Re-apply the knee threshold once to read per-layer pruned counts.
     S := KneeSparsity / 100.0;
-    for I := 0 to TrainableLayers - 1 do
+    for I := 0 to MPTrainM1 do
     begin
       KneeZeroed[I] := 0;
       KneeWeights[I] := 0;
@@ -89414,7 +89453,7 @@ begin
     if not PerLayer then
     begin
       K := 0;
-      for I := 0 to TrainableLayers - 1 do
+      for I := 0 to MPTrainM1 do
       begin
         Layer := NN.Layers[TrLayerIdx[I]];
         LpBnd233 := Layer.Neurons.Count - 1;
@@ -89435,7 +89474,7 @@ begin
       else if CutIdx >= TotalWeights then Threshold := AllAbs[TotalWeights - 1]
       else Threshold := AllAbs[CutIdx - 1];
     end;
-    for I := 0 to TrainableLayers - 1 do
+    for I := 0 to MPTrainM1 do
     begin
       Layer := NN.Layers[TrLayerIdx[I]];
       if PerLayer then
@@ -89489,7 +89528,7 @@ begin
     Lines.Add(Format('  %-5s %-26s %-14s %10s %12s',
       ['idx', 'class', 'out(X,Y,D)', 'weights', 'pruned%']));
     Lines.Add('  ' + StringOfChar('-', 72));
-    for I := 0 to TrainableLayers - 1 do
+    for I := 0 to MPTrainM1 do
     begin
       Layer := NN.Layers[TrLayerIdx[I]];
       ShapeStr := Format('(%d,%d,%d)',
@@ -89525,7 +89564,8 @@ begin
   finally
     // Defensive exact restore (covers any early-exit after the snapshot).
     if RestoreNeeded and (Snapshot <> '') then NN.LoadDataFromString(Snapshot);
-    for I := 0 to High(Baseline) do
+    MPBaselineHigh := High(Baseline);
+    for I := 0 to MPBaselineHigh do
       if Baseline[I] <> nil then Baseline[I].Free;
     Lines.Free;
   end;
@@ -89567,6 +89607,7 @@ var
   LayerIdx, SampleIdx, PassIdx, ClassIdx, BinIdx, I, J: integer;
   Layer: TNNetLayer;
   StochasticLayers, UsedProbes, NumClasses: integer;
+  MCLastLayerIdx, MCUsedProbesM1, MCNumClassesM1, MCNumPassesM1: integer;
   HasLabels, IsProbHead, IsLogHead: boolean;
   HeadKind: string;
   SavedDropout: boolean;
@@ -89628,7 +89669,9 @@ begin
 
     // Detect stochastic (dropout / noise) layers.
     StochasticLayers := 0;
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    MCLastLayerIdx := NN.GetLastLayerIdx();
+    MCNumPassesM1 := NumPasses - 1;
+    for LayerIdx := 0 to MCLastLayerIdx do
       if NN.Layers[LayerIdx] is TNNetAddNoiseBase then Inc(StochasticLayers);
 
     UsedProbes := Probes.Count;
@@ -89641,10 +89684,12 @@ begin
         sLineBreak;
       Exit;
     end;
+    MCNumClassesM1 := NumClasses - 1;
 
     HasLabels := Length(Labels) > 0;
     if HasLabels and (Length(Labels) < UsedProbes) then
       UsedProbes := Length(Labels);
+    MCUsedProbesM1 := UsedProbes - 1;
 
     // Detect the output head so the per-pass probability vector is computed
     // correctly: a softmax-family head already emits probabilities (re-running
@@ -89682,7 +89727,7 @@ begin
 
     // Snapshot + force dropout active for the MC passes.
     SavedDropout := False;
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to MCLastLayerIdx do
       if (NN.Layers[LayerIdx] is TNNetAddNoiseBase) and
          (TNNetAddNoiseBase(NN.Layers[LayerIdx]).Enabled) then
         SavedDropout := True;
@@ -89702,9 +89747,9 @@ begin
     SetLength(MeanConf, UsedProbes);
     SetLength(PredClass, UsedProbes);
 
-    for SampleIdx := 0 to UsedProbes - 1 do
+    for SampleIdx := 0 to MCUsedProbesM1 do
     begin
-      for ClassIdx := 0 to NumClasses - 1 do
+      for ClassIdx := 0 to MCNumClassesM1 do
       begin
         MeanProb[ClassIdx] := 0;
         ArgCount[ClassIdx] := 0;
@@ -89714,7 +89759,7 @@ begin
       TopMean := 0;
       TopM2 := 0;
 
-      for PassIdx := 0 to NumPasses - 1 do
+      for PassIdx := 0 to MCNumPassesM1 do
       begin
         NN.Compute(Probes[SampleIdx]);
         Output := NN.GetLastLayer.Output;
@@ -89727,7 +89772,7 @@ begin
           // a probability is p^(1/T) renormalised (== softmax(logit/T) up to
           // an additive constant); T=1 is the identity.
           SumExp := 0;
-          for ClassIdx := 0 to NumClasses - 1 do
+          for ClassIdx := 0 to MCNumClassesM1 do
           begin
             Z := Output.Raw[ClassIdx];
             if Z < cEps then Z := cEps;
@@ -89736,7 +89781,7 @@ begin
             SumExp := SumExp + Z;
           end;
           if SumExp <= 0 then SumExp := cEps;
-          for ClassIdx := 0 to NumClasses - 1 do
+          for ClassIdx := 0 to MCNumClassesM1 do
             Prob[ClassIdx] := Prob[ClassIdx] / SumExp;
         end
         else if IsLogHead then
@@ -89745,45 +89790,45 @@ begin
           // as in the prob-head case (log p / T -> exp -> renormalise).
           SumExp := 0;
           MaxLogit := Output.Raw[0] / Temperature;
-          for ClassIdx := 1 to NumClasses - 1 do
+          for ClassIdx := 1 to MCNumClassesM1 do
           begin
             Z := Output.Raw[ClassIdx] / Temperature;
             if Z > MaxLogit then MaxLogit := Z;
           end;
-          for ClassIdx := 0 to NumClasses - 1 do
+          for ClassIdx := 0 to MCNumClassesM1 do
           begin
             Z := pcr_expf((Output.Raw[ClassIdx] / Temperature) - MaxLogit);
             Prob[ClassIdx] := Z;
             SumExp := SumExp + Z;
           end;
           if SumExp <= 0 then SumExp := cEps;
-          for ClassIdx := 0 to NumClasses - 1 do
+          for ClassIdx := 0 to MCNumClassesM1 do
             Prob[ClassIdx] := Prob[ClassIdx] / SumExp;
         end
         else
         begin
           // Raw logits: numerically-stable softmax(z / Temperature).
           MaxLogit := Output.Raw[0] / Temperature;
-          for ClassIdx := 1 to NumClasses - 1 do
+          for ClassIdx := 1 to MCNumClassesM1 do
           begin
             Z := Output.Raw[ClassIdx] / Temperature;
             if Z > MaxLogit then MaxLogit := Z;
           end;
           SumExp := 0;
-          for ClassIdx := 0 to NumClasses - 1 do
+          for ClassIdx := 0 to MCNumClassesM1 do
           begin
             Z := pcr_expf((Output.Raw[ClassIdx] / Temperature) - MaxLogit);
             Prob[ClassIdx] := Z;
             SumExp := SumExp + Z;
           end;
           if SumExp <= 0 then SumExp := cEps;
-          for ClassIdx := 0 to NumClasses - 1 do
+          for ClassIdx := 0 to MCNumClassesM1 do
             Prob[ClassIdx] := Prob[ClassIdx] / SumExp;
         end;
 
         // per-pass entropy H[p_t] (aleatoric contribution).
         PEnt := 0;
-        for ClassIdx := 0 to NumClasses - 1 do
+        for ClassIdx := 0 to MCNumClassesM1 do
           if Prob[ClassIdx] > cEps then
             PEnt := PEnt - Prob[ClassIdx] * pcr_logf(Prob[ClassIdx]);
         ExpEntAcc := ExpEntAcc + PEnt;
