@@ -60305,7 +60305,7 @@ begin
       gd[i] := FOutputError.FData[i * (2 * FDepth) + FDepth + c];
     end;
     // adjoint of final scaling
-    for i := 0 to FHalf - 1 do
+    for i := 0 to HalfM1 do
     begin
       gs[i] := gs[i] * FScaleS;
       gd[i] := gd[i] * FScaleD;
@@ -75414,7 +75414,7 @@ var
   PrevNumElements, PrevMissedElements: integer;
   PtrNeuronDelta, PtrPreparedInput: TNeuralFloatArrPtr;
   PrevPtrA, PrevPtrB: TNeuralFloatArrPtr;
-  NeuronWeights: integer;
+  NeuronWeights, NeuronWeightsM1: integer;
   LocalLearningErrorDerivPtr: pointer;
   localNumElements, MissedElements: integer;
   MaxPrevX, MaxPrevY: integer;
@@ -75582,10 +75582,11 @@ begin
   FOutputErrorDeriv.Mul(-FLearningRate);
   InterErrorDeriv.InterleaveWithDepthFrom(FOutputErrorDeriv, FOutputErrorDeriv.SizeX * FOutputErrorDeriv.SizeY);
   InterInput.InterleaveWithDepthFrom(FInputPrepared, FInputPrepared.SizeX * FInputPrepared.SizeY);
+  NeuronWeightsM1 := NeuronWeights - 1;
   for NeuronCnt := 0 to MaxD do
   begin
     LocalDelta := FArrNeurons[NeuronCnt].Delta;
-    for NeuronPosCnt := 0 to NeuronWeights - 1 do
+    for NeuronPosCnt := 0 to NeuronWeightsM1 do
     begin
       {$IFDEF FPC}
       LocalDelta.FData[NeuronPosCnt] +=
@@ -75625,7 +75626,7 @@ var
   LocalWeight, LocalPrevError: TNNetVolume;
   PrevNumElements, PrevMissedElements: integer;
   PtrNeuronDelta, PtrPreparedInput: TNeuralFloatArrPtr;
-  NeuronWeights: integer;
+  NeuronWeights, NeuronWeightsM1: integer;
   LocalLearningErrorDerivPtr: pointer;
   localNumElements, MissedElements: integer;
   MaxPrevX, MaxPrevY: integer;
@@ -75729,10 +75730,11 @@ begin
   FOutputErrorDeriv.Mul(-FLearningRate);
   InterErrorDeriv.InterleaveWithDepthFrom(FOutputErrorDeriv, FOutputErrorDeriv.SizeX * FOutputErrorDeriv.SizeY);
   InterInput.InterleaveWithDepthFrom(FInputPrepared, FInputPrepared.SizeX * FInputPrepared.SizeY);
+  NeuronWeightsM1 := NeuronWeights - 1;
   for NeuronCnt := 0 to MaxD do
   begin
     LocalDelta := FArrNeurons[NeuronCnt].Delta;
-    for NeuronPosCnt := 0 to NeuronWeights - 1 do
+    for NeuronPosCnt := 0 to NeuronWeightsM1 do
     begin
       {$IFDEF FPC}
       LocalDelta.FData[NeuronPosCnt] +=
