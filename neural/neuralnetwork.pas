@@ -25528,6 +25528,7 @@ end;
 procedure TNNetProductKeyMemory.InitDefault();
 var
   a, b, d, h, oldSeed, HeadsM1: integer;
+  HalfKeysM1, HalfQM1, NumKeysM1, ValueDimM1: integer;
 begin
   if FNeurons.Count < 3 * FHeads then
     AddMissingNeurons(3 * FHeads - FNeurons.Count);
@@ -25538,19 +25539,23 @@ begin
   // the v1 seed (161803) so single-head init is byte-for-byte unchanged.
   oldSeed := RandSeed;
   HeadsM1 := FHeads - 1;
+  HalfKeysM1 := FHalfKeys - 1;
+  HalfQM1 := FHalfQ - 1;
+  NumKeysM1 := FNumKeys - 1;
+  ValueDimM1 := FValueDim - 1;
   for h := 0 to HeadsM1 do
   begin
     RandSeed := 161803 + h * 101;
-    for a := 0 to FHalfKeys - 1 do
-      for d := 0 to FHalfQ - 1 do
+    for a := 0 to HalfKeysM1 do
+      for d := 0 to HalfQM1 do
         FNeurons[3 * h].FWeights[a, 0, d] :=
           FNeurons[3 * h].FWeights.RandomGaussianValue() * 0.1;
-    for b := 0 to FHalfKeys - 1 do
-      for d := 0 to FHalfQ - 1 do
+    for b := 0 to HalfKeysM1 do
+      for d := 0 to HalfQM1 do
         FNeurons[3 * h + 1].FWeights[b, 0, d] :=
           FNeurons[3 * h + 1].FWeights.RandomGaussianValue() * 0.1;
-    for a := 0 to FNumKeys - 1 do
-      for d := 0 to FValueDim - 1 do
+    for a := 0 to NumKeysM1 do
+      for d := 0 to ValueDimM1 do
         FNeurons[3 * h + 2].FWeights[a, 0, d] :=
           FNeurons[3 * h + 2].FWeights.RandomGaussianValue() * 0.1;
   end;
@@ -25616,6 +25621,7 @@ var
   StartTime: double;
   X, S: TNNetVolume;
   SeqLen, q, ni, d: integer;
+  SeqLenM1, KM1, DimM1: integer;
   Score, MaxScore, SumExp: TNeuralFloat;
   OutPtr: TNeuralFloatArrPtr;
 begin
@@ -25623,11 +25629,14 @@ begin
   X := FPrevLayer.FOutput;
   S := FNeurons[0].FWeights;
   SeqLen := X.SizeX;
+  SeqLenM1 := SeqLen - 1;
+  KM1 := FK - 1;
+  DimM1 := FDim - 1;
   // PMA = MAB(S, X): each seed q attends over the SeqLen inputs.
-  for q := 0 to FK - 1 do
+  for q := 0 to KM1 do
   begin
     MaxScore := -1e30;
-    for ni := 0 to SeqLen - 1 do
+    for ni := 0 to SeqLenM1 do
     begin
       Score := TNNetVolume.DotProduct(S.GetRawPtr(q, 0, 0), X.GetRawPtr(ni, 0, 0),
         FDim) * FInvSqrtDim;
@@ -25635,18 +25644,18 @@ begin
       if Score > MaxScore then MaxScore := Score;
     end;
     SumExp := 0;
-    for ni := 0 to SeqLen - 1 do
+    for ni := 0 to SeqLenM1 do
     begin
       Score := pcr_expf(FA[ni, q, 0] - MaxScore);
       FA[ni, q, 0] := Score;
       SumExp := SumExp + Score;
     end;
     if SumExp > 0 then
-      for ni := 0 to SeqLen - 1 do
+      for ni := 0 to SeqLenM1 do
         FA[ni, q, 0] := FA[ni, q, 0] / SumExp;
     OutPtr := FOutput.GetRawPtr(q, 0, 0);
-    for d := 0 to FDim - 1 do OutPtr^[d] := 0;
-    for ni := 0 to SeqLen - 1 do
+    for d := 0 to DimM1 do OutPtr^[d] := 0;
+    for ni := 0 to SeqLenM1 do
       TNNetVolume.MulAdd(OutPtr, X.GetRawPtr(ni, 0, 0), FA[ni, q, 0], FDim);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -25657,6 +25666,7 @@ var
   StartTime: double;
   X, S, Xerr: TNNetVolume;
   SeqLen, q, ni, k, d: integer;
+  SeqLenM1, KM1: integer;
   hasInputGrad: boolean;
   dA: array of TNeuralFloat;
   dScore: array of TNeuralFloat;
@@ -25677,11 +25687,13 @@ begin
   FGradS.Fill(0);
   SetLength(dA, SeqLen);
   SetLength(dScore, SeqLen);
-  for q := 0 to FK - 1 do
+  SeqLenM1 := SeqLen - 1;
+  KM1 := FK - 1;
+  for q := 0 to KM1 do
   begin
     // Y[q] = sum_ni a[q,ni] * X[ni].
     //   dX[ni] += a[q,ni] * dOut[q];  dA[ni] = dOut[q] . X[ni]
-    for ni := 0 to SeqLen - 1 do
+    for ni := 0 to SeqLenM1 do
     begin
       A := FA[ni, q, 0];
       if hasInputGrad then
@@ -25691,15 +25703,15 @@ begin
         X.GetRawPtr(ni, 0, 0), FDim);
     end;
     SumDAA := 0;
-    for k := 0 to SeqLen - 1 do SumDAA := SumDAA + dA[k] * FA[k, q, 0];
-    for ni := 0 to SeqLen - 1 do
+    for k := 0 to SeqLenM1 do SumDAA := SumDAA + dA[k] * FA[k, q, 0];
+    for ni := 0 to SeqLenM1 do
       dScore[ni] := FA[ni, q, 0] * (dA[ni] - SumDAA);
     // score[q,ni] = invSqrtDim * (S[q] . X[ni]):
     //   dS[q]  += invSqrtDim * dScore[ni] * X[ni]
     //   dX[ni] += invSqrtDim * dScore[ni] * S[q]
     Sq := S.GetRawPtr(q, 0, 0);
     GradSq := FGradS.GetRawPtr(q, 0, 0);
-    for ni := 0 to SeqLen - 1 do
+    for ni := 0 to SeqLenM1 do
     begin
       dS := dScore[ni] * FInvSqrtDim;
       if dS <> 0 then
@@ -25725,12 +25737,15 @@ end;
 procedure TNNetAttentionPooling.InitDefault();
 var
   q, d, oldSeed: integer;
+  KM1, DimM1: integer;
 begin
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   oldSeed := RandSeed;
   RandSeed := 161803;
-  for q := 0 to FK - 1 do
-    for d := 0 to FDim - 1 do
+  KM1 := FK - 1;
+  DimM1 := FDim - 1;
+  for q := 0 to KM1 do
+    for d := 0 to DimM1 do
       FNeurons[0].FWeights[q, 0, d] :=
         FNeurons[0].FWeights.RandomGaussianValue() * 0.1;
   RandSeed := oldSeed;
@@ -25784,17 +25799,20 @@ var
   StartTime: double;
   X, P: TNNetVolume;
   SeqLen, ni: integer;
+  SeqLenM1, NumVirtualM1: integer;
 begin
   StartTime := Now();
   X := FPrevLayer.FOutput;
   P := FNeurons[0].FWeights;
   SeqLen := X.SizeX;
+  SeqLenM1 := SeqLen - 1;
+  NumVirtualM1 := FNumVirtual - 1;
   // Rows 0..K-1: the learnable virtual tokens.
-  for ni := 0 to FNumVirtual - 1 do
+  for ni := 0 to NumVirtualM1 do
     Move(P.GetRawPtr(ni, 0, 0)^, FOutput.GetRawPtr(ni, 0, 0)^,
       FDim * SizeOf(TNeuralFloat));
   // Rows K..K+SeqLen-1: the real token embeddings, forwarded verbatim.
-  for ni := 0 to SeqLen - 1 do
+  for ni := 0 to SeqLenM1 do
     Move(X.GetRawPtr(ni, 0, 0)^, FOutput.GetRawPtr(FNumVirtual + ni, 0, 0)^,
       FDim * SizeOf(TNeuralFloat));
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -25805,6 +25823,7 @@ var
   StartTime: double;
   X, P, Xerr: TNNetVolume;
   SeqLen, ni: integer;
+  SeqLenM1, NumVirtualM1: integer;
   hasInputGrad: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -25818,14 +25837,16 @@ begin
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
   Xerr := nil;
   if hasInputGrad then Xerr := FPrevLayer.FOutputError;
+  SeqLenM1 := SeqLen - 1;
+  NumVirtualM1 := FNumVirtual - 1;
   // Virtual-token rows -> soft-prompt delta (-LearningRate scaled, like the
   // other learnable-bank layers).
-  for ni := 0 to FNumVirtual - 1 do
+  for ni := 0 to NumVirtualM1 do
     TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(ni, 0, 0),
       FOutputError.GetRawPtr(ni, 0, 0), -FLearningRate, FDim);
   // Real-token rows -> straight-through into the previous layer.
   if hasInputGrad then
-    for ni := 0 to SeqLen - 1 do
+    for ni := 0 to SeqLenM1 do
       TNNetVolume.Add(Xerr.GetRawPtr(ni, 0, 0),
         FOutputError.GetRawPtr(FNumVirtual + ni, 0, 0), FDim);
   if (not FBatchUpdate) then
@@ -25840,14 +25861,17 @@ end;
 procedure TNNetSoftPrompt.InitDefault();
 var
   q, d, oldSeed: integer;
+  NumVirtualM1, DimM1: integer;
 begin
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   // Small Gaussian init (Lester et al. init the soft prompt from a random
   // normal); a fixed seed keeps the eval forward deterministic across builds.
   oldSeed := RandSeed;
   RandSeed := 271828;
-  for q := 0 to FNumVirtual - 1 do
-    for d := 0 to FDim - 1 do
+  NumVirtualM1 := FNumVirtual - 1;
+  DimM1 := FDim - 1;
+  for q := 0 to NumVirtualM1 do
+    for d := 0 to DimM1 do
       FNeurons[0].FWeights[q, 0, d] :=
         FNeurons[0].FWeights.RandomGaussianValue() * 0.1;
   RandSeed := oldSeed;
@@ -25928,6 +25952,7 @@ procedure TNNetRetention.Compute();
 var
   StartTime: double;
   SeqLen, n, m, d: integer;
+  SeqLenM1, DkM1: integer;
   Decay, Dot, GammaVal: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr: TNeuralFloatArrPtr;
@@ -25935,12 +25960,14 @@ begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
+  SeqLenM1 := SeqLen - 1;
+  DkM1 := FDk - 1;
   GammaVal := EffectiveGamma();
   // For each query row n: masked scores then decay-weighted sum of V.
-  for n := 0 to SeqLen - 1 do
+  for n := 0 to SeqLenM1 do
   begin
     OutPtr := FOutput.GetRawPtr(n, 0, 0);
-    for d := 0 to FDk - 1 do
+    for d := 0 to DkM1 do
       OutPtr^[d] := 0;
     // Decay = gamma^(n-m). Build it incrementally from m=n downwards (Decay=1
     // at m=n, multiply by gamma each step back) to avoid a Power() per cell.
@@ -25959,7 +25986,7 @@ begin
       Decay := Decay * GammaVal;
     end;
     // Strict upper triangle (m > n) is hard-masked to 0.
-    for m := n + 1 to SeqLen - 1 do
+    for m := n + 1 to SeqLenM1 do
       FScore[m, n, 0] := 0;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -25969,6 +25996,7 @@ procedure TNNetRetention.Backpropagate();
 var
   StartTime: double;
   SeqLen, n, m, d: integer;
+  SeqLenM1: integer;
   Prev, PrevErr: TNNetVolume;
   Decay, dScoreNM, dS, GammaVal, gradGamma: TNeuralFloat;
   dScore: array of TNeuralFloat;
@@ -25985,8 +26013,9 @@ begin
     Prev := FPrevLayer.FOutput;
     PrevErr := FPrevLayer.FOutputError;
     SeqLen := Prev.SizeX;
+    SeqLenM1 := SeqLen - 1;
     SetLength(dScore, SeqLen);
-    for n := 0 to SeqLen - 1 do
+    for n := 0 to SeqLenM1 do
     begin
       // out[n,d] = sum_{m<=n} score[n,m] * V[m,d], score[n,m] = (Q[n].K[m])*D[n,m].
       // ---- dV[m] and dScore[m] (only m<=n contribute; D[n,m]=0 otherwise) ----
@@ -26117,6 +26146,7 @@ procedure TNNetCrossAttention.Compute();
 var
   StartTime: double;
   QLen, KVLen, i, j, d: integer;
+  QLenM1, KVLenM1, DkM1: integer;
   Score, MaxScore, SumExp: TNeuralFloat;
   Q, KV: TNNetVolume;
   OutPtr: TNeuralFloatArrPtr;
@@ -26126,13 +26156,16 @@ begin
   KV := FKVLayer.FOutput;
   QLen := Q.SizeX;
   KVLen := KV.SizeX;
+  QLenM1 := QLen - 1;
+  KVLenM1 := KVLen - 1;
+  DkM1 := FDk - 1;
   // K is packed at depth [0..d_k-1], V at depth [d_k..2*d_k-1]; both contiguous
   // along depth so each Q[i].K[j] is an AVX dot product and the V mix an AVX
   // MulAdd over FDk floats. For each query row i: scores, softmax, weighted V.
-  for i := 0 to QLen - 1 do
+  for i := 0 to QLenM1 do
   begin
     MaxScore := -1e30;
-    for j := 0 to KVLen - 1 do
+    for j := 0 to KVLenM1 do
     begin
       if FCausal and (j > i) then
       begin
@@ -26147,19 +26180,19 @@ begin
       if FAttn[j, i, 0] > MaxScore then MaxScore := FAttn[j, i, 0];
     end;
     SumExp := 0;
-    for j := 0 to KVLen - 1 do
+    for j := 0 to KVLenM1 do
     begin
       Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
       FAttn[j, i, 0] := Score;
       SumExp := SumExp + Score;
     end;
     if SumExp > 0 then
-      for j := 0 to KVLen - 1 do
+      for j := 0 to KVLenM1 do
         FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
     OutPtr := FOutput.GetRawPtr(i, 0, 0);
-    for d := 0 to FDk - 1 do
+    for d := 0 to DkM1 do
       OutPtr^[d] := 0;
-    for j := 0 to KVLen - 1 do
+    for j := 0 to KVLenM1 do
       TNNetVolume.MulAdd(OutPtr, KV.GetRawPtr(j, 0, FDk),
         FAttn[j, i, 0], FDk);
   end;
@@ -26170,6 +26203,7 @@ procedure TNNetCrossAttention.Backpropagate();
 var
   StartTime: double;
   QLen, KVLen, i, j, k: integer;
+  QLenM1, KVLenM1: integer;
   Q, KV, QErr, KVErr: TNNetVolume;
   dAttn: array of TNeuralFloat;
   dScore: array of TNeuralFloat;
@@ -26188,14 +26222,16 @@ begin
     KVErr := FKVLayer.FOutputError;
     QLen := Q.SizeX;
     KVLen := KV.SizeX;
+    QLenM1 := QLen - 1;
+    KVLenM1 := KVLen - 1;
     SetLength(dAttn, KVLen);
     SetLength(dScore, KVLen);
-    for i := 0 to QLen - 1 do
+    for i := 0 to QLenM1 do
     begin
       // ---- Gradients w.r.t V[j] and w.r.t attention weights ----
       // dV[j,d] += Attn[i,j] * dOut[i,d]   (V at depth FDk, AVX MulAdd)
       // dAttn[j] = sum_d dOut[i,d] * V[j,d] (AVX dot product over FDk)
-      for j := 0 to KVLen - 1 do
+      for j := 0 to KVLenM1 do
       begin
         A := FAttn[j, i, 0];
         TNNetVolume.MulAdd(KVErr.GetRawPtr(j, 0, FDk),
@@ -26205,14 +26241,14 @@ begin
       end;
       // ---- Softmax Jacobian: dScore[j] = Attn[j]*(dAttn[j] - sum_k dAttn[k]*Attn[k]) ----
       SumDAttnAttn := 0;
-      for k := 0 to KVLen - 1 do
+      for k := 0 to KVLenM1 do
         SumDAttnAttn := SumDAttnAttn + dAttn[k] * FAttn[k, i, 0];
-      for j := 0 to KVLen - 1 do
+      for j := 0 to KVLenM1 do
         dScore[j] := FAttn[j, i, 0] * (dAttn[j] - SumDAttnAttn);
       // ---- Gradients w.r.t Q[i] and K[j] ----
       // dQ[i,d] += invSqrtDk * dScore[j] * K[j,d]   (K at depth 0, AVX MulAdd)
       // dK[j,d] += invSqrtDk * dScore[j] * Q[i,d]
-      for j := 0 to KVLen - 1 do
+      for j := 0 to KVLenM1 do
       begin
         dS := dScore[j] * FInvSqrtDk;
         if dS <> 0 then
@@ -26276,6 +26312,7 @@ procedure TNNetAffineGridSample.Compute();
 var
   StartTime: double;
   W, H, D, ox, oy, dd: integer;
+  WM1, HM1, DM1: integer;
   x0, y0, x1, y1: integer;
   th: array[0..5] of TNeuralFloat;
   Theta, Src: TNNetVolume;
@@ -26287,11 +26324,12 @@ begin
   Src := FPrevLayer.FOutput;
   Theta := FThetaLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
+  WM1 := W - 1; HM1 := H - 1; DM1 := D - 1;
   for dd := 0 to 5 do th[dd] := Theta.FData[dd];
-  for oy := 0 to H - 1 do
+  for oy := 0 to HM1 do
   begin
     if H > 1 then yn := 2.0 * oy / (H - 1) - 1.0 else yn := 0.0;
-    for ox := 0 to W - 1 do
+    for ox := 0 to WM1 do
     begin
       if W > 1 then xn := 2.0 * ox / (W - 1) - 1.0 else xn := 0.0;
       // back-warp normalized coord, then map to source pixel space
@@ -26310,7 +26348,7 @@ begin
       inX1 := (x1 >= 0) and (x1 < W);
       inY0 := (y0 >= 0) and (y0 < H);
       inY1 := (y1 >= 0) and (y1 < H);
-      for dd := 0 to D - 1 do
+      for dd := 0 to DM1 do
       begin
         acc := 0;
         if inX0 and inY0 then acc := acc + w00 * Src.Get(x0, y0, dd);
@@ -26328,6 +26366,7 @@ procedure TNNetAffineGridSample.Backpropagate();
 var
   StartTime: double;
   W, H, D, ox, oy, dd: integer;
+  WM1, HM1, DM1: integer;
   x0, y0, x1, y1: integer;
   th: array[0..5] of TNeuralFloat;
   dth: array[0..5] of TNeuralFloat;
@@ -26349,6 +26388,7 @@ begin
   Theta := FThetaLayer.FOutput;
   ThetaErr := FThetaLayer.FOutputError;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
+  WM1 := W - 1; HM1 := H - 1; DM1 := D - 1;
   HasSrcErr := (SrcErr.Size = Src.Size);
   if W > 1 then halfWm1 := (W - 1) * 0.5 else halfWm1 := 0.0;
   if H > 1 then halfHm1 := (H - 1) * 0.5 else halfHm1 := 0.0;
@@ -26357,10 +26397,10 @@ begin
     th[dd] := Theta.FData[dd];
     dth[dd] := 0;
   end;
-  for oy := 0 to H - 1 do
+  for oy := 0 to HM1 do
   begin
     if H > 1 then yn := 2.0 * oy / (H - 1) - 1.0 else yn := 0.0;
-    for ox := 0 to W - 1 do
+    for ox := 0 to WM1 do
     begin
       if W > 1 then xn := 2.0 * ox / (W - 1) - 1.0 else xn := 0.0;
       xp := th[0] * xn + th[1] * yn + th[2];
@@ -26379,7 +26419,7 @@ begin
       inY0 := (y0 >= 0) and (y0 < H);
       inY1 := (y1 >= 0) and (y1 < H);
       dLdxp := 0; dLdyp := 0;
-      for dd := 0 to D - 1 do
+      for dd := 0 to DM1 do
       begin
         gOut := FOutputError.Get(ox, oy, dd);
         if gOut = 0 then continue;
@@ -26471,6 +26511,7 @@ procedure TNNetFlowWarp.Compute();
 var
   StartTime: double;
   W, H, D, ox, oy, dd: integer;
+  WM1, HM1, DM1: integer;
   x0, y0, x1, y1: integer;
   Flow, Src: TNNetVolume;
   sx, sy, fx, fy, w00, w01, w10, w11, acc: TNeuralFloat;
@@ -26479,8 +26520,9 @@ begin
   Src := FPrevLayer.FOutput;
   Flow := FFlowLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
-  for oy := 0 to H - 1 do
-  for ox := 0 to W - 1 do
+  WM1 := W - 1; HM1 := H - 1; DM1 := D - 1;
+  for oy := 0 to HM1 do
+  for ox := 0 to WM1 do
   begin
     // Backward warp: out(x,y) = in(x+dx, y+dy).
     sx := ox + Flow.Get(ox, oy, 0);
@@ -26497,7 +26539,7 @@ begin
     if x1 < 0 then x1 := 0 else if x1 > W - 1 then x1 := W - 1;
     if y0 < 0 then y0 := 0 else if y0 > H - 1 then y0 := H - 1;
     if y1 < 0 then y1 := 0 else if y1 > H - 1 then y1 := H - 1;
-    for dd := 0 to D - 1 do
+    for dd := 0 to DM1 do
     begin
       acc := w00 * Src.Get(x0, y0, dd)
            + w10 * Src.Get(x1, y0, dd)
@@ -26513,6 +26555,7 @@ procedure TNNetFlowWarp.Backpropagate();
 var
   StartTime: double;
   W, H, D, ox, oy, dd: integer;
+  WM1, HM1, DM1: integer;
   x0, y0, x1, y1: integer;
   Flow, FlowErr, Src, SrcErr: TNNetVolume;
   sx, sy, fx, fy, w00, w01, w10, w11: TNeuralFloat;
@@ -26529,10 +26572,11 @@ begin
   Flow := FFlowLayer.FOutput;
   FlowErr := FFlowLayer.FOutputError;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
+  WM1 := W - 1; HM1 := H - 1; DM1 := D - 1;
   HasSrcErr := (SrcErr.Size = Src.Size);
   HasFlowErr := (FlowErr.Size = Flow.Size);
-  for oy := 0 to H - 1 do
-  for ox := 0 to W - 1 do
+  for oy := 0 to HM1 do
+  for ox := 0 to WM1 do
   begin
     sx := ox + Flow.Get(ox, oy, 0);
     sy := oy + Flow.Get(ox, oy, 1);
@@ -26551,7 +26595,7 @@ begin
     if y0 < 0 then y0 := 0 else if y0 > H - 1 then y0 := H - 1;
     if y1 < 0 then y1 := 0 else if y1 > H - 1 then y1 := H - 1;
     dLdx := 0; dLdy := 0;
-    for dd := 0 to D - 1 do
+    for dd := 0 to DM1 do
     begin
       gOut := FOutputError.Get(ox, oy, dd);
       if gOut = 0 then continue;
@@ -26640,6 +26684,7 @@ procedure TNNetBackwardWarp.Compute();
 var
   StartTime: double;
   W, H, D, ox, oy, dd: integer;
+  WM1, HM1, DM1: integer;
   x0, y0, x1, y1: integer;
   Flow, Src: TNNetVolume;
   sx, sy, fx, fy, w00, w01, w10, w11, acc: TNeuralFloat;
@@ -26648,8 +26693,9 @@ begin
   Src := FPrevLayer.FOutput;
   Flow := FFlowLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
-  for oy := 0 to H - 1 do
-  for ox := 0 to W - 1 do
+  WM1 := W - 1; HM1 := H - 1; DM1 := D - 1;
+  for oy := 0 to HM1 do
+  for ox := 0 to WM1 do
   begin
     // Backward warp: out(x,y) = image(x+dx, y+dy).
     sx := ox + Flow.Get(ox, oy, 0);
@@ -26666,7 +26712,7 @@ begin
     if x1 < 0 then x1 := 0 else if x1 > W - 1 then x1 := W - 1;
     if y0 < 0 then y0 := 0 else if y0 > H - 1 then y0 := H - 1;
     if y1 < 0 then y1 := 0 else if y1 > H - 1 then y1 := H - 1;
-    for dd := 0 to D - 1 do
+    for dd := 0 to DM1 do
     begin
       acc := w00 * Src.Get(x0, y0, dd)
            + w10 * Src.Get(x1, y0, dd)
@@ -26682,6 +26728,7 @@ procedure TNNetBackwardWarp.Backpropagate();
 var
   StartTime: double;
   W, H, D, ox, oy, dd: integer;
+  WM1, HM1, DM1: integer;
   x0, y0, x1, y1: integer;
   Flow, FlowErr, Src, SrcErr: TNNetVolume;
   sx, sy, fx, fy, w00, w01, w10, w11: TNeuralFloat;
@@ -26698,10 +26745,11 @@ begin
   Flow := FFlowLayer.FOutput;
   FlowErr := FFlowLayer.FOutputError;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
+  WM1 := W - 1; HM1 := H - 1; DM1 := D - 1;
   HasSrcErr := (SrcErr.Size = Src.Size);
   HasFlowErr := (FlowErr.Size = Flow.Size);
-  for oy := 0 to H - 1 do
-  for ox := 0 to W - 1 do
+  for oy := 0 to HM1 do
+  for ox := 0 to WM1 do
   begin
     sx := ox + Flow.Get(ox, oy, 0);
     sy := oy + Flow.Get(ox, oy, 1);
@@ -26720,7 +26768,7 @@ begin
     if y0 < 0 then y0 := 0 else if y0 > H - 1 then y0 := H - 1;
     if y1 < 0 then y1 := 0 else if y1 > H - 1 then y1 := H - 1;
     dLdx := 0; dLdy := 0;
-    for dd := 0 to D - 1 do
+    for dd := 0 to DM1 do
     begin
       gOut := FOutputError.Get(ox, oy, dd);
       if gOut = 0 then continue;
@@ -26805,6 +26853,7 @@ procedure TNNetCorrelationVolume.Compute();
 var
   StartTime: double;
   W, H, C, ix, iy, jx, jy, dd, ch: integer;
+  WM1, HM1, CM1: integer;
   f1, f2: TNNetVolume;
   acc, invSqrtC: TNeuralFloat;
 begin
@@ -26812,14 +26861,15 @@ begin
   f1 := FPrevLayer.FOutput;
   f2 := FF2Layer.FOutput;
   W := f1.SizeX; H := f1.SizeY; C := f1.Depth;
+  WM1 := W - 1; HM1 := H - 1; CM1 := C - 1;
   if C > 0 then invSqrtC := 1.0 / Sqrt(C) else invSqrtC := 1.0;
-  for iy := 0 to H - 1 do
-  for ix := 0 to W - 1 do
-    for jy := 0 to H - 1 do
-    for jx := 0 to W - 1 do
+  for iy := 0 to HM1 do
+  for ix := 0 to WM1 do
+    for jy := 0 to HM1 do
+    for jx := 0 to WM1 do
     begin
       acc := 0;
-      for dd := 0 to C - 1 do
+      for dd := 0 to CM1 do
         acc := acc + f1.Get(ix, iy, dd) * f2.Get(jx, jy, dd);
       ch := jy * W + jx;
       FOutput.Store(ix, iy, ch, acc * invSqrtC);
@@ -26887,6 +26937,7 @@ var
   StartTime: double;
   Vol, Flow: TNNetVolume;
   ix, iy, dxoff, dyoff, k: integer;
+  FHM1, FWM1: integer;
   x0, y0, x1, y1: integer;
   gx, gy, nx, ny, sgx, sgy, fx, fy: TNeuralFloat;
   w00, w01, w10, w11, acc: TNeuralFloat;
@@ -26904,8 +26955,9 @@ begin
   StartTime := Now();
   Vol := FPrevLayer.FOutput;
   Flow := FFlowLayer.FOutput;
-  for iy := 0 to FH - 1 do
-  for ix := 0 to FW - 1 do
+  FHM1 := FH - 1; FWM1 := FW - 1;
+  for iy := 0 to FHM1 do
+  for ix := 0 to FWM1 do
   begin
     for dyoff := -FRadius to FRadius do
     for dxoff := -FRadius to FRadius do
@@ -27019,30 +27071,33 @@ procedure TNNetConvGRUCell.GateConv(NeuronBase: integer; Src: TNNetVolume;
 var
   W, KW, Bias: TNNetVolume;
   x, y, oc, ky, kx, sy, sx, tap, zi, ZC, ocBase: integer;
+  FHM1, FWM1, HiddenCM1, FeatureM1, ZCM1: integer;
   acc: TNeuralFloat;
   WR, SPtr: TNeuralFloatArrPtr;
 begin
   KW := FNeurons[NeuronBase].FWeights;
   Bias := FNeurons[NeuronBase + 3].FWeights;
   ZC := Src.Depth;
+  FHM1 := FH - 1; FWM1 := FW - 1; HiddenCM1 := FHiddenC - 1;
+  FeatureM1 := FFeature - 1; ZCM1 := ZC - 1;
   WR := KW.GetRawPtr(); // flat: neuron oc owns the contiguous (K*K*ZC) block at oc*K*K*ZC
-  for y := 0 to FH - 1 do
-  for x := 0 to FW - 1 do
-    for oc := 0 to FHiddenC - 1 do
+  for y := 0 to FHM1 do
+  for x := 0 to FWM1 do
+    for oc := 0 to HiddenCM1 do
     begin
       ocBase := oc * (FFeature * FFeature * ZC);
       acc := Bias.FData[oc];
-      for ky := 0 to FFeature - 1 do
+      for ky := 0 to FeatureM1 do
       begin
         sy := y + ky - FPad;
         if (sy < 0) or (sy >= FH) then continue;
-        for kx := 0 to FFeature - 1 do
+        for kx := 0 to FeatureM1 do
         begin
           sx := x + kx - FPad;
           if (sx < 0) or (sx >= FW) then continue;
           tap := ocBase + (ky * FFeature + kx) * ZC;
           SPtr := Src.GetRawPtr(sx, sy, 0); // GetRawPtr(x=col, y=row, d)
-          for zi := 0 to ZC - 1 do
+          for zi := 0 to ZCM1 do
             acc := acc + WR^[tap + zi] * SPtr^[zi];
         end;
       end;
@@ -27055,33 +27110,35 @@ var
   StartTime: double;
   Prev: TNNetVolume;
   x, y, oc: integer;
+  FHM1, FWM1, HiddenCM1, InCM1: integer;
   zv, qv, hv: TNeuralFloat;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
+  FHM1 := FH - 1; FWM1 := FW - 1; HiddenCM1 := FHiddenC - 1; InCM1 := FInC - 1;
   // z = sigmoid(Wz*[h;x]+bz); r = sigmoid(Wr*[h;x]+br) over the raw input.
   GateConv(0, Prev, FZg);
   GateConv(1, Prev, FRg);
-  for y := 0 to FH - 1 do
-  for x := 0 to FW - 1 do
-    for oc := 0 to FHiddenC - 1 do
+  for y := 0 to FHM1 do
+  for x := 0 to FWM1 do
+    for oc := 0 to HiddenCM1 do
     begin
       FZg.Store(x, y, oc, Sigmoid(FZg.Get(x, y, oc)));
       FRg.Store(x, y, oc, Sigmoid(FRg.Get(x, y, oc)));
     end;
   // Build [r*h ; x] then q = tanh(Wq*[r*h;x]+bq).
-  for y := 0 to FH - 1 do
-  for x := 0 to FW - 1 do
+  for y := 0 to FHM1 do
+  for x := 0 to FWM1 do
   begin
-    for oc := 0 to FHiddenC - 1 do
+    for oc := 0 to HiddenCM1 do
       FRH.Store(x, y, oc, FRg.Get(x, y, oc) * Prev.Get(x, y, oc));
-    for oc := 0 to FInC - 1 do
+    for oc := 0 to InCM1 do
       FRH.Store(x, y, FHiddenC + oc, Prev.Get(x, y, FHiddenC + oc));
   end;
   GateConv(2, FRH, FQ);
-  for y := 0 to FH - 1 do
-  for x := 0 to FW - 1 do
-    for oc := 0 to FHiddenC - 1 do
+  for y := 0 to FHM1 do
+  for x := 0 to FWM1 do
+    for oc := 0 to HiddenCM1 do
     begin
       zv := FZg.Get(x, y, oc);
       qv := TanH(FQ.Get(x, y, oc));
@@ -27102,11 +27159,14 @@ end;
 procedure TNNetConvGRUCell.InitDefault();
 var
   d, j, ZC: integer;
+  HiddenCM1, FeatBlockM1: integer;
 begin
   if FNeurons.Count < 6 then exit;
   ZC := FHiddenC + FInC;
-  for d := 0 to FHiddenC - 1 do
-    for j := 0 to FFeature * FFeature * ZC - 1 do
+  HiddenCM1 := FHiddenC - 1;
+  FeatBlockM1 := FFeature * FFeature * ZC - 1;
+  for d := 0 to HiddenCM1 do
+    for j := 0 to FeatBlockM1 do
     begin
       FNeurons[0].FWeights.FData[d * FFeature * FFeature * ZC + j] :=
         FNeurons[0].FWeights.RandomGaussianValue() * 0.05;
@@ -27231,15 +27291,18 @@ procedure TNNetLinearAttention.Compute();
 var
   StartTime: double;
   SeqLen, i, a: integer;
+  SeqLenM1, DkM1: integer;
   Prev: TNNetVolume;
   Q, K, PhiVal, Den: TNeuralFloat;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
+  SeqLenM1 := SeqLen - 1;
+  DkM1 := FDk - 1;
   // 1) Feature maps phi(Q), phi(K) with phi(x) = elu(x)+1.
-  for i := 0 to SeqLen - 1 do
-    for a := 0 to FDk - 1 do
+  for i := 0 to SeqLenM1 do
+    for a := 0 to DkM1 do
     begin
       Q := Prev[i, 0, a];
       if Q >= 0 then FPhiQ[i, 0, a] := Q + 1 else FPhiQ[i, 0, a] := pcr_expf(Q);
@@ -27252,8 +27315,8 @@ begin
   //    GetRawPtr(i,0,2*FDk)).
   FS.Fill(0);
   FZ.Fill(0);
-  for i := 0 to SeqLen - 1 do
-    for a := 0 to FDk - 1 do
+  for i := 0 to SeqLenM1 do
+    for a := 0 to DkM1 do
     begin
       PhiVal := FPhiK[i, 0, a];
       FZ.Add(a, 0, 0, PhiVal);
@@ -27265,7 +27328,7 @@ begin
   //    a-inner (strided over a in FS); reorder to a-outer, accumulating
   //    phi(Q_i,a) * S row a (contiguous over b) into the output row via MulAdd,
   //    then divide the whole row by Den (clamped exactly as before, first).
-  for i := 0 to SeqLen - 1 do
+  for i := 0 to SeqLenM1 do
   begin
     Den := TNNetVolume.DotProduct(
       FPhiQ.GetRawPtr(i, 0, 0), FZ.GetRawPtr(0, 0, 0), FDk);
@@ -27273,7 +27336,7 @@ begin
     if (Den < 0) and (Den > -1e-12) then Den := -1e-12;
     FDen[i, 0, 0] := Den;
     FillChar(FOutput.GetRawPtr(i, 0, 0)^, FDk * SizeOf(TNeuralFloat), 0);
-    for a := 0 to FDk - 1 do
+    for a := 0 to DkM1 do
       TNNetVolume.MulAdd(FOutput.GetRawPtr(i, 0, 0),
         FS.GetRawPtr(a, 0, 0), FPhiQ[i, 0, a], FDk);
     TNNetVolume.Mul(FOutput.GetRawPtr(i, 0, 0), 1 / Den, FDk);
@@ -27285,6 +27348,7 @@ procedure TNNetLinearAttention.Backpropagate();
 var
   StartTime: double;
   SeqLen, i, a, b: integer;
+  SeqLenM1, DkM1: integer;
   Prev, PrevErr: TNNetVolume;
   // dS[a,b] = sum_i dPhiQ-routed; we accumulate gradients into S and Z first,
   // then push them through the phi(K)/V outer-product accumulation.
@@ -27303,6 +27367,8 @@ begin
     Prev := FPrevLayer.FOutput;
     PrevErr := FPrevLayer.FOutputError;
     SeqLen := Prev.SizeX;
+    SeqLenM1 := SeqLen - 1;
+    DkM1 := FDk - 1;
     dS := TNNetVolume.Create(FDk, 1, FDk);
     dZ := TNNetVolume.Create(FDk, 1, 1);
     try
@@ -27320,13 +27386,13 @@ begin
       //   dPhiQ[a] = (dOut.S_row_a)/Den - T*Z[a]  with  T = (dOut.Out)/Den
       //   dS[a,*] += (PhiQa/Den) * dOut_row     (MulAdd)
       //   dZ[a]   += -T * PhiQa
-      for i := 0 to SeqLen - 1 do
+      for i := 0 to SeqLenM1 do
       begin
         Den := FDen[i, 0, 0];
         // T = sum_b dOut[i,b]*Out[i,b] / Den (contiguous over b).
         T := TNNetVolume.DotProduct(FOutputError.GetRawPtr(i, 0, 0),
           FOutput.GetRawPtr(i, 0, 0), FDk) / Den;
-        for a := 0 to FDk - 1 do
+        for a := 0 to DkM1 do
         begin
           PhiQa := FPhiQ[i, 0, a];
           // gradient into phi(Q_i,a): (dOut . S row a)/Den - T*Z[a]
@@ -27350,9 +27416,9 @@ begin
       // dphiK[s,a] is a dot product of dS row a with V_s (both contiguous over
       // b). dV[s,*] is strided over a in dS, so accumulate a-outer via MulAdd of
       // dS row a scaled by phiK[s,a] into the V error row.
-      for i := 0 to SeqLen - 1 do
+      for i := 0 to SeqLenM1 do
       begin
-        for a := 0 to FDk - 1 do
+        for a := 0 to DkM1 do
         begin
           dPhiKa := dZ[a, 0, 0] + TNNetVolume.DotProduct(
             dS.GetRawPtr(a, 0, 0), Prev.GetRawPtr(i, 0, 2 * FDk), FDk);
@@ -27448,6 +27514,7 @@ procedure TNNetPerformerAttention.InitDefault();
 var
   r, a, j, blockStart, blockEnd: integer;
   oldSeed: integer;
+  MM1, DkM1: integer;
   dot, nrm: TNeuralFloat;
   SavedExMask: TFPUExceptionMask;
 begin
@@ -27459,9 +27526,11 @@ begin
     exUnderflow, exPrecision]);
   oldSeed := RandSeed;
   if FSeed <> 0 then RandSeed := FSeed;
+  MM1 := FM - 1;
+  DkM1 := FDk - 1;
   // Fill rows with N(0,1).
-  for r := 0 to FM - 1 do
-    for a := 0 to FDk - 1 do
+  for r := 0 to MM1 do
+    for a := 0 to DkM1 do
       FWProj[a, 0, r] := FWProj.RandomGaussianValue();
   // Block-wise Gram-Schmidt orthogonalization (each block of up to FDk rows).
   r := 0;
@@ -27476,19 +27545,19 @@ begin
       for j := blockStart to r - 1 do
       begin
         dot := 0;
-        for a := 0 to FDk - 1 do dot := dot + FWProj[a, 0, r] * FWProj[a, 0, j];
-        for a := 0 to FDk - 1 do
+        for a := 0 to DkM1 do dot := dot + FWProj[a, 0, r] * FWProj[a, 0, j];
+        for a := 0 to DkM1 do
           FWProj[a, 0, r] := FWProj[a, 0, r] - dot * FWProj[a, 0, j];
       end;
       // Normalize to unit length, then rescale to expected Gaussian-row norm.
       nrm := 0;
-      for a := 0 to FDk - 1 do nrm := nrm + Sqr(FWProj[a, 0, r]);
+      for a := 0 to DkM1 do nrm := nrm + Sqr(FWProj[a, 0, r]);
       nrm := Sqrt(nrm);
       if nrm < 1e-12 then nrm := 1e-12;
       // Each orthonormal direction is scaled by a fresh chi-norm draw so the row
       // length matches a Gaussian row (preserves the unbiased softmax estimate).
       dot := 0;
-      for a := 0 to FDk - 1 do dot := dot + Sqr(FWProj.RandomGaussianValue());
+      for a := 0 to DkM1 do dot := dot + Sqr(FWProj.RandomGaussianValue());
       dot := Sqrt(dot);
       for a := 0 to FDk - 1 do
         FWProj[a, 0, r] := FWProj[a, 0, r] * (dot / nrm);
