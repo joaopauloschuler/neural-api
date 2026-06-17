@@ -96507,13 +96507,17 @@ function TNNetLayer.InitUniform(Value: TNeuralFloat): TNNetLayer;
 var
   Cnt: integer;
 begin
-  if (FNeurons.Count > 0) then
+  // Inference-only layers skip random weight init (overwritten by the loader).
+  if not (FInferenceOnly) then
   begin
-    for Cnt := 0 to FNeurons.Count-1 do
+    if (FNeurons.Count > 0) then
     begin
-      FNeurons[Cnt].InitUniform(Value);
+      for Cnt := 0 to FNeurons.Count-1 do
+      begin
+        FNeurons[Cnt].InitUniform(Value);
+      end;
+      AfterWeightUpdate();
     end;
-    AfterWeightUpdate();
   end;
   Result := Self;
 end;
@@ -96522,13 +96526,17 @@ function TNNetLayer.InitLeCunUniform(Value: TNeuralFloat): TNNetLayer;
 var
   Cnt: integer;
 begin
-  if (FNeurons.Count > 0) then
+  // Inference-only layers skip random weight init (overwritten by the loader).
+  if not (FInferenceOnly) then
   begin
-    for Cnt := 0 to FNeurons.Count-1 do
+    if (FNeurons.Count > 0) then
     begin
-      FNeurons[Cnt].InitLeCunUniform(Value);
+      for Cnt := 0 to FNeurons.Count-1 do
+      begin
+        FNeurons[Cnt].InitLeCunUniform(Value);
+      end;
+      AfterWeightUpdate();
     end;
-    AfterWeightUpdate();
   end;
   Result := Self;
 end;
@@ -96537,13 +96545,17 @@ function TNNetLayer.InitHeUniform(Value: TNeuralFloat): TNNetLayer;
 var
   Cnt: integer;
 begin
-  if (FNeurons.Count > 0) then
+  // Inference-only layers skip random weight init (overwritten by the loader).
+  if not (FInferenceOnly) then
   begin
-    for Cnt := 0 to FNeurons.Count-1 do
+    if (FNeurons.Count > 0) then
     begin
-      FNeurons[Cnt].InitHeUniform(Value);
+      for Cnt := 0 to FNeurons.Count-1 do
+      begin
+        FNeurons[Cnt].InitHeUniform(Value);
+      end;
+      AfterWeightUpdate();
     end;
-    AfterWeightUpdate();
   end;
   Result := Self;
 end;
@@ -96552,13 +96564,17 @@ function TNNetLayer.InitHeUniformDepthwise(Value: TNeuralFloat): TNNetLayer;
 var
   Cnt: integer;
 begin
-  if (FNeurons.Count > 0) then
+  // Inference-only layers skip random weight init (overwritten by the loader).
+  if not (FInferenceOnly) then
   begin
-    for Cnt := 0 to FNeurons.Count-1 do
+    if (FNeurons.Count > 0) then
     begin
-      FNeurons[Cnt].InitHeUniformDepthwise(Value);
+      for Cnt := 0 to FNeurons.Count-1 do
+      begin
+        FNeurons[Cnt].InitHeUniformDepthwise(Value);
+      end;
+      AfterWeightUpdate();
     end;
-    AfterWeightUpdate();
   end;
   Result := Self;
 end;
@@ -96567,13 +96583,17 @@ function TNNetLayer.InitHeGaussian(Value: TNeuralFloat): TNNetLayer;
 var
   Cnt: integer;
 begin
-  if (FNeurons.Count > 0) then
+  // Inference-only layers skip random weight init (overwritten by the loader).
+  if not (FInferenceOnly) then
   begin
-    for Cnt := 0 to FNeurons.Count-1 do
+    if (FNeurons.Count > 0) then
     begin
-      FNeurons[Cnt].InitHeGaussian(Value);
+      for Cnt := 0 to FNeurons.Count-1 do
+      begin
+        FNeurons[Cnt].InitHeGaussian(Value);
+      end;
+      AfterWeightUpdate();
     end;
-    AfterWeightUpdate();
   end;
   Result := Self;
 end;
@@ -96582,13 +96602,17 @@ function TNNetLayer.InitHeGaussianDepthwise(Value: TNeuralFloat): TNNetLayer;
 var
   Cnt: integer;
 begin
-  if (FNeurons.Count > 0) then
+  // Inference-only layers skip random weight init (overwritten by the loader).
+  if not (FInferenceOnly) then
   begin
-    for Cnt := 0 to FNeurons.Count-1 do
+    if (FNeurons.Count > 0) then
     begin
-      FNeurons[Cnt].InitHeGaussianDepthwise(Value);
+      for Cnt := 0 to FNeurons.Count-1 do
+      begin
+        FNeurons[Cnt].InitHeGaussianDepthwise(Value);
+      end;
+      AfterWeightUpdate();
     end;
-    AfterWeightUpdate();
   end;
   Result := Self;
 end;
@@ -96597,23 +96621,24 @@ function TNNetLayer.InitGlorotBengioUniform(Value: TNeuralFloat): TNNetLayer;
 var
   FanIn, FanOut, MulAux: TNeuralFloat;
 begin
-  Result := Self;
   // Inference-only: the weights are about to be overwritten by a checkpoint
   // loader, so skip the (wasted) per-weight random initialization. The weights
   // were already sized and the cache refreshed by SetNumWeightsForAllNeurons,
   // so a forward pass stays valid (zero weights) even before any load. This is
   // the default init path (InitDefault) for the dense/conv layers that dominate
   // an imported model. Coded by Claude (AI).
-  if FInferenceOnly then exit;
-  if (FNeurons.Count > 0) then
+  if not (FInferenceOnly) then
   begin
-    InitUniform(Value);
-    FanIn := FNeurons[0].Weights.Size;
-    if (Self is TNNetConvolutionAbstract)
-    then FanOut := FNeurons[0].Weights.SizeX * FNeurons[0].Weights.SizeY * FNeurons.Count
-    else FanOut := FNeurons.Count;
-    MulAux := Sqrt(6/(FanIn + FanOut));
-    MulWeights(MulAux);
+    if (FNeurons.Count > 0) then
+    begin
+      InitUniform(Value);
+      FanIn := FNeurons[0].Weights.Size;
+      if (Self is TNNetConvolutionAbstract)
+      then FanOut := FNeurons[0].Weights.SizeX * FNeurons[0].Weights.SizeY * FNeurons.Count
+      else FanOut := FNeurons.Count;
+      MulAux := Sqrt(6/(FanIn + FanOut));
+      MulWeights(MulAux);
+    end;
   end;
   Result := Self;
 end;
@@ -96622,13 +96647,17 @@ function TNNetLayer.InitSELU(Value: TNeuralFloat): TNNetLayer;
 var
   Cnt: integer;
 begin
-  if (FNeurons.Count > 0) then
+  // Inference-only layers skip random weight init (overwritten by the loader).
+  if not (FInferenceOnly) then
   begin
-    for Cnt := 0 to FNeurons.Count-1 do
+    if (FNeurons.Count > 0) then
     begin
-      FNeurons[Cnt].InitSELU(Value);
+      for Cnt := 0 to FNeurons.Count-1 do
+      begin
+        FNeurons[Cnt].InitSELU(Value);
+      end;
+      AfterWeightUpdate();
     end;
-    AfterWeightUpdate();
   end;
   Result := Self;
 end;
@@ -96643,13 +96672,17 @@ begin
   FBeta1Decay := 1;
   FBeta2Decay := 1;
 
-  if (FNeurons.Count > 0) then
+  // Inference-only layers skip Adam optimizer-state allocation (training only).
+  if not (FInferenceOnly) then
   begin
-    for Cnt := 0 to FNeurons.Count-1 do
+    if (FNeurons.Count > 0) then
     begin
-      FNeurons[Cnt].InitAdam(Self);
+      for Cnt := 0 to FNeurons.Count-1 do
+      begin
+        FNeurons[Cnt].InitAdam(Self);
+      end;
+      AfterWeightUpdate();
     end;
-    AfterWeightUpdate();
   end;
   Result := Self;
 end;
@@ -97666,6 +97699,9 @@ var
   CntX, CntY, CntD: integer;
   MaxX, MaxY, MaxD: integer;
 begin
+  Result := Self;
+  // Inference-only layers skip pattern weight init (overwritten by the loader).
+  if (FInferenceOnly) then exit;
   MaxNeurons := FNeurons.Count - 1;
   if MaxNeurons >= 16 then
   begin
