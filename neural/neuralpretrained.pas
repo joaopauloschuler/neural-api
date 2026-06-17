@@ -10039,9 +10039,9 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real BPE token ("!"), not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.NEmbd, {EncodeZero=}1) );
+        Config.VocabSize, Config.NEmbd, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       PosLayer := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.NCtx) );
+        TNNetLearnedPositionalEmbedding.Create(Config.NCtx).MakeInferenceOnly(pInferenceOnly) );
       // pInferenceOnly: shrink training volumes as soon as each chunk of
       // layers exists - peak memory then carries the training volumes of at
       // most one block (plus the LM head's, briefly) instead of the whole
@@ -10059,9 +10059,9 @@ begin
       begin
         // Attention sub-block: x := x + c_proj(MHA(c_attn(ln_1(x)))).
         BranchInput := NN.GetLastLayer();
-        Blocks[BlockCnt].LN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-5) );
+        Blocks[BlockCnt].LN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-5).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].CAttn := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.NEmbd) );
+          TNNetPointwiseConvLinear.Create(3 * Config.NEmbd).MakeInferenceOnly(pInferenceOnly) );
         // Splits the fused Q|K|V slab per head, runs one causal SDPA per
         // head, concats heads and out-projects with PointwiseConvLinear(d)
         // - the returned layer IS the out-projection and receives c_proj.
@@ -10073,9 +10073,9 @@ begin
         // composed from existing layers like the BERT/GPT-NeoX paths
         // (Cerebras-GPT's activation_function "gelu").
         BranchInput := NN.GetLastLayer();
-        Blocks[BlockCnt].LN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-5) );
+        Blocks[BlockCnt].LN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-5).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].CFc := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(4 * Config.NEmbd) );
+          TNNetPointwiseConvLinear.Create(4 * Config.NEmbd).MakeInferenceOnly(pInferenceOnly) );
         if pExactGelu then
         begin
           GELUSource := NN.GetLastLayer();
@@ -10090,12 +10090,12 @@ begin
         else
           NN.AddLayer( TNNetGELU.Create() ); // tanh approximation = gelu_new
         Blocks[BlockCnt].MlpProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.NEmbd) );
+          TNNetPointwiseConvLinear.Create(Config.NEmbd).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
-      FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-5) );
+      FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-5).MakeInferenceOnly(pInferenceOnly) );
       NumLabels := 0;
       if pSeqClsHead then
       begin
@@ -10114,14 +10114,14 @@ begin
             Reader.ShapeAsString('score.weight'));
         NumLabels := Reader.DimSize('score.weight', 0);
         LMHead := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(NumLabels) );
+          TNNetPointwiseConvLinear.Create(NumLabels).MakeInferenceOnly(pInferenceOnly) );
       end
       else
         // LM head tied to wte: logits = h . wte^T. Implemented as an untied
         // PointwiseConvLinear(vocab) whose weights are a COPY of wte (see
         // the unit header). Bias-free in GPT-2: biases stay 0.
         LMHead := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+          TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
@@ -12013,7 +12013,8 @@ begin
 end;
 
 procedure BuildMixtralMoEBranch(NN: TNNet; var Block: TLlamaBlockLayers;
-  MoESource: TNNetLayer; const Config: TLlamaConfig);
+  MoESource: TNNetLayer; const Config: TLlamaConfig;
+  pInferenceOnly: boolean = false);
 var
   GateTopK, ExpertOut, GateE, GateEBroadcast, RoutedOut: TNNetLayer;
   MoEBranches: array of TNNetLayer;
@@ -12031,7 +12032,7 @@ begin
   // hard top-k gate with the top-k subset renormalized iff Config.MoENormTopK
   // (Mixtral always renormalizes; Qwen3-MoE follows norm_topk_prob).
   Block.GateConv := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(Config.NumLocalExperts), MoESource);
+    TNNetPointwiseConvLinear.Create(Config.NumLocalExperts).MakeInferenceOnly(pInferenceOnly), MoESource);
   // Config.MoESigmoidGate (Llama-4): HF keeps the top-k LOGITS, scatters them
   // into a -inf tensor and applies SIGMOID (the non-survivors -> sigmoid(-inf)
   // = 0). Sigmoid is monotonic so top-k SELECTION on sigmoid(logit) equals
@@ -12070,10 +12071,11 @@ begin
     else
       ExpertOut := MoESource;
     Block.ExpertGateUp[ExpertCnt] := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(2 * ExpertWidth), ExpertOut);
+      TNNetPointwiseConvLinear.Create(2 * ExpertWidth).MakeInferenceOnly(pInferenceOnly),
+      ExpertOut);
     NN.AddLayer( TNNetSwiGLU.Create() );
     Block.ExpertDown[ExpertCnt] := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+      TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
     ExpertOut := NN.GetLastLayer();
     if Config.MoEScaleInput then
       MoEBranches[ExpertCnt] := ExpertOut
@@ -12099,11 +12101,11 @@ begin
   if Config.SharedIntermediateSize > 0 then
   begin
     Block.SharedGateUp := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(2 * Config.SharedIntermediateSize),
+      TNNetPointwiseConvLinear.Create(2 * Config.SharedIntermediateSize).MakeInferenceOnly(pInferenceOnly),
       MoESource);
     NN.AddLayer( TNNetSwiGLU.Create() );
     Block.SharedDown := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+      TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetSum.Create([RoutedOut, NN.GetLastLayer()]) );
   end;
 end;
@@ -12468,7 +12470,8 @@ begin
       // EncodeZero=1: token id 0 is a real token (<unk> in the Llama vocab),
       // not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1
+        ).MakeInferenceOnly(pInferenceOnly) );
       // pQuantizeInt8: idempotent block-by-block sweeps (same pattern as
       // MakeInferenceOnly) keep peak RAM at quantized-net + one FP32 block
       // during BOTH construction and the weight-load phase below (the
@@ -12549,15 +12552,18 @@ begin
         else
         begin
           Blocks[BlockCnt].AttnNorm :=
-            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly) );
           NormedSource := NN.GetLastLayer();
         end;
         Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(QWidth), NormedSource);
+          TNNetPointwiseConvLinear.Create(QWidth).MakeInferenceOnly(pInferenceOnly),
+          NormedSource);
         Blocks[BlockCnt].KProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+          TNNetPointwiseConvLinear.Create(KVWidth).MakeInferenceOnly(pInferenceOnly),
+          NormedSource);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+          TNNetPointwiseConvLinear.Create(KVWidth).MakeInferenceOnly(pInferenceOnly),
+          NormedSource);
         // Config.QKNormFullWidth (OLMo-2): ONE RMSNorm over the FULL
         // flattened q/k projection width (num_heads*head_dim /
         // num_kv_heads*head_dim) AFTER the projection and BEFORE the head
@@ -12570,11 +12576,11 @@ begin
         if Config.QKNormFullWidth then
         begin
           Blocks[BlockCnt].QNormFull := NN.AddLayerAfter(
-            TNNetTokenRMSNorm.Create(Config.RmsNormEps),
+            TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly),
             Blocks[BlockCnt].QProj);
           QSource := Blocks[BlockCnt].QNormFull;
           Blocks[BlockCnt].KNormFull := NN.AddLayerAfter(
-            TNNetTokenRMSNorm.Create(Config.RmsNormEps),
+            TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly),
             Blocks[BlockCnt].KProj);
           KSource := Blocks[BlockCnt].KNormFull;
         end;
@@ -12624,7 +12630,7 @@ begin
             if Config.QKNorm then
             begin
               Blocks[BlockCnt].KNorms[KVHeadCnt] := NN.AddLayerAfter(
-                TNNetTokenRMSNorm.Create(Config.RmsNormEps), KSlice);
+                TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly), KSlice);
               KSlice := Blocks[BlockCnt].KNorms[KVHeadCnt];
             end;
             // Llama-4 iRoPE: RoPE only on the RoPE layers (NoPE layers carry no
@@ -12639,7 +12645,7 @@ begin
             // A gain=1 TNNetTokenRMSNorm = x*rsqrt(mean(x^2)+eps).
             if Config.Llama4QKL2Norm and LayerUseRoPE then
               KSlice := NN.AddLayerAfter(
-                TNNetTokenRMSNorm.Create(Config.RmsNormEps), KSlice);
+                TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly), KSlice);
             KRotated[KVHeadCnt] := KSlice;
           end;
           VSlices[KVHeadCnt] := NN.AddLayerAfter(
@@ -12673,7 +12679,7 @@ begin
             if Config.QKNorm then
             begin
               Blocks[BlockCnt].QNorms[HeadCnt] := NN.AddLayerAfter(
-                TNNetTokenRMSNorm.Create(Config.RmsNormEps), QSlice);
+                TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly), QSlice);
               QSlice := Blocks[BlockCnt].QNorms[HeadCnt];
             end;
             // Llama-4 iRoPE: RoPE only on the RoPE layers (see the K path).
@@ -12682,7 +12688,7 @@ begin
                 CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling), QSlice);
             if Config.Llama4QKL2Norm and LayerUseRoPE then
               QSlice := NN.AddLayerAfter(
-                TNNetTokenRMSNorm.Create(Config.RmsNormEps), QSlice);
+                TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly), QSlice);
             // Config.AttnTempTuning (attn_temperature_tuning): on the NoPE
             // layers scale the query by the per-position log factor BEFORE SDPA
             // (HF Llama4TextAttention: applied iff attn_temperature_tuning and
@@ -12716,9 +12722,9 @@ begin
         // below (which normalize the WHOLE sublayer output AFTER o_proj).
         if Config.BitNetSubLN then
           Blocks[BlockCnt].AttnSubNorm :=
-            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].OProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         // Config.SandwichNorm (Gemma-2) / Config.PostNormReordered (OLMo-2):
         // post-attention RMSNorm INSIDE the residual branch (HF
         // post_attention_layernorm normalizes the attention output BEFORE
@@ -12726,7 +12732,7 @@ begin
         // the block's ONLY attention norm: x + Norm(Attn(x)).
         if Config.SandwichNorm or Config.PostNormReordered then
           Blocks[BlockCnt].PostAttnNorm :=
-            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         // MLP sub-block: x := x + down(act(gate(h)) * up(h)), h = RMSNorm(x),
         // where act is SiLU (SwiGLU, the Llama default) or tanh-GELU (GeGLU,
@@ -12741,12 +12747,12 @@ begin
         // the branch: x := x + Norm(MLP(x)).
         if not Config.PostNormReordered then
           Blocks[BlockCnt].MlpNorm :=
-            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly) );
         // Per-layer dense/MoE choice (Qwen3-MoE mixed stack; uniform stacks
         // and non-MoE families fall through unchanged - see LlamaLayerIsMoE).
         if LlamaLayerIsMoE(Config, BlockCnt) then
           BuildMixtralMoEBranch(NN, Blocks[BlockCnt], NN.GetLastLayer(),
-            Config)
+            Config, pInferenceOnly)
         else
         begin
           // Llama-4 dense layers use intermediate_size_mlp (wider than an MoE
@@ -12755,7 +12761,7 @@ begin
           if Config.IntermediateSizeMLP > 0 then j := Config.IntermediateSizeMLP
           else j := Config.IntermediateSize;
           Blocks[BlockCnt].GateUp := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(2 * j) );
+            TNNetPointwiseConvLinear.Create(2 * j).MakeInferenceOnly(pInferenceOnly) );
           if Config.ReGLUSquaredFFN then
             // BitNet b1.58 relu2 FFN: down(ffn_sub_norm(relu2(gate)*up)). The
             // fused projection packs up in neurons 0..I-1 and gate in I..2I-1
@@ -12771,24 +12777,24 @@ begin
           // down_proj(ffn_sub_norm(act_fn(gate(x)) * up(x)))).
           if Config.BitNetSubLN then
             Blocks[BlockCnt].FfnSubNorm :=
-              NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+              NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly) );
           Blocks[BlockCnt].Down := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         end;
         // Config.SandwichNorm (Gemma-2) / Config.PostNormReordered (OLMo-2):
         // post-feedforward RMSNorm INSIDE the residual branch (HF
         // post_feedforward_layernorm).
         if Config.SandwichNorm or Config.PostNormReordered then
           Blocks[BlockCnt].PostMlpNorm :=
-            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
-        TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+        TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       // Config.FinalLogitSoftCap (Gemma-2): the LM-head logits are squashed
       // to cap*tanh(logits/cap) - a plain TNNetSoftCapping after the head
       // (HF applies it to the logits before any sampling softmax).
@@ -15776,9 +15782,9 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real BPE token, not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       PosLayer := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions) );
+        TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
@@ -15792,9 +15798,9 @@ begin
         else Window := 0;
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].LN1 := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].QKV := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].AttnProj := NN.AddMultiHeadSelfAttention(
           Config.NumHeads, {CausalMask=}true, {UseRoPE=}false,
           {Variant=}avSDPA, {NumSinks=}1, Window);
@@ -15802,20 +15808,20 @@ begin
         // MLP sub-block: x := x + c_proj(gelu_new(c_fc(ln_2(x)))).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].LN2 := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].CFc := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetGELU.Create() ); // tanh approximation = gelu_new
         Blocks[BlockCnt].MlpProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
@@ -16268,7 +16274,7 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real BPE token, not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
@@ -16281,9 +16287,9 @@ begin
         // Attention branch: dense(MHA-with-partial-RoPE(LN_1(x))).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].LN1 := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         QKVLayer := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].QKV := QKVLayer;
         for HeadCnt := 0 to Config.NumHeads - 1 do
         begin
@@ -16345,14 +16351,14 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].AttnDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         AttnOut := NN.GetLastLayer();
         if Config.UseParallelResidual then
           // PARALLEL residual: the MLP branch reads the BLOCK INPUT through
           // its own LayerNorm; one fused 3-input sum closes the block:
           //   x := x + Attn(LN_1(x)) + MLP(LN_2(x))
           Blocks[BlockCnt].LN2 := NN.AddLayerAfter(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps), BranchInput)
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), BranchInput)
         else
         begin
           // SEQUENTIAL (use_parallel_residual=false): close the attention
@@ -16360,13 +16366,13 @@ begin
           AttnOut := NN.AddLayer(
             TNNetSum.Create([AttnOut, BranchInput]) );
           Blocks[BlockCnt].LN2 := NN.AddLayer(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         end;
         Blocks[BlockCnt].HTo4H := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
         AddExactOrTanhGELU;
         Blocks[BlockCnt].FourHToH := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         MlpOut := NN.GetLastLayer();
         if Config.UseParallelResidual then
           NN.AddLayer( TNNetSum.Create([BranchInput, AttnOut, MlpOut]) )
@@ -16376,9 +16382,9 @@ begin
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
@@ -16773,16 +16779,16 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real token, not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.WordEmbedProjDim, {EncodeZero=}1) );
+        Config.VocabSize, Config.WordEmbedProjDim, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       ProjIn := nil;
       if HasProj then
         // project_in: bias-free [hidden, word_embed_proj_dim] nn.Linear.
         ProjIn := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
       // Learned positions with the +2 offset are added AFTER project_in
       // (HF: hidden_states = project_in(inputs_embeds) + pos_embeds).
       PosLayer := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(SeqLen) );
+        TNNetLearnedPositionalEmbedding.Create(SeqLen).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
@@ -16793,9 +16799,9 @@ begin
         BranchInput := NN.GetLastLayer();
         if Config.DoLayerNormBefore then
           Blocks[BlockCnt].N1 := NN.AddLayer(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].QKV := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         // Per-head causal SDPA (standard 1/sqrt(head_dim) scale); the
         // returned layer IS the out-projection and receives out_proj.
         Blocks[BlockCnt].AttnProj := NN.AddMultiHeadSelfAttention(
@@ -16803,37 +16809,37 @@ begin
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if not Config.DoLayerNormBefore then
           Blocks[BlockCnt].N1 := NN.AddLayer(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         // FFN sub-block. PRE-LN: x := x + fc2(ReLU(fc1(N2(x)))).
         // POST-LN: x := N2(x + fc2(ReLU(fc1(x)))).
         BranchInput := NN.GetLastLayer();
         if Config.DoLayerNormBefore then
           Blocks[BlockCnt].N2 := NN.AddLayer(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].Fc1 := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetReLU.Create() );
         Blocks[BlockCnt].Fc2 := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if not Config.DoLayerNormBefore then
           Blocks[BlockCnt].N2 := NN.AddLayer(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         if pInferenceOnly then NN.MakeInferenceOnly();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := nil;
       if Config.HasFinalLayerNorm then
         FinalLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       ProjOut := nil;
       if HasProj then
         // project_out: bias-free [word_embed_proj_dim, hidden] nn.Linear.
         ProjOut := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.WordEmbedProjDim) );
+          TNNetPointwiseConvLinear.Create(Config.WordEmbedProjDim).MakeInferenceOnly(pInferenceOnly) );
       // LM head tied to embed_tokens (word_embed_proj_dim wide), bias-free.
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
@@ -17232,7 +17238,7 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
@@ -17248,14 +17254,14 @@ begin
         // HF), but with a BIASED LayerNorm pre-norm and biased projections.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].AttnNorm := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         NormedSource := NN.GetLastLayer();
         Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(QWidth), NormedSource);
+          TNNetPointwiseConvLinear.Create(QWidth).MakeInferenceOnly(pInferenceOnly), NormedSource);
         Blocks[BlockCnt].KProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+          TNNetPointwiseConvLinear.Create(KVWidth).MakeInferenceOnly(pInferenceOnly), NormedSource);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+          TNNetPointwiseConvLinear.Create(KVWidth).MakeInferenceOnly(pInferenceOnly), NormedSource);
         // K is rotated ONCE per KV head; V is never rotated.
         for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
         begin
@@ -17288,26 +17294,26 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].OProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         // MLP sub-block: x := x + c_proj(gelu_tanh(c_fc(LayerNorm(x)))) -
         // a plain two-matrix FFN, NO SwiGLU gate.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].MlpNorm := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].CFc := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetGELU.Create() ); // gelu_pytorch_tanh
         Blocks[BlockCnt].CProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
@@ -17643,10 +17649,10 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       // Learned absolute positions (wpe), GPT-2 style: x := wte[token] + wpe[pos].
       PosLayer := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions) );
+        TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
@@ -17658,15 +17664,15 @@ begin
         // No RoPE; the lone K/V head is shared across every query head.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].LN1 := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         NormedSource := NN.GetLastLayer();
         // Three nn.Linear sub-blocks sliced from the fused c_attn slab below.
         Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(QWidth), NormedSource);
+          TNNetPointwiseConvLinear.Create(QWidth).MakeInferenceOnly(pInferenceOnly), NormedSource);
         Blocks[BlockCnt].KProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(HeadDim), NormedSource);
+          TNNetPointwiseConvLinear.Create(HeadDim).MakeInferenceOnly(pInferenceOnly), NormedSource);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(HeadDim), NormedSource);
+          TNNetPointwiseConvLinear.Create(HeadDim).MakeInferenceOnly(pInferenceOnly), NormedSource);
         // The single shared K and V slices (the WHOLE projection is one head).
         KSlice := Blocks[BlockCnt].KProj;
         VSlice := Blocks[BlockCnt].VProj;
@@ -17683,25 +17689,25 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].OProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         // MLP sub-block: x := x + c_proj(gelu_tanh(c_fc(LayerNorm(x)))).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].LN2 := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].CFc := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetGELU.Create() ); // gelu_pytorch_tanh
         Blocks[BlockCnt].CProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
@@ -18050,7 +18056,7 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real BPE token, not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
@@ -18065,16 +18071,16 @@ begin
         // block:  x := x + Attn(LN(x)) + MLP(LN(x))
         BranchInput := NN.GetLastLayer();
         SharedLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].LN1 := SharedLN;
         // SEPARATE bias-free q/k/v projections (plain nn.Linear), all
         // reading the shared LN output.
         Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize), SharedLN);
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly), SharedLN);
         Blocks[BlockCnt].KProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize), SharedLN);
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly), SharedLN);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize), SharedLN);
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly), SharedLN);
         for HeadCnt := 0 to Config.NumHeads - 1 do
         begin
           // PARTIAL ROTARY per head: RoPE on the first rotary_dim channels
@@ -18134,25 +18140,25 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].OutProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         AttnOut := NN.GetLastLayer();
         // MLP branch: reads the SAME shared LN output (NOT a second norm,
         // NOT the attention output - GPT-J is always parallel).
         Blocks[BlockCnt].FcIn := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize),
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly),
           SharedLN);
         AddExactOrTanhGELU;
         Blocks[BlockCnt].FcOut := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         MlpOut := NN.GetLastLayer();
         NN.AddLayer( TNNetSum.Create([BranchInput, AttnOut, MlpOut]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
@@ -18578,7 +18584,7 @@ var
     if Config.UseQKNorm then
     begin
       s := NN.AddLayerAfter(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps), s);
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), s);
       if IsQuery then Blocks[BlockCnt].QNorms[HeadIdx] := s
       else Blocks[BlockCnt].KNorms[HeadIdx] := s;
     end;
@@ -18652,7 +18658,7 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
@@ -18683,15 +18689,15 @@ begin
         // branches; one fused 3-input sum closes the block.
         BranchInput := NN.GetLastLayer();
         SharedLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].LN1 := SharedLN;
         // bias-free q/k/v projections (GQA: kv width may be narrower).
         Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(QWidth), SharedLN);
+          TNNetPointwiseConvLinear.Create(QWidth).MakeInferenceOnly(pInferenceOnly), SharedLN);
         Blocks[BlockCnt].KProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth), SharedLN);
+          TNNetPointwiseConvLinear.Create(KVWidth).MakeInferenceOnly(pInferenceOnly), SharedLN);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth), SharedLN);
+          TNNetPointwiseConvLinear.Create(KVWidth).MakeInferenceOnly(pInferenceOnly), SharedLN);
         if Config.UseQKNorm then
         begin
           SetLength(Blocks[BlockCnt].QNorms, Config.NumHeads);
@@ -18726,24 +18732,24 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].OProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         AttnOut := NN.GetLastLayer();
         // MLP branch reads the SAME shared LN (parallel residual).
         Blocks[BlockCnt].GateUp := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize),
+          TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly),
           SharedLN);
         NN.AddLayer( TNNetSwiGLU.Create() );
         Blocks[BlockCnt].Down := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         MlpOut := NN.GetLastLayer();
         NN.AddLayer( TNNetSum.Create([BranchInput, AttnOut, MlpOut]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
@@ -19184,7 +19190,7 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real BPE token, not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
@@ -19199,16 +19205,16 @@ begin
         // sum closes the block:  x := x + Attn(LN(x)) + MLP(LN(x))
         BranchInput := NN.GetLastLayer();
         SharedLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].LN1 := SharedLN;
         // SEPARATE BIASED q/k/v projections (plain nn.Linear), all
         // reading the shared LN output.
         Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize), SharedLN);
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly), SharedLN);
         Blocks[BlockCnt].KProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize), SharedLN);
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly), SharedLN);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize), SharedLN);
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly), SharedLN);
         for HeadCnt := 0 to Config.NumHeads - 1 do
         begin
           // PARTIAL ROTARY per head: RoPE on the first RotaryDims channels
@@ -19269,25 +19275,25 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].AttnDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         AttnOut := NN.GetLastLayer();
         // MLP branch: reads the SAME shared LN output (NOT a second norm,
         // NOT the attention output - Phi is always parallel).
         Blocks[BlockCnt].Fc1 := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize),
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly),
           SharedLN);
         AddExactOrTanhGELU;
         Blocks[BlockCnt].Fc2 := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         MlpOut := NN.GetLastLayer();
         NN.AddLayer( TNNetSum.Create([BranchInput, AttnOut, MlpOut]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
@@ -19711,11 +19717,11 @@ begin
       // mask source when pPaddingMask is on).
       NN.AddLayerAfter( TNNetSplitChannels.Create([0]), InputLayer );
       WordEmb := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       // The structural table only carries the USABLE rows: row p is
       // checkpoint row p + PositionOffset (0 for bert/distilbert).
       PosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(UsablePositions) );
+        TNNetLearnedPositionalEmbedding.Create(UsablePositions).MakeInferenceOnly(pInferenceOnly) );
       TypeEmb := nil;
       if Config.TypeVocabSize > 0 then
       begin
@@ -19724,13 +19730,13 @@ begin
         SliceLayer := NN.AddLayerAfter(
           TNNetSplitChannels.Create([1]), InputLayer);
         TypeEmb := NN.AddLayerAfter( TNNetEmbedding.Create(
-          Config.TypeVocabSize, Config.HiddenSize, {EncodeZero=}1),
+          Config.TypeVocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly),
           SliceLayer);
         NN.AddLayer( TNNetSum.Create([PosEmb, TypeEmb]) );
       end;
       // ... then the embedding LayerNorm.
       EmbLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
@@ -19740,7 +19746,7 @@ begin
         //   x := LN(x + dense(BIDIRECTIONAL-MHA(q|k|v(x)))).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].QKV := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         // CausalMask=false: every position attends to all SeqLen keys
         // (INTERSECTED with the key-padding segment mask when pPaddingMask is
         // on - SegMaskSrc excludes the [PAD] key positions from every real
@@ -19752,12 +19758,12 @@ begin
           {SegmentSource=}SegMaskSrc);
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         Blocks[BlockCnt].AttnLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         // POST-LN FFN sub-block:
         //   x := LN(x + output.dense(gelu(intermediate.dense(x)))).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].Inter := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
         if Config.HiddenActTanh then
           NN.AddLayer( TNNetGELU.Create() ) // tanh approximation
         else
@@ -19777,10 +19783,10 @@ begin
           NN.AddLayer( TNNetReGLU.Create() );
         end;
         Blocks[BlockCnt].OutDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         Blocks[BlockCnt].OutLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         if pInferenceOnly then NN.MakeInferenceOnly();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
@@ -19791,7 +19797,7 @@ begin
       begin
         // Per-token dense+tanh; row 0 ([CLS]) equals HF's pooler_output.
         PoolerDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetHyperbolicTangent.Create() );
       end;
       ClassifierDense := nil;
@@ -19826,7 +19832,7 @@ begin
               '.weight" - not a *ForSequenceClassification checkpoint of ' +
               'this family?');
           ClsHeadDense := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
           if Config.Family = bfDistilBert then
             NN.AddLayer( TNNetReLU.Create() )
           else
@@ -19844,7 +19850,7 @@ begin
             Reader.ShapeAsString(ClsOutName + '.weight'));
         NumLabels := Reader.DimSize(ClsOutName + '.weight', 0);
         ClassifierDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(NumLabels) );
+          TNNetPointwiseConvLinear.Create(NumLabels).MakeInferenceOnly(pInferenceOnly) );
       end;
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
@@ -20234,7 +20240,7 @@ begin
         TNNetInput.Create(Patches, 1, Config.EncoderHiddenSize) );
       // Model-level embeddings.LayerNorm on the query embeddings FIRST.
       EmbLN := NN.AddLayerAfter(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps), QueryInput );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), QueryInput );
 
       for BlockCnt := 0 to Config.NumLayers - 1 do
       begin
@@ -20243,14 +20249,14 @@ begin
         //   q := LN(q + attn.output.dense(BIDIRECTIONAL-MHA(q|k|v(q)))).
         BranchInput := NN.GetLastLayer();
         QKV := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddMultiHeadSelfAttention(Config.NumHeads, {CausalMask=}false,
           {UseRoPE=}false, avSDPA, {NumSinks=}1, {Window=}0,
           {RelPosNumBuckets=}32, {RelPosMaxDistance=}128, {QKRMSNorm=}false,
           {SegmentSource=}nil);
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         AttnLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
 
         // ---- cross-attention sub-block (only on cross-attn layers) ----
         // Q from the post-normed query stream; K|V projected from the ViT
@@ -20263,11 +20269,11 @@ begin
         begin
           BranchInput := AttnLN;
           QProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize), BranchInput);
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly), BranchInput);
           KProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize), VisionInput);
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly), VisionInput);
           VProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize), VisionInput);
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly), VisionInput);
           for HeadCnt := 0 to Config.NumHeads - 1 do
           begin
             for d := 0 to HeadDim - 1 do
@@ -20285,23 +20291,23 @@ begin
           end;
           NN.AddLayer( TNNetDeepConcat.Create(Heads) );
           // crossattention.output.dense out-projection.
-          NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
           NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
           CrossLN := NN.AddLayer(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         end;
 
         // ---- FFN sub-block (intermediate_query / output_query) ----
         //   q := LN(q + output_query.dense(gelu(intermediate_query.dense(q)))).
         BranchInput := NN.GetLastLayer();
         FFNInter := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
         AddGelu();
         FFNOut := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         FFNLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         if pInferenceOnly then NN.MakeInferenceOnly();
 
         // ---------------- Weights for this block ----------------
@@ -20512,7 +20518,7 @@ begin
         TNNetInput.Create(QFormerConfig.NumQueryTokens, 1,
           QFormerConfig.HiddenSize) );
       ProjDense := ProjectionNet.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(TextHidden), ProjInput);
+        TNNetPointwiseConvLinear.Create(TextHidden).MakeInferenceOnly(pInferenceOnly), ProjInput);
       if pInferenceOnly then ProjectionNet.MakeInferenceOnly();
       LoadLlamaLinearWeights(Reader, ProjDense, ProjName + '.weight',
         QFormerConfig.HiddenSize, TextHidden, 0, -1, 0, ProjName + '.bias');
@@ -20949,14 +20955,16 @@ var
   ProjLayer: TNNetLayer;
   ConfigPath: string;
 begin
-  // Build the stock BERT encoder (no pooler/seq-cls head). DEFER the
-  // inference-only/quantization pass: the projection head appended below must
-  // be loaded with writable weights first (the QA-head pattern).
+  // Build the stock BERT encoder (no pooler/seq-cls head). The base encoder is
+  // fully loaded inside the call, so it may build inference-only up front
+  // (chained); only the int8 pass is DEFERRED, because the projection head
+  // appended below must be loaded with FP32 weights first (the QA-head pattern)
+  // - the final MakeInferenceOnly/QuantizeWeightsInt8 sweep closes it.
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadBertConfigFromJSONFile(ConfigPath);
   Result := BuildBertFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    {pInferenceOnly=}false, {pIncludePooler=}false, {pSeqClsHead=}false,
+    {pInferenceOnly=}pInferenceOnly, {pIncludePooler=}false, {pSeqClsHead=}false,
     {pQuantizeInt8=}false, {pPaddingMask=}pPaddingMask);
   ProjDim := 0;
   try
@@ -20978,7 +20986,7 @@ begin
       // Per-token projection head: TNNetPointwiseConvLinear with bias
       // suppressed (second arg 1).
       ProjLayer := Result.AddLayer(
-        TNNetPointwiseConvLinear.Create(ProjDim, {pSuppressBias=}1) );
+        TNNetPointwiseConvLinear.Create(ProjDim, {pSuppressBias=}1).MakeInferenceOnly(pInferenceOnly) );
       LoadLlamaLinearWeights(Reader, ProjLayer, 'linear.weight',
         Config.HiddenSize, ProjDim, 0, -1, 0, {BiasName=}'');
     finally
@@ -21795,14 +21803,16 @@ var
   Head, StartLayer, EndLayer: TNNetLayer;
   StartIdx: integer;
 begin
-  // Build the stock BERT-family encoder (no pooler, no seq-cls head). DEFER
-  // the inference-only / int8 pass: the qa_outputs head appended below must
-  // be loaded with writable weights first (the ColBERT pattern).
+  // Build the stock BERT-family encoder (no pooler, no seq-cls head). The base
+  // encoder is fully loaded inside the call, so it may build inference-only up
+  // front (chained); only the int8 pass is DEFERRED, because the qa_outputs
+  // head appended below must be loaded with writable weights first (the ColBERT
+  // pattern) - the final MakeInferenceOnly/QuantizeWeightsInt8 sweep closes it.
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadBertConfigFromJSONFile(ConfigPath);
   Result := BuildBertFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    {pInferenceOnly=}false, {pIncludePooler=}false, {pSeqClsHead=}false,
+    {pInferenceOnly=}pInferenceOnly, {pIncludePooler=}false, {pSeqClsHead=}false,
     {pQuantizeInt8=}false);
   try
     // AddQuestionAnsweringHead returns the (SeqLen,1,2) DeepConcat; the two
@@ -22374,10 +22384,10 @@ begin
       InputLayer := NN.AddLayer( TNNetInput.Create(SeqLen, 1, 2) );
       NN.AddLayer( TNNetSplitChannels.Create([0]) );
       WordEmb := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       // position_biased_input=false: NO absolute position add, NO token-type
       // add. Just the embedding LayerNorm.
-      EmbLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      EmbLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       SetLength(Blocks, Config.NumLayers);
       for BlockCnt := 0 to Config.NumLayers - 1 do
@@ -22386,7 +22396,7 @@ begin
         // POST-LN disentangled-attention sub-block.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].QKV := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         // Manual multi-head disentangled attention (one head per
         // TNNetDisentangledAttention so the importer can load each head's
         // position tables).
@@ -22401,14 +22411,14 @@ begin
         ConcatLayer := NN.AddLayer(
           TNNetDeepConcat.Create(Blocks[BlockCnt].Heads) );
         Blocks[BlockCnt].AttnDense := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize), ConcatLayer );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly), ConcatLayer );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         Blocks[BlockCnt].AttnLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         // POST-LN FFN sub-block.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].Inter := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
         if Config.HiddenActTanh then
           NN.AddLayer( TNNetGELU.Create() )
         else
@@ -22423,10 +22433,10 @@ begin
           NN.AddLayer( TNNetReGLU.Create() );
         end;
         Blocks[BlockCnt].OutDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         Blocks[BlockCnt].OutLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         if pInferenceOnly then NN.MakeInferenceOnly();
       end;
       // Optional sequence-classification head (ContextPooler + classifier).
@@ -22438,7 +22448,7 @@ begin
         // ContextPooler: dense(hidden->hidden) + pooler_hidden_act, per-token
         // (row 0 = HF pooled_output); then classifier(pooled).
         PoolerDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         if Config.PoolerActTanh then
           NN.AddLayer( TNNetHyperbolicTangent.Create() )
         else
@@ -22457,7 +22467,7 @@ begin
             '*ForSequenceClassification checkpoint?');
         NumLabels := Reader.DimSize('classifier.weight', 0);
         ClassifierDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(NumLabels) );
+          TNNetPointwiseConvLinear.Create(NumLabels).MakeInferenceOnly(pInferenceOnly) );
       end;
       if pInferenceOnly then NN.MakeInferenceOnly();
 
@@ -23632,7 +23642,7 @@ end;
 // interleaved, clamped-SwiGLU experts.
 procedure BuildGptOssMoEBranch(NN: TNNet; MoESource: TNNetLayer;
   const Config: TGptOssConfig; Reader: TNNetSafeTensorsReader;
-  const BlockPrefix: string);
+  const BlockPrefix: string; pInferenceOnly: boolean = false);
 var
   GateConv, GateTopK, ExpertOut, GateE, GateEBroadcast: TNNetLayer;
   GateUpLayers, DownLayers, MoEBranches: array of TNNetLayer;
@@ -23645,18 +23655,19 @@ begin
   SetLength(DownLayers, Config.NumLocalExperts);
   SetLength(MoEBranches, Config.NumLocalExperts);
   GateConv := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(Config.NumLocalExperts), MoESource);
+    TNNetPointwiseConvLinear.Create(Config.NumLocalExperts).MakeInferenceOnly(pInferenceOnly), MoESource);
   NN.AddLayer( TNNetPointwiseSoftMax.Create() );
   GateTopK := NN.AddLayer( TNNetTopKGate.Create(
     Config.NumExpertsPerTok, {pRenormalize=}True) );
   for ExpertCnt := 0 to Config.NumLocalExperts - 1 do
   begin
     GateUpLayers[ExpertCnt] := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(GU2), MoESource);
+      TNNetPointwiseConvLinear.Create(GU2).MakeInferenceOnly(pInferenceOnly),
+      MoESource);
     NN.AddLayer( TNNetGptOssGatedSwiGLU.Create(
       Config.SwiGLUAlpha, Config.SwiGLULimit) );
     DownLayers[ExpertCnt] := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+      TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
     ExpertOut := NN.GetLastLayer();
     GateE := NN.AddLayerAfter(
       TNNetSplitChannels.Create(ExpertCnt, 1), GateTopK);
@@ -23745,7 +23756,8 @@ begin
     NN := TNNet.Create();
     NN.AddLayer( TNNetInput.Create(SeqLen) );
     EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-      Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      Config.VocabSize, Config.HiddenSize, {EncodeZero=}1
+      ).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
     SetLength(KRotated, Config.NumKVHeads);
     SetLength(VSlices, Config.NumKVHeads);
@@ -23774,14 +23786,17 @@ begin
         LayerWindow := 0;
       // attention sub-block: x := x + o_proj(sink-attn(rope-GQA(RMSNorm(x))))
       BranchInput := NN.GetLastLayer();
-      AttnNorm := NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+      AttnNorm := NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly) );
       NormedSource := AttnNorm;
       QProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(QWidth), NormedSource);
+        TNNetPointwiseConvLinear.Create(QWidth).MakeInferenceOnly(pInferenceOnly),
+        NormedSource);
       KProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+        TNNetPointwiseConvLinear.Create(KVWidth).MakeInferenceOnly(pInferenceOnly),
+        NormedSource);
       VProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+        TNNetPointwiseConvLinear.Create(KVWidth).MakeInferenceOnly(pInferenceOnly),
+        NormedSource);
       for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
       begin
         for d := 0 to HeadDim - 1 do
@@ -23810,12 +23825,12 @@ begin
       end;
       NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
       OProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetSum.Create([OProj, BranchInput]) );
       // MLP sub-block: x := x + MoE(RMSNorm(x))
       BranchInput := NN.GetLastLayer();
-      MlpNorm := NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
-      BuildGptOssMoEBranch(NN, MlpNorm, Config, Reader, BlockPrefix);
+      MlpNorm := NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly) );
+      BuildGptOssMoEBranch(NN, MlpNorm, Config, Reader, BlockPrefix, pInferenceOnly);
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
       if pInferenceOnly then NN.MakeInferenceOnly();
 
@@ -23852,11 +23867,11 @@ begin
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
     end;
 
-    NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+    NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly) );
     LoadLlamaRMSNormWeights(Reader, NN.GetLastLayer(),
       Config.Prefix + 'norm.weight', Config.HiddenSize);
     LMHead := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
     Tmp := TNNetVolume.Create;
     try
@@ -24209,14 +24224,14 @@ begin
     // causal (= HF bidirectional=False bucketing); the encoder is not.
     BranchInput := NN.GetLastLayer();
     Blocks[BlockCnt].SelfAttn.Norm :=
-      NN.AddLayer( TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+      NN.AddLayer( TNNetTokenRMSNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     NormedSource := NN.GetLastLayer();
     Blocks[BlockCnt].SelfAttn.QProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(InnerDim), NormedSource);
+      TNNetPointwiseConvLinear.Create(InnerDim).MakeInferenceOnly(pInferenceOnly), NormedSource);
     Blocks[BlockCnt].SelfAttn.KProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(InnerDim), NormedSource);
+      TNNetPointwiseConvLinear.Create(InnerDim).MakeInferenceOnly(pInferenceOnly), NormedSource);
     Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(InnerDim), NormedSource);
+      TNNetPointwiseConvLinear.Create(InnerDim).MakeInferenceOnly(pInferenceOnly), NormedSource);
     SetLength(Blocks[BlockCnt].SelfAttn.Heads, Config.NumHeads);
     for HeadCnt := 0 to Config.NumHeads - 1 do
     begin
@@ -24240,7 +24255,7 @@ begin
     end;
     NN.AddLayer( TNNetDeepConcat.Create(Blocks[BlockCnt].SelfAttn.Heads) );
     Blocks[BlockCnt].SelfAttn.OProj := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
 
     // ---- cross-attention sub-block (decoder only) ----
@@ -24253,14 +24268,14 @@ begin
     begin
       BranchInput := NN.GetLastLayer();
       Blocks[BlockCnt].CrossAttn.Norm :=
-        NN.AddLayer( TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+        NN.AddLayer( TNNetTokenRMSNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       NormedSource := NN.GetLastLayer();
       Blocks[BlockCnt].CrossAttn.QProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(InnerDim), NormedSource);
+        TNNetPointwiseConvLinear.Create(InnerDim).MakeInferenceOnly(pInferenceOnly), NormedSource);
       Blocks[BlockCnt].CrossAttn.KProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(InnerDim), EncStates);
+        TNNetPointwiseConvLinear.Create(InnerDim).MakeInferenceOnly(pInferenceOnly), EncStates);
       Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(InnerDim), EncStates);
+        TNNetPointwiseConvLinear.Create(InnerDim).MakeInferenceOnly(pInferenceOnly), EncStates);
       SetLength(Blocks[BlockCnt].CrossAttn.Heads, Config.NumHeads);
       for HeadCnt := 0 to Config.NumHeads - 1 do
       begin
@@ -24282,7 +24297,7 @@ begin
       end;
       NN.AddLayer( TNNetDeepConcat.Create(Blocks[BlockCnt].CrossAttn.Heads) );
       Blocks[BlockCnt].CrossAttn.OProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.DModel) );
+        TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
     end;
 
@@ -24294,21 +24309,21 @@ begin
     // "relu": h = relu(wi(x)). Both end with wo back to d_model.
     BranchInput := NN.GetLastLayer();
     Blocks[BlockCnt].FFNNorm :=
-      NN.AddLayer( TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+      NN.AddLayer( TNNetTokenRMSNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     if Config.GatedFFN then
     begin
       Blocks[BlockCnt].Wi := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(2 * Config.DFF) );
+        TNNetPointwiseConvLinear.Create(2 * Config.DFF).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetGEGLU.Create() );
     end
     else
     begin
       Blocks[BlockCnt].Wi := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.DFF) );
+        TNNetPointwiseConvLinear.Create(Config.DFF).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetReLU.Create() );
     end;
     Blocks[BlockCnt].Wo := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
     if pInferenceOnly then NN.MakeInferenceOnly();
     if pQuantizeInt8 then NN.QuantizeWeightsInt8();
@@ -24521,13 +24536,13 @@ begin
       // EncodeZero=1: token id 0 (<pad>, also the decoder start token) is
       // a real embedding row.
       EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1) );
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Enc.MakeInferenceOnly();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       BuildT5StackBlocks(Enc, Config, Config.NumLayers, {IsDecoder=}false,
         nil, EncBlocks, pInferenceOnly, pQuantizeInt8);
       EncFinalNorm := Enc.AddLayer(
-        TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+        TNNetTokenRMSNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Enc.MakeInferenceOnly();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
 
@@ -24541,16 +24556,16 @@ begin
       EncStates := Dec.AddLayerAfter(
         TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly), DecTokenInput);
       if pInferenceOnly then Dec.MakeInferenceOnly();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       BuildT5StackBlocks(Dec, Config, Config.NumDecoderLayers,
         {IsDecoder=}true, EncStates, DecBlocks, pInferenceOnly,
         pQuantizeInt8);
       DecFinalNorm := Dec.AddLayer(
-        TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+        TNNetTokenRMSNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := Dec.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
 
@@ -24850,11 +24865,11 @@ begin
     // unmodified (no T5-style scale compensation).
     BranchInput := NN.GetLastLayer();
     Blocks[BlockCnt].SelfAttn.QProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel), BranchInput);
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), BranchInput);
     Blocks[BlockCnt].SelfAttn.KProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel), BranchInput);
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), BranchInput);
     Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel), BranchInput);
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), BranchInput);
     for HeadCnt := 0 to NumHeads - 1 do
     begin
       for d := 0 to HeadDim - 1 do
@@ -24876,10 +24891,10 @@ begin
     end;
     NN.AddLayer( TNNetDeepConcat.Create(Heads) );
     Blocks[BlockCnt].SelfAttn.OProj := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
     Blocks[BlockCnt].SelfAttn.Norm := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
+      TNNetTokenLayerNorm.Create(MarianLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
 
     // ---- cross-attention sub-block (decoder only) ----
     // Queries from the post-normed decoder stream; Keys|Values projected
@@ -24891,11 +24906,11 @@ begin
     begin
       BranchInput := NN.GetLastLayer();
       Blocks[BlockCnt].CrossAttn.QProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel), BranchInput);
+        TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), BranchInput);
       Blocks[BlockCnt].CrossAttn.KProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel), EncStates);
+        TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), EncStates);
       Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel), EncStates);
+        TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), EncStates);
       for HeadCnt := 0 to NumHeads - 1 do
       begin
         for d := 0 to HeadDim - 1 do
@@ -24916,25 +24931,25 @@ begin
       end;
       NN.AddLayer( TNNetDeepConcat.Create(Heads) );
       Blocks[BlockCnt].CrossAttn.OProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.DModel) );
+        TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
       Blocks[BlockCnt].CrossAttn.Norm := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
+        TNNetTokenLayerNorm.Create(MarianLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     end;
 
     // ---- FFN sub-block: fc2(act(fc1(x))), then final_layer_norm ----
     BranchInput := NN.GetLastLayer();
     Blocks[BlockCnt].Fc1 := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(FFNDim) );
+      TNNetPointwiseConvLinear.Create(FFNDim).MakeInferenceOnly(pInferenceOnly) );
     if Config.SwishFFN then
       NN.AddLayer( TNNetSwish.Create() )
     else
       NN.AddLayer( TNNetReLU.Create() );
     Blocks[BlockCnt].Fc2 := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
     Blocks[BlockCnt].FFNNorm := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
+      TNNetTokenLayerNorm.Create(MarianLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
     if pQuantizeInt8 then NN.QuantizeWeightsInt8();
   end;
@@ -25142,11 +25157,11 @@ begin
       Enc.AddLayer( TNNetInput.Create(EncSeqLen) );
       // EncodeZero=1: token id 0 (eos in opus-mt) is a real embedding row.
       EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1) );
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       // Static sinusoidal positions, added AFTER the (scaled) token
       // embedding; the table is filled below (Marian half-split layout).
       EncPos := Enc.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(EncSeqLen) );
+        TNNetLearnedPositionalEmbedding.Create(EncSeqLen).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Enc.MakeInferenceOnly();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       BuildMarianStackBlocks(Enc, Config, Config.EncoderLayers,
@@ -25164,16 +25179,16 @@ begin
       EncStates := Dec.AddLayerAfter(
         TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly), DecTokenInput);
       DecPos := Dec.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(DecSeqLen) );
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       BuildMarianStackBlocks(Dec, Config, Config.DecoderLayers,
         Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
         EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8);
       LMHead := Dec.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
 
@@ -26192,11 +26207,11 @@ begin
     // ---- self-attention sub-block (residual add, THEN LayerNorm) ----
     BranchInput := NN.GetLastLayer();
     Blocks[BlockCnt].SelfAttn.QProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel), BranchInput);
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), BranchInput);
     Blocks[BlockCnt].SelfAttn.KProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel), BranchInput);
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), BranchInput);
     Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel), BranchInput);
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), BranchInput);
     for HeadCnt := 0 to NumHeads - 1 do
     begin
       for d := 0 to HeadDim - 1 do
@@ -26218,21 +26233,21 @@ begin
     end;
     NN.AddLayer( TNNetDeepConcat.Create(Heads) );
     Blocks[BlockCnt].SelfAttn.OProj := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
     Blocks[BlockCnt].SelfAttn.Norm := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+      TNNetTokenLayerNorm.Create(BartLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
 
     // ---- cross-attention sub-block (decoder only) ----
     if IsDecoder then
     begin
       BranchInput := NN.GetLastLayer();
       Blocks[BlockCnt].CrossAttn.QProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel), BranchInput);
+        TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), BranchInput);
       Blocks[BlockCnt].CrossAttn.KProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel), EncStates);
+        TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), EncStates);
       Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel), EncStates);
+        TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), EncStates);
       for HeadCnt := 0 to NumHeads - 1 do
       begin
         for d := 0 to HeadDim - 1 do
@@ -26253,16 +26268,16 @@ begin
       end;
       NN.AddLayer( TNNetDeepConcat.Create(Heads) );
       Blocks[BlockCnt].CrossAttn.OProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.DModel) );
+        TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
       Blocks[BlockCnt].CrossAttn.Norm := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+        TNNetTokenLayerNorm.Create(BartLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     end;
 
     // ---- FFN sub-block: fc2(gelu(fc1(x))), then final_layer_norm ----
     BranchInput := NN.GetLastLayer();
     Blocks[BlockCnt].Fc1 := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(FFNDim) );
+      TNNetPointwiseConvLinear.Create(FFNDim).MakeInferenceOnly(pInferenceOnly) );
     // EXACT erf GELU x*Phi(x) composed from existing layers (the BERT
     // recipe): Phi = 0.5*(1 + erf(x/sqrt(2))) on a side branch, then
     // ReGLU(Phi|x) = ReLU(Phi)*x = Phi*x since Phi is in (0, 1). TNNetReGLU
@@ -26276,10 +26291,10 @@ begin
     NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
     NN.AddLayer( TNNetReGLU.Create() );
     Blocks[BlockCnt].Fc2 := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
     Blocks[BlockCnt].FFNNorm := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+      TNNetTokenLayerNorm.Create(BartLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
     if pQuantizeInt8 then NN.QuantizeWeightsInt8();
   end;
@@ -26390,11 +26405,11 @@ begin
       Enc := TNNet.Create();
       Enc.AddLayer( TNNetInput.Create(EncSeqLen) );
       EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1) );
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       EncPos := Enc.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(EncSeqLen) );
+        TNNetLearnedPositionalEmbedding.Create(EncSeqLen).MakeInferenceOnly(pInferenceOnly) );
       EncEmbLN := Enc.AddLayer(
-        TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+        TNNetTokenLayerNorm.Create(BartLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Enc.MakeInferenceOnly();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       BuildBartStackBlocks(Enc, Config, Config.EncoderLayers,
@@ -26407,18 +26422,18 @@ begin
       EncStates := Dec.AddLayerAfter(
         TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly), DecTokenInput);
       DecPos := Dec.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(DecSeqLen) );
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).MakeInferenceOnly(pInferenceOnly) );
       DecEmbLN := Dec.AddLayer(
-        TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+        TNNetTokenLayerNorm.Create(BartLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       BuildBartStackBlocks(Dec, Config, Config.DecoderLayers,
         Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
         EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8);
       LMHead := Dec.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
 
@@ -27859,10 +27874,10 @@ begin
       Enc := TNNet.Create();
       Enc.AddLayer( TNNetInput.Create(EncSeqLen) );
       EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1) );
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       // Static sinusoidal positions, NO padding offset (position p -> row p).
       EncPos := Enc.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(EncSeqLen) );
+        TNNetLearnedPositionalEmbedding.Create(EncSeqLen).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Enc.MakeInferenceOnly();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       BuildPegasusStackBlocks(Enc, Config, Config.EncoderLayers,
@@ -27870,7 +27885,7 @@ begin
         nil, EncBlocks, pInferenceOnly, pQuantizeInt8);
       // Pre-norm stack: a FINAL encoder LayerNorm closes the stack.
       EncFinalLN := Enc.AddLayer(
-        TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+        TNNetTokenLayerNorm.Create(PegasusLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Enc.MakeInferenceOnly();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
 
@@ -27880,9 +27895,9 @@ begin
       EncStates := Dec.AddLayerAfter(
         TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly), DecTokenInput);
       DecPos := Dec.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(DecSeqLen) );
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       BuildPegasusStackBlocks(Dec, Config, Config.DecoderLayers,
@@ -27891,9 +27906,9 @@ begin
       // Pre-norm stack: a FINAL decoder LayerNorm closes the stack BEFORE
       // the lm_head.
       DecFinalLN := Dec.AddLayer(
-        TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+        TNNetTokenLayerNorm.Create(PegasusLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := Dec.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
 
@@ -28211,18 +28226,18 @@ begin
       Enc := TNNet.Create();
       Enc.AddLayer( TNNetInput.Create(EncSeqLen) );
       EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1) );
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       EncPos := Enc.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(EncSeqLen) );
+        TNNetLearnedPositionalEmbedding.Create(EncSeqLen).MakeInferenceOnly(pInferenceOnly) );
       EncEmbLN := Enc.AddLayer(
-        TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+        TNNetTokenLayerNorm.Create(BartLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Enc.MakeInferenceOnly();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       BuildPegasusStackBlocks(Enc, PegShim, Config.EncoderLayers,
         Config.EncoderHeads, Config.EncoderFFNDim, {IsDecoder=}false,
         nil, EncBlocks, pInferenceOnly, pQuantizeInt8);
       EncFinalLN := Enc.AddLayer(
-        TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+        TNNetTokenLayerNorm.Create(BartLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Enc.MakeInferenceOnly();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
 
@@ -28232,20 +28247,20 @@ begin
       EncStates := Dec.AddLayerAfter(
         TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly), DecTokenInput);
       DecPos := Dec.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(DecSeqLen) );
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).MakeInferenceOnly(pInferenceOnly) );
       DecEmbLN := Dec.AddLayer(
-        TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+        TNNetTokenLayerNorm.Create(BartLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       BuildPegasusStackBlocks(Dec, PegShim, Config.DecoderLayers,
         Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
         EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8);
       DecFinalLN := Dec.AddLayer(
-        TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+        TNNetTokenLayerNorm.Create(BartLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := Dec.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
 
@@ -28584,16 +28599,16 @@ begin
       Enc := TNNet.Create();
       Enc.AddLayer( TNNetInput.Create(EncSeqLen) );
       EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1) );
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       EncPos := Enc.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(EncSeqLen) );
+        TNNetLearnedPositionalEmbedding.Create(EncSeqLen).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Enc.MakeInferenceOnly();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       BuildPegasusStackBlocks(Enc, PegShim, Config.EncoderLayers,
         Config.EncoderHeads, Config.EncoderFFNDim, {IsDecoder=}false,
         nil, EncBlocks, pInferenceOnly, pQuantizeInt8, {UseReluFFN=}true);
       EncFinalLN := Enc.AddLayer(
-        TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+        TNNetTokenLayerNorm.Create(PegasusLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Enc.MakeInferenceOnly();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
 
@@ -28603,9 +28618,9 @@ begin
       EncStates := Dec.AddLayerAfter(
         TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly), DecTokenInput);
       DecPos := Dec.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(DecSeqLen) );
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       BuildPegasusStackBlocks(Dec, PegShim, Config.DecoderLayers,
@@ -28613,9 +28628,9 @@ begin
         EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8,
         {UseReluFFN=}true);
       DecFinalLN := Dec.AddLayer(
-        TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+        TNNetTokenLayerNorm.Create(PegasusLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := Dec.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
 
@@ -29059,9 +29074,9 @@ var
     HDim := Hidden div NumHeadsLoc;
     SetLength(HArr, NumHeadsLoc);
     SetLength(Slice, HDim);
-    Q := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden), Src);
-    K := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden), Src);
-    V := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden), Src);
+    Q := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden).MakeInferenceOnly(pInferenceOnly), Src);
+    K := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden).MakeInferenceOnly(pInferenceOnly), Src);
+    V := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden).MakeInferenceOnly(pInferenceOnly), Src);
     for hc := 0 to NumHeadsLoc - 1 do
     begin
       for dd := 0 to HDim - 1 do Slice[dd] := hc * HDim + dd;
@@ -29073,7 +29088,7 @@ var
         TNNetScaledDotProductAttention.Create(HDim, {CausalMask=}false), hp);
     end;
     Enc.AddLayer(TNNetDeepConcat.Create(HArr));
-    O := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden));
+    O := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden).MakeInferenceOnly(pInferenceOnly));
   end;
 
   // FFN: fc2(act(fc1(x))) where act is swish; returns the fc2 layer. NoLN -
@@ -29081,10 +29096,10 @@ var
   procedure BuildConformerFFN(InLayer: TNNetLayer; FFNDim: integer;
     UseRelu: boolean; out Fc1, Fc2: TNNetLayer);
   begin
-    Fc1 := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(FFNDim), InLayer);
+    Fc1 := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(FFNDim).MakeInferenceOnly(pInferenceOnly), InLayer);
     if UseRelu then Enc.AddLayer(TNNetReLU.Create())
     else Enc.AddLayer(TNNetSwish.Create());
-    Fc2 := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden));
+    Fc2 := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden).MakeInferenceOnly(pInferenceOnly));
   end;
 
 begin
@@ -29136,8 +29151,8 @@ begin
       Enc := TNNet.Create();
       Enc.AddLayer(TNNetInput.Create(SpeechFrames, 1, Config.FeatureProjInputDim));
       // feature_projection: LayerNorm(feat_in) -> Linear(feat_in -> hidden)
-      FeatProjLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
-      FeatProj := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden));
+      FeatProjLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly));
+      FeatProj := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden).MakeInferenceOnly(pInferenceOnly));
       LoadLayerNormWeights(Reader, FeatProjLN,
         'speech_encoder.feature_projection.layer_norm.weight',
         'speech_encoder.feature_projection.layer_norm.bias',
@@ -29155,7 +29170,7 @@ begin
       begin
         // ---- macaron FFN1: h += 0.5 * FFN1(LN(h)) ----
         ResidualInput := Enc.GetLastLayer();
-        Ffn1LN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+        Ffn1LN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly));
         BuildConformerFFN(Ffn1LN, Config.SpeechEncoderFFNDim, false,
           Ffn1Fc1, Ffn1Fc2);
         Enc.AddLayer(TNNetMulByConstant.Create(0.5));
@@ -29163,33 +29178,33 @@ begin
 
         // ---- self-attention: h += SDPA(LN(h)) ----
         ResidualInput := Enc.GetLastLayer();
-        AttnLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+        AttnLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly));
         BuildConformerSDPA(AttnLN, Heads, QProj, KProj, VProj, OProj);
         Enc.AddLayer(TNNetSum.Create([OProj, ResidualInput]));
 
         // ---- conv module: h += ConvModule(h) ----
         ResidualInput := Enc.GetLastLayer();
-        ConvLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+        ConvLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly));
         // pointwise_conv1: hidden -> 2*hidden (no bias), GLU back to hidden
-        ConvPw1 := Enc.AddLayer(TNNetPointwiseConvLinear.Create(2 * Hidden));
+        ConvPw1 := Enc.AddLayer(TNNetPointwiseConvLinear.Create(2 * Hidden).MakeInferenceOnly(pInferenceOnly));
         Enc.AddLayer(TNNetGLU.Create());
         // causal depthwise conv (left-pad K-1), depthwise LN, swish
         ConvDw := Enc.AddLayer(TNNetDepthwiseConv1D.Create(
           Config.ConvDepthwiseKernel, {Causal=}true, {SuppressBias=}1));
-        ConvDwLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+        ConvDwLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly));
         Enc.AddLayer(TNNetSwish.Create());
         // pointwise_conv2: hidden -> hidden (no bias)
-        ConvPw2 := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden));
+        ConvPw2 := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden).MakeInferenceOnly(pInferenceOnly));
         Enc.AddLayer(TNNetSum.Create([Enc.GetLastLayer(), ResidualInput]));
 
         // ---- macaron FFN2: h = LN(h + 0.5 * FFN2(LN(h))) ----
         ResidualInput := Enc.GetLastLayer();
-        Ffn2LN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+        Ffn2LN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly));
         BuildConformerFFN(Ffn2LN, Config.SpeechEncoderFFNDim, false,
           Ffn2Fc1, Ffn2Fc2);
         Enc.AddLayer(TNNetMulByConstant.Create(0.5));
         Enc.AddLayer(TNNetSum.Create([Enc.GetLastLayer(), ResidualInput]));
-        LayLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+        LayLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly));
 
         // ---- load this layer's weights ----
         SP := 'speech_encoder.encoder.layers.' + IntToStr(LayerCnt) + '.';
@@ -29272,7 +29287,7 @@ begin
       end;
 
       // encoder.layer_norm
-      EncLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+      EncLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly));
       LoadLayerNormWeights(Reader, EncLN,
         'speech_encoder.encoder.layer_norm.weight',
         'speech_encoder.encoder.layer_norm.bias', Hidden);
@@ -29305,28 +29320,28 @@ begin
         // residual = GLU(stride-conv(LN(h)))  (kernel K stride S pad S/2)
         ResidualInput := Enc.GetLastLayer();
         AdResLN := Enc.AddLayerAfter(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps), ResidualInput);
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), ResidualInput);
         // strided pooling conv: pad left/right by stride/2 then stride-S conv
         if (Config.AdaptorStride div 2) > 0 then
           Enc.AddLayer(TNNetPadXY.Create(Config.AdaptorStride div 2, 0));
         AdResConv := Enc.AddLayer(TNNetConvolutionLinear.Create(
-          2 * Hidden, Config.AdaptorKernel, 0, Config.AdaptorStride, 0));
+          2 * Hidden, Config.AdaptorKernel, 0, Config.AdaptorStride, 0).MakeInferenceOnly(pInferenceOnly));
         AdResGLU := Enc.AddLayer(TNNetGLU.Create());
 
         // attn branch = GLU(stride-conv(LN(h))) -> SDPA(no pos) ; h = attn+res
         AdAttnLN := Enc.AddLayerAfter(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps), ResidualInput);
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), ResidualInput);
         if (Config.AdaptorStride div 2) > 0 then
           Enc.AddLayer(TNNetPadXY.Create(Config.AdaptorStride div 2, 0));
         AdAttnConv := Enc.AddLayer(TNNetConvolutionLinear.Create(
-          2 * Hidden, Config.AdaptorKernel, 0, Config.AdaptorStride, 0));
+          2 * Hidden, Config.AdaptorKernel, 0, Config.AdaptorStride, 0).MakeInferenceOnly(pInferenceOnly));
         AdAttnGLU := Enc.AddLayer(TNNetGLU.Create());
         BuildConformerSDPA(AdAttnGLU, Heads, AdQ, AdK, AdV, AdO);
         Enc.AddLayer(TNNetSum.Create([AdO, AdResGLU]));
 
         // h += FFN(LN(h))  (relu)
         ResidualInput := Enc.GetLastLayer();
-        AdFfnLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+        AdFfnLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly));
         BuildConformerFFN(AdFfnLN, Config.SpeechEncoderFFNDim, true,
           AdFc1, AdFc2);
         Enc.AddLayer(TNNetSum.Create([Enc.GetLastLayer(), ResidualInput]));
@@ -29382,7 +29397,7 @@ begin
       end;
 
       // inner_layer_norm
-      InnerLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+      InnerLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly));
       LoadLayerNormWeights(Reader, InnerLN,
         'speech_encoder.inner_layer_norm.weight',
         'speech_encoder.inner_layer_norm.bias', Hidden);
@@ -29397,14 +29412,14 @@ begin
       EncStates := Dec.AddLayerAfter(
         TNNetInput.Create(AdaptedLen, 1, Hidden, 1), 0);
       DecEmbed := Dec.AddLayerAfter(TNNetEmbedding.Create(
-        Config.VocabSize, Hidden, {EncodeZero=}1), DecTokenInput);
-      DecPos := Dec.AddLayer(TNNetLearnedPositionalEmbedding.Create(DecSeqLen));
+        Config.VocabSize, Hidden, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly), DecTokenInput);
+      DecPos := Dec.AddLayer(TNNetLearnedPositionalEmbedding.Create(DecSeqLen).MakeInferenceOnly(pInferenceOnly));
       BuildPegasusStackBlocks(Dec, PegShim, Config.DecoderLayers,
         Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
         EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8,
         {UseReluFFN=}true);
-      DecFinalLN := Dec.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
-      LMHead := Dec.AddLayer(TNNetPointwiseConvLinear.Create(Config.VocabSize));
+      DecFinalLN := Dec.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly));
+      LMHead := Dec.AddLayer(TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly));
 
       // ---- decoder weights ----
       Tmp := TNNetVolume.Create;
@@ -29664,14 +29679,14 @@ begin
     // unmodified.
     BranchInput := NN.GetLastLayer();
     Blocks[BlockCnt].SelfAttn.Norm := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
+      TNNetTokenLayerNorm.Create(MarianLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     NormOut := NN.GetLastLayer();
     Blocks[BlockCnt].SelfAttn.QProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel), NormOut);
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), NormOut);
     Blocks[BlockCnt].SelfAttn.KProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel), NormOut);
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), NormOut);
     Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel), NormOut);
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), NormOut);
     for HeadCnt := 0 to NumHeads - 1 do
     begin
       for d := 0 to HeadDim - 1 do
@@ -29693,7 +29708,7 @@ begin
     end;
     NN.AddLayer( TNNetDeepConcat.Create(Heads) );
     Blocks[BlockCnt].SelfAttn.OProj := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
 
     // ---- cross-attention sub-block (decoder only) ----
@@ -29706,14 +29721,14 @@ begin
     begin
       BranchInput := NN.GetLastLayer();
       Blocks[BlockCnt].CrossAttn.Norm := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
+        TNNetTokenLayerNorm.Create(MarianLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       NormOut := NN.GetLastLayer();
       Blocks[BlockCnt].CrossAttn.QProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel), NormOut);
+        TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), NormOut);
       Blocks[BlockCnt].CrossAttn.KProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel), EncStates);
+        TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), EncStates);
       Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel), EncStates);
+        TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly), EncStates);
       for HeadCnt := 0 to NumHeads - 1 do
       begin
         for d := 0 to HeadDim - 1 do
@@ -29734,19 +29749,19 @@ begin
       end;
       NN.AddLayer( TNNetDeepConcat.Create(Heads) );
       Blocks[BlockCnt].CrossAttn.OProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.DModel) );
+        TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
     end;
 
     // ---- FFN sub-block: x := x + fc2(gelu(fc1(final_layer_norm(x)))) ----
     BranchInput := NN.GetLastLayer();
     Blocks[BlockCnt].FFNNorm := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
+      TNNetTokenLayerNorm.Create(MarianLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     Blocks[BlockCnt].Fc1 := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(FFNDim) );
+      TNNetPointwiseConvLinear.Create(FFNDim).MakeInferenceOnly(pInferenceOnly) );
     AddWhisperExactGelu(NN);
     Blocks[BlockCnt].Fc2 := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
     if pInferenceOnly then NN.MakeInferenceOnly();
   end;
@@ -29994,21 +30009,21 @@ begin
         Config.NumMelBins, 1) );
       Enc.AddLayer( TNNetPadXY.Create(1, 0) );
       Conv1 := Enc.AddLayer( TNNetConvolutionLinear.Create(
-        Config.DModel, 3, {Padding=}0, {Stride=}1) );
+        Config.DModel, 3, {Padding=}0, {Stride=}1).MakeInferenceOnly(pInferenceOnly) );
       AddWhisperExactGelu(Enc);
       Enc.AddLayer( TNNetPadXY.Create(1, 0) );
       Conv2 := Enc.AddLayer( TNNetConvolutionLinear.Create(
-        Config.DModel, 3, {Padding=}0, {Stride=}2) );
+        Config.DModel, 3, {Padding=}0, {Stride=}2).MakeInferenceOnly(pInferenceOnly) );
       AddWhisperExactGelu(Enc);
       EncPos := Enc.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.MaxSourcePositions) );
+        TNNetLearnedPositionalEmbedding.Create(Config.MaxSourcePositions).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Enc.MakeInferenceOnly();
       BuildWhisperStackBlocks(Enc, Config, Config.EncoderLayers,
         Config.EncoderHeads, Config.EncoderFFNDim, {IsDecoder=}false,
         nil, EncBlocks, pInferenceOnly);
       // PRE-norm stack: the FINAL LayerNorm closes the encoder.
       EncFinalNorm := Enc.AddLayer(
-        TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
+        TNNetTokenLayerNorm.Create(MarianLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Enc.MakeInferenceOnly();
 
       // ---------------- Decoder architecture ----------------
@@ -30022,17 +30037,17 @@ begin
         TNNetInput.Create(Config.MaxSourcePositions, 1, Config.DModel, 1),
         0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly), DecTokenInput);
       DecPos := Dec.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(DecSeqLen) );
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
       BuildWhisperStackBlocks(Dec, Config, Config.DecoderLayers,
         Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
         EncStates, DecBlocks, pInferenceOnly);
       DecFinalNorm := Dec.AddLayer(
-        TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
+        TNNetTokenLayerNorm.Create(MarianLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := Dec.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
 
       // ---------------- Weights ----------------
@@ -30850,7 +30865,7 @@ begin
         // conv_bias false => suppress the bias (pSuppressBias=1).
         ConvLayer[k] := NN.AddLayer( TNNetConvolutionLinear.Create(
           Config.ConvDim[k], Config.ConvKernel[k], {Padding=}0,
-          Config.ConvStride[k], {SuppressBias=}1) );
+          Config.ConvStride[k], {SuppressBias=}1).MakeInferenceOnly(pInferenceOnly) );
         InLen := (InLen - Config.ConvKernel[k]) div Config.ConvStride[k] + 1;
         if (k = 0) and Config.FeatExtractGroupNorm then
           // GroupNorm with num_groups = num_channels: each channel is its
@@ -30861,9 +30876,9 @@ begin
       end;
       // ----- Feature projection: LayerNorm then Linear C[-1] -> hidden. ---
       FeatProjLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       FeatProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
       PreEncoder := NN.GetLastLayer();
       // ----- Positional conv embedding (grouped conv1d, even kernel). -----
       // SAME padding via explicit X-only PadXY (kernel div 2 each side); the
@@ -30880,7 +30895,7 @@ begin
       // hidden := encoder.layer_norm( projected_features + pos_embed ).
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), PreEncoder]) );
       EncLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       // ----- POST-LN transformer encoder blocks (BERT block math). -------
       SetLength(QKV, Config.NumLayers);
@@ -30894,16 +30909,16 @@ begin
         // x := LN(x + dense(BIDIRECTIONAL-MHA(q|k|v(x)))).
         BranchInput := NN.GetLastLayer();
         QKV[BlockCnt] := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         AttnDense[BlockCnt] := NN.AddMultiHeadSelfAttention(
           Config.NumHeads, {CausalMask=}false);
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         AttnLN[BlockCnt] := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         // x := final_LN(x + output_dense(gelu(intermediate_dense(x)))).
         BranchInput := NN.GetLastLayer();
         Inter[BlockCnt] := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
         HiddenAct := NN.GetLastLayer();
         NN.AddLayerAfter(
           TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
@@ -30913,15 +30928,15 @@ begin
         NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
         NN.AddLayer( TNNetReGLU.Create() );
         OutDense[BlockCnt] := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         OutLN[BlockCnt] := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         if pInferenceOnly then NN.MakeInferenceOnly();
       end;
       // ----- CTC head: linear hidden -> vocab (lm_head). -----------------
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
 
       // ---------------- Weights ----------------
@@ -31347,13 +31362,13 @@ begin
       NN.AddLayer(Sinc);
       NN.AddLayer( TNNetAbs.Create() );
       NN.AddLayer( TNNetMaxPool.Create(Config.Pool1, Config.Pool1, 0) );
-      LN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      LN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       // Second conv block (valid conv, stride 1) -> relu -> maxpool -> layernorm.
       Conv2 := NN.AddLayer( TNNetConvolutionLinear.Create(
-        Config.ConvChannels, Config.ConvKernel, 0, 1, 0) );
+        Config.ConvChannels, Config.ConvKernel, 0, 1, 0).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetReLU.Create() );
       NN.AddLayer( TNNetMaxPool.Create(Config.Pool2, Config.Pool2, 0) );
-      LN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      LN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       // Bidirectional minimal-LSTM temporal trunk (forward + time-reversed),
       // concatenated along Depth -> 2*LSTMHidden channels per frame.
       Source := NN.GetLastLayer();
@@ -31364,7 +31379,7 @@ begin
       NN.AddLayer( TNNetDeepConcat.Create([FwdCell, RevCell]) );
       // Per-frame powerset head: Linear (2*Hidden -> NumPowersetClasses).
       Head := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.NumPowersetClasses) );
+        TNNetPointwiseConvLinear.Create(Config.NumPowersetClasses).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
 
       // ---------------- Weights ----------------
@@ -31740,18 +31755,18 @@ begin
       // ----- conv stem off the raw waveform (the Moonshine frontend). -----
       // conv1: 1 -> hidden, k=127, s=64, BIAS-FREE, then tanh.
       Conv1 := NN.AddLayer( TNNetConvolutionLinear.Create(
-        Config.HiddenSize, 127, {Padding=}0, {Stride=}64, {SuppressBias=}1) );
+        Config.HiddenSize, 127, {Padding=}0, {Stride=}64, {SuppressBias=}1).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetHyperbolicTangent.Create() );
       // groupnorm: GroupNorm(num_groups=1, hidden) over the WHOLE (T,C) block,
       // per-channel affine - sits BETWEEN conv1 and conv2.
       ConvGN := NN.AddLayer( TNNetGroupNorm.Create({Groups=}1, {Affine=}True) );
       // conv2: hidden -> 2*hidden, k=7, s=3, biased, then erf-GELU.
       Conv2 := NN.AddLayer( TNNetConvolutionLinear.Create(
-        2 * Config.HiddenSize, 7, {Padding=}0, {Stride=}3, {SuppressBias=}0) );
+        2 * Config.HiddenSize, 7, {Padding=}0, {Stride=}3, {SuppressBias=}0).MakeInferenceOnly(pInferenceOnly) );
       AddWhisperExactGelu(NN);
       // conv3: 2*hidden -> hidden, k=3, s=2, biased, then erf-GELU.
       Conv3 := NN.AddLayer( TNNetConvolutionLinear.Create(
-        Config.HiddenSize, 3, {Padding=}0, {Stride=}2, {SuppressBias=}0) );
+        Config.HiddenSize, 3, {Padding=}0, {Stride=}2, {SuppressBias=}0).MakeInferenceOnly(pInferenceOnly) );
       AddWhisperExactGelu(NN);
       if pInferenceOnly then NN.MakeInferenceOnly();
       // ----- PRE-norm BIDIRECTIONAL transformer encoder blocks. -----------
@@ -31774,14 +31789,14 @@ begin
         // x := x + o_proj(bidirectional-RoPE-MHA(input_layernorm(x))).
         BranchInput := NN.GetLastLayer();
         AttnNorm[BlockCnt] := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         NormedSource := NN.GetLastLayer();
         QProj[BlockCnt] := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(QWidth), NormedSource);
+          TNNetPointwiseConvLinear.Create(QWidth).MakeInferenceOnly(pInferenceOnly), NormedSource);
         KProj[BlockCnt] := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+          TNNetPointwiseConvLinear.Create(KVWidth).MakeInferenceOnly(pInferenceOnly), NormedSource);
         VProj[BlockCnt] := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+          TNNetPointwiseConvLinear.Create(KVWidth).MakeInferenceOnly(pInferenceOnly), NormedSource);
         // K rotated once per KV head; V never rotated. Partial rotary: RoPE
         // on the first RotaryDims channels, the tail passes through (the
         // Phi-3 partial-rotary slice wiring).
@@ -31850,23 +31865,23 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         OProj[BlockCnt] := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         // x := x + fc2(gelu(fc1(post_attention_layernorm(x)))).
         BranchInput := NN.GetLastLayer();
         MlpNorm[BlockCnt] := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         Fc1[BlockCnt] := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
         AddWhisperExactGelu(NN);
         Fc2[BlockCnt] := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
       end;
       // ----- FINAL stack LayerNorm (gain-only). -----
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
 
       // ---------------- Weights ----------------
@@ -32042,7 +32057,7 @@ begin
       EncStates := Dec.AddLayerAfter(
         TNNetInput.Create(EncLen, 1, Config.HiddenSize, 1), 0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1), DecTokenInput);
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly), DecTokenInput);
       if pInferenceOnly then Dec.MakeInferenceOnly();
 
       SetLength(SelfNorm, Config.NumDecoderLayers);
@@ -32070,14 +32085,14 @@ begin
         // ---- (1) CAUSAL self-attention with partial RoPE ----
         BranchInput := Dec.GetLastLayer();
         SelfNorm[BlockCnt] := Dec.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         NormedSource := Dec.GetLastLayer();
         SQ[BlockCnt] := Dec.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(QWidth), NormedSource);
+          TNNetPointwiseConvLinear.Create(QWidth).MakeInferenceOnly(pInferenceOnly), NormedSource);
         SK[BlockCnt] := Dec.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+          TNNetPointwiseConvLinear.Create(KVWidth).MakeInferenceOnly(pInferenceOnly), NormedSource);
         SV[BlockCnt] := Dec.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+          TNNetPointwiseConvLinear.Create(KVWidth).MakeInferenceOnly(pInferenceOnly), NormedSource);
         for KVHeadCnt := 0 to Config.NumDecoderKVHeads - 1 do
         begin
           for d := 0 to HeadDim - 1 do
@@ -32143,20 +32158,20 @@ begin
         end;
         Dec.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         SO[BlockCnt] := Dec.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         Dec.AddLayer( TNNetSum.Create([Dec.GetLastLayer(), BranchInput]) );
 
         // ---- (2) CROSS-attention over the encoder states (NO RoPE) ----
         BranchInput := Dec.GetLastLayer();
         CrossNorm[BlockCnt] := Dec.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         NormedSource := Dec.GetLastLayer();
         CQ[BlockCnt] := Dec.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(QWidth), NormedSource);
+          TNNetPointwiseConvLinear.Create(QWidth).MakeInferenceOnly(pInferenceOnly), NormedSource);
         CK[BlockCnt] := Dec.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth), EncStates);
+          TNNetPointwiseConvLinear.Create(KVWidth).MakeInferenceOnly(pInferenceOnly), EncStates);
         CV[BlockCnt] := Dec.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth), EncStates);
+          TNNetPointwiseConvLinear.Create(KVWidth).MakeInferenceOnly(pInferenceOnly), EncStates);
         for HeadCnt := 0 to Config.NumDecoderHeads - 1 do
         begin
           KVGroup := HeadCnt div GroupSize;
@@ -32177,28 +32192,28 @@ begin
         end;
         Dec.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         CO[BlockCnt] := Dec.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         Dec.AddLayer( TNNetSum.Create([Dec.GetLastLayer(), BranchInput]) );
 
         // ---- (3) SwiGLU MLP ----
         BranchInput := Dec.GetLastLayer();
         MlpNorm[BlockCnt] := Dec.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         // fc1 packs [up | gate]; TNNetSwiGLU computes up * SiLU(gate).
         Fc1[BlockCnt] := Dec.AddLayer(
-          TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize) );
+          TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
         Dec.AddLayer( TNNetSwiGLU.Create() );
         Fc2[BlockCnt] := Dec.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         Dec.AddLayer( TNNetSum.Create([Dec.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then Dec.MakeInferenceOnly();
       end;
 
       // ---- final gain-only LayerNorm + LM head ----
       FinalNorm := Dec.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := Dec.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
 
       // ---------------- Weights ----------------
@@ -37191,10 +37206,10 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real token, not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       // Block 0's extra embedding LayerNorm ("ln0" / HF pre_ln).
       PreLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
@@ -37206,18 +37221,18 @@ begin
         // k/v/r stream - one TNNetTokenShift each.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].LN1 := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].AttShiftK := NN.AddLayer( TNNetTokenShift.Create() );
         Blocks[BlockCnt].AttKey := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.AttentionHiddenSize, 1) );
+          TNNetPointwiseConvLinear.Create(Config.AttentionHiddenSize, 1).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].AttShiftV := NN.AddLayerAfter(
           TNNetTokenShift.Create(), Blocks[BlockCnt].LN1 );
         Blocks[BlockCnt].AttValue := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.AttentionHiddenSize, 1) );
+          TNNetPointwiseConvLinear.Create(Config.AttentionHiddenSize, 1).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].AttShiftR := NN.AddLayerAfter(
           TNNetTokenShift.Create(), Blocks[BlockCnt].LN1 );
         Blocks[BlockCnt].AttRecept := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.AttentionHiddenSize, 1) );
+          TNNetPointwiseConvLinear.Create(Config.AttentionHiddenSize, 1).MakeInferenceOnly(pInferenceOnly) );
         RSig := NN.AddLayer( TNNetSigmoid.Create() );
         // k|v concatenated on the Depth axis -> the 2*C tensor TNNetWKV
         // splits (first C channels key, next C value).
@@ -37227,23 +37242,23 @@ begin
         Gated := NN.AddLayer( TNNetCellMulByCell.Create(
           RSig, Blocks[BlockCnt].WKV) );
         Blocks[BlockCnt].AttOut := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1), Gated );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).MakeInferenceOnly(pInferenceOnly), Gated );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         // ---- Channel-mix sub-block: x := x + FFN(ln2(x)) with squared-
         // ReLU keying and sigmoid receptance gating.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].LN2 := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].FFShiftK := NN.AddLayer( TNNetTokenShift.Create() );
         Blocks[BlockCnt].FFKey := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize, 1) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize, 1).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSquaredReLU.Create() );
         Blocks[BlockCnt].FFValue := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].FFShiftR := NN.AddLayerAfter(
           TNNetTokenShift.Create(), Blocks[BlockCnt].LN2 );
         Blocks[BlockCnt].FFRecept := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).MakeInferenceOnly(pInferenceOnly) );
         RSig := NN.AddLayer( TNNetSigmoid.Create() );
         Gated := NN.AddLayer( TNNetCellMulByCell.Create(
           RSig, Blocks[BlockCnt].FFValue) );
@@ -37252,9 +37267,9 @@ begin
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
@@ -37713,7 +37728,7 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real token, not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
@@ -37725,10 +37740,10 @@ begin
         // volume) and the use_bias/use_conv_bias flags.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].Norm := NN.AddLayer(
-          TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+          TNNetTokenRMSNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         // (1) in_proj to 2*d_inner, then the x|z split (x first).
         Blocks[BlockCnt].InProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(2 * Config.DInner, 1) );
+          TNNetPointwiseConvLinear.Create(2 * Config.DInner, 1).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayerAfter( TNNetSplitChannels.Create(0, Config.DInner),
           Blocks[BlockCnt].InProj );
         // (2) x path: depthwise causal conv1d + SiLU.
@@ -37747,15 +37762,15 @@ begin
         Gated := NN.AddLayer( TNNetCellMulByCell.Create(ScanL, ZGate) );
         // (5) out_proj back to hidden + residual sum.
         Blocks[BlockCnt].OutProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1), Gated );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).MakeInferenceOnly(pInferenceOnly), Gated );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
-        TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+        TNNetTokenRMSNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
@@ -38644,7 +38659,7 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
@@ -38653,10 +38668,10 @@ begin
         // x := x + out_proj( gated_norm( Mamba2(conv(x|B|C)|dt|gate) ) ).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].Norm := NN.AddLayer(
-          TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+          TNNetTokenRMSNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         // (1) in_proj -> [gate | x|B|C | dt].
         Blocks[BlockCnt].InProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(ProjSize, 1) );
+          TNNetPointwiseConvLinear.Create(ProjSize, 1).MakeInferenceOnly(pInferenceOnly) );
         // (2) x|B|C path: depthwise causal conv1d + SiLU.
         NN.AddLayerAfter(
           TNNetSplitChannels.Create(Config.DInner, ConvDim),
@@ -38676,15 +38691,15 @@ begin
           Config.NGroups, Config.LayerNormEps) );
         // (5) out_proj back to hidden + residual sum.
         Blocks[BlockCnt].OutProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
-        TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+        TNNetTokenRMSNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
@@ -39091,7 +39106,7 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
@@ -39108,25 +39123,25 @@ begin
         // ---- temporal sub-block: x := x + temporal(RMSNorm(x)) ----
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].TemporalNorm := NN.AddLayer(
-          TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly) );
         NormedSrc := NN.GetLastLayer();
         if not Blocks[BlockCnt].IsAttn then
         begin
           // RECURRENT block. y = gelu_tanh(linear_y(x));
           // x_branch = rg_lru(conv(linear_x(x)));  out = linear_out(x_branch*y).
           Blocks[BlockCnt].LinearY := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.LruWidth), NormedSrc);
+            TNNetPointwiseConvLinear.Create(Config.LruWidth).MakeInferenceOnly(pInferenceOnly), NormedSrc);
           YBranch := NN.AddLayer( TNNetGELU.Create() );
           Blocks[BlockCnt].LinearX := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.LruWidth), NormedSrc);
+            TNNetPointwiseConvLinear.Create(Config.LruWidth).MakeInferenceOnly(pInferenceOnly), NormedSrc);
           Blocks[BlockCnt].Conv := NN.AddLayer( TNNetDepthwiseConv1D.Create(
             Config.ConvKernel, {pCausal=}true, {pSuppressBias=}0) );
           ConvAct := NN.GetLastLayer();
           // The two gate logit projections (block-diagonal, full Pointwise).
           Blocks[BlockCnt].IGate := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.LruWidth), ConvAct);
+            TNNetPointwiseConvLinear.Create(Config.LruWidth).MakeInferenceOnly(pInferenceOnly), ConvAct);
           Blocks[BlockCnt].AGate := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.LruWidth), ConvAct);
+            TNNetPointwiseConvLinear.Create(Config.LruWidth).MakeInferenceOnly(pInferenceOnly), ConvAct);
           // Pack [x | i_logits | a_logits] for the RG-LRU leaf.
           PackedSlab := NN.AddLayer( TNNetDeepConcat.Create(
             [ConvAct, Blocks[BlockCnt].IGate, Blocks[BlockCnt].AGate]) );
@@ -39135,18 +39150,18 @@ begin
           Gated := NN.AddLayer( TNNetCellMulByCell.Create(
             Blocks[BlockCnt].RGLRU, YBranch) );
           Blocks[BlockCnt].LinearOut := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize), Gated);
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly), Gated);
         end
         else
         begin
           // LOCAL sliding-window GQA attention with partial rotary.
           Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(AttnD), NormedSrc);
+            TNNetPointwiseConvLinear.Create(AttnD).MakeInferenceOnly(pInferenceOnly), NormedSrc);
           Blocks[BlockCnt].KProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.NumKVHeads * Config.HeadDim),
+            TNNetPointwiseConvLinear.Create(Config.NumKVHeads * Config.HeadDim).MakeInferenceOnly(pInferenceOnly),
             NormedSrc);
           Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.NumKVHeads * Config.HeadDim),
+            TNNetPointwiseConvLinear.Create(Config.NumKVHeads * Config.HeadDim).MakeInferenceOnly(pInferenceOnly),
             NormedSrc);
           QSrc := Blocks[BlockCnt].QProj;
           KSrc := Blocks[BlockCnt].KProj;
@@ -39191,32 +39206,32 @@ begin
           end;
           NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
           Blocks[BlockCnt].OProj := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         end;
         // Residual sum (temporal).
         Residual := NN.AddLayer(
           TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         // ---- channel sub-block: x := residual + GEGLU(RMSNorm(residual)) ----
         Blocks[BlockCnt].ChannelNorm := NN.AddLayerAfter(
-          TNNetTokenRMSNorm.Create(Config.RmsNormEps), Residual);
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly), Residual);
         MlpNormed := NN.GetLastLayer();
         Blocks[BlockCnt].Gate := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(HalfFFN), MlpNormed);
+          TNNetPointwiseConvLinear.Create(HalfFFN).MakeInferenceOnly(pInferenceOnly), MlpNormed);
         GateAct := NN.AddLayer( TNNetGELU.Create() );
         Blocks[BlockCnt].Up := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(HalfFFN), MlpNormed);
+          TNNetPointwiseConvLinear.Create(HalfFFN).MakeInferenceOnly(pInferenceOnly), MlpNormed);
         UpAct := NN.GetLastLayer();
         GegluProd := NN.AddLayer( TNNetCellMulByCell.Create(GateAct, UpAct) );
         Blocks[BlockCnt].Down := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize), GegluProd);
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly), GegluProd);
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), Residual]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
-        TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+        TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if Config.LogitSoftCap > 0 then
         NN.AddLayer( TNNetSoftCapping.Create(Config.LogitSoftCap) );
       if pInferenceOnly then NN.MakeInferenceOnly();
@@ -39669,7 +39684,7 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       SetLength(Blocks, Config.NumLayers);
       SetLength(KSlices, Config.NumKVHeads);
@@ -39681,17 +39696,17 @@ begin
         // ---- mixer sub-block: x := x + Mixer(input_layernorm(x)) ----
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].InNorm := NN.AddLayer(
-          TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly) );
         NormedSrc := NN.GetLastLayer();
         if JambaLayerIsAttention(Config, BlockCnt) then
         begin
           // Bias-free GQA, NoPE. Pack [Q_h|K_g|V_g] per query head -> SDPA.
           Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(QWidth, 1), NormedSrc);
+            TNNetPointwiseConvLinear.Create(QWidth, 1).MakeInferenceOnly(pInferenceOnly), NormedSrc);
           Blocks[BlockCnt].KProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(KVWidth, 1), NormedSrc);
+            TNNetPointwiseConvLinear.Create(KVWidth, 1).MakeInferenceOnly(pInferenceOnly), NormedSrc);
           Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(KVWidth, 1), NormedSrc);
+            TNNetPointwiseConvLinear.Create(KVWidth, 1).MakeInferenceOnly(pInferenceOnly), NormedSrc);
           for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
           begin
             for d := 0 to HeadDim - 1 do
@@ -39716,7 +39731,7 @@ begin
           end;
           NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
           Blocks[BlockCnt].OProj := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).MakeInferenceOnly(pInferenceOnly) );
         end
         else
         begin
@@ -39724,7 +39739,7 @@ begin
           // causal conv1d + SiLU, the inner-norm selective scan, SiLU(z)
           // gate, out_proj.
           Blocks[BlockCnt].InProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(2 * DI, 1), NormedSrc);
+            TNNetPointwiseConvLinear.Create(2 * DI, 1).MakeInferenceOnly(pInferenceOnly), NormedSrc);
           NN.AddLayerAfter( TNNetSplitChannels.Create(0, DI),
             Blocks[BlockCnt].InProj );
           Blocks[BlockCnt].Conv := NN.AddLayer( TNNetDepthwiseConv1D.Create(
@@ -39738,14 +39753,14 @@ begin
           ZGate := NN.AddLayer( TNNetSiLU.Create() );
           Gated := NN.AddLayer( TNNetCellMulByCell.Create(ScanL, ZGate) );
           Blocks[BlockCnt].OutProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1), Gated );
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).MakeInferenceOnly(pInferenceOnly), Gated );
         end;
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
 
         // ---- FFN sub-block: x := x + FFN(pre_ff_layernorm(x)) ----
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].FfNorm := NN.AddLayer(
-          TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly) );
         NormedSrc := NN.GetLastLayer();
         if JambaLayerIsMoE(Config, BlockCnt) then
         begin
@@ -39755,18 +39770,18 @@ begin
           SetLength(Blocks[BlockCnt].ExpertDown, Config.NumExperts);
           SetLength(MoEBranches, Config.NumExperts);
           Blocks[BlockCnt].GateConv := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.NumExperts), NormedSrc);
+            TNNetPointwiseConvLinear.Create(Config.NumExperts).MakeInferenceOnly(pInferenceOnly), NormedSrc);
           NN.AddLayer( TNNetPointwiseSoftMax.Create() );
           GateTopK := NN.AddLayer( TNNetTopKGate.Create(
             Config.NumExpertsPerTok, {pRenormalize=}false) );
           for e := 0 to Config.NumExperts - 1 do
           begin
             Blocks[BlockCnt].ExpertGateUp[e] := NN.AddLayerAfter(
-              TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize),
+              TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly),
               NormedSrc);
             NN.AddLayer( TNNetSwiGLU.Create() );
             Blocks[BlockCnt].ExpertDown[e] := NN.AddLayer(
-              TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
             ExpertOut := NN.GetLastLayer();
             GateE := NN.AddLayerAfter(
               TNNetSplitChannels.Create(e, 1), GateTopK);
@@ -39781,16 +39796,16 @@ begin
         else
         begin
           Blocks[BlockCnt].GateUp := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize) );
+            TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
           NN.AddLayer( TNNetSwiGLU.Create() );
           Blocks[BlockCnt].Down := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         end;
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
       end;
-      FinalNorm := NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
-      LMHead := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      FinalNorm := NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly) );
+      LMHead := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
 
       // ---------------- Weights ----------------
@@ -40349,7 +40364,7 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       SetLength(Blocks, Config.NumLayers);
       SetLength(KSlices, Config.NumKVHeads);
@@ -40361,7 +40376,7 @@ begin
         // x := x + mixer(norm(x)).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].Norm := NN.AddLayer(
-          TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+          TNNetTokenRMSNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         NormedSrc := NN.GetLastLayer();
         case Config.BlockTypes[BlockCnt] of
           nhMamba2:
@@ -40370,7 +40385,7 @@ begin
             // [gate | x|B|C | dt] (d_mlp=0), depthwise causal conv + SiLU on
             // x|B|C, TNNetMamba2 SSD scan, out_proj.
             Blocks[BlockCnt].InProj := NN.AddLayerAfter(
-              TNNetPointwiseConvLinear.Create(ProjSize, 1), NormedSrc);
+              TNNetPointwiseConvLinear.Create(ProjSize, 1).MakeInferenceOnly(pInferenceOnly), NormedSrc);
             NN.AddLayerAfter(
               TNNetSplitChannels.Create(Config.DInner, ConvDim),
               Blocks[BlockCnt].InProj );
@@ -40387,17 +40402,17 @@ begin
               Config.MambaNumHeads, Config.MambaHeadDim, Config.StateSize,
               Config.NGroups, Config.LayerNormEps) );
             Blocks[BlockCnt].OutProj := NN.AddLayer(
-              TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).MakeInferenceOnly(pInferenceOnly) );
           end;
           nhAttention:
           begin
             // Bias-free GQA, NoPE. Pack [Q_h|K_g|V_g] per query head -> SDPA.
             Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-              TNNetPointwiseConvLinear.Create(QWidth, 1), NormedSrc);
+              TNNetPointwiseConvLinear.Create(QWidth, 1).MakeInferenceOnly(pInferenceOnly), NormedSrc);
             Blocks[BlockCnt].KProj := NN.AddLayerAfter(
-              TNNetPointwiseConvLinear.Create(KVWidth, 1), NormedSrc);
+              TNNetPointwiseConvLinear.Create(KVWidth, 1).MakeInferenceOnly(pInferenceOnly), NormedSrc);
             Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-              TNNetPointwiseConvLinear.Create(KVWidth, 1), NormedSrc);
+              TNNetPointwiseConvLinear.Create(KVWidth, 1).MakeInferenceOnly(pInferenceOnly), NormedSrc);
             for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
             begin
               for d := 0 to Config.HeadDim - 1 do
@@ -40425,19 +40440,19 @@ begin
             end;
             NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
             Blocks[BlockCnt].OProj := NN.AddLayer(
-              TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).MakeInferenceOnly(pInferenceOnly) );
           end;
           nhMLP:
           begin
             // Non-gated relu2 MLP: down(ReLU(up(x))^2). ReLU then Square =
             // ReLU(x)^2 (ACT2FN "relu2"); NO gate projection.
             Blocks[BlockCnt].UpProj := NN.AddLayerAfter(
-              TNNetPointwiseConvLinear.Create(Config.IntermediateSize, 1),
+              TNNetPointwiseConvLinear.Create(Config.IntermediateSize, 1).MakeInferenceOnly(pInferenceOnly),
               NormedSrc);
             NN.AddLayer( TNNetReLU.Create() );
             NN.AddLayer( TNNetSquare.Create() );
             Blocks[BlockCnt].DownProj := NN.AddLayer(
-              TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).MakeInferenceOnly(pInferenceOnly) );
           end;
           nhMoE:
           begin
@@ -40456,12 +40471,12 @@ begin
             if Config.NumSharedExperts > 0 then
             begin
               Blocks[BlockCnt].SharedUp := NN.AddLayerAfter(
-                TNNetPointwiseConvLinear.Create(Config.SharedExpertInterSize, 1),
+                TNNetPointwiseConvLinear.Create(Config.SharedExpertInterSize, 1).MakeInferenceOnly(pInferenceOnly),
                 NormedSrc);
               NN.AddLayer( TNNetReLU.Create() );
               NN.AddLayer( TNNetSquare.Create() );
               Blocks[BlockCnt].SharedDown := NN.AddLayer(
-                TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+                TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).MakeInferenceOnly(pInferenceOnly) );
               SharedOut := NN.GetLastLayer();
             end
             else SharedOut := nil;
@@ -40469,7 +40484,7 @@ begin
             // e_score_correction_bias) lives on a TNNetBiasBalancedTopKGate;
             // when norm_topk_prob the gate already renormalizes the survivors.
             Blocks[BlockCnt].GateConv := NN.AddLayerAfter(
-              TNNetPointwiseConvLinear.Create(Config.NumRoutedExperts, 1),
+              TNNetPointwiseConvLinear.Create(Config.NumRoutedExperts, 1).MakeInferenceOnly(pInferenceOnly),
               NormedSrc);
             NN.AddLayer( TNNetSigmoid.Create() );
             if Config.NormTopKProb then
@@ -40486,12 +40501,12 @@ begin
             for e := 0 to Config.NumRoutedExperts - 1 do
             begin
               Blocks[BlockCnt].ExpertUp[e] := NN.AddLayerAfter(
-                TNNetPointwiseConvLinear.Create(Config.MoEIntermediateSize, 1),
+                TNNetPointwiseConvLinear.Create(Config.MoEIntermediateSize, 1).MakeInferenceOnly(pInferenceOnly),
                 NormedSrc);
               NN.AddLayer( TNNetReLU.Create() );
               NN.AddLayer( TNNetSquare.Create() );
               Blocks[BlockCnt].ExpertDown[e] := NN.AddLayer(
-                TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+                TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).MakeInferenceOnly(pInferenceOnly) );
               ExpertOut := NN.GetLastLayer();
               GateE := NN.AddLayerAfter(
                 TNNetSplitChannels.Create(e, 1), GateScaled);
@@ -40510,9 +40525,9 @@ begin
         if pInferenceOnly then NN.MakeInferenceOnly();
       end;
       FinalNorm := NN.AddLayer(
-        TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+        TNNetTokenRMSNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
 
       // ---------------- Weights ----------------
@@ -40960,12 +40975,12 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real BPE token (<unk>), not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       // word_embeddings_layernorm: BLOOM normalises the embedding output
       // BEFORE the first block (no positional embedding is added - ALiBi
       // is the only position signal, inside the attention scores).
       EmbeddingLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
@@ -40976,9 +40991,9 @@ begin
         // Attention branch: dense(MHA_ALiBi(LN_1(x))).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].LN1 := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         QKVLayer := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].QKV := QKVLayer;
         for HeadCnt := 0 to Config.NumHeads - 1 do
         begin
@@ -41004,29 +41019,29 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].AttnDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         // Sequential pre-LN residuals (apply_residual_connection_post_
         // layernorm=false, the released form):
         //   x := x + Attn(LN_1(x)); x := x + MLP(LN_2(x))
         AttnOut := NN.AddLayer(
           TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         Blocks[BlockCnt].LN2 := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].HTo4H := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
         // BLOOM's Megatron GELU is the tanh approximation
         // x*0.5*(1+tanh(0.79788456*x*(1+0.044715*x^2))) = TNNetGELU.
         NN.AddLayer( TNNetGELU.Create() );
         Blocks[BlockCnt].FourHToH := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), AttnOut]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
@@ -41528,7 +41543,7 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
@@ -41547,22 +41562,22 @@ begin
         if Config.TwoLayerNorms then
         begin
           Blocks[BlockCnt].LNAttn := NN.AddLayerAfter(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps), BranchInput);
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), BranchInput);
           AttnSource := Blocks[BlockCnt].LNAttn;
           Blocks[BlockCnt].LNMlp := NN.AddLayerAfter(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps), BranchInput);
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), BranchInput);
           MlpSource := Blocks[BlockCnt].LNMlp;
         end
         else
         begin
           Blocks[BlockCnt].LNAttn := NN.AddLayerAfter(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps), BranchInput);
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), BranchInput);
           AttnSource := Blocks[BlockCnt].LNAttn;
           MlpSource := Blocks[BlockCnt].LNAttn; // shared (set below if seq.)
         end;
         // ---- attention branch: dense(GQA-RoPE(ln(x))) ----
         QKVLayer := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(QWidth + 2 * KVWidth), AttnSource);
+          TNNetPointwiseConvLinear.Create(QWidth + 2 * KVWidth).MakeInferenceOnly(pInferenceOnly), AttnSource);
         Blocks[BlockCnt].QKV := QKVLayer;
         QSource := QKVLayer;
         KSource := QKVLayer;
@@ -41599,7 +41614,7 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].AttnDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         AttnOut := NN.GetLastLayer();
         if not Config.ParallelAttn then
         begin
@@ -41609,15 +41624,15 @@ begin
           // x := x + MLP(ln2(x)).
           AttnOut := NN.AddLayer( TNNetSum.Create([AttnOut, BranchInput]) );
           Blocks[BlockCnt].LNPostAttn := NN.AddLayer(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
           MlpSource := Blocks[BlockCnt].LNPostAttn;
         end;
         // ---- MLP branch: dense_4h_to_h(gelu(dense_h_to_4h(ln(x)))) ----
         Blocks[BlockCnt].HTo4H := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize), MlpSource);
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly), MlpSource);
         AddExactGELU;
         Blocks[BlockCnt].FourHToH := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         MlpOut := NN.GetLastLayer();
         if Config.ParallelAttn then
           // PARALLEL: x := x + Attn(ln(x)) + MLP(ln(x)). One fused 3-input
@@ -41630,9 +41645,9 @@ begin
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
@@ -42195,12 +42210,12 @@ begin
       // EncodeZero=1: token id 0 is a real BPE token, not padding (the
       // ModernBERT [PAD] sits at id 50283).
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       // embeddings.norm right after the table - ModernBERT has NO position
       // embeddings at all (RoPE inside attention is the only position
       // signal).
       EmbeddingNorm := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.NormEps) );
+        TNNetTokenLayerNorm.Create(Config.NormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
@@ -42239,13 +42254,13 @@ begin
         else
         begin
           Blocks[BlockCnt].AttnNorm := NN.AddLayer(
-            TNNetTokenLayerNorm.Create(Config.NormEps) );
+            TNNetTokenLayerNorm.Create(Config.NormEps).MakeInferenceOnly(pInferenceOnly) );
           NormedSource := NN.GetLastLayer();
         end;
         // ONE fused Wqkv slab (q|k|v whole thirds after the load-time
         // rotate_half permutation; see LoadModernBertQKVWeights).
         Blocks[BlockCnt].QKV := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize),
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).MakeInferenceOnly(pInferenceOnly),
           NormedSource);
         for HeadCnt := 0 to Config.NumHeads - 1 do
         begin
@@ -42279,15 +42294,15 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].AttnWo := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         // PRE-LN GeGLU MLP residual: x := x + Wo(act(input) * gate),
         // input|gate = Wi(mlp_norm(x)).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].MlpNorm := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.NormEps) );
+          TNNetTokenLayerNorm.Create(Config.NormEps).MakeInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].Wi := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize) );
+          TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
         // hidden_activation "gelu" is the EXACT erf GELU (TNNetGEGLUErf);
         // "gelu_pytorch_tanh" the tanh approximation (TNNetGEGLU). Both
         // compute FIRSTHALF * act(SECONDHALF) - the loader swapped the HF
@@ -42297,7 +42312,7 @@ begin
         else
           NN.AddLayer( TNNetGEGLUErf.Create() );
         Blocks[BlockCnt].MlpWo := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
@@ -42305,7 +42320,7 @@ begin
       // final_norm; the output IS the (SeqLen,1,hidden) hidden states (HF
       // ModernBertModel last_hidden_state) - no LM/pooler head.
       FinalNorm := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.NormEps) );
+        TNNetTokenLayerNorm.Create(Config.NormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
@@ -42773,7 +42788,7 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real token, not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
@@ -42786,20 +42801,20 @@ begin
         // checkpoint's kv_a_layernorm RMSNorm inserted on the latent c_KV.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].AttnNorm :=
-          NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+          NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly) );
         NormedSource := NN.GetLastLayer();
         // q_proj content/rope split (the per-head [q_nope|q_rope] row
         // packing is undone at LOAD time; see LoadRows).
         Blocks[BlockCnt].QContent := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.NumHeads * dn),
+          TNNetPointwiseConvLinear.Create(Config.NumHeads * dn).MakeInferenceOnly(pInferenceOnly),
           NormedSource);
         Blocks[BlockCnt].QRope := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.NumHeads * dr),
+          TNNetPointwiseConvLinear.Create(Config.NumHeads * dr).MakeInferenceOnly(pInferenceOnly),
           NormedSource);
         // kv_a_proj_with_mqa = [c_KV(r) | k_rope(dr)]: the latent down-
         // projection + ONE shared rope-K projection, both from x.
         Blocks[BlockCnt].CKV := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(LatentRank), NormedSource);
+          TNNetPointwiseConvLinear.Create(LatentRank).MakeInferenceOnly(pInferenceOnly), NormedSource);
         // kv_a_layernorm: the latent RMSNorm (only c_KV is normalized,
         // never the rope slice - the HF ordering). NOTE the eps: HF
         // constructs DeepseekV2RMSNorm(kv_lora_rank) WITHOUT an eps
@@ -42807,18 +42822,18 @@ begin
         // config.rms_norm_eps like every other norm (a real, measurable
         // parity difference at rms_norm_eps=1e-5).
         Blocks[BlockCnt].LatentNorm := NN.AddLayerAfter(
-          TNNetTokenRMSNorm.Create(1.0e-6), Blocks[BlockCnt].CKV);
+          TNNetTokenRMSNorm.Create(1.0e-6).MakeInferenceOnly(pInferenceOnly), Blocks[BlockCnt].CKV);
         // kv_b_proj = per-head [k_nope|v] up-projections from the latent.
         Blocks[BlockCnt].KContent := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.NumHeads * dn),
+          TNNetPointwiseConvLinear.Create(Config.NumHeads * dn).MakeInferenceOnly(pInferenceOnly),
           Blocks[BlockCnt].LatentNorm);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.NumHeads * dv),
+          TNNetPointwiseConvLinear.Create(Config.NumHeads * dv).MakeInferenceOnly(pInferenceOnly),
           Blocks[BlockCnt].LatentNorm);
         // Shared rope-K: projected from x, rotated ONCE, shared by every
         // head (the paper's w_KR; per-token decode state grows by only dr).
         Blocks[BlockCnt].KRope := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(dr), NormedSource);
+          TNNetPointwiseConvLinear.Create(dr).MakeInferenceOnly(pInferenceOnly), NormedSource);
         KRopeRot := NN.AddLayerAfter(
           CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling),
           Blocks[BlockCnt].KRope);
@@ -42861,24 +42876,24 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].OProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         // ---- MLP sub-block: dense SwiGLU (BlockCnt < ----
         // first_k_dense_replace) or DeepSeekMoE (the AddDeepSeekMoE wiring
         // with SwiGLU experts; shared experts bypass the router).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].MlpNorm :=
-          NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+          NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly) );
         if not LayerIsMoE then
         begin
           // Dense path: TNNetSwiGLU computes FIRSTHALF * act(SECONDHALF),
           // so the fused projection holds up_proj in neurons 0..I-1 and
           // gate_proj in neurons I..2I-1 (the Llama-path convention).
           Blocks[BlockCnt].GateUp := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize) );
+            TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
           NN.AddLayer( TNNetSwiGLU.Create() );
           Blocks[BlockCnt].Down := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
         end
         else
         begin
@@ -42894,7 +42909,7 @@ begin
           // norm_topk_prob=false (DeepSeek-V2/-Lite) keeps the RAW softmax
           // weights of the survivors (pRenormalize=false).
           Blocks[BlockCnt].GateConv := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.NRoutedExperts),
+            TNNetPointwiseConvLinear.Create(Config.NRoutedExperts).MakeInferenceOnly(pInferenceOnly),
             MoESource);
           NN.AddLayer( TNNetPointwiseSoftMax.Create() );
           GateTopK := NN.AddLayer( TNNetTopKGate.Create(
@@ -42904,10 +42919,10 @@ begin
           begin
             Blocks[BlockCnt].ExpertGateUp[ExpertCnt] := NN.AddLayerAfter(
               TNNetPointwiseConvLinear.Create(
-                2 * Config.MoEIntermediateSize), MoESource);
+                2 * Config.MoEIntermediateSize).MakeInferenceOnly(pInferenceOnly), MoESource);
             NN.AddLayer( TNNetSwiGLU.Create() );
             Blocks[BlockCnt].ExpertDown[ExpertCnt] := NN.AddLayer(
-              TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
             ExpertOut := NN.GetLastLayer();
             // Slice this expert's gate weight g[e], broadcast across
             // d_model and cell-multiply in (the AddDeepSeekMoE combine).
@@ -42926,10 +42941,10 @@ begin
             SharedWidth :=
               Config.NSharedExperts * Config.MoEIntermediateSize;
             Blocks[BlockCnt].SharedGateUp := NN.AddLayerAfter(
-              TNNetPointwiseConvLinear.Create(2 * SharedWidth), MoESource);
+              TNNetPointwiseConvLinear.Create(2 * SharedWidth).MakeInferenceOnly(pInferenceOnly), MoESource);
             NN.AddLayer( TNNetSwiGLU.Create() );
             Blocks[BlockCnt].SharedDown := NN.AddLayer(
-              TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
             MoEBranches[Config.NRoutedExperts] := NN.GetLastLayer();
           end;
           // y = Sum_s Shared_s(x) + Sum_e g[e] * Routed_e(x).
@@ -42941,9 +42956,9 @@ begin
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
-        TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+        TNNetTokenRMSNorm.Create(Config.RmsNormEps).MakeInferenceOnly(pInferenceOnly) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
@@ -43257,20 +43272,20 @@ var
 begin
   BranchInput := NN.GetLastLayer();
   Block.LN1 := NN.AddLayer(
-    TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+    TNNetTokenLayerNorm.Create(Tower.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
   Block.QKV := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(3 * Tower.HiddenSize) );
+    TNNetPointwiseConvLinear.Create(3 * Tower.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
   Block.AttnDense := NN.AddMultiHeadSelfAttention(Tower.NumHeads,
     CausalMask);
   NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
   BranchInput := NN.GetLastLayer();
   Block.LN2 := NN.AddLayer(
-    TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+    TNNetTokenLayerNorm.Create(Tower.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
   Block.Inter := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(Tower.IntermediateSize) );
+    TNNetPointwiseConvLinear.Create(Tower.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
   AddClipHiddenAct(NN, Tower.HiddenAct);
   Block.OutDense := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(Tower.HiddenSize) );
+    TNNetPointwiseConvLinear.Create(Tower.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
   NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
   if pInferenceOnly then NN.MakeInferenceOnly();
 end;
@@ -43426,7 +43441,7 @@ begin
     // -> a (Grid, Grid, hidden) patch grid ...
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
       Tower.HiddenSize, PatchSize, {pInputPadding=}0, {pStride=}PatchSize,
-      {pSuppressBias=}1) );
+      {pSuppressBias=}1).MakeInferenceOnly(pInferenceOnly) );
     // ... flattened row-major (the volume layout IS row-major over (y,x),
     // exactly HF's flatten(2).transpose(1,2) patch order) ...
     NN.AddLayer( TNNetReshape.Create(NumPatches, 1, Tower.HiddenSize) );
@@ -43437,9 +43452,9 @@ begin
     NN.AddLayer( TNNetPadXY.Create(1, 0) );
     NN.AddLayer( TNNetCrop.Create(0, 0, NumPatches + 1, 1) );
     PosEmb := NN.AddLayer(
-      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1) );
+      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1).MakeInferenceOnly(pInferenceOnly) );
     PreLN := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+      TNNetTokenLayerNorm.Create(Tower.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
     // LLaVA's vision feature is the penultimate hidden state
     // (output_hidden_states[-2]) WITHOUT the CLS row and WITHOUT
@@ -43469,10 +43484,10 @@ begin
       // HF applies post_layernorm (and the projection) only to the pooled
       // class token; applying them PER TOKEN is exact for row 0.
       PostLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Tower.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if ProjectionTensorName <> '' then
         Proj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(ProjectionDim) );
+          TNNetPointwiseConvLinear.Create(ProjectionDim).MakeInferenceOnly(pInferenceOnly) );
     end;
     if pInferenceOnly then NN.MakeInferenceOnly();
 
@@ -43560,20 +43575,20 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen, 1, 1) );
       // EncodeZero=1: token id 0 (<|startoftext|>) is a REAL vocab row.
       TokEmb := NN.AddLayer( TNNetEmbedding.Create(
-        Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1) );
+        Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       PosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions) );
+        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       SetLength(Blocks, Config.Text.NumLayers);
       for BlockCnt := 0 to Config.Text.NumLayers - 1 do
         AddClipEncoderBlock(NN, Config.Text, {CausalMask=}true,
           Blocks[BlockCnt], pInferenceOnly);
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       // text_projection applied PER TOKEN; HF's text_embeds is the row at
       // the eot position (ClipTextEosPosition).
       Proj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.ProjectionDim) );
+        TNNetPointwiseConvLinear.Create(Config.ProjectionDim).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
 
       // ---------------- TEXT tower weights ----------------
@@ -44220,7 +44235,7 @@ begin
     // BIASED patch embedding: kernel = stride = patch_size, no padding.
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
       d, Config.PatchSize, {pInputPadding=}0, {pStride=}Config.PatchSize,
-      {pSuppressBias=}0) );
+      {pSuppressBias=}0).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
     // Prepend a ZERO class-token slot (PadXY pads both ends; Crop drops the
     // right pad). class_embedding folds into position row 0 - exact, since the
@@ -44228,14 +44243,14 @@ begin
     NN.AddLayer( TNNetPadXY.Create(1, 0) );
     NN.AddLayer( TNNetCrop.Create(0, 0, NumPatches + 1, 1) );
     PosEmb := NN.AddLayer(
-      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1) );
+      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
     SetLength(Blocks, Config.Vision.NumLayers);
     for BlockCnt := 0 to Config.Vision.NumLayers - 1 do
       AddClipEncoderBlock(NN, Config.Vision, {CausalMask=}false,
         Blocks[BlockCnt], pInferenceOnly);
     // post_layernorm over every token (HF applies it to last_hidden_state).
-    PostLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Vision.LayerNormEps) );
+    PostLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Vision.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // -------- weights --------
@@ -44375,11 +44390,11 @@ begin
         TNNetInput.Create(NumVisTokens, 1, Config.Vision.HiddenSize) );
       // Token branch: word_embeddings + position_embeddings, then LayerNorm.
       NN.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, d, {EncodeZero=}1), TokInput );
+        Config.VocabSize, d, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly), TokInput );
       WordEmb := NN.GetLastLayer();
       PosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions) );
-      EmbLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+        TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions).MakeInferenceOnly(pInferenceOnly) );
+      EmbLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
 
       SetLength(Blocks, Config.Text.NumLayers);
@@ -44390,11 +44405,11 @@ begin
         // ---- causal self-attention (residual add, THEN LayerNorm) ----
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].SelfAttn.QProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(d), BranchInput);
+          TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly), BranchInput);
         Blocks[BlockCnt].SelfAttn.KProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(d), BranchInput);
+          TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly), BranchInput);
         Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(d), BranchInput);
+          TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly), BranchInput);
         for HeadCnt := 0 to Config.Text.NumHeads - 1 do
         begin
           for dd := 0 to HeadDim - 1 do
@@ -44412,19 +44427,19 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(Heads) );
         Blocks[BlockCnt].SelfAttn.OProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(d) );
+          TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         Blocks[BlockCnt].SelfAttn.Norm := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
 
         // ---- cross-attention to the image features (no causal mask) ----
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].CrossAttn.QProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(d), BranchInput);
+          TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly), BranchInput);
         Blocks[BlockCnt].CrossAttn.KProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(d), EncStates);
+          TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly), EncStates);
         Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(d), EncStates);
+          TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly), EncStates);
         for HeadCnt := 0 to Config.Text.NumHeads - 1 do
         begin
           for dd := 0 to HeadDim - 1 do
@@ -44442,30 +44457,30 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(Heads) );
         Blocks[BlockCnt].CrossAttn.OProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(d) );
+          TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         Blocks[BlockCnt].CrossAttn.Norm := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
 
         // ---- FFN: output.dense(GELU(intermediate.dense(x))), then LN ----
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].Inter := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.Text.IntermediateSize) );
+          TNNetPointwiseConvLinear.Create(Config.Text.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
         AddClipHiddenAct(NN, Config.Text.HiddenAct);
         Blocks[BlockCnt].OutDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(d) );
+          TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         Blocks[BlockCnt].OutNorm := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+          TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         if pInferenceOnly then NN.MakeInferenceOnly();
       end;
 
       // ---- LM prediction head: transform = LN(GELU(dense(x))), then decoder.
-      HeadDense := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+      HeadDense := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly) );
       AddClipHiddenAct(NN, Config.Text.HiddenAct);
-      HeadLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+      HeadLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       HeadDecoder := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
 
       // ---------------- TEXT decoder weights ----------------
@@ -44843,7 +44858,7 @@ begin
     // BIASED patch embedding: kernel = stride = patch_size, no padding.
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
       Tower.HiddenSize, Config.PatchSize, {pInputPadding=}0,
-      {pStride=}Config.PatchSize, {pSuppressBias=}0) );
+      {pStride=}Config.PatchSize, {pSuppressBias=}0).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetReshape.Create(NumPatches, 1, Tower.HiddenSize) );
     // Prepend TWO zero slots (cls + distillation); both fold into position
     // rows 0 and 1 - exact, since the pre-position content of those slots is
@@ -44851,14 +44866,14 @@ begin
     NN.AddLayer( TNNetPadXY.Create(2, 0) );
     NN.AddLayer( TNNetCrop.Create(0, 0, NumTokens, 1) );
     PosEmb := NN.AddLayer(
-      TNNetLearnedPositionalEmbedding.Create(NumTokens) );
+      TNNetLearnedPositionalEmbedding.Create(NumTokens).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
     SetLength(Blocks, Tower.NumLayers);
     for BlockCnt := 0 to Tower.NumLayers - 1 do
       AddClipEncoderBlock(NN, Tower, {CausalMask=}false, Blocks[BlockCnt],
         pInferenceOnly);
     // final layernorm over every token (HF applies it to last_hidden_state).
-    FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+    FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // -------- weights --------
@@ -45017,17 +45032,17 @@ begin
       EncStates := Dec.AddLayerAfter(
         TNNetInput.Create(NumTokens, 1, Config.DModel, 1), 0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly), DecTokenInput);
       DecPos := Dec.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(SeqLen) );
+        TNNetLearnedPositionalEmbedding.Create(SeqLen).MakeInferenceOnly(pInferenceOnly) );
       DecEmbLN := Dec.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.DecLayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.DecLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
       BuildBartStackBlocks(Dec, BartShim, Config.DecLayers, Config.DecHeads,
         Config.DecFFNDim, {IsDecoder=}true, EncStates, DecBlocks,
         pInferenceOnly);
       LMHead := Dec.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
 
       // ---------------- DECODER weights ----------------
@@ -45244,20 +45259,20 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen, 1, 1) );
       TokEmb := NN.AddLayer( TNNetEmbedding.Create(
-        Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1) );
+        Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       PosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions) );
+        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       SetLength(Blocks, Config.Text.NumLayers);
       for BlockCnt := 0 to Config.Text.NumLayers - 1 do
         AddClipEncoderBlock(NN, Config.Text, {CausalMask=}true,
           Blocks[BlockCnt], pInferenceOnly);
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       // text_projection applied PER TOKEN (bias-free); the query embedding is
       // the argmax-pooled row, L2-normalized in OwlViTQueryEmbedding.
       TextProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.ProjectionDim) );
+        TNNetPointwiseConvLinear.Create(Config.ProjectionDim).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
 
       LoadClipEmbeddingTable(Reader, TokEmb,
@@ -45298,22 +45313,22 @@ begin
       Merged := NN.AddLayer(
         TNNetChannelMulByLayer.Create(PatchRows, ClsRow) );
       MergeLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.Vision.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.Vision.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
 
       // class head: dense0 (hidden -> text_dim), plus logit_shift/scale (->1).
       Dense0 := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(TextDim, 0), MergeLN);
+        TNNetPointwiseConvLinear.Create(TextDim, 0).MakeInferenceOnly(pInferenceOnly), MergeLN);
       LogitShift := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(1, 0), MergeLN);
+        TNNetPointwiseConvLinear.Create(1, 0).MakeInferenceOnly(pInferenceOnly), MergeLN);
       LogitScale := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(1, 0), MergeLN);
+        TNNetPointwiseConvLinear.Create(1, 0).MakeInferenceOnly(pInferenceOnly), MergeLN);
       // box head: dense0 -> gelu -> dense1 -> gelu -> dense2(4).
       Box0 := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(VisHidden, 0), MergeLN);
+        TNNetPointwiseConvLinear.Create(VisHidden, 0).MakeInferenceOnly(pInferenceOnly), MergeLN);
       NN.AddLayer( TNNetGELUErf.Create() );
-      Box1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(VisHidden, 0) );
+      Box1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(VisHidden, 0).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetGELUErf.Create() );
-      Box2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(4, 0) );
+      Box2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(4, 0).MakeInferenceOnly(pInferenceOnly) );
       // concat [ image_class_embeds | logit_shift | logit_scale_raw | box_raw ]
       NN.AddLayer( TNNetDeepConcat.Create([Dense0, LogitShift, LogitScale,
         Box2]) );
@@ -45632,12 +45647,12 @@ begin
     // BIASED patch embedding (unlike CLIP): kernel = stride = patch_size.
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
       d, PatchSize, {pInputPadding=}0, {pStride=}PatchSize,
-      {pSuppressBias=}0) );
+      {pSuppressBias=}0).MakeInferenceOnly(pInferenceOnly) );
     // Row-major (y,x) patch grid = HF flatten(2).transpose order. NO class
     // token (unlike CLIP): the position table covers exactly NumPatches rows.
     NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
     PosEmb := NN.AddLayer(
-      TNNetLearnedPositionalEmbedding.Create(NumPatches) );
+      TNNetLearnedPositionalEmbedding.Create(NumPatches).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
     // SigLIP's vision encoder is a PRENORM stack like CLIP but WITHOUT a
     // pre_layrnorm before block 0. In LLaVA/VLM feature mode a positive
@@ -45660,13 +45675,13 @@ begin
       // post_layernorm (HF last_hidden_state); a selected earlier layer is
       // returned RAW (HF hidden_states[N] is pre-post_layernorm).
       if SelectHiddenLayer <= 0 then
-        PostLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+        PostLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     end
     else
     begin
       // Inference embedding path: post_layernorm over every patch token,
       // then the Multihead Attention Pooling (MAP) head.
-      PostLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+      PostLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       PatchKV := NN.GetLastLayer();    // (NumPatches,1,d) K/V source
       // The learnable probe (one virtual query token) prepended to the patch
       // sequence by TNNetSoftPrompt; we then crop it back out as the query.
@@ -45678,11 +45693,11 @@ begin
       // so the per-head Q/K/V projections can be loaded from nn.Multihead
       // Attention's packed in_proj_weight [3d, d].
       MapQProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(d), ProbeQ);
+        TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly), ProbeQ);
       MapKProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(d), PatchKV);
+        TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly), PatchKV);
       MapVProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(d), PatchKV);
+        TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly), PatchKV);
       SetLength(HeadOutputs, Tower.NumHeads);
       SetLength(Channels, dk);
       for HeadCnt := 0 to Tower.NumHeads - 1 do
@@ -45699,16 +45714,16 @@ begin
           TNNetCrossAttention.Create(dk, {CausalMask=}false, KVPack), QSlice);
       end;
       NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
-      MapOut := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+      MapOut := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly) );
       SetLength(HeadOutputs, 0);
       SetLength(Channels, 0);
       // residual = attn; out = residual + mlp(layernorm(attn)); take row 0.
       AttnSum := MapOut;
-      MapLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+      MapLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       MapInter := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Tower.IntermediateSize) );
+        TNNetPointwiseConvLinear.Create(Tower.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
       AddClipHiddenAct(NN, Tower.HiddenAct);
-      MapFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+      MapFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly) );
       MlpSum := NN.AddLayer( TNNetSum.Create([MapFc2, AttnSum]) );
       // The pooled output is row 0 (the single probe row); already (1,1,d).
       if MlpSum = nil then ;  // (silence unused warning paths)
@@ -45831,9 +45846,9 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen, 1, 1) );
       TokEmb := NN.AddLayer( TNNetEmbedding.Create(
-        Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1) );
+        Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1).MakeInferenceOnly(pInferenceOnly) );
       PosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions) );
+        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
       SetLength(Blocks, Config.Text.NumLayers);
       // BIDIRECTIONAL (no causal mask), unlike CLIP's text tower.
@@ -45841,11 +45856,11 @@ begin
         AddClipEncoderBlock(NN, Config.Text, {CausalMask=}false,
           Blocks[BlockCnt], pInferenceOnly);
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       // BIASED head nn.Linear applied PER TOKEN; HF's text_embeds is the row
       // at the LAST position (SigLIPExtractEmbedding: TokenPos = SeqLen-1).
       Head := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.ProjectionDim) );
+        TNNetPointwiseConvLinear.Create(Config.ProjectionDim).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
 
       // ---------------- TEXT tower weights ----------------
@@ -46125,7 +46140,7 @@ begin
     // = HF flatten(2).transpose(1,2) patch order.
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
       d, Config.PatchSize, {pInputPadding=}0, {pStride=}Config.PatchSize,
-      {pSuppressBias=}0) );
+      {pSuppressBias=}0).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
     // Prepend one ZERO row as the CLS-token slot (PadXY pads both ends;
     // Crop drops the right pad). cls_token is folded into row 0 of the
@@ -46133,18 +46148,18 @@ begin
     NN.AddLayer( TNNetPadXY.Create(1, 0) );
     NN.AddLayer( TNNetCrop.Create(0, 0, NumPatches + 1, 1) );
     PosEmb := NN.AddLayer(
-      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1) );
+      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
     SetLength(Blocks, Config.NumLayers);
     for BlockCnt := 0 to Config.NumLayers - 1 do
       AddClipEncoderBlock(NN, Tower, {CausalMask=}false,
         Blocks[BlockCnt], pInferenceOnly);
     // Final layernorm over every token (exact for the CLS row 0 we read).
-    FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+    FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     // Keep only the CLS row (row 0) -> (1,1,hidden), then the classifier.
     NN.AddLayer( TNNetCrop.Create({StartX=}0, {StartY=}0, {LenX=}1, {LenY=}1) );
     Classifier := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.NumLabels) );
+      TNNetPointwiseConvLinear.Create(Config.NumLabels).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // ---------------- Weights ----------------
@@ -46548,7 +46563,7 @@ begin
       Config.NumChannels) );
     // Stem: conv 7x7 stride2 pad3 (+folded BN bias) -> relu -> maxpool.
     StemConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-      Config.StemWidth, 7, {pad=}3, {stride=}2, {suppressBias=}0) );
+      Config.StemWidth, 7, {pad=}3, {stride=}2, {suppressBias=}0).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetReLU.Create() );
     NN.AddLayer( TNNetMaxPool.Create({pool=}3, {stride=}2, {pad=}1) );
     RefCount := 0;
@@ -46581,7 +46596,7 @@ begin
     end;
     // Head: global average pool over the spatial grid -> fc -> logits.
     NN.AddLayer( TNNetAvgChannel.Create() );
-    FC := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels) );
+    FC := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // ---------------- Weights ----------------
@@ -46971,8 +46986,8 @@ begin
       Config.NumChannels));
     // Stem: patchify conv (PxP stride P, biased) -> channel LayerNorm.
     StemConv := NN.AddLayer(TNNetConvolutionLinear.Create(
-      Config.Dims[0], Config.PatchSize, 0, Config.PatchSize, 0));
-    StemLN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+      Config.Dims[0], Config.PatchSize, 0, Config.PatchSize, 0).MakeInferenceOnly(pInferenceOnly));
+    StemLN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly));
     RefCount := 0;
     InDim := Config.Dims[0];
     for Stage := 0 to 3 do
@@ -46983,9 +46998,9 @@ begin
       if Stage > 0 then
       begin
         DownLN[Stage] := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly));
         DownConv[Stage] := NN.AddLayer(
-          TNNetConvolutionLinear.Create(Dim, 2, 0, 2, 0));
+          TNNetConvolutionLinear.Create(Dim, 2, 0, 2, 0).MakeInferenceOnly(pInferenceOnly));
       end;
       for BlockIdx := 0 to Config.Depths[Stage] - 1 do
       begin
@@ -46996,8 +47011,8 @@ begin
     end;
     // Head: global average pool over spatial grid -> channel LayerNorm -> fc.
     NN.AddLayer(TNNetAvgChannel.Create());
-    HeadLN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
-    FC := NN.AddLayer(TNNetFullConnectLinear.Create(Config.NumLabels));
+    HeadLN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly));
+    FC := NN.AddLayer(TNNetFullConnectLinear.Create(Config.NumLabels).MakeInferenceOnly(pInferenceOnly));
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // ---------------- Weights ----------------
@@ -47435,15 +47450,15 @@ begin
       // Overlap-patch embed: KxK stride S pad K div 2, biased.
       Stages[Stage].PatchConv := NN.AddLayer(TNNetConvolutionLinear.Create(
         C, Config.PatchSizes[Stage], Config.PatchSizes[Stage] div 2,
-        Config.Strides[Stage], 0));
+        Config.Strides[Stage], 0).MakeInferenceOnly(pInferenceOnly));
       Stages[Stage].PatchLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly));
       SetLength(Stages[Stage].Blocks, Config.Depths[Stage]);
       for BlockIdx := 0 to Config.Depths[Stage] - 1 do
         AddSegformerBlock(NN, Config, Stage, GW[Stage], GH[Stage],
           Stages[Stage].Blocks[BlockIdx]);
       Stages[Stage].StageLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly));
       StageOut[Stage] := NN.GetLastLayer();
       InC := C;
     end;
@@ -47452,7 +47467,7 @@ begin
     begin
       // per-token Linear to decoder dim, then bilinear-upsample to stage-0 grid.
       ProjLinear[Stage] := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DecoderHiddenSize),
+        TNNetPointwiseConvLinear.Create(Config.DecoderHiddenSize).MakeInferenceOnly(pInferenceOnly),
         StageOut[Stage]);
       Projected[Stage] := ProjLinear[Stage];
       Factor := GW[0] div GW[Stage];
@@ -47464,12 +47479,12 @@ begin
       [Projected[3], Projected[2], Projected[1], Projected[0]]));
     // linear_fuse 1x1 conv (4*decoder -> decoder, biased), BN, ReLU, classifier.
     FuseConv := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DecoderHiddenSize));
+      TNNetPointwiseConvLinear.Create(Config.DecoderHiddenSize).MakeInferenceOnly(pInferenceOnly));
     BNScale := NN.AddLayer(TNNetChannelMul.Create());
     BNShift := NN.AddLayer(TNNetChannelBias.Create());
     NN.AddLayer(TNNetReLU.Create());
     Classifier := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.NumLabels));
+      TNNetPointwiseConvLinear.Create(Config.NumLabels).MakeInferenceOnly(pInferenceOnly));
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // ---------------- Weights ----------------
@@ -47837,13 +47852,13 @@ begin
     // (Conv2d_1a..4a + maxpools) is a documented follow-up; the multi-branch
     // modules are what is exercised here.
     StemConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-      Config.StemWidth, 3, {pad=}1, {stride=}1, {suppressBias=}0) );
+      Config.StemWidth, 3, {pad=}1, {stride=}1, {suppressBias=}0).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetReLU.Create() );
     for m := 0 to Config.NumModules - 1 do
       AddInceptionAModule(NN, Config, ModRefs[m]);
     // Head: global average pool (the FID pooled-feature tap) -> fc.
     PoolFeatureIdx := NN.AddLayer( TNNetAvgChannel.Create() ).LayerIdx;
-    FC := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels) );
+    FC := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // ---------------- Weights ----------------
@@ -48212,7 +48227,7 @@ begin
       Config.NumChannels));
     // Stem: conv 3x3 stride2 pad1 (+folded BN bias) -> hard-swish.
     StemConv := NN.AddLayer(TNNetConvolutionLinear.Create(
-      Config.StemWidth, 3, {pad=}1, {stride=}2, {suppressBias=}0));
+      Config.StemWidth, 3, {pad=}1, {stride=}2, {suppressBias=}0).MakeInferenceOnly(pInferenceOnly));
     NN.AddLayer(TNNetHardSwish.Create());
     InChannels := Config.StemWidth;
     for i := 0 to High(Config.Blocks) do
@@ -48223,12 +48238,12 @@ begin
     // Head: conv 1x1 +BN +hard-swish -> global avg pool -> Linear -> hard-swish
     //       -> Linear(num_labels).
     HeadConv := NN.AddLayer(TNNetConvolutionLinear.Create(
-      Config.HeadConvWidth, 1, 0, 1, 0));
+      Config.HeadConvWidth, 1, 0, 1, 0).MakeInferenceOnly(pInferenceOnly));
     NN.AddLayer(TNNetHardSwish.Create());
     NN.AddLayer(TNNetAvgChannel.Create());
-    FC0 := NN.AddLayer(TNNetFullConnectLinear.Create(Config.ClassifierHidden));
+    FC0 := NN.AddLayer(TNNetFullConnectLinear.Create(Config.ClassifierHidden).MakeInferenceOnly(pInferenceOnly));
     NN.AddLayer(TNNetHardSwish.Create());
-    FC1 := NN.AddLayer(TNNetFullConnectLinear.Create(Config.NumLabels));
+    FC1 := NN.AddLayer(TNNetFullConnectLinear.Create(Config.NumLabels).MakeInferenceOnly(pInferenceOnly));
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // ---------------- Weights ----------------
@@ -48506,7 +48521,7 @@ begin
       Config.NumChannels));
     // Stem: conv 3x3 stride2 pad1 (+folded BN bias) -> SiLU.
     StemConv := NN.AddLayer(TNNetConvolutionLinear.Create(
-      Config.StemWidth, 3, {pad=}1, {stride=}2, {suppressBias=}0));
+      Config.StemWidth, 3, {pad=}1, {stride=}2, {suppressBias=}0).MakeInferenceOnly(pInferenceOnly));
     NN.AddLayer(TNNetSwish.Create());
     InChannels := Config.StemWidth;
     for i := 0 to High(Config.Blocks) do
@@ -48516,10 +48531,10 @@ begin
     end;
     // Head: conv 1x1 +BN +SiLU -> global avg pool -> Linear(num_labels).
     HeadConv := NN.AddLayer(TNNetConvolutionLinear.Create(
-      Config.HeadConvWidth, 1, 0, 1, 0));
+      Config.HeadConvWidth, 1, 0, 1, 0).MakeInferenceOnly(pInferenceOnly));
     NN.AddLayer(TNNetSwish.Create());
     NN.AddLayer(TNNetAvgChannel.Create());
-    FC := NN.AddLayer(TNNetFullConnectLinear.Create(Config.NumLabels));
+    FC := NN.AddLayer(TNNetFullConnectLinear.Create(Config.NumLabels).MakeInferenceOnly(pInferenceOnly));
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // ---------------- Weights ----------------
@@ -48915,11 +48930,11 @@ begin
     NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
       Config.NumChannels) );
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-      Config.EmbedDim, Config.PatchSize, 0, Config.PatchSize, 0) );
+      Config.EmbedDim, Config.PatchSize, 0, Config.PatchSize, 0).MakeInferenceOnly(pInferenceOnly) );
     // Flatten the (gridW, gridH, C) map to a (gridW*gridH, 1, C) token sequence
     // in row-major (y*Grid + x) order (HF flatten(2).transpose).
     NN.AddLayer( TNNetReshape.Create(PatchGrid * PatchGrid, 1, Config.EmbedDim) );
-    EmbNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+    EmbNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     StageIn := EmbNorm;
     Grid := PatchGrid;
     Dim := Config.EmbedDim;
@@ -48953,7 +48968,7 @@ begin
         ShortcutA := StageIn;
         // --- W-MSA / SW-MSA ---
         NormBefore := NN.AddLayerAfter(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps), StageIn);
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), StageIn);
         // Reorder tokens into window-contiguous (and shifted) order.
         Reordered := NN.AddLayer( TNNetGatherTokens.Create(TokenPerm) );
         SetLength(WindowOuts, NumWindows);
@@ -48963,9 +48978,9 @@ begin
           WinSlice := NN.AddLayerAfter(
             TNNetCrop.Create(wIdx * ws2, 0, ws2, 1), Reordered);
           // per-token Q/K/V projections (Linear over depth)
-          QProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim) );
-          KProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim), WinSlice);
-          VProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim), WinSlice);
+          QProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).MakeInferenceOnly(pInferenceOnly) );
+          KProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim).MakeInferenceOnly(pInferenceOnly), WinSlice);
+          VProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim).MakeInferenceOnly(pInferenceOnly), WinSlice);
           SetLength(HeadOuts, Heads);
           SetLength(Channels, HeadDim);
           for h := 0 to Heads - 1 do
@@ -48985,7 +49000,7 @@ begin
             HeadOuts[h] := HeadAttn;
           end;
           AttnConcat := NN.AddLayer( TNNetDeepConcat.Create(HeadOuts) );
-          OProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim) );
+          OProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).MakeInferenceOnly(pInferenceOnly) );
           WindowOuts[wIdx] := OProj;
           // load q/k/v/o weights for this window (shared across windows -> the
           // same checkpoint tensors load into every window's projections)
@@ -49008,11 +49023,11 @@ begin
         AttnResidual := NN.AddLayer( TNNetSum.Create([ReorderBack, ShortcutA]) );
 
         // --- MLP ---
-        NormAfter := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        NormAfter := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         MlpHidden := Round(Dim * Config.MlpRatio);
-        Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden) );
+        Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetGELU.Create() );
-        Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim) );
+        Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).MakeInferenceOnly(pInferenceOnly) );
         MlpResidual := NN.AddLayer( TNNetSum.Create([Fc2, AttnResidual]) );
         StageIn := MlpResidual;
 
@@ -49072,8 +49087,8 @@ begin
         // pack each group of 4 contiguous tokens (4*Dim values) into one token
         // of depth 4*Dim: (4*half*half,1,Dim) -> (half*half,1,4*Dim).
         NN.AddLayer( TNNetReshape.Create(half * half, 1, 4 * Dim) );
-        MergeNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
-        MergeReduce := NN.AddLayer( TNNetPointwiseConvLinear.Create(2 * Dim) );
+        MergeNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
+        MergeReduce := NN.AddLayer( TNNetPointwiseConvLinear.Create(2 * Dim).MakeInferenceOnly(pInferenceOnly) );
         LoadLayerNormWeights(Reader, MergeNorm,
           Prefix + 'downsample.norm.weight', Prefix + 'downsample.norm.bias', 4 * Dim);
         // reduction is a bias-free Linear [2*Dim, 4*Dim]
@@ -49086,14 +49101,14 @@ begin
     end;
 
     // ---------------- Head ----------------
-    FinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+    FinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     NumTokens := Grid * Grid;
     // mean-pool over tokens: reshape the (NumTokens,1,Dim) sequence into the
     // square (Grid,Grid,Dim) map so TNNetAvgChannel (pool = Grid, divides by
     // Grid*Grid = NumTokens) is the EXACT global token mean.
     GridMap := NN.AddLayer( TNNetReshape.Create(Grid, Grid, Dim) );
     Pooled := NN.AddLayer( TNNetAvgChannel.Create() );
-    Classifier := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels) );
+    Classifier := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels).MakeInferenceOnly(pInferenceOnly) );
     LoadLayerNormWeights(Reader, FinalNorm,
       'layernorm.weight', 'layernorm.bias', Dim);
     LoadLlamaLinearWeights(Reader, Classifier, 'classifier.weight',
@@ -49317,9 +49332,9 @@ begin
     NN.AddLayer( TNNetInput.Create(Config.Audio.SpecSize, Config.Audio.SpecSize, 1) );
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
       Config.Audio.EmbedDim, Config.Audio.PatchSize, 0,
-      Config.Audio.PatchSize, 0) );
+      Config.Audio.PatchSize, 0).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetReshape.Create(PatchGrid * PatchGrid, 1, Config.Audio.EmbedDim) );
-    EmbNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps) );
+    EmbNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     StageIn := EmbNorm;
     Grid := PatchGrid;
     Dim := Config.Audio.EmbedDim;
@@ -49343,16 +49358,16 @@ begin
 
         ShortcutA := StageIn;
         NormBefore := NN.AddLayerAfter(
-          TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps), StageIn);
+          TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps).MakeInferenceOnly(pInferenceOnly), StageIn);
         Reordered := NN.AddLayer( TNNetGatherTokens.Create(TokenPerm) );
         SetLength(WindowOuts, NumWindows);
         for wIdx := 0 to NumWindows - 1 do
         begin
           WinSlice := NN.AddLayerAfter(
             TNNetCrop.Create(wIdx * ws2, 0, ws2, 1), Reordered);
-          QProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim) );
-          KProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim), WinSlice);
-          VProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim), WinSlice);
+          QProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).MakeInferenceOnly(pInferenceOnly) );
+          KProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim).MakeInferenceOnly(pInferenceOnly), WinSlice);
+          VProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim).MakeInferenceOnly(pInferenceOnly), WinSlice);
           SetLength(HeadOuts, Heads);
           SetLength(Channels, HeadDim);
           for h := 0 to Heads - 1 do
@@ -49368,7 +49383,7 @@ begin
             HeadOuts[h] := HeadAttn;
           end;
           AttnConcat := NN.AddLayer( TNNetDeepConcat.Create(HeadOuts) );
-          OProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim) );
+          OProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).MakeInferenceOnly(pInferenceOnly) );
           WindowOuts[wIdx] := OProj;
           // clap key spelling: attention.self.{query,key,value} +
           // attention.output.dense
@@ -49386,11 +49401,11 @@ begin
         ReorderBack := NN.AddLayer( TNNetGatherTokens.Create(InvPerm) );
         AttnResidual := NN.AddLayer( TNNetSum.Create([ReorderBack, ShortcutA]) );
 
-        NormAfter := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps) );
+        NormAfter := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
         MlpHidden := Reader.DimSize(BPrefix + 'intermediate.dense.weight', 0);
-        Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden) );
+        Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetGELUErf.Create() );  // audio hidden_act 'gelu' = exact erf
-        Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim) );
+        Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetSum.Create([Fc2, AttnResidual]) );
         StageIn := NN.GetLastLayer();
 
@@ -49435,8 +49450,8 @@ begin
           end;
         NN.AddLayer( TNNetGatherTokens.Create(MergePerm) );
         NN.AddLayer( TNNetReshape.Create(half * half, 1, 4 * Dim) );
-        MergeNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps) );
-        MergeReduce := NN.AddLayer( TNNetPointwiseConvLinear.Create(2 * Dim) );
+        MergeNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
+        MergeReduce := NN.AddLayer( TNNetPointwiseConvLinear.Create(2 * Dim).MakeInferenceOnly(pInferenceOnly) );
         LoadLayerNormWeights(Reader, MergeNorm,
           Prefix + 'downsample.norm.weight', Prefix + 'downsample.norm.bias', 4 * Dim);
         LoadLlamaLinearWeights(Reader, MergeReduce,
@@ -49448,15 +49463,15 @@ begin
     end;
 
     // ---- head: final LN -> token mean-pool -> 2-layer projection ----
-    FinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps) );
+    FinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     GridMap := NN.AddLayer( TNNetReshape.Create(Grid, Grid, Dim) );
     Pooled := NN.AddLayer( TNNetAvgChannel.Create() );
     // AvgChannel returns (1,1,Dim); ClapProjectionLayer is linear1 -> ReLU
     // -> linear2 (both biased). PointwiseConvLinear over the single token.
-    Proj1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim) );
+    Proj1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim).MakeInferenceOnly(pInferenceOnly) );
     if Config.ProjectionActRelu then NN.AddLayer( TNNetReLU.Create() )
     else NN.AddLayer( TNNetGELU.Create() );
-    Proj2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim) );
+    Proj2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim).MakeInferenceOnly(pInferenceOnly) );
 
     LoadLayerNormWeights(Reader, FinalNorm,
       EncPrefix + 'norm.weight', EncPrefix + 'norm.bias', Dim);
@@ -49528,35 +49543,35 @@ begin
   try
     InputLayer := NN.AddLayer( TNNetInput.Create(SeqLen, 1, 2) );
     NN.AddLayerAfter( TNNetSplitChannels.Create([0]), InputLayer );
-    WordEmb := NN.AddLayer( TNNetEmbedding.Create(Config.Text.VocabSize, HSz, 1) );
-    PosEmb := NN.AddLayer( TNNetLearnedPositionalEmbedding.Create(UsablePositions) );
+    WordEmb := NN.AddLayer( TNNetEmbedding.Create(Config.Text.VocabSize, HSz, 1).MakeInferenceOnly(pInferenceOnly) );
+    PosEmb := NN.AddLayer( TNNetLearnedPositionalEmbedding.Create(UsablePositions).MakeInferenceOnly(pInferenceOnly) );
     TypeEmb := nil;
     if Config.Text.TypeVocabSize > 0 then
     begin
       SliceLayer := NN.AddLayerAfter( TNNetSplitChannels.Create([1]), InputLayer);
       TypeEmb := NN.AddLayerAfter(
-        TNNetEmbedding.Create(Config.Text.TypeVocabSize, HSz, 1), SliceLayer);
+        TNNetEmbedding.Create(Config.Text.TypeVocabSize, HSz, 1).MakeInferenceOnly(pInferenceOnly), SliceLayer);
       NN.AddLayer( TNNetSum.Create([PosEmb, TypeEmb]) );
     end;
-    EmbLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+    EmbLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
     for BlockCnt := 0 to Config.Text.NumLayers - 1 do
     begin
       BranchInput := NN.GetLastLayer();
-      QKV := NN.AddLayer( TNNetPointwiseConvLinear.Create(3 * HSz) );
+      QKV := NN.AddLayer( TNNetPointwiseConvLinear.Create(3 * HSz).MakeInferenceOnly(pInferenceOnly) );
       AttnDense := NN.AddMultiHeadSelfAttention(Config.Text.NumHeads,
         {CausalMask=}false, {UseRoPE=}false, avSDPA, {NumSinks=}1, {Window=}0,
         {RelPosNumBuckets=}32, {RelPosMaxDistance=}128, {QKRMSNorm=}false,
         {SegmentSource=}nil);
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-      AttnLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+      AttnLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       BranchInput := NN.GetLastLayer();
       Inter := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.Text.IntermediateSize) );
+        TNNetPointwiseConvLinear.Create(Config.Text.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetGELUErf.Create() );  // text hidden_act 'gelu' = exact erf
-      OutDense := NN.AddLayer( TNNetPointwiseConvLinear.Create(HSz) );
+      OutDense := NN.AddLayer( TNNetPointwiseConvLinear.Create(HSz).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-      OutLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+      OutLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
 
       BPrefix := 'text_model.encoder.layer.' + IntToStr(BlockCnt) + '.';
@@ -49584,12 +49599,12 @@ begin
     // pooler (dense + tanh on token 0) then the 2-layer projection. Crop
     // token 0 first so everything downstream is a single (1,1,*) token.
     ClsSlice := NN.AddLayer( TNNetCrop.Create(0, 0, 1, 1) );
-    Pooler := NN.AddLayer( TNNetPointwiseConvLinear.Create(HSz) );
+    Pooler := NN.AddLayer( TNNetPointwiseConvLinear.Create(HSz).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetHyperbolicTangent.Create() );
-    Proj1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim) );
+    Proj1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim).MakeInferenceOnly(pInferenceOnly) );
     if Config.ProjectionActRelu then NN.AddLayer( TNNetReLU.Create() )
     else NN.AddLayer( TNNetGELU.Create() );
-    Proj2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim) );
+    Proj2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
     if ClsSlice = nil then ; // silence unused
 
@@ -49956,7 +49971,7 @@ begin
       begin
         // Conv 3x3 pad1 stride1 with bias (suppressBias=0), then ReLU.
         ConvLayers[RefCount] := NN.AddLayer(
-          TNNetConvolutionLinear.Create(Config.StageWidths[Stage], 3, 1, 1, 0) );
+          TNNetConvolutionLinear.Create(Config.StageWidths[Stage], 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
         NN.AddLayer( TNNetReLU.Create() );
         Inc(RefCount);
         InWidth := Config.StageWidths[Stage];
@@ -49990,9 +50005,9 @@ begin
         NN.AddLayer( TNNetAvgChannel.Create() );
       // else: identity (grid already AdaptivePool x AdaptivePool); FC flattens.
       FlatDim := Config.StageWidths[4] * Config.AdaptivePool * Config.AdaptivePool;
-      FC0 := NN.AddLayer( TNNetFullConnectReLU.Create(Config.FCHidden[0]) );
-      FC1 := NN.AddLayer( TNNetFullConnectReLU.Create(Config.FCHidden[1]) );
-      FC2 := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels) );
+      FC0 := NN.AddLayer( TNNetFullConnectReLU.Create(Config.FCHidden[0]).MakeInferenceOnly(pInferenceOnly) );
+      FC1 := NN.AddLayer( TNNetFullConnectReLU.Create(Config.FCHidden[1]).MakeInferenceOnly(pInferenceOnly) );
+      FC2 := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
     end;
 
@@ -50474,9 +50489,9 @@ begin
     // Undo the SD latent scaling, then post_quant_conv (1x1) + conv_in (3x3).
     NN.AddLayer( TNNetMulByConstant.Create(1.0 / Config.ScalingFactor) );
     PostQuant := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.LatentChannels, 1, 0, 1, 0) );
+      TNNetConvolutionLinear.Create(Config.LatentChannels, 1, 0, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     ConvIn := NN.AddLayer(
-      TNNetConvolutionLinear.Create(TopC, 3, 1, 1, 0) );
+      TNNetConvolutionLinear.Create(TopC, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     // MID: resnet -> attention -> resnet (all at width TopC).
     AddVaeResnetBlock(NN, Config, TopC, TopC, MidRes1);
     AddVaeAttention(NN, Config, TopC, MidAttn);
@@ -50502,7 +50517,7 @@ begin
         // Nearest 2x upsample (TNNetDeMaxPool spacing 0) + 3x3 conv.
         NN.AddLayer( TNNetDeMaxPool.Create(2) );
         UpConv[r] := NN.AddLayer(
-          TNNetConvolutionLinear.Create(OutCh, 3, 1, 1, 0) );
+          TNNetConvolutionLinear.Create(OutCh, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
       end
       else
         UpConv[r] := nil;
@@ -50511,7 +50526,7 @@ begin
     NormOut := NN.AddLayer( TNNetGroupNorm.Create(Config.NormNumGroups) );
     NN.AddLayer( TNNetSiLU.Create() );
     ConvOut := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.OutChannels, 3, 1, 1, 0) );
+      TNNetConvolutionLinear.Create(Config.OutChannels, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // ---------------- Weights ----------------
@@ -50649,7 +50664,7 @@ begin
     // ---------------- Architecture ----------------
     NN.AddLayer( TNNetInput.Create(ImgGrid, ImgGrid, Config.OutChannels) );
     ConvIn := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.BlockOutChannels[0], 3, 1, 1, 0) );
+      TNNetConvolutionLinear.Create(Config.BlockOutChannels[0], 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     // DOWN blocks: block_out_channels in low->high order. Block d has nResnet
     // ResNet blocks; every block EXCEPT the last (d = N-1) ends with a
     // stride-2 3x3 conv DOWNSAMPLE using diffusers' asymmetric (0,1,0,1) pad.
@@ -50674,7 +50689,7 @@ begin
         NN.AddLayer( TNNetPadXY.Create(1, 1) );
         NN.AddLayer( TNNetCrop.Create(1, 1, H + 1, H + 1) );
         DownConv[d] := NN.AddLayer(
-          TNNetConvolutionLinear.Create(OutCh, 3, {pad=}0, {stride=}2, 0) );
+          TNNetConvolutionLinear.Create(OutCh, 3, {pad=}0, {stride=}2, 0).MakeInferenceOnly(pInferenceOnly) );
       end
       else
         DownConv[d] := nil;
@@ -50688,9 +50703,9 @@ begin
     NormOut := NN.AddLayer( TNNetGroupNorm.Create(Config.NormNumGroups) );
     NN.AddLayer( TNNetSiLU.Create() );
     ConvOut := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Out2, 3, 1, 1, 0) );
+      TNNetConvolutionLinear.Create(Out2, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     QuantConv := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Out2, 1, 0, 1, 0) );
+      TNNetConvolutionLinear.Create(Out2, 1, 0, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     // DiagonalGaussianDistribution deterministic latent: take the mean (first
     // LatentChannels channels) and apply the SD scaling_factor.
     NN.AddLayer( TNNetSplitChannels.Create(0, Config.LatentChannels) );
@@ -50906,7 +50921,7 @@ begin
     // ---------------- Architecture (mirror of BuildVaeEncoder) ----------------
     NN.AddLayer( TNNetInput.Create(ImgGrid, ImgGrid, Config.InChannels) );
     ConvIn := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.BlockOutChannels[0], 3, 1, 1, 0) );
+      TNNetConvolutionLinear.Create(Config.BlockOutChannels[0], 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     InCh := Config.BlockOutChannels[0];
     for d := 0 to Config.NumBlockOut - 1 do
     begin
@@ -50924,7 +50939,7 @@ begin
         NN.AddLayer( TNNetPadXY.Create(1, 1) );
         NN.AddLayer( TNNetCrop.Create(1, 1, H + 1, H + 1) );
         DownConv[d] := NN.AddLayer(
-          TNNetConvolutionLinear.Create(OutCh, 3, {pad=}0, {stride=}2, 0) );
+          TNNetConvolutionLinear.Create(OutCh, 3, {pad=}0, {stride=}2, 0).MakeInferenceOnly(pInferenceOnly) );
       end
       else
         DownConv[d] := nil;
@@ -50936,12 +50951,12 @@ begin
     NN.AddLayer( TNNetSiLU.Create() );
     // VQModel double_z=False: conv_out -> latent_channels (NOT 2*lat).
     ConvOut := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.LatentChannels, 3, 1, 1, 0) );
+      TNNetConvolutionLinear.Create(Config.LatentChannels, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     // quant_conv (1x1, latent_channels -> vq_embed_dim). The net's output is
     // the continuous pre-quantize latent; the codebook lookup is done by the
     // holder class (plain Pascal argmin).
     QuantConv := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.VqEmbedDim, 1, 0, 1, 0) );
+      TNNetConvolutionLinear.Create(Config.VqEmbedDim, 1, 0, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // ---------------- Weights ----------------
@@ -51011,9 +51026,9 @@ begin
     NN.AddLayer( TNNetInput.Create(Config.LatentGrid, Config.LatentGrid,
       Config.VqEmbedDim) );
     PostQuant := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.LatentChannels, 1, 0, 1, 0) );
+      TNNetConvolutionLinear.Create(Config.LatentChannels, 1, 0, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     ConvIn := NN.AddLayer(
-      TNNetConvolutionLinear.Create(TopC, 3, 1, 1, 0) );
+      TNNetConvolutionLinear.Create(TopC, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     AddVaeResnetBlock(NN, Vae, TopC, TopC, MidRes1);
     AddVaeAttention(NN, Vae, TopC, MidAttn);
     AddVaeResnetBlock(NN, Vae, TopC, TopC, MidRes2);
@@ -51033,7 +51048,7 @@ begin
       begin
         NN.AddLayer( TNNetDeMaxPool.Create(2) );
         UpConv[r] := NN.AddLayer(
-          TNNetConvolutionLinear.Create(OutCh, 3, 1, 1, 0) );
+          TNNetConvolutionLinear.Create(OutCh, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
       end
       else
         UpConv[r] := nil;
@@ -51041,7 +51056,7 @@ begin
     NormOut := NN.AddLayer( TNNetGroupNorm.Create(Config.NormNumGroups) );
     NN.AddLayer( TNNetSiLU.Create() );
     ConvOut := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.OutChannels, 3, 1, 1, 0) );
+      TNNetConvolutionLinear.Create(Config.OutChannels, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // ---------------- Weights ----------------
@@ -51462,12 +51477,12 @@ begin
     NN.AddLayer( TNNetInput.Create(Config.InputSize, Config.InputSize,
       Config.NumInCh) );
     ConvFirst := NN.AddLayer(
-      TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0) );
+      TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     FeatRef := ConvFirst;  // global residual / upsample feeder
     for i := 0 to Config.NumBlock - 1 do
       AddRRDB(NN, Config, Blocks[i]);
     ConvBody := NN.AddLayer(
-      TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0) );
+      TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     // Global residual: feat = conv_first + conv_body(body(conv_first)).
     NN.AddLayer( TNNetSum.Create([ConvBody, FeatRef]) );
     // Upsample x4: two (nearest-2x + 3x3 conv + LeakyReLU(0.2)) stages.
@@ -51478,20 +51493,20 @@ begin
       if s = 0 then
       begin
         ConvUp1 := NN.AddLayer(
-          TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0) );
+          TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
       end
       else
       begin
         ConvUp2 := NN.AddLayer(
-          TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0) );
+          TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
       end;
       NN.AddLayer( TNNetLeakyReLU.Create(0.2) );
     end;
     ConvHR := NN.AddLayer(
-      TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0) );
+      TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetLeakyReLU.Create(0.2) );
     ConvLast := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.NumOutCh, 3, 1, 1, 0) );
+      TNNetConvolutionLinear.Create(Config.NumOutCh, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // ---------------- Weights ----------------
@@ -51921,7 +51936,7 @@ begin
     NN.AddLayer(TNNetInput.Create(Config.InputSize, Config.InputSize,
       Config.ImgChannel));
     Intro := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.Width, 3, 1, 1, 0));
+      TNNetConvolutionLinear.Create(Config.Width, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly));
     Cur := Intro;
     C := Config.Width;
     // Encoder.
@@ -51933,7 +51948,7 @@ begin
       EncSkips[lvl] := Cur;
       // Down: stride-2 2x2 conv, C -> 2C, no padding (exact H/2).
       DownConvs[lvl] := NN.AddLayer(
-        TNNetConvolutionLinear.Create(2 * C, 2, 0, 2, 0));
+        TNNetConvolutionLinear.Create(2 * C, 2, 0, 2, 0).MakeInferenceOnly(pInferenceOnly));
       Cur := DownConvs[lvl];
       C := C * 2;
     end;
@@ -51948,7 +51963,7 @@ begin
       // so 2C -> C/2 channels at 2x resolution. Mirrors the encoder's stride-2
       // down conv (C -> 2C at H/2) to land back on the skip's (C/2, H) shape.
       UpConvs[lvl] := NN.AddLayer(
-        TNNetConvolutionLinear.Create(2 * C, 1, 0, 1, 0));
+        TNNetConvolutionLinear.Create(2 * C, 1, 0, 1, 0).MakeInferenceOnly(pInferenceOnly));
       NN.AddLayer(TNNetDepthToSpace.Create(2));  // 2C -> C/2, spatial x2
       C := C div 2;
       Up := NN.GetLastLayer();
@@ -51960,7 +51975,7 @@ begin
         Cur := AddNAFBlock(NN, C, Cur, DecRefs[lvl][b]);
     end;
     Ending := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.ImgChannel, 3, 1, 1, 0));
+      TNNetConvolutionLinear.Create(Config.ImgChannel, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly));
     // Global residual: out = ending(...) + input image.
     NN.AddLayer(TNNetSum.Create([Ending, NN.Layers[0]]));
     if pInferenceOnly then NN.MakeInferenceOnly();
@@ -52318,7 +52333,7 @@ begin
       Config.InChans) );
     // Shallow feature conv stem (3x3 -> embed_dim).
     ConvFirst := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.EmbedDim, 3, 1, 1, 0) );
+      TNNetConvolutionLinear.Create(Config.EmbedDim, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     F0Map := ConvFirst;
     // Flatten the (W,H,C) map to a (W*H, 1, C) token sequence in row-major
     // (y*Grid + x) order (the same convention as the landed Swin importer).
@@ -52343,16 +52358,16 @@ begin
       // residual-add the RSTB input.
       NN.AddLayer( TNNetReshape.Create(Grid, Grid, Dim) );
       RSTBConv[li] := NN.AddLayer(
-        TNNetConvolutionLinear.Create(Dim, 3, 1, 1, 0) );
+        TNNetConvolutionLinear.Create(Dim, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetReshape.Create(Grid * Grid, 1, Dim) );
       Cur := NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), RSTBIn]) );
     end;
 
     // Token LayerNorm -> map -> conv_after_body 3x3, + conv_first map.
-    FinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+    FinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetReshape.Create(Grid, Grid, Dim) );
     ConvAfterBody := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Dim, 3, 1, 1, 0) );
+      TNNetConvolutionLinear.Create(Dim, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     Cur := NN.AddLayer( TNNetSum.Create([ConvAfterBody, F0Map]) );
 
     // ---------------- Reconstruction / upsample tail ----------------
@@ -52361,19 +52376,19 @@ begin
     if Config.Upscale > 1 then
     begin
       ConvBeforeUp := NN.AddLayer(
-        TNNetConvolutionLinear.Create(Config.NumFeat, 3, 1, 1, 0) );
+        TNNetConvolutionLinear.Create(Config.NumFeat, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetLeakyReLU.Create(0.2) );
       // pixel-shuffle upsample: 3x3 conv -> upscale^2 * num_feat, DepthToSpace.
       UpConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-        Config.Upscale * Config.Upscale * Config.NumFeat, 3, 1, 1, 0) );
+        Config.Upscale * Config.Upscale * Config.NumFeat, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetDepthToSpace.Create(Config.Upscale) );
       ConvLast := NN.AddLayer(
-        TNNetConvolutionLinear.Create(Config.InChans, 3, 1, 1, 0) );
+        TNNetConvolutionLinear.Create(Config.InChans, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     end
     else
       // Same-resolution denoise tail: single conv reconstruction.
       ConvLast := NN.AddLayer(
-        TNNetConvolutionLinear.Create(Config.InChans, 3, 1, 1, 0) );
+        TNNetConvolutionLinear.Create(Config.InChans, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly) );
 
     if pInferenceOnly then NN.MakeInferenceOnly();
 
@@ -52743,15 +52758,15 @@ begin
       NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
         Config.NumChannels) );
       PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-        Config.Vision.HiddenSize, Config.PatchSize, 0, Config.PatchSize, 1) );
+        Config.Vision.HiddenSize, Config.PatchSize, 0, Config.PatchSize, 1).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetReshape.Create(NumPatches, 1,
         Config.Vision.HiddenSize) );
       NN.AddLayer( TNNetPadXY.Create(1, 0) );
       NN.AddLayer( TNNetCrop.Create(0, 0, NumTokens, 1) );
       VPosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(NumTokens) );
+        TNNetLearnedPositionalEmbedding.Create(NumTokens).MakeInferenceOnly(pInferenceOnly) );
       VPreLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.Vision.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.Vision.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       SetLength(VBlocks, Config.Vision.NumLayers);
       SetLength(Config.TapLayerIdx, NumTaps);
       for i := 0 to Config.Vision.NumLayers - 1 do
@@ -52809,17 +52824,17 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen, 1, 1) );
       TokEmb := NN.AddLayer( TNNetEmbedding.Create(
-        Config.TextVocabSize, Config.Text.HiddenSize, 1) );
+        Config.TextVocabSize, Config.Text.HiddenSize, 1).MakeInferenceOnly(pInferenceOnly) );
       PosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions) );
+        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions).MakeInferenceOnly(pInferenceOnly) );
       SetLength(TBlocks, Config.Text.NumLayers);
       for i := 0 to Config.Text.NumLayers - 1 do
         AddClipEncoderBlock(NN, Config.Text, {CausalMask=}true,
           TBlocks[i], pInferenceOnly);
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       TProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.ProjectionDim) );
+        TNNetPointwiseConvLinear.Create(Config.ProjectionDim).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
 
       LoadClipEmbeddingTable(Reader, TokEmb,
@@ -52854,9 +52869,9 @@ begin
 
       // film_mul / film_add: projection_dim -> reduce_dim, applied to cond.
       FilmMul := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.ReduceDim), CondInput);
+        TNNetPointwiseConvLinear.Create(Config.ReduceDim).MakeInferenceOnly(pInferenceOnly), CondInput);
       FilmAdd := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.ReduceDim), CondInput);
+        TNNetPointwiseConvLinear.Create(Config.ReduceDim).MakeInferenceOnly(pInferenceOnly), CondInput);
       // FiLM cond = gamma|beta concatenated on depth -> (1,1,2*reduce_dim).
       FilmCond := NN.AddLayer( TNNetDeepConcat.Create([FilmMul, FilmAdd]) );
 
@@ -52865,7 +52880,7 @@ begin
       begin
         // reduces[i] over tap input i (reversed order matches HF).
         Reduced := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.ReduceDim), TapInputs[i]);
+          TNNetPointwiseConvLinear.Create(Config.ReduceDim).MakeInferenceOnly(pInferenceOnly), TapInputs[i]);
         ReduceLayers[i] := Reduced;
         if Acc = nil then
           Acc := Reduced
@@ -52886,7 +52901,7 @@ begin
       NN.AddLayer( TNNetReshape.Create(Grid, Grid, Config.ReduceDim) );
       // Non-overlapping ConvTranspose2d(reduce_dim,1,P,stride=P).
       TransConv := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.PatchSize * Config.PatchSize) );
+        TNNetPointwiseConvLinear.Create(Config.PatchSize * Config.PatchSize).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetDepthToSpace.Create(Config.PatchSize) );
       if pInferenceOnly then NN.MakeInferenceOnly();
 
@@ -53160,7 +53175,7 @@ var
   function AddConvPass(const Prefix: string): TConvRefs;
   begin
     Result.Affine := NN.AddLayerAfter(
-      TNNetFullConnectLinear.Create(ch), WLatent);
+      TNNetFullConnectLinear.Create(ch).MakeInferenceOnly(pInferenceOnly), WLatent);
     Result.ModConv := TNNetModulatedConv2D.Create(ch, 3, 0, 1, Result.Affine);
     NN.AddLayerAfter(Result.ModConv, Feat);
     Feat := Result.ModConv;
@@ -53202,7 +53217,7 @@ begin
     WLatent := NN.Layers[0];
     for l := 0 to Config.MappingLayers - 1 do
     begin
-      MapFC[l] := NN.AddLayerAfter(TNNetFullConnectLinear.Create(lat), WLatent);
+      MapFC[l] := NN.AddLayerAfter(TNNetFullConnectLinear.Create(lat).MakeInferenceOnly(pInferenceOnly), WLatent);
       WLatent := NN.AddLayer(TNNetLeakyReLU.Create(0.2));
     end;
     // -------- Synthesis network --------
@@ -53219,7 +53234,7 @@ begin
         Convs[b][c] := AddConvPass('block.' + IntToStr(b) + '.conv.' +
           IntToStr(c) + '.');
       // toRGB: modulated 1x1 conv (no demod) -> RGB, summed with upsampled skip.
-      ToRGBAffine[b] := NN.AddLayerAfter(TNNetFullConnectLinear.Create(ch), WLatent);
+      ToRGBAffine[b] := NN.AddLayerAfter(TNNetFullConnectLinear.Create(ch).MakeInferenceOnly(pInferenceOnly), WLatent);
       ToRGBConv[b] := TNNetModulatedConv2D.Create(Config.NumOutCh, 1, 0, 0,
         ToRGBAffine[b]);
       NN.AddLayerAfter(ToRGBConv[b], Feat);
@@ -53458,21 +53473,21 @@ var
 begin
   BranchInput := NN.GetLastLayer();
   Block.LN1 := NN.AddLayer(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
   Block.QKV := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+    TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
   Block.AttnDense := NN.AddMultiHeadSelfAttention(Config.NumHeads,
     {CausalMask=}false);
   Block.LS1 := NN.AddLayer( TNNetChannelMul.Create() );
   NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
   BranchInput := NN.GetLastLayer();
   Block.LN2 := NN.AddLayer(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
   Block.Inter := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+    TNNetPointwiseConvLinear.Create(Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
   AddClipHiddenAct(NN, Config.HiddenAct);
   Block.OutDense := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+    TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
   Block.LS2 := NN.AddLayer( TNNetChannelMul.Create() );
   NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
   if pInferenceOnly then NN.MakeInferenceOnly();
@@ -53558,7 +53573,7 @@ begin
     // = HF flatten(2).transpose(1,2) patch order.
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
       d, Config.PatchSize, {pInputPadding=}0, {pStride=}Config.PatchSize,
-      {pSuppressBias=}0) );
+      {pSuppressBias=}0).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
     // Prepend one ZERO row as the CLS-token slot (PadXY pads both ends;
     // Crop drops the right pad). cls_token is folded into row 0 of the
@@ -53566,14 +53581,14 @@ begin
     NN.AddLayer( TNNetPadXY.Create(1, 0) );
     NN.AddLayer( TNNetCrop.Create(0, 0, NumPatches + 1, 1) );
     PosEmb := NN.AddLayer(
-      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1) );
+      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
     SetLength(Blocks, Config.NumLayers);
     for BlockCnt := 0 to Config.NumLayers - 1 do
       AddDINOv2EncoderBlock(NN, Config, Blocks[BlockCnt], pInferenceOnly);
     // Final layernorm over every token; the output is the CLS + patch token
     // hidden states (NO classifier head, NO CLS-row crop).
-    FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+    FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // ---------------- Weights ----------------
@@ -53870,7 +53885,7 @@ begin
     NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
       Config.NumChannels) );
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-      Config.HiddenSize, Config.PatchSize, 0, Config.PatchSize, 0) );
+      Config.HiddenSize, Config.PatchSize, 0, Config.PatchSize, 0).MakeInferenceOnly(pInferenceOnly) );
     // Output is (Grid, Grid, hidden). Add the learned 2-D pos_embed directly.
     PosEmb := NN.AddLayer( TNNetCellBias.Create() );
     if pInferenceOnly then NN.MakeInferenceOnly();
@@ -53884,15 +53899,15 @@ begin
       if IsGlobal then ws := 0 else ws := Config.WindowSize;
 
       ShortcutA := NN.GetLastLayer();
-      Norm1 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      Norm1 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       Attn := NN.AddLayer( TNNetSAMVisionAttention.Create(
         Config.NumHeads, ws, HeadDim, Config.HiddenSize) );
       AttnRes := NN.AddLayer( TNNetSum.Create([Attn, ShortcutA]) );
-      Norm2 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
-      Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden) );
+      Norm2 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
+      Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden).MakeInferenceOnly(pInferenceOnly) );
       // SAM hidden_act='gelu' is the EXACT erf GELU (not the tanh approximation).
       NN.AddLayer( TNNetGELUErf.Create() );
-      Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+      Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
       MlpRes := NN.AddLayer( TNNetSum.Create([Fc2, AttnRes]) );
       AttnLayers[BlockIdx] := TNNetSAMVisionAttention(Attn);
       Norm1Layers[BlockIdx] := Norm1;
@@ -53903,11 +53918,11 @@ begin
 
     // ---------------- Neck ----------------
     Conv1 := NN.AddLayer( TNNetConvolutionLinear.Create(
-      Config.OutputChannels, 1, 0, 1, 1) );
-    NeckLN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-6) );
+      Config.OutputChannels, 1, 0, 1, 1).MakeInferenceOnly(pInferenceOnly) );
+    NeckLN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-6).MakeInferenceOnly(pInferenceOnly) );
     Conv2 := NN.AddLayer( TNNetConvolutionLinear.Create(
-      Config.OutputChannels, 3, 1, 1, 1) );
-    NeckLN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-6) );
+      Config.OutputChannels, 3, 1, 1, 1).MakeInferenceOnly(pInferenceOnly) );
+    NeckLN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-6).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // ---------------- Weights ----------------
@@ -54810,14 +54825,14 @@ var
 begin
   HeadDim := Config.HiddenSize div Config.NumHeads;
   BranchInput := NN.GetLastLayer();
-  Block.LN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+  Block.LN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
   // per-token Q/K/V projections (Linear over depth, biased: q/v have a bias,
   // k is bias-free in BEiT -> its bias neurons stay zero).
-  Block.QProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+  Block.QProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
   Block.KProj := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(Config.HiddenSize), Block.LN1);
+    TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly), Block.LN1);
   Block.VProj := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(Config.HiddenSize), Block.LN1);
+    TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly), Block.LN1);
   SetLength(HeadOuts, Config.NumHeads);
   SetLength(Block.HeadAttn, Config.NumHeads);
   SetLength(Channels, HeadDim);
@@ -54833,16 +54848,16 @@ begin
   end;
   NN.AddLayer( TNNetDeepConcat.Create(HeadOuts) );
   Block.OProj := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+    TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
   Block.LS1 := NN.AddLayer( TNNetChannelMul.Create() );
   NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
   BranchInput := NN.GetLastLayer();
-  Block.LN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+  Block.LN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
   Block.Inter := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+    TNNetPointwiseConvLinear.Create(Config.IntermediateSize).MakeInferenceOnly(pInferenceOnly) );
   AddClipHiddenAct(NN, Config.HiddenAct);
   Block.OutDense := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+    TNNetPointwiseConvLinear.Create(Config.HiddenSize).MakeInferenceOnly(pInferenceOnly) );
   Block.LS2 := NN.AddLayer( TNNetChannelMul.Create() );
   NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
   if pInferenceOnly then NN.MakeInferenceOnly();
@@ -54946,14 +54961,14 @@ begin
     // BIASED patch embedding (kernel = stride = patch_size), flattened to a
     // (NumPatches, 1, hidden) row-major (y,x) token sequence.
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-      d, Config.PatchSize, 0, Config.PatchSize, 0) );
+      d, Config.PatchSize, 0, Config.PatchSize, 0).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
     // Prepend one row for the cls token (PadXY pads both ends; Crop drops the
     // right pad). The cls slot is then filled by a learned-positional layer
     // whose row 0 = cls_token and rows 1.. = 0 (NO absolute positions).
     NN.AddLayer( TNNetPadXY.Create(1, 0) );
     NN.AddLayer( TNNetCrop.Create(0, 0, Seq, 1) );
-    ClsRow := NN.AddLayer( TNNetLearnedPositionalEmbedding.Create(Seq) );
+    ClsRow := NN.AddLayer( TNNetLearnedPositionalEmbedding.Create(Seq).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
     SetLength(Blocks, Config.NumLayers);
     for BlockCnt := 0 to Config.NumLayers - 1 do
@@ -54963,7 +54978,7 @@ begin
     // LayerNorm + patch mean is the caller's job).
     if not Config.UseMeanPooling then
     begin
-      FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
     end
     else
@@ -55386,11 +55401,11 @@ begin
     // ---------------- DINOv2 backbone (tapped at all 4 hooked stages) -------
     NN.AddLayer(TNNetInput.Create(Bk.ImageSize, Bk.ImageSize, Bk.NumChannels));
     PatchConv := NN.AddLayer(TNNetConvolutionLinear.Create(
-      d, Bk.PatchSize, 0, Bk.PatchSize, 0));
+      d, Bk.PatchSize, 0, Bk.PatchSize, 0).MakeInferenceOnly(pInferenceOnly));
     NN.AddLayer(TNNetReshape.Create(NumPatches, 1, d));
     NN.AddLayer(TNNetPadXY.Create(1, 0));
     NN.AddLayer(TNNetCrop.Create(0, 0, NumPatches + 1, 1));
-    PosEmb := NN.AddLayer(TNNetLearnedPositionalEmbedding.Create(NumPatches + 1));
+    PosEmb := NN.AddLayer(TNNetLearnedPositionalEmbedding.Create(NumPatches + 1).MakeInferenceOnly(pInferenceOnly));
     if pInferenceOnly then NN.MakeInferenceOnly();
     SetLength(Blocks, Bk.NumLayers);
     SetLength(BlockOut, Bk.NumLayers);
@@ -55407,7 +55422,7 @@ begin
     for i := 0 to 3 do
     begin
       StageLN[i] := NN.AddLayerAfter(
-        TNNetTokenLayerNorm.Create(Bk.LayerNormEps),
+        TNNetTokenLayerNorm.Create(Bk.LayerNormEps).MakeInferenceOnly(pInferenceOnly),
         BlockOut[Bk.NumLayers - 4 + i]);
       // drop the CLS row (sequence index 0 along X), keep patch rows 1..N.
       NN.AddLayer(TNNetCrop.Create(1, 0, NumPatches, 1));
@@ -55419,7 +55434,7 @@ begin
       Fac := Config.ReassembleFactors[i];
       // 1x1 projection backbone-hidden -> neck_hidden_sizes[i] (biased).
       Proj[i] := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.NeckHiddenSizes[i]),
+        TNNetPointwiseConvLinear.Create(Config.NeckHiddenSizes[i]).MakeInferenceOnly(pInferenceOnly),
         Reassembled[i]);
       ResizeUp[i] := nil; ResizeDown[i] := nil;
       if Fac > 1 then
@@ -55427,7 +55442,7 @@ begin
         K := Round(Fac);
         // ConvTranspose kernel=stride=K -> pointwise(K*K*neck) + PixelShuffle(K).
         ResizeUp[i] := NN.AddLayer(TNNetPointwiseConvLinear.Create(
-          K * K * Config.NeckHiddenSizes[i]));
+          K * K * Config.NeckHiddenSizes[i]).MakeInferenceOnly(pInferenceOnly));
         NN.AddLayer(TNNetPixelShuffle.Create(K));
       end
       else if Fac < 1 then
@@ -55439,7 +55454,7 @@ begin
       end;
       // neck 3x3 pad-1 bias-free conv -> fusion_hidden.
       NN.AddLayer(TNNetPadXY.Create(1, 1));
-      NeckConv[i] := NN.AddLayer(TNNetConvolutionLinear.Create(Fus, 3, 0, 1, 0));
+      NeckConv[i] := NN.AddLayer(TNNetConvolutionLinear.Create(Fus, 3, 0, 1, 0).MakeInferenceOnly(pInferenceOnly));
       Reassembled[i] := NN.GetLastLayer();
     end;
     // ---------------- fusion stage (reversed: coarse -> fine) --------------
@@ -55481,23 +55496,23 @@ begin
       end;
       NN.AddLayer(TNNetBilinearResize.Create(TargetW, TargetH, 1));
       // 1x1 projection (biased).
-      Fusion[i].Projection := NN.AddLayer(TNNetPointwiseConvLinear.Create(Fus));
+      Fusion[i].Projection := NN.AddLayer(TNNetPointwiseConvLinear.Create(Fus).MakeInferenceOnly(pInferenceOnly));
       Cur := NN.GetLastLayer();
     end;
     // ---------------- depth head -------------------------------------------
     // conv1 3x3 pad1 (fusion -> fusion/2, biased).
     NN.AddLayer(TNNetPadXY.Create(1, 1));
-    HeadConv1 := NN.AddLayer(TNNetConvolutionLinear.Create(Fus div 2, 3, 0, 1, 0));
+    HeadConv1 := NN.AddLayer(TNNetConvolutionLinear.Create(Fus div 2, 3, 0, 1, 0).MakeInferenceOnly(pInferenceOnly));
     // bilinear upsample to (Grid*patch, Grid*patch) = input resolution (a-c True).
     NN.AddLayer(TNNetBilinearResize.Create(
       Grid * Bk.PatchSize, Grid * Bk.PatchSize, 1));
     // conv2 3x3 pad1 (fusion/2 -> head_hidden, biased) -> ReLU.
     NN.AddLayer(TNNetPadXY.Create(1, 1));
     HeadConv2 := NN.AddLayer(TNNetConvolutionLinear.Create(
-      Config.HeadHiddenSize, 3, 0, 1, 0));
+      Config.HeadHiddenSize, 3, 0, 1, 0).MakeInferenceOnly(pInferenceOnly));
     NN.AddLayer(TNNetReLU.Create());
     // conv3 1x1 (head_hidden -> 1, biased).
-    HeadConv3 := NN.AddLayer(TNNetPointwiseConvLinear.Create(1));
+    HeadConv3 := NN.AddLayer(TNNetPointwiseConvLinear.Create(1).MakeInferenceOnly(pInferenceOnly));
     // relative -> ReLU; metric -> Sigmoid (then * max_depth folded as a mul).
     if LowerCase(Config.DepthEstimationType) = 'metric' then
       NN.AddLayer(TNNetSigmoid.Create())
@@ -55841,17 +55856,17 @@ begin
     // BIASED patch conv: kernel = stride = patch, PADDING = 2 -> (GridW, GridH,
     // hidden) grid, flattened row-major (y*GridW + x) = HF flatten(2).transpose.
     PatchConv := NN.AddLayer(TNNetConvolutionLinear.Create(
-      d, p, {pInputPadding=}cPatchPad, {pStride=}p, {pSuppressBias=}0));
+      d, p, {pInputPadding=}cPatchPad, {pStride=}p, {pSuppressBias=}0).MakeInferenceOnly(pInferenceOnly));
     NN.AddLayer(TNNetReshape.Create(NumPatches, 1, d));
     // NO class token: the patch tokens ARE the sequence. The learned position
     // table carries the cls row folded into every patch position (loaded below).
-    PosEmb := NN.AddLayer(TNNetLearnedPositionalEmbedding.Create(NumPatches));
+    PosEmb := NN.AddLayer(TNNetLearnedPositionalEmbedding.Create(NumPatches).MakeInferenceOnly(pInferenceOnly));
     if pInferenceOnly then NN.MakeInferenceOnly();
     SetLength(Blocks, Config.NumLayers);
     for BlockCnt := 0 to Config.NumLayers - 1 do
       AddClipEncoderBlock(NN, Tower, {CausalMask=}false,
         Blocks[BlockCnt], pInferenceOnly);
-    FinalLN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+    FinalLN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly));
     // Reshape the N patch tokens back to a (GridW, GridH, hidden) grid (HF
     // permute(0,2,1).reshape(batch, hidden, GridH, GridW); CAI is (x,y,c)).
     NN.AddLayer(TNNetReshape.Create(GridW, GridH, d));
@@ -55863,7 +55878,7 @@ begin
     NN.AddLayer(TNNetPadXY.Create(1, 1));
     HeadConv := NN.AddLayer(TNNetConvolutionLinear.Create(
       Config.NumKeypoints, 3, {pInputPadding=}0, {pStride=}1,
-      {pSuppressBias=}0));
+      {pSuppressBias=}0).MakeInferenceOnly(pInferenceOnly));
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // ---------------- Weights ---------------------------------------------
@@ -56356,12 +56371,12 @@ var
     R.Conv1 := nil; R.Conv2 := nil; R.Conv3 := nil; R.Down := nil;
     OutW := BaseW * 4;
     Inp := NN.GetLastLayer();
-    R.Conv1 := NN.AddLayer( TNNetConvolutionLinear.Create(BaseW, 1, 0, 1, 0) );
+    R.Conv1 := NN.AddLayer( TNNetConvolutionLinear.Create(BaseW, 1, 0, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetReLU.Create() );
     R.Conv2 := NN.AddLayer(
-      TNNetConvolutionLinear.Create(BaseW, 3, 1, Stride, 0) );
+      TNNetConvolutionLinear.Create(BaseW, 3, 1, Stride, 0).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetReLU.Create() );
-    R.Conv3 := NN.AddLayer( TNNetConvolutionLinear.Create(OutW, 1, 0, 1, 0) );
+    R.Conv3 := NN.AddLayer( TNNetConvolutionLinear.Create(OutW, 1, 0, 1, 0).MakeInferenceOnly(pInferenceOnly) );
     Branch := NN.GetLastLayer();
     if HasShort then
     begin
@@ -56417,7 +56432,7 @@ begin
     NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
       Config.NumChannels) );
     StemConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-      Config.BackboneEmbedSize, 7, 3, 2, 0) );
+      Config.BackboneEmbedSize, 7, 3, 2, 0).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetReLU.Create() );
     // PyTorch-formula maxpool (floor (in-k+2p)/s + 1); the default TNNetMaxPool
     // uses a ceil formula that produces a LARGER grid (off-by-one vs PyTorch).
@@ -56447,7 +56462,7 @@ begin
     // input_projection: 1x1 conv (biased) backbone-channels -> d_model, then
     // flatten the (GridDim,GridDim,d_model) grid to (NumTokens,1,d_model)
     // sequence tokens (row-major y*W+x, matching HF flatten(2)).
-    InputProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0) );
+    InputProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetReshape.Create(NumTokens, 1, Config.DModel) );
 
     // ---- encoder ----
@@ -56458,22 +56473,22 @@ begin
       // spatial pos added to q/k inputs (NOT v). One pos table per layer (all
       // filled with the same 2-D sine constant below).
       SpatialPos := NN.AddLayerAfter(
-        TNNetLearnedPositionalEmbedding.Create(NumTokens), Plain);
+        TNNetLearnedPositionalEmbedding.Create(NumTokens).MakeInferenceOnly(pInferenceOnly), Plain);
       AttnOut := AddDetrAttention(NN, Config, {QSource=}SpatialPos,
         {KSource=}SpatialPos, {VSource=}Plain, Config.EncoderHeads,
         Config.DModel, Refs);
       EncSelf[L] := Refs;
       // residual after attn, then post-LN (DETR is POST-norm).
       NN.AddLayer( TNNetSum.Create([AttnOut, BranchIn]) );
-      EncSelfNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create() );
+      EncSelfNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create().MakeInferenceOnly(pInferenceOnly) );
       // FFN: fc1 -> relu -> fc2, residual, post-LN.
       BranchIn := NN.GetLastLayer();
       EncFC1[L] := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.EncoderFFNDim, 0) );
+        TNNetPointwiseConvLinear.Create(Config.EncoderFFNDim, 0).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetReLU.Create() );
-      EncFC2[L] := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0) );
+      EncFC2[L] := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchIn]) );
-      EncFFNNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create() );
+      EncFFNNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create().MakeInferenceOnly(pInferenceOnly) );
       // The spatial pos table is per-layer; remember the LAST one is the
       // encoder memory's pos (reused by the decoder cross-attn keys).
     end;
@@ -56502,52 +56517,52 @@ begin
       if L = 0 then Plain := QueryInput else Plain := BranchIn;
       // self-attn: query-pos added to q AND k; v plain.
       QPos := NN.AddLayerAfter(
-        TNNetLearnedPositionalEmbedding.Create(Config.NumQueries), Plain);
+        TNNetLearnedPositionalEmbedding.Create(Config.NumQueries).MakeInferenceOnly(pInferenceOnly), Plain);
       DecQueryPosSelf[L] := QPos;
       AttnOut := AddDetrAttention(NN, Config, {QSource=}QPos, {KSource=}QPos,
         {VSource=}Plain, Config.DecoderHeads, Config.DModel, Refs);
       DecSelf[L] := Refs;
       NN.AddLayer( TNNetSum.Create([AttnOut, Plain]) );
-      DecSelfNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create() );
+      DecSelfNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create().MakeInferenceOnly(pInferenceOnly) );
       // cross-attn: query-pos added to q (over the decoder stream); spatial-pos
       // added to k (over encoder states); v = plain encoder states.
       BranchIn := NN.GetLastLayer();
       QPos := NN.AddLayerAfter(
-        TNNetLearnedPositionalEmbedding.Create(Config.NumQueries), BranchIn);
+        TNNetLearnedPositionalEmbedding.Create(Config.NumQueries).MakeInferenceOnly(pInferenceOnly), BranchIn);
       DecQueryPosCross[L] := QPos;
       SpatialPos := NN.AddLayerAfter(
-        TNNetLearnedPositionalEmbedding.Create(NumTokens), EncStates);
+        TNNetLearnedPositionalEmbedding.Create(NumTokens).MakeInferenceOnly(pInferenceOnly), EncStates);
       DecSpatialPos[L] := SpatialPos;
       AttnOut := AddDetrAttention(NN, Config, {QSource=}QPos,
         {KSource=}SpatialPos, {VSource=}EncStates, Config.DecoderHeads,
         Config.DModel, Refs);
       DecCross[L] := Refs;
       NN.AddLayer( TNNetSum.Create([AttnOut, BranchIn]) );
-      DecCrossNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create() );
+      DecCrossNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create().MakeInferenceOnly(pInferenceOnly) );
       // FFN
       BranchIn := NN.GetLastLayer();
       DecFC1[L] := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.DecoderFFNDim, 0) );
+        TNNetPointwiseConvLinear.Create(Config.DecoderFFNDim, 0).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetReLU.Create() );
-      DecFC2[L] := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0) );
+      DecFC2[L] := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0).MakeInferenceOnly(pInferenceOnly) );
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchIn]) );
-      DecFFNNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create() );
+      DecFFNNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create().MakeInferenceOnly(pInferenceOnly) );
     end;
     // final decoder LayerNorm (model.decoder.layernorm)
-    DecFinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create() );
+    DecFinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create().MakeInferenceOnly(pInferenceOnly) );
     Normed := NN.GetLastLayer();
 
     // ---- heads ----
     // class head: Linear d_model -> num_labels+1 (over each query token).
     ClassHead := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.NumLabels + 1, 0), Normed);
+      TNNetPointwiseConvLinear.Create(Config.NumLabels + 1, 0).MakeInferenceOnly(pInferenceOnly), Normed);
     // box head: 3-layer MLP (relu, relu, sigmoid) d_model->d_model->d_model->4.
     BBox0 := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel, 0), Normed);
+      TNNetPointwiseConvLinear.Create(Config.DModel, 0).MakeInferenceOnly(pInferenceOnly), Normed);
     NN.AddLayer( TNNetReLU.Create() );
-    BBox1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0) );
+    BBox1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetReLU.Create() );
-    BBox2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(4, 0) );
+    BBox2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(4, 0).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetSigmoid.Create() );
     // concat [class logits (num_labels+1) | box (4)] on the depth axis.
     NN.AddLayer( TNNetDeepConcat.Create([ClassHead, NN.GetLastLayer()]) );
@@ -56990,12 +57005,12 @@ begin
     Cat := NN.AddLayer(TNNetDeepConcat.Create([U, P3]));
     H3 := YoloAddC2f(NN, Refs, w3 + w2, w2, d0, False, 'model.15');  // head /8
     // neck: bottom-up
-    T := NN.AddLayerAfter(TNNetConvolutionLinear.Create(w2, 3, 1, 2, 0), H3);
+    T := NN.AddLayerAfter(TNNetConvolutionLinear.Create(w2, 3, 1, 2, 0).MakeInferenceOnly(pInferenceOnly), H3);
     YoloPushConv(Refs, T, w2, 3, 'model.16'); NN.AddLayer(TNNetSiLU.Create());
     T := NN.GetLastLayer();
     Cat := NN.AddLayer(TNNetDeepConcat.Create([T, N4]));
     H4 := YoloAddC2f(NN, Refs, w2 + w3, w3, d0, False, 'model.18');  // head /16
-    T := NN.AddLayerAfter(TNNetConvolutionLinear.Create(w3, 3, 1, 2, 0), H4);
+    T := NN.AddLayerAfter(TNNetConvolutionLinear.Create(w3, 3, 1, 2, 0).MakeInferenceOnly(pInferenceOnly), H4);
     YoloPushConv(Refs, T, w3, 3, 'model.19'); NN.AddLayer(TNNetSiLU.Create());
     T := NN.GetLastLayer();
     Cat := NN.AddLayer(TNNetDeepConcat.Create([T, P5]));
@@ -57009,24 +57024,24 @@ begin
       Pref := 'model.22';
       // box branch cv2[i]: Conv3 -> Conv3 -> Conv2d(4*rm,+bias)
       BoxConv[i][0] := NN.AddLayerAfter(
-        TNNetConvolutionLinear.Create(cb, 3, 1, 1, 0), HeadIn[i]);
+        TNNetConvolutionLinear.Create(cb, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly), HeadIn[i]);
       YoloPushConv(Refs, BoxConv[i][0], ci, 3, Pref + '.cv2.' + IntToStr(i) + '.0');
       NN.AddLayer(TNNetSiLU.Create());
-      BoxConv[i][1] := NN.AddLayer(TNNetConvolutionLinear.Create(cb, 3, 1, 1, 0));
+      BoxConv[i][1] := NN.AddLayer(TNNetConvolutionLinear.Create(cb, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly));
       YoloPushConv(Refs, BoxConv[i][1], cb, 3, Pref + '.cv2.' + IntToStr(i) + '.1');
       NN.AddLayer(TNNetSiLU.Create());
       BoxConv[i][2] := NN.AddLayer(
-        TNNetConvolutionLinear.Create(4 * rm, 1, 0, 1, 0));
+        TNNetConvolutionLinear.Create(4 * rm, 1, 0, 1, 0).MakeInferenceOnly(pInferenceOnly));
       BoxC := NN.GetLastLayer();
       // class branch cv3[i]: Conv3 -> Conv3 -> Conv2d(nc,+bias)
       ClsConv[i][0] := NN.AddLayerAfter(
-        TNNetConvolutionLinear.Create(cc, 3, 1, 1, 0), HeadIn[i]);
+        TNNetConvolutionLinear.Create(cc, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly), HeadIn[i]);
       YoloPushConv(Refs, ClsConv[i][0], ci, 3, Pref + '.cv3.' + IntToStr(i) + '.0');
       NN.AddLayer(TNNetSiLU.Create());
-      ClsConv[i][1] := NN.AddLayer(TNNetConvolutionLinear.Create(cc, 3, 1, 1, 0));
+      ClsConv[i][1] := NN.AddLayer(TNNetConvolutionLinear.Create(cc, 3, 1, 1, 0).MakeInferenceOnly(pInferenceOnly));
       YoloPushConv(Refs, ClsConv[i][1], cc, 3, Pref + '.cv3.' + IntToStr(i) + '.1');
       NN.AddLayer(TNNetSiLU.Create());
-      ClsConv[i][2] := NN.AddLayer(TNNetConvolutionLinear.Create(nc, 1, 0, 1, 0));
+      ClsConv[i][2] := NN.AddLayer(TNNetConvolutionLinear.Create(nc, 1, 0, 1, 0).MakeInferenceOnly(pInferenceOnly));
       ClsC := NN.GetLastLayer();
       // per-cell channel layout = [box(4*rm), cls(nc)]
       Cat := NN.AddLayer(TNNetDeepConcat.Create([BoxC, ClsC]));
@@ -57569,11 +57584,11 @@ begin
   try
     NN.AddLayer( TNNetInput.Create(NumPatches, 1, VisionHidden) );
     // linear_1: VisionHidden -> TextHidden (biased), per token.
-    Lin1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden) );
+    Lin1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden).MakeInferenceOnly(pInferenceOnly) );
     if GeluExact then AddClipHiddenAct(NN, chaGeluExact)
     else NN.AddLayer( TNNetGELU.Create() );  // gelu_new tanh approximation
     // linear_2: TextHidden -> TextHidden (biased), per token.
-    Lin2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden) );
+    Lin2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
     // weights (HF nn.Linear weight is [out, in]; LoadLlamaLinearWeights
     // handles the row-major [out,in] layout + the bias vector).
@@ -57943,7 +57958,7 @@ begin
     NN.AddLayer( TNNetInput.Create(NumPatches, 1, VisionHidden) );
     // SINGLE biased linear: VisionHidden -> TextHidden, per token (NO gelu,
     // NO second layer - unlike LLaVA's 2-layer MLP).
-    Lin := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden) );
+    Lin := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
     LoadLlamaLinearWeights(Reader, Lin, Prefix + 'linear.weight',
       VisionHidden, TextHidden, 0, -1, 0, Prefix + 'linear.bias');
@@ -58253,14 +58268,14 @@ begin
       Config.Audio.NumMelBins, 1) );
     Tower.AddLayer( TNNetPadXY.Create(1, 0) );
     Conv1 := Tower.AddLayer( TNNetConvolutionLinear.Create(
-      Config.Audio.DModel, 3, {Padding=}0, {Stride=}1) );
+      Config.Audio.DModel, 3, {Padding=}0, {Stride=}1).MakeInferenceOnly(pInferenceOnly) );
     AddWhisperExactGelu(Tower);
     Tower.AddLayer( TNNetPadXY.Create(1, 0) );
     Conv2 := Tower.AddLayer( TNNetConvolutionLinear.Create(
-      Config.Audio.DModel, 3, {Padding=}0, {Stride=}2) );
+      Config.Audio.DModel, 3, {Padding=}0, {Stride=}2).MakeInferenceOnly(pInferenceOnly) );
     AddWhisperExactGelu(Tower);
     EncPos := Tower.AddLayer(
-      TNNetLearnedPositionalEmbedding.Create(Config.Audio.MaxSourcePositions) );
+      TNNetLearnedPositionalEmbedding.Create(Config.Audio.MaxSourcePositions).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then Tower.MakeInferenceOnly();
     BuildWhisperStackBlocks(Tower, Config.Audio, Config.Audio.EncoderLayers,
       Config.Audio.EncoderHeads, Config.Audio.EncoderFFNDim,
@@ -58273,7 +58288,7 @@ begin
     PoolNorm.AddLayer( TNNetInput.Create(Config.NumAudioTokens, 1,
       Config.Audio.DModel) );
     FinalNorm := PoolNorm.AddLayer(
-      TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
+      TNNetTokenLayerNorm.Create(MarianLayerNormEps).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then PoolNorm.MakeInferenceOnly();
 
     // ---- weights ----
@@ -58330,7 +58345,7 @@ begin
   try
     NN.AddLayer( TNNetInput.Create(NumAudioTokens, 1, AudioHidden) );
     // linear: AudioHidden -> TextHidden (biased), per token.
-    Lin := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden) );
+    Lin := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden).MakeInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.MakeInferenceOnly();
     LoadLlamaLinearWeights(Reader, Lin, Prefix + 'linear.weight',
       AudioHidden, TextHidden, 0, -1, 0, Prefix + 'linear.bias');
@@ -59093,16 +59108,16 @@ begin
         TNNetCorrelationLookup.Create(Config.CorrRadius, Flow), CorrVol);
       // motion encoder: corr branch (1x1 -> relu)
       MencC1[it] := NN.AddLayerAfter(
-        TNNetConvolutionReLU.Create(16, 1, 0, 1), Lookup);
+        TNNetConvolutionReLU.Create(16, 1, 0, 1).MakeInferenceOnly(pInferenceOnly), Lookup);
       Cor := MencC1[it];
       // flow branch (7x7 -> relu -> 3x3 -> relu)
       MencF1[it] := NN.AddLayerAfter(
-        TNNetConvolutionReLU.Create(8, 7, 3, 1), Flow);
-      MencF2[it] := NN.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
+        TNNetConvolutionReLU.Create(8, 7, 3, 1).MakeInferenceOnly(pInferenceOnly), Flow);
+      MencF2[it] := NN.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1).MakeInferenceOnly(pInferenceOnly));
       Flo := MencF2[it];
       CorFlo := NN.AddLayer(TNNetDeepConcat.Create([Cor, Flo]));
       MencConv[it] := NN.AddLayerAfter(
-        TNNetConvolutionReLU.Create(mout - 2, 3, 1, 1), CorFlo);
+        TNNetConvolutionReLU.Create(mout - 2, 3, 1, 1).MakeInferenceOnly(pInferenceOnly), CorFlo);
       Motion := NN.AddLayer(TNNetDeepConcat.Create([MencConv[it], Flow]));
       // GRU input x = [motion ; inp]; state z = [net ; x]
       GruIn := NN.AddLayer(TNNetDeepConcat.Create([Motion, Inp]));
@@ -59113,8 +59128,8 @@ begin
       NetState := Gru;
       // flow head: conv 3x3 relu -> conv 3x3 (2)
       FHc1[it] := NN.AddLayerAfter(
-        TNNetConvolutionReLU.Create(32, 3, 1, 1), Gru);
-      FHc2[it] := NN.AddLayer(TNNetConvolutionLinear.Create(2, 3, 1, 1));
+        TNNetConvolutionReLU.Create(32, 3, 1, 1).MakeInferenceOnly(pInferenceOnly), Gru);
+      FHc2[it] := NN.AddLayer(TNNetConvolutionLinear.Create(2, 3, 1, 1).MakeInferenceOnly(pInferenceOnly));
       DFlow := FHc2[it];
       Flow := NN.AddLayer(TNNetSum.Create([Flow, DFlow]));
     end;
@@ -59796,16 +59811,16 @@ begin
   // adaLN_modulation: Linear(SiLU(c)) -> 6*hidden.
   SiluC := NN.AddLayerAfter(TNNetSiLU.Create(), CondLayer);
   Block.AdaLN := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(6 * d), SiluC);
+    TNNetPointwiseConvLinear.Create(6 * d).MakeInferenceOnly(pInferenceOnly), SiluC);
   // chunk layout: [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
   // gate_mlp] each of width d (matches DiT's chunk(6) order).
   // ---- attention sub-block ----
   LN1 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps), XInput);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), XInput);
   Mod1 := DiTModCond(NN, Block.AdaLN, {scale}1 * d, {shift}0 * d, d);
   FiLM1 := NN.AddLayer( TNNetFiLM.Create([LN1, Mod1]) );
   Block.QKV := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(3 * d), FiLM1);
+    TNNetPointwiseConvLinear.Create(3 * d).MakeInferenceOnly(pInferenceOnly), FiLM1);
   Block.AttnProj := NN.AddMultiHeadSelfAttention(Config.NumHeads,
     {CausalMask=}false);
   Attn := NN.GetLastLayer();
@@ -59817,13 +59832,13 @@ begin
   Res1 := NN.AddLayer( TNNetSum.Create([Gated1, XInput]) );
   // ---- MLP sub-block ----
   LN2 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps), Res1);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), Res1);
   Mod2 := DiTModCond(NN, Block.AdaLN, {scale}4 * d, {shift}3 * d, d);
   FiLM2 := NN.AddLayer( TNNetFiLM.Create([LN2, Mod2]) );
   Block.Fc1 := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(MlpHidden), FiLM2);
+    TNNetPointwiseConvLinear.Create(MlpHidden).MakeInferenceOnly(pInferenceOnly), FiLM2);
   NN.AddLayer( TNNetGELU.Create() ); // DiT gelu_tanh
-  Block.Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+  Block.Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly) );
   FfOut := NN.GetLastLayer();
   // gate_mlp (channels [5d..6d)).
   Gate2Slice := NN.AddLayerAfter(
@@ -59907,23 +59922,23 @@ begin
     // x_embedder: biased patch conv -> (Grid,Grid,d) -> tokens (NumPatches,1,d)
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
       d, Config.PatchSize, {pInputPadding=}0, {pStride=}Config.PatchSize,
-      {pSuppressBias=}0) );
+      {pSuppressBias=}0).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
     // + fixed 2-D sin-cos position embedding (loaded into a learned table).
     PosEmb := NN.AddLayer(
-      TNNetLearnedPositionalEmbedding.Create(NumPatches) );
+      TNNetLearnedPositionalEmbedding.Create(NumPatches).MakeInferenceOnly(pInferenceOnly) );
     XLayer := PosEmb;
 
     // input1: scalar timestep t -> t_embedder MLP.
     TInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
     TSin := NN.AddLayer( TNNetSinusoidalTimeEmbedding.Create(d) );
-    TFc0 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+    TFc0 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly) );
     TSilu := NN.AddLayer( TNNetSiLU.Create() );
-    TFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+    TFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly) );
     // input2: class id -> label embedding table.
     YInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
     YEmb := NN.AddLayer( TNNetEmbedding.Create(Config.NumClasses, d,
-      {EncodeZero=}1, {ScaleEmbedding=}1.0) );
+      {EncodeZero=}1, {ScaleEmbedding=}1.0).MakeInferenceOnly(pInferenceOnly) );
     // conditioning vector c = t_emb + y_emb (1,1,d).
     CondSum := NN.AddLayer( TNNetSum.Create([TFc2, YEmb]) );
 
@@ -59938,14 +59953,14 @@ begin
     // ---- final layer: adaLN (shift,scale) + linear + unpatchify ----
     FinalSilu := NN.AddLayerAfter(TNNetSiLU.Create(), CondSum);
     FinalModLayer := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(2 * d) ); // [shift, scale]
+      TNNetPointwiseConvLinear.Create(2 * d).MakeInferenceOnly(pInferenceOnly) ); // [shift, scale]
     FinalLN := NN.AddLayerAfter(
-      TNNetTokenLayerNorm.Create(Config.LayerNormEps), XLayer);
+      TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), XLayer);
     FinalMod := DiTModCond(NN, FinalModLayer, {scale}1 * d, {shift}0 * d, d);
     FinalFiLM := NN.AddLayer( TNNetFiLM.Create([FinalLN, FinalMod]) );
     FinalLin := NN.AddLayerAfter(
       TNNetPointwiseConvLinear.Create(
-        Config.PatchSize * Config.PatchSize * Config.OutChannels), FinalFiLM);
+        Config.PatchSize * Config.PatchSize * Config.OutChannels).MakeInferenceOnly(pInferenceOnly), FinalFiLM);
     // unpatchify: (NumPatches,1,p*p*out) -> (Grid,Grid,p*p*out) -> DepthToSpace
     NN.AddLayer( TNNetReshape.Create(Grid, Grid,
       Config.PatchSize * Config.PatchSize * Config.OutChannels) );
@@ -60274,14 +60289,14 @@ begin
   // adaLN_modulation: Linear(SiLU(c)) -> 6*d (shared per block, DiT layout).
   SiluC := NN.AddLayerAfter(TNNetSiLU.Create(), CondLayer);
   Block.AdaLN := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(6 * d), SiluC);
+    TNNetPointwiseConvLinear.Create(6 * d).MakeInferenceOnly(pInferenceOnly), SiluC);
   // ---- attention sub-block (scale-block-causal) ----
   LN1 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps), XInput);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), XInput);
   Mod1 := DiTModCond(NN, Block.AdaLN, {scale}1 * d, {shift}0 * d, d);
   FiLM1 := NN.AddLayer( TNNetFiLM.Create([LN1, Mod1]) );
   Block.QKV := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(3 * d), FiLM1);
+    TNNetPointwiseConvLinear.Create(3 * d).MakeInferenceOnly(pInferenceOnly), FiLM1);
   AttnStart := NN.CountLayers();
   Block.AttnProj := NN.AddMultiHeadSelfAttention(Config.NumHeads,
     {CausalMask=}false, {UseRoPE=}false, avSDPA, 1, 0, 32, 128,
@@ -60302,13 +60317,13 @@ begin
   Res1 := NN.AddLayer( TNNetSum.Create([Gated1, XInput]) );
   // ---- FFN sub-block ----
   LN2 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps), Res1);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), Res1);
   Mod2 := DiTModCond(NN, Block.AdaLN, {scale}4 * d, {shift}3 * d, d);
   FiLM2 := NN.AddLayer( TNNetFiLM.Create([LN2, Mod2]) );
   Block.Fc1 := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(MlpHidden), FiLM2);
+    TNNetPointwiseConvLinear.Create(MlpHidden).MakeInferenceOnly(pInferenceOnly), FiLM2);
   NN.AddLayer( TNNetGELU.Create() );
-  Block.Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+  Block.Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly) );
   Gate2Slice := NN.AddLayerAfter(
     TNNetSplitChannels.Create(5 * d, d), Block.AdaLN);
   Gated2 := NN.AddLayer(
@@ -60335,21 +60350,21 @@ begin
     // input0: token index sequence (SeqLen,1,1) -> word_embed table -> (SeqLen,1,d)
     TokInput := NN.AddLayer( TNNetInput.Create(Config.SeqLen, 1, 1) );
     WordEmb := NN.AddLayer( TNNetEmbedding.Create(Config.VocabSize, d,
-      {EncodeZero=}1, {ScaleEmbedding=}1.0) );
+      {EncodeZero=}1, {ScaleEmbedding=}1.0).MakeInferenceOnly(pInferenceOnly) );
     // input1: per-token scale id (SeqLen,1,1). Used BOTH for the level embedding
     // (lvl_embed table) AND the scale-block-causal attention mask side channel.
     ScaleInput := NN.AddLayer( TNNetInput.Create(Config.SeqLen, 1, 1) );
     LvlEmb := NN.AddLayer( TNNetEmbedding.Create(Config.NumScales, d,
-      {EncodeZero=}1, {ScaleEmbedding=}1.0) );
+      {EncodeZero=}1, {ScaleEmbedding=}1.0).MakeInferenceOnly(pInferenceOnly) );
     // x = word_embed + lvl_embed + pos_embed.
     XLayer := NN.AddLayer( TNNetSum.Create([WordEmb, LvlEmb]) );
     PosEmb := NN.AddLayer(
-      TNNetLearnedPositionalEmbedding.Create(Config.SeqLen) );
+      TNNetLearnedPositionalEmbedding.Create(Config.SeqLen).MakeInferenceOnly(pInferenceOnly) );
     XLayer := PosEmb;
     // input2: class id (1,1,1) -> class_emb -> conditioning vector c (1,1,d).
     ClassInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
     ClassEmb := NN.AddLayer( TNNetEmbedding.Create(Config.NumClasses, d,
-      {EncodeZero=}1, {ScaleEmbedding=}1.0) );
+      {EncodeZero=}1, {ScaleEmbedding=}1.0).MakeInferenceOnly(pInferenceOnly) );
     CondLayer := ClassEmb;
     if pInferenceOnly then NN.MakeInferenceOnly();
 
@@ -60361,13 +60376,13 @@ begin
     // ---- final adaLN head -> per-token logits (SeqLen,1,VocabSize) ----
     FinalSilu := NN.AddLayerAfter(TNNetSiLU.Create(), CondLayer);
     FinalModLayer := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(2 * d) ); // [shift, scale]
+      TNNetPointwiseConvLinear.Create(2 * d).MakeInferenceOnly(pInferenceOnly) ); // [shift, scale]
     FinalLN := NN.AddLayerAfter(
-      TNNetTokenLayerNorm.Create(Config.LayerNormEps), XLayer);
+      TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), XLayer);
     FinalMod := DiTModCond(NN, FinalModLayer, {scale}1 * d, {shift}0 * d, d);
     FinalFiLM := NN.AddLayer( TNNetFiLM.Create([FinalLN, FinalMod]) );
     HeadLin := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.VocabSize), FinalFiLM);
+      TNNetPointwiseConvLinear.Create(Config.VocabSize).MakeInferenceOnly(pInferenceOnly), FinalFiLM);
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // ---------------- Weights ----------------
@@ -60612,7 +60627,7 @@ begin
   // scale_mlp, gate_mlp], each width d.
   // ---- self-attention sub-block (adaLN-modulated) ----
   LN1 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps), XInput);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), XInput);
   FiLM1 := NN.AddLayer( TNNetFiLM.Create(
     [LN1, DiTModCond(NN, Mod6, {scale}1 * d, {shift}0 * d, d)]) );
   SelfOut := AddPixArtAttention(NN, d, Config.NumHeads, FiLM1, FiLM1,
@@ -60626,15 +60641,15 @@ begin
   Res2 := NN.AddLayer( TNNetSum.Create([CrossOut, Res1]) );
   // ---- feed-forward sub-block (adaLN-modulated, GEGLU/erf) ----
   LN2 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps), Res2);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), Res2);
   FiLM2 := NN.AddLayer( TNNetFiLM.Create(
     [LN2, DiTModCond(NN, Mod6, {scale}4 * d, {shift}3 * d, d)]) );
   // GEGLU: net.0.proj -> (2*mlp); split a|gate; a * erf_gelu(gate); net.2.
   Block.Ff0 := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(2 * Config.MlpHidden), FiLM2);
+    TNNetPointwiseConvLinear.Create(2 * Config.MlpHidden).MakeInferenceOnly(pInferenceOnly), FiLM2);
   Geglu := NN.AddLayer( TNNetGEGLUErf.Create() ); // erf-gelu gated linear unit
   Block.Ff2 := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(d), Geglu);
+    TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly), Geglu);
   FfOut := Block.Ff2;
   Gate2Slice := NN.AddLayerAfter(TNNetSplitChannels.Create(5 * d, d), Mod6);
   Gated2 := NN.AddLayer( TNNetChannelMulByLayer.Create(FfOut, Gate2Slice) );
@@ -60691,9 +60706,9 @@ begin
     LatentInput := NN.AddLayer( TNNetInput.Create(
       Config.SampleSize, Config.SampleSize, Config.InChannels) );
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-      d, Config.PatchSize, 0, Config.PatchSize, {pSuppressBias=}0) );
+      d, Config.PatchSize, 0, Config.PatchSize, {pSuppressBias=}0).MakeInferenceOnly(pInferenceOnly) );
     NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
-    PosEmb := NN.AddLayer( TNNetLearnedPositionalEmbedding.Create(NumPatches) );
+    PosEmb := NN.AddLayer( TNNetLearnedPositionalEmbedding.Create(NumPatches).MakeInferenceOnly(pInferenceOnly) );
     XLayer := PosEmb;
 
     // input1: scalar timestep t -> 256-d sinusoid -> TimestepEmbedder ->
@@ -60701,18 +60716,18 @@ begin
     TInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
     TSin := NN.AddLayerAfter(
       TNNetSinusoidalTimeEmbedding.Create(256), TInput );
-    TFc0 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+    TFc0 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly) );
     TSilu0 := NN.AddLayer( TNNetSiLU.Create() );
-    TFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) ); // embedded_timestep
+    TFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly) ); // embedded_timestep
     AdalnSilu := NN.AddLayerAfter( TNNetSiLU.Create(), TFc2 );
-    AdalnLin := NN.AddLayer( TNNetPointwiseConvLinear.Create(6 * d) ); // shared adaln
+    AdalnLin := NN.AddLayer( TNNetPointwiseConvLinear.Create(6 * d).MakeInferenceOnly(pInferenceOnly) ); // shared adaln
 
     // input2: T5 encoder states -> caption_projection (Linear->gelu_tanh->Linear).
     TextInput := NN.AddLayer( TNNetInput.Create(
       Config.TextSeqLen, 1, Config.CaptionChannels) );
-    CapFc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+    CapFc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly) );
     CapGelu := NN.AddLayer( TNNetGELU.Create() ); // gelu approximate='tanh'
-    CapFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+    CapFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly) );
     EncLayer := CapFc2;
 
     if pInferenceOnly then NN.MakeInferenceOnly();
@@ -60731,14 +60746,14 @@ begin
       TNNetChannelBias.Create(),
       NN.AddLayer( TNNetDeepConcat.Create([TFc2, TFc2]) ) );
     FinalLN := NN.AddLayerAfter(
-      TNNetTokenLayerNorm.Create(Config.LayerNormEps), XLayer);
+      TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), XLayer);
     // diffusers chunk order is [shift, scale]; DiTModCond reads scale at
     // ScaleStart, shift at ShiftStart.
     FinalFiLM := NN.AddLayer( TNNetFiLM.Create(
       [FinalLN, DiTModCond(NN, FinalScaleShift, {scale}1 * d, {shift}0 * d, d)]) );
     FinalLin := NN.AddLayerAfter(
       TNNetPointwiseConvLinear.Create(
-        Config.PatchSize * Config.PatchSize * Config.OutChannels), FinalFiLM);
+        Config.PatchSize * Config.PatchSize * Config.OutChannels).MakeInferenceOnly(pInferenceOnly), FinalFiLM);
     NN.AddLayer( TNNetReshape.Create(Grid, Grid,
       Config.PatchSize * Config.PatchSize * Config.OutChannels) );
     NN.AddLayer( TNNetDepthToSpace.Create(Config.PatchSize) );
@@ -61008,28 +61023,28 @@ begin
   // scale_mlp, gate_mlp] each width d.
   ImgSilu := NN.AddLayerAfter(TNNetSiLU.Create(), CondInput);
   Block.ImgAdaLN := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(6 * d), ImgSilu);
+    TNNetPointwiseConvLinear.Create(6 * d).MakeInferenceOnly(pInferenceOnly), ImgSilu);
   TxtSilu := NN.AddLayerAfter(TNNetSiLU.Create(), CondInput);
   Block.TxtAdaLN := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(6 * d), TxtSilu);
+    TNNetPointwiseConvLinear.Create(6 * d).MakeInferenceOnly(pInferenceOnly), TxtSilu);
 
   // ---- normed + modulated streams (msa branch) ----
   ImgLN1 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps), ImgInput);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), ImgInput);
   ImgFiLM1 := NN.AddLayer( TNNetFiLM.Create(
     [ImgLN1, DiTModCond(NN, Block.ImgAdaLN, {scale}1 * d, {shift}0 * d, d)]) );
   TxtLN1 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps), TxtInput);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), TxtInput);
   TxtFiLM1 := NN.AddLayer( TNNetFiLM.Create(
     [TxtLN1, DiTModCond(NN, Block.TxtAdaLN, {scale}1 * d, {shift}0 * d, d)]) );
 
   // ---- per-stream q/k/v projections ----
-  Block.ImgQ := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d), ImgFiLM1);
-  Block.ImgK := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d), ImgFiLM1);
-  Block.ImgV := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d), ImgFiLM1);
-  Block.TxtQ := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d), TxtFiLM1);
-  Block.TxtK := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d), TxtFiLM1);
-  Block.TxtV := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d), TxtFiLM1);
+  Block.ImgQ := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly), ImgFiLM1);
+  Block.ImgK := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly), ImgFiLM1);
+  Block.ImgV := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly), ImgFiLM1);
+  Block.TxtQ := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly), TxtFiLM1);
+  Block.TxtK := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly), TxtFiLM1);
+  Block.TxtV := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly), TxtFiLM1);
 
   // ---- JOINT attention: per head, concat [img;txt] on the SEQUENCE axis ----
   SetLength(HeadOutputs, Heads);
@@ -61065,8 +61080,8 @@ begin
   // ---- split the joint output back per stream on the SEQUENCE (X) axis ----
   ImgAttn := NN.AddLayerAfter(TNNetCrop.Create(0, 0, ImgLen, 1), JointOut);
   TxtAttn := NN.AddLayerAfter(TNNetCrop.Create(ImgLen, 0, TxtLen, 1), JointOut);
-  Block.ImgOut := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d), ImgAttn);
-  Block.TxtOut := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d), TxtAttn);
+  Block.ImgOut := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly), ImgAttn);
+  Block.TxtOut := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly), TxtAttn);
 
   // ---- gated residual (gate_msa is the THIRD adaLN chunk, slice 2*d..3*d) ----
   ImgGate1 := NN.AddLayerAfter(TNNetSplitChannels.Create(2 * d, d), Block.ImgAdaLN);
@@ -61078,26 +61093,26 @@ begin
 
   // ---- per-stream MLP (mlp branch: scale_mlp slice 4*d, shift_mlp slice 3*d) ----
   ImgLN2 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps), ImgRes1);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), ImgRes1);
   ImgFiLM2 := NN.AddLayer( TNNetFiLM.Create(
     [ImgLN2, DiTModCond(NN, Block.ImgAdaLN, {scale}4 * d, {shift}3 * d, d)]) );
   Block.ImgFf0 := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(Config.MlpHidden), ImgFiLM2);
+    TNNetPointwiseConvLinear.Create(Config.MlpHidden).MakeInferenceOnly(pInferenceOnly), ImgFiLM2);
   NN.AddLayer( TNNetGELU.Create() ); // gelu approximate='tanh'
-  Block.ImgFf2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+  Block.ImgFf2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly) );
   ImgFf := Block.ImgFf2;
   ImgGate2 := NN.AddLayerAfter(TNNetSplitChannels.Create(5 * d, d), Block.ImgAdaLN);
   ImgGated2 := NN.AddLayer( TNNetChannelMulByLayer.Create(ImgFf, ImgGate2) );
   ImgOutLayer := NN.AddLayer( TNNetSum.Create([ImgGated2, ImgRes1]) );
 
   TxtLN2 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps), TxtRes1);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly), TxtRes1);
   TxtFiLM2 := NN.AddLayer( TNNetFiLM.Create(
     [TxtLN2, DiTModCond(NN, Block.TxtAdaLN, {scale}4 * d, {shift}3 * d, d)]) );
   Block.TxtFf0 := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(Config.MlpHidden), TxtFiLM2);
+    TNNetPointwiseConvLinear.Create(Config.MlpHidden).MakeInferenceOnly(pInferenceOnly), TxtFiLM2);
   NN.AddLayer( TNNetGELU.Create() );
-  Block.TxtFf2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+  Block.TxtFf2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).MakeInferenceOnly(pInferenceOnly) );
   TxtFf := Block.TxtFf2;
   TxtGate2 := NN.AddLayerAfter(TNNetSplitChannels.Create(5 * d, d), Block.TxtAdaLN);
   TxtGated2 := NN.AddLayer( TNNetChannelMulByLayer.Create(TxtFf, TxtGate2) );
@@ -61477,7 +61492,7 @@ begin
       // (W'*H'*T', 1, hidden) in native (h, w, t) order (token (h*W'+w)*T'+t).
       NN.AddLayer( TNNetReshape.Create(NumTokens, 1, Config.HiddenSize) );
       PosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(NumTokens) );
+        TNNetLearnedPositionalEmbedding.Create(NumTokens).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
 
       SetLength(Blocks, Config.NumLayers);
@@ -61489,9 +61504,9 @@ begin
       // the SizeX*SizeY=NumTokens cells per hidden channel (SizeY=1).
       NN.AddLayer( TNNetAvgChannel.Create() );
       FcNorm := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).MakeInferenceOnly(pInferenceOnly) );
       Classifier := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.NumLabels) );
+        TNNetPointwiseConvLinear.Create(Config.NumLabels).MakeInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.MakeInferenceOnly();
 
       // ---------------- Weights ----------------
