@@ -78286,6 +78286,7 @@ var
   Bins: array of integer;
   MaxBin, MaxBarWidth, BarLen: integer;
   BinLo, BinHi: TNeuralFloat;
+  UnitsM1, cBinsM1: integer;
 begin
   Result := '';
   Lines := TStringList.Create();
@@ -78340,7 +78341,7 @@ begin
     WorstName := '';
     Reported := 0;
 
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to NNLastIdx do
     begin
       Layer := NN.Layers[LayerIdx];
       IsRelu :=
@@ -78353,9 +78354,10 @@ begin
 
       Units := Layer.Output.Size;
       if Units = 0 then Continue;
+      UnitsM1 := Units - 1;
 
       SetLength(MaxAbs, Units);
-      for UnitIdx := 0 to Units - 1 do MaxAbs[UnitIdx] := 0;
+      for UnitIdx := 0 to UnitsM1 do MaxAbs[UnitIdx] := 0;
       ZeroSum := 0;
 
       LpBnd144 := Samples.Count - 1;
@@ -78363,7 +78365,7 @@ begin
       begin
         NN.Compute(Samples[SampleIdx]);
         ZeroCount := 0;
-        for UnitIdx := 0 to Units - 1 do
+        for UnitIdx := 0 to UnitsM1 do
         begin
           V := Abs(Layer.Output.Raw[UnitIdx]);
           if V > MaxAbs[UnitIdx] then MaxAbs[UnitIdx] := V;
@@ -78373,7 +78375,7 @@ begin
       end;
 
       DeadUnits := 0;
-      for UnitIdx := 0 to Units - 1 do
+      for UnitIdx := 0 to UnitsM1 do
         if MaxAbs[UnitIdx] <= DeadThreshold then Inc(DeadUnits);
 
       DeadFrac := DeadUnits / Units;
@@ -78402,8 +78404,9 @@ begin
 
     // 10-bin histogram of dead% across reported layers, range [0, 100].
     SetLength(Bins, cBins);
-    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    cBinsM1 := cBins - 1;
+    for BinIdx := 0 to cBinsM1 do Bins[BinIdx] := 0;
+    for LayerIdx := 0 to NNLastIdx do
     begin
       if not PerLayerHasData[LayerIdx] then Continue;
       BinIdx := Trunc(PerLayerDeadFrac[LayerIdx] * cBins);
@@ -78412,12 +78415,12 @@ begin
       Inc(Bins[BinIdx]);
     end;
     MaxBin := 0;
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
       if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
     MaxBarWidth := 40;
     Lines.Add(Format('Histogram of dead%% across %d ReLU-family layer(s):',
       [Reported]));
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
     begin
       BinLo := BinIdx * (100.0 / cBins);
       BinHi := (BinIdx + 1) * (100.0 / cBins);
@@ -78464,6 +78467,7 @@ var
   LpBnd146: integer;
   LpBnd147: integer;
   LpBnd148: integer;
+  LastLayerIdx, cBinsM1, NetParamCntM1, LayerParamM1: integer;
   Lines: TStringList;
   LayerIdx, NeuronIdx, K, SampleIdx, BinIdx: integer;
   FlatIdx, P: integer;
@@ -78516,6 +78520,8 @@ begin
     end;
 
     // --- Catalogue trainable layers and lay out a flat parameter index. ---
+    LastLayerIdx := NN.GetLastLayerIdx();
+    cBinsM1 := cBins - 1;
     SetLength(LayerFisherSum, NN.CountLayers());
     SetLength(LayerFisherMax, NN.CountLayers());
     SetLength(LayerNearZero, NN.CountLayers());
@@ -78526,7 +78532,7 @@ begin
 
     NetParamCnt := 0;
     TrainableLayers := 0;
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LayerIdx];
       LayerFisherSum[LayerIdx] := 0;
@@ -78560,7 +78566,8 @@ begin
     // One bounded scratch float per trainable parameter; accumulates the
     // sum-over-batch of squared per-parameter gradients.
     SetLength(ParamFisher, NetParamCnt);
-    for P := 0 to NetParamCnt - 1 do ParamFisher[P] := 0;
+    NetParamCntM1 := NetParamCnt - 1;
+    for P := 0 to NetParamCntM1 do ParamFisher[P] := 0;
 
     // Why batch update: Delta accumulates -LR * gradient only when batch update
     // is on; otherwise the gradient is consumed inline and never lands in Delta
@@ -78596,7 +78603,7 @@ begin
         NN.Backpropagate(Target);
 
         // Accumulate squared per-parameter gradients into the flat array.
-        for LayerIdx := 0 to NN.GetLastLayerIdx() do
+        for LayerIdx := 0 to LastLayerIdx do
         begin
           if not LayerHasParams[LayerIdx] then Continue;
           Layer := NN.Layers[LayerIdx];
@@ -78635,7 +78642,7 @@ begin
 
     // --- Reduce per-parameter mean Fisher into per-layer / network stats. ---
     SetLength(Bins, cBins);
-    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+    for BinIdx := 0 to cBinsM1 do Bins[BinIdx] := 0;
     NetFisherSum := 0;
     NetFisherSqSum := 0;
     NetNearZero := 0;
@@ -78644,11 +78651,12 @@ begin
     HistMin := 0;
     HistMax := 0;
 
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       if not LayerHasParams[LayerIdx] then Continue;
       P := FlatBase[LayerIdx];
-      for FlatIdx := 0 to LayerParamCnt[LayerIdx] - 1 do
+      LayerParamM1 := LayerParamCnt[LayerIdx] - 1;
+      for FlatIdx := 0 to LayerParamM1 do
       begin
         FVal := ParamFisher[P] / ProcessedSamples; // mean Fisher per param
         ParamFisher[P] := FVal;                    // store back the mean
@@ -78686,11 +78694,12 @@ begin
     begin
       Span := HistMax - HistMin;
       if Span <= 0 then Span := 1.0;
-      for LayerIdx := 0 to NN.GetLastLayerIdx() do
+      for LayerIdx := 0 to LastLayerIdx do
       begin
         if not LayerHasParams[LayerIdx] then Continue;
         P := FlatBase[LayerIdx];
-        for FlatIdx := 0 to LayerParamCnt[LayerIdx] - 1 do
+        LayerParamM1 := LayerParamCnt[LayerIdx] - 1;
+        for FlatIdx := 0 to LayerParamM1 do
         begin
           FVal := ParamFisher[P];
           if FVal > 0 then
@@ -78714,7 +78723,7 @@ begin
 
     // High-importance threshold: top 10% of the largest per-layer Fisher mass.
     MassThreshold := 0;
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to LastLayerIdx do
       if LayerHasParams[LayerIdx] then
         if LayerFisherSum[LayerIdx] > MassThreshold then
           MassThreshold := LayerFisherSum[LayerIdx];
@@ -78732,7 +78741,7 @@ begin
        'Zero%', 'flags']));
     Lines.Add(StringOfChar('-', 108));
 
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       if not LayerHasParams[LayerIdx] then Continue;
       if NetFisherSum > 0 then
@@ -78780,11 +78789,11 @@ begin
     else
     begin
       MaxBin := 0;
-      for BinIdx := 0 to cBins - 1 do
+      for BinIdx := 0 to cBinsM1 do
         if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
       Span := HistMax - HistMin;
       if Span <= 0 then Span := 1.0;
-      for BinIdx := 0 to cBins - 1 do
+      for BinIdx := 0 to cBinsM1 do
       begin
         BinLo := HistMin + BinIdx * (Span / cBins);
         BinHi := HistMin + (BinIdx + 1) * (Span / cBins);
@@ -78835,6 +78844,8 @@ var
   LpBnd150: integer;
   LpBnd151: integer;
   LpBnd152: integer;
+  LastLayerIdx, cBinsM1, NumClassesM1, UsableCountM1: integer;
+  ScopeParamCntM1, PairCountM1, MM1, LayerParamM1: integer;
   Lines: TStringList;
   LIdx, NeuronIdx, K, SampleIdx, BinIdx, P, I, J: integer;
   Layer: TNNetLayer;
@@ -78898,6 +78909,8 @@ begin
     end;
 
     // --- Catalogue trainable layers and lay out a flat parameter index. ---
+    LastLayerIdx := NN.GetLastLayerIdx();
+    cBinsM1 := cBins - 1;
     SetLength(LayerHasParams, NN.CountLayers());
     SetLength(LayerInScope, NN.CountLayers());
     SetLength(FlatBase, NN.CountLayers());
@@ -78905,7 +78918,7 @@ begin
 
     NetParamCnt := 0;
     TrainableLayers := 0;
-    for LIdx := 0 to NN.GetLastLayerIdx() do
+    for LIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LIdx];
       LayerHasParams[LIdx] := false;
@@ -78943,7 +78956,7 @@ begin
     end
     else
     begin
-      for LIdx := 0 to NN.GetLastLayerIdx() do
+      for LIdx := 0 to LastLayerIdx do
         LayerInScope[LIdx] := LayerHasParams[LIdx];
       if LayerIdx >= 0 then
         RestrictName := Format('requested layer %d has no params; ' +
@@ -78955,11 +78968,12 @@ begin
     // Map each net-flat parameter to a scope-flat slot (-1 if out of scope).
     SetLength(ScopeMap, NetParamCnt);
     ScopeFlat := 0;
-    for LIdx := 0 to NN.GetLastLayerIdx() do
+    for LIdx := 0 to LastLayerIdx do
     begin
       if not LayerHasParams[LIdx] then Continue;
       P := FlatBase[LIdx];
-      for K := 0 to LayerParamCnt[LIdx] - 1 do
+      LayerParamM1 := LayerParamCnt[LIdx] - 1;
+      for K := 0 to LayerParamM1 do
       begin
         if LayerInScope[LIdx] then
         begin
@@ -78972,6 +78986,7 @@ begin
       end;
     end;
     ScopeParamCnt := ScopeFlat;
+    ScopeParamCntM1 := ScopeParamCnt - 1;
 
     if ScopeParamCnt = 0 then
     begin
@@ -79019,7 +79034,7 @@ begin
         // Flatten this sample's in-scope per-parameter gradient vector.
         SetLength(Grads[UsableCount], ScopeParamCnt);
         SumSq := 0;
-        for LIdx := 0 to NN.GetLastLayerIdx() do
+        for LIdx := 0 to LastLayerIdx do
         begin
           if not LayerInScope[LIdx] then Continue;
           Layer := NN.Layers[LIdx];
@@ -79068,10 +79083,11 @@ begin
         'samples (need >=2 non-zero gradient vectors).' + sLineBreak;
       Exit;
     end;
+    UsableCountM1 := UsableCount - 1;
 
     // --- Pairwise cosine sweep (i<j). Diagonal cos(g_i,g_i)=1 is implicit. ---
     SetLength(Bins, cBins);
-    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+    for BinIdx := 0 to cBinsM1 do Bins[BinIdx] := 0;
     SetLength(CosList, (UsableCount * (UsableCount - 1)) div 2);
     PairCount := 0;
     NegCount := 0;
@@ -79083,15 +79099,16 @@ begin
 
     // class-pair accumulators (only when labels are decodable)
     NumClasses := OutSize;
+    NumClassesM1 := NumClasses - 1;
     if HaveLabels and (NumClasses > 0) then
     begin
       SetLength(ClassPairSum, NumClasses);
       SetLength(ClassPairCnt, NumClasses);
-      for CA := 0 to NumClasses - 1 do
+      for CA := 0 to NumClassesM1 do
       begin
         SetLength(ClassPairSum[CA], NumClasses);
         SetLength(ClassPairCnt[CA], NumClasses);
-        for CB := 0 to NumClasses - 1 do
+        for CB := 0 to NumClassesM1 do
         begin
           ClassPairSum[CA][CB] := 0;
           ClassPairCnt[CA][CB] := 0;
@@ -79099,11 +79116,11 @@ begin
       end;
     end;
 
-    for I := 0 to UsableCount - 1 do
-      for J := I + 1 to UsableCount - 1 do
+    for I := 0 to UsableCountM1 do
+      for J := I + 1 to UsableCountM1 do
       begin
         Dot := 0;
-        for K := 0 to ScopeParamCnt - 1 do
+        for K := 0 to ScopeParamCntM1 do
           Dot := Dot + Grads[I][K] * Grads[J][K];
         Cos := Dot / (Norms[I] * Norms[J]);
         if Cos > 1.0 then Cos := 1.0;
@@ -79145,9 +79162,10 @@ begin
       end;
 
     MeanCos := Sum / PairCount;
+    PairCountM1 := PairCount - 1;
 
     // median via an in-place insertion-ordered copy (PairCount is small here).
-    for I := 1 to PairCount - 1 do
+    for I := 1 to PairCountM1 do
     begin
       V := CosList[I];
       J := I - 1;
@@ -79167,10 +79185,10 @@ begin
     // --- Built-in correctness checks: self-cosine diagonal and symmetry. ---
     // Diagonal: max |cos(g_i,g_i) - 1| over all usable samples.
     DiagOK := 0;
-    for I := 0 to UsableCount - 1 do
+    for I := 0 to UsableCountM1 do
     begin
       Dot := 0;
-      for K := 0 to ScopeParamCnt - 1 do
+      for K := 0 to ScopeParamCntM1 do
         Dot := Dot + Grads[I][K] * Grads[I][K];
       Cos := Dot / (Norms[I] * Norms[I]);
       if Abs(Cos - 1.0) > DiagOK then DiagOK := Abs(Cos - 1.0);
@@ -79181,16 +79199,17 @@ begin
     SymOK := 0;
     M := UsableCount;
     if M > 8 then M := 8;
-    for I := 0 to M - 1 do
-      for J := 0 to M - 1 do
+    MM1 := M - 1;
+    for I := 0 to MM1 do
+      for J := 0 to MM1 do
         if I <> J then
         begin
           Dot := 0;
-          for K := 0 to ScopeParamCnt - 1 do
+          for K := 0 to ScopeParamCntM1 do
             Dot := Dot + Grads[I][K] * Grads[J][K];
           Cos := Dot / (Norms[I] * Norms[J]);
           Dot := 0;
-          for K := 0 to ScopeParamCnt - 1 do
+          for K := 0 to ScopeParamCntM1 do
             Dot := Dot + Grads[J][K] * Grads[I][K];
           V := Dot / (Norms[J] * Norms[I]);
           if Abs(Cos - V) > SymOK then SymOK := Abs(Cos - V);
@@ -79209,9 +79228,9 @@ begin
 
     Lines.Add('Pairwise cosine histogram (bins over [-1, 1]):');
     MaxBin := 0;
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
       if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
     begin
       BinLo := -1.0 + BinIdx * (2.0 / cBins);
       BinHi := -1.0 + (BinIdx + 1) * (2.0 / cBins);
@@ -79249,13 +79268,13 @@ begin
         'diagonal = within-class):');
       // header row
       Bar := '      ';
-      for CB := 0 to NumClasses - 1 do
+      for CB := 0 to NumClassesM1 do
         Bar := Bar + Format('%8d', [CB]);
       Lines.Add(Bar);
-      for CA := 0 to NumClasses - 1 do
+      for CA := 0 to NumClassesM1 do
       begin
         Bar := Format('  [%2d]', [CA]);
-        for CB := 0 to NumClasses - 1 do
+        for CB := 0 to NumClassesM1 do
         begin
           if ClassPairCnt[CA][CB] > 0 then
           begin
@@ -79271,10 +79290,10 @@ begin
       Lines.Add('');
       Lines.Add('  (glyph map: ' + cGlyphs +
         ' from cos=-1 [most opposed] to cos=+1 [aligned])');
-      for CA := 0 to NumClasses - 1 do
+      for CA := 0 to NumClassesM1 do
       begin
         Bar := Format('  [%2d] ', [CA]);
-        for CB := 0 to NumClasses - 1 do
+        for CB := 0 to NumClassesM1 do
         begin
           if ClassPairCnt[CA][CB] > 0 then
           begin
@@ -79322,6 +79341,7 @@ const
   cBuckets = ' .:-=+*#%@';   // 10 intensity buckets (index 0 = blank/zero)
 var
   LpBnd153: integer;
+  InXM1, InYM1, InDepthM1, HeatMaxIdx, MaxRTrunc: integer;
   Lines: TStringList;
   InX, InY, InDepth: integer;
   SpatialIdx, LastIdx: integer;
@@ -79391,6 +79411,10 @@ begin
     InDepth := InLayer.Output.Depth;
     if InX < 1 then InX := 1;
     if InY < 1 then InY := 1;
+    InXM1 := InX - 1;
+    InYM1 := InY - 1;
+    InDepthM1 := InDepth - 1;
+    HeatMaxIdx := InX * InY - 1;
 
     // Pick the FINAL SPATIAL layer (deepest layer that still has a 2-D map);
     // fall back to the last layer when nothing past the input keeps a map.
@@ -79412,7 +79436,7 @@ begin
     if CenterUnit < 0 then CenterUnit := 0;
 
     SetLength(Heat, InX * InY);
-    for Gi := 0 to InX * InY - 1 do Heat[Gi] := 0;
+    for Gi := 0 to HeatMaxIdx do Heat[Gi] := 0;
 
     // Enable input-gradient flow so the backward pass deposits the gradient on
     // the input layer. A clean Compute below sizes the input Output first.
@@ -79444,11 +79468,11 @@ begin
       if (InLayer.OutputError <> nil) and
          (InLayer.OutputError.Size = InX * InY * InDepth) then
       begin
-        for Py := 0 to InY - 1 do
-          for Px := 0 to InX - 1 do
+        for Py := 0 to InYM1 do
+          for Px := 0 to InXM1 do
           begin
             AbsV := 0;
-            for Ch := 0 to InDepth - 1 do
+            for Ch := 0 to InDepthM1 do
             begin
               FlatIdx := InLayer.OutputError.GetRawPos(Px, Py, Ch);
               AbsV := AbsV + Abs(InLayer.OutputError.Raw[FlatIdx]);
@@ -79504,7 +79528,7 @@ begin
 
     // total mass + max for normalisation
     TotalMass := 0; MaxHeat := 0;
-    for Gi := 0 to InX * InY - 1 do
+    for Gi := 0 to HeatMaxIdx do
     begin
       TotalMass := TotalMass + Heat[Gi];
       if Heat[Gi] > MaxHeat then MaxHeat := Heat[Gi];
@@ -79527,10 +79551,10 @@ begin
     Lines.Add('');
     Lines.Add('Input-plane sensitivity |d out_centre / d in| ' +
       '(summed over depth, shaded by own max):');
-    for Py := 0 to InY - 1 do
+    for Py := 0 to InYM1 do
     begin
       RowStr := '  ';
-      for Px := 0 to InX - 1 do
+      for Px := 0 to InXM1 do
       begin
         V := Heat[Py * InX + Px];
         if MaxHeat > cEps then
@@ -79546,8 +79570,8 @@ begin
 
     // ------------------------------------------------ centroid + spatial std
     SumW := 0; SumX := 0; SumY := 0; SumXX := 0; SumYY := 0;
-    for Py := 0 to InY - 1 do
-      for Px := 0 to InX - 1 do
+    for Py := 0 to InYM1 do
+      for Px := 0 to InXM1 do
       begin
         V := Heat[Py * InX + Px];
         SumW := SumW + V;
@@ -79556,8 +79580,8 @@ begin
       end;
     MeanX := SumX / SumW;
     MeanY := SumY / SumW;
-    for Py := 0 to InY - 1 do
-      for Px := 0 to InX - 1 do
+    for Py := 0 to InYM1 do
+      for Px := 0 to InXM1 do
       begin
         V := Heat[Py * InX + Px];
         SumXX := SumXX + V * (Px - MeanX) * (Px - MeanX);
@@ -79573,15 +79597,16 @@ begin
     CX := (InX - 1) / 2.0;
     CY := (InY - 1) / 2.0;
     if InX > InY then MaxR := InX else MaxR := InY;
+    MaxRTrunc := Trunc(MaxR);
     NeededMass := MassFraction * TotalMass;
     EffRadiusX := InX;       // worst case: full plane
     EffRadiusY := InY;
     EffRadius := Trunc(MaxR);
-    for rad := 0 to Trunc(MaxR) do
+    for rad := 0 to MaxRTrunc do
     begin
       BoxMass := 0;
-      for Py := 0 to InY - 1 do
-        for Px := 0 to InX - 1 do
+      for Py := 0 to InYM1 do
+        for Px := 0 to InXM1 do
           if (Abs(Px - CX) <= rad) and (Abs(Py - CY) <= rad) then
             BoxMass := BoxMass + Heat[Py * InX + Px];
       if BoxMass >= NeededMass then
@@ -79595,16 +79620,16 @@ begin
     for rad := 0 to InX do
     begin
       RowMass := 0;
-      for Py := 0 to InY - 1 do
-        for Px := 0 to InX - 1 do
+      for Py := 0 to InYM1 do
+        for Px := 0 to InXM1 do
           if Abs(Px - CX) <= rad then RowMass := RowMass + Heat[Py * InX + Px];
       if RowMass >= NeededMass then begin EffRadiusX := rad; Break; end;
     end;
     for rad := 0 to InY do
     begin
       RowMass := 0;
-      for Py := 0 to InY - 1 do
-        for Px := 0 to InX - 1 do
+      for Py := 0 to InYM1 do
+        for Px := 0 to InXM1 do
           if Abs(Py - CY) <= rad then RowMass := RowMass + Heat[Py * InX + Px];
       if RowMass >= NeededMass then begin EffRadiusY := rad; Break; end;
     end;
@@ -79649,11 +79674,11 @@ begin
       Csv := TStringList.Create();
       try
         Csv.Add('radius,mass_fraction');
-        for rad := 0 to Trunc(MaxR) do
+        for rad := 0 to MaxRTrunc do
         begin
           BoxMass := 0;
-          for Py := 0 to InY - 1 do
-            for Px := 0 to InX - 1 do
+          for Py := 0 to InYM1 do
+            for Px := 0 to InXM1 do
               if (Abs(Px - CX) <= rad) and (Abs(Py - CY) <= rad) then
                 BoxMass := BoxMass + Heat[Py * InX + Px];
           Csv.Add(Format('%d,%.8f', [rad, BoxMass / TotalMass], FS));
@@ -79705,6 +79730,8 @@ var
   Layer: TNNetLayer;
   Pair: TNNetVolumePair;
   NumClasses, NumProbed, FlatSz, D, N, Nval: integer;
+  LastLayerIdx, MaxFeatDimM1, NumProbedM1, DM1: integer;
+  NumClassesM1, NM1, NvalM1, cBinsM1: integer;
   HaveVal: boolean;
   Probes: array of TLayerProbe;
   ProbeAcc, ProbeMSE, ValAcc, AccDelta: array of TNeuralFloat;
@@ -79730,15 +79757,17 @@ var
   procedure ReadFeatures(const Pr: TLayerProbe; OutVol: TNNetVolume);
   var
     F: integer;
+    FeatDimM1: integer;
   begin
+    FeatDimM1 := Pr.FeatDim - 1;
     if Pr.Projected then
     begin
-      for F := 0 to Pr.FeatDim - 1 do
+      for F := 0 to FeatDimM1 do
         FeatRow[F] := Pr.ProjSign[F] * OutVol.FData[Pr.ProjSrc[F]];
     end
     else
     begin
-      for F := 0 to Pr.FeatDim - 1 do
+      for F := 0 to FeatDimM1 do
         FeatRow[F] := OutVol.FData[F];
     end;
     FeatRow[Pr.FeatDim] := 1.0;  // bias column
@@ -79754,13 +79783,16 @@ var
     Col, Row, PivRow, CC: integer;
     PivVal, Factor, Tmp: Double;
     SwapRow: TDoubleArray;
+    DimM1, ColsM1: integer;
   begin
-    for Col := 0 to Dim - 1 do
+    DimM1 := Dim - 1;
+    ColsM1 := Cols - 1;
+    for Col := 0 to DimM1 do
     begin
       // partial pivot: largest |A[row][col]| at or below the diagonal
       PivRow := Col;
       PivVal := Abs(A[Col][Col]);
-      for Row := Col + 1 to Dim - 1 do
+      for Row := Col + 1 to DimM1 do
         if Abs(A[Row][Col]) > PivVal then
         begin
           PivVal := Abs(A[Row][Col]);
@@ -79775,17 +79807,17 @@ var
       end;
       // normalise pivot row
       PivVal := A[Col][Col];
-      for CC := Col to Dim - 1 do A[Col][CC] := A[Col][CC] / PivVal;
-      for CC := 0 to Cols - 1 do B[Col][CC] := B[Col][CC] / PivVal;
+      for CC := Col to DimM1 do A[Col][CC] := A[Col][CC] / PivVal;
+      for CC := 0 to ColsM1 do B[Col][CC] := B[Col][CC] / PivVal;
       // eliminate this column from every other row
-      for Row := 0 to Dim - 1 do
+      for Row := 0 to DimM1 do
       begin
         if Row = Col then Continue;
         Factor := A[Row][Col];
         if Factor = 0 then Continue;
-        for CC := Col to Dim - 1 do
+        for CC := Col to DimM1 do
           A[Row][CC] := A[Row][CC] - Factor * A[Col][CC];
-        for CC := 0 to Cols - 1 do
+        for CC := 0 to ColsM1 do
           B[Row][CC] := B[Row][CC] - Factor * B[Col][CC];
       end;
     end;
@@ -79812,6 +79844,9 @@ begin
       Exit;
     end;
     if MaxFeatDim < 1 then MaxFeatDim := 1;
+    LastLayerIdx := NN.GetLastLayerIdx();
+    MaxFeatDimM1 := MaxFeatDim - 1;
+    cBinsM1 := cBins - 1;
 
     NumClasses := NN.GetLastLayer().Output.Size;
     if NumClasses < 2 then
@@ -79821,15 +79856,18 @@ begin
       Exit;
     end;
     RandomBaseline := 1.0 / NumClasses;
+    NumClassesM1 := NumClasses - 1;
     N := Samples.Count;
+    NM1 := N - 1;
     HaveVal := (ValSamples <> nil) and (ValSamples.Count > 0);
     if HaveVal then Nval := ValSamples.Count else Nval := 0;
+    NvalM1 := Nval - 1;
 
     // --- Catalogue intermediate layers to probe (skip zero-size outputs),
     //     building a deterministic random projection for over-wide layers. ---
     SetLength(Probes, NN.CountLayers());
     NumProbed := 0;
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LayerIdx];
       FlatSz := Layer.Output.Size;
@@ -79844,7 +79882,7 @@ begin
         // deterministic projection: spread source units across the flat tensor
         // with a fixed +/-1 sign pattern (a simple sparse sign projection).
         RandSeed := cProjSeed + LayerIdx;
-        for J := 0 to MaxFeatDim - 1 do
+        for J := 0 to MaxFeatDimM1 do
         begin
           Probes[NumProbed].ProjSrc[J] := Random(FlatSz);
           if Random(2) = 0 then
@@ -79867,6 +79905,7 @@ begin
         sLineBreak;
       Exit;
     end;
+    NumProbedM1 := NumProbed - 1;
 
     SetLength(ProbeAcc, NumProbed);
     SetLength(ProbeMSE, NumProbed);
@@ -79876,37 +79915,38 @@ begin
     SetLength(HasVal, NumProbed);
 
     // --- Fit a closed-form ridge probe per probed layer. ---
-    for ProbeIdx := 0 to NumProbed - 1 do
+    for ProbeIdx := 0 to NumProbedM1 do
     begin
       LayerIdx := Probes[ProbeIdx].LayerIdx;
       Layer := NN.Layers[LayerIdx];
       ProbeName[ProbeIdx] := Layer.ClassName;
       D := Probes[ProbeIdx].FeatDim + 1;  // +1 bias column
+      DM1 := D - 1;
       HasVal[ProbeIdx] := HaveVal;
 
       SetLength(FeatRow, D);
       // allocate / zero the Gram and X^T Y accumulators
       SetLength(Gram, D);
       SetLength(XtY, D);
-      for I := 0 to D - 1 do
+      for I := 0 to DM1 do
       begin
         SetLength(Gram[I], D);
         SetLength(XtY[I], NumClasses);
-        for J := 0 to D - 1 do Gram[I][J] := 0;
-        for C := 0 to NumClasses - 1 do XtY[I][C] := 0;
+        for J := 0 to DM1 do Gram[I][J] := 0;
+        for C := 0 to NumClassesM1 do XtY[I][C] := 0;
       end;
 
       // Accumulate G = X^T X and X^T Y over the probe batch (one forward each).
-      for SampleIdx := 0 to N - 1 do
+      for SampleIdx := 0 to NM1 do
       begin
         Pair := Samples[SampleIdx];
         if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
         NN.Compute(Pair.I);
         ReadFeatures(Probes[ProbeIdx], Layer.Output);
         TrueCls := Pair.O.GetClass();
-        for I := 0 to D - 1 do
+        for I := 0 to DM1 do
         begin
-          for J := I to D - 1 do
+          for J := I to DM1 do
             Gram[I][J] := Gram[I][J] + FeatRow[I] * FeatRow[J];
           // X^T Y with one-hot Y: only the true-class column gets FeatRow[I]
           if (TrueCls >= 0) and (TrueCls < NumClasses) then
@@ -79914,25 +79954,25 @@ begin
         end;
       end;
       // mirror the symmetric Gram and add the Lambda*I ridge term
-      for I := 0 to D - 1 do
+      for I := 0 to DM1 do
       begin
-        for J := I + 1 to D - 1 do Gram[J][I] := Gram[I][J];
+        for J := I + 1 to DM1 do Gram[J][I] := Gram[I][J];
         Gram[I][I] := Gram[I][I] + Lambda;
       end;
 
       // Solve (X^T X + Lambda I) W = X^T Y  -> Wmat (D x C).
       SetLength(Wmat, D);
-      for I := 0 to D - 1 do
+      for I := 0 to DM1 do
       begin
         SetLength(Wmat[I], NumClasses);
-        for C := 0 to NumClasses - 1 do Wmat[I][C] := XtY[I][C];
+        for C := 0 to NumClassesM1 do Wmat[I][C] := XtY[I][C];
       end;
       GaussJordanSolve(Gram, Wmat, D, NumClasses);
 
       // --- Evaluate the fitted probe on the probe batch (acc + MSE). ---
       CorrectTrain := 0;
       MSESum := 0;
-      for SampleIdx := 0 to N - 1 do
+      for SampleIdx := 0 to NM1 do
       begin
         Pair := Samples[SampleIdx];
         if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
@@ -79942,10 +79982,10 @@ begin
         // single pass: score each class column, accumulate one-hot MSE, argmax.
         PredCls := 0;
         BestVal := -1e30;
-        for C := 0 to NumClasses - 1 do
+        for C := 0 to NumClassesM1 do
         begin
           Score := 0;
-          for I := 0 to D - 1 do Score := Score + FeatRow[I] * Wmat[I][C];
+          for I := 0 to DM1 do Score := Score + FeatRow[I] * Wmat[I][C];
           if C = TrueCls then ColBar := 1.0 else ColBar := 0.0;
           MSESum := MSESum + (Score - ColBar) * (Score - ColBar);
           if Score > BestVal then
@@ -79963,7 +80003,7 @@ begin
       if HaveVal then
       begin
         CorrectVal := 0;
-        for SampleIdx := 0 to Nval - 1 do
+        for SampleIdx := 0 to NvalM1 do
         begin
           Pair := ValSamples[SampleIdx];
           if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
@@ -79972,10 +80012,10 @@ begin
           TrueCls := Pair.O.GetClass();
           PredCls := 0;
           BestVal := -1e30;
-          for C := 0 to NumClasses - 1 do
+          for C := 0 to NumClassesM1 do
           begin
             Score := 0;
-            for I := 0 to D - 1 do Score := Score + FeatRow[I] * Wmat[I][C];
+            for I := 0 to DM1 do Score := Score + FeatRow[I] * Wmat[I][C];
             if Score > BestVal then
             begin
               BestVal := Score;
@@ -79994,7 +80034,7 @@ begin
     FinalAcc := ProbeAcc[NumProbed - 1];
     HavePrev := false;
     PrevAcc := 0;
-    for ProbeIdx := 0 to NumProbed - 1 do
+    for ProbeIdx := 0 to NumProbedM1 do
     begin
       if HavePrev then
         AccDelta[ProbeIdx] := ProbeAcc[ProbeIdx] - PrevAcc
@@ -80005,7 +80045,7 @@ begin
     end;
     // shallowest layer within cSaturatePts points of the final layer's acc
     SatLayer := -1;
-    for ProbeIdx := 0 to NumProbed - 1 do
+    for ProbeIdx := 0 to NumProbedM1 do
       if Abs(ProbeAcc[ProbeIdx] - FinalAcc) * 100.0 <= cSaturatePts then
       begin
         SatLayer := ProbeIdx;
@@ -80033,7 +80073,7 @@ begin
 
     HavePrev := false;
     PrevAcc := 0;
-    for ProbeIdx := 0 to NumProbed - 1 do
+    for ProbeIdx := 0 to NumProbedM1 do
     begin
       RowFlags := '';
       // representation collapse: drop >cCollapsePts points vs previous layer
@@ -80074,7 +80114,7 @@ begin
     // --- ASCII bar chart of per-layer probe accuracy. ---
     Lines.Add('');
     Lines.Add('Per-layer probe accuracy (saturation point visible):');
-    for ProbeIdx := 0 to NumProbed - 1 do
+    for ProbeIdx := 0 to NumProbedM1 do
     begin
       BarLen := Round(ProbeAcc[ProbeIdx] * cMaxBarWidth);
       if BarLen < 0 then BarLen := 0;
@@ -80087,8 +80127,8 @@ begin
 
     // --- 10-bin histogram of per-layer probe accuracy over [0,1]. ---
     SetLength(Bins, cBins);
-    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
-    for ProbeIdx := 0 to NumProbed - 1 do
+    for BinIdx := 0 to cBinsM1 do Bins[BinIdx] := 0;
+    for ProbeIdx := 0 to NumProbedM1 do
     begin
       BinIdx := Trunc(ProbeAcc[ProbeIdx] * cBins);
       if BinIdx < 0 then BinIdx := 0;
@@ -80096,11 +80136,11 @@ begin
       Inc(Bins[BinIdx]);
     end;
     MaxBin := 0;
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
       if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
     Lines.Add('');
     Lines.Add('Distribution of per-layer probe accuracy:');
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
     begin
       if MaxBin > 0 then
         BarLen := Round((Bins[BinIdx] / MaxBin) * cMaxBarWidth)
@@ -80210,11 +80250,13 @@ var
   var
     F: integer;
     NrmSq: TNeuralFloat;
+    FeatDimM1: integer;
   begin
     NrmSq := 0;
+    FeatDimM1 := Pr.FeatDim - 1;
     if Pr.Projected then
     begin
-      for F := 0 to Pr.FeatDim - 1 do
+      for F := 0 to FeatDimM1 do
       begin
         Dst[F] := Pr.ProjSign[F] * OutVol.FData[Pr.ProjSrc[F]];
         NrmSq := NrmSq + Dst[F] * Dst[F];
