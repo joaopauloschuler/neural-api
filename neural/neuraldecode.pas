@@ -3121,7 +3121,7 @@ procedure TNNetGrammar.Compile();
 // each body, then resolves 'root'.
 var
   Lines, Defs: TStringList;
-  I, J, ArrowPos, R: integer;
+  I, J, ArrowPos, R, LineCnt, DefCnt: integer;
   RawLine, Name, Body, FullBody: string;
   LocalBody: TNNetGrammarElemArray;
 
@@ -3147,7 +3147,8 @@ begin
   try
     Lines.Text := FSource;
     FullBody := '';
-    for I := 0 to Lines.Count - 1 do
+    LineCnt := Lines.Count;
+    for I := 0 to LineCnt - 1 do
     begin
       RawLine := Lines[I];
       J := Pos('#', RawLine);
@@ -3162,7 +3163,8 @@ begin
     end;
     if FullBody <> '' then Defs.Add(FullBody);
 
-    for I := 0 to Defs.Count - 1 do
+    DefCnt := Defs.Count;
+    for I := 0 to DefCnt - 1 do
     begin
       RawLine := TrimLeft(Defs[I]);
       ArrowPos := Pos('::=', RawLine);
@@ -3170,7 +3172,7 @@ begin
       FindOrAddRule(Name);
     end;
 
-    for I := 0 to Defs.Count - 1 do
+    for I := 0 to DefCnt - 1 do
     begin
       RawLine := TrimLeft(Defs[I]);
       ArrowPos := Pos('::=', RawLine);
@@ -3747,10 +3749,12 @@ var
   I: integer;
   Body, Lit: string;
   Item: TJSONData;
+  ArrCnt: integer;
 begin
   // Each enum value -> its exact JSON literal; the rule is their alternation.
   Body := '';
-  for I := 0 to Arr.Count - 1 do
+  ArrCnt := Arr.Count;
+  for I := 0 to ArrCnt - 1 do
   begin
     Item := Arr.Items[I];
     case Item.JSONType of
@@ -3772,11 +3776,13 @@ function TJSONSchemaCompiler.CompileAnyOf(Arr: TJSONArray;
 var
   I: integer;
   Body, Sub: string;
+  ArrCnt: integer;
 begin
   // anyOf / oneOf -> alternation of branch rules. (v1 does NOT enforce oneOf's
   // exactly-one-match semantics; both map to '|'.)
   Body := '';
-  for I := 0 to Arr.Count - 1 do
+  ArrCnt := Arr.Count;
+  for I := 0 to ArrCnt - 1 do
   begin
     Sub := Compile(Arr.Items[I], Hint + '_alt' + IntToStr(I));
     if Body = '' then Body := Sub else Body := Body + ' | ' + Sub;
@@ -3875,18 +3881,19 @@ var
   Props: TJSONObject;
   Required: TJSONArray;
   WS, Body, MemberRule, KeyLit, PropName: string;
-  I: integer;
+  I, PropCnt, PropNameCnt: integer;
   IsReq, ExtraAllowed: boolean;
   ReqFlags: array of boolean;
   PropNames: TStringList;
   ExtraNode: TJSONData;
 
   function PropIsRequired(const AName: string): boolean;
-  var K: integer;
+  var K, ReqCnt: integer;
   begin
     Result := false;
     if Required = nil then exit;
-    for K := 0 to Required.Count - 1 do
+    ReqCnt := Required.Count;
+    for K := 0 to ReqCnt - 1 do
       if (Required.Items[K].JSONType = jtString) and
          (Required.Items[K].AsString = AName) then exit(true);
   end;
@@ -3921,9 +3928,11 @@ begin
   // Collect property names + compile a value rule per property.
   PropNames := TStringList.Create();
   try
-    for I := 0 to Props.Count - 1 do PropNames.Add(Props.Names[I]);
-    SetLength(ReqFlags, PropNames.Count);
-    for I := 0 to PropNames.Count - 1 do
+    PropCnt := Props.Count;
+    for I := 0 to PropCnt - 1 do PropNames.Add(Props.Names[I]);
+    PropNameCnt := PropNames.Count;
+    SetLength(ReqFlags, PropNameCnt);
+    for I := 0 to PropNameCnt - 1 do
       ReqFlags[I] := PropIsRequired(PropNames[I]);
 
     // Linear object body in declared property order. A comma precedes every
@@ -3932,7 +3941,7 @@ begin
     // same optional group, and the FIRST member is comma-free. A required
     // first member is mandatory; an optional first member is wrapped in '?'.
     Body := '"{" ' + WS + ' ';
-    for I := 0 to PropNames.Count - 1 do
+    for I := 0 to PropNameCnt - 1 do
     begin
       PropName := PropNames[I];
       KeyLit := GBNFLiteral('"' + PropName + '"');
@@ -4022,13 +4031,14 @@ end;
 
 function TJSONSchemaCompiler.Grammar(const RootRuleName: string): string;
 var
-  I: integer;
+  I, RuleCnt: integer;
 begin
   // root first (TNNetGrammar requires a 'root' rule; it may appear anywhere,
   // but emitting it first reads best), then every emitted rule.
   Result := 'root ::= ' + WSRule() + ' ' + RootRuleName + ' ' + WSRule() +
     LineEnding;
-  for I := 0 to FRules.Count - 1 do
+  RuleCnt := FRules.Count;
+  for I := 0 to RuleCnt - 1 do
     Result := Result + FRules[I] + LineEnding;
 end;
 
@@ -4481,7 +4491,7 @@ end;
 
 constructor TNNetStreamingDecoder.Create(pNet: TNNet; pMaxCacheLen: integer);
 var
-  i, n: integer;
+  i, n, LayerCnt: integer;
   Layer: TNNetLayer;
 begin
   inherited Create();
@@ -4492,7 +4502,8 @@ begin
   SetLength(FLearnedPos, 0);
   // One class-based scan collects every streamable state holder; the scan is
   // builder-agnostic, so any mix of attention/SSM/hybrid models works.
-  for i := 0 to FNet.Layers.Count - 1 do
+  LayerCnt := FNet.Layers.Count;
+  for i := 0 to LayerCnt - 1 do
   begin
     Layer := FNet.Layers[i];
     if Layer is TNNetScaledDotProductAttention then
@@ -7296,11 +7307,12 @@ end;
 
 function Seq2SeqEncoderStatesInput(DecoderNet: TNNet): TNNetLayer;
 var
-  LayerCnt, InputCnt: integer;
+  LayerCnt, InputCnt, LayerTotal: integer;
 begin
   Result := nil;
   InputCnt := 0;
-  for LayerCnt := 0 to DecoderNet.Layers.Count - 1 do
+  LayerTotal := DecoderNet.Layers.Count;
+  for LayerCnt := 0 to LayerTotal - 1 do
     if DecoderNet.Layers[LayerCnt] is TNNetInput then
     begin
       Inc(InputCnt);
