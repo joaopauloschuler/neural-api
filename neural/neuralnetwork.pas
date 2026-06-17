@@ -4957,11 +4957,18 @@ type
   // MaxPosition is serialized in FStruct[0] and the init scale (default
   // 0.02) in FFloatSt[0]. Used by the pretrained-checkpoint importer in
   // neuralpretrained.pas to hold GPT-2's wpe weights.
+  // PositionOffset (default 0, NOT serialized) shifts the table lookup by a
+  // constant: Out[x] += Table[x + PositionOffset]. Streamed/incremental
+  // decoding feeds a SHORT window of tokens through a narrow net, so the
+  // caller (TNNetStreamingDecoder) sets PositionOffset to the window's
+  // ABSOLUTE start position so a width-1 step at position p reads Table[p].
+  // SizeX + PositionOffset must stay <= MaxPosition (checked in Debug).
   // Coded by Claude (AI).
   TNNetLearnedPositionalEmbedding = class(TNNetIdentityWithoutL2)
   private
     FMaxPosition: integer;
     FScaleEmbedding: TNeuralFloat;
+    FPositionOffset: integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(pMaxPosition: integer;
@@ -4970,6 +4977,7 @@ type
     procedure Compute(); override;
     procedure Backpropagate(); override;
     property MaxPosition: integer read FMaxPosition;
+    property PositionOffset: integer read FPositionOffset write FPositionOffset;
   end;
 
   { TNNetSinusoidalPositionalEmbedding }
@@ -74804,11 +74812,18 @@ begin
   StartTime := Now();
   inherited Compute;
   LocalWeights := FNeurons[0].FWeights;
-  // Out[x, y, :] += Table[x, :]; the same row is broadcast over Y.
+  {$IFDEF Debug}
+  if FOutput.SizeX + FPositionOffset > FMaxPosition then
+    FErrorProc('TNNetLearnedPositionalEmbedding: window end ' +
+      IntToStr(FOutput.SizeX + FPositionOffset) + ' exceeds MaxPosition ' +
+      IntToStr(FMaxPosition) + '.');
+  {$ENDIF}
+  // Out[x, y, :] += Table[x + PositionOffset, :]; the same row is broadcast
+  // over Y. PositionOffset (default 0) shifts the lookup for streamed decode.
   for CntX := 0 to FOutput.SizeX - 1 do
     for CntY := 0 to FOutput.SizeY - 1 do
       TNNetVolume.MulAdd(FOutput.GetRawPtr(CntX, CntY, 0),
-        LocalWeights.GetRawPtr(CntX, 0, 0), 1, FOutput.Depth);
+        LocalWeights.GetRawPtr(CntX + FPositionOffset, 0, 0), 1, FOutput.Depth);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 

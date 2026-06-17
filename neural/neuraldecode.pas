@@ -1026,6 +1026,7 @@ type
     FSDPAs: array of TNNetScaledDotProductAttention;
     FSSMs: array of TNNetDiagonalSSM;
     FRopes: array of TNNetRotaryEmbedding;
+    FLearnedPos: array of TNNetLearnedPositionalEmbedding; // GPT-2-style wpe
     FHiddenLayer: TNNetLayer;        // lazily resolved last-hidden-state layer
     function GetSDPACount(): integer;
     function GetSSMCount(): integer;
@@ -4488,6 +4489,7 @@ begin
   SetLength(FSDPAs, 0);
   SetLength(FSSMs, 0);
   SetLength(FRopes, 0);
+  SetLength(FLearnedPos, 0);
   // One class-based scan collects every streamable state holder; the scan is
   // builder-agnostic, so any mix of attention/SSM/hybrid models works.
   for i := 0 to FNet.Layers.Count - 1 do
@@ -4513,6 +4515,14 @@ begin
       SetLength(FRopes, n + 1);
       FRopes[n] := TNNetRotaryEmbedding(Layer);
     end;
+    if Layer is TNNetLearnedPositionalEmbedding then
+    begin
+      // GPT-2-style learned absolute positions: like RoPE, the offset is set
+      // per-StepForward to the window's absolute start (no cache to hold).
+      n := Length(FLearnedPos);
+      SetLength(FLearnedPos, n + 1);
+      FLearnedPos[n] := TNNetLearnedPositionalEmbedding(Layer);
+    end;
   end;
 end;
 
@@ -4525,9 +4535,11 @@ begin
   for i := 0 to High(FSDPAs) do FSDPAs[i].EndIncrementalDecode();
   for i := 0 to High(FSSMs) do FSSMs[i].EndIncrementalDecode();
   for i := 0 to High(FRopes) do FRopes[i].PositionOffset := 0;
+  for i := 0 to High(FLearnedPos) do FLearnedPos[i].PositionOffset := 0;
   SetLength(FSDPAs, 0);
   SetLength(FSSMs, 0);
   SetLength(FRopes, 0);
+  SetLength(FLearnedPos, 0);
   inherited Destroy();
 end;
 
@@ -4548,6 +4560,10 @@ begin
   // width-K speculative verify window both rotate exactly like the full
   // forward.
   for i := 0 to High(FRopes) do FRopes[i].PositionOffset := AbsPos;
+  // Learned absolute positions are shifted the same way RoPE is: a width-1
+  // step at absolute position p reads wpe[p] (and a width-K verify window
+  // reads wpe[p..p+K-1]).
+  for i := 0 to High(FLearnedPos) do FLearnedPos[i].PositionOffset := AbsPos;
   FNet.Compute(InV);
 end;
 

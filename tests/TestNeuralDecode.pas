@@ -25,6 +25,7 @@ type
     function BuildTinySSMLM(ContextLen: integer): TNNet;      // DiagonalSSM
     function BuildTinyHybridLM(ContextLen: integer): TNNet;   // SSM + attention
     function BuildTinyGQALM(ContextLen: integer): TNNet;      // grouped-query
+    function BuildTinyLearnedPosLM(ContextLen: integer): TNNet; // GPT-2 wpe
     // Streams Toks token-at-a-time through Session and asserts every step's
     // output row matches the corresponding row of Full's causal forward.
     procedure AssertStreamMatchesFull(Full: TNNet;
@@ -157,6 +158,7 @@ type
     // TNNetStreamingDecoder: the reusable incremental-decode session.
     procedure TestStreamingDecoderTransformerMatchesFullForward;
     procedure TestStreamingDecoderGQAMatchesFullForward;
+    procedure TestStreamingDecoderLearnedPosMatchesFullForward;
     procedure TestStreamingDecoderSSMMatchesFullForward;
     procedure TestStreamingDecoderResetStartsFreshSequence;
     procedure TestStreamingDecoderTruncateToRollsBack;
@@ -2186,6 +2188,21 @@ begin
   Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamVocab));
 end;
 
+function TTestNeuralDecode.BuildTinyLearnedPosLM(ContextLen: integer): TNNet;
+begin
+  // GPT-2 style: token embedding + LEARNED absolute positions (wpe), then a
+  // causal transformer block with NO RoPE (UseRoPE=false). The wpe table holds
+  // 16 rows (>= any SeqLen these tests stream), so the width-1 twin and the
+  // full net share an identically shaped table for CopyWeights.
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, 1));
+  Result.AddLayer(TNNetEmbedding.Create(csStreamVocab, csStreamDim, 0, 0.02));
+  Result.AddLayer(TNNetLearnedPositionalEmbedding.Create({MaxPosition=}16, 0.02));
+  Result.AddTransformerEncoderBlock({Heads=}2, {d_ff=}8,
+    {PreNorm=}true, {CausalMask=}true, {UseRoPE=}false, {NormClass=}TNNetDyT);
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamVocab));
+end;
+
 function TTestNeuralDecode.BuildTinySSMLM(ContextLen: integer): TNNet;
 begin
   // No RoPE and no positional embedding: the left-to-right recurrence carries
@@ -2313,6 +2330,38 @@ begin
     AssertEquals('no SSM layers in a GQA transformer', 0, Session.SSMCount);
     Session.Reset();
     AssertStreamMatchesFull(Full, Session, Toks, 'gqa');
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// GPT-2-style LEARNED absolute positions (TNNetLearnedPositionalEmbedding /
+// "wpe") must stream exactly: the session advances the layer's PositionOffset
+// per StepForward so a width-1 step at absolute position p reads wpe[p], the
+// same row the full-width forward adds at position p. No RoPE in this net -
+// position lives entirely in the learned table.
+procedure TTestNeuralDecode.TestStreamingDecoderLearnedPosMatchesFullForward;
+const
+  SeqLen = 7;
+  Toks: array[0..6] of integer = (4, 1, 9, 2, 11, 3, 8);
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+begin
+  RandSeed := 424242;
+  Full := BuildTinyLearnedPosLM(SeqLen);
+  Twin := BuildTinyLearnedPosLM(1);
+  Session := nil;
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    AssertEquals('one SDPA per head', 2, Session.SDPACount);
+    AssertEquals('no RoPE layers (learned absolute positions)',
+      0, Session.RopeCount);
+    Session.Reset();
+    AssertStreamMatchesFull(Full, Session, Toks, 'learnedpos');
   finally
     Session.Free;
     Twin.Free;
