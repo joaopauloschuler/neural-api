@@ -38997,6 +38997,7 @@ procedure TNNetSquash.Compute();
 var
   LpBnd38: integer;
   LpBnd39: integer;
+  NumCapsM1, DimM1: integer;
   StartTime: double;
   Dim, NumCaps, x, y, c, i, baseD: integer;
   Prev: TNNetVolume;
@@ -39007,22 +39008,24 @@ begin
   Dim := FStruct[0];
   NumCaps := FOutput.Depth div Dim;
   Eps := 1e-12;
+  NumCapsM1 := NumCaps - 1;
+  DimM1 := Dim - 1;
   LpBnd38 := FOutput.SizeX - 1;
   LpBnd39 := FOutput.SizeY - 1;
   for x := 0 to LpBnd38 do
     for y := 0 to LpBnd39 do
-      for c := 0 to NumCaps - 1 do
+      for c := 0 to NumCapsM1 do
       begin
         baseD := c * Dim;
         SumSq := 0;
-        for i := 0 to Dim - 1 do
+        for i := 0 to DimM1 do
           SumSq := SumSq + Sqr(Prev[x, y, baseD + i]);
         n := Sqrt(SumSq + Eps);
         // f = ||s||^2 / (1 + ||s||^2); v = (f/n) * s
         fOverN := (SumSq / (1 + SumSq)) / n;
         FNorm2[x, y, c] := SumSq;
         FScale[x, y, c] := fOverN;
-        for i := 0 to Dim - 1 do
+        for i := 0 to DimM1 do
           FOutput[x, y, baseD + i] := fOverN * Prev[x, y, baseD + i];
       end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -39032,6 +39035,7 @@ procedure TNNetSquash.Backpropagate();
 var
   LpBnd40: integer;
   LpBnd41: integer;
+  NumCapsM1, DimM1: integer;
   StartTime: double;
   Dim, NumCaps, x, y, c, i, baseD: integer;
   Prev, PrevErr: TNNetVolume;
@@ -39056,9 +39060,11 @@ begin
     //       f = n2/(1+n2), f/n cached in FScale.
     LpBnd40 := FOutput.SizeX - 1;
     LpBnd41 := FOutput.SizeY - 1;
+    NumCapsM1 := NumCaps - 1;
+    DimM1 := Dim - 1;
     for x := 0 to LpBnd40 do
       for y := 0 to LpBnd41 do
-        for c := 0 to NumCaps - 1 do
+        for c := 0 to NumCapsM1 do
         begin
           baseD := c * Dim;
           SumSq := FNorm2[x, y, c];
@@ -39067,9 +39073,9 @@ begin
           // scalar coefficient of s_j in d(f/n)/ds_j
           dFON := ( 2 / Sqr(1 + SumSq) ) / n - fOverN / (SumSq + Eps);
           sDotG := 0;
-          for i := 0 to Dim - 1 do
+          for i := 0 to DimM1 do
             sDotG := sDotG + Prev[x, y, baseD + i] * FOutputError[x, y, baseD + i];
-          for i := 0 to Dim - 1 do
+          for i := 0 to DimM1 do
           begin
             gi := FOutputError[x, y, baseD + i];
             si := Prev[x, y, baseD + i];
@@ -39161,6 +39167,7 @@ var
   StartTime: double;
   Prev: TNNetVolume;
   i, j, o, k, it, nIdx: integer;
+  NumInCapsM1, NumOutCapsM1, OutDimM1, InDimM1, TotalCapsM1: integer;
   W: TNNetVolume;
   acc, sumSq, n, fOverN, Eps, maxB, sumExp, c, agree: TNeuralFloat;
   bLogits: array of TNeuralFloat; // (numInCaps x numOutCaps) coupling logits
@@ -39168,17 +39175,22 @@ begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   Eps := 1e-12;
+  NumInCapsM1 := FNumInCaps - 1;
+  NumOutCapsM1 := FNumOutCaps - 1;
+  OutDimM1 := FOutDim - 1;
+  InDimM1 := FInDim - 1;
+  TotalCapsM1 := FNumInCaps * FNumOutCaps - 1;
 
   // 1) Prediction vectors u_hat_{j|i} = W_ij * u_i.
-  for i := 0 to FNumInCaps - 1 do
-    for j := 0 to FNumOutCaps - 1 do
+  for i := 0 to NumInCapsM1 do
+    for j := 0 to NumOutCapsM1 do
     begin
       nIdx := i * FNumOutCaps + j;
       W := FNeurons[nIdx].FWeights;
-      for o := 0 to FOutDim - 1 do
+      for o := 0 to OutDimM1 do
       begin
         acc := 0;
-        for k := 0 to FInDim - 1 do
+        for k := 0 to InDimM1 do
           acc := acc + W.Raw[o * FInDim + k] * Prev.Raw[i * FInDim + k];
         FUHat[j, i, o] := acc;
       end;
@@ -39186,53 +39198,53 @@ begin
 
   // 2) Routing-by-agreement. Coupling logits b_ij RESET to 0 each forward.
   SetLength(bLogits, FNumInCaps * FNumOutCaps);
-  for i := 0 to FNumInCaps * FNumOutCaps - 1 do bLogits[i] := 0;
+  for i := 0 to TotalCapsM1 do bLogits[i] := 0;
 
   for it := 1 to FRoutingIters do
   begin
     // c_i. = softmax over j of b_i.  ; cache into FCoupling.
-    for i := 0 to FNumInCaps - 1 do
+    for i := 0 to NumInCapsM1 do
     begin
       maxB := bLogits[i * FNumOutCaps];
-      for j := 1 to FNumOutCaps - 1 do
+      for j := 1 to NumOutCapsM1 do
         if bLogits[i * FNumOutCaps + j] > maxB then maxB := bLogits[i * FNumOutCaps + j];
       sumExp := 0;
-      for j := 0 to FNumOutCaps - 1 do
+      for j := 0 to NumOutCapsM1 do
       begin
         c := Exp(bLogits[i * FNumOutCaps + j] - maxB);
         FCoupling[j, i, 0] := c;
         sumExp := sumExp + c;
       end;
-      for j := 0 to FNumOutCaps - 1 do
+      for j := 0 to NumOutCapsM1 do
         FCoupling[j, i, 0] := FCoupling[j, i, 0] / sumExp;
     end;
 
     // s_j = sum_i c_ij * u_hat_{j|i}; v_j = squash(s_j).
-    for j := 0 to FNumOutCaps - 1 do
+    for j := 0 to NumOutCapsM1 do
     begin
-      for o := 0 to FOutDim - 1 do
+      for o := 0 to OutDimM1 do
       begin
         acc := 0;
-        for i := 0 to FNumInCaps - 1 do
+        for i := 0 to NumInCapsM1 do
           acc := acc + FCoupling[j, i, 0] * FUHat[j, i, o];
         FSj[j, 0, o] := acc;
       end;
       sumSq := 0;
-      for o := 0 to FOutDim - 1 do sumSq := sumSq + Sqr(FSj[j, 0, o]);
+      for o := 0 to OutDimM1 do sumSq := sumSq + Sqr(FSj[j, 0, o]);
       n := Sqrt(sumSq + Eps);
       fOverN := (sumSq / (1 + sumSq)) / n;
       FSquashScale[j, 0, 0] := fOverN;
-      for o := 0 to FOutDim - 1 do
+      for o := 0 to OutDimM1 do
         FOutput.Raw[j * FOutDim + o] := fOverN * FSj[j, 0, o];
     end;
 
     // b_ij += u_hat_{j|i} . v_j  (skip on the last iteration).
     if it < FRoutingIters then
-      for i := 0 to FNumInCaps - 1 do
-        for j := 0 to FNumOutCaps - 1 do
+      for i := 0 to NumInCapsM1 do
+        for j := 0 to NumOutCapsM1 do
         begin
           agree := 0;
-          for o := 0 to FOutDim - 1 do
+          for o := 0 to OutDimM1 do
             agree := agree + FUHat[j, i, o] * FOutput.Raw[j * FOutDim + o];
           bLogits[i * FNumOutCaps + j] := bLogits[i * FNumOutCaps + j] + agree;
         end;
@@ -39247,6 +39259,7 @@ var
   StartTime: double;
   Prev, PrevErr: TNNetVolume;
   i, j, o, k, nIdx: integer;
+  NumOutCapsM1, OutDimM1, NumInCapsM1, InDimM1: integer;
   W, Delta: TNNetVolume;
   sumSq, n, fOverN, dFON, sDotG, gOut, dSj, dUHat, Eps: TNeuralFloat;
   gS: array of TNeuralFloat;  // dL/ds_j (length outDim, reused per j)
@@ -39261,23 +39274,27 @@ begin
   Eps := 1e-12;
   hasInputGrad := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
+  NumOutCapsM1 := FNumOutCaps - 1;
+  OutDimM1 := FOutDim - 1;
+  NumInCapsM1 := FNumInCaps - 1;
+  InDimM1 := FInDim - 1;
   SetLength(gS, FOutDim);
 
   // Detached-coupling backward: c_ij are CONSTANTS (FCoupling, from forward).
   // Gradient flows: g_v -> (squash Jacobian) -> g_s -> (sum c_ij) -> g_uhat
   //                     -> (W u) -> {W grad, input grad}.
-  for j := 0 to FNumOutCaps - 1 do
+  for j := 0 to NumOutCapsM1 do
   begin
     // squash Jacobian at s_j (same form as TNNetSquash):
     sumSq := 0;
-    for o := 0 to FOutDim - 1 do sumSq := sumSq + Sqr(FSj[j, 0, o]);
+    for o := 0 to OutDimM1 do sumSq := sumSq + Sqr(FSj[j, 0, o]);
     n := Sqrt(sumSq + Eps);
     fOverN := FSquashScale[j, 0, 0];
     dFON := ( 2 / Sqr(1 + sumSq) ) / n - fOverN / (sumSq + Eps);
     sDotG := 0;
-    for o := 0 to FOutDim - 1 do
+    for o := 0 to OutDimM1 do
       sDotG := sDotG + FSj[j, 0, o] * FOutputError.Raw[j * FOutDim + o];
-    for o := 0 to FOutDim - 1 do
+    for o := 0 to OutDimM1 do
     begin
       gOut := FOutputError.Raw[j * FOutDim + o];
       gS[o] := fOverN * gOut + sDotG * dFON * FSj[j, 0, o];
@@ -39285,15 +39302,15 @@ begin
 
     // s_j = sum_i c_ij u_hat_{j|i}  =>  dL/d u_hat_{j|i}[o] = c_ij * gS[o].
     // u_hat_{j|i}[o] = sum_k W_ij[o,k] * u_i[k].
-    for i := 0 to FNumInCaps - 1 do
+    for i := 0 to NumInCapsM1 do
     begin
       nIdx := i * FNumOutCaps + j;
       W := FNeurons[nIdx].FWeights;
       Delta := FNeurons[nIdx].FDelta;
-      for o := 0 to FOutDim - 1 do
+      for o := 0 to OutDimM1 do
       begin
         dUHat := FCoupling[j, i, 0] * gS[o];
-        for k := 0 to FInDim - 1 do
+        for k := 0 to InDimM1 do
         begin
           // W grad: dL/dW_ij[o,k] = dUHat * u_i[k]  (descend => -LR * grad)
           Delta.Raw[o * FInDim + k] := Delta.Raw[o * FInDim + k] +
@@ -39369,7 +39386,7 @@ procedure TNNetHardConcrete.Compute();
 var
   StartTime: double;
   W: TNNetVolume;
-  Depth, d: integer;
+  Depth, DepthM1, d: integer;
   Beta, Gamma, Zeta, InvBeta, Stretch, SlopeFactor: TNeuralFloat;
   U, NoisyLogit, S, SStr, Z, DZ: TNeuralFloat;
 begin
@@ -39377,6 +39394,7 @@ begin
   inherited Compute;
   W := FNeurons[0].FWeights;
   Depth := FOutput.Depth;
+  DepthM1 := Depth - 1;
   {$IFDEF Debug}
   if W.Size <> Depth then
     FErrorProc('Neuron weight count isn''t compatible with output depth ' +
@@ -39392,7 +39410,7 @@ begin
   // Per-channel gate. While training (Enabled) draw fresh noise u per channel
   // and keep s for the matching backward (reparameterization). At inference
   // the gate is deterministic (no noise): s = sigmoid(log_alpha).
-  for d := 0 to Depth - 1 do
+  for d := 0 to DepthM1 do
   begin
     if FEnabled then
     begin
@@ -39443,7 +39461,7 @@ var
   StartTime: double;
   localNeuron: TNNetNeuron;
   Prev, PrevErr: TNNetVolume;
-  SizeX, SizeY, Depth, x, y, d: integer;
+  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, d: integer;
   gradLogAlpha: array of TNeuralFloat;
   hasInputGrad: boolean;
 begin
@@ -39456,6 +39474,9 @@ begin
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
   Depth := FOutput.Depth;
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
   hasInputGrad := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
 
@@ -39463,13 +39484,13 @@ begin
   // dL/dlog_alpha[d] = (dz/dlog_alpha[d]) * sum over x,y of
   //                    OutputError[x,y,d] * Input[x,y,d].
   SetLength(gradLogAlpha, Depth);
-  for d := 0 to Depth - 1 do gradLogAlpha[d] := 0;
-  for x := 0 to SizeX - 1 do
-    for y := 0 to SizeY - 1 do
-      for d := 0 to Depth - 1 do
+  for d := 0 to DepthM1 do gradLogAlpha[d] := 0;
+  for x := 0 to SizeXM1 do
+    for y := 0 to SizeYM1 do
+      for d := 0 to DepthM1 do
         gradLogAlpha[d] := gradLogAlpha[d] +
           FOutputError[x, y, d] * Prev[x, y, d];
-  for d := 0 to Depth - 1 do
+  for d := 0 to DepthM1 do
     localNeuron.FDelta.Raw[d] := localNeuron.FDelta.Raw[d] +
       (-FLearningRate) * gradLogAlpha[d] * FGateDeriv.Raw[d];
   SetLength(gradLogAlpha, 0);
@@ -39485,9 +39506,9 @@ begin
   begin
     PrevErr := FPrevLayer.FOutputError;
     // Gradient w.r.t. the input: dInput[x,y,d] = OutputError[x,y,d] * z[d].
-    for x := 0 to SizeX - 1 do
-      for y := 0 to SizeY - 1 do
-        for d := 0 to Depth - 1 do
+    for x := 0 to SizeXM1 do
+      for y := 0 to SizeYM1 do
+        for d := 0 to DepthM1 do
           PrevErr[x, y, d] := PrevErr[x, y, d] +
             FOutputError[x, y, d] * FGate.Raw[d];
     FPrevLayer.Backpropagate();
@@ -39531,7 +39552,7 @@ var
   StartTime: double;
   Prev: TNNetVolume;
   Wg, Wb: TNNetVolume;
-  SizeX, SizeY, Depth, x, y, c: integer;
+  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, c: integer;
   Gx, Nx: array of TNeuralFloat;
   s, xv, meanG: TNeuralFloat;
 begin
@@ -39542,6 +39563,9 @@ begin
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
   Depth := FOutput.Depth;
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
   Wg := FNeurons[0].FWeights;
   Wb := FNeurons[1].FWeights;
   {$IFDEF Debug}
@@ -39553,11 +39577,11 @@ begin
   SetLength(Nx, Depth);
   // Gx[c] = sqrt(sum_{x,y} X[x,y,c]^2 + eps)
   meanG := 0;
-  for c := 0 to Depth - 1 do
+  for c := 0 to DepthM1 do
   begin
     s := 0;
-    for x := 0 to SizeX - 1 do
-      for y := 0 to SizeY - 1 do
+    for x := 0 to SizeXM1 do
+      for y := 0 to SizeYM1 do
       begin
         xv := Prev[x, y, c];
         s := s + xv * xv;
@@ -39567,12 +39591,12 @@ begin
   end;
   meanG := meanG / Depth;
   // Avoid division by zero (Gx is always >= sqrt(eps) > 0, so meanG > 0).
-  for c := 0 to Depth - 1 do
+  for c := 0 to DepthM1 do
     Nx[c] := Gx[c] / meanG;
   // Y[x,y,c] = gamma[c] * (X[x,y,c] * Nx[c]) + beta[c] + X[x,y,c]
-  for c := 0 to Depth - 1 do
-    for x := 0 to SizeX - 1 do
-      for y := 0 to SizeY - 1 do
+  for c := 0 to DepthM1 do
+    for x := 0 to SizeXM1 do
+      for y := 0 to SizeYM1 do
       begin
         xv := Prev[x, y, c];
         FOutput[x, y, c] := Wg.Raw[c] * (xv * Nx[c]) + Wb.Raw[c] + xv;
@@ -39590,7 +39614,7 @@ var
   Ng, Nb: TNNetNeuron;
   Wg: TNNetVolume;
   Prev, PrevErr: TNNetVolume;
-  SizeX, SizeY, Depth, x, y, c, cp: integer;
+  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, c, cp: integer;
   Gx, Nx, dL_dN, dL_dG, sumGyX: array of TNeuralFloat;
   s, xv, gy, meanG, gradGamma, gradBeta, term, dL_dM: TNeuralFloat;
   hasInputGrad: boolean;
@@ -39610,6 +39634,9 @@ begin
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
 
   SetLength(Gx, Depth);
   SetLength(Nx, Depth);
@@ -39619,11 +39646,11 @@ begin
 
   // Recompute Gx, Nx, meanG (forward state not cached).
   meanG := 0;
-  for c := 0 to Depth - 1 do
+  for c := 0 to DepthM1 do
   begin
     s := 0;
-    for x := 0 to SizeX - 1 do
-      for y := 0 to SizeY - 1 do
+    for x := 0 to SizeXM1 do
+      for y := 0 to SizeYM1 do
       begin
         xv := Prev[x, y, c];
         s := s + xv * xv;
@@ -39632,7 +39659,7 @@ begin
     meanG := meanG + Gx[c];
   end;
   meanG := meanG / Depth;
-  for c := 0 to Depth - 1 do
+  for c := 0 to DepthM1 do
     Nx[c] := Gx[c] / meanG;
 
   // Weight gradients and helper accumulators per channel:
@@ -39640,12 +39667,12 @@ begin
   //   dL/dgamma[c] = Nx[c] * sumGyX[c]
   //   dL/dbeta[c]  = sum_{x,y} gy[x,y,c]
   //   dL/dN[c]     = gamma[c] * sumGyX[c]
-  for c := 0 to Depth - 1 do
+  for c := 0 to DepthM1 do
   begin
     gradGamma := 0;   // = sumGyX[c]
     gradBeta := 0;
-    for x := 0 to SizeX - 1 do
-      for y := 0 to SizeY - 1 do
+    for x := 0 to SizeXM1 do
+      for y := 0 to SizeYM1 do
       begin
         gy := FOutputError[x, y, c];
         xv := Prev[x, y, c];
@@ -39666,10 +39693,10 @@ begin
   //               = (1/M)*dL/dN[c] - (1/(M*Depth)) * sum_{c'} dL/dN[c'] * Nx[c']
   //   Let dL_dM_term = (1/(M*Depth)) * sum_{c'} dL/dN[c'] * Nx[c']
   dL_dM := 0;
-  for cp := 0 to Depth - 1 do
+  for cp := 0 to DepthM1 do
     dL_dM := dL_dM + dL_dN[cp] * Nx[cp];
   dL_dM := dL_dM / (meanG * Depth);
-  for c := 0 to Depth - 1 do
+  for c := 0 to DepthM1 do
     dL_dG[c] := dL_dN[c] / meanG - dL_dM;
 
   if hasInputGrad then
@@ -39681,11 +39708,11 @@ begin
     //     dGx[c']/dX[x',y',c'] = X[x',y',c'] / Gx[c']
     //   This contributes to dL/dX[x',y',c'] the term:
     //     dL_dG[c'] * X[x',y',c'] / Gx[c']
-    for c := 0 to Depth - 1 do
+    for c := 0 to DepthM1 do
     begin
       term := dL_dG[c] / Gx[c];   // multiplier for X[x,y,c] in chain term
-      for x := 0 to SizeX - 1 do
-        for y := 0 to SizeY - 1 do
+      for x := 0 to SizeXM1 do
+        for y := 0 to SizeYM1 do
         begin
           gy := FOutputError[x, y, c];
           xv := Prev[x, y, c];
@@ -39751,7 +39778,7 @@ var
   StartTime: double;
   Wg, Wb: TNNetVolume;
   Prev: TNNetVolume;
-  SizeX, SizeY, Depth, x, y, d: integer;
+  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, d: integer;
   alpha, xv: TNeuralFloat;
 begin
   StartTime := Now();
@@ -39764,6 +39791,9 @@ begin
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
   Depth := FOutput.Depth;
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
   {$IFDEF Debug}
   if (Wg.Size <> Depth) or (Wb.Size <> Depth) or
      (FNeurons[2].FWeights.Size <> 1) then
@@ -39771,9 +39801,9 @@ begin
       'at TNNetDyT.');
   {$ENDIF}
   // Y[x,y,c] = gamma[c] * tanh(alpha * X[x,y,c]) + beta[c]
-  for x := 0 to SizeX - 1 do
-    for y := 0 to SizeY - 1 do
-      for d := 0 to Depth - 1 do
+  for x := 0 to SizeXM1 do
+    for y := 0 to SizeYM1 do
+      for d := 0 to DepthM1 do
       begin
         xv := Prev[x, y, d];
         FOutput[x, y, d] := Wg.Raw[d] * pcr_tanhf(alpha * xv) + Wb.Raw[d];
@@ -39787,7 +39817,7 @@ var
   Ng, Nb, Na: TNNetNeuron;
   Wg: TNNetVolume;
   Prev, PrevErr: TNNetVolume;
-  SizeX, SizeY, Depth, x, y, d: integer;
+  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, d: integer;
   alpha, xv, gy, t, dt, g_d, gradGamma, gradBeta, gradAlpha: TNeuralFloat;
   hasInputGrad: boolean;
 begin
@@ -39804,6 +39834,9 @@ begin
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
   Depth := FOutput.Depth;
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
   hasInputGrad := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
   PrevErr := nil;
@@ -39814,13 +39847,13 @@ begin
   // dL/dalpha    += sum over everything of dL/dy * gamma[c] * x * dt
   // dL/dx[x,y,c]  = dL/dy * gamma[c] * alpha * dt
   gradAlpha := 0;
-  for d := 0 to Depth - 1 do
+  for d := 0 to DepthM1 do
   begin
     g_d := Wg.Raw[d];
     gradGamma := 0;
     gradBeta := 0;
-    for x := 0 to SizeX - 1 do
-      for y := 0 to SizeY - 1 do
+    for x := 0 to SizeXM1 do
+      for y := 0 to SizeYM1 do
       begin
         xv := Prev[x, y, d];
         gy := FOutputError[x, y, d];
@@ -40014,7 +40047,7 @@ var
   StartTime: double;
   W: TNNetVolume;
   Prev: TNNetVolume;
-  SizeX, SizeY, Depth, x, y, d: integer;
+  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, d: integer;
   xv, alpha_d: TNeuralFloat;
 begin
   StartTime := Now();
@@ -40024,16 +40057,19 @@ begin
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
   Depth := FOutput.Depth;
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
   {$IFDEF Debug}
   if W.Size <> Depth then
     FErrorProc('Neuron weight count isn''t compatible with output depth ' +
       'at TNNetPReLUChannel.');
   {$ENDIF}
-  for d := 0 to Depth - 1 do
+  for d := 0 to DepthM1 do
   begin
     alpha_d := W.Raw[d];
-    for x := 0 to SizeX - 1 do
-      for y := 0 to SizeY - 1 do
+    for x := 0 to SizeXM1 do
+      for y := 0 to SizeYM1 do
       begin
         xv := Prev[x, y, d];
         if xv >= 0 then
@@ -40051,7 +40087,7 @@ var
   N: TNNetNeuron;
   W: TNNetVolume;
   Prev, PrevErr: TNNetVolume;
-  SizeX, SizeY, Depth, x, y, d: integer;
+  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, d: integer;
   xv, gy, gradAlpha, alpha_d: TNeuralFloat;
   hasInputGrad: boolean;
 begin
@@ -40069,12 +40105,15 @@ begin
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
-  for d := 0 to Depth - 1 do
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
+  for d := 0 to DepthM1 do
   begin
     alpha_d := W.Raw[d];
     gradAlpha := 0;
-    for x := 0 to SizeX - 1 do
-      for y := 0 to SizeY - 1 do
+    for x := 0 to SizeXM1 do
+      for y := 0 to SizeYM1 do
       begin
         xv := Prev[x, y, d];
         gy := FOutputError[x, y, d];
@@ -40149,7 +40188,7 @@ var
   StartTime: double;
   Wtr, War, Wtl, Wal: TNNetVolume;
   Prev: TNNetVolume;
-  SizeX, SizeY, Depth, x, y, d: integer;
+  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, d: integer;
   tr_d, ar_d, tl_d, al_d, xv: TNeuralFloat;
 begin
   StartTime := Now();
@@ -40168,14 +40207,17 @@ begin
     FErrorProc('Neuron weight count isn''t compatible with output depth ' +
       'at TNNetSReLU.');
   {$ENDIF}
-  for d := 0 to Depth - 1 do
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
+  for d := 0 to DepthM1 do
   begin
     tr_d := Wtr.Raw[d];
     ar_d := War.Raw[d];
     tl_d := Wtl.Raw[d];
     al_d := Wal.Raw[d];
-    for x := 0 to SizeX - 1 do
-      for y := 0 to SizeY - 1 do
+    for x := 0 to SizeXM1 do
+      for y := 0 to SizeYM1 do
       begin
         xv := Prev[x, y, d];
         if xv >= tr_d then
@@ -40195,7 +40237,7 @@ var
   Ntr, Nar, Ntl, Nal: TNNetNeuron;
   Wtr, War, Wtl, Wal: TNNetVolume;
   Prev, PrevErr: TNNetVolume;
-  SizeX, SizeY, Depth, x, y, d: integer;
+  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, d: integer;
   tr_d, ar_d, tl_d, al_d, xv, gy: TNeuralFloat;
   gradTr, gradAr, gradTl, gradAl: TNeuralFloat;
   hasInputGrad: boolean;
@@ -40220,7 +40262,10 @@ begin
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
-  for d := 0 to Depth - 1 do
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
+  for d := 0 to DepthM1 do
   begin
     tr_d := Wtr.Raw[d];
     ar_d := War.Raw[d];
@@ -40230,8 +40275,8 @@ begin
     gradAr := 0;
     gradTl := 0;
     gradAl := 0;
-    for x := 0 to SizeX - 1 do
-      for y := 0 to SizeY - 1 do
+    for x := 0 to SizeXM1 do
+      for y := 0 to SizeYM1 do
       begin
         xv := Prev[x, y, d];
         gy := FOutputError[x, y, d];
@@ -40319,7 +40364,7 @@ procedure TNNetAPL.Compute();
 var
   StartTime: double;
   Prev: TNNetVolume;
-  SizeX, SizeY, Depth, x, y, d, s: integer;
+  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, NumHingesM1, x, y, d, s: integer;
   xv, acc, a_sd, b_sd: TNeuralFloat;
 begin
   StartTime := Now();
@@ -40328,14 +40373,18 @@ begin
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
   Depth := FOutput.Depth;
-  for d := 0 to Depth - 1 do
-    for x := 0 to SizeX - 1 do
-      for y := 0 to SizeY - 1 do
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
+  NumHingesM1 := FNumHinges - 1;
+  for d := 0 to DepthM1 do
+    for x := 0 to SizeXM1 do
+      for y := 0 to SizeYM1 do
       begin
         xv := Prev[x, y, d];
         acc := 0;
         if xv > 0 then acc := xv;
-        for s := 0 to FNumHinges - 1 do
+        for s := 0 to NumHingesM1 do
         begin
           a_sd := FNeurons[s].FWeights.Raw[d];
           b_sd := FNeurons[FNumHinges + s].FWeights.Raw[d];
@@ -40351,7 +40400,7 @@ procedure TNNetAPL.Backpropagate();
 var
   StartTime: double;
   Prev, PrevErr: TNNetVolume;
-  SizeX, SizeY, Depth, x, y, d, s: integer;
+  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, NumHingesM1, TwoNumHingesM1, x, y, d, s: integer;
   xv, gy, a_sd, b_sd, dx: TNeuralFloat;
   gradA, gradB: array of TNeuralFloat;
   hasInputGrad: boolean;
@@ -40370,21 +40419,26 @@ begin
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
   SetLength(gradA, FNumHinges);
   SetLength(gradB, FNumHinges);
-  for d := 0 to Depth - 1 do
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
+  NumHingesM1 := FNumHinges - 1;
+  TwoNumHingesM1 := 2 * FNumHinges - 1;
+  for d := 0 to DepthM1 do
   begin
-    for s := 0 to FNumHinges - 1 do
+    for s := 0 to NumHingesM1 do
     begin
       gradA[s] := 0;
       gradB[s] := 0;
     end;
-    for x := 0 to SizeX - 1 do
-      for y := 0 to SizeY - 1 do
+    for x := 0 to SizeXM1 do
+      for y := 0 to SizeYM1 do
       begin
         xv := Prev[x, y, d];
         gy := FOutputError[x, y, d];
         // ReLU term contributes 1 to dh/dx when x>0.
         if xv > 0 then dx := 1 else dx := 0;
-        for s := 0 to FNumHinges - 1 do
+        for s := 0 to NumHingesM1 do
         begin
           a_sd := FNeurons[s].FWeights.Raw[d];
           b_sd := FNeurons[FNumHinges + s].FWeights.Raw[d];
@@ -40399,7 +40453,7 @@ begin
         if hasInputGrad then
           PrevErr[x, y, d] := PrevErr[x, y, d] + gy * dx;
       end;
-    for s := 0 to FNumHinges - 1 do
+    for s := 0 to NumHingesM1 do
     begin
       FNeurons[s].FDelta.Raw[d] :=
         FNeurons[s].FDelta.Raw[d] + (-FLearningRate) * gradA[s];
@@ -40409,7 +40463,7 @@ begin
   end;
   if (not FBatchUpdate) then
   begin
-    for s := 0 to 2 * FNumHinges - 1 do
+    for s := 0 to TwoNumHingesM1 do
       FNeurons[s].UpdateWeights(FInertia);
     AfterWeightUpdate();
   end;
@@ -40419,12 +40473,13 @@ end;
 
 procedure TNNetAPL.InitDefault();
 var
-  s: integer;
+  s, NumHingesM1: integer;
   knee: TNeuralFloat;
 begin
   if FNumHinges < 1 then FNumHinges := 2;
   if FNeurons.Count < 2 * FNumHinges then AddMissingNeurons(2 * FNumHinges);
-  for s := 0 to FNumHinges - 1 do
+  NumHingesM1 := FNumHinges - 1;
+  for s := 0 to NumHingesM1 do
   begin
     // Slopes start at 0.25 (non-degenerate leaky start).
     FNeurons[s].FWeights.Fill(0.25);
@@ -40495,7 +40550,7 @@ procedure TNNetSplineActivation.Compute();
 var
   StartTime: double;
   Prev: TNNetVolume;
-  SizeX, SizeY, Depth, x, y, d, i: integer;
+  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, d, i: integer;
   xv, frac, y0, y1: TNeuralFloat;
 begin
   StartTime := Now();
@@ -40504,9 +40559,12 @@ begin
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
   Depth := FOutput.Depth;
-  for d := 0 to Depth - 1 do
-    for x := 0 to SizeX - 1 do
-      for y := 0 to SizeY - 1 do
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
+  for d := 0 to DepthM1 do
+    for x := 0 to SizeXM1 do
+      for y := 0 to SizeYM1 do
       begin
         xv := Prev[x, y, d];
         LocateSegment(xv, i, frac);
@@ -40521,7 +40579,7 @@ procedure TNNetSplineActivation.Backpropagate();
 var
   StartTime: double;
   Prev, PrevErr: TNNetVolume;
-  SizeX, SizeY, Depth, x, y, d, i, c: integer;
+  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, d, i, c: integer;
   xv, gy, frac, dt, slope, y0, y1: TNeuralFloat;
   gradY: array of TNeuralFloat;
   hasInputGrad: boolean;
@@ -40540,11 +40598,14 @@ begin
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
   dt := (2 * FRange) / FNumIntervals;
   SetLength(gradY, FNumIntervals + 1);
-  for d := 0 to Depth - 1 do
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
+  for d := 0 to DepthM1 do
   begin
     for c := 0 to FNumIntervals do gradY[c] := 0;
-    for x := 0 to SizeX - 1 do
-      for y := 0 to SizeY - 1 do
+    for x := 0 to SizeXM1 do
+      for y := 0 to SizeYM1 do
       begin
         xv := Prev[x, y, d];
         gy := FOutputError[x, y, d];
@@ -40617,7 +40678,7 @@ var
   StartTime: double;
   W1, W2, Wb: TNNetVolume;
   Prev: TNNetVolume;
-  SizeX, SizeY, Depth, x, y, d: integer;
+  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, d: integer;
   p1_d, p2_d, beta_d, xv, dv, s: TNeuralFloat;
 begin
   StartTime := Now();
@@ -40635,13 +40696,16 @@ begin
       'at TNNetAconC.');
   {$ENDIF}
   // d = (p1[c]-p2[c])*x;  y = d*sigmoid(beta[c]*d) + p2[c]*x.
-  for d := 0 to Depth - 1 do
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
+  for d := 0 to DepthM1 do
   begin
     p1_d := W1.Raw[d];
     p2_d := W2.Raw[d];
     beta_d := Wb.Raw[d];
-    for x := 0 to SizeX - 1 do
-      for y := 0 to SizeY - 1 do
+    for x := 0 to SizeXM1 do
+      for y := 0 to SizeYM1 do
       begin
         xv := Prev[x, y, d];
         dv := (p1_d - p2_d) * xv;
@@ -40658,7 +40722,7 @@ var
   N1, N2, Nb: TNNetNeuron;
   W1, W2, Wb: TNNetVolume;
   Prev, PrevErr: TNNetVolume;
-  SizeX, SizeY, Depth, x, y, d: integer;
+  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, d: integer;
   p1_d, p2_d, beta_d, xv, gy, dv, s, sds, phi: TNeuralFloat;
   gradP1, gradP2, gradBeta: TNeuralFloat;
   hasInputGrad: boolean;
@@ -40686,7 +40750,10 @@ begin
   // dL/dp1[c]   += dL/dy * x*phi
   // dL/dp2[c]   += dL/dy * x*(1 - phi)
   // dL/dbeta[c] += dL/dy * d*d*s*(1-s)
-  for d := 0 to Depth - 1 do
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
+  for d := 0 to DepthM1 do
   begin
     p1_d := W1.Raw[d];
     p2_d := W2.Raw[d];
@@ -40694,8 +40761,8 @@ begin
     gradP1 := 0;
     gradP2 := 0;
     gradBeta := 0;
-    for x := 0 to SizeX - 1 do
-      for y := 0 to SizeY - 1 do
+    for x := 0 to SizeXM1 do
+      for y := 0 to SizeYM1 do
       begin
         xv := Prev[x, y, d];
         gy := FOutputError[x, y, d];
