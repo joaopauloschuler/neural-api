@@ -63772,13 +63772,13 @@ begin
       FCacheZP.FData[k * b + c] := FCacheXR.FData[c * m + k];
 
   // Pass 3 + 4: L (per column/block c) then P^T into FOutput (b,m layout).
-  for c := 0 to b - 1 do
+  for c := 0 to MaxBlk do
   begin
     blkBase := c * m * m;
-    for k := 0 to m - 1 do
+    for k := 0 to MaxM do
     begin
       acc := 0;
-      for t := 0 to m - 1 do
+      for t := 0 to MaxM do
         acc := acc + WL.FData[blkBase + k * m + t] * FCacheZP.FData[t * b + c];
       // P^T: output (m,b)[k,c] goes to (b,m)[c,k] -> index c*m+k.
       FOutput.FData[c * m + k] := acc;
@@ -63816,6 +63816,7 @@ end;
 procedure TNNetMonarchLinear.BackpropagateCPU();
 var
   b, m, r, c, k, t, blkBase: integer;
+  MaxBlk, MaxM, MaxDim: integer;
   PrevOut, WR, WL, WRDelta, WLDelta, BiasDelta, LocalPrevError: TNNetVolume;
   acc, e: TNeuralFloat;
   HasPrevError: boolean;
@@ -63823,6 +63824,9 @@ var
 begin
   b := FBlocks;
   m := FBlockSize;
+  MaxBlk := b - 1;
+  MaxM := m - 1;
+  MaxDim := FDim - 1;
   PrevOut := FPrevLayer.FOutput;
   WR := FArrNeurons[0].FWeights;
   WL := FArrNeurons[1].FWeights;
@@ -63834,57 +63838,57 @@ begin
 
   // Bias grad.
   if FSuppressBias = 0 then
-    for k := 0 to FDim - 1 do
+    for k := 0 to MaxDim do
       BiasDelta.FData[k] := BiasDelta.FData[k] - FLearningRate * FOutputError.FData[k];
 
   // dyT[k,c] = dy[c,k]  (P: undo P^T). Stored in (m,b) layout index k*b+c.
   SetLength(dyT, FDim);
   SetLength(dxR, FDim);
-  for c := 0 to b - 1 do
-    for k := 0 to m - 1 do
+  for c := 0 to MaxBlk do
+    for k := 0 to MaxM do
       dyT[k * b + c] := FOutputError.FData[c * m + k];
 
   // L weight grad + back through L -> dzP, then dxR = P^T(dzP). zP (the forward
   // pass-2 output) is still in FCacheZP; FCacheXR (forward R*x) is read for dR.
-  for c := 0 to b - 1 do
+  for c := 0 to MaxBlk do
   begin
     blkBase := c * m * m;
     // dL_c[k,t] += dyT[k,c] * zP[t,c].
-    for k := 0 to m - 1 do
+    for k := 0 to MaxM do
     begin
       e := dyT[k * b + c];
-      for t := 0 to m - 1 do
+      for t := 0 to MaxM do
         WLDelta.FData[blkBase + k * m + t] :=
           WLDelta.FData[blkBase + k * m + t]
           - FLearningRate * e * FCacheZP.FData[t * b + c];
     end;
     // dzP[t,c] = sum_k L_c[k,t]*dyT[k,c]; then dxR[c,t] = dzP[t,c] (P^T).
-    for t := 0 to m - 1 do
+    for t := 0 to MaxM do
     begin
       acc := 0;
-      for k := 0 to m - 1 do
+      for k := 0 to MaxM do
         acc := acc + WL.FData[blkBase + k * m + t] * dyT[k * b + c];
       dxR[c * m + t] := acc; // P^T: (m,b)[t,c]->(b,m)[c,t]
     end;
   end;
 
   // R weight grad + back through R -> dx.
-  for r := 0 to b - 1 do
+  for r := 0 to MaxBlk do
   begin
     blkBase := r * m * m;
-    for k := 0 to m - 1 do
+    for k := 0 to MaxM do
     begin
       e := dxR[r * m + k];
-      for t := 0 to m - 1 do
+      for t := 0 to MaxM do
         WRDelta.FData[blkBase + k * m + t] :=
           WRDelta.FData[blkBase + k * m + t]
           - FLearningRate * e * PrevOut.FData[r * m + t];
     end;
     if HasPrevError then
-      for t := 0 to m - 1 do
+      for t := 0 to MaxM do
       begin
         acc := 0;
-        for k := 0 to m - 1 do
+        for k := 0 to MaxM do
           acc := acc + WR.FData[blkBase + k * m + t] * dxR[r * m + k];
         LocalPrevError.FData[r * m + t] := LocalPrevError.FData[r * m + t] + acc;
       end;
@@ -64023,32 +64027,35 @@ end;
 procedure TNNetKroneckerLinear.ComputeCPU();
 var
   p, q, i, j, l, w: integer;
+  MaxP, MaxQ: integer;
   PrevOut, WA, WB, Bias: TNNetVolume;
   acc: TNeuralFloat;
 begin
   p := FP;
   q := FQ;
+  MaxP := p - 1;
+  MaxQ := q - 1;
   PrevOut := FPrevLayer.FOutput;
   WA := FArrNeurons[0].FWeights;
   WB := FArrNeurons[1].FWeights;
   Bias := FArrNeurons[2].FWeights;
 
   // BX[i,l] = sum_k B[i,k]*X[k,l]  (X[k,l] = x[k*p+l]).
-  for i := 0 to q - 1 do
-    for l := 0 to p - 1 do
+  for i := 0 to MaxQ do
+    for l := 0 to MaxP do
     begin
       acc := 0;
-      for w := 0 to q - 1 do
+      for w := 0 to MaxQ do
         acc := acc + WB.FData[i * q + w] * PrevOut.FData[w * p + l];
       FCacheBX.FData[i * p + l] := acc;
     end;
 
   // Y[i,j] = sum_l BX[i,l]*A[j,l]; y[i*p+j] = Y[i,j].
-  for i := 0 to q - 1 do
-    for j := 0 to p - 1 do
+  for i := 0 to MaxQ do
+    for j := 0 to MaxP do
     begin
       acc := 0;
-      for l := 0 to p - 1 do
+      for l := 0 to MaxP do
         acc := acc + FCacheBX.FData[i * p + l] * WA.FData[j * p + l];
       FOutput.FData[i * p + j] := acc;
     end;
@@ -64084,6 +64091,7 @@ end;
 procedure TNNetKroneckerLinear.BackpropagateCPU();
 var
   p, q, i, j, k, l, w: integer;
+  MaxP, MaxQ, MaxDim: integer;
   PrevOut, WA, WB, WADelta, WBDelta, BiasDelta, LocalPrevError: TNNetVolume;
   acc, dyij, glil: TNeuralFloat;
   HasPrevError: boolean;
@@ -64091,6 +64099,9 @@ var
 begin
   p := FP;
   q := FQ;
+  MaxP := p - 1;
+  MaxQ := q - 1;
+  MaxDim := FDim - 1;
   PrevOut := FPrevLayer.FOutput;
   WA := FArrNeurons[0].FWeights;
   WB := FArrNeurons[1].FWeights;
@@ -64102,26 +64113,26 @@ begin
 
   // Bias grad.
   if FSuppressBias = 0 then
-    for i := 0 to FDim - 1 do
+    for i := 0 to MaxDim do
       BiasDelta.FData[i] := BiasDelta.FData[i] - FLearningRate * FOutputError.FData[i];
 
   // dA[j,l] += sum_i dY[i,j]*BX[i,l].
-  for j := 0 to p - 1 do
-    for l := 0 to p - 1 do
+  for j := 0 to MaxP do
+    for l := 0 to MaxP do
     begin
       acc := 0;
-      for i := 0 to q - 1 do
+      for i := 0 to MaxQ do
         acc := acc + FOutputError.FData[i * p + j] * FCacheBX.FData[i * p + l];
       WADelta.FData[j * p + l] := WADelta.FData[j * p + l] - FLearningRate * acc;
     end;
 
   // G[i,l] = sum_j dY[i,j]*A[j,l]  (= dY*A).
   SetLength(G, q * p);
-  for i := 0 to q - 1 do
-    for l := 0 to p - 1 do
+  for i := 0 to MaxQ do
+    for l := 0 to MaxP do
     begin
       acc := 0;
-      for j := 0 to p - 1 do
+      for j := 0 to MaxP do
       begin
         dyij := FOutputError.FData[i * p + j];
         acc := acc + dyij * WA.FData[j * p + l];
@@ -64130,22 +64141,22 @@ begin
     end;
 
   // dB[i,k] += sum_l G[i,l]*X[k,l]   (X[k,l] = x[k*p+l]).
-  for i := 0 to q - 1 do
-    for k := 0 to q - 1 do
+  for i := 0 to MaxQ do
+    for k := 0 to MaxQ do
     begin
       acc := 0;
-      for l := 0 to p - 1 do
+      for l := 0 to MaxP do
         acc := acc + G[i * p + l] * PrevOut.FData[k * p + l];
       WBDelta.FData[i * q + k] := WBDelta.FData[i * q + k] - FLearningRate * acc;
     end;
 
   // dX[k,l] = sum_i B[i,k]*G[i,l]; dx[k*p+l] = dX[k,l].
   if HasPrevError then
-    for k := 0 to q - 1 do
-      for l := 0 to p - 1 do
+    for k := 0 to MaxQ do
+      for l := 0 to MaxP do
       begin
         acc := 0;
-        for i := 0 to q - 1 do
+        for i := 0 to MaxQ do
         begin
           glil := G[i * p + l];
           acc := acc + WB.FData[i * q + k] * glil;
@@ -64186,9 +64197,10 @@ end;
 
 destructor TNNetTensorTrain.Destroy();
 var
-  i: integer;
+  i, MaxMsg: integer;
 begin
-  for i := 0 to Length(FMsg) - 1 do
+  MaxMsg := Length(FMsg) - 1;
+  for i := 0 to MaxMsg do
     if Assigned(FMsg[i]) then FMsg[i].Free;
   SetLength(FMsg, 0);
   inherited Destroy();
@@ -64200,6 +64212,7 @@ end;
 procedure TNNetTensorTrain.FactorN(N: integer);
 var
   d, idx, rem, best, cand, root, prodSoFar: integer;
+  maxFactorIdx, maxCoreIdx: integer;
 begin
   d := FReqCores;
   if d < 2 then d := 2;
@@ -64211,7 +64224,8 @@ begin
 
   SetLength(FFactors, d);
   rem := N;
-  for idx := 0 to d - 1 do
+  maxFactorIdx := d - 1;
+  for idx := 0 to maxFactorIdx do
   begin
     if idx = d - 1 then
     begin
@@ -64244,7 +64258,8 @@ begin
   // Verify the product matches; if a degenerate split slipped through, fall back
   // to a single core (exact dense, still correct).
   prodSoFar := 1;
-  for idx := 0 to FCores - 1 do prodSoFar := prodSoFar * FFactors[idx];
+  maxCoreIdx := FCores - 1;
+  for idx := 0 to maxCoreIdx do prodSoFar := prodSoFar * FFactors[idx];
   if prodSoFar <> N then
   begin
     SetLength(FFactors, 1);
@@ -64256,7 +64271,8 @@ begin
   SetLength(FRanks, FCores + 1);
   FRanks[0] := 1;
   FRanks[FCores] := 1;
-  for idx := 1 to FCores - 1 do
+  maxCoreIdx := FCores - 1;
+  for idx := 1 to maxCoreIdx do
     FRanks[idx] := FRank;
 end;
 
@@ -64264,14 +64280,15 @@ end;
 // final bias neuron of length n.
 procedure TNNetTensorTrain.SizeCores();
 var
-  k, sz: integer;
+  k, sz, MaxCore: integer;
 begin
   while FNeurons.Count > FCores + 1 do
     FNeurons.Delete(FNeurons.Count - 1);
   while FNeurons.Count < FCores + 1 do
     FNeurons.Add(TNNetNeuron.Create());
 
-  for k := 0 to FCores - 1 do
+  MaxCore := FCores - 1;
+  for k := 0 to MaxCore do
   begin
     sz := FRanks[k] * FFactors[k] * FFactors[k] * FRanks[k + 1];
     FNeurons[k].Weights.ReSize(sz, 1, 1);
@@ -64288,7 +64305,7 @@ end;
 
 procedure TNNetTensorTrain.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  N, i: integer;
+  N, i, MaxMsg, MaxCore: integer;
 begin
   FPrevLayer := pPrevLayer;
   N := pPrevLayer.Output.Size;
@@ -64304,10 +64321,12 @@ begin
   FOutputErrorDeriv.ReSize(N, 1, 1);
 
   // Forward messages T_0..T_{d-1} are (re)allocated lazily in ComputeCPU.
-  for i := 0 to Length(FMsg) - 1 do
+  MaxMsg := Length(FMsg) - 1;
+  for i := 0 to MaxMsg do
     if Assigned(FMsg[i]) then FMsg[i].Free;
   SetLength(FMsg, FCores);
-  for i := 0 to FCores - 1 do
+  MaxCore := FCores - 1;
+  for i := 0 to MaxCore do
     FMsg[i] := TNNetVolume.Create();
 
   InitDefault();
@@ -64320,12 +64339,13 @@ end;
 procedure TNNetTensorTrain.InitDefault();
 var
   LpBnd103: integer;
-  k, i, fanIn: integer;
+  k, i, fanIn, MaxCore: integer;
   scale: TNeuralFloat;
   W: TNNetVolume;
 begin
   if FDim <= 0 then exit;
-  for k := 0 to FCores - 1 do
+  MaxCore := FCores - 1;
+  for k := 0 to MaxCore do
   begin
     W := FArrNeurons[k].FWeights;
     fanIn := FRanks[k] * FFactors[k];
@@ -64356,13 +64376,15 @@ procedure TNNetTensorTrain.ComputeCPU();
 var
   k, fk, rinDim, routDim, sufSize, prefPrev, prefCur: integer;
   suf, prefIdx, jk, ik, ain, aout, gIdx, prevIdx, curIdx: integer;
+  MaxCore, MaxDim, MaxSuf, MaxPref, MaxFk, MaxROut, MaxRIn: integer;
   PrevOut, Wk, Bias, Prev, Cur: TNNetVolume;
   acc: TNeuralFloat;
 begin
   PrevOut := FPrevLayer.FOutput;
 
   prefCur := 1;
-  for k := 0 to FCores - 1 do
+  MaxCore := FCores - 1;
+  for k := 0 to MaxCore do
   begin
     fk := FFactors[k];
     rinDim := FRanks[k];
@@ -64377,14 +64399,19 @@ begin
     Cur.ReSize(sufSize * prefCur * routDim, 1, 1);
     if k = 0 then Prev := PrevOut else Prev := FMsg[k - 1];
 
-    for suf := 0 to sufSize - 1 do
-      for prefIdx := 0 to prefPrev - 1 do
-        for jk := 0 to fk - 1 do
-          for aout := 0 to routDim - 1 do
+    MaxSuf := sufSize - 1;
+    MaxPref := prefPrev - 1;
+    MaxFk := fk - 1;
+    MaxROut := routDim - 1;
+    MaxRIn := rinDim - 1;
+    for suf := 0 to MaxSuf do
+      for prefIdx := 0 to MaxPref do
+        for jk := 0 to MaxFk do
+          for aout := 0 to MaxROut do
           begin
             acc := 0;
-            for ik := 0 to fk - 1 do
-              for ain := 0 to rinDim - 1 do
+            for ik := 0 to MaxFk do
+              for ain := 0 to MaxRIn do
               begin
                 // previous suffix index = ik * sufSize + suf.
                 if k = 0 then
@@ -64402,7 +64429,8 @@ begin
 
   // Final message T_{d-1}: sufSize = 1, prefCur = FDim, routDim = 1 -> y.
   Cur := FMsg[FCores - 1];
-  for k := 0 to FDim - 1 do
+  MaxDim := FDim - 1;
+  for k := 0 to MaxDim do
     FOutput.FData[k] := Cur.FData[k];
 
   Bias := FArrNeurons[FCores].FWeights;
@@ -64436,6 +64464,7 @@ procedure TNNetTensorTrain.BackpropagateCPU();
 var
   k, fk, rinDim, routDim, sufSize, prefPrev, prefCur: integer;
   suf, prefIdx, jk, ik, ain, aout, gIdx, prevIdx, curIdx, ti: integer;
+  MaxCore, MaxDim, MaxSuf, MaxPref, MaxFk, MaxROut, MaxRIn, MaxDPrev: integer;
   PrevOut, Wk, WkDelta, BiasDelta, Prev, LocalPrevError: TNNetVolume;
   dCur, dPrev: array of TNeuralFloat;
   dval, gval, tval: TNeuralFloat;
@@ -64447,13 +64476,14 @@ begin
   LocalPrevError := FPrevLayer.OutputError;
 
   // Bias grad.
+  MaxDim := FDim - 1;
   if FSuppressBias = 0 then
-    for ti := 0 to FDim - 1 do
+    for ti := 0 to MaxDim do
       BiasDelta.FData[ti] := BiasDelta.FData[ti] - FLearningRate * FOutputError.FData[ti];
 
   // dT_{d-1} = output error (same flat layout as y).
   SetLength(dCur, FDim);
-  for ti := 0 to FDim - 1 do
+  for ti := 0 to MaxDim do
     dCur[ti] := FOutputError.FData[ti];
 
   for k := FCores - 1 downto 0 do
@@ -64472,18 +64502,24 @@ begin
 
     // dT_{k-1} buffer: size = (fk*sufSize) * prefPrev * rinDim.
     SetLength(dPrev, fk * sufSize * prefPrev * rinDim);
-    for ti := 0 to Length(dPrev) - 1 do dPrev[ti] := 0;
+    MaxDPrev := Length(dPrev) - 1;
+    for ti := 0 to MaxDPrev do dPrev[ti] := 0;
 
-    for suf := 0 to sufSize - 1 do
-      for prefIdx := 0 to prefPrev - 1 do
-        for jk := 0 to fk - 1 do
-          for aout := 0 to routDim - 1 do
+    MaxSuf := sufSize - 1;
+    MaxPref := prefPrev - 1;
+    MaxFk := fk - 1;
+    MaxROut := routDim - 1;
+    MaxRIn := rinDim - 1;
+    for suf := 0 to MaxSuf do
+      for prefIdx := 0 to MaxPref do
+        for jk := 0 to MaxFk do
+          for aout := 0 to MaxROut do
           begin
             curIdx := (suf * prefCur + (prefIdx * fk + jk)) * routDim + aout;
             dval := dCur[curIdx];
             if dval = 0 then continue;
-            for ik := 0 to fk - 1 do
-              for ain := 0 to rinDim - 1 do
+            for ik := 0 to MaxFk do
+              for ain := 0 to MaxRIn do
               begin
                 if k = 0 then
                   prevIdx := ik * sufSize + suf
@@ -64502,20 +64538,21 @@ begin
     if k > 0 then
     begin
       SetLength(dCur, Length(dPrev));
-      for ti := 0 to Length(dPrev) - 1 do dCur[ti] := dPrev[ti];
+      for ti := 0 to MaxDPrev do dCur[ti] := dPrev[ti];
     end
     else
     begin
       // dT_{-1} = dx. Layout of dPrev is exactly x's flat layout (suffix only).
       if HasPrevError then
-        for ti := 0 to FDim - 1 do
+        for ti := 0 to MaxDim do
           LocalPrevError.FData[ti] := LocalPrevError.FData[ti] + dPrev[ti];
     end;
   end;
 
   if not FBatchUpdate then
   begin
-    for k := 0 to FCores - 1 do
+    MaxCore := FCores - 1;
+    for k := 0 to MaxCore do
       FArrNeurons[k].UpdateWeightsWithoutInertia();
     if FSuppressBias = 0 then FArrNeurons[FCores].UpdateWeightsWithoutInertia();
     AfterWeightUpdate();
@@ -64564,7 +64601,7 @@ end;
 
 procedure TNNetSoftDecisionTree.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  i: integer;
+  i, MaxInner, MaxLeaf: integer;
 begin
   FPrevLayer := pPrevLayer;
   FInSize := pPrevLayer.Output.Size;
@@ -64578,14 +64615,16 @@ begin
   FCacheLeaf.ReSize(FNumLeaves, 1, 1);
 
   // Gate neurons: Din weights + bias each.
-  for i := 0 to FNumInner - 1 do
+  MaxInner := FNumInner - 1;
+  for i := 0 to MaxInner do
   begin
     FNeurons[i].Weights.ReSize(FInSize, 1, 1);
     FNeurons[i].BackInertia.ReSize(FInSize, 1, 1);
     FNeurons[i].Delta.ReSize(FInSize, 1, 1);
   end;
   // Leaf neurons: OutputDepth weights, no bias.
-  for i := 0 to FNumLeaves - 1 do
+  MaxLeaf := FNumLeaves - 1;
+  for i := 0 to MaxLeaf do
   begin
     FNeurons[FNumInner + i].Weights.ReSize(FOutDepth, 1, 1);
     FNeurons[FNumInner + i].BackInertia.ReSize(FOutDepth, 1, 1);
@@ -64602,19 +64641,24 @@ end;
 procedure TNNetSoftDecisionTree.InitDefault();
 var
   i, j: integer;
+  MaxInner, MaxLeaf, MaxIn, MaxOut: integer;
   scaleGate: TNeuralFloat;
 begin
   if FInSize <= 0 then exit;
   scaleGate := 1.0 / Sqrt(FInSize);
-  for i := 0 to FNumInner - 1 do
+  MaxInner := FNumInner - 1;
+  MaxLeaf := FNumLeaves - 1;
+  MaxIn := FInSize - 1;
+  MaxOut := FOutDepth - 1;
+  for i := 0 to MaxInner do
   begin
-    for j := 0 to FInSize - 1 do
+    for j := 0 to MaxIn do
       FArrNeurons[i].FWeights.FData[j] := scaleGate * (Random - 0.5) * 2;
     FArrNeurons[i].FBiasWeight := 0;
   end;
-  for i := 0 to FNumLeaves - 1 do
+  for i := 0 to MaxLeaf do
   begin
-    for j := 0 to FOutDepth - 1 do
+    for j := 0 to MaxOut do
       FArrNeurons[FNumInner + i].FWeights.FData[j] := 0.1 * (Random - 0.5) * 2;
     FArrNeurons[FNumInner + i].FBiasWeight := 0;
   end;
@@ -64636,13 +64680,15 @@ end;
 procedure TNNetSoftDecisionTree.ComputeCPU();
 var
   i, l, level, node, bit: integer;
+  MaxInner, MaxLeaf: integer;
   zi, pp, prob: TNeuralFloat;
   PrevOut, Leaf: TNNetVolume;
 begin
   PrevOut := FPrevLayer.FOutput;
 
   // Inner-node routing probabilities.
-  for i := 0 to FNumInner - 1 do
+  MaxInner := FNumInner - 1;
+  for i := 0 to MaxInner do
   begin
     zi := FArrNeurons[i].FWeights.DotProduct(PrevOut) + FArrNeurons[i].FBiasWeight;
     pp := 1.0 / (1.0 + Exp(-FBeta * zi));
@@ -64651,7 +64697,8 @@ begin
 
   // Per-leaf path probability and output mixture.
   FOutput.Fill(0);
-  for l := 0 to FNumLeaves - 1 do
+  MaxLeaf := FNumLeaves - 1;
+  for l := 0 to MaxLeaf do
   begin
     prob := 1.0;
     node := 0;
@@ -64700,6 +64747,7 @@ end;
 procedure TNNetSoftDecisionTree.BackpropagateCPU();
 var
   i, l, d, level, node, bit: integer;
+  MaxInner, MaxLeaf, MaxOut, MaxNeuron: integer;
   PrevOut, LocalPrevError, GateW, GateDelta, LeafW, LeafDelta: TNNetVolume;
   gd, rl, pp, dzi, lr: TNeuralFloat;
   HasPrevError: boolean;
@@ -64713,17 +64761,20 @@ begin
 
   // Per-leaf responsibility and leaf-vector gradient.
   SetLength(r, FNumLeaves);
-  for l := 0 to FNumLeaves - 1 do
+  MaxLeaf := FNumLeaves - 1;
+  MaxInner := FNumInner - 1;
+  MaxOut := FOutDepth - 1;
+  for l := 0 to MaxLeaf do
   begin
     gd := 0;
     LeafW := FArrNeurons[FNumInner + l].FWeights;
-    for d := 0 to FOutDepth - 1 do
+    for d := 0 to MaxOut do
       gd := gd + FOutputError.FData[d] * LeafW.FData[d];
     r[l] := gd * FCacheLeaf.FData[l];
     // dL/dphi_l[d] = P_l * g_d.
     LeafDelta := FArrNeurons[FNumInner + l].FDelta;
     pp := FCacheLeaf.FData[l];
-    for d := 0 to FOutDepth - 1 do
+    for d := 0 to MaxOut do
       LeafDelta.FData[d] := LeafDelta.FData[d] - lr * (pp * FOutputError.FData[d]);
   end;
 
@@ -64731,12 +64782,12 @@ begin
   // bucket of every node on the path according to the branch taken.
   SetLength(A, FNumInner);
   SetLength(B, FNumInner);
-  for i := 0 to FNumInner - 1 do
+  for i := 0 to MaxInner do
   begin
     A[i] := 0;
     B[i] := 0;
   end;
-  for l := 0 to FNumLeaves - 1 do
+  for l := 0 to MaxLeaf do
   begin
     node := 0;
     for level := FTreeDepth - 1 downto 0 do
@@ -64756,7 +64807,7 @@ begin
   end;
 
   // Per inner node: dz_i, then gate weight/bias grads and input-error scatter.
-  for i := 0 to FNumInner - 1 do
+  for i := 0 to MaxInner do
   begin
     pp := FCacheP.FData[i];
     dzi := FBeta * (A[i] * (1.0 - pp) - B[i] * pp);
@@ -64773,7 +64824,8 @@ begin
 
   if not FBatchUpdate then
   begin
-    for i := 0 to FNumInner + FNumLeaves - 1 do
+    MaxNeuron := FNumInner + FNumLeaves - 1;
+    for i := 0 to MaxNeuron do
       FArrNeurons[i].UpdateWeightsWithoutInertia();
     AfterWeightUpdate();
   end;
@@ -64877,18 +64929,21 @@ end;
 procedure TNNetRandomFourierFeatures.ComputeCPU();
 var
   k, j, base, D, Din: integer;
+  MaxD, MaxDin: integer;
   acc: TNeuralFloat;
   PrevOut, W: TNNetVolume;
 begin
   D := FNumFeatures;
   Din := FInSize;
+  MaxD := D - 1;
+  MaxDin := Din - 1;
   PrevOut := FPrevLayer.FOutput;
   W := FArrNeurons[0].FWeights;
-  for k := 0 to D - 1 do
+  for k := 0 to MaxD do
   begin
     base := k * Din;
     acc := 0;
-    for j := 0 to Din - 1 do
+    for j := 0 to MaxDin do
       acc := acc + W.FData[base + j] * PrevOut.FData[j];
     FCacheProj.FData[k] := acc;
     FOutput.FData[k]     := FScale * pcr_cosf(acc);  // cos channels 0..D-1
@@ -64919,12 +64974,15 @@ end;
 procedure TNNetRandomFourierFeatures.BackpropagateCPU();
 var
   k, j, base, D, Din: integer;
+  MaxD, MaxDin: integer;
   z, dz, sc: TNeuralFloat;
   PrevOut, W, WDelta, LocalPrevError: TNNetVolume;
   HasPrevError: boolean;
 begin
   D := FNumFeatures;
   Din := FInSize;
+  MaxD := D - 1;
+  MaxDin := Din - 1;
   sc := FScale;
   PrevOut := FPrevLayer.FOutput;
   W := FArrNeurons[0].FWeights;
@@ -64932,16 +64990,16 @@ begin
   HasPrevError := (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size);
   LocalPrevError := FPrevLayer.OutputError;
 
-  for k := 0 to D - 1 do
+  for k := 0 to MaxD do
   begin
     z := FCacheProj.FData[k];
     dz := sc * (-pcr_sinf(z) * FOutputError.FData[k] + pcr_cosf(z) * FOutputError.FData[D + k]);
     base := k * Din;
     if HasPrevError then
-      for j := 0 to Din - 1 do
+      for j := 0 to MaxDin do
         LocalPrevError.FData[j] := LocalPrevError.FData[j] + dz * W.FData[base + j];
     if FTrainable <> 0 then
-      for j := 0 to Din - 1 do
+      for j := 0 to MaxDin do
         WDelta.FData[base + j] := WDelta.FData[base + j]
           - FLearningRate * dz * PrevOut.FData[j];
   end;
@@ -65031,14 +65089,16 @@ end;
 // orthogonal perturbation of the identity.
 procedure TNNetHouseholderLinear.InitDefault();
 var
-  ReflIdx, j: integer;
+  ReflIdx, j, MaxRefl, MaxDim: integer;
   W: TNNetVolume;
 begin
   if FNumReflections <= 0 then exit;
-  for ReflIdx := 0 to FNumReflections - 1 do
+  MaxRefl := FNumReflections - 1;
+  MaxDim := FDim - 1;
+  for ReflIdx := 0 to MaxRefl do
   begin
     W := FArrNeurons[ReflIdx].FWeights;
-    for j := 0 to FDim - 1 do
+    for j := 0 to MaxDim do
       W.FData[j] := 0.05 * (Random - 0.5) * 2;
     // Bias one coordinate to keep v_i^T v_i comfortably away from zero.
     W.FData[ReflIdx mod FDim] := W.FData[ReflIdx mod FDim] + 1.0;
@@ -65059,37 +65119,38 @@ end;
 // input x_{i+1} fed into reflection H_i (needed by backward).
 procedure TNNetHouseholderLinear.ComputeCPU();
 var
-  N, ReflIdx, j: integer;
+  N, ReflIdx, j, MaxN: integer;
   beta, dot, scale: TNeuralFloat;
   V, Bias, PrevOut: TNNetVolume;
 begin
   N := FDim;
+  MaxN := N - 1;
   PrevOut := FPrevLayer.FOutput;
   Bias := FArrNeurons[FNumReflections].FWeights;
   // Initialize working vector with the input.
-  for j := 0 to N - 1 do
+  for j := 0 to MaxN do
     FOutput.FData[j] := PrevOut.FData[j];
   // Apply H_K, then H_{K-1}, ... , H_1 (so Q = H_1*...*H_K acts left-to-right).
   for ReflIdx := FNumReflections - 1 downto 0 do
   begin
     V := FArrNeurons[ReflIdx].FWeights;
     // Cache the input to this reflection BEFORE applying it.
-    for j := 0 to N - 1 do
+    for j := 0 to MaxN do
       FCache.FData[ReflIdx + j * FNumReflections] := FOutput.FData[j];
     beta := 0;
     dot := 0;
-    for j := 0 to N - 1 do
+    for j := 0 to MaxN do
     begin
       beta := beta + V.FData[j] * V.FData[j];
       dot := dot + V.FData[j] * FOutput.FData[j];
     end;
     if beta < HOUSEHOLDER_MIN_BETA then continue; // degenerate -> identity
     scale := 2.0 * dot / beta;
-    for j := 0 to N - 1 do
+    for j := 0 to MaxN do
       FOutput.FData[j] := FOutput.FData[j] - scale * V.FData[j];
   end;
   if FSuppressBias = 0 then
-    for j := 0 to N - 1 do
+    for j := 0 to MaxN do
       FOutput.FData[j] := FOutput.FData[j] + Bias.FData[j];
 end;
 
@@ -65119,28 +65180,30 @@ end;
 //   g <- g - s*dgv*v   (= H_i * g, since H_i is symmetric).
 procedure TNNetHouseholderLinear.BackpropagateCPU();
 var
-  N, ReflIdx, j: integer;
+  N, ReflIdx, j, MaxN, MaxRefl: integer;
   beta, s, dgv, duv, coef: TNeuralFloat;
   V, VDelta, BiasDelta, U: TNNetVolume;
   g: array of TNeuralFloat;
 begin
   N := FDim;
+  MaxN := N - 1;
+  MaxRefl := FNumReflections - 1;
   BiasDelta := FArrNeurons[FNumReflections].FDelta;
   if FSuppressBias = 0 then
-    for j := 0 to N - 1 do
+    for j := 0 to MaxN do
       BiasDelta.FData[j] := BiasDelta.FData[j] - FLearningRate * FOutputError.FData[j];
 
   SetLength(g, N);
-  for j := 0 to N - 1 do
+  for j := 0 to MaxN do
     g[j] := FOutputError.FData[j];
 
-  for ReflIdx := 0 to FNumReflections - 1 do
+  for ReflIdx := 0 to MaxRefl do
   begin
     V := FArrNeurons[ReflIdx].FWeights;
     VDelta := FArrNeurons[ReflIdx].FDelta;
     U := FCache; // row ReflIdx along depth axis = u = x_{i+1}
     beta := 0; dgv := 0; duv := 0;
-    for j := 0 to N - 1 do
+    for j := 0 to MaxN do
     begin
       beta := beta + V.FData[j] * V.FData[j];
       dgv := dgv + V.FData[j] * g[j];
@@ -65150,13 +65213,13 @@ begin
     s := 2.0 / beta;
     coef := 2.0 * duv * dgv / beta;
     // dL/dv accumulated (Delta carries -LearningRate * gradient).
-    for j := 0 to N - 1 do
+    for j := 0 to MaxN do
       VDelta.FData[j] := VDelta.FData[j]
         - FLearningRate *
           ( -s * ( dgv * U.FData[ReflIdx + j * FNumReflections]
                    + duv * g[j] - coef * V.FData[j] ) );
     // Advance g <- H_i * g.
-    for j := 0 to N - 1 do
+    for j := 0 to MaxN do
       g[j] := g[j] - s * dgv * V.FData[j];
   end;
 
@@ -65173,31 +65236,33 @@ end;
 // here so the layer works with LearningRate = 0 too.
 procedure TNNetHouseholderLinear.ComputePreviousLayerErrorCPU();
 var
-  N, ReflIdx, j: integer;
+  N, ReflIdx, j, MaxN, MaxRefl: integer;
   beta, dgv, s: TNeuralFloat;
   V, LocalPrevError: TNNetVolume;
   g: array of TNeuralFloat;
 begin
   N := FDim;
+  MaxN := N - 1;
+  MaxRefl := FNumReflections - 1;
   LocalPrevError := FPrevLayer.OutputError;
   SetLength(g, N);
-  for j := 0 to N - 1 do
+  for j := 0 to MaxN do
     g[j] := FOutputError.FData[j];
-  for ReflIdx := 0 to FNumReflections - 1 do
+  for ReflIdx := 0 to MaxRefl do
   begin
     V := FArrNeurons[ReflIdx].FWeights;
     beta := 0; dgv := 0;
-    for j := 0 to N - 1 do
+    for j := 0 to MaxN do
     begin
       beta := beta + V.FData[j] * V.FData[j];
       dgv := dgv + V.FData[j] * g[j];
     end;
     if beta < HOUSEHOLDER_MIN_BETA then continue;
     s := 2.0 / beta;
-    for j := 0 to N - 1 do
+    for j := 0 to MaxN do
       g[j] := g[j] - s * dgv * V.FData[j];
   end;
-  for j := 0 to N - 1 do
+  for j := 0 to MaxN do
     LocalPrevError.FData[j] := LocalPrevError.FData[j] + g[j];
 end;
 
