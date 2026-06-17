@@ -238,7 +238,7 @@ var
   WeightMapObj: TJSONObject;
   BaseDir, ShardFile, MappedTensor: string;
   ShardFiles: TStringList;
-  i, ShardIdx, TensorIdx: integer;
+  i, ShardIdx, TensorIdx, WeightMapCount: integer;
 begin
   BaseDir := ExtractFilePath(pIndexFileName);
   IndexText := TStringList.Create;
@@ -263,12 +263,13 @@ begin
         'torch.bin: index has no "weight_map" object: %s',
         [pIndexFileName]);
     WeightMapObj := TJSONObject(WeightMap);
-    if WeightMapObj.Count = 0 then
+    WeightMapCount := WeightMapObj.Count;
+    if WeightMapCount = 0 then
       raise ETorchBinError.CreateFmt(
         'torch.bin: index "weight_map" is empty: %s', [pIndexFileName]);
     // Open each distinct shard once, in first-mention order.
     ShardFiles.Sorted := False;
-    for i := 0 to WeightMapObj.Count - 1 do
+    for i := 0 to WeightMapCount - 1 do
     begin
       if not (WeightMapObj.Items[i].JSONType = jtString) then
         raise ETorchBinError.CreateFmt(
@@ -283,7 +284,7 @@ begin
     end;
     // Validate the weight_map against the shard state_dicts: every mapped
     // tensor must exist and live in the shard the index claims.
-    for i := 0 to WeightMapObj.Count - 1 do
+    for i := 0 to WeightMapCount - 1 do
     begin
       MappedTensor := WeightMapObj.Names[i];
       ShardFile := WeightMapObj.Items[i].AsString;
@@ -544,6 +545,7 @@ var
   PickleLen: Int64;
   Root: TPickleNode;
   i, j, TensorCnt: integer;
+  OwnedCount: integer;
   EntryIdx: integer;
   ElemSize: integer;
   NumElements, ExpectedStride, ByteBegin, ByteEnd: Int64;
@@ -1046,7 +1048,8 @@ begin
     end;
     SetLength(FTensors, TensorCnt);
   finally
-    for i := 0 to Owned.Count - 1 do
+    OwnedCount := Owned.Count;
+    for i := 0 to OwnedCount - 1 do
       TObject(Owned[i]).Free;
     Owned.Free;
   end;

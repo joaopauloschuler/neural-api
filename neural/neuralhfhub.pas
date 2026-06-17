@@ -122,6 +122,7 @@ var
 procedure CheckPathComponent(const S, What: string);
 var
   I: integer;
+  PartsCount: integer;
   Parts: TStringList;
 begin
   if S = '' then
@@ -133,7 +134,8 @@ begin
     Parts.Delimiter := '/';
     Parts.StrictDelimiter := True;
     Parts.DelimitedText := S;
-    for I := 0 to Parts.Count - 1 do
+    PartsCount := Parts.Count;
+    for I := 0 to PartsCount - 1 do
       if (Parts[I] = '') or (Parts[I] = '.') or (Parts[I] = '..') then
         raise EHubError.Create('neuralhfhub: invalid ' + What + ' "' + S +
           '".');
@@ -191,6 +193,7 @@ var
   WeightMap: TJSONData;
   Shards: TStringList;
   I: integer;
+  WeightMapCount, ShardsCount: integer;
 begin
   Root := nil;
   Shards := TStringList.Create;
@@ -210,17 +213,19 @@ begin
     if not (WeightMap is TJSONObject) then
       raise EHubError.Create(
         'neuralhfhub: index json has no "weight_map" object.');
-    if TJSONObject(WeightMap).Count = 0 then
+    WeightMapCount := TJSONObject(WeightMap).Count;
+    if WeightMapCount = 0 then
       raise EHubError.Create('neuralhfhub: index "weight_map" is empty.');
-    for I := 0 to TJSONObject(WeightMap).Count - 1 do
+    for I := 0 to WeightMapCount - 1 do
     begin
       if not (TJSONObject(WeightMap).Items[I].JSONType = jtString) then
         raise EHubError.Create('neuralhfhub: index weight_map entry "' +
           TJSONObject(WeightMap).Names[I] + '" is not a string.');
       Shards.Add(TJSONObject(WeightMap).Items[I].AsString);
     end;
-    SetLength(Result, Shards.Count);
-    for I := 0 to Shards.Count - 1 do
+    ShardsCount := Shards.Count;
+    SetLength(Result, ShardsCount);
+    for I := 0 to ShardsCount - 1 do
       Result[I] := Shards[I];
   finally
     Shards.Free;
