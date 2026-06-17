@@ -474,14 +474,15 @@ end;
 // sequence, or after Opt.MaxNewTokens. Returns the decoded reply (marker
 // trimmed); streamed printing flushes after every token so piped output
 // still streams.
-function GenerateReply(NN: TNNet; Tokenizer: TNeuralHFTokenizer;
+function GenerateReply(NN: TNNet; Session: TNNetStreamingDecoder;
+  Tokenizer: TNeuralHFTokenizer;
   const PromptIds: TNeuralIntegerArray; const Opt: TChatOptions;
   SeqLen, VocabSize: integer; Chain: TNNetLogitsProcessorChain;
   Sampler: TNNetSamplerBase; const MarkerIds: TNeuralIntegerArray): string;
 var
   Tokens: TNeuralIntegerArray;
   Generated: TNeuralIntegerArray;
-  Input, Output, Row: TNNetVolume;
+  InV, Output, Row: TNNetVolume;
   Len, GenLen, StepCnt, Cnt, NewToken: integer;
   Decoded, Printed: string;
 begin
@@ -497,21 +498,28 @@ begin
   for Cnt := 0 to Len - 1 do Tokens[Cnt] := PromptIds[Cnt];
   SetLength(Generated, 0);
   Printed := '';
-  Input := TNNetVolume.Create(SeqLen, 1, 1);
-  Output := TNNetVolume.Create();
+  InV := TNNetVolume.Create(1, 1, 1);
+  Output := nil; // a reference into the net, returned by Session.Output()
   Row := TNNetVolume.Create(VocabSize, 1, 1);
   try
     Chain.Reset(PromptIds);
+    // Fresh KV cache for this reply, then prefill the whole prompt
+    // token-at-a-time. The LAST prompt token is fed as the first decode
+    // step's input (its output row predicts the first reply token).
+    Session.Reset();
+    for Cnt := 0 to Len - 2 do
+    begin
+      InV.FData[0] := Tokens[Cnt];
+      Session.StepForward(InV, Cnt);
+    end;
     for StepCnt := 1 to Opt.MaxNewTokens do
     begin
       if Len >= SeqLen then break;
-      Input.Fill(0);
-      for Cnt := 0 to Len - 1 do Input.FData[Cnt] := Tokens[Cnt];
-      NN.Compute(Input);
-      NN.GetOutput(Output);
-      // The logits row at the last real position predicts the next token.
-      for Cnt := 0 to VocabSize - 1 do
-        Row.FData[Cnt] := Output.FData[(Len - 1) * VocabSize + Cnt];
+      // One width-1 forward of the last committed token over the cached past.
+      InV.FData[0] := Tokens[Len - 1];
+      Session.StepForward(InV, Len - 1);
+      Output := Session.Output(); // (1,1,vocab) -- the single logits row
+      for Cnt := 0 to VocabSize - 1 do Row.FData[Cnt] := Output.FData[Cnt];
       SoftmaxRow(Row);
       Chain.ProcessRow(Row);
       if Assigned(Sampler) then NewToken := Sampler.GetToken(Row)
@@ -551,8 +559,7 @@ begin
     Flush(System.Output);
   finally
     Row.Free;
-    Output.Free;
-    Input.Free;
+    InV.Free;
   end;
 end;
 
@@ -687,6 +694,7 @@ var
   Opt: TChatOptions;
   Args: TStringList;
   NN: TNNet;
+  Session: TNNetStreamingDecoder;
   Tokenizer: TNeuralHFTokenizer;
   ChatFormat: TNeuralChatFormat;
   History: TChatMessages;
@@ -760,13 +768,13 @@ begin
   if Opt.Seed >= 0 then RandSeed := Opt.Seed
   else Randomize;
 
-  // Default context window. The full-recompute decode allocates a persistent
-  // SeqLen x SeqLen attention-score buffer PER HEAD PER LAYER, so build memory
-  // grows as O(SeqLen^2) (e.g. ~336 such buffers for a 24-layer/14-head 0.5B
-  // model). Using the checkpoint's full max_position_embeddings (32768 for
-  // Qwen2.5) would request terabytes and OOM at load, so when the user gives
-  // no --ctx we cap the default at DefaultCtxCap (clamped to the model's own
-  // limit). Raise it with --ctx N (and prefer --int8) if you have the RAM.
+  // Default context window. KV-cache streamed decode (below) holds K/V for up
+  // to CtxLen tokens PER HEAD PER LAYER, so cache memory grows as O(CtxLen)
+  // (not the O(CtxLen^2) score buffers a full-recompute decode would allocate).
+  // Using the checkpoint's full max_position_embeddings (32768 for Qwen2.5)
+  // would still be large, so when the user gives no --ctx we cap the default at
+  // DefaultCtxCap (clamped to the model's own limit). Raise it with --ctx N
+  // (and prefer --int8) if you have the RAM.
   if Opt.CtxLen <= 0 then
   begin
     Cnt := ReadConfigInt(IncludeTrailingPathDelimiter(Opt.ModelDir) +
@@ -788,10 +796,14 @@ begin
       ' bytes; drop --fp32 to use int8 if you run low on RAM]');
 
   WriteLn('Loading ', Opt.ModelDir, ' ...');
-  NN := BuildFromPretrained(Opt.ModelDir, Opt.CtxLen,
+  // Built at INPUT WIDTH 1 (pSeqLen=1): streamed decode feeds one token per
+  // forward and the KV cache (budget = CtxLen, set on the session below) holds
+  // the context. SeqLen is the cache budget, NOT the built input width.
+  NN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}1,
     {pInferenceOnly=}true, '', {pQuantizeInt8=}Opt.Int8);
-  SeqLen := NN.GetFirstLayer().Output.SizeX;
+  SeqLen := Opt.CtxLen;
   VocabSize := NN.GetLastLayer().Output.Depth;
+  Session := TNNetStreamingDecoder.Create(NN, SeqLen);
   ModelType := ReadModelType(IncludeTrailingPathDelimiter(Opt.ModelDir) +
     'config.json');
   if ModelType = '' then ModelType := 'unknown';
@@ -862,7 +874,7 @@ begin
       Msgs := AssembleMessages(Opt.SystemPrompt, History);
       PromptIds := EncodeChat(Tokenizer, ChatFormat, Msgs,
         {AddGenerationPrompt=}true);
-      Reply := GenerateReply(NN, Tokenizer, PromptIds, Opt, SeqLen,
+      Reply := GenerateReply(NN, Session, Tokenizer, PromptIds, Opt, SeqLen,
         VocabSize, Chain, Sampler, MarkerIds);
       SetLength(History, Length(History) + 1);
       History[High(History)] := ChatMessage('assistant', Reply);
@@ -879,6 +891,7 @@ begin
   WriteLn('Bye.');
   Sampler.Free;
   Chain.Free; // owns the processors, which own the penalty
+  Session.Free; // before NN.Free: Destroy ends incremental decode on NN's layers
   Tokenizer.Free;
   NN.Free;
 end.
