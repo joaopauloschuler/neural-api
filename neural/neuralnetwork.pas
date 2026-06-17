@@ -98205,17 +98205,11 @@ begin
     FDelta2.ReSize(1, 1, 1);
     FBackInertia.ReSize(1, 1, 1);
     FBackInertia2.ReSize(1, 1, 1);
-    FDelta.Fill(0);
-    FDelta2.Fill(0);
-    FBackInertia.Fill(0);
-    FBackInertia2.Fill(0);
-    FBiasDelta := 0;
-    FBiasInertia := 0;
-    FBiasInertia2 := 0;
   end
   else
   begin
-    // pInferenceOnly=False keeps the neuron trainable: no-op.
+    FDelta.ReSize(FWeights);
+    FBackInertia.ReSize(FWeights);
   end;
 end;
 
