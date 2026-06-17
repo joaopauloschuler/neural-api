@@ -3787,7 +3787,7 @@ procedure FilterCSVWithNumbersUpToMax(inputFile,outputFile: string; MaxInteger: 
 var
   LargeFileIn, LargeFileOut: TextFile;
   StrLine: string;
-  MaxValue, RowCnt, WordCnt: integer;
+  MaxValue, RowCnt, WordCnt, SepCount: integer;
   Separator: TNNetStringList;
 begin
   Separator := CreateTokenizedStringList(',');
@@ -3804,7 +3804,8 @@ begin
     if Separator.Count > 0 then
     begin
       MaxValue := 0;
-      for WordCnt := 0 to Separator.Count - 1 do
+      SepCount := Separator.Count;
+      for WordCnt := 0 to SepCount - 1 do
       begin
         MaxValue := Max(MaxValue, StrToInt(Separator[WordCnt]));
         if MaxValue > MaxInteger then break;
@@ -3825,7 +3826,7 @@ procedure LoadIntegersInCSV(filename: string; var aTokens: TNNetAAInteger;
 var
   LargeFile: TextFile;
   StrLine: string;
-  RowCnt, WordCnt: integer;
+  RowCnt, WordCnt, SepCount: integer;
   Separator: TNNetStringList;
 begin
   Separator := CreateTokenizedStringList(',');
@@ -3848,10 +3849,11 @@ begin
   begin
     ReadLn(LargeFile, StrLine);
     Separator.DelimitedText := StrLine;
-    SetLength(aTokens[RowCnt], Separator.Count);
-    if Separator.Count > 0 then
+    SepCount := Separator.Count;
+    SetLength(aTokens[RowCnt], SepCount);
+    if SepCount > 0 then
     begin
-      for WordCnt := 0 to Separator.Count - 1 do
+      for WordCnt := 0 to SepCount - 1 do
       begin
         aTokens[RowCnt][WordCnt] := StrToInt(Separator[WordCnt]);
       end;

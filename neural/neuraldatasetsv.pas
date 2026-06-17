@@ -273,7 +273,7 @@ procedure ShowNeurons(
   startImage, filterSize, color_encoding: integer;
   ScalePerImage: boolean);
 var
-  NeuronCount: integer;
+  NeuronCount, NeuronMax: integer;
   MaxW, MinW: TNeuralFloat;
   vDisplay: TNNetVolume;
 begin
@@ -287,7 +287,8 @@ begin
     MinW := pNeuronList.GetMinWeight();
   end;
 
-  for NeuronCount := 0 to pNeuronList.Count - 1 do
+  NeuronMax := pNeuronList.Count - 1;
+  for NeuronCount := 0 to NeuronMax do
   begin
     vDisplay.Copy(pNeuronList[NeuronCount].Weights);
     if (ScalePerImage) then
