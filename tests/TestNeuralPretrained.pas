@@ -138,7 +138,7 @@ type
     procedure TestShardedTorchBinMatchesSingleFile;
     procedure TestShardedTorchBinIndexErrors;
     procedure TestGPT2LogitParityFromShardedTorchBin;
-    procedure TestMakeInferenceOnlyKeepsOutputs;
+    procedure TestSetInferenceOnlyKeepsOutputs;
     procedure TestInt8QuantizeRoundTripAndForward;
     procedure TestInt8QuantizedGPT2LogitDrift;
     procedure TestInt8QuantizedLlamaLogitDrift;
@@ -2999,11 +2999,11 @@ begin
   end;
 end;
 
-// MakeInferenceOnly shrinks every neuron's Delta/BackInertia training
+// SetInferenceOnly shrinks every neuron's Delta/BackInertia training
 // volumes; the forward pass must be bit-for-bit unaffected, whether the
 // shrink happens during construction (pInferenceOnly=True) or on an
-// already-built net (TNNet.MakeInferenceOnly).
-procedure TTestNeuralPretrained.TestMakeInferenceOnlyKeepsOutputs;
+// already-built net (TNNet.SetInferenceOnly).
+procedure TTestNeuralPretrained.TestSetInferenceOnlyKeepsOutputs;
 var
   NNTrain, NNInfer: TNNet;
   Config: TGPT2Config;
@@ -3029,11 +3029,11 @@ begin
       AssertEquals('pInferenceOnly logit ' + IntToStr(i),
         OutTrain.FData[i], OutInfer.FData[i], 0);
     // Shrinking a finished net must not change its outputs either.
-    NNTrain.MakeInferenceOnly();
+    NNTrain.SetInferenceOnly();
     NNTrain.Compute(Input);
     NNTrain.GetOutput(OutInfer);
     for i := 0 to OutTrain.Size - 1 do
-      AssertEquals('post-build MakeInferenceOnly logit ' + IntToStr(i),
+      AssertEquals('post-build SetInferenceOnly logit ' + IntToStr(i),
         OutTrain.FData[i], OutInfer.FData[i], 0);
     AssertEquals('delta volume shrunk', 1,
       NNTrain.Layers[1].Neurons[0].Delta.Size);

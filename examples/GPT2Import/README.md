@@ -215,7 +215,7 @@ agrees, and 16-step greedy generation from "The" is token-for-token
 identical to HF's. Gate: 1e-3.
 
 Both example programs pass `pInferenceOnly=True` to the importer, which
-calls `TNNet.MakeInferenceOnly` while building: every neuron's
+calls `TNNet.SetInferenceOnly` while building: every neuron's
 `Delta`/`BackInertia` training volumes are shrunk to one element, cutting
 weight memory to ~1/3. That is what lets the full 124M checkpoint run in
 ~2.3 GB peak RSS (it needed >3.8 GB before and OOM'd small machines); the
