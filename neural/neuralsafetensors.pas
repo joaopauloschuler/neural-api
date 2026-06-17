@@ -446,7 +446,7 @@ var
   WeightMapObj: TJSONObject;
   BaseDir, ShardFile, MappedTensor: string;
   ShardFiles: TStringList;
-  i, ShardIdx, TensorIdx: integer;
+  i, ShardIdx, TensorIdx, WeightMapCount: integer;
 begin
   BaseDir := ExtractFilePath(pIndexFileName);
   IndexText := TStringList.Create;
@@ -476,7 +476,8 @@ begin
         'safetensors: index "weight_map" is empty: %s', [pIndexFileName]);
     // Open each distinct shard once, in first-mention order.
     ShardFiles.Sorted := False;
-    for i := 0 to WeightMapObj.Count - 1 do
+    WeightMapCount := WeightMapObj.Count;
+    for i := 0 to WeightMapCount - 1 do
     begin
       if not (WeightMapObj.Items[i].JSONType = jtString) then
         raise ESafeTensorsError.CreateFmt(
@@ -491,7 +492,7 @@ begin
     end;
     // Validate the weight_map against the shard headers: every mapped
     // tensor must exist and live in the shard the index claims.
-    for i := 0 to WeightMapObj.Count - 1 do
+    for i := 0 to WeightMapCount - 1 do
     begin
       MappedTensor := WeightMapObj.Names[i];
       ShardFile := WeightMapObj.Items[i].AsString;
@@ -520,7 +521,7 @@ var
   Root: TJSONData;
   Obj, TensorObj: TJSONObject;
   ShapeArr, OffsArr: TJSONArray;
-  i, j, TensorCnt: integer;
+  i, j, TensorCnt, ObjCount, ShapeCount: integer;
   ExpectedBytes, NumElements: Int64;
   ByteSize: integer;
   ShardName: string;
@@ -542,8 +543,9 @@ begin
     // Appends to FTensors: with a sharded checkpoint each shard's header
     // contributes its own tensors (TensorCnt is the global write cursor).
     TensorCnt := Length(FTensors);
-    SetLength(FTensors, TensorCnt + Obj.Count);
-    for i := 0 to Obj.Count - 1 do
+    ObjCount := Obj.Count;
+    SetLength(FTensors, TensorCnt + ObjCount);
+    for i := 0 to ObjCount - 1 do
     begin
       if Obj.Names[i] = '__metadata__' then continue;
       if not (Obj.Items[i] is TJSONObject) then
@@ -569,9 +571,10 @@ begin
           'safetensors: tensor "%s" has no shape array: %s',
           [Obj.Names[i], ShardName]);
       ShapeArr := TJSONArray(TensorObj.Find('shape'));
-      SetLength(FTensors[TensorCnt].Shape, ShapeArr.Count);
+      ShapeCount := ShapeArr.Count;
+      SetLength(FTensors[TensorCnt].Shape, ShapeCount);
       NumElements := 1;
-      for j := 0 to ShapeArr.Count - 1 do
+      for j := 0 to ShapeCount - 1 do
       begin
         FTensors[TensorCnt].Shape[j] := ShapeArr.Items[j].AsInt64;
         if FTensors[TensorCnt].Shape[j] < 0 then
@@ -1006,7 +1009,7 @@ end;
 
 function TNNetSafeTensorsWriter.BuildHeaderJson: string;
 var
-  i, j: integer;
+  i, j, MetaCount: integer;
   Offset: Int64;
   Entry: string;
 begin
@@ -1014,10 +1017,11 @@ begin
   // with no locale-dependent formatting; offsets/shapes are integers and
   // strings go through JsonEscapeString.
   Result := '{';
-  if FMetaKeys.Count > 0 then
+  MetaCount := FMetaKeys.Count;
+  if MetaCount > 0 then
   begin
     Result := Result + '"__metadata__":{';
-    for i := 0 to FMetaKeys.Count - 1 do
+    for i := 0 to MetaCount - 1 do
     begin
       if i > 0 then Result := Result + ',';
       Result := Result + '"' + JsonEscapeString(FMetaKeys[i]) + '":"' +
