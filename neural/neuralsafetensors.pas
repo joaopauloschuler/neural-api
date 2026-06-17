@@ -1090,9 +1090,10 @@ end;
 // Neurons[0] - the packed [NeuronCount, SizeY, SizeX, Depth] layout applies.
 function LayerHasUniformNeurons(L: TNNetLayer): boolean;
 var
-  j: integer;
+  j, MaxNeurons: integer;
 begin
-  for j := 1 to L.Neurons.Count - 1 do
+  MaxNeurons := L.Neurons.Count - 1;
+  for j := 1 to MaxNeurons do
     if (L.FArrNeurons[j].Weights.SizeX <> L.FArrNeurons[0].Weights.SizeX) or
        (L.FArrNeurons[j].Weights.SizeY <> L.FArrNeurons[0].Weights.SizeY) or
        (L.FArrNeurons[j].Weights.Depth <> L.FArrNeurons[0].Weights.Depth) then
@@ -1118,7 +1119,7 @@ var
   Tmp: TNNetVolume;
   L: TNNetLayer;
   W: TNNetVolume;
-  LayerIdx, j, i, Cursor: integer;
+  LayerIdx, j, i, Cursor, NeuronCount, MaxNeurons: integer;
   Base: string;
 begin
   Writer := TNNetSafeTensorsWriter.Create(pFileName);
@@ -1131,25 +1132,27 @@ begin
     for LayerIdx := 0 to NN.Layers.Count - 1 do
     begin
       L := NN.Layers[LayerIdx];
-      if (L.Neurons.Count = 0) or L.LinkedNeurons then continue;
+      NeuronCount := L.Neurons.Count;
+      MaxNeurons := NeuronCount - 1;
+      if (NeuronCount = 0) or L.LinkedNeurons then continue;
       Base := LayerTensorBaseName(NN, LayerIdx);
       if LayerHasUniformNeurons(L) then
       begin
         W := L.FArrNeurons[0].Weights;
-        Tmp.ReSize(L.Neurons.Count * W.Size, 1, 1);
+        Tmp.ReSize(NeuronCount * W.Size, 1, 1);
         Cursor := 0;
-        for j := 0 to L.Neurons.Count - 1 do
+        for j := 0 to MaxNeurons do
           for i := 0 to W.Size - 1 do
           begin
             Tmp.FData[Cursor] := L.FArrNeurons[j].Weights.FData[i];
             Inc(Cursor);
           end;
         Writer.AddTensorFlat(Base + '.weights',
-          [L.Neurons.Count, W.SizeY, W.SizeX, W.Depth], Tmp, pDType);
+          [NeuronCount, W.SizeY, W.SizeX, W.Depth], Tmp, pDType);
       end
       else
       begin
-        for j := 0 to L.Neurons.Count - 1 do
+        for j := 0 to MaxNeurons do
         begin
           W := L.FArrNeurons[j].Weights;
           Writer.AddTensorFlat(
@@ -1157,10 +1160,10 @@ begin
             [W.SizeY, W.SizeX, W.Depth], W, pDType);
         end;
       end;
-      Tmp.ReSize(L.Neurons.Count, 1, 1);
-      for j := 0 to L.Neurons.Count - 1 do
+      Tmp.ReSize(NeuronCount, 1, 1);
+      for j := 0 to MaxNeurons do
         Tmp.FData[j] := L.FArrNeurons[j].BiasWeight;
-      Writer.AddTensorFlat(Base + '.biases', [L.Neurons.Count], Tmp, pDType);
+      Writer.AddTensorFlat(Base + '.biases', [NeuronCount], Tmp, pDType);
     end;
     Writer.SaveToFile;
   finally
@@ -1174,7 +1177,7 @@ var
   Reader: TNNetSafeTensorsReader;
   Tmp: TNNetVolume;
   L: TNNetLayer;
-  LayerIdx, j, i, Cursor: integer;
+  LayerIdx, j, i, Cursor, NeuronCount, MaxNeurons: integer;
   Base, TensorName: string;
 
   procedure LoadExpected(const pName: string; ExpectedElements: integer);
@@ -1201,14 +1204,16 @@ begin
     for LayerIdx := 0 to NN.Layers.Count - 1 do
     begin
       L := NN.Layers[LayerIdx];
-      if (L.Neurons.Count = 0) or L.LinkedNeurons then continue;
+      NeuronCount := L.Neurons.Count;
+      MaxNeurons := NeuronCount - 1;
+      if (NeuronCount = 0) or L.LinkedNeurons then continue;
       Base := LayerTensorBaseName(NN, LayerIdx);
       if LayerHasUniformNeurons(L) then
       begin
         LoadExpected(Base + '.weights',
-          L.Neurons.Count * L.FArrNeurons[0].Weights.Size);
+          NeuronCount * L.FArrNeurons[0].Weights.Size);
         Cursor := 0;
-        for j := 0 to L.Neurons.Count - 1 do
+        for j := 0 to MaxNeurons do
           for i := 0 to L.FArrNeurons[j].Weights.Size - 1 do
           begin
             L.FArrNeurons[j].Weights.FData[i] := Tmp.FData[Cursor];
@@ -1217,7 +1222,7 @@ begin
       end
       else
       begin
-        for j := 0 to L.Neurons.Count - 1 do
+        for j := 0 to MaxNeurons do
         begin
           TensorName := Base + '.neuron_' + IntToStr(j) + '.weights';
           LoadExpected(TensorName, L.FArrNeurons[j].Weights.Size);
@@ -1225,8 +1230,8 @@ begin
             L.FArrNeurons[j].Weights.FData[i] := Tmp.FData[i];
         end;
       end;
-      LoadExpected(Base + '.biases', L.Neurons.Count);
-      for j := 0 to L.Neurons.Count - 1 do
+      LoadExpected(Base + '.biases', NeuronCount);
+      for j := 0 to MaxNeurons do
         L.FArrNeurons[j].BiasWeight := Tmp.FData[j];
       L.ClearInertia();
       L.ClearDeltas();
