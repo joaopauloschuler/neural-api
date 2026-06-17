@@ -237,8 +237,6 @@ type
       FSmoothErrorPropagation: boolean;
       FBatchUpdate: boolean;
       FSuppressBias: integer;
-      // Fast access to TNNetNeuron
-      FArrNeurons: array of TNNetNeuron;
       FInertia: TNeuralFloat;
       FPrevLayer: TNNetLayer;
       FLearningRate: TNeuralFloat;
@@ -284,14 +282,23 @@ type
       procedure ComputePreviousLayerError(); virtual;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); virtual;
       procedure ApplyActivationFunctionToOutput(); virtual;
-      procedure BuildArrNeurons();
       procedure AfterWeightUpdate(); virtual;
       // Zeroes weights (and their gradient/inertia) flagged by FPruneMask,
       // WITHOUT calling AfterWeightUpdate (so it can be called FROM it).
       procedure ZeroPrunedWeights(); // Coded by Claude (AI).
     public
+      // Fast (array) mirror of the FNeurons list: same TNNetNeuron references,
+      // indexed directly without the TNNetNeuronList method/bounds overhead.
+      // Built by BuildArrNeurons (also re-run lazily by the compute loops and,
+      // for weighted layers, at construction via SetNumWeightsForAllNeurons /
+      // the conv & fully-connected SetPrevLayer overrides). Public so the
+      // safetensors/GGUF loaders and savers can move weights through it.
+      FArrNeurons: array of TNNetNeuron;
+
       constructor Create(); override;
       destructor Destroy(); override;
+      // Rebuilds FArrNeurons from the current FNeurons list.
+      procedure BuildArrNeurons();
 
       {$IFDEF OpenCL}
       procedure DisableOpenCL(); virtual;
@@ -14061,6 +14068,10 @@ type
       // sequence-classification head (channel count <> vocab) is left
       // untouched. Returns the embedding layer (nil on error).
       function ResizeTokenEmbeddings(NewVocabSize: integer): TNNetEmbedding; // Coded by Claude (AI).
+      // Rebuilds every layer's fast FArrNeurons mirror. The safetensors/GGUF
+      // loaders and savers call this before moving weights so they can index
+      // the fast array directly. (Coded by Claude (AI).)
+      procedure BuildArrNeurons();
       procedure ResetBackpropCallCurrCnt(); {$IFDEF Release} inline; {$ENDIF}
       // Net-wide recurrent incremental-decode broadcast. Loops every layer and
       // switches the zero-arg recurrent leaves (TNNetTokenShift, TNNetWKV,
@@ -95220,6 +95231,16 @@ begin
   end;
 end;
 
+procedure TNNet.BuildArrNeurons();
+var
+  LayerCnt: integer;
+begin
+  for LayerCnt := 0 to GetLastLayerIdx() do
+  begin
+    FLayers[LayerCnt].BuildArrNeurons();
+  end;
+end;
+
 function TNNet.BeginIncrementalDecode(): integer;
 var
   LayerCnt: integer;
@@ -96762,6 +96783,10 @@ begin
     FNeurons.Add(TNNetNeuron.Create());
   end;
   AfterWeightUpdate();
+  // Keep the fast array mirror length in sync with the neuron count so the
+  // safetensors/GGUF loaders/savers can index FArrNeurons before any forward
+  // pass has triggered the lazy rebuild. (Coded by Claude (AI).)
+  BuildArrNeurons();
 end;
 
 procedure TNNetLayer.AddMissingNeurons(NeuronNum: integer);
@@ -96812,6 +96837,10 @@ begin
       end;
     end;
     AfterWeightUpdate();
+    // Keep the fast array mirror valid right after construction so the
+    // safetensors/GGUF loaders/savers can index FArrNeurons before any
+    // forward pass has triggered the lazy rebuild. (Coded by Claude (AI).)
+    BuildArrNeurons();
   end;
 end;
 

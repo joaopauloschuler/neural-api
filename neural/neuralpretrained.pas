@@ -9923,10 +9923,10 @@ begin
   try
     Reader.LoadTensorFlat(WName, Tmp);
     for i := 0 to d_model - 1 do
-      Layer.Neurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
+      Layer.FArrNeurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
     Reader.LoadTensorFlat(BName, Tmp);
     for i := 0 to d_model - 1 do
-      Layer.Neurons[1].Weights.FData[i] := Tmp.FData[i]; // beta
+      Layer.FArrNeurons[1].Weights.FData[i] := Tmp.FData[i]; // beta
   finally
     Tmp.Free;
   end;
@@ -9982,14 +9982,14 @@ begin
     Reader.LoadTensorFlat(BName, B);
     for j := 0 to OutDim - 1 do
     begin
-      if Layer.Neurons[j].Weights.Size <> InDim then
+      if Layer.FArrNeurons[j].Weights.Size <> InDim then
         ImportError('GPT-2 import: internal error - neuron ' + IntToStr(j) +
           ' for "' + WName + '" has ' +
-          IntToStr(Layer.Neurons[j].Weights.Size) + ' weights, expected ' +
+          IntToStr(Layer.FArrNeurons[j].Weights.Size) + ' weights, expected ' +
           IntToStr(InDim) + '.');
       for i := 0 to InDim - 1 do
-        Layer.Neurons[j].Weights.FData[i] := W.FData[i * OutDim + j];
-      Layer.Neurons[j].BiasWeight := B.FData[j];
+        Layer.FArrNeurons[j].Weights.FData[i] := W.FData[i * OutDim + j];
+      Layer.FArrNeurons[j].BiasWeight := B.FData[j];
     end;
   finally
     B.Free;
@@ -10131,11 +10131,11 @@ begin
         // wte -> embedding table (vocab rows of d floats, row-major both
         // in the checkpoint and in TNNetEmbedding's neuron volume).
         Reader.LoadTensorFlat(Config.Prefix + 'wte.weight', Tmp);
-        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('GPT-2 import: wte.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
-            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
-        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+            IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+        EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'wte.weight');
         if not pSeqClsHead then
@@ -10145,19 +10145,19 @@ begin
           for j := 0 to Config.VocabSize - 1 do
           begin
             for i := 0 to Config.NEmbd - 1 do
-              LMHead.Neurons[j].Weights.FData[i] :=
+              LMHead.FArrNeurons[j].Weights.FData[i] :=
                 Tmp.FData[j * Config.NEmbd + i];
-            LMHead.Neurons[j].BiasWeight := 0;
+            LMHead.FArrNeurons[j].BiasWeight := 0;
           end;
           LMHead.FlushWeightCache();
         end;
         // wpe -> learned positional table (n_ctx rows of d floats).
         Reader.LoadTensorFlat(Config.Prefix + 'wpe.weight', Tmp);
-        if PosLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        if PosLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('GPT-2 import: wpe.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the positional table size ' +
-            IntToStr(PosLayer.Neurons[0].Weights.Size) + '.');
-        PosLayer.Neurons[0].Weights.Copy(Tmp);
+            IntToStr(PosLayer.FArrNeurons[0].Weights.Size) + '.');
+        PosLayer.FArrNeurons[0].Weights.Copy(Tmp);
         PosLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'wpe.weight');
       finally
@@ -10217,9 +10217,9 @@ begin
           for j := 0 to NumLabels - 1 do
           begin
             for i := 0 to Config.NEmbd - 1 do
-              LMHead.Neurons[j].Weights.FData[i] :=
+              LMHead.FArrNeurons[j].Weights.FData[i] :=
                 Tmp.FData[j * Config.NEmbd + i];
-            LMHead.Neurons[j].BiasWeight := 0;
+            LMHead.FArrNeurons[j].BiasWeight := 0;
           end;
           LMHead.FlushWeightCache();
         finally
@@ -10294,13 +10294,13 @@ begin
     B.ReSize(OutDim, 1, 1);
     for j := 0 to OutDim - 1 do
     begin
-      if Layer.Neurons[j].Weights.Size <> InDim then
+      if Layer.FArrNeurons[j].Weights.Size <> InDim then
         ImportError('GPT-2 export: neuron ' + IntToStr(j) + ' for "' + WName +
-          '" has ' + IntToStr(Layer.Neurons[j].Weights.Size) +
+          '" has ' + IntToStr(Layer.FArrNeurons[j].Weights.Size) +
           ' weights, expected ' + IntToStr(InDim) + '.');
       for i := 0 to InDim - 1 do
-        W.FData[i * OutDim + j] := Layer.Neurons[j].Weights.FData[i];
-      B.FData[j] := Layer.Neurons[j].BiasWeight;
+        W.FData[i * OutDim + j] := Layer.FArrNeurons[j].Weights.FData[i];
+      B.FData[j] := Layer.FArrNeurons[j].BiasWeight;
     end;
     Writer.AddTensorFlat(WName, [InDim, OutDim], W, pDType);
     Writer.AddTensorFlat(BName, [OutDim], B, pDType);
@@ -10317,12 +10317,12 @@ procedure SaveLayerNormWeights(Writer: TNNetSafeTensorsWriter; Layer: TNNetLayer
   const WName, BName: string; d_model: integer;
   pDType: TSafeTensorsWriteDType);
 begin
-  if (Layer.Neurons[0].Weights.Size <> d_model) or
-     (Layer.Neurons[1].Weights.Size <> d_model) then
+  if (Layer.FArrNeurons[0].Weights.Size <> d_model) or
+     (Layer.FArrNeurons[1].Weights.Size <> d_model) then
     ImportError('GPT-2 export: LayerNorm "' + WName + '" gamma/beta size ' +
       'mismatch (expected ' + IntToStr(d_model) + ').');
-  Writer.AddTensorFlat(WName, [d_model], Layer.Neurons[0].Weights, pDType);
-  Writer.AddTensorFlat(BName, [d_model], Layer.Neurons[1].Weights, pDType);
+  Writer.AddTensorFlat(WName, [d_model], Layer.FArrNeurons[0].Weights, pDType);
+  Writer.AddTensorFlat(BName, [d_model], Layer.FArrNeurons[1].Weights, pDType);
 end;
 
 procedure SaveGPT2ToSafeTensors(Net: TNNet; const Config: TGPT2Config;
@@ -10384,14 +10384,14 @@ begin
     Writer.SetMetadata('format', 'pt');
     Writer.SetMetadata('exporter', 'cai-neural-api/gpt2');
     // wte: the embedding table is one neuron of [vocab*d] flat row-major.
-    WteVol := EmbeddingLayer.Neurons[0].Weights;
+    WteVol := EmbeddingLayer.FArrNeurons[0].Weights;
     if WteVol.Size <> Config.VocabSize * Config.NEmbd then
       ImportError('GPT-2 export: wte size ' + IntToStr(WteVol.Size) +
         ' <> vocab*d = ' + IntToStr(Config.VocabSize * Config.NEmbd) + '.');
     Writer.AddTensorFlat(Config.Prefix + 'wte.weight',
       [Config.VocabSize, Config.NEmbd], WteVol, pDType);
     // wpe: the learned positional table, [n_ctx, d] flat row-major.
-    L := PosLayer.Neurons[0].Weights;
+    L := PosLayer.FArrNeurons[0].Weights;
     if L.Size <> Config.NCtx * Config.NEmbd then
       ImportError('GPT-2 export: wpe size ' + IntToStr(L.Size) +
         ' <> n_ctx*d = ' + IntToStr(Config.NCtx * Config.NEmbd) + '.');
@@ -11581,7 +11581,7 @@ begin
   try
     Reader.LoadTensorFlat(WName, Tmp);
     for i := 0 to d_model - 1 do
-      Layer.Neurons[0].Weights.FData[i] := GainOffset + Tmp.FData[i]; // gain
+      Layer.FArrNeurons[0].Weights.FData[i] := GainOffset + Tmp.FData[i]; // gain
   finally
     Tmp.Free;
   end;
@@ -11694,18 +11694,18 @@ begin
         TargetIdx := j;
       TargetIdx := TargetIdx + NeuronBase;
       SrcRow := SrcRowBase + j;
-      if Layer.Neurons[TargetIdx].Weights.Size <> InDim then
+      if Layer.FArrNeurons[TargetIdx].Weights.Size <> InDim then
         ImportError('Llama import: internal error - neuron ' +
           IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
-          IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+          IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
           ' weights, expected ' + IntToStr(InDim) + '.');
       for i := 0 to InDim - 1 do
-        Layer.Neurons[TargetIdx].Weights.FData[i] :=
+        Layer.FArrNeurons[TargetIdx].Weights.FData[i] :=
           Scale * W.FData[SrcRow * InDim + i];
       if B <> nil then
-        Layer.Neurons[TargetIdx].BiasWeight := Scale * B.FData[SrcRow]
+        Layer.FArrNeurons[TargetIdx].BiasWeight := Scale * B.FData[SrcRow]
       else
-        Layer.Neurons[TargetIdx].BiasWeight := 0; // bias-free Linear
+        Layer.FArrNeurons[TargetIdx].BiasWeight := 0; // bias-free Linear
     end;
   finally
     B.Free;
@@ -11743,13 +11743,13 @@ begin
     Reader.LoadTensorFlat(WName, W);
     for j := 0 to OutDim - 1 do
     begin
-      if Layer.Neurons[j].Weights.Size <> InDim then
+      if Layer.FArrNeurons[j].Weights.Size <> InDim then
         ImportError('PEFT import: neuron ' + IntToStr(j) + ' for "' + WName +
-          '" has ' + IntToStr(Layer.Neurons[j].Weights.Size) +
+          '" has ' + IntToStr(Layer.FArrNeurons[j].Weights.Size) +
           ' weights, expected ' + IntToStr(InDim) + '.');
       for i := 0 to InDim - 1 do
-        Layer.Neurons[j].Weights.FData[i] := Scale * W.FData[j * InDim + i];
-      Layer.Neurons[j].BiasWeight := 0; // LoRA projections are bias-free
+        Layer.FArrNeurons[j].Weights.FData[i] := Scale * W.FData[j * InDim + i];
+      Layer.FArrNeurons[j].BiasWeight := 0; // LoRA projections are bias-free
     end;
   finally
     W.Free;
@@ -11818,7 +11818,7 @@ begin
   if Rank < 1 then
     ImportError('PEFT import: A layer for "' + ModuleName +
       '" has no neurons.');
-  d_in := ADown.Neurons[0].Weights.Size;
+  d_in := ADown.FArrNeurons[0].Weights.Size;
   // PEFT names are "<prefix><module>.lora_A<seg>weight" where <prefix> is
   // usually "base_model.model." and <seg> is ".default." (the adapter name)
   // or "." (no adapter-name segment). Try the common combinations.
@@ -11899,7 +11899,7 @@ begin
           TargetIdx := 2 * j
         else
           TargetIdx := 2 * (j - HalfDim) + 1;
-        NormLayers[HeadCnt].Neurons[0].Weights.FData[TargetIdx] :=
+        NormLayers[HeadCnt].FArrNeurons[0].Weights.FData[TargetIdx] :=
           Scale * (GainOffset + Tmp.FData[j]); // gain
       end;
       NormLayers[HeadCnt].FlushWeightCache();
@@ -11941,7 +11941,7 @@ begin
           TargetIdx := 2 * j
         else
           TargetIdx := 2 * (j - HalfDim) + 1;
-        NormLayer.Neurons[0].Weights.FData[HeadCnt * HeadDim + TargetIdx] :=
+        NormLayer.FArrNeurons[0].Weights.FData[HeadCnt * HeadDim + TargetIdx] :=
           GainOffset + Tmp.FData[HeadCnt * HeadDim + j]; // gain
       end;
     end;
@@ -12149,9 +12149,9 @@ begin
     for e := 0 to NumExperts - 1 do
     begin
       for i := 0 to HiddenSize - 1 do
-        Block.GateConv.Neurons[e].Weights.FData[i] :=
+        Block.GateConv.FArrNeurons[e].Weights.FData[i] :=
           W.FData[e * HiddenSize + i];
-      Block.GateConv.Neurons[e].BiasWeight := 0;
+      Block.GateConv.FArrNeurons[e].BiasWeight := 0;
     end;
     Block.GateConv.FlushWeightCache();
     Consumed.Add(RouterName);
@@ -12172,15 +12172,15 @@ begin
         // UP half (input_linear rows I..2I-1) -> neurons 0..I-1.
         SrcRow := e * TwoI + ExpertWidth + j;
         for i := 0 to HiddenSize - 1 do
-          Block.ExpertGateUp[e].Neurons[j].Weights.FData[i] :=
+          Block.ExpertGateUp[e].FArrNeurons[j].Weights.FData[i] :=
             W.FData[SrcRow * HiddenSize + i];
-        Block.ExpertGateUp[e].Neurons[j].BiasWeight := 0;
+        Block.ExpertGateUp[e].FArrNeurons[j].BiasWeight := 0;
         // GATE half (input_linear rows 0..I-1) -> neurons I..2I-1.
         SrcRow := e * TwoI + j;
         for i := 0 to HiddenSize - 1 do
-          Block.ExpertGateUp[e].Neurons[ExpertWidth + j].Weights.FData[i] :=
+          Block.ExpertGateUp[e].FArrNeurons[ExpertWidth + j].Weights.FData[i] :=
             W.FData[SrcRow * HiddenSize + i];
-        Block.ExpertGateUp[e].Neurons[ExpertWidth + j].BiasWeight := 0;
+        Block.ExpertGateUp[e].FArrNeurons[ExpertWidth + j].BiasWeight := 0;
       end;
       Block.ExpertGateUp[e].FlushWeightCache();
     end;
@@ -12201,9 +12201,9 @@ begin
       begin
         SrcRow := e * HiddenSize + j;
         for i := 0 to ExpertWidth - 1 do
-          Block.ExpertDown[e].Neurons[j].Weights.FData[i] :=
+          Block.ExpertDown[e].FArrNeurons[j].Weights.FData[i] :=
             ResidualScale * W.FData[SrcRow * ExpertWidth + i];
-        Block.ExpertDown[e].Neurons[j].BiasWeight := 0;
+        Block.ExpertDown[e].FArrNeurons[j].BiasWeight := 0;
       end;
       Block.ExpertDown[e].FlushWeightCache();
     end;
@@ -12252,9 +12252,9 @@ begin
     for e := 0 to NumExperts - 1 do
     begin
       for i := 0 to HiddenSize - 1 do
-        Block.GateConv.Neurons[e].Weights.FData[i] :=
+        Block.GateConv.FArrNeurons[e].Weights.FData[i] :=
           W.FData[e * HiddenSize + i];
-      Block.GateConv.Neurons[e].BiasWeight := 0;
+      Block.GateConv.FArrNeurons[e].BiasWeight := 0;
     end;
     Block.GateConv.FlushWeightCache();
     Consumed.Add(RouterName);
@@ -12275,13 +12275,13 @@ begin
         for i := 0 to HiddenSize - 1 do
         begin
           // UP column (gate_up_proj col I+j) -> neuron j.
-          Block.ExpertGateUp[e].Neurons[j].Weights.FData[i] :=
+          Block.ExpertGateUp[e].FArrNeurons[j].Weights.FData[i] :=
             W.FData[(e * HiddenSize + i) * TwoI + ExpertWidth + j];
-          Block.ExpertGateUp[e].Neurons[j].BiasWeight := 0;
+          Block.ExpertGateUp[e].FArrNeurons[j].BiasWeight := 0;
           // GATE column (gate_up_proj col j) -> neuron I+j.
-          Block.ExpertGateUp[e].Neurons[ExpertWidth + j].Weights.FData[i] :=
+          Block.ExpertGateUp[e].FArrNeurons[ExpertWidth + j].Weights.FData[i] :=
             W.FData[(e * HiddenSize + i) * TwoI + j];
-          Block.ExpertGateUp[e].Neurons[ExpertWidth + j].BiasWeight := 0;
+          Block.ExpertGateUp[e].FArrNeurons[ExpertWidth + j].BiasWeight := 0;
         end;
       Block.ExpertGateUp[e].FlushWeightCache();
     end;
@@ -12301,9 +12301,9 @@ begin
       for j := 0 to HiddenSize - 1 do
       begin
         for i := 0 to ExpertWidth - 1 do
-          Block.ExpertDown[e].Neurons[j].Weights.FData[i] :=
+          Block.ExpertDown[e].FArrNeurons[j].Weights.FData[i] :=
             W.FData[(e * ExpertWidth + i) * HiddenSize + j];
-        Block.ExpertDown[e].Neurons[j].BiasWeight := 0;
+        Block.ExpertDown[e].FArrNeurons[j].BiasWeight := 0;
       end;
       Block.ExpertDown[e].FlushWeightCache();
     end;
@@ -12840,25 +12840,25 @@ begin
         // embed_tokens -> embedding table (vocab rows of d floats,
         // row-major both in the checkpoint and in TNNetEmbedding).
         Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
-        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('Llama import: embed_tokens.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
-            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
-        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+            IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+        EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
         // Config.EmbedScale (Gemma: sqrt(hidden_size)) scales the embedding
         // OUTPUT; TNNetEmbedding's ScaleEmbedding is init-only, so the scale
         // is folded into the embedding ROWS instead. ONLY the embedding copy
         // is scaled - the tied LM head below reads the UNSCALED Tmp rows,
         // matching HF GemmaForCausalLM (the head ties to the raw matrix).
         if (Config.EmbedScale <> 0) and (Config.EmbedScale <> 1.0) then
-          EmbeddingLayer.Neurons[0].Weights.Mul(Config.EmbedScale);
+          EmbeddingLayer.FArrNeurons[0].Weights.Mul(Config.EmbedScale);
         // Config.EmbeddingMultiplier (Granite): scale token embeddings AFTER
         // lookup - folded into the embedding rows like EmbedScale (and, like
         // EmbedScale, NOT into the tied LM head, which reads the raw Tmp rows
         // matching HF GraniteForCausalLM tying to the unscaled matrix).
         if (Config.EmbeddingMultiplier <> 0) and
            (Config.EmbeddingMultiplier <> 1.0) then
-          EmbeddingLayer.Neurons[0].Weights.Mul(Config.EmbeddingMultiplier);
+          EmbeddingLayer.FArrNeurons[0].Weights.Mul(Config.EmbeddingMultiplier);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'embed_tokens.weight');
         // Config.LogitsScaling (Granite): HF DIVIDES the final logits by
@@ -12876,9 +12876,9 @@ begin
           for j := 0 to Config.VocabSize - 1 do
           begin
             for i := 0 to Config.HiddenSize - 1 do
-              LMHead.Neurons[j].Weights.FData[i] :=
+              LMHead.FArrNeurons[j].Weights.FData[i] :=
                 LogitScaleFold * Tmp.FData[j * Config.HiddenSize + i];
-            LMHead.Neurons[j].BiasWeight := 0;
+            LMHead.FArrNeurons[j].BiasWeight := 0;
           end;
           LMHead.FlushWeightCache();
           // A redundant serialized lm_head.weight is ignorable when tied.
@@ -14261,12 +14261,12 @@ var
     V.ReSize(OutDim * InDim, 1, 1);
     for jj := 0 to OutDim - 1 do
     begin
-      if Layer.Neurons[jj].Weights.Size <> InDim then
+      if Layer.FArrNeurons[jj].Weights.Size <> InDim then
         ImportError('TNNet GGUF export: neuron ' + IntToStr(jj) + ' of "' +
-          HFName + '" has ' + IntToStr(Layer.Neurons[jj].Weights.Size) +
+          HFName + '" has ' + IntToStr(Layer.FArrNeurons[jj].Weights.Size) +
           ' weights, expected ' + IntToStr(InDim) + '.');
       for ii := 0 to InDim - 1 do
-        V.FData[jj * InDim + ii] := Layer.Neurons[jj].Weights.FData[ii];
+        V.FData[jj * InDim + ii] := Layer.FArrNeurons[jj].Weights.FData[ii];
     end;
     Reader.AddTensor(HFName, [OutDim, InDim], V);
   end;
@@ -14276,13 +14276,13 @@ var
   var
     ii: integer;
   begin
-    if Layer.Neurons[0].Weights.Size < d then
+    if Layer.FArrNeurons[0].Weights.Size < d then
       ImportError('TNNet GGUF export: norm "' + HFName + '" has ' +
-        IntToStr(Layer.Neurons[0].Weights.Size) + ' gains, expected >= ' +
+        IntToStr(Layer.FArrNeurons[0].Weights.Size) + ' gains, expected >= ' +
         IntToStr(d) + '.');
     V.ReSize(d, 1, 1);
     for ii := 0 to d - 1 do
-      V.FData[ii] := Layer.Neurons[0].Weights.FData[ii] - NormGainOffset;
+      V.FData[ii] := Layer.FArrNeurons[0].Weights.FData[ii] - NormGainOffset;
     Reader.AddTensor(HFName, [d], V);
   end;
 
@@ -14381,11 +14381,11 @@ begin
   V := TNNetVolume.Create;
   try
     // ---- token embedding table [vocab, hidden] (row-major, straight) ----
-    if Embed.Neurons[0].Weights.Size <> Config.VocabSize * Config.HiddenSize then
+    if Embed.FArrNeurons[0].Weights.Size <> Config.VocabSize * Config.HiddenSize then
       ImportError('TNNet GGUF export: embedding table has ' +
-        IntToStr(Embed.Neurons[0].Weights.Size) + ' elements, expected ' +
+        IntToStr(Embed.FArrNeurons[0].Weights.Size) + ' elements, expected ' +
         IntToStr(Config.VocabSize * Config.HiddenSize) + '.');
-    V.Copy(Embed.Neurons[0].Weights);
+    V.Copy(Embed.FArrNeurons[0].Weights);
     Reader.AddTensor('model.embed_tokens.weight',
       [Config.VocabSize, Config.HiddenSize], V);
 
@@ -14418,7 +14418,7 @@ begin
           else j := h * HeadDim + 2 * (k - HalfDim) + 1;
           for c := 0 to Config.HiddenSize - 1 do
             V.FData[(h * HeadDim + k) * Config.HiddenSize + c] :=
-              Lay.Neurons[j].Weights.FData[c];
+              Lay.FArrNeurons[j].Weights.FData[c];
         end;
       Reader.AddTensor(BlockPrefix + 'self_attn.q_proj.weight',
         [QWidth, Config.HiddenSize], V);
@@ -14436,7 +14436,7 @@ begin
           else j := h * HeadDim + 2 * (k - HalfDim) + 1;
           for c := 0 to Config.HiddenSize - 1 do
             V.FData[(h * HeadDim + k) * Config.HiddenSize + c] :=
-              Lay.Neurons[j].Weights.FData[c];
+              Lay.FArrNeurons[j].Weights.FData[c];
         end;
       Reader.AddTensor(BlockPrefix + 'self_attn.k_proj.weight',
         [KVWidth, Config.HiddenSize], V);
@@ -14458,7 +14458,7 @@ begin
       V.ReSize(IntSize * Config.HiddenSize, 1, 1);
       for j := 0 to IntSize - 1 do
         for c := 0 to Config.HiddenSize - 1 do
-          V.FData[j * Config.HiddenSize + c] := Lay.Neurons[j].Weights.FData[c];
+          V.FData[j * Config.HiddenSize + c] := Lay.FArrNeurons[j].Weights.FData[c];
       Reader.AddTensor(BlockPrefix + 'mlp.up_proj.weight',
         [IntSize, Config.HiddenSize], V);
       // gate_proj = neurons I..2I-1
@@ -14466,7 +14466,7 @@ begin
       for j := 0 to IntSize - 1 do
         for c := 0 to Config.HiddenSize - 1 do
           V.FData[j * Config.HiddenSize + c] :=
-            Lay.Neurons[IntSize + j].Weights.FData[c];
+            Lay.FArrNeurons[IntSize + j].Weights.FData[c];
       Reader.AddTensor(BlockPrefix + 'mlp.gate_proj.weight',
         [IntSize, Config.HiddenSize], V);
       // --- down_proj (straight) ---
@@ -14603,12 +14603,12 @@ var
     V.ReSize(OutDim * InDim, 1, 1);
     for jj := 0 to OutDim - 1 do
     begin
-      if Layer.Neurons[jj].Weights.Size <> InDim then
+      if Layer.FArrNeurons[jj].Weights.Size <> InDim then
         ImportError('TNNet Qwen3 export: neuron ' + IntToStr(jj) + ' of "' +
-          HFName + '" has ' + IntToStr(Layer.Neurons[jj].Weights.Size) +
+          HFName + '" has ' + IntToStr(Layer.FArrNeurons[jj].Weights.Size) +
           ' weights, expected ' + IntToStr(InDim) + '.');
       for ii := 0 to InDim - 1 do
-        V.FData[jj * InDim + ii] := Layer.Neurons[jj].Weights.FData[ii];
+        V.FData[jj * InDim + ii] := Layer.FArrNeurons[jj].Weights.FData[ii];
     end;
     Reader.AddTensor(HFName, [OutDim, InDim], V);
   end;
@@ -14618,13 +14618,13 @@ var
   var
     ii: integer;
   begin
-    if Layer.Neurons[0].Weights.Size < d then
+    if Layer.FArrNeurons[0].Weights.Size < d then
       ImportError('TNNet Qwen3 export: norm "' + HFName + '" has ' +
-        IntToStr(Layer.Neurons[0].Weights.Size) + ' gains, expected >= ' +
+        IntToStr(Layer.FArrNeurons[0].Weights.Size) + ' gains, expected >= ' +
         IntToStr(d) + '.');
     V.ReSize(d, 1, 1);
     for ii := 0 to d - 1 do
-      V.FData[ii] := Layer.Neurons[0].Weights.FData[ii];
+      V.FData[ii] := Layer.FArrNeurons[0].Weights.FData[ii];
     Reader.AddTensor(HFName, [d], V);
   end;
 
@@ -14636,16 +14636,16 @@ var
   var
     kk, src: integer;
   begin
-    if Layer.Neurons[0].Weights.Size < HeadDim then
+    if Layer.FArrNeurons[0].Weights.Size < HeadDim then
       ImportError('TNNet Qwen3 export: head norm "' + HFName + '" has ' +
-        IntToStr(Layer.Neurons[0].Weights.Size) + ' gains, expected >= ' +
+        IntToStr(Layer.FArrNeurons[0].Weights.Size) + ' gains, expected >= ' +
         IntToStr(HeadDim) + '.');
     V.ReSize(HeadDim, 1, 1);
     for kk := 0 to HeadDim - 1 do
     begin
       if kk < HalfDim then src := 2 * kk
       else src := 2 * (kk - HalfDim) + 1;
-      V.FData[kk] := Layer.Neurons[0].Weights.FData[src];
+      V.FData[kk] := Layer.FArrNeurons[0].Weights.FData[src];
     end;
     Reader.AddTensor(HFName, [HeadDim], V);
   end;
@@ -14744,11 +14744,11 @@ begin
   V := TNNetVolume.Create;
   try
     // ---- token embedding table [vocab, hidden] (row-major, straight) ----
-    if Embed.Neurons[0].Weights.Size <> Config.VocabSize * Config.HiddenSize then
+    if Embed.FArrNeurons[0].Weights.Size <> Config.VocabSize * Config.HiddenSize then
       ImportError('TNNet Qwen3 export: embedding table has ' +
-        IntToStr(Embed.Neurons[0].Weights.Size) + ' elements, expected ' +
+        IntToStr(Embed.FArrNeurons[0].Weights.Size) + ' elements, expected ' +
         IntToStr(Config.VocabSize * Config.HiddenSize) + '.');
-    V.Copy(Embed.Neurons[0].Weights);
+    V.Copy(Embed.FArrNeurons[0].Weights);
     Reader.AddTensor('model.embed_tokens.weight',
       [Config.VocabSize, Config.HiddenSize], V);
 
@@ -14789,7 +14789,7 @@ begin
           else j := h * HeadDim + 2 * (k - HalfDim) + 1;
           for c := 0 to Config.HiddenSize - 1 do
             V.FData[(h * HeadDim + k) * Config.HiddenSize + c] :=
-              Lay.Neurons[j].Weights.FData[c];
+              Lay.FArrNeurons[j].Weights.FData[c];
         end;
       Reader.AddTensor(BlockPrefix + 'self_attn.q_proj.weight',
         [QWidth, Config.HiddenSize], V);
@@ -14807,7 +14807,7 @@ begin
           else j := h * HeadDim + 2 * (k - HalfDim) + 1;
           for c := 0 to Config.HiddenSize - 1 do
             V.FData[(h * HeadDim + k) * Config.HiddenSize + c] :=
-              Lay.Neurons[j].Weights.FData[c];
+              Lay.FArrNeurons[j].Weights.FData[c];
         end;
       Reader.AddTensor(BlockPrefix + 'self_attn.k_proj.weight',
         [KVWidth, Config.HiddenSize], V);
@@ -14829,7 +14829,7 @@ begin
       V.ReSize(IntSize * Config.HiddenSize, 1, 1);
       for j := 0 to IntSize - 1 do
         for c := 0 to Config.HiddenSize - 1 do
-          V.FData[j * Config.HiddenSize + c] := Lay.Neurons[j].Weights.FData[c];
+          V.FData[j * Config.HiddenSize + c] := Lay.FArrNeurons[j].Weights.FData[c];
       Reader.AddTensor(BlockPrefix + 'mlp.up_proj.weight',
         [IntSize, Config.HiddenSize], V);
       // gate_proj = neurons I..2I-1
@@ -14837,7 +14837,7 @@ begin
       for j := 0 to IntSize - 1 do
         for c := 0 to Config.HiddenSize - 1 do
           V.FData[j * Config.HiddenSize + c] :=
-            Lay.Neurons[IntSize + j].Weights.FData[c];
+            Lay.FArrNeurons[IntSize + j].Weights.FData[c];
       Reader.AddTensor(BlockPrefix + 'mlp.gate_proj.weight',
         [IntSize, Config.HiddenSize], V);
       // --- down_proj (straight) ---
@@ -14944,15 +14944,15 @@ var
       B.ReSize(OutDim, 1, 1);
       for jj := 0 to OutDim - 1 do
       begin
-        if Layer.Neurons[NeuronBase + jj].Weights.Size <> InDim then
+        if Layer.FArrNeurons[NeuronBase + jj].Weights.Size <> InDim then
           ImportError('BERT export: neuron ' + IntToStr(NeuronBase + jj) +
             ' for "' + WName + '" has ' +
-            IntToStr(Layer.Neurons[NeuronBase + jj].Weights.Size) +
+            IntToStr(Layer.FArrNeurons[NeuronBase + jj].Weights.Size) +
             ' weights, expected ' + IntToStr(InDim) + '.');
         for ii := 0 to InDim - 1 do
           W.FData[jj * InDim + ii] :=
-            Layer.Neurons[NeuronBase + jj].Weights.FData[ii];
-        B.FData[jj] := Layer.Neurons[NeuronBase + jj].BiasWeight;
+            Layer.FArrNeurons[NeuronBase + jj].Weights.FData[ii];
+        B.FData[jj] := Layer.FArrNeurons[NeuronBase + jj].BiasWeight;
       end;
       Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
       Writer.AddTensorFlat(BName, [OutDim], B, pDType);
@@ -15033,34 +15033,34 @@ begin
       Writer.SetMetadata('format', 'pt');
       Writer.SetMetadata('exporter', 'cai-neural-api/bert');
       // ---- embeddings ----
-      if WordEmb.Neurons[0].Weights.Size <> Config.VocabSize * d then
+      if WordEmb.FArrNeurons[0].Weights.Size <> Config.VocabSize * d then
         ImportError('BERT export: word embedding size ' +
-          IntToStr(WordEmb.Neurons[0].Weights.Size) + ' <> vocab*hidden = ' +
+          IntToStr(WordEmb.FArrNeurons[0].Weights.Size) + ' <> vocab*hidden = ' +
           IntToStr(Config.VocabSize * d) + '.');
       Writer.AddTensorFlat(Config.Prefix + 'embeddings.word_embeddings.weight',
-        [Config.VocabSize, d], WordEmb.Neurons[0].Weights, pDType);
+        [Config.VocabSize, d], WordEmb.FArrNeurons[0].Weights, pDType);
       // Position table: the layer holds only UsablePositions rows = checkpoint
       // rows PositionOffset..MaxPositions-1. Re-emit a full [MaxPositions,
       // hidden] tensor with the first PositionOffset rows zeroed (never read).
-      if PosEmb.Neurons[0].Weights.Size <> UsablePositions * d then
+      if PosEmb.FArrNeurons[0].Weights.Size <> UsablePositions * d then
         ImportError('BERT export: position table size ' +
-          IntToStr(PosEmb.Neurons[0].Weights.Size) + ' <> usable*hidden = ' +
+          IntToStr(PosEmb.FArrNeurons[0].Weights.Size) + ' <> usable*hidden = ' +
           IntToStr(UsablePositions * d) + '.');
       V.ReSize(Config.MaxPositions * d, 1, 1);
       V.Fill(0);
       for i := 0 to UsablePositions * d - 1 do
         V.FData[Config.PositionOffset * d + i] :=
-          PosEmb.Neurons[0].Weights.FData[i];
+          PosEmb.FArrNeurons[0].Weights.FData[i];
       Writer.AddTensorFlat(
         Config.Prefix + 'embeddings.position_embeddings.weight',
         [Config.MaxPositions, d], V, pDType);
       if TypeEmb <> nil then
       begin
-        if TypeEmb.Neurons[0].Weights.Size <> Config.TypeVocabSize * d then
+        if TypeEmb.FArrNeurons[0].Weights.Size <> Config.TypeVocabSize * d then
           ImportError('BERT export: token_type embedding size mismatch.');
         Writer.AddTensorFlat(
           Config.Prefix + 'embeddings.token_type_embeddings.weight',
-          [Config.TypeVocabSize, d], TypeEmb.Neurons[0].Weights, pDType);
+          [Config.TypeVocabSize, d], TypeEmb.FArrNeurons[0].Weights, pDType);
       end;
       SaveLayerNormWeights(Writer, EmbLN,
         Config.Prefix + 'embeddings.LayerNorm.weight',
@@ -15178,15 +15178,15 @@ var
       B.ReSize(OutDim, 1, 1);
       for jj := 0 to OutDim - 1 do
       begin
-        if Layer.Neurons[NeuronBase + jj].Weights.Size <> InDim then
+        if Layer.FArrNeurons[NeuronBase + jj].Weights.Size <> InDim then
           ImportError('GPT-NeoX export: neuron ' + IntToStr(NeuronBase + jj) +
             ' for "' + WName + '" has ' +
-            IntToStr(Layer.Neurons[NeuronBase + jj].Weights.Size) +
+            IntToStr(Layer.FArrNeurons[NeuronBase + jj].Weights.Size) +
             ' weights, expected ' + IntToStr(InDim) + '.');
         for ii := 0 to InDim - 1 do
           W.FData[jj * InDim + ii] :=
-            Layer.Neurons[NeuronBase + jj].Weights.FData[ii];
-        B.FData[jj] := Layer.Neurons[NeuronBase + jj].BiasWeight;
+            Layer.FArrNeurons[NeuronBase + jj].Weights.FData[ii];
+        B.FData[jj] := Layer.FArrNeurons[NeuronBase + jj].BiasWeight;
       end;
       Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
       if BName <> '' then
@@ -15230,14 +15230,14 @@ var
             TargetRow := 2 * (RowInHead - RotHalf) + 1;
         end;
         TargetIdx := Third * d + HeadIdx * HeadDim + TargetRow;
-        if Layer.Neurons[TargetIdx].Weights.Size <> d then
+        if Layer.FArrNeurons[TargetIdx].Weights.Size <> d then
           ImportError('GPT-NeoX export: neuron ' + IntToStr(TargetIdx) +
             ' for "' + WName + '" has ' +
-            IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+            IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
             ' weights, expected ' + IntToStr(d) + '.');
         for ii := 0 to d - 1 do
-          W.FData[r * d + ii] := Layer.Neurons[TargetIdx].Weights.FData[ii];
-        B.FData[r] := Layer.Neurons[TargetIdx].BiasWeight;
+          W.FData[r * d + ii] := Layer.FArrNeurons[TargetIdx].Weights.FData[ii];
+        B.FData[r] := Layer.FArrNeurons[TargetIdx].BiasWeight;
       end;
       Writer.AddTensorFlat(WName, [3 * d, d], W, pDType);
       Writer.AddTensorFlat(BName, [3 * d], B, pDType);
@@ -15300,12 +15300,12 @@ begin
     Writer.SetMetadata('format', 'pt');
     Writer.SetMetadata('exporter', 'cai-neural-api/gpt_neox');
     // ---- embeddings ----
-    if EmbIn.Neurons[0].Weights.Size <> Config.VocabSize * d then
+    if EmbIn.FArrNeurons[0].Weights.Size <> Config.VocabSize * d then
       ImportError('GPT-NeoX export: embed_in size ' +
-        IntToStr(EmbIn.Neurons[0].Weights.Size) + ' <> vocab*hidden = ' +
+        IntToStr(EmbIn.FArrNeurons[0].Weights.Size) + ' <> vocab*hidden = ' +
         IntToStr(Config.VocabSize * d) + '.');
     Writer.AddTensorFlat(Config.Prefix + 'embed_in.weight',
-      [Config.VocabSize, d], EmbIn.Neurons[0].Weights, pDType);
+      [Config.VocabSize, d], EmbIn.FArrNeurons[0].Weights, pDType);
     // ---- decoder blocks ----
     for BlockCnt := 0 to Config.NumLayers - 1 do
     begin
@@ -15367,15 +15367,15 @@ var
       B.ReSize(OutDim, 1, 1);
       for jj := 0 to OutDim - 1 do
       begin
-        if Layer.Neurons[NeuronBase + jj].Weights.Size <> InDim then
+        if Layer.FArrNeurons[NeuronBase + jj].Weights.Size <> InDim then
           ImportError('BLOOM export: neuron ' + IntToStr(NeuronBase + jj) +
             ' for "' + WName + '" has ' +
-            IntToStr(Layer.Neurons[NeuronBase + jj].Weights.Size) +
+            IntToStr(Layer.FArrNeurons[NeuronBase + jj].Weights.Size) +
             ' weights, expected ' + IntToStr(InDim) + '.');
         for ii := 0 to InDim - 1 do
           W.FData[jj * InDim + ii] :=
-            Layer.Neurons[NeuronBase + jj].Weights.FData[ii];
-        B.FData[jj] := Layer.Neurons[NeuronBase + jj].BiasWeight;
+            Layer.FArrNeurons[NeuronBase + jj].Weights.FData[ii];
+        B.FData[jj] := Layer.FArrNeurons[NeuronBase + jj].BiasWeight;
       end;
       Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
       Writer.AddTensorFlat(BName, [OutDim], B, pDType);
@@ -15409,14 +15409,14 @@ var
         Third := (r mod (3 * HeadDim)) div HeadDim; // 0=q, 1=k, 2=v
         RowInHead := r mod HeadDim;
         TargetIdx := Third * d + HeadIdx * HeadDim + RowInHead;
-        if Layer.Neurons[TargetIdx].Weights.Size <> d then
+        if Layer.FArrNeurons[TargetIdx].Weights.Size <> d then
           ImportError('BLOOM export: neuron ' + IntToStr(TargetIdx) +
             ' for "' + WName + '" has ' +
-            IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+            IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
             ' weights, expected ' + IntToStr(d) + '.');
         for ii := 0 to d - 1 do
-          W.FData[r * d + ii] := Layer.Neurons[TargetIdx].Weights.FData[ii];
-        B.FData[r] := Layer.Neurons[TargetIdx].BiasWeight;
+          W.FData[r * d + ii] := Layer.FArrNeurons[TargetIdx].Weights.FData[ii];
+        B.FData[r] := Layer.FArrNeurons[TargetIdx].BiasWeight;
       end;
       Writer.AddTensorFlat(WName, [3 * d, d], W, pDType);
       Writer.AddTensorFlat(BName, [3 * d], B, pDType);
@@ -15480,12 +15480,12 @@ begin
     Writer.SetMetadata('format', 'pt');
     Writer.SetMetadata('exporter', 'cai-neural-api/bloom');
     // ---- embeddings (LM head is tied; no separate lm_head tensor) ----
-    if EmbIn.Neurons[0].Weights.Size <> Config.VocabSize * d then
+    if EmbIn.FArrNeurons[0].Weights.Size <> Config.VocabSize * d then
       ImportError('BLOOM export: word_embeddings size ' +
-        IntToStr(EmbIn.Neurons[0].Weights.Size) + ' <> vocab*hidden = ' +
+        IntToStr(EmbIn.FArrNeurons[0].Weights.Size) + ' <> vocab*hidden = ' +
         IntToStr(Config.VocabSize * d) + '.');
     Writer.AddTensorFlat(Config.Prefix + 'word_embeddings.weight',
-      [Config.VocabSize, d], EmbIn.Neurons[0].Weights, pDType);
+      [Config.VocabSize, d], EmbIn.FArrNeurons[0].Weights, pDType);
     SaveLayerNormWeights(Writer, EmbLN,
       Config.Prefix + 'word_embeddings_layernorm.weight',
       Config.Prefix + 'word_embeddings_layernorm.bias', d, pDType);
@@ -15830,11 +15830,11 @@ begin
       try
         // wte -> embedding table (vocab rows of d floats).
         Reader.LoadTensorFlat(Config.Prefix + 'wte.weight', Tmp);
-        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('GPT-Neo import: wte.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
-            'size ' + IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
-        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+            'size ' + IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+        EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'wte.weight');
         if Config.TieWordEmbeddings then
@@ -15844,9 +15844,9 @@ begin
           for j := 0 to Config.VocabSize - 1 do
           begin
             for i := 0 to Config.HiddenSize - 1 do
-              LMHead.Neurons[j].Weights.FData[i] :=
+              LMHead.FArrNeurons[j].Weights.FData[i] :=
                 Tmp.FData[j * Config.HiddenSize + i];
-            LMHead.Neurons[j].BiasWeight := 0;
+            LMHead.FArrNeurons[j].BiasWeight := 0;
           end;
           LMHead.FlushWeightCache();
           // A redundant serialized lm_head.weight is ignorable when tied.
@@ -15864,11 +15864,11 @@ begin
           ImportError('GPT-Neo import: missing tensor "' + Config.Prefix +
             'wpe.weight" in ' + Reader.FileName);
         Reader.LoadTensorFlat(Config.Prefix + 'wpe.weight', Tmp);
-        if PosLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        if PosLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('GPT-Neo import: wpe.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the positional table ' +
-            'size ' + IntToStr(PosLayer.Neurons[0].Weights.Size) + '.');
-        PosLayer.Neurons[0].Weights.Copy(Tmp);
+            'size ' + IntToStr(PosLayer.FArrNeurons[0].Weights.Size) + '.');
+        PosLayer.FArrNeurons[0].Weights.Copy(Tmp);
         PosLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'wpe.weight');
       finally
@@ -16150,14 +16150,14 @@ begin
           TargetRow := 2 * (RowInHead - RotHalf) + 1;
       end;
       TargetIdx := Third * Hidden + HeadIdx * HeadDim + TargetRow;
-      if Layer.Neurons[TargetIdx].Weights.Size <> Hidden then
+      if Layer.FArrNeurons[TargetIdx].Weights.Size <> Hidden then
         ImportError('GPT-NeoX import: internal error - neuron ' +
           IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
-          IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+          IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
           ' weights, expected ' + IntToStr(Hidden) + '.');
       for i := 0 to Hidden - 1 do
-        Layer.Neurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
-      Layer.Neurons[TargetIdx].BiasWeight := B.FData[r];
+        Layer.FArrNeurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
+      Layer.FArrNeurons[TargetIdx].BiasWeight := B.FData[r];
     end;
   finally
     B.Free;
@@ -16393,11 +16393,11 @@ begin
       try
         // embed_in -> embedding table (vocab rows of d floats).
         Reader.LoadTensorFlat(Config.Prefix + 'embed_in.weight', Tmp);
-        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('GPT-NeoX import: embed_in.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
-            'size ' + IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
-        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+            'size ' + IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+        EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'embed_in.weight');
         if Config.TieWordEmbeddings then
@@ -16408,9 +16408,9 @@ begin
           for j := 0 to Config.VocabSize - 1 do
           begin
             for i := 0 to Config.HiddenSize - 1 do
-              LMHead.Neurons[j].Weights.FData[i] :=
+              LMHead.FArrNeurons[j].Weights.FData[i] :=
                 Tmp.FData[j * Config.HiddenSize + i];
-            LMHead.Neurons[j].BiasWeight := 0;
+            LMHead.FArrNeurons[j].BiasWeight := 0;
           end;
           LMHead.FlushWeightCache();
           if Reader.HasTensor('embed_out.weight') then
@@ -16703,7 +16703,7 @@ begin
     for p := 0 to SeqLen - 1 do
       for i := 0 to Hidden - 1 do
         // +2 OFFSET: target row p reads source row p + 2.
-        Layer.Neurons[0].Weights.FData[p * Hidden + i] :=
+        Layer.FArrNeurons[0].Weights.FData[p * Hidden + i] :=
           W.FData[(p + 2) * Hidden + i];
   finally
     W.Free;
@@ -16848,11 +16848,11 @@ begin
       try
         // embed_tokens -> embedding table (vocab rows of word_embed_proj_dim).
         Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
-        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('OPT import: embed_tokens.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
-            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
-        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+            IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+        EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'embed_tokens.weight');
         // LM head tied to embed_tokens (row t -> neuron t, bias-free).
@@ -16860,9 +16860,9 @@ begin
         for j := 0 to Config.VocabSize - 1 do
         begin
           for i := 0 to Config.WordEmbedProjDim - 1 do
-            LMHead.Neurons[j].Weights.FData[i] :=
+            LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.WordEmbedProjDim + i];
-          LMHead.Neurons[j].BiasWeight := 0;
+          LMHead.FArrNeurons[j].BiasWeight := 0;
         end;
         LMHead.FlushWeightCache();
         if Reader.HasTensor('lm_head.weight') then
@@ -17321,11 +17321,11 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
-        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('Starcoder2 import: embed_tokens.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
-            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
-        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+            IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+        EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'embed_tokens.weight');
         if Config.TieWordEmbeddings then
@@ -17334,9 +17334,9 @@ begin
           for j := 0 to Config.VocabSize - 1 do
           begin
             for i := 0 to Config.HiddenSize - 1 do
-              LMHead.Neurons[j].Weights.FData[i] :=
+              LMHead.FArrNeurons[j].Weights.FData[i] :=
                 Tmp.FData[j * Config.HiddenSize + i];
-            LMHead.Neurons[j].BiasWeight := 0;
+            LMHead.FArrNeurons[j].BiasWeight := 0;
           end;
           LMHead.FlushWeightCache();
           if Reader.HasTensor(LMHeadName) then MarkConsumed(LMHeadName);
@@ -17715,11 +17715,11 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat(Config.Prefix + 'wte.weight', Tmp);
-        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('GPT-BigCode import: wte.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
-            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
-        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+            IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+        EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'wte.weight');
         if Config.TieWordEmbeddings then
@@ -17728,9 +17728,9 @@ begin
           for j := 0 to Config.VocabSize - 1 do
           begin
             for i := 0 to Config.HiddenSize - 1 do
-              LMHead.Neurons[j].Weights.FData[i] :=
+              LMHead.FArrNeurons[j].Weights.FData[i] :=
                 Tmp.FData[j * Config.HiddenSize + i];
-            LMHead.Neurons[j].BiasWeight := 0;
+            LMHead.FArrNeurons[j].BiasWeight := 0;
           end;
           LMHead.FlushWeightCache();
           if Reader.HasTensor(LMHeadName) then MarkConsumed(LMHeadName);
@@ -17743,11 +17743,11 @@ begin
         end;
         // wpe -> learned positional table (n_positions rows of d floats).
         Reader.LoadTensorFlat(Config.Prefix + 'wpe.weight', Tmp);
-        if PosLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        if PosLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('GPT-BigCode import: wpe.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the positional table size ' +
-            IntToStr(PosLayer.Neurons[0].Weights.Size) + '.');
-        PosLayer.Neurons[0].Weights.Copy(Tmp);
+            IntToStr(PosLayer.FArrNeurons[0].Weights.Size) + '.');
+        PosLayer.FArrNeurons[0].Weights.Copy(Tmp);
         PosLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'wpe.weight');
       finally
@@ -18167,11 +18167,11 @@ begin
       try
         // wte -> embedding table (vocab rows of d floats).
         Reader.LoadTensorFlat(Config.Prefix + 'wte.weight', Tmp);
-        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('GPT-J import: wte.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
-            'size ' + IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
-        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+            'size ' + IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+        EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'wte.weight');
       finally
@@ -18490,8 +18490,8 @@ begin
     Reader.LoadTensorFlat(WName, Tmp);
     for i := 0 to d_model - 1 do
     begin
-      Layer.Neurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
-      Layer.Neurons[1].Weights.FData[i] := 0;            // beta (bias-free)
+      Layer.FArrNeurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
+      Layer.FArrNeurons[1].Weights.FData[i] := 0;            // beta (bias-free)
     end;
   finally
     Tmp.Free;
@@ -18526,9 +18526,9 @@ begin
     begin
       for i := 0 to HeadDim - 1 do
       begin
-        NormLayers[h].Neurons[0].Weights.FData[i] :=
+        NormLayers[h].FArrNeurons[0].Weights.FData[i] :=
           Tmp.FData[h * HeadDim + i];           // gamma row h
-        NormLayers[h].Neurons[1].Weights.FData[i] := 0; // beta
+        NormLayers[h].FArrNeurons[1].Weights.FData[i] := 0; // beta
       end;
       NormLayers[h].FlushWeightCache();
     end;
@@ -18757,11 +18757,11 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
-        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('Cohere import: embed_tokens.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
-            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
-        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+            IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+        EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'embed_tokens.weight');
         // LM head: logits = (h . embed^T) * logit_scale. With tied
@@ -18774,9 +18774,9 @@ begin
           for j := 0 to Config.VocabSize - 1 do
           begin
             for i := 0 to Config.HiddenSize - 1 do
-              LMHead.Neurons[j].Weights.FData[i] :=
+              LMHead.FArrNeurons[j].Weights.FData[i] :=
                 Config.LogitScale * Tmp.FData[j * Config.HiddenSize + i];
-            LMHead.Neurons[j].BiasWeight := 0;
+            LMHead.FArrNeurons[j].BiasWeight := 0;
           end;
           LMHead.FlushWeightCache();
           if Reader.HasTensor(LMHeadName) then MarkConsumed(LMHeadName);
@@ -19062,14 +19062,14 @@ begin
           TargetRow := 2 * (RowInHead - RotHalf) + 1;
       end;
       TargetIdx := HeadIdx * HeadDim + TargetRow;
-      if Layer.Neurons[TargetIdx].Weights.Size <> Hidden then
+      if Layer.FArrNeurons[TargetIdx].Weights.Size <> Hidden then
         ImportError('Phi import: internal error - neuron ' +
           IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
-          IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+          IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
           ' weights, expected ' + IntToStr(Hidden) + '.');
       for i := 0 to Hidden - 1 do
-        Layer.Neurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
-      Layer.Neurons[TargetIdx].BiasWeight := B.FData[r];
+        Layer.FArrNeurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
+      Layer.FArrNeurons[TargetIdx].BiasWeight := B.FData[r];
     end;
   finally
     B.Free;
@@ -19302,11 +19302,11 @@ begin
       try
         // embed_tokens -> embedding table (vocab rows of d floats).
         Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
-        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('Phi import: embed_tokens.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
-            'size ' + IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
-        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+            'size ' + IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+        EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'embed_tokens.weight');
       finally
@@ -19613,15 +19613,15 @@ var
     try
       Reader.LoadTensorFlat(TName, Tmp);
       UsedSize := (Rows - SrcRowOffset) * Cols;
-      if Layer.Neurons[0].Weights.Size <> UsedSize then
+      if Layer.FArrNeurons[0].Weights.Size <> UsedSize then
         ImportError('BERT import: "' + TName + '" usable element count ' +
           IntToStr(UsedSize) + ' does not match the table size ' +
-          IntToStr(Layer.Neurons[0].Weights.Size) + '.');
+          IntToStr(Layer.FArrNeurons[0].Weights.Size) + '.');
       if SrcRowOffset = 0 then
-        Layer.Neurons[0].Weights.Copy(Tmp)
+        Layer.FArrNeurons[0].Weights.Copy(Tmp)
       else
         for ElementCnt := 0 to UsedSize - 1 do
-          Layer.Neurons[0].Weights.FData[ElementCnt] :=
+          Layer.FArrNeurons[0].Weights.FData[ElementCnt] :=
             Tmp.FData[SrcRowOffset * Cols + ElementCnt];
       Layer.FlushWeightCache();
     finally
@@ -22284,8 +22284,8 @@ var
   RelRow: TNeuralFloatArrPtr;
 begin
   EnsureWritableImportWeights(HeadLayer);
-  PosK := HeadLayer.Neurons[0].Weights; // K^r
-  PosQ := HeadLayer.Neurons[1].Weights; // Q^r
+  PosK := HeadLayer.FArrNeurons[0].Weights; // K^r
+  PosQ := HeadLayer.FArrNeurons[1].Weights; // Q^r
   for a := 0 to twoSpan - 1 do
   begin
     RelRow := RelLN.GetRawPtr(a, 0, 0);
@@ -22341,7 +22341,7 @@ var
     Tmp := TNNetVolume.Create;
     try
       Reader.LoadTensorFlat(TName, Tmp);
-      Layer.Neurons[0].Weights.Copy(Tmp);
+      Layer.FArrNeurons[0].Weights.Copy(Tmp);
       Layer.FlushWeightCache();
     finally
       Tmp.Free;
@@ -23565,11 +23565,11 @@ begin
   for j := 0 to OutDim - 1 do
   begin
     for i := 0 to InDim - 1 do
-      WLayer.Neurons[j].Weights.FData[i] := W.FData[ExpertBase + i * OutDim + j];
+      WLayer.FArrNeurons[j].Weights.FData[i] := W.FData[ExpertBase + i * OutDim + j];
     if B <> nil then
-      WLayer.Neurons[j].BiasWeight := B.FData[BiasBase + j]
+      WLayer.FArrNeurons[j].BiasWeight := B.FData[BiasBase + j]
     else
-      WLayer.Neurons[j].BiasWeight := 0;
+      WLayer.FArrNeurons[j].BiasWeight := 0;
   end;
   WLayer.FlushWeightCache();
 end;
@@ -23767,11 +23767,11 @@ begin
     Tmp := TNNetVolume.Create;
     try
       Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
-      if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+      if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
         ImportError('gpt-oss import: embed_tokens.weight element count ' +
           IntToStr(Tmp.Size) + ' <> embedding table size ' +
-          IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
-      EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+          IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+      EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
       EmbeddingLayer.FlushWeightCache();
     finally
       Tmp.Free;
@@ -23882,9 +23882,9 @@ begin
         for j := 0 to Config.VocabSize - 1 do
         begin
           for i := 0 to Config.HiddenSize - 1 do
-            LMHead.Neurons[j].Weights.FData[i] :=
+            LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.HiddenSize + i];
-          LMHead.Neurons[j].BiasWeight := 0;
+          LMHead.FArrNeurons[j].BiasWeight := 0;
         end;
         LMHead.FlushWeightCache();
       end
@@ -24015,7 +24015,7 @@ begin
     ImportError('Embedding import: file not found: ' + FileName);
   EmbDim := Embedding.EmbeddingSize;
   VocabRows := Embedding.VocabSize;
-  Weights := Embedding.Neurons[0].Weights;
+  Weights := Embedding.FArrNeurons[0].Weights;
   FS := DefaultFormatSettings;
   FS.DecimalSeparator := '.'; // the format is locale-independent
   SetLength(Matched, VocabRows);
@@ -24358,13 +24358,13 @@ begin
       for HeadCnt := 0 to Config.NumHeads - 1 do
       begin
         HeadLayer := Blocks[BlockCnt].SelfAttn.Heads[HeadCnt];
-        if HeadLayer.Neurons[0].Weights.Size <> Config.RelPosNumBuckets then
+        if HeadLayer.FArrNeurons[0].Weights.Size <> Config.RelPosNumBuckets then
           ImportError('T5 import: internal error - relpos head neuron for "' +
             WName + '" has ' +
-            IntToStr(HeadLayer.Neurons[0].Weights.Size) +
+            IntToStr(HeadLayer.FArrNeurons[0].Weights.Size) +
             ' weights, expected ' + IntToStr(Config.RelPosNumBuckets) + '.');
         for BucketCnt := 0 to Config.RelPosNumBuckets - 1 do
-          HeadLayer.Neurons[0].Weights.FData[BucketCnt] :=
+          HeadLayer.FArrNeurons[0].Weights.FData[BucketCnt] :=
             Tmp.FData[BucketCnt * Config.NumHeads + HeadCnt];
         HeadLayer.FlushWeightCache();
       end;
@@ -24573,13 +24573,13 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat('shared.weight', Tmp);
-        if EncEmbed.Neurons[0].Weights.Size <> Tmp.Size then
+        if EncEmbed.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('T5 import: shared.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
-            'size ' + IntToStr(EncEmbed.Neurons[0].Weights.Size) + '.');
-        EncEmbed.Neurons[0].Weights.Copy(Tmp);
+            'size ' + IntToStr(EncEmbed.FArrNeurons[0].Weights.Size) + '.');
+        EncEmbed.FArrNeurons[0].Weights.Copy(Tmp);
         EncEmbed.FlushWeightCache();
-        DecEmbed.Neurons[0].Weights.Copy(Tmp);
+        DecEmbed.FArrNeurons[0].Weights.Copy(Tmp);
         DecEmbed.FlushWeightCache();
         Consumed.Add('shared.weight');
         // Legacy exports may still carry the tied embed_tokens aliases.
@@ -24596,9 +24596,9 @@ begin
           for j := 0 to Config.VocabSize - 1 do
           begin
             for i := 0 to Config.DModel - 1 do
-              LMHead.Neurons[j].Weights.FData[i] :=
+              LMHead.FArrNeurons[j].Weights.FData[i] :=
                 TieScale * Tmp.FData[j * Config.DModel + i];
-            LMHead.Neurons[j].BiasWeight := 0;
+            LMHead.FArrNeurons[j].BiasWeight := 0;
           end;
           LMHead.FlushWeightCache();
           // A redundant serialized lm_head.weight is ignorable when tied.
@@ -24977,8 +24977,8 @@ begin
     for ChCnt := 0 to Half - 1 do
     begin
       Angle := PosCnt / Exp(Ln(10000.0) * (2 * ChCnt) / DModel);
-      Layer.Neurons[0].Weights.FData[PosCnt * DModel + ChCnt] := Sin(Angle);
-      Layer.Neurons[0].Weights.FData[PosCnt * DModel + Half + ChCnt] :=
+      Layer.FArrNeurons[0].Weights.FData[PosCnt * DModel + ChCnt] := Sin(Angle);
+      Layer.FArrNeurons[0].Weights.FData[PosCnt * DModel + Half + ChCnt] :=
         Cos(Angle);
     end;
   Layer.FlushWeightCache();
@@ -25009,8 +25009,8 @@ begin
     for ChCnt := 0 to Half - 1 do
     begin
       Angle := Row * Exp(-ChCnt * EmbConst);
-      Layer.Neurons[0].Weights.FData[PosCnt * DModel + ChCnt] := Sin(Angle);
-      Layer.Neurons[0].Weights.FData[PosCnt * DModel + Half + ChCnt] :=
+      Layer.FArrNeurons[0].Weights.FData[PosCnt * DModel + ChCnt] := Sin(Angle);
+      Layer.FArrNeurons[0].Weights.FData[PosCnt * DModel + Half + ChCnt] :=
         Cos(Angle);
     end;
   end;
@@ -25196,10 +25196,10 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat('model.shared.weight', Tmp);
-        if EncEmbed.Neurons[0].Weights.Size <> Tmp.Size then
+        if EncEmbed.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('Marian import: model.shared.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
-            'size ' + IntToStr(EncEmbed.Neurons[0].Weights.Size) + '.');
+            'size ' + IntToStr(EncEmbed.FArrNeurons[0].Weights.Size) + '.');
         // scale_embedding folds sqrt(d_model) into the embedding rows
         // (token embeds are scaled BEFORE positions are added); the TIED
         // head below copies the UNSCALED rows.
@@ -25209,8 +25209,8 @@ begin
           EmbedScale := 1.0;
         for i := 0 to Tmp.Size - 1 do
         begin
-          EncEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
-          DecEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          EncEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
         end;
         EncEmbed.FlushWeightCache();
         DecEmbed.FlushWeightCache();
@@ -25219,11 +25219,11 @@ begin
         EnsureWritableImportWeights(LMHead);
         for j := 0 to Config.VocabSize - 1 do
           for i := 0 to Config.DModel - 1 do
-            LMHead.Neurons[j].Weights.FData[i] :=
+            LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.DModel + i];
         Reader.LoadTensorFlat('final_logits_bias', Tmp);
         for j := 0 to Config.VocabSize - 1 do
-          LMHead.Neurons[j].BiasWeight := Tmp.FData[j];
+          LMHead.FArrNeurons[j].BiasWeight := Tmp.FData[j];
         LMHead.FlushWeightCache();
         Consumed.Add('final_logits_bias');
         // Legacy exports may still carry the tied/static aliases (HF drops
@@ -25327,14 +25327,14 @@ begin
     W.ReSize(OutDim * InDim, 1, 1);
     for jj := 0 to OutDim - 1 do
     begin
-      if Layer.Neurons[NeuronBase + jj].Weights.Size <> InDim then
+      if Layer.FArrNeurons[NeuronBase + jj].Weights.Size <> InDim then
         ImportError('T5 export: neuron ' + IntToStr(NeuronBase + jj) +
           ' for "' + WName + '" has ' +
-          IntToStr(Layer.Neurons[NeuronBase + jj].Weights.Size) +
+          IntToStr(Layer.FArrNeurons[NeuronBase + jj].Weights.Size) +
           ' weights, expected ' + IntToStr(InDim) + '.');
       for ii := 0 to InDim - 1 do
         W.FData[jj * InDim + ii] :=
-          Layer.Neurons[NeuronBase + jj].Weights.FData[ii] * InvScale;
+          Layer.FArrNeurons[NeuronBase + jj].Weights.FData[ii] * InvScale;
     end;
     Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
   finally
@@ -25346,11 +25346,11 @@ end;
 procedure DumpT5RMSNorm(Writer: TNNetSafeTensorsWriter; Layer: TNNetLayer;
   const WName: string; d_model: integer; pDType: TSafeTensorsWriteDType);
 begin
-  if Layer.Neurons[0].Weights.Size <> d_model then
+  if Layer.FArrNeurons[0].Weights.Size <> d_model then
     ImportError('T5 export: RMSNorm "' + WName + '" gain size ' +
-      IntToStr(Layer.Neurons[0].Weights.Size) + ' <> d_model ' +
+      IntToStr(Layer.FArrNeurons[0].Weights.Size) + ' <> d_model ' +
       IntToStr(d_model) + '.');
-  Writer.AddTensorFlat(WName, [d_model], Layer.Neurons[0].Weights, pDType);
+  Writer.AddTensorFlat(WName, [d_model], Layer.FArrNeurons[0].Weights, pDType);
 end;
 
 procedure SaveT5ToSafeTensors(EncoderNet, DecoderNet: TNNet;
@@ -25505,10 +25505,10 @@ begin
     Writer.SetMetadata('format', 'pt');
     Writer.SetMetadata('exporter', 'cai-neural-api/t5');
     // ---- shared embedding (unscaled in T5) ----
-    if EncEmbed.Neurons[0].Weights.Size <> Config.VocabSize * Config.DModel then
+    if EncEmbed.FArrNeurons[0].Weights.Size <> Config.VocabSize * Config.DModel then
       ImportError('T5 export: embedding size mismatch.');
     Writer.AddTensorFlat('shared.weight',
-      [Config.VocabSize, Config.DModel], EncEmbed.Neurons[0].Weights, pDType);
+      [Config.VocabSize, Config.DModel], EncEmbed.FArrNeurons[0].Weights, pDType);
 
     DumpStack(EncoderNet, {IsDecoder=}false, 'encoder.', Config.NumLayers,
       EncLMHead, EncRelHeads0);
@@ -25520,13 +25520,13 @@ begin
     RelBias.ReSize(Config.RelPosNumBuckets * Config.NumHeads, 1, 1);
     for HeadCnt := 0 to Config.NumHeads - 1 do
     begin
-      if EncRelHeads0[HeadCnt].Neurons[0].Weights.Size <>
+      if EncRelHeads0[HeadCnt].FArrNeurons[0].Weights.Size <>
          Config.RelPosNumBuckets then
         ImportError('T5 export: encoder relpos head ' + IntToStr(HeadCnt) +
           ' bucket count mismatch.');
       for BucketCnt := 0 to Config.RelPosNumBuckets - 1 do
         RelBias.FData[BucketCnt * Config.NumHeads + HeadCnt] :=
-          EncRelHeads0[HeadCnt].Neurons[0].Weights.FData[BucketCnt];
+          EncRelHeads0[HeadCnt].FArrNeurons[0].Weights.FData[BucketCnt];
     end;
     Writer.AddTensorFlat('encoder.block.0.layer.0.SelfAttention.' +
       'relative_attention_bias.weight',
@@ -25534,7 +25534,7 @@ begin
     for HeadCnt := 0 to Config.NumHeads - 1 do
       for BucketCnt := 0 to Config.RelPosNumBuckets - 1 do
         RelBias.FData[BucketCnt * Config.NumHeads + HeadCnt] :=
-          DecRelHeads0[HeadCnt].Neurons[0].Weights.FData[BucketCnt];
+          DecRelHeads0[HeadCnt].FArrNeurons[0].Weights.FData[BucketCnt];
     Writer.AddTensorFlat('decoder.block.0.layer.0.SelfAttention.' +
       'relative_attention_bias.weight',
       [Config.RelPosNumBuckets, Config.NumHeads], RelBias, pDType);
@@ -25584,13 +25584,13 @@ var
       B.ReSize(OutDim, 1, 1);
       for jj := 0 to OutDim - 1 do
       begin
-        if Layer.Neurons[jj].Weights.Size <> InDim then
+        if Layer.FArrNeurons[jj].Weights.Size <> InDim then
           ImportError('Marian export: neuron ' + IntToStr(jj) + ' for "' +
-            WName + '" has ' + IntToStr(Layer.Neurons[jj].Weights.Size) +
+            WName + '" has ' + IntToStr(Layer.FArrNeurons[jj].Weights.Size) +
             ' weights, expected ' + IntToStr(InDim) + '.');
         for ii := 0 to InDim - 1 do
-          W.FData[jj * InDim + ii] := Layer.Neurons[jj].Weights.FData[ii];
-        B.FData[jj] := Layer.Neurons[jj].BiasWeight;
+          W.FData[jj * InDim + ii] := Layer.FArrNeurons[jj].Weights.FData[ii];
+        B.FData[jj] := Layer.FArrNeurons[jj].BiasWeight;
       end;
       Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
       Writer.AddTensorFlat(BName, [OutDim], B, pDType);
@@ -25710,11 +25710,11 @@ begin
     Writer.SetMetadata('format', 'pt');
     Writer.SetMetadata('exporter', 'cai-neural-api/marian');
     // ---- shared embedding: un-fold the scale_embedding sqrt(d_model). ----
-    if EncEmbed.Neurons[0].Weights.Size <> Config.VocabSize * Config.DModel then
+    if EncEmbed.FArrNeurons[0].Weights.Size <> Config.VocabSize * Config.DModel then
       ImportError('Marian export: embedding size mismatch.');
     Shared.ReSize(Config.VocabSize * Config.DModel, 1, 1);
     for i := 0 to Shared.Size - 1 do
-      Shared.FData[i] := EncEmbed.Neurons[0].Weights.FData[i] * InvEmbedScale;
+      Shared.FData[i] := EncEmbed.FArrNeurons[0].Weights.FData[i] * InvEmbedScale;
     Writer.AddTensorFlat('model.shared.weight',
       [Config.VocabSize, Config.DModel], Shared, pDType);
 
@@ -25726,7 +25726,7 @@ begin
     // ---- final_logits_bias: the tied head's per-neuron biases ([1,vocab]).
     FinalBias.ReSize(Config.VocabSize, 1, 1);
     for j := 0 to Config.VocabSize - 1 do
-      FinalBias.FData[j] := LMHead.Neurons[j].BiasWeight;
+      FinalBias.FData[j] := LMHead.FArrNeurons[j].BiasWeight;
     Writer.AddTensorFlat('final_logits_bias',
       [1, Config.VocabSize], FinalBias, pDType);
     // The static half-split sinusoidal position tables are NOT learned
@@ -25784,14 +25784,14 @@ var
       B.ReSize(OutDim, 1, 1);
       for jj := 0 to OutDim - 1 do
       begin
-        if Layer.Neurons[jj].Weights.Size <> InDim then
+        if Layer.FArrNeurons[jj].Weights.Size <> InDim then
           ImportError(ExporterTag + ' export: neuron ' + IntToStr(jj) +
             ' for "' + WName + '" has ' +
-            IntToStr(Layer.Neurons[jj].Weights.Size) + ' weights, expected ' +
+            IntToStr(Layer.FArrNeurons[jj].Weights.Size) + ' weights, expected ' +
             IntToStr(InDim) + '.');
         for ii := 0 to InDim - 1 do
-          W.FData[jj * InDim + ii] := Layer.Neurons[jj].Weights.FData[ii];
-        B.FData[jj] := Layer.Neurons[jj].BiasWeight;
+          W.FData[jj * InDim + ii] := Layer.FArrNeurons[jj].Weights.FData[ii];
+        B.FData[jj] := Layer.FArrNeurons[jj].BiasWeight;
       end;
       Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
       Writer.AddTensorFlat(BName, [OutDim], B, pDType);
@@ -25819,7 +25819,7 @@ var
       for PosCnt := 0 to SeqLen - 1 do
         for ElementCnt := 0 to DModel - 1 do
           Tbl.FData[(PosCnt + PosOffset) * DModel + ElementCnt] :=
-            PosLayer.Neurons[0].Weights.FData[PosCnt * DModel + ElementCnt];
+            PosLayer.FArrNeurons[0].Weights.FData[PosCnt * DModel + ElementCnt];
       Writer.AddTensorFlat(TName, [Rows, DModel], Tbl, pDType);
     finally
       Tbl.Free;
@@ -25957,11 +25957,11 @@ begin
     Writer.SetMetadata('format', 'pt');
     Writer.SetMetadata('exporter', 'cai-neural-api/' + LowerCase(ExporterTag));
     // ---- shared embedding: un-fold the scale_embedding sqrt(d_model). ----
-    if EncEmbed.Neurons[0].Weights.Size <> VocabSize * DModel then
+    if EncEmbed.FArrNeurons[0].Weights.Size <> VocabSize * DModel then
       ImportError(ExporterTag + ' export: embedding size mismatch.');
     Shared.ReSize(VocabSize * DModel, 1, 1);
     for i := 0 to Shared.Size - 1 do
-      Shared.FData[i] := EncEmbed.Neurons[0].Weights.FData[i] * InvEmbedScale;
+      Shared.FData[i] := EncEmbed.FArrNeurons[0].Weights.FData[i] * InvEmbedScale;
     Writer.AddTensorFlat('model.shared.weight',
       [VocabSize, DModel], Shared, pDType);
 
@@ -26009,7 +26009,7 @@ begin
     // ---- final_logits_bias: the tied head's per-neuron biases ([1,vocab]). --
     FinalBias.ReSize(VocabSize, 1, 1);
     for j := 0 to VocabSize - 1 do
-      FinalBias.FData[j] := LMHead.Neurons[j].BiasWeight;
+      FinalBias.FData[j] := LMHead.FArrNeurons[j].BiasWeight;
     Writer.AddTensorFlat('final_logits_bias',
       [1, VocabSize], FinalBias, pDType);
 
@@ -26341,7 +26341,7 @@ var
     Reader.LoadTensorFlat(TName, Tmp);
     for PosCnt := 0 to SeqLen - 1 do
       for ElementCnt := 0 to Config.DModel - 1 do
-        PosLayer.Neurons[0].Weights.FData[PosCnt * Config.DModel +
+        PosLayer.FArrNeurons[0].Weights.FData[PosCnt * Config.DModel +
           ElementCnt] := Tmp.FData[(PosCnt + BartPositionOffset) *
             Config.DModel + ElementCnt];
     PosLayer.FlushWeightCache();
@@ -26441,18 +26441,18 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat('model.shared.weight', Tmp);
-        if EncEmbed.Neurons[0].Weights.Size <> Tmp.Size then
+        if EncEmbed.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('BART import: model.shared.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
-            'size ' + IntToStr(EncEmbed.Neurons[0].Weights.Size) + '.');
+            'size ' + IntToStr(EncEmbed.FArrNeurons[0].Weights.Size) + '.');
         if Config.ScaleEmbedding then
           EmbedScale := Sqrt(Config.DModel)
         else
           EmbedScale := 1.0;
         for i := 0 to Tmp.Size - 1 do
         begin
-          EncEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
-          DecEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          EncEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
         end;
         EncEmbed.FlushWeightCache();
         DecEmbed.FlushWeightCache();
@@ -26461,11 +26461,11 @@ begin
         EnsureWritableImportWeights(LMHead);
         for j := 0 to Config.VocabSize - 1 do
           for i := 0 to Config.DModel - 1 do
-            LMHead.Neurons[j].Weights.FData[i] :=
+            LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.DModel + i];
         Reader.LoadTensorFlat('final_logits_bias', Tmp);
         for j := 0 to Config.VocabSize - 1 do
-          LMHead.Neurons[j].BiasWeight := Tmp.FData[j];
+          LMHead.FArrNeurons[j].BiasWeight := Tmp.FData[j];
         LMHead.FlushWeightCache();
         Consumed.Add('final_logits_bias');
         // Legacy exports may still carry the tied aliases (HF drops
@@ -27699,9 +27699,9 @@ begin
         for j := 0 to Config.VocabSize - 1 do
         begin
           for i := 0 to Config.Hidden - 1 do
-            HeadLayers[k_i].Neurons[j].Weights.FData[i] :=
+            HeadLayers[k_i].FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.Hidden + i];
-          HeadLayers[k_i].Neurons[j].BiasWeight := 0;
+          HeadLayers[k_i].FArrNeurons[j].BiasWeight := 0;
         end;
         HeadLayers[k_i].FlushWeightCache();
         Consumed.Add(TName);
@@ -27916,10 +27916,10 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat('model.shared.weight', Tmp);
-        if EncEmbed.Neurons[0].Weights.Size <> Tmp.Size then
+        if EncEmbed.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('Pegasus import: model.shared.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
-            'size ' + IntToStr(EncEmbed.Neurons[0].Weights.Size) + '.');
+            'size ' + IntToStr(EncEmbed.FArrNeurons[0].Weights.Size) + '.');
         // scale_embedding folds sqrt(d_model) into the embedding rows; the
         // TIED head below copies the UNSCALED rows.
         if Config.ScaleEmbedding then
@@ -27928,8 +27928,8 @@ begin
           EmbedScale := 1.0;
         for i := 0 to Tmp.Size - 1 do
         begin
-          EncEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
-          DecEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          EncEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
         end;
         EncEmbed.FlushWeightCache();
         DecEmbed.FlushWeightCache();
@@ -27938,11 +27938,11 @@ begin
         EnsureWritableImportWeights(LMHead);
         for j := 0 to Config.VocabSize - 1 do
           for i := 0 to Config.DModel - 1 do
-            LMHead.Neurons[j].Weights.FData[i] :=
+            LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.DModel + i];
         Reader.LoadTensorFlat('final_logits_bias', Tmp);
         for j := 0 to Config.VocabSize - 1 do
-          LMHead.Neurons[j].BiasWeight := Tmp.FData[j];
+          LMHead.FArrNeurons[j].BiasWeight := Tmp.FData[j];
         LMHead.FlushWeightCache();
         Consumed.Add('final_logits_bias');
         // Legacy exports may still carry the tied/static aliases (HF drops
@@ -28159,7 +28159,7 @@ var
     Reader.LoadTensorFlat(TName, Tmp);
     for PosCnt := 0 to SeqLen - 1 do
       for ElementCnt := 0 to Config.DModel - 1 do
-        PosLayer.Neurons[0].Weights.FData[PosCnt * Config.DModel +
+        PosLayer.FArrNeurons[0].Weights.FData[PosCnt * Config.DModel +
           ElementCnt] := Tmp.FData[(PosCnt + BartPositionOffset) *
             Config.DModel + ElementCnt];
     PosLayer.FlushWeightCache();
@@ -28268,18 +28268,18 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat('model.shared.weight', Tmp);
-        if EncEmbed.Neurons[0].Weights.Size <> Tmp.Size then
+        if EncEmbed.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('mBART import: model.shared.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
-            'size ' + IntToStr(EncEmbed.Neurons[0].Weights.Size) + '.');
+            'size ' + IntToStr(EncEmbed.FArrNeurons[0].Weights.Size) + '.');
         if Config.ScaleEmbedding then
           EmbedScale := Sqrt(Config.DModel)
         else
           EmbedScale := 1.0;
         for i := 0 to Tmp.Size - 1 do
         begin
-          EncEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
-          DecEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          EncEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
         end;
         EncEmbed.FlushWeightCache();
         DecEmbed.FlushWeightCache();
@@ -28288,11 +28288,11 @@ begin
         EnsureWritableImportWeights(LMHead);
         for j := 0 to Config.VocabSize - 1 do
           for i := 0 to Config.DModel - 1 do
-            LMHead.Neurons[j].Weights.FData[i] :=
+            LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.DModel + i];
         Reader.LoadTensorFlat('final_logits_bias', Tmp);
         for j := 0 to Config.VocabSize - 1 do
-          LMHead.Neurons[j].BiasWeight := Tmp.FData[j];
+          LMHead.FArrNeurons[j].BiasWeight := Tmp.FData[j];
         LMHead.FlushWeightCache();
         Consumed.Add('final_logits_bias');
         // Legacy exports may still carry the tied aliases (HF drops
@@ -28638,18 +28638,18 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat('model.shared.weight', Tmp);
-        if EncEmbed.Neurons[0].Weights.Size <> Tmp.Size then
+        if EncEmbed.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('M2M100 import: model.shared.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
-            'size ' + IntToStr(EncEmbed.Neurons[0].Weights.Size) + '.');
+            'size ' + IntToStr(EncEmbed.FArrNeurons[0].Weights.Size) + '.');
         if Config.ScaleEmbedding then
           EmbedScale := Sqrt(Config.DModel)
         else
           EmbedScale := 1.0;
         for i := 0 to Tmp.Size - 1 do
         begin
-          EncEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
-          DecEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          EncEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
         end;
         EncEmbed.FlushWeightCache();
         DecEmbed.FlushWeightCache();
@@ -28658,7 +28658,7 @@ begin
         EnsureWritableImportWeights(LMHead);
         for j := 0 to Config.VocabSize - 1 do
           for i := 0 to Config.DModel - 1 do
-            LMHead.Neurons[j].Weights.FData[i] :=
+            LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.DModel + i];
         // final_logits_bias is optional (see the validation note above): a
         // zero head bias is the default for the bias-free transformers-5 head
@@ -28667,12 +28667,12 @@ begin
         begin
           Reader.LoadTensorFlat('final_logits_bias', Tmp);
           for j := 0 to Config.VocabSize - 1 do
-            LMHead.Neurons[j].BiasWeight := Tmp.FData[j];
+            LMHead.FArrNeurons[j].BiasWeight := Tmp.FData[j];
           Consumed.Add('final_logits_bias');
         end
         else
           for j := 0 to Config.VocabSize - 1 do
-            LMHead.Neurons[j].BiasWeight := 0.0;
+            LMHead.FArrNeurons[j].BiasWeight := 0.0;
         LMHead.FlushWeightCache();
         // Legacy aliases (HF drops embed_tokens/lm_head via
         // _tied_weights_keys and the SINUSOIDAL embed_positions via
@@ -28923,8 +28923,8 @@ begin
     for ChCnt := 0 to Half - 1 do
     begin
       Angle := Row * Exp(-ChCnt * EmbConst);
-      Layer.Neurons[0].Weights.FData[PosCnt * HiddenSize + ChCnt] := Sin(Angle);
-      Layer.Neurons[0].Weights.FData[PosCnt * HiddenSize + Half + ChCnt] :=
+      Layer.FArrNeurons[0].Weights.FData[PosCnt * HiddenSize + ChCnt] := Sin(Angle);
+      Layer.FArrNeurons[0].Weights.FData[PosCnt * HiddenSize + Half + ChCnt] :=
         Cos(Angle);
     end;
   end;
@@ -28966,9 +28966,9 @@ begin
     begin
       for kk := 0 to Kernel - 1 do
         for i := 0 to InDim - 1 do
-          Layer.Neurons[o].Weights.FData[kk * InDim + i] :=
+          Layer.FArrNeurons[o].Weights.FData[kk * InDim + i] :=
             W.FData[(o * InDim + i) * Kernel + kk];
-      Layer.Neurons[o].BiasWeight := 0.0;
+      Layer.FArrNeurons[o].BiasWeight := 0.0;
     end;
     Consumed.Add(WName);
     if BiasName <> '' then
@@ -28978,7 +28978,7 @@ begin
           BiasName + '".');
       Reader.LoadTensorFlat(BiasName, B);
       for o := 0 to OutDim - 1 do
-        Layer.Neurons[o].BiasWeight := B.FData[o];
+        Layer.FArrNeurons[o].BiasWeight := B.FData[o];
       Consumed.Add(BiasName);
     end;
     Layer.FlushWeightCache();
@@ -29021,8 +29021,8 @@ begin
     for c := 0 to Hidden - 1 do
     begin
       for kk := 0 to Kernel - 1 do
-        Layer.Neurons[c].Weights.FData[kk] := W.FData[c * Kernel + kk];
-      Layer.Neurons[c].BiasWeight := 0.0;
+        Layer.FArrNeurons[c].Weights.FData[kk] := W.FData[c * Kernel + kk];
+      Layer.FArrNeurons[c].BiasWeight := 0.0;
     end;
     Consumed.Add(WName);
     Layer.FlushWeightCache();
@@ -29428,7 +29428,7 @@ begin
         if Config.ScaleEmbedding then EmbedScale := Sqrt(Hidden)
         else EmbedScale := 1.0;
         for i := 0 to Tmp.Size - 1 do
-          DecEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
         DecEmbed.FlushWeightCache();
         Consumed.Add('shared.weight');
         // tied bias-free lm_head (UNSCALED rows)
@@ -29436,9 +29436,9 @@ begin
         for j := 0 to Config.VocabSize - 1 do
         begin
           for i := 0 to Hidden - 1 do
-            LMHead.Neurons[j].Weights.FData[i] :=
+            LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Hidden + i];
-          LMHead.Neurons[j].BiasWeight := 0.0;
+          LMHead.FArrNeurons[j].BiasWeight := 0.0;
         end;
         LMHead.FlushWeightCache();
         if Reader.HasTensor('lm_head.weight') then
@@ -29791,8 +29791,8 @@ begin
     for ChCnt := 0 to Half - 1 do
     begin
       Angle := PosCnt * Exp(-Ln(10000.0) * ChCnt / (Half - 1));
-      Layer.Neurons[0].Weights.FData[PosCnt * DModel + ChCnt] := Sin(Angle);
-      Layer.Neurons[0].Weights.FData[PosCnt * DModel + Half + ChCnt] :=
+      Layer.FArrNeurons[0].Weights.FData[PosCnt * DModel + ChCnt] := Sin(Angle);
+      Layer.FArrNeurons[0].Weights.FData[PosCnt * DModel + Half + ChCnt] :=
         Cos(Angle);
     end;
   Layer.FlushWeightCache();
@@ -29894,9 +29894,9 @@ begin
     ImportError('Whisper import: internal error - conv layer for "' +
       WName + '" has ' + IntToStr(Layer.Neurons.Count) +
       ' neurons, expected ' + IntToStr(OutDim) + '.');
-  if Layer.Neurons[0].Weights.Size <> 3 * InDim then
+  if Layer.FArrNeurons[0].Weights.Size <> 3 * InDim then
     ImportError('Whisper import: internal error - conv neuron for "' +
-      WName + '" has ' + IntToStr(Layer.Neurons[0].Weights.Size) +
+      WName + '" has ' + IntToStr(Layer.FArrNeurons[0].Weights.Size) +
       ' weights, expected ' + IntToStr(3 * InDim) + '.');
   W := TNNetVolume.Create;
   B := TNNetVolume.Create;
@@ -29907,9 +29907,9 @@ begin
     begin
       for kk := 0 to 2 do
         for i := 0 to InDim - 1 do
-          Layer.Neurons[o].Weights.FData[kk * InDim + i] :=
+          Layer.FArrNeurons[o].Weights.FData[kk * InDim + i] :=
             W.FData[(o * InDim + i) * 3 + kk];
-      Layer.Neurons[o].BiasWeight := B.FData[o];
+      Layer.FArrNeurons[o].BiasWeight := B.FData[o];
     end;
   finally
     B.Free;
@@ -30063,16 +30063,16 @@ begin
         // folds sqrt(d_model) into the embedding rows like Marian; every
         // released Whisper has it false.
         Reader.LoadTensorFlat('model.decoder.embed_tokens.weight', Tmp);
-        if DecEmbed.Neurons[0].Weights.Size <> Tmp.Size then
+        if DecEmbed.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('Whisper import: embed_tokens element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
-            'size ' + IntToStr(DecEmbed.Neurons[0].Weights.Size) + '.');
+            'size ' + IntToStr(DecEmbed.FArrNeurons[0].Weights.Size) + '.');
         if Config.ScaleEmbedding then
           EmbedScale := Sqrt(Config.DModel)
         else
           EmbedScale := 1.0;
         for i := 0 to Tmp.Size - 1 do
-          DecEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
         DecEmbed.FlushWeightCache();
         Consumed.Add('model.decoder.embed_tokens.weight');
         // Tied head: logits = h . embed_tokens^T (proj_out is bias-free
@@ -30080,9 +30080,9 @@ begin
         for j := 0 to Config.VocabSize - 1 do
         begin
           for i := 0 to Config.DModel - 1 do
-            LMHead.Neurons[j].Weights.FData[i] :=
+            LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.DModel + i];
-          LMHead.Neurons[j].BiasWeight := 0;
+          LMHead.FArrNeurons[j].BiasWeight := 0;
         end;
         LMHead.FlushWeightCache();
         if Reader.HasTensor('proj_out.weight') then
@@ -30091,7 +30091,7 @@ begin
         // [max_target_positions, d_model] table.
         Reader.LoadTensorFlat('model.decoder.embed_positions.weight', Tmp);
         for i := 0 to DecSeqLen * Config.DModel - 1 do
-          DecPos.Neurons[0].Weights.FData[i] := Tmp.FData[i];
+          DecPos.FArrNeurons[0].Weights.FData[i] := Tmp.FData[i];
         DecPos.FlushWeightCache();
         Consumed.Add('model.decoder.embed_positions.weight');
         // FIXED sinusoidal encoder positions: real checkpoints save the
@@ -30111,7 +30111,7 @@ begin
           Reader.LoadTensorFlat('model.encoder.embed_positions.weight',
             Tmp);
           for i := 0 to Config.MaxSourcePositions * Config.DModel - 1 do
-            EncPos.Neurons[0].Weights.FData[i] := Tmp.FData[i];
+            EncPos.FArrNeurons[0].Weights.FData[i] := Tmp.FData[i];
           EncPos.FlushWeightCache();
           Consumed.Add('model.encoder.embed_positions.weight');
         end
@@ -30703,9 +30703,9 @@ begin
     ImportError('Wav2Vec2 import: internal error - conv layer for "' +
       WName + '" has ' + IntToStr(Layer.Neurons.Count) +
       ' neurons, expected ' + IntToStr(OutDim) + '.');
-  if Layer.Neurons[0].Weights.Size <> Kernel * InDim then
+  if Layer.FArrNeurons[0].Weights.Size <> Kernel * InDim then
     ImportError('Wav2Vec2 import: internal error - conv neuron for "' +
-      WName + '" has ' + IntToStr(Layer.Neurons[0].Weights.Size) +
+      WName + '" has ' + IntToStr(Layer.FArrNeurons[0].Weights.Size) +
       ' weights, expected ' + IntToStr(Kernel * InDim) + '.');
   W := TNNetVolume.Create;
   try
@@ -30714,9 +30714,9 @@ begin
     begin
       for kk := 0 to Kernel - 1 do
         for i := 0 to InDim - 1 do
-          Layer.Neurons[o].Weights.FData[kk * InDim + i] :=
+          Layer.FArrNeurons[o].Weights.FData[kk * InDim + i] :=
             W.FData[(o * InDim + i) * Kernel + kk];
-      Layer.Neurons[o].BiasWeight := 0;
+      Layer.FArrNeurons[o].BiasWeight := 0;
     end;
   finally
     W.Free;
@@ -30764,9 +30764,9 @@ begin
     ImportError('Wav2Vec2 import: internal error - pos conv has ' +
       IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
       IntToStr(HiddenSize) + '.');
-  if Layer.Neurons[0].Weights.Size <> Kernel * InPerGroup then
+  if Layer.FArrNeurons[0].Weights.Size <> Kernel * InPerGroup then
     ImportError('Wav2Vec2 import: internal error - pos conv neuron has ' +
-      IntToStr(Layer.Neurons[0].Weights.Size) + ' weights, expected ' +
+      IntToStr(Layer.FArrNeurons[0].Weights.Size) + ' weights, expected ' +
       IntToStr(Kernel * InPerGroup) + '.');
   G := TNNetVolume.Create;
   V := TNNetVolume.Create;
@@ -30795,9 +30795,9 @@ begin
     begin
       for kk := 0 to Kernel - 1 do
         for ic := 0 to InPerGroup - 1 do
-          Layer.Neurons[o].Weights.FData[kk * InPerGroup + ic] :=
+          Layer.FArrNeurons[o].Weights.FData[kk * InPerGroup + ic] :=
             WEff.FData[(o * InPerGroup + ic) * Kernel + kk];
-      Layer.Neurons[o].BiasWeight := B.FData[o];
+      Layer.FArrNeurons[o].BiasWeight := B.FData[o];
     end;
   finally
     WEff.Free; B.Free; V.Free; G.Free;
@@ -31212,8 +31212,8 @@ begin
     Reader.LoadTensorFlat(BandName, Ba);
     for f := 0 to NumFilters - 1 do
     begin
-      Layer.Neurons[0].Weights[f, 0, 0] := Lo.FData[f];
-      Layer.Neurons[0].Weights[f, 0, 1] := Ba.FData[f];
+      Layer.FArrNeurons[0].Weights[f, 0, 0] := Lo.FData[f];
+      Layer.FArrNeurons[0].Weights[f, 0, 1] := Ba.FData[f];
     end;
   finally
     Ba.Free; Lo.Free;
@@ -31237,7 +31237,7 @@ begin
   try
     Reader.LoadTensorFlat(BName, B);
     for o := 0 to OutDim - 1 do
-      Layer.Neurons[o].BiasWeight := B.FData[o];
+      Layer.FArrNeurons[o].BiasWeight := B.FData[o];
   finally
     B.Free;
   end;
@@ -31275,12 +31275,12 @@ begin
       // TNNetMinLSTM stores gate g in Neurons[g] as (InDim,1,Hidden) [out,0,in].
       for o := 0 to Hidden - 1 do
         for i := 0 to InDim - 1 do
-          Layer.Neurons[g].Weights[o, 0, i] := W.FData[o * InDim + i];
+          Layer.FArrNeurons[g].Weights[o, 0, i] := W.FData[o * InDim + i];
       Consumed.Add(WName);
       // Bias.
       Reader.LoadTensorFlat(BName, W);
       for o := 0 to Hidden - 1 do
-        Layer.Neurons[3 + g].Weights.FData[o] := W.FData[o];
+        Layer.FArrNeurons[3 + g].Weights.FData[o] := W.FData[o];
       Consumed.Add(BName);
     end;
   finally
@@ -31637,10 +31637,10 @@ begin
     begin
       for kk := 0 to Kernel - 1 do
         for i := 0 to InDim - 1 do
-          Layer.Neurons[o].Weights.FData[kk * InDim + i] :=
+          Layer.FArrNeurons[o].Weights.FData[kk * InDim + i] :=
             W.FData[(o * InDim + i) * Kernel + kk];
-      if BName <> '' then Layer.Neurons[o].BiasWeight := B.FData[o]
-      else Layer.Neurons[o].BiasWeight := 0;
+      if BName <> '' then Layer.FArrNeurons[o].BiasWeight := B.FData[o]
+      else Layer.FArrNeurons[o].BiasWeight := 0;
     end;
   finally
     B.Free;
@@ -31672,8 +31672,8 @@ begin
     Reader.LoadTensorFlat(WName, Tmp);
     for i := 0 to d_model - 1 do
     begin
-      Layer.Neurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
-      Layer.Neurons[1].Weights.FData[i] := 0;            // beta = 0 (bias-free)
+      Layer.FArrNeurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
+      Layer.FArrNeurons[1].Weights.FData[i] := 0;            // beta = 0 (bias-free)
     end;
   finally
     Tmp.Free;
@@ -32218,13 +32218,13 @@ begin
 
       // ---------------- Weights ----------------
       Reader.LoadTensorFlat('decoder.embed_tokens.weight', EmbedTmp);
-      if DecEmbed.Neurons[0].Weights.Size <> EmbedTmp.Size then
+      if DecEmbed.FArrNeurons[0].Weights.Size <> EmbedTmp.Size then
         ImportError('Moonshine import: decoder.embed_tokens.weight element ' +
           'count ' + IntToStr(EmbedTmp.Size) + ' does not match the ' +
           'embedding table size ' +
-          IntToStr(DecEmbed.Neurons[0].Weights.Size) + '.');
+          IntToStr(DecEmbed.FArrNeurons[0].Weights.Size) + '.');
       for i := 0 to EmbedTmp.Size - 1 do
-        DecEmbed.Neurons[0].Weights.FData[i] := EmbedTmp.FData[i];
+        DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedTmp.FData[i];
       DecEmbed.FlushWeightCache();
       Consumed.Add('decoder.embed_tokens.weight');
 
@@ -32300,9 +32300,9 @@ begin
         for j := 0 to Config.VocabSize - 1 do
         begin
           for i := 0 to Config.HiddenSize - 1 do
-            LMHead.Neurons[j].Weights.FData[i] :=
+            LMHead.FArrNeurons[j].Weights.FData[i] :=
               EmbedTmp.FData[j * Config.HiddenSize + i];
-          LMHead.Neurons[j].BiasWeight := 0;
+          LMHead.FArrNeurons[j].BiasWeight := 0;
         end;
         LMHead.FlushWeightCache();
         if Reader.HasTensor('proj_out.weight') then
@@ -37125,7 +37125,7 @@ var
         IntToStr(Channels) + ' elements, got ' +
         Reader.ShapeAsString(TName));
     for d := 0 to Channels - 1 do
-      Layer.Neurons[NeuronIdx].Weights.FData[d] := Tmp.FData[d];
+      Layer.FArrNeurons[NeuronIdx].Weights.FData[d] := Tmp.FData[d];
     Layer.FlushWeightCache();
     MarkConsumed(TName);
   end;
@@ -37157,7 +37157,7 @@ var
       if x > 30 then wraw := x
       else if x < 1e-7 then wraw := Ln(x)
       else wraw := Ln(Exp(x) - 1.0);
-      Layer.Neurons[0].Weights.FData[d] := wraw;
+      Layer.FArrNeurons[0].Weights.FData[d] := wraw;
     end;
     Layer.FlushWeightCache();
     MarkConsumed(TName);
@@ -37275,11 +37275,11 @@ begin
 
       // ---------------- Weights ----------------
       Reader.LoadTensorFlat(Config.Prefix + 'embeddings.weight', Tmp);
-      if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+      if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
         ImportError('RWKV import: embeddings.weight element count ' +
           IntToStr(Tmp.Size) + ' does not match the embedding table ' +
-          'size ' + IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
-      EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+          'size ' + IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+      EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
       EmbeddingLayer.FlushWeightCache();
       MarkConsumed(Config.Prefix + 'embeddings.weight');
       if Config.TieWordEmbeddings then
@@ -37289,9 +37289,9 @@ begin
         for j := 0 to Config.VocabSize - 1 do
         begin
           for i := 0 to Config.HiddenSize - 1 do
-            LMHead.Neurons[j].Weights.FData[i] :=
+            LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.HiddenSize + i];
-          LMHead.Neurons[j].BiasWeight := 0;
+          LMHead.FArrNeurons[j].BiasWeight := 0;
         end;
         LMHead.FlushWeightCache();
         if Reader.HasTensor('head.weight') then
@@ -37582,7 +37582,7 @@ var
         IntToStr(Channels) + ' elements, got ' +
         Reader.ShapeAsString(TName));
     for d := 0 to Channels - 1 do
-      Layer.Neurons[NeuronIdx].Weights.FData[d] := Tmp.FData[d];
+      Layer.FArrNeurons[NeuronIdx].Weights.FData[d] := Tmp.FData[d];
     Layer.FlushWeightCache();
     MarkConsumed(TName);
   end;
@@ -37609,7 +37609,7 @@ var
     Reader.LoadTensorFlat(WName, Tmp);
     for d := 0 to Config.DInner - 1 do
       for kk := 0 to Config.ConvKernel - 1 do
-        Layer.Neurons[d].Weights.FData[kk] :=
+        Layer.FArrNeurons[d].Weights.FData[kk] :=
           Tmp.FData[d * Config.ConvKernel + kk];
     MarkConsumed(WName);
     if Config.UseConvBias then
@@ -37623,7 +37623,7 @@ var
           IntToStr(Config.DInner) + ' elements, got ' +
           Reader.ShapeAsString(BName));
       for d := 0 to Config.DInner - 1 do
-        Layer.Neurons[d].BiasWeight := Tmp.FData[d];
+        Layer.FArrNeurons[d].BiasWeight := Tmp.FData[d];
       MarkConsumed(BName);
     end;
     Layer.FlushWeightCache();
@@ -37657,16 +37657,16 @@ var
           Acc := 0;
           for r := 0 to RK - 1 do
             Acc := Acc + DtW.FData[d * RK + r] * XW.FData[r * DI + j];
-          Layer.Neurons[0].Weights.FData[d * DI + j] := Acc;
+          Layer.FArrNeurons[0].Weights.FData[d * DI + j] := Acc;
         end;
       // W_B / W_C: the next d_state + d_state x_proj rows (shared across
       // channels - TNNetSelectiveSSM's (NS,1,Depth) projections).
       for s := 0 to NS - 1 do
         for j := 0 to DI - 1 do
         begin
-          Layer.Neurons[1].Weights.FData[s * DI + j] :=
+          Layer.FArrNeurons[1].Weights.FData[s * DI + j] :=
             XW.FData[(RK + s) * DI + j];
-          Layer.Neurons[2].Weights.FData[s * DI + j] :=
+          Layer.FArrNeurons[2].Weights.FData[s * DI + j] :=
             XW.FData[(RK + NS + s) * DI + j];
         end;
     finally
@@ -37776,11 +37776,11 @@ begin
 
       // ---------------- Weights ----------------
       Reader.LoadTensorFlat(Config.Prefix + 'embeddings.weight', Tmp);
-      if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+      if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
         ImportError('Mamba import: embeddings.weight element count ' +
           IntToStr(Tmp.Size) + ' does not match the embedding table ' +
-          'size ' + IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
-      EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+          'size ' + IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+      EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
       EmbeddingLayer.FlushWeightCache();
       MarkConsumed(Config.Prefix + 'embeddings.weight');
       if Config.TieWordEmbeddings then
@@ -37791,9 +37791,9 @@ begin
         for j := 0 to Config.VocabSize - 1 do
         begin
           for i := 0 to Config.HiddenSize - 1 do
-            LMHead.Neurons[j].Weights.FData[i] :=
+            LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.HiddenSize + i];
-          LMHead.Neurons[j].BiasWeight := 0;
+          LMHead.FArrNeurons[j].BiasWeight := 0;
         end;
         LMHead.FlushWeightCache();
         if Reader.HasTensor('lm_head.weight') then
@@ -37914,13 +37914,13 @@ var
       B.ReSize(OutDim, 1, 1);
       for jj := 0 to OutDim - 1 do
       begin
-        if Layer.Neurons[jj].Weights.Size <> InDim then
+        if Layer.FArrNeurons[jj].Weights.Size <> InDim then
           ImportError('Mamba export: neuron ' + IntToStr(jj) + ' for "' +
-            WName + '" has ' + IntToStr(Layer.Neurons[jj].Weights.Size) +
+            WName + '" has ' + IntToStr(Layer.FArrNeurons[jj].Weights.Size) +
             ' weights, expected ' + IntToStr(InDim) + '.');
         for ii := 0 to InDim - 1 do
-          W.FData[jj * InDim + ii] := Layer.Neurons[jj].Weights.FData[ii];
-        B.FData[jj] := Layer.Neurons[jj].BiasWeight;
+          W.FData[jj * InDim + ii] := Layer.FArrNeurons[jj].Weights.FData[ii];
+        B.FData[jj] := Layer.FArrNeurons[jj].BiasWeight;
       end;
       Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
       if BName <> '' then Writer.AddTensorFlat(BName, [OutDim], B, pDType);
@@ -37947,8 +37947,8 @@ var
       begin
         for kk := 0 to Config.ConvKernel - 1 do
           W.FData[dd * Config.ConvKernel + kk] :=
-            Layer.Neurons[dd].Weights.FData[kk];
-        B.FData[dd] := Layer.Neurons[dd].BiasWeight;
+            Layer.FArrNeurons[dd].Weights.FData[kk];
+        B.FData[dd] := Layer.FArrNeurons[dd].BiasWeight;
       end;
       Writer.AddTensorFlat(WName, [DI, 1, Config.ConvKernel], W, pDType);
       if Config.UseConvBias then
@@ -37963,10 +37963,10 @@ var
   // the inverse of LoadLlamaRMSNormWeights.
   procedure DumpRMSNorm(Layer: TNNetLayer; const WName: string);
   begin
-    if Layer.Neurons[0].Weights.Size <> d then
+    if Layer.FArrNeurons[0].Weights.Size <> d then
       ImportError('Mamba export: RMSNorm "' + WName + '" gain size ' +
-        IntToStr(Layer.Neurons[0].Weights.Size) + ' <> ' + IntToStr(d) + '.');
-    Writer.AddTensorFlat(WName, [d], Layer.Neurons[0].Weights, pDType);
+        IntToStr(Layer.FArrNeurons[0].Weights.Size) + ' <> ' + IntToStr(d) + '.');
+    Writer.AddTensorFlat(WName, [d], Layer.FArrNeurons[0].Weights, pDType);
   end;
 
   // The selective-scan bundle (inverse of LoadScanWeights). W_B/W_C/b_d/A_log/D
@@ -37994,7 +37994,7 @@ var
       begin
         SetLength(Wd[a], DI);
         for b := 0 to DI - 1 do
-          Wd[a][b] := Layer.Neurons[0].Weights.FData[a * DI + b];
+          Wd[a][b] := Layer.FArrNeurons[0].Weights.FData[a * DI + b];
       end;
       SetLength(L, DI);
       for a := 0 to DI - 1 do
@@ -38053,9 +38053,9 @@ var
         for b := 0 to DI - 1 do
         begin
           XW.FData[(RK + s) * DI + b] :=
-            Layer.Neurons[1].Weights.FData[s * DI + b];       // W_B
+            Layer.FArrNeurons[1].Weights.FData[s * DI + b];       // W_B
           XW.FData[(RK + NS + s) * DI + b] :=
-            Layer.Neurons[2].Weights.FData[s * DI + b];       // W_C
+            Layer.FArrNeurons[2].Weights.FData[s * DI + b];       // W_C
         end;
       Writer.AddTensorFlat(MixP + 'x_proj.weight', [RK + 2 * NS, DI],
         XW, pDType);
@@ -38067,16 +38067,16 @@ var
       Writer.AddTensorFlat(MixP + 'dt_proj.weight', [DI, RK], DtW, pDType);
       // ---- dt_proj.bias = b_d (Neurons[3]) ----
       Vec.ReSize(DI, 1, 1);
-      for a := 0 to DI - 1 do Vec.FData[a] := Layer.Neurons[3].Weights.FData[a];
+      for a := 0 to DI - 1 do Vec.FData[a] := Layer.FArrNeurons[3].Weights.FData[a];
       Writer.AddTensorFlat(MixP + 'dt_proj.bias', [DI], Vec, pDType);
       // ---- A_log = A_raw RAW (Neurons[4], [DI, NS]) ----
       Vec.ReSize(DI * NS, 1, 1);
       for a := 0 to DI * NS - 1 do
-        Vec.FData[a] := Layer.Neurons[4].Weights.FData[a];
+        Vec.FData[a] := Layer.FArrNeurons[4].Weights.FData[a];
       Writer.AddTensorFlat(MixP + 'A_log', [DI, NS], Vec, pDType);
       // ---- D = e (Neurons[5], [DI]) ----
       Vec.ReSize(DI, 1, 1);
-      for a := 0 to DI - 1 do Vec.FData[a] := Layer.Neurons[5].Weights.FData[a];
+      for a := 0 to DI - 1 do Vec.FData[a] := Layer.FArrNeurons[5].Weights.FData[a];
       Writer.AddTensorFlat(MixP + 'D', [DI], Vec, pDType);
     finally
       Vec.Free;
@@ -38150,12 +38150,12 @@ begin
     Writer.SetMetadata('format', 'pt');
     Writer.SetMetadata('exporter', 'cai-neural-api/mamba');
     // ---- embeddings ----
-    if EmbIn.Neurons[0].Weights.Size <> Config.VocabSize * d then
+    if EmbIn.FArrNeurons[0].Weights.Size <> Config.VocabSize * d then
       ImportError('Mamba export: embeddings size ' +
-        IntToStr(EmbIn.Neurons[0].Weights.Size) + ' <> vocab*hidden = ' +
+        IntToStr(EmbIn.FArrNeurons[0].Weights.Size) + ' <> vocab*hidden = ' +
         IntToStr(Config.VocabSize * d) + '.');
     Writer.AddTensorFlat(Config.Prefix + 'embeddings.weight',
-      [Config.VocabSize, d], EmbIn.Neurons[0].Weights, pDType);
+      [Config.VocabSize, d], EmbIn.FArrNeurons[0].Weights, pDType);
     // ---- mixer blocks ----
     for BlockCnt := 0 to Config.NumLayers - 1 do
     begin
@@ -38215,12 +38215,12 @@ var
       W.ReSize(OutDim * InDim, 1, 1);
       for jj := 0 to OutDim - 1 do
       begin
-        if Layer.Neurons[jj].Weights.Size <> InDim then
+        if Layer.FArrNeurons[jj].Weights.Size <> InDim then
           ImportError('RWKV export: neuron ' + IntToStr(jj) + ' for "' +
-            WName + '" has ' + IntToStr(Layer.Neurons[jj].Weights.Size) +
+            WName + '" has ' + IntToStr(Layer.FArrNeurons[jj].Weights.Size) +
             ' weights, expected ' + IntToStr(InDim) + '.');
         for ii := 0 to InDim - 1 do
-          W.FData[jj * InDim + ii] := Layer.Neurons[jj].Weights.FData[ii];
+          W.FData[jj * InDim + ii] := Layer.FArrNeurons[jj].Weights.FData[ii];
       end;
       Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
     finally
@@ -38236,10 +38236,10 @@ var
     G, B: TNNetVolume;
     ii: integer;
   begin
-    if (Layer.Neurons[0].Weights.Size <> Chan) or
-       (Layer.Neurons[1].Weights.Size <> Chan) then
+    if (Layer.FArrNeurons[0].Weights.Size <> Chan) or
+       (Layer.FArrNeurons[1].Weights.Size <> Chan) then
       ImportError('RWKV export: LayerNorm "' + WName + '" gain/bias size ' +
-        IntToStr(Layer.Neurons[0].Weights.Size) + ' <> ' + IntToStr(Chan) +
+        IntToStr(Layer.FArrNeurons[0].Weights.Size) + ' <> ' + IntToStr(Chan) +
         '.');
     G := TNNetVolume.Create;
     B := TNNetVolume.Create;
@@ -38248,8 +38248,8 @@ var
       B.ReSize(Chan, 1, 1);
       for ii := 0 to Chan - 1 do
       begin
-        G.FData[ii] := Layer.Neurons[0].Weights.FData[ii];
-        B.FData[ii] := Layer.Neurons[1].Weights.FData[ii];
+        G.FData[ii] := Layer.FArrNeurons[0].Weights.FData[ii];
+        B.FData[ii] := Layer.FArrNeurons[1].Weights.FData[ii];
       end;
       Writer.AddTensorFlat(WName, [Chan], G, pDType);
       Writer.AddTensorFlat(BName, [Chan], B, pDType);
@@ -38267,16 +38267,16 @@ var
     V: TNNetVolume;
     ii: integer;
   begin
-    if Layer.Neurons[NeuronIdx].Weights.Size < Chan then
+    if Layer.FArrNeurons[NeuronIdx].Weights.Size < Chan then
       ImportError('RWKV export: vector "' + TName + '" neuron ' +
         IntToStr(NeuronIdx) + ' has ' +
-        IntToStr(Layer.Neurons[NeuronIdx].Weights.Size) +
+        IntToStr(Layer.FArrNeurons[NeuronIdx].Weights.Size) +
         ' elements, expected >= ' + IntToStr(Chan) + '.');
     V := TNNetVolume.Create;
     try
       V.ReSize(Chan, 1, 1);
       for ii := 0 to Chan - 1 do
-        V.FData[ii] := Layer.Neurons[NeuronIdx].Weights.FData[ii];
+        V.FData[ii] := Layer.FArrNeurons[NeuronIdx].Weights.FData[ii];
       Writer.AddTensorFlat(TName, [1, 1, Chan], V, pDType);
     finally
       V.Free;
@@ -38299,7 +38299,7 @@ var
       V.ReSize(Chan, 1, 1);
       for ii := 0 to Chan - 1 do
       begin
-        wraw := Layer.Neurons[0].Weights.FData[ii];
+        wraw := Layer.FArrNeurons[0].Weights.FData[ii];
         if wraw > 30 then x := wraw                 // softplus(w)=w for big w
         else if wraw < Ln(1e-7) then x := Exp(wraw) // softplus(w)=exp(w) tiny
         else x := Ln(1.0 + Exp(wraw));
@@ -38373,12 +38373,12 @@ begin
     Writer.SetMetadata('format', 'pt');
     Writer.SetMetadata('exporter', 'cai-neural-api/rwkv');
     // ---- embeddings ----
-    if EmbIn.Neurons[0].Weights.Size <> Config.VocabSize * d then
+    if EmbIn.FArrNeurons[0].Weights.Size <> Config.VocabSize * d then
       ImportError('RWKV export: embeddings size ' +
-        IntToStr(EmbIn.Neurons[0].Weights.Size) + ' <> vocab*hidden = ' +
+        IntToStr(EmbIn.FArrNeurons[0].Weights.Size) + ' <> vocab*hidden = ' +
         IntToStr(Config.VocabSize * d) + '.');
     Writer.AddTensorFlat(Config.Prefix + 'embeddings.weight',
-      [Config.VocabSize, d], EmbIn.Neurons[0].Weights, pDType);
+      [Config.VocabSize, d], EmbIn.FArrNeurons[0].Weights, pDType);
     // ---- block-0 embedding LayerNorm (ln0 / HF pre_ln) ----
     DumpLayerNorm(PreLN, Config.Prefix + 'blocks.0.pre_ln.weight',
       Config.Prefix + 'blocks.0.pre_ln.bias', d);
@@ -38574,7 +38574,7 @@ var
         IntToStr(Channels) + ' elements, got ' + Reader.ShapeAsString(TName));
     EnsureWritableImportWeights(Layer);
     for d := 0 to Channels - 1 do
-      Layer.Neurons[NeuronIdx].Weights.FData[d] := Tmp.FData[d];
+      Layer.FArrNeurons[NeuronIdx].Weights.FData[d] := Tmp.FData[d];
     Layer.FlushWeightCache();
     MarkConsumed(TName);
   end;
@@ -38598,7 +38598,7 @@ var
     EnsureWritableImportWeights(Layer);
     for d := 0 to ConvDim - 1 do
       for kk := 0 to Config.ConvKernel - 1 do
-        Layer.Neurons[d].Weights.FData[kk] :=
+        Layer.FArrNeurons[d].Weights.FData[kk] :=
           Tmp.FData[d * Config.ConvKernel + kk];
     MarkConsumed(WName);
     if Config.UseConvBias then
@@ -38611,7 +38611,7 @@ var
         ImportError('Mamba2 import: "' + BName + '" must carry ' +
           IntToStr(ConvDim) + ' elements.');
       for d := 0 to ConvDim - 1 do
-        Layer.Neurons[d].BiasWeight := Tmp.FData[d];
+        Layer.FArrNeurons[d].BiasWeight := Tmp.FData[d];
       MarkConsumed(BName);
     end;
     Layer.FlushWeightCache();
@@ -38705,7 +38705,7 @@ begin
 
       // ---------------- Weights ----------------
       Reader.LoadTensorFlat(Config.Prefix + 'embeddings.weight', Tmp);
-      EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+      EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
       EmbeddingLayer.FlushWeightCache();
       MarkConsumed(Config.Prefix + 'embeddings.weight');
       if Config.TieWordEmbeddings then
@@ -38714,9 +38714,9 @@ begin
         for j := 0 to Config.VocabSize - 1 do
         begin
           for i := 0 to Config.HiddenSize - 1 do
-            LMHead.Neurons[j].Weights.FData[i] :=
+            LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.HiddenSize + i];
-          LMHead.Neurons[j].BiasWeight := 0;
+          LMHead.FArrNeurons[j].BiasWeight := 0;
         end;
         LMHead.FlushWeightCache();
         if Reader.HasTensor('lm_head.weight') then
@@ -39008,12 +39008,12 @@ var
     Reader.LoadTensorFlat(WName, Tmp);
     for dd := 0 to Config.LruWidth - 1 do
       for kk := 0 to Config.ConvKernel - 1 do
-        Layer.Neurons[dd].Weights.FData[kk] :=
+        Layer.FArrNeurons[dd].Weights.FData[kk] :=
           Tmp.FData[dd * Config.ConvKernel + kk];
     MarkConsumed(WName);
     Reader.LoadTensorFlat(BName, Tmp);
     for dd := 0 to Config.LruWidth - 1 do
-      Layer.Neurons[dd].BiasWeight := Tmp.FData[dd];
+      Layer.FArrNeurons[dd].BiasWeight := Tmp.FData[dd];
     MarkConsumed(BName);
     Layer.FlushWeightCache();
   end;
@@ -39046,15 +39046,15 @@ var
         for co := 0 to BlockWidth - 1 do
         begin
           outCh := h * BlockWidth + co;
-          Layer.Neurons[outCh].Weights.Fill(0);
+          Layer.FArrNeurons[outCh].Weights.Fill(0);
           for ci := 0 to BlockWidth - 1 do
           begin
             inCh := h * BlockWidth + ci;
             // W[h, ci, co]
-            Layer.Neurons[outCh].Weights.FData[inCh] :=
+            Layer.FArrNeurons[outCh].Weights.FData[inCh] :=
               Wt.FData[(h * BlockWidth + ci) * BlockWidth + co];
           end;
-          Layer.Neurons[outCh].BiasWeight :=
+          Layer.FArrNeurons[outCh].BiasWeight :=
             Bt.FData[h * BlockWidth + co];
         end;
     finally
@@ -39244,13 +39244,13 @@ begin
       for j := 0 to Config.VocabSize - 1 do
       begin
         for i := 0 to Config.HiddenSize - 1 do
-          LMHead.Neurons[j].Weights.FData[i] :=
+          LMHead.FArrNeurons[j].Weights.FData[i] :=
             Tmp.FData[j * Config.HiddenSize + i];
-        LMHead.Neurons[j].BiasWeight := 0;
+        LMHead.FArrNeurons[j].BiasWeight := 0;
       end;
       LMHead.FlushWeightCache();
-      EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
-      EmbeddingLayer.Neurons[0].Weights.Mul(Sqrt(Config.HiddenSize));
+      EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
+      EmbeddingLayer.FArrNeurons[0].Weights.Mul(Sqrt(Config.HiddenSize));
       EmbeddingLayer.FlushWeightCache();
       MarkConsumed(Config.Prefix + 'embed_tokens.weight');
       if Reader.HasTensor('lm_head.weight') then MarkConsumed('lm_head.weight');
@@ -39288,7 +39288,7 @@ begin
           // recurrent_param -> Lambda (raw copy; the layer applies softplus).
           Reader.LoadTensorFlat(MixP + 'rg_lru.recurrent_param', Tmp);
           for d := 0 to Config.LruWidth - 1 do
-            Blocks[BlockCnt].RGLRU.Neurons[0].Weights.FData[d] := Tmp.FData[d];
+            Blocks[BlockCnt].RGLRU.FArrNeurons[0].Weights.FData[d] := Tmp.FData[d];
           Blocks[BlockCnt].RGLRU.FlushWeightCache();
           MarkConsumed(MixP + 'rg_lru.recurrent_param');
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].LinearOut,
@@ -39578,14 +39578,14 @@ var
     Reader.LoadTensorFlat(WName, Tmp);
     for dd := 0 to Config.DInner - 1 do
       for kk := 0 to Config.MambaDConv - 1 do
-        Layer.Neurons[dd].Weights.FData[kk] :=
+        Layer.FArrNeurons[dd].Weights.FData[kk] :=
           Tmp.FData[dd * Config.MambaDConv + kk];
     MarkConsumed(WName);
     if Config.MambaConvBias then
     begin
       Reader.LoadTensorFlat(BName, Tmp);
       for dd := 0 to Config.DInner - 1 do
-        Layer.Neurons[dd].BiasWeight := Tmp.FData[dd];
+        Layer.FArrNeurons[dd].BiasWeight := Tmp.FData[dd];
       MarkConsumed(BName);
     end;
     Layer.FlushWeightCache();
@@ -39600,7 +39600,7 @@ var
       ImportError('Jamba import: "' + TName + '" must carry ' +
         IntToStr(Cnt) + ' elements, got ' + Reader.ShapeAsString(TName));
     for dd := 0 to Cnt - 1 do
-      Layer.Neurons[NeuronIdx].Weights.FData[dd] := Tmp.FData[dd];
+      Layer.FArrNeurons[NeuronIdx].Weights.FData[dd] := Tmp.FData[dd];
     Layer.FlushWeightCache();
     MarkConsumed(TName);
   end;
@@ -39626,16 +39626,16 @@ var
     // [0] dt_proj.weight (DI rows of RK), [6] x_proj_dt (RK rows of DI).
     for d := 0 to DI - 1 do
       for r := 0 to RK - 1 do
-        Layer.Neurons[0].Weights.FData[d * RK + r] := DtW.FData[d * RK + r];
+        Layer.FArrNeurons[0].Weights.FData[d * RK + r] := DtW.FData[d * RK + r];
     for r := 0 to RK - 1 do
       for j := 0 to DI - 1 do
-        Layer.Neurons[6].Weights.FData[r * DI + j] := XW.FData[r * DI + j];
+        Layer.FArrNeurons[6].Weights.FData[r * DI + j] := XW.FData[r * DI + j];
     // W_B / W_C: the d_state + d_state rows after the dt rows.
     for s := 0 to NS - 1 do
       for j := 0 to DI - 1 do
       begin
-        Layer.Neurons[1].Weights.FData[s * DI + j] := XW.FData[(RK + s) * DI + j];
-        Layer.Neurons[2].Weights.FData[s * DI + j] := XW.FData[(RK + NS + s) * DI + j];
+        Layer.FArrNeurons[1].Weights.FData[s * DI + j] := XW.FData[(RK + s) * DI + j];
+        Layer.FArrNeurons[2].Weights.FData[s * DI + j] := XW.FData[(RK + NS + s) * DI + j];
       end;
     MarkConsumed(MixPfx + 'x_proj.weight');
     MarkConsumed(MixPfx + 'dt_proj.weight');
@@ -39810,9 +39810,9 @@ begin
 
       // ---------------- Weights ----------------
       Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
-      if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+      if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
         ImportError('Jamba import: embed_tokens.weight size mismatch.');
-      EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+      EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
       EmbeddingLayer.FlushWeightCache();
       MarkConsumed(Config.Prefix + 'embed_tokens.weight');
       if Config.TieWordEmbeddings then
@@ -39821,9 +39821,9 @@ begin
         for j := 0 to Config.VocabSize - 1 do
         begin
           for i := 0 to Config.HiddenSize - 1 do
-            LMHead.Neurons[j].Weights.FData[i] :=
+            LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.HiddenSize + i];
-          LMHead.Neurons[j].BiasWeight := 0;
+          LMHead.FArrNeurons[j].BiasWeight := 0;
         end;
         LMHead.FlushWeightCache();
         if Reader.HasTensor('lm_head.weight') then MarkConsumed('lm_head.weight');
@@ -40250,7 +40250,7 @@ var
         IntToStr(Channels) + ' elements, got ' + Reader.ShapeAsString(TName));
     EnsureWritableImportWeights(Layer);
     for dd := 0 to Channels - 1 do
-      Layer.Neurons[NeuronIdx].Weights.FData[dd] := Tmp.FData[dd];
+      Layer.FArrNeurons[NeuronIdx].Weights.FData[dd] := Tmp.FData[dd];
     Layer.FlushWeightCache();
     MarkConsumed(TName);
   end;
@@ -40271,7 +40271,7 @@ var
     EnsureWritableImportWeights(Layer);
     for dd := 0 to ConvDim - 1 do
       for kk := 0 to Config.ConvKernel - 1 do
-        Layer.Neurons[dd].Weights.FData[kk] :=
+        Layer.FArrNeurons[dd].Weights.FData[kk] :=
           Tmp.FData[dd * Config.ConvKernel + kk];
     MarkConsumed(WName);
     if Config.UseConvBias then
@@ -40284,7 +40284,7 @@ var
         ImportError('Nemotron-H import: "' + BName + '" must carry ' +
           IntToStr(ConvDim) + ' elements.');
       for dd := 0 to ConvDim - 1 do
-        Layer.Neurons[dd].BiasWeight := Tmp.FData[dd];
+        Layer.FArrNeurons[dd].BiasWeight := Tmp.FData[dd];
       MarkConsumed(BName);
     end;
     Layer.FlushWeightCache();
@@ -40312,9 +40312,9 @@ var
     for oo := 0 to OutDim - 1 do
     begin
       for ii := 0 to InDim - 1 do
-        Layer.Neurons[oo].Weights.FData[ii] :=
+        Layer.FArrNeurons[oo].Weights.FData[ii] :=
           Tmp.FData[ExpertBase + oo * InDim + ii];
-      Layer.Neurons[oo].BiasWeight := 0;
+      Layer.FArrNeurons[oo].BiasWeight := 0;
     end;
     Layer.FlushWeightCache();
   end;
@@ -40532,7 +40532,7 @@ begin
 
       // ---------------- Weights ----------------
       Reader.LoadTensorFlat(Config.Prefix + 'embeddings.weight', Tmp);
-      EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+      EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
       EmbeddingLayer.FlushWeightCache();
       MarkConsumed(Config.Prefix + 'embeddings.weight');
       if Config.TieWordEmbeddings then
@@ -40541,9 +40541,9 @@ begin
         for j := 0 to Config.VocabSize - 1 do
         begin
           for i := 0 to Config.HiddenSize - 1 do
-            LMHead.Neurons[j].Weights.FData[i] :=
+            LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.HiddenSize + i];
-          LMHead.Neurons[j].BiasWeight := 0;
+          LMHead.FArrNeurons[j].BiasWeight := 0;
         end;
         LMHead.FlushWeightCache();
         if Reader.HasTensor('lm_head.weight') then
@@ -40642,7 +40642,7 @@ begin
               begin
                 EnsureWritableImportWeights(GateTopK);
                 for e := 0 to Config.NumRoutedExperts - 1 do
-                  GateTopK.Neurons[0].Weights.FData[e] := BiasVec.FData[e];
+                  GateTopK.FArrNeurons[0].Weights.FData[e] := BiasVec.FData[e];
                 GateTopK.FlushWeightCache();
               end
               else
@@ -40888,14 +40888,14 @@ begin
       Third := (r mod (3 * HeadDim)) div HeadDim; // 0=q, 1=k, 2=v
       RowInHead := r mod HeadDim;
       TargetIdx := Third * Hidden + HeadIdx * HeadDim + RowInHead;
-      if Layer.Neurons[TargetIdx].Weights.Size <> Hidden then
+      if Layer.FArrNeurons[TargetIdx].Weights.Size <> Hidden then
         ImportError('BLOOM import: internal error - neuron ' +
           IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
-          IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+          IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
           ' weights, expected ' + IntToStr(Hidden) + '.');
       for i := 0 to Hidden - 1 do
-        Layer.Neurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
-      Layer.Neurons[TargetIdx].BiasWeight := B.FData[r];
+        Layer.FArrNeurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
+      Layer.FArrNeurons[TargetIdx].BiasWeight := B.FData[r];
     end;
   finally
     B.Free;
@@ -41052,20 +41052,20 @@ begin
         // (BloomForCausalLM ships no separate lm_head tensor; logits =
         // h . word_embeddings^T, bias-free).
         Reader.LoadTensorFlat(Config.Prefix + 'word_embeddings.weight', Tmp);
-        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('BLOOM import: word_embeddings.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
-            'size ' + IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
-        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+            'size ' + IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+        EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'word_embeddings.weight');
         EnsureWritableImportWeights(LMHead);
         for j := 0 to Config.VocabSize - 1 do
         begin
           for i := 0 to Config.HiddenSize - 1 do
-            LMHead.Neurons[j].Weights.FData[i] :=
+            LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.HiddenSize + i];
-          LMHead.Neurons[j].BiasWeight := 0;
+          LMHead.FArrNeurons[j].BiasWeight := 0;
         end;
         LMHead.FlushWeightCache();
         if Reader.HasTensor('lm_head.weight') then
@@ -41417,14 +41417,14 @@ begin
       else
         TargetIdx := QWidth + KVWidth + HeadIdx * HeadDim + TargetRow;
       end;
-      if Layer.Neurons[TargetIdx].Weights.Size <> Hidden then
+      if Layer.FArrNeurons[TargetIdx].Weights.Size <> Hidden then
         ImportError('Falcon import: internal error - neuron ' +
           IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
-          IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+          IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
           ' weights, expected ' + IntToStr(Hidden) + '.');
       for i := 0 to Hidden - 1 do
-        Layer.Neurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
-      Layer.Neurons[TargetIdx].BiasWeight := 0;
+        Layer.FArrNeurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
+      Layer.FArrNeurons[TargetIdx].BiasWeight := 0;
     end;
   finally
     W.Free;
@@ -41655,11 +41655,11 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat(Config.Prefix + 'word_embeddings.weight', Tmp);
-        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('Falcon import: word_embeddings.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
-            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
-        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+            IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+        EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'word_embeddings.weight');
         if Config.TieWordEmbeddings then
@@ -41668,9 +41668,9 @@ begin
           for j := 0 to Config.VocabSize - 1 do
           begin
             for i := 0 to Config.HiddenSize - 1 do
-              LMHead.Neurons[j].Weights.FData[i] :=
+              LMHead.FArrNeurons[j].Weights.FData[i] :=
                 Tmp.FData[j * Config.HiddenSize + i];
-            LMHead.Neurons[j].BiasWeight := 0;
+            LMHead.FArrNeurons[j].BiasWeight := 0;
           end;
           LMHead.FlushWeightCache();
           if Reader.HasTensor('lm_head.weight') then
@@ -41990,17 +41990,17 @@ begin
       end
       else
         TargetIdx := r; // v: straight
-      if Layer.Neurons[TargetIdx].Weights.Size <> Hidden then
+      if Layer.FArrNeurons[TargetIdx].Weights.Size <> Hidden then
         ImportError('ModernBERT import: internal error - neuron ' +
           IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
-          IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+          IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
           ' weights, expected ' + IntToStr(Hidden) + '.');
       for i := 0 to Hidden - 1 do
-        Layer.Neurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
+        Layer.FArrNeurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
       if B <> nil then
-        Layer.Neurons[TargetIdx].BiasWeight := B.FData[r]
+        Layer.FArrNeurons[TargetIdx].BiasWeight := B.FData[r]
       else
-        Layer.Neurons[TargetIdx].BiasWeight := 0;
+        Layer.FArrNeurons[TargetIdx].BiasWeight := 0;
     end;
   finally
     B.Free;
@@ -42063,17 +42063,17 @@ begin
         TargetIdx := Intermediate + r
       else
         TargetIdx := r - Intermediate;
-      if Layer.Neurons[TargetIdx].Weights.Size <> Hidden then
+      if Layer.FArrNeurons[TargetIdx].Weights.Size <> Hidden then
         ImportError('ModernBERT import: internal error - neuron ' +
           IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
-          IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+          IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
           ' weights, expected ' + IntToStr(Hidden) + '.');
       for i := 0 to Hidden - 1 do
-        Layer.Neurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
+        Layer.FArrNeurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
       if B <> nil then
-        Layer.Neurons[TargetIdx].BiasWeight := B.FData[r]
+        Layer.FArrNeurons[TargetIdx].BiasWeight := B.FData[r]
       else
-        Layer.Neurons[TargetIdx].BiasWeight := 0;
+        Layer.FArrNeurons[TargetIdx].BiasWeight := 0;
     end;
   finally
     B.Free;
@@ -42103,7 +42103,7 @@ begin
   try
     Reader.LoadTensorFlat(WName, Tmp);
     for i := 0 to d_model - 1 do
-      Layer.Neurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
+      Layer.FArrNeurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
     if HasBias then
     begin
       if not Reader.HasTensor(BName) then
@@ -42114,11 +42114,11 @@ begin
           IntToStr(d_model) + '], got ' + Reader.ShapeAsString(BName));
       Reader.LoadTensorFlat(BName, Tmp);
       for i := 0 to d_model - 1 do
-        Layer.Neurons[1].Weights.FData[i] := Tmp.FData[i]; // beta
+        Layer.FArrNeurons[1].Weights.FData[i] := Tmp.FData[i]; // beta
     end
     else
       for i := 0 to d_model - 1 do
-        Layer.Neurons[1].Weights.FData[i] := 0; // bias-free norm
+        Layer.FArrNeurons[1].Weights.FData[i] := 0; // bias-free norm
   finally
     Tmp.Free;
   end;
@@ -42329,12 +42329,12 @@ begin
       try
         Reader.LoadTensorFlat(
           Config.Prefix + 'embeddings.tok_embeddings.weight', Tmp);
-        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('ModernBERT import: tok_embeddings.weight element ' +
             'count ' + IntToStr(Tmp.Size) + ' does not match the ' +
             'embedding table size ' +
-            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
-        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+            IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+        EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'embeddings.tok_embeddings.weight');
       finally
@@ -42728,15 +42728,15 @@ var
     EnsureWritableImportWeights(Layer);
     for RowCnt := 0 to RowCount - 1 do
     begin
-      if Layer.Neurons[DstBase + RowCnt].Weights.Size <> InDim then
+      if Layer.FArrNeurons[DstBase + RowCnt].Weights.Size <> InDim then
         ImportError('DeepSeek-V2 import: internal error - neuron ' +
           IntToStr(DstBase + RowCnt) + ' has ' +
-          IntToStr(Layer.Neurons[DstBase + RowCnt].Weights.Size) +
+          IntToStr(Layer.FArrNeurons[DstBase + RowCnt].Weights.Size) +
           ' weights, expected ' + IntToStr(InDim) + '.');
       for ColCnt := 0 to InDim - 1 do
-        Layer.Neurons[DstBase + RowCnt].Weights.FData[ColCnt] :=
+        Layer.FArrNeurons[DstBase + RowCnt].Weights.FData[ColCnt] :=
           W.FData[(SrcRowBase + RowCnt) * InDim + ColCnt];
-      Layer.Neurons[DstBase + RowCnt].BiasWeight := 0;
+      Layer.FArrNeurons[DstBase + RowCnt].BiasWeight := 0;
     end;
   end;
 
@@ -42966,12 +42966,12 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
-        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('DeepSeek-V2 import: embed_tokens.weight element ' +
             'count ' + IntToStr(Tmp.Size) + ' does not match the ' +
             'embedding table size ' +
-            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
-        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+            IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+        EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'embed_tokens.weight');
         if Config.TieWordEmbeddings then
@@ -42981,9 +42981,9 @@ begin
           for j := 0 to Config.VocabSize - 1 do
           begin
             for i := 0 to Config.HiddenSize - 1 do
-              LMHead.Neurons[j].Weights.FData[i] :=
+              LMHead.FArrNeurons[j].Weights.FData[i] :=
                 Tmp.FData[j * Config.HiddenSize + i];
-            LMHead.Neurons[j].BiasWeight := 0;
+            LMHead.FArrNeurons[j].BiasWeight := 0;
           end;
           LMHead.FlushWeightCache();
           if Reader.HasTensor(LMHeadName) then MarkConsumed(LMHeadName);
@@ -43347,11 +43347,11 @@ begin
   Tmp := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(TName, Tmp);
-    if Layer.Neurons[0].Weights.Size <> Rows * Cols then
+    if Layer.FArrNeurons[0].Weights.Size <> Rows * Cols then
       ImportError('CLIP import: "' + TName + '" element count ' +
         IntToStr(Rows * Cols) + ' does not match the table size ' +
-        IntToStr(Layer.Neurons[0].Weights.Size) + '.');
-    Layer.Neurons[0].Weights.Copy(Tmp);
+        IntToStr(Layer.FArrNeurons[0].Weights.Size) + '.');
+    Layer.FArrNeurons[0].Weights.Copy(Tmp);
     Layer.FlushWeightCache();
   finally
     Tmp.Free;
@@ -43386,9 +43386,9 @@ begin
     ImportError('CLIP import: internal error - patch conv has ' +
       IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
       IntToStr(Hidden) + '.');
-  if Layer.Neurons[0].Weights.Size <> Patch * Patch * NumChannels then
+  if Layer.FArrNeurons[0].Weights.Size <> Patch * Patch * NumChannels then
     ImportError('CLIP import: internal error - patch conv neuron has ' +
-      IntToStr(Layer.Neurons[0].Weights.Size) + ' weights, expected ' +
+      IntToStr(Layer.FArrNeurons[0].Weights.Size) + ' weights, expected ' +
       IntToStr(Patch * Patch * NumChannels) + '.');
   W := TNNetVolume.Create;
   try
@@ -43398,10 +43398,10 @@ begin
       for ky := 0 to Patch - 1 do
         for kx := 0 to Patch - 1 do
           for c := 0 to NumChannels - 1 do
-            Layer.Neurons[o].Weights.FData[
+            Layer.FArrNeurons[o].Weights.FData[
               (ky * Patch + kx) * NumChannels + c] :=
               W.FData[((o * NumChannels + c) * Patch + ky) * Patch + kx];
-      Layer.Neurons[o].BiasWeight := 0; // bias=False in CLIP's patch conv
+      Layer.FArrNeurons[o].BiasWeight := 0; // bias=False in CLIP's patch conv
     end;
   finally
     W.Free;
@@ -43511,8 +43511,8 @@ begin
           IntToStr(Tower.HiddenSize) + ' elements, got ' +
           IntToStr(Tbl.Size) + '.');
       for ChanCnt := 0 to Tower.HiddenSize - 1 do
-        PosEmb.Neurons[0].Weights.FData[ChanCnt] :=
-          PosEmb.Neurons[0].Weights.FData[ChanCnt] + Tbl.FData[ChanCnt];
+        PosEmb.FArrNeurons[0].Weights.FData[ChanCnt] :=
+          PosEmb.FArrNeurons[0].Weights.FData[ChanCnt] + Tbl.FData[ChanCnt];
       PosEmb.FlushWeightCache();
     finally
       Tbl.Free;
@@ -44268,7 +44268,7 @@ begin
         ImportError('BLIP import: patch_embedding.bias must have ' +
           IntToStr(d) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
       for ci := 0 to d - 1 do
-        PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+        PatchConv.FArrNeurons[ci].BiasWeight := Tmp.FData[ci];
       PatchConv.FlushWeightCache();
     finally
       Tmp.Free;
@@ -44285,7 +44285,7 @@ begin
         ImportError('BLIP import: position_embedding must have ' +
           IntToStr((NumPatches + 1) * d) + ' elements, got ' +
           IntToStr(Tmp.Size) + '.');
-      PosEmb.Neurons[0].Weights.Copy(Tmp);
+      PosEmb.FArrNeurons[0].Weights.Copy(Tmp);
       PosEmb.FlushWeightCache();
     finally
       Tmp.Free;
@@ -44301,8 +44301,8 @@ begin
         ImportError('BLIP import: class_embedding must have ' +
           IntToStr(d) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
       for ci := 0 to d - 1 do
-        PosEmb.Neurons[0].Weights.FData[ci] :=
-          PosEmb.Neurons[0].Weights.FData[ci] + Tmp.FData[ci];
+        PosEmb.FArrNeurons[0].Weights.FData[ci] :=
+          PosEmb.FArrNeurons[0].Weights.FData[ci] + Tmp.FData[ci];
       PosEmb.FlushWeightCache();
     finally
       Tmp.Free;
@@ -44495,13 +44495,13 @@ begin
           'text_decoder.bert.embeddings.word_embeddings.weight', Tmp);
         if Tmp.Size <> Config.VocabSize * d then
           ImportError('BLIP import: word_embeddings size mismatch.');
-        WordEmb.Neurons[0].Weights.Copy(Tmp);
+        WordEmb.FArrNeurons[0].Weights.Copy(Tmp);
         WordEmb.FlushWeightCache();
         Reader.LoadTensorFlat(
           'text_decoder.bert.embeddings.position_embeddings.weight', Tmp);
         if Tmp.Size <> Config.MaxPositions * d then
           ImportError('BLIP import: position_embeddings size mismatch.');
-        PosEmb.Neurons[0].Weights.Copy(Tmp);
+        PosEmb.FArrNeurons[0].Weights.Copy(Tmp);
         PosEmb.FlushWeightCache();
       finally
         Tmp.Free;
@@ -44895,7 +44895,7 @@ begin
           IntToStr(Tower.HiddenSize) + ' elements, got ' +
           IntToStr(Tmp.Size) + '.');
       for ci := 0 to Tower.HiddenSize - 1 do
-        PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+        PatchConv.FArrNeurons[ci].BiasWeight := Tmp.FData[ci];
       PatchConv.FlushWeightCache();
       Consumed.Add('encoder.embeddings.patch_embeddings.projection.bias');
       // position_embeddings [1, num_patches+2, hidden] -> the table.
@@ -44907,7 +44907,7 @@ begin
         ImportError('TrOCR import: position_embeddings must have ' +
           IntToStr(NumTokens * Tower.HiddenSize) + ' elements, got ' +
           IntToStr(Tmp.Size) + '.');
-      PosEmb.Neurons[0].Weights.Copy(Tmp);
+      PosEmb.FArrNeurons[0].Weights.Copy(Tmp);
       PosEmb.FlushWeightCache();
       Consumed.Add('encoder.embeddings.position_embeddings');
       // cls_token [1,1,hidden] folded into position row 0.
@@ -44920,8 +44920,8 @@ begin
           IntToStr(Tower.HiddenSize) + ' elements, got ' +
           IntToStr(Tmp.Size) + '.');
       for ci := 0 to Tower.HiddenSize - 1 do
-        PosEmb.Neurons[0].Weights.FData[ci] :=
-          PosEmb.Neurons[0].Weights.FData[ci] + Tmp.FData[ci];
+        PosEmb.FArrNeurons[0].Weights.FData[ci] :=
+          PosEmb.FArrNeurons[0].Weights.FData[ci] + Tmp.FData[ci];
       Consumed.Add('encoder.embeddings.cls_token');
       // distillation_token [1,1,hidden] folded into position row 1.
       if not Reader.HasTensor('encoder.embeddings.distillation_token') then
@@ -44933,8 +44933,8 @@ begin
           IntToStr(Tower.HiddenSize) + ' elements, got ' +
           IntToStr(Tmp.Size) + '.');
       for ci := 0 to Tower.HiddenSize - 1 do
-        PosEmb.Neurons[0].Weights.FData[Tower.HiddenSize + ci] :=
-          PosEmb.Neurons[0].Weights.FData[Tower.HiddenSize + ci] +
+        PosEmb.FArrNeurons[0].Weights.FData[Tower.HiddenSize + ci] :=
+          PosEmb.FArrNeurons[0].Weights.FData[Tower.HiddenSize + ci] +
           Tmp.FData[ci];
       PosEmb.FlushWeightCache();
       Consumed.Add('encoder.embeddings.distillation_token');
@@ -45062,7 +45062,7 @@ begin
         if Config.ScaleEmbedding then EmbedScale := Sqrt(Config.DModel)
         else EmbedScale := 1.0;
         for i := 0 to Tmp.Size - 1 do
-          DecEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
         DecEmbed.FlushWeightCache();
         Consumed.Add('decoder.model.decoder.embed_tokens.weight');
         // Tied head: logits = h . embed_tokens^T, NO final_logits_bias.
@@ -45070,9 +45070,9 @@ begin
         for j := 0 to Config.VocabSize - 1 do
         begin
           for i := 0 to Config.DModel - 1 do
-            LMHead.Neurons[j].Weights.FData[i] :=
+            LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.DModel + i];
-          LMHead.Neurons[j].BiasWeight := 0;
+          LMHead.FArrNeurons[j].BiasWeight := 0;
         end;
         LMHead.FlushWeightCache();
         // output_projection aliases embed_tokens (tie_word_embeddings); some
@@ -45093,7 +45093,7 @@ begin
             ' elements, got ' + IntToStr(Tmp.Size) + '.');
         for PosCnt := 0 to SeqLen - 1 do
           for ElementCnt := 0 to Config.DModel - 1 do
-            DecPos.Neurons[0].Weights.FData[PosCnt * Config.DModel +
+            DecPos.FArrNeurons[0].Weights.FData[PosCnt * Config.DModel +
               ElementCnt] := Tmp.FData[(PosCnt + TrOCRPosOffset) *
                 Config.DModel + ElementCnt];
         DecPos.FlushWeightCache();
@@ -45749,7 +45749,7 @@ begin
       try
         Reader.LoadTensorFlat(PatchBiasName, Tmp);
         for ci := 0 to d - 1 do
-          PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+          PatchConv.FArrNeurons[ci].BiasWeight := Tmp.FData[ci];
         PatchConv.FlushWeightCache();
       finally
         Tmp.Free;
@@ -45777,7 +45777,7 @@ begin
           ImportError('SigLIP import: "' + Prefix + 'head.probe" must have ' +
             IntToStr(d) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
         for ci := 0 to d - 1 do
-          Probe.Neurons[0].Weights.FData[ci] := Tmp.FData[ci];
+          Probe.FArrNeurons[0].Weights.FData[ci] := Tmp.FData[ci];
         Probe.FlushWeightCache();
       finally
         Tmp.Free;
@@ -46179,7 +46179,7 @@ begin
     try
       Reader.LoadTensorFlat(PatchBiasName, Tmp);
       for ci := 0 to d - 1 do
-        PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+        PatchConv.FArrNeurons[ci].BiasWeight := Tmp.FData[ci];
       PatchConv.FlushWeightCache();
     finally
       Tmp.Free;
@@ -46198,7 +46198,7 @@ begin
         ImportError('ViT import: "vit.embeddings.position_embeddings" must ' +
           'have ' + IntToStr((NumPatches + 1) * d) + ' elements, got ' +
           IntToStr(Tmp.Size) + '.');
-      PosEmb.Neurons[0].Weights.Copy(Tmp);
+      PosEmb.FArrNeurons[0].Weights.Copy(Tmp);
       PosEmb.FlushWeightCache();
     finally
       Tmp.Free;
@@ -46213,8 +46213,8 @@ begin
         ImportError('ViT import: "vit.embeddings.cls_token" must have ' +
           IntToStr(d) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
       for ci := 0 to d - 1 do
-        PosEmb.Neurons[0].Weights.FData[ci] :=
-          PosEmb.Neurons[0].Weights.FData[ci] + Tmp.FData[ci];
+        PosEmb.FArrNeurons[0].Weights.FData[ci] :=
+          PosEmb.FArrNeurons[0].Weights.FData[ci] + Tmp.FData[ci];
       PosEmb.FlushWeightCache();
     finally
       Tmp.Free;
@@ -46427,9 +46427,9 @@ begin
     ImportError('ResNet import: internal error - conv "' + ConvWName +
       '" target has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
       IntToStr(OutCh) + '.');
-  if Layer.Neurons[0].Weights.Size <> K * K * InCh then
+  if Layer.FArrNeurons[0].Weights.Size <> K * K * InCh then
     ImportError('ResNet import: internal error - conv "' + ConvWName +
-      '" target neuron has ' + IntToStr(Layer.Neurons[0].Weights.Size) +
+      '" target neuron has ' + IntToStr(Layer.FArrNeurons[0].Weights.Size) +
       ' weights, expected ' + IntToStr(K * K * InCh) + '.');
   W := TNNetVolume.Create;
   Gamma := TNNetVolume.Create;
@@ -46469,9 +46469,9 @@ begin
       for ky := 0 to K - 1 do
         for kx := 0 to K - 1 do
           for c := 0 to InCh - 1 do
-            Layer.Neurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
+            Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
               W.FData[((o * InCh + c) * K + ky) * K + kx] * Scale;
-      Layer.Neurons[o].BiasWeight := Shift;
+      Layer.FArrNeurons[o].BiasWeight := Shift;
     end;
     Layer.FlushWeightCache();
   finally
@@ -46821,9 +46821,9 @@ begin
       for ky := 0 to K - 1 do
         for kx := 0 to K - 1 do
           for c := 0 to InCh - 1 do
-            Layer.Neurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
+            Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
               W.FData[((o * InCh + c) * K + ky) * K + kx];
-      Layer.Neurons[o].BiasWeight := B.FData[o];
+      Layer.FArrNeurons[o].BiasWeight := B.FData[o];
     end;
     Layer.FlushWeightCache();
   finally
@@ -46857,9 +46857,9 @@ begin
     ImportError('ConvNeXt import: internal error - depthwise "' + WName +
       '" target must have exactly 1 neuron (multiplier 1), got ' +
       IntToStr(Layer.Neurons.Count) + '.');
-  if Layer.Neurons[0].Weights.Size <> K * K * Ch then
+  if Layer.FArrNeurons[0].Weights.Size <> K * K * Ch then
     ImportError('ConvNeXt import: internal error - depthwise "' + WName +
-      '" neuron has ' + IntToStr(Layer.Neurons[0].Weights.Size) +
+      '" neuron has ' + IntToStr(Layer.FArrNeurons[0].Weights.Size) +
       ' weights, expected ' + IntToStr(K * K * Ch) + '.');
   W := TNNetVolume.Create;
   B := TNNetVolume.Create;
@@ -46872,14 +46872,14 @@ begin
     for c := 0 to Ch - 1 do
       for ky := 0 to K - 1 do
         for kx := 0 to K - 1 do
-          Layer.Neurons[0].Weights.FData[(ky * K + kx) * Ch + c] :=
+          Layer.FArrNeurons[0].Weights.FData[(ky * K + kx) * Ch + c] :=
             W.FData[((c * 1 + 0) * K + ky) * K + kx];
     // Depthwise bias is per-output-channel; TNNetDepthwiseConv has a single
     // neuron and applies its scalar BiasWeight to every output channel, so the
     // per-channel bias must ride a separate channel-bias layer instead. The
     // caller wires a TNNetChannelBias after the depthwise conv and loads the
     // bias there via LoadConvNeXtChannelVector; here BiasWeight stays 0.
-    Layer.Neurons[0].BiasWeight := 0;
+    Layer.FArrNeurons[0].BiasWeight := 0;
     Layer.FlushWeightCache();
   finally
     W.Free; B.Free;
@@ -46905,13 +46905,13 @@ begin
     if Tmp.Size <> Ch then
       ImportError('ConvNeXt import: "' + Name + '" must flatten to ' +
         IntToStr(Ch) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
-    if Layer.Neurons[NeuronIdx].Weights.Size <> Ch then
+    if Layer.FArrNeurons[NeuronIdx].Weights.Size <> Ch then
       ImportError('ConvNeXt import: internal error - neuron ' +
         IntToStr(NeuronIdx) + ' for "' + Name + '" has ' +
-        IntToStr(Layer.Neurons[NeuronIdx].Weights.Size) +
+        IntToStr(Layer.FArrNeurons[NeuronIdx].Weights.Size) +
         ' weights, expected ' + IntToStr(Ch) + '.');
     for i := 0 to Ch - 1 do
-      Layer.Neurons[NeuronIdx].Weights.FData[i] := Tmp.FData[i];
+      Layer.FArrNeurons[NeuronIdx].Weights.FData[i] := Tmp.FData[i];
     Layer.FlushWeightCache();
   finally
     Tmp.Free;
@@ -47276,9 +47276,9 @@ begin
     for o := 0 to OutCh - 1 do
     begin
       for c := 0 to InCh - 1 do
-        Layer.Neurons[o].Weights.FData[c] := W.FData[o * InCh + c];
-      if BName <> '' then Layer.Neurons[o].BiasWeight := B.FData[o]
-      else Layer.Neurons[o].BiasWeight := 0;
+        Layer.FArrNeurons[o].Weights.FData[c] := W.FData[o * InCh + c];
+      if BName <> '' then Layer.FArrNeurons[o].BiasWeight := B.FData[o]
+      else Layer.FArrNeurons[o].BiasWeight := 0;
     end;
     Layer.FlushWeightCache();
   finally
@@ -47635,8 +47635,8 @@ begin
       for ci := 0 to Config.DecoderHiddenSize - 1 do
       begin
         inv := BNGamma.FData[ci] / Sqrt(BNVar.FData[ci] + 0.00001);
-        BNScale.Neurons[0].Weights.FData[ci] := inv;
-        BNShift.Neurons[0].Weights.FData[ci] :=
+        BNScale.FArrNeurons[0].Weights.FData[ci] := inv;
+        BNShift.FArrNeurons[0].Weights.FData[ci] :=
           BNBeta.FData[ci] - BNMean.FData[ci] * inv;
       end;
       BNScale.FlushWeightCache();
@@ -48059,9 +48059,9 @@ begin
     ImportError('MobileNetV3 import: internal error - depthwise "' +
       ConvWName + '" target has ' + IntToStr(DwLayer.Neurons.Count) +
       ' neurons, expected 1.');
-  if DwLayer.Neurons[0].Weights.Size <> K * K * Channels then
+  if DwLayer.FArrNeurons[0].Weights.Size <> K * K * Channels then
     ImportError('MobileNetV3 import: internal error - depthwise "' +
-      ConvWName + '" neuron has ' + IntToStr(DwLayer.Neurons[0].Weights.Size) +
+      ConvWName + '" neuron has ' + IntToStr(DwLayer.FArrNeurons[0].Weights.Size) +
       ' weights, expected ' + IntToStr(K * K * Channels) + '.');
   W := TNNetVolume.Create;
   Gamma := TNNetVolume.Create;
@@ -48088,7 +48088,7 @@ begin
       // torch [c,0,ky,kx] -> CAI w[(ky*K+kx)*C + c], scaled per channel.
       for ky := 0 to K - 1 do
         for kx := 0 to K - 1 do
-          DwLayer.Neurons[0].Weights.FData[(ky * K + kx) * Channels + c] :=
+          DwLayer.FArrNeurons[0].Weights.FData[(ky * K + kx) * Channels + c] :=
             W.FData[(c * K + ky) * K + kx] * Scale;
     end;
     DwLayer.FlushWeightCache();
@@ -48105,12 +48105,12 @@ var
 begin
   EnsureWritableImportWeights(BiasLayer);
   try
-    if BiasLayer.Neurons[0].Weights.Size <> Shift.Size then
+    if BiasLayer.FArrNeurons[0].Weights.Size <> Shift.Size then
       ImportError('MobileNetV3 import: internal error - ChannelBias has ' +
-        IntToStr(BiasLayer.Neurons[0].Weights.Size) + ' weights, expected ' +
+        IntToStr(BiasLayer.FArrNeurons[0].Weights.Size) + ' weights, expected ' +
         IntToStr(Shift.Size) + '.');
     for c := 0 to Shift.Size - 1 do
-      BiasLayer.Neurons[0].Weights.FData[c] := Shift.FData[c];
+      BiasLayer.FArrNeurons[0].Weights.FData[c] := Shift.FData[c];
     BiasLayer.FlushWeightCache();
   finally
     Shift.Free;
@@ -48136,7 +48136,7 @@ begin
       ImportError('MobileNetV3 import: SE conv bias "' + ConvBName +
         '" must have ' + IntToStr(OutCh) + ' elements.');
     for o := 0 to OutCh - 1 do
-      Layer.Neurons[o].BiasWeight := B.FData[o];
+      Layer.FArrNeurons[o].BiasWeight := B.FData[o];
     Layer.FlushWeightCache();
   finally
     B.Free;
@@ -48878,7 +48878,7 @@ begin
   try
     Reader.LoadTensorFlat(BiasName, Tmp);
     for ci := 0 to EmbedDim - 1 do
-      Layer.Neurons[ci].BiasWeight := Tmp.FData[ci];
+      Layer.FArrNeurons[ci].BiasWeight := Tmp.FData[ci];
     Layer.FlushWeightCache();
   finally
     Tmp.Free;
@@ -49519,10 +49519,10 @@ var
     try
       Reader.LoadTensorFlat(TName, Tmp);
       UsedSize := (Rows - SrcRowOffset) * Cols;
-      if SrcRowOffset = 0 then Layer.Neurons[0].Weights.Copy(Tmp)
+      if SrcRowOffset = 0 then Layer.FArrNeurons[0].Weights.Copy(Tmp)
       else
         for ElementCnt := 0 to UsedSize - 1 do
-          Layer.Neurons[0].Weights.FData[ElementCnt] :=
+          Layer.FArrNeurons[0].Weights.FData[ElementCnt] :=
             Tmp.FData[SrcRowOffset * Cols + ElementCnt];
       Layer.FlushWeightCache();
     finally
@@ -49916,7 +49916,7 @@ begin
       ImportError('VGG import: conv bias "' + BiasName + '" must have ' +
         IntToStr(OutCh) + ' elements, got ' + IntToStr(B.Size) + '.');
     for o := 0 to OutCh - 1 do
-      Layer.Neurons[o].BiasWeight := B.FData[o];
+      Layer.FArrNeurons[o].BiasWeight := B.FData[o];
     Layer.FlushWeightCache();
   finally
     B.Free;
@@ -50315,9 +50315,9 @@ begin
     ImportError('VAE import: internal error - conv "' + WName +
       '" target has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
       IntToStr(OutCh) + '.');
-  if Layer.Neurons[0].Weights.Size <> K * K * InCh then
+  if Layer.FArrNeurons[0].Weights.Size <> K * K * InCh then
     ImportError('VAE import: internal error - conv "' + WName +
-      '" target neuron has ' + IntToStr(Layer.Neurons[0].Weights.Size) +
+      '" target neuron has ' + IntToStr(Layer.FArrNeurons[0].Weights.Size) +
       ' weights, expected ' + IntToStr(K * K * InCh) + '.');
   W := TNNetVolume.Create;
   B := TNNetVolume.Create;
@@ -50337,10 +50337,10 @@ begin
       for ky := 0 to K - 1 do
         for kx := 0 to K - 1 do
           for c := 0 to InCh - 1 do
-            Layer.Neurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
+            Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
               W.FData[((o * InCh + c) * K + ky) * K + kx];
-      if BName <> '' then Layer.Neurons[o].BiasWeight := B.FData[o]
-      else Layer.Neurons[o].BiasWeight := 0;
+      if BName <> '' then Layer.FArrNeurons[o].BiasWeight := B.FData[o]
+      else Layer.FArrNeurons[o].BiasWeight := 0;
     end;
     Layer.FlushWeightCache();
   finally
@@ -52692,9 +52692,9 @@ begin
       begin
         k := pw * P + ph;
         for c := 0 to ReduceDim - 1 do
-          Layer.Neurons[k].Weights.FData[c] :=
+          Layer.FArrNeurons[k].Weights.FData[c] :=
             W.FData[((c * 1 + 0) * P + ph) * P + pw];
-        Layer.Neurons[k].BiasWeight := B.FData[0];
+        Layer.FArrNeurons[k].BiasWeight := B.FData[0];
       end;
   finally
     W.Free;
@@ -52795,8 +52795,8 @@ begin
         Reader.LoadTensorFlat(
           'clip.vision_model.embeddings.class_embedding', Tbl);
         for ChanCnt := 0 to Config.Vision.HiddenSize - 1 do
-          VPosEmb.Neurons[0].Weights.FData[ChanCnt] :=
-            VPosEmb.Neurons[0].Weights.FData[ChanCnt] + Tbl.FData[ChanCnt];
+          VPosEmb.FArrNeurons[0].Weights.FData[ChanCnt] :=
+            VPosEmb.FArrNeurons[0].Weights.FData[ChanCnt] + Tbl.FData[ChanCnt];
         VPosEmb.FlushWeightCache();
       finally
         Tbl.Free;
@@ -53091,9 +53091,9 @@ begin
     for j := 0 to OutDim - 1 do
     begin
       for i := 0 to InDim - 1 do
-        Layer.Neurons[j].Weights.FData[i] := W.FData[j * InDim + i];
-      if BName <> '' then Layer.Neurons[j].BiasWeight := B.FData[j]
-      else Layer.Neurons[j].BiasWeight := 0;
+        Layer.FArrNeurons[j].Weights.FData[i] := W.FData[j * InDim + i];
+      if BName <> '' then Layer.FArrNeurons[j].BiasWeight := B.FData[j]
+      else Layer.FArrNeurons[j].BiasWeight := 0;
     end;
     Layer.FlushWeightCache();
   finally
@@ -53133,9 +53133,9 @@ begin
       for ky := 0 to K - 1 do
         for kx := 0 to K - 1 do
           for c := 0 to InCh - 1 do
-            Layer.Neurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
+            Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
               W.FData[((o * InCh + c) * K + ky) * K + kx];
-    Layer.Neurons[OutCh].Weights.Fill(0);
+    Layer.FArrNeurons[OutCh].Weights.Fill(0);
     if BName <> '' then
     begin
       if not Reader.HasTensor(BName) then
@@ -53144,7 +53144,7 @@ begin
       if B.Size <> OutCh then
         ImportError('StyleGAN2 import: bias "' + BName + '" must have ' +
           IntToStr(OutCh) + ' elements, got ' + IntToStr(B.Size) + '.');
-      for o := 0 to OutCh - 1 do Layer.Neurons[OutCh].Weights.FData[o] := B.FData[o];
+      for o := 0 to OutCh - 1 do Layer.FArrNeurons[OutCh].Weights.FData[o] := B.FData[o];
     end;
     Layer.FlushWeightCache();
   finally
@@ -53281,7 +53281,7 @@ begin
           ImportError('StyleGAN2 import: missing "' + pfx + 'noise_strength".');
         Reader.LoadTensorFlat(pfx + 'noise_strength', NoiseW);
         EnsureWritableImportWeights(Convs[b][c].NoiseScale);
-        Convs[b][c].NoiseScale.Neurons[0].Weights.FData[0] := NoiseW.FData[0];
+        Convs[b][c].NoiseScale.FArrNeurons[0].Weights.FData[0] := NoiseW.FData[0];
         Convs[b][c].NoiseScale.FlushWeightCache();
         // Fixed per-pixel noise map (stored CHW [ch,size,size]) -> noise input.
         if not Reader.HasTensor(pfx + 'noise') then
@@ -53439,12 +53439,12 @@ begin
   Tmp := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(TName, Tmp);
-    if Layer.Neurons[0].Weights.Size <> Hidden then
+    if Layer.FArrNeurons[0].Weights.Size <> Hidden then
       ImportError('DINOv2 import: internal error - LayerScale layer has ' +
-        IntToStr(Layer.Neurons[0].Weights.Size) + ' weights, expected ' +
+        IntToStr(Layer.FArrNeurons[0].Weights.Size) + ' weights, expected ' +
         IntToStr(Hidden) + '.');
     for i := 0 to Hidden - 1 do
-      Layer.Neurons[0].Weights.FData[i] := Tmp.FData[i];
+      Layer.FArrNeurons[0].Weights.FData[i] := Tmp.FData[i];
     Layer.FlushWeightCache();
   finally
     Tmp.Free;
@@ -53615,7 +53615,7 @@ begin
     try
       Reader.LoadTensorFlat(PatchBiasName, Tmp);
       for ci := 0 to d - 1 do
-        PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+        PatchConv.FArrNeurons[ci].BiasWeight := Tmp.FData[ci];
       PatchConv.FlushWeightCache();
     finally
       Tmp.Free;
@@ -53636,7 +53636,7 @@ begin
           IntToStr((NumPatches + 1) * d) + ' elements, got ' +
           IntToStr(Tmp.Size) + '. (Only the native image_size=' +
           IntToStr(Config.ImageSize) + ' resolution is supported.)');
-      PosEmb.Neurons[0].Weights.Copy(Tmp);
+      PosEmb.FArrNeurons[0].Weights.Copy(Tmp);
       PosEmb.FlushWeightCache();
     finally
       Tmp.Free;
@@ -53652,8 +53652,8 @@ begin
         ImportError('DINOv2 import: "dinov2.embeddings.cls_token" must have ' +
           IntToStr(d) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
       for ci := 0 to d - 1 do
-        PosEmb.Neurons[0].Weights.FData[ci] :=
-          PosEmb.Neurons[0].Weights.FData[ci] + Tmp.FData[ci];
+        PosEmb.FArrNeurons[0].Weights.FData[ci] :=
+          PosEmb.FArrNeurons[0].Weights.FData[ci] + Tmp.FData[ci];
       PosEmb.FlushWeightCache();
     finally
       Tmp.Free;
@@ -53806,15 +53806,15 @@ begin
       for ky := 0 to Patch - 1 do
         for kx := 0 to Patch - 1 do
           for c := 0 to NumChannels - 1 do
-            Layer.Neurons[o].Weights.FData[
+            Layer.FArrNeurons[o].Weights.FData[
               (ky * Patch + kx) * NumChannels + c] :=
               W.FData[((o * NumChannels + c) * Patch + ky) * Patch + kx];
-      Layer.Neurons[o].BiasWeight := 0;
+      Layer.FArrNeurons[o].BiasWeight := 0;
     end;
     if Reader.HasTensor(BName) then
     begin
       Reader.LoadTensorFlat(BName, B);
-      for o := 0 to Hidden - 1 do Layer.Neurons[o].BiasWeight := B.FData[o];
+      for o := 0 to Hidden - 1 do Layer.FArrNeurons[o].BiasWeight := B.FData[o];
     end;
   finally
     B.Free;
@@ -53841,9 +53841,9 @@ begin
       for ky := 0 to K - 1 do
         for kx := 0 to K - 1 do
           for c := 0 to InCh - 1 do
-            Layer.Neurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
+            Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
               W.FData[((o * InCh + c) * K + ky) * K + kx];
-      Layer.Neurons[o].BiasWeight := 0;
+      Layer.FArrNeurons[o].BiasWeight := 0;
     end;
   finally
     W.Free;
@@ -53937,7 +53937,7 @@ begin
       if Pos.Size <> Grid * Grid * Config.HiddenSize then
         ImportError('SAM import: pos_embed size mismatch.');
       for ci := 0 to Pos.Size - 1 do
-        PosEmb.Neurons[0].Weights.FData[ci] := Pos.FData[ci];
+        PosEmb.FArrNeurons[0].Weights.FData[ci] := Pos.FData[ci];
       PosEmb.FlushWeightCache();
     finally
       Pos.Free;
@@ -55007,7 +55007,7 @@ begin
     try
       Reader.LoadTensorFlat(PatchBiasName, Tmp);
       for ci := 0 to d - 1 do
-        PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+        PatchConv.FArrNeurons[ci].BiasWeight := Tmp.FData[ci];
       PatchConv.FlushWeightCache();
     finally
       Tmp.Free;
@@ -55017,7 +55017,7 @@ begin
     if not Reader.HasTensor(Pfx + 'embeddings.cls_token') then
       ImportError('BEiT import: missing tensor "' + Pfx +
         'embeddings.cls_token".');
-    ClsRow.Neurons[0].Weights.Fill(0);
+    ClsRow.FArrNeurons[0].Weights.Fill(0);
     Tmp := TNNetVolume.Create;
     try
       Reader.LoadTensorFlat(Pfx + 'embeddings.cls_token', Tmp);
@@ -55025,7 +55025,7 @@ begin
         ImportError('BEiT import: "' + Pfx + 'embeddings.cls_token" must have ' +
           IntToStr(d) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
       for ci := 0 to d - 1 do
-        ClsRow.Neurons[0].Weights.FData[ci] := Tmp.FData[ci];
+        ClsRow.FArrNeurons[0].Weights.FData[ci] := Tmp.FData[ci];
       ClsRow.FlushWeightCache();
     finally
       Tmp.Free;
@@ -55234,9 +55234,9 @@ begin
       for ky := 0 to K - 1 do
         for kx := 0 to K - 1 do
           for c := 0 to InCh - 1 do
-            Layer.Neurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
+            Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
               W.FData[((o * InCh + c) * K + ky) * K + kx];
-      Layer.Neurons[o].BiasWeight := 0;
+      Layer.FArrNeurons[o].BiasWeight := 0;
     end;
     Layer.FlushWeightCache();
   finally
@@ -55285,9 +55285,9 @@ begin
         begin
           p := oc * K * K + kx * K + ky;
           for ic := 0 to InCh - 1 do
-            Layer.Neurons[p].Weights.FData[ic] :=
+            Layer.FArrNeurons[p].Weights.FData[ic] :=
               W.FData[((ic * OutCh + oc) * K + ky) * K + kx];
-          Layer.Neurons[p].BiasWeight := B.FData[oc];
+          Layer.FArrNeurons[p].BiasWeight := B.FData[oc];
         end;
     Layer.FlushWeightCache();
   finally
@@ -55535,7 +55535,7 @@ begin
     Tmp := TNNetVolume.Create;
     try
       Reader.LoadTensorFlat(Nm, Tmp);
-      for ci := 0 to d - 1 do PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+      for ci := 0 to d - 1 do PatchConv.FArrNeurons[ci].BiasWeight := Tmp.FData[ci];
       PatchConv.FlushWeightCache();
     finally Tmp.Free; end;
     Tmp := TNNetVolume.Create;
@@ -55544,11 +55544,11 @@ begin
       if Tmp.Size <> (NumPatches + 1) * d then
         ImportError('DPT import: position_embeddings size mismatch (native ' +
           'resolution only).');
-      PosEmb.Neurons[0].Weights.Copy(Tmp);
+      PosEmb.FArrNeurons[0].Weights.Copy(Tmp);
       Reader.LoadTensorFlat(Pfx + 'embeddings.cls_token', Tmp);
       for ci := 0 to d - 1 do
-        PosEmb.Neurons[0].Weights.FData[ci] :=
-          PosEmb.Neurons[0].Weights.FData[ci] + Tmp.FData[ci];
+        PosEmb.FArrNeurons[0].Weights.FData[ci] :=
+          PosEmb.FArrNeurons[0].Weights.FData[ci] + Tmp.FData[ci];
       PosEmb.FlushWeightCache();
     finally Tmp.Free; end;
     for BlockCnt := 0 to Bk.NumLayers - 1 do
@@ -55897,7 +55897,7 @@ begin
         BkPfx + 'embeddings.patch_embeddings.projection.bias', Tmp);
       if Tmp.Size <> d then
         ImportError('ViTPose import: patch conv bias size mismatch.');
-      for ci := 0 to d - 1 do PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+      for ci := 0 to d - 1 do PatchConv.FArrNeurons[ci].BiasWeight := Tmp.FData[ci];
       PatchConv.FlushWeightCache();
     finally Tmp.Free; end;
     // position_embeddings [1, NumPatches+1, hidden]. HF adds pos[:,1:] (per
@@ -55911,7 +55911,7 @@ begin
           '(native resolution only).');
       // Drop the leading cls row, then add it (broadcast) to every patch row.
       for ci := 0 to NumPatches * d - 1 do
-        PosEmb.Neurons[0].Weights.FData[ci] :=
+        PosEmb.FArrNeurons[0].Weights.FData[ci] :=
           Tmp.FData[d + ci] + Tmp.FData[ci mod d];
       PosEmb.FlushWeightCache();
     finally Tmp.Free; end;
@@ -55926,8 +55926,8 @@ begin
         Reader.LoadTensorFlat(ClsName, Tmp);
         if Tmp.Size = d then
           for ci := 0 to NumPatches * d - 1 do
-            PosEmb.Neurons[0].Weights.FData[ci] :=
-              PosEmb.Neurons[0].Weights.FData[ci] + Tmp.FData[ci mod d];
+            PosEmb.FArrNeurons[0].Weights.FData[ci] :=
+              PosEmb.FArrNeurons[0].Weights.FData[ci] + Tmp.FData[ci mod d];
         PosEmb.FlushWeightCache();
       finally Tmp.Free; end;
     end;
@@ -56157,7 +56157,7 @@ begin
   nfeat := DModel div 2;
   if Layer.Neurons.Count < 1 then
     ImportError('DETR import: spatial pos-embed layer has no table neuron.');
-  W := Layer.Neurons[0].Weights;
+  W := Layer.FArrNeurons[0].Weights;
   if W.Size <> GridH * GridW * DModel then
     ImportError('DETR import: spatial pos-embed table size ' +
       IntToStr(W.Size) + ' <> ' + IntToStr(GridH * GridW * DModel) + '.');
@@ -56207,7 +56207,7 @@ begin
     Reader.LoadTensorFlat(WName, Tmp);
     for t := 0 to Rows - 1 do
       for c := 0 to DModel - 1 do
-        Layer.Neurons[0].Weights.FData[t * DModel + c] :=
+        Layer.FArrNeurons[0].Weights.FData[t * DModel + c] :=
           Tmp.FData[t * DModel + c];
     Layer.FlushWeightCache();
   finally
@@ -56322,8 +56322,8 @@ begin
     for o := 0 to OutCh - 1 do
     begin
       for c := 0 to InCh - 1 do
-        Layer.Neurons[o].Weights.FData[c] := W.FData[o * InCh + c];
-      Layer.Neurons[o].BiasWeight := B.FData[o];
+        Layer.FArrNeurons[o].Weights.FData[c] := W.FData[o * InCh + c];
+      Layer.FArrNeurons[o].BiasWeight := B.FData[o];
     end;
     Layer.FlushWeightCache();
   finally
@@ -57733,7 +57733,7 @@ begin
   else
     ImportError('LlavaAssembleEmbeddings: TextNet layer 1 is not a ' +
       'TNNetEmbedding (not a BuildLlavaFromSafeTensors language model?).');
-  EmbWeights := EmbeddingLayer.Neurons[0].Weights;
+  EmbWeights := EmbeddingLayer.FArrNeurons[0].Weights;
   d := TNNetEmbedding(EmbeddingLayer).EmbeddingSize;
   SeqLen := Length(TokenIds);
   // count image placeholder slots
@@ -58310,7 +58310,7 @@ begin
         ImportError('Qwen2-Audio import: ' + Prefix +
           'embed_positions.weight element count mismatch.');
       for i := 0 to Tmp.Size - 1 do
-        EncPos.Neurons[0].Weights.FData[i] := Tmp.FData[i];
+        EncPos.FArrNeurons[0].Weights.FData[i] := Tmp.FData[i];
       EncPos.FlushWeightCache();
     finally
       Tmp.Free;
@@ -58878,16 +58878,16 @@ begin
       for ky := 0 to K - 1 do
         for kx := 0 to K - 1 do
           for c := 0 to InC - 1 do
-            Layer.Neurons[o].Weights.FData[(ky * K + kx) * InC + c] :=
+            Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InC + c] :=
               W.FData[((o * InC + c) * K + ky) * K + kx];
-      Layer.Neurons[o].BiasWeight := 0;
+      Layer.FArrNeurons[o].BiasWeight := 0;
     end;
     if HasBias then
     begin
       if not Reader.HasTensor(BName) then
         ImportError('RAFT import: missing tensor "' + BName + '".');
       Reader.LoadTensorFlat(BName, B);
-      for o := 0 to OutC - 1 do Layer.Neurons[o].BiasWeight := B.FData[o];
+      for o := 0 to OutC - 1 do Layer.FArrNeurons[o].BiasWeight := B.FData[o];
     end;
   finally
     W.Free; B.Free;
@@ -58911,8 +58911,8 @@ begin
     Reader.LoadTensorFlat(BName, B);
     for c := 0 to Depth - 1 do
     begin
-      Layer.Neurons[0].Weights.FData[c] := G.FData[c]; // gamma
-      Layer.Neurons[1].Weights.FData[c] := B.FData[c]; // beta
+      Layer.FArrNeurons[0].Weights.FData[c] := G.FData[c]; // gamma
+      Layer.FArrNeurons[1].Weights.FData[c] := B.FData[c]; // beta
     end;
   finally
     G.Free; B.Free;
@@ -59045,10 +59045,10 @@ begin
         for ky := 0 to K - 1 do
           for kx := 0 to K - 1 do
             for c := 0 to ZC - 1 do
-              Layer.Neurons[gate].Weights.FData[
+              Layer.FArrNeurons[gate].Weights.FData[
                 (o * (K * K) + (ky * K + kx)) * ZC + c] :=
                 W.FData[((o * ZC + c) * K + ky) * K + kx];
-        Layer.Neurons[gate + 3].Weights.FData[o] := B.FData[o];
+        Layer.FArrNeurons[gate + 3].Weights.FData[o] := B.FData[o];
       end;
     end;
   finally
@@ -59868,8 +59868,8 @@ begin
   for SrcIdx := 0 to N - 1 do
   begin
     Saved[SrcIdx] := TNNetVolume.Create;
-    Saved[SrcIdx].Copy(Layer.Neurons[SrcIdx].Weights);
-    SavedBias[SrcIdx] := Layer.Neurons[SrcIdx].BiasWeight;
+    Saved[SrcIdx].Copy(Layer.FArrNeurons[SrcIdx].Weights);
+    SavedBias[SrcIdx] := Layer.FArrNeurons[SrcIdx].BiasWeight;
   end;
   try
     for ph := 0 to P - 1 do
@@ -59878,8 +59878,8 @@ begin
         begin
           SrcIdx := (ph * P + pw) * OutCh + ic;  // reference order
           DstIdx := (pw * P + ph) * OutCh + ic;  // DepthToSpace order
-          Layer.Neurons[DstIdx].Weights.Copy(Saved[SrcIdx]);
-          Layer.Neurons[DstIdx].BiasWeight := SavedBias[SrcIdx];
+          Layer.FArrNeurons[DstIdx].Weights.Copy(Saved[SrcIdx]);
+          Layer.FArrNeurons[DstIdx].BiasWeight := SavedBias[SrcIdx];
         end;
     Layer.FlushWeightCache();
   finally
@@ -59977,7 +59977,7 @@ begin
     Tmp := TNNetVolume.Create;
     try
       Reader.LoadTensorFlat(PatchBiasName, Tmp);
-      for ci := 0 to d - 1 do PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+      for ci := 0 to d - 1 do PatchConv.FArrNeurons[ci].BiasWeight := Tmp.FData[ci];
       PatchConv.FlushWeightCache();
     finally
       Tmp.Free;
@@ -59992,7 +59992,7 @@ begin
         ImportError('DiT import: "pos_embed" must have ' +
           IntToStr(NumPatches * d) + ' elements, got ' +
           IntToStr(Tmp.Size) + '.');
-      PosEmb.Neurons[0].Weights.Copy(Tmp);
+      PosEmb.FArrNeurons[0].Weights.Copy(Tmp);
       PosEmb.FlushWeightCache();
     finally
       Tmp.Free;
@@ -60006,7 +60006,7 @@ begin
     // permute the in-columns: new[:, 0:half]=old[:, half:d]; new[:,half:d]=old[:,0:half]
     for i := 0 to d - 1 do
     begin
-      WVol := TFc0.Neurons[i].Weights;
+      WVol := TFc0.FArrNeurons[i].Weights;
       for ci := 0 to half - 1 do
       begin
         // swap input column ci with column half+ci
@@ -60461,7 +60461,7 @@ begin
   half := InDim div 2;
   for i := 0 to Layer.Neurons.Count - 1 do
   begin
-    WVol := Layer.Neurons[i].Weights;
+    WVol := Layer.FArrNeurons[i].Weights;
     for ci := 0 to half - 1 do
     begin
       SwapTmp := WVol.FData[ci];
@@ -60769,7 +60769,7 @@ begin
     Tmp := TNNetVolume.Create;
     try
       Reader.LoadTensorFlat(PatchBiasName, Tmp);
-      for ci := 0 to d - 1 do PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+      for ci := 0 to d - 1 do PatchConv.FArrNeurons[ci].BiasWeight := Tmp.FData[ci];
       PatchConv.FlushWeightCache();
     finally
       Tmp.Free;
@@ -60784,7 +60784,7 @@ begin
         ImportError('PixArt import: "pos_embed.pos_embed" must have ' +
           IntToStr(NumPatches * d) + ' elements, got ' +
           IntToStr(Tmp.Size) + '.');
-      PosEmb.Neurons[0].Weights.Copy(Tmp);
+      PosEmb.FArrNeurons[0].Weights.Copy(Tmp);
       PosEmb.FlushWeightCache();
     finally
       Tmp.Free;
@@ -60823,7 +60823,7 @@ begin
           ImportError('PixArt import: "' + p + 'scale_shift_table" must have ' +
             IntToStr(6 * d) + ' elements, got ' + IntToStr(SST.Size) + '.');
         for k := 0 to 6 * d - 1 do
-          Blocks[BlockCnt].ScaleShift.Neurons[0].Weights.FData[k] := SST.FData[k];
+          Blocks[BlockCnt].ScaleShift.FArrNeurons[0].Weights.FData[k] := SST.FData[k];
         Blocks[BlockCnt].ScaleShift.FlushWeightCache();
       finally
         SST.Free;
@@ -60846,7 +60846,7 @@ begin
         ImportError('PixArt import: "scale_shift_table" must have ' +
           IntToStr(2 * d) + ' elements, got ' + IntToStr(SST.Size) + '.');
       for k := 0 to 2 * d - 1 do
-        FinalScaleShift.Neurons[0].Weights.FData[k] := SST.FData[k];
+        FinalScaleShift.FArrNeurons[0].Weights.FData[k] := SST.FData[k];
       FinalScaleShift.FlushWeightCache();
     finally
       SST.Free;
@@ -61359,9 +61359,9 @@ begin
     ImportError('VideoMAE import: internal error - tubelet conv has ' +
       IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
       IntToStr(Hidden) + '.');
-  if Layer.Neurons[0].Weights.Size <> Tubelet * Patch * Patch * NumChannels then
+  if Layer.FArrNeurons[0].Weights.Size <> Tubelet * Patch * Patch * NumChannels then
     ImportError('VideoMAE import: internal error - tubelet conv neuron has ' +
-      IntToStr(Layer.Neurons[0].Weights.Size) + ' weights, expected ' +
+      IntToStr(Layer.FArrNeurons[0].Weights.Size) + ' weights, expected ' +
       IntToStr(Tubelet * Patch * Patch * NumChannels) + '.');
   if not Reader.HasTensor(BName) then
     ImportError('VideoMAE import: missing tensor "' + BName + '".');
@@ -61379,12 +61379,12 @@ begin
         for ky := 0 to Patch - 1 do
           for kx := 0 to Patch - 1 do
             for c := 0 to NumChannels - 1 do
-              Layer.Neurons[o].Weights.FData[
+              Layer.FArrNeurons[o].Weights.FData[
                 (ky * Patch + kx) * (Tubelet * NumChannels) +
                 kt * NumChannels + c] :=
                 W.FData[(((o * NumChannels + c) * Tubelet + kt) * Patch + ky)
                   * Patch + kx];
-      Layer.Neurons[o].BiasWeight := B.FData[o];
+      Layer.FArrNeurons[o].BiasWeight := B.FData[o];
     end;
   finally
     W.Free;
@@ -61405,7 +61405,7 @@ var
   Angle, Power: double;
   Tbl: TNNetVolume;
 begin
-  Tbl := PosEmb.Neurons[0].Weights;
+  Tbl := PosEmb.FArrNeurons[0].Weights;
   for tt := 0 to TGrid - 1 do
     for hh := 0 to HGrid - 1 do
       for ww := 0 to WGrid - 1 do

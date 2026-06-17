@@ -1093,9 +1093,9 @@ var
   j: integer;
 begin
   for j := 1 to L.Neurons.Count - 1 do
-    if (L.Neurons[j].Weights.SizeX <> L.Neurons[0].Weights.SizeX) or
-       (L.Neurons[j].Weights.SizeY <> L.Neurons[0].Weights.SizeY) or
-       (L.Neurons[j].Weights.Depth <> L.Neurons[0].Weights.Depth) then
+    if (L.FArrNeurons[j].Weights.SizeX <> L.FArrNeurons[0].Weights.SizeX) or
+       (L.FArrNeurons[j].Weights.SizeY <> L.FArrNeurons[0].Weights.SizeY) or
+       (L.FArrNeurons[j].Weights.Depth <> L.FArrNeurons[0].Weights.Depth) then
       exit(false);
   Result := true;
 end;
@@ -1123,6 +1123,9 @@ var
 begin
   Writer := TNNetSafeTensorsWriter.Create(pFileName);
   Tmp := TNNetVolume.Create;
+  // Build the fast neuron mirror so the indexed FArrNeurons access below is
+  // valid for every layer (even ones not yet run through a forward pass).
+  NN.BuildArrNeurons();
   try
     Writer.SetMetadata('format', 'cai-neural-api/v1');
     for LayerIdx := 0 to NN.Layers.Count - 1 do
@@ -1132,13 +1135,13 @@ begin
       Base := LayerTensorBaseName(NN, LayerIdx);
       if LayerHasUniformNeurons(L) then
       begin
-        W := L.Neurons[0].Weights;
+        W := L.FArrNeurons[0].Weights;
         Tmp.ReSize(L.Neurons.Count * W.Size, 1, 1);
         Cursor := 0;
         for j := 0 to L.Neurons.Count - 1 do
           for i := 0 to W.Size - 1 do
           begin
-            Tmp.FData[Cursor] := L.Neurons[j].Weights.FData[i];
+            Tmp.FData[Cursor] := L.FArrNeurons[j].Weights.FData[i];
             Inc(Cursor);
           end;
         Writer.AddTensorFlat(Base + '.weights',
@@ -1148,7 +1151,7 @@ begin
       begin
         for j := 0 to L.Neurons.Count - 1 do
         begin
-          W := L.Neurons[j].Weights;
+          W := L.FArrNeurons[j].Weights;
           Writer.AddTensorFlat(
             Base + '.neuron_' + IntToStr(j) + '.weights',
             [W.SizeY, W.SizeX, W.Depth], W, pDType);
@@ -1156,7 +1159,7 @@ begin
       end;
       Tmp.ReSize(L.Neurons.Count, 1, 1);
       for j := 0 to L.Neurons.Count - 1 do
-        Tmp.FData[j] := L.Neurons[j].BiasWeight;
+        Tmp.FData[j] := L.FArrNeurons[j].BiasWeight;
       Writer.AddTensorFlat(Base + '.biases', [L.Neurons.Count], Tmp, pDType);
     end;
     Writer.SaveToFile;
@@ -1191,6 +1194,9 @@ var
 begin
   Reader := TNNetSafeTensorsReader.Create(pFileName);
   Tmp := TNNetVolume.Create;
+  // Build the fast neuron mirror so the indexed FArrNeurons access below is
+  // valid for every layer (even ones not yet run through a forward pass).
+  NN.BuildArrNeurons();
   try
     for LayerIdx := 0 to NN.Layers.Count - 1 do
     begin
@@ -1200,12 +1206,12 @@ begin
       if LayerHasUniformNeurons(L) then
       begin
         LoadExpected(Base + '.weights',
-          L.Neurons.Count * L.Neurons[0].Weights.Size);
+          L.Neurons.Count * L.FArrNeurons[0].Weights.Size);
         Cursor := 0;
         for j := 0 to L.Neurons.Count - 1 do
-          for i := 0 to L.Neurons[j].Weights.Size - 1 do
+          for i := 0 to L.FArrNeurons[j].Weights.Size - 1 do
           begin
-            L.Neurons[j].Weights.FData[i] := Tmp.FData[Cursor];
+            L.FArrNeurons[j].Weights.FData[i] := Tmp.FData[Cursor];
             Inc(Cursor);
           end;
       end
@@ -1214,14 +1220,14 @@ begin
         for j := 0 to L.Neurons.Count - 1 do
         begin
           TensorName := Base + '.neuron_' + IntToStr(j) + '.weights';
-          LoadExpected(TensorName, L.Neurons[j].Weights.Size);
-          for i := 0 to L.Neurons[j].Weights.Size - 1 do
-            L.Neurons[j].Weights.FData[i] := Tmp.FData[i];
+          LoadExpected(TensorName, L.FArrNeurons[j].Weights.Size);
+          for i := 0 to L.FArrNeurons[j].Weights.Size - 1 do
+            L.FArrNeurons[j].Weights.FData[i] := Tmp.FData[i];
         end;
       end;
       LoadExpected(Base + '.biases', L.Neurons.Count);
       for j := 0 to L.Neurons.Count - 1 do
-        L.Neurons[j].BiasWeight := Tmp.FData[j];
+        L.FArrNeurons[j].BiasWeight := Tmp.FData[j];
       L.ClearInertia();
       L.ClearDeltas();
       L.FlushWeightCache();
