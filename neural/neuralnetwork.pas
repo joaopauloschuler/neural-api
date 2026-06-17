@@ -81901,13 +81901,13 @@ begin
       for I := 0 to NumClassesM1 do
       begin
         if ClassCount[I] = 0 then Continue;
-        for J := 0 to NumClasses - 1 do
+        for J := 0 to NumClassesM1 do
         begin
           if ClassCount[J] = 0 then Continue;
           if (ClassMeanNorm[I] > 1e-30) and (ClassMeanNorm[J] > 1e-30) then
           begin
             CosV := 0;
-            for F := 0 to D - 1 do
+            for F := 0 to DM1 do
               CosV := CosV + ClassMean[I][F] * ClassMean[J][F];
             CosV := CosV / (ClassMeanNorm[I] * ClassMeanNorm[J]);
           end
@@ -81941,7 +81941,7 @@ begin
       ['Idx', 'Layer', 'FeatDim', 'tr(Sw)', 'tr(Sb)', 'tr(Stot)',
        'Fisher', 'Silh', 'OffCos', 'flags']));
     Lines.Add(StringOfChar('-', 112));
-    for ProbeIdx := 0 to NumProbed - 1 do
+    for ProbeIdx := 0 to NumProbedM1 do
     begin
       RowFlags := '';
       if TrSw[ProbeIdx] <= 1e-6 then RowFlags := RowFlags + 'C';
@@ -81960,7 +81960,7 @@ begin
     //     is exact; the class-balanced tr(Sw)+tr(Sb) matches tr(Stot) only when
     //     classes are balanced). Report worst residual. ---
     Acc := 0;
-    for ProbeIdx := 0 to NumProbed - 1 do
+    for ProbeIdx := 0 to NumProbedM1 do
       if IdResidual[ProbeIdx] > Acc then Acc := IdResidual[ProbeIdx];
     Lines.Add(Format(
       'Scatter identity tr(Stot)=tr(Sw)+tr(Sb): worst residual=%.3e ' +
@@ -81968,7 +81968,7 @@ begin
 
     // --- Fisher-ratio across depth: ASCII bar chart (log-scaled). ---
     MinLogR := 1e30; MaxLogR := -1e30;
-    for ProbeIdx := 0 to NumProbed - 1 do
+    for ProbeIdx := 0 to NumProbedM1 do
     begin
       LogR := pcr_logf(FisherR[ProbeIdx] + 1e-6);
       if LogR < MinLogR then MinLogR := LogR;
@@ -81978,7 +81978,7 @@ begin
     if SpanR < 1e-12 then SpanR := 1e-12;
     Lines.Add('');
     Lines.Add('Fisher ratio tr(Sb)/tr(Sw) across depth (log-scaled bars):');
-    for ProbeIdx := 0 to NumProbed - 1 do
+    for ProbeIdx := 0 to NumProbedM1 do
     begin
       LogR := pcr_logf(FisherR[ProbeIdx] + 1e-6);
       BarLen := Round(((LogR - MinLogR) / SpanR) * cMaxBarWidth);
@@ -81999,12 +81999,12 @@ begin
         '(glyphs " .:-=+*#%%@", brightest=most similar):',
         [Probes[NumProbed - 1].LayerIdx]));
       Line := '       ';
-      for J := 0 to NumClasses - 1 do Line := Line + Format('%4d', [J]);
+      for J := 0 to NumClassesM1 do Line := Line + Format('%4d', [J]);
       Lines.Add(Line);
-      for I := 0 to NumClasses - 1 do
+      for I := 0 to NumClassesM1 do
       begin
         Line := Format('  c%-4d ', [I]);
-        for J := 0 to NumClasses - 1 do
+        for J := 0 to NumClassesM1 do
         begin
           // map cosine [-1,1] to glyph band 0..9
           GlyphIdx := Round((CosMat[I][J] + 1.0) * 0.5 * (Length(cGlyphs) - 1));
@@ -82075,6 +82075,7 @@ var
   Line, Glyph, ProjStr: string;
   FisherVal: Double;
   GlyphIdx: integer;
+  NumClassesM1, NM1, DM1: integer;
 begin
   Result := '';
   Lines := TStringList.Create();
@@ -82096,6 +82097,8 @@ begin
     end;
     if MaxFeatDim < 1 then MaxFeatDim := 1;
     N := Samples.Count;
+    NM1 := N - 1;
+    NumClassesM1 := NumClasses - 1;
 
     // --- locate the final linear classifier HEAD and the feature layer. ---
     // The head is the last trainable layer (Neurons.Count>0); a trailing
@@ -82148,9 +82151,9 @@ begin
     // --- integer labels + per-class counts. ---
     SetLength(Labels, N);
     SetLength(ClassCount, NumClasses);
-    for C := 0 to NumClasses - 1 do ClassCount[C] := 0;
+    for C := 0 to NumClassesM1 do ClassCount[C] := 0;
     NValid := 0;
-    for SampleIdx := 0 to N - 1 do
+    for SampleIdx := 0 to NM1 do
     begin
       Pair := Samples[SampleIdx];
       if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then
@@ -82172,7 +82175,7 @@ begin
       Exit;
     end;
     UsedClasses := 0;
-    for C := 0 to NumClasses - 1 do
+    for C := 0 to NumClassesM1 do
       if ClassCount[C] > 0 then Inc(UsedClasses);
 
     // --- feature dimension + deterministic sign-random projection if wide
@@ -82184,7 +82187,8 @@ begin
       SetLength(ProjSrc, D);
       SetLength(ProjSign, D);
       RandSeed := cProjSeed + FeatLayer;
-      for J := 0 to D - 1 do
+      DM1 := D - 1;
+      for J := 0 to DM1 do
       begin
         ProjSrc[J] := Random(FlatSz);
         if Random(2) = 0 then ProjSign[J] := 1.0 else ProjSign[J] := -1.0;
@@ -82195,59 +82199,60 @@ begin
       D := FlatSz;
       Projected := false;
     end;
+    DM1 := D - 1;
 
     // --- one forward pass per probe: snapshot N x D feature matrix AND the
     //     argmax of the FINAL-layer logits (for NC4). ---
     SetLength(Feats, N);
     NC4Correct := 0;
-    for SampleIdx := 0 to N - 1 do
+    for SampleIdx := 0 to NM1 do
     begin
       if Labels[SampleIdx] < 0 then begin Feats[SampleIdx] := nil; Continue; end;
       Pair := Samples[SampleIdx];
       NN.Compute(Pair.I);
       SetLength(Feats[SampleIdx], D);
       if Projected then
-        for F := 0 to D - 1 do
+        for F := 0 to DM1 do
           Feats[SampleIdx][F] := ProjSign[F] * Layer.Output.FData[ProjSrc[F]]
       else
-        for F := 0 to D - 1 do
+        for F := 0 to DM1 do
           Feats[SampleIdx][F] := Layer.Output.FData[F];
     end;
 
     // --- class means + global mean (REUSED FeatureSeparability machinery). ---
     SetLength(ClassMean, NumClasses);
     SetLength(GlobalMean, D);
-    for F := 0 to D - 1 do GlobalMean[F] := 0;
-    for C := 0 to NumClasses - 1 do
+    for F := 0 to DM1 do GlobalMean[F] := 0;
+    for C := 0 to NumClassesM1 do
     begin
       SetLength(ClassMean[C], D);
-      for F := 0 to D - 1 do ClassMean[C][F] := 0;
+      for F := 0 to DM1 do ClassMean[C][F] := 0;
     end;
-    for SampleIdx := 0 to N - 1 do
+    for SampleIdx := 0 to NM1 do
     begin
       if Labels[SampleIdx] < 0 then Continue;
       C := Labels[SampleIdx];
-      for F := 0 to D - 1 do
+      for F := 0 to DM1 do
       begin
         ClassMean[C][F] := ClassMean[C][F] + Feats[SampleIdx][F];
         GlobalMean[F] := GlobalMean[F] + Feats[SampleIdx][F];
       end;
     end;
-    for F := 0 to D - 1 do GlobalMean[F] := GlobalMean[F] / NValid;
-    for C := 0 to NumClasses - 1 do
+    for F := 0 to DM1 do GlobalMean[F] := GlobalMean[F] / NValid;
+    for C := 0 to NumClassesM1 do
       if ClassCount[C] > 0 then
-        for F := 0 to D - 1 do ClassMean[C][F] := ClassMean[C][F] / ClassCount[C];
+        for F := 0 to DM1 do ClassMean[C][F] := ClassMean[C][F] / ClassCount[C];
 
     // --- tr(S_w), tr(S_b) (FeatureSeparability definitions). ---
     SwSum := 0;
-    for C := 0 to NumClasses - 1 do
+    for C := 0 to NumClassesM1 do
     begin
       if ClassCount[C] = 0 then Continue;
       Acc := 0;
-      for SampleIdx := 0 to N - 1 do
+      for SampleIdx := 0 to NM1 do
       begin
         if Labels[SampleIdx] <> C then Continue;
-        for F := 0 to D - 1 do
+        for F := 0 to DM1 do
         begin
           Diff := Feats[SampleIdx][F] - ClassMean[C][F];
           Acc := Acc + Diff * Diff;
@@ -82257,10 +82262,10 @@ begin
     end;
     SwSum := SwSum / UsedClasses;
     SbSum := 0;
-    for C := 0 to NumClasses - 1 do
+    for C := 0 to NumClassesM1 do
     begin
       if ClassCount[C] = 0 then Continue;
-      for F := 0 to D - 1 do
+      for F := 0 to DM1 do
       begin
         Diff := ClassMean[C][F] - GlobalMean[F];
         SbSum := SbSum + Diff * Diff;
@@ -82274,11 +82279,11 @@ begin
     // --- NC2: centered class means -> simplex ETF. ---
     SetLength(Centered, NumClasses);
     SetLength(CenNorm, NumClasses);
-    for C := 0 to NumClasses - 1 do
+    for C := 0 to NumClassesM1 do
     begin
       SetLength(Centered[C], D);
       Acc := 0;
-      for F := 0 to D - 1 do
+      for F := 0 to DM1 do
       begin
         Centered[C][F] := ClassMean[C][F] - GlobalMean[F];
         Acc := Acc + Centered[C][F] * Centered[C][F];
@@ -82287,11 +82292,11 @@ begin
     end;
     // equinorm: coefficient of variation of CenNorm over occupied classes.
     NormMean := 0;
-    for C := 0 to NumClasses - 1 do
+    for C := 0 to NumClassesM1 do
       if ClassCount[C] > 0 then NormMean := NormMean + CenNorm[C];
     NormMean := NormMean / UsedClasses;
     NormSd := 0;
-    for C := 0 to NumClasses - 1 do
+    for C := 0 to NumClassesM1 do
       if ClassCount[C] > 0 then
         NormSd := NormSd + Sqr(CenNorm[C] - NormMean);
     NormSd := Sqrt(NormSd / UsedClasses);
@@ -82300,22 +82305,22 @@ begin
     // equiangular: centered-mean pairwise cosines vs ETF target -1/(C-1).
     ETFTarget := -1.0 / (UsedClasses - 1);
     SetLength(CosMat, NumClasses);
-    for I := 0 to NumClasses - 1 do
+    for I := 0 to NumClassesM1 do
     begin
       SetLength(CosMat[I], NumClasses);
-      for J := 0 to NumClasses - 1 do CosMat[I][J] := 0;
+      for J := 0 to NumClassesM1 do CosMat[I][J] := 0;
     end;
     DotV := 0; OtherCls := 0; NC2DevMean := 0; NC2DevMax := 0;
-    for I := 0 to NumClasses - 1 do
+    for I := 0 to NumClassesM1 do
     begin
       if ClassCount[I] = 0 then Continue;
-      for J := 0 to NumClasses - 1 do
+      for J := 0 to NumClassesM1 do
       begin
         if ClassCount[J] = 0 then Continue;
         if (CenNorm[I] > 1e-30) and (CenNorm[J] > 1e-30) then
         begin
           CosV := 0;
-          for F := 0 to D - 1 do CosV := CosV + Centered[I][F] * Centered[J][F];
+          for F := 0 to DM1 do CosV := CosV + Centered[I][F] * Centered[J][F];
           CosV := CosV / (CenNorm[I] * CenNorm[J]);
         end
         else
@@ -82352,12 +82357,12 @@ begin
     NC3Mean := 0; NC3Count := 0;
     if HeadIsLinear then
     begin
-      for C := 0 to NumClasses - 1 do
+      for C := 0 to NumClassesM1 do
       begin
         if ClassCount[C] = 0 then Continue;
         WRow := HeadLayer.Neurons[C].Weights;
         WDot := 0; WNw := 0;
-        for F := 0 to D - 1 do
+        for F := 0 to DM1 do
         begin
           WDot := WDot + Centered[C][F] * WRow.FData[F];
           WNw := WNw + WRow.FData[F] * WRow.FData[F];
@@ -82376,7 +82381,7 @@ begin
 
     // --- NC4: classifier argmax == nearest centered class mean. ---
     NC4Correct := 0;
-    for SampleIdx := 0 to N - 1 do
+    for SampleIdx := 0 to NM1 do
     begin
       if Labels[SampleIdx] < 0 then Continue;
       Pair := Samples[SampleIdx];
@@ -82384,11 +82389,11 @@ begin
       ArgLogit := NN.GetLastLayer.Output.GetClass();
       // nearest CENTERED class mean to this point's centered feature.
       NearCls := -1; BestDist := 1e300;
-      for C := 0 to NumClasses - 1 do
+      for C := 0 to NumClassesM1 do
       begin
         if ClassCount[C] = 0 then Continue;
         Dist := 0;
-        for F := 0 to D - 1 do
+        for F := 0 to DM1 do
         begin
           Diff := (Feats[SampleIdx][F] - GlobalMean[F]) - Centered[C][F];
           Dist := Dist + Diff * Diff;
@@ -82434,12 +82439,12 @@ begin
     Lines.Add('Centered class-mean pairwise-cosine heatmap (glyphs " .:-=+*#%@"' +
       ', off-diagonals -> ' + Format('%.4f', [ETFTarget]) + '):');
     Line := '       ';
-    for J := 0 to NumClasses - 1 do Line := Line + Format('%4d', [J]);
+    for J := 0 to NumClassesM1 do Line := Line + Format('%4d', [J]);
     Lines.Add(Line);
-    for I := 0 to NumClasses - 1 do
+    for I := 0 to NumClassesM1 do
     begin
       Line := Format('  c%-4d ', [I]);
-      for J := 0 to NumClasses - 1 do
+      for J := 0 to NumClassesM1 do
       begin
         GlyphIdx := Round((CosMat[I][J] + 1.0) * 0.5 * (Length(cGlyphs) - 1));
         if GlyphIdx < 0 then GlyphIdx := 0;
@@ -82488,6 +82493,7 @@ var
   AdjMinIdx, BestI, BestJ: integer;
   Line, Glyph: string;
   InBlock: boolean;
+  NM1, CountAM1, CountAM2, CountBM1: integer;
 
   // Build the list of double-centered Gram matrices for one net over the
   // probe batch (one Compute per probe per probeable layer). N is the probe
@@ -82497,6 +82503,7 @@ var
     LayerIdx, Si, Sj, Fi, Cnt: integer;
     Layer: TNNetLayer;
     FlatSz: integer;
+    LastLayerIdxA, NM1, FlatSzM1: integer;
     // per-layer activation snapshot: N rows x FeatDim cols
     Acts: TFloatMatrix;
     ColMean: array of TNeuralFloat;
@@ -82504,32 +82511,35 @@ var
     GrandMean, V, Frob: TNeuralFloat;
   begin
     Cnt := 0;
-    for LayerIdx := 0 to ANet.GetLastLayerIdx() do
+    NM1 := N - 1;
+    LastLayerIdxA := ANet.GetLastLayerIdx();
+    for LayerIdx := 0 to LastLayerIdxA do
     begin
       Layer := ANet.Layers[LayerIdx];
       FlatSz := Layer.Output.Size;
       if FlatSz = 0 then Continue;
       if FlatSz > MaxFeatDim then Continue;
+      FlatSzM1 := FlatSz - 1;
 
       // --- snapshot the N x FlatSz activation matrix (one forward per probe).
       SetLength(Acts, N);
-      for Si := 0 to N - 1 do
+      for Si := 0 to NM1 do
       begin
         ANet.Compute(Probes[Si]);
         SetLength(Acts[Si], FlatSz);
-        for Fi := 0 to FlatSz - 1 do
+        for Fi := 0 to FlatSzM1 do
           Acts[Si][Fi] := Layer.Output.Raw[Fi];
       end;
 
       // --- column-center the features (subtract per-feature mean across rows).
       SetLength(ColMean, FlatSz);
-      for Fi := 0 to FlatSz - 1 do ColMean[Fi] := 0;
-      for Si := 0 to N - 1 do
-        for Fi := 0 to FlatSz - 1 do
+      for Fi := 0 to FlatSzM1 do ColMean[Fi] := 0;
+      for Si := 0 to NM1 do
+        for Fi := 0 to FlatSzM1 do
           ColMean[Fi] := ColMean[Fi] + Acts[Si][Fi];
-      for Fi := 0 to FlatSz - 1 do ColMean[Fi] := ColMean[Fi] / N;
-      for Si := 0 to N - 1 do
-        for Fi := 0 to FlatSz - 1 do
+      for Fi := 0 to FlatSzM1 do ColMean[Fi] := ColMean[Fi] / N;
+      for Si := 0 to NM1 do
+        for Fi := 0 to FlatSzM1 do
           Acts[Si][Fi] := Acts[Si][Fi] - ColMean[Fi];
 
       // --- linear Gram K = X X^T (N x N). Column-centering X makes K already
@@ -82539,12 +82549,12 @@ var
       Grams[Cnt].FeatDim := FlatSz;
       Grams[Cnt].Name := Layer.ClassName;
       SetLength(Grams[Cnt].K, N);
-      for Si := 0 to N - 1 do SetLength(Grams[Cnt].K[Si], N);
-      for Si := 0 to N - 1 do
-        for Sj := Si to N - 1 do
+      for Si := 0 to NM1 do SetLength(Grams[Cnt].K[Si], N);
+      for Si := 0 to NM1 do
+        for Sj := Si to NM1 do
         begin
           V := 0;
-          for Fi := 0 to FlatSz - 1 do V := V + Acts[Si][Fi] * Acts[Sj][Fi];
+          for Fi := 0 to FlatSzM1 do V := V + Acts[Si][Fi] * Acts[Sj][Fi];
           Grams[Cnt].K[Si][Sj] := V;
           Grams[Cnt].K[Sj][Si] := V;
         end;
@@ -82554,23 +82564,23 @@ var
       //     keeping the self-CKA diagonal at 1.0 within tolerance.
       SetLength(RowMean, N);
       GrandMean := 0;
-      for Si := 0 to N - 1 do
+      for Si := 0 to NM1 do
       begin
         RowMean[Si] := 0;
-        for Sj := 0 to N - 1 do RowMean[Si] := RowMean[Si] + Grams[Cnt].K[Si][Sj];
+        for Sj := 0 to NM1 do RowMean[Si] := RowMean[Si] + Grams[Cnt].K[Si][Sj];
         GrandMean := GrandMean + RowMean[Si];
         RowMean[Si] := RowMean[Si] / N;
       end;
       GrandMean := GrandMean / (TNeuralFloat(N) * N);
-      for Si := 0 to N - 1 do
-        for Sj := 0 to N - 1 do
+      for Si := 0 to NM1 do
+        for Sj := 0 to NM1 do
           Grams[Cnt].K[Si][Sj] :=
             Grams[Cnt].K[Si][Sj] - RowMean[Si] - RowMean[Sj] + GrandMean;
 
       // --- Frobenius norm of the centered Gram.
       Frob := 0;
-      for Si := 0 to N - 1 do
-        for Sj := 0 to N - 1 do
+      for Si := 0 to NM1 do
+        for Sj := 0 to NM1 do
           Frob := Frob + Grams[Cnt].K[Si][Sj] * Grams[Cnt].K[Si][Sj];
       Grams[Cnt].FrobNorm := Sqrt(Frob);
 
@@ -82624,20 +82634,24 @@ begin
         'zero-size or wider than MaxFeatDim).' + sLineBreak;
       Exit;
     end;
+    NM1 := N - 1;
+    CountAM1 := CountA - 1;
+    CountAM2 := CountA - 2;
+    CountBM1 := CountB - 1;
 
     // --- pairwise linear CKA = <K_i, K_j>_F / (||K_i||_F ||K_j||_F). ---
     SetLength(CKA, CountA);
-    for I := 0 to CountA - 1 do
+    for I := 0 to CountAM1 do
     begin
       SetLength(CKA[I], CountB);
-      for J := 0 to CountB - 1 do
+      for J := 0 to CountBM1 do
       begin
         Dot := 0;
         // <K_i, K_j>_F = sum over all (a,b) of K_i[a][b] * K_j[a][b]
-        for A := 0 to N - 1 do
+        for A := 0 to NM1 do
         begin
           RowAcc := 0;
-          for B := 0 to N - 1 do
+          for B := 0 to NM1 do
             RowAcc := RowAcc + GramsA[I].K[A][B] * GramsB[J].K[A][B];
           Dot := Dot + RowAcc;
         end;
@@ -82682,12 +82696,12 @@ begin
       Lines.Add('NN layer index (rows) -> layer:')
     else
       Lines.Add('Layer index -> layer:');
-    for I := 0 to CountA - 1 do
+    for I := 0 to CountAM1 do
       Lines.Add(Format('  [%2d] L%-3d %s', [I, GramsA[I].LayerIdx, GramsA[I].Name]));
     if CrossMode then
     begin
       Lines.Add('OtherNet layer index (columns) -> layer:');
-      for J := 0 to CountB - 1 do
+      for J := 0 to CountBM1 do
         Lines.Add(Format('  [%2d] L%-3d %s',
           [J, GramsB[J].LayerIdx, GramsB[J].Name]));
     end;
@@ -82698,12 +82712,12 @@ begin
       ', brightest = most similar):');
     // column header (index of each column, two-char field)
     Line := '      ';
-    for J := 0 to CountB - 1 do Line := Line + Format('%2d', [J mod 100]);
+    for J := 0 to CountBM1 do Line := Line + Format('%2d', [J mod 100]);
     Lines.Add(Line);
-    for I := 0 to CountA - 1 do
+    for I := 0 to CountAM1 do
     begin
       Line := Format('  [%2d] ', [I]);
-      for J := 0 to CountB - 1 do
+      for J := 0 to CountBM1 do
       begin
         GlyphIdx := Trunc(CKA[I][J] * Length(cGlyphs));
         if GlyphIdx < 0 then GlyphIdx := 0;
@@ -82722,7 +82736,7 @@ begin
         '(high = near pass-through; sharp dip = reorganization):');
       AdjMin := 2.0;
       AdjMinIdx := -1;
-      for I := 0 to CountA - 2 do
+      for I := 0 to CountAM2 do
       begin
         Adj := CKA[I][I + 1];
         if Adj < AdjMin then
@@ -82751,8 +82765,8 @@ begin
       BestPair := -1.0;
       BestI := -1;
       BestJ := -1;
-      for I := 0 to CountA - 1 do
-        for J := I + 1 to CountA - 1 do
+      for I := 0 to CountAM1 do
+        for J := I + 1 to CountAM1 do
           if CKA[I][J] > BestPair then
           begin
             BestPair := CKA[I][J];
@@ -82772,8 +82786,8 @@ begin
       BestPair := -1.0;
       BestI := -1;
       BestJ := -1;
-      for I := 0 to CountA - 1 do
-        for J := 0 to CountB - 1 do
+      for I := 0 to CountAM1 do
+        for J := 0 to CountBM1 do
           if CKA[I][J] > BestPair then
           begin
             BestPair := CKA[I][J];
@@ -82825,7 +82839,7 @@ begin
 
       // ------------------------------------------------------------- verdict
       NearDup := 0;
-      for I := 0 to CountA - 2 do
+      for I := 0 to CountAM2 do
         if CKA[I][I + 1] >= BlockThreshold then Inc(NearDup);
       Lines.Add('');
       Lines.Add(Format(
@@ -82861,6 +82875,7 @@ var
   BinCounts: array of integer;
   Span, BinLo, BinHi: TNeuralFloat;
   ShapeStr, Bar: string;
+  LastLayerIdx, BinsM1: integer;
 begin
   Result := '';
   Lines := TStringList.Create();
@@ -82871,6 +82886,8 @@ begin
       Exit;
     end;
     if Bins < 1 then Bins := 1;
+    BinsM1 := Bins - 1;
+    LastLayerIdx := NN.GetLastLayerIdx();
 
     TrainableLayers := 0;
     TotalWeights := 0;
@@ -82881,7 +82898,7 @@ begin
       [Bins, cMaxBarWidth]));
     Lines.Add('');
 
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LayerIdx];
       if Layer.Neurons.Count = 0 then Continue;
@@ -82936,7 +82953,7 @@ begin
 
       // Second pass: bin counts over [-MaxAbs, +MaxAbs].
       SetLength(BinCounts, Bins);
-      for BinIdx := 0 to Bins - 1 do BinCounts[BinIdx] := 0;
+      for BinIdx := 0 to BinsM1 do BinCounts[BinIdx] := 0;
       LpBnd157 := Layer.Neurons.Count - 1;
       for NeuronIdx := 0 to LpBnd157 do
       begin
@@ -82952,7 +82969,7 @@ begin
         end;
       end;
       MaxBin := 0;
-      for BinIdx := 0 to Bins - 1 do
+      for BinIdx := 0 to BinsM1 do
         if BinCounts[BinIdx] > MaxBin then MaxBin := BinCounts[BinIdx];
 
       ShapeStr := Format('(%d,%d,%d)',
@@ -82965,7 +82982,7 @@ begin
         [MinW, MaxW, Mean, Std, L2, Linf]));
       Lines.Add(Format('  near-zero (|w|<%g): %d (%.2f%%)',
         [cZeroEps, NearZero, (NearZero / WCount) * 100.0]));
-      for BinIdx := 0 to Bins - 1 do
+      for BinIdx := 0 to BinsM1 do
       begin
         BinLo := -MaxAbs + BinIdx * (Span / Bins);
         BinHi := -MaxAbs + (BinIdx + 1) * (Span / Bins);
@@ -83027,6 +83044,7 @@ var
   BytesPerElem: integer;
   Pct: TNeuralFloat;
   AnyActFlag, AnyParamFlag: boolean;
+  LastLayerIdx, cBinsM1: integer;
 begin
   Result := '';
   Lines := TStringList.Create();
@@ -83062,13 +83080,15 @@ begin
     end;
 
     NumLayers := NN.CountLayers();
+    LastLayerIdx := NN.GetLastLayerIdx();
+    cBinsM1 := cBins - 1;
     SetLength(PerLayerActElements, NumLayers);
     SetLength(PerLayerParamElements, NumLayers);
     TotalActElements := 0;
     TotalParamElements := 0;
 
     // Per-layer measurement pass.
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LayerIdx];
       // Activation tensor size in elements (single sample, batch=1).
@@ -83106,7 +83126,7 @@ begin
     Lines.Add(Format('%-5s %-34s %-18s %12s %12s %12s',
       ['Idx', 'Class', 'OutShape', 'ActMiB', 'ParamMiB', 'GradMiB']));
     Lines.Add(StringOfChar('-', 98));
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LayerIdx];
       ShapeStr := Format('(%d,%d,%d)',
@@ -83145,7 +83165,7 @@ begin
       [cBins, cMaxBarWidth]));
     MinMiB := 0;
     MaxMiB := 0;
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       V := (PerLayerActElements[LayerIdx] * BytesPerElem) / (1024.0 * 1024.0);
       if (LayerIdx = 0) or (V < MinMiB) then MinMiB := V;
@@ -83154,8 +83174,8 @@ begin
     if MaxMiB <= MinMiB then MaxMiB := MinMiB + 1e-9;
     Span := MaxMiB - MinMiB;
     SetLength(Bins, cBins);
-    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for BinIdx := 0 to cBinsM1 do Bins[BinIdx] := 0;
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       V := (PerLayerActElements[LayerIdx] * BytesPerElem) / (1024.0 * 1024.0);
       BinIdx := Trunc(((V - MinMiB) / Span) * cBins);
@@ -83164,9 +83184,9 @@ begin
       Inc(Bins[BinIdx]);
     end;
     MaxBin := 0;
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
       if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
     begin
       if MaxBin > 0 then
         BarLen := Round((Bins[BinIdx] / MaxBin) * cMaxBarWidth)
@@ -83189,7 +83209,7 @@ begin
     // Flag lists.
     AnyActFlag := False;
     AnyParamFlag := False;
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LayerIdx];
       if TotalActElements > 0 then
@@ -83288,6 +83308,7 @@ var
   PrevRFx, PrevRFy: TNeuralFloat;
   PoolSize: integer;
   IsUpsample, IsPad, IsGlobal: boolean;
+  LastLayerIdx: integer;
 begin
   Result := '';
   Lines := TStringList.Create();
@@ -83329,7 +83350,8 @@ begin
        'cover%']));
     Lines.Add(StringOfChar('-', 104));
 
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    LastLayerIdx := NN.GetLastLayerIdx();
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LayerIdx];
       Prev := Layer.PrevLayer;
@@ -83534,6 +83556,7 @@ var
   MinStd, MaxStd, StdRange: TNeuralFloat;
   MaxStdBin, BarLen: integer;
   BinLo, BinHi: TNeuralFloat;
+  LastLayerIdx, LayerCountM1, UnitsM1, cHistBinsM1: integer;
 begin
   Result := '';
   Lines := TStringList.Create();
@@ -83556,9 +83579,12 @@ begin
     end;
 
     LayerCount := NN.CountLayers();
+    LayerCountM1 := LayerCount - 1;
+    LastLayerIdx := NN.GetLastLayerIdx();
+    cHistBinsM1 := cHistBins - 1;
     SetLength(PerLayerStd, LayerCount);
     SetLength(PerLayerHasData, LayerCount);
-    for LayerIdx := 0 to LayerCount - 1 do
+    for LayerIdx := 0 to LayerCountM1 do
       PerLayerHasData[LayerIdx] := False;
 
     Lines.Add(Format(
@@ -83573,11 +83599,12 @@ begin
 
     Reported := 0;
 
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LayerIdx];
       Units := Layer.Output.Size;
       if Units = 0 then Continue;
+      UnitsM1 := Units - 1;
 
       // Reset streaming moments for this layer.
       N := 0;
@@ -83591,7 +83618,7 @@ begin
       for SampleIdx := 0 to LpBnd160 do
       begin
         NN.Compute(Samples[SampleIdx]);
-        for UnitIdx := 0 to Units - 1 do
+        for UnitIdx := 0 to UnitsM1 do
         begin
           V := Layer.Output.Raw[UnitIdx];
           AbsV := Abs(V);
@@ -83651,7 +83678,7 @@ begin
 
       // |median| from the last probe sample: simple insertion sort of the
       // bounded Units-sized buffer (deterministic, memory-bounded).
-      for UnitIdx := 1 to Units - 1 do
+      for UnitIdx := 1 to UnitsM1 do
       begin
         Tmp := LastVals[UnitIdx];
         J := UnitIdx - 1;
@@ -83687,10 +83714,10 @@ begin
       // recomputed with one extra forward sweep would double the cost, so we
       // bin the last sample's values we already have buffered.
       SetLength(HistBins, cHistBins);
-      for BinIdx := 0 to cHistBins - 1 do HistBins[BinIdx] := 0;
+      for BinIdx := 0 to cHistBinsM1 do HistBins[BinIdx] := 0;
       if MaxAbsV > 0 then
       begin
-        for UnitIdx := 0 to Units - 1 do
+        for UnitIdx := 0 to UnitsM1 do
         begin
           BinIdx := Trunc(((LastVals[UnitIdx] + MaxAbsV) /
             (2.0 * MaxAbsV)) * cHistBins);
@@ -83700,7 +83727,7 @@ begin
         end;
       end;
       MaxHistBin := 0;
-      for BinIdx := 0 to cHistBins - 1 do
+      for BinIdx := 0 to cHistBinsM1 do
         if HistBins[BinIdx] > MaxHistBin then MaxHistBin := HistBins[BinIdx];
       HistLine := '';
       for BinIdx := 0 to cHistBins - 1 do
