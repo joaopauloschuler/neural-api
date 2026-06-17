@@ -80241,6 +80241,8 @@ var
   CorrectDepthSum, IncorrectDepthSum: TNeuralFloat;
   CorrectCnt, IncorrectCnt, MaxDepthVal, FinalLayerAgree, UsedQuery: integer;
   MaxBin, BarLen, KK, KEff, Found, DeepCount: integer;
+  LastLayerIdx, MaxFeatDimM1, NumSupportM1, NumProbedM1, NumQueryM1: integer;
+  KEffM1, NumClassesM1, cBinsM1, DeepCountM1: integer;
   Bar: string;
 
   // Fill Row (length FeatDim) from a probed layer's Output, applying the
@@ -80264,7 +80266,7 @@ var
     end
     else
     begin
-      for F := 0 to Pr.FeatDim - 1 do
+      for F := 0 to FeatDimM1 do
       begin
         Dst[F] := OutVol.FData[F];
         NrmSq := NrmSq + Dst[F] * Dst[F];
@@ -80319,13 +80321,20 @@ begin
     HasQLabels := Length(QueryLabels) >= NumQuery;
     KEff := K;
     if KEff > NumSupport then KEff := NumSupport;
+    LastLayerIdx := NN.GetLastLayerIdx();
+    MaxFeatDimM1 := MaxFeatDim - 1;
+    NumSupportM1 := NumSupport - 1;
+    NumQueryM1 := NumQuery - 1;
+    KEffM1 := KEff - 1;
+    NumClassesM1 := NumClasses - 1;
+    cBinsM1 := cBins - 1;
 
     // --- Catalogue probeable layers (skip zero-size outputs), building a
     //     deterministic random projection for over-wide layers. ---
     SetLength(Probes, NN.CountLayers());
     SetLength(ProbeName, NN.CountLayers());
     NumProbed := 0;
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LayerIdx];
       FlatSz := Layer.Output.Size;
@@ -80339,7 +80348,7 @@ begin
         SetLength(Probes[NumProbed].ProjSrc, MaxFeatDim);
         SetLength(Probes[NumProbed].ProjSign, MaxFeatDim);
         RandSeed := cProjSeed + LayerIdx;
-        for J := 0 to MaxFeatDim - 1 do
+        for J := 0 to MaxFeatDimM1 do
         begin
           Probes[NumProbed].ProjSrc[J] := Random(FlatSz);
           if Random(2) = 0 then
@@ -80357,6 +80366,7 @@ begin
     end;
     SetLength(Probes, NumProbed);
     SetLength(ProbeName, NumProbed);
+    NumProbedM1 := NumProbed - 1;
 
     if NumProbed = 0 then
     begin
@@ -80369,11 +80379,11 @@ begin
     //     and cache their L2 norms. ---
     SetLength(SupFeat, NumProbed, NumSupport);
     SetLength(SupNorm, NumProbed, NumSupport);
-    for I := 0 to NumSupport - 1 do
+    for I := 0 to NumSupportM1 do
     begin
       if Support[I] = nil then Continue;
       NN.Compute(Support[I]);
-      for ProbeIdx := 0 to NumProbed - 1 do
+      for ProbeIdx := 0 to NumProbedM1 do
       begin
         LayerIdx := Probes[ProbeIdx].LayerIdx;
         SetLength(SupFeat[ProbeIdx][I], Probes[ProbeIdx].FeatDim);
@@ -80388,7 +80398,7 @@ begin
     SetLength(QryFeat, NumProbed, NumQuery);
     SetLength(QryNorm, NumProbed, NumQuery);
     SetLength(FinalArgmax, NumQuery);
-    for I := 0 to NumQuery - 1 do
+    for I := 0 to NumQueryM1 do
     begin
       if Queries[I] = nil then
       begin
@@ -80397,7 +80407,7 @@ begin
       end;
       NN.Compute(Queries[I]);
       FinalArgmax[I] := NN.GetLastLayer().Output.GetClass();
-      for ProbeIdx := 0 to NumProbed - 1 do
+      for ProbeIdx := 0 to NumProbedM1 do
       begin
         LayerIdx := Probes[ProbeIdx].LayerIdx;
         SetLength(QryFeat[ProbeIdx][I], Probes[ProbeIdx].FeatDim);
@@ -80410,7 +80420,7 @@ begin
     // --- Per-query prediction depth via per-layer k-NN votes. ---
     SetLength(Depth, NumQuery);
     SetLength(NewlyResolved, NumProbed);
-    for ProbeIdx := 0 to NumProbed - 1 do NewlyResolved[ProbeIdx] := 0;
+    for ProbeIdx := 0 to NumProbedM1 do NewlyResolved[ProbeIdx] := 0;
     SetLength(AgreeAtLayer, NumProbed);
     SetLength(BestDist, KEff);
     SetLength(BestCls, KEff);
@@ -80418,7 +80428,7 @@ begin
     FinalLayerAgree := 0;
     UsedQuery := 0;
 
-    for I := 0 to NumQuery - 1 do
+    for I := 0 to NumQueryM1 do
     begin
       if FinalArgmax[I] < 0 then
       begin
@@ -80427,16 +80437,16 @@ begin
       end;
       Inc(UsedQuery);
       // For each probed layer, k-NN vote over the support set (cosine dist).
-      for ProbeIdx := 0 to NumProbed - 1 do
+      for ProbeIdx := 0 to NumProbedM1 do
       begin
         Row := QryFeat[ProbeIdx][I];
         // maintain the KEff smallest distances (simple insertion).
-        for KK := 0 to KEff - 1 do
+        for KK := 0 to KEffM1 do
         begin
           BestDist[KK] := 1e30;
           BestCls[KK] := -1;
         end;
-        for J := 0 to NumSupport - 1 do
+        for J := 0 to NumSupportM1 do
         begin
           if Support[J] = nil then Continue;
           if (QryNorm[ProbeIdx][I] < cEps) or (SupNorm[ProbeIdx][J] < cEps) then
@@ -80466,13 +80476,13 @@ begin
           end;
         end;
         // majority vote (ties -> lowest class index via strict >).
-        for C := 0 to NumClasses - 1 do ClassVotes[C] := 0;
-        for KK := 0 to KEff - 1 do
+        for C := 0 to NumClassesM1 do ClassVotes[C] := 0;
+        for KK := 0 to KEffM1 do
           if (BestCls[KK] >= 0) and (BestCls[KK] < NumClasses) then
             ClassVotes[BestCls[KK]] := ClassVotes[BestCls[KK]] + 1.0;
         Vote := 0;
         BestVal := ClassVotes[0];
-        for C := 1 to NumClasses - 1 do
+        for C := 1 to NumClassesM1 do
           if ClassVotes[C] > BestVal then
           begin
             BestVal := ClassVotes[C];
@@ -80497,12 +80507,12 @@ begin
 
     // --- Aggregate statistics. ---
     MeanDepth := 0;
-    for I := 0 to NumQuery - 1 do MeanDepth := MeanDepth + Depth[I];
+    for I := 0 to NumQueryM1 do MeanDepth := MeanDepth + Depth[I];
     MeanDepth := MeanDepth / NumQuery;
     SetLength(SortDepth, NumQuery);
-    for I := 0 to NumQuery - 1 do SortDepth[I] := Depth[I];
+    for I := 0 to NumQueryM1 do SortDepth[I] := Depth[I];
     // simple insertion sort for the median (query batches are modest)
-    for I := 1 to NumQuery - 1 do
+    for I := 1 to NumQueryM1 do
     begin
       SwapI := SortDepth[I];
       J := I - 1;
@@ -80541,8 +80551,8 @@ begin
 
     // --- 10-bin histogram of prediction depth over [0, NumProbed-1]. ---
     SetLength(DepthBins, cBins);
-    for BinIdx := 0 to cBins - 1 do DepthBins[BinIdx] := 0;
-    for I := 0 to NumQuery - 1 do
+    for BinIdx := 0 to cBinsM1 do DepthBins[BinIdx] := 0;
+    for I := 0 to NumQueryM1 do
     begin
       if NumProbed <= 1 then
         BinIdx := 0
@@ -80553,11 +80563,11 @@ begin
       Inc(DepthBins[BinIdx]);
     end;
     MaxBin := 0;
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
       if DepthBins[BinIdx] > MaxBin then MaxBin := DepthBins[BinIdx];
     Lines.Add('');
     Lines.Add('Distribution of prediction depth across the query batch:');
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
     begin
       if MaxBin > 0 then
         BarLen := Round((DepthBins[BinIdx] / MaxBin) * cMaxBarWidth)
@@ -80571,11 +80581,11 @@ begin
 
     // --- Per-layer "newly-resolved" profile (depth-vs-layer). ---
     MaxBin := 0;
-    for ProbeIdx := 0 to NumProbed - 1 do
+    for ProbeIdx := 0 to NumProbedM1 do
       if NewlyResolved[ProbeIdx] > MaxBin then MaxBin := NewlyResolved[ProbeIdx];
     Lines.Add('');
     Lines.Add('Per-layer newly-resolved count (queries first locking in here):');
-    for ProbeIdx := 0 to NumProbed - 1 do
+    for ProbeIdx := 0 to NumProbedM1 do
     begin
       if MaxBin > 0 then
         BarLen := Round((NewlyResolved[ProbeIdx] / MaxBin) * cMaxBarWidth)
@@ -80590,6 +80600,7 @@ begin
     // --- K deepest (hardest) query indices. ---
     DeepCount := K;
     if DeepCount > NumQuery then DeepCount := NumQuery;
+    DeepCountM1 := DeepCount - 1;
     Lines.Add('');
     Lines.Add(Format(
       'Hardest %d query indices (deepest prediction depth - relabel / hard-' +
@@ -80597,12 +80608,12 @@ begin
     // selection of the DeepCount largest depths (stable-ish: lowest index first
     // among equal depths). Mark consumed entries by setting depth to -1 in copy.
     SetLength(SortDepth, NumQuery);
-    for I := 0 to NumQuery - 1 do SortDepth[I] := Depth[I];
-    for KK := 0 to DeepCount - 1 do
+    for I := 0 to NumQueryM1 do SortDepth[I] := Depth[I];
+    for KK := 0 to DeepCountM1 do
     begin
       MaxDepthVal := -1;
       Found := -1;
-      for I := 0 to NumQuery - 1 do
+      for I := 0 to NumQueryM1 do
         if SortDepth[I] > MaxDepthVal then
         begin
           MaxDepthVal := SortDepth[I];
@@ -80619,7 +80630,7 @@ begin
     begin
       CorrectDepthSum := 0; IncorrectDepthSum := 0;
       CorrectCnt := 0; IncorrectCnt := 0;
-      for I := 0 to NumQuery - 1 do
+      for I := 0 to NumQueryM1 do
       begin
         if FinalArgmax[I] < 0 then Continue;
         if FinalArgmax[I] = QueryLabels[I] then
@@ -80705,6 +80716,7 @@ var
   CrystSum, CrystCnt: TNeuralFloat;
   CrystBins: array of integer;
   MaxBin, BarLen: integer;
+  NumLayersM1, NumCompatM1, NumSamplesM1, NumClassesM1, cBinsM1: integer;
   Prob: TFloatArray;                  // scratch p_L for one sample
   KLval, EntVal, Conf, Pf, Pl, Acc, BarVal, MaxKL: TNeuralFloat;
   Bar, SkipList: string;
@@ -80726,12 +80738,15 @@ begin
     end;
     NumLayers := NN.CountLayers();
     LastLayer := NN.GetLastLayerIdx();
+    NumLayersM1 := NumLayers - 1;
+    cBinsM1 := cBins - 1;
     if NumLayers < 2 then
     begin
       Result := 'LogitLensReport: network needs at least 2 layers.' + sLineBreak;
       Exit;
     end;
     NumClasses := NN.GetLastLayer().Output.Size;
+    NumClassesM1 := NumClasses - 1;
     if NumClasses < 2 then
     begin
       Result := 'LogitLensReport: final layer must have >= 2 outputs.' +
@@ -80764,11 +80779,12 @@ begin
     OnlyHead := (HeadIdx = LastLayer);         // single-layer head?
 
     NumSamples := pInput.Count;
+    NumSamplesM1 := NumSamples - 1;
 
     // --- Catalogue which earlier layers (0..HeadInIdx) are lens-compatible. ---
     SetLength(Compatible, NumLayers);
     NumCompat := 0;
-    for LayerIdx := 0 to NumLayers - 1 do Compatible[LayerIdx] := False;
+    for LayerIdx := 0 to NumLayersM1 do Compatible[LayerIdx] := False;
     for LayerIdx := 0 to HeadInIdx do
       if NN.Layers[LayerIdx].Output.Size = HeadInSize then
       begin
@@ -80776,6 +80792,7 @@ begin
         Inc(NumCompat);
       end;
     // HeadInIdx itself is always compatible (it IS the head input).
+    NumCompatM1 := NumCompat - 1;
     SetLength(CompatOrder, NumCompat);
     I := 0;
     for LayerIdx := 0 to HeadInIdx do
@@ -80789,7 +80806,7 @@ begin
     SetLength(KLsum, NumLayers);
     SetLength(ConfSum, NumLayers);
     SetLength(EntSum, NumLayers);
-    for LayerIdx := 0 to NumLayers - 1 do
+    for LayerIdx := 0 to NumLayersM1 do
     begin
       Agree[LayerIdx] := 0; KLsum[LayerIdx] := 0;
       ConfSum[LayerIdx] := 0; EntSum[LayerIdx] := 0;
@@ -80800,34 +80817,34 @@ begin
     SetLength(LensArgmax, NumSamples);
     SetLength(Prob, NumClasses);
     SetLength(PerSampleCorrect, NumCompat);
-    for I := 0 to NumCompat - 1 do SetLength(PerSampleCorrect[I], NumSamples);
+    for I := 0 to NumCompatM1 do SetLength(PerSampleCorrect[I], NumSamples);
 
     CandSnap := TNNetVolume.Create();
 
     // --- (1) final forward pass per sample: record p_final and argmax. ---
-    for SampleIdx := 0 to NumSamples - 1 do
+    for SampleIdx := 0 to NumSamplesM1 do
     begin
       InVol := pInput[SampleIdx];
       if InVol = nil then
       begin
         SetLength(FinalProb[SampleIdx], NumClasses);
-        for C := 0 to NumClasses - 1 do FinalProb[SampleIdx][C] := 0;
+        for C := 0 to NumClassesM1 do FinalProb[SampleIdx][C] := 0;
         FinalArgmax[SampleIdx] := 0;
         Continue;
       end;
       NN.Compute(InVol);
       FinalArgmax[SampleIdx] := NN.GetLastLayer().Output.GetClass();
       SetLength(FinalProb[SampleIdx], NumClasses);
-      for C := 0 to NumClasses - 1 do
+      for C := 0 to NumClassesM1 do
         FinalProb[SampleIdx][C] := NN.GetLastLayer().Output.FData[C];
     end;
 
     // --- (2) per compatible candidate layer: splice activation into the head
     //         input slot, recompute ONLY the head layers, read the lens p_L. ---
-    for I := 0 to NumCompat - 1 do
+    for I := 0 to NumCompatM1 do
     begin
       L := CompatOrder[I];
-      for SampleIdx := 0 to NumSamples - 1 do
+      for SampleIdx := 0 to NumSamplesM1 do
       begin
         InVol := pInput[SampleIdx];
         if InVol = nil then
@@ -80848,7 +80865,7 @@ begin
           NN.Layers[C].Compute();
         // Read the lens distribution (softmax-family head => already normalised).
         Conf := 0;
-        for C := 0 to NumClasses - 1 do
+        for C := 0 to NumClassesM1 do
         begin
           Pl := NN.GetLastLayer().Output.FData[C];
           if Pl < 0 then Pl := 0;
@@ -80864,7 +80881,7 @@ begin
         // Entropy and KL(p_L || p_final), probabilities floored at cEps.
         EntVal := 0;
         KLval := 0;
-        for C := 0 to NumClasses - 1 do
+        for C := 0 to NumClassesM1 do
         begin
           Pl := Prob[C];
           if Pl < cEps then Pl := cEps;
@@ -80888,7 +80905,7 @@ begin
     SetLength(CrystComp, NumSamples);
     CrystSum := 0;
     CrystCnt := 0;
-    for SampleIdx := 0 to NumSamples - 1 do
+    for SampleIdx := 0 to NumSamplesM1 do
     begin
       CrystComp[SampleIdx] := -1;
       for I := NumCompat - 1 downto 0 do
@@ -80924,7 +80941,7 @@ begin
     Lines.Add(Format('%-5s %-30s %8s %9s %9s %9s',
       ['Idx', 'Layer', 'FlatSz', 'Agree', 'KLtoFinal', 'Conf']));
     Lines.Add(StringOfChar('-', 80));
-    for I := 0 to NumCompat - 1 do
+    for I := 0 to NumCompatM1 do
     begin
       L := CompatOrder[I];
       Lines.Add(Format('%-5d %-30s %8d %8.2f%% %9.4f %8.2f%%',
@@ -80937,7 +80954,7 @@ begin
     Lines.Add('');
     Lines.Add('Per-layer lens agreement with the final argmax (climbs with ' +
       'depth in a trained net):');
-    for I := 0 to NumCompat - 1 do
+    for I := 0 to NumCompatM1 do
     begin
       L := CompatOrder[I];
       BarLen := Round(Agree[L] * cMaxBarWidth);
@@ -80949,13 +80966,13 @@ begin
 
     // --- (6) per-layer KL(p_L || p_final) curve (the headline picture). ---
     MaxKL := 0;
-    for I := 0 to NumCompat - 1 do
+    for I := 0 to NumCompatM1 do
       if KLsum[CompatOrder[I]] > MaxKL then MaxKL := KLsum[CompatOrder[I]];
     if MaxKL <= 0 then MaxKL := 1.0;
     Lines.Add('');
     Lines.Add('Per-layer KL(p_L || p_final) (monotone DECREASE = residual ' +
       'stream refining toward the final answer):');
-    for I := 0 to NumCompat - 1 do
+    for I := 0 to NumCompatM1 do
     begin
       L := CompatOrder[I];
       BarVal := KLsum[L];
@@ -80970,7 +80987,7 @@ begin
     Lines.Add('');
     Lines.Add('Per-layer mean lens entropy (nats; decreasing = a sharpening ' +
       'readout):');
-    for I := 0 to NumCompat - 1 do
+    for I := 0 to NumCompatM1 do
     begin
       L := CompatOrder[I];
       Lines.Add(Format('  L%-3d entropy=%8.4f  conf=%6.2f%%',
@@ -80989,9 +81006,9 @@ begin
         'head (lens never stabilises to the final argmax).');
     // Histogram over compatible-layer absolute index range [first..HeadInIdx].
     SetLength(CrystBins, cBins);
-    for BinIdx := 0 to cBins - 1 do CrystBins[BinIdx] := 0;
+    for BinIdx := 0 to cBinsM1 do CrystBins[BinIdx] := 0;
     HaveAny := False;
-    for SampleIdx := 0 to NumSamples - 1 do
+    for SampleIdx := 0 to NumSamplesM1 do
     begin
       if CrystComp[SampleIdx] < 0 then Continue;
       HaveAny := True;
@@ -81004,14 +81021,14 @@ begin
       Inc(CrystBins[BinIdx]);
     end;
     MaxBin := 0;
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
       if CrystBins[BinIdx] > MaxBin then MaxBin := CrystBins[BinIdx];
     Lines.Add('Per-sample crystallization histogram (left=shallowest ' +
       'compatible layer, right=head input):');
     if not HaveAny then
       Lines.Add('  (no sample crystallizes)')
     else
-      for BinIdx := 0 to cBins - 1 do
+      for BinIdx := 0 to cBinsM1 do
       begin
         if MaxBin > 0 then
           BarLen := Round((CrystBins[BinIdx] / MaxBin) * cMaxBarWidth)
@@ -81106,6 +81123,7 @@ var
   BarLen: integer;
   Bar, SkipList: string;
   TunedCnt: integer;
+  NumLayersM1, NumSamplesM1, NumClassesM1, NumCompatM1: integer;
 begin
   Result := '';
   Lines := TStringList.Create();
@@ -81121,12 +81139,14 @@ begin
     end;
     NumLayers := NN.CountLayers();
     LastLayer := NN.GetLastLayerIdx();
+    NumLayersM1 := NumLayers - 1;
     if NumLayers < 2 then
     begin
       Result := 'TunedLensReport: network needs at least 2 layers.' + sLineBreak;
       Exit;
     end;
     NumClasses := NN.GetLastLayer().Output.Size;
+    NumClassesM1 := NumClasses - 1;
     if NumClasses < 2 then
     begin
       Result := 'TunedLensReport: final layer must have >= 2 outputs.' +
@@ -81153,17 +81173,19 @@ begin
     HeadInIdx := HeadIdx - 1;
     HeadInSize := NN.Layers[HeadInIdx].Output.Size;
     NumSamples := pInput.Count;
+    NumSamplesM1 := NumSamples - 1;
 
     // --- Catalogue lens-compatible layers (flat size == head input size). ---
     SetLength(Compatible, NumLayers);
     NumCompat := 0;
-    for LayerIdx := 0 to NumLayers - 1 do Compatible[LayerIdx] := False;
+    for LayerIdx := 0 to NumLayersM1 do Compatible[LayerIdx] := False;
     for LayerIdx := 0 to HeadInIdx do
       if NN.Layers[LayerIdx].Output.Size = HeadInSize then
       begin
         Compatible[LayerIdx] := True;
         Inc(NumCompat);
       end;
+    NumCompatM1 := NumCompat - 1;
     SetLength(CompatOrder, NumCompat);
     I := 0;
     for LayerIdx := 0 to HeadInIdx do
@@ -81176,7 +81198,7 @@ begin
     SetLength(TunedKL, NumLayers); SetLength(TunedEnt, NumLayers);
     SetLength(TunedAgree, NumLayers); SetLength(TunedKLPre, NumLayers);
     SetLength(MaxDp, NumLayers);
-    for LayerIdx := 0 to NumLayers - 1 do
+    for LayerIdx := 0 to NumLayersM1 do
     begin
       LogitKL[LayerIdx] := 0; LogitEnt[LayerIdx] := 0;
       TunedKL[LayerIdx] := 0; TunedEnt[LayerIdx] := 0;
@@ -81191,19 +81213,19 @@ begin
     LogitProb := TNNetVolume.Create(NumClasses, 1, 1);
 
     // --- (1) final forward pass per sample: record p_final and argmax. ---
-    for SampleIdx := 0 to NumSamples - 1 do
+    for SampleIdx := 0 to NumSamplesM1 do
     begin
       SetLength(FinalProb[SampleIdx], NumClasses);
       InVol := pInput[SampleIdx];
       if InVol = nil then
       begin
-        for C := 0 to NumClasses - 1 do FinalProb[SampleIdx][C] := 0;
+        for C := 0 to NumClassesM1 do FinalProb[SampleIdx][C] := 0;
         FinalArgmax[SampleIdx] := 0;
         Continue;
       end;
       NN.Compute(InVol);
       FinalArgmax[SampleIdx] := NN.GetLastLayer().Output.GetClass();
-      for C := 0 to NumClasses - 1 do
+      for C := 0 to NumClassesM1 do
         FinalProb[SampleIdx][C] := NN.GetLastLayer().Output.FData[C];
     end;
 
@@ -81234,7 +81256,7 @@ begin
     //         the IDENTITY (so untrained == logit lens), measure the pre-fit KL,
     //         then fit the translator on the distillation-to-self KL target, and
     //         finally measure the tuned-lens columns. ---
-    for I := 0 to NumCompat - 1 do
+    for I := 0 to NumCompatM1 do
     begin
       L := CompatOrder[I];
 
@@ -81254,7 +81276,7 @@ begin
       Lens.ClearDeltas();
 
       // --- pre-fit pass (identity translator): KL must tie the raw logit lens.
-      for SampleIdx := 0 to NumSamples - 1 do
+      for SampleIdx := 0 to NumSamplesM1 do
       begin
         InVol := pInput[SampleIdx];
         if InVol = nil then Continue;
@@ -81262,7 +81284,7 @@ begin
         CandSnap.Copy(NN.Layers[L].Output);
         Lens.Compute(CandSnap);
         KLval := 0;
-        for C := 0 to NumClasses - 1 do
+        for C := 0 to NumClassesM1 do
         begin
           Pl := Lens.GetLastLayer().Output.FData[C];
           if Pl < cEps then Pl := cEps;
@@ -81278,7 +81300,7 @@ begin
 
       // --- raw logit-lens columns (the model's own head on the raw activation,
       //     NO translator) - same idiom as LogitLensReport, for the side-by-side.
-      for SampleIdx := 0 to NumSamples - 1 do
+      for SampleIdx := 0 to NumSamplesM1 do
       begin
         InVol := pInput[SampleIdx];
         if InVol = nil then Continue;
@@ -81287,7 +81309,7 @@ begin
         NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
         for C := HeadIdx to LastLayer do NN.Layers[C].Compute();
         EntVal := 0; KLval := 0;
-        for C := 0 to NumClasses - 1 do
+        for C := 0 to NumClassesM1 do
         begin
           Pl := NN.GetLastLayer().Output.FData[C];
           if Pl < 0 then Pl := 0;
@@ -81317,7 +81339,7 @@ begin
         NN.Compute(InVol);
         CandSnap.Copy(NN.Layers[L].Output);
         TargetVol.ReSize(NumClasses, 1, 1);
-        for C := 0 to NumClasses - 1 do TargetVol.FData[C] := FinalProb[SampleIdx][C];
+        for C := 0 to NumClassesM1 do TargetVol.FData[C] := FinalProb[SampleIdx][C];
         Lens.Compute(CandSnap);
         // Online step: TNNetFullConnect.Backpropagate applies the weight update
         // inline (non-batch mode), exactly like the Fit/TrainOnce loop. The head
@@ -81327,7 +81349,7 @@ begin
 
       // --- post-fit tuned-lens columns + correctness signals. ---
       TunedCnt := 0;
-      for SampleIdx := 0 to NumSamples - 1 do
+      for SampleIdx := 0 to NumSamplesM1 do
       begin
         InVol := pInput[SampleIdx];
         if InVol = nil then Continue;
@@ -81335,7 +81357,7 @@ begin
         CandSnap.Copy(NN.Layers[L].Output);
         Lens.Compute(CandSnap);
         EntVal := 0; KLval := 0;
-        for C := 0 to NumClasses - 1 do
+        for C := 0 to NumClassesM1 do
         begin
           Pl := Lens.GetLastLayer().Output.FData[C];
           if Pl < 0 then Pl := 0;
@@ -81360,7 +81382,7 @@ begin
           CandSnap.Copy(NN.Layers[L].Output);
           NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
           for C := HeadIdx to LastLayer do NN.Layers[C].Compute();
-          for C := 0 to NumClasses - 1 do
+          for C := 0 to NumClassesM1 do
           begin
             // Lens is a separate net; its Output persists through the NN
             // recompute above, so this compares tuned vs raw-logit at the head.
@@ -81394,7 +81416,7 @@ begin
       ['Idx', 'Layer', 'logitKL', 'tunedKL', 'logitEnt', 'tunedEnt',
        'tAgree']));
     Lines.Add(StringOfChar('-', 92));
-    for I := 0 to NumCompat - 1 do
+    for I := 0 to NumCompatM1 do
     begin
       L := CompatOrder[I];
       Lines.Add(Format('%-5d %-26s %11.4f %11.4f %11.4f %11.4f %8.2f%%',
@@ -81408,11 +81430,11 @@ begin
     Lines.Add('Per-layer KL-to-final: logit lens (.) vs TUNED lens (#). ' +
       'Tuned should sit LOWER (commits earlier, tracks final more faithfully):');
     MeanLogitKL := 0;
-    for I := 0 to NumCompat - 1 do
+    for I := 0 to NumCompatM1 do
       if LogitKL[CompatOrder[I]] > MeanLogitKL then
         MeanLogitKL := LogitKL[CompatOrder[I]];
     if MeanLogitKL <= 0 then MeanLogitKL := 1.0;
-    for I := 0 to NumCompat - 1 do
+    for I := 0 to NumCompatM1 do
     begin
       L := CompatOrder[I];
       BarLen := Round((LogitKL[L] / MeanLogitKL) * cMaxBarWidth);
@@ -81429,7 +81451,7 @@ begin
 
     // --- (6) headline aggregate: mean KL-to-final across compatible layers. ---
     MeanLogitKL := 0; MeanTunedKLPre := 0; MeanTunedKL := 0;
-    for I := 0 to NumCompat - 1 do
+    for I := 0 to NumCompatM1 do
     begin
       L := CompatOrder[I];
       MeanLogitKL := MeanLogitKL + LogitKL[L];
@@ -81573,21 +81595,24 @@ var
   RowFlags, Bar, Glyph, Line: string;
   BarLen, GlyphIdx: integer;
   LogR, MinLogR, MaxLogR, SpanR: TNeuralFloat;
+  NumClassesM1, NM1, LastLayerIdx, MaxFeatDimM1, NumProbedM1, DM1: integer;
 
   // Fill FeatRow (length D) from a probed layer Output, applying the random
   // projection when this layer was capped.
   procedure ReadFeatures(const Pr: TLayerProbe; OutVol: TNNetVolume);
   var
     K: integer;
+    FeatDimMax: integer;
   begin
+    FeatDimMax := Pr.FeatDim - 1;
     if Pr.Projected then
     begin
-      for K := 0 to Pr.FeatDim - 1 do
+      for K := 0 to FeatDimMax do
         FeatRow[K] := Pr.ProjSign[K] * OutVol.FData[Pr.ProjSrc[K]];
     end
     else
     begin
-      for K := 0 to Pr.FeatDim - 1 do
+      for K := 0 to FeatDimMax do
         FeatRow[K] := OutVol.FData[K];
     end;
   end;
@@ -81615,13 +81640,17 @@ begin
     end;
     if MaxFeatDim < 1 then MaxFeatDim := 1;
     N := Samples.Count;
+    NumClassesM1 := NumClasses - 1;
+    NM1 := N - 1;
+    MaxFeatDimM1 := MaxFeatDim - 1;
+    LastLayerIdx := NN.GetLastLayerIdx();
 
     // --- Extract integer labels and per-class counts (skip out-of-range). ---
     SetLength(Labels, N);
     SetLength(ClassCount, NumClasses);
-    for C := 0 to NumClasses - 1 do ClassCount[C] := 0;
+    for C := 0 to NumClassesM1 do ClassCount[C] := 0;
     NValid := 0;
-    for SampleIdx := 0 to N - 1 do
+    for SampleIdx := 0 to NM1 do
     begin
       Pair := Samples[SampleIdx];
       if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then
@@ -81646,14 +81675,14 @@ begin
       Exit;
     end;
     UsedClasses := 0;
-    for C := 0 to NumClasses - 1 do
+    for C := 0 to NumClassesM1 do
       if ClassCount[C] > 0 then Inc(UsedClasses);
 
     // --- Catalogue trainable layers to probe (Neurons.Count>0, non-zero
     //     Output), building a deterministic random projection where wide. ---
     SetLength(Probes, NN.CountLayers());
     NumProbed := 0;
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LayerIdx];
       if Layer.Neurons.Count = 0 then Continue;
@@ -81668,7 +81697,7 @@ begin
         SetLength(Probes[NumProbed].ProjSrc, MaxFeatDim);
         SetLength(Probes[NumProbed].ProjSign, MaxFeatDim);
         RandSeed := cProjSeed + LayerIdx;
-        for J := 0 to MaxFeatDim - 1 do
+        for J := 0 to MaxFeatDimM1 do
         begin
           Probes[NumProbed].ProjSrc[J] := Random(FlatSz);
           if Random(2) = 0 then
@@ -81685,6 +81714,7 @@ begin
       Inc(NumProbed);
     end;
 
+    NumProbedM1 := NumProbed - 1;
     if NumProbed = 0 then
     begin
       Result := 'FeatureSeparabilityReport: no trainable layers to probe.' +
@@ -81703,16 +81733,17 @@ begin
     HaveCosMat := false;
 
     // --- Per probed layer: one forward pass over the batch, scatter decomp. ---
-    for ProbeIdx := 0 to NumProbed - 1 do
+    for ProbeIdx := 0 to NumProbedM1 do
     begin
       LayerIdx := Probes[ProbeIdx].LayerIdx;
       Layer := NN.Layers[LayerIdx];
       D := Probes[ProbeIdx].FeatDim;
+      DM1 := D - 1;
       SetLength(FeatRow, D);
 
       // snapshot the N x D activation matrix (one Compute per sample)
       SetLength(Feats, N);
-      for SampleIdx := 0 to N - 1 do
+      for SampleIdx := 0 to NM1 do
       begin
         if Labels[SampleIdx] < 0 then
         begin
@@ -81723,44 +81754,44 @@ begin
         NN.Compute(Pair.I);
         ReadFeatures(Probes[ProbeIdx], Layer.Output);
         SetLength(Feats[SampleIdx], D);
-        for F := 0 to D - 1 do Feats[SampleIdx][F] := FeatRow[F];
+        for F := 0 to DM1 do Feats[SampleIdx][F] := FeatRow[F];
       end;
 
       // per-class mean + global mean
       SetLength(ClassMean, NumClasses);
       SetLength(GlobalMean, D);
-      for F := 0 to D - 1 do GlobalMean[F] := 0;
-      for C := 0 to NumClasses - 1 do
+      for F := 0 to DM1 do GlobalMean[F] := 0;
+      for C := 0 to NumClassesM1 do
       begin
         SetLength(ClassMean[C], D);
-        for F := 0 to D - 1 do ClassMean[C][F] := 0;
+        for F := 0 to DM1 do ClassMean[C][F] := 0;
       end;
-      for SampleIdx := 0 to N - 1 do
+      for SampleIdx := 0 to NM1 do
       begin
         if Labels[SampleIdx] < 0 then Continue;
         C := Labels[SampleIdx];
-        for F := 0 to D - 1 do
+        for F := 0 to DM1 do
         begin
           ClassMean[C][F] := ClassMean[C][F] + Feats[SampleIdx][F];
           GlobalMean[F] := GlobalMean[F] + Feats[SampleIdx][F];
         end;
       end;
-      for F := 0 to D - 1 do GlobalMean[F] := GlobalMean[F] / NValid;
-      for C := 0 to NumClasses - 1 do
+      for F := 0 to DM1 do GlobalMean[F] := GlobalMean[F] / NValid;
+      for C := 0 to NumClassesM1 do
         if ClassCount[C] > 0 then
-          for F := 0 to D - 1 do ClassMean[C][F] := ClassMean[C][F] / ClassCount[C];
+          for F := 0 to DM1 do ClassMean[C][F] := ClassMean[C][F] / ClassCount[C];
 
       // tr(S_w) = mean_c mean_{i in c} ||x_i - mu_c||^2  (per-class then mean
       // over occupied classes); tr(S_total) = mean_i ||x_i - mu||^2.
       SwSum := 0;
-      for C := 0 to NumClasses - 1 do
+      for C := 0 to NumClassesM1 do
       begin
         if ClassCount[C] = 0 then Continue;
         Acc := 0;
-        for SampleIdx := 0 to N - 1 do
+        for SampleIdx := 0 to NM1 do
         begin
           if Labels[SampleIdx] <> C then Continue;
-          for F := 0 to D - 1 do
+          for F := 0 to DM1 do
           begin
             Diff := Feats[SampleIdx][F] - ClassMean[C][F];
             Acc := Acc + Diff * Diff;
@@ -81772,10 +81803,10 @@ begin
 
       // tr(S_b) = mean_c ||mu_c - mu||^2 over occupied classes.
       SbSum := 0;
-      for C := 0 to NumClasses - 1 do
+      for C := 0 to NumClassesM1 do
       begin
         if ClassCount[C] = 0 then Continue;
-        for F := 0 to D - 1 do
+        for F := 0 to DM1 do
         begin
           Diff := ClassMean[C][F] - GlobalMean[F];
           SbSum := SbSum + Diff * Diff;
@@ -81784,10 +81815,10 @@ begin
       SbSum := SbSum / UsedClasses;
 
       TotSum := 0;
-      for SampleIdx := 0 to N - 1 do
+      for SampleIdx := 0 to NM1 do
       begin
         if Labels[SampleIdx] < 0 then Continue;
-        for F := 0 to D - 1 do
+        for F := 0 to DM1 do
         begin
           Diff := Feats[SampleIdx][F] - GlobalMean[F];
           TotSum := TotSum + Diff * Diff;
@@ -81815,22 +81846,22 @@ begin
       SilSample := 0;
       if UsedClasses >= 2 then
       begin
-        for SampleIdx := 0 to N - 1 do
+        for SampleIdx := 0 to NM1 do
         begin
           if Labels[SampleIdx] < 0 then Continue;
           TrueCls := Labels[SampleIdx];
           DistSelf := 0;
-          for F := 0 to D - 1 do
+          for F := 0 to DM1 do
           begin
             Diff := Feats[SampleIdx][F] - ClassMean[TrueCls][F];
             DistSelf := DistSelf + Diff * Diff;
           end;
           BestOther := 1e300;
-          for C := 0 to NumClasses - 1 do
+          for C := 0 to NumClassesM1 do
           begin
             if (C = TrueCls) or (ClassCount[C] = 0) then Continue;
             DistOther := 0;
-            for F := 0 to D - 1 do
+            for F := 0 to DM1 do
             begin
               Diff := Feats[SampleIdx][F] - ClassMean[C][F];
               DistOther := DistOther + Diff * Diff;
@@ -81852,22 +81883,22 @@ begin
         Silh[ProbeIdx] := 0;
 
       // class-mean pairwise cosine: mean off-diagonal + ETF target.
-      for C := 0 to NumClasses - 1 do
+      for C := 0 to NumClassesM1 do
       begin
         Acc := 0;
-        for F := 0 to D - 1 do Acc := Acc + ClassMean[C][F] * ClassMean[C][F];
+        for F := 0 to DM1 do Acc := Acc + ClassMean[C][F] * ClassMean[C][F];
         ClassMeanNorm[C] := Sqrt(Acc);
       end;
       DotV := 0;     // sum of off-diagonal cosines
       OtherCls := 0; // count of off-diagonal occupied pairs
       // build the full cosine matrix (kept for the final layer's heatmap)
       SetLength(CosMat, NumClasses);
-      for I := 0 to NumClasses - 1 do
+      for I := 0 to NumClassesM1 do
       begin
         SetLength(CosMat[I], NumClasses);
-        for J := 0 to NumClasses - 1 do CosMat[I][J] := 0;
+        for J := 0 to NumClassesM1 do CosMat[I][J] := 0;
       end;
-      for I := 0 to NumClasses - 1 do
+      for I := 0 to NumClassesM1 do
       begin
         if ClassCount[I] = 0 then Continue;
         for J := 0 to NumClasses - 1 do
