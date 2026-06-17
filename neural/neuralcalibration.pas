@@ -192,7 +192,7 @@ function ComputeCalibration(
   const Labels: array of integer;
   BinCount: integer): TNeuralCalibrationReport;
 var
-  I, B, N, Total: integer;
+  I, B, N, Total, InputCount: integer;
   Probs, Logits: array of TNeuralFloat;
   PredClass, TrueClass, J: integer;
   Conf, BrierAcc, Diff: TNeuralFloat;
@@ -232,7 +232,8 @@ begin
   Total := 0;
   Correct := 0;
   BrierAcc := 0;
-  for I := 0 to Inputs.Count - 1 do
+  InputCount := Inputs.Count;
+  for I := 0 to InputCount - 1 do
   begin
     if Inputs[I] = nil then Continue;
     if I >= Length(Labels) then Break;
@@ -384,7 +385,7 @@ function FitTemperature(
   Inputs: TNNetVolumeList;
   const Labels: array of integer): TNeuralFloat;
 var
-  N, I, J, Step, TrueClass, Total: integer;
+  N, I, J, Step, TrueClass, Total, InputCount: integer;
   Logits, Probs: array of TNeuralFloat;
   // cached pseudo-logits for every valid sample (one forward pass total).
   AllLogits: array of array of TNeuralFloat;
@@ -397,15 +398,16 @@ begin
   N := NN.GetLastLayer().Output.Size;
   if N <= 0 then Exit;
 
+  InputCount := Inputs.Count;
   SetLength(Logits, N);
   SetLength(Probs, N);
-  SetLength(AllLogits, Inputs.Count);
-  SetLength(AllLabel, Inputs.Count);
+  SetLength(AllLogits, InputCount);
+  SetLength(AllLabel, InputCount);
 
   // Single forward pass over the set; cache logits so the grid scan is pure
   // arithmetic (the backbone is touched exactly once and never mutated).
   Total := 0;
-  for I := 0 to Inputs.Count - 1 do
+  for I := 0 to InputCount - 1 do
   begin
     if Inputs[I] = nil then Continue;
     if I >= Length(Labels) then Break;

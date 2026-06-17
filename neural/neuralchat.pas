@@ -420,7 +420,7 @@ function ExtractChatTemplateFromJson(const RawJson, ConfigFile: string): string;
 var
   Root, Node, Entry: TJSONData;
   Arr: TJSONArray;
-  Cnt: integer;
+  Cnt, ArrCount: integer;
 begin
   Result := '';
   // same fpjson stance as neuralhftokenizer: decode \uXXXX up front and
@@ -434,7 +434,8 @@ begin
     if Node is TJSONArray then
     begin // [{"name": ..., "template": ...}, ...]
       Arr := TJSONArray(Node);
-      for Cnt := 0 to Arr.Count - 1 do
+      ArrCount := Arr.Count;
+      for Cnt := 0 to ArrCount - 1 do
       begin
         Entry := Arr.Items[Cnt];
         if (Entry is TJSONObject) and
@@ -1833,12 +1834,13 @@ var
   // Result, setting the mask for the run to Assist.
   procedure EmitSegment(FromPos, ToPos: integer; Assist: boolean);
   var
-    J: integer;
+    J, SegCount: integer;
   begin
     if ToPos <= FromPos then exit;
     SegIds.Clear;
     Tokenizer.Encode(Copy(Rendered, FromPos, ToPos - FromPos), SegIds);
-    for J := 0 to SegIds.Count - 1 do
+    SegCount := SegIds.Count;
+    for J := 0 to SegCount - 1 do
     begin
       if EmitCnt > High(Result) then
       begin

@@ -698,7 +698,7 @@ var
   Toks, Prefix: TNeuralIntegerArray;
   ContextLen, InDepth, VocabSize: integer;
   PerPosition: boolean;
-  LineIdx, SampleLen, ClippedLen, Pos, Tgt: integer;
+  LineIdx, SampleLen, ClippedLen, Pos, Tgt, CorpusCount: integer;
   RowSum, Prob, SumNLL: TNeuralFloat;
 begin
   ZeroStats(Result);
@@ -718,7 +718,8 @@ begin
   SumNLL := 0;
   InV := TNNetVolume.Create(NN.GetFirstLayer().Output);
   try
-    for LineIdx := 0 to Corpus.Count - 1 do
+    CorpusCount := Corpus.Count;
+    for LineIdx := 0 to CorpusCount - 1 do
     begin
       Dict.Tokenize(Corpus[LineIdx], Toks);
       SampleLen := Length(Toks);
@@ -774,7 +775,7 @@ var
   InV: TNNetVolume;
   Last: TNNetLayer;
   ContextLen, VocabSize: integer;
-  LineIdx, SampleLen, Pos, Tgt: integer;
+  LineIdx, SampleLen, Pos, Tgt, CorpusCount: integer;
   Line: string;
   RowSum, Prob, SumNLL: TNeuralFloat;
 begin
@@ -789,7 +790,8 @@ begin
   SumNLL := 0;
   InV := TNNetVolume.Create(NN.GetFirstLayer().Output);
   try
-    for LineIdx := 0 to Corpus.Count - 1 do
+    CorpusCount := Corpus.Count;
+    for LineIdx := 0 to CorpusCount - 1 do
     begin
       Line := Corpus[LineIdx];
       SampleLen := Length(Line);
@@ -828,6 +830,7 @@ var
   ContextLen, InDepth, VocabSize: integer;
   PerPosition: boolean;
   LineIdx, StreamLen, WinStart, WinLen, FirstTgt, LastTgt: integer;
+  CorpusCount: integer;
   PrevEndAbs: integer; // last ABSOLUTE stream position already scored
   SumNLL: TNeuralFloat;
 begin
@@ -850,7 +853,8 @@ begin
   // Concatenate the whole corpus into one token stream (the HF recipe scores
   // the corpus as a single sequence, not per line).
   StreamLen := 0;
-  for LineIdx := 0 to Corpus.Count - 1 do
+  CorpusCount := Corpus.Count;
+  for LineIdx := 0 to CorpusCount - 1 do
   begin
     Dict.Tokenize(Corpus[LineIdx], Toks);
     if Length(Toks) = 0 then continue;
@@ -1528,10 +1532,11 @@ end;
 // min(count in candidate, count in reference).
 function ClippedOverlap(CandCounts, RefCounts: TStringList): integer;
 var
-  Idx, RefPos: integer;
+  Idx, RefPos, CandCount: integer;
 begin
   Result := 0;
-  for Idx := 0 to CandCounts.Count - 1 do
+  CandCount := CandCounts.Count;
+  for Idx := 0 to CandCount - 1 do
     if RefCounts.Find(CandCounts[Idx], RefPos) then
       Result := Result + Min(PtrInt(CandCounts.Objects[Idx]),
         PtrInt(RefCounts.Objects[RefPos]));

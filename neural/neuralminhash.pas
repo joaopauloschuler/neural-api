@@ -286,7 +286,7 @@ function TNeuralMinHasher.Shingle(const Doc: string): TStringList;
 var
   Tokens: TStringList;
   Work: string;
-  I, J: integer;
+  I, J, TokenCount: integer;
   Sh: string;
 begin
   Result := TStringList.Create;
@@ -302,6 +302,7 @@ begin
     // Drop empty tokens that StrictDelimiter=false can still leave on edges.
     for I := Tokens.Count - 1 downto 0 do
       if Trim(Tokens[I]) = '' then Tokens.Delete(I);
+    TokenCount := Tokens.Count;
     if Tokens.Count = 0 then
     begin
       Result.Add(''); // empty-doc shingle: stable degenerate signature
@@ -311,7 +312,7 @@ begin
     begin
       // Fewer tokens than N: one shingle of the whole (short) token list.
       Sh := '';
-      for J := 0 to Tokens.Count - 1 do
+      for J := 0 to TokenCount - 1 do
       begin
         if J > 0 then Sh := Sh + #31; // unit-separator joins tokens unambiguously
         Sh := Sh + Tokens[J];
@@ -319,7 +320,7 @@ begin
       Result.Add(Sh);
       Exit;
     end;
-    for I := 0 to Tokens.Count - FNGramSize do
+    for I := 0 to TokenCount - FNGramSize do
     begin
       Sh := '';
       for J := 0 to FNGramSize - 1 do
@@ -338,14 +339,15 @@ function TNeuralMinHasher.ComputeSignature(
   const Doc: string): TNeuralMinHashSignature;
 var
   Shingles: TStringList;
-  I, S: integer;
+  I, S, ShingleCount: integer;
   Base, HVal: UInt64;
 begin
   SetLength(Result, FNumHashes);
   for I := 0 to FNumHashes - 1 do Result[I] := High(UInt64);
   Shingles := Shingle(Doc);
   try
-    for S := 0 to Shingles.Count - 1 do
+    ShingleCount := Shingles.Count;
+    for S := 0 to ShingleCount - 1 do
     begin
       Base := FNV1a64(Shingles[S]) mod csP; // reduce into the field
       for I := 0 to FNumHashes - 1 do
@@ -389,7 +391,7 @@ function TrueJaccardOfSets(A, B: TStringList): double;
 var
   Inter, UnionCnt, I: integer;
   SA, SB: TStringList;
-  Idx: integer;
+  Idx, ACount, BCount, SACount: integer;
 begin
   // Work on sorted SET copies so |A| / |B| / intersection are exact.
   SA := TStringList.Create;
@@ -397,13 +399,16 @@ begin
   try
     SA.Sorted := true; SA.Duplicates := dupIgnore; SA.CaseSensitive := true;
     SB.Sorted := true; SB.Duplicates := dupIgnore; SB.CaseSensitive := true;
-    for I := 0 to A.Count - 1 do SA.Add(A[I]);
-    for I := 0 to B.Count - 1 do SB.Add(B[I]);
+    ACount := A.Count;
+    BCount := B.Count;
+    for I := 0 to ACount - 1 do SA.Add(A[I]);
+    for I := 0 to BCount - 1 do SB.Add(B[I]);
     if (SA.Count = 0) and (SB.Count = 0) then Exit(1.0);
     Inter := 0;
-    for I := 0 to SA.Count - 1 do
+    SACount := SA.Count;
+    for I := 0 to SACount - 1 do
       if SB.Find(SA[I], Idx) then Inc(Inter);
-    UnionCnt := SA.Count + SB.Count - Inter;
+    UnionCnt := SACount + SB.Count - Inter;
     if UnionCnt = 0 then Exit(0.0);
     Result := Inter / UnionCnt;
   finally
@@ -535,10 +540,11 @@ procedure DeduplicateCorpus(Docs: TStringList; NumHashes, NGramSize: integer;
   out KeepMask: TNeuralBooleanArray; out Stats: TNeuralDedupStats);
 var
   Arr: array of string;
-  I: integer;
+  I, DocCount: integer;
 begin
-  SetLength(Arr, Docs.Count);
-  for I := 0 to Docs.Count - 1 do Arr[I] := Docs[I];
+  DocCount := Docs.Count;
+  SetLength(Arr, DocCount);
+  for I := 0 to DocCount - 1 do Arr[I] := Docs[I];
   DeduplicateCorpusArr(Arr, NumHashes, NGramSize, Threshold, Seed,
     KeepMask, Stats);
 end;
