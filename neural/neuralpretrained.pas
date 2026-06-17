@@ -31356,6 +31356,7 @@ var
   FeatProjLN, FeatProj, PosConv, EncLN: TNNetLayer;
   LMHead, BranchInput, HiddenAct, PhiBranch, FeatInput, PreEncoder: TNNetLayer;
   EncLen, InLen, BlockCnt, i, k, Pad: integer;
+  NumConvLayersM1, NumLayersM1: integer;
   ConvPrefix, EncPrefix, BlockPrefix, TensorNameStr: string;
   Consumed: TStringList;
 
@@ -31388,6 +31389,8 @@ begin
           Reader.FileName + ' - not a ' + Config.ModelType +
           ' CTC checkpoint?');
       EncLen := Wav2Vec2EncoderLength(Config, NumSamples);
+      NumConvLayersM1 := Config.NumConvLayers - 1;
+      NumLayersM1 := Config.NumLayers - 1;
 
       // ---------------- Architecture ----------------
       NN := TNNet.Create();
@@ -31397,7 +31400,7 @@ begin
       SetLength(ConvLayer, Config.NumConvLayers);
       SetLength(ConvGN, Config.NumConvLayers);
       InLen := NumSamples;
-      for k := 0 to Config.NumConvLayers - 1 do
+      for k := 0 to NumConvLayersM1 do
       begin
         // conv_bias false => suppress the bias (pSuppressBias=1).
         ConvLayer[k] := NN.AddLayer( TNNetConvolutionLinear.Create(
@@ -31441,7 +31444,7 @@ begin
       SetLength(Inter, Config.NumLayers);
       SetLength(OutDense, Config.NumLayers);
       SetLength(OutLN, Config.NumLayers);
-      for BlockCnt := 0 to Config.NumLayers - 1 do
+      for BlockCnt := 0 to NumLayersM1 do
       begin
         // x := LN(x + dense(BIDIRECTIONAL-MHA(q|k|v(x)))).
         BranchInput := NN.GetLastLayer();
@@ -31478,7 +31481,7 @@ begin
 
       // ---------------- Weights ----------------
       ConvPrefix := Config.Prefix + 'feature_extractor.conv_layers.';
-      for k := 0 to Config.NumConvLayers - 1 do
+      for k := 0 to NumConvLayersM1 do
       begin
         if k = 0 then InLen := 1 else InLen := Config.ConvDim[k - 1];
         LoadWav2Vec2FeatureConv(Reader, ConvLayer[k],
@@ -31522,7 +31525,7 @@ begin
         Config.HiddenSize);
       MarkConsumed(EncPrefix + 'layer_norm.weight');
       MarkConsumed(EncPrefix + 'layer_norm.bias');
-      for BlockCnt := 0 to Config.NumLayers - 1 do
+      for BlockCnt := 0 to NumLayersM1 do
       begin
         BlockPrefix := EncPrefix + 'layers.' + IntToStr(BlockCnt) + '.';
         // Separate biased q/k/v -> the fused Q|K|V slab (query 0..d-1, key
@@ -31735,7 +31738,9 @@ procedure LoadPyannoteSincConv(Reader: TNNetSafeTensorsReader;
 var
   Lo, Ba: TNNetVolume;
   f: integer;
+  NumFiltersM1: integer;
 begin
+  NumFiltersM1 := NumFilters - 1;
   if not Reader.HasTensor(LowName) then
     ImportError('Pyannote import: missing tensor "' + LowName + '".');
   if not Reader.HasTensor(BandName) then
@@ -31748,7 +31753,7 @@ begin
   try
     Reader.LoadTensorFlat(LowName, Lo);
     Reader.LoadTensorFlat(BandName, Ba);
-    for f := 0 to NumFilters - 1 do
+    for f := 0 to NumFiltersM1 do
     begin
       Layer.FArrNeurons[0].Weights[f, 0, 0] := Lo.FData[f];
       Layer.FArrNeurons[0].Weights[f, 0, 1] := Ba.FData[f];
@@ -31767,14 +31772,16 @@ procedure LoadPyannoteConvBias(Reader: TNNetSafeTensorsReader;
 var
   B: TNNetVolume;
   o: integer;
+  OutDimM1: integer;
 begin
+  OutDimM1 := OutDim - 1;
   if Reader.ElementCount(BName) <> OutDim then
     ImportError('Pyannote import: "' + BName + '" must have ' +
       IntToStr(OutDim) + ' elements, got ' + Reader.ShapeAsString(BName));
   B := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(BName, B);
-    for o := 0 to OutDim - 1 do
+    for o := 0 to OutDimM1 do
       Layer.FArrNeurons[o].BiasWeight := B.FData[o];
   finally
     B.Free;
@@ -31792,8 +31799,11 @@ var
   GateNames: array[0..2] of string;
   BiasNames: array[0..2] of string;
   g, o, i: integer;
+  HiddenM1, InDimM1: integer;
   WName, BName: string;
 begin
+  HiddenM1 := Hidden - 1;
+  InDimM1 := InDim - 1;
   GateNames[0] := 'W_f'; GateNames[1] := 'W_i'; GateNames[2] := 'W_h';
   BiasNames[0] := 'b_f'; BiasNames[1] := 'b_i'; BiasNames[2] := 'b_h';
   W := TNNetVolume.Create;
@@ -31811,13 +31821,13 @@ begin
           Reader.ShapeAsString(WName));
       Reader.LoadTensorFlat(WName, W);   // row-major [out,in]
       // TNNetMinLSTM stores gate g in Neurons[g] as (InDim,1,Hidden) [out,0,in].
-      for o := 0 to Hidden - 1 do
-        for i := 0 to InDim - 1 do
+      for o := 0 to HiddenM1 do
+        for i := 0 to InDimM1 do
           Layer.FArrNeurons[g].Weights[o, 0, i] := W.FData[o * InDim + i];
       Consumed.Add(WName);
       // Bias.
       Reader.LoadTensorFlat(BName, W);
-      for o := 0 to Hidden - 1 do
+      for o := 0 to HiddenM1 do
         Layer.FArrNeurons[3 + g].Weights.FData[o] := W.FData[o];
       Consumed.Add(BName);
     end;
@@ -31833,13 +31843,17 @@ var
   c, best, sp, ii, jj, pairIdx: integer;
   bestVal, v: TNeuralFloat;
   K: integer;
+  KM1, KM2, NumPowersetClassesM1: integer;
 begin
   K := Config.MaxSpeakers;
-  for sp := 0 to K - 1 do Active[sp] := False;
+  KM1 := K - 1;
+  KM2 := K - 2;
+  NumPowersetClassesM1 := Config.NumPowersetClasses - 1;
+  for sp := 0 to KM1 do Active[sp] := False;
   // argmax over the NumPowersetClasses logits at this frame.
   best := 0;
   bestVal := Logits[FrameIdx, 0, 0];
-  for c := 1 to Config.NumPowersetClasses - 1 do
+  for c := 1 to NumPowersetClassesM1 do
   begin
     v := Logits[FrameIdx, 0, c];
     if v > bestVal then begin bestVal := v; best := c; end;
@@ -31850,8 +31864,8 @@ begin
   // Pair classes in lexicographic (i<j) order.
   c := best - K - 1;  // 0-based pair index
   pairIdx := 0;
-  for ii := 0 to K - 2 do
-    for jj := ii + 1 to K - 1 do
+  for ii := 0 to KM2 do
+    for jj := ii + 1 to KM1 do
     begin
       if pairIdx = c then begin Active[ii] := True; Active[jj] := True; exit; end;
       Inc(pairIdx);
@@ -32142,7 +32156,11 @@ procedure LoadMoonshineConv(Reader: TNNetSafeTensorsReader;
 var
   W, B: TNNetVolume;
   o, i, kk: integer;
+  OutDimM1, InDimM1, KernelM1: integer;
 begin
+  OutDimM1 := OutDim - 1;
+  InDimM1 := InDim - 1;
+  KernelM1 := Kernel - 1;
   if not Reader.HasTensor(WName) then
     ImportError('Moonshine import: missing tensor "' + WName + '".');
   if (Reader.DimCount(WName) <> 3) or
@@ -32171,10 +32189,10 @@ begin
           IntToStr(OutDim) + '], got ' + Reader.ShapeAsString(BName));
       Reader.LoadTensorFlat(BName, B);
     end;
-    for o := 0 to OutDim - 1 do
+    for o := 0 to OutDimM1 do
     begin
-      for kk := 0 to Kernel - 1 do
-        for i := 0 to InDim - 1 do
+      for kk := 0 to KernelM1 do
+        for i := 0 to InDimM1 do
           Layer.FArrNeurons[o].Weights.FData[kk * InDim + i] :=
             W.FData[(o * InDim + i) * Kernel + kk];
       if BName <> '' then Layer.FArrNeurons[o].BiasWeight := B.FData[o]
@@ -32198,7 +32216,9 @@ procedure LoadMoonshineGainOnlyLayerNorm(Reader: TNNetSafeTensorsReader;
 var
   Tmp: TNNetVolume;
   i: integer;
+  d_modelM1: integer;
 begin
+  d_modelM1 := d_model - 1;
   if not Reader.HasTensor(WName) then
     ImportError('Moonshine import: missing tensor "' + WName + '".');
   if (Reader.DimCount(WName) <> 1) or
@@ -32208,7 +32228,7 @@ begin
   Tmp := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(WName, Tmp);
-    for i := 0 to d_model - 1 do
+    for i := 0 to d_modelM1 do
     begin
       Layer.FArrNeurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
       Layer.FArrNeurons[1].Weights.FData[i] := 0;            // beta = 0 (bias-free)
@@ -32237,6 +32257,8 @@ var
   RopeScaling: TRoPEScalingConfig;
   HeadDim, QWidth, KVWidth, RotaryDims, GroupSize: integer;
   EncLen, k, d, BlockCnt, HeadCnt, KVHeadCnt, KVGroup, i: integer;
+  NumEncoderLayersM1, NumEncoderKVHeadsM1, NumEncoderHeadsM1: integer;
+  HeadDimM1, RotaryDimsM1, PassDimM1: integer;
   BlockPrefix, TensorNameStr: string;
   Consumed: TStringList;
 
@@ -32286,6 +32308,12 @@ begin
       KVWidth := Config.NumEncoderKVHeads * HeadDim;
       GroupSize := Config.NumEncoderHeads div Config.NumEncoderKVHeads;
       RopeScaling := DefaultRoPEScaling();
+      NumEncoderLayersM1 := Config.NumEncoderLayers - 1;
+      NumEncoderKVHeadsM1 := Config.NumEncoderKVHeads - 1;
+      NumEncoderHeadsM1 := Config.NumEncoderHeads - 1;
+      HeadDimM1 := HeadDim - 1;
+      RotaryDimsM1 := RotaryDims - 1;
+      PassDimM1 := HeadDim - RotaryDims - 1;
 
       // ---------------- Architecture ----------------
       NN := TNNet.Create();
@@ -32323,7 +32351,7 @@ begin
       SetLength(SliceChannels, HeadDim);
       SetLength(RotChannels, RotaryDims);
       SetLength(PassChannels, HeadDim - RotaryDims);
-      for BlockCnt := 0 to Config.NumEncoderLayers - 1 do
+      for BlockCnt := 0 to NumEncoderLayersM1 do
       begin
         // x := x + o_proj(bidirectional-RoPE-MHA(input_layernorm(x))).
         BranchInput := NN.GetLastLayer();
@@ -32339,15 +32367,15 @@ begin
         // K rotated once per KV head; V never rotated. Partial rotary: RoPE
         // on the first RotaryDims channels, the tail passes through (the
         // Phi-3 partial-rotary slice wiring).
-        for KVHeadCnt := 0 to Config.NumEncoderKVHeads - 1 do
+        for KVHeadCnt := 0 to NumEncoderKVHeadsM1 do
         begin
-          for d := 0 to HeadDim - 1 do
+          for d := 0 to HeadDimM1 do
             SliceChannels[d] := KVHeadCnt * HeadDim + d;
           if RotaryDims < HeadDim then
           begin
-            for d := 0 to RotaryDims - 1 do
+            for d := 0 to RotaryDimsM1 do
               RotChannels[d] := KVHeadCnt * HeadDim + d;
-            for d := 0 to HeadDim - RotaryDims - 1 do
+            for d := 0 to PassDimM1 do
               PassChannels[d] := KVHeadCnt * HeadDim + RotaryDims + d;
             RotSlice := NN.AddLayerAfter(
               TNNetSplitChannels.Create(RotChannels), KProj[BlockCnt]);
@@ -32368,16 +32396,16 @@ begin
           VSlices[KVHeadCnt] := NN.AddLayerAfter(
             TNNetSplitChannels.Create(SliceChannels), VProj[BlockCnt]);
         end;
-        for HeadCnt := 0 to Config.NumEncoderHeads - 1 do
+        for HeadCnt := 0 to NumEncoderHeadsM1 do
         begin
           KVGroup := HeadCnt div GroupSize;
-          for d := 0 to HeadDim - 1 do
+          for d := 0 to HeadDimM1 do
             SliceChannels[d] := HeadCnt * HeadDim + d;
           if RotaryDims < HeadDim then
           begin
-            for d := 0 to RotaryDims - 1 do
+            for d := 0 to RotaryDimsM1 do
               RotChannels[d] := HeadCnt * HeadDim + d;
-            for d := 0 to HeadDim - RotaryDims - 1 do
+            for d := 0 to PassDimM1 do
               PassChannels[d] := HeadCnt * HeadDim + RotaryDims + d;
             RotSlice := NN.AddLayerAfter(
               TNNetSplitChannels.Create(RotChannels), QProj[BlockCnt]);
@@ -32439,7 +32467,7 @@ begin
       LoadMoonshineConv(Reader, Conv3, 'encoder.conv3.weight',
         'encoder.conv3.bias', 2 * Config.HiddenSize, Config.HiddenSize, 3,
         Consumed);
-      for BlockCnt := 0 to Config.NumEncoderLayers - 1 do
+      for BlockCnt := 0 to NumEncoderLayersM1 do
       begin
         BlockPrefix := 'encoder.layers.' + IntToStr(BlockCnt) + '.';
         LoadMoonshineGainOnlyLayerNorm(Reader, AttnNorm[BlockCnt],
@@ -32558,6 +32586,8 @@ var
   RopeScaling: TRoPEScalingConfig;
   HeadDim, QWidth, KVWidth, RotaryDims, GroupSize, EncLen: integer;
   d, BlockCnt, HeadCnt, KVHeadCnt, KVGroup, i, j: integer;
+  NumDecoderLayersM1, NumDecoderKVHeadsM1, NumDecoderHeadsM1: integer;
+  HeadDimM1, RotaryDimsM1, PassDimM1, VocabSizeM1, HiddenSizeM1: integer;
   BlockPrefix, TensorNameStr: string;
   Consumed: TStringList;
   EmbedTmp: TNNetVolume;
@@ -32591,6 +32621,14 @@ begin
       KVWidth := Config.NumDecoderKVHeads * HeadDim;
       GroupSize := Config.NumDecoderHeads div Config.NumDecoderKVHeads;
       RopeScaling := DefaultRoPEScaling();
+      NumDecoderLayersM1 := Config.NumDecoderLayers - 1;
+      NumDecoderKVHeadsM1 := Config.NumDecoderKVHeads - 1;
+      NumDecoderHeadsM1 := Config.NumDecoderHeads - 1;
+      HeadDimM1 := HeadDim - 1;
+      RotaryDimsM1 := RotaryDims - 1;
+      PassDimM1 := HeadDim - RotaryDims - 1;
+      VocabSizeM1 := Config.VocabSize - 1;
+      HiddenSizeM1 := Config.HiddenSize - 1;
 
       // ---------------- Architecture ----------------
       Dec := TNNet.Create();
@@ -32622,7 +32660,7 @@ begin
       SetLength(RotChannels, RotaryDims);
       SetLength(PassChannels, HeadDim - RotaryDims);
 
-      for BlockCnt := 0 to Config.NumDecoderLayers - 1 do
+      for BlockCnt := 0 to NumDecoderLayersM1 do
       begin
         // ---- (1) CAUSAL self-attention with partial RoPE ----
         BranchInput := Dec.GetLastLayer();
@@ -32635,15 +32673,15 @@ begin
           TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly), NormedSource);
         SV[BlockCnt] := Dec.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly), NormedSource);
-        for KVHeadCnt := 0 to Config.NumDecoderKVHeads - 1 do
+        for KVHeadCnt := 0 to NumDecoderKVHeadsM1 do
         begin
-          for d := 0 to HeadDim - 1 do
+          for d := 0 to HeadDimM1 do
             SliceChannels[d] := KVHeadCnt * HeadDim + d;
           if RotaryDims < HeadDim then
           begin
-            for d := 0 to RotaryDims - 1 do
+            for d := 0 to RotaryDimsM1 do
               RotChannels[d] := KVHeadCnt * HeadDim + d;
-            for d := 0 to HeadDim - RotaryDims - 1 do
+            for d := 0 to PassDimM1 do
               PassChannels[d] := KVHeadCnt * HeadDim + RotaryDims + d;
             RotSlice := Dec.AddLayerAfter(
               TNNetSplitChannels.Create(RotChannels), SK[BlockCnt]);
@@ -32664,16 +32702,16 @@ begin
           VSlices[KVHeadCnt] := Dec.AddLayerAfter(
             TNNetSplitChannels.Create(SliceChannels), SV[BlockCnt]);
         end;
-        for HeadCnt := 0 to Config.NumDecoderHeads - 1 do
+        for HeadCnt := 0 to NumDecoderHeadsM1 do
         begin
           KVGroup := HeadCnt div GroupSize;
-          for d := 0 to HeadDim - 1 do
+          for d := 0 to HeadDimM1 do
             SliceChannels[d] := HeadCnt * HeadDim + d;
           if RotaryDims < HeadDim then
           begin
-            for d := 0 to RotaryDims - 1 do
+            for d := 0 to RotaryDimsM1 do
               RotChannels[d] := HeadCnt * HeadDim + d;
-            for d := 0 to HeadDim - RotaryDims - 1 do
+            for d := 0 to PassDimM1 do
               PassChannels[d] := HeadCnt * HeadDim + RotaryDims + d;
             RotSlice := Dec.AddLayerAfter(
               TNNetSplitChannels.Create(RotChannels), SQ[BlockCnt]);
@@ -32714,14 +32752,14 @@ begin
           TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly), EncStates);
         CV[BlockCnt] := Dec.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly), EncStates);
-        for HeadCnt := 0 to Config.NumDecoderHeads - 1 do
+        for HeadCnt := 0 to NumDecoderHeadsM1 do
         begin
           KVGroup := HeadCnt div GroupSize;
-          for d := 0 to HeadDim - 1 do
+          for d := 0 to HeadDimM1 do
             SliceChannels[d] := HeadCnt * HeadDim + d;
           QSlice := Dec.AddLayerAfter(
             TNNetSplitChannels.Create(SliceChannels), CQ[BlockCnt]);
-          for d := 0 to HeadDim - 1 do
+          for d := 0 to HeadDimM1 do
             SliceChannels[d] := KVGroup * HeadDim + d;
           KSlice := Dec.AddLayerAfter(
             TNNetSplitChannels.Create(SliceChannels), CK[BlockCnt]);
@@ -32771,7 +32809,7 @@ begin
       DecEmbed.FlushWeightCache();
       Consumed.Add('decoder.embed_tokens.weight');
 
-      for BlockCnt := 0 to Config.NumDecoderLayers - 1 do
+      for BlockCnt := 0 to NumDecoderLayersM1 do
       begin
         BlockPrefix := 'decoder.layers.' + IntToStr(BlockCnt) + '.';
         LoadMoonshineGainOnlyLayerNorm(Reader, SelfNorm[BlockCnt],
@@ -32840,9 +32878,9 @@ begin
       end
       else
       begin
-        for j := 0 to Config.VocabSize - 1 do
+        for j := 0 to VocabSizeM1 do
         begin
-          for i := 0 to Config.HiddenSize - 1 do
+          for i := 0 to HiddenSizeM1 do
             LMHead.FArrNeurons[j].Weights.FData[i] :=
               EmbedTmp.FData[j * Config.HiddenSize + i];
           LMHead.FArrNeurons[j].BiasWeight := 0;
@@ -33001,10 +33039,12 @@ end;
 function EnCodecConfigToString(const Config: TEnCodecConfig): string;
 var
   I: integer;
+  RatiosMax: integer;
   Ratios: string;
 begin
   Ratios := '[';
-  for I := 0 to Length(Config.UpsamplingRatios) - 1 do
+  RatiosMax := Length(Config.UpsamplingRatios) - 1;
+  for I := 0 to RatiosMax do
   begin
     if I > 0 then Ratios := Ratios + ',';
     Ratios := Ratios + IntToStr(Config.UpsamplingRatios[I]);
@@ -33047,6 +33087,7 @@ var
   LpMax: integer;
   G, V: TNNetVolume;
   OutDim, InDim, K, o, i, k2, Base, Cnt: integer;
+  OutDimM1, InDimM1, KM1: integer;
   Norm: TNeuralFloat;
   GName, VName: string;
 begin
@@ -33076,6 +33117,9 @@ begin
     OutDim := Reader.DimSize(VName, 0);
     InDim := Reader.DimSize(VName, 1);
     K := Reader.DimSize(VName, 2);
+    OutDimM1 := OutDim - 1;
+    InDimM1 := InDim - 1;
+    KM1 := K - 1;
     Conv.Transpose := pTranspose;
     Conv.Stride := pStride;
     Conv.Dilation := pDilation;
@@ -33094,17 +33138,17 @@ begin
     Cnt := OutDim * InDim * K;
     SetLength(Conv.W, Cnt);
     // weight_norm dim=0: per group-row o, w = g[o] * v[o,:,:] / ||v[o,:,:]||.
-    for o := 0 to OutDim - 1 do
+    for o := 0 to OutDimM1 do
     begin
       Base := o * InDim * K;
       Norm := 0;
-      for i := 0 to InDim - 1 do
-        for k2 := 0 to K - 1 do
+      for i := 0 to InDimM1 do
+        for k2 := 0 to KM1 do
           Norm := Norm + Sqr(V.FData[Base + i * K + k2]);
       Norm := Sqrt(Norm);
       if Norm = 0 then Norm := 1;
-      for i := 0 to InDim - 1 do
-        for k2 := 0 to K - 1 do
+      for i := 0 to InDimM1 do
+        for k2 := 0 to KM1 do
           Conv.W[Base + i * K + k2] :=
             G.FData[o] * V.FData[Base + i * K + k2] / Norm;
     end;
@@ -33165,6 +33209,7 @@ procedure LoadEnCodecLSTM(Reader: TNNetSafeTensorsReader;
   Consumed: TStrings);
 var
   L: integer;
+  NumLayersM1: integer;
   S: string;
 begin
   LSTM.NumLayers := NumLayers;
@@ -33172,7 +33217,8 @@ begin
   SetLength(LSTM.Whh, NumLayers);
   SetLength(LSTM.Bih, NumLayers);
   SetLength(LSTM.Bhh, NumLayers);
-  for L := 0 to NumLayers - 1 do
+  NumLayersM1 := NumLayers - 1;
+  for L := 0 to NumLayersM1 do
   begin
     S := IntToStr(L);
     LoadEnCodecMat(Reader, Prefix + '.weight_ih_l' + S,
@@ -33215,6 +33261,8 @@ procedure RunEnCodecConv(const Conv: TEnCodecConv;
 var
   InCh, OutCh, K, Stride, Dil, InLen, o, i, t, k2, src, PadTotal, Extra: integer;
   NFrames, OutLen, idx, FullLen, PadLeft, PadRight, EffK: integer;
+  InChM1, OutChM1, KM1, InLenM1: integer;
+  PadLeftM1, PadRightM1, OutLenM1, FullLenM1: integer;
   Acc: TNeuralFloat;
   Padded: array of TNeuralFloatDynArr;
   Full: array of TNeuralFloatDynArr;
@@ -33226,6 +33274,10 @@ begin
   Stride := Conv.Stride;
   Dil := Conv.Dilation;
   InLen := Length(InSig[0]);
+  InChM1 := InCh - 1;
+  OutChM1 := OutCh - 1;
+  KM1 := K - 1;
+  InLenM1 := InLen - 1;
   if not Conv.Transpose then
   begin
     // HF buffers: effective kernel = (K-1)*dilation + 1; total causal
@@ -33253,21 +33305,23 @@ begin
       PadRight := PadRight + Extra;
     end;
     // Build the reflect-padded signal per channel.
+    PadLeftM1 := PadLeft - 1;
+    PadRightM1 := PadRight - 1;
     SetLength(Padded, InCh);
-    for i := 0 to InCh - 1 do
+    for i := 0 to InChM1 do
     begin
       SetLength(Padded[i], PadLeft + InLen + PadRight);
       // Left reflect pad: mirror around index 0 WITHOUT repeating sample 0
       // (PyTorch 'reflect': padded[PadLeft-1-j] = x[1+j]).
-      for t := 0 to PadLeft - 1 do
+      for t := 0 to PadLeftM1 do
       begin
         RefIdx := PadLeft - t; // distance from the first real sample
         if RefIdx >= InLen then RefIdx := InLen - 1;
         Padded[i][t] := InSig[i][RefIdx];
       end;
-      for t := 0 to InLen - 1 do Padded[i][PadLeft + t] := InSig[i][t];
+      for t := 0 to InLenM1 do Padded[i][PadLeft + t] := InSig[i][t];
       // Right reflect pad around the last index.
-      for t := 0 to PadRight - 1 do
+      for t := 0 to PadRightM1 do
       begin
         RefIdx := InLen - 2 - t;
         if RefIdx < 0 then RefIdx := 0;
@@ -33276,15 +33330,16 @@ begin
     end;
     OutLen := (Length(Padded[0]) - EffK) div Stride + 1;
     if OutLen < 0 then OutLen := 0;
+    OutLenM1 := OutLen - 1;
     SetLength(OutSig, OutCh);
-    for o := 0 to OutCh - 1 do
+    for o := 0 to OutChM1 do
     begin
       SetLength(OutSig[o], OutLen);
-      for t := 0 to OutLen - 1 do
+      for t := 0 to OutLenM1 do
       begin
         Acc := Conv.B[o];
-        for i := 0 to InCh - 1 do
-          for k2 := 0 to K - 1 do
+        for i := 0 to InChM1 do
+          for k2 := 0 to KM1 do
           begin
             src := t * Stride + k2 * Dil;
             Acc := Acc + Conv.W[o * InCh * K + i * K + k2] * Padded[i][src];
@@ -33298,24 +33353,25 @@ begin
     // ConvTranspose1d: full length = (InLen-1)*stride + K. Weight is
     // [In,Out,K] flat: W[i*OutCh*K + o*K + k2]. Then right-trim (K-stride).
     FullLen := (InLen - 1) * Stride + K;
+    FullLenM1 := FullLen - 1;
     SetLength(Full, OutCh);
-    for o := 0 to OutCh - 1 do
+    for o := 0 to OutChM1 do
     begin
       SetLength(Full[o], FullLen);
-      for t := 0 to FullLen - 1 do Full[o][t] := 0;
+      for t := 0 to FullLenM1 do Full[o][t] := 0;
     end;
-    for i := 0 to InCh - 1 do
-      for t := 0 to InLen - 1 do
-        for o := 0 to OutCh - 1 do
-          for k2 := 0 to K - 1 do
+    for i := 0 to InChM1 do
+      for t := 0 to InLenM1 do
+        for o := 0 to OutChM1 do
+          for k2 := 0 to KM1 do
           begin
             idx := t * Stride + k2;
             Full[o][idx] := Full[o][idx] +
               Conv.W[i * OutCh * K + o * K + k2] * InSig[i][t];
           end;
     // Add bias across the whole (untrimmed) output.
-    for o := 0 to OutCh - 1 do
-      for t := 0 to FullLen - 1 do Full[o][t] := Full[o][t] + Conv.B[o];
+    for o := 0 to OutChM1 do
+      for t := 0 to FullLenM1 do Full[o][t] := Full[o][t] + Conv.B[o];
     // Un-pad: padding_total = K - stride. Causal trims it all on the RIGHT
     // (trim_right_ratio 1.0, padding_left = 0); non-causal trims symmetrically
     // (padding_right = padding_total div 2, the remainder on the left).
@@ -33332,11 +33388,12 @@ begin
     end;
     OutLen := FullLen - PadLeft - PadRight;
     if OutLen < 0 then OutLen := 0;
+    OutLenM1 := OutLen - 1;
     SetLength(OutSig, OutCh);
-    for o := 0 to OutCh - 1 do
+    for o := 0 to OutChM1 do
     begin
       SetLength(OutSig[o], OutLen);
-      for t := 0 to OutLen - 1 do OutSig[o][t] := Full[o][PadLeft + t];
+      for t := 0 to OutLenM1 do OutSig[o][t] := Full[o][PadLeft + t];
     end;
   end;
 end;
@@ -33348,6 +33405,7 @@ procedure RunEnCodecLSTM(const LSTM: TEnCodecLSTM;
   var Sig: TNNetFloatDynArr2D);
 var
   H, T, L, t2, ch, g, j: integer;
+  HM1, TM1, FourHM1, NumLayersM1: integer;
   hPrev, cPrev, xIn: TNeuralFloatDynArr;
   gates: TNeuralFloatDynArr;
   ig, fg, gg, og, cNew, hNew: TNeuralFloat;
@@ -33355,33 +33413,37 @@ var
 begin
   H := LSTM.Hidden;
   T := Length(Sig[0]);
+  HM1 := H - 1;
+  TM1 := T - 1;
+  FourHM1 := 4 * H - 1;
+  NumLayersM1 := LSTM.NumLayers - 1;
   // Keep the input copy for the final residual add.
   SetLength(Inp, H);
-  for ch := 0 to H - 1 do
+  for ch := 0 to HM1 do
   begin
     SetLength(Inp[ch], T);
-    for t2 := 0 to T - 1 do Inp[ch][t2] := Sig[ch][t2];
+    for t2 := 0 to TM1 do Inp[ch][t2] := Sig[ch][t2];
   end;
   SetLength(xIn, H);
   SetLength(gates, 4 * H);
-  for L := 0 to LSTM.NumLayers - 1 do
+  for L := 0 to NumLayersM1 do
   begin
     SetLength(hPrev, H);
     SetLength(cPrev, H);
-    for j := 0 to H - 1 do begin hPrev[j] := 0; cPrev[j] := 0; end;
-    for t2 := 0 to T - 1 do
+    for j := 0 to HM1 do begin hPrev[j] := 0; cPrev[j] := 0; end;
+    for t2 := 0 to TM1 do
     begin
-      for ch := 0 to H - 1 do xIn[ch] := Sig[ch][t2];
+      for ch := 0 to HM1 do xIn[ch] := Sig[ch][t2];
       // gates = Wih*x + bih + Whh*hPrev + bhh
-      for g := 0 to 4 * H - 1 do
+      for g := 0 to FourHM1 do
       begin
         gates[g] := LSTM.Bih[L][g] + LSTM.Bhh[L][g];
-        for ch := 0 to H - 1 do
+        for ch := 0 to HM1 do
           gates[g] := gates[g] + LSTM.Wih[L].Data[g * H + ch] * xIn[ch];
-        for ch := 0 to H - 1 do
+        for ch := 0 to HM1 do
           gates[g] := gates[g] + LSTM.Whh[L].Data[g * H + ch] * hPrev[ch];
       end;
-      for ch := 0 to H - 1 do
+      for ch := 0 to HM1 do
       begin
         ig := 1 / (1 + Exp(-gates[ch]));
         fg := 1 / (1 + Exp(-gates[H + ch]));
@@ -33396,15 +33458,17 @@ begin
     end;
   end;
   // Residual add of the ORIGINAL pre-LSTM input.
-  for ch := 0 to H - 1 do
-    for t2 := 0 to T - 1 do Sig[ch][t2] := Sig[ch][t2] + Inp[ch][t2];
+  for ch := 0 to HM1 do
+    for t2 := 0 to TM1 do Sig[ch][t2] := Sig[ch][t2] + Inp[ch][t2];
 end;
 
 procedure ApplyEnCodecELU(var Sig: TNNetFloatDynArr2D);
 var
   c, t: integer;
+  SigMax: integer;
 begin
-  for c := 0 to Length(Sig) - 1 do
+  SigMax := Length(Sig) - 1;
+  for c := 0 to SigMax do
     for t := 0 to Length(Sig[c]) - 1 do
       Sig[c][t] := EnCodecELU(Sig[c][t]);
 end;
@@ -33414,13 +33478,15 @@ procedure TEnCodecModel.RunStage(const Stage: TEnCodecStage;
 var
   Tmp, Shr_, Res: TNNetFloatDynArr2D;
   c, t: integer;
+  InSigMax, TmpMax: integer;
 begin
+  InSigMax := Length(InSig) - 1;
   case Stage.Kind of
     eskConv: RunEnCodecConv(Stage.Conv, InSig, OutSig, FConfig.UseCausalConv);
     eskELU:
       begin
         SetLength(OutSig, Length(InSig));
-        for c := 0 to Length(InSig) - 1 do
+        for c := 0 to InSigMax do
         begin
           SetLength(OutSig[c], Length(InSig[c]));
           for t := 0 to Length(InSig[c]) - 1 do
@@ -33431,7 +33497,7 @@ begin
       begin
         // block: ELU -> Conv1 -> ELU -> Conv2; output = shortcut(x) + block.
         SetLength(Tmp, Length(InSig));
-        for c := 0 to Length(InSig) - 1 do
+        for c := 0 to InSigMax do
         begin
           SetLength(Tmp[c], Length(InSig[c]));
           for t := 0 to Length(InSig[c]) - 1 do
@@ -33445,10 +33511,11 @@ begin
         else
         begin
           SetLength(Shr_, Length(InSig));
-          for c := 0 to Length(InSig) - 1 do Shr_[c] := InSig[c];
+          for c := 0 to InSigMax do Shr_[c] := InSig[c];
         end;
         SetLength(OutSig, Length(Tmp));
-        for c := 0 to Length(Tmp) - 1 do
+        TmpMax := Length(Tmp) - 1;
+        for c := 0 to TmpMax do
         begin
           SetLength(OutSig[c], Length(Tmp[c]));
           for t := 0 to Length(Tmp[c]) - 1 do
@@ -33465,15 +33532,18 @@ procedure TEnCodecModel.EncodeAudioToCodes(
 var
   Sig, Nxt: TNNetFloatDynArr2D;
   s, q, t, d, best, K, Dm, Frames: integer;
+  WaveformMax, EncStagesMax, CodebooksMax, FramesM1, DmM1, KM1: integer;
   Dist, BestDist, Diff: TNeuralFloat;
   Residual, Vec: TNeuralFloatDynArr;
 begin
   // Channel-major input (mono): Sig[0][t] = waveform.
   SetLength(Sig, FConfig.AudioChannels);
   SetLength(Sig[0], Length(Waveform));
-  for t := 0 to Length(Waveform) - 1 do Sig[0][t] := Waveform[t];
+  WaveformMax := Length(Waveform) - 1;
+  for t := 0 to WaveformMax do Sig[0][t] := Waveform[t];
   // Run the encoder stages in order; the LSTM stage is applied in place.
-  for s := 0 to Length(FEncStages) - 1 do
+  EncStagesMax := Length(FEncStages) - 1;
+  for s := 0 to EncStagesMax do
   begin
     if FEncStages[s].Kind = eskLSTM then
       RunEnCodecLSTM(FEncLSTM, Sig)
@@ -33488,20 +33558,24 @@ begin
   K := FConfig.CodebookSize;
   Frames := Length(Sig[0]);
   FrameCount := Frames;
+  CodebooksMax := Length(FCodebooks) - 1;
+  FramesM1 := Frames - 1;
+  DmM1 := Dm - 1;
+  KM1 := K - 1;
   SetLength(Codes, Length(FCodebooks));
   SetLength(Residual, Dm);
   SetLength(Vec, Dm);
-  for q := 0 to Length(FCodebooks) - 1 do SetLength(Codes[q], Frames);
-  for t := 0 to Frames - 1 do
+  for q := 0 to CodebooksMax do SetLength(Codes[q], Frames);
+  for t := 0 to FramesM1 do
   begin
-    for d := 0 to Dm - 1 do Residual[d] := Sig[d][t];
-    for q := 0 to Length(FCodebooks) - 1 do
+    for d := 0 to DmM1 do Residual[d] := Sig[d][t];
+    for q := 0 to CodebooksMax do
     begin
       best := 0; BestDist := -1;
-      for s := 0 to K - 1 do
+      for s := 0 to KM1 do
       begin
         Dist := 0;
-        for d := 0 to Dm - 1 do
+        for d := 0 to DmM1 do
         begin
           Diff := Residual[d] - FCodebooks[q].Data[s * Dm + d];
           Dist := Dist + Diff * Diff;
