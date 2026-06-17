@@ -40480,6 +40480,8 @@ var
   MixP, FfP, AttP, LayerP, TensorNameStr: string;
   Consumed: TStringList;
   ConvBiasSuppress, NS, DI, RK: integer;
+  NumLayersM1, NumKVHeadsM1, HeadDimM1, NumHeadsM1: integer;
+  NumExpertsM1, VocabSizeM1, HiddenSizeM1: integer;
   SliceChannels: array of integer;
 
   procedure MarkConsumed(const TName: string);
@@ -40490,7 +40492,7 @@ var
   // conv1d.weight [d_inner,1,k] (+ bias) into TNNetDepthwiseConv1D, exactly
   // like the plain Mamba importer.
   procedure LoadDepthwiseConv(Layer: TNNetLayer; const WName, BName: string);
-  var dd, kk: integer;
+  var dd, kk, DInnerM1, MambaDConvM1: integer;
   begin
     if (not Reader.HasTensor(WName)) or (Reader.DimCount(WName) <> 3) or
        (Reader.DimSize(WName, 0) <> Config.DInner) or
@@ -40500,15 +40502,17 @@ var
         IntToStr(Config.DInner) + ', 1, ' + IntToStr(Config.MambaDConv) +
         '], got ' + Reader.ShapeAsString(WName));
     Reader.LoadTensorFlat(WName, Tmp);
-    for dd := 0 to Config.DInner - 1 do
-      for kk := 0 to Config.MambaDConv - 1 do
+    DInnerM1 := Config.DInner - 1;
+    MambaDConvM1 := Config.MambaDConv - 1;
+    for dd := 0 to DInnerM1 do
+      for kk := 0 to MambaDConvM1 do
         Layer.FArrNeurons[dd].Weights.FData[kk] :=
           Tmp.FData[dd * Config.MambaDConv + kk];
     MarkConsumed(WName);
     if Config.MambaConvBias then
     begin
       Reader.LoadTensorFlat(BName, Tmp);
-      for dd := 0 to Config.DInner - 1 do
+      for dd := 0 to DInnerM1 do
         Layer.FArrNeurons[dd].BiasWeight := Tmp.FData[dd];
       MarkConsumed(BName);
     end;
@@ -40517,13 +40521,14 @@ var
 
   procedure LoadVec(Layer: TNNetLayer; NeuronIdx: integer;
     const TName: string; Cnt: integer);
-  var dd: integer;
+  var dd, CntM1: integer;
   begin
     Reader.LoadTensorFlat(TName, Tmp);
     if Tmp.Size <> Cnt then
       ImportError('Jamba import: "' + TName + '" must carry ' +
         IntToStr(Cnt) + ' elements, got ' + Reader.ShapeAsString(TName));
-    for dd := 0 to Cnt - 1 do
+    CntM1 := Cnt - 1;
+    for dd := 0 to CntM1 do
       Layer.FArrNeurons[NeuronIdx].Weights.FData[dd] := Tmp.FData[dd];
     Layer.FlushWeightCache();
     MarkConsumed(TName);
@@ -40533,8 +40538,11 @@ var
   // [0]=dt_proj.weight (DI,RK), [6]=x_proj_dt (RK,DI). W_B/W_C are the
   // remaining x_proj rows; the three inner gains go to [7..9].
   procedure LoadJambaScan(Layer: TNNetLayer; const MixPfx: string);
-  var d, j, r, s: integer;
+  var d, j, r, s, DIM1, RKM1, NSM1: integer;
   begin
+    DIM1 := DI - 1;
+    RKM1 := RK - 1;
+    NSM1 := NS - 1;
     if (not Reader.HasTensor(MixPfx + 'x_proj.weight')) or
        (Reader.DimSize(MixPfx + 'x_proj.weight', 0) <> RK + 2 * NS) or
        (Reader.DimSize(MixPfx + 'x_proj.weight', 1) <> DI) then
@@ -40548,15 +40556,15 @@ var
     Reader.LoadTensorFlat(MixPfx + 'x_proj.weight', XW);
     Reader.LoadTensorFlat(MixPfx + 'dt_proj.weight', DtW);
     // [0] dt_proj.weight (DI rows of RK), [6] x_proj_dt (RK rows of DI).
-    for d := 0 to DI - 1 do
-      for r := 0 to RK - 1 do
+    for d := 0 to DIM1 do
+      for r := 0 to RKM1 do
         Layer.FArrNeurons[0].Weights.FData[d * RK + r] := DtW.FData[d * RK + r];
-    for r := 0 to RK - 1 do
-      for j := 0 to DI - 1 do
+    for r := 0 to RKM1 do
+      for j := 0 to DIM1 do
         Layer.FArrNeurons[6].Weights.FData[r * DI + j] := XW.FData[r * DI + j];
     // W_B / W_C: the d_state + d_state rows after the dt rows.
-    for s := 0 to NS - 1 do
-      for j := 0 to DI - 1 do
+    for s := 0 to NSM1 do
+      for j := 0 to DIM1 do
       begin
         Layer.FArrNeurons[1].Weights.FData[s * DI + j] := XW.FData[(RK + s) * DI + j];
         Layer.FArrNeurons[2].Weights.FData[s * DI + j] := XW.FData[(RK + NS + s) * DI + j];
@@ -40603,6 +40611,13 @@ begin
       if Config.MambaConvBias then ConvBiasSuppress := 0
       else ConvBiasSuppress := 1;
       if pSeqLen <= 0 then SeqLen := 1024 else SeqLen := pSeqLen;
+      NumLayersM1 := Config.NumLayers - 1;
+      NumKVHeadsM1 := Config.NumKVHeads - 1;
+      HeadDimM1 := HeadDim - 1;
+      NumHeadsM1 := Config.NumHeads - 1;
+      NumExpertsM1 := Config.NumExperts - 1;
+      VocabSizeM1 := Config.VocabSize - 1;
+      HiddenSizeM1 := Config.HiddenSize - 1;
 
       // ---------------- Architecture (NO positional encoding) ----------
       NN := TNNet.Create();
@@ -40615,7 +40630,7 @@ begin
       SetLength(VSlices, Config.NumKVHeads);
       SetLength(HeadOutputs, Config.NumHeads);
       SetLength(SliceChannels, HeadDim);
-      for BlockCnt := 0 to Config.NumLayers - 1 do
+      for BlockCnt := 0 to NumLayersM1 do
       begin
         // ---- mixer sub-block: x := x + Mixer(input_layernorm(x)) ----
         BranchInput := NN.GetLastLayer();
@@ -40631,19 +40646,19 @@ begin
             TNNetPointwiseConvLinear.Create(KVWidth, 1).SetInferenceOnly(pInferenceOnly), NormedSrc);
           Blocks[BlockCnt].VProj := NN.AddLayerAfter(
             TNNetPointwiseConvLinear.Create(KVWidth, 1).SetInferenceOnly(pInferenceOnly), NormedSrc);
-          for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
+          for KVHeadCnt := 0 to NumKVHeadsM1 do
           begin
-            for d := 0 to HeadDim - 1 do
+            for d := 0 to HeadDimM1 do
               SliceChannels[d] := KVHeadCnt * HeadDim + d;
             KSlices[KVHeadCnt] := NN.AddLayerAfter(
               TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].KProj);
             VSlices[KVHeadCnt] := NN.AddLayerAfter(
               TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].VProj);
           end;
-          for HeadCnt := 0 to Config.NumHeads - 1 do
+          for HeadCnt := 0 to NumHeadsM1 do
           begin
             KVGroup := HeadCnt div GroupSize;
-            for d := 0 to HeadDim - 1 do
+            for d := 0 to HeadDimM1 do
               SliceChannels[d] := HeadCnt * HeadDim + d;
             QSlice := NN.AddLayerAfter(
               TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].QProj);
@@ -40698,7 +40713,7 @@ begin
           NN.AddLayer( TNNetPointwiseSoftMax.Create() );
           GateTopK := NN.AddLayer( TNNetTopKGate.Create(
             Config.NumExpertsPerTok, {pRenormalize=}false) );
-          for e := 0 to Config.NumExperts - 1 do
+          for e := 0 to NumExpertsM1 do
           begin
             Blocks[BlockCnt].ExpertGateUp[e] := NN.AddLayerAfter(
               TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).SetInferenceOnly(pInferenceOnly),
@@ -40742,9 +40757,9 @@ begin
       if Config.TieWordEmbeddings then
       begin
         EnsureWritableImportWeights(LMHead);
-        for j := 0 to Config.VocabSize - 1 do
+        for j := 0 to VocabSizeM1 do
         begin
-          for i := 0 to Config.HiddenSize - 1 do
+          for i := 0 to HiddenSizeM1 do
             LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.HiddenSize + i];
           LMHead.FArrNeurons[j].BiasWeight := 0;
@@ -40758,7 +40773,7 @@ begin
           Config.HiddenSize, Config.VocabSize);
         MarkConsumed('lm_head.weight');
       end;
-      for BlockCnt := 0 to Config.NumLayers - 1 do
+      for BlockCnt := 0 to NumLayersM1 do
       begin
         LayerP := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
         LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].InNorm,
@@ -40802,7 +40817,7 @@ begin
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateConv,
             FfP + 'router.weight', Config.HiddenSize, Config.NumExperts);
           MarkConsumed(FfP + 'router.weight');
-          for e := 0 to Config.NumExperts - 1 do
+          for e := 0 to NumExpertsM1 do
           begin
             // SwiGLU fused: up_proj (w3) in 0..I-1, gate_proj (w1) in I..2I-1.
             LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertGateUp[e],
@@ -40900,10 +40915,11 @@ end;
 // block is actually on the schedule.
 function NemotronHHasBlock(const Config: TNemotronHConfig;
   Bt: TNemotronHBlockType): boolean;
-var i: integer;
+var i, MaxIdx: integer;
 begin
   Result := False;
-  for i := 0 to Length(Config.BlockTypes) - 1 do
+  MaxIdx := Length(Config.BlockTypes) - 1;
+  for i := 0 to MaxIdx do
     if Config.BlockTypes[i] = Bt then exit(True);
 end;
 
@@ -40917,7 +40933,7 @@ var
   ModelType, Pattern: string;
   Field, ListData: TJSONData;
   Arr: TJSONArray;
-  i: integer;
+  i, LenPattern: integer;
   ch, sb: string;
 
   function RequiredInt(const FieldName: string): integer;
@@ -40987,7 +41003,8 @@ begin
     Result.Pattern := Pattern;
     Result.NumLayers := Length(Pattern);
     SetLength(Result.BlockTypes, Result.NumLayers);
-    for i := 1 to Length(Pattern) do
+    LenPattern := Length(Pattern);
+    for i := 1 to LenPattern do
     begin
       ch := Pattern[i];
       if ch = 'M' then Result.BlockTypes[i - 1] := nhMamba2
@@ -41156,6 +41173,8 @@ var
   KSlices, VSlices, HeadOutputs, MoEBranches: array of TNNetLayer;
   BlockCnt, SeqLen, i, j, d, ConvDim, ProjSize, ConvBiasSuppress: integer;
   QWidth, KVWidth, GroupSize, HeadCnt, KVHeadCnt, KVGroup, e: integer;
+  NumLayersM1, NumKVHeadsM1, HeadDimM1, NumHeadsM1: integer;
+  NumRoutedExpertsM1, VocabSizeM1, HiddenSizeM1: integer;
   Tmp, BiasVec: TNNetVolume;
   MixPrefix, LayerP, AttP, TensorNameStr, InBias, OutBias, MoeP: string;
   Consumed: TStringList;
@@ -41168,7 +41187,7 @@ var
 
   procedure LoadChannelVector(Layer: TNNetLayer; NeuronIdx: integer;
     const TName: string; Channels: integer);
-  var dd: integer;
+  var dd, ChannelsM1: integer;
   begin
     if not Reader.HasTensor(TName) then
       ImportError('Nemotron-H import: missing tensor "' + TName + '".');
@@ -41177,14 +41196,15 @@ var
       ImportError('Nemotron-H import: "' + TName + '" must carry ' +
         IntToStr(Channels) + ' elements, got ' + Reader.ShapeAsString(TName));
     EnsureWritableImportWeights(Layer);
-    for dd := 0 to Channels - 1 do
+    ChannelsM1 := Channels - 1;
+    for dd := 0 to ChannelsM1 do
       Layer.FArrNeurons[NeuronIdx].Weights.FData[dd] := Tmp.FData[dd];
     Layer.FlushWeightCache();
     MarkConsumed(TName);
   end;
 
   procedure LoadDepthwiseConv(Layer: TNNetLayer; const WName, BName: string);
-  var dd, kk: integer;
+  var dd, kk, ConvDimM1, ConvKernelM1: integer;
   begin
     if not Reader.HasTensor(WName) then
       ImportError('Nemotron-H import: missing tensor "' + WName + '".');
@@ -41197,8 +41217,10 @@ var
         '], got ' + Reader.ShapeAsString(WName));
     Reader.LoadTensorFlat(WName, Tmp);
     EnsureWritableImportWeights(Layer);
-    for dd := 0 to ConvDim - 1 do
-      for kk := 0 to Config.ConvKernel - 1 do
+    ConvDimM1 := ConvDim - 1;
+    ConvKernelM1 := Config.ConvKernel - 1;
+    for dd := 0 to ConvDimM1 do
+      for kk := 0 to ConvKernelM1 do
         Layer.FArrNeurons[dd].Weights.FData[kk] :=
           Tmp.FData[dd * Config.ConvKernel + kk];
     MarkConsumed(WName);
@@ -41211,7 +41233,7 @@ var
       if Tmp.Size <> ConvDim then
         ImportError('Nemotron-H import: "' + BName + '" must carry ' +
           IntToStr(ConvDim) + ' elements.');
-      for dd := 0 to ConvDim - 1 do
+      for dd := 0 to ConvDimM1 do
         Layer.FArrNeurons[dd].BiasWeight := Tmp.FData[dd];
       MarkConsumed(BName);
     end;
@@ -41223,7 +41245,7 @@ var
   // into a TNNetPointwiseConvLinear (neuron o = output channel, bias-free).
   procedure LoadMoEExpertSlice(Layer: TNNetLayer; const TName: string;
     ExpertIdx, NumExperts, OutDim, InDim: integer);
-  var oo, ii, ExpertBase: integer;
+  var oo, ii, ExpertBase, OutDimM1, InDimM1: integer;
   begin
     if not Reader.HasTensor(TName) then
       ImportError('Nemotron-H import: missing tensor "' + TName + '".');
@@ -41237,9 +41259,11 @@ var
     Reader.LoadTensorFlat(TName, Tmp);
     EnsureWritableImportWeights(Layer);
     ExpertBase := ExpertIdx * OutDim * InDim;
-    for oo := 0 to OutDim - 1 do
+    OutDimM1 := OutDim - 1;
+    InDimM1 := InDim - 1;
+    for oo := 0 to OutDimM1 do
     begin
-      for ii := 0 to InDim - 1 do
+      for ii := 0 to InDimM1 do
         Layer.FArrNeurons[oo].Weights.FData[ii] :=
           Tmp.FData[ExpertBase + oo * InDim + ii];
       Layer.FArrNeurons[oo].BiasWeight := 0;
@@ -41287,6 +41311,13 @@ begin
       QWidth := Config.NumHeads * Config.HeadDim;
       KVWidth := Config.NumKVHeads * Config.HeadDim;
       GroupSize := Config.NumHeads div Config.NumKVHeads;
+      NumLayersM1 := Config.NumLayers - 1;
+      NumKVHeadsM1 := Config.NumKVHeads - 1;
+      HeadDimM1 := Config.HeadDim - 1;
+      NumHeadsM1 := Config.NumHeads - 1;
+      NumRoutedExpertsM1 := Config.NumRoutedExperts - 1;
+      VocabSizeM1 := Config.VocabSize - 1;
+      HiddenSizeM1 := Config.HiddenSize - 1;
 
       // ---------------- Architecture (single pre-norm residual / block) ----
       NN := TNNet.Create();
@@ -41299,7 +41330,7 @@ begin
       SetLength(VSlices, Config.NumKVHeads);
       SetLength(HeadOutputs, Config.NumHeads);
       SetLength(SliceChannels, Config.HeadDim);
-      for BlockCnt := 0 to Config.NumLayers - 1 do
+      for BlockCnt := 0 to NumLayersM1 do
       begin
         // x := x + mixer(norm(x)).
         BranchInput := NN.GetLastLayer();
@@ -41341,9 +41372,9 @@ begin
               TNNetPointwiseConvLinear.Create(KVWidth, 1).SetInferenceOnly(pInferenceOnly), NormedSrc);
             Blocks[BlockCnt].VProj := NN.AddLayerAfter(
               TNNetPointwiseConvLinear.Create(KVWidth, 1).SetInferenceOnly(pInferenceOnly), NormedSrc);
-            for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
+            for KVHeadCnt := 0 to NumKVHeadsM1 do
             begin
-              for d := 0 to Config.HeadDim - 1 do
+              for d := 0 to HeadDimM1 do
                 SliceChannels[d] := KVHeadCnt * Config.HeadDim + d;
               KSlices[KVHeadCnt] := NN.AddLayerAfter(
                 TNNetSplitChannels.Create(SliceChannels),
@@ -41352,10 +41383,10 @@ begin
                 TNNetSplitChannels.Create(SliceChannels),
                 Blocks[BlockCnt].VProj);
             end;
-            for HeadCnt := 0 to Config.NumHeads - 1 do
+            for HeadCnt := 0 to NumHeadsM1 do
             begin
               KVGroup := HeadCnt div GroupSize;
-              for d := 0 to Config.HeadDim - 1 do
+              for d := 0 to HeadDimM1 do
                 SliceChannels[d] := HeadCnt * Config.HeadDim + d;
               QSlice := NN.AddLayerAfter(
                 TNNetSplitChannels.Create(SliceChannels),
@@ -41426,7 +41457,7 @@ begin
                 TNNetMulByConstant.Create(Config.RoutedScalingFactor) )
             else
               GateScaled := GateTopK;
-            for e := 0 to Config.NumRoutedExperts - 1 do
+            for e := 0 to NumRoutedExpertsM1 do
             begin
               Blocks[BlockCnt].ExpertUp[e] := NN.AddLayerAfter(
                 TNNetPointwiseConvLinear.Create(Config.MoEIntermediateSize, 1).SetInferenceOnly(pInferenceOnly),
@@ -41466,9 +41497,9 @@ begin
       if Config.TieWordEmbeddings then
       begin
         EnsureWritableImportWeights(LMHead);
-        for j := 0 to Config.VocabSize - 1 do
+        for j := 0 to VocabSizeM1 do
         begin
-          for i := 0 to Config.HiddenSize - 1 do
+          for i := 0 to HiddenSizeM1 do
             LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.HiddenSize + i];
           LMHead.FArrNeurons[j].BiasWeight := 0;
@@ -41483,7 +41514,7 @@ begin
           Config.HiddenSize, Config.VocabSize);
         MarkConsumed('lm_head.weight');
       end;
-      for BlockCnt := 0 to Config.NumLayers - 1 do
+      for BlockCnt := 0 to NumLayersM1 do
       begin
         LayerP := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
         LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].Norm,
@@ -41569,13 +41600,13 @@ begin
               if Config.NormTopKProb then
               begin
                 EnsureWritableImportWeights(GateTopK);
-                for e := 0 to Config.NumRoutedExperts - 1 do
+                for e := 0 to NumRoutedExpertsM1 do
                   GateTopK.FArrNeurons[0].Weights.FData[e] := BiasVec.FData[e];
                 GateTopK.FlushWeightCache();
               end
               else
               begin
-                for e := 0 to Config.NumRoutedExperts - 1 do
+                for e := 0 to NumRoutedExpertsM1 do
                   if BiasVec.FData[e] <> 0 then
                     ImportError('Nemotron-H import: a non-zero ' +
                       'e_score_correction_bias with norm_topk_prob=false is ' +
@@ -41584,7 +41615,7 @@ begin
               MarkConsumed(MoeP + 'gate.e_score_correction_bias');
             end;
             // Routed experts: 3D slabs [E, *, *].
-            for e := 0 to Config.NumRoutedExperts - 1 do
+            for e := 0 to NumRoutedExpertsM1 do
             begin
               LoadMoEExpertSlice(Blocks[BlockCnt].ExpertUp[e],
                 MoeP + 'experts.up_proj', e, Config.NumRoutedExperts,
@@ -41786,6 +41817,7 @@ procedure LoadBloomQKVWeights(Reader: TNNetSafeTensorsReader;
 var
   W, B: TNNetVolume;
   r, i, HeadIdx, Third, RowInHead, TargetIdx: integer;
+  ThreeHiddenM1, HiddenM1: integer;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -41811,7 +41843,9 @@ begin
   try
     Reader.LoadTensorFlat(WName, W);
     Reader.LoadTensorFlat(BName, B);
-    for r := 0 to 3 * Hidden - 1 do
+    ThreeHiddenM1 := 3 * Hidden - 1;
+    HiddenM1 := Hidden - 1;
+    for r := 0 to ThreeHiddenM1 do
     begin
       HeadIdx := r div (3 * HeadDim);
       Third := (r mod (3 * HeadDim)) div HeadDim; // 0=q, 1=k, 2=v
@@ -41822,7 +41856,7 @@ begin
           IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
           IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
           ' weights, expected ' + IntToStr(Hidden) + '.');
-      for i := 0 to Hidden - 1 do
+      for i := 0 to HiddenM1 do
         Layer.FArrNeurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
       Layer.FArrNeurons[TargetIdx].BiasWeight := B.FData[r];
     end;
@@ -41851,6 +41885,7 @@ var
   HeadOutputs: array of TNNetLayer;
   Channels: array of integer;
   BlockCnt, SeqLen, HeadCnt, HeadDim, i, j, d: integer;
+  NumLayersM1, NumHeadsM1, HeadDimM1, VocabSizeM1, HiddenSizeM1: integer;
   Tmp: TNNetVolume;
   BlockPrefix, AttnPrefix, TensorNameStr: string;
   Consumed: TStringList;
@@ -41899,6 +41934,11 @@ begin
       if pSeqLen > 0 then SeqLen := pSeqLen
       else if Config.SeqLength > 0 then SeqLen := Config.SeqLength
       else SeqLen := 2048;
+      NumLayersM1 := Config.NumLayers - 1;
+      NumHeadsM1 := Config.NumHeads - 1;
+      HeadDimM1 := HeadDim - 1;
+      VocabSizeM1 := Config.VocabSize - 1;
+      HiddenSizeM1 := Config.HiddenSize - 1;
 
       // ---------------- Architecture ----------------
       NN := TNNet.Create();
@@ -41916,7 +41956,7 @@ begin
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
       SetLength(Channels, 3 * HeadDim);
-      for BlockCnt := 0 to Config.NumLayers - 1 do
+      for BlockCnt := 0 to NumLayersM1 do
       begin
         // Attention branch: dense(MHA_ALiBi(LN_1(x))).
         BranchInput := NN.GetLastLayer();
@@ -41925,11 +41965,11 @@ begin
         QKVLayer := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
         Blocks[BlockCnt].QKV := QKVLayer;
-        for HeadCnt := 0 to Config.NumHeads - 1 do
+        for HeadCnt := 0 to NumHeadsM1 do
         begin
           // Pack [Q_h | K_h | V_h] (width 3*head_dim) straight off the slab
           // (no rotary: BLOOM's only position signal is the ALiBi bias).
-          for d := 0 to HeadDim - 1 do
+          for d := 0 to HeadDimM1 do
           begin
             Channels[d]               := HeadCnt * HeadDim + d;
             Channels[HeadDim + d]     :=
@@ -41990,9 +42030,9 @@ begin
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'word_embeddings.weight');
         EnsureWritableImportWeights(LMHead);
-        for j := 0 to Config.VocabSize - 1 do
+        for j := 0 to VocabSizeM1 do
         begin
-          for i := 0 to Config.HiddenSize - 1 do
+          for i := 0 to HiddenSizeM1 do
             LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.HiddenSize + i];
           LMHead.FArrNeurons[j].BiasWeight := 0;
@@ -42008,7 +42048,7 @@ begin
         Config.Prefix + 'word_embeddings_layernorm.bias', Config.HiddenSize);
       MarkConsumed(Config.Prefix + 'word_embeddings_layernorm.weight');
       MarkConsumed(Config.Prefix + 'word_embeddings_layernorm.bias');
-      for BlockCnt := 0 to Config.NumLayers - 1 do
+      for BlockCnt := 0 to NumLayersM1 do
       begin
         BlockPrefix := Config.Prefix + 'h.' + IntToStr(BlockCnt) + '.';
         AttnPrefix := BlockPrefix + 'self_attention.';
@@ -42272,7 +42312,7 @@ var
   W: TNNetVolume;
   GroupSize, QkvOut, QWidth, KVWidth, r, i: integer;
   HeadIdx, Third, RowInHead, RotHalf, TargetRow, TargetIdx: integer;
-  Group, SubInGroup, GroupStride: integer;
+  Group, SubInGroup, GroupStride, QkvOutM1, HiddenM1: integer;
 begin
   EnsureWritableImportWeights(Layer);
   GroupSize := Heads div KVHeads;
@@ -42293,10 +42333,12 @@ begin
       IntToStr(QkvOut) + '.');
   RotHalf := HeadDim div 2;
   GroupStride := (GroupSize + 2) * HeadDim;
+  QkvOutM1 := QkvOut - 1;
+  HiddenM1 := Hidden - 1;
   W := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(WName, W);
-    for r := 0 to QkvOut - 1 do
+    for r := 0 to QkvOutM1 do
     begin
       // Decode source row r -> (Third in {0=q,1=k,2=v}, HeadIdx, RowInHead).
       if PerHeadThirds then
@@ -42353,7 +42395,7 @@ begin
           IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
           IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
           ' weights, expected ' + IntToStr(Hidden) + '.');
-      for i := 0 to Hidden - 1 do
+      for i := 0 to HiddenM1 do
         Layer.FArrNeurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
       Layer.FArrNeurons[TargetIdx].BiasWeight := 0;
     end;
@@ -42383,6 +42425,8 @@ var
   SliceChannels: array of integer;
   BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
   HeadDim, QWidth, KVWidth, i, j, d: integer;
+  NumLayersM1, NumKVHeadsM1, HeadDimM1, NumHeadsM1: integer;
+  VocabSizeM1, HiddenSizeM1: integer;
   PerHeadThirds: boolean;
   Tmp: TNNetVolume;
   BlockPrefix, AttnPrefix, TensorNameStr: string;
@@ -42437,6 +42481,12 @@ begin
       QWidth := Config.NumHeads * HeadDim;
       KVWidth := Config.NumKVHeads * HeadDim;
       GroupSize := Config.NumHeads div Config.NumKVHeads;
+      NumLayersM1 := Config.NumLayers - 1;
+      NumKVHeadsM1 := Config.NumKVHeads - 1;
+      HeadDimM1 := HeadDim - 1;
+      NumHeadsM1 := Config.NumHeads - 1;
+      VocabSizeM1 := Config.VocabSize - 1;
+      HiddenSizeM1 := Config.HiddenSize - 1;
       // The plain-MHA QKV layout (per-head [q|k|v] thirds) is used ONLY when
       // neither the new arch nor multi_query applies: that is exactly when
       // the effective num_kv_heads equals num_heads AND the new arch is off.
@@ -42483,7 +42533,7 @@ begin
       SetLength(VSlices, Config.NumKVHeads);
       SetLength(HeadOutputs, Config.NumHeads);
       SetLength(SliceChannels, HeadDim);
-      for BlockCnt := 0 to Config.NumLayers - 1 do
+      for BlockCnt := 0 to NumLayersM1 do
       begin
         BranchInput := NN.GetLastLayer();
         // LayerNorm topology:
@@ -42514,24 +42564,24 @@ begin
         QSource := QKVLayer;
         KSource := QKVLayer;
         // K is rotated ONCE per KV head; V (slab tail) is never rotated.
-        for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
+        for KVHeadCnt := 0 to NumKVHeadsM1 do
         begin
-          for d := 0 to HeadDim - 1 do
+          for d := 0 to HeadDimM1 do
             SliceChannels[d] := QWidth + KVHeadCnt * HeadDim + d;
           KSlice := NN.AddLayerAfter(
             TNNetSplitChannels.Create(SliceChannels), KSource);
           KRotated[KVHeadCnt] := NN.AddLayerAfter(
             CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling),
             KSlice);
-          for d := 0 to HeadDim - 1 do
+          for d := 0 to HeadDimM1 do
             SliceChannels[d] := QWidth + KVWidth + KVHeadCnt * HeadDim + d;
           VSlices[KVHeadCnt] := NN.AddLayerAfter(
             TNNetSplitChannels.Create(SliceChannels), QKVLayer);
         end;
-        for HeadCnt := 0 to Config.NumHeads - 1 do
+        for HeadCnt := 0 to NumHeadsM1 do
         begin
           KVGroup := HeadCnt div GroupSize;
-          for d := 0 to HeadDim - 1 do
+          for d := 0 to HeadDimM1 do
             SliceChannels[d] := HeadCnt * HeadDim + d;
           QSlice := NN.AddLayerAfter(
             TNNetSplitChannels.Create(SliceChannels), QSource);
@@ -42597,9 +42647,9 @@ begin
         if Config.TieWordEmbeddings then
         begin
           EnsureWritableImportWeights(LMHead);
-          for j := 0 to Config.VocabSize - 1 do
+          for j := 0 to VocabSizeM1 do
           begin
-            for i := 0 to Config.HiddenSize - 1 do
+            for i := 0 to HiddenSizeM1 do
               LMHead.FArrNeurons[j].Weights.FData[i] :=
                 Tmp.FData[j * Config.HiddenSize + i];
             LMHead.FArrNeurons[j].BiasWeight := 0;
@@ -42617,7 +42667,7 @@ begin
       finally
         Tmp.Free;
       end;
-      for BlockCnt := 0 to Config.NumLayers - 1 do
+      for BlockCnt := 0 to NumLayersM1 do
       begin
         BlockPrefix := Config.Prefix + 'h.' + IntToStr(BlockCnt) + '.';
         AttnPrefix := BlockPrefix + 'self_attention.';
@@ -42734,7 +42784,7 @@ var
   Obj: TJSONObject;
   LayerTypes: TJSONData;
   HiddenAct, LayerTypeStr, ExpectedTypeStr: string;
-  LayerCnt: integer;
+  LayerCnt, NumLayersM1: integer;
 
   function RequiredInt(const Key: string): integer;
   var
@@ -42813,7 +42863,8 @@ begin
          (TJSONArray(LayerTypes).Count <> Result.NumLayers) then
         ImportError('ModernBERT import: layer_types must be an array of ' +
           IntToStr(Result.NumLayers) + ' entries.');
-      for LayerCnt := 0 to Result.NumLayers - 1 do
+      NumLayersM1 := Result.NumLayers - 1;
+      for LayerCnt := 0 to NumLayersM1 do
       begin
         LayerTypeStr := TJSONArray(LayerTypes).Items[LayerCnt].AsString;
         if (LayerCnt mod Result.GlobalEveryN) = 0 then
@@ -42873,6 +42924,7 @@ procedure LoadModernBertQKVWeights(Reader: TNNetSafeTensorsReader;
 var
   W, B: TNNetVolume;
   r, i, Third, RowInThird, HeadIdx, RowInHead, HalfDim, TargetIdx: integer;
+  ThreeHiddenM1, HiddenM1: integer;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -42897,6 +42949,8 @@ begin
       '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
       IntToStr(3 * Hidden) + '.');
   HalfDim := HeadDim div 2;
+  ThreeHiddenM1 := 3 * Hidden - 1;
+  HiddenM1 := Hidden - 1;
   W := TNNetVolume.Create;
   B := nil;
   try
@@ -42906,7 +42960,7 @@ begin
       B := TNNetVolume.Create;
       Reader.LoadTensorFlat(BName, B);
     end;
-    for r := 0 to 3 * Hidden - 1 do
+    for r := 0 to ThreeHiddenM1 do
     begin
       Third := r div Hidden; // 0=q, 1=k, 2=v (whole thirds)
       RowInThird := r mod Hidden;
@@ -42928,7 +42982,7 @@ begin
           IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
           IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
           ' weights, expected ' + IntToStr(Hidden) + '.');
-      for i := 0 to Hidden - 1 do
+      for i := 0 to HiddenM1 do
         Layer.FArrNeurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
       if B <> nil then
         Layer.FArrNeurons[TargetIdx].BiasWeight := B.FData[r]
@@ -42954,7 +43008,7 @@ procedure LoadModernBertWiWeights(Reader: TNNetSafeTensorsReader;
   Hidden, Intermediate: integer);
 var
   W, B: TNNetVolume;
-  r, i, TargetIdx: integer;
+  r, i, TargetIdx, TwoIntermediateM1, HiddenM1: integer;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -42988,7 +43042,9 @@ begin
       B := TNNetVolume.Create;
       Reader.LoadTensorFlat(BName, B);
     end;
-    for r := 0 to 2 * Intermediate - 1 do
+    TwoIntermediateM1 := 2 * Intermediate - 1;
+    HiddenM1 := Hidden - 1;
+    for r := 0 to TwoIntermediateM1 do
     begin
       // Swap the halves: HF input rows (r < I) -> neurons I + r (the
       // activated SECOND half); HF gate rows (r >= I) -> neurons r - I.
@@ -43001,7 +43057,7 @@ begin
           IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
           IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
           ' weights, expected ' + IntToStr(Hidden) + '.');
-      for i := 0 to Hidden - 1 do
+      for i := 0 to HiddenM1 do
         Layer.FArrNeurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
       if B <> nil then
         Layer.FArrNeurons[TargetIdx].BiasWeight := B.FData[r]
@@ -43024,7 +43080,7 @@ procedure LoadModernBertNormWeights(Reader: TNNetSafeTensorsReader;
   HasBias: boolean);
 var
   Tmp: TNNetVolume;
-  i: integer;
+  i, DModelM1: integer;
 begin
   if not Reader.HasTensor(WName) then
     ImportError('ModernBERT import: missing tensor "' + WName + '".');
@@ -43032,10 +43088,11 @@ begin
      (Reader.DimSize(WName, 0) <> d_model) then
     ImportError('ModernBERT import: "' + WName + '" must have shape [' +
       IntToStr(d_model) + '], got ' + Reader.ShapeAsString(WName));
+  DModelM1 := d_model - 1;
   Tmp := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(WName, Tmp);
-    for i := 0 to d_model - 1 do
+    for i := 0 to DModelM1 do
       Layer.FArrNeurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
     if HasBias then
     begin
@@ -43046,11 +43103,11 @@ begin
         ImportError('ModernBERT import: "' + BName + '" must have shape [' +
           IntToStr(d_model) + '], got ' + Reader.ShapeAsString(BName));
       Reader.LoadTensorFlat(BName, Tmp);
-      for i := 0 to d_model - 1 do
+      for i := 0 to DModelM1 do
         Layer.FArrNeurons[1].Weights.FData[i] := Tmp.FData[i]; // beta
     end
     else
-      for i := 0 to d_model - 1 do
+      for i := 0 to DModelM1 do
         Layer.FArrNeurons[1].Weights.FData[i] := 0; // bias-free norm
   finally
     Tmp.Free;
@@ -43076,6 +43133,7 @@ var
   HeadOutputs: array of TNNetLayer;
   Channels: array of integer;
   BlockCnt, SeqLen, HeadCnt, HeadDim, LayerWindow, i, d: integer;
+  NumLayersM1, NumHeadsM1, HeadDimM1: integer;
   LayerIsGlobal: boolean;
   LayerTheta: TNeuralFloat;
   BlockPrefix, TensorNameStr: string;
@@ -43137,6 +43195,9 @@ begin
         ImportError('ModernBERT import: requested SeqLen=' +
           IntToStr(SeqLen) + ' exceeds max_position_embeddings=' +
           IntToStr(Config.MaxPositions) + '.');
+      NumLayersM1 := Config.NumLayers - 1;
+      NumHeadsM1 := Config.NumHeads - 1;
+      HeadDimM1 := HeadDim - 1;
 
       // ---------------- Architecture ----------------
       NN := TNNet.Create();
@@ -43155,7 +43216,7 @@ begin
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
       SetLength(Channels, HeadDim);
-      for BlockCnt := 0 to Config.NumLayers - 1 do
+      for BlockCnt := 0 to NumLayersM1 do
       begin
         // Per-layer attention type: layer i attends GLOBALLY iff
         // i mod global_attn_every_n_layers = 0 (HF ModernBertConfig:
@@ -43196,22 +43257,22 @@ begin
         Blocks[BlockCnt].QKV := NN.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetInferenceOnly(pInferenceOnly),
           NormedSource);
-        for HeadCnt := 0 to Config.NumHeads - 1 do
+        for HeadCnt := 0 to NumHeadsM1 do
         begin
           // q and k slices rotate with the layer's RoPE theta; v never.
-          for d := 0 to HeadDim - 1 do
+          for d := 0 to HeadDimM1 do
             Channels[d] := HeadCnt * HeadDim + d;
           QSlice := NN.AddLayerAfter(
             TNNetSplitChannels.Create(Channels), Blocks[BlockCnt].QKV);
           QSlice := NN.AddLayerAfter(
             TNNetRotaryEmbedding.Create(LayerTheta), QSlice);
-          for d := 0 to HeadDim - 1 do
+          for d := 0 to HeadDimM1 do
             Channels[d] := Config.HiddenSize + HeadCnt * HeadDim + d;
           KSlice := NN.AddLayerAfter(
             TNNetSplitChannels.Create(Channels), Blocks[BlockCnt].QKV);
           KSlice := NN.AddLayerAfter(
             TNNetRotaryEmbedding.Create(LayerTheta), KSlice);
-          for d := 0 to HeadDim - 1 do
+          for d := 0 to HeadDimM1 do
             Channels[d] := 2 * Config.HiddenSize + HeadCnt * HeadDim + d;
           VSlice := NN.AddLayerAfter(
             TNNetSplitChannels.Create(Channels), Blocks[BlockCnt].QKV);
@@ -43281,7 +43342,7 @@ begin
       MarkConsumed(Config.Prefix + 'embeddings.norm.weight');
       if Config.NormBias then
         MarkConsumed(Config.Prefix + 'embeddings.norm.bias');
-      for BlockCnt := 0 to Config.NumLayers - 1 do
+      for BlockCnt := 0 to NumLayersM1 do
       begin
         BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
         // Layer 0's attn_norm is nn.Identity - NO tensors exist for it.
@@ -43624,6 +43685,7 @@ var
   MoEBranches, HeadOutputs: array of TNNetLayer;
   BlockCnt, SeqLen, HeadCnt, ExpertCnt, i, j: integer;
   dn, dr, dv, LatentRank, SharedWidth: integer;
+  NumLayersM1, NumHeadsM1, NRoutedExpertsM1, VocabSizeM1, HiddenSizeM1: integer;
   LayerIsMoE: boolean;
   Tmp: TNNetVolume;
   BlockPrefix, TensorNameStr, LMHeadName, AttnPrefix: string;
@@ -43659,17 +43721,19 @@ var
   procedure LoadRows(Layer: TNNetLayer; const W: TNNetVolume;
     InDim, SrcRowBase, RowCount, DstBase: integer);
   var
-    RowCnt, ColCnt: integer;
+    RowCnt, ColCnt, RowCountM1, InDimM1: integer;
   begin
     EnsureWritableImportWeights(Layer);
-    for RowCnt := 0 to RowCount - 1 do
+    RowCountM1 := RowCount - 1;
+    InDimM1 := InDim - 1;
+    for RowCnt := 0 to RowCountM1 do
     begin
       if Layer.FArrNeurons[DstBase + RowCnt].Weights.Size <> InDim then
         ImportError('DeepSeek-V2 import: internal error - neuron ' +
           IntToStr(DstBase + RowCnt) + ' has ' +
           IntToStr(Layer.FArrNeurons[DstBase + RowCnt].Weights.Size) +
           ' weights, expected ' + IntToStr(InDim) + '.');
-      for ColCnt := 0 to InDim - 1 do
+      for ColCnt := 0 to InDimM1 do
         Layer.FArrNeurons[DstBase + RowCnt].Weights.FData[ColCnt] :=
           W.FData[(SrcRowBase + RowCnt) * InDim + ColCnt];
       Layer.FArrNeurons[DstBase + RowCnt].BiasWeight := 0;
@@ -43718,6 +43782,11 @@ begin
         ImportError('DeepSeek-V2 import: requested SeqLen=' +
           IntToStr(SeqLen) + ' exceeds max_position_embeddings=' +
           IntToStr(Config.MaxPositions) + '.');
+      NumLayersM1 := Config.NumLayers - 1;
+      NumHeadsM1 := Config.NumHeads - 1;
+      NRoutedExpertsM1 := Config.NRoutedExperts - 1;
+      VocabSizeM1 := Config.VocabSize - 1;
+      HiddenSizeM1 := Config.HiddenSize - 1;
 
       // ---------------- Architecture ----------------
       NN := TNNet.Create();
@@ -43729,7 +43798,7 @@ begin
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
-      for BlockCnt := 0 to Config.NumLayers - 1 do
+      for BlockCnt := 0 to NumLayersM1 do
       begin
         LayerIsMoE := BlockCnt >= Config.FirstKDenseReplace;
         // ---- MLA sub-block: x := x + o_proj(MLA(RMSNorm(x))). Wired ----
@@ -43779,7 +43848,7 @@ begin
         // branches cancel (the MLA builder's trick).
         NegRopeK := NN.AddLayerAfter( TNNetNegate.Create(), KRopeRot );
         VZeroPad := NN.AddLayer( TNNetSum.Create([KRopeRot, NegRopeK]) );
-        for HeadCnt := 0 to Config.NumHeads - 1 do
+        for HeadCnt := 0 to NumHeadsM1 do
         begin
           QSlice := NN.AddLayerAfter(
             TNNetSplitChannels.Create(HeadCnt * dn, dn),
@@ -43851,7 +43920,7 @@ begin
           GateTopK := NN.AddLayer( TNNetTopKGate.Create(
             Config.NumExpertsPerTok,
             {pRenormalize=}Config.NormTopKProb) );
-          for ExpertCnt := 0 to Config.NRoutedExperts - 1 do
+          for ExpertCnt := 0 to NRoutedExpertsM1 do
           begin
             Blocks[BlockCnt].ExpertGateUp[ExpertCnt] := NN.AddLayerAfter(
               TNNetPointwiseConvLinear.Create(
@@ -43914,9 +43983,9 @@ begin
         begin
           // Tied LM head: logits = h . embed^T (rows copied, bias-free).
           EnsureWritableImportWeights(LMHead);
-          for j := 0 to Config.VocabSize - 1 do
+          for j := 0 to VocabSizeM1 do
           begin
-            for i := 0 to Config.HiddenSize - 1 do
+            for i := 0 to HiddenSizeM1 do
               LMHead.FArrNeurons[j].Weights.FData[i] :=
                 Tmp.FData[j * Config.HiddenSize + i];
             LMHead.FArrNeurons[j].BiasWeight := 0;
@@ -43930,7 +43999,7 @@ begin
             Config.HiddenSize, Config.VocabSize);
           MarkConsumed(LMHeadName);
         end;
-        for BlockCnt := 0 to Config.NumLayers - 1 do
+        for BlockCnt := 0 to NumLayersM1 do
         begin
           LayerIsMoE := BlockCnt >= Config.FirstKDenseReplace;
           BlockPrefix := Config.Prefix + 'layers.' +
@@ -43944,7 +44013,7 @@ begin
           CheckLinearShape(AttnPrefix + 'q_proj.weight',
             Config.NumHeads * (dn + dr), Config.HiddenSize);
           Reader.LoadTensorFlat(AttnPrefix + 'q_proj.weight', Tmp);
-          for HeadCnt := 0 to Config.NumHeads - 1 do
+          for HeadCnt := 0 to NumHeadsM1 do
           begin
             LoadRows(Blocks[BlockCnt].QContent, Tmp, Config.HiddenSize,
               HeadCnt * (dn + dr), dn, HeadCnt * dn);
@@ -43975,7 +44044,7 @@ begin
           CheckLinearShape(AttnPrefix + 'kv_b_proj.weight',
             Config.NumHeads * (dn + dv), LatentRank);
           Reader.LoadTensorFlat(AttnPrefix + 'kv_b_proj.weight', Tmp);
-          for HeadCnt := 0 to Config.NumHeads - 1 do
+          for HeadCnt := 0 to NumHeadsM1 do
           begin
             LoadRows(Blocks[BlockCnt].KContent, Tmp, LatentRank,
               HeadCnt * (dn + dv), dn, HeadCnt * dn);
@@ -44023,7 +44092,7 @@ begin
             // since the scale is linear, it multiplies ONLY the routed
             // contributions, and the shared branch bypasses it. (HF
             // multiplies the top-k gate weights instead; same product.)
-            for ExpertCnt := 0 to Config.NRoutedExperts - 1 do
+            for ExpertCnt := 0 to NRoutedExpertsM1 do
             begin
               TensorNameStr := BlockPrefix + 'mlp.experts.' +
                 IntToStr(ExpertCnt) + '.';
@@ -44306,7 +44375,7 @@ procedure LoadClipPatchConv(Reader: TNNetSafeTensorsReader;
   NumChannels, Patch, Hidden: integer);
 var
   W: TNNetVolume;
-  o, c, ky, kx: integer;
+  o, c, ky, kx, HiddenM1, PatchM1, NumChannelsM1: integer;
 begin
   if not Reader.HasTensor(WName) then
     ImportError('CLIP import: missing tensor "' + WName + '".');
@@ -44328,13 +44397,16 @@ begin
       IntToStr(Layer.FArrNeurons[0].Weights.Size) + ' weights, expected ' +
       IntToStr(Patch * Patch * NumChannels) + '.');
   W := TNNetVolume.Create;
+  HiddenM1 := Hidden - 1;
+  PatchM1 := Patch - 1;
+  NumChannelsM1 := NumChannels - 1;
   try
     Reader.LoadTensorFlat(WName, W);
-    for o := 0 to Hidden - 1 do
+    for o := 0 to HiddenM1 do
     begin
-      for ky := 0 to Patch - 1 do
-        for kx := 0 to Patch - 1 do
-          for c := 0 to NumChannels - 1 do
+      for ky := 0 to PatchM1 do
+        for kx := 0 to PatchM1 do
+          for c := 0 to NumChannelsM1 do
             Layer.FArrNeurons[o].Weights.FData[
               (ky * Patch + kx) * NumChannels + c] :=
               W.FData[((o * NumChannels + c) * Patch + ky) * Patch + kx];
@@ -44358,6 +44430,7 @@ var
   Blocks: TClipBlockLayersArray;
   Tbl: TNNetVolume;
   Grid, NumPatches, BlockCnt, BuiltLayers, ChanCnt: integer;
+  BuiltLayersM1, HiddenSizeM1: integer;
   PreLNName: string;
 begin
   if (Tower.NumHeads < 1) or
@@ -44404,8 +44477,10 @@ begin
     else
       BuiltLayers := Tower.NumLayers;
     if BuiltLayers < 0 then BuiltLayers := 0;
+    BuiltLayersM1 := BuiltLayers - 1;
+    HiddenSizeM1 := Tower.HiddenSize - 1;
     SetLength(Blocks, BuiltLayers);
-    for BlockCnt := 0 to BuiltLayers - 1 do
+    for BlockCnt := 0 to BuiltLayersM1 do
       AddClipEncoderBlock(NN, Tower, {CausalMask=}false,
         Blocks[BlockCnt], pInferenceOnly);
     PostLN := nil;
@@ -44447,7 +44522,7 @@ begin
           'embeddings.class_embedding" must have ' +
           IntToStr(Tower.HiddenSize) + ' elements, got ' +
           IntToStr(Tbl.Size) + '.');
-      for ChanCnt := 0 to Tower.HiddenSize - 1 do
+      for ChanCnt := 0 to HiddenSizeM1 do
         PosEmb.FArrNeurons[0].Weights.FData[ChanCnt] :=
           PosEmb.FArrNeurons[0].Weights.FData[ChanCnt] + Tbl.FData[ChanCnt];
       PosEmb.FlushWeightCache();
@@ -44461,7 +44536,7 @@ begin
       PreLNName := Prefix + 'pre_layernorm';
     LoadLayerNormWeights(Reader, PreLN, PreLNName + '.weight',
       PreLNName + '.bias', Tower.HiddenSize);
-    for BlockCnt := 0 to BuiltLayers - 1 do
+    for BlockCnt := 0 to BuiltLayersM1 do
       LoadClipEncoderBlockWeights(Reader, Blocks[BlockCnt],
         Prefix + 'encoder.layers.' + IntToStr(BlockCnt) + '.', Tower);
     if PostLN <> nil then
@@ -44487,7 +44562,7 @@ var
   TokEmb, PosEmb, FinalLN, Proj: TNNetLayer;
   Blocks: TClipBlockLayersArray;
   Tmp: TNNetVolume;
-  SeqLen, BlockCnt: integer;
+  SeqLen, BlockCnt, TextNumLayersM1: integer;
 begin
   TextNet := nil;
   VisionNet := nil;
@@ -44517,7 +44592,8 @@ begin
         TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions).SetInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.SetInferenceOnly();
       SetLength(Blocks, Config.Text.NumLayers);
-      for BlockCnt := 0 to Config.Text.NumLayers - 1 do
+      TextNumLayersM1 := Config.Text.NumLayers - 1;
+      for BlockCnt := 0 to TextNumLayersM1 do
         AddClipEncoderBlock(NN, Config.Text, {CausalMask=}true,
           Blocks[BlockCnt], pInferenceOnly);
       FinalLN := NN.AddLayer(
@@ -44535,7 +44611,7 @@ begin
       LoadClipEmbeddingTable(Reader, PosEmb,
         'text_model.embeddings.position_embedding.weight',
         Config.TextMaxPositions, Config.Text.HiddenSize);
-      for BlockCnt := 0 to Config.Text.NumLayers - 1 do
+      for BlockCnt := 0 to TextNumLayersM1 do
         LoadClipEncoderBlockWeights(Reader, Blocks[BlockCnt],
           'text_model.encoder.layers.' + IntToStr(BlockCnt) + '.',
           Config.Text);
@@ -44751,7 +44827,7 @@ end;
 procedure ClipExtractEmbedding(NetOutput: TNNetVolume; TokenPos: integer;
   Embedding: TNNetVolume);
 var
-  Depth, ChanCnt: integer;
+  Depth, ChanCnt, DepthM1: integer;
   Norm: TNeuralFloat;
 begin
   Depth := NetOutput.Depth;
@@ -44764,14 +44840,15 @@ begin
       ' out of range 0..' + IntToStr(NetOutput.SizeX - 1) + '.');
   Embedding.ReSize(1, 1, Depth);
   Norm := 0;
-  for ChanCnt := 0 to Depth - 1 do
+  DepthM1 := Depth - 1;
+  for ChanCnt := 0 to DepthM1 do
   begin
     Embedding.FData[ChanCnt] := NetOutput.FData[TokenPos * Depth + ChanCnt];
     Norm := Norm + Embedding.FData[ChanCnt] * Embedding.FData[ChanCnt];
   end;
   Norm := Sqrt(Norm);
   if Norm > 0 then
-    for ChanCnt := 0 to Depth - 1 do
+    for ChanCnt := 0 to DepthM1 do
       Embedding.FData[ChanCnt] := Embedding.FData[ChanCnt] / Norm;
 end;
 
@@ -45157,7 +45234,7 @@ var
   PatchConv, PosEmb, PostLN: TNNetLayer;
   Blocks: TClipBlockLayersArray;
   Tmp: TNNetVolume;
-  Grid, NumPatches, BlockCnt, ci, d: integer;
+  Grid, NumPatches, BlockCnt, ci, d, VisionNumLayersM1: integer;
 begin
   d := Config.Vision.HiddenSize;
   if (Config.Vision.NumHeads < 1) or ((d mod Config.Vision.NumHeads) <> 0) then
@@ -45170,6 +45247,7 @@ begin
       ' is not a multiple of patch_size=' + IntToStr(Config.PatchSize) + '.');
   Grid := Config.ImageSize div Config.PatchSize;
   NumPatches := Grid * Grid;
+  VisionNumLayersM1 := Config.Vision.NumLayers - 1;
   NN := TNNet.Create();
   try
     NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
@@ -45188,7 +45266,7 @@ begin
       TNNetLearnedPositionalEmbedding.Create(NumPatches + 1).SetInferenceOnly(pInferenceOnly) );
     if pInferenceOnly then NN.SetInferenceOnly();
     SetLength(Blocks, Config.Vision.NumLayers);
-    for BlockCnt := 0 to Config.Vision.NumLayers - 1 do
+    for BlockCnt := 0 to VisionNumLayersM1 do
       AddClipEncoderBlock(NN, Config.Vision, {CausalMask=}false,
         Blocks[BlockCnt], pInferenceOnly);
     // post_layernorm over every token (HF applies it to last_hidden_state).
