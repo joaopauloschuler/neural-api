@@ -44107,7 +44107,7 @@ procedure TNNetInvertible1x1Conv.Compute();
 var
   StartTime: double;
   SizeX, SizeY, x, y, i, j: integer;
-  MaxFC: integer;
+  MaxFC, SizeXM1, SizeYM1: integer;
   acc, sumLogS, sval: TNeuralFloat;
   InPtr, OutPtr, T1Ptr, T2Ptr, SPtr, LURow: TNeuralFloatArrPtr;
 begin
@@ -44119,8 +44119,10 @@ begin
   sumLogS := 0;
   for i := 0 to MaxFC do sumLogS := sumLogS + Ln(Abs(SPtr^[i]) + 1e-12);
   FLogDet := 0;
-  for y := 0 to SizeY - 1 do
-    for x := 0 to SizeX - 1 do
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  for y := 0 to SizeYM1 do
+    for x := 0 to SizeXM1 do
     begin
       InPtr := FPrevLayer.FOutput.GetRawPtr(x, y, 0);
       OutPtr := FOutput.GetRawPtr(x, y, 0);
@@ -44134,11 +44136,11 @@ begin
         begin
           LURow := FNeurons[0].FWeights.GetRawPtr(0, 0, i);
           acc := SPtr^[i] * InPtr^[i];
-          for j := i + 1 to FC - 1 do acc := acc + LURow^[j] * InPtr^[j];
+          for j := i + 1 to MaxFC do acc := acc + LURow^[j] * InPtr^[j];
           T1Ptr^[i] := acc;
         end;
         // t2 = L * t1 : L unit-lower (diag implicit 1).
-        for i := 0 to FC - 1 do
+        for i := 0 to MaxFC do
         begin
           LURow := FNeurons[0].FWeights.GetRawPtr(0, 0, i);
           acc := T1Ptr^[i];
@@ -44146,16 +44148,16 @@ begin
           T2Ptr^[i] := acc;
         end;
         // y = P * t2 : output row FPerm[i] gets t2[i].
-        for i := 0 to FC - 1 do OutPtr^[FPerm[i]] := T2Ptr^[i];
+        for i := 0 to MaxFC do OutPtr^[FPerm[i]] := T2Ptr^[i];
         FLogDet := FLogDet + sumLogS;
       end
       else
       begin
         // Inverse (sampling): x = (U+diag(s))^-1 * L^-1 * P^T * z.
         // t2 = P^T * z : t2[i] = z[FPerm[i]].
-        for i := 0 to FC - 1 do T2Ptr^[i] := InPtr^[FPerm[i]];
+        for i := 0 to MaxFC do T2Ptr^[i] := InPtr^[FPerm[i]];
         // Solve L * t1 = t2 (forward substitution, unit diagonal).
-        for i := 0 to FC - 1 do
+        for i := 0 to MaxFC do
         begin
           LURow := FNeurons[0].FWeights.GetRawPtr(0, 0, i);
           acc := T2Ptr^[i];
@@ -44167,7 +44169,7 @@ begin
         begin
           LURow := FNeurons[0].FWeights.GetRawPtr(0, 0, i);
           acc := T1Ptr^[i];
-          for j := i + 1 to FC - 1 do acc := acc - LURow^[j] * OutPtr^[j];
+          for j := i + 1 to MaxFC do acc := acc - LURow^[j] * OutPtr^[j];
           sval := SPtr^[i];
           if Abs(sval) < 1e-12 then
           begin
@@ -44184,6 +44186,7 @@ procedure TNNetInvertible1x1Conv.Backpropagate();
 var
   StartTime: double;
   SizeX, SizeY, x, y, i, j: integer;
+  MaxFC, SizeXM1, SizeYM1: integer;
   hasInputGrad: boolean;
   gt1, gt2, gx, sval: TNeuralFloat;
   InPtr, GyPtr, PrevErrPtr, T1Ptr, SPtr, LURow, dLURow, dSPtr: TNeuralFloatArrPtr;
@@ -44203,6 +44206,9 @@ begin
   end;
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  MaxFC := FC - 1;
   lr := FLearningRate;
   SPtr := FNeurons[1].FWeights.GetRawPtr(0, 0, 0);
   dSPtr := FNeurons[1].FDelta.GetRawPtr(0, 0, 0);
@@ -44215,7 +44221,7 @@ begin
   // -logdet term: d(-SizeX*SizeY*sum(log|s|))/ds_i = -SizeX*SizeY/s_i, folded in
   // once (it does not depend on the per-position data).
   if FLogDetLossWeight <> 0 then
-    for i := 0 to FC - 1 do
+    for i := 0 to MaxFC do
     begin
       sval := SPtr^[i];
       if Abs(sval) < 1e-12 then
@@ -44224,19 +44230,19 @@ begin
       end;
       dSPtr^[i] := dSPtr^[i] + (-lr) * (-FLogDetLossWeight * SizeX * SizeY / sval);
     end;
-  for y := 0 to SizeY - 1 do
-    for x := 0 to SizeX - 1 do
+  for y := 0 to SizeYM1 do
+    for x := 0 to SizeXM1 do
     begin
       InPtr := FPrevLayer.FOutput.GetRawPtr(x, y, 0);
       GyPtr := FOutputError.GetRawPtr(x, y, 0);
       T1Ptr := FT1.GetRawPtr(x, y, 0);
       if hasInputGrad then PrevErrPtr := FPrevLayer.FOutputError.GetRawPtr(x, y, 0);
       // y = P * t2 -> dL/dt2[i] = dL/dy[FPerm[i]].
-      for i := 0 to FC - 1 do gT2Arr[i] := GyPtr^[FPerm[i]];
+      for i := 0 to MaxFC do gT2Arr[i] := GyPtr^[FPerm[i]];
       // t2 = L * t1 ; t2[i] = t1[i] + sum_{j<i} L[i][j]*t1[j].
       // dL/dt1[j] = gT2[j] + sum_{i>j} gT2[i]*L[i][j] ; dL/dL[i][j] = gT2[i]*t1[j].
-      for j := 0 to FC - 1 do gT1Arr[j] := gT2Arr[j];
-      for i := 0 to FC - 1 do
+      for j := 0 to MaxFC do gT1Arr[j] := gT2Arr[j];
+      for i := 0 to MaxFC do
       begin
         LURow := FNeurons[0].FWeights.GetRawPtr(0, 0, i);
         dLURow := FNeurons[0].FDelta.GetRawPtr(0, 0, i);
@@ -44250,7 +44256,7 @@ begin
       // t1 = (U + diag(s)) * x ; t1[i] = s[i]*x[i] + sum_{j>i} U[i][j]*x[j].
       // dL/dx[j] = gT1[j]*s[j] + sum_{i<j} gT1[i]*U[i][j].
       // dL/ds[i] = gT1[i]*x[i] ; dL/dU[i][j] = gT1[i]*x[j] (j>i).
-      for i := 0 to FC - 1 do
+      for i := 0 to MaxFC do
       begin
         LURow := FNeurons[0].FWeights.GetRawPtr(0, 0, i);
         dLURow := FNeurons[0].FDelta.GetRawPtr(0, 0, i);
@@ -44261,7 +44267,7 @@ begin
           gx := gt1 * SPtr^[i];
           PrevErrPtr^[i] := PrevErrPtr^[i] + gx;
         end;
-        for j := i + 1 to FC - 1 do
+        for j := i + 1 to MaxFC do
         begin
           dLURow^[j] := dLURow^[j] + (-lr) * gt1 * InPtr^[j];
           if hasInputGrad then
@@ -44282,23 +44288,25 @@ end;
 procedure TNNetInvertible1x1Conv.InitDefault();
 var
   i, j, oldSeed: integer;
+  MaxFC: integer;
   LURow: TNeuralFloatArrPtr;
 begin
   if FNeurons.Count < 2 then exit;
   if FC < 1 then exit;
+  MaxFC := FC - 1;
   oldSeed := RandSeed;
   RandSeed := 161803;
   // Small random L (strictly lower) and U (strictly upper); s = 1 -> near-identity
   // (W = P at init, log-det = 0).
   FNeurons[0].FWeights.Fill(0);
-  for i := 0 to FC - 1 do
+  for i := 0 to MaxFC do
   begin
     LURow := FNeurons[0].FWeights.GetRawPtr(0, 0, i);
-    for j := 0 to FC - 1 do
+    for j := 0 to MaxFC do
       if j <> i then
         LURow^[j] := FNeurons[0].FWeights.RandomGaussianValue() * 0.05;
   end;
-  for i := 0 to FC - 1 do FNeurons[1].FWeights.FData[i] := 1.0;
+  for i := 0 to MaxFC do FNeurons[1].FWeights.FData[i] := 1.0;
   FNeurons[0].FDelta.Fill(0);
   FNeurons[0].FBackInertia.Fill(0);
   FNeurons[0].FBiasWeight := 0; FNeurons[0].FBiasDelta := 0; FNeurons[0].FBiasInertia := 0;
@@ -44361,27 +44369,31 @@ end;
 procedure TNNetActNorm.DataDependentInit();
 var
   SizeX, SizeY, x, y, c, cnt: integer;
+  FCM1, SizeXM1, SizeYM1: integer;
   mean, varc, v, std: TNeuralFloat;
   LogSPtr, BPtr, InPtr: TNeuralFloatArrPtr;
 begin
   SizeX := FPrevLayer.FOutput.SizeX;
   SizeY := FPrevLayer.FOutput.SizeY;
   cnt := SizeX * SizeY;
+  FCM1 := FC - 1;
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
   LogSPtr := FNeurons[0].FWeights.GetRawPtr(0, 0, 0);
   BPtr := FNeurons[1].FWeights.GetRawPtr(0, 0, 0);
-  for c := 0 to FC - 1 do
+  for c := 0 to FCM1 do
   begin
     mean := 0;
-    for y := 0 to SizeY - 1 do
-      for x := 0 to SizeX - 1 do
+    for y := 0 to SizeYM1 do
+      for x := 0 to SizeXM1 do
       begin
         InPtr := FPrevLayer.FOutput.GetRawPtr(x, y, 0);
         mean := mean + InPtr^[c];
       end;
     if cnt > 0 then mean := mean / cnt;
     varc := 0;
-    for y := 0 to SizeY - 1 do
-      for x := 0 to SizeX - 1 do
+    for y := 0 to SizeYM1 do
+      for x := 0 to SizeXM1 do
       begin
         InPtr := FPrevLayer.FOutput.GetRawPtr(x, y, 0);
         v := InPtr^[c] - mean;
@@ -44402,6 +44414,7 @@ procedure TNNetActNorm.Compute();
 var
   StartTime: double;
   SizeX, SizeY, x, y, c: integer;
+  FCM1, SizeXM1, SizeYM1: integer;
   sumLogS, sval, bval: TNeuralFloat;
   LogSPtr, BPtr, InPtr, OutPtr: TNeuralFloatArrPtr;
 begin
@@ -44410,20 +44423,23 @@ begin
   if (not FInitialised) and (not FInverse) then DataDependentInit();
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
+  FCM1 := FC - 1;
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
   LogSPtr := FNeurons[0].FWeights.GetRawPtr(0, 0, 0);
   BPtr := FNeurons[1].FWeights.GetRawPtr(0, 0, 0);
   sumLogS := 0;
-  for c := 0 to FC - 1 do sumLogS := sumLogS + LogSPtr^[c];
+  for c := 0 to FCM1 do sumLogS := sumLogS + LogSPtr^[c];
   if not FInverse then FLogDet := SizeX * SizeY * sumLogS
   else FLogDet := -SizeX * SizeY * sumLogS;
-  for y := 0 to SizeY - 1 do
-    for x := 0 to SizeX - 1 do
+  for y := 0 to SizeYM1 do
+    for x := 0 to SizeXM1 do
     begin
       InPtr := FPrevLayer.FOutput.GetRawPtr(x, y, 0);
       OutPtr := FOutput.GetRawPtr(x, y, 0);
       if not FInverse then
       begin
-        for c := 0 to FC - 1 do
+        for c := 0 to FCM1 do
         begin
           sval := Exp(LogSPtr^[c]);
           OutPtr^[c] := sval * InPtr^[c] + BPtr^[c];
@@ -44432,7 +44448,7 @@ begin
       else
       begin
         // Inverse (sampling): x = (z - b) / s = (z - b) * exp(-logs).
-        for c := 0 to FC - 1 do
+        for c := 0 to FCM1 do
         begin
           sval := Exp(-LogSPtr^[c]);
           bval := BPtr^[c];
@@ -44447,6 +44463,7 @@ procedure TNNetActNorm.Backpropagate();
 var
   StartTime: double;
   SizeX, SizeY, x, y, c: integer;
+  FCM1, SizeXM1, SizeYM1: integer;
   hasInputGrad: boolean;
   sval, gy: TNeuralFloat;
   LogSPtr, GyPtr, InPtr, PrevErrPtr, dLogSPtr, dBPtr: TNeuralFloatArrPtr;
@@ -44465,6 +44482,9 @@ begin
   end;
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
+  FCM1 := FC - 1;
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
   lr := FLearningRate;
   LogSPtr := FNeurons[0].FWeights.GetRawPtr(0, 0, 0);
   dLogSPtr := FNeurons[0].FDelta.GetRawPtr(0, 0, 0);
@@ -44476,19 +44496,19 @@ begin
   // -logdet term: d(-SizeX*SizeY*sum(logs))/dlogs_c = -SizeX*SizeY, folded in once
   // (it does not depend on the per-position data).
   if FLogDetLossWeight <> 0 then
-    for c := 0 to FC - 1 do
+    for c := 0 to FCM1 do
       dLogSPtr^[c] := dLogSPtr^[c] + (-lr) * (-FLogDetLossWeight * SizeX * SizeY);
   // y = s*x + b, s = exp(logs).
   // dL/dx[c]    = gy * s
   // dL/db[c]    = gy
   // dL/dlogs[c] = gy * s * x = gy * (y - b) ... computed directly as gy*s*x.
-  for y := 0 to SizeY - 1 do
-    for x := 0 to SizeX - 1 do
+  for y := 0 to SizeYM1 do
+    for x := 0 to SizeXM1 do
     begin
       InPtr := FPrevLayer.FOutput.GetRawPtr(x, y, 0);
       GyPtr := FOutputError.GetRawPtr(x, y, 0);
       if hasInputGrad then PrevErrPtr := FPrevLayer.FOutputError.GetRawPtr(x, y, 0);
-      for c := 0 to FC - 1 do
+      for c := 0 to FCM1 do
       begin
         sval := Exp(LogSPtr^[c]);
         gy := GyPtr^[c];
@@ -44644,6 +44664,7 @@ var
   W1, b1, W2: TNNetVolume;
   Prev: TNNetVolume;
   SeqLen, P, Hd, Dhalf, t, s, kk, it2: integer;
+  PM1, HdM1, DhalfM1, SeqLenM1, FStepsM1: integer;
   zv: array of TNeuralFloat;
   gv: array of TNeuralFloat;
 
@@ -44654,18 +44675,18 @@ var
   begin
     zb := FZin.GetRawPos(it2idx, 0, 0);
     bp := FAct.GetRawPos(it2idx, 0, 0);
-    for k2 := 0 to P - 1 do FZin.FData[zb + k2] := zv[k2];
-    for k2 := 0 to P - 1 do gv[k2] := 0;
-    for jj := 0 to Hd - 1 do
+    for k2 := 0 to PM1 do FZin.FData[zb + k2] := zv[k2];
+    for k2 := 0 to PM1 do gv[k2] := 0;
+    for jj := 0 to HdM1 do
     begin
       a2 := b1.FData[jj];
-      for k2 := 0 to P - 1 do
+      for k2 := 0 to PM1 do
         a2 := a2 + W1.FData[W1.GetRawPos(jj, 0, k2)] * zv[k2];
       FAct.FData[bp + jj] := a2;
       h2 := TanH(a2);
       t2 := 1 - h2 * h2;
       s2 := W2.FData[jj] * t2;
-      for k2 := 0 to P - 1 do
+      for k2 := 0 to PM1 do
         gv[k2] := gv[k2] + W1.FData[W1.GetRawPos(jj, 0, k2)] * s2;
     end;
   end;
@@ -44683,18 +44704,18 @@ var
     hW2 := FNeurons[nbase + 2].FWeights;
     zb := Zc.GetRawPos(idx, 0, 0);
     bp := Ac.GetRawPos(idx, 0, 0);
-    for k2 := 0 to Dhalf - 1 do Zc.FData[zb + k2] := hv[k2];
-    for k2 := 0 to Dhalf - 1 do outg[k2] := 0;
-    for jj := 0 to Hd - 1 do
+    for k2 := 0 to DhalfM1 do Zc.FData[zb + k2] := hv[k2];
+    for k2 := 0 to DhalfM1 do outg[k2] := 0;
+    for jj := 0 to HdM1 do
     begin
       a2 := hb1.FData[jj];
-      for k2 := 0 to Dhalf - 1 do
+      for k2 := 0 to DhalfM1 do
         a2 := a2 + hW1.FData[hW1.GetRawPos(jj, 0, k2)] * hv[k2];
       Ac.FData[bp + jj] := a2;
       h2 := TanH(a2);
       t2 := 1 - h2 * h2;
       s2 := hW2.FData[jj] * t2;
-      for k2 := 0 to Dhalf - 1 do
+      for k2 := 0 to DhalfM1 do
         outg[k2] := outg[k2] + hW1.FData[hW1.GetRawPos(jj, 0, k2)] * s2;
     end;
   end;
@@ -44709,6 +44730,11 @@ begin
   P := FPhaseDim;
   Hd := FHidden;
   Dhalf := P div 2;
+  PM1 := P - 1;
+  HdM1 := Hd - 1;
+  DhalfM1 := Dhalf - 1;
+  SeqLenM1 := SeqLen - 1;
+  FStepsM1 := FSteps - 1;
   if FSeparable then
   begin
     // Exact leapfrog (Stormer-Verlet) with H=T(p)+V(q).
@@ -44716,28 +44742,28 @@ begin
     SetLength(pv, Dhalf);
     SetLength(gqv, Dhalf);   // dV/dq
     SetLength(gpv, Dhalf);   // dT/dp
-    for t := 0 to SeqLen - 1 do
+    for t := 0 to SeqLenM1 do
     begin
-      for kk := 0 to Dhalf - 1 do
+      for kk := 0 to DhalfM1 do
       begin
         qv[kk] := Prev.FData[Prev.GetRawPos(t, 0, kk)];
         pv[kk] := Prev.FData[Prev.GetRawPos(t, 0, kk + Dhalf)];
       end;
-      for s := 0 to FSteps - 1 do
+      for s := 0 to FStepsM1 do
       begin
         itv := (t * FSteps + s) * 2;   // two V evals per step
         itt := (t * FSteps + s);       // one T eval per step
         // p_half = p - (dt/2) dV/dq(q)
         HalfFieldAt(0, FZin, FAct, itv, qv, gqv);
-        for kk := 0 to Dhalf - 1 do pv[kk] := pv[kk] - 0.5 * Fdt * gqv[kk];
+        for kk := 0 to DhalfM1 do pv[kk] := pv[kk] - 0.5 * Fdt * gqv[kk];
         // q_new = q + dt dT/dp(p_half)
         HalfFieldAt(4, FZinT, FActT, itt, pv, gpv);
-        for kk := 0 to Dhalf - 1 do qv[kk] := qv[kk] + Fdt * gpv[kk];
+        for kk := 0 to DhalfM1 do qv[kk] := qv[kk] + Fdt * gpv[kk];
         // p_new = p_half - (dt/2) dV/dq(q_new)
         HalfFieldAt(0, FZin, FAct, itv + 1, qv, gqv);
-        for kk := 0 to Dhalf - 1 do pv[kk] := pv[kk] - 0.5 * Fdt * gqv[kk];
+        for kk := 0 to DhalfM1 do pv[kk] := pv[kk] - 0.5 * Fdt * gqv[kk];
       end;
-      for kk := 0 to Dhalf - 1 do
+      for kk := 0 to DhalfM1 do
       begin
         FOutput.FData[FOutput.GetRawPos(t, 0, kk)] := qv[kk];
         FOutput.FData[FOutput.GetRawPos(t, 0, kk + Dhalf)] := pv[kk];
@@ -44751,12 +44777,12 @@ begin
   W2 := FNeurons[2].FWeights;
   SetLength(zv, P);
   SetLength(gv, P);
-  for t := 0 to SeqLen - 1 do
+  for t := 0 to SeqLenM1 do
   begin
     // Load this time-step's phase vector z=(q|p).
-    for kk := 0 to P - 1 do
+    for kk := 0 to PM1 do
       zv[kk] := Prev.FData[Prev.GetRawPos(t, 0, kk)];
-    for s := 0 to FSteps - 1 do
+    for s := 0 to FStepsM1 do
     begin
       it2 := (t * FSteps + s) * 2;
       // Sequential symplectic Euler (exact-symplectic for separable H):
@@ -44764,15 +44790,15 @@ begin
       //   q_new = q + dt*dH/dp(q, p_mid) (sub 1, field at (q,p_mid))
       // Sub 0: field at the current (q,p); use its q-part for the p update.
       FieldAt(it2);
-      for kk := 0 to Dhalf - 1 do
+      for kk := 0 to DhalfM1 do
         zv[kk + Dhalf] := zv[kk + Dhalf] - Fdt * gv[kk];   // p_mid
       // Sub 1: field at (q, p_mid); use its p-part for the q update.
       FieldAt(it2 + 1);
-      for kk := 0 to Dhalf - 1 do
+      for kk := 0 to DhalfM1 do
         zv[kk] := zv[kk] + Fdt * gv[kk + Dhalf];           // q_new
     end;
     // Emit the integrated phase vector.
-    for kk := 0 to P - 1 do
+    for kk := 0 to PM1 do
       FOutput.FData[FOutput.GetRawPos(t, 0, kk)] := zv[kk];
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -44786,6 +44812,7 @@ var
   GW1, Gb1, GW2: TNNetVolume;
   Prev, PrevErr: TNNetVolume;
   SeqLen, P, Hd, Dhalf, t, s, kk, it2: integer;
+  PM1, HdM1, DhalfM1, SeqLenM1: integer;
   negLR: TNeuralFloat;
   hasInputGrad: boolean;
   gzp: array of TNeuralFloat;   // adjoint dL/dz' on this step's output
@@ -44813,20 +44840,20 @@ var
     hGW2 := FNeurons[nbase + 2].FDelta;
     bp := Ac.GetRawPos(idx, 0, 0);
     zb := Zc.GetRawPos(idx, 0, 0);
-    for k2 := 0 to Dhalf - 1 do dzh[k2] := 0;
-    for jj := 0 to Hd - 1 do
+    for k2 := 0 to DhalfM1 do dzh[k2] := 0;
+    for jj := 0 to HdM1 do
     begin
       a2 := Ac.FData[bp + jj];
       h2 := TanH(a2);
       t2 := 1 - h2 * h2;
       cj := 0;
-      for k2 := 0 to Dhalf - 1 do
+      for k2 := 0 to DhalfM1 do
         cj := cj + hW1.FData[hW1.GetRawPos(jj, 0, k2)] * uh[k2];
       dLda := hW2.FData[jj] * cj * (-2 * h2 * t2);
       dLdc := hW2.FData[jj] * t2;
       hGW2.FData[jj] := hGW2.FData[jj] + negLR * (t2 * cj);
       hGb1.FData[jj] := hGb1.FData[jj] + negLR * dLda;
-      for k2 := 0 to Dhalf - 1 do
+      for k2 := 0 to DhalfM1 do
       begin
         w1jk := hW1.FData[hW1.GetRawPos(jj, 0, k2)];
         hGW1.FData[hW1.GetRawPos(jj, 0, k2)] :=
@@ -44846,21 +44873,21 @@ var
   begin
     bp := FAct.GetRawPos(it2idx, 0, 0);
     zb := FZin.GetRawPos(it2idx, 0, 0);
-    for k2 := 0 to P - 1 do dz[k2] := 0;
-    for jj := 0 to Hd - 1 do
+    for k2 := 0 to PM1 do dz[k2] := 0;
+    for jj := 0 to HdM1 do
     begin
       a2 := FAct.FData[bp + jj];
       h2 := TanH(a2);
       t2 := 1 - h2 * h2;
       cj := 0;
-      for k2 := 0 to P - 1 do
+      for k2 := 0 to PM1 do
         cj := cj + W1.FData[W1.GetRawPos(jj, 0, k2)] * uu[k2];
       // dL/dW2_j = t_j*c_j ; dL/da_j = W2_j*c_j*(-2 h_j t_j) ; dL/dc_j = W2_j*t_j
       dLda := W2.FData[jj] * cj * (-2 * h2 * t2);
       dLdc := W2.FData[jj] * t2;
       GW2.FData[jj] := GW2.FData[jj] + negLR * (t2 * cj);
       Gb1.FData[jj] := Gb1.FData[jj] + negLR * dLda;
-      for k2 := 0 to P - 1 do
+      for k2 := 0 to PM1 do
       begin
         w1jk := W1.FData[W1.GetRawPos(jj, 0, k2)];
         // dL/dW1[j,k] = dL/da_j*z_k + dL/dc_j*u_k ; dL/dz_k += dL/da_j*W1[j,k]
@@ -44882,6 +44909,10 @@ begin
   P := FPhaseDim;
   Hd := FHidden;
   Dhalf := P div 2;
+  PM1 := P - 1;
+  HdM1 := Hd - 1;
+  DhalfM1 := Dhalf - 1;
+  SeqLenM1 := SeqLen - 1;
   negLR := -FLearningRate;
   hasInputGrad := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
@@ -44893,10 +44924,10 @@ begin
     SetLength(dzh, Dhalf);
     SetLength(gqh, Dhalf);
     SetLength(gph, Dhalf);
-    for t := 0 to SeqLen - 1 do
+    for t := 0 to SeqLenM1 do
     begin
       // Seed (gq_new, gp_new) from this time-step's output error.
-      for kk := 0 to Dhalf - 1 do
+      for kk := 0 to DhalfM1 do
       begin
         gqh[kk] := FOutputError.FData[FOutputError.GetRawPos(t, 0, kk)];
         gph[kk] := FOutputError.FData[FOutputError.GetRawPos(t, 0, kk + Dhalf)];
@@ -44910,27 +44941,27 @@ begin
         //   gqc=dV/dq(q_new);  p_new  = p_half - (dt/2) gqc
         // adjoints in (gqh,gph) = (dL/dq_new, dL/dp_new).
         // (3) p_new = p_half - (dt/2) gqc(q_new) [V eval at it2+1]
-        for kk := 0 to Dhalf - 1 do uh[kk] := -0.5 * Fdt * gph[kk]; // adj on gqc
+        for kk := 0 to DhalfM1 do uh[kk] := -0.5 * Fdt * gph[kk]; // adj on gqc
         HalfHVP(0, FZin, FAct, it2 + 1);
         // gp_half += gp_new ; gq_new += dzh
-        for kk := 0 to Dhalf - 1 do gqh[kk] := gqh[kk] + dzh[kk];
+        for kk := 0 to DhalfM1 do gqh[kk] := gqh[kk] + dzh[kk];
         // (2) q_new = q + dt gpb(p_half) [T eval at it2 div 2 = t*Steps+s]
-        for kk := 0 to Dhalf - 1 do uh[kk] := Fdt * gqh[kk];        // adj on gpb
+        for kk := 0 to DhalfM1 do uh[kk] := Fdt * gqh[kk];        // adj on gpb
         HalfHVP(4, FZinT, FActT, t * FSteps + s);
         // gq += gq_new (direct) ; gp_half += dzh
         // gph currently holds dL/dp_new == dL/dp_half (direct from step 3),
         // now add the T contribution.
-        for kk := 0 to Dhalf - 1 do gph[kk] := gph[kk] + dzh[kk];
+        for kk := 0 to DhalfM1 do gph[kk] := gph[kk] + dzh[kk];
         // (1) p_half = p - (dt/2) gqa(q) [V eval at it2]
-        for kk := 0 to Dhalf - 1 do uh[kk] := -0.5 * Fdt * gph[kk]; // adj on gqa
+        for kk := 0 to DhalfM1 do uh[kk] := -0.5 * Fdt * gph[kk]; // adj on gqa
         HalfHVP(0, FZin, FAct, it2);
         // gq += dzh ; gp = gp_half (direct). gqh already = dL/dq (direct from
         // step 2) + step-3 V contribution; add step-1 V contribution.
-        for kk := 0 to Dhalf - 1 do gqh[kk] := gqh[kk] + dzh[kk];
+        for kk := 0 to DhalfM1 do gqh[kk] := gqh[kk] + dzh[kk];
         // gph is dL/dp (direct), already accumulated.
       end;
       if hasInputGrad then
-        for kk := 0 to Dhalf - 1 do
+        for kk := 0 to DhalfM1 do
         begin
           PrevErr.FData[PrevErr.GetRawPos(t, 0, kk)] :=
             PrevErr.FData[PrevErr.GetRawPos(t, 0, kk)] + gqh[kk];
@@ -44961,10 +44992,10 @@ begin
   SetLength(dz, P);
   SetLength(gz, P);
   SetLength(gpmid, Dhalf);
-  for t := 0 to SeqLen - 1 do
+  for t := 0 to SeqLenM1 do
   begin
     // Seed the per-time-step adjoint with the output error on z'_last.
-    for kk := 0 to P - 1 do
+    for kk := 0 to PM1 do
       gzp[kk] := FOutputError.FData[FOutputError.GetRawPos(t, 0, kk)];
     // Walk the integration steps right-to-left.
     for s := FSteps - 1 downto 0 do
@@ -44975,38 +45006,38 @@ begin
       //   sub1: g_b=field(q,p_mid); q_new = q + dt*g_b[p-part]
       //   output z' = (q_new, p_mid)
       // Adjoints in (gq_new, gp_mid_out) = gzp; build dL/dz0 in gz.
-      for kk := 0 to P - 1 do gz[kk] := 0;
+      for kk := 0 to PM1 do gz[kk] := 0;
       // ----- reverse sub1 (q_new = q + dt*g_b[p-part]) -----
       // direct: dL/dq += gq_new ; adjoint on g_b only on its p-part.
-      for kk := 0 to P - 1 do uu[kk] := 0;
-      for kk := 0 to Dhalf - 1 do
+      for kk := 0 to PM1 do uu[kk] := 0;
+      for kk := 0 to DhalfM1 do
       begin
         gz[kk] := gz[kk] + gzp[kk];              // q_new -> q direct
         uu[kk + Dhalf] := Fdt * gzp[kk];         // u_b on g_b p-part
       end;
       HVP(it2 + 1);                               // field at (q, p_mid)
       // dz = dL/dz_b where z_b=(q, p_mid): q-part -> dL/dq, p-part -> dL/dp_mid.
-      for kk := 0 to Dhalf - 1 do
+      for kk := 0 to DhalfM1 do
       begin
         gz[kk] := gz[kk] + dz[kk];                // q contribution from z_b
         gpmid[kk] := gzp[kk + Dhalf] + dz[kk + Dhalf]; // total adjoint on p_mid
       end;
       // ----- reverse sub0 (p_mid = p - dt*g_a[q-part]) -----
       // direct: dL/dp += gpmid ; adjoint on g_a only on its q-part.
-      for kk := 0 to P - 1 do uu[kk] := 0;
-      for kk := 0 to Dhalf - 1 do
+      for kk := 0 to PM1 do uu[kk] := 0;
+      for kk := 0 to DhalfM1 do
       begin
         gz[kk + Dhalf] := gz[kk + Dhalf] + gpmid[kk]; // p_mid -> p direct
         uu[kk] := -Fdt * gpmid[kk];                   // u_a on g_a q-part
       end;
       HVP(it2);                                   // field at (q, p)
-      for kk := 0 to P - 1 do gz[kk] := gz[kk] + dz[kk]; // z0 contribution
+      for kk := 0 to PM1 do gz[kk] := gz[kk] + dz[kk]; // z0 contribution
       // Carry dL/dz0 to the previous integration step.
-      for kk := 0 to P - 1 do gzp[kk] := gz[kk];
+      for kk := 0 to PM1 do gzp[kk] := gz[kk];
     end;
     // After s=0, gzp holds dL/d(input phase vector for this time-step).
     if hasInputGrad then
-      for kk := 0 to P - 1 do
+      for kk := 0 to PM1 do
         PrevErr.FData[PrevErr.GetRawPos(t, 0, kk)] :=
           PrevErr.FData[PrevErr.GetRawPos(t, 0, kk)] + gzp[kk];
   end;
@@ -45024,6 +45055,7 @@ end;
 procedure TNNetHamiltonianCell.InitDefault();
 var
   oldSeed, j, kk, nbase, NetCnt, InW: integer;
+  NetCntM1, FHiddenM1, InWM1: integer;
   scale: TNeuralFloat;
 begin
   if FNeurons.Count < 4 then AddMissingNeurons(4);
@@ -45046,11 +45078,14 @@ begin
   end;
   if InW < 1 then InW := 1;
   scale := 1.0 / Sqrt(InW);
-  for nbase := 0 to NetCnt - 1 do
+  NetCntM1 := NetCnt - 1;
+  FHiddenM1 := FHidden - 1;
+  InWM1 := InW - 1;
+  for nbase := 0 to NetCntM1 do
   begin
-    for j := 0 to FHidden - 1 do
+    for j := 0 to FHiddenM1 do
     begin
-      for kk := 0 to InW - 1 do
+      for kk := 0 to InWM1 do
         FNeurons[nbase * 4 + 0].FWeights.FData[
           FNeurons[nbase * 4 + 0].FWeights.GetRawPos(j, 0, kk)] :=
             FNeurons[nbase * 4 + 0].FWeights.RandomGaussianValue() * scale;
@@ -45140,6 +45175,7 @@ var
   StartTime: double;
   Wt, Wg, Bt, Bg, Prev: TNNetVolume;
   SeqLen, Depth, t, d, j: integer;
+  SeqLenM1, DepthM1: integer;
   tau, gv, gate, tnorm, accT, accG, xj: TNeuralFloat;
   XtPtr, OutPtr: TNeuralFloatArrPtr;
   WtRow, WgRow: TNeuralFloatArrPtr;
@@ -45152,20 +45188,22 @@ begin
   Bg := FNeurons[3].FWeights;
   SeqLen := FOutput.SizeX;
   Depth := FOutput.Depth;
+  SeqLenM1 := SeqLen - 1;
+  DepthM1 := Depth - 1;
   FH.Fill(0);
-  for t := 0 to SeqLen - 1 do
+  for t := 0 to SeqLenM1 do
   begin
     XtPtr := Prev.GetRawPtr(t, 0, 0);
     OutPtr := FOutput.GetRawPtr(t, 0, 0);
     // Elapsed continuous time: monotone in t, in (0,1].
     tnorm := (t + 1) / SeqLen;
-    for d := 0 to Depth - 1 do
+    for d := 0 to DepthM1 do
     begin
       WtRow := Wt.GetRawPtr(d, 0, 0);
       WgRow := Wg.GetRawPtr(d, 0, 0);
       accT := Bt.FData[d];
       accG := Bg.FData[d];
-      for j := 0 to Depth - 1 do
+      for j := 0 to DepthM1 do
       begin
         xj := XtPtr^[j];
         accT := accT + WtRow^[j] * xj;
@@ -45193,6 +45231,7 @@ var
   Nt, NBt, Ng, NBg: TNNetNeuron;
   Wt, Wg, Prev, PrevErr: TNNetVolume;
   SeqLen, Depth, t, d, j: integer;
+  DepthM1: integer;
   hasInputGrad: boolean;
   GyPtr, XtPtr, PrevErrPtr: TNeuralFloatArrPtr;
   WtRow, WgRow, GradWtRow, GradWgRow: TNeuralFloatArrPtr;
@@ -45208,6 +45247,7 @@ begin
   Prev := FPrevLayer.FOutput;
   SeqLen := FOutput.SizeX;
   Depth := FOutput.Depth;
+  DepthM1 := Depth - 1;
   hasInputGrad := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
   PrevErr := nil;
@@ -45227,7 +45267,7 @@ begin
     if hasInputGrad
       then PrevErrPtr := PrevErr.GetRawPtr(t, 0, 0)
       else PrevErrPtr := nil;
-    for d := 0 to Depth - 1 do
+    for d := 0 to DepthM1 do
     begin
       gy := GyPtr^[d];
       gate := FGate.FData[(t * Depth) + d];
@@ -45251,13 +45291,13 @@ begin
       WgRow := Wg.GetRawPtr(d, 0, 0);
       GradWtRow := FGradWt.GetRawPtr(d, 0, 0);
       GradWgRow := FGradWg.GetRawPtr(d, 0, 0);
-      for j := 0 to Depth - 1 do
+      for j := 0 to DepthM1 do
       begin
         GradWtRow^[j] := GradWtRow^[j] + gtau * XtPtr^[j];
         GradWgRow^[j] := GradWgRow^[j] + gpreG * XtPtr^[j];
       end;
       if hasInputGrad then
-        for j := 0 to Depth - 1 do
+        for j := 0 to DepthM1 do
           PrevErrPtr^[j] := PrevErrPtr^[j] +
             gtau * WtRow^[j] + gpreG * WgRow^[j];
       // Carry dL/dh_{t-1} = (1-gate)*ght to the previous timestep.
@@ -45282,15 +45322,17 @@ end;
 procedure TNNetClosedFormContinuous.InitDefault();
 var
   Depth, d, j, oldSeed: integer;
+  DepthM1: integer;
 begin
   if FNeurons.Count < 4 then AddMissingNeurons(4);
   Depth := FNeurons[1].FWeights.Size;
+  DepthM1 := Depth - 1;
   // Small random projections so the cell starts as a benign gentle leak toward a
   // tanh of the input; both biases zero.
   oldSeed := RandSeed;
   RandSeed := 271828;
-  for d := 0 to Depth - 1 do
-    for j := 0 to Depth - 1 do
+  for d := 0 to DepthM1 do
+    for j := 0 to DepthM1 do
     begin
       FNeurons[0].FWeights[d, 0, j] := FNeurons[0].FWeights.RandomGaussianValue() * 0.05;
       FNeurons[2].FWeights[d, 0, j] := FNeurons[2].FWeights.RandomGaussianValue() * 0.05;
@@ -45372,6 +45414,7 @@ var
   StartTime: double;
   Wz, Wi, Wf, Wo, Rz, Ri, Rf, Ro, Bz, Bi, Bf, Bo, Prev: TNNetVolume;
   SeqLen, Depth, t, d, j, baseT: integer;
+  SeqLenM1, DepthM1: integer;
   liv, lfv, zv, ov, mPrev, mv, ip, fp, cPrev, nPrev, cv, nv: TNeuralFloat;
   accZ, accI, accF, accO, xj, hj: TNeuralFloat;
   XtPtr, OutPtr: TNeuralFloatArrPtr;
@@ -45387,16 +45430,18 @@ begin
   Bf := FNeurons[10].FWeights; Bo := FNeurons[11].FWeights;
   SeqLen := FOutput.SizeX;
   Depth := FOutput.Depth;
+  SeqLenM1 := SeqLen - 1;
+  DepthM1 := Depth - 1;
   // FHprev holds the FROZEN h_{t-1} read by every gate of step t; FH receives the
   // new h_t. Reading FHprev (not FH) avoids letting an earlier channel's h_t leak
   // into a later channel's gate within the same timestep.
   FHprev.Fill(0);
-  for t := 0 to SeqLen - 1 do
+  for t := 0 to SeqLenM1 do
   begin
     XtPtr := Prev.GetRawPtr(t, 0, 0);
     OutPtr := FOutput.GetRawPtr(t, 0, 0);
     baseT := t * Depth;
-    for d := 0 to Depth - 1 do
+    for d := 0 to DepthM1 do
     begin
       WzR := Wz.GetRawPtr(d, 0, 0); WiR := Wi.GetRawPtr(d, 0, 0);
       WfR := Wf.GetRawPtr(d, 0, 0); WoR := Wo.GetRawPtr(d, 0, 0);
