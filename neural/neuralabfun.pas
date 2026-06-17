@@ -408,6 +408,7 @@ procedure TTestsClass.LoadFromString(str: string);
 var
   S: TStringList;
   NCount: integer;
+  MaxTestIdx: integer;
 begin
   if (Length(str) > 0) then
   begin
@@ -418,11 +419,12 @@ begin
     S.DelimitedText := str;
     Self.TestBasePosition := StrToInt(S[0]);
     Self.TestThreshold := StrToInt(S[1]);
-    Self.N := S.Count - 2;
+    MaxTestIdx := S.Count - 1;
+    Self.N := MaxTestIdx - 1;
     // Tests are emitted by ToString starting at T[0] (S[2]); load back from
     // T[0], not T[1] -- the previous T[NCount-1] left T[0] zeroed and dropped
     // the last test, corrupting every reloaded relation.
-    for NCount := 2 to S.Count - 1 do
+    for NCount := 2 to MaxTestIdx do
     begin
       Self.T[NCount-2].LoadFromString(S[NCount]);
     end;

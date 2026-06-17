@@ -865,6 +865,7 @@ var
   pActionLen: integer;
   pStatelen: integer;
   inputNeuronCnt: integer;
+  MaxInputNeuron: integer;
 begin
   version := 1;
   S := TStringList.Create;
@@ -883,7 +884,8 @@ begin
   if (S.Count>4) then
   begin
     neuronPos := pos;
-    for inputNeuronCnt := 4 to S.Count-1 do
+    MaxInputNeuron := S.Count-1;
+    for inputNeuronCnt := 4 to MaxInputNeuron do
     begin
       FNN[neuronPos].LoadFromString(S[inputNeuronCnt]);
       inc(neuronPos);
