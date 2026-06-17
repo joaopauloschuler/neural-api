@@ -39,6 +39,12 @@ type
     // directories - config.json + model.safetensors - in a temp dir for
     // the BuildFromPretrained directory-dispatch tests).
     procedure CopyFileTo(const Src, Dst: string);
+    // Shared body for the EnCodec round-trip parity tests, parameterized by
+    // fixture base name. MUST stay PRIVATE: a published parameterized method
+    // is auto-run by FPCUnit with an empty BaseName and fails on the missing
+    // "_ref.json". Callers: TestEnCodec{RoundTrip,NonCausalRoundTrip,
+    // LegacyWeightNorm}Parity.
+    procedure CheckEnCodecParity(const BaseName: string);
     // Shared parity loop: feeds every "sequences" row of the reference
     // logits fixture (JSON {"sequences": [[ids..]..], "logits": [[[..]]]})
     // through NN and asserts max |logit diff| < 1e-4 (hard ceiling 1e-3 -
@@ -297,9 +303,6 @@ type
     // ships) instead of the new .parametrizations.weight.original0/1; pins the
     // importer's legacy-naming branch (same w = g*v/||v||, identical oracle).
     procedure TestEnCodecLegacyWeightNormParity;
-    // Shared body for both EnCodec round-trip parity tests (parameterized, so
-    // FPCUnit does not auto-run it as a test).
-    procedure CheckEnCodecParity(const BaseName: string);
     // Mimi: round-trips three pinned waveforms through the imported Mimi codec
     // (waveform -> conv encoder -> RoPE transformer -> downsample -> split
     // semantic/acoustic RVQ -> codes -> ... -> waveform) and asserts the codes
