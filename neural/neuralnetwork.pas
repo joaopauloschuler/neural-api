@@ -51167,7 +51167,7 @@ var
   Wa, Wb, Wc: TNNetVolume;
   Prev: TNNetVolume;
   SizeX, SizeY, Depth, x, y, d: integer;
-  SizeXM1, SizeYM1: integer;
+  SizeXM1, SizeYM1, DepthM1: integer;
   xv: TNeuralFloat;
 begin
   StartTime := Now();
@@ -51182,6 +51182,7 @@ begin
   Depth := FOutput.Depth;
   SizeXM1 := SizeX - 1;
   SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
   {$IFDEF Debug}
   if (Wa.Size <> Depth) or (Wb.Size <> Depth) or (Wc.Size <> Depth) then
     FErrorProc('Neuron weight count isn''t compatible with output depth ' +
@@ -51189,7 +51190,7 @@ begin
   {$ENDIF}
   for x := 0 to SizeXM1 do
     for y := 0 to SizeYM1 do
-      for d := 0 to Depth - 1 do
+      for d := 0 to DepthM1 do
       begin
         xv := Prev[x, y, d];
         FOutput[x, y, d] := Wa.Raw[d] * xv * xv + Wb.Raw[d] * xv + Wc.Raw[d];
@@ -51204,6 +51205,7 @@ var
   Wa, Wb: TNNetVolume;
   Prev, PrevErr: TNNetVolume;
   SizeX, SizeY, Depth, x, y, d: integer;
+  SizeXM1, SizeYM1, DepthM1: integer;
   xv, gy, gradA, gradB, gradC, a_d, b_d: TNeuralFloat;
   hasInputGrad: boolean;
 begin
@@ -51228,15 +51230,18 @@ begin
   // dL/db[c] += dL/dy * x
   // dL/dc0[c] += dL/dy
   // dL/dx[x,y,c] = dL/dy[x,y,c] * (2*a[c]*x + b[c])
-  for d := 0 to Depth - 1 do
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
+  for d := 0 to DepthM1 do
   begin
     a_d := Wa.Raw[d];
     b_d := Wb.Raw[d];
     gradA := 0;
     gradB := 0;
     gradC := 0;
-    for x := 0 to SizeX - 1 do
-      for y := 0 to SizeY - 1 do
+    for x := 0 to SizeXM1 do
+      for y := 0 to SizeYM1 do
       begin
         xv := Prev[x, y, d];
         gy := FOutputError[x, y, d];
@@ -52016,7 +52021,7 @@ end;
 procedure TNNetTokenLayerNorm.Compute();
 var
   StartTime: double;
-  Depth, TokenCnt, TokenMax, ChannelCnt, BaseIdx: integer;
+  Depth, TokenCnt, TokenMax, ChannelCnt, BaseIdx, DepthM1: integer;
   Mean, Variance, InvStdDev, Diff: TNeuralFloat;
   Gamma, Beta: TNNetVolume;
 begin
@@ -52026,17 +52031,18 @@ begin
   // Token index runs over the flattened (X, Y) positions; the Depth axis is
   // contiguous in memory, so token t occupies FData[t*Depth .. t*Depth+Depth-1].
   TokenMax := (FOutput.Size div Depth) - 1;
+  DepthM1 := Depth - 1;
   Gamma := FNeurons[0].FWeights;
   Beta := FNeurons[1].FWeights;
   for TokenCnt := 0 to TokenMax do
   begin
     BaseIdx := TokenCnt * Depth;
     Mean := 0;
-    for ChannelCnt := 0 to Depth - 1 do
+    for ChannelCnt := 0 to DepthM1 do
       Mean := Mean + FOutput.FData[BaseIdx + ChannelCnt];
     Mean := Mean / Depth;
     Variance := 0;
-    for ChannelCnt := 0 to Depth - 1 do
+    for ChannelCnt := 0 to DepthM1 do
     begin
       Diff := FOutput.FData[BaseIdx + ChannelCnt] - Mean;
       Variance := Variance + Diff * Diff;
@@ -52044,7 +52050,7 @@ begin
     Variance := Variance / Depth;
     InvStdDev := 1 / Sqrt(Variance + FTokenLNEpsilon);
     FInvStd.FData[TokenCnt] := InvStdDev;
-    for ChannelCnt := 0 to Depth - 1 do
+    for ChannelCnt := 0 to DepthM1 do
     begin
       Diff := (FOutput.FData[BaseIdx + ChannelCnt] - Mean) * InvStdDev;
       FNormalized.FData[BaseIdx + ChannelCnt] := Diff;
@@ -52058,7 +52064,7 @@ end;
 procedure TNNetTokenLayerNorm.Backpropagate();
 var
   StartTime: double;
-  Depth, TokenCnt, TokenMax, ChannelCnt, BaseIdx: integer;
+  Depth, TokenCnt, TokenMax, ChannelCnt, BaseIdx, DepthM1: integer;
   SumDxHat, SumDxHatXHat, DxHat, InvStdDev: TNeuralFloat;
   Gamma: TNNetVolume;
 begin
@@ -52068,6 +52074,7 @@ begin
   StartTime := Now();
   Depth := FOutput.Depth;
   TokenMax := (FOutput.Size div Depth) - 1;
+  DepthM1 := Depth - 1;
   Gamma := FNeurons[0].FWeights;
   // Gradients with respect to gamma and beta accumulate over all tokens:
   //   d(gamma)[c] = sum_t OutputError[t,c] * x_hat[t,c]
@@ -52075,7 +52082,7 @@ begin
   for TokenCnt := 0 to TokenMax do
   begin
     BaseIdx := TokenCnt * Depth;
-    for ChannelCnt := 0 to Depth - 1 do
+    for ChannelCnt := 0 to DepthM1 do
     begin
       FNeurons[0].FDelta.FData[ChannelCnt] :=
         FNeurons[0].FDelta.FData[ChannelCnt] - FLearningRate *
@@ -52104,7 +52111,7 @@ begin
       InvStdDev := FInvStd.FData[TokenCnt];
       SumDxHat := 0;
       SumDxHatXHat := 0;
-      for ChannelCnt := 0 to Depth - 1 do
+      for ChannelCnt := 0 to DepthM1 do
       begin
         DxHat := FOutputError.FData[BaseIdx + ChannelCnt] *
           Gamma.FData[ChannelCnt];
@@ -52115,7 +52122,7 @@ begin
       end;
       SumDxHat := SumDxHat / Depth;
       SumDxHatXHat := SumDxHatXHat / Depth;
-      for ChannelCnt := 0 to Depth - 1 do
+      for ChannelCnt := 0 to DepthM1 do
       begin
         FPrevLayer.FOutputError.FData[BaseIdx + ChannelCnt] :=
           FPrevLayer.FOutputError.FData[BaseIdx + ChannelCnt] +
@@ -52278,7 +52285,7 @@ end;
 procedure TNNetTokenRMSNorm.Compute();
 var
   StartTime: double;
-  Depth, TokenCnt, TokenMax, ChannelCnt, BaseIdx: integer;
+  Depth, TokenCnt, TokenMax, ChannelCnt, BaseIdx, DepthM1: integer;
   MeanSqr, InvRMSV, XHat: TNeuralFloat;
   Gain: TNNetVolume;
 begin
@@ -52288,18 +52295,19 @@ begin
   // Token index runs over the flattened (X, Y) positions; the Depth axis is
   // contiguous in memory, so token t occupies FData[t*Depth .. t*Depth+Depth-1].
   TokenMax := (FOutput.Size div Depth) - 1;
+  DepthM1 := Depth - 1;
   Gain := FNeurons[0].FWeights;
   for TokenCnt := 0 to TokenMax do
   begin
     BaseIdx := TokenCnt * Depth;
     MeanSqr := 0;
-    for ChannelCnt := 0 to Depth - 1 do
+    for ChannelCnt := 0 to DepthM1 do
       MeanSqr := MeanSqr +
         FOutput.FData[BaseIdx + ChannelCnt] * FOutput.FData[BaseIdx + ChannelCnt];
     MeanSqr := MeanSqr / Depth;
     InvRMSV := 1 / Sqrt(MeanSqr + FTokenRMSEpsilon);
     FInvRMS.FData[TokenCnt] := InvRMSV;
-    for ChannelCnt := 0 to Depth - 1 do
+    for ChannelCnt := 0 to DepthM1 do
     begin
       XHat := FOutput.FData[BaseIdx + ChannelCnt] * InvRMSV;
       FNormalized.FData[BaseIdx + ChannelCnt] := XHat;
@@ -52312,7 +52320,7 @@ end;
 procedure TNNetTokenRMSNorm.Backpropagate();
 var
   StartTime: double;
-  Depth, TokenCnt, TokenMax, ChannelCnt, BaseIdx: integer;
+  Depth, TokenCnt, TokenMax, ChannelCnt, BaseIdx, DepthM1: integer;
   SumDxHatXHat, DxHat, InvRMSV: TNeuralFloat;
   Gain: TNNetVolume;
 begin
@@ -52322,13 +52330,14 @@ begin
   StartTime := Now();
   Depth := FOutput.Depth;
   TokenMax := (FOutput.Size div Depth) - 1;
+  DepthM1 := Depth - 1;
   Gain := FNeurons[0].FWeights;
   // Gain gradient accumulates over all tokens:
   //   d(gain)[c] = sum_t OutputError[t,c] * x_hat[t,c]
   for TokenCnt := 0 to TokenMax do
   begin
     BaseIdx := TokenCnt * Depth;
-    for ChannelCnt := 0 to Depth - 1 do
+    for ChannelCnt := 0 to DepthM1 do
       FNeurons[0].FDelta.FData[ChannelCnt] :=
         FNeurons[0].FDelta.FData[ChannelCnt] - FLearningRate *
         FOutputError.FData[BaseIdx + ChannelCnt] *
@@ -52350,7 +52359,7 @@ begin
       BaseIdx := TokenCnt * Depth;
       InvRMSV := FInvRMS.FData[TokenCnt];
       SumDxHatXHat := 0;
-      for ChannelCnt := 0 to Depth - 1 do
+      for ChannelCnt := 0 to DepthM1 do
       begin
         DxHat := FOutputError.FData[BaseIdx + ChannelCnt] *
           Gain.FData[ChannelCnt];
@@ -52359,7 +52368,7 @@ begin
           DxHat * FNormalized.FData[BaseIdx + ChannelCnt];
       end;
       SumDxHatXHat := SumDxHatXHat / Depth;
-      for ChannelCnt := 0 to Depth - 1 do
+      for ChannelCnt := 0 to DepthM1 do
       begin
         FPrevLayer.FOutputError.FData[BaseIdx + ChannelCnt] :=
           FPrevLayer.FOutputError.FData[BaseIdx + ChannelCnt] +
@@ -52402,20 +52411,22 @@ end;
 procedure TNNetLlama4AttnTemperature.Compute();
 var
   StartTime: double;
-  SeqLen, Depth, pos, k, BaseIdx: integer;
+  SeqLen, Depth, pos, k, BaseIdx, SeqLenM1, DepthM1: integer;
   Scale: TNeuralFloat;
 begin
   StartTime := Now();
   inherited Compute; // copies FPrevLayer.FOutput into FOutput
   SeqLen := FOutput.SizeX;
   Depth := FOutput.Depth;
-  for pos := 0 to SeqLen - 1 do
+  SeqLenM1 := SeqLen - 1;
+  DepthM1 := Depth - 1;
+  for pos := 0 to SeqLenM1 do
   begin
     // f(pos) = log1p(floor((pos+1)/floor_scale))*attn_scale + 1.
     Scale := Ln(1 + Floor((pos + FPositionOffset + 1) / FFloorScale)) *
       FAttnScale + 1;
     BaseIdx := pos * Depth;
-    for k := 0 to Depth - 1 do
+    for k := 0 to DepthM1 do
       FOutput.FData[BaseIdx + k] := FOutput.FData[BaseIdx + k] * Scale;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -52424,7 +52435,7 @@ end;
 procedure TNNetLlama4AttnTemperature.Backpropagate();
 var
   StartTime: double;
-  SeqLen, Depth, pos, k, BaseIdx: integer;
+  SeqLen, Depth, pos, k, BaseIdx, SeqLenM1, DepthM1: integer;
   Scale: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -52437,12 +52448,14 @@ begin
     StartTime := Now();
     SeqLen := FOutput.SizeX;
     Depth := FOutput.Depth;
-    for pos := 0 to SeqLen - 1 do
+    SeqLenM1 := SeqLen - 1;
+    DepthM1 := Depth - 1;
+    for pos := 0 to SeqLenM1 do
     begin
       Scale := Ln(1 + Floor((pos + FPositionOffset + 1) / FFloorScale)) *
         FAttnScale + 1;
       BaseIdx := pos * Depth;
-      for k := 0 to Depth - 1 do
+      for k := 0 to DepthM1 do
         FPrevLayer.FOutputError.FData[BaseIdx + k] :=
           FPrevLayer.FOutputError.FData[BaseIdx + k] +
           Scale * FOutputError.FData[BaseIdx + k];
@@ -52485,6 +52498,7 @@ var
   W: TNNetVolume;
   MeanSqr, s: TNeuralFloat;
   SizeX, SizeY, Depth, x, y, d: integer;
+  SizeXM1, SizeYM1, DepthM1: integer;
 begin
   StartTime := Now();
   inherited Compute;
@@ -52500,11 +52514,14 @@ begin
   Depth := FOutput.Depth;
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
-  for d := 0 to Depth - 1 do
+  DepthM1 := Depth - 1;
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  for d := 0 to DepthM1 do
   begin
     s := Sigmoid(W.Raw[d]);
-    for x := 0 to SizeX - 1 do
-      for y := 0 to SizeY - 1 do
+    for x := 0 to SizeXM1 do
+      for y := 0 to SizeYM1 do
         FOutput[x, y, d] := FOutput[x, y, d] * s;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -52517,6 +52534,7 @@ var
   W: TNNetVolume;
   FloatSize, SumDxHatXHat, s, sDeriv, g: TNeuralFloat;
   SizeX, SizeY, Depth, x, y, d, Cnt, SizeM1: integer;
+  SizeXM1, SizeYM1, DepthM1: integer;
   gradG: array of TNeuralFloat;
   sByDepth: array of TNeuralFloat;
 begin
@@ -52531,21 +52549,24 @@ begin
   SizeY := FOutput.SizeY;
   FloatSize := FOutput.Size;
   SizeM1 := FOutput.Size - 1;
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
 
   // Precompute per-channel sigmoid s_d once.
   SetLength(sByDepth, Depth);
-  for d := 0 to Depth - 1 do sByDepth[d] := Sigmoid(W.Raw[d]);
+  for d := 0 to DepthM1 do sByDepth[d] := Sigmoid(W.Raw[d]);
 
   // Gradient w.r.t. each gate logit g[d]:
   //   dL/dg[d] = sum_{x,y} OutputError[x,y,d] * n[x,y,d] * s_d*(1 - s_d).
   SetLength(gradG, Depth);
-  for d := 0 to Depth - 1 do gradG[d] := 0;
-  for x := 0 to SizeX - 1 do
-    for y := 0 to SizeY - 1 do
-      for d := 0 to Depth - 1 do
+  for d := 0 to DepthM1 do gradG[d] := 0;
+  for x := 0 to SizeXM1 do
+    for y := 0 to SizeYM1 do
+      for d := 0 to DepthM1 do
         gradG[d] := gradG[d] +
           FOutputError[x, y, d] * FNormalized[x, y, d];
-  for d := 0 to Depth - 1 do
+  for d := 0 to DepthM1 do
   begin
     s := sByDepth[d];
     sDeriv := s * (1 - s);
@@ -52570,11 +52591,11 @@ begin
     //   dx = invRMS * ( dxhat - xhat * mean(dxhat * xhat) )
     // where xhat = n (the normalized activation cached in FNormalized).
     SumDxHatXHat := 0;
-    for d := 0 to Depth - 1 do
+    for d := 0 to DepthM1 do
     begin
       s := sByDepth[d];
-      for x := 0 to SizeX - 1 do
-        for y := 0 to SizeY - 1 do
+      for x := 0 to SizeXM1 do
+        for y := 0 to SizeYM1 do
           FOutputErrorDeriv[x, y, d] := FOutputError[x, y, d] * s;
     end;
     for Cnt := 0 to SizeM1 do
@@ -52890,7 +52911,7 @@ var
   LpBnd69: integer;
   LpBnd70: integer;
   StartTime: double;
-  x, y, c, BaseIdx, PixelIdx, Depth: integer;
+  x, y, c, BaseIdx, PixelIdx, Depth, DepthM1: integer;
   SumSqr, InvRMS: TNeuralFloat;
 begin
   StartTime := Now();
@@ -52904,6 +52925,7 @@ begin
     Exit;
   end;
   PixelIdx := 0;
+  DepthM1 := Depth - 1;
   LpBnd69 := FOutput.SizeY - 1;
   for y := 0 to LpBnd69 do
   begin
@@ -52912,11 +52934,11 @@ begin
     begin
       BaseIdx := FOutput.GetRawPos(x, y, 0);
       SumSqr := 0;
-      for c := 0 to Depth - 1 do
+      for c := 0 to DepthM1 do
         SumSqr := SumSqr + FOutput.FData[BaseIdx + c] * FOutput.FData[BaseIdx + c];
       InvRMS := pcr_rsqrtf(SumSqr / Depth + FPixelNormEpsilon);
       FInvRMS[PixelIdx] := InvRMS;
-      for c := 0 to Depth - 1 do
+      for c := 0 to DepthM1 do
         FOutput.FData[BaseIdx + c] := FOutput.FData[BaseIdx + c] * InvRMS;
       Inc(PixelIdx);
     end;
@@ -52931,7 +52953,7 @@ var
   LpBnd71: integer;
   LpBnd72: integer;
   StartTime: double;
-  x, y, c, BaseIdx, PixelIdx, Depth: integer;
+  x, y, c, BaseIdx, PixelIdx, Depth, DepthM1: integer;
   SumDyY, InvRMS, DepthF: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -52947,6 +52969,7 @@ begin
     //   dL/dx_i = invRMS * ( dL/dy_i - (1/Depth) * y_i * sum_j( y_j * dL/dy_j ) )
     DepthF := Depth;
     PixelIdx := 0;
+    DepthM1 := Depth - 1;
     LpBnd71 := FOutput.SizeY - 1;
     for y := 0 to LpBnd71 do
     begin
@@ -52956,11 +52979,11 @@ begin
         BaseIdx := FOutput.GetRawPos(x, y, 0);
         InvRMS := FInvRMS[PixelIdx];
         SumDyY := 0;
-        for c := 0 to Depth - 1 do
+        for c := 0 to DepthM1 do
           SumDyY := SumDyY +
             FOutputError.FData[BaseIdx + c] * FNormalized.FData[BaseIdx + c];
         SumDyY := SumDyY / DepthF;
-        for c := 0 to Depth - 1 do
+        for c := 0 to DepthM1 do
           FPrevLayer.FOutputError.FData[BaseIdx + c] :=
             FPrevLayer.FOutputError.FData[BaseIdx + c] +
             InvRMS * ( FOutputError.FData[BaseIdx + c] -
@@ -53030,13 +53053,14 @@ var
   LpBnd78: integer;
   StartTime: double;
   Mean, Variance: TNeuralFloat;
-  GroupCnt, GroupSize: integer;
+  GroupCnt, GroupSize, FGroupsM1: integer;
   CntX, CntY, CntD, DStart, DEnd: integer;
 begin
   StartTime := Now();
   inherited Compute;
   GroupSize := FOutput.SizeX * FOutput.SizeY * FChannelsPerGroup;
-  for GroupCnt := 0 to FGroups - 1 do
+  FGroupsM1 := FGroups - 1;
+  for GroupCnt := 0 to FGroupsM1 do
   begin
     DStart := GroupCnt * FChannelsPerGroup;
     DEnd := DStart + FChannelsPerGroup - 1;
@@ -53092,7 +53116,7 @@ var
   LpBnd81: integer;
   LpBnd82: integer;
   StartTime: double;
-  GroupCnt, GroupSize: integer;
+  GroupCnt, GroupSize, FGroupsM1: integer;
   CntX, CntY, CntD, DStart, DEnd, RawPos: integer;
   SumDxHat, SumDxHatXHat, FloatGroupSize, DxHat: TNeuralFloat;
 begin
@@ -53135,7 +53159,8 @@ begin
     // dxhat = OutputError * gamma
     // dx = invStdDev * ( dxhat - mean(dxhat) - xhat * mean(dxhat*xhat) )
     // computed independently per group.
-    for GroupCnt := 0 to FGroups - 1 do
+    FGroupsM1 := FGroups - 1;
+    for GroupCnt := 0 to FGroupsM1 do
     begin
       DStart := GroupCnt * FChannelsPerGroup;
       DEnd := DStart + FChannelsPerGroup - 1;
@@ -53345,16 +53370,17 @@ end;
 procedure TNNetLayerConcatedWeights.DequantizeIntoConcatedWeights();
 var
   LpBnd83: integer;
-  NeuronCnt, ElementCnt, RowBase: integer;
+  NeuronCnt, ElementCnt, RowBase, QVSizeM1: integer;
   Scale: TNeuralFloat;
 begin
   FConcatedWeights.ReSize(FNeurons.Count, 1, FQuantVectorSize);
   LpBnd83 := FNeurons.Count - 1;
+  QVSizeM1 := FQuantVectorSize - 1;
   for NeuronCnt := 0 to LpBnd83 do
   begin
     RowBase := NeuronCnt * FQuantVectorSize;
     Scale := FQuantScales[NeuronCnt];
-    for ElementCnt := 0 to FQuantVectorSize - 1 do
+    for ElementCnt := 0 to QVSizeM1 do
       FConcatedWeights.FData[RowBase + ElementCnt] :=
         FQuantCodes[RowBase + ElementCnt] * Scale;
   end;
@@ -53363,14 +53389,15 @@ end;
 procedure TNNetLayerConcatedWeights.DequantizeRowIntoScratch(
   NeuronIdx: integer);
 var
-  ElementCnt, RowBase: integer;
+  ElementCnt, RowBase, QVSizeM1: integer;
   Scale: TNeuralFloat;
 begin
   if FQuantScratch.Size <> FQuantVectorSize then
     FQuantScratch.ReSize(FQuantVectorSize, 1, 1);
   RowBase := NeuronIdx * FQuantVectorSize;
   Scale := FQuantScales[NeuronIdx];
-  for ElementCnt := 0 to FQuantVectorSize - 1 do
+  QVSizeM1 := FQuantVectorSize - 1;
+  for ElementCnt := 0 to QVSizeM1 do
     FQuantScratch.FData[ElementCnt] := FQuantCodes[RowBase + ElementCnt] * Scale;
 end;
 
@@ -53378,7 +53405,7 @@ procedure TNNetLayerConcatedWeights.QuantizeWeightsInt8();
 var
   LpBnd84: integer;
   LpBnd85: integer;
-  NeuronCnt, ElementCnt, RowBase, Code: integer;
+  NeuronCnt, ElementCnt, RowBase, Code, QVSizeM1: integer;
   MaxAbs, Scale, InvScale: TNeuralFloat;
   W: TNNetVolume;
 begin
@@ -53393,6 +53420,7 @@ begin
   SetLength(FQuantScales, FNeurons.Count);
   SetLength(FQuantCodes, FNeurons.Count * FQuantVectorSize);
   LpBnd84 := FNeurons.Count - 1;
+  QVSizeM1 := FQuantVectorSize - 1;
   for NeuronCnt := 0 to LpBnd84 do
   begin
     W := FNeurons[NeuronCnt].Weights;
@@ -53407,7 +53435,7 @@ begin
     // with the SIGNED first element and never abs-es it, so a negative
     // max-magnitude element 0 is missed - unusable for a scale.
     MaxAbs := 0;
-    for ElementCnt := 0 to FQuantVectorSize - 1 do
+    for ElementCnt := 0 to QVSizeM1 do
       if Abs(W.FData[ElementCnt]) > MaxAbs then
         MaxAbs := Abs(W.FData[ElementCnt]);
     if MaxAbs > 0
@@ -53416,7 +53444,7 @@ begin
     FQuantScales[NeuronCnt] := Scale;
     InvScale := 1 / Scale;
     RowBase := NeuronCnt * FQuantVectorSize;
-    for ElementCnt := 0 to FQuantVectorSize - 1 do
+    for ElementCnt := 0 to QVSizeM1 do
     begin
       Code := Round(W.FData[ElementCnt] * InvScale);
       if Code > 127 then Code := 127;
@@ -53441,19 +53469,20 @@ end;
 procedure TNNetLayerConcatedWeights.DequantizeWeightsInt8();
 var
   LpBnd86: integer;
-  NeuronCnt, ElementCnt, RowBase: integer;
+  NeuronCnt, ElementCnt, RowBase, QVSizeM1: integer;
   Scale: TNeuralFloat;
   W: TNNetVolume;
 begin
   if not FQuantInt8 then exit;
   LpBnd86 := FNeurons.Count - 1;
+  QVSizeM1 := FQuantVectorSize - 1;
   for NeuronCnt := 0 to LpBnd86 do
   begin
     W := FNeurons[NeuronCnt].Weights;
     W.ReSize(FQuantWSizeX, FQuantWSizeY, FQuantWSizeD);
     RowBase := NeuronCnt * FQuantVectorSize;
     Scale := FQuantScales[NeuronCnt];
-    for ElementCnt := 0 to FQuantVectorSize - 1 do
+    for ElementCnt := 0 to QVSizeM1 do
       W.FData[ElementCnt] := FQuantCodes[RowBase + ElementCnt] * Scale;
   end;
   SetLength(FQuantCodes, 0);
@@ -53472,7 +53501,7 @@ end;
 function TNNetLayerConcatedWeights.GetInt8QuantData(out pCodes: TInt8DynArr;
   out pScales: TNeuralFloatDynArr; out NumRows, VS: integer): boolean;
 var
-  i: integer;
+  i, CodesMax, ScalesMax: integer;
 begin
   SetLength(pCodes, 0);
   SetLength(pScales, 0);
@@ -53483,9 +53512,11 @@ begin
   NumRows := FNeurons.Count;
   VS := FQuantVectorSize;
   SetLength(pCodes, Length(FQuantCodes));
-  for i := 0 to Length(FQuantCodes) - 1 do pCodes[i] := FQuantCodes[i];
+  CodesMax := Length(FQuantCodes) - 1;
+  for i := 0 to CodesMax do pCodes[i] := FQuantCodes[i];
   SetLength(pScales, Length(FQuantScales));
-  for i := 0 to Length(FQuantScales) - 1 do pScales[i] := FQuantScales[i];
+  ScalesMax := Length(FQuantScales) - 1;
+  for i := 0 to ScalesMax do pScales[i] := FQuantScales[i];
 end;
 
 procedure TNNetLayerConcatedWeights.BuildBiasOutput();
@@ -53707,7 +53738,7 @@ end;
 constructor TNNetSum.Create(aL: array of TNNetLayer);
 var
   LayerCnt: integer;
-  SizeX, SizeY, Deep: integer;
+  SizeX, SizeY, Deep, MaxLayer: integer;
 begin
   inherited Create();
 
@@ -53721,7 +53752,8 @@ begin
     SizeY := aL[0].FOutput.SizeY;
     Deep  := aL[0].FOutput.Depth;
 
-    for LayerCnt := Low(aL) to High(aL) do
+    MaxLayer := High(aL);
+    for LayerCnt := Low(aL) to MaxLayer do
     begin
       if
       (
@@ -53808,7 +53840,7 @@ end;
 constructor TNNetFiLM.Create(aL: array of TNNetLayer);
 var
   LayerCnt: integer;
-  SizeX, SizeY: integer;
+  SizeX, SizeY, MaxLayer: integer;
 begin
   inherited Create();
 
@@ -53841,7 +53873,8 @@ begin
       );
     end;
 
-    for LayerCnt := Low(aL) to High(aL) do
+    MaxLayer := High(aL);
+    for LayerCnt := Low(aL) to MaxLayer do
     begin
       FPrevOutput.Add(aL[LayerCnt].FOutput);
       FPrevOutputError.Add(aL[LayerCnt].FOutputError);
@@ -53868,14 +53901,15 @@ var
   LpBnd91: integer;
   StartTime: double;
   Feature, Cond: TNNetVolume;
-  X, Y, C: integer;
+  X, Y, C, FDepthM1: integer;
   Gamma, Beta: TNeuralFloat;
 begin
   StartTime := Now();
   Feature := FPrevOutput[0];
   Cond    := FPrevOutput[1];
   // Out[x,y,c] = gamma[c]*input0[x,y,c] + beta[c]; gamma/beta broadcast over XY.
-  for C := 0 to FDepth - 1 do
+  FDepthM1 := FDepth - 1;
+  for C := 0 to FDepthM1 do
   begin
     Gamma := Cond[0, 0, C];
     Beta  := Cond[0, 0, FDepth + C];
@@ -53894,7 +53928,7 @@ var
   LpBnd93: integer;
   StartTime: double;
   Feature, FeatureErr, Cond, CondErr: TNNetVolume;
-  X, Y, C: integer;
+  X, Y, C, FDepthM1: integer;
   Gamma, dOut, GradGamma, GradBeta: TNeuralFloat;
   MaxError: TNeuralFloat;
 begin
@@ -53909,7 +53943,8 @@ begin
     FeatureErr := FPrevOutputError[0];
     Cond       := FPrevOutput[1];
     CondErr    := FPrevOutputError[1];
-    for C := 0 to FDepth - 1 do
+    FDepthM1 := FDepth - 1;
+    for C := 0 to FDepthM1 do
     begin
       Gamma     := Cond[0, 0, C];
       GradGamma := 0;
@@ -53942,7 +53977,7 @@ end;
 constructor TNNetShakeShakeMerge.Create(aL: array of TNNetLayer);
 var
   LayerCnt: integer;
-  SizeX, SizeY, Deep: integer;
+  SizeX, SizeY, Deep, MaxLayer: integer;
 begin
   inherited Create();
   if Length(aL) <> 3 then
@@ -53955,7 +53990,8 @@ begin
     SizeX := aL[0].FOutput.SizeX;
     SizeY := aL[0].FOutput.SizeY;
     Deep  := aL[0].FOutput.Depth;
-    for LayerCnt := Low(aL) to High(aL) do
+    MaxLayer := High(aL);
+    for LayerCnt := Low(aL) to MaxLayer do
     begin
       if
       (
@@ -54020,7 +54056,7 @@ procedure TNNetShakeShakeMerge.Backpropagate();
 var
   StartTime: double;
   B1Err, B2Err, SkipErr: TNNetVolume;
-  I: integer;
+  I, OutSizeM1: integer;
   MaxError: TNeuralFloat;
 begin
   StartTime := Now();
@@ -54038,14 +54074,15 @@ begin
     else
       FBeta := 0.5;
     // dL/dB1 = beta*dOut ; dL/dB2 = (1-beta)*dOut ; dL/dskip = dOut
+    OutSizeM1 := FOutput.Size - 1;
     if B1Err.Size = FOutput.Size then
-      for I := 0 to FOutput.Size - 1 do
+      for I := 0 to OutSizeM1 do
         B1Err.FData[I] := B1Err.FData[I] + FBeta * FOutputError.FData[I];
     if B2Err.Size = FOutput.Size then
-      for I := 0 to FOutput.Size - 1 do
+      for I := 0 to OutSizeM1 do
         B2Err.FData[I] := B2Err.FData[I] + (1 - FBeta) * FOutputError.FData[I];
     if SkipErr.Size = FOutput.Size then
-      for I := 0 to FOutput.Size - 1 do
+      for I := 0 to OutSizeM1 do
         SkipErr.FData[I] := SkipErr.FData[I] + FOutputError.FData[I];
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -54061,7 +54098,7 @@ end;
 constructor TNNetShakeDropMerge.Create(pKeepProb: TNeuralFloat; aL: array of TNNetLayer);
 var
   LayerCnt: integer;
-  SizeX, SizeY, Deep: integer;
+  SizeX, SizeY, Deep, MaxLayer: integer;
 begin
   inherited Create();
   if pKeepProb < 0 then pKeepProb := 0;
@@ -54077,7 +54114,8 @@ begin
     SizeX := aL[0].FOutput.SizeX;
     SizeY := aL[0].FOutput.SizeY;
     Deep  := aL[0].FOutput.Depth;
-    for LayerCnt := Low(aL) to High(aL) do
+    MaxLayer := High(aL);
+    for LayerCnt := Low(aL) to MaxLayer do
     begin
       if
       (
@@ -54152,7 +54190,7 @@ procedure TNNetShakeDropMerge.Backpropagate();
 var
   StartTime: double;
   BErr, SkipErr: TNNetVolume;
-  I: integer;
+  I, OutSizeM1: integer;
   MaxError, bl, Beta: TNeuralFloat;
 begin
   StartTime := Now();
@@ -54175,11 +54213,12 @@ begin
     else
       FBackGate := FFloatSt[0];
     // dL/dB = backgate*dOut ; dL/dskip = dOut
+    OutSizeM1 := FOutput.Size - 1;
     if BErr.Size = FOutput.Size then
-      for I := 0 to FOutput.Size - 1 do
+      for I := 0 to OutSizeM1 do
         BErr.FData[I] := BErr.FData[I] + FBackGate * FOutputError.FData[I];
     if SkipErr.Size = FOutput.Size then
-      for I := 0 to FOutput.Size - 1 do
+      for I := 0 to OutSizeM1 do
         SkipErr.FData[I] := SkipErr.FData[I] + FOutputError.FData[I];
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -54310,6 +54349,7 @@ procedure TNNetAdaptiveAvgPool.Compute();
 var
   StartTime: double;
   OutX, OutY, InX, InY, D, MaxD: integer;
+  FOutSXM1, FOutSYM1, EndXM1, EndYM1: integer;
   StartX, EndX, StartY, EndY: integer;
   InSizeX, InSizeY, WinArea: integer;
   InvArea: TNeuralFloat;
@@ -54321,17 +54361,21 @@ begin
   InSizeY := Prev.SizeY;
   MaxD := Prev.Depth - 1;
   FOutput.Fill(0);
-  for OutX := 0 to FOutputSizeX - 1 do
+  FOutSXM1 := FOutputSizeX - 1;
+  FOutSYM1 := FOutputSizeY - 1;
+  for OutX := 0 to FOutSXM1 do
   begin
     StartX := (OutX * InSizeX) div FOutputSizeX;
     EndX := ((OutX + 1) * InSizeX + FOutputSizeX - 1) div FOutputSizeX; // ceil, exclusive
-    for OutY := 0 to FOutputSizeY - 1 do
+    EndXM1 := EndX - 1;
+    for OutY := 0 to FOutSYM1 do
     begin
       StartY := (OutY * InSizeY) div FOutputSizeY;
       EndY := ((OutY + 1) * InSizeY + FOutputSizeY - 1) div FOutputSizeY; // ceil, exclusive
+      EndYM1 := EndY - 1;
       WinArea := (EndX - StartX) * (EndY - StartY);
-      for InX := StartX to EndX - 1 do
-        for InY := StartY to EndY - 1 do
+      for InX := StartX to EndXM1 do
+        for InY := StartY to EndYM1 do
         begin
           FOutput.Add
           (
@@ -54352,6 +54396,7 @@ procedure TNNetAdaptiveAvgPool.Backpropagate();
 var
   StartTime: double;
   OutX, OutY, InX, InY, D, MaxD: integer;
+  FOutSXM1, FOutSYM1, EndXM1, EndYM1: integer;
   StartX, EndX, StartY, EndY: integer;
   InSizeX, InSizeY, WinArea: integer;
   PrevErr: TNNetVolume;
@@ -54369,20 +54414,24 @@ begin
     InSizeX := FPrevLayer.Output.SizeX;
     InSizeY := FPrevLayer.Output.SizeY;
     MaxD := FOutput.Depth - 1;
-    for OutX := 0 to FOutputSizeX - 1 do
+    FOutSXM1 := FOutputSizeX - 1;
+    FOutSYM1 := FOutputSizeY - 1;
+    for OutX := 0 to FOutSXM1 do
     begin
       StartX := (OutX * InSizeX) div FOutputSizeX;
       EndX := ((OutX + 1) * InSizeX + FOutputSizeX - 1) div FOutputSizeX;
-      for OutY := 0 to FOutputSizeY - 1 do
+      EndXM1 := EndX - 1;
+      for OutY := 0 to FOutSYM1 do
       begin
         StartY := (OutY * InSizeY) div FOutputSizeY;
         EndY := ((OutY + 1) * InSizeY + FOutputSizeY - 1) div FOutputSizeY;
+        EndYM1 := EndY - 1;
         WinArea := (EndX - StartX) * (EndY - StartY);
         for D := 0 to MaxD do
         begin
           Err := FOutputError[OutX, OutY, D] / WinArea;
-          for InX := StartX to EndX - 1 do
-            for InY := StartY to EndY - 1 do
+          for InX := StartX to EndXM1 do
+            for InY := StartY to EndYM1 do
               PrevErr.Add(InX, InY, D, Err); // accumulate (overlapping windows)
         end;
       end;
@@ -54422,6 +54471,7 @@ procedure TNNetAdaptiveMaxPool.Compute();
 var
   StartTime: double;
   OutX, OutY, InX, InY, D, MaxD: integer;
+  FOutSXM1, FOutSYM1, EndXM1, EndYM1: integer;
   StartX, EndX, StartY, EndY: integer;
   InSizeX, InSizeY: integer;
   MaxVal, CurVal: TNeuralFloat;
@@ -54432,19 +54482,23 @@ begin
   InSizeX := Prev.SizeX;
   InSizeY := Prev.SizeY;
   MaxD := Prev.Depth - 1;
-  for OutX := 0 to FOutputSizeX - 1 do
+  FOutSXM1 := FOutputSizeX - 1;
+  FOutSYM1 := FOutputSizeY - 1;
+  for OutX := 0 to FOutSXM1 do
   begin
     StartX := (OutX * InSizeX) div FOutputSizeX;
     EndX := ((OutX + 1) * InSizeX + FOutputSizeX - 1) div FOutputSizeX; // ceil, exclusive
-    for OutY := 0 to FOutputSizeY - 1 do
+    EndXM1 := EndX - 1;
+    for OutY := 0 to FOutSYM1 do
     begin
       StartY := (OutY * InSizeY) div FOutputSizeY;
       EndY := ((OutY + 1) * InSizeY + FOutputSizeY - 1) div FOutputSizeY; // ceil, exclusive
+      EndYM1 := EndY - 1;
       for D := 0 to MaxD do
       begin
         MaxVal := Prev[StartX, StartY, D];
-        for InX := StartX to EndX - 1 do
-          for InY := StartY to EndY - 1 do
+        for InX := StartX to EndXM1 do
+          for InY := StartY to EndYM1 do
           begin
             CurVal := Prev[InX, InY, D];
             if CurVal > MaxVal then MaxVal := CurVal;
@@ -54460,6 +54514,7 @@ procedure TNNetAdaptiveMaxPool.Backpropagate();
 var
   StartTime: double;
   OutX, OutY, InX, InY, D, MaxD: integer;
+  FOutSXM1, FOutSYM1, EndXM1, EndYM1: integer;
   StartX, EndX, StartY, EndY: integer;
   InSizeX, InSizeY: integer;
   ArgX, ArgY: integer;
@@ -54479,22 +54534,26 @@ begin
     InSizeX := Prev.SizeX;
     InSizeY := Prev.SizeY;
     MaxD := FOutput.Depth - 1;
-    for OutX := 0 to FOutputSizeX - 1 do
+    FOutSXM1 := FOutputSizeX - 1;
+    FOutSYM1 := FOutputSizeY - 1;
+    for OutX := 0 to FOutSXM1 do
     begin
       StartX := (OutX * InSizeX) div FOutputSizeX;
       EndX := ((OutX + 1) * InSizeX + FOutputSizeX - 1) div FOutputSizeX;
-      for OutY := 0 to FOutputSizeY - 1 do
+      EndXM1 := EndX - 1;
+      for OutY := 0 to FOutSYM1 do
       begin
         StartY := (OutY * InSizeY) div FOutputSizeY;
         EndY := ((OutY + 1) * InSizeY + FOutputSizeY - 1) div FOutputSizeY;
+        EndYM1 := EndY - 1;
         for D := 0 to MaxD do
         begin
           // recompute the argmax cell of this window (no extra serialized state)
           ArgX := StartX;
           ArgY := StartY;
           MaxVal := Prev[StartX, StartY, D];
-          for InX := StartX to EndX - 1 do
-            for InY := StartY to EndY - 1 do
+          for InX := StartX to EndXM1 do
+            for InY := StartY to EndYM1 do
             begin
               CurVal := Prev[InX, InY, D];
               if CurVal > MaxVal then
@@ -55299,7 +55358,7 @@ function TNNet.AddUNet(Depth, BaseFeatures, OutputChannels: integer;
   out EncoderTaps: TNeuralIntegerArray;
   UseNorm: boolean): TNNetLayer;
 var
-  Stage, Features: integer;
+  Stage, Features, DepthM1: integer;
   Tap: TNNetLayer;
 
   // 2x [ Conv3x3(pad1,stride1) -> (optional Norm) -> ReLU ], shape-preserving
@@ -55326,7 +55385,8 @@ begin
 
   // ---- ENCODER: Depth stages, each doubling features, each pooling x2 ------
   Features := BaseFeatures;
-  for Stage := 0 to Depth - 1 do
+  DepthM1 := Depth - 1;
+  for Stage := 0 to DepthM1 do
   begin
     DoubleConv(Features);
     // Record the PRE-pool feature map as the skip tap for this resolution.
@@ -55397,6 +55457,7 @@ procedure TNNet.MergeLoRA(BaseLayer, ADown, BUp: TNNetLayer;
   Alpha: TNeuralFloat);
 var
   Rank, d_in, d_out, i, j, k: integer;
+  RankM1, d_inM1, d_outM1: integer;
   Scale, Acc: TNeuralFloat;
 begin
   if (BaseLayer = nil) or (ADown = nil) or (BUp = nil) then
@@ -55421,6 +55482,9 @@ begin
     FErrorProc('MergeLoRA: BUp in-dim (' + IntToStr(BUp.Neurons[0].Weights.Size) +
       ') must equal Rank (' + IntToStr(Rank) + ').');
   Scale := Alpha / Rank;
+  RankM1 := Rank - 1;
+  d_inM1 := d_in - 1;
+  d_outM1 := d_out - 1;
   // The bypass output is bypass[j] = Scale*( sum_k B[j][k]*(A[k].x + biasA[k])
   // + biasB[j] ). The x-dependent part folds into the base WEIGHTS and the
   // constant part (the A/B biases threaded through B) folds into the base
@@ -55429,19 +55493,19 @@ begin
   //   bias_base[j] += Scale * ( sum_k B[j][k] * biasA[k] + biasB[j] )
   // (AddLoRAAdapter zero-inits biasB, but a general PEFT-imported adapter may
   // carry one, so both terms are folded.)
-  for j := 0 to d_out - 1 do
+  for j := 0 to d_outM1 do
   begin
-    for i := 0 to d_in - 1 do
+    for i := 0 to d_inM1 do
     begin
       Acc := 0;
-      for k := 0 to Rank - 1 do
+      for k := 0 to RankM1 do
         Acc := Acc +
           BUp.Neurons[j].Weights.FData[k] * ADown.Neurons[k].Weights.FData[i];
       BaseLayer.Neurons[j].Weights.FData[i] :=
         BaseLayer.Neurons[j].Weights.FData[i] + Scale * Acc;
     end;
     Acc := BUp.Neurons[j].BiasWeight;
-    for k := 0 to Rank - 1 do
+    for k := 0 to RankM1 do
       Acc := Acc + BUp.Neurons[j].Weights.FData[k] * ADown.Neurons[k].BiasWeight;
     BaseLayer.Neurons[j].BiasWeight :=
       BaseLayer.Neurons[j].BiasWeight + Scale * Acc;
@@ -55453,7 +55517,7 @@ end;
 procedure TNNet.AddSplitQKVHeads(d_model, Heads: integer;
   out SliceLayers: array of TNNetLayer; SourceLayer: TNNetLayer = nil);
 var
-  d_k, HeadCnt, d: integer;
+  d_k, HeadCnt, d, HeadsM1, d_kM1: integer;
   Channels: array of integer;
 begin
   if SourceLayer = nil then SourceLayer := GetLastLayer();
@@ -55470,11 +55534,13 @@ begin
       IntToStr(SourceLayer.Output.Depth) + ', d_model=' + IntToStr(d_model));
   d_k := d_model div Heads;
   SetLength(Channels, 3 * d_k);
-  for HeadCnt := 0 to Heads - 1 do
+  HeadsM1 := Heads - 1;
+  d_kM1 := d_k - 1;
+  for HeadCnt := 0 to HeadsM1 do
   begin
     // Re-interleave head HeadCnt as [Q_h | K_h | V_h] from the
     // [Q_all | K_all | V_all] slab.
-    for d := 0 to d_k - 1 do
+    for d := 0 to d_kM1 do
     begin
       Channels[d]           := HeadCnt * d_k + d;                 // Q_h
       Channels[d_k + d]     := d_model + HeadCnt * d_k + d;       // K_h
@@ -55497,7 +55563,7 @@ function TNNet.AddMultiHeadSDPAConcat(Heads: integer;
   QKRMSNorm: boolean = false;
   SegmentSource: TNNetLayer = nil): TNNetLayer;
 var
-  d_model, d_k, HeadCnt, d: integer;
+  d_model, d_k, HeadCnt, d, HeadsM1, d_kM1: integer;
   SliceLayers, HeadOutputs: array of TNNetLayer;
   QSlice, KSlice, VSlice, AttnInput: TNNetLayer;
   QChannels, KChannels, VChannels: array of integer;
@@ -55573,6 +55639,8 @@ begin
   SetLength(SliceLayers, Heads);
   AddSplitQKVHeads(d_model, Heads, SliceLayers, SourceLayer);
   SetLength(HeadOutputs, Heads);
+  HeadsM1 := Heads - 1;
+  d_kM1 := d_k - 1;
   if UseRoPE or QKRMSNorm then
   begin
     // Each SliceLayers[h] is a [Q_h | K_h | V_h] pack of width 3*d_k.
@@ -55583,13 +55651,13 @@ begin
     SetLength(QChannels, d_k);
     SetLength(KChannels, d_k);
     SetLength(VChannels, d_k);
-    for d := 0 to d_k - 1 do
+    for d := 0 to d_kM1 do
     begin
       QChannels[d] := d;            // Q_h occupies [0 .. d_k-1]
       KChannels[d] := d_k + d;      // K_h occupies [d_k .. 2*d_k-1]
       VChannels[d] := 2 * d_k + d;  // V_h occupies [2*d_k .. 3*d_k-1]
     end;
-    for HeadCnt := 0 to Heads - 1 do
+    for HeadCnt := 0 to HeadsM1 do
     begin
       QSlice := AddLayerAfter(TNNetSplitChannels.Create(QChannels), SliceLayers[HeadCnt]);
       if QKRMSNorm then
@@ -55611,7 +55679,7 @@ begin
   end
   else
   begin
-    for HeadCnt := 0 to Heads - 1 do
+    for HeadCnt := 0 to HeadsM1 do
       HeadOutputs[HeadCnt] := AddHeadAttention(SliceLayers[HeadCnt], HeadCnt);
   end;
   Result := AddLayer(TNNetDeepConcat.Create(HeadOutputs));
@@ -55644,7 +55712,7 @@ end;
 function TNNet.AddMultiHeadLinformerAttention(Heads, k: integer): TNNetLayer;
 var
   SourceLayer: TNNetLayer;
-  d_model, d_k, HeadCnt: integer;
+  d_model, d_k, HeadCnt, HeadsM1: integer;
   SliceLayers, HeadOutputs: array of TNNetLayer;
 begin
   SourceLayer := GetLastLayer();
@@ -55666,7 +55734,8 @@ begin
   AddSplitQKVHeads(d_model, Heads, SliceLayers, SourceLayer);
   // One independent Linformer head per slice (each with its own learnable E,F).
   SetLength(HeadOutputs, Heads);
-  for HeadCnt := 0 to Heads - 1 do
+  HeadsM1 := Heads - 1;
+  for HeadCnt := 0 to HeadsM1 do
     HeadOutputs[HeadCnt] :=
       AddLayerAfter(TNNetLinformerAttention.Create(d_k, k), SliceLayers[HeadCnt]);
   // Concat the H (SeqLen,1,d_k) head outputs back to d_model.
@@ -55685,7 +55754,7 @@ function TNNet.AddTalkingHeadsAttention(Heads, d_model: integer;
 var
   PreviousLayer, QGroup, KGroup, VGroup: TNNetLayer;
   QHead, KHead, VHead, VTHead, ScoreHead, WHead, OutHead: TNNetLayer;
-  PreviousDepth, PreviousSizeX, PreviousSizeY, d_k, HeadCnt: integer;
+  PreviousDepth, PreviousSizeX, PreviousSizeY, d_k, HeadCnt, HeadsM1: integer;
   ScoreSlabs, WeightSlabs, HeadOutputs: array of TNNetLayer;
   MixedLogits, MixedWeights, ConcatScores, ConcatWeights: TNNetLayer;
   InvSqrtDk: TNeuralFloat;
@@ -55705,6 +55774,7 @@ begin
       TNNetReshape.Create(PreviousSizeX * PreviousSizeY, 1, PreviousDepth));
   d_k := d_model div Heads;
   InvSqrtDk := 1.0 / Sqrt(d_k);
+  HeadsM1 := Heads - 1;
 
   // Per-token Q/K/V projections (PointwiseConvLinear = 1x1 conv; FullConnect
   // would flatten the sequence axis -- see AddMultiHeadSelfAttention header).
@@ -55717,7 +55787,7 @@ begin
   SetLength(HeadOutputs, Heads);
 
   // 1) Per-head scaled logits as a real [X=key, Y=query, 1] graph tensor.
-  for HeadCnt := 0 to Heads - 1 do
+  for HeadCnt := 0 to HeadsM1 do
   begin
     QHead := AddLayerAfter(
       TNNetSplitChannels.Create(HeadCnt * d_k, d_k), QGroup);
@@ -55735,14 +55805,14 @@ begin
   begin
     ConcatScores := AddLayer(TNNetDeepConcat.Create(ScoreSlabs));
     MixedLogits := AddLayer(TNNetPointwiseConvLinear.Create(Heads));
-    for HeadCnt := 0 to Heads - 1 do
+    for HeadCnt := 0 to HeadsM1 do
       ScoreSlabs[HeadCnt] := AddLayerAfter(
         TNNetSplitChannels.Create(HeadCnt, 1), MixedLogits);
   end;
 
   // 3) Optional causal mask (mask where key X > query Y), then softmax over the
   //    KEY axis per query row, per head.
-  for HeadCnt := 0 to Heads - 1 do
+  for HeadCnt := 0 to HeadsM1 do
   begin
     WHead := ScoreSlabs[HeadCnt]; // [key, query, 1]
     if CausalMask then
@@ -55759,13 +55829,13 @@ begin
   begin
     ConcatWeights := AddLayer(TNNetDeepConcat.Create(WeightSlabs));
     MixedWeights := AddLayer(TNNetPointwiseConvLinear.Create(Heads));
-    for HeadCnt := 0 to Heads - 1 do
+    for HeadCnt := 0 to HeadsM1 do
       WeightSlabs[HeadCnt] := AddLayerAfter(
         TNNetSplitChannels.Create(HeadCnt, 1), MixedWeights);
   end;
 
   // 5) weights . V per head, then concat heads back to d_model.
-  for HeadCnt := 0 to Heads - 1 do
+  for HeadCnt := 0 to HeadsM1 do
   begin
     // Back to [key,1,query] for the DotProducts with V^T (matches CAI path).
     WHead := AddLayerAfter(TNNetTransposeYD.Create(), WeightSlabs[HeadCnt]);
@@ -55791,7 +55861,7 @@ function TNNet.AddForgettingAttention(Heads, d_model: integer): TNNetLayer;
 var
   PreviousLayer, QGroup, KGroup, VGroup: TNNetLayer;
   QHead, KHead, VHead, VTHead, ScoreHead, ForgetBias, WHead, OutHead: TNNetLayer;
-  PreviousDepth, PreviousSizeX, PreviousSizeY, d_k, HeadCnt: integer;
+  PreviousDepth, PreviousSizeX, PreviousSizeY, d_k, HeadCnt, HeadsM1: integer;
   HeadOutputs: array of TNNetLayer;
   InvSqrtDk: TNeuralFloat;
 begin
@@ -55818,7 +55888,8 @@ begin
   VGroup := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), PreviousLayer);
 
   SetLength(HeadOutputs, Heads);
-  for HeadCnt := 0 to Heads - 1 do
+  HeadsM1 := Heads - 1;
+  for HeadCnt := 0 to HeadsM1 do
   begin
     QHead := AddLayerAfter(
       TNNetSplitChannels.Create(HeadCnt * d_k, d_k), QGroup);
@@ -55862,7 +55933,7 @@ function TNNet.AddMultiHeadGraphAttention(Heads, pHeadFeatures: integer;
   pAttentionDropout: TNeuralFloat = 0.0;
   SourceLayer: TNNetLayer = nil): TNNetLayer;
 var
-  HeadCnt: integer;
+  HeadCnt, HeadsM1: integer;
   Head: TNNetGraphAttention;
   HeadOutputs: array of TNNetLayer;
 begin
@@ -55871,9 +55942,10 @@ begin
       IntToStr(Heads));
   if SourceLayer = nil then SourceLayer := GetLastLayer();
   SetLength(HeadOutputs, Heads);
+  HeadsM1 := Heads - 1;
   // Heads independent single-head GAT layers, all fed from the SAME source and
   // wired to the SAME adjacency mask.
-  for HeadCnt := 0 to Heads - 1 do
+  for HeadCnt := 0 to HeadsM1 do
   begin
     Head := TNNetGraphAttention.Create(pHeadFeatures, pAttentionDropout, 0);
     AddLayerAfter(Head, SourceLayer);
@@ -56038,7 +56110,7 @@ end;
 function TNNet.AddRetention(d_model, Heads: integer;
   GammaMinExp: TNeuralFloat): TNNetLayer;
 var
-  d_k, HeadCnt: integer;
+  d_k, HeadCnt, HeadsM1: integer;
   Gamma: TNeuralFloat;
   SourceLayer: TNNetLayer;
   SliceLayers, HeadOutputs: array of TNNetLayer;
@@ -56053,7 +56125,8 @@ begin
   SetLength(SliceLayers, Heads);
   AddSplitQKVHeads(d_model, Heads, SliceLayers, SourceLayer);
   SetLength(HeadOutputs, Heads);
-  for HeadCnt := 0 to Heads - 1 do
+  HeadsM1 := Heads - 1;
+  for HeadCnt := 0 to HeadsM1 do
   begin
     // Geometric per-head decay schedule: gamma_h = 1 - 2^(-GammaMinExp - h).
     Gamma := 1.0 - Power(2.0, -GammaMinExp - HeadCnt);
@@ -56122,7 +56195,7 @@ end;
 function TNNet.AddWaveletPacketTransform(Levels, Filter: integer;
   Learnable: boolean = false): TNNetLayer;
 var
-  LevelCnt: integer;
+  LevelCnt, LevelsM1: integer;
 begin
   // Balanced binary wavelet-packet tree: stack Levels single-level DWTs. Each
   // TNNetDWT1D transforms every channel, so re-applying it recursively splits
@@ -56134,7 +56207,8 @@ begin
     FErrorProc('AddWaveletPacketTransform requires Levels >= 1; got ' +
       IntToStr(Levels) + '.');
   Result := GetLastLayer();
-  for LevelCnt := 0 to Levels - 1 do
+  LevelsM1 := Levels - 1;
+  for LevelCnt := 0 to LevelsM1 do
     Result := AddLayer(TNNetDWT1D.Create(Filter, Learnable));
 end;
 
@@ -56177,7 +56251,7 @@ function TNNet.AddInducedSetAttention(InducingPoints: integer;
   Heads: integer): TNNetLayer;
 var
   SetLayer: TNNetLayer;
-  d_model, d_head, HeadCnt: integer;
+  d_model, d_head, HeadCnt, HeadsM1: integer;
   HeadOutputs: array of TNNetLayer;
 begin
   SetLayer := GetLastLayer();
@@ -56204,7 +56278,8 @@ begin
       'd_model=' + IntToStr(d_model) + ', Heads=' + IntToStr(Heads));
   d_head := d_model div Heads;
   SetLength(HeadOutputs, Heads);
-  for HeadCnt := 0 to Heads - 1 do
+  HeadsM1 := Heads - 1;
+  for HeadCnt := 0 to HeadsM1 do
   begin
     // Learnable per-token input projection of the SAME set into this head's
     // d_head subspace (Q/K/V share this projection; values are mixed by the
@@ -56223,7 +56298,7 @@ function TNNet.AddAttentionPooling(NumSeeds: integer;
   Heads: integer): TNNetLayer;
 var
   SetLayer: TNNetLayer;
-  d_model, d_head, HeadCnt: integer;
+  d_model, d_head, HeadCnt, HeadsM1: integer;
   HeadOutputs: array of TNNetLayer;
 begin
   SetLayer := GetLastLayer();
@@ -56249,7 +56324,8 @@ begin
       'd_model=' + IntToStr(d_model) + ', Heads=' + IntToStr(Heads));
   d_head := d_model div Heads;
   SetLength(HeadOutputs, Heads);
-  for HeadCnt := 0 to Heads - 1 do
+  HeadsM1 := Heads - 1;
+  for HeadCnt := 0 to HeadsM1 do
   begin
     AddLayerAfter(TNNetPointwiseConvLinear.Create(d_head), SetLayer);
     HeadOutputs[HeadCnt] :=
@@ -56435,7 +56511,7 @@ function TNNet.AddMultiHeadCrossAttention(d_model, Heads: integer;
   QuerySource, KeyValueSource: TNNetLayer;
   CausalMask: boolean = false): TNNetLayer;
 var
-  d_k, HeadCnt, d: integer;
+  d_k, HeadCnt, d, HeadsM1, d_kM1: integer;
   QProj, KProj, VProj: TNNetLayer;
   QSlice, KSlice, VSlice, KVPack: TNNetLayer;
   HeadOutputs: array of TNNetLayer;
@@ -56460,7 +56536,9 @@ begin
   SetLength(HeadOutputs, Heads);
   SetLength(QChannels, d_k);
   SetLength(KVChannels, d_k);
-  for HeadCnt := 0 to Heads - 1 do
+  HeadsM1 := Heads - 1;
+  d_kM1 := d_k - 1;
+  for HeadCnt := 0 to HeadsM1 do
   begin
     // Slice this head's d_k channels out of each projection. Q lives on the
     // QuerySeqLen grid; K|V on the KeyValueSeqLen grid (the two sequence lengths
@@ -56469,7 +56547,7 @@ begin
     // which forms the rectangular QuerySeqLen x KeyValueSeqLen attention. (A
     // single Q|K|V DeepConcat would be illegal here -- TNNetDeepConcat requires
     // a shared X size, which the unequal sequence lengths violate.)
-    for d := 0 to d_k - 1 do
+    for d := 0 to d_kM1 do
     begin
       QChannels[d]  := HeadCnt * d_k + d;
       KVChannels[d] := HeadCnt * d_k + d;
@@ -56494,7 +56572,7 @@ end;
 function TNNet.AddMultiHeadGroupedQueryAttention(QueryHeads,
   KVHeads: integer; CausalMask: boolean = false): TNNetLayer;
 var
-  d_model, d_k, d_kv, GroupSize, HeadCnt, KVGroup, d: integer;
+  d_model, d_k, d_kv, GroupSize, HeadCnt, KVGroup, d, QueryHeadsM1, d_kM1: integer;
   SourceLayer, QProj, KProj, VProj: TNNetLayer;
   QSlice, KSlice, VSlice, HeadPack: TNNetLayer;
   HeadOutputs: array of TNNetLayer;
@@ -56528,12 +56606,14 @@ begin
   SetLength(HeadOutputs, QueryHeads);
   SetLength(QChannels, d_k);
   SetLength(KVChannels, d_k);
-  for HeadCnt := 0 to QueryHeads - 1 do
+  QueryHeadsM1 := QueryHeads - 1;
+  d_kM1 := d_k - 1;
+  for HeadCnt := 0 to QueryHeadsM1 do
   begin
     // This query head owns its own d_k slice of Q, but shares the KV head of
     // its group (replicating that KV head across the GroupSize query heads).
     KVGroup := HeadCnt div GroupSize;
-    for d := 0 to d_k - 1 do
+    for d := 0 to d_kM1 do
     begin
       QChannels[d]  := HeadCnt * d_k + d;
       KVChannels[d] := KVGroup * d_k + d;
@@ -56561,7 +56641,7 @@ function TNNet.AddMultiHeadLatentAttention(d_model, Heads,
   RopeDim: integer = 0;
   MinChannelsPerGroupCount: integer = 0): TNNetLayer;
 var
-  d_k, HeadCnt, d: integer;
+  d_k, HeadCnt, d, HeadsM1, d_kM1, RopeDimM1: integer;
   SourceLayer, QProj, CKV, KProj, VProj: TNNetLayer;
   QRopeProj, KRopeShared, VZeroPad, NegRopeK: TNNetLayer;
   QSlice, KSlice, VSlice, QRopeSlice, HeadPack, HeadAttn: TNNetLayer;
@@ -56630,9 +56710,12 @@ begin
   SetLength(QChannels, d_k);
   SetLength(KVChannels, d_k);
   SetLength(RopeChannels, RopeDim);
-  for HeadCnt := 0 to Heads - 1 do
+  HeadsM1 := Heads - 1;
+  d_kM1 := d_k - 1;
+  RopeDimM1 := RopeDim - 1;
+  for HeadCnt := 0 to HeadsM1 do
   begin
-    for d := 0 to d_k - 1 do
+    for d := 0 to d_kM1 do
     begin
       QChannels[d]  := HeadCnt * d_k + d;
       KVChannels[d] := HeadCnt * d_k + d;
@@ -56643,7 +56726,7 @@ begin
     if RopeDim > 0 then
     begin
       // This head's rope-Q slice, rotated; rope-K is the shared rotated slice.
-      for d := 0 to RopeDim - 1 do
+      for d := 0 to RopeDimM1 do
         RopeChannels[d] := HeadCnt * RopeDim + d;
       QRopeSlice := AddLayerAfter(
         TNNetSplitChannels.Create(RopeChannels), QRopeProj);
