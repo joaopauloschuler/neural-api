@@ -129,12 +129,13 @@ end;
 // Function to find the most frequent pair
 class function TTokenizerBase.GetMostFrequentPair(const pairCounts: TPairFrequency): string;
 var
-  i, maxCount: integer;
+  i, maxCount, maxI: integer;
   maxPair: string;
 begin
   maxCount := 0;
   maxPair := '';
-  for i := 0 to pairCounts.Count - 1 do
+  maxI := pairCounts.Count - 1;
+  for i := 0 to maxI do
   begin
     if pairCounts.Integers[i] > maxCount then
     begin
@@ -149,9 +150,10 @@ end;
 // Function to merge a pair in the vocabulary
 class procedure TTokenizerBase.MergePair(var vocab: TNNetStringList; const pair: string; const replacement: string);
 var
-  i: integer;
+  i, maxI: integer;
 begin
-  for i := 0 to vocab.Count - 1 do
+  maxI := vocab.Count - 1;
+  for i := 0 to maxI do
     vocab[i] := StringReplace(vocab[i], pair, replacement, [rfReplaceAll]);
 end;
 
@@ -206,14 +208,15 @@ end;
 class function TTokenizerBase.LoadDataset(const filename: string): TNNetStringList;
 var
   lines: TStringList;
-  i: integer;
+  i, maxI: integer;
 begin
   Result := TNNetStringList.Create;
   lines := CreateQuotedTokenizedStringList(' ', chr(29));
   try
     lines.LoadFromFile(filename);
     lines.DelimitedText := lines.Text;
-    for i := 0 to lines.Count - 1 do
+    maxI := lines.Count - 1;
+    for i := 0 to maxI do
     begin
       //WriteLn(InsertSpacesBetweenChars(lines[i],csBPESeparator));
       Result.Add(InsertCharBetweenChars(Trim(lines[i]),csBPESeparator));
@@ -442,7 +445,7 @@ procedure TNeuralTokenizer.FitOnFile(const FileName: string; VocabSize: integer;
 var
   vocab: TNNetStringList;
   merges: TMergeList;
-  i: integer;
+  i, maxI: integer;
   Tokens: TIntegerList;
 begin
   try
@@ -458,7 +461,8 @@ begin
 
     Self.Clear;
     Self.Sorted := true;
-    for i := 0 to merges.Count - 1 do
+    maxI := merges.Count - 1;
+    for i := 0 to maxI do
     begin
       Self.Add(merges.ValueFromIndex[i]);
     end;
@@ -506,7 +510,7 @@ procedure TNeuralTokenizer.Test;
 var
   vocab: TNNetStringList;
   merges: TMergeList;
-  i: integer;
+  i, maxI: integer;
   Tokens: TIntegerList;
 begin
   try
@@ -534,7 +538,8 @@ begin
     WriteLn('Final vocabulary has:',merges.Count - 1,' elements.');
     Self.Clear;
     Self.Sorted := true;
-    for i := 0 to merges.Count - 1 do
+    maxI := merges.Count - 1;
+    for i := 0 to maxI do
     begin
       Self.Add(merges.ValueFromIndex[i]);
     end;
@@ -547,7 +552,8 @@ begin
     WriteLn('Tokenizing new text:');
     Tokenize('lowest 12 3 . lower', Tokens);
     WriteLn('Tokens: ');
-    for i := 0 to Tokens.Count - 1 do
+    maxI := Tokens.Count - 1;
+    for i := 0 to maxI do
       WriteLn(i,' : ',Tokens[i]);
     WriteLn(DeTokenize(Tokens));
     ReadLn;
