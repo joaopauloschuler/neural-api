@@ -89608,6 +89608,7 @@ var
   Layer: TNNetLayer;
   StochasticLayers, UsedProbes, NumClasses: integer;
   MCLastLayerIdx, MCUsedProbesM1, MCNumClassesM1, MCNumPassesM1: integer;
+  cBinsM1, QnM1, RowCapM1: integer;
   HasLabels, IsProbHead, IsLogHead: boolean;
   HeadKind: string;
   SavedDropout: boolean;
@@ -89835,7 +89836,7 @@ begin
 
         // accumulate mean_p and per-pass argmax / top-prob.
         BestArg := 0;
-        for ClassIdx := 0 to NumClasses - 1 do
+        for ClassIdx := 0 to MCNumClassesM1 do
         begin
           MeanProb[ClassIdx] := MeanProb[ClassIdx] + Prob[ClassIdx];
           if Prob[ClassIdx] > Prob[BestArg] then BestArg := ClassIdx;
@@ -89851,13 +89852,13 @@ begin
       end;
 
       // finalize mean_p and expected entropy.
-      for ClassIdx := 0 to NumClasses - 1 do
+      for ClassIdx := 0 to MCNumClassesM1 do
         MeanProb[ClassIdx] := MeanProb[ClassIdx] / NumPasses;
       ExpEntropy[SampleIdx] := ExpEntAcc / NumPasses;
 
       // predictive entropy H[mean_p] (total).
       PEnt := 0;
-      for ClassIdx := 0 to NumClasses - 1 do
+      for ClassIdx := 0 to MCNumClassesM1 do
         if MeanProb[ClassIdx] > cEps then
           PEnt := PEnt - MeanProb[ClassIdx] * pcr_logf(MeanProb[ClassIdx]);
       PredEntropy[SampleIdx] := PEnt;
@@ -89868,7 +89869,7 @@ begin
 
       // predicted class = argmax of mean_p; mean confidence = its prob.
       BestArg := 0;
-      for ClassIdx := 0 to NumClasses - 1 do
+      for ClassIdx := 0 to MCNumClassesM1 do
         if MeanProb[ClassIdx] > MeanProb[BestArg] then BestArg := ClassIdx;
       PredClass[SampleIdx] := BestArg;
       MeanConf[SampleIdx] := MeanProb[BestArg];
@@ -89882,14 +89883,14 @@ begin
       // pass-to-pass argmax flip rate (vs the modal argmax).
       ModalArg := 0;
       BestCount := ArgCount[0];
-      for ClassIdx := 1 to NumClasses - 1 do
+      for ClassIdx := 1 to MCNumClassesM1 do
         if ArgCount[ClassIdx] > BestCount then
         begin
           BestCount := ArgCount[ClassIdx];
           ModalArg := ClassIdx;
         end;
       Flips := 0;
-      for PassIdx := 0 to NumPasses - 1 do
+      for PassIdx := 0 to MCNumPassesM1 do
         if PassArgmax[PassIdx] <> ModalArg then Inc(Flips);
       FlipRate[SampleIdx] := Flips / NumPasses;
     end;
@@ -89902,7 +89903,8 @@ begin
     Lines.Add('  ' + StringOfChar('-', 74));
     J := UsedProbes;
     if J > 32 then J := 32;
-    for SampleIdx := 0 to J - 1 do
+    RowCapM1 := J - 1;
+    for SampleIdx := 0 to RowCapM1 do
       Lines.Add(Format('  %-5d %-6d %8.4f %9.4f %9.4f %9.4f %9.5f %8.1f%%',
         [SampleIdx, PredClass[SampleIdx], MeanConf[SampleIdx],
          PredEntropy[SampleIdx], ExpEntropy[SampleIdx], BALD[SampleIdx],
@@ -89914,15 +89916,16 @@ begin
     // ---- 10-bin histogram of per-sample BALD. ----
     MinB := BALD[0];
     MaxB := BALD[0];
-    for SampleIdx := 1 to UsedProbes - 1 do
+    for SampleIdx := 1 to MCUsedProbesM1 do
     begin
       if BALD[SampleIdx] < MinB then MinB := BALD[SampleIdx];
       if BALD[SampleIdx] > MaxB then MaxB := BALD[SampleIdx];
     end;
     Span := MaxB - MinB;
     SetLength(Bins, cBins);
-    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
-    for SampleIdx := 0 to UsedProbes - 1 do
+    cBinsM1 := cBins - 1;
+    for BinIdx := 0 to cBinsM1 do Bins[BinIdx] := 0;
+    for SampleIdx := 0 to MCUsedProbesM1 do
     begin
       if Span > 1e-30 then
         BinIdx := Trunc((BALD[SampleIdx] - MinB) / Span * cBins)
@@ -89933,12 +89936,12 @@ begin
       Inc(Bins[BinIdx]);
     end;
     MaxBin := 0;
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
       if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
     Lines.Add(Format(
       'Per-sample BALD histogram (10 bins over [%.4f, %.4f]):',
       [MinB, MaxB]));
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
     begin
       BinLo := MinB + BinIdx / cBins * Span;
       BinHi := MinB + (BinIdx + 1) / cBins * Span;
@@ -89955,16 +89958,17 @@ begin
     // ---- top-K most uncertain (active-learning queue) by BALD. ----
     Qn := TopK;
     if Qn > UsedProbes then Qn := UsedProbes;
+    QnM1 := Qn - 1;
     SetLength(QueueIdx, UsedProbes);
     SetLength(QueueVal, UsedProbes);
-    for SampleIdx := 0 to UsedProbes - 1 do
+    for SampleIdx := 0 to MCUsedProbesM1 do
     begin
       QueueIdx[SampleIdx] := SampleIdx;
       QueueVal[SampleIdx] := BALD[SampleIdx];
     end;
     // partial selection sort: first Qn descending by BALD.
-    for I := 0 to Qn - 1 do
-      for J := I + 1 to UsedProbes - 1 do
+    for I := 0 to QnM1 do
+      for J := I + 1 to MCUsedProbesM1 do
         if QueueVal[J] > QueueVal[I] then
         begin
           Span := QueueVal[I]; QueueVal[I] := QueueVal[J]; QueueVal[J] := Span;
@@ -89972,7 +89976,7 @@ begin
         end;
     Lines.Add(Format(
       'Active-learning queue — %d most-uncertain sample(s) by BALD:', [Qn]));
-    for I := 0 to Qn - 1 do
+    for I := 0 to QnM1 do
       Lines.Add(Format('  #%-2d sample %-5d BALD=%.4f  H[tot]=%.4f  pred=%d',
         [I + 1, QueueIdx[I], QueueVal[I],
          PredEntropy[QueueIdx[I]], PredClass[QueueIdx[I]]]));
@@ -89985,7 +89989,7 @@ begin
       WrongCnt := 0;
       CorrectEntSum := 0;
       WrongEntSum := 0;
-      for SampleIdx := 0 to UsedProbes - 1 do
+      for SampleIdx := 0 to MCUsedProbesM1 do
       begin
         if PredClass[SampleIdx] = Labels[SampleIdx] then
         begin
@@ -90027,7 +90031,7 @@ begin
     MeanBALD := 0;
     MeanPred := 0;
     MeanExp := 0;
-    for SampleIdx := 0 to UsedProbes - 1 do
+    for SampleIdx := 0 to MCUsedProbesM1 do
     begin
       MeanBALD := MeanBALD + BALD[SampleIdx];
       MeanPred := MeanPred + PredEntropy[SampleIdx];
@@ -90066,6 +90070,7 @@ const
 var
   LpBnd240: integer;
   LpBnd241: integer;
+  TransformM1, EqCBinsM1, CountedM1: integer;
   Lines: TStringList;
   TName: array[0 .. cTransformCount - 1] of string;
   TNet: array[0 .. cTransformCount - 1] of TNNet;
@@ -90105,7 +90110,9 @@ begin
   Result := '';
   Lines := TStringList.Create();
   Base := nil;
-  for TIdx := 0 to cTransformCount - 1 do TNet[TIdx] := nil;
+  TransformM1 := cTransformCount - 1;
+  EqCBinsM1 := cBins - 1;
+  for TIdx := 0 to TransformM1 do TNet[TIdx] := nil;
   try
     if NN = nil then
     begin
@@ -90134,7 +90141,7 @@ begin
     TName[2] := 'TNNetReverseChannels';
     TName[3] := 'TNNetRoll(+1) (depth roll)';
 
-    for TIdx := 0 to cTransformCount - 1 do
+    for TIdx := 0 to TransformM1 do
       TNet[TIdx] := BuildTransformNet(TIdx, ShapeX, ShapeY, ShapeD);
 
     Base := TNNetVolume.Create();
@@ -90151,7 +90158,7 @@ begin
       ['Transform', 'InvarErr', 'Top1-Agree', 'Skipped', 'Verdict']));
     Lines.Add(StringOfChar('-', 92));
 
-    for TIdx := 0 to cTransformCount - 1 do
+    for TIdx := 0 to TransformM1 do
     begin
       SetLength(PerSampleErr, 0);
       AccErr := 0;
@@ -90221,10 +90228,11 @@ begin
 
       // 10-bin histogram of per-sample relative error over [0, MaxErr].
       SetLength(Bins, cBins);
-      for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+      for BinIdx := 0 to EqCBinsM1 do Bins[BinIdx] := 0;
       if (Counted > 0) and (MaxErr > cEps) then
       begin
-        for I := 0 to Counted - 1 do
+        CountedM1 := Counted - 1;
+        for I := 0 to CountedM1 do
         begin
           BinIdx := Trunc((PerSampleErr[I] / MaxErr) * cBins);
           if BinIdx >= cBins then BinIdx := cBins - 1;
@@ -90235,11 +90243,11 @@ begin
       else if Counted > 0 then
         Bins[0] := Counted; // all-zero error -> first bin
       MaxBin := 0;
-      for BinIdx := 0 to cBins - 1 do
+      for BinIdx := 0 to EqCBinsM1 do
         if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
       Lines.Add(Format('  per-sample InvarErr histogram (range [0, %.6f]):',
         [MaxErr]));
-      for BinIdx := 0 to cBins - 1 do
+      for BinIdx := 0 to EqCBinsM1 do
       begin
         if MaxErr > cEps then
         begin
@@ -90273,7 +90281,7 @@ begin
     Result := Lines.Text;
   finally
     if Base <> nil then Base.Free;
-    for TIdx := 0 to cTransformCount - 1 do
+    for TIdx := 0 to TransformM1 do
       if TNet[TIdx] <> nil then TNet[TIdx].Free;
     Lines.Free;
   end;
@@ -90290,6 +90298,7 @@ const
   cTransformCount = 5; // identity, FlipX, FlipY, ReverseChannels, Roll(+1)
 var
   LpBnd242: integer;
+  TTATransformM1, LabelsM1, TTANumClassesM1, OutSizeM1: integer;
   Lines: TStringList;
   TName: array[0 .. cTransformCount - 1] of string;
   TNet: array[0 .. cTransformCount - 1 ] of TNNet;
@@ -90332,7 +90341,8 @@ begin
   Result := '';
   Lines := TStringList.Create();
   Avg := nil;
-  for TIdx := 0 to cTransformCount - 1 do TNet[TIdx] := nil;
+  TTATransformM1 := cTransformCount - 1;
+  for TIdx := 0 to TTATransformM1 do TNet[TIdx] := nil;
   try
     if NN = nil then
     begin
@@ -90361,30 +90371,33 @@ begin
     // NumClasses: from the final-layer output size, but at least 1 + max label.
     NN.Compute(pInput[0]);
     OutSize := NN.GetLastLayer.Output.Size;
+    OutSizeM1 := OutSize - 1;
     NumClasses := OutSize;
-    for I := 0 to Length(pLabels) - 1 do
+    LabelsM1 := Length(pLabels) - 1;
+    for I := 0 to LabelsM1 do
       if pLabels[I] + 1 > NumClasses then NumClasses := pLabels[I] + 1;
     if NumClasses < 1 then NumClasses := 1;
+    TTANumClassesM1 := NumClasses - 1;
 
     TName[0] := 'identity (baseline)';
     TName[1] := 'TNNetFlipX (mirror X)';
     TName[2] := 'TNNetFlipY (mirror Y)';
     TName[3] := 'TNNetReverseChannels';
     TName[4] := 'TNNetRoll(+1) (depth roll)';
-    for TIdx := 0 to cTransformCount - 1 do
+    for TIdx := 0 to TTATransformM1 do
       TNet[TIdx] := BuildTransformNet(TIdx, ShapeX, ShapeY, ShapeD);
 
     Avg := TNNetVolume.Create(OutSize, 1, 1);
     SetLength(ClassSupport, NumClasses);
     SetLength(ClassBaseCorrect, NumClasses);
     SetLength(ClassEnsCorrect, NumClasses);
-    for I := 0 to NumClasses - 1 do
+    for I := 0 to TTANumClassesM1 do
     begin
       ClassSupport[I] := 0;
       ClassBaseCorrect[I] := 0;
       ClassEnsCorrect[I] := 0;
     end;
-    for TIdx := 0 to cTransformCount - 1 do TransformCorrect[TIdx] := 0;
+    for TIdx := 0 to TTATransformM1 do TransformCorrect[TIdx] := 0;
     BaseCorrect := 0;
     EnsCorrect := 0;
     AgreeCount := 0;
@@ -90404,7 +90417,7 @@ begin
       Avg.Fill(0);
       BaseClass := -1;
 
-      for TIdx := 0 to cTransformCount - 1 do
+      for TIdx := 0 to TTATransformM1 do
       begin
         // T(x) via the wrapper net, then the classifier on the transformed
         // input. Identity (TIdx=0, TNet[0]=nil) feeds the raw input directly.
@@ -90437,13 +90450,13 @@ begin
         begin
           // numerically-stable softmax over the OutSize outputs.
           MaxV := Cur.Raw[0];
-          for I := 1 to OutSize - 1 do
+          for I := 1 to OutSizeM1 do
             if Cur.Raw[I] > MaxV then MaxV := Cur.Raw[I];
           SumExp := 0;
-          for I := 0 to OutSize - 1 do
+          for I := 0 to OutSizeM1 do
             SumExp := SumExp + pcr_expf(Cur.Raw[I] - MaxV);
           if SumExp <= 0 then SumExp := 1;
-          for I := 0 to OutSize - 1 do
+          for I := 0 to OutSizeM1 do
           begin
             E := pcr_expf(Cur.Raw[I] - MaxV) / SumExp;
             Avg.Raw[I] := Avg.Raw[I] + E;
@@ -90451,7 +90464,7 @@ begin
         end
         else
         begin
-          for I := 0 to OutSize - 1 do
+          for I := 0 to OutSizeM1 do
             Avg.Raw[I] := Avg.Raw[I] + Cur.Raw[I];
         end;
       end;
@@ -90492,7 +90505,7 @@ begin
     Lines.Add('Per-transform top-1 accuracy (each transform applied alone):');
     Lines.Add(Format('%-28s %12s', ['Transform', 'Top1-Acc']));
     Lines.Add(StringOfChar('-', 44));
-    for TIdx := 0 to cTransformCount - 1 do
+    for TIdx := 0 to TTATransformM1 do
     begin
       if UsedSamples > 0 then
         BaseAcc := TransformCorrect[TIdx] / UsedSamples
@@ -90521,7 +90534,7 @@ begin
     Lines.Add(Format('%-6s %8s %10s %10s %10s',
       ['Class', 'Support', 'Baseline', 'Ensemble', 'Delta']));
     Lines.Add(StringOfChar('-', 48));
-    for I := 0 to NumClasses - 1 do
+    for I := 0 to TTANumClassesM1 do
     begin
       if ClassSupport[I] > 0 then
       begin
@@ -90557,7 +90570,7 @@ begin
     Result := Lines.Text;
   finally
     if Avg <> nil then Avg.Free;
-    for TIdx := 0 to cTransformCount - 1 do
+    for TIdx := 0 to TTATransformM1 do
       if TNet[TIdx] <> nil then TNet[TIdx].Free;
     Lines.Free;
   end;
@@ -90572,6 +90585,7 @@ class function TNNet.AdversarialRobustnessReport(
 var
   LpBnd243: integer;
   LpBnd244: integer;
+  NM1, NEpsM1, NClassesM1, EpsListM1, EpsLenM1: integer;
   Lines: TStringList;
   N, NClasses, OutSize, NEps, MedianIdx: integer;
   I, J, E, c: integer;
@@ -90611,7 +90625,7 @@ var
   // into GradOut (assumed already sized to X).
   procedure InputLossGrad(X: TNNetVolume; TrueClass: integer; GradOut: TNNetVolume);
   var
-    Gi: integer;
+    Gi, GradOutM1: integer;
     Target: TNNetVolume;
     InLayer: TNNetLayer;
   begin
@@ -90632,8 +90646,11 @@ var
     InLayer := NN.Layers[0];
     if (InLayer.OutputError <> nil) and
        (InLayer.OutputError.Size = GradOut.Size) then
-      for Gi := 0 to GradOut.Size - 1 do
+    begin
+      GradOutM1 := GradOut.Size - 1;
+      for Gi := 0 to GradOutM1 do
         GradOut.Raw[Gi] := InLayer.OutputError.Raw[Gi];
+    end;
   end;
 
 begin
@@ -90677,10 +90694,12 @@ begin
     else
     begin
       SetLength(Eps, Length(EpsList));
-      for I := 0 to Length(EpsList) - 1 do Eps[I] := EpsList[I];
+      EpsListM1 := Length(EpsList) - 1;
+      for I := 0 to EpsListM1 do Eps[I] := EpsList[I];
     end;
     HaveZero := False;
-    for I := 0 to Length(Eps) - 1 do
+    EpsLenM1 := Length(Eps) - 1;
+    for I := 0 to EpsLenM1 do
       if Eps[I] = 0 then HaveZero := True;
     if not HaveZero then
     begin
@@ -90688,7 +90707,8 @@ begin
       Eps[High(Eps)] := 0;
     end;
     // insertion sort ascending
-    for I := 1 to Length(Eps) - 1 do
+    EpsLenM1 := Length(Eps) - 1;
+    for I := 1 to EpsLenM1 do
     begin
       Tmp := Eps[I]; J := I - 1;
       while (J >= 0) and (Eps[J] > Tmp) do
@@ -90716,8 +90736,11 @@ begin
     SetLength(Acc, NEps);
     SetLength(ClassTotal, NClasses);
     SetLength(ClassCorrect, NClasses);
-    for E := 0 to NEps - 1 do CorrectAtEps[E] := 0;
-    for c := 0 to NClasses - 1 do
+    NM1 := N - 1;
+    NEpsM1 := NEps - 1;
+    NClassesM1 := NClasses - 1;
+    for E := 0 to NEpsM1 do CorrectAtEps[E] := 0;
+    for c := 0 to NClassesM1 do
     begin
       ClassTotal[c] := 0; ClassCorrect[c] := 0;
     end;
@@ -90725,7 +90748,7 @@ begin
     Grad := TNNetVolume.Create(Samples[0]);
     Adv := TNNetVolume.Create(Samples[0]);
 
-    for I := 0 to N - 1 do
+    for I := 0 to NM1 do
     begin
       // Clean forward: record argmax and max-softmax confidence.
       NN.Compute(Samples[I]);
@@ -90740,7 +90763,7 @@ begin
       LpBnd243 := Grad.Size - 1;
       for J := 0 to LpBnd243 do Grad.Raw[J] := SignF(Grad.Raw[J]);
 
-      for E := 0 to NEps - 1 do
+      for E := 0 to NEpsM1 do
       begin
         // x_adv = x + eps * sign(grad); eps=0 reproduces the clean input.
         LpBnd244 := Adv.Size - 1;
@@ -90765,7 +90788,7 @@ begin
       end;
     end;
 
-    for E := 0 to NEps - 1 do Acc[E] := CorrectAtEps[E] / N;
+    for E := 0 to NEpsM1 do Acc[E] := CorrectAtEps[E] / N;
 
     // ---- Report ----
     Lines.Add('AdversarialRobustnessReport (FGSM, frozen network)');
@@ -90778,7 +90801,7 @@ begin
     // (a) accuracy degradation curve.
     Lines.Add('(a) top-1 accuracy vs eps (eps=0 is the clean baseline):');
     Lines.Add('      eps     accuracy   bar');
-    for E := 0 to NEps - 1 do
+    for E := 0 to NEpsM1 do
     begin
       BarLen := Round(Acc[E] * 40);
       if BarLen < 0 then BarLen := 0;
@@ -90796,7 +90819,7 @@ begin
     for Bin := 0 to 9 do Hist[Bin] := 0;
     Survived := 0; Flipped := 0;
     MinCrit := 1e30; MaxCrit := -1e30;
-    for I := 0 to N - 1 do
+    for I := 0 to NM1 do
       if CritEps[I] < 0 then Inc(Survived)
       else
       begin
@@ -90812,7 +90835,7 @@ begin
     else
     begin
       Span := MaxCrit - MinCrit;
-      for I := 0 to N - 1 do
+      for I := 0 to NM1 do
         if CritEps[I] >= 0 then
         begin
           if Span <= 0 then Bin := 0
@@ -90845,7 +90868,7 @@ begin
     begin
       // earliest = samples whose critical eps equals the smallest observed.
       EarlyEps := MinCrit;
-      for I := 0 to N - 1 do
+      for I := 0 to NM1 do
         if (CritEps[I] >= 0) and (CritEps[I] <= EarlyEps + 1e-12) then
         begin
           ConfEarly := ConfEarly + CleanConf[I]; Inc(CntEarly);
@@ -90854,7 +90877,7 @@ begin
     // longest survivors = samples that never flipped; if none, the highest crit.
     if Survived > 0 then
     begin
-      for I := 0 to N - 1 do
+      for I := 0 to NM1 do
         if CritEps[I] < 0 then
         begin
           ConfLate := ConfLate + CleanConf[I]; Inc(CntLate);
@@ -90863,7 +90886,7 @@ begin
     else if Flipped > 0 then
     begin
       LateEps := MaxCrit;
-      for I := 0 to N - 1 do
+      for I := 0 to NM1 do
         if (CritEps[I] >= 0) and (CritEps[I] >= LateEps - 1e-12) then
         begin
           ConfLate := ConfLate + CleanConf[I]; Inc(CntLate);
@@ -90884,7 +90907,7 @@ begin
     // (d) per-class accuracy at the median eps.
     Lines.Add(Format('(d) per-class top-1 accuracy at median eps=%.4f:',
       [Eps[MedianIdx]]));
-    for c := 0 to NClasses - 1 do
+    for c := 0 to NClassesM1 do
     begin
       if ClassTotal[c] > 0 then
         Lines.Add(Format('  class %3d  n=%4d  acc=%7.3f',
@@ -90990,6 +91013,8 @@ var
   TopVal: array of TNeuralFloat;
   TopIdx: array of integer;
   KeepK, TopCount, J, WorstPos: integer;
+  SmoothSamplesM1, NoisySizeM1, SaSizeXM1, SaSizeYM1, SaDepthM1: integer;
+  KeepKM1, TopCountM1, TopCountM2: integer;
   WorstVal, AbsV: TNeuralFloat;
   RowStr: string;
   BucketIdx: integer;
@@ -91030,7 +91055,7 @@ var
   procedure AccumLogitGrad(X: TNNetVolume; c: integer;
     AccGrad: TNNetVolume; out OutLogit: TNeuralFloat; Scale: TNeuralFloat);
   var
-    LastIdx, Gi: integer;
+    LastIdx, Gi, AccGradM1: integer;
     LastLayer, InLayer: TNNetLayer;
   begin
     OutLogit := 0;
@@ -91054,8 +91079,11 @@ var
     InLayer := NN.Layers[0];
     if (InLayer.OutputError <> nil) and
        (InLayer.OutputError.Size = AccGrad.Size) then
-      for Gi := 0 to AccGrad.Size - 1 do
+    begin
+      AccGradM1 := AccGrad.Size - 1;
+      for Gi := 0 to AccGradM1 do
         AccGrad.Raw[Gi] := AccGrad.Raw[Gi] + Scale * InLayer.OutputError.Raw[Gi];
+    end;
   end;
 
 begin
@@ -91090,6 +91118,9 @@ begin
     SizeX := Probe.SizeX;
     SizeY := Probe.SizeY;
     Depth := Probe.Depth;
+    SaSizeXM1 := SizeX - 1;
+    SaSizeYM1 := SizeY - 1;
+    SaDepthM1 := Depth - 1;
 
     // Read batch-update / delta state once so weights are never stepped.
     NN.SetBatchUpdate(true);
@@ -91134,11 +91165,13 @@ begin
     for I := 0 to LpBnd246 do Vanilla[I] := Abs(Grad.Raw[I]);
 
     // (b) SmoothGrad: average |grad| over SmoothSamples noisy copies.
-    for S := 0 to SmoothSamples - 1 do
+    SmoothSamplesM1 := SmoothSamples - 1;
+    NoisySizeM1 := Noisy.Size - 1;
+    for S := 0 to SmoothSamplesM1 do
     begin
       Noisy.Copy(Probe);
       if Sigma > 0 then
-        for I := 0 to Noisy.Size - 1 do
+        for I := 0 to NoisySizeM1 do
           Noisy.Raw[I] := Noisy.Raw[I] + Sigma * NextGaussian();
       Grad.Fill(0);
       AccumLogitGrad(Noisy, PredClass, Grad, LogitAtX, 1.0);
@@ -91196,11 +91229,11 @@ begin
     Lines.Add(StringOfChar('-', 72));
 
     // Heatmaps: one block per channel, per variant, normalised per channel.
-    for Ch := 0 to Depth - 1 do
+    for Ch := 0 to SaDepthM1 do
     begin
       ChMassV := 0; ChMassS := 0; ChMassI := 0;
-      for Py := 0 to SizeY - 1 do
-        for Px := 0 to SizeX - 1 do
+      for Py := 0 to SaSizeYM1 do
+        for Px := 0 to SaSizeXM1 do
         begin
           FlatIdx := (Py * SizeX + Px) * Depth + Ch;
           if FlatIdx < Probe.Size then
@@ -91216,18 +91249,18 @@ begin
 
       // (a) vanilla heatmap.
       MapMax := 0;
-      for Py := 0 to SizeY - 1 do
-        for Px := 0 to SizeX - 1 do
+      for Py := 0 to SaSizeYM1 do
+        for Px := 0 to SaSizeXM1 do
         begin
           FlatIdx := (Py * SizeX + Px) * Depth + Ch;
           if (FlatIdx < Probe.Size) and (Vanilla[FlatIdx] > MapMax) then
             MapMax := Vanilla[FlatIdx];
         end;
       Lines.Add('  (a) vanilla |d logit/dx|:');
-      for Py := 0 to SizeY - 1 do
+      for Py := 0 to SaSizeYM1 do
       begin
         RowStr := '    ';
-        for Px := 0 to SizeX - 1 do
+        for Px := 0 to SaSizeXM1 do
         begin
           FlatIdx := (Py * SizeX + Px) * Depth + Ch;
           if (MapMax > cEps) and (FlatIdx < Probe.Size) then
@@ -91243,18 +91276,18 @@ begin
 
       // (b) smoothgrad heatmap.
       MapMax := 0;
-      for Py := 0 to SizeY - 1 do
-        for Px := 0 to SizeX - 1 do
+      for Py := 0 to SaSizeYM1 do
+        for Px := 0 to SaSizeXM1 do
         begin
           FlatIdx := (Py * SizeX + Px) * Depth + Ch;
           if (FlatIdx < Probe.Size) and (Smooth[FlatIdx] > MapMax) then
             MapMax := Smooth[FlatIdx];
         end;
       Lines.Add('  (b) SmoothGrad:');
-      for Py := 0 to SizeY - 1 do
+      for Py := 0 to SaSizeYM1 do
       begin
         RowStr := '    ';
-        for Px := 0 to SizeX - 1 do
+        for Px := 0 to SaSizeXM1 do
         begin
           FlatIdx := (Py * SizeX + Px) * Depth + Ch;
           if (MapMax > cEps) and (FlatIdx < Probe.Size) then
@@ -91270,18 +91303,18 @@ begin
 
       // (c) integrated-gradients heatmap (by |IG|).
       MapMax := 0;
-      for Py := 0 to SizeY - 1 do
-        for Px := 0 to SizeX - 1 do
+      for Py := 0 to SaSizeYM1 do
+        for Px := 0 to SaSizeXM1 do
         begin
           FlatIdx := (Py * SizeX + Px) * Depth + Ch;
           if (FlatIdx < Probe.Size) and (Abs(Intg[FlatIdx]) > MapMax) then
             MapMax := Abs(Intg[FlatIdx]);
         end;
       Lines.Add('  (c) Integrated Gradients |IG|:');
-      for Py := 0 to SizeY - 1 do
+      for Py := 0 to SaSizeYM1 do
       begin
         RowStr := '    ';
-        for Px := 0 to SizeX - 1 do
+        for Px := 0 to SaSizeXM1 do
         begin
           FlatIdx := (Py * SizeX + Px) * Depth + Ch;
           if (MapMax > cEps) and (FlatIdx < Probe.Size) then
@@ -91297,11 +91330,12 @@ begin
 
       // Top-K most-attributing pixels of the vanilla map for this channel.
       KeepK := TopK;
+      KeepKM1 := KeepK - 1;
       SetLength(TopVal, KeepK);
       SetLength(TopIdx, KeepK);
       TopCount := 0;
-      for Py := 0 to SizeY - 1 do
-        for Px := 0 to SizeX - 1 do
+      for Py := 0 to SaSizeYM1 do
+        for Px := 0 to SaSizeXM1 do
         begin
           FlatIdx := (Py * SizeX + Px) * Depth + Ch;
           if FlatIdx >= Probe.Size then Continue;
@@ -91317,7 +91351,7 @@ begin
             // replace the current minimum if this one is larger.
             WorstPos := 0;
             WorstVal := TopVal[0];
-            for J := 1 to KeepK - 1 do
+            for J := 1 to KeepKM1 do
               if TopVal[J] < WorstVal then
               begin
                 WorstVal := TopVal[J];
@@ -91331,15 +91365,17 @@ begin
           end;
         end;
       // selection-sort the kept entries descending.
-      for I := 0 to TopCount - 2 do
-        for J := I + 1 to TopCount - 1 do
+      TopCountM2 := TopCount - 2;
+      TopCountM1 := TopCount - 1;
+      for I := 0 to TopCountM2 do
+        for J := I + 1 to TopCountM1 do
           if TopVal[J] > TopVal[I] then
           begin
             WorstVal := TopVal[I]; TopVal[I] := TopVal[J]; TopVal[J] := WorstVal;
             WorstPos := TopIdx[I]; TopIdx[I] := TopIdx[J]; TopIdx[J] := WorstPos;
           end;
       RowStr := Format('  top-%d |grad| pixels (x,y)=val:', [TopCount]);
-      for I := 0 to TopCount - 1 do
+      for I := 0 to TopCountM1 do
       begin
         FlatIdx := TopIdx[I];
         Px := (FlatIdx div Depth) mod SizeX;
@@ -91383,6 +91419,7 @@ var
   ConvLayer: TNNetLayer;
   CSizeX, CSizeY, CDepth: integer;
   ISizeX, ISizeY: integer;
+  CamSizeM1, CDepthM1, CSizeXM1, CSizeYM1, ISizeXM1, ISizeYM1: integer;
   Cam: array of TNeuralFloat;           // coarse map, size CSizeX*CSizeY
   Alpha: TNeuralFloat;
   k, x, y, fi, BucketIdx: integer;
@@ -91481,37 +91518,43 @@ begin
     CDepth := ConvLayer.Output.Depth;
     ISizeX := Probe.SizeX;
     ISizeY := Probe.SizeY;
+    CamSizeM1 := CSizeX * CSizeY - 1;
+    CDepthM1 := CDepth - 1;
+    CSizeXM1 := CSizeX - 1;
+    CSizeYM1 := CSizeY - 1;
+    ISizeXM1 := ISizeX - 1;
+    ISizeYM1 := ISizeY - 1;
 
     SetLength(Cam, CSizeX * CSizeY);
-    for fi := 0 to CSizeX * CSizeY - 1 do Cam[fi] := 0;
+    for fi := 0 to CamSizeM1 do Cam[fi] := 0;
 
     // L_xy = ReLU( sum_k alpha_k * A^k_xy ),  alpha_k = mean_xy dlogit/dA^k.
-    for k := 0 to CDepth - 1 do
+    for k := 0 to CDepthM1 do
     begin
       gsum := 0;
-      for y := 0 to CSizeY - 1 do
-        for x := 0 to CSizeX - 1 do
+      for y := 0 to CSizeYM1 do
+        for x := 0 to CSizeXM1 do
           gsum := gsum + ConvLayer.OutputError[x, y, k];
       Alpha := gsum / (CSizeX * CSizeY);
-      for y := 0 to CSizeY - 1 do
-        for x := 0 to CSizeX - 1 do
+      for y := 0 to CSizeYM1 do
+        for x := 0 to CSizeXM1 do
           Cam[y * CSizeX + x] := Cam[y * CSizeX + x] +
             Alpha * ConvLayer.Output[x, y, k];
     end;
     // ReLU + normalise to [0,1].
     CamMax := 0;
-    for fi := 0 to CSizeX * CSizeY - 1 do
+    for fi := 0 to CamSizeM1 do
     begin
       if Cam[fi] < 0 then Cam[fi] := 0;
       if Cam[fi] > CamMax then CamMax := Cam[fi];
     end;
     if CamMax > cEps then
-      for fi := 0 to CSizeX * CSizeY - 1 do Cam[fi] := Cam[fi] / CamMax;
+      for fi := 0 to CamSizeM1 do Cam[fi] := Cam[fi] / CamMax;
 
     // Peak coarse cell.
     PeakX := 0; PeakY := 0; PeakVal := -1;
-    for y := 0 to CSizeY - 1 do
-      for x := 0 to CSizeX - 1 do
+    for y := 0 to CSizeYM1 do
+      for x := 0 to CSizeXM1 do
         if Cam[y * CSizeX + x] > PeakVal then
         begin
           PeakVal := Cam[y * CSizeX + x];
@@ -91531,10 +91574,10 @@ begin
     Lines.Add(StringOfChar('-', 72));
 
     Lines.Add(Format('Coarse Grad-CAM map (%dx%d):', [CSizeX, CSizeY]));
-    for y := 0 to CSizeY - 1 do
+    for y := 0 to CSizeYM1 do
     begin
       RowStr := '    ';
-      for x := 0 to CSizeX - 1 do
+      for x := 0 to CSizeXM1 do
       begin
         v := Cam[y * CSizeX + x];
         BucketIdx := Trunc(v * (Length(cBuckets) - 1) + 0.5);
@@ -91548,12 +91591,12 @@ begin
     // Nearest-upsample the coarse map to the input plane for overlay.
     Lines.Add(Format('Nearest-upsampled to input plane (%dx%d):',
       [ISizeX, ISizeY]));
-    for uy := 0 to ISizeY - 1 do
+    for uy := 0 to ISizeYM1 do
     begin
       RowStr := '    ';
       sy := (uy * CSizeY) div ISizeY;
       if sy > CSizeY - 1 then sy := CSizeY - 1;
-      for ux := 0 to ISizeX - 1 do
+      for ux := 0 to ISizeXM1 do
       begin
         sx := (ux * CSizeX) div ISizeX;
         if sx > CSizeX - 1 then sx := CSizeX - 1;
@@ -91593,6 +91636,7 @@ const
   cBuckets = ' .:-=+*#%@';   // 10 intensity buckets (index 0 = blank/zero)
 var
   LpBnd251: integer;
+  RLayerM1, RinM1: integer;
   Beta: TNeuralFloat;
   zPos, zNeg, cPos, cNeg, wEff: TNeuralFloat;
   RuleName: string;
@@ -91700,7 +91744,8 @@ begin
     for LIdx := 0 to LastIdx do
     begin
       SetLength(R[LIdx], NN.Layers[LIdx].Output.Size);
-      for i := 0 to Length(R[LIdx]) - 1 do R[LIdx][i] := 0;
+      RLayerM1 := Length(R[LIdx]) - 1;
+      for i := 0 to RLayerM1 do R[LIdx][i] := 0;
     end;
 
     // Seed: relevance of the explained logit at the last layer = its value.
@@ -91729,7 +91774,8 @@ begin
       Layer := NN.Layers[LIdx];
       PrevLayer := Layer.PrevLayer;
       SetLength(Rin, PrevLayer.Output.Size);
-      for i := 0 to Length(Rin) - 1 do Rin[i] := 0;
+      RinM1 := Length(Rin) - 1;
+      for i := 0 to RinM1 do Rin[i] := 0;
 
       IsDense := IsEpsRuleDense(Layer);
       Handled := IsDense or IsPassThrough(Layer);
@@ -91748,7 +91794,7 @@ begin
               // gamma-rule: effective weight w -> w + gamma*w+. Bias is mapped
               // through the SAME gamma transform so conservation holds exactly.
               zPos := Neuron.Bias + Gamma * Max(Neuron.Bias, 0);
-              for i := 0 to Length(Rin) - 1 do
+              for i := 0 to RinM1 do
               begin
                 ai := PrevLayer.Output.Raw[i];
                 wij := Neuron.Weights.Raw[i];
@@ -91758,7 +91804,7 @@ begin
               if zPos >= 0 then sgn := 1 else sgn := -1;
               denom := zPos + Eps * sgn;
               if denom = 0 then denom := Eps;
-              for i := 0 to Length(Rin) - 1 do
+              for i := 0 to RinM1 do
               begin
                 ai := PrevLayer.Output.Raw[i];
                 wij := Neuron.Weights.Raw[i];
@@ -91773,13 +91819,13 @@ begin
               // Bias is folded into both z+ and z- by its sign.
               zPos := Max(Neuron.Bias, 0);
               zNeg := Max(-Neuron.Bias, 0);
-              for i := 0 to Length(Rin) - 1 do
+              for i := 0 to RinM1 do
               begin
                 cPos := PrevLayer.Output.Raw[i] * Neuron.Weights.Raw[i];
                 if cPos > 0 then zPos := zPos + cPos
                 else zNeg := zNeg - cPos;
               end;
-              for i := 0 to Length(Rin) - 1 do
+              for i := 0 to RinM1 do
               begin
                 cPos := PrevLayer.Output.Raw[i] * Neuron.Weights.Raw[i];
                 cNeg := 0;
@@ -91793,12 +91839,12 @@ begin
           else
             // lrpEpsilon: z-rule stabilised by eps*sign(z_j).
             z := Neuron.Bias;
-            for i := 0 to Length(Rin) - 1 do
+            for i := 0 to RinM1 do
               z := z + PrevLayer.Output.Raw[i] * Neuron.Weights.Raw[i];
             if z >= 0 then sgn := 1 else sgn := -1;
             denom := z + Eps * sgn;
             if denom = 0 then denom := Eps;  // last-resort guard
-            for i := 0 to Length(Rin) - 1 do
+            for i := 0 to RinM1 do
             begin
               ai := PrevLayer.Output.Raw[i];
               wij := Neuron.Weights.Raw[i];
