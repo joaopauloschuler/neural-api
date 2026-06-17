@@ -33596,29 +33596,34 @@ procedure TEnCodecModel.DecodeCodesToAudio(const Codes: TNNetIntArr2D;
 var
   Sig, Nxt: TNNetFloatDynArr2D;
   s, q, t, d, Dm, Frames, NQ, code: integer;
+  DmM1, FramesM1, NQM1, DecStagesM1, SigLenM1: integer;
 begin
   Dm := FConfig.HiddenSize;
+  DmM1 := Dm - 1;
   NQ := Length(Codes);
   if (UseQuantizers > 0) and (UseQuantizers < NQ) then NQ := UseQuantizers;
   if NQ > Length(FCodebooks) then NQ := Length(FCodebooks);
+  NQM1 := NQ - 1;
   Frames := 0;
   if Length(Codes) > 0 then Frames := Length(Codes[0]);
+  FramesM1 := Frames - 1;
   // RVQ decode: latent = sum over stages of embed[code].
   SetLength(Sig, Dm);
-  for d := 0 to Dm - 1 do
+  for d := 0 to DmM1 do
   begin
     SetLength(Sig[d], Frames);
-    for t := 0 to Frames - 1 do Sig[d][t] := 0;
+    for t := 0 to FramesM1 do Sig[d][t] := 0;
   end;
-  for q := 0 to NQ - 1 do
-    for t := 0 to Frames - 1 do
+  for q := 0 to NQM1 do
+    for t := 0 to FramesM1 do
     begin
       code := Codes[q][t];
-      for d := 0 to Dm - 1 do
+      for d := 0 to DmM1 do
         Sig[d][t] := Sig[d][t] + FCodebooks[q].Data[code * Dm + d];
     end;
   // Run the decoder stages.
-  for s := 0 to Length(FDecStages) - 1 do
+  DecStagesM1 := Length(FDecStages) - 1;
+  for s := 0 to DecStagesM1 do
   begin
     if FDecStages[s].Kind = eskLSTM then
       RunEnCodecLSTM(FDecLSTM, Sig)
@@ -33630,7 +33635,8 @@ begin
   end;
   // Mono output.
   SetLength(Waveform, Length(Sig[0]));
-  for t := 0 to Length(Sig[0]) - 1 do Waveform[t] := Sig[0][t];
+  SigLenM1 := Length(Sig[0]) - 1;
+  for t := 0 to SigLenM1 do Waveform[t] := Sig[0][t];
 end;
 
 procedure TEnCodecModel.Reconstruct(const Waveform: array of TNeuralFloat;
@@ -33649,6 +33655,7 @@ var
   Model: TEnCodecModel;
   Consumed: TStringList;
   Idx, r, j, dim, NumRatios, ratio, dil, NQ, ScalePow: integer;
+  NumRatiosM1, NumResLayM1, NQM1: integer;
   EncStages, DecStages: array of TEnCodecStage;
   EncCnt, DecCnt: integer;
   Pref: string;
@@ -33706,10 +33713,13 @@ begin
         'tensors found in ' + Reader.FileName + ' - not an EnCodec ' +
         'checkpoint?');
     Config.NumQuantizers := NQ;
+    NQM1 := NQ - 1;
 
     Model := TEnCodecModel.Create(Config);
     EncCnt := 0; DecCnt := 0;
     NumRatios := Length(Config.UpsamplingRatios);
+    NumRatiosM1 := NumRatios - 1;
+    NumResLayM1 := Config.NumResidualLayers - 1;
 
     // ---------------- ENCODER stage list (matching HF nn.ModuleList) ------
     // layer 0: Conv(audio_channels -> num_filters, kernel_size)
@@ -33722,7 +33732,7 @@ begin
     for r := NumRatios - 1 downto 0 do
     begin
       ratio := Config.UpsamplingRatios[r];
-      for j := 0 to Config.NumResidualLayers - 1 do
+      for j := 0 to NumResLayM1 do
       begin
         dil := Round(IntPower(Config.DilationGrowthRate, j));
         PushEnc(MakeResnetStage('encoder.layers.' + IntToStr(Idx), dim,
@@ -33749,14 +33759,14 @@ begin
     PushDec(MakeConvStage('decoder.layers.0.conv', False, 1, 1));
     Idx := 1;
     ScalePow := 1;
-    for j := 0 to NumRatios - 1 do ScalePow := ScalePow * 2;
+    for j := 0 to NumRatiosM1 do ScalePow := ScalePow * 2;
     dim := ScalePow * Config.NumFilters;
     // LSTM stage (decoder layer 1)
     LoadEnCodecLSTM(Reader, 'decoder.layers.' + IntToStr(Idx) + '.lstm',
       Model.FDecLSTM, Config.NumLSTMLayers, Consumed);
     PushDec(MakeELU); DecStages[DecCnt - 1].Kind := eskLSTM;
     Inc(Idx);
-    for r := 0 to NumRatios - 1 do
+    for r := 0 to NumRatiosM1 do
     begin
       ratio := Config.UpsamplingRatios[r];
       PushDec(MakeELU); Inc(Idx);
@@ -33765,7 +33775,7 @@ begin
         True, ratio, 1));
       Inc(Idx);
       dim := dim div 2;
-      for j := 0 to Config.NumResidualLayers - 1 do
+      for j := 0 to NumResLayM1 do
       begin
         dil := Round(IntPower(Config.DilationGrowthRate, j));
         PushDec(MakeResnetStage('decoder.layers.' + IntToStr(Idx), dim,
@@ -33784,7 +33794,7 @@ begin
 
     // ---------------- RVQ codebooks ----------------
     SetLength(Model.FCodebooks, NQ);
-    for j := 0 to NQ - 1 do
+    for j := 0 to NQM1 do
     begin
       Pref := 'quantizer.layers.' + IntToStr(j) + '.codebook.';
       LoadEnCodecMat(Reader, Pref + 'embed', Model.FCodebooks[j], Consumed);
@@ -33921,7 +33931,7 @@ begin
       Result.UpsamplingRatios[I] := Arr.Integers[I];
     // encodec_frame_rate = sampling_rate / prod(ratios).
     RatiosProd := 1;
-    for I := 0 to Length(Result.UpsamplingRatios) - 1 do
+    for I := 0 to LpMax do
       RatiosProd := RatiosProd * Result.UpsamplingRatios[I];
     Result.EncodecFrameRate := Result.SamplingRate / RatiosProd;
     if not Result.UseCausalConv then
@@ -33935,10 +33945,12 @@ end;
 function MimiConfigToString(const Config: TMimiConfig): string;
 var
   I: integer;
+  RatiosM1: integer;
   Ratios: string;
 begin
   Ratios := '[';
-  for I := 0 to Length(Config.UpsamplingRatios) - 1 do
+  RatiosM1 := Length(Config.UpsamplingRatios) - 1;
+  for I := 0 to RatiosM1 do
   begin
     if I > 0 then Ratios := Ratios + ',';
     Ratios := Ratios + IntToStr(Config.UpsamplingRatios[I]);
@@ -34046,7 +34058,7 @@ procedure LoadMimiConv(Reader: TNNetSafeTensorsReader;
 var
   LpMax: integer;
   W: TNNetVolume;
-  D0, D1, K, o, i: integer;
+  D0, D1, K, o, i, OutChM1: integer;
 begin
   W := TNNetVolume.Create;
   try
@@ -34088,7 +34100,8 @@ begin
     else
     begin
       SetLength(Conv.B, Conv.OutCh);
-      for o := 0 to Conv.OutCh - 1 do Conv.B[o] := 0;
+      OutChM1 := Conv.OutCh - 1;
+      for o := 0 to OutChM1 do Conv.B[o] := 0;
     end;
     i := i; // silence unused
   finally
@@ -34105,6 +34118,8 @@ var
   InCh, OutCh, K, Stride, Dil, InLen, o, i, t, k2, src, EffK: integer;
   PadTotal, Extra, NFrames, OutLen, idx, FullLen, PadRight, G: integer;
   IPG, OPG, gi, ci, co, grp: integer;
+  InChM1, OutChM1, KM1, GM1, InLenM1, PadTotalM1, ExtraM1: integer;
+  OutLenM1, IPGM1, OPGM1, FullLenM1: integer;
   Acc: double;
   Padded, Full: TMimiDblArr2D;
 begin
@@ -34116,6 +34131,11 @@ begin
   G := Conv.Groups;
   if G < 1 then G := 1;
   InLen := Length(InSig[0]);
+  InChM1 := InCh - 1;
+  OutChM1 := OutCh - 1;
+  KM1 := K - 1;
+  GM1 := G - 1;
+  InLenM1 := InLen - 1;
   if not Conv.Transpose then
   begin
     EffK := (K - 1) * Dil + 1;
@@ -34123,18 +34143,20 @@ begin
     NFrames := Ceil((InLen - EffK + PadTotal) / Stride + 1) - 1;
     Extra := NFrames * Stride + EffK - PadTotal - InLen;
     if Extra < 0 then Extra := 0;
+    PadTotalM1 := PadTotal - 1;
+    ExtraM1 := Extra - 1;
     SetLength(Padded, InCh);
-    for i := 0 to InCh - 1 do
+    for i := 0 to InChM1 do
     begin
       SetLength(Padded[i], PadTotal + InLen + Extra);
       // Causal left pad (PadTotal frames) + extra right pad.
-      for t := 0 to PadTotal - 1 do
+      for t := 0 to PadTotalM1 do
       begin
         if Conv.PadMode = 'replicate' then Padded[i][t] := InSig[i][0]
         else Padded[i][t] := 0; // 'constant'
       end;
-      for t := 0 to InLen - 1 do Padded[i][PadTotal + t] := InSig[i][t];
-      for t := 0 to Extra - 1 do
+      for t := 0 to InLenM1 do Padded[i][PadTotal + t] := InSig[i][t];
+      for t := 0 to ExtraM1 do
       begin
         if Conv.PadMode = 'replicate' then
           Padded[i][PadTotal + InLen + t] := InSig[i][InLen - 1]
@@ -34146,18 +34168,21 @@ begin
     if OutLen < 0 then OutLen := 0;
     IPG := InCh div G;
     OPG := OutCh div G;
+    OutLenM1 := OutLen - 1;
+    IPGM1 := IPG - 1;
+    OPGM1 := OPG - 1;
     SetLength(OutSig, OutCh);
-    for o := 0 to OutCh - 1 do
+    for o := 0 to OutChM1 do
     begin
       SetLength(OutSig[o], OutLen);
       grp := o div OPG;
-      for t := 0 to OutLen - 1 do
+      for t := 0 to OutLenM1 do
       begin
         Acc := Conv.B[o];
-        for gi := 0 to IPG - 1 do
+        for gi := 0 to IPGM1 do
         begin
           i := grp * IPG + gi;
-          for k2 := 0 to K - 1 do
+          for k2 := 0 to KM1 do
           begin
             src := t * Stride + k2 * Dil;
             // Conv1d weight [Out, In/groups, K]: W[o*IPG*K + gi*K + k2].
@@ -34175,21 +34200,24 @@ begin
     FullLen := (InLen - 1) * Stride + K;
     IPG := InCh div G;
     OPG := OutCh div G;
+    FullLenM1 := FullLen - 1;
+    IPGM1 := IPG - 1;
+    OPGM1 := OPG - 1;
     SetLength(Full, OutCh);
-    for o := 0 to OutCh - 1 do
+    for o := 0 to OutChM1 do
     begin
       SetLength(Full[o], FullLen);
-      for t := 0 to FullLen - 1 do Full[o][t] := 0;
+      for t := 0 to FullLenM1 do Full[o][t] := 0;
     end;
-    for grp := 0 to G - 1 do
-      for gi := 0 to IPG - 1 do
+    for grp := 0 to GM1 do
+      for gi := 0 to IPGM1 do
       begin
         ci := grp * IPG + gi;
-        for t := 0 to InLen - 1 do
-          for o := 0 to OPG - 1 do
+        for t := 0 to InLenM1 do
+          for o := 0 to OPGM1 do
           begin
             co := grp * OPG + o;
-            for k2 := 0 to K - 1 do
+            for k2 := 0 to KM1 do
             begin
               idx := t * Stride + k2;
               // W[ci, o, k2] = W[ci*OPG*K + o*K + k2].
@@ -34198,18 +34226,19 @@ begin
             end;
           end;
       end;
-    for o := 0 to OutCh - 1 do
-      for t := 0 to FullLen - 1 do Full[o][t] := Full[o][t] + Conv.B[o];
+    for o := 0 to OutChM1 do
+      for t := 0 to FullLenM1 do Full[o][t] := Full[o][t] + Conv.B[o];
     // Causal right-trim: padding_right = K - stride (trim_right_ratio 1.0),
     // padding_left = 0.
     PadRight := K - Stride;
     OutLen := FullLen - PadRight;
     if OutLen < 0 then OutLen := 0;
+    OutLenM1 := OutLen - 1;
     SetLength(OutSig, OutCh);
-    for o := 0 to OutCh - 1 do
+    for o := 0 to OutChM1 do
     begin
       SetLength(OutSig[o], OutLen);
-      for t := 0 to OutLen - 1 do OutSig[o][t] := Full[o][t];
+      for t := 0 to OutLenM1 do OutSig[o][t] := Full[o][t];
     end;
   end;
 end;
@@ -34261,6 +34290,7 @@ procedure LoadMimiCodebook(Reader: TNNetSafeTensorsReader;
 var
   ES, CU: TNNetVolume;
   K, D, r, c: integer;
+  KM1, DM1: integer;
   denom: TNeuralFloat;
 begin
   ES := TNNetVolume.Create;
@@ -34278,11 +34308,13 @@ begin
     Mat.Rows := K;
     Mat.Cols := D;
     SetLength(Mat.Data, K * D);
-    for r := 0 to K - 1 do
+    KM1 := K - 1;
+    DM1 := D - 1;
+    for r := 0 to KM1 do
     begin
       denom := CU.FData[r];
       if denom < Eps then denom := Eps;
-      for c := 0 to D - 1 do
+      for c := 0 to DM1 do
         Mat.Data[r * D + c] := ES.FData[r * D + c] / denom;
     end;
   finally
@@ -34312,8 +34344,10 @@ end;
 procedure ApplyMimiELU(var Sig: TMimiDblArr2D);
 var
   c, t: integer;
+  SigM1: integer;
 begin
-  for c := 0 to Length(Sig) - 1 do
+  SigM1 := Length(Sig) - 1;
+  for c := 0 to SigM1 do
     for t := 0 to Length(Sig[c]) - 1 do
       if Sig[c][t] <= 0 then Sig[c][t] := Exp(Sig[c][t]) - 1;
 end;
@@ -34324,6 +34358,7 @@ procedure TNNetMimi.RunTransformer(
   const Layers: array of TMimiTransformerLayer; var Sig: TMimiDblArr2D);
 var
   D, T, NH, NKV, Dh, FFN, L, h, t1, t2, dd, gidx, kvh, NRep, half: integer;
+  TM1, DM1, halfM1, DhM1, NHM1, NKVM1, FFNM1, NHDhM1, NKVDhM1, LayersM1: integer;
   Theta, Scaling, eps, m, v, e, denom, sc, mx, qr, kr: double;
   X, Hn, Q, Kk, Vv, Attn, Mlp1: array of array of double; // [T][feature]
   cosv, sinv, invfreq: array of double;
@@ -34341,67 +34376,77 @@ begin
   Scaling := 1.0 / Sqrt(Dh);
   NRep := NH div NKV;
   half := Dh div 2;
+  TM1 := T - 1;
+  DM1 := D - 1;
+  halfM1 := half - 1;
+  DhM1 := Dh - 1;
+  NHM1 := NH - 1;
+  NKVM1 := NKV - 1;
+  FFNM1 := FFN - 1;
+  NHDhM1 := NH * Dh - 1;
+  NKVDhM1 := NKV * Dh - 1;
+  LayersM1 := Length(Layers) - 1;
   // X[t][d] row-major copy of the signal.
   SetLength(X, T);
-  for t1 := 0 to T - 1 do
+  for t1 := 0 to TM1 do
   begin
     SetLength(X[t1], D);
-    for dd := 0 to D - 1 do X[t1][dd] := Sig[dd][t1];
+    for dd := 0 to DM1 do X[t1][dd] := Sig[dd][t1];
   end;
   // Precompute inv_freq for RoPE (head_dim).
   SetLength(invfreq, half);
-  for dd := 0 to half - 1 do
+  for dd := 0 to halfM1 do
     invfreq[dd] := 1.0 / Power(Theta, (2.0 * dd) / Dh);
 
-  for L := 0 to Length(Layers) - 1 do
+  for L := 0 to LayersM1 do
   begin
     // ---- input LayerNorm ----
     SetLength(Hn, T);
-    for t1 := 0 to T - 1 do
+    for t1 := 0 to TM1 do
     begin
       SetLength(Hn[t1], D);
       m := 0;
-      for dd := 0 to D - 1 do m := m + X[t1][dd];
+      for dd := 0 to DM1 do m := m + X[t1][dd];
       m := m / D;
       v := 0;
-      for dd := 0 to D - 1 do v := v + Sqr(X[t1][dd] - m);
+      for dd := 0 to DM1 do v := v + Sqr(X[t1][dd] - m);
       v := v / D;
       denom := Sqrt(v + eps);
-      for dd := 0 to D - 1 do
+      for dd := 0 to DM1 do
         Hn[t1][dd] := (X[t1][dd] - m) / denom * Layers[L].LnInG[dd] +
           Layers[L].LnInB[dd];
     end;
     // ---- Q,K,V projections (rows = out, cols = in) ----
     SetLength(Q, T); SetLength(Kk, T); SetLength(Vv, T);
-    for t1 := 0 to T - 1 do
+    for t1 := 0 to TM1 do
     begin
       SetLength(Q[t1], NH * Dh);
       SetLength(Kk[t1], NKV * Dh);
       SetLength(Vv[t1], NKV * Dh);
-      for gidx := 0 to NH * Dh - 1 do
+      for gidx := 0 to NHDhM1 do
       begin
         sc := 0;
-        for dd := 0 to D - 1 do sc := sc + Layers[L].Wq.Data[gidx * D + dd] * Hn[t1][dd];
+        for dd := 0 to DM1 do sc := sc + Layers[L].Wq.Data[gidx * D + dd] * Hn[t1][dd];
         if Length(Layers[L].Bq) > 0 then sc := sc + Layers[L].Bq[gidx];
         Q[t1][gidx] := sc;
       end;
-      for gidx := 0 to NKV * Dh - 1 do
+      for gidx := 0 to NKVDhM1 do
       begin
         sc := 0;
-        for dd := 0 to D - 1 do sc := sc + Layers[L].Wk.Data[gidx * D + dd] * Hn[t1][dd];
+        for dd := 0 to DM1 do sc := sc + Layers[L].Wk.Data[gidx * D + dd] * Hn[t1][dd];
         if Length(Layers[L].Bk) > 0 then sc := sc + Layers[L].Bk[gidx];
         Kk[t1][gidx] := sc;
         sc := 0;
-        for dd := 0 to D - 1 do sc := sc + Layers[L].Wv.Data[gidx * D + dd] * Hn[t1][dd];
+        for dd := 0 to DM1 do sc := sc + Layers[L].Wv.Data[gidx * D + dd] * Hn[t1][dd];
         if Length(Layers[L].Bv) > 0 then sc := sc + Layers[L].Bv[gidx];
         Vv[t1][gidx] := sc;
       end;
     end;
     // ---- apply RoPE to Q and K (per head, rotate_half convention) ----
-    for t1 := 0 to T - 1 do
+    for t1 := 0 to TM1 do
     begin
       SetLength(cosv, Dh); SetLength(sinv, Dh);
-      for dd := 0 to half - 1 do
+      for dd := 0 to halfM1 do
       begin
         cosv[dd] := Cos(t1 * invfreq[dd]);
         cosv[dd + half] := cosv[dd];
@@ -34412,19 +34457,19 @@ begin
       // Orig before writing back (an in-place rotation would feed the already
       // rotated first half into the second half).
       SetLength(Orig, Dh);
-      for h := 0 to NH - 1 do
+      for h := 0 to NHM1 do
       begin
-        for dd := 0 to Dh - 1 do Orig[dd] := Q[t1][h * Dh + dd];
-        for dd := 0 to Dh - 1 do
+        for dd := 0 to DhM1 do Orig[dd] := Q[t1][h * Dh + dd];
+        for dd := 0 to DhM1 do
         begin
           if dd < half then qr := -Orig[dd + half] else qr := Orig[dd - half];
           Q[t1][h * Dh + dd] := Orig[dd] * cosv[dd] + qr * sinv[dd];
         end;
       end;
-      for h := 0 to NKV - 1 do
+      for h := 0 to NKVM1 do
       begin
-        for dd := 0 to Dh - 1 do Orig[dd] := Kk[t1][h * Dh + dd];
-        for dd := 0 to Dh - 1 do
+        for dd := 0 to DhM1 do Orig[dd] := Kk[t1][h * Dh + dd];
+        for dd := 0 to DhM1 do
         begin
           if dd < half then kr := -Orig[dd + half] else kr := Orig[dd - half];
           Kk[t1][h * Dh + dd] := Orig[dd] * cosv[dd] + kr * sinv[dd];
@@ -34433,12 +34478,12 @@ begin
     end;
     // ---- causal attention per head (GQA: head h uses kv head h div NRep) ----
     SetLength(Attn, T);
-    for t1 := 0 to T - 1 do SetLength(Attn[t1], NH * Dh);
+    for t1 := 0 to TM1 do SetLength(Attn[t1], NH * Dh);
     SetLength(AccVec, Dh);
-    for h := 0 to NH - 1 do
+    for h := 0 to NHM1 do
     begin
       kvh := h div NRep;
-      for t1 := 0 to T - 1 do
+      for t1 := 0 to TM1 do
       begin
         // scores over keys 0..t1 (causal); sliding window optional.
         mx := -1e30;
@@ -34447,37 +34492,37 @@ begin
           if (FConfig.SlidingWindow > 0) and (t1 - t2 >= FConfig.SlidingWindow) then
             Continue;
           sc := 0;
-          for dd := 0 to Dh - 1 do
+          for dd := 0 to DhM1 do
             sc := sc + Q[t1][h * Dh + dd] * Kk[t2][kvh * Dh + dd];
           sc := sc * Scaling;
           if sc > mx then mx := sc;
         end;
         denom := 0;
-        for dd := 0 to Dh - 1 do AccVec[dd] := 0;
+        for dd := 0 to DhM1 do AccVec[dd] := 0;
         for t2 := 0 to t1 do
         begin
           if (FConfig.SlidingWindow > 0) and (t1 - t2 >= FConfig.SlidingWindow) then
             Continue;
           sc := 0;
-          for dd := 0 to Dh - 1 do
+          for dd := 0 to DhM1 do
             sc := sc + Q[t1][h * Dh + dd] * Kk[t2][kvh * Dh + dd];
           sc := sc * Scaling;
           e := Exp(sc - mx);
           denom := denom + e;
-          for dd := 0 to Dh - 1 do
+          for dd := 0 to DhM1 do
             AccVec[dd] := AccVec[dd] + e * Vv[t2][kvh * Dh + dd];
         end;
-        for dd := 0 to Dh - 1 do
+        for dd := 0 to DhM1 do
           Attn[t1][h * Dh + dd] := AccVec[dd] / denom;
       end;
     end;
     // ---- output projection + LayerScale residual ----
-    for t1 := 0 to T - 1 do
+    for t1 := 0 to TM1 do
     begin
-      for dd := 0 to D - 1 do
+      for dd := 0 to DM1 do
       begin
         sc := 0;
-        for gidx := 0 to NH * Dh - 1 do
+        for gidx := 0 to NHDhM1 do
           sc := sc + Layers[L].Wo.Data[dd * (NH * Dh) + gidx] * Attn[t1][gidx];
         if Length(Layers[L].Bo) > 0 then sc := sc + Layers[L].Bo[dd];
         X[t1][dd] := X[t1][dd] + Layers[L].AttnScale[dd] * sc;
@@ -34485,41 +34530,41 @@ begin
     end;
     // ---- post-attention LayerNorm + GELU MLP + LayerScale residual ----
     SetLength(Mlp1, T);
-    for t1 := 0 to T - 1 do
+    for t1 := 0 to TM1 do
     begin
       // post LN
       m := 0;
-      for dd := 0 to D - 1 do m := m + X[t1][dd];
+      for dd := 0 to DM1 do m := m + X[t1][dd];
       m := m / D;
       v := 0;
-      for dd := 0 to D - 1 do v := v + Sqr(X[t1][dd] - m);
+      for dd := 0 to DM1 do v := v + Sqr(X[t1][dd] - m);
       v := v / D;
       denom := Sqrt(v + eps);
       SetLength(Hn[t1], D);
-      for dd := 0 to D - 1 do
+      for dd := 0 to DM1 do
         Hn[t1][dd] := (X[t1][dd] - m) / denom * Layers[L].LnPostG[dd] +
           Layers[L].LnPostB[dd];
       // fc1 -> GELU
       SetLength(Mlp1[t1], FFN);
-      for gidx := 0 to FFN - 1 do
+      for gidx := 0 to FFNM1 do
       begin
         sc := 0;
-        for dd := 0 to D - 1 do sc := sc + Layers[L].Fc1.Data[gidx * D + dd] * Hn[t1][dd];
+        for dd := 0 to DM1 do sc := sc + Layers[L].Fc1.Data[gidx * D + dd] * Hn[t1][dd];
         Mlp1[t1][gidx] := MimiGELU(sc);
       end;
       // fc2 -> residual
-      for dd := 0 to D - 1 do
+      for dd := 0 to DM1 do
       begin
         sc := 0;
-        for gidx := 0 to FFN - 1 do
+        for gidx := 0 to FFNM1 do
           sc := sc + Layers[L].Fc2.Data[dd * FFN + gidx] * Mlp1[t1][gidx];
         X[t1][dd] := X[t1][dd] + Layers[L].MlpScale[dd] * sc;
       end;
     end;
   end;
   // write back channel-major.
-  for dd := 0 to D - 1 do
-    for t1 := 0 to T - 1 do Sig[dd][t1] := X[t1][dd];
+  for dd := 0 to DM1 do
+    for t1 := 0 to TM1 do Sig[dd][t1] := X[t1][dd];
 end;
 
 // One conv encoder/decoder stage (eskConv / eskELU / eskResnet) using the
@@ -34534,13 +34579,15 @@ procedure RunStageMimi(const Stage: TEnCodecStage;
 var
   Tmp, Shr_, Res: TMimiDblArr2D;
   c, t: integer;
+  InSigM1, TmpM1: integer;
 begin
+  InSigM1 := Length(InSig) - 1;
   case Stage.Kind of
     eskConv: RunMimiConv(Stage.Conv, InSig, OutSig);
     eskELU:
       begin
         SetLength(OutSig, Length(InSig));
-        for c := 0 to Length(InSig) - 1 do
+        for c := 0 to InSigM1 do
         begin
           SetLength(OutSig[c], Length(InSig[c]));
           for t := 0 to Length(InSig[c]) - 1 do
@@ -34550,7 +34597,7 @@ begin
     eskResnet:
       begin
         SetLength(Tmp, Length(InSig));
-        for c := 0 to Length(InSig) - 1 do
+        for c := 0 to InSigM1 do
         begin
           SetLength(Tmp[c], Length(InSig[c]));
           for t := 0 to Length(InSig[c]) - 1 do
@@ -34564,10 +34611,11 @@ begin
         else
         begin
           SetLength(Shr_, Length(InSig));
-          for c := 0 to Length(InSig) - 1 do Shr_[c] := InSig[c];
+          for c := 0 to InSigM1 do Shr_[c] := InSig[c];
         end;
         SetLength(OutSig, Length(Tmp));
-        for c := 0 to Length(Tmp) - 1 do
+        TmpM1 := Length(Tmp) - 1;
+        for c := 0 to TmpM1 do
         begin
           SetLength(OutSig[c], Length(Tmp[c]));
           for t := 0 to Length(Tmp[c]) - 1 do
@@ -34583,14 +34631,17 @@ procedure TNNetMimi.Encode(const Waveform: array of TNeuralFloat;
 var
   Sig, Nxt, Proj: TMimiDblArr2D;
   s, q, t, d, best, Dm, Frames, K, NSem, NAco: integer;
+  WaveLenM1, EncStagesM1, NSemNAcoM1, FramesM1, DmM1, NSemM1, NAcoM1, KM1: integer;
   Dist, BestDist, Diff: double;
   Residual: TMimiDblArr;
 begin
   SetLength(Sig, FConfig.AudioChannels);
   SetLength(Sig[0], Length(Waveform));
-  for t := 0 to Length(Waveform) - 1 do Sig[0][t] := Waveform[t];
+  WaveLenM1 := Length(Waveform) - 1;
+  for t := 0 to WaveLenM1 do Sig[0][t] := Waveform[t];
   // conv encoder
-  for s := 0 to Length(FEncStages) - 1 do
+  EncStagesM1 := Length(FEncStages) - 1;
+  for s := 0 to EncStagesM1 do
   begin
     RunStageMimi(FEncStages[s], Sig, Nxt);
     Sig := Nxt;
@@ -34601,27 +34652,33 @@ begin
   RunMimiConv(FDownsample, Sig, Nxt);
   Sig := Nxt;
   Frames := Length(Sig[0]);
+  FramesM1 := Frames - 1;
   FrameCount := Frames;
   NSem := Length(FSemCodebooks);
   NAco := Length(FAcoCodebooks);
+  NSemM1 := NSem - 1;
+  NAcoM1 := NAco - 1;
+  NSemNAcoM1 := NSem + NAco - 1;
   SetLength(Codes, NSem + NAco);
-  for q := 0 to NSem + NAco - 1 do SetLength(Codes[q], Frames);
+  for q := 0 to NSemNAcoM1 do SetLength(Codes[q], Frames);
   K := FConfig.CodebookSize;
+  KM1 := K - 1;
 
   // ---- semantic RVQ ----
   RunMimiConv(FSemInProj, Sig, Proj);
   Dm := FConfig.VqHiddenDim;
+  DmM1 := Dm - 1;
   SetLength(Residual, Dm);
-  for t := 0 to Frames - 1 do
+  for t := 0 to FramesM1 do
   begin
-    for d := 0 to Dm - 1 do Residual[d] := Proj[d][t];
-    for q := 0 to NSem - 1 do
+    for d := 0 to DmM1 do Residual[d] := Proj[d][t];
+    for q := 0 to NSemM1 do
     begin
       best := 0; BestDist := -1;
-      for s := 0 to K - 1 do
+      for s := 0 to KM1 do
       begin
         Dist := 0;
-        for d := 0 to Dm - 1 do
+        for d := 0 to DmM1 do
         begin
           Diff := Residual[d] - FSemCodebooks[q].Data[s * Dm + d];
           Dist := Dist + Diff * Diff;
@@ -34630,23 +34687,23 @@ begin
         begin BestDist := Dist; best := s; end;
       end;
       Codes[q][t] := best;
-      for d := 0 to Dm - 1 do
+      for d := 0 to DmM1 do
         Residual[d] := Residual[d] - FSemCodebooks[q].Data[best * Dm + d];
     end;
   end;
 
   // ---- acoustic RVQ ----
   RunMimiConv(FAcoInProj, Sig, Proj);
-  for t := 0 to Frames - 1 do
+  for t := 0 to FramesM1 do
   begin
-    for d := 0 to Dm - 1 do Residual[d] := Proj[d][t];
-    for q := 0 to NAco - 1 do
+    for d := 0 to DmM1 do Residual[d] := Proj[d][t];
+    for q := 0 to NAcoM1 do
     begin
       best := 0; BestDist := -1;
-      for s := 0 to K - 1 do
+      for s := 0 to KM1 do
       begin
         Dist := 0;
-        for d := 0 to Dm - 1 do
+        for d := 0 to DmM1 do
         begin
           Diff := Residual[d] - FAcoCodebooks[q].Data[s * Dm + d];
           Dist := Dist + Diff * Diff;
@@ -34655,7 +34712,7 @@ begin
         begin BestDist := Dist; best := s; end;
       end;
       Codes[NSem + q][t] := best;
-      for d := 0 to Dm - 1 do
+      for d := 0 to DmM1 do
         Residual[d] := Residual[d] - FAcoCodebooks[q].Data[best * Dm + d];
     end;
   end;
@@ -34666,15 +34723,17 @@ procedure TNNetMimi.Decode(const Codes: TNNetIntArr2D;
 var
   Sig, Nxt, Zsem, Zaco, Zh: TMimiDblArr2D;
   s, q, t, d, Dm, Frames, NSem, NAco, code, code2: integer;
+  DmM1: integer;
 begin
   Dm := FConfig.VqHiddenDim;
+  DmM1 := Dm - 1;
   NSem := Length(FSemCodebooks);
   NAco := Length(FAcoCodebooks);
   Frames := 0;
   if Length(Codes) > 0 then Frames := Length(Codes[0]);
   // semantic RVQ decode -> vq dim -> output proj -> hidden
   SetLength(Zsem, Dm);
-  for d := 0 to Dm - 1 do
+  for d := 0 to DmM1 do
   begin
     SetLength(Zsem[d], Frames);
     for t := 0 to Frames - 1 do Zsem[d][t] := 0;
