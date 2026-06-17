@@ -21101,6 +21101,7 @@ var
   RecallSum: TNeuralFloatDynArr;
   NDCGSum, DCG, IDCG, Gain: TNeuralFloat;
   HitCount, NumRel, i, j: integer;
+  KListHi, NQM1, NPM1, NumRelM1, MaxKM1: integer;
 begin
   NQ := Length(QueryEmb);
   NP := Length(PassageEmb);
@@ -21112,22 +21113,27 @@ begin
   if Length(KList) < 1 then
     ImportError('RetrievalReport: KList must list at least one k.');
   SetLength(RecallSum, Length(KList));
-  for Ki := 0 to High(KList) do RecallSum[Ki] := 0;
+  KListHi := High(KList);
+  for Ki := 0 to KListHi do RecallSum[Ki] := 0;
   NDCGSum := 0;
   MaxK := 10; // nDCG@10
+  MaxKM1 := MaxK - 1;
   SetLength(Scores, NP);
   SetLength(Order, NP);
   SetLength(IsRel, NP);
-  for Qi := 0 to NQ - 1 do
+  NQM1 := NQ - 1;
+  NPM1 := NP - 1;
+  for Qi := 0 to NQM1 do
   begin
-    for Pj := 0 to NP - 1 do
+    for Pj := 0 to NPM1 do
     begin
       Scores[Pj] := CosineSimilarity(QueryEmb[Qi], PassageEmb[Pj]);
       Order[Pj] := Pj;
       IsRel[Pj] := False;
     end;
     NumRel := Length(Relevant[Qi]);
-    for RelIdx := 0 to NumRel - 1 do
+    NumRelM1 := NumRel - 1;
+    for RelIdx := 0 to NumRelM1 do
     begin
       Pj := Relevant[Qi][RelIdx];
       if (Pj < 0) or (Pj >= NP) then
@@ -21137,7 +21143,7 @@ begin
     end;
     // descending sort of passage indices by score (stable insertion sort,
     // ties keep lower index first -> deterministic ranking)
-    for i := 1 to NP - 1 do
+    for i := 1 to NPM1 do
     begin
       Tmp := Order[i];
       j := i - 1;
@@ -21149,7 +21155,7 @@ begin
       Order[j + 1] := Tmp;
     end;
     // Recall@k for each requested k
-    for Ki := 0 to High(KList) do
+    for Ki := 0 to KListHi do
     begin
       HitCount := 0;
       for RankPos := 0 to KList[Ki] - 1 do
@@ -21159,14 +21165,14 @@ begin
     end;
     // nDCG@10 (binary relevance: gain 1 per relevant hit)
     DCG := 0;
-    for RankPos := 0 to MaxK - 1 do
+    for RankPos := 0 to MaxKM1 do
       if (RankPos < NP) and IsRel[Order[RankPos]] then
       begin
         Gain := 1;
         DCG := DCG + Gain / (Ln(RankPos + 2) / Ln(2)); // log2(rank+1), rank 1-based
       end;
     IDCG := 0;
-    for RankPos := 0 to MaxK - 1 do
+    for RankPos := 0 to MaxKM1 do
       if RankPos < NumRel then
         IDCG := IDCG + 1 / (Ln(RankPos + 2) / Ln(2));
     if IDCG > 0 then
@@ -21176,7 +21182,7 @@ begin
     '=== Retrieval Report ===' + sLineBreak +
     'queries:  ' + IntToStr(NQ) + sLineBreak +
     'passages: ' + IntToStr(NP) + sLineBreak;
-  for Ki := 0 to High(KList) do
+  for Ki := 0 to KListHi do
     Result := Result + 'Recall@' + IntToStr(KList[Ki]) + ': ' +
       FloatToStrF(RecallSum[Ki] / NQ, ffFixed, 8, 4) + sLineBreak;
   Result := Result + 'nDCG@10:  ' +
@@ -21286,6 +21292,7 @@ function ColBERTBuildInput(Tokenizer: TNeuralHFTokenizer; const Text: string;
 var
   ContentIds: TNeuralIntegerArray;
   Marker, FillId, ContentLen, Cnt, Used: integer;
+  ContentLenM1, SeqLenM1: integer;
 begin
   if SeqLen < 4 then
     ImportError('ColBERTBuildInput: SeqLen must be >= 4 ([CLS][Q/D] x ... ' +
@@ -21307,10 +21314,12 @@ begin
   SetLength(Result, SeqLen);
   Result[0] := Markers.ClsId;
   Result[1] := Marker;
-  for Cnt := 0 to ContentLen - 1 do Result[Cnt + 2] := ContentIds[Cnt];
+  ContentLenM1 := ContentLen - 1;
+  for Cnt := 0 to ContentLenM1 do Result[Cnt + 2] := ContentIds[Cnt];
   Result[ContentLen + 2] := Markers.SepId;
   Used := ContentLen + 3; // [CLS][marker] content [SEP]
-  for Cnt := Used to SeqLen - 1 do Result[Cnt] := FillId;
+  SeqLenM1 := SeqLen - 1;
+  for Cnt := Used to SeqLenM1 do Result[Cnt] := FillId;
   // Query: the [MASK] augmentation rows ARE real inputs and contribute to
   // MaxSim, so all SeqLen rows count. Document: only the non-[PAD] prefix.
   if IsQuery then RealTokens := SeqLen
@@ -21320,6 +21329,7 @@ end;
 procedure ColBERTNormalizeRows(Mat: TNNetVolume);
 var
   Rows, Dim, R, C: integer;
+  RowsM1, DimM1: integer;
   Norm: TNeuralFloat;
 begin
   Rows := Mat.SizeX;
@@ -21327,14 +21337,16 @@ begin
   if (Mat.SizeY <> 1) or (Rows < 1) or (Dim < 1) then
     ImportError('ColBERTNormalizeRows: expected a (Rows,1,Dim) volume, got ' +
       IntToStr(Rows) + 'x' + IntToStr(Mat.SizeY) + 'x' + IntToStr(Dim) + '.');
-  for R := 0 to Rows - 1 do
+  RowsM1 := Rows - 1;
+  DimM1 := Dim - 1;
+  for R := 0 to RowsM1 do
   begin
     Norm := 0;
-    for C := 0 to Dim - 1 do
+    for C := 0 to DimM1 do
       Norm := Norm + Mat.FData[R * Dim + C] * Mat.FData[R * Dim + C];
     Norm := Sqrt(Norm);
     if Norm > 0 then
-      for C := 0 to Dim - 1 do
+      for C := 0 to DimM1 do
         Mat.FData[R * Dim + C] := Mat.FData[R * Dim + C] / Norm;
   end;
 end;
@@ -21346,6 +21358,7 @@ var
   TokenIds: TNeuralIntegerArray;
   Input, Proj: TNNetVolume;
   SeqLen, Dim, RealTokens, PosCnt, ChanCnt, InDepth: integer;
+  SeqLenM1, RealTokensM1, DimM1: integer;
 begin
   SeqLen := Net.Layers[0].Output.SizeX;
   InDepth := Net.Layers[0].Output.Depth;
@@ -21359,14 +21372,15 @@ begin
   try
     Input.ReSize(SeqLen, 1, InDepth);
     Input.Fill(0); // single segment: token-type channel all zeros
-    for PosCnt := 0 to SeqLen - 1 do
+    SeqLenM1 := SeqLen - 1;
+    for PosCnt := 0 to SeqLenM1 do
       Input.FData[PosCnt * InDepth] := TokenIds[PosCnt];
     // Key-padding-mask channel (only present when the net was built with
     // pPaddingMask): real prefix (positions < RealTokens) = segment 0, the
     // [PAD] tail = segment 1 so real tokens never attend the pad rows. A
     // query has RealTokens = SeqLen, so its mask is all-zero (no change).
     if InDepth = 3 then
-      for PosCnt := 0 to SeqLen - 1 do
+      for PosCnt := 0 to SeqLenM1 do
         if PosCnt >= RealTokens then
           Input.FData[PosCnt * InDepth + 2] := 1;
     Net.Compute(Input);
@@ -21378,8 +21392,10 @@ begin
         IntToStr(Dim) + '.');
     // Keep only the MaxSim-contributing rows (skip [PAD] for documents).
     Mat.ReSize(RealTokens, 1, Dim);
-    for PosCnt := 0 to RealTokens - 1 do
-      for ChanCnt := 0 to Dim - 1 do
+    RealTokensM1 := RealTokens - 1;
+    DimM1 := Dim - 1;
+    for PosCnt := 0 to RealTokensM1 do
+      for ChanCnt := 0 to DimM1 do
         Mat.FData[PosCnt * Dim + ChanCnt] :=
           Proj.FData[PosCnt * Dim + ChanCnt];
     ColBERTNormalizeRows(Mat);
@@ -21392,6 +21408,7 @@ end;
 function ColBERTMaxSimScore(QueryMat, DocMat: TNNetVolume): TNeuralFloat;
 var
   QRows, DRows, Dim, Qi, Di, C: integer;
+  QRowsM1, DRowsM1, DimM1: integer;
   Dot, Best: TNeuralFloat;
 begin
   Dim := QueryMat.Depth;
@@ -21407,13 +21424,16 @@ begin
     ImportError('ColBERTMaxSimScore: dim mismatch query ' + IntToStr(Dim) +
       ' vs doc ' + IntToStr(DocMat.Depth) + '.');
   Result := 0;
-  for Qi := 0 to QRows - 1 do
+  QRowsM1 := QRows - 1;
+  DRowsM1 := DRows - 1;
+  DimM1 := Dim - 1;
+  for Qi := 0 to QRowsM1 do
   begin
     Best := -1e30;
-    for Di := 0 to DRows - 1 do
+    for Di := 0 to DRowsM1 do
     begin
       Dot := 0;
-      for C := 0 to Dim - 1 do
+      for C := 0 to DimM1 do
         Dot := Dot + QueryMat.FData[Qi * Dim + C] * DocMat.FData[Di * Dim + C];
       if Dot > Best then Best := Dot;
     end;
@@ -21433,6 +21453,7 @@ var
   RecallSum: TNeuralFloatDynArr;
   NDCGSum, DCG, IDCG: TNeuralFloat;
   HitCount, NumRel, i, j: integer;
+  KListHi, NQM1, NPM1, NumRelM1, MaxKM1: integer;
 begin
   NQ := Length(QueryMats);
   NP := Length(DocMats);
@@ -21444,22 +21465,27 @@ begin
   if Length(KList) < 1 then
     ImportError('ColBERTRetrievalReport: KList must list at least one k.');
   SetLength(RecallSum, Length(KList));
-  for Ki := 0 to High(KList) do RecallSum[Ki] := 0;
+  KListHi := High(KList);
+  for Ki := 0 to KListHi do RecallSum[Ki] := 0;
   NDCGSum := 0;
   MaxK := 10; // nDCG@10
+  MaxKM1 := MaxK - 1;
   SetLength(Scores, NP);
   SetLength(Order, NP);
   SetLength(IsRel, NP);
-  for Qi := 0 to NQ - 1 do
+  NQM1 := NQ - 1;
+  NPM1 := NP - 1;
+  for Qi := 0 to NQM1 do
   begin
-    for Pj := 0 to NP - 1 do
+    for Pj := 0 to NPM1 do
     begin
       Scores[Pj] := ColBERTMaxSimScore(QueryMats[Qi], DocMats[Pj]);
       Order[Pj] := Pj;
       IsRel[Pj] := False;
     end;
     NumRel := Length(Relevant[Qi]);
-    for RelIdx := 0 to NumRel - 1 do
+    NumRelM1 := NumRel - 1;
+    for RelIdx := 0 to NumRelM1 do
     begin
       Pj := Relevant[Qi][RelIdx];
       if (Pj < 0) or (Pj >= NP) then
@@ -21468,7 +21494,7 @@ begin
       IsRel[Pj] := True;
     end;
     // descending stable insertion sort by MaxSim (ties keep lower index)
-    for i := 1 to NP - 1 do
+    for i := 1 to NPM1 do
     begin
       Tmp := Order[i];
       j := i - 1;
@@ -21479,7 +21505,7 @@ begin
       end;
       Order[j + 1] := Tmp;
     end;
-    for Ki := 0 to High(KList) do
+    for Ki := 0 to KListHi do
     begin
       HitCount := 0;
       for RankPos := 0 to KList[Ki] - 1 do
@@ -21488,11 +21514,11 @@ begin
         RecallSum[Ki] := RecallSum[Ki] + HitCount / NumRel;
     end;
     DCG := 0;
-    for RankPos := 0 to MaxK - 1 do
+    for RankPos := 0 to MaxKM1 do
       if (RankPos < NP) and IsRel[Order[RankPos]] then
         DCG := DCG + 1 / (Ln(RankPos + 2) / Ln(2));
     IDCG := 0;
-    for RankPos := 0 to MaxK - 1 do
+    for RankPos := 0 to MaxKM1 do
       if RankPos < NumRel then
         IDCG := IDCG + 1 / (Ln(RankPos + 2) / Ln(2));
     if IDCG > 0 then
@@ -21502,7 +21528,7 @@ begin
     '=== ColBERT Retrieval Report (MaxSim) ===' + sLineBreak +
     'queries:  ' + IntToStr(NQ) + sLineBreak +
     'docs:     ' + IntToStr(NP) + sLineBreak;
-  for Ki := 0 to High(KList) do
+  for Ki := 0 to KListHi do
     Result := Result + 'Recall@' + IntToStr(KList[Ki]) + ': ' +
       FloatToStrF(RecallSum[Ki] / NQ, ffFixed, 8, 4) + sLineBreak;
   Result := Result + 'nDCG@10:  ' +
@@ -21542,8 +21568,10 @@ end;
 procedure TColBERTIndex.Clear;
 var
   i: integer;
+  FCountM1: integer;
 begin
-  for i := 0 to FCount - 1 do
+  FCountM1 := FCount - 1;
+  for i := 0 to FCountM1 do
     if FDocMats[i] <> nil then FDocMats[i].Free;
   SetLength(FDocMats, 0);
   SetLength(FDocTexts, 0);
@@ -21588,8 +21616,10 @@ end;
 procedure TColBERTIndex.AddCorpus(const Corpus: array of string);
 var
   i: integer;
+  CorpusHi: integer;
 begin
-  for i := 0 to High(Corpus) do
+  CorpusHi := High(Corpus);
+  for i := 0 to CorpusHi do
     AddDocument(Corpus[i]);
 end;
 
@@ -21624,13 +21654,15 @@ procedure TColBERTIndex.ScoreAll(const Query: string;
 var
   QueryMat: TNNetVolume;
   i: integer;
+  FCountM1: integer;
 begin
   SetLength(Scores, FCount);
   if FCount = 0 then Exit;
   QueryMat := TNNetVolume.Create();
   try
     EncodeQuery(Query, QueryMat);
-    for i := 0 to FCount - 1 do
+    FCountM1 := FCount - 1;
+    for i := 0 to FCountM1 do
       Scores[i] := ColBERTMaxSimScore(QueryMat, FDocMats[i]);
   finally
     QueryMat.Free;
@@ -21643,13 +21675,15 @@ var
   Scores: TNeuralFloatDynArr;
   Order: array of integer;
   i, j, Tmp: integer;
+  FCountM1, TopKM1: integer;
 begin
   ScoreAll(Query, Scores);
   SetLength(Order, FCount);
-  for i := 0 to FCount - 1 do Order[i] := i;
+  FCountM1 := FCount - 1;
+  for i := 0 to FCountM1 do Order[i] := i;
   // descending insertion sort by score (stable for the small corpora ColBERT
   // demos use; matches the example's hand-rolled ranking exactly).
-  for i := 1 to FCount - 1 do
+  for i := 1 to FCountM1 do
   begin
     Tmp := Order[i]; j := i - 1;
     while (j >= 0) and (Scores[Order[j]] < Scores[Tmp]) do
@@ -21660,7 +21694,8 @@ begin
   end;
   if (TopK <= 0) or (TopK > FCount) then TopK := FCount;
   SetLength(Result, TopK);
-  for i := 0 to TopK - 1 do
+  TopKM1 := TopK - 1;
+  for i := 0 to TopKM1 do
   begin
     Result[i].DocIndex := Order[i];
     Result[i].Score := Scores[Order[i]];
@@ -21743,6 +21778,7 @@ procedure SelectTokenLogits(NetOutput: TNNetVolume; TokenPos: integer;
   Logits: TNNetVolume);
 var
   ChanCnt, LabelCnt: integer;
+  LabelCntM1: integer;
 begin
   if NetOutput.SizeY <> 1 then
     ImportError('SelectTokenLogits: expected a (SeqLen,1,num_labels) ' +
@@ -21752,7 +21788,8 @@ begin
       ' is outside 0..' + IntToStr(NetOutput.SizeX - 1) + '.');
   LabelCnt := NetOutput.Depth;
   Logits.ReSize(1, 1, LabelCnt);
-  for ChanCnt := 0 to LabelCnt - 1 do
+  LabelCntM1 := LabelCnt - 1;
+  for ChanCnt := 0 to LabelCntM1 do
     Logits.FData[ChanCnt] := NetOutput.FData[TokenPos * LabelCnt + ChanCnt];
 end;
 
@@ -21803,6 +21840,7 @@ procedure BertTokenizePair(Tokenizer: TNeuralHFTokenizer;
 var
   IdsA, IdsB: TNeuralIntegerArray;
   ClsId, SepId, LenA, LenB, Cnt, Pos, Budget: integer;
+  LenAM1, LenBM1: integer;
 begin
   ClsId := Tokenizer.TokenToId('[CLS]');
   SepId := Tokenizer.TokenToId('[SEP]');
@@ -21831,12 +21869,14 @@ begin
   SetLength(SegmentIds, LenA + LenB + 3);
   Pos := 0;
   TokenIds[Pos] := ClsId; SegmentIds[Pos] := 0; Inc(Pos);
-  for Cnt := 0 to LenA - 1 do
+  LenAM1 := LenA - 1;
+  for Cnt := 0 to LenAM1 do
   begin
     TokenIds[Pos] := IdsA[Cnt]; SegmentIds[Pos] := 0; Inc(Pos);
   end;
   TokenIds[Pos] := SepId; SegmentIds[Pos] := 0; Inc(Pos);
-  for Cnt := 0 to LenB - 1 do
+  LenBM1 := LenB - 1;
+  for Cnt := 0 to LenBM1 do
   begin
     TokenIds[Pos] := IdsB[Cnt]; SegmentIds[Pos] := 1; Inc(Pos);
   end;
@@ -21850,6 +21890,7 @@ var
   TokenIds, SegmentIds: TNeuralIntegerArray;
   Input, Output: TNNetVolume;
   SeqLen, PadId, Pos: integer;
+  SeqLenM1: integer;
 begin
   SeqLen := Net.Layers[0].Output.SizeX;
   if Net.Layers[0].Output.Depth <> 2 then
@@ -21863,7 +21904,8 @@ begin
   try
     Input.ReSize(SeqLen, 1, 2);
     Input.Fill(0); // pad rows: token=PadId below, segment 0
-    for Pos := 0 to SeqLen - 1 do
+    SeqLenM1 := SeqLen - 1;
+    for Pos := 0 to SeqLenM1 do
       if Pos < Length(TokenIds) then
       begin
         Input.FData[Pos * 2]     := TokenIds[Pos];
@@ -21888,20 +21930,22 @@ procedure RerankPassages(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
 var
   NP, Pj, i, j, Tmp: integer;
   RawScores: TNeuralFloatDynArr;
+  NPM1: integer;
 begin
   NP := Length(Passages);
   if NP < 1 then
     ImportError('RerankPassages: need at least one candidate passage.');
   SetLength(RawScores, NP);
   SetLength(Order, NP);
-  for Pj := 0 to NP - 1 do
+  NPM1 := NP - 1;
+  for Pj := 0 to NPM1 do
   begin
     RawScores[Pj] := CrossEncoderScore(Net, Tokenizer, Query, Passages[Pj],
       {ApplySigmoid=}True);
     Order[Pj] := Pj;
   end;
   // descending stable insertion sort by score (ties keep original order).
-  for i := 1 to NP - 1 do
+  for i := 1 to NPM1 do
   begin
     Tmp := Order[i];
     j := i - 1;
@@ -21913,7 +21957,7 @@ begin
     Order[j + 1] := Tmp;
   end;
   SetLength(Scores, NP);
-  for i := 0 to NP - 1 do Scores[i] := RawScores[Order[i]];
+  for i := 0 to NPM1 do Scores[i] := RawScores[Order[i]];
 end;
 
 function RerankReport(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
@@ -21927,22 +21971,24 @@ var
   Scores: TNeuralFloatDynArr;
 
   function ReciprocalRank(const Ord: array of integer): TNeuralFloat;
-  var r: integer;
+  var r: integer; OrdHi: integer;
   begin
     Result := 0;
-    for r := 0 to High(Ord) do
+    OrdHi := High(Ord);
+    for r := 0 to OrdHi do
       if IsRel[Ord[r]] then begin Result := 1 / (r + 1); Exit; end;
   end;
 
   function NDCGAtK(const Ord: array of integer; K: integer): TNeuralFloat;
-  var r: integer; DCG, IDCG: TNeuralFloat;
+  var r: integer; DCG, IDCG: TNeuralFloat; KM1: integer;
   begin
     DCG := 0;
-    for r := 0 to K - 1 do
+    KM1 := K - 1;
+    for r := 0 to KM1 do
       if (r < Length(Ord)) and IsRel[Ord[r]] then
         DCG := DCG + 1 / (Ln(r + 2) / Ln(2)); // log2(rank+1), rank 1-based
     IDCG := 0;
-    for r := 0 to K - 1 do
+    for r := 0 to KM1 do
       if r < NumRel then IDCG := IDCG + 1 / (Ln(r + 2) / Ln(2));
     if IDCG > 0 then Result := DCG / IDCG else Result := 0;
   end;
@@ -21950,15 +21996,18 @@ var
 var
   BeforeOrder: TNeuralIntegerArray;
   r: integer;
+  NPM1, NumRelM1, KListHi: integer;
 begin
   NP := Length(Passages);
   if NP < 1 then ImportError('RerankReport: need >=1 passage.');
   if Length(KList) < 1 then
     ImportError('RerankReport: KList must list at least one k.');
   SetLength(IsRel, NP);
-  for Pj := 0 to NP - 1 do IsRel[Pj] := False;
+  NPM1 := NP - 1;
+  for Pj := 0 to NPM1 do IsRel[Pj] := False;
   NumRel := Length(Relevant);
-  for RelIdx := 0 to NumRel - 1 do
+  NumRelM1 := NumRel - 1;
+  for RelIdx := 0 to NumRelM1 do
   begin
     Pj := Relevant[RelIdx];
     if (Pj < 0) or (Pj >= NP) then
@@ -21968,7 +22017,7 @@ begin
   end;
   // BEFORE = the initial (retrieval) order: identity.
   SetLength(BeforeOrder, NP);
-  for r := 0 to NP - 1 do BeforeOrder[r] := r;
+  for r := 0 to NPM1 do BeforeOrder[r] := r;
   // AFTER = cross-encoder rerank.
   RerankPassages(Net, Tokenizer, Query, Passages, Order, Scores);
   Result :=
@@ -21978,14 +22027,15 @@ begin
     'MRR    before -> after: ' +
       FloatToStrF(ReciprocalRank(BeforeOrder), ffFixed, 8, 4) + ' -> ' +
       FloatToStrF(ReciprocalRank(Order), ffFixed, 8, 4) + sLineBreak;
-  for Ki := 0 to High(KList) do
+  KListHi := High(KList);
+  for Ki := 0 to KListHi do
     Result := Result + 'nDCG@' + IntToStr(KList[Ki]) +
       ' before -> after: ' +
       FloatToStrF(NDCGAtK(BeforeOrder, KList[Ki]), ffFixed, 8, 4) + ' -> ' +
       FloatToStrF(NDCGAtK(Order, KList[Ki]), ffFixed, 8, 4) + sLineBreak;
   // top-ranked-after listing for eyeballing.
   Result := Result + 'top-after: ';
-  for RankPos := 0 to NP - 1 do
+  for RankPos := 0 to NPM1 do
   begin
     if RankPos >= 3 then Break;
     Result := Result + '#' + IntToStr(Order[RankPos]) + '(' +
@@ -22130,6 +22180,7 @@ var
   StartLogit, EndLogit: TNeuralFloat;
   s, e, BestS, BestE: integer;
   Best: TNeuralFloat;
+  SeqLenM1, QOffHi, COffHi, SMax: integer;
 begin
   StartChar := -1;
   EndChar := -1;
@@ -22167,11 +22218,13 @@ begin
     Input.ReSize(SeqLen, 1, 2);
     Input.Fill(0); // segment ids: 0 everywhere here (works for distilbert/roberta
                    // which ignore them; BERT QA is robust to all-zero segments).
-    for Pos := 0 to SeqLen - 1 do IsContext[Pos] := False;
+    SeqLenM1 := SeqLen - 1;
+    for Pos := 0 to SeqLenM1 do IsContext[Pos] := False;
     // [CLS] question [SEP] context [SEP], truncating context to fit.
     Pos := 0;
     Input.FData[Pos * 2] := ClsId; Inc(Pos);
-    for QCnt := 0 to High(QOff) do
+    QOffHi := High(QOff);
+    for QCnt := 0 to QOffHi do
     begin
       if Pos >= SeqLen - 2 then Break; // leave room for [SEP] context [SEP]
       Input.FData[Pos * 2] := QOff[QCnt].Id; Inc(Pos);
@@ -22180,7 +22233,8 @@ begin
     Input.FData[Pos * 2] := SepId; Inc(Pos);
     ContextBase := Pos;
     ContextCnt := 0;
-    for CCnt := 0 to High(COff) do
+    COffHi := High(COff);
+    for CCnt := 0 to COffHi do
     begin
       if Pos >= SeqLen - 1 then Break; // leave room for the trailing [SEP]
       Input.FData[Pos * 2] := COff[CCnt].Id;
@@ -22196,7 +22250,7 @@ begin
     end;
     Input.FData[Pos * 2] := SepId; Inc(Pos);
     Used := Pos;
-    for Pos := Used to SeqLen - 1 do Input.FData[Pos * 2] := PadId;
+    for Pos := Used to SeqLenM1 do Input.FData[Pos * 2] := PadId;
 
     Net.Compute(Input);
     Net.GetOutput(Output); // (SeqLen,1,2): depth 0 = start, depth 1 = end
@@ -22207,7 +22261,8 @@ begin
     if ContextCnt = 0 then Exit; // nothing to answer over
 
     Best := -1e30; BestS := -1; BestE := -1;
-    for s := ContextBase to ContextBase + ContextCnt - 1 do
+    SMax := ContextBase + ContextCnt - 1;
+    for s := ContextBase to SMax do
     begin
       if not IsContext[s] then Continue;
       StartLogit := Output.FData[s * 2 + 0];
@@ -22243,12 +22298,14 @@ var
   i: integer;
   Words: TStringList;
   Ch: char;
+  LowerLen: integer;
 begin
   // Lowercase, strip punctuation to spaces, collapse whitespace, drop the
   // English articles a/an/the (the official SQuAD normalize_answer).
   Lower := LowerCase(S);
   Tmp := '';
-  for i := 1 to Length(Lower) do
+  LowerLen := Length(Lower);
+  for i := 1 to LowerLen do
   begin
     Ch := Lower[i];
     if ((Ch >= 'a') and (Ch <= 'z')) or ((Ch >= '0') and (Ch <= '9')) then
@@ -22327,6 +22384,7 @@ var
   Pred: string;
   StartChar, EndChar: integer;
   Score, NoAns, F1Sum, F1: TNeuralFloat;
+  NM1: integer;
 begin
   N := Length(Questions);
   if (N <> Length(Contexts)) or (N <> Length(GoldAnswers)) then
@@ -22335,7 +22393,8 @@ begin
     ImportError('QAReport: need at least 1 example.');
   EMCount := 0;
   F1Sum := 0;
-  for i := 0 to N - 1 do
+  NM1 := N - 1;
+  for i := 0 to NM1 do
   begin
     Pred := AnswerSpan(Net, Tokenizer, Questions[i], Contexts[i],
       StartChar, EndChar, Score, NoAns);
@@ -22490,30 +22549,33 @@ procedure DebertaBuildRelLN(RelEmb, RelGamma, RelBeta: TNNetVolume;
 var
   a, c: integer;
   Mean, Variance, InvStd, V: TNeuralFloat;
+  twoSpanM1, HiddenM1: integer;
 begin
-  for a := 0 to twoSpan - 1 do
+  twoSpanM1 := twoSpan - 1;
+  HiddenM1 := Hidden - 1;
+  for a := 0 to twoSpanM1 do
   begin
     if NormRel then
     begin
       Mean := 0;
-      for c := 0 to Hidden - 1 do
+      for c := 0 to HiddenM1 do
         Mean := Mean + RelEmb.FData[a * Hidden + c];
       Mean := Mean / Hidden;
       Variance := 0;
-      for c := 0 to Hidden - 1 do
+      for c := 0 to HiddenM1 do
       begin
         V := RelEmb.FData[a * Hidden + c] - Mean;
         Variance := Variance + V * V;
       end;
       Variance := Variance / Hidden;
       InvStd := 1.0 / Sqrt(Variance + Eps);
-      for c := 0 to Hidden - 1 do
+      for c := 0 to HiddenM1 do
         RelLN.FData[a * Hidden + c] :=
           (RelEmb.FData[a * Hidden + c] - Mean) * InvStd *
           RelGamma.FData[c] + RelBeta.FData[c];
     end
     else
-      for c := 0 to Hidden - 1 do
+      for c := 0 to HiddenM1 do
         RelLN.FData[a * Hidden + c] := RelEmb.FData[a * Hidden + c];
   end;
 end;
@@ -22532,19 +22594,23 @@ var
   a, dLocal, c, OutRow: integer;
   AccK, AccQ: TNeuralFloat;
   RelRow: TNeuralFloatArrPtr;
+  twoSpanM1, d_kM1, HiddenM1: integer;
 begin
   EnsureWritableImportWeights(HeadLayer);
   PosK := HeadLayer.FArrNeurons[0].Weights; // K^r
   PosQ := HeadLayer.FArrNeurons[1].Weights; // Q^r
-  for a := 0 to twoSpan - 1 do
+  twoSpanM1 := twoSpan - 1;
+  d_kM1 := d_k - 1;
+  HiddenM1 := Hidden - 1;
+  for a := 0 to twoSpanM1 do
   begin
     RelRow := RelLN.GetRawPtr(a, 0, 0);
-    for dLocal := 0 to d_k - 1 do
+    for dLocal := 0 to d_kM1 do
     begin
       OutRow := HeadIdx * d_k + dLocal;
       AccK := Bk.FData[OutRow];
       AccQ := Bq.FData[OutRow];
-      for c := 0 to Hidden - 1 do
+      for c := 0 to HiddenM1 do
       begin
         AccK := AccK + RelRow^[c] * Wk.FData[OutRow * Hidden + c];
         AccQ := AccQ + RelRow^[c] * Wq.FData[OutRow * Hidden + c];
@@ -22568,6 +22634,7 @@ var
   PoolerDense, ClassifierDense, ConcatLayer: TNNetLayer;
   SliceLayers: array of TNNetLayer;
   BlockCnt, SeqLen, d_k, h, NumLabels, i, twoSpan: integer;
+  NumLayersM1, NumHeadsM1: integer;
   BlockPrefix, TensorNameStr, QName, KName, VName: string;
   Consumed: TStringList;
   RelEmb, RelGamma, RelBeta, RelLN: TNNetVolume;
@@ -22641,7 +22708,9 @@ begin
       EmbLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
       if pInferenceOnly then NN.SetInferenceOnly();
       SetLength(Blocks, Config.NumLayers);
-      for BlockCnt := 0 to Config.NumLayers - 1 do
+      NumLayersM1 := Config.NumLayers - 1;
+      NumHeadsM1 := Config.NumHeads - 1;
+      for BlockCnt := 0 to NumLayersM1 do
       begin
         SetLength(Blocks[BlockCnt].Heads, Config.NumHeads);
         // POST-LN disentangled-attention sub-block.
@@ -22654,7 +22723,7 @@ begin
         SetLength(SliceLayers, Config.NumHeads);
         NN.AddSplitQKVHeads(Config.HiddenSize, Config.NumHeads, SliceLayers,
           Blocks[BlockCnt].QKV);
-        for h := 0 to Config.NumHeads - 1 do
+        for h := 0 to NumHeadsM1 do
           Blocks[BlockCnt].Heads[h] := NN.AddLayerAfter(
             TNNetDisentangledAttention.Create(d_k, {causal=}false,
               Config.PosEbdSize, Config.PosBuckets, Config.MaxRelPos),
@@ -22758,7 +22827,7 @@ begin
       DebertaBuildRelLN(RelEmb, RelGamma, RelBeta, Config.NormRelEbd,
         twoSpan, Config.HiddenSize, Config.LayerNormEps, RelLN);
 
-      for BlockCnt := 0 to Config.NumLayers - 1 do
+      for BlockCnt := 0 to NumLayersM1 do
       begin
         BlockPrefix := Config.Prefix + 'encoder.layer.' + IntToStr(BlockCnt) +
           '.';
@@ -22787,7 +22856,7 @@ begin
         Reader.LoadTensorFlat(KName + '.weight', WkV);
         Reader.LoadTensorFlat(QName + '.bias', BqV);
         Reader.LoadTensorFlat(KName + '.bias', BkV);
-        for h := 0 to Config.NumHeads - 1 do
+        for h := 0 to NumHeadsM1 do
           DebertaLoadHeadPosTables(Blocks[BlockCnt].Heads[h], RelLN,
             WqV, BqV, WkV, BkV, h, d_k, Config.HiddenSize, twoSpan);
         FreeAndNil(WqV); FreeAndNil(WkV); FreeAndNil(BqV); FreeAndNil(BkV);
@@ -22999,6 +23068,7 @@ var
   Field: TJSONData;
   i, Step, Interval: integer;
   IsMoELayer: boolean;
+  NumLayersM1: integer;
 
   function RequiredInt(const FieldName: string): integer;
   begin
@@ -23071,19 +23141,20 @@ begin
     // no_rope_layers: explicit list, else built from no_rope_layer_interval
     // (default 4): element i = ((i+1) mod interval != 0) (1 = RoPE, 0 = NoPE).
     SetLength(Result.NoRopeLayers, Result.NumLayers);
+    NumLayersM1 := Result.NumLayers - 1;
     Field := Obj.Find('no_rope_layers');
     if (Field <> nil) and (Field is TJSONArray) and (TJSONArray(Field).Count > 0) then
     begin
       if TJSONArray(Field).Count <> Result.NumLayers then
         ImportError('Llama4 import: no_rope_layers length <> num_hidden_layers.');
-      for i := 0 to Result.NumLayers - 1 do
+      for i := 0 to NumLayersM1 do
         Result.NoRopeLayers[i] := TJSONArray(Field).Integers[i] <> 0;
     end
     else
     begin
       Interval := Obj.Get('no_rope_layer_interval', 4);
       if Interval < 1 then Interval := 1;
-      for i := 0 to Result.NumLayers - 1 do
+      for i := 0 to NumLayersM1 do
         Result.NoRopeLayers[i] := ((i + 1) mod Interval) <> 0;
     end;
     // QK L2-norm (use_qk_norm, default true) on the RoPE layers.
@@ -23120,7 +23191,7 @@ begin
     begin
       // Build the explicit dense (mlp-only) list = complement of moe_layers.
       Result.MoEDecoderSparseStep := 1; // step handled via the explicit list
-      for i := 0 to Result.NumLayers - 1 do
+      for i := 0 to NumLayersM1 do
       begin
         IsMoELayer := False;
         LpMax := TJSONArray(Field).Count - 1;
@@ -23344,6 +23415,7 @@ procedure TNNetInternLM2Reader.AddSynthetic(const HFName, SrcName: string;
   Kind: integer; const Shape: array of Int64);
 var
   Idx, i: integer;
+  ShapeHi: integer;
 begin
   if not FInner.HasTensor(SrcName) then
     ImportError('InternLM2 import: missing tensor "' + SrcName + '" in ' +
@@ -23358,7 +23430,8 @@ begin
   FTensors[Idx].DataBegin := 0;
   FTensors[Idx].DataEnd := 0;
   SetLength(FTensors[Idx].Shape, Length(Shape));
-  for i := 0 to High(Shape) do FTensors[Idx].Shape[i] := Shape[i];
+  ShapeHi := High(Shape);
+  for i := 0 to ShapeHi do FTensors[Idx].Shape[i] := Shape[i];
   FSrcNames[Idx] := SrcName;
   FKinds[Idx] := Kind;
 end;
@@ -23369,6 +23442,7 @@ constructor TNNetInternLM2Reader.Create(Inner: TNNetSafeTensorsReader;
 var
   b, WqkvRows: integer;
   P, Src: string;
+  NumLayersM1: integer;
 begin
   inherited CreateBare;
   FInner := Inner;
@@ -23384,7 +23458,8 @@ begin
   AddSynthetic('model.norm.weight', 'model.norm.weight', 0, [Hidden]);
   if not TieWordEmbeddings then
     AddSynthetic('lm_head.weight', 'output.weight', 0, [VocabSize, Hidden]);
-  for b := 0 to NumLayers - 1 do
+  NumLayersM1 := NumLayers - 1;
+  for b := 0 to NumLayersM1 do
   begin
     P := 'model.layers.' + IntToStr(b) + '.';
     Src := P + 'attention.wqkv.weight';
@@ -23432,6 +23507,7 @@ var
   GroupStride, KOffset, VOffset: integer;
   g, q, r, c, DstRow: integer;
   SrcBase: integer;
+  FNumKVHeadsM1, QPerKVHeadDimM1, FHeadDimM1, FHiddenM1: integer;
 begin
   Idx := FindTensor(pName);
   if Idx < 0 then
@@ -23458,15 +23534,19 @@ begin
     else
       Dest.ReSize(FNumKVHeads * FHeadDim * FHidden, 1, 1);
     DstRow := 0;
-    for g := 0 to FNumKVHeads - 1 do
+    FNumKVHeadsM1 := FNumKVHeads - 1;
+    QPerKVHeadDimM1 := FQPerKV * FHeadDim - 1;
+    FHeadDimM1 := FHeadDim - 1;
+    FHiddenM1 := FHidden - 1;
+    for g := 0 to FNumKVHeadsM1 do
     begin
       SrcBase := g * GroupStride;
       if Kind = 1 then
       begin
         // all q_per_kv query head-rows of this group (group-major)
-        for q := 0 to FQPerKV * FHeadDim - 1 do
+        for q := 0 to QPerKVHeadDimM1 do
         begin
-          for c := 0 to FHidden - 1 do
+          for c := 0 to FHiddenM1 do
             Dest.FData[DstRow * FHidden + c] :=
               Wqkv.FData[(SrcBase + q) * FHidden + c];
           Inc(DstRow);
@@ -23476,9 +23556,9 @@ begin
       begin
         if Kind = 2 then r := SrcBase + KOffset
         else r := SrcBase + VOffset;
-        for q := 0 to FHeadDim - 1 do
+        for q := 0 to FHeadDimM1 do
         begin
-          for c := 0 to FHidden - 1 do
+          for c := 0 to FHiddenM1 do
             Dest.FData[DstRow * FHidden + c] :=
               Wqkv.FData[(r + q) * FHidden + c];
           Inc(DstRow);
@@ -23774,9 +23854,11 @@ end;
 function GptOssConfigToString(const Config: TGptOssConfig): string;
 var
   i, SlideCnt: integer;
+  LayerIsSlidingHi: integer;
 begin
   SlideCnt := 0;
-  for i := 0 to High(Config.LayerIsSliding) do
+  LayerIsSlidingHi := High(Config.LayerIsSliding);
+  for i := 0 to LayerIsSlidingHi do
     if Config.LayerIsSliding[i] then Inc(SlideCnt);
   Result :=
     'gpt_oss: hidden=' + IntToStr(Config.HiddenSize) +
@@ -23808,6 +23890,7 @@ procedure LoadGptOssExpertMatrix(WLayer: TNNetLayer; const W, B: TNNetVolume;
   ExpertIdx, InDim, OutDim: integer);
 var
   i, j, ExpertBase, BiasBase: integer;
+  OutDimM1, InDimM1: integer;
 begin
   EnsureWritableImportWeights(WLayer);
   if WLayer.Neurons.Count <> OutDim then
@@ -23816,9 +23899,11 @@ begin
       IntToStr(OutDim) + '.');
   ExpertBase := ExpertIdx * InDim * OutDim;
   BiasBase := ExpertIdx * OutDim;
-  for j := 0 to OutDim - 1 do
+  OutDimM1 := OutDim - 1;
+  InDimM1 := InDim - 1;
+  for j := 0 to OutDimM1 do
   begin
-    for i := 0 to InDim - 1 do
+    for i := 0 to InDimM1 do
       WLayer.FArrNeurons[j].Weights.FData[i] := W.FData[ExpertBase + i * OutDim + j];
     if B <> nil then
       WLayer.FArrNeurons[j].BiasWeight := B.FData[BiasBase + j]
@@ -23842,6 +23927,7 @@ var
   Deq: array of single;
   e, ii, oo, NumBlocks: integer;
   BlocksName, ScalesName: string;
+  NumExpertsM1, OutDimM1, InDimM1: integer;
 begin
   if Reader.HasTensor(BaseName) then
   begin
@@ -23881,9 +23967,12 @@ begin
   // Deq is [E, Out, In] (row-major). Transpose the last two axes into Dest's
   // [E, In, Out] layout.
   Dest.ReSize(NumExperts * InDim * OutDim, 1, 1);
-  for e := 0 to NumExperts - 1 do
-    for oo := 0 to OutDim - 1 do
-      for ii := 0 to InDim - 1 do
+  NumExpertsM1 := NumExperts - 1;
+  OutDimM1 := OutDim - 1;
+  InDimM1 := InDim - 1;
+  for e := 0 to NumExpertsM1 do
+    for oo := 0 to OutDimM1 do
+      for ii := 0 to InDimM1 do
         Dest.FData[(e * InDim + ii) * OutDim + oo] :=
           Deq[(e * OutDim + oo) * InDim + ii];
   SetLength(Deq, 0);
@@ -23903,6 +23992,7 @@ var
   ExpertCnt: integer;
   GateUpW, GateUpB, DownW, DownB: TNNetVolume;
   GU2: integer;
+  NumLocalExpertsM1: integer;
 begin
   GU2 := 2 * Config.IntermediateSize;
   SetLength(GateUpLayers, Config.NumLocalExperts);
@@ -23913,7 +24003,8 @@ begin
   NN.AddLayer( TNNetPointwiseSoftMax.Create() );
   GateTopK := NN.AddLayer( TNNetTopKGate.Create(
     Config.NumExpertsPerTok, {pRenormalize=}True) );
-  for ExpertCnt := 0 to Config.NumLocalExperts - 1 do
+  NumLocalExpertsM1 := Config.NumLocalExperts - 1;
+  for ExpertCnt := 0 to NumLocalExpertsM1 do
   begin
     GateUpLayers[ExpertCnt] := NN.AddLayerAfter(
       TNNetPointwiseConvLinear.Create(GU2).SetInferenceOnly(pInferenceOnly),
@@ -23947,7 +24038,7 @@ begin
     LoadGptOssExpertSlab(Reader, BlockPrefix + 'mlp.experts.down_proj',
       Config.NumLocalExperts, Config.IntermediateSize, Config.HiddenSize, DownW);
     Reader.LoadTensorFlat(BlockPrefix + 'mlp.experts.down_proj_bias', DownB);
-    for ExpertCnt := 0 to Config.NumLocalExperts - 1 do
+    for ExpertCnt := 0 to NumLocalExpertsM1 do
     begin
       LoadGptOssExpertMatrix(GateUpLayers[ExpertCnt], GateUpW, GateUpB,
         ExpertCnt, Config.HiddenSize, GU2);
@@ -23973,6 +24064,7 @@ var
   SliceChannels: array of integer;
   BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
   HeadDim, QWidth, KVWidth, LayerWindow, i, j, d: integer;
+  NumLayersM1, NumKVHeadsM1, NumHeadsM1, HeadDimM1, VocabSizeM1, HiddenSizeM1: integer;
   LMHeadName, BlockPrefix: string;
   Tmp: TNNetVolume;
 begin
@@ -24031,7 +24123,11 @@ begin
       Tmp.Free;
     end;
 
-    for BlockCnt := 0 to Config.NumLayers - 1 do
+    NumLayersM1 := Config.NumLayers - 1;
+    NumKVHeadsM1 := Config.NumKVHeads - 1;
+    NumHeadsM1 := Config.NumHeads - 1;
+    HeadDimM1 := HeadDim - 1;
+    for BlockCnt := 0 to NumLayersM1 do
     begin
       BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
       if Config.LayerIsSliding[BlockCnt] then
@@ -24051,9 +24147,9 @@ begin
       VProj := NN.AddLayerAfter(
         TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly),
         NormedSource);
-      for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
+      for KVHeadCnt := 0 to NumKVHeadsM1 do
       begin
-        for d := 0 to HeadDim - 1 do
+        for d := 0 to HeadDimM1 do
           SliceChannels[d] := KVHeadCnt * HeadDim + d;
         KSlice := NN.AddLayerAfter(
           TNNetSplitChannels.Create(SliceChannels), KProj);
@@ -24062,10 +24158,10 @@ begin
         VSlices[KVHeadCnt] := NN.AddLayerAfter(
           TNNetSplitChannels.Create(SliceChannels), VProj);
       end;
-      for HeadCnt := 0 to Config.NumHeads - 1 do
+      for HeadCnt := 0 to NumHeadsM1 do
       begin
         KVGroup := HeadCnt div GroupSize;
-        for d := 0 to HeadDim - 1 do
+        for d := 0 to HeadDimM1 do
           SliceChannels[d] := HeadCnt * HeadDim + d;
         QSlice := NN.AddLayerAfter(
           TNNetSplitChannels.Create(SliceChannels), QProj);
@@ -24112,7 +24208,7 @@ begin
             'self_attn.sinks" has ' + IntToStr(Tmp.Size) +
             ' entries, expected num_attention_heads=' +
             IntToStr(Config.NumHeads) + '.');
-        for HeadCnt := 0 to Config.NumHeads - 1 do
+        for HeadCnt := 0 to NumHeadsM1 do
           TNNetGptOssSinkAttention(HeadOutputs[HeadCnt]).SetSinkLogit(
             Tmp.FData[HeadCnt]);
       finally
@@ -24133,9 +24229,11 @@ begin
       begin
         Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
         EnsureWritableImportWeights(LMHead);
-        for j := 0 to Config.VocabSize - 1 do
+        VocabSizeM1 := Config.VocabSize - 1;
+        HiddenSizeM1 := Config.HiddenSize - 1;
+        for j := 0 to VocabSizeM1 do
         begin
-          for i := 0 to Config.HiddenSize - 1 do
+          for i := 0 to HiddenSizeM1 do
             LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.HiddenSize + i];
           LMHead.FArrNeurons[j].BiasWeight := 0;
