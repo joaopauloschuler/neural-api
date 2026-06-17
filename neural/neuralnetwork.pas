@@ -91637,6 +91637,8 @@ const
 var
   LpBnd251: integer;
   RLayerM1, RinM1: integer;
+  RLIdxM1, R0M1, KeepKM1, TopCountM1, TopCountM2: integer;
+  DepthM1, SizeXM1, SizeYM1: integer;
   Beta: TNeuralFloat;
   zPos, zNeg, cPos, cNeg, wEff: TNeuralFloat;
   RuleName: string;
@@ -91738,6 +91740,9 @@ begin
     SizeX := Probe.SizeX;
     SizeY := Probe.SizeY;
     Depth := Probe.Depth;
+    SizeXM1 := SizeX - 1;
+    SizeYM1 := SizeY - 1;
+    DepthM1 := Depth - 1;
 
     // Allocate per-layer relevance vectors.
     SetLength(R, LastIdx + 1);
@@ -91775,6 +91780,7 @@ begin
       PrevLayer := Layer.PrevLayer;
       SetLength(Rin, PrevLayer.Output.Size);
       RinM1 := Length(Rin) - 1;
+      RLIdxM1 := Length(R[LIdx]) - 1;
       for i := 0 to RinM1 do Rin[i] := 0;
 
       IsDense := IsEpsRuleDense(Layer);
@@ -91856,7 +91862,7 @@ begin
       else if IsPassThrough(Layer) then
       begin
         KindStr := 'passthru';
-        for i := 0 to Length(Rin) - 1 do Rin[i] := R[LIdx][i];
+        for i := 0 to RinM1 do Rin[i] := R[LIdx][i];
       end
       else
       begin
@@ -91865,21 +91871,21 @@ begin
         // relevance is conserved and the residual stays meaningful.
         KindStr := 'SKIPPED';
         if Length(Rin) = Length(R[LIdx]) then
-          for i := 0 to Length(Rin) - 1 do Rin[i] := R[LIdx][i]
+          for i := 0 to RinM1 do Rin[i] := R[LIdx][i]
         else
         begin
           SumOut := 0;
-          for j := 0 to Length(R[LIdx]) - 1 do SumOut := SumOut + R[LIdx][j];
+          for j := 0 to RLIdxM1 do SumOut := SumOut + R[LIdx][j];
           if Length(Rin) > 0 then
-            for i := 0 to Length(Rin) - 1 do Rin[i] := SumOut / Length(Rin);
+            for i := 0 to RinM1 do Rin[i] := SumOut / Length(Rin);
         end;
       end;
 
       // Conservation residual for this boundary.
       SumOut := 0;
-      for j := 0 to Length(R[LIdx]) - 1 do SumOut := SumOut + R[LIdx][j];
+      for j := 0 to RLIdxM1 do SumOut := SumOut + R[LIdx][j];
       SumIn := 0;
-      for i := 0 to Length(Rin) - 1 do SumIn := SumIn + Rin[i];
+      for i := 0 to RinM1 do SumIn := SumIn + Rin[i];
       Residual := Abs(SumIn - SumOut);
       if Handled and (Residual > MaxResidual) then MaxResidual := Residual;
 
@@ -91889,7 +91895,7 @@ begin
          SumOut, SumIn, Residual]));
 
       // Store input relevance into the previous layer's slot.
-      for i := 0 to Length(Rin) - 1 do R[LIdx - 1][i] := Rin[i];
+      for i := 0 to RinM1 do R[LIdx - 1][i] := Rin[i];
     end;
 
     Lines.Add(StringOfChar('-', 72));
@@ -91922,7 +91928,9 @@ begin
     SetLength(TopVal, KeepK);
     SetLength(TopIdx, KeepK);
     TopCount := 0;
-    for i := 0 to Length(R[0]) - 1 do
+    R0M1 := Length(R[0]) - 1;
+    KeepKM1 := KeepK - 1;
+    for i := 0 to R0M1 do
     begin
       AbsV := Abs(R[0][i]);
       if TopCount < KeepK then
@@ -91934,7 +91942,7 @@ begin
       else
       begin
         WorstPos := 0; WorstVal := TopVal[0];
-        for j := 1 to KeepK - 1 do
+        for j := 1 to KeepKM1 do
           if TopVal[j] < WorstVal then begin WorstVal := TopVal[j]; WorstPos := j; end;
         if AbsV > WorstVal then
         begin
@@ -91944,8 +91952,10 @@ begin
       end;
     end;
     // simple selection sort (descending) of the kept top-K
-    for i := 0 to TopCount - 2 do
-      for j := i + 1 to TopCount - 1 do
+    TopCountM1 := TopCount - 1;
+    TopCountM2 := TopCount - 2;
+    for i := 0 to TopCountM2 do
+      for j := i + 1 to TopCountM1 do
         if TopVal[j] > TopVal[i] then
         begin
           v := TopVal[i]; TopVal[i] := TopVal[j]; TopVal[j] := v;
@@ -91954,7 +91964,7 @@ begin
 
     Lines.Add(Format('Top-%d most-relevant input positions (channel, x, y):',
       [TopCount]));
-    for i := 0 to TopCount - 1 do
+    for i := 0 to TopCountM1 do
     begin
       FlatIdx := TopIdx[i];
       // flat index layout in TNNetVolume: x + SizeX*(y + SizeY*ch) ... use
@@ -91970,16 +91980,16 @@ begin
 
     // --- Per-channel ASCII relevance heatmap over the input plane. ---
     MapAbsMax := 0;
-    for i := 0 to Length(R[0]) - 1 do
+    for i := 0 to R0M1 do
       if Abs(R[0][i]) > MapAbsMax then MapAbsMax := Abs(R[0][i]);
     if MapAbsMax <= 0 then MapAbsMax := 1;
-    for Ch := 0 to Depth - 1 do
+    for Ch := 0 to DepthM1 do
     begin
       Lines.Add(Format('input-relevance |R| heatmap, channel %d:', [Ch]));
-      for Py := 0 to SizeY - 1 do
+      for Py := 0 to SizeYM1 do
       begin
         RowStr := '  ';
-        for Px := 0 to SizeX - 1 do
+        for Px := 0 to SizeXM1 do
         begin
           FlatIdx := Ch + Depth * (Px + SizeX * Py);
           if (FlatIdx >= 0) and (FlatIdx < Length(R[0])) then
@@ -92019,7 +92029,7 @@ const
   cEps = 1e-9;     // denominator-collapse guard
 var
   Lines: TStringList;
-  LayerCnt, LastLayer, NumLayers: integer;
+  LayerCnt, LastLayer, NumLayers, NumLayersM1, CleanCacheHigh: integer;
   CleanCache: array of TNNetVolume;   // cached clean Output per layer
   Recovery: array of TNeuralFloat;    // r_L per layer
   DeltaLogit: array of TNeuralFloat;  // logit_c(patch_L) - logit_c(corrupt)
@@ -92051,6 +92061,7 @@ begin
       Exit;
     end;
     NumLayers := NN.CountLayers();
+    NumLayersM1 := NumLayers - 1;
     LastLayer := NN.GetLastLayerIdx();
     if NumLayers < 2 then
     begin
@@ -92074,7 +92085,7 @@ begin
     end;
     CleanLogitC := NN.GetLastLayer.Output.Raw[c];
     SetLength(CleanCache, NumLayers);
-    for LayerCnt := 0 to NumLayers - 1 do
+    for LayerCnt := 0 to NumLayersM1 do
     begin
       CleanCache[LayerCnt] := TNNetVolume.Create();
       // Copy (resizes) so each cache volume matches its layer's Output shape.
@@ -92117,7 +92128,7 @@ begin
     SetLength(Recovery, NumLayers);
     SetLength(DeltaLogit, NumLayers);
     SetLength(PatchArgmax, NumLayers);
-    for L := 0 to NumLayers - 1 do
+    for L := 0 to NumLayersM1 do
     begin
       // Reset the whole net to the CORRUPT run so each patch is independent.
       NN.Compute(CorruptInput);
@@ -92139,7 +92150,7 @@ begin
     // ---- (4) headline plot: per-layer r_L bar chart across depth. ----
     MinR := Recovery[0];
     MaxR := Recovery[0];
-    for L := 1 to NumLayers - 1 do
+    for L := 1 to NumLayersM1 do
     begin
       if Recovery[L] < MinR then MinR := Recovery[L];
       if Recovery[L] > MaxR then MaxR := Recovery[L];
@@ -92153,7 +92164,7 @@ begin
       'this layer alone restores the clean decision):');
     Lines.Add('  Lyr  argmax        r_L  delta_logit  bar (scaled to max|r|=' +
       Format('%.2f', [MaxAbsR]) + ')');
-    for L := 0 to NumLayers - 1 do
+    for L := 0 to NumLayersM1 do
     begin
       RvalForBar := Recovery[L];
       if RvalForBar < 0 then RvalForBar := 0;
@@ -92168,7 +92179,7 @@ begin
 
     // ---- (5) argmax-flip layer: shallowest L whose patch yields argmax c. ----
     FlipLayer := -1;
-    for L := 0 to NumLayers - 1 do
+    for L := 0 to NumLayersM1 do
       if PatchArgmax[L] = c then
       begin
         FlipLayer := L;
@@ -92184,7 +92195,7 @@ begin
     // ---- (6) peak-recovery layer. ----
     PeakLayer := 0;
     PeakR := Recovery[0];
-    for L := 1 to NumLayers - 1 do
+    for L := 1 to NumLayersM1 do
       if Recovery[L] > PeakR then
       begin
         PeakR := Recovery[L];
@@ -92198,7 +92209,7 @@ begin
     Mid := NumLayers div 2;
     EarlyMass := 0;
     LateMass := 0;
-    for L := 0 to NumLayers - 1 do
+    for L := 0 to NumLayersM1 do
     begin
       RvalForBar := Recovery[L];
       if RvalForBar < 0 then RvalForBar := 0;
@@ -92231,7 +92242,8 @@ begin
     // transient activation overwrite). Guard against a nil/partial setup.
     if (NN <> nil) and (CleanInput <> nil) and (NN.CountLayers() >= 2) then
       NN.Compute(CleanInput);
-    for I := 0 to High(CleanCache) do
+    CleanCacheHigh := High(CleanCache);
+    for I := 0 to CleanCacheHigh do
       if CleanCache[I] <> nil then CleanCache[I].Free;
     Lines.Free;
   end;
@@ -92278,7 +92290,7 @@ var
   P: TNNetVolumePair;
   pIdx, tClass: integer;
   px, py: TNeuralFloat;
-  GxLoc, GyLoc: integer;
+  GxLoc, GyLoc, GxLocM1, GyLocM1, GridCellM1, NumClassesM1: integer;
 
   function CellGlyph(Cls: integer): char;
   begin
@@ -92330,6 +92342,10 @@ begin
     if GyLoc < 2 then GyLoc := 2;
     if GxLoc > cMaxGrid then GxLoc := cMaxGrid;
     if GyLoc > cMaxGrid then GyLoc := cMaxGrid;
+    GxLocM1 := GxLoc - 1;
+    GyLocM1 := GyLoc - 1;
+    GridCellM1 := GxLoc * GyLoc - 1;
+    NumClassesM1 := NumClasses - 1;
 
     HaveProbes := (Probes <> nil) and (Probes.Count > 0);
 
@@ -92367,16 +92383,16 @@ begin
     SetLength(ArgMax, GxLoc * GyLoc);
     SetLength(TopProb, GxLoc * GyLoc);
     SetLength(ProbeClass, GxLoc * GyLoc);
-    for ci := 0 to GxLoc * GyLoc - 1 do ProbeClass[ci] := -1;
+    for ci := 0 to GridCellM1 do ProbeClass[ci] := -1;
 
     InVol := TNNetVolume.Create(2, 1, 1);
     OutVol := TNNetVolume.Create();
 
     // Sweep the grid: one forward pass per cell.
-    for iy := 0 to GyLoc - 1 do
+    for iy := 0 to GyLocM1 do
     begin
       vy := yMin + (iy / (GyLoc - 1)) * BoxH;
-      for ix := 0 to GxLoc - 1 do
+      for ix := 0 to GxLocM1 do
       begin
         vx := xMin + (ix / (GxLoc - 1)) * BoxW;
         InVol.FData[0] := vx;
@@ -92387,7 +92403,7 @@ begin
         // top1 / top2 of the raw output values.
         Top1 := -1e30; Top2 := -1e30; Sum := 0;
         NeighIdx := 0; // reuse as argmax index here
-        for ci := 0 to NumClasses - 1 do
+        for ci := 0 to NumClassesM1 do
         begin
           Sum := Sum + OutVol.FData[ci];
           if OutVol.FData[ci] > Top1 then
@@ -92447,8 +92463,8 @@ begin
     // Boundary cells: a cell counts as a boundary cell when any 4-neighbour
     // disagrees with it on argmax.
     BoundaryCells := 0;
-    for iy := 0 to GyLoc - 1 do
-      for ix := 0 to GxLoc - 1 do
+    for iy := 0 to GyLocM1 do
+      for ix := 0 to GxLocM1 do
       begin
         CenterArg := ArgMax[iy * GxLoc + ix];
         for NeighIdx := 0 to 3 do
@@ -92490,7 +92506,7 @@ begin
     for iy := GyLoc - 1 downto 0 do
     begin
       RowStr := '  ';
-      for ix := 0 to GxLoc - 1 do
+      for ix := 0 to GxLocM1 do
         RowStr := RowStr + CellGlyph(ArgMax[iy * GxLoc + ix]);
       Lines.Add(RowStr);
     end;
@@ -92503,7 +92519,7 @@ begin
     for iy := GyLoc - 1 downto 0 do
     begin
       RowStr := '  ';
-      for ix := 0 to GxLoc - 1 do
+      for ix := 0 to GxLocM1 do
       begin
         Conf := TopProb[iy * GxLoc + ix];
         Bucket := Trunc(Conf * (Length(cConfBuckets) - 1) + 0.5);
@@ -92525,7 +92541,7 @@ begin
       for iy := GyLoc - 1 downto 0 do
       begin
         RowStr := '  ';
-        for ix := 0 to GxLoc - 1 do
+        for ix := 0 to GxLocM1 do
         begin
           if ProbeClass[iy * GxLoc + ix] >= 0 then
             RowStr := RowStr + CellGlyph(ProbeClass[iy * GxLoc + ix])
@@ -92554,10 +92570,10 @@ begin
       Lines.Add('');
       Lines.Add('--- BEGIN CSV (x,y,argmax,top1prob) ---');
       Lines.Add('x,y,argmax,top1prob');
-      for iy := 0 to GyLoc - 1 do
+      for iy := 0 to GyLocM1 do
       begin
         vy := yMin + (iy / (GyLoc - 1)) * BoxH;
-        for ix := 0 to GxLoc - 1 do
+        for ix := 0 to GxLocM1 do
         begin
           vx := xMin + (ix / (GxLoc - 1)) * BoxW;
           Lines.Add(Format('%.6f,%.6f,%d,%.6f',
@@ -92588,6 +92604,7 @@ var
   Tree: TNNetSoftDecisionTree;
   Layer: TNNetLayer;
   D, NumInner, NumLeaves, InSize, BatchN: integer;
+  NumInnerM1, NumLeavesM1, BatchNM1, LastLayerIdx: integer;
   Beta: TNeuralFloat;
   PrevOut: TNNetVolume;
   i, l, level, node, bit, s: integer;
@@ -92625,7 +92642,8 @@ begin
     // Locate the first TNNetSoftDecisionTree layer.
     Tree := nil;
     TreeIdx := -1;
-    for LayerIdx := 0 to NN.GetLastLayerIdx() do
+    LastLayerIdx := NN.GetLastLayerIdx();
+    for LayerIdx := 0 to LastLayerIdx do
     begin
       Layer := NN.Layers[LayerIdx];
       if Layer is TNNetSoftDecisionTree then
@@ -92654,23 +92672,26 @@ begin
     InSize := Tree.PrevLayer.Output.Size;
     Beta := Tree.Beta;
     BatchN := Probe.Count;
+    NumInnerM1 := NumInner - 1;
+    NumLeavesM1 := NumLeaves - 1;
+    BatchNM1 := BatchN - 1;
 
     SetLength(GateP, NumInner);
     SetLength(LeafProb, NumLeaves);
     SetLength(SumLeafProb, NumLeaves);
     SetLength(SumGateEntropy, NumInner);
-    for i := 0 to NumInner - 1 do SumGateEntropy[i] := 0;
-    for l := 0 to NumLeaves - 1 do SumLeafProb[l] := 0;
+    for i := 0 to NumInnerM1 do SumGateEntropy[i] := 0;
+    for l := 0 to NumLeavesM1 do SumLeafProb[l] := 0;
     SumEffLeaves := 0;
 
     // ---- Recompute routing over the probe batch (forward only). ----
-    for s := 0 to BatchN - 1 do
+    for s := 0 to BatchNM1 do
     begin
       NN.Compute(Probe[s]);
       PrevOut := Tree.PrevLayer.Output;
 
       // Inner-gate probabilities p_i = sigmoid(beta*(w_i.x + b_i)).
-      for i := 0 to NumInner - 1 do
+      for i := 0 to NumInnerM1 do
       begin
         zi := Tree.Neurons[i].Weights.DotProduct(PrevOut) +
               Tree.Neurons[i].BiasWeight;
@@ -92687,7 +92708,7 @@ begin
       // Per-leaf path probability (same heap layout as Compute: MSB = root,
       // bit=0 -> left -> factor p_i, bit=1 -> right -> 1-p_i).
       sampleNegEntropy := 0;
-      for l := 0 to NumLeaves - 1 do
+      for l := 0 to NumLeavesM1 do
       begin
         prob := 1.0;
         node := 0;
@@ -92728,11 +92749,11 @@ begin
 
     // ---- (1) Per-leaf occupancy = mean P_l over the batch. ----
     MaxOcc := 0;
-    for l := 0 to NumLeaves - 1 do
+    for l := 0 to NumLeavesM1 do
       if (SumLeafProb[l] / BatchN) > MaxOcc then MaxOcc := SumLeafProb[l] / BatchN;
     Lines.Add(Format('(1) Per-leaf OCCUPANCY = mean P_l over the batch ' +
       '(uniform = %.4f). Are all %d leaves used?', [1.0 / NumLeaves, NumLeaves]));
-    for l := 0 to NumLeaves - 1 do
+    for l := 0 to NumLeavesM1 do
     begin
       plv := SumLeafProb[l] / BatchN;
       if MaxOcc > cEps then
@@ -92746,13 +92767,13 @@ begin
 
     // ---- (2) Average per-gate binary entropy. ----
     OverallGateH := 0;
-    for i := 0 to NumInner - 1 do
+    for i := 0 to NumInnerM1 do
       OverallGateH := OverallGateH + (SumGateEntropy[i] / BatchN);
     if NumInner > 0 then OverallGateH := OverallGateH / NumInner;
     Lines.Add(Format('(2) Average per-gate BINARY ENTROPY H(p_i) in bits ' +
       '[0=crisp split, 1=mushy/undecided]. Overall mean = %.4f.',
       [OverallGateH]));
-    for i := 0 to NumInner - 1 do
+    for i := 0 to NumInnerM1 do
     begin
       hh := SumGateEntropy[i] / BatchN;
       BarLen := Round(hh * cBarW); // H in [0,1] maps directly to the bar.
@@ -92809,6 +92830,7 @@ var
   TmpF: TNeuralFloat;
   Shown: integer;
   RecallLoss: TNeuralFloat;
+  NumClassesM1, TotalM1, PairTotalM1, ShownM1, KM1, KM2: integer;
 begin
   Result := '';
   Lines := TStringList.Create();
@@ -92829,6 +92851,7 @@ begin
       Exit;
     end;
 
+    NumClassesM1 := NumClasses - 1;
     SetLength(Matrix, NumClasses, NumClasses);
     SetLength(RowSum, NumClasses);
     SetLength(ColSum, NumClasses);
@@ -92838,9 +92861,9 @@ begin
     SetLength(F1, NumClasses);
     SetLength(HardIdx, NumClasses);
     SetLength(HardConf, NumClasses);
-    for I := 0 to NumClasses - 1 do
+    for I := 0 to NumClassesM1 do
     begin
-      for J := 0 to NumClasses - 1 do Matrix[I][J] := 0;
+      for J := 0 to NumClassesM1 do Matrix[I][J] := 0;
       RowSum[I] := 0;
       ColSum[I] := 0;
       TruePos[I] := 0;
@@ -92852,7 +92875,8 @@ begin
     end;
 
     Total := Samples.Count;
-    for I := 0 to Total - 1 do
+    TotalM1 := Total - 1;
+    for I := 0 to TotalM1 do
     begin
       Pair := Samples[I];
       if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
@@ -92875,6 +92899,7 @@ begin
         // Insert into HardIdx[T] / HardConf[T] keeping at most
         // HardExamplesPerClass items with the LOWEST confidence values.
         K := Length(HardIdx[T]);
+        KM1 := K - 1;
         if K < HardExamplesPerClass then
         begin
           SetLength(HardIdx[T], K + 1);
@@ -92887,7 +92912,7 @@ begin
           // find current max-confidence entry; replace if Conf is smaller
           WorstIdx := 0;
           WorstConf := HardConf[T][0];
-          for J := 1 to K - 1 do
+          for J := 1 to KM1 do
             if HardConf[T][J] > WorstConf then
             begin
               WorstConf := HardConf[T][J];
@@ -92906,15 +92931,15 @@ begin
     ColW := 7;
     Lines.Add('Confusion matrix (rows = true class, cols = predicted class):');
     Line := Format('%6s', ['t\p']);
-    for J := 0 to NumClasses - 1 do
+    for J := 0 to NumClassesM1 do
       Line := Line + Format(' %*d', [ColW, J]);
     Line := Line + Format(' %*s', [ColW, 'sum']);
     Lines.Add(Line);
     Lines.Add(StringOfChar('-', Length(Line)));
-    for I := 0 to NumClasses - 1 do
+    for I := 0 to NumClassesM1 do
     begin
       Line := Format('%6d', [I]);
-      for J := 0 to NumClasses - 1 do
+      for J := 0 to NumClassesM1 do
         Line := Line + Format(' %*d', [ColW, Matrix[I][J]]);
       Line := Line + Format(' %*d', [ColW, RowSum[I]]);
       Lines.Add(Line);
@@ -92924,14 +92949,14 @@ begin
     // Row-normalized variant (per-row recall)
     Lines.Add('Row-normalized (each cell = Matrix[i][j] / row_sum[i]):');
     Line := Format('%6s', ['t\p']);
-    for J := 0 to NumClasses - 1 do
+    for J := 0 to NumClassesM1 do
       Line := Line + Format(' %*d', [ColW, J]);
     Lines.Add(Line);
     Lines.Add(StringOfChar('-', Length(Line)));
-    for I := 0 to NumClasses - 1 do
+    for I := 0 to NumClassesM1 do
     begin
       Line := Format('%6d', [I]);
-      for J := 0 to NumClasses - 1 do
+      for J := 0 to NumClassesM1 do
       begin
         if RowSum[I] > 0 then
           Line := Line + Format(' %*.*f', [ColW, 3, Matrix[I][J] / RowSum[I]])
@@ -92947,7 +92972,7 @@ begin
     SumFP := 0;
     SumFN := 0;
     RecallSum := 0;
-    for I := 0 to NumClasses - 1 do
+    for I := 0 to NumClassesM1 do
     begin
       if ColSum[I] > 0 then
         Precision[I] := TruePos[I] / ColSum[I]
@@ -92971,7 +92996,7 @@ begin
       ['Class', 'Precision', 'Recall', 'F1', 'Support']));
     Lines.Add(StringOfChar('-', 50));
     MacroF1 := 0;
-    for I := 0 to NumClasses - 1 do
+    for I := 0 to NumClassesM1 do
     begin
       MacroF1 := MacroF1 + F1[I];
       Lines.Add(Format('%-6d %10.4f %10.4f %10.4f %10d',
@@ -93017,8 +93042,8 @@ begin
       SetLength(PairTrue, NumClasses * NumClasses);
       SetLength(PairPred, NumClasses * NumClasses);
       SetLength(PairCount, NumClasses * NumClasses);
-      for I := 0 to NumClasses - 1 do
-        for J := 0 to NumClasses - 1 do
+      for I := 0 to NumClassesM1 do
+        for J := 0 to NumClassesM1 do
           if (I <> J) and (Matrix[I][J] > 0) then
           begin
             PairTrue[PairTotal] := I;
@@ -93029,10 +93054,12 @@ begin
       // simple selection sort: descending by count, take top K
       Shown := TopConfusedPairs;
       if Shown > PairTotal then Shown := PairTotal;
-      for I := 0 to Shown - 1 do
+      ShownM1 := Shown - 1;
+      PairTotalM1 := PairTotal - 1;
+      for I := 0 to ShownM1 do
       begin
         WorstIdx := I;
-        for J := I + 1 to PairTotal - 1 do
+        for J := I + 1 to PairTotalM1 do
           if PairCount[J] > PairCount[WorstIdx] then WorstIdx := J;
         if WorstIdx <> I then
         begin
@@ -93047,7 +93074,7 @@ begin
       Lines.Add(Format('%-6s %-6s %10s %14s',
         ['true', 'pred', 'count', 'recall_loss']));
       Lines.Add(StringOfChar('-', 42));
-      for I := 0 to Shown - 1 do
+      for I := 0 to ShownM1 do
       begin
         if RowSum[PairTrue[I]] > 0 then
           RecallLoss := PairCount[I] / RowSum[PairTrue[I]]
@@ -93064,14 +93091,16 @@ begin
     begin
       Lines.Add(Format('Hard examples per class (up to %d, sorted by confidence asc):',
         [HardExamplesPerClass]));
-      for I := 0 to NumClasses - 1 do
+      for I := 0 to NumClassesM1 do
       begin
         K := Length(HardIdx[I]);
+        KM1 := K - 1;
+        KM2 := K - 2;
         // sort ascending by confidence (simple selection sort)
-        for J := 0 to K - 2 do
+        for J := 0 to KM2 do
         begin
           WorstIdx := J;
-          for T := J + 1 to K - 1 do
+          for T := J + 1 to KM1 do
             if HardConf[I][T] < HardConf[I][WorstIdx] then WorstIdx := T;
           if WorstIdx <> J then
           begin
@@ -93083,7 +93112,7 @@ begin
         if K = 0 then
           Line := Line + ' (none)'
         else
-          for J := 0 to K - 1 do
+          for J := 0 to KM1 do
             Line := Line + Format(' %d(%.3f)', [HardIdx[I][J], HardConf[I][J]]);
         Lines.Add(Line);
       end;
@@ -93104,11 +93133,13 @@ class function TNNet.TopLogitMarginReport(
 ): string;
 const
   cBins = 10;
+  cBinsM1 = cBins - 1;
   cMaxBarWidth = 40;
 var
   LpBnd254: integer;
   LpBnd255: integer;
   LpBnd256: integer;
+  NumClassesM1, SampleCountM1, KM1, KM2: integer;
   Lines: TStringList;
   // per-sample margin and its true class
   Margins: array of TNeuralFloat;
@@ -93137,7 +93168,7 @@ var
   function MedianOf(const Arr: array of TNeuralFloat): TNeuralFloat;
   var
     Work: array of TNeuralFloat;
-    A, B, MinPos, N: integer;
+    A, B, MinPos, N, NM1, NM2: integer;
     Sw: TNeuralFloat;
   begin
     N := Length(Arr);
@@ -93146,13 +93177,15 @@ var
       Result := 0;
       Exit;
     end;
+    NM1 := N - 1;
+    NM2 := N - 2;
     SetLength(Work, N);
-    for A := 0 to N - 1 do Work[A] := Arr[A];
+    for A := 0 to NM1 do Work[A] := Arr[A];
     // selection sort (N is small in these diagnostics)
-    for A := 0 to N - 2 do
+    for A := 0 to NM2 do
     begin
       MinPos := A;
-      for B := A + 1 to N - 1 do
+      for B := A + 1 to NM1 do
         if Work[B] < Work[MinPos] then MinPos := B;
       if MinPos <> A then
       begin
@@ -93185,10 +93218,11 @@ begin
       Exit;
     end;
 
+    NumClassesM1 := NumClasses - 1;
     SetLength(ClassMargins, NumClasses);
     SetLength(HardIdx, NumClasses);
     SetLength(HardMrg, NumClasses);
-    for I := 0 to NumClasses - 1 do
+    for I := 0 to NumClassesM1 do
     begin
       SetLength(ClassMargins[I], 0);
       SetLength(HardIdx[I], 0);
@@ -93248,6 +93282,7 @@ begin
       if HardExamplesPerClass > 0 then
       begin
         K := Length(HardIdx[T]);
+        KM1 := K - 1;
         if K < HardExamplesPerClass then
         begin
           SetLength(HardIdx[T], K + 1);
@@ -93260,7 +93295,7 @@ begin
           // replace the current largest-margin entry if this one is smaller
           WorstIdx := 0;
           WorstMrg := HardMrg[T][0];
-          for J := 1 to K - 1 do
+          for J := 1 to KM1 do
             if HardMrg[T][J] > WorstMrg then
             begin
               WorstMrg := HardMrg[T][J];
@@ -93286,7 +93321,8 @@ begin
     SumAll := 0;
     MinMargin := Margins[0];
     MaxMargin := Margins[0];
-    for I := 0 to SampleCount - 1 do
+    SampleCountM1 := SampleCount - 1;
+    for I := 0 to SampleCountM1 do
     begin
       AllMargins[I] := Margins[I];
       SumAll := SumAll + Margins[I];
@@ -93305,9 +93341,9 @@ begin
 
     // (a) overall 10-bin margin histogram over [MinMargin, MaxMargin]
     SetLength(Bins, cBins);
-    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+    for BinIdx := 0 to cBinsM1 do Bins[BinIdx] := 0;
     Span := MaxMargin - MinMargin;
-    for I := 0 to SampleCount - 1 do
+    for I := 0 to SampleCountM1 do
     begin
       if Span > 0 then
         BinIdx := Trunc(((Margins[I] - MinMargin) / Span) * cBins)
@@ -93318,11 +93354,11 @@ begin
       Inc(Bins[BinIdx]);
     end;
     MaxBin := 0;
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
       if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
     Lines.Add(Format('Margin histogram (%d bins over [%.4f, %.4f]):',
       [cBins, MinMargin, MaxMargin]));
-    for BinIdx := 0 to cBins - 1 do
+    for BinIdx := 0 to cBinsM1 do
     begin
       if Span > 0 then
       begin
@@ -93348,16 +93384,17 @@ begin
     Lines.Add(Format('%-6s %8s %10s %10s', ['Class', 'Support', 'MeanMrg',
       'MedianMrg']));
     Lines.Add(StringOfChar('-', 38));
-    for I := 0 to NumClasses - 1 do
+    for I := 0 to NumClassesM1 do
     begin
       K := Length(ClassMargins[I]);
+      KM1 := K - 1;
       if K = 0 then
       begin
         Lines.Add(Format('%-6d %8d %10s %10s', [I, 0, '-', '-']));
         Continue;
       end;
       ClassMean := 0;
-      for J := 0 to K - 1 do ClassMean := ClassMean + ClassMargins[I][J];
+      for J := 0 to KM1 do ClassMean := ClassMean + ClassMargins[I][J];
       ClassMean := ClassMean / K;
       ClassMedian := MedianOf(ClassMargins[I]);
       Lines.Add(Format('%-6d %8d %10.4f %10.4f',
@@ -93370,14 +93407,16 @@ begin
     begin
       Lines.Add(Format('Hard examples per class (up to %d, lowest margin first):',
         [HardExamplesPerClass]));
-      for I := 0 to NumClasses - 1 do
+      for I := 0 to NumClassesM1 do
       begin
         K := Length(HardIdx[I]);
+        KM1 := K - 1;
+        KM2 := K - 2;
         // sort ascending by margin (selection sort)
-        for J := 0 to K - 2 do
+        for J := 0 to KM2 do
         begin
           WorstIdx := J;
-          for T := J + 1 to K - 1 do
+          for T := J + 1 to KM1 do
             if HardMrg[I][T] < HardMrg[I][WorstIdx] then WorstIdx := T;
           if WorstIdx <> J then
           begin
@@ -93389,7 +93428,7 @@ begin
         if K = 0 then
           Line := Line + ' (none)'
         else
-          for J := 0 to K - 1 do
+          for J := 0 to KM1 do
             Line := Line + Format(' %d(%.4f)', [HardIdx[I][J], HardMrg[I][J]]);
         Lines.Add(Line);
       end;
@@ -93412,12 +93451,14 @@ class function TNNet.PerplexityReport(
 const
   cEps = 1e-12;
   cBins = 10;
+  cBinsM1 = cBins - 1;
 var
   Lines: TStringList;
   Input: TNNetVolume;
   Last: TNNetLayer;
   IsLogSpace: boolean;
   V, TgtTok, BinIdx: integer;
+  VM1, NM1, ContextLenM1, TotalCountM1, WorstKM1: integer;
   TotalCount, Top1Hits, Top5Hits, TotalChars: integer;
   CharLenLocal: integer;
   SumNats, SumBits, SumBitsForBPC, OutVal, NatsHere, BitsHere: TNeuralFloat;
@@ -93478,6 +93519,9 @@ begin
       Exit;
     end;
     V := Last.Output.Size;
+    VM1 := V - 1;
+    NM1 := N - 1;
+    ContextLenM1 := ContextLen - 1;
 
     // Auto-detect log-space vs probability-space by sniffing the final layer.
     IsLogSpace := (Last is TNNetLogSoftMax) or
@@ -93495,6 +93539,7 @@ begin
 
     if WorstK < 0 then WorstK := 0;
     if WorstK > N - ContextLen then WorstK := N - ContextLen;
+    WorstKM1 := WorstK - 1;
 
     // Build a 1-D input volume of token ids of size ContextLen. This shape is
     // consumed by TNNetEmbedding / TNNetTokenAndPositionalEmbedding, and is
@@ -93502,6 +93547,7 @@ begin
     Input := TNNetVolume.Create(ContextLen, 1, 1);
 
     TotalCount := N - ContextLen;
+    TotalCountM1 := TotalCount - 1;
     SetLength(PerTokenBits, TotalCount);
     SetLength(PerTokenIdx, TotalCount);
 
@@ -93512,10 +93558,10 @@ begin
     Top1Hits := 0;
     Top5Hits := 0;
 
-    for t := ContextLen to N - 1 do
+    for t := ContextLen to NM1 do
     begin
       // Fill input window.
-      for d := 0 to ContextLen - 1 do
+      for d := 0 to ContextLenM1 do
         Input.FData[d] := Tokens[t - ContextLen + d];
 
       NN.Compute(Input);
@@ -93558,7 +93604,7 @@ begin
         TopIdx[k] := -1;
         TopVal[k] := -1e30;
       end;
-      for d := 0 to V - 1 do
+      for d := 0 to VM1 do
       begin
         curVal := Output.FData[d];
         if curVal > TopVal[4] then
@@ -93648,7 +93694,7 @@ begin
     // 10-bin histogram of per-token bits.
     Lines.Add('Per-token bits histogram:');
     SetLength(Bins, cBins);
-    for BinIdx := 0 to cBins - 1 do Bins[BinIdx] := 0;
+    for BinIdx := 0 to cBinsM1 do Bins[BinIdx] := 0;
     if TotalCount = 0 then
     begin
       Lines.Add('  (no positions scored)');
@@ -93657,14 +93703,14 @@ begin
     begin
       HistMin := PerTokenBits[0];
       HistMax := PerTokenBits[0];
-      for t := 1 to TotalCount - 1 do
+      for t := 1 to TotalCountM1 do
       begin
         if PerTokenBits[t] < HistMin then HistMin := PerTokenBits[t];
         if PerTokenBits[t] > HistMax then HistMax := PerTokenBits[t];
       end;
       Span := HistMax - HistMin;
       if Span < 1e-9 then Span := 1e-9;
-      for t := 0 to TotalCount - 1 do
+      for t := 0 to TotalCountM1 do
       begin
         BinIdx := Trunc(((PerTokenBits[t] - HistMin) / Span) * cBins);
         if BinIdx >= cBins then BinIdx := cBins - 1;
@@ -93672,10 +93718,10 @@ begin
         Inc(Bins[BinIdx]);
       end;
       MaxBin := 0;
-      for BinIdx := 0 to cBins - 1 do
+      for BinIdx := 0 to cBinsM1 do
         if Bins[BinIdx] > MaxBin then MaxBin := Bins[BinIdx];
       MaxBarWidth := 40;
-      for BinIdx := 0 to cBins - 1 do
+      for BinIdx := 0 to cBinsM1 do
       begin
         BinCenter := HistMin + (BinIdx + 0.5) * (Span / cBins);
         if MaxBin > 0 then
@@ -93696,15 +93742,15 @@ begin
         [WorstK]));
       SetLength(worstIdxs, TotalCount);
       SetLength(worstBits, TotalCount);
-      for t := 0 to TotalCount - 1 do
+      for t := 0 to TotalCountM1 do
       begin
         worstIdxs[t] := PerTokenIdx[t];
         worstBits[t] := PerTokenBits[t];
       end;
       // Partial selection sort, only WorstK passes.
-      for sortI := 0 to WorstK - 1 do
+      for sortI := 0 to WorstKM1 do
       begin
-        for sortJ := sortI + 1 to TotalCount - 1 do
+        for sortJ := sortI + 1 to TotalCountM1 do
         begin
           if worstBits[sortJ] > worstBits[sortI] then
           begin
@@ -93719,11 +93765,11 @@ begin
       end;
       Lines.Add(Format('  %-5s %-8s %-12s %s',
         ['rank', 'pos', 'bits', 'token_id  context_window']));
-      for sortI := 0 to WorstK - 1 do
+      for sortI := 0 to WorstKM1 do
       begin
         t := worstIdxs[sortI];
         ctxStr := '[';
-        for d := 0 to ContextLen - 1 do
+        for d := 0 to ContextLenM1 do
         begin
           if d > 0 then ctxStr := ctxStr + ',';
           ctxStr := ctxStr + IntToStr(Tokens[t - ContextLen + d]);
@@ -93757,12 +93803,13 @@ end;
 
 function TNNet.GetWeightSum(): TNeuralFloat;
 var
-  LayerCnt: integer;
+  LayerCnt, LastIdx: integer;
 begin
   Result := 0;
   if FLayers.Count > 0 then
   begin
-    for LayerCnt := 0 to GetLastLayerIdx() do
+    LastIdx := GetLastLayerIdx();
+    for LayerCnt := 0 to LastIdx do
     begin
       Result := Result + FLayers[LayerCnt].GetWeightSum();
     end;
@@ -93771,12 +93818,13 @@ end;
 
 function TNNet.GetBiasSum(): TNeuralFloat;
 var
-  LayerCnt: integer;
+  LayerCnt, LastIdx: integer;
 begin
   Result := 0;
   if FLayers.Count > 0 then
   begin
-    for LayerCnt := 0 to GetLastLayerIdx() do
+    LastIdx := GetLastLayerIdx();
+    for LayerCnt := 0 to LastIdx do
     begin
       Result := Result + FLayers[LayerCnt].GetBiasSum();
     end;
@@ -93785,12 +93833,13 @@ end;
 
 function TNNet.GetInertiaSum(): TNeuralFloat;
 var
-  LayerCnt: integer;
+  LayerCnt, LastIdx: integer;
 begin
   Result := 0;
   if FLayers.Count > 0 then
   begin
-    for LayerCnt := 0 to GetLastLayerIdx() do
+    LastIdx := GetLastLayerIdx();
+    for LayerCnt := 0 to LastIdx do
     begin
       Result := Result + FLayers[LayerCnt].GetInertiaSum();
     end;
@@ -93799,12 +93848,13 @@ end;
 
 function TNNet.GetDeltaSum(): TNeuralFloat;
 var
-  LayerCnt: integer;
+  LayerCnt, LastIdx: integer;
 begin
   Result := 0;
   if FLayers.Count > 0 then
   begin
-    for LayerCnt := 0 to GetLastLayerIdx() do
+    LastIdx := GetLastLayerIdx();
+    for LayerCnt := 0 to LastIdx do
     begin
       Result := Result + FLayers[LayerCnt].GetDeltaSum();
     end;
@@ -93817,11 +93867,12 @@ function BuildMultiQuantileLoss(N: integer;
   const Ft: array of TNeuralFloat): TNNetMultiQuantileLoss;
 var
   Qs: array of TNeuralFloat;
-  I: integer;
+  I, NM1: integer;
 begin
   if (N < 1) or (N > csNNetMaxParameterIdx + 1) then N := 1;
   SetLength(Qs, N);
-  for I := 0 to N - 1 do Qs[I] := Ft[I];
+  NM1 := N - 1;
+  for I := 0 to NM1 do Qs[I] := Ft[I];
   Result := TNNetMultiQuantileLoss.Create(Qs);
 end;
 
@@ -93841,9 +93892,12 @@ var
   SCount: integer;
   StructCount: integer;
   SegSrc: TNNetLayer;
+  StHigh, FtHigh: integer;
 begin
   Result := nil;
   SegSrc := nil;
+  StHigh := High(St);
+  FtHigh := High(Ft);
   S := CreateTokenizedStringList(strData,':');
   S2 := CreateTokenizedStringList(strData,';');
 
@@ -93858,7 +93912,7 @@ begin
     //   WriteLn('hello');
     // end;
 
-    for I := Low(St) to High(St) do St[i] := 0;
+    for I := Low(St) to StHigh do St[i] := 0;
     S2.DelimitedText := S[1];
     StructCount := S2.Count;
     if S2.Count > 0 then
@@ -93891,7 +93945,7 @@ begin
 
     if SCount >= 4 then
     begin
-      for I := Low(Ft) to High(Ft) do Ft[i] := 0;
+      for I := Low(Ft) to FtHigh do Ft[i] := 0;
       S2.DelimitedText := S[3];
       if S2.Count > 0 then
       begin
@@ -93902,7 +93956,7 @@ begin
     else
     // backward compatibility
     begin
-      for I := Low(Ft) to High(Ft) do Ft[i] := St[i];
+      for I := Low(Ft) to FtHigh do Ft[i] := St[i];
     end;
 
     {$IFDEF FPC}
@@ -94853,7 +94907,7 @@ var
   FeaturesPerGroup: integer;
   InputChannelsPerGroup: integer;
   EachGroupOutput: array of TNNetLayer;
-  GroupCnt: integer;
+  GroupCnt, GroupsM1: integer;
 begin
   if pInputPadding > 0 then
   begin
@@ -94873,7 +94927,8 @@ begin
   end;
   if Groups > 1 then
   begin
-    for GroupCnt := 0 to Groups - 1 do
+    GroupsM1 := Groups - 1;
+    for GroupCnt := 0 to GroupsM1 do
     begin
       if ChannelInterleaving
         then AddLayerAfter( TNNetSplitChannelEvery.Create(Groups, GroupCnt), PreviousLayer)
