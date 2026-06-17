@@ -24312,9 +24312,10 @@ var
   // the word is a vocabulary token, copies them into its embedding row.
   procedure ParseDataLine(P: integer; const WordStr: string);
   var
-    DimCnt: integer;
+    DimCnt, EmbDimM1: integer;
   begin
-    for DimCnt := 0 to EmbDim - 1 do
+    EmbDimM1 := EmbDim - 1;
+    for DimCnt := 0 to EmbDimM1 do
     begin
       Field := NextField(P);
       if Field = '' then
@@ -24339,7 +24340,7 @@ var
     begin
       if not Matched[TokenIdx] then Inc(MatchedCnt);
       Matched[TokenIdx] := true;
-      for DimCnt := 0 to EmbDim - 1 do
+      for DimCnt := 0 to EmbDimM1 do
         Weights.FData[TokenIdx * EmbDim + DimCnt] := Row[DimCnt];
     end;
   end;
@@ -24347,15 +24348,16 @@ var
   // True when S is a plain unsigned integer (a "count dim" header field).
   function IsPlainInteger(const S: string): boolean;
   var
-    CharPos: integer;
+    CharPos, LenS: integer;
   begin
     Result := S <> '';
-    for CharPos := 1 to Length(S) do
+    LenS := Length(S);
+    for CharPos := 1 to LenS do
       if not (S[CharPos] in ['0'..'9']) then Result := false;
   end;
 
 var
-  P: integer;
+  P, EmbDimM1B, VocabRowsM1: integer;
   WordStr, SecondField, ThirdField: string;
 begin
   Result := 0;
@@ -24367,11 +24369,13 @@ begin
     ImportError('Embedding import: file not found: ' + FileName);
   EmbDim := Embedding.EmbeddingSize;
   VocabRows := Embedding.VocabSize;
+  EmbDimM1B := EmbDim - 1;
+  VocabRowsM1 := VocabRows - 1;
   Weights := Embedding.FArrNeurons[0].Weights;
   FS := DefaultFormatSettings;
   FS.DecimalSeparator := '.'; // the format is locale-independent
   SetLength(Matched, VocabRows);
-  for RowCnt := 0 to VocabRows - 1 do Matched[RowCnt] := false;
+  for RowCnt := 0 to VocabRowsM1 do Matched[RowCnt] := false;
   SetLength(Row, EmbDim);
   MatchedCnt := 0;
   LineNo := 0;
@@ -24417,14 +24421,14 @@ begin
     // one match, the mean vector is a better prior than the random init.
     if (MatchedCnt > 0) and (MatchedCnt < VocabRows) then
     begin
-      for DimCnt := 0 to EmbDim - 1 do
+      for DimCnt := 0 to EmbDimM1B do
       begin
         MeanVal := 0;
-        for RowCnt := 0 to VocabRows - 1 do
+        for RowCnt := 0 to VocabRowsM1 do
           if Matched[RowCnt] then
             MeanVal := MeanVal + Weights.FData[RowCnt * EmbDim + DimCnt];
         MeanVal := MeanVal / MatchedCnt;
-        for RowCnt := 0 to VocabRows - 1 do
+        for RowCnt := 0 to VocabRowsM1 do
           if not Matched[RowCnt] then
             Weights.FData[RowCnt * EmbDim + DimCnt] := MeanVal;
       end;
@@ -24560,14 +24564,18 @@ procedure BuildT5StackBlocks(NN: TNNet; const Config: TT5Config;
   pQuantizeInt8: boolean = false);
 var
   InnerDim, BlockCnt, HeadCnt, d: integer;
+  NumBlocksM1, NumHeadsM1, DKVM1: integer;
   BranchInput, NormedSource: TNNetLayer;
   QSlice, KSlice, VSlice, HeadPack, KVPack: TNNetLayer;
   SliceChannels: array of integer;
 begin
   InnerDim := Config.NumHeads * Config.DKV;
+  NumBlocksM1 := NumBlocks - 1;
+  NumHeadsM1 := Config.NumHeads - 1;
+  DKVM1 := Config.DKV - 1;
   SetLength(Blocks, NumBlocks);
   SetLength(SliceChannels, Config.DKV);
-  for BlockCnt := 0 to NumBlocks - 1 do
+  for BlockCnt := 0 to NumBlocksM1 do
   begin
     // ---- self-attention sub-block (pre-norm, residual after) ----
     // Wired from primitives like the Llama importer; the per-head leaf is
@@ -24585,9 +24593,9 @@ begin
     Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
       TNNetPointwiseConvLinear.Create(InnerDim).SetInferenceOnly(pInferenceOnly), NormedSource);
     SetLength(Blocks[BlockCnt].SelfAttn.Heads, Config.NumHeads);
-    for HeadCnt := 0 to Config.NumHeads - 1 do
+    for HeadCnt := 0 to NumHeadsM1 do
     begin
-      for d := 0 to Config.DKV - 1 do
+      for d := 0 to DKVM1 do
         SliceChannels[d] := HeadCnt * Config.DKV + d;
       QSlice := NN.AddLayerAfter(
         TNNetSplitChannels.Create(SliceChannels),
@@ -24629,9 +24637,9 @@ begin
       Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
         TNNetPointwiseConvLinear.Create(InnerDim).SetInferenceOnly(pInferenceOnly), EncStates);
       SetLength(Blocks[BlockCnt].CrossAttn.Heads, Config.NumHeads);
-      for HeadCnt := 0 to Config.NumHeads - 1 do
+      for HeadCnt := 0 to NumHeadsM1 do
       begin
-        for d := 0 to Config.DKV - 1 do
+        for d := 0 to DKVM1 do
           SliceChannels[d] := HeadCnt * Config.DKV + d;
         QSlice := NN.AddLayerAfter(
           TNNetSplitChannels.Create(SliceChannels),
@@ -24693,6 +24701,7 @@ procedure LoadT5RelPosBias(Reader: TNNetSafeTensorsReader;
 var
   Tmp: TNNetVolume;
   BlockCnt, HeadCnt, BucketCnt: integer;
+  BlocksHi, NumHeadsM1, NumBucketsM1: integer;
   HeadLayer: TNNetLayer;
 begin
   if not Reader.HasTensor(WName) then
@@ -24704,10 +24713,13 @@ begin
       IntToStr(Config.RelPosNumBuckets) + ', ' +
       IntToStr(Config.NumHeads) + '], got ' + Reader.ShapeAsString(WName));
   Tmp := TNNetVolume.Create;
+  BlocksHi := High(Blocks);
+  NumHeadsM1 := Config.NumHeads - 1;
+  NumBucketsM1 := Config.RelPosNumBuckets - 1;
   try
     Reader.LoadTensorFlat(WName, Tmp);
-    for BlockCnt := 0 to High(Blocks) do
-      for HeadCnt := 0 to Config.NumHeads - 1 do
+    for BlockCnt := 0 to BlocksHi do
+      for HeadCnt := 0 to NumHeadsM1 do
       begin
         HeadLayer := Blocks[BlockCnt].SelfAttn.Heads[HeadCnt];
         if HeadLayer.FArrNeurons[0].Weights.Size <> Config.RelPosNumBuckets then
@@ -24715,7 +24727,7 @@ begin
             WName + '" has ' +
             IntToStr(HeadLayer.FArrNeurons[0].Weights.Size) +
             ' weights, expected ' + IntToStr(Config.RelPosNumBuckets) + '.');
-        for BucketCnt := 0 to Config.RelPosNumBuckets - 1 do
+        for BucketCnt := 0 to NumBucketsM1 do
           HeadLayer.FArrNeurons[0].Weights.FData[BucketCnt] :=
             Tmp.FData[BucketCnt * Config.NumHeads + HeadCnt];
         HeadLayer.FlushWeightCache();
@@ -24757,11 +24769,12 @@ procedure LoadT5Stack(Reader: TNNetSafeTensorsReader;
   const Blocks: TT5BlockArray; const StackPrefix: string;
   const Config: TT5Config; IsDecoder: boolean; Consumed: TStringList);
 var
-  BlockCnt, FFNIdx: integer;
+  BlockCnt, FFNIdx, BlocksHi: integer;
   BP, FFNPrefix: string;
 begin
   if IsDecoder then FFNIdx := 2 else FFNIdx := 1;
-  for BlockCnt := 0 to High(Blocks) do
+  BlocksHi := High(Blocks);
+  for BlockCnt := 0 to BlocksHi do
   begin
     BP := StackPrefix + 'block.' + IntToStr(BlockCnt) + '.';
     LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].SelfAttn.Norm,
@@ -24838,7 +24851,7 @@ var
   DecTokenInput, EncStates, LMHead: TNNetLayer;
   Consumed: TStringList;
   Tmp: TNNetVolume;
-  i, j: integer;
+  i, j, VocabSizeM1, DModelM1: integer;
   TieScale: TNeuralFloat;
   TensorNameStr: string;
 begin
@@ -24946,9 +24959,11 @@ begin
           // the scale is folded into the copied rows (bias-free).
           TieScale := 1.0 / Sqrt(Config.DModel);
           EnsureWritableImportWeights(LMHead);
-          for j := 0 to Config.VocabSize - 1 do
+          VocabSizeM1 := Config.VocabSize - 1;
+          DModelM1 := Config.DModel - 1;
+          for j := 0 to VocabSizeM1 do
           begin
-            for i := 0 to Config.DModel - 1 do
+            for i := 0 to DModelM1 do
               LMHead.FArrNeurons[j].Weights.FData[i] :=
                 TieScale * Tmp.FData[j * Config.DModel + i];
             LMHead.FArrNeurons[j].BiasWeight := 0;
@@ -25204,16 +25219,20 @@ procedure BuildMarianStackBlocks(NN: TNNet; const Config: TMarianConfig;
   pInferenceOnly: boolean; pQuantizeInt8: boolean = false);
 var
   HeadDim, BlockCnt, HeadCnt, d: integer;
+  NumBlocksM1, NumHeadsM1, HeadDimM1: integer;
   BranchInput: TNNetLayer;
   QSlice, KSlice, VSlice, HeadPack, KVPack: TNNetLayer;
   Heads: array of TNNetLayer;
   SliceChannels: array of integer;
 begin
   HeadDim := Config.DModel div NumHeads;
+  NumBlocksM1 := NumBlocks - 1;
+  NumHeadsM1 := NumHeads - 1;
+  HeadDimM1 := HeadDim - 1;
   SetLength(Blocks, NumBlocks);
   SetLength(SliceChannels, HeadDim);
   SetLength(Heads, NumHeads);
-  for BlockCnt := 0 to NumBlocks - 1 do
+  for BlockCnt := 0 to NumBlocksM1 do
   begin
     // ---- self-attention sub-block (residual add, THEN LayerNorm) ----
     // Standard softmax(QK^T/sqrt(head_dim)) per head - exactly what
@@ -25226,9 +25245,9 @@ begin
       TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), BranchInput);
     Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
       TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), BranchInput);
-    for HeadCnt := 0 to NumHeads - 1 do
+    for HeadCnt := 0 to NumHeadsM1 do
     begin
-      for d := 0 to HeadDim - 1 do
+      for d := 0 to HeadDimM1 do
         SliceChannels[d] := HeadCnt * HeadDim + d;
       QSlice := NN.AddLayerAfter(
         TNNetSplitChannels.Create(SliceChannels),
@@ -25267,9 +25286,9 @@ begin
         TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), EncStates);
       Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
         TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), EncStates);
-      for HeadCnt := 0 to NumHeads - 1 do
+      for HeadCnt := 0 to NumHeadsM1 do
       begin
-        for d := 0 to HeadDim - 1 do
+        for d := 0 to HeadDimM1 do
           SliceChannels[d] := HeadCnt * HeadDim + d;
         QSlice := NN.AddLayerAfter(
           TNNetSplitChannels.Create(SliceChannels),
@@ -25325,12 +25344,14 @@ end;
 procedure FillMarianSinusoidalPositions(Layer: TNNetLayer;
   SeqLen, DModel: integer);
 var
-  PosCnt, ChCnt, Half: integer;
+  PosCnt, ChCnt, Half, SeqLenM1, HalfM1: integer;
   Angle: double;
 begin
   Half := DModel div 2;
-  for PosCnt := 0 to SeqLen - 1 do
-    for ChCnt := 0 to Half - 1 do
+  SeqLenM1 := SeqLen - 1;
+  HalfM1 := Half - 1;
+  for PosCnt := 0 to SeqLenM1 do
+    for ChCnt := 0 to HalfM1 do
     begin
       Angle := PosCnt / Exp(Ln(10000.0) * (2 * ChCnt) / DModel);
       Layer.FArrNeurons[0].Weights.FData[PosCnt * DModel + ChCnt] := Sin(Angle);
@@ -25354,15 +25375,17 @@ procedure FillM2M100SinusoidalPositions(Layer: TNNetLayer;
 const
   M2M100PositionOffset = 2;
 var
-  PosCnt, ChCnt, Half, Row: integer;
+  PosCnt, ChCnt, Half, Row, SeqLenM1, HalfM1: integer;
   EmbConst, Angle: double;
 begin
   Half := DModel div 2;
   EmbConst := Ln(10000.0) / (Half - 1);
-  for PosCnt := 0 to SeqLen - 1 do
+  SeqLenM1 := SeqLen - 1;
+  HalfM1 := Half - 1;
+  for PosCnt := 0 to SeqLenM1 do
   begin
     Row := PosCnt + M2M100PositionOffset;
-    for ChCnt := 0 to Half - 1 do
+    for ChCnt := 0 to HalfM1 do
     begin
       Angle := Row * Exp(-ChCnt * EmbConst);
       Layer.FArrNeurons[0].Weights.FData[PosCnt * DModel + ChCnt] := Sin(Angle);
@@ -25410,10 +25433,11 @@ procedure LoadMarianStack(Reader: TNNetSafeTensorsReader;
   const Config: TMarianConfig; FFNDim: integer; IsDecoder: boolean;
   Consumed: TStringList);
 var
-  BlockCnt: integer;
+  BlockCnt, BlocksHi: integer;
   BP: string;
 begin
-  for BlockCnt := 0 to High(Blocks) do
+  BlocksHi := High(Blocks);
+  for BlockCnt := 0 to BlocksHi do
   begin
     BP := StackPrefix + IntToStr(BlockCnt) + '.';
     LoadMarianAttn(Reader, Blocks[BlockCnt].SelfAttn, BP + 'self_attn.',
@@ -25452,7 +25476,7 @@ var
   DecTokenInput, EncStates, LMHead: TNNetLayer;
   Consumed: TStringList;
   Tmp: TNNetVolume;
-  i, j: integer;
+  i, j, VocabSizeM1, DModelM1: integer;
   EmbedScale: TNeuralFloat;
   TensorNameStr: string;
 begin
@@ -25566,6 +25590,8 @@ begin
         else
           EmbedScale := 1.0;
         LpMax := Tmp.Size - 1;
+        VocabSizeM1 := Config.VocabSize - 1;
+        DModelM1 := Config.DModel - 1;
         for i := 0 to LpMax do
         begin
           EncEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
@@ -25576,12 +25602,12 @@ begin
         Consumed.Add('model.shared.weight');
         // Tied head: logits = h . shared^T + final_logits_bias.
         EnsureWritableImportWeights(LMHead);
-        for j := 0 to Config.VocabSize - 1 do
-          for i := 0 to Config.DModel - 1 do
+        for j := 0 to VocabSizeM1 do
+          for i := 0 to DModelM1 do
             LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.DModel + i];
         Reader.LoadTensorFlat('final_logits_bias', Tmp);
-        for j := 0 to Config.VocabSize - 1 do
+        for j := 0 to VocabSizeM1 do
           LMHead.FArrNeurons[j].BiasWeight := Tmp.FData[j];
         LMHead.FlushWeightCache();
         Consumed.Add('final_logits_bias');
@@ -25680,19 +25706,21 @@ procedure DumpT5Linear(Writer: TNNetSafeTensorsWriter; Layer: TNNetLayer;
   InvScale: TNeuralFloat; pDType: TSafeTensorsWriteDType);
 var
   W: TNNetVolume;
-  jj, ii: integer;
+  jj, ii, OutDimM1, InDimM1: integer;
 begin
   W := TNNetVolume.Create;
   try
     W.ReSize(OutDim * InDim, 1, 1);
-    for jj := 0 to OutDim - 1 do
+    OutDimM1 := OutDim - 1;
+    InDimM1 := InDim - 1;
+    for jj := 0 to OutDimM1 do
     begin
       if Layer.FArrNeurons[NeuronBase + jj].Weights.Size <> InDim then
         ImportError('T5 export: neuron ' + IntToStr(NeuronBase + jj) +
           ' for "' + WName + '" has ' +
           IntToStr(Layer.FArrNeurons[NeuronBase + jj].Weights.Size) +
           ' weights, expected ' + IntToStr(InDim) + '.');
-      for ii := 0 to InDim - 1 do
+      for ii := 0 to InDimM1 do
         W.FData[jj * InDim + ii] :=
           Layer.FArrNeurons[NeuronBase + jj].Weights.FData[ii] * InvScale;
     end;
@@ -25730,14 +25758,17 @@ var
     out LMHead: TNNetLayer; out RelHeads0: TT5ExportLayerArray);
   var
     PwConvs, Norms, RelHeads: array of TNNetLayer;
-    li, BlockCnt, PwBase, NormBase, PwPerBlock, NormPerBlock: integer;
+    li, BlockCnt, PwBase, NormBase, PwPerBlock, NormPerBlock, CountLayersM1, NumBlocksM1, NumHeadsM1: integer;
     BP, FFNPrefix, SAP, CAP: string;
     FFNIdx: integer;
   begin
+    CountLayersM1 := Net.CountLayers - 1;
+    NumBlocksM1 := NumBlocks - 1;
+    NumHeadsM1 := Config.NumHeads - 1;
     SetLength(PwConvs, 0);
     SetLength(Norms, 0);
     SetLength(RelHeads, 0);
-    for li := 0 to Net.CountLayers - 1 do
+    for li := 0 to CountLayersM1 do
     begin
       if Net.Layers[li] is TNNetT5RelPosBiasAttention then
       begin
@@ -25775,7 +25806,7 @@ var
       ImportError('T5 export: ' + StackPrefix + ' has ' +
         IntToStr(Length(RelHeads)) + ' relpos heads, expected ' +
         IntToStr(Config.NumHeads * NumBlocks) + '.');
-    for BlockCnt := 0 to NumBlocks - 1 do
+    for BlockCnt := 0 to NumBlocksM1 do
     begin
       BP := StackPrefix + 'block.' + IntToStr(BlockCnt) + '.';
       PwBase := BlockCnt * PwPerBlock;
@@ -25832,7 +25863,7 @@ var
       StackPrefix + 'final_layer_norm.weight', Config.DModel, pDType);
     // The block-0 per-head rel-pos columns (the SHARED table for the stack).
     SetLength(RelHeads0, Config.NumHeads);
-    for li := 0 to Config.NumHeads - 1 do
+    for li := 0 to NumHeadsM1 do
       RelHeads0[li] := RelHeads[li];
     if IsDecoder then LMHead := PwConvs[High(PwConvs)] else LMHead := nil;
   end;
@@ -25841,18 +25872,22 @@ var
   EncEmbed, DecEmbed: TNNetLayer;
   EncLMHead, DecLMHead: TNNetLayer;
   EncRelHeads0, DecRelHeads0: TT5ExportLayerArray;
-  i: integer;
+  i, EncCountM1, DecCountM1, NumHeadsM1, NumBucketsM1: integer;
 begin
+  EncCountM1 := EncoderNet.CountLayers - 1;
+  DecCountM1 := DecoderNet.CountLayers - 1;
+  NumHeadsM1 := Config.NumHeads - 1;
+  NumBucketsM1 := Config.RelPosNumBuckets - 1;
   InnerDim := Config.NumHeads * Config.DKV;
   // The importer multiplies every q weight by sqrt(d_kv); un-fold by dividing.
   QInvScale := 1.0 / Sqrt(Config.DKV);
 
   // ---- find the embeddings ----
   EncEmbed := nil; DecEmbed := nil;
-  for i := 0 to EncoderNet.CountLayers - 1 do
+  for i := 0 to EncCountM1 do
     if EncoderNet.Layers[i] is TNNetEmbedding then
     begin EncEmbed := EncoderNet.Layers[i]; break; end;
-  for i := 0 to DecoderNet.CountLayers - 1 do
+  for i := 0 to DecCountM1 do
     if DecoderNet.Layers[i] is TNNetEmbedding then
     begin DecEmbed := DecoderNet.Layers[i]; break; end;
   if (EncEmbed = nil) or (DecEmbed = nil) then
@@ -25878,21 +25913,21 @@ begin
     // ---- shared relative-position bias tables (block 0 of each stack) ----
     // HF [NumBuckets, NumHeads]: T[bucket, h] = head h's bucket bias.
     RelBias.ReSize(Config.RelPosNumBuckets * Config.NumHeads, 1, 1);
-    for HeadCnt := 0 to Config.NumHeads - 1 do
+    for HeadCnt := 0 to NumHeadsM1 do
     begin
       if EncRelHeads0[HeadCnt].FArrNeurons[0].Weights.Size <>
          Config.RelPosNumBuckets then
         ImportError('T5 export: encoder relpos head ' + IntToStr(HeadCnt) +
           ' bucket count mismatch.');
-      for BucketCnt := 0 to Config.RelPosNumBuckets - 1 do
+      for BucketCnt := 0 to NumBucketsM1 do
         RelBias.FData[BucketCnt * Config.NumHeads + HeadCnt] :=
           EncRelHeads0[HeadCnt].FArrNeurons[0].Weights.FData[BucketCnt];
     end;
     Writer.AddTensorFlat('encoder.block.0.layer.0.SelfAttention.' +
       'relative_attention_bias.weight',
       [Config.RelPosNumBuckets, Config.NumHeads], RelBias, pDType);
-    for HeadCnt := 0 to Config.NumHeads - 1 do
-      for BucketCnt := 0 to Config.RelPosNumBuckets - 1 do
+    for HeadCnt := 0 to NumHeadsM1 do
+      for BucketCnt := 0 to NumBucketsM1 do
         RelBias.FData[BucketCnt * Config.NumHeads + HeadCnt] :=
           DecRelHeads0[HeadCnt].FArrNeurons[0].Weights.FData[BucketCnt];
     Writer.AddTensorFlat('decoder.block.0.layer.0.SelfAttention.' +
@@ -25928,7 +25963,7 @@ var
   EncEmbed, DecEmbed, LMHead: TNNetLayer;
   Shared, FinalBias: TNNetVolume;
   EmbedScale, InvEmbedScale: TNeuralFloat;
-  i, j: integer;
+  i, j, EncCountM1, DecCountM1, VocabSizeM1: integer;
 
   // Writes a HF nn.Linear [OutDim, InDim] (+bias [OutDim]) from OutDim
   // neurons of Layer (biased - the Marian convention).
@@ -25936,20 +25971,22 @@ var
     const WName, BName: string);
   var
     W, B: TNNetVolume;
-    jj, ii: integer;
+    jj, ii, OutDimM1, InDimM1: integer;
   begin
     W := TNNetVolume.Create;
     B := TNNetVolume.Create;
     try
       W.ReSize(OutDim * InDim, 1, 1);
       B.ReSize(OutDim, 1, 1);
-      for jj := 0 to OutDim - 1 do
+      OutDimM1 := OutDim - 1;
+      InDimM1 := InDim - 1;
+      for jj := 0 to OutDimM1 do
       begin
         if Layer.FArrNeurons[jj].Weights.Size <> InDim then
           ImportError('Marian export: neuron ' + IntToStr(jj) + ' for "' +
             WName + '" has ' + IntToStr(Layer.FArrNeurons[jj].Weights.Size) +
             ' weights, expected ' + IntToStr(InDim) + '.');
-        for ii := 0 to InDim - 1 do
+        for ii := 0 to InDimM1 do
           W.FData[jj * InDim + ii] := Layer.FArrNeurons[jj].Weights.FData[ii];
         B.FData[jj] := Layer.FArrNeurons[jj].BiasWeight;
       end;
@@ -25970,12 +26007,14 @@ var
     out LMHeadOut: TNNetLayer);
   var
     PwConvs, Norms: array of TNNetLayer;
-    li, BlockCnt, PwBase, NormBase, PwPerBlock, NormPerBlock: integer;
+    li, BlockCnt, PwBase, NormBase, PwPerBlock, NormPerBlock, CountLayersM1, NumBlocksM1: integer;
     BP: string;
   begin
+    CountLayersM1 := Net.CountLayers - 1;
+    NumBlocksM1 := NumBlocks - 1;
     SetLength(PwConvs, 0);
     SetLength(Norms, 0);
-    for li := 0 to Net.CountLayers - 1 do
+    for li := 0 to CountLayersM1 do
     begin
       if Net.Layers[li] is TNNetTokenLayerNorm then
       begin
@@ -26004,7 +26043,7 @@ var
       ImportError('Marian export: ' + StackPrefix + ' has ' +
         IntToStr(Length(Norms)) + ' TokenLayerNorm layers, expected ' +
         IntToStr(NormPerBlock * NumBlocks) + '.');
-    for BlockCnt := 0 to NumBlocks - 1 do
+    for BlockCnt := 0 to NumBlocksM1 do
     begin
       BP := StackPrefix + IntToStr(BlockCnt) + '.';
       PwBase := BlockCnt * PwPerBlock;
@@ -26048,12 +26087,15 @@ var
   end;
 
 begin
+  EncCountM1 := EncoderNet.CountLayers - 1;
+  DecCountM1 := DecoderNet.CountLayers - 1;
+  VocabSizeM1 := Config.VocabSize - 1;
   // ---- find embeddings ----
   EncEmbed := nil; DecEmbed := nil;
-  for i := 0 to EncoderNet.CountLayers - 1 do
+  for i := 0 to EncCountM1 do
     if EncoderNet.Layers[i] is TNNetEmbedding then
     begin EncEmbed := EncoderNet.Layers[i]; break; end;
-  for i := 0 to DecoderNet.CountLayers - 1 do
+  for i := 0 to DecCountM1 do
     if DecoderNet.Layers[i] is TNNetEmbedding then
     begin DecEmbed := DecoderNet.Layers[i]; break; end;
   if (EncEmbed = nil) or (DecEmbed = nil) then
@@ -26087,7 +26129,7 @@ begin
 
     // ---- final_logits_bias: the tied head's per-neuron biases ([1,vocab]).
     FinalBias.ReSize(Config.VocabSize, 1, 1);
-    for j := 0 to Config.VocabSize - 1 do
+    for j := 0 to VocabSizeM1 do
       FinalBias.FData[j] := LMHead.FArrNeurons[j].BiasWeight;
     Writer.AddTensorFlat('final_logits_bias',
       [1, Config.VocabSize], FinalBias, pDType);
@@ -26130,7 +26172,7 @@ var
   EncEmbed, DecEmbed, LMHead: TNNetLayer;
   Shared, FinalBias: TNNetVolume;
   EmbedScale, InvEmbedScale: TNeuralFloat;
-  i, j: integer;
+  i, j, EncCountM1, DecCountM1, VocabSizeM1: integer;
 
   // Writes a HF nn.Linear [OutDim, InDim] (+bias [OutDim]) from OutDim biased
   // neurons of Layer - the BART-family convention (identical to Marian).
@@ -26138,21 +26180,23 @@ var
     const WName, BName: string);
   var
     W, B: TNNetVolume;
-    jj, ii: integer;
+    jj, ii, OutDimM1, InDimM1: integer;
   begin
     W := TNNetVolume.Create;
     B := TNNetVolume.Create;
     try
       W.ReSize(OutDim * InDim, 1, 1);
       B.ReSize(OutDim, 1, 1);
-      for jj := 0 to OutDim - 1 do
+      OutDimM1 := OutDim - 1;
+      InDimM1 := InDim - 1;
+      for jj := 0 to OutDimM1 do
       begin
         if Layer.FArrNeurons[jj].Weights.Size <> InDim then
           ImportError(ExporterTag + ' export: neuron ' + IntToStr(jj) +
             ' for "' + WName + '" has ' +
             IntToStr(Layer.FArrNeurons[jj].Weights.Size) + ' weights, expected ' +
             IntToStr(InDim) + '.');
-        for ii := 0 to InDim - 1 do
+        for ii := 0 to InDimM1 do
           W.FData[jj * InDim + ii] := Layer.FArrNeurons[jj].Weights.FData[ii];
         B.FData[jj] := Layer.FArrNeurons[jj].BiasWeight;
       end;
@@ -26172,15 +26216,17 @@ var
     const TName: string);
   var
     Tbl: TNNetVolume;
-    PosCnt, ElementCnt, Rows: integer;
+    PosCnt, ElementCnt, Rows, SeqLenM1, DModelM1: integer;
   begin
     Rows := MaxPositionEmbeddings + PosOffset;
     Tbl := TNNetVolume.Create;
     try
       Tbl.ReSize(Rows * DModel, 1, 1);
       Tbl.Fill(0);
-      for PosCnt := 0 to SeqLen - 1 do
-        for ElementCnt := 0 to DModel - 1 do
+      SeqLenM1 := SeqLen - 1;
+      DModelM1 := DModel - 1;
+      for PosCnt := 0 to SeqLenM1 do
+        for ElementCnt := 0 to DModelM1 do
           Tbl.FData[(PosCnt + PosOffset) * DModel + ElementCnt] :=
             PosLayer.FArrNeurons[0].Weights.FData[PosCnt * DModel + ElementCnt];
       Writer.AddTensorFlat(TName, [Rows, DModel], Tbl, pDType);
@@ -26199,12 +26245,14 @@ var
   var
     PwConvs, Norms: array of TNNetLayer;
     li, BlockCnt, PwBase, NormBase, PwPerBlock, NormPerBlock,
-      BlockNormBase, ExpectNorm: integer;
+      BlockNormBase, ExpectNorm, CountLayersM1, NumBlocksM1: integer;
     BP: string;
   begin
+    CountLayersM1 := Net.CountLayers - 1;
+    NumBlocksM1 := NumBlocks - 1;
     SetLength(PwConvs, 0);
     SetLength(Norms, 0);
-    for li := 0 to Net.CountLayers - 1 do
+    for li := 0 to CountLayersM1 do
     begin
       if Net.Layers[li] is TNNetTokenLayerNorm then
       begin
@@ -26236,7 +26284,7 @@ var
         IntToStr(Length(Norms)) + ' TokenLayerNorm layers, expected ' +
         IntToStr(ExpectNorm) + '.');
     BlockNormBase := IfThen(HasEmbLN, 1, 0);
-    for BlockCnt := 0 to NumBlocks - 1 do
+    for BlockCnt := 0 to NumBlocksM1 do
     begin
       BP := StackPrefix + IntToStr(BlockCnt) + '.';
       PwBase := BlockCnt * PwPerBlock;
@@ -26283,10 +26331,11 @@ var
 
   procedure FindLearnedPos(Net: TNNet; out PosLayer: TNNetLayer);
   var
-    li: integer;
+    li, CountLayersM1: integer;
   begin
     PosLayer := nil;
-    for li := 0 to Net.CountLayers - 1 do
+    CountLayersM1 := Net.CountLayers - 1;
+    for li := 0 to CountLayersM1 do
       if Net.Layers[li] is TNNetLearnedPositionalEmbedding then
       begin PosLayer := Net.Layers[li]; break; end;
     if PosLayer = nil then
@@ -26297,12 +26346,15 @@ var
   EncEmbLN, DecEmbLN, EncFinalLN, DecFinalLN, EncPos, DecPos,
     EncLMHeadUnused: TNNetLayer;
 begin
+  EncCountM1 := EncoderNet.CountLayers - 1;
+  DecCountM1 := DecoderNet.CountLayers - 1;
+  VocabSizeM1 := VocabSize - 1;
   // ---- find embeddings ----
   EncEmbed := nil; DecEmbed := nil;
-  for i := 0 to EncoderNet.CountLayers - 1 do
+  for i := 0 to EncCountM1 do
     if EncoderNet.Layers[i] is TNNetEmbedding then
     begin EncEmbed := EncoderNet.Layers[i]; break; end;
-  for i := 0 to DecoderNet.CountLayers - 1 do
+  for i := 0 to DecCountM1 do
     if DecoderNet.Layers[i] is TNNetEmbedding then
     begin DecEmbed := DecoderNet.Layers[i]; break; end;
   if (EncEmbed = nil) or (DecEmbed = nil) then
@@ -26372,7 +26424,7 @@ begin
 
     // ---- final_logits_bias: the tied head's per-neuron biases ([1,vocab]). --
     FinalBias.ReSize(VocabSize, 1, 1);
-    for j := 0 to VocabSize - 1 do
+    for j := 0 to VocabSizeM1 do
       FinalBias.FData[j] := LMHead.FArrNeurons[j].BiasWeight;
     Writer.AddTensorFlat('final_logits_bias',
       [1, VocabSize], FinalBias, pDType);
@@ -26556,17 +26608,20 @@ procedure BuildBartStackBlocks(NN: TNNet; const Config: TBartConfig;
   EncStates: TNNetLayer; var Blocks: TMarianBlockArray;
   pInferenceOnly: boolean; pQuantizeInt8: boolean = false);
 var
-  HeadDim, BlockCnt, HeadCnt, d: integer;
+  HeadDim, BlockCnt, HeadCnt, d, NumBlocksM1, NumHeadsM1, HeadDimM1: integer;
   BranchInput, HiddenAct, PhiBranch: TNNetLayer;
   QSlice, KSlice, VSlice, HeadPack, KVPack: TNNetLayer;
   Heads: array of TNNetLayer;
   SliceChannels: array of integer;
 begin
   HeadDim := Config.DModel div NumHeads;
+  NumBlocksM1 := NumBlocks - 1;
+  NumHeadsM1 := NumHeads - 1;
+  HeadDimM1 := HeadDim - 1;
   SetLength(Blocks, NumBlocks);
   SetLength(SliceChannels, HeadDim);
   SetLength(Heads, NumHeads);
-  for BlockCnt := 0 to NumBlocks - 1 do
+  for BlockCnt := 0 to NumBlocksM1 do
   begin
     // ---- self-attention sub-block (residual add, THEN LayerNorm) ----
     BranchInput := NN.GetLastLayer();
@@ -26576,9 +26631,9 @@ begin
       TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), BranchInput);
     Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
       TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), BranchInput);
-    for HeadCnt := 0 to NumHeads - 1 do
+    for HeadCnt := 0 to NumHeadsM1 do
     begin
-      for d := 0 to HeadDim - 1 do
+      for d := 0 to HeadDimM1 do
         SliceChannels[d] := HeadCnt * HeadDim + d;
       QSlice := NN.AddLayerAfter(
         TNNetSplitChannels.Create(SliceChannels),
@@ -26612,9 +26667,9 @@ begin
         TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), EncStates);
       Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
         TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), EncStates);
-      for HeadCnt := 0 to NumHeads - 1 do
+      for HeadCnt := 0 to NumHeadsM1 do
       begin
-        for d := 0 to HeadDim - 1 do
+        for d := 0 to HeadDimM1 do
           SliceChannels[d] := HeadCnt * HeadDim + d;
         QSlice := NN.AddLayerAfter(
           TNNetSplitChannels.Create(SliceChannels),
@@ -26680,7 +26735,7 @@ var
   DecTokenInput, EncStates, LMHead: TNNetLayer;
   Consumed: TStringList;
   Tmp: TNNetVolume;
-  i, j: integer;
+  i, j, VocabSizeM1, DModelM1B: integer;
   EmbedScale: TNeuralFloat;
   TensorNameStr: string;
   // LoadMarianStack/LoadMarianAttn only read .DModel from the config; this
@@ -26693,7 +26748,7 @@ var
   procedure LoadBartPositions(PosLayer: TNNetLayer; const TName: string;
     SeqLen: integer);
   var
-    PosCnt, ElementCnt: integer;
+    PosCnt, ElementCnt, SeqLenM1, DModelM1: integer;
   begin
     if not Reader.HasTensor(TName) then
       ImportError('BART import: missing tensor "' + TName + '".');
@@ -26705,8 +26760,10 @@ var
         IntToStr(Config.MaxPositionEmbeddings + BartPositionOffset) + ', ' +
         IntToStr(Config.DModel) + '], got ' + Reader.ShapeAsString(TName));
     Reader.LoadTensorFlat(TName, Tmp);
-    for PosCnt := 0 to SeqLen - 1 do
-      for ElementCnt := 0 to Config.DModel - 1 do
+    SeqLenM1 := SeqLen - 1;
+    DModelM1 := Config.DModel - 1;
+    for PosCnt := 0 to SeqLenM1 do
+      for ElementCnt := 0 to DModelM1 do
         PosLayer.FArrNeurons[0].Weights.FData[PosCnt * Config.DModel +
           ElementCnt] := Tmp.FData[(PosCnt + BartPositionOffset) *
             Config.DModel + ElementCnt];
@@ -26816,6 +26873,8 @@ begin
         else
           EmbedScale := 1.0;
         LpMax := Tmp.Size - 1;
+        VocabSizeM1 := Config.VocabSize - 1;
+        DModelM1B := Config.DModel - 1;
         for i := 0 to LpMax do
         begin
           EncEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
@@ -26826,12 +26885,12 @@ begin
         Consumed.Add('model.shared.weight');
         // Tied head: logits = h . shared^T + final_logits_bias.
         EnsureWritableImportWeights(LMHead);
-        for j := 0 to Config.VocabSize - 1 do
-          for i := 0 to Config.DModel - 1 do
+        for j := 0 to VocabSizeM1 do
+          for i := 0 to DModelM1B do
             LMHead.FArrNeurons[j].Weights.FData[i] :=
               Tmp.FData[j * Config.DModel + i];
         Reader.LoadTensorFlat('final_logits_bias', Tmp);
-        for j := 0 to Config.VocabSize - 1 do
+        for j := 0 to VocabSizeM1 do
           LMHead.FArrNeurons[j].BiasWeight := Tmp.FData[j];
         LMHead.FlushWeightCache();
         Consumed.Add('final_logits_bias');
@@ -27052,17 +27111,20 @@ procedure BuildPegasusStackBlocks(NN: TNNet; const Config: TPegasusConfig;
   pInferenceOnly: boolean; pQuantizeInt8: boolean = false;
   UseReluFFN: boolean = false);
 var
-  HeadDim, BlockCnt, HeadCnt, d: integer;
+  HeadDim, BlockCnt, HeadCnt, d, NumBlocksM1, NumHeadsM1, HeadDimM1: integer;
   ResidualInput, NormedInput, HiddenAct, PhiBranch: TNNetLayer;
   QSlice, KSlice, VSlice, HeadPack, KVPack: TNNetLayer;
   Heads: array of TNNetLayer;
   SliceChannels: array of integer;
 begin
   HeadDim := Config.DModel div NumHeads;
+  NumBlocksM1 := NumBlocks - 1;
+  NumHeadsM1 := NumHeads - 1;
+  HeadDimM1 := HeadDim - 1;
   SetLength(Blocks, NumBlocks);
   SetLength(SliceChannels, HeadDim);
   SetLength(Heads, NumHeads);
-  for BlockCnt := 0 to NumBlocks - 1 do
+  for BlockCnt := 0 to NumBlocksM1 do
   begin
     // ---- self-attention sub-block (PRE-norm: LN, sublayer, add raw) ----
     ResidualInput := NN.GetLastLayer();
@@ -27075,9 +27137,9 @@ begin
       TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), NormedInput);
     Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
       TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), NormedInput);
-    for HeadCnt := 0 to NumHeads - 1 do
+    for HeadCnt := 0 to NumHeadsM1 do
     begin
-      for d := 0 to HeadDim - 1 do
+      for d := 0 to HeadDimM1 do
         SliceChannels[d] := HeadCnt * HeadDim + d;
       QSlice := NN.AddLayerAfter(
         TNNetSplitChannels.Create(SliceChannels),
@@ -27113,9 +27175,9 @@ begin
         TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), EncStates);
       Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
         TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), EncStates);
-      for HeadCnt := 0 to NumHeads - 1 do
+      for HeadCnt := 0 to NumHeadsM1 do
       begin
-        for d := 0 to HeadDim - 1 do
+        for d := 0 to HeadDimM1 do
           SliceChannels[d] := HeadCnt * HeadDim + d;
         QSlice := NN.AddLayerAfter(
           TNNetSplitChannels.Create(SliceChannels),
@@ -27181,16 +27243,18 @@ end;
 procedure MusicGenDelayInterleave(const Raw: TNNetIntArr2D; PadId: integer;
   out Delayed: TNNetIntArr2D);
 var
-  K, Len, k_i, t: integer;
+  K, Len, k_i, t, KM1, LenM1: integer;
 begin
   K := Length(Raw);
   if K = 0 then begin SetLength(Delayed, 0); exit; end;
   Len := Length(Raw[0]);
+  KM1 := K - 1;
+  LenM1 := Len - 1;
   SetLength(Delayed, K);
-  for k_i := 0 to K - 1 do
+  for k_i := 0 to KM1 do
   begin
     SetLength(Delayed[k_i], Len);
-    for t := 0 to Len - 1 do
+    for t := 0 to LenM1 do
       // HF build_delay_pattern_mask: codebook k is placed at shifted columns
       // [k .. seq_len+k) then the lower-triangular BOS mask pads columns
       // [0 .. k] (k+1 leading slots), so the truncated delayed form is
@@ -27206,15 +27270,17 @@ end;
 procedure MusicGenDelayDeinterleave(const Delayed: TNNetIntArr2D;
   OutLen: integer; out Raw: TNNetIntArr2D);
 var
-  K, k_i, t: integer;
+  K, k_i, t, KM1, OutLenM1: integer;
 begin
   K := Length(Delayed);
   if K = 0 then begin SetLength(Raw, 0); exit; end;
+  KM1 := K - 1;
+  OutLenM1 := OutLen - 1;
   SetLength(Raw, K);
-  for k_i := 0 to K - 1 do
+  for k_i := 0 to KM1 do
   begin
     SetLength(Raw[k_i], OutLen);
-    for t := 0 to OutLen - 1 do
+    for t := 0 to OutLenM1 do
       // Inverse shift: raw[k][t] (for t >= 1) was placed at delayed column
       // t + k by the interleave above; raw[k][0] is the dropped BOS slot, so
       // index 0 reads back the leading pad (callers ignore it / overwrite it).
@@ -27328,14 +27394,15 @@ function BuildMusicGenDecoderNet(const Config: TMusicGenConfig;
 constructor TMusicGenModel.Create(const pConfig: TMusicGenConfig;
   EncSeqLen, DecSeqLen: integer);
 var
-  k_i: integer;
+  k_i, NumCodebooksM1: integer;
 begin
   inherited Create;
   FConfig := pConfig;
   FEncSeqLen := EncSeqLen;
   FDecSeqLen := DecSeqLen;
   SetLength(FEmbed, FConfig.NumCodebooks);
-  for k_i := 0 to FConfig.NumCodebooks - 1 do
+  NumCodebooksM1 := FConfig.NumCodebooks - 1;
+  for k_i := 0 to NumCodebooksM1 do
     FEmbed[k_i] := TNNetVolume.Create;
   FPosTable := TNNetVolume.Create;
   FEncToDecW := TNNetVolume.Create;
@@ -27347,9 +27414,10 @@ end;
 
 destructor TMusicGenModel.Destroy;
 var
-  k_i: integer;
+  k_i, FEmbedHi: integer;
 begin
-  for k_i := 0 to High(FEmbed) do FEmbed[k_i].Free;
+  FEmbedHi := High(FEmbed);
+  for k_i := 0 to FEmbedHi do FEmbed[k_i].Free;
   SetLength(FEmbed, 0);
   FPosTable.Free;
   FEncToDecW.Free;
@@ -27395,17 +27463,20 @@ end;
 
 procedure TMusicGenModel.ProjectEncoderStates(EncStates, Dst: TNNetVolume);
 var
-  t, o, i: integer;
+  t, o, i, FEncSeqLenM1, HiddenM1, TextDModelM1: integer;
   Acc: TNeuralFloat;
 begin
+  FEncSeqLenM1 := FEncSeqLen - 1;
+  HiddenM1 := FConfig.Hidden - 1;
+  TextDModelM1 := FConfig.TextDModel - 1;
   // EncStates is (EncSeqLen, 1, TextDModel); Dst becomes (EncSeqLen,1,Hidden):
   // Dst[t][o] = sum_i EncToDecW[o][i] * EncStates[t][i] + EncToDecB[o].
   Dst.ReSize(FEncSeqLen, 1, FConfig.Hidden);
-  for t := 0 to FEncSeqLen - 1 do
-    for o := 0 to FConfig.Hidden - 1 do
+  for t := 0 to FEncSeqLenM1 do
+    for o := 0 to HiddenM1 do
     begin
       Acc := FEncToDecB.FData[o];
-      for i := 0 to FConfig.TextDModel - 1 do
+      for i := 0 to TextDModelM1 do
         Acc := Acc + FEncToDecW.FData[o * FConfig.TextDModel + i] *
           EncStates.FData[t * FConfig.TextDModel + i];
       Dst.FData[t * FConfig.Hidden + o] := Acc;
@@ -27417,8 +27488,11 @@ procedure TMusicGenModel.ComputeLogits(const Codes: TNNetIntArr2D;
 var
   InEmb: TNNetVolume;
   EncStatesInput: TNNetLayer;
-  t, k_i, c, tok: integer;
+  t, k_i, c, tok, FDecSeqLenM1, NumCodebooksM1, HiddenM1: integer;
 begin
+  FDecSeqLenM1 := FDecSeqLen - 1;
+  NumCodebooksM1 := FConfig.NumCodebooks - 1;
+  HiddenM1 := FConfig.Hidden - 1;
   if Length(Codes) <> FConfig.NumCodebooks then
     ImportError('MusicGen ComputeLogits: code stack has ' +
       IntToStr(Length(Codes)) + ' codebooks, expected ' +
@@ -27429,20 +27503,20 @@ begin
   try
     InEmb.ReSize(FDecSeqLen, 1, FConfig.Hidden);
     InEmb.Fill(0);
-    for t := 0 to FDecSeqLen - 1 do
+    for t := 0 to FDecSeqLenM1 do
     begin
-      for k_i := 0 to FConfig.NumCodebooks - 1 do
+      for k_i := 0 to NumCodebooksM1 do
       begin
         tok := Codes[k_i][t];
         if (tok < 0) or (tok > FConfig.VocabSize) then
           ImportError('MusicGen ComputeLogits: code ' + IntToStr(tok) +
             ' out of range [0, ' + IntToStr(FConfig.VocabSize) + '].');
-        for c := 0 to FConfig.Hidden - 1 do
+        for c := 0 to HiddenM1 do
           InEmb.FData[t * FConfig.Hidden + c] :=
             InEmb.FData[t * FConfig.Hidden + c] +
             FEmbed[k_i].FData[tok * FConfig.Hidden + c];
       end;
-      for c := 0 to FConfig.Hidden - 1 do
+      for c := 0 to HiddenM1 do
         InEmb.FData[t * FConfig.Hidden + c] :=
           InEmb.FData[t * FConfig.Hidden + c] +
           FPosTable.FData[t * FConfig.Hidden + c];
@@ -27476,7 +27550,7 @@ procedure TMusicGenModel.GenerateCFG(EncStates, UncondStates: TNNetVolume;
 var
   EncHidden, UncondHidden, Logits, UncondLogits: TNNetVolume;
   Delayed: TNNetIntArr2D;
-  PadId, Steps, step, k_i, v, best, t, base, idx: integer;
+  PadId, Steps, step, k_i, v, best, t, base, idx, NumCodebooksM1, FDecSeqLenM1, StepsM1, VsM1, NumFramesM1: integer;
   bestVal, vv, condVal, uncondVal: TNeuralFloat;
   UseGuidance: boolean;
 begin
@@ -27490,6 +27564,11 @@ begin
   // Steps = NumFrames + K - 1 steps to fill them all (predicting column s+1
   // from the logits at position s).
   Steps := NumFrames + FConfig.NumCodebooks - 1;
+  NumCodebooksM1 := FConfig.NumCodebooks - 1;
+  FDecSeqLenM1 := FDecSeqLen - 1;
+  StepsM1 := Steps - 1;
+  VsM1 := FConfig.VocabSize - 1;
+  NumFramesM1 := NumFrames - 1;
   if Steps >= FDecSeqLen then
     ImportError('MusicGen Generate: NumFrames + K = ' + IntToStr(Steps + 1) +
       ' exceeds DecSeqLen ' + IntToStr(FDecSeqLen) +
@@ -27505,10 +27584,10 @@ begin
     // Delayed[k][s] holds the (delay-shifted) decoder input id at step s;
     // initialise every slot to PadId (the start-of-sequence pad).
     SetLength(Delayed, FConfig.NumCodebooks);
-    for k_i := 0 to FConfig.NumCodebooks - 1 do
+    for k_i := 0 to NumCodebooksM1 do
     begin
       SetLength(Delayed[k_i], FDecSeqLen);
-      for step := 0 to FDecSeqLen - 1 do
+      for step := 0 to FDecSeqLenM1 do
         Delayed[k_i][step] := PadId;
     end;
     // Greedy autoregressive loop. At step s we run the decoder on the codes
@@ -27516,13 +27595,13 @@ begin
     // becomes valid (codebook k predicts the token at position s+1 for slot
     // s+1-k, mirroring the delay pattern). We fill StepCodes[k][s+1] for the
     // codebooks active at the NEXT step, then copy into Delayed.
-    for step := 0 to Steps - 1 do
+    for step := 0 to StepsM1 do
     begin
       ComputeLogits(Delayed, EncHidden, Logits);
       if UseGuidance then
         ComputeLogits(Delayed, UncondHidden, UncondLogits);
       t := step + 1; // the delayed column being predicted this step
-      for k_i := 0 to FConfig.NumCodebooks - 1 do
+      for k_i := 0 to NumCodebooksM1 do
       begin
         // Codebook k_i fills delayed column t only once its delay has started
         // (t >= k_i + 1) and the column still maps to a real frame
@@ -27543,7 +27622,7 @@ begin
           end
           else
             bestVal := condVal;
-          for v := 1 to FConfig.VocabSize - 1 do
+          for v := 1 to VsM1 do
           begin
             idx := base + v;
             condVal := Logits.FData[idx];
@@ -27563,10 +27642,10 @@ begin
     // Undelay: code (k, frame f) lives at delayed column f + k + 1 (column 0
     // is the shared BOS prompt).
     SetLength(Codes, FConfig.NumCodebooks);
-    for k_i := 0 to FConfig.NumCodebooks - 1 do
+    for k_i := 0 to NumCodebooksM1 do
     begin
       SetLength(Codes[k_i], NumFrames);
-      for t := 0 to NumFrames - 1 do
+      for t := 0 to NumFramesM1 do
         Codes[k_i][t] := Delayed[k_i][t + k_i + 1];
     end;
   finally
@@ -27602,14 +27681,15 @@ var
   // offset Off). nil Sampler -> exact argmax; else softmax(./Temperature) draw.
   function SelectToken(L: TNNetVolume; Off: integer): integer;
   var
-    v, best: integer;
+    v, best, VsM1: integer;
     bestVal, vv, MaxLogit, SumExp: TNeuralFloat;
   begin
+    VsM1 := FConfig.VocabSize - 1;
     if Sampler = nil then
     begin
       best := 0;
       bestVal := L.FData[Off];
-      for v := 1 to FConfig.VocabSize - 1 do
+      for v := 1 to VsM1 do
       begin
         vv := L.FData[Off + v];
         if vv > bestVal then begin bestVal := vv; best := v; end;
@@ -27621,16 +27701,16 @@ var
       // Stable softmax of the VocabSize-wide row at Temperature, then draw
       // (the same probability convention as DecodeSeq2SeqSampled).
       MaxLogit := L.FData[Off];
-      for v := 1 to FConfig.VocabSize - 1 do
+      for v := 1 to VsM1 do
         if L.FData[Off + v] > MaxLogit then MaxLogit := L.FData[Off + v];
       SumExp := 0;
-      for v := 0 to FConfig.VocabSize - 1 do
+      for v := 0 to VsM1 do
       begin
         Probs.FData[v] := Exp((L.FData[Off + v] - MaxLogit) / Temperature);
         SumExp := SumExp + Probs.FData[v];
       end;
       if SumExp <= 0 then SumExp := 1.0;
-      for v := 0 to FConfig.VocabSize - 1 do
+      for v := 0 to VsM1 do
         Probs.FData[v] := Probs.FData[v] / SumExp;
       Result := Sampler.GetToken(Probs);
     end;
