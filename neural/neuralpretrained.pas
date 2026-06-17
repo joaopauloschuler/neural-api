@@ -36919,44 +36919,48 @@ procedure TNNetVits.RunDuration(const Hidden: TNNetFloatDynArr2D;
   out LogDur: TNeuralFloatDynArr);
 var
   H, Tlen, i, t, c, F: integer;
+  HM1, TlenM1, FM1: integer;
   Inp, C1, C2, Pr: TNNetFloatDynArr2D;
   Col: TNeuralFloatDynArr;
 begin
   Tlen := Length(Hidden);
   H := FConfig.HiddenSize;
   F := FConfig.DurFilterChannels;
+  HM1 := H - 1;
+  TlenM1 := Tlen - 1;
+  FM1 := F - 1;
   // channel-major input [H][Tlen].
   SetLength(Inp, H);
-  for c := 0 to H - 1 do
+  for c := 0 to HM1 do
   begin
     SetLength(Inp[c], Tlen);
-    for t := 0 to Tlen - 1 do Inp[c][t] := Hidden[t][c];
+    for t := 0 to TlenM1 do Inp[c][t] := Hidden[t][c];
   end;
   // conv_1 (k, "same" pad k//2), relu, LayerNorm over channels per time.
   RunHiFiGANConv(FDurConv1, Inp, C1);
-  for c := 0 to F - 1 do
-    for t := 0 to Tlen - 1 do if C1[c][t] < 0 then C1[c][t] := 0;
+  for c := 0 to FM1 do
+    for t := 0 to TlenM1 do if C1[c][t] < 0 then C1[c][t] := 0;
   SetLength(Col, F);
-  for t := 0 to Tlen - 1 do
+  for t := 0 to TlenM1 do
   begin
-    for c := 0 to F - 1 do Col[c] := C1[c][t];
+    for c := 0 to FM1 do Col[c] := C1[c][t];
     VitsLayerNormVec(Col, FDurNorm1W, FDurNorm1B, FConfig.LayerNormEps);
-    for c := 0 to F - 1 do C1[c][t] := Col[c];
+    for c := 0 to FM1 do C1[c][t] := Col[c];
   end;
   // conv_2, relu, LayerNorm.
   RunHiFiGANConv(FDurConv2, C1, C2);
-  for c := 0 to F - 1 do
-    for t := 0 to Tlen - 1 do if C2[c][t] < 0 then C2[c][t] := 0;
-  for t := 0 to Tlen - 1 do
+  for c := 0 to FM1 do
+    for t := 0 to TlenM1 do if C2[c][t] < 0 then C2[c][t] := 0;
+  for t := 0 to TlenM1 do
   begin
-    for c := 0 to F - 1 do Col[c] := C2[c][t];
+    for c := 0 to FM1 do Col[c] := C2[c][t];
     VitsLayerNormVec(Col, FDurNorm2W, FDurNorm2B, FConfig.LayerNormEps);
-    for c := 0 to F - 1 do C2[c][t] := Col[c];
+    for c := 0 to FM1 do C2[c][t] := Col[c];
   end;
   // proj (F -> 1, k=1).
   RunHiFiGANConv(FDurProj, C2, Pr);
   SetLength(LogDur, Tlen);
-  for i := 0 to Tlen - 1 do LogDur[i] := Pr[0][i];
+  for i := 0 to TlenM1 do LogDur[i] := Pr[0][i];
 end;
 
 // VitsWaveNet forward (no global conditioning): gated dilated residual stack.
@@ -36964,23 +36968,27 @@ procedure TNNetVits.RunWaveNet(const WN: TVitsWaveNet;
   const Inp: TNNetFloatDynArr2D; out Outp: TNNetFloatDynArr2D);
 var
   H, Tlen, L, c, t, NumLayers: integer;
+  HM1, TlenM1, NumLayersM1: integer;
   Cur, InActs, ResSkip: TNNetFloatDynArr2D;
 begin
   H := FConfig.HiddenSize;
   Tlen := Length(Inp[0]);
   NumLayers := Length(WN.InLayers);
+  HM1 := H - 1;
+  TlenM1 := Tlen - 1;
+  NumLayersM1 := NumLayers - 1;
   // outputs accumulator (H channels) starts at zero.
   SetLength(Outp, H);
-  for c := 0 to H - 1 do
+  for c := 0 to HM1 do
   begin
     SetLength(Outp[c], Tlen);
-    for t := 0 to Tlen - 1 do Outp[c][t] := 0;
+    for t := 0 to TlenM1 do Outp[c][t] := 0;
   end;
   // current input (H channels).
   SetLength(Cur, H);
-  for c := 0 to H - 1 do Cur[c] := Copy(Inp[c]);
+  for c := 0 to HM1 do Cur[c] := Copy(Inp[c]);
 
-  for L := 0 to NumLayers - 1 do
+  for L := 0 to NumLayersM1 do
   begin
     RunHiFiGANConv(WN.InLayers[L], Cur, InActs);   // 2H channels
     // fused tanh-sigmoid: acts[c] = tanh(in[c]) * sigmoid(in[H+c]), c in 0..H-1.
@@ -36988,42 +36996,46 @@ begin
     if L < NumLayers - 1 then
     begin
       // res_acts = ResSkip[0..H-1]; CUR += res_acts; outputs += ResSkip[H..].
-      for c := 0 to H - 1 do
-        for t := 0 to Tlen - 1 do Cur[c][t] := Cur[c][t] + ResSkip[c][t];
-      for c := 0 to H - 1 do
-        for t := 0 to Tlen - 1 do Outp[c][t] := Outp[c][t] + ResSkip[H + c][t];
+      for c := 0 to HM1 do
+        for t := 0 to TlenM1 do Cur[c][t] := Cur[c][t] + ResSkip[c][t];
+      for c := 0 to HM1 do
+        for t := 0 to TlenM1 do Outp[c][t] := Outp[c][t] + ResSkip[H + c][t];
     end
     else
-      for c := 0 to H - 1 do
-        for t := 0 to Tlen - 1 do Outp[c][t] := Outp[c][t] + ResSkip[c][t];
+      for c := 0 to HM1 do
+        for t := 0 to TlenM1 do Outp[c][t] := Outp[c][t] + ResSkip[c][t];
   end;
 end;
 
 procedure TNNetVits.RunFlowReverse(var Latent: TNNetFloatDynArr2D);
 var
   fi, half, c, t, Tlen, Flow: integer;
+  FlowM1, HalfM1, TlenM1: integer;
   FirstHalf, Pre, WNOut, Mean, Tmp: TNNetFloatDynArr2D;
 begin
   Flow := FConfig.FlowSize;
   half := Flow div 2;
   Tlen := Length(Latent[0]);
+  FlowM1 := Flow - 1;
+  HalfM1 := half - 1;
+  TlenM1 := Tlen - 1;
   // reversed(flows): for each flow (from last to first): flip channels, then
   // reverse coupling (second_half -= mean(first_half)).
   for fi := FConfig.PriorNumFlows - 1 downto 0 do
   begin
     // flip channels [1]: reverse the channel order.
     SetLength(Tmp, Flow);
-    for c := 0 to Flow - 1 do Tmp[c] := Latent[Flow - 1 - c];
+    for c := 0 to FlowM1 do Tmp[c] := Latent[Flow - 1 - c];
     Latent := Tmp;
     // first_half = channels [0..half-1].
     SetLength(FirstHalf, half);
-    for c := 0 to half - 1 do FirstHalf[c] := Latent[c];
+    for c := 0 to HalfM1 do FirstHalf[c] := Latent[c];
     RunHiFiGANConv(FFlows[fi].ConvPre, FirstHalf, Pre);
     RunWaveNet(FFlows[fi].WaveNet, Pre, WNOut);
     RunHiFiGANConv(FFlows[fi].ConvPost, WNOut, Mean);   // half channels
     // reverse: second_half := second_half - mean (log_stddev == 0).
-    for c := 0 to half - 1 do
-      for t := 0 to Tlen - 1 do
+    for c := 0 to HalfM1 do
+      for t := 0 to TlenM1 do
         Latent[half + c][t] := Latent[half + c][t] - Mean[c][t];
   end;
 end;
@@ -37034,6 +37046,7 @@ procedure VitsDepthwiseConv(const Conv: THiFiGANConv;
   const InSig: TNNetFloatDynArr2D; out OutSig: TNNetFloatDynArr2D);
 var
   Ch, K, Dil, Pad, InLen, c, t, k2, src: integer;
+  ChM1, InLenM1, KM1: integer;
   Acc: TNeuralFloat;
 begin
   Ch := Conv.OutCh;
@@ -37041,14 +37054,17 @@ begin
   Dil := Conv.Dilation;
   Pad := Conv.Pad;
   InLen := Length(InSig[0]);
+  ChM1 := Ch - 1;
+  InLenM1 := InLen - 1;
+  KM1 := K - 1;
   SetLength(OutSig, Ch);
-  for c := 0 to Ch - 1 do
+  for c := 0 to ChM1 do
   begin
     SetLength(OutSig[c], InLen);
-    for t := 0 to InLen - 1 do
+    for t := 0 to InLenM1 do
     begin
       Acc := Conv.B[c];
-      for k2 := 0 to K - 1 do
+      for k2 := 0 to KM1 do
       begin
         src := t + k2 * Dil - Pad;
         if (src >= 0) and (src < InLen) then
@@ -37063,34 +37079,38 @@ procedure TNNetVits.RunVitsDDS(const DDS: TVitsDDS;
   var Sig: TNNetFloatDynArr2D);
 var
   L, c, t, Ch, Tlen: integer;
+  ChM1, TlenM1, DDSMaxIdx: integer;
   H, Tmp: TNNetFloatDynArr2D;
   Col: TNeuralFloatDynArr;
 begin
   Ch := Length(Sig);
   Tlen := Length(Sig[0]);
+  ChM1 := Ch - 1;
+  TlenM1 := Tlen - 1;
+  DDSMaxIdx := Length(DDS) - 1;
   SetLength(Col, Ch);
-  for L := 0 to Length(DDS) - 1 do
+  for L := 0 to DDSMaxIdx do
   begin
     // grouped dilated conv (padding_mask is all-ones here).
     VitsDepthwiseConv(DDS[L].Dilated, Sig, H);
     // norms_1 (LayerNorm over channels per time), then GELU.
-    for t := 0 to Tlen - 1 do
+    for t := 0 to TlenM1 do
     begin
-      for c := 0 to Ch - 1 do Col[c] := H[c][t];
+      for c := 0 to ChM1 do Col[c] := H[c][t];
       VitsLayerNormVec(Col, DDS[L].Norm1W, DDS[L].Norm1B, FConfig.LayerNormEps);
-      for c := 0 to Ch - 1 do H[c][t] := VitsGELU(Col[c]);
+      for c := 0 to ChM1 do H[c][t] := VitsGELU(Col[c]);
     end;
     // pointwise 1x1 conv, then norms_2, then GELU.
     RunHiFiGANConv(DDS[L].Pointwise, H, Tmp);
-    for t := 0 to Tlen - 1 do
+    for t := 0 to TlenM1 do
     begin
-      for c := 0 to Ch - 1 do Col[c] := Tmp[c][t];
+      for c := 0 to ChM1 do Col[c] := Tmp[c][t];
       VitsLayerNormVec(Col, DDS[L].Norm2W, DDS[L].Norm2B, FConfig.LayerNormEps);
-      for c := 0 to Ch - 1 do Tmp[c][t] := VitsGELU(Col[c]);
+      for c := 0 to ChM1 do Tmp[c][t] := VitsGELU(Col[c]);
     end;
     // residual: inputs = inputs + hidden_states.
-    for c := 0 to Ch - 1 do
-      for t := 0 to Tlen - 1 do Sig[c][t] := Sig[c][t] + Tmp[c][t];
+    for c := 0 to ChM1 do
+      for t := 0 to TlenM1 do Sig[c][t] := Sig[c][t] + Tmp[c][t];
   end;
 end;
 
@@ -37098,16 +37118,19 @@ procedure TNNetVits.RunSDPFlowReverse(const Flow: TVitsSDPFlow;
   var Latent: TNNetFloatDynArr2D; const Cond: TNNetFloatDynArr2D);
 var
   Half, Filt, NumBins, Tlen, c, t, b, o: integer;
+  TlenM1, LatentMaxIdx, HalfM1, FiltM1, NumBinsM1, NumBinsM2: integer;
   FirstHalf, Hid, Proj: TNNetFloatDynArr2D;
   UW, UH, UD: TNeuralFloatDynArr;
   InvSqrtFilt, V: TNeuralFloat;
 begin
   Tlen := Length(Latent[0]);
+  TlenM1 := Tlen - 1;
   if Flow.IsAffine then
   begin
     // reverse: out = (in - translate) * exp(-log_scale).
-    for c := 0 to Length(Latent) - 1 do
-      for t := 0 to Tlen - 1 do
+    LatentMaxIdx := Length(Latent) - 1;
+    for c := 0 to LatentMaxIdx do
+      for t := 0 to TlenM1 do
         Latent[c][t] := (Latent[c][t] - Flow.Translate[c]) * Exp(-Flow.LogScale[c]);
     Exit;
   end;
@@ -37115,30 +37138,34 @@ begin
   Half := FConfig.DSepChannels div 2;
   Filt := FConfig.HiddenSize;
   NumBins := FConfig.DurFlowBins;
+  HalfM1 := Half - 1;
+  FiltM1 := Filt - 1;
+  NumBinsM1 := NumBins - 1;
+  NumBinsM2 := NumBins - 2;
   InvSqrtFilt := 1.0 / Sqrt(Filt);
   // first_half = channels [0..Half-1]; the spline transforms second_half.
   SetLength(FirstHalf, Half);
-  for c := 0 to Half - 1 do FirstHalf[c] := Latent[c];
+  for c := 0 to HalfM1 do FirstHalf[c] := Latent[c];
   RunHiFiGANConv(Flow.ConvPre, FirstHalf, Hid);     // -> Filt channels
   // global_conditioning is ADDED at the start of the DDS (inputs+cond).
-  for c := 0 to Filt - 1 do
-    for t := 0 to Tlen - 1 do Hid[c][t] := Hid[c][t] + Cond[c][t];
+  for c := 0 to FiltM1 do
+    for t := 0 to TlenM1 do Hid[c][t] := Hid[c][t] + Cond[c][t];
   RunVitsDDS(Flow.DDS, Hid);
   RunHiFiGANConv(Flow.ConvProj, Hid, Proj);         // -> Half*(3*NumBins-1) ch
   // reshape (channels=Half, bins-per-channel = 3*NumBins-1) per (half, time).
   SetLength(UW, NumBins);
   SetLength(UH, NumBins);
   SetLength(UD, NumBins - 1);
-  for c := 0 to Half - 1 do
-    for t := 0 to Tlen - 1 do
+  for c := 0 to HalfM1 do
+    for t := 0 to TlenM1 do
     begin
       o := c * (3 * NumBins - 1);
-      for b := 0 to NumBins - 1 do
+      for b := 0 to NumBinsM1 do
       begin
         UW[b] := Proj[o + b][t] * InvSqrtFilt;
         UH[b] := Proj[o + NumBins + b][t] * InvSqrtFilt;
       end;
-      for b := 0 to NumBins - 2 do
+      for b := 0 to NumBinsM2 do
         UD[b] := Proj[o + 2 * NumBins + b][t];
       V := VitsRQSplineInverse(Latent[Half + c][t], UW, UH, UD, NumBins,
         FConfig.DurTailBound);
@@ -37150,6 +37177,7 @@ procedure TNNetVits.StochasticDurationReverse(const Hidden: TNNetFloatDynArr2D;
   const ZDur: TNNetFloatDynArr2D; out LogDur: TNeuralFloatDynArr);
 var
   Tlen, H, c, t, fi, NumApplied: integer;
+  HM1, TlenM1, NumAppliedM1: integer;
   Inp, Cond, Latent, Tmp: TNNetFloatDynArr2D;
   Order: array of integer;
 begin
@@ -37158,12 +37186,14 @@ begin
       'duration model.');
   Tlen := Length(Hidden);
   H := FConfig.HiddenSize;
+  HM1 := H - 1;
+  TlenM1 := Tlen - 1;
   // channel-major hidden [H][T].
   SetLength(Inp, H);
-  for c := 0 to H - 1 do
+  for c := 0 to HM1 do
   begin
     SetLength(Inp[c], Tlen);
-    for t := 0 to Tlen - 1 do Inp[c][t] := Hidden[t][c];
+    for t := 0 to TlenM1 do Inp[c][t] := Hidden[t][c];
   end;
   // conv_pre (1x1) -> conv_dds -> conv_proj (1x1). This is the conditioner.
   RunHiFiGANConv(FSDPConvPre, Inp, Cond);
@@ -37175,7 +37205,7 @@ begin
   for c := 0 to 1 do
   begin
     SetLength(Latent[c], Tlen);
-    for t := 0 to Tlen - 1 do
+    for t := 0 to TlenM1 do
       if (Length(ZDur) > c) and (Length(ZDur[c]) > t) then Latent[c][t] := ZDur[c][t]
       else Latent[c][t] := 0;
   end;
@@ -37191,7 +37221,8 @@ begin
   end;
   Order[NumApplied] := 0;                       // the elementwise affine last
   Inc(NumApplied);
-  for fi := 0 to NumApplied - 1 do
+  NumAppliedM1 := NumApplied - 1;
+  for fi := 0 to NumAppliedM1 do
   begin
     // flip the 2 channels.
     SetLength(Tmp, 2);
@@ -37202,7 +37233,7 @@ begin
   end;
   // log_duration = channel 0.
   SetLength(LogDur, Tlen);
-  for t := 0 to Tlen - 1 do LogDur[t] := Latent[0][t];
+  for t := 0 to TlenM1 do LogDur[t] := Latent[0][t];
 end;
 
 procedure TNNetVits.RunTextEncoderPublic(const Ids: array of integer;
