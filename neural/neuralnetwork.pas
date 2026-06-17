@@ -48497,7 +48497,7 @@ var
   ThK, ThV, ThQ: TNNetVolume;
   W1init, W2init: TNNetVolume;
   SeqLen, Depth, Hd, t, o, i, j, baseT, baseW, baseW1, baseW2: integer;
-  SeqLenM1, DepthM1: integer;
+  SeqLenM1, DepthM1, HdM1: integer;
   eta, acc, gg, g1, g2, rj, S: TNeuralFloat;
   XtPtr, OutPtr: TNeuralFloatArrPtr;
   ThR: TNeuralFloatArrPtr;
@@ -48508,6 +48508,7 @@ begin
   SeqLen := FOutput.SizeX; Depth := FDepth; Hd := FHidden;
   SeqLenM1 := SeqLen - 1;
   DepthM1 := Depth - 1;
+  HdM1 := Hd - 1;
   eta := TTTSoftPlus(FNeurons[3].FWeights.FData[0]);
   W1init := nil; W2init := nil;
   if FIsMLP then begin W1init := FNeurons[4].FWeights; W2init := FNeurons[5].FWeights; end;
@@ -48539,20 +48540,20 @@ begin
             acc := acc + FWlin.FData[baseW - Depth * Depth + o * Depth + i] * FK.FData[baseT + i];
         FResid.FData[baseT + o] := acc - FVv.FData[baseT + o];
       end;
-      for o := 0 to Depth - 1 do
+      for o := 0 to DepthM1 do
       begin
         rj := FResid.FData[baseT + o];
-        for i := 0 to Depth - 1 do
+        for i := 0 to DepthM1 do
         begin
           if t > 0 then acc := FWlin.FData[baseW - Depth * Depth + o * Depth + i]
           else acc := 0;
           FWlin.FData[baseW + o * Depth + i] := acc - eta * rj * FK.FData[baseT + i];
         end;
       end;
-      for o := 0 to Depth - 1 do
+      for o := 0 to DepthM1 do
       begin
         acc := 0;
-        for i := 0 to Depth - 1 do
+        for i := 0 to DepthM1 do
           acc := acc + FWlin.FData[baseW + o * Depth + i] * FQ.FData[baseT + i];
         OutPtr^[o] := acc;
       end;
@@ -48562,42 +48563,42 @@ begin
       baseW1 := t * Hd * Depth;
       baseW2 := t * Depth * Hd;
       // inner forward at k (using W1_{t-1}, W2_{t-1})
-      for j := 0 to Hd - 1 do
+      for j := 0 to HdM1 do
       begin
         acc := 0;
-        for i := 0 to Depth - 1 do
+        for i := 0 to DepthM1 do
           if t > 0 then acc := acc + FW1.FData[baseW1 - Hd * Depth + j * Depth + i] * FK.FData[baseT + i]
           else acc := acc + W1init.FData[j * Depth + i] * FK.FData[baseT + i];
         FA1k.FData[t * Hd + j] := acc;
         TTTGelu(acc, gg, g1, g2);
         FH1k.FData[t * Hd + j] := gg;
       end;
-      for o := 0 to Depth - 1 do
+      for o := 0 to DepthM1 do
       begin
         acc := 0;
-        for j := 0 to Hd - 1 do
+        for j := 0 to HdM1 do
           if t > 0 then acc := acc + FW2.FData[baseW2 - Depth * Hd + o * Hd + j] * FH1k.FData[t * Hd + j]
           else acc := acc + W2init.FData[o * Hd + j] * FH1k.FData[t * Hd + j];
         FRr.FData[baseT + o] := acc - FVv.FData[baseT + o];
       end;
       // W2 update
-      for o := 0 to Depth - 1 do
-        for j := 0 to Hd - 1 do
+      for o := 0 to DepthM1 do
+        for j := 0 to HdM1 do
         begin
           if t > 0 then acc := FW2.FData[baseW2 - Depth * Hd + o * Hd + j]
           else acc := W2init.FData[o * Hd + j];
           FW2.FData[baseW2 + o * Hd + j] := acc - eta * FRr.FData[baseT + o] * FH1k.FData[t * Hd + j];
         end;
       // W1 update via da1[j] = g1(a1)*S, S = (W2_{t-1}^T r)[j]
-      for j := 0 to Hd - 1 do
+      for j := 0 to HdM1 do
       begin
         TTTGelu(FA1k.FData[t * Hd + j], gg, g1, g2);
         S := 0;
-        for o := 0 to Depth - 1 do
+        for o := 0 to DepthM1 do
           if t > 0 then S := S + FW2.FData[baseW2 - Depth * Hd + o * Hd + j] * FRr.FData[baseT + o]
           else S := S + W2init.FData[o * Hd + j] * FRr.FData[baseT + o];
         rj := g1 * S; // da1[j]
-        for i := 0 to Depth - 1 do
+        for i := 0 to DepthM1 do
         begin
           if t > 0 then acc := FW1.FData[baseW1 - Hd * Depth + j * Depth + i]
           else acc := W1init.FData[j * Depth + i];
@@ -48605,19 +48606,19 @@ begin
         end;
       end;
       // read-out using W1_t, W2_t
-      for j := 0 to Hd - 1 do
+      for j := 0 to HdM1 do
       begin
         acc := 0;
-        for i := 0 to Depth - 1 do
+        for i := 0 to DepthM1 do
           acc := acc + FW1.FData[baseW1 + j * Depth + i] * FQ.FData[baseT + i];
         FA1q.FData[t * Hd + j] := acc;
         TTTGelu(acc, gg, g1, g2);
         FH1q.FData[t * Hd + j] := gg;
       end;
-      for o := 0 to Depth - 1 do
+      for o := 0 to DepthM1 do
       begin
         acc := 0;
-        for j := 0 to Hd - 1 do
+        for j := 0 to HdM1 do
           acc := acc + FW2.FData[baseW2 + o * Hd + j] * FH1q.FData[t * Hd + j];
         OutPtr^[o] := acc;
       end;
@@ -48633,6 +48634,7 @@ var
   ThK, ThV, ThQ, W1init, W2init: TNNetVolume;
   GThK, GThV, GThQ, GW1in, GW2in: TNNetVolume;
   SeqLen, Depth, Hd, t, o, i, j, baseT, baseW, baseW1, baseW2: integer;
+  DepthM1, HdM1, DDM1, HDepM1, DHM1: integer;
   eta, dEtaRaw, acc, rj, gk, gv, gqv, gg, g1, g2, S, w2v, w1v: TNeuralFloat;
   negLR, etaGrad: TNeuralFloat;
   hasInputGrad: boolean;
@@ -48658,6 +48660,11 @@ begin
     GW1in := FNeurons[4].FDelta;    GW2in := FNeurons[5].FDelta;
   end;
   SeqLen := FOutput.SizeX; Depth := FDepth; Hd := FHidden;
+  DepthM1 := Depth - 1;
+  HdM1 := Hd - 1;
+  DDM1 := Depth * Depth - 1;
+  HDepM1 := Hd * Depth - 1;
+  DHM1 := Depth * Hd - 1;
   negLR := -FLearningRate;
   eta := TTTSoftPlus(FNeurons[3].FWeights.FData[0]);
   dEtaRaw := Sigmoid(FNeurons[3].FWeights.FData[0]); // d eta / d eta_raw
@@ -48671,41 +48678,41 @@ begin
   if not FIsMLP then
   begin
     SetLength(gWlin, Depth * Depth); SetLength(gWprev, Depth * Depth);
-    for i := 0 to Depth * Depth - 1 do gWlin[i] := 0;
+    for i := 0 to DDM1 do gWlin[i] := 0;
   end
   else
   begin
     SetLength(gW1c, Hd * Depth); SetLength(gW2c, Depth * Hd);
     SetLength(gW1prev, Hd * Depth); SetLength(gW2prev, Depth * Hd);
     SetLength(dr, Depth); SetLength(dh1, Hd); SetLength(da1, Hd); SetLength(dS, Hd);
-    for i := 0 to Hd * Depth - 1 do gW1c[i] := 0;
-    for i := 0 to Depth * Hd - 1 do gW2c[i] := 0;
+    for i := 0 to HDepM1 do gW1c[i] := 0;
+    for i := 0 to DHM1 do gW2c[i] := 0;
   end;
   for t := SeqLen - 1 downto 0 do
   begin
     GyPtr := FOutputError.GetRawPtr(t, 0, 0);
     XtPtr := FPrevLayer.FOutput.GetRawPtr(t, 0, 0);
     baseT := t * Depth;
-    for o := 0 to Depth - 1 do begin gkv[o] := 0; gvv[o] := 0; gqq[o] := 0; end;
+    for o := 0 to DepthM1 do begin gkv[o] := 0; gvv[o] := 0; gqq[o] := 0; end;
 
     if not FIsMLP then
     begin
       baseW := t * Depth * Depth;
       // read-out y[o] = sum_i W_t[o,i] q[i]
-      for o := 0 to Depth - 1 do
-        for i := 0 to Depth - 1 do
+      for o := 0 to DepthM1 do
+        for i := 0 to DepthM1 do
         begin
           gWlin[o * Depth + i] := gWlin[o * Depth + i] + GyPtr^[o] * FQ.FData[baseT + i];
           gqq[i] := gqq[i] + GyPtr^[o] * FWlin.FData[baseW + o * Depth + i];
         end;
       // gWlin now = dL/dW_t. Update: W_t[o,i] = W_{t-1}[o,i] - eta*r[o]*k[i].
-      for i := 0 to Depth * Depth - 1 do gWprev[i] := gWlin[i]; // identity carry
-      for o := 0 to Depth - 1 do
+      for i := 0 to DDM1 do gWprev[i] := gWlin[i]; // identity carry
+      for o := 0 to DepthM1 do
       begin
         rj := FResid.FData[baseT + o]; // r[o] = W_{t-1}k - v
         // dL/dr[o] = sum_i (-eta*k[i]) * gWlin[o,i]; also eta-grad and dL/dk via the write.
         gv := 0; // accumulates dL/dr[o]
-        for i := 0 to Depth - 1 do
+        for i := 0 to DepthM1 do
         begin
           acc := gWlin[o * Depth + i];
           etaGrad := etaGrad - acc * rj * FK.FData[baseT + i] * dEtaRaw;
@@ -48715,42 +48722,42 @@ begin
         // r = W_{t-1}k - v : dv -= dr ; feed W_{t-1} and k.
         gvv[o] := gvv[o] - gv;
         if t > 0 then
-          for i := 0 to Depth - 1 do
+          for i := 0 to DepthM1 do
           begin
             gkv[i] := gkv[i] + gv * FWlin.FData[baseW - Depth * Depth + o * Depth + i];
             gWprev[o * Depth + i] := gWprev[o * Depth + i] + gv * FK.FData[baseT + i];
           end;
       end;
-      for i := 0 to Depth * Depth - 1 do gWlin[i] := gWprev[i];
+      for i := 0 to DDM1 do gWlin[i] := gWprev[i];
     end
     else
     begin
       baseW1 := t * Hd * Depth;
       baseW2 := t * Depth * Hd;
       // ---- read-out: a1q=W1_t q, h1q=GeLU(a1q), y=W2_t h1q ----
-      for o := 0 to Depth - 1 do
-        for j := 0 to Hd - 1 do
+      for o := 0 to DepthM1 do
+        for j := 0 to HdM1 do
           gW2c[o * Hd + j] := gW2c[o * Hd + j] + GyPtr^[o] * FH1q.FData[t * Hd + j];
-      for j := 0 to Hd - 1 do
+      for j := 0 to HdM1 do
       begin
         acc := 0;
-        for o := 0 to Depth - 1 do acc := acc + GyPtr^[o] * FW2.FData[baseW2 + o * Hd + j];
+        for o := 0 to DepthM1 do acc := acc + GyPtr^[o] * FW2.FData[baseW2 + o * Hd + j];
         TTTGelu(FA1q.FData[t * Hd + j], gg, g1, g2);
         acc := acc * g1; // dL/da1q[j]
-        for i := 0 to Depth - 1 do
+        for i := 0 to DepthM1 do
         begin
           gW1c[j * Depth + i] := gW1c[j * Depth + i] + acc * FQ.FData[baseT + i];
           gqq[i] := gqq[i] + acc * FW1.FData[baseW1 + j * Depth + i];
         end;
       end;
       // gW1c/gW2c = dL/dW1_t, dL/dW2_t. Identity carry to t-1.
-      for i := 0 to Hd * Depth - 1 do gW1prev[i] := gW1c[i];
-      for i := 0 to Depth * Hd - 1 do gW2prev[i] := gW2c[i];
-      for o := 0 to Depth - 1 do dr[o] := 0;
-      for j := 0 to Hd - 1 do begin dh1[j] := 0; da1[j] := 0; dS[j] := 0; end;
+      for i := 0 to HDepM1 do gW1prev[i] := gW1c[i];
+      for i := 0 to DHM1 do gW2prev[i] := gW2c[i];
+      for o := 0 to DepthM1 do dr[o] := 0;
+      for j := 0 to HdM1 do begin dh1[j] := 0; da1[j] := 0; dS[j] := 0; end;
       // ---- W2 update: W2_t[o,j] = W2_{t-1}[o,j] - eta*r[o]*h1[j] ----
-      for o := 0 to Depth - 1 do
-        for j := 0 to Hd - 1 do
+      for o := 0 to DepthM1 do
+        for j := 0 to HdM1 do
         begin
           acc := gW2c[o * Hd + j];
           etaGrad := etaGrad - acc * FRr.FData[baseT + o] * FH1k.FData[t * Hd + j] * dEtaRaw;
@@ -48758,16 +48765,16 @@ begin
           dh1[j] := dh1[j] - eta * acc * FRr.FData[baseT + o];
         end;
       // ---- W1 update: W1_t[j,i] = W1_{t-1}[j,i] - eta*da1[j]*k[i] ----
-      for j := 0 to Hd - 1 do
+      for j := 0 to HdM1 do
       begin
         TTTGelu(FA1k.FData[t * Hd + j], gg, g1, g2);
         S := 0; // (W2_{t-1}^T r)[j]
-        for o := 0 to Depth - 1 do
+        for o := 0 to DepthM1 do
           if t > 0 then S := S + FW2.FData[baseW2 - Depth * Hd + o * Hd + j] * FRr.FData[baseT + o]
           else S := S + W2init.FData[o * Hd + j] * FRr.FData[baseT + o];
         // da1_fwd[j] = g1 * S ; d(da1[j]) accumulates from the W1 write.
         rj := 0; // d(da1[j])
-        for i := 0 to Depth - 1 do
+        for i := 0 to DepthM1 do
         begin
           acc := gW1c[j * Depth + i];
           etaGrad := etaGrad - acc * (g1 * S) * FK.FData[baseT + i] * dEtaRaw;
@@ -48779,8 +48786,8 @@ begin
         da1[j] := da1[j] + rj * g2 * S;
       end;
       // dS feeds r and W2_{t-1}.
-      for j := 0 to Hd - 1 do
-        for o := 0 to Depth - 1 do
+      for j := 0 to HdM1 do
+        for o := 0 to DepthM1 do
         begin
           if t > 0 then w2v := FW2.FData[baseW2 - Depth * Hd + o * Hd + j]
           else w2v := W2init.FData[o * Hd + j];
@@ -48789,10 +48796,10 @@ begin
           else GW2in.FData[o * Hd + j] := GW2in.FData[o * Hd + j] + negLR * dS[j] * FRr.FData[baseT + o];
         end;
       // r[o] = f[o] - v[o], f[o] = W2_{t-1} h1 : dv -= dr ; feed W2_{t-1}, h1.
-      for o := 0 to Depth - 1 do
+      for o := 0 to DepthM1 do
       begin
         gvv[o] := gvv[o] - dr[o];
-        for j := 0 to Hd - 1 do
+        for j := 0 to HdM1 do
         begin
           if t > 0 then w2v := FW2.FData[baseW2 - Depth * Hd + o * Hd + j]
           else w2v := W2init.FData[o * Hd + j];
@@ -48802,14 +48809,14 @@ begin
         end;
       end;
       // h1[j] = GeLU(a1[j]) : da1 += dh1 * g1(a1).
-      for j := 0 to Hd - 1 do
+      for j := 0 to HdM1 do
       begin
         TTTGelu(FA1k.FData[t * Hd + j], gg, g1, g2);
         da1[j] := da1[j] + dh1[j] * g1;
       end;
       // a1[j] = sum_i W1_{t-1}[j,i] k[i] : feed W1_{t-1}, k.
-      for j := 0 to Hd - 1 do
-        for i := 0 to Depth - 1 do
+      for j := 0 to HdM1 do
+        for i := 0 to DepthM1 do
         begin
           if t > 0 then w1v := FW1.FData[baseW1 - Hd * Depth + j * Depth + i]
           else w1v := W1init.FData[j * Depth + i];
@@ -48817,19 +48824,19 @@ begin
           if t > 0 then gW1prev[j * Depth + i] := gW1prev[j * Depth + i] + da1[j] * FK.FData[baseT + i]
           else GW1in.FData[j * Depth + i] := GW1in.FData[j * Depth + i] + negLR * da1[j] * FK.FData[baseT + i];
         end;
-      for i := 0 to Hd * Depth - 1 do gW1c[i] := gW1prev[i];
-      for i := 0 to Depth * Hd - 1 do gW2c[i] := gW2prev[i];
+      for i := 0 to HDepM1 do gW1c[i] := gW1prev[i];
+      for i := 0 to DHM1 do gW2c[i] := gW2prev[i];
     end;
 
     // ---- map dL/dk, dL/dv, dL/dq back to projections + input ----
     if hasInputGrad then PrevErrPtr := PrevErr.GetRawPtr(t, 0, 0)
     else PrevErrPtr := nil;
-    for o := 0 to Depth - 1 do
+    for o := 0 to DepthM1 do
     begin
       gqv := gqq[o] * FScaleQ;
       gk := gkv[o];
       gv := gvv[o];
-      for i := 0 to Depth - 1 do
+      for i := 0 to DepthM1 do
       begin
         GThQ.FData[o * Depth + i] := GThQ.FData[o * Depth + i] + negLR * gqv * XtPtr^[i];
         GThK.FData[o * Depth + i] := GThK.FData[o * Depth + i] + negLR * gk * XtPtr^[i];
@@ -48846,9 +48853,9 @@ begin
   // the t=0 TTT update). Flush it (the a1/dS/df paths already wrote their parts).
   if FIsMLP then
   begin
-    for i := 0 to Hd * Depth - 1 do
+    for i := 0 to HDepM1 do
       GW1in.FData[i] := GW1in.FData[i] + negLR * gW1c[i];
-    for i := 0 to Depth * Hd - 1 do
+    for i := 0 to DHM1 do
       GW2in.FData[i] := GW2in.FData[i] + negLR * gW2c[i];
   end;
   // eta_raw grad.
@@ -48980,6 +48987,7 @@ var
   ThK, ThV, ThQ, Walpha, W1init, W2init: TNNetVolume;
   EtaR, ThetaR, AlphaR: TNNetVolume;
   SeqLen, Depth, Hd, t, o, i, j, gj, baseT, baseW1, baseW2: integer;
+  SeqLenM1, DepthM1, HdM1: integer;
   acc, gg, g1, g2, rj, Ss, etao, thetao, alphao: TNeuralFloat;
   XtPtr, OutPtr: TNeuralFloatArrPtr;
   ThR: TNeuralFloatArrPtr;
@@ -48991,7 +48999,10 @@ begin
   AlphaR := FNeurons[5].FWeights; Walpha := FNeurons[6].FWeights;
   W1init := FNeurons[7].FWeights; W2init := FNeurons[8].FWeights;
   SeqLen := FOutput.SizeX; Depth := FDepth; Hd := FHidden;
-  for t := 0 to SeqLen - 1 do
+  SeqLenM1 := SeqLen - 1;
+  DepthM1 := Depth - 1;
+  HdM1 := Hd - 1;
+  for t := 0 to SeqLenM1 do
   begin
     XtPtr := FPrevLayer.FOutput.GetRawPtr(t, 0, 0);
     OutPtr := FOutput.GetRawPtr(t, 0, 0);
@@ -48999,47 +49010,47 @@ begin
     baseW1 := t * Hd * Depth;
     baseW2 := t * Depth * Hd;
     // view projections k/v/q and the data-dependent forget gate alpha_t.
-    for o := 0 to Depth - 1 do
+    for o := 0 to DepthM1 do
     begin
       ThR := ThK.GetRawPtr(o, 0, 0); acc := 0;
-      for i := 0 to Depth - 1 do acc := acc + ThR^[i] * XtPtr^[i];
+      for i := 0 to DepthM1 do acc := acc + ThR^[i] * XtPtr^[i];
       FK.FData[baseT + o] := acc;
       ThR := ThV.GetRawPtr(o, 0, 0); acc := 0;
-      for i := 0 to Depth - 1 do acc := acc + ThR^[i] * XtPtr^[i];
+      for i := 0 to DepthM1 do acc := acc + ThR^[i] * XtPtr^[i];
       FVv.FData[baseT + o] := acc;
       ThR := ThQ.GetRawPtr(o, 0, 0); acc := 0;
-      for i := 0 to Depth - 1 do acc := acc + ThR^[i] * XtPtr^[i];
+      for i := 0 to DepthM1 do acc := acc + ThR^[i] * XtPtr^[i];
       FQ.FData[baseT + o] := acc * FScaleQ;
       ThR := Walpha.GetRawPtr(o, 0, 0); acc := AlphaR.FData[o];
-      for i := 0 to Depth - 1 do acc := acc + ThR^[i] * XtPtr^[i];
+      for i := 0 to DepthM1 do acc := acc + ThR^[i] * XtPtr^[i];
       FAlpha.FData[baseT + o] := Sigmoid(acc);
     end;
     // inner forward at k (M_{t-1}): a1=W1p k, h1=GeLU(a1), f=W2p h1, r=f-v.
-    for j := 0 to Hd - 1 do
+    for j := 0 to HdM1 do
     begin
       acc := 0;
-      for i := 0 to Depth - 1 do
+      for i := 0 to DepthM1 do
         if t > 0 then acc := acc + FW1.FData[baseW1 - Hd * Depth + j * Depth + i] * FK.FData[baseT + i]
         else acc := acc + W1init.FData[j * Depth + i] * FK.FData[baseT + i];
       FA1k.FData[t * Hd + j] := acc;
       TTTGelu(acc, gg, g1, g2);
       FH1k.FData[t * Hd + j] := gg;
     end;
-    for o := 0 to Depth - 1 do
+    for o := 0 to DepthM1 do
     begin
       acc := 0;
-      for j := 0 to Hd - 1 do
+      for j := 0 to HdM1 do
         if t > 0 then acc := acc + FW2.FData[baseW2 - Depth * Hd + o * Hd + j] * FH1k.FData[t * Hd + j]
         else acc := acc + W2init.FData[o * Hd + j] * FH1k.FData[t * Hd + j];
       FRr.FData[baseT + o] := acc - FVv.FData[baseT + o];
     end;
     // momentum + forget update of W2: gW2[o,j]=r[o]*h1[j].
-    for o := 0 to Depth - 1 do
+    for o := 0 to DepthM1 do
     begin
       etao   := Sigmoid(EtaR.FData[o]);
       thetao := Sigmoid(ThetaR.FData[o]);
       alphao := FAlpha.FData[baseT + o];
-      for j := 0 to Hd - 1 do
+      for j := 0 to HdM1 do
       begin
         if t > 0 then Ss := FS2.FData[baseW2 - Depth * Hd + o * Hd + j] else Ss := 0;
         Ss := etao * Ss - thetao * FRr.FData[baseT + o] * FH1k.FData[t * Hd + j];
@@ -49051,7 +49062,7 @@ begin
     end;
     // momentum + forget update of W1: gW1[j,i]=da1[j]*k[i],
     // da1[j]=g1(a1[j])*(W2_{t-1}^T r)[j]. Gate row j by gj = j mod Depth.
-    for j := 0 to Hd - 1 do
+    for j := 0 to HdM1 do
     begin
       gj := j mod Depth;
       etao   := Sigmoid(EtaR.FData[gj]);
@@ -49059,11 +49070,11 @@ begin
       alphao := FAlpha.FData[baseT + gj];
       TTTGelu(FA1k.FData[t * Hd + j], gg, g1, g2);
       Ss := 0;
-      for o := 0 to Depth - 1 do
+      for o := 0 to DepthM1 do
         if t > 0 then Ss := Ss + FW2.FData[baseW2 - Depth * Hd + o * Hd + j] * FRr.FData[baseT + o]
         else Ss := Ss + W2init.FData[o * Hd + j] * FRr.FData[baseT + o];
       rj := g1 * Ss; // da1[j]
-      for i := 0 to Depth - 1 do
+      for i := 0 to DepthM1 do
       begin
         if t > 0 then Ss := FS1.FData[baseW1 - Hd * Depth + j * Depth + i] else Ss := 0;
         Ss := etao * Ss - thetao * rj * FK.FData[baseT + i];
@@ -49074,19 +49085,19 @@ begin
       end;
     end;
     // read-out using M_t: a1q=W1_t q, h1q=GeLU(a1q), y=W2_t h1q.
-    for j := 0 to Hd - 1 do
+    for j := 0 to HdM1 do
     begin
       acc := 0;
-      for i := 0 to Depth - 1 do
+      for i := 0 to DepthM1 do
         acc := acc + FW1.FData[baseW1 + j * Depth + i] * FQ.FData[baseT + i];
       FA1q.FData[t * Hd + j] := acc;
       TTTGelu(acc, gg, g1, g2);
       FH1q.FData[t * Hd + j] := gg;
     end;
-    for o := 0 to Depth - 1 do
+    for o := 0 to DepthM1 do
     begin
       acc := 0;
-      for j := 0 to Hd - 1 do
+      for j := 0 to HdM1 do
         acc := acc + FW2.FData[baseW2 + o * Hd + j] * FH1q.FData[t * Hd + j];
       OutPtr^[o] := acc;
     end;
@@ -49103,6 +49114,7 @@ var
   EtaR, ThetaR, AlphaR: TNNetVolume;
   GEtaR, GThetaR, GAlphaR: TNNetVolume;
   SeqLen, Depth, Hd, t, o, i, j, gj, baseT, baseW1, baseW2: integer;
+  DepthM1, HdM1, HDepM1, DHM1: integer;
   acc, rj, gk, gv, gqv, gg, g1, g2, Ss, w2v, w1v: TNeuralFloat;
   negLR, etao, thetao, alphao, dEta, dTheta, dAlpha, galpha_pre: TNeuralFloat;
   W1p, W2p, S1p, S2p, daW1, daW2: TNeuralFloat;
@@ -49130,6 +49142,10 @@ begin
   W1init := FNeurons[7].FWeights; W2init := FNeurons[8].FWeights;
   GW1in := FNeurons[7].FDelta; GW2in := FNeurons[8].FDelta;
   SeqLen := FOutput.SizeX; Depth := FDepth; Hd := FHidden;
+  DepthM1 := Depth - 1;
+  HdM1 := Hd - 1;
+  HDepM1 := Hd * Depth - 1;
+  DHM1 := Depth * Hd - 1;
   negLR := -FLearningRate;
   hasInputGrad := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
@@ -49142,8 +49158,8 @@ begin
   SetLength(gS1, Hd * Depth); SetLength(gS2, Depth * Hd);
   SetLength(gW1p, Hd * Depth); SetLength(gW2p, Depth * Hd);
   SetLength(gS1p, Hd * Depth); SetLength(gS2p, Depth * Hd);
-  for i := 0 to Hd * Depth - 1 do begin gW1[i] := 0; gS1[i] := 0; end;
-  for i := 0 to Depth * Hd - 1 do begin gW2[i] := 0; gS2[i] := 0; end;
+  for i := 0 to HDepM1 do begin gW1[i] := 0; gS1[i] := 0; end;
+  for i := 0 to DHM1 do begin gW2[i] := 0; gS2[i] := 0; end;
   for t := SeqLen - 1 downto 0 do
   begin
     GyPtr := FOutputError.GetRawPtr(t, 0, 0);
@@ -49151,19 +49167,19 @@ begin
     baseT := t * Depth;
     baseW1 := t * Hd * Depth;
     baseW2 := t * Depth * Hd;
-    for o := 0 to Depth - 1 do begin gkv[o] := 0; gvv[o] := 0; gqq[o] := 0; end;
+    for o := 0 to DepthM1 do begin gkv[o] := 0; gvv[o] := 0; gqq[o] := 0; end;
 
     // ---- read-out: a1q=W1_t q, h1q=GeLU(a1q), y=W2_t h1q ----
-    for o := 0 to Depth - 1 do
-      for j := 0 to Hd - 1 do
+    for o := 0 to DepthM1 do
+      for j := 0 to HdM1 do
         gW2[o * Hd + j] := gW2[o * Hd + j] + GyPtr^[o] * FH1q.FData[t * Hd + j];
-    for j := 0 to Hd - 1 do
+    for j := 0 to HdM1 do
     begin
       acc := 0;
-      for o := 0 to Depth - 1 do acc := acc + GyPtr^[o] * FW2.FData[baseW2 + o * Hd + j];
+      for o := 0 to DepthM1 do acc := acc + GyPtr^[o] * FW2.FData[baseW2 + o * Hd + j];
       TTTGelu(FA1q.FData[t * Hd + j], gg, g1, g2);
       acc := acc * g1; // dL/da1q[j]
-      for i := 0 to Depth - 1 do
+      for i := 0 to DepthM1 do
       begin
         gW1[j * Depth + i] := gW1[j * Depth + i] + acc * FQ.FData[baseT + i];
         gqq[i] := gqq[i] + acc * FW1.FData[baseW1 + j * Depth + i];
@@ -49174,17 +49190,17 @@ begin
     // ---- undo the forget+momentum update of W1/W2 (output of the step) ----
     // W2_t[o,j] = (1-alpha[o])*W2p[o,j] + S2_t[o,j]
     // W1_t[j,i] = (1-alpha[gj])*W1p[j,i] + S1_t[j,i]
-    for i := 0 to Hd * Depth - 1 do begin gW1p[i] := 0; gS1[i] := gW1[i]; end;
-    for i := 0 to Depth * Hd - 1 do begin gW2p[i] := 0; gS2[i] := gW2[i]; end;
-    for o := 0 to Depth - 1 do dr[o] := 0;
-    for j := 0 to Hd - 1 do begin dh1[j] := 0; da1[j] := 0; dSj[j] := 0; end;
+    for i := 0 to HDepM1 do begin gW1p[i] := 0; gS1[i] := gW1[i]; end;
+    for i := 0 to DHM1 do begin gW2p[i] := 0; gS2[i] := gW2[i]; end;
+    for o := 0 to DepthM1 do dr[o] := 0;
+    for j := 0 to HdM1 do begin dh1[j] := 0; da1[j] := 0; dSj[j] := 0; end;
     dAlpha := 0; // accumulated per-channel later (alpha is per-channel)
     // W2 branch.
-    for o := 0 to Depth - 1 do
+    for o := 0 to DepthM1 do
     begin
       alphao := FAlpha.FData[baseT + o];
       galpha_pre := 0;
-      for j := 0 to Hd - 1 do
+      for j := 0 to HdM1 do
       begin
         if t > 0 then W2p := FW2.FData[baseW2 - Depth * Hd + o * Hd + j]
         else W2p := W2init.FData[o * Hd + j];
@@ -49194,7 +49210,7 @@ begin
       // d alpha[o] / d pre = alpha*(1-alpha) ; chain to alpha_raw[o] and W_alpha[o,:].
       galpha_pre := galpha_pre * alphao * (1 - alphao);
       GAlphaR.FData[o] := GAlphaR.FData[o] + negLR * galpha_pre;
-      for i := 0 to Depth - 1 do
+      for i := 0 to DepthM1 do
         GWalpha.FData[o * Depth + i] := GWalpha.FData[o * Depth + i] + negLR * galpha_pre * XtPtr^[i];
       if hasInputGrad then
       begin
@@ -49204,17 +49220,17 @@ begin
       if hasInputGrad then
       begin
         PrevErrPtr := PrevErr.GetRawPtr(t, 0, 0);
-        for i := 0 to Depth - 1 do
+        for i := 0 to DepthM1 do
           PrevErrPtr^[i] := PrevErrPtr^[i] + galpha_pre * Walpha.FData[o * Depth + i];
       end;
     end;
     // W1 branch (gate index gj).
-    for j := 0 to Hd - 1 do
+    for j := 0 to HdM1 do
     begin
       gj := j mod Depth;
       alphao := FAlpha.FData[baseT + gj];
       galpha_pre := 0;
-      for i := 0 to Depth - 1 do
+      for i := 0 to DepthM1 do
       begin
         if t > 0 then W1p := FW1.FData[baseW1 - Hd * Depth + j * Depth + i]
         else W1p := W1init.FData[j * Depth + i];
@@ -49223,24 +49239,24 @@ begin
       end;
       galpha_pre := galpha_pre * alphao * (1 - alphao);
       GAlphaR.FData[gj] := GAlphaR.FData[gj] + negLR * galpha_pre;
-      for i := 0 to Depth - 1 do
+      for i := 0 to DepthM1 do
         GWalpha.FData[gj * Depth + i] := GWalpha.FData[gj * Depth + i] + negLR * galpha_pre * XtPtr^[i];
       if hasInputGrad then
       begin
         PrevErrPtr := PrevErr.GetRawPtr(t, 0, 0);
-        for i := 0 to Depth - 1 do
+        for i := 0 to DepthM1 do
           PrevErrPtr^[i] := PrevErrPtr^[i] + galpha_pre * Walpha.FData[gj * Depth + i];
       end;
     end;
 
     // ---- undo the momentum update S_t = eta*S_{t-1} - theta*grad_t ----
     // S2_t[o,j] = eta[o]*S2p[o,j] - theta[o]*r[o]*h1[j]
-    for o := 0 to Depth - 1 do
+    for o := 0 to DepthM1 do
     begin
       etao   := Sigmoid(EtaR.FData[o]);
       thetao := Sigmoid(ThetaR.FData[o]);
       dEta := 0; dTheta := 0;
-      for j := 0 to Hd - 1 do
+      for j := 0 to HdM1 do
       begin
         acc := gS2[o * Hd + j]; // dL/dS2_t[o,j]
         if t > 0 then S2p := FS2.FData[baseW2 - Depth * Hd + o * Hd + j] else S2p := 0;
@@ -49258,20 +49274,20 @@ begin
     end;
     // S1_t[j,i] = eta[gj]*S1p[j,i] - theta[gj]*da1[j]*k[i]
     // need dL/d(da1[j]) accumulated then split through g1.
-    for j := 0 to Hd - 1 do
+    for j := 0 to HdM1 do
     begin
       gj := j mod Depth;
       etao   := Sigmoid(EtaR.FData[gj]);
       thetao := Sigmoid(ThetaR.FData[gj]);
       TTTGelu(FA1k.FData[t * Hd + j], gg, g1, g2);
       Ss := 0; // (W2p^T r)[j]
-      for o := 0 to Depth - 1 do
+      for o := 0 to DepthM1 do
         if t > 0 then Ss := Ss + FW2.FData[baseW2 - Depth * Hd + o * Hd + j] * FRr.FData[baseT + o]
         else Ss := Ss + W2init.FData[o * Hd + j] * FRr.FData[baseT + o];
       // da1_fwd[j] = g1*Ss
       rj := 0; // dL/d(da1[j])
       dEta := 0; dTheta := 0;
-      for i := 0 to Depth - 1 do
+      for i := 0 to DepthM1 do
       begin
         acc := gS1[j * Depth + i]; // dL/dS1_t[j,i]
         if t > 0 then S1p := FS1.FData[baseW1 - Hd * Depth + j * Depth + i] else S1p := 0;
@@ -49290,7 +49306,7 @@ begin
 
     // ---- inner-forward backward (forms r, h1, a1) ----
     // dSj[j] feeds r and W2p (Ss = sum_o W2p[o,j]*r[o]).
-    for j := 0 to Hd - 1 do
+    for j := 0 to HdM1 do
       for o := 0 to Depth - 1 do
       begin
         if t > 0 then w2v := FW2.FData[baseW2 - Depth * Hd + o * Hd + j]
