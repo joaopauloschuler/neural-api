@@ -66926,7 +66926,7 @@ procedure TNNetOctonionConv.ComputeCPU();
 var
   ox, oy, oo, fx, fy, io, tapBase, oBase, i, j: integer;
   prevX, prevY: integer;
-  outSizeYMax: integer;
+  outSizeYMax, outSizeXMax, outOctMax, featYMax, featXMax, inOctMax: integer;
   acc: TNeuralFloat;
   x: array[0..7] of TNeuralFloat;
   y: array[0..7] of TNeuralFloat;
@@ -66938,22 +66938,27 @@ begin
   prevSizeX := PrevOut.SizeX;
   prevSizeY := PrevOut.SizeY;
   outSizeYMax := FOutputSizeY - 1;
+  outSizeXMax := FOutputSizeX - 1;
+  outOctMax := FOutOctonions - 1;
+  featYMax := FFeatureSizeY - 1;
+  featXMax := FFeatureSizeX - 1;
+  inOctMax := FInOctonions - 1;
   for oy := 0 to outSizeYMax do
-  for ox := 0 to FOutputSizeX - 1 do
+  for ox := 0 to outSizeXMax do
   begin
-    for oo := 0 to FOutOctonions - 1 do
+    for oo := 0 to outOctMax do
     begin
       W := FArrNeurons[oo].FWeights;
       for i := 0 to 7 do y[i] := 0;
-      for fy := 0 to FFeatureSizeY - 1 do
+      for fy := 0 to featYMax do
       begin
         prevY := oy * FStride + fy - FPadding;
         if (prevY < 0) or (prevY >= prevSizeY) then continue;
-        for fx := 0 to FFeatureSizeX - 1 do
+        for fx := 0 to featXMax do
         begin
           prevX := ox * FStride + fx - FPadding;
           if (prevX < 0) or (prevX >= prevSizeX) then continue;
-          for io := 0 to FInOctonions - 1 do
+          for io := 0 to inOctMax do
           begin
             tapBase := ((fy * FFeatureSizeX + fx) * FInOctonions + io) * 8;
             for j := 0 to 7 do
@@ -67007,15 +67012,22 @@ var
   contrib: TNeuralFloat;
   W, LocalPrevError: TNNetVolume;
   prevSizeX, prevSizeY: integer;
+  outSizeYMax, outSizeXMax, outOctMax, featYMax, featXMax, inOctMax: integer;
 begin
   if not FCalculatePrevLayerError then exit;
   LocalPrevError := FPrevLayer.OutputError;
   prevSizeX := FPrevLayer.FOutput.SizeX;
   prevSizeY := FPrevLayer.FOutput.SizeY;
-  for oy := 0 to FOutputSizeY - 1 do
-  for ox := 0 to FOutputSizeX - 1 do
+  outSizeYMax := FOutputSizeY - 1;
+  outSizeXMax := FOutputSizeX - 1;
+  outOctMax := FOutOctonions - 1;
+  featYMax := FFeatureSizeY - 1;
+  featXMax := FFeatureSizeX - 1;
+  inOctMax := FInOctonions - 1;
+  for oy := 0 to outSizeYMax do
+  for ox := 0 to outSizeXMax do
   begin
-    for oo := 0 to FOutOctonions - 1 do
+    for oo := 0 to outOctMax do
     begin
       oBase := oo * 8;
       allZero := True;
@@ -67026,15 +67038,15 @@ begin
       end;
       if allZero then continue;
       W := FArrNeurons[oo].FWeights;
-      for fy := 0 to FFeatureSizeY - 1 do
+      for fy := 0 to featYMax do
       begin
         prevY := oy * FStride + fy - FPadding;
         if (prevY < 0) or (prevY >= prevSizeY) then continue;
-        for fx := 0 to FFeatureSizeX - 1 do
+        for fx := 0 to featXMax do
         begin
           prevX := ox * FStride + fx - FPadding;
           if (prevX < 0) or (prevX >= prevSizeX) then continue;
-          for io := 0 to FInOctonions - 1 do
+          for io := 0 to inOctMax do
           begin
             tapBase := ((fy * FFeatureSizeX + fx) * FInOctonions + io) * 8;
             for j := 0 to 7 do
@@ -67064,16 +67076,23 @@ var
   lr: TNeuralFloat;
   WDelta, BiasDelta, PrevOut: TNNetVolume;
   prevSizeX, prevSizeY: integer;
+  outSizeYMax, outSizeXMax, outOctMax, featYMax, featXMax, inOctMax: integer;
 begin
   PrevOut := FPrevLayer.FOutput;
   BiasDelta := FArrNeurons[FOutOctonions].FDelta;
   prevSizeX := PrevOut.SizeX;
   prevSizeY := PrevOut.SizeY;
   lr := -FLearningRate;
-  for oy := 0 to FOutputSizeY - 1 do
-  for ox := 0 to FOutputSizeX - 1 do
+  outSizeYMax := FOutputSizeY - 1;
+  outSizeXMax := FOutputSizeX - 1;
+  outOctMax := FOutOctonions - 1;
+  featYMax := FFeatureSizeY - 1;
+  featXMax := FFeatureSizeX - 1;
+  inOctMax := FInOctonions - 1;
+  for oy := 0 to outSizeYMax do
+  for ox := 0 to outSizeXMax do
   begin
-    for oo := 0 to FOutOctonions - 1 do
+    for oo := 0 to outOctMax do
     begin
       oBase := oo * 8;
       allZero := True;
@@ -67087,15 +67106,15 @@ begin
           BiasDelta.FData[oBase + i] := BiasDelta.FData[oBase + i] + e[i];
       if allZero then continue;
       WDelta := FArrNeurons[oo].FDelta;
-      for fy := 0 to FFeatureSizeY - 1 do
+      for fy := 0 to featYMax do
       begin
         prevY := oy * FStride + fy - FPadding;
         if (prevY < 0) or (prevY >= prevSizeY) then continue;
-        for fx := 0 to FFeatureSizeX - 1 do
+        for fx := 0 to featXMax do
         begin
           prevX := ox * FStride + fx - FPadding;
           if (prevX < 0) or (prevX >= prevSizeX) then continue;
-          for io := 0 to FInOctonions - 1 do
+          for io := 0 to inOctMax do
           begin
             tapBase := ((fy * FFeatureSizeX + fx) * FInOctonions + io) * 8;
             for j := 0 to 7 do
@@ -67176,6 +67195,7 @@ end;
 procedure TNNetKANLayer.InitDefault();
 var
   j, i, base, Dout: integer;
+  DoutMax, inDimMax: integer;
   scale: TNeuralFloat;
 begin
   if FInDim <= 0 then exit;
@@ -67185,11 +67205,13 @@ begin
   // Near-linear init: c_{ij1} (the T_1=u term) gets a small random weight,
   // c_{ij0} and c_{ijk>=2} stay 0. Scale like a fan-in linear init.
   scale := Sqrt(2.0 / Max(1, FInDim));
-  for j := 0 to Dout - 1 do
+  DoutMax := Dout - 1;
+  inDimMax := FInDim - 1;
+  for j := 0 to DoutMax do
   begin
     FArrNeurons[j].FWeights.Fill(0);
     FArrNeurons[j].FBiasWeight := 0;
-    for i := 0 to FInDim - 1 do
+    for i := 0 to inDimMax do
     begin
       base := i * (FDegree + 1);
       // index +1 is the degree-1 (T_1 = u) coefficient.
@@ -67213,16 +67235,19 @@ end;
 procedure TNNetKANLayer.ComputeCPU();
 var
   j, i, k, base, Dout: integer;
+  DoutMax, inDimMax: integer;
   u, acc: TNeuralFloat;
   PrevOut, W: TNNetVolume;
 begin
   Dout := FOutput.Size;
   PrevOut := FPrevLayer.FOutput;
-  for j := 0 to Dout - 1 do
+  DoutMax := Dout - 1;
+  inDimMax := FInDim - 1;
+  for j := 0 to DoutMax do
   begin
     W := FArrNeurons[j].FWeights;
     acc := 0;
-    for i := 0 to FInDim - 1 do
+    for i := 0 to inDimMax do
     begin
       u := pcr_tanhf(PrevOut.FData[i]);
       // Chebyshev T_k(u) recurrence.
@@ -67259,18 +67284,21 @@ end;
 procedure TNNetKANLayer.BackpropagateCPU();
 var
   j, i, k, base, Dout: integer;
+  DoutMax, inDimMax: integer;
   u, gy, localErr: TNeuralFloat;
   PrevOut, Delta: TNNetVolume;
 begin
   Dout := FOutput.Size;
   PrevOut := FPrevLayer.FOutput;
-  for j := 0 to Dout - 1 do
+  DoutMax := Dout - 1;
+  inDimMax := FInDim - 1;
+  for j := 0 to DoutMax do
   begin
     gy := FOutputError.FData[j];
     localErr := -FLearningRate * gy;
     if localErr = 0.0 then continue;
     Delta := FArrNeurons[j].FDelta;
-    for i := 0 to FInDim - 1 do
+    for i := 0 to inDimMax do
     begin
       u := pcr_tanhf(PrevOut.FData[i]);
       FT[0] := 1;
@@ -67283,7 +67311,7 @@ begin
   end;
   if (not FBatchUpdate) then
   begin
-    for j := 0 to Dout - 1 do FArrNeurons[j].UpdateWeights(FInertia);
+    for j := 0 to DoutMax do FArrNeurons[j].UpdateWeights(FInertia);
     AfterWeightUpdate();
   end;
 end;
@@ -67293,6 +67321,7 @@ end;
 procedure TNNetKANLayer.ComputePreviousLayerErrorCPU();
 var
   j, i, k, base, Dout: integer;
+  DoutMax, inDimMax: integer;
   u, gy, dudx, edgeDeriv, gradAcc: TNeuralFloat;
   PrevOut, PrevErr, W: TNNetVolume;
   Tderiv: array of TNeuralFloat;
@@ -67301,7 +67330,9 @@ begin
   PrevOut := FPrevLayer.FOutput;
   Dout := FOutput.Size;
   SetLength(Tderiv, FDegree + 1);
-  for i := 0 to FInDim - 1 do
+  DoutMax := Dout - 1;
+  inDimMax := FInDim - 1;
+  for i := 0 to inDimMax do
   begin
     u := pcr_tanhf(PrevOut.FData[i]);
     dudx := 1 - u * u;
@@ -67313,7 +67344,7 @@ begin
     for k := 1 to FDegree do Tderiv[k] := k * FU2[k - 1];
     base := i * (FDegree + 1);
     gradAcc := 0;
-    for j := 0 to Dout - 1 do
+    for j := 0 to DoutMax do
     begin
       gy := FOutputError.FData[j];
       if gy = 0.0 then continue;
@@ -67389,14 +67420,16 @@ end;
 procedure TNNetKANConv.SetupBSplineBasis();
 var
   nKnots, jj, gi, KK1: integer;
+  gridMax: integer;
   step: TNeuralFloat;
 begin
   KK1 := FDegree;
   nKnots := csKANBSplineGrid + 2 * KK1 + 1;
   SetLength(FKnots, nKnots);
   step := 2.0 / csKANBSplineGrid; // interior spacing over [-1,1]
+  gridMax := csKANBSplineGrid - 1;
   for jj := 0 to KK1 do FKnots[jj] := -1.0;
-  for gi := 1 to csKANBSplineGrid - 1 do
+  for gi := 1 to gridMax do
     FKnots[KK1 + gi] := -1.0 + gi * step;
   for jj := 0 to KK1 do FKnots[KK1 + csKANBSplineGrid + jj] := 1.0;
   SetLength(FBVal, csKANBSplineGrid + KK1);
@@ -67411,17 +67444,20 @@ end;
 procedure TNNetKANConv.EvalBSpline(u: TNeuralFloat; wantDeriv: boolean);
 var
   nBasis, nKnots, p, ii: integer;
+  knotMax2, nBasisMax: integer;
   left, right, denomA, denomB, termA, termB: TNeuralFloat;
   Nprev, Ncur: array of TNeuralFloat;
 begin
   nBasis := csKANBSplineGrid + FDegree;
   nKnots := Length(FKnots);
+  knotMax2 := nKnots - 2;
+  nBasisMax := nBasis - 1;
   if u < -1.0 then u := -1.0;
   if u > 1.0 then u := 1.0;
   SetLength(Nprev, nKnots);
   SetLength(Ncur, nKnots);
   // Degree-0 basis: indicator of each knot span [t_i, t_{i+1}).
-  for ii := 0 to nKnots - 2 do
+  for ii := 0 to knotMax2 do
   begin
     if ((u >= FKnots[ii]) and (u < FKnots[ii + 1])) then Nprev[ii] := 1.0
     else Nprev[ii] := 0.0;
@@ -67459,12 +67495,12 @@ begin
     if p < FDegree then
       for ii := 0 to nKnots - 2 - p do Nprev[ii] := Ncur[ii];
   end;
-  for ii := 0 to nBasis - 1 do FBVal[ii] := Ncur[ii];
+  for ii := 0 to nBasisMax do FBVal[ii] := Ncur[ii];
   if wantDeriv then
   begin
     // Need the degree-(K-1) basis (it is in Nprev after the last raise above,
     // since the loop copies Ncur->Nprev only for p<FDegree).
-    for ii := 0 to nBasis - 1 do
+    for ii := 0 to nBasisMax do
     begin
       denomA := FKnots[ii + FDegree] - FKnots[ii];
       denomB := FKnots[ii + FDegree + 1] - FKnots[ii + 1];
@@ -67479,6 +67515,7 @@ end;
 procedure TNNetKANConv.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
   oo, OutDepth, coeffs: integer;
+  outDepthMax: integer;
 begin
   OutDepth := FNeurons.Count; // numFeatures requested in Create
   // Let the standard convolution machinery size FOutput / FOutputError /
@@ -67497,7 +67534,8 @@ begin
   while FNeurons.Count > OutDepth do FNeurons.Delete(FNeurons.Count - 1);
   while FNeurons.Count < OutDepth do FNeurons.Add(TNNetNeuron.Create());
 
-  for oo := 0 to OutDepth - 1 do
+  outDepthMax := OutDepth - 1;
+  for oo := 0 to outDepthMax do
   begin
     FNeurons[oo].Weights.ReSize(coeffs, 1, 1);
     FNeurons[oo].BackInertia.ReSize(coeffs, 1, 1);
@@ -67511,7 +67549,7 @@ begin
   SetLength(FU2, FDegree + 1);
   BuildArrNeurons();
   InitDefault();
-  for oo := 0 to OutDepth - 1 do
+  for oo := 0 to outDepthMax do
     FNeurons[oo].FBiasWeight := 0;
   RefreshCalculatePrevLayerError();
   AfterWeightUpdate();
@@ -67527,24 +67565,28 @@ end;
 procedure TNNetKANConv.InitDefault();
 var
   oo, t, base, jj, mm, OutDepth: integer;
+  outDepthMax, tapsMax, coeffsMax: integer;
   scale, w0, greville: TNeuralFloat;
   W: TNNetVolume;
 begin
   if FTapsPerFilter <= 0 then exit;
   OutDepth := FNeurons.Count;
   scale := Sqrt(2.0 / Max(1, FTapsPerFilter));
+  outDepthMax := OutDepth - 1;
+  tapsMax := FTapsPerFilter - 1;
+  coeffsMax := FCoeffsPerEdge - 1;
   if FBasis = csKANBasisBSpline then
   begin
-    for oo := 0 to OutDepth - 1 do
+    for oo := 0 to outDepthMax do
     begin
       W := FArrNeurons[oo].FWeights;
       W.Fill(0);
       FArrNeurons[oo].FBiasWeight := 0;
-      for t := 0 to FTapsPerFilter - 1 do
+      for t := 0 to tapsMax do
       begin
         base := t * FCoeffsPerEdge;
         w0 := scale * (Random - 0.5) * 2.0;
-        for jj := 0 to FCoeffsPerEdge - 1 do
+        for jj := 0 to coeffsMax do
         begin
           // Greville abscissa of basis jj = mean of knots jj+1..jj+FDegree.
           greville := 0;
@@ -67557,12 +67599,12 @@ begin
     AfterWeightUpdate();
     exit;
   end;
-  for oo := 0 to OutDepth - 1 do
+  for oo := 0 to outDepthMax do
   begin
     W := FArrNeurons[oo].FWeights;
     W.Fill(0);
     FArrNeurons[oo].FBiasWeight := 0;
-    for t := 0 to FTapsPerFilter - 1 do
+    for t := 0 to tapsMax do
     begin
       base := t * (FDegree + 1);
       // index +1 is the degree-1 (T_1 = u) coefficient.
@@ -67589,27 +67631,35 @@ var
   prevX, prevY, prevSizeX, prevSizeY: integer;
   u, acc, xv: TNeuralFloat;
   W, PrevOut: TNNetVolume;
+  outSizeYMax, outSizeXMax, outDepthMax, featYMax, featXMax, inDepthMax, coeffsMax: integer;
 begin
   PrevOut := FPrevLayer.FOutput;
   prevSizeX := PrevOut.SizeX;
   prevSizeY := PrevOut.SizeY;
   OutDepth := FNeurons.Count;
-  for oy := 0 to FOutputSizeY - 1 do
-  for ox := 0 to FOutputSizeX - 1 do
+  outSizeYMax := FOutputSizeY - 1;
+  outSizeXMax := FOutputSizeX - 1;
+  outDepthMax := OutDepth - 1;
+  featYMax := FFeatureSizeY - 1;
+  featXMax := FFeatureSizeX - 1;
+  inDepthMax := FInDepth - 1;
+  coeffsMax := FCoeffsPerEdge - 1;
+  for oy := 0 to outSizeYMax do
+  for ox := 0 to outSizeXMax do
   begin
-    for oo := 0 to OutDepth - 1 do
+    for oo := 0 to outDepthMax do
     begin
       W := FArrNeurons[oo].FWeights;
       acc := 0;
-      for fy := 0 to FFeatureSizeY - 1 do
+      for fy := 0 to featYMax do
       begin
         prevY := oy * FStride + fy - FPadding;
         if (prevY < 0) or (prevY >= prevSizeY) then continue;
-        for fx := 0 to FFeatureSizeX - 1 do
+        for fx := 0 to featXMax do
         begin
           prevX := ox * FStride + fx - FPadding;
           if (prevX < 0) or (prevX >= prevSizeX) then continue;
-          for ic := 0 to FInDepth - 1 do
+          for ic := 0 to inDepthMax do
           begin
             xv := PrevOut.Get(prevX, prevY, ic);
             u := Tanh(xv);
@@ -67618,7 +67668,7 @@ begin
             if FBasis = csKANBasisBSpline then
             begin
               EvalBSpline(u, false);
-              for kk := 0 to FCoeffsPerEdge - 1 do
+              for kk := 0 to coeffsMax do
                 acc := acc + W.FData[base + kk] * FBVal[kk];
             end
             else
@@ -67662,29 +67712,37 @@ var
   prevX, prevY, prevSizeX, prevSizeY: integer;
   u, gy, localErr, xv: TNeuralFloat;
   WDelta, PrevOut: TNNetVolume;
+  outSizeYMax, outSizeXMax, outDepthMax, featYMax, featXMax, inDepthMax, coeffsMax: integer;
 begin
   PrevOut := FPrevLayer.FOutput;
   prevSizeX := PrevOut.SizeX;
   prevSizeY := PrevOut.SizeY;
   OutDepth := FNeurons.Count;
-  for oy := 0 to FOutputSizeY - 1 do
-  for ox := 0 to FOutputSizeX - 1 do
+  outSizeYMax := FOutputSizeY - 1;
+  outSizeXMax := FOutputSizeX - 1;
+  outDepthMax := OutDepth - 1;
+  featYMax := FFeatureSizeY - 1;
+  featXMax := FFeatureSizeX - 1;
+  inDepthMax := FInDepth - 1;
+  coeffsMax := FCoeffsPerEdge - 1;
+  for oy := 0 to outSizeYMax do
+  for ox := 0 to outSizeXMax do
   begin
-    for oo := 0 to OutDepth - 1 do
+    for oo := 0 to outDepthMax do
     begin
       gy := FOutputError.Get(ox, oy, oo);
       localErr := -FLearningRate * gy;
       if localErr = 0.0 then continue;
       WDelta := FArrNeurons[oo].FDelta;
-      for fy := 0 to FFeatureSizeY - 1 do
+      for fy := 0 to featYMax do
       begin
         prevY := oy * FStride + fy - FPadding;
         if (prevY < 0) or (prevY >= prevSizeY) then continue;
-        for fx := 0 to FFeatureSizeX - 1 do
+        for fx := 0 to featXMax do
         begin
           prevX := ox * FStride + fx - FPadding;
           if (prevX < 0) or (prevX >= prevSizeX) then continue;
-          for ic := 0 to FInDepth - 1 do
+          for ic := 0 to inDepthMax do
           begin
             xv := PrevOut.Get(prevX, prevY, ic);
             u := Tanh(xv);
@@ -67693,7 +67751,7 @@ begin
             if FBasis = csKANBasisBSpline then
             begin
               EvalBSpline(u, false);
-              for kk := 0 to FCoeffsPerEdge - 1 do
+              for kk := 0 to coeffsMax do
                 WDelta.FData[base + kk] := WDelta.FData[base + kk] + localErr * FBVal[kk];
             end
             else
@@ -67711,7 +67769,7 @@ begin
   end;
   if not FBatchUpdate then
   begin
-    for oo := 0 to OutDepth - 1 do
+    for oo := 0 to outDepthMax do
       FArrNeurons[oo].UpdateWeights(FInertia);
     AfterWeightUpdate();
   end;
@@ -67727,6 +67785,7 @@ var
   u, dudx, gy, edgeDeriv, gradAcc, xv: TNeuralFloat;
   W, PrevOut, LocalPrevError: TNNetVolume;
   Tderiv: array of TNeuralFloat;
+  outSizeYMax, outSizeXMax, featYMax, featXMax, inDepthMax, outDepthMax, coeffsMax: integer;
 begin
   if not FCalculatePrevLayerError then exit;
   PrevOut := FPrevLayer.FOutput;
@@ -67735,18 +67794,25 @@ begin
   prevSizeY := PrevOut.SizeY;
   OutDepth := FNeurons.Count;
   SetLength(Tderiv, FDegree + 1);
-  for oy := 0 to FOutputSizeY - 1 do
-  for ox := 0 to FOutputSizeX - 1 do
+  outSizeYMax := FOutputSizeY - 1;
+  outSizeXMax := FOutputSizeX - 1;
+  featYMax := FFeatureSizeY - 1;
+  featXMax := FFeatureSizeX - 1;
+  inDepthMax := FInDepth - 1;
+  outDepthMax := OutDepth - 1;
+  coeffsMax := FCoeffsPerEdge - 1;
+  for oy := 0 to outSizeYMax do
+  for ox := 0 to outSizeXMax do
   begin
-    for fy := 0 to FFeatureSizeY - 1 do
+    for fy := 0 to featYMax do
     begin
       prevY := oy * FStride + fy - FPadding;
       if (prevY < 0) or (prevY >= prevSizeY) then continue;
-      for fx := 0 to FFeatureSizeX - 1 do
+      for fx := 0 to featXMax do
       begin
         prevX := ox * FStride + fx - FPadding;
         if (prevX < 0) or (prevX >= prevSizeX) then continue;
-        for ic := 0 to FInDepth - 1 do
+        for ic := 0 to inDepthMax do
         begin
           xv := PrevOut.Get(prevX, prevY, ic);
           u := Tanh(xv);
@@ -67758,13 +67824,13 @@ begin
             // dphi/du = sum_j c_j * B_j'(u); chain through dudx = 1-u^2.
             EvalBSpline(u, true);
             gradAcc := 0;
-            for oo := 0 to OutDepth - 1 do
+            for oo := 0 to outDepthMax do
             begin
               gy := FOutputError.Get(ox, oy, oo);
               if gy = 0.0 then continue;
               W := FArrNeurons[oo].FWeights;
               edgeDeriv := 0;
-              for kk := 0 to FCoeffsPerEdge - 1 do
+              for kk := 0 to coeffsMax do
                 edgeDeriv := edgeDeriv + W.FData[base + kk] * FBDeriv[kk];
               gradAcc := gradAcc + gy * edgeDeriv;
             end;
@@ -67778,7 +67844,7 @@ begin
           Tderiv[0] := 0;
           for kk := 1 to FDegree do Tderiv[kk] := kk * FU2[kk - 1];
           gradAcc := 0;
-          for oo := 0 to OutDepth - 1 do
+          for oo := 0 to outDepthMax do
           begin
             gy := FOutputError.Get(ox, oy, oo);
             if gy = 0.0 then continue;
@@ -67832,6 +67898,7 @@ end;
 procedure TNNetGraphConvolution.SetAdjacency(A: TNNetVolume);
 var
   N, i, j: integer;
+  nMax: integer;
   Deg: array of TNeuralFloat;
   InvSqrt: array of TNeuralFloat;
   Aij, Sum: TNeuralFloat;
@@ -67844,18 +67911,19 @@ begin
   FAhat.ReSize(N, N, 1);
   SetLength(Deg, N);
   SetLength(InvSqrt, N);
+  nMax := N - 1;
   // Degrees of (A + I): row sums including the added self-loop.
-  for i := 0 to N - 1 do
+  for i := 0 to nMax do
   begin
     Sum := 1; // the +I self-loop
-    for j := 0 to N - 1 do
+    for j := 0 to nMax do
       if i <> j then
         Sum := Sum + A.FData[A.GetRawPos(i, j, 0)];
     Deg[i] := Sum;
     if Sum > 0 then InvSqrt[i] := 1.0 / Sqrt(Sum) else InvSqrt[i] := 0;
   end;
-  for i := 0 to N - 1 do
-    for j := 0 to N - 1 do
+  for i := 0 to nMax do
+    for j := 0 to nMax do
     begin
       if i = j then
         Aij := 1 // (A + I) diagonal
@@ -67909,6 +67977,7 @@ end;
 procedure TNNetGraphConvolution.ComputeCPU();
 var
   OutFeat, NodeIdx, FeatOut, InIdx, NbrIdx: integer;
+  numNodesMax, outFeatMax, inFeatMax: integer;
   Acc: TNeuralFloat;
   Neuron: TNNetNeuron;
   PrevOut: TNNetVolume;
@@ -67921,24 +67990,27 @@ begin
       ') does not match input NumNodes ('+IntToStr(FPrevLayer.Output.SizeX)+').');
   OutFeat := FOutput.Depth;
   PrevOut := FPrevLayer.FOutput;
+  numNodesMax := FNumNodes - 1;
+  outFeatMax := OutFeat - 1;
+  inFeatMax := FInFeat - 1;
   // (1) pointwise linear map into FAggIn.
-  for NodeIdx := 0 to FNumNodes - 1 do
-    for FeatOut := 0 to OutFeat - 1 do
+  for NodeIdx := 0 to numNodesMax do
+    for FeatOut := 0 to outFeatMax do
     begin
       Neuron := FArrNeurons[FeatOut];
       Acc := 0;
-      for InIdx := 0 to FInFeat - 1 do
+      for InIdx := 0 to inFeatMax do
         Acc := Acc + Neuron.FWeights.FData[InIdx] *
           PrevOut.FData[NodeIdx * FInFeat + InIdx];
       if FSuppressBias = 0 then Acc := Acc + Neuron.FBiasWeight;
       FAggIn.FData[NodeIdx * OutFeat + FeatOut] := Acc;
     end;
   // (2) neighbour aggregation  Y = Ahat * Z.
-  for NodeIdx := 0 to FNumNodes - 1 do
-    for FeatOut := 0 to OutFeat - 1 do
+  for NodeIdx := 0 to numNodesMax do
+    for FeatOut := 0 to outFeatMax do
     begin
       Acc := 0;
-      for NbrIdx := 0 to FNumNodes - 1 do
+      for NbrIdx := 0 to numNodesMax do
       begin
         AhatVal := FAhat.FData[NodeIdx * FNumNodes + NbrIdx];
         if AhatVal <> 0.0 then
@@ -67977,18 +68049,22 @@ end;
 procedure TNNetGraphConvolution.BackpropagateCPU();
 var
   OutFeat, NodeIdx, FeatOut, NbrIdx, InIdx: integer;
+  numNodesMax, outFeatMax, inFeatMax: integer;
   Err, AhatVal, dZ, Scale: TNeuralFloat;
   Neuron: TNNetNeuron;
   PrevOut: TNNetVolume;
 begin
   OutFeat := FOutput.Depth;
   PrevOut := FPrevLayer.FOutput;
+  numNodesMax := FNumNodes - 1;
+  outFeatMax := OutFeat - 1;
+  inFeatMax := FInFeat - 1;
   // dL/dZ = Ahat * dL/dY (stored in FAggErr).
-  for NodeIdx := 0 to FNumNodes - 1 do          // m
-    for FeatOut := 0 to OutFeat - 1 do
+  for NodeIdx := 0 to numNodesMax do          // m
+    for FeatOut := 0 to outFeatMax do
     begin
       dZ := 0;
-      for NbrIdx := 0 to FNumNodes - 1 do       // i
+      for NbrIdx := 0 to numNodesMax do       // i
       begin
         AhatVal := FAhat.FData[NbrIdx * FNumNodes + NodeIdx]; // Ahat[i,m]
         if AhatVal <> 0.0 then
@@ -68003,15 +68079,15 @@ begin
   Scale := -FLearningRate;
   // Accumulate weight/bias deltas (the standard inertia/Adam update consumes
   // these, so they carry the -LearningRate factor like the rest of the tree).
-  for FeatOut := 0 to OutFeat - 1 do
+  for FeatOut := 0 to outFeatMax do
   begin
     Neuron := FArrNeurons[FeatOut];
-    for NodeIdx := 0 to FNumNodes - 1 do
+    for NodeIdx := 0 to numNodesMax do
     begin
       dZ := FAggErr.FData[NodeIdx * OutFeat + FeatOut];
       if dZ <> 0.0 then
       begin
-        for InIdx := 0 to FInFeat - 1 do
+        for InIdx := 0 to inFeatMax do
           Neuron.FDelta.FData[InIdx] := Neuron.FDelta.FData[InIdx] +
             Scale * dZ * PrevOut.FData[NodeIdx * FInFeat + InIdx];
         if FSuppressBias = 0 then
@@ -68021,7 +68097,7 @@ begin
   end;
   if not FBatchUpdate then
   begin
-    for FeatOut := 0 to OutFeat - 1 do
+    for FeatOut := 0 to outFeatMax do
       FArrNeurons[FeatOut].UpdateWeightsWithoutInertia();
     AfterWeightUpdate();
   end;
@@ -68032,20 +68108,24 @@ end;
 procedure TNNetGraphConvolution.ComputePreviousLayerErrorCPU();
 var
   OutFeat, NodeIdx, FeatOut, InIdx: integer;
+  numNodesMax, outFeatMax, inFeatMax: integer;
   dZ: TNeuralFloat;
   Neuron: TNNetNeuron;
   LocalPrevError: TNNetVolume;
 begin
   LocalPrevError := FPrevLayer.OutputError;
   OutFeat := FOutput.Depth;
-  for NodeIdx := 0 to FNumNodes - 1 do
-    for FeatOut := 0 to OutFeat - 1 do
+  numNodesMax := FNumNodes - 1;
+  outFeatMax := OutFeat - 1;
+  inFeatMax := FInFeat - 1;
+  for NodeIdx := 0 to numNodesMax do
+    for FeatOut := 0 to outFeatMax do
     begin
       dZ := FAggErr.FData[NodeIdx * OutFeat + FeatOut];
       if dZ <> 0.0 then
       begin
         Neuron := FArrNeurons[FeatOut];
-        for InIdx := 0 to FInFeat - 1 do
+        for InIdx := 0 to inFeatMax do
           LocalPrevError.FData[NodeIdx * FInFeat + InIdx] :=
             LocalPrevError.FData[NodeIdx * FInFeat + InIdx] +
             dZ * Neuron.FWeights.FData[InIdx];
@@ -68115,6 +68195,7 @@ end;
 procedure TNNetGraphAttention.SetAdjacency(A: TNNetVolume);
 var
   N, i, j: integer;
+  nMax: integer;
 begin
   if A.SizeX <> A.SizeY then
     FErrorProc('TNNetGraphAttention.SetAdjacency requires a square adjacency, got '+
@@ -68122,8 +68203,9 @@ begin
   N := A.SizeX;
   FNumNodes := N;
   FMask.ReSize(N, N, 1);
-  for i := 0 to N - 1 do
-    for j := 0 to N - 1 do
+  nMax := N - 1;
+  for i := 0 to nMax do
+    for j := 0 to nMax do
     begin
       if i = j then
         FMask.FData[FMask.GetRawPos(i, j, 0)] := 1 // self-loop
@@ -68182,6 +68264,7 @@ end;
 procedure TNNetGraphAttention.ComputeCPU();
 var
   OutFeat, NodeIdx, FeatOut, InIdx, NbrIdx: integer;
+  numNodesMax, outFeatMax, inFeatMax: integer;
   Acc, Pre, MaxE, SumE, alphaVal, KeepScale: TNeuralFloat;
   Neuron, AttNeuron: TNNetNeuron;
   PrevOut: TNNetVolume;
@@ -68199,13 +68282,16 @@ begin
   FLeakNeg.ReSize(FNumNodes, FNumNodes, 1);
   FAlpha.Fill(0);
   FLeakNeg.Fill(0);
+  numNodesMax := FNumNodes - 1;
+  outFeatMax := OutFeat - 1;
+  inFeatMax := FInFeat - 1;
   // (1) pointwise linear map into FAggIn.
-  for NodeIdx := 0 to FNumNodes - 1 do
-    for FeatOut := 0 to OutFeat - 1 do
+  for NodeIdx := 0 to numNodesMax do
+    for FeatOut := 0 to outFeatMax do
     begin
       Neuron := FArrNeurons[FeatOut];
       Acc := 0;
-      for InIdx := 0 to FInFeat - 1 do
+      for InIdx := 0 to inFeatMax do
         Acc := Acc + Neuron.FWeights.FData[InIdx] *
           PrevOut.FData[NodeIdx * FInFeat + InIdx];
       if FSuppressBias = 0 then Acc := Acc + Neuron.FBiasWeight;
@@ -68214,11 +68300,11 @@ begin
   // Per-node attention partial scores: src[n] = a_src.Z[n], dst[n] = a_dst.Z[n].
   SetLength(SrcScore, FNumNodes);
   SetLength(DstScore, FNumNodes);
-  for NodeIdx := 0 to FNumNodes - 1 do
+  for NodeIdx := 0 to numNodesMax do
   begin
     SrcScore[NodeIdx] := 0;
     DstScore[NodeIdx] := 0;
-    for FeatOut := 0 to OutFeat - 1 do
+    for FeatOut := 0 to outFeatMax do
     begin
       SrcScore[NodeIdx] := SrcScore[NodeIdx] +
         AttNeuron.FWeights.FData[FeatOut] * FAggIn.FData[NodeIdx * OutFeat + FeatOut];
@@ -68228,10 +68314,10 @@ begin
   end;
   // (2)+(3): for each node, LeakyReLU logits over its masked neighbourhood, then
   // a numerically-stable softmax. Store alpha and the LeakyReLU negative mask.
-  for NodeIdx := 0 to FNumNodes - 1 do
+  for NodeIdx := 0 to numNodesMax do
   begin
     MaxE := -1e30;
-    for NbrIdx := 0 to FNumNodes - 1 do
+    for NbrIdx := 0 to numNodesMax do
       if FMask.FData[NodeIdx * FNumNodes + NbrIdx] <> 0 then
       begin
         Pre := SrcScore[NodeIdx] + DstScore[NbrIdx];
@@ -68244,7 +68330,7 @@ begin
         if Pre > MaxE then MaxE := Pre;
       end;
     SumE := 0;
-    for NbrIdx := 0 to FNumNodes - 1 do
+    for NbrIdx := 0 to numNodesMax do
       if FMask.FData[NodeIdx * FNumNodes + NbrIdx] <> 0 then
       begin
         alphaVal := Exp(FAlpha.FData[NodeIdx * FNumNodes + NbrIdx] - MaxE);
@@ -68252,7 +68338,7 @@ begin
         SumE := SumE + alphaVal;
       end;
     if SumE > 0 then
-      for NbrIdx := 0 to FNumNodes - 1 do
+      for NbrIdx := 0 to numNodesMax do
         if FMask.FData[NodeIdx * FNumNodes + NbrIdx] <> 0 then
           FAlpha.FData[NodeIdx * FNumNodes + NbrIdx] :=
             FAlpha.FData[NodeIdx * FNumNodes + NbrIdx] / SumE;
@@ -68267,8 +68353,8 @@ begin
   if FEnabled and (FAttDropRate > 0) then
   begin
     KeepScale := 1.0 / (1.0 - FAttDropRate);
-    for NodeIdx := 0 to FNumNodes - 1 do
-      for NbrIdx := 0 to FNumNodes - 1 do
+    for NodeIdx := 0 to numNodesMax do
+      for NbrIdx := 0 to numNodesMax do
         if (FMask.FData[NodeIdx * FNumNodes + NbrIdx] <> 0) and
            (Random < FAttDropRate) then
           FAttDropMask.FData[NodeIdx * FNumNodes + NbrIdx] := 0
@@ -68278,11 +68364,11 @@ begin
   else
     FAttDropMask.Fill(1);
   // (4) aggregate Y[i,f] = sum_j (m[i,j]*alpha[i,j]) * Z[j,f].
-  for NodeIdx := 0 to FNumNodes - 1 do
-    for FeatOut := 0 to OutFeat - 1 do
+  for NodeIdx := 0 to numNodesMax do
+    for FeatOut := 0 to outFeatMax do
     begin
       Acc := 0;
-      for NbrIdx := 0 to FNumNodes - 1 do
+      for NbrIdx := 0 to numNodesMax do
       begin
         alphaVal := FAlpha.FData[NodeIdx * FNumNodes + NbrIdx] *
           FAttDropMask.FData[NodeIdx * FNumNodes + NbrIdx];
@@ -68318,6 +68404,7 @@ procedure TNNetGraphAttention.BackpropagateCPU();
 var
   LpBnd105: integer;
   OutFeat, NodeIdx, FeatOut, NbrIdx, InIdx: integer;
+  numNodesMax, outFeatMax: integer;
   Err, alphaVal, dZ, Scale, gP, gPRowSum, leak, gAij, dotg: TNeuralFloat;
   Neuron, AttNeuron: TNNetNeuron;
   PrevOut: TNNetVolume;
@@ -68327,14 +68414,16 @@ begin
   OutFeat := FOutput.Depth;
   PrevOut := FPrevLayer.FOutput;
   AttNeuron := FArrNeurons[OutFeat];
+  numNodesMax := FNumNodes - 1;
+  outFeatMax := OutFeat - 1;
   gAlpha := TNNetVolume.Create(FNumNodes, FNumNodes, 1);
   gPmat := TNNetVolume.Create(FNumNodes, FNumNodes, 1);
   try
     // (A) direct aggregation path into dL/dZ. The aggregation used the
     // dropout-scaled coefficients (m[i,j]*alpha[i,j]), so the same mask multiplies
     // here:  dL/dZ[j,f] += sum_i m[i,j]*alpha[i,j] * gY[i,f].
-    for NbrIdx := 0 to FNumNodes - 1 do            // j
-      for FeatOut := 0 to OutFeat - 1 do
+    for NbrIdx := 0 to numNodesMax do            // j
+      for FeatOut := 0 to outFeatMax do
       begin
         dZ := 0;
         for NodeIdx := 0 to FNumNodes - 1 do       // i
