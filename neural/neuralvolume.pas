@@ -1757,12 +1757,13 @@ end;
 
 procedure AssertFinite(V: TNNetVolume; const Where: string);
 var
-  I: integer;
+  I, MaxN: integer;
   Val: TNeuralFloat;
 begin
   if V = nil then
     raise Exception.Create('AssertFinite(' + Where + '): volume is nil');
-  for I := 0 to V.Size - 1 do
+  MaxN := V.Size - 1;
+  for I := 0 to MaxN do
   begin
     Val := V.FData[I];
     if IsNan(Val) then
@@ -1942,7 +1943,7 @@ var
   Cnt, I, J, Tmp, Partner: integer;
   Perm: array of integer;
   Lambda, LambdaAdj: TNeuralFloat;
-  X0, Y0, BoxW, BoxH, X, Y, D, W, H: integer;
+  X0, Y0, BoxW, BoxH, X, Y, D, W, H, DepthMax: integer;
   CutA, MixedB: TNNetVolume;
   SrcA, SrcB: TNNetVolume;
   PartnerPair: TNNetVolumePair;
@@ -1982,9 +1983,10 @@ begin
     // fall back to lambda=1 (no paste) so mismatched shapes are still safe.
     if (SrcB.SizeX = W) and (SrcB.SizeY = H) and (SrcB.Depth = SrcA.Depth) then
     begin
+      DepthMax := SrcA.Depth - 1;
       for X := X0 to X0 + BoxW - 1 do
         for Y := Y0 to Y0 + BoxH - 1 do
-          for D := 0 to SrcA.Depth - 1 do
+          for D := 0 to DepthMax do
             CutA[X, Y, D] := SrcB[X, Y, D];
       // True pasted-area fraction after clamping.
       LambdaAdj := 1.0 - (BoxW * BoxH) / (W * H);
@@ -2021,7 +2023,7 @@ end;
 procedure TestTNNetVolume();
 var
   TestSize: integer;
-  I: integer;
+  I, SizeMax: integer;
   Result, Aux: TNeuralFloat;
   Min0, Max0, Min1, Max1, Min2, Max2: TNeuralFloat;
   A, B: TNNetVolume;
@@ -2043,8 +2045,9 @@ begin
 
   R.Copy(A);
   R.Add(B);
+  SizeMax := A.Size - 1;
   Result := 0;
-  for I := 0 to A.Size - 1 do
+  for I := 0 to SizeMax do
   begin
     Result := Result + Abs( R.Raw[I] - (A.Raw[I]+B.Raw[I]) );
   end;
@@ -2052,7 +2055,7 @@ begin
   WriteLnPassIfZero(Result);
 
   Result := 0;
-  for I := 0 to A.Size - 1 do
+  for I := 0 to SizeMax do
   begin
     Result := Result + ( A.Raw[I] * B.Raw[I]);
   end;
@@ -2062,7 +2065,7 @@ begin
   R.Copy(A);
   R.Sub(B);
   Result := 0;
-  for I := 0 to A.Size - 1 do
+  for I := 0 to SizeMax do
   begin
     Result := Result + Abs( A.Raw[I] - B.Raw[I] );
   end;
@@ -2072,7 +2075,7 @@ begin
   R.Copy(A);
   R.Sub(B);
   Result := 0;
-  for I := 0 to A.Size - 1 do
+  for I := 0 to SizeMax do
   begin
     Result := Result + Sqr( A.Raw[I] - B.Raw[I] );
   end;
@@ -2082,7 +2085,7 @@ begin
   R.Copy(A);
   R.Mul(B);
   Result := 0;
-  for I := 0 to A.Size - 1 do
+  for I := 0 to SizeMax do
   begin
     Result := Result + Abs( R.Raw[I] - (A.Raw[I]*B.Raw[I]) );
   end;
@@ -2091,7 +2094,7 @@ begin
 
   Result := 0;
   R.Randomize();
-  for I := 0 to A.Size - 1 do
+  for I := 0 to SizeMax do
   begin
     R.Raw[I] := Abs(R.Raw[I]);
     Result := Result + R.Raw[I];
@@ -2100,7 +2103,7 @@ begin
   WriteLnPassIfZero(Result - R.GetSum());
 
   Result := 0;
-  for I := 0 to A.Size - 1 do
+  for I := 0 to SizeMax do
   begin
     Result := Result + Sqr(R.Raw[I]);
   end;
@@ -2111,7 +2114,7 @@ begin
   A.Randomize();
   R.Copy(A);
   R.Mul(3);
-  for I := 0 to A.Size - 1 do
+  for I := 0 to SizeMax do
   begin
     Result := Result + Abs( R.Raw[I] - 3*A.Raw[I] );
   end;
@@ -2121,7 +2124,7 @@ begin
   R.Copy(A);
   R.MulAdd(3,B);
   Result := 0;
-  for I := 0 to A.Size - 1 do
+  for I := 0 to SizeMax do
   begin
     Aux := Abs( R.Raw[I] - (A.Raw[I]+ 3*B.Raw[I]) );
     Result := Result + Aux;
@@ -2136,7 +2139,7 @@ begin
   R.Copy(A);
   R.MulMulAdd(2,3,B);
   Result := 0;
-  for I := 0 to A.Size - 1 do
+  for I := 0 to SizeMax do
   begin
     Result := Result + Abs( R.Raw[I] - (2*A.Raw[I] + 3*B.Raw[I]) );
   end;
@@ -2146,7 +2149,7 @@ begin
   R.Fill(10);
   TNNetVolume.MulAdd(R.DataPtr, A.DataPtr, B.DataPtr, R.Size);
   Result := 0;
-  for I := 0 to R.Size - 1 do
+  for I := 0 to SizeMax do
   begin
     Result := Result + Abs( R.Raw[I] - (10 + A.Raw[I] * B.Raw[I]) );
   end;
@@ -2232,6 +2235,7 @@ var
   SampleVolume: TNNetVolume;
   ClustersWithElements: integer;
   ClusteredElements: integer;
+  ClusterMax: integer;
 begin
   Clusters := Random(128) + 1;
   ClusterSize := Random(128) + 1;
@@ -2259,7 +2263,8 @@ begin
   // Counts how many clusters have elements.
   ClustersWithElements := 0;
   ClusteredElements := 0;
-  for ClusterCnt := 0 to KMeans.Clusters.Count - 1 do
+  ClusterMax := KMeans.Clusters.Count - 1;
+  for ClusterCnt := 0 to ClusterMax do
   begin
     if KMeans.Clusters[ClusterCnt].Tag > 0 then Inc(ClustersWithElements);
     Inc(ClusteredElements, KMeans.Clusters[ClusterCnt].Tag);
@@ -3457,7 +3462,7 @@ end;
 
 function TNNetDictionary.AddWordsToDictionary(pString: string): boolean;
 var
-  WordCount: integer;
+  WordCount, TokenMax: integer;
 begin
   Result := false;
   FTokenizer.Delimiter := ' ';
@@ -3465,7 +3470,8 @@ begin
 
   if FTokenizer.Count > 0 then
   begin
-    for WordCount := 0  to FTokenizer.Count - 1 do
+    TokenMax := FTokenizer.Count - 1;
+    for WordCount := 0  to TokenMax do
     begin
       Result := AddWordToDictionary(Trim(FTokenizer[WordCount]));
     end;
@@ -3580,10 +3586,11 @@ end;
 
 procedure TStringListInt.SaveCurrentPosition();
 var
-  RowCnt: integer;
+  RowCnt, RowMax: integer;
 begin
   SetLength(FIntegerToStr, Self.Count);
-  for RowCnt := 0 to Self.Count - 1 do
+  RowMax := Self.Count - 1;
+  for RowCnt := 0 to RowMax do
   begin
     Self.Integers[RowCnt] := RowCnt;
     FIntegerToStr[RowCnt] := Self[RowCnt];
@@ -3595,6 +3602,7 @@ procedure TStringListInt.StringToIndexArray(pString: string;
 var
   WordCount: integer;
   WordIndex: integer;
+  TokenMax: integer;
 begin
   FTokenizer.Delimiter := ' ';
   FTokenizer.DelimitedText := pString;
@@ -3602,7 +3610,8 @@ begin
   if FTokenizer.Count > 0 then
   begin
     SetLength(IntArr, FTokenizer.Count);
-    for WordCount := 0  to FTokenizer.Count - 1 do
+    TokenMax := FTokenizer.Count - 1;
+    for WordCount := 0  to TokenMax do
     begin
       WordIndex := Self.WordToIndex(FTokenizer[WordCount]);
       //WriteLn(WordIndex,':',FTokenizer[WordCount]);
@@ -3619,6 +3628,7 @@ procedure TStringListInt.StringToIntegerArray(pString: string;
 var
   WordCount: integer;
   WordInteger: integer;
+  TokenMax: integer;
 begin
   FTokenizer.Delimiter := ' ';
   FTokenizer.DelimitedText := pString;
@@ -3626,7 +3636,8 @@ begin
   if FTokenizer.Count > 0 then
   begin
     SetLength(IntArr, FTokenizer.Count);
-    for WordCount := 0  to FTokenizer.Count - 1 do
+    TokenMax := FTokenizer.Count - 1;
+    for WordCount := 0  to TokenMax do
     begin
       WordInteger := Self.WordToInteger(FTokenizer[WordCount]);
       //WriteLn(WordIndex,':',FTokenizer[WordCount]);
@@ -3714,6 +3725,7 @@ procedure TNNetDictionary.StringToVolume(pString: string; Volume: TNNetVolume);
 var
   WordCount: integer;
   WordIndex: integer;
+  TokenMax: integer;
 begin
   if Volume.Size <> Count then Volume.Resize(Count,1,1);
 
@@ -3723,7 +3735,8 @@ begin
 
   if FTokenizer.Count > 0 then
   begin
-    for WordCount := 0  to FTokenizer.Count - 1 do
+    TokenMax := FTokenizer.Count - 1;
+    for WordCount := 0  to TokenMax do
     begin
       WordIndex := Self.WordToIndex(FTokenizer[WordCount]);
       //WriteLn(WordIndex,':',FTokenizer[WordCount]);
@@ -4322,12 +4335,13 @@ end;
 
 procedure TNNetVolumeList.AddVolumes(Origin: TNNetVolumeList);
 var
-  I: integer;
+  I, OriginMax: integer;
   NewVolume: TNNetVolume;
 begin
   if Origin.Count > 0 then
   begin
-    for I := 0 to Origin.Count - 1 do
+    OriginMax := Origin.Count - 1;
+    for I := 0 to OriginMax do
     begin
       NewVolume := TNNetVolume.Create();
       NewVolume.Copy(Origin[I]);
@@ -8058,7 +8072,7 @@ var
   S: TStringList;
   version: integer;
   pSizeX, pSizeY, pDepth: integer;
-  I: integer;
+  I, SCountMax: integer;
   AuxFloat: Single;
 begin
   version := 1;
@@ -8087,7 +8101,8 @@ begin
 
   if (S.Count>4) then
   begin
-    for I := 4 to S.Count-1 do
+    SCountMax := S.Count-1;
+    for I := 4 to SCountMax do
     begin
       AuxFloat := StrToFloat(S[I], FFormatSettings);
       FData[I-4] := AuxFloat;
