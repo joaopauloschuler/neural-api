@@ -43,6 +43,11 @@ on the fly).
 REPL commands: /exit, /reset (clear history), /system <msg> (set the system
 prompt; raises on formats without a system role, e.g. gemma/mistral).
 
+--stats prints per-turn timing to stderr (kept off stdout so piped model
+output stays clean): time-to-first-token (prefill + the first decode step)
+and the steady-state decode rate in tok/s (measured over the tokens after
+the first, so prefill is excluded).
+
 --selftest runs the argument-parsing / prompt-assembly / REPL-command unit
 checks (no model needed) and exits.
 
@@ -102,6 +107,7 @@ type
     SystemPrompt: string;
     SelfTest: boolean;
     ShowHelp: boolean;
+    Stats: boolean;              // per-turn timing to stderr (TTFT, tok/s)
     ErrorMsg: string;
   end;
 
@@ -129,6 +135,7 @@ begin
   WriteLn('  --system "msg"        initial system prompt');
   WriteLn('  --fp32                full-precision weights (DEFAULT; faster, more RAM)');
   WriteLn('  --int8                int8 weight-only quantized inference (slower, less RAM)');
+  WriteLn('  --stats               per-turn timing to stderr (TTFT, decode tok/s)');
   WriteLn('  --selftest            run the offline unit checks and exit');
   WriteLn('  --help                this text');
   WriteLn;
@@ -154,6 +161,7 @@ begin
   Result.SystemPrompt := '';
   Result.SelfTest := false;
   Result.ShowHelp := false;
+  Result.Stats := false;
   Result.ErrorMsg := '';
 end;
 
@@ -218,6 +226,7 @@ begin
     Arg := Args[ArgPos];
     if Arg = '--int8' then Opt.Int8 := true
     else if Arg = '--fp32' then Opt.Int8 := false
+    else if Arg = '--stats' then Opt.Stats := true
     else if Arg = '--selftest' then Opt.SelfTest := true
     else if (Arg = '--help') or (Arg = '-h') then Opt.ShowHelp := true
     else if Arg = '--temperature' then
@@ -482,6 +491,12 @@ var
   InV, Output, Row: TNNetVolume;
   Len, GenLen, StepCnt, Cnt, NewToken: integer;
   Decoded, Printed: string;
+  // --stats timing (monotonic ms). TStart: before prefill; TFirst: when the
+  // first reply token is produced (so TTFT covers prefill + first step);
+  // TEnd: after the decode loop. Produced counts emitted tokens.
+  TStart, TFirst, TEnd: QWord;
+  Produced: integer;
+  DecodeSecs: double;
 begin
   Result := '';
   Len := Length(PromptIds);
@@ -498,6 +513,10 @@ begin
   InV := TNNetVolume.Create(1, 1, 1);
   Output := nil; // a reference into the net, returned by Session.Output()
   Row := TNNetVolume.Create(VocabSize, 1, 1);
+  TStart := GetTickCount64();
+  TFirst := 0;
+  TEnd := 0;
+  Produced := 0;
   try
     Chain.Reset(PromptIds);
     // Fresh KV cache for this reply, then prefill the whole prompt
@@ -524,6 +543,8 @@ begin
       Chain.Commit(NewToken);
       Tokens[Len] := NewToken;
       Inc(Len);
+      Inc(Produced);
+      if Produced = 1 then TFirst := GetTickCount64(); // TTFT boundary
       GenLen := Length(Generated);
       SetLength(Generated, GenLen + 1);
       Generated[GenLen] := NewToken;
@@ -554,6 +575,24 @@ begin
       Write(Copy(Result, Length(Printed) + 1, Length(Result) - Length(Printed)));
     WriteLn;
     Flush(System.Output);
+    // Per-turn timing to stderr (keeps stdout = pure model output). TTFT =
+    // prefill + first decode step; tok/s measures the steady-state decode of
+    // the tokens AFTER the first, so prefill cost is excluded.
+    if Opt.Stats and (Produced > 0) then
+    begin
+      TEnd := GetTickCount64();
+      Write(StdErr, Format('[stats] %d tokens, TTFT %d ms',
+        [Produced, TFirst - TStart]));
+      if Produced > 1 then
+      begin
+        DecodeSecs := (TEnd - TFirst) / 1000.0;
+        if DecodeSecs > 0 then
+          Write(StdErr, Format(', decode %.1f tok/s',
+            [(Produced - 1) / DecodeSecs]));
+      end;
+      WriteLn(StdErr);
+      Flush(StdErr);
+    end;
   finally
     Row.Free;
     InV.Free;
@@ -603,6 +642,7 @@ begin
     Args.Add('--format'); Args.Add('chatml');
     Args.Add('--system'); Args.Add('Be brief.');
     Args.Add('--int8');
+    Args.Add('--stats');
     Check(ParseArgs(Args, Opt), 'full flag set parses');
     Check(Opt.ModelDir = '/tmp/model', 'model dir is the positional arg');
     Check(Abs(Opt.Temperature - 0.7) < 1e-6, '--temperature');
@@ -618,6 +658,7 @@ begin
     Check(Opt.FormatName = 'chatml', '--format');
     Check(Opt.SystemPrompt = 'Be brief.', '--system');
     Check(Opt.Int8, '--int8');
+    Check(Opt.Stats, '--stats');
 
     // fp32 is the default; --int8 opts into quantized weights.
     Args.Clear;
@@ -627,6 +668,11 @@ begin
     Args.Add('/tmp/model');
     Args.Add('--int8');
     Check(ParseArgs(Args, Opt) and Opt.Int8, '--int8 enables int8');
+
+    // --stats is off by default.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and not Opt.Stats, 'stats off by default');
 
     Args.Clear;
     Args.Add('--bogus-flag');

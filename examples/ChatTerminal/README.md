@@ -64,6 +64,7 @@ guard, flushed per token so piped output streams too).
 | `--format NAME` | `chatml`/`llama2`/`llama3`/`zephyr`/`gemma`/`phi3`/`mistral` override | autodetect |
 | `--system "msg"` | initial system prompt | none |
 | `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — slower, less RAM | fp32 (faster, more RAM) |
+| `--stats` | per-turn timing to **stderr**: TTFT (prefill + first token) and steady-state decode tok/s | off |
 | `--selftest` | run the offline unit checks and exit | — |
 
 The model is always built with `pInferenceOnly=true` (the REPL never
