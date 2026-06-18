@@ -20,8 +20,8 @@ Coded by Claude (AI).
 *)
 
 // WhisperTranscribe -- SPEECH-TO-TEXT with a pretrained OpenAI Whisper
-// checkpoint (openai/whisper-tiny and siblings): the first audio demo in
-// the library. The pipeline is pure CAI Pascal end to end:
+// checkpoint (openai/whisper-tiny and siblings): an audio demo.
+// The pipeline is pure CAI Pascal end to end:
 //
 //   16-bit PCM WAV (16 kHz mono)
 //     -> log-mel spectrogram          (neuralaudio.WhisperLogMelFromWavFile:

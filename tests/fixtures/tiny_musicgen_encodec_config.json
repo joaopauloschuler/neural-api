@@ -1,0 +1,28 @@
+{
+ "model_type": "encodec",
+ "sampling_rate": 8000,
+ "audio_channels": 1,
+ "normalize": false,
+ "hidden_size": 8,
+ "num_filters": 2,
+ "num_residual_layers": 1,
+ "upsampling_ratios": [
+  2,
+  2
+ ],
+ "norm_type": "weight_norm",
+ "kernel_size": 7,
+ "last_kernel_size": 7,
+ "residual_kernel_size": 3,
+ "dilation_growth_rate": 2,
+ "use_causal_conv": true,
+ "pad_mode": "reflect",
+ "compress": 2,
+ "num_lstm_layers": 1,
+ "trim_right_ratio": 1.0,
+ "codebook_size": 16,
+ "codebook_dim": 8,
+ "target_bandwidths": [
+  48.0
+ ]
+}

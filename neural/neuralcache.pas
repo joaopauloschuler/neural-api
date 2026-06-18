@@ -93,9 +93,11 @@ function TCacheMem.Used: extended;
 var
   I: integer;
   S: extended;
+  FMaxStatesM1: integer;
 begin
   S := 0;
-  for I := 0 to FMaxStates - 1 do
+  FMaxStatesM1 := FMaxStates - 1;
+  for I := 0 to FMaxStatesM1 do
     if FFilledStatePosition[I] then
       S := S + 1;
   Used := S / FMaxStates;
@@ -112,6 +114,7 @@ end;
 procedure TCacheMem.Init(StateLength, DataLength: longint; CacheSize: integer);
 var
   I: integer;
+  FMaxStatesM1: integer;
 begin
   Clear;
   NHit := 0;
@@ -121,7 +124,8 @@ begin
   SetLength(FKeyStates, FMaxStates);
   SetLength(DataA, FMaxStates);
   SetLength(FFilledStatePosition, FMaxStates);
-  for I := 0 to FMaxStates - 1 do
+  FMaxStatesM1 := FMaxStates - 1;
+  for I := 0 to FMaxStatesM1 do
   begin
     SetLength(FKeyStates[I], StateLength);
     SetLength(DataA[I], DataLength);
@@ -132,8 +136,10 @@ end;
 procedure TCacheMem.DeInit;
 var
   I: integer;
+  FMaxStatesM1: integer;
 begin
-  for I := 0 to FMaxStates - 1 do
+  FMaxStatesM1 := FMaxStates - 1;
+  for I := 0 to FMaxStatesM1 do
   begin
     SetLength(FKeyStates[I], 0);
     SetLength(DataA[I], 0);
@@ -146,8 +152,10 @@ end;
 procedure TCacheMem.Clear;
 var
   I: integer;
+  FMaxStatesM1: integer;
 begin
-  for I := 0 to FMaxStates - 1 do
+  FMaxStatesM1 := FMaxStates - 1;
+  for I := 0 to FMaxStatesM1 do
     FFilledStatePosition[I] := False;
 end;
 

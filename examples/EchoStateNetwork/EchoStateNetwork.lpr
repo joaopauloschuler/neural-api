@@ -2,7 +2,7 @@ program EchoStateNetwork;
 (*
 EchoStateNetwork: a self-contained Reservoir Computing demo (Jaeger 2001,
 "The echo state approach to analysing and training recurrent neural
-networks"). This is a genuinely different training paradigm from everything
+networks"). This is a different training paradigm from everything
 else in the repository: there is NO backpropagation-through-time. The
 recurrent core is a FIXED, RANDOM, sparse matrix; only a single linear
 readout is ever trained.

@@ -338,6 +338,103 @@ procedure TestBatch
 // This function translates the original CIFAR10 labels to Animal/Machine labels.
 procedure TranslateCifar10VolumesToMachineAnimal(VolumeList: TNNetVolumeList);
 
+// ----------------------------------------------------------------------------
+//  RandAugment / TrivialAugment automatic augmentation policy
+// ----------------------------------------------------------------------------
+//  Single-image geometric/photometric augmentation, ported from the
+//  torchvision transforms-v2 staple. The op bank and both selection policies
+//  operate IN PLACE on a TNNetVolume holding an RGB(/gray) image in this
+//  library's neuronal input domain ([-2..2], i.e. (pixel-128)/64). All ops
+//  keep the result clamped to that domain.
+//
+//  Magnitude convention follows torchvision RandAugment: an integer M in
+//  0..NeuralAugMaxMagnitude (default 10), 0 being (close to) identity. Each
+//  op maps M onto its torchvision _AUGMENTATION_SPACE range.
+// ----------------------------------------------------------------------------
+
+const
+  // Maximum magnitude value (torchvision uses num_magnitude_bins=31 -> M in
+  // 0..30 by default; RandAugment's default magnitude is 9 on that scale.
+  // We keep the same 0..30 scale).
+  NeuralAugMaxMagnitude: integer = 30;
+
+type
+  // Identifiers for the single-image augmentation op bank. csaIdentity is a
+  // genuine no-op; the geometric/photometric ops map magnitude M as described
+  // above.
+  TNeuralAugOp = (
+    csaIdentity,
+    csaAutoContrast,
+    csaEqualize,
+    csaRotate,
+    csaShearX,
+    csaShearY,
+    csaTranslateX,
+    csaTranslateY,
+    csaPosterize,
+    csaSolarize,
+    csaColor,
+    csaContrast,
+    csaBrightness,
+    csaSharpness
+  );
+
+// Applies a single augmentation op IN PLACE on V (neuronal [-2..2] image).
+// Magnitude is the integer M on the 0..NeuralAugMaxMagnitude scale. For
+// signed geometric ops (rotate/shear/translate) the sign is chosen randomly
+// (torchvision behaviour) unless pSignedNeg is supplied. Photometric ops are
+// clamped to the valid image domain.
+procedure NeuralAugApplyOp(V: TNNetVolume; Op: TNeuralAugOp; Magnitude: integer);
+
+// RandAugment (Cubuk et al. 2020): apply N ops drawn uniformly from the bank,
+// each at the SAME fixed magnitude M. Operates IN PLACE on V. Deterministic
+// for a fixed RandSeed.
+procedure NeuralRandAugment(V: TNNetVolume; N: integer = 2; Magnitude: integer = 9);
+
+// TrivialAugment (Muller & Hutter 2021): apply exactly ONE op drawn uniformly
+// from the bank, with its magnitude drawn uniformly from 0..NeuralAugMaxMagnitude.
+// Parameter-free. Operates IN PLACE on V. Deterministic for a fixed RandSeed.
+procedure NeuralTrivialAugment(V: TNNetVolume);
+
+// RandomErasing / Cutout (Zhong et al. 2020 / DeVries & Taylor 2017): with
+// probability pProb, erase a random rectangle whose area is a fraction in
+// [pAreaLow,pAreaHigh] of the image (aspect in [pAspectLow,1/pAspectLow]) by
+// filling it with pFill (in the neuronal domain; default 0 = neutral gray).
+// Operates IN PLACE. Deterministic for a fixed RandSeed.
+procedure NeuralRandomErasing(V: TNNetVolume;
+  pProb: TNeuralFloat = 0.5;
+  pAreaLow: TNeuralFloat = 0.02; pAreaHigh: TNeuralFloat = 0.33;
+  pAspectLow: TNeuralFloat = 0.3; pFill: TNeuralFloat = 0.0);
+
+type
+  // Selection policy for the optional TNeuralImageFit augmentation hook.
+  TNeuralAugPolicy = (napNone, napRandAugment, napTrivialAugment);
+
+  // TNeuralAugmentationPolicy is a tiny, stateless-per-call helper that bundles
+  // a chosen policy (RandAugment / TrivialAugment) plus an optional
+  // RandomErasing pass into a single procedure-of-object compatible with
+  // TNNetDataAugmentationFn (see neuralfit.pas). Assign its Augment method to
+  // TNeuralImageFit.DataAugmentationFn to opt CIFAR examples into the policy
+  // WITHOUT disturbing the default flip+crop pipeline.
+  // Coded by Claude (AI).
+  TNeuralAugmentationPolicy = class(TObject)
+  private
+    FPolicy: TNeuralAugPolicy;
+    FNumOps: integer;
+    FMagnitude: integer;
+    FErasingProb: TNeuralFloat;
+  public
+    constructor Create(pPolicy: TNeuralAugPolicy = napTrivialAugment;
+      pNumOps: integer = 2; pMagnitude: integer = 9;
+      pErasingProb: TNeuralFloat = 0.25);
+    // Signature matches TNNetDataAugmentationFn (pInput, ThreadId).
+    procedure Augment(pInput: TNNetVolume; ThreadId: integer);
+    property Policy: TNeuralAugPolicy read FPolicy write FPolicy;
+    property NumOps: integer read FNumOps write FNumOps;
+    property Magnitude: integer read FMagnitude write FMagnitude;
+    property ErasingProb: TNeuralFloat read FErasingProb write FErasingProb;
+  end;
+
 {
   RandomSubstring:
   This NLP function takes a string as input and returns a substring that starts
@@ -1058,6 +1155,7 @@ var
   pInput, pOutput: TNNetVolume;
   CntHit, CntMiss: integer;
   InputString: string;
+  MaxIdx: integer;
 begin
   pInput := TNNetVolume.Create();
   pOutput := TNNetVolume.Create();
@@ -1066,7 +1164,8 @@ begin
   // Make sure that expected input and output have the proper sizes.
   if NN.GetFirstLayer().Output.Size <> pInput.Size then pInput.ReSize(NN.GetFirstLayer().Output);
   if NN.GetLastLayer().Output.Size <> pOutput.Size then pOutput.ReSize(NN.GetLastLayer().Output);
-  for SampleId := 0 to Samples -1 do
+  MaxIdx := Samples - 1;
+  for SampleId := 0 to MaxIdx do
   begin
     // Get the input sample
     SampleLen := Min(Length(Dataset[SampleId]), pInput.SizeX);
@@ -1148,11 +1247,14 @@ end;
 procedure TNNetSequencePacker.Clear();
 var
   I: integer;
+  MaxIdx: integer;
 begin
-  for I := 0 to Length(FDocs) - 1 do SetLength(FDocs[I], 0);
+  MaxIdx := Length(FDocs) - 1;
+  for I := 0 to MaxIdx do SetLength(FDocs[I], 0);
   SetLength(FDocs, 0);
   FDocCount := 0;
-  for I := 0 to Length(FWindows) - 1 do SetLength(FWindows[I], 0);
+  MaxIdx := Length(FWindows) - 1;
+  for I := 0 to MaxIdx do SetLength(FWindows[I], 0);
   SetLength(FWindows, 0);
   FIsPacked := false;
 end;
@@ -1160,8 +1262,10 @@ end;
 procedure TNNetSequencePacker.AddDocument(const Tokens: array of integer);
 var
   I: integer;
+  MaxIdx: integer;
 begin
-  for I := 0 to Length(Tokens) - 1 do
+  MaxIdx := Length(Tokens) - 1;
+  for I := 0 to MaxIdx do
   begin
     if Tokens[I] < 2 then
       raise Exception.Create(
@@ -1171,7 +1275,7 @@ begin
   end;
   if FDocCount >= Length(FDocs) then SetLength(FDocs, 8 + FDocCount * 2);
   SetLength(FDocs[FDocCount], Length(Tokens));
-  for I := 0 to Length(Tokens) - 1 do FDocs[FDocCount][I] := Tokens[I];
+  for I := 0 to MaxIdx do FDocs[FDocCount][I] := Tokens[I];
   Inc(FDocCount);
   FIsPacked := false;
 end;
@@ -1198,13 +1302,15 @@ procedure TNNetSequencePacker.PackSplit();
 var
   StreamLen, DocIdx, I, Pos, WinCount, W: integer;
   Stream: TNeuralIntegerArray;
+  DocM1, WinM1, ContextM1: integer;
 begin
   StreamLen := 0;
-  for DocIdx := 0 to FDocCount - 1 do
+  DocM1 := FDocCount - 1;
+  for DocIdx := 0 to DocM1 do
     StreamLen := StreamLen + Length(FDocs[DocIdx]) + 1; // +1 separator
   SetLength(Stream, StreamLen);
   Pos := 0;
-  for DocIdx := 0 to FDocCount - 1 do
+  for DocIdx := 0 to DocM1 do
   begin
     for I := 0 to Length(FDocs[DocIdx]) - 1 do
     begin
@@ -1216,10 +1322,12 @@ begin
   end;
   WinCount := (StreamLen + FContextLen - 1) div FContextLen;
   SetLength(FWindows, WinCount);
-  for W := 0 to WinCount - 1 do
+  WinM1 := WinCount - 1;
+  ContextM1 := FContextLen - 1;
+  for W := 0 to WinM1 do
   begin
     SetLength(FWindows[W], FContextLen);
-    for I := 0 to FContextLen - 1 do
+    for I := 0 to ContextM1 do
     begin
       Pos := W * FContextLen + I;
       if Pos < StreamLen
@@ -1236,12 +1344,15 @@ end;
 procedure TNNetSequencePacker.PackGreedyBins(OneDocPerWindow: boolean);
 var
   DocIdx, DocLen, I, Pos, W: integer;
+  DocM1: integer;
 
   procedure PadAndCloseCurrent();
   var
     P: integer;
+    ContextM1: integer;
   begin
-    for P := Pos to FContextLen - 1 do FWindows[W][P] := FPadToken;
+    ContextM1 := FContextLen - 1;
+    for P := Pos to ContextM1 do FWindows[W][P] := FPadToken;
     Pos := FContextLen;
   end;
 
@@ -1256,7 +1367,8 @@ var
 begin
   W := -1;
   Pos := FContextLen; // force a new window for the first document
-  for DocIdx := 0 to FDocCount - 1 do
+  DocM1 := FDocCount - 1;
+  for DocIdx := 0 to DocM1 do
   begin
     DocLen := Length(FDocs[DocIdx]);
     if DocLen > FContextLen - 1 then DocLen := FContextLen - 1;
@@ -1297,10 +1409,12 @@ end;
 function TNNetSequencePacker.GetWindow(WindowIdx: integer): TNeuralIntegerArray;
 var
   I: integer;
+  ContextM1: integer;
 begin
   RequirePacked();
   SetLength(Result, FContextLen);
-  for I := 0 to FContextLen - 1 do Result[I] := FWindows[WindowIdx][I];
+  ContextM1 := FContextLen - 1;
+  for I := 0 to ContextM1 do Result[I] := FWindows[WindowIdx][I];
 end;
 
 function TNNetSequencePacker.GetToken(WindowIdx, Pos: integer): integer;
@@ -1312,6 +1426,7 @@ end;
 function TNNetSequencePacker.GetSegmentIds(WindowIdx: integer): TNeuralIntegerArray;
 var
   Pos, SegId, PadId: integer;
+  ContextM1: integer;
 begin
   RequirePacked();
   SetLength(Result, FContextLen);
@@ -1319,7 +1434,8 @@ begin
   // document opens right after each separator. Pad positions are tagged -1 and
   // reassigned a single shared id below.
   SegId := 0;
-  for Pos := 0 to FContextLen - 1 do
+  ContextM1 := FContextLen - 1;
+  for Pos := 0 to ContextM1 do
   begin
     if FWindows[WindowIdx][Pos] = FPadToken then
     begin
@@ -1334,7 +1450,7 @@ begin
   // Pads share one id distinct from every real-document id (= SegId, the next
   // unused value), so a pad never matches any real document.
   PadId := SegId;
-  for Pos := 0 to FContextLen - 1 do
+  for Pos := 0 to ContextM1 do
     if Result[Pos] = -1 then Result[Pos] := PadId;
 end;
 
@@ -1343,6 +1459,7 @@ procedure TNNetSequencePacker.GetSegmentVolume(WindowIdx: integer;
 var
   Ids: TNeuralIntegerArray;
   Pos: integer;
+  ContextM1: integer;
 begin
   RequirePacked();
   if (pSegment.SizeX <> FContextLen) or (pSegment.SizeY <> 1) or
@@ -1351,7 +1468,8 @@ begin
       'must be (ContextLen,1,1). Got (' + IntToStr(pSegment.SizeX) + ',' +
       IntToStr(pSegment.SizeY) + ',' + IntToStr(pSegment.Depth) + ').');
   Ids := GetSegmentIds(WindowIdx);
-  for Pos := 0 to FContextLen - 1 do
+  ContextM1 := FContextLen - 1;
+  for Pos := 0 to ContextM1 do
     pSegment[Pos, 0, 0] := Ids[Pos];
   SetLength(Ids, 0);
 end;
@@ -1366,22 +1484,26 @@ end;
 function TNNetSequencePacker.PredictableTargetCount(WindowIdx: integer): integer;
 var
   Pos: integer;
+  ContextM2: integer;
 begin
   Result := 0;
-  for Pos := 0 to FContextLen - 2 do
+  ContextM2 := FContextLen - 2;
+  for Pos := 0 to ContextM2 do
     if IsTargetPredictable(WindowIdx, Pos) then Inc(Result);
 end;
 
 function TNNetSequencePacker.Utilization(): TNeuralFloat;
 var
   W, TotalSlots, Predictable: integer;
+  WinM1: integer;
 begin
   RequirePacked();
   Result := 0;
   TotalSlots := Length(FWindows) * (FContextLen - 1);
   if TotalSlots = 0 then exit;
   Predictable := 0;
-  for W := 0 to Length(FWindows) - 1 do
+  WinM1 := Length(FWindows) - 1;
+  for W := 0 to WinM1 do
     Predictable := Predictable + PredictableTargetCount(W);
   Result := Predictable / TotalSlots;
 end;
@@ -1390,6 +1512,7 @@ procedure TNNetSequencePacker.GetTrainingPair(WindowIdx: integer;
   pInput, pTarget: TNNetVolume);
 var
   Pos, Token: integer;
+  ContextM1, ContextM2: integer;
 begin
   RequirePacked();
   if pInput.SizeX <> FContextLen then
@@ -1399,7 +1522,9 @@ begin
     raise Exception.Create('TNNetSequencePacker.GetTrainingPair: target SizeX ' +
       IntToStr(pTarget.SizeX) + ' <> ContextLen ' + IntToStr(FContextLen) + '.');
   pInput.Fill(0);
-  for Pos := 0 to FContextLen - 1 do
+  ContextM1 := FContextLen - 1;
+  ContextM2 := FContextLen - 2;
+  for Pos := 0 to ContextM1 do
   begin
     Token := FWindows[WindowIdx][Pos];
     if pInput.Depth = 1
@@ -1408,7 +1533,7 @@ begin
     then pInput[Pos, 0, Token] := 1;             // one-hot across depth
   end;
   pTarget.Fill(0);
-  for Pos := 0 to FContextLen - 2 do
+  for Pos := 0 to ContextM2 do
   begin
     if IsTargetPredictable(WindowIdx, Pos) then
     begin
@@ -1422,13 +1547,16 @@ procedure TNNetSequencePacker.ApplyLossMask(WindowIdx: integer;
   Desired, Actual: TNNetVolume);
 var
   Pos, D: integer;
+  ContextM1, DepthM1: integer;
 begin
   RequirePacked();
-  for Pos := 0 to FContextLen - 1 do
+  ContextM1 := FContextLen - 1;
+  DepthM1 := Desired.Depth - 1;
+  for Pos := 0 to ContextM1 do
   begin
     if not IsTargetPredictable(WindowIdx, Pos) then
     begin
-      for D := 0 to Desired.Depth - 1 do
+      for D := 0 to DepthM1 do
         Desired[Pos, 0, D] := Actual[Pos, 0, D];
     end;
   end;
@@ -1499,9 +1627,11 @@ end;
 function TNNetMaskedLMCollator.IsSpecial(TokenId: integer): boolean;
 var
   I: integer;
+  SpecialM1: integer;
 begin
   Result := false;
-  for I := 0 to FSpecialCount - 1 do
+  SpecialM1 := FSpecialCount - 1;
+  for I := 0 to SpecialM1 do
     if FSpecials[I] = TokenId then begin Result := true; exit; end;
 end;
 
@@ -1518,11 +1648,13 @@ procedure TNNetMaskedLMCollator.Collate(const Tokens: array of integer;
 var
   Len, I: integer;
   Roll: TNeuralFloat;
+  LenM1: integer;
 begin
   Len := Length(Tokens);
   SetLength(CorruptedIds, Len);
   SetLength(Labels, Len);
-  for I := 0 to Len - 1 do
+  LenM1 := Len - 1;
+  for I := 0 to LenM1 do
   begin
     CorruptedIds[I] := Tokens[I];
     Labels[I] := csMaskedLMIgnoreLabel;
@@ -1547,6 +1679,7 @@ var
   Len, I, J: integer;
   Roll: TNeuralFloat;
   WordSelected: boolean;
+  LenM1: integer;
 begin
   Len := Length(Tokens);
   if Length(WordIds) <> Len then
@@ -1555,7 +1688,8 @@ begin
       'differ.');
   SetLength(CorruptedIds, Len);
   SetLength(Labels, Len);
-  for I := 0 to Len - 1 do
+  LenM1 := Len - 1;
+  for I := 0 to LenM1 do
   begin
     CorruptedIds[I] := Tokens[I];
     Labels[I] := csMaskedLMIgnoreLabel;
@@ -1601,6 +1735,7 @@ procedure TNNetMaskedLMCollator.BuildTrainingPair(
   const CorruptedIds, Labels: TNeuralIntegerArray; pInput, pTarget: TNNetVolume);
 var
   Len, P: integer;
+  LenM1: integer;
 begin
   Len := Length(CorruptedIds);
   if Length(Labels) <> Len then
@@ -1617,7 +1752,8 @@ begin
       IntToStr(pTarget.SizeX) + ') < sequence length (' + IntToStr(Len) + ').');
   pInput.Fill(0);
   pTarget.Fill(0);
-  for P := 0 to Len - 1 do
+  LenM1 := Len - 1;
+  for P := 0 to LenM1 do
   begin
     if pInput.Depth = 1 then
       pInput[P, 0, 0] := CorruptedIds[P]            // token ids on the X axis
@@ -1634,10 +1770,13 @@ procedure TNNetMaskedLMCollator.ApplyLossMask(const Labels: TNeuralIntegerArray;
   Desired, Actual: TNNetVolume);
 var
   P, D: integer;
+  LabelsM1, DepthM1: integer;
 begin
-  for P := 0 to Length(Labels) - 1 do
+  LabelsM1 := Length(Labels) - 1;
+  DepthM1 := Desired.Depth - 1;
+  for P := 0 to LabelsM1 do
     if Labels[P] = csMaskedLMIgnoreLabel then
-      for D := 0 to Desired.Depth - 1 do
+      for D := 0 to DepthM1 do
         Desired[P, 0, D] := Actual[P, 0, D];
 end;
 
@@ -1705,9 +1844,11 @@ end;
 function TNNetSpanCorruptionCollator.IsSpecial(TokenId: integer): boolean;
 var
   I: integer;
+  SpecialM1: integer;
 begin
   Result := false;
-  for I := 0 to FSpecialCount - 1 do
+  SpecialM1 := FSpecialCount - 1;
+  for I := 0 to SpecialM1 do
     if FSpecials[I] = TokenId then begin Result := true; exit; end;
 end;
 
@@ -1733,14 +1874,16 @@ procedure TNNetSpanCorruptionCollator.Collate(const Tokens: array of integer;
 var
   Len, I, Budget, SpanLen, SrcLen, TgtLen, SpanEnd: integer;
   Masked: array of boolean;
+  LenM1: integer;
 begin
   Len := Length(Tokens);
   NumSpans := 0;
   SetLength(Masked, Len);
-  for I := 0 to Len - 1 do Masked[I] := false;
+  LenM1 := Len - 1;
+  for I := 0 to LenM1 do Masked[I] := false;
   // Token budget to mask (~CorruptionRate of non-special tokens).
   Budget := 0;
-  for I := 0 to Len - 1 do
+  for I := 0 to LenM1 do
     if not IsSpecial(Tokens[I]) then Inc(Budget);
   Budget := Round(Budget * FCorruptionRate);
 
@@ -1809,6 +1952,7 @@ procedure TNNetSpanCorruptionCollator.BuildTrainingPair(
   const SourceIds, TargetIds: TNeuralIntegerArray; pSource, pTarget: TNNetVolume);
 var
   P: integer;
+  SrcM1, TgtM1: integer;
 begin
   if pSource.SizeX < Length(SourceIds) then
     raise Exception.Create(
@@ -1822,12 +1966,14 @@ begin
       IntToStr(Length(TargetIds)) + ').');
   pSource.Fill(0);
   pTarget.Fill(0);
-  for P := 0 to Length(SourceIds) - 1 do
+  SrcM1 := Length(SourceIds) - 1;
+  TgtM1 := Length(TargetIds) - 1;
+  for P := 0 to SrcM1 do
     if pSource.Depth = 1 then
       pSource[P, 0, 0] := SourceIds[P]
     else
       pSource[P, 0, SourceIds[P]] := 1;
-  for P := 0 to Length(TargetIds) - 1 do
+  for P := 0 to TgtM1 do
     if pTarget.Depth = 1 then
       pTarget[P, 0, 0] := TargetIds[P]
     else
@@ -1877,6 +2023,7 @@ end;
 procedure TNNetLengthGroupedBatcher.AddSample(const Tokens: array of integer);
 var
   I: integer;
+  TokM1: integer;
 begin
   if Length(Tokens) < 1 then
     raise Exception.Create(
@@ -1884,7 +2031,8 @@ begin
   if FSampleCount >= Length(FSamples) then
     SetLength(FSamples, (FSampleCount + 1) * 2);
   SetLength(FSamples[FSampleCount], Length(Tokens));
-  for I := 0 to Length(Tokens) - 1 do
+  TokM1 := Length(Tokens) - 1;
+  for I := 0 to TokM1 do
     FSamples[FSampleCount][I] := Tokens[I];
   Inc(FSampleCount);
   FIsBuilt := false;
@@ -1894,9 +2042,11 @@ procedure TNNetLengthGroupedBatcher.AddSampleFromString(const Str: string);
 var
   Tokens: TNeuralIntegerArray;
   I: integer;
+  StrLen: integer;
 begin
   SetLength(Tokens, Length(Str));
-  for I := 1 to Length(Str) do
+  StrLen := Length(Str);
+  for I := 1 to StrLen do
     Tokens[I - 1] := Ord(Str[I]);
   AddSample(Tokens);
 end;
@@ -1931,9 +2081,11 @@ end;
 procedure TNNetLengthGroupedBatcher.ShuffleOrder();
 var
   I, J, Tmp: integer;
+  SampleM1: integer;
 begin
   // Fisher-Yates over the sample indices using the internal LCG.
-  for I := 0 to FSampleCount - 1 do FOrder[I] := I;
+  SampleM1 := FSampleCount - 1;
+  for I := 0 to SampleM1 do FOrder[I] := I;
   for I := FSampleCount - 1 downto 1 do
   begin
     J := NextRandomInt(I + 1);
@@ -1965,6 +2117,7 @@ end;
 procedure TNNetLengthGroupedBatcher.BuildBatches();
 var
   Mega, Lo, Hi, I, LongestPos, Tmp: integer;
+  SampleM1: integer;
 begin
   if FSampleCount < 1 then
     raise Exception.Create(
@@ -1988,7 +2141,8 @@ begin
   if FSampleCount > 1 then
   begin
     LongestPos := 0;
-    for I := 1 to FSampleCount - 1 do
+    SampleM1 := FSampleCount - 1;
+    for I := 1 to SampleM1 do
       if Length(FSamples[FOrder[I]]) > Length(FSamples[FOrder[LongestPos]]) then
         LongestPos := I;
     if LongestPos <> 0 then
@@ -2037,10 +2191,12 @@ end;
 function TNNetLengthGroupedBatcher.BatchSeqLen(BatchIdx: integer): integer;
 var
   W, L: integer;
+  MaxW: integer;
 begin
   RequireBuilt();
   Result := 0;
-  for W := 0 to BatchSize(BatchIdx) - 1 do
+  MaxW := BatchSize(BatchIdx) - 1;
+  for W := 0 to MaxW do
   begin
     L := SampleLenOf(BatchIdx, W);
     if L > Result then Result := L;
@@ -2052,6 +2208,7 @@ procedure TNNetLengthGroupedBatcher.GetTrainingPair(BatchIdx, WithinIdx: integer
 var
   Sample: TNeuralIntegerArray;
   SeqLen, Len, Pos, Token: integer;
+  SeqM1, LenM2: integer;
 begin
   RequireBuilt();
   SeqLen := BatchSeqLen(BatchIdx);
@@ -2067,7 +2224,9 @@ begin
   Len := Length(Sample);
   // Input: real tokens then right-padding to the batch's seq len.
   pInput.Fill(0);
-  for Pos := 0 to SeqLen - 1 do
+  SeqM1 := SeqLen - 1;
+  LenM2 := Len - 2;
+  for Pos := 0 to SeqM1 do
   begin
     if Pos < Len then Token := Sample[Pos] else Token := FPadToken;
     if pInput.Depth = 1
@@ -2078,7 +2237,7 @@ begin
   // Target: per-position one-hot of the NEXT real token (positions 0..Len-2);
   // every padded position and the sample's last real token carry no target.
   pTarget.Fill(0);
-  for Pos := 0 to Len - 2 do
+  for Pos := 0 to LenM2 do
   begin
     Token := Sample[Pos + 1];
     if (Token >= 0) and (Token < pTarget.Depth) then pTarget[Pos, 0, Token] := 1;
@@ -2089,15 +2248,18 @@ procedure TNNetLengthGroupedBatcher.ApplyLossMask(BatchIdx, WithinIdx: integer;
   Desired, Actual: TNNetVolume);
 var
   SeqLen, Len, Pos, D: integer;
+  SeqM1, DepthM1: integer;
 begin
   RequireBuilt();
   SeqLen := BatchSeqLen(BatchIdx);
   Len := SampleLenOf(BatchIdx, WithinIdx);
-  for Pos := 0 to SeqLen - 1 do
+  SeqM1 := SeqLen - 1;
+  DepthM1 := Desired.Depth - 1;
+  for Pos := 0 to SeqM1 do
   begin
     // Predictable iff a next real token exists: Pos in 0..Len-2.
     if Pos > Len - 2 then
-      for D := 0 to Desired.Depth - 1 do
+      for D := 0 to DepthM1 do
         Desired[Pos, 0, D] := Actual[Pos, 0, D];
   end;
 end;
@@ -2105,10 +2267,12 @@ end;
 function TNNetLengthGroupedBatcher.TotalPadTokens(): int64;
 var
   B, W, SeqLen: integer;
+  BatchM1: integer;
 begin
   RequireBuilt();
   Result := 0;
-  for B := 0 to FBatchCount - 1 do
+  BatchM1 := FBatchCount - 1;
+  for B := 0 to BatchM1 do
   begin
     SeqLen := BatchSeqLen(B);
     for W := 0 to BatchSize(B) - 1 do
@@ -2120,10 +2284,12 @@ function TNNetLengthGroupedBatcher.NaiveTotalPadTokens(): int64;
 var
   I, GlobalMax, L: integer;
   RealTokens: int64;
+  SampleM1: integer;
 begin
   GlobalMax := 0;
   RealTokens := 0;
-  for I := 0 to FSampleCount - 1 do
+  SampleM1 := FSampleCount - 1;
+  for I := 0 to SampleM1 do
   begin
     L := Length(FSamples[I]);
     if L > GlobalMax then GlobalMax := L;
@@ -2236,11 +2402,13 @@ end;
 function TClassesAndElements.CountElements(): integer;
 var
   ClassId: integer;
+  MaxIdx: integer;
 begin
   Result := 0;
   if Count > 0 then
   begin
-    for ClassId := 0 to Count - 1 do
+    MaxIdx := Count - 1;
+    for ClassId := 0 to MaxIdx do
     begin
       Result := Result + Self.List[ClassId].Count;
     end;
@@ -3138,6 +3306,7 @@ var
   Work: TNNetVolume;
   ResizeW, ResizeH, OffX, OffY, X, Y, C, SrcX, SrcY: integer;
   Scale, Fx, Fy, V: TNeuralFloat;
+  ResizeWM1, ResizeHM1, CropM1: integer;
 begin
   if (Src = nil) or (Dst = nil) then
     raise Exception.Create('PreprocessImageForVisionModel: nil volume.');
@@ -3174,8 +3343,10 @@ begin
       if ResizeW < 1 then ResizeW := 1;
       if ResizeH < 1 then ResizeH := 1;
       Work.ReSize(ResizeW, ResizeH, 3);
-      for Y := 0 to ResizeH - 1 do
-        for X := 0 to ResizeW - 1 do
+      ResizeHM1 := ResizeH - 1;
+      ResizeWM1 := ResizeW - 1;
+      for Y := 0 to ResizeHM1 do
+        for X := 0 to ResizeWM1 do
         begin
           // bilinear sample location (align_corners = false convention)
           Fx := (X + 0.5) * Src.SizeX / ResizeW - 0.5;
@@ -3196,8 +3367,9 @@ begin
     OffX := (Work.SizeX - CropSize) div 2;
     OffY := (Work.SizeY - CropSize) div 2;
     Dst.ReSize(CropSize, CropSize, 3);
-    for Y := 0 to CropSize - 1 do
-      for X := 0 to CropSize - 1 do
+    CropM1 := CropSize - 1;
+    for Y := 0 to CropM1 do
+      for X := 0 to CropM1 do
       begin
         SrcX := OffX + X;
         SrcY := OffY + Y;
@@ -3324,8 +3496,10 @@ end;
 procedure ConfusionWriteCSVHeader(var CSVConfusion: TextFile; Labels: array of string);
 var
   I: integer;
+  Hi: integer;
 begin
-  for I := Low(Labels) to High(Labels) do
+  Hi := High(Labels);
+  for I := Low(Labels) to Hi do
   begin
     if I > 0 then Write(CSVConfusion, ',');
     Write(CSVConfusion, Labels[I]);
@@ -3336,10 +3510,13 @@ end;
 procedure ConfusionWriteCSV(var CSVConfusion: TextFile; Vol: TNNetVolume; Digits: integer);
 var
   I, J: integer;
+  SizeYM1, DepthM1: integer;
 begin
-  for I := 0 to Vol.SizeY - 1 do
+  SizeYM1 := Vol.SizeY - 1;
+  DepthM1 := Vol.Depth - 1;
+  for I := 0 to SizeYM1 do
   begin
-    for J := 0 to Vol.Depth - 1 do
+    for J := 0 to DepthM1 do
     begin
       if J > 0 then Write(CSVConfusion, ',');
       Write(CSVConfusion, Round(Vol[0, I, J]):Digits);
@@ -3690,8 +3867,9 @@ procedure FilterCSVWithNumbersUpToMax(inputFile,outputFile: string; MaxInteger: 
 var
   LargeFileIn, LargeFileOut: TextFile;
   StrLine: string;
-  MaxValue, RowCnt, WordCnt: integer;
+  MaxValue, RowCnt, WordCnt, SepCount: integer;
   Separator: TNNetStringList;
+  SepCountM1: integer;
 begin
   Separator := CreateTokenizedStringList(',');
   RowCnt := 0;
@@ -3707,7 +3885,9 @@ begin
     if Separator.Count > 0 then
     begin
       MaxValue := 0;
-      for WordCnt := 0 to Separator.Count - 1 do
+      SepCount := Separator.Count;
+      SepCountM1 := SepCount - 1;
+      for WordCnt := 0 to SepCountM1 do
       begin
         MaxValue := Max(MaxValue, StrToInt(Separator[WordCnt]));
         if MaxValue > MaxInteger then break;
@@ -3728,8 +3908,9 @@ procedure LoadIntegersInCSV(filename: string; var aTokens: TNNetAAInteger;
 var
   LargeFile: TextFile;
   StrLine: string;
-  RowCnt, WordCnt: integer;
+  RowCnt, WordCnt, SepCount: integer;
   Separator: TNNetStringList;
+  SepCountM1: integer;
 begin
   Separator := CreateTokenizedStringList(',');
   RowCnt := 0;
@@ -3751,10 +3932,12 @@ begin
   begin
     ReadLn(LargeFile, StrLine);
     Separator.DelimitedText := StrLine;
-    SetLength(aTokens[RowCnt], Separator.Count);
-    if Separator.Count > 0 then
+    SepCount := Separator.Count;
+    SetLength(aTokens[RowCnt], SepCount);
+    if SepCount > 0 then
     begin
-      for WordCnt := 0 to Separator.Count - 1 do
+      SepCountM1 := SepCount - 1;
+      for WordCnt := 0 to SepCountM1 do
       begin
         aTokens[RowCnt][WordCnt] := StrToInt(Separator[WordCnt]);
       end;
@@ -3821,6 +4004,526 @@ begin
     SpacePositions.Free;
   end
   else Result := '';
+end;
+
+// ----------------------------------------------------------------------------
+//  RandAugment / TrivialAugment automatic augmentation policy - implementation
+// ----------------------------------------------------------------------------
+
+// Neuronal domain <-> 0..255 pixel helpers. RGB neuronal input uses
+// p = (px - 128)/64, so px = p*64 + 128 and the valid neuronal range is
+// [-2 .. (255-128)/64 = 1.984375]. We treat [-2..2] as the clamp domain to
+// match the rest of the library (RgbImgToNeuronalInput comment).
+const
+  cAugNeuronMin: TNeuralFloat = -2.0;
+  cAugNeuronMax: TNeuralFloat =  2.0;
+
+function AugNeuronToPixel(v: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+begin
+  Result := v * 64.0 + 128.0;
+end;
+
+function AugPixelToNeuron(p: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+begin
+  Result := (p - 128.0) / 64.0;
+end;
+
+function AugClampNeuron(v: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+begin
+  if v < cAugNeuronMin then Result := cAugNeuronMin
+  else if v > cAugNeuronMax then Result := cAugNeuronMax
+  else Result := v;
+end;
+
+function AugClampPixel(p: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+begin
+  if p < 0 then Result := 0
+  else if p > 255 then Result := 255
+  else Result := p;
+end;
+
+// Linearly interpolate every pixel toward a per-channel "degenerate" image:
+//   out = blend*degenerate + (1-blend)*original   (torchvision _blend).
+// Here we blend toward a scalar gray value per the photometric op.
+procedure AugBlendTowardScalar(V: TNNetVolume; GrayPixel, Factor: TNeuralFloat);
+var
+  I: integer;
+  p: TNeuralFloat;
+  SizeM1: integer;
+begin
+  // out_px = Factor*orig_px + (1-Factor)*gray  (torchvision uses
+  //   img2 = (1-ratio)*degenerate + ratio*img). Factor>1 enhances.
+  SizeM1 := V.Size - 1;
+  for I := 0 to SizeM1 do
+  begin
+    p := AugNeuronToPixel(V.FData[I]);
+    p := Factor * p + (1.0 - Factor) * GrayPixel;
+    V.FData[I] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
+  end;
+end;
+
+// Bilinear-free nearest geometric warp helper. Maps each destination pixel
+// (dx,dy) back to a source pixel via an affine transform around the image
+// center; out-of-bounds samples are filled with neutral gray (neuronal 0).
+// Mat is [a,b,c, d,e,f] s.t. src = Mat * (dst_centered) + center.
+procedure AugAffineWarp(V: TNNetVolume; const Mat: array of TNeuralFloat);
+var
+  W, H, Dep, dx, dy, d, sx, sy: integer;
+  cx, cy, ox, oy, fx, fy: TNeuralFloat;
+  Src: TNNetVolume;
+  WM1, HM1, DepM1: integer;
+begin
+  W := V.SizeX; H := V.SizeY; Dep := V.Depth;
+  if (W <= 0) or (H <= 0) then Exit;
+  Src := TNNetVolume.Create;
+  Src.Copy(V);
+  cx := (W - 1) / 2.0;
+  cy := (H - 1) / 2.0;
+  WM1 := W - 1; HM1 := H - 1; DepM1 := Dep - 1;
+  for dy := 0 to HM1 do
+    for dx := 0 to WM1 do
+    begin
+      ox := dx - cx;
+      oy := dy - cy;
+      fx := Mat[0] * ox + Mat[1] * oy + Mat[2] + cx;
+      fy := Mat[3] * ox + Mat[4] * oy + Mat[5] + cy;
+      sx := Round(fx);
+      sy := Round(fy);
+      for d := 0 to DepM1 do
+      begin
+        if (sx >= 0) and (sx < W) and (sy >= 0) and (sy < H)
+          then V[dx, dy, d] := Src[sx, sy, d]
+          else V[dx, dy, d] := 0.0; // neutral gray fill (pixel 128)
+      end;
+    end;
+  Src.Free;
+end;
+
+// --- Photometric ops -------------------------------------------------------
+
+procedure AugAutoContrast(V: TNNetVolume);
+var
+  d, x, y: integer;
+  lo, hi, p, scale: TNeuralFloat;
+  DepthM1, SizeYM1, SizeXM1: integer;
+begin
+  // Per-channel min/max stretch to full 0..255 range (torchvision autocontrast).
+  DepthM1 := V.Depth - 1;
+  SizeYM1 := V.SizeY - 1;
+  SizeXM1 := V.SizeX - 1;
+  for d := 0 to DepthM1 do
+  begin
+    lo := 255; hi := 0;
+    for y := 0 to SizeYM1 do
+      for x := 0 to SizeXM1 do
+      begin
+        p := AugClampPixel(AugNeuronToPixel(V[x, y, d]));
+        if p < lo then lo := p;
+        if p > hi then hi := p;
+      end;
+    if hi <= lo then continue;
+    scale := 255.0 / (hi - lo);
+    for y := 0 to SizeYM1 do
+      for x := 0 to SizeXM1 do
+      begin
+        p := AugClampPixel(AugNeuronToPixel(V[x, y, d]));
+        p := (p - lo) * scale;
+        V[x, y, d] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
+      end;
+  end;
+end;
+
+procedure AugEqualize(V: TNNetVolume);
+var
+  d, x, y, i, b, total: integer;
+  hist: array[0..255] of integer;
+  cdf: array[0..255] of integer;
+  lut: array[0..255] of TNeuralFloat;
+  cdfMin, denom, p: TNeuralFloat;
+  acc: integer;
+  DepthM1, SizeYM1, SizeXM1: integer;
+begin
+  // Per-channel histogram equalization (torchvision equalize).
+  DepthM1 := V.Depth - 1;
+  SizeYM1 := V.SizeY - 1;
+  SizeXM1 := V.SizeX - 1;
+  for d := 0 to DepthM1 do
+  begin
+    for i := 0 to 255 do hist[i] := 0;
+    for y := 0 to SizeYM1 do
+      for x := 0 to SizeXM1 do
+      begin
+        b := Round(AugClampPixel(AugNeuronToPixel(V[x, y, d])));
+        if b < 0 then b := 0; if b > 255 then b := 255;
+        Inc(hist[b]);
+      end;
+    acc := 0;
+    cdfMin := -1;
+    for i := 0 to 255 do
+    begin
+      Inc(acc, hist[i]);
+      cdf[i] := acc;
+      if (cdfMin < 0) and (hist[i] > 0) then cdfMin := acc;
+    end;
+    total := V.SizeX * V.SizeY;
+    denom := total - cdfMin;
+    if denom <= 0 then
+    begin
+      // Flat channel: identity LUT.
+      for i := 0 to 255 do lut[i] := i;
+    end
+    else
+      for i := 0 to 255 do
+        lut[i] := AugClampPixel(((cdf[i] - cdfMin) / denom) * 255.0);
+    for y := 0 to SizeYM1 do
+      for x := 0 to SizeXM1 do
+      begin
+        b := Round(AugClampPixel(AugNeuronToPixel(V[x, y, d])));
+        if b < 0 then b := 0; if b > 255 then b := 255;
+        p := lut[b];
+        V[x, y, d] := AugClampNeuron(AugPixelToNeuron(p));
+      end;
+  end;
+end;
+
+function AugChannelMeanGray(V: TNNetVolume): TNeuralFloat;
+var
+  I: integer;
+  s: TNeuralFloat;
+  SizeM1: integer;
+begin
+  // Luminance-ish mean over all pixels (used by Color/Contrast degenerate).
+  s := 0;
+  SizeM1 := V.Size - 1;
+  for I := 0 to SizeM1 do
+    s := s + AugClampPixel(AugNeuronToPixel(V.FData[I]));
+  if V.Size > 0 then Result := s / V.Size else Result := 128;
+end;
+
+procedure AugColor(V: TNNetVolume; Factor: TNeuralFloat);
+var
+  W, H, Dep, x, y, d: integer;
+  gray, p: TNeuralFloat;
+  WM1, HM1, DepM1: integer;
+begin
+  // Saturation adjustment: blend each pixel toward its per-pixel grayscale.
+  W := V.SizeX; H := V.SizeY; Dep := V.Depth;
+  if Dep < 2 then
+  begin
+    // Single channel: color has no effect.
+    Exit;
+  end;
+  WM1 := W - 1; HM1 := H - 1; DepM1 := Dep - 1;
+  for y := 0 to HM1 do
+    for x := 0 to WM1 do
+    begin
+      gray := 0;
+      for d := 0 to DepM1 do
+        gray := gray + AugClampPixel(AugNeuronToPixel(V[x, y, d]));
+      gray := gray / Dep;
+      for d := 0 to DepM1 do
+      begin
+        p := AugClampPixel(AugNeuronToPixel(V[x, y, d]));
+        p := Factor * p + (1.0 - Factor) * gray;
+        V[x, y, d] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
+      end;
+    end;
+end;
+
+procedure AugContrast(V: TNNetVolume; Factor: TNeuralFloat);
+begin
+  // Blend toward the global mean gray.
+  AugBlendTowardScalar(V, AugChannelMeanGray(V), Factor);
+end;
+
+procedure AugBrightness(V: TNNetVolume; Factor: TNeuralFloat);
+begin
+  // Blend toward black (pixel 0).
+  AugBlendTowardScalar(V, 0.0, Factor);
+end;
+
+procedure AugSharpness(V: TNNetVolume; Factor: TNeuralFloat);
+var
+  W, H, Dep, x, y, d, ix, iy: integer;
+  Src: TNNetVolume;
+  acc, wsum, p, smooth: TNeuralFloat;
+  kw: TNeuralFloat;
+  WM1, HM1, DepM1: integer;
+begin
+  // Blend toward a 3x3 box-blurred image (torchvision uses a smoothing kernel;
+  // a box blur is a close, dependency-free stand-in). Factor>1 sharpens.
+  W := V.SizeX; H := V.SizeY; Dep := V.Depth;
+  if (W < 3) or (H < 3) then Exit;
+  Src := TNNetVolume.Create;
+  Src.Copy(V);
+  WM1 := W - 1; HM1 := H - 1; DepM1 := Dep - 1;
+  for d := 0 to DepM1 do
+    for y := 0 to HM1 do
+      for x := 0 to WM1 do
+      begin
+        // Interior pixels get blurred; the 1px border is left unchanged
+        // (matches torchvision which keeps the border).
+        if (x = 0) or (y = 0) or (x = W - 1) or (y = H - 1) then continue;
+        acc := 0; wsum := 0;
+        for iy := -1 to 1 do
+          for ix := -1 to 1 do
+          begin
+            if (ix = 0) and (iy = 0) then kw := 5 else kw := 1;
+            acc := acc + kw * AugClampPixel(AugNeuronToPixel(Src[x + ix, y + iy, d]));
+            wsum := wsum + kw;
+          end;
+        smooth := acc / wsum;
+        p := AugClampPixel(AugNeuronToPixel(Src[x, y, d]));
+        p := Factor * p + (1.0 - Factor) * smooth;
+        V[x, y, d] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
+      end;
+  Src.Free;
+end;
+
+procedure AugPosterize(V: TNNetVolume; Bits: integer);
+var
+  mask, I, b: integer;
+  SizeM1: integer;
+begin
+  if Bits < 1 then Bits := 1;
+  if Bits > 8 then Bits := 8;
+  if Bits = 8 then Exit; // identity
+  mask := (255 shl (8 - Bits)) and 255;
+  SizeM1 := V.Size - 1;
+  for I := 0 to SizeM1 do
+  begin
+    b := Round(AugClampPixel(AugNeuronToPixel(V.FData[I])));
+    if b < 0 then b := 0; if b > 255 then b := 255;
+    b := b and mask;
+    V.FData[I] := AugClampNeuron(AugPixelToNeuron(b));
+  end;
+end;
+
+procedure AugSolarize(V: TNNetVolume; Threshold: TNeuralFloat);
+var
+  I: integer;
+  p: TNeuralFloat;
+  SizeM1: integer;
+begin
+  SizeM1 := V.Size - 1;
+  for I := 0 to SizeM1 do
+  begin
+    p := AugClampPixel(AugNeuronToPixel(V.FData[I]));
+    if p >= Threshold then p := 255 - p;
+    V.FData[I] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
+  end;
+end;
+
+// --- Geometric ops ---------------------------------------------------------
+
+procedure AugRotate(V: TNNetVolume; DegAngle: TNeuralFloat);
+var
+  rad, c, s: TNeuralFloat;
+  Mat: array[0..5] of TNeuralFloat;
+begin
+  if DegAngle = 0 then Exit; // bit-identity
+  rad := DegAngle * Pi / 180.0;
+  c := Cos(rad); s := Sin(rad);
+  // Inverse rotation (dst -> src) so we sample. Rotating image by +theta uses
+  // src = R(-theta)*dst.
+  Mat[0] := c;  Mat[1] := s;  Mat[2] := 0;
+  Mat[3] := -s; Mat[4] := c;  Mat[5] := 0;
+  AugAffineWarp(V, Mat);
+end;
+
+procedure AugShearX(V: TNNetVolume; ShearFactor: TNeuralFloat);
+var
+  Mat: array[0..5] of TNeuralFloat;
+begin
+  if ShearFactor = 0 then Exit; // bit-identity
+  // src_x = dst_x - shear*dst_y (inverse of x' = x + shear*y).
+  Mat[0] := 1; Mat[1] := -ShearFactor; Mat[2] := 0;
+  Mat[3] := 0; Mat[4] := 1;            Mat[5] := 0;
+  AugAffineWarp(V, Mat);
+end;
+
+procedure AugShearY(V: TNNetVolume; ShearFactor: TNeuralFloat);
+var
+  Mat: array[0..5] of TNeuralFloat;
+begin
+  if ShearFactor = 0 then Exit; // bit-identity
+  Mat[0] := 1;            Mat[1] := 0; Mat[2] := 0;
+  Mat[3] := -ShearFactor; Mat[4] := 1; Mat[5] := 0;
+  AugAffineWarp(V, Mat);
+end;
+
+procedure AugTranslateX(V: TNNetVolume; Pixels: TNeuralFloat);
+var
+  Mat: array[0..5] of TNeuralFloat;
+begin
+  if Pixels = 0 then Exit; // bit-identity
+  // Shift content by +Pixels -> sample from src_x = dst_x - Pixels.
+  Mat[0] := 1; Mat[1] := 0; Mat[2] := -Pixels;
+  Mat[3] := 0; Mat[4] := 1; Mat[5] := 0;
+  AugAffineWarp(V, Mat);
+end;
+
+procedure AugTranslateY(V: TNNetVolume; Pixels: TNeuralFloat);
+var
+  Mat: array[0..5] of TNeuralFloat;
+begin
+  if Pixels = 0 then Exit; // bit-identity
+  Mat[0] := 1; Mat[1] := 0; Mat[2] := 0;
+  Mat[3] := 0; Mat[4] := 1; Mat[5] := -Pixels;
+  AugAffineWarp(V, Mat);
+end;
+
+// --- Magnitude mapping (torchvision _AUGMENTATION_SPACE) --------------------
+
+function AugMagFrac(Magnitude: integer): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+begin
+  // Maps M in 0..NeuralAugMaxMagnitude to t in 0..1.
+  if NeuralAugMaxMagnitude <= 0 then Result := 0
+  else Result := Magnitude / NeuralAugMaxMagnitude;
+  if Result < 0 then Result := 0;
+  if Result > 1 then Result := 1;
+end;
+
+function AugRandSign: TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+begin
+  if Random(2) = 0 then Result := 1.0 else Result := -1.0;
+end;
+
+procedure NeuralAugApplyOp(V: TNNetVolume; Op: TNeuralAugOp; Magnitude: integer);
+var
+  t, sgn: TNeuralFloat;
+  W, H: integer;
+begin
+  if (V = nil) or (V.Size = 0) then Exit;
+  W := V.SizeX; H := V.SizeY;
+  t := AugMagFrac(Magnitude);
+  case Op of
+    csaIdentity: ; // no-op
+    csaAutoContrast: AugAutoContrast(V);   // parameter-free
+    csaEqualize:     AugEqualize(V);       // parameter-free
+    csaRotate:
+      begin
+        sgn := AugRandSign;
+        AugRotate(V, sgn * t * 30.0);      // up to +/-30 deg
+      end;
+    csaShearX:
+      begin
+        sgn := AugRandSign;
+        AugShearX(V, sgn * t * 0.3);       // up to +/-0.3
+      end;
+    csaShearY:
+      begin
+        sgn := AugRandSign;
+        AugShearY(V, sgn * t * 0.3);
+      end;
+    csaTranslateX:
+      begin
+        sgn := AugRandSign;
+        AugTranslateX(V, sgn * t * (W * 0.45));
+      end;
+    csaTranslateY:
+      begin
+        sgn := AugRandSign;
+        AugTranslateY(V, sgn * t * (H * 0.45));
+      end;
+    csaPosterize:
+      // torchvision: bits = 8 - round(t*4); M=0 -> 8 bits (identity).
+      AugPosterize(V, 8 - Round(t * 4));
+    csaSolarize:
+      // threshold = 255*(1-t); M=0 -> 255 (identity).
+      AugSolarize(V, 255.0 * (1.0 - t));
+    csaColor:
+      AugColor(V, 1.0 + AugRandSign * t * 0.9);
+    csaContrast:
+      AugContrast(V, 1.0 + AugRandSign * t * 0.9);
+    csaBrightness:
+      AugBrightness(V, 1.0 + AugRandSign * t * 0.9);
+    csaSharpness:
+      AugSharpness(V, 1.0 + AugRandSign * t * 0.9);
+  end;
+end;
+
+procedure NeuralRandAugment(V: TNNetVolume; N: integer; Magnitude: integer);
+var
+  i, opIdx, opCount: integer;
+begin
+  if (V = nil) or (V.Size = 0) or (N <= 0) then Exit;
+  opCount := Ord(High(TNeuralAugOp)) + 1;
+  for i := 1 to N do
+  begin
+    // Uniform over the WHOLE bank including identity (torchvision includes it).
+    opIdx := Random(opCount);
+    NeuralAugApplyOp(V, TNeuralAugOp(opIdx), Magnitude);
+  end;
+end;
+
+procedure NeuralTrivialAugment(V: TNNetVolume);
+var
+  opIdx, opCount, mag: integer;
+begin
+  if (V = nil) or (V.Size = 0) then Exit;
+  opCount := Ord(High(TNeuralAugOp)) + 1;
+  opIdx := Random(opCount);
+  mag := Random(NeuralAugMaxMagnitude + 1); // uniform 0..max inclusive
+  NeuralAugApplyOp(V, TNeuralAugOp(opIdx), mag);
+end;
+
+procedure NeuralRandomErasing(V: TNNetVolume;
+  pProb: TNeuralFloat; pAreaLow, pAreaHigh, pAspectLow, pFill: TNeuralFloat);
+var
+  W, H, Dep, area, x0, y0, ew, eh, x, y, d, attempt: integer;
+  targetArea, aspect, logLo, logHi: TNeuralFloat;
+  YMax, XMax, DepM1: integer;
+begin
+  if (V = nil) or (V.Size = 0) then Exit;
+  if Random >= pProb then Exit;
+  W := V.SizeX; H := V.SizeY; Dep := V.Depth;
+  if (W <= 0) or (H <= 0) then Exit;
+  area := W * H;
+  logLo := Ln(pAspectLow);
+  logHi := Ln(1.0 / pAspectLow);
+  for attempt := 1 to 10 do
+  begin
+    targetArea := (pAreaLow + Random * (pAreaHigh - pAreaLow)) * area;
+    aspect := Exp(logLo + Random * (logHi - logLo));
+    ew := Round(Sqrt(targetArea / aspect));
+    eh := Round(Sqrt(targetArea * aspect));
+    if (ew > 0) and (ew < W) and (eh > 0) and (eh < H) then
+    begin
+      x0 := Random(W - ew + 1);
+      y0 := Random(H - eh + 1);
+      YMax := y0 + eh - 1;
+      XMax := x0 + ew - 1;
+      DepM1 := Dep - 1;
+      for y := y0 to YMax do
+        for x := x0 to XMax do
+          for d := 0 to DepM1 do
+            V[x, y, d] := pFill;
+      Exit;
+    end;
+  end;
+end;
+
+{ TNeuralAugmentationPolicy }
+
+constructor TNeuralAugmentationPolicy.Create(pPolicy: TNeuralAugPolicy;
+  pNumOps: integer; pMagnitude: integer; pErasingProb: TNeuralFloat);
+begin
+  inherited Create;
+  FPolicy := pPolicy;
+  FNumOps := pNumOps;
+  FMagnitude := pMagnitude;
+  FErasingProb := pErasingProb;
+end;
+
+procedure TNeuralAugmentationPolicy.Augment(pInput: TNNetVolume; ThreadId: integer);
+begin
+  case FPolicy of
+    napRandAugment:    NeuralRandAugment(pInput, FNumOps, FMagnitude);
+    napTrivialAugment: NeuralTrivialAugment(pInput);
+  end;
+  if FErasingProb > 0 then
+    NeuralRandomErasing(pInput, FErasingProb);
 end;
 
 end.

@@ -123,6 +123,7 @@ function ABKey(S: array of byte; Divisor: longint): longint;
 var
   I: longint;
   SumKey: longint;
+  Hi: longint;
 begin
   SumKey := 203;
 {$IFDEF FPC}
@@ -130,7 +131,8 @@ begin
 {$ENDIF}
 {$OVERFLOWCHECKS OFF}
 
-  for I := Low(S) to High(S) do
+  Hi := High(S);
+  for I := Low(S) to Hi do
   begin
     SumKey :=
       (((SumKey * (S[I] + 11)) mod Divisor) *
@@ -157,16 +159,20 @@ end;
 procedure ABSet(var A: array of byte; B: array of byte);
 var
   I: longint;
+  Hi: longint;
 begin
-  for I := Low(A) to High(A) do
+  Hi := High(A);
+  for I := Low(A) to Hi do
     A[I] := B[I];
 end;
 
 procedure ABTriPascal(var A, B: array of byte);
 var
   I: longint;
+  HiM1: longint;
 begin
-  for I := Low(A) + 1 to High(A) - 1 do
+  HiM1 := High(A) - 1;
+  for I := Low(A) + 1 to HiM1 do
     A[I] := B[I - 1] xor B[I + 1];
 end;
 
@@ -202,24 +208,30 @@ end;
 procedure ABClear(var AB: array of byte);
 var
   I: longint;
+  Hi: longint;
 begin
-  for I := Low(AB) to High(AB) do
+  Hi := High(AB);
+  for I := Low(AB) to Hi do
     AB[I] := 0;
 end;
 
 procedure ABFull(var AB: array of byte);
 var
   I: longint;
+  Hi: longint;
 begin
-  for I := Low(AB) to High(AB) do
+  Hi := High(AB);
+  for I := Low(AB) to Hi do
     AB[I] := 1;
 end;
 
 procedure ABAnd(var A, B: array of byte);
 var
   I: longint;
+  Hi: longint;
 begin
-  for I := Low(A) to High(A) do
+  Hi := High(A);
+  for I := Low(A) to Hi do
     A[I] := A[I] and B[I];
 end;
 
@@ -227,9 +239,11 @@ function ABCountDif(var X, Y: array of byte): longint;
 var
   I: longint;
   R: longint;
+  Hi: longint;
 begin
   R := 0;
-  for I := Low(X) to High(X) do
+  Hi := High(X);
+  for I := Low(X) to Hi do
     if X[I] <> Y[I] then
       Inc(R);
   ABCountDif := R;
@@ -239,9 +253,11 @@ function ABCountDifZero(var X: array of byte): longint;
 var
   I: longint;
   R: longint;
+  Hi: longint;
 begin
   R := 0;
-  for I := Low(X) to High(X) do
+  Hi := High(X);
+  for I := Low(X) to Hi do
     if X[I] <> 0 then
       Inc(R);
   ABCountDifZero := R;
@@ -251,9 +267,11 @@ function ABGetEqual(var Equal, X, Y: array of byte): longint;
 var
   I: longint;
   R: longint;
+  Hi: longint;
 begin
   R := 0;
-  for I := Low(X) to High(X) do
+  Hi := High(X);
+  for I := Low(X) to Hi do
     if X[I] = Y[I] then
     begin
       Equal[I] := 1;
@@ -267,10 +285,14 @@ end;
 procedure ABShiftLogicalLeft(var X: array of byte);
 var
   I: longint;
+  HiM1: longint;
 begin
   if High(X) > Low(X) then
-    for I := Low(X) to High(X) - 1 do
+  begin
+    HiM1 := High(X) - 1;
+    for I := Low(X) to HiM1 do
       X[I] := X[I + 1];
+  end;
   X[High(X)] := 0;
 end;
 
@@ -289,9 +311,11 @@ function ABGetDif(var Dif, X, Y: array of byte): longint;
 var
   I: longint;
   R: longint;
+  Hi: longint;
 begin
   R := 0;
-  for I := Low(X) to High(X) do
+  Hi := High(X);
+  for I := Low(X) to Hi do
     if X[I] <> Y[I] then
     begin
       Dif[I] := 1;
@@ -311,8 +335,10 @@ end;
 procedure ABBitOnPosAtPos(var AB: array of byte; X, Start, Len: longint);
 var
   I: longint;
+  EndIdx: longint;
 begin
-  for I := Start to Start + Len - 1 do
+  EndIdx := Start + Len - 1;
+  for I := Start to EndIdx do
     AB[I] := 0;
   if (X < 0) or (X > Len) then
   begin
@@ -327,10 +353,12 @@ var
   I: longint;
   Max: single;
   MaxPos: longint;
+  EndIdx: longint;
 begin
   MaxPos := Start;
   Max := AB[Start];
-  for I := Start + 1 to Start + Len - 1 do
+  EndIdx := Start + Len - 1;
+  for I := Start + 1 to EndIdx do
   begin
     if AB[I] > Max then
     begin
@@ -345,9 +373,11 @@ function ABToString(var AB: array of byte): string;
 var
   I: longint;
   R: string;
+  Hi: longint;
 begin
   R := '';
-  for I := Low(AB) to High(AB) do
+  Hi := High(AB);
+  for I := Low(AB) to Hi do
     case AB[I] of
       0: R := R + '0';
       1: R := R + '1';
@@ -361,9 +391,11 @@ function ABToStringR(var AB: array of byte): string;
 var
   I: longint;
   R: string;
+  Hi: longint;
 begin
   R := '';
-  for I := Low(AB) to High(AB) do
+  Hi := High(AB);
+  for I := Low(AB) to Hi do
     if AB[I] <> 0 then
       R := R + IntToStr(AB[I])
     else

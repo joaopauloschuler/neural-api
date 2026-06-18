@@ -3,7 +3,7 @@ program GumbelAnnealingAutoencoder;
 GumbelAnnealingAutoencoder: a temperature-annealing micro-experiment for the
 TNNetGumbelSoftmax bottleneck.
 
-This is a genuinely different experiment from examples/GumbelSoftmaxDemo/, which
+This is a different experiment from examples/GumbelSoftmaxDemo/, which
 only sweeps tau on a FIXED logit vector at inference (no training). Here we TRAIN
 a tiny discrete-latent autoencoder end-to-end:
 

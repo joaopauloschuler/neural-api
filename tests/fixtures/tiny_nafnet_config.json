@@ -1,0 +1,13 @@
+{
+ "model_type": "nafnet",
+ "img_channel": 3,
+ "width": 6,
+ "enc_blk_nums": [
+  1
+ ],
+ "middle_blk_num": 1,
+ "dec_blk_nums": [
+  1
+ ],
+ "input_size": 8
+}

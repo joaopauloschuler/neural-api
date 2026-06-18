@@ -1,0 +1,23 @@
+{
+ "model_type": "resnet",
+ "architectures": [
+  "ResNetForImageClassification"
+ ],
+ "depth": 34,
+ "image_size": 64,
+ "num_channels": 3,
+ "num_labels": 5,
+ "widths": [
+  4,
+  6,
+  8,
+  12
+ ],
+ "blocks_per_stage": [
+  3,
+  2,
+  2,
+  2
+ ],
+ "bn_eps": 1e-05
+}

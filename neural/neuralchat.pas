@@ -420,7 +420,7 @@ function ExtractChatTemplateFromJson(const RawJson, ConfigFile: string): string;
 var
   Root, Node, Entry: TJSONData;
   Arr: TJSONArray;
-  Cnt: integer;
+  Cnt, ArrCount, ArrCountM1: integer;
 begin
   Result := '';
   // same fpjson stance as neuralhftokenizer: decode \uXXXX up front and
@@ -434,7 +434,9 @@ begin
     if Node is TJSONArray then
     begin // [{"name": ..., "template": ...}, ...]
       Arr := TJSONArray(Node);
-      for Cnt := 0 to Arr.Count - 1 do
+      ArrCount := Arr.Count;
+      ArrCountM1 := ArrCount - 1;
+      for Cnt := 0 to ArrCountM1 do
       begin
         Entry := Arr.Items[Cnt];
         if (Entry is TJSONObject) and
@@ -498,7 +500,7 @@ function RenderChatMLCore(const Messages: array of TChatMessage;
   AddGenerationPrompt, InjectQwenDefaultSystem: boolean;
   var Spans: TChatSpanArray): string;
 var
-  Cnt, ContentStart: integer;
+  Cnt, ContentStart, MessagesHi: integer;
 begin
   Result := '';
   SetLength(Spans, 0);
@@ -506,7 +508,8 @@ begin
     not ((Length(Messages) > 0) and (Messages[0].Role = 'system')) then
     Result := Result + '<|im_start|>system' + #10 + csQwenDefaultSystem +
       '<|im_end|>' + #10;
-  for Cnt := 0 to High(Messages) do
+  MessagesHi := High(Messages);
+  for Cnt := 0 to MessagesHi do
   begin
     Result := Result + '<|im_start|>' + Messages[Cnt].Role + #10;
     ContentStart := Length(Result) + 1;
@@ -529,7 +532,7 @@ end;
 
 function RenderLlama2(const Messages: array of TChatMessage): string;
 var
-  Cnt, LoopFirst, LoopIdx: integer;
+  Cnt, LoopFirst, LoopIdx, MessagesHi: integer;
   SystemMessage, Content: string;
   HasSystem: boolean;
 begin
@@ -542,7 +545,8 @@ begin
   end
   else
     LoopFirst := 0;
-  for Cnt := LoopFirst to High(Messages) do
+  MessagesHi := High(Messages);
+  for Cnt := LoopFirst to MessagesHi do
   begin
     LoopIdx := Cnt - LoopFirst;
     // {% if (role == 'user') != (loop.index0 % 2 == 0) %}raise{% endif %}
@@ -565,10 +569,11 @@ end;
 function RenderLlama3(const Messages: array of TChatMessage;
   AddGenerationPrompt: boolean): string;
 var
-  Cnt: integer;
+  Cnt, MessagesHi: integer;
 begin
   Result := '';
-  for Cnt := 0 to High(Messages) do
+  MessagesHi := High(Messages);
+  for Cnt := 0 to MessagesHi do
   begin
     if Cnt = 0 then Result := Result + '<|begin_of_text|>';
     Result := Result + '<|start_header_id|>' + Messages[Cnt].Role +
@@ -583,11 +588,12 @@ end;
 function RenderZephyr(const Messages: array of TChatMessage;
   AddGenerationPrompt: boolean): string;
 var
-  Cnt: integer;
+  Cnt, MessagesHi: integer;
   Role: string;
 begin
   Result := '';
-  for Cnt := 0 to High(Messages) do
+  MessagesHi := High(Messages);
+  for Cnt := 0 to MessagesHi do
   begin
     Role := Messages[Cnt].Role;
     if (Role = 'user') or (Role = 'system') or (Role = 'assistant') then
@@ -603,13 +609,14 @@ end;
 function RenderGemma(const Messages: array of TChatMessage;
   AddGenerationPrompt: boolean): string;
 var
-  Cnt: integer;
+  Cnt, MessagesHi: integer;
   Role: string;
 begin
   Result := '<bos>';
   if (Length(Messages) > 0) and (Messages[0].Role = 'system') then
     raise ENeuralChatError.Create('System role not supported');
-  for Cnt := 0 to High(Messages) do
+  MessagesHi := High(Messages);
+  for Cnt := 0 to MessagesHi do
   begin
     if (Messages[Cnt].Role = 'user') <> (Cnt mod 2 = 0) then
       raise ENeuralChatError.Create(csAlternateError);
@@ -627,11 +634,12 @@ end;
 function RenderPhi3(const Messages: array of TChatMessage;
   AddGenerationPrompt: boolean): string;
 var
-  Cnt: integer;
+  Cnt, MessagesHi: integer;
   Role: string;
 begin
   Result := '';
-  for Cnt := 0 to High(Messages) do
+  MessagesHi := High(Messages);
+  for Cnt := 0 to MessagesHi do
   begin
     Role := Messages[Cnt].Role;
     if (Role = 'system') or (Role = 'user') or (Role = 'assistant') then
@@ -646,10 +654,11 @@ end;
 
 function RenderMistral(const Messages: array of TChatMessage): string;
 var
-  Cnt: integer;
+  Cnt, MessagesHi: integer;
 begin
   Result := '<s>';
-  for Cnt := 0 to High(Messages) do
+  MessagesHi := High(Messages);
+  for Cnt := 0 to MessagesHi do
   begin
     if (Messages[Cnt].Role = 'user') <> (Cnt mod 2 = 0) then
       raise ENeuralChatError.Create(csAlternateError);
@@ -666,12 +675,13 @@ end;
 function RenderDeepSeek(const Messages: array of TChatMessage;
   AddGenerationPrompt: boolean): string;
 var
-  Cnt: integer;
+  Cnt, MessagesHi: integer;
   Role: string;
 begin
   // {{ bos_token }} -- always emitted, exactly once, before the loop.
   Result := csDeepSeekBos;
-  for Cnt := 0 to High(Messages) do
+  MessagesHi := High(Messages);
+  for Cnt := 0 to MessagesHi do
   begin
     Role := Messages[Cnt].Role;
     if Role = 'user' then
@@ -690,13 +700,14 @@ end;
 function RenderPhi4Mini(const Messages: array of TChatMessage;
   AddGenerationPrompt: boolean): string;
 var
-  Cnt: integer;
+  Cnt, MessagesHi: integer;
   Role: string;
 begin
   // Like cfPhi3 but the <|...|> tags carry NO trailing newline, and there
   // is no eos fallback when add_generation_prompt is false.
   Result := '';
-  for Cnt := 0 to High(Messages) do
+  MessagesHi := High(Messages);
+  for Cnt := 0 to MessagesHi do
   begin
     Role := Messages[Cnt].Role;
     if (Role = 'system') or (Role = 'user') or (Role = 'assistant') then
@@ -716,7 +727,7 @@ end;
 function RenderLlava(const Messages: array of TChatMessage;
   AddGenerationPrompt: boolean): string;
 var
-  Cnt: integer;
+  Cnt, MessagesHi: integer;
   Role, SystemMsg: string;
   HaveSystem: boolean;
 begin
@@ -725,7 +736,8 @@ begin
   if HaveSystem then SystemMsg := Messages[0].Content
   else SystemMsg := csLlavaDefaultSystem;
   Result := SystemMsg;
-  for Cnt := 0 to High(Messages) do
+  MessagesHi := High(Messages);
+  for Cnt := 0 to MessagesHi do
   begin
     Role := Messages[Cnt].Role;
     if Role = 'system' then continue;  // already emitted as the preamble
@@ -826,12 +838,13 @@ constructor TJInterp.Create(const ATemplate: string;
   const AMessages: array of TChatMessage; AAddGen: boolean;
   const ABos, AEos: string);
 var
-  I: integer;
+  I, AMessagesHi: integer;
 begin
   inherited Create;
   FTemplate := ATemplate;
   SetLength(FMessages, Length(AMessages));
-  for I := 0 to High(AMessages) do FMessages[I] := AMessages[I];
+  AMessagesHi := High(AMessages);
+  for I := 0 to AMessagesHi do FMessages[I] := AMessages[I];
   FAddGen := AAddGen;
   FBos := ABos;
   FEos := AEos;
@@ -945,9 +958,10 @@ end;
 
 procedure TJInterp.SetVar(const Name: string; const V: TJValue);
 var
-  I: integer;
+  I, FVarsHi: integer;
 begin
-  for I := 0 to High(FVars) do
+  FVarsHi := High(FVars);
+  for I := 0 to FVarsHi do
     if FVars[I].Name = Name then
     begin
       FVars[I].Value := V;
@@ -1573,7 +1587,7 @@ var
   I, P, EndIdx, BodyStart: integer;
   Body, Kw, Rest, VarName, IterName: string;
   IterVal, Item, LoopVal, SetVal: TJValue;
-  M: integer;
+  M, SliceHiM1: integer;
 begin
   I := Lo;
   while I < Hi do
@@ -1607,7 +1621,8 @@ begin
               Fail('for: trailing characters after iterable');
             if IterVal.Kind <> jvMessages then
               Fail('for: only message lists are iterable');
-            for M := IterVal.SliceLo to IterVal.SliceHi - 1 do
+            SliceHiM1 := IterVal.SliceHi - 1;
+            for M := IterVal.SliceLo to SliceHiM1 do
             begin
               FillChar(Item, SizeOf(Item), 0);
               Item.Kind := jvMessage;
@@ -1709,7 +1724,7 @@ function RenderFormatWithSpans(ChatFormat: TNeuralChatFormat;
   const Messages: array of TChatMessage;
   AddGenerationPrompt: boolean; out Spans: TChatSpanArray): string;
 var
-  Cnt, FoundAt, Cursor: integer;
+  Cnt, FoundAt, Cursor, MessagesHi: integer;
 begin
   SetLength(Spans, 0);
   if (ChatFormat = cfChatML) or (ChatFormat = cfQwen) then
@@ -1721,7 +1736,8 @@ begin
   Result := RenderFormat(ChatFormat, Messages, AddGenerationPrompt);
   // Generic span recovery: locate each assistant message's content in order.
   Cursor := 1;
-  for Cnt := 0 to High(Messages) do
+  MessagesHi := High(Messages);
+  for Cnt := 0 to MessagesHi do
     if Messages[Cnt].Role = 'assistant' then
     begin
       if Messages[Cnt].Content = '' then continue;
@@ -1745,7 +1761,7 @@ function RenderContinueFinal(ChatFormat: TNeuralChatFormat;
 var
   Sentinel, Rendered: string;
   Tagged: TChatMessages;
-  Cnt, TagLoc: integer;
+  Cnt, TagLoc, MessagesHi: integer;
 begin
   if Length(Messages) = 0 then
     raise ENeuralChatError.Create(
@@ -1754,7 +1770,8 @@ begin
   // generation prompt, then truncate at the sentinel and rstrip (HF-exact).
   Sentinel := 'CONTINUE_FINAL_MESSAGE_TAG ';
   SetLength(Tagged, Length(Messages));
-  for Cnt := 0 to High(Messages) do Tagged[Cnt] := Messages[Cnt];
+  MessagesHi := High(Messages);
+  for Cnt := 0 to MessagesHi do Tagged[Cnt] := Messages[Cnt];
   Tagged[High(Tagged)].Content := Tagged[High(Tagged)].Content + Sentinel;
   Rendered := RenderFormat(ChatFormat, Tagged, {AddGenerationPrompt=}false);
   TagLoc := Pos(Trim(Sentinel), Rendered);
@@ -1827,18 +1844,20 @@ var
   Spans: TChatSpanArray;
   Rendered: string;
   SegIds: TIntegerList;
-  K, Cursor, EmitCnt: integer;
+  K, Cursor, EmitCnt, SpansHi: integer;
 
   // Encodes the substring Rendered[FromPos..ToPos) and appends its ids to
   // Result, setting the mask for the run to Assist.
   procedure EmitSegment(FromPos, ToPos: integer; Assist: boolean);
   var
-    J: integer;
+    J, SegCount, SegCountM1: integer;
   begin
     if ToPos <= FromPos then exit;
     SegIds.Clear;
     Tokenizer.Encode(Copy(Rendered, FromPos, ToPos - FromPos), SegIds);
-    for J := 0 to SegIds.Count - 1 do
+    SegCount := SegIds.Count;
+    SegCountM1 := SegCount - 1;
+    for J := 0 to SegCountM1 do
     begin
       if EmitCnt > High(Result) then
       begin
@@ -1866,7 +1885,8 @@ begin
   SegIds := TIntegerList.Create;
   try
     Cursor := 1; // 1-based position into Rendered
-    for K := 0 to High(Spans) do
+    SpansHi := High(Spans);
+    for K := 0 to SpansHi do
     begin
       EmitSegment(Cursor, Spans[K].Start, false);     // pre-span text
       EmitSegment(Spans[K].Start, Spans[K].Start + Spans[K].Len, true);

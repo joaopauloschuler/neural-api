@@ -6,8 +6,8 @@
 /// small depth head: four intermediate encoder stages are projected and resized
 /// into a feature pyramid, RefineNet-style additive fusion blocks merge them
 /// coarse-to-fine, and a 3-conv head emits a SINGLE-channel per-pixel depth map
-/// at the full input resolution. It is the repo's first dense per-pixel
-/// REGRESSION import (a continuous depth value per pixel, not a class label).
+/// at the full input resolution. The output is a dense per-pixel
+/// REGRESSION (a continuous depth value per pixel, not a class label).
 ///
 /// This example loads the committed PICO Depth-Anything parity fixture
 /// (tests/fixtures/tiny_dpt.safetensors, a tiny DINOv2-backbone model) with

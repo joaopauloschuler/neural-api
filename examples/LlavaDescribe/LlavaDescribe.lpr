@@ -1,7 +1,7 @@
 program LlavaDescribe;
 // LLaVA generative vision-language captioning on the committed pico fixture
-// (or any LLaVA checkpoint passed as argument 1): the FIRST image-in /
-// text-out demo in the repo. It loads the THREE nets returned by
+// (or any LLaVA checkpoint passed as argument 1): an image-in /
+// text-out demo. It loads the THREE nets returned by
 // BuildLlavaFromSafeTensors (neural/neuralpretrained.pas) - the SigLIP/CLIP
 // vision tower, the 2-layer gelu projector, and the Qwen2/Llama language
 // decoder - assembles a multimodal prompt with the cfLlava chat template

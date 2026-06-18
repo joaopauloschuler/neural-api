@@ -5859,10 +5859,12 @@ var
   t32, trh, trl: Tb32u32;
   ax: UInt32;
   i: Int32;
+  nM1: Int32;
 begin
   t32.f := x;
   ax := t32.u and UInt32($7FFFFFFF);
-  for i := 0 to n - 1 do begin
+  nM1 := n - 1;
+  for i := 0 to nM1 do begin
     if db_uarg[i] = ax then begin
       trh.u := db_urh[i];
       trl.u := db_url[i];
@@ -5936,10 +5938,12 @@ var
   t32, trh, trl: Tb32u32;
   ax: UInt32;
   i: Int32;
+  nM1: Int32;
 begin
   t32.f := x;
   ax := t32.u and UInt32($7FFFFFFF);
-  for i := 0 to n - 1 do begin
+  nM1 := n - 1;
+  for i := 0 to nM1 do begin
     if db_uarg[i] = ax then begin
       trh.u := db_urh[i];
       trl.u := db_url[i];

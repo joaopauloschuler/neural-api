@@ -162,18 +162,21 @@ end;
 procedure LoadVolumeIntoTImage(V:TNNetVolume; Image:TImage; color_encoding: integer = csEncodeRGB);
 var
   I, J: integer;
+  MaxX, MaxY: integer;
   bG: byte;
   H,S,A,B,R,G: TNeuralFloat;
 begin
   R := 0;
   G := 0;
   B := 0;
+  MaxX := V.SizeX - 1;
+  MaxY := V.SizeY - 1;
 
   if V.Depth = 1 then
   begin
-    for I := 0 to V.SizeX - 1 do
+    for I := 0 to MaxX do
     begin
-      for J := 0 to V.SizeY - 1 do
+      for J := 0 to MaxY do
       begin
         if color_encoding = csEncodeLAB then
         begin
@@ -194,9 +197,9 @@ begin
   end
   else if V.Depth = 2 then
   begin
-    for I := 0 to V.SizeX - 1 do
+    for I := 0 to MaxX do
     begin
-      for J := 0 to V.SizeY - 1 do
+      for J := 0 to MaxY do
       begin
         if color_encoding = csEncodeLAB then
         begin
@@ -228,9 +231,9 @@ begin
   end
   else if V.Depth > 2 then
   begin
-    for I := 0 to V.SizeX - 1 do
+    for I := 0 to MaxX do
     begin
-      for J := 0 to V.SizeY - 1 do
+      for J := 0 to MaxY do
       begin
         if color_encoding = csEncodeLAB then
         begin

@@ -103,7 +103,7 @@ THREE ACRONYMS USED THROUGHOUT:
            FFN -> residual] skeleton as phases 3/4 so comparisons stay fair.
            Token-only embedding, NO absolute positions: order enters through
            the SSM recurrences plus the MLA decoupled-rope slice. The decode
-           benchmark is the novel part -- no other example streams BOTH mixer
+           benchmark streams BOTH mixer
            families in one loop: greedy full re-encode per token vs ONE
            streamed step per token driving SIMULTANEOUSLY the DiagonalSSM
            layers' O(1) incremental state AND the MLA heads' SDPA caches +
@@ -2014,7 +2014,7 @@ end;
 // in the box) with ONE MLA block (precise content addressing at 40 analytic
 // floats/token of cache) and plain greedy decode (phase 5 showed speculation
 // does not pay on CPU; phase 2's MTP heads cost two extra 128->3000 heads).
-// The streamed arm is the novel bit: one loop drives BOTH mixer families.
+// The streamed arm: one loop drives BOTH mixer families.
 // ---------------------------------------------------------------------------
 procedure TDecodeBakeoff.RunPhase6;
 var

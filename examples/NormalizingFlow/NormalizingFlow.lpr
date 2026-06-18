@@ -2,7 +2,7 @@
   NormalizingFlow example
 
   Fits a 2-D "two-moons" density with a small RealNVP/Glow-style normalizing
-  flow built from stacked TNNetAffineCoupling layers -- the library's first
+  flow built from stacked TNNetAffineCoupling layers -- an
   exact-likelihood generative primitive -- and shows that interleaving the
   affine couplings with Glow's LEARNABLE invertible 1x1 convolution
   (TNNetInvertible1x1Conv) reaches a HIGHER mean log-likelihood than the

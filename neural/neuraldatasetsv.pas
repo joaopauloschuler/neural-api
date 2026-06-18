@@ -87,12 +87,14 @@ procedure LoadNNLayersIntoCombo(NN: TNNet; Combo: TComboBox);
 var
   LayerCnt: integer;
   LayerStr: string;
+  LastIdx: integer;
 begin
   Combo.Enabled := false;
   Combo.Items.Clear;
   if NN.GetLastLayerIdx() > 0 then
   begin
-    for LayerCnt := 0 to NN.GetLastLayerIdx() do
+    LastIdx := NN.GetLastLayerIdx();
+    for LayerCnt := 0 to LastIdx do
     begin
       LayerStr := IntToStr(LayerCnt) + ' - ' + NN.Layers[LayerCnt].ClassName;
       Combo.Items.Add(LayerStr);
@@ -110,8 +112,10 @@ procedure CreateLabels
 );
 var
   RowCount, ColCount: integer;
+  ColM1, RowM1: integer;
 begin
-  for ColCount := 0 to ColNum - 1 do
+  ColM1 := ColNum - 1;
+  for ColCount := 0 to ColM1 do
   begin
     pLabelX[ColCount] := TLabel.Create(GrBoxNeurons.Parent);
     pLabelX[ColCount].Parent  := GrBoxNeurons;
@@ -120,7 +124,8 @@ begin
     pLabelX[ColCount].Caption := Chr(Ord('A') + ColCount);
   end;
 
-  for RowCount := 0 to RowNum - 1 do
+  RowM1 := RowNum - 1;
+  for RowCount := 0 to RowM1 do
   begin
     pLabelY[RowCount] := TLabel.Create(GrBoxNeurons.Parent);
     pLabelY[RowCount].Parent  := GrBoxNeurons;
@@ -143,6 +148,7 @@ var
   RowNum, ColNum: integer;
   PosTop, PosLeft: integer;
   MaxTop, MaxLeft: integer;
+  ImagesM1: integer;
 begin
   PosTop  := 14;
   PosLeft := 22;
@@ -161,7 +167,8 @@ begin
   SetLength(pLabelY, RowNum);
   SetLength(pLabelX, ColNum);
 
-  for NeuronCount := 0 to ImagesNum - 1 do
+  ImagesM1 := ImagesNum - 1;
+  for NeuronCount := 0 to ImagesM1 do
   begin
     pImage[NeuronCount] := TImage.Create(GrBoxNeurons.Parent);
     pImage[NeuronCount].Parent  := GrBoxNeurons;
@@ -193,6 +200,7 @@ var
   RowNum, ColNum: integer;
   PosTop, PosLeft: integer;
   MaxTop, MaxLeft: integer;
+  NeuronM1: integer;
 begin
   PosTop  := 14;
   PosLeft := 22;
@@ -211,7 +219,8 @@ begin
   SetLength(pLabelY, RowNum);
   SetLength(pLabelX, ColNum);
 
-  for NeuronCount := 0 to NeuronNum - 1 do
+  NeuronM1 := NeuronNum - 1;
+  for NeuronCount := 0 to NeuronM1 do
   begin
     pImage[NeuronCount] := TImage.Create(GrBoxNeurons.Parent);
     pImage[NeuronCount].Parent  := GrBoxNeurons;
@@ -237,10 +246,12 @@ procedure FreeNeuronImages
 );
 var
   NeuronCount, RowCount, ColCount: integer;
+  HiImage, HiLabelX, HiLabelY: integer;
 begin
   if Length(pImage) > 0 then
   begin
-    for NeuronCount := Low(pImage) to High(pImage) do
+    HiImage := High(pImage);
+    for NeuronCount := Low(pImage) to HiImage do
     begin
       pImage[NeuronCount].Free;
     end;
@@ -248,7 +259,8 @@ begin
 
   if Length(pLabelX) > 0 then
   begin
-    for RowCount := Low(pLabelX) to High(pLabelX) do
+    HiLabelX := High(pLabelX);
+    for RowCount := Low(pLabelX) to HiLabelX do
     begin
       pLabelX[RowCount].Free;
     end;
@@ -256,7 +268,8 @@ begin
 
   if Length(pLabelY) > 0 then
   begin
-    for ColCount := Low(pLabelY) to High(pLabelY) do
+    HiLabelY := High(pLabelY);
+    for ColCount := Low(pLabelY) to HiLabelY do
     begin
       pLabelY[ColCount].Free;
     end;
@@ -273,7 +286,7 @@ procedure ShowNeurons(
   startImage, filterSize, color_encoding: integer;
   ScalePerImage: boolean);
 var
-  NeuronCount: integer;
+  NeuronCount, NeuronMax: integer;
   MaxW, MinW: TNeuralFloat;
   vDisplay: TNNetVolume;
 begin
@@ -287,7 +300,8 @@ begin
     MinW := pNeuronList.GetMinWeight();
   end;
 
-  for NeuronCount := 0 to pNeuronList.Count - 1 do
+  NeuronMax := pNeuronList.Count - 1;
+  for NeuronCount := 0 to NeuronMax do
   begin
     vDisplay.Copy(pNeuronList[NeuronCount].Weights);
     if (ScalePerImage) then

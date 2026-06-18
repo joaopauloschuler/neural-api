@@ -70,6 +70,14 @@ uses
 function LoadWav16ToVolume(const FileName: string;
   Samples: TNNetVolume): integer;
 
+// Writes Samples (a mono waveform, floats in [-1, 1], laid out along FData as
+// LoadWav16ToVolume reads them) to a canonical mono 16-bit PCM RIFF/WAVE file.
+// Samples are clamped to [-1, 1] and scaled to int16 (x * 32768, rounded and
+// clamped to the int16 range). This is the inverse of LoadWav16ToVolume
+// (which divides by 32768) to within 1 LSB.
+procedure SaveVolumeToWav16(Samples: TNNetVolume; const FileName: string;
+  SampleRate: integer = 16000);
+
 // HF WhisperFeatureExtractor log-mel spectrogram (see the unit header).
 // Samples: mono waveform at 16 kHz, any length (padded/truncated to
 // NumFrames*160 samples). Mel is resized to (NumFrames, 1, NumMelBins).
@@ -81,6 +89,44 @@ procedure ComputeWhisperLogMel(Samples: TNNetVolume; Mel: TNNetVolume;
 // Exception otherwise; convert first, e.g. ffmpeg -ar 16000 -ac 1).
 procedure WhisperLogMelFromWavFile(const FileName: string; Mel: TNNetVolume;
   NumMelBins: integer = 80; NumFrames: integer = 3000);
+
+// Inverse STFT overlap-add (OLA) synthesis - the exact inverse of the forward
+// real STFT used by ComputeWhisperLogMel (periodic Hann analysis window, same
+// one-sided rDFT bin convention). Reconstructs a mono waveform from a complex
+// spectrogram given as a magnitude + phase pair (ISTFTOverlapAdd) or as a
+// real + imaginary pair (ISTFTOverlapAddReIm).
+//
+// Mag/Phase (or Re/Im) are (NumFrames, 1, NumFreqBins) volumes, time along
+// SizeX and frequency bins along Depth - the same (SeqLen, 1, Channels) layout
+// ComputeWhisperLogMel emits. NumFreqBins MUST equal NFFT div 2 + 1 (one-sided
+// real-FFT layout). The bin convention mirrors the forward DFT tables exactly:
+//   Re[k] = Mag[k]*cos(Phase[k]),  Im[k] = Mag[k]*sin(Phase[k])
+// where the stored Im is +sum(x*sin(2*pi*k*t/NFFT)) (i.e. the negated standard
+// imaginary part, identical to the forward CosTab/SinTab convention here), so
+// a forward STFT computed with the file's tables fed straight back in is a true
+// round-trip.
+//
+// Each frame is inverse-rDFT'd, multiplied by the synthesis Hann window, and
+// overlap-added; the accumulated signal is then divided by the overlap-added
+// squared-window envelope (the COLA / window_sumsquare normalization that
+// torch/librosa apply), with a small epsilon guard against divide-by-zero at
+// edge samples covered by no window. With a perfect-reconstruction Hann window
+// and 75% overlap (HopLength = NFFT div 4) the interior reconstructs the
+// original waveform to ~1e-12.
+//
+// Wave is resized to (NFFT + (NumFrames-1)*HopLength, 1, 1) - the full
+// uncentred OLA length (NO librosa center-trim; trim NFFT div 2 from each end
+// yourself if you fed a centre-padded forward STFT). The first and last
+// ~NFFT-HopLength samples are partial-overlap (COLA not satisfied) and should
+// be treated as edge transients.
+procedure ISTFTOverlapAdd(Mag, Phase, Wave: TNNetVolume;
+  NFFT: integer; HopLength: integer);
+
+// As ISTFTOverlapAdd but the spectrogram is supplied as real + imaginary parts
+// (same bin/sign convention as the forward CosTab/SinTab tables here) instead
+// of magnitude + phase. ISTFTOverlapAdd is a thin wrapper over this.
+procedure ISTFTOverlapAddReIm(Re, Im, Wave: TNNetVolume;
+  NFFT: integer; HopLength: integer);
 
 implementation
 
@@ -102,6 +148,7 @@ var
   BlockAlign: word;
   HaveFmt: boolean;
   DataBytes, FrameCnt, NumFrames, ChCnt: integer;
+  NumFramesM1, NumChannelsM1: integer;
   Raw: array of smallint;
   Acc: double;
 
@@ -170,10 +217,12 @@ begin
         if NumFrames > 0 then
           ReadExact(Raw[0], NumFrames * NumChannels * 2);
         Samples.ReSize(NumFrames, 1, 1);
-        for FrameCnt := 0 to NumFrames - 1 do
+        NumFramesM1 := NumFrames - 1;
+        NumChannelsM1 := NumChannels - 1;
+        for FrameCnt := 0 to NumFramesM1 do
         begin
           Acc := 0;
-          for ChCnt := 0 to NumChannels - 1 do
+          for ChCnt := 0 to NumChannelsM1 do
             Acc := Acc + Raw[FrameCnt * NumChannels + ChCnt];
           Samples.FData[FrameCnt] := (Acc / NumChannels) / 32768.0;
         end;
@@ -185,6 +234,84 @@ begin
     end;
     raise Exception.Create('LoadWav16ToVolume: no "data" chunk in ' +
       FileName);
+  finally
+    FS.Free;
+  end;
+end;
+
+procedure SaveVolumeToWav16(Samples: TNNetVolume; const FileName: string;
+  SampleRate: integer = 16000);
+var
+  FS: TFileStream;
+  NumFrames, i: integer;
+  NumFramesM1: integer;
+  DataBytes, ByteRate, FileTail: longword;
+  ChunkSize16: longword;
+  NumChannels, BlockAlign, BitsPerSample, AudioFormat: word;
+  SR: longword;
+  Raw: array of smallint;
+  V: TNeuralFloat;
+  Scaled: double;
+
+  procedure WriteBytes(const Buf; Count: integer);
+  begin
+    FS.WriteBuffer(Buf, Count);
+  end;
+
+  procedure WriteTag(const Tag: string);
+  var
+    A: array[0..3] of AnsiChar;
+    k: integer;
+  begin
+    for k := 0 to 3 do A[k] := AnsiChar(Tag[k + 1]);
+    WriteBytes(A, 4);
+  end;
+
+begin
+  NumFrames := Samples.Size;
+  NumChannels := 1;
+  BitsPerSample := 16;
+  AudioFormat := 1;            // PCM
+  SR := longword(SampleRate);
+  BlockAlign := NumChannels * (BitsPerSample div 8);
+  ByteRate := SR * BlockAlign;
+  DataBytes := longword(NumFrames) * BlockAlign;
+  ChunkSize16 := 16;
+  // RIFF chunk size = 4 ("WAVE") + (8 + 16) fmt + (8 + DataBytes) data.
+  FileTail := 4 + (8 + 16) + (8 + DataBytes);
+
+  SetLength(Raw, NumFrames);
+  NumFramesM1 := NumFrames - 1;
+  for i := 0 to NumFramesM1 do
+  begin
+    V := Samples.FData[i];
+    if V > 1.0 then V := 1.0
+    else if V < -1.0 then V := -1.0;
+    // Scale by 32768 to be the exact inverse of LoadWav16ToVolume (which
+    // divides by 32768), clamped to the int16 range so +1.0 does not overflow.
+    Scaled := Round(V * 32768.0);
+    if Scaled > 32767 then Scaled := 32767
+    else if Scaled < -32768 then Scaled := -32768;
+    Raw[i] := smallint(Round(Scaled));
+  end;
+
+  FS := TFileStream.Create(FileName, fmCreate);
+  try
+    WriteTag('RIFF');
+    WriteBytes(FileTail, 4);
+    WriteTag('WAVE');
+    WriteTag('fmt ');
+    WriteBytes(ChunkSize16, 4);
+    WriteBytes(AudioFormat, 2);
+    WriteBytes(NumChannels, 2);
+    WriteBytes(SR, 4);
+    WriteBytes(ByteRate, 4);
+    WriteBytes(BlockAlign, 2);
+    WriteBytes(BitsPerSample, 2);
+    WriteTag('data');
+    WriteBytes(DataBytes, 4);
+    if NumFrames > 0 then
+      WriteBytes(Raw[0], NumFrames * 2);
   finally
     FS.Free;
   end;
@@ -213,6 +340,8 @@ procedure ComputeWhisperLogMel(Samples: TNNetVolume; Mel: TNNetVolume;
   NumMelBins: integer = 80; NumFrames: integer = 3000);
 var
   NumSamples, NumBins, NumStftFrames: integer;
+  NumSamplesM1, NumBinsM1, NumMelBinsM1, NumMelBinsP1, NFFTM1: integer;
+  NumStftFramesM1, NumFramesM1: integer;
   Wave: array of double;          // padded/truncated waveform
   Window: array of double;        // periodic hann
   CosTab, SinTab: array of double; // (NumBins x NFFT) DFT twiddles
@@ -242,10 +371,16 @@ begin
     raise Exception.Create('ComputeWhisperLogMel: NumMelBins must be >= 2.');
   NumSamples := NumFrames * csWhisperHop;
   NumBins := csWhisperNFFT div 2 + 1; // 201 one-sided rfft bins
+  NumSamplesM1 := NumSamples - 1;
+  NumBinsM1 := NumBins - 1;
+  NumMelBinsM1 := NumMelBins - 1;
+  NumMelBinsP1 := NumMelBins + 1;
+  NFFTM1 := csWhisperNFFT - 1;
+  NumFramesM1 := NumFrames - 1;
 
   // ---- pad / truncate to the fixed 30 s context ----
   SetLength(Wave, NumSamples);
-  for SampleCnt := 0 to NumSamples - 1 do
+  for SampleCnt := 0 to NumSamplesM1 do
     if SampleCnt < Samples.Size then
       Wave[SampleCnt] := Samples.FData[SampleCnt]
     else
@@ -253,14 +388,14 @@ begin
 
   // ---- periodic hann window (transformers window_function default) ----
   SetLength(Window, csWhisperNFFT);
-  for TapCnt := 0 to csWhisperNFFT - 1 do
+  for TapCnt := 0 to NFFTM1 do
     Window[TapCnt] := 0.5 - 0.5 * Cos(2.0 * Pi * TapCnt / csWhisperNFFT);
 
   // ---- DFT twiddle tables (400 is not a power of two - direct rDFT) ----
   SetLength(CosTab, NumBins * csWhisperNFFT);
   SetLength(SinTab, NumBins * csWhisperNFFT);
-  for BinCnt := 0 to NumBins - 1 do
-    for TapCnt := 0 to csWhisperNFFT - 1 do
+  for BinCnt := 0 to NumBinsM1 do
+    for TapCnt := 0 to NFFTM1 do
     begin
       CosTab[BinCnt * csWhisperNFFT + TapCnt] :=
         Cos(2.0 * Pi * BinCnt * TapCnt / csWhisperNFFT);
@@ -272,14 +407,14 @@ begin
   MelMin := HertzToMelSlaney(0.0);
   MelMax := HertzToMelSlaney(csWhisperMaxFreq);
   SetLength(FilterFreqs, NumMelBins + 2);
-  for MelCnt := 0 to NumMelBins + 1 do
+  for MelCnt := 0 to NumMelBinsP1 do
     FilterFreqs[MelCnt] := MelToHertzSlaney(
       MelMin + (MelMax - MelMin) * MelCnt / (NumMelBins + 1));
   SetLength(FilterBank, NumBins * NumMelBins);
-  for BinCnt := 0 to NumBins - 1 do
+  for BinCnt := 0 to NumBinsM1 do
   begin
     FFTFreq := (csWhisperSampleRate div 2) * BinCnt / (NumBins - 1);
-    for MelCnt := 0 to NumMelBins - 1 do
+    for MelCnt := 0 to NumMelBinsM1 do
     begin
       DownSlope := (FFTFreq - FilterFreqs[MelCnt]) /
         (FilterFreqs[MelCnt + 1] - FilterFreqs[MelCnt]);
@@ -299,16 +434,17 @@ begin
   // dropped by WhisperFeatureExtractor (log_spec[:, :-1]), so only the
   // first NumFrames frames are ever computed here.
   NumStftFrames := NumFrames;
+  NumStftFramesM1 := NumStftFrames - 1;
   SetLength(Power, NumBins);
   SetLength(LogMel, NumStftFrames * NumMelBins);
   MaxLog := -1e30;
-  for FrameCnt := 0 to NumStftFrames - 1 do
+  for FrameCnt := 0 to NumStftFramesM1 do
   begin
     FrameStart := FrameCnt * csWhisperHop - (csWhisperNFFT div 2);
     // The 30 s zero-padding tail produces all-zero frames whose mel rows
     // are exactly log10(mel_floor) - skip their O(bins*taps) DFT.
     AllZero := true;
-    for TapCnt := 0 to csWhisperNFFT - 1 do
+    for TapCnt := 0 to NFFTM1 do
     begin
       SrcIdx := FrameStart + TapCnt;
       if (SrcIdx >= 0) and (SrcIdx < NumSamples) then
@@ -319,16 +455,16 @@ begin
     end;
     if AllZero then
     begin
-      for MelCnt := 0 to NumMelBins - 1 do
+      for MelCnt := 0 to NumMelBinsM1 do
         LogMel[FrameCnt * NumMelBins + MelCnt] := Ln(csWhisperMelFloor) / Ln(10.0);
     end
     else
     begin
-      for BinCnt := 0 to NumBins - 1 do
+      for BinCnt := 0 to NumBinsM1 do
       begin
         ReAcc := 0.0;
         ImAcc := 0.0;
-        for TapCnt := 0 to csWhisperNFFT - 1 do
+        for TapCnt := 0 to NFFTM1 do
         begin
           V := WaveAt(FrameStart + TapCnt) * Window[TapCnt];
           ReAcc := ReAcc + V * CosTab[BinCnt * csWhisperNFFT + TapCnt];
@@ -336,25 +472,25 @@ begin
         end;
         Power[BinCnt] := ReAcc * ReAcc + ImAcc * ImAcc;
       end;
-      for MelCnt := 0 to NumMelBins - 1 do
+      for MelCnt := 0 to NumMelBinsM1 do
       begin
         Acc := 0.0;
-        for BinCnt := 0 to NumBins - 1 do
+        for BinCnt := 0 to NumBinsM1 do
           Acc := Acc + FilterBank[BinCnt * NumMelBins + MelCnt] *
             Power[BinCnt];
         if Acc < csWhisperMelFloor then Acc := csWhisperMelFloor;
         LogMel[FrameCnt * NumMelBins + MelCnt] := Ln(Acc) / Ln(10.0);
       end;
     end;
-    for MelCnt := 0 to NumMelBins - 1 do
+    for MelCnt := 0 to NumMelBinsM1 do
       if LogMel[FrameCnt * NumMelBins + MelCnt] > MaxLog then
         MaxLog := LogMel[FrameCnt * NumMelBins + MelCnt];
   end;
 
   // ---- global max-8 clamp + (x + 4) / 4 ----
   Mel.ReSize(NumFrames, 1, NumMelBins);
-  for FrameCnt := 0 to NumFrames - 1 do
-    for MelCnt := 0 to NumMelBins - 1 do
+  for FrameCnt := 0 to NumFramesM1 do
+    for MelCnt := 0 to NumMelBinsM1 do
     begin
       V := LogMel[FrameCnt * NumMelBins + MelCnt];
       if V < MaxLog - 8.0 then V := MaxLog - 8.0;
@@ -379,6 +515,135 @@ begin
     ComputeWhisperLogMel(Samples, Mel, NumMelBins, NumFrames);
   finally
     Samples.Free;
+  end;
+end;
+
+procedure ISTFTOverlapAddReIm(Re, Im, Wave: TNNetVolume;
+  NFFT: integer; HopLength: integer);
+var
+  NumFrames, NumBins, OutLen: integer;
+  NFFTM1, NumBinsM1, OutLenM1, NumFramesM1: integer;
+  FrameCnt, BinCnt, TapCnt, OutIdx, FrameStart: integer;
+  Window: array of double;        // periodic hann (matches forward analysis)
+  CosTab, SinTab: array of double; // (NumBins x NFFT) inverse-DFT twiddles
+  AccSig: array of double;        // overlap-added windowed frames
+  AccEnv: array of double;        // overlap-added squared-window envelope
+  ReVal, ImVal, Sample, Scale, WinTap: double;
+const
+  csEnvEps = 1e-12;               // divide-by-zero guard for the COLA envelope
+begin
+  if NFFT < 2 then
+    raise Exception.Create('ISTFTOverlapAdd: NFFT must be >= 2.');
+  if HopLength < 1 then
+    raise Exception.Create('ISTFTOverlapAdd: HopLength must be >= 1.');
+  NumBins := NFFT div 2 + 1;
+  NFFTM1 := NFFT - 1;
+  NumBinsM1 := NumBins - 1;
+  if (Re.Depth <> NumBins) or (Im.Depth <> NumBins) then
+    raise Exception.Create('ISTFTOverlapAdd: Re/Im Depth must be NFFT div 2 + 1.');
+  NumFrames := Re.SizeX;
+  if Im.SizeX <> NumFrames then
+    raise Exception.Create('ISTFTOverlapAdd: Re and Im must have the same frame count.');
+  if NumFrames < 1 then
+    raise Exception.Create('ISTFTOverlapAdd: at least one frame is required.');
+
+  // ---- periodic hann synthesis window (matches the forward analysis) ----
+  SetLength(Window, NFFT);
+  for TapCnt := 0 to NFFTM1 do
+    Window[TapCnt] := 0.5 - 0.5 * Cos(2.0 * Pi * TapCnt / NFFT);
+
+  // ---- inverse-rDFT twiddle tables (same cos/sin convention as forward) ----
+  // x[t] = (1/NFFT) * ( Re[0]
+  //        + 2*sum_{k=1..NumBins-1}( Re[k]*cos + Im[k]*sin )  [k=NFFT/2 halved]
+  //        ). The Im sign matches the forward SinTab (stored Im = +sum x*sin),
+  // so feeding a forward STFT computed with this file's tables back in inverts.
+  SetLength(CosTab, NumBins * NFFT);
+  SetLength(SinTab, NumBins * NFFT);
+  for BinCnt := 0 to NumBinsM1 do
+    for TapCnt := 0 to NFFTM1 do
+    begin
+      CosTab[BinCnt * NFFT + TapCnt] :=
+        Cos(2.0 * Pi * BinCnt * TapCnt / NFFT);
+      SinTab[BinCnt * NFFT + TapCnt] :=
+        Sin(2.0 * Pi * BinCnt * TapCnt / NFFT);
+    end;
+
+  OutLen := NFFT + (NumFrames - 1) * HopLength;
+  OutLenM1 := OutLen - 1;
+  NumFramesM1 := NumFrames - 1;
+  SetLength(AccSig, OutLen);
+  SetLength(AccEnv, OutLen);
+  for OutIdx := 0 to OutLenM1 do
+  begin
+    AccSig[OutIdx] := 0.0;
+    AccEnv[OutIdx] := 0.0;
+  end;
+
+  for FrameCnt := 0 to NumFramesM1 do
+  begin
+    FrameStart := FrameCnt * HopLength;
+    for TapCnt := 0 to NFFTM1 do
+    begin
+      // inverse real DFT of this frame at sample TapCnt
+      Sample := 0.0;
+      for BinCnt := 0 to NumBinsM1 do
+      begin
+        ReVal := Re.FData[FrameCnt * NumBins + BinCnt];
+        ImVal := Im.FData[FrameCnt * NumBins + BinCnt];
+        // bins 0 and NFFT/2 are self-conjugate -> weight 1, the rest weight 2
+        // (they stand in for their negative-frequency conjugate partner).
+        if (BinCnt = 0) or ((BinCnt = NumBins - 1) and (NFFT mod 2 = 0)) then
+          Scale := 1.0
+        else
+          Scale := 2.0;
+        Sample := Sample + Scale *
+          (ReVal * CosTab[BinCnt * NFFT + TapCnt] +
+           ImVal * SinTab[BinCnt * NFFT + TapCnt]);
+      end;
+      Sample := Sample / NFFT;
+      WinTap := Window[TapCnt];
+      OutIdx := FrameStart + TapCnt;
+      AccSig[OutIdx] := AccSig[OutIdx] + Sample * WinTap;
+      AccEnv[OutIdx] := AccEnv[OutIdx] + WinTap * WinTap;
+    end;
+  end;
+
+  // ---- COLA / window_sumsquare normalization (guarded) ----
+  Wave.ReSize(OutLen, 1, 1);
+  for OutIdx := 0 to OutLenM1 do
+    if AccEnv[OutIdx] > csEnvEps then
+      Wave.FData[OutIdx] := AccSig[OutIdx] / AccEnv[OutIdx]
+    else
+      Wave.FData[OutIdx] := 0.0;
+end;
+
+procedure ISTFTOverlapAdd(Mag, Phase, Wave: TNNetVolume;
+  NFFT: integer; HopLength: integer);
+var
+  Re, Im: TNNetVolume;
+  Idx: integer;
+  MagSizeM1: integer;
+  M, P: double;
+begin
+  if (Mag.SizeX <> Phase.SizeX) or (Mag.Depth <> Phase.Depth) then
+    raise Exception.Create('ISTFTOverlapAdd: Mag and Phase must have the same shape.');
+  Re := TNNetVolume.Create(Mag.SizeX, 1, Mag.Depth);
+  Im := TNNetVolume.Create(Mag.SizeX, 1, Mag.Depth);
+  try
+    // Re[k] = Mag*cos(Phase), Im[k] = Mag*sin(Phase) - the forward table
+    // convention (stored Im = +sum x*sin), so the round-trip is exact.
+    MagSizeM1 := Mag.Size - 1;
+    for Idx := 0 to MagSizeM1 do
+    begin
+      M := Mag.FData[Idx];
+      P := Phase.FData[Idx];
+      Re.FData[Idx] := M * Cos(P);
+      Im.FData[Idx] := M * Sin(P);
+    end;
+    ISTFTOverlapAddReIm(Re, Im, Wave, NFFT, HopLength);
+  finally
+    Re.Free;
+    Im.Free;
   end;
 end;
 

@@ -872,6 +872,7 @@ var
   i: integer;
   buf: TNeuralStrBuffer;
   bufwritten: csize_t;
+  local_platformsM1: integer;
 begin
   bufwritten := 0;
   err := clGetPlatformIDs(0, nil, @local_platforms);
@@ -895,7 +896,8 @@ begin
 
   if (local_platforms > 0) then
   begin
-    for i := 0 to local_platforms - 1 do
+    local_platformsM1 := local_platforms - 1;
+    for i := 0 to local_platformsM1 do
     begin
       {$IFDEF FPC}
       err := clGetPlatformInfo(local_platformids[i], CL_PLATFORM_NAME, sizeof(buf), @buf, bufwritten);
@@ -999,14 +1001,20 @@ var
   i, j, k: integer;
   buf: TNeuralStrBuffer;
   bufwritten: csize_t;
+  FPlatformIdsHi, platform_str_infoHi, device_str_infoHi: integer;
+  device_word_infoHi, local_deviceidsHi: integer;
 begin
   bufwritten := 0;
+  platform_str_infoHi := high(platform_str_info);
+  device_str_infoHi := high(device_str_info);
+  device_word_infoHi := high(device_word_info);
   if GetPlatformCount()>0 then
   begin
-    for i := Low(FPlatformIds) to High(FPlatformIds) do
+    FPlatformIdsHi := High(FPlatformIds);
+    for i := Low(FPlatformIds) to FPlatformIdsHi do
     begin
       FMessageProc('Platform info: ' + IntToStr(i) + ' ---------------------');
-      for k := low(platform_str_info) to high(platform_str_info) do
+      for k := low(platform_str_info) to platform_str_infoHi do
       begin
         clGetPlatformInfo(FPlatformIds[i], platform_str_info[k].id, sizeof(buf), @buf, {$IFDEF FPC}bufwritten{$ELSE}@bufwritten{$ENDIF});
         MessageProc(platform_str_info[k].Name + ': ' + buf);
@@ -1016,16 +1024,17 @@ begin
 
       if Length(local_devices)>0 then
       begin
-        for j := Low(local_deviceids) to High(local_deviceids) do
+        local_deviceidsHi := High(local_deviceids);
+        for j := Low(local_deviceids) to local_deviceidsHi do
         begin
           MessageProc('Device info: ' + IntToStr(j) + ' ------------');
-          for k := low(device_str_info) to high(device_str_info) do
+          for k := low(device_str_info) to device_str_infoHi do
           begin
             clGetDeviceInfo(local_deviceids[j], device_str_info[k].id, sizeof(buf), @buf, {$IFDEF FPC}bufwritten{$ELSE}@bufwritten{$ENDIF});
             MessageProc(device_str_info[k].Name + ': ' + buf);
           end;
 
-          for k := low(device_word_info) to high(device_word_info) do
+          for k := low(device_word_info) to device_word_infoHi do
           begin
             clGetDeviceInfo(local_deviceids[j], device_word_info[k].id, sizeof(buf), @buf, {$IFDEF FPC}bufwritten{$ELSE}@bufwritten{$ENDIF});
             MessageProc(device_word_info[k].Name + ': ' + IntToStr(pdword(@buf)^));
@@ -1054,6 +1063,7 @@ var
   j: integer;
   buf: TNeuralStrBuffer;
   bufwritten: csize_t;
+  local_devicesM1: integer;
 begin
   bufwritten := 0;
   err := clGetDeviceIDs(PlatformId, CL_DEVICE_TYPE_ALL, 0, nil, @local_devices);
@@ -1072,7 +1082,8 @@ begin
 
     if (local_devices > 0) then
     begin
-      for j := 0 to local_devices - 1 do
+      local_devicesM1 := local_devices - 1;
+      for j := 0 to local_devicesM1 do
       begin
         {$IFDEF FPC}
         err := clGetDeviceInfo(local_deviceids[j], CL_DEVICE_NAME, sizeof(buf), @buf, bufwritten);

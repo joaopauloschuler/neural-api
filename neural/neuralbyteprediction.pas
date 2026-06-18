@@ -514,6 +514,8 @@ var
   PredictionPosition: integer;
   PCurrentStates, PNextStates: array[0..0] of byte;
   PossibleStates: array of single;
+  Hi: longint;
+  MaxIdx: longint;
 begin
   PCurrentStates[0] := 0;
   PNextStates[0] := 0;
@@ -521,12 +523,14 @@ begin
 
   ABF.Load(FCS, PActions, PCurrentStates, PNextStates);
 
-  for i := Low(PossibleStates) to High(PossibleStates) do
+  Hi := High(PossibleStates);
+  for i := Low(PossibleStates) to Hi do
   begin
     PossibleStates[I] := 0;
   end;
 
-  for I := 0 to FMaxOperationNeuronCount - 1 do
+  MaxIdx := FMaxOperationNeuronCount - 1;
+  for I := 0 to MaxIdx do
   begin
     Probability := FNN[I].GetF();
     PredictionPosition := 0;
@@ -818,6 +822,7 @@ var
   S: TStringList;
   neuronPos: longint;
   version: integer;
+  Hi: longint;
 begin
   version := 1;
   S := TStringList.Create;
@@ -830,7 +835,8 @@ begin
   S.Add( IntToStr(FActionByteLen) );
   S.Add( IntToStr(FStateByteLen)  );
 
-  for neuronPos := Low(FNN) to High(FNN) do
+  Hi := High(FNN);
+  for neuronPos := Low(FNN) to Hi do
   begin
     if ( FNN[neuronPos].Filled() ) then
     begin
@@ -865,6 +871,7 @@ var
   pActionLen: integer;
   pStatelen: integer;
   inputNeuronCnt: integer;
+  MaxInputNeuron: integer;
 begin
   version := 1;
   S := TStringList.Create;
@@ -883,7 +890,8 @@ begin
   if (S.Count>4) then
   begin
     neuronPos := pos;
-    for inputNeuronCnt := 4 to S.Count-1 do
+    MaxInputNeuron := S.Count-1;
+    for inputNeuronCnt := 4 to MaxInputNeuron do
     begin
       FNN[neuronPos].LoadFromString(S[inputNeuronCnt]);
       inc(neuronPos);
@@ -894,8 +902,10 @@ end;
 procedure TStatePredictionClass.Dump;
 var
   I: longint;
+  Hi: longint;
 begin
-  for I := Low(FNN) to High(FNN) do
+  Hi := High(FNN);
+  for I := Low(FNN) to Hi do
   begin
     if (FNN[I].Filled()) then
     begin
@@ -926,9 +936,11 @@ end;
 procedure TStatePredictionClass.ClearAll;
 var
   I: longint;
+  Hi: longint;
 begin
   FCycle := 0;
-  for I := Low(FNN) to High(FNN) do
+  Hi := High(FNN);
+  for I := Low(FNN) to Hi do
   begin
     FNN[I].Clear;
   end;
@@ -954,9 +966,11 @@ var
   neuronPos: longint;
   ABF: TRunOperation;
   PredictedState: byte;
+  MaxIdx: longint;
 begin
   ABF.Load(FCS, PActions, pCurrentStates, pFoundStates);
-  for neuronPos := 0 to FMaxOperationNeuronCount - 1 do
+  MaxIdx := FMaxOperationNeuronCount - 1;
+  for neuronPos := 0 to MaxIdx do
   begin
     if ABF.TestTests(FNN[neuronPos].TestNeuronLayer) > 0 then
     begin
@@ -1082,6 +1096,7 @@ procedure TStatePredictionClass.CreateNewNeuronsOnError(
   var NewOp: TCreateValidOperations);
   var
     IV, NumV: word;
+    NumVM1: longint;
     OP: neuralabfun.TOperation;
   begin
     NewOp.Create(False{no tests}, FZerosIncluded, pred{prediction errors});
@@ -1097,7 +1112,8 @@ procedure TStatePredictionClass.CreateNewNeuronsOnError(
 
       FNN[neuronPos].TestNeuronLayer.N := NumV;
       NewOp.Create(True{with tests}, FZerosIncluded, pred{prediction errorss});
-      for IV := 0 to NumV - 1 do
+      NumVM1 := NumV - 1;
+      for IV := 0 to NumVM1 do
       begin
         OP := NewOp.GetRandomOp;
         if (OP.OpCode = 0) then
@@ -1155,8 +1171,10 @@ end; // of CreateNewRelationOnError
 procedure TStatePredictionClass.ClearNeuronVictories;
 var
   I: longint;
+  MaxIdx: longint;
 begin
-  for I := 0 to FMaxOperationNeuronCount - 1 do
+  MaxIdx := FMaxOperationNeuronCount - 1;
+  for I := 0 to MaxIdx do
     FNN[I].Vitories := 0;
 end;
 
@@ -1173,8 +1191,10 @@ end;
 procedure TStatePredictionClass.deleteRarelyUsedNeuros(minPredictions: integer);
 var
   neuronPos: integer;
+  Hi: longint;
 begin
-  for neuronPos := Low(FNN) to High(FNN) do
+  Hi := High(FNN);
+  for neuronPos := Low(FNN) to Hi do
   begin
     if (FNN[neuronPos].CorrectNeuronPredictionCnt) < minPredictions then
       RemoveNeuronsAtPos(neuronPos);
@@ -1184,8 +1204,10 @@ end;
 procedure TStatePredictionClass.deleteNeverWinningNeurons(minVictories: integer);
 var
   neuronPos: integer;
+  Hi: longint;
 begin
-  for neuronPos := Low(FNN) to High(FNN) do
+  Hi := High(FNN);
+  for neuronPos := Low(FNN) to Hi do
   begin
     if (FNN[neuronPos].Vitories) < minVictories then
       RemoveNeuronsAtPos(neuronPos);
@@ -1197,13 +1219,15 @@ var
   neuronPos: integer;
   NeuronList: TStringList;
   NeuronStr: string;
+  Hi: longint;
 begin
   NeuronList := TStringList.Create();
   NeuronList.Sorted := True;
   {$IFDEF FPC}
   NeuronList.SortStyle := sslAuto;
   {$ENDIF}
-  for neuronPos := Low(FNN) to High(FNN) do
+  Hi := High(FNN);
+  for neuronPos := Low(FNN) to Hi do
   begin
 
     if FNN[neuronPos].Filled then
@@ -1222,9 +1246,11 @@ function TStatePredictionClass.getVictoriousNeuronsCnt(): integer;
 var
   neuronPos: integer;
   victoriousNeuronsCnt: integer;
+  Hi: longint;
 begin
   victoriousNeuronsCnt := 0;
-  for neuronPos := Low(FNN) to High(FNN) do
+  Hi := High(FNN);
+  for neuronPos := Low(FNN) to Hi do
   begin
     if (FNN[neuronPos].Vitories) > 0 then
       Inc(victoriousNeuronsCnt);
@@ -1243,11 +1269,13 @@ var
   Probability, TotalCount: single;
   NextState: byte;
   PredictionPos: integer;
+  Hi: longint;
 begin
   ABCopy(PNextStates, PCurrentStates); // LOOK
   ABF.Load(FCS, PActions, PCurrentStates, PNextStates);
 
-  for i := Low(pRelationProbability) to High(pRelationProbability) do
+  Hi := High(pRelationProbability);
+  for i := Low(pRelationProbability) to Hi do
   begin
     pRelationProbability[I] := 0;
     pVictoryIndex[I] := -1;
@@ -1312,16 +1340,20 @@ var
   Probability, TotalCount: single;
   NextState: byte;
   PredictionPosition: integer;
+  Hi: longint;
+  MaxIdx: longint;
 begin
   ABF.Load(FCS, PActions, PCurrentStates, PNextStates);
 
-  for i := Low(pRelationProbability) to High(pRelationProbability) do
+  Hi := High(pRelationProbability);
+  for i := Low(pRelationProbability) to Hi do
   begin
     pRelationProbability[I] := 0;
     pVictoryIndex[I] := -1;
   end;
 
-  for I := 0 to FMaxOperationNeuronCount - 1 do
+  MaxIdx := FMaxOperationNeuronCount - 1;
+  for I := 0 to MaxIdx do
   begin
     PredictionPosition := FNN[I].PredictionPos;
     if (FNN[I].Filled) and
@@ -1354,10 +1386,12 @@ procedure TStatePredictionClass.SelectBestIndexes(MinimumNumberOfVictories: long
 var
   I: longint;
   TotalCount, Probability: extended;
+  Hi: longint;
 begin
   FFastPrediction := True;
   NumberOfSelectedIndexes := 0;
-  for I := Low(FNN) to High(FNN) do
+  Hi := High(FNN);
+  for I := Low(FNN) to Hi do
   begin
     TotalCount := FNN[I].WrongNeuronPredictionCnt + FNN[I].CorrectNeuronPredictionCnt;
     if TotalCount > 0 then
@@ -1388,9 +1422,11 @@ end;
 function TStatePredictionClass.Defrag: integer;
 var
   NeuroCount: integer;
+  Hi: longint;
 begin
   Result := 0;
-  for NeuroCount := Low(FNN) to High(FNN) do
+  Hi := High(FNN);
+  for NeuroCount := Low(FNN) to Hi do
   begin
     if ( FNN[NeuroCount].Filled() ) then
     begin
@@ -1410,9 +1446,11 @@ procedure TStatePredictionClass.UpdateNeuronVictories(
 var
   I: word;
   IVict: integer;
+  Hi: longint;
 begin
   Inc(FCycle);
-  for I := Low(pFoundStates) to High(pFoundStates) do
+  Hi := High(pFoundStates);
+  for I := Low(pFoundStates) to Hi do
   begin
     IVict := pVictoryIndex[I];
     if (IVict <> -1) then

@@ -12,7 +12,7 @@ y[i] = bias[i] + sum_k c[(i-k) mod n] * x[k]
 so it stores only **O(n)** weights (the kernel `c` plus an optional length-n
 bias) instead of the **O(n²)** of a full dense layer.
 
-This is genuinely distinct from the other structured dense layers in the library:
+This is distinct from the other structured dense layers in the library:
 LoRA is *low-rank*, `AddGroupedFullConnect` is *block-diagonal*,
 `TNNetBitLinear` *quantizes* a full matrix and `TNNetSpectralNorm` *rescales*
 one — none impose a shift-invariant Toeplitz/circulant structure.

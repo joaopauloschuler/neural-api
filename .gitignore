@@ -86,3 +86,13 @@ examples/Inpainting/*.ppm
 examples/Inpainting/*.png
 examples/Inpainting/*.o
 examples/Inpainting/*.ppu
+
+examples/TinyNeRF/TinyNeRF
+examples/TinyNeRF/*.ppm
+examples/TinyNeRF/*.o
+examples/TinyNeRF/*.ppu
+examples/TinyNeRF/tinynerf_run.txt
+
+# Python bytecode caches (fixture generators in tools/)
+__pycache__/
+*.pyc

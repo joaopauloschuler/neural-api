@@ -1,6 +1,6 @@
 program Inpainting;
 (*
-Inpainting: the repo's first FREE-FORM MASK COMPLETION example - fill a hole in
+Inpainting: a FREE-FORM MASK COMPLETION example - fill a hole in
 an image from its surroundings (the context-encoder task, Pathak et al. 2016,
 "Context Encoders: Feature Learning by Inpainting"). This is distinct from the
 two image-translation examples already in the tree:

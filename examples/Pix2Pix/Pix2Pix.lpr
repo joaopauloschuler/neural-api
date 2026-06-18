@@ -1,6 +1,6 @@
 program Pix2Pix;
 (*
-Pix2Pix: the repo's first PAIRED conditional image-to-image translation example
+Pix2Pix: a PAIRED conditional image-to-image translation example
 (Isola et al. 2017, "Image-to-Image Translation with Conditional Adversarial
 Networks"). It trains a conditional GAN that maps a 1-channel GRAYSCALE shapes
 image to its 3-channel COLORIZED version on a SYNTHETIC, generated-in-code task.

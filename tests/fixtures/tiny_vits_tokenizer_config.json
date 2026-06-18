@@ -1,0 +1,1 @@
+{"add_blank": true, "normalize": true, "phonemize": false, "is_uroman": false, "pad_token": "k", "unk_token": "<unk>", "tokenizer_class": "VitsTokenizer", "language": "eng"}

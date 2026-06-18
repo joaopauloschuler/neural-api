@@ -1,7 +1,7 @@
 program VideoAction;
 (*
 VideoAction: classifies a short synthetic video CLIP with an IMPORTED VideoMAE
-spatiotemporal transformer (BuildVideoMAEFromSafeTensors) - the repo's first
+spatiotemporal transformer (BuildVideoMAEFromSafeTensors), a
 video-classification importer (a clip of T frames -> an action label). Pure CPU,
 no external dataset, finishes in well under a second.
 

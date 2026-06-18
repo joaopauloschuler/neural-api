@@ -1,0 +1,15 @@
+{
+ "model_type": "t5",
+ "d_model": 12,
+ "d_kv": 6,
+ "d_ff": 16,
+ "num_layers": 2,
+ "num_decoder_layers": 2,
+ "num_heads": 2,
+ "vocab_size": 40,
+ "relative_attention_num_buckets": 8,
+ "relative_attention_max_distance": 16,
+ "layer_norm_epsilon": 1e-06,
+ "feed_forward_proj": "relu",
+ "tie_word_embeddings": true
+}

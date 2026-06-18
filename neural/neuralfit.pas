@@ -342,6 +342,12 @@ type
       property ShouldQuit: boolean read FShouldQuit write FShouldQuit;
   end;
 
+  // Optional in-place single-image augmentation hook (pInput, ThreadId).
+  // Declared here so TNeuralFitWithImageBase descendants (e.g. TNeuralImageFit)
+  // can opt into a custom policy such as RandAugment / TrivialAugment from
+  // neuraldatasets, layered on top of the built-in flip+crop pipeline.
+  TNNetImageAugmentationFn = procedure(pInput: TNNetVolume; ThreadId: integer) of object;
+
   { TNeuralFitWithImageBase }
 
   TNeuralFitWithImageBase = class(TNeuralFitBase)
@@ -354,6 +360,7 @@ type
       FHasResizing: boolean;
       FColorEncoding: integer;
       FChannelShiftRate: TNeuralFloat;
+      FImageAugmentationFn: TNNetImageAugmentationFn;
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -370,6 +377,9 @@ type
       property HasFlipY: boolean read FHasFlipY write FHasFlipY;
       property HasResizing: boolean read FHasResizing write FHasResizing;
       property MaxCropSize: integer read FMaxCropSize write FMaxCropSize;
+      // Optional opt-in single-image augmentation policy applied AFTER the
+      // built-in flip/crop pipeline (nil = disabled, the default).
+      property ImageAugmentationFn: TNNetImageAugmentationFn read FImageAugmentationFn write FImageAugmentationFn;
   end;
 
   TNNetDataAugmentationFn = procedure(pInput: TNNetVolume; ThreadId: integer) of object;
@@ -913,6 +923,7 @@ begin
   FColorEncoding := 0;
   FMultipleSamplesAtValidation := false;
   FChannelShiftRate := 0;
+  FImageAugmentationFn := nil;
 end;
 
 destructor TNeuralFitWithImageBase.Destroy();
@@ -1110,7 +1121,7 @@ var
           end;
   end;
 var
-  I: integer;
+  I, MaxIterCnt: integer;
   startTime, totalTimeSeconds: double;
   fileName, FileNameCSV: string;
   CurrentError, CurrentLoss: TNeuralFloat;
@@ -1173,7 +1184,8 @@ begin
     FGlobalErrorSum := 0;
     startTime := Now();
     CheckLearningRate(FCurrentEpoch);
-    for I := 1 to (TrainingCnt div FStepSize) {$IFDEF MakeQuick}div 10{$ENDIF} do
+    MaxIterCnt := (TrainingCnt div FStepSize) {$IFDEF MakeQuick}div 10{$ENDIF};
+    for I := 1 to MaxIterCnt do
     begin
       if FShouldQuit then break;
       RunTrainingBatch();
@@ -1524,7 +1536,7 @@ var
   InitialInertia, FinalInertia: TNeuralFloat;
   {$ENDIF}
   CropSizeX, CropSizeY: integer;
-  DepthCnt: integer;
+  DepthCnt, DepthM1: integer;
   LocalChannelShiftRate: TNeuralFloat;
 begin
   vInput     := TNNetVolume.Create();
@@ -1589,7 +1601,8 @@ begin
 
       if FChannelShiftRate > 0 then
       begin
-        for DepthCnt := 0 to vInput.Depth - 1 do
+        DepthM1 := vInput.Depth - 1;
+        for DepthCnt := 0 to DepthM1 do
         begin
           LocalChannelShiftRate := ((random(10000) - 5000) / 5000);
           LocalChannelShiftRate := 1 + (LocalChannelShiftRate * LocalChannelShiftRate);
@@ -1736,7 +1749,7 @@ var
   vInputCopy: TNNetVolume;
   sumOutput: TNNetVolume;
   I: integer;
-  StartPos, FinishPos: integer;
+  StartPos, FinishPos, FinishPosM1: integer;
   LocalHit, LocalMiss: integer;
   LocalTotalLoss, LocalErrorSum: TNeuralFloat;
   LocalTestPair: TNNetVolumePair;
@@ -1761,7 +1774,8 @@ begin
   LocalNN := FThreadNN[Index];
   LocalNN.CopyWeights(FAvgWeight);
   LocalNN.EnableDropouts(false);
-  for I := StartPos to FinishPos - 1 do
+  FinishPosM1 := FinishPos - 1;
+  for I := StartPos to FinishPosM1 do
   begin
     if FShouldQuit then Break;
 
@@ -1946,7 +1960,7 @@ end;
 procedure TNeuralDataLoadingFit.RunTrainingBatch();
 var
   MaxDelta: TNeuralFloat;
-  AccStep: integer;
+  AccStep, FAccumulationStepsM1: integer;
 begin
   // Reset the global hit/loss/error accumulators ONCE per optimizer step. When
   // FAccumulationSteps = N > 1 they keep accumulating across all N micro-batches
@@ -1959,7 +1973,8 @@ begin
   // them via UpdateWeights). Each micro-batch's threads SUM their deltas into
   // FNN without clearing it, so deltas accumulate across the whole group; the
   // single Optimize() below applies the summed delta exactly once.
-  for AccStep := 0 to FAccumulationSteps - 1 do
+  FAccumulationStepsM1 := FAccumulationSteps - 1;
+  for AccStep := 0 to FAccumulationStepsM1 do
   begin
     FCurrentAccumulationStep := AccStep;
     if FShouldQuit then break;
@@ -2159,9 +2174,10 @@ end;
 function TNeuralOptimizerAdam.InitAdam(Beta1, Beta2, Epsilon: TNeuralFloat
   ): TNNetLayer;
 var
-  LayerCnt: integer;
+  LayerCnt, LastLayerIdx: integer;
 begin
-  for LayerCnt := 0 to FNN.GetLastLayerIdx() do
+  LastLayerIdx := FNN.GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
   begin
     FNN.Layers[LayerCnt].InitAdam(Beta1, Beta2, Epsilon);
   end;
@@ -2500,7 +2516,7 @@ var
           end;
   end;
 var
-  I: integer;
+  I, MaxIterCnt: integer;
   startTime, totalTimeSeconds: double;
   fileName, FileNameCSV: string;
   CurrentError, CurrentLoss: TNeuralFloat;
@@ -2627,7 +2643,8 @@ begin
     startTime := Now();
     CheckLearningRate(FCurrentEpoch);
     // the following for command will run 1 epoch
-    for I := 1 to (FImgVolumes.Count div FStepSize) {$IFDEF MakeQuick}div 10{$ENDIF} do
+    MaxIterCnt := (FImgVolumes.Count div FStepSize) {$IFDEF MakeQuick}div 10{$ENDIF};
+    for I := 1 to MaxIterCnt do
     begin
       if (FShouldQuit) then break;
       FGlobalHit       := 0;
@@ -2913,7 +2930,7 @@ var
   OutputValue, CurrentLoss: TNeuralFloat;
   LocalHit, LocalMiss: integer;
   LocalTotalLoss, LocalErrorSum, CurrentError: TNeuralFloat;
-  DepthCnt: integer;
+  DepthCnt, DepthM1: integer;
   LocalChannelShiftRate: TNeuralFloat;
 begin
   ImgInput := TNNetVolume.Create();
@@ -2963,7 +2980,8 @@ begin
 
       if FChannelShiftRate > 0 then
       begin
-        for DepthCnt := 0 to ImgInput.Depth - 1 do
+        DepthM1 := ImgInput.Depth - 1;
+        for DepthCnt := 0 to DepthM1 do
         begin
           LocalChannelShiftRate := ((random(10000) - 5000) / 5000);
           LocalChannelShiftRate := 1 + (LocalChannelShiftRate * FChannelShiftRate);
@@ -2988,6 +3006,12 @@ begin
       begin
         ImgInput.FlipY();
       end;
+
+      // Optional opt-in single-image augmentation policy (e.g. RandAugment /
+      // TrivialAugment from neuraldatasets), applied in place on top of the
+      // built-in flip/crop pipeline. Disabled (nil) by default.
+      if Assigned(FImageAugmentationFn) then
+        FImageAugmentationFn(ImgInput, index);
     end
     else
     begin
@@ -3132,7 +3156,7 @@ var
   ImgInput, ImgInputCp: TNNetVolume;
   pOutput, vOutput, sumOutput: TNNetVolume;
   I, ImgIdx: integer;
-  StartPos, FinishPos: integer;
+  StartPos, FinishPos, FinishPosM1: integer;
   OutputValue, CurrentLoss: TNeuralFloat;
   LocalHit, LocalMiss: integer;
   LocalTotalLoss, LocalErrorSum: TNeuralFloat;
@@ -3162,7 +3186,8 @@ begin
   LocalNN := FThreadNN[Index];
   LocalNN.CopyWeights(FAvgWeight);
   LocalNN.EnableDropouts(false);
-  for I := StartPos to FinishPos - 1 do
+  FinishPosM1 := FinishPos - 1;
+  for I := StartPos to FinishPosM1 do
   begin
     if FShouldQuit then Break;
     sumOutput.Fill(0);

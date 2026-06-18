@@ -25,12 +25,24 @@ Coded by Claude (AI).
 // checkpoint and its stock BPE tokenizer.json, encodes a code PROMPT and
 // greedily extends it one token at a time, printing the decoded completion.
 //
-// Starcoder2 is the first CODE-specialised decoder in the unit: RoPE + GQA +
+// Starcoder2 is a CODE-specialised decoder: RoPE + GQA +
 // (optional) sliding-window attention paired with biased nn.LayerNorm norms
 // (NOT RMSNorm), bias=True on every linear (q/k/v AND o_proj), and a plain
 // two-matrix gelu_pytorch_tanh FFN (c_fc -> GELU -> c_proj). All of that is
 // handled by BuildStarCoder2FromSafeTensors / BuildFromPretrained; this demo
 // is just the generation harness on top.
+//
+// KV-CACHE DECODE. Generation runs through a TNNetStreamingDecoder
+// (neural/neuraldecode.pas) instead of re-encoding the whole prefix every
+// step. The model is built at INPUT WIDTH 1 (BuildFromPretrained pSeqLen=1):
+// every weight shape in a streamable decoder is sequence-length independent,
+// RoPE rotates per-position from PositionOffset (no SeqLen-sized table), and
+// Starcoder2's per-token TNNetTokenLayerNorm normalizes each token on its own,
+// so a width-1 streamed step is BIT-IDENTICAL to the position's row in a full
+// forward. The session owns the KV cache; its budget (SeqLen) bounds the
+// longest sequence. The prompt is prefilled token-at-a-time and each new
+// token costs ONE width-1 forward over the cached past -- O(cache) per token
+// instead of the O(prefix) re-encode the previous full-Compute loop paid.
 //
 // Usage:
 //   StarCoder2Complete <model-dir-or-safetensors> <tokenizer.json> \
@@ -53,12 +65,13 @@ uses
   {$IFDEF UNIX}cthreads, cmem,{$ENDIF}
   Classes, SysUtils,
   neuralvolume, neuralnetwork, neuralsafetensors, neuralpretrained,
-  neuralhftokenizer;
+  neuralhftokenizer, neuraldecode;
 
 var
   NN: TNNet;
   Tokenizer: TNeuralHFTokenizer;
-  Input, Output: TNNetVolume;
+  Session: TNNetStreamingDecoder;
+  InV, Output: TNNetVolume;
   PromptIds, Tokens: TNeuralIntegerArray;
   ModelPath, TokenizerPath, Prompt: string;
   SeqLen, MaxNewTokens, VocabSize: integer;
@@ -89,16 +102,19 @@ begin
   WriteLn(StdErr, '==> Loading tokenizer: ', TokenizerPath);
   Tokenizer := TNeuralHFTokenizer.Create();
   NN := nil;
-  Input := nil;
-  Output := nil;
+  Session := nil;
+  InV := nil;
   try
     Tokenizer.LoadFromFile(TokenizerPath);
 
     WriteLn(StdErr, '==> Loading Starcoder2 checkpoint: ', ModelPath);
     // pInferenceOnly=true frees training volumes during construction (~1/3 the
-    // RAM); BuildFromPretrained dispatches model_type "starcoder2".
-    NN := BuildFromPretrained(ModelPath, SeqLen, {pInferenceOnly=}true);
-    VocabSize := NN.GetLastLayer().Output.Size; // (SeqLen,1,vocab) flattened
+    // RAM); BuildFromPretrained dispatches model_type "starcoder2". The net is
+    // built at INPUT WIDTH 1 (pSeqLen=1): streamed decode feeds one token per
+    // forward and the KV cache (sized below to SeqLen) holds the context, so no
+    // wide input layer is ever needed.
+    NN := BuildFromPretrained(ModelPath, {pSeqLen=}1, {pInferenceOnly=}true);
+    VocabSize := NN.GetLastLayer().Output.Size; // (1,1,vocab) flattened
 
     PromptIds := Tokenizer.Encode(Prompt);
     Len := Length(PromptIds);
@@ -121,23 +137,33 @@ begin
     SetLength(Tokens, Len);
     for Cnt := 0 to Len - 1 do Tokens[Cnt] := PromptIds[Cnt];
 
-    Input := TNNetVolume.Create(SeqLen, 1, 1);
-    Output := TNNetVolume.Create();
+    // KV-cache session over the width-1 net; the budget (SeqLen) must cover the
+    // longest sequence (prompt + completion) ever produced.
+    Session := TNNetStreamingDecoder.Create(NN, SeqLen);
+    InV := TNNetVolume.Create(1, 1, 1);
+    Session.Reset();
+    // Prefill tokens 0..Len-2 (each at its absolute position); the LAST prompt
+    // token is fed as the first decode step's input -- its output row predicts
+    // the first new token.
+    for Cnt := 0 to Len - 2 do
+    begin
+      InV.FData[0] := Tokens[Cnt];
+      Session.StepForward(InV, Cnt);
+    end;
     for StepCnt := 1 to MaxNewTokens do
     begin
       if Len >= SeqLen then break;
-      Input.Fill(0);
-      for Cnt := 0 to Len - 1 do Input.FData[Cnt] := Tokens[Cnt];
-      NN.Compute(Input);
-      NN.GetOutput(Output);
-      // Greedy: argmax of the logits row at the last real position (depends
-      // only on tokens 0..Len-1 thanks to the causal mask).
+      // One width-1 forward of the last committed token over the cached past.
+      InV.FData[0] := Tokens[Len - 1];
+      Session.StepForward(InV, Len - 1);
+      Output := Session.Output(); // (1,1,vocab) -- the single logits row
+      // Greedy: argmax over the vocabulary.
       BestId := 0;
-      BestVal := Output.FData[(Len - 1) * VocabSize];
+      BestVal := Output.FData[0];
       for Cnt := 1 to VocabSize - 1 do
-        if Output.FData[(Len - 1) * VocabSize + Cnt] > BestVal then
+        if Output.FData[Cnt] > BestVal then
         begin
-          BestVal := Output.FData[(Len - 1) * VocabSize + Cnt];
+          BestVal := Output.FData[Cnt];
           BestId := Cnt;
         end;
       SetLength(Tokens, Len + 1);
@@ -151,8 +177,8 @@ begin
       Len - Length(PromptIds)));
     WriteLn(Completion);
   finally
-    Output.Free;
-    Input.Free;
+    InV.Free;
+    Session.Free; // frees BEFORE NN: Destroy ends incremental decode on NN's layers
     NN.Free;
     Tokenizer.Free;
   end;

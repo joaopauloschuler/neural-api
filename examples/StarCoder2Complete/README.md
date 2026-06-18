@@ -4,8 +4,8 @@ This example is a minimal **code-completion** harness for the CAI
 **StarCoder2** importer (`BuildStarCoder2FromSafeTensors` /
 `BuildFromPretrained` model_type `starcoder2`, in
 `neural/neuralpretrained.pas`). StarCoder2 (bigcode/`starcoder2-3b` /
-`starcoder2-7b` / `starcoder2-15b`) is the first **code-specialised**
-decoder in the repo. Point the demo at a model directory and its stock BPE
+`starcoder2-7b` / `starcoder2-15b`) is a **code-specialised**
+decoder. Point the demo at a model directory and its stock BPE
 `tokenizer.json`, give it a code prompt, and it greedily extends the prompt
 one argmax token at a time and prints the decoded continuation.
 

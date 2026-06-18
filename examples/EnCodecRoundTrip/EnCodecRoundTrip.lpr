@@ -19,7 +19,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 Coded by Claude (AI).
 *)
 
-// EnCodecRoundTrip -- the FIRST audio-GENERATIVE demo: a NEURAL AUDIO CODEC
+// EnCodecRoundTrip -- an audio-GENERATIVE demo: a NEURAL AUDIO CODEC
 // that compresses a waveform to a stack of discrete codes and reconstructs
 // it (waveform -> codes -> waveform), the inverse of the analysis-only
 // Whisper / Wav2Vec2 demos. The new primitive is RESIDUAL VECTOR

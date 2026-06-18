@@ -1,0 +1,14 @@
+{
+  "model_type": "pyannote",
+  "sample_rate": 4000.0,
+  "sinc_filters": 4,
+  "sinc_kernel": 11,
+  "sinc_stride": 2,
+  "pool1": 2,
+  "conv_channels": 5,
+  "conv_kernel": 3,
+  "pool2": 2,
+  "lstm_hidden": 5,
+  "max_speakers": 3,
+  "layer_norm_eps": 1e-05
+}

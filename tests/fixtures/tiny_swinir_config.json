@@ -1,0 +1,17 @@
+{
+ "model_type": "swinir",
+ "upscale": 2,
+ "in_chans": 3,
+ "img_size": 4,
+ "window_size": 2,
+ "embed_dim": 6,
+ "depths": [
+  2
+ ],
+ "num_heads": [
+  2
+ ],
+ "mlp_ratio": 2.0,
+ "num_feat": 4,
+ "layer_norm_eps": 1e-05
+}

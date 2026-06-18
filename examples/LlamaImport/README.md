@@ -121,6 +121,6 @@ dispatches gpt2 / llama / mistral / qwen2 (pinned HF-parity fixtures
 `tools/mistral_qwen2_tiny_fixture.py`).
 
 Memory note: `LlamaLogitsDump` passes `pInferenceOnly=true`, which frees
-every layer's training volumes during construction (`MakeInferenceOnly`),
+every layer's training volumes during construction (`SetInferenceOnly`),
 cutting peak memory to roughly one third. Keep `SeqLen` small (e.g. 16) on
 real checkpoints — attention cost grows with the square of it.

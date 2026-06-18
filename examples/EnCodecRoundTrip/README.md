@@ -1,12 +1,12 @@
 # EnCodec round-trip (neural audio codec)
 
-The first **audio-generative** demo in the library: a neural audio **codec**
+An **audio-generative** demo: a neural audio **codec**
 that compresses a waveform into a stack of discrete codes and reconstructs it
 (waveform → codes → waveform). Every prior audio demo (Whisper, Wav2Vec2 /
 HuBERT) is analysis-only (audio → text); EnCodec is the inverse — a streaming
 convolutional encoder/decoder that you can run in both directions.
 
-The genuinely new building block is **Residual Vector Quantization (RVQ)**: a
+The new building block is **Residual Vector Quantization (RVQ)**: a
 cascade of `num_codebooks` codebooks where each successive codebook quantizes
 the **residual** left by the previous one. The single-codebook
 `TNNetVectorQuantizer` (used by VQ-VAE / MaskGIT) is exactly the one-stage

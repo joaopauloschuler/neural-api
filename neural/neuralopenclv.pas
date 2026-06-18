@@ -58,13 +58,15 @@ function TEasyOpenCLCL.ProbeClick(ComboPlatform,
 var
   Platforms: TPlatformNames;
   I: integer;
+  PlatformsHi: integer;
 begin
   Result := False;
   ComboPlatform.Items.Clear();
   Platforms := PlatformNames;
   if Length(Platforms) > 0 then
   begin
-    for I := low(Platforms) to high(Platforms) do
+    PlatformsHi := high(Platforms);
+    for I := low(Platforms) to PlatformsHi do
     begin
       ComboPlatform.Items.Add(Platforms[I]);
     end;
@@ -82,13 +84,15 @@ procedure TEasyOpenCLCL.ComboPlatformChange(ComboPlatform,
 var
   PlatformId: cl_platform_id;
   I: integer;
+  DeviceCountM1: integer;
 begin
   PlatformId := PlatformIds[ComboPlatform.ItemIndex];
   SetCurrentPlatform(PlatformId);
   ComboDevType.Items.Clear();
   if GetDeviceCount()>0 then
   begin
-    for I := 0 to GetDeviceCount() - 1 do
+    DeviceCountM1 := GetDeviceCount() - 1;
+    for I := 0 to DeviceCountM1 do
     begin
       ComboDevType.Items.Add(DeviceNames[I]);
     end;

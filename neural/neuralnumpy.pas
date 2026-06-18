@@ -257,6 +257,7 @@ var
   Vals: array of Int64;
   i: integer;
   C: char;
+  ShapeLenP1, ValsHi: integer;
 
   function FindKey(const Key: string): integer;
   var idx: integer;
@@ -318,7 +319,8 @@ begin
   // ShapeStr is like "3, 4" or "5" or "" (0-D scalar) or "5," (1-tuple)
   SetLength(Vals, 0);
   Num := '';
-  for i := 1 to Length(ShapeStr) + 1 do
+  ShapeLenP1 := Length(ShapeStr) + 1;
+  for i := 1 to ShapeLenP1 do
   begin
     if (i <= Length(ShapeStr)) and (ShapeStr[i] in ['0'..'9']) then
       Num := Num + ShapeStr[i]
@@ -333,7 +335,8 @@ begin
     end;
   end;
   SetLength(Shape, Length(Vals));
-  for i := 0 to High(Vals) do Shape[i] := Vals[i];
+  ValsHi := High(Vals);
+  for i := 0 to ValsHi do Shape[i] := Vals[i];
 end;
 
 // ---------------------------------------------------------------------------
@@ -351,60 +354,62 @@ var
   pi2: PSmallInt;
   pi4: PLongInt;
   pi8: PInt64;
+  NumElementsM1: Int64;
 begin
   // Dest is expected pre-sized to NumElements by the caller.
+  NumElementsM1 := NumElements - 1;
   if DType = 'f4' then
   begin
     pf4 := PSingle(@Raw[0]);
-    for i := 0 to NumElements - 1 do begin Dest.FData[i] := pf4^; Inc(pf4); end;
+    for i := 0 to NumElementsM1 do begin Dest.FData[i] := pf4^; Inc(pf4); end;
   end
   else if DType = 'f8' then
   begin
     pf8 := PDouble(@Raw[0]);
-    for i := 0 to NumElements - 1 do begin Dest.FData[i] := pf8^; Inc(pf8); end;
+    for i := 0 to NumElementsM1 do begin Dest.FData[i] := pf8^; Inc(pf8); end;
   end
   else if DType = 'f2' then
   begin
     pu16 := PWord(@Raw[0]);
-    for i := 0 to NumElements - 1 do
+    for i := 0 to NumElementsM1 do
       begin Dest.FData[i] := DecodeF16(pu16^); Inc(pu16); end;
   end
   else if DType = 'i1' then
   begin
     pi1 := PShortInt(@Raw[0]);
-    for i := 0 to NumElements - 1 do begin Dest.FData[i] := pi1^; Inc(pi1); end;
+    for i := 0 to NumElementsM1 do begin Dest.FData[i] := pi1^; Inc(pi1); end;
   end
   else if (DType = 'u1') or (DType = 'b1') then
   begin
     pu1 := PByte(@Raw[0]);
-    for i := 0 to NumElements - 1 do begin Dest.FData[i] := pu1^; Inc(pu1); end;
+    for i := 0 to NumElementsM1 do begin Dest.FData[i] := pu1^; Inc(pu1); end;
   end
   else if DType = 'i2' then
   begin
     pi2 := PSmallInt(@Raw[0]);
-    for i := 0 to NumElements - 1 do begin Dest.FData[i] := pi2^; Inc(pi2); end;
+    for i := 0 to NumElementsM1 do begin Dest.FData[i] := pi2^; Inc(pi2); end;
   end
   else if DType = 'u2' then
   begin
     pu16 := PWord(@Raw[0]);
-    for i := 0 to NumElements - 1 do begin Dest.FData[i] := pu16^; Inc(pu16); end;
+    for i := 0 to NumElementsM1 do begin Dest.FData[i] := pu16^; Inc(pu16); end;
   end
   else if DType = 'i4' then
   begin
     pi4 := PLongInt(@Raw[0]);
-    for i := 0 to NumElements - 1 do begin Dest.FData[i] := pi4^; Inc(pi4); end;
+    for i := 0 to NumElementsM1 do begin Dest.FData[i] := pi4^; Inc(pi4); end;
   end
   else if DType = 'u4' then
   begin
     pi8 := nil; // unused
-    for i := 0 to NumElements - 1 do
+    for i := 0 to NumElementsM1 do
       Dest.FData[i] := Cardinal(ReadU32LE(Raw, i * 4));
     if pi8 = nil then ;
   end
   else if (DType = 'i8') or (DType = 'u8') then
   begin
     pi8 := PInt64(@Raw[0]);
-    for i := 0 to NumElements - 1 do begin Dest.FData[i] := pi8^; Inc(pi8); end;
+    for i := 0 to NumElementsM1 do begin Dest.FData[i] := pi8^; Inc(pi8); end;
   end
   else
     raise ENumpyError.CreateFmt('numpy: unsupported dtype "%s"', [DType]);
@@ -442,6 +447,7 @@ var
   i: integer;
   ElemSize: integer;
   Raw: TBytes;
+  HeaderLenM1, ShapeHi: integer;
 begin
   if Stream.Read(Magic, 6) <> 6 then
     raise ENumpyError.Create('numpy: stream too short for magic');
@@ -471,7 +477,8 @@ begin
     if Stream.Read(HeaderBytes[0], HeaderLen) <> integer(HeaderLen) then
       raise ENumpyError.Create('numpy: truncated header dict');
   SetLength(Header, HeaderLen);
-  for i := 0 to integer(HeaderLen) - 1 do
+  HeaderLenM1 := integer(HeaderLen) - 1;
+  for i := 0 to HeaderLenM1 do
     Header[i + 1] := Chr(HeaderBytes[i]);
 
   ParseHeaderDict(Header, Descr, FortranOrder, Shape);
@@ -484,7 +491,8 @@ begin
       're-save with np.ascontiguousarray');
 
   NumElements := 1;
-  for i := 0 to High(Shape) do NumElements := NumElements * Shape[i];
+  ShapeHi := High(Shape);
+  for i := 0 to ShapeHi do NumElements := NumElements * Shape[i];
   if Length(Shape) = 0 then NumElements := 1;
   if NumElements > High(integer) then
     raise ENumpyError.CreateFmt('numpy: array too large (%d elements)',
@@ -532,7 +540,7 @@ end;
 // ---------------------------------------------------------------------------
 
 function ShapeTupleStr(const Shape: array of Int64): string;
-var i: integer;
+var i: integer; ShapeHi: integer;
 begin
   if Length(Shape) = 0 then
     Result := '()'
@@ -541,10 +549,11 @@ begin
   else
   begin
     Result := '(';
-    for i := 0 to High(Shape) do
+    ShapeHi := High(Shape);
+    for i := 0 to ShapeHi do
     begin
       Result := Result + IntToStr(Shape[i]);
-      if i < High(Shape) then Result := Result + ', ';
+      if i < ShapeHi then Result := Result + ', ';
     end;
     Result := Result + ')';
   end;
@@ -622,6 +631,8 @@ var
   HeaderLen, TotalHeader, PadTo: integer;
   PreambleLen: integer;
   DataPos: integer;
+  pShapeHi, ShapeHi, HeaderTextLen: integer;
+  NumElementsM1: Int64;
 begin
   // normalize dtype (lower, strip byte-order if caller passed one)
   DType := LowerCase(pDType);
@@ -637,11 +648,13 @@ begin
   else
   begin
     SetLength(Shape, Length(pShape));
-    for i := 0 to High(pShape) do Shape[i] := pShape[i];
+    pShapeHi := High(pShape);
+    for i := 0 to pShapeHi do Shape[i] := pShape[i];
   end;
 
   NumElements := 1;
-  for i := 0 to High(Shape) do NumElements := NumElements * Shape[i];
+  ShapeHi := High(Shape);
+  for i := 0 to ShapeHi do NumElements := NumElements * Shape[i];
   if NumElements <> Src.Size then
     raise ENumpyError.CreateFmt(
       'numpy: shape declares %d elements but volume holds %d',
@@ -673,11 +686,13 @@ begin
   Result[7] := 0; // minor
   Result[8] := HeaderLen and $FF;
   Result[9] := (HeaderLen shr 8) and $FF;
-  for i := 1 to Length(HeaderText) do
+  HeaderTextLen := Length(HeaderText);
+  for i := 1 to HeaderTextLen do
     Result[PreambleLen + i - 1] := Ord(HeaderText[i]);
 
   DataPos := PreambleLen + HeaderLen;
-  for i := 0 to NumElements - 1 do
+  NumElementsM1 := NumElements - 1;
+  for i := 0 to NumElementsM1 do
     AppendElement(Result, DataPos, DType, Src.FData[i]);
 end;
 
@@ -718,11 +733,12 @@ begin
 end;
 
 function Crc32Of(const B: TBytes): Cardinal;
-var i: integer; c: Cardinal;
+var i: integer; c: Cardinal; BHi: integer;
 begin
   if not CrcReady then InitCrcTable;
   c := $FFFFFFFF;
-  for i := 0 to High(B) do
+  BHi := High(B);
+  for i := 0 to BHi do
     c := CrcTable[(c xor B[i]) and $FF] xor (c shr 8);
   Result := c xor $FFFFFFFF;
 end;
@@ -773,6 +789,7 @@ var
   CompSize, USize, LocalOfs: Cardinal;
   EntryName: string;
   i: integer;
+  NameLenM1: integer;
 begin
   if FStream.Size < 22 then
     raise ENumpyError.Create('numpy: .npz too small to be a ZIP');
@@ -820,7 +837,8 @@ begin
     CommentLen := ReadWordAt(CdBytes, Pos + 32);
     LocalOfs := ReadDWordAt(CdBytes, Pos + 42);
     SetLength(EntryName, NameLen);
-    for i := 0 to NameLen - 1 do
+    NameLenM1 := NameLen - 1;
+    for i := 0 to NameLenM1 do
       EntryName[i + 1] := Chr(CdBytes[Pos + 46 + i]);
     // strip trailing ".npy" to form the dict key
     if (Length(EntryName) > 4) and
@@ -919,9 +937,10 @@ begin
 end;
 
 function TNNetNpzReader.IndexOfKey(const pKey: string): integer;
-var i: integer;
+var i: integer; FNamesHi: integer;
 begin
-  for i := 0 to High(FNames) do
+  FNamesHi := High(FNames);
+  for i := 0 to FNamesHi do
     if FNames[i] = pKey then exit(i);
   Result := -1;
 end;
@@ -999,6 +1018,7 @@ procedure TNNetNpzWriter.Save;
 var
   Stream: TFileStream;
   i, n: integer;
+  nM1, EntryNameLenM1: integer;
   EntryName: string;
   NameBytes: TBytes;
   Crc, CompSize: Cardinal;
@@ -1021,16 +1041,18 @@ begin
     raise ENumpyError.Create('numpy: .npz writer already saved');
   FSaved := true;
   n := FKeys.Count;
+  nM1 := n - 1;
   SetLength(LocalOfs, n);
   Stream := TFileStream.Create(FFileName, fmCreate);
   try
     // local file headers + data
-    for i := 0 to n - 1 do
+    for i := 0 to nM1 do
     begin
       LocalOfs[i] := Stream.Position;
       EntryName := FKeys[i] + '.npy';
       SetLength(NameBytes, Length(EntryName));
-      for P := 0 to Length(EntryName) - 1 do
+      EntryNameLenM1 := Length(EntryName) - 1;
+      for P := 0 to EntryNameLenM1 do
         NameBytes[P] := Ord(EntryName[P + 1]);
       Crc := Crc32Of(FBlobs[i]);
       CompSize := Length(FBlobs[i]);
@@ -1054,11 +1076,12 @@ begin
     end;
     // central directory
     CdStart := Stream.Position;
-    for i := 0 to n - 1 do
+    for i := 0 to nM1 do
     begin
       EntryName := FKeys[i] + '.npy';
       SetLength(NameBytes, Length(EntryName));
-      for P := 0 to Length(EntryName) - 1 do
+      EntryNameLenM1 := Length(EntryName) - 1;
+      for P := 0 to EntryNameLenM1 do
         NameBytes[P] := Ord(EntryName[P + 1]);
       Crc := Crc32Of(FBlobs[i]);
       CompSize := Length(FBlobs[i]);

@@ -195,6 +195,88 @@ print(f'wrote tiny_whisper.safetensors ({len(sd)} tensors)'
 for k in sorted(sd):
     print(f'  {k} {list(sd[k].shape)}')
 
+# ---------------- WORD-TIMESTAMP / DTW alignment oracle ----------------
+# Mirrors the Pascal WhisperCollectCrossAttention + WhisperDTW path exactly
+# in float64: average a FIXED alignment-head subset of the decoder->encoder
+# cross-attention, per-token softmax-normalize across frames, then run the
+# monotonic O(N*M) DTW and emit the warp path + per-token frame spans.
+# The pico fixture's (2 layers, 2 heads) shape is NOT a released Whisper
+# size, so the head list here is an explicit choice (the Pascal test passes
+# the SAME list); it exercises averaging over a >1 head subset.
+ALIGN_HEADS = [(0, 1), (1, 0), (1, 1)]   # (decoder_layer, head)
+
+
+def dtw_path(score):
+    # score: (N text tokens, M audio frames); cost = -score; monotonic DP.
+    n, m = score.shape
+    cost = np.full((n + 1, m + 1), 1e30)
+    trace = np.zeros((n + 1, m + 1), dtype=np.int8)
+    cost[0, 0] = 0.0
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            c0, c1, c2 = cost[i - 1, j - 1], cost[i - 1, j], cost[i, j - 1]
+            best, mv = c0, 0
+            if c1 < best:
+                best, mv = c1, 1
+            if c2 < best:
+                best, mv = c2, 2
+            cost[i, j] = best - score[i - 1, j - 1]
+            trace[i, j] = mv
+    toks, frames = [], []
+    i, j = n, m
+    while i > 0 and j > 0:
+        toks.append(i - 1)
+        frames.append(j - 1)
+        mv = trace[i, j]
+        if mv == 0:
+            i, j = i - 1, j - 1
+        elif mv == 1:
+            i -= 1
+        else:
+            j -= 1
+    return toks[::-1], frames[::-1]
+
+
+align_oracle = []
+with torch.no_grad():
+    for mel, ds in zip(mel_inputs, dec_sequences):
+        feats = torch.tensor([mel], dtype=torch.float64)
+        dec_ids = torch.tensor([ds])
+        out = model(input_features=feats, decoder_input_ids=dec_ids,
+                    output_attentions=True)
+        # out.cross_attentions: tuple[layer] of (batch, heads, tgt, src)
+        n_tok = len(ds)
+        n_src = out.cross_attentions[0].shape[-1]
+        acc = np.zeros((n_tok, n_src), dtype=np.float64)
+        for (lyr, hd) in ALIGN_HEADS:
+            acc += out.cross_attentions[lyr][0, hd].numpy()
+        acc /= len(ALIGN_HEADS)
+        # per-token softmax across frames (matches the Pascal collector)
+        acc = acc - acc.max(axis=1, keepdims=True)
+        acc = np.exp(acc)
+        acc = acc / acc.sum(axis=1, keepdims=True)
+        toks, frames = dtw_path(acc)
+        # per-token frame span
+        tok_start = [-1] * n_tok
+        tok_end = [-1] * n_tok
+        for t, fr in zip(toks, frames):
+            if tok_start[t] < 0:
+                tok_start[t] = fr
+            tok_end[t] = fr
+        align_oracle.append({
+            'n_tok': n_tok, 'n_src': n_src,
+            'score': acc.tolist(),
+            'path_tok': toks, 'path_frame': frames,
+            'path_len': len(toks),
+            'tok_start_frame': tok_start, 'tok_end_frame': tok_end,
+        })
+with open('tests/fixtures/tiny_whisper_alignment.json', 'w') as f:
+    json.dump({'align_heads': ALIGN_HEADS,
+               'dec_sequences': dec_sequences,
+               'alignment': align_oracle}, f)
+print('wrote tiny_whisper_alignment.json '
+      f'({len(align_oracle)} sequences, heads {ALIGN_HEADS})')
+
 # ---------------- frontend oracle: 440 Hz sine log-mel ----------------
 SR = 16000
 sine = (0.5 * np.sin(2.0 * np.pi * 440.0 * np.arange(SR) / SR)).astype(

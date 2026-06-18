@@ -14,12 +14,13 @@ uses
   TestNeuralScheduler, TestNeuralDecode, TestNeuralPretrained,
   TestNeuralDPO, TestNeuralGRPO, TestNeuralPreference,
   TestNeuralRewardModel,
-  TestNeuralKD, TestNeuralNLPMetrics, TestNeuralPacking,
+  TestNeuralKD, TestNeuralNLPMetrics, TestNeuralMinHash, TestNeuralPacking,
   TestNeuralLengthGrouped,
   TestNeuralMaskedLM,
   TestNeuralHFTokenizer, TestNeuralHFHub, TestNeuralNumpy,
   TestNeuralTokenizer, TestNeuralImagePreprocess,
-  TestNeuralDiffusion, TestNeuralImageMetrics;
+  TestNeuralDiffusion, TestNeuralImageMetrics, TestNeuralAudio,
+  TestNeuralAugment;
 
 type
   TMyTestRunner = class(TTestRunner)

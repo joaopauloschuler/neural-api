@@ -20,11 +20,11 @@ with:
      repeats until the grid is full. That is ~10 forward passes for the whole
      49-token image instead of VQVAE's 49 autoregressive passes.
 
-This is the FIRST masked-token parallel image decoder in the repo: structurally
+This is a masked-token parallel image decoder, structurally
 distinct from the autoregressive (TinyGPT, VQVAE prior), GAN (VisualGAN,
 StyleGAN2) and diffusion (DiffusionMNIST, ConsistencyDistill) generators here.
 
-WHAT IS GENUINELY NEW HERE (everything else is landed and reused):
+WHAT IS NEW HERE (everything else is landed and reused):
   - the [MASK]-token corruption used as the training objective (FillMaskedInput),
   - the confidence-based COSINE unmasking SCHEDULER, i.e. the generation loop
     (GenerateGrid): gamma(t/T) = cos(pi/2 * t/T) sets how many tokens stay

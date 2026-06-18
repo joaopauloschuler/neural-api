@@ -37,6 +37,14 @@ type
   private
     // The analytic stand-in model used by both the oracle and the DDIM test.
     procedure ToyModel(Xt, Output: TNNetVolume; Tt: integer);
+    // An "oracle" CONSISTENCY model for the LCM tests: it already knows the clean
+    // image gLCMTarget and, fed any noised x_t at any t, returns the raw eps such
+    // that the FULL consistency map f(x_t,t)=c_skip*x_t+c_out*x0_hat lands exactly
+    // on gLCMTarget (i.e. f is consistent: f(x_t,t)=x0 for every t). It solves
+    // x0_hat=(target-c_skip*x_t)/c_out, then back-outs the matching eps. This is
+    // what a perfectly-distilled LCM satisfies, so the multistep loop is a fixed
+    // point and must return the clean image.
+    procedure LCMOracleModel(Xt, Output: TNNetVolume; Tt: integer);
   published
     procedure TestLinearScheduleVsOracle;
     procedure TestScaledLinearInvariants;
@@ -50,6 +58,9 @@ type
     procedure TestEulerAncestralZeroEtaMatchesDDIM;
     procedure TestKarrasSpacingSigmaMonotone;
     procedure TestKarrasEulerAncestralRunsNoNaN;
+    procedure TestLCMBoundaryScalings;
+    procedure TestLCMConsistencyFixedPoint;
+    procedure TestLCMReproducible;
   end;
 
 implementation
@@ -84,6 +95,32 @@ begin
   s := Sin(0.01 * Tt);
   for i := 0 to Xt.Size - 1 do
     Output.FData[i] := s * Xt.FData[i];
+end;
+
+var
+  // The clean image the LCM oracle "knows", and the scheduler whose tables it
+  // uses to invert the forward process. Module-level so the of-object callback
+  // can reach them.
+  gLCMTarget: TNNetVolume = nil;
+  gLCMSched: TNNetLCMScheduler = nil;
+
+procedure TTestNeuralDiffusion.LCMOracleModel(Xt, Output: TNNetVolume; Tt: integer);
+var
+  i: integer;
+  sab, somab, cs, co, x0hat: TNeuralFloat;
+begin
+  // Pick eps so the full f(x_t,t)=c_skip*x_t+c_out*x0_hat equals gLCMTarget:
+  //   x0_hat = (target - c_skip*x_t)/c_out,
+  //   eps    = (x_t - sqrt(ab_t)*x0_hat)/sqrt(1-ab_t).
+  sab := Sqrt(gLCMSched.AlphaBar[Tt]);
+  somab := Sqrt(1.0 - gLCMSched.AlphaBar[Tt]);
+  cs := gLCMSched.CSkip(Tt);
+  co := gLCMSched.COut(Tt);
+  for i := 0 to Xt.Size - 1 do
+  begin
+    x0hat := (gLCMTarget.FData[i] - cs * Xt.FData[i]) / co;
+    Output.FData[i] := (Xt.FData[i] - sab * x0hat) / somab;
+  end;
 end;
 
 procedure TTestNeuralDiffusion.TestLinearScheduleVsOracle;
@@ -397,6 +434,105 @@ begin
     end;
   finally
     Sched.Free; X.Free; XBase.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestLCMBoundaryScalings;
+var
+  Sched: TNNetLCMScheduler;
+  cs1, csT, co1, coT: TNeuralFloat;
+const
+  cSigmaData = 0.5;
+begin
+  // c_skip(t) = sigma_data^2/((t/0.1)^2+sigma_data^2),
+  // c_out(t)  = (t/0.1)*sigma_data/sqrt((t/0.1)^2+sigma_data^2).
+  // At the LARGEST sigma (t=T) the (t/0.1)^2 term dominates: c_skip -> ~0 and
+  // c_out -> ~sigma_data. At small t (t=1) c_skip is near 1 and c_out near 0
+  // (the consistency boundary condition f(x,0)=x).
+  Sched := TNNetLCMScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  try
+    cs1 := Sched.CSkip(1);    co1 := Sched.COut(1);
+    csT := Sched.CSkip(cT);   coT := Sched.COut(cT);
+    // At t=1: (1/0.1)^2 = 100 vs sigma_data^2 = 0.25 -> c_skip ~ 0.25/100.25.
+    AssertEquals('c_skip(1)', 0.25 / 100.25, cs1, 1e-6);
+    AssertEquals('c_out(1)', 10.0 * 0.5 / Sqrt(100.0 + 0.25), co1, 1e-6);
+    // Monotonicity: c_skip shrinks with t, c_out grows toward sigma_data.
+    AssertTrue('c_skip largest-sigma small', csT < cs1);
+    AssertTrue('c_skip(T) < 1e-3', csT < 1e-3);
+    AssertTrue('c_out grows with t', coT > co1);
+    AssertTrue('c_out(T) ~ sigma_data', Abs(coT - cSigmaData) < 1e-3);
+    AssertTrue('c_out(T) < sigma_data', coT < cSigmaData);
+  finally
+    Sched.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestLCMConsistencyFixedPoint;
+var
+  Sched: TNNetLCMScheduler;
+  X, Target: TNNetVolume;
+  i: integer;
+begin
+  // On a TRIVIAL "model" that is already consistent (its x0 prediction is the
+  // true clean image at every t), f(x_t,t) returns that clean image for any t,
+  // so the multistep LCM loop is a fixed point: starting from a noised latent it
+  // returns the clean image to tolerance after the few steps. This pins both the
+  // c_skip/c_out parameterization AND the predict-x0 / re-noise loop.
+  RandSeed := 424242;
+  Sched := TNNetLCMScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  X      := TNNetVolume.Create(cN, 1, 1);
+  Target := TNNetVolume.Create(cN, 1, 1);
+  try
+    for i := 0 to cN - 1 do Target.FData[i] := (i - cN / 2) * 0.3;
+    gLCMTarget := Target;
+    gLCMSched := Sched;
+    // Start from the clean target fully noised toward t=T (pure-noise regime).
+    Sched.AddNoise(Target, X, cT);
+    Sched.LCMSample(X, @LCMOracleModel, 4, tsUniform);
+    for i := 0 to cN - 1 do
+    begin
+      AssertFalse('lcm no NaN @ ' + IntToStr(i),
+        IsNan(X.FData[i]) or IsInfinite(X.FData[i]));
+      AssertEquals('lcm consistency fixed point @ ' + IntToStr(i),
+        Target.FData[i], X.FData[i], 1e-3);
+    end;
+  finally
+    gLCMTarget := nil; gLCMSched := nil;
+    Sched.Free; X.Free; Target.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestLCMReproducible;
+var
+  SchedA, SchedB: TNNetLCMScheduler;
+  XA, XB, Target: TNNetVolume;
+  i: integer;
+begin
+  // A seeded LCM run (the re-noise hops draw fresh Gaussian noise) is exactly
+  // reproducible when the RNG seed is fixed before each run.
+  SchedA := TNNetLCMScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  SchedB := TNNetLCMScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  XA     := TNNetVolume.Create(cN, 1, 1);
+  XB     := TNNetVolume.Create(cN, 1, 1);
+  Target := TNNetVolume.Create(cN, 1, 1);
+  try
+    for i := 0 to cN - 1 do Target.FData[i] := (i - cN / 2) * 0.3;
+    gLCMTarget := Target;
+
+    RandSeed := 777; gLCMSched := SchedA;
+    for i := 0 to cN - 1 do XA.FData[i] := RandG(0, 1);
+    SchedA.LCMSample(XA, @LCMOracleModel, 4, tsUniform);
+
+    RandSeed := 777; gLCMSched := SchedB;
+    for i := 0 to cN - 1 do XB.FData[i] := RandG(0, 1);
+    SchedB.LCMSample(XB, @LCMOracleModel, 4, tsUniform);
+
+    for i := 0 to cN - 1 do
+      AssertEquals('lcm reproducible @ ' + IntToStr(i),
+        XA.FData[i], XB.FData[i], 1e-6);
+  finally
+    gLCMTarget := nil; gLCMSched := nil;
+    SchedA.Free; SchedB.Free; XA.Free; XB.Free; Target.Free;
   end;
 end;
 

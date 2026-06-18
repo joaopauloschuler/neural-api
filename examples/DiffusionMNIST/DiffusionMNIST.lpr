@@ -1,6 +1,6 @@
 program DiffusionMNIST;
 (*
-DiffusionMNIST: the repository's first GENERATIVE-BY-DIFFUSION example -- a
+DiffusionMNIST: a GENERATIVE-BY-DIFFUSION example -- a
 Denoising Diffusion Probabilistic Model (DDPM, Ho et al. 2020,
 https://arxiv.org/abs/2006.11239) that learns to synthesise 28x28 MNIST
 digits from pure Gaussian noise. It now also supports CLASS-CONDITIONAL

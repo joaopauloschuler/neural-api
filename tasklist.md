@@ -234,9 +234,6 @@ rather than acted on.
       reader/ToString, resnet18 parity 1.0e-6 vs a numpy float64 oracle —
       torchvision not installed; ConvNeXt LayerScale+GRN+depthwise-7x7 is the
       modern-CNN stretch goal on the same path):
-  - [ ] resnet50 Bottleneck (expansion 4) is CODED but not parity-tested — add a
-        pico Bottleneck fixture + TestResNet50...Parity. resnet34 likewise coded,
-        untested. resnet101/152 + ConvNeXt remain out of scope.
   - [ ] real torchvision .pth (pickle) load path: today the importer reads
         safetensors only; the pico fixture is a numpy float64 oracle (no
         torchvision). Also: CAI maxpool (ceil sizing + edge-clamped windows + zero
@@ -253,23 +250,6 @@ rather than acted on.
   - [ ] real-checkpoint (stabilityai/sd-vae-ft-mse) parity once diffusers is
         installable; SDXL VAE uses different group counts / multi-head attention.
   - [ ] the SD UNet itself (the remaining piece for end-to-end latent text-to-image).
-- [ ] Segment Anything (SAM) image-encoder + mask-decoder importer
-      (facebook/sam-vit-base) — first PROMPTABLE-segmentation importer, a new
-      output modality (dense binary masks, not class logits or embeddings).
-      Two pieces: (a) the ViT-H/L/B image encoder (windowed attention + a few
-      global-attention blocks + the neck 1x1+3x3 conv to a 256-ch image
-      embedding) reusing the landed BuildClipVisionTower ViT path; (b) the
-      lightweight two-way mask decoder (point/box prompt embeddings -> a couple
-      of cross-attention blocks -> upscaled mask). Scope v1 to a single point
-      prompt + single mask output to keep the decoder small. Pico parity vs HF
-      float64 on the encoder embedding first (decoder is the stretch); demo:
-      examples/SegmentAnything segments an object from one click on a tiny image.
-  (DPT / Depth-Anything monocular-depth importer LANDED: BuildDPTFromSafeTensors
-   + ReadDPTConfigFromJSONFile/DPTConfigToString, DINOv2 backbone reuse + DPT
-   reassemble/RefineNet-fusion neck, pico parity < 1e-4 via tiny_dpt.* fixtures
-   and TestDPT{Config,DepthEstimation}Parity. Follow-ups deferred: real-checkpoint
-   slicer for depth-anything/Depth-Anything-V2-Small-hf, the dpt-hybrid (resnet
-   backbone) variant, and an examples/MonoDepth grayscale demo.)
 - [ ] Mask2Former universal-segmentation importer
       (BuildMask2FormerFromSafeTensors, e.g. facebook/mask2former-swin-tiny-*-semantic)
       — a third, architecturally DISTINCT segmentation vertical: mask-classification
@@ -295,6 +275,57 @@ rather than acted on.
       (TNNetTorchBinReader path); (b) real x4 upscale of a tiny PNG end-to-end
       example; (c) scale=2 / other scales (currently only scale=4 = two upsample
       stages wired).
+- [ ] NAFNet image-restoration importer follow-ups (BuildNAFNetFromSafeTensors[Ex]
+      + TNAFNetConfig LANDED — TNNetSimpleGate gate layer + Simplified Channel
+      Attention + U-Net of NAFBlocks with LayerNorm2d / depthwise 3x3 / PixelShuffle;
+      pico parity TestNAFNetParity < 1e-4 vs a numpy float64 oracle;
+      examples/ImageRestoration end-to-end CPU denoise):
+  - [ ] Real official NAFNet denoise/deblur checkpoint parity (offline env — the
+        weights are large / not redistributable; importer uses the canonical
+        NAFNet state_dict key scheme so a real checkpoint should drop in).
+  - [ ] PNG input/output (the example uses deterministic synthetic images + PPM;
+        no PNG decoder in-tree).
+  - [ ] NAFBlock dropout + the wider official width/block configs are wired by
+        config but only the small pico shape is parity-pinned.
+- [ ] SwinIR transformer image-restoration importer follow-ups
+      (BuildSwinIRFromSafeTensors[Ex] + TSwinIRConfig LANDED — RSTB of Swin
+      window/shifted-window attention + 3x3 conv residual + pixel-shuffle upsample
+      tail, reusing the landed Swin attention blocks, NO new leaf layers; pico parity
+      TestSwinIRParity / TestSwinIRConfigFromJSONFile < 1e-4 vs a float64 numpy
+      oracle; examples/SwinIRRestore 2x SR smoke):
+  - [ ] Pinned the classical-SR (pixel-shuffle upscale) variant; the
+        same-resolution denoise tail (upscale=1, single conv reconstruction) is
+        wired by config but only the SR shape is parity-pinned.
+  - [ ] Real-checkpoint parity deferred (official SwinIR .safetensors are large /
+        not obtainable offline); the importer accepts a real checkpoint path.
+  - [ ] Lightweight-SR (no conv_after_body / single shared upsample) and the
+        nearest+conv "real-world" SR upsampler variants not yet wired.
+- [ ] RIFE video frame-interpolation importer follow-ups (BuildRIFEFromSafeTensors[Ex]
+      + TRIFEConfig + TNNetBackwardWarp LANDED — IFNet intermediate-frame synthesis
+      with accumulated flow residuals + sigmoid fusion-mask blend; pico parity
+      TestRIFEParity < 1e-4 vs a float64 numpy oracle;
+      examples/VideoFrameInterpolation one middle frame t=0.5, inference-only, on CPU):
+  - [ ] Real Practical-RIFE checkpoint parity (offline-download deferred): the real
+          IFNet is MULTI-SCALE (stride-2 IFBlocks downsample then bilinearly upsample
+          the predicted flow) and RE-FEEDS the warped frames + previous flow/mask into
+          each successive block; v1 refines from the SAME [frame0|frame1] input at full
+          resolution. Wire the scale schedule + warped-frame re-feeding and verify
+          against an exported hzwer/Practical-RIFE checkpoint.
+  - [ ] Arbitrary-t interpolation (t != 0.5) and the recursive 2x->4x multi-frame
+        schedule (RIFE's timestep encoding + recursion).
+  - [ ] Privileged-distillation teacher (the training-time IFNet that sees the GT
+        middle frame); inference-only path is landed.
+- [ ] GFPGAN blind face-restoration importer (BuildGFPGANFromSafeTensors[Ex],
+      TencentARC/GFPGAN) — leverages the LANDED StyleGAN2 generator
+      (BuildStyleGAN2GeneratorFromSafeTensors) as a fixed facial prior: a U-Net
+      degradation-removal encoder maps a low-quality face to the StyleGAN2 latent/
+      noise inputs, and per-resolution encoder features are spatially modulated into
+      the generator via CS-SFT (channel-split spatial feature transform) layers. The
+      only genuinely new code is the small U-Net encoder + the CS-SFT scale/shift
+      injection (an affine FiLM-like modulation — reuse the landed TNNetFiLM); the
+      synthesis backbone is reuse. Distinct from NAFNet/SwinIR (generic restoration
+      with no generative face prior). Pico parity vs a float64 oracle on the SFT
+      injection for a fixed latent + examples/FaceRestoration on a tiny CPU image.
 - [ ] Inception-v3 / GoogLeNet importer (BuildInceptionV3FromSafeTensors,
       torchvision) — PARTIAL (commit 503540b): the branch-concatenation block
       builder LANDED (AddInceptionAModule runs 4 parallel branches
@@ -335,18 +366,6 @@ rather than acted on.
       diffusers float64 oracle on the down/mid residual tensors for a fixed control
       image; an examples/ControlNetCanny that conditions generation on a hand-drawn
       edge map once the base UNet lands. First conditioning-by-feature-injection model.
-- [ ] RandAugment / TrivialAugment automatic augmentation policy in
-      neuraldatasets.pas — the repo has Mixup (landed) and CutMix (tracked) but NO
-      single-image geometric/photometric augmentation policy; CV training augmentation
-      is currently just flips + pad-crop. Port the torchvision transforms-v2 staple:
-      a fixed op bank (autocontrast, equalize, rotate, shear-x/y, translate-x/y,
-      posterize, solarize, color/contrast/brightness/sharpness) over a TNNetVolume,
-      with RandAugment (N ops at fixed magnitude M) and the parameter-free
-      TrivialAugment (one op, magnitude drawn uniformly) selection policies, plus
-      RandomErasing/Cutout. Wire it as an optional hook in the TNeuralImageFit
-      augmentation path so existing CIFAR examples can opt in. New code is the op
-      bank + the two sampling policies; reuses existing volume rotate/shear/color
-      primitives where present. Adds a measurable top-1 lift on the SimpleImageClassifier.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
       for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
       parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful
@@ -515,12 +534,6 @@ rather than acted on.
       registered on TNeuralFitBase. Early stopping, custom logging, and the
       EMA/SWA tasks become small callbacks instead of ever more
       TNeuralFitBase fields.
-- [ ] CutMix training augmentation (torchvision transforms-v2 staple;
-      Mixup itself is landed: CreateMixedVolumePairList in neuralvolume +
-      examples/Mixup): patch a random rectangle from a second sample into
-      the input and mix the targets by area fraction (Beta-distributed
-      lambda). The CIFAR image-classification examples give an instant
-      bake-off harness.
 - [ ] True single-kernel batched forward (real batch axis + attention padding
       mask for left-pad) — the lockstep DecodeBatchGreedy orchestration landed,
       but NN.Compute has no SIMD batch axis on the char path, so each step still
@@ -639,14 +652,6 @@ rather than acted on.
       way to pretrain on corpora bigger than RAM. Assert: same model
       quality on a small corpus vs the in-memory path at matched
       examples-seen, and bounded RSS on a corpus larger than the buffer.
-- [ ] MinHash near-duplicate corpus dedup tool: the C4/Pile hygiene step —
-      shingle each document, MinHash signatures, LSH banding to find
-      near-duplicate clusters, keep one representative. Small standalone
-      unit (or scripts/ tool) pairing with the streaming-corpus-loader
-      task above; report duplicate-cluster stats. Test: planted
-      near-duplicates (one-word edits) are found, distinct documents are
-      not merged.
-
 - [ ] Wav2Vec2 -large / robust LayerNorm variant + pretraining (follow-up to the
       landed Wav2Vec2/HuBERT CTC importer, which supports ONLY the wav2vec2-base
       "group" feat_extract_norm + post-norm encoder; ReadWav2Vec2ConfigFromJSONFile
@@ -656,47 +661,283 @@ rather than acted on.
       (do_stable_layer_norm), and the final encoder LayerNorm placement that
       pre-norm implies. Then wav2vec2 SELF-SUPERVISED pretraining (the quantizer /
       contrastive masked-prediction heads currently dropped as ignorable tensors).
-- [X] EnCodec neural audio codec importer (BuildEnCodecFromSafeTensors, e.g.
-      facebook/encodec_24khz) — the FIRST audio-GENERATIVE importer and the foundational
-      decoder for neural audio synthesis. Every landed audio model (Wav2Vec2/HuBERT) is
-      analysis-only (audio -> CTC text); EnCodec is the inverse — a streaming
-      convolutional encoder/decoder that turns a waveform into a stack of discrete codes
-      and back. The genuinely NEW primitive is **Residual Vector Quantization (RVQ)**: a
-      cascade of N codebooks where each successive codebook quantizes the RESIDUAL left by
-      the previous one (the repo today has only the single-codebook TNNetVectorQuantizer
-      used by VQVAE/MaskGIT — RVQ is the multi-stage generalization, a small holder class
-      EncodeAudioToCodes / DecodeCodesToAudio doing argmin/gather per stage, NO heavy new
-      TNNet layer). The conv encoder/decoder reuse the SeparableConv / causal-Conv1D
-      blocks already in tree; v1 is inference-only reconstruction (waveform -> codes ->
-      waveform). Pico parity vs a transformers float64 oracle on the round-tripped
-      waveform (< 1e-4) + reuse make_pico_*_fixture.py; an examples/EnCodecRoundTrip that
-      compresses and reconstructs a tiny WAV on CPU. Unblocks the MusicGen / Bark
-      text-to-audio follow-up below (those generate EnCodec codes with a transformer LM,
-      then decode through this codec) — the audio analogue of the VQModel->image-LM path.
-  - [X] MusicGen text-to-music follow-up (BuildMusicGenFromSafeTensors, e.g.
-        facebook/musicgen-small) once EnCodec lands: a T5 text encoder
-        (BuildT5FromSafeTensors) conditioning a single-stage transformer decoder that
-        autoregressively predicts the EnCodec code stack with the **delay-pattern**
-        codebook interleaving (each of the K codebooks is offset by one step so a single
-        LM head predicts them causally), decoded back to audio through the landed EnCodec
-        decoder. DONE: TMusicGenModel holder + BuildMusicGenFromSafeTensors[Ex]; the
-        decoder is the PRE-norm cross-attention Pegasus block skeleton (NOT post-norm
-        BART) with K summed code-embedding tables, HF cat([cos,sin]) half-split sinusoidal
-        positions, bias-free q/k/v/out + fc, a final decoder LayerNorm, and K untied LM
-        heads, plus a biased enc_to_dec_proj. The genuinely new code is the delay-pattern
-        (de)interleave helpers (MusicGenDelayInterleave/Deinterleave) matching HF
-        build_delay_pattern_mask + a greedy Generate loop. Parity: TestMusicGenDecoderParity
-        (next-token logits K x T x vocab vs HF float64 oracle, max |diff| = 0.0 < 1e-4) +
-        TestMusicGenDelayPattern (interleave matches HF exactly + round-trip). Fixture:
-        tools/musicgen_tiny_fixture.py -> tests/fixtures/tiny_musicgen.{safetensors,
-        _config.json,_ref.json} (~16 KB). examples/MusicGenSmoke runs the importer +
-        delay-pattern greedy generation on the pico fixture (CPU, ulimit-bounded).
-        REMAINING FOLLOW-UPS (deferred): (a) stereo audio_channels=2 (the interleaved
-        2*K-codebook delay layout, currently rejected); (b) wire the FULL pipeline
-        end-to-end with a real T5 encoder + EnCodec decoder (RunT5-style helper) to emit
-        an actual waveform from a text prompt (v1's Generate stops at the code stack);
-        (c) KV-cache incremental decode in Generate (v1 recomputes the whole prefix each
-        step); (d) sampling (top-k/temperature) instead of greedy.
+- [ ] HiFi-GAN neural vocoder importer follow-ups (`BuildHiFiGANFromSafeTensors[Ex]`
+      LANDED + `ReadHiFiGANConfigFromJSONFile`/`HiFiGANConfigToString` +
+      `THiFiGANConfig` + the `TNNetHiFiGAN` channel-major holder
+      (Synthesize / SynthesizeVolume); mel-spectrogram -> waveform, the reusable
+      synthesis backend shared by Tacotron2 / FastSpeech2 / SpeechT5 / Bark /
+      VITS-style models). The generator is implemented as a self-contained
+      convolutional holder (like TEnCodecModel) doing the conv_pre ->
+      ConvTranspose1d-upsample + MRF (AVERAGE of num_kernels dilated ResBlocks) ->
+      conv_post -> tanh math directly on channel-major arrays; conv weights fold
+      weight_norm g/v at import (or load plain folded `.weight` as SpeechT5HifiGan
+      ships). Discriminators skipped (training-only). Parity-gated < 1e-4 against an
+      HF SpeechT5HifiGan float64 oracle (tools/make_pico_hifigan_fixture.py ->
+      tests/fixtures/tiny_hifigan*, TestHiFiGANSynthesisParity). Open follow-ups:
+  - [ ] real-checkpoint smoke: resynthesize a clip with a downloaded `hifigan` /
+        SpeechT5HifiGan generator (weight_norm fold path) and write it via
+        SaveVolumeToWav16 (offline + RAM-gated here, so deferred).
+- [ ] VITS / MMS-TTS end-to-end text-to-speech importer (`BuildVitsFromSafeTensors[Ex]`
+      LANDED + `ReadVitsConfigFromJSONFile`/`VitsConfigToString` + the `TVitsConfig`
+      record + the `TNNetVits` channel-major holder (Analyze / ExpandPrior /
+      FlowReverse / Synthesize) + examples/TextToSpeech) — the FIRST text-to-speech
+      model in the library (model_type `vits`: facebook/mms-tts-* and
+      kakao-enterprise/vits-ljs; Kim et al. 2021). Like the HiFi-GAN vocoder it is a
+      self-contained channel-major holder doing the INFERENCE math directly (conv1d /
+      relative-position attention / WaveNet residual stacks). All four stages landed
+      and parity-gated `< 1e-4` vs the HF `VitsModel` float64 oracle
+      (`TestVitsSynthesisParity`, `tools/make_pico_vits_fixture.py` ->
+      `tests/fixtures/tiny_vits*`): (1) the conditional-prior normalizing FLOW run in
+      reverse — VITS's residual coupling is RealNVP/Glow ADDITIVE coupling
+      (`log_stddev≡0`, so `second_half -= mean(first_half)` with the mean from a
+      `conv_pre`->WaveNet->`conv_post` stack, weight_norm g/v folded) — note this
+      REUSES the WaveNet/coupling math directly rather than the generic
+      `TNNetAffineCoupling`/`TNNetInvertible1x1Conv` Glow layers (VITS's coupling is
+      its own WaveNet-conditioned variant, not a layer-graph fit); (2) the HiFi-GAN
+      DECODER reused from `TNNetHiFiGAN` via a shared `BuildVitsDecoderInto` (loaded
+      under the `decoder.` key prefix, bias-free `conv_post`); (3) the
+      relative-position text encoder + the DETERMINISTIC duration predictor + the
+      monotonic length-regulator expansion; (4) the full text->waveform graph (the
+      prior noise `z` is an EXPLICIT input so the parity test is deterministic). The
+      posterior encoder (training-only) is dropped from the committed fixture and
+      never required. Example writes a smoke WAV via `SaveVolumeToWav16`. Open
+      follow-ups:
+  - [X] the STOCHASTIC duration predictor (`VitsStochasticDurationPredictor`, the
+        spline-flow `use_stochastic_duration_prediction=true` path used by
+        `kakao-enterprise/vits-ljs`) — `TNNetVits.StochasticDurationReverse` ports the
+        HF reverse path EXACTLY: the `VitsDilatedDepthSeparableConv` conditioner
+        (grouped dilated conv + LayerNorm + erf-GELU + pointwise + LayerNorm + GELU,
+        residual), the `[:-2]+[-1]` flow reversal (drop the first conv flow), per-step
+        channel flip, the `VitsElementwiseAffine` reverse and the unconstrained
+        rational-quadratic spline (`_unconstrained_rational_quadratic_spline`,
+        reverse=True: cumwidth/cumheight bin search, quadratic-root inverse). The
+        duration noise `z_dur` is an EXPLICIT input (`SetStochasticDurationNoise`) like
+        the prior noise `z`. `ReadVitsConfigFromJSONFile` now ACCEPTS
+        `use_stochastic_duration_prediction=true`; the deterministic readout (the
+        MMS-TTS default) is unchanged. Parity-gated `< 1e-4` vs the HF `VitsModel`
+        float64 oracle (`TestVitsStochasticDurationParity`,
+        `tools/make_pico_vits_sdp_fixture.py` -> `tests/fixtures/tiny_vits_sdp*`).
+  - [ ] MULTI-SPEAKER models (`num_speakers>1` / `speaker_embedding_size!=0`, the
+        global-conditioning `cond` convs into the WaveNet/duration/decoder) —
+        rejected loudly.
+  - [ ] real-checkpoint smoke: synthesize a sentence with a downloaded
+        `facebook/mms-tts-eng` / `kakao-enterprise/vits-ljs` and write it via
+        `SaveVolumeToWav16` (offline + RAM-gated here, so deferred).
+- [ ] Kokoro / StyleTTS2 text-to-speech importer (`BuildKokoroFromSafeTensors[Ex]` +
+      `BuildKokoroFromSafeTensorsWithConfig`, `TKokoroConfig`/`ReadKokoroConfigFromJSONFile`,
+      a channel-major `TNNetKokoro` holder like the landed `TNNetVits`/`TNNetHiFiGAN`)
+      + an examples/KokoroTTS smoke that writes a WAV via `SaveVolumeToWav16`. Kokoro
+      (`hexgrad/Kokoro-82M`, Apache-2.0, ~82M params) is the current best-in-class
+      *lightweight* open TTS model and a natural CPU-native fit, but is genuinely
+      DISTINCT from the landed VITS path so it is not a near-duplicate of an existing
+      importer: it is a **StyleTTS2** architecture, not VITS. Three new pieces to wire:
+      (1) a **style-vector-conditioned** generator — the 256-d voice/style embedding
+      (the per-voice `voices/*.pt` reference tensors, indexed by token length) is
+      AdaIN/affine-injected into the duration predictor, the F0/energy predictors and
+      the decoder, so the conditioning math is the new part vs VITS's WaveNet `cond`
+      convs; (2) an **iSTFTNet-style decoder** — the generator predicts magnitude +
+      phase and runs an INVERSE STFT to waveform rather than HiFi-GAN's pure transposed-
+      conv upsampling, so it needs an `ISTFT(mag, phase)` overlap-add primitive in
+      `neuralaudio.pas` (the inverse of the existing `WhisperLogMelFromWavFile` /
+      forward-STFT machinery — a genuinely missing DSP building block, also reusable by
+      future vocoders) — **the ISTFT primitive LANDED**: `ISTFTOverlapAdd(Mag, Phase,
+      Wave, NFFT, HopLength)` + `ISTFTOverlapAddReIm(Re, Im, ...)` in `neuralaudio.pas`
+      (COLA / window_sumsquare normalization, periodic-Hann synthesis mirroring the
+      forward CosTab/SinTab convention), with a forward-STFT->ISTFT round-trip test
+      `TestISTFTRoundTrip` (75% overlap, interior max-abs err 2.98e-8, float32-storage
+      limited); the rest of the iSTFTNet decoder wiring stays open; (3) a **prosody/duration stack** driving a length-regulator
+      expansion analogous to the VITS deterministic duration path but conditioned on the
+      style vector. Reuse where possible: the length-regulator / monotonic-expansion math
+      and `SaveVolumeToWav16` from the VITS path, and the conv/LSTM primitives already in
+      the library. SCOPE v1: single forward graph text(phonemes)->waveform with the
+      reference style vector as an EXPLICIT input (deterministic, no sampling) so a
+      parity test `TestKokoroSynthesisParity` can gate `< 1e-4` vs the HF/`kokoro`
+      float64 oracle on a pico fixture (`tools/make_pico_kokoro_fixture.py` ->
+      `tests/fixtures/tiny_kokoro*`, re-randomized O(1)-scale weights per the ModernBERT
+      fixture lesson). The grapheme->phoneme (misaki/espeak) front-end is OUT OF SCOPE —
+      feed pre-phonemized input and reject `language`/g2p config loudly, exactly as the
+      VITS uroman/phonemizer front-ends are deferred. Unlocks the missing inverse-STFT
+      vocoding rung shared with any spectral-domain generator.
+- [ ] Mimi streaming neural-codec importer (`BuildMimiFromSafeTensors[Ex]`,
+      model_type "mimi", e.g. `kyutai/mimi`) — LANDED (conv encoder/decoder +
+      RoPE transformer bottleneck + semantic/acoustic split-VQ; codes match the
+      HF `MimiModel` float64 oracle exactly, round-trip waveform max|diff| ~1e-12,
+      `TestMimiParity`; examples/MimiCodec round-trip smoke). Open follow-ups:
+  - [ ] Mimi REAL-checkpoint parity vs the downloaded `kyutai/mimi` (encode codes +
+        decode waveform) — the pico fixture pins the wiring; a real run pins widths,
+        the GELU/erf path at scale, and the F32-storage budget on a trained model.
+  - [ ] Mimi STREAMING chunk-at-a-time encode/decode (HF `MimiConv1dPaddingCache`
+        per-conv padding cache + KV-cache transformer decode via the landed SDPA
+        Begin/EndIncrementalDecode) for O(1) per-frame Moshi-style inference.
+- [ ] CLAP audio-text contrastive importer (`BuildClapFromSafeTensors[Ex]` +
+      `BuildClapFromSafeTensorsWithConfig`, `TClapConfig`/`ReadClapConfigFromJSONFile`)
+      + examples/ZeroShotAudioTag — LANDED. Audio-domain analogue of the CLIP
+      dual-encoder (two nets, shared L2-normalized space, `exp(logit_scale_a)*cosine`),
+      but genuinely distinct: the audio tower is an HTS-AT Swin transformer over a
+      log-mel spectrogram (PURE REUSE of the landed Swin window machinery —
+      `TNNetWindowAttention`/`TNNetGatherTokens`/`SwinBuildWindowLayout`/
+      `SwinSetWindowBias`/patch-merge — under the `clap_audio_model` key spelling, plus
+      a Conv2d patch-embed + token mean-pool + 2-layer `ClapProjectionLayer`), and the
+      text tower is RoBERTa (built inline like `BuildBertFromSafeTensors` + BERT pooler
+      + 2-layer projection). The HF `BatchNorm2d`(mel) + `reshape_mel2img` freq<->time
+      transpose are folded into `ClapBatchNormMelImage` (caller supplies the
+      `(time,mel,1)` image). NO new leaf layers. Reuses `ClipExtractEmbedding`/
+      `ClipSimilarity` + new `ClapSimilarityMatrix`. Pico parity `< 1e-4` on BOTH
+      embeddings vs the float64 HF `ClapModel` oracle (`TestClapParity`, generator
+      `tools/clap_tiny_fixture.py`, committed `tests/fixtures/tiny_clap.*`).
+      Follow-ups:
+  - [X] freq_ratio > 1 (the real laion 1024-frame/64-mel `freq_ratio = 4` layout):
+        the `reshape_mel2img` mel-crop reorganization + the final group-2D-CNN reshape
+        before the avgpool were identity-only and loudly REJECTED. LANDED: the general
+        `reshape_mel2img` indexing is folded into `ClapBatchNormMelImage` (square
+        spec_size x spec_size image; pixel (W,H) reads mel[(H div mel)*spec_size + W]
+        [H mod mel]); the HF group-2D-CNN reshape is a permutation of the final feature
+        map followed by a mean over ALL of it, so it is permutation-invariant and the
+        existing token mean-pool reproduces it for any freq_ratio. Any integral
+        freq_ratio >= 1 now accepted (freq_ratio = 1 transpose path unchanged). Gated
+        by a freq_ratio=4 pico fixture (`tools/clap_tiny_fixture_fr4.py` ->
+        `tests/fixtures/tiny_clap_fr4.*`) + `TestClapFreqRatio4Parity` (< 1e-4 on BOTH
+        embeddings vs the float64 HF `ClapModel` oracle).
+  - [ ] "fused" CLAP (`enable_fusion = true`, clap-htsat-FUSED): the local/global
+        mel-fusion patch-embed (`mel_conv2d` + the attention-feature-fusion block) is
+        rejected. Distinct windowing — own importer branch + fixture.
+  - [ ] Real laion checkpoint parity + the log-mel frontend wiring: `ClapFeatureExtractor`
+        produces the 1024x64 mel (depends on freq_ratio=4); wire `neuralaudio.pas`
+        log-mel -> `ClapBatchNormMelImage` end-to-end and verify against a downloaded
+        `clap-htsat-unfused`. (The RoBERTa BPE tokenizer is already importable.)
+- [ ] AudioLDM 2 / Stable Audio latent text-to-audio (music & sound) capstone —
+      text-prompt -> audio via LATENT diffusion, the audio analogue of the landed
+      LatentTextToImage (PixArt/DiT + VAE) pipeline and the natural home for the
+      music priority. Reuses the landed `TNNetDiffusionScheduler` samplers
+      (DDIM / DPM-Solver++(2M) / Euler) and a VAE/EnCodec latent codec; the new piece
+      is the importer for the audio U-Net/DiT denoiser conditioned on a text encoder
+      (CLAP or T5/FLAN-T5, both already importable) plus the mel-VAE decode ->
+      HiFi-GAN vocode -> WAV tail. Scope v1 as: denoiser + scheduler loop producing a
+      latent, decoded to a short (~5 s) clip written via the WAV writer; defer
+      classifier-free-guidance tuning and long-form generation to a follow-up.
+      DEPENDS ON the WAV writer + HiFi-GAN vocoder tasks above.
+- [X] LANDED: real downloaded musicgen-small checkpoint + real tokenizer for
+      examples/MusicGenText. The example's --download mode fetches three
+      STANDARD public repos through the native Pascal Hub helper (neuralhfhub
+      HubFetchModel, no Python) and imports each directly with no split step:
+      facebook/musicgen-small (decoder; importer ignores the bundled
+      text/audio-encoder keys), t5-base (T5 encoder + SentencePiece tokenizer
+      via TNeuralHFTokenizer), facebook/encodec_32khz (32 kHz codec).
+      --prompt/--seconds/--guidance/--topk/--temperature wired; downloads
+      cached under ~/.cache/neural-api/hub. Also LANDED as part of this: the
+      EnCodec importer now supports use_causal_conv=false (the non-causal
+      32 kHz symmetric-pad variant) -- RunEnCodecConv branches on
+      Config.UseCausalConv (symmetric Conv1d pad + symmetric ConvTranspose
+      trim); verified by TestEnCodecNonCausalRoundTripParity (tiny HF oracle,
+      <1e-4) alongside the unchanged causal TestEnCodecRoundTripParity. NOT yet
+      run end-to-end on the real full-size model (host RAM-limited; see
+      memory).
+- [ ] Read generation_config.json for decode defaults (MusicGen + general).
+      examples/MusicGenText currently HARDCODES MusicGen's intended sampling
+      recipe in --download mode (top_k=250, temperature=1.0, guidance_scale=3.0,
+      do_sample=true) -- these match facebook/musicgen-small's
+      generation_config.json exactly, but a non-standard MusicGen variant with
+      different generation defaults would not be picked up. Add a small
+      generation_config.json reader (top_k / top_p / temperature / do_sample /
+      guidance_scale / max_length) and have the example seed its defaults from
+      it when present (explicit --flags still override). NOTE: the greedy-vs-
+      sampling distinction matters a LOT here -- greedy argmax collapses MusicGen
+      into a repetitive drone; top_k sampling is what actually produces music
+      (root cause of the "not music" bug, fixed by defaulting --download to
+      top_k=250 in commit 882a75b). Generalizes beyond MusicGen to any imported
+      generative LM that ships a generation_config.json.
+- [ ] Stereo MusicGen (audio_channels=2, the 2K-codebook layout) -- the
+      ReadMusicGenConfigFromJSONFile importer currently REJECTS audio_channels=2
+      (the 2*K interleaved-codebook delay layout is a documented follow-up).
+- [ ] SeamlessM4T-v2 follow-ups deferred from the landed S2TT v1:
+      (1) position_embeddings_type="relative_key" — the v2 conformer self-attn
+      distance-embedding attention bias (einsum("bhld,lrd->bhlr") added to the
+      scores, clamped to [-left_max, right_max]); needs a new relative-position
+      attention layer (the importer currently REJECTS "relative_key" and the
+      pico fixture pins it disabled). (2) the text-to-speech (T2ST) unit
+      vocoder path (TextToUnit decoder + HiFi-GAN-style unit vocoder).
+      (3) the UnitY2 two-pass decoding. (4) a real downloaded
+      facebook/seamless-m4t-v2-large checkpoint + real SentencePiece tokenizer
+      + a runnable examples/SeamlessTranslate S2TT end-to-end demo.
+- [ ] examples/SpeechCommands keyword-spotting trainer — the audio analogue of
+      SimpleImageClassifier and the first FROM-SCRATCH (no-import) audio training
+      example. Feed the existing log-mel frontend (neuralaudio.pas) into a small
+      conv stack to classify the Google Speech Commands v2 spoken-word set
+      ("yes"/"no"/"up"/"down"/...). Pure CPU, ships a tiny downloader + a
+      reproducible accuracy number; demonstrates that the audio frontend is usable
+      for ordinary supervised training, not only for pretrained-model import.
+      LANDED (examples/SpeechCommands, .lpr + .lpi + README + scripts/download_speech_commands.sh):
+      default no-network SMOKE generates a deterministic synthetic 6-keyword set
+      (fixed RandSeed; low/mid/high tones + up/down chirps + band-limited noise)
+      and runs it through the REAL ComputeWhisperLogMel ((100,1,40) log-mel) into a
+      Conv(24,5)/MaxPool4 -> Conv(32,3)/MaxPool4 -> Conv(48,3)/MaxPool2 ->
+      FullConnectReLU(64) -> Dropout -> FullConnectLinear -> SoftMax stack trained
+      with TNeuralFit. Smoke validation climbs 83.5% -> 100% over 2 epochs and the
+      held-out test set scores 93.89% (chance 16.7%), well under the 280 s /
+      ulimit -v 3000000 budget. An optional `--full <dir>` loads real Speech
+      Commands WAVs via LoadWav16ToVolume (same frontend), documented but NOT
+      exercised by the smoke. Open follow-ups:
+  - [ ] run the `--full` path on real downloaded Speech Commands v2 and record a
+        real-data accuracy number (the synthetic smoke is trivially separable —
+        validation saturates at epoch 2 — so it proves the path, not a hard
+        benchmark).
+  - [ ] a harder synthetic task (overlapping classes / lower SNR / more keywords)
+        so the smoke trains for more than ~2 epochs before validation hits the
+        default TargetAccuracy and early-stops.
+  - [ ] a 16 kHz resampler in neuralaudio so `--full` accepts non-16 kHz WAVs
+        directly instead of requiring an ffmpeg pre-pass.
+- [ ] Moonshine GQA decoder/encoder pico fixture (follow-up to the landed
+      Moonshine encoder-decoder importer + examples/MoonshineTranscribe):
+      decoder/encoder_num_key_value_heads != heads (the pico currently sets
+      kv_heads == heads; the GQA slice path is wired but unexercised by an
+      oracle — add a fixture with kv_heads < heads and assert parity).
+- [ ] KV-cache O(1) incremental decode for the Moonshine decoder (self-attn cache +
+      cross-attn states are constant across steps; reuse the SDPA Begin/EndIncrementalDecode
+      machinery) so long transcripts don't re-run the whole prefix each step.
+- [ ] Whisper word-timestamp follow-ups (v1 landed, scoped to one 30 s
+      greedy window): (a) median-filter smoothing of the score matrix before DTW
+      (openai-whisper's `median_filter`, default kernel 7) to suppress single-
+      frame spikes; (b) multi-window stitching for clips > 30 s (carry the
+      running time offset and merge the per-window word lists); (c) baked-in
+      alignment heads for the medium/large shapes + reading
+      generation_config.alignment_heads when present (v1 hardcodes tiny/base/small
+      and falls back to all-heads otherwise); (d) wire it into
+      examples/WhisperTranscribe behind a `--word-timestamps` flag and document
+      in examples/README; (e) optional per-word confidence (mean path attention).
+- [X] Speaker diarization importer (`BuildPyannoteSegmentationFromSafeTensors[Ex]` +
+      `TPyannoteConfig`/`ReadPyannoteConfigFromJSONFile`, model_type `pyannote`) — LANDED.
+      New leaf layer `TNNetSincConv1D` (SincNet band-pass, kernels materialized from two
+      scalars (low_freq, band) per filter, Hamming-windowed; full forward+BPTT, input &
+      weight numerical-gradient tests `TestSincConv1D*`, README layer row). Importer
+      pipeline: SincConv front-end → abs/MaxPool/TokenLayerNorm → Conv+ReLU/MaxPool/
+      TokenLayerNorm → bidirectional `TNNetMinLSTM` trunk (forward + time-reversed concat)
+      → linear → per-frame 7-class **powerset** head + `PyannotePowersetDecode` to a
+      per-speaker binary activity matrix. Parity-gated `< 1e-4` (observed ~2e-7) vs a
+      hand-written numpy float64 forward oracle on a pico fixture
+      (`tools/make_pico_pyannote_fixture.py` → `tests/fixtures/tiny_pyannote*`,
+      `TestPyannoteParity`) — the `pyannote.audio` python package is NOT installed here, so
+      the oracle reimplements the exact forward math on a re-randomized fixture.
+      `examples/SpeakerDiarization` synthesizes a two-tone clip, prints a speaker-activity
+      timeline + RTTM lines, saves a WAV via `SaveVolumeToWav16`. Open follow-ups:
+  - [ ] Real `pyannote/segmentation-3.0` checkpoint key-mapping (the on-disk tensor
+        names + the actual conv-stack depths/strides) instead of the pico fixture's
+        re-keyed names, verified against a real `pyannote.audio` float64 oracle once the
+        package is available.
+  - [ ] Swap the `TNNetMinLSTM` trunk (gates depend on x_t only) for a VANILLA LSTM with a
+        true cell state + recurrent gate feed (pyannote uses `nn.LSTM`), so real weights
+        load without re-training; needs a landed vanilla-LSTM cell first.
+  - [ ] Sliding-window inference + overlap stitching for clips longer than the model's
+        receptive field, and turning the per-frame activity matrix into final diarized
+        speaker turns (clustering across windows).
+- [ ] SAM mask decoder as a real TNNet layer graph (TNNetCrossAttention two-source
+      wiring) instead of the plain-array RunSAMMaskDecoder forward, so the decoder is
+      trainable / fine-tunable end-to-end (v1 is inference-only). Needs a builder that
+      threads the per-step query/key positional-embedding additions through the
+      asymmetric token<->image cross-attentions.
+- [ ] SAM full end-to-end importer + processor parity: a single BuildSAMModel that wires
+      encoder + decoder + the HF SamProcessor coordinate transform (longest-side resize
+      to image_size, point rescaling) so a real sam-vit-base checkpoint segments a real
+      image from pixel-space clicks (v1 assumes input_image_size == raw pixel coords).
 - [ ] Medusa / EAGLE tree-attention speculative decoding — a follow-up that is
       genuinely distinct from the landed SEQUENTIAL self-speculative paths
       (MTP-draft SelfSpeculativeDecoding + LayerSkip/CALM EarlyExitSelfSpeculative,
@@ -731,18 +972,23 @@ rather than acted on.
       LANDED, parity < 1e-4) -> VAE decoder (BuildVaeDecoderFromSafeTensors, LANDED)
       -> RGB, driven by the existing TNNetDiffusionScheduler DDIM/DPM-Solver++ loop
       with classifier-free guidance (PixArt uses a null/empty-caption uncond branch).
-      Suggested smaller, doable breakdown:
-  - [ ] Step 1 — wire PixArtConditioning/PixArtDenoise into a multi-step DDIM/
-        DPM-Solver++ sampling loop over caller-supplied T5 states (fixture-only,
-        no real checkpoint): assert no NaN/Inf, produce a latent. Pure offline.
-  - [ ] Step 2 — decode the sampled latent through BuildVaeDecoderFromSafeTensors
-        (latent /0.18215 scaling) to an RGB image; write a PPM/PNG. Fixture VAE.
+      Steps 1 & 2 LANDED: examples/LatentTextToImage runs a CFG DDIM / DPM-Solver++(2M)
+      loop over the pico PixArt (regression TestLatentTextToImageSmoke) and decodes the
+      (6,6,4) latent through a matched pico VAE decoder to a (12,12,3) RGB P6 PPM.
+      Remaining steps:
   - [ ] Step 3 — add the real T5 tower (BuildT5FromSafeTensors) + CFG (cond vs
         empty-caption uncond) and a hard-coded prompt; ulimit-bounded demo that
         generates one small image. The CV-generative-stack-composes capstone.
+        (Steps 1+2 supply only DETERMINISTIC SYNTHETIC T5 states + pico fixtures;
+        Step 3 swaps in a real T5 encoder + real PixArt/VAE checkpoint.)
+  - [ ] Follow-up — the pico PixArt + matched pico VAE are RANDOM (smoke only);
+        once a real checkpoint is wired (Step 3) re-verify the chain produces a
+        sensible image, and consider a Karras-spaced / Euler-ancestral variant.
       Edit examples/README.md. Mind the 5-min/ulimit budget — default to a smoke run.
 
 - [ ] Mask R-CNN instance-segmentation importer + a RoIAlign primitive
+      (RoIAlign DEPENDENCY NOW SATISFIED — TNNetRoIAlign has landed in
+      neuralnetwork.pas; remaining work is the importer/FPN/heads below)
       (BuildMaskRCNNFromSafeTensors, e.g. torchvision maskrcnn_resnet50_fpn) — the
       FIRST instance-segmentation vertical (per-OBJECT binary masks, distinct from
       DETR's boxes-only, SegFormer's single dense class map, and SAM's prompt-driven
@@ -782,35 +1028,15 @@ rather than acted on.
         per-pixel broadcast noise for real stochastic synthesis).
   - [ ] real stylegan2 checkpoint (NVIDIA .pkl / a rosinality safetensors) parity once
         obtainable; the training path (discriminator + path-length reg) and StyleGAN3.
-- [ ] MMDiT (Stable Diffusion 3 / FLUX.1) text-to-image transformer importer
-      (BuildMMDiTFromSafeTensors, e.g. stabilityai/stable-diffusion-3-medium or a
-      small Flux-schnell config) — the DUAL-STREAM joint-attention DiT, architecturally
-      DISTINCT from the landed class-conditional DiT (BuildDiTFromSafeTensors) and the
-      tracked single-stream cross-attention PixArt-alpha. The genuinely new piece is the
-      MMDiT block: image tokens and text tokens carry SEPARATE per-stream
-      projections/MLPs/adaLN modulations but are CONCATENATED for ONE JOINT
-      self-attention pass (text and image attend to each other symmetrically), then
-      split back — not the image->text CROSS-attention of PixArt. Everything else is
-      landed: patch embed, the T5 + CLIP prompt towers (BuildT5/BuildClip), the VAE
-      decoder (BuildVaeDecoderFromSafeTensors), and a RECTIFIED-FLOW Euler sampler
-      (the examples/FlowMatching velocity-field loop). Scope v1 to inference on one
-      denoise step. The cheapest path to a REAL modern text-to-image checkpoint and a
-      second route (besides the tracked PixArt) to the LatentTextToImage capstone with
-      NO SD UNet. Pico parity vs a diffusers float64 oracle on one block's joint-attention
-      output + reuse make_pico_*_fixture.py.
-- [ ] PaliGemma vision-language importer (BuildPaliGemmaFromSafeTensors, e.g.
-      google/paligemma-3b-mix-224) — a VLM follow-up that exercises a genuinely
-      DIFFERENT attention regime from the tracked causal LLaVA path: PaliGemma is a
-      PREFIX-LM, the image tokens AND the prompt tokens see each other with FULL
-      BIDIRECTIONAL attention (a block-bidirectional mask over the prefix) and only the
-      generated suffix is causal. The new code is that prefix-LM attention-mask wiring
-      threaded through the decoder; nearly everything else is landed — the SigLIP tower
-      (BuildSigLIPVisionTower), the Gemma decoder (BuildGemmaFromSafeTensors), and the
-      linear multimodal projector + image-token splice are exactly the LLaVA
-      prompt-assembly helper (so this depends on / shares that helper). Distinct from
-      LLaVA's causal-everywhere mask and from the open Qwen2-VL M-RoPE path. Pico parity
-      vs HF float64 on next-token logits for a mixed image+text prompt + an
-      examples/PaliGemmaCaption that captions a tiny image on CPU (ulimit-bounded).
+- [ ] MMDiT (Stable Diffusion 3 / FLUX.1) full text-to-image importer + sampler
+      (dual-stream joint-attention BLOCK v1 LANDED — AddMMDiTJointBlock +
+      BuildMMDiTBlockFromSafeTensors + ReadMMDiTConfigFromJSONFile): full
+      BuildMMDiTFromSafeTensors stack (patch embed + combined CLIP+T5 prompt tower +
+      pooled-projection conditioning + N joint blocks + final adaLN/unpatchify); the
+      CONTEXT-FREE final block (context_pre_only=True, text stream dropped); the
+      end-to-end rectified-flow Euler sampler (reuse examples/FlowMatching) into the
+      LatentTextToImage capstone with NO SD UNet; real stable-diffusion-3-medium
+      (or Flux-schnell) checkpoint parity; SD3.5 RMSNorm QK-norm support.
 - [ ] AnimateDiff text-to-VIDEO motion-module importer (BuildAnimateDiffFromSafeTensors,
       e.g. guoyww/animatediff-motion-adapter-v1-5-2) — the FIRST video-GENERATIVE
       importer (a sequence of frames from a text prompt), a brand-new generative
@@ -829,15 +1055,44 @@ rather than acted on.
       examples/TextToVideo that writes a short animated GIF/PPM sequence on CPU once the
       base UNet lands. Note: the cheaper no-UNet route to video is bolting the same
       temporal block onto the landed PixArt DiT — worth scoping if SD UNet stays blocked.
-- [ ] Diffusion INPAINTING example (examples/ImageToImage --inpaint, or a sibling) — the
-      one-flag follow-up unblocked by the landed SDEdit examples/ImageToImage driver: reuse
-      the exact same encode->partial-noise->denoise->decode pipeline but, BEFORE each
-      reverse step, overwrite the UNMASKED latent region with the (re-noised to that
-      timestep) clean encoded latent, so only the masked region is regenerated while the
-      rest stays pixel-faithful (the RePaint / SD-inpaint resample trick). No new model:
-      it adds a mask volume + a per-step composite to the existing ImageToImage loop. The
-      diffusion-based sibling of the tracked GAN context-encoder examples/Inpainting.
-      CPU/ulimit-bounded smoke run on the same tiny fixtures, writing before/masked/after.
+- [ ] CogVideoX native text-to-VIDEO DiT importer (BuildCogVideoXFromSafeTensors[Ex] +
+      TCogVideoXConfig / ReadCogVideoXConfigFromJSONFile in neuralpretrained.pas, e.g.
+      THUDM/CogVideoX-2b) — a SELF-CONTAINED native video generator, architecturally
+      distinct from the tracked AnimateDiff task (which only bolts a temporal module onto a
+      frozen SD UNet and DEPENDS ON the still-open SD UNet importer). CogVideoX has no UNet
+      dependency: it is a flat MMDiT-style transformer over a flattened (frame x height x
+      width) latent token sequence with T5 text conditioning (BuildT5FromSafeTensors already
+      importable) + expert adaLN-Zero modulation (reuse the landed DiT DiTModCond / TNNetFiLM
+      gate recipe, exactly as MMDiT/PixArt/VAR). The ONE genuinely-new primitive is the 3D
+      CAUSAL-CONV VAE used to encode/decode the spatio-temporal latent: a depth-axis causal
+      temporal convolution (left-pad the time axis, no peeking at future frames) over a
+      (NumFrames, H*W, C) channel-major reshape — a new TNNetCausalConv3D leaf (or a thin
+      temporal-causal wrapper over the landed Conv1D/DepthwiseConv1D so each spatial cell
+      convolves along time), the video analogue of the VideoMAE space<->time transpose
+      already used in the AnimateDiff plan. Second new piece: 3D RoPE over the
+      (t,h,w)-factored positions, expressible by concatenating three axis-wise RoPE leaves.
+      Scope v1 as: the DiT denoiser forward + the 3D-causal VAE DECODE tail, reusing the
+      landed TNNetDiffusionScheduler (DDIM / DPM-Solver++(2M)) loop — NO training. Pico
+      parity test TestCogVideoXParity asserting < 1e-4 on one denoiser step AND one VAE-decode
+      against a self-contained torch/numpy float64 oracle (diffusers not required), with a
+      committed pico fixture tiny_cogvideox.* + tools/make_pico_cogvideox_fixture.py (tiny
+      hidden/depth/heads, 2-frame latent). Follow-up: an examples/TextToVideo writing a short
+      animated GIF/PPM sequence on CPU; shares the writer with the AnimateDiff example.
+- [ ] VAR (Visual AutoRegressive, next-scale prediction) image-generation follow-ups
+      (class-conditional v1 LANDED — BuildVARFromSafeTensors[Ex] + ReadVARConfigFromJSONFile
+      + the TNNetScaledDotProductAttention.BlockCausalSegments scale-mask flag):
+  - [ ] VAR full multi-scale autoregressive SAMPLING loop (next-scale interpolation/
+        up-sampling between predicted levels + residual-VQ decode to pixels via the
+        landed BuildVqModelFromSafeTensors family) + an examples/VARGenerate demo. v1
+        only runs the forward producing one scale's logits; the coarse-to-fine
+        generation loop and pixel decode are deferred.
+  - [ ] VAR text-conditioned (Infinity-style) variant — replace the single class token
+        with caller-supplied text encoder states + cross-attention (the PixArt-style
+        text-cond path), the analogue of the DiT->PixArt step.
+  - [ ] VAR real-checkpoint parity (FoundationVision/var) — v1 parity is vs a
+        first-principles float64 oracle on a random pico config; verify against a sliced
+        real checkpoint once weights are available (the make_pico_*_fixture slicer
+        pattern).
 - [ ] Structured-vision accuracy eval harness for the imported DETECTION and DENSE-
       prediction backbones (EvaluateDetectionMAP / EvaluateSegmentationMIoU + reports in
       neuralimagemetrics.pas, plus examples/VisionEval) — the verification backstop that
@@ -868,46 +1123,41 @@ rather than acted on.
       HF float64 on the decoder logits for a fixed image+task token + an examples/
       Florence2 that captions and box-detects one tiny CPU image. First "spatial-output-
       as-text" importer; complements the box/mask importers (DETR/SAM/Mask2Former).
-- [ ] Qwen2-VL / Qwen2.5-VL vision-language importer (BuildQwen2VLFromSafeTensors, e.g.
-      Qwen/Qwen2-VL-2B-Instruct or Qwen/Qwen2.5-VL-3B-Instruct) — referenced today only
-      as "the open Qwen2-VL M-RoPE path" in the PaliGemma task but never tracked as a
-      deliverable. The genuinely NEW piece, distinct from every landed/tracked VLM
-      (LLaVA causal-everywhere, PaliGemma prefix-LM bidirectional), is **M-RoPE
-      (Multimodal Rotary Position Embedding)**: the RoPE position index is split into
-      three sections (temporal, height, width) so image/video tokens carry a 3-D grid
-      position while text tokens fall back to the scalar 1-D index — a new rotary-index
-      assignment threaded through the decoder's RoPE, NOT a new attention math. The
-      vision side is a native-dynamic-resolution ViT (window attention over a variable
-      patch grid + a small patch-merger MLP that 2x2-pools spatial tokens), reusing the
-      landed BuildClipVisionTower/SigLIP ViT path and the LLaVA prompt-assembly splice
-      (so it shares that open helper). Scope v1 to a SINGLE still image + text, greedy
-      decode on CPU. Genuinely new code: the M-RoPE 3-D position builder (reuse the
-      existing rotary tables, only the per-token index changes) + the spatial patch
-      merger + the variable-grid window-attention mask. Pico parity vs HF float64 on
-      next-token logits for a mixed image+text prompt (reuse make_pico_*_fixture.py) +
-      an examples/Qwen2VLDescribe that captions a tiny image (ulimit-bounded). The
-      M-RoPE index builder also unblocks Qwen2.5-VL video (the temporal section) later.
-- [ ] CLIPSeg text-prompted zero-shot segmentation importer (BuildCLIPSegFromSafeTensors,
-      e.g. CIDAS/clipseg-rd64-refined) — a genuinely DISTINCT dense-prediction output
-      modality: given an image and a free-text prompt (or a prompt image), it emits a
-      single-channel binary mask for "whatever the prompt names", with NO fixed label
-      set. Different from every landed/tracked segmentation vertical — SegFormer
-      (per-pixel argmax over a FIXED class list), SAM (geometric point/box prompts, no
-      semantics), Mask2Former (closed-vocab query set), and OWL-ViT (open-vocab BOXES,
-      not masks). The genuinely new piece is the lightweight FiLM-conditioned transformer
-      DECODER: the frozen CLIP ViT image tower (reuse BuildClipVisionTower) exposes a few
-      intermediate hidden states which are projected and FiLM-modulated by the CLIP TEXT
-      embedding of the prompt (BuildClipFromSafeTensors text tower), then upsampled
-      through a small transposed-conv stack to a HxW logit map. Reuses the landed CLIP
-      dual encoder + the TNNetDeMaxPool/conv upsampling blocks the VAE decoder already
-      uses; the new code is the conditional decoder wiring (text-embedding -> per-token
-      affine modulation of the visual tokens). Scope v1 to a SINGLE text prompt -> one
-      mask, inference-only. Pico parity vs an HF float64 oracle on the decoder logit map
-      for a fixed (image, prompt) pair (reuse make_pico_*_fixture.py) + an
-      examples/CLIPSegPrompt that writes a binary-mask PPM for a hand-typed prompt over a
-      tiny CPU image. First "text-prompt -> dense mask" importer; the segmentation
-      counterpart to the landed open-vocab DETECTION (OWL-ViT).
-- [ ] TinyNeRF novel-view-synthesis example (examples/TinyNeRF) — a brand-new
+- [ ] Qwen2-VL / Qwen2.5-VL vision-language importer follow-ups (M-RoPE v1 LANDED —
+      BuildQwen2VLFromSafeTensors[Ex] + TNNetMRotaryEmbedding + Qwen2VLRunLogits):
+  - [ ] The native-dynamic-resolution VISION TOWER (Conv3d patch embed + window
+        attention over a variable patch grid + the 2x2 spatial patch-merger MLP) — v1
+        takes the MERGED visual tokens as input (precomputed). Reuse the landed
+        BuildClipVisionTower/SigLIP ViT path; build the variable-grid window-attention
+        mask + the patch merger. Then drop the precomputed-embeds shortcut.
+  - [ ] Qwen2.5-VL specifics (the temporal M-RoPE section for VIDEO, the per-frame
+        time_interval, the windowed full-attention layer pattern, MRoPE rope_deltas for
+        incremental decode) — the M-RoPE index builder already has the temporal slot.
+  - [ ] Multi-image / multi-modality prompts (the v1 position builder assumes ONE
+        contiguous still-image block); generalize the get_rope_index grouping.
+  - [ ] Real-checkpoint parity (Qwen/Qwen2-VL-2B-Instruct) + an examples/Qwen2VLDescribe
+        that captions a tiny CPU image (ulimit-bounded).
+- [ ] CLIPSeg text-prompted zero-shot segmentation importer follow-ups
+      (BuildCLIPSegFromSafeTensors[WithConfig] + TCLIPSegConfig + RunCLIPSeg LANDED —
+      frozen CLIP dual encoder + a FiLM-conditioned transposed-conv decoder emitting a
+      single-channel mask for a free-text prompt; pico parity TestCLIPSegParity < 1e-4
+      vs the REAL HF CLIPSegForImageSegmentation float64 oracle; examples/CLIPSegPrompt
+      writes a binary-mask PPM; v1 = single text prompt -> one mask, inference-only,
+      use_complex_transposed_convolution = false):
+  - [ ] Real-checkpoint parity (CIDAS/clipseg-rd64-refined) — verify against the REAL
+        HF checkpoint logits (the offline env could not download it; the pico parity
+        already pins the math vs the real HF classes). Needs the ~600 MB checkpoint +
+        CLIP tokenizer ids; also exercises the default extract_layers [3,6,9] and
+        reduce_dim 64 (the pico uses [0,1]/6).
+  - [ ] Complex transposed-conv upsample (use_complex_transposed_convolution=true) —
+        the rd64-refined head uses the 3-stage Conv2d(3x3)+ReLU+2× ConvTranspose2d
+        decoder instead of the single ConvTranspose2d v1 ships; add the 3x3 conv + the
+        two-stage DepthToSpace upsample and a pico parity for that branch.
+  - [ ] Image-prompt (visual) conditioning — CLIPSeg can also condition on a PROMPT
+        IMAGE (conditional_pixel_values -> clip.get_image_features pooled embedding)
+        instead of text; v1 does text only. Add a RunCLIPSegImagePrompt path reusing
+        the vision tower's pooled class-token embedding as the conditional vector.
+- [X] TinyNeRF novel-view-synthesis example (examples/TinyNeRF) — a brand-new
       output modality for the tree: a learned implicit 3-D scene that renders an image
       from an arbitrary camera pose, the first differentiable VOLUME RENDERER in the
       repo. Distinct from every landed image generator (DiT/PixArt diffusion,
@@ -927,6 +1177,79 @@ rather than acted on.
       ulimit/time-bounded smoke run; no importer, no external download. Establishes the
       ray-marching + alpha-compositing primitive that any future 3-D / view-synthesis
       work (instant-NGP hash grids, 3D Gaussian splatting) would build on.
+
+- [ ] BEiT / data2vec-vision ViT importer follow-ups (BuildBeitFromSafeTensors[Ex]
+      /WithConfig + TBeitConfig + ReadBeitConfigFromJSONFile/BeitConfigToString
+      LANDED, e.g. microsoft/beit-base-patch16-224, facebook/data2vec-vision-base —
+      full global attention with a per-LAYER learned cls-aware relative_position_bias
+      reusing TNNetWindowAttention (no new leaf layer) + LayerScale (TNNetChannelMul)
+      on both branches, learnable cls token, query/value biased + KEY bias-free, no
+      absolute positions; BeitBuildRelPosIndex matches HF generate_relative_position_index
+      exactly; pico parity TestBeitParity/TestBeitConfigFromJSONFile < 1e-4 vs HF
+      float64 oracle via tools/beit_tiny_fixture.py + tests/fixtures/tiny_beit.*):
+  - [ ] use_shared_relative_position_bias=true (one model-level table shared by
+        all layers) is rejected; only the per-layer table is wired.
+  - [ ] use_absolute_position_embeddings=true and use_relative_position_bias=
+        false variants rejected (the published checkpoints don't use them).
+  - [ ] No top-level BuildFromPretrained dispatch entry / classifier head /
+        ForImageClassification wrapper yet (builder returns token hidden states;
+        use_mean_pooling pooler LayerNorm + patch mean left to the caller).
+  - [ ] BEiTv2 (vector-quantized) not validated.
+
+- [ ] OPT decoder importer (BuildOPTFromSafeTensors[Ex], model_type "opt", e.g.
+      facebook/opt-125m..2.7b) — LANDED (learned-absolute +2-offset positions,
+      LayerNorm + ReLU FFN, pre-/post-LN per do_layer_norm_before, optional
+      final_layer_norm, BuildFromPretrained dispatch; TestOPTNextTokenLogitsParity
+      < 1e-4 vs float64 HF OPTForCausalLM). Open follow-ups:
+  - [ ] word_embed_proj_dim real-checkpoint parity: the equal-dims pico
+        fixture leaves the project_in/project_out path (opt-350m) UNTESTED.
+        Add an opt-350m-shaped pico fixture (hidden != word_embed_proj_dim) to
+        exercise the two bias-free projections end-to-end.
+  - [ ] do_layer_norm_before=false (POST-LN, opt-350m) pico parity: the build
+        path is wired but only the PRE-LN (125m) wiring is covered by a
+        fixture. Add a post-LN pico fixture.
+  - [ ] Wire OPT as the blip2-opt decode tail (the original motivation): feed
+        the Q-Former query/text states into BuildOPTFromSafeTensors and verify
+        a BLIP-2-OPT generation path.
+
+- [ ] DepthPro (Apple ml-depth-pro) sharp metric monocular-depth importer
+      (BuildDepthProFromSafeTensors[Ex], apple/DepthPro). DISTINCT from the landed
+      DPT and Depth-Anything importers, which produce RELATIVE/affine-invariant
+      depth at a single patch scale: DepthPro is a MULTI-SCALE patch-ViT that runs a
+      shared ViT (reuse the landed DINOv2/ViT tower) over the image at several
+      resolutions, splits each into overlapping 384px patches, then fuses the
+      per-scale patch features through a DPT-style convolutional decoder to emit a
+      high-resolution METRIC depth map (plus a focal-length head for true scale).
+      The genuinely new code is the image->patch tiling + per-scale feature
+      stitching/merge and the metric (not normalized) depth head; the ViT encoder
+      and the DPT fusion-block decoder are already landed and reusable. Real value:
+      first sharp, boundary-accurate, metric-depth model in the tree. Pico-fixture
+      smoke + a real-checkpoint parity follow-up.
+
+- [ ] LCM sampler wiring into examples/LatentTextToImage (TNNetLCMScheduler /
+      LCMStep/LCMSample multistep loop + boundary scalings LANDED in
+      neuraldiffusion.pas, commit 8557e99, tests in TestNeuralDiffusion.pas):
+      expose the LCM scheduler as an opt-in sampler in the examples/LatentTextToImage
+      pipeline so the landed pico PixArt/DiT + VAE renders in ~4 steps (no cond/uncond
+      double pass); add it to the example's regression smoke. A short note on the
+      matching LCM-distillation objective (consistency loss to a teacher) is enough
+      for v1.
+
+- [ ] RT-DETR real-time detection-transformer importer
+      (BuildRtDetrFromSafeTensors[Ex], e.g. PekingU/rtdetr_r50vd). A DISTINCT
+      detection model family from the landed DETR (ResNet+sinusoidal+vanilla
+      transformer decoder, the slow NMS-free baseline): RT-DETR is the real-time
+      redesign — a CNN backbone (reuse the landed ResNet) feeding an EFFICIENT
+      HYBRID ENCODER (intra-scale single-layer self-attention "AIFI" on the top
+      feature map only + a CNN cross-scale fusion / PANet-style neck) and an
+      IoU-AWARE / uncertainty-minimal QUERY SELECTION that seeds the decoder from
+      the top-K encoder proposals instead of fixed learned object queries. The new
+      code is the hybrid-encoder neck (AIFI block + CCFM up/down conv fusion) and
+      the top-K query-selection head; the transformer decoder, box/class heads, and
+      the DETR-style post-process can be reused from the landed DETR. Real value:
+      the first real-time / production-grade detector importer (DETR is reference,
+      not deployable speed). Pico-fixture smoke + a real-checkpoint top-1/box
+      parity follow-up via the structured-vision detection eval harness.
 
 ## Layer follow-ups that fix real limitations
 

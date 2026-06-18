@@ -54,7 +54,8 @@ import numpy as np
 import torch
 from safetensors.torch import save_file
 from transformers import (EncodecConfig, MusicgenConfig,
-                          MusicgenForConditionalGeneration, T5Config)
+                          MusicgenForConditionalGeneration, T5Config,
+                          T5ForConditionalGeneration)
 from transformers.models.musicgen.configuration_musicgen import (
     MusicgenDecoderConfig)
 from transformers.models.musicgen.modeling_musicgen import MusicgenForCausalLM
@@ -79,12 +80,17 @@ def build_config():
     t5 = T5Config(vocab_size=40, d_model=TEXT_DMODEL, d_ff=16, num_layers=2,
                   num_heads=2, d_kv=6, relative_attention_num_buckets=8,
                   relative_attention_max_distance=16)
+    # EnCodec codebook_size MUST equal the MusicGen decoder VOCAB so the
+    # generated code ids are valid RVQ indices for the codec decoder. The
+    # target_bandwidths list controls how many RVQ stages decode; the lowest
+    # band already yields >= NUM_CODEBOOKS quantizers at this frame rate.
     enc = EncodecConfig(sampling_rate=8000, audio_channels=1, normalize=False,
                         hidden_size=8, num_filters=2, num_residual_layers=1,
                         upsampling_ratios=[2, 2], kernel_size=7,
                         last_kernel_size=7, residual_kernel_size=3,
                         dilation_growth_rate=2, compress=2, num_lstm_layers=1,
-                        codebook_size=VOCAB, codebook_dim=8)
+                        codebook_size=VOCAB, codebook_dim=8,
+                        target_bandwidths=[48.0])
     dec = MusicgenDecoderConfig(
         vocab_size=VOCAB, max_position_embeddings=64,
         num_hidden_layers=DEC_LAYERS, ffn_dim=FFN,
@@ -100,6 +106,22 @@ def main():
     np.random.seed(SEED)
     cfg = build_config()
     model = MusicgenForConditionalGeneration(cfg).eval()
+
+    # The default HF init (std 0.02 / Xavier) makes the cross-attention
+    # conditioning path so weak that, over a 16-way greedy argmax, the encoder
+    # states barely move the predicted code ids - the generation looks
+    # text-INDEPENDENT. Amplify the conditioning path (enc_to_dec_proj and the
+    # decoder cross-attention k/v/q/out projections) to O(1) so the prompt
+    # genuinely steers generation; this is the same "re-randomize pico weights
+    # to a useful scale" trick used for the ModernBERT fixtures. The decoder
+    # logit-parity oracle below is recomputed AFTER this scaling (and from the
+    # SAME state dict that is saved), so importer parity is preserved exactly.
+    with torch.no_grad():
+        model.enc_to_dec_proj.weight.mul_(12.0)
+        for layer in model.decoder.model.decoder.layers:
+            ca = layer.encoder_attn
+            for proj in (ca.q_proj, ca.k_proj, ca.v_proj, ca.out_proj):
+                proj.weight.mul_(4.0)
 
     # float64 oracle
     model_f64 = MusicgenForConditionalGeneration(cfg).double().eval()
@@ -204,6 +226,86 @@ def main():
     }
     with open(os.path.join(FIX, "tiny_musicgen_ref.json"), "w") as f:
         json.dump(ref, f)
+
+    # ---- matched T5 text fixture (for examples/MusicGenText) ----
+    # The end-to-end text-conditioned example wires the REAL T5 encoder, whose
+    # d_model MUST equal TEXT_DMODEL so its hidden states feed enc_to_dec_proj.
+    # MusicGen ships only a T5 ENCODER, but the standalone T5 importer
+    # (BuildT5FromSafeTensors) builds the full encoder+decoder pair and needs
+    # the decoder tower's weights too. So emit a FULL standard
+    # T5ForConditionalGeneration checkpoint at the matched config (a drop-in
+    # T5 fixture); the example only runs its ENCODER. The encoder hidden states
+    # are identical to MusicGen's text encoder up to the random init - parity
+    # between the two T5 instances is NOT required (the example/test only need a
+    # deterministic, shape-matched encoder), so a fresh standard T5 is correct.
+    t5_full = T5ForConditionalGeneration(
+        T5Config(**cfg.text_encoder.to_dict())).eval()
+    t5_sd = {k: v.to(torch.float32).contiguous()
+             for k, v in t5_full.state_dict().items()}
+    # HF T5 ties shared/embed_tokens/lm_head; drop the aliases the importer
+    # reconstructs from shared.weight (matches real-checkpoint _tied keys).
+    t5_sd.pop("encoder.embed_tokens.weight", None)
+    t5_sd.pop("decoder.embed_tokens.weight", None)
+    if cfg.text_encoder.tie_word_embeddings:
+        t5_sd.pop("lm_head.weight", None)
+    save_file(t5_sd, os.path.join(FIX, "tiny_musicgen_t5enc.safetensors"))
+    t5cfg = cfg.text_encoder
+    t5_out_cfg = {
+        "model_type": "t5",
+        "d_model": t5cfg.d_model,
+        "d_kv": t5cfg.d_kv,
+        "d_ff": t5cfg.d_ff,
+        "num_layers": t5cfg.num_layers,
+        "num_decoder_layers": t5cfg.num_decoder_layers,
+        "num_heads": t5cfg.num_heads,
+        "vocab_size": t5cfg.vocab_size,
+        "relative_attention_num_buckets": t5cfg.relative_attention_num_buckets,
+        "relative_attention_max_distance":
+            t5cfg.relative_attention_max_distance,
+        "layer_norm_epsilon": t5cfg.layer_norm_epsilon,
+        "feed_forward_proj": t5cfg.feed_forward_proj,
+        "tie_word_embeddings": t5cfg.tie_word_embeddings,
+    }
+    with open(os.path.join(FIX, "tiny_musicgen_t5enc_config.json"), "w") as f:
+        json.dump(t5_out_cfg, f, indent=1)
+
+    # ---- matched EnCodec DECODER fixture (for examples/MusicGenText) ----
+    # codebook_size == VOCAB so MusicGen-generated ids are valid RVQ indices.
+    ec_sd = {}
+    for k, v in model.state_dict().items():
+        if not k.startswith("audio_encoder."):
+            continue
+        nk = k[len("audio_encoder."):]
+        ec_sd[nk] = v.to(torch.float32).contiguous()
+    save_file(ec_sd, os.path.join(FIX, "tiny_musicgen_encodec.safetensors"))
+    eccfg = cfg.audio_encoder
+    ec_out_cfg = {
+        "model_type": "encodec",
+        "sampling_rate": eccfg.sampling_rate,
+        "audio_channels": eccfg.audio_channels,
+        "normalize": eccfg.normalize,
+        "hidden_size": eccfg.hidden_size,
+        "num_filters": eccfg.num_filters,
+        "num_residual_layers": eccfg.num_residual_layers,
+        "upsampling_ratios": eccfg.upsampling_ratios,
+        "norm_type": eccfg.norm_type,
+        "kernel_size": eccfg.kernel_size,
+        "last_kernel_size": eccfg.last_kernel_size,
+        "residual_kernel_size": eccfg.residual_kernel_size,
+        "dilation_growth_rate": eccfg.dilation_growth_rate,
+        "use_causal_conv": eccfg.use_causal_conv,
+        "pad_mode": eccfg.pad_mode,
+        "compress": eccfg.compress,
+        "num_lstm_layers": eccfg.num_lstm_layers,
+        "trim_right_ratio": eccfg.trim_right_ratio,
+        "codebook_size": eccfg.codebook_size,
+        "codebook_dim": eccfg.codebook_dim,
+        "target_bandwidths": eccfg.target_bandwidths,
+    }
+    with open(os.path.join(FIX, "tiny_musicgen_encodec_config.json"), "w") as f:
+        json.dump(ec_out_cfg, f, indent=1)
+    print("wrote tiny_musicgen_t5enc.safetensors (%d tensors)" % len(t5_sd))
+    print("wrote tiny_musicgen_encodec.safetensors (%d tensors)" % len(ec_sd))
 
     st = os.path.getsize(os.path.join(FIX, "tiny_musicgen.safetensors"))
     print("wrote tiny_musicgen.safetensors %d bytes" % st)

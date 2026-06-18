@@ -382,8 +382,10 @@ var
   Sc, Mn: array[0..7] of byte;
   q: byte;
   Outp: PSingle;
+  NumBlocksM1: Int64;
 begin
-  for b := 0 to NumBlocks - 1 do
+  NumBlocksM1 := NumBlocks - 1;
+  for b := 0 to NumBlocksM1 do
   begin
     Base := Raw + b * GGUF_Q4_K_BLOCK_BYTES;
     d    := DecodeF16(PWord(Base)^);
@@ -435,8 +437,10 @@ var
   Sc, Mn: array[0..7] of byte;
   ql, qh, q: byte;
   Outp: PSingle;
+  NumBlocksM1: Int64;
 begin
-  for b := 0 to NumBlocks - 1 do
+  NumBlocksM1 := NumBlocks - 1;
+  for b := 0 to NumBlocksM1 do
   begin
     Base := Raw + b * GGUF_Q5_K_BLOCK_BYTES;
     d    := DecodeF16(PWord(Base)^);
@@ -493,8 +497,11 @@ var
   d, dmin: single;
   scale, mn, q: byte;
   Outp: PSingle;
+  NumBlocksM1, QKM1: Int64;
 begin
-  for b := 0 to NumBlocks - 1 do
+  NumBlocksM1 := NumBlocks - 1;
+  QKM1 := GGUF_QK_K - 1;
+  for b := 0 to NumBlocksM1 do
   begin
     Base   := Raw + b * GGUF_Q2_K_BLOCK_BYTES;
     ScPtr  := Base;            // 16 bytes scale|min
@@ -502,7 +509,7 @@ begin
     d    := DecodeF16(PWord(Base + 80)^);
     dmin := DecodeF16(PWord(Base + 82)^);
     Outp := Dest + b * GGUF_QK_K;
-    for e := 0 to GGUF_QK_K - 1 do
+    for e := 0 to QKM1 do
     begin
       c := e div 128;
       s := (e mod 128) div 32;
@@ -536,8 +543,11 @@ var
   Scales: PShortInt;
   Outp: PSingle;
   ql, qh, idx, qv: integer;
+  NumBlocksM1, QKM1: Int64;
 begin
-  for b := 0 to NumBlocks - 1 do
+  NumBlocksM1 := NumBlocks - 1;
+  QKM1 := GGUF_QK_K - 1;
+  for b := 0 to NumBlocksM1 do
   begin
     Base := Raw + b * GGUF_Q6_K_BLOCK_BYTES;
     QlPtr := Base;
@@ -554,7 +564,7 @@ begin
     //              < 64, else high nibble.
     //   qh byte  = (i div 128)*32 + (i mod 32); 2-bit field at shift
     //              2*((i mod 128) div 32).
-    for i := 0 to GGUF_QK_K - 1 do
+    for i := 0 to QKM1 do
     begin
       ql := (QlPtr + ((i div 128) * 64 + (i mod 64)))^;
       if (i mod 128) < 64 then
@@ -621,7 +631,7 @@ var
   F32: single;
   F64: double;
   Cnt: QWord;
-  i: integer;
+  i, CntM1: integer;
 
   // Reads one scalar of type TypeId into IntOut/FloatOut/StrOut.
   procedure ReadScalar(TypeId: integer; out IntOut: Int64;
@@ -674,7 +684,8 @@ begin
       SetLength(Meta.ArrInt, Cnt);
       SetLength(Meta.ArrNum, Cnt);
     end;
-    for i := 0 to integer(Cnt) - 1 do
+    CntM1 := integer(Cnt) - 1;
+    for i := 0 to CntM1 do
     begin
       ReadScalar(Meta.ArrElemType, I64, F64, Meta.StrVal);
       if Meta.ArrElemType = GGUF_TYPE_STRING then
@@ -699,6 +710,7 @@ var
   Magic, U32: cardinal;
   TensorCount, KVCount, U64: QWord;
   i, j, NDims: integer;
+  KVCountM1, TensorCountM1, NDimsM1, FTensorsHi: integer;
   Dims: array of Int64;
   NumElements, ByteSize, DataStart: Int64;
 begin
@@ -727,7 +739,8 @@ begin
 
   // ---- metadata KV pairs ----
   SetLength(FMeta, KVCount);
-  for i := 0 to integer(KVCount) - 1 do
+  KVCountM1 := integer(KVCount) - 1;
+  for i := 0 to KVCountM1 do
   begin
     FMeta[i].Key := ReadHeaderString(Stream);
     if FMeta[i].Key = '' then
@@ -745,7 +758,8 @@ begin
   SetLength(FTensors, TensorCount);
   SetLength(FGGMLTypes, TensorCount);
   Dims := nil;
-  for i := 0 to integer(TensorCount) - 1 do
+  TensorCountM1 := integer(TensorCount) - 1;
+  for i := 0 to TensorCountM1 do
   begin
     FTensors[i].Name := ReadHeaderString(Stream);
     FTensors[i].Shard := 0;
@@ -763,8 +777,9 @@ begin
         'gguf: tensor "%s" has implausible n_dims %d: %s',
         [FTensors[i].Name, NDims, FFileName]);
     SetLength(Dims, NDims);
+    NDimsM1 := NDims - 1;
     NumElements := 1;
-    for j := 0 to NDims - 1 do
+    for j := 0 to NDimsM1 do
     begin
       Stream.ReadBuffer(U64, 8);
       if (U64 = 0) or (U64 > QWord(High(integer))) then
@@ -778,7 +793,7 @@ begin
     // row-major (contiguous axis LAST), so the dims are reversed: a HF
     // [out, in] matrix arrives as [in, out] and is served as [out, in].
     SetLength(FTensors[i].Shape, NDims);
-    for j := 0 to NDims - 1 do
+    for j := 0 to NDimsM1 do
       FTensors[i].Shape[j] := Dims[NDims - 1 - j];
     Stream.ReadBuffer(U32, 4);
     FGGMLTypes[i] := integer(U32);
@@ -822,7 +837,8 @@ begin
       [DataStart, Stream.Size, FFileName]);
   FDataStarts[0] := DataStart;
   FDataSizes[0] := Stream.Size - DataStart;
-  for i := 0 to High(FTensors) do
+  FTensorsHi := High(FTensors);
+  for i := 0 to FTensorsHi do
     if (FTensors[i].DataBegin < 0) or
        (FTensors[i].DataEnd > FDataSizes[0]) then
       raise EGGUFError.CreateFmt(
@@ -833,9 +849,10 @@ end;
 
 function TNNetGGUFReader.FindMeta(const pKey: string): integer;
 var
-  i: integer;
+  i, MetaHi: integer;
 begin
-  for i := 0 to High(FMeta) do
+  MetaHi := High(FMeta);
+  for i := 0 to MetaHi do
     if FMeta[i].Key = pKey then exit(i);
   Result := -1;
 end;
@@ -1039,9 +1056,10 @@ end;
 function TNNetGGUFReader.DeinterleaveHeadDimFor(
   const pName: string): integer;
 var
-  i: integer;
+  i, NamesHi: integer;
 begin
-  for i := 0 to High(FDeinterleaveNames) do
+  NamesHi := High(FDeinterleaveNames);
+  for i := 0 to NamesHi do
     if FDeinterleaveNames[i] = pName then
       exit(FDeinterleaveHeadDim[i]);
   Result := 0;
@@ -1053,6 +1071,7 @@ var
   Idx, GGMLType, HeadDim, HalfDim: integer;
   NumElements, i, BlockCnt, NumBlocks: Int64;
   Rows, RowLen, r, RowInHead, SrcRow: Int64;
+  NumElementsM1, NumBlocksM1, Q8ElemsM1, RowsM1, RowLenM1: Int64;
   RawBytes: TBytes;
   Scale: single;
   WordPtr: PWord;
@@ -1080,6 +1099,8 @@ begin
       [pName, NumElements, FFileName]);
   Dest.ReSize(integer(NumElements), 1, 1);
   if NumElements = 0 then exit;
+  NumElementsM1 := NumElements - 1;
+  Q8ElemsM1 := GGUF_Q8_0_BLOCK_ELEMS - 1;
   SetLength(RawBytes, FTensors[Idx].DataEnd - FTensors[Idx].DataBegin);
   FStreams[0].Position := FDataStarts[0] + FTensors[Idx].DataBegin;
   FStreams[0].ReadBuffer(RawBytes[0], Length(RawBytes));
@@ -1087,7 +1108,7 @@ begin
     GGML_TYPE_F32:
     begin
       SinglePtr := PSingle(@RawBytes[0]);
-      for i := 0 to NumElements - 1 do
+      for i := 0 to NumElementsM1 do
       begin
         Dest.FData[i] := SinglePtr^;
         Inc(SinglePtr);
@@ -1096,7 +1117,7 @@ begin
     GGML_TYPE_F16:
     begin
       WordPtr := PWord(@RawBytes[0]);
-      for i := 0 to NumElements - 1 do
+      for i := 0 to NumElementsM1 do
       begin
         Dest.FData[i] := DecodeF16(WordPtr^);
         Inc(WordPtr);
@@ -1109,13 +1130,14 @@ begin
       // multiple of 32 (validated at parse), so blocks never straddle
       // rows and a sequential sweep decodes the flat row-major order.
       NumBlocks := NumElements div GGUF_Q8_0_BLOCK_ELEMS;
-      for BlockCnt := 0 to NumBlocks - 1 do
+      NumBlocksM1 := NumBlocks - 1;
+      for BlockCnt := 0 to NumBlocksM1 do
       begin
         Scale := DecodeF16(
           PWord(@RawBytes[BlockCnt * GGUF_Q8_0_BLOCK_BYTES])^);
         QuantPtr := PShortInt(
           @RawBytes[BlockCnt * GGUF_Q8_0_BLOCK_BYTES + 2]);
-        for i := 0 to GGUF_Q8_0_BLOCK_ELEMS - 1 do
+        for i := 0 to Q8ElemsM1 do
         begin
           Dest.FData[BlockCnt * GGUF_Q8_0_BLOCK_ELEMS + i] :=
             Scale * QuantPtr^;
@@ -1160,15 +1182,17 @@ begin
     RowLen := NumElements div Rows;
     HalfDim := HeadDim div 2;
     SetLength(Tmp, NumElements);
-    for i := 0 to NumElements - 1 do Tmp[i] := Dest.FData[i];
-    for r := 0 to Rows - 1 do
+    for i := 0 to NumElementsM1 do Tmp[i] := Dest.FData[i];
+    RowsM1 := Rows - 1;
+    RowLenM1 := RowLen - 1;
+    for r := 0 to RowsM1 do
     begin
       RowInHead := r mod HeadDim;
       if RowInHead < HalfDim then
         SrcRow := (r - RowInHead) + 2 * RowInHead
       else
         SrcRow := (r - RowInHead) + 2 * (RowInHead - HalfDim) + 1;
-      for i := 0 to RowLen - 1 do
+      for i := 0 to RowLenM1 do
         Dest.FData[r * RowLen + i] := Tmp[SrcRow * RowLen + i];
     end;
   end;
@@ -1191,18 +1215,20 @@ end;
 
 function TNNetGGUFWriter.FindMeta(const pKey: string): integer;
 var
-  i: integer;
+  i, MetaHi: integer;
 begin
-  for i := 0 to High(FMeta) do
+  MetaHi := High(FMeta);
+  for i := 0 to MetaHi do
     if FMeta[i].Key = pKey then exit(i);
   Result := -1;
 end;
 
 function TNNetGGUFWriter.FindTensor(const pName: string): integer;
 var
-  i: integer;
+  i, TensorsHi: integer;
 begin
-  for i := 0 to High(FTensors) do
+  TensorsHi := High(FTensors);
+  for i := 0 to TensorsHi do
     if FTensors[i].Name = pName then exit(i);
   Result := -1;
 end;
@@ -1278,13 +1304,14 @@ procedure TNNetGGUFWriter.AddMetaStringArray(const pKey: string;
   const Values: array of string);
 var
   M: TGGUFMetaValue;
-  i: integer;
+  i, ValuesHi: integer;
 begin
   M := Default(TGGUFMetaValue);
   M.Key := pKey; M.ValueType := GGUF_TYPE_ARRAY;
   M.ArrElemType := GGUF_TYPE_STRING;
   SetLength(M.ArrStr, Length(Values));
-  for i := 0 to High(Values) do M.ArrStr[i] := Values[i];
+  ValuesHi := High(Values);
+  for i := 0 to ValuesHi do M.ArrStr[i] := Values[i];
   AddMeta(M);
 end;
 
@@ -1292,14 +1319,15 @@ procedure TNNetGGUFWriter.AddMetaFloat32Array(const pKey: string;
   const Values: array of single);
 var
   M: TGGUFMetaValue;
-  i: integer;
+  i, ValuesHi: integer;
 begin
   M := Default(TGGUFMetaValue);
   M.Key := pKey; M.ValueType := GGUF_TYPE_ARRAY;
   M.ArrElemType := GGUF_TYPE_FLOAT32;
   SetLength(M.ArrNum, Length(Values));
   SetLength(M.ArrInt, Length(Values));
-  for i := 0 to High(Values) do M.ArrNum[i] := Values[i];
+  ValuesHi := High(Values);
+  for i := 0 to ValuesHi do M.ArrNum[i] := Values[i];
   AddMeta(M);
 end;
 
@@ -1307,14 +1335,15 @@ procedure TNNetGGUFWriter.AddMetaInt32Array(const pKey: string;
   const Values: array of Int64);
 var
   M: TGGUFMetaValue;
-  i: integer;
+  i, ValuesHi: integer;
 begin
   M := Default(TGGUFMetaValue);
   M.Key := pKey; M.ValueType := GGUF_TYPE_ARRAY;
   M.ArrElemType := GGUF_TYPE_INT32;
   SetLength(M.ArrInt, Length(Values));
   SetLength(M.ArrNum, Length(Values));
-  for i := 0 to High(Values) do M.ArrInt[i] := Values[i];
+  ValuesHi := High(Values);
+  for i := 0 to ValuesHi do M.ArrInt[i] := Values[i];
   AddMeta(M);
 end;
 
@@ -1329,6 +1358,8 @@ var
   ScalePtr: PWord;
   AbsMax, V, Scale, InvScale, Q: single;
   Pending: TGGUFPendingTensor;
+  pShapeHi: integer;
+  NumElementsM1, NumBlocksM1, Q8ElemsM1: Int64;
 begin
   if FSaved then
     raise EGGUFError.Create('gguf writer: AddTensorFlat after SaveToFile.');
@@ -1341,7 +1372,8 @@ begin
     raise EGGUFError.CreateFmt(
       'gguf writer: tensor "%s" needs at least one dimension.', [pName]);
   NumElements := 1;
-  for i := 0 to High(pShape) do
+  pShapeHi := High(pShape);
+  for i := 0 to pShapeHi do
   begin
     if pShape[i] <= 0 then
       raise EGGUFError.CreateFmt(
@@ -1353,11 +1385,13 @@ begin
     raise EGGUFError.CreateFmt(
       'gguf writer: tensor "%s" shape implies %d elements but the source ' +
       'holds %d.', [pName, NumElements, Src.Size]);
+  NumElementsM1 := NumElements - 1;
+  Q8ElemsM1 := GGUF_Q8_0_BLOCK_ELEMS - 1;
 
   Pending := Default(TGGUFPendingTensor);
   Pending.Name := pName;
   SetLength(Pending.Shape, Length(pShape));
-  for i := 0 to High(pShape) do Pending.Shape[i] := pShape[i];
+  for i := 0 to pShapeHi do Pending.Shape[i] := pShape[i];
 
   case pDType of
     gwF32:
@@ -1365,7 +1399,7 @@ begin
       Pending.GGMLType := GGML_TYPE_F32;
       SetLength(Pending.Data, NumElements * 4);
       SinglePtr := PSingle(@Pending.Data[0]);
-      for i := 0 to NumElements - 1 do
+      for i := 0 to NumElementsM1 do
       begin
         SinglePtr^ := Src.FData[i];
         Inc(SinglePtr);
@@ -1376,7 +1410,7 @@ begin
       Pending.GGMLType := GGML_TYPE_F16;
       SetLength(Pending.Data, NumElements * 2);
       WordPtr := PWord(@Pending.Data[0]);
-      for i := 0 to NumElements - 1 do
+      for i := 0 to NumElementsM1 do
       begin
         WordPtr^ := EncodeF16(Src.FData[i]);
         Inc(WordPtr);
@@ -1392,14 +1426,15 @@ begin
           [pName, ContigDim, GGUF_Q8_0_BLOCK_ELEMS]);
       Pending.GGMLType := GGML_TYPE_Q8_0;
       NumBlocks := NumElements div GGUF_Q8_0_BLOCK_ELEMS;
+      NumBlocksM1 := NumBlocks - 1;
       SetLength(Pending.Data, NumBlocks * GGUF_Q8_0_BLOCK_BYTES);
-      for b := 0 to NumBlocks - 1 do
+      for b := 0 to NumBlocksM1 do
       begin
         // ggml quantize_row_q8_0: scale = max|x| / 127, quants = round(x/scale)
         // clamped to int8; the scale is stored as f16. Mirrors gguf's
         // quants.quantize(..., Q8_0) so a reader round-trip is bit-stable.
         AbsMax := 0;
-        for i := 0 to GGUF_Q8_0_BLOCK_ELEMS - 1 do
+        for i := 0 to Q8ElemsM1 do
         begin
           V := Abs(Src.FData[b * GGUF_Q8_0_BLOCK_ELEMS + i]);
           if V > AbsMax then AbsMax := V;
@@ -1409,7 +1444,7 @@ begin
         ScalePtr := PWord(@Pending.Data[b * GGUF_Q8_0_BLOCK_BYTES]);
         ScalePtr^ := EncodeF16(Scale);
         QuantPtr := PShortInt(@Pending.Data[b * GGUF_Q8_0_BLOCK_BYTES + 2]);
-        for i := 0 to GGUF_Q8_0_BLOCK_ELEMS - 1 do
+        for i := 0 to Q8ElemsM1 do
         begin
           Q := Src.FData[b * GGUF_Q8_0_BLOCK_ELEMS + i] * InvScale;
           // round-half-away-from-zero then clamp to [-127, 127]
@@ -1438,6 +1473,8 @@ var
   ScalePtr: PWord;
   Scale, Q: single;
   Pending: TGGUFPendingTensor;
+  pShapeHi, NumRowsM1: integer;
+  RowBlocksM1, Q8ElemsM1: Int64;
 begin
   if FSaved then
     raise EGGUFError.Create('gguf writer: AddTensorFlatInt8 after SaveToFile.');
@@ -1454,7 +1491,9 @@ begin
       'gguf writer: tensor "%s" int8 source has non-positive geometry ' +
       '(%d rows x %d).', [pName, NumRows, VS]);
   NumElements := 1;
-  for i := 0 to High(pShape) do
+  pShapeHi := High(pShape);
+  Q8ElemsM1 := GGUF_Q8_0_BLOCK_ELEMS - 1;
+  for i := 0 to pShapeHi do
   begin
     if pShape[i] <= 0 then
       raise EGGUFError.CreateFmt(
@@ -1493,15 +1532,17 @@ begin
   Pending := Default(TGGUFPendingTensor);
   Pending.Name := pName;
   SetLength(Pending.Shape, Length(pShape));
-  for i := 0 to High(pShape) do Pending.Shape[i] := pShape[i];
+  for i := 0 to pShapeHi do Pending.Shape[i] := pShape[i];
   Pending.GGMLType := GGML_TYPE_Q8_0;
   NumBlocks := NumElements div GGUF_Q8_0_BLOCK_ELEMS;
   SetLength(Pending.Data, NumBlocks * GGUF_Q8_0_BLOCK_BYTES);
   RowBlocks := VS div GGUF_Q8_0_BLOCK_ELEMS;
-  for r := 0 to NumRows - 1 do
+  NumRowsM1 := NumRows - 1;
+  RowBlocksM1 := RowBlocks - 1;
+  for r := 0 to NumRowsM1 do
   begin
     RowBase := Int64(r) * VS;
-    for b := 0 to RowBlocks - 1 do
+    for b := 0 to RowBlocksM1 do
     begin
       BlockBase := RowBase + b * GGUF_Q8_0_BLOCK_ELEMS;
       // Per-block absmax over the int8 CODES; the true FP32 value is
@@ -1509,7 +1550,7 @@ begin
       // block scale = max|x|/127. The row scale rides into d only; the
       // quants q[i] = round(code[i]*127 / AbsMaxCode) are scale-invariant.
       AbsMaxCode := 0;
-      for i := 0 to GGUF_Q8_0_BLOCK_ELEMS - 1 do
+      for i := 0 to Q8ElemsM1 do
       begin
         c := pCodes[BlockBase + i];
         if c < 0 then c := -c;
@@ -1521,7 +1562,7 @@ begin
       ScalePtr^ := EncodeF16(Scale);
       QuantPtr := PShortInt(@Pending.Data[(Int64(r) * RowBlocks + b) *
         GGUF_Q8_0_BLOCK_BYTES + 2]);
-      for i := 0 to GGUF_Q8_0_BLOCK_ELEMS - 1 do
+      for i := 0 to Q8ElemsM1 do
       begin
         if AbsMaxCode = 0 then
           e := 0
@@ -1566,7 +1607,7 @@ var
   U32: cardinal;
   U64: QWord;
   Cnt: QWord;
-  i: integer;
+  i, CntM1: integer;
   ElemType: cardinal;
 
   procedure WriteScalar(TypeId: integer; const M: TGGUFMetaValue;
@@ -1615,7 +1656,8 @@ begin
     if Meta.ArrElemType = GGUF_TYPE_FLOAT32 then
       Cnt := Length(Meta.ArrNum);
     Stream.WriteBuffer(Cnt, 8);
-    for i := 0 to integer(Cnt) - 1 do
+    CntM1 := integer(Cnt) - 1;
+    for i := 0 to CntM1 do
     begin
       case Meta.ArrElemType of
         GGUF_TYPE_STRING: WriteScalar(GGUF_TYPE_STRING, Meta, i, -1);
@@ -1644,6 +1686,7 @@ var
   U64, Offset: QWord;
   TensorCount, KVCount: QWord;
   i, j, NDims: integer;
+  MetaHi, TensorsHi, NDimsM1: integer;
   Pad: array of byte;
   PadLen: Int64;
   HeaderEnd, DataStart: Int64;
@@ -1668,7 +1711,8 @@ begin
     Stream.WriteBuffer(KVCount, 8);
 
     // ---- metadata KV pairs ----
-    for i := 0 to High(FMeta) do
+    MetaHi := High(FMeta);
+    for i := 0 to MetaHi do
     begin
       WriteHeaderString(Stream, FMeta[i].Key);
       U32 := cardinal(FMeta[i].ValueType);
@@ -1679,14 +1723,16 @@ begin
     // ---- tensor infos (offsets computed below, relative to data section) ----
     // First pass: compute each tensor's aligned offset into the data blob.
     Offset := 0;
-    for i := 0 to High(FTensors) do
+    TensorsHi := High(FTensors);
+    for i := 0 to TensorsHi do
     begin
       WriteHeaderString(Stream, FTensors[i].Name);
       NDims := Length(FTensors[i].Shape);
+      NDimsM1 := NDims - 1;
       U32 := cardinal(NDims);
       Stream.WriteBuffer(U32, 4);
       // ggml stores the contiguous axis FIRST: reverse the row-major shape.
-      for j := 0 to NDims - 1 do
+      for j := 0 to NDimsM1 do
       begin
         U64 := QWord(FTensors[i].Shape[NDims - 1 - j]);
         Stream.WriteBuffer(U64, 8);
@@ -1711,7 +1757,7 @@ begin
       Stream.WriteBuffer(Pad[0], PadLen);
     end;
     // Write each tensor's payload, padding between tensors to FAlignment.
-    for i := 0 to High(FTensors) do
+    for i := 0 to TensorsHi do
     begin
       if Length(FTensors[i].Data) > 0 then
         Stream.WriteBuffer(FTensors[i].Data[0], Length(FTensors[i].Data));

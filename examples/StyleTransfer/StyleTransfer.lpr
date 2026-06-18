@@ -55,7 +55,7 @@ type
   end;
 
 // ---------------------------------------------------------------------------
-// Gram-matrix helper (the genuinely new piece of code). Given a feature map
+// Gram-matrix helper (the new piece of code). Given a feature map
 // V of shape (W, H, C) (depth-contiguous in V.FData), compute the normalised
 // Gram matrix G[i,j] = (1/(C*H*W)) * sum_{x,y} V[x,y,i] * V[x,y,j].  G is
 // returned as a (C, C, 1) volume (G.FData[i*C + j]).

@@ -6,7 +6,7 @@ program OpenVocabDetection;
 // whatever text you encode, decided at inference time.
 //
 // The demo loads the two nets returned by BuildOwlViTFromSafeTensors
-// (neural/neuralpretrained.pas - the repo's first zero-shot detector), runs one
+// (neural/neuralpretrained.pas), runs one
 // tiny image through the CLIP ViT image + detection head, embeds a couple of
 // free-text query token-id sequences through the CLIP text tower
 // (OwlViTQueryEmbedding), and reads off the (patch, query) match scores and

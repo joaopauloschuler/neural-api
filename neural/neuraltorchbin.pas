@@ -238,7 +238,7 @@ var
   WeightMapObj: TJSONObject;
   BaseDir, ShardFile, MappedTensor: string;
   ShardFiles: TStringList;
-  i, ShardIdx, TensorIdx: integer;
+  i, ShardIdx, TensorIdx, WeightMapCount, WeightMapMax: integer;
 begin
   BaseDir := ExtractFilePath(pIndexFileName);
   IndexText := TStringList.Create;
@@ -263,12 +263,14 @@ begin
         'torch.bin: index has no "weight_map" object: %s',
         [pIndexFileName]);
     WeightMapObj := TJSONObject(WeightMap);
-    if WeightMapObj.Count = 0 then
+    WeightMapCount := WeightMapObj.Count;
+    if WeightMapCount = 0 then
       raise ETorchBinError.CreateFmt(
         'torch.bin: index "weight_map" is empty: %s', [pIndexFileName]);
     // Open each distinct shard once, in first-mention order.
     ShardFiles.Sorted := False;
-    for i := 0 to WeightMapObj.Count - 1 do
+    WeightMapMax := WeightMapCount - 1;
+    for i := 0 to WeightMapMax do
     begin
       if not (WeightMapObj.Items[i].JSONType = jtString) then
         raise ETorchBinError.CreateFmt(
@@ -283,7 +285,7 @@ begin
     end;
     // Validate the weight_map against the shard state_dicts: every mapped
     // tensor must exist and live in the shard the index claims.
-    for i := 0 to WeightMapObj.Count - 1 do
+    for i := 0 to WeightMapMax do
     begin
       MappedTensor := WeightMapObj.Names[i];
       ShardFile := WeightMapObj.Items[i].AsString;
@@ -319,6 +321,7 @@ var
   CDirOfs: QWord;
   Z64EocdOfs: QWord;
   EntryCnt: QWord;
+  EntryMax: QWord;
   Sig: Cardinal;
   Method: word;
   CompSize32, Size32, LocalOfs32: Cardinal;
@@ -329,6 +332,7 @@ var
   ExtraPos, FieldId, FieldLen: integer;
   ZipIdx: integer;
   SlashPos: integer;
+  ZipNamesHi: integer;
 
   function ReadWordAt(const Buf: TBytes; Ofs: Int64): word;
   begin
@@ -407,7 +411,8 @@ begin
   SetLength(FZipCompSize, EntryCount);
   SetLength(FZipSize, EntryCount);
   SetLength(FZipLocalOfs, EntryCount);
-  for EntryCnt := 0 to EntryCount - 1 do
+  EntryMax := EntryCount - 1;
+  for EntryCnt := 0 to EntryMax do
   begin
     SetLength(Tail, 46);
     Stream.ReadBuffer(Tail[0], 46);
@@ -469,7 +474,8 @@ begin
   // torch.save; "" is tolerated for hand-rolled containers).
   FArchivePrefix := '';
   ZipIdx := -1;
-  for ScanPos := 0 to High(FZipNames) do
+  ZipNamesHi := High(FZipNames);
+  for ScanPos := 0 to ZipNamesHi do
     if (FZipNames[ScanPos] = 'data.pkl') or
        (Copy(FZipNames[ScanPos],
          Length(FZipNames[ScanPos]) - 8, 9) = '/data.pkl') then
@@ -487,9 +493,10 @@ end;
 
 function TNNetTorchBinReader.FindZipEntry(const pEntryName: string): integer;
 var
-  i: integer;
+  i, ZipNamesHi: integer;
 begin
-  for i := 0 to High(FZipNames) do
+  ZipNamesHi := High(FZipNames);
+  for i := 0 to ZipNamesHi do
     if FZipNames[i] = pEntryName then exit(i);
   Result := -1;
 end;
@@ -544,11 +551,13 @@ var
   PickleLen: Int64;
   Root: TPickleNode;
   i, j, TensorCnt: integer;
+  OwnedCount: integer;
   EntryIdx: integer;
   ElemSize: integer;
   NumElements, ExpectedStride, ByteBegin, ByteEnd: Int64;
   Node, ValNode: TPickleNode;
   EntryName: string;
+  MemoHi, LongLenM1, NodeItemsHi, RootKeysHi, NodeShapeHi, OwnedMax: integer;
 
   procedure Fail(const Msg: string);
   begin
@@ -696,7 +705,7 @@ var
   function ApplyReduce(Callable, Args: TPickleNode): TPickleNode;
   var
     PersId, SizeT, StrideT, StorageT: TPickleNode;
-    n: integer;
+    n, SizeItemsHi: integer;
   begin
     if Callable.Kind <> pkGlobal then
       Fail('REDUCE callable is not a GLOBAL');
@@ -746,7 +755,8 @@ var
         Fail('_rebuild_tensor_v2 size/stride are not matching tuples');
       SetLength(Result.Shape, Length(SizeT.Items));
       SetLength(Result.Stride, Length(StrideT.Items));
-      for n := 0 to High(SizeT.Items) do
+      SizeItemsHi := High(SizeT.Items);
+      for n := 0 to SizeItemsHi do
       begin
         Result.Shape[n] := NodeAsInt(SizeT.Items[n], 'tensor size');
         Result.Stride[n] := NodeAsInt(StrideT.Items[n], 'tensor stride');
@@ -788,7 +798,8 @@ begin
     StackTop := -1;
     SetLength(Stack, 64);
     SetLength(Memo, 256);
-    for i := 0 to High(Memo) do Memo[i] := nil;
+    MemoHi := High(Memo);
+    for i := 0 to MemoHi do Memo[i] := nil;
     MemoNext := 0;
     Root := nil;
     Stopped := false;
@@ -838,7 +849,8 @@ begin
             if LongLen > 8 then
               Fail('LONG1 integer wider than 64 bits');
             Accum := 0;
-            for i := 0 to LongLen - 1 do
+            LongLenM1 := LongLen - 1;
+            for i := 0 to LongLenM1 do
               Accum := Accum or (QWord(ReadByte) shl (8 * i));
             // Sign-extend from the top bit of the last byte.
             if (LongLen > 0) and (LongLen < 8) and
@@ -953,7 +965,8 @@ begin
             ValNode := Stack[StackTop];
             j := Length(ValNode.Items);
             SetLength(ValNode.Items, j + Length(Node.Items));
-            for i := 0 to High(Node.Items) do
+            NodeItemsHi := High(Node.Items);
+            for i := 0 to NodeItemsHi do
               ValNode.Items[j + i] := Node.Items[i];
           end;
         $95: // FRAME (protocol 4): 8-byte length hint, ignored
@@ -974,7 +987,8 @@ begin
     // shards are rejected via FindTensor below).
     TensorCnt := Length(FTensors);
     SetLength(FTensors, TensorCnt + Length(Root.Keys));
-    for i := 0 to High(Root.Keys) do
+    RootKeysHi := High(Root.Keys);
+    for i := 0 to RootKeysHi do
     begin
       if (Root.Keys[i].Kind <> pkStr) then
         raise ETorchBinError.CreateFmt(
@@ -1008,7 +1022,8 @@ begin
       FTensors[TensorCnt].DType :=
         DTypeOfStorageClass(Node.StorageDType, ElemSize);
       SetLength(FTensors[TensorCnt].Shape, Length(Node.Shape));
-      for j := 0 to High(Node.Shape) do
+      NodeShapeHi := High(Node.Shape);
+      for j := 0 to NodeShapeHi do
         FTensors[TensorCnt].Shape[j] := Node.Shape[j];
       // Resolve the storage zip entry to an ABSOLUTE byte range
       // (FDataStarts[FCurShard] = 0, so the inherited LoadTensorFlat reads
@@ -1046,7 +1061,9 @@ begin
     end;
     SetLength(FTensors, TensorCnt);
   finally
-    for i := 0 to Owned.Count - 1 do
+    OwnedCount := Owned.Count;
+    OwnedMax := OwnedCount - 1;
+    for i := 0 to OwnedMax do
       TObject(Owned[i]).Free;
     Owned.Free;
   end;

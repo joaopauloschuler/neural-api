@@ -391,9 +391,10 @@ end;
 
 destructor TNNetSafeTensorsReader.Destroy;
 var
-  i: integer;
+  i, Hi: integer;
 begin
-  for i := 0 to High(FStreams) do
+  Hi := High(FStreams);
+  for i := 0 to Hi do
     FStreams[i].Free;
   inherited Destroy;
 end;
@@ -446,7 +447,7 @@ var
   WeightMapObj: TJSONObject;
   BaseDir, ShardFile, MappedTensor: string;
   ShardFiles: TStringList;
-  i, ShardIdx, TensorIdx: integer;
+  i, ShardIdx, TensorIdx, WeightMapCount, MaxIdx: integer;
 begin
   BaseDir := ExtractFilePath(pIndexFileName);
   IndexText := TStringList.Create;
@@ -476,7 +477,9 @@ begin
         'safetensors: index "weight_map" is empty: %s', [pIndexFileName]);
     // Open each distinct shard once, in first-mention order.
     ShardFiles.Sorted := False;
-    for i := 0 to WeightMapObj.Count - 1 do
+    WeightMapCount := WeightMapObj.Count;
+    MaxIdx := WeightMapCount - 1;
+    for i := 0 to MaxIdx do
     begin
       if not (WeightMapObj.Items[i].JSONType = jtString) then
         raise ESafeTensorsError.CreateFmt(
@@ -491,7 +494,7 @@ begin
     end;
     // Validate the weight_map against the shard headers: every mapped
     // tensor must exist and live in the shard the index claims.
-    for i := 0 to WeightMapObj.Count - 1 do
+    for i := 0 to MaxIdx do
     begin
       MappedTensor := WeightMapObj.Names[i];
       ShardFile := WeightMapObj.Items[i].AsString;
@@ -520,7 +523,7 @@ var
   Root: TJSONData;
   Obj, TensorObj: TJSONObject;
   ShapeArr, OffsArr: TJSONArray;
-  i, j, TensorCnt: integer;
+  i, j, TensorCnt, ObjCount, ShapeCount, ObjMax, ShapeMax: integer;
   ExpectedBytes, NumElements: Int64;
   ByteSize: integer;
   ShardName: string;
@@ -542,8 +545,10 @@ begin
     // Appends to FTensors: with a sharded checkpoint each shard's header
     // contributes its own tensors (TensorCnt is the global write cursor).
     TensorCnt := Length(FTensors);
-    SetLength(FTensors, TensorCnt + Obj.Count);
-    for i := 0 to Obj.Count - 1 do
+    ObjCount := Obj.Count;
+    SetLength(FTensors, TensorCnt + ObjCount);
+    ObjMax := ObjCount - 1;
+    for i := 0 to ObjMax do
     begin
       if Obj.Names[i] = '__metadata__' then continue;
       if not (Obj.Items[i] is TJSONObject) then
@@ -569,9 +574,11 @@ begin
           'safetensors: tensor "%s" has no shape array: %s',
           [Obj.Names[i], ShardName]);
       ShapeArr := TJSONArray(TensorObj.Find('shape'));
-      SetLength(FTensors[TensorCnt].Shape, ShapeArr.Count);
+      ShapeCount := ShapeArr.Count;
+      SetLength(FTensors[TensorCnt].Shape, ShapeCount);
       NumElements := 1;
-      for j := 0 to ShapeArr.Count - 1 do
+      ShapeMax := ShapeCount - 1;
+      for j := 0 to ShapeMax do
       begin
         FTensors[TensorCnt].Shape[j] := ShapeArr.Items[j].AsInt64;
         if FTensors[TensorCnt].Shape[j] < 0 then
@@ -624,9 +631,10 @@ end;
 
 function TNNetSafeTensorsReader.FindTensor(const pName: string): integer;
 var
-  i: integer;
+  i, Hi: integer;
 begin
-  for i := 0 to High(FTensors) do
+  Hi := High(FTensors);
+  for i := 0 to Hi do
     if FTensors[i].Name = pName then exit(i);
   Result := -1;
 end;
@@ -655,11 +663,12 @@ end;
 function TNNetSafeTensorsReader.RenameTensorPrefix(
   const pOldPrefix, pNewPrefix: string): integer;
 var
-  i, OldLen: integer;
+  i, OldLen, Hi: integer;
 begin
   Result := 0;
   OldLen := Length(pOldPrefix);
-  for i := 0 to High(FTensors) do
+  Hi := High(FTensors);
+  for i := 0 to Hi do
     if (Length(FTensors[i].Name) >= OldLen) and
        (Copy(FTensors[i].Name, 1, OldLen) = pOldPrefix) then
     begin
@@ -672,12 +681,13 @@ end;
 function TNNetSafeTensorsReader.RemoveTensorsWithPrefix(
   const pPrefix: string): integer;
 var
-  i, PfxLen, WriteIdx: integer;
+  i, PfxLen, WriteIdx, Hi: integer;
 begin
   Result := 0;
   PfxLen := Length(pPrefix);
   WriteIdx := 0;
-  for i := 0 to High(FTensors) do
+  Hi := High(FTensors);
+  for i := 0 to Hi do
   begin
     if (Length(FTensors[i].Name) >= PfxLen) and
        (Copy(FTensors[i].Name, 1, PfxLen) = pPrefix) then
@@ -747,22 +757,24 @@ end;
 function TNNetSafeTensorsReader.ElementCount(const pName: string): Int64;
 var
   Info: TSafeTensorInfo;
-  i: integer;
+  i, Hi: integer;
 begin
   Info := GetInfo(pName);
   Result := 1;
-  for i := 0 to High(Info.Shape) do
+  Hi := High(Info.Shape);
+  for i := 0 to Hi do
     Result := Result * Info.Shape[i];
 end;
 
 function TNNetSafeTensorsReader.ShapeAsString(const pName: string): string;
 var
   Info: TSafeTensorInfo;
-  i: integer;
+  i, Hi: integer;
 begin
   Info := GetInfo(pName);
   Result := '[';
-  for i := 0 to High(Info.Shape) do
+  Hi := High(Info.Shape);
+  for i := 0 to Hi do
   begin
     if i > 0 then Result := Result + ', ';
     Result := Result + IntToStr(Info.Shape[i]);
@@ -774,7 +786,7 @@ procedure TNNetSafeTensorsReader.LoadTensorFlat(const pName: string;
   Dest: TNNetVolume);
 var
   Info: TSafeTensorInfo;
-  NumElements, i: Int64;
+  NumElements, i, MaxIdx: Int64;
   RawBytes: TBytes;
   WordPtr: PWord;
   SinglePtr: PSingle;
@@ -792,13 +804,14 @@ begin
       [pName, NumElements, FFileName]);
   Dest.ReSize(integer(NumElements), 1, 1);
   if NumElements = 0 then exit;
+  MaxIdx := NumElements - 1;
   SetLength(RawBytes, Info.DataEnd - Info.DataBegin);
   FStreams[Info.Shard].Position := FDataStarts[Info.Shard] + Info.DataBegin;
   FStreams[Info.Shard].ReadBuffer(RawBytes[0], Length(RawBytes));
   if Info.DType = 'F32' then
   begin
     SinglePtr := PSingle(@RawBytes[0]);
-    for i := 0 to NumElements - 1 do
+    for i := 0 to MaxIdx do
     begin
       Dest.FData[i] := SinglePtr^;
       Inc(SinglePtr);
@@ -807,7 +820,7 @@ begin
   else if Info.DType = 'F16' then
   begin
     WordPtr := PWord(@RawBytes[0]);
-    for i := 0 to NumElements - 1 do
+    for i := 0 to MaxIdx do
     begin
       Dest.FData[i] := DecodeF16(WordPtr^);
       Inc(WordPtr);
@@ -816,7 +829,7 @@ begin
   else if Info.DType = 'BF16' then
   begin
     WordPtr := PWord(@RawBytes[0]);
-    for i := 0 to NumElements - 1 do
+    for i := 0 to MaxIdx do
     begin
       Dest.FData[i] := DecodeBF16(WordPtr^);
       Inc(WordPtr);
@@ -825,7 +838,7 @@ begin
   else // I64
   begin
     Int64Ptr := PInt64(@RawBytes[0]);
-    for i := 0 to NumElements - 1 do
+    for i := 0 to MaxIdx do
     begin
       Dest.FData[i] := Int64Ptr^;
       Inc(Int64Ptr);
@@ -854,11 +867,12 @@ end;
 // (including UTF-8 multi-byte sequences) passes through verbatim.
 function JsonEscapeString(const S: string): string;
 var
-  i: integer;
+  i, Len: integer;
   C: char;
 begin
   Result := '';
-  for i := 1 to Length(S) do
+  Len := Length(S);
+  for i := 1 to Len do
   begin
     C := S[i];
     case C of
@@ -896,9 +910,10 @@ end;
 
 function TNNetSafeTensorsWriter.FindTensor(const pName: string): integer;
 var
-  i: integer;
+  i, Hi: integer;
 begin
-  for i := 0 to High(FTensors) do
+  Hi := High(FTensors);
+  for i := 0 to Hi do
     if FTensors[i].Name = pName then exit(i);
   Result := -1;
 end;
@@ -921,8 +936,8 @@ procedure TNNetSafeTensorsWriter.AddTensorFlat(const pName: string;
   const pShape: array of Int64; Src: TNNetVolume;
   pDType: TSafeTensorsWriteDType = stwF32);
 var
-  NumElements: Int64;
-  i, Idx, ElemBytes: integer;
+  NumElements, MaxIdx: Int64;
+  i, Idx, ElemBytes, ShapeHi: integer;
   SinglePtr: PSingle;
   WordPtr: PWord;
 begin
@@ -938,7 +953,8 @@ begin
     raise ESafeTensorsError.CreateFmt(
       'safetensors: duplicate tensor name "%s": %s', [pName, FFileName]);
   NumElements := 1;
-  for i := 0 to High(pShape) do
+  ShapeHi := High(pShape);
+  for i := 0 to ShapeHi do
   begin
     if pShape[i] < 0 then
       raise ESafeTensorsError.CreateFmt(
@@ -959,10 +975,11 @@ begin
   FTensors[Idx].Name := pName;
   FTensors[Idx].DType := pDType;
   SetLength(FTensors[Idx].Shape, Length(pShape));
-  for i := 0 to High(pShape) do
+  for i := 0 to ShapeHi do
     FTensors[Idx].Shape[i] := pShape[i];
   if pDType = stwF32 then ElemBytes := 4 else ElemBytes := 2;
   SetLength(FTensors[Idx].Data, NumElements * ElemBytes);
+  MaxIdx := NumElements - 1;
   if NumElements > 0 then
   begin
     case pDType of
@@ -971,7 +988,7 @@ begin
           // Element-wise copy through PSingle so the bytes are F32 even if
           // TNeuralFloat is ever widened.
           SinglePtr := PSingle(@FTensors[Idx].Data[0]);
-          for i := 0 to NumElements - 1 do
+          for i := 0 to MaxIdx do
           begin
             SinglePtr^ := Src.FData[i];
             Inc(SinglePtr);
@@ -980,7 +997,7 @@ begin
       stwF16:
         begin
           WordPtr := PWord(@FTensors[Idx].Data[0]);
-          for i := 0 to NumElements - 1 do
+          for i := 0 to MaxIdx do
           begin
             WordPtr^ := EncodeF16(Src.FData[i]);
             Inc(WordPtr);
@@ -989,7 +1006,7 @@ begin
       stwBF16:
         begin
           WordPtr := PWord(@FTensors[Idx].Data[0]);
-          for i := 0 to NumElements - 1 do
+          for i := 0 to MaxIdx do
           begin
             WordPtr^ := EncodeBF16(Src.FData[i]);
             Inc(WordPtr);
@@ -1006,7 +1023,7 @@ end;
 
 function TNNetSafeTensorsWriter.BuildHeaderJson: string;
 var
-  i, j: integer;
+  i, j, MetaCount, MetaMax, Hi: integer;
   Offset: Int64;
   Entry: string;
 begin
@@ -1014,10 +1031,12 @@ begin
   // with no locale-dependent formatting; offsets/shapes are integers and
   // strings go through JsonEscapeString.
   Result := '{';
-  if FMetaKeys.Count > 0 then
+  MetaCount := FMetaKeys.Count;
+  if MetaCount > 0 then
   begin
     Result := Result + '"__metadata__":{';
-    for i := 0 to FMetaKeys.Count - 1 do
+    MetaMax := MetaCount - 1;
+    for i := 0 to MetaMax do
     begin
       if i > 0 then Result := Result + ',';
       Result := Result + '"' + JsonEscapeString(FMetaKeys[i]) + '":"' +
@@ -1027,7 +1046,8 @@ begin
     if Length(FTensors) > 0 then Result := Result + ',';
   end;
   Offset := 0;
-  for i := 0 to High(FTensors) do
+  Hi := High(FTensors);
+  for i := 0 to Hi do
   begin
     if i > 0 then Result := Result + ',';
     case FTensors[i].DType of
@@ -1060,7 +1080,7 @@ var
   HeaderJson: string;
   HeaderLen: QWord;
   Stream: TFileStream;
-  i: integer;
+  i, Hi: integer;
 begin
   if FSaved then
     raise ESafeTensorsError.CreateFmt(
@@ -1075,7 +1095,8 @@ begin
     {$ENDIF}
     Stream.WriteBuffer(HeaderLen, 8); // little-endian uint64
     Stream.WriteBuffer(HeaderJson[1], Length(HeaderJson));
-    for i := 0 to High(FTensors) do
+    Hi := High(FTensors);
+    for i := 0 to Hi do
       if Length(FTensors[i].Data) > 0 then
         Stream.WriteBuffer(FTensors[i].Data[0], Length(FTensors[i].Data));
   finally
@@ -1090,12 +1111,13 @@ end;
 // Neurons[0] - the packed [NeuronCount, SizeY, SizeX, Depth] layout applies.
 function LayerHasUniformNeurons(L: TNNetLayer): boolean;
 var
-  j: integer;
+  j, MaxNeurons: integer;
 begin
-  for j := 1 to L.Neurons.Count - 1 do
-    if (L.Neurons[j].Weights.SizeX <> L.Neurons[0].Weights.SizeX) or
-       (L.Neurons[j].Weights.SizeY <> L.Neurons[0].Weights.SizeY) or
-       (L.Neurons[j].Weights.Depth <> L.Neurons[0].Weights.Depth) then
+  MaxNeurons := L.Neurons.Count - 1;
+  for j := 1 to MaxNeurons do
+    if (L.FArrNeurons[j].Weights.SizeX <> L.FArrNeurons[0].Weights.SizeX) or
+       (L.FArrNeurons[j].Weights.SizeY <> L.FArrNeurons[0].Weights.SizeY) or
+       (L.FArrNeurons[j].Weights.Depth <> L.FArrNeurons[0].Weights.Depth) then
       exit(false);
   Result := true;
 end;
@@ -1118,46 +1140,53 @@ var
   Tmp: TNNetVolume;
   L: TNNetLayer;
   W: TNNetVolume;
-  LayerIdx, j, i, Cursor: integer;
+  LayerIdx, j, i, Cursor, NeuronCount, MaxNeurons, LayerMax, WSizeM1: integer;
   Base: string;
 begin
   Writer := TNNetSafeTensorsWriter.Create(pFileName);
   Tmp := TNNetVolume.Create;
+  // Build the fast neuron mirror so the indexed FArrNeurons access below is
+  // valid for every layer (even ones not yet run through a forward pass).
+  NN.BuildArrNeurons();
   try
     Writer.SetMetadata('format', 'cai-neural-api/v1');
-    for LayerIdx := 0 to NN.Layers.Count - 1 do
+    LayerMax := NN.Layers.Count - 1;
+    for LayerIdx := 0 to LayerMax do
     begin
       L := NN.Layers[LayerIdx];
-      if (L.Neurons.Count = 0) or L.LinkedNeurons then continue;
+      NeuronCount := L.Neurons.Count;
+      MaxNeurons := NeuronCount - 1;
+      if (NeuronCount = 0) or L.LinkedNeurons then continue;
       Base := LayerTensorBaseName(NN, LayerIdx);
       if LayerHasUniformNeurons(L) then
       begin
-        W := L.Neurons[0].Weights;
-        Tmp.ReSize(L.Neurons.Count * W.Size, 1, 1);
+        W := L.FArrNeurons[0].Weights;
+        Tmp.ReSize(NeuronCount * W.Size, 1, 1);
         Cursor := 0;
-        for j := 0 to L.Neurons.Count - 1 do
-          for i := 0 to W.Size - 1 do
+        WSizeM1 := W.Size - 1;
+        for j := 0 to MaxNeurons do
+          for i := 0 to WSizeM1 do
           begin
-            Tmp.FData[Cursor] := L.Neurons[j].Weights.FData[i];
+            Tmp.FData[Cursor] := L.FArrNeurons[j].Weights.FData[i];
             Inc(Cursor);
           end;
         Writer.AddTensorFlat(Base + '.weights',
-          [L.Neurons.Count, W.SizeY, W.SizeX, W.Depth], Tmp, pDType);
+          [NeuronCount, W.SizeY, W.SizeX, W.Depth], Tmp, pDType);
       end
       else
       begin
-        for j := 0 to L.Neurons.Count - 1 do
+        for j := 0 to MaxNeurons do
         begin
-          W := L.Neurons[j].Weights;
+          W := L.FArrNeurons[j].Weights;
           Writer.AddTensorFlat(
             Base + '.neuron_' + IntToStr(j) + '.weights',
             [W.SizeY, W.SizeX, W.Depth], W, pDType);
         end;
       end;
-      Tmp.ReSize(L.Neurons.Count, 1, 1);
-      for j := 0 to L.Neurons.Count - 1 do
-        Tmp.FData[j] := L.Neurons[j].BiasWeight;
-      Writer.AddTensorFlat(Base + '.biases', [L.Neurons.Count], Tmp, pDType);
+      Tmp.ReSize(NeuronCount, 1, 1);
+      for j := 0 to MaxNeurons do
+        Tmp.FData[j] := L.FArrNeurons[j].BiasWeight;
+      Writer.AddTensorFlat(Base + '.biases', [NeuronCount], Tmp, pDType);
     end;
     Writer.SaveToFile;
   finally
@@ -1171,7 +1200,7 @@ var
   Reader: TNNetSafeTensorsReader;
   Tmp: TNNetVolume;
   L: TNNetLayer;
-  LayerIdx, j, i, Cursor: integer;
+  LayerIdx, j, i, Cursor, NeuronCount, MaxNeurons, LayerMax: integer;
   Base, TensorName: string;
 
   procedure LoadExpected(const pName: string; ExpectedElements: integer);
@@ -1191,37 +1220,43 @@ var
 begin
   Reader := TNNetSafeTensorsReader.Create(pFileName);
   Tmp := TNNetVolume.Create;
+  // Build the fast neuron mirror so the indexed FArrNeurons access below is
+  // valid for every layer (even ones not yet run through a forward pass).
+  NN.BuildArrNeurons();
   try
-    for LayerIdx := 0 to NN.Layers.Count - 1 do
+    LayerMax := NN.Layers.Count - 1;
+    for LayerIdx := 0 to LayerMax do
     begin
       L := NN.Layers[LayerIdx];
-      if (L.Neurons.Count = 0) or L.LinkedNeurons then continue;
+      NeuronCount := L.Neurons.Count;
+      MaxNeurons := NeuronCount - 1;
+      if (NeuronCount = 0) or L.LinkedNeurons then continue;
       Base := LayerTensorBaseName(NN, LayerIdx);
       if LayerHasUniformNeurons(L) then
       begin
         LoadExpected(Base + '.weights',
-          L.Neurons.Count * L.Neurons[0].Weights.Size);
+          NeuronCount * L.FArrNeurons[0].Weights.Size);
         Cursor := 0;
-        for j := 0 to L.Neurons.Count - 1 do
-          for i := 0 to L.Neurons[j].Weights.Size - 1 do
+        for j := 0 to MaxNeurons do
+          for i := 0 to L.FArrNeurons[j].Weights.Size - 1 do
           begin
-            L.Neurons[j].Weights.FData[i] := Tmp.FData[Cursor];
+            L.FArrNeurons[j].Weights.FData[i] := Tmp.FData[Cursor];
             Inc(Cursor);
           end;
       end
       else
       begin
-        for j := 0 to L.Neurons.Count - 1 do
+        for j := 0 to MaxNeurons do
         begin
           TensorName := Base + '.neuron_' + IntToStr(j) + '.weights';
-          LoadExpected(TensorName, L.Neurons[j].Weights.Size);
-          for i := 0 to L.Neurons[j].Weights.Size - 1 do
-            L.Neurons[j].Weights.FData[i] := Tmp.FData[i];
+          LoadExpected(TensorName, L.FArrNeurons[j].Weights.Size);
+          for i := 0 to L.FArrNeurons[j].Weights.Size - 1 do
+            L.FArrNeurons[j].Weights.FData[i] := Tmp.FData[i];
         end;
       end;
-      LoadExpected(Base + '.biases', L.Neurons.Count);
-      for j := 0 to L.Neurons.Count - 1 do
-        L.Neurons[j].BiasWeight := Tmp.FData[j];
+      LoadExpected(Base + '.biases', NeuronCount);
+      for j := 0 to MaxNeurons do
+        L.FArrNeurons[j].BiasWeight := Tmp.FData[j];
       L.ClearInertia();
       L.ClearDeltas();
       L.FlushWeightCache();

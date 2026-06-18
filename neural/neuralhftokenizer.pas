@@ -594,13 +594,14 @@ procedure NFCDecomposeRec(CP: cardinal; var Buf: array of cardinal;
 var
   A, B: cardinal;
   SIndex, LIndex, VIndex, TIndex: integer;
-  Offset, Count, K: integer;
+  Offset, Count, K, CountM1: integer;
 begin
   if Compat and NFKCDecomposeStep(CP, Offset, Count) then
   begin
     // Pool holds the FULL recursive NFKD expansion; any canonical parts in it
     // are already canonical (NFKD result), so copy verbatim.
-    for K := 0 to Count - 1 do
+    CountM1 := Count - 1;
+    for K := 0 to CountM1 do
     begin
       Buf[Len] := cNFKCDecompPool[Offset + K]; Inc(Len);
     end;
@@ -670,7 +671,7 @@ var
   Len, Position, CP, OutLen: integer;
   StarterPos: integer;
   StarterCC, CC, Composite: integer;
-  I: integer;
+  I, LenM1: integer;
 begin
   if S = '' then Exit('');
   // Worst-case compatibility expansion is bounded but larger than canonical
@@ -694,7 +695,8 @@ begin
     OutLen := 0;
     StarterPos := -1;
     StarterCC := 0;
-    for I := 0 to Len - 1 do
+    LenM1 := Len - 1;
+    for I := 0 to LenM1 do
     begin
       CC := NFCCombiningClass(Buf[I]);
       // Candidate Buf[I] may compose onto the starter unless it is BLOCKED:
@@ -727,7 +729,8 @@ begin
   end;
 
   Result := '';
-  for I := 0 to Len - 1 do
+  LenM1 := Len - 1;
+  for I := 0 to LenM1 do
     Result := Result + CodePointToUTF8(Buf[I]);
 end;
 
@@ -935,13 +938,14 @@ var
 
   function HexAt(StartPos: integer; out Value: cardinal): boolean;
   var
-    Cnt: integer;
+    Cnt, EndPos: integer;
     Digit: char;
   begin
     Value := 0;
     Result := StartPos + 3 <= Length(S);
     if not Result then exit;
-    for Cnt := StartPos to StartPos + 3 do
+    EndPos := StartPos + 3;
+    for Cnt := StartPos to EndPos do
     begin
       Digit := S[Cnt];
       case Digit of
@@ -954,7 +958,7 @@ var
   end;
 
 var
-  OutPos, ByteCnt: integer;
+  OutPos, ByteCnt, EncLen: integer;
   Encoded: string;
 
   // Writes into the preallocated Result buffer. Plain Result := Result + c
@@ -991,7 +995,8 @@ begin
           Inc(Position, 6);
         end;
         Encoded := CodePointToUTF8(CP);
-        for ByteCnt := 1 to Length(Encoded) do AppendChar(Encoded[ByteCnt]);
+        EncLen := Length(Encoded);
+        for ByteCnt := 1 to EncLen do AppendChar(Encoded[ByteCnt]);
       end
       else
       begin // any other escape: copy verbatim, never reinterpret char 2
@@ -1090,10 +1095,11 @@ end;
 // themselves; the rest map to 256, 257, ... in byte order.
 procedure TNeuralHFTokenizer.BuildByteTable();
 var
-  B, Shifted: integer;
+  B, Shifted, CPToByteHi: integer;
   CP: cardinal;
 begin
-  for B := 0 to High(FCPToByte) do FCPToByte[B] := -1;
+  CPToByteHi := High(FCPToByte);
+  for B := 0 to CPToByteHi do FCPToByte[B] := -1;
   Shifted := 0;
   for B := 0 to 255 do
   begin
@@ -1200,6 +1206,8 @@ var
   MergesArr, AddedArr, SubArr, VocabArr: TJSONArray;
   FS: TFileStream;
   Cnt, TokenId, MaxId: integer;
+  VocabCnt, VocabObjCnt, MergesCnt, AddedCnt: integer;
+  VocabCntM1, VocabObjCntM1, AddedCntM1: integer;
   Score: double;
   Left, Right, MergeStr, NormType, Content: string;
   SpacePos: integer;
@@ -1209,13 +1217,14 @@ var
   var
     Kind: string;
     InnerArr: TJSONArray;
-    InnerCnt: integer;
+    InnerCnt, InnerMax: integer;
   begin
     Kind := NormObj.Get('type', '');
     if Kind = 'Sequence' then
     begin
       InnerArr := NormObj.Arrays['normalizers'];
-      for InnerCnt := 0 to InnerArr.Count - 1 do
+      InnerMax := InnerArr.Count - 1;
+      for InnerCnt := 0 to InnerMax do
         AddNormalizer(InnerArr.Objects[InnerCnt]);
     end
     else if Kind = 'Prepend' then
@@ -1281,14 +1290,15 @@ var
   // verbatim multi-KB string constant is intentionally avoided).
   function MatchesDeepSeekSequence(Arr: TJSONArray): boolean;
   var
-    I: integer;
+    I, ArrMax: integer;
     HasNL, HasLetters, HasDigits, HasByteLevel: boolean;
     R, Kind2: string;
   begin
     Result := false;
     HasNL := false; HasLetters := false; HasDigits := false;
     HasByteLevel := false;
-    for I := 0 to Arr.Count - 1 do
+    ArrMax := Arr.Count - 1;
+    for I := 0 to ArrMax do
     begin
       Kind2 := Arr.Objects[I].Get('type', '');
       if (Kind2 = 'Digits') and Arr.Objects[I].Get('individual_digits', false)
@@ -1311,7 +1321,7 @@ var
   var
     Kind, Pattern: string;
     InnerArr: TJSONArray;
-    InnerCnt: integer;
+    InnerCnt, InnerMax: integer;
     SubNode: TJSONData;
   begin
     Kind := PreObj.Get('type', '');
@@ -1332,7 +1342,8 @@ var
         FAddPrefixSpace := false;
         Exit;
       end;
-      for InnerCnt := 0 to InnerArr.Count - 1 do
+      InnerMax := InnerArr.Count - 1;
+      for InnerCnt := 0 to InnerMax do
         AddPreTokenizer(InnerArr.Objects[InnerCnt]);
     end
     else if Kind = 'ByteLevel' then
@@ -1409,13 +1420,14 @@ var
   var
     Kind: string;
     InnerArr: TJSONArray;
-    InnerCnt: integer;
+    InnerCnt, InnerMax: integer;
   begin
     Kind := DecObj.Get('type', '');
     if Kind = 'Sequence' then
     begin
       InnerArr := DecObj.Arrays['decoders'];
-      for InnerCnt := 0 to InnerArr.Count - 1 do
+      InnerMax := InnerArr.Count - 1;
+      for InnerCnt := 0 to InnerMax do
         AddDecoder(InnerArr.Objects[InnerCnt]);
     end
     else if Kind = 'Replace' then
@@ -1519,10 +1531,12 @@ begin
     if FUnigram then
     begin
       VocabArr := ModelObj.Arrays['vocab'];
-      SetLength(FIdToToken, VocabArr.Count);
-      SetLength(FUniScore, VocabArr.Count);
+      VocabCnt := VocabArr.Count;
+      SetLength(FIdToToken, VocabCnt);
+      SetLength(FUniScore, VocabCnt);
       FUniMinScore := 0;
-      for Cnt := 0 to VocabArr.Count - 1 do
+      VocabCntM1 := VocabCnt - 1;
+      for Cnt := 0 to VocabCntM1 do
       begin
         SubArr := TJSONArray(VocabArr.Items[Cnt]);
         Content := FixJSONKey(SubArr.Strings[0]);
@@ -1539,11 +1553,13 @@ begin
     else
     begin
       VocabObj := ModelObj.Objects['vocab'];
+      VocabObjCnt := VocabObj.Count;
       MaxId := -1;
-      for Cnt := 0 to VocabObj.Count - 1 do
+      VocabObjCntM1 := VocabObjCnt - 1;
+      for Cnt := 0 to VocabObjCntM1 do
         MaxId := Max(MaxId, VocabObj.Items[Cnt].AsInteger);
       SetLength(FIdToToken, MaxId + 1);
-      for Cnt := 0 to VocabObj.Count - 1 do
+      for Cnt := 0 to VocabObjCntM1 do
       begin
         TokenId := VocabObj.Items[Cnt].AsInteger;
         Content := FixJSONKey(VocabObj.Names[Cnt]);
@@ -1559,7 +1575,9 @@ begin
     else
       MergesArr := ModelObj.Arrays['merges'];
     if MergesArr <> nil then
-    for Cnt := 0 to MergesArr.Count - 1 do
+    begin
+    MergesCnt := MergesArr.Count - 1;
+    for Cnt := 0 to MergesCnt do
     begin
       Node := MergesArr.Items[Cnt];
       if Node is TJSONArray then
@@ -1577,6 +1595,7 @@ begin
       end;
       FMerges.AddObject(Left + csMergeSep + Right, TObject(PtrInt(Cnt)));
     end;
+    end;
 
     // unk token
     Node := ModelObj.Find('unk_token');
@@ -1588,8 +1607,10 @@ begin
     if (Node <> nil) and (Node is TJSONArray) then
     begin
       AddedArr := TJSONArray(Node);
-      SetLength(FAddedTokens, AddedArr.Count);
-      for Cnt := 0 to AddedArr.Count - 1 do
+      AddedCnt := AddedArr.Count;
+      SetLength(FAddedTokens, AddedCnt);
+      AddedCntM1 := AddedCnt - 1;
+      for Cnt := 0 to AddedCntM1 do
       begin
         Entry := AddedArr.Objects[Cnt];
         FAddedTokens[Cnt].Content := Entry.Get('content', '');
@@ -1660,10 +1681,12 @@ var
   L, R, Piece: string;
   Tmp: TMergeCand;
   LocalStart: integer;
+  APieceCountM1, NumCPM1, CandsHi: integer;
 begin
   Seq := 0;
   SetLength(Cands, 0);
-  for CnPiece := 0 to APieceCount - 1 do
+  APieceCountM1 := APieceCount - 1;
+  for CnPiece := 0 to APieceCountM1 do
   begin
     Piece := PieceTextV[CnPiece];
     if Piece = '' then continue;
@@ -1681,7 +1704,8 @@ begin
     if NumCP < 2 then continue;  // single codepoint -> no split
     LocalStart := Length(Cands);
     // Each codepoint split (1..NumCP-1) where both halves are in the vocab.
-    for SplitI := 1 to NumCP - 1 do
+    NumCPM1 := NumCP - 1;
+    for SplitI := 1 to NumCPM1 do
     begin
       ByteSplit := Boundaries[SplitI];
       L := Copy(Piece, 1, ByteSplit - 1);
@@ -1703,7 +1727,8 @@ begin
     end;
     // local sort by (LeftId, RightId) -- insertion sort over this piece's run.
     NLocal := Length(Cands) - LocalStart;
-    for I := LocalStart + 1 to High(Cands) do
+    CandsHi := High(Cands);
+    for I := LocalStart + 1 to CandsHi do
     begin
       Tmp := Cands[I];
       J := I - 1;
@@ -1722,10 +1747,11 @@ begin
 
   // Stamp the append/sequence order (after all local sorts) so the final
   // sort can keep ties stable (Python's sort is stable).
-  for I := 0 to High(Cands) do Cands[I].Seq := I;
+  CandsHi := High(Cands);
+  for I := 0 to CandsHi do Cands[I].Seq := I;
 
   // Final stable sort by (PieceId, LenL, LenR, Seq) ascending -> merge rank.
-  for I := 1 to High(Cands) do
+  for I := 1 to CandsHi do
   begin
     Tmp := Cands[I];
     J := I - 1;
@@ -1744,7 +1770,7 @@ begin
   end;
 
   // Position in the final list IS the rank (lower rank = applied first).
-  for I := 0 to High(Cands) do
+  for I := 0 to CandsHi do
     FMerges.AddObject(Cands[I].Left + csMergeSep + Cands[I].Right,
       TObject(PtrInt(I)));
 end;
@@ -1774,6 +1800,7 @@ var
   PieceTextV: array of string;  // piece text, id-indexed
   PieceTypeV: array of integer; // piece type, id-indexed
   PieceCount: integer;
+  PieceCountM1: integer;
   ModelType: integer;           // trainer_spec.model_type (default UNIGRAM)
   SpmUnk, SpmBos, SpmEos: integer;
   Cnt: integer;
@@ -1978,7 +2005,8 @@ begin
   SetLength(FUniScore, PieceCount);
   FUniMinScore := 0;
   FByteFallback := false;
-  for Cnt := 0 to PieceCount - 1 do
+  PieceCountM1 := PieceCount - 1;
+  for Cnt := 0 to PieceCountM1 do
   begin
     FVocab.AddObject(PieceTextV[Cnt], TObject(PtrInt(Cnt)));
     FIdToToken[Cnt] := PieceTextV[Cnt];
@@ -2036,7 +2064,8 @@ begin
   // in the input text and Decode(skip_special_tokens) drops them, matching
   // the tokenizer.json path's added_tokens handling.
   SetLength(FAddedTokens, 0);
-  for Cnt := 0 to PieceCount - 1 do
+  PieceCountM1 := PieceCount - 1;
+  for Cnt := 0 to PieceCountM1 do
     if (PieceTypeV[Cnt] = 2) or (PieceTypeV[Cnt] = 3) then // UNKNOWN/CONTROL
     begin
       SetLength(FAddedTokens, Length(FAddedTokens) + 1);
@@ -2055,8 +2084,8 @@ procedure TNeuralHFTokenizer.LoadFromGGUF(const FileName: string);
 var
   Reader: TNNetGGUFReader;
   Model: string;
-  TokCount, Cnt: integer;
-  ScoreCount, TypeCount, MergeCount: Int64;
+  TokCount, Cnt, TokCountM1: integer;
+  ScoreCount, TypeCount, MergeCount, MergeCountM1: Int64;
   HasScores, HasTypes: boolean;
   TokType: integer;
   Content, MergeStr, Left, Right: string;
@@ -2077,6 +2106,7 @@ begin
     if TokCount = 0 then
       raise EHFTokenizerError.Create('GGUF: tokenizer.ggml.tokens is empty ' +
         'in ' + FileName + '.');
+    TokCountM1 := TokCount - 1;
 
     ScoreCount := Reader.GetMetaArrayCount('tokenizer.ggml.scores');
     TypeCount := Reader.GetMetaArrayCount('tokenizer.ggml.token_type');
@@ -2085,7 +2115,7 @@ begin
 
     // ---- vocab (the 0-based array index IS the id) ----
     SetLength(FIdToToken, TokCount);
-    for Cnt := 0 to TokCount - 1 do
+    for Cnt := 0 to TokCountM1 do
     begin
       Content := Reader.GetMetaArrayString('tokenizer.ggml.tokens', Cnt);
       FVocab.AddObject(Content, TObject(PtrInt(Cnt)));
@@ -2108,7 +2138,7 @@ begin
       FByteFallback := true;
       SetLength(FUniScore, TokCount);
       FUniMinScore := 0;
-      for Cnt := 0 to TokCount - 1 do
+      for Cnt := 0 to TokCountM1 do
       begin
         if HasScores
         then FUniScore[Cnt] :=
@@ -2131,7 +2161,7 @@ begin
 
       // Expose CONTROL / UNKNOWN / USER_DEFINED pieces as added tokens.
       SetLength(FAddedTokens, 0);
-      for Cnt := 0 to TokCount - 1 do
+      for Cnt := 0 to TokCountM1 do
       begin
         if HasTypes
         then TokType := integer(Round(
@@ -2154,7 +2184,8 @@ begin
       FSplitPreTok := true;
       FSplitDigitsMax := 3;
       MergeCount := Reader.GetMetaArrayCount('tokenizer.ggml.merges');
-      for Cnt := 0 to MergeCount - 1 do
+      MergeCountM1 := MergeCount - 1;
+      for Cnt := 0 to MergeCountM1 do
       begin
         MergeStr := Reader.GetMetaArrayString('tokenizer.ggml.merges', Cnt);
         SpacePos := Pos(' ', MergeStr);
@@ -2168,7 +2199,7 @@ begin
       // round-trip verbatim (e.g. <|endoftext|>); fall back to id-based
       // special wiring below.
       SetLength(FAddedTokens, 0);
-      for Cnt := 0 to TokCount - 1 do
+      for Cnt := 0 to TokCountM1 do
       begin
         if HasTypes
         then TokType := integer(Round(
@@ -2200,7 +2231,8 @@ procedure TNeuralHFTokenizer.SaveTokenizerToGGUF(Writer: TNNetGGUFWriter);
 // (1=NORMAL, 2=UNKNOWN, 3=CONTROL); added special pieces are tagged CONTROL
 // (the unk piece UNKNOWN) so the reader re-exposes them as added tokens.
 var
-  TokCount, Cnt, SepPos, Rank, MaxRank, Mi: integer;
+  TokCount, Cnt, SepPos, Rank, MaxRank, Mi, MergesNum: integer;
+  TokCountM1, MergesNumM1, MergesHi, AddedHi: integer;
   Tokens, Merges: array of string;
   Scores: array of single;
   Types: array of Int64;
@@ -2222,7 +2254,8 @@ begin
   SetLength(Tokens, TokCount);
   SetLength(Scores, TokCount);
   SetLength(Types, TokCount);
-  for Cnt := 0 to TokCount - 1 do
+  TokCountM1 := TokCount - 1;
+  for Cnt := 0 to TokCountM1 do
   begin
     Tokens[Cnt] := FIdToToken[Cnt];
     if FUnigram and (Cnt <= High(FUniScore))
@@ -2231,7 +2264,8 @@ begin
     Types[Cnt] := 1; // NORMAL (overridden below for added/special pieces)
   end;
   // Tag added pieces: special -> CONTROL (3); the unk piece -> UNKNOWN (2).
-  for Cnt := 0 to High(FAddedTokens) do
+  AddedHi := High(FAddedTokens);
+  for Cnt := 0 to AddedHi do
     if (FAddedTokens[Cnt].Id >= 0) and (FAddedTokens[Cnt].Id <= High(Types)) then
     begin
       if FAddedTokens[Cnt].Id = FUnkId then Types[FAddedTokens[Cnt].Id] := 2
@@ -2255,7 +2289,9 @@ begin
   begin
     Sep := csMergeSep;
     MaxRank := 0;
-    for Cnt := 0 to FMerges.Count - 1 do
+    MergesNum := FMerges.Count;
+    MergesNumM1 := MergesNum - 1;
+    for Cnt := 0 to MergesNumM1 do
     begin
       Rank := integer(PtrInt(FMerges.Objects[Cnt]));
       if Rank > MaxRank then MaxRank := Rank;
@@ -2263,8 +2299,9 @@ begin
     // Ranks are dense 0..N-1 (LoadFromFile/LoadFromGGUF assign the array
     // index); slot each "Left Right" string back into its rank position.
     SetLength(Merges, MaxRank + 1);
-    for Cnt := 0 to High(Merges) do Merges[Cnt] := '';
-    for Mi := 0 to FMerges.Count - 1 do
+    MergesHi := High(Merges);
+    for Cnt := 0 to MergesHi do Merges[Cnt] := '';
+    for Mi := 0 to MergesNumM1 do
     begin
       Combined := FMerges[Mi];
       Rank := integer(PtrInt(FMerges.Objects[Mi]));
@@ -2290,12 +2327,13 @@ end;
 function TNeuralHFTokenizer.FindAddedToken(const Text: string;
   Position: integer; out TokenIndex: integer): boolean;
 var
-  Cnt, BestLen, ContentLen: integer;
+  Cnt, BestLen, ContentLen, AddedHi: integer;
 begin
   Result := false;
   TokenIndex := -1;
   BestLen := 0;
-  for Cnt := 0 to High(FAddedTokens) do
+  AddedHi := High(FAddedTokens);
+  for Cnt := 0 to AddedHi do
   begin
     ContentLen := Length(FAddedTokens[Cnt].Content);
     if (ContentLen > BestLen) and
@@ -2311,11 +2349,12 @@ end;
 function TNeuralHFTokenizer.IsAddedTokenId(Id: integer;
   out TokenIndex: integer): boolean;
 var
-  Cnt: integer;
+  Cnt, AddedHi: integer;
 begin
   Result := false;
   TokenIndex := -1;
-  for Cnt := 0 to High(FAddedTokens) do
+  AddedHi := High(FAddedTokens);
+  for Cnt := 0 to AddedHi do
     if FAddedTokens[Cnt].Id = Id then
     begin
       TokenIndex := Cnt;
@@ -2974,17 +3013,18 @@ end;
 function TNeuralHFTokenizer.MapPieceToByteLevel(
   const Piece: string): TStringList;
 var
-  Cnt: integer;
+  Cnt, PieceLen: integer;
 begin
   Result := TStringList.Create();
-  for Cnt := 1 to Length(Piece) do
+  PieceLen := Length(Piece);
+  for Cnt := 1 to PieceLen do
     Result.Add(CodePointToUTF8(FByteToCP[Ord(Piece[Cnt])]));
 end;
 
 procedure TNeuralHFTokenizer.EmitTokenOrFallback(const Symbol: string;
   Ids: TIntegerList);
 var
-  TokenId, Cnt: integer;
+  TokenId, Cnt, SymbolLen: integer;
   ByteToken: string;
 begin
   TokenId := VocabFind(Symbol);
@@ -2995,8 +3035,9 @@ begin
   end;
   if FByteFallback then
   begin
+    SymbolLen := Length(Symbol);
     // check all byte tokens exist before emitting any
-    for Cnt := 1 to Length(Symbol) do
+    for Cnt := 1 to SymbolLen do
       if VocabFind('<0x' + IntToHex(Ord(Symbol[Cnt]), 2) + '>') < 0 then
       begin
         if (FUnkId >= 0) and ((not FFuseUnk) or (Ids.Count = 0) or
@@ -3004,7 +3045,7 @@ begin
           Ids.Add(FUnkId);
         Exit;
       end;
-    for Cnt := 1 to Length(Symbol) do
+    for Cnt := 1 to SymbolLen do
     begin
       ByteToken := '<0x' + IntToHex(Ord(Symbol[Cnt]), 2) + '>';
       Ids.Add(VocabFind(ByteToken));
@@ -3019,7 +3060,7 @@ end;
 procedure TNeuralHFTokenizer.BPEWord(const Symbols: TStringList;
   Ids: TIntegerList);
 var
-  Cnt, BestIdx, BestRank, Rank, WholeId: integer;
+  Cnt, BestIdx, BestRank, Rank, WholeId, SymMax, SymCntM2: integer;
   Whole: string;
 begin
   if Symbols.Count = 0 then exit;
@@ -3028,7 +3069,8 @@ begin
   if FIgnoreMerges and (FDropoutProb <= 0) then
   begin
     Whole := '';
-    for Cnt := 0 to Symbols.Count - 1 do Whole := Whole + Symbols[Cnt];
+    SymMax := Symbols.Count - 1;
+    for Cnt := 0 to SymMax do Whole := Whole + Symbols[Cnt];
     WholeId := VocabFind(Whole);
     if WholeId >= 0 then
     begin
@@ -3040,7 +3082,8 @@ begin
   begin
     BestIdx := -1;
     BestRank := High(integer);
-    for Cnt := 0 to Symbols.Count - 2 do
+    SymCntM2 := Symbols.Count - 2;
+    for Cnt := 0 to SymCntM2 do
     begin
       Rank := MergeRank(Symbols[Cnt], Symbols[Cnt + 1]);
       // BPE-dropout (Provilkov et al. 2020): with probability FDropoutProb
@@ -3060,7 +3103,8 @@ begin
     Symbols[BestIdx] := Symbols[BestIdx] + Symbols[BestIdx + 1];
     Symbols.Delete(BestIdx + 1);
   end;
-  for Cnt := 0 to Symbols.Count - 1 do
+  SymMax := Symbols.Count - 1;
+  for Cnt := 0 to SymMax do
     EmitTokenOrFallback(Symbols[Cnt], Ids);
 end;
 
@@ -3273,7 +3317,7 @@ procedure TNeuralHFTokenizer.WordPieceWord(const WordText: string;
 var
   CPStr: array of string;
   Total, Position, RunStart: integer;
-  StartIdx, EndIdx, TokenId, Found, Cnt: integer;
+  StartIdx, EndIdx, TokenId, Found, Cnt, MatchedCnt, EndIdxM1: integer;
   Sub: string;
   Matched: TIntegerList;
 begin
@@ -3304,7 +3348,8 @@ begin
       while EndIdx > StartIdx do
       begin
         Sub := '';
-        for Cnt := StartIdx to EndIdx - 1 do Sub := Sub + CPStr[Cnt];
+        EndIdxM1 := EndIdx - 1;
+        for Cnt := StartIdx to EndIdxM1 do Sub := Sub + CPStr[Cnt];
         if StartIdx > 0 then Sub := FWPPrefix + Sub;
         TokenId := VocabFind(Sub);
         if TokenId >= 0 then
@@ -3322,7 +3367,8 @@ begin
       Matched.Add(Found);
       StartIdx := EndIdx;
     end;
-    for Cnt := 0 to Matched.Count - 1 do Ids.Add(Matched[Cnt]);
+    MatchedCnt := Matched.Count - 1;
+    for Cnt := 0 to MatchedCnt do Ids.Add(Matched[Cnt]);
   finally
     Matched.Free;
   end;
@@ -3332,7 +3378,7 @@ procedure TNeuralHFTokenizer.EncodeSegment(const Segment: string;
   Ids: TIntegerList; IsFirstSegment: boolean);
 var
   Pieces, Symbols: TStringList;
-  Cnt, Position, RunStart, PieceStart: integer;
+  Cnt, Position, RunStart, PieceStart, PiecesCnt, NormReplaceHi: integer;
   Normalized: string;
   Seg: string;
 
@@ -3383,7 +3429,8 @@ begin
     Pieces := TStringList.Create();
     try
       BertPieces(BertNormalize(Seg), Pieces);
-      for Cnt := 0 to Pieces.Count - 1 do
+      PiecesCnt := Pieces.Count - 1;
+      for Cnt := 0 to PiecesCnt do
         WordPieceWord(Pieces[Cnt], Ids);
     finally
       Pieces.Free;
@@ -3396,7 +3443,8 @@ begin
     Pieces := TStringList.Create();
     try
       SplitDeepSeekPieces(Seg, Pieces);
-      for Cnt := 0 to Pieces.Count - 1 do
+      PiecesCnt := Pieces.Count - 1;
+      for Cnt := 0 to PiecesCnt do
       begin
         Symbols := MapPieceToByteLevel(Pieces[Cnt]);
         try
@@ -3417,7 +3465,8 @@ begin
     Pieces := TStringList.Create();
     try
       SplitO200kPieces(Seg, Pieces);
-      for Cnt := 0 to Pieces.Count - 1 do
+      PiecesCnt := Pieces.Count - 1;
+      for Cnt := 0 to PiecesCnt do
       begin
         Symbols := MapPieceToByteLevel(Pieces[Cnt]);
         try
@@ -3438,7 +3487,8 @@ begin
     Pieces := TStringList.Create();
     try
       SplitCl100kPieces(Seg, Pieces);
-      for Cnt := 0 to Pieces.Count - 1 do
+      PiecesCnt := Pieces.Count - 1;
+      for Cnt := 0 to PiecesCnt do
       begin
         Symbols := MapPieceToByteLevel(Pieces[Cnt]);
         try
@@ -3465,7 +3515,8 @@ begin
         // use_regex=false: NO GPT-2 regex split -- the whole segment is a
         // single chunk fed straight to the byte-level alphabet + BPE.
         Pieces.Add(Normalized);
-      for Cnt := 0 to Pieces.Count - 1 do
+      PiecesCnt := Pieces.Count - 1;
+      for Cnt := 0 to PiecesCnt do
       begin
         Symbols := MapPieceToByteLevel(Pieces[Cnt]);
         try
@@ -3483,7 +3534,8 @@ begin
     // metaspace family: normalizer chain first (Prepend/Replace --
     // Llama-2 style files do metaspace HERE and have no pre_tokenizer)
     Normalized := FNormPrepend + Seg;
-    for Cnt := 0 to High(FNormReplaceFrom) do
+    NormReplaceHi := High(FNormReplaceFrom);
+    for Cnt := 0 to NormReplaceHi do
       Normalized := StringReplace(Normalized, FNormReplaceFrom[Cnt],
         FNormReplaceTo[Cnt], [rfReplaceAll]);
     if FMetaspacePreTok then
@@ -3559,13 +3611,15 @@ end;
 function TNeuralHFTokenizer.Encode(const Text: string): TNeuralIntegerArray;
 var
   Ids: TIntegerList;
-  Cnt: integer;
+  Cnt, IdsCnt, IdsCntM1: integer;
 begin
   Ids := TIntegerList.Create();
   try
     Encode(Text, Ids);
-    SetLength(Result, Ids.Count);
-    for Cnt := 0 to Ids.Count - 1 do Result[Cnt] := Ids[Cnt];
+    IdsCnt := Ids.Count;
+    SetLength(Result, IdsCnt);
+    IdsCntM1 := IdsCnt - 1;
+    for Cnt := 0 to IdsCntM1 do Result[Cnt] := Ids[Cnt];
   finally
     Ids.Free;
   end;
@@ -3577,6 +3631,7 @@ var
   Ids: TIntegerList;
   WordOf: array of integer;   // 1-based byte pos -> 0-based word index
   Cnt, Cursor, TokenIndex, SurfPos, SurfLen, StartPos, WordStart: integer;
+  IdsCnt, IdsCntM1, TextLen: integer;
   InWord: boolean;
   WordCnt: integer;
   Surface: string;
@@ -3593,14 +3648,16 @@ begin
   Ids := TIntegerList.Create();
   try
     Encode(Text, Ids);
-    SetLength(Result, Ids.Count);
+    IdsCnt := Ids.Count;
+    SetLength(Result, IdsCnt);
 
     // Per-byte word index: a word starts at each whitespace -> non-whitespace
     // transition (whitespace-split words, HF word_ids granularity).
     SetLength(WordOf, Length(Text) + 1);
     WordCnt := -1;
     InWord := false;
-    for Cnt := 1 to Length(Text) do
+    TextLen := Length(Text);
+    for Cnt := 1 to TextLen do
     begin
       if IsWs(Text[Cnt]) then
         InWord := false
@@ -3629,7 +3686,8 @@ begin
     // A token whose surface still cannot be aligned (true unk with no source
     // bytes, e.g. unk_surface) keeps Start=0/Length=0/WordId=-1.
     Cursor := 1;
-    for Cnt := 0 to Ids.Count - 1 do
+    IdsCntM1 := IdsCnt - 1;
+    for Cnt := 0 to IdsCntM1 do
     begin
       Result[Cnt].Id := Ids[Cnt];
       Result[Cnt].Start := 0;
@@ -3716,7 +3774,7 @@ end;
 function TNeuralHFTokenizer.DecodeToken(Id: integer): string;
 var
   Token: string;
-  Position, ByteVal, Cnt: integer;
+  Position, ByteVal, Cnt, DecReplaceHi: integer;
   CP: cardinal;
 begin
   Result := '';
@@ -3743,7 +3801,8 @@ begin
       if ByteVal >= 0 then Exit(Chr(ByteVal));
     end;
     Result := Token;
-    for Cnt := 0 to High(FDecReplaceFrom) do
+    DecReplaceHi := High(FDecReplaceFrom);
+    for Cnt := 0 to DecReplaceHi do
       Result := StringReplace(Result, FDecReplaceFrom[Cnt],
         FDecReplaceTo[Cnt], [rfReplaceAll]);
   end;
@@ -3752,11 +3811,12 @@ end;
 function TNeuralHFTokenizer.Decode(const Ids: array of integer;
   SkipSpecialTokens: boolean = true): string;
 var
-  Cnt, TokenIndex, Stripped: integer;
+  Cnt, TokenIndex, Stripped, IdsHi: integer;
   Piece: string;
 begin
   Result := '';
-  for Cnt := 0 to High(Ids) do
+  IdsHi := High(Ids);
+  for Cnt := 0 to IdsHi do
   begin
     if IsAddedTokenId(Ids[Cnt], TokenIndex) then
     begin
@@ -3807,23 +3867,26 @@ function TNeuralHFTokenizer.Decode(Ids: TIntegerList;
   SkipSpecialTokens: boolean = true): string;
 var
   Arr: array of integer;
-  Cnt: integer;
+  Cnt, IdsCnt, IdsCntM1: integer;
 begin
-  SetLength(Arr, Ids.Count);
-  for Cnt := 0 to Ids.Count - 1 do Arr[Cnt] := Ids[Cnt];
+  IdsCnt := Ids.Count;
+  SetLength(Arr, IdsCnt);
+  IdsCntM1 := IdsCnt - 1;
+  for Cnt := 0 to IdsCntM1 do Arr[Cnt] := Ids[Cnt];
   Result := Decode(Arr, SkipSpecialTokens);
 end;
 
 function TNeuralHFTokenizer.FragmentToSurface(const Fragment: string): string;
 var
-  Cnt: integer;
+  Cnt, FragmentLen: integer;
 begin
   if FByteLevel then
   begin
     // Each raw byte -> its GPT-2 byte-alphabet codepoint (same mapping
     // MapPieceToByteLevel applies during encoding; DecodeToken inverts it).
     Result := '';
-    for Cnt := 1 to Length(Fragment) do
+    FragmentLen := Length(Fragment);
+    for Cnt := 1 to FragmentLen do
       Result := Result + CodePointToUTF8(FByteToCP[Ord(Fragment[Cnt])]);
   end
   else if FMetaspacePreTok then
@@ -3838,7 +3901,7 @@ function TNeuralHFTokenizer.PrefixScanVocab(
   const Fragment: string): TNeuralIntegerArray;
 var
   Surface, Cand: string;
-  SurfLen, Id, Count: integer;
+  SurfLen, Id, Count, IdToTokenHi: integer;
 begin
   SetLength(Result, 0);
   if Fragment = '' then exit;
@@ -3847,7 +3910,8 @@ begin
   if SurfLen = 0 then exit;
   SetLength(Result, Length(FIdToToken));
   Count := 0;
-  for Id := 0 to High(FIdToToken) do
+  IdToTokenHi := High(FIdToToken);
+  for Id := 0 to IdToTokenHi do
   begin
     Cand := FIdToToken[Id];
     if (Cand <> '') and (Length(Cand) >= SurfLen) and
@@ -3867,11 +3931,12 @@ end;
 
 function TNeuralHFTokenizer.TokenToId(const Token: string): integer;
 var
-  TokenIndex: integer;
+  TokenIndex, AddedHi: integer;
 begin
   Result := VocabFind(Token);
+  AddedHi := High(FAddedTokens);
   if Result < 0 then
-    for TokenIndex := 0 to High(FAddedTokens) do
+    for TokenIndex := 0 to AddedHi do
       if FAddedTokens[TokenIndex].Content = Token then
         Exit(FAddedTokens[TokenIndex].Id);
 end;

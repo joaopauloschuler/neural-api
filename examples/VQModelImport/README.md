@@ -15,7 +15,7 @@ generators (MaskGIT, Parti, LlamaGen) to turn an image into a sequence of
 codebook token IDs a stock Llama/GPT LM can model, and back again.
 
 It reuses the landed AutoencoderKL VAE encoder/decoder ResNet+attention blocks
-(`BuildVaeEncoder` / `BuildVaeDecoder`); the genuinely new pieces are the
+(`BuildVaeEncoder` / `BuildVaeDecoder`); the new pieces are the
 nearest-neighbour codebook lookup (`EncodeImageToTokens`, argmin squared-L2 to
 `quantize.embedding.weight`) and the inverse gather (`DecodeTokensToImage`),
 both plain Pascal on the holder class `TNNetVqModel` (no new `TNNet*` layer).

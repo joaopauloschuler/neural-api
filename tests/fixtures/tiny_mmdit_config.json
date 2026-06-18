@@ -1,0 +1,10 @@
+{
+  "_class_name": "SD3Transformer2DModel",
+  "hidden_size": 16,
+  "num_attention_heads": 2,
+  "attention_head_dim": 8,
+  "img_len": 5,
+  "txt_len": 3,
+  "mlp_hidden": 64,
+  "layer_norm_eps": 1e-06
+}

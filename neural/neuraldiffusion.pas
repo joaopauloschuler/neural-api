@@ -120,8 +120,14 @@ type
     // image) using the requested spacing. Caller-owned dynamic array.
     function BuildTimestepSchedule(NumSteps: integer;
       Spacing: TNNetTimestepSpacing): TNeuralIntegerArray;
+  protected
     // Convert a raw model prediction (eps or v) at timestep Tt into eps.
     procedure ToEps(Xt, RawPred, EpsOut: TNNetVolume; Tt: integer);
+    // Convert a raw model prediction at Tt into the predicted clean image x0:
+    //   x0 = (x_t - sqrt(1-ab_t)*eps)/sqrt(ab_t),  eps = ToEps(raw).
+    // The subclasses (LCM) reuse this to share one parameterization with the
+    // iterative samplers (eps/v plumbing). X0Out may alias RawPred.
+    procedure PredictX0(Xt, RawPred, X0Out: TNNetVolume; Tt: integer);
   public
     // T = number of diffusion steps. Beta1/BetaT used by linear & scaled-linear;
     // CosineS is the small offset of the cosine schedule (default 0.008).
@@ -173,6 +179,45 @@ type
     procedure Sample(X: TNNetVolume; Denoise: TNNetDenoiseCallback;
       NumSteps: integer; Method: TNNetSamplerMethod = smDDIM;
       Eta: TNeuralFloat = 0.0; Spacing: TNNetTimestepSpacing = tsUniform);
+  end;
+
+  { TNNetLCMScheduler }
+  // Latent Consistency Model (LCM) few-step sampler (Luo et al. 2023,
+  // arXiv:2310.04378). Unlike the iterative noise-prediction integrators (DDIM /
+  // DPM++ / Euler) it does NOT integrate the probability-flow ODE step by step;
+  // instead it evaluates a learned CONSISTENCY function f(x_t,t) that maps any
+  // noised latent DIRECTLY toward the clean solution x0, parameterized with the
+  // standard boundary scalings c_skip(t), c_out(t) (sigma_data=0.5):
+  //   f(x,t) = c_skip(t)*x + c_out(t)*x0_hat,
+  //   c_skip(t) = sigma_data^2 / ((t/0.1)^2 + sigma_data^2),
+  //   c_out(t)  = (t/0.1)*sigma_data / sqrt((t/0.1)^2 + sigma_data^2),
+  // where x0_hat is the model's x0 prediction (eps/v converted via the inherited
+  // shared plumbing -- the LCM sampler consumes the SAME raw model output the
+  // other samplers do). Generation is a SMALL number of steps (1-4): predict x0
+  // via f, then re-noise x0 forward to the NEXT (smaller) timestep with the
+  // inherited AddNoise using fresh Gaussian noise, repeat. Guidance is BAKED IN
+  // (the distilled consistency model already absorbed CFG), so there is no
+  // cond/uncond double pass per step. All schedule tables (alpha-bar/sigma) and
+  // the timestep-schedule builder are inherited unchanged.
+  // Coded by Claude (AI).
+  TNNetLCMScheduler = class(TNNetDiffusionScheduler)
+  public
+    // Boundary scalings at (integer) timestep Tt with sigma_data=0.5. At the
+    // largest Tt c_skip -> small and c_out -> ~sigma_data; at Tt->0 c_skip -> 1
+    // and c_out -> 0 (the consistency boundary condition f(x,0)=x).
+    function CSkip(Tt: integer): TNeuralFloat;
+    function COut(Tt: integer): TNeuralFloat;
+    // ONE consistency step: evaluate f(Xt,Tt) IN PLACE into Xt, writing the
+    // consistency-mapped clean-image estimate x0_consistent. RawPred is the raw
+    // model output (eps or v) at Tt. After this Xt holds the f-estimate of x0.
+    procedure LCMStep(Xt, RawPred: TNNetVolume; Tt: integer);
+    // High-level few-step driver. X starts as N(0,I) noise (text->image) or a
+    // partially-noised latent. Runs NumSteps (typically 1-4) consistency steps
+    // over the inherited timestep schedule: at each step predict x0 via f, and
+    // (unless it is the last step) re-noise that x0 forward to the NEXT, smaller
+    // timestep with fresh Gaussian noise. Leaves the sampled x0 in X.
+    procedure LCMSample(X: TNNetVolume; Denoise: TNNetDenoiseCallback;
+      NumSteps: integer = 4; Spacing: TNNetTimestepSpacing = tsUniform);
   end;
 
 implementation
@@ -316,12 +361,14 @@ function TNNetDiffusionScheduler.BuildTimestepSchedule(NumSteps: integer;
   Spacing: TNNetTimestepSpacing): TNeuralIntegerArray;
 var
   k, Tt: integer;
+  NumStepsM1: integer;
   sigMin, sigMax, invRho, frac, targetSigma: double;
 const
   cRho = 7.0; // Karras et al. (2022) recommended rho.
 begin
   if NumSteps < 1 then NumSteps := 1;
   SetLength(Result, NumSteps + 1);
+  NumStepsM1 := NumSteps - 1;
   case Spacing of
     tsKarras:
       begin
@@ -332,7 +379,7 @@ begin
         sigMin := SigmaOf(1);
         sigMax := SigmaOf(FT);
         invRho := 1.0 / cRho;
-        for k := 0 to NumSteps - 1 do
+        for k := 0 to NumStepsM1 do
         begin
           if NumSteps = 1 then frac := 0.0
           else frac := k / (NumSteps - 1);
@@ -347,7 +394,7 @@ begin
       end;
     else // tsUniform
       begin
-        for k := 0 to NumSteps - 1 do
+        for k := 0 to NumStepsM1 do
         begin
           // Descending: Result[0] is the highest timestep.
           if NumSteps = 1 then Tt := FT
@@ -362,6 +409,7 @@ end;
 procedure TNNetDiffusionScheduler.ToEps(Xt, RawPred, EpsOut: TNNetVolume; Tt: integer);
 var
   i: integer;
+  EpsOutSizeM1: integer;
   sab, somab: TNeuralFloat;
 begin
   if FPrediction = dpEps then
@@ -372,19 +420,45 @@ begin
   // v-prediction: eps = sqrt(ab)*v + sqrt(1-ab)*x_t.
   sab := FSqrtAlphaBar[Tt];
   somab := FSqrtOneMinusAlphaBar[Tt];
-  for i := 0 to EpsOut.Size - 1 do
+  EpsOutSizeM1 := EpsOut.Size - 1;
+  for i := 0 to EpsOutSizeM1 do
     EpsOut.FData[i] := sab * RawPred.FData[i] + somab * Xt.FData[i];
+end;
+
+procedure TNNetDiffusionScheduler.PredictX0(Xt, RawPred, X0Out: TNNetVolume;
+  Tt: integer);
+var
+  i: integer;
+  X0OutSizeM1: integer;
+  somab, invSqrtAb: TNeuralFloat;
+  Eps: TNNetVolume;
+begin
+  // Reuse the shared eps plumbing, then map eps -> x0. Use a scratch buffer so
+  // X0Out may safely alias RawPred.
+  Eps := TNNetVolume.Create(Xt);
+  try
+    ToEps(Xt, RawPred, Eps, Tt);
+    somab := FSqrtOneMinusAlphaBar[Tt];
+    invSqrtAb := 1.0 / FSqrtAlphaBar[Tt];
+    X0OutSizeM1 := X0Out.Size - 1;
+    for i := 0 to X0OutSizeM1 do
+      X0Out.FData[i] := (Xt.FData[i] - somab * Eps.FData[i]) * invSqrtAb;
+  finally
+    Eps.Free;
+  end;
 end;
 
 procedure TNNetDiffusionScheduler.AddNoise(X0, Xt: TNNetVolume; Tt: integer;
   NoiseOut, PreSampledNoise: TNNetVolume);
 var
   i: integer;
+  X0SizeM1: integer;
   sab, somab, eps: TNeuralFloat;
 begin
   sab := FSqrtAlphaBar[Tt];
   somab := FSqrtOneMinusAlphaBar[Tt];
-  for i := 0 to X0.Size - 1 do
+  X0SizeM1 := X0.Size - 1;
+  for i := 0 to X0SizeM1 do
   begin
     if Assigned(PreSampledNoise) then eps := PreSampledNoise.FData[i]
     else eps := RandG(0, 1);
@@ -395,9 +469,10 @@ end;
 
 class procedure TNNetDiffusionScheduler.ApplyCFG(EpsCond, EpsUncond,
   Dst: TNNetVolume; W: TNeuralFloat);
-var i: integer;
+var i, DstSizeM1: integer;
 begin
-  for i := 0 to Dst.Size - 1 do
+  DstSizeM1 := Dst.Size - 1;
+  for i := 0 to DstSizeM1 do
     Dst.FData[i] := EpsUncond.FData[i] +
       W * (EpsCond.FData[i] - EpsUncond.FData[i]);
 end;
@@ -411,6 +486,7 @@ procedure TNNetDiffusionScheduler.Step(Xt, RawPred: TNNetVolume;
   Tt, TtPrev: integer; Method: TNNetSamplerMethod; Eta: TNeuralFloat);
 var
   i: integer;
+  XtSizeM1: integer;
   Eps: TNNetVolume;
   invSqrtAlpha, coef, sigma, z: TNeuralFloat;
   abT, abPrev, sqrtAbPrev, x0, dirCoef: TNeuralFloat;
@@ -422,6 +498,7 @@ begin
   try
     // All updates work from eps; v-prediction is converted up front.
     ToEps(Xt, RawPred, Eps, Tt);
+    XtSizeM1 := Xt.Size - 1;
     case Method of
       smDDPM:
         begin
@@ -429,7 +506,7 @@ begin
           invSqrtAlpha := 1.0 / Sqrt(FAlpha[Tt]);
           coef := FBeta[Tt] / FSqrtOneMinusAlphaBar[Tt];
           if Tt > 1 then sigma := Sqrt(FBeta[Tt]) else sigma := 0;
-          for i := 0 to Xt.Size - 1 do
+          for i := 0 to XtSizeM1 do
           begin
             if Tt > 1 then z := RandG(0, 1) else z := 0;
             Xt.FData[i] := invSqrtAlpha *
@@ -450,7 +527,7 @@ begin
           else
             sigma := 0;
           dirCoef := Sqrt(Max(0.0, 1.0 - abPrev - sigma * sigma));
-          for i := 0 to Xt.Size - 1 do
+          for i := 0 to XtSizeM1 do
           begin
             if sigma > 0 then z := RandG(0, 1) else z := 0;
             // x_{TtPrev} = sqrt(ab_prev)*x0 + dirCoef*eps + sigma*z,
@@ -477,7 +554,7 @@ begin
           if TtPrev = 0 then
           begin
             // Final hop: emit the denoised x0 directly.
-            for i := 0 to Xt.Size - 1 do
+            for i := 0 to XtSizeM1 do
               Xt.FData[i] :=
                 (Xt.FData[i] - FSqrtOneMinusAlphaBar[Tt] * Eps.FData[i]) / Sqrt(abT);
             Exit;
@@ -495,7 +572,7 @@ begin
               sigma := 0;                            // sigma_up
             h := Sqrt(Max(0.0, lamPrev * lamPrev - sigma * sigma)); // sigma_down
             if lamT > 0 then r0 := h / lamT else r0 := 0;           // drift ratio
-            for i := 0 to Xt.Size - 1 do
+            for i := 0 to XtSizeM1 do
             begin
               if sigma > 0 then z := RandG(0, 1) else z := 0;
               x0 := (Xt.FData[i] - FSqrtOneMinusAlphaBar[Tt] * Eps.FData[i]) / Sqrt(abT);
@@ -519,7 +596,7 @@ begin
           //   r = h_last / h, h_last = lambda_t - lambda_{Tt of previous step}.
           abT := FAlphaBar[Tt];
           // Convert current eps -> x0 prediction; reuse Eps to hold curX0.
-          for i := 0 to Xt.Size - 1 do
+          for i := 0 to XtSizeM1 do
             Eps.FData[i] := (Xt.FData[i] - FSqrtOneMinusAlphaBar[Tt] * Eps.FData[i]) / Sqrt(abT);
           lamT := Lambda(Tt);
           if TtPrev = 0 then
@@ -530,7 +607,7 @@ begin
               hLast := lamT - FPrevLambda;          // < 0
               h := -hLast;                          // approximate remaining step
               if Abs(h) < 1e-12 then r0 := 1.0 else r0 := hLast / h;
-              for i := 0 to Xt.Size - 1 do
+              for i := 0 to XtSizeM1 do
                 Xt.FData[i] := (1.0 + 1.0 / (2.0 * r0)) * Eps.FData[i]
                   - (1.0 / (2.0 * r0)) * FPrevX0.FData[i];
             end
@@ -546,7 +623,7 @@ begin
           if not FHasPrev then
           begin
             // First-order (DDIM-equivalent) bootstrap.
-            for i := 0 to Xt.Size - 1 do
+            for i := 0 to XtSizeM1 do
               Xt.FData[i] := (sqrtAbPrev / Sqrt(abT)) * Xt.FData[i]
                 - Sqrt(1.0 - abPrev) * (Exp(-h) - 1.0) * Eps.FData[i];
           end
@@ -554,7 +631,7 @@ begin
           begin
             hLast := lamT - FPrevLambda;            // < 0
             if Abs(h) < 1e-12 then r0 := 1.0 else r0 := hLast / h;
-            for i := 0 to Xt.Size - 1 do
+            for i := 0 to XtSizeM1 do
             begin
               curX0 := Eps.FData[i];
               dCoef := (1.0 + 1.0 / (2.0 * r0)) * curX0
@@ -580,16 +657,18 @@ procedure TNNetDiffusionScheduler.Sample(X: TNNetVolume;
   Method: TNNetSamplerMethod; Eta: TNeuralFloat; Spacing: TNNetTimestepSpacing);
 var
   k, Tt, TtPrev: integer;
+  NumStepsM1: integer;
   Pred: TNNetVolume;
   Schedule: TNeuralIntegerArray;
 begin
   if NumSteps < 1 then NumSteps := 1;
+  NumStepsM1 := NumSteps - 1;
   ResetMultistep;
   // Schedule[0..NumSteps]: descending timesteps, Schedule[NumSteps]=0 (clean).
   Schedule := BuildTimestepSchedule(NumSteps, Spacing);
   Pred := TNNetVolume.Create(X);
   try
-    for k := 0 to NumSteps - 1 do
+    for k := 0 to NumStepsM1 do
     begin
       Tt := Schedule[k];
       TtPrev := Schedule[k + 1];
@@ -598,6 +677,89 @@ begin
     end;
   finally
     Pred.Free;
+  end;
+end;
+
+{ TNNetLCMScheduler }
+
+const
+  cLCMSigmaData = 0.5;   // sigma_data in the LCM boundary scalings.
+  cLCMTimeScale = 0.1;   // the 1/0.1 = 10x timestep scaling (Luo et al. 2023).
+
+function TNNetLCMScheduler.CSkip(Tt: integer): TNeuralFloat;
+var ts2, sd2: double;
+begin
+  // c_skip(t) = sigma_data^2 / ((t/0.1)^2 + sigma_data^2).
+  ts2 := Sqr(Tt / cLCMTimeScale);
+  sd2 := Sqr(cLCMSigmaData);
+  Result := sd2 / (ts2 + sd2);
+end;
+
+function TNNetLCMScheduler.COut(Tt: integer): TNeuralFloat;
+var ts, sd2: double;
+begin
+  // c_out(t) = (t/0.1)*sigma_data / sqrt((t/0.1)^2 + sigma_data^2).
+  ts := Tt / cLCMTimeScale;
+  sd2 := Sqr(cLCMSigmaData);
+  Result := ts * cLCMSigmaData / Sqrt(Sqr(ts) + sd2);
+end;
+
+procedure TNNetLCMScheduler.LCMStep(Xt, RawPred: TNNetVolume; Tt: integer);
+var
+  i: integer;
+  XtSizeM1: integer;
+  cs, co: TNeuralFloat;
+  X0Hat: TNNetVolume;
+begin
+  // f(x,t) = c_skip(t)*x + c_out(t)*x0_hat. x0_hat reuses the shared eps/v->x0
+  // plumbing so LCM consumes the SAME raw model output the iterative samplers do.
+  cs := CSkip(Tt);
+  co := COut(Tt);
+  X0Hat := TNNetVolume.Create(Xt);
+  try
+    PredictX0(Xt, RawPred, X0Hat, Tt);
+    XtSizeM1 := Xt.Size - 1;
+    for i := 0 to XtSizeM1 do
+      Xt.FData[i] := cs * Xt.FData[i] + co * X0Hat.FData[i];
+  finally
+    X0Hat.Free;
+  end;
+end;
+
+procedure TNNetLCMScheduler.LCMSample(X: TNNetVolume;
+  Denoise: TNNetDenoiseCallback; NumSteps: integer; Spacing: TNNetTimestepSpacing);
+var
+  k, Tt, TtNext: integer;
+  NumStepsM1: integer;
+  Pred, X0: TNNetVolume;
+  Schedule: TNeuralIntegerArray;
+begin
+  if NumSteps < 1 then NumSteps := 1;
+  NumStepsM1 := NumSteps - 1;
+  // Schedule[0..NumSteps]: descending timesteps, Schedule[NumSteps]=0 (clean).
+  Schedule := BuildTimestepSchedule(NumSteps, Spacing);
+  Pred := TNNetVolume.Create(X);
+  X0   := TNNetVolume.Create(X);
+  try
+    for k := 0 to NumStepsM1 do
+    begin
+      Tt := Schedule[k];
+      TtNext := Schedule[k + 1];
+      // 1. evaluate the consistency function f(x_t,t) -> x0 estimate.
+      Denoise(X, Pred, Tt);
+      LCMStep(X, Pred, Tt);   // X now holds the consistency x0 estimate.
+      if TtNext > 0 then
+      begin
+        // 2. re-noise the x0 estimate FORWARD to the next, smaller timestep with
+        //    fresh Gaussian noise (the LCM multistep "noise back" hop).
+        X0.Copy(X);
+        AddNoise(X0, X, TtNext);
+      end;
+      // On the last step (TtNext=0) X already holds the final x0 estimate.
+    end;
+  finally
+    Pred.Free;
+    X0.Free;
   end;
 end;
 

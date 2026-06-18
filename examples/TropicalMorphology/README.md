@@ -14,7 +14,7 @@ with **max** (or **min**):
 The weights `W` are learnable **additive thresholds** (a morphological
 structuring element), and the combine op is `max` / `min`. As a result the layer
 learns piecewise-linear **convex** (dilation) / **concave** (erosion) functions
-and *tropical polynomials* — a genuinely **different hypothesis class** from any
+and *tropical polynomials* — a **different hypothesis class** from any
 linear layer, and from the *parameterless* max/min pooling layers.
 
 Forward is `O(Din·Dout)`, like a dense layer. Backward is the same hard

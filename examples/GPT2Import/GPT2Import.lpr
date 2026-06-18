@@ -56,7 +56,7 @@ uses
   {$IFDEF UNIX}cthreads, cmem,{$ENDIF}
   Classes, SysUtils,
   neuralvolume, neuralnetwork,
-  neuralsafetensors, neuralpretrained, neuralhftokenizer;
+  neuralsafetensors, neuralpretrained, neuralhftokenizer, neuraldecode;
 
 const
   csDefaultSeqLen = 64;
@@ -140,11 +140,12 @@ end;
 var
   NN: TNNet;
   Config: TGPT2Config;
-  Input, Output: TNNetVolume;
+  Session: TNNetStreamingDecoder;
+  InV, Output: TNNetVolume;
   Prompt: array of integer;
   FileName: string;
   SeqLen, NumHeads, ParamCnt: integer;
-  TokenCnt, PromptLen, StepCnt, PosIdx: integer;
+  TokenCnt, PromptLen, StepCnt: integer;
   BestToken, TokCnt: integer;
   BestLogit: TNeuralFloat;
   Tokenizer: TNeuralHFTokenizer;
@@ -233,22 +234,25 @@ begin
   WriteLn('Loading ', FileName, ' ...');
   // This program only generates (never trains), so free the training
   // volumes during construction: ~1/3 the memory, full GPT-2 fits in RAM.
-  NN := BuildGPT2FromSafeTensorsEx(FileName, Config, SeqLen, NumHeads,
+  // The net is built at INPUT WIDTH 1 (pSeqLen=1): KV-cache streamed decode
+  // feeds one token per forward and the learned wpe table (sized to the full
+  // n_ctx, independent of the built input width) is indexed at the absolute
+  // position via PositionOffset, so no wide input layer is ever needed.
+  NN := BuildGPT2FromSafeTensorsEx(FileName, Config, {pSeqLen=}1, NumHeads,
     {pInferenceOnly=}true);
   try
     WriteLn(GPT2ConfigToString(Config));
     if SeqLen <= 0 then SeqLen := Config.NCtx;
-    WriteLn('Context window built: ', SeqLen, ' tokens.');
+    WriteLn('KV-cache context budget: ', SeqLen, ' tokens.');
     WriteLn;
     WriteLn('--- Architecture ---');
     NN.DebugStructure();
     WriteLn;
 
-    // Greedy generation from raw token ids. The net is a fixed-width
-    // causal LM: feed the current sequence left-aligned (positions past
-    // the end padded with token 0 - the causal mask keeps them from
-    // influencing earlier positions) and read the logits row of the last
-    // real position.
+    // Generation from raw token ids via a KV-cache streamed session: the
+    // prompt is prefilled token-at-a-time and each new token costs ONE
+    // width-1 forward over the cached past, instead of re-encoding the whole
+    // growing prefix every step.
     for TokenCnt := 0 to High(Prompt) do
       if (Prompt[TokenCnt] < 0) or (Prompt[TokenCnt] >= Config.VocabSize) then
       begin
@@ -272,30 +276,38 @@ begin
       if TopK > 0 then Write(', top-k ', TopK);
       WriteLn('.');
     end;
-    Input := TNNetVolume.Create(SeqLen, 1, 1);
-    Output := TNNetVolume.Create;
+    // KV-cache session over the width-1 net; the budget (SeqLen) must cover
+    // the longest sequence (prompt + continuation) ever produced.
+    Session := TNNetStreamingDecoder.Create(NN, SeqLen);
+    InV := TNNetVolume.Create(1, 1, 1);
     try
+      Session.Reset();
+      // Prefill tokens 0..PromptLen-2 (each at its absolute position); the
+      // LAST prompt token is fed as the first decode step's input.
+      for TokenCnt := 0 to PromptLen - 2 do
+      begin
+        InV.FData[0] := Prompt[TokenCnt];
+        Session.StepForward(InV, TokenCnt);
+      end;
       Write('Generated continuation:');
       for StepCnt := 1 to csNewTokens do
       begin
         if PromptLen >= SeqLen then break;
-        Input.Fill(0);
-        for TokenCnt := 0 to PromptLen - 1 do
-          Input.FData[TokenCnt] := Prompt[TokenCnt];
-        NN.Compute(Input);
-        NN.GetOutput(Output);
-        PosIdx := PromptLen - 1; // logits row predicting the NEXT token
+        // One width-1 forward of the last committed token over the cached past.
+        InV.FData[0] := Prompt[PromptLen - 1];
+        Session.StepForward(InV, PromptLen - 1);
+        Output := Session.Output(); // (1,1,vocab) -- the single logits row
         if UseSampling then
-          BestToken := SampleNextToken(Output, PosIdx, Config.VocabSize,
+          BestToken := SampleNextToken(Output, {PosIdx=}0, Config.VocabSize,
             Temperature, TopK)
         else
         begin
           BestToken := 0;
-          BestLogit := Output.FData[PosIdx * Config.VocabSize];
+          BestLogit := Output.FData[0];
           for TokCnt := 1 to Config.VocabSize - 1 do
-            if Output.FData[PosIdx * Config.VocabSize + TokCnt] > BestLogit then
+            if Output.FData[TokCnt] > BestLogit then
             begin
-              BestLogit := Output.FData[PosIdx * Config.VocabSize + TokCnt];
+              BestLogit := Output.FData[TokCnt];
               BestToken := TokCnt;
             end;
         end;
@@ -316,8 +328,8 @@ begin
         WriteLn(' tokenizer.json next to the checkpoint for text in/out.)');
       end;
     finally
-      Output.Free;
-      Input.Free;
+      InV.Free;
+      Session.Free; // before NN.Free below: Destroy ends incremental decode on NN
     end;
   finally
     Tokenizer.Free;

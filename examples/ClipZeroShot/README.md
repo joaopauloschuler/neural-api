@@ -1,12 +1,11 @@
-# CLIP zero-shot classification (the first vision-language import)
+# CLIP zero-shot classification
 
 CLIP (Radford et al. 2021, [arXiv:2103.00020](https://arxiv.org/abs/2103.00020))
 classifies images **zero-shot**: embed the image with one tower, embed a text
 prompt per candidate class with the other, and softmax the scaled cosine
 similarities — no task-specific training at all. This example shows that exact
 structure on top of `BuildClipFromSafeTensors`
-(`neural/neuralpretrained.pas`, the repo's first **vision-language** importer
-and first **ViT**), which returns the contrastive dual encoder as **two
+(`neural/neuralpretrained.pas`), which returns the contrastive dual encoder as **two
 independent nets** (the T5/Marian two-net convention, but as peers — no
 cross-attention):
 

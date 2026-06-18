@@ -19,7 +19,7 @@ Over a `(SeqLen, 1, d)` tensor (`d` even) the SGU:
    `(SeqLen, 1, d/2)`.
 
 Because `W` is fixed after training (it does not depend on the input), the SGU is
-a genuinely different primitive from attention — there are no per-input
+a different primitive from attention — there are no per-input
 query/key scores, just one static cross-token matrix. The mixing matrix is a
 true `SeqLen x SeqLen` object, so the sequence length is **pinned at
 construction** (`TNNetSpatialGatingUnit.Create(SeqLen)`); a mismatched input is
