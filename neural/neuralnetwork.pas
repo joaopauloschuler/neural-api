@@ -9545,6 +9545,7 @@ type
     FCache: TNNetVolume;       // x_{i+1} stacked: row i holds the input to H_i
     FgBuf: array of TNeuralFloat; // backward reflection-walk scratch g (length n)
     procedure ComputePreviousLayerErrorCPU(); override;
+    procedure FreeBackpropScratch();
   public
     // pSizeY carries the reflection count K (this is a vector n->n map, so the
     // SizeY output axis is otherwise unused); K<=0 defaults to K=n. pDepth is
@@ -9554,6 +9555,7 @@ type
     // overload (it would be ambiguous with the inherited FullConnect signature).
     constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
     destructor Destroy(); override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure Compute(); override;
     procedure ComputeCPU(); override;
@@ -9644,6 +9646,7 @@ type
     procedure SyncCurvatureFromRaw();    // c = bounded-sigmoid(raw)
     procedure SeedCurvatureRaw();        // raw := logit((c0-CMIN)/(CMAX-CMIN))
     procedure AccumulateCurvatureGradient(); // dL/draw -> curvature neuron Delta
+    procedure FreeBackpropScratch();
   public
     // pSizeX carries D_out (the map is D_in -> D_out). pCurvature is the fixed
     // (or, when pLearnCurvature, the INITIAL) ball curvature c > 0 (default 1.0).
@@ -9651,6 +9654,7 @@ type
     // single trainable scalar (see class header); default false keeps c fixed.
     constructor Create(pSizeX: integer; pCurvature: TNeuralFloat = 1.0; pSuppressBias: integer = 0; pLearnCurvature: boolean = false); reintroduce; overload;
     destructor Destroy(); override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure InitDefault(); override;
     procedure Compute(); override;
@@ -9708,11 +9712,13 @@ type
     procedure MobiusAddBack(const c: TNeuralFloat; const A: TNNetVolume;
       const Bvec: TNNetVolume; const M: TNNetVolume; const kk: integer;
       const dLdm: array of TNeuralFloat; var dLda, dLdb: array of TNeuralFloat);
+    procedure FreeBackpropScratch();
   public
     // pNumProto carries K (the number of learnable prototypes => output Size).
     // pCurvature is the fixed ball curvature c > 0 (default 1.0).
     constructor Create(pNumProto: integer; pCurvature: TNeuralFloat = 1.0); reintroduce; overload;
     destructor Destroy(); override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure Compute(); override;
     procedure ComputeCPU(); override;
@@ -9908,12 +9914,14 @@ type
     FgAttDstBuf: array of TNeuralFloat;  // bwd scratch (sized OutFeat)
     FgColDstBuf: array of TNeuralFloat;  // bwd scratch (sized FNumNodes)
     procedure ComputePreviousLayerErrorCPU(); override;
+    procedure FreeBackpropScratch();
   public
     constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
     constructor Create(pNumFeatures: integer; pSuppressBias: integer = 0); overload;
     constructor Create(pNumFeatures: integer; pAttentionDropout: TNeuralFloat;
       pSuppressBias: integer); overload;
     destructor Destroy(); override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
     // Attention-dropout train/inference gate; TNNet.EnableDropouts toggles it.
     property Enabled: boolean read FEnabled write FEnabled;
     procedure SetAdjacency(A: TNNetVolume);
@@ -11387,9 +11395,11 @@ type
     FdPooledBuf: array of TNeuralFloat; // BackpropagateCPU dL/dpooled accumulator (FInDepth)
     procedure ComputeCPU();
     procedure BackpropagateCPU();
+    procedure FreeBackpropScratch();
   public
     constructor Create(pNumExperts, pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); reintroduce; overload;
     destructor Destroy(); override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure InitDefault(); override;
     procedure Compute(); override;
@@ -11666,9 +11676,11 @@ type
     FdxRBuf: array of TNeuralFloat; // backward scratch, length n
     procedure ComputeCPU();
     procedure BackpropagateCPU();
+    procedure FreeBackpropScratch();
   public
     constructor Create(pSuppressBias: integer = 0); overload;
     destructor Destroy(); override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure InitDefault(); override;
     procedure Compute(); override;
@@ -11706,9 +11718,11 @@ type
     FGBuf: array of TNeuralFloat; // backward scratch dY*A, q x p (length n)
     procedure ComputeCPU();
     procedure BackpropagateCPU();
+    procedure FreeBackpropScratch();
   public
     constructor Create(pSuppressBias: integer = 0; pP: integer = 0); overload;
     destructor Destroy(); override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure InitDefault(); override;
     procedure Compute(); override;
@@ -11830,9 +11844,11 @@ type
     FBBuf: array of TNeuralFloat; // per-inner-node right subtree sums (len FNumInner)
     procedure ComputeCPU();
     procedure BackpropagateCPU();
+    procedure FreeBackpropScratch();
   public
     constructor Create(TreeDepth, OutputDepth: integer; Beta: TNeuralFloat = 1.0); overload;
     destructor Destroy(); override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure InitDefault(); override;
     procedure Compute(); override;
@@ -63080,11 +63096,22 @@ begin
   // Expert + routing neurons are sized in SetPrevLayer once InDepth is known.
 end;
 
+procedure TNNetCondConv.FreeBackpropScratch();
+begin
+  SetLength(FdPooledBuf, 0);
+end;
+
+function TNNetCondConv.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+begin
+  Result := inherited SetInferenceOnly(pInferenceOnly);
+  if pInferenceOnly then FreeBackpropScratch();
+end;
+
 destructor TNNetCondConv.Destroy();
 begin
   FWeff.Free;
   FPooled.Free;
-  SetLength(FdPooledBuf, 0);
+  FreeBackpropScratch();
   inherited Destroy();
 end;
 
@@ -63115,19 +63142,29 @@ begin
   for iK := 0 to MaxNExp do
   begin
     FNeurons[iK].Weights.ReSize(FKSize, 1, 1);
-    FNeurons[iK].BackInertia.ReSize(FKSize, 1, 1);
-    FNeurons[iK].Delta.ReSize(FKSize, 1, 1);
+    // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
+    if not FInferenceOnly then
+    begin
+      FNeurons[iK].BackInertia.ReSize(FKSize, 1, 1);
+      FNeurons[iK].Delta.ReSize(FKSize, 1, 1);
+    end;
     FNeurons[iK].FBiasWeight := 0;
   end;
   // Routing weights: K*InDepth.
   FNeurons[FNumExperts].Weights.ReSize(FNumExperts * FInDepth, 1, 1);
-  FNeurons[FNumExperts].BackInertia.ReSize(FNumExperts * FInDepth, 1, 1);
-  FNeurons[FNumExperts].Delta.ReSize(FNumExperts * FInDepth, 1, 1);
+  if not FInferenceOnly then
+  begin
+    FNeurons[FNumExperts].BackInertia.ReSize(FNumExperts * FInDepth, 1, 1);
+    FNeurons[FNumExperts].Delta.ReSize(FNumExperts * FInDepth, 1, 1);
+  end;
   FNeurons[FNumExperts].FBiasWeight := 0;
   // Routing biases: K.
   FNeurons[FNumExperts + 1].Weights.ReSize(FNumExperts, 1, 1);
-  FNeurons[FNumExperts + 1].BackInertia.ReSize(FNumExperts, 1, 1);
-  FNeurons[FNumExperts + 1].Delta.ReSize(FNumExperts, 1, 1);
+  if not FInferenceOnly then
+  begin
+    FNeurons[FNumExperts + 1].BackInertia.ReSize(FNumExperts, 1, 1);
+    FNeurons[FNumExperts + 1].Delta.ReSize(FNumExperts, 1, 1);
+  end;
   FNeurons[FNumExperts + 1].FBiasWeight := 0;
 
   FVectorSize := FKSize;
@@ -63137,8 +63174,10 @@ begin
 
   FWeff.ReSize(FKSize, 1, 1);
   FPooled.ReSize(FInDepth, 1, 1);
-  SetLength(FAlpha, FNumExperts);
-  SetLength(FdPooledBuf, FInDepth);  // FInDepth fixed for this instance
+  SetLength(FAlpha, FNumExperts);  // forward routing coefficients
+  // Backprop-only scratch: skip on inference-only layers.
+  if not FInferenceOnly then
+    SetLength(FdPooledBuf, FInDepth);  // FInDepth fixed for this instance
 
   InitDefault();
   RefreshCalculatePrevLayerError();
@@ -63439,34 +63478,50 @@ begin
   while FNeurons.Count < NeededNeurons do
     FNeurons.Add(TNNetNeuron.Create());
 
-  // neuron 0: main conv weights.
+  // neuron 0: main conv weights. Backprop-only per-neuron weight mirrors
+  // (BackInertia/Delta) are skipped on inference-only layers.
   FNeurons[0].Weights.ReSize(FMainSize, 1, 1);
-  FNeurons[0].BackInertia.ReSize(FMainSize, 1, 1);
-  FNeurons[0].Delta.ReSize(FMainSize, 1, 1);
+  if not FInferenceOnly then
+  begin
+    FNeurons[0].BackInertia.ReSize(FMainSize, 1, 1);
+    FNeurons[0].Delta.ReSize(FMainSize, 1, 1);
+  end;
   FNeurons[0].FBiasWeight := 0;
   // neuron 1: main conv biases (one per output channel; empty if suppressed).
   if FStruct[4] = 0 then
   begin
     FNeurons[1].Weights.ReSize(FOutDepth, 1, 1);
-    FNeurons[1].BackInertia.ReSize(FOutDepth, 1, 1);
-    FNeurons[1].Delta.ReSize(FOutDepth, 1, 1);
+    if not FInferenceOnly then
+    begin
+      FNeurons[1].BackInertia.ReSize(FOutDepth, 1, 1);
+      FNeurons[1].Delta.ReSize(FOutDepth, 1, 1);
+    end;
   end
   else
   begin
     FNeurons[1].Weights.ReSize(1, 1, 1);
-    FNeurons[1].BackInertia.ReSize(1, 1, 1);
-    FNeurons[1].Delta.ReSize(1, 1, 1);
+    if not FInferenceOnly then
+    begin
+      FNeurons[1].BackInertia.ReSize(1, 1, 1);
+      FNeurons[1].Delta.ReSize(1, 1, 1);
+    end;
   end;
   FNeurons[1].FBiasWeight := 0;
   // neuron 2: offset-head weights.
   FNeurons[2].Weights.ReSize(FOffSize, 1, 1);
-  FNeurons[2].BackInertia.ReSize(FOffSize, 1, 1);
-  FNeurons[2].Delta.ReSize(FOffSize, 1, 1);
+  if not FInferenceOnly then
+  begin
+    FNeurons[2].BackInertia.ReSize(FOffSize, 1, 1);
+    FNeurons[2].Delta.ReSize(FOffSize, 1, 1);
+  end;
   FNeurons[2].FBiasWeight := 0;
   // neuron 3: offset-head biases (2*KK).
   FNeurons[3].Weights.ReSize(FOffOut, 1, 1);
-  FNeurons[3].BackInertia.ReSize(FOffOut, 1, 1);
-  FNeurons[3].Delta.ReSize(FOffOut, 1, 1);
+  if not FInferenceOnly then
+  begin
+    FNeurons[3].BackInertia.ReSize(FOffOut, 1, 1);
+    FNeurons[3].Delta.ReSize(FOffOut, 1, 1);
+  end;
   FNeurons[3].FBiasWeight := 0;
 
   FVectorSize := FMainSize;
@@ -63908,14 +63963,21 @@ begin
   for co := 0 to MaxFeat do
   begin
     FNeurons[co].Weights.ReSize(FKSize, 1, 1);
-    FNeurons[co].BackInertia.ReSize(FKSize, 1, 1);
-    FNeurons[co].Delta.ReSize(FKSize, 1, 1);
+    // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
+    if not FInferenceOnly then
+    begin
+      FNeurons[co].BackInertia.ReSize(FKSize, 1, 1);
+      FNeurons[co].Delta.ReSize(FKSize, 1, 1);
+    end;
     FNeurons[co].FBiasWeight := 0;
   end;
   // Bias neuron: one bias per FEATURE (shared across the 4 orientations).
   FNeurons[FFeaturesCount].Weights.ReSize(FFeaturesCount, 1, 1);
-  FNeurons[FFeaturesCount].BackInertia.ReSize(FFeaturesCount, 1, 1);
-  FNeurons[FFeaturesCount].Delta.ReSize(FFeaturesCount, 1, 1);
+  if not FInferenceOnly then
+  begin
+    FNeurons[FFeaturesCount].BackInertia.ReSize(FFeaturesCount, 1, 1);
+    FNeurons[FFeaturesCount].Delta.ReSize(FFeaturesCount, 1, 1);
+  end;
   FNeurons[FFeaturesCount].FBiasWeight := 0;
 
   FVectorSize := FKSize;
@@ -64504,12 +64566,23 @@ begin
   BuildArrNeurons();
 end;
 
+procedure TNNetMonarchLinear.FreeBackpropScratch();
+begin
+  SetLength(FdyTBuf, 0);
+  SetLength(FdxRBuf, 0);
+end;
+
+function TNNetMonarchLinear.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+begin
+  Result := inherited SetInferenceOnly(pInferenceOnly);
+  if pInferenceOnly then FreeBackpropScratch();
+end;
+
 destructor TNNetMonarchLinear.Destroy();
 begin
   FCacheXR.Free;
   FCacheZP.Free;
-  SetLength(FdyTBuf, 0);
-  SetLength(FdxRBuf, 0);
+  FreeBackpropScratch();
   inherited Destroy();
 end;
 
@@ -64541,21 +64614,32 @@ begin
   FOutputErrorDeriv.ReSize(N, 1, 1);
   FCacheXR.ReSize(N, 1, 1);
   FCacheZP.ReSize(N, 1, 1);
-  SetLength(FdyTBuf, N);
-  SetLength(FdxRBuf, N);
+  // Backprop-only scratch: skip on inference-only layers.
+  if not FInferenceOnly then
+  begin
+    SetLength(FdyTBuf, N);
+    SetLength(FdxRBuf, N);
+  end;
 
   // neuron 0 = R, neuron 1 = L (each b blocks of m*m), neuron 2 = bias (n).
   BlockWeights := FBlocks * FBlockSize * FBlockSize;
   for d := 0 to 1 do
   begin
     FNeurons[d].Weights.ReSize(BlockWeights, 1, 1);
-    FNeurons[d].BackInertia.ReSize(BlockWeights, 1, 1);
-    FNeurons[d].Delta.ReSize(BlockWeights, 1, 1);
+    // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
+    if not FInferenceOnly then
+    begin
+      FNeurons[d].BackInertia.ReSize(BlockWeights, 1, 1);
+      FNeurons[d].Delta.ReSize(BlockWeights, 1, 1);
+    end;
     FNeurons[d].FBiasWeight := 0;
   end;
   FNeurons[2].Weights.ReSize(N, 1, 1);
-  FNeurons[2].BackInertia.ReSize(N, 1, 1);
-  FNeurons[2].Delta.ReSize(N, 1, 1);
+  if not FInferenceOnly then
+  begin
+    FNeurons[2].BackInertia.ReSize(N, 1, 1);
+    FNeurons[2].Delta.ReSize(N, 1, 1);
+  end;
   FNeurons[2].FBiasWeight := 0;
   BuildArrNeurons();
 
@@ -64787,10 +64871,21 @@ begin
   BuildArrNeurons();
 end;
 
+procedure TNNetKroneckerLinear.FreeBackpropScratch();
+begin
+  SetLength(FGBuf, 0);
+end;
+
+function TNNetKroneckerLinear.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+begin
+  Result := inherited SetInferenceOnly(pInferenceOnly);
+  if pInferenceOnly then FreeBackpropScratch();
+end;
+
 destructor TNNetKroneckerLinear.Destroy();
 begin
   FCacheBX.Free;
-  SetLength(FGBuf, 0);
+  FreeBackpropScratch();
   inherited Destroy();
 end;
 
@@ -64826,20 +64921,26 @@ begin
   FOutputError.ReSize(N, 1, 1);
   FOutputErrorDeriv.ReSize(N, 1, 1);
   FCacheBX.ReSize(N, 1, 1); // B*X is q x p = n reals
-  SetLength(FGBuf, N); // dY*A scratch is q x p = n reals
+  // Backprop-only scratch: skip on inference-only layers.
+  if not FInferenceOnly then
+    SetLength(FGBuf, N); // dY*A scratch is q x p = n reals
 
   // neuron 0 = A (p*p), neuron 1 = B (q*q), neuron 2 = bias (n).
+  // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
   FNeurons[0].Weights.ReSize(FP * FP, 1, 1);
-  FNeurons[0].BackInertia.ReSize(FP * FP, 1, 1);
-  FNeurons[0].Delta.ReSize(FP * FP, 1, 1);
-  FNeurons[0].FBiasWeight := 0;
   FNeurons[1].Weights.ReSize(FQ * FQ, 1, 1);
-  FNeurons[1].BackInertia.ReSize(FQ * FQ, 1, 1);
-  FNeurons[1].Delta.ReSize(FQ * FQ, 1, 1);
-  FNeurons[1].FBiasWeight := 0;
   FNeurons[2].Weights.ReSize(N, 1, 1);
-  FNeurons[2].BackInertia.ReSize(N, 1, 1);
-  FNeurons[2].Delta.ReSize(N, 1, 1);
+  if not FInferenceOnly then
+  begin
+    FNeurons[0].BackInertia.ReSize(FP * FP, 1, 1);
+    FNeurons[0].Delta.ReSize(FP * FP, 1, 1);
+    FNeurons[1].BackInertia.ReSize(FQ * FQ, 1, 1);
+    FNeurons[1].Delta.ReSize(FQ * FQ, 1, 1);
+    FNeurons[2].BackInertia.ReSize(N, 1, 1);
+    FNeurons[2].Delta.ReSize(N, 1, 1);
+  end;
+  FNeurons[0].FBiasWeight := 0;
+  FNeurons[1].FBiasWeight := 0;
   FNeurons[2].FBiasWeight := 0;
   BuildArrNeurons();
 
@@ -65153,13 +65254,20 @@ begin
   begin
     sz := FRanks[k] * FFactors[k] * FFactors[k] * FRanks[k + 1];
     FNeurons[k].Weights.ReSize(sz, 1, 1);
-    FNeurons[k].BackInertia.ReSize(sz, 1, 1);
-    FNeurons[k].Delta.ReSize(sz, 1, 1);
+    // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
+    if not FInferenceOnly then
+    begin
+      FNeurons[k].BackInertia.ReSize(sz, 1, 1);
+      FNeurons[k].Delta.ReSize(sz, 1, 1);
+    end;
     FNeurons[k].FBiasWeight := 0;
   end;
   FNeurons[FCores].Weights.ReSize(FDim, 1, 1);
-  FNeurons[FCores].BackInertia.ReSize(FDim, 1, 1);
-  FNeurons[FCores].Delta.ReSize(FDim, 1, 1);
+  if not FInferenceOnly then
+  begin
+    FNeurons[FCores].BackInertia.ReSize(FDim, 1, 1);
+    FNeurons[FCores].Delta.ReSize(FDim, 1, 1);
+  end;
   FNeurons[FCores].FBiasWeight := 0;
   BuildArrNeurons();
 end;
@@ -65451,13 +65559,24 @@ begin
   BuildArrNeurons();
 end;
 
+procedure TNNetSoftDecisionTree.FreeBackpropScratch();
+begin
+  SetLength(FrBuf, 0);
+  SetLength(FABuf, 0);
+  SetLength(FBBuf, 0);
+end;
+
+function TNNetSoftDecisionTree.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+begin
+  Result := inherited SetInferenceOnly(pInferenceOnly);
+  if pInferenceOnly then FreeBackpropScratch();
+end;
+
 destructor TNNetSoftDecisionTree.Destroy();
 begin
   FCacheP.Free;
   FCacheLeaf.Free;
-  SetLength(FrBuf, 0);
-  SetLength(FABuf, 0);
-  SetLength(FBBuf, 0);
+  FreeBackpropScratch();
   inherited Destroy();
 end;
 
@@ -65475,25 +65594,36 @@ begin
   FOutputErrorDeriv.ReSize(1, 1, FOutDepth);
   FCacheP.ReSize(FNumInner, 1, 1);
   FCacheLeaf.ReSize(FNumLeaves, 1, 1);
-  SetLength(FrBuf, FNumLeaves);
-  SetLength(FABuf, FNumInner);
-  SetLength(FBBuf, FNumInner);
+  // Backprop-only scratch: skip on inference-only layers.
+  if not FInferenceOnly then
+  begin
+    SetLength(FrBuf, FNumLeaves);
+    SetLength(FABuf, FNumInner);
+    SetLength(FBBuf, FNumInner);
+  end;
 
   // Gate neurons: Din weights + bias each.
   MaxInner := FNumInner - 1;
   for i := 0 to MaxInner do
   begin
     FNeurons[i].Weights.ReSize(FInSize, 1, 1);
-    FNeurons[i].BackInertia.ReSize(FInSize, 1, 1);
-    FNeurons[i].Delta.ReSize(FInSize, 1, 1);
+    // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
+    if not FInferenceOnly then
+    begin
+      FNeurons[i].BackInertia.ReSize(FInSize, 1, 1);
+      FNeurons[i].Delta.ReSize(FInSize, 1, 1);
+    end;
   end;
   // Leaf neurons: OutputDepth weights, no bias.
   MaxLeaf := FNumLeaves - 1;
   for i := 0 to MaxLeaf do
   begin
     FNeurons[FNumInner + i].Weights.ReSize(FOutDepth, 1, 1);
-    FNeurons[FNumInner + i].BackInertia.ReSize(FOutDepth, 1, 1);
-    FNeurons[FNumInner + i].Delta.ReSize(FOutDepth, 1, 1);
+    if not FInferenceOnly then
+    begin
+      FNeurons[FNumInner + i].BackInertia.ReSize(FOutDepth, 1, 1);
+      FNeurons[FNumInner + i].Delta.ReSize(FOutDepth, 1, 1);
+    end;
   end;
   BuildArrNeurons();
 
@@ -65744,8 +65874,12 @@ begin
 
   // neuron 0 = W (D rows of Din weights; row k at k*Din). No bias.
   FNeurons[0].Weights.ReSize(FNumFeatures * FInSize, 1, 1);
-  FNeurons[0].BackInertia.ReSize(FNumFeatures * FInSize, 1, 1);
-  FNeurons[0].Delta.ReSize(FNumFeatures * FInSize, 1, 1);
+  // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
+  if not FInferenceOnly then
+  begin
+    FNeurons[0].BackInertia.ReSize(FNumFeatures * FInSize, 1, 1);
+    FNeurons[0].Delta.ReSize(FNumFeatures * FInSize, 1, 1);
+  end;
   FNeurons[0].FBiasWeight := 0;
   BuildArrNeurons();
 
@@ -65897,10 +66031,21 @@ begin
   BuildArrNeurons();
 end;
 
+procedure TNNetHouseholderLinear.FreeBackpropScratch();
+begin
+  SetLength(FgBuf, 0);
+end;
+
+function TNNetHouseholderLinear.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+begin
+  Result := inherited SetInferenceOnly(pInferenceOnly);
+  if pInferenceOnly then FreeBackpropScratch();
+end;
+
 destructor TNNetHouseholderLinear.Destroy();
 begin
   FCache.Free;
-  SetLength(FgBuf, 0);
+  FreeBackpropScratch();
   inherited Destroy();
 end;
 
@@ -65930,11 +66075,16 @@ begin
   for ReflIdx := 0 to FNumReflections do
   begin
     FNeurons[ReflIdx].Weights.ReSize(N, 1, 1);
-    FNeurons[ReflIdx].BackInertia.ReSize(N, 1, 1);
-    FNeurons[ReflIdx].Delta.ReSize(N, 1, 1);
+    // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
+    if not FInferenceOnly then
+    begin
+      FNeurons[ReflIdx].BackInertia.ReSize(N, 1, 1);
+      FNeurons[ReflIdx].Delta.ReSize(N, 1, 1);
+    end;
   end;
   FCache.ReSize(FNumReflections, 1, N); // row r (depth axis) = input to H_r
-  SetLength(FgBuf, N);
+  // Backprop-only scratch: skip on inference-only layers.
+  if not FInferenceOnly then SetLength(FgBuf, N);
 
   FVectorSize := FNeurons[0].Weights.Size;
   BuildArrNeurons();
@@ -66183,11 +66333,15 @@ procedure TNNetHyperbolicLinear.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   // Size the per-instance backward scratch (D_out vectors plus the D_in dL/du).
-  SetLength(FgBuf, FOutput.Size);
-  SetLength(FdLdvBuf, FOutput.Size);
-  SetLength(FdLdbBuf, FOutput.Size);
-  SetLength(FdLdzBuf, FOutput.Size);
-  SetLength(FdLduBuf, pPrevLayer.Output.Size);
+  // Backprop-only: skip on inference-only layers.
+  if not FInferenceOnly then
+  begin
+    SetLength(FgBuf, FOutput.Size);
+    SetLength(FdLdvBuf, FOutput.Size);
+    SetLength(FdLdbBuf, FOutput.Size);
+    SetLength(FdLdzBuf, FOutput.Size);
+    SetLength(FdLduBuf, pPrevLayer.Output.Size);
+  end;
   // Append ONE extra 1-weight neuron holding the raw (pre-sigmoid) curvature,
   // wired like TNNetRetention's learnable gamma. The matrix-row backward loops
   // only touch FArrNeurons[0..D_out-1], so this neuron is invisible to them but
@@ -66197,8 +66351,12 @@ begin
     AddNeurons(1);
     BuildArrNeurons();
     FNeurons[CurvatureNeuronIdx()].FWeights.ReSize(1, 1, 1);
-    FNeurons[CurvatureNeuronIdx()].FBackInertia.ReSize(1, 1, 1);
-    FNeurons[CurvatureNeuronIdx()].FDelta.ReSize(1, 1, 1);
+    // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
+    if not FInferenceOnly then
+    begin
+      FNeurons[CurvatureNeuronIdx()].FBackInertia.ReSize(1, 1, 1);
+      FNeurons[CurvatureNeuronIdx()].FDelta.ReSize(1, 1, 1);
+    end;
     // Seed only the curvature neuron (the matrix rows were already initialised by
     // the inherited SetPrevLayer); avoids re-drawing the whole weight init.
     SeedCurvatureRaw();
@@ -66226,6 +66384,21 @@ begin
   SeedCurvatureRaw();
 end;
 
+procedure TNNetHyperbolicLinear.FreeBackpropScratch();
+begin
+  SetLength(FgBuf, 0);
+  SetLength(FdLdvBuf, 0);
+  SetLength(FdLdbBuf, 0);
+  SetLength(FdLduBuf, 0);
+  SetLength(FdLdzBuf, 0);
+end;
+
+function TNNetHyperbolicLinear.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+begin
+  Result := inherited SetInferenceOnly(pInferenceOnly);
+  if pInferenceOnly then FreeBackpropScratch();
+end;
+
 destructor TNNetHyperbolicLinear.Destroy();
 begin
   FCacheX.Free;
@@ -66233,11 +66406,7 @@ begin
   FCacheV.Free;
   FCacheZ.Free;
   FCacheB.Free;
-  SetLength(FgBuf, 0);
-  SetLength(FdLdvBuf, 0);
-  SetLength(FdLdbBuf, 0);
-  SetLength(FdLduBuf, 0);
-  SetLength(FdLdzBuf, 0);
+  FreeBackpropScratch();
   inherited Destroy();
 end;
 
@@ -66741,15 +66910,26 @@ begin
   FCacheDen := TNNetVolume.Create();
 end;
 
+procedure TNNetHyperbolicDistance.FreeBackpropScratch();
+begin
+  SetLength(FdLdmBuf, 0);
+  SetLength(FdLdaBuf, 0);
+  SetLength(FdLdbBuf, 0);
+end;
+
+function TNNetHyperbolicDistance.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+begin
+  Result := inherited SetInferenceOnly(pInferenceOnly);
+  if pInferenceOnly then FreeBackpropScratch();
+end;
+
 destructor TNNetHyperbolicDistance.Destroy();
 begin
   FCacheX.Free;
   FCacheM.Free;
   FCacheR.Free;
   FCacheDen.Free;
-  SetLength(FdLdmBuf, 0);
-  SetLength(FdLdaBuf, 0);
-  SetLength(FdLdbBuf, 0);
+  FreeBackpropScratch();
   inherited Destroy();
 end;
 
@@ -66757,9 +66937,13 @@ procedure TNNetHyperbolicDistance.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   // Size the per-instance backward scratch (each a D_in vector).
-  SetLength(FdLdmBuf, pPrevLayer.Output.Size);
-  SetLength(FdLdaBuf, pPrevLayer.Output.Size);
-  SetLength(FdLdbBuf, pPrevLayer.Output.Size);
+  // Backprop-only: skip on inference-only layers.
+  if not FInferenceOnly then
+  begin
+    SetLength(FdLdmBuf, pPrevLayer.Output.Size);
+    SetLength(FdLdaBuf, pPrevLayer.Output.Size);
+    SetLength(FdLdbBuf, pPrevLayer.Output.Size);
+  end;
 end;
 
 procedure TNNetHyperbolicDistance.Compute();
@@ -67056,13 +67240,20 @@ begin
   for oq := 0 to outQMax do
   begin
     FNeurons[oq].Weights.ReSize(taps, 1, 1);
-    FNeurons[oq].BackInertia.ReSize(taps, 1, 1);
-    FNeurons[oq].Delta.ReSize(taps, 1, 1);
+    // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
+    if not FInferenceOnly then
+    begin
+      FNeurons[oq].BackInertia.ReSize(taps, 1, 1);
+      FNeurons[oq].Delta.ReSize(taps, 1, 1);
+    end;
   end;
   // Bias neuron: one bias per output channel.
   FNeurons[FOutQuaternions].Weights.ReSize(OutDepth, 1, 1);
-  FNeurons[FOutQuaternions].BackInertia.ReSize(OutDepth, 1, 1);
-  FNeurons[FOutQuaternions].Delta.ReSize(OutDepth, 1, 1);
+  if not FInferenceOnly then
+  begin
+    FNeurons[FOutQuaternions].BackInertia.ReSize(OutDepth, 1, 1);
+    FNeurons[FOutQuaternions].Delta.ReSize(OutDepth, 1, 1);
+  end;
 
   FVectorSize := taps;
   FShouldConcatWeights := false;
@@ -67401,13 +67592,20 @@ begin
   for oc := 0 to outCMax do
   begin
     FNeurons[oc].Weights.ReSize(taps, 1, 1);
-    FNeurons[oc].BackInertia.ReSize(taps, 1, 1);
-    FNeurons[oc].Delta.ReSize(taps, 1, 1);
+    // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
+    if not FInferenceOnly then
+    begin
+      FNeurons[oc].BackInertia.ReSize(taps, 1, 1);
+      FNeurons[oc].Delta.ReSize(taps, 1, 1);
+    end;
   end;
   // Bias neuron: one bias per output channel.
   FNeurons[FOutComplex].Weights.ReSize(OutDepth, 1, 1);
-  FNeurons[FOutComplex].BackInertia.ReSize(OutDepth, 1, 1);
-  FNeurons[FOutComplex].Delta.ReSize(OutDepth, 1, 1);
+  if not FInferenceOnly then
+  begin
+    FNeurons[FOutComplex].BackInertia.ReSize(OutDepth, 1, 1);
+    FNeurons[FOutComplex].Delta.ReSize(OutDepth, 1, 1);
+  end;
 
   FVectorSize := taps;
   FShouldConcatWeights := false;
@@ -67729,13 +67927,20 @@ begin
   for oo := 0 to outOMax do
   begin
     FNeurons[oo].Weights.ReSize(taps, 1, 1);
-    FNeurons[oo].BackInertia.ReSize(taps, 1, 1);
-    FNeurons[oo].Delta.ReSize(taps, 1, 1);
+    // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
+    if not FInferenceOnly then
+    begin
+      FNeurons[oo].BackInertia.ReSize(taps, 1, 1);
+      FNeurons[oo].Delta.ReSize(taps, 1, 1);
+    end;
   end;
   // Bias neuron: one bias per output channel.
   FNeurons[FOutOctonions].Weights.ReSize(OutDepth, 1, 1);
-  FNeurons[FOutOctonions].BackInertia.ReSize(OutDepth, 1, 1);
-  FNeurons[FOutOctonions].Delta.ReSize(OutDepth, 1, 1);
+  if not FInferenceOnly then
+  begin
+    FNeurons[FOutOctonions].BackInertia.ReSize(OutDepth, 1, 1);
+    FNeurons[FOutOctonions].Delta.ReSize(OutDepth, 1, 1);
+  end;
 
   FVectorSize := taps;
   FShouldConcatWeights := false;
@@ -68419,8 +68624,12 @@ begin
   for oo := 0 to outDepthMax do
   begin
     FNeurons[oo].Weights.ReSize(coeffs, 1, 1);
-    FNeurons[oo].BackInertia.ReSize(coeffs, 1, 1);
-    FNeurons[oo].Delta.ReSize(coeffs, 1, 1);
+    // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
+    if not FInferenceOnly then
+    begin
+      FNeurons[oo].BackInertia.ReSize(coeffs, 1, 1);
+      FNeurons[oo].Delta.ReSize(coeffs, 1, 1);
+    end;
   end;
 
   FVectorSize := coeffs;
@@ -69057,13 +69266,24 @@ begin
   FFloatSt[0] := pAttentionDropout;
 end;
 
+procedure TNNetGraphAttention.FreeBackpropScratch();
+begin
+  SetLength(FgAttSrcBuf, 0);
+  SetLength(FgAttDstBuf, 0);
+  SetLength(FgColDstBuf, 0);
+end;
+
+function TNNetGraphAttention.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+begin
+  Result := inherited SetInferenceOnly(pInferenceOnly);
+  if pInferenceOnly then FreeBackpropScratch();
+end;
+
 destructor TNNetGraphAttention.Destroy();
 begin
   SetLength(FSrcScoreBuf, 0);
   SetLength(FDstScoreBuf, 0);
-  SetLength(FgAttSrcBuf, 0);
-  SetLength(FgAttDstBuf, 0);
-  SetLength(FgColDstBuf, 0);
+  FreeBackpropScratch();
   FMask.Free;
   FAggIn.Free;
   FAggErr.Free;
@@ -69122,19 +69342,28 @@ begin
   FAggIn.ReSize(FNumNodes, 1, OutFeat);
   FAggErr.ReSize(FNumNodes, 1, OutFeat);
   // Per-pass scratch (fixed shapes: FNumNodes nodes, OutFeat features).
+  // FSrcScoreBuf/FDstScoreBuf are forward Compute scratch; the rest is
+  // backprop-only and skipped on inference-only layers.
   SetLength(FSrcScoreBuf, FNumNodes);
   SetLength(FDstScoreBuf, FNumNodes);
-  SetLength(FgAttSrcBuf, OutFeat);
-  SetLength(FgAttDstBuf, OutFeat);
-  SetLength(FgColDstBuf, FNumNodes);
+  if not FInferenceOnly then
+  begin
+    SetLength(FgAttSrcBuf, OutFeat);
+    SetLength(FgAttDstBuf, OutFeat);
+    SetLength(FgColDstBuf, FNumNodes);
+  end;
   // Size the W neurons (one per output feature) to FeatureDim_in.
   SetNumWeightsForAllNeurons(FInFeat);
   // Append the attention-vector neuron (length 2*OutFeat) if not present yet.
   if FNeurons.Count = OutFeat then
     FNeurons.Add(TNNetNeuron.Create());
   FNeurons[OutFeat].Weights.ReSize(2 * OutFeat, 1, 1);
-  FNeurons[OutFeat].BackInertia.ReSize(2 * OutFeat, 1, 1);
-  FNeurons[OutFeat].Delta.ReSize(2 * OutFeat, 1, 1);
+  // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
+  if not FInferenceOnly then
+  begin
+    FNeurons[OutFeat].BackInertia.ReSize(2 * OutFeat, 1, 1);
+    FNeurons[OutFeat].Delta.ReSize(2 * OutFeat, 1, 1);
+  end;
   FVectorSize := FNeurons[0].Weights.Size;
   InitDefault();
   BuildArrNeurons();
@@ -74981,8 +75210,12 @@ begin
   // and UpdateRoutingBias() is the only writer.
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   FNeurons[0].FWeights.ReSize(pPrevLayer.FOutput.Depth, 1, 1);
-  FNeurons[0].FDelta.ReSize(FNeurons[0].FWeights);
-  FNeurons[0].FBackInertia.ReSize(FNeurons[0].FWeights);
+  // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
+  if not FInferenceOnly then
+  begin
+    FNeurons[0].FDelta.ReSize(FNeurons[0].FWeights);
+    FNeurons[0].FBackInertia.ReSize(FNeurons[0].FWeights);
+  end;
   InitDefault();
   SetLength(FLoadAcc, pPrevLayer.FOutput.Depth);
   ResetExpertLoad();
