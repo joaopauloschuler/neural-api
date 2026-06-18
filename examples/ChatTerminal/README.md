@@ -1,15 +1,17 @@
 # ChatTerminal: interactive chat REPL over any imported instruct checkpoint
 
 A terminal chat program for the checkpoints the generic importer dispatch
-(`BuildFromPretrained` in `neural/neuralpretrained.pas`) understands: gpt2,
-llama, mistral, qwen2/3, gemma/2/3, phi/phi3, gpt_neo(x), gptj,
-cohere/cohere2, rwkv, mamba, bloom, deepseek_v2, ... Point it at a
+(`BuildFromPretrained` in `neural/neuralpretrained.pas`) supports: qwen2, quen2.5.
+It is planned (coded) to support: quen3, gpt2, llama, mistral, /3, gemma/2/3, phi/phi3, gpt_neo(x), 
+gptj, cohere/cohere2, rwkv, mamba, bloom, deepseek_v2. Point it at a
 HuggingFace-style model directory (`config.json` + `model.safetensors` [or
 sharded index / pytorch_model.bin] + `tokenizer.json`
 [+ `tokenizer_config.json`]) and chat:
 
 ```
-ChatTerminal /path/to/Qwen2.5-0.5B-Instruct --temperature 0.8 --top-p 0.9
+lazbuild neural-api/examples/ChatTerminal/ChatTerminal.lpi
+git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q2
+neural-api/bin/x86_64-linux/bin/ChatTerminal q2/ --ctx 64 --fp32
 ```
 
 ### Multilingual generation (Cohere Command-R / Aya)
