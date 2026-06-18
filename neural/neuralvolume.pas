@@ -1867,7 +1867,7 @@ end;
 function CreateMixedVolumePairList(Original: TNNetVolumePairList;
   Alpha: TNeuralFloat; FixedLambda: TNeuralFloat): TNNetVolumePairList;
 var
-  Cnt, I, J, Tmp, Partner: integer;
+  Cnt, CntM1, I, J, Tmp, Partner: integer;
   Perm: array of integer;
   Lambda: TNeuralFloat;
   MixedA, MixedB: TNNetVolume;
@@ -1877,18 +1877,19 @@ begin
   if Original = nil then Exit;
   Cnt := Original.Count;
   if Cnt = 0 then Exit;
+  CntM1 := Cnt - 1;
 
   // Build a random derangement-ish permutation (Fisher-Yates) so each sample
   // is paired with another sample from the same list (minibatch mixup).
   SetLength(Perm, Cnt);
-  for I := 0 to Cnt - 1 do Perm[I] := I;
+  for I := 0 to CntM1 do Perm[I] := I;
   for I := Cnt - 1 downto 1 do
   begin
     J := Random(I + 1);
     Tmp := Perm[I]; Perm[I] := Perm[J]; Perm[J] := Tmp;
   end;
 
-  for I := 0 to Cnt - 1 do
+  for I := 0 to CntM1 do
   begin
     Partner := Perm[I];
     PartnerPair := Original[Partner];
@@ -1940,10 +1941,10 @@ end;
 function CreateCutMixVolumePairList(Original: TNNetVolumePairList;
   Alpha: TNeuralFloat; FixedLambda: TNeuralFloat): TNNetVolumePairList;
 var
-  Cnt, I, J, Tmp, Partner: integer;
+  Cnt, CntM1, I, J, Tmp, Partner: integer;
   Perm: array of integer;
   Lambda, LambdaAdj: TNeuralFloat;
-  X0, Y0, BoxW, BoxH, X, Y, D, W, H, DepthMax: integer;
+  X0, Y0, BoxW, BoxH, X, Y, D, W, H, DepthMax, XMax, YMax: integer;
   CutA, MixedB: TNNetVolume;
   SrcA, SrcB: TNNetVolume;
   PartnerPair: TNNetVolumePair;
@@ -1952,17 +1953,18 @@ begin
   if Original = nil then Exit;
   Cnt := Original.Count;
   if Cnt = 0 then Exit;
+  CntM1 := Cnt - 1;
 
   // Random partner permutation (Fisher-Yates) -> minibatch CutMix.
   SetLength(Perm, Cnt);
-  for I := 0 to Cnt - 1 do Perm[I] := I;
+  for I := 0 to CntM1 do Perm[I] := I;
   for I := Cnt - 1 downto 1 do
   begin
     J := Random(I + 1);
     Tmp := Perm[I]; Perm[I] := Perm[J]; Perm[J] := Tmp;
   end;
 
-  for I := 0 to Cnt - 1 do
+  for I := 0 to CntM1 do
   begin
     Partner := Perm[I];
     PartnerPair := Original[Partner];
@@ -1984,8 +1986,10 @@ begin
     if (SrcB.SizeX = W) and (SrcB.SizeY = H) and (SrcB.Depth = SrcA.Depth) then
     begin
       DepthMax := SrcA.Depth - 1;
-      for X := X0 to X0 + BoxW - 1 do
-        for Y := Y0 to Y0 + BoxH - 1 do
+      XMax := X0 + BoxW - 1;
+      YMax := Y0 + BoxH - 1;
+      for X := X0 to XMax do
+        for Y := Y0 to YMax do
           for D := 0 to DepthMax do
             CutA[X, Y, D] := SrcB[X, Y, D];
       // True pasted-area fraction after clamping.
@@ -2230,7 +2234,7 @@ end;
 procedure TestKMeans();
 var
   KMeans: TNNetKMeans;
-  Clusters, ClusterSize, Samples: integer;
+  Clusters, ClusterSize, Samples, SamplesM1: integer;
   SampleCnt, StepCnt, ClusterCnt: integer;
   SampleVolume: TNNetVolume;
   ClustersWithElements: integer;
@@ -2244,7 +2248,8 @@ begin
     ' Samples:', Samples);
   KMeans := TNNetKMeans.Create(Clusters, 1, 1, ClusterSize);
   // Creates the sample for clustering.
-  for SampleCnt := 0 to Samples - 1 do
+  SamplesM1 := Samples - 1;
+  for SampleCnt := 0 to SamplesM1 do
   begin
     SampleVolume := TNNetVolume.Create(1, 1, ClusterSize);
     SampleVolume.FillForDebug();
@@ -2405,13 +2410,14 @@ end;
 function TNNetSamplerTopP.GetToken(Origin: TNNetVolume): integer;
 var
   CumulativeSum: TNeuralFloat;
-  I, Threshold: Integer;
+  I, Threshold, Hi: Integer;
 begin
   Origin.GetTokenArray(FTokenArr);
   SortTokenArray();
   CumulativeSum := 0;
   Threshold := 0;
-  for I := Low(FTokenArr) to High(FTokenArr) do
+  Hi := High(FTokenArr);
+  for I := Low(FTokenArr) to Hi do
   begin
     CumulativeSum := CumulativeSum + FTokenArr[i].Score;
     if CumulativeSum > FTopP then
@@ -2432,13 +2438,14 @@ function TNNetSamplerTopP.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 var
   CumulativeSum: TNeuralFloat;
-  I, Threshold: Integer;
+  I, Threshold, Hi: Integer;
 begin
   Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
   SortTokenArray();
   CumulativeSum := 0;
   Threshold := 0;
-  for I := Low(FTokenArr) to High(FTokenArr) do
+  Hi := High(FTokenArr);
+  for I := Low(FTokenArr) to Hi do
   begin
     CumulativeSum := CumulativeSum + FTokenArr[i].Score;
     if CumulativeSum > FTopP then
@@ -2466,7 +2473,7 @@ end;
 function TNNetSamplerMinP.SampleFromSorted(): integer;
 var
   Threshold, KeptSum, Roll, Cumulative: TNeuralFloat;
-  I, KeptCount: integer;
+  I, KeptCount, KeptCountM1, Hi: integer;
 begin
   if Length(FTokenArr) = 0 then
   begin
@@ -2477,7 +2484,8 @@ begin
   Threshold := FMinP * FTokenArr[0].Score;
   KeptCount := 0;
   KeptSum := 0;
-  for I := Low(FTokenArr) to High(FTokenArr) do
+  Hi := High(FTokenArr);
+  for I := Low(FTokenArr) to Hi do
   begin
     if FTokenArr[I].Score >= Threshold then
     begin
@@ -2494,8 +2502,9 @@ begin
   // Weighted draw proportional to the renormalized kept mass.
   Roll := Random * KeptSum;
   Cumulative := 0;
-  Result := FTokenArr[KeptCount - 1].Token; // numeric-safety fallback
-  for I := 0 to KeptCount - 1 do
+  KeptCountM1 := KeptCount - 1;
+  Result := FTokenArr[KeptCountM1].Token; // numeric-safety fallback
+  for I := 0 to KeptCountM1 do
   begin
     Cumulative := Cumulative + FTokenArr[I].Score;
     if Roll < Cumulative then
@@ -2555,7 +2564,7 @@ end;
 function TNNetSamplerWeightedTopK.SampleFromSorted(): integer;
 var
   KeptSum, Roll, Cumulative: TNeuralFloat;
-  I, KeptCount: integer;
+  I, KeptCount, KeptCountM1: integer;
 begin
   if Length(FTokenArr) = 0 then
   begin
@@ -2567,7 +2576,8 @@ begin
   if (KeptCount <= 0) or (KeptCount > Length(FTokenArr)) then
     KeptCount := Length(FTokenArr); // <=0 or >=vocab => whole row
   KeptSum := 0;
-  for I := 0 to KeptCount - 1 do
+  KeptCountM1 := KeptCount - 1;
+  for I := 0 to KeptCountM1 do
     KeptSum := KeptSum + FTokenArr[I].Score;
   if KeptSum <= 0 then
   begin
@@ -2577,8 +2587,8 @@ begin
   // Weighted draw proportional to the renormalized kept mass.
   Roll := Random * KeptSum;
   Cumulative := 0;
-  Result := FTokenArr[KeptCount - 1].Token; // numeric-safety fallback
-  for I := 0 to KeptCount - 1 do
+  Result := FTokenArr[KeptCountM1].Token; // numeric-safety fallback
+  for I := 0 to KeptCountM1 do
   begin
     Cumulative := Cumulative + FTokenArr[I].Score;
     if Roll < Cumulative then
@@ -2617,7 +2627,7 @@ var
   Entropy, P, Surprise, KeptSum, Roll, Cumulative: TNeuralFloat;
   Dist: array of TNeuralFloat; // |surprise - entropy| per FTokenArr entry
   Order: array of integer;     // FTokenArr indices sorted by ascending Dist
-  I, J, KeptCount, Tmp, N: integer;
+  I, J, KeptCount, KeptCountM1, Tmp, N, NM1, NM2: integer;
 begin
   N := Length(FTokenArr);
   if N = 0 then
@@ -2625,9 +2635,11 @@ begin
     Result := 0; // defensive: empty distribution
     exit;
   end;
+  NM1 := N - 1;
+  NM2 := N - 2;
   // Conditional (Shannon) entropy of the row, in nats.
   Entropy := 0;
-  for I := 0 to N - 1 do
+  for I := 0 to NM1 do
   begin
     P := FTokenArr[I].Score;
     if P > 0 then Entropy := Entropy - P * Ln(P);
@@ -2635,7 +2647,7 @@ begin
   // Per-token distance |(-log p) - H|.
   SetLength(Dist, N);
   SetLength(Order, N);
-  for I := 0 to N - 1 do
+  for I := 0 to NM1 do
   begin
     P := FTokenArr[I].Score;
     if P > 0 then Surprise := -Ln(P) else Surprise := 1e30; // p=0 => infinite
@@ -2644,8 +2656,8 @@ begin
   end;
   // Selection sort of Order by ascending Dist (vocab-sized but only run once
   // per step; mirrors the simple sort style used elsewhere in this unit).
-  for I := 0 to N - 2 do
-    for J := I + 1 to N - 1 do
+  for I := 0 to NM2 do
+    for J := I + 1 to NM1 do
       if Dist[Order[J]] < Dist[Order[I]] then
       begin
         Tmp := Order[I]; Order[I] := Order[J]; Order[J] := Tmp;
@@ -2653,7 +2665,7 @@ begin
   // Smallest prefix (by ascending distance) whose cumulative mass reaches FMass.
   KeptCount := 0;
   KeptSum := 0;
-  for I := 0 to N - 1 do
+  for I := 0 to NM1 do
   begin
     Inc(KeptCount);
     KeptSum := KeptSum + FTokenArr[Order[I]].Score;
@@ -2667,8 +2679,9 @@ begin
   // Weighted draw proportional to the renormalized kept mass.
   Roll := Random * KeptSum;
   Cumulative := 0;
-  Result := FTokenArr[Order[KeptCount - 1]].Token; // numeric-safety fallback
-  for I := 0 to KeptCount - 1 do
+  KeptCountM1 := KeptCount - 1;
+  Result := FTokenArr[Order[KeptCountM1]].Token; // numeric-safety fallback
+  for I := 0 to KeptCountM1 do
   begin
     Cumulative := Cumulative + FTokenArr[Order[I]].Score;
     if Roll < Cumulative then
@@ -2714,7 +2727,7 @@ var
   KeptSum, Roll, Cumulative, P, Surprise: TNeuralFloat;
   SumLogP, SumLogRank, SumLogPLogRank, SumLogRankSq, LogRank, LogP: TNeuralFloat;
   S, Epsilon, KFloat, ChosenScore: TNeuralFloat;
-  I, KeptCount, N, NumFit, K: integer;
+  I, KeptCount, KeptCountM1, N, NM1, NumFit, NumFitM2, K: integer;
 begin
   N := Length(FTokenArr);
   if N = 0 then
@@ -2722,13 +2735,14 @@ begin
     Result := 0; // defensive
     exit;
   end;
+  NM1 := N - 1;
   // FTokenArr is sorted DESCENDING: [0] is the max probability.
   if FVersion = mvV2 then
   begin
     // v2: keep every token with surprise -log p <= Mu.
     KeptCount := 0;
     KeptSum := 0;
-    for I := 0 to N - 1 do
+    for I := 0 to NM1 do
     begin
       P := FTokenArr[I].Score;
       if P <= 0 then Break; // descending: nothing later is larger
@@ -2753,7 +2767,8 @@ begin
     if NumFit > 100 then NumFit := 100; // fit on the head (paper uses ~100)
     SumLogP := 0; SumLogRank := 0; SumLogPLogRank := 0; SumLogRankSq := 0;
     K := 0;
-    for I := 0 to NumFit - 2 do
+    NumFitM2 := NumFit - 2;
+    for I := 0 to NumFitM2 do
     begin
       P := FTokenArr[I].Score;
       if (P <= 0) or (FTokenArr[I + 1].Score <= 0) then Break;
@@ -2783,7 +2798,8 @@ begin
     if KeptCount < 1 then KeptCount := 1;
     if KeptCount > N then KeptCount := N;
     KeptSum := 0;
-    for I := 0 to KeptCount - 1 do
+    KeptCountM1 := KeptCount - 1;
+    for I := 0 to KeptCountM1 do
       KeptSum := KeptSum + FTokenArr[I].Score;
   end;
 
@@ -2797,9 +2813,10 @@ begin
     // Weighted draw proportional to the renormalized kept mass.
     Roll := Random * KeptSum;
     Cumulative := 0;
-    Result := FTokenArr[KeptCount - 1].Token;        // numeric-safety fallback
-    ChosenScore := FTokenArr[KeptCount - 1].Score;
-    for I := 0 to KeptCount - 1 do
+    KeptCountM1 := KeptCount - 1;
+    Result := FTokenArr[KeptCountM1].Token;        // numeric-safety fallback
+    ChosenScore := FTokenArr[KeptCountM1].Score;
+    for I := 0 to KeptCountM1 do
     begin
       Cumulative := Cumulative + FTokenArr[I].Score;
       if Roll < Cumulative then
@@ -2881,13 +2898,14 @@ end;
 
 procedure TNNetTokenHistoryPenalty.EnsureSize(NewSize: integer);
 var
-  OldSize, I: integer;
+  OldSize, NewSizeM1, I: integer;
 begin
   OldSize := Length(FCounts);
   if NewSize > OldSize then
   begin
     SetLength(FCounts, NewSize);
-    for I := OldSize to NewSize - 1 do FCounts[I] := 0;
+    NewSizeM1 := NewSize - 1;
+    for I := OldSize to NewSizeM1 do FCounts[I] := 0;
   end;
 end;
 
@@ -3093,7 +3111,7 @@ end;
 function TNNetStringList.GetDelimitedTextFast: string;
 {$IFDEF FPC}
 var
-  I: Integer;
+  I, MaxIdx: Integer;
   S: String;
   BreakChars: set of Char;
   DoQuote: Boolean;
@@ -3106,8 +3124,9 @@ begin
     BreakChars := [#0..' ', QuoteChar, Delimiter];
 
   StringBuilder := TAnsiStringBuilder.Create();
+  MaxIdx := Count - 1;
   try
-    for I := 0 to Count - 1 do
+    for I := 0 to MaxIdx do
     begin
       S := Strings[I];
       DoQuote := AlwaysQuote;
@@ -3187,11 +3206,12 @@ end;
 
 procedure TStringsObj.FixObjects();
 var
-  ElementId: integer;
+  ElementId, MaxIdx: integer;
 begin
   if Count > 0 then
   begin
-    for ElementId := 0 to Count - 1 do
+    MaxIdx := Count - 1;
+    for ElementId := 0 to MaxIdx do
     begin
       if not Assigned(Self.List[ElementId]) then
       begin
@@ -3304,11 +3324,12 @@ end;
 
 procedure TStringsObj.FixObjects();
 var
-  ElementId: integer;
+  ElementId, MaxIdx: integer;
 begin
   if Count > 0 then
   begin
-    for ElementId := 0 to Count - 1 do
+    MaxIdx := Count - 1;
+    for ElementId := 0 to MaxIdx do
     begin
       if not Assigned(Self.List[ElementId]) then
       begin
@@ -3829,14 +3850,15 @@ end;
 
 procedure TNNetDictionary.PrintDebug(FirstElements: integer);
 var
-  ElementCnt: integer;
+  ElementCnt, MaxIdx: integer;
 begin
   WriteLn('Number of elements: ', Count);
   if Count > 0 then
   begin
     if FirstElements > Count then FirstElements := Count;
     WriteLn('Showing first ',FirstElements,' elements.');
-    for ElementCnt := 0 to FirstElements - 1 do
+    MaxIdx := FirstElements - 1;
+    for ElementCnt := 0 to MaxIdx do
     begin
       WriteLn(ElementCnt,': ',Self[ElementCnt],' -> ', Self.Integers[ElementCnt]);
     end;
@@ -4071,12 +4093,13 @@ end;
 
 function TNNetVolumeList.GetTotalSize(): integer;
 var
-  I: integer;
+  I, MaxIdx: integer;
 begin
   Result := 0;
   if (Count>0) then
   begin
-    for I := 0 to Count - 1 do
+    MaxIdx := Count - 1;
+    for I := 0 to MaxIdx do
     begin
       Result := Result + Self[I].Size;
     end;
@@ -4085,12 +4108,13 @@ end;
 
 function TNNetVolumeList.GetSum(): TNeuralFloat;
 var
-  I: integer;
+  I, MaxIdx: integer;
 begin
   Result := 0;
   if (Count>0) then
   begin
-    for I := 0 to Count - 1 do
+    MaxIdx := Count - 1;
+    for I := 0 to MaxIdx do
     begin
       Result := Result + Self[I].GetSum();
     end;
@@ -4114,12 +4138,13 @@ end;
 
 procedure TNNetVolumeList.AddValue(Value: TNeuralFloat);
 var
-  I: integer;
+  I, MaxIdx: integer;
   AuxVolume: TNNetVolume;
 begin
   if (Count>0) then
   begin
-    for I := 0 to Count - 1 do
+    MaxIdx := Count - 1;
+    for I := 0 to MaxIdx do
     begin
       Self[I].Add(Value);
     end;
@@ -4128,12 +4153,13 @@ end;
 
 procedure TNNetVolumeList.Mul(Value: TNeuralFloat);
 var
-  I: integer;
+  I, MaxIdx: integer;
   AuxVolume: TNNetVolume;
 begin
   if (Count>0) then
   begin
-    for I := 0 to Count - 1 do
+    MaxIdx := Count - 1;
+    for I := 0 to MaxIdx do
     begin
       Self[I].Mul(Value);
     end;
@@ -4142,12 +4168,13 @@ end;
 
 procedure TNNetVolumeList.Divi(Value: TNeuralFloat);
 var
-  I: integer;
+  I, MaxIdx: integer;
   AuxVolume: TNNetVolume;
 begin
   if (Count>0) then
   begin
-    for I := 0 to Count - 1 do
+    MaxIdx := Count - 1;
+    for I := 0 to MaxIdx do
     begin
       Self[I].Divi(Value);
     end;
@@ -4204,11 +4231,12 @@ end;
 
 procedure TNNetVolumeList.Fill(c: Single);
 var
-  I: integer;
+  I, MaxIdx: integer;
 begin
   if (Count>0) then
   begin
-    for I := 0 to Count - 1 do
+    MaxIdx := Count - 1;
+    for I := 0 to MaxIdx do
     begin
       Self[I].Fill(c);
     end;
@@ -4217,11 +4245,12 @@ end;
 
 procedure TNNetVolumeList.ClearTag();
 var
-  I: integer;
+  I, MaxIdx: integer;
 begin
   if (Count>0) then
   begin
-    for I := 0 to Count - 1 do
+    MaxIdx := Count - 1;
+    for I := 0 to MaxIdx do
     begin
       Self[I].ClearTag();
     end;
@@ -4230,11 +4259,12 @@ end;
 
 procedure TNNetVolumeList.FillTag(TagId, TagValue: integer);
 var
-  I: integer;
+  I, MaxIdx: integer;
 begin
   if (Count>0) then
   begin
-    for I := 0 to Count - 1 do
+    MaxIdx := Count - 1;
+    for I := 0 to MaxIdx do
     begin
       Self[I].Tags[TagId] := TagValue;
     end;
@@ -4244,7 +4274,7 @@ end;
 procedure TNNetVolumeList.ConcatInto(V: TNNetVolume);
 var
   TotalSize: integer;
-  I: integer;
+  I, MaxIdx: integer;
   CurrPos: integer;
 begin
   if (Count>0) then
@@ -4259,7 +4289,8 @@ begin
     end;
 
     CurrPos := 0;
-    for I := 0 to Count - 1 do
+    MaxIdx := Count - 1;
+    for I := 0 to MaxIdx do
     begin
       system.Move(Self[I].FData[0], V.FData[CurrPos], Self[I].Size * SizeOf(TNeuralFloat));
       {$IFDEF FPC}
@@ -4297,7 +4328,7 @@ end;
 procedure TNNetVolumeList.SplitFrom(V: TNNetVolume);
 var
   TotalSize: integer;
-  I: integer;
+  I, MaxIdx: integer;
   CurrPos: integer;
 begin
   if (Count>0) then
@@ -4310,7 +4341,8 @@ begin
     end;
 
     CurrPos := 0;
-    for I := 0 to Count - 1 do
+    MaxIdx := Count - 1;
+    for I := 0 to MaxIdx do
     begin
       system.Move(V.FData[CurrPos], Self[I].FData[0], Self[I].Size * SizeOf(TNeuralFloat));
       {$IFDEF FPC}
@@ -4396,7 +4428,7 @@ end;
 
 procedure TNNetVolumeList.GetColumn(V: TNNetVolume; colIdx: integer);
 var
-  I: integer;
+  I, MaxIdx: integer;
 begin
   if (Count>0) then
   begin
@@ -4405,7 +4437,8 @@ begin
       V.ReSize(1, 1, Self.Count);
     end;
 
-    for I := 0 to Count - 1 do
+    MaxIdx := Count - 1;
+    for I := 0 to MaxIdx do
     begin
       V.FData[I] := Self[I].FData[colIdx];
     end;
@@ -4414,13 +4447,14 @@ end;
 
 procedure TNNetVolumeList.ResizeImage(NewSizeX, NewSizeY: integer);
 var
-  I: integer;
+  I, MaxIdx: integer;
   AuxVolume: TNNetVolume;
 begin
   if (Count>0) then
   begin
     AuxVolume := TNNetVolume.Create();
-    for I := 0 to Count - 1 do
+    MaxIdx := Count - 1;
+    for I := 0 to MaxIdx do
     begin
       AuxVolume.Copy(Self[I]);
       Self[I].CopyResizing(AuxVolume, NewSizeX, NewSizeY);
@@ -4431,13 +4465,14 @@ end;
 
 procedure TNNetVolumeList.AddPadding(Padding: integer);
 var
-  I: integer;
+  I, MaxIdx: integer;
   AuxVolume: TNNetVolume;
 begin
   if (Count>0) then
   begin
     AuxVolume := TNNetVolume.Create();
-    for I := 0 to Count - 1 do
+    MaxIdx := Count - 1;
+    for I := 0 to MaxIdx do
     begin
       AuxVolume.Copy(Self[I]);
       Self[I].CopyPadding(AuxVolume, Padding);
@@ -4592,9 +4627,10 @@ procedure TVolume.AddSaltAndPepper(pNum: integer; pSalt: T = 1.0;
   pPepper: T = -1.0; pColor:boolean = false);
 var
   I: integer;
-  CntDepth: integer;
+  CntDepth, DepthM1: integer;
   SaltPosX, SaltPosY, PepperPosX, PepperPosY: integer;
 begin
+  DepthM1 := FDepth - 1;
   for I := 1 to pNum do
   begin
     SaltPosX := Random(FSizeX);
@@ -4602,7 +4638,7 @@ begin
     PepperPosX := Random(FSizeX);
     PepperPosY := Random(FSizeY);
 
-    for CntDepth := 0 to FDepth - 1 do
+    for CntDepth := 0 to DepthM1 do
     begin
       if (Not(pColor) or (Random(100) < 50) ) then
       begin
@@ -4870,6 +4906,7 @@ procedure TVolume.AddLayers(A,B: TVolume);
 var
   I,J,K: integer;
   MaxX, MaxY, MaxD: integer;
+  ASizeXM1, ASizeYM1, ADepthM1, BSizeXM1, BSizeYM1, BDepthM1: integer;
 begin
   MaxX := Max(A.FSizeX, B.FSizeX);
   MaxY := Max(A.FSizeX, B.FSizeX);
@@ -4878,11 +4915,14 @@ begin
 
   if (A.FDepth>0) and (A.FSizeX > 0) and (A.FSizeY > 0) then
   begin
-    for I := 0 to A.FSizeX - 1 do
+    ASizeXM1 := A.FSizeX - 1;
+    ASizeYM1 := A.FSizeY - 1;
+    ADepthM1 := A.FDepth - 1;
+    for I := 0 to ASizeXM1 do
     begin
-      for J := 0 to A.FSizeY - 1 do
+      for J := 0 to ASizeYM1 do
       begin
-        for K := 0 to A.FDepth -1 do
+        for K := 0 to ADepthM1 do
         begin
           Self[I,J,K] := A[I,J,K];
         end;
@@ -4892,11 +4932,14 @@ begin
 
   if (B.FDepth>0) and (B.FSizeX > 0) and (B.FSizeY > 0) then
   begin
-    for I := 0 to B.FSizeX - 1 do
+    BSizeXM1 := B.FSizeX - 1;
+    BSizeYM1 := B.FSizeY - 1;
+    BDepthM1 := B.FDepth - 1;
+    for I := 0 to BSizeXM1 do
     begin
-      for J := 0 to B.FSizeY - 1 do
+      for J := 0 to BSizeYM1 do
       begin
-        for K := 0 to B.FDepth -1 do
+        for K := 0 to BDepthM1 do
         begin
           Self[I,J,A.FDepth+K] := B[I,J,K];
         end;
@@ -5494,10 +5537,11 @@ end;
 
 function TVolume.HasNonFinite(): boolean;
 var
-  I: integer;
+  I, MaxIdx: integer;
 begin
   Result := false;
-  for I := 0 to FSize - 1 do
+  MaxIdx := FSize - 1;
+  for I := 0 to MaxIdx do
   begin
     if IsNan(FData[I]) or IsInfinite(FData[I]) then
     begin
@@ -6762,9 +6806,10 @@ end;
 
 procedure TVolume.ClearTag();
 var
-  I: integer;
+  I, Hi: integer;
 begin
-  for I := Low(FTag) to High(FTag) do FTag[I] := 0;
+  Hi := High(FTag);
+  for I := Low(FTag) to Hi do FTag[I] := 0;
 end;
 
 function TVolume.NeuralToStr(V: TNeuralFloat): string;
@@ -7111,7 +7156,7 @@ end;
 procedure TVolume.PointwiseSoftMax(NoForward: boolean = false);
 var
   I, StartPointPos: integer;
-  MaxX, MaxY, MaxD: integer;
+  MaxX, MaxY, MaxD, FDepthM1: integer;
   CountX, CountY, CountD: integer;
   MaxValue: T;
   LocalValue: T;
@@ -7121,6 +7166,7 @@ begin
   MaxX := FSizeX - 1;
   MaxY := FSizeY - 1;
   MaxD := FDepth - 1;
+  FDepthM1 := FDepth - 1;
 
   if MaxD > 0 then
   begin
@@ -7133,7 +7179,7 @@ begin
         if NoForward and (MaxD < FDepth - 1) then
         begin
           I := StartPointPos + MaxD + 1;
-          for CountD := MaxD + 1 to FDepth - 1 do
+          for CountD := MaxD + 1 to FDepthM1 do
           begin
             FData[I] := 0;
             Inc(I);
@@ -7235,12 +7281,14 @@ var
   LocalValue: T;
   TotalSum: TNeuralFloat;
   GroupCnt, StartD: integer;
-  ChannelsPerGroup: integer;
+  ChannelsPerGroup, ChannelsPerGroupM1, GroupsM1: integer;
 begin
   // TODO: This portion of code can be optimized
   MaxX := FSizeX - 1;
   MaxY := FSizeY - 1;
   ChannelsPerGroup := FDepth div Groups;
+  ChannelsPerGroupM1 := ChannelsPerGroup - 1;
+  GroupsM1 := Groups - 1;
   if ChannelsPerGroup > 1 then
   begin
     for CountX := 0 to MaxX do
@@ -7248,7 +7296,7 @@ begin
       for CountY := 0 to MaxY do
       begin
         StartPointPos := GetRawPos(CountX, CountY);
-        for GroupCnt := 0 to Groups-1 do
+        for GroupCnt := 0 to GroupsM1 do
         begin
           StartD := ChannelsPerGroup * GroupCnt;
           //EndD := StartD + ChannelsPerGroup - 1;
@@ -7256,7 +7304,7 @@ begin
           I := StartPointPos;
           // Find the point max value.
           MaxValue := FData[I];
-          for CountD := 1 to ChannelsPerGroup - 1 do
+          for CountD := 1 to ChannelsPerGroupM1 do
           begin
             Inc(I);
             if FData[I] > MaxValue
@@ -7264,7 +7312,7 @@ begin
           end;
           TotalSum := 0;
           I := StartPointPos;
-          for CountD := 0 to ChannelsPerGroup - 1 do
+          for CountD := 0 to ChannelsPerGroupM1 do
           begin
             //LocalValue := pcr_expf( NeuronForceRange(FData[I] - MaxValue, 4000) );
             LocalValue := Exp( NeuronForceRange(FData[I] - MaxValue, 4000) );
@@ -7275,7 +7323,7 @@ begin
           if TotalSum > 0 then
           begin
             I := StartPointPos;
-            for CountD := 0 to ChannelsPerGroup - 1 do
+            for CountD := 0 to ChannelsPerGroupM1 do
             begin
               FData[I] := FData[I] / TotalSum;
               Inc(I);
@@ -7289,9 +7337,10 @@ end;
 
 procedure TVolume.OneHotEncoding(aTokens: array of integer);
 var
-  CntToken, MaxToken, Token: integer;
+  CntToken, MaxToken, Token, SizeXM1: integer;
 begin
   MaxToken := Length(aTokens) - 1;
+  SizeXM1 := SizeX - 1;
   Self.Fill(0);
   if MaxToken < SizeX then
   begin
@@ -7309,7 +7358,7 @@ begin
     end;
     if MaxToken < SizeX - 1 then
     begin
-      for CntToken := MaxToken + 1 to SizeX - 1 do
+      for CntToken := MaxToken + 1 to SizeXM1 do
       begin
         Self[CntToken, 0, 0] := 1;
       end;
@@ -7854,7 +7903,7 @@ end;
 
 procedure TVolume.ShiftRight(Positions: integer = 1);
 var
-  I, VMax, VMin: longint;
+  I, VMax, VMin, VMinM1: longint;
 begin
   if ( (FSize > 0) and (Positions > 0) ) then
   begin
@@ -7865,7 +7914,8 @@ begin
       if ( (VMin <= VMax) and (VMin > 0) ) then
       begin
         for I := VMax downto VMin do FData[I] := FData[I - Positions];
-        for I := 0 to VMin-1 do FData[I] := 0;
+        VMinM1 := VMin - 1;
+        for I := 0 to VMinM1 do FData[I] := 0;
       end;
     end;
   end;
@@ -7905,12 +7955,14 @@ end;
 
 procedure TVolume.PrintXD(Digits: integer; Decimals: integer);
 var
-  CX, CD: integer;
+  CX, CD, DepthM1, SizeXM1: integer;
   AUX: TNeuralFloat;
 begin
-  for CD := 0 to Depth - 1 do
+  DepthM1 := Depth - 1;
+  SizeXM1 := SizeX - 1;
+  for CD := 0 to DepthM1 do
   begin
-    for CX := 0 to SizeX - 1 do
+    for CX := 0 to SizeXM1 do
     begin
       AUX := Self[CX, 0, CD];
       Write(AUX:Digits:Decimals);
@@ -7921,13 +7973,16 @@ end;
 
 procedure TVolume.PrintWithIndex();
 var
-  CX, CY, CD: integer;
+  CX, CY, CD, SizeXM1, SizeYM1, DepthM1: integer;
 begin
-  for CX := 0 to SizeX - 1 do
+  SizeXM1 := SizeX - 1;
+  SizeYM1 := SizeY - 1;
+  DepthM1 := Depth - 1;
+  for CX := 0 to SizeXM1 do
   begin
-    for CY := 0 to SizeY - 1 do
+    for CY := 0 to SizeYM1 do
     begin
-      for CD := 0 to Depth - 1 do
+      for CD := 0 to DepthM1 do
       begin
         WriteLn(CX,' ',CY,' ',CD,':',Self[CX, CY, CD]);
       end;
@@ -8044,7 +8099,7 @@ end;
 function TVolume.SaveToString(): string;
 var
   S: TNNetStringList;
-  I: integer;
+  I, Hi: integer;
   version: integer;
   AuxFloat: Single;
 begin
@@ -8056,7 +8111,8 @@ begin
   S.Add( IntToStr(FSizeY) );
   S.Add( IntToStr(FDepth) );
 
-  for I := Low(FData) to High(FData) do
+  Hi := High(FData);
+  for I := Low(FData) to Hi do
   begin
     AuxFloat := FData[I];
     S.Add( FloatToStr(AuxFloat, FFormatSettings) );
@@ -8294,12 +8350,13 @@ procedure TNNetVolume.InterleavedDotProduct(InterleavedAs, Bs: TNNetVolume;
   VectorSize: integer);
 var
   CntB, CntBPos, MaxBPos: integer;
-  NumA, NumB: integer;
+  NumA, NumB, NumBM1: integer;
   DestPointer: pointer;
   CntBVectorSizePlusCntBPos: integer;
 begin
   NumA := InterleavedAs.Size div VectorSize;
   NumB := Bs.Size div VectorSize;
+  NumBM1 := NumB - 1;
 
   MaxBPos := VectorSize - 1;
 
@@ -8309,7 +8366,7 @@ begin
   end;
 
   Fill(0);
-  for CntB := 0 to NumB - 1 do
+  for CntB := 0 to NumBM1 do
   begin
     DestPointer := Self.GetRawPtr(NumA*CntB);
     CntBVectorSizePlusCntBPos := CntB*VectorSize;
@@ -12617,11 +12674,12 @@ end;
 
 destructor TNNetList.Destroy;
 var
-  I: integer;
+  I, MaxIdx: integer;
 begin
   if (FreeObjects and (Count>0)) then
   begin
-    for I := 0 to Count - 1 do
+    MaxIdx := Count - 1;
+    for I := 0 to MaxIdx do
     begin
       TObject(Self[I]).Free;
     end;
