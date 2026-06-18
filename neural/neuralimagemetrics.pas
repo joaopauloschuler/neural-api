@@ -228,12 +228,13 @@ end;
 
 procedure TFIDFeatureAccumulator.Clear;
 var
-  i: integer;
+  i, DimM1: integer;
 begin
   FCount := 0;
   SetLength(FSum, FDim);
   SetLength(FOuter, FDim);
-  for i := 0 to FDim - 1 do
+  DimM1 := FDim - 1;
+  for i := 0 to DimM1 do
   begin
     FSum[i] := 0;
     SetLength(FOuter[i], FDim);
@@ -243,7 +244,7 @@ end;
 
 procedure TFIDFeatureAccumulator.Add(const AFeature: array of Double);
 var
-  i, j: integer;
+  i, j, DimM1: integer;
   xi: Double;
 begin
   if Length(AFeature) <> FDim then
@@ -251,11 +252,12 @@ begin
       'TFIDFeatureAccumulator.Add: feature length %d <> Dim %d',
       [Length(AFeature), FDim]);
   Inc(FCount);
-  for i := 0 to FDim - 1 do
+  DimM1 := FDim - 1;
+  for i := 0 to DimM1 do
   begin
     xi := AFeature[i];
     FSum[i] := FSum[i] + xi;
-    for j := 0 to FDim - 1 do
+    for j := 0 to DimM1 do
       FOuter[i][j] := FOuter[i][j] + xi * AFeature[j];
   end;
 end;
@@ -263,10 +265,11 @@ end;
 procedure TFIDFeatureAccumulator.Add(const AFeature: TNeuralFloatDynArr);
 var
   d: TIMDoubleArray;
-  i: integer;
+  i, MaxIdx: integer;
 begin
   SetLength(d, Length(AFeature));
-  for i := 0 to Length(AFeature) - 1 do
+  MaxIdx := Length(AFeature) - 1;
+  for i := 0 to MaxIdx do
     d[i] := AFeature[i];
   Add(d);
 end;
@@ -274,32 +277,34 @@ end;
 procedure TFIDFeatureAccumulator.AddVolume(AVolume: TNNetVolume);
 var
   d: TIMDoubleArray;
-  i: integer;
+  i, DimM1: integer;
 begin
   if AVolume.Size < FDim then
     raise Exception.CreateFmt(
       'TFIDFeatureAccumulator.AddVolume: volume size %d < Dim %d',
       [AVolume.Size, FDim]);
   SetLength(d, FDim);
-  for i := 0 to FDim - 1 do
+  DimM1 := FDim - 1;
+  for i := 0 to DimM1 do
     d[i] := AVolume.FData[i];
   Add(d);
 end;
 
 function TFIDFeatureAccumulator.Mean: TIMDoubleArray;
 var
-  i: integer;
+  i, DimM1: integer;
 begin
   if FCount = 0 then
     raise Exception.Create('TFIDFeatureAccumulator.Mean: no samples');
   SetLength(Result, FDim);
-  for i := 0 to FDim - 1 do
+  DimM1 := FDim - 1;
+  for i := 0 to DimM1 do
     Result[i] := FSum[i] / FCount;
 end;
 
 function TFIDFeatureAccumulator.Covariance: TIMDoubleMatrix;
 var
-  i, j: integer;
+  i, j, DimM1: integer;
   mu: TIMDoubleArray;
   denom: Double;
 begin
@@ -309,10 +314,11 @@ begin
   mu := Mean;
   denom := FCount - 1;  // unbiased
   SetLength(Result, FDim);
-  for i := 0 to FDim - 1 do
+  DimM1 := FDim - 1;
+  for i := 0 to DimM1 do
   begin
     SetLength(Result[i], FDim);
-    for j := 0 to FDim - 1 do
+    for j := 0 to DimM1 do
       // Cov[i][j] = (sum xi xj - N mu_i mu_j) / (N-1)
       Result[i][j] := (FOuter[i][j] - FCount * mu[i] * mu[j]) / denom;
   end;
@@ -324,26 +330,28 @@ procedure SymmetricEigenJacobi(const A: TIMDoubleMatrix;
   out EigVals: TIMDoubleArray; out EigVecs: TIMDoubleMatrix;
   MaxSweeps: integer = 100);
 var
-  n, i, j, k, sweep: integer;
+  n, nM1, nM2, i, j, k, sweep: integer;
   M: TIMDoubleMatrix;
   offdiag, theta, t, c, s, tau, g, h, aij: Double;
   Mik, Mjk, Vik, Vjk: Double;
 begin
   n := Length(A);
+  nM1 := n - 1;
+  nM2 := n - 2;
   // Working copy of A (symmetrised defensively).
   SetLength(M, n);
-  for i := 0 to n - 1 do
+  for i := 0 to nM1 do
   begin
     SetLength(M[i], n);
-    for j := 0 to n - 1 do
+    for j := 0 to nM1 do
       M[i][j] := 0.5 * (A[i][j] + A[j][i]);
   end;
   // V starts as identity.
   SetLength(EigVecs, n);
-  for i := 0 to n - 1 do
+  for i := 0 to nM1 do
   begin
     SetLength(EigVecs[i], n);
-    for j := 0 to n - 1 do
+    for j := 0 to nM1 do
       if i = j then EigVecs[i][j] := 1 else EigVecs[i][j] := 0;
   end;
 
@@ -351,13 +359,13 @@ begin
   begin
     // Sum of off-diagonal magnitudes; stop when negligible.
     offdiag := 0;
-    for i := 0 to n - 1 do
-      for j := i + 1 to n - 1 do
+    for i := 0 to nM1 do
+      for j := i + 1 to nM1 do
         offdiag := offdiag + Abs(M[i][j]);
     if offdiag <= cEPS then Break;
 
-    for i := 0 to n - 2 do
-      for j := i + 1 to n - 1 do
+    for i := 0 to nM2 do
+      for j := i + 1 to nM1 do
       begin
         aij := M[i][j];
         if Abs(aij) <= cEPS then Continue;
@@ -387,7 +395,7 @@ begin
         M[j][i] := 0;
 
         // Update remaining entries in rows/cols i and j.
-        for k := 0 to n - 1 do
+        for k := 0 to nM1 do
           if (k <> i) and (k <> j) then
           begin
             Mik := M[i][k];
@@ -399,7 +407,7 @@ begin
           end;
 
         // Accumulate eigenvectors.
-        for k := 0 to n - 1 do
+        for k := 0 to nM1 do
         begin
           Vik := EigVecs[k][i];
           Vjk := EigVecs[k][j];
@@ -410,32 +418,33 @@ begin
   end;
 
   SetLength(EigVals, n);
-  for i := 0 to n - 1 do
+  for i := 0 to nM1 do
     EigVals[i] := M[i][i];
 end;
 
 function MatrixSqrtSPD(const A: TIMDoubleMatrix): TIMDoubleMatrix;
 var
-  n, i, j, k: integer;
+  n, nM1, i, j, k: integer;
   vals: TIMDoubleArray;
   vecs: TIMDoubleMatrix;
   sl: TIMDoubleArray;
   acc: Double;
 begin
   n := Length(A);
+  nM1 := n - 1;
   SymmetricEigenJacobi(A, vals, vecs);
   SetLength(sl, n);
-  for i := 0 to n - 1 do
+  for i := 0 to nM1 do
     if vals[i] > 0 then sl[i] := Sqrt(vals[i]) else sl[i] := 0;
   // Result = V * diag(sl) * V^T
   SetLength(Result, n);
-  for i := 0 to n - 1 do
+  for i := 0 to nM1 do
   begin
     SetLength(Result[i], n);
-    for j := 0 to n - 1 do
+    for j := 0 to nM1 do
     begin
       acc := 0;
-      for k := 0 to n - 1 do
+      for k := 0 to nM1 do
         acc := acc + vecs[i][k] * sl[k] * vecs[j][k];
       Result[i][j] := acc;
     end;
@@ -445,18 +454,19 @@ end;
 // C = A * B (n x n).
 function MatMul(const A, B: TIMDoubleMatrix): TIMDoubleMatrix;
 var
-  n, i, j, k: integer;
+  n, nM1, i, j, k: integer;
   acc: Double;
 begin
   n := Length(A);
+  nM1 := n - 1;
   SetLength(Result, n);
-  for i := 0 to n - 1 do
+  for i := 0 to nM1 do
   begin
     SetLength(Result[i], n);
-    for j := 0 to n - 1 do
+    for j := 0 to nM1 do
     begin
       acc := 0;
-      for k := 0 to n - 1 do
+      for k := 0 to nM1 do
         acc := acc + A[i][k] * B[k][j];
       Result[i][j] := acc;
     end;
@@ -468,24 +478,25 @@ var
   sqrtA, prod, sym: TIMDoubleMatrix;
   vals: TIMDoubleArray;
   vecs: TIMDoubleMatrix;
-  n, i, j: integer;
+  n, nM1, i, j: integer;
 begin
   n := Length(A);
+  nM1 := n - 1;
   // M = sqrtA * B * sqrtA is SPD and similar to A*B, so eig(M) = eig(A*B)
   // and Tr(sqrt(A*B)) = sum sqrt(eig(M)).
   sqrtA := MatrixSqrtSPD(A);
   prod := MatMul(MatMul(sqrtA, B), sqrtA);
   // Symmetrise to kill rounding asymmetry before the symmetric solver.
   SetLength(sym, n);
-  for i := 0 to n - 1 do
+  for i := 0 to nM1 do
   begin
     SetLength(sym[i], n);
-    for j := 0 to n - 1 do
+    for j := 0 to nM1 do
       sym[i][j] := 0.5 * (prod[i][j] + prod[j][i]);
   end;
   SymmetricEigenJacobi(sym, vals, vecs);
   Result := 0;
-  for i := 0 to n - 1 do
+  for i := 0 to nM1 do
     if vals[i] > 0 then Result := Result + Sqrt(vals[i]);
 end;
 
@@ -494,19 +505,20 @@ end;
 function ComputeFID(const MeanR, MeanG: TIMDoubleArray;
   const CovR, CovG: TIMDoubleMatrix): Double;
 var
-  n, i: integer;
+  n, nM1, i: integer;
   diff, traceTerm, crossTr: Double;
 begin
   n := Length(MeanR);
   if Length(MeanG) <> n then
     raise Exception.Create('ComputeFID: mean dimension mismatch');
+  nM1 := n - 1;
   // ||muR - muG||^2
   diff := 0;
-  for i := 0 to n - 1 do
+  for i := 0 to nM1 do
     diff := diff + Sqr(MeanR[i] - MeanG[i]);
   // Tr(Cr) + Tr(Cg)
   traceTerm := 0;
-  for i := 0 to n - 1 do
+  for i := 0 to nM1 do
     traceTerm := traceTerm + CovR[i][i] + CovG[i][i];
   // 2 * Tr(sqrt(Cr*Cg))
   crossTr := TraceOfSqrtProductSPD(CovR, CovG);
@@ -525,7 +537,7 @@ end;
 function ComputeFIDFromFeatures(const FeaturesR, FeaturesG: TIMDoubleMatrix): Double;
 var
   accR, accG: TFIDFeatureAccumulator;
-  dim, i: integer;
+  dim, i, MaxR, MaxG: integer;
 begin
   if (Length(FeaturesR) = 0) or (Length(FeaturesG) = 0) then
     raise Exception.Create('ComputeFIDFromFeatures: empty feature set');
@@ -533,8 +545,10 @@ begin
   accR := TFIDFeatureAccumulator.Create(dim);
   accG := TFIDFeatureAccumulator.Create(dim);
   try
-    for i := 0 to Length(FeaturesR) - 1 do accR.Add(FeaturesR[i]);
-    for i := 0 to Length(FeaturesG) - 1 do accG.Add(FeaturesG[i]);
+    MaxR := Length(FeaturesR) - 1;
+    MaxG := Length(FeaturesG) - 1;
+    for i := 0 to MaxR do accR.Add(FeaturesR[i]);
+    for i := 0 to MaxG do accG.Add(FeaturesG[i]);
     Result := ComputeFIDFromAccumulators(accR, accG);
   finally
     accR.Free;
@@ -547,25 +561,26 @@ end;
 // IS over one block of probability rows: exp( mean_x KL(p(y|x) || pbar) ).
 function ISBlock(const Probs: TIMDoubleMatrix; First, Last: integer): Double;
 var
-  numClass, i, c, n: integer;
+  numClass, numClassM1, i, c, n: integer;
   pbar: TIMDoubleArray;
   klSum, kl, p, q: Double;
 begin
   numClass := Length(Probs[First]);
+  numClassM1 := numClass - 1;
   n := Last - First + 1;
   SetLength(pbar, numClass);
-  for c := 0 to numClass - 1 do pbar[c] := 0;
+  for c := 0 to numClassM1 do pbar[c] := 0;
   for i := First to Last do
-    for c := 0 to numClass - 1 do
+    for c := 0 to numClassM1 do
       pbar[c] := pbar[c] + Probs[i][c];
-  for c := 0 to numClass - 1 do
+  for c := 0 to numClassM1 do
     pbar[c] := pbar[c] / n;
 
   klSum := 0;
   for i := First to Last do
   begin
     kl := 0;
-    for c := 0 to numClass - 1 do
+    for c := 0 to numClassM1 do
     begin
       p := Probs[i][c];
       if p > cEPS then
@@ -583,7 +598,7 @@ end;
 procedure ComputeInceptionScore(const Probs: TIMDoubleMatrix;
   NumSplits: integer; out Score: Double; out StdDev: Double);
 var
-  total, split, first, last, sz: integer;
+  total, split, first, last, sz, NumSplitsM1: integer;
   scores: TIMDoubleArray;
   mean, varSum: Double;
   i: integer;
@@ -593,9 +608,10 @@ begin
     raise Exception.Create('ComputeInceptionScore: no samples');
   if NumSplits < 1 then NumSplits := 1;
   if NumSplits > total then NumSplits := total;
+  NumSplitsM1 := NumSplits - 1;
 
   SetLength(scores, NumSplits);
-  for split := 0 to NumSplits - 1 do
+  for split := 0 to NumSplitsM1 do
   begin
     // Contiguous split [first..last]; spread the remainder over early splits.
     first := (split * total) div NumSplits;
@@ -610,10 +626,10 @@ begin
   end;
 
   mean := 0;
-  for i := 0 to NumSplits - 1 do mean := mean + scores[i];
+  for i := 0 to NumSplitsM1 do mean := mean + scores[i];
   mean := mean / NumSplits;
   varSum := 0;
-  for i := 0 to NumSplits - 1 do varSum := varSum + Sqr(scores[i] - mean);
+  for i := 0 to NumSplitsM1 do varSum := varSum + Sqr(scores[i] - mean);
   Score := mean;
   if NumSplits > 1 then
     StdDev := Sqrt(varSum / NumSplits)  // population std (standard IS report)
@@ -639,10 +655,11 @@ const
 // Build the normalised 11x11 Gaussian window (sum = 1), row-major length 121.
 procedure BuildGaussianWindow(out W: TIMDoubleArray);
 var
-  half, x, y, idx: integer;
+  half, x, y, idx, WinSizeM1: integer;
   s, v, sum: Double;
 begin
   SetLength(W, cSSIMWin * cSSIMWin);
+  WinSizeM1 := cSSIMWin * cSSIMWin - 1;
   half := cSSIMWin div 2;
   s := 2.0 * cSSIMSigma * cSSIMSigma;
   sum := 0;
@@ -655,7 +672,7 @@ begin
       sum := sum + v;
       Inc(idx);
     end;
-  for idx := 0 to cSSIMWin * cSSIMWin - 1 do
+  for idx := 0 to WinSizeM1 do
     W[idx] := W[idx] / sum;
 end;
 
@@ -663,25 +680,28 @@ end;
 procedure ExtractChannel(const Img: TIMDoubleArray; H, W, Channels, C: integer;
   out Plane: TIMDoubleArray);
 var
-  y, x: integer;
+  y, x, HM1, WM1: integer;
 begin
   SetLength(Plane, H * W);
-  for y := 0 to H - 1 do
-    for x := 0 to W - 1 do
+  HM1 := H - 1;
+  WM1 := W - 1;
+  for y := 0 to HM1 do
+    for x := 0 to WM1 do
       Plane[y * W + x] := Img[(y * W + x) * Channels + C];
 end;
 
 function ComputePSNR(const ImgA, ImgB: TIMDoubleArray;
   H, W, Channels: integer; DataRange: Double): Double;
 var
-  i, n: integer;
+  i, n, nM1: integer;
   mse, d: Double;
 begin
   n := H * W * Channels;
   if (Length(ImgA) < n) or (Length(ImgB) < n) then
     raise Exception.Create('ComputePSNR: image array too small for H*W*Channels');
+  nM1 := n - 1;
   mse := 0;
-  for i := 0 to n - 1 do
+  for i := 0 to nM1 do
   begin
     d := ImgA[i] - ImgB[i];
     mse := mse + d * d;
@@ -699,7 +719,7 @@ function SSIMPlaneMean(const PA, PB: TIMDoubleArray; H, W: integer;
 var
   Win: TIMDoubleArray;
   half, oy, ox, wy, wx, wi, pix: integer;
-  outH, outW, cnt: integer;
+  outH, outW, cnt, outHM1, outWM1, WinM1: integer;
   mx, my, sxx, syy, sxy, gw, a, b: Double;
   a1, a2, b1, b2, ssimSum: Double;
 begin
@@ -710,15 +730,18 @@ begin
   half := cSSIMWin div 2;
   outH := H - cSSIMWin + 1;
   outW := W - cSSIMWin + 1;
+  outHM1 := outH - 1;
+  outWM1 := outW - 1;
+  WinM1 := cSSIMWin - 1;
   ssimSum := 0;
   cnt := 0;
-  for oy := 0 to outH - 1 do
-    for ox := 0 to outW - 1 do
+  for oy := 0 to outHM1 do
+    for ox := 0 to outWM1 do
     begin
       mx := 0; my := 0; sxx := 0; syy := 0; sxy := 0;
       wi := 0;
-      for wy := 0 to cSSIMWin - 1 do
-        for wx := 0 to cSSIMWin - 1 do
+      for wy := 0 to WinM1 do
+        for wx := 0 to WinM1 do
         begin
           pix := (oy + wy) * W + (ox + wx);
           gw := Win[wi];
@@ -747,7 +770,7 @@ end;
 function ComputeSSIM(const ImgA, ImgB: TIMDoubleArray;
   H, W, Channels: integer; DataRange: Double): Double;
 var
-  c: integer;
+  c, ChannelsM1: integer;
   PA, PB: TIMDoubleArray;
   C1, C2, acc: Double;
 begin
@@ -755,8 +778,9 @@ begin
     raise Exception.Create('ComputeSSIM: image array too small');
   C1 := Sqr(cSSIM_K1 * DataRange);
   C2 := Sqr(cSSIM_K2 * DataRange);
+  ChannelsM1 := Channels - 1;
   acc := 0;
-  for c := 0 to Channels - 1 do
+  for c := 0 to ChannelsM1 do
   begin
     ExtractChannel(ImgA, H, W, Channels, c, PA);
     ExtractChannel(ImgB, H, W, Channels, c, PB);
@@ -769,13 +793,15 @@ end;
 procedure AvgPool2x2(const Plane: TIMDoubleArray; H, W: integer;
   out OutPlane: TIMDoubleArray; out OH, OW: integer);
 var
-  y, x: integer;
+  y, x, OHM1, OWM1: integer;
 begin
   OH := H div 2;
   OW := W div 2;
+  OHM1 := OH - 1;
+  OWM1 := OW - 1;
   SetLength(OutPlane, OH * OW);
-  for y := 0 to OH - 1 do
-    for x := 0 to OW - 1 do
+  for y := 0 to OHM1 do
+    for x := 0 to OWM1 do
       OutPlane[y * OW + x] := 0.25 *
         (Plane[(2 * y) * W + (2 * x)] +
          Plane[(2 * y) * W + (2 * x + 1)] +
@@ -790,7 +816,7 @@ procedure SSIMPlaneLCS(const PA, PB: TIMDoubleArray; H, W: integer;
 var
   Win: TIMDoubleArray;
   oy, ox, wy, wx, wi, pix: integer;
-  outH, outW, cnt: integer;
+  outH, outW, cnt, outHM1, outWM1, WinM1: integer;
   mx, my, sxx, syy, sxy, gw, a, b: Double;
   lSum, csSum: Double;
 begin
@@ -800,14 +826,17 @@ begin
   BuildGaussianWindow(Win);
   outH := H - cSSIMWin + 1;
   outW := W - cSSIMWin + 1;
+  outHM1 := outH - 1;
+  outWM1 := outW - 1;
+  WinM1 := cSSIMWin - 1;
   lSum := 0; csSum := 0; cnt := 0;
-  for oy := 0 to outH - 1 do
-    for ox := 0 to outW - 1 do
+  for oy := 0 to outHM1 do
+    for ox := 0 to outWM1 do
     begin
       mx := 0; my := 0; sxx := 0; syy := 0; sxy := 0;
       wi := 0;
-      for wy := 0 to cSSIMWin - 1 do
-        for wx := 0 to cSSIMWin - 1 do
+      for wy := 0 to WinM1 do
+        for wx := 0 to WinM1 do
         begin
           pix := (oy + wy) * W + (ox + wx);
           gw := Win[wi];
@@ -864,7 +893,7 @@ end;
 function ComputeMSSSIM(const ImgA, ImgB: TIMDoubleArray;
   H, W, Channels: integer; DataRange: Double): Double;
 var
-  c: integer;
+  c, ChannelsM1: integer;
   PA, PB: TIMDoubleArray;
   C1, C2, acc: Double;
 begin
@@ -872,8 +901,9 @@ begin
     raise Exception.Create('ComputeMSSSIM: image array too small');
   C1 := Sqr(cSSIM_K1 * DataRange);
   C2 := Sqr(cSSIM_K2 * DataRange);
+  ChannelsM1 := Channels - 1;
   acc := 0;
-  for c := 0 to Channels - 1 do
+  for c := 0 to ChannelsM1 do
   begin
     ExtractChannel(ImgA, H, W, Channels, c, PA);
     ExtractChannel(ImgB, H, W, Channels, c, PB);
@@ -899,7 +929,7 @@ function SSIMPlaneLossGrad(const PA, PB: TIMDoubleArray; H, W: integer;
 var
   Win: TIMDoubleArray;
   oy, ox, wy, wx, wi, pix, gpix: integer;
-  outH, outW, cnt: integer;
+  outH, outW, cnt, outHM1, outWM1, WinM1: integer;
   mx, my, sxx, syy, sxy, gw, a, b: Double;
   a1, a2, b1, b2, bb, sp, ssimSum: Double;
   dSdmx, dSdsxx, dSdsxy, gi: Double;
@@ -907,15 +937,18 @@ begin
   BuildGaussianWindow(Win);
   outH := H - cSSIMWin + 1;
   outW := W - cSSIMWin + 1;
+  outHM1 := outH - 1;
+  outWM1 := outW - 1;
+  WinM1 := cSSIMWin - 1;
   cnt := outH * outW;
   ssimSum := 0;
-  for oy := 0 to outH - 1 do
-    for ox := 0 to outW - 1 do
+  for oy := 0 to outHM1 do
+    for ox := 0 to outWM1 do
     begin
       mx := 0; my := 0; sxx := 0; syy := 0; sxy := 0;
       wi := 0;
-      for wy := 0 to cSSIMWin - 1 do
-        for wx := 0 to cSSIMWin - 1 do
+      for wy := 0 to WinM1 do
+        for wx := 0 to WinM1 do
         begin
           pix := (oy + wy) * W + (ox + wx);
           gw := Win[wi];
@@ -941,8 +974,8 @@ begin
       dSdsxx := -(a1 * a2) / (b1 * b2 * b2);
       // scatter to pixels of PA
       wi := 0;
-      for wy := 0 to cSSIMWin - 1 do
-        for wx := 0 to cSSIMWin - 1 do
+      for wy := 0 to WinM1 do
+        for wx := 0 to WinM1 do
         begin
           pix := (oy + wy) * W + (ox + wx);
           gw := Win[wi];
@@ -963,7 +996,7 @@ function ComputeSSIMLossAndGradient(const ImgA, ImgB: TIMDoubleArray;
   H, W, Channels: integer; out GradA: TIMDoubleArray;
   DataRange: Double): Double;
 var
-  c, i, n: integer;
+  c, i, n, nM1, ChannelsM1: integer;
   PA, PB: TIMDoubleArray;
   C1, C2, ssimAcc: Double;
 begin
@@ -975,10 +1008,12 @@ begin
       'ComputeSSIMLossAndGradient: image %dx%d smaller than window', [H, W]);
   C1 := Sqr(cSSIM_K1 * DataRange);
   C2 := Sqr(cSSIM_K2 * DataRange);
+  nM1 := n - 1;
+  ChannelsM1 := Channels - 1;
   SetLength(GradA, n);
-  for i := 0 to n - 1 do GradA[i] := 0;
+  for i := 0 to nM1 do GradA[i] := 0;
   ssimAcc := 0;
-  for c := 0 to Channels - 1 do
+  for c := 0 to ChannelsM1 do
   begin
     ExtractChannel(ImgA, H, W, Channels, c, PA);
     ExtractChannel(ImgB, H, W, Channels, c, PB);
@@ -988,7 +1023,7 @@ begin
       SSIMPlaneLossGrad(PA, PB, H, W, C1, C2, GradA, Channels, c);
   end;
   // average over channels
-  for i := 0 to n - 1 do GradA[i] := GradA[i] / Channels;
+  for i := 0 to nM1 do GradA[i] := GradA[i] / Channels;
   Result := 1.0 - ssimAcc / Channels;
 end;
 
@@ -997,11 +1032,12 @@ end;
 // Cubic polynomial kernel k(x,y) = (x.y/d + 1)^3.
 function PolyKernel(const X, Y: TIMDoubleArray; d: integer): Double;
 var
-  i: integer;
+  i, dM1: integer;
   dot, t: Double;
 begin
   dot := 0;
-  for i := 0 to d - 1 do dot := dot + X[i] * Y[i];
+  dM1 := d - 1;
+  for i := 0 to dM1 do dot := dot + X[i] * Y[i];
   t := dot / d + 1.0;
   Result := t * t * t;
 end;
@@ -1009,15 +1045,16 @@ end;
 // Unbiased within-set term sum_{i<>j} k(x_i,x_j) / (m(m-1)).
 function UnbiasedSelfTerm(const F: TIMDoubleMatrix; d: integer): Double;
 var
-  m, i, j: integer;
+  m, mM1, i, j: integer;
   s, k: Double;
 begin
   m := Length(F);
   if m < 2 then
     raise Exception.Create('KID: each set needs at least 2 samples');
+  mM1 := m - 1;
   s := 0;
-  for i := 0 to m - 1 do
-    for j := 0 to m - 1 do
+  for i := 0 to mM1 do
+    for j := 0 to mM1 do
       if i <> j then
       begin
         k := PolyKernel(F[i], F[j], d);
@@ -1028,7 +1065,7 @@ end;
 
 function ComputeKIDMMD2(const FeaturesR, FeaturesG: TIMDoubleMatrix): Double;
 var
-  m, n, d, i, j: integer;
+  m, n, d, i, j, mM1, nM1: integer;
   termR, termG, cross: Double;
 begin
   if (Length(FeaturesR) = 0) or (Length(FeaturesG) = 0) then
@@ -1038,11 +1075,13 @@ begin
     raise Exception.Create('ComputeKIDMMD2: feature dimension mismatch');
   m := Length(FeaturesR);
   n := Length(FeaturesG);
+  mM1 := m - 1;
+  nM1 := n - 1;
   termR := UnbiasedSelfTerm(FeaturesR, d);
   termG := UnbiasedSelfTerm(FeaturesG, d);
   cross := 0;
-  for i := 0 to m - 1 do
-    for j := 0 to n - 1 do
+  for i := 0 to mM1 do
+    for j := 0 to nM1 do
       cross := cross + PolyKernel(FeaturesR[i], FeaturesG[j], d);
   cross := cross / (m * n);
   Result := termR + termG - 2.0 * cross;
@@ -1052,12 +1091,14 @@ end;
 procedure SampleIndices(Count, SubsetSize: integer; out Idx: array of integer);
 var
   pool: array of integer;
-  i, j, tmp: integer;
+  i, j, tmp, CountM1, SubsetM1: integer;
 begin
   SetLength(pool, Count);
-  for i := 0 to Count - 1 do pool[i] := i;
+  CountM1 := Count - 1;
+  SubsetM1 := SubsetSize - 1;
+  for i := 0 to CountM1 do pool[i] := i;
   // partial Fisher-Yates
-  for i := 0 to SubsetSize - 1 do
+  for i := 0 to SubsetM1 do
   begin
     j := i + Random(Count - i);
     tmp := pool[i]; pool[i] := pool[j]; pool[j] := tmp;
@@ -1068,7 +1109,7 @@ end;
 procedure ComputeKID(const FeaturesR, FeaturesG: TIMDoubleMatrix;
   SubsetSize, NumSubsets: integer; out Score: Double; out StdDev: Double);
 var
-  m, n, sub, s, i: integer;
+  m, n, sub, s, i, subM1, NumSubsetsM1: integer;
   idxR, idxG: array of integer;
   subR, subG: TIMDoubleMatrix;
   scores: TIMDoubleArray;
@@ -1083,17 +1124,19 @@ begin
   sub := SubsetSize;
   if sub > m then sub := m;
   if sub > n then sub := n;
+  NumSubsetsM1 := NumSubsets - 1;
+  subM1 := sub - 1;
 
   SetLength(scores, NumSubsets);
   SetLength(idxR, sub);
   SetLength(idxG, sub);
   SetLength(subR, sub);
   SetLength(subG, sub);
-  for s := 0 to NumSubsets - 1 do
+  for s := 0 to NumSubsetsM1 do
   begin
     SampleIndices(m, sub, idxR);
     SampleIndices(n, sub, idxG);
-    for i := 0 to sub - 1 do
+    for i := 0 to subM1 do
     begin
       subR[i] := FeaturesR[idxR[i]];
       subG[i] := FeaturesG[idxG[i]];
@@ -1102,10 +1145,10 @@ begin
   end;
 
   mean := 0;
-  for i := 0 to NumSubsets - 1 do mean := mean + scores[i];
+  for i := 0 to NumSubsetsM1 do mean := mean + scores[i];
   mean := mean / NumSubsets;
   varSum := 0;
-  for i := 0 to NumSubsets - 1 do varSum := varSum + Sqr(scores[i] - mean);
+  for i := 0 to NumSubsetsM1 do varSum := varSum + Sqr(scores[i] - mean);
   Score := mean;
   if NumSubsets > 1 then
     StdDev := Sqrt(varSum / NumSubsets)  // population std (mirrors IS report)
