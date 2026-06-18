@@ -4909,7 +4909,7 @@ function GenerateTokensStreamedWithProcessors(Session: TNNetStreamingDecoder;
   const EOSTokens: TNeuralIntegerArray): integer;
 var
   InV: TNNetVolume;
-  Pos, CapLen, NextTokenInt, StopLen: integer;
+  Pos, CapLen, NextTokenInt, StopLen, PromptLenM2: integer;
 begin
   // The chain's explicit domain contract: the streamed row is POST-SOFTMAX
   // probabilities, so a raw-logit processor cannot be applied here.
@@ -4945,7 +4945,8 @@ begin
     // Prefill tokens 0..PromptLen-2 one at a time; the LAST prompt token is
     // the first decode step's input (its output row predicts the first new
     // token) - the established prefill-then-step idiom.
-    for Pos := 0 to PromptLen - 2 do
+    PromptLenM2 := PromptLen - 2;
+    for Pos := 0 to PromptLenM2 do
     begin
       InV.FData[0] := Tokens[Pos];
       Session.StepForward(InV, Pos);
