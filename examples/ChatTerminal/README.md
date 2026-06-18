@@ -35,7 +35,7 @@ Le chat est assis sur le rebord de la fenetre.
 Aya / Command-R are tuned for cross-lingual instruction following, so a
 single session can switch languages turn to turn. The chat format is
 fingerprinted from the Cohere `tokenizer_config.json` like every other
-family; `--int8` keeps an 8B checkpoint within a few GB of RAM.
+family; `--int8` trades speed for memory.
 
 The conversation is kept as a multi-turn history rendered through the
 chat-template engine (`neural/neuralchat.pas`): the chat format is
@@ -63,7 +63,9 @@ guard, flushed per token so piped output streams too).
 | `--ctx N` | context window to build (`pSeqLen`) | model max |
 | `--format NAME` | `chatml`/`llama2`/`llama3`/`zephyr`/`gemma`/`phi3`/`mistral` override | autodetect |
 | `--system "msg"` | initial system prompt | none |
-| `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) | fp32 |
+| `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — slower, less RAM | fp32 (faster, more RAM) |
+| `--stats` | per-turn timing to **stderr**: TTFT (prefill + first token), steady-state decode tok/s, and `prompt N (reused K)` from the KV-cache reuse | off |
+| `--no-cache-reuse` | re-prefill the whole prompt every turn instead of reusing the shared KV-cache prefix (A/B + debugging) | reuse on |
 | `--selftest` | run the offline unit checks and exit | — |
 
 The model is always built with `pInferenceOnly=true` (the REPL never
@@ -74,6 +76,19 @@ greedy argmax. Generation stops on the tokenizer's EOS id, on the chat
 format's end-of-turn marker (`<|im_end|>`, `<|eot_id|>`, `<end_of_turn>`,
 `<|end|>`, `</s>` — matched as a token-id stop sequence in the generated
 region and trimmed from the reply), or at `--max-new-tokens`.
+
+**KV-cache reuse across turns.** Each turn re-renders the whole history, but
+its token prefix is almost always identical to what is already resident in
+the KV cache (last turn's prompt + reply). The session keeps the cache,
+diffs the new prompt against it (`CommonPrefixLen`), `TruncateTo`s the
+divergent tail and prefills only the new tokens — so time-to-first-token
+stays roughly flat instead of growing with the transcript. This is correct
+regardless of tokenizer round-tripping (the diff always finds the true
+shared prefix; `/system` and `/reset` simply diverge earlier and re-prefill
+more). It applies to pure-attention models only: a recurrent (SSM/Mamba/RWKV)
+state cannot be truncated by position, so those fall back to a full
+re-prefill each turn. `--no-cache-reuse` forces the full re-prefill (use
+`--stats` to compare: watch `prompt N (reused K)` and TTFT).
 
 ## REPL commands
 

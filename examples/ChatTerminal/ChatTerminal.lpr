@@ -35,22 +35,32 @@ sequence in the generated region and trimmed from the reply), or after
 --max-new-tokens.
 
 The model is always built with pInferenceOnly=true (the REPL never trains;
-frees the per-neuron gradient/momentum buffers). Weight-only int8 storage
-(pQuantizeInt8) is the DEFAULT because the FP32 forward path keeps ~3 copies
-of every weight matrix (per-neuron + concatenated + interleaved caches), so
-a 0.5B model can need >10GB resident; int8 holds ~1/4 of ONE FP32 copy and
-dequantizes a layer at a time. Pass --fp32 to opt back into full precision
-(much more RAM) when you have the memory and want bit-exact FP32 outputs.
+frees the per-neuron gradient/momentum buffers). Full-precision FP32 weights
+are the DEFAULT: faster, at the cost of more RAM. Pass --int8 for weight-only
+int8 storage (pQuantizeInt8): less RAM, but slower (each layer is dequantized
+on the fly).
 
 REPL commands: /exit, /reset (clear history), /system <msg> (set the system
 prompt; raises on formats without a system role, e.g. gemma/mistral).
 
+--stats prints per-turn timing to stderr (kept off stdout so piped model
+output stays clean): time-to-first-token (prefill + the first decode step)
+and the steady-state decode rate in tok/s (measured over the tokens after
+the first, so prefill is excluded).
+
 --selftest runs the argument-parsing / prompt-assembly / REPL-command unit
 checks (no model needed) and exits.
 
-Decoding is a full forward per token (the fixed-width GPT2Import
-convention): architecture-agnostic across every imported family, including
-the ones whose normalization layers are not KV-cache streamable.
+Decoding streams through a TNNetStreamingDecoder KV cache (one width-1
+forward per token). Across turns the cache is REUSED: each turn's prompt
+shares a long prefix with what is already resident (last turn's prompt +
+reply), so the session diffs the new prompt against the cached token ids
+(CommonPrefixLen), TruncateTo's the divergent tail and prefills only the new
+tokens - time-to-first-token stays roughly flat instead of growing with the
+conversation. Correct independent of tokenizer round-tripping (the diff
+always finds the true shared prefix; /system and /reset just diverge earlier).
+Pure-attention models only: a recurrent (SSM) state cannot be position-
+truncated, so those (and --no-cache-reuse) fall back to a full re-prefill.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -104,6 +114,8 @@ type
     SystemPrompt: string;
     SelfTest: boolean;
     ShowHelp: boolean;
+    Stats: boolean;              // per-turn timing to stderr (TTFT, tok/s)
+    NoCacheReuse: boolean;       // force full re-prefill every turn (A/B + debug)
     ErrorMsg: string;
   end;
 
@@ -129,9 +141,11 @@ begin
   WriteLn('  --ctx N               context window (default min(model max,2048); mem ~O(ctx^2))');
   WriteLn('  --format NAME         chatml|llama2|llama3|zephyr|gemma|phi3|mistral');
   WriteLn('  --system "msg"        initial system prompt');
-  WriteLn('  --int8                int8 weight-only quantized inference (DEFAULT)');
-  WriteLn('  --fp32                full-precision weights (much more RAM; ~3x the');
-  WriteLn('                        weight bytes are held - see --int8)');
+  WriteLn('  --fp32                full-precision weights (DEFAULT; faster, more RAM)');
+  WriteLn('  --int8                int8 weight-only quantized inference (slower, less RAM)');
+  WriteLn('  --stats               per-turn timing to stderr (TTFT, decode tok/s)');
+  WriteLn('  --no-cache-reuse      re-prefill the whole prompt each turn (default:');
+  WriteLn('                        reuse the shared KV-cache prefix from last turn)');
   WriteLn('  --selftest            run the offline unit checks and exit');
   WriteLn('  --help                this text');
   WriteLn;
@@ -141,7 +155,7 @@ end;
 function DefaultChatOptions(): TChatOptions;
 begin
   Result.ModelDir := '';
-  Result.Int8 := true; // int8 weight-only by default (a fraction of FP32 RAM)
+  Result.Int8 := false; // full-precision FP32 weights by default (--int8 for less RAM)
   Result.CtxLen := 0;
   Result.MaxNewTokens := 128;
   Result.Temperature := 1.0;
@@ -157,6 +171,8 @@ begin
   Result.SystemPrompt := '';
   Result.SelfTest := false;
   Result.ShowHelp := false;
+  Result.Stats := false;
+  Result.NoCacheReuse := false;
   Result.ErrorMsg := '';
 end;
 
@@ -221,6 +237,8 @@ begin
     Arg := Args[ArgPos];
     if Arg = '--int8' then Opt.Int8 := true
     else if Arg = '--fp32' then Opt.Int8 := false
+    else if Arg = '--stats' then Opt.Stats := true
+    else if Arg = '--no-cache-reuse' then Opt.NoCacheReuse := true
     else if Arg = '--selftest' then Opt.SelfTest := true
     else if (Arg = '--help') or (Arg = '-h') then Opt.ShowHelp := true
     else if Arg = '--temperature' then
@@ -397,6 +415,20 @@ begin
   Result := true;
 end;
 
+// Length of the longest common prefix of two token-id sequences. Used by the
+// incremental KV-cache reuse: A is the sequence currently resident in the
+// cache (positions 0..High), B is this turn's freshly rendered prompt; the
+// cache can be kept up to this length and only B's tail re-prefilled.
+function CommonPrefixLen(const A, B: TNeuralIntegerArray): integer;
+var
+  N: integer;
+begin
+  Result := 0;
+  N := Length(A);
+  if Length(B) < N then N := Length(B);
+  while (Result < N) and (A[Result] = B[Result]) do Inc(Result);
+end;
+
 // Reads config.json's model_type for the one-line summary ('' on trouble).
 // fpjson gotcha: TJSONParser with options [] (GetJSON mangles non-ASCII).
 function ReadModelType(const ConfigFile: string): string;
@@ -474,17 +506,30 @@ end;
 // sequence, or after Opt.MaxNewTokens. Returns the decoded reply (marker
 // trimmed); streamed printing flushes after every token so piped output
 // still streams.
+// CacheReuse: keep the KV cache across turns and only prefill the tail that
+// diverges from CachedTokens (the token-id sequence currently resident in the
+// cache, updated here in/out). When false, the cache is fully reset and the
+// whole prompt re-prefilled (the SSM/recurrent path, where the cache cannot be
+// truncated by position, and --no-cache-reuse).
 function GenerateReply(NN: TNNet; Session: TNNetStreamingDecoder;
   Tokenizer: TNeuralHFTokenizer;
   const PromptIds: TNeuralIntegerArray; const Opt: TChatOptions;
   SeqLen, VocabSize: integer; Chain: TNNetLogitsProcessorChain;
-  Sampler: TNNetSamplerBase; const MarkerIds: TNeuralIntegerArray): string;
+  Sampler: TNNetSamplerBase; const MarkerIds: TNeuralIntegerArray;
+  var CachedTokens: TNeuralIntegerArray; CacheReuse: boolean): string;
 var
   Tokens: TNeuralIntegerArray;
   Generated: TNeuralIntegerArray;
   InV, Output, Row: TNNetVolume;
   Len, GenLen, StepCnt, Cnt, NewToken: integer;
+  Reused, PromptLen: integer;  // KV-cache reuse bookkeeping (and --stats)
   Decoded, Printed: string;
+  // --stats timing (monotonic ms). TStart: before prefill; TFirst: when the
+  // first reply token is produced (so TTFT covers prefill + first step);
+  // TEnd: after the decode loop. Produced counts emitted tokens.
+  TStart, TFirst, TEnd: QWord;
+  Produced: integer;
+  DecodeSecs: double;
 begin
   Result := '';
   Len := Length(PromptIds);
@@ -501,13 +546,30 @@ begin
   InV := TNNetVolume.Create(1, 1, 1);
   Output := nil; // a reference into the net, returned by Session.Output()
   Row := TNNetVolume.Create(VocabSize, 1, 1);
+  TStart := GetTickCount64();
+  TFirst := 0;
+  TEnd := 0;
+  Produced := 0;
+  PromptLen := Len;
   try
     Chain.Reset(PromptIds);
-    // Fresh KV cache for this reply, then prefill the whole prompt
-    // token-at-a-time. The LAST prompt token is fed as the first decode
-    // step's input (its output row predicts the first reply token).
-    Session.Reset();
-    for Cnt := 0 to Len - 2 do
+    // Prefill the prompt token-at-a-time, reusing the KV-cache prefix shared
+    // with last turn when possible. Reused = length of the cached prefix that
+    // still matches this prompt; TruncateTo drops the divergent tail (Reused=0
+    // is a full reset). The LAST prompt token is fed as the first decode step's
+    // input, so the cache must not already hold it - cap reuse at Len-1.
+    if CacheReuse then
+    begin
+      Reused := CommonPrefixLen(CachedTokens, PromptIds);
+      if Reused > Len - 1 then Reused := Len - 1;
+      Session.TruncateTo(Reused);
+    end
+    else
+    begin
+      Reused := 0;
+      Session.Reset(); // SSM state cannot be position-truncated; full reset
+    end;
+    for Cnt := Reused to Len - 2 do
     begin
       InV.FData[0] := Tokens[Cnt];
       Session.StepForward(InV, Cnt);
@@ -527,6 +589,8 @@ begin
       Chain.Commit(NewToken);
       Tokens[Len] := NewToken;
       Inc(Len);
+      Inc(Produced);
+      if Produced = 1 then TFirst := GetTickCount64(); // TTFT boundary
       GenLen := Length(Generated);
       SetLength(Generated, GenLen + 1);
       Generated[GenLen] := NewToken;
@@ -557,6 +621,30 @@ begin
       Write(Copy(Result, Length(Printed) + 1, Length(Result) - Length(Printed)));
     WriteLn;
     Flush(System.Output);
+    // Record the sequence now resident in the cache for next turn's prefix
+    // diff: every token that was FED is cached (positions 0..Len-2); the final
+    // produced token (Tokens[Len-1]) was sampled but never fed, so it is not.
+    SetLength(CachedTokens, Len - 1);
+    for Cnt := 0 to Len - 2 do CachedTokens[Cnt] := Tokens[Cnt];
+    // Per-turn timing to stderr (keeps stdout = pure model output). TTFT =
+    // prefill + first decode step; tok/s measures the steady-state decode of
+    // the tokens AFTER the first, so prefill cost is excluded. prompt N (reused
+    // K) shows how much of the prompt the KV-cache reuse skipped re-prefilling.
+    if Opt.Stats and (Produced > 0) then
+    begin
+      TEnd := GetTickCount64();
+      Write(StdErr, Format('[stats] %d tokens, TTFT %d ms, prompt %d (reused %d)',
+        [Produced, TFirst - TStart, PromptLen, Reused]));
+      if Produced > 1 then
+      begin
+        DecodeSecs := (TEnd - TFirst) / 1000.0;
+        if DecodeSecs > 0 then
+          Write(StdErr, Format(', decode %.1f tok/s',
+            [(Produced - 1) / DecodeSecs]));
+      end;
+      WriteLn(StdErr);
+      Flush(StdErr);
+    end;
   finally
     Row.Free;
     InV.Free;
@@ -586,6 +674,7 @@ var
   Msgs: TChatMessages;
   History: TChatMessages;
   Rendered, Cmd, Arg: string;
+  PA, PB: TNeuralIntegerArray;  // CommonPrefixLen fixtures
 begin
   Failures := 0;
   Args := TStringList.Create();
@@ -606,6 +695,7 @@ begin
     Args.Add('--format'); Args.Add('chatml');
     Args.Add('--system'); Args.Add('Be brief.');
     Args.Add('--int8');
+    Args.Add('--stats');
     Check(ParseArgs(Args, Opt), 'full flag set parses');
     Check(Opt.ModelDir = '/tmp/model', 'model dir is the positional arg');
     Check(Abs(Opt.Temperature - 0.7) < 1e-6, '--temperature');
@@ -621,15 +711,31 @@ begin
     Check(Opt.FormatName = 'chatml', '--format');
     Check(Opt.SystemPrompt = 'Be brief.', '--system');
     Check(Opt.Int8, '--int8');
+    Check(Opt.Stats, '--stats');
 
-    // int8 is the default; --fp32 opts back into full precision.
+    // fp32 is the default; --int8 opts into quantized weights.
     Args.Clear;
     Args.Add('/tmp/model');
-    Check(ParseArgs(Args, Opt) and Opt.Int8, 'int8 is the default weight mode');
+    Check(ParseArgs(Args, Opt) and not Opt.Int8, 'fp32 is the default weight mode');
     Args.Clear;
     Args.Add('/tmp/model');
-    Args.Add('--fp32');
-    Check(ParseArgs(Args, Opt) and not Opt.Int8, '--fp32 disables int8');
+    Args.Add('--int8');
+    Check(ParseArgs(Args, Opt) and Opt.Int8, '--int8 enables int8');
+
+    // --stats is off by default.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and not Opt.Stats, 'stats off by default');
+
+    // KV-cache reuse is on by default; --no-cache-reuse disables it.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and not Opt.NoCacheReuse,
+      'cache reuse on by default');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--no-cache-reuse');
+    Check(ParseArgs(Args, Opt) and Opt.NoCacheReuse, '--no-cache-reuse parses');
 
     Args.Clear;
     Args.Add('--bogus-flag');
@@ -676,6 +782,22 @@ begin
     // Format name round trip used by --format.
     Check(ChatFormatFromName('llama3') = cfLlama3, '--format name lookup');
     Check(ChatFormatFromName('nope') = cfUnknown, 'unknown format name');
+
+    // CommonPrefixLen: the KV-cache reuse diff. Drives how much of the prompt
+    // is re-prefilled each turn (Reused = matching prefix, capped at Len-1).
+    SetLength(PA, 0); SetLength(PB, 0);
+    Check(CommonPrefixLen(PA, PB) = 0, 'prefix of two empty arrays is 0');
+    SetLength(PA, 4); PA[0] := 1; PA[1] := 2; PA[2] := 3; PA[3] := 4;
+    SetLength(PB, 0);
+    Check(CommonPrefixLen(PA, PB) = 0, 'prefix with an empty array is 0');
+    SetLength(PB, 4); PB[0] := 1; PB[1] := 2; PB[2] := 3; PB[3] := 4;
+    Check(CommonPrefixLen(PA, PB) = 4, 'identical arrays: full length');
+    PB[0] := 9;
+    Check(CommonPrefixLen(PA, PB) = 0, 'divergent at position 0');
+    PB[0] := 1; PB[2] := 9;
+    Check(CommonPrefixLen(PA, PB) = 2, 'divergent mid-sequence');
+    SetLength(PB, 2); PB[0] := 1; PB[1] := 2;
+    Check(CommonPrefixLen(PA, PB) = 2, 'one array is a prefix of the other');
   finally
     Args.Free;
   end;
@@ -699,10 +821,11 @@ var
   ChatFormat: TNeuralChatFormat;
   History: TChatMessages;
   Msgs: TChatMessages;
-  PromptIds, MarkerIds: TNeuralIntegerArray;
+  PromptIds, MarkerIds, CachedTokens: TNeuralIntegerArray;
   Chain: TNNetLogitsProcessorChain;
   Sampler: TNNetSamplerBase;
   Penalty: TNNetTokenHistoryPenalty;
+  ReuseOK: boolean;             // KV-cache reuse sound for this architecture?
   Cnt, SeqLen, VocabSize: integer;
   Line, Cmd, Arg, Reply, ModelType, Marker: string;
   TokenizerFile, TokenizerConfigFile: string;
@@ -786,14 +909,14 @@ begin
   end;
 
   // Model: generic architecture dispatch, inference-only, optional int8.
-  // Weight precision. int8 is the default because the FP32 forward path keeps
-  // ~3 copies of every weight matrix; FP32 is opt-in via --fp32.
+  // Weight precision. FP32 is the default (faster, more RAM); int8 is the
+  // opt-in for less RAM at the cost of speed (per-layer dequantization).
   if Opt.Int8 then
-    WriteLn('[int8 weights (default) - pass --fp32 for full-precision',
-      ' weights (much more RAM)]')
+    WriteLn('[--int8: int8 weight-only quantized weights - slower, less RAM;',
+      ' pass --fp32 (or drop --int8) for full-precision]')
   else
-    WriteLn('[--fp32: full-precision weights - this holds ~3x the weight',
-      ' bytes; drop --fp32 to use int8 if you run low on RAM]');
+    WriteLn('[fp32 weights (default) - faster, more RAM;',
+      ' pass --int8 for less RAM (slower)]');
 
   WriteLn('Loading ', Opt.ModelDir, ' ...');
   // Built at INPUT WIDTH 1 (pSeqLen=1): streamed decode feeds one token per
@@ -804,6 +927,11 @@ begin
   SeqLen := Opt.CtxLen;
   VocabSize := NN.GetLastLayer().Output.Depth;
   Session := TNNetStreamingDecoder.Create(NN, SeqLen);
+  // KV-cache reuse across turns needs position-truncatable attention K/V and no
+  // recurrent (SSM) state to rewind. Pure-attention nets qualify; --no-cache-
+  // reuse forces the full re-prefill at the call site.
+  ReuseOK := (Session.SSMCount = 0) and (Session.SDPACount > 0);
+  SetLength(CachedTokens, 0);
   ModelType := ReadModelType(IncludeTrailingPathDelimiter(Opt.ModelDir) +
     'config.json');
   if ModelType = '' then ModelType := 'unknown';
@@ -811,6 +939,13 @@ begin
     VocabSize, ', context ', SeqLen, ', chat format ',
     ChatFormatName(ChatFormat), ', ',
     BoolToStr(Opt.Int8, 'int8', 'fp32'), ' weights.');
+  if Opt.NoCacheReuse then
+    WriteLn('[KV-cache reuse OFF (--no-cache-reuse) - full re-prefill each turn]')
+  else if ReuseOK then
+    WriteLn('[KV-cache reuse ON - only the new prompt tail is prefilled each turn]')
+  else
+    WriteLn('[KV-cache reuse N/A for this architecture (recurrent/SSM state)',
+      ' - full re-prefill each turn]');
 
   // Distribution pipeline (TGenerationConfig order: penalty -> temperature
   // -> sampler).
@@ -875,7 +1010,8 @@ begin
       PromptIds := EncodeChat(Tokenizer, ChatFormat, Msgs,
         {AddGenerationPrompt=}true);
       Reply := GenerateReply(NN, Session, Tokenizer, PromptIds, Opt, SeqLen,
-        VocabSize, Chain, Sampler, MarkerIds);
+        VocabSize, Chain, Sampler, MarkerIds, CachedTokens,
+        {CacheReuse=}ReuseOK and not Opt.NoCacheReuse);
       SetLength(History, Length(History) + 1);
       History[High(History)] := ChatMessage('assistant', Reply);
     except
