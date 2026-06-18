@@ -265,11 +265,13 @@ procedure TNeuralThreadList.StartEngine();
 var
   I: integer;
   localCount: integer;
+  localCountM1: integer;
 begin
   if not(FStarted) then
   begin
     localCount := Count;
-    for I := 0 to localCount - 1 do
+    localCountM1 := localCount - 1;
+    for I := 0 to localCountM1 do
     begin
       Self.Items[I].Start();
     end;
@@ -281,17 +283,19 @@ procedure TNeuralThreadList.StopEngine();
 var
   I: integer;
   localCount: integer;
+  localCountM1: integer;
 begin
   if (FStarted) then
   begin
     localCount := Count;
-    for I := 0 to localCount - 1 do
+    localCountM1 := localCount - 1;
+    for I := 0 to localCountM1 do
     begin
       Self.Items[I].Terminate();
       Self.Items[I].DoSomething();
     end;
 
-    for I := 0 to localCount - 1 do
+    for I := 0 to localCountM1 do
     begin
       Self.Items[I].DoSomething();
       Self.Items[I].WaitFor();
@@ -304,6 +308,7 @@ procedure TNeuralThreadList.StartProc(pProc: TNeuralProc; pBlock: boolean = true
 var
   I: integer;
   localCount: integer;
+  localCountM1: integer;
 begin
   localCount := Count;
 
@@ -314,7 +319,8 @@ begin
   else
   begin
     if not(FStarted) then StartEngine();
-    for I := 0 to localCount - 1 do
+    localCountM1 := localCount - 1;
+    for I := 0 to localCountM1 do
     begin
       Self.Items[I].StartProc(pProc, I, localCount);
     end;

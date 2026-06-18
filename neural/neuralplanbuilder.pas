@@ -222,10 +222,12 @@ implementation
 procedure TVisitedStatesCopy(var A, B: TActionStateList);
 var
   I: longint;
+  BNumStatesM1: longint;
 begin
   A.NumStates := B.NumStates;
   A.ListActions := B.ListActions;
-  for I := 0 to B.NumStates - 1 do
+  BNumStatesM1 := B.NumStates - 1;
+  for I := 0 to BNumStatesM1 do
     ABCopy(A.ListStates[I], B.ListStates[I]);
   // copy hash table.
   ABCopy(A.FKeyCache.A, B.FKeyCache.A);
@@ -235,8 +237,10 @@ procedure TCompositePlan.Init(PPred, PPredOpt: TProcPred;
   PNumberActions, StateLength: longint);
 var
   I: longint;
+  PlansHi: longint;
 begin
-  for I := Low(Plans) to High(Plans) do
+  PlansHi := High(Plans);
+  for I := Low(Plans) to PlansHi do
     Plans[I].Init(PPred, PPredOpt, PNumberActions, StateLength);
   LastUsedPlan := -1;
   LastPlanedPlan := -1;
@@ -289,10 +293,12 @@ end;
 procedure TCompositePlan.CollapsePlans(X, Y: longint);
 var
   I: longint;
+  YNumStatesM1: longint;
 begin
   if (Plans[Y].Found) and (Plans[Y].NumStates + Plans[X].NumStates < MaxStates) then
   begin
-    for I := 0 to Plans[Y].NumStates - 1 do
+    YNumStatesM1 := Plans[Y].NumStates - 1;
+    for I := 0 to YNumStatesM1 do
     begin
       Plans[X].FPlan.Include(Plans[Y].FPlan.ListStates[I], Plans[Y].Action(I));
     end;
@@ -320,8 +326,10 @@ var
   I: longint;
 var
   ACI: longint;
+  PlansHi: longint;
 begin
-  for I := Low(Plans) to High(Plans) do
+  PlansHi := High(Plans);
+  for I := Low(Plans) to PlansHi do
     if Plans[I].Found then
     begin
       if (I <> LastUsedPlan) then
@@ -356,13 +364,15 @@ function TCompositePlan.ToAct(ST: array of byte;
   var FutureS: array of byte): boolean;
 var
   I, AcI, C: longint;
+  PlansHi: longint;
 begin
   ToAct := False;
   LastAct := False;
 
   C := ChooseBestPlanBasedOnNextStep(ST);
 
-  for I := Low(Plans) to High(Plans) do
+  PlansHi := High(Plans);
+  for I := Low(Plans) to PlansHi do
   begin
     AcI := Plans[C].GetNextStep(ST);
     if AcI <> -1 then
@@ -384,10 +394,12 @@ var
   WorstPlan: longint;
   WorstPlanEvaluation: extended;
   PlanEvaluation: extended;
+  PlansHi: longint;
 begin
   WorstPlan := 0;
   WorstPlanEvaluation := -1000000;
-  for I := Low(Plans) to High(Plans) do
+  PlansHi := High(Plans);
+  for I := Low(Plans) to PlansHi do
   begin
     PlanEvaluation := EvalPlan(I);
     if (PlanEvaluation > WorstPlanEvaluation) or
@@ -407,10 +419,12 @@ var
   BestPlan: longint;
   BestPlanEvaluation: extended;
   PlanEvaluation: extended;
+  PlansHi: longint;
 begin
   BestPlan := 0;
   BestPlanEvaluation := 1000000;
-  for I := Low(Plans) to High(Plans) do
+  PlansHi := High(Plans);
+  for I := Low(Plans) to PlansHi do
   begin
     PlanEvaluation := EvalPlanBasedOnNextStep(CurrentState, I);
     if (PlanEvaluation < BestPlanEvaluation) or
@@ -447,9 +461,11 @@ end;
 procedure TActionStateList.Init(StateLength: longint);
 var
   I: integer;
+  MaxStatesM1: integer;
 begin
   Clear;
-  for I := 0 to MaxStates - 1 do
+  MaxStatesM1 := MaxStates - 1;
+  for I := 0 to MaxStatesM1 do
     SetLength(ListStates[I], StateLength);
   FKeyCache.Init(8000);
 end;
@@ -463,11 +479,13 @@ end;
 procedure TActionStateList.RemoveFirst;
 var
   I: integer;
+  NumStatesM1: integer;
 begin
   FKeyCache.Clear;
   if NumStates > 0 then
   begin
-    for I := 1 to NumStates - 1 do
+    NumStatesM1 := NumStates - 1;
+    for I := 1 to NumStatesM1 do
     begin
       ABCopy(ListStates[I - 1], ListStates[I]);
       ListActions[I - 1] := ListActions[I];
@@ -522,9 +540,11 @@ end;
 procedure TActionStateList.ReDoHash;
 var
   I: longint;
+  NumStatesM1: longint;
 begin
   FKeyCache.Clear;
-  for I := 0 to NumStates - 1 do
+  NumStatesM1 := NumStates - 1;
+  for I := 0 to NumStatesM1 do
     FKeyCache.Include(ListStates[I]);
 end;
 
@@ -562,10 +582,12 @@ end;
 procedure TActionStateList.RemoveSubList(InitPos, FinishPos: longint);
 var
   I, difer: longint;
+  NumStatesM1: longint;
 begin
   difer := FinishPos - InitPos + 1;
-  if (FinishPos + 1 <= NumStates - 1) then
-    for I := FinishPos + 1 to NumStates - 1 do
+  NumStatesM1 := NumStates - 1;
+  if (FinishPos + 1 <= NumStatesM1) then
+    for I := FinishPos + 1 to NumStatesM1 do
     begin
       ABCopy(ListStates[I - Difer], ListStates[I]);
       ListActions[I - Difer] := ListActions[I];
@@ -650,9 +672,11 @@ function BuildPlanFn(
     I: integer;
     NewState: TState;
     Action: byte;
+    NumberActionsM1: integer;
   begin
     SetLength(NewState, Length(State));
-    for I := 0 to NumberActions - 1 do
+    NumberActionsM1 := NumberActions - 1;
+    for I := 0 to NumberActionsM1 do
     begin
       Action := random(NumberActions);
       ABCopy(NewState, State);
@@ -675,10 +699,12 @@ function BuildPlanFn(
   var
     I: integer;
     NewState: TState;
+    NumberActionsM1: integer;
   begin
     ChooseActionIn1Step := -1;
     SetLength(NewState, Length(State));
-    for I := 0 to NumberActions - 1 do
+    NumberActionsM1 := NumberActions - 1;
+    for I := 0 to NumberActionsM1 do
     begin
       ABCopy(NewState, State);
       if PPred(NewState, I) then
@@ -791,6 +817,7 @@ var
   StartPos, FinishPos: longint;
   IniState, FinalState: TState;
   v2pos, FPlanPos, K: longint;
+  V2NumStatesM1, FPlanNumStatesM1: longint;
 begin
   OptimizeFrom := 0;
 
@@ -815,14 +842,16 @@ begin
   TryToBuildSubPath(V2, FinalState, IniState, deep, PredOpt, FNumberActions);
   V2.RemoveAllCicles;
   // for each state in the new sub path
-  for v2pos := 1 to V2.NumStates - 1 do
+  V2NumStatesM1 := V2.NumStates - 1;
+  for v2pos := 1 to V2NumStatesM1 do
   begin
     if ((StartPos + v2pos) < (FPlan.NumStates - 1))
       // is it a state in the existing plan?
       and (FPlan.FastExists(V2.ListStates[v2pos]) <> -1) then
     begin
       // for each of the following states in the current plan FPlan.
-      for FPlanPos := StartPos + v2pos to FPlan.NumStates - 1 do
+      FPlanNumStatesM1 := FPlan.NumStates - 1;
+      for FPlanPos := StartPos + v2pos to FPlanNumStatesM1 do
       begin
         // Does the state in V2 exist in FPlan? Has shorter path been found?
         if ABCmp(V2.ListStates[v2pos], FPlan.ListStates[FPlanPos])
