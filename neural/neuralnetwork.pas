@@ -23419,7 +23419,7 @@ end;
 // conjugates the exponent and divides by N. Double precision throughout.
 procedure FourierMixFFT(var Re, Im: array of Double; N: integer; Inverse: boolean);
 var
-  i, j, len, half, k, NM1, halfM1: integer;
+  i, j, len, half, k, NM1, halfM1, a, b: integer;
   ang, wRe, wIm, wpRe, wpIm, tmp: Double;
   uRe, uIm, vRe, vIm: Double;
 begin
@@ -23459,14 +23459,16 @@ begin
       wIm := 0.0;
       for k := 0 to halfM1 do
       begin
-        uRe := Re[i + k];
-        uIm := Im[i + k];
-        vRe := wRe * Re[i + k + half] - wIm * Im[i + k + half];
-        vIm := wRe * Im[i + k + half] + wIm * Re[i + k + half];
-        Re[i + k]        := uRe + vRe;
-        Im[i + k]        := uIm + vIm;
-        Re[i + k + half] := uRe - vRe;
-        Im[i + k + half] := uIm - vIm;
+        a := i + k;
+        b := a + half;
+        uRe := Re[a];
+        uIm := Im[a];
+        vRe := wRe * Re[b] - wIm * Im[b];
+        vIm := wRe * Im[b] + wIm * Re[b];
+        Re[a] := uRe + vRe;
+        Im[a] := uIm + vIm;
+        Re[b] := uRe - vRe;
+        Im[b] := uIm - vIm;
         tmp := wRe * wpRe - wIm * wpIm;
         wIm := wRe * wpIm + wIm * wpRe;
         wRe := tmp;
