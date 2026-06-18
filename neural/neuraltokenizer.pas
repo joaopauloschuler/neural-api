@@ -168,12 +168,13 @@ var
   I, J, MaxJ: integer;
   pair, newToken: string;
   StartTime: double;
-  MergesLoopCnt: integer;
+  MergesLoopCnt, MergesLoopCntM1: integer;
 begin
   pairCounts := TPairFrequency.Create;
   MergesLoopCnt := (numMerges-128) div MergesPerLoop;
+  MergesLoopCntM1 := MergesLoopCnt - 1;
   try
-    for I := 0 to MergesLoopCnt - 1 do
+    for I := 0 to MergesLoopCntM1 do
     begin
       StartTime := Now();
       if WriteDebug then Write(I*MergesPerLoop, ' Counting pairs. ');
