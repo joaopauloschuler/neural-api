@@ -45,7 +45,7 @@ unit neuralscheduler;
 interface
 
 uses
-  SysUtils, Math, neuralvolume;
+  SysUtils, Math, neuralvolume, pascoremath32;
 
 type
   { TNeuralLRScheduler: abstract base for all LR schedulers. }
@@ -226,7 +226,7 @@ var
 begin
   T := Step;
   if T < 0 then T := 0;
-  Result := FBaseLR * Power(FGamma, T div FStepSize);
+  Result := FBaseLR * pcr_powf(FGamma, T div FStepSize);
 end;
 
 { TCosineAnnealingLR }
@@ -248,7 +248,7 @@ begin
   T := Step;
   if T < 0 then T := 0;
   if T > FT then T := FT;
-  Result := FEtaMin + (FEtaMax - FEtaMin) * 0.5 * (1 + Cos(Pi * T / FT));
+  Result := FEtaMin + (FEtaMax - FEtaMin) * 0.5 * (1 + pcr_cosf(Pi * T / FT));
 end;
 
 { TWarmupCosineLR }
@@ -277,7 +277,7 @@ begin
     Result := FEtaMax * T / FWarmup
   else
     Result := FEtaMin + (FEtaMax - FEtaMin) * 0.5 *
-      (1 + Cos(Pi * (T - FWarmup) / (FT - FWarmup)));
+      (1 + pcr_cosf(Pi * (T - FWarmup) / (FT - FWarmup)));
 end;
 
 { TPolyLR }
@@ -307,7 +307,7 @@ begin
     Exit;
   end;
   Base := 1 - T / FT;
-  Result := FBaseLR * Power(Base, FPower);
+  Result := FBaseLR * pcr_powf(Base, FPower);
 end;
 
 { TReduceLROnPlateau }
@@ -421,7 +421,7 @@ var
 
   function Anneal(startV, endV, p: TNeuralFloat): TNeuralFloat;
   begin
-    Result := endV + (startV - endV) / 2.0 * (Cos(Pi * p) + 1);
+    Result := endV + (startV - endV) / 2.0 * (pcr_cosf(Pi * p) + 1);
   end;
 
 begin
@@ -479,7 +479,7 @@ begin
   if scaleFactor < 0 then scaleFactor := 0;
   amp := FMaxLR - FBaseLR;
   if FMode = clTriangular2 then
-    amp := amp / Power(2.0, cycle - 1);
+    amp := amp / pcr_powf(2.0, cycle - 1);
   baseHeight := amp * scaleFactor;
   Result := FBaseLR + baseHeight;
 end;
