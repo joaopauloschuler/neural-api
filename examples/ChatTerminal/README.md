@@ -35,7 +35,7 @@ Le chat est assis sur le rebord de la fenetre.
 Aya / Command-R are tuned for cross-lingual instruction following, so a
 single session can switch languages turn to turn. The chat format is
 fingerprinted from the Cohere `tokenizer_config.json` like every other
-family; `--int8` keeps an 8B checkpoint within a few GB of RAM.
+family; `--int8` trades speed for memory.
 
 The conversation is kept as a multi-turn history rendered through the
 chat-template engine (`neural/neuralchat.pas`): the chat format is
@@ -63,7 +63,7 @@ guard, flushed per token so piped output streams too).
 | `--ctx N` | context window to build (`pSeqLen`) | model max |
 | `--format NAME` | `chatml`/`llama2`/`llama3`/`zephyr`/`gemma`/`phi3`/`mistral` override | autodetect |
 | `--system "msg"` | initial system prompt | none |
-| `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) | fp32 |
+| `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — slower, less RAM | fp32 (faster, more RAM) |
 | `--selftest` | run the offline unit checks and exit | — |
 
 The model is always built with `pInferenceOnly=true` (the REPL never

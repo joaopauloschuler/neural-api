@@ -35,12 +35,10 @@ sequence in the generated region and trimmed from the reply), or after
 --max-new-tokens.
 
 The model is always built with pInferenceOnly=true (the REPL never trains;
-frees the per-neuron gradient/momentum buffers). Weight-only int8 storage
-(pQuantizeInt8) is the DEFAULT because the FP32 forward path keeps ~3 copies
-of every weight matrix (per-neuron + concatenated + interleaved caches), so
-a 0.5B model can need >10GB resident; int8 holds ~1/4 of ONE FP32 copy and
-dequantizes a layer at a time. Pass --fp32 to opt back into full precision
-(much more RAM) when you have the memory and want bit-exact FP32 outputs.
+frees the per-neuron gradient/momentum buffers). Full-precision FP32 weights
+are the DEFAULT: faster, at the cost of more RAM. Pass --int8 for weight-only
+int8 storage (pQuantizeInt8): less RAM, but slower (each layer is dequantized
+on the fly).
 
 REPL commands: /exit, /reset (clear history), /system <msg> (set the system
 prompt; raises on formats without a system role, e.g. gemma/mistral).
@@ -129,9 +127,8 @@ begin
   WriteLn('  --ctx N               context window (default min(model max,2048); mem ~O(ctx^2))');
   WriteLn('  --format NAME         chatml|llama2|llama3|zephyr|gemma|phi3|mistral');
   WriteLn('  --system "msg"        initial system prompt');
-  WriteLn('  --int8                int8 weight-only quantized inference (DEFAULT)');
-  WriteLn('  --fp32                full-precision weights (much more RAM; ~3x the');
-  WriteLn('                        weight bytes are held - see --int8)');
+  WriteLn('  --fp32                full-precision weights (DEFAULT; faster, more RAM)');
+  WriteLn('  --int8                int8 weight-only quantized inference (slower, less RAM)');
   WriteLn('  --selftest            run the offline unit checks and exit');
   WriteLn('  --help                this text');
   WriteLn;
@@ -141,7 +138,7 @@ end;
 function DefaultChatOptions(): TChatOptions;
 begin
   Result.ModelDir := '';
-  Result.Int8 := true; // int8 weight-only by default (a fraction of FP32 RAM)
+  Result.Int8 := false; // full-precision FP32 weights by default (--int8 for less RAM)
   Result.CtxLen := 0;
   Result.MaxNewTokens := 128;
   Result.Temperature := 1.0;
@@ -622,14 +619,14 @@ begin
     Check(Opt.SystemPrompt = 'Be brief.', '--system');
     Check(Opt.Int8, '--int8');
 
-    // int8 is the default; --fp32 opts back into full precision.
+    // fp32 is the default; --int8 opts into quantized weights.
     Args.Clear;
     Args.Add('/tmp/model');
-    Check(ParseArgs(Args, Opt) and Opt.Int8, 'int8 is the default weight mode');
+    Check(ParseArgs(Args, Opt) and not Opt.Int8, 'fp32 is the default weight mode');
     Args.Clear;
     Args.Add('/tmp/model');
-    Args.Add('--fp32');
-    Check(ParseArgs(Args, Opt) and not Opt.Int8, '--fp32 disables int8');
+    Args.Add('--int8');
+    Check(ParseArgs(Args, Opt) and Opt.Int8, '--int8 enables int8');
 
     Args.Clear;
     Args.Add('--bogus-flag');
@@ -786,14 +783,14 @@ begin
   end;
 
   // Model: generic architecture dispatch, inference-only, optional int8.
-  // Weight precision. int8 is the default because the FP32 forward path keeps
-  // ~3 copies of every weight matrix; FP32 is opt-in via --fp32.
+  // Weight precision. FP32 is the default (faster, more RAM); int8 is the
+  // opt-in for less RAM at the cost of speed (per-layer dequantization).
   if Opt.Int8 then
-    WriteLn('[int8 weights (default) - pass --fp32 for full-precision',
-      ' weights (much more RAM)]')
+    WriteLn('[--int8: int8 weight-only quantized weights - slower, less RAM;',
+      ' pass --fp32 (or drop --int8) for full-precision]')
   else
-    WriteLn('[--fp32: full-precision weights - this holds ~3x the weight',
-      ' bytes; drop --fp32 to use int8 if you run low on RAM]');
+    WriteLn('[fp32 weights (default) - faster, more RAM;',
+      ' pass --int8 for less RAM (slower)]');
 
   WriteLn('Loading ', Opt.ModelDir, ' ...');
   // Built at INPUT WIDTH 1 (pSeqLen=1): streamed decode feeds one token per
