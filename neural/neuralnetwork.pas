@@ -6980,6 +6980,13 @@ type
       // serve the V-network. Sized at the HALF width (D inputs).
       FZinT: TNNetVolume;
       FActT: TNNetVolume;
+      // Per-pass scratch promoted from method locals (sized in SetPrevLayer) to
+      // avoid per-call heap allocation in the hot forward/backward paths.
+      FzvBuf, FgvBuf: array of TNeuralFloat;                     // Compute, P-wide
+      FqvBuf, FpvBuf, FgqvBuf, FgpvBuf: array of TNeuralFloat;   // Compute, Dhalf
+      FgzpBuf, FuuBuf, FdzBuf, FgzBuf: array of TNeuralFloat;    // Backprop, P-wide
+      FgpmidBuf: array of TNeuralFloat;                          // Backprop, Dhalf
+      FuhBuf, FdzhBuf, FgqhBuf, FgphBuf: array of TNeuralFloat;  // Backprop sep, Dhalf
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(pSteps: integer = 1; pDt: TNeuralFloat = 0.1;
@@ -7713,6 +7720,12 @@ type
       FA1k, FH1k: TNNetVolume;    // a1=W1_{t-1}k_t, h1=GeLU(a1), (SeqLen,1,H)
       FRr: TNNetVolume;           // inner residual r_t (SeqLen,1,Depth)
       FA1q, FH1q: TNNetVolume;    // a1q=W1_t q_t, h1q=GeLU(a1q), (SeqLen,1,H)
+      // Per-pass Backpropagate scratch promoted from method locals (sized in
+      // SetPrevLayer) to avoid per-call heap allocation.
+      FgkvBuf, FgvvBuf, FgqqBuf: array of TNeuralFloat;          // dL/dk,dL/dv,dL/dq
+      FgWlinBuf, FgWprevBuf: array of TNeuralFloat;              // linear arm carries
+      FgW1cBuf, FgW2cBuf, FgW1prevBuf, FgW2prevBuf: array of TNeuralFloat; // MLP arm
+      FdrBuf, Fdh1Buf, Fda1Buf, FdSBuf: array of TNeuralFloat;   // MLP scratch
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       // pVariant: 0 = TTT-Linear (matrix inner state), 1 = TTT-MLP (2-layer
@@ -7790,6 +7803,12 @@ type
       FRr: TNNetVolume;           // inner residual r_t (SeqLen,1,Depth)
       FA1q, FH1q: TNNetVolume;    // a1q=W1_t q_t, h1q=GeLU(a1q), (SeqLen,1,H)
       FAlpha: TNNetVolume;        // cached alpha_t per token (SeqLen,1,Depth)
+      // Per-pass Backpropagate scratch promoted from method locals (sized in
+      // SetPrevLayer) to avoid per-call heap allocation.
+      FgkvBuf, FgvvBuf, FgqqBuf: array of TNeuralFloat;
+      FdrBuf, Fdh1Buf, Fda1Buf, FdSjBuf: array of TNeuralFloat;
+      FgW1Buf, FgW2Buf, FgS1Buf, FgS2Buf: array of TNeuralFloat;
+      FgW1pBuf, FgW2pBuf, FgS1pBuf, FgS2pBuf: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       // pHidden: inner-MLP hidden width (0 => auto max(2*Depth,8)).
@@ -44571,6 +44590,13 @@ end;
 
 destructor TNNetHamiltonianCell.Destroy();
 begin
+  SetLength(FzvBuf, 0); SetLength(FgvBuf, 0);
+  SetLength(FqvBuf, 0); SetLength(FpvBuf, 0);
+  SetLength(FgqvBuf, 0); SetLength(FgpvBuf, 0);
+  SetLength(FgzpBuf, 0); SetLength(FuuBuf, 0);
+  SetLength(FdzBuf, 0); SetLength(FgzBuf, 0); SetLength(FgpmidBuf, 0);
+  SetLength(FuhBuf, 0); SetLength(FdzhBuf, 0);
+  SetLength(FgqhBuf, 0); SetLength(FgphBuf, 0);
   FActT.Free;
   FZinT.Free;
   FAct.Free;
@@ -44655,6 +44681,15 @@ begin
     FZin.ReSize(FOutput.SizeX * FSteps * 2, 1, FPhaseDim);
     FAct.ReSize(FOutput.SizeX * FSteps * 2, 1, FHidden);
   end;
+  // Promote per-pass scratch from method locals (P = FPhaseDim wide; Dhalf half).
+  SetLength(FzvBuf, FPhaseDim); SetLength(FgvBuf, FPhaseDim);
+  SetLength(FgzpBuf, FPhaseDim); SetLength(FuuBuf, FPhaseDim);
+  SetLength(FdzBuf, FPhaseDim); SetLength(FgzBuf, FPhaseDim);
+  SetLength(FqvBuf, Dhalf); SetLength(FpvBuf, Dhalf);
+  SetLength(FgqvBuf, Dhalf); SetLength(FgpvBuf, Dhalf);
+  SetLength(FgpmidBuf, Dhalf);
+  SetLength(FuhBuf, Dhalf); SetLength(FdzhBuf, Dhalf);
+  SetLength(FgqhBuf, Dhalf); SetLength(FgphBuf, Dhalf);
   InitDefault();
 end;
 
@@ -44665,29 +44700,27 @@ var
   Prev: TNNetVolume;
   SeqLen, P, Hd, Dhalf, t, s, kk, it2: integer;
   PM1, HdM1, DhalfM1, SeqLenM1, FStepsM1: integer;
-  zv: array of TNeuralFloat;
-  gv: array of TNeuralFloat;
 
-  // Evaluate the symplectic field g = dH/dz at the current zv, caching the input
+  // Evaluate the symplectic field g = dH/dz at the current FzvBuf, caching the input
   // and pre-activations at sub-index it2 for the backward HVP. Result into gv.
   procedure FieldAt(it2idx: integer);
   var jj, k2, zb, bp: integer; a2, h2, t2, s2: TNeuralFloat;
   begin
     zb := FZin.GetRawPos(it2idx, 0, 0);
     bp := FAct.GetRawPos(it2idx, 0, 0);
-    for k2 := 0 to PM1 do FZin.FData[zb + k2] := zv[k2];
-    for k2 := 0 to PM1 do gv[k2] := 0;
+    for k2 := 0 to PM1 do FZin.FData[zb + k2] := FzvBuf[k2];
+    for k2 := 0 to PM1 do FgvBuf[k2] := 0;
     for jj := 0 to HdM1 do
     begin
       a2 := b1.FData[jj];
       for k2 := 0 to PM1 do
-        a2 := a2 + W1.FData[W1.GetRawPos(jj, 0, k2)] * zv[k2];
+        a2 := a2 + W1.FData[W1.GetRawPos(jj, 0, k2)] * FzvBuf[k2];
       FAct.FData[bp + jj] := a2;
       h2 := TanH(a2);
       t2 := 1 - h2 * h2;
       s2 := W2.FData[jj] * t2;
       for k2 := 0 to PM1 do
-        gv[k2] := gv[k2] + W1.FData[W1.GetRawPos(jj, 0, k2)] * s2;
+        FgvBuf[k2] := FgvBuf[k2] + W1.FData[W1.GetRawPos(jj, 0, k2)] * s2;
     end;
   end;
 
@@ -44721,7 +44754,6 @@ var
   end;
 
 var
-  qv, pv, gqv, gpv: array of TNeuralFloat;
   itv, itt: integer;
 begin
   StartTime := Now();
@@ -44738,35 +44770,31 @@ begin
   if FSeparable then
   begin
     // Exact leapfrog (Stormer-Verlet) with H=T(p)+V(q).
-    SetLength(qv, Dhalf);
-    SetLength(pv, Dhalf);
-    SetLength(gqv, Dhalf);   // dV/dq
-    SetLength(gpv, Dhalf);   // dT/dp
     for t := 0 to SeqLenM1 do
     begin
       for kk := 0 to DhalfM1 do
       begin
-        qv[kk] := Prev.FData[Prev.GetRawPos(t, 0, kk)];
-        pv[kk] := Prev.FData[Prev.GetRawPos(t, 0, kk + Dhalf)];
+        FqvBuf[kk] := Prev.FData[Prev.GetRawPos(t, 0, kk)];
+        FpvBuf[kk] := Prev.FData[Prev.GetRawPos(t, 0, kk + Dhalf)];
       end;
       for s := 0 to FStepsM1 do
       begin
         itv := (t * FSteps + s) * 2;   // two V evals per step
         itt := (t * FSteps + s);       // one T eval per step
         // p_half = p - (dt/2) dV/dq(q)
-        HalfFieldAt(0, FZin, FAct, itv, qv, gqv);
-        for kk := 0 to DhalfM1 do pv[kk] := pv[kk] - 0.5 * Fdt * gqv[kk];
+        HalfFieldAt(0, FZin, FAct, itv, FqvBuf, FgqvBuf);
+        for kk := 0 to DhalfM1 do FpvBuf[kk] := FpvBuf[kk] - 0.5 * Fdt * FgqvBuf[kk];
         // q_new = q + dt dT/dp(p_half)
-        HalfFieldAt(4, FZinT, FActT, itt, pv, gpv);
-        for kk := 0 to DhalfM1 do qv[kk] := qv[kk] + Fdt * gpv[kk];
+        HalfFieldAt(4, FZinT, FActT, itt, FpvBuf, FgpvBuf);
+        for kk := 0 to DhalfM1 do FqvBuf[kk] := FqvBuf[kk] + Fdt * FgpvBuf[kk];
         // p_new = p_half - (dt/2) dV/dq(q_new)
-        HalfFieldAt(0, FZin, FAct, itv + 1, qv, gqv);
-        for kk := 0 to DhalfM1 do pv[kk] := pv[kk] - 0.5 * Fdt * gqv[kk];
+        HalfFieldAt(0, FZin, FAct, itv + 1, FqvBuf, FgqvBuf);
+        for kk := 0 to DhalfM1 do FpvBuf[kk] := FpvBuf[kk] - 0.5 * Fdt * FgqvBuf[kk];
       end;
       for kk := 0 to DhalfM1 do
       begin
-        FOutput.FData[FOutput.GetRawPos(t, 0, kk)] := qv[kk];
-        FOutput.FData[FOutput.GetRawPos(t, 0, kk + Dhalf)] := pv[kk];
+        FOutput.FData[FOutput.GetRawPos(t, 0, kk)] := FqvBuf[kk];
+        FOutput.FData[FOutput.GetRawPos(t, 0, kk + Dhalf)] := FpvBuf[kk];
       end;
     end;
     FForwardTime := FForwardTime + (Now() - StartTime);
@@ -44775,13 +44803,11 @@ begin
   W1 := FNeurons[0].FWeights;
   b1 := FNeurons[1].FWeights;
   W2 := FNeurons[2].FWeights;
-  SetLength(zv, P);
-  SetLength(gv, P);
   for t := 0 to SeqLenM1 do
   begin
     // Load this time-step's phase vector z=(q|p).
     for kk := 0 to PM1 do
-      zv[kk] := Prev.FData[Prev.GetRawPos(t, 0, kk)];
+      FzvBuf[kk] := Prev.FData[Prev.GetRawPos(t, 0, kk)];
     for s := 0 to FStepsM1 do
     begin
       it2 := (t * FSteps + s) * 2;
@@ -44791,15 +44817,15 @@ begin
       // Sub 0: field at the current (q,p); use its q-part for the p update.
       FieldAt(it2);
       for kk := 0 to DhalfM1 do
-        zv[kk + Dhalf] := zv[kk + Dhalf] - Fdt * gv[kk];   // p_mid
+        FzvBuf[kk + Dhalf] := FzvBuf[kk + Dhalf] - Fdt * FgvBuf[kk];   // p_mid
       // Sub 1: field at (q, p_mid); use its p-part for the q update.
       FieldAt(it2 + 1);
       for kk := 0 to DhalfM1 do
-        zv[kk] := zv[kk] + Fdt * gv[kk + Dhalf];           // q_new
+        FzvBuf[kk] := FzvBuf[kk] + Fdt * FgvBuf[kk + Dhalf];           // q_new
     end;
     // Emit the integrated phase vector.
     for kk := 0 to PM1 do
-      FOutput.FData[FOutput.GetRawPos(t, 0, kk)] := zv[kk];
+      FOutput.FData[FOutput.GetRawPos(t, 0, kk)] := FzvBuf[kk];
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -44815,15 +44841,10 @@ var
   PM1, HdM1, DhalfM1, SeqLenM1: integer;
   negLR: TNeuralFloat;
   hasInputGrad: boolean;
-  gzp: array of TNeuralFloat;   // adjoint dL/dz' on this step's output
-  uu: array of TNeuralFloat;    // adjoint on the field g for one sub-eval
-  dz: array of TNeuralFloat;    // dL/d(field input) returned by one HVP
-  gz: array of TNeuralFloat;    // accumulated dL/dz0 for this step's input
-  gpmid: array of TNeuralFloat; // adjoint on the p_mid intermediate
-  // Separable-only scratch (half width Dhalf).
-  uh: array of TNeuralFloat;    // adjoint on a half-field (T or V)
-  dzh: array of TNeuralFloat;   // dL/d(half-field input) returned by HalfHVP
-  gqh, gph: array of TNeuralFloat;  // accumulated input adjoints (q,p)
+  // Per-pass scratch now lives in the F...Buf fields (sized in SetPrevLayer):
+  //   FgzpBuf adjoint dL/dz'; FuuBuf adjoint on field g; FdzBuf dL/d(field input);
+  //   FgzBuf accumulated dL/dz0; FgpmidBuf adjoint on p_mid intermediate.
+  //   Separable half-width: FuhBuf, FdzhBuf, FgqhBuf, FgphBuf.
 
   // Half-width Hessian-vector product through ONE half-MLP (T or V) field eval
   // cached in (Zc,Ac) at idx, neurons based at nbase. Contracts the half-field
@@ -44840,7 +44861,7 @@ var
     hGW2 := FNeurons[nbase + 2].FDelta;
     bp := Ac.GetRawPos(idx, 0, 0);
     zb := Zc.GetRawPos(idx, 0, 0);
-    for k2 := 0 to DhalfM1 do dzh[k2] := 0;
+    for k2 := 0 to DhalfM1 do FdzhBuf[k2] := 0;
     for jj := 0 to HdM1 do
     begin
       a2 := Ac.FData[bp + jj];
@@ -44848,7 +44869,7 @@ var
       t2 := 1 - h2 * h2;
       cj := 0;
       for k2 := 0 to DhalfM1 do
-        cj := cj + hW1.FData[hW1.GetRawPos(jj, 0, k2)] * uh[k2];
+        cj := cj + hW1.FData[hW1.GetRawPos(jj, 0, k2)] * FuhBuf[k2];
       dLda := hW2.FData[jj] * cj * (-2 * h2 * t2);
       dLdc := hW2.FData[jj] * t2;
       hGW2.FData[jj] := hGW2.FData[jj] + negLR * (t2 * cj);
@@ -44858,8 +44879,8 @@ var
         w1jk := hW1.FData[hW1.GetRawPos(jj, 0, k2)];
         hGW1.FData[hW1.GetRawPos(jj, 0, k2)] :=
           hGW1.FData[hW1.GetRawPos(jj, 0, k2)]
-          + negLR * (dLda * Zc.FData[zb + k2] + dLdc * uh[k2]);
-        dzh[k2] := dzh[k2] + dLda * w1jk;
+          + negLR * (dLda * Zc.FData[zb + k2] + dLdc * FuhBuf[k2]);
+        FdzhBuf[k2] := FdzhBuf[k2] + dLda * w1jk;
       end;
     end;
   end;
@@ -44873,7 +44894,7 @@ var
   begin
     bp := FAct.GetRawPos(it2idx, 0, 0);
     zb := FZin.GetRawPos(it2idx, 0, 0);
-    for k2 := 0 to PM1 do dz[k2] := 0;
+    for k2 := 0 to PM1 do FdzBuf[k2] := 0;
     for jj := 0 to HdM1 do
     begin
       a2 := FAct.FData[bp + jj];
@@ -44881,7 +44902,7 @@ var
       t2 := 1 - h2 * h2;
       cj := 0;
       for k2 := 0 to PM1 do
-        cj := cj + W1.FData[W1.GetRawPos(jj, 0, k2)] * uu[k2];
+        cj := cj + W1.FData[W1.GetRawPos(jj, 0, k2)] * FuuBuf[k2];
       // dL/dW2_j = t_j*c_j ; dL/da_j = W2_j*c_j*(-2 h_j t_j) ; dL/dc_j = W2_j*t_j
       dLda := W2.FData[jj] * cj * (-2 * h2 * t2);
       dLdc := W2.FData[jj] * t2;
@@ -44893,8 +44914,8 @@ var
         // dL/dW1[j,k] = dL/da_j*z_k + dL/dc_j*u_k ; dL/dz_k += dL/da_j*W1[j,k]
         GW1.FData[W1.GetRawPos(jj, 0, k2)] :=
           GW1.FData[W1.GetRawPos(jj, 0, k2)]
-          + negLR * (dLda * FZin.FData[zb + k2] + dLdc * uu[k2]);
-        dz[k2] := dz[k2] + dLda * w1jk;
+          + negLR * (dLda * FZin.FData[zb + k2] + dLdc * FuuBuf[k2]);
+        FdzBuf[k2] := FdzBuf[k2] + dLda * w1jk;
       end;
     end;
   end;
@@ -44920,17 +44941,13 @@ begin
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
   if FSeparable then
   begin
-    SetLength(uh, Dhalf);
-    SetLength(dzh, Dhalf);
-    SetLength(gqh, Dhalf);
-    SetLength(gph, Dhalf);
     for t := 0 to SeqLenM1 do
     begin
       // Seed (gq_new, gp_new) from this time-step's output error.
       for kk := 0 to DhalfM1 do
       begin
-        gqh[kk] := FOutputError.FData[FOutputError.GetRawPos(t, 0, kk)];
-        gph[kk] := FOutputError.FData[FOutputError.GetRawPos(t, 0, kk + Dhalf)];
+        FgqhBuf[kk] := FOutputError.FData[FOutputError.GetRawPos(t, 0, kk)];
+        FgphBuf[kk] := FOutputError.FData[FOutputError.GetRawPos(t, 0, kk + Dhalf)];
       end;
       for s := FSteps - 1 downto 0 do
       begin
@@ -44941,32 +44958,32 @@ begin
         //   gqc=dV/dq(q_new);  p_new  = p_half - (dt/2) gqc
         // adjoints in (gqh,gph) = (dL/dq_new, dL/dp_new).
         // (3) p_new = p_half - (dt/2) gqc(q_new) [V eval at it2+1]
-        for kk := 0 to DhalfM1 do uh[kk] := -0.5 * Fdt * gph[kk]; // adj on gqc
+        for kk := 0 to DhalfM1 do FuhBuf[kk] := -0.5 * Fdt * FgphBuf[kk]; // adj on gqc
         HalfHVP(0, FZin, FAct, it2 + 1);
         // gp_half += gp_new ; gq_new += dzh
-        for kk := 0 to DhalfM1 do gqh[kk] := gqh[kk] + dzh[kk];
+        for kk := 0 to DhalfM1 do FgqhBuf[kk] := FgqhBuf[kk] + FdzhBuf[kk];
         // (2) q_new = q + dt gpb(p_half) [T eval at it2 div 2 = t*Steps+s]
-        for kk := 0 to DhalfM1 do uh[kk] := Fdt * gqh[kk];        // adj on gpb
+        for kk := 0 to DhalfM1 do FuhBuf[kk] := Fdt * FgqhBuf[kk];        // adj on gpb
         HalfHVP(4, FZinT, FActT, t * FSteps + s);
         // gq += gq_new (direct) ; gp_half += dzh
         // gph currently holds dL/dp_new == dL/dp_half (direct from step 3),
         // now add the T contribution.
-        for kk := 0 to DhalfM1 do gph[kk] := gph[kk] + dzh[kk];
+        for kk := 0 to DhalfM1 do FgphBuf[kk] := FgphBuf[kk] + FdzhBuf[kk];
         // (1) p_half = p - (dt/2) gqa(q) [V eval at it2]
-        for kk := 0 to DhalfM1 do uh[kk] := -0.5 * Fdt * gph[kk]; // adj on gqa
+        for kk := 0 to DhalfM1 do FuhBuf[kk] := -0.5 * Fdt * FgphBuf[kk]; // adj on gqa
         HalfHVP(0, FZin, FAct, it2);
         // gq += dzh ; gp = gp_half (direct). gqh already = dL/dq (direct from
         // step 2) + step-3 V contribution; add step-1 V contribution.
-        for kk := 0 to DhalfM1 do gqh[kk] := gqh[kk] + dzh[kk];
+        for kk := 0 to DhalfM1 do FgqhBuf[kk] := FgqhBuf[kk] + FdzhBuf[kk];
         // gph is dL/dp (direct), already accumulated.
       end;
       if hasInputGrad then
         for kk := 0 to DhalfM1 do
         begin
           PrevErr.FData[PrevErr.GetRawPos(t, 0, kk)] :=
-            PrevErr.FData[PrevErr.GetRawPos(t, 0, kk)] + gqh[kk];
+            PrevErr.FData[PrevErr.GetRawPos(t, 0, kk)] + FgqhBuf[kk];
           PrevErr.FData[PrevErr.GetRawPos(t, 0, kk + Dhalf)] :=
-            PrevErr.FData[PrevErr.GetRawPos(t, 0, kk + Dhalf)] + gph[kk];
+            PrevErr.FData[PrevErr.GetRawPos(t, 0, kk + Dhalf)] + FgphBuf[kk];
         end;
     end;
     if (not FBatchUpdate) then
@@ -44987,16 +45004,11 @@ begin
   GW1 := N1.FDelta;
   Gb1 := Nb1.FDelta;
   GW2 := N2.FDelta;
-  SetLength(gzp, P);
-  SetLength(uu, P);
-  SetLength(dz, P);
-  SetLength(gz, P);
-  SetLength(gpmid, Dhalf);
   for t := 0 to SeqLenM1 do
   begin
     // Seed the per-time-step adjoint with the output error on z'_last.
     for kk := 0 to PM1 do
-      gzp[kk] := FOutputError.FData[FOutputError.GetRawPos(t, 0, kk)];
+      FgzpBuf[kk] := FOutputError.FData[FOutputError.GetRawPos(t, 0, kk)];
     // Walk the integration steps right-to-left.
     for s := FSteps - 1 downto 0 do
     begin
@@ -45006,40 +45018,40 @@ begin
       //   sub1: g_b=field(q,p_mid); q_new = q + dt*g_b[p-part]
       //   output z' = (q_new, p_mid)
       // Adjoints in (gq_new, gp_mid_out) = gzp; build dL/dz0 in gz.
-      for kk := 0 to PM1 do gz[kk] := 0;
+      for kk := 0 to PM1 do FgzBuf[kk] := 0;
       // ----- reverse sub1 (q_new = q + dt*g_b[p-part]) -----
       // direct: dL/dq += gq_new ; adjoint on g_b only on its p-part.
-      for kk := 0 to PM1 do uu[kk] := 0;
+      for kk := 0 to PM1 do FuuBuf[kk] := 0;
       for kk := 0 to DhalfM1 do
       begin
-        gz[kk] := gz[kk] + gzp[kk];              // q_new -> q direct
-        uu[kk + Dhalf] := Fdt * gzp[kk];         // u_b on g_b p-part
+        FgzBuf[kk] := FgzBuf[kk] + FgzpBuf[kk];        // q_new -> q direct
+        FuuBuf[kk + Dhalf] := Fdt * FgzpBuf[kk];       // u_b on g_b p-part
       end;
       HVP(it2 + 1);                               // field at (q, p_mid)
       // dz = dL/dz_b where z_b=(q, p_mid): q-part -> dL/dq, p-part -> dL/dp_mid.
       for kk := 0 to DhalfM1 do
       begin
-        gz[kk] := gz[kk] + dz[kk];                // q contribution from z_b
-        gpmid[kk] := gzp[kk + Dhalf] + dz[kk + Dhalf]; // total adjoint on p_mid
+        FgzBuf[kk] := FgzBuf[kk] + FdzBuf[kk];                // q contribution from z_b
+        FgpmidBuf[kk] := FgzpBuf[kk + Dhalf] + FdzBuf[kk + Dhalf]; // total adjoint on p_mid
       end;
       // ----- reverse sub0 (p_mid = p - dt*g_a[q-part]) -----
       // direct: dL/dp += gpmid ; adjoint on g_a only on its q-part.
-      for kk := 0 to PM1 do uu[kk] := 0;
+      for kk := 0 to PM1 do FuuBuf[kk] := 0;
       for kk := 0 to DhalfM1 do
       begin
-        gz[kk + Dhalf] := gz[kk + Dhalf] + gpmid[kk]; // p_mid -> p direct
-        uu[kk] := -Fdt * gpmid[kk];                   // u_a on g_a q-part
+        FgzBuf[kk + Dhalf] := FgzBuf[kk + Dhalf] + FgpmidBuf[kk]; // p_mid -> p direct
+        FuuBuf[kk] := -Fdt * FgpmidBuf[kk];                   // u_a on g_a q-part
       end;
       HVP(it2);                                   // field at (q, p)
-      for kk := 0 to PM1 do gz[kk] := gz[kk] + dz[kk]; // z0 contribution
+      for kk := 0 to PM1 do FgzBuf[kk] := FgzBuf[kk] + FdzBuf[kk]; // z0 contribution
       // Carry dL/dz0 to the previous integration step.
-      for kk := 0 to PM1 do gzp[kk] := gz[kk];
+      for kk := 0 to PM1 do FgzpBuf[kk] := FgzBuf[kk];
     end;
     // After s=0, gzp holds dL/d(input phase vector for this time-step).
     if hasInputGrad then
       for kk := 0 to PM1 do
         PrevErr.FData[PrevErr.GetRawPos(t, 0, kk)] :=
-          PrevErr.FData[PrevErr.GetRawPos(t, 0, kk)] + gzp[kk];
+          PrevErr.FData[PrevErr.GetRawPos(t, 0, kk)] + FgzpBuf[kk];
   end;
   if (not FBatchUpdate) then
   begin
@@ -48425,6 +48437,12 @@ end;
 
 destructor TNNetTestTimeTraining.Destroy();
 begin
+  SetLength(FgkvBuf, 0); SetLength(FgvvBuf, 0); SetLength(FgqqBuf, 0);
+  SetLength(FgWlinBuf, 0); SetLength(FgWprevBuf, 0);
+  SetLength(FgW1cBuf, 0); SetLength(FgW2cBuf, 0);
+  SetLength(FgW1prevBuf, 0); SetLength(FgW2prevBuf, 0);
+  SetLength(FdrBuf, 0); SetLength(Fdh1Buf, 0);
+  SetLength(Fda1Buf, 0); SetLength(FdSBuf, 0);
   FH1q.Free; FA1q.Free; FRr.Free; FH1k.Free; FA1k.Free;
   FW2.Free; FW1.Free; FResid.Free; FWlin.Free;
   FQ.Free; FVv.Free; FK.Free;
@@ -48487,6 +48505,19 @@ begin
   begin
     FWlin.ReSize(SeqLen, FDepth, FDepth);
     FResid.ReSize(SeqLen, 1, FDepth);
+  end;
+  // Promote per-pass Backpropagate scratch from method locals.
+  SetLength(FgkvBuf, FDepth); SetLength(FgvvBuf, FDepth); SetLength(FgqqBuf, FDepth);
+  if FIsMLP then
+  begin
+    SetLength(FgW1cBuf, FHidden * FDepth); SetLength(FgW2cBuf, FDepth * FHidden);
+    SetLength(FgW1prevBuf, FHidden * FDepth); SetLength(FgW2prevBuf, FDepth * FHidden);
+    SetLength(FdrBuf, FDepth); SetLength(Fdh1Buf, FHidden);
+    SetLength(Fda1Buf, FHidden); SetLength(FdSBuf, FHidden);
+  end
+  else
+  begin
+    SetLength(FgWlinBuf, FDepth * FDepth); SetLength(FgWprevBuf, FDepth * FDepth);
   end;
   InitDefault();
 end;
@@ -48640,10 +48671,6 @@ var
   hasInputGrad: boolean;
   GyPtr, XtPtr, PrevErrPtr: TNeuralFloatArrPtr;
   PrevErr: TNNetVolume;
-  gWlin, gWprev: array of TNeuralFloat;                 // linear arm dL/dW_t
-  gW1c, gW2c, gW1prev, gW2prev: array of TNeuralFloat;  // MLP arm carries
-  gkv, gvv, gqq: array of TNeuralFloat;                 // dL/dk, dL/dv, dL/dq
-  dr, dh1, da1, dS: array of TNeuralFloat;              // MLP scratch
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -48674,26 +48701,21 @@ begin
     (FPrevLayer.FOutput.Size > 0);
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
-  SetLength(gkv, Depth); SetLength(gvv, Depth); SetLength(gqq, Depth);
   if not FIsMLP then
   begin
-    SetLength(gWlin, Depth * Depth); SetLength(gWprev, Depth * Depth);
-    for i := 0 to DDM1 do gWlin[i] := 0;
+    for i := 0 to DDM1 do FgWlinBuf[i] := 0;
   end
   else
   begin
-    SetLength(gW1c, Hd * Depth); SetLength(gW2c, Depth * Hd);
-    SetLength(gW1prev, Hd * Depth); SetLength(gW2prev, Depth * Hd);
-    SetLength(dr, Depth); SetLength(dh1, Hd); SetLength(da1, Hd); SetLength(dS, Hd);
-    for i := 0 to HDepM1 do gW1c[i] := 0;
-    for i := 0 to DHM1 do gW2c[i] := 0;
+    for i := 0 to HDepM1 do FgW1cBuf[i] := 0;
+    for i := 0 to DHM1 do FgW2cBuf[i] := 0;
   end;
   for t := SeqLen - 1 downto 0 do
   begin
     GyPtr := FOutputError.GetRawPtr(t, 0, 0);
     XtPtr := FPrevLayer.FOutput.GetRawPtr(t, 0, 0);
     baseT := t * Depth;
-    for o := 0 to DepthM1 do begin gkv[o] := 0; gvv[o] := 0; gqq[o] := 0; end;
+    for o := 0 to DepthM1 do begin FgkvBuf[o] := 0; FgvvBuf[o] := 0; FgqqBuf[o] := 0; end;
 
     if not FIsMLP then
     begin
@@ -48702,11 +48724,11 @@ begin
       for o := 0 to DepthM1 do
         for i := 0 to DepthM1 do
         begin
-          gWlin[o * Depth + i] := gWlin[o * Depth + i] + GyPtr^[o] * FQ.FData[baseT + i];
-          gqq[i] := gqq[i] + GyPtr^[o] * FWlin.FData[baseW + o * Depth + i];
+          FgWlinBuf[o * Depth + i] := FgWlinBuf[o * Depth + i] + GyPtr^[o] * FQ.FData[baseT + i];
+          FgqqBuf[i] := FgqqBuf[i] + GyPtr^[o] * FWlin.FData[baseW + o * Depth + i];
         end;
       // gWlin now = dL/dW_t. Update: W_t[o,i] = W_{t-1}[o,i] - eta*r[o]*k[i].
-      for i := 0 to DDM1 do gWprev[i] := gWlin[i]; // identity carry
+      for i := 0 to DDM1 do FgWprevBuf[i] := FgWlinBuf[i]; // identity carry
       for o := 0 to DepthM1 do
       begin
         rj := FResid.FData[baseT + o]; // r[o] = W_{t-1}k - v
@@ -48714,21 +48736,21 @@ begin
         gv := 0; // accumulates dL/dr[o]
         for i := 0 to DepthM1 do
         begin
-          acc := gWlin[o * Depth + i];
+          acc := FgWlinBuf[o * Depth + i];
           etaGrad := etaGrad - acc * rj * FK.FData[baseT + i] * dEtaRaw;
-          gkv[i] := gkv[i] - acc * eta * rj;          // dL/dk via the explicit k factor
+          FgkvBuf[i] := FgkvBuf[i] - acc * eta * rj;          // dL/dk via the explicit k factor
           gv := gv - eta * FK.FData[baseT + i] * acc; // dL/dr[o]
         end;
         // r = W_{t-1}k - v : dv -= dr ; feed W_{t-1} and k.
-        gvv[o] := gvv[o] - gv;
+        FgvvBuf[o] := FgvvBuf[o] - gv;
         if t > 0 then
           for i := 0 to DepthM1 do
           begin
-            gkv[i] := gkv[i] + gv * FWlin.FData[baseW - Depth * Depth + o * Depth + i];
-            gWprev[o * Depth + i] := gWprev[o * Depth + i] + gv * FK.FData[baseT + i];
+            FgkvBuf[i] := FgkvBuf[i] + gv * FWlin.FData[baseW - Depth * Depth + o * Depth + i];
+            FgWprevBuf[o * Depth + i] := FgWprevBuf[o * Depth + i] + gv * FK.FData[baseT + i];
           end;
       end;
-      for i := 0 to DDM1 do gWlin[i] := gWprev[i];
+      for i := 0 to DDM1 do FgWlinBuf[i] := FgWprevBuf[i];
     end
     else
     begin
@@ -48737,7 +48759,7 @@ begin
       // ---- read-out: a1q=W1_t q, h1q=GeLU(a1q), y=W2_t h1q ----
       for o := 0 to DepthM1 do
         for j := 0 to HdM1 do
-          gW2c[o * Hd + j] := gW2c[o * Hd + j] + GyPtr^[o] * FH1q.FData[t * Hd + j];
+          FgW2cBuf[o * Hd + j] := FgW2cBuf[o * Hd + j] + GyPtr^[o] * FH1q.FData[t * Hd + j];
       for j := 0 to HdM1 do
       begin
         acc := 0;
@@ -48746,23 +48768,23 @@ begin
         acc := acc * g1; // dL/da1q[j]
         for i := 0 to DepthM1 do
         begin
-          gW1c[j * Depth + i] := gW1c[j * Depth + i] + acc * FQ.FData[baseT + i];
-          gqq[i] := gqq[i] + acc * FW1.FData[baseW1 + j * Depth + i];
+          FgW1cBuf[j * Depth + i] := FgW1cBuf[j * Depth + i] + acc * FQ.FData[baseT + i];
+          FgqqBuf[i] := FgqqBuf[i] + acc * FW1.FData[baseW1 + j * Depth + i];
         end;
       end;
       // gW1c/gW2c = dL/dW1_t, dL/dW2_t. Identity carry to t-1.
-      for i := 0 to HDepM1 do gW1prev[i] := gW1c[i];
-      for i := 0 to DHM1 do gW2prev[i] := gW2c[i];
-      for o := 0 to DepthM1 do dr[o] := 0;
-      for j := 0 to HdM1 do begin dh1[j] := 0; da1[j] := 0; dS[j] := 0; end;
+      for i := 0 to HDepM1 do FgW1prevBuf[i] := FgW1cBuf[i];
+      for i := 0 to DHM1 do FgW2prevBuf[i] := FgW2cBuf[i];
+      for o := 0 to DepthM1 do FdrBuf[o] := 0;
+      for j := 0 to HdM1 do begin Fdh1Buf[j] := 0; Fda1Buf[j] := 0; FdSBuf[j] := 0; end;
       // ---- W2 update: W2_t[o,j] = W2_{t-1}[o,j] - eta*r[o]*h1[j] ----
       for o := 0 to DepthM1 do
         for j := 0 to HdM1 do
         begin
-          acc := gW2c[o * Hd + j];
+          acc := FgW2cBuf[o * Hd + j];
           etaGrad := etaGrad - acc * FRr.FData[baseT + o] * FH1k.FData[t * Hd + j] * dEtaRaw;
-          dr[o]  := dr[o]  - eta * acc * FH1k.FData[t * Hd + j];
-          dh1[j] := dh1[j] - eta * acc * FRr.FData[baseT + o];
+          FdrBuf[o]  := FdrBuf[o]  - eta * acc * FH1k.FData[t * Hd + j];
+          Fdh1Buf[j] := Fdh1Buf[j] - eta * acc * FRr.FData[baseT + o];
         end;
       // ---- W1 update: W1_t[j,i] = W1_{t-1}[j,i] - eta*da1[j]*k[i] ----
       for j := 0 to HdM1 do
@@ -48776,14 +48798,14 @@ begin
         rj := 0; // d(da1[j])
         for i := 0 to DepthM1 do
         begin
-          acc := gW1c[j * Depth + i];
+          acc := FgW1cBuf[j * Depth + i];
           etaGrad := etaGrad - acc * (g1 * S) * FK.FData[baseT + i] * dEtaRaw;
-          gkv[i] := gkv[i] - eta * acc * (g1 * S);    // dL/dk via explicit k
+          FgkvBuf[i] := FgkvBuf[i] - eta * acc * (g1 * S);    // dL/dk via explicit k
           rj := rj - eta * acc * FK.FData[baseT + i]; // dL/d(da1[j])
         end;
         // da1 = g1(a1)*S : split into dS and the g2 second-derivative term on a1.
-        dS[j]  := dS[j]  + rj * g1;
-        da1[j] := da1[j] + rj * g2 * S;
+        FdSBuf[j]  := FdSBuf[j]  + rj * g1;
+        Fda1Buf[j] := Fda1Buf[j] + rj * g2 * S;
       end;
       // dS feeds r and W2_{t-1}.
       for j := 0 to HdM1 do
@@ -48791,28 +48813,28 @@ begin
         begin
           if t > 0 then w2v := FW2.FData[baseW2 - Depth * Hd + o * Hd + j]
           else w2v := W2init.FData[o * Hd + j];
-          dr[o] := dr[o] + dS[j] * w2v;
-          if t > 0 then gW2prev[o * Hd + j] := gW2prev[o * Hd + j] + dS[j] * FRr.FData[baseT + o]
-          else GW2in.FData[o * Hd + j] := GW2in.FData[o * Hd + j] + negLR * dS[j] * FRr.FData[baseT + o];
+          FdrBuf[o] := FdrBuf[o] + FdSBuf[j] * w2v;
+          if t > 0 then FgW2prevBuf[o * Hd + j] := FgW2prevBuf[o * Hd + j] + FdSBuf[j] * FRr.FData[baseT + o]
+          else GW2in.FData[o * Hd + j] := GW2in.FData[o * Hd + j] + negLR * FdSBuf[j] * FRr.FData[baseT + o];
         end;
       // r[o] = f[o] - v[o], f[o] = W2_{t-1} h1 : dv -= dr ; feed W2_{t-1}, h1.
       for o := 0 to DepthM1 do
       begin
-        gvv[o] := gvv[o] - dr[o];
+        FgvvBuf[o] := FgvvBuf[o] - FdrBuf[o];
         for j := 0 to HdM1 do
         begin
           if t > 0 then w2v := FW2.FData[baseW2 - Depth * Hd + o * Hd + j]
           else w2v := W2init.FData[o * Hd + j];
-          dh1[j] := dh1[j] + dr[o] * w2v;
-          if t > 0 then gW2prev[o * Hd + j] := gW2prev[o * Hd + j] + dr[o] * FH1k.FData[t * Hd + j]
-          else GW2in.FData[o * Hd + j] := GW2in.FData[o * Hd + j] + negLR * dr[o] * FH1k.FData[t * Hd + j];
+          Fdh1Buf[j] := Fdh1Buf[j] + FdrBuf[o] * w2v;
+          if t > 0 then FgW2prevBuf[o * Hd + j] := FgW2prevBuf[o * Hd + j] + FdrBuf[o] * FH1k.FData[t * Hd + j]
+          else GW2in.FData[o * Hd + j] := GW2in.FData[o * Hd + j] + negLR * FdrBuf[o] * FH1k.FData[t * Hd + j];
         end;
       end;
       // h1[j] = GeLU(a1[j]) : da1 += dh1 * g1(a1).
       for j := 0 to HdM1 do
       begin
         TTTGelu(FA1k.FData[t * Hd + j], gg, g1, g2);
-        da1[j] := da1[j] + dh1[j] * g1;
+        Fda1Buf[j] := Fda1Buf[j] + Fdh1Buf[j] * g1;
       end;
       // a1[j] = sum_i W1_{t-1}[j,i] k[i] : feed W1_{t-1}, k.
       for j := 0 to HdM1 do
@@ -48820,12 +48842,12 @@ begin
         begin
           if t > 0 then w1v := FW1.FData[baseW1 - Hd * Depth + j * Depth + i]
           else w1v := W1init.FData[j * Depth + i];
-          gkv[i] := gkv[i] + da1[j] * w1v;
-          if t > 0 then gW1prev[j * Depth + i] := gW1prev[j * Depth + i] + da1[j] * FK.FData[baseT + i]
-          else GW1in.FData[j * Depth + i] := GW1in.FData[j * Depth + i] + negLR * da1[j] * FK.FData[baseT + i];
+          FgkvBuf[i] := FgkvBuf[i] + Fda1Buf[j] * w1v;
+          if t > 0 then FgW1prevBuf[j * Depth + i] := FgW1prevBuf[j * Depth + i] + Fda1Buf[j] * FK.FData[baseT + i]
+          else GW1in.FData[j * Depth + i] := GW1in.FData[j * Depth + i] + negLR * Fda1Buf[j] * FK.FData[baseT + i];
         end;
-      for i := 0 to HDepM1 do gW1c[i] := gW1prev[i];
-      for i := 0 to DHM1 do gW2c[i] := gW2prev[i];
+      for i := 0 to HDepM1 do FgW1cBuf[i] := FgW1prevBuf[i];
+      for i := 0 to DHM1 do FgW2cBuf[i] := FgW2prevBuf[i];
     end;
 
     // ---- map dL/dk, dL/dv, dL/dq back to projections + input ----
@@ -48833,9 +48855,9 @@ begin
     else PrevErrPtr := nil;
     for o := 0 to DepthM1 do
     begin
-      gqv := gqq[o] * FScaleQ;
-      gk := gkv[o];
-      gv := gvv[o];
+      gqv := FgqqBuf[o] * FScaleQ;
+      gk := FgkvBuf[o];
+      gv := FgvvBuf[o];
       for i := 0 to DepthM1 do
       begin
         GThQ.FData[o * Depth + i] := GThQ.FData[o * Depth + i] + negLR * gqv * XtPtr^[i];
@@ -48854,9 +48876,9 @@ begin
   if FIsMLP then
   begin
     for i := 0 to HDepM1 do
-      GW1in.FData[i] := GW1in.FData[i] + negLR * gW1c[i];
+      GW1in.FData[i] := GW1in.FData[i] + negLR * FgW1cBuf[i];
     for i := 0 to DHM1 do
-      GW2in.FData[i] := GW2in.FData[i] + negLR * gW2c[i];
+      GW2in.FData[i] := GW2in.FData[i] + negLR * FgW2cBuf[i];
   end;
   // eta_raw grad.
   FNeurons[3].FDelta.FData[0] := FNeurons[3].FDelta.FData[0] + negLR * etaGrad;
@@ -48926,6 +48948,13 @@ end;
 
 destructor TNNetTitansMemory.Destroy();
 begin
+  SetLength(FgkvBuf, 0); SetLength(FgvvBuf, 0); SetLength(FgqqBuf, 0);
+  SetLength(FdrBuf, 0); SetLength(Fdh1Buf, 0);
+  SetLength(Fda1Buf, 0); SetLength(FdSjBuf, 0);
+  SetLength(FgW1Buf, 0); SetLength(FgW2Buf, 0);
+  SetLength(FgS1Buf, 0); SetLength(FgS2Buf, 0);
+  SetLength(FgW1pBuf, 0); SetLength(FgW2pBuf, 0);
+  SetLength(FgS1pBuf, 0); SetLength(FgS2pBuf, 0);
   FAlpha.Free; FH1q.Free; FA1q.Free; FRr.Free; FH1k.Free; FA1k.Free;
   FS2.Free; FS1.Free; FW2.Free; FW1.Free;
   FQ.Free; FVv.Free; FK.Free;
@@ -48978,6 +49007,14 @@ begin
   FA1q.ReSize(SeqLen, 1, FHidden);
   FH1q.ReSize(SeqLen, 1, FHidden);
   FAlpha.ReSize(SeqLen, 1, FDepth);
+  // Promote per-pass Backpropagate scratch from method locals.
+  SetLength(FgkvBuf, FDepth); SetLength(FgvvBuf, FDepth); SetLength(FgqqBuf, FDepth);
+  SetLength(FdrBuf, FDepth); SetLength(Fdh1Buf, FHidden);
+  SetLength(Fda1Buf, FHidden); SetLength(FdSjBuf, FHidden);
+  SetLength(FgW1Buf, FHidden * FDepth); SetLength(FgW2Buf, FDepth * FHidden);
+  SetLength(FgS1Buf, FHidden * FDepth); SetLength(FgS2Buf, FDepth * FHidden);
+  SetLength(FgW1pBuf, FHidden * FDepth); SetLength(FgW2pBuf, FDepth * FHidden);
+  SetLength(FgS1pBuf, FHidden * FDepth); SetLength(FgS2pBuf, FDepth * FHidden);
   InitDefault();
 end;
 
@@ -49121,11 +49158,8 @@ var
   hasInputGrad: boolean;
   GyPtr, XtPtr, PrevErrPtr: TNeuralFloatArrPtr;
   PrevErr: TNNetVolume;
-  // outer adjoints of the carried inner states W1_t,W2_t,S1_t,S2_t.
-  gW1, gW2, gS1, gS2: array of TNeuralFloat;
-  gW1p, gW2p, gS1p, gS2p: array of TNeuralFloat;
-  gkv, gvv, gqq: array of TNeuralFloat;
-  dr, dh1, da1, dSj: array of TNeuralFloat;
+  // outer adjoints of the carried inner states W1_t,W2_t,S1_t,S2_t now live in
+  // the F...Buf fields (sized in SetPrevLayer).
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -49152,14 +49186,8 @@ begin
     (FPrevLayer.FOutput.Size > 0);
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
-  SetLength(gkv, Depth); SetLength(gvv, Depth); SetLength(gqq, Depth);
-  SetLength(dr, Depth); SetLength(dh1, Hd); SetLength(da1, Hd); SetLength(dSj, Hd);
-  SetLength(gW1, Hd * Depth); SetLength(gW2, Depth * Hd);
-  SetLength(gS1, Hd * Depth); SetLength(gS2, Depth * Hd);
-  SetLength(gW1p, Hd * Depth); SetLength(gW2p, Depth * Hd);
-  SetLength(gS1p, Hd * Depth); SetLength(gS2p, Depth * Hd);
-  for i := 0 to HDepM1 do begin gW1[i] := 0; gS1[i] := 0; end;
-  for i := 0 to DHM1 do begin gW2[i] := 0; gS2[i] := 0; end;
+  for i := 0 to HDepM1 do begin FgW1Buf[i] := 0; FgS1Buf[i] := 0; end;
+  for i := 0 to DHM1 do begin FgW2Buf[i] := 0; FgS2Buf[i] := 0; end;
   for t := SeqLen - 1 downto 0 do
   begin
     GyPtr := FOutputError.GetRawPtr(t, 0, 0);
@@ -49167,12 +49195,12 @@ begin
     baseT := t * Depth;
     baseW1 := t * Hd * Depth;
     baseW2 := t * Depth * Hd;
-    for o := 0 to DepthM1 do begin gkv[o] := 0; gvv[o] := 0; gqq[o] := 0; end;
+    for o := 0 to DepthM1 do begin FgkvBuf[o] := 0; FgvvBuf[o] := 0; FgqqBuf[o] := 0; end;
 
     // ---- read-out: a1q=W1_t q, h1q=GeLU(a1q), y=W2_t h1q ----
     for o := 0 to DepthM1 do
       for j := 0 to HdM1 do
-        gW2[o * Hd + j] := gW2[o * Hd + j] + GyPtr^[o] * FH1q.FData[t * Hd + j];
+        FgW2Buf[o * Hd + j] := FgW2Buf[o * Hd + j] + GyPtr^[o] * FH1q.FData[t * Hd + j];
     for j := 0 to HdM1 do
     begin
       acc := 0;
@@ -49181,8 +49209,8 @@ begin
       acc := acc * g1; // dL/da1q[j]
       for i := 0 to DepthM1 do
       begin
-        gW1[j * Depth + i] := gW1[j * Depth + i] + acc * FQ.FData[baseT + i];
-        gqq[i] := gqq[i] + acc * FW1.FData[baseW1 + j * Depth + i];
+        FgW1Buf[j * Depth + i] := FgW1Buf[j * Depth + i] + acc * FQ.FData[baseT + i];
+        FgqqBuf[i] := FgqqBuf[i] + acc * FW1.FData[baseW1 + j * Depth + i];
       end;
     end;
 
@@ -49190,10 +49218,10 @@ begin
     // ---- undo the forget+momentum update of W1/W2 (output of the step) ----
     // W2_t[o,j] = (1-alpha[o])*W2p[o,j] + S2_t[o,j]
     // W1_t[j,i] = (1-alpha[gj])*W1p[j,i] + S1_t[j,i]
-    for i := 0 to HDepM1 do begin gW1p[i] := 0; gS1[i] := gW1[i]; end;
-    for i := 0 to DHM1 do begin gW2p[i] := 0; gS2[i] := gW2[i]; end;
-    for o := 0 to DepthM1 do dr[o] := 0;
-    for j := 0 to HdM1 do begin dh1[j] := 0; da1[j] := 0; dSj[j] := 0; end;
+    for i := 0 to HDepM1 do begin FgW1pBuf[i] := 0; FgS1Buf[i] := FgW1Buf[i]; end;
+    for i := 0 to DHM1 do begin FgW2pBuf[i] := 0; FgS2Buf[i] := FgW2Buf[i]; end;
+    for o := 0 to DepthM1 do FdrBuf[o] := 0;
+    for j := 0 to HdM1 do begin Fdh1Buf[j] := 0; Fda1Buf[j] := 0; FdSjBuf[j] := 0; end;
     dAlpha := 0; // accumulated per-channel later (alpha is per-channel)
     // W2 branch.
     for o := 0 to DepthM1 do
@@ -49204,8 +49232,8 @@ begin
       begin
         if t > 0 then W2p := FW2.FData[baseW2 - Depth * Hd + o * Hd + j]
         else W2p := W2init.FData[o * Hd + j];
-        gW2p[o * Hd + j] := gW2p[o * Hd + j] + gW2[o * Hd + j] * (1 - alphao);
-        galpha_pre := galpha_pre - gW2[o * Hd + j] * W2p;
+        FgW2pBuf[o * Hd + j] := FgW2pBuf[o * Hd + j] + FgW2Buf[o * Hd + j] * (1 - alphao);
+        galpha_pre := galpha_pre - FgW2Buf[o * Hd + j] * W2p;
       end;
       // d alpha[o] / d pre = alpha*(1-alpha) ; chain to alpha_raw[o] and W_alpha[o,:].
       galpha_pre := galpha_pre * alphao * (1 - alphao);
@@ -49234,8 +49262,8 @@ begin
       begin
         if t > 0 then W1p := FW1.FData[baseW1 - Hd * Depth + j * Depth + i]
         else W1p := W1init.FData[j * Depth + i];
-        gW1p[j * Depth + i] := gW1p[j * Depth + i] + gW1[j * Depth + i] * (1 - alphao);
-        galpha_pre := galpha_pre - gW1[j * Depth + i] * W1p;
+        FgW1pBuf[j * Depth + i] := FgW1pBuf[j * Depth + i] + FgW1Buf[j * Depth + i] * (1 - alphao);
+        galpha_pre := galpha_pre - FgW1Buf[j * Depth + i] * W1p;
       end;
       galpha_pre := galpha_pre * alphao * (1 - alphao);
       GAlphaR.FData[gj] := GAlphaR.FData[gj] + negLR * galpha_pre;
@@ -49258,15 +49286,15 @@ begin
       dEta := 0; dTheta := 0;
       for j := 0 to HdM1 do
       begin
-        acc := gS2[o * Hd + j]; // dL/dS2_t[o,j]
+        acc := FgS2Buf[o * Hd + j]; // dL/dS2_t[o,j]
         if t > 0 then S2p := FS2.FData[baseW2 - Depth * Hd + o * Hd + j] else S2p := 0;
         dEta   := dEta   + acc * S2p;
-        gS2p[o * Hd + j] := acc * etao; // carry to S2_{t-1}
+        FgS2pBuf[o * Hd + j] := acc * etao; // carry to S2_{t-1}
         // -theta*grad ; grad = r[o]*h1[j]
         dTheta := dTheta - acc * FRr.FData[baseT + o] * FH1k.FData[t * Hd + j];
         // dL/dr[o] and dL/dh1[j] via grad.
-        dr[o]  := dr[o]  - acc * thetao * FH1k.FData[t * Hd + j];
-        dh1[j] := dh1[j] - acc * thetao * FRr.FData[baseT + o];
+        FdrBuf[o]  := FdrBuf[o]  - acc * thetao * FH1k.FData[t * Hd + j];
+        Fdh1Buf[j] := Fdh1Buf[j] - acc * thetao * FRr.FData[baseT + o];
       end;
       // d sigmoid : eta=sig(eta_raw) -> d/draw = eta*(1-eta).
       GEtaR.FData[o]   := GEtaR.FData[o]   + negLR * dEta   * etao   * (1 - etao);
@@ -49289,19 +49317,19 @@ begin
       dEta := 0; dTheta := 0;
       for i := 0 to DepthM1 do
       begin
-        acc := gS1[j * Depth + i]; // dL/dS1_t[j,i]
+        acc := FgS1Buf[j * Depth + i]; // dL/dS1_t[j,i]
         if t > 0 then S1p := FS1.FData[baseW1 - Hd * Depth + j * Depth + i] else S1p := 0;
         dEta   := dEta   + acc * S1p;
-        gS1p[j * Depth + i] := acc * etao; // carry to S1_{t-1}
+        FgS1pBuf[j * Depth + i] := acc * etao; // carry to S1_{t-1}
         dTheta := dTheta - acc * (g1 * Ss) * FK.FData[baseT + i];
-        gkv[i] := gkv[i] - acc * thetao * (g1 * Ss); // dL/dk via explicit k
+        FgkvBuf[i] := FgkvBuf[i] - acc * thetao * (g1 * Ss); // dL/dk via explicit k
         rj := rj - acc * thetao * FK.FData[baseT + i]; // dL/d(da1[j])
       end;
       GEtaR.FData[gj]   := GEtaR.FData[gj]   + negLR * dEta   * etao   * (1 - etao);
       GThetaR.FData[gj] := GThetaR.FData[gj] + negLR * dTheta * thetao * (1 - thetao);
       // da1 = g1(a1)*Ss : dS feeds (W2p^T r)[j]; g2 second-deriv term on a1.
-      dSj[j] := dSj[j] + rj * g1;
-      da1[j] := da1[j] + rj * g2 * Ss;
+      FdSjBuf[j] := FdSjBuf[j] + rj * g1;
+      Fda1Buf[j] := Fda1Buf[j] + rj * g2 * Ss;
     end;
 
     // ---- inner-forward backward (forms r, h1, a1) ----
@@ -49311,28 +49339,28 @@ begin
       begin
         if t > 0 then w2v := FW2.FData[baseW2 - Depth * Hd + o * Hd + j]
         else w2v := W2init.FData[o * Hd + j];
-        dr[o] := dr[o] + dSj[j] * w2v;
-        if t > 0 then gW2p[o * Hd + j] := gW2p[o * Hd + j] + dSj[j] * FRr.FData[baseT + o]
-        else GW2in.FData[o * Hd + j] := GW2in.FData[o * Hd + j] + negLR * dSj[j] * FRr.FData[baseT + o];
+        FdrBuf[o] := FdrBuf[o] + FdSjBuf[j] * w2v;
+        if t > 0 then FgW2pBuf[o * Hd + j] := FgW2pBuf[o * Hd + j] + FdSjBuf[j] * FRr.FData[baseT + o]
+        else GW2in.FData[o * Hd + j] := GW2in.FData[o * Hd + j] + negLR * FdSjBuf[j] * FRr.FData[baseT + o];
       end;
     // r[o] = f[o] - v[o], f[o]=W2p h1 : dv -= dr ; feed W2p, h1.
     for o := 0 to DepthM1 do
     begin
-      gvv[o] := gvv[o] - dr[o];
+      FgvvBuf[o] := FgvvBuf[o] - FdrBuf[o];
       for j := 0 to HdM1 do
       begin
         if t > 0 then w2v := FW2.FData[baseW2 - Depth * Hd + o * Hd + j]
         else w2v := W2init.FData[o * Hd + j];
-        dh1[j] := dh1[j] + dr[o] * w2v;
-        if t > 0 then gW2p[o * Hd + j] := gW2p[o * Hd + j] + dr[o] * FH1k.FData[t * Hd + j]
-        else GW2in.FData[o * Hd + j] := GW2in.FData[o * Hd + j] + negLR * dr[o] * FH1k.FData[t * Hd + j];
+        Fdh1Buf[j] := Fdh1Buf[j] + FdrBuf[o] * w2v;
+        if t > 0 then FgW2pBuf[o * Hd + j] := FgW2pBuf[o * Hd + j] + FdrBuf[o] * FH1k.FData[t * Hd + j]
+        else GW2in.FData[o * Hd + j] := GW2in.FData[o * Hd + j] + negLR * FdrBuf[o] * FH1k.FData[t * Hd + j];
       end;
     end;
     // h1[j] = GeLU(a1[j]) : da1 += dh1 * g1(a1).
     for j := 0 to HdM1 do
     begin
       TTTGelu(FA1k.FData[t * Hd + j], gg, g1, g2);
-      da1[j] := da1[j] + dh1[j] * g1;
+      Fda1Buf[j] := Fda1Buf[j] + Fdh1Buf[j] * g1;
     end;
     // a1[j] = sum_i W1p[j,i] k[i] : feed W1p, k.
     for j := 0 to HdM1 do
@@ -49340,23 +49368,23 @@ begin
       begin
         if t > 0 then w1v := FW1.FData[baseW1 - Hd * Depth + j * Depth + i]
         else w1v := W1init.FData[j * Depth + i];
-        gkv[i] := gkv[i] + da1[j] * w1v;
-        if t > 0 then gW1p[j * Depth + i] := gW1p[j * Depth + i] + da1[j] * FK.FData[baseT + i]
-        else GW1in.FData[j * Depth + i] := GW1in.FData[j * Depth + i] + negLR * da1[j] * FK.FData[baseT + i];
+        FgkvBuf[i] := FgkvBuf[i] + Fda1Buf[j] * w1v;
+        if t > 0 then FgW1pBuf[j * Depth + i] := FgW1pBuf[j * Depth + i] + Fda1Buf[j] * FK.FData[baseT + i]
+        else GW1in.FData[j * Depth + i] := GW1in.FData[j * Depth + i] + negLR * Fda1Buf[j] * FK.FData[baseT + i];
       end;
 
     // carry adjoints to step t-1 (W and S of the previous step).
-    for i := 0 to HDepM1 do begin gW1[i] := gW1p[i]; gS1[i] := gS1p[i]; end;
-    for i := 0 to DHM1 do begin gW2[i] := gW2p[i]; gS2[i] := gS2p[i]; end;
+    for i := 0 to HDepM1 do begin FgW1Buf[i] := FgW1pBuf[i]; FgS1Buf[i] := FgS1pBuf[i]; end;
+    for i := 0 to DHM1 do begin FgW2Buf[i] := FgW2pBuf[i]; FgS2Buf[i] := FgS2pBuf[i]; end;
 
     // ---- map dL/dk, dL/dv, dL/dq back to projections + input ----
     if hasInputGrad then PrevErrPtr := PrevErr.GetRawPtr(t, 0, 0)
     else PrevErrPtr := nil;
     for o := 0 to DepthM1 do
     begin
-      gqv := gqq[o] * FScaleQ;
-      gk := gkv[o];
-      gv := gvv[o];
+      gqv := FgqqBuf[o] * FScaleQ;
+      gk := FgkvBuf[o];
+      gv := FgvvBuf[o];
       for i := 0 to DepthM1 do
       begin
         GThQ.FData[o * Depth + i] := GThQ.FData[o * Depth + i] + negLR * gqv * XtPtr^[i];
@@ -49372,9 +49400,9 @@ begin
   // after t=0 the carried adjoints gW1/gW2 are dL/dW1_0/W2_0 (the M_{-1} term);
   // gS1/gS2 belong to S_{-1}=0 so they are dropped. Flush the initial-weight grad.
   for i := 0 to HDepM1 do
-    GW1in.FData[i] := GW1in.FData[i] + negLR * gW1[i];
+    GW1in.FData[i] := GW1in.FData[i] + negLR * FgW1Buf[i];
   for i := 0 to DHM1 do
-    GW2in.FData[i] := GW2in.FData[i] + negLR * gW2[i];
+    GW2in.FData[i] := GW2in.FData[i] + negLR * FgW2Buf[i];
   if (not FBatchUpdate) then
   begin
     LpBnd57 := FNeurons.Count - 1;
