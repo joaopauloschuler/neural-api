@@ -2144,10 +2144,14 @@ type
   // Coded by Claude (AI).
   TNNetInfoNCELoss = class(TNNetIdentity)
   private
+    // Per-instance backward scratch (sized K = number of keys in SetPrevLayer)
+    // to avoid per-pass heap allocation in the hot path.
+    FSimsBuf, FProbsBuf: array of TNeuralFloat;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(); overload; override;
     constructor Create(EmbeddingDim: integer; Temperature: TNeuralFloat); overload;
+    destructor Destroy(); override;
     procedure Backpropagate(); override;
   end;
 
@@ -2220,9 +2224,16 @@ type
   /// trainable parameters; output shape equals input shape.
   // Coded by Claude (AI).
   TNNetLoadBalanceLoss = class(TNNetIdentity)
+  private
+    // Per-instance backward scratch (sized E = number of experts in
+    // SetPrevLayer) to avoid per-pass heap allocation in the hot path.
+    FPBuf, FFBuf: array of TNeuralFloat;
+    FKeptBuf: array of boolean;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(); overload; override;
     constructor Create(TopCnt: integer; Coeff: TNeuralFloat); overload;
+    destructor Destroy(); override;
     procedure Backpropagate(); override;
   end;
 
@@ -2308,10 +2319,16 @@ type
   // Coded by Claude (AI).
   TNNetArcFace = class(TNNetIdentity)
   private
+    // Per-instance backward scratch (CosArr/ANorm/ProbArr/WNormArr sized K =
+    // number of classes; GradX sized D = embedding dim, set in SetPrevLayer)
+    // to avoid per-pass heap allocation in the hot path.
+    FCosArrBuf, FANormBuf, FProbArrBuf, FWNormArrBuf: array of TNeuralFloat;
+    FGradXBuf: array of TNeuralFloat;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(); overload; override;
     constructor Create(NumClasses: integer; Margin, Scale: TNeuralFloat); overload;
+    destructor Destroy(); override;
     procedure Backpropagate(); override;
   end;
 
@@ -2356,10 +2373,15 @@ type
   // Coded by Claude (AI).
   TNNetMixtureDensity = class(TNNetIdentity)
   private
+    // Per-instance backward scratch (Yt sized D = target dim; LogComp/GammaArr/
+    // PiArr sized K = number of components, set in SetPrevLayer) to avoid
+    // per-pass heap allocation in the hot path.
+    FYtBuf, FLogCompBuf, FGammaArrBuf, FPiArrBuf: array of TNeuralFloat;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(); overload; override;
     constructor Create(NumComponents, TargetDim: integer); overload;
+    destructor Destroy(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     // Number of mixture components K and target dimension D.
@@ -21170,13 +21192,30 @@ begin
   FFloatSt[0] := Coeff;
 end;
 
+procedure TNNetLoadBalanceLoss.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  E: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  E := pPrevLayer.FOutput.Depth; // number of experts
+  SetLength(FPBuf, E);
+  SetLength(FFBuf, E);
+  SetLength(FKeptBuf, E);
+end;
+
+destructor TNNetLoadBalanceLoss.Destroy();
+begin
+  SetLength(FPBuf, 0);
+  SetLength(FFBuf, 0);
+  SetLength(FKeptBuf, 0);
+  inherited Destroy();
+end;
+
 procedure TNNetLoadBalanceLoss.Backpropagate();
 var
   StartTime: double;
   Coeff, Val, BestVal, InvT, GradScale: TNeuralFloat;
   E, EM1, T, TopCnt, MaxX, MaxY, X, Y, D, CntK, BestIdx: integer;
-  P, F: array of TNeuralFloat;
-  Kept: array of boolean;
 begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
@@ -21192,10 +21231,7 @@ begin
   Coeff := FFloatSt[0];
   if T < 1 then T := 1;
   InvT := 1.0 / T;
-  SetLength(P, E);
-  SetLength(F, E);
-  SetLength(Kept, E);
-  for D := 0 to EM1 do begin P[D] := 0; F[D] := 0; end;
+  for D := 0 to EM1 do begin FPBuf[D] := 0; FFBuf[D] := 0; end;
   // Aggregate P_i (mean gate prob) and f_i (mean top-k touch fraction) over
   // all tokens (cells).
   for X := 0 to MaxX do
@@ -21203,8 +21239,8 @@ begin
     begin
       for D := 0 to EM1 do
       begin
-        P[D] := P[D] + FOutput[X, Y, D];
-        Kept[D] := False;
+        FPBuf[D] := FPBuf[D] + FOutput[X, Y, D];
+        FKeptBuf[D] := False;
       end;
       // Hard top-TopCnt assignment for this token.
       for CntK := 1 to TopCnt do
@@ -21213,7 +21249,7 @@ begin
         BestVal := 0;
         for D := 0 to EM1 do
         begin
-          if Kept[D] then continue;
+          if FKeptBuf[D] then continue;
           Val := FOutput[X, Y, D];
           if (BestIdx = -1) or (Val > BestVal) then
           begin
@@ -21221,27 +21257,24 @@ begin
             BestVal := Val;
           end;
         end;
-        if BestIdx >= 0 then Kept[BestIdx] := True;
+        if BestIdx >= 0 then FKeptBuf[BestIdx] := True;
       end;
       for D := 0 to EM1 do
-        if Kept[D] then F[D] := F[D] + 1;
+        if FKeptBuf[D] then FFBuf[D] := FFBuf[D] + 1;
     end;
   for D := 0 to EM1 do
   begin
-    P[D] := P[D] * InvT;
-    F[D] := F[D] * InvT;
+    FPBuf[D] := FPBuf[D] * InvT;
+    FFBuf[D] := FFBuf[D] * InvT;
   end;
   // dL_aux/dg_t[i] = coeff * E * f_i / T  (f_i is stop-gradient).
   for X := 0 to MaxX do
     for Y := 0 to MaxY do
       for D := 0 to EM1 do
       begin
-        GradScale := Coeff * E * F[D] * InvT;
+        GradScale := Coeff * E * FFBuf[D] * InvT;
         FOutputError[X, Y, D] := GradScale;
       end;
-  SetLength(P, 0);
-  SetLength(F, 0);
-  SetLength(Kept, 0);
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
 end;
@@ -21370,6 +21403,16 @@ begin
     FErrorProc('TNNetInfoNCELoss requires at least 3 slabs (1 query + 2 ' +
       'keys). Slabs: ' + IntToStr(NumSlabs));
   end;
+  // Backward scratch sized K = number of keys (NumSlabs - 1).
+  SetLength(FSimsBuf, NumSlabs - 1);
+  SetLength(FProbsBuf, NumSlabs - 1);
+end;
+
+destructor TNNetInfoNCELoss.Destroy();
+begin
+  SetLength(FSimsBuf, 0);
+  SetLength(FProbsBuf, 0);
+  inherited Destroy();
 end;
 
 procedure TNNetInfoNCELoss.Backpropagate();
@@ -21377,7 +21420,6 @@ var
   StartTime: double;
   Tau, InvTau, QVal, KVal, MaxS, SumExp, Sj, dLdQ: TNeuralFloat;
   EmbDim, EmbDimM1, K, KM1, NumSlabs, X, Y, MaxX, MaxY, J, C: integer;
-  Sims, Probs: array of TNeuralFloat;
 begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
@@ -21394,8 +21436,6 @@ begin
   KM1 := K - 1;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
-  SetLength(Sims, K);
-  SetLength(Probs, K);
   // Per spatial cell: q is slab 0 (channels 0..EmbDim-1), key j is slab (1+j)
   // occupying channels [EmbDim*(1+j) .. EmbDim*(2+j)-1]. Compute similarities
   // s_j = <q, k_j>/tau, softmax over j, then write the analytic +gradient.
@@ -21412,20 +21452,20 @@ begin
           KVal := FOutput[X, Y, EmbDim * (1 + J) + C];
           Sj := Sj + QVal * KVal;
         end;
-        Sims[J] := Sj * InvTau;
+        FSimsBuf[J] := Sj * InvTau;
       end;
       // softmax over similarities (stable via max subtraction)
-      MaxS := Sims[0];
+      MaxS := FSimsBuf[0];
       for J := 1 to KM1 do
-        if Sims[J] > MaxS then MaxS := Sims[J];
+        if FSimsBuf[J] > MaxS then MaxS := FSimsBuf[J];
       SumExp := 0;
       for J := 0 to KM1 do
       begin
-        Probs[J] := pcr_expf(Sims[J] - MaxS);
-        SumExp := SumExp + Probs[J];
+        FProbsBuf[J] := pcr_expf(FSimsBuf[J] - MaxS);
+        SumExp := SumExp + FProbsBuf[J];
       end;
       for J := 0 to KM1 do
-        Probs[J] := Probs[J] / SumExp;
+        FProbsBuf[J] := FProbsBuf[J] / SumExp;
       // gradients per channel
       for C := 0 to EmbDimM1 do
       begin
@@ -21433,13 +21473,13 @@ begin
         // dL/dq = (1/tau) * ( sum_j p_j * k_j - k_0 )
         dLdQ := 0;
         for J := 0 to KM1 do
-          dLdQ := dLdQ + Probs[J] * FOutput[X, Y, EmbDim * (1 + J) + C];
+          dLdQ := dLdQ + FProbsBuf[J] * FOutput[X, Y, EmbDim * (1 + J) + C];
         dLdQ := dLdQ - FOutput[X, Y, EmbDim + C]; // minus k_0
         FOutputError[X, Y, C] := InvTau * dLdQ;
         // dL/dk_0 = (1/tau) * (p_0 - 1) * q ; dL/dk_j = (1/tau) * p_j * q (j>0)
-        FOutputError[X, Y, EmbDim + C] := InvTau * (Probs[0] - 1.0) * QVal;
+        FOutputError[X, Y, EmbDim + C] := InvTau * (FProbsBuf[0] - 1.0) * QVal;
         for J := 1 to KM1 do
-          FOutputError[X, Y, EmbDim * (1 + J) + C] := InvTau * Probs[J] * QVal;
+          FOutputError[X, Y, EmbDim * (1 + J) + C] := InvTau * FProbsBuf[J] * QVal;
       end;
     end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -21781,6 +21821,22 @@ begin
   AddMissingNeurons(K);
   SetNumWeightsForAllNeurons(D, 1, 1);
   InitDefault();
+  // Backward scratch: K-sized per-class arrays and a D-sized feature gradient.
+  SetLength(FCosArrBuf, K);
+  SetLength(FANormBuf, K);
+  SetLength(FProbArrBuf, K);
+  SetLength(FWNormArrBuf, K);
+  SetLength(FGradXBuf, D);
+end;
+
+destructor TNNetArcFace.Destroy();
+begin
+  SetLength(FCosArrBuf, 0);
+  SetLength(FANormBuf, 0);
+  SetLength(FProbArrBuf, 0);
+  SetLength(FWNormArrBuf, 0);
+  SetLength(FGradXBuf, 0);
+  inherited Destroy();
 end;
 
 procedure TNNetArcFace.Backpropagate();
@@ -21792,8 +21848,6 @@ var
   K, KM1, D, DM1, LabelIdx, ClassC, X, Y, MaxX, MaxY, I, Kk: integer;
   WeightNeuron: TNNetNeuron;
   W: TNNetVolume;
-  CosArr, ANorm, ProbArr, GradX: array of TNeuralFloat;
-  WNormArr: array of TNeuralFloat;
 begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
@@ -21813,11 +21867,6 @@ begin
   MaxY := FOutput.SizeY - 1;
   CosM := Cos(Margin);
   SinM := Sin(Margin);
-  SetLength(CosArr, K);
-  SetLength(ANorm, K);     // cos value used in the logit (margined for y)
-  SetLength(ProbArr, K);
-  SetLength(WNormArr, K);
-  SetLength(GradX, D);
   for X := 0 to MaxX do
     for Y := 0 to MaxY do
     begin
@@ -21846,12 +21895,12 @@ begin
         end;
         WNorm := Sqrt(WNorm);
         if WNorm < 1e-12 then WNorm := 1e-12;
-        WNormArr[Kk] := WNorm;
+        FWNormArrBuf[Kk] := WNorm;
         CosT := Dot * InvXNorm / WNorm;
         // Clamp for numerical safety (acos/sqrt domain).
         if CosT > 1.0 then CosT := 1.0;
         if CosT < -1.0 then CosT := -1.0;
-        CosArr[Kk] := CosT;
+        FCosArrBuf[Kk] := CosT;
         if Kk = ClassC then
         begin
           // cos(theta_y + m) = cos*cosM - sin*sinM
@@ -21859,44 +21908,44 @@ begin
           if SinTheta < 0 then SinTheta := 0;
           SinTheta := Sqrt(SinTheta);
           CosMargined := CosT * CosM - SinTheta * SinM;
-          ANorm[Kk] := CosMargined;
+          FANormBuf[Kk] := CosMargined;
         end
         else
-          ANorm[Kk] := CosT;
+          FANormBuf[Kk] := CosT;
       end;
 
       // Softmax over the scaled (margined) logits.
-      MaxLogit := Scale * ANorm[0];
+      MaxLogit := Scale * FANormBuf[0];
       for Kk := 1 to KM1 do
       begin
-        Logit := Scale * ANorm[Kk];
+        Logit := Scale * FANormBuf[Kk];
         if Logit > MaxLogit then MaxLogit := Logit;
       end;
       SumExp := 0;
       for Kk := 0 to KM1 do
       begin
-        ProbArr[Kk] := Exp(Scale * ANorm[Kk] - MaxLogit);
-        SumExp := SumExp + ProbArr[Kk];
+        FProbArrBuf[Kk] := Exp(Scale * FANormBuf[Kk] - MaxLogit);
+        SumExp := SumExp + FProbArrBuf[Kk];
       end;
       if SumExp < 1e-30 then SumExp := 1e-30;
       ProbY := 0;
       for Kk := 0 to KM1 do
       begin
-        ProbArr[Kk] := ProbArr[Kk] / SumExp;
-        if Kk = ClassC then ProbY := ProbArr[Kk];
+        FProbArrBuf[Kk] := FProbArrBuf[Kk] / SumExp;
+        if Kk = ClassC then ProbY := FProbArrBuf[Kk];
       end;
 
       // Accumulate feature gradient dL/dx and weight gradients.
-      for I := 0 to DM1 do GradX[I] := 0;
+      for I := 0 to DM1 do FGradXBuf[I] := 0;
       for Kk := 0 to KM1 do
       begin
         // dL/dz_k = p_k - [k==y]; z_k = s * cos-term.
-        GK := ProbArr[Kk];
+        GK := FProbArrBuf[Kk];
         if Kk = ClassC then GK := GK - 1.0;
         // a_k = dL/d(cos(theta_k)) folding in the margin chain for the true
         // class. For k=y: d(cos(theta'_y))/d(cos(theta_y)) =
         //   cosM + sinM * cos / sqrt(1 - cos^2).
-        CosT := CosArr[Kk];
+        CosT := FCosArrBuf[Kk];
         if Kk = ClassC then
         begin
           SinTheta := 1.0 - CosT * CosT;
@@ -21909,13 +21958,13 @@ begin
 
         WeightNeuron := FNeurons[Kk];
         W := WeightNeuron.FWeights;
-        WNorm := WNormArr[Kk];
+        WNorm := FWNormArrBuf[Kk];
         // d(cos)/dx   = (W_hat - cos * x_hat) / ||x||
         // d(cos)/dW_k = (x_hat - cos * W_k_hat) / ||W_k||
         for I := 0 to DM1 do
         begin
           // x_hat[i] = x[i]/||x|| ; W_hat[i] = W[i]/||W||
-          GradX[I] := GradX[I] + AK *
+          FGradXBuf[I] := FGradXBuf[I] + AK *
             (W.Raw[I] / WNorm - CosT * FOutput[X, Y, I] * InvXNorm) * InvXNorm;
           // weight gradient (descend): accumulate -LR * dL/dW into delta.
           WeightNeuron.FDelta.Raw[I] := WeightNeuron.FDelta.Raw[I] +
@@ -21925,7 +21974,7 @@ begin
       end;
 
       for I := 0 to DM1 do
-        FOutputError[X, Y, I] := GradX[I];
+        FOutputError[X, Y, I] := FGradXBuf[I];
       // The label channel carries no gradient.
       FOutputError[X, Y, LabelIdx] := 0;
     end;
@@ -21973,6 +22022,20 @@ begin
     FErrorProc('TNNetMixtureDensity requires input depth = K*(1+2*D) = ' +
       IntToStr(Expected) + ' (K=' + IntToStr(Kcomp) + ', D=' + IntToStr(Dim) +
       '), got ' + IntToStr(pPrevLayer.FOutput.Depth) + '.');
+  // Backward scratch: D-sized target and K-sized per-component arrays.
+  SetLength(FYtBuf, Dim);
+  SetLength(FLogCompBuf, Kcomp);
+  SetLength(FGammaArrBuf, Kcomp);
+  SetLength(FPiArrBuf, Kcomp);
+end;
+
+destructor TNNetMixtureDensity.Destroy();
+begin
+  SetLength(FYtBuf, 0);
+  SetLength(FLogCompBuf, 0);
+  SetLength(FGammaArrBuf, 0);
+  SetLength(FPiArrBuf, 0);
+  inherited Destroy();
 end;
 
 function TNNetMixtureDensity.ComponentCount(): integer;
@@ -22114,7 +22177,6 @@ var
   Kcomp, Dim, KcompM1, DimM1, X, Y, kk, dd, MaxX, MaxY, BaseMu, BaseS: integer;
   LogPi, Sigma, Mu, Diff, MaxB, SumExp, RawS, SigmoidS: TNeuralFloat;
   Gamma, Pi_k, InvS2, GMu, GSigma: TNeuralFloat;
-  Yt, LogComp, GammaArr, PiArr: array of TNeuralFloat;
 const
   cLog2Pi = 1.8378770664093453; // ln(2*pi)
   cSigEps = 1e-6;
@@ -22131,50 +22193,46 @@ begin
   BaseS := Kcomp + Kcomp * Dim;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
-  SetLength(Yt, Dim);
-  SetLength(LogComp, Kcomp);
-  SetLength(GammaArr, Kcomp);
-  SetLength(PiArr, Kcomp);
   for X := 0 to MaxX do
     for Y := 0 to MaxY do
     begin
       // Recover the D-dim regression target from the first D channels:
       // framework seeded FOutputError := output - target.
       for dd := 0 to DimM1 do
-        Yt[dd] := FOutput[X, Y, dd] - FOutputError[X, Y, dd];
+        FYtBuf[dd] := FOutput[X, Y, dd] - FOutputError[X, Y, dd];
       // Log-responsibilities (stable log-sum-exp over components).
       MaxB := -1e30;
       for kk := 0 to KcompM1 do
       begin
         Pi_k := FOutput[X, Y, kk];
-        PiArr[kk] := Pi_k;
+        FPiArrBuf[kk] := Pi_k;
         LogPi := Ln(Pi_k + 1e-30);
-        LogComp[kk] := LogPi;
+        FLogCompBuf[kk] := LogPi;
         for dd := 0 to DimM1 do
         begin
           Mu := FOutput[X, Y, BaseMu + kk * Dim + dd];
           Sigma := FOutput[X, Y, BaseS + kk * Dim + dd];
           if Sigma < cSigEps then Sigma := cSigEps;
-          Diff := Yt[dd] - Mu;
-          LogComp[kk] := LogComp[kk] -
+          Diff := FYtBuf[dd] - Mu;
+          FLogCompBuf[kk] := FLogCompBuf[kk] -
             (0.5 * cLog2Pi + Ln(Sigma) + (Diff * Diff) / (2 * Sigma * Sigma));
         end;
-        if LogComp[kk] > MaxB then MaxB := LogComp[kk];
+        if FLogCompBuf[kk] > MaxB then MaxB := FLogCompBuf[kk];
       end;
       SumExp := 0;
       for kk := 0 to KcompM1 do
       begin
-        GammaArr[kk] := Exp(LogComp[kk] - MaxB);
-        SumExp := SumExp + GammaArr[kk];
+        FGammaArrBuf[kk] := Exp(FLogCompBuf[kk] - MaxB);
+        SumExp := SumExp + FGammaArrBuf[kk];
       end;
       if SumExp <= 0 then SumExp := 1e-30;
       for kk := 0 to KcompM1 do
-        GammaArr[kk] := GammaArr[kk] / SumExp;
+        FGammaArrBuf[kk] := FGammaArrBuf[kk] / SumExp;
       // Write the exact dNLL/d(raw param) into FOutputError.
       for kk := 0 to KcompM1 do
       begin
-        Gamma := GammaArr[kk];
-        Pi_k := PiArr[kk];
+        Gamma := FGammaArrBuf[kk];
+        Pi_k := FPiArrBuf[kk];
         // Mixing logit: dNLL/da_k = pi_k - gamma_k.
         FOutputError[X, Y, kk] := Pi_k - Gamma;
         for dd := 0 to DimM1 do
@@ -22182,10 +22240,10 @@ begin
           Mu := FOutput[X, Y, BaseMu + kk * Dim + dd];
           Sigma := FOutput[X, Y, BaseS + kk * Dim + dd];
           if Sigma < cSigEps then Sigma := cSigEps;
-          Diff := Yt[dd] - Mu;
+          Diff := FYtBuf[dd] - Mu;
           InvS2 := 1 / (Sigma * Sigma);
           // Mean: dNLL/dmu = gamma * (mu - y) / sigma^2.
-          GMu := Gamma * (Mu - Yt[dd]) * InvS2;
+          GMu := Gamma * (Mu - FYtBuf[dd]) * InvS2;
           FOutputError[X, Y, BaseMu + kk * Dim + dd] := GMu;
           // Scale: dNLL/dsigma = gamma*(1/sigma - diff^2/sigma^3); then chain
           // softplus' = sigmoid(rawS), rawS recovered as sigmoid via sigma.
