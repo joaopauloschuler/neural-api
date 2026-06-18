@@ -2619,6 +2619,8 @@ type
   TNNetL2Normalize = class(TNNetIdentity)
   protected
     FInvNorms: TNNetVolume;
+    FSumSqBuf: array of TNeuralFloat;
+    FDotBuf: array of TNeuralFloat;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure ComputePerDepth();
     procedure ComputeFullVolume();
@@ -5753,6 +5755,8 @@ type
       FCoupling: TNNetVolume; // (numOutCaps, numInCaps, 1): detached c_ij
       FSquashScale: TNNetVolume; // (numOutCaps,1,1): f/n per output capsule
       FSj: TNNetVolume;     // (numOutCaps, 1, outDim): pre-squash s_j
+      FbLogitsBuf: array of TNeuralFloat; // (numInCaps x numOutCaps) coupling logits
+      FgSBuf: array of TNeuralFloat;  // dL/ds_j (length outDim, reused per j)
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); overload; override;
@@ -5896,9 +5900,11 @@ type
   // Coded by Claude (AI).
   TNNetGRN = class(TNNetChannelTransformBase)
     private
+      FGxBuf, FNxBuf, FdL_dNBuf, FdL_dGBuf, FsumGyXBuf: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
+      destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -8695,8 +8701,12 @@ type
   /// No learnable parameters.
   // Coded by Claude (AI).
   TNNetSparsemax = class(TNNetIdentity)
+    private
+      FSortedBuf: array of TNeuralFloat;
     public
       constructor Create(); override;
+      destructor Destroy(); override;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
   end;
@@ -9708,10 +9718,12 @@ type
     FInDim: integer;       // D_in (input size), learned in SetPrevLayer
     FT: array of TNeuralFloat;   // scratch T_k(u) buffer (length K+1)
     FU2: array of TNeuralFloat;  // scratch U_k(u) buffer (length K+1)
+    FTderivBuf: array of TNeuralFloat; // scratch T_k'(u) buffer (length K+1)
     procedure ComputePreviousLayerErrorCPU(); override;
   public
     constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
     constructor Create(pDout: integer; pDegree: integer); overload;
+    destructor Destroy(); override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure Compute(); override;
     procedure ComputeCPU(); override;
@@ -10065,8 +10077,12 @@ type
   /// K is stored in FStruct[0]. Gradient passes through only at kept positions.
   // Coded by Claude (AI).
   TNNetTopK = class(TNNetIdentity)
+    private
+      FKeptBuf: array of boolean;
     public
       constructor Create(K: integer); overload;
+      destructor Destroy(); override;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
   end;
@@ -10095,9 +10111,13 @@ type
   /// No trainable parameters; output shape equals input shape.
   // Coded by Claude (AI).
   TNNetTopKGate = class(TNNetIdentity)
+    private
+      FKeptBuf: array of boolean;
     public
       constructor Create(TopCnt: integer;
         pRenormalize: boolean = true); overload;
+      destructor Destroy(); override;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
   end;
@@ -10119,8 +10139,12 @@ type
   /// parameters; output shape equals input shape.
   // Coded by Claude (AI).
   TNNetExpertChoiceGate = class(TNNetIdentity)
+    private
+      FKeptBuf: array of boolean;
     public
       constructor Create(Capacity: integer); overload;
+      destructor Destroy(); override;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
   end;
@@ -10595,6 +10619,7 @@ type
     FCoeffsPerEdge: integer;     // Chebyshev: K+1; B-spline: csKANBSplineGrid+K
     FT: array of TNeuralFloat;   // scratch T_k(u) buffer (length K+1)
     FU2: array of TNeuralFloat;  // scratch U_k(u) buffer (length K+1)
+    FTderivBuf: array of TNeuralFloat; // scratch T_k'(u) buffer (length K+1)
     FKnots: array of TNeuralFloat;     // B-spline knot vector (clamped uniform)
     FBVal: array of TNeuralFloat;      // scratch B_j(u) buffer (length G+K)
     FBDeriv: array of TNeuralFloat;    // scratch B_j'(u) buffer (length G+K)
@@ -10608,6 +10633,7 @@ type
   public
     constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
     constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pDegree, pSuppressBias: integer; pBasis: integer = csKANBasisChebyshev); overload;
+    destructor Destroy(); override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -23066,6 +23092,8 @@ end;
 
 destructor TNNetL2Normalize.Destroy();
 begin
+  SetLength(FSumSqBuf, 0);
+  SetLength(FDotBuf, 0);
   FInvNorms.Free;
   inherited Destroy();
 end;
@@ -23081,6 +23109,9 @@ begin
     FInvNorms.ReSize(1, 1, FOutput.Depth)
   else
     FInvNorms.ReSize(FOutput.SizeX, FOutput.SizeY, 1);
+  // Per-channel scratch (sum-of-squares forward, dot backward), one per depth.
+  SetLength(FSumSqBuf, FOutput.Depth);
+  SetLength(FDotBuf, FOutput.Depth);
 end;
 
 procedure TNNetL2Normalize.Compute();
@@ -23149,7 +23180,6 @@ var
   Pos: integer;
   LocalPrevOutput: TNNetVolume;
   InvN, Eps, Xi: TNeuralFloat;
-  SumSq: array of TNeuralFloat;
 begin
   // For each depth channel d independently, reduce sum-of-squares over all
   // (x,y) positions so that channel's spatial map has unit L2 norm:
@@ -23160,9 +23190,8 @@ begin
   MaxX := LocalPrevOutput.SizeX - 1;
   MaxY := LocalPrevOutput.SizeY - 1;
   MaxD := LocalPrevOutput.Depth - 1;
-  SetLength(SumSq, MaxD + 1);
   for CntD := 0 to MaxD do
-    SumSq[CntD] := 0;
+    FSumSqBuf[CntD] := 0;
   for CntX := 0 to MaxX do
     for CntY := 0 to MaxY do
     begin
@@ -23170,11 +23199,11 @@ begin
       for CntD := 0 to MaxD do
       begin
         Xi := LocalPrevOutput.FData[Pos + CntD];
-        SumSq[CntD] := SumSq[CntD] + Xi * Xi;
+        FSumSqBuf[CntD] := FSumSqBuf[CntD] + Xi * Xi;
       end;
     end;
   for CntD := 0 to MaxD do
-    FInvNorms.FData[CntD] := pcr_rsqrtf(SumSq[CntD] + Eps);
+    FInvNorms.FData[CntD] := pcr_rsqrtf(FSumSqBuf[CntD] + Eps);
   for CntX := 0 to MaxX do
     for CntY := 0 to MaxY do
     begin
@@ -23262,7 +23291,6 @@ var
   CntX, CntY, CntD, MaxX, MaxY, MaxD: integer;
   Pos: integer;
   Yi, InvN: TNeuralFloat;
-  Dot: array of TNeuralFloat;
 begin
   // For each channel d, apply the L2-normalize Jacobian over its (x,y) map:
   //   dL/dx_i = invN_d * (gy_i - y_i * sum_j y_j * gy_j)
@@ -23271,15 +23299,14 @@ begin
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := FOutput.Depth - 1;
-  SetLength(Dot, MaxD + 1);
   for CntD := 0 to MaxD do
-    Dot[CntD] := 0;
+    FDotBuf[CntD] := 0;
   for CntX := 0 to MaxX do
     for CntY := 0 to MaxY do
     begin
       Pos := FOutput.GetRawPos(CntX, CntY, 0);
       for CntD := 0 to MaxD do
-        Dot[CntD] := Dot[CntD] +
+        FDotBuf[CntD] := FDotBuf[CntD] +
           FOutput.FData[Pos + CntD] * FOutputError.FData[Pos + CntD];
     end;
   for CntX := 0 to MaxX do
@@ -23292,7 +23319,7 @@ begin
         InvN := FInvNorms.FData[CntD];
         FPrevLayer.OutputError.FData[Pos + CntD] :=
           FPrevLayer.OutputError.FData[Pos + CntD] +
-          InvN * (FOutputError.FData[Pos + CntD] - Yi * Dot[CntD]);
+          InvN * (FOutputError.FData[Pos + CntD] - Yi * FDotBuf[CntD]);
       end;
     end;
 end;
@@ -34681,12 +34708,23 @@ begin
   inherited Create();
 end;
 
+destructor TNNetSparsemax.Destroy();
+begin
+  SetLength(FSortedBuf, 0);
+  inherited Destroy();
+end;
+
+procedure TNNetSparsemax.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  SetLength(FSortedBuf, FOutput.Depth);
+end;
+
 procedure TNNetSparsemax.Compute();
 var
   StartTime: double;
   SX, SY, D, X, Y, CntD, StartPos, k, kMax: integer;
   SXM1, SYM1, DM1, kMaxM1: integer;
-  Sorted: array of TNeuralFloat;
   CumSum, Threshold, Tau, Val: TNeuralFloat;
   i, j: integer;
   Tmp: TNeuralFloat;
@@ -34699,7 +34737,6 @@ begin
   SXM1 := SX - 1;
   SYM1 := SY - 1;
   DM1 := D - 1;
-  SetLength(Sorted, D);
   for X := 0 to SXM1 do
   begin
     for Y := 0 to SYM1 do
@@ -34707,36 +34744,36 @@ begin
       StartPos := FOutput.GetRawPos(X, Y, 0);
       // Copy depth vector for in-place sort.
       for CntD := 0 to DM1 do
-        Sorted[CntD] := FOutput.FData[StartPos + CntD];
+        FSortedBuf[CntD] := FOutput.FData[StartPos + CntD];
       // Insertion sort descending (D is typically small at a single
       // spatial position — vocabulary-sized sparsemax should use a
       // dedicated kernel, but for attention/classification heads with
       // tens to hundreds of channels insertion sort is fine).
       for i := 1 to DM1 do
       begin
-        Tmp := Sorted[i];
+        Tmp := FSortedBuf[i];
         j := i - 1;
-        while (j >= 0) and (Sorted[j] < Tmp) do
+        while (j >= 0) and (FSortedBuf[j] < Tmp) do
         begin
-          Sorted[j + 1] := Sorted[j];
+          FSortedBuf[j + 1] := FSortedBuf[j];
           Dec(j);
         end;
-        Sorted[j + 1] := Tmp;
+        FSortedBuf[j + 1] := Tmp;
       end;
       // Find kMax: largest k (1..D) with 1 + k*z_sorted[k-1] > cumsum_k.
       CumSum := 0;
       kMax := 1;
       for k := 1 to D do
       begin
-        CumSum := CumSum + Sorted[k - 1];
-        Threshold := 1 + k * Sorted[k - 1];
+        CumSum := CumSum + FSortedBuf[k - 1];
+        Threshold := 1 + k * FSortedBuf[k - 1];
         if Threshold > CumSum then kMax := k;
       end;
       // Recompute cumsum up to kMax for tau.
       CumSum := 0;
       kMaxM1 := kMax - 1;
       for k := 0 to kMaxM1 do
-        CumSum := CumSum + Sorted[k];
+        CumSum := CumSum + FSortedBuf[k];
       Tau := (CumSum - 1) / kMax;
       // Write p[i] = max(0, z[i] - tau) into FOutput (in-place).
       for CntD := 0 to DM1 do
@@ -39308,6 +39345,8 @@ end;
 
 destructor TNNetCapsuleRouting.Destroy();
 begin
+  SetLength(FbLogitsBuf, 0);
+  SetLength(FgSBuf, 0);
   FUHat.Free;
   FCoupling.Free;
   FSquashScale.Free;
@@ -39331,6 +39370,8 @@ begin
   FCoupling.ReSize(FNumOutCaps, FNumInCaps, 1);
   FSquashScale.ReSize(FNumOutCaps, 1, 1);
   FSj.ReSize(FNumOutCaps, 1, FOutDim);
+  SetLength(FbLogitsBuf, FNumInCaps * FNumOutCaps);
+  SetLength(FgSBuf, FOutDim);
   InitDefault();
   AfterWeightUpdate();
 end;
@@ -39355,7 +39396,6 @@ var
   NumInCapsM1, NumOutCapsM1, OutDimM1, InDimM1, TotalCapsM1: integer;
   W: TNNetVolume;
   acc, sumSq, n, fOverN, Eps, maxB, sumExp, c, agree: TNeuralFloat;
-  bLogits: array of TNeuralFloat; // (numInCaps x numOutCaps) coupling logits
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -39382,21 +39422,20 @@ begin
     end;
 
   // 2) Routing-by-agreement. Coupling logits b_ij RESET to 0 each forward.
-  SetLength(bLogits, FNumInCaps * FNumOutCaps);
-  for i := 0 to TotalCapsM1 do bLogits[i] := 0;
+  for i := 0 to TotalCapsM1 do FbLogitsBuf[i] := 0;
 
   for it := 1 to FRoutingIters do
   begin
     // c_i. = softmax over j of b_i.  ; cache into FCoupling.
     for i := 0 to NumInCapsM1 do
     begin
-      maxB := bLogits[i * FNumOutCaps];
+      maxB := FbLogitsBuf[i * FNumOutCaps];
       for j := 1 to NumOutCapsM1 do
-        if bLogits[i * FNumOutCaps + j] > maxB then maxB := bLogits[i * FNumOutCaps + j];
+        if FbLogitsBuf[i * FNumOutCaps + j] > maxB then maxB := FbLogitsBuf[i * FNumOutCaps + j];
       sumExp := 0;
       for j := 0 to NumOutCapsM1 do
       begin
-        c := Exp(bLogits[i * FNumOutCaps + j] - maxB);
+        c := Exp(FbLogitsBuf[i * FNumOutCaps + j] - maxB);
         FCoupling[j, i, 0] := c;
         sumExp := sumExp + c;
       end;
@@ -39431,10 +39470,9 @@ begin
           agree := 0;
           for o := 0 to OutDimM1 do
             agree := agree + FUHat[j, i, o] * FOutput.Raw[j * FOutDim + o];
-          bLogits[i * FNumOutCaps + j] := bLogits[i * FNumOutCaps + j] + agree;
+          FbLogitsBuf[i * FNumOutCaps + j] := FbLogitsBuf[i * FNumOutCaps + j] + agree;
         end;
   end;
-  SetLength(bLogits, 0);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -39447,7 +39485,6 @@ var
   NumOutCapsM1, OutDimM1, NumInCapsM1, InDimM1: integer;
   W, Delta: TNNetVolume;
   sumSq, n, fOverN, dFON, sDotG, gOut, dSj, dUHat, Eps: TNeuralFloat;
-  gS: array of TNeuralFloat;  // dL/ds_j (length outDim, reused per j)
   hasInputGrad: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -39463,7 +39500,6 @@ begin
   OutDimM1 := FOutDim - 1;
   NumInCapsM1 := FNumInCaps - 1;
   InDimM1 := FInDim - 1;
-  SetLength(gS, FOutDim);
 
   // Detached-coupling backward: c_ij are CONSTANTS (FCoupling, from forward).
   // Gradient flows: g_v -> (squash Jacobian) -> g_s -> (sum c_ij) -> g_uhat
@@ -39482,10 +39518,10 @@ begin
     for o := 0 to OutDimM1 do
     begin
       gOut := FOutputError.Raw[j * FOutDim + o];
-      gS[o] := fOverN * gOut + sDotG * dFON * FSj[j, 0, o];
+      FgSBuf[o] := fOverN * gOut + sDotG * dFON * FSj[j, 0, o];
     end;
 
-    // s_j = sum_i c_ij u_hat_{j|i}  =>  dL/d u_hat_{j|i}[o] = c_ij * gS[o].
+    // s_j = sum_i c_ij u_hat_{j|i}  =>  dL/d u_hat_{j|i}[o] = c_ij * FgSBuf[o].
     // u_hat_{j|i}[o] = sum_k W_ij[o,k] * u_i[k].
     for i := 0 to NumInCapsM1 do
     begin
@@ -39494,7 +39530,7 @@ begin
       Delta := FNeurons[nIdx].FDelta;
       for o := 0 to OutDimM1 do
       begin
-        dUHat := FCoupling[j, i, 0] * gS[o];
+        dUHat := FCoupling[j, i, 0] * FgSBuf[o];
         for k := 0 to InDimM1 do
         begin
           // W grad: dL/dW_ij[o,k] = dUHat * u_i[k]  (descend => -LR * grad)
@@ -39510,7 +39546,6 @@ begin
       end;
     end;
   end;
-  SetLength(gS, 0);
 
   if (not FBatchUpdate) then
   begin
@@ -39719,6 +39754,16 @@ begin
   InitDefault();
 end;
 
+destructor TNNetGRN.Destroy();
+begin
+  SetLength(FGxBuf, 0);
+  SetLength(FNxBuf, 0);
+  SetLength(FdL_dNBuf, 0);
+  SetLength(FdL_dGBuf, 0);
+  SetLength(FsumGyXBuf, 0);
+  inherited Destroy();
+end;
+
 procedure TNNetGRN.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -39726,6 +39771,11 @@ begin
   // additionally need FNeurons[1] with Depth weights for beta.
   if FNeurons.Count < 2 then AddMissingNeurons(2);
   SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  SetLength(FGxBuf, FOutput.Depth);
+  SetLength(FNxBuf, FOutput.Depth);
+  SetLength(FdL_dNBuf, FOutput.Depth);
+  SetLength(FdL_dGBuf, FOutput.Depth);
+  SetLength(FsumGyXBuf, FOutput.Depth);
   InitDefault();
 end;
 
@@ -39737,7 +39787,6 @@ var
   Prev: TNNetVolume;
   Wg, Wb: TNNetVolume;
   SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, c: integer;
-  Gx, Nx: array of TNeuralFloat;
   s, xv, meanG: TNeuralFloat;
 begin
   StartTime := Now();
@@ -39757,8 +39806,6 @@ begin
     FErrorProc('Neuron weight count isn''t compatible with output depth ' +
       'at TNNetGRN.');
   {$ENDIF}
-  SetLength(Gx, Depth);
-  SetLength(Nx, Depth);
   // Gx[c] = sqrt(sum_{x,y} X[x,y,c]^2 + eps)
   meanG := 0;
   for c := 0 to DepthM1 do
@@ -39770,23 +39817,21 @@ begin
         xv := Prev[x, y, c];
         s := s + xv * xv;
       end;
-    Gx[c] := Sqrt(s + cEps);
-    meanG := meanG + Gx[c];
+    FGxBuf[c] := Sqrt(s + cEps);
+    meanG := meanG + FGxBuf[c];
   end;
   meanG := meanG / Depth;
   // Avoid division by zero (Gx is always >= sqrt(eps) > 0, so meanG > 0).
   for c := 0 to DepthM1 do
-    Nx[c] := Gx[c] / meanG;
+    FNxBuf[c] := FGxBuf[c] / meanG;
   // Y[x,y,c] = gamma[c] * (X[x,y,c] * Nx[c]) + beta[c] + X[x,y,c]
   for c := 0 to DepthM1 do
     for x := 0 to SizeXM1 do
       for y := 0 to SizeYM1 do
       begin
         xv := Prev[x, y, c];
-        FOutput[x, y, c] := Wg.Raw[c] * (xv * Nx[c]) + Wb.Raw[c] + xv;
+        FOutput[x, y, c] := Wg.Raw[c] * (xv * FNxBuf[c]) + Wb.Raw[c] + xv;
       end;
-  SetLength(Gx, 0);
-  SetLength(Nx, 0);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -39799,7 +39844,6 @@ var
   Wg: TNNetVolume;
   Prev, PrevErr: TNNetVolume;
   SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, c, cp: integer;
-  Gx, Nx, dL_dN, dL_dG, sumGyX: array of TNeuralFloat;
   s, xv, gy, meanG, gradGamma, gradBeta, term, dL_dM: TNeuralFloat;
   hasInputGrad: boolean;
 begin
@@ -39822,12 +39866,6 @@ begin
   SizeYM1 := SizeY - 1;
   DepthM1 := Depth - 1;
 
-  SetLength(Gx, Depth);
-  SetLength(Nx, Depth);
-  SetLength(dL_dN, Depth);
-  SetLength(dL_dG, Depth);
-  SetLength(sumGyX, Depth);
-
   // Recompute Gx, Nx, meanG (forward state not cached).
   meanG := 0;
   for c := 0 to DepthM1 do
@@ -39839,12 +39877,12 @@ begin
         xv := Prev[x, y, c];
         s := s + xv * xv;
       end;
-    Gx[c] := Sqrt(s + cEps);
-    meanG := meanG + Gx[c];
+    FGxBuf[c] := Sqrt(s + cEps);
+    meanG := meanG + FGxBuf[c];
   end;
   meanG := meanG / Depth;
   for c := 0 to DepthM1 do
-    Nx[c] := Gx[c] / meanG;
+    FNxBuf[c] := FGxBuf[c] / meanG;
 
   // Weight gradients and helper accumulators per channel:
   //   sumGyX[c] = sum_{x,y} gy[x,y,c] * X[x,y,c]
@@ -39863,9 +39901,9 @@ begin
         gradGamma := gradGamma + gy * xv;
         gradBeta := gradBeta + gy;
       end;
-    sumGyX[c] := gradGamma;
-    dL_dN[c]  := Wg.Raw[c] * gradGamma;
-    Ng.FDelta.Raw[c] := Ng.FDelta.Raw[c] + (-FLearningRate) * (Nx[c] * gradGamma);
+    FsumGyXBuf[c] := gradGamma;
+    FdL_dNBuf[c]  := Wg.Raw[c] * gradGamma;
+    Ng.FDelta.Raw[c] := Ng.FDelta.Raw[c] + (-FLearningRate) * (FNxBuf[c] * gradGamma);
     Nb.FDelta.Raw[c] := Nb.FDelta.Raw[c] + (-FLearningRate) * gradBeta;
   end;
 
@@ -39878,10 +39916,10 @@ begin
   //   Let dL_dM_term = (1/(M*Depth)) * sum_{c'} dL/dN[c'] * Nx[c']
   dL_dM := 0;
   for cp := 0 to DepthM1 do
-    dL_dM := dL_dM + dL_dN[cp] * Nx[cp];
+    dL_dM := dL_dM + FdL_dNBuf[cp] * FNxBuf[cp];
   dL_dM := dL_dM / (meanG * Depth);
   for c := 0 to DepthM1 do
-    dL_dG[c] := dL_dN[c] / meanG - dL_dM;
+    FdL_dGBuf[c] := FdL_dNBuf[c] / meanG - dL_dM;
 
   if hasInputGrad then
   begin
@@ -39894,14 +39932,14 @@ begin
     //     dL_dG[c'] * X[x',y',c'] / Gx[c']
     for c := 0 to DepthM1 do
     begin
-      term := dL_dG[c] / Gx[c];   // multiplier for X[x,y,c] in chain term
+      term := FdL_dGBuf[c] / FGxBuf[c];   // multiplier for X[x,y,c] in chain term
       for x := 0 to SizeXM1 do
         for y := 0 to SizeYM1 do
         begin
           gy := FOutputError[x, y, c];
           xv := Prev[x, y, c];
           PrevErr[x, y, c] := PrevErr[x, y, c] +
-            gy * (1 + Wg.Raw[c] * Nx[c]) + term * xv;
+            gy * (1 + Wg.Raw[c] * FNxBuf[c]) + term * xv;
         end;
     end;
   end;
@@ -39913,12 +39951,6 @@ begin
     AfterWeightUpdate();
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
-
-  SetLength(Gx, 0);
-  SetLength(Nx, 0);
-  SetLength(dL_dN, 0);
-  SetLength(dL_dG, 0);
-  SetLength(sumGyX, 0);
 
   if hasInputGrad then FPrevLayer.Backpropagate();
 end;
@@ -67435,6 +67467,14 @@ begin
   FDegree := pDegree;
 end;
 
+destructor TNNetKANLayer.Destroy();
+begin
+  SetLength(FT, 0);
+  SetLength(FU2, 0);
+  SetLength(FTderivBuf, 0);
+  inherited Destroy();
+end;
+
 procedure TNNetKANLayer.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
   Dout: integer;
@@ -67450,6 +67490,7 @@ begin
   SetNumWeightsForAllNeurons(FInDim * (FDegree + 1));
   SetLength(FT, FDegree + 1);
   SetLength(FU2, FDegree + 1);
+  SetLength(FTderivBuf, FDegree + 1);
   BuildArrNeurons();
   InitDefault();
 end;
@@ -67586,12 +67627,10 @@ var
   DoutMax, inDimMax: integer;
   u, gy, dudx, edgeDeriv, gradAcc: TNeuralFloat;
   PrevOut, PrevErr, W: TNNetVolume;
-  Tderiv: array of TNeuralFloat;
 begin
   PrevErr := FPrevLayer.OutputError;
   PrevOut := FPrevLayer.FOutput;
   Dout := FOutput.Size;
-  SetLength(Tderiv, FDegree + 1);
   DoutMax := Dout - 1;
   inDimMax := FInDim - 1;
   for i := 0 to inDimMax do
@@ -67602,8 +67641,8 @@ begin
     FU2[0] := 1;
     if FDegree >= 1 then FU2[1] := 2 * u;
     for k := 2 to FDegree do FU2[k] := 2 * u * FU2[k - 1] - FU2[k - 2];
-    Tderiv[0] := 0;
-    for k := 1 to FDegree do Tderiv[k] := k * FU2[k - 1];
+    FTderivBuf[0] := 0;
+    for k := 1 to FDegree do FTderivBuf[k] := k * FU2[k - 1];
     base := i * (FDegree + 1);
     gradAcc := 0;
     for j := 0 to DoutMax do
@@ -67613,7 +67652,7 @@ begin
       W := FArrNeurons[j].FWeights;
       edgeDeriv := 0;
       for k := 1 to FDegree do
-        edgeDeriv := edgeDeriv + W.FData[base + k] * Tderiv[k];
+        edgeDeriv := edgeDeriv + W.FData[base + k] * FTderivBuf[k];
       gradAcc := gradAcc + gy * edgeDeriv;
     end;
     PrevErr.FData[i] := PrevErr.FData[i] + dudx * gradAcc;
@@ -67672,6 +67711,12 @@ begin
   end
   else
     FCoeffsPerEdge := FDegree + 1;
+end;
+
+destructor TNNetKANConv.Destroy();
+begin
+  SetLength(FTderivBuf, 0);
+  inherited Destroy();
 end;
 
 // Builds the fixed clamped uniform knot vector for the degree-K B-spline over
@@ -67809,6 +67854,7 @@ begin
   FShouldInterleaveWeights := false;
   SetLength(FT, FDegree + 1);
   SetLength(FU2, FDegree + 1);
+  SetLength(FTderivBuf, FDegree + 1);
   BuildArrNeurons();
   InitDefault();
   for oo := 0 to outDepthMax do
@@ -68046,7 +68092,6 @@ var
   prevX, prevY, prevSizeX, prevSizeY: integer;
   u, dudx, gy, edgeDeriv, gradAcc, xv: TNeuralFloat;
   W, PrevOut, LocalPrevError: TNNetVolume;
-  Tderiv: array of TNeuralFloat;
   outSizeYMax, outSizeXMax, featYMax, featXMax, inDepthMax, outDepthMax, coeffsMax: integer;
 begin
   if not FCalculatePrevLayerError then exit;
@@ -68055,7 +68100,6 @@ begin
   prevSizeX := PrevOut.SizeX;
   prevSizeY := PrevOut.SizeY;
   OutDepth := FNeurons.Count;
-  SetLength(Tderiv, FDegree + 1);
   outSizeYMax := FOutputSizeY - 1;
   outSizeXMax := FOutputSizeX - 1;
   featYMax := FFeatureSizeY - 1;
@@ -68103,8 +68147,8 @@ begin
           FU2[0] := 1;
           if FDegree >= 1 then FU2[1] := 2 * u;
           for kk := 2 to FDegree do FU2[kk] := 2 * u * FU2[kk - 1] - FU2[kk - 2];
-          Tderiv[0] := 0;
-          for kk := 1 to FDegree do Tderiv[kk] := kk * FU2[kk - 1];
+          FTderivBuf[0] := 0;
+          for kk := 1 to FDegree do FTderivBuf[kk] := kk * FU2[kk - 1];
           gradAcc := 0;
           for oo := 0 to outDepthMax do
           begin
@@ -68113,7 +68157,7 @@ begin
             W := FArrNeurons[oo].FWeights;
             edgeDeriv := 0;
             for kk := 1 to FDegree do
-              edgeDeriv := edgeDeriv + W.FData[base + kk] * Tderiv[kk];
+              edgeDeriv := edgeDeriv + W.FData[base + kk] * FTderivBuf[kk];
             gradAcc := gradAcc + gy * edgeDeriv;
           end;
           LocalPrevError.Add(prevX, prevY, ic, dudx * gradAcc);
@@ -73979,12 +74023,23 @@ begin
   FStruct[0] := K;
 end;
 
+destructor TNNetTopK.Destroy();
+begin
+  SetLength(FKeptBuf, 0);
+  inherited Destroy();
+end;
+
+procedure TNNetTopK.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  SetLength(FKeptBuf, FOutput.Depth);
+end;
+
 procedure TNNetTopK.Compute;
 var
   StartTime: double;
   CntX, CntY, CntD, CntK, MaxX, MaxY, MaxD, StartPos, K, BestIdx: integer;
   BestVal, Val: TNeuralFloat;
-  Kept: array of boolean;
 begin
   StartTime := Now();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
@@ -73997,20 +74052,19 @@ begin
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
   end;
-  SetLength(Kept, FOutput.Depth);
   for CntX := 0 to MaxX do
   begin
     for CntY := 0 to MaxY do
     begin
       StartPos := FOutput.GetRawPos(CntX, CntY, 0);
-      for CntD := 0 to MaxD do Kept[CntD] := False;
+      for CntD := 0 to MaxD do FKeptBuf[CntD] := False;
       for CntK := 1 to K do
       begin
         BestIdx := -1;
         BestVal := 0;
         for CntD := 0 to MaxD do
         begin
-          if Kept[CntD] then continue;
+          if FKeptBuf[CntD] then continue;
           Val := FOutput.FData[StartPos + CntD];
           if (BestIdx = -1) or (Val > BestVal) then
           begin
@@ -74018,10 +74072,10 @@ begin
             BestVal := Val;
           end;
         end;
-        if BestIdx >= 0 then Kept[BestIdx] := True;
+        if BestIdx >= 0 then FKeptBuf[BestIdx] := True;
       end;
       for CntD := 0 to MaxD do
-        if not Kept[CntD] then
+        if not FKeptBuf[CntD] then
           FOutput.FData[StartPos + CntD] := 0;
     end;
   end;
@@ -74066,12 +74120,23 @@ begin
   else FStruct[1] := 1;
 end;
 
+destructor TNNetTopKGate.Destroy();
+begin
+  SetLength(FKeptBuf, 0);
+  inherited Destroy();
+end;
+
+procedure TNNetTopKGate.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  SetLength(FKeptBuf, FOutput.Depth);
+end;
+
 procedure TNNetTopKGate.Compute;
 var
   StartTime: double;
   CntX, CntY, CntD, CntK, MaxX, MaxY, MaxD, StartPos, TopCnt, BestIdx: integer;
   BestVal, Val, SurvSum: TNeuralFloat;
-  Kept: array of boolean;
 begin
   StartTime := Now();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
@@ -74084,12 +74149,11 @@ begin
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
   end;
-  SetLength(Kept, FOutput.Depth);
   for CntX := 0 to MaxX do
     for CntY := 0 to MaxY do
     begin
       StartPos := FOutput.GetRawPos(CntX, CntY, 0);
-      for CntD := 0 to MaxD do Kept[CntD] := False;
+      for CntD := 0 to MaxD do FKeptBuf[CntD] := False;
       // Keep the TopCnt largest gate weights (first occurrence wins on ties).
       for CntK := 1 to TopCnt do
       begin
@@ -74097,7 +74161,7 @@ begin
         BestVal := 0;
         for CntD := 0 to MaxD do
         begin
-          if Kept[CntD] then continue;
+          if FKeptBuf[CntD] then continue;
           Val := FOutput.FData[StartPos + CntD];
           if (BestIdx = -1) or (Val > BestVal) then
           begin
@@ -74105,24 +74169,24 @@ begin
             BestVal := Val;
           end;
         end;
-        if BestIdx >= 0 then Kept[BestIdx] := True;
+        if BestIdx >= 0 then FKeptBuf[BestIdx] := True;
       end;
       if FStruct[1] = 1 then
       begin
         // Raw mode (norm_topk_prob=false): survivors keep their input gate
         // weights; only the non-survivors are zeroed.
         for CntD := 0 to MaxD do
-          if not Kept[CntD] then FOutput.FData[StartPos + CntD] := 0;
+          if not FKeptBuf[CntD] then FOutput.FData[StartPos + CntD] := 0;
       end
       else
       begin
         // Renormalize survivors so they sum to 1; zero the rest.
         SurvSum := 0;
         for CntD := 0 to MaxD do
-          if Kept[CntD] then SurvSum := SurvSum + FOutput.FData[StartPos + CntD];
+          if FKeptBuf[CntD] then SurvSum := SurvSum + FOutput.FData[StartPos + CntD];
         if SurvSum = 0 then SurvSum := 1;
         for CntD := 0 to MaxD do
-          if Kept[CntD]
+          if FKeptBuf[CntD]
             then FOutput.FData[StartPos + CntD] := FOutput.FData[StartPos + CntD] / SurvSum
             else FOutput.FData[StartPos + CntD] := 0;
       end;
@@ -74220,12 +74284,23 @@ begin
   FStruct[0] := Capacity;
 end;
 
+destructor TNNetExpertChoiceGate.Destroy();
+begin
+  SetLength(FKeptBuf, 0);
+  inherited Destroy();
+end;
+
+procedure TNNetExpertChoiceGate.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  SetLength(FKeptBuf, FOutput.SizeX);
+end;
+
 procedure TNNetExpertChoiceGate.Compute;
 var
   StartTime: double;
   CntX, CntY, CntD, CntK, MaxX, MaxY, MaxD, Capacity, BestIdx: integer;
   BestVal, Val: TNeuralFloat;
-  Kept: array of boolean;
 begin
   StartTime := Now();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
@@ -74238,21 +74313,20 @@ begin
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
   end;
-  SetLength(Kept, FOutput.SizeX);
   // For EACH expert channel (Depth) keep the top-Capacity TOKEN positions
   // (SizeX); zero the rest. No renormalization (raw gate value is the combine
   // weight) so the backward is a hard 0/1 mask.
   for CntD := 0 to MaxD do
     for CntY := 0 to MaxY do
     begin
-      for CntX := 0 to MaxX do Kept[CntX] := False;
+      for CntX := 0 to MaxX do FKeptBuf[CntX] := False;
       for CntK := 1 to Capacity do
       begin
         BestIdx := -1;
         BestVal := 0;
         for CntX := 0 to MaxX do
         begin
-          if Kept[CntX] then continue;
+          if FKeptBuf[CntX] then continue;
           Val := FOutput.FData[FOutput.GetRawPos(CntX, CntY, CntD)];
           if (BestIdx = -1) or (Val > BestVal) then
           begin
@@ -74260,10 +74334,10 @@ begin
             BestVal := Val;
           end;
         end;
-        if BestIdx >= 0 then Kept[BestIdx] := True;
+        if BestIdx >= 0 then FKeptBuf[BestIdx] := True;
       end;
       for CntX := 0 to MaxX do
-        if not Kept[CntX] then
+        if not FKeptBuf[CntX] then
           FOutput.FData[FOutput.GetRawPos(CntX, CntY, CntD)] := 0;
     end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -74358,7 +74432,6 @@ var
   StartTime: double;
   CntX, CntY, CntD, CntK, MaxX, MaxY, MaxD, StartPos, TopCnt, BestIdx: integer;
   BestVal, Val, SurvSum: TNeuralFloat;
-  Kept: array of boolean;
   BiasPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
@@ -74381,12 +74454,11 @@ begin
     exit;
   end;
   BiasPtr := FNeurons[0].FWeights.GetRawPtr(0, 0, 0);
-  SetLength(Kept, FOutput.Depth);
   for CntX := 0 to MaxX do
     for CntY := 0 to MaxY do
     begin
       StartPos := FOutput.GetRawPos(CntX, CntY, 0);
-      for CntD := 0 to MaxD do Kept[CntD] := False;
+      for CntD := 0 to MaxD do FKeptBuf[CntD] := False;
       // SELECTION uses the BIASED affinity g + b (first occurrence wins ties).
       for CntK := 1 to TopCnt do
       begin
@@ -74394,7 +74466,7 @@ begin
         BestVal := 0;
         for CntD := 0 to MaxD do
         begin
-          if Kept[CntD] then continue;
+          if FKeptBuf[CntD] then continue;
           Val := FOutput.FData[StartPos + CntD] + BiasPtr^[CntD];
           if (BestIdx = -1) or (Val > BestVal) then
           begin
@@ -74402,16 +74474,16 @@ begin
             BestVal := Val;
           end;
         end;
-        if BestIdx >= 0 then Kept[BestIdx] := True;
+        if BestIdx >= 0 then FKeptBuf[BestIdx] := True;
       end;
       // COMBINE weights stay UNBIASED: renormalize the surviving raw g values
       // so they sum to 1; zero the rest. Accumulate per-expert load counts.
       SurvSum := 0;
       for CntD := 0 to MaxD do
-        if Kept[CntD] then SurvSum := SurvSum + FOutput.FData[StartPos + CntD];
+        if FKeptBuf[CntD] then SurvSum := SurvSum + FOutput.FData[StartPos + CntD];
       if SurvSum = 0 then SurvSum := 1;
       for CntD := 0 to MaxD do
-        if Kept[CntD] then
+        if FKeptBuf[CntD] then
         begin
           FOutput.FData[StartPos + CntD] := FOutput.FData[StartPos + CntD] / SurvSum;
           FLoadAcc[CntD] := FLoadAcc[CntD] + 1;
