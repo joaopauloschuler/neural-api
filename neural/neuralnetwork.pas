@@ -3834,6 +3834,11 @@ type
       FGradK1: TNNetVolume;      // (HalfKeys,1,HalfQ) K1-gradient accumulator (reused per head)
       FGradK2: TNNetVolume;      // (HalfKeys,1,HalfQ) K2-gradient accumulator (reused per head)
       FGradV: TNNetVolume;       // (NumKeys,1,ValueDim) V-gradient accumulator (reused per head)
+      // Compute scratch: per-half top-K indices (TopK) + candidate buffers (TopK*TopK).
+      FSelABuf, FSelBBuf, FCandABuf, FCandBBuf: array of integer;
+      FCandScoreBuf: array of TNeuralFloat;
+      // Backpropagate scratch (TopK): g_k and softmax-Jacobian score gradient.
+      FGBuf, FdScoreBuf: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(NumKeys, ValueDim, TopK, Heads, QueryDim: integer); overload;
@@ -6594,6 +6599,7 @@ type
       FGradW: array[0..3] of TNNetVolume; // DepthxDepth grad accumulators (Wq/Wk/Wv/Wo)
       FGradWi, FGradWf: TNNetVolume;      // Depth-long grad accumulators (w_i/w_f)
       FGradBo: TNNetVolume;               // Depth-long grad accumulator (b_o)
+      FgqBuf, FgkvBuf, FgvvBuf: array of TNeuralFloat; // Backpropagate scratch (Depth)
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
@@ -6842,6 +6848,8 @@ type
       FGM: TNNetVolume;         // dL/dM carried across steps, (NumSlots,1,SlotWidth)
       FGradWk, FGradWb, FGradWe, FGradWa: TNNetVolume;
       FGradBk, FGradBb, FGradBe, FGradBa: TNNetVolume;
+      FgWArrBuf, FgScoreArrBuf: array of TNeuralFloat; // Backpropagate scratch (NumSlots)
+      FgEArrBuf, FgAArrBuf: array of TNeuralFloat;      // Backpropagate scratch (SlotWidth)
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(pNumSlots, pSlotWidth: integer;
@@ -7048,6 +7056,7 @@ type
       FGS: TNNetVolume;              // dL/dS_t carried across steps, (Depth,1,Depth)
       FGradWq, FGradWk, FGradWv: TNNetVolume; // DepthxDepth grad accumulators
       FGradWb: TNNetVolume;          // Depth-long grad accumulator (w_beta)
+      FgqBuf, FgvBuf, FgknBuf, FgkrawBuf: array of TNeuralFloat; // Backpropagate scratch (Depth)
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
@@ -7106,6 +7115,7 @@ type
       FGS: TNNetVolume;              // dL/dS_t carried across steps, (Depth,1,Depth)
       FGradWq, FGradWk, FGradWv, FGradWa: TNNetVolume; // DepthxDepth grad accumulators
       FGradBa: TNNetVolume;          // Depth-long grad accumulator (b_a)
+      FgqBuf, FgvBuf, FgknBuf, FgkrawBuf, FgaBuf: array of TNeuralFloat; // Backpropagate scratch (Depth)
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
@@ -25249,6 +25259,10 @@ begin
   FS2.Free;
   FS1.Free;
   FW.Free;
+  SetLength(FSelABuf, 0); SetLength(FSelBBuf, 0);
+  SetLength(FCandABuf, 0); SetLength(FCandBBuf, 0);
+  SetLength(FCandScoreBuf, 0);
+  SetLength(FGBuf, 0); SetLength(FdScoreBuf, 0);
   inherited Destroy();
 end;
 
@@ -25296,6 +25310,10 @@ begin
   SetLength(FIdxA, FHeads * SeqLen * FTopK);
   SetLength(FIdxB, FHeads * SeqLen * FTopK);
   SetLength(FIdxKey, FHeads * SeqLen * FTopK);
+  SetLength(FSelABuf, FTopK); SetLength(FSelBBuf, FTopK);
+  SetLength(FCandScoreBuf, FTopK * FTopK);
+  SetLength(FCandABuf, FTopK * FTopK); SetLength(FCandBBuf, FTopK * FTopK);
+  SetLength(FGBuf, FTopK); SetLength(FdScoreBuf, FTopK);
   InitDefault();
 end;
 
@@ -25339,9 +25357,6 @@ var
   Prev, K1, K2, V: TNNetVolume;
   SeqLen, t, a, b, kk, jj, base, keyIdx, h, qOff, wOff, outOff: integer;
   q1, q2, OutPtr, Vptr: TNeuralFloatArrPtr;
-  SelA, SelB: array of integer;
-  CandScore: array of TNeuralFloat;
-  CandA, CandB: array of integer;
   nCand, gi, gbest: integer;
   SeqLenM1, HeadsM1, HalfKeysM1, TopKM1, ValueDimM1, nCandM1: integer;
   MaxScore, SumExp, sc, w: TNeuralFloat;
@@ -25354,11 +25369,6 @@ begin
   HalfKeysM1 := FHalfKeys - 1;
   TopKM1 := FTopK - 1;
   ValueDimM1 := FValueDim - 1;
-  SetLength(SelA, FTopK);
-  SetLength(SelB, FTopK);
-  SetLength(CandScore, FTopK * FTopK);
-  SetLength(CandA, FTopK * FTopK);
-  SetLength(CandB, FTopK * FTopK);
   for h := 0 to HeadsM1 do
   begin
     K1 := FNeurons[3 * h].FWeights;
@@ -25377,16 +25387,16 @@ begin
       for b := 0 to HalfKeysM1 do
         FS2[t, 0, b] := TNNetVolume.DotProduct(q2, K2.GetRawPtr(b, 0, 0), FHalfQ);
       // Top-TopK per half.
-      PKMTopKIndices(FS1.GetRawPtr(t, 0, 0), FHalfKeys, FTopK, SelA);
-      PKMTopKIndices(FS2.GetRawPtr(t, 0, 0), FHalfKeys, FTopK, SelB);
+      PKMTopKIndices(FS1.GetRawPtr(t, 0, 0), FHalfKeys, FTopK, FSelABuf);
+      PKMTopKIndices(FS2.GetRawPtr(t, 0, 0), FHalfKeys, FTopK, FSelBBuf);
       // TopK x TopK candidate combinations, scored s1[a] + s2[b].
       nCand := 0;
       for a := 0 to TopKM1 do
         for b := 0 to TopKM1 do
         begin
-          CandScore[nCand] := FS1[t, 0, SelA[a]] + FS2[t, 0, SelB[b]];
-          CandA[nCand] := SelA[a];
-          CandB[nCand] := SelB[b];
+          FCandScoreBuf[nCand] := FS1[t, 0, FSelABuf[a]] + FS2[t, 0, FSelBBuf[b]];
+          FCandABuf[nCand] := FSelABuf[a];
+          FCandBBuf[nCand] := FSelBBuf[b];
           Inc(nCand);
         end;
       // Pick the global top-TopK of the candidates (partial selection sort).
@@ -25396,14 +25406,14 @@ begin
       begin
         gbest := -1;
         for gi := 0 to nCandM1 do
-          if (CandA[gi] >= 0) and
-             ((gbest = -1) or (CandScore[gi] > CandScore[gbest])) then
+          if (FCandABuf[gi] >= 0) and
+             ((gbest = -1) or (FCandScoreBuf[gi] > FCandScoreBuf[gbest])) then
             gbest := gi;
-        FIdxA[base + kk] := CandA[gbest];
-        FIdxB[base + kk] := CandB[gbest];
-        FIdxKey[base + kk] := CandA[gbest] * FHalfKeys + CandB[gbest];
-        FW[t, 0, wOff + kk] := CandScore[gbest]; // store raw score; softmax below
-        CandA[gbest] := -1;                      // mark consumed
+        FIdxA[base + kk] := FCandABuf[gbest];
+        FIdxB[base + kk] := FCandBBuf[gbest];
+        FIdxKey[base + kk] := FCandABuf[gbest] * FHalfKeys + FCandBBuf[gbest];
+        FW[t, 0, wOff + kk] := FCandScoreBuf[gbest]; // store raw score; softmax below
+        FCandABuf[gbest] := -1;                      // mark consumed
       end;
       // Softmax over the TopK selected combination scores (this head).
       MaxScore := -1e30;
@@ -25442,8 +25452,6 @@ var
   SeqLenM1, HeadsM1, TopKM1, ThreeHeadsM1: integer;
   hasInputGrad: boolean;
   q1, q2, dq1, dq2, dOut, Vptr: TNeuralFloatArrPtr;
-  G: array of TNeuralFloat;       // g_k = dOut . V[keyIdx_k]
-  dScore: array of TNeuralFloat;  // softmax-Jacobian score gradient
   SumWG, w, ds: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -25460,8 +25468,6 @@ begin
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
-  SetLength(G, FTopK);
-  SetLength(dScore, FTopK);
   for h := 0 to HeadsM1 do
   begin
     K1 := FNeurons[3 * h].FWeights;
@@ -25487,16 +25493,16 @@ begin
         keyIdx := FIdxKey[base + kk];
         w := FW[t, 0, wOff + kk];
         Vptr := V.GetRawPtr(keyIdx, 0, 0);
-        G[kk] := TNNetVolume.DotProduct(dOut, Vptr, FValueDim);
+        FGBuf[kk] := TNNetVolume.DotProduct(dOut, Vptr, FValueDim);
         TNNetVolume.MulAdd(FGradV.GetRawPtr(keyIdx, 0, 0), dOut, w, FValueDim);
       end;
       // Exact softmax Jacobian over the selected TopK:
       //   dScore_k = w_k * (g_k - sum_j w_j g_j).
       SumWG := 0;
       for kk := 0 to TopKM1 do
-        SumWG := SumWG + FW[t, 0, wOff + kk] * G[kk];
+        SumWG := SumWG + FW[t, 0, wOff + kk] * FGBuf[kk];
       for kk := 0 to TopKM1 do
-        dScore[kk] := FW[t, 0, wOff + kk] * (G[kk] - SumWG);
+        FdScoreBuf[kk] := FW[t, 0, wOff + kk] * (FGBuf[kk] - SumWG);
       // Combination score s_k = s1[a_k] + s2[b_k], with
       //   s1[a] = q1 . K1[a],  s2[b] = q2 . K2[b].
       // So dScore_k flows into BOTH halves:
@@ -25513,7 +25519,7 @@ begin
       end;
       for kk := 0 to TopKM1 do
       begin
-        ds := dScore[kk];
+        ds := FdScoreBuf[kk];
         if ds = 0 then continue;
         a := FIdxA[base + kk];
         b := FIdxB[base + kk];
@@ -45709,6 +45715,7 @@ begin
   FGn.Free; FGc.Free; FNv.Free; FC.Free; FCq.Free;
   FRawDen.Free; FDen.Free; FM.Free; FLf.Free; FLi.Free; FFp.Free; FIp.Free;
   FO.Free; FV.Free; FKey.Free; FQ.Free;
+  SetLength(FgqBuf, 0); SetLength(FgkvBuf, 0); SetLength(FgvvBuf, 0);
   inherited Destroy();
 end;
 
@@ -45751,6 +45758,7 @@ begin
   for ii := 0 to 3 do FGradW[ii].ReSize(Depth, 1, Depth);
   FGradWi.ReSize(1, 1, Depth); FGradWf.ReSize(1, 1, Depth);
   FGradBo.ReSize(1, 1, Depth);
+  SetLength(FgqBuf, Depth); SetLength(FgkvBuf, Depth); SetLength(FgvvBuf, Depth);
   InitDefault();
 end;
 
@@ -45864,7 +45872,6 @@ var
   gov, gcq, gov_pre, gip, gfp, gscat, cPrevVal, nPrevVal: TNeuralFloat;
   gm, gmNext, mPrev: TNeuralFloat;
   forgetBranch: boolean;
-  gq, gkv, gvv: array of TNeuralFloat;
   PrevErr: TNNetVolume;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -45881,7 +45888,6 @@ begin
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
-  SetLength(gq, Depth); SetLength(gkv, Depth); SetLength(gvv, Depth);
   FGc.Fill(0); FGn.Fill(0);
   for j := 0 to 3 do FGradW[j].Fill(0);
   FGradWi.Fill(0); FGradWf.Fill(0); FGradBo.Fill(0);
@@ -45902,7 +45908,7 @@ begin
     den := FDen.FData[t]; rawDen := FRawDen.FData[t];
     if hasInputGrad then PrevErrPtr := PrevErr.GetRawPtr(t, 0, 0)
     else PrevErrPtr := nil;
-    for d := 0 to DepthM1 do begin gq[d] := 0; gkv[d] := 0; gvv[d] := 0; end;
+    for d := 0 to DepthM1 do begin FgqBuf[d] := 0; FgkvBuf[d] := 0; FgvvBuf[d] := 0; end;
     // Read-out: h[d] = o[d] * Cq[d] / den.
     gden := 0;
     for d := 0 to DepthM1 do
@@ -45926,7 +45932,7 @@ begin
       for e := 0 to DepthM1 do
       begin
         FGc.FData[d * Depth + e] := FGc.FData[d * Depth + e] + gcq * FQ.FData[baseT + e];
-        gq[e] := gq[e] + gcq * FC.FData[baseC + d * Depth + e];
+        FgqBuf[e] := FgqBuf[e] + gcq * FC.FData[baseC + d * Depth + e];
       end;
     end;
     // den = max(|rawDen|,1): grad flows to rawDen only when not clamped.
@@ -45939,7 +45945,7 @@ begin
     for e := 0 to DepthM1 do
     begin
       FGn.FData[e] := FGn.FData[e] + gdenRaw * FQ.FData[baseT + e];
-      gq[e] := gq[e] + gdenRaw * FNv.FData[baseT + e];
+      FgqBuf[e] := FgqBuf[e] + gdenRaw * FNv.FData[baseT + e];
     end;
     // Now FGc = dL/dC_t (full), FGn = dL/dn_t (full).
     // C_t = f'_t C_{t-1} + i'_t v_t k_t^T ; n_t = f'_t n_{t-1} + i'_t k_t.
@@ -45947,8 +45953,8 @@ begin
     for d := 0 to DepthM1 do
       for e := 0 to DepthM1 do
       begin
-        gvv[d] := gvv[d] + FGc.FData[d * Depth + e] * ip * FKey.FData[baseT + e];
-        gkv[e] := gkv[e] + FGc.FData[d * Depth + e] * ip * FV.FData[baseT + d];
+        FgvvBuf[d] := FgvvBuf[d] + FGc.FData[d * Depth + e] * ip * FKey.FData[baseT + e];
+        FgkvBuf[e] := FgkvBuf[e] + FGc.FData[d * Depth + e] * ip * FV.FData[baseT + d];
         gip := gip + FGc.FData[d * Depth + e] * FV.FData[baseT + d] * FKey.FData[baseT + e];
         if t > 0 then cPrevVal := FC.FData[baseC - Depth * Depth + d * Depth + e]
         else cPrevVal := 0;
@@ -45956,7 +45962,7 @@ begin
       end;
     for e := 0 to DepthM1 do
     begin
-      gkv[e] := gkv[e] + FGn.FData[e] * ip;
+      FgkvBuf[e] := FgkvBuf[e] + FGn.FData[e] * ip;
       gip := gip + FGn.FData[e] * FKey.FData[baseT + e];
       if t > 0 then nPrevVal := FNv.FData[baseT - Depth + e] else nPrevVal := 0;
       gfp := gfp + FGn.FData[e] * nPrevVal;
@@ -46013,15 +46019,15 @@ begin
       WvR := Wv.GetRawPtr(d, 0, 0);
       GWqR := FGradW[0].GetRawPtr(d, 0, 0); GWkR := FGradW[1].GetRawPtr(d, 0, 0);
       GWvR := FGradW[2].GetRawPtr(d, 0, 0);
-      gscat := gkv[d] * FScale;  // dL/d(raw k_t[d])
+      gscat := FgkvBuf[d] * FScale;  // dL/d(raw k_t[d])
       for j := 0 to DepthM1 do
       begin
-        GWqR^[j] := GWqR^[j] + gq[d]  * XtPtr^[j];
+        GWqR^[j] := GWqR^[j] + FgqBuf[d]  * XtPtr^[j];
         GWkR^[j] := GWkR^[j] + gscat  * XtPtr^[j];
-        GWvR^[j] := GWvR^[j] + gvv[d] * XtPtr^[j];
+        GWvR^[j] := GWvR^[j] + FgvvBuf[d] * XtPtr^[j];
         if hasInputGrad then
           PrevErrPtr^[j] := PrevErrPtr^[j] +
-            gq[d] * WqR^[j] + gscat * WkR^[j] + gvv[d] * WvR^[j];
+            FgqBuf[d] * WqR^[j] + gscat * WkR^[j] + FgvvBuf[d] * WvR^[j];
       end;
     end;
   end;
@@ -47139,6 +47145,8 @@ begin
   FGradWb.Free; FGradWv.Free; FGradWk.Free; FGradWq.Free;
   FGS.Free; FS.Free; FErr.Free; FBeta.Free; FKnorm.Free;
   FKraw.Free; FKey.Free; FV.Free; FQ.Free;
+  SetLength(FgqBuf, 0); SetLength(FgvBuf, 0);
+  SetLength(FgknBuf, 0); SetLength(FgkrawBuf, 0);
   inherited Destroy();
 end;
 
@@ -47175,6 +47183,8 @@ begin
   FGS.ReSize(Depth, 1, Depth);
   FGradWq.ReSize(Depth, 1, Depth); FGradWk.ReSize(Depth, 1, Depth);
   FGradWv.ReSize(Depth, 1, Depth); FGradWb.ReSize(1, 1, Depth);
+  SetLength(FgqBuf, Depth); SetLength(FgvBuf, Depth);
+  SetLength(FgknBuf, Depth); SetLength(FgkrawBuf, Depth);
   InitDefault();
 end;
 
@@ -47270,7 +47280,6 @@ var
   GyPtr, XtPtr, PrevErrPtr: TNeuralFloatArrPtr;
   WqR, WkR, WvR, GWqR, GWkR, GWvR: TNeuralFloatArrPtr;
   betav, knrm, gbeta_pre, gbetav, kdotgkn, sPrev: TNeuralFloat;
-  gq, gv, gkn, gkraw: array of TNeuralFloat; // grads wrt q,v,normalized k,raw k
   PrevErr: TNNetVolume;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -47287,8 +47296,6 @@ begin
     (FPrevLayer.FOutput.Size > 0);
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
-  SetLength(gq, Depth); SetLength(gv, Depth);
-  SetLength(gkn, Depth); SetLength(gkraw, Depth);
   FGS.Fill(0);
   FGradWq.Fill(0); FGradWk.Fill(0); FGradWv.Fill(0); FGradWb.Fill(0);
   // Right-to-left BPTT. FGS carries dL/dS_t (DepthxDepth) arriving from the
@@ -47305,14 +47312,14 @@ begin
     else PrevErrPtr := nil;
     for d := 0 to DepthM1 do
     begin
-      gq[d] := 0; gv[d] := 0; gkn[d] := 0; gkraw[d] := 0;
+      FgqBuf[d] := 0; FgvBuf[d] := 0; FgknBuf[d] := 0; FgkrawBuf[d] := 0;
     end;
     // Read-out y_t[e] = sum_d S_t[d,e] q_t[d]: scatter into dL/dS_t (+carry) and dL/dq.
     for e := 0 to DepthM1 do
       for d := 0 to DepthM1 do
       begin
         FGS.FData[d * Depth + e] := FGS.FData[d * Depth + e] + GyPtr^[e] * FQ.FData[baseT + d];
-        gq[d] := gq[d] + GyPtr^[e] * FS.FData[baseS + d * Depth + e];
+        FgqBuf[d] := FgqBuf[d] + GyPtr^[e] * FS.FData[baseS + d * Depth + e];
       end;
     // Now FGS = dL/dS_t (full). Write: S_t[d,e] = S_{t-1}[d,e] + beta*k[d]*err[e].
     // dL/dbeta, dL/dk (via write), dL/derr, and the carry dL/dS_{t-1} = FGS
@@ -47322,21 +47329,21 @@ begin
       for e := 0 to DepthM1 do
       begin
         gbetav := gbetav + FGS.FData[d * Depth + e] * FKey.FData[baseT + d] * FErr.FData[baseT + e];
-        gkn[d] := gkn[d] + FGS.FData[d * Depth + e] * betav * FErr.FData[baseT + e];
-        gv[e] := gv[e] + FGS.FData[d * Depth + e] * betav * FKey.FData[baseT + d]; // via err=v-pred
+        FgknBuf[d] := FgknBuf[d] + FGS.FData[d * Depth + e] * betav * FErr.FData[baseT + e];
+        FgvBuf[e] := FgvBuf[e] + FGS.FData[d * Depth + e] * betav * FKey.FData[baseT + d]; // via err=v-pred
       end;
     // err_t = v_t - S_{t-1}^T k_t. The -pred term feeds dL/dk and dL/dS_{t-1}.
-    // gerr[e] (= gv[e] here, since d err/d v = +1) propagates: pred[e]=sum_d S_{t-1}[d,e] k[d].
+    // gerr[e] (= FgvBuf[e] here, since d err/d v = +1) propagates: pred[e]=sum_d S_{t-1}[d,e] k[d].
     if t > 0 then
     begin
       for e := 0 to DepthM1 do
         for d := 0 to DepthM1 do
         begin
           sPrev := FS.FData[baseS - Depth * Depth + d * Depth + e];
-          // d pred[e]/d k[d] = S_{t-1}[d,e]; err = v - pred -> chain -gv[e].
-          gkn[d] := gkn[d] - gv[e] * sPrev;
+          // d pred[e]/d k[d] = S_{t-1}[d,e]; err = v - pred -> chain -FgvBuf[e].
+          FgknBuf[d] := FgknBuf[d] - FgvBuf[e] * sPrev;
           // d pred[e]/d S_{t-1}[d,e] = k[d]; carry into dL/dS_{t-1}.
-          FGS.FData[d * Depth + e] := FGS.FData[d * Depth + e] - gv[e] * FKey.FData[baseT + d];
+          FGS.FData[d * Depth + e] := FGS.FData[d * Depth + e] - FgvBuf[e] * FKey.FData[baseT + d];
         end;
     end;
     // (FGS now holds dL/dS_{t-1}: the +S_{t-1} write term contributes identity,
@@ -47351,9 +47358,9 @@ begin
     end;
     // k_t = kraw / ||kraw||: backprop the L2 normalization (gkn -> gkraw).
     kdotgkn := 0;
-    for d := 0 to DepthM1 do kdotgkn := kdotgkn + gkn[d] * FKey.FData[baseT + d];
+    for d := 0 to DepthM1 do kdotgkn := kdotgkn + FgknBuf[d] * FKey.FData[baseT + d];
     for d := 0 to DepthM1 do
-      gkraw[d] := (gkn[d] - FKey.FData[baseT + d] * kdotgkn) / knrm;
+      FgkrawBuf[d] := (FgknBuf[d] - FKey.FData[baseT + d] * kdotgkn) / knrm;
     // q_t = scale*(W_q x_t); k_raw = W_k x_t; v_t = W_v x_t.
     for d := 0 to DepthM1 do
     begin
@@ -47361,15 +47368,15 @@ begin
       WvR := Wv.GetRawPtr(d, 0, 0);
       GWqR := FGradWq.GetRawPtr(d, 0, 0); GWkR := FGradWk.GetRawPtr(d, 0, 0);
       GWvR := FGradWv.GetRawPtr(d, 0, 0);
-      gq[d] := gq[d] * FScale;
+      FgqBuf[d] := FgqBuf[d] * FScale;
       for j := 0 to DepthM1 do
       begin
-        GWqR^[j] := GWqR^[j] + gq[d] * XtPtr^[j];
-        GWkR^[j] := GWkR^[j] + gkraw[d] * XtPtr^[j];
-        GWvR^[j] := GWvR^[j] + gv[d] * XtPtr^[j];
+        GWqR^[j] := GWqR^[j] + FgqBuf[d] * XtPtr^[j];
+        GWkR^[j] := GWkR^[j] + FgkrawBuf[d] * XtPtr^[j];
+        GWvR^[j] := GWvR^[j] + FgvBuf[d] * XtPtr^[j];
         if hasInputGrad then
           PrevErrPtr^[j] := PrevErrPtr^[j] +
-            gq[d] * WqR^[j] + gkraw[d] * WkR^[j] + gv[d] * WvR^[j];
+            FgqBuf[d] * WqR^[j] + FgkrawBuf[d] * WkR^[j] + FgvBuf[d] * WvR^[j];
       end;
     end;
   end;
@@ -47685,6 +47692,8 @@ begin
   FGradBa.Free; FGradWa.Free; FGradWv.Free; FGradWk.Free; FGradWq.Free;
   FGS.Free; FS.Free; FAlpha.Free; FKnorm.Free; FKraw.Free; FKey.Free;
   FV.Free; FQ.Free;
+  SetLength(FgqBuf, 0); SetLength(FgvBuf, 0); SetLength(FgknBuf, 0);
+  SetLength(FgkrawBuf, 0); SetLength(FgaBuf, 0);
   inherited Destroy();
 end;
 
@@ -47725,6 +47734,8 @@ begin
   FGradWq.ReSize(Depth, 1, Depth); FGradWk.ReSize(Depth, 1, Depth);
   FGradWv.ReSize(Depth, 1, Depth); FGradWa.ReSize(Depth, 1, Depth);
   FGradBa.ReSize(1, 1, Depth);
+  SetLength(FgqBuf, Depth); SetLength(FgvBuf, Depth); SetLength(FgknBuf, Depth);
+  SetLength(FgkrawBuf, Depth); SetLength(FgaBuf, Depth);
   InitDefault();
 end;
 
@@ -47809,7 +47820,6 @@ var
   GyPtr, XtPtr, PrevErrPtr: TNeuralFloatArrPtr;
   WqR, WkR, WvR, WaR, GWqR, GWkR, GWvR, GWaR: TNeuralFloatArrPtr;
   knrm, kdotgkn, alphad, ga_pre, sPrev: TNeuralFloat;
-  gq, gv, gkn, gkraw, ga: array of TNeuralFloat; // grads wrt q,v,normK,rawK,alpha
   PrevErr: TNNetVolume;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -47827,8 +47837,6 @@ begin
     (FPrevLayer.FOutput.Size > 0);
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
-  SetLength(gq, Depth); SetLength(gv, Depth);
-  SetLength(gkn, Depth); SetLength(gkraw, Depth); SetLength(ga, Depth);
   FGS.Fill(0);
   FGradWq.Fill(0); FGradWk.Fill(0); FGradWv.Fill(0); FGradWa.Fill(0);
   FGradBa.Fill(0);
@@ -47845,14 +47853,14 @@ begin
     else PrevErrPtr := nil;
     for d := 0 to DepthM1 do
     begin
-      gq[d] := 0; gv[d] := 0; gkn[d] := 0; gkraw[d] := 0; ga[d] := 0;
+      FgqBuf[d] := 0; FgvBuf[d] := 0; FgknBuf[d] := 0; FgkrawBuf[d] := 0; FgaBuf[d] := 0;
     end;
     // Read-out y_t[e] = sum_d q_t[d]*S_t[d,e]: scatter into dL/dS_t (+carry) and dL/dq.
     for e := 0 to DepthM1 do
       for d := 0 to DepthM1 do
       begin
         FGS.FData[d * Depth + e] := FGS.FData[d * Depth + e] + GyPtr^[e] * FQ.FData[baseT + d];
-        gq[d] := gq[d] + GyPtr^[e] * FS.FData[baseS + d * Depth + e];
+        FgqBuf[d] := FgqBuf[d] + GyPtr^[e] * FS.FData[baseS + d * Depth + e];
       end;
     // Now FGS = dL/dS_t (full). Write: S_t[d,e] = alpha[d]*S_{t-1}[d,e] + k[d]*v[e].
     // dL/dk, dL/dv (via the outer product), dL/dalpha and the carry dL/dS_{t-1}
@@ -47862,12 +47870,12 @@ begin
       alphad := FAlpha.FData[baseT + d];
       for e := 0 to DepthM1 do
       begin
-        gkn[d] := gkn[d] + FGS.FData[d * Depth + e] * FV.FData[baseT + e];
-        gv[e] := gv[e] + FGS.FData[d * Depth + e] * FKey.FData[baseT + d];
+        FgknBuf[d] := FgknBuf[d] + FGS.FData[d * Depth + e] * FV.FData[baseT + e];
+        FgvBuf[e] := FgvBuf[e] + FGS.FData[d * Depth + e] * FKey.FData[baseT + d];
         if t > 0 then
         begin
           sPrev := FS.FData[baseS - Depth * Depth + d * Depth + e];
-          ga[d] := ga[d] + FGS.FData[d * Depth + e] * sPrev;
+          FgaBuf[d] := FgaBuf[d] + FGS.FData[d * Depth + e] * sPrev;
         end;
       end;
       // Carry dL/dS_{t-1}[d,e] = alpha[d] * dL/dS_t[d,e] (row-scaled by the gate).
@@ -47879,7 +47887,7 @@ begin
     for d := 0 to DepthM1 do
     begin
       alphad := FAlpha.FData[baseT + d];
-      ga_pre := ga[d] * alphad * (1 - alphad);
+      ga_pre := FgaBuf[d] * alphad * (1 - alphad);
       FGradBa.FData[d] := FGradBa.FData[d] + ga_pre;
       WaR := Wa.GetRawPtr(d, 0, 0);
       GWaR := FGradWa.GetRawPtr(d, 0, 0);
@@ -47891,9 +47899,9 @@ begin
     end;
     // k_t = kraw / ||kraw||: backprop the L2 normalization (gkn -> gkraw).
     kdotgkn := 0;
-    for d := 0 to DepthM1 do kdotgkn := kdotgkn + gkn[d] * FKey.FData[baseT + d];
+    for d := 0 to DepthM1 do kdotgkn := kdotgkn + FgknBuf[d] * FKey.FData[baseT + d];
     for d := 0 to DepthM1 do
-      gkraw[d] := (gkn[d] - FKey.FData[baseT + d] * kdotgkn) / knrm;
+      FgkrawBuf[d] := (FgknBuf[d] - FKey.FData[baseT + d] * kdotgkn) / knrm;
     // q_t = scale*(W_q x_t); k_raw = W_k x_t; v_t = W_v x_t.
     for d := 0 to DepthM1 do
     begin
@@ -47901,15 +47909,15 @@ begin
       WvR := Wv.GetRawPtr(d, 0, 0);
       GWqR := FGradWq.GetRawPtr(d, 0, 0); GWkR := FGradWk.GetRawPtr(d, 0, 0);
       GWvR := FGradWv.GetRawPtr(d, 0, 0);
-      gq[d] := gq[d] * FScale;
+      FgqBuf[d] := FgqBuf[d] * FScale;
       for j := 0 to DepthM1 do
       begin
-        GWqR^[j] := GWqR^[j] + gq[d] * XtPtr^[j];
-        GWkR^[j] := GWkR^[j] + gkraw[d] * XtPtr^[j];
-        GWvR^[j] := GWvR^[j] + gv[d] * XtPtr^[j];
+        GWqR^[j] := GWqR^[j] + FgqBuf[d] * XtPtr^[j];
+        GWkR^[j] := GWkR^[j] + FgkrawBuf[d] * XtPtr^[j];
+        GWvR^[j] := GWvR^[j] + FgvBuf[d] * XtPtr^[j];
         if hasInputGrad then
           PrevErrPtr^[j] := PrevErrPtr^[j] +
-            gq[d] * WqR^[j] + gkraw[d] * WkR^[j] + gv[d] * WvR^[j];
+            FgqBuf[d] * WqR^[j] + FgkrawBuf[d] * WkR^[j] + FgvBuf[d] * WvR^[j];
       end;
     end;
   end;
@@ -47998,6 +48006,8 @@ begin
   FGM.Free; FM.Free; FMhist.Free; FMnorm.Free; FKnorm.Free;
   FSim.Free; FW.Free; FAdd.Free; FErase.Free; FPreBeta.Free;
   FBeta.Free; FKey.Free;
+  SetLength(FgWArrBuf, 0); SetLength(FgScoreArrBuf, 0);
+  SetLength(FgEArrBuf, 0); SetLength(FgAArrBuf, 0);
   inherited Destroy();
 end;
 
@@ -48054,6 +48064,8 @@ begin
   FGradWb.ReSize(FNeurons[2].FWeights); FGradBb.ReSize(FNeurons[3].FWeights);
   FGradWe.ReSize(FNeurons[4].FWeights); FGradBe.ReSize(FNeurons[5].FWeights);
   FGradWa.ReSize(FNeurons[6].FWeights); FGradBa.ReSize(FNeurons[7].FWeights);
+  SetLength(FgWArrBuf, FNumSlots); SetLength(FgScoreArrBuf, FNumSlots);
+  SetLength(FgEArrBuf, FSlotWidth); SetLength(FgAArrBuf, FSlotWidth);
   InitMemory();
   InitDefault();
 end;
@@ -48187,7 +48199,6 @@ var
   WkR, WeR, WaR, GWkR, GWeR, GWaR: TNeuralFloatArrPtr;
   betaV, kn, wv, ev, av, gw, gsim, gbeta, gpreBeta: TNeuralFloat;
   gk, gdot, gMcell, mn, sumWG, gEc, gAc, prevM: TNeuralFloat;
-  gWArr, gScoreArr, gEArr, gAArr: array of TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -48207,10 +48218,6 @@ begin
   FGM.Fill(0);
   FGradWk.Fill(0); FGradBk.Fill(0); FGradWb.Fill(0); FGradBb.Fill(0);
   FGradWe.Fill(0); FGradBe.Fill(0); FGradWa.Fill(0); FGradBa.Fill(0);
-  SetLength(gWArr, FNumSlots);
-  SetLength(gScoreArr, FNumSlots);
-  SetLength(gEArr, FSlotWidth);
-  SetLength(gAArr, FSlotWidth);
   // Right-to-left BPTT. FGM carries dL/dM_t (the post-step-t memory, which is the
   // memory fed to step t+1) into step t. At step t the write maps M_{t-1} -> M_t,
   // so we pull FGM (= dL/dM_t) back through the erase/add to dL/dM_{t-1}, dL/dw,
@@ -48230,8 +48237,8 @@ begin
     kn := FKnorm.FData[t];
     if hasInputGrad then PrevErrPtr := PrevErr.GetRawPtr(t, 0, 0)
     else PrevErrPtr := nil;
-    for i := 0 to NumSlotsM1 do gWArr[i] := 0;
-    for c := 0 to SlotWidthM1 do begin gEArr[c] := 0; gAArr[c] := 0; end;
+    for i := 0 to NumSlotsM1 do FgWArrBuf[i] := 0;
+    for c := 0 to SlotWidthM1 do begin FgEArrBuf[c] := 0; FgAArrBuf[c] := 0; end;
     // --- (1) Write backward: M_t[i,c] = M_{t-1}[i,c]*(1 - w*e) + w*a, with
     // gMnew := dL/dM_t taken from FGM BEFORE we overwrite it in place.
     //   dL/dw[i]        += sum_c gMnew * (a - M_{t-1}*e)
@@ -48247,9 +48254,9 @@ begin
       begin
         ev := EPtr^[c]; av := APtr^[c]; prevM := MiPtr^[c];
         gMcell := GMiPtr^[c];                       // dL/dM_t[i,c] (= gMnew)
-        gWArr[i] := gWArr[i] + gMcell * (av - prevM * ev);
-        gEArr[c] := gEArr[c] + gMcell * (-wv * prevM);
-        gAArr[c] := gAArr[c] + gMcell * wv;
+        FgWArrBuf[i] := FgWArrBuf[i] + gMcell * (av - prevM * ev);
+        FgEArrBuf[c] := FgEArrBuf[c] + gMcell * (-wv * prevM);
+        FgAArrBuf[c] := FgAArrBuf[c] + gMcell * wv;
         GMiPtr^[c] := gMcell * (1 - wv * ev);       // -> dL/dM_{t-1}[i,c] (write)
       end;
     end;
@@ -48267,15 +48274,15 @@ begin
         gw := gw + GyPtr^[c] * MiPtr^[c];
         GMiPtr^[c] := GMiPtr^[c] + GyPtr^[c] * wv;
       end;
-      gWArr[i] := gWArr[i] + gw;
+      FgWArrBuf[i] := FgWArrBuf[i] + gw;
     end;
     // --- (3) Fold e/a gradients into their projections. e_t = sigmoid(preE),
     // a_t = linear. dpreE = gE * e*(1-e).
     for c := 0 to SlotWidthM1 do
     begin
       ev := EPtr^[c];
-      gEc := gEArr[c] * ev * (1 - ev);              // -> dL/dpreE[c]
-      gAc := gAArr[c];                              // a_t is linear
+      gEc := FgEArrBuf[c] * ev * (1 - ev);              // -> dL/dpreE[c]
+      gAc := FgAArrBuf[c];                              // a_t is linear
       FGradBe.FData[c] := FGradBe.FData[c] + gEc;
       FGradBa.FData[c] := FGradBa.FData[c] + gAc;
       WeR := We.GetRawPtr(c, 0, 0); GWeR := FGradWe.GetRawPtr(c, 0, 0);
@@ -48290,26 +48297,26 @@ begin
           PrevErrPtr^[j] := PrevErrPtr^[j] + gEc * WeR^[j] + gAc * WaR^[j];
     end;
     // --- (4) Softmax backward: w = softmax(score), score[i] = beta*sim[i]. ---
-    //   dL/dscore[i] = w[i]*(gWArr[i] - sum_j w[j]*gWArr[j])
+    //   dL/dscore[i] = w[i]*(FgWArrBuf[i] - sum_j w[j]*FgWArrBuf[j])
     sumWG := 0;
-    for i := 0 to NumSlotsM1 do sumWG := sumWG + WPtr^[i] * gWArr[i];
+    for i := 0 to NumSlotsM1 do sumWG := sumWG + WPtr^[i] * FgWArrBuf[i];
     gbeta := 0;
     for i := 0 to NumSlotsM1 do
     begin
-      gScoreArr[i] := WPtr^[i] * (gWArr[i] - sumWG);
-      gbeta := gbeta + gScoreArr[i] * SimPtr^[i];   // score = beta*sim -> dL/dbeta
+      FgScoreArrBuf[i] := WPtr^[i] * (FgWArrBuf[i] - sumWG);
+      gbeta := gbeta + FgScoreArrBuf[i] * SimPtr^[i];   // score = beta*sim -> dL/dbeta
     end;
     // --- (5) sim backward into k and M_{t-1}. sim[i] = dot/(kn*mn),
     //   dot = sum_c k[c]*M[i,c], kn=||k||, mn=||M[i]||.
     //   dL/dk[c] = sum_i gsim_i * (M[i,c]/(kn*mn) - sim_i*k[c]/kn^2)
     //   dL/dM[i,c] += gsim_i * (k[c]/(kn*mn) - sim_i*M[i,c]/mn^2)
-    // where gsim_i = beta * gScoreArr[i].
+    // where gsim_i = beta * FgScoreArrBuf[i].
     for c := 0 to SlotWidthM1 do
     begin
       gk := 0;
       for i := 0 to NumSlotsM1 do
       begin
-        gsim := betaV * gScoreArr[i];
+        gsim := betaV * FgScoreArrBuf[i];
         MiPtr := FMhist.GetRawPtr(t * FNumSlots + i, 0, 0);
         mn := MnPtr^[i];
         gdot := gsim / (kn * mn);
@@ -48328,7 +48335,7 @@ begin
     // dL/dM_{t-1}[i,c] from sim path.
     for i := 0 to NumSlotsM1 do
     begin
-      gsim := betaV * gScoreArr[i];
+      gsim := betaV * FgScoreArrBuf[i];
       MiPtr := FMhist.GetRawPtr(t * FNumSlots + i, 0, 0);
       GMiPtr := FGM.GetRawPtr(i, 0, 0);
       mn := MnPtr^[i];
