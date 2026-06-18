@@ -218,8 +218,10 @@ procedure BAXOr(var r, x, y: array of byte);
 { r := x XOR y }
 var
   Cont: longint;
+  Hi: longint;
 begin
-  for Cont := Low(r) to High(r) do
+  Hi := High(r);
+  for Cont := Low(r) to Hi do
     r[Cont] := x[Cont] xor y[Cont];
 end;
 
@@ -227,8 +229,10 @@ procedure BAOr(var r, x, y: array of byte);
 { r := x OR y }
 var
   Cont: longint;
+  Hi: longint;
 begin
-  for Cont := Low(r) to High(r) do
+  Hi := High(r);
+  for Cont := Low(r) to Hi do
     r[Cont] := x[Cont] or y[Cont];
 end;
 
@@ -236,8 +240,10 @@ procedure BAAnd(var r, x, y: array of byte);
 { r := x AND y }
 var
   Cont: longint;
+  Hi: longint;
 begin
-  for Cont := Low(r) to High(r) do
+  Hi := High(r);
+  for Cont := Low(r) to Hi do
     r[Cont] := x[Cont] and y[Cont];
 end;
 
@@ -245,8 +251,10 @@ procedure BANot(var VARS: array of byte);
 { NOT }
 var
   Cont: longint;
+  Hi: longint;
 begin
-  for Cont := Low(VARS) to High(VARS) do
+  Hi := High(VARS);
+  for Cont := Low(VARS) to Hi do
     VARS[Cont] := not (VARS[Cont]);
 end;
 
@@ -254,8 +262,10 @@ procedure BAClear(var VARS: array of byte);
 { limpa o valor }
 var
   Cont: longint;
+  Hi: longint;
 begin
-  for Cont := Low(VARS) to High(VARS) do
+  Hi := High(VARS);
+  for Cont := Low(VARS) to Hi do
     VARS[Cont] := 0;
 end;
 
@@ -295,10 +305,12 @@ procedure BASum(var x, y: array of byte);
 { soma registradores: x=x+y }
 var
   NumBytes: longint;
+  NumBytesM1: longint;
   Cont: longint;
 begin
   NumBytes := High(y) + 1;
-  for Cont := 0 to NumBytes - 1 do
+  NumBytesM1 := NumBytes - 1;
+  for Cont := 0 to NumBytesM1 do
   begin
     BASumWordPos(X, Cont, Y[Cont]);
   end;
@@ -327,10 +339,12 @@ procedure BASub(var x, y: array of byte);
 { soma registradores: x=x+y }
 var
   NumBytes: longint;
+  NumBytesM1: longint;
   Cont: longint;
 begin
   NumBytes := High(y) + 1;
-  for Cont := 0 to NumBytes - 1 do
+  NumBytesM1 := NumBytes - 1;
+  for Cont := 0 to NumBytesM1 do
   begin
     BASubBytePos(X, Cont, Y[Cont]);
   end;
@@ -454,13 +468,15 @@ procedure BANumFirstLast(var x: array of byte; var Num, First, Last: longint);
 { return the Number of 1s; the first 1; the last 1 }
 var
   NumBits: longint;
+  NumBitsM1: longint;
   ContX: longint;
 begin
   NumBits := (High(x) + 1) * 8;
+  NumBitsM1 := NumBits - 1;
   First := NumBits - 1;
   Last := 0;
   Num := 0;
-  for ContX := 0 to NumBits - 1 do
+  for ContX := 0 to NumBitsM1 do
   begin
     if BATest(x, ContX) then
     begin
@@ -623,12 +639,14 @@ function ROrer(var VARS: array of extended): extended;
   { calcula OR de todos os operandos }
 var
   NumVars: longint;
+  NumVarsM1: longint;
   R: extended;
   Cont: longint;
 begin
   R := 0; {elemento neutro do OR}
   NumVars := High(VARS) + 1;
-  for Cont := 0 to NumVars - 1 do
+  NumVarsM1 := NumVars - 1;
+  for Cont := 0 to NumVarsM1 do
     R := ROr(R, VARS[Cont]);
   ROrer := R;
 end; { of function }
@@ -637,12 +655,14 @@ function RAnder(var VARS: array of extended): extended;
   { calcula AND de todos os operandos }
 var
   NumVars: longint;
+  NumVarsM1: longint;
   R: extended;
   Cont: longint;
 begin
   R := 1; {elemento neutro do AND}
   NumVars := High(VARS) + 1;
-  for Cont := 0 to NumVars - 1 do
+  NumVarsM1 := NumVars - 1;
+  for Cont := 0 to NumVarsM1 do
     R := RAnd(R, VARS[Cont]);
   RAnder := R;
 end; { of function }
@@ -693,13 +713,15 @@ function RegOrdEqual(var x, y: array of extended): extended;
   { devolve nivel de igualdade entre 2 registradores usando relacao de ordem}
 var
   NumVars: longint;
+  NumVarsM1: longint;
   O1, O2: extended;
   Cont: longint;
 begin
   O1 := 0;
   O2 := 0;
   NumVars := High(y) + 1;
-  for Cont := 0 to NumVars - 1 do
+  NumVarsM1 := NumVars - 1;
+  for Cont := 0 to NumVarsM1 do
   begin
     O1 := O1 + x[Cont] * WPOW2[NumVars - Cont - 1];
     O2 := O2 + y[Cont] * WPOW2[NumVars - Cont - 1];
@@ -772,12 +794,14 @@ function RegToString(var VARS: array of extended): string;
   { transforma um registrador em string }
 var
   NumVars: longint;
+  NumVarsM1: longint;
   R: string;
   Cont: longint;
 begin
   R := ''; {elemento neutro da string}
   NumVars := High(VARS) + 1;
-  for Cont := 0 to NumVars - 1 do
+  NumVarsM1 := NumVars - 1;
+  for Cont := 0 to NumVarsM1 do
     if VARS[Cont] > 0.55 then
       R := R + '1'
     else if VARS[Cont] < 0.45 then
@@ -799,12 +823,14 @@ function ROrMaxTerm(var VARS: array of extended; NumMaxTerm: longint): extended;
   { termo maximo do Or }
 var
   NumVars: longint;
+  NumVarsM1: longint;
   R: extended;
   Cont: longint;
 begin
   R := 0; {elemento neutro do OR}
   NumVars := High(VARS) + 1;
-  for Cont := 0 to NumVars - 1 do
+  NumVarsM1 := NumVars - 1;
+  for Cont := 0 to NumVarsM1 do
   begin
     if LongintBitTest(NumMaxTerm, Cont) then
       R := ROr(R, VARS[Cont])
@@ -819,10 +845,12 @@ function ROrMaxTermStr(NumVars: longint; NumMaxTerm: longint): string;
   { string do termo maximo do or }
 var
   R: string;
+  NumVarsM1: longint;
   Cont: longint;
 begin
   R := ''; {elemento neutro da + em String}
-  for Cont := 0 to NumVars - 1 do
+  NumVarsM1 := NumVars - 1;
+  for Cont := 0 to NumVarsM1 do
   begin
     if Cont > 0 then
       R := R + ' ';
@@ -878,8 +906,10 @@ procedure RRegen(var VARS: array of extended);
 { regenera o valor }
 var
   Cont: longint;
+  Hi: longint;
 begin
-  for Cont := Low(VARS) to High(VARS) do
+  Hi := High(VARS);
+  for Cont := Low(VARS) to Hi do
   begin
     if VARS[Cont] > 0.5 then
       VARS[Cont] := 1
@@ -892,8 +922,10 @@ procedure RDegen(var VARS: array of extended);
 { degenera o valor }
 var
   Cont: longint;
+  Hi: longint;
 begin
-  for Cont := Low(VARS) to High(VARS) do
+  Hi := High(VARS);
+  for Cont := Low(VARS) to Hi do
   begin
     if VARS[Cont] > 0.5 then
       VARS[Cont] := 0.8
@@ -906,8 +938,10 @@ procedure RDegenP(var VARS: array of extended; P: extended);
 { degenera o valor usando parametro }
 var
   Cont: longint;
+  Hi: longint;
 begin
-  for Cont := Low(VARS) to High(VARS) do
+  Hi := High(VARS);
+  for Cont := Low(VARS) to Hi do
   begin
     if VARS[Cont] > 0.5 then
       VARS[Cont] := P
@@ -920,8 +954,10 @@ procedure Clear(var VARS: array of extended);
 { limpa o valor }
 var
   Cont: longint;
+  Hi: longint;
 begin
-  for Cont := Low(VARS) to High(VARS) do
+  Hi := High(VARS);
+  for Cont := Low(VARS) to Hi do
     VARS[Cont] := 0;
 end;
 

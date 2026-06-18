@@ -362,6 +362,7 @@ uses Classes, SysUtils, Math;
 procedure TTestsClass.DeleteOperation(operationIndex: integer);
 var
   I: integer;
+  NM2: integer;
 begin
   if operationIndex = Self.N - 1 then
     Dec(Self.N)
@@ -370,7 +371,8 @@ begin
     if (operationIndex >= 0) and (operationIndex < Self.N - 1) and
       (operationIndex < Self.N - 1) then
     begin
-      for I := operationIndex to Self.N - 2 do
+      NM2 := Self.N - 2;
+      for I := operationIndex to NM2 do
         Self.T[I] := Self.T[I + 1];
       Dec(Self.N);
     end
@@ -385,6 +387,7 @@ function TTestsClass.ToString: string;
 var
   S: TStringList;
   NCount: integer;
+  NM1: integer;
 begin
   Result := '';
   if (Self.N > 0) then
@@ -395,7 +398,8 @@ begin
     S.StrictDelimiter := true;
     S.Add( IntToStr(Self.TestBasePosition) );
     S.Add( IntToStr(Self.TestThreshold) );
-    for NCount := 0 to Self.N - 1 do
+    NM1 := Self.N - 1;
+    for NCount := 0 to NM1 do
     begin
       S.Add( Self.T[NCount].ToString() );
     end;
@@ -536,12 +540,14 @@ function TTestsClass.ToHumanString: string;
 var
   I: integer;
   R: string;
+  NM1: integer;
 begin
   R := '';
   if self.N > 0 then
   begin
     R := R + 'B=' + IntToStr(self.TestBasePosition) + ' ';
-    for I := 0 to self.N - 1 do
+    NM1 := self.N - 1;
+    for I := 0 to NM1 do
       R := R + ( self.T[I].ToHumanString() );
   end;
   result := R;
@@ -652,9 +658,11 @@ end;
 function getNonZeroElementsPos(InputLen: integer; var InputData: array of byte; var OutputData: TPositionArray):integer;
 var
   InputPos, OutputCount: integer;
+  InputLenM1: integer;
 begin
   OutputCount := 0;
-  for InputPos := 0 to InputLen - 1 do
+  InputLenM1 := InputLen - 1;
+  for InputPos := 0 to InputLenM1 do
   begin
     if InputData[InputPos] <> 0 then
     begin
@@ -778,6 +786,7 @@ var
   procedure IncludeBinaryTestsForNonZero;
   var
     I, MI: integer;
+    MIM1: integer;
     Pos1, Pos2: integer;
     NZPos1, NZPos2: integer;
     Val1, Val2: byte;
@@ -785,7 +794,8 @@ var
     if (LocalNonZeroPrevStatesCount >= 2) then
     begin
       MI := FCS.MaxTests;
-      for I := 0 to MI - 1 do
+      MIM1 := MI - 1;
+      for I := 0 to MIM1 do
       begin
         NZPos1 := random(LocalNonZeroPrevStatesCount);
         Pos1 := LocalNonZeroPrevStates[NZPos1];
@@ -814,6 +824,7 @@ var
   procedure IncludeBinaryTests;
   var
     I, MI: integer;
+    MIM1: integer;
     Pos1, Pos2: integer;
     Val1, Val2: byte;
 
@@ -821,8 +832,9 @@ var
     if (LocalNumberOfPreviousStates >= 2) then
     begin
       MI := FCS.MaxTests;
+      MIM1 := MI - 1;
 
-      for I := 0 to MI - 1 do
+      for I := 0 to MIM1 do
       begin
         if (FCS.Bidimensional) then
         begin
