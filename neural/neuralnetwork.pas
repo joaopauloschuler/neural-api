@@ -18631,10 +18631,10 @@ begin
       else
       begin
         expVal := pcr_expf(ax);
-        sp := Ln(1 + expVal);
+        sp := pcr_logf(1 + expVal);
         sig := expVal / (1 + expVal);
       end;
-      t := Tanh(sp);
+      t := pcr_tanhf(sp);
       FOutput.FData[i] := x * t;
       // dy/dx = t + x*(1 - t^2)*(alpha*sig).
       FOutputErrorDeriv.FData[i] := t + x * (1 - t * t) * (alpha * sig);
@@ -18651,7 +18651,7 @@ begin
       else if ax < -30 then
         sp := pcr_expf(ax)
       else
-        sp := Ln(1 + pcr_expf(ax));
+        sp := pcr_logf(1 + pcr_expf(ax));
       FOutput.FData[i] := x * pcr_tanhf(sp);
     end;
   end;
@@ -18697,10 +18697,10 @@ begin
     else
     begin
       expVal := pcr_expf(ax);
-      sp := Ln(1 + expVal);
+      sp := pcr_logf(1 + expVal);
       sig := expVal / (1 + expVal);
     end;
-    t := Tanh(sp);
+    t := pcr_tanhf(sp);
     gradAlpha := gradAlpha + FOutputError.Raw[i] * x * x * (1 - t * t) * sig;
   end;
   localNeuron.FDelta.Raw[0] := localNeuron.FDelta.Raw[0] +
@@ -18734,10 +18734,10 @@ begin
       else
       begin
         expVal := pcr_expf(ax);
-        sp := Ln(1 + expVal);
+        sp := pcr_logf(1 + expVal);
         sig := expVal / (1 + expVal);
       end;
-      t := Tanh(sp);
+      t := pcr_tanhf(sp);
       FPrevLayer.FOutputError.Raw[i] := FPrevLayer.FOutputError.Raw[i] +
         FOutputError.Raw[i] * (t + x * (1 - t * t) * (alpha * sig));
     end;
@@ -19033,7 +19033,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      tanhVal := Tanh(x);
+      tanhVal := pcr_tanhf(x);
       sech2 := 1 - tanhVal * tanhVal;
       if x > 0 then
       begin
@@ -19053,7 +19053,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      tanhVal := Tanh(x);
+      tanhVal := pcr_tanhf(x);
       if x > 0 then
         FOutput.FData[OutputCnt] := tanhVal
       else
@@ -20812,8 +20812,8 @@ begin
       else if P > 1.0 - cFocalEps then P := 1.0 - cFocalEps;
       OneMinusP := 1.0 - P;
       // dL/dp_t = alpha * (1-p)^(gamma-1) * [gamma * p * log(p) - (1-p)] / p
-      Grad := Alpha * Power(OneMinusP, Gamma - 1.0) *
-              (Gamma * P * Ln(P) - OneMinusP) / P;
+      Grad := Alpha * pcr_powf(OneMinusP, Gamma - 1.0) *
+              (Gamma * P * pcr_logf(P) - OneMinusP) / P;
       FOutputError.FData[Idx] := Grad;
     end
     else
@@ -20925,8 +20925,8 @@ var
   begin
     if x <= cNegInf then Result := y
     else if y <= cNegInf then Result := x
-    else if x > y then Result := x + Ln(1 + Exp(y - x))
-    else Result := y + Ln(1 + Exp(x - y));
+    else if x > y then Result := x + pcr_logf(1 + Exp(y - x))
+    else Result := y + pcr_logf(1 + Exp(x - y));
   end;
 begin
   NT := ALogProbs.SizeX;
@@ -22032,8 +22032,7 @@ begin
   LabelIdx := FOutput.Depth - 1; // label channel index (last channel)
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
-  CosM := Cos(Margin);
-  SinM := Sin(Margin);
+  pcr_sincosf(Margin, SinM, CosM);
   for X := 0 to MaxX do
     for Y := 0 to MaxY do
     begin
@@ -22258,7 +22257,7 @@ begin
         if RawS > 30 then
           FOutput[X, Y, BaseS + dd] := RawS
         else
-          FOutput[X, Y, BaseS + dd] := Ln(1 + Exp(RawS));
+          FOutput[X, Y, BaseS + dd] := pcr_logf(1 + Exp(RawS));
       end;
     end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -22284,7 +22283,7 @@ begin
   MaxB := -1e30;
   for kk := 0 to KcompM1 do
   begin
-    LogPi := Ln(FOutput[X, Y, kk] + 1e-30);
+    LogPi := pcr_logf(FOutput[X, Y, kk] + 1e-30);
     LogComp[kk] := LogPi;
     for dd := 0 to DimM1 do
     begin
@@ -22293,14 +22292,14 @@ begin
       if Sigma < cSigEps then Sigma := cSigEps;
       Diff := yTarget[dd] - Mu;
       LogComp[kk] := LogComp[kk] -
-        (0.5 * cLog2Pi + Ln(Sigma) + (Diff * Diff) / (2 * Sigma * Sigma));
+        (0.5 * cLog2Pi + pcr_logf(Sigma) + (Diff * Diff) / (2 * Sigma * Sigma));
     end;
     if LogComp[kk] > MaxB then MaxB := LogComp[kk];
   end;
   SumExp := 0;
   for kk := 0 to KcompM1 do
     SumExp := SumExp + Exp(LogComp[kk] - MaxB);
-  Result := -(MaxB + Ln(SumExp));
+  Result := -(MaxB + pcr_logf(SumExp));
 end;
 
 procedure TNNetMixtureDensity.SampleMixture(var Sample: array of TNeuralFloat;
@@ -22373,7 +22372,7 @@ begin
       begin
         Pi_k := FOutput[X, Y, kk];
         FPiArrBuf[kk] := Pi_k;
-        LogPi := Ln(Pi_k + 1e-30);
+        LogPi := pcr_logf(Pi_k + 1e-30);
         FLogCompBuf[kk] := LogPi;
         for dd := 0 to DimM1 do
         begin
@@ -22382,7 +22381,7 @@ begin
           if Sigma < cSigEps then Sigma := cSigEps;
           Diff := FYtBuf[dd] - Mu;
           FLogCompBuf[kk] := FLogCompBuf[kk] -
-            (0.5 * cLog2Pi + Ln(Sigma) + (Diff * Diff) / (2 * Sigma * Sigma));
+            (0.5 * cLog2Pi + pcr_logf(Sigma) + (Diff * Diff) / (2 * Sigma * Sigma));
         end;
         if FLogCompBuf[kk] > MaxB then MaxB := FLogCompBuf[kk];
       end;
@@ -22532,7 +22531,7 @@ var
   function SoftPlus(s: TNeuralFloat): TNeuralFloat;
   begin
     if s > 30 then Result := s
-    else Result := Ln(1 + Exp(s));
+    else Result := pcr_logf(1 + Exp(s));
   end;
 
 begin
@@ -22586,9 +22585,9 @@ begin
     Omega := 2 * Be * (1 + Nu);
     S := Delta * Delta * Nu + Omega;
     Total := Total
-      + 0.5 * Ln(Pi / Nu)
-      - Al * Ln(Omega)
-      + (Al + 0.5) * Ln(S)
+      + 0.5 * pcr_logf(Pi / Nu)
+      - Al * pcr_logf(Omega)
+      + (Al + 0.5) * pcr_logf(S)
       + LnGammaF(Al) - LnGammaF(Al + 0.5)
       + Lam * Abs(Delta) * (2 * Nu + Al);
   end;
@@ -22682,7 +22681,7 @@ begin
                + (Al + 0.5) * (Delta * Delta + 2 * Be) / S
                + 2 * Lam * AbsD;
         // dL/dalpha (before softplus chain).
-        dAl := -Ln(Omega) + Ln(S)
+        dAl := -pcr_logf(Omega) + pcr_logf(S)
                + DigammaF(Al) - DigammaF(Al + 0.5)
                + Lam * AbsD;
         // dL/dbeta (before softplus chain).
@@ -22823,7 +22822,7 @@ var
   function SoftPlus(s: TNeuralFloat): TNeuralFloat;
   begin
     if s > 30 then Result := s
-    else Result := Ln(1 + Exp(s));
+    else Result := pcr_logf(1 + Exp(s));
   end;
 
 begin
@@ -23137,7 +23136,7 @@ begin
   begin
     P := FOutput.FData[Idx];
     FOutputError.FData[Idx] := FOutputError.FData[Idx] +
-      Lambda * (Ln(P + cEntropyEps) + 1.0);
+      Lambda * (pcr_logf(P + cEntropyEps) + 1.0);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
@@ -24882,7 +24881,7 @@ begin
       FFeatures) + FNeurons[0].FBiasWeight;
     FVal := Sigmoid(Logit);
     FF.FData[t] := FVal;
-    RunF := RunF + Ln(FVal);
+    RunF := RunF + pcr_logf(FVal);
     FLogF.FData[t] := RunF;
   end;
   // 2) D[j, i, 0] = F_i - F_j for j <= i (0 on diagonal); -1e9 for j > i so the
@@ -26300,7 +26299,7 @@ begin
   // Store the raw (pre-sigmoid) decay so sigmoid(raw) = FGamma, i.e. raw =
   // logit(FGamma) = ln(gamma/(1-gamma)). The optimizer updates this unconstrained
   // scalar while the effective decay stays inside (0,1).
-  FNeurons[0].FWeights.FData[0] := Ln(FGamma / (1.0 - FGamma));
+  FNeurons[0].FWeights.FData[0] := pcr_logf(FGamma / (1.0 - FGamma));
   AfterWeightUpdate();
 end;
 
@@ -27536,7 +27535,7 @@ begin
     for oc := 0 to HiddenCM1 do
     begin
       zv := FZg.Get(x, y, oc);
-      qv := TanH(FQ.Get(x, y, oc));
+      qv := pcr_tanhf(FQ.Get(x, y, oc));
       hv := Prev.Get(x, y, oc);
       FOutput.Store(x, y, oc, (1 - zv) * hv + zv * qv);
     end;
@@ -29330,7 +29329,7 @@ begin
     // AbsPos >= MaxExact >= 1, so the Ln arguments are >= 1 and the floor
     // (Trunc on a non-negative value) matches the reference exactly.
     LargeBucket := MaxExact + Trunc(
-      Ln(AbsPos / MaxExact) / Ln(pMaxDistance / MaxExact) *
+      pcr_logf(AbsPos / MaxExact) / pcr_logf(pMaxDistance / MaxExact) *
       (HalfBuckets - MaxExact));
     if LargeBucket > HalfBuckets - 1 then LargeBucket := HalfBuckets - 1;
     Result := Result + LargeBucket;
@@ -29660,7 +29659,7 @@ begin
   else
   begin
     // log_pos = ceil( ln(abs_pos/mid) / ln((max-1)/mid) * (mid-1) ) + mid
-    Ratio := Ln(AbsPos / Mid) / Ln((MaxPosition - 1) / Mid) * (Mid - 1);
+    Ratio := pcr_logf(AbsPos / Mid) / pcr_logf((MaxPosition - 1) / Mid) * (Mid - 1);
     LogPos := Ceil(Ratio) + Mid;
     Result := LogPos * Sign;
   end;
@@ -29924,15 +29923,15 @@ begin
   if Head < ClosestPow2 then
   begin
     // base = 2^(-(2^-(log2(closest_power_of_2) - 3))); slope = base^(Head+1).
-    Base := Power(2, -Power(2, -(Log2(ClosestPow2) - 3)));
-    Result := Power(Base, Head + 1);
+    Base := pcr_powf(2, -pcr_powf(2, -(pcr_log2f(ClosestPow2) - 3)));
+    Result := pcr_powf(Base, Head + 1);
   end
   else
   begin
     // Extra heads take EVERY OTHER slope of the doubled table: the odd
     // powers 1, 3, 5, ... of extra_base = 2^(-(2^-(log2(2*cp2) - 3))).
-    Base := Power(2, -Power(2, -(Log2(2 * ClosestPow2) - 3)));
-    Result := Power(Base, 2 * (Head - ClosestPow2) + 1);
+    Base := pcr_powf(2, -pcr_powf(2, -(pcr_log2f(2 * ClosestPow2) - 3)));
+    Result := pcr_powf(Base, 2 * (Head - ClosestPow2) + 1);
   end;
 end;
 
@@ -33282,8 +33281,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := pcr_sinf(x);
-      FOutputErrorDeriv.FData[OutputCnt] := pcr_cosf(x);
+      pcr_sincosf(x, FOutput.FData[OutputCnt], FOutputErrorDeriv.FData[OutputCnt]);
     end;
   end
   else
@@ -33315,8 +33313,8 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := pcr_cosf(x);
-      FOutputErrorDeriv.FData[OutputCnt] := -pcr_sinf(x);
+      pcr_sincosf(x, FOutputErrorDeriv.FData[OutputCnt], FOutput.FData[OutputCnt]);
+      FOutputErrorDeriv.FData[OutputCnt] := -FOutputErrorDeriv.FData[OutputCnt];
     end;
   end
   else
@@ -33583,8 +33581,7 @@ begin
       end
       else
       begin
-        SinX := pcr_sinf(x);
-        CosX := pcr_cosf(x);
+        pcr_sincosf(x, SinX, CosX);
         SincVal := SinX / x;
         FOutput.FData[OutputCnt] := SincVal;
         FOutputErrorDeriv.FData[OutputCnt] := (CosX - SincVal) / x;
@@ -33697,8 +33694,7 @@ begin
     end;
     FZ.FData[j] := Acc;
     Angle := TwoPi * Acc;
-    FOutput.FData[j] := pcr_cosf(Angle);
-    FOutput.FData[FNumFeatures + j] := pcr_sinf(Angle);
+    pcr_sincosf(Angle, FOutput.FData[FNumFeatures + j], FOutput.FData[j]);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -33708,7 +33704,7 @@ var
   LocalPrevError: TNNetVolume;
   DInputs, i, j: integer;
   DInputsM1, NumFeaturesM1: integer;
-  TwoPi, Angle, dZ, gCos, gSin: TNeuralFloat;
+  TwoPi, Angle, dZ, gCos, gSin, cAng, sAng: TNeuralFloat;
   StartTime: double;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -33731,7 +33727,8 @@ begin
       gCos := FOutputError.FData[j];
       gSin := FOutputError.FData[FNumFeatures + j];
       Angle := TwoPi * FZ.FData[j];
-      dZ := TwoPi * (-pcr_sinf(Angle) * gCos + pcr_cosf(Angle) * gSin);
+      pcr_sincosf(Angle, sAng, cAng);
+      dZ := TwoPi * (-sAng * gCos + cAng * gSin);
       for i := 0 to DInputsM1 do
         LocalPrevError.FData[i] := LocalPrevError.FData[i] +
           FFreqMatrix.FData[i * FNumFeatures + j] * dZ;
@@ -39911,7 +39908,7 @@ begin
       U := Random();
       if U < 1e-7 then U := 1e-7;
       if U > 1 - 1e-7 then U := 1 - 1e-7;
-      NoisyLogit := Ln(U) - Ln(1 - U) + W.Raw[d];
+      NoisyLogit := pcr_logf(U) - pcr_logf(1 - U) + W.Raw[d];
       S := 1.0 / (1.0 + Exp(-NoisyLogit * InvBeta));
       SlopeFactor := InvBeta;
     end
@@ -43388,8 +43385,9 @@ begin
   begin
     absLam := Exp(-Exp(Wnu.FData[d]));          // |lambda| in (0,1)
     angle := Exp(Wtheta.FData[d]);              // rotation rate
-    lr := absLam * Cos(angle);
-    li := absLam * Sin(angle);
+    pcr_sincosf(angle, li, lr);
+    lr := absLam * lr;
+    li := absLam * li;
     gamma := Sqrt(1 - absLam * absLam);         // input normalisation
     gB := gamma * Wb.FData[d];
     cre := Wcre.FData[d];
@@ -43424,7 +43422,7 @@ var
   phre, phim, phrePrev, phimPrev: TNeuralFloat;
   dlr, dli, dgB, dxt: TNeuralFloat;
   gNu, gTheta, gB_, gCre, gCim, gD: TNeuralFloat;
-  dAbs, dAngle, dGamma: TNeuralFloat;
+  dAbs, dAngle, dGamma, cAng, sAng: TNeuralFloat;
   hasInputGrad: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -43460,8 +43458,9 @@ begin
   begin
     absLam := Exp(-Exp(Wnu.FData[d]));
     angle := Exp(Wtheta.FData[d]);
-    lr := absLam * Cos(angle);
-    li := absLam * Sin(angle);
+    pcr_sincosf(angle, li, lr);
+    lr := absLam * lr;
+    li := absLam * li;
     gamma := Sqrt(1 - absLam * absLam);
     gB := gamma * Wb.FData[d];
     cre := Wcre.FData[d];
@@ -43513,8 +43512,9 @@ begin
     end;
     // ---- Chain through the parameterisation ----
     // lr = absLam*cos(angle); li = absLam*sin(angle).
-    dAbs := dlr * Cos(angle) + dli * Sin(angle);
-    dAngle := -dlr * absLam * Sin(angle) + dli * absLam * Cos(angle);
+    pcr_sincosf(angle, sAng, cAng);
+    dAbs := dlr * cAng + dli * sAng;
+    dAngle := -dlr * absLam * sAng + dli * absLam * cAng;
     // gB = gamma*B, gamma = sqrt(1-absLam^2) -> dgamma/dabsLam = -absLam/gamma.
     gB_ := dgB * gamma;                      // dL/dB
     dGamma := dgB * Wb.FData[d];             // dL/dgamma
@@ -43647,7 +43647,7 @@ begin
   begin
     lam := WLam.FData[d];
     // softplus(Lambda) with the usual large-x shortcut.
-    if lam > 30 then sp := lam else sp := Ln(1 + Exp(lam));
+    if lam > 30 then sp := lam else sp := pcr_logf(1 + Exp(lam));
     hPrev := 0;
     for t := 0 to MaxT do
     begin
@@ -43722,7 +43722,7 @@ begin
     end
     else
     begin
-      sp := Ln(1 + Exp(lam));
+      sp := pcr_logf(1 + Exp(lam));
       dSpdLam := 1 / (1 + Exp(-lam)); // d/dlam softplus = sigmoid(lam)
     end;
     ph := 0;
@@ -44434,7 +44434,7 @@ begin
           accT := accT + Wr^[j] * InPtr^[aOfs + j];
         spre := accS;
         // Glow tanh clamp: s = clamp * tanh(s_pre / clamp).
-        sval := FClamp * Tanh(spre / FClamp);
+        sval := FClamp * pcr_tanhf(spre / FClamp);
         tval := accT;
         SPrePtr^[r] := spre;
         SPtr^[r] := sval;
@@ -44701,7 +44701,7 @@ begin
   MaxFC := FC - 1;
   SPtr := FNeurons[1].FWeights.GetRawPtr(0, 0, 0);
   sumLogS := 0;
-  for i := 0 to MaxFC do sumLogS := sumLogS + Ln(Abs(SPtr^[i]) + 1e-12);
+  for i := 0 to MaxFC do sumLogS := sumLogS + pcr_logf(Abs(SPtr^[i]) + 1e-12);
   FLogDet := 0;
   SizeXM1 := SizeX - 1;
   SizeYM1 := SizeY - 1;
@@ -44987,7 +44987,7 @@ begin
     if cnt > 0 then varc := varc / cnt;
     std := Sqrt(varc + 1e-6);
     // y = s*x + b with s = 1/std, b = -mean/std => first batch ~0 mean / ~1 var.
-    LogSPtr^[c] := -Ln(std);
+    LogSPtr^[c] := -pcr_logf(std);
     BPtr^[c] := -mean / std;
   end;
   FInitialised := true;
@@ -45286,7 +45286,7 @@ var
       for k2 := 0 to PM1 do
         a2 := a2 + W1.FData[W1.GetRawPos(jj, 0, k2)] * FzvBuf[k2];
       FAct.FData[bp + jj] := a2;
-      h2 := TanH(a2);
+      h2 := pcr_tanhf(a2);
       t2 := 1 - h2 * h2;
       s2 := W2.FData[jj] * t2;
       for k2 := 0 to PM1 do
@@ -45315,7 +45315,7 @@ var
       for k2 := 0 to DhalfM1 do
         a2 := a2 + hW1.FData[hW1.GetRawPos(jj, 0, k2)] * hv[k2];
       Ac.FData[bp + jj] := a2;
-      h2 := TanH(a2);
+      h2 := pcr_tanhf(a2);
       t2 := 1 - h2 * h2;
       s2 := hW2.FData[jj] * t2;
       for k2 := 0 to DhalfM1 do
@@ -45435,7 +45435,7 @@ var
     for jj := 0 to HdM1 do
     begin
       a2 := Ac.FData[bp + jj];
-      h2 := TanH(a2);
+      h2 := pcr_tanhf(a2);
       t2 := 1 - h2 * h2;
       cj := 0;
       for k2 := 0 to DhalfM1 do
@@ -45468,7 +45468,7 @@ var
     for jj := 0 to HdM1 do
     begin
       a2 := FAct.FData[bp + jj];
-      h2 := TanH(a2);
+      h2 := pcr_tanhf(a2);
       t2 := 1 - h2 * h2;
       cj := 0;
       for k2 := 0 to PM1 do
@@ -45795,7 +45795,7 @@ begin
       end;
       tau := accT;                          // input-dependent rate
       gate := Sigmoid(-tau * tnorm);        // closed-form time gate
-      gv := TanH(accG);                     // fast input pathway
+      gv := pcr_tanhf(accG);                     // fast input pathway
       FTau.FData[(t * Depth) + d] := tau;
       FGate.FData[(t * Depth) + d] := gate;
       FG.FData[(t * Depth) + d] := gv;
@@ -46046,7 +46046,7 @@ begin
       end;
       liv := accI;                  // log input gate
       lfv := accF;                  // log forget gate
-      zv := TanH(accZ);             // cell input
+      zv := pcr_tanhf(accZ);             // cell input
       ov := Sigmoid(accO);          // output gate
       if t > 0 then mPrev := FM.FData[baseT - Depth + d] else mPrev := 0;
       // Stabilizer running max (stop-grad in backward).
@@ -46940,7 +46940,7 @@ begin
   half := (FKernelSize - 1) div 2;
   KernelSizeM1 := FKernelSize - 1;
   for n := 0 to KernelSizeM1 do
-    FWindow.FData[n] := 0.54 - 0.46 * Cos(2 * Pi * n / (FKernelSize - 1));
+    FWindow.FData[n] := 0.54 - 0.46 * pcr_cosf(2 * Pi * n / (FKernelSize - 1));
   if half < 0 then half := 0; // half is re-derived where needed
   InitDefault();
 end;
@@ -46948,7 +46948,7 @@ end;
 // SincFn(x) = sin(x)/x with the removable singularity sinc(0)=1.
 function SincConvSinc(x: TNeuralFloat): TNeuralFloat;
 begin
-  if Abs(x) < 1e-12 then Result := 1.0 else Result := Sin(x) / x;
+  if Abs(x) < 1e-12 then Result := 1.0 else Result := pcr_sinf(x) / x;
 end;
 
 procedure TNNetSincConv1D.MaterializeBank();
@@ -47029,7 +47029,7 @@ var
   var a: TNeuralFloat;
   begin
     if Abs(tapv) < 1e-12 then Result := 2.0
-    else begin a := 2 * Pi * tapv; Result := 2 * Cos(a * fval); end;
+    else begin a := 2 * Pi * tapv; Result := 2 * pcr_cosf(a * fval); end;
   end;
 
 begin
@@ -47129,9 +47129,9 @@ var
   melLo, melHi, melStep, hzLo, hzHi: TNeuralFloat;
 
   function HzToMel(hz: TNeuralFloat): TNeuralFloat;
-  begin Result := 2595 * Ln(1 + hz / 700) / Ln(10); end;
+  begin Result := 2595 * pcr_logf(1 + hz / 700) / pcr_logf(10); end;
   function MelToHz(m: TNeuralFloat): TNeuralFloat;
-  begin Result := 700 * (Exp(m * Ln(10) / 2595) - 1); end;
+  begin Result := 700 * (Exp(m * pcr_logf(10) / 2595) - 1); end;
 
 begin
   if FNeurons.Count < 1 then AddMissingNeurons(1);
@@ -47538,10 +47538,10 @@ begin
             end;
           end;
           iv := Sigmoid(accI); fv := Sigmoid(accF);
-          ov := Sigmoid(accO); gv := TanH(accG);
+          ov := Sigmoid(accO); gv := pcr_tanhf(accG);
           if t > 0 then hp := FC.Data[(t - 1) * FH + y, x, oc] else hp := 0;
           cv := fv * hp + iv * gv;
-          tc := TanH(cv);
+          tc := pcr_tanhf(cv);
           FI.Data[oy + y, x, oc] := iv;  FFg.Data[oy + y, x, oc] := fv;
           FO.Data[oy + y, x, oc] := ov;  FG.Data[oy + y, x, oc] := gv;
           FC.Data[oy + y, x, oc] := cv;  FTanhC.Data[oy + y, x, oc] := tc;
@@ -48765,7 +48765,7 @@ begin
     for j := 0 to InputDimM1 do accB := accB + Wb.FData[j] * XtPtr^[j];
     FPreBeta.FData[t] := accB;
     // softplus -> non-negative key strength.
-    if accB > 30 then betaV := accB else betaV := Ln(1 + Exp(accB));
+    if accB > 30 then betaV := accB else betaV := pcr_logf(1 + Exp(accB));
     FBeta.FData[t] := betaV;
     kn := 0;
     for c := 0 to SlotWidthM1 do
@@ -49061,7 +49061,7 @@ begin
   u   := cC * (a + cA * a * a * a);
   up  := cC * (1 + 3 * cA * a * a);   // du/da
   upp := cC * 6 * cA * a;             // d2u/da2
-  s   := TanH(u);
+  s   := pcr_tanhf(u);
   p   := 1 - s * s;                   // ds/du
   g   := 0.5 * a * (1 + s);
   g1  := 0.5 * (1 + s) + 0.5 * a * p * up;
@@ -49070,7 +49070,7 @@ end;
 
 function TTTSoftPlus(x: TNeuralFloat): TNeuralFloat;
 begin
-  if x > 30 then Result := x else Result := Ln(1 + Exp(x));
+  if x > 30 then Result := x else Result := pcr_logf(1 + Exp(x));
 end;
 
 constructor TNNetTestTimeTraining.Create(pVariant: integer = 0; pHidden: integer = 0);
@@ -50376,7 +50376,7 @@ begin
       // delta = softplus(pre); numerically stable.
       if pre > 30 then sp := pre
       else if pre < -30 then sp := Exp(pre)
-      else sp := Ln(1 + Exp(pre));
+      else sp := pcr_logf(1 + Exp(pre));
       FDelta.FData[(t * Depth) + d] := sp;
       FBt.FData[(t * Depth) + d] := acc;
       FCt.FData[(t * Depth) + d] := hprev;
@@ -50442,7 +50442,7 @@ begin
         pre := pre + WdRow^[j] * XtPtr^[j];
       if pre > 30 then sp := pre
       else if pre < -30 then sp := Exp(pre)
-      else sp := Ln(1 + Exp(pre));
+      else sp := pcr_logf(1 + Exp(pre));
       FDelta.FData[(t * Depth) + d] := sp;
     end;
     // b_t[s] = WB[s,:].x_t ; c_t[s] = WC[s,:].x_t  (shared across channels).
@@ -50552,7 +50552,7 @@ begin
         pre := pre + WdtRow^[r] * FTsBuf.FData[r];
       if pre > 30 then sp := pre
       else if pre < -30 then sp := Exp(pre)
-      else sp := Ln(1 + Exp(pre));
+      else sp := pcr_logf(1 + Exp(pre));
       FDelta.FData[(t * Depth) + d] := sp;
     end;
     // b_t / c_t = RMSNorm(W_{B,C} . x_conv) * gain, rms over the NS axis.
@@ -50950,7 +50950,7 @@ begin
     FNeurons[3].FWeights.Fill(0);                 // dt_proj.bias
     for d := 0 to DepthM1 do
       for s := 0 to NSM1 do
-        FNeurons[4].FWeights[d, 0, s] := Ln(1 + s);
+        FNeurons[4].FWeights[d, 0, s] := pcr_logf(1 + s);
     FNeurons[5].FWeights.Fill(1);                 // D
     FNeurons[6].FWeights.Fill(0);                 // x_proj_dt
     FNeurons[7].FWeights.Fill(1);                 // dt_gain
@@ -50986,7 +50986,7 @@ begin
       end;
     for d := 0 to DepthM1 do
       for s := 0 to NSM1 do
-        FNeurons[4].FWeights[d, 0, s] := Ln(1 + s);
+        FNeurons[4].FWeights[d, 0, s] := pcr_logf(1 + s);
   end;
   FNeurons[3].FWeights.Fill(0);   // b_d
   FNeurons[5].FWeights.Fill(1);   // e (feedthrough / Mamba D skip)
@@ -51134,7 +51134,7 @@ begin
       pre := XtPtr^[dtOff + h] + DtB.FData[h];
       if pre > 30 then dth := pre
       else if pre < -30 then dth := Exp(pre)
-      else dth := Ln(1 + Exp(pre));
+      else dth := pcr_logf(1 + Exp(pre));
       FDt.FData[(t * FNumHeads) + h] := dth;
       ar := -Exp(Min(Alog.FData[h], 30));   // A = -exp(A_log)
       ah := Exp(dth * ar);
@@ -51402,7 +51402,7 @@ begin
       else pn := 0;
     FPhi[p, 0, 0] := 1.0;
     FPhi[p, 0, 1] := pn;
-    FPhi[p, 0, 2] := Sin(2 * Pi * pn);
+    FPhi[p, 0, 2] := pcr_sinf(2 * Pi * pn);
   end;
 end;
 
@@ -51475,7 +51475,7 @@ begin
       for f := 0 to FNumFeatM1 do
         s := s + W1[j, 0, f] * FPhi[p, 0, f];
       FPre[p, 0, j] := s;
-      FAct[p, 0, j] := TanH(s);
+      FAct[p, 0, j] := pcr_tanhf(s);
     end;
     // Output: base = W2*act + b2; decay = exp(-softplus(logDecay)*p_norm).
     for c := 0 to DepthM1 do
@@ -53158,7 +53158,7 @@ begin
   for pos := 0 to SeqLenM1 do
   begin
     // f(pos) = log1p(floor((pos+1)/floor_scale))*attn_scale + 1.
-    Scale := Ln(1 + Floor((pos + FPositionOffset + 1) / FFloorScale)) *
+    Scale := pcr_logf(1 + Floor((pos + FPositionOffset + 1) / FFloorScale)) *
       FAttnScale + 1;
     BaseIdx := pos * Depth;
     for k := 0 to DepthM1 do
@@ -53187,7 +53187,7 @@ begin
     DepthM1 := Depth - 1;
     for pos := 0 to SeqLenM1 do
     begin
-      Scale := Ln(1 + Floor((pos + FPositionOffset + 1) / FFloorScale)) *
+      Scale := pcr_logf(1 + Floor((pos + FPositionOffset + 1) / FFloorScale)) *
         FAttnScale + 1;
       BaseIdx := pos * Depth;
       for k := 0 to DepthM1 do
@@ -56868,7 +56868,7 @@ begin
   for HeadCnt := 0 to HeadsM1 do
   begin
     // Geometric per-head decay schedule: gamma_h = 1 - 2^(-GammaMinExp - h).
-    Gamma := 1.0 - Power(2.0, -GammaMinExp - HeadCnt);
+    Gamma := 1.0 - pcr_powf(2.0, -GammaMinExp - HeadCnt);
     HeadOutputs[HeadCnt] :=
       AddLayerAfter(TNNetRetention.Create(d_k, Gamma), SliceLayers[HeadCnt]);
   end;
@@ -61844,7 +61844,7 @@ begin
       sumExp := 0;
       for cj := 0 to FNm1 do
         sumExp := sumExp + Exp(L.FData[ri * FN + cj] - maxVal);
-      lse := maxVal + Ln(sumExp);
+      lse := maxVal + pcr_logf(sumExp);
       for cj := 0 to FNm1 do
         L.FData[ri * FN + cj] := L.FData[ri * FN + cj] - lse;
     end;
@@ -61860,7 +61860,7 @@ begin
       sumExp := 0;
       for ri := 0 to FNm1 do
         sumExp := sumExp + Exp(L.FData[ri * FN + cj] - maxVal);
-      lse := maxVal + Ln(sumExp);
+      lse := maxVal + pcr_logf(sumExp);
       for ri := 0 to FNm1 do
         L.FData[ri * FN + cj] := L.FData[ri * FN + cj] - lse;
     end;
@@ -62275,7 +62275,7 @@ begin
   for d := 0 to DepthM1 do
   begin
     FNeurons[0].FWeights.FData[d] := FVth;
-    FNeurons[1].FWeights.FData[d] := Ln(FBeta / (1.0 - FBeta));
+    FNeurons[1].FWeights.FData[d] := pcr_logf(FBeta / (1.0 - FBeta));
   end;
   AfterWeightUpdate();
 end;
@@ -62609,7 +62609,7 @@ begin
   for d := 0 to DepthM1 do
   begin
     FNeurons[0].FWeights.FData[d] := FVth;
-    FNeurons[1].FWeights.FData[d] := Ln(FBeta / (1.0 - FBeta));
+    FNeurons[1].FWeights.FData[d] := pcr_logf(FBeta / (1.0 - FBeta));
   end;
   AfterWeightUpdate();
 end;
@@ -65197,7 +65197,7 @@ begin
     else
     begin
       // Ideal factor = rem^(1/(remaining cores)); search divisors near it.
-      root := Trunc(Exp(Ln(rem) / (d - idx)) + 0.5);
+      root := Trunc(Exp(pcr_logf(rem) / (d - idx)) + 0.5);
       if root < 2 then root := 2;
       best := 0;
       // Prefer the divisor closest to root, scanning outward.
@@ -65940,8 +65940,9 @@ begin
     for j := 0 to MaxDin do
       acc := acc + W.FData[base + j] * PrevOut.FData[j];
     FCacheProj.FData[k] := acc;
-    FOutput.FData[k]     := FScale * pcr_cosf(acc);  // cos channels 0..D-1
-    FOutput.FData[D + k] := FScale * pcr_sinf(acc);  // sin channels D..2D-1
+    pcr_sincosf(acc, FOutput.FData[D + k], FOutput.FData[k]);
+    FOutput.FData[k]     := FScale * FOutput.FData[k];      // cos channels 0..D-1
+    FOutput.FData[D + k] := FScale * FOutput.FData[D + k];  // sin channels D..2D-1
   end;
 end;
 
@@ -65969,7 +65970,7 @@ procedure TNNetRandomFourierFeatures.BackpropagateCPU();
 var
   k, j, base, D, Din: integer;
   MaxD, MaxDin: integer;
-  z, dz, sc: TNeuralFloat;
+  z, dz, sc, cz, sz: TNeuralFloat;
   PrevOut, W, WDelta, LocalPrevError: TNNetVolume;
   HasPrevError: boolean;
 begin
@@ -65987,7 +65988,8 @@ begin
   for k := 0 to MaxD do
   begin
     z := FCacheProj.FData[k];
-    dz := sc * (-pcr_sinf(z) * FOutputError.FData[k] + pcr_cosf(z) * FOutputError.FData[D + k]);
+    pcr_sincosf(z, sz, cz);
+    dz := sc * (-sz * FOutputError.FData[k] + cz * FOutputError.FData[D + k]);
     base := k * Din;
     if HasPrevError then
       for j := 0 to MaxDin do
@@ -66371,7 +66373,7 @@ procedure TNNetHyperbolicLinear.SeedCurvatureRaw();
 begin
   if FNeurons.Count <= CurvatureNeuronIdx() then exit;
   FNeurons[CurvatureNeuronIdx()].FWeights.FData[0] :=
-    Ln( (FInitCurvature - HYPERBOLIC_CMIN) /
+    pcr_logf( (FInitCurvature - HYPERBOLIC_CMIN) /
         (HYPERBOLIC_CMAX - FInitCurvature) );
   FNeurons[CurvatureNeuronIdx()].FBiasWeight := 0;
   SyncCurvatureFromRaw();
@@ -66460,7 +66462,7 @@ begin
   if t < HYPERBOLIC_EPS then
     Result := 1.0 - t * t / 3.0
   else
-    Result := Tanh(t) / t;
+    Result := pcr_tanhf(t) / t;
 end;
 
 // gamma_exp(n) = beta'(n)/n. With t=s*n, beta=tanh(t)/t,
@@ -66476,7 +66478,7 @@ begin
     Result := -s * s / 3.0
   else
   begin
-    th := Tanh(t);
+    th := pcr_tanhf(t);
     dbeta := ( t * (1.0 - th * th) - th ) / (t * t);
     Result := s * dbeta / n;
   end;
@@ -66513,7 +66515,7 @@ begin
     Result := -n * n / 3.0
   else
   begin
-    th := Tanh(t);
+    th := pcr_tanhf(t);
     dbeta := ( t * (1.0 - th * th) - th ) / (t * t);
     Result := dbeta * n / (2.0 * s);
   end;
@@ -68753,7 +68755,7 @@ begin
           for ic := 0 to inDepthMax do
           begin
             xv := PrevOut.Get(prevX, prevY, ic);
-            u := Tanh(xv);
+            u := pcr_tanhf(xv);
             tap := (fy * FFeatureSizeX + fx) * FInDepth + ic;
             base := tap * FCoeffsPerEdge;
             if FBasis = csKANBasisBSpline then
@@ -68836,7 +68838,7 @@ begin
           for ic := 0 to inDepthMax do
           begin
             xv := PrevOut.Get(prevX, prevY, ic);
-            u := Tanh(xv);
+            u := pcr_tanhf(xv);
             tap := (fy * FFeatureSizeX + fx) * FInDepth + ic;
             base := tap * FCoeffsPerEdge;
             if FBasis = csKANBasisBSpline then
@@ -68904,7 +68906,7 @@ begin
         for ic := 0 to inDepthMax do
         begin
           xv := PrevOut.Get(prevX, prevY, ic);
-          u := Tanh(xv);
+          u := pcr_tanhf(xv);
           dudx := 1 - u * u;
           tap := (fy * FFeatureSizeX + fx) * FInDepth + ic;
           base := tap * FCoeffsPerEdge;
@@ -88098,7 +88100,7 @@ var
       Pv := Out2.FData[Cls];
       if Pv < cLossEps then Pv := cLossEps;
       if Pv > 1.0 then Pv := 1.0;
-      SumL := SumL - Ln(Pv);
+      SumL := SumL - pcr_logf(Pv);
       Inc(Cnt);
     end;
     if Cnt > 0 then Result := SumL / Cnt else Result := 0;
@@ -88169,7 +88171,7 @@ var
       yy := 2.0 * Random() - 1.0;
       rr := xx * xx + yy * yy;
     end;
-    Result := xx * Sqrt(-2.0 * Ln(rr) / rr);
+    Result := xx * Sqrt(-2.0 * pcr_logf(rr) / rr);
   end;
 
   // One anchored-Langevin (SGLD) step IN PLACE on the live weights:
@@ -88301,7 +88303,7 @@ begin
     end;
 
     // WBIC inverse temperature beta = 1/ln(n); n=1 would divide by zero.
-    if NSamples > 1 then Beta := 1.0 / Ln(NSamples) else Beta := 1.0;
+    if NSamples > 1 then Beta := 1.0 / pcr_logf(NSamples) else Beta := 1.0;
     nBeta := NSamples * Beta;
 
     // Snapshot w* (data only) for exact restore AND as the Langevin anchor.
@@ -89698,8 +89700,9 @@ var
     U2 := LcgNext();
     R := Sqrt(-2.0 * pcr_logf(U1));
     Theta := 2.0 * Pi * U2;
-    G1 := R * pcr_cosf(Theta);
-    G2 := R * pcr_sinf(Theta);
+    pcr_sincosf(Theta, G2, G1);
+    G1 := R * G1;
+    G2 := R * G2;
     Spare := G2;
     HaveSpare := True;
     Result := G1;
@@ -92188,8 +92191,9 @@ var
     U2 := LcgNext();
     R := Sqrt(-2.0 * pcr_logf(U1));
     Theta := 2.0 * Pi * U2;
-    Result := R * pcr_cosf(Theta);
-    G2 := R * pcr_sinf(Theta);
+    pcr_sincosf(Theta, G2, Result);
+    Result := R * Result;
+    G2 := R * G2;
     Spare := G2;
     HaveSpare := True;
   end;
@@ -93879,7 +93883,7 @@ begin
         SumLeafProb[l] := SumLeafProb[l] + prob;
         // Accumulate sum_l P_l*ln P_l for this sample's effective-leaf-count.
         if prob > cEps then
-          sampleNegEntropy := sampleNegEntropy + prob * Ln(prob);
+          sampleNegEntropy := sampleNegEntropy + prob * pcr_logf(prob);
       end;
       // Effective leaf count = exp(-sum_l P_l*ln P_l).
       effLeaves := Exp(-sampleNegEntropy);
@@ -95314,8 +95318,8 @@ begin
       'TNNetTropicalConv' :         Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]);
       'TNNetSinkhorn' :             Result := TNNetSinkhorn.Create(St[0], Ft[0]);
       'TNNetTokenMerging' :         Result := TNNetTokenMerging.Create(St[0], St[1]);
-      'TNNetLIFNeuron' :            Result := TNNetLIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2], St[0] = 1);
-      'TNNetALIFNeuron' :           Result := TNNetALIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2], Ft[3], Ft[4], St[0] = 1);
+      'TNNetLIFNeuron' :            Result := TNNetLIFNeuron.Create(-1.0/pcr_logf(Ft[0]), Ft[1], Ft[2], St[0] = 1);
+      'TNNetALIFNeuron' :           Result := TNNetALIFNeuron.Create(-1.0/pcr_logf(Ft[0]), Ft[1], Ft[2], Ft[3], Ft[4], St[0] = 1);
       'TNNetCondConv' :             Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]);
       'TNNetDeformableConv' :       Result := TNNetDeformableConv.Create(St[0], St[1], St[2], St[3], St[4], St[5]);
       'TNNetGroupConvP4' :          Result := TNNetGroupConvP4.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -95730,8 +95734,8 @@ begin
       if S[0] = 'TNNetTropicalConv' then Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]) else
       if S[0] = 'TNNetSinkhorn' then Result := TNNetSinkhorn.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetTokenMerging' then Result := TNNetTokenMerging.Create(St[0], St[1]) else
-      if S[0] = 'TNNetLIFNeuron' then Result := TNNetLIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2], St[0] = 1) else
-      if S[0] = 'TNNetALIFNeuron' then Result := TNNetALIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2], Ft[3], Ft[4], St[0] = 1) else
+      if S[0] = 'TNNetLIFNeuron' then Result := TNNetLIFNeuron.Create(-1.0/pcr_logf(Ft[0]), Ft[1], Ft[2], St[0] = 1) else
+      if S[0] = 'TNNetALIFNeuron' then Result := TNNetALIFNeuron.Create(-1.0/pcr_logf(Ft[0]), Ft[1], Ft[2], Ft[3], Ft[4], St[0] = 1) else
       if S[0] = 'TNNetCondConv' then Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetDeformableConv' then Result := TNNetDeformableConv.Create(St[0], St[1], St[2], St[3], St[4], St[5]) else
       if S[0] = 'TNNetGroupConvP4' then Result := TNNetGroupConvP4.Create(St[0], St[1], St[2], St[3], St[4]) else

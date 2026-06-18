@@ -28,7 +28,7 @@ interface
 
 uses
   {$IFNDEF FPC}System.Classes, Windows, Vcl.Graphics,{$ENDIF}
-  neuralvolume, neuralnetwork
+  neuralvolume, neuralnetwork, pascoremath32
   {$IFDEF FPC},
   FPimage, FPReadBMP, FPReadPCX, FPReadJPEG, FPReadPNG,
   FPReadGif, FPReadPNM, FPReadPSD, FPReadTGA, FPReadTiff,
@@ -3820,7 +3820,7 @@ begin
       OutputValue := pOutput.FData[ ImgVolumes[ImgIdx].Tag ];
       if (OutputValue > 0) then
       begin
-        CurrentLoss := -Ln(OutputValue);
+        CurrentLoss := -pcr_logf(OutputValue);
       end
       else
       begin
@@ -4323,7 +4323,7 @@ var
 begin
   if DegAngle = 0 then Exit; // bit-identity
   rad := DegAngle * Pi / 180.0;
-  c := Cos(rad); s := Sin(rad);
+  pcr_sincosf(rad, s, c);
   // Inverse rotation (dst -> src) so we sample. Rotating image by +theta uses
   // src = R(-theta)*dst.
   Mat[0] := c;  Mat[1] := s;  Mat[2] := 0;
@@ -4480,8 +4480,8 @@ begin
   W := V.SizeX; H := V.SizeY; Dep := V.Depth;
   if (W <= 0) or (H <= 0) then Exit;
   area := W * H;
-  logLo := Ln(pAspectLow);
-  logHi := Ln(1.0 / pAspectLow);
+  logLo := pcr_logf(pAspectLow);
+  logHi := pcr_logf(1.0 / pAspectLow);
   for attempt := 1 to 10 do
   begin
     targetArea := (pAreaLow + Random * (pAreaHigh - pAreaLow)) * area;

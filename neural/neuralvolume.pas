@@ -1600,7 +1600,7 @@ begin
 
   if (r > 0.0031308) then
   begin
-    r  := (1.055 * power(r, 1/2.4) - 0.055);
+    r  := (1.055 * pcr_powf(r, 1/2.4) - 0.055);
   end
   else
   begin
@@ -1609,7 +1609,7 @@ begin
 
   if (g > 0.0031308) then
   begin
-    g  := (1.055 * power(g, 1/2.4) - 0.055);
+    g  := (1.055 * pcr_powf(g, 1/2.4) - 0.055);
   end
   else
   begin
@@ -1618,7 +1618,7 @@ begin
 
   if (bb > 0.0031308) then
   begin
-    bb := (1.055 * power(bb, 1/2.4) - 0.055);
+    bb := (1.055 * pcr_powf(bb, 1/2.4) - 0.055);
   end
   else
   begin
@@ -1649,7 +1649,7 @@ begin
 
   if (r > 0.04045) then
   begin
-    r := power((r + 0.055) / 1.055, 2.4)
+    r := pcr_powf((r + 0.055) / 1.055, 2.4)
   end
   else
   begin
@@ -1658,7 +1658,7 @@ begin
 
   if (g > 0.04045) then
   begin
-    g := power((g + 0.055) / 1.055, 2.4);
+    g := pcr_powf((g + 0.055) / 1.055, 2.4);
   end
   else
   begin
@@ -1667,7 +1667,7 @@ begin
 
   if (b > 0.04045) then
   begin
-    b := power((b + 0.055) / 1.055, 2.4);
+    b := pcr_powf((b + 0.055) / 1.055, 2.4);
   end
   else
   begin
@@ -1680,7 +1680,7 @@ begin
 
   if (x > 0.008856) then
   begin
-    x := power(x, 1/3);
+    x := pcr_powf(x, 1/3);
   end
   else
   begin
@@ -1689,7 +1689,7 @@ begin
 
   if (y > 0.008856) then
   begin
-    y := power(y, 1/3);
+    y := pcr_powf(y, 1/3);
   end
   else
   begin
@@ -1698,7 +1698,7 @@ begin
 
   if (z > 0.008856) then
   begin
-    z := power(z, 1/3);
+    z := pcr_powf(z, 1/3);
   end
   else
   begin
@@ -1798,7 +1798,7 @@ begin
     y := 2.0 * Random() - 1.0;
     r := x * x + y * y;
   end;
-  Result := x * Sqrt(-2.0 * Ln(r) / r);
+  Result := x * Sqrt(-2.0 * pcr_logf(r) / r);
 end;
 
 function RandomGammaValue(Alpha: TNeuralFloat): TNeuralFloat;
@@ -1813,7 +1813,7 @@ begin
     u := Random();
     // Guard against log(0) below by avoiding a zero draw.
     while u <= 0 do u := Random();
-    Result := RandomGammaValue(Alpha + 1.0) * Power(u, 1.0 / Alpha);
+    Result := RandomGammaValue(Alpha + 1.0) * pcr_powf(u, 1.0 / Alpha);
     Exit;
   end;
   d := Alpha - 1.0 / 3.0;
@@ -1831,7 +1831,7 @@ begin
       Result := d * v;
       Exit;
     end;
-    if Ln(u) < 0.5 * x * x + d * (1.0 - v + Ln(v)) then
+    if pcr_logf(u) < 0.5 * x * x + d * (1.0 - v + pcr_logf(v)) then
     begin
       Result := d * v;
       Exit;
@@ -2642,7 +2642,7 @@ begin
   for I := 0 to NM1 do
   begin
     P := FTokenArr[I].Score;
-    if P > 0 then Entropy := Entropy - P * Ln(P);
+    if P > 0 then Entropy := Entropy - P * pcr_logf(P);
   end;
   // Per-token distance |(-log p) - H|.
   SetLength(Dist, N);
@@ -2650,7 +2650,7 @@ begin
   for I := 0 to NM1 do
   begin
     P := FTokenArr[I].Score;
-    if P > 0 then Surprise := -Ln(P) else Surprise := 1e30; // p=0 => infinite
+    if P > 0 then Surprise := -pcr_logf(P) else Surprise := 1e30; // p=0 => infinite
     Dist[I] := Abs(Surprise - Entropy);
     Order[I] := I;
   end;
@@ -2746,7 +2746,7 @@ begin
     begin
       P := FTokenArr[I].Score;
       if P <= 0 then Break; // descending: nothing later is larger
-      if -Ln(P) <= FMu then
+      if -pcr_logf(P) <= FMu then
       begin
         Inc(KeptCount);
         KeptSum := KeptSum + P;
@@ -2773,8 +2773,8 @@ begin
       P := FTokenArr[I].Score;
       if (P <= 0) or (FTokenArr[I + 1].Score <= 0) then Break;
       // t_i = log(p_i / p_{i+1}) regressed on log((i+2)/(i+1)) gives s.
-      LogP := Ln(P / FTokenArr[I + 1].Score);
-      LogRank := Ln((I + 2) / (I + 1));
+      LogP := pcr_logf(P / FTokenArr[I + 1].Score);
+      LogRank := pcr_logf((I + 2) / (I + 1));
       SumLogP := SumLogP + LogP;
       SumLogRank := SumLogRank + LogRank;
       SumLogPLogRank := SumLogPLogRank + LogP * LogRank;
@@ -2791,8 +2791,8 @@ begin
     if Abs(Epsilon) < 1e-6 then
       KFloat := Exp(FMu)            // s ~ 1 limit
     else
-      KFloat := Exp( Ln( (Epsilon * Exp(FMu * Ln(2.0))) /
-                         (1 - Power(N, -Epsilon)) ) / S );
+      KFloat := Exp( pcr_logf( (Epsilon * Exp(FMu * pcr_logf(2.0))) /
+                         (1 - pcr_powf(N, -Epsilon)) ) / S );
     if KFloat < 1 then KFloat := 1;
     KeptCount := Round(KFloat);
     if KeptCount < 1 then KeptCount := 1;
@@ -2828,7 +2828,7 @@ begin
     end;
   end;
   // Feedback update: drive observed surprise toward Tau.
-  if ChosenScore > 0 then Surprise := -Ln(ChosenScore) else Surprise := FMu;
+  if ChosenScore > 0 then Surprise := -pcr_logf(ChosenScore) else Surprise := FMu;
   FMu := FMu - FEta * (Surprise - FTau);
 end;
 
@@ -2973,7 +2973,7 @@ begin
       // (a) repetition penalty: p := p^r ("power then renormalize", the
       // probability-domain image of the sign-correct CTRL logit rule -
       // ln p <= 0 always, so the negative branch ln p * r applies).
-      if (FRepetition <> 1.0) and (P > 0) then P := Power(P, FRepetition);
+      if (FRepetition <> 1.0) and (P > 0) then P := pcr_powf(P, FRepetition);
       // (b) frequency + (c) presence: log-space subtraction is a
       // multiplicative exp() factor on the probability.
       if (FFrequency <> 0.0) or (FPresence <> 0.0) then
