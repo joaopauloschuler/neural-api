@@ -158,10 +158,11 @@ const
   csOffset: UInt64 = 14695981039346656037;
   csPrime: UInt64 = 1099511628211;
 var
-  I: integer;
+  I, Len: integer;
 begin
   Result := csOffset;
-  for I := 1 to Length(S) do
+  Len := Length(S);
+  for I := 1 to Len do
   begin
     Result := Result xor UInt64(Ord(S[I]));
     Result := Result * csPrime;
@@ -234,7 +235,7 @@ end;
 
 procedure TNeuralMinHasher.InitPermutations;
 var
-  I: integer;
+  I, NumHashesM1: integer;
   R: UInt64;
   State: UInt64;
 begin
@@ -243,7 +244,8 @@ begin
   // Deterministic splitmix64-style generator seeded by FSeed (independent of
   // the global RandSeed so results never depend on RNG call ordering).
   State := UInt64(FSeed) + 14695981039346656037;
-  for I := 0 to FNumHashes - 1 do
+  NumHashesM1 := FNumHashes - 1;
+  for I := 0 to NumHashesM1 do
   begin
     // a_i in [1, p)
     State := State + 11400714819323198485;
@@ -286,7 +288,7 @@ function TNeuralMinHasher.Shingle(const Doc: string): TStringList;
 var
   Tokens: TStringList;
   Work: string;
-  I, J, TokenCount: integer;
+  I, J, TokenCount, TokenCountM1, LastStart, NGramM1: integer;
   Sh: string;
 begin
   Result := TStringList.Create;
@@ -312,7 +314,8 @@ begin
     begin
       // Fewer tokens than N: one shingle of the whole (short) token list.
       Sh := '';
-      for J := 0 to TokenCount - 1 do
+      TokenCountM1 := TokenCount - 1;
+      for J := 0 to TokenCountM1 do
       begin
         if J > 0 then Sh := Sh + #31; // unit-separator joins tokens unambiguously
         Sh := Sh + Tokens[J];
@@ -320,10 +323,12 @@ begin
       Result.Add(Sh);
       Exit;
     end;
-    for I := 0 to TokenCount - FNGramSize do
+    LastStart := TokenCount - FNGramSize;
+    NGramM1 := FNGramSize - 1;
+    for I := 0 to LastStart do
     begin
       Sh := '';
-      for J := 0 to FNGramSize - 1 do
+      for J := 0 to NGramM1 do
       begin
         if J > 0 then Sh := Sh + #31;
         Sh := Sh + Tokens[I + J];
@@ -339,18 +344,20 @@ function TNeuralMinHasher.ComputeSignature(
   const Doc: string): TNeuralMinHashSignature;
 var
   Shingles: TStringList;
-  I, S, ShingleCount: integer;
+  I, S, ShingleCount, ShingleCountM1, NumHashesM1: integer;
   Base, HVal: UInt64;
 begin
   SetLength(Result, FNumHashes);
-  for I := 0 to FNumHashes - 1 do Result[I] := High(UInt64);
+  NumHashesM1 := FNumHashes - 1;
+  for I := 0 to NumHashesM1 do Result[I] := High(UInt64);
   Shingles := Shingle(Doc);
   try
     ShingleCount := Shingles.Count;
-    for S := 0 to ShingleCount - 1 do
+    ShingleCountM1 := ShingleCount - 1;
+    for S := 0 to ShingleCountM1 do
     begin
       Base := FNV1a64(Shingles[S]) mod csP; // reduce into the field
-      for I := 0 to FNumHashes - 1 do
+      for I := 0 to NumHashesM1 do
       begin
         HVal := AddModP(MulModP(FA[I], Base), FB[I]);
         if HVal < Result[I] then Result[I] := HVal;
@@ -364,12 +371,13 @@ end;
 function TNeuralMinHasher.EstimateJaccard(
   const SigA, SigB: TNeuralMinHashSignature): double;
 var
-  I, Match, N: integer;
+  I, Match, N, NM1: integer;
 begin
   N := Min(Length(SigA), Length(SigB));
   if N = 0 then Exit(0.0);
   Match := 0;
-  for I := 0 to N - 1 do
+  NM1 := N - 1;
+  for I := 0 to NM1 do
     if SigA[I] = SigB[I] then Inc(Match);
   Result := Match / N;
 end;
@@ -377,11 +385,12 @@ end;
 function TNeuralMinHasher.BandKey(const Sig: TNeuralMinHashSignature;
   BandIdx: integer): string;
 var
-  R, Start: integer;
+  R, Start, RowsM1: integer;
 begin
   Start := BandIdx * FRows;
   Result := '';
-  for R := 0 to FRows - 1 do
+  RowsM1 := FRows - 1;
+  for R := 0 to RowsM1 do
     Result := Result + IntToHex(Sig[Start + R], 16);
 end;
 
@@ -391,7 +400,7 @@ function TrueJaccardOfSets(A, B: TStringList): double;
 var
   Inter, UnionCnt, I: integer;
   SA, SB: TStringList;
-  Idx, ACount, BCount, SACount: integer;
+  Idx, ACount, BCount, SACount, ACountM1, BCountM1, SACountM1: integer;
 begin
   // Work on sorted SET copies so |A| / |B| / intersection are exact.
   SA := TStringList.Create;
@@ -401,12 +410,15 @@ begin
     SB.Sorted := true; SB.Duplicates := dupIgnore; SB.CaseSensitive := true;
     ACount := A.Count;
     BCount := B.Count;
-    for I := 0 to ACount - 1 do SA.Add(A[I]);
-    for I := 0 to BCount - 1 do SB.Add(B[I]);
+    ACountM1 := ACount - 1;
+    BCountM1 := BCount - 1;
+    for I := 0 to ACountM1 do SA.Add(A[I]);
+    for I := 0 to BCountM1 do SB.Add(B[I]);
     if (SA.Count = 0) and (SB.Count = 0) then Exit(1.0);
     Inter := 0;
     SACount := SA.Count;
-    for I := 0 to SACount - 1 do
+    SACountM1 := SACount - 1;
+    for I := 0 to SACountM1 do
       if SB.Find(SA[I], Idx) then Inc(Inter);
     UnionCnt := SACount + SB.Count - Inter;
     if UnionCnt = 0 then Exit(0.0);
@@ -449,7 +461,7 @@ procedure DeduplicateCorpusArr(const Docs: array of string;
   out KeepMask: TNeuralBooleanArray; out Stats: TNeuralDedupStats);
 var
   Hasher: TNeuralMinHasher;
-  N, I, B, D, Root: integer;
+  N, I, B, D, Root, NM1, BandsM1: integer;
   Sigs: array of TNeuralMinHashSignature;
   Buckets: TStringList; // band-bucket key -> first doc index seen (as Object)
   Parent: TIntArr;
@@ -462,27 +474,29 @@ begin
   FillChar(Stats, SizeOf(Stats), 0);
   Stats.DocCount := N;
   if N = 0 then Exit;
+  NM1 := N - 1;
 
   Hasher := TNeuralMinHasher.Create(NumHashes, NGramSize, Seed);
   try
     SetLength(Sigs, N);
-    for I := 0 to N - 1 do
+    for I := 0 to NM1 do
       Sigs[I] := Hasher.ComputeSignature(Docs[I]);
 
     SetLength(Parent, N);
-    for I := 0 to N - 1 do Parent[I] := I;
+    for I := 0 to NM1 do Parent[I] := I;
 
     // LSH banding: for each band, group docs sharing a band bucket; union the
     // confirmed candidate pairs. One bucket map per band (cleared between bands)
     // so only same-band collisions are candidates.
-    for B := 0 to Hasher.Bands - 1 do
+    BandsM1 := Hasher.Bands - 1;
+    for B := 0 to BandsM1 do
     begin
       Buckets := TStringList.Create;
       try
         Buckets.Sorted := true;
         Buckets.CaseSensitive := true;
         Buckets.Duplicates := dupError; // we manage first-seen ourselves
-        for D := 0 to N - 1 do
+        for D := 0 to NM1 do
         begin
           Key := Hasher.BandKey(Sigs[D], B);
           if Buckets.Find(Key, Idx) then
@@ -506,8 +520,8 @@ begin
 
     // KeepMask: keep a doc iff it IS its cluster root (lowest index).
     SetLength(ClusterSize, N);
-    for I := 0 to N - 1 do ClusterSize[I] := 0;
-    for I := 0 to N - 1 do
+    for I := 0 to NM1 do ClusterSize[I] := 0;
+    for I := 0 to NM1 do
     begin
       Root := UFFind(Parent, I);
       Inc(ClusterSize[Root]);
@@ -519,7 +533,7 @@ begin
     Stats.RemovedCount := 0;
     Stats.ClusterCount := 0;
     Stats.LargestClusterSize := 0;
-    for I := 0 to N - 1 do
+    for I := 0 to NM1 do
     begin
       if KeepMask[I] then Inc(Stats.KeptCount) else Inc(Stats.RemovedCount);
       if ClusterSize[I] > 1 then
@@ -540,11 +554,12 @@ procedure DeduplicateCorpus(Docs: TStringList; NumHashes, NGramSize: integer;
   out KeepMask: TNeuralBooleanArray; out Stats: TNeuralDedupStats);
 var
   Arr: array of string;
-  I, DocCount: integer;
+  I, DocCount, DocCountM1: integer;
 begin
   DocCount := Docs.Count;
   SetLength(Arr, DocCount);
-  for I := 0 to DocCount - 1 do Arr[I] := Docs[I];
+  DocCountM1 := DocCount - 1;
+  for I := 0 to DocCountM1 do Arr[I] := Docs[I];
   DeduplicateCorpusArr(Arr, NumHashes, NGramSize, Threshold, Seed,
     KeepMask, Stats);
 end;
