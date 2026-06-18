@@ -125,18 +125,19 @@ procedure ForwardProbsAndLogits(
   out Logits: array of TNeuralFloat);
 var
   Output: TNNetVolume;
-  I, N: integer;
+  I, N, NM1: integer;
   Sum, MaxV, Acc: TNeuralFloat;
   IsProb: boolean;
 begin
   NN.Compute(Input);
   Output := NN.GetLastLayer().Output;
   N := Output.Size;
+  NM1 := N - 1;
   // Detect whether the output already looks like a probability simplex
   // (non-negative entries summing to ~1) -> softmax head.
   Sum := 0;
   IsProb := True;
-  for I := 0 to N - 1 do
+  for I := 0 to NM1 do
   begin
     if Output.FData[I] < -cEps then IsProb := False;
     Sum := Sum + Output.FData[I];
@@ -145,7 +146,7 @@ begin
 
   if IsProb then
   begin
-    for I := 0 to N - 1 do
+    for I := 0 to NM1 do
     begin
       Probs[I]  := Max(cEps, Output.FData[I]);
       Logits[I] := Ln(Probs[I]); // pseudo-logits, see unit header
@@ -155,15 +156,15 @@ begin
   begin
     // Treat raw output as logits; softmax it into Probs.
     MaxV := Output.FData[0];
-    for I := 1 to N - 1 do
+    for I := 1 to NM1 do
       if Output.FData[I] > MaxV then MaxV := Output.FData[I];
     Acc := 0;
-    for I := 0 to N - 1 do
+    for I := 0 to NM1 do
     begin
       Logits[I] := Output.FData[I];
       Acc := Acc + Exp(Output.FData[I] - MaxV);
     end;
-    for I := 0 to N - 1 do
+    for I := 0 to NM1 do
       Probs[I] := Exp(Output.FData[I] - MaxV) / Max(cEps, Acc);
   end;
 end;
@@ -173,16 +174,17 @@ procedure SoftmaxTemp(
   const Logits: array of TNeuralFloat; T: TNeuralFloat;
   out Probs: array of TNeuralFloat; N: integer);
 var
-  I: integer;
+  I, NM1: integer;
   MaxV, Acc: TNeuralFloat;
 begin
+  NM1 := N - 1;
   MaxV := Logits[0] / T;
-  for I := 1 to N - 1 do
+  for I := 1 to NM1 do
     if Logits[I] / T > MaxV then MaxV := Logits[I] / T;
   Acc := 0;
-  for I := 0 to N - 1 do
+  for I := 0 to NM1 do
     Acc := Acc + Exp(Logits[I] / T - MaxV);
-  for I := 0 to N - 1 do
+  for I := 0 to NM1 do
     Probs[I] := Exp(Logits[I] / T - MaxV) / Max(cEps, Acc);
 end;
 
@@ -193,6 +195,7 @@ function ComputeCalibration(
   BinCount: integer): TNeuralCalibrationReport;
 var
   I, B, N, Total, InputCount: integer;
+  NM1, BinCountM1, InputCountM1: integer;
   Probs, Logits: array of TNeuralFloat;
   PredClass, TrueClass, J: integer;
   Conf, BrierAcc, Diff: TNeuralFloat;
@@ -213,6 +216,8 @@ begin
 
   N := NN.GetLastLayer().Output.Size;
   if N <= 0 then Exit;
+  NM1 := N - 1;
+  BinCountM1 := BinCount - 1;
   Result.NumClasses := N;
 
   SetLength(Probs, N);
@@ -222,7 +227,7 @@ begin
   SetLength(Result.BinAcc, BinCount);
   SetLength(BinSumConf, BinCount);
   SetLength(BinSumAcc, BinCount);
-  for B := 0 to BinCount - 1 do
+  for B := 0 to BinCountM1 do
   begin
     Result.BinCount_[B] := 0;
     BinSumConf[B] := 0;
@@ -233,7 +238,8 @@ begin
   Correct := 0;
   BrierAcc := 0;
   InputCount := Inputs.Count;
-  for I := 0 to InputCount - 1 do
+  InputCountM1 := InputCount - 1;
+  for I := 0 to InputCountM1 do
   begin
     if Inputs[I] = nil then Continue;
     if I >= Length(Labels) then Break;
@@ -245,7 +251,7 @@ begin
     // top-1 prediction + confidence.
     PredClass := 0;
     Conf := Probs[0];
-    for J := 1 to N - 1 do
+    for J := 1 to NM1 do
       if Probs[J] > Conf then
       begin
         Conf := Probs[J];
@@ -253,7 +259,7 @@ begin
       end;
 
     // Brier: sum over classes of (p_j - onehot_j)^2.
-    for J := 0 to N - 1 do
+    for J := 0 to NM1 do
     begin
       if J = TrueClass then Diff := Probs[J] - 1.0
       else Diff := Probs[J];
@@ -280,7 +286,7 @@ begin
 
   Result.ECE := 0;
   Result.MCE := 0;
-  for B := 0 to BinCount - 1 do
+  for B := 0 to BinCountM1 do
   begin
     if Result.BinCount_[B] > 0 then
     begin
@@ -306,7 +312,7 @@ function CalibrationReport(
 var
   Lines: TStringList;
   R: TNeuralCalibrationReport;
-  B, BarW, NConf, NAcc: integer;
+  B, BarW, NConf, NAcc, RBinCountM1: integer;
   Lo, Hi: TNeuralFloat;
 begin
   Result := '';
@@ -351,7 +357,8 @@ begin
     // ASCII chart: two bars per bin -- conf (-) and acc (#) -- over a 0..1
     // width-BarW axis. Where acc < conf the model is over-confident.
     BarW := 24;
-    for B := 0 to R.BinCount - 1 do
+    RBinCountM1 := R.BinCount - 1;
+    for B := 0 to RBinCountM1 do
     begin
       Lo := B / R.BinCount;
       Hi := (B + 1) / R.BinCount;
@@ -386,6 +393,7 @@ function FitTemperature(
   const Labels: array of integer): TNeuralFloat;
 var
   N, I, J, Step, TrueClass, Total, InputCount: integer;
+  NM1, InputCountM1, TotalM1: integer;
   Logits, Probs: array of TNeuralFloat;
   // cached pseudo-logits for every valid sample (one forward pass total).
   AllLogits: array of array of TNeuralFloat;
@@ -397,8 +405,10 @@ begin
   if (Inputs = nil) or (Inputs.Count = 0) then Exit;
   N := NN.GetLastLayer().Output.Size;
   if N <= 0 then Exit;
+  NM1 := N - 1;
 
   InputCount := Inputs.Count;
+  InputCountM1 := InputCount - 1;
   SetLength(Logits, N);
   SetLength(Probs, N);
   SetLength(AllLogits, InputCount);
@@ -407,7 +417,7 @@ begin
   // Single forward pass over the set; cache logits so the grid scan is pure
   // arithmetic (the backbone is touched exactly once and never mutated).
   Total := 0;
-  for I := 0 to InputCount - 1 do
+  for I := 0 to InputCountM1 do
   begin
     if Inputs[I] = nil then Continue;
     if I >= Length(Labels) then Break;
@@ -415,11 +425,12 @@ begin
     if (TrueClass < 0) or (TrueClass >= N) then Continue;
     ForwardProbsAndLogits(NN, Inputs[I], Probs, Logits);
     SetLength(AllLogits[Total], N);
-    for J := 0 to N - 1 do AllLogits[Total][J] := Logits[J];
+    for J := 0 to NM1 do AllLogits[Total][J] := Logits[J];
     AllLabel[Total] := TrueClass;
     Inc(Total);
   end;
   if Total = 0 then Exit;
+  TotalM1 := Total - 1;
 
   // Coarse-then-fine grid scan over T in [0.5, 5.0], minimising mean NLL.
   Lo := 0.5;
@@ -434,7 +445,7 @@ begin
     while T <= Hi + 1e-9 do
     begin
       NLL := 0;
-      for I := 0 to Total - 1 do
+      for I := 0 to TotalM1 do
       begin
         SoftmaxTemp(AllLogits[I], T, Probs, N);
         NLL := NLL - Ln(Max(cEps, Probs[AllLabel[I]]));
@@ -462,11 +473,13 @@ const
   cW = 256;   // image width  (pixels)
   cH = 256;   // image height (pixels)
   cMax = 255; // PGM max gray value
+  cWM1 = cW - 1;
+  cHM1 = cH - 1;
 var
   F: TextFile;
   Img: array of array of integer; // [row][col], 0=black .. 255=white
   X, Y, B, Col, BarTop, RefRow: integer;
-  BinW: integer;
+  BinW, BinWM1, ReportBinCountM1: integer;
   Acc: TNeuralFloat;
   Line: string;
 begin
@@ -474,33 +487,35 @@ begin
   if Report.BinCount <= 0 then Exit;
 
   SetLength(Img, cH, cW);
-  for Y := 0 to cH - 1 do
-    for X := 0 to cW - 1 do
+  for Y := 0 to cHM1 do
+    for X := 0 to cWM1 do
       Img[Y][X] := cMax; // white background
 
   BinW := cW div Report.BinCount;
   if BinW < 1 then BinW := 1;
+  BinWM1 := BinW - 1;
 
   // y = x reference (perfect-calibration) diagonal, mid-gray.
-  for X := 0 to cW - 1 do
+  for X := 0 to cWM1 do
   begin
     RefRow := (cH - 1) - Round((X / (cW - 1)) * (cH - 1));
     if (RefRow >= 0) and (RefRow < cH) then Img[RefRow][X] := 128;
   end;
 
   // Per-bin accuracy bars in dark gray, anchored at the bottom.
-  for B := 0 to Report.BinCount - 1 do
+  ReportBinCountM1 := Report.BinCount - 1;
+  for B := 0 to ReportBinCountM1 do
   begin
     if Report.BinCount_[B] <= 0 then Continue;
     Acc := Report.BinAcc[B];
     if Acc < 0 then Acc := 0;
     if Acc > 1 then Acc := 1;
     BarTop := (cH - 1) - Round(Acc * (cH - 1));
-    for Col := 0 to BinW - 1 do
+    for Col := 0 to BinWM1 do
     begin
       X := B * BinW + Col;
       if X >= cW then Break;
-      for Y := BarTop to cH - 1 do
+      for Y := BarTop to cHM1 do
         if Img[Y][X] = cMax then Img[Y][X] := 64
         else Img[Y][X] := 32; // darker where the bar crosses the diagonal
     end;
@@ -513,10 +528,10 @@ begin
     WriteLn(F, '# reliability diagram: per-bin accuracy bars vs y=x reference');
     WriteLn(F, cW, ' ', cH);
     WriteLn(F, cMax);
-    for Y := 0 to cH - 1 do
+    for Y := 0 to cHM1 do
     begin
       Line := '';
-      for X := 0 to cW - 1 do
+      for X := 0 to cWM1 do
       begin
         if Line <> '' then Line := Line + ' ';
         Line := Line + IntToStr(Img[Y][X]);

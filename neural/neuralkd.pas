@@ -216,22 +216,23 @@ end;
 procedure TNeuralKDTrainer.SoftenLogits(Logits: TNNetVolume;
   Temp: TNeuralFloat; Dest: TNNetVolume);
 var
-  I: integer;
+  I, LogitsSizeM1: integer;
   MaxLogit, SumExp, V: TNeuralFloat;
 begin
   if Dest.Size <> Logits.Size then Dest.ReSize(Logits);
+  LogitsSizeM1 := Logits.Size - 1;
   // Numerically stable softmax over (Logits / Temp).
   MaxLogit := Logits.FData[0] / Temp;
-  for I := 1 to Logits.Size - 1 do
+  for I := 1 to LogitsSizeM1 do
     if (Logits.FData[I] / Temp) > MaxLogit then MaxLogit := Logits.FData[I] / Temp;
   SumExp := 0;
-  for I := 0 to Logits.Size - 1 do
+  for I := 0 to LogitsSizeM1 do
   begin
     V := Exp((Logits.FData[I] / Temp) - MaxLogit);
     Dest.FData[I] := V;
     SumExp := SumExp + V;
   end;
-  for I := 0 to Logits.Size - 1 do
+  for I := 0 to LogitsSizeM1 do
     Dest.FData[I] := Dest.FData[I] / SumExp;
 end;
 
@@ -239,7 +240,7 @@ function TNeuralKDTrainer.ComputeLoss(pInput: TNNetVolume;
   HardLabel: integer): TNeuralFloat;
 var
   StudentLogits, TeacherLogits: TNNetVolume;
-  I: integer;
+  I, TeacherSoftSizeM1: integer;
   PHard: TNeuralFloat;
 begin
   // Forward passes. The teacher is run forward only -> never updated.
@@ -258,7 +259,8 @@ begin
   SoftenLogits(TeacherLogits, FTemperature, FTeacherSoft);
   // KL(qS || pS) = sum_i qS_i * (ln qS_i - ln pS_i).
   FLastKL := 0;
-  for I := 0 to FTeacherSoft.Size - 1 do
+  TeacherSoftSizeM1 := FTeacherSoft.Size - 1;
+  for I := 0 to TeacherSoftSizeM1 do
     FLastKL := FLastKL + FTeacherSoft.FData[I] *
       ( Ln(Max(FTeacherSoft.FData[I], FProbFloor)) -
         Ln(Max(FStudentSoft.FData[I], FProbFloor)) );
@@ -272,7 +274,7 @@ function TNeuralKDTrainer.AccumulateGradients(pInput: TNNetVolume;
   HardLabel: integer): TNeuralFloat;
 var
   Logit: TNNetLayer;
-  I: integer;
+  I, LogitGradSizeM1: integer;
   HardW, SoftW: TNeuralFloat;
 begin
   Result := ComputeLoss(pInput, HardLabel);
@@ -280,7 +282,8 @@ begin
   if FLogitGrad.Size <> FStudentHard.Size then FLogitGrad.ReSize(FStudentHard);
   HardW := FAlpha;
   SoftW := (1 - FAlpha) * FTemperature;   // (1-alpha)*T^2 * (1/T)
-  for I := 0 to FLogitGrad.Size - 1 do
+  LogitGradSizeM1 := FLogitGrad.Size - 1;
+  for I := 0 to LogitGradSizeM1 do
     FLogitGrad.FData[I] :=
       HardW * FStudentHard.FData[I] +
       SoftW * (FStudentSoft.FData[I] - FTeacherSoft.FData[I]);

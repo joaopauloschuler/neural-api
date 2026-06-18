@@ -481,10 +481,11 @@ implementation
 
 function DPOTokens(const S: string): TNeuralDPOTokenArray;
 var
-  I: integer;
+  I, LenS: integer;
 begin
   SetLength(Result, Length(S));
-  for I := 1 to Length(S) do Result[I-1] := Ord(S[I]);
+  LenS := Length(S);
+  for I := 1 to LenS do Result[I-1] := Ord(S[I]);
 end;
 
 // Numerically stable softplus: ln(1+exp(X)).
@@ -601,7 +602,7 @@ procedure TNeuralDPOTrainer.EncodePrefix(NN: TNNet;
   const Prompt, Completion: array of integer; UpToTokenCount: integer);
 var
   Prefix: TNeuralDPOTokenArray;
-  PrefixLen, ContextLen, StartPos, I: integer;
+  PrefixLen, ContextLen, StartPos, I, PrefixLenM1: integer;
   FirstLayerOutput: TNNetVolume;
 begin
   FirstLayerOutput := NN.GetFirstLayer().Output;
@@ -611,7 +612,8 @@ begin
   // Sliding window: keep only the most recent ContextLen tokens.
   StartPos := Max(0, PrefixLen - ContextLen);
   SetLength(Prefix, PrefixLen - StartPos);
-  for I := StartPos to PrefixLen - 1 do
+  PrefixLenM1 := PrefixLen - 1;
+  for I := StartPos to PrefixLenM1 do
   begin
     if I < Length(Prompt)
     then Prefix[I - StartPos] := Prompt[I]
@@ -623,11 +625,12 @@ end;
 function TNeuralDPOTrainer.SequenceLogProb(NN: TNNet;
   const Prompt, Completion: array of integer): TNeuralFloat;
 var
-  T: integer;
+  T, CompletionHi: integer;
   P: TNeuralFloat;
 begin
   Result := 0;
-  for T := 0 to High(Completion) do
+  CompletionHi := High(Completion);
+  for T := 0 to CompletionHi do
   begin
     EncodePrefix(NN, Prompt, Completion, T);
     NN.Compute(FInput);
@@ -757,23 +760,25 @@ end;
 procedure TNeuralDPOTrainer.BackpropagateCompletion(
   const Prompt, Completion: array of integer; ErrScale: TNeuralFloat);
 var
-  T, I, Target: integer;
+  T, I, Target, CompletionHi, YSizeM1: integer;
   Y: TNNetVolume;
   PTarget: TNeuralFloat;
 begin
-  for T := 0 to High(Completion) do
+  CompletionHi := High(Completion);
+  for T := 0 to CompletionHi do
   begin
     Target := Completion[T];
     EncodePrefix(FPolicy, Prompt, Completion, T);
     FPolicy.Compute(FInput);
     Y := FPolicy.GetLastLayer().Output;
     if FPseudoTarget.Size <> Y.Size then FPseudoTarget.ReSize(Y);
+    YSizeM1 := Y.Size - 1;
     // TNNet.Backpropagate(pDesired) sets the output error e = Y - pDesired,
     // so pDesired = Y - e for the error signal e we want (see unit header).
     if FSkipDerivSoftmax then
     begin
       // e must equal dL/dlogit = -ErrScale*(y - onehot) directly.
-      for I := 0 to Y.Size - 1 do
+      for I := 0 to YSizeM1 do
         FPseudoTarget.FData[I] := Y.FData[I] * (1 + ErrScale);
       FPseudoTarget.FData[Target] := FPseudoTarget.FData[Target] - ErrScale;
     end
@@ -857,7 +862,7 @@ procedure TNeuralRewardModelTrainer.EncodeSequence(
   const Prompt, Response: array of integer);
 var
   Seq: TNeuralDPOTokenArray;
-  SeqLen, ContextLen, StartPos, I: integer;
+  SeqLen, ContextLen, StartPos, I, SeqLenM1: integer;
   FirstLayerOutput: TNNetVolume;
 begin
   FirstLayerOutput := FRewardNet.GetFirstLayer().Output;
@@ -867,7 +872,8 @@ begin
   // Sliding window: keep only the most recent ContextLen tokens.
   StartPos := Max(0, SeqLen - ContextLen);
   SetLength(Seq, SeqLen - StartPos);
-  for I := StartPos to SeqLen - 1 do
+  SeqLenM1 := SeqLen - 1;
+  for I := StartPos to SeqLenM1 do
   begin
     if I < Length(Prompt)
     then Seq[I - StartPos] := Prompt[I]
@@ -1001,7 +1007,7 @@ procedure TNeuralGRPOTrainer.EncodePrefix(NN: TNNet;
   const Prompt, Completion: array of integer; UpToTokenCount: integer);
 var
   Prefix: TNeuralDPOTokenArray;
-  PrefixLen, ContextLen, StartPos, I: integer;
+  PrefixLen, ContextLen, StartPos, I, PrefixLenM1: integer;
   FirstLayerOutput: TNNetVolume;
 begin
   FirstLayerOutput := NN.GetFirstLayer().Output;
@@ -1010,7 +1016,8 @@ begin
   PrefixLen := Length(Prompt) + UpToTokenCount;
   StartPos := Max(0, PrefixLen - ContextLen);
   SetLength(Prefix, PrefixLen - StartPos);
-  for I := StartPos to PrefixLen - 1 do
+  PrefixLenM1 := PrefixLen - 1;
+  for I := StartPos to PrefixLenM1 do
   begin
     if I < Length(Prompt)
     then Prefix[I - StartPos] := Prompt[I]
@@ -1022,11 +1029,12 @@ end;
 function TNeuralGRPOTrainer.SequenceLogProb(NN: TNNet;
   const Prompt, Completion: array of integer): TNeuralFloat;
 var
-  T: integer;
+  T, CompletionHi: integer;
   P: TNeuralFloat;
 begin
   Result := 0;
-  for T := 0 to High(Completion) do
+  CompletionHi := High(Completion);
+  for T := 0 to CompletionHi do
   begin
     EncodePrefix(NN, Prompt, Completion, T);
     NN.Compute(FInput);
@@ -1039,7 +1047,7 @@ procedure TNeuralGRPOTrainer.SampleCompletion(const Prompt: array of integer;
   out Completion: TNeuralDPOTokenArray;
   out OldLogProbs: array of TNeuralFloat; var SampledLen: integer);
 var
-  T, I, Vocab, Picked: integer;
+  T, I, Vocab, Picked, FMaxNewTokensM1, VocabM1: integer;
   Y: TNNetVolume;
   R, Acc, Sum, MaxLogit, P, InvTemp: TNeuralFloat;
   Probs: array of TNeuralFloat;
@@ -1047,9 +1055,11 @@ begin
   SetLength(Completion, FMaxNewTokens);
   SampledLen := FMaxNewTokens;
   Vocab := FPolicy.GetLastLayer().Output.Size;
+  VocabM1 := Vocab - 1;
   SetLength(Probs, Vocab);
   if FTemperature > 0 then InvTemp := 1.0 / FTemperature else InvTemp := 1.0;
-  for T := 0 to FMaxNewTokens - 1 do
+  FMaxNewTokensM1 := FMaxNewTokens - 1;
+  for T := 0 to FMaxNewTokensM1 do
   begin
     EncodePrefix(FPolicy, Prompt, Completion, T);
     FPolicy.Compute(FInput);
@@ -1058,21 +1068,21 @@ begin
     // (The last layer already outputs probabilities, so apply temperature in
     // log space: logit' = ln(p)/Tau.)
     MaxLogit := -1e30;
-    for I := 0 to Vocab - 1 do
+    for I := 0 to VocabM1 do
     begin
       P := Ln(Max(Y.FData[I], FProbFloor)) * InvTemp;
       Probs[I] := P;
       if P > MaxLogit then MaxLogit := P;
     end;
     Sum := 0;
-    for I := 0 to Vocab - 1 do
+    for I := 0 to VocabM1 do
     begin
       Probs[I] := Exp(Probs[I] - MaxLogit);
       Sum := Sum + Probs[I];
     end;
     R := Random * Sum;
     Acc := 0; Picked := Vocab - 1;
-    for I := 0 to Vocab - 1 do
+    for I := 0 to VocabM1 do
     begin
       Acc := Acc + Probs[I];
       if R <= Acc then begin Picked := I; Break; end;
@@ -1089,20 +1099,21 @@ class procedure TNeuralGRPOTrainer.ComputeAdvantages(
   const Rewards: array of TNeuralFloat; var Advantages: array of TNeuralFloat;
   Eps: TNeuralFloat; out Mean, Std: TNeuralFloat);
 var
-  I, N: integer;
+  I, N, NM1: integer;
   S, Var_: TNeuralFloat;
 begin
   N := Length(Rewards);
   Mean := 0; Std := 0;
   if N = 0 then Exit;
+  NM1 := N - 1;
   S := 0;
-  for I := 0 to N - 1 do S := S + Rewards[I];
+  for I := 0 to NM1 do S := S + Rewards[I];
   Mean := S / N;
   Var_ := 0;
-  for I := 0 to N - 1 do Var_ := Var_ + Sqr(Rewards[I] - Mean);
+  for I := 0 to NM1 do Var_ := Var_ + Sqr(Rewards[I] - Mean);
   Var_ := Var_ / N;            // population variance (GRPO uses /N)
   Std := Sqrt(Var_);
-  for I := 0 to N - 1 do
+  for I := 0 to NM1 do
     Advantages[I] := (Rewards[I] - Mean) / (Std + Eps);
 end;
 
@@ -1110,7 +1121,7 @@ procedure TNeuralGRPOTrainer.BackpropagateToken(
   const Prompt, Completion: array of integer; UpToTokenCount,
   Target: integer; ErrScale: TNeuralFloat);
 var
-  I: integer;
+  I, YSizeM1: integer;
   Y: TNNetVolume;
   PTarget: TNeuralFloat;
 begin
@@ -1118,6 +1129,7 @@ begin
   FPolicy.Compute(FInput);
   Y := FPolicy.GetLastLayer().Output;
   if FPseudoTarget.Size <> Y.Size then FPseudoTarget.ReSize(Y);
+  YSizeM1 := Y.Size - 1;
   // ErrScale = dL/d logpi(target). Since d logpi/d logit = (onehot - y),
   //   dL/d logit = ErrScale*(onehot - y) = -ErrScale*(y - onehot),
   // identical to the DPO plumbing: pass pDesired so the logit gradient is
@@ -1125,7 +1137,7 @@ begin
   // backward conventions.)
   if FSkipDerivSoftmax then
   begin
-    for I := 0 to Y.Size - 1 do
+    for I := 0 to YSizeM1 do
       FPseudoTarget.FData[I] := Y.FData[I] * (1 + ErrScale);
     FPseudoTarget.FData[Target] := FPseudoTarget.FData[Target] - ErrScale;
   end
@@ -1141,7 +1153,7 @@ end;
 function TNeuralGRPOTrainer.TrainOnPrompt(
   const Prompt: array of integer): TNeuralFloat;
 var
-  G, T, Len, MaxLen: integer;
+  G, T, Len, MaxLen, FGroupSizeM1, LenM1: integer;
   Completions: array of TNeuralDPOTokenArray;
   OldLP: array of array of TNeuralFloat;
   Lengths: array of integer;
@@ -1156,6 +1168,7 @@ begin
   if not Assigned(FReward) then
     raise Exception.Create('TNeuralGRPOTrainer: Reward callback not assigned.');
   if FGroupSize < 1 then FGroupSize := 1;
+  FGroupSizeM1 := FGroupSize - 1;
 
   SetLength(Completions, FGroupSize);
   SetLength(OldLP, FGroupSize);
@@ -1164,7 +1177,7 @@ begin
   SetLength(Advantages, FGroupSize);
 
   // ---- 1) Sample the group + score each completion. -----------------------
-  for G := 0 to FGroupSize - 1 do
+  for G := 0 to FGroupSizeM1 do
   begin
     SetLength(OldLP[G], FMaxNewTokens);
     MaxLen := FMaxNewTokens;
@@ -1182,11 +1195,12 @@ begin
   FPolicy.SetBatchUpdate(true);
   FPolicy.ClearDeltas();
   TotalKL := 0; TotalObj := 0; TokenCount := 0;
-  for G := 0 to FGroupSize - 1 do
+  for G := 0 to FGroupSizeM1 do
   begin
     A := Advantages[G];
     Len := Lengths[G];
-    for T := 0 to Len - 1 do
+    LenM1 := Len - 1;
+    for T := 0 to LenM1 do
     begin
       // Current policy log-prob of the sampled token (forward pass).
       EncodePrefix(FPolicy, Prompt, Completions[G], T);
