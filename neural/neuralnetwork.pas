@@ -9462,6 +9462,7 @@ type
     FNumReflections: integer;  // K
     FDim: integer;             // n = Depth
     FCache: TNNetVolume;       // x_{i+1} stacked: row i holds the input to H_i
+    FgBuf: array of TNeuralFloat; // backward reflection-walk scratch g (length n)
     procedure ComputePreviousLayerErrorCPU(); override;
   public
     // pSizeY carries the reflection count K (this is a vector n->n map, so the
@@ -9534,7 +9535,19 @@ type
     FCacheV: TNNetVolume;                // v = M.u                     (D_out)
     FCacheZ: TNNetVolume;                // z = exp_0(v)                (D_out)
     FCacheB: TNNetVolume;                // Mobius bias b               (D_out)
+    // Backward scratch (per-instance; a layer never backprops on two threads at
+    // once). Shared by BackpropagateCPU and ComputePreviousLayerErrorCPU, which
+    // run sequentially (never nested) within one Backpropagate.
+    FgBuf: array of TNeuralFloat;        // upstream error g = dL/dy    (D_out)
+    FdLdvBuf: array of TNeuralFloat;     // dL/dv                       (D_out)
+    FdLdbBuf: array of TNeuralFloat;     // dL/db                       (D_out)
+    FdLduBuf: array of TNeuralFloat;     // dL/du                       (D_in)
+    FdLdzBuf: array of TNeuralFloat;     // dL/dz (Mobius-back scratch) (D_out)
     procedure ComputePreviousLayerErrorCPU(); override;
+    // Shared Mobius-add + exp_0 backward helper (member so it can reuse FdLdzBuf).
+    procedure ComputeMobiusBack(const c: TNeuralFloat; const Z, B: TNNetVolume;
+      const g: array of TNeuralFloat; ExpGammaVal, ExpBetaVal: TNeuralFloat;
+      var dLdv, dLdb: array of TNeuralFloat);
     // Radial log/exp coefficients and their (d coeff / d norm)/norm helpers,
     // all with a small-norm series fallback so the Jacobian stays finite.
     function LogCoef(const n: TNeuralFloat): TNeuralFloat;   // alpha(||x||)
@@ -9602,6 +9615,11 @@ type
     FCacheM: TNNetVolume;                // m_k = (-x)(+)_c p_k, k-th row  (K x D_in)
     FCacheR: TNNetVolume;                // radius r_k = ||m_k||           (K)
     FCacheDen: TNNetVolume;              // Mobius denominator Den_k       (K)
+    // Backward scratch (per-instance; BackpropagateCPU and
+    // ComputePreviousLayerErrorCPU run sequentially, never nested), each D_in.
+    FdLdmBuf: array of TNeuralFloat;     // radial seed dL/dm_k            (D_in)
+    FdLdaBuf: array of TNeuralFloat;     // dL/da                          (D_in)
+    FdLdbBuf: array of TNeuralFloat;     // dL/dp_k                        (D_in)
     procedure ComputePreviousLayerErrorCPU(); override;
     // Accumulates dL/da and dL/dp_k for ONE prototype given the radial seed
     // dLdm = (dL/dr_k / r_k) * m_k. Shared by the weight- and input-gradient
@@ -9614,6 +9632,7 @@ type
     // pCurvature is the fixed ball curvature c > 0 (default 1.0).
     constructor Create(pNumProto: integer; pCurvature: TNeuralFloat = 1.0); reintroduce; overload;
     destructor Destroy(); override;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure Compute(); override;
     procedure ComputeCPU(); override;
     procedure Backpropagate(); override;
@@ -11520,6 +11539,8 @@ type
     FBlockSize: integer;  // m (block size, n = b*m)
     FCacheXR: TNNetVolume; // R*x  (length n, (b,m) layout)
     FCacheZP: TNNetVolume; // P*(R*x) (length n, (m,b) layout)
+    FdyTBuf: array of TNeuralFloat; // backward scratch, length n
+    FdxRBuf: array of TNeuralFloat; // backward scratch, length n
     procedure ComputeCPU();
     procedure BackpropagateCPU();
   public
@@ -11559,6 +11580,7 @@ type
     FQ: integer;     // q (B is q x q)
     FPinP: integer;  // requested factor split (0 = auto); resolved p (FP) round-trips via FStruct[1]
     FCacheBX: TNNetVolume; // B*X (q x p), reused by both A-grad and X-grad
+    FGBuf: array of TNeuralFloat; // backward scratch dY*A, q x p (length n)
     procedure ComputeCPU();
     procedure BackpropagateCPU();
   public
@@ -11680,6 +11702,9 @@ type
     FNumLeaves: integer;   // 2^D
     FCacheP: TNNetVolume;  // p_i per inner node, cached for backward (len FNumInner)
     FCacheLeaf: TNNetVolume; // P_l per leaf, cached for backward (len FNumLeaves)
+    FrBuf: array of TNeuralFloat; // per-leaf responsibility r_l (len FNumLeaves)
+    FABuf: array of TNeuralFloat; // per-inner-node left subtree sums (len FNumInner)
+    FBBuf: array of TNeuralFloat; // per-inner-node right subtree sums (len FNumInner)
     procedure ComputeCPU();
     procedure BackpropagateCPU();
   public
@@ -63777,6 +63802,8 @@ destructor TNNetMonarchLinear.Destroy();
 begin
   FCacheXR.Free;
   FCacheZP.Free;
+  SetLength(FdyTBuf, 0);
+  SetLength(FdxRBuf, 0);
   inherited Destroy();
 end;
 
@@ -63808,6 +63835,8 @@ begin
   FOutputErrorDeriv.ReSize(N, 1, 1);
   FCacheXR.ReSize(N, 1, 1);
   FCacheZP.ReSize(N, 1, 1);
+  SetLength(FdyTBuf, N);
+  SetLength(FdxRBuf, N);
 
   // neuron 0 = R, neuron 1 = L (each b blocks of m*m), neuron 2 = bias (n).
   BlockWeights := FBlocks * FBlockSize * FBlockSize;
@@ -63949,7 +63978,6 @@ var
   PrevOut, WR, WL, WRDelta, WLDelta, BiasDelta, LocalPrevError: TNNetVolume;
   acc, e: TNeuralFloat;
   HasPrevError: boolean;
-  dyT, dxR: array of TNeuralFloat; // scratch, both length n
 begin
   b := FBlocks;
   m := FBlockSize;
@@ -63971,11 +63999,9 @@ begin
       BiasDelta.FData[k] := BiasDelta.FData[k] - FLearningRate * FOutputError.FData[k];
 
   // dyT[k,c] = dy[c,k]  (P: undo P^T). Stored in (m,b) layout index k*b+c.
-  SetLength(dyT, FDim);
-  SetLength(dxR, FDim);
   for c := 0 to MaxBlk do
     for k := 0 to MaxM do
-      dyT[k * b + c] := FOutputError.FData[c * m + k];
+      FdyTBuf[k * b + c] := FOutputError.FData[c * m + k];
 
   // L weight grad + back through L -> dzP, then dxR = P^T(dzP). zP (the forward
   // pass-2 output) is still in FCacheZP; FCacheXR (forward R*x) is read for dR.
@@ -63985,7 +64011,7 @@ begin
     // dL_c[k,t] += dyT[k,c] * zP[t,c].
     for k := 0 to MaxM do
     begin
-      e := dyT[k * b + c];
+      e := FdyTBuf[k * b + c];
       for t := 0 to MaxM do
         WLDelta.FData[blkBase + k * m + t] :=
           WLDelta.FData[blkBase + k * m + t]
@@ -63996,8 +64022,8 @@ begin
     begin
       acc := 0;
       for k := 0 to MaxM do
-        acc := acc + WL.FData[blkBase + k * m + t] * dyT[k * b + c];
-      dxR[c * m + t] := acc; // P^T: (m,b)[t,c]->(b,m)[c,t]
+        acc := acc + WL.FData[blkBase + k * m + t] * FdyTBuf[k * b + c];
+      FdxRBuf[c * m + t] := acc; // P^T: (m,b)[t,c]->(b,m)[c,t]
     end;
   end;
 
@@ -64007,7 +64033,7 @@ begin
     blkBase := r * m * m;
     for k := 0 to MaxM do
     begin
-      e := dxR[r * m + k];
+      e := FdxRBuf[r * m + k];
       for t := 0 to MaxM do
         WRDelta.FData[blkBase + k * m + t] :=
           WRDelta.FData[blkBase + k * m + t]
@@ -64018,7 +64044,7 @@ begin
       begin
         acc := 0;
         for k := 0 to MaxM do
-          acc := acc + WR.FData[blkBase + k * m + t] * dxR[r * m + k];
+          acc := acc + WR.FData[blkBase + k * m + t] * FdxRBuf[r * m + k];
         LocalPrevError.FData[r * m + t] := LocalPrevError.FData[r * m + t] + acc;
       end;
   end;
@@ -64058,6 +64084,7 @@ end;
 destructor TNNetKroneckerLinear.Destroy();
 begin
   FCacheBX.Free;
+  SetLength(FGBuf, 0);
   inherited Destroy();
 end;
 
@@ -64093,6 +64120,7 @@ begin
   FOutputError.ReSize(N, 1, 1);
   FOutputErrorDeriv.ReSize(N, 1, 1);
   FCacheBX.ReSize(N, 1, 1); // B*X is q x p = n reals
+  SetLength(FGBuf, N); // dY*A scratch is q x p = n reals
 
   // neuron 0 = A (p*p), neuron 1 = B (q*q), neuron 2 = bias (n).
   FNeurons[0].Weights.ReSize(FP * FP, 1, 1);
@@ -64224,7 +64252,6 @@ var
   PrevOut, WA, WB, WADelta, WBDelta, BiasDelta, LocalPrevError: TNNetVolume;
   acc, dyij, glil: TNeuralFloat;
   HasPrevError: boolean;
-  G: array of TNeuralFloat; // dY*A, q x p, index i*p+l
 begin
   p := FP;
   q := FQ;
@@ -64256,7 +64283,6 @@ begin
     end;
 
   // G[i,l] = sum_j dY[i,j]*A[j,l]  (= dY*A).
-  SetLength(G, q * p);
   for i := 0 to MaxQ do
     for l := 0 to MaxP do
     begin
@@ -64266,7 +64292,7 @@ begin
         dyij := FOutputError.FData[i * p + j];
         acc := acc + dyij * WA.FData[j * p + l];
       end;
-      G[i * p + l] := acc;
+      FGBuf[i * p + l] := acc;
     end;
 
   // dB[i,k] += sum_l G[i,l]*X[k,l]   (X[k,l] = x[k*p+l]).
@@ -64275,7 +64301,7 @@ begin
     begin
       acc := 0;
       for l := 0 to MaxP do
-        acc := acc + G[i * p + l] * PrevOut.FData[k * p + l];
+        acc := acc + FGBuf[i * p + l] * PrevOut.FData[k * p + l];
       WBDelta.FData[i * q + k] := WBDelta.FData[i * q + k] - FLearningRate * acc;
     end;
 
@@ -64287,7 +64313,7 @@ begin
         acc := 0;
         for i := 0 to MaxQ do
         begin
-          glil := G[i * p + l];
+          glil := FGBuf[i * p + l];
           acc := acc + WB.FData[i * q + k] * glil;
         end;
         LocalPrevError.FData[k * p + l] := LocalPrevError.FData[k * p + l] + acc;
@@ -64725,6 +64751,9 @@ destructor TNNetSoftDecisionTree.Destroy();
 begin
   FCacheP.Free;
   FCacheLeaf.Free;
+  SetLength(FrBuf, 0);
+  SetLength(FABuf, 0);
+  SetLength(FBBuf, 0);
   inherited Destroy();
 end;
 
@@ -64742,6 +64771,9 @@ begin
   FOutputErrorDeriv.ReSize(1, 1, FOutDepth);
   FCacheP.ReSize(FNumInner, 1, 1);
   FCacheLeaf.ReSize(FNumLeaves, 1, 1);
+  SetLength(FrBuf, FNumLeaves);
+  SetLength(FABuf, FNumInner);
+  SetLength(FBBuf, FNumInner);
 
   // Gate neurons: Din weights + bias each.
   MaxInner := FNumInner - 1;
@@ -64880,8 +64912,6 @@ var
   PrevOut, LocalPrevError, GateW, GateDelta, LeafW, LeafDelta: TNNetVolume;
   gd, rl, pp, dzi, lr: TNeuralFloat;
   HasPrevError: boolean;
-  r: array of TNeuralFloat;    // per-leaf responsibility r_l
-  A, B: array of TNeuralFloat; // per-inner-node left / right subtree sums
 begin
   PrevOut := FPrevLayer.FOutput;
   HasPrevError := (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size);
@@ -64889,7 +64919,6 @@ begin
   lr := FLearningRate;
 
   // Per-leaf responsibility and leaf-vector gradient.
-  SetLength(r, FNumLeaves);
   MaxLeaf := FNumLeaves - 1;
   MaxInner := FNumInner - 1;
   MaxOut := FOutDepth - 1;
@@ -64899,7 +64928,7 @@ begin
     LeafW := FArrNeurons[FNumInner + l].FWeights;
     for d := 0 to MaxOut do
       gd := gd + FOutputError.FData[d] * LeafW.FData[d];
-    r[l] := gd * FCacheLeaf.FData[l];
+    FrBuf[l] := gd * FCacheLeaf.FData[l];
     // dL/dphi_l[d] = P_l * g_d.
     LeafDelta := FArrNeurons[FNumInner + l].FDelta;
     pp := FCacheLeaf.FData[l];
@@ -64909,12 +64938,10 @@ begin
 
   // Accumulate A_i / B_i: walk each leaf's path and add r_l to the left/right
   // bucket of every node on the path according to the branch taken.
-  SetLength(A, FNumInner);
-  SetLength(B, FNumInner);
   for i := 0 to MaxInner do
   begin
-    A[i] := 0;
-    B[i] := 0;
+    FABuf[i] := 0;
+    FBBuf[i] := 0;
   end;
   for l := 0 to MaxLeaf do
   begin
@@ -64924,12 +64951,12 @@ begin
       bit := (l shr level) and 1;
       if bit = 0 then
       begin
-        A[node] := A[node] + r[l];
+        FABuf[node] := FABuf[node] + FrBuf[l];
         node := 2 * node + 1;
       end
       else
       begin
-        B[node] := B[node] + r[l];
+        FBBuf[node] := FBBuf[node] + FrBuf[l];
         node := 2 * node + 2;
       end;
     end;
@@ -64939,7 +64966,7 @@ begin
   for i := 0 to MaxInner do
   begin
     pp := FCacheP.FData[i];
-    dzi := FBeta * (A[i] * (1.0 - pp) - B[i] * pp);
+    dzi := FBeta * (FABuf[i] * (1.0 - pp) - FBBuf[i] * pp);
     GateW := FArrNeurons[i].FWeights;
     GateDelta := FArrNeurons[i].FDelta;
     // dL/dw_i = dz_i * x ; dL/db_i = dz_i.
@@ -65169,6 +65196,7 @@ end;
 destructor TNNetHouseholderLinear.Destroy();
 begin
   FCache.Free;
+  SetLength(FgBuf, 0);
   inherited Destroy();
 end;
 
@@ -65202,6 +65230,7 @@ begin
     FNeurons[ReflIdx].Delta.ReSize(N, 1, 1);
   end;
   FCache.ReSize(FNumReflections, 1, N); // row r (depth axis) = input to H_r
+  SetLength(FgBuf, N);
 
   FVectorSize := FNeurons[0].Weights.Size;
   BuildArrNeurons();
@@ -65312,7 +65341,6 @@ var
   N, ReflIdx, j, MaxN, MaxRefl: integer;
   beta, s, dgv, duv, coef: TNeuralFloat;
   V, VDelta, BiasDelta, U: TNNetVolume;
-  g: array of TNeuralFloat;
 begin
   N := FDim;
   MaxN := N - 1;
@@ -65322,9 +65350,8 @@ begin
     for j := 0 to MaxN do
       BiasDelta.FData[j] := BiasDelta.FData[j] - FLearningRate * FOutputError.FData[j];
 
-  SetLength(g, N);
   for j := 0 to MaxN do
-    g[j] := FOutputError.FData[j];
+    FgBuf[j] := FOutputError.FData[j];
 
   for ReflIdx := 0 to MaxRefl do
   begin
@@ -65335,7 +65362,7 @@ begin
     for j := 0 to MaxN do
     begin
       beta := beta + V.FData[j] * V.FData[j];
-      dgv := dgv + V.FData[j] * g[j];
+      dgv := dgv + V.FData[j] * FgBuf[j];
       duv := duv + V.FData[j] * U.FData[ReflIdx + j * FNumReflections];
     end;
     if beta < HOUSEHOLDER_MIN_BETA then continue; // identity -> no grad, g unchanged
@@ -65346,10 +65373,10 @@ begin
       VDelta.FData[j] := VDelta.FData[j]
         - FLearningRate *
           ( -s * ( dgv * U.FData[ReflIdx + j * FNumReflections]
-                   + duv * g[j] - coef * V.FData[j] ) );
+                   + duv * FgBuf[j] - coef * V.FData[j] ) );
     // Advance g <- H_i * g.
     for j := 0 to MaxN do
-      g[j] := g[j] - s * dgv * V.FData[j];
+      FgBuf[j] := FgBuf[j] - s * dgv * V.FData[j];
   end;
 
   if not FBatchUpdate then
@@ -65368,15 +65395,13 @@ var
   N, ReflIdx, j, MaxN, MaxRefl: integer;
   beta, dgv, s: TNeuralFloat;
   V, LocalPrevError: TNNetVolume;
-  g: array of TNeuralFloat;
 begin
   N := FDim;
   MaxN := N - 1;
   MaxRefl := FNumReflections - 1;
   LocalPrevError := FPrevLayer.OutputError;
-  SetLength(g, N);
   for j := 0 to MaxN do
-    g[j] := FOutputError.FData[j];
+    FgBuf[j] := FOutputError.FData[j];
   for ReflIdx := 0 to MaxRefl do
   begin
     V := FArrNeurons[ReflIdx].FWeights;
@@ -65384,15 +65409,15 @@ begin
     for j := 0 to MaxN do
     begin
       beta := beta + V.FData[j] * V.FData[j];
-      dgv := dgv + V.FData[j] * g[j];
+      dgv := dgv + V.FData[j] * FgBuf[j];
     end;
     if beta < HOUSEHOLDER_MIN_BETA then continue;
     s := 2.0 / beta;
     for j := 0 to MaxN do
-      g[j] := g[j] - s * dgv * V.FData[j];
+      FgBuf[j] := FgBuf[j] - s * dgv * V.FData[j];
   end;
   for j := 0 to MaxN do
-    LocalPrevError.FData[j] := LocalPrevError.FData[j] + g[j];
+    LocalPrevError.FData[j] := LocalPrevError.FData[j] + FgBuf[j];
 end;
 
 { TNNetHyperbolicLinear }
@@ -65456,6 +65481,12 @@ end;
 procedure TNNetHyperbolicLinear.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
+  // Size the per-instance backward scratch (D_out vectors plus the D_in dL/du).
+  SetLength(FgBuf, FOutput.Size);
+  SetLength(FdLdvBuf, FOutput.Size);
+  SetLength(FdLdbBuf, FOutput.Size);
+  SetLength(FdLdzBuf, FOutput.Size);
+  SetLength(FdLduBuf, pPrevLayer.Output.Size);
   // Append ONE extra 1-weight neuron holding the raw (pre-sigmoid) curvature,
   // wired like TNNetRetention's learnable gamma. The matrix-row backward loops
   // only touch FArrNeurons[0..D_out-1], so this neuron is invisible to them but
@@ -65501,6 +65532,11 @@ begin
   FCacheV.Free;
   FCacheZ.Free;
   FCacheB.Free;
+  SetLength(FgBuf, 0);
+  SetLength(FdLdvBuf, 0);
+  SetLength(FdLdbBuf, 0);
+  SetLength(FdLduBuf, 0);
+  SetLength(FdLdzBuf, 0);
   inherited Destroy();
 end;
 
@@ -65830,9 +65866,10 @@ end;
 // the input-gradient (ComputePreviousLayerErrorCPU) paths. Given the upstream
 // error g = dL/dy it computes dL/dz and dL/db (Mobius-add Jacobian) and then
 // dL/dv (exp_0 radial Jacobian). The two callers each recompute this so the
-// layer is correct at LearningRate = 0 too. Kept inline (no member) for clarity;
-// it is O(D_out) and runs at most twice per backward.
-procedure ComputeHyperbolicMobiusBack(
+// layer is correct at LearningRate = 0 too. A member (so its dLdz scratch reuses
+// the persistent FdLdzBuf field); it is O(D_out) and runs at most twice per
+// backward.
+procedure TNNetHyperbolicLinear.ComputeMobiusBack(
   const c: TNeuralFloat; const Z, B: TNNetVolume;
   const g: array of TNeuralFloat; ExpGammaVal, ExpBetaVal: TNeuralFloat;
   var dLdv, dLdb: array of TNeuralFloat);
@@ -65841,11 +65878,9 @@ var
   nOutMax: integer;
   A, nz2, nb2, p, qq, Den, Gy: TNeuralFloat;
   gz, gb, hv: TNeuralFloat;
-  dLdz: array of TNeuralFloat;
 begin
   nOut := Z.Size;
   nOutMax := nOut - 1;
-  SetLength(dLdz, nOut);
   A := 0; nz2 := 0; nb2 := 0;
   for jOut := 0 to nOutMax do
   begin
@@ -65872,7 +65907,7 @@ begin
   //           - (Gy/Den^2)[2c z_l + 2c^2 nz2 b_l].
   for jOut := 0 to nOutMax do
   begin
-    dLdz[jOut] :=
+    FdLdzBuf[jOut] :=
       ( 2.0*c*B.FData[jOut]*gz + p*g[jOut] - 2.0*c*Z.FData[jOut]*gb ) / Den
       - Gy / (Den*Den) * ( 2.0*c*B.FData[jOut] + 2.0*c*c*nb2*Z.FData[jOut] );
     dLdb[jOut] :=
@@ -65885,9 +65920,9 @@ begin
   // fold it via hv = <dLdz, z> (since v = z/beta). dL/dv_l = beta*dLdz_l +
   // gamma*(z_l/beta)*<dLdz, z/beta> = beta*dLdz_l + (gamma/beta^2)*z_l*<dLdz,z>.
   hv := 0;
-  for jOut := 0 to nOutMax do hv := hv + dLdz[jOut] * Z.FData[jOut];
+  for jOut := 0 to nOutMax do hv := hv + FdLdzBuf[jOut] * Z.FData[jOut];
   for jOut := 0 to nOutMax do
-    dLdv[jOut] := ExpBetaVal * dLdz[jOut]
+    dLdv[jOut] := ExpBetaVal * FdLdzBuf[jOut]
       + (ExpGammaVal / (ExpBetaVal * ExpBetaVal)) * Z.FData[jOut] * hv;
 end;
 
@@ -65899,7 +65934,6 @@ var
   nInMax, nOutMax: integer;
   nv, beta, gammaExp, ld: TNeuralFloat;
   V, Z, B, U, WDelta: TNNetVolume;
-  g, dLdv, dLdb: array of TNeuralFloat;
 begin
   nIn := FCacheU.Size;
   nOut := FOutput.Size;
@@ -65913,21 +65947,20 @@ begin
   beta := ExpCoef(nv);
   gammaExp := ExpGamma(nv);
 
-  SetLength(g, nOut); SetLength(dLdv, nOut); SetLength(dLdb, nOut);
-  for jOut := 0 to nOutMax do g[jOut] := FOutputError.FData[jOut];
-  ComputeHyperbolicMobiusBack(FCurvature, Z, B, g, gammaExp, beta, dLdv, dLdb);
+  for jOut := 0 to nOutMax do FgBuf[jOut] := FOutputError.FData[jOut];
+  ComputeMobiusBack(FCurvature, Z, B, FgBuf, gammaExp, beta, FdLdvBuf, FdLdbBuf);
 
   // Weight deltas: dL/dW[j][i] = dLdv_j * u_i.
   for jOut := 0 to nOutMax do
   begin
     WDelta := FArrNeurons[jOut].FDelta;
-    ld := -FLearningRate * dLdv[jOut];
+    ld := -FLearningRate * FdLdvBuf[jOut];
     if ld <> 0.0 then
       for i := 0 to nInMax do
         WDelta.FData[i] := WDelta.FData[i] + ld * U.FData[i];
     if FSuppressBias = 0 then
       FArrNeurons[jOut].FBiasDelta :=
-        FArrNeurons[jOut].FBiasDelta - FLearningRate * dLdb[jOut];
+        FArrNeurons[jOut].FBiasDelta - FLearningRate * FdLdbBuf[jOut];
   end;
 
   if not FBatchUpdate then
@@ -65947,7 +65980,6 @@ var
   nInMax, nOutMax: integer;
   nx, nv, alpha, beta, gammaExp, gammaLog, dotUX: TNeuralFloat;
   Z, B, V, X, WRow, LocalPrevError: TNNetVolume;
-  g, dLdv, dLdb, dLdu: array of TNeuralFloat;
 begin
   nIn := FCacheU.Size;
   nOut := FOutput.Size;
@@ -65962,19 +65994,17 @@ begin
   beta := ExpCoef(nv);
   gammaExp := ExpGamma(nv);
 
-  SetLength(g, nOut); SetLength(dLdv, nOut); SetLength(dLdb, nOut);
-  for jOut := 0 to nOutMax do g[jOut] := FOutputError.FData[jOut];
-  ComputeHyperbolicMobiusBack(FCurvature, Z, B, g, gammaExp, beta, dLdv, dLdb);
+  for jOut := 0 to nOutMax do FgBuf[jOut] := FOutputError.FData[jOut];
+  ComputeMobiusBack(FCurvature, Z, B, FgBuf, gammaExp, beta, FdLdvBuf, FdLdbBuf);
 
   // dL/du = M^T (dL/dv).
-  SetLength(dLdu, nIn);
-  for i := 0 to nInMax do dLdu[i] := 0;
+  for i := 0 to nInMax do FdLduBuf[i] := 0;
   for jOut := 0 to nOutMax do
   begin
-    if dLdv[jOut] = 0.0 then continue;
+    if FdLdvBuf[jOut] = 0.0 then continue;
     WRow := FArrNeurons[jOut].FWeights;
     for i := 0 to nInMax do
-      dLdu[i] := dLdu[i] + dLdv[jOut] * WRow.FData[i];
+      FdLduBuf[i] := FdLduBuf[i] + FdLdvBuf[jOut] * WRow.FData[i];
   end;
 
   // log_0 radial Jacobian.
@@ -65984,10 +66014,10 @@ begin
   alpha := LogCoef(nx);
   gammaLog := LogGamma(nx);
   dotUX := 0;
-  for i := 0 to nInMax do dotUX := dotUX + dLdu[i] * X.FData[i];
+  for i := 0 to nInMax do dotUX := dotUX + FdLduBuf[i] * X.FData[i];
   for i := 0 to nInMax do
     LocalPrevError.FData[i] := LocalPrevError.FData[i]
-      + alpha * dLdu[i] + gammaLog * X.FData[i] * dotUX;
+      + alpha * FdLduBuf[i] + gammaLog * X.FData[i] * dotUX;
 end;
 
 { TNNetHyperbolicDistance }
@@ -66016,7 +66046,19 @@ begin
   FCacheM.Free;
   FCacheR.Free;
   FCacheDen.Free;
+  SetLength(FdLdmBuf, 0);
+  SetLength(FdLdaBuf, 0);
+  SetLength(FdLdbBuf, 0);
   inherited Destroy();
+end;
+
+procedure TNNetHyperbolicDistance.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // Size the per-instance backward scratch (each a D_in vector).
+  SetLength(FdLdmBuf, pPrevLayer.Output.Size);
+  SetLength(FdLdaBuf, pPrevLayer.Output.Size);
+  SetLength(FdLdbBuf, pPrevLayer.Output.Size);
 end;
 
 procedure TNNetHyperbolicDistance.Compute();
@@ -66167,7 +66209,6 @@ var
   nInMax, nProtoMax: integer;
   c, s, r, t, ddr, rscale: TNeuralFloat;
   Avec, Mk, WDelta: TNNetVolume;
-  dLdm, dLda, dLdb: array of TNeuralFloat;
 begin
   c := FCurvature;
   s := Sqrt(c);
@@ -66181,7 +66222,6 @@ begin
   Mk := TNNetVolume.Create(nIn, 1, 1);
   try
     for i := 0 to nInMax do Avec.FData[i] := -FCacheX.FData[i];
-    SetLength(dLdm, nIn); SetLength(dLda, nIn); SetLength(dLdb, nIn);
 
     for kk := 0 to nProtoMax do
     begin
@@ -66197,14 +66237,14 @@ begin
       for i := 0 to nInMax do
       begin
         Mk.FData[i] := FCacheM.FData[kk * nIn + i];
-        dLdm[i] := rscale * Mk.FData[i];
-        dLda[i] := 0; dLdb[i] := 0;
+        FdLdmBuf[i] := rscale * Mk.FData[i];
+        FdLdaBuf[i] := 0; FdLdbBuf[i] := 0;
       end;
-      MobiusAddBack(c, Avec, FArrNeurons[kk].FWeights, Mk, kk, dLdm, dLda, dLdb);
+      MobiusAddBack(c, Avec, FArrNeurons[kk].FWeights, Mk, kk, FdLdmBuf, FdLdaBuf, FdLdbBuf);
       // dL/dp_k = dLdb. Accumulate into neuron delta scaled by -LearningRate.
       WDelta := FArrNeurons[kk].FDelta;
       for i := 0 to nInMax do
-        WDelta.FData[i] := WDelta.FData[i] - FLearningRate * dLdb[i];
+        WDelta.FData[i] := WDelta.FData[i] - FLearningRate * FdLdbBuf[i];
     end;
 
     if not FBatchUpdate then
@@ -66226,7 +66266,6 @@ var
   nInMax, nProtoMax: integer;
   c, s, r, t, ddr, rscale: TNeuralFloat;
   Avec, Mk, LocalPrevError: TNNetVolume;
-  dLdm, dLda, dLdb: array of TNeuralFloat;
 begin
   c := FCurvature;
   s := Sqrt(c);
@@ -66240,7 +66279,6 @@ begin
   Mk := TNNetVolume.Create(nIn, 1, 1);
   try
     for i := 0 to nInMax do Avec.FData[i] := -FCacheX.FData[i];
-    SetLength(dLdm, nIn); SetLength(dLda, nIn); SetLength(dLdb, nIn);
 
     for kk := 0 to nProtoMax do
     begin
@@ -66255,13 +66293,13 @@ begin
       for i := 0 to nInMax do
       begin
         Mk.FData[i] := FCacheM.FData[kk * nIn + i];
-        dLdm[i] := rscale * Mk.FData[i];
-        dLda[i] := 0; dLdb[i] := 0;
+        FdLdmBuf[i] := rscale * Mk.FData[i];
+        FdLdaBuf[i] := 0; FdLdbBuf[i] := 0;
       end;
-      MobiusAddBack(c, Avec, FArrNeurons[kk].FWeights, Mk, kk, dLdm, dLda, dLdb);
+      MobiusAddBack(c, Avec, FArrNeurons[kk].FWeights, Mk, kk, FdLdmBuf, FdLdaBuf, FdLdbBuf);
       // x = -a => dL/dx = -dL/da. Accumulate across prototypes.
       for i := 0 to nInMax do
-        LocalPrevError.FData[i] := LocalPrevError.FData[i] - dLda[i];
+        LocalPrevError.FData[i] := LocalPrevError.FData[i] - FdLdaBuf[i];
     end;
   finally
     Avec.Free;
