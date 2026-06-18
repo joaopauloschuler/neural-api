@@ -87,13 +87,17 @@ var
   ScaleByte: byte;
   ScaleVal, NaNVal: single;
   PackedByte: byte;
+  NumBlocksM1, ElemsM1, BytesM1: Int64;
 begin
   if (Blocks = nil) or (Scales = nil) or (Dest = nil) then
     raise EMXFP4Error.Create('DequantizeMXFP4: nil pointer.');
   if NumBlocks <= 0 then
     raise EMXFP4Error.Create('DequantizeMXFP4: NumBlocks must be positive.');
   NaNVal := NaN;
-  for b := 0 to NumBlocks - 1 do
+  NumBlocksM1 := NumBlocks - 1;
+  ElemsM1 := MXFP4_BLOCK_ELEMS - 1;
+  BytesM1 := MXFP4_BLOCK_BYTES - 1;
+  for b := 0 to NumBlocksM1 do
   begin
     BlkPtr := Blocks + b * MXFP4_BLOCK_BYTES;
     Outp   := Dest + b * MXFP4_BLOCK_ELEMS;
@@ -101,13 +105,13 @@ begin
     if ScaleByte = MXFP4_E8M0_NAN then
     begin
       // Reserved NaN scale: whole block is NaN.
-      for i := 0 to MXFP4_BLOCK_ELEMS - 1 do
+      for i := 0 to ElemsM1 do
         Outp[i] := NaNVal;
       Continue;
     end;
     // 2^(byte - 127). Ldexp keeps it exact and avoids Exp/Power rounding.
     ScaleVal := Ldexp(1.0, Integer(ScaleByte) - MXFP4_E8M0_BIAS);
-    for i := 0 to MXFP4_BLOCK_BYTES - 1 do
+    for i := 0 to BytesM1 do
     begin
       PackedByte := (BlkPtr + i)^;
       // Low nibble -> even element, high nibble -> odd element.
