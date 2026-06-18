@@ -148,6 +148,7 @@ var
   BlockAlign: word;
   HaveFmt: boolean;
   DataBytes, FrameCnt, NumFrames, ChCnt: integer;
+  NumFramesM1, NumChannelsM1: integer;
   Raw: array of smallint;
   Acc: double;
 
@@ -216,10 +217,12 @@ begin
         if NumFrames > 0 then
           ReadExact(Raw[0], NumFrames * NumChannels * 2);
         Samples.ReSize(NumFrames, 1, 1);
-        for FrameCnt := 0 to NumFrames - 1 do
+        NumFramesM1 := NumFrames - 1;
+        NumChannelsM1 := NumChannels - 1;
+        for FrameCnt := 0 to NumFramesM1 do
         begin
           Acc := 0;
-          for ChCnt := 0 to NumChannels - 1 do
+          for ChCnt := 0 to NumChannelsM1 do
             Acc := Acc + Raw[FrameCnt * NumChannels + ChCnt];
           Samples.FData[FrameCnt] := (Acc / NumChannels) / 32768.0;
         end;
@@ -241,6 +244,7 @@ procedure SaveVolumeToWav16(Samples: TNNetVolume; const FileName: string;
 var
   FS: TFileStream;
   NumFrames, i: integer;
+  NumFramesM1: integer;
   DataBytes, ByteRate, FileTail: longword;
   ChunkSize16: longword;
   NumChannels, BlockAlign, BitsPerSample, AudioFormat: word;
@@ -277,7 +281,8 @@ begin
   FileTail := 4 + (8 + 16) + (8 + DataBytes);
 
   SetLength(Raw, NumFrames);
-  for i := 0 to NumFrames - 1 do
+  NumFramesM1 := NumFrames - 1;
+  for i := 0 to NumFramesM1 do
   begin
     V := Samples.FData[i];
     if V > 1.0 then V := 1.0
@@ -335,6 +340,8 @@ procedure ComputeWhisperLogMel(Samples: TNNetVolume; Mel: TNNetVolume;
   NumMelBins: integer = 80; NumFrames: integer = 3000);
 var
   NumSamples, NumBins, NumStftFrames: integer;
+  NumSamplesM1, NumBinsM1, NumMelBinsM1, NumMelBinsP1, NFFTM1: integer;
+  NumStftFramesM1, NumFramesM1: integer;
   Wave: array of double;          // padded/truncated waveform
   Window: array of double;        // periodic hann
   CosTab, SinTab: array of double; // (NumBins x NFFT) DFT twiddles
@@ -364,10 +371,16 @@ begin
     raise Exception.Create('ComputeWhisperLogMel: NumMelBins must be >= 2.');
   NumSamples := NumFrames * csWhisperHop;
   NumBins := csWhisperNFFT div 2 + 1; // 201 one-sided rfft bins
+  NumSamplesM1 := NumSamples - 1;
+  NumBinsM1 := NumBins - 1;
+  NumMelBinsM1 := NumMelBins - 1;
+  NumMelBinsP1 := NumMelBins + 1;
+  NFFTM1 := csWhisperNFFT - 1;
+  NumFramesM1 := NumFrames - 1;
 
   // ---- pad / truncate to the fixed 30 s context ----
   SetLength(Wave, NumSamples);
-  for SampleCnt := 0 to NumSamples - 1 do
+  for SampleCnt := 0 to NumSamplesM1 do
     if SampleCnt < Samples.Size then
       Wave[SampleCnt] := Samples.FData[SampleCnt]
     else
@@ -375,14 +388,14 @@ begin
 
   // ---- periodic hann window (transformers window_function default) ----
   SetLength(Window, csWhisperNFFT);
-  for TapCnt := 0 to csWhisperNFFT - 1 do
+  for TapCnt := 0 to NFFTM1 do
     Window[TapCnt] := 0.5 - 0.5 * Cos(2.0 * Pi * TapCnt / csWhisperNFFT);
 
   // ---- DFT twiddle tables (400 is not a power of two - direct rDFT) ----
   SetLength(CosTab, NumBins * csWhisperNFFT);
   SetLength(SinTab, NumBins * csWhisperNFFT);
-  for BinCnt := 0 to NumBins - 1 do
-    for TapCnt := 0 to csWhisperNFFT - 1 do
+  for BinCnt := 0 to NumBinsM1 do
+    for TapCnt := 0 to NFFTM1 do
     begin
       CosTab[BinCnt * csWhisperNFFT + TapCnt] :=
         Cos(2.0 * Pi * BinCnt * TapCnt / csWhisperNFFT);
@@ -394,14 +407,14 @@ begin
   MelMin := HertzToMelSlaney(0.0);
   MelMax := HertzToMelSlaney(csWhisperMaxFreq);
   SetLength(FilterFreqs, NumMelBins + 2);
-  for MelCnt := 0 to NumMelBins + 1 do
+  for MelCnt := 0 to NumMelBinsP1 do
     FilterFreqs[MelCnt] := MelToHertzSlaney(
       MelMin + (MelMax - MelMin) * MelCnt / (NumMelBins + 1));
   SetLength(FilterBank, NumBins * NumMelBins);
-  for BinCnt := 0 to NumBins - 1 do
+  for BinCnt := 0 to NumBinsM1 do
   begin
     FFTFreq := (csWhisperSampleRate div 2) * BinCnt / (NumBins - 1);
-    for MelCnt := 0 to NumMelBins - 1 do
+    for MelCnt := 0 to NumMelBinsM1 do
     begin
       DownSlope := (FFTFreq - FilterFreqs[MelCnt]) /
         (FilterFreqs[MelCnt + 1] - FilterFreqs[MelCnt]);
@@ -421,16 +434,17 @@ begin
   // dropped by WhisperFeatureExtractor (log_spec[:, :-1]), so only the
   // first NumFrames frames are ever computed here.
   NumStftFrames := NumFrames;
+  NumStftFramesM1 := NumStftFrames - 1;
   SetLength(Power, NumBins);
   SetLength(LogMel, NumStftFrames * NumMelBins);
   MaxLog := -1e30;
-  for FrameCnt := 0 to NumStftFrames - 1 do
+  for FrameCnt := 0 to NumStftFramesM1 do
   begin
     FrameStart := FrameCnt * csWhisperHop - (csWhisperNFFT div 2);
     // The 30 s zero-padding tail produces all-zero frames whose mel rows
     // are exactly log10(mel_floor) - skip their O(bins*taps) DFT.
     AllZero := true;
-    for TapCnt := 0 to csWhisperNFFT - 1 do
+    for TapCnt := 0 to NFFTM1 do
     begin
       SrcIdx := FrameStart + TapCnt;
       if (SrcIdx >= 0) and (SrcIdx < NumSamples) then
@@ -441,16 +455,16 @@ begin
     end;
     if AllZero then
     begin
-      for MelCnt := 0 to NumMelBins - 1 do
+      for MelCnt := 0 to NumMelBinsM1 do
         LogMel[FrameCnt * NumMelBins + MelCnt] := Ln(csWhisperMelFloor) / Ln(10.0);
     end
     else
     begin
-      for BinCnt := 0 to NumBins - 1 do
+      for BinCnt := 0 to NumBinsM1 do
       begin
         ReAcc := 0.0;
         ImAcc := 0.0;
-        for TapCnt := 0 to csWhisperNFFT - 1 do
+        for TapCnt := 0 to NFFTM1 do
         begin
           V := WaveAt(FrameStart + TapCnt) * Window[TapCnt];
           ReAcc := ReAcc + V * CosTab[BinCnt * csWhisperNFFT + TapCnt];
@@ -458,25 +472,25 @@ begin
         end;
         Power[BinCnt] := ReAcc * ReAcc + ImAcc * ImAcc;
       end;
-      for MelCnt := 0 to NumMelBins - 1 do
+      for MelCnt := 0 to NumMelBinsM1 do
       begin
         Acc := 0.0;
-        for BinCnt := 0 to NumBins - 1 do
+        for BinCnt := 0 to NumBinsM1 do
           Acc := Acc + FilterBank[BinCnt * NumMelBins + MelCnt] *
             Power[BinCnt];
         if Acc < csWhisperMelFloor then Acc := csWhisperMelFloor;
         LogMel[FrameCnt * NumMelBins + MelCnt] := Ln(Acc) / Ln(10.0);
       end;
     end;
-    for MelCnt := 0 to NumMelBins - 1 do
+    for MelCnt := 0 to NumMelBinsM1 do
       if LogMel[FrameCnt * NumMelBins + MelCnt] > MaxLog then
         MaxLog := LogMel[FrameCnt * NumMelBins + MelCnt];
   end;
 
   // ---- global max-8 clamp + (x + 4) / 4 ----
   Mel.ReSize(NumFrames, 1, NumMelBins);
-  for FrameCnt := 0 to NumFrames - 1 do
-    for MelCnt := 0 to NumMelBins - 1 do
+  for FrameCnt := 0 to NumFramesM1 do
+    for MelCnt := 0 to NumMelBinsM1 do
     begin
       V := LogMel[FrameCnt * NumMelBins + MelCnt];
       if V < MaxLog - 8.0 then V := MaxLog - 8.0;
@@ -508,6 +522,7 @@ procedure ISTFTOverlapAddReIm(Re, Im, Wave: TNNetVolume;
   NFFT: integer; HopLength: integer);
 var
   NumFrames, NumBins, OutLen: integer;
+  NFFTM1, NumBinsM1, OutLenM1, NumFramesM1: integer;
   FrameCnt, BinCnt, TapCnt, OutIdx, FrameStart: integer;
   Window: array of double;        // periodic hann (matches forward analysis)
   CosTab, SinTab: array of double; // (NumBins x NFFT) inverse-DFT twiddles
@@ -522,6 +537,8 @@ begin
   if HopLength < 1 then
     raise Exception.Create('ISTFTOverlapAdd: HopLength must be >= 1.');
   NumBins := NFFT div 2 + 1;
+  NFFTM1 := NFFT - 1;
+  NumBinsM1 := NumBins - 1;
   if (Re.Depth <> NumBins) or (Im.Depth <> NumBins) then
     raise Exception.Create('ISTFTOverlapAdd: Re/Im Depth must be NFFT div 2 + 1.');
   NumFrames := Re.SizeX;
@@ -532,7 +549,7 @@ begin
 
   // ---- periodic hann synthesis window (matches the forward analysis) ----
   SetLength(Window, NFFT);
-  for TapCnt := 0 to NFFT - 1 do
+  for TapCnt := 0 to NFFTM1 do
     Window[TapCnt] := 0.5 - 0.5 * Cos(2.0 * Pi * TapCnt / NFFT);
 
   // ---- inverse-rDFT twiddle tables (same cos/sin convention as forward) ----
@@ -542,8 +559,8 @@ begin
   // so feeding a forward STFT computed with this file's tables back in inverts.
   SetLength(CosTab, NumBins * NFFT);
   SetLength(SinTab, NumBins * NFFT);
-  for BinCnt := 0 to NumBins - 1 do
-    for TapCnt := 0 to NFFT - 1 do
+  for BinCnt := 0 to NumBinsM1 do
+    for TapCnt := 0 to NFFTM1 do
     begin
       CosTab[BinCnt * NFFT + TapCnt] :=
         Cos(2.0 * Pi * BinCnt * TapCnt / NFFT);
@@ -552,22 +569,24 @@ begin
     end;
 
   OutLen := NFFT + (NumFrames - 1) * HopLength;
+  OutLenM1 := OutLen - 1;
+  NumFramesM1 := NumFrames - 1;
   SetLength(AccSig, OutLen);
   SetLength(AccEnv, OutLen);
-  for OutIdx := 0 to OutLen - 1 do
+  for OutIdx := 0 to OutLenM1 do
   begin
     AccSig[OutIdx] := 0.0;
     AccEnv[OutIdx] := 0.0;
   end;
 
-  for FrameCnt := 0 to NumFrames - 1 do
+  for FrameCnt := 0 to NumFramesM1 do
   begin
     FrameStart := FrameCnt * HopLength;
-    for TapCnt := 0 to NFFT - 1 do
+    for TapCnt := 0 to NFFTM1 do
     begin
       // inverse real DFT of this frame at sample TapCnt
       Sample := 0.0;
-      for BinCnt := 0 to NumBins - 1 do
+      for BinCnt := 0 to NumBinsM1 do
       begin
         ReVal := Re.FData[FrameCnt * NumBins + BinCnt];
         ImVal := Im.FData[FrameCnt * NumBins + BinCnt];
@@ -591,7 +610,7 @@ begin
 
   // ---- COLA / window_sumsquare normalization (guarded) ----
   Wave.ReSize(OutLen, 1, 1);
-  for OutIdx := 0 to OutLen - 1 do
+  for OutIdx := 0 to OutLenM1 do
     if AccEnv[OutIdx] > csEnvEps then
       Wave.FData[OutIdx] := AccSig[OutIdx] / AccEnv[OutIdx]
     else
@@ -603,6 +622,7 @@ procedure ISTFTOverlapAdd(Mag, Phase, Wave: TNNetVolume;
 var
   Re, Im: TNNetVolume;
   Idx: integer;
+  MagSizeM1: integer;
   M, P: double;
 begin
   if (Mag.SizeX <> Phase.SizeX) or (Mag.Depth <> Phase.Depth) then
@@ -612,7 +632,8 @@ begin
   try
     // Re[k] = Mag*cos(Phase), Im[k] = Mag*sin(Phase) - the forward table
     // convention (stored Im = +sum x*sin), so the round-trip is exact.
-    for Idx := 0 to Mag.Size - 1 do
+    MagSizeM1 := Mag.Size - 1;
+    for Idx := 0 to MagSizeM1 do
     begin
       M := Mag.FData[Idx];
       P := Phase.FData[Idx];

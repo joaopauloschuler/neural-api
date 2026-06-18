@@ -361,12 +361,14 @@ function TNNetDiffusionScheduler.BuildTimestepSchedule(NumSteps: integer;
   Spacing: TNNetTimestepSpacing): TNeuralIntegerArray;
 var
   k, Tt: integer;
+  NumStepsM1: integer;
   sigMin, sigMax, invRho, frac, targetSigma: double;
 const
   cRho = 7.0; // Karras et al. (2022) recommended rho.
 begin
   if NumSteps < 1 then NumSteps := 1;
   SetLength(Result, NumSteps + 1);
+  NumStepsM1 := NumSteps - 1;
   case Spacing of
     tsKarras:
       begin
@@ -377,7 +379,7 @@ begin
         sigMin := SigmaOf(1);
         sigMax := SigmaOf(FT);
         invRho := 1.0 / cRho;
-        for k := 0 to NumSteps - 1 do
+        for k := 0 to NumStepsM1 do
         begin
           if NumSteps = 1 then frac := 0.0
           else frac := k / (NumSteps - 1);
@@ -392,7 +394,7 @@ begin
       end;
     else // tsUniform
       begin
-        for k := 0 to NumSteps - 1 do
+        for k := 0 to NumStepsM1 do
         begin
           // Descending: Result[0] is the highest timestep.
           if NumSteps = 1 then Tt := FT
@@ -407,6 +409,7 @@ end;
 procedure TNNetDiffusionScheduler.ToEps(Xt, RawPred, EpsOut: TNNetVolume; Tt: integer);
 var
   i: integer;
+  EpsOutSizeM1: integer;
   sab, somab: TNeuralFloat;
 begin
   if FPrediction = dpEps then
@@ -417,7 +420,8 @@ begin
   // v-prediction: eps = sqrt(ab)*v + sqrt(1-ab)*x_t.
   sab := FSqrtAlphaBar[Tt];
   somab := FSqrtOneMinusAlphaBar[Tt];
-  for i := 0 to EpsOut.Size - 1 do
+  EpsOutSizeM1 := EpsOut.Size - 1;
+  for i := 0 to EpsOutSizeM1 do
     EpsOut.FData[i] := sab * RawPred.FData[i] + somab * Xt.FData[i];
 end;
 
@@ -425,6 +429,7 @@ procedure TNNetDiffusionScheduler.PredictX0(Xt, RawPred, X0Out: TNNetVolume;
   Tt: integer);
 var
   i: integer;
+  X0OutSizeM1: integer;
   somab, invSqrtAb: TNeuralFloat;
   Eps: TNNetVolume;
 begin
@@ -435,7 +440,8 @@ begin
     ToEps(Xt, RawPred, Eps, Tt);
     somab := FSqrtOneMinusAlphaBar[Tt];
     invSqrtAb := 1.0 / FSqrtAlphaBar[Tt];
-    for i := 0 to X0Out.Size - 1 do
+    X0OutSizeM1 := X0Out.Size - 1;
+    for i := 0 to X0OutSizeM1 do
       X0Out.FData[i] := (Xt.FData[i] - somab * Eps.FData[i]) * invSqrtAb;
   finally
     Eps.Free;
@@ -446,11 +452,13 @@ procedure TNNetDiffusionScheduler.AddNoise(X0, Xt: TNNetVolume; Tt: integer;
   NoiseOut, PreSampledNoise: TNNetVolume);
 var
   i: integer;
+  X0SizeM1: integer;
   sab, somab, eps: TNeuralFloat;
 begin
   sab := FSqrtAlphaBar[Tt];
   somab := FSqrtOneMinusAlphaBar[Tt];
-  for i := 0 to X0.Size - 1 do
+  X0SizeM1 := X0.Size - 1;
+  for i := 0 to X0SizeM1 do
   begin
     if Assigned(PreSampledNoise) then eps := PreSampledNoise.FData[i]
     else eps := RandG(0, 1);
@@ -461,9 +469,10 @@ end;
 
 class procedure TNNetDiffusionScheduler.ApplyCFG(EpsCond, EpsUncond,
   Dst: TNNetVolume; W: TNeuralFloat);
-var i: integer;
+var i, DstSizeM1: integer;
 begin
-  for i := 0 to Dst.Size - 1 do
+  DstSizeM1 := Dst.Size - 1;
+  for i := 0 to DstSizeM1 do
     Dst.FData[i] := EpsUncond.FData[i] +
       W * (EpsCond.FData[i] - EpsUncond.FData[i]);
 end;
@@ -477,6 +486,7 @@ procedure TNNetDiffusionScheduler.Step(Xt, RawPred: TNNetVolume;
   Tt, TtPrev: integer; Method: TNNetSamplerMethod; Eta: TNeuralFloat);
 var
   i: integer;
+  XtSizeM1: integer;
   Eps: TNNetVolume;
   invSqrtAlpha, coef, sigma, z: TNeuralFloat;
   abT, abPrev, sqrtAbPrev, x0, dirCoef: TNeuralFloat;
@@ -488,6 +498,7 @@ begin
   try
     // All updates work from eps; v-prediction is converted up front.
     ToEps(Xt, RawPred, Eps, Tt);
+    XtSizeM1 := Xt.Size - 1;
     case Method of
       smDDPM:
         begin
@@ -495,7 +506,7 @@ begin
           invSqrtAlpha := 1.0 / Sqrt(FAlpha[Tt]);
           coef := FBeta[Tt] / FSqrtOneMinusAlphaBar[Tt];
           if Tt > 1 then sigma := Sqrt(FBeta[Tt]) else sigma := 0;
-          for i := 0 to Xt.Size - 1 do
+          for i := 0 to XtSizeM1 do
           begin
             if Tt > 1 then z := RandG(0, 1) else z := 0;
             Xt.FData[i] := invSqrtAlpha *
@@ -516,7 +527,7 @@ begin
           else
             sigma := 0;
           dirCoef := Sqrt(Max(0.0, 1.0 - abPrev - sigma * sigma));
-          for i := 0 to Xt.Size - 1 do
+          for i := 0 to XtSizeM1 do
           begin
             if sigma > 0 then z := RandG(0, 1) else z := 0;
             // x_{TtPrev} = sqrt(ab_prev)*x0 + dirCoef*eps + sigma*z,
@@ -543,7 +554,7 @@ begin
           if TtPrev = 0 then
           begin
             // Final hop: emit the denoised x0 directly.
-            for i := 0 to Xt.Size - 1 do
+            for i := 0 to XtSizeM1 do
               Xt.FData[i] :=
                 (Xt.FData[i] - FSqrtOneMinusAlphaBar[Tt] * Eps.FData[i]) / Sqrt(abT);
             Exit;
@@ -561,7 +572,7 @@ begin
               sigma := 0;                            // sigma_up
             h := Sqrt(Max(0.0, lamPrev * lamPrev - sigma * sigma)); // sigma_down
             if lamT > 0 then r0 := h / lamT else r0 := 0;           // drift ratio
-            for i := 0 to Xt.Size - 1 do
+            for i := 0 to XtSizeM1 do
             begin
               if sigma > 0 then z := RandG(0, 1) else z := 0;
               x0 := (Xt.FData[i] - FSqrtOneMinusAlphaBar[Tt] * Eps.FData[i]) / Sqrt(abT);
@@ -585,7 +596,7 @@ begin
           //   r = h_last / h, h_last = lambda_t - lambda_{Tt of previous step}.
           abT := FAlphaBar[Tt];
           // Convert current eps -> x0 prediction; reuse Eps to hold curX0.
-          for i := 0 to Xt.Size - 1 do
+          for i := 0 to XtSizeM1 do
             Eps.FData[i] := (Xt.FData[i] - FSqrtOneMinusAlphaBar[Tt] * Eps.FData[i]) / Sqrt(abT);
           lamT := Lambda(Tt);
           if TtPrev = 0 then
@@ -596,7 +607,7 @@ begin
               hLast := lamT - FPrevLambda;          // < 0
               h := -hLast;                          // approximate remaining step
               if Abs(h) < 1e-12 then r0 := 1.0 else r0 := hLast / h;
-              for i := 0 to Xt.Size - 1 do
+              for i := 0 to XtSizeM1 do
                 Xt.FData[i] := (1.0 + 1.0 / (2.0 * r0)) * Eps.FData[i]
                   - (1.0 / (2.0 * r0)) * FPrevX0.FData[i];
             end
@@ -612,7 +623,7 @@ begin
           if not FHasPrev then
           begin
             // First-order (DDIM-equivalent) bootstrap.
-            for i := 0 to Xt.Size - 1 do
+            for i := 0 to XtSizeM1 do
               Xt.FData[i] := (sqrtAbPrev / Sqrt(abT)) * Xt.FData[i]
                 - Sqrt(1.0 - abPrev) * (Exp(-h) - 1.0) * Eps.FData[i];
           end
@@ -620,7 +631,7 @@ begin
           begin
             hLast := lamT - FPrevLambda;            // < 0
             if Abs(h) < 1e-12 then r0 := 1.0 else r0 := hLast / h;
-            for i := 0 to Xt.Size - 1 do
+            for i := 0 to XtSizeM1 do
             begin
               curX0 := Eps.FData[i];
               dCoef := (1.0 + 1.0 / (2.0 * r0)) * curX0
@@ -646,16 +657,18 @@ procedure TNNetDiffusionScheduler.Sample(X: TNNetVolume;
   Method: TNNetSamplerMethod; Eta: TNeuralFloat; Spacing: TNNetTimestepSpacing);
 var
   k, Tt, TtPrev: integer;
+  NumStepsM1: integer;
   Pred: TNNetVolume;
   Schedule: TNeuralIntegerArray;
 begin
   if NumSteps < 1 then NumSteps := 1;
+  NumStepsM1 := NumSteps - 1;
   ResetMultistep;
   // Schedule[0..NumSteps]: descending timesteps, Schedule[NumSteps]=0 (clean).
   Schedule := BuildTimestepSchedule(NumSteps, Spacing);
   Pred := TNNetVolume.Create(X);
   try
-    for k := 0 to NumSteps - 1 do
+    for k := 0 to NumStepsM1 do
     begin
       Tt := Schedule[k];
       TtPrev := Schedule[k + 1];
@@ -694,6 +707,7 @@ end;
 procedure TNNetLCMScheduler.LCMStep(Xt, RawPred: TNNetVolume; Tt: integer);
 var
   i: integer;
+  XtSizeM1: integer;
   cs, co: TNeuralFloat;
   X0Hat: TNNetVolume;
 begin
@@ -704,7 +718,8 @@ begin
   X0Hat := TNNetVolume.Create(Xt);
   try
     PredictX0(Xt, RawPred, X0Hat, Tt);
-    for i := 0 to Xt.Size - 1 do
+    XtSizeM1 := Xt.Size - 1;
+    for i := 0 to XtSizeM1 do
       Xt.FData[i] := cs * Xt.FData[i] + co * X0Hat.FData[i];
   finally
     X0Hat.Free;
@@ -715,16 +730,18 @@ procedure TNNetLCMScheduler.LCMSample(X: TNNetVolume;
   Denoise: TNNetDenoiseCallback; NumSteps: integer; Spacing: TNNetTimestepSpacing);
 var
   k, Tt, TtNext: integer;
+  NumStepsM1: integer;
   Pred, X0: TNNetVolume;
   Schedule: TNeuralIntegerArray;
 begin
   if NumSteps < 1 then NumSteps := 1;
+  NumStepsM1 := NumSteps - 1;
   // Schedule[0..NumSteps]: descending timesteps, Schedule[NumSteps]=0 (clean).
   Schedule := BuildTimestepSchedule(NumSteps, Spacing);
   Pred := TNNetVolume.Create(X);
   X0   := TNNetVolume.Create(X);
   try
-    for k := 0 to NumSteps - 1 do
+    for k := 0 to NumStepsM1 do
     begin
       Tt := Schedule[k];
       TtNext := Schedule[k + 1];
