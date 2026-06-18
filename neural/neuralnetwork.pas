@@ -17711,17 +17711,7 @@ begin
   else
   begin
     // can't calculate error on input layers.
-    for OutputCnt := 0 to SizeM1 do
-    begin
-      if LocalPrevOutput.FData[OutputCnt]>0 then
-      begin
-        FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt];
-      end
-      else
-      begin
-        FOutput.FData[OutputCnt] := 0;
-      end;
-    end;
+    FOutput.CopyRelu(LocalPrevOutput);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -20990,9 +20980,7 @@ begin
   Grad := TNNetVolume.Create(FOutput);
   try
     TNNetCTCLoss.ForwardBackwardLogLoss(FOutput, Labels, BlankIndex(), Grad);
-    SizeM1 := FOutputError.Size - 1;
-    for Idx := 0 to SizeM1 do
-      FOutputError.FData[Idx] := Grad.FData[Idx];
+    FOutputError.Copy(Grad);
   finally
     Grad.Free;
   end;
@@ -29913,9 +29901,6 @@ begin
 end;
 
 procedure TNNetWindowAttention.SetBiasMatrix(const Bias: TNNetVolume);
-var
-  i: integer;
-  BiasMaxIdx: integer;
 begin
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   SetNumWeightsForAllNeurons(1, 1, FSeqLen * FSeqLen);
@@ -29923,9 +29908,7 @@ begin
     FErrorProc('TNNetWindowAttention.SetBiasMatrix expects ' +
       IntToStr(FSeqLen * FSeqLen) + ' values, got ' + IntToStr(Bias.Size) +
       '.');
-  BiasMaxIdx := FSeqLen * FSeqLen - 1;
-  for i := 0 to BiasMaxIdx do
-    FNeurons[0].FWeights.FData[i] := Bias.FData[i];
+  FNeurons[0].FWeights.Copy(Bias);
   AfterWeightUpdate();
 end;
 
@@ -32502,8 +32485,7 @@ begin
     // can't calculate error on input layers.
     if Alpha = 0 then
     begin
-      for OutputCnt := 0 to SizeM1 do
-        FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt];
+      FOutput.Copy(LocalPrevOutput);
     end
     else if Alpha < 0 then
     begin
@@ -54292,7 +54274,6 @@ procedure TNNetShakeShakeMerge.Backpropagate();
 var
   StartTime: double;
   B1Err, B2Err, SkipErr: TNNetVolume;
-  I, OutSizeM1: integer;
   MaxError: TNeuralFloat;
 begin
   StartTime := Now();
@@ -54310,16 +54291,12 @@ begin
     else
       FBeta := 0.5;
     // dL/dB1 = beta*dOut ; dL/dB2 = (1-beta)*dOut ; dL/dskip = dOut
-    OutSizeM1 := FOutput.Size - 1;
     if B1Err.Size = FOutput.Size then
-      for I := 0 to OutSizeM1 do
-        B1Err.FData[I] := B1Err.FData[I] + FBeta * FOutputError.FData[I];
+      B1Err.MulAdd(FBeta, FOutputError);
     if B2Err.Size = FOutput.Size then
-      for I := 0 to OutSizeM1 do
-        B2Err.FData[I] := B2Err.FData[I] + (1 - FBeta) * FOutputError.FData[I];
+      B2Err.MulAdd(1 - FBeta, FOutputError);
     if SkipErr.Size = FOutput.Size then
-      for I := 0 to OutSizeM1 do
-        SkipErr.FData[I] := SkipErr.FData[I] + FOutputError.FData[I];
+      SkipErr.Add(FOutputError);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   BackpropagateConcat();
@@ -54426,7 +54403,6 @@ procedure TNNetShakeDropMerge.Backpropagate();
 var
   StartTime: double;
   BErr, SkipErr: TNNetVolume;
-  I, OutSizeM1: integer;
   MaxError, bl, Beta: TNeuralFloat;
 begin
   StartTime := Now();
@@ -54449,13 +54425,10 @@ begin
     else
       FBackGate := FFloatSt[0];
     // dL/dB = backgate*dOut ; dL/dskip = dOut
-    OutSizeM1 := FOutput.Size - 1;
     if BErr.Size = FOutput.Size then
-      for I := 0 to OutSizeM1 do
-        BErr.FData[I] := BErr.FData[I] + FBackGate * FOutputError.FData[I];
+      BErr.MulAdd(FBackGate, FOutputError);
     if SkipErr.Size = FOutput.Size then
-      for I := 0 to OutSizeM1 do
-        SkipErr.FData[I] := SkipErr.FData[I] + FOutputError.FData[I];
+      SkipErr.Add(FOutputError);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   BackpropagateConcat();
@@ -64658,7 +64631,7 @@ procedure TNNetTensorTrain.ComputeCPU();
 var
   k, fk, rinDim, routDim, sufSize, prefPrev, prefCur: integer;
   suf, prefIdx, jk, ik, ain, aout, gIdx, prevIdx, curIdx: integer;
-  MaxCore, MaxDim, MaxSuf, MaxPref, MaxFk, MaxROut, MaxRIn: integer;
+  MaxCore, MaxSuf, MaxPref, MaxFk, MaxROut, MaxRIn: integer;
   PrevOut, Wk, Bias, Prev, Cur: TNNetVolume;
   acc: TNeuralFloat;
 begin
@@ -64711,9 +64684,7 @@ begin
 
   // Final message T_{d-1}: sufSize = 1, prefCur = FDim, routDim = 1 -> y.
   Cur := FMsg[FCores - 1];
-  MaxDim := FDim - 1;
-  for k := 0 to MaxDim do
-    FOutput.FData[k] := Cur.FData[k];
+  FOutput.Copy(Cur);
 
   Bias := FArrNeurons[FCores].FWeights;
   if FSuppressBias = 0 then
@@ -65413,8 +65384,7 @@ begin
   PrevOut := FPrevLayer.FOutput;
   Bias := FArrNeurons[FNumReflections].FWeights;
   // Initialize working vector with the input.
-  for j := 0 to MaxN do
-    FOutput.FData[j] := PrevOut.FData[j];
+  FOutput.Copy(PrevOut);
   // Apply H_K, then H_{K-1}, ... , H_1 (so Q = H_1*...*H_K acts left-to-right).
   for ReflIdx := FNumReflections - 1 downto 0 do
   begin
@@ -65431,12 +65401,10 @@ begin
     end;
     if beta < HOUSEHOLDER_MIN_BETA then continue; // degenerate -> identity
     scale := 2.0 * dot / beta;
-    for j := 0 to MaxN do
-      FOutput.FData[j] := FOutput.FData[j] - scale * V.FData[j];
+    FOutput.MulAdd(-scale, V);
   end;
   if FSuppressBias = 0 then
-    for j := 0 to MaxN do
-      FOutput.FData[j] := FOutput.FData[j] + Bias.FData[j];
+    FOutput.Add(Bias);
 end;
 
 procedure TNNetHouseholderLinear.Backpropagate();
