@@ -53,11 +53,6 @@ uses {$IFDEF UNIX} cthreads, {$ENDIF}
     end;
   end;
 
-  function ArgMax(V: TNNetVolume): integer;
-  begin
-    if V.Raw[0] >= V.Raw[1] then Result := 0 else Result := 1;
-  end;
-
   // Manual accuracy over a pair list (argmax match).
   function Accuracy(NN: TNNet; Pairs: TNNetVolumePairList): TNeuralFloat;
   var
@@ -70,7 +65,7 @@ uses {$IFDEF UNIX} cthreads, {$ENDIF}
     begin
       NN.Compute(Pairs[Cnt].I);
       NN.GetOutput(Output);
-      if ArgMax(Output) = ArgMax(Pairs[Cnt].O) then Inc(Hits);
+      if Output.GetClass() = Pairs[Cnt].O.GetClass() then Inc(Hits);
     end;
     Output.Free;
     Result := Hits / Pairs.Count;

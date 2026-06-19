@@ -152,21 +152,6 @@ const
     end;
   end;
 
-  function ArgMaxDepth(V: TNNetVolume; Pos: integer): integer;
-  var
-    D, Best: integer;
-    BestVal, Cur: TNeuralFloat;
-  begin
-    Best := 0;
-    BestVal := V[Pos, 0, 0];
-    for D := 1 to cVocab - 1 do
-    begin
-      Cur := V[Pos, 0, D];
-      if Cur > BestVal then begin BestVal := Cur; Best := D; end;
-    end;
-    Result := Best;
-  end;
-
   function CrossEntropy(Output, Target: TNNetVolume): TNeuralFloat;
   var
     I: integer;
@@ -205,7 +190,7 @@ const
         SumLoss := SumLoss + CrossEntropy(NN.GetLastLayer.Output, TargetV);
         for I := 0 to cSeqLen - 1 do
         begin
-          Pred := ArgMaxDepth(NN.GetLastLayer.Output, I);
+          Pred := NN.GetLastLayer.Output.GetClassOnPixel(I, 0);
           // Recover the gold token from the one-hot target row.
           Gold := 0;
           while (Gold < cVocab - 1) and (TargetV[I, 0, Gold] = 0) do Inc(Gold);

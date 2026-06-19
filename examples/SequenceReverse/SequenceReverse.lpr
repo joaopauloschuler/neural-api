@@ -149,21 +149,6 @@ begin
   Result := Result / cSeqLen;
 end;
 
-function ArgMaxDepth(V: TNNetVolume; Pos: integer): integer;
-var
-  d, Best: integer;
-  BestVal, Cur: TNeuralFloat;
-begin
-  Best := 0;
-  BestVal := V[Pos, 0, 0];
-  for d := 1 to cVocab - 1 do
-  begin
-    Cur := V[Pos, 0, d];
-    if Cur > BestVal then begin BestVal := Cur; Best := d; end;
-  end;
-  Result := Best;
-end;
-
 procedure Train(NN: TNNet);
 var
   Epoch, b: integer;
@@ -223,7 +208,7 @@ begin
       AllRight := True;
       for t := 0 to cSeqLen - 1 do
       begin
-        Pred := ArgMaxDepth(NN.GetLastLayer.Output, t);
+        Pred := NN.GetLastLayer.Output.GetClassOnPixel(t, 0);
         if Pred = S[cSeqLen - 1 - t] then Inc(TokHits)
         else AllRight := False;
         Inc(TokTotal);
@@ -265,7 +250,7 @@ begin
     NN.Compute(InputV);
     for t := 0 to cSeqLen - 1 do
     begin
-      Pred[t] := ArgMaxDepth(NN.GetLastLayer.Output, t);
+      Pred[t] := NN.GetLastLayer.Output.GetClassOnPixel(t, 0);
       Tgt[t]  := S[cSeqLen - 1 - t];
     end;
     WriteLn('  input     : ', SeqToStr(S));

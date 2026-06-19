@@ -60,14 +60,6 @@ const
     end;
   end;
 
-  function ArgMax(V: TNNetVolume): integer;
-  var I: integer;
-  begin
-    Result := 0;
-    for I := 1 to V.Size - 1 do
-      if V.Raw[I] > V.Raw[Result] then Result := I;
-  end;
-
   // Manual accuracy over a pair list (argmax match).
   function Accuracy(NN: TNNet; Pairs: TNNetVolumePairList): TNeuralFloat;
   var
@@ -80,7 +72,7 @@ const
     begin
       NN.Compute(Pairs[Cnt].I);
       NN.GetOutput(Output);
-      if ArgMax(Output) = ArgMax(Pairs[Cnt].O) then Inc(Hits);
+      if Output.GetClass() = Pairs[Cnt].O.GetClass() then Inc(Hits);
     end;
     Output.Free;
     Result := Hits / Pairs.Count;

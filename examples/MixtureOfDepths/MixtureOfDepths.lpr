@@ -193,21 +193,6 @@ begin
   Result := Result / cSeqLen;
 end;
 
-function ArgMaxDepth(V: TNNetVolume; Pos: integer): integer;
-var
-  d, Best: integer;
-  BestVal, Cur: TNeuralFloat;
-begin
-  Best := 0;
-  BestVal := V[Pos, 0, 0];
-  for d := 1 to cVocab - 1 do
-  begin
-    Cur := V[Pos, 0, d];
-    if Cur > BestVal then begin BestVal := Cur; Best := d; end;
-  end;
-  Result := Best;
-end;
-
 function EvalMeanCE(NN: TNNet): TNeuralFloat;
 var
   k: integer;
@@ -255,7 +240,7 @@ begin
       NN.Compute(InputV);
       for t := 0 to cSeqLen - 1 do
       begin
-        Pred := ArgMaxDepth(NN.GetLastLayer.Output, t);
+        Pred := NN.GetLastLayer.Output.GetClassOnPixel(t, 0);
         Tgt  := TargetTok(S, t);
         if Pred = Tgt then Inc(C);
         Inc(Ctot);

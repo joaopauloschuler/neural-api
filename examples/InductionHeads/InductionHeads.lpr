@@ -211,21 +211,6 @@ begin
   Result := Result / cSeqLen;
 end;
 
-function ArgMaxDepth(V: TNNetVolume; Pos: integer): integer;
-var
-  d, Best: integer;
-  BestVal, Cur: TNeuralFloat;
-begin
-  Best := 0;
-  BestVal := V[Pos, 0, 0];
-  for d := 1 to cVocab - 1 do
-  begin
-    Cur := V[Pos, 0, d];
-    if Cur > BestVal then begin BestVal := Cur; Best := d; end;
-  end;
-  Result := Best;
-end;
-
 procedure Train(NN: TNNet);
 var
   Epoch, b: integer;
@@ -287,7 +272,7 @@ begin
       NN.Compute(InputV);
       for t := 0 to cSeqLen - 2 do
       begin
-        Pred := ArgMaxDepth(NN.GetLastLayer.Output, t);
+        Pred := NN.GetLastLayer.Output.GetClassOnPixel(t, 0);
         if t < cPrefix - 1 then
         begin
           // First half: predicting still-unseen prefix tokens (chance only).

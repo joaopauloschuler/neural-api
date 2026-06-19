@@ -121,15 +121,6 @@ begin
   end;
 end;
 
-function ArgMax(V: TNNetVolume): integer;
-var I, Best: integer;
-begin
-  Best := 0;
-  for I := 1 to V.Size - 1 do
-    if V.FData[I] > V.FData[Best] then Best := I;
-  Result := Best;
-end;
-
 procedure EvaluateNet(NN: TNNet; Pairs: TNNetVolumePairList;
   out Accuracy, MeanLoss: TNeuralFloat);
 var
@@ -142,8 +133,8 @@ begin
   for I := 0 to Pairs.Count - 1 do
   begin
     NN.Compute(Pairs[I].I);
-    if ArgMax(NN.GetLastLayer().Output) = ArgMax(Pairs[I].O) then Inc(Correct);
-    P := NN.GetLastLayer().Output.FData[ArgMax(Pairs[I].O)];
+    if NN.GetLastLayer().Output.GetClass() = Pairs[I].O.GetClass() then Inc(Correct);
+    P := NN.GetLastLayer().Output.FData[Pairs[I].O.GetClass()];
     if P < 1e-7 then P := 1e-7;
     SumLoss := SumLoss - Ln(P);
   end;

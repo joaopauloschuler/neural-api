@@ -307,8 +307,15 @@ type
     procedure SetClassForHiperbolicTangent(pClass: integer);
     procedure SetClassForReLU(pClass: integer);
     procedure SetClassForSoftMax(pClass: integer);
-    // GetClass is similar to argmax
+    // GetClass is similar to argmax over the whole volume (returns the flat
+    // index of the maximum element). Prefer it instead of hand-rolling an
+    // argmax loop over Raw/FData.
     function GetClass(): integer;
+    // GetClassOnPixel is the per-position argmax along the depth axis at pixel
+    // (X, Y): it returns the depth index with the maximum value. This is
+    // exactly the "argmax over the depth/vocab axis at a sequence position"
+    // pattern (e.g. ArgMaxDepth(V, Pos) == V.GetClassOnPixel(Pos, 0)); reuse
+    // it rather than re-implementing such a loop in callers/examples.
     function GetClassOnPixel(X, Y: integer): integer;
     function SoftMax(): T;
     procedure PointwiseSoftMax(NoForward: boolean = false);
