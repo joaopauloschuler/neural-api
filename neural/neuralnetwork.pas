@@ -100323,21 +100323,18 @@ end;
 
 function TNNetLayer.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
 var
-  LpBnd277: integer;
+  MaxLayer: integer;
   Cnt: integer;
 begin
   Result := Self;
-  // pInferenceOnly=False keeps the layer trainable: strict no-op so callers
-  // can chain .SetInferenceOnly(flag) on every layer unconditionally.
-  if not pInferenceOnly then exit;
-  FInferenceOnly := True;
+  FInferenceOnly := pInferenceOnly;
   // Shrink any training buffers already allocated (e.g. a layer that sized its
   // weights in the constructor, before this was chained). When the layer is
   // attached later, the FInferenceOnly flag stops them being re-allocated.
-  LpBnd277 := FNeurons.Count - 1;
-  for Cnt := 0 to LpBnd277 do
+  MaxLayer := FNeurons.Count - 1;
+  for Cnt := 0 to MaxLayer do
   begin
-    FNeurons[Cnt].SetInferenceOnly();
+    FNeurons[Cnt].SetInferenceOnly(pInferenceOnly);
   end;
 end;
 
