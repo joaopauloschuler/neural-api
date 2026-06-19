@@ -10407,6 +10407,9 @@ type
   end;
 
   /// Convolutional layer with hyperbolic tangent activation function.
+
+  { TNNetConvolution }
+
   TNNetConvolution = class(TNNetConvolutionBase)
     protected
       procedure BackpropagateAtOutputPos(pCanBackpropOnPos: boolean; OutputRawPos, OutputX, OutputY, OutputD, PrevX, PrevY: integer); {$IFDEF Release} inline; {$ENDIF}
@@ -10419,11 +10422,12 @@ type
       procedure BackpropagateFastTiledCPU();
       procedure BackpropagateFastCPUDev(); // Backprop CPU development version (do not use it)
       procedure BackpropagatePointwiseOpenCL();
-
+      procedure ComputeLowMemoryCPU(); {$IFDEF Release} inline; {$ENDIF}
+      procedure AfterWeightUpdate(); override;
+      function WillOpenCL: boolean;
       {$IFDEF OpenCL}
       procedure ComputeOpenCL();
       {$ENDIF}
-      procedure ComputeLowMemoryCPU(); {$IFDEF Release} inline; {$ENDIF}
       {$IFDEF Debug}
       procedure AddBiasToRawResult(); {$IFDEF Release} inline; {$ENDIF}
       //procedure ComputeNeuronFromResult(NeuronIdx: integer); {$IFDEF Release} inline; {$ENDIF}
@@ -54102,6 +54106,16 @@ end;
 procedure TNNetLayerConcatedWeights.AfterWeightUpdate();
 begin
   inherited AfterWeightUpdate();
+  // this is a hack - START
+  if self is TNNetConvolution then
+  begin
+    if FLowMemory then
+    begin
+      FShouldConcatWeights := false;
+      FShouldInterleaveWeights := false;
+      BuildBiasOutput();
+    end;
+  end;
   if FNeuronWeightList.Count > 0 then
   begin
     if FShouldConcatWeights then
@@ -76002,9 +76016,12 @@ procedure TNNetConvolution.Compute();
       ComputeTiledCPU();
       FConcatedWeights.ReSize(1, 1, 1);
     end
-    else
+    else if FLowMemory then
+    begin
+      ComputeLowMemoryCPU();
+    end
     // interleaved dot product is faster with small vectors or big convs.
-    if ShouldUseInterleavedDotProduct then
+    else if ShouldUseInterleavedDotProduct then
     begin
       ComputeInterleaved();
     end
@@ -76043,7 +76060,7 @@ begin
     PrepareInputForConvolutionFast();
 
     {$IFDEF OpenCL}
-    if (Assigned(FDotCL) and FHasOpenCL and FShouldOpenCL) then
+    if WillOpenCL() then
     begin
       ComputeOpenCL();
     end
@@ -102069,6 +102086,25 @@ begin
   end;
   if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
   ApplyActivationFunctionToOutput();
+end;
+
+procedure TNNetConvolution.AfterWeightUpdate();
+begin
+  inherited AfterWeightUpdate();
+  if not WillOpenCL() and FLowMemory then
+  begin
+    FConcatedWeights.Resize(1,1,1);
+    FConcatedWInter.Resize(1,1,1);
+  end;
+end;
+
+function TNNetConvolution.WillOpenCL: boolean;
+begin
+  {$IFDEF OpenCL}
+  Result := (Assigned(FDotCL) and FHasOpenCL and FShouldOpenCL);
+  {$ELSE}
+  Result := False;
+  {$ENDIF}
 end;
 
 {$IFDEF Debug}
