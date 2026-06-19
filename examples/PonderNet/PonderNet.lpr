@@ -76,7 +76,7 @@ begin
     if bit = 1 then Input[0, 0, j] := 1.0 else Input[0, 0, j] := -1.0;
     par := par xor bit;
   end;
-  Target[0, 0, par] := 1.0;  // one-hot parity (class 0 or 1)
+  Target.OneHotEncodingOnPixel(0, 0, par);  // one-hot parity (class 0 or 1)
   Result := L;
 end;
 

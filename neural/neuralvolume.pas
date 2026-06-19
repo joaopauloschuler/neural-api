@@ -255,6 +255,14 @@ type
     function GetMagnitude(): T; {$IFDEF Release} inline; {$ENDIF}
     function GetEntropy(): T;
     function GetPerplexity(): T;
+    // Cross-entropy of this volume (treated as predicted probabilities)
+    // against Target, along the depth axis at pixel (X, Y):
+    //   -sum_d Target[X,Y,d] * Ln(Self[X,Y,d]).
+    // Predicted values are clamped to >= 1e-12 before Ln to avoid log(0).
+    // Mirrors GetClassOnPixel: it operates per pixel along the depth axis.
+    function CrossEntropyOnPixel(Target: TVolume; X, Y: integer): T;
+    // Mean of CrossEntropyOnPixel over every (X, Y) pixel of the volume.
+    function MeanCrossEntropy(Target: TVolume): T;
     procedure FlipX();
     procedure FlipY();
     procedure IncTag(); {$IFDEF Release} inline; {$ENDIF}
@@ -307,14 +315,28 @@ type
     procedure SetClassForHiperbolicTangent(pClass: integer);
     procedure SetClassForReLU(pClass: integer);
     procedure SetClassForSoftMax(pClass: integer);
-    // GetClass is similar to argmax
+    // GetClass is similar to argmax over the whole volume (returns the flat
+    // index of the maximum element). Prefer it instead of hand-rolling an
+    // argmax loop over Raw/FData.
     function GetClass(): integer;
+    // GetClassOnPixel is the per-position argmax along the depth axis at pixel
+    // (X, Y): it returns the depth index with the maximum value. This is
+    // exactly the "argmax over the depth/vocab axis at a sequence position"
+    // pattern (e.g. ArgMaxDepth(V, Pos) == V.GetClassOnPixel(Pos, 0)); reuse
+    // it rather than re-implementing such a loop in callers/examples.
     function GetClassOnPixel(X, Y: integer): integer;
     function SoftMax(): T;
     procedure PointwiseSoftMax(NoForward: boolean = false);
     procedure GroupedPointwiseSoftMax(Groups: integer);
 
     // Encoding Functions
+    // Sets the depth column at pixel (X, Y) to a one-hot of Token: writes 1 at
+    // depth Token and 0 at every other depth of that pixel, leaving the rest of
+    // the volume untouched. Inverse of GetClassOnPixel. Unlike the array/string
+    // OneHotEncoding overloads it does NOT Fill(0) the whole volume nor pad
+    // other positions, so it is the right primitive for per-position sequence
+    // targets and for single-position one-hots.
+    procedure OneHotEncodingOnPixel(X, Y, Token: integer);
     procedure OneHotEncoding(aTokens: array of integer); overload;
     procedure GroupedOneHotEncoding(aTokens: array of integer; Groups: integer); overload;
     procedure ReverseGroupedOneHotEncoding(out aTokens: TNeuralIntegerArray; Groups: integer);
@@ -6739,6 +6761,40 @@ begin
   Result := pcr_exp2f(GetEntropy());
 end;
 
+function TVolume.CrossEntropyOnPixel(Target: TVolume; X, Y: integer): T;
+var
+  d, MaxD: integer;
+  P, Tgt: T;
+begin
+  Result := 0;
+  MaxD := FDepth - 1;
+  for d := 0 to MaxD do
+  begin
+    Tgt := Target[X, Y, d];
+    if Tgt > 0 then
+    begin
+      P := Self[X, Y, d];
+      if P < 1e-12 then P := 1e-12;
+      Result := Result - Tgt * Ln(P);
+    end;
+  end;
+end;
+
+function TVolume.MeanCrossEntropy(Target: TVolume): T;
+var
+  X, Y, MaxX, MaxY, PixelCount: integer;
+begin
+  Result := 0;
+  PixelCount := FSizeX * FSizeY;
+  if PixelCount = 0 then Exit;
+  MaxX := FSizeX - 1;
+  MaxY := FSizeY - 1;
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
+      Result := Result + CrossEntropyOnPixel(Target, X, Y);
+  Result := Result / PixelCount;
+end;
+
 procedure TVolume.FlipX();
 var
   iFrom, iTo: integer;
@@ -7333,6 +7389,22 @@ begin
       end;
     end;
   end;
+end;
+
+procedure TVolume.OneHotEncodingOnPixel(X, Y, Token: integer);
+var
+  d, MaxD: integer;
+begin
+  if (Token < 0) or (Token >= FDepth) then
+  begin
+    WriteLn('Token '+IntToStr(Token)+' is out of range [0,'+IntToStr(FDepth)+
+      ') at OneHotEncodingOnPixel.');
+    Exit;
+  end;
+  MaxD := FDepth - 1;
+  for d := 0 to MaxD do
+    Self[X, Y, d] := 0;
+  Self[X, Y, Token] := 1;
 end;
 
 procedure TVolume.OneHotEncoding(aTokens: array of integer);

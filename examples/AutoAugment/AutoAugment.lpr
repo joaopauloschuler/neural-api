@@ -60,7 +60,7 @@ begin
   V.ReSize(cImgSize, cImgSize, 3);
   Y.ReSize(1, 1, cClasses);
   Y.Fill(0);
-  Y[0, 0, ClassId] := 1;
+  Y.OneHotEncodingOnPixel(0, 0, ClassId);
   // Noisy gray background in 0..255 pixel space.
   for d := 0 to 2 do
     for y2 := 0 to cImgSize - 1 do

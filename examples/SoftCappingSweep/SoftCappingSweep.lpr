@@ -161,7 +161,7 @@ const
     for I := 0 to cSeqLen - 1 do
     begin
       InputV.FData[I] := Tokens[I];
-      TargetV[I, 0, Prev] := 1.0;
+      TargetV.OneHotEncodingOnPixel(I, 0, Prev);
       Prev := Tokens[I];
     end;
   end;

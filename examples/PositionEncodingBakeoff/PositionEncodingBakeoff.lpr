@@ -215,27 +215,8 @@ const
     begin
       InputV.FData[I] := Tokens[I];
       if I = 0 then Prev := 0 else Prev := Tokens[I - 1];
-      TargetV[I, 0, Prev] := 1.0;
+      TargetV.OneHotEncodingOnPixel(I, 0, Prev);
     end;
-  end;
-
-  function ArgMaxDepth(V: TNNetVolume; Pos: integer): integer;
-  var
-    D, Best: integer;
-    BestVal, Cur: TNeuralFloat;
-  begin
-    Best := 0;
-    BestVal := V[Pos, 0, 0];
-    for D := 1 to cVocab - 1 do
-    begin
-      Cur := V[Pos, 0, D];
-      if Cur > BestVal then
-      begin
-        BestVal := Cur;
-        Best := D;
-      end;
-    end;
-    Result := Best;
   end;
 
   function CrossEntropy(Output, Target: TNNetVolume): TNeuralFloat;
@@ -319,7 +300,7 @@ const
       TgtS := '';
       for I := 0 to cSeqLen - 1 do
       begin
-        Pred := ArgMaxDepth(NN.GetLastLayer.Output, I);
+        Pred := NN.GetLastLayer.Output.GetClassOnPixel(I, 0);
         if I = 0 then Prev := 0 else Prev := Tokens[I - 1];
         InS   := InS + IntToStr(Tokens[I]) + ' ';
         PredS := PredS + IntToStr(Pred) + ' ';

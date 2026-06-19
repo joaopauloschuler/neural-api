@@ -120,7 +120,7 @@ begin
   cls := Random(cClasses);
   DrawGlyph(InputV, cls, gx, gy);
   TargetV.Fill(0);
-  TargetV[0, 0, cls] := 1.0;
+  TargetV.OneHotEncodingOnPixel(0, 0, cls);
 end;
 
 procedure CenterCrop(Src, Dst: TNNetVolume);

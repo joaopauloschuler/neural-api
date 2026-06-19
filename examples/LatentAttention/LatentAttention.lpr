@@ -154,7 +154,7 @@ begin
   for t := 0 to cSeqLen - 1 do
   begin
     InputV.FData[t] := S[t];
-    TargetV[t, 0, TargetTok(S, t)] := 1.0;
+    TargetV.OneHotEncodingOnPixel(t, 0, TargetTok(S, t));
   end;
 end;
 
@@ -202,40 +202,6 @@ begin
   Result.SetL2Decay(0.0);
 end;
 
-function CrossEntropyAt(Output, Target: TNNetVolume; t: integer): TNeuralFloat;
-var d: integer; P: TNeuralFloat;
-begin
-  Result := 0;
-  for d := 0 to cVocab - 1 do
-    if Target[t, 0, d] > 0 then
-    begin
-      P := Output[t, 0, d];
-      if P < 1e-12 then P := 1e-12;
-      Result := Result - Target[t, 0, d] * Ln(P);
-    end;
-end;
-
-function MeanCrossEntropy(Output, Target: TNNetVolume): TNeuralFloat;
-var t: integer;
-begin
-  Result := 0;
-  for t := 0 to cSeqLen - 1 do
-    Result := Result + CrossEntropyAt(Output, Target, t);
-  Result := Result / cSeqLen;
-end;
-
-function ArgMaxDepth(V: TNNetVolume; Pos: integer): integer;
-var d, Best: integer; BestVal, Cur: TNeuralFloat;
-begin
-  Best := 0; BestVal := V[Pos, 0, 0];
-  for d := 1 to cVocab - 1 do
-  begin
-    Cur := V[Pos, 0, d];
-    if Cur > BestVal then begin BestVal := Cur; Best := d; end;
-  end;
-  Result := Best;
-end;
-
 function EvalMeanCE(NN: TNNet): TNeuralFloat;
 var k: integer; InputV, TargetV: TNNetVolume; S: TSeq; Sum: TNeuralFloat;
 begin
@@ -248,7 +214,7 @@ begin
       MakeSeq(S);
       FillPair(S, InputV, TargetV);
       NN.Compute(InputV);
-      Sum := Sum + MeanCrossEntropy(NN.GetLastLayer.Output, TargetV);
+      Sum := Sum + NN.GetLastLayer.Output.MeanCrossEntropy(TargetV);
     end;
   finally
     InputV.Free; TargetV.Free;
@@ -274,7 +240,7 @@ begin
       NN.Compute(InputV);
       for t := 0 to cSeqLen - 1 do
       begin
-        Pred := ArgMaxDepth(NN.GetLastLayer.Output, t);
+        Pred := NN.GetLastLayer.Output.GetClassOnPixel(t, 0);
         Tgt  := TargetTok(S, t);
         if Pred = Tgt then Inc(C);
         Inc(Ctot);

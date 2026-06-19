@@ -72,7 +72,7 @@ begin
     Vol := Inputs[I];
     Vol.Fill(0);
     Task := I mod NumTasks;
-    Vol[0, 0, Task] := 1.0;                 // one-hot task selector
+    Vol.OneHotEncodingOnPixel(0, 0, Task);                 // one-hot task selector
     p0 := Random() * 2 - 1;
     p1 := Random() * 2 - 1;
     Vol[0, 0, NumTasks + 0] := p0;

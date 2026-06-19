@@ -84,11 +84,6 @@ const
     end;
   end;
 
-  function ArgMax(V: TNNetVolume): integer;
-  begin
-    if V.Raw[0] >= V.Raw[1] then Result := 0 else Result := 1;
-  end;
-
   // Accuracy + mean cross-entropy loss over a pair list.
   procedure Evaluate(NN: TNNet; Pairs: TNNetVolumePairList;
     out Acc, Loss: TNeuralFloat);
@@ -104,8 +99,8 @@ const
     begin
       NN.Compute(Pairs[Cnt].I);
       NN.GetOutput(Output);
-      if ArgMax(Output) = ArgMax(Pairs[Cnt].O) then Inc(Hits);
-      T := ArgMax(Pairs[Cnt].O);
+      if Output.GetClass() = Pairs[Cnt].O.GetClass() then Inc(Hits);
+      T := Pairs[Cnt].O.GetClass();
       P := Output.Raw[T];
       if P < 1e-7 then P := 1e-7;
       SumLoss := SumLoss - Ln(P);
