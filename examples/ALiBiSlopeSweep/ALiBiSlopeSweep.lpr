@@ -148,7 +148,7 @@ const
     begin
       InputV.FData[I] := Tokens[I];
       if Tokens[I] >= cFirstVowel then LastVowel := Tokens[I];
-      TargetV[I, 0, LastVowel] := 1.0;
+      TargetV.OneHotEncodingOnPixel(I, 0, LastVowel);
     end;
   end;
 

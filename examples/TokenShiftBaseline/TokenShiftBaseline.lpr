@@ -139,7 +139,7 @@ begin
   for t := 0 to cSeqLen - 1 do
   begin
     InputV.FData[t] := S[t];
-    TargetV[t, 0, TargetTok(S, t)] := 1.0;
+    TargetV.OneHotEncodingOnPixel(t, 0, TargetTok(S, t));
   end;
 end;
 

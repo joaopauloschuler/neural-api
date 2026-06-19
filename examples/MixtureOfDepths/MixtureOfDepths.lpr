@@ -124,7 +124,7 @@ begin
     // scalar input, the ONLY nonlinearity in the whole net is the ReLU inside the
     // MoD block, so the odd-position periodic remap GENUINELY requires the block.
     InputV[t, 0, 0] := S[t] / (cVocab - 1);
-    TargetV[t, 0, TargetTok(S, t)] := 1.0;
+    TargetV.OneHotEncodingOnPixel(t, 0, TargetTok(S, t));
   end;
 end;
 

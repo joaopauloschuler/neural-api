@@ -33,6 +33,7 @@ type
     procedure TestVolumeMagnitude;
     procedure TestVolumeEntropy;
     procedure TestVolumeCrossEntropy;
+    procedure TestVolumeOneHotEncodingOnPixel;
     procedure TestVolumeOneHotEncoding;
     procedure TestVolumePositionalEncoding;
     procedure TestVolumeColorConversions;
@@ -532,6 +533,30 @@ begin
   finally
     Output.Free;
     Target.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeOneHotEncodingOnPixel;
+var
+  V: TNNetVolume;
+begin
+  // 3 positions (X axis), vocab size 4 (depth axis), single row (Y = 0).
+  V := TNNetVolume.Create(3, 1, 4);
+  try
+    V.Fill(9);  // non-zero garbage to prove the column is cleared
+    V.OneHotEncodingOnPixel(1, 0, 2);
+    // The targeted pixel becomes a clean one-hot of class 2 ...
+    AssertEquals('one-hot bit set', 1.0, V[1, 0, 2], 0.0001);
+    AssertEquals('other depth 0 cleared', 0.0, V[1, 0, 0], 0.0001);
+    AssertEquals('other depth 1 cleared', 0.0, V[1, 0, 1], 0.0001);
+    AssertEquals('other depth 3 cleared', 0.0, V[1, 0, 3], 0.0001);
+    // ... and GetClassOnPixel is its inverse.
+    AssertEquals('GetClassOnPixel inverts it', 2, V.GetClassOnPixel(1, 0));
+    // Neighbouring pixels are left untouched (still the garbage fill).
+    AssertEquals('neighbour pixel untouched', 9.0, V[0, 0, 0], 0.0001);
+    AssertEquals('neighbour pixel untouched', 9.0, V[2, 0, 3], 0.0001);
+  finally
+    V.Free;
   end;
 end;
 

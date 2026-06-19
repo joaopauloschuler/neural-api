@@ -215,7 +215,7 @@ const
     begin
       InputV.FData[I] := Tokens[I];
       if I = 0 then Prev := 0 else Prev := Tokens[I - 1];
-      TargetV[I, 0, Prev] := 1.0;
+      TargetV.OneHotEncodingOnPixel(I, 0, Prev);
     end;
   end;
 

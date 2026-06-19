@@ -330,6 +330,13 @@ type
     procedure GroupedPointwiseSoftMax(Groups: integer);
 
     // Encoding Functions
+    // Sets the depth column at pixel (X, Y) to a one-hot of Token: writes 1 at
+    // depth Token and 0 at every other depth of that pixel, leaving the rest of
+    // the volume untouched. Inverse of GetClassOnPixel. Unlike the array/string
+    // OneHotEncoding overloads it does NOT Fill(0) the whole volume nor pad
+    // other positions, so it is the right primitive for per-position sequence
+    // targets and for single-position one-hots.
+    procedure OneHotEncodingOnPixel(X, Y, Token: integer);
     procedure OneHotEncoding(aTokens: array of integer); overload;
     procedure GroupedOneHotEncoding(aTokens: array of integer; Groups: integer); overload;
     procedure ReverseGroupedOneHotEncoding(out aTokens: TNeuralIntegerArray; Groups: integer);
@@ -7382,6 +7389,22 @@ begin
       end;
     end;
   end;
+end;
+
+procedure TVolume.OneHotEncodingOnPixel(X, Y, Token: integer);
+var
+  d, MaxD: integer;
+begin
+  if (Token < 0) or (Token >= FDepth) then
+  begin
+    WriteLn('Token '+IntToStr(Token)+' is out of range [0,'+IntToStr(FDepth)+
+      ') at OneHotEncodingOnPixel.');
+    Exit;
+  end;
+  MaxD := FDepth - 1;
+  for d := 0 to MaxD do
+    Self[X, Y, d] := 0;
+  Self[X, Y, Token] := 1;
 end;
 
 procedure TVolume.OneHotEncoding(aTokens: array of integer);
