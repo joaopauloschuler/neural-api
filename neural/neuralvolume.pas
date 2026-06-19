@@ -255,6 +255,14 @@ type
     function GetMagnitude(): T; {$IFDEF Release} inline; {$ENDIF}
     function GetEntropy(): T;
     function GetPerplexity(): T;
+    // Cross-entropy of this volume (treated as predicted probabilities)
+    // against Target, along the depth axis at pixel (X, Y):
+    //   -sum_d Target[X,Y,d] * Ln(Self[X,Y,d]).
+    // Predicted values are clamped to >= 1e-12 before Ln to avoid log(0).
+    // Mirrors GetClassOnPixel: it operates per pixel along the depth axis.
+    function CrossEntropyOnPixel(Target: TVolume; X, Y: integer): T;
+    // Mean of CrossEntropyOnPixel over every (X, Y) pixel of the volume.
+    function MeanCrossEntropy(Target: TVolume): T;
     procedure FlipX();
     procedure FlipY();
     procedure IncTag(); {$IFDEF Release} inline; {$ENDIF}
@@ -6744,6 +6752,40 @@ end;
 function TVolume.GetPerplexity: T;
 begin
   Result := pcr_exp2f(GetEntropy());
+end;
+
+function TVolume.CrossEntropyOnPixel(Target: TVolume; X, Y: integer): T;
+var
+  d, MaxD: integer;
+  P, Tgt: T;
+begin
+  Result := 0;
+  MaxD := FDepth - 1;
+  for d := 0 to MaxD do
+  begin
+    Tgt := Target[X, Y, d];
+    if Tgt > 0 then
+    begin
+      P := Self[X, Y, d];
+      if P < 1e-12 then P := 1e-12;
+      Result := Result - Tgt * Ln(P);
+    end;
+  end;
+end;
+
+function TVolume.MeanCrossEntropy(Target: TVolume): T;
+var
+  X, Y, MaxX, MaxY, PixelCount: integer;
+begin
+  Result := 0;
+  PixelCount := FSizeX * FSizeY;
+  if PixelCount = 0 then Exit;
+  MaxX := FSizeX - 1;
+  MaxY := FSizeY - 1;
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
+      Result := Result + CrossEntropyOnPixel(Target, X, Y);
+  Result := Result / PixelCount;
 end;
 
 procedure TVolume.FlipX();

@@ -32,6 +32,7 @@ type
     procedure TestVolumeNormalization;
     procedure TestVolumeMagnitude;
     procedure TestVolumeEntropy;
+    procedure TestVolumeCrossEntropy;
     procedure TestVolumeOneHotEncoding;
     procedure TestVolumePositionalEncoding;
     procedure TestVolumeColorConversions;
@@ -496,6 +497,41 @@ begin
     AssertEquals('Entropy of deterministic dist should be 0', 0.0, Entropy, 0.001);
   finally
     V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeCrossEntropy;
+var
+  Output, Target: TNNetVolume;
+begin
+  // Sequence of 2 positions (X axis), vocab size 3 (depth axis).
+  Output := TNNetVolume.Create(2, 1, 3);
+  Target := TNNetVolume.Create(2, 1, 3);
+  try
+    Target.Fill(0);
+    // Position 0: true class 1, predicted perfectly -> CE = -ln(1) = 0.
+    Target[0, 0, 1] := 1.0;
+    Output[0, 0, 0] := 0.0; Output[0, 0, 1] := 1.0; Output[0, 0, 2] := 0.0;
+    AssertEquals('CE of perfect prediction is 0', 0.0,
+      Output.CrossEntropyOnPixel(Target, 0, 0), 0.0001);
+
+    // Position 1: true class 2, predicted prob 0.7 -> CE = -ln(0.7).
+    Target[1, 0, 2] := 1.0;
+    Output[1, 0, 0] := 0.1; Output[1, 0, 1] := 0.2; Output[1, 0, 2] := 0.7;
+    AssertEquals('CE matches -ln(p) of the true class', -Ln(0.7),
+      Output.CrossEntropyOnPixel(Target, 1, 0), 0.0001);
+
+    // Mean over the two positions.
+    AssertEquals('Mean CE averages over all pixels', (0.0 + (-Ln(0.7))) / 2,
+      Output.MeanCrossEntropy(Target), 0.0001);
+
+    // Zero predicted probability on the true class is clamped to 1e-12.
+    Output[1, 0, 2] := 0.0;
+    AssertEquals('Zero probability is clamped before Ln', -Ln(1e-12),
+      Output.CrossEntropyOnPixel(Target, 1, 0), 0.0001);
+  finally
+    Output.Free;
+    Target.Free;
   end;
 end;
 

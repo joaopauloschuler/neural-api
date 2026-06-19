@@ -186,31 +186,6 @@ begin
   gAttn2Idx := Sdpa2.LayerIdx;
 end;
 
-function CrossEntropyAt(Output, Target: TNNetVolume; t: integer): TNeuralFloat;
-var
-  d: integer;
-  P: TNeuralFloat;
-begin
-  Result := 0;
-  for d := 0 to cVocab - 1 do
-    if Target[t, 0, d] > 0 then
-    begin
-      P := Output[t, 0, d];
-      if P < 1e-12 then P := 1e-12;
-      Result := Result - Target[t, 0, d] * Ln(P);
-    end;
-end;
-
-function MeanCrossEntropy(Output, Target: TNNetVolume): TNeuralFloat;
-var
-  t: integer;
-begin
-  Result := 0;
-  for t := 0 to cSeqLen - 1 do
-    Result := Result + CrossEntropyAt(Output, Target, t);
-  Result := Result / cSeqLen;
-end;
-
 procedure Train(NN: TNNet);
 var
   Epoch, b: integer;
@@ -231,7 +206,7 @@ begin
         MakeSeq(S);
         FillPair(S, InputV, TargetV);
         NN.Compute(InputV);
-        SumCE := SumCE + MeanCrossEntropy(NN.GetLastLayer.Output, TargetV);
+        SumCE := SumCE + NN.GetLastLayer.Output.MeanCrossEntropy(TargetV);
         NN.Backpropagate(TargetV);   // per-sample SGD update (auto)
       end;
       if (Epoch = 1) or (Epoch mod 30 = 0) or (Epoch = cEpochs) then
@@ -278,14 +253,14 @@ begin
           // First half: predicting still-unseen prefix tokens (chance only).
           if Pred = S[t + 1] then Inc(C1);
           Inc(N1);
-          SumCE1 := SumCE1 + CrossEntropyAt(NN.GetLastLayer.Output, TargetV, t);
+          SumCE1 := SumCE1 + NN.GetLastLayer.Output.CrossEntropyOnPixel(TargetV, t, 0);
         end
         else
         begin
           // Second half (and the boundary): induction can recover S[t+1].
           if Pred = S[t + 1] then Inc(C2);
           Inc(N2);
-          SumCE2 := SumCE2 + CrossEntropyAt(NN.GetLastLayer.Output, TargetV, t);
+          SumCE2 := SumCE2 + NN.GetLastLayer.Output.CrossEntropyOnPixel(TargetV, t, 0);
         end;
       end;
     end;
