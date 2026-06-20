@@ -54128,13 +54128,18 @@ begin
   inherited AfterWeightUpdate();
   if FNeuronWeightList.Count > 0 then
   begin
-    if FShouldConcatWeights and not(ActiveLowMemory()) then
+    if FShouldConcatWeights then
     begin
       BuildBiasOutput();
-      // In int8-quantized mode the per-neuron FP32 volumes are shrunk to a
-      // single element - concatenating them would build a garbage cache.
-      // The bias output above stays correct (biases remain FP32).
-      if not FQuantInt8 then
+      // Both int8-quantized and low-memory inference need FBiasOutput (biases
+      // stay FP32 and are added at compute time), so the bias is always built.
+      // Only the concatenated weight cache is skipped:
+      //  - int8: the per-neuron FP32 volumes are shrunk to a single element,
+      //    so concatenating them would build a garbage cache (it is rebuilt
+      //    transiently from the int8 codes in Compute).
+      //  - low-memory: ComputeLowMemoryCPU reads per-neuron weights directly,
+      //    so the persistent cache is pure overhead.
+      if not FQuantInt8 and not ActiveLowMemory() then
       begin
         FNeuronWeightList.ConcatInto(FConcatedWeights);
         if FShouldInterleaveWeights then
