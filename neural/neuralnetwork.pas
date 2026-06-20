@@ -75676,7 +75676,7 @@ begin
   inherited SetPrevLayer(pPrevLayer);
   FOutput.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
   FOutputRaw.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
-  if not(FInferenceOnly) then
+  //if not(FInferenceOnly) then
   begin
     FOutputError.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
     FOutputErrorDeriv.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
