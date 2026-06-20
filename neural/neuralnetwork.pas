@@ -54128,7 +54128,7 @@ begin
   inherited AfterWeightUpdate();
   if FNeuronWeightList.Count > 0 then
   begin
-    if FShouldConcatWeights then
+    if FShouldConcatWeights and not(ActiveLowMemory()) then
     begin
       BuildBiasOutput();
       // In int8-quantized mode the per-neuron FP32 volumes are shrunk to a
