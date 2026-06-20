@@ -483,6 +483,17 @@ type
       // gradient scratch) can override to release them when marked inference-only.
       function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; virtual;
 
+      // Low-memory inference predicates (Coded by Claude (AI)):
+      // SupportsLowMemory is True only for layer classes that implement a
+      // per-neuron CPU forward path (default False = safe). WillOpenCL is True
+      // when the layer will dispatch to an OpenCL kernel, in which case the
+      // concatenated-weight caches must be kept (default False). ActiveLowMemory
+      // is the complete gate used by call sites: low-memory weights are dropped
+      // and the per-neuron path is used only when all three conditions hold.
+      function SupportsLowMemory(): boolean; virtual;
+      function WillOpenCL(): boolean; virtual;
+      function ActiveLowMemory(): boolean;
+
       procedure InitDefault(); virtual;
 
       property ActivationFn: TNeuralActivationFunction read FActivationFn write FActivationFn;
@@ -10424,7 +10435,8 @@ type
       procedure BackpropagatePointwiseOpenCL();
       procedure ComputeLowMemoryCPU(); {$IFDEF Release} inline; {$ENDIF}
       procedure AfterWeightUpdate(); override;
-      function WillOpenCL: boolean;
+      function SupportsLowMemory(): boolean; override;
+      function WillOpenCL(): boolean; override;
       {$IFDEF OpenCL}
       procedure ComputeOpenCL();
       {$ENDIF}
@@ -10450,6 +10462,9 @@ type
     public
       constructor Create(LinkedLayer: TNNetLayer); overload; virtual;
       destructor Destroy; override;
+      // Shared-weight convolutions depend on FConcatedWeights (snapshotted or
+      // rebuilt per forward), so they cannot drop it for low-memory mode.
+      function SupportsLowMemory(): boolean; override;
   end;
 
   /// Weight-tied convolution that REBUILDS its concatenated-weight cache from the
@@ -36994,6 +37009,11 @@ begin
   inherited Destroy;
 end;
 
+function TNNetConvolutionSharedWeights.SupportsLowMemory(): boolean;
+begin
+  Result := False;
+end;
+
 { TNNetDeepEquilibriumSharedConv }
 procedure TNNetDeepEquilibriumSharedConv.Compute();
 begin
@@ -54106,16 +54126,6 @@ end;
 procedure TNNetLayerConcatedWeights.AfterWeightUpdate();
 begin
   inherited AfterWeightUpdate();
-  // this is a hack - START
-  if self is TNNetConvolution then
-  begin
-    if FLowMemory then
-    begin
-      FShouldConcatWeights := false;
-      FShouldInterleaveWeights := false;
-      BuildBiasOutput();
-    end;
-  end;
   if FNeuronWeightList.Count > 0 then
   begin
     if FShouldConcatWeights then
@@ -76016,7 +76026,7 @@ procedure TNNetConvolution.Compute();
       ComputeTiledCPU();
       FConcatedWeights.ReSize(1, 1, 1);
     end
-    else if FLowMemory then
+    else if ActiveLowMemory() then
     begin
       ComputeLowMemoryCPU();
     end
@@ -76088,6 +76098,11 @@ begin
     raise Exception.Create('TNNetConvolution.Backpropagate: layer ' +
       IntToStr(FLayerIdx) + ' has int8-quantized weights (inference-only). ' +
       'Rebuild/reload without quantization to train.');
+  if ActiveLowMemory() then
+    raise Exception.Create('TNNetConvolution.Backpropagate: layer ' +
+      IntToStr(FLayerIdx) + ' is in low-memory inference mode (the weight ' +
+      'caches backprop needs were released). Rebuild with ' +
+      'SetInferenceOnly(False, False) to train.');
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -99963,6 +99978,7 @@ begin
   FCanNormalizeDelta := true;
   FCanSetNumWeightsForAllNeurons := True;
   FInferenceOnly := False;
+  FLowMemory := False;
   FActivationFn := @Identity;
   FActivationFnDerivative := @IdentityDerivative;
   FLearningRate := 0.01;
@@ -100351,7 +100367,10 @@ var
 begin
   Result := Self;
   FInferenceOnly := pInferenceOnly;
-  FLowMemory := pLowMemory;
+  // Low-memory mode drops the backprop-side weight caches, so it only makes
+  // sense for an inference-only layer. Coercing here makes the contradictory
+  // SetInferenceOnly(False, True) combination impossible.
+  FLowMemory := pLowMemory and pInferenceOnly;
   // Shrink any training buffers already allocated (e.g. a layer that sized its
   // weights in the constructor, before this was chained). When the layer is
   // attached later, the FInferenceOnly flag stops them being re-allocated.
@@ -100360,6 +100379,23 @@ begin
   begin
     FNeurons[Cnt].SetInferenceOnly(pInferenceOnly, pLowMemory);
   end;
+end;
+
+function TNNetLayer.SupportsLowMemory(): boolean;
+begin
+  // Default: no per-neuron CPU forward path, so low-memory mode is unsupported.
+  Result := False;
+end;
+
+function TNNetLayer.WillOpenCL(): boolean;
+begin
+  // Default: generic layers do not dispatch to the convolution OpenCL kernel.
+  Result := False;
+end;
+
+function TNNetLayer.ActiveLowMemory(): boolean;
+begin
+  Result := FLowMemory and SupportsLowMemory() and not WillOpenCL();
 end;
 
 procedure TNNetLayer.InitDefault();
@@ -102090,15 +102126,28 @@ end;
 
 procedure TNNetConvolution.AfterWeightUpdate();
 begin
+  // Let the inherited update build FBiasOutput (and, transiently, the
+  // concatenated caches) under its own FShouldConcatWeights guard - that guard
+  // is only true once the layer is fully sized, so we must not build the bias
+  // ourselves here (SetNumWeightsForAllNeurons calls this BEFORE FOutputRaw is
+  // sized, and an early BuildBiasOutput writes out of bounds).
   inherited AfterWeightUpdate();
-  if not WillOpenCL() and FLowMemory then
+  if ActiveLowMemory() then
   begin
-    FConcatedWeights.Resize(1,1,1);
-    FConcatedWInter.Resize(1,1,1);
+    // Release the persistent weight caches the per-neuron forward does not need.
+    // FBiasOutput (built above) is kept - ComputeLowMemoryCPU uses it.
+    FConcatedWeights.ReSize(1, 1, 1);
+    FConcatedWInter.ReSize(1, 1, 1);
   end;
 end;
 
-function TNNetConvolution.WillOpenCL: boolean;
+function TNNetConvolution.SupportsLowMemory(): boolean;
+begin
+  // TNNetConvolution (and most descendants) has a per-neuron CPU forward path.
+  Result := True;
+end;
+
+function TNNetConvolution.WillOpenCL(): boolean;
 begin
   {$IFDEF OpenCL}
   Result := (Assigned(FDotCL) and FHasOpenCL and FShouldOpenCL);
