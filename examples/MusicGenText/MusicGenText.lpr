@@ -60,6 +60,7 @@ Coded by Claude (AI).
 //   MusicGenText --download --prompt "..." --topk 250 --temperature 1.0
 //   MusicGenText --download --prompt "..." --topk 0    # force greedy (drone!)
 //   MusicGenText --frames 6 --no-cache            # explicit pico frame count
+//   MusicGenText --summary                        # print weights-per-layer tables
 // Repo overrides: --musicgen-repo / --t5-repo / --encodec-repo. Gated repos:
 // set HF_TOKEN in the environment.
 //
@@ -109,7 +110,7 @@ var
   MgDir, T5Dir, EcDir: string;
   Ids: array of integer;
   GuidanceScale, Temperature, Seconds: TNeuralFloat;
-  UseCache, RealMode: boolean;
+  UseCache, RealMode, ShowSummary: boolean;
   Sampler: TNNetSamplerBase;
   TickStart: QWord;   // captured before each timed model load / pipeline step
 
@@ -180,6 +181,7 @@ begin
   Temperature := ParseFloatArg('--temperature', 1.0);
   Seconds := ParseFloatArg('--seconds', DefaultSeconds);
   UseCache := not HasFlag('--no-cache');
+  ShowSummary := HasFlag('--summary');
   Tok := nil;
 
   if RealMode then
@@ -301,6 +303,12 @@ begin
       {pInferenceOnly=}true, T5CfgPath);
     WriteLn('[time] T5 model load (', T5Safe, '): ', Elapsed(TickStart));
     WriteLn('T5 text encoder: ', T5ConfigToString(T5Cfg));
+    if ShowSummary then
+    begin
+      WriteLn;
+      WriteLn('== T5 text encoder: weights per layer ==');
+      T5Enc.PrintSummary();
+    end;
 
     Tokens.ReSize(EncSeq, 1, 1);
     Write('Prompt token ids:');
@@ -338,6 +346,12 @@ begin
       {pInferenceOnly=}true, MgCfg);
     WriteLn('[time] MusicGen decoder load (', MgSafe, '): ', Elapsed(TickStart));
     WriteLn(MusicGenConfigToString(Config));
+    if ShowSummary then
+    begin
+      WriteLn;
+      WriteLn('== MusicGen decoder: weights per layer ==');
+      Model.Decoder.PrintSummary();
+    end;
 
     WriteLn('Generating ', NumFrames, ' frames over ', Config.NumCodebooks,
       ' codebooks via the delay pattern (conditioned on the T5 prompt)...');

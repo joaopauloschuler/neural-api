@@ -164,7 +164,7 @@ type
       // write out-of-range training buffers. The weight initializers and
       // InitAdam do NOT restore the buffers; to train again, rebuild or
       // reload the network.
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetNeuron; // Coded by Claude (AI).
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetNeuron; // Coded by Claude (AI).
 
       // Initializers
 
@@ -261,6 +261,12 @@ type
       // BEFORE the layer is attached (SetPrevLayer). Default False (trainable).
       // Coded by Claude (AI).
       FInferenceOnly: boolean;
+      // When True (and FInferenceOnly is also True), CPU forward passes avoid
+      // building the persistent concatenated-weight caches
+      // (FConcatedWeights/FConcatedWInter), computing per-neuron instead to keep
+      // the inference weight footprint minimal. Set by SetInferenceOnly's
+      // pLowMemory argument. Default False. (Coded by Claude (AI).)
+      FLowMemory: boolean;
       FNN: TNNet;
       // Persistent magnitude-pruning mask: one volume per neuron (parallel to
       // FNeurons), each element 1.0 = keep, 0.0 = pruned. nil = no mask on this
@@ -475,7 +481,18 @@ type
       // importer code can chain it unconditionally. Coded by Claude (AI).
       // Virtual so layers that allocate their own backprop-only buffers (per-pass
       // gradient scratch) can override to release them when marked inference-only.
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; virtual;
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; virtual;
+
+      // Low-memory inference predicates (Coded by Claude (AI)):
+      // SupportsLowMemory is True only for layer classes that implement a
+      // per-neuron CPU forward path (default False = safe). WillOpenCL is True
+      // when the layer will dispatch to an OpenCL kernel, in which case the
+      // concatenated-weight caches must be kept (default False). ActiveLowMemory
+      // is the complete gate used by call sites: low-memory weights are dropped
+      // and the per-neuron path is used only when all three conditions hold.
+      function SupportsLowMemory(): boolean; virtual;
+      function WillOpenCL(): boolean; virtual;
+      function ActiveLowMemory(): boolean;
 
       procedure InitDefault(); virtual;
 
@@ -2332,7 +2349,7 @@ type
     constructor Create(); overload; override;
     constructor Create(NumClasses: integer; Margin, Scale: TNeuralFloat); overload;
     destructor Destroy(); override;
-    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
     procedure Backpropagate(); override;
   end;
 
@@ -3112,7 +3129,7 @@ type
     constructor Create(d_k: integer; CausalMask: boolean;
       KeyValueSource: TNNetLayer); overload;
     destructor Destroy(); override;
-    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
     function SaveStructureToString(): string; override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -3165,7 +3182,7 @@ type
   public
     constructor Create(); override;
     destructor Destroy(); override;
-    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     // Read-only access to the per-position forget values f_t (in (0,1)).
@@ -3706,7 +3723,7 @@ type
     public
       constructor Create(InducingPoints, d: integer); overload;
       destructor Destroy(); override;
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -3753,7 +3770,7 @@ type
     public
       constructor Create(NumSeeds, d: integer); overload;
       destructor Destroy(); override;
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -3895,7 +3912,7 @@ type
     public
       constructor Create(NumKeys, ValueDim, TopK, Heads, QueryDim: integer); overload;
       destructor Destroy(); override;
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -4052,7 +4069,7 @@ type
       pNumBuckets: integer = 32; pMaxDistance: integer = 128;
       pWindow: integer = 0); overload;
     destructor Destroy(); override;
-    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     procedure InitDefault(); override;
@@ -4421,7 +4438,7 @@ type
     constructor Create(d_k: integer; pCausalMask: boolean = false;
       pLambdaInit: TNeuralFloat = 0.8); overload;
     destructor Destroy(); override;
-    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     procedure InitDefault(); override;
@@ -4471,7 +4488,7 @@ type
     constructor Create(d_k: integer; pGamma: TNeuralFloat = 0.96;
       pLearnGamma: boolean = false); overload;
     destructor Destroy(); override;
-    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
     procedure InitDefault(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -4646,7 +4663,7 @@ type
   public
     constructor Create(d_k: integer; k: integer); overload;
     destructor Destroy(); override;
-    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
     procedure InitDefault(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -5701,7 +5718,7 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure FreeBackpropScratch();
     public
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
       constructor Create(); overload; override;
       constructor Create(pInitialAlpha: TNeuralFloat); overload;
       destructor Destroy(); override;
@@ -5784,7 +5801,7 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure FreeBackpropScratch();
     public
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
       constructor Create(); overload; override;
       constructor Create(pNumInCaps, pInDim, pNumOutCaps, pOutDim, pRoutingIters: integer); overload;
       destructor Destroy(); override;
@@ -5826,7 +5843,7 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure FreeBackpropScratch();
     public
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
       constructor Create(); overload; override;
       constructor Create(pBeta, pGamma, pZeta: TNeuralFloat); overload;
       destructor Destroy(); override;
@@ -5868,7 +5885,7 @@ type
     public
       constructor Create(); override;
       destructor Destroy(); override;
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -5934,7 +5951,7 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure FreeBackpropScratch();
     public
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
       constructor Create(); override;
       destructor Destroy(); override;
       procedure Compute(); override;
@@ -6153,7 +6170,7 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure FreeBackpropScratch();
     public
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
       constructor Create(); overload; override;
       constructor Create(NumHinges: integer); overload;
       destructor Destroy(); override;
@@ -6210,7 +6227,7 @@ type
       constructor Create(NumIntervals: integer;
         Range: TNeuralFloat = 2.0); overload;
       destructor Destroy(); override;
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -6706,7 +6723,7 @@ type
     public
       constructor Create(); override;
       destructor Destroy(); override;
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -6959,7 +6976,7 @@ type
       constructor Create(pNumSlots, pSlotWidth: integer;
         pInitVal: TNeuralFloat = 0.001); reintroduce; overload;
       destructor Destroy(); override;
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -7167,7 +7184,7 @@ type
     public
       constructor Create(); override;
       destructor Destroy(); override;
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -7228,7 +7245,7 @@ type
     public
       constructor Create(); override;
       destructor Destroy(); override;
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -7719,7 +7736,7 @@ type
       constructor Create(); overload; override;
       constructor Create(pInverse: boolean; pPermSeed: integer = 0); overload;
       destructor Destroy(); override;
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -7856,7 +7873,7 @@ type
       // non-linear inner state). pHidden: MLP hidden width (0 => auto max(2*Depth,8)).
       constructor Create(pVariant: integer = 0; pHidden: integer = 0); reintroduce; overload;
       destructor Destroy(); override;
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -7944,7 +7961,7 @@ type
       // Frees backprop-only scratch when the layer is marked inference-only
       // after it was already attached (the construction path is handled by the
       // guard in SetPrevLayer).
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -9555,7 +9572,7 @@ type
     // overload (it would be ambiguous with the inherited FullConnect signature).
     constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
     destructor Destroy(); override;
-    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure Compute(); override;
     procedure ComputeCPU(); override;
@@ -9654,7 +9671,7 @@ type
     // single trainable scalar (see class header); default false keeps c fixed.
     constructor Create(pSizeX: integer; pCurvature: TNeuralFloat = 1.0; pSuppressBias: integer = 0; pLearnCurvature: boolean = false); reintroduce; overload;
     destructor Destroy(); override;
-    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure InitDefault(); override;
     procedure Compute(); override;
@@ -9718,7 +9735,7 @@ type
     // pCurvature is the fixed ball curvature c > 0 (default 1.0).
     constructor Create(pNumProto: integer; pCurvature: TNeuralFloat = 1.0); reintroduce; overload;
     destructor Destroy(); override;
-    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure Compute(); override;
     procedure ComputeCPU(); override;
@@ -9921,7 +9938,7 @@ type
     constructor Create(pNumFeatures: integer; pAttentionDropout: TNeuralFloat;
       pSuppressBias: integer); overload;
     destructor Destroy(); override;
-    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
     // Attention-dropout train/inference gate; TNNet.EnableDropouts toggles it.
     property Enabled: boolean read FEnabled write FEnabled;
     procedure SetAdjacency(A: TNNetVolume);
@@ -10401,6 +10418,9 @@ type
   end;
 
   /// Convolutional layer with hyperbolic tangent activation function.
+
+  { TNNetConvolution }
+
   TNNetConvolution = class(TNNetConvolutionBase)
     protected
       procedure BackpropagateAtOutputPos(pCanBackpropOnPos: boolean; OutputRawPos, OutputX, OutputY, OutputD, PrevX, PrevY: integer); {$IFDEF Release} inline; {$ENDIF}
@@ -10413,12 +10433,14 @@ type
       procedure BackpropagateFastTiledCPU();
       procedure BackpropagateFastCPUDev(); // Backprop CPU development version (do not use it)
       procedure BackpropagatePointwiseOpenCL();
-
+      procedure ComputeLowMemoryCPU(); {$IFDEF Release} inline; {$ENDIF}
+      procedure AfterWeightUpdate(); override;
+      function SupportsLowMemory(): boolean; override;
+      function WillOpenCL(): boolean; override;
       {$IFDEF OpenCL}
       procedure ComputeOpenCL();
       {$ENDIF}
       {$IFDEF Debug}
-      procedure ComputeNeuronCPU(); {$IFDEF Release} inline; {$ENDIF}
       procedure AddBiasToRawResult(); {$IFDEF Release} inline; {$ENDIF}
       //procedure ComputeNeuronFromResult(NeuronIdx: integer); {$IFDEF Release} inline; {$ENDIF}
       procedure ComputeNeuron(NeuronIdx: integer); {$IFDEF Release} inline; {$ENDIF}
@@ -10440,6 +10462,9 @@ type
     public
       constructor Create(LinkedLayer: TNNetLayer); overload; virtual;
       destructor Destroy; override;
+      // Shared-weight convolutions depend on FConcatedWeights (snapshotted or
+      // rebuilt per forward), so they cannot drop it for low-memory mode.
+      function SupportsLowMemory(): boolean; override;
   end;
 
   /// Weight-tied convolution that REBUILDS its concatenated-weight cache from the
@@ -10792,7 +10817,7 @@ type
   public
     constructor Create(pOutDepth, pModes: integer); overload;
     destructor Destroy(); override;
-    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure InitDefault(); override;
     procedure Compute(); override;
@@ -10852,7 +10877,7 @@ type
   public
     constructor Create(pOutDepth, pModesX, pModesY: integer); overload;
     destructor Destroy(); override;
-    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure InitDefault(); override;
     procedure Compute(); override;
@@ -10933,7 +10958,7 @@ type
   public
     constructor Create(pFilter: integer; pLearnable: boolean = false); overload;
     destructor Destroy(); override;
-    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure InitDefault(); override;
     procedure Compute(); override;
@@ -11399,7 +11424,7 @@ type
   public
     constructor Create(pNumExperts, pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); reintroduce; overload;
     destructor Destroy(); override;
-    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure InitDefault(); override;
     procedure Compute(); override;
@@ -11680,7 +11705,7 @@ type
   public
     constructor Create(pSuppressBias: integer = 0); overload;
     destructor Destroy(); override;
-    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure InitDefault(); override;
     procedure Compute(); override;
@@ -11722,7 +11747,7 @@ type
   public
     constructor Create(pSuppressBias: integer = 0; pP: integer = 0); overload;
     destructor Destroy(); override;
-    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure InitDefault(); override;
     procedure Compute(); override;
@@ -11848,7 +11873,7 @@ type
   public
     constructor Create(TreeDepth, OutputDepth: integer; Beta: TNeuralFloat = 1.0); overload;
     destructor Destroy(); override;
-    function SetInferenceOnly(pInferenceOnly: boolean = True): TNNetLayer; override;
+    function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure InitDefault(); override;
     procedure Compute(); override;
@@ -14283,7 +14308,7 @@ type
       // train again, rebuild or reload the network. Idempotent - safe to
       // call repeatedly while a network is still being built (used by the
       // GPT-2 importer to bound peak memory during construction).
-      function SetInferenceOnly(pInferenceOnly: boolean = True): TNNet; // Coded by Claude (AI).
+      function SetInferenceOnly(pInferenceOnly: boolean = True; pLowMemory: boolean = True): TNNet; // Coded by Claude (AI).
       // Converts the FP32 weights of every weight-heavy dense/convolutional
       // layer (exact classes: TNNetConvolution/Linear/ReLU, TNNetPointwise
       // Conv/Linear/ReLU, TNNetFullConnect/Linear/ReLU/Sigmoid - the same
@@ -22000,9 +22025,9 @@ begin
   inherited Destroy();
 end;
 
-function TNNetArcFace.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetArcFace.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -24822,9 +24847,9 @@ begin
   inherited Destroy();
 end;
 
-function TNNetForgetGateBias.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetForgetGateBias.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -25257,9 +25282,9 @@ begin
   inherited Destroy();
 end;
 
-function TNNetInducedSetAttention.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetInducedSetAttention.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -25573,9 +25598,9 @@ begin
   SetLength(FGBuf, 0); SetLength(FdScoreBuf, 0);
 end;
 
-function TNNetProductKeyMemory.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetProductKeyMemory.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -25943,9 +25968,9 @@ begin
   inherited Destroy();
 end;
 
-function TNNetAttentionPooling.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetAttentionPooling.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -26278,9 +26303,9 @@ begin
   inherited Destroy();
 end;
 
-function TNNetRetention.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetRetention.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -26498,9 +26523,9 @@ begin
   inherited Destroy();
 end;
 
-function TNNetCrossAttention.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetCrossAttention.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -29375,9 +29400,9 @@ begin
   inherited Destroy();
 end;
 
-function TNNetT5RelPosBiasAttention.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetT5RelPosBiasAttention.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -31034,9 +31059,9 @@ begin
   inherited Destroy();
 end;
 
-function TNNetDifferentialAttention.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetDifferentialAttention.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -31291,9 +31316,9 @@ begin
   inherited Destroy();
 end;
 
-function TNNetLinformerAttention.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetLinformerAttention.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -36984,6 +37009,11 @@ begin
   inherited Destroy;
 end;
 
+function TNNetConvolutionSharedWeights.SupportsLowMemory(): boolean;
+begin
+  Result := False;
+end;
+
 { TNNetDeepEquilibriumSharedConv }
 procedure TNNetDeepEquilibriumSharedConv.Compute();
 begin
@@ -39321,9 +39351,9 @@ begin
   inherited Destroy();
 end;
 
-function TNNetGatedResidual.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetGatedResidual.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -39593,9 +39623,9 @@ begin
   SetLength(FgSBuf, 0);
 end;
 
-function TNNetCapsuleRouting.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetCapsuleRouting.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -39848,9 +39878,9 @@ begin
   SetLength(FgradLogAlphaBuf, 0);
 end;
 
-function TNNetHardConcrete.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetHardConcrete.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -40031,9 +40061,9 @@ begin
   SetLength(FsumGyXBuf, 0);
 end;
 
-function TNNetGRN.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetGRN.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -40878,9 +40908,9 @@ begin
   SetLength(FgradBBuf, 0);
 end;
 
-function TNNetAPL.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetAPL.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -41080,9 +41110,9 @@ begin
   SetLength(FgradYBuf, 0);
 end;
 
-function TNNetSplineActivation.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetSplineActivation.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -44614,9 +44644,9 @@ begin
   SetLength(FgT2ArrBuf, 0);
 end;
 
-function TNNetInvertible1x1Conv.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetInvertible1x1Conv.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -46282,9 +46312,9 @@ begin
   SetLength(FgqBuf, 0); SetLength(FgkvBuf, 0); SetLength(FgvvBuf, 0);
 end;
 
-function TNNetMLSTMCell.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetMLSTMCell.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -47743,9 +47773,9 @@ begin
   SetLength(FgknBuf, 0); SetLength(FgkrawBuf, 0);
 end;
 
-function TNNetDeltaNet.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetDeltaNet.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -48311,9 +48341,9 @@ begin
   SetLength(FgkrawBuf, 0); SetLength(FgaBuf, 0);
 end;
 
-function TNNetGatedLinearAttention.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetGatedLinearAttention.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -48640,9 +48670,9 @@ begin
   SetLength(FgEArrBuf, 0); SetLength(FgAArrBuf, 0);
 end;
 
-function TNNetNTMMemory.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetNTMMemory.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -49104,9 +49134,9 @@ begin
   SetLength(Fda1Buf, 0); SetLength(FdSBuf, 0);
 end;
 
-function TNNetTestTimeTraining.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetTestTimeTraining.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -49644,11 +49674,11 @@ begin
   SetLength(FgS1pBuf, 0); SetLength(FgS2pBuf, 0);
 end;
 
-function TNNetTitansMemory.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetTitansMemory.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   // Base shrinks the per-neuron Delta/BackInertia mirrors; also drop our own
   // per-pass Backpropagate scratch (no-op unless transitioning to inference).
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -53217,9 +53247,9 @@ begin
   SetLength(FsByDepthBuf, 0);
 end;
 
-function TNNetRMSNormGated.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetRMSNormGated.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -54101,10 +54131,15 @@ begin
     if FShouldConcatWeights then
     begin
       BuildBiasOutput();
-      // In int8-quantized mode the per-neuron FP32 volumes are shrunk to a
-      // single element - concatenating them would build a garbage cache.
-      // The bias output above stays correct (biases remain FP32).
-      if not FQuantInt8 then
+      // Both int8-quantized and low-memory inference need FBiasOutput (biases
+      // stay FP32 and are added at compute time), so the bias is always built.
+      // Only the concatenated weight cache is skipped:
+      //  - int8: the per-neuron FP32 volumes are shrunk to a single element,
+      //    so concatenating them would build a garbage cache (it is rebuilt
+      //    transiently from the int8 codes in Compute).
+      //  - low-memory: ComputeLowMemoryCPU reads per-neuron weights directly,
+      //    so the persistent cache is pure overhead.
+      if not FQuantInt8 and not ActiveLowMemory() then
       begin
         FNeuronWeightList.ConcatInto(FConcatedWeights);
         if FShouldInterleaveWeights then
@@ -60384,9 +60419,9 @@ begin
   SetLength(FdXimBuf, 0);
 end;
 
-function TNNetSpectralConv1D.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetSpectralConv1D.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -60700,9 +60735,9 @@ begin
   SetLength(FhistDBuf, 0);
 end;
 
-function TNNetDWT1D.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetDWT1D.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -61251,9 +61286,9 @@ begin
   SetLength(FdXimBuf, 0);
 end;
 
-function TNNetSpectralConv2D.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetSpectralConv2D.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -63103,9 +63138,9 @@ begin
   SetLength(FdPooledBuf, 0);
 end;
 
-function TNNetCondConv.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetCondConv.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -64574,9 +64609,9 @@ begin
   SetLength(FdxRBuf, 0);
 end;
 
-function TNNetMonarchLinear.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetMonarchLinear.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -64878,9 +64913,9 @@ begin
   SetLength(FGBuf, 0);
 end;
 
-function TNNetKroneckerLinear.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetKroneckerLinear.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -65568,9 +65603,9 @@ begin
   SetLength(FBBuf, 0);
 end;
 
-function TNNetSoftDecisionTree.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetSoftDecisionTree.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -66040,9 +66075,9 @@ begin
   SetLength(FgBuf, 0);
 end;
 
-function TNNetHouseholderLinear.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetHouseholderLinear.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -66397,9 +66432,9 @@ begin
   SetLength(FdLdzBuf, 0);
 end;
 
-function TNNetHyperbolicLinear.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetHyperbolicLinear.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -66921,9 +66956,9 @@ begin
   SetLength(FdLdbBuf, 0);
 end;
 
-function TNNetHyperbolicDistance.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetHyperbolicDistance.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -69277,9 +69312,9 @@ begin
   SetLength(FgColDstBuf, 0);
 end;
 
-function TNNetGraphAttention.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetGraphAttention.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 begin
-  Result := inherited SetInferenceOnly(pInferenceOnly);
+  Result := inherited SetInferenceOnly(pInferenceOnly, pLowMemory);
   if pInferenceOnly then FreeBackpropScratch();
 end;
 
@@ -75641,8 +75676,11 @@ begin
   inherited SetPrevLayer(pPrevLayer);
   FOutput.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
   FOutputRaw.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
-  FOutputError.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
-  FOutputErrorDeriv.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
+  //if not(FInferenceOnly) then
+  begin
+    FOutputError.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
+    FOutputErrorDeriv.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
+  end;
   FVectorSize := FFeatureSizeX*FFeatureSizeY*pPrevLayer.Output.Depth;
   FVectorSizeBytes := FVectorSize * SizeOf(TNeuralFloat);
   if FPointwise then
@@ -75996,9 +76034,12 @@ procedure TNNetConvolution.Compute();
       ComputeTiledCPU();
       FConcatedWeights.ReSize(1, 1, 1);
     end
-    else
+    else if ActiveLowMemory() then
+    begin
+      ComputeLowMemoryCPU();
+    end
     // interleaved dot product is faster with small vectors or big convs.
-    if ShouldUseInterleavedDotProduct then
+    else if ShouldUseInterleavedDotProduct then
     begin
       ComputeInterleaved();
     end
@@ -76037,7 +76078,7 @@ begin
     PrepareInputForConvolutionFast();
 
     {$IFDEF OpenCL}
-    if (Assigned(FDotCL) and FHasOpenCL and FShouldOpenCL) then
+    if WillOpenCL() then
     begin
       ComputeOpenCL();
     end
@@ -76065,6 +76106,11 @@ begin
     raise Exception.Create('TNNetConvolution.Backpropagate: layer ' +
       IntToStr(FLayerIdx) + ' has int8-quantized weights (inference-only). ' +
       'Rebuild/reload without quantization to train.');
+  if ActiveLowMemory() then
+    raise Exception.Create('TNNetConvolution.Backpropagate: layer ' +
+      IntToStr(FLayerIdx) + ' is in low-memory inference mode (the weight ' +
+      'caches backprop needs were released). Rebuild with ' +
+      'SetInferenceOnly(False, False) to train.');
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -98527,7 +98573,7 @@ begin
   end;
 end;
 
-function TNNet.SetInferenceOnly(pInferenceOnly: boolean): TNNet;
+function TNNet.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNet;
 var
   LayerCnt: integer;
   LastLayerIdx: integer;
@@ -99940,6 +99986,7 @@ begin
   FCanNormalizeDelta := true;
   FCanSetNumWeightsForAllNeurons := True;
   FInferenceOnly := False;
+  FLowMemory := False;
   FActivationFn := @Identity;
   FActivationFnDerivative := @IdentityDerivative;
   FLearningRate := 0.01;
@@ -100321,24 +100368,42 @@ begin
   Result := Self;
 end;
 
-function TNNetLayer.SetInferenceOnly(pInferenceOnly: boolean): TNNetLayer;
+function TNNetLayer.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetLayer;
 var
-  LpBnd277: integer;
+  MaxLayer: integer;
   Cnt: integer;
 begin
   Result := Self;
-  // pInferenceOnly=False keeps the layer trainable: strict no-op so callers
-  // can chain .SetInferenceOnly(flag) on every layer unconditionally.
-  if not pInferenceOnly then exit;
-  FInferenceOnly := True;
+  FInferenceOnly := pInferenceOnly;
+  // Low-memory mode drops the backprop-side weight caches, so it only makes
+  // sense for an inference-only layer. Coercing here makes the contradictory
+  // SetInferenceOnly(False, True) combination impossible.
+  FLowMemory := pLowMemory and pInferenceOnly;
   // Shrink any training buffers already allocated (e.g. a layer that sized its
   // weights in the constructor, before this was chained). When the layer is
   // attached later, the FInferenceOnly flag stops them being re-allocated.
-  LpBnd277 := FNeurons.Count - 1;
-  for Cnt := 0 to LpBnd277 do
+  MaxLayer := FNeurons.Count - 1;
+  for Cnt := 0 to MaxLayer do
   begin
-    FNeurons[Cnt].SetInferenceOnly();
+    FNeurons[Cnt].SetInferenceOnly(pInferenceOnly, pLowMemory);
   end;
+end;
+
+function TNNetLayer.SupportsLowMemory(): boolean;
+begin
+  // Default: no per-neuron CPU forward path, so low-memory mode is unsupported.
+  Result := False;
+end;
+
+function TNNetLayer.WillOpenCL(): boolean;
+begin
+  // Default: generic layers do not dispatch to the convolution OpenCL kernel.
+  Result := False;
+end;
+
+function TNNetLayer.ActiveLowMemory(): boolean;
+begin
+  Result := FLowMemory and SupportsLowMemory() and not WillOpenCL();
 end;
 
 procedure TNNetLayer.InitDefault();
@@ -101893,7 +101958,7 @@ begin
   FBiasDelta := 0;
 end;
 
-function TNNetNeuron.SetInferenceOnly(pInferenceOnly: boolean): TNNetNeuron;
+function TNNetNeuron.SetInferenceOnly(pInferenceOnly: boolean; pLowMemory: boolean): TNNetNeuron;
 begin
   Result := Self;
   if pInferenceOnly then
@@ -102026,6 +102091,79 @@ begin
 end;
 
 
+procedure TNNetConvolution.ComputeLowMemoryCPU();
+var
+  OutputCntX, OutputCntY: integer;
+  MaxX, MaxY: integer;
+  LocalSize: integer;
+  LocalNeuron: TNNetNeuron;
+  PtrA: TNeuralFloatArrPtr;
+  NeuronIdx: integer;
+  MaxNeurons: integer;
+  ConvResult: TNeuralFloatPtr;
+begin
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxNeurons := FNeurons.Count - 1;
+  LocalSize := FFeatureSizeX*FFeatureSizeY*FInputCopy.Depth;
+
+  OutputCntX := 0;
+  while OutputCntX <= MaxX do
+  begin
+    OutputCntY := 0;
+    while OutputCntY <= MaxY do
+    begin
+      PtrA := FInputPrepared.GetRawPtr(OutputCntX, OutputCntY);
+      ConvResult := FOutputRaw.GetRawPtr(OutputCntX, OutputCntY);
+      for NeuronIdx := 0 to MaxNeurons do
+      begin
+        LocalNeuron := FArrNeurons[NeuronIdx];
+
+        ConvResult^ :=
+          LocalNeuron.Weights.DotProduct(PtrA, LocalNeuron.Weights.DataPtr, LocalSize);
+
+        Inc(ConvResult);
+      end;
+      Inc(OutputCntY);
+    end;
+    Inc(OutputCntX);
+  end;
+  if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
+  ApplyActivationFunctionToOutput();
+end;
+
+procedure TNNetConvolution.AfterWeightUpdate();
+begin
+  // Let the inherited update build FBiasOutput (and, transiently, the
+  // concatenated caches) under its own FShouldConcatWeights guard - that guard
+  // is only true once the layer is fully sized, so we must not build the bias
+  // ourselves here (SetNumWeightsForAllNeurons calls this BEFORE FOutputRaw is
+  // sized, and an early BuildBiasOutput writes out of bounds).
+  inherited AfterWeightUpdate();
+  if ActiveLowMemory() then
+  begin
+    // Release the persistent weight caches the per-neuron forward does not need.
+    // FBiasOutput (built above) is kept - ComputeLowMemoryCPU uses it.
+    FConcatedWeights.ReSize(1, 1, 1);
+    FConcatedWInter.ReSize(1, 1, 1);
+  end;
+end;
+
+function TNNetConvolution.SupportsLowMemory(): boolean;
+begin
+  // TNNetConvolution (and most descendants) has a per-neuron CPU forward path.
+  Result := True;
+end;
+
+function TNNetConvolution.WillOpenCL(): boolean;
+begin
+  {$IFDEF OpenCL}
+  Result := (Assigned(FDotCL) and FHasOpenCL and FShouldOpenCL);
+  {$ELSE}
+  Result := False;
+  {$ENDIF}
+end;
+
 {$IFDEF Debug}
 procedure TNNetConvolutionBase.PrepareInputForConvolution();
 var
@@ -102078,46 +102216,6 @@ begin
       FInputPrepared.FData[FInputPrepared.GetRawPos(OutputX, OutputY, DepthFSize * yCount)],
       SizeOfDepthFSize
     );
-  end;
-end;
-
-procedure TNNetConvolution.ComputeNeuronCPU();
-var
-  OutputCntX, OutputCntY: integer;
-  MaxX, MaxY: integer;
-  LocalSize: integer;
-  LocalNeuron: TNNetNeuron;
-  PtrA: TNeuralFloatArrPtr;
-  NeuronIdx: integer;
-  MaxNeurons: integer;
-  ConvResult: TNeuralFloatPtr;
-begin
-  MaxX := FOutput.SizeX - 1;
-  MaxY := FOutput.SizeY - 1;
-  MaxNeurons := FNeurons.Count - 1;
-  LocalSize := FFeatureSizeX*FFeatureSizeY*FInputCopy.Depth;
-
-  OutputCntX := 0;
-  while OutputCntX <= MaxX do
-  begin
-    OutputCntY := 0;
-    while OutputCntY <= MaxY do
-    begin
-      PtrA := FInputPrepared.GetRawPtr(OutputCntX, OutputCntY);
-      ConvResult := FOutputRaw.GetRawPtr(OutputCntX, OutputCntY);
-      for NeuronIdx := 0 to MaxNeurons do
-      begin
-        LocalNeuron := FArrNeurons[NeuronIdx];
-
-        ConvResult^ :=
-          LocalNeuron.Weights.DotProduct(PtrA, LocalNeuron.Weights.DataPtr, LocalSize) +
-          LocalNeuron.FBiasWeight;
-
-        Inc(ConvResult);
-      end;
-      Inc(OutputCntY);
-    end;
-    Inc(OutputCntX);
   end;
 end;
 

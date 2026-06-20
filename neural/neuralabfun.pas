@@ -1048,6 +1048,8 @@ var
   efeito: byte;
   PermissibleErrors: ShortInt;
 begin
+  // Initialised so the Tests.N = 0 case below does not read it uninitialised.
+  PermissibleErrors := 0;
   if Tests.N > 0 then
   begin
     PermissibleErrors := Tests.N - Tests.TestThreshold;
@@ -1116,7 +1118,14 @@ var
   OpCode: byte;
   Operand1Value, Operand2Value: integer;
   StatePosition1, StatePosition2: integer;
+  CurrentBaseValue: integer;
 begin
+  // NextState is a var output read below (and returned as the result for test
+  // opcodes); csNop, csDiv/csMod by zero and the invalid-opcode branch never
+  // assign it. Leaving it uninitialised let garbage flow into the prediction
+  // engine's neuron-allocation sizes - the actual source of the heap
+  // corruption. Define it up front.
+  NextState := 0;
   RelativeOperandPosition1 := Oper.RelativeOperandPosition1;
   RelativeOperandPosition2 := Oper.RelativeOperandPosition2;
   OpCode := Oper.OpCode and 63;
@@ -1139,22 +1148,42 @@ begin
     exit;
   end;
 
+  // Upstream can pass operand/base positions outside the state arrays (the
+  // range is "wrong" per the historical TODOs here); clamp every index into
+  // its own array's bounds so the reads stay in range. EnsureRange handles
+  // both negative and over-large positions; in-range positions are unchanged.
   if Oper.RunOnAction then
   begin
-    //TODO: this is a hack. We need to find why the range is wrong.
-    StatePosition1 := Min(Self.NumberOfActions - 1, StatePosition1);
-    StatePosition2 := Min(Self.NumberOfActions - 1, StatePosition2);
-    Operand1Value := Actions[StatePosition1];
-    Operand2Value := Actions[StatePosition2];
+    if NumberOfActions > 0 then
+    begin
+      Operand1Value := Actions[EnsureRange(StatePosition1, 0, NumberOfActions - 1)];
+      Operand2Value := Actions[EnsureRange(StatePosition2, 0, NumberOfActions - 1)];
+    end
+    else
+    begin
+      Operand1Value := 0;
+      Operand2Value := 0;
+    end;
   end
   else
   begin
-    //TODO: this is a hack. We need to find why the range is wrong.
-    StatePosition1 := Min(Self.NumberOfCurrentStates - 1, StatePosition1);
-    StatePosition2 := Min(Self.NumberOfCurrentStates - 1, StatePosition2);
-    Operand1Value := CurrentStates[StatePosition1];
-    Operand2Value := CurrentStates[StatePosition2];
+    if NumberOfCurrentStates > 0 then
+    begin
+      Operand1Value := CurrentStates[EnsureRange(StatePosition1, 0, NumberOfCurrentStates - 1)];
+      Operand2Value := CurrentStates[EnsureRange(StatePosition2, 0, NumberOfCurrentStates - 1)];
+    end
+    else
+    begin
+      Operand1Value := 0;
+      Operand2Value := 0;
+    end;
   end;
+
+  // Some opcodes read the current state at BasePosition directly; clamp it the
+  // same way (BasePosition itself was never range-checked).
+  if NumberOfCurrentStates > 0
+    then CurrentBaseValue := CurrentStates[EnsureRange(BasePosition, 0, NumberOfCurrentStates - 1)]
+    else CurrentBaseValue := 0;
 
   try
     case OpCode of
@@ -1166,8 +1195,8 @@ begin
       csLesser:   NextState:=BoolToByte[Operand1Value<Operand2Value];
       csTrue:     NextState:=1;
       csSet:      NextState:=Oper.Op1;
-      csInc:      NextState:=(CurrentStates[BasePosition]+1) and 255{$R+};
-      csDec:      NextState:=(CurrentStates[BasePosition]-1) and 255{$R+};
+      csInc:      NextState:=(CurrentBaseValue+1) and 255{$R+};
+      csDec:      NextState:=(CurrentBaseValue-1) and 255{$R+};
       csAdd:      NextState:=(Operand1Value+Operand2Value) and 255{$R+};
       csSub:      NextState:=(Operand1Value-Operand2Value) and 255{$R+};
       csMul:      NextState:=(Operand1Value*Operand2Value) and 255{$R+};
@@ -1178,8 +1207,8 @@ begin
       csAnd:      NextState:=(Operand1Value and Operand2Value) and 255{$R+};
       csOr:       NextState:=(Operand1Value or Operand2Value) and 255{$R+};
       csXor:      NextState:=(Operand1Value xor Operand2Value) and 255{$R+};
-      csInj:      NextState:=CurrentStates[BasePosition];
-      csNot:      NextState:=not(CurrentStates[BasePosition]);
+      csInj:      NextState:=CurrentBaseValue;
+      csNot:      NextState:=not(CurrentBaseValue);
       csShl:      {$R-}NextState:=(Operand1Value shl (Operand2Value and 7)) and 255{$R+};
       csShr:      NextState:=Operand1Value shr (Operand2Value and 7);
       csMin:      NextState:=Min(Operand1Value, Operand2Value);
@@ -1197,8 +1226,10 @@ begin
   end;
   if (OpCode in TestOperationSet) then
     OperateAndTestOperation := NextState
+  else if NumberOfNextStates > 0 then
+    OperateAndTestOperation := BoolToByte[NextStates[EnsureRange(BasePosition, 0, NumberOfNextStates - 1)] = NextState]
   else
-    OperateAndTestOperation := BoolToByte[NextStates[BasePosition] = NextState];
+    OperateAndTestOperation := 0;
 end;
 
 function TRunOperation.TestTests(var Tests: TTestsClass): integer;
