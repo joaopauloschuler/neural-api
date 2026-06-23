@@ -17732,8 +17732,9 @@ procedure TNNetTransposeYD.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   FOutput.ReSize(pPrevLayer.Output.SizeX, pPrevLayer.Output.Depth, pPrevLayer.Output.SizeY);
-  FOutputError.ReSize(pPrevLayer.OutputError.SizeX, pPrevLayer.OutputError.Depth, pPrevLayer.OutputError.SizeY);
-  FOutputErrorDeriv.ReSize(pPrevLayer.OutputErrorDeriv.SizeX, pPrevLayer.OutputErrorDeriv.Depth, pPrevLayer.OutputErrorDeriv.SizeY);
+  // Size from FOutput, not pPrevLayer's error buffer (collapsed when the prev
+  // layer is inference-only).
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetTransposeYD.Compute;
@@ -17769,8 +17770,9 @@ procedure TNNetTransposeXD.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   FOutput.ReSize(pPrevLayer.Output.Depth, pPrevLayer.Output.SizeY, pPrevLayer.Output.SizeX);
-  FOutputError.ReSize(pPrevLayer.OutputError.Depth, pPrevLayer.OutputError.SizeY, pPrevLayer.OutputError.SizeX);
-  FOutputErrorDeriv.ReSize(pPrevLayer.OutputErrorDeriv.Depth, pPrevLayer.OutputErrorDeriv.SizeY, pPrevLayer.OutputErrorDeriv.SizeX);
+  // Size from FOutput, not pPrevLayer's error buffer (collapsed when the prev
+  // layer is inference-only).
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetTransposeXD.Compute;
