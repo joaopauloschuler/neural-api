@@ -70925,7 +70925,7 @@ begin
     FPrevLayerList.Add(aL[LayerCnt]);
     aL[LayerCnt].IncDepartingBranchesCnt();
 
-    LpBnd106 := Al[LayerCnt].FOutputError.Depth - 1;
+    LpBnd106 := Al[LayerCnt].FOutput.Depth - 1;
     for ForDeepCnt := 0 to LpBnd106 do
     begin
       Inc(DeepCnt);
@@ -70934,7 +70934,7 @@ begin
       SetLength(FRemainingChannels, DeepCnt);
       FDeepsLayer[DeepCnt-1] := LayerCnt;
       FDeepsChannel[DeepCnt-1] := ForDeepCnt;
-      FRemainingChannels[DeepCnt-1] := Al[LayerCnt].FOutputError.Depth - ForDeepCnt;
+      FRemainingChannels[DeepCnt-1] := Al[LayerCnt].FOutput.Depth - ForDeepCnt;
     end;
   end;
 
@@ -75676,7 +75676,7 @@ begin
   inherited SetPrevLayer(pPrevLayer);
   FOutput.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
   FOutputRaw.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
-  //if not(FInferenceOnly) then
+  if not(FInferenceOnly) then
   begin
     FOutputError.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
     FOutputErrorDeriv.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
