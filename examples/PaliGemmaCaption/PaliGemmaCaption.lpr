@@ -111,7 +111,7 @@ begin
 
   WriteLn('Loading ', CheckpointPath, ' ...');
   BuildPaliGemmaFromSafeTensors(CheckpointPath, VisionNet, ProjectorNet,
-    TextNet, Config, {pSeqLen=}1, {pInferenceOnly=}true, ConfigPath);
+    TextNet, Config, {pSeqLen=}1, {pTrainable=}false, ConfigPath);
   WriteLn(PaliGemmaConfigToString(Config));
   WriteLn;
 
@@ -145,7 +145,7 @@ begin
       // positions line up (the KV-cache fast path is a follow-up).
       VisionNet.Free; ProjectorNet.Free; TextNet.Free;
       BuildPaliGemmaFromSafeTensors(CheckpointPath, VisionNet, ProjectorNet,
-        TextNet, Config, {pSeqLen=}Length(TokenIds), {pInferenceOnly=}true,
+        TextNet, Config, {pSeqLen=}Length(TokenIds), {pTrainable=}false,
         ConfigPath);
       PaliGemmaRunLogits(VisionNet, ProjectorNet, TextNet, ImageInput, TokenIds,
         Config.ImageTokenIndex, Config.NumPatches, PrefixLen, Logits);

@@ -336,10 +336,10 @@ begin
   Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps);
   Denoiser := TPixArtDenoiser.Create;
 
-  Enc := BuildVaeEncoderFromSafeTensors(EncPath, EncCfg, {pInferenceOnly=}false, EncCfgPath);
-  Dec := BuildVaeDecoderFromSafeTensors(DecPath, DecCfg, {pInferenceOnly=}false, DecCfgPath);
+  Enc := BuildVaeEncoderFromSafeTensors(EncPath, EncCfg, {pTrainable=}true, EncCfgPath);
+  Dec := BuildVaeDecoderFromSafeTensors(DecPath, DecCfg, {pTrainable=}true, DecCfgPath);
   gPixArt := BuildPixArtFromSafeTensors(PixPath, {TextSeqLen=}5, gPixCfg,
-    {pInferenceOnly=}false, PixCfgPath);
+    {pTrainable=}true, PixCfgPath);
 
   LatGrid := EncCfg.LatentGrid;
   ImgGrid := LatGrid shl (EncCfg.NumBlockOut - 1);

@@ -78,10 +78,10 @@ begin
 
   WriteLn('Loading ', CheckpointPath, ' ...');
   // SeqLen 8 covers the pico prompts; real checkpoints allow up to
-  // text max_position_embeddings (77). pInferenceOnly keeps the full
+  // text max_position_embeddings (77). pTrainable=False keeps the full
   // clip-vit-base-patch32 import comfortably in memory.
   BuildClipFromSafeTensors(CheckpointPath, TextNet, VisionNet, Config,
-    {TextSeqLen=}8, {pInferenceOnly=}true, ConfigPath);
+    {TextSeqLen=}8, {pTrainable=}false, ConfigPath);
   WriteLn(ClipConfigToString(Config));
   WriteLn;
 

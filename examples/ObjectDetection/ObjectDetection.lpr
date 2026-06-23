@@ -143,7 +143,7 @@ begin
   IoFile := ExtractFilePath(ModelFile) + 'tiny_detr_io.json';
 
   WriteLn('ObjectDetection (DETR): loading ', ModelFile);
-  NN := BuildDetrFromSafeTensors(ModelFile, Config, {pInferenceOnly=}false,
+  NN := BuildDetrFromSafeTensors(ModelFile, Config, {pTrainable=}true,
     ConfigFile);
   RefJson := TStringList.Create;
   Img := TNNetVolume.Create;

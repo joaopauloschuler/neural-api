@@ -5508,7 +5508,7 @@ begin
   RandSeed := 424242;
   BuildT5FromSafeTensors(FixturePath('tiny_t5v10.safetensors'),
     Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
-    {pInferenceOnly=}false, FixturePath('tiny_t5v10_config.json'));
+    {pTrainable=}true, FixturePath('tiny_t5v10_config.json'));
   EncToks := TNNetVolume.Create(10, 1, 1);
   DecToks := TNNetVolume.Create(6, 1, 1);
   Logits := TNNetVolume.Create();
@@ -5575,7 +5575,7 @@ begin
   RandSeed := 424242;
   BuildT5FromSafeTensors(FixturePath('tiny_t5v10.safetensors'),
     Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
-    {pInferenceOnly=}false, FixturePath('tiny_t5v10_config.json'));
+    {pTrainable=}true, FixturePath('tiny_t5v10_config.json'));
   try
     Greedy := DecodeSeq2SeqGreedy(Enc, Dec, Src, 0, 1, 5);
     Sampler := TNNetSamplerTopK.Create(1);
@@ -5639,7 +5639,7 @@ begin
   RandSeed := 424242;
   BuildMarianFromSafeTensors(FixturePath('tiny_marian.safetensors'),
     Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
-    {pInferenceOnly=}false, FixturePath('tiny_marian_config.json'));
+    {pTrainable=}true, FixturePath('tiny_marian_config.json'));
   EncToks := TNNetVolume.Create(10, 1, 1);
   DecToks := TNNetVolume.Create(6, 1, 1);
   Logits := TNNetVolume.Create();
@@ -5692,7 +5692,7 @@ begin
   RandSeed := 424242;
   BuildT5FromSafeTensors(FixturePath('tiny_t5v10.safetensors'),
     Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
-    {pInferenceOnly=}false, FixturePath('tiny_t5v10_config.json'));
+    {pTrainable=}true, FixturePath('tiny_t5v10_config.json'));
   try
     try
       DecodeSeq2SeqGreedy(Enc, Dec, [3, 7, 1], 0, 1, 5);
@@ -5924,7 +5924,7 @@ begin
   RandSeed := 424242;
   BuildT5FromSafeTensors(FixturePath('tiny_t5v10.safetensors'),
     Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
-    {pInferenceOnly=}false, FixturePath('tiny_t5v10_config.json'));
+    {pTrainable=}true, FixturePath('tiny_t5v10_config.json'));
   try
     A1 := DecodeSeq2SeqBeamSearchAll(Enc, Dec, Src, StartId, EOSId, 99,
       {BeamWidth=}3, {LengthPenalty=}1.0);

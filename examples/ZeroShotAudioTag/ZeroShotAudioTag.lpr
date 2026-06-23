@@ -76,7 +76,7 @@ begin
 
   WriteLn('Loading ', CheckpointPath, ' ...');
   BuildClapFromSafeTensors(CheckpointPath, AudioNet, TextNet, Config,
-    {TextSeqLen=}8, {pInferenceOnly=}true, ConfigPath);
+    {TextSeqLen=}8, {pTrainable=}false, ConfigPath);
   WriteLn(ClapConfigToString(Config));
   WriteLn;
 

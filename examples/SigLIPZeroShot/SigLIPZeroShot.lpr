@@ -84,7 +84,7 @@ begin
 
   WriteLn('Loading ', CheckpointPath, ' ...');
   BuildSigLIPFromSafeTensors(CheckpointPath, TextNet, VisionNet, Config,
-    {TextSeqLen=}8, {pInferenceOnly=}true, ConfigPath);
+    {TextSeqLen=}8, {pTrainable=}false, ConfigPath);
   WriteLn(SigLIPConfigToString(Config));
   WriteLn;
 

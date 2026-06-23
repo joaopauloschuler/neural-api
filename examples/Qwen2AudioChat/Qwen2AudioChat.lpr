@@ -116,7 +116,7 @@ begin
   // rebuilds at each step's exact prompt length. pSeqLen=1 is the smallest
   // valid context for the config read.
   BuildQwen2AudioFromSafeTensors(CheckpointPath, TowerNet, PoolNormNet,
-    ProjectorNet, TextNet, Config, {pSeqLen=}1, {pInferenceOnly=}true,
+    ProjectorNet, TextNet, Config, {pSeqLen=}1, {pTrainable=}false,
     ConfigPath);
   WriteLn(Qwen2AudioConfigToString(Config));
   WriteLn;
@@ -146,7 +146,7 @@ begin
       TowerNet.Free; PoolNormNet.Free; ProjectorNet.Free; TextNet.Free;
       BuildQwen2AudioFromSafeTensors(CheckpointPath, TowerNet, PoolNormNet,
         ProjectorNet, TextNet, Config, {pSeqLen=}Length(TokenIds),
-        {pInferenceOnly=}true, ConfigPath);
+        {pTrainable=}false, ConfigPath);
       Qwen2AudioRunLogits(TowerNet, PoolNormNet, ProjectorNet, TextNet,
         MelInput, TokenIds, Config.AudioTokenIndex, Config.NumAudioTokens,
         Logits);

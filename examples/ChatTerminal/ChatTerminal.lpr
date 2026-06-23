@@ -34,7 +34,7 @@ end-of-turn marker (e.g. <|im_end|> for ChatML - matched as a token-id stop
 sequence in the generated region and trimmed from the reply), or after
 --max-new-tokens.
 
-The model is always built with pInferenceOnly=true (the REPL never trains;
+The model is always built with pTrainable=false (the REPL never trains;
 frees the per-neuron gradient/momentum buffers). Full-precision FP32 weights
 are the DEFAULT: faster, at the cost of more RAM. Pass --int8 for weight-only
 int8 storage (pQuantizeInt8): less RAM, but slower (each layer is dequantized
@@ -923,7 +923,7 @@ begin
   // forward and the KV cache (budget = CtxLen, set on the session below) holds
   // the context. SeqLen is the cache budget, NOT the built input width.
   NN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}1,
-    {pInferenceOnly=}true, '', {pQuantizeInt8=}Opt.Int8);
+    {pTrainable=}false, '', {pQuantizeInt8=}Opt.Int8);
   SeqLen := Opt.CtxLen;
   VocabSize := NN.GetLastLayer().Output.Depth;
   Session := TNNetStreamingDecoder.Create(NN, SeqLen);

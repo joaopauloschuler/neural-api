@@ -131,7 +131,7 @@ begin
   end;
 
   NN := BuildStyleGAN2GeneratorFromSafeTensors(STPath, Config,
-    {pInferenceOnly=}true, CfgPath);
+    {pTrainable=}false, CfgPath);
   try
     WriteLn(StyleGAN2ConfigToString(Config));
     Z := TNNetVolume.Create(Config.LatentDim, 1, 1);

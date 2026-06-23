@@ -76,7 +76,7 @@ var
 begin
   BuildTicks := GetTickCount64;
   NN := BuildMoonshineFromSafeTensorsEx(WeightsPath, Config, NumSamples,
-    {pInferenceOnly=}true, ConfigPath);
+    {pTrainable=}false, ConfigPath);
   try
     BuildTicks := GetTickCount64 - BuildTicks;
     Wave := TNNetVolume.Create;
@@ -120,7 +120,7 @@ begin
   StartId := 1;  // decoder_start_token_id (Moonshine default)
   EOSId := 2;    // eos_token_id (Moonshine default)
   BuildMoonshineEncoderDecoderFromSafeTensors(WeightsPath, Enc, Dec, Config,
-    NumSamples, DecSeqLen, {pInferenceOnly=}true, ConfigPath);
+    NumSamples, DecSeqLen, {pTrainable=}false, ConfigPath);
   Tok := TNeuralHFTokenizer.Create();
   Wave := TNNetVolume.Create;
   DecIn := TNNetVolume.Create;

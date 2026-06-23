@@ -55,7 +55,7 @@ begin
   WriteLn('---------------------------------------');
   NN := BuildSegformerFromSafeTensors(
     FixturePath('tiny_segformer.safetensors'), Config,
-    {pInferenceOnly=}true, FixturePath('tiny_segformer_config.json'));
+    {pTrainable=}false, FixturePath('tiny_segformer_config.json'));
   try
     WriteLn(SegformerConfigToString(Config));
     W := Config.ImageSize; H := Config.ImageSize;

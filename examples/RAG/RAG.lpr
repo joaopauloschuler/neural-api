@@ -279,7 +279,7 @@ begin
   SetLength(Nets, Length(Nets) + 1);
   NetLens[High(NetLens)] := TokenCount;
   Nets[High(Nets)] := BuildBertFromSafeTensors(EmbWeightsPath, TokenCount,
-    {pInferenceOnly=}true);
+    {pTrainable=}false);
   Result := Nets[High(Nets)];
 end;
 
@@ -751,7 +751,7 @@ begin
     WriteLn('Loading decoder ', Opt.GenModelDir, ' (',
       BoolToStr(Opt.Int8, 'int8', 'fp32'), ') ...');
     GenNN := BuildFromPretrained(Opt.GenModelDir, Opt.CtxLen,
-      {pInferenceOnly=}true, '', {pQuantizeInt8=}Opt.Int8);
+      {pTrainable=}false, '', {pQuantizeInt8=}Opt.Int8);
     SeqLen := GenNN.GetFirstLayer().Output.SizeX;
     VocabSize := GenNN.GetLastLayer().Output.Depth;
     WriteLn('Decoder ready: vocab ', VocabSize, ', context ', SeqLen,

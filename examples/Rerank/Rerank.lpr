@@ -105,7 +105,7 @@ begin
   SetLength(BiNets, Length(BiNets) + 1);
   BiLens[High(BiLens)] := TokenCount;
   BiNets[High(BiNets)] := BuildBertFromSafeTensors(BiWeights, TokenCount,
-    {pInferenceOnly=}true);
+    {pTrainable=}false);
   Result := BiNets[High(BiNets)];
 end;
 
@@ -232,7 +232,7 @@ begin
     WriteLn('=== Stage 2: cross-encoder joint rerank (top-', TopK, ') ===');
     CePath := IncludeTrailingPathDelimiter(CeDir) + 'config.json';
     CeNet := BuildBertForSequenceClassificationFromSafeTensorsEx(CeWeights,
-      CeConfig, nil, {SeqLen=}0, {pInferenceOnly=}true, CePath, UseInt8);
+      CeConfig, nil, {SeqLen=}0, {pTrainable=}false, CePath, UseInt8);
     try
       if CeNet.GetLastLayer().Output.Depth <> 1 then
         WriteLn('  WARNING: cross-encoder is not num_labels=1 (depth=',

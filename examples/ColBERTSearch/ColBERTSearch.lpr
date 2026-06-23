@@ -125,7 +125,7 @@ begin
 
   WriteLn('Building ColBERT encoder (SeqLen ', SeqLen, ') ...');
   Net := BuildColBERTFromSafeTensors(WeightsPath, SeqLen,
-    {pInferenceOnly=}true);
+    {pTrainable=}false);
 
   // TColBERTIndex wraps the encoder + tokenizer and owns the cached per-token
   // doc matrices: AddCorpus encodes every passage ONCE, Search encodes the

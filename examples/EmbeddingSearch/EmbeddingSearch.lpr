@@ -108,7 +108,7 @@ begin
   WriteLn;
 
   NN := BuildBertFromSafeTensorsEx(WeightsPath, Config, {SeqLen=}csSeqLen,
-    {pInferenceOnly=}true, {pIncludePooler=}false, ConfigPath);
+    {pTrainable=}false, {pIncludePooler=}false, ConfigPath);
   Input := TNNetVolume.Create();
   Hidden := TNNetVolume.Create();
   try

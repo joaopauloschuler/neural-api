@@ -98,7 +98,7 @@ begin
 
   WriteLn('Loading ', CheckpointPath, ' ...');
   BuildClipFromSafeTensors(CheckpointPath, TextNet, VisionNet, Config,
-    {TextSeqLen=}8, {pInferenceOnly=}true, ConfigPath);
+    {TextSeqLen=}8, {pTrainable=}false, ConfigPath);
   WriteLn(ClipConfigToString(Config));
   WriteLn;
 

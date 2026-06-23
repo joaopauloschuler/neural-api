@@ -89,7 +89,7 @@ begin
     Config := ReadMusicGenConfigFromJSONFile(CfgPath);
     DecSeq := NumFrames + Config.NumCodebooks - 1 + 1;
     Model := BuildMusicGenFromSafeTensors(SafePath, Config, EncSeq, DecSeq,
-      {pInferenceOnly=}true, CfgPath);
+      {pTrainable=}false, CfgPath);
     WriteLn(MusicGenConfigToString(Config));
     WriteLn;
 

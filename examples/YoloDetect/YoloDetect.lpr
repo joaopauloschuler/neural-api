@@ -137,7 +137,7 @@ begin
   IoFile := ExtractFilePath(ModelFile) + 'tiny_yolo_io.json';
 
   WriteLn('YoloDetect (YOLOv8): loading ', ModelFile);
-  NN := BuildYoloFromSafeTensors(ModelFile, Config, {pInferenceOnly=}false,
+  NN := BuildYoloFromSafeTensors(ModelFile, Config, {pTrainable=}true,
     ConfigFile);
   RefJson := TStringList.Create;
   Img := TNNetVolume.Create;

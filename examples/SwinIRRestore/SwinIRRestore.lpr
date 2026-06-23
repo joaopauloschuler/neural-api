@@ -145,7 +145,7 @@ begin
   end;
 
   NN := BuildSwinIRFromSafeTensors(STPath, Config,
-    {pInferenceOnly=}true, CfgPath);
+    {pTrainable=}false, CfgPath);
   try
     WriteLn(SwinIRConfigToString(Config));
     LowRes := TNNetVolume.Create(Config.ImgSize, Config.ImgSize, Config.InChans);

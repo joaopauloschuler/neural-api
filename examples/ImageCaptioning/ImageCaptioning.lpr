@@ -57,7 +57,7 @@ begin
 
   WriteLn('Loading ', CheckpointPath, ' ...');
   BuildBlipForCaptioningFromSafeTensors(CheckpointPath, VisionNet, TextNet,
-    Config, {DecSeqLen=}20, {pInferenceOnly=}true, ConfigPath);
+    Config, {DecSeqLen=}20, {pTrainable=}false, ConfigPath);
   WriteLn(BlipConfigToString(Config));
   WriteLn;
 

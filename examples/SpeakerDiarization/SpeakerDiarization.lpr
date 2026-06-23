@@ -94,7 +94,7 @@ begin
 
   // ---- build the net for this clip length and run it ---------------------
   NN := BuildPyannoteSegmentationFromSafeTensorsEx(ModelPath, Cfg, NumSamples,
-    {pInferenceOnly=}true, ConfigPath);
+    {pTrainable=}false, ConfigPath);
   Frames := PyannoteFrameCount(Cfg, NumSamples);
   FrameDurMs := 1000.0 * NumSamples / SampleRate / Frames;
   WriteLn('Net frames: ', Frames, '  (', FrameDurMs:0:1, ' ms/frame)  classes: ',

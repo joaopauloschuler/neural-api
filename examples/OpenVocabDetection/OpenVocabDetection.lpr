@@ -73,7 +73,7 @@ begin
 
   WriteLn('Loading ', CheckpointPath, ' ...');
   BuildOwlViTFromSafeTensors(CheckpointPath, TextNet, VisionNet, Config,
-    {TextSeqLen=}0, {pInferenceOnly=}true, ConfigPath);
+    {TextSeqLen=}0, {pTrainable=}false, ConfigPath);
   WriteLn(OwlViTConfigToString(Config));
   WriteLn;
 

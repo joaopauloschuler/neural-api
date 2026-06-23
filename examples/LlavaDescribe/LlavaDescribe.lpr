@@ -126,7 +126,7 @@ begin
   // rebuilds at each step's exact prompt length. pSeqLen=1 is the smallest
   // valid context for the config read.
   BuildLlavaFromSafeTensors(CheckpointPath, VisionNet, ProjectorNet, TextNet,
-    Config, {pSeqLen=}1, {pInferenceOnly=}true, ConfigPath);
+    Config, {pSeqLen=}1, {pTrainable=}false, ConfigPath);
   WriteLn(LlavaConfigToString(Config));
   WriteLn;
 
@@ -153,7 +153,7 @@ begin
       // mask and positions line up (the KV-cache fast path is a follow-up).
       VisionNet.Free; ProjectorNet.Free; TextNet.Free;
       BuildLlavaFromSafeTensors(CheckpointPath, VisionNet, ProjectorNet,
-        TextNet, Config, {pSeqLen=}Length(TokenIds), {pInferenceOnly=}true,
+        TextNet, Config, {pSeqLen=}Length(TokenIds), {pTrainable=}false,
         ConfigPath);
       LlavaRunLogits(VisionNet, ProjectorNet, TextNet, ImageInput, TokenIds,
         Config.ImageTokenIndex, Config.NumPatches, Logits);

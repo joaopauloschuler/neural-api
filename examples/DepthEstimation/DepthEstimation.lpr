@@ -56,7 +56,7 @@ begin
   WriteLn('-------------------------------------------------------');
   NN := BuildDPTFromSafeTensors(
     FixturePath('tiny_dpt.safetensors'), Config,
-    {pInferenceOnly=}true, FixturePath('tiny_dpt_config.json'));
+    {pTrainable=}false, FixturePath('tiny_dpt_config.json'));
   try
     WriteLn(DPTConfigToString(Config));
     W := Config.Backbone.ImageSize; H := Config.Backbone.ImageSize;

@@ -196,9 +196,9 @@ begin
 
   RandSeed := 424242;
   PixArtNet := BuildPixArtFromSafeTensors(PixST, cTextSeqLen, PixCfg,
-    {pInferenceOnly=}true, PixCfgPath);
+    {pTrainable=}false, PixCfgPath);
   VaeNet := BuildVaeDecoderFromSafeTensors(VaeST, VaeCfg,
-    {pInferenceOnly=}true, VaeCfgPath);
+    {pTrainable=}false, VaeCfgPath);
   Scheduler := TNNetDiffusionScheduler.Create(100, dsLinear, dpEps);
   Latent := TNNetVolume.Create;
   TextStates := TNNetVolume.Create;
