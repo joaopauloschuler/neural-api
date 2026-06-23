@@ -19285,8 +19285,7 @@ begin
   end;
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
     pPrevLayer.FOutput.Depth div 2);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetGEGLU.Compute();
@@ -19379,8 +19378,7 @@ begin
   end;
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
     pPrevLayer.FOutput.Depth div 2);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetGEGLUErf.Compute();
@@ -19665,8 +19663,7 @@ begin
   end;
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
     pPrevLayer.FOutput.Depth div 2);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetGptOssGatedSwiGLU.Compute();
@@ -19767,8 +19764,7 @@ begin
   end;
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
     pPrevLayer.FOutput.Depth div 2);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetGLU.Compute();
@@ -25307,8 +25303,7 @@ begin
       IntToStr(pPrevLayer.FOutput.Depth) + ', d=' + IntToStr(FDim));
   SeqLen := pPrevLayer.FOutput.SizeX;
   FOutput.ReSize(SeqLen, 1, FDim);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   // Inducing bank I: (M, 1, d) -- each inducing d-vector is depth-contiguous.
   FNeurons[0].FWeights.ReSize(FM, 1, FDim);
@@ -28419,8 +28414,7 @@ begin
       ' (Din=' + IntToStr(FDin) + ', Dout=' + IntToStr(FDout) +
       '). Got size=' + IntToStr(FWeightsLayer.FOutput.Size));
   FOutput.ReSize(FDout, 1, 1);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetHyperLinear.Compute();
@@ -28566,8 +28560,7 @@ begin
       IntToStr(FInChannels) + '). Got size=' +
       IntToStr(FWeightsLayer.FOutput.Size));
   FOutput.ReSize(OutX, OutY, FOutChannels);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetHyperConv.Compute();
@@ -34406,8 +34399,7 @@ begin
     end;
   end;
   FOutput.ReSize(OutLen, 1, pPrevLayer.Output.Depth);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetGatherTokens.Compute();
@@ -42660,8 +42652,7 @@ begin
   FStruct[0] := FStateDim;
   // Output is the filtered means, same shape as the observation sequence.
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FStateDim);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   if FNeurons.Count < 3 then AddMissingNeurons(3);
   SetNumWeightsForAllNeurons(1, 1, FStateDim);
   // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
@@ -44664,8 +44655,7 @@ begin
       IntToStr(FC));
   FStruct[0] := FC;
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY, FC);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   // Neuron 0 = packed LU matrix (C,1,C); neuron 1 = log-scale vector s (C,1,1).
   if FNeurons.Count < 2 then AddMissingNeurons(2 - FNeurons.Count);
   FNeurons[0].FWeights.ReSize(FC, 1, FC);
@@ -45202,8 +45192,7 @@ begin
   Dhalf := FPhaseDim div 2;
   // Output is the integrated phase sequence, same shape as the input.
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FPhaseDim);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   // Coupled: one 2*D-input MLP (4 neurons). Separable: two D-input MLPs
   // (8 neurons): V over q in [0..3], T over p in [4..7].
   if FSeparable then
@@ -48121,8 +48110,7 @@ begin
   FStruct[1] := FDepth;
   // LMU preserves the sequence layout: one read-out value per channel per step.
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FDepth);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   // [0]=Wout per-channel read-out weights, (Depth,1,Order) [d,0,n].
   FNeurons[0].FWeights.ReSize(FDepth, 1, FOrder);
@@ -51419,8 +51407,7 @@ begin
   Depth := pPrevLayer.FOutput.Depth;
   // Causal long conv preserves the sequence layout.
   FOutput.ReSize(FSeqLen, 1, Depth);
-  FOutputError.ReSize(FSeqLen, 1, Depth);
-  FOutputErrorDeriv.ReSize(FSeqLen, 1, Depth);
+  SetOutputErrorSize(FSeqLen, 1, Depth);
   if FNeurons.Count < 5 then AddMissingNeurons(5);
   // Per-neuron weight shapes:
   //   [0] W1 (H,1,F)  [1] b1 (H,1,1)  [2] W2 (Depth,1,H)
@@ -52626,8 +52613,7 @@ begin
   // FNeurons[0] holds gamma (scale), FNeurons[1] holds beta (bias).
   SetNumWeightsForAllNeurons(FOutput);
   FNormalized.ReSize(FOutput);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   InitDefault();
 end;
 
@@ -53786,8 +53772,7 @@ begin
     // Legacy affine: one gamma/beta per output element.
     SetNumWeightsForAllNeurons(FOutput);
   FNormalized.ReSize(FOutput);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   InitDefault();
 end;
 
@@ -55004,8 +54989,7 @@ procedure TNNetGlobalSumPool.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   FOutput.ReSize(1, 1, pPrevLayer.Output.Depth);
-  FOutputError.ReSize(1, 1, pPrevLayer.Output.Depth);
-  FOutputErrorDeriv.ReSize(1, 1, pPrevLayer.Output.Depth);
+  SetOutputErrorSize(1, 1, pPrevLayer.Output.Depth);
 end;
 
 procedure TNNetGlobalSumPool.Compute();
@@ -59663,8 +59647,7 @@ begin
     );
   FN := InSize div 2;
   FOutput.ReSize(1, 1, FN);
-  FOutputError.ReSize(1, 1, FN);
-  FOutputErrorDeriv.ReSize(1, 1, FN);
+  SetOutputErrorSize(1, 1, FN);
 end;
 
 procedure TNNetHolographicBinding.Compute();
@@ -62290,8 +62273,7 @@ begin
   FSeqLen := pPrevLayer.Output.SizeX;
   FDepth := pPrevLayer.Output.Depth;
   FOutput.ReSize(FSeqLen, 1, FDepth);
-  FOutputError.ReSize(FSeqLen, 1, FDepth);
-  FOutputErrorDeriv.ReSize(FSeqLen, 1, FDepth);
+  SetOutputErrorSize(FSeqLen, 1, FDepth);
   FVmem.ReSize(FSeqLen, 1, FDepth);
   FSpike.ReSize(FSeqLen, 1, FDepth);
   // Learnable variant: two per-channel weight neurons (threshold, leak) of width
@@ -63951,8 +63933,7 @@ begin
   // The C4 feature field: Depth = 4*FeaturesCount (channel = co*4 + r).
   FOutput.ReSize(FOutputSizeX, FOutputSizeY, OutDepth);
   FOutputRaw.ReSize(FOutputSizeX, FOutputSizeY, OutDepth);
-  FOutputError.ReSize(FOutputSizeX, FOutputSizeY, OutDepth);
-  FOutputErrorDeriv.ReSize(FOutputSizeX, FOutputSizeY, OutDepth);
+  SetOutputErrorSize(FOutputSizeX, FOutputSizeY, OutDepth);
 
   while FNeurons.Count > FFeaturesCount + 1 do
     FNeurons.Delete(FNeurons.Count - 1);
@@ -64227,7 +64208,7 @@ begin
   FFeaturesCount := pPrevLayer.Output.Depth div 4;
   FStruct[1] := FFeaturesCount;
   FOutput.ReSize(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY, FFeaturesCount);
-  FOutputError.ReSize(FOutput);
+  SetOutputErrorSizeNoDeriv(FOutput);
   SetLength(FArgMax, FOutput.Size);
 end;
 
@@ -64918,8 +64899,7 @@ begin
   FStruct[1] := FP;
 
   FOutput.ReSize(N, 1, 1);
-  FOutputError.ReSize(N, 1, 1);
-  FOutputErrorDeriv.ReSize(N, 1, 1);
+  SetOutputErrorSize(N, 1, 1);
   FCacheBX.ReSize(N, 1, 1); // B*X is q x p = n reals
   // Backprop-only scratch: skip on inference-only layers.
   if FIsTrainable then
@@ -69041,8 +69021,7 @@ begin
   // Output is (NumNodes, 1, OutFeat).
   FOutput.ReSize(FNumNodes, 1, FOutput.Depth);
   FOutputRaw.ReSize(FNumNodes, 1, FOutput.Depth);
-  FOutputError.ReSize(FNumNodes, 1, FOutput.Depth);
-  FOutputErrorDeriv.ReSize(FNumNodes, 1, FOutput.Depth);
+  SetOutputErrorSize(FNumNodes, 1, FOutput.Depth);
   FAggIn.ReSize(FNumNodes, 1, FOutput.Depth);
   FAggErr.ReSize(FNumNodes, 1, FOutput.Depth);
   N := FInFeat;
@@ -69339,8 +69318,7 @@ begin
   OutFeat := FOutput.Depth;
   FOutput.ReSize(FNumNodes, 1, OutFeat);
   FOutputRaw.ReSize(FNumNodes, 1, OutFeat);
-  FOutputError.ReSize(FNumNodes, 1, OutFeat);
-  FOutputErrorDeriv.ReSize(FNumNodes, 1, OutFeat);
+  SetOutputErrorSize(FNumNodes, 1, OutFeat);
   FAggIn.ReSize(FNumNodes, 1, OutFeat);
   FAggErr.ReSize(FNumNodes, 1, OutFeat);
   // Per-pass scratch (fixed shapes: FNumNodes nodes, OutFeat features).
@@ -77621,8 +77599,7 @@ begin
   // FNeurons[0] holds the position table: row p (of FMaxPosition rows) is the
   // Depth-wide embedding of absolute position p.
   SetNumWeightsForAllNeurons(FMaxPosition, 1, FOutput.Depth);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   InitDefault();
 end;
 
