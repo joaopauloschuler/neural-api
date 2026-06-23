@@ -292,6 +292,22 @@ type
       // Zeroes weights (and their gradient/inertia) flagged by FPruneMask,
       // WITHOUT calling AfterWeightUpdate (so it can be called FROM it).
       procedure ZeroPrunedWeights(); // Coded by Claude (AI).
+      // Sizes the error buffers (FOutputError/FOutputErrorDeriv) to match the
+      // forward output, but ONLY when the layer is trainable. Inference-only
+      // layers (FIsTrainable=False) collapse both buffers to a single float
+      // (1,1,1) instead, saving the per-layer error footprint. (1,1,1) -- never
+      // (0,0,0) -- because TNNetVolume.ReSize takes addr(FData[0]); an empty
+      // array would make that an out-of-bounds access. Backward never runs in
+      // an inference-only build, so the degenerate buffers are never read; the
+      // forward derivative-caching paths already guard on FOutputError.Size =
+      // FOutput.Size and skip themselves when the sizes no longer match.
+      procedure SetOutputErrorSize(pSizeX, pSizeY, pDepth: integer); overload; // Coded by Claude (AI).
+      procedure SetOutputErrorSize(Original: TNNetVolume); overload; // Coded by Claude (AI).
+      // Variant for the handful of layers that size FOutputError but never use
+      // FOutputErrorDeriv (it stays at the constructor default). Same trainable
+      // gate, but leaves the deriv buffer untouched so trainable builds don't
+      // pay for an unused buffer.
+      procedure SetOutputErrorSizeNoDeriv(Original: TNNetVolume); // Coded by Claude (AI).
     public
       // Fast (array) mirror of the FNeurons list: same TNNetNeuron references,
       // indexed directly without the TNNetNeuronList method/bounds overhead.
@@ -38441,10 +38457,7 @@ begin
   inherited SetPrevLayer(pPrevLayer);
   // Layers concerned about L2 should collect errors.
   if FOutputError.Size <> FOutput.Size then
-  begin
-    FOutputError.ReSize(FOutput);
-    FOutputErrorDeriv.ReSize(FOutput);
-  end;
+    SetOutputErrorSize(FOutput);
 end;
 
 { TNNetIdentityWithoutL2 }
@@ -70939,8 +70952,7 @@ begin
   end;
 
   Output.Resize(SizeX, SizeY, DeepCnt);
-  FOutputError.Resize(SizeX, SizeY, DeepCnt);
-  FOutputErrorDeriv.Resize(SizeX, SizeY, DeepCnt);
+  SetOutputErrorSize(SizeX, SizeY, DeepCnt);
 
   FActivationFn := @Identity;
   FActivationFnDerivative := @IdentityDerivative;
@@ -74002,8 +74014,9 @@ procedure TNNetIdentity.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   FOutput.ReSize(pPrevLayer.FOutput);
-  FOutputError.ReSize(pPrevLayer.FOutputError);
-  FOutputErrorDeriv.ReSize(pPrevLayer.FOutputErrorDeriv);
+  // Size from FOutput, not pPrevLayer.FOutputError: an inference-only prev
+  // layer carries a collapsed (1,1,1) error buffer that must not drive ours.
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetIdentity.BackpropagateNoTest();
@@ -75401,8 +75414,7 @@ begin
   FOutputSizeD := pPrevLayer.Output.Depth;
 
   FOutput.ReSize(FOutputSizeX, FOutputSizeY, FOutputSizeD);
-  FOutputError.ReSize(FOutputSizeX, FOutputSizeY, FOutputSizeD);
-  FOutputErrorDeriv.ReSize(FOutputSizeX, FOutputSizeY, FOutputSizeD);
+  SetOutputErrorSize(FOutputSizeX, FOutputSizeY, FOutputSizeD);
   SetLength(FMaxPosX, FOutput.Size);
   SetLength(FMaxPosY, FOutput.Size);
   if ((FStride = FPoolSize) and (FPadding = 0)) then
@@ -75676,11 +75688,7 @@ begin
   inherited SetPrevLayer(pPrevLayer);
   FOutput.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
   FOutputRaw.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
-  if FIsTrainable then
-  begin
-    FOutputError.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
-    FOutputErrorDeriv.ReSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
-  end;
+  SetOutputErrorSize(FOutputSizeX,FOutputSizeY,FNeurons.Count);
   FVectorSize := FFeatureSizeX*FFeatureSizeY*pPrevLayer.Output.Depth;
   FVectorSizeBytes := FVectorSize * SizeOf(TNeuralFloat);
   if FPointwise then
@@ -77102,8 +77110,7 @@ begin
   inherited Create;
   FOutPut.ReSize(pSizeX, pSizeY, pDepth);
   FOutputRaw.ReSize(pSizeX, pSizeY, pDepth);
-  FOutputError.ReSize(pSizeX, pSizeY, pDepth);
-  FOutputErrorDeriv.ReSize(pSizeX, pSizeY, pDepth);
+  SetOutputErrorSize(pSizeX, pSizeY, pDepth);
   FSuppressBias := pSuppressBias;
 
   FStruct[0] := pSizeX;
@@ -99888,6 +99895,32 @@ begin
   // to be implemented by inherited classes
 end;
 
+procedure TNNetLayer.SetOutputErrorSize(pSizeX, pSizeY, pDepth: integer);
+begin
+  if FIsTrainable then
+  begin
+    FOutputError.ReSize(pSizeX, pSizeY, pDepth);
+    FOutputErrorDeriv.ReSize(pSizeX, pSizeY, pDepth);
+  end
+  else
+  begin
+    FOutputError.ReSize(1, 1, 1);
+    FOutputErrorDeriv.ReSize(1, 1, 1);
+  end;
+end;
+
+procedure TNNetLayer.SetOutputErrorSize(Original: TNNetVolume);
+begin
+  SetOutputErrorSize(Original.SizeX, Original.SizeY, Original.Depth);
+end;
+
+procedure TNNetLayer.SetOutputErrorSizeNoDeriv(Original: TNNetVolume);
+begin
+  if FIsTrainable
+    then FOutputError.ReSize(Original.SizeX, Original.SizeY, Original.Depth)
+    else FOutputError.ReSize(1, 1, 1);
+end;
+
 procedure TNNetLayer.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   FPrevLayer := pPrevLayer;
@@ -100382,6 +100415,15 @@ begin
   // Shrink any training buffers already allocated (e.g. a layer that sized its
   // weights in the constructor, before this was chained). When the layer is
   // attached later, FIsTrainable being False stops them being re-allocated.
+  // The error buffers are normally re-sized by SetPrevLayer (now gated on
+  // FIsTrainable), but shrink them here too so an inference-only flip AFTER the
+  // layer is already attached frees them immediately rather than waiting for a
+  // re-wire that may never come.
+  if not pTrainable then
+  begin
+    FOutputError.ReSize(1, 1, 1);
+    FOutputErrorDeriv.ReSize(1, 1, 1);
+  end;
   MaxLayer := FNeurons.Count - 1;
   for Cnt := 0 to MaxLayer do
   begin
