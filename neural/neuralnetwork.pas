@@ -17248,8 +17248,7 @@ begin
     FB.Output.SizeY,
     FA.Output.SizeX * FA.Output.SizeY
   );
-  FOutputError.Resize(FOutput);
-  FOutputErrorDeriv.Resize(FOutput);
+  SetOutputErrorSize(FOutput);
   if FNoForward then
   begin
     PrepareNoForwardMask();
@@ -17985,10 +17984,7 @@ begin
   inherited SetPrevLayer(pPrevLayer);
   FOutput.ReSize(FLenX, FLenY, pPrevLayer.FOutput.Depth);
   if (pPrevLayer.FOutputError.Size = pPrevLayer.FOutput.Size) then
-  begin
-    FOutputError.ReSize(FOutput);
-    FOutputErrorDeriv.ReSize(FOutput);
-  end;
+    SetOutputErrorSize(FOutput);
 end;
 
 constructor TNNetCrop.Create(StartX, StartY, LenX, LenY: integer);
@@ -20106,8 +20102,7 @@ begin
       ' Input depth: ' + IntToStr(pPrevLayer.FOutput.Depth));
   end;
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY, 1);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetCosineSimilarity.Compute();
@@ -24880,8 +24875,7 @@ begin
   SeqLen := pPrevLayer.FOutput.SizeX;
   // Output is the additive decay-bias matrix D[X=key j, Y=query i, 1].
   FOutput.ReSize(SeqLen, SeqLen, 1);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   FF.ReSize(SeqLen, 1, 1);
   FLogF.ReSize(SeqLen, 1, 1);
   // Backprop-only scratch: skip on inference-only layers.
@@ -26565,8 +26559,7 @@ begin
     FErrorProc('TNNetCrossAttention requires Key|Value depth = 2*d_k. Got depth=' +
       IntToStr(FKVLayer.FOutput.Depth) + ', d_k=' + IntToStr(FDk));
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   // Attention weights: rows = queries (Y=i over QSeqLen), cols = keys
   // (X=j over KVSeqLen).
   FAttn.ReSize(FKVLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeX, 1);
@@ -26934,8 +26927,7 @@ begin
       + IntToStr(FFlowLayer.FOutput.SizeX) + 'x'
       + IntToStr(FFlowLayer.FOutput.SizeY));
   FOutput.ReSize(pPrevLayer.FOutput);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetFlowWarp.Compute();
@@ -27275,8 +27267,7 @@ begin
   // Output depth = H*W (one correlation per target pixel), channel = jy*W + jx.
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
     pPrevLayer.FOutput.SizeX * pPrevLayer.FOutput.SizeY);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetCorrelationVolume.Compute();
@@ -27358,8 +27349,7 @@ begin
     FErrorProc('TNNetCorrelationLookup requires a (W,H,2) flow field matching '
       + 'the volume spatial size.');
   FOutput.ReSize(FW, FH, (2 * FRadius + 1) * (2 * FRadius + 1));
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetCorrelationLookup.Compute();
@@ -33658,8 +33648,7 @@ begin
   FZ := TNNetVolume.Create(1, 1, M);
   // The output is always 1 x 1 x (2*M) regardless of upstream spatial shape.
   FOutput.ReSize(1, 1, 2 * M);
-  FOutputError.ReSize(1, 1, 2 * M);
-  FOutputErrorDeriv.ReSize(1, 1, 2 * M);
+  SetOutputErrorSize(1, 1, 2 * M);
 end;
 
 destructor TNNetFourierFeatures.Destroy();
@@ -33694,8 +33683,7 @@ procedure TNNetFourierFeatures.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   FOutput.ReSize(1, 1, 2 * FNumFeatures);
-  FOutputError.ReSize(1, 1, 2 * FNumFeatures);
-  FOutputErrorDeriv.ReSize(1, 1, 2 * FNumFeatures);
+  SetOutputErrorSize(1, 1, 2 * FNumFeatures);
   // Only (re)sample B if it has not already been loaded with the matching
   // shape. LoadDataFromString runs AFTER SetPrevLayer and overwrites it; a
   // re-load with the exact stored B is what pins the mapping on round-trip.
@@ -34199,8 +34187,7 @@ begin
     Exit;
   end;
   FOutput.ReSize(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY, 1);
-  FOutputError.ReSize(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY, 1);
-  FOutputErrorDeriv.ReSize(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY, 1);
+  SetOutputErrorSize(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY, 1);
 end;
 
 procedure TNNetGather.Compute();
@@ -34298,8 +34285,7 @@ begin
     end;
   end;
   FOutput.ReSize(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY, OutDepth);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetGatherChannels.Compute();
@@ -34817,8 +34803,7 @@ begin
   FOutput.ReSize(pPrevLayer.Output.SizeX * P,
                  pPrevLayer.Output.SizeY * P,
                  pPrevLayer.Output.Depth div (P * P));
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetDepthToSpace.Compute();
@@ -34894,8 +34879,7 @@ begin
   FOutput.ReSize(pPrevLayer.Output.SizeX,
                  pPrevLayer.Output.SizeY,
                  pPrevLayer.Output.Depth + 2);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetCoordConv.Compute();
@@ -38622,8 +38606,7 @@ begin
   inherited SetPrevLayer(pPrevLayer);
   FOutput.ReSize(FOutputSizeX, FOutputSizeY, pPrevLayer.Output.Depth * FNeurons.Count);
   FOutputRaw.ReSize(FOutput);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   FVectorSize := FFeatureSizeX*FFeatureSizeY*pPrevLayer.Output.Depth;
   FVectorSizeBytes := FVectorSize * SizeOf(TNeuralFloat);
   RefreshNeuronWeightList();
@@ -39084,8 +39067,7 @@ constructor TNNetDepthwiseConv.Create(pMultiplier, pFeatureSize, pInputPadding,
 begin
   inherited Create(pFeatureSize, pInputPadding, pStride);
   AddNeurons(pMultiplier);
-  FOutputError.ReSize(1, 1, 1);
-  FOutputErrorDeriv.ReSize(1, 1, 1);
+  SetOutputErrorSize(1, 1, 1);
   FStruct[0] := pMultiplier;
   FStruct[1] := pFeatureSize;
   FStruct[2] := pInputPadding;
@@ -41975,8 +41957,7 @@ begin
   AddNeurons(Channels);
   FStruct[0] := Channels;
   FOutput.ReSize(SeqLen, 1, Channels);
-  FOutputError.ReSize(SeqLen, 1, Channels);
-  FOutputErrorDeriv.ReSize(SeqLen, 1, Channels);
+  SetOutputErrorSize(SeqLen, 1, Channels);
   // Each channel's kernel is a (K, 1, 1) weight volume.
   SetNumWeightsForAllNeurons(FKernelSize, 1, 1);
   InitDefault();
@@ -43916,8 +43897,7 @@ begin
   FStruct[1] := Ord(FAsymmetric);
   // Output = gated wkv, C channels, length = receptance (query) length.
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FChannels);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   if FNeurons.Count < 2 then AddMissingNeurons(2);
   SetNumWeightsForAllNeurons(1, 1, FChannels);
   // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
@@ -47791,8 +47771,7 @@ begin
   FScale := 1.0 / Sqrt(Depth);
   // The delta-rule cell preserves the sequence layout.
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, Depth);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   if FNeurons.Count < 5 then AddMissingNeurons(5);
   // [0..2]=W_q/W_k/W_v are DepthxDepth (stored [out,0,in]); [3]=w_beta is
   // Depth-long; [4]=b_beta is a scalar.
@@ -48363,8 +48342,7 @@ begin
   FStruct[1] := Depth; // d_v
   // The gated linear-attention cell preserves the sequence layout.
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, Depth);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   if FNeurons.Count < 5 then AddMissingNeurons(5);
   // [0..3]=W_q/W_k/W_v/W_a are DepthxDepth (stored [out,0,in]); [4]=b_a is
   // Depth-long.
@@ -54658,8 +54636,7 @@ begin
       aL[LayerCnt].IncDepartingBranchesCnt();
     end;
     Output.Resize(SizeX, SizeY, FDepth);
-    FOutputError.Resize(SizeX, SizeY, FDepth);
-    FOutputErrorDeriv.Resize(SizeX, SizeY, FDepth);
+    SetOutputErrorSize(SizeX, SizeY, FDepth);
   end;
   FActivationFn := @Identity;
   FActivationFnDerivative := @IdentityDerivative;
@@ -60965,8 +60942,7 @@ begin
   FHalf := FExtLen div 2;
 
   FOutput.ReSize(FHalf, 1, 2 * FDepth);
-  FOutputError.ReSize(FHalf, 1, 2 * FDepth);
-  FOutputErrorDeriv.ReSize(FHalf, 1, 2 * FDepth);
+  SetOutputErrorSize(FHalf, 1, 2 * FDepth);
 
   if FLearnable = 1 then
     WeightCount := FTapCount
@@ -73872,8 +73848,7 @@ begin
   else
     FOutput.Resize(1, 1, N);
   end;
-  FOutputError.Resize(FOutput);
-  FOutputErrorDeriv.Resize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetExpandDims.Compute;
@@ -77475,7 +77450,7 @@ procedure TNNetEmbedding.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   FOutput.ReSize(pPrevLayer.Output.Size, 1, FEmbeddingSize);
-  FOutputError.ReSize(FOutput);
+  SetOutputErrorSizeNoDeriv(FOutput);
   SetLength(FInputTokens, pPrevLayer.Output.Size);
 end;
 
