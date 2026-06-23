@@ -18013,10 +18013,7 @@ begin
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
     (FOutput.Size <> FOutputError.Size)
     then
-  begin
-    FOutputError.ReSize(FOutput);
-    FOutputErrorDeriv.ReSize(FOutput);
-  end;
+    SetOutputErrorSize(FOutput);
   FOutput.CopyCropping(FPrevLayer.FOutput, FStartX, FStartY, FLenX, FLenY);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -18077,10 +18074,7 @@ begin
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
     (FOutput.Size <> FOutputError.Size)
     then
-  begin
-    FOutputError.ReSize(FOutput);
-    FOutputErrorDeriv.ReSize(FOutput);
-  end;
+    SetOutputErrorSize(FOutput);
   FOutput.CopyPadding(FPrevLayer.FOutput, FPaddingX, FPaddingY);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -37072,10 +37066,7 @@ begin
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
     (FOutput.Size <> FOutputError.Size)
     then
-  begin
-    FOutputError.ReSize(FOutput);
-    FOutputErrorDeriv.ReSize(FOutput);
-  end;
+    SetOutputErrorSize(FOutput);
   FOutput.CopyPadding(FPrevLayer.FOutput, FPadding);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
