@@ -26000,8 +26000,7 @@ begin
   SeqLen := pPrevLayer.FOutput.SizeX;
   // Output is the FIXED k seeds (k,1,d), independent of the input length N.
   FOutput.ReSize(FK, 1, FDim);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   // Seed bank S: (k, 1, d) -- each seed d-vector is depth-contiguous.
   FNeurons[0].FWeights.ReSize(FK, 1, FDim);
@@ -26737,8 +26736,7 @@ begin
     FErrorProc('TNNetAffineGridSample requires a theta source of Size=6 (a 2x3 '
       + 'affine matrix). Got Size=' + IntToStr(FThetaLayer.FOutput.Size));
   FOutput.ReSize(pPrevLayer.FOutput);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetAffineGridSample.Compute();
@@ -27109,8 +27107,7 @@ begin
       + IntToStr(FFlowLayer.FOutput.SizeX) + 'x'
       + IntToStr(FFlowLayer.FOutput.SizeY));
   FOutput.ReSize(pPrevLayer.FOutput);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetBackwardWarp.Compute();
@@ -27494,8 +27491,7 @@ begin
   FRH.ReSize(FW, FH, ZC);   // [r*h ; x]
   FZcat.ReSize(FW, FH, ZC);
   FOutput.ReSize(FW, FH, FHiddenC);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   InitDefault();
 end;
 
@@ -28215,8 +28211,7 @@ begin
     FErrorProc('TNNetCausalLinearAttention requires input depth = 3*d_k. Got depth=' +
       IntToStr(pPrevLayer.FOutput.Depth) + ', d_k=' + IntToStr(FDk));
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   FPhiQ.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
   FPhiK.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
   // Per-query running prefix sums: X = key feature (d_k), Y = query position t,
@@ -36110,8 +36105,7 @@ begin
   FStyleMean.ReSize(1, 1, FContentLayer.Output.Depth);
   FStyleStd.ReSize(1, 1, FContentLayer.Output.Depth);
   FNormContent.ReSize(FContentLayer.Output);
-  FOutputError.ReSize(FContentLayer.Output);
-  FOutputErrorDeriv.ReSize(FContentLayer.Output);
+  SetOutputErrorSize(FContentLayer.Output);
 end;
 
 procedure TNNetAdaIN.Compute();
@@ -36407,7 +36401,7 @@ begin
     FStruct[1]{relationTableSize}, FStruct[2]{pNumberOfSearches},
     (FStruct[0]>0){pUseCache}, FStruct[0]{CacheSize});
   FOutput.Resize(1, 1, ByteLen*8);
-  FOutputError.Resize(FOutput);
+  SetOutputErrorSizeNoDeriv(FOutput);
   SetLength(FByteInput, ByteLen);
   SetLength(FByteOutput, ByteLen);
   SetLength(FByteOutputFound, ByteLen);
@@ -36718,7 +36712,7 @@ begin
     FStruct[1]{relationTableSize}, FStruct[2]{pNumberOfSearches},
     (FStruct[0]>0){pUseCache}, FStruct[0]{CacheSize});
   FOutput.Resize(1, 1, ByteLen);
-  FOutputError.Resize(FOutput);
+  SetOutputErrorSizeNoDeriv(FOutput);
   SetLength(FByteInput, ByteLen);
   SetLength(FByteOutput, ByteLen);
   SetLength(FByteOutputFound, ByteLen);
@@ -37750,8 +37744,7 @@ begin
   FOutput.ReSize(pPrevLayer.Output.SizeX * s,
                  pPrevLayer.Output.SizeY * s,
                  pPrevLayer.Output.Depth);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 // Bilinear sampling shared geometry: for output index o on an axis of input
@@ -37853,8 +37846,7 @@ procedure TNNetBilinearResize.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   FOutput.ReSize(FStruct[0], FStruct[1], pPrevLayer.Output.Depth);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 // Resize sampling geometry: for output index o on an axis of input size InSize
@@ -39620,8 +39612,7 @@ begin
   FSquashScale := TNNetVolume.Create();
   FSj          := TNNetVolume.Create();
   FOutput.ReSize(1, 1, pNumOutCaps * pOutDim);
-  FOutputError.ReSize(1, 1, pNumOutCaps * pOutDim);
-  FOutputErrorDeriv.ReSize(1, 1, pNumOutCaps * pOutDim);
+  SetOutputErrorSize(1, 1, pNumOutCaps * pOutDim);
 end;
 
 procedure TNNetCapsuleRouting.FreeBackpropScratch();
@@ -41832,8 +41823,7 @@ begin
   InputDepth := pPrevLayer.FOutput.Depth;
   // Causal/SAME along time: output length == input length.
   FOutput.ReSize(SeqLen, 1, FNeurons.Count);
-  FOutputError.ReSize(SeqLen, 1, FNeurons.Count);
-  FOutputErrorDeriv.ReSize(SeqLen, 1, FNeurons.Count);
+  SetOutputErrorSize(SeqLen, 1, FNeurons.Count);
   // Each output channel reads a (Ksize, 1, InputDepth) window.
   SetNumWeightsForAllNeurons(FFeatureSize, 1, InputDepth);
   InitDefault();
@@ -42149,8 +42139,7 @@ begin
   // Temporal: VALID conv (no temporal padding).
   FOutputT := FInputT - FFeatureSizeT + 1;
   FOutput.ReSize(OutW, OutH, FOutputT * FNeurons.Count);
-  FOutputError.ReSize(OutW, OutH, FOutputT * FNeurons.Count);
-  FOutputErrorDeriv.ReSize(OutW, OutH, FOutputT * FNeurons.Count);
+  SetOutputErrorSize(OutW, OutH, FOutputT * FNeurons.Count);
   // Each feature reads a (FeatureSizeXY, FeatureSizeXY, FeatureSizeT*C) window.
   SetNumWeightsForAllNeurons(FFeatureSizeXY, FFeatureSizeXY,
     FFeatureSizeT * FChannels);
@@ -44408,8 +44397,7 @@ begin
   FHalfB := Depth - FHalfA;
   // Output preserves the full input shape.
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY, Depth);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   // One neuron per conditioner output row: rows [0..HalfB-1]=s_pre, [HalfB..]=t.
   if FNeurons.Count < 2 * FHalfB then AddMissingNeurons(2 * FHalfB - FNeurons.Count);
   MaxR2B := 2 * FHalfB - 1;
@@ -44969,8 +44957,7 @@ begin
   FStruct[0] := FC;
   FInitialised := (FStruct[1] = 1);
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY, FC);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   // Neuron 0 = logs (C,1,1); neuron 1 = b (C,1,1).
   if FNeurons.Count < 2 then AddMissingNeurons(2 - FNeurons.Count);
   FNeurons[0].FWeights.ReSize(FC, 1, 1);
@@ -45763,8 +45750,7 @@ begin
   Depth := pPrevLayer.FOutput.Depth;
   // The CfC cell preserves the sequence layout.
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, Depth);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   if FNeurons.Count < 4 then AddMissingNeurons(4);
   // [0]=Wt [2]=Wg are DepthxDepth (stored [out,0,in]);
   // [1]=b_t [3]=b_g are Depth-long per-channel vectors.
@@ -47485,8 +47471,7 @@ begin
   FW := pPrevLayer.FOutput.SizeY;
   ZC := FInC + FHiddenC;       // concatenated channel count [x_t ; h_{t-1}]
   FOutput.ReSize(FTimeSteps * FH, FW, FHiddenC);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   if FNeurons.Count < 8 then AddMissingNeurons(8);
   // [0..3] kernels (HiddenC, K*K, ZC); [4..7] biases (1,1,HiddenC).
   for ii := 0 to 3 do
@@ -52057,8 +52042,7 @@ begin
   inherited SetPrevLayer(pPrevLayer);
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   SetNumWeightsForAllNeurons(FOutput);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   InitDefault();
 end;
 
@@ -52163,7 +52147,7 @@ begin
   inherited SetPrevLayer(pPrevLayer);
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   SetNumWeightsForAllNeurons(FOutput);
-  FOutputError.ReSize(FOutput);
+  SetOutputErrorSizeNoDeriv(FOutput);
   InitDefault();
 end;
 
@@ -55123,8 +55107,7 @@ procedure TNNetAdaptiveAvgPool.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   FOutput.ReSize(FOutputSizeX, FOutputSizeY, pPrevLayer.Output.Depth);
-  FOutputError.ReSize(FOutputSizeX, FOutputSizeY, pPrevLayer.Output.Depth);
-  FOutputErrorDeriv.ReSize(FOutputSizeX, FOutputSizeY, pPrevLayer.Output.Depth);
+  SetOutputErrorSize(FOutputSizeX, FOutputSizeY, pPrevLayer.Output.Depth);
 end;
 
 procedure TNNetAdaptiveAvgPool.Compute();
@@ -55245,8 +55228,7 @@ procedure TNNetAdaptiveMaxPool.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   FOutput.ReSize(FOutputSizeX, FOutputSizeY, pPrevLayer.Output.Depth);
-  FOutputError.ReSize(FOutputSizeX, FOutputSizeY, pPrevLayer.Output.Depth);
-  FOutputErrorDeriv.ReSize(FOutputSizeX, FOutputSizeY, pPrevLayer.Output.Depth);
+  SetOutputErrorSize(FOutputSizeX, FOutputSizeY, pPrevLayer.Output.Depth);
 end;
 
 procedure TNNetAdaptiveMaxPool.Compute();
@@ -62666,8 +62648,7 @@ begin
   FSeqLen := pPrevLayer.Output.SizeX;
   FDepth := pPrevLayer.Output.Depth;
   FOutput.ReSize(FSeqLen, 1, FDepth);
-  FOutputError.ReSize(FSeqLen, 1, FDepth);
-  FOutputErrorDeriv.ReSize(FSeqLen, 1, FDepth);
+  SetOutputErrorSize(FSeqLen, 1, FDepth);
   FVmem.ReSize(FSeqLen, 1, FDepth);
   FAdapt.ReSize(FSeqLen, 1, FDepth);
   FSpike.ReSize(FSeqLen, 1, FDepth);
@@ -73787,15 +73768,13 @@ begin
   if (pSizeX>0) and (pSizeY>0) and (pDepth>0) then
   begin
     FOutput.Resize(pSizeX, pSizeY, pDepth);
-    FOutputError.Resize(pSizeX, pSizeY, pDepth);
-    FOutputErrorDeriv.Resize(pSizeX, pSizeY, pDepth);
+    SetOutputErrorSize(pSizeX, pSizeY, pDepth);
   end
   else
   begin
     NewSize := FPrevOutput.GetTotalSize();
     FOutput.Resize(NewSize, 1, 1);
-    FOutputError.Resize(NewSize, 1, 1);
-    FOutputErrorDeriv.Resize(NewSize, 1, 1);
+    SetOutputErrorSize(NewSize, 1, 1);
   end;
 end;
 
@@ -75996,8 +75975,7 @@ begin
     (FPadding = 0) and
     (FStride = 1) );
   AddNeurons(pNumFeatures);
-  FOutputError.ReSize(pNumFeatures, 1, 1);
-  FOutputErrorDeriv.ReSize(pNumFeatures, 1, 1);
+  SetOutputErrorSize(pNumFeatures, 1, 1);
   //FDotProductResult := TNNetVolume.Create;
 
   if not FPointwise
