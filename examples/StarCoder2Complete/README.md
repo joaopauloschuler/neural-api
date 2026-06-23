@@ -61,7 +61,7 @@ to the HuggingFace `transformers` float64 oracle within `1e-4`
 LayerNorm biases, the `o_proj` bias and the sliding window each move the
 logits, so the importer's bias/window paths are genuinely covered.
 
-This demo always builds the net `pInferenceOnly` (training volumes freed
+This demo always builds the net `pTrainable=false` (training volumes freed
 during construction) and runs a full forward per token (no KV cache).
 
 Coded by Claude (AI).

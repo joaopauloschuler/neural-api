@@ -89,7 +89,7 @@ A convolution sizes its prev-layer-error scratch buffer from the previous
 layer's `OutputError` size at wiring time, so for backprop to reach the input
 PIXELS the input layer's error collection must be enabled **before** the first
 conv is added. `BuildVGG` now enables input error collection when built with
-`pInferenceOnly = false`, so an imported VGG can be used directly for
+`pTrainable = true`, so an imported VGG can be used directly for
 input-gradient methods (style transfer, perceptual gradient ascent, saliency).
 This is harmless for plain forward inference.
 

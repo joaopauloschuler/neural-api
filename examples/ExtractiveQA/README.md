@@ -51,7 +51,7 @@ For a **real** model, replace the demo-net block with:
 
 ```pascal
 NN := BuildBertForQuestionAnsweringFromSafeTensors(
-        'model.safetensors', {pSeqLen=}384, {pInferenceOnly=}true);
+        'model.safetensors', {pSeqLen=}384, {pTrainable=}false);
 Tok.LoadFromFile('tokenizer.json');
 ```
 

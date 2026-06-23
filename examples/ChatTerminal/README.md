@@ -68,7 +68,7 @@ guard, flushed per token so piped output streams too).
 | `--no-cache-reuse` | re-prefill the whole prompt every turn instead of reusing the shared KV-cache prefix (A/B + debugging) | reuse on |
 | `--selftest` | run the offline unit checks and exit | — |
 
-The model is always built with `pInferenceOnly=true` (the REPL never
+The model is always built with `pTrainable=false` (the REPL never
 trains; ~1/3 the memory). Temperature and the penalties run through a
 `TNNetLogitsProcessorChain` in the `TGenerationConfig` pipeline order
 (penalty -> temperature -> sampler); without a sampler flag decoding is
