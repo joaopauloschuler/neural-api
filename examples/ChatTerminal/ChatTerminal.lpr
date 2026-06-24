@@ -992,16 +992,16 @@ begin
   // opt-in for less RAM at the cost of speed (per-layer dequantization).
   if Opt.Int8 then
     WriteLn('[--int8: int8 weight-only quantized weights - slower, less RAM;',
-      ' pass --fp32 (or drop --int8) for full-precision]')
+      ' pass --fp32 (or drop --int8) for GPU capable full-precision]')
   else
-    WriteLn('[fp32 weights (default) - faster, more RAM;',
-      ' pass --int8 for less RAM (slower)]');
+    WriteLn('[fp32 weights (default) - GPU capable]');
   if Opt.LowMemory then
     WriteLn('[low-memory forward (default) - concatenated weight cache dropped,',
-      ' per-neuron compute; pass --max-fast-memory to keep the cache]')
+      ' per-neuron compute, not compatible with GPU,',
+      ' pass --max-fast-memory to keep the (faster) cache and/or use GPU.]')
   else
     WriteLn('[--max-fast-memory: concatenated weight cache kept - faster forward,',
-      ' more RAM]');
+      ' more RAM, GPU compatible]');
 
   WriteLn('Loading ', Opt.ModelDir, ' ...');
   // Built at INPUT WIDTH 1 (pSeqLen=1): streamed decode feeds one token per
