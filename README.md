@@ -14,11 +14,7 @@ CAI NEURAL API is a Pascal deep-learning library optimized for the AVX, AVX2 and
 * 🧠 **Modern architectures, built in** — GPT-style transformers, Mixture-of-Experts, RWKV, xLSTM, spiking neurons and normalizing flows, all as native Pascal layers.
 * ⚡ **Fast everywhere** — AVX/AVX2/AVX512 CPU paths plus OpenCL offload for AMD, Intel and NVIDIA GPUs.
 * 📦 **Single-binary deploy** — compile to one self-contained native executable. No runtime, no dependency tree.
-
-## Why Pascal?
-* The Pascal computer language is easy to learn. Pascal allows developers to make a readable and understandable source code.
-* You'll be able to make super-fast **native code** and at the same time have a readable code.
-* This API can outperform some major APIs in some architectures.
+* 📖 **Readable at native speed** — clean, easy-to-learn Pascal that compiles to fast native code. No trade-off between readable source and raw performance.
 
 ## Prerequisites
 You'll need [Lazarus](https://www.lazarus-ide.org/) development environment. If you have an OpenCL capable device, you'll need its OpenCL drivers. Many examples use the [CIFAR-10](https://www.cs.toronto.edu/~kriz/cifar.html) dataset. You'll also find examples for the [CIFAR-100](https://www.cs.toronto.edu/~kriz/cifar.html), [MNIST](http://yann.lecun.com/exdb/mnist/), [Fashion MNIST](https://www.kaggle.com/zalando-research/fashionmnist) and the [Places365-Standard Small images 256x256](http://places2.csail.mit.edu/download.html) dataset.
