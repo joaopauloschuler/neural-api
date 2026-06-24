@@ -4135,6 +4135,15 @@ type
     FEncStages, FDecStages: array of TEnCodecStage;
     FEncLSTM, FDecLSTM: TEnCodecLSTM;
     FCodebooks: array of TEnCodecMat;   // [NumQuantizers] each [size, dim]
+    // Worker pool for the conv kernels, sized like neuralfit (NeuralDefault
+    // ThreadCount, settable via MaxThreadNum). Built lazily on the first
+    // encode/decode and reused. NOTE: sized from NeuralDefaultThreadCount, NOT
+    // TThread.ProcessorCount - the latter under-reports (returns 1) in some
+    // container/OpenCL-POCL setups, which would silently serialize the threads.
+    FProcs: TNeuralThreadList;
+    FMaxThreadNum: integer;
+    // Builds FProcs on first use if more than one thread is available.
+    procedure EnsureThreadPool;
     // Applies one stage to a channel-major signal (Channels x Time arrays).
     procedure RunStage(const Stage: TEnCodecStage;
       const InSig: array of TNeuralFloatDynArr; out OutSig: TNNetFloatDynArr2D);
@@ -4142,6 +4151,9 @@ type
     constructor Create(const pConfig: TEnCodecConfig);
     destructor Destroy; override;
     property Config: TEnCodecConfig read FConfig;
+    // Conv worker-thread count (default NeuralDefaultThreadCount). Set before the
+    // first encode/decode; 1 disables conv threading.
+    property MaxThreadNum: integer read FMaxThreadNum write FMaxThreadNum;
     // Number of RVQ codebooks loaded.
     function NumCodebooks: integer;
     // Runs the conv encoder + RVQ on a mono waveform of NumSamples samples,
@@ -33308,11 +33320,21 @@ constructor TEnCodecModel.Create(const pConfig: TEnCodecConfig);
 begin
   inherited Create();
   FConfig := pConfig;
+  FProcs := nil;
+  // Default to the real CPU thread count (sched-affinity aware), like neuralfit.
+  FMaxThreadNum := NeuralDefaultThreadCount();
 end;
 
 destructor TEnCodecModel.Destroy;
 begin
+  FProcs.Free;   // TNeuralThreadList.Destroy stops the worker engine; nil-safe
   inherited Destroy;
+end;
+
+procedure TEnCodecModel.EnsureThreadPool;
+begin
+  if (FProcs = nil) and (FMaxThreadNum > 1) then
+    FProcs := TNeuralThreadList.Create(FMaxThreadNum);
 end;
 
 function TEnCodecModel.NumCodebooks: integer;
@@ -33383,7 +33405,7 @@ end;
 // (trim_right_ratio 1.0 in the supported family). InSig[c][t], OutSig[c][t].
 procedure RunEnCodecConv(const Conv: TEnCodecConv;
   const InSig: array of TNeuralFloatDynArr; out OutSig: TNNetFloatDynArr2D;
-  Causal: boolean = true);
+  Causal: boolean = true; Pool: TNeuralThreadList = nil);
 var
   InCh, OutCh, K, Stride, Dil, InLen, o, i, t, k2, src, PadTotal, Extra: integer;
   NFrames, OutLen, idx, FullLen, PadLeft, PadRight, EffK: integer;
@@ -33467,16 +33489,15 @@ begin
     // way, in a register, with one write). Keying off the output LENGTH (not the
     // channel count) keeps the heavy high-resolution decode stages parallel even
     // when they have few channels. Tiny convs run inline.
-    if OutLen >= 512 then
+    if (Pool <> nil) and (Pool.Count > 1) and (OutLen >= 512) then
     begin
-      CreateNeuralThreadListIfRequired();
       ConvWorker := TEnCodecConvWorker.Create;
       ConvWorker.W := Conv.W;       ConvWorker.B := Conv.B;
       ConvWorker.Padded := Padded;  ConvWorker.OutSig := OutSig;
       ConvWorker.InCh := InCh;      ConvWorker.OutCh := OutCh;
       ConvWorker.K := K;            ConvWorker.Stride := Stride;
       ConvWorker.Dil := Dil;        ConvWorker.OutLen := OutLen;
-      fNTL.StartProc({$IFDEF FPC}@ConvWorker.RunForward{$ELSE}ConvWorker.RunForward{$ENDIF});
+      Pool.StartProc({$IFDEF FPC}@ConvWorker.RunForward{$ELSE}ConvWorker.RunForward{$ENDIF});
       ConvWorker.Free;
     end
     else
@@ -33510,9 +33531,8 @@ begin
     // disjoint set of Full[o] arrays - race-free, and bit-identical because every
     // Full[o][idx] still accumulates its (i,t,k2) contributions in the same
     // i-major, t, k2 order. Tiny convs run inline.
-    if (OutCh >= 4) and (InLen >= 512) then
+    if (Pool <> nil) and (Pool.Count > 1) and (OutCh >= 4) and (InLen >= 512) then
     begin
-      CreateNeuralThreadListIfRequired();
       // Mirror the open-array InSig into a dynamic 2D array (shares the inner
       // channel rows by reference - no data copy) so the worker can hold it.
       SetLength(InSigArr, InCh);
@@ -33522,7 +33542,7 @@ begin
       ConvWorker.Full := Full;      ConvWorker.InCh := InCh;
       ConvWorker.OutCh := OutCh;    ConvWorker.K := K;
       ConvWorker.Stride := Stride;  ConvWorker.InLen := InLen;
-      fNTL.StartProc({$IFDEF FPC}@ConvWorker.RunTranspose{$ELSE}ConvWorker.RunTranspose{$ENDIF});
+      Pool.StartProc({$IFDEF FPC}@ConvWorker.RunTranspose{$ELSE}ConvWorker.RunTranspose{$ENDIF});
       ConvWorker.Free;
     end
     else
@@ -33648,7 +33668,7 @@ var
 begin
   InSigMax := Length(InSig) - 1;
   case Stage.Kind of
-    eskConv: RunEnCodecConv(Stage.Conv, InSig, OutSig, FConfig.UseCausalConv);
+    eskConv: RunEnCodecConv(Stage.Conv, InSig, OutSig, FConfig.UseCausalConv, FProcs);
     eskELU:
       begin
         SetLength(OutSig, Length(InSig));
@@ -33669,11 +33689,11 @@ begin
           for t := 0 to Length(InSig[c]) - 1 do
             Tmp[c][t] := EnCodecELU(InSig[c][t]);
         end;
-        RunEnCodecConv(Stage.Resnet.Conv1, Tmp, Res, FConfig.UseCausalConv);
+        RunEnCodecConv(Stage.Resnet.Conv1, Tmp, Res, FConfig.UseCausalConv, FProcs);
         ApplyEnCodecELU(Res);
-        RunEnCodecConv(Stage.Resnet.Conv2, Res, Tmp, FConfig.UseCausalConv);
+        RunEnCodecConv(Stage.Resnet.Conv2, Res, Tmp, FConfig.UseCausalConv, FProcs);
         if Stage.Resnet.HasShortcut then
-          RunEnCodecConv(Stage.Resnet.Shortcut, InSig, Shr_, FConfig.UseCausalConv)
+          RunEnCodecConv(Stage.Resnet.Shortcut, InSig, Shr_, FConfig.UseCausalConv, FProcs)
         else
         begin
           SetLength(Shr_, Length(InSig));
@@ -33702,6 +33722,7 @@ var
   Dist, BestDist, Diff: TNeuralFloat;
   Residual, Vec: TNeuralFloatDynArr;
 begin
+  EnsureThreadPool;
   // Channel-major input (mono): Sig[0][t] = waveform.
   SetLength(Sig, FConfig.AudioChannels);
   SetLength(Sig[0], Length(Waveform));
@@ -33764,6 +33785,7 @@ var
   s, q, t, d, Dm, Frames, NQ, code: integer;
   DmM1, FramesM1, NQM1, DecStagesM1, SigLenM1: integer;
 begin
+  EnsureThreadPool;
   Dm := FConfig.HiddenSize;
   DmM1 := Dm - 1;
   NQ := Length(Codes);
