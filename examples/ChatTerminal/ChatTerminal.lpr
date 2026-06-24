@@ -987,6 +987,21 @@ begin
       ' tokens; override with --ctx N (memory grows ~O(ctx^2))]');
   end;
 
+  {$IFDEF OpenCL}
+  GpuCL := nil;
+  if Opt.Gpu and Opt.Int8 then
+  begin
+    WriteLn('[--int8 ignored: incompatible with --gpu]');
+    Opt.Int8 := false;
+  end;
+
+  if Opt.Gpu and Opt.LowMemory then
+  begin
+    WriteLn('[--low-memory ignored: incompatible with --gpu]');
+    Opt.LowMemory := false;
+  end;
+  {$ENDIF}
+
   // Model: generic architecture dispatch, inference-only, optional int8.
   // Weight precision. FP32 is the default (faster, more RAM); int8 is the
   // opt-in for less RAM at the cost of speed (per-layer dequantization).
@@ -1023,12 +1038,6 @@ begin
   // forward path off (the GPU kernel needs the cache), so --gpu effectively
   // overrides --low-memory on those layers. Incompatible with --int8 (the
   // int8 path never builds the interleaved cache the kernel consumes).
-  GpuCL := nil;
-  if Opt.Gpu and Opt.Int8 then
-  begin
-    WriteLn('[--gpu ignored: incompatible with --int8 - running int8 on CPU]');
-    Opt.Gpu := false;
-  end;
   if Opt.Gpu then
   begin
     GpuCL := TEasyOpenCL.Create();
