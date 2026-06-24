@@ -579,6 +579,10 @@ begin
   begin
     CompileProgramFromFile('neural.cl');
   end
+  else if FileExists('neural-api/neural/neural.cl') then
+  begin
+    CompileProgramFromFile('neural-api/neural/neural.cl');
+  end
   else
   begin
     MessageProc('File neural.cl could not be found.');
