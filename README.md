@@ -6,11 +6,13 @@
 
 CAI NEURAL API is a Pascal deep-learning library optimized for the AVX, AVX2 and AVX512 instruction sets and for OpenCL devices from AMD, Intel and NVIDIA. Tested on Windows and Linux.
 
-
-## Intro Videos
-[![Watch the video](https://img.youtube.com/vi/aIy1S7clhQo/0.jpg)](https://youtu.be/aIy1S7clhQo) | [![Watch the video](https://img.youtube.com/vi/q56NcgUiAAk/0.jpg)](https://youtu.be/q56NcgUiAAk) | [![Watch the video](https://img.youtube.com/vi/PdNTgI_qSyo/0.jpg)](https://youtu.be/PdNTgI_qSyo)
---------------------------- | ------------------------------------- | -------------------------
-Basics of Neural Networks in Pascal - Loading and Saving | Neural Networks for Absolute Beginners! Learning a Simple Function | Coding a Neural Network in Pascal that Learns to Calculate the Hypotenuse
+## Highlights
+* 🗣️ **Run real LLMs, natively** — import a HuggingFace Qwen2/Qwen2.5 instruct checkpoint and chat from your terminal with [`ChatTerminal`](examples/ChatTerminal). No Python, no CUDA.
+* 🎵 **Text-to-music** — turn a text prompt into audio with [`MusicGenText`](examples/MusicGenText) (T5 encoder + MusicGen decoder).
+* 🔊 **More audio** — separate a song into stems with [`MusicSourceSeparation`](examples/MusicSourceSeparation), or talk to an audio-aware model with [`Qwen2AudioChat`](examples/Qwen2AudioChat).
+* 🧠 **Modern architectures, built in** — GPT-style transformers, Mixture-of-Experts, RWKV, xLSTM, spiking neurons and normalizing flows, all as native Pascal layers.
+* ⚡ **Fast everywhere** — AVX/AVX2/AVX512 CPU paths plus OpenCL offload for AMD, Intel and NVIDIA GPUs.
+* 📦 **Single-binary deploy** — compile to one self-contained native executable. No runtime, no dependency tree.
 
 ## Why Pascal?
 * The Pascal computer language is easy to learn. Pascal allows developers to make a readable and understandable source code.
@@ -47,6 +49,11 @@ The documentation covers:
 * [Normalization Cheat Sheet](docs/normalization.md)
 * [Layer Authoring Guide](docs/layer-authoring.md) — checklist for adding a new layer plus mini-guides on reading numerical-gradient failures and picking a tolerance
 * [Other scientific publications from the same author](#publications-from-the-author)
+
+## Intro Videos
+[![Watch the video](https://img.youtube.com/vi/aIy1S7clhQo/0.jpg)](https://youtu.be/aIy1S7clhQo) | [![Watch the video](https://img.youtube.com/vi/q56NcgUiAAk/0.jpg)](https://youtu.be/q56NcgUiAAk) | [![Watch the video](https://img.youtube.com/vi/PdNTgI_qSyo/0.jpg)](https://youtu.be/PdNTgI_qSyo)
+--------------------------- | ------------------------------------- | -------------------------
+Basics of Neural Networks in Pascal - Loading and Saving | Neural Networks for Absolute Beginners! Learning a Simple Function | Coding a Neural Network in Pascal that Learns to Calculate the Hypotenuse
 
 ### Easy Examples First Please!
 [![Watch the video](https://img.youtube.com/vi/PdNTgI_qSyo/0.jpg)](https://youtu.be/PdNTgI_qSyo)
