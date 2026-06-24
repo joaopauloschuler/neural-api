@@ -522,6 +522,9 @@ unit neuralpretrained;
 interface
 
 uses
+  {$IFDEF OpenCL}
+  cl,  // cl_platform_id / cl_device_id for TMusicGenModel.EnableOpenCL
+  {$ENDIF}
   Classes, SysUtils, Math, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralhftokenizer, neuralmxfp4, pascoremath32;
@@ -4863,6 +4866,16 @@ type
     FEncToDecW: TNNetVolume;               // hidden*textDModel row-major
     FEncToDecB: TNNetVolume;               // hidden
     FDecSeqLen, FEncSeqLen: integer;
+    {$IFDEF OpenCL}
+    // OpenCL offload state. When FGpuEnabled the prefill decoder (FDecoder) is
+    // already offloaded; the platform/device ids are retained so the lazily
+    // built width-1 step twins can be offloaded too as soon as they are created
+    // (EnsureStepDecoder[Uncond]) - the per-token decode loop runs on the twins,
+    // so without that the cached fast path would stay on the CPU.
+    FGpuEnabled: boolean;
+    FGpuPlatform: cl_platform_id;
+    FGpuDevice: cl_device_id;
+    {$ENDIF}
     // Builds FStepDecoder (the width-1 twin) on first use and copies weights
     // from FDecoder. No-op once built. Coded by Claude (AI).
     procedure EnsureStepDecoder;
@@ -4877,6 +4890,16 @@ type
     property Decoder: TNNet read FDecoder;
     property DecSeqLen: integer read FDecSeqLen;
     property EncSeqLen: integer read FEncSeqLen;
+    {$IFDEF OpenCL}
+    // Offloads the decoder conv/linear matmuls to the given OpenCL device. Must
+    // be called AFTER the model is built (FDecoder assigned). Offloads the
+    // prefill decoder immediately and arms the lazily built width-1 step twins
+    // (FStepDecoder / FStepDecoderUncond) so the KV-cache decode loop - which
+    // runs on those twins, not FDecoder - is offloaded too. The EnCodec audio
+    // codec is a separate hand-rolled conv path (not a TNNet) and stays on CPU.
+    // Coded by Claude (AI).
+    procedure EnableOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
+    {$ENDIF}
     // Projects raw T5 encoder hidden states (EncSeqLen x TextDModel) through
     // enc_to_dec_proj into Dst (EncSeqLen,1,Hidden).
     procedure ProjectEncoderStates(EncStates, Dst: TNNetVolume);
@@ -27411,6 +27434,9 @@ begin
   FDecoder := nil;
   FStepDecoder := nil;
   FStepDecoderUncond := nil;
+  {$IFDEF OpenCL}
+  FGpuEnabled := false;
+  {$ENDIF}
 end;
 
 destructor TMusicGenModel.Destroy;
@@ -27445,6 +27471,11 @@ begin
   // Layer-by-layer weight copy: the two nets have identical layer topology
   // (only the input SizeX differs), so every neuron weight transfers exactly.
   FStepDecoder.CopyWeights(FDecoder);
+  {$IFDEF OpenCL}
+  // The per-token cached decode loop runs on this twin, so it must be offloaded
+  // too when the model was GPU-enabled before the twin existed.
+  if FGpuEnabled then FStepDecoder.EnableOpenCL(FGpuPlatform, FGpuDevice);
+  {$ENDIF}
 end;
 
 procedure TMusicGenModel.EnsureStepDecoderUncond;
@@ -27460,7 +27491,29 @@ begin
   FStepDecoderUncond := BuildMusicGenDecoderNet(FConfig, FEncSeqLen, 1,
     {pTrainable=}false, StepBlocks, StepHeads, StepFinalLN);
   FStepDecoderUncond.CopyWeights(FDecoder);
+  {$IFDEF OpenCL}
+  if FGpuEnabled then FStepDecoderUncond.EnableOpenCL(FGpuPlatform, FGpuDevice);
+  {$ENDIF}
 end;
+
+{$IFDEF OpenCL}
+procedure TMusicGenModel.EnableOpenCL(platform_id: cl_platform_id;
+  device_id: cl_device_id);
+begin
+  FGpuPlatform := platform_id;
+  FGpuDevice := device_id;
+  FGpuEnabled := true;
+  // Offload the prefill / non-cached decoder now. The width-1 step twins are
+  // built lazily by GenerateEx; EnsureStepDecoder[Uncond] reads FGpuEnabled and
+  // offloads them on creation. If a twin already exists (model reused across
+  // calls), offload it here too so this stays idempotent.
+  if Assigned(FDecoder) then FDecoder.EnableOpenCL(platform_id, device_id);
+  if Assigned(FStepDecoder) then
+    FStepDecoder.EnableOpenCL(platform_id, device_id);
+  if Assigned(FStepDecoderUncond) then
+    FStepDecoderUncond.EnableOpenCL(platform_id, device_id);
+end;
+{$ENDIF}
 
 procedure TMusicGenModel.ProjectEncoderStates(EncStates, Dst: TNNetVolume);
 var

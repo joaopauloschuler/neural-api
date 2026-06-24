@@ -2928,14 +2928,19 @@ type
     FdAttnBuf: array of TNeuralFloat;
     FdScoreBuf: array of TNeuralFloat;
     {$IFDEF OpenCL}
-    // Phase-1 OpenCL offload of the Q.K^T score matmul (prefill path only).
-    // The scores run on the device; masking, softmax and the value sum stay on
-    // the CPU. FKInterBuf holds K interleaved for the cai_dot_product kernel
-    // (As[a + i*SeqLen]); FQRowBuf holds Q packed row-major (Bs[b*d_k + i]); the
-    // result lands directly in FAttn's [query*SeqLen+key] layout. The inherited
-    // FDotCL is the shared kernel handle. Coded by Claude (AI).
+    // OpenCL offload of BOTH attention matmuls (prefill path only); masking and
+    // softmax stay on the CPU. All three reuse the single cai_dot_product kernel
+    // (the inherited FDotCL):
+    //  - scores Q.K^T: FKInterBuf = K interleaved (kernel A: As[a + i*SeqLen]),
+    //    FQRowBuf = Q row-major (kernel B: Bs[b*d_k + i]); the result lands in
+    //    FAttn's [query*SeqLen+key] layout.
+    //  - value sum P.V: FVRowBuf = V packed token-contiguous (kernel A:
+    //    As[d + key*d_k]), FAttn (now the softmax weights) is the kernel B
+    //    DIRECTLY; the result lands in FOutput's [query*d_k+d] layout.
+    // Coded by Claude (AI).
     FQRowBuf: TNNetVolume;
     FKInterBuf: TNNetVolume;
+    FVRowBuf: TNNetVolume;
     procedure ComputeOpenCL();
     {$ENDIF}
     // True when score (query i, key j) is masked out (causal / sliding-window /
@@ -24194,6 +24199,7 @@ begin
   // FDotCL is freed by the inherited TNNetLayer.Destroy; free only our buffers.
   if Assigned(FQRowBuf) then FQRowBuf.Free;
   if Assigned(FKInterBuf) then FKInterBuf.Free;
+  if Assigned(FVRowBuf) then FVRowBuf.Free;
   {$ENDIF}
   inherited Destroy();
 end;
@@ -24668,13 +24674,13 @@ begin
   end;
   if not Assigned(FQRowBuf) then FQRowBuf := TNNetVolume.Create();
   if not Assigned(FKInterBuf) then FKInterBuf := TNNetVolume.Create();
+  if not Assigned(FVRowBuf) then FVRowBuf := TNNetVolume.Create();
   FShouldOpenCL := true;
 end;
 
-// Phase-1 forward: Q.K^T on the device, everything else on the CPU. Mirrors the
-// CPU Compute() math exactly (shared ScoreIsMasked, same scale/soft-cap/softmax
-// and value sum); only the raw scores come from the kernel instead of per-pair
-// AVX dot products. Coded by Claude (AI).
+// Forward: BOTH matmuls (Q.K^T and P.V) on the device, masking + softmax on the
+// CPU in between. Mirrors the CPU Compute() math exactly (shared ScoreIsMasked,
+// same scale/soft-cap/softmax and all-masked-row zero policy). Coded by Claude (AI).
 procedure TNNetScaledDotProductAttention.ComputeOpenCL();
 const
   cMaskFloor = -1e8; // matches Compute(): row max <= this => fully masked
@@ -24684,8 +24690,7 @@ var
   SeqLenM1, DkM1: integer;
   Score, MaxScore, SumExp: TNeuralFloat;
   Prev, Seg: TNNetVolume;
-  OutPtr: TNeuralFloatArrPtr;
-  SegI, QBase, KBase: integer;
+  SegI, QBase, KBase, VBase: integer;
   HasSeg: boolean;
 begin
   StartTime := Now();
@@ -24698,30 +24703,36 @@ begin
   SegI := 0;
   if HasSeg then Seg := FSegLayer.FOutput;
 
-  // 1) Pack Q row-major (the kernel's B operand: Bs[b*d_k + i]) and K
-  //    interleaved (the A operand: As[a + i*FNumAs], FNumAs = SeqLen), then run
-  //    every Q_i . K_j on the device. The kernel writes Result[query*SeqLen +
-  //    key] = Q_query . K_key, which is exactly FAttn's raw [j,i] layout, so the
-  //    readback lands the RAW (unscaled, unmasked) scores straight into FAttn.
+  // 1) Unpack the depth-packed Q|K|V into the kernel's operand layouts.
+  //    Q row-major (scores' B: Bs[b*d_k + i]); K interleaved (scores' A:
+  //    As[a + i*SeqLen]); V token-contiguous (value sum's A: As[d + key*d_k]).
   FQRowBuf.ReSize(SeqLen * FDk, 1, 1);
   FKInterBuf.ReSize(SeqLen * FDk, 1, 1);
+  FVRowBuf.ReSize(SeqLen * FDk, 1, 1);
   for i := 0 to SeqLenM1 do
   begin
     QBase := i * (3 * FDk);       // Q_i packed at depth [0, FDk)
     KBase := QBase + FDk;         // K_i packed at depth [FDk, 2*FDk)
+    VBase := QBase + 2 * FDk;     // V_i packed at depth [2*FDk, 3*FDk)
     for d := 0 to DkM1 do
     begin
       FQRowBuf.FData[i * FDk + d] := Prev.FData[QBase + d];
       FKInterBuf.FData[i + d * SeqLen] := Prev.FData[KBase + d];
+      FVRowBuf.FData[i * FDk + d] := Prev.FData[VBase + d];
     end;
   end;
+
+  // 2) Scores Q_i . K_j on the device. The kernel writes Result[query*SeqLen +
+  //    key] = Q_query . K_key, which is exactly FAttn's raw [j,i] layout, so the
+  //    readback lands the RAW (unscaled, unmasked) scores straight into FAttn.
   FDotCL.PrepareForCompute(FKInterBuf, FQRowBuf, FDk);
   FDotCL.Compute(FKInterBuf, FQRowBuf, {ActFN}0, {NewVAs}true, {NewVBs}true);
   FDotCL.FinishAndLoadResult(FAttn, 0);
 
-  // 2) Per query row: scale + soft-cap the unmasked scores (mask the rest),
-  //    numerically-stable softmax (with the all-masked-row zero policy), then
-  //    Output[i] = sum_j Attn[i,j] * V[j]. Identical to the CPU forward.
+  // 3) Per query row: scale + soft-cap the unmasked scores (mask the rest),
+  //    numerically-stable softmax (with the all-masked-row zero policy). FAttn
+  //    now holds the softmax weights P[query, key]. (No value sum here - that is
+  //    the second device matmul below.)
   for i := 0 to SeqLenM1 do
   begin
     if HasSeg then SegI := Round(Seg[i, 0, 0]);
@@ -24741,6 +24752,8 @@ begin
     end;
     if MaxScore <= cMaskFloor then
     begin
+      // Fully-masked query: zero weights => zero output row (the P.V matmul
+      // below then yields 0 for this row, matching the CPU policy).
       for j := 0 to SeqLenM1 do
         FAttn[j, i, 0] := 0;
     end
@@ -24757,13 +24770,16 @@ begin
         for j := 0 to SeqLenM1 do
           FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
     end;
-    OutPtr := FOutput.GetRawPtr(i, 0, 0);
-    for d := 0 to DkM1 do
-      OutPtr^[d] := 0;
-    for j := 0 to SeqLenM1 do
-      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
-        FAttn[j, i, 0], FDk);
   end;
+
+  // 4) Value sum O[i,d] = sum_key P[i,key] * V[key,d] on the device. Mapping
+  //    A = V (a = depth d, FNumAs = d_k), B = FAttn (b = query, FNumBs = SeqLen),
+  //    contraction = SeqLen: Result[b*FNumAs + a] = O[query, d] = FOutput's
+  //    native [query*d_k + d] layout, and FAttn is passed as B unchanged.
+  FDotCL.PrepareForCompute(FVRowBuf, FAttn, SeqLen);
+  FDotCL.Compute(FVRowBuf, FAttn, {ActFN}0, {NewVAs}true, {NewVBs}true);
+  FDotCL.FinishAndLoadResult(FOutput, 0);
+
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 {$ENDIF}
