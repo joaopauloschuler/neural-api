@@ -2927,6 +2927,23 @@ type
     // decode path can change the effective sequence length on the same instance.
     FdAttnBuf: array of TNeuralFloat;
     FdScoreBuf: array of TNeuralFloat;
+    {$IFDEF OpenCL}
+    // Phase-1 OpenCL offload of the Q.K^T score matmul (prefill path only).
+    // The scores run on the device; masking, softmax and the value sum stay on
+    // the CPU. FKInterBuf holds K interleaved for the cai_dot_product kernel
+    // (As[a + i*SeqLen]); FQRowBuf holds Q packed row-major (Bs[b*d_k + i]); the
+    // result lands directly in FAttn's [query*SeqLen+key] layout. The inherited
+    // FDotCL is the shared kernel handle. Coded by Claude (AI).
+    FQRowBuf: TNNetVolume;
+    FKInterBuf: TNNetVolume;
+    procedure ComputeOpenCL();
+    {$ENDIF}
+    // True when score (query i, key j) is masked out (causal / sliding-window /
+    // bidirectional-window / segment / prefix-LM). Extracted so the CPU and
+    // OpenCL forwards share one mask definition and cannot drift.
+    // Coded by Claude (AI).
+    function ScoreIsMasked(i, j: integer; HasSeg: boolean; Seg: TNNetVolume;
+      SegI: integer): boolean;
     // Quantize Src[0..d_k-1] into the int8 cache row Slot (Codes/Scale arrays).
     procedure QuantizeCacheRow(Src: TNeuralFloatArrPtr;
       var Codes: array of ShortInt; var Scale: array of TNeuralFloat;
@@ -3004,6 +3021,12 @@ type
     function SaveStructureToString(): string; override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
+    {$IFDEF OpenCL}
+    // Allocates the shared dot-product kernel handle (inherited FDotCL) and the
+    // Q/K packing buffers, then flags this layer to offload the prefill score
+    // matmul. Coded by Claude (AI).
+    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    {$ENDIF}
     // Enable the KV-cache incremental-decode path. Preallocates the K and V
     // caches for at most MaxContext positions and starts an empty sequence.
     procedure BeginIncrementalDecode(MaxContext: integer);
@@ -24167,6 +24190,11 @@ begin
   FAttn.Free;
   SetLength(FdAttnBuf, 0);
   SetLength(FdScoreBuf, 0);
+  {$IFDEF OpenCL}
+  // FDotCL is freed by the inherited TNNetLayer.Destroy; free only our buffers.
+  if Assigned(FQRowBuf) then FQRowBuf.Free;
+  if Assigned(FKInterBuf) then FKInterBuf.Free;
+  {$ENDIF}
   inherited Destroy();
 end;
 
@@ -24611,8 +24639,140 @@ begin
   end;
 end;
 
+function TNNetScaledDotProductAttention.ScoreIsMasked(i, j: integer;
+  HasSeg: boolean; Seg: TNNetVolume; SegI: integer): boolean;
+begin
+  // A key j is attendable for query i only when EVERY active mask permits it,
+  // so it is masked when any of these holds: strict-future causal (j>i) unless
+  // both sit in the prefix-LM bidirectional block; outside the sliding window
+  // (past, and future too when bidirectional); a different segment/document id
+  // (equality mode) or a later scale block (block-causal mode).
+  Result :=
+    (FCausal and (j > i) and
+       not ((FPrefixLen > 0) and (i < FPrefixLen) and (j < FPrefixLen))) or
+    ((FWindow > 0) and ((i - j >= FWindow) or
+     (FBidirectionalWindow and (j - i >= FWindow)))) or
+    (HasSeg and (not FBlockCausalSeg) and (Round(Seg[j, 0, 0]) <> SegI)) or
+    (HasSeg and FBlockCausalSeg and (Round(Seg[j, 0, 0]) > SegI));
+end;
+
+{$IFDEF OpenCL}
+procedure TNNetScaledDotProductAttention.EnableOpenCL(
+  DotProductKernel: TDotProductKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL, FDotProductKernel
+  if not Assigned(FDotCL) then
+  begin
+    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL.HideMessages();
+  end;
+  if not Assigned(FQRowBuf) then FQRowBuf := TNNetVolume.Create();
+  if not Assigned(FKInterBuf) then FKInterBuf := TNNetVolume.Create();
+  FShouldOpenCL := true;
+end;
+
+// Phase-1 forward: Q.K^T on the device, everything else on the CPU. Mirrors the
+// CPU Compute() math exactly (shared ScoreIsMasked, same scale/soft-cap/softmax
+// and value sum); only the raw scores come from the kernel instead of per-pair
+// AVX dot products. Coded by Claude (AI).
+procedure TNNetScaledDotProductAttention.ComputeOpenCL();
+const
+  cMaskFloor = -1e8; // matches Compute(): row max <= this => fully masked
+var
+  StartTime: double;
+  SeqLen, i, j, d: integer;
+  SeqLenM1, DkM1: integer;
+  Score, MaxScore, SumExp: TNeuralFloat;
+  Prev, Seg: TNNetVolume;
+  OutPtr: TNeuralFloatArrPtr;
+  SegI, QBase, KBase: integer;
+  HasSeg: boolean;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  SeqLenM1 := SeqLen - 1;
+  DkM1 := FDk - 1;
+  HasSeg := Assigned(FSegLayer);
+  Seg := nil;
+  SegI := 0;
+  if HasSeg then Seg := FSegLayer.FOutput;
+
+  // 1) Pack Q row-major (the kernel's B operand: Bs[b*d_k + i]) and K
+  //    interleaved (the A operand: As[a + i*FNumAs], FNumAs = SeqLen), then run
+  //    every Q_i . K_j on the device. The kernel writes Result[query*SeqLen +
+  //    key] = Q_query . K_key, which is exactly FAttn's raw [j,i] layout, so the
+  //    readback lands the RAW (unscaled, unmasked) scores straight into FAttn.
+  FQRowBuf.ReSize(SeqLen * FDk, 1, 1);
+  FKInterBuf.ReSize(SeqLen * FDk, 1, 1);
+  for i := 0 to SeqLenM1 do
+  begin
+    QBase := i * (3 * FDk);       // Q_i packed at depth [0, FDk)
+    KBase := QBase + FDk;         // K_i packed at depth [FDk, 2*FDk)
+    for d := 0 to DkM1 do
+    begin
+      FQRowBuf.FData[i * FDk + d] := Prev.FData[QBase + d];
+      FKInterBuf.FData[i + d * SeqLen] := Prev.FData[KBase + d];
+    end;
+  end;
+  FDotCL.PrepareForCompute(FKInterBuf, FQRowBuf, FDk);
+  FDotCL.Compute(FKInterBuf, FQRowBuf, {ActFN}0, {NewVAs}true, {NewVBs}true);
+  FDotCL.FinishAndLoadResult(FAttn, 0);
+
+  // 2) Per query row: scale + soft-cap the unmasked scores (mask the rest),
+  //    numerically-stable softmax (with the all-masked-row zero policy), then
+  //    Output[i] = sum_j Attn[i,j] * V[j]. Identical to the CPU forward.
+  for i := 0 to SeqLenM1 do
+  begin
+    if HasSeg then SegI := Round(Seg[i, 0, 0]);
+    MaxScore := -1e30;
+    for j := 0 to SeqLenM1 do
+    begin
+      if ScoreIsMasked(i, j, HasSeg, Seg, SegI) then
+        FAttn[j, i, 0] := -1e9
+      else
+      begin
+        Score := FAttn[j, i, 0] * FInvSqrtDk;
+        if FScoreSoftCap > 0 then
+          Score := FScoreSoftCap * pcr_tanhf(Score * FInvScoreSoftCap);
+        FAttn[j, i, 0] := Score;
+      end;
+      if FAttn[j, i, 0] > MaxScore then MaxScore := FAttn[j, i, 0];
+    end;
+    if MaxScore <= cMaskFloor then
+    begin
+      for j := 0 to SeqLenM1 do
+        FAttn[j, i, 0] := 0;
+    end
+    else
+    begin
+      SumExp := 0;
+      for j := 0 to SeqLenM1 do
+      begin
+        Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
+        FAttn[j, i, 0] := Score;
+        SumExp := SumExp + Score;
+      end;
+      if SumExp > 0 then
+        for j := 0 to SeqLenM1 do
+          FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
+    end;
+    OutPtr := FOutput.GetRawPtr(i, 0, 0);
+    for d := 0 to DkM1 do
+      OutPtr^[d] := 0;
+    for j := 0 to SeqLenM1 do
+      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
+        FAttn[j, i, 0], FDk);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+{$ENDIF}
+
 procedure TNNetScaledDotProductAttention.Compute();
 const
+  // Minimum prefill sequence length to offload the score matmul to OpenCL;
+  // below this the kernel launch + Q/K upload cost outweighs the matmul.
+  csSDPAOpenCLMinSeqLen = 32;
   // Floor used to detect a fully-masked query row. The additive mask sentinel
   // is -1e9; real scaled dot products of normal activations are O(1), so any
   // row whose maximum score is <= -1e8 can only have come from every key being
@@ -24633,6 +24793,17 @@ begin
     ComputeIncremental();
     exit;
   end;
+  {$IFDEF OpenCL}
+  // Prefill score matmul on the device when OpenCL is enabled and the sequence
+  // is long enough to amortize the per-forward upload/dispatch (short prompts
+  // and the width-1 cached decode path stay on the CPU).
+  if FHasOpenCL and FShouldOpenCL and
+     (FPrevLayer.FOutput.SizeX >= csSDPAOpenCLMinSeqLen) then
+  begin
+    ComputeOpenCL();
+    exit;
+  end;
+  {$ENDIF}
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
@@ -24652,12 +24823,7 @@ begin
     MaxScore := -1e30;
     for j := 0 to SeqLenM1 do
     begin
-      if (FCausal and (j > i) and
-            not ((FPrefixLen > 0) and (i < FPrefixLen) and (j < FPrefixLen))) or
-         ((FWindow > 0) and ((i - j >= FWindow) or
-          (FBidirectionalWindow and (j - i >= FWindow)))) or
-         (HasSeg and (not FBlockCausalSeg) and (Round(Seg[j, 0, 0]) <> SegI)) or
-         (HasSeg and FBlockCausalSeg and (Round(Seg[j, 0, 0]) > SegI)) then
+      if ScoreIsMasked(i, j, HasSeg, Seg, SegI) then
       begin
         // Masked: strict future (causal) - EXCEPT when both query and key are in
         // the prefix-LM bidirectional block ([0..FPrefixLen-1] attend to each
