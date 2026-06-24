@@ -33337,11 +33337,17 @@ type
   end;
 
 procedure TEnCodecConvWorker.RunForward(index, threadnum: integer);
-var oStart, oFin, o, t, i, k2, src: integer; Acc: TNeuralFloat;
+var tStart, tFin, o, t, i, k2, src: integer; Acc: TNeuralFloat;
 begin
-  TNeuralThreadList.CalculateWorkingRange(index, threadnum, OutCh, oStart, oFin);
-  for o := oStart to oFin do
-    for t := 0 to OutLen - 1 do
+  // Split the OUTPUT-TIME axis across threads. Every output position (o,t) is
+  // independent, so this is race-free and bit-identical to the serial conv - and
+  // unlike splitting over output channels it stays fully parallel for the
+  // high-resolution, LOW-channel decode stages where a SEANet decoder spends the
+  // bulk of its time (the final conv_out has OutCh=1 over ~1M samples; splitting
+  // its single output channel would have left it serial).
+  TNeuralThreadList.CalculateWorkingRange(index, threadnum, OutLen, tStart, tFin);
+  for o := 0 to OutCh - 1 do
+    for t := tStart to tFin do
     begin
       Acc := B[o];
       for i := 0 to InCh - 1 do
@@ -33455,14 +33461,13 @@ begin
     OutLenM1 := OutLen - 1;
     SetLength(OutSig, OutCh);
     for o := 0 to OutChM1 do SetLength(OutSig[o], OutLen);
-    // The output-channel loop is embarrassingly parallel: each channel reads the
-    // shared (read-only) padded input + weights and writes its OWN OutSig[o], so
-    // splitting the channels across worker threads is race-free and BIT-IDENTICAL
-    // to the serial scalar conv (each element still accumulates the same way, in
-    // a register, with one write - the cache-efficient pattern). Only parallelize
-    // when the work is big enough to outweigh thread dispatch (the upsampled
-    // decode stages); tiny convs run inline.
-    if (OutCh >= 4) and (OutLen >= 512) then
+    // The forward conv is parallelized over the OUTPUT-TIME axis (see RunForward):
+    // every output position is independent, so this is race-free and
+    // BIT-IDENTICAL to the serial scalar conv (each element accumulates the same
+    // way, in a register, with one write). Keying off the output LENGTH (not the
+    // channel count) keeps the heavy high-resolution decode stages parallel even
+    // when they have few channels. Tiny convs run inline.
+    if OutLen >= 512 then
     begin
       CreateNeuralThreadListIfRequired();
       ConvWorker := TEnCodecConvWorker.Create;
