@@ -98443,7 +98443,7 @@ begin
   LastLayerIdx := GetLastLayerIdx();
   for LayerCnt := 0 to LastLayerIdx do
   begin
-    FLayers[LayerCnt].SetTrainable(pTrainable);
+    FLayers[LayerCnt].SetTrainable(pTrainable, pLowMemory);
   end;
 end;
 
