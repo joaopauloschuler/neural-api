@@ -61,8 +61,17 @@ Coded by Claude (AI).
 //   MusicGenText --download --prompt "..." --topk 0    # force greedy (drone!)
 //   MusicGenText --frames 6 --no-cache            # explicit pico frame count
 //   MusicGenText --summary                        # print weights-per-layer tables
+//   MusicGenText --download --prompt "..." --no-gpu      # force CPU
+//   MusicGenText --download --prompt "..." --gpu-device 1 # pick OpenCL device
 // Repo overrides: --musicgen-repo / --t5-repo / --encodec-repo. Gated repos:
 // set HF_TOKEN in the environment.
+//
+// GPU OFFLOAD (OpenCL): when built with -dOpenCL (the default .lpi config) the
+// T5 text encoder and the MusicGen decoder offload their conv/linear matmuls to
+// the GPU by default; --no-gpu forces CPU and --gpu-platform N / --gpu-device N
+// select the OpenCL device. The decode loop's hot path runs on the MusicGen
+// width-1 step twins, which are offloaded too (TMusicGenModel.EnableOpenCL).
+// The EnCodec codec is a hand-rolled conv path (not a TNNet) and stays on CPU.
 //
 // DECODE DEFAULTS (--download mode): MusicGen is trained for top-k SAMPLING, so
 // --download defaults to MusicGen's top_k=250 / temperature 1.0 and classifier-
@@ -78,6 +87,8 @@ Coded by Claude (AI).
 {$mode objfpc}{$H+}
 
 uses
+  {$IFDEF UNIX}cthreads, cmem,{$ENDIF}
+  {$IFDEF OpenCL}neuralopencl,{$ENDIF}
   SysUtils, Math, StrUtils,
   neuralvolume, neuralnetwork, neuralsafetensors, neuralpretrained,
   neuralaudio, neuralhftokenizer, neuralhfhub;
@@ -113,6 +124,11 @@ var
   UseCache, RealMode, ShowSummary: boolean;
   Sampler: TNNetSamplerBase;
   TickStart: QWord;   // captured before each timed model load / pipeline step
+  Gpu: boolean;                  // OpenCL offload requested (T5 enc + MusicGen dec)
+  GpuPlatform, GpuDevice: integer;
+  {$IFDEF OpenCL}
+  GpuCL: TEasyOpenCL;            // platform/device handle for OpenCL offload (nil = CPU)
+  {$ENDIF}
 
   // Milliseconds elapsed since TickStart, formatted as a human-readable string
   // (e.g. "1234 ms" or "12.34 s"). GetTickCount64 is a monotonic ms clock.
@@ -182,6 +198,11 @@ begin
   Seconds := ParseFloatArg('--seconds', DefaultSeconds);
   UseCache := not HasFlag('--no-cache');
   ShowSummary := HasFlag('--summary');
+  // OpenCL offload: ON by default when built with -dOpenCL (--no-gpu forces
+  // CPU); a non-OpenCL build ignores the --gpu* flags entirely.
+  Gpu := {$IFDEF OpenCL}not HasFlag('--no-gpu'){$ELSE}false{$ENDIF};
+  GpuPlatform := ParseIntArg('--gpu-platform', 0);
+  GpuDevice := ParseIntArg('--gpu-device', 0);
   Tok := nil;
 
   if RealMode then
@@ -248,11 +269,52 @@ begin
   end;
 
   T5Enc := nil; T5Dec := nil; Model := nil; Codec := nil; Sampler := nil;
+  {$IFDEF OpenCL}GpuCL := nil;{$ENDIF}
   Tokens := TNNetVolume.Create;
   EncStates := TNNetVolume.Create;
   NullStates := TNNetVolume.Create;
   Wave := TNNetVolume.Create;
   try
+    // ---- OpenCL device selection -------------------------------------------
+    // Resolve the OpenCL platform/device ONCE; the same handle drives both the
+    // T5 encoder and the MusicGen decoder (each TNNet gets its own dot-product
+    // kernel from it). Any failure falls back to CPU with a message. The pico
+    // demo's tiny layers fall below the per-layer ShouldOpenCL size threshold,
+    // so GPU mainly matters with --download (real checkpoints). EnCodec is a
+    // hand-rolled conv codec (not a TNNet) and always synthesizes on CPU.
+    {$IFDEF OpenCL}
+    if Gpu then
+    begin
+      GpuCL := TEasyOpenCL.Create();
+      if GpuCL.GetPlatformCount() = 0 then
+      begin
+        WriteLn('[--gpu: no OpenCL platform found - falling back to CPU]');
+        FreeAndNil(GpuCL);
+      end
+      else
+      begin
+        if (GpuPlatform < 0) or (GpuPlatform >= GpuCL.GetPlatformCount()) then
+          GpuPlatform := 0;
+        GpuCL.SetCurrentPlatform(GpuCL.PlatformIds[GpuPlatform]);
+        if GpuCL.GetDeviceCount() = 0 then
+        begin
+          WriteLn('[--gpu: no OpenCL device on platform ',
+            GpuCL.PlatformNames[GpuPlatform], ' - falling back to CPU]');
+          FreeAndNil(GpuCL);
+        end
+        else
+        begin
+          if (GpuDevice < 0) or (GpuDevice >= GpuCL.GetDeviceCount()) then
+            GpuDevice := 0;
+          GpuCL.SetCurrentDevice(GpuCL.Devices[GpuDevice]);
+          WriteLn('[--gpu: OpenCL on ', GpuCL.PlatformNames[GpuPlatform],
+            ' / ', GpuCL.DeviceNames[GpuDevice],
+            ' - T5 encoder + MusicGen decoder; EnCodec stays on CPU]');
+        end;
+      end;
+    end;
+    {$ENDIF}
+
     // ---- 0. Build the prompt token ids. ------------------------------------
     if RealMode then
     begin
@@ -302,6 +364,10 @@ begin
     BuildT5FromSafeTensors(T5Safe, T5Enc, T5Dec, T5Cfg, EncSeq, 1,
       {pTrainable=}false, T5CfgPath);
     WriteLn('[time] T5 model load (', T5Safe, '): ', Elapsed(TickStart));
+    {$IFDEF OpenCL}
+    if Assigned(GpuCL) then
+      T5Enc.EnableOpenCL(GpuCL.PlatformIds[GpuPlatform], GpuCL.Devices[GpuDevice]);
+    {$ENDIF}
     WriteLn('T5 text encoder: ', T5ConfigToString(T5Cfg));
     if ShowSummary then
     begin
@@ -345,6 +411,12 @@ begin
     Model := BuildMusicGenFromSafeTensors(MgSafe, Config, EncSeq, DecSeq,
       {pTrainable=}false, MgCfg);
     WriteLn('[time] MusicGen decoder load (', MgSafe, '): ', Elapsed(TickStart));
+    {$IFDEF OpenCL}
+    // Offloads the prefill decoder and arms the lazily built width-1 step twins
+    // that the KV-cache decode loop actually runs on.
+    if Assigned(GpuCL) then
+      Model.EnableOpenCL(GpuCL.PlatformIds[GpuPlatform], GpuCL.Devices[GpuDevice]);
+    {$ENDIF}
     WriteLn(MusicGenConfigToString(Config));
     if ShowSummary then
     begin
@@ -475,5 +547,7 @@ begin
     EncStates.Free;
     NullStates.Free;
     Wave.Free;
+    // After the nets (their dot-product kernels reference this handle's device).
+    {$IFDEF OpenCL}GpuCL.Free;{$ENDIF}
   end;
 end.
