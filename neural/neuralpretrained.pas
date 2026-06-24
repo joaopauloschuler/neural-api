@@ -567,8 +567,8 @@ function CreatePretrainedTensorReader(
 // volume of token ids (as floats) and outputs (SeqLen,1,vocab) logits, one
 // row per input position. pSeqLen = 0 uses the full n_ctx context;
 // pNumHeads = 0 applies the n_embd/64 rule (see ReadGPT2Config).
-// pInferenceOnly = True frees every layer's Delta/BackInertia training
-// volumes DURING construction (TNNet.SetInferenceOnly after each block),
+// pTrainable = False frees every layer's Delta/BackInertia training
+// volumes DURING construction (TNNet.SetTrainable after each block),
 // cutting peak and resident memory to ~1/3 - the returned net can only
 // Compute(), never train. The full 124M GPT-2 then fits in well under 2 GB.
 // pExactGelu = True swaps the MLP's gelu_new (the tanh approximation, the
@@ -585,7 +585,7 @@ function CreatePretrainedTensorReader(
 // see TestInt8QuantizedGPT2LogitDrift.
 function BuildGPT2FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pNumHeads: integer = 0;
-  pInferenceOnly: boolean = false; pExactGelu: boolean = false;
+  pTrainable: boolean = true; pExactGelu: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
 // Same, also returning the inferred config.
@@ -597,7 +597,7 @@ function BuildGPT2FromSafeTensors(const FileName: string;
 // section and SelectTokenLogits). num_labels comes from score.weight.
 function BuildGPT2FromSafeTensorsEx(const FileName: string;
   out Config: TGPT2Config; pSeqLen: integer = 0;
-  pNumHeads: integer = 0; pInferenceOnly: boolean = false;
+  pNumHeads: integer = 0; pTrainable: boolean = true;
   pSeqClsHead: boolean = false; pExactGelu: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
@@ -968,7 +968,7 @@ function LlamaConfigToString(const Config: TLlamaConfig): string;
 // every weight from the safetensors checkpoint at FileName (see the unit
 // header for the exact mapping). The net takes a (SeqLen,1,1) volume of
 // token ids (as floats) and outputs (SeqLen,1,vocab) logits. pSeqLen = 0
-// uses the full max_position_embeddings context. pInferenceOnly = True
+// uses the full max_position_embeddings context. pTrainable = False
 // frees training volumes during construction (Compute()-only afterwards).
 // Config.Prefix is detected from the checkpoint and written back.
 // pQuantizeInt8 = True stores every projection/MLP/LM-head weight matrix in
@@ -984,18 +984,18 @@ function LlamaConfigToString(const Config: TLlamaConfig): string;
 // the behaviour by passing pQuantizeInt8 through.
 function BuildLlamaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildLlamaFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = '';
   pQuantizeInt8: boolean = false): TNNet;
 
 function BuildLlamaFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // GGUF IMPORT (llama.cpp checkpoints): builds the SAME Llama net as
@@ -1028,15 +1028,15 @@ function BuildLlamaFromSafeTensors(const FileName: string;
 // load (TNNetGGUFReader.RegisterRowDeinterleave).
 // Tensor dtypes F32/F16/Q8_0 are decoded (Q8_0 dequantizes to FP32 at
 // load); other ggml quantizations are rejected with a clear error.
-// pInferenceOnly/pQuantizeInt8 behave exactly as in
+// pTrainable/pQuantizeInt8 behave exactly as in
 // BuildLlamaFromSafeTensorsWithConfig (pQuantizeInt8 re-quantizes the
 // dequantized weights into the int8 weight-only storage).
 function BuildLlamaFromGGUFEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildLlamaFromGGUF(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // ---- GENERIC GGUF IMPORT (architecture dispatch) -----------------------
@@ -1065,14 +1065,14 @@ function BuildLlamaFromGGUF(const FileName: string;
 //   - qwen3 / gemma3 / phi3 / MoE / Mamba / RWKV / BERT / enc-dec etc.:
 //     either need q/k-norm, fused slabs, per-layer theta, or a different
 //     backbone; import those through their dedicated safetensors builders.
-// pSeqLen / pInferenceOnly / pQuantizeInt8 behave as in BuildLlamaFromGGUFEx.
+// pSeqLen / pTrainable / pQuantizeInt8 behave as in BuildLlamaFromGGUFEx.
 // Coded by Claude (AI).
 function BuildFromGGUFEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildFromGGUF(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // ---- GGUF EXPORT (writer) ----------------------------------------------
@@ -1169,11 +1169,11 @@ procedure SaveLlamaToSafeTensors(Net: TNNet; const Config: TLlamaConfig;
 // Llama path that ASSERT the config's model_type is 'mistral'.
 function BuildMistralFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildMistralFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // Qwen2: the Llama skeleton + biases on the q/k/v projections (o_proj and
@@ -1181,11 +1181,11 @@ function BuildMistralFromSafeTensors(const FileName: string;
 // the config's model_type is 'qwen2'.
 function BuildQwen2FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildQwen2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // Qwen3: the Llama skeleton WITHOUT q/k/v biases, with per-head RMSNorm on
@@ -1195,11 +1195,11 @@ function BuildQwen2FromSafeTensors(const FileName: string;
 // config's model_type is 'qwen3'.
 function BuildQwen3FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildQwen3FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // HF-names safetensors exporter - the exact inverse of
@@ -1230,11 +1230,11 @@ procedure SaveQwen3ToSafeTensors(Net: TNNet; const Config: TLlamaConfig;
 // the Llama path that ASSERT the config's model_type is 'qwen3_moe'.
 function BuildQwen3MoeFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildQwen3MoeFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // Llama-4 text decoder (model_type "llama4" / "llama4_text",
@@ -1263,11 +1263,11 @@ function ReadLlama4ConfigFromJSONFile(const FileName: string): TLlamaConfig;
 
 function BuildLlama4FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildLlama4FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // OLMo-2 (model_type "olmo2", e.g. allenai/OLMo-2-0425-1B - the fully-open
@@ -1289,11 +1289,11 @@ function BuildLlama4FromSafeTensors(const FileName: string;
 // over the Llama path that ASSERT the config's model_type is 'olmo2'.
 function BuildOlmo2FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildOlmo2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // OLMoE (model_type "olmoe", e.g. allenai/OLMoE-1B-0924 - the fully-open
@@ -1315,11 +1315,11 @@ function BuildOlmo2FromSafeTensors(const FileName: string;
 // config's model_type is 'olmoe'.
 function BuildOlmoeFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildOlmoeFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // Gemma 1: the Llama skeleton with three load-time deltas (no new layers):
@@ -1335,11 +1335,11 @@ function BuildOlmoeFromSafeTensors(const FileName: string;
 // Thin wrappers over the Llama path that ASSERT model_type is 'gemma'.
 function BuildGemmaFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGemmaFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // Gemma 2: the Gemma-1 skeleton (GeGLU MLP, zero-centered RMSNorm,
@@ -1362,11 +1362,11 @@ function BuildGemmaFromSafeTensors(const FileName: string;
 // Thin wrappers over the Llama path that ASSERT model_type is 'gemma2'.
 function BuildGemma2FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGemma2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // Gemma 3 TEXT-ONLY (model_type "gemma3_text", architectures
@@ -1391,11 +1391,11 @@ function BuildGemma2FromSafeTensors(const FileName: string;
 // that ASSERT model_type is 'gemma3_text'.
 function BuildGemma3FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGemma3FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // Phi-3 / Phi-4-mini (model_type "phi3": microsoft/Phi-3-mini-4k-instruct,
@@ -1422,11 +1422,11 @@ function BuildGemma3FromSafeTensors(const FileName: string;
 // ASSERT model_type is 'phi3'.
 function BuildPhi3FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildPhi3FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // BitNet b1.58 (model_type "bitnet", microsoft/bitnet-b1.58-2B-4T - the
@@ -1452,11 +1452,11 @@ function BuildPhi3FromSafeTensors(const FileName: string;
 // path that ASSERT model_type is 'bitnet'.
 function BuildBitNetFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildBitNetFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // InternLM2 / InternLM2.5 (model_type "internlm2", e.g.
@@ -1484,11 +1484,11 @@ function BuildBitNetFromSafeTensors(const FileName: string;
 //     model_type is 'internlm2'.
 function BuildInternLM2FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildInternLM2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // GLM-4 (model_type "glm4", e.g. THUDM/GLM-4-9B-0414 / zai-org/GLM-4 text
@@ -1512,11 +1512,11 @@ function BuildInternLM2FromSafeTensors(const FileName: string;
 //     ASSERT the config's model_type is 'glm4'.
 function BuildGLM4FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGLM4FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // Imports a HF Mixtral checkpoint (model_type "mixtral", e.g.
@@ -1530,11 +1530,11 @@ function BuildGLM4FromSafeTensors(const FileName: string;
 // Llama path (TLlamaConfig.IsMoE).
 function BuildMixtralFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildMixtralFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // Builds an IBM Granite 3.x decoder (HF GraniteForCausalLM, model_type
@@ -1562,11 +1562,11 @@ function BuildMixtralFromSafeTensors(const FileName: string;
 // SUMMED with the routed output before the FFN residual close.
 function BuildGraniteFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGraniteFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // MiniCPM (openbmb/MiniCPM-1.2B / 2B-sft/dpo, model_type "minicpm"): the Llama
@@ -1575,11 +1575,11 @@ function BuildGraniteFromSafeTensors(const FileName: string;
 // existing Granite-style multiplier slots at load (no new layer types).
 function BuildMiniCPMFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildMiniCPMFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 type
@@ -1643,16 +1643,16 @@ function GptOssConfigToString(const Config: TGptOssConfig): string;
 // shard set - the real 20B/120B checkpoints are sharded - or pytorch_model.bin
 // via CreatePretrainedTensorReader). ConfigFileName overrides the config.json
 // location (defaults to a sibling of FileName). pSeqLen caps the context (0 =
-// max_position_embeddings). pInferenceOnly / pQuantizeInt8 mirror the other
+// max_position_embeddings). pTrainable / pQuantizeInt8 mirror the other
 // importers. gpt-oss-120b imports with the SAME path but is RAM-gated like the
-// other large checkpoints - use pInferenceOnly and a sharded checkpoint.
+// other large checkpoints - use pTrainable=false and a sharded checkpoint.
 function BuildGptOssFromSafeTensorsEx(const FileName: string;
   out Config: TGptOssConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGptOssFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 type
@@ -1687,22 +1687,22 @@ function GPTNeoConfigToString(const Config: TGPTNeoConfig): string;
 // loads every weight from the safetensors checkpoint at FileName (see the
 // GPT-NEO IMPORT section of the unit header). The net takes a (SeqLen,1,1)
 // volume of token ids and outputs (SeqLen,1,vocab) logits. pSeqLen = 0 uses
-// the full max_position_embeddings context. pInferenceOnly = True frees
+// the full max_position_embeddings context. pTrainable = False frees
 // training volumes during construction (Compute()-only afterwards).
 // Config.Prefix is detected from the checkpoint and written back.
 function BuildGPTNeoFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGPTNeoConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildGPTNeoFromSafeTensorsEx(const FileName: string;
   out Config: TGPTNeoConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGPTNeoFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 type
@@ -1742,22 +1742,22 @@ function GPTNeoXConfigToString(const Config: TGPTNeoXConfig): string;
 // loads every weight from the safetensors checkpoint at FileName (see the
 // GPT-NEOX IMPORT section of the unit header). The net takes a (SeqLen,1,1)
 // volume of token ids and outputs (SeqLen,1,vocab) logits. pSeqLen = 0 uses
-// the full max_position_embeddings context. pInferenceOnly = True frees
+// the full max_position_embeddings context. pTrainable = False frees
 // training volumes during construction (Compute()-only afterwards).
 // Config.Prefix is detected from the checkpoint and written back.
 function BuildGPTNeoXFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGPTNeoXConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildGPTNeoXFromSafeTensorsEx(const FileName: string;
   out Config: TGPTNeoXConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGPTNeoXFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 type
@@ -1817,17 +1817,17 @@ function OPTConfigToString(const Config: TOPTConfig): string;
 // Config.Prefix is detected from the checkpoint and written back.
 function BuildOPTFromSafeTensorsWithConfig(const FileName: string;
   var Config: TOPTConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildOPTFromSafeTensorsEx(const FileName: string;
   out Config: TOPTConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildOPTFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 type
@@ -1874,17 +1874,17 @@ function StarCoder2ConfigToString(const Config: TStarCoder2Config): string;
 // max_position_embeddings context. Config.Prefix is detected and written back.
 function BuildStarCoder2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TStarCoder2Config; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildStarCoder2FromSafeTensorsEx(const FileName: string;
   out Config: TStarCoder2Config; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildStarCoder2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 type
@@ -1929,17 +1929,17 @@ function GptBigCodeConfigToString(const Config: TGptBigCodeConfig): string;
 // n_positions context. Config.Prefix is detected and written back.
 function BuildGptBigCodeFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGptBigCodeConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildGptBigCodeFromSafeTensorsEx(const FileName: string;
   out Config: TGptBigCodeConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGptBigCodeFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 type
@@ -1974,22 +1974,22 @@ function GPTJConfigToString(const Config: TGPTJConfig): string;
 // loads every weight from the safetensors checkpoint at FileName (see the
 // GPT-J IMPORT section of the unit header). The net takes a (SeqLen,1,1)
 // volume of token ids and outputs (SeqLen,1,vocab) logits. pSeqLen = 0 uses
-// the full n_positions context. pInferenceOnly = True frees training
+// the full n_positions context. pTrainable = False frees training
 // volumes during construction (Compute()-only afterwards).
 // Config.Prefix is detected from the checkpoint and written back.
 function BuildGPTJFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGPTJConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildGPTJFromSafeTensorsEx(const FileName: string;
   out Config: TGPTJConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGPTJFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 type
@@ -2033,21 +2033,21 @@ function CohereConfigToString(const Config: TCohereConfig): string;
 // ('cohere2') decoder and loads every weight from FileName. The net takes a
 // (SeqLen,1,1) volume of token ids and outputs (SeqLen,1,vocab) logits
 // already scaled by logit_scale (folded into the tied LM head). See the
-// COHERE IMPORT section for the architecture mapping. pSeqLen/pInferenceOnly/
+// COHERE IMPORT section for the architecture mapping. pSeqLen/pTrainable/
 // pQuantizeInt8 behave as on the Llama path.
 function BuildCohereFromSafeTensorsWithConfig(const FileName: string;
   var Config: TCohereConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildCohereFromSafeTensorsEx(const FileName: string;
   out Config: TCohereConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildCohereFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 type
@@ -2087,22 +2087,22 @@ function PhiConfigToString(const Config: TPhiConfig): string;
 // loads every weight from the safetensors checkpoint at FileName (see the
 // PHI IMPORT section of the unit header). The net takes a (SeqLen,1,1)
 // volume of token ids and outputs (SeqLen,1,vocab) logits. pSeqLen = 0 uses
-// the full max_position_embeddings context. pInferenceOnly = True frees
+// the full max_position_embeddings context. pTrainable = False frees
 // training volumes during construction (Compute()-only afterwards).
 // Config.Prefix is detected from the checkpoint and written back.
 function BuildPhiFromSafeTensorsWithConfig(const FileName: string;
   var Config: TPhiConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildPhiFromSafeTensorsEx(const FileName: string;
   out Config: TPhiConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildPhiFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 type
@@ -2163,7 +2163,7 @@ function BertConfigToString(const Config: TBertConfig): string;
 // applied per token): the output stays (SeqLen,1,hidden_size) and ROW 0
 // (the [CLS] position) equals HF's pooler_output; the other rows are
 // tanh(dense(h_i)) and carry no HF meaning. pSeqLen = 0 uses the full
-// max_position_embeddings context. pInferenceOnly = True frees training
+// max_position_embeddings context. pTrainable = False frees training
 // volumes during construction (Compute()-only afterwards).
 // Config.Prefix is detected from the checkpoint and written back.
 // Config.Family = bfDistilBert keeps the same math and input/output shapes
@@ -2196,7 +2196,7 @@ function BertConfigToString(const Config: TBertConfig): string;
 // tail (see ColBERTEmbedTokens).
 function BuildBertFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBertConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pIncludePooler: boolean = false;
+  pTrainable: boolean = true; pIncludePooler: boolean = false;
   pSeqClsHead: boolean = false; pQuantizeInt8: boolean = false;
   pPaddingMask: boolean = false): TNNet;
 
@@ -2204,11 +2204,11 @@ function BuildBertFromSafeTensorsWithConfig(const FileName: string;
 // directory of FileName) and returning it in Config.
 function BuildBertFromSafeTensorsEx(const FileName: string;
   out Config: TBertConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pIncludePooler: boolean = false;
+  pTrainable: boolean = true; pIncludePooler: boolean = false;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildBertFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pIncludePooler: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
 // Re-emits a wired BERT-family encoder (built by BuildBertFromSafeTensors) as
@@ -2306,13 +2306,13 @@ function Blip2QFormerConfigToString(
 // (resized at Compute). The net is owned by the caller.
 function BuildBlip2QFormerFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBlip2QFormerConfig; NumPatches: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" beside
 // FileName) and returning it in Config.
 function BuildBlip2QFormerFromSafeTensorsEx(const FileName: string;
   out Config: TBlip2QFormerConfig; NumPatches: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // Returns the SECOND TNNetInput of a Q-Former net (built above): the
@@ -2340,7 +2340,7 @@ function Blip2QFormerVisionInput(QFormerNet: TNNet): TNNetLayer;
 procedure BuildBlip2FromSafeTensors(const FileName: string;
   out QFormerNet, ProjectionNet: TNNet; out QueryTokens: TNNetVolume;
   out QFormerConfig: TBlip2QFormerConfig; NumPatches: integer = 0;
-  pInferenceOnly: boolean = false; const ConfigFileName: string = '');
+  pTrainable: boolean = true; const ConfigFileName: string = '');
 
 // Inverse of BuildGPTNeoXFromSafeTensors: walks the wired GPT-NeoX decoder
 // in importer build order, recovers each HF-named tensor with the EXACT
@@ -2490,12 +2490,12 @@ function RetrievalReport(QueryEmb, PassageEmb: array of TNNetVolume;
 // the projection head is no longer forced to stay f32.
 function BuildColBERTFromSafeTensorsEx(const FileName: string;
   out Config: TBertConfig; out ProjDim: integer; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pPaddingMask: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
 function BuildColBERTFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pPaddingMask: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
 // ColBERT marker-token convention: a query is [CLS][Q] tokens... [SEP] then
@@ -2652,12 +2652,12 @@ procedure SelectTokenLogits(NetOutput: TNNetVolume; TokenPos: integer;
 // id2label map (index-ordered; empty when the config has none).
 function BuildBertForSequenceClassificationFromSafeTensorsEx(
   const FileName: string; out Config: TBertConfig; Id2Label: TStringList;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildBertForSequenceClassificationFromSafeTensors(
   const FileName: string; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 // =================== CROSS-ENCODER RERANKER ==============================
 // The cross-encoder reranker (cross-encoder/ms-marco-MiniLM-L-6-v2,
@@ -2728,12 +2728,12 @@ function RerankReport(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
 function BuildGPT2ForSequenceClassificationFromSafeTensorsEx(
   const FileName: string; out Config: TGPT2Config; Id2Label: TStringList;
   pSeqLen: integer = 0; pNumHeads: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGPT2ForSequenceClassificationFromSafeTensors(
   const FileName: string; pSeqLen: integer = 0; pNumHeads: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 // =================== EXTRACTIVE QUESTION ANSWERING (SQuAD) ================
 // Fine-tuned *ForQuestionAnswering checkpoints (bert / distilbert / roberta
@@ -2752,11 +2752,11 @@ function BuildGPT2ForSequenceClassificationFromSafeTensors(
 // Config is returned; ConfigFileName '' = "config.json" next to FileName.
 function BuildBertForQuestionAnsweringFromSafeTensorsEx(const FileName: string;
   out Config: TBertConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildBertForQuestionAnsweringFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // AnswerSpan: runs "[CLS] question [SEP] context [SEP]" through a QA net and
@@ -2884,18 +2884,18 @@ function T5ConfigToString(const Config: TT5Config): string;
 // IMPORT section above for shapes and the two-input decoder convention).
 // EncSeqLen/DecSeqLen fix the two sequence lengths at build time (T5 has
 // no positional table, so any positive lengths are valid). Both nets are
-// owned by the caller. pInferenceOnly = True frees training volumes during
+// owned by the caller. pTrainable = False frees training volumes during
 // construction (Compute()-only afterwards).
 procedure BuildT5FromSafeTensorsWithConfig(const FileName: string;
   var Config: TT5Config; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 procedure BuildT5FromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TT5Config;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 
 // Returns the decoder net's SECOND TNNetInput - the (EncSeqLen,1,d_model)
@@ -2993,18 +2993,18 @@ function MarianConfigToString(const Config: TMarianConfig): string;
 // EncSeqLen/DecSeqLen fix the two sequence lengths at build time and must
 // not exceed max_position_embeddings (the static sinusoidal tables are
 // generated for exactly these lengths). Both nets are owned by the caller.
-// pInferenceOnly = True frees training volumes during construction
+// pTrainable = False frees training volumes during construction
 // (Compute()-only afterwards). Run the pair with RunT5.
 procedure BuildMarianFromSafeTensorsWithConfig(const FileName: string;
   var Config: TMarianConfig; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 procedure BuildMarianFromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TMarianConfig;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 
 // Exports a T5 ENCODER+DECODER pair (built by BuildT5FromSafeTensors) back to
@@ -3102,21 +3102,21 @@ function BartConfigToString(const Config: TBartConfig): string;
 // holds the encoder hidden states (T5EncoderStatesInput).
 procedure BuildBartFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 
 // Same, but takes the already-read Config by value (the ...Ex naming the
 // single-net importers use); kept for symmetry with the dispatch helpers.
 procedure BuildBartFromSafeTensorsEx(const FileName: string;
   Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 procedure BuildBartFromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TBartConfig;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 
 // ---------------------------------------------------------------------------
@@ -3188,21 +3188,21 @@ function PegasusConfigToString(const Config: TPegasusConfig): string;
 // holds the encoder hidden states (T5EncoderStatesInput).
 procedure BuildPegasusFromSafeTensorsWithConfig(const FileName: string;
   var Config: TPegasusConfig; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 
 // Same, but takes the already-read Config by value (the ...Ex naming the
 // single-net importers use); kept for symmetry with the dispatch helpers.
 procedure BuildPegasusFromSafeTensorsEx(const FileName: string;
   Config: TPegasusConfig; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 procedure BuildPegasusFromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TPegasusConfig;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 
 // ---------------------------------------------------------------------------
@@ -3257,20 +3257,20 @@ function ReadMBartConfigFromJSONFile(const FileName: string): TBartConfig;
 // hidden states (T5EncoderStatesInput).
 procedure BuildMBartFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 
 // Same, but takes the already-read Config by value (the ...Ex naming).
 procedure BuildMBartFromSafeTensorsEx(const FileName: string;
   Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 procedure BuildMBartFromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TBartConfig;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 
 // Exports a BART ENCODER+DECODER pair (built by BuildBartFromSafeTensors) back
@@ -3376,20 +3376,20 @@ function M2M100ConfigToString(const Config: TM2M100Config): string;
 // holds the encoder hidden states (T5EncoderStatesInput).
 procedure BuildM2M100FromSafeTensorsWithConfig(const FileName: string;
   var Config: TM2M100Config; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 
 // Same, but takes the already-read Config by value (the ...Ex naming).
 procedure BuildM2M100FromSafeTensorsEx(const FileName: string;
   Config: TM2M100Config; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 procedure BuildM2M100FromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TM2M100Config;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 
 // Exports an M2M100/NLLB ENCODER+DECODER pair (built by
@@ -3491,20 +3491,20 @@ function SeamlessM4Tv2AdaptedLength(const Config: TSeamlessM4Tv2Config;
 // caller. Run with RunT5 / DecodeSeq2SeqGreedy.
 procedure BuildSeamlessM4TFromSafeTensorsWithConfig(const FileName: string;
   var Config: TSeamlessM4Tv2Config; out EncoderNet, DecoderNet: TNNet;
-  SpeechFrames, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  SpeechFrames, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 
 // Same, but takes the already-read Config by value (the ...Ex naming).
 procedure BuildSeamlessM4TFromSafeTensorsEx(const FileName: string;
   Config: TSeamlessM4Tv2Config; out EncoderNet, DecoderNet: TNNet;
-  SpeechFrames, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  SpeechFrames, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 procedure BuildSeamlessM4TFromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TSeamlessM4Tv2Config;
-  SpeechFrames, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  SpeechFrames, DecSeqLen: integer; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 
 // ---------------------------------------------------------------------------
@@ -3600,18 +3600,18 @@ function WhisperConfigToString(const Config: TWhisperConfig): string;
 // at FileName (.safetensors, sharded index or pytorch_model.bin). The
 // encoder length is FIXED by the config (like HF, which rejects any other
 // mel length); only DecSeqLen is chosen at build time (1..
-// max_target_positions). Both nets are owned by the caller. pInferenceOnly
+// max_target_positions). Both nets are owned by the caller. pTrainable
 // = True frees training volumes during construction. Run the pair with
 // RunT5 (the generic two-net runner).
 procedure BuildWhisperFromSafeTensorsWithConfig(const FileName: string;
   var Config: TWhisperConfig; out EncoderNet, DecoderNet: TNNet;
-  DecSeqLen: integer; pInferenceOnly: boolean = false);
+  DecSeqLen: integer; pTrainable: boolean = true);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 procedure BuildWhisperFromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TWhisperConfig;
-  DecSeqLen: integer; pInferenceOnly: boolean = false;
+  DecSeqLen: integer; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 
 // -------------------- WHISPER WORD-LEVEL TIMESTAMPS -----------------------
@@ -3805,22 +3805,22 @@ function Wav2Vec2EncoderLength(const Config: TWav2Vec2Config;
 // out (EncLen = Wav2Vec2EncoderLength(Config, NumSamples)), and loads every
 // weight from the checkpoint at FileName (see the WAV2VEC2 / HUBERT CTC
 // IMPORT section). Config.Prefix and Config.IsHubert are detected from the
-// checkpoint / model_type. pInferenceOnly = True frees training volumes
+// checkpoint / model_type. pTrainable = False frees training volumes
 // during construction (Compute()-only afterwards). Decode the logits with
 // DecodeCTCGreedy (neuraldecode.pas) against the tokenizer's vocab.json.
 function BuildWav2Vec2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TWav2Vec2Config; NumSamples: integer;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildWav2Vec2FromSafeTensorsEx(const FileName: string;
   out Config: TWav2Vec2Config; NumSamples: integer;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 function BuildWav2Vec2FromSafeTensors(const FileName: string;
-  NumSamples: integer; pInferenceOnly: boolean = false): TNNet;
+  NumSamples: integer; pTrainable: boolean = true): TNNet;
 
 // ---------------------------------------------------------------------------
 // PYANNOTE SPEAKER-DIARIZATION IMPORT (model_type "pyannote", e.g.
@@ -3873,15 +3873,15 @@ function PyannoteFrameCount(const Config: TPyannoteConfig;
 // every weight from FileName. Coded by Claude (AI).
 function BuildPyannoteSegmentationFromSafeTensorsWithConfig(
   const FileName: string; var Config: TPyannoteConfig; NumSamples: integer;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 
 function BuildPyannoteSegmentationFromSafeTensorsEx(const FileName: string;
   out Config: TPyannoteConfig; NumSamples: integer;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 function BuildPyannoteSegmentationFromSafeTensors(const FileName: string;
-  NumSamples: integer; pInferenceOnly: boolean = false): TNNet;
+  NumSamples: integer; pTrainable: boolean = true): TNNet;
 
 // Decodes one frame of NumPowersetClasses powerset logits into a per-speaker
 // binary activity vector (length MaxSpeakers): argmax over the powerset classes
@@ -3959,23 +3959,23 @@ function MoonshineEncoderLength(NumSamples: integer): integer;
 // Builds the Moonshine ENCODER described by Config: a single TNNetInput
 // (NumSamples,1,1) raw waveform in, (EncLen,1,hidden) encoder hidden states
 // out (EncLen = MoonshineEncoderLength(NumSamples)), loading every encoder.*
-// weight from the checkpoint at FileName. pInferenceOnly frees training
+// weight from the checkpoint at FileName. pTrainable=False frees training
 // volumes during construction. Feed the hidden states to a seq2seq decoder
 // via T5EncoderStatesInput (the landed two-net convention) - that decoder is
 // a documented follow-up.
 function BuildMoonshineFromSafeTensorsWithConfig(const FileName: string;
   var Config: TMoonshineConfig; NumSamples: integer;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" beside
 // FileName) and returning it in Config.
 function BuildMoonshineFromSafeTensorsEx(const FileName: string;
   out Config: TMoonshineConfig; NumSamples: integer;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 function BuildMoonshineFromSafeTensors(const FileName: string;
-  NumSamples: integer; pInferenceOnly: boolean = false): TNNet;
+  NumSamples: integer; pTrainable: boolean = true): TNNet;
 
 // Builds the FULL Moonshine encoder-decoder pair: Enc is the waveform encoder
 // (identical to BuildMoonshineFromSafeTensorsWithConfig) and Dec is the
@@ -3992,13 +3992,13 @@ function BuildMoonshineFromSafeTensors(const FileName: string;
 procedure BuildMoonshineEncoderDecoderFromSafeTensorsWithConfig(
   const FileName: string; var Config: TMoonshineConfig;
   NumSamples, DecSeqLen: integer; out Enc, Dec: TNNet;
-  pInferenceOnly: boolean = false);
+  pTrainable: boolean = true);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" beside
 // FileName) and returning it in Config.
 procedure BuildMoonshineEncoderDecoderFromSafeTensors(const FileName: string;
   out Enc, Dec: TNNet; out Config: TMoonshineConfig;
-  NumSamples, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  NumSamples, DecSeqLen: integer; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 
 // ---------------------------------------------------------------------------
@@ -4968,17 +4968,17 @@ function MusicGenConfigToString(const Config: TMusicGenConfig): string;
 
 // Builds a TMusicGenModel (the decoder side) from Reader (caller owns Reader).
 // EncSeqLen/DecSeqLen fix the cross-attention and decoder sequence lengths.
-// pInferenceOnly frees training volumes during construction. Coded by Claude
+// pTrainable=False frees training volumes during construction. Coded by Claude
 // (AI).
 function BuildMusicGenFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
   const Config: TMusicGenConfig; EncSeqLen, DecSeqLen: integer;
-  pInferenceOnly: boolean = false): TMusicGenModel;
+  pTrainable: boolean = true): TMusicGenModel;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" beside
 // FileName) and returning it in Config.
 function BuildMusicGenFromSafeTensors(const FileName: string;
   out Config: TMusicGenConfig; EncSeqLen, DecSeqLen: integer;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TMusicGenModel;
 
 // ---------------------------------------------------------------------------
@@ -5051,21 +5051,21 @@ function RWKVConfigToString(const Config: TRWKVConfig): string;
 // Builds the RWKV-4 causal-LM net described by Config ((SeqLen,1,1) token
 // ids in, (SeqLen,1,vocab) logits out, like the decoder families) and loads
 // every weight from the checkpoint at FileName (see the RWKV-4 IMPORT
-// section above). pSeqLen <= 0 uses Config.ContextLength. pInferenceOnly =
-// True frees training volumes during construction (Compute()-only).
+// section above). pSeqLen <= 0 uses Config.ContextLength. pTrainable =
+// False frees training volumes during construction (Compute()-only).
 function BuildRWKVFromSafeTensorsWithConfig(const FileName: string;
   var Config: TRWKVConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildRWKVFromSafeTensorsEx(const FileName: string;
   out Config: TRWKVConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildRWKVFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 // Writes Net (a BuildRWKVFromSafeTensors causal-LM) back out under the HF
@@ -5148,20 +5148,20 @@ function MambaConfigToString(const Config: TMambaConfig): string;
 // ids in, (SeqLen,1,vocab) logits out, like the decoder families) and loads
 // every weight from the checkpoint at FileName (see the MAMBA IMPORT
 // section above). pSeqLen <= 0 uses 1024 (Mamba has no positional limit).
-// pInferenceOnly = True frees training volumes during construction.
+// pTrainable = False frees training volumes during construction.
 function BuildMambaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TMambaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildMambaFromSafeTensorsEx(const FileName: string;
   out Config: TMambaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildMambaFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 // Writes Net (a BuildMambaFromSafeTensors causal-LM) back out under the HF
@@ -5227,17 +5227,17 @@ function Mamba2ConfigToString(const Config: TMamba2Config): string;
 // pSeqLen <= 0 uses 1024 (Mamba has no positional limit).
 function BuildMamba2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TMamba2Config; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildMamba2FromSafeTensorsEx(const FileName: string;
   out Config: TMamba2Config; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildMamba2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 // ====================== RECURRENT GEMMA IMPORT ===========================
@@ -5305,17 +5305,17 @@ function RecurrentGemmaConfigToString(
 // checkpoint at FileName. pSeqLen <= 0 uses 2048.
 function BuildRecurrentGemmaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TRecurrentGemmaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildRecurrentGemmaFromSafeTensorsEx(const FileName: string;
   out Config: TRecurrentGemmaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildRecurrentGemmaFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 // ============================ JAMBA IMPORT ================================
@@ -5404,15 +5404,15 @@ function JambaLayerIsMoE(const Config: TJambaConfig;
 
 function BuildJambaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TJambaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildJambaFromSafeTensorsEx(const FileName: string;
   out Config: TJambaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildJambaFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 // ====================== NEMOTRON-H IMPORT (interface) =====================
@@ -5505,15 +5505,15 @@ function NemotronHConfigToString(const Config: TNemotronHConfig): string;
 
 function BuildNemotronHFromSafeTensorsWithConfig(const FileName: string;
   var Config: TNemotronHConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildNemotronHFromSafeTensorsEx(const FileName: string;
   out Config: TNemotronHConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildNemotronHFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 // ============================ BLOOM IMPORT =================================
@@ -5592,20 +5592,20 @@ function BloomConfigToString(const Config: TBloomConfig): string;
 // loads every weight from the checkpoint at FileName (see the BLOOM IMPORT
 // section above). pSeqLen <= 0 uses Config.SeqLength (2048 when the config
 // does not carry seq_length; ALiBi imposes no hard positional limit).
-// pInferenceOnly = True frees training volumes during construction.
+// pTrainable = False frees training volumes during construction.
 function BuildBloomFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBloomConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildBloomFromSafeTensorsEx(const FileName: string;
   out Config: TBloomConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildBloomFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 // Inverse of BuildBloomFromSafeTensors: walks the wired BLOOM decoder in
@@ -5681,22 +5681,22 @@ function FalconConfigToString(const Config: TFalconConfig): string;
 
 // Builds the Falcon causal-LM net described by Config and loads every weight
 // from the checkpoint at FileName (see the FALCON IMPORT section above).
-// pSeqLen <= 0 uses max_position_embeddings. pInferenceOnly = True frees
+// pSeqLen <= 0 uses max_position_embeddings. pTrainable = False frees
 // training volumes during construction. Config.Prefix is detected from the
 // checkpoint and written back.
 function BuildFalconFromSafeTensorsWithConfig(const FileName: string;
   var Config: TFalconConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildFalconFromSafeTensorsEx(const FileName: string;
   out Config: TFalconConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildFalconFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // ========================= MODERNBERT IMPORT ===============================
@@ -5790,20 +5790,20 @@ function ModernBertConfigToString(const Config: TModernBertConfig): string;
 // weight from the checkpoint at FileName (see the MODERNBERT IMPORT section
 // above). pSeqLen = 0 uses the full max_position_embeddings context (8192
 // on the released checkpoints - pass an explicit pSeqLen for CPU work).
-// pInferenceOnly = True frees training volumes during construction.
+// pTrainable = False frees training volumes during construction.
 function BuildModernBertFromSafeTensorsWithConfig(const FileName: string;
   var Config: TModernBertConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildModernBertFromSafeTensorsEx(const FileName: string;
   out Config: TModernBertConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildModernBertFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 // ---------------------------------------------------------------------------
@@ -5881,20 +5881,20 @@ function DebertaV2ConfigToString(const Config: TDebertaV2Config): string;
 // Builds the DeBERTa-v2/v3 ENCODER described by Config ((SeqLen,1,1) token ids
 // in, (SeqLen,1,hidden) final hidden states out) and loads every weight from
 // the checkpoint at FileName. pSeqLen = 0 uses the full
-// max_position_embeddings context. pInferenceOnly frees training volumes.
+// max_position_embeddings context. pTrainable=False frees training volumes.
 // pSeqClsHead = True appends the ContextPooler + classifier head (row 0 then
 // carries HF's sequence-classification logits).
 function BuildDebertaV2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TDebertaV2Config; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pSeqClsHead: boolean = false): TNNet;
+  pTrainable: boolean = true; pSeqClsHead: boolean = false): TNNet;
 
 function BuildDebertaV2FromSafeTensorsEx(const FileName: string;
   out Config: TDebertaV2Config; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; const ConfigFileName: string = '';
+  pTrainable: boolean = true; const ConfigFileName: string = '';
   pSeqClsHead: boolean = false): TNNet;
 
 function BuildDebertaV2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
@@ -6005,14 +6005,14 @@ function DeepSeekV2ConfigToString(const Config: TDeepSeekV2Config): string;
 // Config.Prefix is detected from the checkpoint (var parameter).
 function BuildDeepSeekV2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TDeepSeekV2Config; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 // Reads ConfigFileName (default: config.json next to FileName), then builds.
 function BuildDeepSeekV2FromSafeTensorsEx(const FileName: string;
   out Config: TDeepSeekV2Config; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 function BuildDeepSeekV2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
 // ---------------------------------------------------------------------------
@@ -6134,18 +6134,18 @@ function ClipConfigToString(const Config: TClipConfig): string;
 // pytorch_model.bin via CreatePretrainedTensorReader; see the CLIP IMPORT
 // section above for shapes). TextSeqLen <= 0 uses the full
 // text max_position_embeddings context. Both nets are owned by the caller.
-// pInferenceOnly = True frees training volumes during construction
+// pTrainable = False frees training volumes during construction
 // (Compute()-only afterwards). Config.LogitScale is updated from the
 // checkpoint's logit_scale tensor.
 procedure BuildClipFromSafeTensorsWithConfig(const FileName: string;
   var Config: TClipConfig; out TextNet, VisionNet: TNNet;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  TextSeqLen: integer = 0; pTrainable: boolean = true);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 procedure BuildClipFromSafeTensors(const FileName: string;
   out TextNet, VisionNet: TNNet; out Config: TClipConfig;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  TextSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 
 // Builds + loads the CLIP ViT VISION tower alone (the reusable half: a
@@ -6164,7 +6164,7 @@ function BuildClipVisionTower(Reader: TNNetSafeTensorsReader;
   const Tower: TClipTowerConfig; ImageSize, PatchSize, NumChannels,
   ProjectionDim: integer; const Prefix: string;
   const ProjectionTensorName: string = '';
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   pVisionFeatures: boolean = false): TNNet;
 
 // The text-pooling position of modeling_clip: EosTokenId = 2 (the legacy
@@ -6333,17 +6333,17 @@ function ClapConfigToString(const Config: TClapConfig): string;
 // (TextSeqLen,1,2) [token id | token-type id] volume and outputs the same.
 // Pool + L2-normalize BOTH with ClipExtractEmbedding(out, 0, emb).
 // TextSeqLen <= 0 uses the usable text context. Both nets are caller-owned.
-// pInferenceOnly frees training volumes during construction.
+// pTrainable=False frees training volumes during construction.
 // Config.LogitScale{A,T} are updated from the checkpoint scalars.
 procedure BuildClapFromSafeTensorsWithConfig(const FileName: string;
   var Config: TClapConfig; out AudioNet, TextNet: TNNet;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  TextSeqLen: integer = 0; pTrainable: boolean = true);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" beside
 // FileName) and returning it in Config.
 procedure BuildClapFromSafeTensors(const FileName: string;
   out AudioNet, TextNet: TNNet; out Config: TClapConfig;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  TextSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 
 // Applies the HF ClapAudioEncoder front affine to a raw (time, mel_bins)
@@ -6466,16 +6466,16 @@ function BlipConfigToString(const Config: TBlipConfig): string;
 // every weight from the checkpoint at FileName (.safetensors / sharded index /
 // pytorch_model.bin via CreatePretrainedTensorReader). DecSeqLen <= 0 uses the
 // full text max_position_embeddings context. Both nets are owned by the
-// caller. pInferenceOnly = True frees training volumes during construction.
+// caller. pTrainable = False frees training volumes during construction.
 procedure BuildBlipForCaptioningFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBlipConfig; out VisionNet, TextNet: TNNet;
-  DecSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  DecSeqLen: integer = 0; pTrainable: boolean = true);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 procedure BuildBlipForCaptioningFromSafeTensors(const FileName: string;
   out VisionNet, TextNet: TNNet; out Config: TBlipConfig;
-  DecSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  DecSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 
 // Runs ONE forward step of the BLIP caption decoder: computes the image patch
@@ -6578,18 +6578,18 @@ function TrOCRConfigToString(const Config: TTrOCRConfig): string;
 // two-net convention).
 procedure BuildTrOCRFromSafeTensorsWithConfig(const FileName: string;
   var Config: TTrOCRConfig; out EncoderNet, DecoderNet: TNNet;
-  DecSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  DecSeqLen: integer = 0; pTrainable: boolean = true);
 
 // Same, but takes the already-read Config by value (the ...Ex naming).
 procedure BuildTrOCRFromSafeTensorsEx(const FileName: string;
   Config: TTrOCRConfig; out EncoderNet, DecoderNet: TNNet;
-  DecSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  DecSeqLen: integer = 0; pTrainable: boolean = true);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 procedure BuildTrOCRFromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TTrOCRConfig;
-  DecSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  DecSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 
 // Runs ONE forward step of the TrOCR decoder: computes the image patch hidden
@@ -6644,16 +6644,16 @@ function OwlViTConfigToString(const Config: TOwlViTConfig): string;
 // Builds the OWL-ViT TEXT net (CLIP text tower) and the VISION+head detection
 // net described by Config and loads every weight from the checkpoint at
 // FileName. TextSeqLen <= 0 uses the full text max_position_embeddings context.
-// Both nets are owned by the caller. pInferenceOnly frees training volumes.
+// Both nets are owned by the caller. pTrainable=False frees training volumes.
 procedure BuildOwlViTFromSafeTensorsWithConfig(const FileName: string;
   var Config: TOwlViTConfig; out TextNet, VisionNet: TNNet;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  TextSeqLen: integer = 0; pTrainable: boolean = true);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" beside
 // FileName) and returning it in Config.
 procedure BuildOwlViTFromSafeTensors(const FileName: string;
   out TextNet, VisionNet: TNNet; out Config: TOwlViTConfig;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  TextSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 
 // Pools and L2-normalizes one OWL-ViT text-query embedding from a forward of
@@ -6731,20 +6731,20 @@ function SigLIPConfigToString(const Config: TSigLIPConfig): string;
 // Builds the SigLIP TEXT and VISION nets described by Config and loads every
 // weight from the checkpoint at FileName. TextSeqLen <= 0 uses the full
 // max_position_embeddings context. Both nets are owned by the caller.
-// pInferenceOnly frees training volumes during construction. The TEXT net
+// pTrainable=False frees training volumes during construction. The TEXT net
 // outputs (SeqLen,1,ProjectionDim): the per-token final_layer_norm + biased
 // head; the IMAGE embed is the VISION net's row-0 output (the MAP pooled
 // token), shape (1,1,vision hidden). Config.LogitScale / LogitBias are
 // updated from the checkpoint tensors.
 procedure BuildSigLIPFromSafeTensorsWithConfig(const FileName: string;
   var Config: TSigLIPConfig; out TextNet, VisionNet: TNNet;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  TextSeqLen: integer = 0; pTrainable: boolean = true);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" beside
 // FileName) and returning it in Config.
 procedure BuildSigLIPFromSafeTensors(const FileName: string;
   out TextNet, VisionNet: TNNet; out Config: TSigLIPConfig;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  TextSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 
 // Builds + loads the SigLIP ViT VISION tower alone (the reusable half, the
@@ -6759,7 +6759,7 @@ procedure BuildSigLIPFromSafeTensors(const FileName: string;
 // MAP-pooled (1,1,hidden) image embedding token at row 0.
 function BuildSigLIPVisionTower(Reader: TNNetSafeTensorsReader;
   const Tower: TClipTowerConfig; ImageSize, PatchSize, NumChannels: integer;
-  const Prefix: string; pInferenceOnly: boolean = false;
+  const Prefix: string; pTrainable: boolean = true;
   pVisionFeatures: boolean = false;
   SelectHiddenLayer: integer = 0): TNNet;
 
@@ -6880,7 +6880,7 @@ function LlavaConfigToString(const Config: TLlavaConfig): string;
 // owned by the caller. Coded by Claude (AI).
 function BuildLlavaProjector(Reader: TNNetSafeTensorsReader;
   NumPatches, VisionHidden, TextHidden: integer; GeluExact: boolean;
-  const Prefix: string; pInferenceOnly: boolean = false): TNNet;
+  const Prefix: string; pTrainable: boolean = true): TNNet;
 
 // Builds the three LLaVA nets from the checkpoint at FileName (.safetensors /
 // sharded index / .bin via CreatePretrainedTensorReader): VisionNet (the ViT
@@ -6888,16 +6888,16 @@ function BuildLlavaProjector(Reader: TNNetSafeTensorsReader;
 // (the stock Llama/Qwen2 decoder, its TNNetEmbedding fed externally by
 // LlavaRunLogits). All three are owned by the caller. pSeqLen <= 0 uses the
 // text max_position_embeddings; the prompt's assembled length must not exceed
-// it. pInferenceOnly frees training volumes during construction.
+// it. pTrainable=False frees training volumes during construction.
 procedure BuildLlavaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TLlavaConfig; out VisionNet, ProjectorNet, TextNet: TNNet;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  pSeqLen: integer = 0; pTrainable: boolean = true);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" beside
 // FileName) and returning it in Config.
 procedure BuildLlavaFromSafeTensors(const FileName: string;
   out VisionNet, ProjectorNet, TextNet: TNNet; out Config: TLlavaConfig;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 
 // Runs the vision tower + projector on Pixels (an (ImageSize,ImageSize,3)
@@ -6983,23 +6983,23 @@ function PaliGemmaConfigToString(const Config: TPaliGemmaConfig): string;
 // Coded by Claude (AI).
 function BuildPaliGemmaProjector(Reader: TNNetSafeTensorsReader;
   NumPatches, VisionHidden, TextHidden: integer;
-  const Prefix: string; pInferenceOnly: boolean = false): TNNet;
+  const Prefix: string; pTrainable: boolean = true): TNNet;
 
 // Builds the three PaliGemma nets from the checkpoint at FileName: VisionNet
 // (the SigLIP tower in feature mode WITH post_layernorm), ProjectorNet (the
 // single linear), and TextNet (the stock Gemma decoder, its TNNetEmbedding fed
 // externally by PaliGemmaRunLogits). All three owned by the caller. pSeqLen<=0
 // uses the text max_position_embeddings; the assembled prompt length must not
-// exceed it. pInferenceOnly frees training volumes during construction.
+// exceed it. pTrainable=False frees training volumes during construction.
 procedure BuildPaliGemmaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TPaliGemmaConfig; out VisionNet, ProjectorNet, TextNet: TNNet;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  pSeqLen: integer = 0; pTrainable: boolean = true);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" beside
 // FileName) and returning it in Config.
 procedure BuildPaliGemmaFromSafeTensors(const FileName: string;
   out VisionNet, ProjectorNet, TextNet: TNNet; out Config: TPaliGemmaConfig;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 
 // Full PaliGemma PREFIX-LM forward: projects the image, assembles the spliced
@@ -7074,7 +7074,7 @@ function Qwen2AudioConfigToString(const Config: TQwen2AudioConfig): string;
 // Both nets are owned by the caller. Coded by Claude (AI).
 procedure Qwen2AudioBuildTower(Reader: TNNetSafeTensorsReader;
   const Config: TQwen2AudioConfig; const Prefix: string;
-  out TowerNet, PoolNormNet: TNNet; pInferenceOnly: boolean = false);
+  out TowerNet, PoolNormNet: TNNet; pTrainable: boolean = true);
 
 // Builds the Qwen2-Audio PROJECTOR net: a single biased Linear
 // (multi_modal_projector.linear) mapping the (NumAudioTokens,1,d_model) audio
@@ -7083,25 +7083,25 @@ procedure Qwen2AudioBuildTower(Reader: TNNetSafeTensorsReader;
 // the caller. Coded by Claude (AI).
 function Qwen2AudioBuildProjector(Reader: TNNetSafeTensorsReader;
   NumAudioTokens, AudioHidden, TextHidden: integer;
-  const Prefix: string; pInferenceOnly: boolean = false): TNNet;
+  const Prefix: string; pTrainable: boolean = true): TNNet;
 
 // Builds the three Qwen2-Audio nets from the checkpoint at FileName: the audio
 // tower (TowerNet + PoolNormNet, see Qwen2AudioBuildTower), the ProjectorNet
 // (single linear), and TextNet (the stock Qwen2 decoder, its TNNetEmbedding
 // fed externally by Qwen2AudioRunLogits). All owned by the caller. pSeqLen<=0
 // uses the text max_position_embeddings; the assembled prompt length must not
-// exceed it. pInferenceOnly frees training volumes during construction.
+// exceed it. pTrainable=False frees training volumes during construction.
 procedure Qwen2AudioBuildFromSafeTensorsWithConfig(const FileName: string;
   var Config: TQwen2AudioConfig;
   out TowerNet, PoolNormNet, ProjectorNet, TextNet: TNNet;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  pSeqLen: integer = 0; pTrainable: boolean = true);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" beside
 // FileName) and returning it in Config.
 procedure BuildQwen2AudioFromSafeTensors(const FileName: string;
   out TowerNet, PoolNormNet, ProjectorNet, TextNet: TNNet;
   out Config: TQwen2AudioConfig;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 
 // Transposes a (num_mel_bins, mel_len) log-mel spectrogram Mel (mel bins along
@@ -7180,12 +7180,12 @@ function Qwen2VLConfigToString(const Config: TQwen2VLConfig): string;
 // caller. pSeqLen <= 0 uses max_position_embeddings. Coded by Claude (AI).
 function BuildQwen2VLFromSafeTensorsEx(const FileName: string;
   out Config: TQwen2VLConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 function BuildQwen2VLFromSafeTensors(const FileName: string;
   out Config: TQwen2VLConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // Builds the M-RoPE 3-D position indices for a SINGLE-image+text prompt, the
@@ -7253,9 +7253,9 @@ function RaftConfigToString(const Config: TRaftConfig): string;
 // TNNetConvGRUCell-driven update; use RaftPredictFlow to run it. The net is
 // owned by the caller. Coded by Claude (AI).
 function BuildRaftFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
-  const Config: TRaftConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TRaftConfig; pTrainable: boolean = true): TNNet;
 function BuildRaftFromSafeTensors(const FileName: string;
-  out Config: TRaftConfig; pInferenceOnly: boolean = false;
+  out Config: TRaftConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // Runs the RAFT iterative forward on two frames (each ImageH x ImageW x 3,
@@ -7322,11 +7322,11 @@ function ViTConfigToString(
 // Builds the ViT image-classification net described by Config and loads every
 // weight from Reader (the caller owns Reader). The net takes an
 // (ImageSize, ImageSize, NumChannels) normalized RGB volume and outputs
-// (1, 1, NumLabels) class logits (the CLS-row classifier). pInferenceOnly
+// (1, 1, NumLabels) class logits (the CLS-row classifier). pTrainable
 // frees training volumes during construction.
 function BuildViTForImageClassification(Reader: TNNetSafeTensorsReader;
   const Config: TViTImageClassificationConfig;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 
 // Builds + loads the ViT classifier from the checkpoint at FileName
 // (.safetensors / sharded index / pytorch_model.bin via CreatePretrained
@@ -7335,11 +7335,11 @@ function BuildViTForImageClassification(Reader: TNNetSafeTensorsReader;
 // is owned by the caller. Output: (1,1,num_labels) class logits.
 function BuildViTFromSafeTensorsEx(const FileName: string;
   const Config: TViTImageClassificationConfig;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 
 function BuildViTFromSafeTensors(const FileName: string;
   out Config: TViTImageClassificationConfig;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
@@ -7404,17 +7404,17 @@ function ResNetConfigToString(const Config: TResNetConfig): string;
 // net takes an (ImageSize, ImageSize, NumChannels) ImageNet-normalized RGB
 // volume and outputs (1, 1, NumLabels) class logits.
 function BuildResNet(Reader: TNNetSafeTensorsReader;
-  const Config: TResNetConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TResNetConfig; pTrainable: boolean = true): TNNet;
 
 // Builds + loads the ResNet classifier from the checkpoint at FileName
 // (.safetensors / sharded index / pytorch_model.bin). Config is supplied by
 // the caller (Ex) or read from ConfigFileName ('' = "config.json" beside
 // FileName) and returned. Net owned by caller. Output: (1,1,num_labels).
 function BuildResNetFromSafeTensorsEx(const FileName: string;
-  const Config: TResNetConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TResNetConfig; pTrainable: boolean = true): TNNet;
 
 function BuildResNetFromSafeTensors(const FileName: string;
-  out Config: TResNetConfig; pInferenceOnly: boolean = false;
+  out Config: TResNetConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
@@ -7462,13 +7462,13 @@ function ConvNeXtConfigToString(const Config: TConvNeXtConfig): string;
 // (caller owns Reader). Input (ImageSize, ImageSize, NumChannels) RGB volume;
 // output (1, 1, NumLabels) class logits.
 function BuildConvNeXt(Reader: TNNetSafeTensorsReader;
-  const Config: TConvNeXtConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TConvNeXtConfig; pTrainable: boolean = true): TNNet;
 
 function BuildConvNeXtFromSafeTensorsEx(const FileName: string;
-  const Config: TConvNeXtConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TConvNeXtConfig; pTrainable: boolean = true): TNNet;
 
 function BuildConvNeXtFromSafeTensors(const FileName: string;
-  out Config: TConvNeXtConfig; pInferenceOnly: boolean = false;
+  out Config: TConvNeXtConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
@@ -7541,13 +7541,13 @@ function SegformerConfigToString(const Config: TSegformerConfig): string;
 // output (ImageSize/4, ImageSize/4, NumLabels) per-pixel class logits (the caller
 // upsamples to full input resolution).
 function BuildSegformer(Reader: TNNetSafeTensorsReader;
-  const Config: TSegformerConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TSegformerConfig; pTrainable: boolean = true): TNNet;
 
 function BuildSegformerFromSafeTensorsEx(const FileName: string;
-  const Config: TSegformerConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TSegformerConfig; pTrainable: boolean = true): TNNet;
 
 function BuildSegformerFromSafeTensors(const FileName: string;
-  out Config: TSegformerConfig; pInferenceOnly: boolean = false;
+  out Config: TSegformerConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
@@ -7631,17 +7631,17 @@ function MobileNetV3ConfigToString(const Config: TMobileNetV3Config): string;
 // (ImageSize, ImageSize, NumChannels) ImageNet-normalized RGB volume and
 // outputs (1, 1, NumLabels) class logits.
 function BuildMobileNetV3(Reader: TNNetSafeTensorsReader;
-  const Config: TMobileNetV3Config; pInferenceOnly: boolean = false): TNNet;
+  const Config: TMobileNetV3Config; pTrainable: boolean = true): TNNet;
 
 // Builds + loads the MobileNetV3 classifier from the checkpoint at FileName
 // (.safetensors / sharded index / pytorch_model.bin). Config is supplied by the
 // caller (Ex) or read from ConfigFileName ('' = "config.json" beside FileName)
 // and returned. Net owned by caller. Output: (1,1,num_labels).
 function BuildMobileNetV3FromSafeTensorsEx(const FileName: string;
-  const Config: TMobileNetV3Config; pInferenceOnly: boolean = false): TNNet;
+  const Config: TMobileNetV3Config; pTrainable: boolean = true): TNNet;
 
 function BuildMobileNetV3FromSafeTensors(const FileName: string;
-  out Config: TMobileNetV3Config; pInferenceOnly: boolean = false;
+  out Config: TMobileNetV3Config; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
@@ -7705,17 +7705,17 @@ function EfficientNetConfigToString(const Config: TEfficientNetConfig): string;
 // takes an (ImageSize, ImageSize, NumChannels) ImageNet-normalized RGB volume
 // and outputs (1, 1, NumLabels) class logits.
 function BuildEfficientNet(Reader: TNNetSafeTensorsReader;
-  const Config: TEfficientNetConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TEfficientNetConfig; pTrainable: boolean = true): TNNet;
 
 // Builds + loads the EfficientNet classifier from the checkpoint at FileName
 // (.safetensors / sharded index / pytorch_model.bin). Config is supplied by the
 // caller (Ex) or read from ConfigFileName ('' = "config.json" beside FileName)
 // and returned. Net owned by caller. Output: (1,1,num_labels).
 function BuildEfficientNetFromSafeTensorsEx(const FileName: string;
-  const Config: TEfficientNetConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TEfficientNetConfig; pTrainable: boolean = true): TNNet;
 
 function BuildEfficientNetFromSafeTensors(const FileName: string;
-  out Config: TEfficientNetConfig; pInferenceOnly: boolean = false;
+  out Config: TEfficientNetConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
@@ -7788,18 +7788,18 @@ function InceptionV3ConfigToString(const Config: TInceptionV3Config): string;
 // index of the global-avg-pool (the FID pooled-feature backbone tap).
 function BuildInceptionV3(Reader: TNNetSafeTensorsReader;
   const Config: TInceptionV3Config; out PoolFeatureIdx: integer;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 
 // Builds + loads the Inception-v3 classifier from a checkpoint file. Config
 // supplied by the caller (Ex) or read from ConfigFileName ('' = "config.json"
 // beside FileName) and returned. Net owned by caller. Output: (1,1,num_labels).
 function BuildInceptionV3FromSafeTensorsEx(const FileName: string;
   const Config: TInceptionV3Config; out PoolFeatureIdx: integer;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 
 function BuildInceptionV3FromSafeTensors(const FileName: string;
   out Config: TInceptionV3Config; out PoolFeatureIdx: integer;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
@@ -7839,15 +7839,15 @@ function SwinConfigToString(const Config: TSwinConfig): string;
 // Reader (caller owns Reader). The net takes an (ImageSize, ImageSize,
 // NumChannels) normalized RGB volume and outputs (1, 1, NumLabels) logits.
 function BuildSwinFromSafeTensors(Reader: TNNetSafeTensorsReader;
-  const Config: TSwinConfig; pInferenceOnly: boolean = false): TNNet; overload;
+  const Config: TSwinConfig; pTrainable: boolean = true): TNNet; overload;
 
 // Builds + loads the Swin classifier from a checkpoint file. Config supplied by
 // the caller (Ex) or read from ConfigFileName ('' = "config.json" beside it).
 function BuildSwinFromSafeTensorsEx(const FileName: string;
-  const Config: TSwinConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TSwinConfig; pTrainable: boolean = true): TNNet;
 
 function BuildSwinFromSafeTensors(const FileName: string;
-  out Config: TSwinConfig; pInferenceOnly: boolean = false;
+  out Config: TSwinConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet; overload;
 
 // ---------------------------------------------------------------------------
@@ -7888,15 +7888,15 @@ function SAMConfigToString(const Config: TSAMConfig): string;
 // Mirrors BuildClipVisionTower as a reusable vision tower.
 function BuildSAMVisionTower(Reader: TNNetSafeTensorsReader;
   const Config: TSAMConfig; const Prefix: string = 'vision_encoder.';
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 
 // Builds + loads the SAM image encoder from a checkpoint file. Config supplied
 // by the caller (Ex) or read from ConfigFileName ('' = "config.json" beside it).
 function BuildSAMFromSafeTensorsEx(const FileName: string;
-  const Config: TSAMConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TSAMConfig; pTrainable: boolean = true): TNNet;
 
 function BuildSAMFromSafeTensors(const FileName: string;
-  out Config: TSAMConfig; pInferenceOnly: boolean = false;
+  out Config: TSAMConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet; overload;
 
 // ---------------------------------------------------------------------------
@@ -8056,15 +8056,15 @@ function VGGConfigToString(const Config: TVGGConfig): string;
 // slots are -1.
 function BuildVGG(Reader: TNNetSafeTensorsReader;
   const Config: TVGGConfig; out TapLayerIdx: array of integer;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 
 function BuildVGGFromSafeTensorsEx(const FileName: string;
   const Config: TVGGConfig; out TapLayerIdx: array of integer;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 
 function BuildVGGFromSafeTensors(const FileName: string;
   out Config: TVGGConfig; out TapLayerIdx: array of integer;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
@@ -8188,13 +8188,13 @@ function VaeDecoderConfigToString(const Config: TVaeDecoderConfig): string;
 // LatentChannels) latent volume and outputs a (LatentGrid*2^(num_block-1))^2
 // RGB image with OutChannels channels (raw, pre-clamp).
 function BuildVaeDecoder(Reader: TNNetSafeTensorsReader;
-  const Config: TVaeDecoderConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TVaeDecoderConfig; pTrainable: boolean = true): TNNet;
 
 function BuildVaeDecoderFromSafeTensorsEx(const FileName: string;
-  const Config: TVaeDecoderConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TVaeDecoderConfig; pTrainable: boolean = true): TNNet;
 
 function BuildVaeDecoderFromSafeTensors(const FileName: string;
-  out Config: TVaeDecoderConfig; pInferenceOnly: boolean = false;
+  out Config: TVaeDecoderConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
@@ -8238,13 +8238,13 @@ function ReadVaeEncoderConfigFromJSONFile(
 // image; output is the deterministic (LatentGrid, LatentGrid, LatentChannels)
 // latent = mean * scaling_factor. ImgGrid = LatentGrid * 2^(NumBlockOut-1).
 function BuildVaeEncoder(Reader: TNNetSafeTensorsReader;
-  const Config: TVaeDecoderConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TVaeDecoderConfig; pTrainable: boolean = true): TNNet;
 
 function BuildVaeEncoderFromSafeTensorsEx(const FileName: string;
-  const Config: TVaeDecoderConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TVaeDecoderConfig; pTrainable: boolean = true): TNNet;
 
 function BuildVaeEncoderFromSafeTensors(const FileName: string;
-  out Config: TVaeDecoderConfig; pInferenceOnly: boolean = false;
+  out Config: TVaeDecoderConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // ===========================================================================
@@ -8333,15 +8333,15 @@ function DiTConfigToString(const Config: TDiTConfig): string;
 // (LatentSize, LatentSize, InChannels) latent and input1 the (1,1,HiddenSize)
 // conditioning vector c; it outputs the (LatentSize, LatentSize, OutChannels)
 // raw prediction. Use DiTConditioning to fill input1 and DiTDenoise to run a
-// full step. pInferenceOnly frees training volumes during construction.
+// full step. pTrainable=False frees training volumes during construction.
 function BuildDiT(Reader: TNNetSafeTensorsReader; const Config: TDiTConfig;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 
 function BuildDiTFromSafeTensorsEx(const FileName: string;
-  const Config: TDiTConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TDiTConfig; pTrainable: boolean = true): TNNet;
 
 function BuildDiTFromSafeTensors(const FileName: string;
-  out Config: TDiTConfig; pInferenceOnly: boolean = false;
+  out Config: TDiTConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // Returns the DiT net's timestep input (the (1,1,1) scalar t input, the net's
@@ -8443,13 +8443,13 @@ function VARConfigToString(const Config: TVARConfig): string;
 // Output: per-token logits (SeqLen,1,VocabSize) - the next-scale-prediction
 // head. v1 reads ONE scale's logits for parity (VARScaleLogits).
 function BuildVAR(Reader: TNNetSafeTensorsReader; const Config: TVARConfig;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 
 function BuildVARFromSafeTensorsEx(const FileName: string;
-  const Config: TVARConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TVARConfig; pTrainable: boolean = true): TNNet;
 
 function BuildVARFromSafeTensors(const FileName: string;
-  out Config: TVARConfig; pInferenceOnly: boolean = false;
+  out Config: TVARConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // Fills input1 (the scale-id side channel) with the per-token pyramid level
@@ -8541,16 +8541,16 @@ function PixArtConfigToString(const Config: TPixArtConfig): string;
 
 // Builds the PixArt transformer described by Config and loads every weight from
 // Reader (caller owns Reader). THREE inputs (latent / scalar t / T5 states); it
-// outputs the (SampleSize,SampleSize,OutChannels) raw prediction. pInferenceOnly
+// outputs the (SampleSize,SampleSize,OutChannels) raw prediction. pTrainable
 // frees training volumes during construction.
 function BuildPixArt(Reader: TNNetSafeTensorsReader; const Config: TPixArtConfig;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 
 function BuildPixArtFromSafeTensorsEx(const FileName: string;
-  const Config: TPixArtConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TPixArtConfig; pTrainable: boolean = true): TNNet;
 
 function BuildPixArtFromSafeTensors(const FileName: string; TextSeqLen: integer;
-  out Config: TPixArtConfig; pInferenceOnly: boolean = false;
+  out Config: TPixArtConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // Returns the PixArt net's timestep input (the (1,1,1) scalar t, the SECOND
@@ -8651,7 +8651,7 @@ type
 // lands; v1 wires it standalone for the parity test.
 procedure AddMMDiTJointBlock(NN: TNNet; ImgInput, TxtInput, CondInput: TNNetLayer;
   const Config: TMMDiTConfig; var Block: TMMDiTBlockLayers;
-  out ImgOutLayer, TxtOutLayer: TNNetLayer; pInferenceOnly: boolean = false);
+  out ImgOutLayer, TxtOutLayer: TNNetLayer; pTrainable: boolean = true);
 
 // Loads one MMDiT joint block's diffusers weights from Reader under Prefix
 // (e.g. 'transformer_blocks.0.'). Expects qk_norm=None (no attn.norm_q/norm_k);
@@ -8668,12 +8668,12 @@ procedure LoadMMDiTJointBlock(Reader: TNNetSafeTensorsReader;
 function BuildMMDiTBlock(Reader: TNNetSafeTensorsReader;
   const Config: TMMDiTConfig; const Prefix: string;
   out ImgOutLayer, TxtOutLayer: TNNetLayer;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 
 function BuildMMDiTBlockFromSafeTensors(const FileName: string;
   const Config: TMMDiTConfig; const Prefix: string;
   out ImgOutLayer, TxtOutLayer: TNNetLayer;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 
 // Reads a tiny MMDiT block config.json (hidden_size, num_attention_heads,
 // attention_head_dim, img_len, txt_len, mlp_hidden, layer_norm_eps).
@@ -8777,12 +8777,12 @@ type
 // ending at quant_conv. Reuses the VAE encoder helpers; double_z=False so
 // conv_out emits latent_channels and quant_conv maps to vq_embed_dim.
 function BuildVqEncoderNet(Reader: TNNetSafeTensorsReader;
-  const Config: TVqModelConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TVqModelConfig; pTrainable: boolean = true): TNNet;
 
 // Builds the VQModel decoder net (gathered vq_embed_dim latent -> RGB), starting
 // at post_quant_conv. Reuses the VAE decoder helpers; no 1/scaling_factor.
 function BuildVqDecoderNet(Reader: TNNetSafeTensorsReader;
-  const Config: TVqModelConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TVqModelConfig; pTrainable: boolean = true): TNNet;
 
 // Reads the codebook embedding table quantize.embedding.weight ([n_e, e_dim])
 // into a [n_e][e_dim] volume (entry k at Depth-row k*e_dim..).
@@ -8793,13 +8793,13 @@ function ReadVqCodebook(Reader: TNNetSafeTensorsReader;
 // an open safetensors Reader (caller owns Reader). The returned TNNetVqModel
 // owns its nets and codebook.
 function BuildVqModel(Reader: TNNetSafeTensorsReader;
-  const Config: TVqModelConfig; pInferenceOnly: boolean = false): TNNetVqModel;
+  const Config: TVqModelConfig; pTrainable: boolean = true): TNNetVqModel;
 
 function BuildVqModelFromSafeTensorsEx(const FileName: string;
-  const Config: TVqModelConfig; pInferenceOnly: boolean = false): TNNetVqModel;
+  const Config: TVqModelConfig; pTrainable: boolean = true): TNNetVqModel;
 
 function BuildVqModelFromSafeTensors(const FileName: string;
-  out Config: TVqModelConfig; pInferenceOnly: boolean = false;
+  out Config: TVqModelConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNetVqModel;
 
 // ---------------------------------------------------------------------------
@@ -8845,13 +8845,13 @@ function RRDBNetConfigToString(const Config: TRRDBNetConfig): string;
 // (caller owns Reader). The net takes a (InputSize, InputSize, NumInCh) image
 // and outputs a (InputSize*Scale)^2 image with NumOutCh channels (raw).
 function BuildRRDBNet(Reader: TNNetSafeTensorsReader;
-  const Config: TRRDBNetConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TRRDBNetConfig; pTrainable: boolean = true): TNNet;
 
 function BuildRRDBNetFromSafeTensorsEx(const FileName: string;
-  const Config: TRRDBNetConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TRRDBNetConfig; pTrainable: boolean = true): TNNet;
 
 function BuildRRDBNetFromSafeTensors(const FileName: string;
-  out Config: TRRDBNetConfig; pInferenceOnly: boolean = false;
+  out Config: TRRDBNetConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
@@ -8903,13 +8903,13 @@ function NAFNetConfigToString(const Config: TNAFNetConfig): string;
 // (caller owns Reader). The net takes a (InputSize, InputSize, ImgChannel)
 // image and outputs the SAME shape (restored image, raw).
 function BuildNAFNet(Reader: TNNetSafeTensorsReader;
-  const Config: TNAFNetConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TNAFNetConfig; pTrainable: boolean = true): TNNet;
 
 function BuildNAFNetFromSafeTensorsEx(const FileName: string;
-  const Config: TNAFNetConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TNAFNetConfig; pTrainable: boolean = true): TNNet;
 
 function BuildNAFNetFromSafeTensors(const FileName: string;
-  out Config: TNAFNetConfig; pInferenceOnly: boolean = false;
+  out Config: TNAFNetConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
@@ -8964,13 +8964,13 @@ function RIFEConfigToString(const Config: TRIFEConfig): string;
 // image whose depth axis is [frame0 | frame1] and outputs the
 // (InputSize, InputSize, InChannel) interpolated middle frame (raw).
 function BuildRIFE(Reader: TNNetSafeTensorsReader;
-  const Config: TRIFEConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TRIFEConfig; pTrainable: boolean = true): TNNet;
 
 function BuildRIFEFromSafeTensorsEx(const FileName: string;
-  const Config: TRIFEConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TRIFEConfig; pTrainable: boolean = true): TNNet;
 
 function BuildRIFEFromSafeTensors(const FileName: string;
-  out Config: TRIFEConfig; pInferenceOnly: boolean = false;
+  out Config: TRIFEConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
@@ -9020,13 +9020,13 @@ function SwinIRConfigToString(const Config: TSwinIRConfig): string;
 // Reader (caller owns Reader). Takes an (ImgSize, ImgSize, InChans) image and
 // outputs an (ImgSize*Upscale, ImgSize*Upscale, InChans) restored image (raw).
 function BuildSwinIRFromSafeTensors(Reader: TNNetSafeTensorsReader;
-  const Config: TSwinIRConfig; pInferenceOnly: boolean = false): TNNet; overload;
+  const Config: TSwinIRConfig; pTrainable: boolean = true): TNNet; overload;
 
 function BuildSwinIRFromSafeTensorsEx(const FileName: string;
-  const Config: TSwinIRConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TSwinIRConfig; pTrainable: boolean = true): TNNet;
 
 function BuildSwinIRFromSafeTensors(const FileName: string;
-  out Config: TSwinIRConfig; pInferenceOnly: boolean = false;
+  out Config: TSwinIRConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet; overload;
 
 // ---------------------------------------------------------------------------
@@ -9111,13 +9111,13 @@ function CLIPSegConfigToString(const Config: TCLIPSegConfig): string;
 // caller. Use RunCLIPSeg to drive the pipeline end to end.
 procedure BuildCLIPSegFromSafeTensorsWithConfig(const FileName: string;
   var Config: TCLIPSegConfig; out VisionNet, TextNet, DecoderNet: TNNet;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  TextSeqLen: integer = 0; pTrainable: boolean = true);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" beside
 // FileName) and returning it in Config.
 procedure BuildCLIPSegFromSafeTensors(const FileName: string;
   out VisionNet, TextNet, DecoderNet: TNNet; out Config: TCLIPSegConfig;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  TextSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 
 // Runs the full CLIPSeg pipeline: VisionNet.Compute(ImageInput), reads the
@@ -9171,13 +9171,13 @@ function StyleGAN2ConfigToString(const Config: TStyleGAN2Config): string;
 // in synthesis order). OUTPUT = a (FinalSize, FinalSize, NumOutCh) raw RGB
 // image, FinalSize = StartSize * 2^(NumBlocks-1).
 function BuildStyleGAN2Generator(Reader: TNNetSafeTensorsReader;
-  const Config: TStyleGAN2Config; pInferenceOnly: boolean = false): TNNet;
+  const Config: TStyleGAN2Config; pTrainable: boolean = true): TNNet;
 
 function BuildStyleGAN2GeneratorFromSafeTensorsEx(const FileName: string;
-  const Config: TStyleGAN2Config; pInferenceOnly: boolean = false): TNNet;
+  const Config: TStyleGAN2Config; pTrainable: boolean = true): TNNet;
 
 function BuildStyleGAN2GeneratorFromSafeTensors(const FileName: string;
-  out Config: TStyleGAN2Config; pInferenceOnly: boolean = false;
+  out Config: TStyleGAN2Config; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
@@ -9249,9 +9249,9 @@ function DINOv2ConfigToString(const Config: TDINOv2Config): string;
 // (ImageSize, ImageSize, NumChannels) normalized RGB volume and outputs the
 // (num_patches+1, 1, HiddenSize) post-final-LayerNorm hidden states: row 0 is
 // the CLS global feature, rows 1.. are the per-patch dense features. There is
-// NO classifier head. pInferenceOnly frees training volumes during build.
+// NO classifier head. pTrainable=False frees training volumes during build.
 function BuildDINOv2FromSafeTensors(Reader: TNNetSafeTensorsReader;
-  const Config: TDINOv2Config; pInferenceOnly: boolean = false): TNNet;
+  const Config: TDINOv2Config; pTrainable: boolean = true): TNNet;
 
 // Builds + loads the DINOv2 net from the checkpoint at FileName
 // (.safetensors / sharded index / pytorch_model.bin via CreatePretrained
@@ -9260,10 +9260,10 @@ function BuildDINOv2FromSafeTensors(Reader: TNNetSafeTensorsReader;
 // is owned by the caller. Output: (num_patches+1, 1, HiddenSize) hidden
 // states (CLS row 0 + patch tokens).
 function BuildDINOv2FromSafeTensorsEx(const FileName: string;
-  const Config: TDINOv2Config; pInferenceOnly: boolean = false): TNNet;
+  const Config: TDINOv2Config; pTrainable: boolean = true): TNNet;
 
 function BuildDINOv2FromSafeTensorsWithConfig(const FileName: string;
-  out Config: TDINOv2Config; pInferenceOnly: boolean = false;
+  out Config: TDINOv2Config; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 type
@@ -9313,18 +9313,18 @@ function BeitConfigToString(const Config: TBeitConfig): string;
 // (num_patches+1, 1, HiddenSize) token hidden states (row 0 = cls). When
 // use_mean_pooling is false a final encoder LayerNorm is applied; when true the
 // raw encoder output is returned (the pooler LayerNorm + patch mean is the
-// caller's job). pInferenceOnly frees training volumes during build.
+// caller's job). pTrainable=False frees training volumes during build.
 function BuildBeitFromSafeTensors(Reader: TNNetSafeTensorsReader;
-  const Config: TBeitConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TBeitConfig; pTrainable: boolean = true): TNNet;
 
 // Builds + loads the BEiT net from the checkpoint at FileName. Config is
 // supplied by the caller (Ex) or read from ConfigFileName ('' = "config.json"
 // beside FileName) and returned. The net is owned by the caller.
 function BuildBeitFromSafeTensorsEx(const FileName: string;
-  const Config: TBeitConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TBeitConfig; pTrainable: boolean = true): TNNet;
 
 function BuildBeitFromSafeTensorsWithConfig(const FileName: string;
-  out Config: TBeitConfig; pInferenceOnly: boolean = false;
+  out Config: TBeitConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 type
@@ -9362,20 +9362,20 @@ function DPTConfigToString(const Config: TDPTConfig): string;
 // (ImageSize, ImageSize, 1) per-pixel depth map (full input resolution), exactly
 // HF's predicted_depth. The DINOv2 encoder is reused (inline blocks tapped at
 // each hooked stage, shared final LayerNorm); the genuinely new code is the
-// convolutional reassemble/fusion neck + 3-conv depth head. pInferenceOnly frees
+// convolutional reassemble/fusion neck + 3-conv depth head. pTrainable=False frees
 // training volumes during build.
 function BuildDPTFromSafeTensors(Reader: TNNetSafeTensorsReader;
-  const Config: TDPTConfig; pInferenceOnly: boolean = false): TNNet; overload;
+  const Config: TDPTConfig; pTrainable: boolean = true): TNNet; overload;
 
 // Builds + loads the DPT net from the checkpoint at FileName. Config is supplied
 // by the caller (Ex) or read from ConfigFileName ('' = "config.json" beside
 // FileName) and returned. The net is owned by the caller. Output:
 // (ImageSize, ImageSize, 1) depth map.
 function BuildDPTFromSafeTensorsEx(const FileName: string;
-  const Config: TDPTConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TDPTConfig; pTrainable: boolean = true): TNNet;
 
 function BuildDPTFromSafeTensors(const FileName: string;
-  out Config: TDPTConfig; pInferenceOnly: boolean = false;
+  out Config: TDPTConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet; overload;
 
 type
@@ -9430,16 +9430,16 @@ function ViTPoseConfigToString(const Config: TViTPoseConfig): string;
 // + the simple deconvolution head (ReLU -> bilinear upsample -> 3x3 conv). Decode
 // the (x,y) keypoints from the output with DecodeViTPoseKeypoints.
 function BuildViTPoseFromSafeTensors(Reader: TNNetSafeTensorsReader;
-  const Config: TViTPoseConfig; pInferenceOnly: boolean = false): TNNet; overload;
+  const Config: TViTPoseConfig; pTrainable: boolean = true): TNNet; overload;
 
 // Builds + loads the ViTPose net from the checkpoint at FileName. Config is
 // supplied by the caller (Ex) or read from ConfigFileName ('' = "config.json"
 // beside FileName) and returned. The net is owned by the caller.
 function BuildViTPoseFromSafeTensorsEx(const FileName: string;
-  const Config: TViTPoseConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TViTPoseConfig; pTrainable: boolean = true): TNNet;
 
 function BuildViTPoseFromSafeTensors(const FileName: string;
-  out Config: TViTPoseConfig; pInferenceOnly: boolean = false;
+  out Config: TViTPoseConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet; overload;
 
 type
@@ -9509,16 +9509,16 @@ function DetrConfigToString(const Config: TDetrConfig): string;
 // sinusoidal spatial position embedding (added to queries+keys but NOT values of
 // every attention, matching DetrSinePositionEmbedding) and the class/box heads.
 function BuildDetrFromSafeTensors(Reader: TNNetSafeTensorsReader;
-  const Config: TDetrConfig; pInferenceOnly: boolean = false): TNNet; overload;
+  const Config: TDetrConfig; pTrainable: boolean = true): TNNet; overload;
 
 // Builds + loads the DETR net from the checkpoint at FileName. Config is
 // supplied by the caller (Ex) or read from ConfigFileName ('' = "config.json"
 // beside FileName) and returned. The net is owned by the caller.
 function BuildDetrFromSafeTensorsEx(const FileName: string;
-  const Config: TDetrConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TDetrConfig; pTrainable: boolean = true): TNNet;
 
 function BuildDetrFromSafeTensors(const FileName: string;
-  out Config: TDetrConfig; pInferenceOnly: boolean = false;
+  out Config: TDetrConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet; overload;
 
 type
@@ -9592,13 +9592,13 @@ function YoloConfigToString(const Config: TYoloConfig): string;
 // Reader (caller owns Reader), folding each BatchNorm into its conv. Output:
 // (sum_i Hi*Wi, 1, 4*reg_max + num_classes) raw head (see the section comment).
 function BuildYolo(Reader: TNNetSafeTensorsReader;
-  const Config: TYoloConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TYoloConfig; pTrainable: boolean = true): TNNet;
 
 function BuildYoloFromSafeTensorsEx(const FileName: string;
-  const Config: TYoloConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TYoloConfig; pTrainable: boolean = true): TNNet;
 
 function BuildYoloFromSafeTensors(const FileName: string;
-  out Config: TYoloConfig; pInferenceOnly: boolean = false;
+  out Config: TYoloConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 type
@@ -9653,7 +9653,7 @@ function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
 // SEQUENCE CLASSIFICATION IMPORT section); the LM/encoder stays the
 // default for every other architectures value.
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 // ---------------------------------------------------------------------------
@@ -9793,20 +9793,20 @@ function VideoMAEConfigToString(const Config: TVideoMAEConfig): string;
 // pytorch_model.bin via CreatePretrainedTensorReader). The net consumes a
 // (image_size, image_size, num_frames*num_channels) clip volume (frame t's C
 // channels contiguous at depth [t*C..t*C+C)) and outputs (1, 1, num_labels)
-// action logits. The caller owns the net. pInferenceOnly frees training
+// action logits. The caller owns the net. pTrainable=False frees training
 // volumes during construction.
 function BuildVideoMAEFromSafeTensorsWithConfig(const FileName: string;
-  var Config: TVideoMAEConfig; pInferenceOnly: boolean = false): TNNet;
+  var Config: TVideoMAEConfig; pTrainable: boolean = true): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" beside
 // FileName) and returning it in Config.
 function BuildVideoMAEFromSafeTensorsEx(const FileName: string;
-  out Config: TVideoMAEConfig; pInferenceOnly: boolean = false;
+  out Config: TVideoMAEConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 // Same, discarding the config.
 function BuildVideoMAEFromSafeTensors(const FileName: string;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 
 // Runs one forward pass of a BuildVideoMAEFromSafeTensors net over the clip
 // volume ClipInput ((image_size,image_size,num_frames*num_channels)) and
@@ -10003,7 +10003,7 @@ end;
 
 function BuildGPT2FromSafeTensorsEx(const FileName: string;
   out Config: TGPT2Config; pSeqLen: integer = 0;
-  pNumHeads: integer = 0; pInferenceOnly: boolean = false;
+  pNumHeads: integer = 0; pTrainable: boolean = true;
   pSeqClsHead: boolean = false; pExactGelu: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 var
@@ -10044,20 +10044,20 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real BPE token ("!"), not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.NEmbd, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.VocabSize, Config.NEmbd, {EncodeZero=}1).SetTrainable(pTrainable) );
       PosLayer := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.NCtx).SetInferenceOnly(pInferenceOnly) );
-      // pInferenceOnly: shrink training volumes as soon as each chunk of
+        TNNetLearnedPositionalEmbedding.Create(Config.NCtx).SetTrainable(pTrainable) );
+      // pTrainable=False: shrink training volumes as soon as each chunk of
       // layers exists - peak memory then carries the training volumes of at
       // most one block (plus the LM head's, briefly) instead of the whole
-      // net's. SetInferenceOnly is idempotent, so re-sweeping all layers
+      // net's. SetTrainable is idempotent, so re-sweeping all layers
       // each time is cheap and keeps this code simple.
       // pQuantizeInt8 follows the same idempotent-sweep pattern: each sweep
       // converts the freshly built block's weight matrices to int8 so peak
       // memory carries at most one block of FP32 weights; the load phase
       // below refills each layer (DequantizeWeightsInt8 inside the loaders)
       // and re-sweeps after every block.
-      if pInferenceOnly then NN.SetInferenceOnly();
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NLayers);
       NLayersM1 := Config.NLayers - 1;
@@ -10065,9 +10065,9 @@ begin
       begin
         // Attention sub-block: x := x + c_proj(MHA(c_attn(ln_1(x)))).
         BranchInput := NN.GetLastLayer();
-        Blocks[BlockCnt].LN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-5).SetInferenceOnly(pInferenceOnly) );
+        Blocks[BlockCnt].LN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-5).SetTrainable(pTrainable) );
         Blocks[BlockCnt].CAttn := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.NEmbd).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(3 * Config.NEmbd).SetTrainable(pTrainable) );
         // Splits the fused Q|K|V slab per head, runs one causal SDPA per
         // head, concats heads and out-projects with PointwiseConvLinear(d)
         // - the returned layer IS the out-projection and receives c_proj.
@@ -10079,9 +10079,9 @@ begin
         // composed from existing layers like the BERT/GPT-NeoX paths
         // (Cerebras-GPT's activation_function "gelu").
         BranchInput := NN.GetLastLayer();
-        Blocks[BlockCnt].LN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-5).SetInferenceOnly(pInferenceOnly) );
+        Blocks[BlockCnt].LN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-5).SetTrainable(pTrainable) );
         Blocks[BlockCnt].CFc := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(4 * Config.NEmbd).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(4 * Config.NEmbd).SetTrainable(pTrainable) );
         if pExactGelu then
         begin
           GELUSource := NN.GetLastLayer();
@@ -10096,12 +10096,12 @@ begin
         else
           NN.AddLayer( TNNetGELU.Create() ); // tanh approximation = gelu_new
         Blocks[BlockCnt].MlpProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.NEmbd).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.NEmbd).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
-      FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-5).SetInferenceOnly(pInferenceOnly) );
+      FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-5).SetTrainable(pTrainable) );
       NumLabels := 0;
       if pSeqClsHead then
       begin
@@ -10120,15 +10120,15 @@ begin
             Reader.ShapeAsString('score.weight'));
         NumLabels := Reader.DimSize('score.weight', 0);
         LMHead := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(NumLabels).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(NumLabels).SetTrainable(pTrainable) );
       end
       else
         // LM head tied to wte: logits = h . wte^T. Implemented as an untied
         // PointwiseConvLinear(vocab) whose weights are a COPY of wte (see
         // the unit header). Bias-free in GPT-2: biases stay 0.
         LMHead := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+          TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -10273,13 +10273,13 @@ end;
 
 function BuildGPT2FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pNumHeads: integer = 0;
-  pInferenceOnly: boolean = false; pExactGelu: boolean = false;
+  pTrainable: boolean = true; pExactGelu: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TGPT2Config;
 begin
   Result := BuildGPT2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pNumHeads, pInferenceOnly, {pSeqClsHead=}false, pExactGelu,
+    pNumHeads, pTrainable, {pSeqClsHead=}false, pExactGelu,
     pQuantizeInt8);
 end;
 
@@ -12051,7 +12051,7 @@ end;
 
 procedure BuildMixtralMoEBranch(NN: TNNet; var Block: TLlamaBlockLayers;
   MoESource: TNNetLayer; const Config: TLlamaConfig;
-  pInferenceOnly: boolean = false);
+  pTrainable: boolean = true);
 var
   GateTopK, ExpertOut, GateE, GateEBroadcast, RoutedOut: TNNetLayer;
   MoEBranches: array of TNNetLayer;
@@ -12069,7 +12069,7 @@ begin
   // hard top-k gate with the top-k subset renormalized iff Config.MoENormTopK
   // (Mixtral always renormalizes; Qwen3-MoE follows norm_topk_prob).
   Block.GateConv := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(Config.NumLocalExperts).SetInferenceOnly(pInferenceOnly), MoESource);
+    TNNetPointwiseConvLinear.Create(Config.NumLocalExperts).SetTrainable(pTrainable), MoESource);
   // Config.MoESigmoidGate (Llama-4): HF keeps the top-k LOGITS, scatters them
   // into a -inf tensor and applies SIGMOID (the non-survivors -> sigmoid(-inf)
   // = 0). Sigmoid is monotonic so top-k SELECTION on sigmoid(logit) equals
@@ -12109,11 +12109,11 @@ begin
     else
       ExpertOut := MoESource;
     Block.ExpertGateUp[ExpertCnt] := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(2 * ExpertWidth).SetInferenceOnly(pInferenceOnly),
+      TNNetPointwiseConvLinear.Create(2 * ExpertWidth).SetTrainable(pTrainable),
       ExpertOut);
     NN.AddLayer( TNNetSwiGLU.Create() );
     Block.ExpertDown[ExpertCnt] := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+      TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
     ExpertOut := NN.GetLastLayer();
     if Config.MoEScaleInput then
       MoEBranches[ExpertCnt] := ExpertOut
@@ -12139,11 +12139,11 @@ begin
   if Config.SharedIntermediateSize > 0 then
   begin
     Block.SharedGateUp := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(2 * Config.SharedIntermediateSize).SetInferenceOnly(pInferenceOnly),
+      TNNetPointwiseConvLinear.Create(2 * Config.SharedIntermediateSize).SetTrainable(pTrainable),
       MoESource);
     NN.AddLayer( TNNetSwiGLU.Create() );
     Block.SharedDown := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+      TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetSum.Create([RoutedOut, NN.GetLastLayer()]) );
   end;
 end;
@@ -12368,7 +12368,7 @@ end;
 function BuildLlamaFromTensorReaderWithConfig(
   pReader: TNNetSafeTensorsReader; const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -12520,12 +12520,12 @@ begin
       // not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
         Config.VocabSize, Config.HiddenSize, {EncodeZero=}1
-        ).SetInferenceOnly(pInferenceOnly) );
+        ).SetTrainable(pTrainable) );
       // pQuantizeInt8: idempotent block-by-block sweeps (same pattern as
-      // SetInferenceOnly) keep peak RAM at quantized-net + one FP32 block
+      // SetTrainable) keep peak RAM at quantized-net + one FP32 block
       // during BOTH construction and the weight-load phase below (the
       // loaders call DequantizeWeightsInt8 before refilling a layer).
-      if pInferenceOnly then NN.SetInferenceOnly();
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(KRotated, Config.NumKVHeads);
@@ -12607,17 +12607,17 @@ begin
         else
         begin
           Blocks[BlockCnt].AttnNorm :=
-            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly) );
+            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
           NormedSource := NN.GetLastLayer();
         end;
         Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(QWidth).SetInferenceOnly(pInferenceOnly),
+          TNNetPointwiseConvLinear.Create(QWidth).SetTrainable(pTrainable),
           NormedSource);
         Blocks[BlockCnt].KProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly),
+          TNNetPointwiseConvLinear.Create(KVWidth).SetTrainable(pTrainable),
           NormedSource);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly),
+          TNNetPointwiseConvLinear.Create(KVWidth).SetTrainable(pTrainable),
           NormedSource);
         // Config.QKNormFullWidth (OLMo-2): ONE RMSNorm over the FULL
         // flattened q/k projection width (num_heads*head_dim /
@@ -12631,11 +12631,11 @@ begin
         if Config.QKNormFullWidth then
         begin
           Blocks[BlockCnt].QNormFull := NN.AddLayerAfter(
-            TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly),
+            TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable),
             Blocks[BlockCnt].QProj);
           QSource := Blocks[BlockCnt].QNormFull;
           Blocks[BlockCnt].KNormFull := NN.AddLayerAfter(
-            TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly),
+            TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable),
             Blocks[BlockCnt].KProj);
           KSource := Blocks[BlockCnt].KNormFull;
         end;
@@ -12685,7 +12685,7 @@ begin
             if Config.QKNorm then
             begin
               Blocks[BlockCnt].KNorms[KVHeadCnt] := NN.AddLayerAfter(
-                TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly), KSlice);
+                TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable), KSlice);
               KSlice := Blocks[BlockCnt].KNorms[KVHeadCnt];
             end;
             // Llama-4 iRoPE: RoPE only on the RoPE layers (NoPE layers carry no
@@ -12700,7 +12700,7 @@ begin
             // A gain=1 TNNetTokenRMSNorm = x*rsqrt(mean(x^2)+eps).
             if Config.Llama4QKL2Norm and LayerUseRoPE then
               KSlice := NN.AddLayerAfter(
-                TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly), KSlice);
+                TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable), KSlice);
             KRotated[KVHeadCnt] := KSlice;
           end;
           VSlices[KVHeadCnt] := NN.AddLayerAfter(
@@ -12734,7 +12734,7 @@ begin
             if Config.QKNorm then
             begin
               Blocks[BlockCnt].QNorms[HeadCnt] := NN.AddLayerAfter(
-                TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly), QSlice);
+                TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable), QSlice);
               QSlice := Blocks[BlockCnt].QNorms[HeadCnt];
             end;
             // Llama-4 iRoPE: RoPE only on the RoPE layers (see the K path).
@@ -12743,7 +12743,7 @@ begin
                 CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling), QSlice);
             if Config.Llama4QKL2Norm and LayerUseRoPE then
               QSlice := NN.AddLayerAfter(
-                TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly), QSlice);
+                TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable), QSlice);
             // Config.AttnTempTuning (attn_temperature_tuning): on the NoPE
             // layers scale the query by the per-position log factor BEFORE SDPA
             // (HF Llama4TextAttention: applied iff attn_temperature_tuning and
@@ -12777,9 +12777,9 @@ begin
         // below (which normalize the WHOLE sublayer output AFTER o_proj).
         if Config.BitNetSubLN then
           Blocks[BlockCnt].AttnSubNorm :=
-            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly) );
+            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
         Blocks[BlockCnt].OProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         // Config.SandwichNorm (Gemma-2) / Config.PostNormReordered (OLMo-2):
         // post-attention RMSNorm INSIDE the residual branch (HF
         // post_attention_layernorm normalizes the attention output BEFORE
@@ -12787,7 +12787,7 @@ begin
         // the block's ONLY attention norm: x + Norm(Attn(x)).
         if Config.SandwichNorm or Config.PostNormReordered then
           Blocks[BlockCnt].PostAttnNorm :=
-            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly) );
+            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         // MLP sub-block: x := x + down(act(gate(h)) * up(h)), h = RMSNorm(x),
         // where act is SiLU (SwiGLU, the Llama default) or tanh-GELU (GeGLU,
@@ -12802,12 +12802,12 @@ begin
         // the branch: x := x + Norm(MLP(x)).
         if not Config.PostNormReordered then
           Blocks[BlockCnt].MlpNorm :=
-            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly) );
+            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
         // Per-layer dense/MoE choice (Qwen3-MoE mixed stack; uniform stacks
         // and non-MoE families fall through unchanged - see LlamaLayerIsMoE).
         if LlamaLayerIsMoE(Config, BlockCnt) then
           BuildMixtralMoEBranch(NN, Blocks[BlockCnt], NN.GetLastLayer(),
-            Config, pInferenceOnly)
+            Config, pTrainable)
         else
         begin
           // Llama-4 dense layers use intermediate_size_mlp (wider than an MoE
@@ -12816,7 +12816,7 @@ begin
           if Config.IntermediateSizeMLP > 0 then j := Config.IntermediateSizeMLP
           else j := Config.IntermediateSize;
           Blocks[BlockCnt].GateUp := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(2 * j).SetInferenceOnly(pInferenceOnly) );
+            TNNetPointwiseConvLinear.Create(2 * j).SetTrainable(pTrainable) );
           if Config.ReGLUSquaredFFN then
             // BitNet b1.58 relu2 FFN: down(ffn_sub_norm(relu2(gate)*up)). The
             // fused projection packs up in neurons 0..I-1 and gate in I..2I-1
@@ -12832,30 +12832,30 @@ begin
           // down_proj(ffn_sub_norm(act_fn(gate(x)) * up(x)))).
           if Config.BitNetSubLN then
             Blocks[BlockCnt].FfnSubNorm :=
-              NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly) );
+              NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
           Blocks[BlockCnt].Down := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         end;
         // Config.SandwichNorm (Gemma-2) / Config.PostNormReordered (OLMo-2):
         // post-feedforward RMSNorm INSIDE the residual branch (HF
         // post_feedforward_layernorm).
         if Config.SandwichNorm or Config.PostNormReordered then
           Blocks[BlockCnt].PostMlpNorm :=
-            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly) );
+            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
-        TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
       // Config.FinalLogitSoftCap (Gemma-2): the LM-head logits are squashed
       // to cap*tanh(logits/cap) - a plain TNNetSoftCapping after the head
       // (HF applies it to the logits before any sampling softmax).
       if Config.FinalLogitSoftCap > 0 then
         NN.AddLayer( TNNetSoftCapping.Create(Config.FinalLogitSoftCap) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -13383,16 +13383,16 @@ end;
 
 function BuildLlamaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFromTensorReaderWithConfig(
     CreatePretrainedTensorReader(FileName), FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildLlamaFromGGUFEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   Reader: TNNetGGUFReader;
   Arch, ScalingType, GGUFPrefix, HFPrefix: string;
@@ -13539,22 +13539,22 @@ begin
     if not OK then Reader.Free;
   end;
   Result := BuildLlamaFromTensorReaderWithConfig(Reader, FileName, Config,
-    pSeqLen, pInferenceOnly, pQuantizeInt8);
+    pSeqLen, pTrainable, pQuantizeInt8);
 end;
 
 function BuildLlamaFromGGUF(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildLlamaFromGGUFEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildFromGGUFEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   Reader: TNNetGGUFReader;
   Arch, GGUFPrefix, HFPrefix: string;
@@ -13598,7 +13598,7 @@ begin
   if Arch = 'llama' then
   begin
     Result := BuildLlamaFromGGUFEx(FileName, Config, pSeqLen,
-      pInferenceOnly, pQuantizeInt8);
+      pTrainable, pQuantizeInt8);
     Exit;
   end;
   if (Arch <> 'qwen2') and (Arch <> 'gemma2') then
@@ -13781,17 +13781,17 @@ begin
     if not OK then Reader.Free;
   end;
   Result := BuildLlamaFromTensorReaderWithConfig(Reader, FileName, Config,
-    pSeqLen, pInferenceOnly, pQuantizeInt8);
+    pSeqLen, pTrainable, pQuantizeInt8);
 end;
 
 function BuildFromGGUF(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildFromGGUFEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 procedure SaveLlamaToGGUFEx(Reader: TNNetSafeTensorsReader;
@@ -15651,7 +15651,7 @@ end;
 
 function BuildLlamaFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = '';
   pQuantizeInt8: boolean = false): TNNet;
 var
@@ -15662,17 +15662,17 @@ begin
   Config := ReadLlamaConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildLlamaFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildLlamaFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildLlamaFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 // ============================ GPT-NEO IMPORT ===============================
@@ -15838,7 +15838,7 @@ type
 
 function BuildGPTNeoFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGPTNeoConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -15916,10 +15916,10 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real BPE token, not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
       PosLayer := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       BlockMax := Config.NumLayers - 1;
@@ -15933,9 +15933,9 @@ begin
         else Window := 0;
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].LN1 := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         Blocks[BlockCnt].QKV := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable) );
         Blocks[BlockCnt].AttnProj := NN.AddMultiHeadSelfAttention(
           Config.NumHeads, {CausalMask=}true, {UseRoPE=}false,
           {Variant=}avSDPA, {NumSinks=}1, Window);
@@ -15943,21 +15943,21 @@ begin
         // MLP sub-block: x := x + c_proj(gelu_new(c_fc(ln_2(x)))).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].LN2 := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         Blocks[BlockCnt].CFc := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetGELU.Create() ); // tanh approximation = gelu_new
         Blocks[BlockCnt].MlpProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -16101,7 +16101,7 @@ end;
 
 function BuildGPTNeoFromSafeTensorsEx(const FileName: string;
   out Config: TGPTNeoConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -16111,17 +16111,17 @@ begin
   Config := ReadGPTNeoConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildGPTNeoFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildGPTNeoFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TGPTNeoConfig;
 begin
   Result := BuildGPTNeoFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 // =========================== GPT-NEOX IMPORT ===============================
@@ -16315,7 +16315,7 @@ type
 
 function BuildGPTNeoXFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGPTNeoXConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -16418,8 +16418,8 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real BPE token, not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
@@ -16436,9 +16436,9 @@ begin
         // Attention branch: dense(MHA-with-partial-RoPE(LN_1(x))).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].LN1 := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         QKVLayer := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable) );
         Blocks[BlockCnt].QKV := QKVLayer;
         for HeadCnt := 0 to HeadMax do
         begin
@@ -16500,14 +16500,14 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].AttnDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         AttnOut := NN.GetLastLayer();
         if Config.UseParallelResidual then
           // PARALLEL residual: the MLP branch reads the BLOCK INPUT through
           // its own LayerNorm; one fused 3-input sum closes the block:
           //   x := x + Attn(LN_1(x)) + MLP(LN_2(x))
           Blocks[BlockCnt].LN2 := NN.AddLayerAfter(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), BranchInput)
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), BranchInput)
         else
         begin
           // SEQUENTIAL (use_parallel_residual=false): close the attention
@@ -16515,26 +16515,26 @@ begin
           AttnOut := NN.AddLayer(
             TNNetSum.Create([AttnOut, BranchInput]) );
           Blocks[BlockCnt].LN2 := NN.AddLayer(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         end;
         Blocks[BlockCnt].HTo4H := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
         AddExactOrTanhGELU;
         Blocks[BlockCnt].FourHToH := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         MlpOut := NN.GetLastLayer();
         if Config.UseParallelResidual then
           NN.AddLayer( TNNetSum.Create([BranchInput, AttnOut, MlpOut]) )
         else
           NN.AddLayer( TNNetSum.Create([MlpOut, AttnOut]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -16662,7 +16662,7 @@ end;
 
 function BuildGPTNeoXFromSafeTensorsEx(const FileName: string;
   out Config: TGPTNeoXConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -16672,17 +16672,17 @@ begin
   Config := ReadGPTNeoXConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildGPTNeoXFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildGPTNeoXFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TGPTNeoXConfig;
 begin
   Result := BuildGPTNeoXFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 // =============================== OPT IMPORT ===============================
@@ -16868,7 +16868,7 @@ end;
 
 function BuildOPTFromSafeTensorsWithConfig(const FileName: string;
   var Config: TOPTConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -16936,17 +16936,17 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real token, not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.WordEmbedProjDim, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.VocabSize, Config.WordEmbedProjDim, {EncodeZero=}1).SetTrainable(pTrainable) );
       ProjIn := nil;
       if HasProj then
         // project_in: bias-free [hidden, word_embed_proj_dim] nn.Linear.
         ProjIn := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
       // Learned positions with the +2 offset are added AFTER project_in
       // (HF: hidden_states = project_in(inputs_embeds) + pos_embeds).
       PosLayer := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(SeqLen).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetLearnedPositionalEmbedding.Create(SeqLen).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       BlockMax := Config.NumLayers - 1;
@@ -16957,9 +16957,9 @@ begin
         BranchInput := NN.GetLastLayer();
         if Config.DoLayerNormBefore then
           Blocks[BlockCnt].N1 := NN.AddLayer(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         Blocks[BlockCnt].QKV := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable) );
         // Per-head causal SDPA (standard 1/sqrt(head_dim) scale); the
         // returned layer IS the out-projection and receives out_proj.
         Blocks[BlockCnt].AttnProj := NN.AddMultiHeadSelfAttention(
@@ -16967,38 +16967,38 @@ begin
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if not Config.DoLayerNormBefore then
           Blocks[BlockCnt].N1 := NN.AddLayer(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         // FFN sub-block. PRE-LN: x := x + fc2(ReLU(fc1(N2(x)))).
         // POST-LN: x := N2(x + fc2(ReLU(fc1(x)))).
         BranchInput := NN.GetLastLayer();
         if Config.DoLayerNormBefore then
           Blocks[BlockCnt].N2 := NN.AddLayer(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         Blocks[BlockCnt].Fc1 := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetReLU.Create() );
         Blocks[BlockCnt].Fc2 := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if not Config.DoLayerNormBefore then
           Blocks[BlockCnt].N2 := NN.AddLayer(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := nil;
       if Config.HasFinalLayerNorm then
         FinalLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       ProjOut := nil;
       if HasProj then
         // project_out: bias-free [word_embed_proj_dim, hidden] nn.Linear.
         ProjOut := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.WordEmbedProjDim).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.WordEmbedProjDim).SetTrainable(pTrainable) );
       // LM head tied to embed_tokens (word_embed_proj_dim wide), bias-free.
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -17147,7 +17147,7 @@ end;
 
 function BuildOPTFromSafeTensorsEx(const FileName: string;
   out Config: TOPTConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -17156,17 +17156,17 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadOPTConfigFromJSONFile(ConfigPath);
   Result := BuildOPTFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildOPTFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TOPTConfig;
 begin
   Result := BuildOPTFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 // ========================= STARCODER2 IMPORT ==============================
@@ -17302,7 +17302,7 @@ type
 
 function BuildStarCoder2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TStarCoder2Config; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -17402,8 +17402,8 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(KRotated, Config.NumKVHeads);
@@ -17422,14 +17422,14 @@ begin
         // HF), but with a BIASED LayerNorm pre-norm and biased projections.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].AttnNorm := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         NormedSource := NN.GetLastLayer();
         Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(QWidth).SetInferenceOnly(pInferenceOnly), NormedSource);
+          TNNetPointwiseConvLinear.Create(QWidth).SetTrainable(pTrainable), NormedSource);
         Blocks[BlockCnt].KProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly), NormedSource);
+          TNNetPointwiseConvLinear.Create(KVWidth).SetTrainable(pTrainable), NormedSource);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly), NormedSource);
+          TNNetPointwiseConvLinear.Create(KVWidth).SetTrainable(pTrainable), NormedSource);
         // K is rotated ONCE per KV head; V is never rotated.
         for KVHeadCnt := 0 to KVHeadMax do
         begin
@@ -17462,27 +17462,27 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].OProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         // MLP sub-block: x := x + c_proj(gelu_tanh(c_fc(LayerNorm(x)))) -
         // a plain two-matrix FFN, NO SwiGLU gate.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].MlpNorm := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         Blocks[BlockCnt].CFc := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetGELU.Create() ); // gelu_pytorch_tanh
         Blocks[BlockCnt].CProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -17611,7 +17611,7 @@ end;
 
 function BuildStarCoder2FromSafeTensorsEx(const FileName: string;
   out Config: TStarCoder2Config; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -17620,17 +17620,17 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadStarCoder2ConfigFromJSONFile(ConfigPath);
   Result := BuildStarCoder2FromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildStarCoder2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TStarCoder2Config;
 begin
   Result := BuildStarCoder2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 // ========================== GPT-BIGCODE IMPORT =============================
@@ -17747,7 +17747,7 @@ type
 
 function BuildGptBigCodeFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGptBigCodeConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -17823,11 +17823,11 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
       // Learned absolute positions (wpe), GPT-2 style: x := wte[token] + wpe[pos].
       PosLayer := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
@@ -17841,15 +17841,15 @@ begin
         // No RoPE; the lone K/V head is shared across every query head.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].LN1 := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         NormedSource := NN.GetLastLayer();
         // Three nn.Linear sub-blocks sliced from the fused c_attn slab below.
         Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(QWidth).SetInferenceOnly(pInferenceOnly), NormedSource);
+          TNNetPointwiseConvLinear.Create(QWidth).SetTrainable(pTrainable), NormedSource);
         Blocks[BlockCnt].KProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(HeadDim).SetInferenceOnly(pInferenceOnly), NormedSource);
+          TNNetPointwiseConvLinear.Create(HeadDim).SetTrainable(pTrainable), NormedSource);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(HeadDim).SetInferenceOnly(pInferenceOnly), NormedSource);
+          TNNetPointwiseConvLinear.Create(HeadDim).SetTrainable(pTrainable), NormedSource);
         // The single shared K and V slices (the WHOLE projection is one head).
         KSlice := Blocks[BlockCnt].KProj;
         VSlice := Blocks[BlockCnt].VProj;
@@ -17866,26 +17866,26 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].OProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         // MLP sub-block: x := x + c_proj(gelu_tanh(c_fc(LayerNorm(x)))).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].LN2 := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         Blocks[BlockCnt].CFc := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetGELU.Create() ); // gelu_pytorch_tanh
         Blocks[BlockCnt].CProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -18002,7 +18002,7 @@ end;
 
 function BuildGptBigCodeFromSafeTensorsEx(const FileName: string;
   out Config: TGptBigCodeConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -18011,17 +18011,17 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadGptBigCodeConfigFromJSONFile(ConfigPath);
   Result := BuildGptBigCodeFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildGptBigCodeFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TGptBigCodeConfig;
 begin
   Result := BuildGptBigCodeFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 // ============================ GPT-J IMPORT =================================
@@ -18136,7 +18136,7 @@ type
 
 function BuildGPTJFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGPTJConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -18239,8 +18239,8 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real BPE token, not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
@@ -18259,16 +18259,16 @@ begin
         // block:  x := x + Attn(LN(x)) + MLP(LN(x))
         BranchInput := NN.GetLastLayer();
         SharedLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         Blocks[BlockCnt].LN1 := SharedLN;
         // SEPARATE bias-free q/k/v projections (plain nn.Linear), all
         // reading the shared LN output.
         Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly), SharedLN);
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable), SharedLN);
         Blocks[BlockCnt].KProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly), SharedLN);
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable), SharedLN);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly), SharedLN);
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable), SharedLN);
         for HeadCnt := 0 to HeadMax do
         begin
           // PARTIAL ROTARY per head: RoPE on the first rotary_dim channels
@@ -18328,26 +18328,26 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].OutProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         AttnOut := NN.GetLastLayer();
         // MLP branch: reads the SAME shared LN output (NOT a second norm,
         // NOT the attention output - GPT-J is always parallel).
         Blocks[BlockCnt].FcIn := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetInferenceOnly(pInferenceOnly),
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable),
           SharedLN);
         AddExactOrTanhGELU;
         Blocks[BlockCnt].FcOut := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         MlpOut := NN.GetLastLayer();
         NN.AddLayer( TNNetSum.Create([BranchInput, AttnOut, MlpOut]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -18455,7 +18455,7 @@ end;
 
 function BuildGPTJFromSafeTensorsEx(const FileName: string;
   out Config: TGPTJConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -18465,17 +18465,17 @@ begin
   Config := ReadGPTJConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildGPTJFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildGPTJFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TGPTJConfig;
 begin
   Result := BuildGPTJFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 // ============================ COHERE IMPORT ================================
@@ -18738,7 +18738,7 @@ type
 
 function BuildCohereFromSafeTensorsWithConfig(const FileName: string;
   var Config: TCohereConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -18780,7 +18780,7 @@ var
     if Config.UseQKNorm then
     begin
       s := NN.AddLayerAfter(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), s);
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), s);
       if IsQuery then Blocks[BlockCnt].QNorms[HeadIdx] := s
       else Blocks[BlockCnt].KNorms[HeadIdx] := s;
     end;
@@ -18854,8 +18854,8 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
@@ -18889,15 +18889,15 @@ begin
         // branches; one fused 3-input sum closes the block.
         BranchInput := NN.GetLastLayer();
         SharedLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         Blocks[BlockCnt].LN1 := SharedLN;
         // bias-free q/k/v projections (GQA: kv width may be narrower).
         Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(QWidth).SetInferenceOnly(pInferenceOnly), SharedLN);
+          TNNetPointwiseConvLinear.Create(QWidth).SetTrainable(pTrainable), SharedLN);
         Blocks[BlockCnt].KProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly), SharedLN);
+          TNNetPointwiseConvLinear.Create(KVWidth).SetTrainable(pTrainable), SharedLN);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly), SharedLN);
+          TNNetPointwiseConvLinear.Create(KVWidth).SetTrainable(pTrainable), SharedLN);
         if Config.UseQKNorm then
         begin
           SetLength(Blocks[BlockCnt].QNorms, Config.NumHeads);
@@ -18932,25 +18932,25 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].OProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         AttnOut := NN.GetLastLayer();
         // MLP branch reads the SAME shared LN (parallel residual).
         Blocks[BlockCnt].GateUp := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).SetInferenceOnly(pInferenceOnly),
+          TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).SetTrainable(pTrainable),
           SharedLN);
         NN.AddLayer( TNNetSwiGLU.Create() );
         Blocks[BlockCnt].Down := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         MlpOut := NN.GetLastLayer();
         NN.AddLayer( TNNetSum.Create([BranchInput, AttnOut, MlpOut]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -19075,7 +19075,7 @@ end;
 
 function BuildCohereFromSafeTensorsEx(const FileName: string;
   out Config: TCohereConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -19084,17 +19084,17 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadCohereConfigFromJSONFile(ConfigPath);
   Result := BuildCohereFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildCohereFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TCohereConfig;
 begin
   Result := BuildCohereFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 // ============================ PHI IMPORT ===================================
@@ -19291,7 +19291,7 @@ type
 
 function BuildPhiFromSafeTensorsWithConfig(const FileName: string;
   var Config: TPhiConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -19398,8 +19398,8 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real BPE token, not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
@@ -19418,16 +19418,16 @@ begin
         // sum closes the block:  x := x + Attn(LN(x)) + MLP(LN(x))
         BranchInput := NN.GetLastLayer();
         SharedLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         Blocks[BlockCnt].LN1 := SharedLN;
         // SEPARATE BIASED q/k/v projections (plain nn.Linear), all
         // reading the shared LN output.
         Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly), SharedLN);
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable), SharedLN);
         Blocks[BlockCnt].KProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly), SharedLN);
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable), SharedLN);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly), SharedLN);
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable), SharedLN);
         for HeadCnt := 0 to HeadMax do
         begin
           // PARTIAL ROTARY per head: RoPE on the first RotaryDims channels
@@ -19488,26 +19488,26 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].AttnDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         AttnOut := NN.GetLastLayer();
         // MLP branch: reads the SAME shared LN output (NOT a second norm,
         // NOT the attention output - Phi is always parallel).
         Blocks[BlockCnt].Fc1 := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetInferenceOnly(pInferenceOnly),
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable),
           SharedLN);
         AddExactOrTanhGELU;
         Blocks[BlockCnt].Fc2 := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         MlpOut := NN.GetLastLayer();
         NN.AddLayer( TNNetSum.Create([BranchInput, AttnOut, MlpOut]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -19614,7 +19614,7 @@ end;
 
 function BuildPhiFromSafeTensorsEx(const FileName: string;
   out Config: TPhiConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -19624,17 +19624,17 @@ begin
   Config := ReadPhiConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildPhiFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildPhiFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TPhiConfig;
 begin
   Result := BuildPhiFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 // ============================ BERT IMPORT ==================================
@@ -19781,7 +19781,7 @@ type
 
 function BuildBertFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBertConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pIncludePooler: boolean = false;
+  pTrainable: boolean = true; pIncludePooler: boolean = false;
   pSeqClsHead: boolean = false; pQuantizeInt8: boolean = false;
   pPaddingMask: boolean = false): TNNet;
 var
@@ -19935,11 +19935,11 @@ begin
       // mask source when pPaddingMask is on).
       NN.AddLayerAfter( TNNetSplitChannels.Create([0]), InputLayer );
       WordEmb := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
       // The structural table only carries the USABLE rows: row p is
       // checkpoint row p + PositionOffset (0 for bert/distilbert).
       PosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(UsablePositions).SetInferenceOnly(pInferenceOnly) );
+        TNNetLearnedPositionalEmbedding.Create(UsablePositions).SetTrainable(pTrainable) );
       TypeEmb := nil;
       if Config.TypeVocabSize > 0 then
       begin
@@ -19948,14 +19948,14 @@ begin
         SliceLayer := NN.AddLayerAfter(
           TNNetSplitChannels.Create([1]), InputLayer);
         TypeEmb := NN.AddLayerAfter( TNNetEmbedding.Create(
-          Config.TypeVocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly),
+          Config.TypeVocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable),
           SliceLayer);
         NN.AddLayer( TNNetSum.Create([PosEmb, TypeEmb]) );
       end;
       // ... then the embedding LayerNorm.
       EmbLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       BlockMax := Config.NumLayers - 1;
@@ -19965,7 +19965,7 @@ begin
         //   x := LN(x + dense(BIDIRECTIONAL-MHA(q|k|v(x)))).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].QKV := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable) );
         // CausalMask=false: every position attends to all SeqLen keys
         // (INTERSECTED with the key-padding segment mask when pPaddingMask is
         // on - SegMaskSrc excludes the [PAD] key positions from every real
@@ -19977,12 +19977,12 @@ begin
           {SegmentSource=}SegMaskSrc);
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         Blocks[BlockCnt].AttnLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         // POST-LN FFN sub-block:
         //   x := LN(x + output.dense(gelu(intermediate.dense(x)))).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].Inter := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
         if Config.HiddenActTanh then
           NN.AddLayer( TNNetGELU.Create() ) // tanh approximation
         else
@@ -20002,11 +20002,11 @@ begin
           NN.AddLayer( TNNetReGLU.Create() );
         end;
         Blocks[BlockCnt].OutDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         Blocks[BlockCnt].OutLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       // No final norm and NO LM head: the encoder output IS the last
@@ -20016,7 +20016,7 @@ begin
       begin
         // Per-token dense+tanh; row 0 ([CLS]) equals HF's pooler_output.
         PoolerDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetHyperbolicTangent.Create() );
       end;
       ClassifierDense := nil;
@@ -20051,7 +20051,7 @@ begin
               '.weight" - not a *ForSequenceClassification checkpoint of ' +
               'this family?');
           ClsHeadDense := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
           if Config.Family = bfDistilBert then
             NN.AddLayer( TNNetReLU.Create() )
           else
@@ -20069,9 +20069,9 @@ begin
             Reader.ShapeAsString(ClsOutName + '.weight'));
         NumLabels := Reader.DimSize(ClsOutName + '.weight', 0);
         ClassifierDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(NumLabels).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(NumLabels).SetTrainable(pTrainable) );
       end;
-      if pInferenceOnly then NN.SetInferenceOnly();
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -20249,7 +20249,7 @@ end;
 
 function BuildBertFromSafeTensorsEx(const FileName: string;
   out Config: TBertConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pIncludePooler: boolean = false;
+  pTrainable: boolean = true; pIncludePooler: boolean = false;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -20259,17 +20259,17 @@ begin
   Config := ReadBertConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildBertFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pIncludePooler, {pSeqClsHead=}false, pQuantizeInt8);
+    pTrainable, pIncludePooler, {pSeqClsHead=}false, pQuantizeInt8);
 end;
 
 function BuildBertFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pIncludePooler: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TBertConfig;
 begin
   Result := BuildBertFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, pIncludePooler, '', pQuantizeInt8);
+    pTrainable, pIncludePooler, '', pQuantizeInt8);
 end;
 
 // ======================= BLIP-2 Q-FORMER (impl) ============================
@@ -20370,7 +20370,7 @@ end;
 
 function BuildBlip2QFormerFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBlip2QFormerConfig; NumPatches: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -20466,7 +20466,7 @@ begin
         TNNetInput.Create(Patches, 1, Config.EncoderHiddenSize) );
       // Model-level embeddings.LayerNorm on the query embeddings FIRST.
       EmbLN := NN.AddLayerAfter(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), QueryInput );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), QueryInput );
 
       for BlockCnt := 0 to BlockMax do
       begin
@@ -20475,14 +20475,14 @@ begin
         //   q := LN(q + attn.output.dense(BIDIRECTIONAL-MHA(q|k|v(q)))).
         BranchInput := NN.GetLastLayer();
         QKV := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddMultiHeadSelfAttention(Config.NumHeads, {CausalMask=}false,
           {UseRoPE=}false, avSDPA, {NumSinks=}1, {Window=}0,
           {RelPosNumBuckets=}32, {RelPosMaxDistance=}128, {QKRMSNorm=}false,
           {SegmentSource=}nil);
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         AttnLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
 
         // ---- cross-attention sub-block (only on cross-attn layers) ----
         // Q from the post-normed query stream; K|V projected from the ViT
@@ -20495,11 +20495,11 @@ begin
         begin
           BranchInput := AttnLN;
           QProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly), BranchInput);
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable), BranchInput);
           KProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly), VisionInput);
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable), VisionInput);
           VProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly), VisionInput);
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable), VisionInput);
           for HeadCnt := 0 to HeadMax do
           begin
             for d := 0 to HeadDimM1 do
@@ -20517,24 +20517,24 @@ begin
           end;
           NN.AddLayer( TNNetDeepConcat.Create(Heads) );
           // crossattention.output.dense out-projection.
-          NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
           NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
           CrossLN := NN.AddLayer(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         end;
 
         // ---- FFN sub-block (intermediate_query / output_query) ----
         //   q := LN(q + output_query.dense(gelu(intermediate_query.dense(q)))).
         BranchInput := NN.GetLastLayer();
         FFNInter := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
         AddGelu();
         FFNOut := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         FFNLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+        if not pTrainable then NN.SetTrainable();
 
         // ---------------- Weights for this block ----------------
         BlockPrefix := Config.Prefix + 'encoder.layer.' +
@@ -20621,7 +20621,7 @@ begin
       MarkConsumed(Config.Prefix + 'layernorm.weight');
       MarkConsumed(Config.Prefix + 'layernorm.bias');
 
-      if pInferenceOnly then NN.SetInferenceOnly();
+      if not pTrainable then NN.SetTrainable();
 
       // ---------------- Unexpected-tensor check ----------------
       ReaderMax := Reader.Count - 1;
@@ -20668,7 +20668,7 @@ end;
 
 function BuildBlip2QFormerFromSafeTensorsEx(const FileName: string;
   out Config: TBlip2QFormerConfig; NumPatches: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -20677,7 +20677,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadBlip2QFormerConfigFromJSONFile(ConfigPath);
   Result := BuildBlip2QFormerFromSafeTensorsWithConfig(FileName, Config,
-    NumPatches, pInferenceOnly);
+    NumPatches, pTrainable);
 end;
 
 function Blip2QFormerVisionInput(QFormerNet: TNNet): TNNetLayer;
@@ -20705,7 +20705,7 @@ end;
 procedure BuildBlip2FromSafeTensors(const FileName: string;
   out QFormerNet, ProjectionNet: TNNet; out QueryTokens: TNNetVolume;
   out QFormerConfig: TBlip2QFormerConfig; NumPatches: integer = 0;
-  pInferenceOnly: boolean = false; const ConfigFileName: string = '');
+  pTrainable: boolean = true; const ConfigFileName: string = '');
 var
   Reader: TNNetSafeTensorsReader;
   ConfigPath, QTName, ProjName: string;
@@ -20718,7 +20718,7 @@ begin
   // The Q-Former net (its builder detects the 'qformer.' prefix in a full
   // blip2 checkpoint and ignores the ViT / LLM / projection siblings).
   QFormerNet := BuildBlip2QFormerFromSafeTensorsWithConfig(FileName,
-    QFormerConfig, NumPatches, pInferenceOnly);
+    QFormerConfig, NumPatches, pTrainable);
   ProjectionNet := nil;
   QueryTokens := nil;
   Reader := CreatePretrainedTensorReader(FileName);
@@ -20747,8 +20747,8 @@ begin
         TNNetInput.Create(QFormerConfig.NumQueryTokens, 1,
           QFormerConfig.HiddenSize) );
       ProjDense := ProjectionNet.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(TextHidden).SetInferenceOnly(pInferenceOnly), ProjInput);
-      if pInferenceOnly then ProjectionNet.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(TextHidden).SetTrainable(pTrainable), ProjInput);
+      if not pTrainable then ProjectionNet.SetTrainable();
       LoadLlamaLinearWeights(Reader, ProjDense, ProjName + '.weight',
         QFormerConfig.HiddenSize, TextHidden, 0, -1, 0, ProjName + '.bias');
     except
@@ -21193,7 +21193,7 @@ end;
 
 function BuildColBERTFromSafeTensorsEx(const FileName: string;
   out Config: TBertConfig; out ProjDim: integer; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pPaddingMask: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 var
@@ -21205,12 +21205,12 @@ begin
   // fully loaded inside the call, so it may build inference-only up front
   // (chained); only the int8 pass is DEFERRED, because the projection head
   // appended below must be loaded with FP32 weights first (the QA-head pattern)
-  // - the final SetInferenceOnly/QuantizeWeightsInt8 sweep closes it.
+  // - the final SetTrainable/QuantizeWeightsInt8 sweep closes it.
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadBertConfigFromJSONFile(ConfigPath);
   Result := BuildBertFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    {pInferenceOnly=}pInferenceOnly, {pIncludePooler=}false, {pSeqClsHead=}false,
+    {pTrainable=}pTrainable, {pIncludePooler=}false, {pSeqClsHead=}false,
     {pQuantizeInt8=}false, {pPaddingMask=}pPaddingMask);
   ProjDim := 0;
   try
@@ -21232,7 +21232,7 @@ begin
       // Per-token projection head: TNNetPointwiseConvLinear with bias
       // suppressed (second arg 1).
       ProjLayer := Result.AddLayer(
-        TNNetPointwiseConvLinear.Create(ProjDim, {pSuppressBias=}1).SetInferenceOnly(pInferenceOnly) );
+        TNNetPointwiseConvLinear.Create(ProjDim, {pSuppressBias=}1).SetTrainable(pTrainable) );
       LoadLlamaLinearWeights(Reader, ProjLayer, 'linear.weight',
         Config.HiddenSize, ProjDim, 0, -1, 0, {BiasName=}'');
     finally
@@ -21250,21 +21250,21 @@ begin
       raise;
     end;
   end;
-  if pInferenceOnly then Result.SetInferenceOnly();
+  if not pTrainable then Result.SetTrainable();
   // Quantize AFTER the projection head is loaded so the int8 sweep covers it
   // too (the projection head is a TNNetPointwiseConvLinear).
   if pQuantizeInt8 then Result.QuantizeWeightsInt8();
 end;
 
 function BuildColBERTFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pPaddingMask: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TBertConfig;
   IgnoredDim: integer;
 begin
   Result := BuildColBERTFromSafeTensorsEx(FileName, IgnoredConfig, IgnoredDim,
-    pSeqLen, pInferenceOnly, '', pPaddingMask, pQuantizeInt8);
+    pSeqLen, pTrainable, '', pPaddingMask, pQuantizeInt8);
 end;
 
 function ColBERTDefaultMarkers(Tokenizer: TNeuralHFTokenizer):
@@ -21795,7 +21795,7 @@ end;
 
 function BuildBertForSequenceClassificationFromSafeTensorsEx(
   const FileName: string; out Config: TBertConfig; Id2Label: TStringList;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -21818,18 +21818,18 @@ begin
   // families whose head needs it (bert only - distilbert/roberta
   // classifier checkpoints carry no pooler tensors).
   Result := BuildBertFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, {pIncludePooler=}false, {pSeqClsHead=}true,
+    pTrainable, {pIncludePooler=}false, {pSeqClsHead=}true,
     pQuantizeInt8);
 end;
 
 function BuildBertForSequenceClassificationFromSafeTensors(
   const FileName: string; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TBertConfig;
 begin
   Result := BuildBertForSequenceClassificationFromSafeTensorsEx(FileName,
-    IgnoredConfig, nil, pSeqLen, pInferenceOnly, '', pQuantizeInt8);
+    IgnoredConfig, nil, pSeqLen, pTrainable, '', pQuantizeInt8);
 end;
 
 // ----------------------- CROSS-ENCODER RERANKER --------------------------
@@ -22048,7 +22048,7 @@ end;
 function BuildGPT2ForSequenceClassificationFromSafeTensorsEx(
   const FileName: string; out Config: TGPT2Config; Id2Label: TStringList;
   pSeqLen: integer = 0; pNumHeads: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -22069,18 +22069,18 @@ begin
     end;
   end;
   Result := BuildGPT2FromSafeTensorsEx(FileName, Config, pSeqLen,
-    pNumHeads, pInferenceOnly, {pSeqClsHead=}true, {pExactGelu=}false,
+    pNumHeads, pTrainable, {pSeqClsHead=}true, {pExactGelu=}false,
     pQuantizeInt8);
 end;
 
 function BuildGPT2ForSequenceClassificationFromSafeTensors(
   const FileName: string; pSeqLen: integer = 0; pNumHeads: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TGPT2Config;
 begin
   Result := BuildGPT2ForSequenceClassificationFromSafeTensorsEx(FileName,
-    IgnoredConfig, nil, pSeqLen, pNumHeads, pInferenceOnly, '',
+    IgnoredConfig, nil, pSeqLen, pNumHeads, pTrainable, '',
     pQuantizeInt8);
 end;
 
@@ -22088,7 +22088,7 @@ end;
 
 function BuildBertForQuestionAnsweringFromSafeTensorsEx(const FileName: string;
   out Config: TBertConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
@@ -22100,12 +22100,12 @@ begin
   // encoder is fully loaded inside the call, so it may build inference-only up
   // front (chained); only the int8 pass is DEFERRED, because the qa_outputs
   // head appended below must be loaded with writable weights first (the ColBERT
-  // pattern) - the final SetInferenceOnly/QuantizeWeightsInt8 sweep closes it.
+  // pattern) - the final SetTrainable/QuantizeWeightsInt8 sweep closes it.
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadBertConfigFromJSONFile(ConfigPath);
   Result := BuildBertFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    {pInferenceOnly=}pInferenceOnly, {pIncludePooler=}false, {pSeqClsHead=}false,
+    {pTrainable=}pTrainable, {pIncludePooler=}false, {pSeqClsHead=}false,
     {pQuantizeInt8=}false);
   try
     // AddQuestionAnsweringHead returns the (SeqLen,1,2) DeepConcat; the two
@@ -22152,18 +22152,18 @@ begin
       raise;
     end;
   end;
-  if pInferenceOnly then Result.SetInferenceOnly();
+  if not pTrainable then Result.SetTrainable();
   if pQuantizeInt8 then Result.QuantizeWeightsInt8();
 end;
 
 function BuildBertForQuestionAnsweringFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TBertConfig;
 begin
   Result := BuildBertForQuestionAnsweringFromSafeTensorsEx(FileName,
-    IgnoredConfig, pSeqLen, pInferenceOnly, '', pQuantizeInt8);
+    IgnoredConfig, pSeqLen, pTrainable, '', pQuantizeInt8);
 end;
 
 function AnswerSpan(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
@@ -22624,7 +22624,7 @@ end;
 
 function BuildDebertaV2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TDebertaV2Config; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pSeqClsHead: boolean = false): TNNet;
+  pTrainable: boolean = true; pSeqClsHead: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -22702,11 +22702,11 @@ begin
       InputLayer := NN.AddLayer( TNNetInput.Create(SeqLen, 1, 2) );
       NN.AddLayer( TNNetSplitChannels.Create([0]) );
       WordEmb := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
       // position_biased_input=false: NO absolute position add, NO token-type
       // add. Just the embedding LayerNorm.
-      EmbLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+      EmbLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       SetLength(Blocks, Config.NumLayers);
       NumLayersM1 := Config.NumLayers - 1;
       NumHeadsM1 := Config.NumHeads - 1;
@@ -22716,7 +22716,7 @@ begin
         // POST-LN disentangled-attention sub-block.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].QKV := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable) );
         // Manual multi-head disentangled attention (one head per
         // TNNetDisentangledAttention so the importer can load each head's
         // position tables).
@@ -22731,14 +22731,14 @@ begin
         ConcatLayer := NN.AddLayer(
           TNNetDeepConcat.Create(Blocks[BlockCnt].Heads) );
         Blocks[BlockCnt].AttnDense := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly), ConcatLayer );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable), ConcatLayer );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         Blocks[BlockCnt].AttnLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         // POST-LN FFN sub-block.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].Inter := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
         if Config.HiddenActTanh then
           NN.AddLayer( TNNetGELU.Create() )
         else
@@ -22753,11 +22753,11 @@ begin
           NN.AddLayer( TNNetReGLU.Create() );
         end;
         Blocks[BlockCnt].OutDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         Blocks[BlockCnt].OutLN := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+        if not pTrainable then NN.SetTrainable();
       end;
       // Optional sequence-classification head (ContextPooler + classifier).
       PoolerDense := nil;
@@ -22768,7 +22768,7 @@ begin
         // ContextPooler: dense(hidden->hidden) + pooler_hidden_act, per-token
         // (row 0 = HF pooled_output); then classifier(pooled).
         PoolerDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         if Config.PoolerActTanh then
           NN.AddLayer( TNNetHyperbolicTangent.Create() )
         else
@@ -22787,9 +22787,9 @@ begin
             '*ForSequenceClassification checkpoint?');
         NumLabels := Reader.DimSize('classifier.weight', 0);
         ClassifierDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(NumLabels).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(NumLabels).SetTrainable(pTrainable) );
       end;
-      if pInferenceOnly then NN.SetInferenceOnly();
+      if not pTrainable then NN.SetTrainable();
 
       // ---------------- Weights ----------------
       LoadWordEmbedding(WordEmb,
@@ -22939,7 +22939,7 @@ end;
 
 function BuildDebertaV2FromSafeTensorsEx(const FileName: string;
   out Config: TDebertaV2Config; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; const ConfigFileName: string = '';
+  pTrainable: boolean = true; const ConfigFileName: string = '';
   pSeqClsHead: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -22948,17 +22948,17 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadDebertaV2ConfigFromJSONFile(ConfigPath);
   Result := BuildDebertaV2FromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pSeqClsHead);
+    pTrainable, pSeqClsHead);
 end;
 
 function BuildDebertaV2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   IgnoredConfig: TDebertaV2Config;
 begin
   Result := BuildDebertaV2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, ConfigFileName, {pSeqClsHead=}false);
+    pTrainable, ConfigFileName, {pSeqClsHead=}false);
 end;
 
 // ============= MISTRAL / QWEN2 / QWEN3 / GEMMA / DISPATCH ==================
@@ -22967,11 +22967,11 @@ end;
 // model_type is the expected family.
 function BuildLlamaFamilyFromSafeTensors(const FileName: string;
   const ExpectedModelType: string; out Config: TLlamaConfig;
-  pSeqLen: integer; pInferenceOnly: boolean;
+  pSeqLen: integer; pTrainable: boolean;
   const ConfigFileName: string; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFromSafeTensorsEx(FileName, Config, pSeqLen,
-    pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pTrainable, ConfigFileName, pQuantizeInt8);
   if Config.ModelType <> ExpectedModelType then
   begin
     Result.Free;
@@ -22984,78 +22984,78 @@ end;
 
 function BuildMistralFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'mistral', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildMistralFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildMistralFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 function BuildQwen2FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'qwen2', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildQwen2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildQwen2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 function BuildQwen3FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'qwen3', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildQwen3FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildQwen3FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 function BuildQwen3MoeFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'qwen3_moe', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildQwen3MoeFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildQwen3MoeFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 function ReadLlama4ConfigFromJSONFile(const FileName: string): TLlamaConfig;
@@ -23215,7 +23215,7 @@ end;
 
 function BuildLlama4FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -23224,150 +23224,150 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadLlama4ConfigFromJSONFile(ConfigPath);
   Result := BuildLlamaFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildLlama4FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildLlama4FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 function BuildOlmo2FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'olmo2', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildOlmo2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildOlmo2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 function BuildOlmoeFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'olmoe', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildOlmoeFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildOlmoeFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 function BuildGemmaFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'gemma', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildGemmaFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildGemmaFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 function BuildGemma2FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'gemma2', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildGemma2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildGemma2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 function BuildGemma3FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'gemma3_text', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildGemma3FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildGemma3FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 function BuildPhi3FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'phi3', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildPhi3FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildPhi3FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 function BuildBitNetFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'bitnet', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildBitNetFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildBitNetFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 type
@@ -23572,7 +23572,7 @@ end;
 
 function BuildInternLM2FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -23614,66 +23614,66 @@ begin
   end;
   // The core builder takes ownership of Reader (it frees it in its finally).
   Result := BuildLlamaFromTensorReaderWithConfig(Reader, FileName, Config,
-    pSeqLen, pInferenceOnly, pQuantizeInt8);
+    pSeqLen, pTrainable, pQuantizeInt8);
 end;
 
 function BuildInternLM2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildInternLM2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 function BuildGLM4FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'glm4', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildGLM4FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildGLM4FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 function BuildMixtralFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'mixtral', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildMixtralFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildMixtralFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 function BuildGraniteFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   // The config reader accepts both 'granite' (dense FFN) and 'granitemoe'
   // (Mixtral-style MoE FFN); accept whichever the checkpoint declares.
   Result := BuildLlamaFromSafeTensorsEx(FileName, Config, pSeqLen,
-    pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pTrainable, ConfigFileName, pQuantizeInt8);
   if (Config.ModelType <> 'granite') and (Config.ModelType <> 'granitemoe') then
   begin
     Result.Free;
@@ -23685,13 +23685,13 @@ begin
 end;
 
 function BuildGraniteFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildGraniteFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 // ============================ MiniCPM IMPORT ===============================
@@ -23709,11 +23709,11 @@ end;
 // ReadLlamaConfigFromJSONFile's "minicpm" branch for the three folds.
 function BuildMiniCPMFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFromSafeTensorsEx(FileName, Config, pSeqLen,
-    pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pTrainable, ConfigFileName, pQuantizeInt8);
   if Config.ModelType <> 'minicpm' then
   begin
     Result.Free;
@@ -23725,13 +23725,13 @@ begin
 end;
 
 function BuildMiniCPMFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildMiniCPMFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 // ============================ GPT-OSS IMPORT ===============================
@@ -23986,7 +23986,7 @@ end;
 // interleaved, clamped-SwiGLU experts.
 procedure BuildGptOssMoEBranch(NN: TNNet; MoESource: TNNetLayer;
   const Config: TGptOssConfig; Reader: TNNetSafeTensorsReader;
-  const BlockPrefix: string; pInferenceOnly: boolean = false);
+  const BlockPrefix: string; pTrainable: boolean = true);
 var
   GateConv, GateTopK, ExpertOut, GateE, GateEBroadcast: TNNetLayer;
   GateUpLayers, DownLayers, MoEBranches: array of TNNetLayer;
@@ -24000,7 +24000,7 @@ begin
   SetLength(DownLayers, Config.NumLocalExperts);
   SetLength(MoEBranches, Config.NumLocalExperts);
   GateConv := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(Config.NumLocalExperts).SetInferenceOnly(pInferenceOnly), MoESource);
+    TNNetPointwiseConvLinear.Create(Config.NumLocalExperts).SetTrainable(pTrainable), MoESource);
   NN.AddLayer( TNNetPointwiseSoftMax.Create() );
   GateTopK := NN.AddLayer( TNNetTopKGate.Create(
     Config.NumExpertsPerTok, {pRenormalize=}True) );
@@ -24008,12 +24008,12 @@ begin
   for ExpertCnt := 0 to NumLocalExpertsM1 do
   begin
     GateUpLayers[ExpertCnt] := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(GU2).SetInferenceOnly(pInferenceOnly),
+      TNNetPointwiseConvLinear.Create(GU2).SetTrainable(pTrainable),
       MoESource);
     NN.AddLayer( TNNetGptOssGatedSwiGLU.Create(
       Config.SwiGLUAlpha, Config.SwiGLULimit) );
     DownLayers[ExpertCnt] := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+      TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
     ExpertOut := NN.GetLastLayer();
     GateE := NN.AddLayerAfter(
       TNNetSplitChannels.Create(ExpertCnt, 1), GateTopK);
@@ -24054,7 +24054,7 @@ end;
 function BuildGptOssFromTensorReaderWithConfig(
   pReader: TNNetSafeTensorsReader; const FileName: string;
   var Config: TGptOssConfig; pSeqLen: integer;
-  pInferenceOnly: boolean; pQuantizeInt8: boolean): TNNet;
+  pTrainable: boolean; pQuantizeInt8: boolean): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -24104,8 +24104,8 @@ begin
     NN.AddLayer( TNNetInput.Create(SeqLen) );
     EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
       Config.VocabSize, Config.HiddenSize, {EncodeZero=}1
-      ).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+      ).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
     SetLength(KRotated, Config.NumKVHeads);
     SetLength(VSlices, Config.NumKVHeads);
     SetLength(HeadOutputs, Config.NumHeads);
@@ -24137,16 +24137,16 @@ begin
         LayerWindow := 0;
       // attention sub-block: x := x + o_proj(sink-attn(rope-GQA(RMSNorm(x))))
       BranchInput := NN.GetLastLayer();
-      AttnNorm := NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly) );
+      AttnNorm := NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
       NormedSource := AttnNorm;
       QProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(QWidth).SetInferenceOnly(pInferenceOnly),
+        TNNetPointwiseConvLinear.Create(QWidth).SetTrainable(pTrainable),
         NormedSource);
       KProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly),
+        TNNetPointwiseConvLinear.Create(KVWidth).SetTrainable(pTrainable),
         NormedSource);
       VProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly),
+        TNNetPointwiseConvLinear.Create(KVWidth).SetTrainable(pTrainable),
         NormedSource);
       for KVHeadCnt := 0 to NumKVHeadsM1 do
       begin
@@ -24176,14 +24176,14 @@ begin
       end;
       NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
       OProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+        TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetSum.Create([OProj, BranchInput]) );
       // MLP sub-block: x := x + MoE(RMSNorm(x))
       BranchInput := NN.GetLastLayer();
-      MlpNorm := NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly) );
-      BuildGptOssMoEBranch(NN, MlpNorm, Config, Reader, BlockPrefix, pInferenceOnly);
+      MlpNorm := NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
+      BuildGptOssMoEBranch(NN, MlpNorm, Config, Reader, BlockPrefix, pTrainable);
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+      if not pTrainable then NN.SetTrainable();
 
       LoadLlamaRMSNormWeights(Reader, AttnNorm,
         BlockPrefix + 'input_layernorm.weight', Config.HiddenSize);
@@ -24218,12 +24218,12 @@ begin
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
     end;
 
-    NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly) );
+    NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
     LoadLlamaRMSNormWeights(Reader, NN.GetLastLayer(),
       Config.Prefix + 'norm.weight', Config.HiddenSize);
     LMHead := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+      TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
     Tmp := TNNetVolume.Create;
     try
       if Config.TieWordEmbeddings then
@@ -24258,7 +24258,7 @@ end;
 
 function BuildGptOssFromSafeTensorsEx(const FileName: string;
   out Config: TGptOssConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -24268,17 +24268,17 @@ begin
   Config := ReadGptOssConfigFromJSONFile(ConfigPath);
   Result := BuildGptOssFromTensorReaderWithConfig(
     CreatePretrainedTensorReader(FileName), FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildGptOssFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TGptOssConfig;
 begin
   Result := BuildGptOssFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 function LoadPretrainedEmbedding(const FileName: string;
@@ -24561,7 +24561,7 @@ type
 // TNNetInput). Layer handles for the weight loader are returned in Blocks.
 procedure BuildT5StackBlocks(NN: TNNet; const Config: TT5Config;
   NumBlocks: integer; IsDecoder: boolean; EncStates: TNNetLayer;
-  var Blocks: TT5BlockArray; pInferenceOnly: boolean;
+  var Blocks: TT5BlockArray; pTrainable: boolean;
   pQuantizeInt8: boolean = false);
 var
   InnerDim, BlockCnt, HeadCnt, d: integer;
@@ -24585,14 +24585,14 @@ begin
     // causal (= HF bidirectional=False bucketing); the encoder is not.
     BranchInput := NN.GetLastLayer();
     Blocks[BlockCnt].SelfAttn.Norm :=
-      NN.AddLayer( TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+      NN.AddLayer( TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
     NormedSource := NN.GetLastLayer();
     Blocks[BlockCnt].SelfAttn.QProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(InnerDim).SetInferenceOnly(pInferenceOnly), NormedSource);
+      TNNetPointwiseConvLinear.Create(InnerDim).SetTrainable(pTrainable), NormedSource);
     Blocks[BlockCnt].SelfAttn.KProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(InnerDim).SetInferenceOnly(pInferenceOnly), NormedSource);
+      TNNetPointwiseConvLinear.Create(InnerDim).SetTrainable(pTrainable), NormedSource);
     Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(InnerDim).SetInferenceOnly(pInferenceOnly), NormedSource);
+      TNNetPointwiseConvLinear.Create(InnerDim).SetTrainable(pTrainable), NormedSource);
     SetLength(Blocks[BlockCnt].SelfAttn.Heads, Config.NumHeads);
     for HeadCnt := 0 to NumHeadsM1 do
     begin
@@ -24616,7 +24616,7 @@ begin
     end;
     NN.AddLayer( TNNetDeepConcat.Create(Blocks[BlockCnt].SelfAttn.Heads) );
     Blocks[BlockCnt].SelfAttn.OProj := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
 
     // ---- cross-attention sub-block (decoder only) ----
@@ -24629,14 +24629,14 @@ begin
     begin
       BranchInput := NN.GetLastLayer();
       Blocks[BlockCnt].CrossAttn.Norm :=
-        NN.AddLayer( TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        NN.AddLayer( TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       NormedSource := NN.GetLastLayer();
       Blocks[BlockCnt].CrossAttn.QProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(InnerDim).SetInferenceOnly(pInferenceOnly), NormedSource);
+        TNNetPointwiseConvLinear.Create(InnerDim).SetTrainable(pTrainable), NormedSource);
       Blocks[BlockCnt].CrossAttn.KProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(InnerDim).SetInferenceOnly(pInferenceOnly), EncStates);
+        TNNetPointwiseConvLinear.Create(InnerDim).SetTrainable(pTrainable), EncStates);
       Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(InnerDim).SetInferenceOnly(pInferenceOnly), EncStates);
+        TNNetPointwiseConvLinear.Create(InnerDim).SetTrainable(pTrainable), EncStates);
       SetLength(Blocks[BlockCnt].CrossAttn.Heads, Config.NumHeads);
       for HeadCnt := 0 to NumHeadsM1 do
       begin
@@ -24658,7 +24658,7 @@ begin
       end;
       NN.AddLayer( TNNetDeepConcat.Create(Blocks[BlockCnt].CrossAttn.Heads) );
       Blocks[BlockCnt].CrossAttn.OProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly) );
+        TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
     end;
 
@@ -24670,23 +24670,23 @@ begin
     // "relu": h = relu(wi(x)). Both end with wo back to d_model.
     BranchInput := NN.GetLastLayer();
     Blocks[BlockCnt].FFNNorm :=
-      NN.AddLayer( TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+      NN.AddLayer( TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
     if Config.GatedFFN then
     begin
       Blocks[BlockCnt].Wi := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(2 * Config.DFF).SetInferenceOnly(pInferenceOnly) );
+        TNNetPointwiseConvLinear.Create(2 * Config.DFF).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetGEGLU.Create() );
     end
     else
     begin
       Blocks[BlockCnt].Wi := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.DFF).SetInferenceOnly(pInferenceOnly) );
+        TNNetPointwiseConvLinear.Create(Config.DFF).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetReLU.Create() );
     end;
     Blocks[BlockCnt].Wo := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
     if pQuantizeInt8 then NN.QuantizeWeightsInt8();
   end;
   SetLength(SliceChannels, 0);
@@ -24841,7 +24841,7 @@ end;
 
 procedure BuildT5FromSafeTensorsWithConfig(const FileName: string;
   var Config: TT5Config; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 var
   ReaderMax: integer;
@@ -24903,14 +24903,14 @@ begin
       // EncodeZero=1: token id 0 (<pad>, also the decoder start token) is
       // a real embedding row.
       EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Enc.SetInferenceOnly();
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetTrainable(pTrainable) );
+      if not pTrainable then Enc.SetTrainable();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       BuildT5StackBlocks(Enc, Config, Config.NumLayers, {IsDecoder=}false,
-        nil, EncBlocks, pInferenceOnly, pQuantizeInt8);
+        nil, EncBlocks, pTrainable, pQuantizeInt8);
       EncFinalNorm := Enc.AddLayer(
-        TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Enc.SetInferenceOnly();
+        TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then Enc.SetTrainable();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
 
       // ---------------- Decoder architecture ----------------
@@ -24923,17 +24923,17 @@ begin
       EncStates := Dec.AddLayerAfter(
         TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly), DecTokenInput);
-      if pInferenceOnly then Dec.SetInferenceOnly();
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetTrainable(pTrainable), DecTokenInput);
+      if not pTrainable then Dec.SetTrainable();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       BuildT5StackBlocks(Dec, Config, Config.NumDecoderLayers,
-        {IsDecoder=}true, EncStates, DecBlocks, pInferenceOnly,
+        {IsDecoder=}true, EncStates, DecBlocks, pTrainable,
         pQuantizeInt8);
       DecFinalNorm := Dec.AddLayer(
-        TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       LMHead := Dec.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Dec.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then Dec.SetTrainable();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -25030,7 +25030,7 @@ end;
 
 procedure BuildT5FromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TT5Config;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 var
   ConfigPath: string;
@@ -25039,7 +25039,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadT5ConfigFromJSONFile(ConfigPath);
   BuildT5FromSafeTensorsWithConfig(FileName, Config, EncoderNet,
-    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+    DecoderNet, EncSeqLen, DecSeqLen, pTrainable, pQuantizeInt8);
 end;
 
 function T5EncoderStatesInput(DecoderNet: TNNet): TNNetLayer;
@@ -25217,7 +25217,7 @@ type
 procedure BuildMarianStackBlocks(NN: TNNet; const Config: TMarianConfig;
   NumBlocks, NumHeads, FFNDim: integer; IsDecoder: boolean;
   EncStates: TNNetLayer; var Blocks: TMarianBlockArray;
-  pInferenceOnly: boolean; pQuantizeInt8: boolean = false);
+  pTrainable: boolean; pQuantizeInt8: boolean = false);
 var
   HeadDim, BlockCnt, HeadCnt, d: integer;
   NumBlocksM1, NumHeadsM1, HeadDimM1: integer;
@@ -25241,11 +25241,11 @@ begin
     // unmodified (no T5-style scale compensation).
     BranchInput := NN.GetLastLayer();
     Blocks[BlockCnt].SelfAttn.QProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), BranchInput);
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), BranchInput);
     Blocks[BlockCnt].SelfAttn.KProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), BranchInput);
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), BranchInput);
     Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), BranchInput);
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), BranchInput);
     for HeadCnt := 0 to NumHeadsM1 do
     begin
       for d := 0 to HeadDimM1 do
@@ -25267,10 +25267,10 @@ begin
     end;
     NN.AddLayer( TNNetDeepConcat.Create(Heads) );
     Blocks[BlockCnt].SelfAttn.OProj := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
     Blocks[BlockCnt].SelfAttn.Norm := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(MarianLayerNormEps).SetInferenceOnly(pInferenceOnly) );
+      TNNetTokenLayerNorm.Create(MarianLayerNormEps).SetTrainable(pTrainable) );
 
     // ---- cross-attention sub-block (decoder only) ----
     // Queries from the post-normed decoder stream; Keys|Values projected
@@ -25282,11 +25282,11 @@ begin
     begin
       BranchInput := NN.GetLastLayer();
       Blocks[BlockCnt].CrossAttn.QProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), BranchInput);
+        TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), BranchInput);
       Blocks[BlockCnt].CrossAttn.KProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), EncStates);
+        TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), EncStates);
       Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), EncStates);
+        TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), EncStates);
       for HeadCnt := 0 to NumHeadsM1 do
       begin
         for d := 0 to HeadDimM1 do
@@ -25307,26 +25307,26 @@ begin
       end;
       NN.AddLayer( TNNetDeepConcat.Create(Heads) );
       Blocks[BlockCnt].CrossAttn.OProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly) );
+        TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
       Blocks[BlockCnt].CrossAttn.Norm := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(MarianLayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(MarianLayerNormEps).SetTrainable(pTrainable) );
     end;
 
     // ---- FFN sub-block: fc2(act(fc1(x))), then final_layer_norm ----
     BranchInput := NN.GetLastLayer();
     Blocks[BlockCnt].Fc1 := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(FFNDim).SetInferenceOnly(pInferenceOnly) );
+      TNNetPointwiseConvLinear.Create(FFNDim).SetTrainable(pTrainable) );
     if Config.SwishFFN then
       NN.AddLayer( TNNetSwish.Create() )
     else
       NN.AddLayer( TNNetReLU.Create() );
     Blocks[BlockCnt].Fc2 := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
     Blocks[BlockCnt].FFNNorm := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(MarianLayerNormEps).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+      TNNetTokenLayerNorm.Create(MarianLayerNormEps).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
     if pQuantizeInt8 then NN.QuantizeWeightsInt8();
   end;
   SetLength(SliceChannels, 0);
@@ -25465,7 +25465,7 @@ end;
 
 procedure BuildMarianFromSafeTensorsWithConfig(const FileName: string;
   var Config: TMarianConfig; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 var
   LpMax: integer;
@@ -25540,16 +25540,16 @@ begin
       Enc.AddLayer( TNNetInput.Create(EncSeqLen) );
       // EncodeZero=1: token id 0 (eos in opus-mt) is a real embedding row.
       EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetTrainable(pTrainable) );
       // Static sinusoidal positions, added AFTER the (scaled) token
       // embedding; the table is filled below (Marian half-split layout).
       EncPos := Enc.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(EncSeqLen).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Enc.SetInferenceOnly();
+        TNNetLearnedPositionalEmbedding.Create(EncSeqLen).SetTrainable(pTrainable) );
+      if not pTrainable then Enc.SetTrainable();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       BuildMarianStackBlocks(Enc, Config, Config.EncoderLayers,
         Config.EncoderHeads, Config.EncoderFFNDim, {IsDecoder=}false,
-        nil, EncBlocks, pInferenceOnly, pQuantizeInt8);
+        nil, EncBlocks, pTrainable, pQuantizeInt8);
       // POST-norm stack: NO final norm (the last block ends in one).
 
       // ---------------- Decoder architecture ----------------
@@ -25562,17 +25562,17 @@ begin
       EncStates := Dec.AddLayerAfter(
         TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly), DecTokenInput);
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetTrainable(pTrainable), DecTokenInput);
       DecPos := Dec.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Dec.SetInferenceOnly();
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).SetTrainable(pTrainable) );
+      if not pTrainable then Dec.SetTrainable();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       BuildMarianStackBlocks(Dec, Config, Config.DecoderLayers,
         Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
-        EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8);
+        EncStates, DecBlocks, pTrainable, pQuantizeInt8);
       LMHead := Dec.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Dec.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then Dec.SetTrainable();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -25670,7 +25670,7 @@ end;
 
 procedure BuildMarianFromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TMarianConfig;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 var
   ConfigPath: string;
@@ -25679,7 +25679,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadMarianConfigFromJSONFile(ConfigPath);
   BuildMarianFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
-    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+    DecoderNet, EncSeqLen, DecSeqLen, pTrainable, pQuantizeInt8);
 end;
 
 // ===========================================================================
@@ -26607,7 +26607,7 @@ end;
 procedure BuildBartStackBlocks(NN: TNNet; const Config: TBartConfig;
   NumBlocks, NumHeads, FFNDim: integer; IsDecoder: boolean;
   EncStates: TNNetLayer; var Blocks: TMarianBlockArray;
-  pInferenceOnly: boolean; pQuantizeInt8: boolean = false);
+  pTrainable: boolean; pQuantizeInt8: boolean = false);
 var
   HeadDim, BlockCnt, HeadCnt, d, NumBlocksM1, NumHeadsM1, HeadDimM1: integer;
   BranchInput, HiddenAct, PhiBranch: TNNetLayer;
@@ -26627,11 +26627,11 @@ begin
     // ---- self-attention sub-block (residual add, THEN LayerNorm) ----
     BranchInput := NN.GetLastLayer();
     Blocks[BlockCnt].SelfAttn.QProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), BranchInput);
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), BranchInput);
     Blocks[BlockCnt].SelfAttn.KProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), BranchInput);
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), BranchInput);
     Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), BranchInput);
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), BranchInput);
     for HeadCnt := 0 to NumHeadsM1 do
     begin
       for d := 0 to HeadDimM1 do
@@ -26653,21 +26653,21 @@ begin
     end;
     NN.AddLayer( TNNetDeepConcat.Create(Heads) );
     Blocks[BlockCnt].SelfAttn.OProj := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
     Blocks[BlockCnt].SelfAttn.Norm := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(BartLayerNormEps).SetInferenceOnly(pInferenceOnly) );
+      TNNetTokenLayerNorm.Create(BartLayerNormEps).SetTrainable(pTrainable) );
 
     // ---- cross-attention sub-block (decoder only) ----
     if IsDecoder then
     begin
       BranchInput := NN.GetLastLayer();
       Blocks[BlockCnt].CrossAttn.QProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), BranchInput);
+        TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), BranchInput);
       Blocks[BlockCnt].CrossAttn.KProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), EncStates);
+        TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), EncStates);
       Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), EncStates);
+        TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), EncStates);
       for HeadCnt := 0 to NumHeadsM1 do
       begin
         for d := 0 to HeadDimM1 do
@@ -26688,16 +26688,16 @@ begin
       end;
       NN.AddLayer( TNNetDeepConcat.Create(Heads) );
       Blocks[BlockCnt].CrossAttn.OProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly) );
+        TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
       Blocks[BlockCnt].CrossAttn.Norm := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(BartLayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(BartLayerNormEps).SetTrainable(pTrainable) );
     end;
 
     // ---- FFN sub-block: fc2(gelu(fc1(x))), then final_layer_norm ----
     BranchInput := NN.GetLastLayer();
     Blocks[BlockCnt].Fc1 := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(FFNDim).SetInferenceOnly(pInferenceOnly) );
+      TNNetPointwiseConvLinear.Create(FFNDim).SetTrainable(pTrainable) );
     // EXACT erf GELU x*Phi(x) composed from existing layers (the BERT
     // recipe): Phi = 0.5*(1 + erf(x/sqrt(2))) on a side branch, then
     // ReGLU(Phi|x) = ReLU(Phi)*x = Phi*x since Phi is in (0, 1). TNNetReGLU
@@ -26711,11 +26711,11 @@ begin
     NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
     NN.AddLayer( TNNetReGLU.Create() );
     Blocks[BlockCnt].Fc2 := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
     Blocks[BlockCnt].FFNNorm := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(BartLayerNormEps).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+      TNNetTokenLayerNorm.Create(BartLayerNormEps).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
     if pQuantizeInt8 then NN.QuantizeWeightsInt8();
   end;
   SetLength(SliceChannels, 0);
@@ -26724,7 +26724,7 @@ end;
 
 procedure BuildBartFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 var
   LpMax: integer;
@@ -26829,16 +26829,16 @@ begin
       Enc := TNNet.Create();
       Enc.AddLayer( TNNetInput.Create(EncSeqLen) );
       EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetTrainable(pTrainable) );
       EncPos := Enc.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(EncSeqLen).SetInferenceOnly(pInferenceOnly) );
+        TNNetLearnedPositionalEmbedding.Create(EncSeqLen).SetTrainable(pTrainable) );
       EncEmbLN := Enc.AddLayer(
-        TNNetTokenLayerNorm.Create(BartLayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Enc.SetInferenceOnly();
+        TNNetTokenLayerNorm.Create(BartLayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then Enc.SetTrainable();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       BuildBartStackBlocks(Enc, Config, Config.EncoderLayers,
         Config.EncoderHeads, Config.EncoderFFNDim, {IsDecoder=}false,
-        nil, EncBlocks, pInferenceOnly, pQuantizeInt8);
+        nil, EncBlocks, pTrainable, pQuantizeInt8);
 
       // ---------------- Decoder architecture ----------------
       Dec := TNNet.Create();
@@ -26846,19 +26846,19 @@ begin
       EncStates := Dec.AddLayerAfter(
         TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly), DecTokenInput);
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetTrainable(pTrainable), DecTokenInput);
       DecPos := Dec.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).SetInferenceOnly(pInferenceOnly) );
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).SetTrainable(pTrainable) );
       DecEmbLN := Dec.AddLayer(
-        TNNetTokenLayerNorm.Create(BartLayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Dec.SetInferenceOnly();
+        TNNetTokenLayerNorm.Create(BartLayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then Dec.SetTrainable();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       BuildBartStackBlocks(Dec, Config, Config.DecoderLayers,
         Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
-        EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8);
+        EncStates, DecBlocks, pTrainable, pQuantizeInt8);
       LMHead := Dec.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Dec.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then Dec.SetTrainable();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -26963,16 +26963,16 @@ end;
 
 procedure BuildBartFromSafeTensorsEx(const FileName: string;
   Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 begin
   BuildBartFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
-    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+    DecoderNet, EncSeqLen, DecSeqLen, pTrainable, pQuantizeInt8);
 end;
 
 procedure BuildBartFromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TBartConfig;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 var
   ConfigPath: string;
@@ -26981,7 +26981,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadBartConfigFromJSONFile(ConfigPath);
   BuildBartFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
-    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+    DecoderNet, EncSeqLen, DecSeqLen, pTrainable, pQuantizeInt8);
 end;
 
 // ===========================================================================
@@ -27109,7 +27109,7 @@ end;
 procedure BuildPegasusStackBlocks(NN: TNNet; const Config: TPegasusConfig;
   NumBlocks, NumHeads, FFNDim: integer; IsDecoder: boolean;
   EncStates: TNNetLayer; var Blocks: TMarianBlockArray;
-  pInferenceOnly: boolean; pQuantizeInt8: boolean = false;
+  pTrainable: boolean; pQuantizeInt8: boolean = false;
   UseReluFFN: boolean = false);
 var
   HeadDim, BlockCnt, HeadCnt, d, NumBlocksM1, NumHeadsM1, HeadDimM1: integer;
@@ -27130,14 +27130,14 @@ begin
     // ---- self-attention sub-block (PRE-norm: LN, sublayer, add raw) ----
     ResidualInput := NN.GetLastLayer();
     Blocks[BlockCnt].SelfAttn.Norm := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(PegasusLayerNormEps).SetInferenceOnly(pInferenceOnly) );
+      TNNetTokenLayerNorm.Create(PegasusLayerNormEps).SetTrainable(pTrainable) );
     NormedInput := NN.GetLastLayer();
     Blocks[BlockCnt].SelfAttn.QProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), NormedInput);
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), NormedInput);
     Blocks[BlockCnt].SelfAttn.KProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), NormedInput);
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), NormedInput);
     Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), NormedInput);
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), NormedInput);
     for HeadCnt := 0 to NumHeadsM1 do
     begin
       for d := 0 to HeadDimM1 do
@@ -27159,7 +27159,7 @@ begin
     end;
     NN.AddLayer( TNNetDeepConcat.Create(Heads) );
     Blocks[BlockCnt].SelfAttn.OProj := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), ResidualInput]) );
 
     // ---- cross-attention sub-block (decoder only, PRE-norm) ----
@@ -27167,15 +27167,15 @@ begin
     begin
       ResidualInput := NN.GetLastLayer();
       Blocks[BlockCnt].CrossAttn.Norm := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(PegasusLayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(PegasusLayerNormEps).SetTrainable(pTrainable) );
       NormedInput := NN.GetLastLayer();
       Blocks[BlockCnt].CrossAttn.QProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), NormedInput);
+        TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), NormedInput);
       // Keys|Values come from the (already final-normed) encoder states.
       Blocks[BlockCnt].CrossAttn.KProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), EncStates);
+        TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), EncStates);
       Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), EncStates);
+        TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), EncStates);
       for HeadCnt := 0 to NumHeadsM1 do
       begin
         for d := 0 to HeadDimM1 do
@@ -27196,16 +27196,16 @@ begin
       end;
       NN.AddLayer( TNNetDeepConcat.Create(Heads) );
       Blocks[BlockCnt].CrossAttn.OProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly) );
+        TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), ResidualInput]) );
     end;
 
     // ---- FFN sub-block (PRE-norm): fc2(act(fc1(LN(x)))) + x ----
     ResidualInput := NN.GetLastLayer();
     Blocks[BlockCnt].FFNNorm := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(PegasusLayerNormEps).SetInferenceOnly(pInferenceOnly) );
+      TNNetTokenLayerNorm.Create(PegasusLayerNormEps).SetTrainable(pTrainable) );
     Blocks[BlockCnt].Fc1 := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(FFNDim).SetInferenceOnly(pInferenceOnly) );
+      TNNetPointwiseConvLinear.Create(FFNDim).SetTrainable(pTrainable) );
     if UseReluFFN then
     begin
       // Plain ReLU FFN (M2M100/NLLB use activation_function="relu").
@@ -27226,11 +27226,11 @@ begin
       NN.AddLayer( TNNetReGLU.Create() );
     end;
     Blocks[BlockCnt].Fc2 := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), ResidualInput]) );
     // Backstop: demote any non-weight-bearing stragglers (the weight layers
-    // above are already built inference-only via the chained SetInferenceOnly).
-    if pInferenceOnly then NN.SetInferenceOnly();
+    // above are already built inference-only via the chained SetTrainable).
+    if not pTrainable then NN.SetTrainable();
     if pQuantizeInt8 then NN.QuantizeWeightsInt8();
   end;
   SetLength(SliceChannels, 0);
@@ -27388,7 +27388,7 @@ end;
 // Forward declaration: the width-1 step net builder is defined alongside the
 // importer below, but EnsureStepDecoder (above it) needs it.
 function BuildMusicGenDecoderNet(const Config: TMusicGenConfig;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean;
   out Blocks: TMarianBlockArray;
   out HeadLayers: array of TNNetLayer; out FinalLN: TNNetLayer): TNNet; forward;
 
@@ -27438,10 +27438,10 @@ begin
   if Assigned(FStepDecoder) then exit;
   // Same structure as FDecoder but with a width-1 decoder input (DecSeqLen=1).
   // The cross-attention encoder-states input keeps the full FEncSeqLen width.
-  // pInferenceOnly=true: the twin is only ever run forward.
+  // pTrainable=false: the twin is only ever run forward.
   SetLength(StepHeads, FConfig.NumCodebooks);
   FStepDecoder := BuildMusicGenDecoderNet(FConfig, FEncSeqLen, 1,
-    {pInferenceOnly=}true, StepBlocks, StepHeads, StepFinalLN);
+    {pTrainable=}false, StepBlocks, StepHeads, StepFinalLN);
   // Layer-by-layer weight copy: the two nets have identical layer topology
   // (only the input SizeX differs), so every neuron weight transfers exactly.
   FStepDecoder.CopyWeights(FDecoder);
@@ -27458,7 +27458,7 @@ begin
   // run the unconditional pass with its own self-attention KV-cache.
   SetLength(StepHeads, FConfig.NumCodebooks);
   FStepDecoderUncond := BuildMusicGenDecoderNet(FConfig, FEncSeqLen, 1,
-    {pInferenceOnly=}true, StepBlocks, StepHeads, StepFinalLN);
+    {pTrainable=}false, StepBlocks, StepHeads, StepFinalLN);
   FStepDecoderUncond.CopyWeights(FDecoder);
 end;
 
@@ -28035,7 +28035,7 @@ end;
 // step path (a width-1 twin: DecSeqLen=1 input, weights copied from the full
 // decoder). Coded by Claude (AI).
 function BuildMusicGenDecoderNet(const Config: TMusicGenConfig;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean;
   out Blocks: TMarianBlockArray;
   out HeadLayers: array of TNNetLayer; out FinalLN: TNNetLayer): TNNet;
 var
@@ -28056,25 +28056,25 @@ begin
   PegShim.DModel := Config.Hidden;
   PegShim.VocabSize := Config.VocabSize;
   BuildPegasusStackBlocks(Dec, PegShim, Config.NumLayers, Config.NumHeads,
-    Config.FFNDim, {IsDecoder=}true, EncStates, Blocks, pInferenceOnly,
+    Config.FFNDim, {IsDecoder=}true, EncStates, Blocks, pTrainable,
     {pQuantizeInt8=}false, {UseReluFFN=}false);
   // Final decoder LayerNorm (closes the pre-norm stack).
   FinalLN := Dec.AddLayer(
-    TNNetTokenLayerNorm.Create(PegasusLayerNormEps).SetInferenceOnly(pInferenceOnly) );
+    TNNetTokenLayerNorm.Create(PegasusLayerNormEps).SetTrainable(pTrainable) );
   // K LM heads over the final hidden, depth-concatenated into K*vocab.
   NumCbM1 := Config.NumCodebooks - 1;
   for k_i := 0 to NumCbM1 do
     HeadLayers[k_i] := Dec.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly),
+      TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable),
       FinalLN);
   Dec.AddLayer( TNNetDeepConcat.Create(HeadLayers) );
-  if pInferenceOnly then Dec.SetInferenceOnly();
+  if not pTrainable then Dec.SetTrainable();
   Result := Dec;
 end;
 
 function BuildMusicGenFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
   const Config: TMusicGenConfig; EncSeqLen, DecSeqLen: integer;
-  pInferenceOnly: boolean = false): TMusicGenModel;
+  pTrainable: boolean = true): TMusicGenModel;
 var
   Model: TMusicGenModel;
   Dec: TNNet;
@@ -28106,7 +28106,7 @@ begin
     // ----- decoder net: input embeddings + enc states -> blocks -> heads ---
     SetLength(HeadLayers, Config.NumCodebooks);
     FinalLN := nil;
-    Dec := BuildMusicGenDecoderNet(Config, EncSeqLen, DecSeqLen, pInferenceOnly,
+    Dec := BuildMusicGenDecoderNet(Config, EncSeqLen, DecSeqLen, pTrainable,
       Blocks, HeadLayers, FinalLN);
     Model.FDecoder := Dec;
     NumCbM1 := Config.NumCodebooks - 1;
@@ -28250,7 +28250,7 @@ end;
 
 function BuildMusicGenFromSafeTensors(const FileName: string;
   out Config: TMusicGenConfig; EncSeqLen, DecSeqLen: integer;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TMusicGenModel;
 var
   Reader: TNNetSafeTensorsReader;
@@ -28262,7 +28262,7 @@ begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
     Result := BuildMusicGenFromSafeTensorsEx(Reader, Config, EncSeqLen,
-      DecSeqLen, pInferenceOnly);
+      DecSeqLen, pTrainable);
   finally
     Reader.Free;
   end;
@@ -28270,7 +28270,7 @@ end;
 
 procedure BuildPegasusFromSafeTensorsWithConfig(const FileName: string;
   var Config: TPegasusConfig; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 var
   LpMax: integer;
@@ -28348,19 +28348,19 @@ begin
       Enc := TNNet.Create();
       Enc.AddLayer( TNNetInput.Create(EncSeqLen) );
       EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetTrainable(pTrainable) );
       // Static sinusoidal positions, NO padding offset (position p -> row p).
       EncPos := Enc.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(EncSeqLen).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Enc.SetInferenceOnly();
+        TNNetLearnedPositionalEmbedding.Create(EncSeqLen).SetTrainable(pTrainable) );
+      if not pTrainable then Enc.SetTrainable();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       BuildPegasusStackBlocks(Enc, Config, Config.EncoderLayers,
         Config.EncoderHeads, Config.EncoderFFNDim, {IsDecoder=}false,
-        nil, EncBlocks, pInferenceOnly, pQuantizeInt8);
+        nil, EncBlocks, pTrainable, pQuantizeInt8);
       // Pre-norm stack: a FINAL encoder LayerNorm closes the stack.
       EncFinalLN := Enc.AddLayer(
-        TNNetTokenLayerNorm.Create(PegasusLayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Enc.SetInferenceOnly();
+        TNNetTokenLayerNorm.Create(PegasusLayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then Enc.SetTrainable();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
 
       // ---------------- Decoder architecture ----------------
@@ -28369,21 +28369,21 @@ begin
       EncStates := Dec.AddLayerAfter(
         TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly), DecTokenInput);
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetTrainable(pTrainable), DecTokenInput);
       DecPos := Dec.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Dec.SetInferenceOnly();
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).SetTrainable(pTrainable) );
+      if not pTrainable then Dec.SetTrainable();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       BuildPegasusStackBlocks(Dec, Config, Config.DecoderLayers,
         Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
-        EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8);
+        EncStates, DecBlocks, pTrainable, pQuantizeInt8);
       // Pre-norm stack: a FINAL decoder LayerNorm closes the stack BEFORE
       // the lm_head.
       DecFinalLN := Dec.AddLayer(
-        TNNetTokenLayerNorm.Create(PegasusLayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(PegasusLayerNormEps).SetTrainable(pTrainable) );
       LMHead := Dec.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Dec.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then Dec.SetTrainable();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -28492,16 +28492,16 @@ end;
 
 procedure BuildPegasusFromSafeTensorsEx(const FileName: string;
   Config: TPegasusConfig; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 begin
   BuildPegasusFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
-    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+    DecoderNet, EncSeqLen, DecSeqLen, pTrainable, pQuantizeInt8);
 end;
 
 procedure BuildPegasusFromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TPegasusConfig;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 var
   ConfigPath: string;
@@ -28510,7 +28510,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadPegasusConfigFromJSONFile(ConfigPath);
   BuildPegasusFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
-    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+    DecoderNet, EncSeqLen, DecSeqLen, pTrainable, pQuantizeInt8);
 end;
 
 // ===========================================================================
@@ -28596,7 +28596,7 @@ end;
 
 procedure BuildMBartFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 var
   LpMax: integer;
@@ -28708,19 +28708,19 @@ begin
       Enc := TNNet.Create();
       Enc.AddLayer( TNNetInput.Create(EncSeqLen) );
       EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetTrainable(pTrainable) );
       EncPos := Enc.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(EncSeqLen).SetInferenceOnly(pInferenceOnly) );
+        TNNetLearnedPositionalEmbedding.Create(EncSeqLen).SetTrainable(pTrainable) );
       EncEmbLN := Enc.AddLayer(
-        TNNetTokenLayerNorm.Create(BartLayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Enc.SetInferenceOnly();
+        TNNetTokenLayerNorm.Create(BartLayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then Enc.SetTrainable();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       BuildPegasusStackBlocks(Enc, PegShim, Config.EncoderLayers,
         Config.EncoderHeads, Config.EncoderFFNDim, {IsDecoder=}false,
-        nil, EncBlocks, pInferenceOnly, pQuantizeInt8);
+        nil, EncBlocks, pTrainable, pQuantizeInt8);
       EncFinalLN := Enc.AddLayer(
-        TNNetTokenLayerNorm.Create(BartLayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Enc.SetInferenceOnly();
+        TNNetTokenLayerNorm.Create(BartLayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then Enc.SetTrainable();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
 
       // ---------------- Decoder architecture ----------------
@@ -28729,21 +28729,21 @@ begin
       EncStates := Dec.AddLayerAfter(
         TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly), DecTokenInput);
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetTrainable(pTrainable), DecTokenInput);
       DecPos := Dec.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).SetInferenceOnly(pInferenceOnly) );
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).SetTrainable(pTrainable) );
       DecEmbLN := Dec.AddLayer(
-        TNNetTokenLayerNorm.Create(BartLayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Dec.SetInferenceOnly();
+        TNNetTokenLayerNorm.Create(BartLayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then Dec.SetTrainable();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       BuildPegasusStackBlocks(Dec, PegShim, Config.DecoderLayers,
         Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
-        EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8);
+        EncStates, DecBlocks, pTrainable, pQuantizeInt8);
       DecFinalLN := Dec.AddLayer(
-        TNNetTokenLayerNorm.Create(BartLayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(BartLayerNormEps).SetTrainable(pTrainable) );
       LMHead := Dec.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Dec.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then Dec.SetTrainable();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -28857,16 +28857,16 @@ end;
 
 procedure BuildMBartFromSafeTensorsEx(const FileName: string;
   Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 begin
   BuildMBartFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
-    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+    DecoderNet, EncSeqLen, DecSeqLen, pTrainable, pQuantizeInt8);
 end;
 
 procedure BuildMBartFromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TBartConfig;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 var
   ConfigPath: string;
@@ -28875,7 +28875,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadMBartConfigFromJSONFile(ConfigPath);
   BuildMBartFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
-    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+    DecoderNet, EncSeqLen, DecSeqLen, pTrainable, pQuantizeInt8);
 end;
 
 // ===========================================================================
@@ -29001,7 +29001,7 @@ end;
 
 procedure BuildM2M100FromSafeTensorsWithConfig(const FileName: string;
   var Config: TM2M100Config; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 var
   LpMax: integer;
@@ -29087,17 +29087,17 @@ begin
       Enc := TNNet.Create();
       Enc.AddLayer( TNNetInput.Create(EncSeqLen) );
       EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetTrainable(pTrainable) );
       EncPos := Enc.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(EncSeqLen).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Enc.SetInferenceOnly();
+        TNNetLearnedPositionalEmbedding.Create(EncSeqLen).SetTrainable(pTrainable) );
+      if not pTrainable then Enc.SetTrainable();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       BuildPegasusStackBlocks(Enc, PegShim, Config.EncoderLayers,
         Config.EncoderHeads, Config.EncoderFFNDim, {IsDecoder=}false,
-        nil, EncBlocks, pInferenceOnly, pQuantizeInt8, {UseReluFFN=}true);
+        nil, EncBlocks, pTrainable, pQuantizeInt8, {UseReluFFN=}true);
       EncFinalLN := Enc.AddLayer(
-        TNNetTokenLayerNorm.Create(PegasusLayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Enc.SetInferenceOnly();
+        TNNetTokenLayerNorm.Create(PegasusLayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then Enc.SetTrainable();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
 
       // ---------------- Decoder architecture ----------------
@@ -29106,20 +29106,20 @@ begin
       EncStates := Dec.AddLayerAfter(
         TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly), DecTokenInput);
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetTrainable(pTrainable), DecTokenInput);
       DecPos := Dec.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Dec.SetInferenceOnly();
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).SetTrainable(pTrainable) );
+      if not pTrainable then Dec.SetTrainable();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       BuildPegasusStackBlocks(Dec, PegShim, Config.DecoderLayers,
         Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
-        EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8,
+        EncStates, DecBlocks, pTrainable, pQuantizeInt8,
         {UseReluFFN=}true);
       DecFinalLN := Dec.AddLayer(
-        TNNetTokenLayerNorm.Create(PegasusLayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(PegasusLayerNormEps).SetTrainable(pTrainable) );
       LMHead := Dec.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Dec.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then Dec.SetTrainable();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -29234,16 +29234,16 @@ end;
 
 procedure BuildM2M100FromSafeTensorsEx(const FileName: string;
   Config: TM2M100Config; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 begin
   BuildM2M100FromSafeTensorsWithConfig(FileName, Config, EncoderNet,
-    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+    DecoderNet, EncSeqLen, DecSeqLen, pTrainable, pQuantizeInt8);
 end;
 
 procedure BuildM2M100FromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TM2M100Config;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  EncSeqLen, DecSeqLen: integer; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 var
   ConfigPath: string;
@@ -29252,7 +29252,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadM2M100ConfigFromJSONFile(ConfigPath);
   BuildM2M100FromSafeTensorsWithConfig(FileName, Config, EncoderNet,
-    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+    DecoderNet, EncSeqLen, DecSeqLen, pTrainable, pQuantizeInt8);
 end;
 
 // ===========================================================================
@@ -29533,7 +29533,7 @@ end;
 
 procedure BuildSeamlessM4TFromSafeTensorsWithConfig(const FileName: string;
   var Config: TSeamlessM4Tv2Config; out EncoderNet, DecoderNet: TNNet;
-  SpeechFrames, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  SpeechFrames, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 var
   LpMax: integer;
@@ -29579,9 +29579,9 @@ var
     HDimM1 := HDim - 1;
     SetLength(HArr, NumHeadsLoc);
     SetLength(Slice, HDim);
-    Q := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden).SetInferenceOnly(pInferenceOnly), Src);
-    K := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden).SetInferenceOnly(pInferenceOnly), Src);
-    V := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden).SetInferenceOnly(pInferenceOnly), Src);
+    Q := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable), Src);
+    K := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable), Src);
+    V := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable), Src);
     for hc := 0 to NumHeadsM1 do
     begin
       for dd := 0 to HDimM1 do Slice[dd] := hc * HDim + dd;
@@ -29593,7 +29593,7 @@ var
         TNNetScaledDotProductAttention.Create(HDim, {CausalMask=}false), hp);
     end;
     Enc.AddLayer(TNNetDeepConcat.Create(HArr));
-    O := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden).SetInferenceOnly(pInferenceOnly));
+    O := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable));
   end;
 
   // FFN: fc2(act(fc1(x))) where act is swish; returns the fc2 layer. NoLN -
@@ -29601,10 +29601,10 @@ var
   procedure BuildConformerFFN(InLayer: TNNetLayer; FFNDim: integer;
     UseRelu: boolean; out Fc1, Fc2: TNNetLayer);
   begin
-    Fc1 := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(FFNDim).SetInferenceOnly(pInferenceOnly), InLayer);
+    Fc1 := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(FFNDim).SetTrainable(pTrainable), InLayer);
     if UseRelu then Enc.AddLayer(TNNetReLU.Create())
     else Enc.AddLayer(TNNetSwish.Create());
-    Fc2 := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden).SetInferenceOnly(pInferenceOnly));
+    Fc2 := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable));
   end;
 
 begin
@@ -29656,8 +29656,8 @@ begin
       Enc := TNNet.Create();
       Enc.AddLayer(TNNetInput.Create(SpeechFrames, 1, Config.FeatureProjInputDim));
       // feature_projection: LayerNorm(feat_in) -> Linear(feat_in -> hidden)
-      FeatProjLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly));
-      FeatProj := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden).SetInferenceOnly(pInferenceOnly));
+      FeatProjLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
+      FeatProj := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable));
       LoadLayerNormWeights(Reader, FeatProjLN,
         'speech_encoder.feature_projection.layer_norm.weight',
         'speech_encoder.feature_projection.layer_norm.bias',
@@ -29676,7 +29676,7 @@ begin
       begin
         // ---- macaron FFN1: h += 0.5 * FFN1(LN(h)) ----
         ResidualInput := Enc.GetLastLayer();
-        Ffn1LN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly));
+        Ffn1LN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
         BuildConformerFFN(Ffn1LN, Config.SpeechEncoderFFNDim, false,
           Ffn1Fc1, Ffn1Fc2);
         Enc.AddLayer(TNNetMulByConstant.Create(0.5));
@@ -29684,33 +29684,33 @@ begin
 
         // ---- self-attention: h += SDPA(LN(h)) ----
         ResidualInput := Enc.GetLastLayer();
-        AttnLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly));
+        AttnLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
         BuildConformerSDPA(AttnLN, Heads, QProj, KProj, VProj, OProj);
         Enc.AddLayer(TNNetSum.Create([OProj, ResidualInput]));
 
         // ---- conv module: h += ConvModule(h) ----
         ResidualInput := Enc.GetLastLayer();
-        ConvLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly));
+        ConvLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
         // pointwise_conv1: hidden -> 2*hidden (no bias), GLU back to hidden
-        ConvPw1 := Enc.AddLayer(TNNetPointwiseConvLinear.Create(2 * Hidden).SetInferenceOnly(pInferenceOnly));
+        ConvPw1 := Enc.AddLayer(TNNetPointwiseConvLinear.Create(2 * Hidden).SetTrainable(pTrainable));
         Enc.AddLayer(TNNetGLU.Create());
         // causal depthwise conv (left-pad K-1), depthwise LN, swish
         ConvDw := Enc.AddLayer(TNNetDepthwiseConv1D.Create(
           Config.ConvDepthwiseKernel, {Causal=}true, {SuppressBias=}1));
-        ConvDwLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly));
+        ConvDwLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
         Enc.AddLayer(TNNetSwish.Create());
         // pointwise_conv2: hidden -> hidden (no bias)
-        ConvPw2 := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden).SetInferenceOnly(pInferenceOnly));
+        ConvPw2 := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable));
         Enc.AddLayer(TNNetSum.Create([Enc.GetLastLayer(), ResidualInput]));
 
         // ---- macaron FFN2: h = LN(h + 0.5 * FFN2(LN(h))) ----
         ResidualInput := Enc.GetLastLayer();
-        Ffn2LN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly));
+        Ffn2LN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
         BuildConformerFFN(Ffn2LN, Config.SpeechEncoderFFNDim, false,
           Ffn2Fc1, Ffn2Fc2);
         Enc.AddLayer(TNNetMulByConstant.Create(0.5));
         Enc.AddLayer(TNNetSum.Create([Enc.GetLastLayer(), ResidualInput]));
-        LayLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly));
+        LayLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
 
         // ---- load this layer's weights ----
         SP := 'speech_encoder.encoder.layers.' + IntToStr(LayerCnt) + '.';
@@ -29793,7 +29793,7 @@ begin
       end;
 
       // encoder.layer_norm
-      EncLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly));
+      EncLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
       LoadLayerNormWeights(Reader, EncLN,
         'speech_encoder.encoder.layer_norm.weight',
         'speech_encoder.encoder.layer_norm.bias', Hidden);
@@ -29827,28 +29827,28 @@ begin
         // residual = GLU(stride-conv(LN(h)))  (kernel K stride S pad S/2)
         ResidualInput := Enc.GetLastLayer();
         AdResLN := Enc.AddLayerAfter(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), ResidualInput);
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), ResidualInput);
         // strided pooling conv: pad left/right by stride/2 then stride-S conv
         if (Config.AdaptorStride div 2) > 0 then
           Enc.AddLayer(TNNetPadXY.Create(Config.AdaptorStride div 2, 0));
         AdResConv := Enc.AddLayer(TNNetConvolutionLinear.Create(
-          2 * Hidden, Config.AdaptorKernel, 0, Config.AdaptorStride, 0).SetInferenceOnly(pInferenceOnly));
+          2 * Hidden, Config.AdaptorKernel, 0, Config.AdaptorStride, 0).SetTrainable(pTrainable));
         AdResGLU := Enc.AddLayer(TNNetGLU.Create());
 
         // attn branch = GLU(stride-conv(LN(h))) -> SDPA(no pos) ; h = attn+res
         AdAttnLN := Enc.AddLayerAfter(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), ResidualInput);
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), ResidualInput);
         if (Config.AdaptorStride div 2) > 0 then
           Enc.AddLayer(TNNetPadXY.Create(Config.AdaptorStride div 2, 0));
         AdAttnConv := Enc.AddLayer(TNNetConvolutionLinear.Create(
-          2 * Hidden, Config.AdaptorKernel, 0, Config.AdaptorStride, 0).SetInferenceOnly(pInferenceOnly));
+          2 * Hidden, Config.AdaptorKernel, 0, Config.AdaptorStride, 0).SetTrainable(pTrainable));
         AdAttnGLU := Enc.AddLayer(TNNetGLU.Create());
         BuildConformerSDPA(AdAttnGLU, Heads, AdQ, AdK, AdV, AdO);
         Enc.AddLayer(TNNetSum.Create([AdO, AdResGLU]));
 
         // h += FFN(LN(h))  (relu)
         ResidualInput := Enc.GetLastLayer();
-        AdFfnLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly));
+        AdFfnLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
         BuildConformerFFN(AdFfnLN, Config.SpeechEncoderFFNDim, true,
           AdFc1, AdFc2);
         Enc.AddLayer(TNNetSum.Create([Enc.GetLastLayer(), ResidualInput]));
@@ -29904,13 +29904,13 @@ begin
       end;
 
       // inner_layer_norm
-      InnerLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly));
+      InnerLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
       LoadLayerNormWeights(Reader, InnerLN,
         'speech_encoder.inner_layer_norm.weight',
         'speech_encoder.inner_layer_norm.bias', Hidden);
       Consumed.Add('speech_encoder.inner_layer_norm.weight');
       Consumed.Add('speech_encoder.inner_layer_norm.bias');
-      if pInferenceOnly then Enc.SetInferenceOnly();
+      if not pTrainable then Enc.SetTrainable();
       if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
 
       // =============== TEXT DECODER (NLLB/M2M100 body) ===============
@@ -29919,14 +29919,14 @@ begin
       EncStates := Dec.AddLayerAfter(
         TNNetInput.Create(AdaptedLen, 1, Hidden, 1), 0);
       DecEmbed := Dec.AddLayerAfter(TNNetEmbedding.Create(
-        Config.VocabSize, Hidden, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly), DecTokenInput);
-      DecPos := Dec.AddLayer(TNNetLearnedPositionalEmbedding.Create(DecSeqLen).SetInferenceOnly(pInferenceOnly));
+        Config.VocabSize, Hidden, {EncodeZero=}1).SetTrainable(pTrainable), DecTokenInput);
+      DecPos := Dec.AddLayer(TNNetLearnedPositionalEmbedding.Create(DecSeqLen).SetTrainable(pTrainable));
       BuildPegasusStackBlocks(Dec, PegShim, Config.DecoderLayers,
         Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
-        EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8,
+        EncStates, DecBlocks, pTrainable, pQuantizeInt8,
         {UseReluFFN=}true);
-      DecFinalLN := Dec.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly));
-      LMHead := Dec.AddLayer(TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly));
+      DecFinalLN := Dec.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
+      LMHead := Dec.AddLayer(TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable));
 
       // ---- decoder weights ----
       Tmp := TNNetVolume.Create;
@@ -29989,7 +29989,7 @@ begin
         'text_decoder.layer_norm.bias', Hidden);
       Consumed.Add('text_decoder.layer_norm.weight');
       Consumed.Add('text_decoder.layer_norm.bias');
-      if pInferenceOnly then Dec.SetInferenceOnly();
+      if not pTrainable then Dec.SetTrainable();
       if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
 
       // ---------------- Unexpected-tensor check ----------------
@@ -30020,16 +30020,16 @@ end;
 
 procedure BuildSeamlessM4TFromSafeTensorsEx(const FileName: string;
   Config: TSeamlessM4Tv2Config; out EncoderNet, DecoderNet: TNNet;
-  SpeechFrames, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  SpeechFrames, DecSeqLen: integer; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false);
 begin
   BuildSeamlessM4TFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
-    DecoderNet, SpeechFrames, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+    DecoderNet, SpeechFrames, DecSeqLen, pTrainable, pQuantizeInt8);
 end;
 
 procedure BuildSeamlessM4TFromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TSeamlessM4Tv2Config;
-  SpeechFrames, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  SpeechFrames, DecSeqLen: integer; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 var
   ConfigPath: string;
@@ -30038,7 +30038,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadSeamlessM4Tv2ConfigFromJSONFile(ConfigPath);
   BuildSeamlessM4TFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
-    DecoderNet, SpeechFrames, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+    DecoderNet, SpeechFrames, DecSeqLen, pTrainable, pQuantizeInt8);
 end;
 
 function ReadWhisperConfigFromJSONFile(const FileName: string): TWhisperConfig;
@@ -30171,7 +30171,7 @@ end;
 procedure BuildWhisperStackBlocks(NN: TNNet; const Config: TWhisperConfig;
   NumBlocks, NumHeads, FFNDim: integer; IsDecoder: boolean;
   EncStates: TNNetLayer; var Blocks: TMarianBlockArray;
-  pInferenceOnly: boolean);
+  pTrainable: boolean);
 var
   HeadDim, BlockCnt, HeadCnt, d: integer;
   NumBlocksM1, NumHeadsM1, HeadDimM1: integer;
@@ -30195,14 +30195,14 @@ begin
     // unmodified.
     BranchInput := NN.GetLastLayer();
     Blocks[BlockCnt].SelfAttn.Norm := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(MarianLayerNormEps).SetInferenceOnly(pInferenceOnly) );
+      TNNetTokenLayerNorm.Create(MarianLayerNormEps).SetTrainable(pTrainable) );
     NormOut := NN.GetLastLayer();
     Blocks[BlockCnt].SelfAttn.QProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), NormOut);
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), NormOut);
     Blocks[BlockCnt].SelfAttn.KProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), NormOut);
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), NormOut);
     Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), NormOut);
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), NormOut);
     for HeadCnt := 0 to NumHeadsM1 do
     begin
       for d := 0 to HeadDimM1 do
@@ -30224,7 +30224,7 @@ begin
     end;
     NN.AddLayer( TNNetDeepConcat.Create(Heads) );
     Blocks[BlockCnt].SelfAttn.OProj := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
 
     // ---- cross-attention sub-block (decoder only) ----
@@ -30237,14 +30237,14 @@ begin
     begin
       BranchInput := NN.GetLastLayer();
       Blocks[BlockCnt].CrossAttn.Norm := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(MarianLayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(MarianLayerNormEps).SetTrainable(pTrainable) );
       NormOut := NN.GetLastLayer();
       Blocks[BlockCnt].CrossAttn.QProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), NormOut);
+        TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), NormOut);
       Blocks[BlockCnt].CrossAttn.KProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), EncStates);
+        TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), EncStates);
       Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly), EncStates);
+        TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable), EncStates);
       for HeadCnt := 0 to NumHeadsM1 do
       begin
         for d := 0 to HeadDimM1 do
@@ -30265,21 +30265,21 @@ begin
       end;
       NN.AddLayer( TNNetDeepConcat.Create(Heads) );
       Blocks[BlockCnt].CrossAttn.OProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly) );
+        TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
     end;
 
     // ---- FFN sub-block: x := x + fc2(gelu(fc1(final_layer_norm(x)))) ----
     BranchInput := NN.GetLastLayer();
     Blocks[BlockCnt].FFNNorm := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(MarianLayerNormEps).SetInferenceOnly(pInferenceOnly) );
+      TNNetTokenLayerNorm.Create(MarianLayerNormEps).SetTrainable(pTrainable) );
     Blocks[BlockCnt].Fc1 := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(FFNDim).SetInferenceOnly(pInferenceOnly) );
+      TNNetPointwiseConvLinear.Create(FFNDim).SetTrainable(pTrainable) );
     AddWhisperExactGelu(NN);
     Blocks[BlockCnt].Fc2 := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DModel).SetInferenceOnly(pInferenceOnly) );
+      TNNetPointwiseConvLinear.Create(Config.DModel).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
   end;
   SetLength(SliceChannels, 0);
   SetLength(Heads, 0);
@@ -30443,7 +30443,7 @@ end;
 
 procedure BuildWhisperFromSafeTensorsWithConfig(const FileName: string;
   var Config: TWhisperConfig; out EncoderNet, DecoderNet: TNNet;
-  DecSeqLen: integer; pInferenceOnly: boolean = false);
+  DecSeqLen: integer; pTrainable: boolean = true);
 var
   LpMax: integer;
   ReaderMax: integer;
@@ -30533,22 +30533,22 @@ begin
         Config.NumMelBins, 1) );
       Enc.AddLayer( TNNetPadXY.Create(1, 0) );
       Conv1 := Enc.AddLayer( TNNetConvolutionLinear.Create(
-        Config.DModel, 3, {Padding=}0, {Stride=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.DModel, 3, {Padding=}0, {Stride=}1).SetTrainable(pTrainable) );
       AddWhisperExactGelu(Enc);
       Enc.AddLayer( TNNetPadXY.Create(1, 0) );
       Conv2 := Enc.AddLayer( TNNetConvolutionLinear.Create(
-        Config.DModel, 3, {Padding=}0, {Stride=}2).SetInferenceOnly(pInferenceOnly) );
+        Config.DModel, 3, {Padding=}0, {Stride=}2).SetTrainable(pTrainable) );
       AddWhisperExactGelu(Enc);
       EncPos := Enc.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.MaxSourcePositions).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Enc.SetInferenceOnly();
+        TNNetLearnedPositionalEmbedding.Create(Config.MaxSourcePositions).SetTrainable(pTrainable) );
+      if not pTrainable then Enc.SetTrainable();
       BuildWhisperStackBlocks(Enc, Config, Config.EncoderLayers,
         Config.EncoderHeads, Config.EncoderFFNDim, {IsDecoder=}false,
-        nil, EncBlocks, pInferenceOnly);
+        nil, EncBlocks, pTrainable);
       // PRE-norm stack: the FINAL LayerNorm closes the encoder.
       EncFinalNorm := Enc.AddLayer(
-        TNNetTokenLayerNorm.Create(MarianLayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Enc.SetInferenceOnly();
+        TNNetTokenLayerNorm.Create(MarianLayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then Enc.SetTrainable();
 
       // ---------------- Decoder architecture ----------------
       // TWO inputs: Layers[0] = decoder token ids (what Compute feeds);
@@ -30561,18 +30561,18 @@ begin
         TNNetInput.Create(Config.MaxSourcePositions, 1, Config.DModel, 1),
         0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly), DecTokenInput);
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetTrainable(pTrainable), DecTokenInput);
       DecPos := Dec.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Dec.SetInferenceOnly();
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).SetTrainable(pTrainable) );
+      if not pTrainable then Dec.SetTrainable();
       BuildWhisperStackBlocks(Dec, Config, Config.DecoderLayers,
         Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
-        EncStates, DecBlocks, pInferenceOnly);
+        EncStates, DecBlocks, pTrainable);
       DecFinalNorm := Dec.AddLayer(
-        TNNetTokenLayerNorm.Create(MarianLayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(MarianLayerNormEps).SetTrainable(pTrainable) );
       LMHead := Dec.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Dec.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then Dec.SetTrainable();
 
       // ---------------- Weights ----------------
       LoadWhisperConv1D(Reader, Conv1, 'model.encoder.conv1.weight',
@@ -30693,7 +30693,7 @@ end;
 
 procedure BuildWhisperFromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TWhisperConfig;
-  DecSeqLen: integer; pInferenceOnly: boolean = false;
+  DecSeqLen: integer; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 var
   ConfigPath: string;
@@ -30702,7 +30702,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadWhisperConfigFromJSONFile(ConfigPath);
   BuildWhisperFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
-    DecoderNet, DecSeqLen, pInferenceOnly);
+    DecoderNet, DecSeqLen, pTrainable);
 end;
 
 // -------------------- WHISPER WORD-LEVEL TIMESTAMPS -----------------------
@@ -31362,7 +31362,7 @@ end;
 
 function BuildWav2Vec2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TWav2Vec2Config; NumSamples: integer;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -31421,7 +31421,7 @@ begin
         // conv_bias false => suppress the bias (pSuppressBias=1).
         ConvLayer[k] := NN.AddLayer( TNNetConvolutionLinear.Create(
           Config.ConvDim[k], Config.ConvKernel[k], {Padding=}0,
-          Config.ConvStride[k], {SuppressBias=}1).SetInferenceOnly(pInferenceOnly) );
+          Config.ConvStride[k], {SuppressBias=}1).SetTrainable(pTrainable) );
         InLen := (InLen - Config.ConvKernel[k]) div Config.ConvStride[k] + 1;
         if (k = 0) and Config.FeatExtractGroupNorm then
           // GroupNorm with num_groups = num_channels: each channel is its
@@ -31432,9 +31432,9 @@ begin
       end;
       // ----- Feature projection: LayerNorm then Linear C[-1] -> hidden. ---
       FeatProjLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       FeatProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+        TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
       PreEncoder := NN.GetLastLayer();
       // ----- Positional conv embedding (grouped conv1d, even kernel). -----
       // SAME padding via explicit X-only PadXY (kernel div 2 each side); the
@@ -31451,8 +31451,8 @@ begin
       // hidden := encoder.layer_norm( projected_features + pos_embed ).
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), PreEncoder]) );
       EncLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       // ----- POST-LN transformer encoder blocks (BERT block math). -------
       SetLength(QKV, Config.NumLayers);
       SetLength(AttnDense, Config.NumLayers);
@@ -31465,16 +31465,16 @@ begin
         // x := LN(x + dense(BIDIRECTIONAL-MHA(q|k|v(x)))).
         BranchInput := NN.GetLastLayer();
         QKV[BlockCnt] := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable) );
         AttnDense[BlockCnt] := NN.AddMultiHeadSelfAttention(
           Config.NumHeads, {CausalMask=}false);
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         AttnLN[BlockCnt] := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         // x := final_LN(x + output_dense(gelu(intermediate_dense(x)))).
         BranchInput := NN.GetLastLayer();
         Inter[BlockCnt] := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
         HiddenAct := NN.GetLastLayer();
         NN.AddLayerAfter(
           TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
@@ -31484,16 +31484,16 @@ begin
         NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
         NN.AddLayer( TNNetReGLU.Create() );
         OutDense[BlockCnt] := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         OutLN[BlockCnt] := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+        if not pTrainable then NN.SetTrainable();
       end;
       // ----- CTC head: linear hidden -> vocab (lm_head). -----------------
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
 
       // ---------------- Weights ----------------
       ConvPrefix := Config.Prefix + 'feature_extractor.conv_layers.';
@@ -31629,7 +31629,7 @@ end;
 
 function BuildWav2Vec2FromSafeTensorsEx(const FileName: string;
   out Config: TWav2Vec2Config; NumSamples: integer;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -31638,16 +31638,16 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadWav2Vec2ConfigFromJSONFile(ConfigPath);
   Result := BuildWav2Vec2FromSafeTensorsWithConfig(FileName, Config,
-    NumSamples, pInferenceOnly);
+    NumSamples, pTrainable);
 end;
 
 function BuildWav2Vec2FromSafeTensors(const FileName: string;
-  NumSamples: integer; pInferenceOnly: boolean = false): TNNet;
+  NumSamples: integer; pTrainable: boolean = true): TNNet;
 var
   Config: TWav2Vec2Config;
 begin
   Result := BuildWav2Vec2FromSafeTensorsEx(FileName, Config, NumSamples,
-    pInferenceOnly);
+    pTrainable);
 end;
 
 // ===========================================================================
@@ -31890,7 +31890,7 @@ end;
 
 function BuildPyannoteSegmentationFromSafeTensorsWithConfig(
   const FileName: string; var Config: TPyannoteConfig; NumSamples: integer;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -31930,13 +31930,13 @@ begin
       NN.AddLayer(Sinc);
       NN.AddLayer( TNNetAbs.Create() );
       NN.AddLayer( TNNetMaxPool.Create(Config.Pool1, Config.Pool1, 0) );
-      LN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+      LN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       // Second conv block (valid conv, stride 1) -> relu -> maxpool -> layernorm.
       Conv2 := NN.AddLayer( TNNetConvolutionLinear.Create(
-        Config.ConvChannels, Config.ConvKernel, 0, 1, 0).SetInferenceOnly(pInferenceOnly) );
+        Config.ConvChannels, Config.ConvKernel, 0, 1, 0).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetReLU.Create() );
       NN.AddLayer( TNNetMaxPool.Create(Config.Pool2, Config.Pool2, 0) );
-      LN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+      LN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       // Bidirectional minimal-LSTM temporal trunk (forward + time-reversed),
       // concatenated along Depth -> 2*LSTMHidden channels per frame.
       Source := NN.GetLastLayer();
@@ -31947,8 +31947,8 @@ begin
       NN.AddLayer( TNNetDeepConcat.Create([FwdCell, RevCell]) );
       // Per-frame powerset head: Linear (2*Hidden -> NumPowersetClasses).
       Head := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.NumPowersetClasses).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.NumPowersetClasses).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
 
       // ---------------- Weights ----------------
       LoadPyannoteSincConv(Reader, Sinc, 'sincnet.low_hz', 'sincnet.band_hz',
@@ -31997,7 +31997,7 @@ end;
 
 function BuildPyannoteSegmentationFromSafeTensorsEx(const FileName: string;
   out Config: TPyannoteConfig; NumSamples: integer;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   CfgFile: string;
@@ -32006,16 +32006,16 @@ begin
   else CfgFile := ExtractFilePath(FileName) + 'config.json';
   Config := ReadPyannoteConfigFromJSONFile(CfgFile);
   Result := BuildPyannoteSegmentationFromSafeTensorsWithConfig(FileName,
-    Config, NumSamples, pInferenceOnly);
+    Config, NumSamples, pTrainable);
 end;
 
 function BuildPyannoteSegmentationFromSafeTensors(const FileName: string;
-  NumSamples: integer; pInferenceOnly: boolean = false): TNNet;
+  NumSamples: integer; pTrainable: boolean = true): TNNet;
 var
   Config: TPyannoteConfig;
 begin
   Result := BuildPyannoteSegmentationFromSafeTensorsEx(FileName, Config,
-    NumSamples, pInferenceOnly);
+    NumSamples, pTrainable);
 end;
 
 // ===========================================================================
@@ -32258,7 +32258,7 @@ end;
 
 function BuildMoonshineFromSafeTensorsWithConfig(const FileName: string;
   var Config: TMoonshineConfig; NumSamples: integer;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -32338,20 +32338,20 @@ begin
       // ----- conv stem off the raw waveform (the Moonshine frontend). -----
       // conv1: 1 -> hidden, k=127, s=64, BIAS-FREE, then tanh.
       Conv1 := NN.AddLayer( TNNetConvolutionLinear.Create(
-        Config.HiddenSize, 127, {Padding=}0, {Stride=}64, {SuppressBias=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.HiddenSize, 127, {Padding=}0, {Stride=}64, {SuppressBias=}1).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetHyperbolicTangent.Create() );
       // groupnorm: GroupNorm(num_groups=1, hidden) over the WHOLE (T,C) block,
       // per-channel affine - sits BETWEEN conv1 and conv2.
       ConvGN := NN.AddLayer( TNNetGroupNorm.Create({Groups=}1, {Affine=}True) );
       // conv2: hidden -> 2*hidden, k=7, s=3, biased, then erf-GELU.
       Conv2 := NN.AddLayer( TNNetConvolutionLinear.Create(
-        2 * Config.HiddenSize, 7, {Padding=}0, {Stride=}3, {SuppressBias=}0).SetInferenceOnly(pInferenceOnly) );
+        2 * Config.HiddenSize, 7, {Padding=}0, {Stride=}3, {SuppressBias=}0).SetTrainable(pTrainable) );
       AddWhisperExactGelu(NN);
       // conv3: 2*hidden -> hidden, k=3, s=2, biased, then erf-GELU.
       Conv3 := NN.AddLayer( TNNetConvolutionLinear.Create(
-        Config.HiddenSize, 3, {Padding=}0, {Stride=}2, {SuppressBias=}0).SetInferenceOnly(pInferenceOnly) );
+        Config.HiddenSize, 3, {Padding=}0, {Stride=}2, {SuppressBias=}0).SetTrainable(pTrainable) );
       AddWhisperExactGelu(NN);
-      if pInferenceOnly then NN.SetInferenceOnly();
+      if not pTrainable then NN.SetTrainable();
       // ----- PRE-norm BIDIRECTIONAL transformer encoder blocks. -----------
       SetLength(AttnNorm, Config.NumEncoderLayers);
       SetLength(QProj, Config.NumEncoderLayers);
@@ -32372,14 +32372,14 @@ begin
         // x := x + o_proj(bidirectional-RoPE-MHA(input_layernorm(x))).
         BranchInput := NN.GetLastLayer();
         AttnNorm[BlockCnt] := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         NormedSource := NN.GetLastLayer();
         QProj[BlockCnt] := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(QWidth).SetInferenceOnly(pInferenceOnly), NormedSource);
+          TNNetPointwiseConvLinear.Create(QWidth).SetTrainable(pTrainable), NormedSource);
         KProj[BlockCnt] := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly), NormedSource);
+          TNNetPointwiseConvLinear.Create(KVWidth).SetTrainable(pTrainable), NormedSource);
         VProj[BlockCnt] := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly), NormedSource);
+          TNNetPointwiseConvLinear.Create(KVWidth).SetTrainable(pTrainable), NormedSource);
         // K rotated once per KV head; V never rotated. Partial rotary: RoPE
         // on the first RotaryDims channels, the tail passes through (the
         // Phi-3 partial-rotary slice wiring).
@@ -32448,24 +32448,24 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         OProj[BlockCnt] := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         // x := x + fc2(gelu(fc1(post_attention_layernorm(x)))).
         BranchInput := NN.GetLastLayer();
         MlpNorm[BlockCnt] := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         Fc1[BlockCnt] := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
         AddWhisperExactGelu(NN);
         Fc2[BlockCnt] := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
       end;
       // ----- FINAL stack LayerNorm (gain-only). -----
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
 
       // ---------------- Weights ----------------
       LoadMoonshineConv(Reader, Conv1, 'encoder.conv1.weight', '',
@@ -32554,7 +32554,7 @@ end;
 
 function BuildMoonshineFromSafeTensorsEx(const FileName: string;
   out Config: TMoonshineConfig; NumSamples: integer;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -32563,16 +32563,16 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadMoonshineConfigFromJSONFile(ConfigPath);
   Result := BuildMoonshineFromSafeTensorsWithConfig(FileName, Config,
-    NumSamples, pInferenceOnly);
+    NumSamples, pTrainable);
 end;
 
 function BuildMoonshineFromSafeTensors(const FileName: string;
-  NumSamples: integer; pInferenceOnly: boolean = false): TNNet;
+  NumSamples: integer; pTrainable: boolean = true): TNNet;
 var
   Config: TMoonshineConfig;
 begin
   Result := BuildMoonshineFromSafeTensorsEx(FileName, Config, NumSamples,
-    pInferenceOnly);
+    pTrainable);
 end;
 
 // ---------------------------------------------------------------------------
@@ -32586,7 +32586,7 @@ end;
 procedure BuildMoonshineEncoderDecoderFromSafeTensorsWithConfig(
   const FileName: string; var Config: TMoonshineConfig;
   NumSamples, DecSeqLen: integer; out Enc, Dec: TNNet;
-  pInferenceOnly: boolean = false);
+  pTrainable: boolean = true);
 var
   LpMax: integer;
   ReaderMax: integer;
@@ -32611,7 +32611,7 @@ begin
   // The encoder is built and weight-loaded by the landed importer; this
   // routine only adds the decoder net.
   Enc := BuildMoonshineFromSafeTensorsWithConfig(FileName, Config, NumSamples,
-    pInferenceOnly);
+    pTrainable);
   Dec := nil;
   Reader := CreatePretrainedTensorReader(FileName);
   Consumed := TStringList.Create;
@@ -32653,8 +32653,8 @@ begin
       EncStates := Dec.AddLayerAfter(
         TNNetInput.Create(EncLen, 1, Config.HiddenSize, 1), 0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly), DecTokenInput);
-      if pInferenceOnly then Dec.SetInferenceOnly();
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable), DecTokenInput);
+      if not pTrainable then Dec.SetTrainable();
 
       SetLength(SelfNorm, Config.NumDecoderLayers);
       SetLength(SQ, Config.NumDecoderLayers);
@@ -32681,14 +32681,14 @@ begin
         // ---- (1) CAUSAL self-attention with partial RoPE ----
         BranchInput := Dec.GetLastLayer();
         SelfNorm[BlockCnt] := Dec.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         NormedSource := Dec.GetLastLayer();
         SQ[BlockCnt] := Dec.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(QWidth).SetInferenceOnly(pInferenceOnly), NormedSource);
+          TNNetPointwiseConvLinear.Create(QWidth).SetTrainable(pTrainable), NormedSource);
         SK[BlockCnt] := Dec.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly), NormedSource);
+          TNNetPointwiseConvLinear.Create(KVWidth).SetTrainable(pTrainable), NormedSource);
         SV[BlockCnt] := Dec.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly), NormedSource);
+          TNNetPointwiseConvLinear.Create(KVWidth).SetTrainable(pTrainable), NormedSource);
         for KVHeadCnt := 0 to NumDecoderKVHeadsM1 do
         begin
           for d := 0 to HeadDimM1 do
@@ -32754,20 +32754,20 @@ begin
         end;
         Dec.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         SO[BlockCnt] := Dec.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         Dec.AddLayer( TNNetSum.Create([Dec.GetLastLayer(), BranchInput]) );
 
         // ---- (2) CROSS-attention over the encoder states (NO RoPE) ----
         BranchInput := Dec.GetLastLayer();
         CrossNorm[BlockCnt] := Dec.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         NormedSource := Dec.GetLastLayer();
         CQ[BlockCnt] := Dec.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(QWidth).SetInferenceOnly(pInferenceOnly), NormedSource);
+          TNNetPointwiseConvLinear.Create(QWidth).SetTrainable(pTrainable), NormedSource);
         CK[BlockCnt] := Dec.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly), EncStates);
+          TNNetPointwiseConvLinear.Create(KVWidth).SetTrainable(pTrainable), EncStates);
         CV[BlockCnt] := Dec.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(KVWidth).SetInferenceOnly(pInferenceOnly), EncStates);
+          TNNetPointwiseConvLinear.Create(KVWidth).SetTrainable(pTrainable), EncStates);
         for HeadCnt := 0 to NumDecoderHeadsM1 do
         begin
           KVGroup := HeadCnt div GroupSize;
@@ -32788,29 +32788,29 @@ begin
         end;
         Dec.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         CO[BlockCnt] := Dec.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         Dec.AddLayer( TNNetSum.Create([Dec.GetLastLayer(), BranchInput]) );
 
         // ---- (3) SwiGLU MLP ----
         BranchInput := Dec.GetLastLayer();
         MlpNorm[BlockCnt] := Dec.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         // fc1 packs [up | gate]; TNNetSwiGLU computes up * SiLU(gate).
         Fc1[BlockCnt] := Dec.AddLayer(
-          TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).SetTrainable(pTrainable) );
         Dec.AddLayer( TNNetSwiGLU.Create() );
         Fc2[BlockCnt] := Dec.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         Dec.AddLayer( TNNetSum.Create([Dec.GetLastLayer(), BranchInput]) );
-        if pInferenceOnly then Dec.SetInferenceOnly();
+        if not pTrainable then Dec.SetTrainable();
       end;
 
       // ---- final gain-only LayerNorm + LM head ----
       FinalNorm := Dec.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       LMHead := Dec.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Dec.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then Dec.SetTrainable();
 
       // ---------------- Weights ----------------
       Reader.LoadTensorFlat('decoder.embed_tokens.weight', EmbedTmp);
@@ -32943,7 +32943,7 @@ end;
 
 procedure BuildMoonshineEncoderDecoderFromSafeTensors(const FileName: string;
   out Enc, Dec: TNNet; out Config: TMoonshineConfig;
-  NumSamples, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  NumSamples, DecSeqLen: integer; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 var
   ConfigPath: string;
@@ -32952,7 +32952,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadMoonshineConfigFromJSONFile(ConfigPath);
   BuildMoonshineEncoderDecoderFromSafeTensorsWithConfig(FileName, Config,
-    NumSamples, DecSeqLen, Enc, Dec, pInferenceOnly);
+    NumSamples, DecSeqLen, Enc, Dec, pTrainable);
 end;
 
 // ===========================================================================
@@ -37986,7 +37986,7 @@ type
 
 function BuildRWKVFromSafeTensorsWithConfig(const FileName: string;
   var Config: TRWKVConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -38104,11 +38104,11 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real token, not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
       // Block 0's extra embedding LayerNorm ("ln0" / HF pre_ln).
       PreLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       NumLayersM1 := Config.NumLayers - 1;
@@ -38120,18 +38120,18 @@ begin
         // k/v/r stream - one TNNetTokenShift each.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].LN1 := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         Blocks[BlockCnt].AttShiftK := NN.AddLayer( TNNetTokenShift.Create() );
         Blocks[BlockCnt].AttKey := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.AttentionHiddenSize, 1).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.AttentionHiddenSize, 1).SetTrainable(pTrainable) );
         Blocks[BlockCnt].AttShiftV := NN.AddLayerAfter(
           TNNetTokenShift.Create(), Blocks[BlockCnt].LN1 );
         Blocks[BlockCnt].AttValue := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.AttentionHiddenSize, 1).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.AttentionHiddenSize, 1).SetTrainable(pTrainable) );
         Blocks[BlockCnt].AttShiftR := NN.AddLayerAfter(
           TNNetTokenShift.Create(), Blocks[BlockCnt].LN1 );
         Blocks[BlockCnt].AttRecept := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.AttentionHiddenSize, 1).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.AttentionHiddenSize, 1).SetTrainable(pTrainable) );
         RSig := NN.AddLayer( TNNetSigmoid.Create() );
         // k|v concatenated on the Depth axis -> the 2*C tensor TNNetWKV
         // splits (first C channels key, next C value).
@@ -38141,35 +38141,35 @@ begin
         Gated := NN.AddLayer( TNNetCellMulByCell.Create(
           RSig, Blocks[BlockCnt].WKV) );
         Blocks[BlockCnt].AttOut := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetInferenceOnly(pInferenceOnly), Gated );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetTrainable(pTrainable), Gated );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         // ---- Channel-mix sub-block: x := x + FFN(ln2(x)) with squared-
         // ReLU keying and sigmoid receptance gating.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].LN2 := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         Blocks[BlockCnt].FFShiftK := NN.AddLayer( TNNetTokenShift.Create() );
         Blocks[BlockCnt].FFKey := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize, 1).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize, 1).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSquaredReLU.Create() );
         Blocks[BlockCnt].FFValue := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetTrainable(pTrainable) );
         Blocks[BlockCnt].FFShiftR := NN.AddLayerAfter(
           TNNetTokenShift.Create(), Blocks[BlockCnt].LN2 );
         Blocks[BlockCnt].FFRecept := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetTrainable(pTrainable) );
         RSig := NN.AddLayer( TNNetSigmoid.Create() );
         Gated := NN.AddLayer( TNNetCellMulByCell.Create(
           RSig, Blocks[BlockCnt].FFValue) );
         NN.AddLayer( TNNetSum.Create([Gated, BranchInput]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -38306,7 +38306,7 @@ end;
 
 function BuildRWKVFromSafeTensorsEx(const FileName: string;
   out Config: TRWKVConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -38315,17 +38315,17 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadRWKVConfigFromJSONFile(ConfigPath);
   Result := BuildRWKVFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildRWKVFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TRWKVConfig;
 begin
   Result := BuildRWKVFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 function ReadMambaConfigFromJSONFile(const FileName: string): TMambaConfig;
@@ -38437,7 +38437,7 @@ type
 
 function BuildMambaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TMambaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -38637,8 +38637,8 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real token, not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       NumLayersM1 := Config.NumLayers - 1;
@@ -38650,10 +38650,10 @@ begin
         // volume) and the use_bias/use_conv_bias flags.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].Norm := NN.AddLayer(
-          TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         // (1) in_proj to 2*d_inner, then the x|z split (x first).
         Blocks[BlockCnt].InProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(2 * Config.DInner, 1).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(2 * Config.DInner, 1).SetTrainable(pTrainable) );
         NN.AddLayerAfter( TNNetSplitChannels.Create(0, Config.DInner),
           Blocks[BlockCnt].InProj );
         // (2) x path: depthwise causal conv1d + SiLU.
@@ -38672,16 +38672,16 @@ begin
         Gated := NN.AddLayer( TNNetCellMulByCell.Create(ScanL, ZGate) );
         // (5) out_proj back to hidden + residual sum.
         Blocks[BlockCnt].OutProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetInferenceOnly(pInferenceOnly), Gated );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetTrainable(pTrainable), Gated );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
-        TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -38778,7 +38778,7 @@ end;
 
 function BuildMambaFromSafeTensorsEx(const FileName: string;
   out Config: TMambaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -38787,17 +38787,17 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadMambaConfigFromJSONFile(ConfigPath);
   Result := BuildMambaFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildMambaFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TMambaConfig;
 begin
   Result := BuildMambaFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 procedure SaveMambaToSafeTensors(Net: TNNet; const Config: TMambaConfig;
@@ -39473,7 +39473,7 @@ type
 
 function BuildMamba2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TMamba2Config; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -39594,8 +39594,8 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       NumLayersM1 := Config.NumLayers - 1;
@@ -39604,10 +39604,10 @@ begin
         // x := x + out_proj( gated_norm( Mamba2(conv(x|B|C)|dt|gate) ) ).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].Norm := NN.AddLayer(
-          TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         // (1) in_proj -> [gate | x|B|C | dt].
         Blocks[BlockCnt].InProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(ProjSize, 1).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(ProjSize, 1).SetTrainable(pTrainable) );
         // (2) x|B|C path: depthwise causal conv1d + SiLU.
         NN.AddLayerAfter(
           TNNetSplitChannels.Create(Config.DInner, ConvDim),
@@ -39627,16 +39627,16 @@ begin
           Config.NGroups, Config.LayerNormEps) );
         // (5) out_proj back to hidden + residual sum.
         Blocks[BlockCnt].OutProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
-        TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -39732,7 +39732,7 @@ end;
 
 function BuildMamba2FromSafeTensorsEx(const FileName: string;
   out Config: TMamba2Config; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -39741,17 +39741,17 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadMamba2ConfigFromJSONFile(ConfigPath);
   Result := BuildMamba2FromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildMamba2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TMamba2Config;
 begin
   Result := BuildMamba2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 // ====================== RECURRENT GEMMA IMPORT (impl) =====================
@@ -39910,7 +39910,7 @@ type
 
 function BuildRecurrentGemmaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TRecurrentGemmaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -40063,8 +40063,8 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
@@ -40080,25 +40080,25 @@ begin
         // ---- temporal sub-block: x := x + temporal(RMSNorm(x)) ----
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].TemporalNorm := NN.AddLayer(
-          TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
         NormedSrc := NN.GetLastLayer();
         if not Blocks[BlockCnt].IsAttn then
         begin
           // RECURRENT block. y = gelu_tanh(linear_y(x));
           // x_branch = rg_lru(conv(linear_x(x)));  out = linear_out(x_branch*y).
           Blocks[BlockCnt].LinearY := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.LruWidth).SetInferenceOnly(pInferenceOnly), NormedSrc);
+            TNNetPointwiseConvLinear.Create(Config.LruWidth).SetTrainable(pTrainable), NormedSrc);
           YBranch := NN.AddLayer( TNNetGELU.Create() );
           Blocks[BlockCnt].LinearX := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.LruWidth).SetInferenceOnly(pInferenceOnly), NormedSrc);
+            TNNetPointwiseConvLinear.Create(Config.LruWidth).SetTrainable(pTrainable), NormedSrc);
           Blocks[BlockCnt].Conv := NN.AddLayer( TNNetDepthwiseConv1D.Create(
             Config.ConvKernel, {pCausal=}true, {pSuppressBias=}0) );
           ConvAct := NN.GetLastLayer();
           // The two gate logit projections (block-diagonal, full Pointwise).
           Blocks[BlockCnt].IGate := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.LruWidth).SetInferenceOnly(pInferenceOnly), ConvAct);
+            TNNetPointwiseConvLinear.Create(Config.LruWidth).SetTrainable(pTrainable), ConvAct);
           Blocks[BlockCnt].AGate := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.LruWidth).SetInferenceOnly(pInferenceOnly), ConvAct);
+            TNNetPointwiseConvLinear.Create(Config.LruWidth).SetTrainable(pTrainable), ConvAct);
           // Pack [x | i_logits | a_logits] for the RG-LRU leaf.
           PackedSlab := NN.AddLayer( TNNetDeepConcat.Create(
             [ConvAct, Blocks[BlockCnt].IGate, Blocks[BlockCnt].AGate]) );
@@ -40107,18 +40107,18 @@ begin
           Gated := NN.AddLayer( TNNetCellMulByCell.Create(
             Blocks[BlockCnt].RGLRU, YBranch) );
           Blocks[BlockCnt].LinearOut := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly), Gated);
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable), Gated);
         end
         else
         begin
           // LOCAL sliding-window GQA attention with partial rotary.
           Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(AttnD).SetInferenceOnly(pInferenceOnly), NormedSrc);
+            TNNetPointwiseConvLinear.Create(AttnD).SetTrainable(pTrainable), NormedSrc);
           Blocks[BlockCnt].KProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.NumKVHeads * Config.HeadDim).SetInferenceOnly(pInferenceOnly),
+            TNNetPointwiseConvLinear.Create(Config.NumKVHeads * Config.HeadDim).SetTrainable(pTrainable),
             NormedSrc);
           Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.NumKVHeads * Config.HeadDim).SetInferenceOnly(pInferenceOnly),
+            TNNetPointwiseConvLinear.Create(Config.NumKVHeads * Config.HeadDim).SetTrainable(pTrainable),
             NormedSrc);
           QSrc := Blocks[BlockCnt].QProj;
           KSrc := Blocks[BlockCnt].KProj;
@@ -40163,35 +40163,35 @@ begin
           end;
           NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
           Blocks[BlockCnt].OProj := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         end;
         // Residual sum (temporal).
         Residual := NN.AddLayer(
           TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         // ---- channel sub-block: x := residual + GEGLU(RMSNorm(residual)) ----
         Blocks[BlockCnt].ChannelNorm := NN.AddLayerAfter(
-          TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly), Residual);
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable), Residual);
         MlpNormed := NN.GetLastLayer();
         Blocks[BlockCnt].Gate := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(HalfFFN).SetInferenceOnly(pInferenceOnly), MlpNormed);
+          TNNetPointwiseConvLinear.Create(HalfFFN).SetTrainable(pTrainable), MlpNormed);
         GateAct := NN.AddLayer( TNNetGELU.Create() );
         Blocks[BlockCnt].Up := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(HalfFFN).SetInferenceOnly(pInferenceOnly), MlpNormed);
+          TNNetPointwiseConvLinear.Create(HalfFFN).SetTrainable(pTrainable), MlpNormed);
         UpAct := NN.GetLastLayer();
         GegluProd := NN.AddLayer( TNNetCellMulByCell.Create(GateAct, UpAct) );
         Blocks[BlockCnt].Down := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly), GegluProd);
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable), GegluProd);
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), Residual]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
-        TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
       if Config.LogitSoftCap > 0 then
         NN.AddLayer( TNNetSoftCapping.Create(Config.LogitSoftCap) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -40335,7 +40335,7 @@ end;
 
 function BuildRecurrentGemmaFromSafeTensorsEx(const FileName: string;
   out Config: TRecurrentGemmaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -40344,17 +40344,17 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadRecurrentGemmaConfigFromJSONFile(ConfigPath);
   Result := BuildRecurrentGemmaFromSafeTensorsWithConfig(FileName, Config,
-    pSeqLen, pInferenceOnly, pQuantizeInt8);
+    pSeqLen, pTrainable, pQuantizeInt8);
 end;
 
 function BuildRecurrentGemmaFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TRecurrentGemmaConfig;
 begin
   Result := BuildRecurrentGemmaFromSafeTensorsEx(FileName, IgnoredConfig,
-    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 // ============================ JAMBA IMPORT (impl) =========================
@@ -40498,7 +40498,7 @@ type
 
 function BuildJambaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TJambaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -40658,8 +40658,8 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       SetLength(Blocks, Config.NumLayers);
       SetLength(KSlices, Config.NumKVHeads);
       SetLength(VSlices, Config.NumKVHeads);
@@ -40670,17 +40670,17 @@ begin
         // ---- mixer sub-block: x := x + Mixer(input_layernorm(x)) ----
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].InNorm := NN.AddLayer(
-          TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
         NormedSrc := NN.GetLastLayer();
         if JambaLayerIsAttention(Config, BlockCnt) then
         begin
           // Bias-free GQA, NoPE. Pack [Q_h|K_g|V_g] per query head -> SDPA.
           Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(QWidth, 1).SetInferenceOnly(pInferenceOnly), NormedSrc);
+            TNNetPointwiseConvLinear.Create(QWidth, 1).SetTrainable(pTrainable), NormedSrc);
           Blocks[BlockCnt].KProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(KVWidth, 1).SetInferenceOnly(pInferenceOnly), NormedSrc);
+            TNNetPointwiseConvLinear.Create(KVWidth, 1).SetTrainable(pTrainable), NormedSrc);
           Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(KVWidth, 1).SetInferenceOnly(pInferenceOnly), NormedSrc);
+            TNNetPointwiseConvLinear.Create(KVWidth, 1).SetTrainable(pTrainable), NormedSrc);
           for KVHeadCnt := 0 to NumKVHeadsM1 do
           begin
             for d := 0 to HeadDimM1 do
@@ -40705,7 +40705,7 @@ begin
           end;
           NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
           Blocks[BlockCnt].OProj := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetInferenceOnly(pInferenceOnly) );
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetTrainable(pTrainable) );
         end
         else
         begin
@@ -40713,7 +40713,7 @@ begin
           // causal conv1d + SiLU, the inner-norm selective scan, SiLU(z)
           // gate, out_proj.
           Blocks[BlockCnt].InProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(2 * DI, 1).SetInferenceOnly(pInferenceOnly), NormedSrc);
+            TNNetPointwiseConvLinear.Create(2 * DI, 1).SetTrainable(pTrainable), NormedSrc);
           NN.AddLayerAfter( TNNetSplitChannels.Create(0, DI),
             Blocks[BlockCnt].InProj );
           Blocks[BlockCnt].Conv := NN.AddLayer( TNNetDepthwiseConv1D.Create(
@@ -40727,14 +40727,14 @@ begin
           ZGate := NN.AddLayer( TNNetSiLU.Create() );
           Gated := NN.AddLayer( TNNetCellMulByCell.Create(ScanL, ZGate) );
           Blocks[BlockCnt].OutProj := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetInferenceOnly(pInferenceOnly), Gated );
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetTrainable(pTrainable), Gated );
         end;
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
 
         // ---- FFN sub-block: x := x + FFN(pre_ff_layernorm(x)) ----
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].FfNorm := NN.AddLayer(
-          TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
         NormedSrc := NN.GetLastLayer();
         if JambaLayerIsMoE(Config, BlockCnt) then
         begin
@@ -40744,18 +40744,18 @@ begin
           SetLength(Blocks[BlockCnt].ExpertDown, Config.NumExperts);
           SetLength(MoEBranches, Config.NumExperts);
           Blocks[BlockCnt].GateConv := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.NumExperts).SetInferenceOnly(pInferenceOnly), NormedSrc);
+            TNNetPointwiseConvLinear.Create(Config.NumExperts).SetTrainable(pTrainable), NormedSrc);
           NN.AddLayer( TNNetPointwiseSoftMax.Create() );
           GateTopK := NN.AddLayer( TNNetTopKGate.Create(
             Config.NumExpertsPerTok, {pRenormalize=}false) );
           for e := 0 to NumExpertsM1 do
           begin
             Blocks[BlockCnt].ExpertGateUp[e] := NN.AddLayerAfter(
-              TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).SetInferenceOnly(pInferenceOnly),
+              TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).SetTrainable(pTrainable),
               NormedSrc);
             NN.AddLayer( TNNetSwiGLU.Create() );
             Blocks[BlockCnt].ExpertDown[e] := NN.AddLayer(
-              TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
             ExpertOut := NN.GetLastLayer();
             GateE := NN.AddLayerAfter(
               TNNetSplitChannels.Create(e, 1), GateTopK);
@@ -40770,17 +40770,17 @@ begin
         else
         begin
           Blocks[BlockCnt].GateUp := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+            TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).SetTrainable(pTrainable) );
           NN.AddLayer( TNNetSwiGLU.Create() );
           Blocks[BlockCnt].Down := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         end;
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
       end;
-      FinalNorm := NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly) );
-      LMHead := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+      FinalNorm := NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
+      LMHead := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
 
       // ---------------- Weights ----------------
       Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
@@ -40921,7 +40921,7 @@ end;
 
 function BuildJambaFromSafeTensorsEx(const FileName: string;
   out Config: TJambaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -40930,17 +40930,17 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadJambaConfigFromJSONFile(ConfigPath);
   Result := BuildJambaFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildJambaFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TJambaConfig;
 begin
   Result := BuildJambaFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 // ====================== NEMOTRON-H IMPORT (impl) =========================
@@ -41195,7 +41195,7 @@ type
 
 function BuildNemotronHFromSafeTensorsWithConfig(const FileName: string;
   var Config: TNemotronHConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -41358,8 +41358,8 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       SetLength(Blocks, Config.NumLayers);
       SetLength(KSlices, Config.NumKVHeads);
       SetLength(VSlices, Config.NumKVHeads);
@@ -41370,7 +41370,7 @@ begin
         // x := x + mixer(norm(x)).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].Norm := NN.AddLayer(
-          TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         NormedSrc := NN.GetLastLayer();
         case Config.BlockTypes[BlockCnt] of
           nhMamba2:
@@ -41379,7 +41379,7 @@ begin
             // [gate | x|B|C | dt] (d_mlp=0), depthwise causal conv + SiLU on
             // x|B|C, TNNetMamba2 SSD scan, out_proj.
             Blocks[BlockCnt].InProj := NN.AddLayerAfter(
-              TNNetPointwiseConvLinear.Create(ProjSize, 1).SetInferenceOnly(pInferenceOnly), NormedSrc);
+              TNNetPointwiseConvLinear.Create(ProjSize, 1).SetTrainable(pTrainable), NormedSrc);
             NN.AddLayerAfter(
               TNNetSplitChannels.Create(Config.DInner, ConvDim),
               Blocks[BlockCnt].InProj );
@@ -41396,17 +41396,17 @@ begin
               Config.MambaNumHeads, Config.MambaHeadDim, Config.StateSize,
               Config.NGroups, Config.LayerNormEps) );
             Blocks[BlockCnt].OutProj := NN.AddLayer(
-              TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetInferenceOnly(pInferenceOnly) );
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetTrainable(pTrainable) );
           end;
           nhAttention:
           begin
             // Bias-free GQA, NoPE. Pack [Q_h|K_g|V_g] per query head -> SDPA.
             Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-              TNNetPointwiseConvLinear.Create(QWidth, 1).SetInferenceOnly(pInferenceOnly), NormedSrc);
+              TNNetPointwiseConvLinear.Create(QWidth, 1).SetTrainable(pTrainable), NormedSrc);
             Blocks[BlockCnt].KProj := NN.AddLayerAfter(
-              TNNetPointwiseConvLinear.Create(KVWidth, 1).SetInferenceOnly(pInferenceOnly), NormedSrc);
+              TNNetPointwiseConvLinear.Create(KVWidth, 1).SetTrainable(pTrainable), NormedSrc);
             Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-              TNNetPointwiseConvLinear.Create(KVWidth, 1).SetInferenceOnly(pInferenceOnly), NormedSrc);
+              TNNetPointwiseConvLinear.Create(KVWidth, 1).SetTrainable(pTrainable), NormedSrc);
             for KVHeadCnt := 0 to NumKVHeadsM1 do
             begin
               for d := 0 to HeadDimM1 do
@@ -41434,19 +41434,19 @@ begin
             end;
             NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
             Blocks[BlockCnt].OProj := NN.AddLayer(
-              TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetInferenceOnly(pInferenceOnly) );
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetTrainable(pTrainable) );
           end;
           nhMLP:
           begin
             // Non-gated relu2 MLP: down(ReLU(up(x))^2). ReLU then Square =
             // ReLU(x)^2 (ACT2FN "relu2"); NO gate projection.
             Blocks[BlockCnt].UpProj := NN.AddLayerAfter(
-              TNNetPointwiseConvLinear.Create(Config.IntermediateSize, 1).SetInferenceOnly(pInferenceOnly),
+              TNNetPointwiseConvLinear.Create(Config.IntermediateSize, 1).SetTrainable(pTrainable),
               NormedSrc);
             NN.AddLayer( TNNetReLU.Create() );
             NN.AddLayer( TNNetSquare.Create() );
             Blocks[BlockCnt].DownProj := NN.AddLayer(
-              TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetInferenceOnly(pInferenceOnly) );
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetTrainable(pTrainable) );
           end;
           nhMoE:
           begin
@@ -41465,12 +41465,12 @@ begin
             if Config.NumSharedExperts > 0 then
             begin
               Blocks[BlockCnt].SharedUp := NN.AddLayerAfter(
-                TNNetPointwiseConvLinear.Create(Config.SharedExpertInterSize, 1).SetInferenceOnly(pInferenceOnly),
+                TNNetPointwiseConvLinear.Create(Config.SharedExpertInterSize, 1).SetTrainable(pTrainable),
                 NormedSrc);
               NN.AddLayer( TNNetReLU.Create() );
               NN.AddLayer( TNNetSquare.Create() );
               Blocks[BlockCnt].SharedDown := NN.AddLayer(
-                TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetInferenceOnly(pInferenceOnly) );
+                TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetTrainable(pTrainable) );
               SharedOut := NN.GetLastLayer();
             end
             else SharedOut := nil;
@@ -41478,7 +41478,7 @@ begin
             // e_score_correction_bias) lives on a TNNetBiasBalancedTopKGate;
             // when norm_topk_prob the gate already renormalizes the survivors.
             Blocks[BlockCnt].GateConv := NN.AddLayerAfter(
-              TNNetPointwiseConvLinear.Create(Config.NumRoutedExperts, 1).SetInferenceOnly(pInferenceOnly),
+              TNNetPointwiseConvLinear.Create(Config.NumRoutedExperts, 1).SetTrainable(pTrainable),
               NormedSrc);
             NN.AddLayer( TNNetSigmoid.Create() );
             if Config.NormTopKProb then
@@ -41495,12 +41495,12 @@ begin
             for e := 0 to NumRoutedExpertsM1 do
             begin
               Blocks[BlockCnt].ExpertUp[e] := NN.AddLayerAfter(
-                TNNetPointwiseConvLinear.Create(Config.MoEIntermediateSize, 1).SetInferenceOnly(pInferenceOnly),
+                TNNetPointwiseConvLinear.Create(Config.MoEIntermediateSize, 1).SetTrainable(pTrainable),
                 NormedSrc);
               NN.AddLayer( TNNetReLU.Create() );
               NN.AddLayer( TNNetSquare.Create() );
               Blocks[BlockCnt].ExpertDown[e] := NN.AddLayer(
-                TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetInferenceOnly(pInferenceOnly) );
+                TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetTrainable(pTrainable) );
               ExpertOut := NN.GetLastLayer();
               GateE := NN.AddLayerAfter(
                 TNNetSplitChannels.Create(e, 1), GateScaled);
@@ -41516,13 +41516,13 @@ begin
           end;
         end;
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
       end;
       FinalNorm := NN.AddLayer(
-        TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenRMSNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
 
       // ---------------- Weights ----------------
       Reader.LoadTensorFlat(Config.Prefix + 'embeddings.weight', Tmp);
@@ -41708,7 +41708,7 @@ end;
 
 function BuildNemotronHFromSafeTensorsEx(const FileName: string;
   out Config: TNemotronHConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -41717,17 +41717,17 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadNemotronHConfigFromJSONFile(ConfigPath);
   Result := BuildNemotronHFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildNemotronHFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TNemotronHConfig;
 begin
   Result := BuildNemotronHFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 // ============================ BLOOM IMPORT =================================
@@ -41909,7 +41909,7 @@ type
 
 function BuildBloomFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBloomConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -41980,13 +41980,13 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real BPE token (<unk>), not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
       // word_embeddings_layernorm: BLOOM normalises the embedding output
       // BEFORE the first block (no positional embedding is added - ALiBi
       // is the only position signal, inside the attention scores).
       EmbeddingLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
@@ -41996,9 +41996,9 @@ begin
         // Attention branch: dense(MHA_ALiBi(LN_1(x))).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].LN1 := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         QKVLayer := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable) );
         Blocks[BlockCnt].QKV := QKVLayer;
         for HeadCnt := 0 to NumHeadsM1 do
         begin
@@ -42024,30 +42024,30 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].AttnDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         // Sequential pre-LN residuals (apply_residual_connection_post_
         // layernorm=false, the released form):
         //   x := x + Attn(LN_1(x)); x := x + MLP(LN_2(x))
         AttnOut := NN.AddLayer(
           TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         Blocks[BlockCnt].LN2 := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         Blocks[BlockCnt].HTo4H := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
         // BLOOM's Megatron GELU is the tanh approximation
         // x*0.5*(1+tanh(0.79788456*x*(1+0.044715*x^2))) = TNNetGELU.
         NN.AddLayer( TNNetGELU.Create() );
         Blocks[BlockCnt].FourHToH := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), AttnOut]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -42158,7 +42158,7 @@ end;
 
 function BuildBloomFromSafeTensorsEx(const FileName: string;
   out Config: TBloomConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -42168,17 +42168,17 @@ begin
   Config := ReadBloomConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildBloomFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildBloomFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TBloomConfig;
 begin
   Result := BuildBloomFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 // ============================= FALCON IMPORT ===============================
@@ -42447,7 +42447,7 @@ type
 
 function BuildFalconFromSafeTensorsWithConfig(const FileName: string;
   var Config: TFalconConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -42560,8 +42560,8 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(KRotated, Config.NumKVHeads);
@@ -42579,22 +42579,22 @@ begin
         if Config.TwoLayerNorms then
         begin
           Blocks[BlockCnt].LNAttn := NN.AddLayerAfter(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), BranchInput);
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), BranchInput);
           AttnSource := Blocks[BlockCnt].LNAttn;
           Blocks[BlockCnt].LNMlp := NN.AddLayerAfter(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), BranchInput);
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), BranchInput);
           MlpSource := Blocks[BlockCnt].LNMlp;
         end
         else
         begin
           Blocks[BlockCnt].LNAttn := NN.AddLayerAfter(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), BranchInput);
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), BranchInput);
           AttnSource := Blocks[BlockCnt].LNAttn;
           MlpSource := Blocks[BlockCnt].LNAttn; // shared (set below if seq.)
         end;
         // ---- attention branch: dense(GQA-RoPE(ln(x))) ----
         QKVLayer := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(QWidth + 2 * KVWidth).SetInferenceOnly(pInferenceOnly), AttnSource);
+          TNNetPointwiseConvLinear.Create(QWidth + 2 * KVWidth).SetTrainable(pTrainable), AttnSource);
         Blocks[BlockCnt].QKV := QKVLayer;
         QSource := QKVLayer;
         KSource := QKVLayer;
@@ -42631,7 +42631,7 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].AttnDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         AttnOut := NN.GetLastLayer();
         if not Config.ParallelAttn then
         begin
@@ -42641,15 +42641,15 @@ begin
           // x := x + MLP(ln2(x)).
           AttnOut := NN.AddLayer( TNNetSum.Create([AttnOut, BranchInput]) );
           Blocks[BlockCnt].LNPostAttn := NN.AddLayer(
-            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
           MlpSource := Blocks[BlockCnt].LNPostAttn;
         end;
         // ---- MLP branch: dense_4h_to_h(gelu(dense_h_to_4h(ln(x)))) ----
         Blocks[BlockCnt].HTo4H := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetInferenceOnly(pInferenceOnly), MlpSource);
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable), MlpSource);
         AddExactGELU;
         Blocks[BlockCnt].FourHToH := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         MlpOut := NN.GetLastLayer();
         if Config.ParallelAttn then
           // PARALLEL: x := x + Attn(ln(x)) + MLP(ln(x)). One fused 3-input
@@ -42658,14 +42658,14 @@ begin
           NN.AddLayer( TNNetSum.Create([BranchInput, AttnOut, MlpOut]) )
         else
           NN.AddLayer( TNNetSum.Create([MlpOut, AttnOut]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -42788,7 +42788,7 @@ end;
 
 function BuildFalconFromSafeTensorsEx(const FileName: string;
   out Config: TFalconConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -42798,17 +42798,17 @@ begin
   Config := ReadFalconConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildFalconFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pQuantizeInt8);
+    pTrainable, pQuantizeInt8);
 end;
 
 function BuildFalconFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TFalconConfig;
 begin
   Result := BuildFalconFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, '', pQuantizeInt8);
+    pTrainable, '', pQuantizeInt8);
 end;
 
 function ReadModernBertConfigFromJSONFile(
@@ -43157,7 +43157,7 @@ type
 
 function BuildModernBertFromSafeTensorsWithConfig(const FileName: string;
   var Config: TModernBertConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -43240,13 +43240,13 @@ begin
       // EncodeZero=1: token id 0 is a real BPE token, not padding (the
       // ModernBERT [PAD] sits at id 50283).
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
       // embeddings.norm right after the table - ModernBERT has NO position
       // embeddings at all (RoPE inside attention is the only position
       // signal).
       EmbeddingNorm := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.NormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetTokenLayerNorm.Create(Config.NormEps).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
@@ -43284,13 +43284,13 @@ begin
         else
         begin
           Blocks[BlockCnt].AttnNorm := NN.AddLayer(
-            TNNetTokenLayerNorm.Create(Config.NormEps).SetInferenceOnly(pInferenceOnly) );
+            TNNetTokenLayerNorm.Create(Config.NormEps).SetTrainable(pTrainable) );
           NormedSource := NN.GetLastLayer();
         end;
         // ONE fused Wqkv slab (q|k|v whole thirds after the load-time
         // rotate_half permutation; see LoadModernBertQKVWeights).
         Blocks[BlockCnt].QKV := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetInferenceOnly(pInferenceOnly),
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable),
           NormedSource);
         for HeadCnt := 0 to NumHeadsM1 do
         begin
@@ -43324,15 +43324,15 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].AttnWo := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         // PRE-LN GeGLU MLP residual: x := x + Wo(act(input) * gate),
         // input|gate = Wi(mlp_norm(x)).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].MlpNorm := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.NormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.NormEps).SetTrainable(pTrainable) );
         Blocks[BlockCnt].Wi := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).SetTrainable(pTrainable) );
         // hidden_activation "gelu" is the EXACT erf GELU (TNNetGEGLUErf);
         // "gelu_pytorch_tanh" the tanh approximation (TNNetGEGLU). Both
         // compute FIRSTHALF * act(SECONDHALF) - the loader swapped the HF
@@ -43342,16 +43342,16 @@ begin
         else
           NN.AddLayer( TNNetGEGLUErf.Create() );
         Blocks[BlockCnt].MlpWo := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       // final_norm; the output IS the (SeqLen,1,hidden) hidden states (HF
       // ModernBertModel last_hidden_state) - no LM/pooler head.
       FinalNorm := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.NormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetTokenLayerNorm.Create(Config.NormEps).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -43481,7 +43481,7 @@ end;
 
 function BuildModernBertFromSafeTensorsEx(const FileName: string;
   out Config: TModernBertConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -43491,17 +43491,17 @@ begin
   Config := ReadModernBertConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildModernBertFromSafeTensorsWithConfig(FileName, Config,
-    pSeqLen, pInferenceOnly, pQuantizeInt8);
+    pSeqLen, pTrainable, pQuantizeInt8);
 end;
 
 function BuildModernBertFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TModernBertConfig;
 begin
   Result := BuildModernBertFromSafeTensorsEx(FileName, IgnoredConfig,
-    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
 // ========================= DEEPSEEK-V2 IMPORT ==============================
@@ -43706,7 +43706,7 @@ type
 
 function BuildDeepSeekV2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TDeepSeekV2Config; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
   ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
@@ -43828,8 +43828,8 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real token, not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
@@ -43841,20 +43841,20 @@ begin
         // checkpoint's kv_a_layernorm RMSNorm inserted on the latent c_KV.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].AttnNorm :=
-          NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly) );
+          NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
         NormedSource := NN.GetLastLayer();
         // q_proj content/rope split (the per-head [q_nope|q_rope] row
         // packing is undone at LOAD time; see LoadRows).
         Blocks[BlockCnt].QContent := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.NumHeads * dn).SetInferenceOnly(pInferenceOnly),
+          TNNetPointwiseConvLinear.Create(Config.NumHeads * dn).SetTrainable(pTrainable),
           NormedSource);
         Blocks[BlockCnt].QRope := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.NumHeads * dr).SetInferenceOnly(pInferenceOnly),
+          TNNetPointwiseConvLinear.Create(Config.NumHeads * dr).SetTrainable(pTrainable),
           NormedSource);
         // kv_a_proj_with_mqa = [c_KV(r) | k_rope(dr)]: the latent down-
         // projection + ONE shared rope-K projection, both from x.
         Blocks[BlockCnt].CKV := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(LatentRank).SetInferenceOnly(pInferenceOnly), NormedSource);
+          TNNetPointwiseConvLinear.Create(LatentRank).SetTrainable(pTrainable), NormedSource);
         // kv_a_layernorm: the latent RMSNorm (only c_KV is normalized,
         // never the rope slice - the HF ordering). NOTE the eps: HF
         // constructs DeepseekV2RMSNorm(kv_lora_rank) WITHOUT an eps
@@ -43862,18 +43862,18 @@ begin
         // config.rms_norm_eps like every other norm (a real, measurable
         // parity difference at rms_norm_eps=1e-5).
         Blocks[BlockCnt].LatentNorm := NN.AddLayerAfter(
-          TNNetTokenRMSNorm.Create(1.0e-6).SetInferenceOnly(pInferenceOnly), Blocks[BlockCnt].CKV);
+          TNNetTokenRMSNorm.Create(1.0e-6).SetTrainable(pTrainable), Blocks[BlockCnt].CKV);
         // kv_b_proj = per-head [k_nope|v] up-projections from the latent.
         Blocks[BlockCnt].KContent := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.NumHeads * dn).SetInferenceOnly(pInferenceOnly),
+          TNNetPointwiseConvLinear.Create(Config.NumHeads * dn).SetTrainable(pTrainable),
           Blocks[BlockCnt].LatentNorm);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.NumHeads * dv).SetInferenceOnly(pInferenceOnly),
+          TNNetPointwiseConvLinear.Create(Config.NumHeads * dv).SetTrainable(pTrainable),
           Blocks[BlockCnt].LatentNorm);
         // Shared rope-K: projected from x, rotated ONCE, shared by every
         // head (the paper's w_KR; per-token decode state grows by only dr).
         Blocks[BlockCnt].KRope := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(dr).SetInferenceOnly(pInferenceOnly), NormedSource);
+          TNNetPointwiseConvLinear.Create(dr).SetTrainable(pTrainable), NormedSource);
         KRopeRot := NN.AddLayerAfter(
           CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling),
           Blocks[BlockCnt].KRope);
@@ -43916,24 +43916,24 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].OProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         // ---- MLP sub-block: dense SwiGLU (BlockCnt < ----
         // first_k_dense_replace) or DeepSeekMoE (the AddDeepSeekMoE wiring
         // with SwiGLU experts; shared experts bypass the router).
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].MlpNorm :=
-          NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly) );
+          NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
         if not LayerIsMoE then
         begin
           // Dense path: TNNetSwiGLU computes FIRSTHALF * act(SECONDHALF),
           // so the fused projection holds up_proj in neurons 0..I-1 and
           // gate_proj in neurons I..2I-1 (the Llama-path convention).
           Blocks[BlockCnt].GateUp := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+            TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize).SetTrainable(pTrainable) );
           NN.AddLayer( TNNetSwiGLU.Create() );
           Blocks[BlockCnt].Down := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         end
         else
         begin
@@ -43949,7 +43949,7 @@ begin
           // norm_topk_prob=false (DeepSeek-V2/-Lite) keeps the RAW softmax
           // weights of the survivors (pRenormalize=false).
           Blocks[BlockCnt].GateConv := NN.AddLayerAfter(
-            TNNetPointwiseConvLinear.Create(Config.NRoutedExperts).SetInferenceOnly(pInferenceOnly),
+            TNNetPointwiseConvLinear.Create(Config.NRoutedExperts).SetTrainable(pTrainable),
             MoESource);
           NN.AddLayer( TNNetPointwiseSoftMax.Create() );
           GateTopK := NN.AddLayer( TNNetTopKGate.Create(
@@ -43959,10 +43959,10 @@ begin
           begin
             Blocks[BlockCnt].ExpertGateUp[ExpertCnt] := NN.AddLayerAfter(
               TNNetPointwiseConvLinear.Create(
-                2 * Config.MoEIntermediateSize).SetInferenceOnly(pInferenceOnly), MoESource);
+                2 * Config.MoEIntermediateSize).SetTrainable(pTrainable), MoESource);
             NN.AddLayer( TNNetSwiGLU.Create() );
             Blocks[BlockCnt].ExpertDown[ExpertCnt] := NN.AddLayer(
-              TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
             ExpertOut := NN.GetLastLayer();
             // Slice this expert's gate weight g[e], broadcast across
             // d_model and cell-multiply in (the AddDeepSeekMoE combine).
@@ -43981,10 +43981,10 @@ begin
             SharedWidth :=
               Config.NSharedExperts * Config.MoEIntermediateSize;
             Blocks[BlockCnt].SharedGateUp := NN.AddLayerAfter(
-              TNNetPointwiseConvLinear.Create(2 * SharedWidth).SetInferenceOnly(pInferenceOnly), MoESource);
+              TNNetPointwiseConvLinear.Create(2 * SharedWidth).SetTrainable(pTrainable), MoESource);
             NN.AddLayer( TNNetSwiGLU.Create() );
             Blocks[BlockCnt].SharedDown := NN.AddLayer(
-              TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
             MoEBranches[Config.NRoutedExperts] := NN.GetLastLayer();
           end;
           // y = Sum_s Shared_s(x) + Sum_e g[e] * Routed_e(x).
@@ -43992,14 +43992,14 @@ begin
             NN.AddLayer( TNNetSum.Create(MoEBranches) );
         end;
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+        if not pTrainable then NN.SetTrainable();
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
-        TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
       LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
@@ -44215,7 +44215,7 @@ end;
 
 function BuildDeepSeekV2FromSafeTensorsEx(const FileName: string;
   out Config: TDeepSeekV2Config; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
@@ -44225,17 +44225,17 @@ begin
   Config := ReadDeepSeekV2ConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildDeepSeekV2FromSafeTensorsWithConfig(FileName, Config,
-    pSeqLen, pInferenceOnly, pQuantizeInt8);
+    pSeqLen, pTrainable, pQuantizeInt8);
 end;
 
 function BuildDeepSeekV2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TDeepSeekV2Config;
 begin
   Result := BuildDeepSeekV2FromSafeTensorsEx(FileName, IgnoredConfig,
-    pSeqLen, pInferenceOnly, '', pQuantizeInt8);
+    pSeqLen, pTrainable, '', pQuantizeInt8);
 end;
 
 // ============================ CLIP IMPORT ==================================
@@ -44307,28 +44307,28 @@ end;
 // Standard 1/sqrt(head_dim)-scaled SDPA, causal only in the text tower.
 procedure AddClipEncoderBlock(NN: TNNet; const Tower: TClipTowerConfig;
   CausalMask: boolean; var Block: TClipBlockLayers;
-  pInferenceOnly: boolean);
+  pTrainable: boolean);
 var
   BranchInput: TNNetLayer;
 begin
   BranchInput := NN.GetLastLayer();
   Block.LN1 := NN.AddLayer(
-    TNNetTokenLayerNorm.Create(Tower.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+    TNNetTokenLayerNorm.Create(Tower.LayerNormEps).SetTrainable(pTrainable) );
   Block.QKV := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(3 * Tower.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+    TNNetPointwiseConvLinear.Create(3 * Tower.HiddenSize).SetTrainable(pTrainable) );
   Block.AttnDense := NN.AddMultiHeadSelfAttention(Tower.NumHeads,
     CausalMask);
   NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
   BranchInput := NN.GetLastLayer();
   Block.LN2 := NN.AddLayer(
-    TNNetTokenLayerNorm.Create(Tower.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+    TNNetTokenLayerNorm.Create(Tower.LayerNormEps).SetTrainable(pTrainable) );
   Block.Inter := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(Tower.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+    TNNetPointwiseConvLinear.Create(Tower.IntermediateSize).SetTrainable(pTrainable) );
   AddClipHiddenAct(NN, Tower.HiddenAct);
   Block.OutDense := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(Tower.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+    TNNetPointwiseConvLinear.Create(Tower.HiddenSize).SetTrainable(pTrainable) );
   NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-  if pInferenceOnly then NN.SetInferenceOnly();
+  if not pTrainable then NN.SetTrainable();
 end;
 
 // Loads one CLIP encoder block: separate biased nn.Linear q/k/v into the
@@ -44457,7 +44457,7 @@ function BuildClipVisionTower(Reader: TNNetSafeTensorsReader;
   const Tower: TClipTowerConfig; ImageSize, PatchSize, NumChannels,
   ProjectionDim: integer; const Prefix: string;
   const ProjectionTensorName: string = '';
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   pVisionFeatures: boolean = false): TNNet;
 var
   NN: TNNet;
@@ -44486,7 +44486,7 @@ begin
     // -> a (Grid, Grid, hidden) patch grid ...
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
       Tower.HiddenSize, PatchSize, {pInputPadding=}0, {pStride=}PatchSize,
-      {pSuppressBias=}1).SetInferenceOnly(pInferenceOnly) );
+      {pSuppressBias=}1).SetTrainable(pTrainable) );
     // ... flattened row-major (the volume layout IS row-major over (y,x),
     // exactly HF's flatten(2).transpose(1,2) patch order) ...
     NN.AddLayer( TNNetReshape.Create(NumPatches, 1, Tower.HiddenSize) );
@@ -44497,10 +44497,10 @@ begin
     NN.AddLayer( TNNetPadXY.Create(1, 0) );
     NN.AddLayer( TNNetCrop.Create(0, 0, NumPatches + 1, 1) );
     PosEmb := NN.AddLayer(
-      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1).SetInferenceOnly(pInferenceOnly) );
+      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1).SetTrainable(pTrainable) );
     PreLN := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(Tower.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+      TNNetTokenLayerNorm.Create(Tower.LayerNormEps).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
     // LLaVA's vision feature is the penultimate hidden state
     // (output_hidden_states[-2]) WITHOUT the CLS row and WITHOUT
     // post_layernorm/projection: that is the output of the stack with the
@@ -44517,7 +44517,7 @@ begin
     SetLength(Blocks, BuiltLayers);
     for BlockCnt := 0 to BuiltLayersM1 do
       AddClipEncoderBlock(NN, Tower, {CausalMask=}false,
-        Blocks[BlockCnt], pInferenceOnly);
+        Blocks[BlockCnt], pTrainable);
     PostLN := nil;
     Proj := nil;
     if pVisionFeatures then
@@ -44531,12 +44531,12 @@ begin
       // HF applies post_layernorm (and the projection) only to the pooled
       // class token; applying them PER TOKEN is exact for row 0.
       PostLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Tower.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Tower.LayerNormEps).SetTrainable(pTrainable) );
       if ProjectionTensorName <> '' then
         Proj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(ProjectionDim).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(ProjectionDim).SetTrainable(pTrainable) );
     end;
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     LoadClipPatchConv(Reader, PatchConv,
@@ -44590,7 +44590,7 @@ end;
 
 procedure BuildClipFromSafeTensorsWithConfig(const FileName: string;
   var Config: TClipConfig; out TextNet, VisionNet: TNNet;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  TextSeqLen: integer = 0; pTrainable: boolean = true);
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -44622,22 +44622,22 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen, 1, 1) );
       // EncodeZero=1: token id 0 (<|startoftext|>) is a REAL vocab row.
       TokEmb := NN.AddLayer( TNNetEmbedding.Create(
-        Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
       PosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       SetLength(Blocks, Config.Text.NumLayers);
       TextNumLayersM1 := Config.Text.NumLayers - 1;
       for BlockCnt := 0 to TextNumLayersM1 do
         AddClipEncoderBlock(NN, Config.Text, {CausalMask=}true,
-          Blocks[BlockCnt], pInferenceOnly);
+          Blocks[BlockCnt], pTrainable);
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetTrainable(pTrainable) );
       // text_projection applied PER TOKEN; HF's text_embeds is the row at
       // the eot position (ClipTextEosPosition).
       Proj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.ProjectionDim).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.ProjectionDim).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
 
       // ---------------- TEXT tower weights ----------------
       LoadClipEmbeddingTable(Reader, TokEmb,
@@ -44662,7 +44662,7 @@ begin
       VisionNet := BuildClipVisionTower(Reader, Config.Vision,
         Config.ImageSize, Config.PatchSize, Config.NumChannels,
         Config.ProjectionDim, 'vision_model.',
-        'visual_projection.weight', pInferenceOnly);
+        'visual_projection.weight', pTrainable);
 
       // ---------------- logit_scale ----------------
       if Reader.HasTensor('logit_scale') then
@@ -44690,7 +44690,7 @@ end;
 
 procedure BuildClipFromSafeTensors(const FileName: string;
   out TextNet, VisionNet: TNNet; out Config: TClipConfig;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  TextSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 var
   ConfigPath: string;
@@ -44699,7 +44699,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadClipConfigFromJSONFile(ConfigPath);
   BuildClipFromSafeTensorsWithConfig(FileName, Config, TextNet, VisionNet,
-    TextSeqLen, pInferenceOnly);
+    TextSeqLen, pTrainable);
 end;
 
 function ReadClipConfigFromJSONFile(const FileName: string): TClipConfig;
@@ -45263,7 +45263,7 @@ end;
 // hidden states (vision_model.last_hidden_state - cross-attention reads every
 // row, so there is NO CLS crop and NO projection).
 function BuildBlipVisionTower(Reader: TNNetSafeTensorsReader;
-  const Config: TBlipConfig; pInferenceOnly: boolean): TNNet;
+  const Config: TBlipConfig; pTrainable: boolean): TNNet;
 var
   NN: TNNet;
   PatchConv, PosEmb, PostLN: TNNetLayer;
@@ -45291,7 +45291,7 @@ begin
     // BIASED patch embedding: kernel = stride = patch_size, no padding.
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
       d, Config.PatchSize, {pInputPadding=}0, {pStride=}Config.PatchSize,
-      {pSuppressBias=}0).SetInferenceOnly(pInferenceOnly) );
+      {pSuppressBias=}0).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
     // Prepend a ZERO class-token slot (PadXY pads both ends; Crop drops the
     // right pad). class_embedding folds into position row 0 - exact, since the
@@ -45299,15 +45299,15 @@ begin
     NN.AddLayer( TNNetPadXY.Create(1, 0) );
     NN.AddLayer( TNNetCrop.Create(0, 0, NumPatches + 1, 1) );
     PosEmb := NN.AddLayer(
-      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
     SetLength(Blocks, Config.Vision.NumLayers);
     for BlockCnt := 0 to VisionNumLayersM1 do
       AddClipEncoderBlock(NN, Config.Vision, {CausalMask=}false,
-        Blocks[BlockCnt], pInferenceOnly);
+        Blocks[BlockCnt], pTrainable);
     // post_layernorm over every token (HF applies it to last_hidden_state).
-    PostLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Vision.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+    PostLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Vision.LayerNormEps).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
 
     // -------- weights --------
     LoadClipPatchConv(Reader, PatchConv,
@@ -45399,7 +45399,7 @@ end;
 
 procedure BuildBlipForCaptioningFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBlipConfig; out VisionNet, TextNet: TNNet;
-  DecSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  DecSeqLen: integer = 0; pTrainable: boolean = true);
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -45436,7 +45436,7 @@ begin
       NumVisTokens := Grid * Grid + 1;
 
       // ---------------- VISION tower ----------------
-      VisionNet := BuildBlipVisionTower(Reader, Config, pInferenceOnly);
+      VisionNet := BuildBlipVisionTower(Reader, Config, pTrainable);
 
       // ---------------- TEXT decoder architecture ----------------
       NN := TNNet.Create();
@@ -45447,12 +45447,12 @@ begin
         TNNetInput.Create(NumVisTokens, 1, Config.Vision.HiddenSize) );
       // Token branch: word_embeddings + position_embeddings, then LayerNorm.
       NN.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, d, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly), TokInput );
+        Config.VocabSize, d, {EncodeZero=}1).SetTrainable(pTrainable), TokInput );
       WordEmb := NN.GetLastLayer();
       PosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions).SetInferenceOnly(pInferenceOnly) );
-      EmbLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions).SetTrainable(pTrainable) );
+      EmbLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
 
       SetLength(Blocks, Config.Text.NumLayers);
       SetLength(Heads, Config.Text.NumHeads);
@@ -45465,11 +45465,11 @@ begin
         // ---- causal self-attention (residual add, THEN LayerNorm) ----
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].SelfAttn.QProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly), BranchInput);
+          TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), BranchInput);
         Blocks[BlockCnt].SelfAttn.KProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly), BranchInput);
+          TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), BranchInput);
         Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly), BranchInput);
+          TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), BranchInput);
         for HeadCnt := 0 to NumTextHeadsM1 do
         begin
           for dd := 0 to HeadDimM1 do
@@ -45487,19 +45487,19 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(Heads) );
         Blocks[BlockCnt].SelfAttn.OProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         Blocks[BlockCnt].SelfAttn.Norm := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetTrainable(pTrainable) );
 
         // ---- cross-attention to the image features (no causal mask) ----
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].CrossAttn.QProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly), BranchInput);
+          TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), BranchInput);
         Blocks[BlockCnt].CrossAttn.KProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly), EncStates);
+          TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), EncStates);
         Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly), EncStates);
+          TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), EncStates);
         for HeadCnt := 0 to NumTextHeadsM1 do
         begin
           for dd := 0 to HeadDimM1 do
@@ -45517,31 +45517,31 @@ begin
         end;
         NN.AddLayer( TNNetDeepConcat.Create(Heads) );
         Blocks[BlockCnt].CrossAttn.OProj := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         Blocks[BlockCnt].CrossAttn.Norm := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+          TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetTrainable(pTrainable) );
 
         // ---- FFN: output.dense(GELU(intermediate.dense(x))), then LN ----
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].Inter := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.Text.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(Config.Text.IntermediateSize).SetTrainable(pTrainable) );
         AddClipHiddenAct(NN, Config.Text.HiddenAct);
         Blocks[BlockCnt].OutDense := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly) );
+          TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         Blocks[BlockCnt].OutNorm := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-        if pInferenceOnly then NN.SetInferenceOnly();
+          TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetTrainable(pTrainable) );
+        if not pTrainable then NN.SetTrainable();
       end;
 
       // ---- LM prediction head: transform = LN(GELU(dense(x))), then decoder.
-      HeadDense := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly) );
+      HeadDense := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
       AddClipHiddenAct(NN, Config.Text.HiddenAct);
-      HeadLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+      HeadLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetTrainable(pTrainable) );
       HeadDecoder := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
 
       // ---------------- TEXT decoder weights ----------------
       if not Reader.HasTensor(
@@ -45619,7 +45619,7 @@ end;
 
 procedure BuildBlipForCaptioningFromSafeTensors(const FileName: string;
   out VisionNet, TextNet: TNNet; out Config: TBlipConfig;
-  DecSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  DecSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 var
   CfgFile: string;
@@ -45629,7 +45629,7 @@ begin
     'config.json';
   Config := ReadBlipConfigFromJSONFile(CfgFile);
   BuildBlipForCaptioningFromSafeTensorsWithConfig(FileName, Config,
-    VisionNet, TextNet, DecSeqLen, pInferenceOnly);
+    VisionNet, TextNet, DecSeqLen, pTrainable);
 end;
 
 // Returns the decoder's SECOND TNNetInput (the image hidden-states input).
@@ -45888,7 +45888,7 @@ end;
 // row - NO CLS crop, NO projection, NO pooling).
 function BuildTrOCREncoder(Reader: TNNetSafeTensorsReader;
   const Config: TTrOCRConfig; Consumed: TStringList;
-  pInferenceOnly: boolean): TNNet;
+  pTrainable: boolean): TNNet;
 var
   NN: TNNet;
   PatchConv, PosEmb, FinalLN: TNNetLayer;
@@ -45923,7 +45923,7 @@ begin
     // BIASED patch embedding: kernel = stride = patch_size, no padding.
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
       Tower.HiddenSize, Config.PatchSize, {pInputPadding=}0,
-      {pStride=}Config.PatchSize, {pSuppressBias=}0).SetInferenceOnly(pInferenceOnly) );
+      {pStride=}Config.PatchSize, {pSuppressBias=}0).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetReshape.Create(NumPatches, 1, Tower.HiddenSize) );
     // Prepend TWO zero slots (cls + distillation); both fold into position
     // rows 0 and 1 - exact, since the pre-position content of those slots is
@@ -45931,17 +45931,17 @@ begin
     NN.AddLayer( TNNetPadXY.Create(2, 0) );
     NN.AddLayer( TNNetCrop.Create(0, 0, NumTokens, 1) );
     PosEmb := NN.AddLayer(
-      TNNetLearnedPositionalEmbedding.Create(NumTokens).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+      TNNetLearnedPositionalEmbedding.Create(NumTokens).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
     SetLength(Blocks, Tower.NumLayers);
     TowerNumLayersM1 := Tower.NumLayers - 1;
     TowerHiddenSizeM1 := Tower.HiddenSize - 1;
     for BlockCnt := 0 to TowerNumLayersM1 do
       AddClipEncoderBlock(NN, Tower, {CausalMask=}false, Blocks[BlockCnt],
-        pInferenceOnly);
+        pTrainable);
     // final layernorm over every token (HF applies it to last_hidden_state).
-    FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+    FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
 
     // -------- weights --------
     LoadClipPatchConv(Reader, PatchConv,
@@ -46048,7 +46048,7 @@ end;
 
 procedure BuildTrOCRFromSafeTensorsWithConfig(const FileName: string;
   var Config: TTrOCRConfig; out EncoderNet, DecoderNet: TNNet;
-  DecSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  DecSeqLen: integer = 0; pTrainable: boolean = true);
 var
   LpMax: integer;
   ReaderMax: integer;
@@ -46090,7 +46090,7 @@ begin
   try
     try
       // ---------------- ENCODER ----------------
-      Enc := BuildTrOCREncoder(Reader, Config, Consumed, pInferenceOnly);
+      Enc := BuildTrOCREncoder(Reader, Config, Consumed, pTrainable);
 
       // ---------------- DECODER architecture (BART decoder) ----------------
       // BuildBartStackBlocks / LoadMarianStack only read .DModel; carry it.
@@ -46102,18 +46102,18 @@ begin
       EncStates := Dec.AddLayerAfter(
         TNNetInput.Create(NumTokens, 1, Config.DModel, 1), 0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
-        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly), DecTokenInput);
+        Config.VocabSize, Config.DModel, {EncodeZero=}1).SetTrainable(pTrainable), DecTokenInput);
       DecPos := Dec.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(SeqLen).SetInferenceOnly(pInferenceOnly) );
+        TNNetLearnedPositionalEmbedding.Create(SeqLen).SetTrainable(pTrainable) );
       DecEmbLN := Dec.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.DecLayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Dec.SetInferenceOnly();
+        TNNetTokenLayerNorm.Create(Config.DecLayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then Dec.SetTrainable();
       BuildBartStackBlocks(Dec, BartShim, Config.DecLayers, Config.DecHeads,
         Config.DecFFNDim, {IsDecoder=}true, EncStates, DecBlocks,
-        pInferenceOnly);
+        pTrainable);
       LMHead := Dec.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then Dec.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then Dec.SetTrainable();
 
       // ---------------- DECODER weights ----------------
       if not Reader.HasTensor(
@@ -46213,15 +46213,15 @@ end;
 
 procedure BuildTrOCRFromSafeTensorsEx(const FileName: string;
   Config: TTrOCRConfig; out EncoderNet, DecoderNet: TNNet;
-  DecSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  DecSeqLen: integer = 0; pTrainable: boolean = true);
 begin
   BuildTrOCRFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
-    DecoderNet, DecSeqLen, pInferenceOnly);
+    DecoderNet, DecSeqLen, pTrainable);
 end;
 
 procedure BuildTrOCRFromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TTrOCRConfig;
-  DecSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  DecSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 var
   CfgFile: string;
@@ -46231,7 +46231,7 @@ begin
     'config.json';
   Config := ReadTrOCRConfigFromJSONFile(CfgFile);
   BuildTrOCRFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
-    DecoderNet, DecSeqLen, pInferenceOnly);
+    DecoderNet, DecSeqLen, pTrainable);
 end;
 
 procedure RunTrOCRLogits(EncoderNet, DecoderNet: TNNet;
@@ -46300,7 +46300,7 @@ end;
 
 procedure BuildOwlViTFromSafeTensorsWithConfig(const FileName: string;
   var Config: TOwlViTConfig; out TextNet, VisionNet: TNNet;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  TextSeqLen: integer = 0; pTrainable: boolean = true);
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -46337,22 +46337,22 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen, 1, 1) );
       TokEmb := NN.AddLayer( TNNetEmbedding.Create(
-        Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
       PosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       SetLength(Blocks, Config.Text.NumLayers);
       NumTextLayersM1 := Config.Text.NumLayers - 1;
       for BlockCnt := 0 to NumTextLayersM1 do
         AddClipEncoderBlock(NN, Config.Text, {CausalMask=}true,
-          Blocks[BlockCnt], pInferenceOnly);
+          Blocks[BlockCnt], pTrainable);
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetTrainable(pTrainable) );
       // text_projection applied PER TOKEN (bias-free); the query embedding is
       // the argmax-pooled row, L2-normalized in OwlViTQueryEmbedding.
       TextProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.ProjectionDim).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.ProjectionDim).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
 
       LoadClipEmbeddingTable(Reader, TokEmb,
         'owlvit.text_model.embeddings.token_embedding.weight',
@@ -46377,7 +46377,7 @@ begin
       // (NumPatches+1, 1, hidden) post_layernorm hidden states (CLS row 0).
       NN := BuildClipVisionTower(Reader, Config.Vision,
         Config.ImageSize, Config.PatchSize, Config.NumChannels,
-        Config.ProjectionDim, 'owlvit.vision_model.', '', pInferenceOnly);
+        Config.ProjectionDim, 'owlvit.vision_model.', '', pTrainable);
       VisionTower := NN.GetLastLayer();
 
       // CLS MERGE: image_embeds[p] = post_ln[1+p] * post_ln[0]. The CLS row
@@ -46392,26 +46392,26 @@ begin
       Merged := NN.AddLayer(
         TNNetChannelMulByLayer.Create(PatchRows, ClsRow) );
       MergeLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.Vision.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.Vision.LayerNormEps).SetTrainable(pTrainable) );
 
       // class head: dense0 (hidden -> text_dim), plus logit_shift/scale (->1).
       Dense0 := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(TextDim, 0).SetInferenceOnly(pInferenceOnly), MergeLN);
+        TNNetPointwiseConvLinear.Create(TextDim, 0).SetTrainable(pTrainable), MergeLN);
       LogitShift := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(1, 0).SetInferenceOnly(pInferenceOnly), MergeLN);
+        TNNetPointwiseConvLinear.Create(1, 0).SetTrainable(pTrainable), MergeLN);
       LogitScale := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(1, 0).SetInferenceOnly(pInferenceOnly), MergeLN);
+        TNNetPointwiseConvLinear.Create(1, 0).SetTrainable(pTrainable), MergeLN);
       // box head: dense0 -> gelu -> dense1 -> gelu -> dense2(4).
       Box0 := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(VisHidden, 0).SetInferenceOnly(pInferenceOnly), MergeLN);
+        TNNetPointwiseConvLinear.Create(VisHidden, 0).SetTrainable(pTrainable), MergeLN);
       NN.AddLayer( TNNetGELUErf.Create() );
-      Box1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(VisHidden, 0).SetInferenceOnly(pInferenceOnly) );
+      Box1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(VisHidden, 0).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetGELUErf.Create() );
-      Box2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(4, 0).SetInferenceOnly(pInferenceOnly) );
+      Box2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(4, 0).SetTrainable(pTrainable) );
       // concat [ image_class_embeds | logit_shift | logit_scale_raw | box_raw ]
       NN.AddLayer( TNNetDeepConcat.Create([Dense0, LogitShift, LogitScale,
         Box2]) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+      if not pTrainable then NN.SetTrainable();
 
       // ---------------- head weights ----------------
       LoadLayerNormWeights(Reader, MergeLN,
@@ -46449,7 +46449,7 @@ end;
 
 procedure BuildOwlViTFromSafeTensors(const FileName: string;
   out TextNet, VisionNet: TNNet; out Config: TOwlViTConfig;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  TextSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 var
   ConfigPath: string;
@@ -46458,7 +46458,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadOwlViTConfigFromJSONFile(ConfigPath);
   BuildOwlViTFromSafeTensorsWithConfig(FileName, Config, TextNet, VisionNet,
-    TextSeqLen, pInferenceOnly);
+    TextSeqLen, pTrainable);
 end;
 
 procedure OwlViTQueryEmbedding(TextNet: TNNet; TokenIds: TNNetVolume;
@@ -46699,7 +46699,7 @@ end;
 
 function BuildSigLIPVisionTower(Reader: TNNetSafeTensorsReader;
   const Tower: TClipTowerConfig; ImageSize, PatchSize, NumChannels: integer;
-  const Prefix: string; pInferenceOnly: boolean = false;
+  const Prefix: string; pTrainable: boolean = true;
   pVisionFeatures: boolean = false;
   SelectHiddenLayer: integer = 0): TNNet;
 var
@@ -46735,13 +46735,13 @@ begin
     // BIASED patch embedding (unlike CLIP): kernel = stride = patch_size.
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
       d, PatchSize, {pInputPadding=}0, {pStride=}PatchSize,
-      {pSuppressBias=}0).SetInferenceOnly(pInferenceOnly) );
+      {pSuppressBias=}0).SetTrainable(pTrainable) );
     // Row-major (y,x) patch grid = HF flatten(2).transpose order. NO class
     // token (unlike CLIP): the position table covers exactly NumPatches rows.
     NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
     PosEmb := NN.AddLayer(
-      TNNetLearnedPositionalEmbedding.Create(NumPatches).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+      TNNetLearnedPositionalEmbedding.Create(NumPatches).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
     // SigLIP's vision encoder is a PRENORM stack like CLIP but WITHOUT a
     // pre_layrnorm before block 0. In LLaVA/VLM feature mode a positive
     // SelectHiddenLayer runs only the first N blocks (HF
@@ -46758,7 +46758,7 @@ begin
     dM1 := d - 1;
     for BlockCnt := 0 to BuiltLayersM1 do
       AddClipEncoderBlock(NN, Tower, {CausalMask=}false,
-        Blocks[BlockCnt], pInferenceOnly);
+        Blocks[BlockCnt], pTrainable);
     PostLN := nil;
     if pVisionFeatures then
     begin
@@ -46767,13 +46767,13 @@ begin
       // post_layernorm (HF last_hidden_state); a selected earlier layer is
       // returned RAW (HF hidden_states[N] is pre-post_layernorm).
       if SelectHiddenLayer <= 0 then
-        PostLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        PostLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps).SetTrainable(pTrainable) );
     end
     else
     begin
       // Inference embedding path: post_layernorm over every patch token,
       // then the Multihead Attention Pooling (MAP) head.
-      PostLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+      PostLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps).SetTrainable(pTrainable) );
       PatchKV := NN.GetLastLayer();    // (NumPatches,1,d) K/V source
       // The learnable probe (one virtual query token) prepended to the patch
       // sequence by TNNetSoftPrompt; we then crop it back out as the query.
@@ -46785,11 +46785,11 @@ begin
       // so the per-head Q/K/V projections can be loaded from nn.Multihead
       // Attention's packed in_proj_weight [3d, d].
       MapQProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly), ProbeQ);
+        TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), ProbeQ);
       MapKProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly), PatchKV);
+        TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), PatchKV);
       MapVProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly), PatchKV);
+        TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), PatchKV);
       SetLength(HeadOutputs, Tower.NumHeads);
       SetLength(Channels, dk);
       for HeadCnt := 0 to TowerNumHeadsM1 do
@@ -46806,21 +46806,21 @@ begin
           TNNetCrossAttention.Create(dk, {CausalMask=}false, KVPack), QSlice);
       end;
       NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
-      MapOut := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly) );
+      MapOut := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
       SetLength(HeadOutputs, 0);
       SetLength(Channels, 0);
       // residual = attn; out = residual + mlp(layernorm(attn)); take row 0.
       AttnSum := MapOut;
-      MapLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+      MapLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps).SetTrainable(pTrainable) );
       MapInter := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Tower.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+        TNNetPointwiseConvLinear.Create(Tower.IntermediateSize).SetTrainable(pTrainable) );
       AddClipHiddenAct(NN, Tower.HiddenAct);
-      MapFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly) );
+      MapFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
       MlpSum := NN.AddLayer( TNNetSum.Create([MapFc2, AttnSum]) );
       // The pooled output is row 0 (the single probe row); already (1,1,d).
       if MlpSum = nil then ;  // (silence unused warning paths)
     end;
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     PatchBiasName := Prefix + 'embeddings.patch_embedding.bias';
@@ -46907,7 +46907,7 @@ end;
 
 procedure BuildSigLIPFromSafeTensorsWithConfig(const FileName: string;
   var Config: TSigLIPConfig; out TextNet, VisionNet: TNNet;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  TextSeqLen: integer = 0; pTrainable: boolean = true);
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -46939,23 +46939,23 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen, 1, 1) );
       TokEmb := NN.AddLayer( TNNetEmbedding.Create(
-        Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1).SetInferenceOnly(pInferenceOnly) );
+        Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
       PosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
       SetLength(Blocks, Config.Text.NumLayers);
       NumTextLayersM1 := Config.Text.NumLayers - 1;
       // BIDIRECTIONAL (no causal mask), unlike CLIP's text tower.
       for BlockCnt := 0 to NumTextLayersM1 do
         AddClipEncoderBlock(NN, Config.Text, {CausalMask=}false,
-          Blocks[BlockCnt], pInferenceOnly);
+          Blocks[BlockCnt], pTrainable);
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetTrainable(pTrainable) );
       // BIASED head nn.Linear applied PER TOKEN; HF's text_embeds is the row
       // at the LAST position (SigLIPExtractEmbedding: TokenPos = SeqLen-1).
       Head := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.ProjectionDim).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.ProjectionDim).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
 
       // ---------------- TEXT tower weights ----------------
       LoadClipEmbeddingTable(Reader, TokEmb,
@@ -46980,7 +46980,7 @@ begin
       // ---------------- VISION tower ----------------
       VisionNet := BuildSigLIPVisionTower(Reader, Config.Vision,
         Config.ImageSize, Config.PatchSize, Config.NumChannels,
-        'vision_model.', pInferenceOnly);
+        'vision_model.', pTrainable);
 
       // ---------------- logit_scale / logit_bias ----------------
       if Reader.HasTensor('logit_scale') then
@@ -47018,7 +47018,7 @@ end;
 
 procedure BuildSigLIPFromSafeTensors(const FileName: string;
   out TextNet, VisionNet: TNNet; out Config: TSigLIPConfig;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  TextSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 var
   ConfigPath: string;
@@ -47027,7 +47027,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadSigLIPConfigFromJSONFile(ConfigPath);
   BuildSigLIPFromSafeTensorsWithConfig(FileName, Config, TextNet, VisionNet,
-    TextSeqLen, pInferenceOnly);
+    TextSeqLen, pTrainable);
 end;
 
 // ===========================================================================
@@ -47193,7 +47193,7 @@ end;
 
 function BuildViTForImageClassification(Reader: TNNetSafeTensorsReader;
   const Config: TViTImageClassificationConfig;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   Tower: TClipTowerConfig;
@@ -47235,7 +47235,7 @@ begin
     // = HF flatten(2).transpose(1,2) patch order.
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
       d, Config.PatchSize, {pInputPadding=}0, {pStride=}Config.PatchSize,
-      {pSuppressBias=}0).SetInferenceOnly(pInferenceOnly) );
+      {pSuppressBias=}0).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
     // Prepend one ZERO row as the CLS-token slot (PadXY pads both ends;
     // Crop drops the right pad). cls_token is folded into row 0 of the
@@ -47243,21 +47243,21 @@ begin
     NN.AddLayer( TNNetPadXY.Create(1, 0) );
     NN.AddLayer( TNNetCrop.Create(0, 0, NumPatches + 1, 1) );
     PosEmb := NN.AddLayer(
-      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
     SetLength(Blocks, Config.NumLayers);
     NumLayersM1 := Config.NumLayers - 1;
     dM1 := d - 1;
     for BlockCnt := 0 to NumLayersM1 do
       AddClipEncoderBlock(NN, Tower, {CausalMask=}false,
-        Blocks[BlockCnt], pInferenceOnly);
+        Blocks[BlockCnt], pTrainable);
     // Final layernorm over every token (exact for the CLS row 0 we read).
-    FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+    FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
     // Keep only the CLS row (row 0) -> (1,1,hidden), then the classifier.
     NN.AddLayer( TNNetCrop.Create({StartX=}0, {StartY=}0, {LenX=}1, {LenY=}1) );
     Classifier := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.NumLabels).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+      TNNetPointwiseConvLinear.Create(Config.NumLabels).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     LoadClipPatchConv(Reader, PatchConv,
@@ -47338,13 +47338,13 @@ end;
 
 function BuildViTFromSafeTensorsEx(const FileName: string;
   const Config: TViTImageClassificationConfig;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildViTForImageClassification(Reader, Config, pInferenceOnly);
+    Result := BuildViTForImageClassification(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
@@ -47352,7 +47352,7 @@ end;
 
 function BuildViTFromSafeTensors(const FileName: string;
   out Config: TViTImageClassificationConfig;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -47360,7 +47360,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadViTConfigFromJSONFile(ConfigPath);
-  Result := BuildViTFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildViTFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -47640,7 +47640,7 @@ begin
 end;
 
 function BuildResNet(Reader: TNNetSafeTensorsReader;
-  const Config: TResNetConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TResNetConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   StemConv, FC: TNNetLayer;
@@ -47664,7 +47664,7 @@ begin
       Config.NumChannels) );
     // Stem: conv 7x7 stride2 pad3 (+folded BN bias) -> relu -> maxpool.
     StemConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-      Config.StemWidth, 7, {pad=}3, {stride=}2, {suppressBias=}0).SetInferenceOnly(pInferenceOnly) );
+      Config.StemWidth, 7, {pad=}3, {stride=}2, {suppressBias=}0).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetReLU.Create() );
     NN.AddLayer( TNNetMaxPool.Create({pool=}3, {stride=}2, {pad=}1) );
     RefCount := 0;
@@ -47697,8 +47697,8 @@ begin
     end;
     // Head: global average pool over the spatial grid -> fc -> logits.
     NN.AddLayer( TNNetAvgChannel.Create() );
-    FC := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+    FC := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     LoadResNetConvFoldBN(Reader, StemConv, 'conv1.weight', 'bn1',
@@ -47758,20 +47758,20 @@ begin
 end;
 
 function BuildResNetFromSafeTensorsEx(const FileName: string;
-  const Config: TResNetConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TResNetConfig; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildResNet(Reader, Config, pInferenceOnly);
+    Result := BuildResNet(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildResNetFromSafeTensors(const FileName: string;
-  out Config: TResNetConfig; pInferenceOnly: boolean = false;
+  out Config: TResNetConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -47779,7 +47779,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadResNetConfigFromJSONFile(ConfigPath);
-  Result := BuildResNetFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildResNetFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -48070,7 +48070,7 @@ begin
 end;
 
 function BuildConvNeXt(Reader: TNNetSafeTensorsReader;
-  const Config: TConvNeXtConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TConvNeXtConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   StemConv, StemLN, HeadLN, FC: TNNetLayer;
@@ -48096,8 +48096,8 @@ begin
       Config.NumChannels));
     // Stem: patchify conv (PxP stride P, biased) -> channel LayerNorm.
     StemConv := NN.AddLayer(TNNetConvolutionLinear.Create(
-      Config.Dims[0], Config.PatchSize, 0, Config.PatchSize, 0).SetInferenceOnly(pInferenceOnly));
-    StemLN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly));
+      Config.Dims[0], Config.PatchSize, 0, Config.PatchSize, 0).SetTrainable(pTrainable));
+    StemLN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
     RefCount := 0;
     InDim := Config.Dims[0];
     for Stage := 0 to 3 do
@@ -48108,9 +48108,9 @@ begin
       if Stage > 0 then
       begin
         DownLN[Stage] := NN.AddLayer(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly));
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
         DownConv[Stage] := NN.AddLayer(
-          TNNetConvolutionLinear.Create(Dim, 2, 0, 2, 0).SetInferenceOnly(pInferenceOnly));
+          TNNetConvolutionLinear.Create(Dim, 2, 0, 2, 0).SetTrainable(pTrainable));
       end;
       for BlockIdx := 0 to Config.Depths[Stage] - 1 do
       begin
@@ -48121,9 +48121,9 @@ begin
     end;
     // Head: global average pool over spatial grid -> channel LayerNorm -> fc.
     NN.AddLayer(TNNetAvgChannel.Create());
-    HeadLN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly));
-    FC := NN.AddLayer(TNNetFullConnectLinear.Create(Config.NumLabels).SetInferenceOnly(pInferenceOnly));
-    if pInferenceOnly then NN.SetInferenceOnly();
+    HeadLN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
+    FC := NN.AddLayer(TNNetFullConnectLinear.Create(Config.NumLabels).SetTrainable(pTrainable));
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     LoadConvNeXtConv(Reader, StemConv,
@@ -48190,20 +48190,20 @@ begin
 end;
 
 function BuildConvNeXtFromSafeTensorsEx(const FileName: string;
-  const Config: TConvNeXtConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TConvNeXtConfig; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildConvNeXt(Reader, Config, pInferenceOnly);
+    Result := BuildConvNeXt(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildConvNeXtFromSafeTensors(const FileName: string;
-  out Config: TConvNeXtConfig; pInferenceOnly: boolean = false;
+  out Config: TConvNeXtConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -48211,7 +48211,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadConvNeXtConfigFromJSONFile(ConfigPath);
-  Result := BuildConvNeXtFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildConvNeXtFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -48503,7 +48503,7 @@ begin
 end;
 
 function BuildSegformer(Reader: TNNetSafeTensorsReader;
-  const Config: TSegformerConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TSegformerConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   Stages: array[0..3] of TSegformerStageRefs;
@@ -48566,15 +48566,15 @@ begin
       // Overlap-patch embed: KxK stride S pad K div 2, biased.
       Stages[Stage].PatchConv := NN.AddLayer(TNNetConvolutionLinear.Create(
         C, Config.PatchSizes[Stage], Config.PatchSizes[Stage] div 2,
-        Config.Strides[Stage], 0).SetInferenceOnly(pInferenceOnly));
+        Config.Strides[Stage], 0).SetTrainable(pTrainable));
       Stages[Stage].PatchLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly));
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
       SetLength(Stages[Stage].Blocks, Config.Depths[Stage]);
       for BlockIdx := 0 to Config.Depths[Stage] - 1 do
         AddSegformerBlock(NN, Config, Stage, GW[Stage], GH[Stage],
           Stages[Stage].Blocks[BlockIdx]);
       Stages[Stage].StageLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly));
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
       StageOut[Stage] := NN.GetLastLayer();
       InC := C;
     end;
@@ -48583,7 +48583,7 @@ begin
     begin
       // per-token Linear to decoder dim, then bilinear-upsample to stage-0 grid.
       ProjLinear[Stage] := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.DecoderHiddenSize).SetInferenceOnly(pInferenceOnly),
+        TNNetPointwiseConvLinear.Create(Config.DecoderHiddenSize).SetTrainable(pTrainable),
         StageOut[Stage]);
       Projected[Stage] := ProjLinear[Stage];
       Factor := GW[0] div GW[Stage];
@@ -48595,13 +48595,13 @@ begin
       [Projected[3], Projected[2], Projected[1], Projected[0]]));
     // linear_fuse 1x1 conv (4*decoder -> decoder, biased), BN, ReLU, classifier.
     FuseConv := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.DecoderHiddenSize).SetInferenceOnly(pInferenceOnly));
+      TNNetPointwiseConvLinear.Create(Config.DecoderHiddenSize).SetTrainable(pTrainable));
     BNScale := NN.AddLayer(TNNetChannelMul.Create());
     BNShift := NN.AddLayer(TNNetChannelBias.Create());
     NN.AddLayer(TNNetReLU.Create());
     Classifier := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.NumLabels).SetInferenceOnly(pInferenceOnly));
-    if pInferenceOnly then NN.SetInferenceOnly();
+      TNNetPointwiseConvLinear.Create(Config.NumLabels).SetTrainable(pTrainable));
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     for Stage := 0 to 3 do
@@ -48774,20 +48774,20 @@ begin
 end;
 
 function BuildSegformerFromSafeTensorsEx(const FileName: string;
-  const Config: TSegformerConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TSegformerConfig; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildSegformer(Reader, Config, pInferenceOnly);
+    Result := BuildSegformer(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildSegformerFromSafeTensors(const FileName: string;
-  out Config: TSegformerConfig; pInferenceOnly: boolean = false;
+  out Config: TSegformerConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -48795,7 +48795,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadSegformerConfigFromJSONFile(ConfigPath);
-  Result := BuildSegformerFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildSegformerFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -48943,7 +48943,7 @@ end;
 
 function BuildInceptionV3(Reader: TNNetSafeTensorsReader;
   const Config: TInceptionV3Config; out PoolFeatureIdx: integer;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   StemConv, FC: TNNetLayer;
@@ -48971,14 +48971,14 @@ begin
     // (Conv2d_1a..4a + maxpools) is a documented follow-up; the multi-branch
     // modules are what is exercised here.
     StemConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-      Config.StemWidth, 3, {pad=}1, {stride=}1, {suppressBias=}0).SetInferenceOnly(pInferenceOnly) );
+      Config.StemWidth, 3, {pad=}1, {stride=}1, {suppressBias=}0).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetReLU.Create() );
     for m := 0 to NumModulesM1 do
       AddInceptionAModule(NN, Config, ModRefs[m]);
     // Head: global average pool (the FID pooled-feature tap) -> fc.
     PoolFeatureIdx := NN.AddLayer( TNNetAvgChannel.Create() ).LayerIdx;
-    FC := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+    FC := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     // Stem BasicConv2d: Conv2d_1a_3x3.{conv,bn}.
@@ -49024,13 +49024,13 @@ end;
 
 function BuildInceptionV3FromSafeTensorsEx(const FileName: string;
   const Config: TInceptionV3Config; out PoolFeatureIdx: integer;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildInceptionV3(Reader, Config, PoolFeatureIdx, pInferenceOnly);
+    Result := BuildInceptionV3(Reader, Config, PoolFeatureIdx, pTrainable);
   finally
     Reader.Free;
   end;
@@ -49038,7 +49038,7 @@ end;
 
 function BuildInceptionV3FromSafeTensors(const FileName: string;
   out Config: TInceptionV3Config; out PoolFeatureIdx: integer;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -49047,7 +49047,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadInceptionV3ConfigFromJSONFile(ConfigPath);
   Result := BuildInceptionV3FromSafeTensorsEx(FileName, Config, PoolFeatureIdx,
-    pInferenceOnly);
+    pTrainable);
 end;
 
 // ===========================================================================
@@ -49334,7 +49334,7 @@ begin
 end;
 
 function BuildMobileNetV3(Reader: TNNetSafeTensorsReader;
-  const Config: TMobileNetV3Config; pInferenceOnly: boolean = false): TNNet;
+  const Config: TMobileNetV3Config; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   StemConv, HeadConv, FC0, FC1: TNNetLayer;
@@ -49357,7 +49357,7 @@ begin
       Config.NumChannels));
     // Stem: conv 3x3 stride2 pad1 (+folded BN bias) -> hard-swish.
     StemConv := NN.AddLayer(TNNetConvolutionLinear.Create(
-      Config.StemWidth, 3, {pad=}1, {stride=}2, {suppressBias=}0).SetInferenceOnly(pInferenceOnly));
+      Config.StemWidth, 3, {pad=}1, {stride=}2, {suppressBias=}0).SetTrainable(pTrainable));
     NN.AddLayer(TNNetHardSwish.Create());
     InChannels := Config.StemWidth;
     for i := 0 to BlocksHi do
@@ -49368,13 +49368,13 @@ begin
     // Head: conv 1x1 +BN +hard-swish -> global avg pool -> Linear -> hard-swish
     //       -> Linear(num_labels).
     HeadConv := NN.AddLayer(TNNetConvolutionLinear.Create(
-      Config.HeadConvWidth, 1, 0, 1, 0).SetInferenceOnly(pInferenceOnly));
+      Config.HeadConvWidth, 1, 0, 1, 0).SetTrainable(pTrainable));
     NN.AddLayer(TNNetHardSwish.Create());
     NN.AddLayer(TNNetAvgChannel.Create());
-    FC0 := NN.AddLayer(TNNetFullConnectLinear.Create(Config.ClassifierHidden).SetInferenceOnly(pInferenceOnly));
+    FC0 := NN.AddLayer(TNNetFullConnectLinear.Create(Config.ClassifierHidden).SetTrainable(pTrainable));
     NN.AddLayer(TNNetHardSwish.Create());
-    FC1 := NN.AddLayer(TNNetFullConnectLinear.Create(Config.NumLabels).SetInferenceOnly(pInferenceOnly));
-    if pInferenceOnly then NN.SetInferenceOnly();
+    FC1 := NN.AddLayer(TNNetFullConnectLinear.Create(Config.NumLabels).SetTrainable(pTrainable));
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     // features.0.0 = stem conv, features.0.1 = stem BN.
@@ -49451,20 +49451,20 @@ begin
 end;
 
 function BuildMobileNetV3FromSafeTensorsEx(const FileName: string;
-  const Config: TMobileNetV3Config; pInferenceOnly: boolean = false): TNNet;
+  const Config: TMobileNetV3Config; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildMobileNetV3(Reader, Config, pInferenceOnly);
+    Result := BuildMobileNetV3(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildMobileNetV3FromSafeTensors(const FileName: string;
-  out Config: TMobileNetV3Config; pInferenceOnly: boolean = false;
+  out Config: TMobileNetV3Config; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -49472,7 +49472,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadMobileNetV3ConfigFromJSONFile(ConfigPath);
-  Result := BuildMobileNetV3FromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildMobileNetV3FromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -49632,7 +49632,7 @@ begin
 end;
 
 function BuildEfficientNet(Reader: TNNetSafeTensorsReader;
-  const Config: TEfficientNetConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TEfficientNetConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   StemConv, HeadConv, FC: TNNetLayer;
@@ -49655,7 +49655,7 @@ begin
       Config.NumChannels));
     // Stem: conv 3x3 stride2 pad1 (+folded BN bias) -> SiLU.
     StemConv := NN.AddLayer(TNNetConvolutionLinear.Create(
-      Config.StemWidth, 3, {pad=}1, {stride=}2, {suppressBias=}0).SetInferenceOnly(pInferenceOnly));
+      Config.StemWidth, 3, {pad=}1, {stride=}2, {suppressBias=}0).SetTrainable(pTrainable));
     NN.AddLayer(TNNetSwish.Create());
     InChannels := Config.StemWidth;
     for i := 0 to BlocksHi do
@@ -49665,11 +49665,11 @@ begin
     end;
     // Head: conv 1x1 +BN +SiLU -> global avg pool -> Linear(num_labels).
     HeadConv := NN.AddLayer(TNNetConvolutionLinear.Create(
-      Config.HeadConvWidth, 1, 0, 1, 0).SetInferenceOnly(pInferenceOnly));
+      Config.HeadConvWidth, 1, 0, 1, 0).SetTrainable(pTrainable));
     NN.AddLayer(TNNetSwish.Create());
     NN.AddLayer(TNNetAvgChannel.Create());
-    FC := NN.AddLayer(TNNetFullConnectLinear.Create(Config.NumLabels).SetInferenceOnly(pInferenceOnly));
-    if pInferenceOnly then NN.SetInferenceOnly();
+    FC := NN.AddLayer(TNNetFullConnectLinear.Create(Config.NumLabels).SetTrainable(pTrainable));
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     // features.0.0 = stem conv, features.0.1 = stem BN.
@@ -49742,20 +49742,20 @@ begin
 end;
 
 function BuildEfficientNetFromSafeTensorsEx(const FileName: string;
-  const Config: TEfficientNetConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TEfficientNetConfig; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildEfficientNet(Reader, Config, pInferenceOnly);
+    Result := BuildEfficientNet(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildEfficientNetFromSafeTensors(const FileName: string;
-  out Config: TEfficientNetConfig; pInferenceOnly: boolean = false;
+  out Config: TEfficientNetConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -49763,7 +49763,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadEfficientNetConfigFromJSONFile(ConfigPath);
-  Result := BuildEfficientNetFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildEfficientNetFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -50034,7 +50034,7 @@ begin
 end;
 
 function BuildSwinFromSafeTensors(Reader: TNNetSafeTensorsReader;
-  const Config: TSwinConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TSwinConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   PatchConv, EmbNorm, FinalNorm, Classifier, Pooled, GridMap: TNNetLayer;
@@ -50080,11 +50080,11 @@ begin
     NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
       Config.NumChannels) );
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-      Config.EmbedDim, Config.PatchSize, 0, Config.PatchSize, 0).SetInferenceOnly(pInferenceOnly) );
+      Config.EmbedDim, Config.PatchSize, 0, Config.PatchSize, 0).SetTrainable(pTrainable) );
     // Flatten the (gridW, gridH, C) map to a (gridW*gridH, 1, C) token sequence
     // in row-major (y*Grid + x) order (HF flatten(2).transpose).
     NN.AddLayer( TNNetReshape.Create(PatchGrid * PatchGrid, 1, Config.EmbedDim) );
-    EmbNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+    EmbNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
     StageIn := EmbNorm;
     Grid := PatchGrid;
     Dim := Config.EmbedDim;
@@ -50121,7 +50121,7 @@ begin
         ShortcutA := StageIn;
         // --- W-MSA / SW-MSA ---
         NormBefore := NN.AddLayerAfter(
-          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), StageIn);
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), StageIn);
         // Reorder tokens into window-contiguous (and shifted) order.
         Reordered := NN.AddLayer( TNNetGatherTokens.Create(TokenPerm) );
         SetLength(WindowOuts, NumWindows);
@@ -50131,9 +50131,9 @@ begin
           WinSlice := NN.AddLayerAfter(
             TNNetCrop.Create(wIdx * ws2, 0, ws2, 1), Reordered);
           // per-token Q/K/V projections (Linear over depth)
-          QProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).SetInferenceOnly(pInferenceOnly) );
-          KProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim).SetInferenceOnly(pInferenceOnly), WinSlice);
-          VProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim).SetInferenceOnly(pInferenceOnly), WinSlice);
+          QProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).SetTrainable(pTrainable) );
+          KProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim).SetTrainable(pTrainable), WinSlice);
+          VProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim).SetTrainable(pTrainable), WinSlice);
           SetLength(HeadOuts, Heads);
           SetLength(Channels, HeadDim);
           for h := 0 to HeadsM1 do
@@ -50153,7 +50153,7 @@ begin
             HeadOuts[h] := HeadAttn;
           end;
           AttnConcat := NN.AddLayer( TNNetDeepConcat.Create(HeadOuts) );
-          OProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).SetInferenceOnly(pInferenceOnly) );
+          OProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).SetTrainable(pTrainable) );
           WindowOuts[wIdx] := OProj;
           // load q/k/v/o weights for this window (shared across windows -> the
           // same checkpoint tensors load into every window's projections)
@@ -50176,11 +50176,11 @@ begin
         AttnResidual := NN.AddLayer( TNNetSum.Create([ReorderBack, ShortcutA]) );
 
         // --- MLP ---
-        NormAfter := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        NormAfter := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
         MlpHidden := Round(Dim * Config.MlpRatio);
-        Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden).SetInferenceOnly(pInferenceOnly) );
+        Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetGELU.Create() );
-        Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).SetInferenceOnly(pInferenceOnly) );
+        Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).SetTrainable(pTrainable) );
         MlpResidual := NN.AddLayer( TNNetSum.Create([Fc2, AttnResidual]) );
         StageIn := MlpResidual;
 
@@ -50241,8 +50241,8 @@ begin
         // pack each group of 4 contiguous tokens (4*Dim values) into one token
         // of depth 4*Dim: (4*half*half,1,Dim) -> (half*half,1,4*Dim).
         NN.AddLayer( TNNetReshape.Create(half * half, 1, 4 * Dim) );
-        MergeNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-        MergeReduce := NN.AddLayer( TNNetPointwiseConvLinear.Create(2 * Dim).SetInferenceOnly(pInferenceOnly) );
+        MergeNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+        MergeReduce := NN.AddLayer( TNNetPointwiseConvLinear.Create(2 * Dim).SetTrainable(pTrainable) );
         LoadLayerNormWeights(Reader, MergeNorm,
           Prefix + 'downsample.norm.weight', Prefix + 'downsample.norm.bias', 4 * Dim);
         // reduction is a bias-free Linear [2*Dim, 4*Dim]
@@ -50255,14 +50255,14 @@ begin
     end;
 
     // ---------------- Head ----------------
-    FinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+    FinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
     NumTokens := Grid * Grid;
     // mean-pool over tokens: reshape the (NumTokens,1,Dim) sequence into the
     // square (Grid,Grid,Dim) map so TNNetAvgChannel (pool = Grid, divides by
     // Grid*Grid = NumTokens) is the EXACT global token mean.
     GridMap := NN.AddLayer( TNNetReshape.Create(Grid, Grid, Dim) );
     Pooled := NN.AddLayer( TNNetAvgChannel.Create() );
-    Classifier := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels).SetInferenceOnly(pInferenceOnly) );
+    Classifier := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels).SetTrainable(pTrainable) );
     LoadLayerNormWeights(Reader, FinalNorm,
       'layernorm.weight', 'layernorm.bias', Dim);
     LoadLlamaLinearWeights(Reader, Classifier, 'classifier.weight',
@@ -50277,7 +50277,7 @@ begin
     LoadLayerNormWeights(Reader, EmbNorm,
       'embeddings.norm.weight', 'embeddings.norm.bias', Config.EmbedDim);
 
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
     if (GridMap = nil) or (Pooled = nil) then ; // silence unused
     Result := NN;
   except
@@ -50287,20 +50287,20 @@ begin
 end;
 
 function BuildSwinFromSafeTensorsEx(const FileName: string;
-  const Config: TSwinConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TSwinConfig; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildSwinFromSafeTensors(Reader, Config, pInferenceOnly);
+    Result := BuildSwinFromSafeTensors(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildSwinFromSafeTensors(const FileName: string;
-  out Config: TSwinConfig; pInferenceOnly: boolean = false;
+  out Config: TSwinConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -50308,7 +50308,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadSwinConfigFromJSONFile(ConfigPath);
-  Result := BuildSwinFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildSwinFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -50442,7 +50442,7 @@ end;
 // the already batch-normed + transposed (mel_bins, time, 1) image
 // (freq_ratio = 1 contract).
 function BuildClapAudioTower(Reader: TNNetSafeTensorsReader;
-  const Config: TClapConfig; pInferenceOnly: boolean): TNNet;
+  const Config: TClapConfig; pTrainable: boolean): TNNet;
 var
   NN: TNNet;
   PatchConv, EmbNorm, FinalNorm, StageIn, GridMap, Pooled: TNNetLayer;
@@ -50492,9 +50492,9 @@ begin
     NN.AddLayer( TNNetInput.Create(Config.Audio.SpecSize, Config.Audio.SpecSize, 1) );
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
       Config.Audio.EmbedDim, Config.Audio.PatchSize, 0,
-      Config.Audio.PatchSize, 0).SetInferenceOnly(pInferenceOnly) );
+      Config.Audio.PatchSize, 0).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetReshape.Create(PatchGrid * PatchGrid, 1, Config.Audio.EmbedDim) );
-    EmbNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+    EmbNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps).SetTrainable(pTrainable) );
     StageIn := EmbNorm;
     Grid := PatchGrid;
     Dim := Config.Audio.EmbedDim;
@@ -50521,16 +50521,16 @@ begin
 
         ShortcutA := StageIn;
         NormBefore := NN.AddLayerAfter(
-          TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps).SetInferenceOnly(pInferenceOnly), StageIn);
+          TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps).SetTrainable(pTrainable), StageIn);
         Reordered := NN.AddLayer( TNNetGatherTokens.Create(TokenPerm) );
         SetLength(WindowOuts, NumWindows);
         for wIdx := 0 to NumWindowsM1 do
         begin
           WinSlice := NN.AddLayerAfter(
             TNNetCrop.Create(wIdx * ws2, 0, ws2, 1), Reordered);
-          QProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).SetInferenceOnly(pInferenceOnly) );
-          KProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim).SetInferenceOnly(pInferenceOnly), WinSlice);
-          VProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim).SetInferenceOnly(pInferenceOnly), WinSlice);
+          QProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).SetTrainable(pTrainable) );
+          KProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim).SetTrainable(pTrainable), WinSlice);
+          VProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim).SetTrainable(pTrainable), WinSlice);
           SetLength(HeadOuts, Heads);
           SetLength(Channels, HeadDim);
           for h := 0 to HeadsM1 do
@@ -50546,7 +50546,7 @@ begin
             HeadOuts[h] := HeadAttn;
           end;
           AttnConcat := NN.AddLayer( TNNetDeepConcat.Create(HeadOuts) );
-          OProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).SetInferenceOnly(pInferenceOnly) );
+          OProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).SetTrainable(pTrainable) );
           WindowOuts[wIdx] := OProj;
           // clap key spelling: attention.self.{query,key,value} +
           // attention.output.dense
@@ -50564,11 +50564,11 @@ begin
         ReorderBack := NN.AddLayer( TNNetGatherTokens.Create(InvPerm) );
         AttnResidual := NN.AddLayer( TNNetSum.Create([ReorderBack, ShortcutA]) );
 
-        NormAfter := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        NormAfter := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps).SetTrainable(pTrainable) );
         MlpHidden := Reader.DimSize(BPrefix + 'intermediate.dense.weight', 0);
-        Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden).SetInferenceOnly(pInferenceOnly) );
+        Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetGELUErf.Create() );  // audio hidden_act 'gelu' = exact erf
-        Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).SetInferenceOnly(pInferenceOnly) );
+        Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([Fc2, AttnResidual]) );
         StageIn := NN.GetLastLayer();
 
@@ -50614,8 +50614,8 @@ begin
           end;
         NN.AddLayer( TNNetGatherTokens.Create(MergePerm) );
         NN.AddLayer( TNNetReshape.Create(half * half, 1, 4 * Dim) );
-        MergeNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-        MergeReduce := NN.AddLayer( TNNetPointwiseConvLinear.Create(2 * Dim).SetInferenceOnly(pInferenceOnly) );
+        MergeNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps).SetTrainable(pTrainable) );
+        MergeReduce := NN.AddLayer( TNNetPointwiseConvLinear.Create(2 * Dim).SetTrainable(pTrainable) );
         LoadLayerNormWeights(Reader, MergeNorm,
           Prefix + 'downsample.norm.weight', Prefix + 'downsample.norm.bias', 4 * Dim);
         LoadLlamaLinearWeights(Reader, MergeReduce,
@@ -50627,15 +50627,15 @@ begin
     end;
 
     // ---- head: final LN -> token mean-pool -> 2-layer projection ----
-    FinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+    FinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps).SetTrainable(pTrainable) );
     GridMap := NN.AddLayer( TNNetReshape.Create(Grid, Grid, Dim) );
     Pooled := NN.AddLayer( TNNetAvgChannel.Create() );
     // AvgChannel returns (1,1,Dim); ClapProjectionLayer is linear1 -> ReLU
     // -> linear2 (both biased). PointwiseConvLinear over the single token.
-    Proj1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim).SetInferenceOnly(pInferenceOnly) );
+    Proj1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim).SetTrainable(pTrainable) );
     if Config.ProjectionActRelu then NN.AddLayer( TNNetReLU.Create() )
     else NN.AddLayer( TNNetGELU.Create() );
-    Proj2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim).SetInferenceOnly(pInferenceOnly) );
+    Proj2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim).SetTrainable(pTrainable) );
 
     LoadLayerNormWeights(Reader, FinalNorm,
       EncPrefix + 'norm.weight', EncPrefix + 'norm.bias', Dim);
@@ -50653,7 +50653,7 @@ begin
       Config.ProjectionDim, Config.ProjectionDim, 0, -1, 0,
       'audio_projection.linear2.bias');
 
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
     if (GridMap = nil) or (Pooled = nil) then ; // silence unused
     Result := NN;
   except
@@ -50665,7 +50665,7 @@ end;
 // Builds the RoBERTa text tower (inline, exactly the BuildBertFromSafeTensors
 // post-LN bidirectional shape) + the BERT-style pooler + 2-layer projection.
 function BuildClapTextTower(Reader: TNNetSafeTensorsReader;
-  const Config: TClapConfig; TextSeqLen: integer; pInferenceOnly: boolean): TNNet;
+  const Config: TClapConfig; TextSeqLen: integer; pTrainable: boolean): TNNet;
 var
   NN: TNNet;
   InputLayer, WordEmb, PosEmb, TypeEmb, EmbLN, SliceLayer: TNNetLayer;
@@ -50708,37 +50708,37 @@ begin
   try
     InputLayer := NN.AddLayer( TNNetInput.Create(SeqLen, 1, 2) );
     NN.AddLayerAfter( TNNetSplitChannels.Create([0]), InputLayer );
-    WordEmb := NN.AddLayer( TNNetEmbedding.Create(Config.Text.VocabSize, HSz, 1).SetInferenceOnly(pInferenceOnly) );
-    PosEmb := NN.AddLayer( TNNetLearnedPositionalEmbedding.Create(UsablePositions).SetInferenceOnly(pInferenceOnly) );
+    WordEmb := NN.AddLayer( TNNetEmbedding.Create(Config.Text.VocabSize, HSz, 1).SetTrainable(pTrainable) );
+    PosEmb := NN.AddLayer( TNNetLearnedPositionalEmbedding.Create(UsablePositions).SetTrainable(pTrainable) );
     TypeEmb := nil;
     if Config.Text.TypeVocabSize > 0 then
     begin
       SliceLayer := NN.AddLayerAfter( TNNetSplitChannels.Create([1]), InputLayer);
       TypeEmb := NN.AddLayerAfter(
-        TNNetEmbedding.Create(Config.Text.TypeVocabSize, HSz, 1).SetInferenceOnly(pInferenceOnly), SliceLayer);
+        TNNetEmbedding.Create(Config.Text.TypeVocabSize, HSz, 1).SetTrainable(pTrainable), SliceLayer);
       NN.AddLayer( TNNetSum.Create([PosEmb, TypeEmb]) );
     end;
-    EmbLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+    EmbLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
     TextNumLayersM1 := Config.Text.NumLayers - 1;
     for BlockCnt := 0 to TextNumLayersM1 do
     begin
       BranchInput := NN.GetLastLayer();
-      QKV := NN.AddLayer( TNNetPointwiseConvLinear.Create(3 * HSz).SetInferenceOnly(pInferenceOnly) );
+      QKV := NN.AddLayer( TNNetPointwiseConvLinear.Create(3 * HSz).SetTrainable(pTrainable) );
       AttnDense := NN.AddMultiHeadSelfAttention(Config.Text.NumHeads,
         {CausalMask=}false, {UseRoPE=}false, avSDPA, {NumSinks=}1, {Window=}0,
         {RelPosNumBuckets=}32, {RelPosMaxDistance=}128, {QKRMSNorm=}false,
         {SegmentSource=}nil);
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-      AttnLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+      AttnLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetTrainable(pTrainable) );
       BranchInput := NN.GetLastLayer();
       Inter := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.Text.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+        TNNetPointwiseConvLinear.Create(Config.Text.IntermediateSize).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetGELUErf.Create() );  // text hidden_act 'gelu' = exact erf
-      OutDense := NN.AddLayer( TNNetPointwiseConvLinear.Create(HSz).SetInferenceOnly(pInferenceOnly) );
+      OutDense := NN.AddLayer( TNNetPointwiseConvLinear.Create(HSz).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-      OutLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+      OutLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
 
       BPrefix := 'text_model.encoder.layer.' + IntToStr(BlockCnt) + '.';
       // pack q|k|v into the single 3*HSz QKV projection (depth-concatenated).
@@ -50765,13 +50765,13 @@ begin
     // pooler (dense + tanh on token 0) then the 2-layer projection. Crop
     // token 0 first so everything downstream is a single (1,1,*) token.
     ClsSlice := NN.AddLayer( TNNetCrop.Create(0, 0, 1, 1) );
-    Pooler := NN.AddLayer( TNNetPointwiseConvLinear.Create(HSz).SetInferenceOnly(pInferenceOnly) );
+    Pooler := NN.AddLayer( TNNetPointwiseConvLinear.Create(HSz).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetHyperbolicTangent.Create() );
-    Proj1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim).SetInferenceOnly(pInferenceOnly) );
+    Proj1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim).SetTrainable(pTrainable) );
     if Config.ProjectionActRelu then NN.AddLayer( TNNetReLU.Create() )
     else NN.AddLayer( TNNetGELU.Create() );
-    Proj2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+    Proj2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
     if ClsSlice = nil then ; // silence unused
 
     // ---- weights ----
@@ -50801,7 +50801,7 @@ end;
 
 procedure BuildClapFromSafeTensorsWithConfig(const FileName: string;
   var Config: TClapConfig; out AudioNet, TextNet: TNNet;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  TextSeqLen: integer = 0; pTrainable: boolean = true);
 var
   Reader: TNNetSafeTensorsReader;
   Tmp: TNNetVolume;
@@ -50821,8 +50821,8 @@ begin
       Reader.LoadTensorFlat('logit_scale_t', Tmp);
       if Tmp.Size >= 1 then Config.LogitScaleT := Tmp.FData[0];
     end;
-    AudioNet := BuildClapAudioTower(Reader, Config, pInferenceOnly);
-    TextNet := BuildClapTextTower(Reader, Config, TextSeqLen, pInferenceOnly);
+    AudioNet := BuildClapAudioTower(Reader, Config, pTrainable);
+    TextNet := BuildClapTextTower(Reader, Config, TextSeqLen, pTrainable);
   except
     AudioNet.Free;
     TextNet.Free;
@@ -50836,7 +50836,7 @@ end;
 
 procedure BuildClapFromSafeTensors(const FileName: string;
   out AudioNet, TextNet: TNNet; out Config: TClapConfig;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  TextSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 var
   ConfigPath: string;
@@ -50845,7 +50845,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadClapConfigFromJSONFile(ConfigPath);
   BuildClapFromSafeTensorsWithConfig(FileName, Config, AudioNet, TextNet,
-    TextSeqLen, pInferenceOnly);
+    TextSeqLen, pTrainable);
 end;
 
 procedure ClapBatchNormMelImage(Reader: TNNetSafeTensorsReader;
@@ -51095,7 +51095,7 @@ end;
 
 function BuildVGG(Reader: TNNetSafeTensorsReader;
   const Config: TVGGConfig; out TapLayerIdx: array of integer;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   ConvLayers: array of TNNetLayer;
@@ -51132,7 +51132,7 @@ begin
     // prev layer's OutputError size at SetPrevLayer time, so collection must be
     // on now for backprop-to-the-input (perceptual / style-transfer gradient
     // ascent) to reach the pixels. Harmless for plain forward inference.
-    if not pInferenceOnly then
+    if pTrainable then
       TNNetInput(NN.GetLastLayer()).EnableErrorCollection();
     RefCount := 0;
     InWidth := Config.NumChannels;
@@ -51142,7 +51142,7 @@ begin
       begin
         // Conv 3x3 pad1 stride1 with bias (suppressBias=0), then ReLU.
         ConvLayers[RefCount] := NN.AddLayer(
-          TNNetConvolutionLinear.Create(Config.StageWidths[Stage], 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+          TNNetConvolutionLinear.Create(Config.StageWidths[Stage], 3, 1, 1, 0).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetReLU.Create() );
         Inc(RefCount);
         InWidth := Config.StageWidths[Stage];
@@ -51162,7 +51162,7 @@ begin
     if (Config.FeatureTapStage >= 1) and (Config.FeatureTapStage <= 5) then
     begin
       // Feature-extractor variant: no classifier; the net ends at the tap ReLU.
-      if pInferenceOnly then NN.SetInferenceOnly();
+      if not pTrainable then NN.SetTrainable();
     end
     else
     begin
@@ -51176,10 +51176,10 @@ begin
         NN.AddLayer( TNNetAvgChannel.Create() );
       // else: identity (grid already AdaptivePool x AdaptivePool); FC flattens.
       FlatDim := Config.StageWidths[4] * Config.AdaptivePool * Config.AdaptivePool;
-      FC0 := NN.AddLayer( TNNetFullConnectReLU.Create(Config.FCHidden[0]).SetInferenceOnly(pInferenceOnly) );
-      FC1 := NN.AddLayer( TNNetFullConnectReLU.Create(Config.FCHidden[1]).SetInferenceOnly(pInferenceOnly) );
-      FC2 := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+      FC0 := NN.AddLayer( TNNetFullConnectReLU.Create(Config.FCHidden[0]).SetTrainable(pTrainable) );
+      FC1 := NN.AddLayer( TNNetFullConnectReLU.Create(Config.FCHidden[1]).SetTrainable(pTrainable) );
+      FC2 := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
     end;
 
     // ---------------- Weights ----------------
@@ -51225,13 +51225,13 @@ end;
 
 function BuildVGGFromSafeTensorsEx(const FileName: string;
   const Config: TVGGConfig; out TapLayerIdx: array of integer;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildVGG(Reader, Config, TapLayerIdx, pInferenceOnly);
+    Result := BuildVGG(Reader, Config, TapLayerIdx, pTrainable);
   finally
     Reader.Free;
   end;
@@ -51239,7 +51239,7 @@ end;
 
 function BuildVGGFromSafeTensors(const FileName: string;
   out Config: TVGGConfig; out TapLayerIdx: array of integer;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -51248,7 +51248,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadVGGConfigFromJSONFile(ConfigPath);
   Result := BuildVGGFromSafeTensorsEx(FileName, Config, TapLayerIdx,
-    pInferenceOnly);
+    pTrainable);
 end;
 
 // ===========================================================================
@@ -51642,7 +51642,7 @@ begin
 end;
 
 function BuildVaeDecoder(Reader: TNNetSafeTensorsReader;
-  const Config: TVaeDecoderConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TVaeDecoderConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   PostQuant, ConvIn, NormOut, ConvOut: TNNetLayer;
@@ -51673,9 +51673,9 @@ begin
     // Undo the SD latent scaling, then post_quant_conv (1x1) + conv_in (3x3).
     NN.AddLayer( TNNetMulByConstant.Create(1.0 / Config.ScalingFactor) );
     PostQuant := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.LatentChannels, 1, 0, 1, 0).SetInferenceOnly(pInferenceOnly) );
+      TNNetConvolutionLinear.Create(Config.LatentChannels, 1, 0, 1, 0).SetTrainable(pTrainable) );
     ConvIn := NN.AddLayer(
-      TNNetConvolutionLinear.Create(TopC, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+      TNNetConvolutionLinear.Create(TopC, 3, 1, 1, 0).SetTrainable(pTrainable) );
     // MID: resnet -> attention -> resnet (all at width TopC).
     AddVaeResnetBlock(NN, Config, TopC, TopC, MidRes1);
     AddVaeAttention(NN, Config, TopC, MidAttn);
@@ -51701,7 +51701,7 @@ begin
         // Nearest 2x upsample (TNNetDeMaxPool spacing 0) + 3x3 conv.
         NN.AddLayer( TNNetDeMaxPool.Create(2) );
         UpConv[r] := NN.AddLayer(
-          TNNetConvolutionLinear.Create(OutCh, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+          TNNetConvolutionLinear.Create(OutCh, 3, 1, 1, 0).SetTrainable(pTrainable) );
       end
       else
         UpConv[r] := nil;
@@ -51710,8 +51710,8 @@ begin
     NormOut := NN.AddLayer( TNNetGroupNorm.Create(Config.NormNumGroups) );
     NN.AddLayer( TNNetSiLU.Create() );
     ConvOut := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.OutChannels, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+      TNNetConvolutionLinear.Create(Config.OutChannels, 3, 1, 1, 0).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     LoadVaeConv(Reader, PostQuant, 'post_quant_conv.weight',
@@ -51756,20 +51756,20 @@ begin
 end;
 
 function BuildVaeDecoderFromSafeTensorsEx(const FileName: string;
-  const Config: TVaeDecoderConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TVaeDecoderConfig; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildVaeDecoder(Reader, Config, pInferenceOnly);
+    Result := BuildVaeDecoder(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildVaeDecoderFromSafeTensors(const FileName: string;
-  out Config: TVaeDecoderConfig; pInferenceOnly: boolean = false;
+  out Config: TVaeDecoderConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -51777,7 +51777,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadVaeDecoderConfigFromJSONFile(ConfigPath);
-  Result := BuildVaeDecoderFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildVaeDecoderFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -51822,7 +51822,7 @@ begin
 end;
 
 function BuildVaeEncoder(Reader: TNNetSafeTensorsReader;
-  const Config: TVaeDecoderConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TVaeDecoderConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   ConvIn, NormOut, ConvOut, QuantConv: TNNetLayer;
@@ -51851,7 +51851,7 @@ begin
     // ---------------- Architecture ----------------
     NN.AddLayer( TNNetInput.Create(ImgGrid, ImgGrid, Config.OutChannels) );
     ConvIn := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.BlockOutChannels[0], 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+      TNNetConvolutionLinear.Create(Config.BlockOutChannels[0], 3, 1, 1, 0).SetTrainable(pTrainable) );
     // DOWN blocks: block_out_channels in low->high order. Block d has nResnet
     // ResNet blocks; every block EXCEPT the last (d = N-1) ends with a
     // stride-2 3x3 conv DOWNSAMPLE using diffusers' asymmetric (0,1,0,1) pad.
@@ -51876,7 +51876,7 @@ begin
         NN.AddLayer( TNNetPadXY.Create(1, 1) );
         NN.AddLayer( TNNetCrop.Create(1, 1, H + 1, H + 1) );
         DownConv[d] := NN.AddLayer(
-          TNNetConvolutionLinear.Create(OutCh, 3, {pad=}0, {stride=}2, 0).SetInferenceOnly(pInferenceOnly) );
+          TNNetConvolutionLinear.Create(OutCh, 3, {pad=}0, {stride=}2, 0).SetTrainable(pTrainable) );
       end
       else
         DownConv[d] := nil;
@@ -51890,14 +51890,14 @@ begin
     NormOut := NN.AddLayer( TNNetGroupNorm.Create(Config.NormNumGroups) );
     NN.AddLayer( TNNetSiLU.Create() );
     ConvOut := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Out2, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+      TNNetConvolutionLinear.Create(Out2, 3, 1, 1, 0).SetTrainable(pTrainable) );
     QuantConv := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Out2, 1, 0, 1, 0).SetInferenceOnly(pInferenceOnly) );
+      TNNetConvolutionLinear.Create(Out2, 1, 0, 1, 0).SetTrainable(pTrainable) );
     // DiagonalGaussianDistribution deterministic latent: take the mean (first
     // LatentChannels channels) and apply the SD scaling_factor.
     NN.AddLayer( TNNetSplitChannels.Create(0, Config.LatentChannels) );
     NN.AddLayer( TNNetMulByConstant.Create(Config.ScalingFactor) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     LoadVaeConv(Reader, ConvIn, 'encoder.conv_in.weight',
@@ -51940,20 +51940,20 @@ begin
 end;
 
 function BuildVaeEncoderFromSafeTensorsEx(const FileName: string;
-  const Config: TVaeDecoderConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TVaeDecoderConfig; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildVaeEncoder(Reader, Config, pInferenceOnly);
+    Result := BuildVaeEncoder(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildVaeEncoderFromSafeTensors(const FileName: string;
-  out Config: TVaeDecoderConfig; pInferenceOnly: boolean = false;
+  out Config: TVaeDecoderConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -51961,7 +51961,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadVaeEncoderConfigFromJSONFile(ConfigPath);
-  Result := BuildVaeEncoderFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildVaeEncoderFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -52084,7 +52084,7 @@ begin
 end;
 
 function BuildVqEncoderNet(Reader: TNNetSafeTensorsReader;
-  const Config: TVqModelConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TVqModelConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   Vae: TVaeDecoderConfig;
@@ -52114,7 +52114,7 @@ begin
     // ---------------- Architecture (mirror of BuildVaeEncoder) ----------------
     NN.AddLayer( TNNetInput.Create(ImgGrid, ImgGrid, Config.InChannels) );
     ConvIn := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.BlockOutChannels[0], 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+      TNNetConvolutionLinear.Create(Config.BlockOutChannels[0], 3, 1, 1, 0).SetTrainable(pTrainable) );
     InCh := Config.BlockOutChannels[0];
     for d := 0 to NumBlockOutM1 do
     begin
@@ -52132,7 +52132,7 @@ begin
         NN.AddLayer( TNNetPadXY.Create(1, 1) );
         NN.AddLayer( TNNetCrop.Create(1, 1, H + 1, H + 1) );
         DownConv[d] := NN.AddLayer(
-          TNNetConvolutionLinear.Create(OutCh, 3, {pad=}0, {stride=}2, 0).SetInferenceOnly(pInferenceOnly) );
+          TNNetConvolutionLinear.Create(OutCh, 3, {pad=}0, {stride=}2, 0).SetTrainable(pTrainable) );
       end
       else
         DownConv[d] := nil;
@@ -52144,13 +52144,13 @@ begin
     NN.AddLayer( TNNetSiLU.Create() );
     // VQModel double_z=False: conv_out -> latent_channels (NOT 2*lat).
     ConvOut := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.LatentChannels, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+      TNNetConvolutionLinear.Create(Config.LatentChannels, 3, 1, 1, 0).SetTrainable(pTrainable) );
     // quant_conv (1x1, latent_channels -> vq_embed_dim). The net's output is
     // the continuous pre-quantize latent; the codebook lookup is done by the
     // holder class (plain Pascal argmin).
     QuantConv := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.VqEmbedDim, 1, 0, 1, 0).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+      TNNetConvolutionLinear.Create(Config.VqEmbedDim, 1, 0, 1, 0).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     LoadVaeConv(Reader, ConvIn, 'encoder.conv_in.weight',
@@ -52193,7 +52193,7 @@ begin
 end;
 
 function BuildVqDecoderNet(Reader: TNNetSafeTensorsReader;
-  const Config: TVqModelConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TVqModelConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   Vae: TVaeDecoderConfig;
@@ -52222,9 +52222,9 @@ begin
     NN.AddLayer( TNNetInput.Create(Config.LatentGrid, Config.LatentGrid,
       Config.VqEmbedDim) );
     PostQuant := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.LatentChannels, 1, 0, 1, 0).SetInferenceOnly(pInferenceOnly) );
+      TNNetConvolutionLinear.Create(Config.LatentChannels, 1, 0, 1, 0).SetTrainable(pTrainable) );
     ConvIn := NN.AddLayer(
-      TNNetConvolutionLinear.Create(TopC, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+      TNNetConvolutionLinear.Create(TopC, 3, 1, 1, 0).SetTrainable(pTrainable) );
     AddVaeResnetBlock(NN, Vae, TopC, TopC, MidRes1);
     AddVaeAttention(NN, Vae, TopC, MidAttn);
     AddVaeResnetBlock(NN, Vae, TopC, TopC, MidRes2);
@@ -52244,7 +52244,7 @@ begin
       begin
         NN.AddLayer( TNNetDeMaxPool.Create(2) );
         UpConv[r] := NN.AddLayer(
-          TNNetConvolutionLinear.Create(OutCh, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+          TNNetConvolutionLinear.Create(OutCh, 3, 1, 1, 0).SetTrainable(pTrainable) );
       end
       else
         UpConv[r] := nil;
@@ -52252,8 +52252,8 @@ begin
     NormOut := NN.AddLayer( TNNetGroupNorm.Create(Config.NormNumGroups) );
     NN.AddLayer( TNNetSiLU.Create() );
     ConvOut := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.OutChannels, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+      TNNetConvolutionLinear.Create(Config.OutChannels, 3, 1, 1, 0).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     LoadVaeConv(Reader, PostQuant, 'post_quant_conv.weight',
@@ -52449,15 +52449,15 @@ begin
 end;
 
 function BuildVqModel(Reader: TNNetSafeTensorsReader;
-  const Config: TVqModelConfig; pInferenceOnly: boolean = false): TNNetVqModel;
+  const Config: TVqModelConfig; pTrainable: boolean = true): TNNetVqModel;
 var
   Enc, Dec: TNNet;
   Codebook: TNNetVolume;
 begin
   Enc := nil; Dec := nil; Codebook := nil;
   try
-    Enc := BuildVqEncoderNet(Reader, Config, pInferenceOnly);
-    Dec := BuildVqDecoderNet(Reader, Config, pInferenceOnly);
+    Enc := BuildVqEncoderNet(Reader, Config, pTrainable);
+    Dec := BuildVqDecoderNet(Reader, Config, pTrainable);
     Codebook := ReadVqCodebook(Reader, Config);
     Result := TNNetVqModel.Create(Enc, Dec, Codebook, Config);
   except
@@ -52467,20 +52467,20 @@ begin
 end;
 
 function BuildVqModelFromSafeTensorsEx(const FileName: string;
-  const Config: TVqModelConfig; pInferenceOnly: boolean = false): TNNetVqModel;
+  const Config: TVqModelConfig; pTrainable: boolean = true): TNNetVqModel;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildVqModel(Reader, Config, pInferenceOnly);
+    Result := BuildVqModel(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildVqModelFromSafeTensors(const FileName: string;
-  out Config: TVqModelConfig; pInferenceOnly: boolean = false;
+  out Config: TVqModelConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNetVqModel;
 var
   ConfigPath: string;
@@ -52488,7 +52488,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadVqModelConfigFromJSONFile(ConfigPath);
-  Result := BuildVqModelFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildVqModelFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -52653,7 +52653,7 @@ begin
 end;
 
 function BuildRRDBNet(Reader: TNNetSafeTensorsReader;
-  const Config: TRRDBNetConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TRRDBNetConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   ConvFirst, FeatRef, ConvBody, ConvUp1, ConvUp2, ConvHR, ConvLast: TNNetLayer;
@@ -52680,12 +52680,12 @@ begin
     NN.AddLayer( TNNetInput.Create(Config.InputSize, Config.InputSize,
       Config.NumInCh) );
     ConvFirst := NN.AddLayer(
-      TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+      TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0).SetTrainable(pTrainable) );
     FeatRef := ConvFirst;  // global residual / upsample feeder
     for i := 0 to NumBlockM1 do
       AddRRDB(NN, Config, Blocks[i]);
     ConvBody := NN.AddLayer(
-      TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+      TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0).SetTrainable(pTrainable) );
     // Global residual: feat = conv_first + conv_body(body(conv_first)).
     NN.AddLayer( TNNetSum.Create([ConvBody, FeatRef]) );
     // Upsample x4: two (nearest-2x + 3x3 conv + LeakyReLU(0.2)) stages.
@@ -52696,21 +52696,21 @@ begin
       if s = 0 then
       begin
         ConvUp1 := NN.AddLayer(
-          TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+          TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0).SetTrainable(pTrainable) );
       end
       else
       begin
         ConvUp2 := NN.AddLayer(
-          TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+          TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0).SetTrainable(pTrainable) );
       end;
       NN.AddLayer( TNNetLeakyReLU.Create(0.2) );
     end;
     ConvHR := NN.AddLayer(
-      TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+      TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetLeakyReLU.Create(0.2) );
     ConvLast := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.NumOutCh, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+      TNNetConvolutionLinear.Create(Config.NumOutCh, 3, 1, 1, 0).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     LoadVaeConv(Reader, ConvFirst, 'conv_first.weight', 'conv_first.bias',
@@ -52732,20 +52732,20 @@ begin
 end;
 
 function BuildRRDBNetFromSafeTensorsEx(const FileName: string;
-  const Config: TRRDBNetConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TRRDBNetConfig; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildRRDBNet(Reader, Config, pInferenceOnly);
+    Result := BuildRRDBNet(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildRRDBNetFromSafeTensors(const FileName: string;
-  out Config: TRRDBNetConfig; pInferenceOnly: boolean = false;
+  out Config: TRRDBNetConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -52753,7 +52753,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadRRDBNetConfigFromJSONFile(ConfigPath);
-  Result := BuildRRDBNetFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildRRDBNetFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -52840,7 +52840,7 @@ begin
 end;
 
 function BuildRIFE(Reader: TNNetSafeTensorsReader;
-  const Config: TRIFEConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TRIFEConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   Refs: array of TRIFEBlockLayers;
@@ -52909,7 +52909,7 @@ begin
     Term0 := NN.AddLayer(TNNetCellMulByCell.Create(Warped0, MaskRep));
     Term1 := NN.AddLayer(TNNetCellMulByCell.Create(Warped1, OneMinusRep));
     NN.AddLayer(TNNetSum.Create([Term0, Term1]));
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     for b := 0 to NumBlocksM1 do
@@ -52923,20 +52923,20 @@ begin
 end;
 
 function BuildRIFEFromSafeTensorsEx(const FileName: string;
-  const Config: TRIFEConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TRIFEConfig; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildRIFE(Reader, Config, pInferenceOnly);
+    Result := BuildRIFE(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildRIFEFromSafeTensors(const FileName: string;
-  out Config: TRIFEConfig; pInferenceOnly: boolean = false;
+  out Config: TRIFEConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -52944,7 +52944,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadRIFEConfigFromJSONFile(ConfigPath);
-  Result := BuildRIFEFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildRIFEFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -53109,7 +53109,7 @@ begin
 end;
 
 function BuildNAFNet(Reader: TNNetSafeTensorsReader;
-  const Config: TNAFNetConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TNAFNetConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   Intro, Ending: TNNetLayer;
@@ -53148,7 +53148,7 @@ begin
     NN.AddLayer(TNNetInput.Create(Config.InputSize, Config.InputSize,
       Config.ImgChannel));
     Intro := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.Width, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly));
+      TNNetConvolutionLinear.Create(Config.Width, 3, 1, 1, 0).SetTrainable(pTrainable));
     Cur := Intro;
     C := Config.Width;
     // Encoder.
@@ -53160,7 +53160,7 @@ begin
       EncSkips[lvl] := Cur;
       // Down: stride-2 2x2 conv, C -> 2C, no padding (exact H/2).
       DownConvs[lvl] := NN.AddLayer(
-        TNNetConvolutionLinear.Create(2 * C, 2, 0, 2, 0).SetInferenceOnly(pInferenceOnly));
+        TNNetConvolutionLinear.Create(2 * C, 2, 0, 2, 0).SetTrainable(pTrainable));
       Cur := DownConvs[lvl];
       C := C * 2;
     end;
@@ -53175,7 +53175,7 @@ begin
       // so 2C -> C/2 channels at 2x resolution. Mirrors the encoder's stride-2
       // down conv (C -> 2C at H/2) to land back on the skip's (C/2, H) shape.
       UpConvs[lvl] := NN.AddLayer(
-        TNNetConvolutionLinear.Create(2 * C, 1, 0, 1, 0).SetInferenceOnly(pInferenceOnly));
+        TNNetConvolutionLinear.Create(2 * C, 1, 0, 1, 0).SetTrainable(pTrainable));
       NN.AddLayer(TNNetDepthToSpace.Create(2));  // 2C -> C/2, spatial x2
       C := C div 2;
       Up := NN.GetLastLayer();
@@ -53187,10 +53187,10 @@ begin
         Cur := AddNAFBlock(NN, C, Cur, DecRefs[lvl][b]);
     end;
     Ending := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.ImgChannel, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly));
+      TNNetConvolutionLinear.Create(Config.ImgChannel, 3, 1, 1, 0).SetTrainable(pTrainable));
     // Global residual: out = ending(...) + input image.
     NN.AddLayer(TNNetSum.Create([Ending, NN.Layers[0]]));
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     LoadVaeConv(Reader, Intro, 'intro.weight', 'intro.bias',
@@ -53231,20 +53231,20 @@ begin
 end;
 
 function BuildNAFNetFromSafeTensorsEx(const FileName: string;
-  const Config: TNAFNetConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TNAFNetConfig; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildNAFNet(Reader, Config, pInferenceOnly);
+    Result := BuildNAFNet(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildNAFNetFromSafeTensors(const FileName: string;
-  out Config: TNAFNetConfig; pInferenceOnly: boolean = false;
+  out Config: TNAFNetConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -53252,7 +53252,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadNAFNetConfigFromJSONFile(ConfigPath);
-  Result := BuildNAFNetFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildNAFNetFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -53517,7 +53517,7 @@ begin
 end;
 
 function BuildSwinIRFromSafeTensors(Reader: TNNetSafeTensorsReader;
-  const Config: TSwinIRConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TSwinIRConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   ConvFirst, ConvAfterBody, ConvBeforeUp, UpConv, ConvLast: TNNetLayer;
@@ -53557,7 +53557,7 @@ begin
       Config.InChans) );
     // Shallow feature conv stem (3x3 -> embed_dim).
     ConvFirst := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Config.EmbedDim, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+      TNNetConvolutionLinear.Create(Config.EmbedDim, 3, 1, 1, 0).SetTrainable(pTrainable) );
     F0Map := ConvFirst;
     // Flatten the (W,H,C) map to a (W*H, 1, C) token sequence in row-major
     // (y*Grid + x) order (the same convention as the landed Swin importer).
@@ -53582,16 +53582,16 @@ begin
       // residual-add the RSTB input.
       NN.AddLayer( TNNetReshape.Create(Grid, Grid, Dim) );
       RSTBConv[li] := NN.AddLayer(
-        TNNetConvolutionLinear.Create(Dim, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+        TNNetConvolutionLinear.Create(Dim, 3, 1, 1, 0).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetReshape.Create(Grid * Grid, 1, Dim) );
       Cur := NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), RSTBIn]) );
     end;
 
     // Token LayerNorm -> map -> conv_after_body 3x3, + conv_first map.
-    FinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+    FinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetReshape.Create(Grid, Grid, Dim) );
     ConvAfterBody := NN.AddLayer(
-      TNNetConvolutionLinear.Create(Dim, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+      TNNetConvolutionLinear.Create(Dim, 3, 1, 1, 0).SetTrainable(pTrainable) );
     Cur := NN.AddLayer( TNNetSum.Create([ConvAfterBody, F0Map]) );
 
     // ---------------- Reconstruction / upsample tail ----------------
@@ -53600,21 +53600,21 @@ begin
     if Config.Upscale > 1 then
     begin
       ConvBeforeUp := NN.AddLayer(
-        TNNetConvolutionLinear.Create(Config.NumFeat, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+        TNNetConvolutionLinear.Create(Config.NumFeat, 3, 1, 1, 0).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetLeakyReLU.Create(0.2) );
       // pixel-shuffle upsample: 3x3 conv -> upscale^2 * num_feat, DepthToSpace.
       UpConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-        Config.Upscale * Config.Upscale * Config.NumFeat, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+        Config.Upscale * Config.Upscale * Config.NumFeat, 3, 1, 1, 0).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetDepthToSpace.Create(Config.Upscale) );
       ConvLast := NN.AddLayer(
-        TNNetConvolutionLinear.Create(Config.InChans, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+        TNNetConvolutionLinear.Create(Config.InChans, 3, 1, 1, 0).SetTrainable(pTrainable) );
     end
     else
       // Same-resolution denoise tail: single conv reconstruction.
       ConvLast := NN.AddLayer(
-        TNNetConvolutionLinear.Create(Config.InChans, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly) );
+        TNNetConvolutionLinear.Create(Config.InChans, 3, 1, 1, 0).SetTrainable(pTrainable) );
 
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     LoadVaeConv(Reader, ConvFirst, 'conv_first.weight', 'conv_first.bias',
@@ -53654,20 +53654,20 @@ begin
 end;
 
 function BuildSwinIRFromSafeTensorsEx(const FileName: string;
-  const Config: TSwinIRConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TSwinIRConfig; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildSwinIRFromSafeTensors(Reader, Config, pInferenceOnly);
+    Result := BuildSwinIRFromSafeTensors(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildSwinIRFromSafeTensors(const FileName: string;
-  out Config: TSwinIRConfig; pInferenceOnly: boolean = false;
+  out Config: TSwinIRConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -53675,7 +53675,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadSwinIRConfigFromJSONFile(ConfigPath);
-  Result := BuildSwinIRFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildSwinIRFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -53934,7 +53934,7 @@ end;
 
 procedure BuildCLIPSegFromSafeTensorsWithConfig(const FileName: string;
   var Config: TCLIPSegConfig; out VisionNet, TextNet, DecoderNet: TNNet;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  TextSeqLen: integer = 0; pTrainable: boolean = true);
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -53992,21 +53992,21 @@ begin
       NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
         Config.NumChannels) );
       PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-        Config.Vision.HiddenSize, Config.PatchSize, 0, Config.PatchSize, 1).SetInferenceOnly(pInferenceOnly) );
+        Config.Vision.HiddenSize, Config.PatchSize, 0, Config.PatchSize, 1).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetReshape.Create(NumPatches, 1,
         Config.Vision.HiddenSize) );
       NN.AddLayer( TNNetPadXY.Create(1, 0) );
       NN.AddLayer( TNNetCrop.Create(0, 0, NumTokens, 1) );
       VPosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(NumTokens).SetInferenceOnly(pInferenceOnly) );
+        TNNetLearnedPositionalEmbedding.Create(NumTokens).SetTrainable(pTrainable) );
       VPreLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.Vision.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.Vision.LayerNormEps).SetTrainable(pTrainable) );
       SetLength(VBlocks, Config.Vision.NumLayers);
       SetLength(Config.TapLayerIdx, NumTaps);
       for i := 0 to VisionNumLayersM1 do
       begin
         AddClipEncoderBlock(NN, Config.Vision, {CausalMask=}false,
-          VBlocks[i], pInferenceOnly);
+          VBlocks[i], pTrainable);
         // Record the tap layer index (the block's output Sum layer) for any
         // extract layer == i. HF taps hidden_states[i+1] = output of block i.
         TapBlock := -1;
@@ -54015,7 +54015,7 @@ begin
         if TapBlock >= 0 then
           Config.TapLayerIdx[TapBlock] := NN.GetLastLayerIdx();
       end;
-      if pInferenceOnly then NN.SetInferenceOnly();
+      if not pTrainable then NN.SetTrainable();
 
       LoadClipPatchConv(Reader, PatchConv,
         'clip.vision_model.embeddings.patch_embedding.weight',
@@ -54058,18 +54058,18 @@ begin
       NN := TNNet.Create();
       NN.AddLayer( TNNetInput.Create(SeqLen, 1, 1) );
       TokEmb := NN.AddLayer( TNNetEmbedding.Create(
-        Config.TextVocabSize, Config.Text.HiddenSize, 1).SetInferenceOnly(pInferenceOnly) );
+        Config.TextVocabSize, Config.Text.HiddenSize, 1).SetTrainable(pTrainable) );
       PosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions).SetInferenceOnly(pInferenceOnly) );
+        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions).SetTrainable(pTrainable) );
       SetLength(TBlocks, Config.Text.NumLayers);
       for i := 0 to TextNumLayersM1 do
         AddClipEncoderBlock(NN, Config.Text, {CausalMask=}true,
-          TBlocks[i], pInferenceOnly);
+          TBlocks[i], pTrainable);
       FinalLN := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps).SetTrainable(pTrainable) );
       TProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.ProjectionDim).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.ProjectionDim).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
 
       LoadClipEmbeddingTable(Reader, TokEmb,
         'clip.text_model.embeddings.token_embedding.weight',
@@ -54103,9 +54103,9 @@ begin
 
       // film_mul / film_add: projection_dim -> reduce_dim, applied to cond.
       FilmMul := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.ReduceDim).SetInferenceOnly(pInferenceOnly), CondInput);
+        TNNetPointwiseConvLinear.Create(Config.ReduceDim).SetTrainable(pTrainable), CondInput);
       FilmAdd := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.ReduceDim).SetInferenceOnly(pInferenceOnly), CondInput);
+        TNNetPointwiseConvLinear.Create(Config.ReduceDim).SetTrainable(pTrainable), CondInput);
       // FiLM cond = gamma|beta concatenated on depth -> (1,1,2*reduce_dim).
       FilmCond := NN.AddLayer( TNNetDeepConcat.Create([FilmMul, FilmAdd]) );
 
@@ -54114,7 +54114,7 @@ begin
       begin
         // reduces[i] over tap input i (reversed order matches HF).
         Reduced := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.ReduceDim).SetInferenceOnly(pInferenceOnly), TapInputs[i]);
+          TNNetPointwiseConvLinear.Create(Config.ReduceDim).SetTrainable(pTrainable), TapInputs[i]);
         ReduceLayers[i] := Reduced;
         if Acc = nil then
           Acc := Reduced
@@ -54135,9 +54135,9 @@ begin
       NN.AddLayer( TNNetReshape.Create(Grid, Grid, Config.ReduceDim) );
       // Non-overlapping ConvTranspose2d(reduce_dim,1,P,stride=P).
       TransConv := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.PatchSize * Config.PatchSize).SetInferenceOnly(pInferenceOnly) );
+        TNNetPointwiseConvLinear.Create(Config.PatchSize * Config.PatchSize).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetDepthToSpace.Create(Config.PatchSize) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+      if not pTrainable then NN.SetTrainable();
 
       // Decoder weights. reduces[i] maps to tap input i (the REVERSED order
       // HF iterates activations[::-1] in), so decoder.reduces.i.* loads into
@@ -54175,7 +54175,7 @@ end;
 
 procedure BuildCLIPSegFromSafeTensors(const FileName: string;
   out VisionNet, TextNet, DecoderNet: TNNet; out Config: TCLIPSegConfig;
-  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  TextSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 var
   ConfigPath: string;
@@ -54184,7 +54184,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadCLIPSegConfigFromJSONFile(ConfigPath);
   BuildCLIPSegFromSafeTensorsWithConfig(FileName, Config,
-    VisionNet, TextNet, DecoderNet, TextSeqLen, pInferenceOnly);
+    VisionNet, TextNet, DecoderNet, TextSeqLen, pTrainable);
 end;
 
 procedure RunCLIPSeg(VisionNet, TextNet, DecoderNet: TNNet;
@@ -54394,7 +54394,7 @@ begin
 end;
 
 function BuildStyleGAN2Generator(Reader: TNNetSafeTensorsReader;
-  const Config: TStyleGAN2Config; pInferenceOnly: boolean = false): TNNet;
+  const Config: TStyleGAN2Config; pTrainable: boolean = true): TNNet;
 type
   TConvRefs = record
     Affine: TNNetLayer;
@@ -54417,7 +54417,7 @@ var
   function AddConvPass(const Prefix: string): TConvRefs;
   begin
     Result.Affine := NN.AddLayerAfter(
-      TNNetFullConnectLinear.Create(ch).SetInferenceOnly(pInferenceOnly), WLatent);
+      TNNetFullConnectLinear.Create(ch).SetTrainable(pTrainable), WLatent);
     Result.ModConv := TNNetModulatedConv2D.Create(ch, 3, 0, 1, Result.Affine);
     NN.AddLayerAfter(Result.ModConv, Feat);
     Feat := Result.ModConv;
@@ -54462,7 +54462,7 @@ begin
     WLatent := NN.Layers[0];
     for l := 0 to MappingLayersM1 do
     begin
-      MapFC[l] := NN.AddLayerAfter(TNNetFullConnectLinear.Create(lat).SetInferenceOnly(pInferenceOnly), WLatent);
+      MapFC[l] := NN.AddLayerAfter(TNNetFullConnectLinear.Create(lat).SetTrainable(pTrainable), WLatent);
       WLatent := NN.AddLayer(TNNetLeakyReLU.Create(0.2));
     end;
     // -------- Synthesis network --------
@@ -54480,7 +54480,7 @@ begin
         Convs[b][c] := AddConvPass('block.' + IntToStr(b) + '.conv.' +
           IntToStr(c) + '.');
       // toRGB: modulated 1x1 conv (no demod) -> RGB, summed with upsampled skip.
-      ToRGBAffine[b] := NN.AddLayerAfter(TNNetFullConnectLinear.Create(ch).SetInferenceOnly(pInferenceOnly), WLatent);
+      ToRGBAffine[b] := NN.AddLayerAfter(TNNetFullConnectLinear.Create(ch).SetTrainable(pTrainable), WLatent);
       ToRGBConv[b] := TNNetModulatedConv2D.Create(Config.NumOutCh, 1, 0, 0,
         ToRGBAffine[b]);
       NN.AddLayerAfter(ToRGBConv[b], Feat);
@@ -54493,7 +54493,7 @@ begin
       end;
       PrevRGB := RGB;
     end;
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
 
     // -------- Weights --------
     for l := 0 to MappingLayersM1 do
@@ -54558,20 +54558,20 @@ begin
 end;
 
 function BuildStyleGAN2GeneratorFromSafeTensorsEx(const FileName: string;
-  const Config: TStyleGAN2Config; pInferenceOnly: boolean = false): TNNet;
+  const Config: TStyleGAN2Config; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildStyleGAN2Generator(Reader, Config, pInferenceOnly);
+    Result := BuildStyleGAN2Generator(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildStyleGAN2GeneratorFromSafeTensors(const FileName: string;
-  out Config: TStyleGAN2Config; pInferenceOnly: boolean = false;
+  out Config: TStyleGAN2Config; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -54580,7 +54580,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadStyleGAN2ConfigFromJSONFile(ConfigPath);
   Result := BuildStyleGAN2GeneratorFromSafeTensorsEx(FileName, Config,
-    pInferenceOnly);
+    pTrainable);
 end;
 
 // ===========================================================================
@@ -54717,30 +54717,30 @@ type
 // (TNNetChannelMul is the per-channel LayerScale multiply, inserted before
 // each TNNetSum skip add.)
 procedure AddDINOv2EncoderBlock(NN: TNNet; const Config: TDINOv2Config;
-  var Block: TDINOv2BlockLayers; pInferenceOnly: boolean);
+  var Block: TDINOv2BlockLayers; pTrainable: boolean);
 var
   BranchInput: TNNetLayer;
 begin
   BranchInput := NN.GetLastLayer();
   Block.LN1 := NN.AddLayer(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
   Block.QKV := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+    TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable) );
   Block.AttnDense := NN.AddMultiHeadSelfAttention(Config.NumHeads,
     {CausalMask=}false);
   Block.LS1 := NN.AddLayer( TNNetChannelMul.Create() );
   NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
   BranchInput := NN.GetLastLayer();
   Block.LN2 := NN.AddLayer(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
   Block.Inter := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+    TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
   AddClipHiddenAct(NN, Config.HiddenAct);
   Block.OutDense := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+    TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
   Block.LS2 := NN.AddLayer( TNNetChannelMul.Create() );
   NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-  if pInferenceOnly then NN.SetInferenceOnly();
+  if not pTrainable then NN.SetTrainable();
 end;
 
 // Loads one DINOv2 encoder block. BERT-style attention names (same as ViT's
@@ -54786,7 +54786,7 @@ begin
 end;
 
 function BuildDINOv2FromSafeTensors(Reader: TNNetSafeTensorsReader;
-  const Config: TDINOv2Config; pInferenceOnly: boolean = false): TNNet;
+  const Config: TDINOv2Config; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   PatchConv, PosEmb, FinalLN: TNNetLayer;
@@ -54826,7 +54826,7 @@ begin
     // = HF flatten(2).transpose(1,2) patch order.
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
       d, Config.PatchSize, {pInputPadding=}0, {pStride=}Config.PatchSize,
-      {pSuppressBias=}0).SetInferenceOnly(pInferenceOnly) );
+      {pSuppressBias=}0).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
     // Prepend one ZERO row as the CLS-token slot (PadXY pads both ends;
     // Crop drops the right pad). cls_token is folded into row 0 of the
@@ -54834,15 +54834,15 @@ begin
     NN.AddLayer( TNNetPadXY.Create(1, 0) );
     NN.AddLayer( TNNetCrop.Create(0, 0, NumPatches + 1, 1) );
     PosEmb := NN.AddLayer(
-      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
     SetLength(Blocks, Config.NumLayers);
     for BlockCnt := 0 to LayersM1 do
-      AddDINOv2EncoderBlock(NN, Config, Blocks[BlockCnt], pInferenceOnly);
+      AddDINOv2EncoderBlock(NN, Config, Blocks[BlockCnt], pTrainable);
     // Final layernorm over every token; the output is the CLS + patch token
     // hidden states (NO classifier head, NO CLS-row crop).
-    FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+    FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     // The bare Dinov2Model checkpoint (incl. published facebook/dinov2-*) has
@@ -54924,20 +54924,20 @@ begin
 end;
 
 function BuildDINOv2FromSafeTensorsEx(const FileName: string;
-  const Config: TDINOv2Config; pInferenceOnly: boolean = false): TNNet;
+  const Config: TDINOv2Config; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildDINOv2FromSafeTensors(Reader, Config, pInferenceOnly);
+    Result := BuildDINOv2FromSafeTensors(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildDINOv2FromSafeTensorsWithConfig(const FileName: string;
-  out Config: TDINOv2Config; pInferenceOnly: boolean = false;
+  out Config: TDINOv2Config; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -54945,7 +54945,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadDINOv2ConfigFromJSONFile(ConfigPath);
-  Result := BuildDINOv2FromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildDINOv2FromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -55118,7 +55118,7 @@ end;
 
 function BuildSAMVisionTower(Reader: TNNetSafeTensorsReader;
   const Config: TSAMConfig; const Prefix: string;
-  pInferenceOnly: boolean): TNNet;
+  pTrainable: boolean): TNNet;
 var
   LpMax: integer;
   NN: TNNet;
@@ -55154,10 +55154,10 @@ begin
     NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
       Config.NumChannels) );
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-      Config.HiddenSize, Config.PatchSize, 0, Config.PatchSize, 0).SetInferenceOnly(pInferenceOnly) );
+      Config.HiddenSize, Config.PatchSize, 0, Config.PatchSize, 0).SetTrainable(pTrainable) );
     // Output is (Grid, Grid, hidden). Add the learned 2-D pos_embed directly.
     PosEmb := NN.AddLayer( TNNetCellBias.Create() );
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Transformer blocks ----------------
     for BlockIdx := 0 to LayersM1 do
@@ -55168,15 +55168,15 @@ begin
       if IsGlobal then ws := 0 else ws := Config.WindowSize;
 
       ShortcutA := NN.GetLastLayer();
-      Norm1 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+      Norm1 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       Attn := NN.AddLayer( TNNetSAMVisionAttention.Create(
         Config.NumHeads, ws, HeadDim, Config.HiddenSize) );
       AttnRes := NN.AddLayer( TNNetSum.Create([Attn, ShortcutA]) );
-      Norm2 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden).SetInferenceOnly(pInferenceOnly) );
+      Norm2 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+      Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden).SetTrainable(pTrainable) );
       // SAM hidden_act='gelu' is the EXACT erf GELU (not the tanh approximation).
       NN.AddLayer( TNNetGELUErf.Create() );
-      Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+      Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
       MlpRes := NN.AddLayer( TNNetSum.Create([Fc2, AttnRes]) );
       AttnLayers[BlockIdx] := TNNetSAMVisionAttention(Attn);
       Norm1Layers[BlockIdx] := Norm1;
@@ -55187,12 +55187,12 @@ begin
 
     // ---------------- Neck ----------------
     Conv1 := NN.AddLayer( TNNetConvolutionLinear.Create(
-      Config.OutputChannels, 1, 0, 1, 1).SetInferenceOnly(pInferenceOnly) );
-    NeckLN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-6).SetInferenceOnly(pInferenceOnly) );
+      Config.OutputChannels, 1, 0, 1, 1).SetTrainable(pTrainable) );
+    NeckLN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-6).SetTrainable(pTrainable) );
     Conv2 := NN.AddLayer( TNNetConvolutionLinear.Create(
-      Config.OutputChannels, 3, 1, 1, 1).SetInferenceOnly(pInferenceOnly) );
-    NeckLN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-6).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+      Config.OutputChannels, 3, 1, 1, 1).SetTrainable(pTrainable) );
+    NeckLN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-6).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     LoadSAMPatchConv(Reader, PatchConv,
@@ -55267,21 +55267,21 @@ begin
 end;
 
 function BuildSAMFromSafeTensorsEx(const FileName: string;
-  const Config: TSAMConfig; pInferenceOnly: boolean): TNNet;
+  const Config: TSAMConfig; pTrainable: boolean): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
     Result := BuildSAMVisionTower(Reader, Config, 'vision_encoder.',
-      pInferenceOnly);
+      pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildSAMFromSafeTensors(const FileName: string;
-  out Config: TSAMConfig; pInferenceOnly: boolean;
+  out Config: TSAMConfig; pTrainable: boolean;
   const ConfigFileName: string): TNNet;
 var
   ConfigPath: string;
@@ -55289,7 +55289,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadSAMConfigFromJSONFile(ConfigPath);
-  Result := BuildSAMFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildSAMFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -56132,7 +56132,7 @@ type
 // MHSA is built as Heads separate TNNetWindowAttention layers (per-head split
 // of the Q|K|V projections), each carrying the per-head seq x seq bias matrix.
 procedure AddBeitEncoderBlock(NN: TNNet; const Config: TBeitConfig;
-  Seq: integer; var Block: TBeitBlockLayers; pInferenceOnly: boolean);
+  Seq: integer; var Block: TBeitBlockLayers; pTrainable: boolean);
 var
   BranchInput, QSlice, KSlice, VSlice, QKV: TNNetLayer;
   HeadDim, h, ci: integer;
@@ -56144,14 +56144,14 @@ begin
   NumHeadsM1 := Config.NumHeads - 1;
   HeadDimM1 := HeadDim - 1;
   BranchInput := NN.GetLastLayer();
-  Block.LN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+  Block.LN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
   // per-token Q/K/V projections (Linear over depth, biased: q/v have a bias,
   // k is bias-free in BEiT -> its bias neurons stay zero).
-  Block.QProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+  Block.QProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
   Block.KProj := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly), Block.LN1);
+    TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable), Block.LN1);
   Block.VProj := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly), Block.LN1);
+    TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable), Block.LN1);
   SetLength(HeadOuts, Config.NumHeads);
   SetLength(Block.HeadAttn, Config.NumHeads);
   SetLength(Channels, HeadDim);
@@ -56167,19 +56167,19 @@ begin
   end;
   NN.AddLayer( TNNetDeepConcat.Create(HeadOuts) );
   Block.OProj := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+    TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
   Block.LS1 := NN.AddLayer( TNNetChannelMul.Create() );
   NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
   BranchInput := NN.GetLastLayer();
-  Block.LN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+  Block.LN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
   Block.Inter := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetInferenceOnly(pInferenceOnly) );
+    TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
   AddClipHiddenAct(NN, Config.HiddenAct);
   Block.OutDense := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetInferenceOnly(pInferenceOnly) );
+    TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
   Block.LS2 := NN.AddLayer( TNNetChannelMul.Create() );
   NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-  if pInferenceOnly then NN.SetInferenceOnly();
+  if not pTrainable then NN.SetTrainable();
 end;
 
 procedure LoadBeitEncoderBlockWeights(Reader: TNNetSafeTensorsReader;
@@ -56243,7 +56243,7 @@ begin
 end;
 
 function BuildBeitFromSafeTensors(Reader: TNNetSafeTensorsReader;
-  const Config: TBeitConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TBeitConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   PatchConv, ClsRow, FinalLN: TNNetLayer;
@@ -56285,25 +56285,25 @@ begin
     // BIASED patch embedding (kernel = stride = patch_size), flattened to a
     // (NumPatches, 1, hidden) row-major (y,x) token sequence.
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-      d, Config.PatchSize, 0, Config.PatchSize, 0).SetInferenceOnly(pInferenceOnly) );
+      d, Config.PatchSize, 0, Config.PatchSize, 0).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
     // Prepend one row for the cls token (PadXY pads both ends; Crop drops the
     // right pad). The cls slot is then filled by a learned-positional layer
     // whose row 0 = cls_token and rows 1.. = 0 (NO absolute positions).
     NN.AddLayer( TNNetPadXY.Create(1, 0) );
     NN.AddLayer( TNNetCrop.Create(0, 0, Seq, 1) );
-    ClsRow := NN.AddLayer( TNNetLearnedPositionalEmbedding.Create(Seq).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+    ClsRow := NN.AddLayer( TNNetLearnedPositionalEmbedding.Create(Seq).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
     SetLength(Blocks, Config.NumLayers);
     for BlockCnt := 0 to NumLayersM1 do
-      AddBeitEncoderBlock(NN, Config, Seq, Blocks[BlockCnt], pInferenceOnly);
+      AddBeitEncoderBlock(NN, Config, Seq, Blocks[BlockCnt], pTrainable);
     // use_mean_pooling=false -> final encoder LayerNorm over every token;
     // use_mean_pooling=true -> the encoder output is returned raw (the pooler
     // LayerNorm + patch mean is the caller's job).
     if not Config.UseMeanPooling then
     begin
-      FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+      FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
     end
     else
       FinalLN := nil;
@@ -56368,20 +56368,20 @@ begin
 end;
 
 function BuildBeitFromSafeTensorsEx(const FileName: string;
-  const Config: TBeitConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TBeitConfig; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildBeitFromSafeTensors(Reader, Config, pInferenceOnly);
+    Result := BuildBeitFromSafeTensors(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildBeitFromSafeTensorsWithConfig(const FileName: string;
-  out Config: TBeitConfig; pInferenceOnly: boolean = false;
+  out Config: TBeitConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -56389,7 +56389,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadBeitConfigFromJSONFile(ConfigPath);
-  Result := BuildBeitFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildBeitFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -56661,7 +56661,7 @@ type
   end;
 
 function BuildDPT(Reader: TNNetSafeTensorsReader;
-  const Config: TDPTConfig; pInferenceOnly: boolean): TNNet;
+  const Config: TDPTConfig; pTrainable: boolean): TNNet;
 var
   NN: TNNet;
   Bk: TDINOv2Config;
@@ -56736,12 +56736,12 @@ begin
     // ---------------- DINOv2 backbone (tapped at all 4 hooked stages) -------
     NN.AddLayer(TNNetInput.Create(Bk.ImageSize, Bk.ImageSize, Bk.NumChannels));
     PatchConv := NN.AddLayer(TNNetConvolutionLinear.Create(
-      d, Bk.PatchSize, 0, Bk.PatchSize, 0).SetInferenceOnly(pInferenceOnly));
+      d, Bk.PatchSize, 0, Bk.PatchSize, 0).SetTrainable(pTrainable));
     NN.AddLayer(TNNetReshape.Create(NumPatches, 1, d));
     NN.AddLayer(TNNetPadXY.Create(1, 0));
     NN.AddLayer(TNNetCrop.Create(0, 0, NumPatches + 1, 1));
-    PosEmb := NN.AddLayer(TNNetLearnedPositionalEmbedding.Create(NumPatches + 1).SetInferenceOnly(pInferenceOnly));
-    if pInferenceOnly then NN.SetInferenceOnly();
+    PosEmb := NN.AddLayer(TNNetLearnedPositionalEmbedding.Create(NumPatches + 1).SetTrainable(pTrainable));
+    if not pTrainable then NN.SetTrainable();
     SetLength(Blocks, Bk.NumLayers);
     SetLength(BlockOut, Bk.NumLayers);
     // Build every encoder block first (each continues from the previous block's
@@ -56749,7 +56749,7 @@ begin
     // afterwards as SIDE BRANCHES so they don't redirect the encoder backbone.
     for BlockCnt := 0 to NumLayersM1 do
     begin
-      AddDINOv2EncoderBlock(NN, Bk, Blocks[BlockCnt], pInferenceOnly);
+      AddDINOv2EncoderBlock(NN, Bk, Blocks[BlockCnt], pTrainable);
       BlockOut[BlockCnt] := NN.GetLastLayer();
     end;
     // Hook the last 4 blocks (out_features stage_{N-3..N}): shared final
@@ -56757,7 +56757,7 @@ begin
     for i := 0 to 3 do
     begin
       StageLN[i] := NN.AddLayerAfter(
-        TNNetTokenLayerNorm.Create(Bk.LayerNormEps).SetInferenceOnly(pInferenceOnly),
+        TNNetTokenLayerNorm.Create(Bk.LayerNormEps).SetTrainable(pTrainable),
         BlockOut[Bk.NumLayers - 4 + i]);
       // drop the CLS row (sequence index 0 along X), keep patch rows 1..N.
       NN.AddLayer(TNNetCrop.Create(1, 0, NumPatches, 1));
@@ -56769,7 +56769,7 @@ begin
       Fac := Config.ReassembleFactors[i];
       // 1x1 projection backbone-hidden -> neck_hidden_sizes[i] (biased).
       Proj[i] := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.NeckHiddenSizes[i]).SetInferenceOnly(pInferenceOnly),
+        TNNetPointwiseConvLinear.Create(Config.NeckHiddenSizes[i]).SetTrainable(pTrainable),
         Reassembled[i]);
       ResizeUp[i] := nil; ResizeDown[i] := nil;
       if Fac > 1 then
@@ -56777,7 +56777,7 @@ begin
         K := Round(Fac);
         // ConvTranspose kernel=stride=K -> pointwise(K*K*neck) + PixelShuffle(K).
         ResizeUp[i] := NN.AddLayer(TNNetPointwiseConvLinear.Create(
-          K * K * Config.NeckHiddenSizes[i]).SetInferenceOnly(pInferenceOnly));
+          K * K * Config.NeckHiddenSizes[i]).SetTrainable(pTrainable));
         NN.AddLayer(TNNetPixelShuffle.Create(K));
       end
       else if Fac < 1 then
@@ -56789,7 +56789,7 @@ begin
       end;
       // neck 3x3 pad-1 bias-free conv -> fusion_hidden.
       NN.AddLayer(TNNetPadXY.Create(1, 1));
-      NeckConv[i] := NN.AddLayer(TNNetConvolutionLinear.Create(Fus, 3, 0, 1, 0).SetInferenceOnly(pInferenceOnly));
+      NeckConv[i] := NN.AddLayer(TNNetConvolutionLinear.Create(Fus, 3, 0, 1, 0).SetTrainable(pTrainable));
       Reassembled[i] := NN.GetLastLayer();
     end;
     // ---------------- fusion stage (reversed: coarse -> fine) --------------
@@ -56831,23 +56831,23 @@ begin
       end;
       NN.AddLayer(TNNetBilinearResize.Create(TargetW, TargetH, 1));
       // 1x1 projection (biased).
-      Fusion[i].Projection := NN.AddLayer(TNNetPointwiseConvLinear.Create(Fus).SetInferenceOnly(pInferenceOnly));
+      Fusion[i].Projection := NN.AddLayer(TNNetPointwiseConvLinear.Create(Fus).SetTrainable(pTrainable));
       Cur := NN.GetLastLayer();
     end;
     // ---------------- depth head -------------------------------------------
     // conv1 3x3 pad1 (fusion -> fusion/2, biased).
     NN.AddLayer(TNNetPadXY.Create(1, 1));
-    HeadConv1 := NN.AddLayer(TNNetConvolutionLinear.Create(Fus div 2, 3, 0, 1, 0).SetInferenceOnly(pInferenceOnly));
+    HeadConv1 := NN.AddLayer(TNNetConvolutionLinear.Create(Fus div 2, 3, 0, 1, 0).SetTrainable(pTrainable));
     // bilinear upsample to (Grid*patch, Grid*patch) = input resolution (a-c True).
     NN.AddLayer(TNNetBilinearResize.Create(
       Grid * Bk.PatchSize, Grid * Bk.PatchSize, 1));
     // conv2 3x3 pad1 (fusion/2 -> head_hidden, biased) -> ReLU.
     NN.AddLayer(TNNetPadXY.Create(1, 1));
     HeadConv2 := NN.AddLayer(TNNetConvolutionLinear.Create(
-      Config.HeadHiddenSize, 3, 0, 1, 0).SetInferenceOnly(pInferenceOnly));
+      Config.HeadHiddenSize, 3, 0, 1, 0).SetTrainable(pTrainable));
     NN.AddLayer(TNNetReLU.Create());
     // conv3 1x1 (head_hidden -> 1, biased).
-    HeadConv3 := NN.AddLayer(TNNetPointwiseConvLinear.Create(1).SetInferenceOnly(pInferenceOnly));
+    HeadConv3 := NN.AddLayer(TNNetPointwiseConvLinear.Create(1).SetTrainable(pTrainable));
     // relative -> ReLU; metric -> Sigmoid (then * max_depth folded as a mul).
     if LowerCase(Config.DepthEstimationType) = 'metric' then
       NN.AddLayer(TNNetSigmoid.Create())
@@ -56856,7 +56856,7 @@ begin
     // HF scales the activated depth by max_depth (no-op for relative max_depth=1).
     if Abs(Config.MaxDepth - 1) > 1e-12 then
       NN.AddLayer(TNNetMulByConstant.Create(Config.MaxDepth));
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------------------------------------
     if Reader.HasTensor('backbone.embeddings.cls_token') then Pfx := 'backbone.'
@@ -56952,9 +56952,9 @@ begin
 end;
 
 function BuildDPTFromSafeTensors(Reader: TNNetSafeTensorsReader;
-  const Config: TDPTConfig; pInferenceOnly: boolean): TNNet;
+  const Config: TDPTConfig; pTrainable: boolean): TNNet;
 begin
-  Result := BuildDPT(Reader, Config, pInferenceOnly);
+  Result := BuildDPT(Reader, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -57137,7 +57137,7 @@ begin
 end;
 
 function BuildViTPose(Reader: TNNetSafeTensorsReader;
-  const Config: TViTPoseConfig; pInferenceOnly: boolean): TNNet;
+  const Config: TViTPoseConfig; pTrainable: boolean): TNNet;
 const
   cPatchPad = 2;   // ViTPose hardcodes nn.Conv2d(..., padding=2) on the patch conv
 var
@@ -57195,17 +57195,17 @@ begin
     // BIASED patch conv: kernel = stride = patch, PADDING = 2 -> (GridW, GridH,
     // hidden) grid, flattened row-major (y*GridW + x) = HF flatten(2).transpose.
     PatchConv := NN.AddLayer(TNNetConvolutionLinear.Create(
-      d, p, {pInputPadding=}cPatchPad, {pStride=}p, {pSuppressBias=}0).SetInferenceOnly(pInferenceOnly));
+      d, p, {pInputPadding=}cPatchPad, {pStride=}p, {pSuppressBias=}0).SetTrainable(pTrainable));
     NN.AddLayer(TNNetReshape.Create(NumPatches, 1, d));
     // NO class token: the patch tokens ARE the sequence. The learned position
     // table carries the cls row folded into every patch position (loaded below).
-    PosEmb := NN.AddLayer(TNNetLearnedPositionalEmbedding.Create(NumPatches).SetInferenceOnly(pInferenceOnly));
-    if pInferenceOnly then NN.SetInferenceOnly();
+    PosEmb := NN.AddLayer(TNNetLearnedPositionalEmbedding.Create(NumPatches).SetTrainable(pTrainable));
+    if not pTrainable then NN.SetTrainable();
     SetLength(Blocks, Config.NumLayers);
     for BlockCnt := 0 to NumLayersM1 do
       AddClipEncoderBlock(NN, Tower, {CausalMask=}false,
-        Blocks[BlockCnt], pInferenceOnly);
-    FinalLN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly));
+        Blocks[BlockCnt], pTrainable);
+    FinalLN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
     // Reshape the N patch tokens back to a (GridW, GridH, hidden) grid (HF
     // permute(0,2,1).reshape(batch, hidden, GridH, GridW); CAI is (x,y,c)).
     NN.AddLayer(TNNetReshape.Create(GridW, GridH, d));
@@ -57217,8 +57217,8 @@ begin
     NN.AddLayer(TNNetPadXY.Create(1, 1));
     HeadConv := NN.AddLayer(TNNetConvolutionLinear.Create(
       Config.NumKeypoints, 3, {pInputPadding=}0, {pStride=}1,
-      {pSuppressBias=}0).SetInferenceOnly(pInferenceOnly));
-    if pInferenceOnly then NN.SetInferenceOnly();
+      {pSuppressBias=}0).SetTrainable(pTrainable));
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ---------------------------------------------
     // Prefix probing: the standalone backbone or the ForPoseEstimation wrap.
@@ -57287,26 +57287,26 @@ begin
 end;
 
 function BuildViTPoseFromSafeTensors(Reader: TNNetSafeTensorsReader;
-  const Config: TViTPoseConfig; pInferenceOnly: boolean): TNNet;
+  const Config: TViTPoseConfig; pTrainable: boolean): TNNet;
 begin
-  Result := BuildViTPose(Reader, Config, pInferenceOnly);
+  Result := BuildViTPose(Reader, Config, pTrainable);
 end;
 
 function BuildViTPoseFromSafeTensorsEx(const FileName: string;
-  const Config: TViTPoseConfig; pInferenceOnly: boolean): TNNet;
+  const Config: TViTPoseConfig; pTrainable: boolean): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildViTPose(Reader, Config, pInferenceOnly);
+    Result := BuildViTPose(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildViTPoseFromSafeTensors(const FileName: string;
-  out Config: TViTPoseConfig; pInferenceOnly: boolean;
+  out Config: TViTPoseConfig; pTrainable: boolean;
   const ConfigFileName: string): TNNet;
 var
   ConfigPath: string;
@@ -57314,7 +57314,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadViTPoseConfigFromJSONFile(ConfigPath);
-  Result := BuildViTPoseFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildViTPoseFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 function DecodeViTPoseKeypoints(
@@ -57697,7 +57697,7 @@ begin
 end;
 
 function BuildDetr(Reader: TNNetSafeTensorsReader;
-  const Config: TDetrConfig; pInferenceOnly: boolean): TNNet;
+  const Config: TDetrConfig; pTrainable: boolean): TNNet;
 var
   LpMax: integer;
   NN: TNNet;
@@ -57731,12 +57731,12 @@ var
     R.Conv1 := nil; R.Conv2 := nil; R.Conv3 := nil; R.Down := nil;
     OutW := BaseW * 4;
     Inp := NN.GetLastLayer();
-    R.Conv1 := NN.AddLayer( TNNetConvolutionLinear.Create(BaseW, 1, 0, 1, 0).SetInferenceOnly(pInferenceOnly) );
+    R.Conv1 := NN.AddLayer( TNNetConvolutionLinear.Create(BaseW, 1, 0, 1, 0).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetReLU.Create() );
     R.Conv2 := NN.AddLayer(
-      TNNetConvolutionLinear.Create(BaseW, 3, 1, Stride, 0).SetInferenceOnly(pInferenceOnly) );
+      TNNetConvolutionLinear.Create(BaseW, 3, 1, Stride, 0).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetReLU.Create() );
-    R.Conv3 := NN.AddLayer( TNNetConvolutionLinear.Create(OutW, 1, 0, 1, 0).SetInferenceOnly(pInferenceOnly) );
+    R.Conv3 := NN.AddLayer( TNNetConvolutionLinear.Create(OutW, 1, 0, 1, 0).SetTrainable(pTrainable) );
     Branch := NN.GetLastLayer();
     if HasShort then
     begin
@@ -57795,7 +57795,7 @@ begin
     NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
       Config.NumChannels) );
     StemConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-      Config.BackboneEmbedSize, 7, 3, 2, 0).SetInferenceOnly(pInferenceOnly) );
+      Config.BackboneEmbedSize, 7, 3, 2, 0).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetReLU.Create() );
     // PyTorch-formula maxpool (floor (in-k+2p)/s + 1); the default TNNetMaxPool
     // uses a ceil formula that produces a LARGER grid (off-by-one vs PyTorch).
@@ -57825,7 +57825,7 @@ begin
     // input_projection: 1x1 conv (biased) backbone-channels -> d_model, then
     // flatten the (GridDim,GridDim,d_model) grid to (NumTokens,1,d_model)
     // sequence tokens (row-major y*W+x, matching HF flatten(2)).
-    InputProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0).SetInferenceOnly(pInferenceOnly) );
+    InputProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetReshape.Create(NumTokens, 1, Config.DModel) );
 
     // ---- encoder ----
@@ -57836,22 +57836,22 @@ begin
       // spatial pos added to q/k inputs (NOT v). One pos table per layer (all
       // filled with the same 2-D sine constant below).
       SpatialPos := NN.AddLayerAfter(
-        TNNetLearnedPositionalEmbedding.Create(NumTokens).SetInferenceOnly(pInferenceOnly), Plain);
+        TNNetLearnedPositionalEmbedding.Create(NumTokens).SetTrainable(pTrainable), Plain);
       AttnOut := AddDetrAttention(NN, Config, {QSource=}SpatialPos,
         {KSource=}SpatialPos, {VSource=}Plain, Config.EncoderHeads,
         Config.DModel, Refs);
       EncSelf[L] := Refs;
       // residual after attn, then post-LN (DETR is POST-norm).
       NN.AddLayer( TNNetSum.Create([AttnOut, BranchIn]) );
-      EncSelfNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create().SetInferenceOnly(pInferenceOnly) );
+      EncSelfNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create().SetTrainable(pTrainable) );
       // FFN: fc1 -> relu -> fc2, residual, post-LN.
       BranchIn := NN.GetLastLayer();
       EncFC1[L] := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.EncoderFFNDim, 0).SetInferenceOnly(pInferenceOnly) );
+        TNNetPointwiseConvLinear.Create(Config.EncoderFFNDim, 0).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetReLU.Create() );
-      EncFC2[L] := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0).SetInferenceOnly(pInferenceOnly) );
+      EncFC2[L] := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchIn]) );
-      EncFFNNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create().SetInferenceOnly(pInferenceOnly) );
+      EncFFNNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create().SetTrainable(pTrainable) );
       // The spatial pos table is per-layer; remember the LAST one is the
       // encoder memory's pos (reused by the decoder cross-attn keys).
     end;
@@ -57880,56 +57880,56 @@ begin
       if L = 0 then Plain := QueryInput else Plain := BranchIn;
       // self-attn: query-pos added to q AND k; v plain.
       QPos := NN.AddLayerAfter(
-        TNNetLearnedPositionalEmbedding.Create(Config.NumQueries).SetInferenceOnly(pInferenceOnly), Plain);
+        TNNetLearnedPositionalEmbedding.Create(Config.NumQueries).SetTrainable(pTrainable), Plain);
       DecQueryPosSelf[L] := QPos;
       AttnOut := AddDetrAttention(NN, Config, {QSource=}QPos, {KSource=}QPos,
         {VSource=}Plain, Config.DecoderHeads, Config.DModel, Refs);
       DecSelf[L] := Refs;
       NN.AddLayer( TNNetSum.Create([AttnOut, Plain]) );
-      DecSelfNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create().SetInferenceOnly(pInferenceOnly) );
+      DecSelfNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create().SetTrainable(pTrainable) );
       // cross-attn: query-pos added to q (over the decoder stream); spatial-pos
       // added to k (over encoder states); v = plain encoder states.
       BranchIn := NN.GetLastLayer();
       QPos := NN.AddLayerAfter(
-        TNNetLearnedPositionalEmbedding.Create(Config.NumQueries).SetInferenceOnly(pInferenceOnly), BranchIn);
+        TNNetLearnedPositionalEmbedding.Create(Config.NumQueries).SetTrainable(pTrainable), BranchIn);
       DecQueryPosCross[L] := QPos;
       SpatialPos := NN.AddLayerAfter(
-        TNNetLearnedPositionalEmbedding.Create(NumTokens).SetInferenceOnly(pInferenceOnly), EncStates);
+        TNNetLearnedPositionalEmbedding.Create(NumTokens).SetTrainable(pTrainable), EncStates);
       DecSpatialPos[L] := SpatialPos;
       AttnOut := AddDetrAttention(NN, Config, {QSource=}QPos,
         {KSource=}SpatialPos, {VSource=}EncStates, Config.DecoderHeads,
         Config.DModel, Refs);
       DecCross[L] := Refs;
       NN.AddLayer( TNNetSum.Create([AttnOut, BranchIn]) );
-      DecCrossNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create().SetInferenceOnly(pInferenceOnly) );
+      DecCrossNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create().SetTrainable(pTrainable) );
       // FFN
       BranchIn := NN.GetLastLayer();
       DecFC1[L] := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.DecoderFFNDim, 0).SetInferenceOnly(pInferenceOnly) );
+        TNNetPointwiseConvLinear.Create(Config.DecoderFFNDim, 0).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetReLU.Create() );
-      DecFC2[L] := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0).SetInferenceOnly(pInferenceOnly) );
+      DecFC2[L] := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchIn]) );
-      DecFFNNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create().SetInferenceOnly(pInferenceOnly) );
+      DecFFNNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create().SetTrainable(pTrainable) );
     end;
     // final decoder LayerNorm (model.decoder.layernorm)
-    DecFinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create().SetInferenceOnly(pInferenceOnly) );
+    DecFinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create().SetTrainable(pTrainable) );
     Normed := NN.GetLastLayer();
 
     // ---- heads ----
     // class head: Linear d_model -> num_labels+1 (over each query token).
     ClassHead := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.NumLabels + 1, 0).SetInferenceOnly(pInferenceOnly), Normed);
+      TNNetPointwiseConvLinear.Create(Config.NumLabels + 1, 0).SetTrainable(pTrainable), Normed);
     // box head: 3-layer MLP (relu, relu, sigmoid) d_model->d_model->d_model->4.
     BBox0 := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.DModel, 0).SetInferenceOnly(pInferenceOnly), Normed);
+      TNNetPointwiseConvLinear.Create(Config.DModel, 0).SetTrainable(pTrainable), Normed);
     NN.AddLayer( TNNetReLU.Create() );
-    BBox1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0).SetInferenceOnly(pInferenceOnly) );
+    BBox1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetReLU.Create() );
-    BBox2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(4, 0).SetInferenceOnly(pInferenceOnly) );
+    BBox2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(4, 0).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetSigmoid.Create() );
     // concat [class logits (num_labels+1) | box (4)] on the depth axis.
     NN.AddLayer( TNNetDeepConcat.Create([ClassHead, NN.GetLastLayer()]) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
 
     // ===================== WEIGHTS =====================
     // backbone stem
@@ -58058,26 +58058,26 @@ begin
 end;
 
 function BuildDetrFromSafeTensors(Reader: TNNetSafeTensorsReader;
-  const Config: TDetrConfig; pInferenceOnly: boolean): TNNet;
+  const Config: TDetrConfig; pTrainable: boolean): TNNet;
 begin
-  Result := BuildDetr(Reader, Config, pInferenceOnly);
+  Result := BuildDetr(Reader, Config, pTrainable);
 end;
 
 function BuildDetrFromSafeTensorsEx(const FileName: string;
-  const Config: TDetrConfig; pInferenceOnly: boolean): TNNet;
+  const Config: TDetrConfig; pTrainable: boolean): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildDetr(Reader, Config, pInferenceOnly);
+    Result := BuildDetr(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildDetrFromSafeTensors(const FileName: string;
-  out Config: TDetrConfig; pInferenceOnly: boolean;
+  out Config: TDetrConfig; pTrainable: boolean;
   const ConfigFileName: string): TNNet;
 var
   ConfigPath: string;
@@ -58085,7 +58085,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadDetrConfigFromJSONFile(ConfigPath);
-  Result := BuildDetrFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildDetrFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 function DecodeDetrDetections(Output: TNNetVolume; NumLabels: integer;
@@ -58329,7 +58329,7 @@ begin
 end;
 
 function BuildYolo(Reader: TNNetSafeTensorsReader;
-  const Config: TYoloConfig; pInferenceOnly: boolean): TNNet;
+  const Config: TYoloConfig; pTrainable: boolean): TNNet;
 var
   NN: TNNet;
   Refs: TYoloConvRefArray;
@@ -58374,12 +58374,12 @@ begin
     Cat := NN.AddLayer(TNNetDeepConcat.Create([U, P3]));
     H3 := YoloAddC2f(NN, Refs, w3 + w2, w2, d0, False, 'model.15');  // head /8
     // neck: bottom-up
-    T := NN.AddLayerAfter(TNNetConvolutionLinear.Create(w2, 3, 1, 2, 0).SetInferenceOnly(pInferenceOnly), H3);
+    T := NN.AddLayerAfter(TNNetConvolutionLinear.Create(w2, 3, 1, 2, 0).SetTrainable(pTrainable), H3);
     YoloPushConv(Refs, T, w2, 3, 'model.16'); NN.AddLayer(TNNetSiLU.Create());
     T := NN.GetLastLayer();
     Cat := NN.AddLayer(TNNetDeepConcat.Create([T, N4]));
     H4 := YoloAddC2f(NN, Refs, w2 + w3, w3, d0, False, 'model.18');  // head /16
-    T := NN.AddLayerAfter(TNNetConvolutionLinear.Create(w3, 3, 1, 2, 0).SetInferenceOnly(pInferenceOnly), H4);
+    T := NN.AddLayerAfter(TNNetConvolutionLinear.Create(w3, 3, 1, 2, 0).SetTrainable(pTrainable), H4);
     YoloPushConv(Refs, T, w3, 3, 'model.19'); NN.AddLayer(TNNetSiLU.Create());
     T := NN.GetLastLayer();
     Cat := NN.AddLayer(TNNetDeepConcat.Create([T, P5]));
@@ -58393,24 +58393,24 @@ begin
       Pref := 'model.22';
       // box branch cv2[i]: Conv3 -> Conv3 -> Conv2d(4*rm,+bias)
       BoxConv[i][0] := NN.AddLayerAfter(
-        TNNetConvolutionLinear.Create(cb, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly), HeadIn[i]);
+        TNNetConvolutionLinear.Create(cb, 3, 1, 1, 0).SetTrainable(pTrainable), HeadIn[i]);
       YoloPushConv(Refs, BoxConv[i][0], ci, 3, Pref + '.cv2.' + IntToStr(i) + '.0');
       NN.AddLayer(TNNetSiLU.Create());
-      BoxConv[i][1] := NN.AddLayer(TNNetConvolutionLinear.Create(cb, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly));
+      BoxConv[i][1] := NN.AddLayer(TNNetConvolutionLinear.Create(cb, 3, 1, 1, 0).SetTrainable(pTrainable));
       YoloPushConv(Refs, BoxConv[i][1], cb, 3, Pref + '.cv2.' + IntToStr(i) + '.1');
       NN.AddLayer(TNNetSiLU.Create());
       BoxConv[i][2] := NN.AddLayer(
-        TNNetConvolutionLinear.Create(4 * rm, 1, 0, 1, 0).SetInferenceOnly(pInferenceOnly));
+        TNNetConvolutionLinear.Create(4 * rm, 1, 0, 1, 0).SetTrainable(pTrainable));
       BoxC := NN.GetLastLayer();
       // class branch cv3[i]: Conv3 -> Conv3 -> Conv2d(nc,+bias)
       ClsConv[i][0] := NN.AddLayerAfter(
-        TNNetConvolutionLinear.Create(cc, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly), HeadIn[i]);
+        TNNetConvolutionLinear.Create(cc, 3, 1, 1, 0).SetTrainable(pTrainable), HeadIn[i]);
       YoloPushConv(Refs, ClsConv[i][0], ci, 3, Pref + '.cv3.' + IntToStr(i) + '.0');
       NN.AddLayer(TNNetSiLU.Create());
-      ClsConv[i][1] := NN.AddLayer(TNNetConvolutionLinear.Create(cc, 3, 1, 1, 0).SetInferenceOnly(pInferenceOnly));
+      ClsConv[i][1] := NN.AddLayer(TNNetConvolutionLinear.Create(cc, 3, 1, 1, 0).SetTrainable(pTrainable));
       YoloPushConv(Refs, ClsConv[i][1], cc, 3, Pref + '.cv3.' + IntToStr(i) + '.1');
       NN.AddLayer(TNNetSiLU.Create());
-      ClsConv[i][2] := NN.AddLayer(TNNetConvolutionLinear.Create(nc, 1, 0, 1, 0).SetInferenceOnly(pInferenceOnly));
+      ClsConv[i][2] := NN.AddLayer(TNNetConvolutionLinear.Create(nc, 1, 0, 1, 0).SetTrainable(pTrainable));
       ClsC := NN.GetLastLayer();
       // per-cell channel layout = [box(4*rm), cls(nc)]
       Cat := NN.AddLayer(TNNetDeepConcat.Create([BoxC, ClsC]));
@@ -58442,7 +58442,7 @@ begin
         'model.22.cv3.' + IntToStr(i) + '.2.weight',
         'model.22.cv3.' + IntToStr(i) + '.2.bias', nc, cc);
     end;
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
     Result := NN;
   except
     NN.Free;
@@ -58451,20 +58451,20 @@ begin
 end;
 
 function BuildYoloFromSafeTensorsEx(const FileName: string;
-  const Config: TYoloConfig; pInferenceOnly: boolean): TNNet;
+  const Config: TYoloConfig; pTrainable: boolean): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildYolo(Reader, Config, pInferenceOnly);
+    Result := BuildYolo(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildYoloFromSafeTensors(const FileName: string;
-  out Config: TYoloConfig; pInferenceOnly: boolean;
+  out Config: TYoloConfig; pTrainable: boolean;
   const ConfigFileName: string): TNNet;
 var
   ConfigPath: string;
@@ -58472,7 +58472,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadYoloConfigFromJSONFile(ConfigPath);
-  Result := BuildYoloFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildYoloFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
@@ -58578,20 +58578,20 @@ begin
 end;
 
 function BuildDPTFromSafeTensorsEx(const FileName: string;
-  const Config: TDPTConfig; pInferenceOnly: boolean): TNNet;
+  const Config: TDPTConfig; pTrainable: boolean): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildDPT(Reader, Config, pInferenceOnly);
+    Result := BuildDPT(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildDPTFromSafeTensors(const FileName: string;
-  out Config: TDPTConfig; pInferenceOnly: boolean;
+  out Config: TDPTConfig; pTrainable: boolean;
   const ConfigFileName: string): TNNet;
 var
   ConfigPath: string;
@@ -58599,7 +58599,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadDPTConfigFromJSONFile(ConfigPath);
-  Result := BuildDPTFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildDPTFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 function ReadClipImageProcessorConfig(
@@ -58954,7 +58954,7 @@ end;
 
 function BuildLlavaProjector(Reader: TNNetSafeTensorsReader;
   NumPatches, VisionHidden, TextHidden: integer; GeluExact: boolean;
-  const Prefix: string; pInferenceOnly: boolean = false): TNNet;
+  const Prefix: string; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   Lin1, Lin2: TNNetLayer;
@@ -58963,12 +58963,12 @@ begin
   try
     NN.AddLayer( TNNetInput.Create(NumPatches, 1, VisionHidden) );
     // linear_1: VisionHidden -> TextHidden (biased), per token.
-    Lin1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden).SetInferenceOnly(pInferenceOnly) );
+    Lin1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden).SetTrainable(pTrainable) );
     if GeluExact then AddClipHiddenAct(NN, chaGeluExact)
     else NN.AddLayer( TNNetGELU.Create() );  // gelu_new tanh approximation
     // linear_2: TextHidden -> TextHidden (biased), per token.
-    Lin2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+    Lin2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
     // weights (HF nn.Linear weight is [out, in]; LoadLlamaLinearWeights
     // handles the row-major [out,in] layout + the bias vector).
     LoadLlamaLinearWeights(Reader, Lin1, Prefix + 'linear_1.weight',
@@ -58984,7 +58984,7 @@ end;
 
 procedure BuildLlavaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TLlavaConfig; out VisionNet, ProjectorNet, TextNet: TNNet;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  pSeqLen: integer = 0; pTrainable: boolean = true);
 var
   Reader: TNNetSafeTensorsReader;
   VisionPrefix, ProjPrefix: string;
@@ -59043,16 +59043,16 @@ begin
       VisionNet := BuildClipVisionTower(Reader, Config.Vision,
         Config.ImageSize, Config.PatchSize, Config.NumChannels,
         {ProjectionDim=}Config.Vision.HiddenSize, VisionPrefix, '',
-        pInferenceOnly, {pVisionFeatures=}true)
+        pTrainable, {pVisionFeatures=}true)
     else
       VisionNet := BuildSigLIPVisionTower(Reader, Config.Vision,
         Config.ImageSize, Config.PatchSize, Config.NumChannels,
-        VisionPrefix, pInferenceOnly, {pVisionFeatures=}true, SelHidden);
+        VisionPrefix, pTrainable, {pVisionFeatures=}true, SelHidden);
 
     // ---- projector ----
     ProjectorNet := BuildLlavaProjector(Reader, Config.NumPatches,
       Config.Vision.HiddenSize, Config.Text.HiddenSize,
-      Config.ProjectorGeluExact, ProjPrefix, pInferenceOnly);
+      Config.ProjectorGeluExact, ProjPrefix, pTrainable);
 
     // Drop the vision-tower + projector tensors from the reader so the stock
     // Llama builder's strict all-tensors-consumed check sees only the
@@ -59064,7 +59064,7 @@ begin
     // by LlavaRunLogits). The reader is consumed (freed) by the core builder,
     // so this MUST be last. ----
     TextNet := BuildLlamaFromTensorReaderWithConfig(Reader, FileName,
-      Config.Text, pSeqLen, pInferenceOnly, {pQuantizeInt8=}false);
+      Config.Text, pSeqLen, pTrainable, {pQuantizeInt8=}false);
     Reader := nil;  // ownership transferred to the Llama builder
   except
     VisionNet.Free;
@@ -59077,7 +59077,7 @@ end;
 
 procedure BuildLlavaFromSafeTensors(const FileName: string;
   out VisionNet, ProjectorNet, TextNet: TNNet; out Config: TLlavaConfig;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 var
   CfgPath: string;
@@ -59087,7 +59087,7 @@ begin
     'config.json';
   Config := ReadLlavaConfigFromJSONFile(CfgPath);
   BuildLlavaFromSafeTensorsWithConfig(FileName, Config,
-    VisionNet, ProjectorNet, TextNet, pSeqLen, pInferenceOnly);
+    VisionNet, ProjectorNet, TextNet, pSeqLen, pTrainable);
 end;
 
 procedure LlavaProjectImage(VisionNet, ProjectorNet: TNNet;
@@ -59331,7 +59331,7 @@ end;
 
 function BuildPaliGemmaProjector(Reader: TNNetSafeTensorsReader;
   NumPatches, VisionHidden, TextHidden: integer;
-  const Prefix: string; pInferenceOnly: boolean = false): TNNet;
+  const Prefix: string; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   Lin: TNNetLayer;
@@ -59341,8 +59341,8 @@ begin
     NN.AddLayer( TNNetInput.Create(NumPatches, 1, VisionHidden) );
     // SINGLE biased linear: VisionHidden -> TextHidden, per token (NO gelu,
     // NO second layer - unlike LLaVA's 2-layer MLP).
-    Lin := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+    Lin := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
     LoadLlamaLinearWeights(Reader, Lin, Prefix + 'linear.weight',
       VisionHidden, TextHidden, 0, -1, 0, Prefix + 'linear.bias');
     Result := NN;
@@ -59354,7 +59354,7 @@ end;
 
 procedure BuildPaliGemmaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TPaliGemmaConfig; out VisionNet, ProjectorNet, TextNet: TNNet;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  pSeqLen: integer = 0; pTrainable: boolean = true);
 var
   Reader: TNNetSafeTensorsReader;
   VisionPrefix, ProjPrefix: string;
@@ -59403,13 +59403,13 @@ begin
     // vision_feature_layer = -1, which SKIPS it). ----
     VisionNet := BuildSigLIPVisionTower(Reader, Config.Vision,
       Config.ImageSize, Config.PatchSize, Config.NumChannels,
-      VisionPrefix, pInferenceOnly, {pVisionFeatures=}true,
+      VisionPrefix, pTrainable, {pVisionFeatures=}true,
       {SelectHiddenLayer=}0);
 
     // ---- projector (single linear) ----
     ProjectorNet := BuildPaliGemmaProjector(Reader, Config.NumPatches,
       Config.Vision.HiddenSize, Config.Text.HiddenSize, ProjPrefix,
-      pInferenceOnly);
+      pTrainable);
 
     // Drop the vision-tower + projector tensors so the Gemma builder's strict
     // all-tensors-consumed check sees only the language-model tensors.
@@ -59420,7 +59420,7 @@ begin
     // PaliGemmaRunLogits). The reader is consumed (freed) by the builder, so
     // this MUST be last. ----
     TextNet := BuildLlamaFromTensorReaderWithConfig(Reader, FileName,
-      Config.Text, pSeqLen, pInferenceOnly, {pQuantizeInt8=}false);
+      Config.Text, pSeqLen, pTrainable, {pQuantizeInt8=}false);
     Reader := nil;  // ownership transferred
   except
     VisionNet.Free;
@@ -59433,7 +59433,7 @@ end;
 
 procedure BuildPaliGemmaFromSafeTensors(const FileName: string;
   out VisionNet, ProjectorNet, TextNet: TNNet; out Config: TPaliGemmaConfig;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 var
   CfgPath: string;
@@ -59443,7 +59443,7 @@ begin
     'config.json';
   Config := ReadPaliGemmaConfigFromJSONFile(CfgPath);
   BuildPaliGemmaFromSafeTensorsWithConfig(FileName, Config,
-    VisionNet, ProjectorNet, TextNet, pSeqLen, pInferenceOnly);
+    VisionNet, ProjectorNet, TextNet, pSeqLen, pTrainable);
 end;
 
 procedure PaliGemmaRunLogits(VisionNet, ProjectorNet, TextNet: TNNet;
@@ -59625,7 +59625,7 @@ end;
 
 procedure Qwen2AudioBuildTower(Reader: TNNetSafeTensorsReader;
   const Config: TQwen2AudioConfig; const Prefix: string;
-  out TowerNet, PoolNormNet: TNNet; pInferenceOnly: boolean = false);
+  out TowerNet, PoolNormNet: TNNet; pTrainable: boolean = true);
 var
   LpMax: integer;
   Tower, PoolNorm: TNNet;
@@ -59653,19 +59653,19 @@ begin
       Config.Audio.NumMelBins, 1) );
     Tower.AddLayer( TNNetPadXY.Create(1, 0) );
     Conv1 := Tower.AddLayer( TNNetConvolutionLinear.Create(
-      Config.Audio.DModel, 3, {Padding=}0, {Stride=}1).SetInferenceOnly(pInferenceOnly) );
+      Config.Audio.DModel, 3, {Padding=}0, {Stride=}1).SetTrainable(pTrainable) );
     AddWhisperExactGelu(Tower);
     Tower.AddLayer( TNNetPadXY.Create(1, 0) );
     Conv2 := Tower.AddLayer( TNNetConvolutionLinear.Create(
-      Config.Audio.DModel, 3, {Padding=}0, {Stride=}2).SetInferenceOnly(pInferenceOnly) );
+      Config.Audio.DModel, 3, {Padding=}0, {Stride=}2).SetTrainable(pTrainable) );
     AddWhisperExactGelu(Tower);
     EncPos := Tower.AddLayer(
-      TNNetLearnedPositionalEmbedding.Create(Config.Audio.MaxSourcePositions).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then Tower.SetInferenceOnly();
+      TNNetLearnedPositionalEmbedding.Create(Config.Audio.MaxSourcePositions).SetTrainable(pTrainable) );
+    if not pTrainable then Tower.SetTrainable();
     BuildWhisperStackBlocks(Tower, Config.Audio, Config.Audio.EncoderLayers,
       Config.Audio.EncoderHeads, Config.Audio.EncoderFFNDim,
-      {IsDecoder=}false, nil, EncBlocks, pInferenceOnly);
-    if pInferenceOnly then Tower.SetInferenceOnly();
+      {IsDecoder=}false, nil, EncBlocks, pTrainable);
+    if not pTrainable then Tower.SetTrainable();
 
     // ---- pool-norm tail net: the post-avg_pooler final LayerNorm. Input is
     // the pooled frame grid (NumAudioTokens,1,d_model). ----
@@ -59673,8 +59673,8 @@ begin
     PoolNorm.AddLayer( TNNetInput.Create(Config.NumAudioTokens, 1,
       Config.Audio.DModel) );
     FinalNorm := PoolNorm.AddLayer(
-      TNNetTokenLayerNorm.Create(MarianLayerNormEps).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then PoolNorm.SetInferenceOnly();
+      TNNetTokenLayerNorm.Create(MarianLayerNormEps).SetTrainable(pTrainable) );
+    if not pTrainable then PoolNorm.SetTrainable();
 
     // ---- weights ----
     LoadWhisperConv1D(Reader, Conv1, Prefix + 'conv1.weight',
@@ -59722,7 +59722,7 @@ end;
 
 function Qwen2AudioBuildProjector(Reader: TNNetSafeTensorsReader;
   NumAudioTokens, AudioHidden, TextHidden: integer;
-  const Prefix: string; pInferenceOnly: boolean = false): TNNet;
+  const Prefix: string; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   Lin: TNNetLayer;
@@ -59731,8 +59731,8 @@ begin
   try
     NN.AddLayer( TNNetInput.Create(NumAudioTokens, 1, AudioHidden) );
     // linear: AudioHidden -> TextHidden (biased), per token.
-    Lin := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden).SetInferenceOnly(pInferenceOnly) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+    Lin := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
     LoadLlamaLinearWeights(Reader, Lin, Prefix + 'linear.weight',
       AudioHidden, TextHidden, 0, -1, 0, Prefix + 'linear.bias');
     Result := NN;
@@ -59745,7 +59745,7 @@ end;
 procedure Qwen2AudioBuildFromSafeTensorsWithConfig(const FileName: string;
   var Config: TQwen2AudioConfig;
   out TowerNet, PoolNormNet, ProjectorNet, TextNet: TNNet;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false);
+  pSeqLen: integer = 0; pTrainable: boolean = true);
 var
   Reader: TNNetSafeTensorsReader;
   AudioPrefix, ProjPrefix: string;
@@ -59790,10 +59790,10 @@ begin
 
     // ---- audio tower (+ pool/norm tail) and projector ----
     Qwen2AudioBuildTower(Reader, Config, AudioPrefix,
-      TowerNet, PoolNormNet, pInferenceOnly);
+      TowerNet, PoolNormNet, pTrainable);
     ProjectorNet := Qwen2AudioBuildProjector(Reader, Config.NumAudioTokens,
       Config.Audio.DModel, Config.Text.HiddenSize, ProjPrefix,
-      pInferenceOnly);
+      pTrainable);
 
     // Drop the audio-tower + projector tensors so the stock Qwen2 builder's
     // strict all-tensors-consumed check sees only the language-model tensors.
@@ -59804,7 +59804,7 @@ begin
     // Qwen2AudioRunLogits). The reader is consumed (freed) by the core
     // builder, so this MUST be last. ----
     TextNet := BuildLlamaFromTensorReaderWithConfig(Reader, FileName,
-      Config.Text, pSeqLen, pInferenceOnly, {pQuantizeInt8=}false);
+      Config.Text, pSeqLen, pTrainable, {pQuantizeInt8=}false);
     Reader := nil;  // ownership transferred to the Llama builder
   except
     TowerNet.Free;
@@ -59819,7 +59819,7 @@ end;
 procedure BuildQwen2AudioFromSafeTensors(const FileName: string;
   out TowerNet, PoolNormNet, ProjectorNet, TextNet: TNNet;
   out Config: TQwen2AudioConfig;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = '');
 var
   CfgPath: string;
@@ -59829,7 +59829,7 @@ begin
     'config.json';
   Config := ReadQwen2AudioConfigFromJSONFile(CfgPath);
   Qwen2AudioBuildFromSafeTensorsWithConfig(FileName, Config,
-    TowerNet, PoolNormNet, ProjectorNet, TextNet, pSeqLen, pInferenceOnly);
+    TowerNet, PoolNormNet, ProjectorNet, TextNet, pSeqLen, pTrainable);
 end;
 
 procedure Qwen2AudioMelToInput(Mel, Dst: TNNetVolume;
@@ -60030,7 +60030,7 @@ end;
 
 function BuildQwen2VLFromSafeTensorsEx(const FileName: string;
   out Config: TQwen2VLConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -60045,16 +60045,16 @@ begin
   Config.Text.MRoPESectionH := Config.MRoPESectionH;
   Config.Text.MRoPESectionW := Config.MRoPESectionW;
   Result := BuildLlamaFromSafeTensorsWithConfig(FileName, Config.Text, pSeqLen,
-    pInferenceOnly);
+    pTrainable);
 end;
 
 function BuildQwen2VLFromSafeTensors(const FileName: string;
   out Config: TQwen2VLConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 begin
   Result := BuildQwen2VLFromSafeTensorsEx(FileName, Config, pSeqLen,
-    pInferenceOnly, ConfigFileName);
+    pTrainable, ConfigFileName);
 end;
 
 procedure BuildQwen2VLMRoPEPositionIds(const TokenIds: array of integer;
@@ -60466,7 +60466,7 @@ begin
 end;
 
 function BuildRaftFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
-  const Config: TRaftConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TRaftConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   Inp1, Inp2, FlowSeed: TNNetLayer;
@@ -60518,16 +60518,16 @@ begin
         TNNetCorrelationLookup.Create(Config.CorrRadius, Flow), CorrVol);
       // motion encoder: corr branch (1x1 -> relu)
       MencC1[it] := NN.AddLayerAfter(
-        TNNetConvolutionReLU.Create(16, 1, 0, 1).SetInferenceOnly(pInferenceOnly), Lookup);
+        TNNetConvolutionReLU.Create(16, 1, 0, 1).SetTrainable(pTrainable), Lookup);
       Cor := MencC1[it];
       // flow branch (7x7 -> relu -> 3x3 -> relu)
       MencF1[it] := NN.AddLayerAfter(
-        TNNetConvolutionReLU.Create(8, 7, 3, 1).SetInferenceOnly(pInferenceOnly), Flow);
-      MencF2[it] := NN.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1).SetInferenceOnly(pInferenceOnly));
+        TNNetConvolutionReLU.Create(8, 7, 3, 1).SetTrainable(pTrainable), Flow);
+      MencF2[it] := NN.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1).SetTrainable(pTrainable));
       Flo := MencF2[it];
       CorFlo := NN.AddLayer(TNNetDeepConcat.Create([Cor, Flo]));
       MencConv[it] := NN.AddLayerAfter(
-        TNNetConvolutionReLU.Create(mout - 2, 3, 1, 1).SetInferenceOnly(pInferenceOnly), CorFlo);
+        TNNetConvolutionReLU.Create(mout - 2, 3, 1, 1).SetTrainable(pTrainable), CorFlo);
       Motion := NN.AddLayer(TNNetDeepConcat.Create([MencConv[it], Flow]));
       // GRU input x = [motion ; inp]; state z = [net ; x]
       GruIn := NN.AddLayer(TNNetDeepConcat.Create([Motion, Inp]));
@@ -60538,15 +60538,15 @@ begin
       NetState := Gru;
       // flow head: conv 3x3 relu -> conv 3x3 (2)
       FHc1[it] := NN.AddLayerAfter(
-        TNNetConvolutionReLU.Create(32, 3, 1, 1).SetInferenceOnly(pInferenceOnly), Gru);
-      FHc2[it] := NN.AddLayer(TNNetConvolutionLinear.Create(2, 3, 1, 1).SetInferenceOnly(pInferenceOnly));
+        TNNetConvolutionReLU.Create(32, 3, 1, 1).SetTrainable(pTrainable), Gru);
+      FHc2[it] := NN.AddLayer(TNNetConvolutionLinear.Create(2, 3, 1, 1).SetTrainable(pTrainable));
       DFlow := FHc2[it];
       Flow := NN.AddLayer(TNNetSum.Create([Flow, DFlow]));
     end;
     FH1 := Flow; // final flow output (the net's last layer)
     if FH1 = nil then
       ImportError('RAFT import: internal error - no flow output produced.');
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
 
     // -------------------- weights --------------------
     // fnet weights are SHARED across both frame branches (same tensors).
@@ -60581,7 +60581,7 @@ begin
 end;
 
 function BuildRaftFromSafeTensors(const FileName: string;
-  out Config: TRaftConfig; pInferenceOnly: boolean = false;
+  out Config: TRaftConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
@@ -60596,7 +60596,7 @@ begin
   Config := ReadRaftConfigFromJSONFile(CfgFile);
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildRaftFromSafeTensorsEx(Reader, Config, pInferenceOnly);
+    Result := BuildRaftFromSafeTensorsEx(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
@@ -60632,7 +60632,7 @@ begin
 end;
 
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false;
+  pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath, WeightsPath, ModelType, ArchName: string;
@@ -60750,28 +60750,28 @@ begin
     IgnoredId2Label := nil;
     Result := BuildGPT2ForSequenceClassificationFromSafeTensorsEx(
       WeightsPath, IgnoredGPT2Config, IgnoredId2Label, pSeqLen, NumHeads,
-      pInferenceOnly, ConfigPath, pQuantizeInt8);
+      pTrainable, ConfigPath, pQuantizeInt8);
   end
   else if ModelType = 'gpt2' then
     Result := BuildGPT2FromSafeTensors(WeightsPath, pSeqLen, NumHeads,
-      pInferenceOnly, GPT2ExactGelu, pQuantizeInt8)
+      pTrainable, GPT2ExactGelu, pQuantizeInt8)
   else if ((ModelType = 'bert') or (ModelType = 'distilbert') or
            (ModelType = 'roberta')) and BertSeqCls then
   begin
     IgnoredId2Label := nil;
     Result := BuildBertForSequenceClassificationFromSafeTensorsEx(
       WeightsPath, IgnoredBertConfig, IgnoredId2Label, pSeqLen,
-      pInferenceOnly, ConfigPath, pQuantizeInt8);
+      pTrainable, ConfigPath, pQuantizeInt8);
   end
   else if ModelType = 'gpt_neo' then
     Result := BuildGPTNeoFromSafeTensorsEx(WeightsPath, IgnoredGPTNeoConfig,
-      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if ModelType = 'gpt_neox' then
     Result := BuildGPTNeoXFromSafeTensorsEx(WeightsPath, IgnoredGPTNeoXConfig,
-      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if ModelType = 'gptj' then
     Result := BuildGPTJFromSafeTensorsEx(WeightsPath, IgnoredGPTJConfig,
-      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if ModelType = 'opt' then
     // OPT (architectures ["OPTForCausalLM"], facebook/opt-125m..opt-66b): a
     // plain learned-absolute-position decoder - biased pre-/post-LN GPT-2
@@ -60779,7 +60779,7 @@ begin
     // out_proj, an optional decoder-level final_layer_norm and optional
     // word_embed_proj_dim project_in/out. See the OPT IMPORT section.
     Result := BuildOPTFromSafeTensorsEx(WeightsPath, IgnoredOPTConfig,
-      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if ModelType = 'starcoder2' then
     // Starcoder2 (architectures ["Starcoder2ForCausalLM"],
     // bigcode/starcoder2-3b/7b/15b): the first CODE-specialised decoder -
@@ -60789,7 +60789,7 @@ begin
     // Causal-LM contract like the other decoder families. See the STARCODER2
     // IMPORT section.
     Result := BuildStarCoder2FromSafeTensorsEx(WeightsPath,
-      IgnoredStarCoder2Config, pSeqLen, pInferenceOnly, ConfigPath,
+      IgnoredStarCoder2Config, pSeqLen, pTrainable, ConfigPath,
       pQuantizeInt8)
   else if ModelType = 'gpt_bigcode' then
     // GPT-BigCode / StarCoder-v1 (architectures ["GPTBigCodeForCausalLM"];
@@ -60799,7 +60799,7 @@ begin
     // a FUSED c_attn slab and MULTI-QUERY attention (one shared K/V head
     // broadcast across query heads). See the GPT-BIGCODE IMPORT section.
     Result := BuildGptBigCodeFromSafeTensorsEx(WeightsPath,
-      IgnoredGptBigCodeConfig, pSeqLen, pInferenceOnly, ConfigPath,
+      IgnoredGptBigCodeConfig, pSeqLen, pTrainable, ConfigPath,
       pQuantizeInt8)
   else if ModelType = 'gpt_oss' then
     // GPT-OSS (OpenAI gpt-oss, architectures ["GptOssForCausalLM"], the
@@ -60808,7 +60808,7 @@ begin
     // and gpt-oss's clamped-SwiGLU experts (MXFP4 dequant-at-load for the real
     // checkpoints). See BuildGptOssFromSafeTensors.
     Result := BuildGptOssFromSafeTensorsEx(WeightsPath, IgnoredGptOssConfig,
-      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if (ModelType = 'cohere') or (ModelType = 'cohere2') then
     // Cohere Command-R / Aya (architectures ["CohereForCausalLM"]) and the
     // Command-R7B variant (["Cohere2ForCausalLM"]): parallel residual,
@@ -60817,10 +60817,10 @@ begin
     // alternating sliding/global pattern with NoPE on global layers. See
     // the COHERE IMPORT section.
     Result := BuildCohereFromSafeTensorsEx(WeightsPath, IgnoredCohereConfig,
-      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if ModelType = 'phi' then
     Result := BuildPhiFromSafeTensorsEx(WeightsPath, IgnoredPhiConfig,
-      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if ModelType = 'internlm2' then
     // InternLM2 / InternLM2.5 (architectures ["InternLM2ForCausalLM"],
     // internlm/internlm2_5-*): a plain Llama backbone whose ONLY new piece is
@@ -60829,7 +60829,7 @@ begin
     // names + separate W_q/W_k/W_v by the InternLM2 reader, then ridden over
     // the Llama path. See BuildInternLM2FromSafeTensors.
     Result := BuildInternLM2FromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
-      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if (ModelType = 'llama4') or (ModelType = 'llama4_text') then
     // Llama-4 text decoder (architectures ["Llama4ForCausalLM"],
     // meta-llama/Llama-4-Scout-17B-16E + redistills; text-only - the vision
@@ -60838,7 +60838,7 @@ begin
     // sigmoid-gated top-k MoE with an always-on shared expert. See
     // BuildLlama4FromSafeTensors.
     Result := BuildLlama4FromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
-      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if (ModelType = 'llama') or (ModelType = 'mistral') or
           (ModelType = 'qwen2') or (ModelType = 'qwen3') or
           (ModelType = 'qwen3_moe') or
@@ -60876,7 +60876,7 @@ begin
     // (embedding / residual / attention / logits), all load-time folds; the
     // MoE variant adds the fused 3-D expert slab.
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
-      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if (ModelType = 'bert') or (ModelType = 'distilbert') or
           (ModelType = 'roberta') then
     // ENCODER route: input (SeqLen,1,2) token|token-type ids (channel 1
@@ -60885,7 +60885,7 @@ begin
     // comment). Pooler excluded; call BuildBertFromSafeTensors directly to
     // include it (bert/roberta - distilbert has none).
     Result := BuildBertFromSafeTensorsEx(WeightsPath, IgnoredBertConfig,
-      pSeqLen, pInferenceOnly, {pIncludePooler=}false, ConfigPath,
+      pSeqLen, pTrainable, {pIncludePooler=}false, ConfigPath,
       pQuantizeInt8)
   else if ModelType = 'rwkv' then
     // The first NON-TRANSFORMER route: RWKV-4 (architectures
@@ -60893,28 +60893,28 @@ begin
     // like the decoder families ((SeqLen,1,1) ids in, (SeqLen,1,vocab)
     // logits out). See the RWKV-4 IMPORT section.
     Result := BuildRWKVFromSafeTensorsEx(WeightsPath, IgnoredRWKVConfig,
-      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if ModelType = 'mamba' then
     // The second non-transformer route: Mamba (architectures
     // ["MambaForCausalLM"]), a selective-SSM mixer - causal-LM contract
     // like the decoder families ((SeqLen,1,1) ids in, (SeqLen,1,vocab)
     // logits out). See the MAMBA IMPORT section.
     Result := BuildMambaFromSafeTensorsEx(WeightsPath, IgnoredMambaConfig,
-      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if ModelType = 'mamba2' then
     // Mamba-2 / SSD (architectures ["Mamba2ForCausalLM"]), the multi-head
     // state-space-duality successor to Mamba-1 (per-head scalar A, grouped
     // B/C, gated RMSNorm before out_proj). Causal-LM contract like the other
     // decoder families. See the MAMBA-2 IMPORT section.
     Result := BuildMamba2FromSafeTensorsEx(WeightsPath, IgnoredMamba2Config,
-      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if ModelType = 'recurrent_gemma' then
     // RecurrentGemma (architectures ["RecurrentGemmaForCausalLM"]) - the
     // Griffin/Hawk recurrent+local-attention hybrid built on the new
     // TNNetRGLRU. Causal-LM contract like the other decoder families. See the
     // RECURRENT GEMMA IMPORT section.
     Result := BuildRecurrentGemmaFromSafeTensorsEx(WeightsPath,
-      IgnoredRecGemmaConfig, pSeqLen, pInferenceOnly, ConfigPath,
+      IgnoredRecGemmaConfig, pSeqLen, pTrainable, ConfigPath,
       pQuantizeInt8)
   else if ModelType = 'jamba' then
     // The first HYBRID route: Jamba (architectures ["JambaForCausalLM"]) -
@@ -60922,7 +60922,7 @@ begin
     // top-k MoE FFNs on the config schedule. NoPE, RMSNorm, GQA. Causal-LM
     // contract like the other decoder families. See the JAMBA IMPORT section.
     Result := BuildJambaFromSafeTensorsEx(WeightsPath, IgnoredJambaConfig,
-      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if ModelType = 'nemotron_h' then
     // The second HYBRID route: Nemotron-H (architectures
     // ["NemotronHForCausalLM"]) - the multi-head TNNetMamba2 SSD mixer, full
@@ -60931,7 +60931,7 @@ begin
     // contract like the other decoder families. See the NEMOTRON-H IMPORT
     // section.
     Result := BuildNemotronHFromSafeTensorsEx(WeightsPath,
-      IgnoredNemotronHConfig, pSeqLen, pInferenceOnly, ConfigPath,
+      IgnoredNemotronHConfig, pSeqLen, pTrainable, ConfigPath,
       pQuantizeInt8)
   else if ModelType = 'bloom' then
     // The ALiBi route: BLOOM (architectures ["BloomForCausalLM"]), no
@@ -60939,7 +60939,7 @@ begin
     // (TNNetALiBiAttention). Causal-LM contract like the other decoder
     // families. See the BLOOM IMPORT section.
     Result := BuildBloomFromSafeTensorsEx(WeightsPath, IgnoredBloomConfig,
-      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if (ModelType = 'falcon') or (ModelType = 'RefinedWebModel') or
           (ModelType = 'RefinedWeb') then
     // Falcon (architectures ["FalconForCausalLM"]; the original tiiuae
@@ -60949,7 +60949,7 @@ begin
     // ln_attn/ln_mlp) LayerNorms. Causal-LM contract like the other decoder
     // families. See the FALCON IMPORT section.
     Result := BuildFalconFromSafeTensorsEx(WeightsPath, IgnoredFalconConfig,
-      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if ModelType = 'modernbert' then
     // The second ENCODER route: ModernBERT (architectures
     // ["ModernBertModel"]; head-bearing exports load their base weights
@@ -60957,7 +60957,7 @@ begin
     // token-type channel, unlike the bert family), output (SeqLen,1,hidden)
     // final hidden states. See the MODERNBERT IMPORT section.
     Result := BuildModernBertFromSafeTensorsEx(WeightsPath,
-      IgnoredModernBertConfig, pSeqLen, pInferenceOnly, ConfigPath,
+      IgnoredModernBertConfig, pSeqLen, pTrainable, ConfigPath,
       pQuantizeInt8)
   else if ModelType = 'deberta-v2' then
     // The third ENCODER route: DeBERTa-v2/v3 (architectures
@@ -60969,7 +60969,7 @@ begin
     // call BuildDebertaV2FromSafeTensorsEx with pSeqClsHead=true for it. See
     // the DEBERTA-V2 IMPORT section.
     Result := BuildDebertaV2FromSafeTensorsEx(WeightsPath,
-      IgnoredDebertaV2Config, pSeqLen, pInferenceOnly, ConfigPath)
+      IgnoredDebertaV2Config, pSeqLen, pTrainable, ConfigPath)
   else if ModelType = 'deepseek_v2' then
     // DeepSeek-V2 (architectures ["DeepseekV2ForCausalLM"];
     // DeepSeek-V2-Lite is the reference checkpoint): Multi-head Latent
@@ -60980,7 +60980,7 @@ begin
     // full-V2 variants (q_lora_rank, YaRN-with-mscale rope_scaling,
     // group_limited_greedy).
     Result := BuildDeepSeekV2FromSafeTensorsEx(WeightsPath,
-      IgnoredDeepSeekV2Config, pSeqLen, pInferenceOnly, ConfigPath,
+      IgnoredDeepSeekV2Config, pSeqLen, pTrainable, ConfigPath,
       pQuantizeInt8)
   else if ModelType = 't5' then
   begin
@@ -61072,7 +61072,7 @@ begin
     if pSeqLen > 0 then Wav2Vec2Samples := pSeqLen
     else Wav2Vec2Samples := 16000;
     Result := BuildWav2Vec2FromSafeTensorsEx(WeightsPath,
-      IgnoredWav2Vec2Config, Wav2Vec2Samples, pInferenceOnly, ConfigPath);
+      IgnoredWav2Vec2Config, Wav2Vec2Samples, pTrainable, ConfigPath);
   end
   else if ModelType = 'clip' then
   begin
@@ -61216,7 +61216,7 @@ end;
 
 function AddDiTBlock(NN: TNNet; XInput, CondLayer: TNNetLayer;
   const Config: TDiTConfig; var Block: TDiTBlockLayers;
-  pInferenceOnly: boolean): TNNetLayer;
+  pTrainable: boolean): TNNetLayer;
 var
   d, MlpHidden: integer;
   SiluC, LN1, Mod1, FiLM1, Attn, Gate1Slice, Gated1, Res1: TNNetLayer;
@@ -61227,16 +61227,16 @@ begin
   // adaLN_modulation: Linear(SiLU(c)) -> 6*hidden.
   SiluC := NN.AddLayerAfter(TNNetSiLU.Create(), CondLayer);
   Block.AdaLN := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(6 * d).SetInferenceOnly(pInferenceOnly), SiluC);
+    TNNetPointwiseConvLinear.Create(6 * d).SetTrainable(pTrainable), SiluC);
   // chunk layout: [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
   // gate_mlp] each of width d (matches DiT's chunk(6) order).
   // ---- attention sub-block ----
   LN1 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), XInput);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), XInput);
   Mod1 := DiTModCond(NN, Block.AdaLN, {scale}1 * d, {shift}0 * d, d);
   FiLM1 := NN.AddLayer( TNNetFiLM.Create([LN1, Mod1]) );
   Block.QKV := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(3 * d).SetInferenceOnly(pInferenceOnly), FiLM1);
+    TNNetPointwiseConvLinear.Create(3 * d).SetTrainable(pTrainable), FiLM1);
   Block.AttnProj := NN.AddMultiHeadSelfAttention(Config.NumHeads,
     {CausalMask=}false);
   Attn := NN.GetLastLayer();
@@ -61248,13 +61248,13 @@ begin
   Res1 := NN.AddLayer( TNNetSum.Create([Gated1, XInput]) );
   // ---- MLP sub-block ----
   LN2 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), Res1);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), Res1);
   Mod2 := DiTModCond(NN, Block.AdaLN, {scale}4 * d, {shift}3 * d, d);
   FiLM2 := NN.AddLayer( TNNetFiLM.Create([LN2, Mod2]) );
   Block.Fc1 := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(MlpHidden).SetInferenceOnly(pInferenceOnly), FiLM2);
+    TNNetPointwiseConvLinear.Create(MlpHidden).SetTrainable(pTrainable), FiLM2);
   NN.AddLayer( TNNetGELU.Create() ); // DiT gelu_tanh
-  Block.Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly) );
+  Block.Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
   FfOut := NN.GetLastLayer();
   // gate_mlp (channels [5d..6d)).
   Gate2Slice := NN.AddLayerAfter(
@@ -61262,7 +61262,7 @@ begin
   Gated2 := NN.AddLayer(
     TNNetChannelMulByLayer.Create(FfOut, Gate2Slice) );
   Result := NN.AddLayer( TNNetSum.Create([Gated2, Res1]) );
-  if pInferenceOnly then NN.SetInferenceOnly();
+  if not pTrainable then NN.SetTrainable();
 end;
 
 // Transposes the patch sub-axes of the final-linear output neurons: the
@@ -61307,7 +61307,7 @@ begin
 end;
 
 function BuildDiT(Reader: TNNetSafeTensorsReader; const Config: TDiTConfig;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   LatentInput, TInput, YInput, PatchConv, PosEmb: TNNetLayer;
@@ -61344,50 +61344,50 @@ begin
     // x_embedder: biased patch conv -> (Grid,Grid,d) -> tokens (NumPatches,1,d)
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
       d, Config.PatchSize, {pInputPadding=}0, {pStride=}Config.PatchSize,
-      {pSuppressBias=}0).SetInferenceOnly(pInferenceOnly) );
+      {pSuppressBias=}0).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
     // + fixed 2-D sin-cos position embedding (loaded into a learned table).
     PosEmb := NN.AddLayer(
-      TNNetLearnedPositionalEmbedding.Create(NumPatches).SetInferenceOnly(pInferenceOnly) );
+      TNNetLearnedPositionalEmbedding.Create(NumPatches).SetTrainable(pTrainable) );
     XLayer := PosEmb;
 
     // input1: scalar timestep t -> t_embedder MLP.
     TInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
     TSin := NN.AddLayer( TNNetSinusoidalTimeEmbedding.Create(d) );
-    TFc0 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly) );
+    TFc0 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
     TSilu := NN.AddLayer( TNNetSiLU.Create() );
-    TFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly) );
+    TFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
     // input2: class id -> label embedding table.
     YInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
     YEmb := NN.AddLayer( TNNetEmbedding.Create(Config.NumClasses, d,
-      {EncodeZero=}1, {ScaleEmbedding=}1.0).SetInferenceOnly(pInferenceOnly) );
+      {EncodeZero=}1, {ScaleEmbedding=}1.0).SetTrainable(pTrainable) );
     // conditioning vector c = t_emb + y_emb (1,1,d).
     CondSum := NN.AddLayer( TNNetSum.Create([TFc2, YEmb]) );
 
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
 
     // ---- DiT blocks ----
     SetLength(Blocks, Config.NumLayers);
     for BlockCnt := 0 to NumLayersM1 do
       XLayer := AddDiTBlock(NN, XLayer, CondSum, Config, Blocks[BlockCnt],
-        pInferenceOnly);
+        pTrainable);
 
     // ---- final layer: adaLN (shift,scale) + linear + unpatchify ----
     FinalSilu := NN.AddLayerAfter(TNNetSiLU.Create(), CondSum);
     FinalModLayer := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(2 * d).SetInferenceOnly(pInferenceOnly) ); // [shift, scale]
+      TNNetPointwiseConvLinear.Create(2 * d).SetTrainable(pTrainable) ); // [shift, scale]
     FinalLN := NN.AddLayerAfter(
-      TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), XLayer);
+      TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), XLayer);
     FinalMod := DiTModCond(NN, FinalModLayer, {scale}1 * d, {shift}0 * d, d);
     FinalFiLM := NN.AddLayer( TNNetFiLM.Create([FinalLN, FinalMod]) );
     FinalLin := NN.AddLayerAfter(
       TNNetPointwiseConvLinear.Create(
-        Config.PatchSize * Config.PatchSize * Config.OutChannels).SetInferenceOnly(pInferenceOnly), FinalFiLM);
+        Config.PatchSize * Config.PatchSize * Config.OutChannels).SetTrainable(pTrainable), FinalFiLM);
     // unpatchify: (NumPatches,1,p*p*out) -> (Grid,Grid,p*p*out) -> DepthToSpace
     NN.AddLayer( TNNetReshape.Create(Grid, Grid,
       Config.PatchSize * Config.PatchSize * Config.OutChannels) );
     NN.AddLayer( TNNetDepthToSpace.Create(Config.PatchSize) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     // patch conv (biased).
@@ -61481,20 +61481,20 @@ begin
 end;
 
 function BuildDiTFromSafeTensorsEx(const FileName: string;
-  const Config: TDiTConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TDiTConfig; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildDiT(Reader, Config, pInferenceOnly);
+    Result := BuildDiT(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildDiTFromSafeTensors(const FileName: string;
-  out Config: TDiTConfig; pInferenceOnly: boolean = false;
+  out Config: TDiTConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -61502,7 +61502,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadDiTConfigFromJSONFile(ConfigPath);
-  Result := BuildDiTFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildDiTFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // Returns the Nth TNNetInput layer (0-based) of Net.
@@ -61708,7 +61708,7 @@ type
 
 function AddVARBlock(NN: TNNet; XInput, CondLayer, ScaleIdLayer: TNNetLayer;
   const Config: TVARConfig; var Block: TVARBlockLayers;
-  pInferenceOnly: boolean): TNNetLayer;
+  pTrainable: boolean): TNNetLayer;
 var
   d, MlpHidden, i, AttnStart, LayersM1: integer;
   SiluC, LN1, Mod1, FiLM1, Attn, Gate1Slice, Gated1, Res1: TNNetLayer;
@@ -61720,14 +61720,14 @@ begin
   // adaLN_modulation: Linear(SiLU(c)) -> 6*d (shared per block, DiT layout).
   SiluC := NN.AddLayerAfter(TNNetSiLU.Create(), CondLayer);
   Block.AdaLN := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(6 * d).SetInferenceOnly(pInferenceOnly), SiluC);
+    TNNetPointwiseConvLinear.Create(6 * d).SetTrainable(pTrainable), SiluC);
   // ---- attention sub-block (scale-block-causal) ----
   LN1 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), XInput);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), XInput);
   Mod1 := DiTModCond(NN, Block.AdaLN, {scale}1 * d, {shift}0 * d, d);
   FiLM1 := NN.AddLayer( TNNetFiLM.Create([LN1, Mod1]) );
   Block.QKV := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(3 * d).SetInferenceOnly(pInferenceOnly), FiLM1);
+    TNNetPointwiseConvLinear.Create(3 * d).SetTrainable(pTrainable), FiLM1);
   AttnStart := NN.CountLayers();
   Block.AttnProj := NN.AddMultiHeadSelfAttention(Config.NumHeads,
     {CausalMask=}false, {UseRoPE=}false, avSDPA, 1, 0, 32, 128,
@@ -61749,23 +61749,23 @@ begin
   Res1 := NN.AddLayer( TNNetSum.Create([Gated1, XInput]) );
   // ---- FFN sub-block ----
   LN2 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), Res1);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), Res1);
   Mod2 := DiTModCond(NN, Block.AdaLN, {scale}4 * d, {shift}3 * d, d);
   FiLM2 := NN.AddLayer( TNNetFiLM.Create([LN2, Mod2]) );
   Block.Fc1 := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(MlpHidden).SetInferenceOnly(pInferenceOnly), FiLM2);
+    TNNetPointwiseConvLinear.Create(MlpHidden).SetTrainable(pTrainable), FiLM2);
   NN.AddLayer( TNNetGELU.Create() );
-  Block.Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly) );
+  Block.Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
   Gate2Slice := NN.AddLayerAfter(
     TNNetSplitChannels.Create(5 * d, d), Block.AdaLN);
   Gated2 := NN.AddLayer(
     TNNetChannelMulByLayer.Create(Block.Fc2, Gate2Slice) );
   Result := NN.AddLayer( TNNetSum.Create([Gated2, Res1]) );
-  if pInferenceOnly then NN.SetInferenceOnly();
+  if not pTrainable then NN.SetTrainable();
 end;
 
 function BuildVAR(Reader: TNNetSafeTensorsReader; const Config: TVARConfig;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   TokInput, ScaleInput, ClassInput: TNNetLayer;
@@ -61783,40 +61783,40 @@ begin
     // input0: token index sequence (SeqLen,1,1) -> word_embed table -> (SeqLen,1,d)
     TokInput := NN.AddLayer( TNNetInput.Create(Config.SeqLen, 1, 1) );
     WordEmb := NN.AddLayer( TNNetEmbedding.Create(Config.VocabSize, d,
-      {EncodeZero=}1, {ScaleEmbedding=}1.0).SetInferenceOnly(pInferenceOnly) );
+      {EncodeZero=}1, {ScaleEmbedding=}1.0).SetTrainable(pTrainable) );
     // input1: per-token scale id (SeqLen,1,1). Used BOTH for the level embedding
     // (lvl_embed table) AND the scale-block-causal attention mask side channel.
     ScaleInput := NN.AddLayer( TNNetInput.Create(Config.SeqLen, 1, 1) );
     LvlEmb := NN.AddLayer( TNNetEmbedding.Create(Config.NumScales, d,
-      {EncodeZero=}1, {ScaleEmbedding=}1.0).SetInferenceOnly(pInferenceOnly) );
+      {EncodeZero=}1, {ScaleEmbedding=}1.0).SetTrainable(pTrainable) );
     // x = word_embed + lvl_embed + pos_embed.
     XLayer := NN.AddLayer( TNNetSum.Create([WordEmb, LvlEmb]) );
     PosEmb := NN.AddLayer(
-      TNNetLearnedPositionalEmbedding.Create(Config.SeqLen).SetInferenceOnly(pInferenceOnly) );
+      TNNetLearnedPositionalEmbedding.Create(Config.SeqLen).SetTrainable(pTrainable) );
     XLayer := PosEmb;
     // input2: class id (1,1,1) -> class_emb -> conditioning vector c (1,1,d).
     ClassInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
     ClassEmb := NN.AddLayer( TNNetEmbedding.Create(Config.NumClasses, d,
-      {EncodeZero=}1, {ScaleEmbedding=}1.0).SetInferenceOnly(pInferenceOnly) );
+      {EncodeZero=}1, {ScaleEmbedding=}1.0).SetTrainable(pTrainable) );
     CondLayer := ClassEmb;
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
 
     SetLength(Blocks, Config.NumLayers);
     for BlockCnt := 0 to NumLayersM1 do
       XLayer := AddVARBlock(NN, XLayer, CondLayer, ScaleInput, Config,
-        Blocks[BlockCnt], pInferenceOnly);
+        Blocks[BlockCnt], pTrainable);
 
     // ---- final adaLN head -> per-token logits (SeqLen,1,VocabSize) ----
     FinalSilu := NN.AddLayerAfter(TNNetSiLU.Create(), CondLayer);
     FinalModLayer := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(2 * d).SetInferenceOnly(pInferenceOnly) ); // [shift, scale]
+      TNNetPointwiseConvLinear.Create(2 * d).SetTrainable(pTrainable) ); // [shift, scale]
     FinalLN := NN.AddLayerAfter(
-      TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), XLayer);
+      TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), XLayer);
     FinalMod := DiTModCond(NN, FinalModLayer, {scale}1 * d, {shift}0 * d, d);
     FinalFiLM := NN.AddLayer( TNNetFiLM.Create([FinalLN, FinalMod]) );
     HeadLin := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(Config.VocabSize).SetInferenceOnly(pInferenceOnly), FinalFiLM);
-    if pInferenceOnly then NN.SetInferenceOnly();
+      TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable), FinalFiLM);
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     LoadClipEmbeddingTable(Reader, WordEmb, 'word_embed.weight',
@@ -61854,20 +61854,20 @@ begin
 end;
 
 function BuildVARFromSafeTensorsEx(const FileName: string;
-  const Config: TVARConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TVARConfig; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildVAR(Reader, Config, pInferenceOnly);
+    Result := BuildVAR(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildVARFromSafeTensors(const FileName: string;
-  out Config: TVARConfig; pInferenceOnly: boolean = false;
+  out Config: TVARConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -61875,7 +61875,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadVARConfigFromJSONFile(ConfigPath);
-  Result := BuildVARFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildVARFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ============================ PixArt-alpha IMPORT ==========================
@@ -62051,7 +62051,7 @@ type
 
 function AddPixArtBlock(NN: TNNet; XInput, AdalnLayer, EncLayer: TNNetLayer;
   const Config: TPixArtConfig; var Block: TPixArtBlockLayers;
-  pInferenceOnly: boolean): TNNetLayer;
+  pTrainable: boolean): TNNetLayer;
 var
   d: integer;
   Mod6, LN1, FiLM1, SelfOut, Gate1Slice, Gated1, Res1: TNNetLayer;
@@ -62065,7 +62065,7 @@ begin
   // scale_mlp, gate_mlp], each width d.
   // ---- self-attention sub-block (adaLN-modulated) ----
   LN1 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), XInput);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), XInput);
   FiLM1 := NN.AddLayer( TNNetFiLM.Create(
     [LN1, DiTModCond(NN, Mod6, {scale}1 * d, {shift}0 * d, d)]) );
   SelfOut := AddPixArtAttention(NN, d, Config.NumHeads, FiLM1, FiLM1,
@@ -62079,20 +62079,20 @@ begin
   Res2 := NN.AddLayer( TNNetSum.Create([CrossOut, Res1]) );
   // ---- feed-forward sub-block (adaLN-modulated, GEGLU/erf) ----
   LN2 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), Res2);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), Res2);
   FiLM2 := NN.AddLayer( TNNetFiLM.Create(
     [LN2, DiTModCond(NN, Mod6, {scale}4 * d, {shift}3 * d, d)]) );
   // GEGLU: net.0.proj -> (2*mlp); split a|gate; a * erf_gelu(gate); net.2.
   Block.Ff0 := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(2 * Config.MlpHidden).SetInferenceOnly(pInferenceOnly), FiLM2);
+    TNNetPointwiseConvLinear.Create(2 * Config.MlpHidden).SetTrainable(pTrainable), FiLM2);
   Geglu := NN.AddLayer( TNNetGEGLUErf.Create() ); // erf-gelu gated linear unit
   Block.Ff2 := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly), Geglu);
+    TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), Geglu);
   FfOut := Block.Ff2;
   Gate2Slice := NN.AddLayerAfter(TNNetSplitChannels.Create(5 * d, d), Mod6);
   Gated2 := NN.AddLayer( TNNetChannelMulByLayer.Create(FfOut, Gate2Slice) );
   Result := NN.AddLayer( TNNetSum.Create([Gated2, Res2]) );
-  if pInferenceOnly then NN.SetInferenceOnly();
+  if not pTrainable then NN.SetTrainable();
 end;
 
 // Loads one PixArt attention's HF weights: to_q/to_k/to_v (each hidden->hidden,
@@ -62113,7 +62113,7 @@ begin
 end;
 
 function BuildPixArt(Reader: TNNetSafeTensorsReader;
-  const Config: TPixArtConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TPixArtConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   LatentInput, TInput, TextInput, PatchConv, PosEmb: TNNetLayer;
@@ -62149,9 +62149,9 @@ begin
     LatentInput := NN.AddLayer( TNNetInput.Create(
       Config.SampleSize, Config.SampleSize, Config.InChannels) );
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-      d, Config.PatchSize, 0, Config.PatchSize, {pSuppressBias=}0).SetInferenceOnly(pInferenceOnly) );
+      d, Config.PatchSize, 0, Config.PatchSize, {pSuppressBias=}0).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
-    PosEmb := NN.AddLayer( TNNetLearnedPositionalEmbedding.Create(NumPatches).SetInferenceOnly(pInferenceOnly) );
+    PosEmb := NN.AddLayer( TNNetLearnedPositionalEmbedding.Create(NumPatches).SetTrainable(pTrainable) );
     XLayer := PosEmb;
 
     // input1: scalar timestep t -> 256-d sinusoid -> TimestepEmbedder ->
@@ -62159,27 +62159,27 @@ begin
     TInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
     TSin := NN.AddLayerAfter(
       TNNetSinusoidalTimeEmbedding.Create(256), TInput );
-    TFc0 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly) );
+    TFc0 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
     TSilu0 := NN.AddLayer( TNNetSiLU.Create() );
-    TFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly) ); // embedded_timestep
+    TFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) ); // embedded_timestep
     AdalnSilu := NN.AddLayerAfter( TNNetSiLU.Create(), TFc2 );
-    AdalnLin := NN.AddLayer( TNNetPointwiseConvLinear.Create(6 * d).SetInferenceOnly(pInferenceOnly) ); // shared adaln
+    AdalnLin := NN.AddLayer( TNNetPointwiseConvLinear.Create(6 * d).SetTrainable(pTrainable) ); // shared adaln
 
     // input2: T5 encoder states -> caption_projection (Linear->gelu_tanh->Linear).
     TextInput := NN.AddLayer( TNNetInput.Create(
       Config.TextSeqLen, 1, Config.CaptionChannels) );
-    CapFc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly) );
+    CapFc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
     CapGelu := NN.AddLayer( TNNetGELU.Create() ); // gelu approximate='tanh'
-    CapFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly) );
+    CapFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
     EncLayer := CapFc2;
 
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
 
     // ---- transformer blocks ----
     SetLength(Blocks, Config.NumLayers);
     for BlockCnt := 0 to NumLayersM1 do
       XLayer := AddPixArtBlock(NN, XLayer, AdalnLin, EncLayer, Config,
-        Blocks[BlockCnt], pInferenceOnly);
+        Blocks[BlockCnt], pTrainable);
 
     // ---- final layer: (scale_shift_table[2,d] + embedded_timestep) ----
     // embedded_timestep is TFc2; build [shift|scale] = table + embedded_t via a
@@ -62189,18 +62189,18 @@ begin
       TNNetChannelBias.Create(),
       NN.AddLayer( TNNetDeepConcat.Create([TFc2, TFc2]) ) );
     FinalLN := NN.AddLayerAfter(
-      TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), XLayer);
+      TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), XLayer);
     // diffusers chunk order is [shift, scale]; DiTModCond reads scale at
     // ScaleStart, shift at ShiftStart.
     FinalFiLM := NN.AddLayer( TNNetFiLM.Create(
       [FinalLN, DiTModCond(NN, FinalScaleShift, {scale}1 * d, {shift}0 * d, d)]) );
     FinalLin := NN.AddLayerAfter(
       TNNetPointwiseConvLinear.Create(
-        Config.PatchSize * Config.PatchSize * Config.OutChannels).SetInferenceOnly(pInferenceOnly), FinalFiLM);
+        Config.PatchSize * Config.PatchSize * Config.OutChannels).SetTrainable(pTrainable), FinalFiLM);
     NN.AddLayer( TNNetReshape.Create(Grid, Grid,
       Config.PatchSize * Config.PatchSize * Config.OutChannels) );
     NN.AddLayer( TNNetDepthToSpace.Create(Config.PatchSize) );
-    if pInferenceOnly then NN.SetInferenceOnly();
+    if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
     // patch conv (biased): HF key 'pos_embed.proj.weight'.
@@ -62306,20 +62306,20 @@ begin
 end;
 
 function BuildPixArtFromSafeTensorsEx(const FileName: string;
-  const Config: TPixArtConfig; pInferenceOnly: boolean = false): TNNet;
+  const Config: TPixArtConfig; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildPixArt(Reader, Config, pInferenceOnly);
+    Result := BuildPixArt(Reader, Config, pTrainable);
   finally
     Reader.Free;
   end;
 end;
 
 function BuildPixArtFromSafeTensors(const FileName: string; TextSeqLen: integer;
-  out Config: TPixArtConfig; pInferenceOnly: boolean = false;
+  out Config: TPixArtConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -62327,7 +62327,7 @@ begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadPixArtConfigFromJSONFile(ConfigPath, TextSeqLen);
-  Result := BuildPixArtFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+  Result := BuildPixArtFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 function PixArtNthInput(Net: TNNet; N: integer): TNNetLayer;
@@ -62443,7 +62443,7 @@ end;
 
 procedure AddMMDiTJointBlock(NN: TNNet; ImgInput, TxtInput, CondInput: TNNetLayer;
   const Config: TMMDiTConfig; var Block: TMMDiTBlockLayers;
-  out ImgOutLayer, TxtOutLayer: TNNetLayer; pInferenceOnly: boolean);
+  out ImgOutLayer, TxtOutLayer: TNNetLayer; pTrainable: boolean);
 var
   d, Heads, dk, ImgLen, TxtLen, JointLen, HeadCnt, ci, HeadsM1, dkM1: integer;
   ImgSilu, TxtSilu: TNNetLayer;
@@ -62471,28 +62471,28 @@ begin
   // scale_mlp, gate_mlp] each width d.
   ImgSilu := NN.AddLayerAfter(TNNetSiLU.Create(), CondInput);
   Block.ImgAdaLN := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(6 * d).SetInferenceOnly(pInferenceOnly), ImgSilu);
+    TNNetPointwiseConvLinear.Create(6 * d).SetTrainable(pTrainable), ImgSilu);
   TxtSilu := NN.AddLayerAfter(TNNetSiLU.Create(), CondInput);
   Block.TxtAdaLN := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(6 * d).SetInferenceOnly(pInferenceOnly), TxtSilu);
+    TNNetPointwiseConvLinear.Create(6 * d).SetTrainable(pTrainable), TxtSilu);
 
   // ---- normed + modulated streams (msa branch) ----
   ImgLN1 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), ImgInput);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), ImgInput);
   ImgFiLM1 := NN.AddLayer( TNNetFiLM.Create(
     [ImgLN1, DiTModCond(NN, Block.ImgAdaLN, {scale}1 * d, {shift}0 * d, d)]) );
   TxtLN1 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), TxtInput);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), TxtInput);
   TxtFiLM1 := NN.AddLayer( TNNetFiLM.Create(
     [TxtLN1, DiTModCond(NN, Block.TxtAdaLN, {scale}1 * d, {shift}0 * d, d)]) );
 
   // ---- per-stream q/k/v projections ----
-  Block.ImgQ := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly), ImgFiLM1);
-  Block.ImgK := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly), ImgFiLM1);
-  Block.ImgV := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly), ImgFiLM1);
-  Block.TxtQ := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly), TxtFiLM1);
-  Block.TxtK := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly), TxtFiLM1);
-  Block.TxtV := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly), TxtFiLM1);
+  Block.ImgQ := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), ImgFiLM1);
+  Block.ImgK := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), ImgFiLM1);
+  Block.ImgV := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), ImgFiLM1);
+  Block.TxtQ := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), TxtFiLM1);
+  Block.TxtK := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), TxtFiLM1);
+  Block.TxtV := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), TxtFiLM1);
 
   // ---- JOINT attention: per head, concat [img;txt] on the SEQUENCE axis ----
   SetLength(HeadOutputs, Heads);
@@ -62528,8 +62528,8 @@ begin
   // ---- split the joint output back per stream on the SEQUENCE (X) axis ----
   ImgAttn := NN.AddLayerAfter(TNNetCrop.Create(0, 0, ImgLen, 1), JointOut);
   TxtAttn := NN.AddLayerAfter(TNNetCrop.Create(ImgLen, 0, TxtLen, 1), JointOut);
-  Block.ImgOut := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly), ImgAttn);
-  Block.TxtOut := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly), TxtAttn);
+  Block.ImgOut := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), ImgAttn);
+  Block.TxtOut := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), TxtAttn);
 
   // ---- gated residual (gate_msa is the THIRD adaLN chunk, slice 2*d..3*d) ----
   ImgGate1 := NN.AddLayerAfter(TNNetSplitChannels.Create(2 * d, d), Block.ImgAdaLN);
@@ -62541,32 +62541,32 @@ begin
 
   // ---- per-stream MLP (mlp branch: scale_mlp slice 4*d, shift_mlp slice 3*d) ----
   ImgLN2 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), ImgRes1);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), ImgRes1);
   ImgFiLM2 := NN.AddLayer( TNNetFiLM.Create(
     [ImgLN2, DiTModCond(NN, Block.ImgAdaLN, {scale}4 * d, {shift}3 * d, d)]) );
   Block.ImgFf0 := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(Config.MlpHidden).SetInferenceOnly(pInferenceOnly), ImgFiLM2);
+    TNNetPointwiseConvLinear.Create(Config.MlpHidden).SetTrainable(pTrainable), ImgFiLM2);
   NN.AddLayer( TNNetGELU.Create() ); // gelu approximate='tanh'
-  Block.ImgFf2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly) );
+  Block.ImgFf2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
   ImgFf := Block.ImgFf2;
   ImgGate2 := NN.AddLayerAfter(TNNetSplitChannels.Create(5 * d, d), Block.ImgAdaLN);
   ImgGated2 := NN.AddLayer( TNNetChannelMulByLayer.Create(ImgFf, ImgGate2) );
   ImgOutLayer := NN.AddLayer( TNNetSum.Create([ImgGated2, ImgRes1]) );
 
   TxtLN2 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly), TxtRes1);
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), TxtRes1);
   TxtFiLM2 := NN.AddLayer( TNNetFiLM.Create(
     [TxtLN2, DiTModCond(NN, Block.TxtAdaLN, {scale}4 * d, {shift}3 * d, d)]) );
   Block.TxtFf0 := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(Config.MlpHidden).SetInferenceOnly(pInferenceOnly), TxtFiLM2);
+    TNNetPointwiseConvLinear.Create(Config.MlpHidden).SetTrainable(pTrainable), TxtFiLM2);
   NN.AddLayer( TNNetGELU.Create() );
-  Block.TxtFf2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetInferenceOnly(pInferenceOnly) );
+  Block.TxtFf2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
   TxtFf := Block.TxtFf2;
   TxtGate2 := NN.AddLayerAfter(TNNetSplitChannels.Create(5 * d, d), Block.TxtAdaLN);
   TxtGated2 := NN.AddLayer( TNNetChannelMulByLayer.Create(TxtFf, TxtGate2) );
   TxtOutLayer := NN.AddLayer( TNNetSum.Create([TxtGated2, TxtRes1]) );
 
-  if pInferenceOnly then NN.SetInferenceOnly();
+  if not pTrainable then NN.SetTrainable();
 end;
 
 procedure LoadMMDiTJointBlock(Reader: TNNetSafeTensorsReader;
@@ -62624,7 +62624,7 @@ end;
 function BuildMMDiTBlock(Reader: TNNetSafeTensorsReader;
   const Config: TMMDiTConfig; const Prefix: string;
   out ImgOutLayer, TxtOutLayer: TNNetLayer;
-  pInferenceOnly: boolean): TNNet;
+  pTrainable: boolean): TNNet;
 var
   NN: TNNet;
   ImgInput, TxtInput, CondInput: TNNetLayer;
@@ -62639,7 +62639,7 @@ begin
     TxtInput := NN.AddLayer( TNNetInput.Create(Config.TxtLen, 1, Config.HiddenSize) );
     CondInput := NN.AddLayer( TNNetInput.Create(1, 1, Config.HiddenSize) );
     AddMMDiTJointBlock(NN, ImgInput, TxtInput, CondInput, Config, Block,
-      ImgOutLayer, TxtOutLayer, pInferenceOnly);
+      ImgOutLayer, TxtOutLayer, pTrainable);
     LoadMMDiTJointBlock(Reader, Block, Prefix, Config);
     Result := NN;
   except
@@ -62651,14 +62651,14 @@ end;
 function BuildMMDiTBlockFromSafeTensors(const FileName: string;
   const Config: TMMDiTConfig; const Prefix: string;
   out ImgOutLayer, TxtOutLayer: TNNetLayer;
-  pInferenceOnly: boolean): TNNet;
+  pTrainable: boolean): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
     Result := BuildMMDiTBlock(Reader, Config, Prefix, ImgOutLayer, TxtOutLayer,
-      pInferenceOnly);
+      pTrainable);
   finally
     Reader.Free;
   end;
@@ -62884,7 +62884,7 @@ begin
 end;
 
 function BuildVideoMAEFromSafeTensorsWithConfig(const FileName: string;
-  var Config: TVideoMAEConfig; pInferenceOnly: boolean = false): TNNet;
+  var Config: TVideoMAEConfig; pTrainable: boolean = true): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -62953,22 +62953,22 @@ begin
       // (W'*H'*T', 1, hidden) in native (h, w, t) order (token (h*W'+w)*T'+t).
       NN.AddLayer( TNNetReshape.Create(NumTokens, 1, Config.HiddenSize) );
       PosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(NumTokens).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetLearnedPositionalEmbedding.Create(NumTokens).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
 
       SetLength(Blocks, Config.NumLayers);
       for BlockCnt := 0 to NumLayersM1 do
         AddClipEncoderBlock(NN, Tower, {CausalMask=}false,
-          Blocks[BlockCnt], pInferenceOnly);
+          Blocks[BlockCnt], pTrainable);
 
       // Mean-pool over all tokens -> (1,1,hidden). TNNetAvgChannel averages
       // the SizeX*SizeY=NumTokens cells per hidden channel (SizeY=1).
       NN.AddLayer( TNNetAvgChannel.Create() );
       FcNorm := NN.AddLayer(
-        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetInferenceOnly(pInferenceOnly) );
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
       Classifier := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.NumLabels).SetInferenceOnly(pInferenceOnly) );
-      if pInferenceOnly then NN.SetInferenceOnly();
+        TNNetPointwiseConvLinear.Create(Config.NumLabels).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
 
       // ---------------- Weights ----------------
       LoadVideoMAETubeletConv(Reader, TubeletConv,
@@ -63020,7 +63020,7 @@ begin
 end;
 
 function BuildVideoMAEFromSafeTensorsEx(const FileName: string;
-  out Config: TVideoMAEConfig; pInferenceOnly: boolean = false;
+  out Config: TVideoMAEConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
@@ -63029,16 +63029,16 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadVideoMAEConfigFromJSONFile(ConfigPath);
   Result := BuildVideoMAEFromSafeTensorsWithConfig(FileName, Config,
-    pInferenceOnly);
+    pTrainable);
 end;
 
 function BuildVideoMAEFromSafeTensors(const FileName: string;
-  pInferenceOnly: boolean = false): TNNet;
+  pTrainable: boolean = true): TNNet;
 var
   IgnoredConfig: TVideoMAEConfig;
 begin
   Result := BuildVideoMAEFromSafeTensorsEx(FileName, IgnoredConfig,
-    pInferenceOnly);
+    pTrainable);
 end;
 
 procedure RunVideoMAELogits(Net: TNNet; ClipInput, Logits: TNNetVolume);

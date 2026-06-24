@@ -192,7 +192,7 @@ begin
   SeqLen := Length(PromptIds);
   // Build the text tower sized to the prompt length.
   BuildCLIPSegFromSafeTensors(STPath, VisionNet, TextNet, DecoderNet, Config,
-    {TextSeqLen=}SeqLen, {pInferenceOnly=}true, CfgPath);
+    {TextSeqLen=}SeqLen, {pTrainable=}false, CfgPath);
   Image := TNNetVolume.Create(Config.ImageSize, Config.ImageSize,
     Config.NumChannels);
   TokenIds := TNNetVolume.Create(SeqLen, 1, 1);

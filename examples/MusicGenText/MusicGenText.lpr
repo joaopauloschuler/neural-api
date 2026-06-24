@@ -300,7 +300,7 @@ begin
     // ---- 1. Build the T5 text encoder and run it on the prompt ids. --------
     TickStart := GetTickCount64;
     BuildT5FromSafeTensors(T5Safe, T5Enc, T5Dec, T5Cfg, EncSeq, 1,
-      {pInferenceOnly=}true, T5CfgPath);
+      {pTrainable=}false, T5CfgPath);
     WriteLn('[time] T5 model load (', T5Safe, '): ', Elapsed(TickStart));
     WriteLn('T5 text encoder: ', T5ConfigToString(T5Cfg));
     if ShowSummary then
@@ -343,7 +343,7 @@ begin
     DecSeq := NumFrames + Config.NumCodebooks - 1 + 1;
     TickStart := GetTickCount64;
     Model := BuildMusicGenFromSafeTensors(MgSafe, Config, EncSeq, DecSeq,
-      {pInferenceOnly=}true, MgCfg);
+      {pTrainable=}false, MgCfg);
     WriteLn('[time] MusicGen decoder load (', MgSafe, '): ', Elapsed(TickStart));
     WriteLn(MusicGenConfigToString(Config));
     if ShowSummary then

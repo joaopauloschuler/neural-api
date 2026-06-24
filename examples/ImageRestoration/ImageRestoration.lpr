@@ -171,7 +171,7 @@ begin
   end;
 
   NN := BuildNAFNetFromSafeTensors(STPath, Config,
-    {pInferenceOnly=}true, CfgPath);
+    {pTrainable=}false, CfgPath);
   try
     WriteLn(NAFNetConfigToString(Config));
     Clean := TNNetVolume.Create(Config.InputSize, Config.InputSize,

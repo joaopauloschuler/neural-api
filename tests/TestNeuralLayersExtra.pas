@@ -73,6 +73,9 @@ type
     procedure TestDenseNetBlock;
     procedure TestMobileNetBlock;
 
+    // Inference-only error-buffer skipping (SetOutputErrorSize gate)
+    procedure TestInferenceOnlySkipsErrorBuffers;
+
     // Normalization builders (use TNNetInstanceNorm internally)
     procedure TestAddAutoGroupedPointwiseConvUsesInstanceNorm;
     procedure TestAddAutoGroupedPointwiseConv2UsesInstanceNorm;
@@ -1295,6 +1298,114 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+// Builds a probe network exercising a diverse set of error-buffer allocation
+// paths. When pTrainable is False, every layer is chained with SetTrainable so
+// SetPrevLayer sees the inference-only gate at build time. RandSeed is fixed so
+// weights are deterministic. The net deliberately exercises:
+//  - a dual-branch forward activation (TNNetSwish) that caches its derivative
+//    into FOutputErrorDeriv only when trainable;
+//  - a DeepConcat over two pointwise convs (the exact int8+RWKV heap-corruption
+//    shape that motivated sizing concat depth from FOutput, not FOutputError);
+//  - weighted (conv/fullconnect), pooling and normalization allocation paths.
+function BuildInferenceProbeNet(pTrainable: boolean): TNNet;
+  function T(L: TNNetLayer): TNNetLayer;
+  begin
+    // Inference-only but NOT low-memory: keeps the weight caches intact so the
+    // forward path is unchanged, isolating the error-buffer skip we test here.
+    if not pTrainable then L.SetTrainable({pTrainable=}False, {pLowMemory=}False);
+    Result := L;
+  end;
+var
+  Parent, B1, B2: TNNetLayer;
+begin
+  RandSeed := 424242;
+  Result := TNNet.Create();
+  Result.AddLayer(T(TNNetInput.Create(8, 8, 4)));
+  Result.AddLayer(T(TNNetConvolutionReLU.Create(8, 3, 1, 1)));
+  Result.AddLayer(T(TNNetSwish.Create()));
+  Result.AddLayer(T(TNNetMaxPool.Create(2)));
+  Parent := Result.AddLayer(T(TNNetMovingStdNormalization.Create()));
+  B1 := Result.AddLayerAfter(T(TNNetPointwiseConvLinear.Create(6)), Parent);
+  B2 := Result.AddLayerAfter(T(TNNetPointwiseConvReLU.Create(6)), Parent);
+  Result.AddLayer(T(TNNetDeepConcat.Create([B1, B2])));
+  Result.AddLayer(T(TNNetFullConnectReLU.Create(10)));
+  Result.AddLayer(T(TNNetFullConnectLinear.Create(4)));
+end;
+
+procedure TTestNeuralLayersExtra.TestInferenceOnlySkipsErrorBuffers;
+var
+  NN, NNShrunk, NNInferBuilt: TNNet;
+  Input, OutTrain, OutInfer: TNNetVolume;
+  i: integer;
+begin
+  // Part A -- correctness: build two identical trainable nets (so weight caches
+  // are populated), shrink one to inference-only, then compute each net ONCE on
+  // the same input. The forward output must match -- the guard against
+  // DeepConcat-class shape corruption -- and the shrunk net's error buffers must
+  // each collapse to a single float. Both nets are computed exactly once from a
+  // fresh state so the stateful normalization layer (TNNetMovingStdNormalization)
+  // is in the same state for both. The comparison uses a 1e-4 tolerance, not 0,
+  // because TNNetSwish is a dual-branch activation: with error buffers it caches
+  // the derivative (if-branch) and without them it skips it (else-branch), and
+  // the two branches compute the output via numerically-equivalent-but-not-
+  // identical single-precision expressions (~2.4e-7 here). That tolerance is
+  // still ~1000x tighter than any corruption signal (garbage/NaN). (A from-scratch
+  // inference forward of weighted layers is a separate, pre-existing weight-cache
+  // concern -- real nets load weights first -- so correctness is asserted via the
+  // post-build shrink, the same approach as TestSetTrainableKeepsOutputs.)
+  NN := BuildInferenceProbeNet(True);
+  NNShrunk := BuildInferenceProbeNet(True);
+  NNShrunk.SetTrainable({pTrainable=}False, {pLowMemory=}False);
+  Input := TNNetVolume.Create(8, 8, 4);
+  OutTrain := TNNetVolume.Create();
+  OutInfer := TNNetVolume.Create();
+  try
+    Input.RandomizeGaussian();
+    NN.Compute(Input);
+    NN.GetOutput(OutTrain);
+    NNShrunk.Compute(Input);
+    NNShrunk.GetOutput(OutInfer);
+
+    // DeepConcat depth must come from FOutput (6+6), not a collapsed error buffer.
+    AssertEquals('DeepConcat output depth', 12,
+      NN.Layers[NN.Layers.Count - 3].Output.Depth);
+    AssertTrue('trainable keeps error buffer',
+      NN.GetLastLayer.OutputError.Size > 1);
+
+    AssertEquals('output size', OutTrain.Size, OutInfer.Size);
+    for i := 0 to OutTrain.Size - 1 do
+      AssertEquals('forward unchanged after shrink, logit ' + IntToStr(i),
+        OutTrain.FData[i], OutInfer.FData[i], 1e-4);
+    for i := 1 to NNShrunk.Layers.Count - 1 do
+    begin
+      AssertEquals('FOutputError shrunk on layer ' + IntToStr(i), 1,
+        NNShrunk.Layers[i].OutputError.Size);
+      AssertEquals('FOutputErrorDeriv shrunk on layer ' + IntToStr(i), 1,
+        NNShrunk.Layers[i].OutputErrorDeriv.Size);
+    end;
+  finally
+    OutInfer.Free;
+    OutTrain.Free;
+    Input.Free;
+    NNShrunk.Free;
+    NN.Free;
+  end;
+
+  // Part B -- build-time gating: building inference-only from the start must
+  // make SetPrevLayer skip the error-buffer allocation (the SetOutputErrorSize
+  // gate), so the buffers are already collapsed right after construction --
+  // before any post-build shrink. Asserted on buffer sizes directly (no
+  // forward, to stay clear of the weight-cache concern noted above).
+  NNInferBuilt := BuildInferenceProbeNet(False);
+  try
+    for i := 1 to NNInferBuilt.Layers.Count - 1 do
+      AssertEquals('build-time error buffer skipped on layer ' + IntToStr(i), 1,
+        NNInferBuilt.Layers[i].OutputError.Size);
+  finally
+    NNInferBuilt.Free;
   end;
 end;
 

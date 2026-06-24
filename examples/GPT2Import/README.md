@@ -133,9 +133,9 @@ with a second MXFP4-packed copy (`tiny_gpt_oss_mxfp4.*`) driving the MXFP4
 dequant-at-load path end-to-end in `TestGptOssMXFP4LogitParity`.
 
 **`gpt-oss-120b` is import-capable but RAM-gated** like the other large
-checkpoints: pass `pInferenceOnly=True` and a sharded checkpoint so peak memory
+checkpoints: pass `pTrainable=false` and a sharded checkpoint so peak memory
 stays near the quantized weight size. The 20B fits comfortably with
-`pInferenceOnly`; the 120B needs a large-memory host (the importer expands the
+`pTrainable=false`; the 120B needs a large-memory host (the importer expands the
 MXFP4 experts to FP32 at load — the same RAM caveat as the other multi-billion
 checkpoints documented above).
 
@@ -214,8 +214,8 @@ logits spanning down to −287 (relative ≈ 1e-6, plain f32 accumulation),
 agrees, and 16-step greedy generation from "The" is token-for-token
 identical to HF's. Gate: 1e-3.
 
-Both example programs pass `pInferenceOnly=True` to the importer, which
-calls `TNNet.SetInferenceOnly` while building: every neuron's
+Both example programs pass `pTrainable=false` to the importer, which
+calls `TNNet.SetTrainable` while building: every neuron's
 `Delta`/`BackInertia` training volumes are shrunk to one element, cutting
 weight memory to ~1/3. That is what lets the full 124M checkpoint run in
 ~2.3 GB peak RSS (it needed >3.8 GB before and OOM'd small machines); the

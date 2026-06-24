@@ -139,7 +139,7 @@ begin
     Halt(1);
   end;
 
-  NN := BuildRaftFromSafeTensors(fixturePath, Config, {pInferenceOnly=}True);
+  NN := BuildRaftFromSafeTensors(fixturePath, Config, {pTrainable=}True);
   WriteLn(RaftConfigToString(Config));
 
   Frame1 := TNNetVolume.Create;

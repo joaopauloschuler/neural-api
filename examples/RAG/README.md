@@ -77,7 +77,7 @@ cd ..
 ./RAG --embed-model ./minilm --gen-model /path/to/decoder --int8
 ```
 
-The decoder is always built `pInferenceOnly` and `--int8` (weight-only int8)
+The decoder is always built `pTrainable=false` and `--int8` (weight-only int8)
 is the default — pass `--fp32` for full precision (much more RAM). Keep
 `--ctx` modest (default 1024): the full-recompute decode allocates a
 `SeqLen×SeqLen` attention buffer per head per layer, so build memory grows

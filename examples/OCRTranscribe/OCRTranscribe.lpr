@@ -60,7 +60,7 @@ begin
 
   WriteLn('Loading ', CheckpointPath, ' ...');
   BuildTrOCRFromSafeTensors(CheckpointPath, EncoderNet, DecoderNet,
-    Config, {DecSeqLen=}20, {pInferenceOnly=}true, ConfigPath);
+    Config, {DecSeqLen=}20, {pTrainable=}false, ConfigPath);
   WriteLn(TrOCRConfigToString(Config));
   WriteLn;
 

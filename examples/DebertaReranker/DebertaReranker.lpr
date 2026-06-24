@@ -181,7 +181,7 @@ begin
 
   WriteLn('Loading DeBERTa-v3 reranker: ', ModelPath);
   NN := BuildDebertaV2FromSafeTensorsEx(ModelPath, Config, SeqLen,
-    {pInferenceOnly=}true, ConfigPath, {pSeqClsHead=}true);
+    {pTrainable=}false, ConfigPath, {pSeqClsHead=}true);
   WriteLn(DebertaV2ConfigToString(Config));
   WriteLn('Labels (output depth): ', NN.GetLastLayer().Output.Depth);
 

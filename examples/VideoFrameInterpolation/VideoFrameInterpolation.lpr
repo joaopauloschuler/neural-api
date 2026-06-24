@@ -153,7 +153,7 @@ begin
       '(random weights -- wiring SMOKE demo).');
   end;
 
-  NN := BuildRIFEFromSafeTensors(STPath, Config, {pInferenceOnly=}true, CfgPath);
+  NN := BuildRIFEFromSafeTensors(STPath, Config, {pTrainable=}false, CfgPath);
   try
     WriteLn(RIFEConfigToString(Config));
     S := Config.InputSize;

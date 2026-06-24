@@ -177,7 +177,7 @@ begin
       Config := ReadWav2Vec2ConfigFromJSONFile(
         ExtractFilePath(WeightsPath) + 'tiny_wav2vec2_config.json');
       NN := BuildWav2Vec2FromSafeTensorsWithConfig(WeightsPath, Config,
-        NumSamples, {pInferenceOnly=}true);
+        NumSamples, {pTrainable=}false);
       WriteLn('Built ', Wav2Vec2ConfigToString(Config));
       NN.Compute(Samples);
       NN.GetOutput(Logits);
@@ -229,7 +229,7 @@ begin
     LoadVocab(VocabPath);
     StartTicks := GetTickCount64;
     NN := BuildWav2Vec2FromSafeTensorsWithConfig(WeightsPath, Config,
-      NumSamples, {pInferenceOnly=}true);
+      NumSamples, {pTrainable=}false);
     WriteLn('Built ', NN.CountLayers, ' layers in ',
       (GetTickCount64 - StartTicks) div 1000, ' s');
 

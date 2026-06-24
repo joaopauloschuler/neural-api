@@ -148,7 +148,7 @@ begin
   // ---- build the two nets and load the weights ----
   StartTicks := GetTickCount64;
   BuildWhisperFromSafeTensorsWithConfig(WeightsPath, Config, Enc, Dec,
-    DecSeqLen, {pInferenceOnly=}true);
+    DecSeqLen, {pTrainable=}false);
   WriteLn('Built encoder (', Enc.CountLayers, ' layers) + decoder (',
     Dec.CountLayers, ' layers) in ',
     (GetTickCount64 - StartTicks) div 1000, ' s');

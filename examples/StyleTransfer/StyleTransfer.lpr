@@ -258,12 +258,12 @@ begin
   // net at relu5 (drops the AdaptiveAvgPool + FC classifier). All five per-stage
   // taps are still exposed via TapIdx and relu5 becomes the net's last layer, so
   // a manual Backpropagate() from the last layer carries every injected tap
-  // gradient back to the input. pInferenceOnly = false so OutputError buffers
+  // gradient back to the input. pTrainable = true so OutputError buffers
   // exist for backprop to the input pixels.
   if ConfigFile = '' then ConfigFile := ExtractFilePath(VGGFile) + 'config.json';
   Config := ReadVGGConfigFromJSONFile(ConfigFile);
   Config.FeatureTapStage := 5;
-  NN := BuildVGGFromSafeTensorsEx(VGGFile, Config, TapIdx, {pInferenceOnly=}false);
+  NN := BuildVGGFromSafeTensorsEx(VGGFile, Config, TapIdx, {pTrainable=}true);
   NN.EnableDropouts(false);
   // FREEZE the VGG: backprop must flow to the INPUT pixels only, never touch
   // the conv weights. SetBatchUpdate(true) makes Backpropagate ACCUMULATE weight

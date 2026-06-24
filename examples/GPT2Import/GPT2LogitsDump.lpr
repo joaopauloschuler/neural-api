@@ -63,7 +63,7 @@ begin
 
   // Dump-only tool: free training volumes during construction (~1/3 memory).
   NN := BuildGPT2FromSafeTensorsEx(ParamStr(1), Config, SeqLen, NumHeads,
-    {pInferenceOnly=}true);
+    {pTrainable=}false);
   try
     if SeqLen <= 0 then SeqLen := Config.NCtx;
     if Length(Prompt) > SeqLen then

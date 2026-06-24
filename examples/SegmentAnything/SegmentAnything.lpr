@@ -72,7 +72,7 @@ begin
   WriteLn('  checkpoint: ', Ckpt);
   WriteLn('  config    : ', ConfigPath);
 
-  NN := BuildSAMFromSafeTensors(Ckpt, Config, {pInferenceOnly=}true, ConfigPath);
+  NN := BuildSAMFromSafeTensors(Ckpt, Config, {pTrainable=}false, ConfigPath);
   Reader := TNNetSafeTensorsReader.Create(Ckpt);
   Img := TNNetVolume.Create();
   MaskLogits := TNNetVolume.Create();

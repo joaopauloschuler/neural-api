@@ -169,7 +169,7 @@ begin
   try
     WriteLn('Loading BART checkpoint from ', CheckpointDir, ' ...');
     BuildBartFromSafeTensors(ModelPath, Enc, Dec, Config,
-      EncSeqLen, DecSeqLen, {pInferenceOnly=}true, ConfigPath);
+      EncSeqLen, DecSeqLen, {pTrainable=}false, ConfigPath);
     WriteLn(BartConfigToString(Config));
     WriteLn('Encoder window ', EncSeqLen, ', decoder window ', DecSeqLen,
       ', beam ', BeamWidth, ', length penalty ',

@@ -127,7 +127,7 @@ begin
     WriteLn('=== Seq2Seq beam-decode + BLEU/ROUGE plumbing demo (OFFLINE) ===');
     WriteLn('Importing pico Marian fixture: ', ModelPath);
     BuildMarianFromSafeTensors(ModelPath, Enc, Dec, Config,
-      EncSeqLen, DecSeqLen, {pInferenceOnly=}true, ConfigPath);
+      EncSeqLen, DecSeqLen, {pTrainable=}false, ConfigPath);
     WriteLn(MarianConfigToString(Config));
     WriteLn('Encoder window ', EncSeqLen, ', decoder window ', DecSeqLen,
       ', beam ', BeamWidth, ', length penalty ',

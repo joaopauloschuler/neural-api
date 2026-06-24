@@ -67,7 +67,7 @@ begin
     IoFile := ExtractFilePath(ModelFile) + 'tiny_vqmodel_io.json';
 
   WriteLn('VQModelImport: loading ', ModelFile);
-  Vq := BuildVqModelFromSafeTensors(ModelFile, Config, {pInferenceOnly=}false,
+  Vq := BuildVqModelFromSafeTensors(ModelFile, Config, {pTrainable=}true,
     ConfigFile);
   try
     WriteLn(VqModelConfigToString(Config));

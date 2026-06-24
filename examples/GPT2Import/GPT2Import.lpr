@@ -239,7 +239,7 @@ begin
   // n_ctx, independent of the built input width) is indexed at the absolute
   // position via PositionOffset, so no wide input layer is ever needed.
   NN := BuildGPT2FromSafeTensorsEx(FileName, Config, {pSeqLen=}1, NumHeads,
-    {pInferenceOnly=}true);
+    {pTrainable=}false);
   try
     WriteLn(GPT2ConfigToString(Config));
     if SeqLen <= 0 then SeqLen := Config.NCtx;

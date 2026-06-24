@@ -68,4 +68,4 @@ prints the reordered relevance scores. `-int8` quantizes the reranker backbone.
 The pair/segment-id path is pinned against the HF float64
 `AutoModelForSequenceClassification` logit to **<1e-4** on a synthesized pico
 reranker (`tools/bert_reranker_tiny_fixture.py`, `TestRerankerPairLogitParity`).
-Always built `pInferenceOnly`; pure CPU.
+Always built `pTrainable=false`; pure CPU.

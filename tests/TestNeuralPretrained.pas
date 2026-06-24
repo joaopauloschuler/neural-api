@@ -138,7 +138,7 @@ type
     procedure TestShardedTorchBinMatchesSingleFile;
     procedure TestShardedTorchBinIndexErrors;
     procedure TestGPT2LogitParityFromShardedTorchBin;
-    procedure TestSetInferenceOnlyKeepsOutputs;
+    procedure TestSetTrainableKeepsOutputs;
     procedure TestInt8QuantizeRoundTripAndForward;
     procedure TestInt8QuantizedGPT2LogitDrift;
     procedure TestInt8QuantizedLlamaLogitDrift;
@@ -1818,7 +1818,7 @@ begin
   TmpPath := GetTempDir(false) + 'cai_llama_roundtrip_' +
     IntToStr(Random(1000000)) + '.safetensors';
   NN := BuildLlamaFromSafeTensorsEx(FixturePath('tiny_llama.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false, CfgPath);
+    Config, {SeqLen=}0, {pTrainable=}true, CfgPath);
   Input := TNNetVolume.Create;
   Out1 := TNNetVolume.Create;
   Out2 := TNNetVolume.Create;
@@ -1826,7 +1826,7 @@ begin
   try
     SaveLlamaToSafeTensors(NN, Config, TmpPath);
     NN2 := BuildLlamaFromSafeTensorsEx(TmpPath, Config2, {SeqLen=}0,
-      {pInferenceOnly=}false, CfgPath);
+      {pTrainable=}true, CfgPath);
 
     SeqLen := Config.MaxPositions;
     Vocab := Config.VocabSize;
@@ -1878,7 +1878,7 @@ begin
   TmpPath := GetTempDir(false) + 'cai_qwen3_roundtrip_' +
     IntToStr(Random(1000000)) + '.safetensors';
   NN := BuildQwen3FromSafeTensorsEx(FixturePath('tiny_qwen3.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false, CfgPath);
+    Config, {SeqLen=}0, {pTrainable=}true, CfgPath);
   Input := TNNetVolume.Create;
   Out1 := TNNetVolume.Create;
   Out2 := TNNetVolume.Create;
@@ -1887,7 +1887,7 @@ begin
     AssertTrue('qk_norm', Config.QKNorm);
     SaveQwen3ToSafeTensors(NN, Config, TmpPath);
     NN2 := BuildQwen3FromSafeTensorsEx(TmpPath, Config2, {SeqLen=}0,
-      {pInferenceOnly=}false, CfgPath);
+      {pTrainable=}true, CfgPath);
 
     SeqLen := Config.MaxPositions;
     Vocab := Config.VocabSize;
@@ -1941,7 +1941,7 @@ begin
   TmpPath := GetTempDir(false) + 'cai_bert_roundtrip_' +
     IntToStr(Random(1000000)) + '.safetensors';
   NN := BuildBertFromSafeTensorsEx(FixturePath('tiny_bert.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false, {pIncludePooler=}true, CfgPath);
+    Config, {SeqLen=}0, {pTrainable=}true, {pIncludePooler=}true, CfgPath);
   Input := TNNetVolume.Create;
   Out1 := TNNetVolume.Create;
   Out2 := TNNetVolume.Create;
@@ -1949,7 +1949,7 @@ begin
   try
     SaveBertToSafeTensors(NN, Config, TmpPath, {pIncludePooler=}true);
     NN2 := BuildBertFromSafeTensorsEx(TmpPath, Config2, {SeqLen=}0,
-      {pInferenceOnly=}false, {pIncludePooler=}true, CfgPath);
+      {pTrainable=}true, {pIncludePooler=}true, CfgPath);
 
     SeqLen := Config.MaxPositions - Config.PositionOffset;
     Vocab := Config.VocabSize;
@@ -2014,7 +2014,7 @@ begin
       IntToStr(Random(1000000)) + '.safetensors';
     NN := BuildGPTNeoXFromSafeTensorsEx(
       FixturePath('tiny_gptneox.safetensors'), Config, {SeqLen=}0,
-      {pInferenceOnly=}false, FixturePath(CfgName));
+      {pTrainable=}true, FixturePath(CfgName));
     Input := TNNetVolume.Create;
     Out1 := TNNetVolume.Create;
     Out2 := TNNetVolume.Create;
@@ -2022,7 +2022,7 @@ begin
     try
       SaveGPTNeoXToSafeTensors(NN, Config, TmpPath);
       NN2 := BuildGPTNeoXFromSafeTensorsEx(TmpPath, Config2, {SeqLen=}0,
-        {pInferenceOnly=}false, FixturePath(CfgName));
+        {pTrainable=}true, FixturePath(CfgName));
       SeqLen := Config.MaxPositions;
       Vocab := Config.VocabSize;
       Input.ReSize(SeqLen, 1, 1);
@@ -2070,7 +2070,7 @@ begin
     IntToStr(Random(1000000)) + '.safetensors';
   NN := BuildBloomFromSafeTensorsEx(
     FixturePath('tiny_bloom.safetensors'), Config, {SeqLen=}0,
-    {pInferenceOnly=}false, FixturePath('tiny_bloom_config.json'));
+    {pTrainable=}true, FixturePath('tiny_bloom_config.json'));
   Input := TNNetVolume.Create;
   Out1 := TNNetVolume.Create;
   Out2 := TNNetVolume.Create;
@@ -2078,7 +2078,7 @@ begin
   try
     SaveBloomToSafeTensors(NN, Config, TmpPath);
     NN2 := BuildBloomFromSafeTensorsEx(TmpPath, Config2, {SeqLen=}0,
-      {pInferenceOnly=}false, FixturePath('tiny_bloom_config.json'));
+      {pTrainable=}true, FixturePath('tiny_bloom_config.json'));
     SeqLen := Config.SeqLength;
     Vocab := Config.VocabSize;
     Input.ReSize(SeqLen, 1, 1);
@@ -2130,7 +2130,7 @@ begin
     IntToStr(Random(1000000)) + '.safetensors';
   NN := BuildMambaFromSafeTensorsEx(
     FixturePath('tiny_mamba.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}false, FixturePath('tiny_mamba_config.json'));
+    {pTrainable=}true, FixturePath('tiny_mamba_config.json'));
   Input := TNNetVolume.Create;
   Out1 := TNNetVolume.Create;
   Out2 := TNNetVolume.Create;
@@ -2138,7 +2138,7 @@ begin
   try
     SaveMambaToSafeTensors(NN, Config, TmpPath);
     NN2 := BuildMambaFromSafeTensorsEx(TmpPath, Config2, {SeqLen=}8,
-      {pInferenceOnly=}false, FixturePath('tiny_mamba_config.json'));
+      {pTrainable=}true, FixturePath('tiny_mamba_config.json'));
     SeqLen := 8;
     Vocab := Config.VocabSize;
     Input.ReSize(SeqLen, 1, 1);
@@ -2187,7 +2187,7 @@ begin
     IntToStr(Random(1000000)) + '.safetensors';
   NN := BuildRWKVFromSafeTensorsEx(
     FixturePath('tiny_rwkv.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}false, FixturePath('tiny_rwkv_config.json'));
+    {pTrainable=}true, FixturePath('tiny_rwkv_config.json'));
   Input := TNNetVolume.Create;
   Out1 := TNNetVolume.Create;
   Out2 := TNNetVolume.Create;
@@ -2195,7 +2195,7 @@ begin
   try
     SaveRWKVToSafeTensors(NN, Config, TmpPath);
     NN2 := BuildRWKVFromSafeTensorsEx(TmpPath, Config2, {SeqLen=}8,
-      {pInferenceOnly=}false, FixturePath('tiny_rwkv_config.json'));
+      {pTrainable=}true, FixturePath('tiny_rwkv_config.json'));
     SeqLen := 8;
     Vocab := Config.VocabSize;
     Input.ReSize(SeqLen, 1, 1);
@@ -2255,7 +2255,7 @@ begin
     TmpPath := GetTempDir(false) + 'cai_t5_roundtrip_' +
       IntToStr(Random(1000000)) + '.safetensors';
     BuildT5FromSafeTensors(StName, Enc, Dec, Config, EncSeqLen, DecSeqLen,
-      {pInferenceOnly=}false, CfgName);
+      {pTrainable=}true, CfgName);
     EncInput := TNNetVolume.Create;
     DecInput := TNNetVolume.Create;
     L1 := TNNetVolume.Create;
@@ -2264,7 +2264,7 @@ begin
     try
       SaveT5ToSafeTensors(Enc, Dec, Config, TmpPath);
       BuildT5FromSafeTensors(TmpPath, Enc2, Dec2, Config2, EncSeqLen,
-        DecSeqLen, {pInferenceOnly=}false, CfgName);
+        DecSeqLen, {pTrainable=}true, CfgName);
       Vocab := Config.VocabSize;
       EncInput.ReSize(EncSeqLen, 1, 1);
       DecInput.ReSize(DecSeqLen, 1, 1);
@@ -2314,7 +2314,7 @@ begin
   TmpPath := GetTempDir(false) + 'cai_marian_roundtrip_' +
     IntToStr(Random(1000000)) + '.safetensors';
   BuildMarianFromSafeTensors(FixturePath('tiny_marian.safetensors'),
-    Enc, Dec, Config, EncSeqLen, DecSeqLen, {pInferenceOnly=}false,
+    Enc, Dec, Config, EncSeqLen, DecSeqLen, {pTrainable=}true,
     FixturePath('tiny_marian_config.json'));
   EncInput := TNNetVolume.Create;
   DecInput := TNNetVolume.Create;
@@ -2324,7 +2324,7 @@ begin
   try
     SaveMarianToSafeTensors(Enc, Dec, Config, TmpPath);
     BuildMarianFromSafeTensors(TmpPath, Enc2, Dec2, Config2, EncSeqLen,
-      DecSeqLen, {pInferenceOnly=}false,
+      DecSeqLen, {pTrainable=}true,
       FixturePath('tiny_marian_config.json'));
     Vocab := Config.VocabSize;
     EncInput.ReSize(EncSeqLen, 1, 1);
@@ -2374,7 +2374,7 @@ begin
   TmpPath := GetTempDir(false) + 'cai_bart_roundtrip_' +
     IntToStr(Random(1000000)) + '.safetensors';
   BuildBartFromSafeTensors(FixturePath('tiny_bart.safetensors'),
-    Enc, Dec, Config, EncSeqLen, DecSeqLen, {pInferenceOnly=}false,
+    Enc, Dec, Config, EncSeqLen, DecSeqLen, {pTrainable=}true,
     FixturePath('tiny_bart_config.json'));
   EncInput := TNNetVolume.Create;
   DecInput := TNNetVolume.Create;
@@ -2384,7 +2384,7 @@ begin
   try
     SaveBartToSafeTensors(Enc, Dec, Config, TmpPath);
     BuildBartFromSafeTensors(TmpPath, Enc2, Dec2, Config2, EncSeqLen,
-      DecSeqLen, {pInferenceOnly=}false, FixturePath('tiny_bart_config.json'));
+      DecSeqLen, {pTrainable=}true, FixturePath('tiny_bart_config.json'));
     Vocab := Config.VocabSize;
     EncInput.ReSize(EncSeqLen, 1, 1);
     DecInput.ReSize(DecSeqLen, 1, 1);
@@ -2431,7 +2431,7 @@ begin
   TmpPath := GetTempDir(false) + 'cai_pegasus_roundtrip_' +
     IntToStr(Random(1000000)) + '.safetensors';
   BuildPegasusFromSafeTensors(FixturePath('tiny_pegasus.safetensors'),
-    Enc, Dec, Config, EncSeqLen, DecSeqLen, {pInferenceOnly=}false,
+    Enc, Dec, Config, EncSeqLen, DecSeqLen, {pTrainable=}true,
     FixturePath('tiny_pegasus_config.json'));
   EncInput := TNNetVolume.Create;
   DecInput := TNNetVolume.Create;
@@ -2441,7 +2441,7 @@ begin
   try
     SavePegasusToSafeTensors(Enc, Dec, Config, TmpPath);
     BuildPegasusFromSafeTensors(TmpPath, Enc2, Dec2, Config2, EncSeqLen,
-      DecSeqLen, {pInferenceOnly=}false,
+      DecSeqLen, {pTrainable=}true,
       FixturePath('tiny_pegasus_config.json'));
     Vocab := Config.VocabSize;
     EncInput.ReSize(EncSeqLen, 1, 1);
@@ -2488,7 +2488,7 @@ begin
   TmpPath := GetTempDir(false) + 'cai_mbart_roundtrip_' +
     IntToStr(Random(1000000)) + '.safetensors';
   BuildMBartFromSafeTensors(FixturePath('tiny_mbart.safetensors'),
-    Enc, Dec, Config, EncSeqLen, DecSeqLen, {pInferenceOnly=}false,
+    Enc, Dec, Config, EncSeqLen, DecSeqLen, {pTrainable=}true,
     FixturePath('tiny_mbart_config.json'));
   EncInput := TNNetVolume.Create;
   DecInput := TNNetVolume.Create;
@@ -2498,7 +2498,7 @@ begin
   try
     SaveMBartToSafeTensors(Enc, Dec, Config, TmpPath);
     BuildMBartFromSafeTensors(TmpPath, Enc2, Dec2, Config2, EncSeqLen,
-      DecSeqLen, {pInferenceOnly=}false,
+      DecSeqLen, {pTrainable=}true,
       FixturePath('tiny_mbart_config.json'));
     Vocab := Config.VocabSize;
     EncInput.ReSize(EncSeqLen, 1, 1);
@@ -2546,7 +2546,7 @@ begin
   TmpPath := GetTempDir(false) + 'cai_m2m100_roundtrip_' +
     IntToStr(Random(1000000)) + '.safetensors';
   BuildM2M100FromSafeTensors(FixturePath('tiny_m2m100.safetensors'),
-    Enc, Dec, Config, EncSeqLen, DecSeqLen, {pInferenceOnly=}false,
+    Enc, Dec, Config, EncSeqLen, DecSeqLen, {pTrainable=}true,
     FixturePath('tiny_m2m100_config.json'));
   EncInput := TNNetVolume.Create;
   DecInput := TNNetVolume.Create;
@@ -2556,7 +2556,7 @@ begin
   try
     SaveM2M100ToSafeTensors(Enc, Dec, Config, TmpPath);
     BuildM2M100FromSafeTensors(TmpPath, Enc2, Dec2, Config2, EncSeqLen,
-      DecSeqLen, {pInferenceOnly=}false,
+      DecSeqLen, {pTrainable=}true,
       FixturePath('tiny_m2m100_config.json'));
     Vocab := Config.VocabSize;
     EncInput.ReSize(EncSeqLen, 1, 1);
@@ -2721,7 +2721,7 @@ begin
     // ---------------- int8-quantized head ----------------
     RandSeed := 424242;
     QNN := BuildGPT2FromSafeTensorsEx(FixturePath('tiny_gpt2.safetensors'),
-      QConfig, {SeqLen=}0, {NumHeads=}2, {pInferenceOnly=}false,
+      QConfig, {SeqLen=}0, {NumHeads=}2, {pTrainable=}true,
       {pSeqClsHead=}false, {pExactGelu=}false, {pQuantizeInt8=}true);
     QNN.Compute(Input);
     QNN.GetOutput(QBaseline);
@@ -2999,11 +2999,11 @@ begin
   end;
 end;
 
-// SetInferenceOnly shrinks every neuron's Delta/BackInertia training
+// SetTrainable shrinks every neuron's Delta/BackInertia training
 // volumes; the forward pass must be bit-for-bit unaffected, whether the
-// shrink happens during construction (pInferenceOnly=True) or on an
-// already-built net (TNNet.SetInferenceOnly).
-procedure TTestNeuralPretrained.TestSetInferenceOnlyKeepsOutputs;
+// shrink happens during construction (pTrainable=True) or on an
+// already-built net (TNNet.SetTrainable).
+procedure TTestNeuralPretrained.TestSetTrainableKeepsOutputs;
 var
   NNTrain, NNInfer: TNNet;
   Config: TGPT2Config;
@@ -3013,7 +3013,7 @@ begin
   NNTrain := BuildGPT2FromSafeTensorsEx(FixturePath('tiny_gpt2.safetensors'),
     Config, {SeqLen=}0, {NumHeads=}2);
   NNInfer := BuildGPT2FromSafeTensorsEx(FixturePath('tiny_gpt2.safetensors'),
-    Config, {SeqLen=}0, {NumHeads=}2, {pInferenceOnly=}true);
+    Config, {SeqLen=}0, {NumHeads=}2, {pTrainable=}false);
   Input := TNNetVolume.Create(Config.NCtx, 1, 1);
   OutTrain := TNNetVolume.Create;
   OutInfer := TNNetVolume.Create;
@@ -3026,14 +3026,14 @@ begin
     NNInfer.GetOutput(OutInfer);
     AssertEquals('output size', OutTrain.Size, OutInfer.Size);
     for i := 0 to OutTrain.Size - 1 do
-      AssertEquals('pInferenceOnly logit ' + IntToStr(i),
+      AssertEquals('pTrainable logit ' + IntToStr(i),
         OutTrain.FData[i], OutInfer.FData[i], 0);
     // Shrinking a finished net must not change its outputs either.
-    NNTrain.SetInferenceOnly();
+    NNTrain.SetTrainable();
     NNTrain.Compute(Input);
     NNTrain.GetOutput(OutInfer);
     for i := 0 to OutTrain.Size - 1 do
-      AssertEquals('post-build SetInferenceOnly logit ' + IntToStr(i),
+      AssertEquals('post-build SetTrainable logit ' + IntToStr(i),
         OutTrain.FData[i], OutInfer.FData[i], 0);
     AssertEquals('delta volume shrunk', 1,
       NNTrain.Layers[1].Neurons[0].Delta.Size);
@@ -3181,7 +3181,7 @@ end;
 
 // Logit drift of the int8-quantized GPT-2 import vs the FP32 import on the
 // committed pico fixture. Builds the SAME checkpoint twice - FP32 and
-// pQuantizeInt8 (combined with pInferenceOnly, the intended deployment
+// pQuantizeInt8 (combined with pTrainable=false, the intended deployment
 // pairing) - and gates the max |logit diff| RELATIVE to the largest FP32
 // logit magnitude. Measured on tiny_gpt2: see the gate comment below.
 procedure TTestNeuralPretrained.TestInt8QuantizedGPT2LogitDrift;
@@ -3197,7 +3197,7 @@ begin
   NNFP32 := BuildGPT2FromSafeTensorsEx(FixturePath('tiny_gpt2.safetensors'),
     Config, {SeqLen=}0, {NumHeads=}2);
   NNQ := BuildGPT2FromSafeTensorsEx(FixturePath('tiny_gpt2.safetensors'),
-    Config, {SeqLen=}0, {NumHeads=}2, {pInferenceOnly=}true,
+    Config, {SeqLen=}0, {NumHeads=}2, {pTrainable=}false,
     {pSeqClsHead=}false, {pExactGelu=}false, {pQuantizeInt8=}true);
   Input := TNNetVolume.Create(Config.NCtx, 1, 1);
   OutF := TNNetVolume.Create;
@@ -3275,10 +3275,10 @@ var
 begin
   RandSeed := 424242;
   NNFP32 := BuildLlamaFromSafeTensorsEx(FixturePath('tiny_llama.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_llama_config.json'));
   NNQ := BuildLlamaFromSafeTensorsEx(FixturePath('tiny_llama.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}true,
+    Config, {SeqLen=}0, {pTrainable=}false,
     FixturePath('tiny_llama_config.json'), {pQuantizeInt8=}true);
   Input := TNNetVolume.Create(Config.MaxPositions, 1, 1);
   OutF := TNNetVolume.Create;
@@ -3471,7 +3471,7 @@ end;
 // Int8 drift gates for the importer families wired AFTER GPT-2/Llama (the
 // "thread pQuantizeInt8 through the remaining entry points" batch). Each
 // builds the SAME pico checkpoint twice - FP32, and pQuantizeInt8 combined
-// with pInferenceOnly (the intended deployment pairing) - and gates the
+// with pTrainable=false (the intended deployment pairing) - and gates the
 // output drift through AssertInt8DriftPair/Seq2Seq. The per-family
 // relative gates are pinned from measurements on the pico fixtures (see
 // the call sites); a REGRESSION past one means the family quantize or
@@ -3484,10 +3484,10 @@ begin
   RandSeed := 424242;
   NNFP32 := BuildGPTNeoFromSafeTensorsEx(
     FixturePath('tiny_gptneo.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}false, FixturePath('tiny_gptneo_config.json'));
+    {pTrainable=}true, FixturePath('tiny_gptneo_config.json'));
   NNQ := BuildGPTNeoFromSafeTensorsEx(
     FixturePath('tiny_gptneo.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}true, FixturePath('tiny_gptneo_config.json'),
+    {pTrainable=}false, FixturePath('tiny_gptneo_config.json'),
     {pQuantizeInt8=}true);
   try
     // 2 blocks x (qkv slab + out_proj + c_fc + c_proj) + LM head.
@@ -3509,10 +3509,10 @@ begin
   RandSeed := 424242;
   NNFP32 := BuildGPTNeoXFromSafeTensorsEx(
     FixturePath('tiny_gptneox.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}false, FixturePath('tiny_gptneox_config.json'));
+    {pTrainable=}true, FixturePath('tiny_gptneox_config.json'));
   NNQ := BuildGPTNeoXFromSafeTensorsEx(
     FixturePath('tiny_gptneox.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}true, FixturePath('tiny_gptneox_config.json'),
+    {pTrainable=}false, FixturePath('tiny_gptneox_config.json'),
     {pQuantizeInt8=}true);
   try
     // 2 blocks x (qkv + dense + h_to_4h + 4h_to_h) + untied embed_out.
@@ -3533,10 +3533,10 @@ begin
   RandSeed := 424242;
   NNFP32 := BuildGPTJFromSafeTensorsEx(
     FixturePath('tiny_gptj.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}false, FixturePath('tiny_gptj_config.json'));
+    {pTrainable=}true, FixturePath('tiny_gptj_config.json'));
   NNQ := BuildGPTJFromSafeTensorsEx(
     FixturePath('tiny_gptj.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}true, FixturePath('tiny_gptj_config.json'),
+    {pTrainable=}false, FixturePath('tiny_gptj_config.json'),
     {pQuantizeInt8=}true);
   try
     // 2 blocks x (qkv slab + out_proj + fc_in + fc_out) + biased lm_head.
@@ -3557,10 +3557,10 @@ begin
   RandSeed := 424242;
   NNFP32 := BuildPhiFromSafeTensorsEx(
     FixturePath('tiny_phi.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}false, FixturePath('tiny_phi_config.json'));
+    {pTrainable=}true, FixturePath('tiny_phi_config.json'));
   NNQ := BuildPhiFromSafeTensorsEx(
     FixturePath('tiny_phi.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}true, FixturePath('tiny_phi_config.json'),
+    {pTrainable=}false, FixturePath('tiny_phi_config.json'),
     {pQuantizeInt8=}true);
   try
     // 2 blocks x (qkv slab + dense + fc1 + fc2) + biased lm_head.
@@ -3581,11 +3581,11 @@ begin
   RandSeed := 424242;
   NNFP32 := BuildBertFromSafeTensorsEx(
     FixturePath('tiny_bert.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}false, {pIncludePooler=}false,
+    {pTrainable=}true, {pIncludePooler=}false,
     FixturePath('tiny_bert_config.json'));
   NNQ := BuildBertFromSafeTensorsEx(
     FixturePath('tiny_bert.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}true, {pIncludePooler=}false,
+    {pTrainable=}false, {pIncludePooler=}false,
     FixturePath('tiny_bert_config.json'), {pQuantizeInt8=}true);
   try
     // 2 blocks x (qkv + attn dense + intermediate + output) - the
@@ -3607,10 +3607,10 @@ begin
   RandSeed := 424242;
   NNFP32 := BuildBloomFromSafeTensorsEx(
     FixturePath('tiny_bloom.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}false, FixturePath('tiny_bloom_config.json'));
+    {pTrainable=}true, FixturePath('tiny_bloom_config.json'));
   NNQ := BuildBloomFromSafeTensorsEx(
     FixturePath('tiny_bloom.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}true, FixturePath('tiny_bloom_config.json'),
+    {pTrainable=}false, FixturePath('tiny_bloom_config.json'),
     {pQuantizeInt8=}true);
   try
     // 2 blocks x (qkv + dense + h_to_4h + 4h_to_h) + tied LM head.
@@ -3631,10 +3631,10 @@ begin
   RandSeed := 424242;
   NNFP32 := BuildRWKVFromSafeTensorsEx(
     FixturePath('tiny_rwkv.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}false, FixturePath('tiny_rwkv_config.json'));
+    {pTrainable=}true, FixturePath('tiny_rwkv_config.json'));
   NNQ := BuildRWKVFromSafeTensorsEx(
     FixturePath('tiny_rwkv.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}true, FixturePath('tiny_rwkv_config.json'),
+    {pTrainable=}false, FixturePath('tiny_rwkv_config.json'),
     {pQuantizeInt8=}true);
   try
     // 2 blocks x (attn k/v/r/output + ffn k/r/v = 7) + untied head.
@@ -3656,10 +3656,10 @@ begin
   RandSeed := 424242;
   NNFP32 := BuildMambaFromSafeTensorsEx(
     FixturePath('tiny_mamba.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}false, FixturePath('tiny_mamba_config.json'));
+    {pTrainable=}true, FixturePath('tiny_mamba_config.json'));
   NNQ := BuildMambaFromSafeTensorsEx(
     FixturePath('tiny_mamba.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}true, FixturePath('tiny_mamba_config.json'),
+    {pTrainable=}false, FixturePath('tiny_mamba_config.json'),
     {pQuantizeInt8=}true);
   try
     // 2 blocks x (in_proj + out_proj) + tied LM head (the scan/conv
@@ -3682,10 +3682,10 @@ begin
   RandSeed := 424242;
   NNFP32 := BuildModernBertFromSafeTensorsEx(
     FixturePath('tiny_modernbert.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}false, FixturePath('tiny_modernbert_config.json'));
+    {pTrainable=}true, FixturePath('tiny_modernbert_config.json'));
   NNQ := BuildModernBertFromSafeTensorsEx(
     FixturePath('tiny_modernbert.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}true, FixturePath('tiny_modernbert_config.json'),
+    {pTrainable=}false, FixturePath('tiny_modernbert_config.json'),
     {pQuantizeInt8=}true);
   try
     // 4 blocks x (Wqkv + attn Wo + mlp Wi + mlp Wo) - encoder, no head.
@@ -3708,10 +3708,10 @@ begin
   RandSeed := 424242;
   NNFP32 := BuildDeepSeekV2FromSafeTensorsEx(
     FixturePath('tiny_deepseek_v2.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}false, FixturePath('tiny_deepseek_v2_config.json'));
+    {pTrainable=}true, FixturePath('tiny_deepseek_v2_config.json'));
   NNQ := BuildDeepSeekV2FromSafeTensorsEx(
     FixturePath('tiny_deepseek_v2.safetensors'), Config, {SeqLen=}8,
-    {pInferenceOnly=}true, FixturePath('tiny_deepseek_v2_config.json'),
+    {pTrainable=}false, FixturePath('tiny_deepseek_v2_config.json'),
     {pQuantizeInt8=}true);
   try
     // MLA projections + dense block-0 MLP + MoE expert/shared SwiGLUs +
@@ -3735,10 +3735,10 @@ begin
   RandSeed := 424242;
   BuildT5FromSafeTensors(FixturePath('tiny_t5v10.safetensors'),
     EncF, DecF, Config, {EncSeqLen=}10, {DecSeqLen=}6,
-    {pInferenceOnly=}false, FixturePath('tiny_t5v10_config.json'));
+    {pTrainable=}true, FixturePath('tiny_t5v10_config.json'));
   BuildT5FromSafeTensors(FixturePath('tiny_t5v10.safetensors'),
     EncQ, DecQ, Config, {EncSeqLen=}10, {DecSeqLen=}6,
-    {pInferenceOnly=}true, FixturePath('tiny_t5v10_config.json'),
+    {pTrainable=}false, FixturePath('tiny_t5v10_config.json'),
     {pQuantizeInt8=}true);
   try
     // enc 2 blocks x (q/k/v/o + wi + wo) + dec 2 blocks x (self q/k/v/o +
@@ -3764,10 +3764,10 @@ begin
   RandSeed := 424242;
   BuildMarianFromSafeTensors(FixturePath('tiny_marian.safetensors'),
     EncF, DecF, Config, {EncSeqLen=}10, {DecSeqLen=}6,
-    {pInferenceOnly=}false, FixturePath('tiny_marian_config.json'));
+    {pTrainable=}true, FixturePath('tiny_marian_config.json'));
   BuildMarianFromSafeTensors(FixturePath('tiny_marian.safetensors'),
     EncQ, DecQ, Config, {EncSeqLen=}10, {DecSeqLen=}6,
-    {pInferenceOnly=}true, FixturePath('tiny_marian_config.json'),
+    {pTrainable=}false, FixturePath('tiny_marian_config.json'),
     {pQuantizeInt8=}true);
   try
     // Same layout as T5 with biased linears + tied head with
@@ -4283,7 +4283,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildLlamaFromSafeTensorsEx(FixturePath('tiny_llama.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_llama_config.json'));
   RefJson := TStringList.Create;
   Input := TNNetVolume.Create;
@@ -4698,7 +4698,7 @@ begin
   // ---- (a) Q8_0 ----
   NNRef := BuildLlamaFromSafeTensorsEx(
     FixturePath('tiny_llama_q8.safetensors'), ConfigRef, {SeqLen=}0,
-    {pInferenceOnly=}false, FixturePath('tiny_llama_q8_config.json'));
+    {pTrainable=}true, FixturePath('tiny_llama_q8_config.json'));
   NNG := BuildLlamaFromGGUFEx(FixturePath('tiny_llama_q8.gguf'), ConfigG);
   try
     AssertEquals('q8 hidden', 32, ConfigG.HiddenSize);
@@ -4728,7 +4728,7 @@ begin
   // ---- (b) F16 ----
   NNRef := BuildLlamaFromSafeTensorsEx(
     FixturePath('tiny_llama.safetensors'), ConfigRef, {SeqLen=}0,
-    {pInferenceOnly=}false, FixturePath('tiny_llama_config.json'));
+    {pTrainable=}true, FixturePath('tiny_llama_config.json'));
   NNG := BuildLlamaFromGGUFEx(FixturePath('tiny_llama_f16.gguf'), ConfigG);
   try
     Drift := RelativeDrift(ConfigG.MaxPositions, ConfigG.VocabSize);
@@ -4787,7 +4787,7 @@ begin
 
   NNRef := BuildLlamaFromSafeTensorsEx(
     FixturePath('tiny_llama.safetensors'), Config, {SeqLen=}0,
-    {pInferenceOnly=}false, FixturePath('tiny_llama_config.json'));
+    {pTrainable=}true, FixturePath('tiny_llama_config.json'));
   NNG := BuildLlamaFromGGUFEx(GGUFPath, ConfigG);
   Input := TNNetVolume.Create;
   OutR := TNNetVolume.Create;
@@ -4856,7 +4856,7 @@ begin
   end;
   NNRef := BuildLlamaFromSafeTensorsEx(
     FixturePath('tiny_llama_q8.safetensors'), Config, {SeqLen=}0,
-    {pInferenceOnly=}false, FixturePath('tiny_llama_q8_config.json'));
+    {pTrainable=}true, FixturePath('tiny_llama_q8_config.json'));
   NNG := BuildLlamaFromGGUFEx(GGUFPath, ConfigG);
   Input := TNNetVolume.Create;
   OutR := TNNetVolume.Create;
@@ -4932,7 +4932,7 @@ begin
   end;
 
   NNRef := BuildQwen2FromSafeTensorsEx(FixturePath('tiny_qwen2.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_qwen2_config.json'));
   NNG := BuildFromGGUFEx(GGUFPath, ConfigG);
   Input := TNNetVolume.Create;
@@ -5017,7 +5017,7 @@ begin
   end;
 
   NNRef := BuildGemma2FromSafeTensorsEx(FixturePath('tiny_gemma2.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_gemma2_config.json'));
   NNG := BuildFromGGUFEx(GGUFPath, ConfigG);
   Input := TNNetVolume.Create;
@@ -5164,7 +5164,7 @@ var
     SetLength(NoTokens, 0);
     Config := ReadLlamaConfigFromJSONFile(FixturePath(Stem + '_config.json'));
     NNRef := BuildGemma2FromSafeTensorsEx(FixturePath(Stem + '.safetensors'),
-      Config, {SeqLen=}0, {pInferenceOnly=}false,
+      Config, {SeqLen=}0, {pTrainable=}true,
       FixturePath(Stem + '_config.json'));
     GGUFPath := GetTempDir(false) + 'cai_gemma2_drift_' +
       IntToStr(Random(1000000)) + '.gguf';
@@ -5431,7 +5431,7 @@ begin
   // ---- (a) model logits round-trip ----
   NNRef := BuildLlamaFromSafeTensorsEx(
     FixturePath('tiny_llama.safetensors'), Config, {SeqLen=}0,
-    {pInferenceOnly=}false, FixturePath('tiny_llama_config.json'));
+    {pTrainable=}true, FixturePath('tiny_llama_config.json'));
   NNG := BuildLlamaFromGGUFEx(GGUFPath, ConfigG);
   Input := TNNetVolume.Create;
   OutR := TNNetVolume.Create;
@@ -5525,7 +5525,7 @@ begin
   // would carry) - this is the export SOURCE.
   NNRef := BuildLlamaFromSafeTensorsEx(
     FixturePath('tiny_llama.safetensors'), Config, {SeqLen=}0,
-    {pInferenceOnly=}false, FixturePath('tiny_llama_config.json'));
+    {pTrainable=}true, FixturePath('tiny_llama_config.json'));
 
   GGUFPath := GetTempDir(false) + 'cai_tnnet_gguf_rt_' +
     IntToStr(Random(1000000)) + '.gguf';
@@ -5632,10 +5632,10 @@ begin
   RandSeed := 424242;
   NNSingle := BuildLlamaFromSafeTensorsEx(
     FixturePath('tiny_llama.safetensors'), ConfigSingle, {SeqLen=}0,
-    {pInferenceOnly=}false, FixturePath('tiny_llama_config.json'));
+    {pTrainable=}true, FixturePath('tiny_llama_config.json'));
   NNSharded := BuildLlamaFromSafeTensorsEx(
     FixturePath('tiny_llama.safetensors.index.json'), ConfigSharded,
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_llama_config.json'));
   Input := TNNetVolume.Create(ConfigSingle.MaxPositions, 1, 1);
   OutSingle := TNNetVolume.Create;
@@ -5725,7 +5725,7 @@ begin
   // Direct builder route with the explicit exact-gelu flag.
   NN := BuildGPT2FromSafeTensorsEx(
     FixturePath('tiny_cerebras_gpt.safetensors'), Config, {SeqLen=}0,
-    {NumHeads=}2, {pInferenceOnly=}false, {pSeqClsHead=}false,
+    {NumHeads=}2, {pTrainable=}true, {pSeqClsHead=}false,
     {pExactGelu=}true);
   try
     AssertEquals('n_layer', 2, Config.NLayers);
@@ -5742,7 +5742,7 @@ begin
   // Config-driven route: BuildFromPretrained must pick up n_head=2 AND
   // activation_function "gelu" from the real (sliced) Cerebras config.
   NN := BuildFromPretrained(FixturePath('tiny_cerebras_gpt.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_cerebras_gpt_config.json'));
   try
     HasErf := false;
@@ -5775,7 +5775,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildLlamaFromSafeTensorsEx(FixturePath('tiny_smollm2.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_smollm2_config.json'));
   try
     AssertEquals('layers', 2, Config.NumLayers);
@@ -5808,7 +5808,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildMistralFromSafeTensorsEx(FixturePath('tiny_mistral.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_mistral_config.json'));
   try
     AssertEquals('model_type', 'mistral', Config.ModelType);
@@ -5842,7 +5842,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildQwen2FromSafeTensorsEx(FixturePath('tiny_qwen2.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_qwen2_config.json'));
   try
     AssertEquals('model_type', 'qwen2', Config.ModelType);
@@ -5878,7 +5878,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildQwen3FromSafeTensorsEx(FixturePath('tiny_qwen3.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_qwen3_config.json'));
   try
     AssertEquals('model_type', 'qwen3', Config.ModelType);
@@ -5926,7 +5926,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildGemmaFromSafeTensorsEx(FixturePath('tiny_gemma.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_gemma_config.json'));
   try
     AssertEquals('model_type', 'gemma', Config.ModelType);
@@ -5954,7 +5954,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "gemma" (architectures ["GemmaForCausalLM"]) onto the same path.
   NN := BuildFromPretrained(FixturePath('tiny_gemma.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_gemma_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -5991,7 +5991,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildGemma2FromSafeTensorsEx(FixturePath('tiny_gemma2.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_gemma2_config.json'));
   try
     AssertEquals('model_type', 'gemma2', Config.ModelType);
@@ -6052,7 +6052,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "gemma2" (architectures ["Gemma2ForCausalLM"]) onto the same path.
   NN := BuildFromPretrained(FixturePath('tiny_gemma2.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_gemma2_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -6095,7 +6095,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildGemma3FromSafeTensorsEx(FixturePath('tiny_gemma3.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_gemma3_config.json'));
   try
     AssertEquals('model_type', 'gemma3_text', Config.ModelType);
@@ -6163,7 +6163,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "gemma3_text" (architectures ["Gemma3ForCausalLM"]) onto the same path.
   NN := BuildFromPretrained(FixturePath('tiny_gemma3.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_gemma3_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -6204,7 +6204,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildOlmo2FromSafeTensorsEx(FixturePath('tiny_olmo2.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_olmo2_config.json'));
   try
     AssertEquals('model_type', 'olmo2', Config.ModelType);
@@ -6234,7 +6234,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "olmo2" (architectures ["Olmo2ForCausalLM"]) onto the same path.
   NN := BuildFromPretrained(FixturePath('tiny_olmo2.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_olmo2_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -6274,7 +6274,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildOlmoeFromSafeTensorsEx(FixturePath('tiny_olmoe.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_olmoe_config.json'));
   try
     AssertEquals('model_type', 'olmoe', Config.ModelType);
@@ -6334,7 +6334,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "olmoe" (architectures ["OlmoeForCausalLM"]) onto the same path.
   NN := BuildFromPretrained(FixturePath('tiny_olmoe.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_olmoe_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -6367,7 +6367,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildMixtralFromSafeTensorsEx(FixturePath('tiny_mixtral.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_mixtral_config.json'));
   try
     AssertEquals('model_type', 'mixtral', Config.ModelType);
@@ -6406,7 +6406,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "mixtral" (architectures ["MixtralForCausalLM"]) onto the same path.
   NN := BuildFromPretrained(FixturePath('tiny_mixtral.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_mixtral_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -6440,7 +6440,7 @@ begin
   RandSeed := 424242;
   NN := BuildQwen3MoeFromSafeTensorsEx(
     FixturePath('tiny_qwen3_moe.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_qwen3_moe_config.json'));
   try
     AssertEquals('model_type', 'qwen3_moe', Config.ModelType);
@@ -6484,7 +6484,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "qwen3_moe" (architectures ["Qwen3MoeForCausalLM"]) onto the same path.
   NN := BuildFromPretrained(FixturePath('tiny_qwen3_moe.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_qwen3_moe_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -6515,7 +6515,7 @@ begin
   RandSeed := 424242;
   NN := BuildQwen3MoeFromSafeTensorsEx(
     FixturePath('tiny_qwen3_moe_mixed.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_qwen3_moe_mixed_config.json'));
   try
     AssertEquals('model_type', 'qwen3_moe', Config.ModelType);
@@ -6612,7 +6612,7 @@ begin
   RandSeed := 424242;
   NN := BuildLlama4FromSafeTensorsEx(
     FixturePath('tiny_llama4.safetensors'),
-    Config, {SeqLen=}LLAMA4_SEQ, {pInferenceOnly=}false,
+    Config, {SeqLen=}LLAMA4_SEQ, {pTrainable=}true,
     FixturePath('tiny_llama4_config.json'));
   try
     AssertEquals('model_type', 'llama4_text', Config.ModelType);
@@ -6637,7 +6637,7 @@ begin
   RandSeed := 424242;
   NN := BuildLlama4FromSafeTensorsEx(
     FixturePath('tiny_llama4.safetensors'),
-    Config, {SeqLen=}LLAMA4_SEQ, {pInferenceOnly=}false,
+    Config, {SeqLen=}LLAMA4_SEQ, {pTrainable=}true,
     FixturePath('tiny_llama4_config.json'));
   try
     GateCnt := 0; SigmoidCnt := 0; SoftMaxCnt := 0; TempCnt := 0;
@@ -6690,7 +6690,7 @@ begin
   RandSeed := 424242;
   NN := BuildQwen3MoeFromSafeTensorsEx(
     FixturePath('tiny_qwen3_moe_window.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_qwen3_moe_window_config.json'));
   try
     AssertEquals('model_type', 'qwen3_moe', Config.ModelType);
@@ -6750,7 +6750,7 @@ begin
   RandSeed := 424242;
   NN := BuildGptOssFromSafeTensorsEx(
     FixturePath('tiny_gpt_oss.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_gpt_oss_config.json'));
   try
     AssertEquals('layers', 2, Config.NumLayers);
@@ -6800,7 +6800,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "gpt_oss" onto the same path.
   NN := BuildFromPretrained(FixturePath('tiny_gpt_oss.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_gpt_oss_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -6828,7 +6828,7 @@ begin
   RandSeed := 424242;
   NN := BuildGptOssFromSafeTensorsEx(
     FixturePath('tiny_gpt_oss_mxfp4.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_gpt_oss_config.json'));
   try
     AssertEquals('num_local_experts', 4, Config.NumLocalExperts);
@@ -6870,7 +6870,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildRWKVFromSafeTensorsEx(FixturePath('tiny_rwkv.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_rwkv_config.json'));
   try
     AssertEquals('model_type', 'rwkv', Config.ModelType);
@@ -6917,7 +6917,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "rwkv" (architectures ["RwkvForCausalLM"]) onto the same path.
   NN := BuildFromPretrained(FixturePath('tiny_rwkv.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_rwkv_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -6960,7 +6960,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildMambaFromSafeTensorsEx(FixturePath('tiny_mamba.safetensors'),
-    Config, {SeqLen=}8, {pInferenceOnly=}false,
+    Config, {SeqLen=}8, {pTrainable=}true,
     FixturePath('tiny_mamba_config.json'));
   try
     AssertEquals('model_type', 'mamba', Config.ModelType);
@@ -7008,7 +7008,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "mamba" (architectures ["MambaForCausalLM"]) onto the same path.
   NN := BuildFromPretrained(FixturePath('tiny_mamba.safetensors'),
-    {SeqLen=}8, {pInferenceOnly=}false,
+    {SeqLen=}8, {pTrainable=}true,
     FixturePath('tiny_mamba_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -7038,7 +7038,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildMamba2FromSafeTensorsEx(FixturePath('tiny_mamba2.safetensors'),
-    Config, {SeqLen=}8, {pInferenceOnly=}false,
+    Config, {SeqLen=}8, {pTrainable=}true,
     FixturePath('tiny_mamba2_config.json'));
   try
     AssertEquals('model_type', 'mamba2', Config.ModelType);
@@ -7076,7 +7076,7 @@ begin
   end;
   // Config-driven route: BuildFromPretrained must dispatch model_type "mamba2".
   NN := BuildFromPretrained(FixturePath('tiny_mamba2.safetensors'),
-    {SeqLen=}8, {pInferenceOnly=}false,
+    {SeqLen=}8, {pTrainable=}true,
     FixturePath('tiny_mamba2_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -7111,7 +7111,7 @@ begin
   RandSeed := 424242;
   NN := BuildRecurrentGemmaFromSafeTensorsEx(
     FixturePath('tiny_recurrentgemma.safetensors'), Config, {SeqLen=}6,
-    {pInferenceOnly=}false, FixturePath('tiny_recurrentgemma_config.json'));
+    {pTrainable=}true, FixturePath('tiny_recurrentgemma_config.json'));
   try
     AssertEquals('model_type', 'recurrent_gemma', Config.ModelType);
     AssertEquals('layers', 3, Config.NumLayers);
@@ -7146,7 +7146,7 @@ begin
   end;
   // Config-driven route via BuildFromPretrained (model_type dispatch).
   NN := BuildFromPretrained(FixturePath('tiny_recurrentgemma.safetensors'),
-    {SeqLen=}6, {pInferenceOnly=}false,
+    {SeqLen=}6, {pTrainable=}true,
     FixturePath('tiny_recurrentgemma_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -7180,7 +7180,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildJambaFromSafeTensorsEx(FixturePath('tiny_jamba.safetensors'),
-    Config, {SeqLen=}7, {pInferenceOnly=}false,
+    Config, {SeqLen=}7, {pTrainable=}true,
     FixturePath('tiny_jamba_config.json'));
   try
     AssertEquals('model_type', 'jamba', Config.ModelType);
@@ -7220,7 +7220,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "jamba" (architectures ["JambaForCausalLM"]) onto the same path.
   NN := BuildFromPretrained(FixturePath('tiny_jamba.safetensors'),
-    {SeqLen=}7, {pInferenceOnly=}true,
+    {SeqLen=}7, {pTrainable=}false,
     FixturePath('tiny_jamba_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -7254,7 +7254,7 @@ begin
   RandSeed := 424242;
   NN := BuildNemotronHFromSafeTensorsEx(
     FixturePath('tiny_nemotronh.safetensors'), Config, {SeqLen=}7,
-    {pInferenceOnly=}false, FixturePath('tiny_nemotronh_config.json'));
+    {pTrainable=}true, FixturePath('tiny_nemotronh_config.json'));
   try
     AssertEquals('model_type', 'nemotron_h', Config.ModelType);
     AssertEquals('pattern', 'M*-M', Config.Pattern);
@@ -7299,7 +7299,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "nemotron_h" (architectures ["NemotronHForCausalLM"]) onto the same path.
   NN := BuildFromPretrained(FixturePath('tiny_nemotronh.safetensors'),
-    {SeqLen=}7, {pInferenceOnly=}true,
+    {SeqLen=}7, {pTrainable=}false,
     FixturePath('tiny_nemotronh_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -7342,7 +7342,7 @@ begin
   RandSeed := 424242;
   NN := BuildNemotronHFromSafeTensorsEx(
     FixturePath('tiny_nemotronh_moe.safetensors'), Config, {SeqLen=}7,
-    {pInferenceOnly=}false, FixturePath('tiny_nemotronh_moe_config.json'));
+    {pTrainable=}true, FixturePath('tiny_nemotronh_moe_config.json'));
   try
     AssertEquals('model_type', 'nemotron_h', Config.ModelType);
     AssertEquals('pattern', 'M*E-', Config.Pattern);
@@ -7384,7 +7384,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch "nemotron_h" with an
   // 'E' block onto the same path.
   NN := BuildFromPretrained(FixturePath('tiny_nemotronh_moe.safetensors'),
-    {SeqLen=}7, {pInferenceOnly=}true,
+    {SeqLen=}7, {pTrainable=}false,
     FixturePath('tiny_nemotronh_moe_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -7426,7 +7426,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildBloomFromSafeTensorsEx(FixturePath('tiny_bloom.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_bloom_config.json'));
   try
     AssertEquals('model_type', 'bloom', Config.ModelType);
@@ -7479,7 +7479,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "bloom" (architectures ["BloomForCausalLM"]) onto the same path.
   NN := BuildFromPretrained(FixturePath('tiny_bloom.safetensors'),
-    {SeqLen=}16, {pInferenceOnly=}false,
+    {SeqLen=}16, {pTrainable=}true,
     FixturePath('tiny_bloom_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -7522,7 +7522,7 @@ begin
   RandSeed := 424242;
   NN := BuildModernBertFromSafeTensorsEx(
     FixturePath('tiny_modernbert.safetensors'), Config, {SeqLen=}0,
-    {pInferenceOnly=}false, FixturePath('tiny_modernbert_config.json'));
+    {pTrainable=}true, FixturePath('tiny_modernbert_config.json'));
   try
     AssertEquals('model_type', 'modernbert', Config.ModelType);
     AssertEquals('layers', 4, Config.NumLayers);
@@ -7598,7 +7598,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "modernbert" onto the same path.
   NN := BuildFromPretrained(FixturePath('tiny_modernbert.safetensors'),
-    {SeqLen=}16, {pInferenceOnly=}false,
+    {SeqLen=}16, {pTrainable=}true,
     FixturePath('tiny_modernbert_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -7645,7 +7645,7 @@ begin
   RandSeed := 424242;
   NN := BuildDebertaV2FromSafeTensorsEx(
     FixturePath('tiny_debertav2.safetensors'), Config, {SeqLen=}0,
-    {pInferenceOnly=}false, FixturePath('tiny_debertav2_config.json'));
+    {pTrainable=}true, FixturePath('tiny_debertav2_config.json'));
   try
     AssertEquals('model_type', 'deberta-v2', Config.ModelType);
     AssertEquals('prefix (plain DebertaV2Model export)', '', Config.Prefix);
@@ -7672,7 +7672,7 @@ begin
   end;
   // Config-driven route: BuildFromPretrained must dispatch "deberta-v2".
   NN := BuildFromPretrained(FixturePath('tiny_debertav2.safetensors'),
-    {SeqLen=}16, {pInferenceOnly=}false,
+    {SeqLen=}16, {pTrainable=}true,
     FixturePath('tiny_debertav2_config.json'));
   try
     AssertBertParityWithFixture(NN,
@@ -7695,7 +7695,7 @@ begin
   try
     NN := BuildDebertaV2FromSafeTensorsEx(
       FixturePath('tiny_debertav2_seqcls.safetensors'), Config, {SeqLen=}16,
-      {pInferenceOnly=}false,
+      {pTrainable=}true,
       FixturePath('tiny_debertav2_seqcls_config.json'),
       {pSeqClsHead=}true);
     try
@@ -7756,7 +7756,7 @@ begin
   RandSeed := 424242;
   NN := BuildDeepSeekV2FromSafeTensorsEx(
     FixturePath('tiny_deepseek_v2.safetensors'), Config, {SeqLen=}0,
-    {pInferenceOnly=}false, FixturePath('tiny_deepseek_v2_config.json'));
+    {pTrainable=}true, FixturePath('tiny_deepseek_v2_config.json'));
   Input := TNNetVolume.Create;
   Output := TNNetVolume.Create;
   try
@@ -7866,7 +7866,7 @@ begin
 
     // ---- BuildFromPretrained dispatch route: bit-identical logits ----
     NN2 := BuildFromPretrained(FixturePath('tiny_deepseek_v2.safetensors'),
-      {pSeqLen=}0, {pInferenceOnly=}false,
+      {pSeqLen=}0, {pTrainable=}true,
       FixturePath('tiny_deepseek_v2_config.json'));
     Output2 := TNNetVolume.Create;
     try
@@ -7911,7 +7911,7 @@ begin
   RandSeed := 424242;
   NN := BuildDeepSeekV2FromSafeTensorsEx(
     FixturePath('tiny_deepseek_v2_yarn.safetensors'), Config, {SeqLen=}0,
-    {pInferenceOnly=}false, FixturePath('tiny_deepseek_v2_yarn_config.json'));
+    {pTrainable=}true, FixturePath('tiny_deepseek_v2_yarn_config.json'));
   try
     AssertEquals('model_type', 'deepseek_v2', Config.ModelType);
     // The YaRN rope_scaling parsed with an explicit mscale override.
@@ -7989,7 +7989,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildGPTNeoFromSafeTensorsEx(FixturePath('tiny_gptneo.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_gptneo_config.json'));
   try
     AssertEquals('layers', 2, Config.NumLayers);
@@ -8053,7 +8053,7 @@ begin
   RandSeed := 424242;
   NN := BuildGPTNeoXFromSafeTensorsEx(
     FixturePath('tiny_gptneox.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_gptneox_config.json'));
   try
     AssertEquals('layers', 2, Config.NumLayers);
@@ -8083,7 +8083,7 @@ begin
   RandSeed := 424242;
   NN := BuildGPTNeoXFromSafeTensorsEx(
     FixturePath('tiny_gptneox.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_gptneox_seq_config.json'));
   try
     AssertFalse('sequential residual', Config.UseParallelResidual);
@@ -8137,7 +8137,7 @@ begin
   RandSeed := 424242;
   NN := BuildOPTFromSafeTensorsEx(
     FixturePath('tiny_opt.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_opt_config.json'));
   try
     AssertEquals('layers', 2, Config.NumLayers);
@@ -8203,7 +8203,7 @@ begin
   RandSeed := 424242;
   NN := BuildFalconFromSafeTensorsEx(
     FixturePath('tiny_falcon_mq.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_falcon_mq_config.json'));
   try
     AssertEquals('layers', 2, Config.NumLayers);
@@ -8238,7 +8238,7 @@ begin
   RandSeed := 424242;
   NN := BuildFalconFromSafeTensorsEx(
     FixturePath('tiny_falcon_nda.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_falcon_nda_config.json'));
   try
     AssertEquals('layers', 2, Config.NumLayers);
@@ -8298,7 +8298,7 @@ begin
   RandSeed := 424242;
   NN := BuildGPTJFromSafeTensorsEx(
     FixturePath('tiny_gptj.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_gptj_config.json'));
   try
     AssertEquals('layers', 2, Config.NumLayers);
@@ -8337,7 +8337,7 @@ begin
   RandSeed := 424242;
   NN := BuildStarCoder2FromSafeTensorsEx(
     FixturePath('tiny_starcoder2.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_starcoder2_config.json'));
   try
     AssertEquals('layers', 2, Config.NumLayers);
@@ -8369,7 +8369,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "starcoder2" onto the same path.
   NN := BuildFromPretrained(FixturePath('tiny_starcoder2.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_starcoder2_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -8393,7 +8393,7 @@ begin
   RandSeed := 424242;
   NN := BuildStarCoder2FromSafeTensorsEx(
     FixturePath('tiny_starcoder2_window.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_starcoder2_window_config.json'));
   try
     AssertTrue('sliding window set', Config.SlidingWindow > 0);
@@ -8428,7 +8428,7 @@ begin
   RandSeed := 424242;
   NN := BuildGptBigCodeFromSafeTensorsEx(
     FixturePath('tiny_gptbigcode.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_gptbigcode_config.json'));
   try
     AssertEquals('layers', 2, Config.NumLayers);
@@ -8463,7 +8463,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "gpt_bigcode" onto the same path.
   NN := BuildFromPretrained(FixturePath('tiny_gptbigcode.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_gptbigcode_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -8518,7 +8518,7 @@ begin
   RandSeed := 424242;
   NN := BuildCohereFromSafeTensorsEx(
     FixturePath('tiny_cohere.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_cohere_config.json'));
   try
     AssertEquals('model_type', 'cohere', Config.ModelType);
@@ -8576,7 +8576,7 @@ begin
   RandSeed := 424242;
   NN := BuildCohereFromSafeTensorsEx(
     FixturePath('tiny_cohere2.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_cohere2_config.json'));
   try
     AssertEquals('model_type', 'cohere2', Config.ModelType);
@@ -8661,7 +8661,7 @@ begin
   RandSeed := 424242;
   NN := BuildPhiFromSafeTensorsEx(
     FixturePath('tiny_phi.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_phi_config.json'));
   try
     AssertEquals('layers', 2, Config.NumLayers);
@@ -8701,7 +8701,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildPhi3FromSafeTensorsEx(FixturePath('tiny_phi3.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_phi3_config.json'));
   try
     AssertEquals('model_type', 'phi3', Config.ModelType);
@@ -8725,7 +8725,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "phi3" (architectures ["Phi3ForCausalLM"]) onto the same Llama path.
   NN := BuildFromPretrained(FixturePath('tiny_phi3.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_phi3_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -8755,7 +8755,7 @@ begin
   // reject the 16-token parity inputs.
   NN := BuildPhi3FromSafeTensorsEx(
     FixturePath('tiny_phi3_longrope.safetensors'),
-    Config, {SeqLen=}16, {pInferenceOnly=}false,
+    Config, {SeqLen=}16, {pTrainable=}true,
     FixturePath('tiny_phi3_longrope_config.json'));
   try
     AssertEquals('model_type', 'phi3', Config.ModelType);
@@ -8786,7 +8786,7 @@ begin
   // reproduces the same logits.
   RandSeed := 424242;
   NN := BuildFromPretrained(FixturePath('tiny_phi3_longrope.safetensors'),
-    {SeqLen=}16, {pInferenceOnly=}false,
+    {SeqLen=}16, {pTrainable=}true,
     FixturePath('tiny_phi3_longrope_config.json'));
   try
     NN2 := TNNet.Create;
@@ -8850,7 +8850,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildBitNetFromSafeTensorsEx(FixturePath('tiny_bitnet.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_bitnet_config.json'));
   try
     AssertEquals('model_type', 'bitnet', Config.ModelType);
@@ -8865,7 +8865,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type "bitnet"
   // (architectures ["BitNetForCausalLM"]) onto the same Llama path.
   NN := BuildFromPretrained(FixturePath('tiny_bitnet.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_bitnet_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -8921,7 +8921,7 @@ begin
   RandSeed := 424242;
   NN := BuildInternLM2FromSafeTensorsEx(
     FixturePath('tiny_internlm2.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_internlm2_config.json'));
   try
     AssertEquals('model_type', 'internlm2', Config.ModelType);
@@ -8936,7 +8936,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "internlm2" (architectures ["InternLM2ForCausalLM"]) onto the same path.
   NN := BuildFromPretrained(FixturePath('tiny_internlm2.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_internlm2_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -8999,7 +8999,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildGLM4FromSafeTensorsEx(FixturePath('tiny_glm4.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    Config, {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_glm4_config.json'));
   try
     AssertEquals('model_type', 'glm4', Config.ModelType);
@@ -9031,7 +9031,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "glm4" (architectures ["Glm4ForCausalLM"]) onto the same Llama path.
   NN := BuildFromPretrained(FixturePath('tiny_glm4.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_glm4_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -9094,7 +9094,7 @@ begin
   RandSeed := 424242;
   NN := BuildGraniteFromSafeTensorsEx(
     FixturePath('tiny_granite.safetensors'), Config, {SeqLen=}0,
-    {pInferenceOnly=}false, FixturePath('tiny_granite_config.json'));
+    {pTrainable=}true, FixturePath('tiny_granite_config.json'));
   try
     AssertEquals('model_type', 'granite', Config.ModelType);
     AssertEquals('layers', 2, Config.NumLayers);
@@ -9119,7 +9119,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "granite" (architectures ["GraniteForCausalLM"]) onto the Llama path.
   NN := BuildFromPretrained(FixturePath('tiny_granite.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_granite_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -9144,7 +9144,7 @@ begin
   RandSeed := 424242;
   NN := BuildGraniteFromSafeTensorsEx(
     FixturePath('tiny_granitemoe.safetensors'), Config, {SeqLen=}0,
-    {pInferenceOnly=}false, FixturePath('tiny_granitemoe_config.json'));
+    {pTrainable=}true, FixturePath('tiny_granitemoe_config.json'));
   try
     AssertEquals('model_type', 'granitemoe', Config.ModelType);
     AssertTrue('is MoE', Config.IsMoE);
@@ -9160,7 +9160,7 @@ begin
   end;
   // Config-driven route.
   NN := BuildFromPretrained(FixturePath('tiny_granitemoe.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_granitemoe_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -9188,7 +9188,7 @@ begin
   RandSeed := 424242;
   NN := BuildGraniteFromSafeTensorsEx(
     FixturePath('tiny_granitemoeshared.safetensors'), Config, {SeqLen=}0,
-    {pInferenceOnly=}false, FixturePath('tiny_granitemoeshared_config.json'));
+    {pTrainable=}true, FixturePath('tiny_granitemoeshared_config.json'));
   try
     AssertEquals('model_type', 'granitemoe', Config.ModelType);
     AssertTrue('is MoE', Config.IsMoE);
@@ -9206,7 +9206,7 @@ begin
   // Config-driven route.
   NN := BuildFromPretrained(
     FixturePath('tiny_granitemoeshared.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_granitemoeshared_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -9273,7 +9273,7 @@ begin
   RandSeed := 424242;
   NN := BuildMiniCPMFromSafeTensorsEx(
     FixturePath('tiny_minicpm.safetensors'), Config, {SeqLen=}0,
-    {pInferenceOnly=}false, FixturePath('tiny_minicpm_config.json'));
+    {pTrainable=}true, FixturePath('tiny_minicpm_config.json'));
   try
     AssertEquals('model_type', 'minicpm', Config.ModelType);
     AssertEquals('layers', 2, Config.NumLayers);
@@ -9296,7 +9296,7 @@ begin
   // Config-driven route: BuildFromPretrained must dispatch model_type
   // "minicpm" (architectures ["MiniCPMForCausalLM"]) onto the Llama path.
   NN := BuildFromPretrained(FixturePath('tiny_minicpm.safetensors'),
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_minicpm_config.json'));
   try
     AssertLogitParityWithFixture(NN,
@@ -9336,7 +9336,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildBertFromSafeTensorsEx(FixturePath('tiny_bert.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false, {pIncludePooler=}false,
+    Config, {SeqLen=}0, {pTrainable=}true, {pIncludePooler=}false,
     FixturePath('tiny_bert_config.json'));
   try
     AssertEquals('layers', 2, Config.NumLayers);
@@ -9357,7 +9357,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildBertFromSafeTensorsEx(FixturePath('tiny_bert.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false, {pIncludePooler=}true,
+    Config, {SeqLen=}0, {pTrainable=}true, {pIncludePooler=}true,
     FixturePath('tiny_bert_config.json'));
   try
     AssertBertParityWithFixture(NN, FixturePath('tiny_bert_hidden.json'),
@@ -9401,7 +9401,7 @@ begin
   RandSeed := 424242;
   NN := BuildBertFromSafeTensorsEx(
     FixturePath('tiny_distilbert.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false, {pIncludePooler=}false,
+    Config, {SeqLen=}0, {pTrainable=}true, {pIncludePooler=}false,
     FixturePath('tiny_distilbert_config.json'));
   try
     AssertTrue('family', Config.Family = bfDistilBert);
@@ -9468,7 +9468,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildBertFromSafeTensorsEx(FixturePath('tiny_roberta.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false, {pIncludePooler=}false,
+    Config, {SeqLen=}0, {pTrainable=}true, {pIncludePooler=}false,
     FixturePath('tiny_roberta_config.json'));
   try
     AssertTrue('family', Config.Family = bfRoberta);
@@ -9511,7 +9511,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildBertFromSafeTensorsEx(FixturePath('tiny_roberta.safetensors'),
-    Config, {SeqLen=}0, {pInferenceOnly=}false, {pIncludePooler=}true,
+    Config, {SeqLen=}0, {pTrainable=}true, {pIncludePooler=}true,
     FixturePath('tiny_roberta_config.json'));
   try
     AssertBertParityWithFixture(NN, FixturePath('tiny_roberta_hidden.json'),
@@ -9541,7 +9541,7 @@ begin
   try
     NN := BuildBertForSequenceClassificationFromSafeTensorsEx(
       FixturePath('tiny_bert_seqcls.safetensors'), Config, Id2Label,
-      {SeqLen=}0, {pInferenceOnly=}false,
+      {SeqLen=}0, {pTrainable=}true,
       FixturePath('tiny_bert_seqcls_config.json'));
     try
       AssertEquals('prefix (BertFor* exports carry "bert.")', 'bert.',
@@ -9581,7 +9581,7 @@ begin
   try
     NN := BuildBertForSequenceClassificationFromSafeTensorsEx(
       FixturePath('tiny_distilbert_seqcls.safetensors'), Config, Id2Label,
-      {SeqLen=}0, {pInferenceOnly=}false,
+      {SeqLen=}0, {pTrainable=}true,
       FixturePath('tiny_distilbert_seqcls_config.json'));
     try
       AssertEquals('prefix (DistilBertFor* exports carry "distilbert.")',
@@ -9622,7 +9622,7 @@ begin
   try
     NN := BuildBertForSequenceClassificationFromSafeTensorsEx(
       FixturePath('tiny_roberta_seqcls.safetensors'), Config, Id2Label,
-      {SeqLen=}0, {pInferenceOnly=}false,
+      {SeqLen=}0, {pTrainable=}true,
       FixturePath('tiny_roberta_seqcls_config.json'));
     try
       AssertEquals('prefix (RobertaFor* exports carry "roberta.")',
@@ -9665,7 +9665,7 @@ begin
   try
     NN := BuildGPT2ForSequenceClassificationFromSafeTensorsEx(
       FixturePath('tiny_gpt2_seqcls.safetensors'), Config, Id2Label,
-      {SeqLen=}0, {pNumHeads=}2, {pInferenceOnly=}false,
+      {SeqLen=}0, {pNumHeads=}2, {pTrainable=}true,
       FixturePath('tiny_gpt2_seqcls_config.json'));
     try
       AssertEquals('prefix (GPT2For* exports carry "transformer.")',
@@ -9707,7 +9707,7 @@ begin
   RandSeed := 424242;
   NN := BuildBertForQuestionAnsweringFromSafeTensorsEx(
     FixturePath('tiny_distilbert_qa.safetensors'), Config,
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_distilbert_qa_config.json'));
   RefJson := TStringList.Create;
   Input := TNNetVolume.Create;
@@ -10389,7 +10389,7 @@ begin
   RefRoot := nil;
   NN := BuildBertForSequenceClassificationFromSafeTensorsEx(
     FixturePath('tiny_bert_reranker.safetensors'), Config, nil,
-    {SeqLen=}0, {pInferenceOnly=}false,
+    {SeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_bert_reranker_config.json'));
   try
     AssertEquals('num_labels=1 reranker output depth', 1,
@@ -10534,7 +10534,7 @@ begin
     AssertTrue('at least 3 sequences', Sequences.Count >= 3);
     SeqLen := TJSONArray(Sequences.Items[0]).Count;
     NN := BuildBertFromSafeTensorsEx(FixturePath('tiny_e5.safetensors'),
-      Config, {SeqLen=}SeqLen, {pInferenceOnly=}false, {pIncludePooler=}false,
+      Config, {SeqLen=}SeqLen, {pTrainable=}true, {pIncludePooler=}false,
       FixturePath('tiny_e5_config.json'));
     Hid := Config.HiddenSize;
     AssertEquals('net seqlen', SeqLen, NN.Layers[0].Output.SizeX);
@@ -10632,7 +10632,7 @@ begin
     // parity the net length must equal the pinned input length.
     NN := BuildColBERTFromSafeTensorsEx(
       FixturePath('tiny_colbert.safetensors'),
-      Config, ProjDim, {pSeqLen=}SeqLen, {pInferenceOnly=}false,
+      Config, ProjDim, {pSeqLen=}SeqLen, {pTrainable=}true,
       FixturePath('tiny_colbert_config.json'));
     AssertEquals('proj dim', 5, ProjDim);
     AssertEquals('layers', 2, Config.NumLayers);
@@ -10726,7 +10726,7 @@ begin
     //     channel 2 = 1 on the [PAD] tail.
     NNMasked := BuildColBERTFromSafeTensorsEx(
       FixturePath('tiny_colbert.safetensors'),
-      Config, ProjDim, {pSeqLen=}SeqLen, {pInferenceOnly=}false,
+      Config, ProjDim, {pSeqLen=}SeqLen, {pTrainable=}true,
       FixturePath('tiny_colbert_config.json'), {pPaddingMask=}true);
     AssertEquals('masked net input depth', 3, NNMasked.Layers[0].Output.Depth);
     InMasked.ReSize(SeqLen, 1, 3);
@@ -10743,7 +10743,7 @@ begin
     //     (SeqLen,1,2), real tokens attend the [PAD] rows.
     NNUnmasked := BuildColBERTFromSafeTensorsEx(
       FixturePath('tiny_colbert.safetensors'),
-      Config, ProjDim2, {pSeqLen=}SeqLen, {pInferenceOnly=}false,
+      Config, ProjDim2, {pSeqLen=}SeqLen, {pTrainable=}true,
       FixturePath('tiny_colbert_config.json'), {pPaddingMask=}false);
     InExact.ReSize(SeqLen, 1, 2);
     InExact.Fill(0);
@@ -10756,7 +10756,7 @@ begin
     //     (no padding rows exist at all).
     NNExact := BuildColBERTFromSafeTensorsEx(
       FixturePath('tiny_colbert.safetensors'),
-      Config, ProjDim2, {pSeqLen=}DReal, {pInferenceOnly=}false,
+      Config, ProjDim2, {pSeqLen=}DReal, {pTrainable=}true,
       FixturePath('tiny_colbert_config.json'), {pPaddingMask=}false);
     AssertEquals('exact net seqlen', DReal, NNExact.Layers[0].Output.SizeX);
     InExact.ReSize(DReal, 1, 2);
@@ -10948,7 +10948,7 @@ begin
     Tok.LoadFromFile(FixturePath('tiny_wordpiece_tokenizer.json'));
     NN := BuildColBERTFromSafeTensorsEx(
       FixturePath('tiny_colbert.safetensors'), Config, ProjDim,
-      SeqLen, {pInferenceOnly=}false,
+      SeqLen, {pTrainable=}true,
       FixturePath('tiny_colbert_config.json'));
     Markers := ColBERTDefaultMarkers(Tok);
 
@@ -11043,12 +11043,12 @@ begin
 
     NNf := BuildColBERTFromSafeTensorsEx(
       FixturePath('tiny_colbert.safetensors'), ConfigF, ProjDimF,
-      SeqLen, {pInferenceOnly=}false,
+      SeqLen, {pTrainable=}true,
       FixturePath('tiny_colbert_config.json'), {pPaddingMask=}false,
       {pQuantizeInt8=}false);
     NNq := BuildColBERTFromSafeTensorsEx(
       FixturePath('tiny_colbert.safetensors'), ConfigQ, ProjDimQ,
-      SeqLen, {pInferenceOnly=}false,
+      SeqLen, {pTrainable=}true,
       FixturePath('tiny_colbert_config.json'), {pPaddingMask=}false,
       {pQuantizeInt8=}true);
 
@@ -11240,7 +11240,7 @@ begin
   AssertTrue('v1.0: tied', Config.TieWordEmbeddings);
   try
     BuildFromPretrained(FixturePath('tiny_flan_t5.safetensors'),
-      {SeqLen=}0, {pInferenceOnly=}false,
+      {SeqLen=}0, {pTrainable=}true,
       FixturePath('tiny_flan_t5_config.json'));
     Fail('BuildFromPretrained must reject model_type "t5"');
   except
@@ -11270,7 +11270,7 @@ begin
   RandSeed := 424242;
   BuildT5FromSafeTensors(FixturePath('tiny_flan_t5.safetensors'),
     Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
-    {pInferenceOnly=}false, FixturePath('tiny_flan_t5_config.json'));
+    {pTrainable=}true, FixturePath('tiny_flan_t5_config.json'));
   try
     AssertTrue('encoder built', Enc <> nil);
     AssertTrue('decoder built', Dec <> nil);
@@ -11300,7 +11300,7 @@ begin
   RandSeed := 424242;
   BuildT5FromSafeTensors(FixturePath('tiny_t5v10.safetensors'),
     Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
-    {pInferenceOnly=}false, FixturePath('tiny_t5v10_config.json'));
+    {pTrainable=}true, FixturePath('tiny_t5v10_config.json'));
   try
     AssertFalse('v1.0 relu ffn', Config.GatedFFN);
     AssertTrue('v1.0 tied head', Config.TieWordEmbeddings);
@@ -11341,7 +11341,7 @@ begin
   AssertTrue('swish ffn', Config.SwishFFN);
   try
     BuildFromPretrained(FixturePath('tiny_marian.safetensors'),
-      {SeqLen=}0, {pInferenceOnly=}false,
+      {SeqLen=}0, {pTrainable=}true,
       FixturePath('tiny_marian_config.json'));
     Fail('BuildFromPretrained must reject model_type "marian"');
   except
@@ -11373,7 +11373,7 @@ begin
   RandSeed := 424242;
   BuildMarianFromSafeTensors(FixturePath('tiny_marian.safetensors'),
     Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
-    {pInferenceOnly=}false, FixturePath('tiny_marian_config.json'));
+    {pTrainable=}true, FixturePath('tiny_marian_config.json'));
   try
     AssertTrue('encoder built', Enc <> nil);
     AssertTrue('decoder built', Dec <> nil);
@@ -11420,7 +11420,7 @@ begin
   AssertFalse('scale_embedding off', Config.ScaleEmbedding);
   try
     BuildFromPretrained(FixturePath('tiny_bart.safetensors'),
-      {SeqLen=}0, {pInferenceOnly=}false,
+      {SeqLen=}0, {pTrainable=}true,
       FixturePath('tiny_bart_config.json'));
     Fail('BuildFromPretrained must reject model_type "bart"');
   except
@@ -11453,7 +11453,7 @@ begin
   RandSeed := 424242;
   BuildBartFromSafeTensors(FixturePath('tiny_bart.safetensors'),
     Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
-    {pInferenceOnly=}false, FixturePath('tiny_bart_config.json'));
+    {pTrainable=}true, FixturePath('tiny_bart_config.json'));
   try
     AssertTrue('encoder built', Enc <> nil);
     AssertTrue('decoder built', Dec <> nil);
@@ -11497,7 +11497,7 @@ begin
   AssertTrue('scale_embedding on', Config.ScaleEmbedding);
   try
     BuildFromPretrained(FixturePath('tiny_pegasus.safetensors'),
-      {SeqLen=}0, {pInferenceOnly=}false,
+      {SeqLen=}0, {pTrainable=}true,
       FixturePath('tiny_pegasus_config.json'));
     Fail('BuildFromPretrained must reject model_type "pegasus"');
   except
@@ -11529,7 +11529,7 @@ begin
   RandSeed := 424242;
   BuildPegasusFromSafeTensors(FixturePath('tiny_pegasus.safetensors'),
     Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
-    {pInferenceOnly=}false, FixturePath('tiny_pegasus_config.json'));
+    {pTrainable=}true, FixturePath('tiny_pegasus_config.json'));
   try
     AssertTrue('encoder built', Enc <> nil);
     AssertTrue('decoder built', Dec <> nil);
@@ -11574,7 +11574,7 @@ begin
   AssertTrue('scale_embedding on', Config.ScaleEmbedding);
   try
     BuildFromPretrained(FixturePath('tiny_mbart.safetensors'),
-      {SeqLen=}0, {pInferenceOnly=}false,
+      {SeqLen=}0, {pTrainable=}true,
       FixturePath('tiny_mbart_config.json'));
     Fail('BuildFromPretrained must reject model_type "mbart"');
   except
@@ -11607,7 +11607,7 @@ begin
   RandSeed := 424242;
   BuildMBartFromSafeTensors(FixturePath('tiny_mbart.safetensors'),
     Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
-    {pInferenceOnly=}false, FixturePath('tiny_mbart_config.json'));
+    {pTrainable=}true, FixturePath('tiny_mbart_config.json'));
   try
     AssertTrue('encoder built', Enc <> nil);
     AssertTrue('decoder built', Dec <> nil);
@@ -11652,7 +11652,7 @@ begin
   AssertTrue('scale_embedding on', Config.ScaleEmbedding);
   try
     BuildFromPretrained(FixturePath('tiny_m2m100.safetensors'),
-      {SeqLen=}0, {pInferenceOnly=}false,
+      {SeqLen=}0, {pTrainable=}true,
       FixturePath('tiny_m2m100_config.json'));
     Fail('BuildFromPretrained must reject model_type "m2m_100"');
   except
@@ -11688,7 +11688,7 @@ begin
   RandSeed := 424242;
   BuildM2M100FromSafeTensors(FixturePath('tiny_m2m100.safetensors'),
     Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
-    {pInferenceOnly=}false, FixturePath('tiny_m2m100_config.json'));
+    {pTrainable=}true, FixturePath('tiny_m2m100_config.json'));
   try
     AssertTrue('encoder built', Enc <> nil);
     AssertTrue('decoder built', Dec <> nil);
@@ -11761,7 +11761,7 @@ begin
   RandSeed := 424242;
   BuildSeamlessM4TFromSafeTensors(
     FixturePath('tiny_seamless_m4t_v2.safetensors'), Enc, Dec, Config,
-    SpeechFrames, DecLen, {pInferenceOnly=}false,
+    SpeechFrames, DecLen, {pTrainable=}true,
     FixturePath('tiny_seamless_m4t_v2_config.json'));
   RefJson := TStringList.Create;
   EncInput := TNNetVolume.Create;
@@ -11884,7 +11884,7 @@ begin
   NN := nil;
   try
     NN := BuildFromPretrained(FixturePath('tiny_whisper.safetensors'),
-      {pSeqLen=}8, {pInferenceOnly=}false,
+      {pSeqLen=}8, {pTrainable=}true,
       FixturePath('tiny_whisper_config.json'));
     Fail('BuildFromPretrained must reject model_type "whisper"');
   except
@@ -11928,7 +11928,7 @@ const
 begin
   RandSeed := 424242;
   BuildWhisperFromSafeTensors(FixturePath('tiny_whisper.safetensors'),
-    Enc, Dec, Config, {DecSeqLen=}DecLen, {pInferenceOnly=}false,
+    Enc, Dec, Config, {DecSeqLen=}DecLen, {pTrainable=}true,
     FixturePath('tiny_whisper_config.json'));
   RefJson := TStringList.Create;
   EncInput := TNNetVolume.Create;
@@ -12073,7 +12073,7 @@ const
 begin
   RandSeed := 424242;
   BuildWhisperFromSafeTensors(FixturePath('tiny_whisper.safetensors'),
-    Enc, Dec, Config, {DecSeqLen=}DecLen, {pInferenceOnly=}false,
+    Enc, Dec, Config, {DecSeqLen=}DecLen, {pTrainable=}true,
     FixturePath('tiny_whisper_config.json'));
   RefJson := TStringList.Create;
   LogJson := TStringList.Create;
@@ -12299,7 +12299,7 @@ begin
 
     NN := BuildWav2Vec2FromSafeTensorsEx(
       FixturePath(Prefix + '.safetensors'), Config, NumSamples,
-      {pInferenceOnly=}false, FixturePath(Prefix + '_config.json'));
+      {pTrainable=}true, FixturePath(Prefix + '_config.json'));
     AssertTrue('net built', NN <> nil);
     AssertEquals('hubert flag from config', IsHubert, Config.IsHubert);
     EncLen := Wav2Vec2EncoderLength(Config, NumSamples);
@@ -12415,7 +12415,7 @@ begin
 
     NN := BuildPyannoteSegmentationFromSafeTensorsEx(
       FixturePath('tiny_pyannote.safetensors'), Config, NumSamples,
-      {pInferenceOnly=}false, FixturePath('tiny_pyannote_config.json'));
+      {pTrainable=}true, FixturePath('tiny_pyannote_config.json'));
     AssertTrue('net built', NN <> nil);
     AssertEquals('powerset classes', Powerset, Config.NumPowersetClasses);
     AssertEquals('frame count matches the oracle', Frames,
@@ -12511,7 +12511,7 @@ begin
 
     NN := BuildMoonshineFromSafeTensorsEx(
       FixturePath('tiny_moonshine.safetensors'), Config, NumSamples,
-      {pInferenceOnly=}false, FixturePath('tiny_moonshine_config.json'));
+      {pTrainable=}true, FixturePath('tiny_moonshine_config.json'));
     AssertTrue('net built', NN <> nil);
     EncLen := MoonshineEncoderLength(NumSamples);
     AssertEquals('encoder length matches the oracle', expLen, EncLen);
@@ -12592,7 +12592,7 @@ begin
 
     BuildMoonshineEncoderDecoderFromSafeTensors(
       FixturePath('tiny_moonshine.safetensors'), Enc, Dec, Config,
-      NumSamples, DecSeqLen, {pInferenceOnly=}false,
+      NumSamples, DecSeqLen, {pTrainable=}true,
       FixturePath('tiny_moonshine_config.json'));
     AssertTrue('encoder built', Enc <> nil);
     AssertTrue('decoder built', Dec <> nil);
@@ -13360,7 +13360,7 @@ begin
 
     Model := BuildMusicGenFromSafeTensors(
       FixturePath('tiny_musicgen.safetensors'), Config, EncSeq, DecSeq,
-      {pInferenceOnly=}false, FixturePath('tiny_musicgen_config.json'));
+      {pTrainable=}true, FixturePath('tiny_musicgen_config.json'));
     AssertTrue('musicgen decoder built', Model <> nil);
     AssertEquals('num codebooks', K, Config.NumCodebooks);
     AssertEquals('vocab size', Vocab, Config.VocabSize);
@@ -13500,7 +13500,7 @@ procedure TTestNeuralPretrained.TestMusicGenTextWiring;
     EncStates := TNNetVolume.Create;
     try
       BuildT5FromSafeTensors(FixturePath('tiny_musicgen_t5enc.safetensors'),
-        T5Enc, T5Dec, T5Cfg, EncSeq, 1, {pInferenceOnly=}true,
+        T5Enc, T5Dec, T5Cfg, EncSeq, 1, {pTrainable=}false,
         FixturePath('tiny_musicgen_t5enc_config.json'));
       Tokens.ReSize(EncSeq, 1, 1);
       for i := 0 to EncSeq - 1 do Tokens.FData[i] := Ids[i];
@@ -13514,7 +13514,7 @@ procedure TTestNeuralPretrained.TestMusicGenTextWiring;
       DecSeq := NumFrames + Config.NumCodebooks - 1 + 1;
       Model := BuildMusicGenFromSafeTensors(
         FixturePath('tiny_musicgen.safetensors'), Config, EncSeq, DecSeq,
-        {pInferenceOnly=}true, FixturePath('tiny_musicgen_config.json'));
+        {pTrainable=}false, FixturePath('tiny_musicgen_config.json'));
       Model.Generate(EncStates, NumFrames, Codes);
 
       Codec := BuildEnCodecFromSafeTensors(
@@ -13595,7 +13595,7 @@ procedure TTestNeuralPretrained.TestMusicGenCFG;
     Tokens := TNNetVolume.Create;
     try
       BuildT5FromSafeTensors(FixturePath('tiny_musicgen_t5enc.safetensors'),
-        T5Enc, T5Dec, T5Cfg, EncSeq, 1, {pInferenceOnly=}true,
+        T5Enc, T5Dec, T5Cfg, EncSeq, 1, {pTrainable=}false,
         FixturePath('tiny_musicgen_t5enc_config.json'));
       Tokens.ReSize(EncSeq, 1, 1);
       for i := 0 to EncSeq - 1 do Tokens.FData[i] := Ids[i];
@@ -13636,7 +13636,7 @@ begin
     DecSeq := NumFrames + Config.NumCodebooks - 1 + 1;
     Model := BuildMusicGenFromSafeTensors(
       FixturePath('tiny_musicgen.safetensors'), Config, Length([3, 8, 1, 5, 2]),
-      DecSeq, {pInferenceOnly=}true, FixturePath('tiny_musicgen_config.json'));
+      DecSeq, {pTrainable=}false, FixturePath('tiny_musicgen_config.json'));
 
     Model.Generate(Cond, NumFrames, CodesPlain);
 
@@ -13699,7 +13699,7 @@ procedure TTestNeuralPretrained.TestMusicGenGenerateEx;
     Tokens := TNNetVolume.Create;
     try
       BuildT5FromSafeTensors(FixturePath('tiny_musicgen_t5enc.safetensors'),
-        T5Enc, T5Dec, T5Cfg, EncSeq, 1, {pInferenceOnly=}true,
+        T5Enc, T5Dec, T5Cfg, EncSeq, 1, {pTrainable=}false,
         FixturePath('tiny_musicgen_t5enc_config.json'));
       Tokens.ReSize(EncSeq, 1, 1);
       for i := 0 to EncSeq - 1 do Tokens.FData[i] := Ids[i];
@@ -13734,7 +13734,7 @@ begin
     DecSeq := NumFrames + Config.NumCodebooks - 1 + 1;
     Model := BuildMusicGenFromSafeTensors(
       FixturePath('tiny_musicgen.safetensors'), Config, Length([3, 8, 1, 5, 2]),
-      DecSeq, {pInferenceOnly=}true, FixturePath('tiny_musicgen_config.json'));
+      DecSeq, {pTrainable=}false, FixturePath('tiny_musicgen_config.json'));
 
     // Baseline: the full re-encode greedy loop.
     Model.Generate(Cond, NumFrames, CodesGreedy);
@@ -13806,7 +13806,7 @@ procedure TTestNeuralPretrained.TestMusicGenGuidedCache;
     Tokens := TNNetVolume.Create;
     try
       BuildT5FromSafeTensors(FixturePath('tiny_musicgen_t5enc.safetensors'),
-        T5Enc, T5Dec, T5Cfg, EncSeq, 1, {pInferenceOnly=}true,
+        T5Enc, T5Dec, T5Cfg, EncSeq, 1, {pTrainable=}false,
         FixturePath('tiny_musicgen_t5enc_config.json'));
       Tokens.ReSize(EncSeq, 1, 1);
       for i := 0 to EncSeq - 1 do Tokens.FData[i] := Ids[i];
@@ -13844,7 +13844,7 @@ begin
     DecSeq := NumFrames + Config.NumCodebooks - 1 + 1;
     Model := BuildMusicGenFromSafeTensors(
       FixturePath('tiny_musicgen.safetensors'), Config, Length([3, 8, 1, 5, 2]),
-      DecSeq, {pInferenceOnly=}true, FixturePath('tiny_musicgen_config.json'));
+      DecSeq, {pTrainable=}false, FixturePath('tiny_musicgen_config.json'));
 
     // (a) Distinct uncond condition at scale 3.0: the dual-twin cached CFG path
     // (GenerateEx, UseCache=true) must match the un-cached GenerateCFG loop
@@ -13953,7 +13953,7 @@ begin
 
     NN := BuildBlip2QFormerFromSafeTensorsEx(
       FixturePath('tiny_blip2_qformer.safetensors'), Config, NumPatches,
-      {pInferenceOnly=}true, FixturePath('tiny_blip2_qformer_config.json'));
+      {pTrainable=}false, FixturePath('tiny_blip2_qformer_config.json'));
     AssertEquals('qformer num query tokens', NumQuery, Config.NumQueryTokens);
     AssertEquals('qformer encoder hidden', EncHidden, Config.EncoderHiddenSize);
 
@@ -14041,7 +14041,7 @@ begin
 
     BuildBlip2FromSafeTensors(FixturePath('tiny_blip2_full.safetensors'),
       QFormerNet, ProjectionNet, QueryTokens, Config, NumPatches,
-      {pInferenceOnly=}true,
+      {pTrainable=}false,
       FixturePath('tiny_blip2_full_config.json'));
     NumQuery := Config.NumQueryTokens;
     AssertTrue('query_tokens loaded', QueryTokens <> nil);
@@ -14140,7 +14140,7 @@ begin
   NN := nil;
   try
     NN := BuildFromPretrained(FixturePath('tiny_clip.safetensors'),
-      {pSeqLen=}8, {pInferenceOnly=}false,
+      {pSeqLen=}8, {pTrainable=}true,
       FixturePath('tiny_clip_config.json'));
     Fail('BuildFromPretrained must reject model_type "clip"');
   except
@@ -14184,7 +14184,7 @@ begin
   RandSeed := 424242;
   BuildClipFromSafeTensors(FixturePath('tiny_clip.safetensors'),
     TextNet, VisionNet, Config, {TextSeqLen=}SeqLen,
-    {pInferenceOnly=}false, FixturePath('tiny_clip_config.json'));
+    {pTrainable=}true, FixturePath('tiny_clip_config.json'));
   RefJson := TStringList.Create;
   TextInput := TNNetVolume.Create;
   ImageInput := TNNetVolume.Create;
@@ -14338,7 +14338,7 @@ var
 begin
   RandSeed := 424242;
   BuildClapFromSafeTensors(FixturePath('tiny_clap.safetensors'),
-    AudioNet, TextNet, Config, {TextSeqLen=}8, {pInferenceOnly=}false,
+    AudioNet, TextNet, Config, {TextSeqLen=}8, {pTrainable=}true,
     FixturePath('tiny_clap_config.json'));
   Reader := CreatePretrainedTensorReader(FixturePath('tiny_clap.safetensors'));
   RefJson := TStringList.Create;
@@ -14483,7 +14483,7 @@ var
 begin
   RandSeed := 424242;
   BuildClapFromSafeTensors(FixturePath('tiny_clap_fr4.safetensors'),
-    AudioNet, TextNet, Config, {TextSeqLen=}8, {pInferenceOnly=}false,
+    AudioNet, TextNet, Config, {TextSeqLen=}8, {pTrainable=}true,
     FixturePath('tiny_clap_fr4_config.json'));
   Reader := CreatePretrainedTensorReader(FixturePath('tiny_clap_fr4.safetensors'));
   RefJson := TStringList.Create;
@@ -14633,7 +14633,7 @@ begin
   RandSeed := 424242;
   BuildClipFromSafeTensors(FixturePath('tiny_clip.safetensors'),
     TextNet, VisionNet, Config, {TextSeqLen=}SeqLen,
-    {pInferenceOnly=}false, FixturePath('tiny_clip_config.json'));
+    {pTrainable=}true, FixturePath('tiny_clip_config.json'));
   RefJson := TStringList.Create;
   TextInput := TNNetVolume.Create;
   ImageInput := TNNetVolume.Create;
@@ -14760,7 +14760,7 @@ begin
       Config.ImageSize, Config.PatchSize, Config.NumChannels,
       Config.ProjectionDim, 'vision_model.',
       {ProjectionTensorName=}'visual_projection.weight',
-      {pInferenceOnly=}false, {pVisionFeatures=}true);
+      {pTrainable=}true, {pVisionFeatures=}true);
 
     // Shape contract: (num_patches, 1, hidden), no CLS row, no projection.
     AssertEquals('feature rows = num patches (CLS dropped)',
@@ -14956,7 +14956,7 @@ begin
   NN := nil;
   try
     NN := BuildFromPretrained(FixturePath('tiny_siglip.safetensors'),
-      {pSeqLen=}8, {pInferenceOnly=}false,
+      {pSeqLen=}8, {pTrainable=}true,
       FixturePath('tiny_siglip_config.json'));
     Fail('BuildFromPretrained must reject model_type "siglip"');
   except
@@ -14999,7 +14999,7 @@ begin
   RandSeed := 424242;
   BuildSigLIPFromSafeTensors(FixturePath('tiny_siglip.safetensors'),
     TextNet, VisionNet, Config, {TextSeqLen=}SeqLen,
-    {pInferenceOnly=}false, FixturePath('tiny_siglip_config.json'));
+    {pTrainable=}true, FixturePath('tiny_siglip_config.json'));
   RefJson := TStringList.Create;
   TextInput := TNNetVolume.Create;
   ImageInput := TNNetVolume.Create;
@@ -15140,7 +15140,7 @@ begin
   try
     VisionNet := BuildSigLIPVisionTower(Reader, Config.Vision,
       Config.ImageSize, Config.PatchSize, Config.NumChannels,
-      'vision_model.', {pInferenceOnly=}false, {pVisionFeatures=}true);
+      'vision_model.', {pTrainable=}true, {pVisionFeatures=}true);
     AssertEquals('feature rows = num patches (no MAP pool, no class token)',
       NumPatches, VisionNet.GetLastLayer().Output.SizeX);
     AssertEquals('feature height', 1, VisionNet.GetLastLayer().Output.SizeY);
@@ -15199,7 +15199,7 @@ begin
   RandSeed := 424242;
   BuildLlavaFromSafeTensors(FixturePath('tiny_llava.safetensors'),
     VisionNet, ProjectorNet, TextNet, Config, {pSeqLen=}13,
-    {pInferenceOnly=}false, FixturePath('tiny_llava_config.json'));
+    {pTrainable=}true, FixturePath('tiny_llava_config.json'));
   RefJson := TStringList.Create;
   ImageInput := TNNetVolume.Create;
   VisualTokens := TNNetVolume.Create;
@@ -15291,7 +15291,7 @@ begin
 
     BuildLlavaFromSafeTensors(FixturePath('tiny_llava.safetensors'),
       VisionNet, ProjectorNet, TextNet, Config, {pSeqLen=}SeqLen,
-      {pInferenceOnly=}false, FixturePath('tiny_llava_config.json'));
+      {pTrainable=}true, FixturePath('tiny_llava_config.json'));
 
     Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
     ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
@@ -15401,7 +15401,7 @@ begin
 
     BuildQwen2AudioFromSafeTensors(FixturePath('tiny_qwen2audio.safetensors'),
       TowerNet, PoolNormNet, ProjectorNet, TextNet, Config, {pSeqLen=}SeqLen,
-      {pInferenceOnly=}false, FixturePath('tiny_qwen2audio_config.json'));
+      {pTrainable=}true, FixturePath('tiny_qwen2audio_config.json'));
     AssertTrue('tower net built', TowerNet <> nil);
     AssertTrue('pool/norm net built', PoolNormNet <> nil);
     AssertTrue('projector net built', ProjectorNet <> nil);
@@ -15535,7 +15535,7 @@ begin
 
     BuildPaliGemmaFromSafeTensors(FixturePath('tiny_paligemma.safetensors'),
       VisionNet, ProjectorNet, TextNet, Config, {pSeqLen=}SeqLen,
-      {pInferenceOnly=}false, FixturePath('tiny_paligemma_config.json'));
+      {pTrainable=}true, FixturePath('tiny_paligemma_config.json'));
 
     Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
     ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
@@ -15699,7 +15699,7 @@ begin
 
     TextNet := BuildQwen2VLFromSafeTensors(
       FixturePath('tiny_qwen2vl.safetensors'), Config, {pSeqLen=}SeqLen,
-      {pInferenceOnly=}false, FixturePath('tiny_qwen2vl_config.json'));
+      {pTrainable=}true, FixturePath('tiny_qwen2vl_config.json'));
     HiddenT := Config.Text.HiddenSize;
 
     // load the merged image embeds [NumImg][hidden] into (NumImg,1,hidden)
@@ -15817,7 +15817,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildViTFromSafeTensors(FixturePath('tiny_vit.safetensors'),
-    Config, {pInferenceOnly=}false, FixturePath('tiny_vit_config.json'));
+    Config, {pTrainable=}true, FixturePath('tiny_vit_config.json'));
   RefJson := TStringList.Create;
   ImageInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -15921,7 +15921,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildResNetFromSafeTensors(FixturePath(Base + '.safetensors'),
-    Config, {pInferenceOnly=}false, FixturePath(Base + '_config.json'));
+    Config, {pTrainable=}true, FixturePath(Base + '_config.json'));
   RefJson := TStringList.Create;
   ImageInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -16041,7 +16041,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildConvNeXtFromSafeTensors(
-    FixturePath(Base + '.safetensors'), Config, {pInferenceOnly=}false,
+    FixturePath(Base + '.safetensors'), Config, {pTrainable=}true,
     FixturePath(Base + '_config.json'));
   RefJson := TStringList.Create;
   ImageInput := TNNetVolume.Create;
@@ -16162,7 +16162,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildSegformerFromSafeTensors(FixturePath('tiny_segformer.safetensors'),
-    Config, {pInferenceOnly=}false, FixturePath('tiny_segformer_config.json'));
+    Config, {pTrainable=}true, FixturePath('tiny_segformer_config.json'));
   RefJson := TStringList.Create;
   Img := TNNetVolume.Create;
   RefRoot := nil;
@@ -16271,7 +16271,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildDPTFromSafeTensors(FixturePath('tiny_dpt.safetensors'),
-    Config, {pInferenceOnly=}false, FixturePath('tiny_dpt_config.json'));
+    Config, {pTrainable=}true, FixturePath('tiny_dpt_config.json'));
   RefJson := TStringList.Create;
   Img := TNNetVolume.Create;
   RefRoot := nil;
@@ -16368,7 +16368,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildVideoMAEFromSafeTensorsEx(
-    FixturePath('tiny_videomae.safetensors'), Config, {pInferenceOnly=}false,
+    FixturePath('tiny_videomae.safetensors'), Config, {pTrainable=}true,
     FixturePath('tiny_videomae_config.json'));
   RefJson := TStringList.Create;
   Clip := TNNetVolume.Create;
@@ -16458,7 +16458,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildViTPoseFromSafeTensors(FixturePath('tiny_vitpose.safetensors'),
-    Config, {pInferenceOnly=}false, FixturePath('tiny_vitpose_config.json'));
+    Config, {pTrainable=}true, FixturePath('tiny_vitpose_config.json'));
   RefJson := TStringList.Create;
   Img := TNNetVolume.Create;
   RefRoot := nil;
@@ -16532,7 +16532,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildViTPoseFromSafeTensors(FixturePath('tiny_vitpose.safetensors'),
-    Config, {pInferenceOnly=}false, FixturePath('tiny_vitpose_config.json'));
+    Config, {pTrainable=}true, FixturePath('tiny_vitpose_config.json'));
   RefJson := TStringList.Create;
   Img := TNNetVolume.Create;
   RefRoot := nil;
@@ -16634,7 +16634,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildDetrFromSafeTensors(FixturePath('tiny_detr.safetensors'),
-    Config, {pInferenceOnly=}false, FixturePath('tiny_detr_config.json'));
+    Config, {pTrainable=}true, FixturePath('tiny_detr_config.json'));
   RefJson := TStringList.Create;
   Img := TNNetVolume.Create;
   RefRoot := nil;
@@ -16720,7 +16720,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildDetrFromSafeTensors(FixturePath('tiny_detr.safetensors'),
-    Config, {pInferenceOnly=}false, FixturePath('tiny_detr_config.json'));
+    Config, {pTrainable=}true, FixturePath('tiny_detr_config.json'));
   RefJson := TStringList.Create;
   Img := TNNetVolume.Create;
   RefRoot := nil;
@@ -16813,7 +16813,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildYoloFromSafeTensors(FixturePath('tiny_yolo.safetensors'),
-    Config, {pInferenceOnly=}false, FixturePath('tiny_yolo_config.json'));
+    Config, {pTrainable=}true, FixturePath('tiny_yolo_config.json'));
   RefJson := TStringList.Create;
   Img := TNNetVolume.Create;
   RefRoot := nil;
@@ -16879,7 +16879,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildYoloFromSafeTensors(FixturePath('tiny_yolo.safetensors'),
-    Config, {pInferenceOnly=}false, FixturePath('tiny_yolo_config.json'));
+    Config, {pTrainable=}true, FixturePath('tiny_yolo_config.json'));
   RefJson := TStringList.Create;
   Img := TNNetVolume.Create;
   RefRoot := nil;
@@ -16976,7 +16976,7 @@ var
 begin
   RandSeed := 424242;
   BuildBlipForCaptioningFromSafeTensors(FixturePath('tiny_blip.safetensors'),
-    VisionNet, TextNet, Config, {DecSeqLen=}8, {pInferenceOnly=}false,
+    VisionNet, TextNet, Config, {DecSeqLen=}8, {pTrainable=}true,
     FixturePath('tiny_blip_config.json'));
   RefJson := TStringList.Create;
   Img := TNNetVolume.Create;
@@ -17054,7 +17054,7 @@ var
 begin
   RandSeed := 424242;
   BuildBlipForCaptioningFromSafeTensors(FixturePath('tiny_blip.safetensors'),
-    VisionNet, TextNet, Config, {DecSeqLen=}12, {pInferenceOnly=}false,
+    VisionNet, TextNet, Config, {DecSeqLen=}12, {pTrainable=}true,
     FixturePath('tiny_blip_config.json'));
   RefJson := TStringList.Create;
   Img := TNNetVolume.Create;
@@ -17140,7 +17140,7 @@ var
 begin
   RandSeed := 424242;
   BuildTrOCRFromSafeTensors(FixturePath('tiny_trocr.safetensors'),
-    EncoderNet, DecoderNet, Config, {DecSeqLen=}8, {pInferenceOnly=}false,
+    EncoderNet, DecoderNet, Config, {DecSeqLen=}8, {pTrainable=}true,
     FixturePath('tiny_trocr_config.json'));
   RefJson := TStringList.Create;
   Img := TNNetVolume.Create;
@@ -17247,7 +17247,7 @@ var
 begin
   RandSeed := 424242;
   BuildOwlViTFromSafeTensors(FixturePath('tiny_owlvit.safetensors'),
-    TextNet, VisionNet, Config, {TextSeqLen=}0, {pInferenceOnly=}false,
+    TextNet, VisionNet, Config, {TextSeqLen=}0, {pTrainable=}true,
     FixturePath('tiny_owlvit_config.json'));
   RefJson := TStringList.Create;
   Img := TNNetVolume.Create;
@@ -17497,7 +17497,7 @@ begin
   RandSeed := 424242;
   NN := BuildInceptionV3FromSafeTensors(
     FixturePath('tiny_inceptionv3.safetensors'), Config, PoolIdx,
-    {pInferenceOnly=}false, FixturePath('tiny_inceptionv3_config.json'));
+    {pTrainable=}true, FixturePath('tiny_inceptionv3_config.json'));
   RefJson := TStringList.Create;
   ImageInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -17620,7 +17620,7 @@ begin
   RandSeed := 424242;
   NN := BuildMobileNetV3FromSafeTensors(
     FixturePath('tiny_mobilenetv3.safetensors'), Config,
-    {pInferenceOnly=}false, FixturePath('tiny_mobilenetv3_config.json'));
+    {pTrainable=}true, FixturePath('tiny_mobilenetv3_config.json'));
   RefJson := TStringList.Create;
   ImageInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -17726,7 +17726,7 @@ begin
   RandSeed := 424242;
   NN := BuildEfficientNetFromSafeTensors(
     FixturePath('tiny_efficientnet.safetensors'), Config,
-    {pInferenceOnly=}false, FixturePath('tiny_efficientnet_config.json'));
+    {pTrainable=}true, FixturePath('tiny_efficientnet_config.json'));
   RefJson := TStringList.Create;
   ImageInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -17821,7 +17821,7 @@ begin
   RandSeed := 424242;
   NN := BuildSwinFromSafeTensors(
     FixturePath('tiny_swin.safetensors'), Config,
-    {pInferenceOnly=}false, FixturePath('tiny_swin_config.json'));
+    {pTrainable=}true, FixturePath('tiny_swin_config.json'));
   RefJson := TStringList.Create;
   ImageInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -17959,7 +17959,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildVGGFromSafeTensors(FixturePath('tiny_vgg16.safetensors'),
-    Config, TapIdx, {pInferenceOnly=}false,
+    Config, TapIdx, {pTrainable=}true,
     FixturePath('tiny_vgg16_config.json'));
   RefJson := TStringList.Create;
   ImageInput := TNNetVolume.Create;
@@ -18014,7 +18014,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildVGGFromSafeTensors(FixturePath('tiny_vgg16.safetensors'),
-    Config, TapIdx, {pInferenceOnly=}false,
+    Config, TapIdx, {pTrainable=}true,
     FixturePath('tiny_vgg16_config.json'));
   RefJson := TStringList.Create;
   ImageInput := TNNetVolume.Create;
@@ -18088,7 +18088,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildVGGFromSafeTensors(FixturePath('tiny_vgg16.safetensors'),
-    Config, TapIdx, {pInferenceOnly=}false,
+    Config, TapIdx, {pTrainable=}true,
     FixturePath('tiny_vgg16_config.json'));
   RefJson := TStringList.Create;
   LpipsJson := TStringList.Create;
@@ -18178,7 +18178,7 @@ begin
   RandSeed := 424242;
   NN := BuildVaeDecoderFromSafeTensors(
     FixturePath('tiny_vae_decoder.safetensors'), Config,
-    {pInferenceOnly=}false, FixturePath('tiny_vae_decoder_config.json'));
+    {pTrainable=}true, FixturePath('tiny_vae_decoder_config.json'));
   RefJson := TStringList.Create;
   LatentInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -18264,7 +18264,7 @@ begin
   RandSeed := 424242;
   NN := BuildVaeEncoderFromSafeTensors(
     FixturePath('tiny_vae_encoder.safetensors'), Config,
-    {pInferenceOnly=}false, FixturePath('tiny_vae_encoder_config.json'));
+    {pTrainable=}true, FixturePath('tiny_vae_encoder_config.json'));
   RefJson := TStringList.Create;
   ImgInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -18347,10 +18347,10 @@ begin
   try
     Enc := BuildVaeEncoderFromSafeTensors(
       FixturePath('tiny_vae_encoder.safetensors'), EncCfg,
-      {pInferenceOnly=}false, FixturePath('tiny_vae_encoder_config.json'));
+      {pTrainable=}true, FixturePath('tiny_vae_encoder_config.json'));
     Dec := BuildVaeDecoderFromSafeTensors(
       FixturePath('tiny_vae_decoder.safetensors'), DecCfg,
-      {pInferenceOnly=}false, FixturePath('tiny_vae_decoder_config.json'));
+      {pTrainable=}true, FixturePath('tiny_vae_decoder_config.json'));
     LatGrid := EncCfg.LatentGrid;
     ImgGrid := LatGrid shl (EncCfg.NumBlockOut - 1);
     AssertEquals('encoder latent grid == decoder latent grid',
@@ -18443,7 +18443,7 @@ begin
   RandSeed := 424242;
   Vq := BuildVqModelFromSafeTensors(
     FixturePath('tiny_vqmodel.safetensors'), Config,
-    {pInferenceOnly=}false, FixturePath('tiny_vqmodel_config.json'));
+    {pTrainable=}true, FixturePath('tiny_vqmodel_config.json'));
   RefJson := TStringList.Create;
   ImgInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -18502,7 +18502,7 @@ begin
   RandSeed := 424242;
   Vq := BuildVqModelFromSafeTensors(
     FixturePath('tiny_vqmodel.safetensors'), Config,
-    {pInferenceOnly=}false, FixturePath('tiny_vqmodel_config.json'));
+    {pTrainable=}true, FixturePath('tiny_vqmodel_config.json'));
   RefJson := TStringList.Create;
   OutImage := TNNetVolume.Create;
   RefRoot := nil;
@@ -18570,7 +18570,7 @@ begin
   RandSeed := 424242;
   Vq := BuildVqModelFromSafeTensors(
     FixturePath('tiny_vqmodel.safetensors'), Config,
-    {pInferenceOnly=}false, FixturePath('tiny_vqmodel_config.json'));
+    {pTrainable=}true, FixturePath('tiny_vqmodel_config.json'));
   RefJson := TStringList.Create;
   ImgInput := TNNetVolume.Create;
   OutImage := TNNetVolume.Create;
@@ -18664,7 +18664,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildDiTFromSafeTensors(FixturePath('tiny_dit.safetensors'), Config,
-    {pInferenceOnly=}false, FixturePath('tiny_dit_config.json'));
+    {pTrainable=}true, FixturePath('tiny_dit_config.json'));
   RefJson := TStringList.Create;
   LatentInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -18735,7 +18735,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildDiTFromSafeTensors(FixturePath('tiny_dit.safetensors'), Config,
-    {pInferenceOnly=}false, FixturePath('tiny_dit_config.json'));
+    {pTrainable=}true, FixturePath('tiny_dit_config.json'));
   Scheduler := TNNetDiffusionScheduler.Create(100, dsLinear, dpEps);
   Latent := TNNetVolume.Create;
   Eps := TNNetVolume.Create;
@@ -18816,7 +18816,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildVARFromSafeTensors(FixturePath('tiny_var.safetensors'), Config,
-    {pInferenceOnly=}false, FixturePath('tiny_var_config.json'));
+    {pTrainable=}true, FixturePath('tiny_var_config.json'));
   RefJson := TStringList.Create;
   TokInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -18926,7 +18926,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildPixArtFromSafeTensors(FixturePath('tiny_pixart.safetensors'),
-    {TextSeqLen=}5, Config, {pInferenceOnly=}false,
+    {TextSeqLen=}5, Config, {pTrainable=}true,
     FixturePath('tiny_pixart_config.json'));
   RefJson := TStringList.Create;
   LatentInput := TNNetVolume.Create;
@@ -19036,7 +19036,7 @@ begin
   d := Config.HiddenSize;
   NN := BuildMMDiTBlockFromSafeTensors(FixturePath('tiny_mmdit.safetensors'),
     Config, {Prefix=}'', ImgOutLayer, TxtOutLayer,
-    {pInferenceOnly=}false);
+    {pTrainable=}true);
   // The pico fixture writes raw diffusers JointTransformerBlock tensor names
   // (norm1.*, attn.to_q, ...); a real SD3 checkpoint prefixes them with
   // 'transformer_blocks.<i>.' which the importer accepts via the Prefix arg.
@@ -19153,11 +19153,11 @@ var
 begin
   RandSeed := 424242;
   PixArtNet := BuildPixArtFromSafeTensors(FixturePath('tiny_pixart.safetensors'),
-    {TextSeqLen=}5, PixCfg, {pInferenceOnly=}false,
+    {TextSeqLen=}5, PixCfg, {pTrainable=}true,
     FixturePath('tiny_pixart_config.json'));
   VaeNet := BuildVaeDecoderFromSafeTensors(
     FixturePath('tiny_vae_decoder_ltt.safetensors'), VaeCfg,
-    {pInferenceOnly=}false, FixturePath('tiny_vae_decoder_ltt_config.json'));
+    {pTrainable=}true, FixturePath('tiny_vae_decoder_ltt_config.json'));
   Scheduler := TNNetDiffusionScheduler.Create(100, dsLinear, dpEps);
   Latent := TNNetVolume.Create;
   TextStates := TNNetVolume.Create;
@@ -19256,7 +19256,7 @@ begin
   RandSeed := 424242;
   NN := BuildRRDBNetFromSafeTensors(
     FixturePath('tiny_rrdbnet.safetensors'), Config,
-    {pInferenceOnly=}false, FixturePath('tiny_rrdbnet_config.json'));
+    {pTrainable=}true, FixturePath('tiny_rrdbnet_config.json'));
   RefJson := TStringList.Create;
   ImgInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -19364,7 +19364,7 @@ begin
   RandSeed := 424242;
   NN := BuildNAFNetFromSafeTensors(
     FixturePath('tiny_nafnet.safetensors'), Config,
-    {pInferenceOnly=}false, FixturePath('tiny_nafnet_config.json'));
+    {pTrainable=}true, FixturePath('tiny_nafnet_config.json'));
   RefJson := TStringList.Create;
   ImgInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -19468,7 +19468,7 @@ begin
   RandSeed := 424242;
   NN := BuildRIFEFromSafeTensors(
     FixturePath('tiny_rife.safetensors'), Config,
-    {pInferenceOnly=}false, FixturePath('tiny_rife_config.json'));
+    {pTrainable=}true, FixturePath('tiny_rife_config.json'));
   RefJson := TStringList.Create;
   ImgInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -19579,7 +19579,7 @@ begin
   RandSeed := 424242;
   NN := BuildSwinIRFromSafeTensors(
     FixturePath('tiny_swinir.safetensors'), Config,
-    {pInferenceOnly=}false, FixturePath('tiny_swinir_config.json'));
+    {pTrainable=}true, FixturePath('tiny_swinir_config.json'));
   RefJson := TStringList.Create;
   ImgInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -19695,7 +19695,7 @@ begin
   BuildCLIPSegFromSafeTensors(
     FixturePath('tiny_clipseg.safetensors'),
     VisionNet, TextNet, DecoderNet, Config,
-    {TextSeqLen=}5, {pInferenceOnly=}false,
+    {TextSeqLen=}5, {pTrainable=}true,
     FixturePath('tiny_clipseg_config.json'));
   RefJson := TStringList.Create;
   ImgInput := TNNetVolume.Create;
@@ -19828,7 +19828,7 @@ begin
   RandSeed := 424242;
   NN := BuildStyleGAN2GeneratorFromSafeTensors(
     FixturePath('tiny_stylegan2.safetensors'), Config,
-    {pInferenceOnly=}false, FixturePath('tiny_stylegan2_config.json'));
+    {pTrainable=}true, FixturePath('tiny_stylegan2_config.json'));
   RefJson := TStringList.Create;
   ZInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -19919,7 +19919,7 @@ begin
   RandSeed := 424242;
   NN := BuildDINOv2FromSafeTensorsWithConfig(
     FixturePath('tiny_dinov2.safetensors'),
-    Config, {pInferenceOnly=}false, FixturePath('tiny_dinov2_config.json'));
+    Config, {pTrainable=}true, FixturePath('tiny_dinov2_config.json'));
   RefJson := TStringList.Create;
   ImageInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -20023,7 +20023,7 @@ begin
   RandSeed := 424242;
   NN := BuildBeitFromSafeTensorsWithConfig(
     FixturePath('tiny_beit.safetensors'),
-    Config, {pInferenceOnly=}false, FixturePath('tiny_beit_config.json'));
+    Config, {pTrainable=}true, FixturePath('tiny_beit_config.json'));
   RefJson := TStringList.Create;
   ImageInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -20092,7 +20092,7 @@ begin
   RandSeed := 424242;
   NN := BuildSAMFromSafeTensors(
     FixturePath('tiny_sam.safetensors'),
-    Config, {pInferenceOnly=}true, FixturePath('tiny_sam_config.json'));
+    Config, {pTrainable=}false, FixturePath('tiny_sam_config.json'));
   RefJson := TStringList.Create;
   ImageInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -20879,7 +20879,7 @@ var
 begin
   RandSeed := 424242;
   NN := BuildRaftFromSafeTensors(FixturePath('tiny_raft.safetensors'),
-    Config, {pInferenceOnly=}false, FixturePath('tiny_raft_config.json'));
+    Config, {pTrainable=}true, FixturePath('tiny_raft_config.json'));
   RefJson := TStringList.Create;
   F1 := TNNetVolume.Create(Config.ImageW, Config.ImageH, 3);
   F2 := TNNetVolume.Create(Config.ImageW, Config.ImageH, 3);

@@ -54,11 +54,11 @@ with one of the importers, e.g.
 ```pascal
 uses neuralllmimport;   // BuildGPT2FromSafeTensors / .bin importers
 ...
-Teacher := BuildGPT2FromSafeTensors('gpt2', {pInferenceOnly=}true);
+Teacher := BuildGPT2FromSafeTensors('gpt2', {pTrainable=}false);
 ```
 
 and feed token windows in the teacher's tokenization. **Memory note:** a full
-GPT-2 (124M) needs `pInferenceOnly` / `SetInferenceOnly` to stay under a
+GPT-2 (124M) needs `pTrainable=false` / `SetTrainable` to stay under a
 3 GB cap (see the project memory note `gpt2-import-oom-and-slicer`). The tiny
 synthetic teacher here keeps the demo inside that budget and under a minute,
 while still showing the KD-vs-hard-label perplexity gap that is the whole

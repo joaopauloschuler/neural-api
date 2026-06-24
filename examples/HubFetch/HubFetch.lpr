@@ -56,7 +56,7 @@ begin
   WriteLn('Snapshot  : ', SnapshotDir);
 
   Net := BuildFromPretrained(SnapshotDir, {pSeqLen=}16,
-    {pInferenceOnly=}true);
+    {pTrainable=}false);
   try
     WriteLn('Imported  : ', Net.CountLayers, ' layers, ',
       Net.CountWeights, ' weights.');

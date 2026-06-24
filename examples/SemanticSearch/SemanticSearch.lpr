@@ -93,7 +93,7 @@ begin
   SetLength(Nets, Length(Nets) + 1);
   NetLens[High(NetLens)] := TokenCount;
   Nets[High(Nets)] := BuildBertFromSafeTensors(WeightsPath, TokenCount,
-    {pInferenceOnly=}true);
+    {pTrainable=}false);
   Result := Nets[High(Nets)];
 end;
 

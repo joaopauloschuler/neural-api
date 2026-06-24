@@ -38,7 +38,7 @@ Coded by Claude (AI).
 //
 // To run a REAL checkpoint instead, replace the BuildDemoNet block with:
 //   NN := BuildBertForQuestionAnsweringFromSafeTensors(
-//           'model.safetensors', {pSeqLen=}384, {pInferenceOnly=}true);
+//           'model.safetensors', {pSeqLen=}384, {pTrainable=}false);
 //   Tok.LoadFromFile('tokenizer.json');
 // and AnswerSpan / QAReport work unchanged.
 //

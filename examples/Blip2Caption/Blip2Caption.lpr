@@ -91,7 +91,7 @@ begin
   WriteLn('Checkpoint : ', STFile);
 
   BuildBlip2FromSafeTensors(STFile, QFormerNet, ProjectionNet, QueryTokens,
-    Config, NumPatches, {pInferenceOnly=}true, CfgFile);
+    Config, NumPatches, {pTrainable=}false, CfgFile);
 
   VisFeatures := TNNetVolume.Create;
   QfOut := TNNetVolume.Create;

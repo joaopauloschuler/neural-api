@@ -65,7 +65,7 @@ begin
 
   // Dump-only tool: free training volumes during construction (~1/3 memory).
   NN := BuildLlamaFromSafeTensorsEx(ParamStr(1), Config, SeqLen,
-    {pInferenceOnly=}true);
+    {pTrainable=}false);
   try
     WriteLn(StdErr, LlamaConfigToString(Config));
     if SeqLen <= 0 then SeqLen := Config.MaxPositions;

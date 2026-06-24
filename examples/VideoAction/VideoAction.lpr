@@ -132,7 +132,7 @@ begin
 
   WriteLn('VideoAction: imported VideoMAE video-classification transformer');
   Net := BuildVideoMAEFromSafeTensorsEx(FixturePath, Config,
-    {pInferenceOnly=}true, ConfigPath);
+    {pTrainable=}false, ConfigPath);
   try
     WriteLn('  ', VideoMAEConfigToString(Config));
     WriteLn(Format('  clip = %d frames of %dx%d x %d channels, %d tubelet ' +

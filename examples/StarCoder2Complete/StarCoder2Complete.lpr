@@ -51,7 +51,7 @@ Coded by Claude (AI).
 // model.safetensors (or pytorch_model.bin), or the weights file directly
 // (config.json read from its directory). SeqLen defaults to 256 (keep it
 // small on a real 3B checkpoint - the full 16384 context is slow and
-// memory-hungry on CPU; pass pInferenceOnly is on). MaxNewTokens defaults to
+// memory-hungry on CPU; pTrainable is off). MaxNewTokens defaults to
 // 48. The remaining arguments are joined with spaces as the prompt; the
 // default prompt is a short Python function header.
 //
@@ -108,12 +108,12 @@ begin
     Tokenizer.LoadFromFile(TokenizerPath);
 
     WriteLn(StdErr, '==> Loading Starcoder2 checkpoint: ', ModelPath);
-    // pInferenceOnly=true frees training volumes during construction (~1/3 the
+    // pTrainable=false frees training volumes during construction (~1/3 the
     // RAM); BuildFromPretrained dispatches model_type "starcoder2". The net is
     // built at INPUT WIDTH 1 (pSeqLen=1): streamed decode feeds one token per
     // forward and the KV cache (sized below to SeqLen) holds the context, so no
     // wide input layer is ever needed.
-    NN := BuildFromPretrained(ModelPath, {pSeqLen=}1, {pInferenceOnly=}true);
+    NN := BuildFromPretrained(ModelPath, {pSeqLen=}1, {pTrainable=}false);
     VocabSize := NN.GetLastLayer().Output.Size; // (1,1,vocab) flattened
 
     PromptIds := Tokenizer.Encode(Prompt);

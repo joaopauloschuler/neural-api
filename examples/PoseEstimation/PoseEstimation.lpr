@@ -54,7 +54,7 @@ begin
   WriteLn('----------------------------------------------');
   NN := BuildViTPoseFromSafeTensors(
     FixturePath('tiny_vitpose.safetensors'), Config,
-    {pInferenceOnly=}true, FixturePath('tiny_vitpose_config.json'));
+    {pTrainable=}false, FixturePath('tiny_vitpose_config.json'));
   try
     WriteLn(ViTPoseConfigToString(Config));
     W := Config.ImageW; H := Config.ImageH;
