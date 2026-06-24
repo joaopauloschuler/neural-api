@@ -526,7 +526,7 @@ uses
   cl,  // cl_platform_id / cl_device_id for TMusicGenModel.EnableOpenCL
   {$ENDIF}
   Classes, SysUtils, Math, fpjson, jsonparser,
-  neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
+  neuralvolume, neuralnetwork, neuralthread, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralhftokenizer, neuralmxfp4, pascoremath32;
 
 type
@@ -33320,6 +33320,57 @@ begin
   Result := Length(FCodebooks);
 end;
 
+// Per-output-channel worker for the EnCodec conv kernels. EnCodec waveform
+// synthesis is dominated by the upsampled decode convolutions (millions of
+// samples through the SEANet stack); the output-channel loop is embarrassingly
+// parallel (each channel reads the shared read-only input + weights and writes
+// its OWN output row), so splitting the channels across the shared thread pool
+// is race-free and BIT-IDENTICAL to the serial scalar conv. Coded by Claude (AI).
+type
+  TEnCodecConvWorker = class
+  public
+    W, B: TNeuralFloatDynArr;
+    Padded, OutSig, InSig, Full: TNNetFloatDynArr2D;
+    InCh, OutCh, K, Stride, Dil, OutLen, InLen: integer;
+    procedure RunForward(index, threadnum: integer);
+    procedure RunTranspose(index, threadnum: integer);
+  end;
+
+procedure TEnCodecConvWorker.RunForward(index, threadnum: integer);
+var oStart, oFin, o, t, i, k2, src: integer; Acc: TNeuralFloat;
+begin
+  TNeuralThreadList.CalculateWorkingRange(index, threadnum, OutCh, oStart, oFin);
+  for o := oStart to oFin do
+    for t := 0 to OutLen - 1 do
+    begin
+      Acc := B[o];
+      for i := 0 to InCh - 1 do
+        for k2 := 0 to K - 1 do
+        begin
+          src := t * Stride + k2 * Dil;
+          Acc := Acc + W[o * InCh * K + i * K + k2] * Padded[i][src];
+        end;
+      OutSig[o][t] := Acc;
+    end;
+end;
+
+procedure TEnCodecConvWorker.RunTranspose(index, threadnum: integer);
+var oStart, oFin, o, t, i, k2, idx: integer;
+begin
+  TNeuralThreadList.CalculateWorkingRange(index, threadnum, OutCh, oStart, oFin);
+  // Full[o] was zeroed by the caller. Same i-major, t, k2 accumulation order per
+  // element as the serial scatter, so the overlap-add result is bit-identical.
+  for o := oStart to oFin do
+    for i := 0 to InCh - 1 do
+      for t := 0 to InLen - 1 do
+        for k2 := 0 to K - 1 do
+        begin
+          idx := t * Stride + k2;
+          Full[o][idx] := Full[o][idx] +
+            W[i * OutCh * K + o * K + k2] * InSig[i][t];
+        end;
+end;
+
 // Causal Conv1d / ConvTranspose1d on a channel-major signal. Reflect
 // left-padding for Conv1d (pad = (k-1)*dilation + extra ceil-to-stride);
 // ConvTranspose1d upsamples by stride then right-trims (k - stride) frames
@@ -33333,8 +33384,10 @@ var
   InChM1, OutChM1, KM1, InLenM1: integer;
   PadLeftM1, PadRightM1, OutLenM1, FullLenM1: integer;
   Acc: TNeuralFloat;
-  Padded: array of TNeuralFloatDynArr;
-  Full: array of TNeuralFloatDynArr;
+  Padded: TNNetFloatDynArr2D;
+  Full: TNNetFloatDynArr2D;
+  InSigArr: TNNetFloatDynArr2D;
+  ConvWorker: TEnCodecConvWorker;
   RefIdx: integer;
 begin
   InCh := Conv.InCh;
@@ -33401,9 +33454,28 @@ begin
     if OutLen < 0 then OutLen := 0;
     OutLenM1 := OutLen - 1;
     SetLength(OutSig, OutCh);
-    for o := 0 to OutChM1 do
+    for o := 0 to OutChM1 do SetLength(OutSig[o], OutLen);
+    // The output-channel loop is embarrassingly parallel: each channel reads the
+    // shared (read-only) padded input + weights and writes its OWN OutSig[o], so
+    // splitting the channels across worker threads is race-free and BIT-IDENTICAL
+    // to the serial scalar conv (each element still accumulates the same way, in
+    // a register, with one write - the cache-efficient pattern). Only parallelize
+    // when the work is big enough to outweigh thread dispatch (the upsampled
+    // decode stages); tiny convs run inline.
+    if (OutCh >= 4) and (OutLen >= 512) then
     begin
-      SetLength(OutSig[o], OutLen);
+      CreateNeuralThreadListIfRequired();
+      ConvWorker := TEnCodecConvWorker.Create;
+      ConvWorker.W := Conv.W;       ConvWorker.B := Conv.B;
+      ConvWorker.Padded := Padded;  ConvWorker.OutSig := OutSig;
+      ConvWorker.InCh := InCh;      ConvWorker.OutCh := OutCh;
+      ConvWorker.K := K;            ConvWorker.Stride := Stride;
+      ConvWorker.Dil := Dil;        ConvWorker.OutLen := OutLen;
+      fNTL.StartProc({$IFDEF FPC}@ConvWorker.RunForward{$ELSE}ConvWorker.RunForward{$ENDIF});
+      ConvWorker.Free;
+    end
+    else
+    for o := 0 to OutChM1 do
       for t := 0 to OutLenM1 do
       begin
         Acc := Conv.B[o];
@@ -33415,7 +33487,6 @@ begin
           end;
         OutSig[o][t] := Acc;
       end;
-    end;
   end
   else
   begin
@@ -33429,6 +33500,27 @@ begin
       SetLength(Full[o], FullLen);
       for t := 0 to FullLenM1 do Full[o][t] := 0;
     end;
+    // Overlap-add upsample, parallelized over output channels. The o loop is
+    // hoisted outermost (vs. the original i,t,o,k2 nesting) so each thread owns a
+    // disjoint set of Full[o] arrays - race-free, and bit-identical because every
+    // Full[o][idx] still accumulates its (i,t,k2) contributions in the same
+    // i-major, t, k2 order. Tiny convs run inline.
+    if (OutCh >= 4) and (InLen >= 512) then
+    begin
+      CreateNeuralThreadListIfRequired();
+      // Mirror the open-array InSig into a dynamic 2D array (shares the inner
+      // channel rows by reference - no data copy) so the worker can hold it.
+      SetLength(InSigArr, InCh);
+      for i := 0 to InChM1 do InSigArr[i] := InSig[i];
+      ConvWorker := TEnCodecConvWorker.Create;
+      ConvWorker.W := Conv.W;       ConvWorker.InSig := InSigArr;
+      ConvWorker.Full := Full;      ConvWorker.InCh := InCh;
+      ConvWorker.OutCh := OutCh;    ConvWorker.K := K;
+      ConvWorker.Stride := Stride;  ConvWorker.InLen := InLen;
+      fNTL.StartProc({$IFDEF FPC}@ConvWorker.RunTranspose{$ELSE}ConvWorker.RunTranspose{$ENDIF});
+      ConvWorker.Free;
+    end
+    else
     for i := 0 to InChM1 do
       for t := 0 to InLenM1 do
         for o := 0 to OutChM1 do
