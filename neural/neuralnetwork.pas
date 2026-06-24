@@ -19565,8 +19565,7 @@ begin
   end;
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
     pPrevLayer.FOutput.Depth div 2);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetSwiGLU.Compute();
@@ -20007,8 +20006,7 @@ begin
   end;
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
     pPrevLayer.FOutput.Depth div 2);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetTanhGLU.Compute();
@@ -37516,8 +37514,7 @@ begin
   FOutputSizeD := pPrevLayer.Output.Depth div (FPoolSize*FPoolSize);
 
   FOutput.ReSize(FOutputSizeX, FOutputSizeY, FOutputSizeD);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 constructor TNNetUpsample.Create();
@@ -42897,8 +42894,7 @@ begin
   FStruct[0] := FChannels;
   // Output = wkv, C channels, same length as the sequence.
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FChannels);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   if FNeurons.Count < 2 then AddMissingNeurons(2);
   SetNumWeightsForAllNeurons(1, 1, FChannels);
   // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
@@ -49089,8 +49085,7 @@ begin
   FStruct[2] := FHidden;
   SeqLen := pPrevLayer.FOutput.SizeX;
   FOutput.ReSize(SeqLen, 1, FDepth);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   if FIsMLP then
   begin
     if FNeurons.Count < 6 then AddMissingNeurons(6);
@@ -49620,8 +49615,7 @@ begin
   FStruct[2] := FHidden;
   SeqLen := pPrevLayer.FOutput.SizeX;
   FOutput.ReSize(SeqLen, 1, FDepth);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   if FNeurons.Count < 9 then AddMissingNeurons(9);
   for ii := 0 to 2 do FNeurons[ii].FWeights.ReSize(FDepth, 1, FDepth); // theta_K/V/Q
   FNeurons[3].FWeights.ReSize(FDepth, 1, 1);   // eta_raw
@@ -51685,8 +51679,7 @@ begin
       IntToStr(pPrevLayer.FOutput.Depth));
   FHalf := pPrevLayer.FOutput.Depth div 2;
   FOutput.ReSize(FSeqLen, 1, FHalf);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   FVProj.ReSize(FSeqLen, 1, FHalf);
   FGVProj.ReSize(FSeqLen, 1, FHalf);
 end;
@@ -52696,8 +52689,7 @@ begin
   SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
   FNormalized.ReSize(FOutput);
   FInvStd.ReSize(FOutput.SizeX, FOutput.SizeY, 1);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   InitDefault();
 end;
 
@@ -52959,8 +52951,7 @@ begin
   SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
   FNormalized.ReSize(FOutput);
   FInvRMS.ReSize(FOutput.SizeX, FOutput.SizeY, 1);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   InitDefault();
 end;
 
@@ -53346,8 +53337,7 @@ begin
   FNormLN.ReSize(FOutput);
   FNormRMS.ReSize(FOutput);
   FTmp.ReSize(FOutput);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
   InitDefault();
 end;
 
@@ -53513,8 +53503,7 @@ procedure TNNetZScore.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   FNormalized.ReSize(FOutput);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetZScore.Compute();
@@ -54474,8 +54463,7 @@ begin
       aL[LayerCnt].IncDepartingBranchesCnt();
     end;
     Output.Resize(SizeX, SizeY, Deep);
-    FOutputError.Resize(SizeX, SizeY, Deep);
-    FOutputErrorDeriv.Resize(SizeX, SizeY, Deep);
+    SetOutputErrorSize(SizeX, SizeY, Deep);
   end;
   FActivationFn := @Identity;
   FActivationFnDerivative := @IdentityDerivative;
@@ -60361,8 +60349,7 @@ begin
       ') must be <= SeqLen (' + IntToStr(FSeqLen) + ').');
 
   FOutput.ReSize(FSeqLen, 1, FOutDepth);
-  FOutputError.ReSize(FSeqLen, 1, FOutDepth);
-  FOutputErrorDeriv.ReSize(FSeqLen, 1, FOutDepth);
+  SetOutputErrorSize(FSeqLen, 1, FOutDepth);
 
   WeightCount := 2 * FModes * FInDepth * FOutDepth;
   FNeurons[0].Weights.ReSize(WeightCount, 1, 1);
@@ -61279,8 +61266,7 @@ begin
       ') must be <= SizeY (' + IntToStr(FSizeY) + ').');
 
   FOutput.ReSize(FSizeX, FSizeY, FOutDepth);
-  FOutputError.ReSize(FSizeX, FSizeY, FOutDepth);
-  FOutputErrorDeriv.ReSize(FSizeX, FSizeY, FOutDepth);
+  SetOutputErrorSize(FSizeX, FSizeY, FOutDepth);
 
   WeightCount := 2 * FModesX * FModesY * FInDepth * FOutDepth;
   FNeurons[0].Weights.ReSize(WeightCount, 1, 1);
@@ -61547,8 +61533,7 @@ begin
     FErrorProc('TNNetTropicalLinear requires a non-empty input.');
 
   FOutput.ReSize(1, 1, FOutDepth);
-  FOutputError.ReSize(1, 1, FOutDepth);
-  FOutputErrorDeriv.ReSize(1, 1, FOutDepth);
+  SetOutputErrorSize(1, 1, FOutDepth);
 
   WeightCount := FOutDepth * FInDepth;
   FNeurons[0].Weights.ReSize(WeightCount, 1, 1);
@@ -61973,8 +61958,7 @@ begin
   OutLen := FSeqLen - FR;
 
   FOutput.ReSize(OutLen, 1, FDepth);
-  FOutputError.ReSize(OutLen, 1, FDepth);
-  FOutputErrorDeriv.ReSize(OutLen, 1, FDepth);
+  SetOutputErrorSize(OutLen, 1, FDepth);
 
   SetLength(FSrcToOut, FSeqLen);
   SetLength(FSrcWeight, FSeqLen);
@@ -65219,8 +65203,7 @@ begin
   SizeCores();
 
   FOutput.ReSize(N, 1, 1);
-  FOutputError.ReSize(N, 1, 1);
-  FOutputErrorDeriv.ReSize(N, 1, 1);
+  SetOutputErrorSize(N, 1, 1);
 
   // Forward messages T_0..T_{d-1} are (re)allocated lazily in ComputeCPU.
   MaxMsg := Length(FMsg) - 1;
@@ -71045,8 +71028,7 @@ begin
   end;
 
   FOutput.ReSize(SizeX,SizeY,Depth);
-  FOutputError.ReSize(FOutput);
-  FOutputErrorDeriv.ReSize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 constructor TNNetSplitChannels.Create(ChannelStart, ChannelLen: integer);
@@ -73856,8 +73838,7 @@ begin
     // Collapse-all mode: any (SizeX, SizeY, Depth) -> (1, 1, N).
     FOutput.Resize(1, 1, pPrevLayer.FOutput.Size);
   end;
-  FOutputError.Resize(FOutput);
-  FOutputErrorDeriv.Resize(FOutput);
+  SetOutputErrorSize(FOutput);
 end;
 
 procedure TNNetSqueeze.Compute;
