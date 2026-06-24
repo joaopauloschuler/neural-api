@@ -2,9 +2,10 @@
 <img align="right" src="docs/cai.png" height="192">
 
 **Everyone says Pascal died in the 90s.** Meanwhile, this Pascal library runs GPT-style transformers, Mixture-of-Experts, RWKV, xLSTM, spiking neurons, and normalizing flows, natively, with no Python nor CUDA lock-in. Your PyTorch project: 4GB of dependencies, a conda environment that breaks monthly. This: **compile to a single native binary with AVX**. This is deep learning the way systems programmers wish it worked.
-CAI NEURAL API is a pascal based deep learning neural network API optimized for AVX, AVX2 and AVX512 instruction sets plus OpenCL capable devices including AMD, Intel and NVIDIA. This API has been tested under Windows and Linux. 
+**And it actually runs the real thing.** Point the [`ChatTerminal`](examples/ChatTerminal) example at a HuggingFace Qwen2 or Qwen2.5 instruct checkpoint and chat with a genuine LLM in your terminal: **OpenCL-accelerated**, **no Python**, **no CUDA** — with more architectures landing all the time. Then hand a text prompt to [`MusicGenText`](examples/MusicGenText) and watch the *same library* turn *"lo-fi hip-hop with a mellow piano"* into actual audio — T5 encoder and MusicGen decoder. One native binary, from a 20-line CIFAR demo to a billion-parameter transformer.
 
-Some [trained neural networks](https://github.com/joaopauloschuler/pre-trained-neural-api-networks/) are available.
+CAI NEURAL API is a Pascal deep-learning library optimized for the AVX, AVX2 and AVX512 instruction sets and for OpenCL devices from AMD, Intel and NVIDIA. Tested on Windows and Linux.
+
 
 ## Intro Videos
 [![Watch the video](https://img.youtube.com/vi/aIy1S7clhQo/0.jpg)](https://youtu.be/aIy1S7clhQo) | [![Watch the video](https://img.youtube.com/vi/q56NcgUiAAk/0.jpg)](https://youtu.be/q56NcgUiAAk) | [![Watch the video](https://img.youtube.com/vi/PdNTgI_qSyo/0.jpg)](https://youtu.be/PdNTgI_qSyo)
