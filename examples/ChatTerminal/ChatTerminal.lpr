@@ -34,8 +34,18 @@ end-of-turn marker (e.g. <|im_end|> for ChatML - matched as a token-id stop
 sequence in the generated region and trimmed from the reply), or after
 --max-new-tokens.
 
-The model is always built with pTrainable=false (the REPL never trains;
-frees the per-neuron gradient/momentum buffers). Full-precision FP32 weights
+The model is always built inference-only (pTrainable=false): the REPL never
+trains, so the per-neuron gradient/momentum (Delta/BackInertia) training
+buffers are never allocated.
+
+Independently of trainability, --low-memory / --max-fast-memory toggles the
+low-memory forward path (the pLowMemory argument of SetTrainable). When ON
+(the DEFAULT) each conv/linear layer DROPS its persistent concatenated
+weight cache (FConcatedWeights) and computes per-neuron straight from the
+weights: less resident RAM, a somewhat slower forward. --max-fast-memory keeps
+the concatenated cache for a faster forward at the cost of more RAM. (The two
+settings are orthogonal; low memory only touches the forward weight cache,
+trainability only the backprop buffers.) Full-precision FP32 weights
 are the DEFAULT: faster, at the cost of more RAM. Pass --int8 for weight-only
 int8 storage (pQuantizeInt8): less RAM, but slower (each layer is dequantized
 on the fly).
@@ -85,6 +95,7 @@ Coded by Claude (AI).
 
 uses
   {$IFDEF UNIX}cthreads, cmem,{$ENDIF}
+  {$IFDEF OpenCL}neuralopencl,{$ENDIF}
   Classes, SysUtils, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralpretrained, neuralhftokenizer,
   neuralchat, neuraldecode;
@@ -99,6 +110,9 @@ type
   TChatOptions = record
     ModelDir: string;
     Int8: boolean;
+    LowMemory: boolean;          // true (default) = low-memory forward path
+                                 // (drops the concatenated weight cache);
+                                 // independent of trainability
     CtxLen: integer;             // pSeqLen (0 = the model's full context)
     MaxNewTokens: integer;
     Temperature: TNeuralFloat;   // 1.0 = off
@@ -116,6 +130,9 @@ type
     ShowHelp: boolean;
     Stats: boolean;              // per-turn timing to stderr (TTFT, tok/s)
     NoCacheReuse: boolean;       // force full re-prefill every turn (A/B + debug)
+    Gpu: boolean;                // offload conv/linear matmuls via OpenCL
+    GpuPlatform: integer;        // OpenCL platform index (default 0)
+    GpuDevice: integer;          // OpenCL device index within the platform (0)
     ErrorMsg: string;
   end;
 
@@ -143,6 +160,12 @@ begin
   WriteLn('  --system "msg"        initial system prompt');
   WriteLn('  --fp32                full-precision weights (DEFAULT; faster, more RAM)');
   WriteLn('  --int8                int8 weight-only quantized inference (slower, less RAM)');
+  WriteLn('  --low-memory          drop conv/linear weight cache; per-neuron forward (DEFAULT)');
+  WriteLn('  --max-fast-memory     keep the concatenated weight cache (faster forward, more RAM)');
+  WriteLn('  --gpu                 OpenCL offload of conv/linear matmuls (DEFAULT when');
+  WriteLn('                        built with -dOpenCL); --no-gpu forces CPU');
+  WriteLn('  --gpu-platform N      OpenCL platform index (default 0)');
+  WriteLn('  --gpu-device N        OpenCL device index within the platform (default 0)');
   WriteLn('  --stats               per-turn timing to stderr (TTFT, decode tok/s)');
   WriteLn('  --no-cache-reuse      re-prefill the whole prompt each turn (default:');
   WriteLn('                        reuse the shared KV-cache prefix from last turn)');
@@ -156,6 +179,7 @@ function DefaultChatOptions(): TChatOptions;
 begin
   Result.ModelDir := '';
   Result.Int8 := false; // full-precision FP32 weights by default (--int8 for less RAM)
+  Result.LowMemory := true; // low-memory forward path by default (drops weight cache)
   Result.CtxLen := 0;
   Result.MaxNewTokens := 128;
   Result.Temperature := 1.0;
@@ -173,6 +197,11 @@ begin
   Result.ShowHelp := false;
   Result.Stats := false;
   Result.NoCacheReuse := false;
+  // OpenCL offload defaults ON when the binary is built with -dOpenCL (the
+  // default compilation), OFF otherwise; --no-gpu forces CPU either way.
+  Result.Gpu := {$IFDEF OpenCL}true{$ELSE}false{$ENDIF};
+  Result.GpuPlatform := 0;
+  Result.GpuDevice := 0;
   Result.ErrorMsg := '';
 end;
 
@@ -237,8 +266,22 @@ begin
     Arg := Args[ArgPos];
     if Arg = '--int8' then Opt.Int8 := true
     else if Arg = '--fp32' then Opt.Int8 := false
+    else if Arg = '--low-memory' then Opt.LowMemory := true
+    else if Arg = '--max-fast-memory' then Opt.LowMemory := false
     else if Arg = '--stats' then Opt.Stats := true
     else if Arg = '--no-cache-reuse' then Opt.NoCacheReuse := true
+    else if Arg = '--gpu' then Opt.Gpu := true
+    else if Arg = '--no-gpu' then Opt.Gpu := false
+    else if Arg = '--gpu-platform' then
+    begin
+      if not NextInt(Arg, IVal) then exit(false);
+      Opt.GpuPlatform := IVal;
+    end
+    else if Arg = '--gpu-device' then
+    begin
+      if not NextInt(Arg, IVal) then exit(false);
+      Opt.GpuDevice := IVal;
+    end
     else if Arg = '--selftest' then Opt.SelfTest := true
     else if (Arg = '--help') or (Arg = '-h') then Opt.ShowHelp := true
     else if Arg = '--temperature' then
@@ -727,6 +770,39 @@ begin
     Args.Add('/tmp/model');
     Check(ParseArgs(Args, Opt) and not Opt.Stats, 'stats off by default');
 
+    // Low-memory forward path is on by default; --max-fast-memory keeps the
+    // concatenated weight cache; --low-memory re-enables the per-neuron path.
+    // Orthogonal to trainability (the build is always inference-only).
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and Opt.LowMemory, 'low-memory on by default');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--max-fast-memory');
+    Check(ParseArgs(Args, Opt) and not Opt.LowMemory, '--max-fast-memory disables it');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--max-fast-memory'); Args.Add('--low-memory');
+    Check(ParseArgs(Args, Opt) and Opt.LowMemory, '--low-memory re-enables it');
+
+    // OpenCL offload: --gpu/--no-gpu toggle, platform/device indices parse.
+    // (The default depends on the -dOpenCL build define, so only toggles are
+    // asserted here.)
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--gpu');
+    Check(ParseArgs(Args, Opt) and Opt.Gpu, '--gpu enables OpenCL offload');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--no-gpu');
+    Check(ParseArgs(Args, Opt) and not Opt.Gpu, '--no-gpu forces CPU');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--gpu-platform'); Args.Add('1');
+    Args.Add('--gpu-device'); Args.Add('2');
+    Check(ParseArgs(Args, Opt) and (Opt.GpuPlatform = 1) and (Opt.GpuDevice = 2),
+      '--gpu-platform/--gpu-device parse');
+
     // KV-cache reuse is on by default; --no-cache-reuse disables it.
     Args.Clear;
     Args.Add('/tmp/model');
@@ -826,6 +902,9 @@ var
   Sampler: TNNetSamplerBase;
   Penalty: TNNetTokenHistoryPenalty;
   ReuseOK: boolean;             // KV-cache reuse sound for this architecture?
+  {$IFDEF OpenCL}
+  GpuCL: TEasyOpenCL;           // platform/device handle for OpenCL offload
+  {$ENDIF}
   Cnt, SeqLen, VocabSize: integer;
   Line, Cmd, Arg, Reply, ModelType, Marker: string;
   TokenizerFile, TokenizerConfigFile: string;
@@ -913,10 +992,16 @@ begin
   // opt-in for less RAM at the cost of speed (per-layer dequantization).
   if Opt.Int8 then
     WriteLn('[--int8: int8 weight-only quantized weights - slower, less RAM;',
-      ' pass --fp32 (or drop --int8) for full-precision]')
+      ' pass --fp32 (or drop --int8) for GPU capable full-precision]')
   else
-    WriteLn('[fp32 weights (default) - faster, more RAM;',
-      ' pass --int8 for less RAM (slower)]');
+    WriteLn('[fp32 weights (default) - GPU capable]');
+  if Opt.LowMemory then
+    WriteLn('[low-memory forward (default) - concatenated weight cache dropped,',
+      ' per-neuron compute, not compatible with GPU,',
+      ' pass --max-fast-memory to keep the (faster) cache and/or use GPU.]')
+  else
+    WriteLn('[--max-fast-memory: concatenated weight cache kept - faster forward,',
+      ' more RAM, GPU compatible]');
 
   WriteLn('Loading ', Opt.ModelDir, ' ...');
   // Built at INPUT WIDTH 1 (pSeqLen=1): streamed decode feeds one token per
@@ -924,6 +1009,59 @@ begin
   // the context. SeqLen is the cache budget, NOT the built input width.
   NN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}1,
     {pTrainable=}false, '', {pQuantizeInt8=}Opt.Int8);
+  // Low-memory forward path, set independently of trainability. The importer
+  // built inference-only with low memory ON (SetTrainable's pLowMemory default);
+  // honor --max-fast-memory by re-sweeping the layers, then flush each weight
+  // cache so the concatenated-weight cache is (re)built or dropped to match.
+  NN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
+  for Cnt := 0 to NN.GetLastLayerIdx() do
+    NN.Layers[Cnt].FlushWeightCache();
+
+  {$IFDEF OpenCL}
+  // OpenCL offload of the conv/linear matmuls. Enabling it rebuilds each
+  // accelerated layer's concatenated weight cache and turns its low-memory
+  // forward path off (the GPU kernel needs the cache), so --gpu effectively
+  // overrides --low-memory on those layers. Incompatible with --int8 (the
+  // int8 path never builds the interleaved cache the kernel consumes).
+  GpuCL := nil;
+  if Opt.Gpu and Opt.Int8 then
+  begin
+    WriteLn('[--gpu ignored: incompatible with --int8 - running int8 on CPU]');
+    Opt.Gpu := false;
+  end;
+  if Opt.Gpu then
+  begin
+    GpuCL := TEasyOpenCL.Create();
+    if GpuCL.GetPlatformCount() = 0 then
+    begin
+      WriteLn('[--gpu: no OpenCL platform found - falling back to CPU]');
+      FreeAndNil(GpuCL);
+    end
+    else
+    begin
+      if (Opt.GpuPlatform < 0) or
+        (Opt.GpuPlatform >= GpuCL.GetPlatformCount()) then Opt.GpuPlatform := 0;
+      GpuCL.SetCurrentPlatform(GpuCL.PlatformIds[Opt.GpuPlatform]);
+      if GpuCL.GetDeviceCount() = 0 then
+      begin
+        WriteLn('[--gpu: no OpenCL device on platform ',
+          GpuCL.PlatformNames[Opt.GpuPlatform], ' - falling back to CPU]');
+        FreeAndNil(GpuCL);
+      end
+      else
+      begin
+        if (Opt.GpuDevice < 0) or
+          (Opt.GpuDevice >= GpuCL.GetDeviceCount()) then Opt.GpuDevice := 0;
+        GpuCL.SetCurrentDevice(GpuCL.Devices[Opt.GpuDevice]);
+        WriteLn('[--gpu: OpenCL on ', GpuCL.PlatformNames[Opt.GpuPlatform],
+          ' / ', GpuCL.DeviceNames[Opt.GpuDevice], ']');
+        NN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
+          GpuCL.Devices[Opt.GpuDevice]);
+      end;
+    end;
+  end;
+  {$ENDIF}
+
   SeqLen := Opt.CtxLen;
   VocabSize := NN.GetLastLayer().Output.Depth;
   Session := TNNetStreamingDecoder.Create(NN, SeqLen);
@@ -1030,4 +1168,7 @@ begin
   Session.Free; // before NN.Free: Destroy ends incremental decode on NN's layers
   Tokenizer.Free;
   NN.Free;
+  {$IFDEF OpenCL}
+  GpuCL.Free; // after NN.Free; nil-safe when --gpu was off or fell back to CPU
+  {$ENDIF}
 end.
