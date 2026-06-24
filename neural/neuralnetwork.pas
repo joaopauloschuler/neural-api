@@ -1,4 +1,4 @@
-(*
+﻿(*
 neuralnetwork
 Copyright (C) 2024 Joao Paulo Schwarz Schuler
 
@@ -8872,7 +8872,7 @@ type
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create(); override;
+      constructor Create(); overload; override;
       constructor Create(pAxis: integer); overload;
 
       procedure Compute(); override;
@@ -17052,6 +17052,13 @@ type
 
 implementation
 
+{$IFNDEF FPC}
+function BoolToString(B: Boolean; const TrueS, FalseS: string): String; inline;
+begin
+  if B then Result := TrueS else Result := FalseS;
+end;
+{$ENDIF}
+
 procedure RebuildPatternOnPreviousPatterns
 (
   Calculated: TNNetVolume;
@@ -20933,9 +20940,9 @@ var
   Alpha, Beta: array of array of double; // [ti][si] log-space lattice
   LogLike, av, bv, occ, lse: double;
   Gamma: array of array of double; // [ti][si] = exp(alpha+beta-LogLike)
-  function LP(tt, kk: integer): double; inline;
+  function LP(volume: TNNetVolume; tt, kk: integer): double; inline;
   begin
-    Result := ALogProbs[tt, 0, kk];
+    Result := volume[tt, 0, kk];
   end;
   function LogAdd(x, y: double): double; inline;
   begin
@@ -20982,8 +20989,8 @@ begin
     end;
 
   // Forward (alpha). Init: at ti=0 only the first blank or first label.
-  Alpha[0][0] := LP(0, Ext[0]);
-  if NS > 1 then Alpha[0][1] := LP(0, Ext[1]);
+  Alpha[0][0] := LP(ALogProbs, 0, Ext[0]);
+  if NS > 1 then Alpha[0][1] := LP(ALogProbs, 0, Ext[1]);
   for ti := 1 to NTM1 do
     for si := 0 to NSM1 do
     begin
@@ -20992,7 +20999,7 @@ begin
       // Skip transition allowed only between two DISTINCT non-blank labels.
       if (si >= 2) and (Ext[si] <> Blank) and (Ext[si] <> Ext[si - 2]) then
         av := LogAdd(av, Alpha[ti - 1][si - 2]);
-      Alpha[ti][si] := av + LP(ti, Ext[si]);
+      Alpha[ti][si] := av + LP(ALogProbs, ti, Ext[si]);
     end;
 
   // Backward (beta). Init: at ti=NT-1 only the last blank or last label.
@@ -21001,11 +21008,11 @@ begin
   for ti := NT - 2 downto 0 do
     for si := NS - 1 downto 0 do
     begin
-      bv := Beta[ti + 1][si] + LP(ti + 1, Ext[si]);
+      bv := Beta[ti + 1][si] + LP(ALogProbs, ti + 1, Ext[si]);
       if si + 1 <= NS - 1 then
-        bv := LogAdd(bv, Beta[ti + 1][si + 1] + LP(ti + 1, Ext[si + 1]));
+        bv := LogAdd(bv, Beta[ti + 1][si + 1] + LP(ALogProbs, ti + 1, Ext[si + 1]));
       if (si + 2 <= NS - 1) and (Ext[si] <> Blank) and (Ext[si] <> Ext[si + 2]) then
-        bv := LogAdd(bv, Beta[ti + 1][si + 2] + LP(ti + 1, Ext[si + 2]));
+        bv := LogAdd(bv, Beta[ti + 1][si + 2] + LP(ALogProbs, ti + 1, Ext[si + 2]));
       Beta[ti][si] := bv;
     end;
 
@@ -28389,7 +28396,8 @@ begin
   if FUseBias then Needed := Needed + FDout;
   if FWeightsLayer.FOutput.Size <> Needed then
     FErrorProc('TNNetHyperLinear requires a WeightsSource of size Din*Dout' +
-      BoolToStr(FUseBias, '+Dout', '') + ' = ' + IntToStr(Needed) +
+      {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(FUseBias, '+Dout', '') +
+      ' = ' + IntToStr(Needed) +
       ' (Din=' + IntToStr(FDin) + ', Dout=' + IntToStr(FDout) +
       '). Got size=' + IntToStr(FWeightsLayer.FOutput.Size));
   FOutput.ReSize(FDout, 1, 1);
@@ -28533,7 +28541,8 @@ begin
   if FUseBias then Needed := Needed + FOutChannels;
   if FWeightsLayer.FOutput.Size <> Needed then
     FErrorProc('TNNetHyperConv requires a WeightsSource of size ' +
-      'OutChannels*K*K*InChannels' + BoolToStr(FUseBias, '+OutChannels', '') +
+      'OutChannels*K*K*InChannels' +
+      {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(FUseBias, '+OutChannels', '') +
       ' = ' + IntToStr(Needed) + ' (OutChannels=' + IntToStr(FOutChannels) +
       ', K=' + IntToStr(FFeatureSize) + ', InChannels=' +
       IntToStr(FInChannels) + '). Got size=' +
@@ -78629,7 +78638,7 @@ begin
       'LossLandscapeProbe: K=%d, R=%.4f, samples=%d, trainable layers=%d, ' +
       'LossKind=%d (%s).',
       [K, R, Samples.Count, T, LossKind,
-       BoolToStr(LossKind = 1, 'cross-entropy', 'MSE')]));
+       {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(LossKind = 1, 'cross-entropy', 'MSE')]));
     Lines.Add('');
     Lines.Add(Format('%-7s %14s', ['alpha', 'loss']));
     Lines.Add(StringOfChar('-', 24));
@@ -80544,7 +80553,7 @@ begin
 
     // Theoretical RF from the analytical sibling: parse the "Final receptive
     // field: <rfx> x <rfy>" line so we never duplicate the recurrence.
-    FS := DefaultFormatSettings;
+    FS := {$IFDEF FPC} DefaultFormatSettings; {$ELSE} FormatSettings; {$ENDIF}
     FS.DecimalSeparator := '.';
     FS.ThousandSeparator := #0;
     AnalyticReport := TNNet.ReceptiveFieldReport(NN);
@@ -84328,13 +84337,13 @@ begin
 
     Lines.Add(Format('Would-fit-in budget (%.1f MiB):', [BudgetMiB]));
     Lines.Add(Format('  forward-only : %10.4f MiB  -> %s',
-      [ForwardOnlyMiB, BoolToStr(ForwardOnlyMiB <= BudgetMiB, 'FITS', 'OVER')]));
+      [ForwardOnlyMiB, {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(ForwardOnlyMiB <= BudgetMiB, 'FITS', 'OVER')]));
     Lines.Add(Format('  train-SGD    : %10.4f MiB  -> %s',
-      [TrainSGDMiB, BoolToStr(TrainSGDMiB <= BudgetMiB, 'FITS', 'OVER')]));
+      [TrainSGDMiB, {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(TrainSGDMiB <= BudgetMiB, 'FITS', 'OVER')]));
     Lines.Add(Format('  train-Adam   : %10.4f MiB  -> %s',
-      [TrainAdamMiB, BoolToStr(TrainAdamMiB <= BudgetMiB, 'FITS', 'OVER')]));
+      [TrainAdamMiB, {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(TrainAdamMiB <= BudgetMiB, 'FITS', 'OVER')]));
     Lines.Add(Format('  train-%-6s : %10.4f MiB  -> %s',
-      [KindLow, TrainMiB, BoolToStr(TrainMiB <= BudgetMiB, 'FITS', 'OVER')]));
+      [KindLow, TrainMiB, {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(TrainMiB <= BudgetMiB, 'FITS', 'OVER')]));
 
     Result := Lines.Text;
   finally
@@ -92277,7 +92286,7 @@ begin
       'SaliencyReport: probe shape (%d,%d,%d), %d classes. ' +
       'Predicted class c=%d (forced=%s).',
       [SizeX, SizeY, Depth, NClasses, PredClass,
-       BoolToStr(ForcedClass >= 0, 'yes', 'no')]));
+       {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(ForcedClass >= 0, 'yes', 'no')]));
     Lines.Add(Format(
       'logit_c(x)=%8.4f  logit_c(0)=%8.4f  delta=%8.4f  ' +
       'SmoothGrad N=%d sigma=%.4f  IG steps=%d.',
@@ -92285,7 +92294,7 @@ begin
     Lines.Add(Format(
       'IG completeness gap |sum(IG) - delta| = %.6g  (relative %.4f%%): %s.',
       [GapAbs, RelGap * 100.0,
-       BoolToStr((RelGap < 0.1) and (not IsNan(RelGap)),
+       {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}((RelGap < 0.1) and (not IsNan(RelGap)),
                  'OK (small)', 'large - check integration')]));
     Lines.Add(StringOfChar('-', 72));
 
@@ -92628,7 +92637,7 @@ begin
       'feature map (%d,%d,%d). Predicted class c=%d (forced=%s).',
       [Probe.SizeX, Probe.SizeY, Probe.Depth, TargetIdx,
        ConvLayer.ClassName, CSizeX, CSizeY, CDepth, PredClass,
-       BoolToStr(ForcedClass >= 0, 'yes', 'no')]));
+       {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(ForcedClass >= 0, 'yes', 'no')]));
     Lines.Add(Format(
       'Coarse Grad-CAM peak at conv cell (x=%d,y=%d) value=%.4f. ' +
       'Map normalised to [0,1].', [PeakX, PeakY, PeakVal]));
@@ -92823,7 +92832,7 @@ begin
     Lines.Add(Format('Probe shape (%d,%d,%d), %d outputs. Explained class c=%d '
       + '(forced=%s).',
       [SizeX, SizeY, Depth, OutSize, PredClass,
-       BoolToStr(ForcedClass >= 0, 'yes', 'no')]));
+       {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(ForcedClass >= 0, 'yes', 'no')]));
     Lines.Add(Format('Seed relevance R_c = logit_c = %8.4f   eps = %.4g   '
       + 'gamma = %.4g   alpha = %.4g   beta = %.4g',
       [PredLogit, Eps, Gamma, Alpha, Beta]));
@@ -93166,7 +93175,7 @@ begin
     Lines.Add(Format('Layers=%d. Clean argmax=%d, Corrupt argmax=%d, ' +
       'TargetClass c=%d%s.',
       [NumLayers, CleanClass, CorruptClass, c,
-       BoolToStr(TargetIdx < 0, ' (default=clean argmax)', '')]));
+       {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(TargetIdx < 0, ' (default=clean argmax)', '')]));
     Lines.Add(Format('logit_c(clean)=%8.4f  logit_c(corrupt)=%8.4f  ' +
       'denom=%8.4f', [CleanLogitC, CorruptLogitC, Denom]));
     if DenomCollapsed then

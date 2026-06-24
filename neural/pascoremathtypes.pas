@@ -12,8 +12,18 @@ interface
 uses Math;
 
 type
+  {$IFDEF FPC}
+  {$ELSE}
+  QWord = UInt64;
+  DWord = UInt32;
+  {$ENDIF}
+
   TUInt128 = record
     lo, hi: UInt64;
+    {$IFDEF FPC}
+    {$ELSE}
+    class operator Add(const a: TUInt128; b: UInt64): TUInt128; inline;
+    {$ENDIF}
   end;
 
   Tb32u32 = record
@@ -58,7 +68,9 @@ type
     sgn: UInt64;   // sign: 0 = positive, 1 = negative
   end;
 
+{$IFDEF FPC}
 operator +(const a: TUInt128; b: UInt64): TUInt128; inline;
+{$ENDIF}
 
 procedure AddU128(out r: TUInt128; const a, b: TUInt128); inline;
 procedure SubU128(out r: TUInt128; const a, b: TUInt128); inline;
@@ -126,7 +138,7 @@ procedure MulTInt(out r: TInt64; const a, b: TInt64); {$IFNDEF AVX2} inline; {$E
 procedure TIntFromD(out a: TInt64; b: Double); inline;
 // Convert TInt64 to Double with directed rounding driven by err (in ulps of l).
 // y, x are pass-through inputs used only for the worst-case panic message.
-function TIntToD(const a: TInt64; err: UInt64; y, x: Double): Double; inline;
+function TIntToD(const a: TInt64; err: UInt64; y, x: Double): Double; {$IFDEF FPC} inline; {$ENDIF}
 // r := 1 / A   (relative error < 2^-103.9; A must be non-zero)
 procedure InvTInt(out r: TInt64; const A: TInt64); inline;
 // r := b / a   (relative error < 2^-185.53)
@@ -318,11 +330,13 @@ end;
 // TUInt128 operator and Mulu64u64 (existing)
 // ---------------------------------------------------------------------------
 
+{$IFDEF FPC}
 operator +(const a: TUInt128; b: UInt64): TUInt128; inline;
 begin
   Result.lo := a.lo + b;
   Result.hi := a.hi + UInt64(Result.lo < b);
 end;
+{$ENDIF}
 
 function Mulu64u64(a, b: UInt64): TUInt128;
 {$IFDEF AVX2}
@@ -985,7 +999,7 @@ asm
   mul r9                 // rdx:rax = a*b
   mov [rcx], rdx         // *hi = high
   mov [r10], rax         // *lo = low
-end ['rax', 'rcx', 'r10'];
+end;
 {$ELSE}
 // SysV: rdi=@hi, rsi=@lo, rdx=a, rcx=b. mul leaves product in rdx:rax.
 procedure Mul64x64(out hi, lo: UInt64; a, b: UInt64); assembler; nostackframe;
@@ -994,7 +1008,7 @@ asm
   mul rcx                // a * b -> rdx:rax (high:low)
   mov [rdi], rdx         // *hi = high
   mov [rsi], rax         // *lo = low
-end ['rax', 'rdx'];
+end;
 {$ENDIF}
 {$ELSE}
 procedure Mul64x64(out hi, lo: UInt64; a, b: UInt64); inline;
@@ -1027,7 +1041,7 @@ asm
   mov rax, [rdx+8]       // a.h
   sbb rax, [r8+8]        // - b.h - borrow
   mov [rcx+8], rax       // r.h
-end ['rax','rcx','rdx','r8'];
+end;
 {$ELSE}
 // SysV x86-64 ABI: rdi=@r, rsi=@a, rdx=@b. TInt64 layout: m@0, h@8, l@16.
 procedure Sub192(out r: TInt64; const a, b: TInt64); assembler; nostackframe;
@@ -1041,7 +1055,7 @@ asm
   mov rax, [rsi+8]       // a.h
   sbb rax, [rdx+8]       // - b.h - borrow
   mov [rdi+8], rax       // r.h
-end ['rax'];
+end;
 {$ENDIF}
 {$ELSE}
 procedure Sub192(out r: TInt64; const a, b: TInt64); inline;
@@ -1078,7 +1092,7 @@ asm
   mov [rcx+8], rax       // r.h
   setc al                // carry-out into AL
   movzx rax, al          // zero-extend to 64-bit Result (RAX)
-end ['rax','rcx','rdx','r8'];
+end;
 {$ELSE}
 // SysV x86-64 ABI: rdi=@r, rsi=@a, rdx=@b. Result returned in rax.
 function Add192Cy(out r: TInt64; const a, b: TInt64): UInt64; assembler; nostackframe;
@@ -1510,7 +1524,7 @@ begin
 end;
 
 // Ported from tint_tod in tint.h. Calls Math.Ldexp for the final exponent fold.
-function TIntToD(const a: TInt64; err: UInt64; y, x: Double): Double; inline;
+function TIntToD(const a: TInt64; err: UInt64; y, x: Double): Double; {$IFDEF FPC} inline; {$ENDIF}
 const
   S: array[0..1] of Double = (1.0, -1.0);
 var
@@ -2305,5 +2319,15 @@ begin
   r := a.r0 shr (63 - a.ex);
   if a.sgn = 1 then QIntToI := -Int64(r) else QIntToI := Int64(r);
 end;
+
+{ TUInt128 }
+
+{$IFNDEF FPC}
+class operator TUInt128.Add(const a: TUInt128; b: UInt64): TUInt128;
+begin
+  Result.lo := a.lo + b;
+  Result.hi := a.hi + UInt64(Result.lo < b);
+end;
+{$ENDIF}
 
 end.

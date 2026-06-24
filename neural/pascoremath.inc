@@ -1,5 +1,6 @@
-{$UNITPATH ./}
 {$IFDEF FPC}
+  {$UNITPATH ./}
+
   {$COPERATORS ON}
   {$MODE OBJFPC}
   {$ASMMODE INTEL}
@@ -78,5 +79,7 @@
 {$ENDIF}
 
 {$IFDEF AVXANY}
-  {$PIC OFF}
+  {$IFNDEF MSWINDOWS}
+    {$PIC OFF}
+  {$ENDIF}
 {$ENDIF}

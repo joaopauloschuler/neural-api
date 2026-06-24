@@ -27,7 +27,7 @@ unit neuraldatasets;
 interface
 
 uses
-  {$IFNDEF FPC}System.Classes, Windows, Vcl.Graphics,{$ENDIF}
+  {$IFNDEF FPC}System.Classes, Windows, Vcl.Graphics, System.JSON, {$ENDIF}
   neuralvolume, neuralnetwork, pascoremath32
   {$IFDEF FPC},
   FPimage, FPReadBMP, FPReadPCX, FPReadJPEG, FPReadPNG,
@@ -3409,6 +3409,7 @@ begin
   end;
 end;
 
+{$IFDEF FPC}
 function ReadImagePreprocessConfig(
   const FileName: string): TNNetImagePreprocess;
 var
@@ -3492,6 +3493,90 @@ begin
     JsonText.Free;
   end;
 end;
+{$ELSE}
+function ReadImagePreprocessConfig(
+  const FileName: string): TNNetImagePreprocess;
+var
+  JsonText: TStringList;
+  Root: TJSONValue;
+  Obj: TJSONObject;
+
+  // Reads a size-like field that may be an int (square) or an object with
+  // shortest_edge / height / width. Returns the resolved edge length.
+  function ReadEdge(const FieldName: string; DefaultEdge: integer): integer;
+  var
+    Data: TJSONValue;
+    O: TJSONObject;
+    Temp: TJSONValue;
+  begin
+    Result := DefaultEdge;
+    Data := Obj.FindValue(FieldName);
+    if Data = nil then Exit;
+
+    if Data is TJSONObject then
+    begin
+      O := Data as TJSONObject;
+      if O.TryGetValue('shortest_edge', Temp) then
+        Result := (Temp as TJSONNumber).AsInt
+      else if O.TryGetValue('height', Temp) then
+        Result := (Temp as TJSONNumber).AsInt
+      else if O.TryGetValue('width', Temp) then
+        Result := (Temp as TJSONNumber).AsInt;
+    end
+    else if Data is TJSONNumber then
+      Result := (Data as TJSONNumber).AsInt;
+  end;
+
+  procedure ReadTriple(const FieldName: string; var Arr: array of TNeuralFloat;
+    D0, D1, D2: TNeuralFloat);
+  var
+    Data: TJSONValue;
+    A: TJSONArray;
+  begin
+    Arr[0] := D0; Arr[1] := D1; Arr[2] := D2;
+    Data := Obj.FindValue(FieldName);
+    if (Data <> nil) and (Data is TJSONArray) then
+    begin
+      A := Data as TJSONArray;
+      if A.Count >= 3 then
+      begin
+        Arr[0] := (A.Items[0] as TJSONNumber).AsDouble;
+        Arr[1] := (A.Items[1] as TJSONNumber).AsDouble;
+        Arr[2] := (A.Items[2] as TJSONNumber).AsDouble;
+      end;
+    end;
+  end;
+
+begin
+  if not FileExists(FileName) then
+    raise Exception.Create(
+      'ReadImagePreprocessConfig: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := TJSONObject.ParseJSONValue(JsonText.Text);
+    if Root = nil then
+      raise Exception.Create('ReadImagePreprocessConfig: config "' +
+        FileName + '" is not valid JSON.');
+    if not (Root is TJSONObject) then
+      raise Exception.Create('ReadImagePreprocessConfig: config "' +
+        FileName + '" is not a JSON object.');
+    Obj := Root as TJSONObject;
+
+    Result.ResizeShorterSide := ReadEdge('size', 224);
+    Result.CropSize := ReadEdge('crop_size', Result.ResizeShorterSide);
+    // Defaults follow CLIPImageProcessor (the OpenAI image_mean/image_std).
+    ReadTriple('image_mean', Result.Mean,
+      csClipMean[0], csClipMean[1], csClipMean[2]);
+    ReadTriple('image_std', Result.Std,
+      csClipStd[0], csClipStd[1], csClipStd[2]);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+{$ENDIF}
 
 procedure ConfusionWriteCSVHeader(var CSVConfusion: TextFile; Labels: array of string);
 var
