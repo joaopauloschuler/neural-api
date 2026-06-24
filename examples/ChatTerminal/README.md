@@ -63,13 +63,50 @@ guard, flushed per token so piped output streams too).
 | `--ctx N` | context window to build (`pSeqLen`) | model max |
 | `--format NAME` | `chatml`/`llama2`/`llama3`/`zephyr`/`gemma`/`phi3`/`mistral` override | autodetect |
 | `--system "msg"` | initial system prompt | none |
-| `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — slower, less RAM | fp32 (faster, more RAM) |
+| `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — slower, less RAM. **Not GPU-compatible** (see below) | fp32 (faster, more RAM) |
+| `--low-memory` | drop each conv/linear layer's concatenated weight cache (`FConcatedWeights`) and compute per-neuron straight from the weights — less RAM, somewhat slower forward (`pLowMemory`). **Not GPU-compatible** (see below) | **on** |
+| `--max-fast-memory` | keep the concatenated weight cache for a faster forward at the cost of more RAM — required for GPU offload | off |
+| `--gpu` | OpenCL offload of the conv/linear matmuls (only when built with `-dOpenCL`) — incompatible with `--int8` and `--low-memory` (see below) | **on** when built with `-dOpenCL`, else off |
+| `--no-gpu` | force CPU even when built with `-dOpenCL` | — |
+| `--gpu-platform N` | OpenCL platform index | 0 |
+| `--gpu-device N` | OpenCL device index within the platform | 0 |
 | `--stats` | per-turn timing to **stderr**: TTFT (prefill + first token), steady-state decode tok/s, and `prompt N (reused K)` from the KV-cache reuse | off |
 | `--no-cache-reuse` | re-prefill the whole prompt every turn instead of reusing the shared KV-cache prefix (A/B + debugging) | reuse on |
 | `--selftest` | run the offline unit checks and exit | — |
 
 The model is always built with `pTrainable=false` (the REPL never
-trains; ~1/3 the memory). Temperature and the penalties run through a
+trains; ~1/3 the memory). **Memory vs. speed** is controlled by two
+orthogonal axes on top of that: trainability gates the backprop buffers,
+while `--low-memory`/`--max-fast-memory` toggles the *forward* weight cache.
+Low memory is the default — each conv/linear layer drops its persistent
+concatenated weight cache and computes per-neuron from the raw weights
+(less resident RAM, a somewhat slower forward); `--max-fast-memory` keeps
+the cache for a faster forward at the cost of more RAM. Orthogonally,
+`--int8` swaps fp32 storage for weight-only int8 (less RAM, dequantized on
+the fly).
+
+**OpenCL / GPU offload.** When the binary is built with `-dOpenCL` (the
+default compilation), the conv/linear matmuls are offloaded to the GPU by
+default; `--no-gpu` forces CPU, and `--gpu-platform N` / `--gpu-device N`
+select the OpenCL device. A binary built without `-dOpenCL` is CPU-only and
+ignores the `--gpu*` flags.
+
+GPU offload is **incompatible with both `--int8` and `--low-memory`**, because
+the OpenCL kernel consumes each accelerated layer's concatenated weight cache,
+which neither path provides:
+
+- **`--int8`** — the int8 path never builds the interleaved cache the kernel
+  reads, so combining it with `--gpu` is rejected: the GPU is disabled and the
+  model runs int8 on CPU (`[--gpu ignored: incompatible with --int8 - running
+  int8 on CPU]`). Use `--fp32` (the default) for GPU.
+- **`--low-memory`** (the default) drops exactly that weight cache. Enabling
+  `--gpu` therefore *overrides* it: the cache is rebuilt and the low-memory
+  forward is turned off on the accelerated layers (more RAM, the GPU's cost of
+  entry). Since both `--low-memory` and `--gpu` default to on, the default GPU
+  run keeps the cache; pass `--no-gpu` to honor low-memory on CPU, or
+  `--max-fast-memory` to keep the cache explicitly.
+
+Temperature and the penalties run through a
 `TNNetLogitsProcessorChain` in the `TGenerationConfig` pipeline order
 (penalty -> temperature -> sampler); without a sampler flag decoding is
 greedy argmax. Generation stops on the tokenizer's EOS id, on the chat
