@@ -1,0 +1,753 @@
+unit CAI_NEURAL_API_Exec_47590_SimpleImageClassifier2_Tutor_89_Test2;
+
+//http://www.softwareschule.ch/examples/uPSI_NeuralNetworkCAI.txt
+//http://www.softwareschule.ch/examples/uPSI_Neuralvolume.txt
+//https://github.com/joaopauloschuler/neural-api/blob/master/examples/SimpleImageClassifier/SimpleImageClassifier.lpr
+{fix done: not complete cause the neuralfil() has a writeln which troubles I/O 105 exception}
+//https://ibrt.ch/delphi/neuralnets.html
+
+interface
+
+//uses
+  {$ifdef unix}
+  cmem, // the c memory manager is on some systems much faster for multi-threading
+  {$endif}
+  {Classes, SysUtils, FileUtil, Forms, Controls, Graphics, Dialogs, StdCtrls,
+  ExtCtrls, Menus, neuralnetwork, neuralvolumev, neuraldatasets, neuraldatasetsv,
+  neuralvolume, MTProcs, math, neuralfit    }
+
+  {$ifdef OpenCL}
+  //, neuralopencl
+  {$endif}
+ // ;
+
+var
+  csLearningRates: array[0..2] of TNeuralFloat; // = (1, 0.1, 0.01);
+const  
+  csGeneratorInputSize = 4;
+  csMaxDiscriminatorError = 0.1;
+
+type
+
+  { TFormVisualLearning }
+  TFormVisualLearning = {class(}TForm;
+  var
+    ButLearn: TButton;
+    ChkRunOnGPU: TCheckBox;
+    ChkBigNetwork: TCheckBox;
+    ComboLearningRate: TComboBox;
+    ComboComplexity: TComboBox;
+    GrBoxNeurons: TGroupBox;
+    ImgSample: TImage;
+    LabClassRate: TLabel;
+    LabComplexity: TLabel;
+    LabLearningRate: TLabel;
+    RadLAB: TRadioButton;
+    RadRGB: TRadioButton;
+    procedure ButLearnClick(Sender: TObject);
+    procedure FormClose(Sender: TObject; var CloseAction: TCloseAction);
+    procedure FormCreate(Sender: TObject);
+    procedure FormDestroy(Sender: TObject);
+  //private
+    { private declarations }
+    var
+    FRunning: boolean;
+    FDisplay: TNNetVolume;
+    FImageCnt: integer;
+    iEpochCount, iEpochCountAfterLoading: integer;
+    FAutoencoder: THistoricalNets;
+    aImage: array of TImage;
+    aLabelX, aLabelY: array of TLabel;
+    FBaseName: string;
+    FColorEncoding: byte;
+    {$ifdef OpenCL}
+    FEasyOpenCL: TEasyOpenCL;
+    FHasOpenCL: boolean;
+    {$endif}
+
+    FCritSec: TRTLCriticalSection;
+    FFit: TNeuralDataLoadingFit;
+    FTrainImages: TClassesAndElements;
+       procedure GetTrainingData(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume);
+       procedure AutoencoderOnAfterEpoch(Sender: TObject);
+       procedure AutoencoderOnAfterStep(Sender: TObject);
+       procedure TFormVisualLearningAutoencoderOnStart(Sender: TObject);
+       procedure AutoencoderAugmentation(pInput: TNNetVolume; ThreadId: integer);
+       procedure TFormVisualLearningLearn(Sender: TObject);
+       procedure SaveScreenshot(filename: string);
+       procedure DisplayInputImage(ImgInput: TNNetVolume; color_encoding: integer); //}
+       procedure SendStop;  
+     //public
+       procedure TFormVisualLearningProcessMessages();
+  //end;
+
+var
+  FormVisualLearning: TFormVisualLearning;
+
+implementation
+//{$R *.lfm}
+
+//uses strutils, LCLIntf, LCLType;
+
+
+{ TFormVisualLearning }
+
+procedure ButLearnClick(Sender: TObject);
+begin
+  if not CheckCIFARFile() then exit;
+
+  if (FRunning) then
+  begin
+    SendStop;
+  end
+  else
+  begin
+    FRunning := true;
+    ButLearn.Caption := 'Stop';
+    ChkBigNetwork.Enabled := false;
+    TFormVisualLearningLearn(Sender);
+    ChkBigNetwork.Enabled := true;
+    ButLearn.Caption := 'Restart';
+    FRunning := false;
+  end;
+end;
+
+procedure FormClose(Sender: TObject;
+  var CloseAction: TCloseAction);
+begin
+  SendStop;
+end;
+
+procedure FormCreate(Sender: TObject);
+begin
+  FRunning := false;
+  FFit := TNeuralDataLoadingFit.Create();
+  FTrainImages := TClassesAndElements.Create();
+  neuralInitCriticalSection(FCritSec);
+  FDisplay := TNNetVolume.Create();
+  FImageCnt := 0;
+  CreateAscentImages
+  (
+    GrBoxNeurons,
+    aImage, aLabelX, aLabelY,
+    {ImageCount=}32,
+    {InputSize=}64, {displaySize=}128, {ImagesPerRow=}8
+  );
+  {$ifdef OpenCL}
+  FEasyOpenCL := TEasyOpenCL.Create();
+  {$else}
+  ChkRunOnGPU.Visible := false;
+  {$endif}
+end;
+
+procedure FormDestroy(Sender: TObject);
+begin
+  SendStop;
+  while FFit.Running do Application.ProcessMessages;
+  while FRunning do Application.ProcessMessages;
+  FreeNeuronImages(aImage, aLabelX, aLabelY);
+  neuralDoneCriticalSection(FCritSec);
+  FDisplay.Free;
+  {$ifdef OpenCL}FEasyOpenCL.Free;{$endif}
+  FFit.Free;
+  //FTrainImages.Free;
+end;
+
+procedure DisplayInputImage(ImgInput: TNNetVolume; color_encoding: integer);
+var
+  pMin0, pMax0: TNeuralFloat;
+  pMin1, pMax1: TNeuralFloat;
+  pMin2, pMax2: TNeuralFloat;
+begin
+  FDisplay.Resize(ImgInput,0,0);
+  FDisplay.Copy76(ImgInput);
+
+  if color_encoding = csEncodeLAB then
+  begin
+    FDisplay.GetMinMaxAtDepth(0, pMin0, pMax0);
+    FDisplay.GetMinMaxAtDepth(1, pMin1, pMax1);
+    FDisplay.GetMinMaxAtDepth(2, pMin2, pMax2);
+    pMax0 := MaxF(Abs(pMin0), Abs(pMax0));
+    pMax1 := MaxF(Abs(pMin1), Abs(pMax1));
+    pMax2 := MaxF(Abs(pMin2), Abs(pMax2));
+
+    if pMax0 > 2 then
+    begin
+      FDisplay.MulAtDepth27(0, 2/pMax0);
+    end;
+
+    if pMax1 > 2 then
+    begin
+      FDisplay.MulAtDepth27(1, 2/pMax1);
+    end;
+
+    if pMax2 > 2 then
+    begin
+      FDisplay.MulAtDepth27(2, 2/pMax2);
+    end;
+  end
+  else if FDisplay.GetMaxAbs() > 2 then
+  begin
+    FDisplay.NormalizeMax(2);
+  end;
+
+  //Debug only: FDisplay.PrintDebugChannel();
+
+  FDisplay.NeuronalInputToRgbImg(color_encoding);
+
+  LoadVolumeIntoTImage(FDisplay, aImage[FImageCnt],csEncodeRGB);
+  aImage[FImageCnt].Width := 128;
+  aImage[FImageCnt].Height := 128;
+  TFormVisualLearningProcessMessages();
+  FImageCnt := (FImageCnt + 1) mod Length(aImage);
+end;    //*)
+
+procedure TFormVisualLearningAutoencoderOnStart(Sender: TObject);
+begin
+  // TODO
+end;
+
+procedure SendStop;
+begin
+  WriteLn('Sending STOP request');
+  FFit.ShouldQuit := true;
+end;
+
+
+procedure TFormVisualLearningLearn( Sender: TObject);
+var
+  NeuronMultiplier: integer;
+begin
+  {$ifdef OpenCL}
+  FHasOpenCL := false;
+  if ChkRunOnGPU.Checked then
+  begin
+    if FEasyOpenCL.GetPlatformCount() > 0 then
+    begin
+      FEasyOpenCL.SetCurrentPlatform(FEasyOpenCL.PlatformIds[0]);
+      if FEasyOpenCL.GetDeviceCount() > 0 then
+      begin
+        FHasOpenCL := true;
+      end;
+    end;
+  end;
+  {$endif}
+  if ChkBigNetwork.Checked
+    then NeuronMultiplier := 2
+    else NeuronMultiplier := 1;
+  FBaseName := 'IMAGEART'+IntToStr(NeuronMultiplier)+'-';
+  if RadRGB.Checked then
+  begin
+    FColorEncoding := csEncodeRGB;
+    //FBaseName += 'RGB-';
+    FBaseName:= Fbasename+ 'RGB-';
+  end
+  else
+  begin
+    FColorEncoding := csEncodeLAB;
+    FBaseName:= fbasename+'LAB-';
+  end;
+  Self.Height := GrBoxNeurons.Top + GrBoxNeurons.Height + 10;
+  Self.Width  := GrBoxNeurons.Left + GrBoxNeurons.Width + 10;
+  TFormVisualLearningProcessMessages();
+  //if FTrainImages.Count = 0 then
+  begin
+    WriteLn('Loading Tiny ImageNet 200 file names.');
+    FTrainImages.LoadFoldersAsClassesProportional('tiny-imagenet-200/train/','images',0,0.2);
+    //WriteLn('Tiny ImageNet 200 loaded classes: ',FTrainImages.Count,'. File names: ', FTrainImages.CountElements(),'.');
+    WriteLn('Loading Tiny ImageNet 200 images.');
+    //FTrainImages.LoadImages(FColorEncoding);
+    WriteLn('Loaded.');
+  end;
+  iEpochCount := 0;
+  iEpochCountAfterLoading := 0;
+
+  writeln('Creating Neural Networks...');
+  FAutoencoder := THistoricalNets.Create();
+
+  if Not(FileExists(FBaseName+'autoencoder.nn')) then begin
+    WriteLn('Creating auto encoder.');
+    FAutoencoder.AddLayer49([
+      TNNetInput.Create4(64, 64, 3),
+      TNNetConvolution.Create36(32 * NeuronMultiplier,3,1,2,1), //32x32
+      TNNetConvolution.Create36(32 * NeuronMultiplier,3,1,1,1),
+      TNNetConvolution.Create36(32 * NeuronMultiplier,3,1,2,1), //16x16
+      TNNetConvolution.Create36(32 * NeuronMultiplier,3,1,1,1),
+      TNNetConvolution.Create36(64 * NeuronMultiplier,3,1,2,0), //8x8
+      TNNetConvolution.Create36(64 * NeuronMultiplier,3,1,1,0),
+
+      TNNetConvolution.Create36(128 * NeuronMultiplier,3,1,2,1), //4x4
+      TNNetConvolution.Create36(128 * NeuronMultiplier,3,1,1,1),
+      TNNetDeMaxPool.Create46(2,0),
+      TNNetConvolution.Create36(128 * NeuronMultiplier,5,2,1,1), //8x8
+      TNNetConvolution.Create36(128 * NeuronMultiplier,3,1,1,1),
+
+      TNNetDeMaxPool.Create46(2,0),
+      TNNetConvolution.Create36(32 * NeuronMultiplier,5,2,1,1), //16x16
+      TNNetConvolution.Create36(32 * NeuronMultiplier,3,1,1,1),
+      TNNetDeMaxPool.Create46(2,0),
+      TNNetConvolution.Create36(32 * NeuronMultiplier,5,2,1,1), //32x32
+      TNNetConvolution.Create36(32 * NeuronMultiplier,3,1,1,1),
+      TNNetDeMaxPool.Create46(2,0),
+      TNNetConvolution.Create36(32 * NeuronMultiplier,5,2,1,1), //64x64
+      TNNetConvolution.Create36(32 * NeuronMultiplier,3,1,1,1),
+      TNNetConvolutionLinear.Create(3,1,0,1,0),
+      TNNetReLUL.Create(-40, +40) // Protection against overflow
+    ]);
+  end
+  else
+  begin
+    WriteLn('Loading auto encoder.');
+    FAutoencoder.LoadFromFile(FBaseName+'autoencoder.nn');
+  end;
+  FAutoencoder.DebugStructure();
+  FAutoencoder.SetLearningRate(0.001,0.9);
+  FAutoencoder.SetL2Decay(0.0);
+
+  FFit.OnAfterEpoch := @AutoencoderOnAfterEpoch;
+  FFit.OnAfterStep := @{Self.}AutoencoderOnAfterStep;
+  FFit.OnStart := @{Self.}TFormVisualLearningAutoencoderOnStart;
+  FFit.LearningRateDecay := 0.0;
+  FFit.L2Decay := 0.0;
+  FFit.AvgWeightEpochCount := 1;
+  FFit.InitialLearningRate := 0.0001;
+  FFit.FileNameBase := FBaseName+'autoencoder';
+  FFit.EnableBipolar99HitComparison();
+  {$ifdef OpenCL}
+  if FHasOpenCL then
+  begin
+    FFit.EnableOpenCL(FEasyOpenCL.PlatformIds[0], FEasyOpenCL.Devices[0]);
+    FAutoencoder.EnableOpenCL(FEasyOpenCL.PlatformIds[0], FEasyOpenCL.Devices[0]);
+  end;
+  {$endif}
+  //Debug only:
+  FFit.MaxThreadNum := 2;
+  FFit.FitLoading1(FAutoencoder, {EpochSize=}10{FTrainImages.CountElements()}, 500, 500, {Batch=}64, {Epochs=}35000, @GetTrainingData, nil, nil); // This line does the same as above
+
+  FAutoencoder.Free;
+end;
+
+procedure GetTrainingData(Idx: integer;
+  ThreadId: integer; pInput, pOutput: TNNetVolume);
+var
+  ClassId, ImageId: integer;
+begin
+  ClassId := FTrainImages.GetRandomClassId();
+  //ImageId := FTrainImages.strings[ClassId].GetRandomIndex();
+  //pInput.Copy38(FTrainImages.List[ClassId].List[ImageId]);
+  if Random(1000)>500 then pInput.FlipX();
+  pOutput.Copy38(pInput);
+end;
+
+procedure AutoencoderOnAfterEpoch(Sender: TObject);
+begin
+end;
+
+procedure AutoencoderOnAfterStep(Sender: TObject);
+var
+  ClassId, ImageId: integer;
+begin
+  //LabClassRate.Caption := PadLeft(IntToStr(Round(FFit.TrainingAccuracy*100))+'%',4);
+  TFormVisualLearningProcessMessages();
+  //if FFit.CurrentStep mod 10 = 0 then
+  begin
+    ClassId := FTrainImages.GetRandomClassId();
+    //ImageId := FTrainImages.List[ClassId].GetRandomIndex();
+    //FFit.NN.Compute65(FTrainImages.List[ClassId].List[ImageId]);
+    DisplayInputImage(FFit.NN.GetLastLayer().Output, 0);
+    FFit.NN.GetLastLayer().Output.PrintDebug();
+  end;
+end;
+
+procedure AutoencoderAugmentation(pInput: TNNetVolume;
+  ThreadId: integer);
+begin
+end;
+
+procedure SaveScreenshot(filename: string);
+begin
+  try
+    WriteLn(' Saving '+filename+'.');
+    SaveHandleToBitmap(filename, Self.Handle);
+  except
+    // Nothing can be done if this fails.
+  end;
+end;       //*)
+
+procedure TFormVisualLearningProcessMessages();
+begin
+  Application.ProcessMessages();
+end;
+
+//begin
+  //writeln(cpuspeed)
+  //procedure TestBackProp();
+  //TestBackProp();
+  
+End.
+
+Ref: simple logical learner
+300 x 0 Output:  0.30   0.07   0.26  - Training/Desired Output:  0.10   0.10   0.10 
+300 x 1 Output:  0.40   0.29   0.62  - Training/Desired Output:  0.80   0.10   0.80 
+300 x 2 Output:  0.72   0.22   0.62  - Training/Desired Output:  0.80   0.10   0.80 
+300 x 3 Output:  0.37   0.56   1.00  - Training/Desired Output:  0.10   0.80   0.80 
+
+600 x 0 Output:  0.29   0.02   0.23  - Training/Desired Output:  0.10   0.10   0.10 
+600 x 1 Output:  0.52   0.28   0.62  - Training/Desired Output:  0.80   0.10   0.80 
+600 x 2 Output:  0.74   0.15   0.69  - Training/Desired Output:  0.80   0.10   0.80 
+600 x 3 Output:  0.27   0.66   0.96  - Training/Desired Output:  0.10   0.80   0.80 
+
+900 x 0 Output:  0.22   0.02   0.20  - Training/Desired Output:  0.10   0.10   0.10 
+900 x 1 Output:  0.65   0.23   0.66  - Training/Desired Output:  0.80   0.10   0.80 
+900 x 2 Output:  0.75   0.13   0.74  - Training/Desired Output:  0.80   0.10   0.80 
+900 x 3 Output:  0.18   0.72   0.90  - Training/Desired Output:  0.10   0.80   0.80 
+
+1200 x 0 Output:  0.15   0.04   0.16  - Training/Desired Output:  0.10   0.10   0.10 
+1200 x 1 Output:  0.73   0.18   0.72  - Training/Desired Output:  0.80   0.10   0.80 
+1200 x 2 Output:  0.78   0.13   0.77  - Training/Desired Output:  0.80   0.10   0.80 
+1200 x 3 Output:  0.13   0.75   0.85  - Training/Desired Output:  0.10   0.80   0.80 
+
+1500 x 0 Output:  0.11   0.06   0.12  - Training/Desired Output:  0.10   0.10   0.10 
+1500 x 1 Output:  0.79   0.15   0.77  - Training/Desired Output:  0.80   0.10   0.80 
+1500 x 2 Output:  0.80   0.12   0.79  - Training/Desired Output:  0.80   0.10   0.80 
+1500 x 3 Output:  0.10   0.77   0.82  - Training/Desired Output:  0.10   0.80   0.80 
+
+1800 x 0 Output:  0.10   0.07   0.11  - Training/Desired Output:  0.10   0.10   0.10 
+1800 x 1 Output:  0.80   0.13   0.79  - Training/Desired Output:  0.80   0.10   0.80 
+1800 x 2 Output:  0.80   0.11   0.80  - Training/Desired Output:  0.80   0.10   0.80 
+1800 x 3 Output:  0.10   0.78   0.81  - Training/Desired Output:  0.10   0.80   0.80 
+
+2100 x 0 Output:  0.10   0.09   0.11  - Training/Desired Output:  0.10   0.10   0.10 
+2100 x 1 Output:  0.80   0.12   0.79  - Training/Desired Output:  0.80   0.10   0.80 
+2100 x 2 Output:  0.80   0.11   0.80  - Training/Desired Output:  0.80   0.10   0.80 
+2100 x 3 Output:  0.10   0.79   0.80  - Training/Desired Output:  0.10   0.80   0.80 
+
+2400 x 0 Output:  0.10   0.09   0.10  - Training/Desired Output:  0.10   0.10   0.10 
+2400 x 1 Output:  0.80   0.11   0.80  - Training/Desired Output:  0.80   0.10   0.80 
+2400 x 2 Output:  0.80   0.10   0.80  - Training/Desired Output:  0.80   0.10   0.80 
+2400 x 3 Output:  0.10   0.79   0.80  - Training/Desired Output:  0.10   0.80   0.80 
+
+2700 x 0 Output:  0.10   0.09   0.10  - Training/Desired Output:  0.10   0.10   0.10 
+2700 x 1 Output:  0.80   0.11   0.80  - Training/Desired Output:  0.80   0.10   0.80 
+2700 x 2 Output:  0.80   0.10   0.80  - Training/Desired Output:  0.80   0.10   0.80 
+2700 x 3 Output:  0.10   0.80   0.80  - Training/Desired Output:  0.10   0.80   0.80 
+
+3000 x 0 Output:  0.10   0.10   0.10  - Training/Desired Output:  0.10   0.10   0.10 
+3000 x 1 Output:  0.80   0.10   0.80  - Training/Desired Output:  0.80   0.10   0.80 
+3000 x 2 Output:  0.80   0.10   0.80  - Training/Desired Output:  0.80   0.10   0.80 
+3000 x 3 Output:  0.10   0.80   0.80  - Training/Desired Output:  0.10   0.80   0.80 
+
+Layer 0 Max Error: 0 Min Error: 0 Max ErrorD: 0 Min ErrorD: 0 TNNetInput 2,1,1
+debug errors else
+Layer 1 Max Error: 0.000858666782733053 Min Error: -0.00092624151147902 Max ErrorD: 0 Min ErrorD: 0 TNNetFullConnectReLU 3,1,1
+ Parent:0
+Layer 2 Max Error: 0.0012739896774292 Min Error: -0.00215935707092285 Max ErrorD: 0 Min ErrorD: 0 TNNetFullConnectReLU 3,1,1
+ Parent:1
+Press ENTER to exit.
+
+3000 x 0 Output:  0.37   0.16   0.56  - Training/Desired Output: 0.10  0.10  0.10 
+3000 x 1 Output:  0.77   0.10   0.82  - Training/Desired Output: 0.80  0.10  0.80 
+3000 x 2 Output:  0.59   0.00   0.55  - Training/Desired Output: 0.80  0.10  0.80 
+3000 x 3 Output:  0.11   0.72   0.57  - Training/Desired Output: 0.10  0.80  0.80 
+
+Ref:
+Starting Validation.
+VALIDATION RECORD! Saving NN at autosave-neuralnetwork_a1.nn
+Debug SavetokenStructureToString: 
+Debug structuretostring: -1)TNNetInput:32;32;3;0;0;0;0;0#0)TNNetConvolutionReLU:16;5;0;0;1;0;0;0#1)TNNetMaxPool:2;2;0;0;0;0;0;0#2)TNNetConvolutionReLU:128;5;0;0;1;0;0;0#3)TNNetFullConnectLinear:64;1;1;2;0;0;0;0#4)TNNetFullConnect:10;1;1;10;0;0;0;0#5)TNNetSoftMax:0;0;0;0;0;0;0;0
+Epochs: 1 Examples seen:40000 Validation Accuracy: 0.1014 Validation Error: 1.7999 Validation Loss: 2.3027 Total time: 5.21min
+Image mX4 FThreadNN[0].DebugWeights(); skipped...
+Epoch time: 3.5000 minutes. 1 epochs: 0.0580 hours.
+Epochs: 1. Working time: 0.09 hours.
+CAI maXbox Neural Fit Finished.
+ mX4 executed: 04/11/2021 15:47:19  Runtime: 0:5:21.565  Memload: 41% use
+
+SELU Classifier
+0 -1 0
+0 -1 0
+0 -1 0
+0 -1 0
+0 -1 0
+0 -1 0
+40000 of samples have been processed.
+Starting Validation. 
+ Epochs: 5 Examples seen:200000 Validation Accuracy: 0.0980 Validation Error: 1.8000 Validation Loss: 2.3028 Total time: 14.31min
+Image mX4 FThreadNN[0].DebugWeights(); skipped...
+Epoch time: 2.0000 minutes. 5 epochs: 0.1600 hours.
+Epochs: 5. Working time: 0.24 hours.
+CAI maXbox Neural Fit Finished.
+3 Volumes + NN + NF freed...
+ mX4 executed: 04/11/2021 16:07:45  Runtime: 0:14:25.509  Memload: 43% use
+PascalScript maXbox4 - RemObjects & SynEdit
+C:\maXbox\works2021\maxbox4\examples\1065__CAI_2_SiImageClassifier21_Tutor_89_test2.txtOutput.txt  as output file stored
+
+50 epochs:
+40000 of samples have been processed.
+Starting Validation.
+Starting Testing.
+Epoch time: 2.2000 minutes. 50 epochs: 1.8000 hours.
+Epochs: 50. Working time: 2.14 hours.
+CAI maXbox Neural Fit Finished.
+3 Volumes + NN + NF freed...
+ mX4 executed: 04/11/2021 22:45:35  Runtime: 2:8:19.673  Memload: 41% use
+ 
+ 
+epoch	training accuracy	training loss	training error	validation accuracy	validation loss
+1	0.0955	2.3005	1.7996	0.0977	2.3028
+2	0.0924	2.3026	1.8	0.0977	2.3028
+3	0.0919	2.3027	1.8	0.0977	2.3028
+4	0.0981	2.3063	1.8007	0.098	2.3027
+
+47	0.0938	2.3036	1.8002	0.0977
+48	0.0997	2.3018	1.7998	0.0977
+49	0.0903	2.303	1.8001	0.0977
+50	0.0995	2.3036	1.8002	0.0977
+
+
+
+Doc: Destroying it calls Py_Finalize, which frees all memory allocated by the Python DLL.
+
+Or, if you're just using the Python API without the VCL wrappers, you can probably just call Py_NewInterpreter on your TPythonInterface object to get a fresh execution environment without necessarily discarding everything done before.
+
+Example - How to create a simple fully forward connected network 3x3
+NN := TNNet.Create();
+NN.AddLayer( TNNetInput.Create(3) );
+NN.AddLayer( TNNetLayerFullConnectReLU.Create(3) );
+NN.AddLayer( TNNetLayerFullConnectReLU.Create(3) );
+NN.SetLearningRate(0.01,0.8);
+
+Evil eval()
+
+You should never pass untrusted source to the eval() directly. As it is quite easy for the malicious user to wreak havoc on your system. For example, the following code can be used to delete all the files from the system.
+
+1 >>>
+2 eval('os.system("RM -RF /")') # command is deliberately capitalized
+3 >>>
+
+procedure TNNet.LoadDataFromString(strData: string);
+var
+  S: TStringList;
+  Cnt: integer;
+begin
+  S := CreateTokenizedStringList(strData,'!');
+
+  if S.Count = FLayers.Count then
+  begin
+    if S.Count > 0 then
+    begin
+      for Cnt := 0 to S.Count - 1 do
+      begin
+        FLayers[Cnt].LoadDataFromString(S[Cnt]);
+      end;
+    end;
+  end
+  else
+  begin
+    FErrorProc
+    (
+      'Error while loading network: number of structure layers '+
+      IntToStr(FLayers.Count)+' differ from data loaded layers '+
+      IntToStr(S.Count)
+    );
+
+
+Ref:   https://github.com/joaopauloschuler/neural-api
+
+ 
+As we grow, we occasionally need to update our terms of service. To keep using Bitbucket Cloud, review and agree to the updated terms. To learn more, please see our Summary of Changes.
+
+
+              _od#HMM6&*MMMH::-_
+          _dHMMMR??MMM? ""| `"'-?Hb_
+       .~HMMMMMMMMHMMM#M?        `*HMb.
+     ./?HMMMMMMMMMMM"*"""           &MHb.
+    /'|MMMMMMMMMMM'             -   `*MHM\
+   /  |MMMMMMHHM''                   .MMMHb
+  |   9HMMP   .Hq,                   TMMMMMH
+ /     |MM\,H-""&&6\__               `MMMMMMb
+|       `""HH#,       \             - MMMMMMM|
+|           `HoodHMM###.              `9MMMMMH
+|              .MMMMMMMM##\             `*"?HM
+|         ..  ,HMMMMMMMMMMMo\.              |M
+|             |MMMMMMMMMMMMMMMMHo           |M
+|              ?MMMMMMMMMMMMMMMM*           |H
+|.              `#MMMMMMMMMMMMM'           .M|
+ \                `MMMMMMMMMMM*            |P
+ `\                MMMMMMMMT"'            ,H
+  `\              `MMMMMMH?              ./
+    \.            |MMMH#"               ,/
+     `\.          |MMP'               ./'
+       `~\        `HM:.-    .       ,/'
+          "-\_       '_\ .      _.-"
+              "-\-#odMM\_,oo==-"
+    
+
+normal
+             uninvolving = True              neg : pos    =     11.7 : 1.0
+                  avoids = True              pos : neg    =     11.7 : 1.0
+             fascination = True              pos : neg    =     10.3 : 1.0
+              astounding = True              pos : neg    =     10.3 : 1.0
+                 idiotic = True              neg : pos    =      9.8 : 1.0
+    |   n   p |                   |   n   p |    Stemmer more false positive
+    |   e   o |                   |   e   o | 
+    |   g   s |                   |   g   s | 
+----+---------+               ----+---------+ 
+neg |<119>131 |               neg |<110>140 | 
+pos |   5<245>|               pos |   5<245>| 
+----+---------+               ----+---------+ 
+(row = reference; col = test)
+
+unit uPSI_neuraldatasets;
+{
+mindset let mindset set
+
+}
+interface
+ 
+
+ 
+uses
+   SysUtils
+  ,Classes
+  ,uPSComponent
+  ,uPSRuntime
+  ,uPSCompiler
+  ;
+ 
+type 
+(*----------------------------------------------------------------------------*)
+  TPSImport_neuraldatasets = class(TPSPlugin)
+  public
+    procedure CompileImport1(CompExec: TPSScript); override;
+    procedure ExecImport1(CompExec: TPSScript; const ri: TPSRuntimeClassImporter); override;
+  end;
+ 
+ 
+{ compile-time registration functions }
+procedure SIRegister_TClassesAndElements(CL: TPSPascalCompiler);
+procedure SIRegister_TFileNameList(CL: TPSPascalCompiler);
+procedure SIRegister_neuraldatasets(CL: TPSPascalCompiler);
+
+{ run-time registration functions }
+procedure RIRegister_neuraldatasets_Routines(S: TPSExec);
+procedure RIRegister_TClassesAndElements(CL: TPSRuntimeClassImporter);
+procedure RIRegister_TFileNameList(CL: TPSRuntimeClassImporter);
+procedure RIRegister_neuraldatasets(CL: TPSRuntimeClassImporter);
+
+procedure Register;
+
+implementation
+
+
+uses
+   neuraldatasets, neuralnetworkCAI, neuralvolume , neuralthread ,math
+  ;
+ 
+ 
+procedure Register;
+begin
+  RegisterComponents('Pascal Script', [TPSImport_neuraldatasets]);
+end;
+
+(* === compile-time registration functions === *)
+(*----------------------------------------------------------------------------*)
+procedure SIRegister_TClassesAndElements(CL: TPSPascalCompiler);
+begin
+  //with RegClassS(CL,'TStringStringListVolume', 'TClassesAndElements') do
+  with CL.AddClassN(CL.FindClass('TStringStringListVolume'),'TClassesAndElements') do
+  begin
+    RegisterMethod('Constructor Create( )');
+    Function CountElements( ) : integer');
+    Procedure LoadFoldersAsClasses( FolderName : string; pImageSubFolder : string; SkipFirst : integer; SkipLast : integer)');
+    Procedure LoadFoldersAsClassesProportional( FolderName : string; pImageSubFolder : string; fSkipFirst : TNeuralFloat; fLoadLen : TNeuralFloat)');
+    Procedure LoadImages0( color_encoding : integer; NewSizeX : integer; NewSizeY : integer);');
+    Procedure LoadClass_FilenameFromFolder( FolderName : string)');
+    Function GetRandomClassId( ) : integer');
+    Function GetClassesCount( ) : integer');
+    Procedure GetRandomFileId( out ClassId : integer; out FileId : integer; StartPos : TNeuralFloat; Range : TNeuralFloat)');
+    Procedure GetRandomFileName( out ClassId : integer; out FileName : string; StartPos : TNeuralFloat; Range : TNeuralFloat)');
+    Procedure GetRandomImgVolumes( vInput, vOutput : TNNetVolume; StartPos : TNeuralFloat; Range : TNeuralFloat)');
+    Function GetFileName( ClassId, ElementId : integer) : string');
+    Procedure AddVolumesTo( Volumes : TNNetVolumeList; EmptySource : boolean)');
+    Procedure AddFileNamesTo( FileNames : TFileNameList)');
+    Procedure MakeMonopolar( Divisor : TNeuralFloat)');
+    Function FileCountAtClassId( ClassId : integer) : integer');
+    Procedure LoadImages_NTL( index, threadnum : integer)');
+  end;
+end;
+
+(*----------------------------------------------------------------------------*)
+procedure SIRegister_TFileNameList(CL: TPSPascalCompiler);
+begin
+  //with RegClassS(CL,'TStringListInt', 'TFileNameList') do
+  with CL.AddClassN(CL.FindClass('TStringListInt'),'TFileNameList') do
+  begin
+    Constructor Create( )');
+    Procedure GetImageVolumePairFromId( ImageId : integer; vInput, vOutput : TNNetVolume; ThreadDangerous : boolean)');
+    Procedure GetRandomImagePair( vInput, vOutput : TNNetVolume)');
+    Function ThreadSafeLoadImageFromFileIntoVolume( ImageFileName : string; V : TNNetVolume) : boolean');
+    RegisterProperty('ClassCount', 'integer', iptrw);
+  end;
+end;
+
+(*----------------------------------------------------------------------------*)
+procedure SIRegister_neuraldatasets(CL: TPSPascalCompiler);
+begin
+  CL.AddTypeS('TTinyImageChannel','array [0..31] of array[0..31] of byte; ');
+  CL.AddTypeS('TTinyImageChannel1D','array [0..32 * 32 - 1] of byte; ');
+  CL.AddTypeS('TMNistImage','array [0..27] of array[0..27] of byte; ');
+
+  //TTinyImageChannel1D = packed array [0..32 * 32 - 1] of byte;
+  //TMNistImage = packed array [0..27, 0..27] of byte;
+
+  CL.AddTypeS('TTinyImage', 'record bLabel : byte; R : TTinyImageChannel; G : T'
+   +'TinyImageChannel; B : TTinyImageChannel; end');
+  CL.AddTypeS('TCifar100Image', 'record bCoarseLabel : byte; bFineLabel : byte;'
+   +' R : TTinyImageChannel; G : TTinyImageChannel; B : TTinyImageChannel; end');
+  CL.AddTypeS('TTinySingleChannelImage', 'record bLabel : byte; Grey : TTinyImageChannel; end');
+  CL.AddTypeS('TTinySingleChannelImage1D', 'record bLabel : byte; Grey : TTinyImageChannel1D; end');
+  //CL.AddTypeS('TTinySingleChannelImagePtr','^TTinySingleChannelImage// will not work');
+  //CL.AddTypeS('TTinySingleChannelImage1DPtr', '^TTinySingleChannelImage1D // will not work');
+  SIRegister_TFileNameList(CL);
+  SIRegister_TClassesAndElements(CL);
+ CL.AddDelphiFunction('Procedure CreateVolumesFromImagesFromFolder(out ImgTrainingVolumes,ImgValidationVolumes,ImgTestVolumes:TNNetVolumeList;FolderName,pImageSubFolder:string;color_encoding:integer;TrainingProp,ValidationProp,TestProp:single;'+
+                                                 'NewSizeX:integer;NewSizeY:integer)');
+ CL.AddDelphiFunction('Procedure CreateFileNameListsFromImagesFromFolder( out TrainingFileNames, ValidationFileNames, TestFileNames : TFileNameList; FolderName, pImageSubFolder : string; TrainingProp, ValidationProp, TestProp : single)');
+ //Procedure LoadImageIntoVolume( M : TFPMemoryImage; Vol : TNNetVolume)');
+ //Procedure LoadVolumeIntoImage( Vol : TNNetVolume; M : TFPMemoryImage)');
+ Function LoadImageFromFileIntoVolume(ImageFileName:string; V:TNNetVolume): boolean');
+ Function SaveImageFromVolumeIntoFile(V:TNNetVolume;ImageFileName:string) : boolean');
+ Procedure ConfusionWriteCSVHeader(var CSVConfusion:TextFile;Labels array of string)');
+ Procedure ConfusionWriteCSV( var CSVConfusion: TextFile; Vol:TNNetVolume; Digits : integer)');
+ Procedure LoadTinyImageIntoNNetVolume1( var TI : TTinyImage; Vol : TNNetVolume);');
+ Procedure LoadTinyImageIntoNNetVolume2(var TI: TCifar100Image; Vol : TNNetVolume);');
+ Procedure LoadTinyImageIntoNNetVolume3( var TI : TMNistImage; Vol : TNNetVolume);');
+ Procedure LoadNNetVolumeIntoTinyImage4( Vol : TNNetVolume; var TI : TTinyImage);');
+ Procedure LoadNNetVolumeIntoTinyImage5( Vol:TNNetVolume; var TI : TCifar100Image);');
+ Procedure LoadTinySingleChannelIntoNNetVolume( var SC : TTinySingleChannelImage; Vol : TNNetVolume)');
+ Procedure TinyImageCreateGrey(var TI:TTinyImage;var TIGrey:TTinySingleChannelImage)');
+ Procedure TinyImageHE( var TI, TIHE : TTinySingleChannelImage)');
+ Procedure TinyImageVE( var TI, TIVE : TTinySingleChannelImage)');
+ Procedure TinyImageRemoveZeroGradient(var TI:TTinySingleChannelImage;distance:byte)');
+ Procedure TinyImageHVE( var TI, TIHE : TTinySingleChannelImage)');
+ Function TinyImageTo1D( var TI:TTinySingleChannelImage): TTinySingleChannelImage1D');
+ Procedure CreateCifar10Volumes( out ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes : TNNetVolumeList; color_encoding : byte)');
+ Procedure CreateCifar100Volumes( out ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes : TNNetVolumeList; color_encoding : byte; Verbose : boolean)');
+ Procedure CreateMNISTVolumes( out ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes : TNNetVolumeList; TrainFileName, TestFileName: string; Verbose: boolean; IsFashion : boolean)');
+ Procedure loadCifar10Dataset6( ImgVolumes : TNNetVolumeList; idx : integer; base_pos : integer; color_encoding : byte);');
+ Procedure loadCifar10Dataset7( ImgVolumes : TNNetVolumeList; fileName : string; base_pos : integer; color_encoding : byte);');
+ Procedure loadCifar100Dataset( ImgVolumes : TNNetVolumeList; fileName : string; color_encoding : byte; Verbose : boolean)');
+ Procedure loadMNISTDataset( ImgVolumes : TNNetVolumeList; fileName : string; Verbose : boolean; IsFashion : boolean; MaxLabel : integer);');
+ Function CheckCIFARFile( ) : boolean');
+ Function CheckCIFAR100File( ) : boolean');
+ Function CheckMNISTFile( fileName : string; IsFasion : boolean) : boolean');
+ Procedure TestBatch( NN : TNNet; ImgVolumes : TNNetVolumeList; SampleSize : integer; out Rate, Loss, ErrorSum : TNeuralFloat)');
+ Procedure TranslateCifar10VolumesToMachineAnimal( VolumeList : TNNetVolumeList)');
+ Function SwapEndian( I : integer) : integer');
+end;
+
+compare the two files:
+
+
+
+
