@@ -1299,7 +1299,7 @@ property CustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn read 
 property MessageProc: TGetStrProc read FMessageProc write FMessageProc;
 property ErrorProc: TGetStrProc read FErrorProc write FErrorProc;
 ```
-On your own code, you could something is:
+On your own code, you could do something like this:
 ```
 MyFit.MessageProc := {$IFDEF FPC}@{$ENDIF}Self.MessageProc;
 MyFit.ErrorProc := {$IFDEF FPC}@{$ENDIF}Self.ErrorProc;
