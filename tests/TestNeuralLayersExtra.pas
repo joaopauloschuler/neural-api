@@ -16,6 +16,7 @@ type
     procedure TestDeconvolutionOutputSize;
     procedure TestDeconvolutionNumeric;
     procedure TestDeconvolutionGradient;
+    procedure TestDeconvolutionLinear;
     
     // DeLocalConnect tests
     procedure TestDeLocalConnectForward;
@@ -424,6 +425,62 @@ begin
         AssertEquals('tile['+IntToStr(ox)+','+IntToStr(oy)+']',
           expected, NN.GetLastLayer.Output.Get(ox, oy, 0));
       end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// TNNetDeconvolutionLinear must use identity activation: with an all-ones 2x2
+// kernel, stride 2 and no bias it scatters each input into a 2x2 tile EXACTLY
+// (a tanh-activated deconv would squash these). Also checks save/load dispatch.
+procedure TTestNeuralLayersExtra.TestDeconvolutionLinear;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  D: TNNetDeconvolutionLinear;
+  ox, oy: integer;
+  s: string;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 1));
+    D := TNNetDeconvolutionLinear.Create(1, 2, 2, 0, 0, 1); // k=2 stride=2, no bias
+    NN.AddLayer(D);
+    NN.InitWeights;
+    D.Neurons[0].Weights.Fill(1.0);
+    D.Neurons[0].BiasWeight := 0.0;
+
+    Input.Fill(0);
+    Input[0,0,0] := 5;  Input[1,0,0] := -3;
+    Input[0,1,0] := 2;  Input[1,1,0] := -7;
+    NN.Compute(Input);
+
+    AssertEquals('Out SizeX', 4, NN.GetLastLayer.Output.SizeX);
+    // Linear (identity) => exact tiling, including negatives a tanh would clip.
+    for oy := 0 to 3 do
+      for ox := 0 to 3 do
+        AssertEquals('tile['+IntToStr(ox)+','+IntToStr(oy)+']',
+          Input.Get(ox div 2, oy div 2, 0),
+          NN.GetLastLayer.Output.Get(ox, oy, 0));
+
+    // Save/load round-trip keeps class + geometry + behavior.
+    s := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(s);
+      AssertTrue('Reloaded layer is TNNetDeconvolutionLinear',
+        NN2.GetLastLayer is TNNetDeconvolutionLinear);
+      NN2.Compute(Input);
+      for oy := 0 to 3 do
+        for ox := 0 to 3 do
+          AssertEquals('reload tile['+IntToStr(ox)+','+IntToStr(oy)+']',
+            NN.GetLastLayer.Output.Get(ox, oy, 0),
+            NN2.GetLastLayer.Output.Get(ox, oy, 0));
+    finally
+      NN2.Free;
+    end;
   finally
     NN.Free;
     Input.Free;

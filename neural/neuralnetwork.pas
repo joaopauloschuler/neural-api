@@ -12151,6 +12151,18 @@ type
       pOutputPadding: integer = 0; pSuppressBias: integer = 0); reintroduce; overload;
   end;
 
+  { TNNetDeconvolutionLinear }
+  // Identity-activated transposed convolution: the linear sibling of
+  // TNNetDeconvolution, mirroring TNNetConvolutionLinear. This is the natural
+  // default for the final upsampling layer of a decoder/generator (raw output,
+  // no squashing nonlinearity). Coded by Claude (AI).
+  TNNetDeconvolutionLinear = class(TNNetDeconvolution)
+  public
+    constructor Create(pNumFeatures, pFeatureSize: integer;
+      pStride: integer = 2; pPadding: integer = 0;
+      pOutputPadding: integer = 0; pSuppressBias: integer = 0); reintroduce; overload;
+  end;
+
   { TNNetLocalConnect }
   TNNetLocalConnect = class(TNNetConvolutionBase)
     private
@@ -74036,6 +74048,16 @@ begin
   FActivationFnDerivative := @RectifiedLinearUnitDerivative;
 end;
 
+{ TNNetDeconvolutionLinear }
+constructor TNNetDeconvolutionLinear.Create(pNumFeatures, pFeatureSize: integer;
+  pStride: integer = 2; pPadding: integer = 0;
+  pOutputPadding: integer = 0; pSuppressBias: integer = 0);
+begin
+  inherited Create(pNumFeatures, pFeatureSize, pStride, pPadding, pOutputPadding, pSuppressBias);
+  FActivationFn := @Identity;
+  FActivationFnDerivative := @IdentityDerivative;
+end;
+
 { TNNetConcat }
 constructor TNNetConcat.Create(pSizeX, pSizeY, pDepth: integer;
   aL: array of TNNetLayer);
@@ -95898,6 +95920,7 @@ begin
       'TNNetDeLocalConnectReLU' :   Result := TNNetDeLocalConnectReLU.Create(St[0], St[1], St[4]);
       'TNNetDeconvolution' :        Result := TNNetDeconvolution.Create(St[0], St[1], St[3], St[2], St[5], St[4]);
       'TNNetDeconvolutionReLU' :    Result := TNNetDeconvolutionReLU.Create(St[0], St[1], St[3], St[2], St[5], St[4]);
+      'TNNetDeconvolutionLinear' :  Result := TNNetDeconvolutionLinear.Create(St[0], St[1], St[3], St[2], St[5], St[4]);
       'TNNetDeMaxPool' :            Result := TNNetDeMaxPool.Create(St[0], St[7]);
       'TNNetDeAvgPool' :            Result := TNNetDeAvgPool.Create(St[0]);
       'TNNetUpsample' :             Result := TNNetUpsample.Create();
@@ -96314,6 +96337,7 @@ begin
       if S[0] = 'TNNetDeLocalConnectReLU' then Result := TNNetDeLocalConnectReLU.Create(St[0], St[1], St[4]) else
       if S[0] = 'TNNetDeconvolution' then Result := TNNetDeconvolution.Create(St[0], St[1], St[3], St[2], St[5], St[4]) else
       if S[0] = 'TNNetDeconvolutionReLU' then Result := TNNetDeconvolutionReLU.Create(St[0], St[1], St[3], St[2], St[5], St[4]) else
+      if S[0] = 'TNNetDeconvolutionLinear' then Result := TNNetDeconvolutionLinear.Create(St[0], St[1], St[3], St[2], St[5], St[4]) else
       if S[0] = 'TNNetDeMaxPool' then Result := TNNetDeMaxPool.Create(St[0], St[7]) else
       if S[0] = 'TNNetDeAvgPool' then Result := TNNetDeAvgPool.Create(St[0]) else
       if S[0] = 'TNNetUpsample' then Result := TNNetUpsample.Create() else
