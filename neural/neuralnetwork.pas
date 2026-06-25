@@ -10346,7 +10346,7 @@ type
       FSizeXDepthBytes: integer;
       FPrevSizeXDepthBytes: integer;
       FCalculatePrevLayerError: boolean;
-      function CalcOutputSize(pInputSize, pFeatureSize, pInputPadding, pStride: integer) : integer;
+      function CalcOutputSize(pInputSize, pFeatureSize, pInputPadding, pStride: integer) : integer; virtual;
       procedure RefreshCalculatePrevLayerError();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure RefreshPrevSizeXDepthBytes();
@@ -12120,15 +12120,35 @@ type
   end;
 
   { TNNetDeconvolution }
+  // Real transposed (fractionally-strided) convolution, a.k.a. "deconvolution".
+  // Upsamples by FStride via overlap-add scatter: each input cell distributes
+  // its weighted kernel into the output, accumulating overlaps. Output geometry
+  //   out = (in-1)*stride - 2*padding + kernel + output_padding
+  // is the exact inverse of TNNetConvolution's downsampling formula, matching
+  // PyTorch ConvTranspose2d. The per-neuron weight tensor keeps the same
+  // (FeatureSizeX, FeatureSizeY, InputDepth) layout as a convolution.
+  // NOTE: as with TNNetConvolution, the kernel is clamped to the input size, so
+  // FeatureSize must be <= the previous layer's spatial size.
+  // Coded by Claude (AI).
   TNNetDeconvolution = class(TNNetConvolution)
+  protected
+    FOutputPadding: integer;
+    function CalcOutputSize(pInputSize, pFeatureSize, pInputPadding, pStride: integer): integer; override;
   public
-    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pNumFeatures, pFeatureSize: integer;
+      pStride: integer = 2; pPadding: integer = 0;
+      pOutputPadding: integer = 0; pSuppressBias: integer = 0); reintroduce; overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
   end;
 
   { TNNetDeconvolutionReLU }
-  TNNetDeconvolutionReLU = class(TNNetConvolutionReLU)
+  // ReLU-activated transposed convolution. Coded by Claude (AI).
+  TNNetDeconvolutionReLU = class(TNNetDeconvolution)
   public
-    constructor Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0); overload;
+    constructor Create(pNumFeatures, pFeatureSize: integer;
+      pStride: integer = 2; pPadding: integer = 0;
+      pOutputPadding: integer = 0; pSuppressBias: integer = 0); reintroduce; overload;
   end;
 
   { TNNetLocalConnect }
@@ -73830,16 +73850,190 @@ begin
   inherited Create(pNumFeatures,pFeatureSize,pFeatureSize-1,0,pSuppressBias);
 end;
 
-{ TNNetDeconvolutionReLU }
-constructor TNNetDeconvolutionReLU.Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0);
+{ TNNetDeconvolution }
+constructor TNNetDeconvolution.Create(pNumFeatures, pFeatureSize: integer;
+  pStride: integer = 2; pPadding: integer = 0;
+  pOutputPadding: integer = 0; pSuppressBias: integer = 0);
 begin
-  inherited Create(pNumFeatures,pFeatureSize,pFeatureSize-1,0,pSuppressBias);
+  // Reuses the convolution weight storage / neuron management; only geometry
+  // (CalcOutputSize) and the forward/backward math are overridden below.
+  inherited Create(pNumFeatures, pFeatureSize, Max(pPadding, 0), Max(pStride, 1), pSuppressBias);
+  FOutputPadding := Max(pOutputPadding, 0);
+  FStruct[5] := FOutputPadding;
 end;
 
-{ TNNetDeconvolution }
-constructor TNNetDeconvolution.Create(pNumFeatures, pFeatureSize: integer; pSuppressBias: integer = 0);
+function TNNetDeconvolution.CalcOutputSize(pInputSize, pFeatureSize, pInputPadding, pStride: integer): integer;
 begin
-  inherited Create(pNumFeatures,pFeatureSize,pFeatureSize-1,0,pSuppressBias);
+  // Transposed-conv geometry: the exact inverse of the conv downsample.
+  Result := (pInputSize - 1) * pStride - 2 * pInputPadding + pFeatureSize + FOutputPadding;
+end;
+
+procedure TNNetDeconvolution.Compute();
+var
+  StartTime: double;
+  Prev: TNNetVolume;
+  InW, InH, InD, OutW, OutH: integer;
+  ix, iy, id, kx, ky, oc, ox, oy: integer;
+  MaxInX, MaxInY, MaxInD, MaxN: integer;
+  StrideX, Pad: integer;
+  acc, raw, b: TNeuralFloat;
+  W: TNNetVolume;
+begin
+  if FNeurons.Count = 0 then
+  begin
+    FErrorProc('Neuronal layer contains no neuron:' + IntToStr(FNeurons.Count));
+    exit;
+  end;
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  InW := Prev.SizeX; InH := Prev.SizeY; InD := Prev.Depth;
+  OutW := FOutput.SizeX; OutH := FOutput.SizeY;
+  StrideX := FStride; Pad := FPadding;
+  MaxInX := InW - 1; MaxInY := InH - 1; MaxInD := InD - 1;
+  MaxN := FNeurons.Count - 1;
+
+  // Overlap-add scatter: out[i*stride - pad + k] += W[k] * in[i], accumulated
+  // over every (input cell, kernel tap) pair that lands inside the output.
+  FOutputRaw.Fill(0);
+  for iy := 0 to MaxInY do
+   for ky := 0 to FFeatureSizeY - 1 do
+   begin
+     oy := iy * StrideX - Pad + ky;
+     if (oy < 0) or (oy >= OutH) then continue;
+     for ix := 0 to MaxInX do
+      for kx := 0 to FFeatureSizeX - 1 do
+      begin
+        ox := ix * StrideX - Pad + kx;
+        if (ox < 0) or (ox >= OutW) then continue;
+        for oc := 0 to MaxN do
+        begin
+          W := FNeurons[oc].FWeights;
+          acc := 0;
+          for id := 0 to MaxInD do
+            acc := acc + W.Get(kx, ky, id) * Prev.Get(ix, iy, id);
+          FOutputRaw.Add(ox, oy, oc, acc);
+        end;
+      end;
+   end;
+
+  // Add bias INTO the raw output (so the activation derivative used in
+  // Backpropagate sees the true pre-activation), then apply the activation.
+  for oc := 0 to MaxN do
+  begin
+    if FSuppressBias = 0 then b := FNeurons[oc].FBiasWeight else b := 0;
+    for oy := 0 to OutH - 1 do
+     for ox := 0 to OutW - 1 do
+     begin
+       raw := FOutputRaw.Get(ox, oy, oc) + b;
+       FOutputRaw[ox, oy, oc] := raw;
+       FOutput[ox, oy, oc] := FActivationFn(raw);
+     end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetDeconvolution.Backpropagate();
+var
+  StartTime: double;
+  Prev, PrevErr: TNNetVolume;
+  InW, InH, InD, OutW, OutH: integer;
+  ix, iy, id, kx, ky, oc, ox, oy: integer;
+  MaxInX, MaxInY, MaxInD, MaxN: integer;
+  StrideX, Pad: integer;
+  lr, d, deriv, xval: TNeuralFloat;
+  W, GW: TNNetVolume;
+  localNeuron: TNNetNeuron;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  InW := Prev.SizeX; InH := Prev.SizeY; InD := Prev.Depth;
+  OutW := FOutput.SizeX; OutH := FOutput.SizeY;
+  StrideX := FStride; Pad := FPadding;
+  MaxInX := InW - 1; MaxInY := InH - 1; MaxInD := InD - 1;
+  MaxN := FNeurons.Count - 1;
+  lr := -FLearningRate;
+
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = Prev.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+
+  // Activation-corrected output-error derivative, plus bias deltas in the same
+  // pass (bias grad = sum of the derivative over all output positions).
+  for oc := 0 to MaxN do
+  begin
+    localNeuron := FNeurons[oc];
+    for oy := 0 to OutH - 1 do
+     for ox := 0 to OutW - 1 do
+     begin
+       if FActivationFn = @Identity then
+         deriv := FOutputError.Get(ox, oy, oc)
+       else if FActivationFn = @RectifiedLinearUnit then
+       begin
+         if FOutput.Get(ox, oy, oc) > 0
+           then deriv := FOutputError.Get(ox, oy, oc)
+           else deriv := 0;
+       end
+       else
+         deriv := FOutputError.Get(ox, oy, oc) *
+           FActivationFnDerivative(FOutputRaw.Get(ox, oy, oc));
+       FOutputErrorDeriv[ox, oy, oc] := deriv;
+       if (FSuppressBias = 0) and (deriv <> 0) then
+         localNeuron.FBiasDelta := localNeuron.FBiasDelta + lr * deriv;
+     end;
+  end;
+
+  // Scatter (dual of the forward overlap-add):
+  //   dL/dW[oc][k] += deriv[o] * in[i]      (o = i*stride - pad + k)
+  //   dL/dx[i]     += deriv[o] * W[oc][k]
+  for iy := 0 to MaxInY do
+   for ky := 0 to FFeatureSizeY - 1 do
+   begin
+     oy := iy * StrideX - Pad + ky;
+     if (oy < 0) or (oy >= OutH) then continue;
+     for ix := 0 to MaxInX do
+      for kx := 0 to FFeatureSizeX - 1 do
+      begin
+        ox := ix * StrideX - Pad + kx;
+        if (ox < 0) or (ox >= OutW) then continue;
+        for oc := 0 to MaxN do
+        begin
+          d := FOutputErrorDeriv.Get(ox, oy, oc);
+          if d = 0 then continue;
+          GW := FNeurons[oc].FDelta;
+          W := FNeurons[oc].FWeights;
+          for id := 0 to MaxInD do
+          begin
+            xval := Prev.Get(ix, iy, id);
+            GW.Add(kx, ky, id, lr * d * xval);
+            if hasInputGrad then
+              PrevErr.Add(ix, iy, id, d * W.Get(kx, ky, id));
+          end;
+        end;
+      end;
+   end;
+
+  if (not FBatchUpdate) then
+  begin
+    for oc := 0 to MaxN do FNeurons[oc].UpdateWeights(FInertia);
+  end;
+
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetDeconvolutionReLU }
+constructor TNNetDeconvolutionReLU.Create(pNumFeatures, pFeatureSize: integer;
+  pStride: integer = 2; pPadding: integer = 0;
+  pOutputPadding: integer = 0; pSuppressBias: integer = 0);
+begin
+  inherited Create(pNumFeatures, pFeatureSize, pStride, pPadding, pOutputPadding, pSuppressBias);
+  FActivationFn := @RectifiedLinearUnit;
+  FActivationFnDerivative := @RectifiedLinearUnitDerivative;
 end;
 
 { TNNetConcat }
@@ -95702,8 +95896,8 @@ begin
       'TNNetSplitChannelEvery' :    Result := TNNetSplitChannelEvery.Create(aIdx);
       'TNNetDeLocalConnect' :       Result := TNNetDeLocalConnect.Create(St[0], St[1], St[4]);
       'TNNetDeLocalConnectReLU' :   Result := TNNetDeLocalConnectReLU.Create(St[0], St[1], St[4]);
-      'TNNetDeconvolution' :        Result := TNNetDeconvolution.Create(St[0], St[1], St[4]);
-      'TNNetDeconvolutionReLU' :    Result := TNNetDeconvolutionReLU.Create(St[0], St[1], St[4]);
+      'TNNetDeconvolution' :        Result := TNNetDeconvolution.Create(St[0], St[1], St[3], St[2], St[5], St[4]);
+      'TNNetDeconvolutionReLU' :    Result := TNNetDeconvolutionReLU.Create(St[0], St[1], St[3], St[2], St[5], St[4]);
       'TNNetDeMaxPool' :            Result := TNNetDeMaxPool.Create(St[0], St[7]);
       'TNNetDeAvgPool' :            Result := TNNetDeAvgPool.Create(St[0]);
       'TNNetUpsample' :             Result := TNNetUpsample.Create();
@@ -96118,8 +96312,8 @@ begin
       if S[0] = 'TNNetSplitChannelEvery' then Result := TNNetSplitChannelEvery.Create(aIdx) else
       if S[0] = 'TNNetDeLocalConnect' then Result := TNNetDeLocalConnect.Create(St[0], St[1], St[4]) else
       if S[0] = 'TNNetDeLocalConnectReLU' then Result := TNNetDeLocalConnectReLU.Create(St[0], St[1], St[4]) else
-      if S[0] = 'TNNetDeconvolution' then Result := TNNetDeconvolution.Create(St[0], St[1], St[4]) else
-      if S[0] = 'TNNetDeconvolutionReLU' then Result := TNNetDeconvolutionReLU.Create(St[0], St[1], St[4]) else
+      if S[0] = 'TNNetDeconvolution' then Result := TNNetDeconvolution.Create(St[0], St[1], St[3], St[2], St[5], St[4]) else
+      if S[0] = 'TNNetDeconvolutionReLU' then Result := TNNetDeconvolutionReLU.Create(St[0], St[1], St[3], St[2], St[5], St[4]) else
       if S[0] = 'TNNetDeMaxPool' then Result := TNNetDeMaxPool.Create(St[0], St[7]) else
       if S[0] = 'TNNetDeAvgPool' then Result := TNNetDeAvgPool.Create(St[0]) else
       if S[0] = 'TNNetUpsample' then Result := TNNetUpsample.Create() else

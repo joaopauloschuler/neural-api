@@ -14,6 +14,8 @@ type
     procedure TestDeconvolutionForward;
     procedure TestDeconvolutionReLUForward;
     procedure TestDeconvolutionOutputSize;
+    procedure TestDeconvolutionNumeric;
+    procedure TestDeconvolutionGradient;
     
     // DeLocalConnect tests
     procedure TestDeLocalConnectForward;
@@ -311,14 +313,15 @@ begin
   Input := TNNetVolume.Create(4, 4, 8);
   try
     NN.AddLayer(TNNetInput.Create(4, 4, 8));
-    NN.AddLayer(TNNetDeconvolution.Create(16, 3, 0, 2)); // stride 2 upsamples
+    // Real transposed conv: stride 2 UPSAMPLES. out = (4-1)*2 + 3 = 9.
+    NN.AddLayer(TNNetDeconvolution.Create(16, 3, 2, 0, 0));
 
     Input.Fill(1.0);
     NN.Compute(Input);
 
-    // Deconvolution with stride 2 produces output
+    AssertEquals('Upsampled SizeX (stride 2)', 9, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Upsampled SizeY (stride 2)', 9, NN.GetLastLayer.Output.SizeY);
     AssertEquals('Output depth should be 16', 16, NN.GetLastLayer.Output.Depth);
-    AssertTrue('Deconvolution should produce output', NN.GetLastLayer.Output.Size > 0);
   finally
     NN.Free;
     Input.Free;
@@ -329,18 +332,26 @@ procedure TTestNeuralLayersExtra.TestDeconvolutionReLUForward;
 var
   NN: TNNet;
   Input: TNNetVolume;
+  i: integer;
+  AllNonNeg: boolean;
 begin
   NN := TNNet.Create();
   Input := TNNetVolume.Create(4, 4, 4);
   try
     NN.AddLayer(TNNetInput.Create(4, 4, 4));
-    NN.AddLayer(TNNetDeconvolutionReLU.Create(8, 3, 0, 2));
+    // out = (4-1)*2 + 3 = 9.
+    NN.AddLayer(TNNetDeconvolutionReLU.Create(8, 3, 2, 0, 0));
 
     Input.Fill(1.0);
     NN.Compute(Input);
 
-    // Output should have ReLU applied (non-negative values)
+    AssertEquals('Upsampled SizeX (stride 2)', 9, NN.GetLastLayer.Output.SizeX);
     AssertEquals('Output depth should be 8', 8, NN.GetLastLayer.Output.Depth);
+    // ReLU output must be non-negative everywhere.
+    AllNonNeg := True;
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      if NN.GetLastLayer.Output.FData[i] < 0 then AllNonNeg := False;
+    AssertTrue('ReLU output is non-negative', AllNonNeg);
   finally
     NN.Free;
     Input.Free;
@@ -356,18 +367,128 @@ begin
   Input := TNNetVolume.Create(8, 8, 16);
   try
     NN.AddLayer(TNNetInput.Create(8, 8, 16));
-    // Deconvolution with stride 1 and padding should maintain size
-    NN.AddLayer(TNNetDeconvolution.Create(32, 3, 1, 1));
+    // stride 2, padding 1, output_padding 1, kernel 4:
+    // out = (8-1)*2 - 2*1 + 4 + 1 = 17. (PyTorch ConvTranspose2d geometry.)
+    NN.AddLayer(TNNetDeconvolution.Create(32, 4, 2, 1, 1));
 
     Input.Fill(0.5);
     NN.Compute(Input);
 
-    AssertEquals('Output SizeX with stride 1', 8, NN.GetLastLayer.Output.SizeX);
-    AssertEquals('Output SizeY with stride 1', 8, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('Output SizeX', 17, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Output SizeY', 17, NN.GetLastLayer.Output.SizeY);
     AssertEquals('Output depth should be 32', 32, NN.GetLastLayer.Output.Depth);
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+// Forward correctness: a stride-2 transposed conv with a single input feature
+// and an all-ones 2x2 kernel scatters each input value into a 2x2 output block
+// with no overlap, so the output is an exact nearest-neighbour-like tiling.
+procedure TTestNeuralLayersExtra.TestDeconvolutionNumeric;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  D: TNNetDeconvolution;
+  ox, oy: integer;
+  expected: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 1));
+    D := TNNetDeconvolution.Create(1, 2, 2, 0, 0, 1); // k=2 stride=2, no bias
+    NN.AddLayer(D);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.InitWeights;
+    // Force identity activation and a unit kernel so the math is exact.
+    D.ActivationFn := @Identity;
+    D.ActivationFnDerivative := @IdentityDerivative;
+    D.Neurons[0].Weights.Fill(1.0);
+    D.Neurons[0].BiasWeight := 0.0;
+
+    // Input = [[1,2],[3,4]] (x fastest).
+    Input.Fill(0);
+    Input[0,0,0] := 1; Input[1,0,0] := 2;
+    Input[0,1,0] := 3; Input[1,1,0] := 4;
+    NN.Compute(Input);
+
+    AssertEquals('Out SizeX', 4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Out SizeY', 4, NN.GetLastLayer.Output.SizeY);
+    // Each input cell (ix,iy) fills the 2x2 block at (2*ix..2*ix+1, 2*iy..2*iy+1).
+    for oy := 0 to 3 do
+      for ox := 0 to 3 do
+      begin
+        expected := Input.Get(ox div 2, oy div 2, 0);
+        AssertEquals('tile['+IntToStr(ox)+','+IntToStr(oy)+']',
+          expected, NN.GetLastLayer.Output.Get(ox, oy, 0));
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Finite-difference gradient check of a weight against analytic backprop.
+procedure TTestNeuralLayersExtra.TestDeconvolutionGradient;
+var
+  NN: TNNet;
+  V, Tgt: TNNetVolume;
+  D: TNNetDeconvolution;
+  analytic, numeric, orig, eps, lp, lm: TNeuralFloat;
+
+  function Loss: TNeuralFloat;
+  var i: integer; s: TNeuralFloat; L: TNNetLayer;
+  begin
+    NN.Compute(V);
+    L := NN.GetLastLayer;
+    s := 0;
+    for i := 0 to L.Output.Size - 1 do
+      s := s + 0.5 * Sqr(L.Output.FData[i] - Tgt.FData[i]);
+    Result := s;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  V := TNNetVolume.Create(4, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 2, 1));
+    D := TNNetDeconvolution.Create(3, 2, 2, 0, 0, 0);
+    NN.AddLayer(D);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.InitWeights;
+    V.Randomize;
+    NN.Compute(V);
+    Tgt := TNNetVolume.Create(NN.GetLastLayer.Output);
+    try
+      Tgt.Fill(0.1);
+
+      // Analytic: LR=1 so dL/dW = -Delta. Freeze weights via batch update.
+      D.SetBatchUpdate(True);
+      NN.ClearDeltas;
+      Loss;
+      NN.Backpropagate(Tgt);
+      analytic := -D.Neurons[0].Delta.Get(0, 0, 0);
+
+      // Numeric: central difference.
+      eps := 1e-4;
+      orig := D.Neurons[0].Weights.Get(0, 0, 0);
+      D.Neurons[0].Weights[0,0,0] := orig + eps; lp := Loss;
+      D.Neurons[0].Weights[0,0,0] := orig - eps; lm := Loss;
+      D.Neurons[0].Weights[0,0,0] := orig;
+      numeric := (lp - lm) / (2 * eps);
+
+      AssertTrue('weight grad analytic≈numeric (a='+FloatToStr(analytic)+
+        ' n='+FloatToStr(numeric)+')',
+        Abs(analytic - numeric) <= 1e-2 * (1 + Abs(analytic)));
+    finally
+      Tgt.Free;
+    end;
+  finally
+    NN.Free;
+    V.Free;
   end;
 end;
 
