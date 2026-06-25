@@ -349,7 +349,7 @@ begin
     mul  b           // rdx:rax = a * b
     mov  rlo, rax
     mov  rhi, rdx
-  end ['rax', 'rdx'];
+  end {$IFDEF FPC} ['rax', 'rdx']{$ENDIF};
   Result.lo := rlo;
   Result.hi := rhi;
 end;
@@ -999,7 +999,7 @@ asm
   mul r9                 // rdx:rax = a*b
   mov [rcx], rdx         // *hi = high
   mov [r10], rax         // *lo = low
-end;
+end {$IFDEF FPC} ['rax', 'rcx', 'r10']{$ENDIF};
 {$ELSE}
 // SysV: rdi=@hi, rsi=@lo, rdx=a, rcx=b. mul leaves product in rdx:rax.
 procedure Mul64x64(out hi, lo: UInt64; a, b: UInt64); assembler; nostackframe;
@@ -1008,7 +1008,7 @@ asm
   mul rcx                // a * b -> rdx:rax (high:low)
   mov [rdi], rdx         // *hi = high
   mov [rsi], rax         // *lo = low
-end;
+end {$IFDEF FPC} ['rax', 'rdx']{$ENDIF};
 {$ENDIF}
 {$ELSE}
 procedure Mul64x64(out hi, lo: UInt64; a, b: UInt64); inline;
@@ -1041,7 +1041,7 @@ asm
   mov rax, [rdx+8]       // a.h
   sbb rax, [r8+8]        // - b.h - borrow
   mov [rcx+8], rax       // r.h
-end;
+end {$IFDEF FPC} ['rax','rcx','rdx','r8']{$ENDIF};
 {$ELSE}
 // SysV x86-64 ABI: rdi=@r, rsi=@a, rdx=@b. TInt64 layout: m@0, h@8, l@16.
 procedure Sub192(out r: TInt64; const a, b: TInt64); assembler; nostackframe;
@@ -1055,7 +1055,7 @@ asm
   mov rax, [rsi+8]       // a.h
   sbb rax, [rdx+8]       // - b.h - borrow
   mov [rdi+8], rax       // r.h
-end;
+end {$IFDEF FPC} ['rax']{$ENDIF};
 {$ENDIF}
 {$ELSE}
 procedure Sub192(out r: TInt64; const a, b: TInt64); inline;
@@ -1092,7 +1092,7 @@ asm
   mov [rcx+8], rax       // r.h
   setc al                // carry-out into AL
   movzx rax, al          // zero-extend to 64-bit Result (RAX)
-end;
+end {$IFDEF FPC} ['rax','rcx','rdx','r8']{$ENDIF};
 {$ELSE}
 // SysV x86-64 ABI: rdi=@r, rsi=@a, rdx=@b. Result returned in rax.
 function Add192Cy(out r: TInt64; const a, b: TInt64): UInt64; assembler; nostackframe;
@@ -1108,7 +1108,7 @@ asm
   mov [rdi+8], rax       // r.h
   setc al                // carry-out into AL
   movzx rax, al          // zero-extend to 64-bit Result (RAX)
-end ['rax'];
+end {$IFDEF FPC} ['rax']{$ENDIF};
 {$ENDIF}
 {$ELSE}
 function Add192Cy(out r: TInt64; const a, b: TInt64): UInt64; inline;
@@ -1356,7 +1356,7 @@ asm
 
   pop rdi
   pop rsi
-end ['rax', 'rcx', 'rdx', 'r8', 'r9', 'r10', 'rdi', 'rsi'];
+end {$IFDEF FPC} ['rax', 'rcx', 'rdx', 'r8', 'r9', 'r10', 'rdi', 'rsi']{$ENDIF};
 {$ELSE}
 procedure MulTInt(out r: TInt64; const a, b: TInt64); assembler; nostackframe;
 asm
@@ -1428,7 +1428,7 @@ asm
   mov [rdi+8],  r10             // r.h
   mov [rdi+0],  r9              // r.m
   mov [rdi+16], r8              // r.l
-end ['rax', 'rcx', 'rdx', 'r8', 'r9', 'r10'];
+end {$IFDEF FPC} ['rax', 'rcx', 'rdx', 'r8', 'r9', 'r10']{$ENDIF};
 {$ENDIF}
 {$ELSE}
 procedure MulTInt(out r: TInt64; const a, b: TInt64); inline;
