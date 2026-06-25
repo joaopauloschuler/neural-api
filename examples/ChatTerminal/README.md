@@ -11,7 +11,7 @@ sharded index / pytorch_model.bin] + `tokenizer.json`
 ```
 lazbuild neural-api/examples/ChatTerminal/ChatTerminal.lpi
 git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q2
-neural-api/bin/x86_64-linux/bin/ChatTerminal q2/ --ctx 64 --fp32
+neural-api/bin/x86_64-linux/bin/ChatTerminal q2/ --gpu
 ```
 
 ### Multilingual generation (Cohere Command-R / Aya)
