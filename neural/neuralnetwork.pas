@@ -17080,12 +17080,10 @@ type
 
 implementation
 
-{$IFNDEF FPC}
 function BoolToString(B: Boolean; const TrueS, FalseS: string): String; inline;
 begin
   if B then Result := TrueS else Result := FalseS;
 end;
-{$ENDIF}
 
 procedure RebuildPatternOnPreviousPatterns
 (
@@ -28578,8 +28576,7 @@ begin
   if FUseBias then Needed := Needed + FDout;
   if FWeightsLayer.FOutput.Size <> Needed then
     FErrorProc('TNNetHyperLinear requires a WeightsSource of size Din*Dout' +
-      {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(FUseBias, '+Dout', '') +
-      ' = ' + IntToStr(Needed) +
+      BoolToString(FUseBias, '+Dout', '') + ' = ' + IntToStr(Needed) +
       ' (Din=' + IntToStr(FDin) + ', Dout=' + IntToStr(FDout) +
       '). Got size=' + IntToStr(FWeightsLayer.FOutput.Size));
   FOutput.ReSize(FDout, 1, 1);
@@ -28724,7 +28721,7 @@ begin
   if FWeightsLayer.FOutput.Size <> Needed then
     FErrorProc('TNNetHyperConv requires a WeightsSource of size ' +
       'OutChannels*K*K*InChannels' +
-      {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(FUseBias, '+OutChannels', '') +
+      BoolToString(FUseBias, '+OutChannels', '') +
       ' = ' + IntToStr(Needed) + ' (OutChannels=' + IntToStr(FOutChannels) +
       ', K=' + IntToStr(FFeatureSize) + ', InChannels=' +
       IntToStr(FInChannels) + '). Got size=' +
@@ -78820,7 +78817,7 @@ begin
       'LossLandscapeProbe: K=%d, R=%.4f, samples=%d, trainable layers=%d, ' +
       'LossKind=%d (%s).',
       [K, R, Samples.Count, T, LossKind,
-       {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(LossKind = 1, 'cross-entropy', 'MSE')]));
+       BoolToString(LossKind = 1, 'cross-entropy', 'MSE')]));
     Lines.Add('');
     Lines.Add(Format('%-7s %14s', ['alpha', 'loss']));
     Lines.Add(StringOfChar('-', 24));
@@ -84519,13 +84516,13 @@ begin
 
     Lines.Add(Format('Would-fit-in budget (%.1f MiB):', [BudgetMiB]));
     Lines.Add(Format('  forward-only : %10.4f MiB  -> %s',
-      [ForwardOnlyMiB, {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(ForwardOnlyMiB <= BudgetMiB, 'FITS', 'OVER')]));
+      [ForwardOnlyMiB, BoolToString(ForwardOnlyMiB <= BudgetMiB, 'FITS', 'OVER')]));
     Lines.Add(Format('  train-SGD    : %10.4f MiB  -> %s',
-      [TrainSGDMiB, {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(TrainSGDMiB <= BudgetMiB, 'FITS', 'OVER')]));
+      [TrainSGDMiB, BoolToString(TrainSGDMiB <= BudgetMiB, 'FITS', 'OVER')]));
     Lines.Add(Format('  train-Adam   : %10.4f MiB  -> %s',
-      [TrainAdamMiB, {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(TrainAdamMiB <= BudgetMiB, 'FITS', 'OVER')]));
+      [TrainAdamMiB, BoolToString(TrainAdamMiB <= BudgetMiB, 'FITS', 'OVER')]));
     Lines.Add(Format('  train-%-6s : %10.4f MiB  -> %s',
-      [KindLow, TrainMiB, {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(TrainMiB <= BudgetMiB, 'FITS', 'OVER')]));
+      [KindLow, TrainMiB, BoolToString(TrainMiB <= BudgetMiB, 'FITS', 'OVER')]));
 
     Result := Lines.Text;
   finally
@@ -92468,7 +92465,7 @@ begin
       'SaliencyReport: probe shape (%d,%d,%d), %d classes. ' +
       'Predicted class c=%d (forced=%s).',
       [SizeX, SizeY, Depth, NClasses, PredClass,
-       {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(ForcedClass >= 0, 'yes', 'no')]));
+       BoolToString(ForcedClass >= 0, 'yes', 'no')]));
     Lines.Add(Format(
       'logit_c(x)=%8.4f  logit_c(0)=%8.4f  delta=%8.4f  ' +
       'SmoothGrad N=%d sigma=%.4f  IG steps=%d.',
@@ -92476,7 +92473,7 @@ begin
     Lines.Add(Format(
       'IG completeness gap |sum(IG) - delta| = %.6g  (relative %.4f%%): %s.',
       [GapAbs, RelGap * 100.0,
-       {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}((RelGap < 0.1) and (not IsNan(RelGap)),
+       BoolToString((RelGap < 0.1) and (not IsNan(RelGap)),
                  'OK (small)', 'large - check integration')]));
     Lines.Add(StringOfChar('-', 72));
 
@@ -92819,7 +92816,7 @@ begin
       'feature map (%d,%d,%d). Predicted class c=%d (forced=%s).',
       [Probe.SizeX, Probe.SizeY, Probe.Depth, TargetIdx,
        ConvLayer.ClassName, CSizeX, CSizeY, CDepth, PredClass,
-       {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(ForcedClass >= 0, 'yes', 'no')]));
+       BoolToString(ForcedClass >= 0, 'yes', 'no')]));
     Lines.Add(Format(
       'Coarse Grad-CAM peak at conv cell (x=%d,y=%d) value=%.4f. ' +
       'Map normalised to [0,1].', [PeakX, PeakY, PeakVal]));
@@ -93014,7 +93011,7 @@ begin
     Lines.Add(Format('Probe shape (%d,%d,%d), %d outputs. Explained class c=%d '
       + '(forced=%s).',
       [SizeX, SizeY, Depth, OutSize, PredClass,
-       {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(ForcedClass >= 0, 'yes', 'no')]));
+       BoolToString(ForcedClass >= 0, 'yes', 'no')]));
     Lines.Add(Format('Seed relevance R_c = logit_c = %8.4f   eps = %.4g   '
       + 'gamma = %.4g   alpha = %.4g   beta = %.4g',
       [PredLogit, Eps, Gamma, Alpha, Beta]));
@@ -93357,7 +93354,7 @@ begin
     Lines.Add(Format('Layers=%d. Clean argmax=%d, Corrupt argmax=%d, ' +
       'TargetClass c=%d%s.',
       [NumLayers, CleanClass, CorruptClass, c,
-       {$IFDEF FPC}BoolToStr{$ELSE}BoolToString{$ENDIF}(TargetIdx < 0, ' (default=clean argmax)', '')]));
+       BoolToString(TargetIdx < 0, ' (default=clean argmax)', '')]));
     Lines.Add(Format('logit_c(clean)=%8.4f  logit_c(corrupt)=%8.4f  ' +
       'denom=%8.4f', [CleanLogitC, CorruptLogitC, Denom]));
     if DenomCollapsed then
