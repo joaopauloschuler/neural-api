@@ -24516,6 +24516,10 @@ var
   Prev: TNNetVolume;
   OutPtr: TNeuralFloatArrPtr;
 begin
+  // The KV-cache decode attention is CPU-only (no OpenCL path here), so count
+  // it as a CPU dispatch - otherwise a profiler sees neither counter and the
+  // GPU column reads "-" instead of an honest 0% for the decode workload.
+  Inc(FForwardCPUCnt);
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
