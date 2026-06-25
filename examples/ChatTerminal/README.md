@@ -67,7 +67,7 @@ guard, flushed per token so piped output streams too).
 | `--low-memory` | drop each conv/linear layer's concatenated weight cache (`FConcatedWeights`) and compute per-neuron straight from the weights — less RAM, somewhat slower forward (`pLowMemory`). **Overridden by `--gpu`** (see below) | **on** |
 | `--max-fast-memory` | keep the concatenated weight cache for a faster forward at the cost of more RAM — required for GPU offload | off |
 | `--gpu` | OpenCL offload of the conv/linear matmuls (only when built with `-dOpenCL`) — overrides `--int8` and `--low-memory` (see below) | **on** when built with `-dOpenCL`, else off |
-| `--no-gpu` | force CPU even when built with `-dOpenCL` | — |
+| `--cpu` | force CPU even when built with `-dOpenCL` | — |
 | `--gpu-platform N` | OpenCL platform index | 0 |
 | `--gpu-device N` | OpenCL device index within the platform | 0 |
 | `--stats` | per-turn timing to **stderr**: TTFT (prefill + first token), steady-state decode tok/s, and `prompt N (reused K)` from the KV-cache reuse | off |
@@ -87,7 +87,7 @@ the fly).
 
 **OpenCL / GPU offload.** When the binary is built with `-dOpenCL` (the
 default compilation), the conv/linear matmuls are offloaded to the GPU by
-default; `--no-gpu` forces CPU, and `--gpu-platform N` / `--gpu-device N`
+default; `--cpu` forces CPU, and `--gpu-platform N` / `--gpu-device N`
 select the OpenCL device. A binary built without `-dOpenCL` is CPU-only and
 ignores the `--gpu*` flags.
 
@@ -99,13 +99,13 @@ the cache is built so the kernel can run.
 - **`--int8`** — the int8 path never builds the interleaved cache the kernel
   reads, so combining it with `--gpu` drops int8, not the GPU: int8 is disabled
   and the model runs fp32 on the GPU (`[--int8 ignored: incompatible with
-  --gpu]`). To actually run int8, pass `--no-gpu` and keep it on CPU.
+  --gpu]`). To actually run int8, pass `--cpu` and keep it on CPU.
 - **`--low-memory`** (the default) drops exactly that weight cache. Combining it
   with `--gpu` therefore *overrides* it (`[--low-memory ignored: incompatible
   with --gpu]`): the cache is rebuilt and the low-memory forward is turned off
   on the accelerated layers (more RAM, the GPU's cost of entry). Since both
   `--low-memory` and `--gpu` default to on, the default GPU run keeps the cache;
-  pass `--no-gpu` to honor low-memory on CPU, or `--max-fast-memory` to keep the
+  pass `--cpu` to honor low-memory on CPU, or `--max-fast-memory` to keep the
   cache explicitly.
 
 Temperature and the penalties run through a

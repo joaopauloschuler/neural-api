@@ -166,7 +166,8 @@ begin
   WriteLn('  --low-memory          drop conv/linear weight cache; per-neuron forward (DEFAULT)');
   WriteLn('  --max-fast-memory     keep the concatenated weight cache (faster forward, more RAM)');
   WriteLn('  --gpu                 OpenCL offload of conv/linear matmuls (DEFAULT when');
-  WriteLn('                        built with -dOpenCL); --no-gpu forces CPU');
+  WriteLn('                        built with -dOpenCL); --cpu forces CPU');
+  WriteLn('  --cpu                 force CPU even when built with -dOpenCL');
   WriteLn('  --gpu-platform N      OpenCL platform index (default 0)');
   WriteLn('  --gpu-device N        OpenCL device index within the platform (default 0)');
   WriteLn('  --stats               per-turn timing to stderr (TTFT, decode tok/s)');
@@ -204,7 +205,7 @@ begin
   Result.Profile := false;
   Result.NoCacheReuse := false;
   // OpenCL offload defaults ON when the binary is built with -dOpenCL (the
-  // default compilation), OFF otherwise; --no-gpu forces CPU either way.
+  // default compilation), OFF otherwise; --cpu forces CPU either way.
   Result.Gpu := {$IFDEF OpenCL}true{$ELSE}false{$ENDIF};
   Result.GpuPlatform := 0;
   Result.GpuDevice := 0;
@@ -278,7 +279,7 @@ begin
     else if Arg = '--profile' then Opt.Profile := true
     else if Arg = '--no-cache-reuse' then Opt.NoCacheReuse := true
     else if Arg = '--gpu' then Opt.Gpu := true
-    else if Arg = '--no-gpu' then Opt.Gpu := false
+    else if Arg = '--cpu' then Opt.Gpu := false
     else if Arg = '--gpu-platform' then
     begin
       if not NextInt(Arg, IVal) then exit(false);
@@ -813,7 +814,7 @@ begin
     Args.Add('--max-fast-memory'); Args.Add('--low-memory');
     Check(ParseArgs(Args, Opt) and Opt.LowMemory, '--low-memory re-enables it');
 
-    // OpenCL offload: --gpu/--no-gpu toggle, platform/device indices parse.
+    // OpenCL offload: --gpu/--cpu toggle, platform/device indices parse.
     // (The default depends on the -dOpenCL build define, so only toggles are
     // asserted here.)
     Args.Clear;
@@ -822,8 +823,8 @@ begin
     Check(ParseArgs(Args, Opt) and Opt.Gpu, '--gpu enables OpenCL offload');
     Args.Clear;
     Args.Add('/tmp/model');
-    Args.Add('--no-gpu');
-    Check(ParseArgs(Args, Opt) and not Opt.Gpu, '--no-gpu forces CPU');
+    Args.Add('--cpu');
+    Check(ParseArgs(Args, Opt) and not Opt.Gpu, '--cpu forces CPU');
     Args.Clear;
     Args.Add('/tmp/model');
     Args.Add('--gpu-platform'); Args.Add('1');
