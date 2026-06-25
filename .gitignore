@@ -24,6 +24,7 @@ examples/EmbeddingSearch/EmbeddingSearch
 examples/EnCodecRoundTrip/EnCodecRoundTrip
 examples/MusicGenSmoke/MusicGenSmoke
 examples/MusicGenText/MusicGenText
+examples/MusicGenText/musicgen_text_demo.wav
 examples/LotteryTicketIMP/LotteryTicketIMP
 examples/VQCodebookUsage/VQCodebookUsage
 examples/FourierMix/FourierMix
