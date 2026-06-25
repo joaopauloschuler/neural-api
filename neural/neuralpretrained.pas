@@ -33726,15 +33726,16 @@ begin
     for t2 := 0 to TM1 do
     begin
       for ch := 0 to HM1 do xIn[ch] := Sig[ch][t2];
-      // gates = Wih*x + bih + Whh*hPrev + bhh
+      // gates = Wih*x + bih + Whh*hPrev + bhh. Each gate row is a contiguous
+      // H-long dot product (Wih/Whh rows are flat, xIn/hPrev are contiguous), so
+      // use the AVX-dispatching DotProduct (H is large -> AVXDotProduct path).
+      // This is the dominant EnCodec-decode cost: a 4H x H mat-vec done twice per
+      // timestep, ~3.4 GMAC total for a 4 s clip. Bit-approximate vs the prior
+      // scalar loop only in the usual AVX-reassociation sense.
       for g := 0 to FourHM1 do
-      begin
-        gates[g] := LSTM.Bih[L][g] + LSTM.Bhh[L][g];
-        for ch := 0 to HM1 do
-          gates[g] := gates[g] + LSTM.Wih[L].Data[g * H + ch] * xIn[ch];
-        for ch := 0 to HM1 do
-          gates[g] := gates[g] + LSTM.Whh[L].Data[g * H + ch] * hPrev[ch];
-      end;
+        gates[g] := LSTM.Bih[L][g] + LSTM.Bhh[L][g] +
+          TNNetVolume.DotProduct(Addr(LSTM.Wih[L].Data[g * H]), Addr(xIn[0]), H) +
+          TNNetVolume.DotProduct(Addr(LSTM.Whh[L].Data[g * H]), Addr(hPrev[0]), H);
       for ch := 0 to HM1 do
       begin
         ig := 1 / (1 + Exp(-gates[ch]));
