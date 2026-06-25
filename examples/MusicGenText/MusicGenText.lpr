@@ -60,7 +60,7 @@ Coded by Claude (AI).
 //   MusicGenText --download --prompt "..." --topk 250 --temperature 1.0
 //   MusicGenText --download --prompt "..." --topk 0    # force greedy (drone!)
 //   MusicGenText --frames 6 --no-cache            # explicit pico frame count
-//   MusicGenText --summary                        # print weights-per-layer tables
+//   MusicGenText --print-model                    # print weights-per-layer tables
 //   MusicGenText --download --prompt "..." --no-gpu      # force CPU
 //   MusicGenText --download --prompt "..." --gpu-device 1 # pick OpenCL device
 // Repo overrides: --musicgen-repo / --t5-repo / --encodec-repo. Gated repos:
@@ -197,7 +197,10 @@ begin
   Temperature := ParseFloatArg('--temperature', 1.0);
   Seconds := ParseFloatArg('--seconds', DefaultSeconds);
   UseCache := not HasFlag('--no-cache');
-  ShowSummary := HasFlag('--summary');
+  // Per-layer weight tables are verbose and bury the timing log; print them
+  // only on request. --print-model is the documented flag; --summary is kept as
+  // a backward-compatible alias.
+  ShowSummary := HasFlag('--print-model') or HasFlag('--summary');
   // OpenCL offload: ON by default when built with -dOpenCL (--no-gpu forces
   // CPU); a non-OpenCL build ignores the --gpu* flags entirely.
   Gpu := {$IFDEF OpenCL}not HasFlag('--no-gpu'){$ELSE}false{$ENDIF};

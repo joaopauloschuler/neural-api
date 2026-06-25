@@ -27467,6 +27467,44 @@ begin
   inherited Destroy;
 end;
 
+// Diagnostic: report whether a net's weight-bearing layers ACTUALLY take the
+// OpenCL path. EnableOpenCL only ARMS a layer; each layer then decides via its
+// ShouldOpenCL size heuristic whether to offload. For the width-1 decode twins
+// the per-token matmuls are tiny, so many layers may stay on CPU even though
+// the GPU was "enabled" - this line makes that visible (the headline metric for
+// "GPU allocated but idle"). Counts only the weight-bearing classes the offload
+// applies to (FullConnect / convolution / SDPA). Always prints (instrumentation).
+procedure ReportNetGpuEngagement(Net: TNNet; const NetName: string);
+{$IFDEF OpenCL}
+var
+  i, LastLayer, weighted, armed, offloaded: integer;
+  Lay: TNNetLayer;
+begin
+  if not Assigned(Net) then exit;
+  weighted := 0; armed := 0; offloaded := 0;
+  LastLayer := Net.Layers.Count - 1;
+  for i := 0 to LastLayer do
+  begin
+    Lay := Net.Layers[i];
+    if (Lay is TNNetFullConnect) or (Lay is TNNetConvolutionBase) or
+       (Lay is TNNetScaledDotProductAttention) then
+    begin
+      Inc(weighted);
+      if Lay.HasOpenCL then Inc(armed);
+      if Lay.HasOpenCL and Lay.ShouldOpenCL then Inc(offloaded);
+    end;
+  end;
+  WriteLn('[gpu] ', NetName, ': ', offloaded, '/', weighted,
+    ' weight-bearing layers actually offload to GPU (', armed,
+    ' armed). ', weighted - offloaded, ' stay on CPU.');
+end;
+{$ELSE}
+begin
+  if not Assigned(Net) then exit;
+  WriteLn('[gpu] ', NetName, ': built without OpenCL - all layers run on CPU.');
+end;
+{$ENDIF}
+
 procedure TMusicGenModel.EnsureStepDecoder;
 var
   StepBlocks: TMarianBlockArray;
@@ -27744,6 +27782,12 @@ var
   gv: integer;
   NumCodebooksM1, HiddenM1, DecSeqLenM1, StepsM1, NumFramesM1, GuidedM1,
     SDPAsHi, SDPAsUHi: integer;
+  // Always-on decode-loop instrumentation. The autoregressive loop is the
+  // dominant cost and is STRICTLY serial across steps (step s needs step s-1's
+  // token), so neither GPU batching nor cross-step CPU threading can apply here;
+  // ms/token is the figure that explains the whole decode budget.
+  tCondTotal, tUncondTotal, tStepTick, tLoopStart: QWord;
+  StepCount: integer;
 
   // Selects codebook k_i's token from its logit row (StepLogits starts at
   // offset Off). nil Sampler -> exact argmax; else softmax(./Temperature) draw.
@@ -27870,6 +27914,11 @@ begin
 
       FrameEmb.ReSize(1, 1, FConfig.Hidden);
       GuidedLogits.ReSize(1, 1, FConfig.NumCodebooks * FConfig.VocabSize);
+      WriteLn('[decode] cached CFG path (dual width-1 twins, 2 passes/step).');
+      ReportNetGpuEngagement(FStepDecoder, 'step decoder (cond)');
+      ReportNetGpuEngagement(FStepDecoderUncond, 'step decoder (uncond)');
+      tCondTotal := 0; tUncondTotal := 0; StepCount := 0;
+      tLoopStart := GetTickCount64;
       for step := 0 to StepsM1 do
       begin
         // One frame embedding (codes-so-far + position), fed to BOTH twins.
@@ -27885,10 +27934,20 @@ begin
             FrameEmb.FData[c] := FrameEmb.FData[c] +
               FEmbed[k_i].FData[tok * FConfig.Hidden + c];
         end;
+        tStepTick := GetTickCount64;
         FStepDecoder.Compute(FrameEmb);
+        tCondTotal := tCondTotal + (GetTickCount64 - tStepTick);
         StepLogits.Copy(FStepDecoder.GetLastLayer().Output);
+        tStepTick := GetTickCount64;
         FStepDecoderUncond.Compute(FrameEmb);
+        tUncondTotal := tUncondTotal + (GetTickCount64 - tStepTick);
         UncondLogits.Copy(FStepDecoderUncond.GetLastLayer().Output);
+        Inc(StepCount);
+        // Heartbeat every 64 steps so a long real-checkpoint decode shows live
+        // progress instead of one silent multi-minute block.
+        if (StepCount mod 64 = 0) then
+          WriteLn('[decode]   step ', StepCount, '/', Steps, ' (',
+            ((GetTickCount64 - tLoopStart) / StepCount):0:1, ' ms/step so far)');
         // Blend: guided = uncond + scale*(cond - uncond).
         for gv := 0 to GuidedM1 do
           GuidedLogits.FData[gv] := UncondLogits.FData[gv] +
@@ -27903,6 +27962,13 @@ begin
             Delayed[k_i][t] := SelectToken(GuidedLogits, base);
           end;
       end;
+
+      if StepCount > 0 then
+        WriteLn('[decode] summary: ', StepCount, ' steps, ',
+          (GetTickCount64 - tLoopStart), ' ms total, ',
+          ((GetTickCount64 - tLoopStart) / StepCount):0:2, ' ms/step ',
+          '(cond ', (tCondTotal / StepCount):0:2, ' + uncond ',
+          (tUncondTotal / StepCount):0:2, ' ms/Compute).');
 
       SetLength(Codes, FConfig.NumCodebooks);
       for k_i := 0 to NumCodebooksM1 do
@@ -27959,9 +28025,19 @@ begin
         for step := 0 to DecSeqLenM1 do
           Delayed[k_i][step] := PadId;
       end;
+      WriteLn('[decode] un-cached full-prefix path (O(T^2), re-encodes the ',
+        'whole prefix each step).');
+      tCondTotal := 0; StepCount := 0;
+      tLoopStart := GetTickCount64;
       for step := 0 to StepsM1 do
       begin
+        tStepTick := GetTickCount64;
         ComputeLogits(Delayed, EncHidden, StepLogits);
+        tCondTotal := tCondTotal + (GetTickCount64 - tStepTick);
+        Inc(StepCount);
+        if (StepCount mod 64 = 0) then
+          WriteLn('[decode]   step ', StepCount, '/', Steps, ' (',
+            ((GetTickCount64 - tLoopStart) / StepCount):0:1, ' ms/step so far)');
         t := step + 1;
         for k_i := 0 to NumCodebooksM1 do
           if (t < FDecSeqLen) and (t >= k_i + 1) and
@@ -27972,6 +28048,10 @@ begin
             Delayed[k_i][t] := SelectToken(StepLogits, base);
           end;
       end;
+      if StepCount > 0 then
+        WriteLn('[decode] summary: ', StepCount, ' steps, ',
+          (GetTickCount64 - tLoopStart), ' ms total, ',
+          ((GetTickCount64 - tLoopStart) / StepCount):0:2, ' ms/step.');
       SetLength(Codes, FConfig.NumCodebooks);
       for k_i := 0 to NumCodebooksM1 do
       begin
@@ -28038,6 +28118,10 @@ begin
     end;
 
     FrameEmb.ReSize(1, 1, FConfig.Hidden);
+    WriteLn('[decode] KV-cache incremental path (single width-1 twin, 1 pass/step).');
+    ReportNetGpuEngagement(FStepDecoder, 'step decoder');
+    tCondTotal := 0; StepCount := 0;
+    tLoopStart := GetTickCount64;
     // Incremental loop: feed exactly ONE frame embedding per step. At step s the
     // fed frame is delayed column s (the codes emitted so far), whose self-attn
     // K/V are appended to the cache; the head output corresponds to position s
@@ -28059,8 +28143,14 @@ begin
           FrameEmb.FData[c] := FrameEmb.FData[c] +
             FEmbed[k_i].FData[tok * FConfig.Hidden + c];
       end;
+      tStepTick := GetTickCount64;
       FStepDecoder.Compute(FrameEmb);
+      tCondTotal := tCondTotal + (GetTickCount64 - tStepTick);
       StepLogits.Copy(FStepDecoder.GetLastLayer().Output); // (1,1,K*VocabSize)
+      Inc(StepCount);
+      if (StepCount mod 64 = 0) then
+        WriteLn('[decode]   step ', StepCount, '/', Steps, ' (',
+          ((GetTickCount64 - tLoopStart) / StepCount):0:1, ' ms/step so far)');
 
       t := step + 1; // delayed column predicted this step
       for k_i := 0 to NumCodebooksM1 do
@@ -28074,6 +28164,10 @@ begin
         end;
       end;
     end;
+    if StepCount > 0 then
+      WriteLn('[decode] summary: ', StepCount, ' steps, ',
+        (GetTickCount64 - tLoopStart), ' ms total, ',
+        ((GetTickCount64 - tLoopStart) / StepCount):0:2, ' ms/step.');
 
     SetLength(Codes, FConfig.NumCodebooks);
     for k_i := 0 to NumCodebooksM1 do
@@ -33342,6 +33436,18 @@ begin
   Result := Length(FCodebooks);
 end;
 
+// Short label for a decoder stage kind, used by the per-stage timing logs.
+function EnCodecStageKindName(K: TEnCodecStageKind): string;
+begin
+  case K of
+    eskConv:   Result := 'conv';
+    eskResnet: Result := 'resnet';
+    eskLSTM:   Result := 'lstm';
+    eskELU:    Result := 'elu';
+  else Result := '?';
+  end;
+end;
+
 // Per-output-channel worker for the EnCodec conv kernels. EnCodec waveform
 // synthesis is dominated by the upsampled decode convolutions (millions of
 // samples through the SEANet stack); the output-channel loop is embarrassingly
@@ -33784,8 +33890,19 @@ var
   Sig, Nxt: TNNetFloatDynArr2D;
   s, q, t, d, Dm, Frames, NQ, code: integer;
   DmM1, FramesM1, NQM1, DecStagesM1, SigLenM1: integer;
+  tStageTick: QWord;   // per-stage wall clock (always-on instrumentation)
 begin
   EnsureThreadPool;
+  // EnCodec runs on CPU (hand-rolled conv codec, not a TNNet); its only
+  // parallelism is the per-output-channel thread pool inside RunStage. Report
+  // the pool width so an "EnCodec is slow" log distinguishes "not threaded"
+  // (pool=1) from "threaded but conv-bound".
+  if Assigned(FProcs) then
+    WriteLn('[encodec] decode: thread pool = ', FMaxThreadNum, ' threads, ',
+      Length(FDecStages), ' decoder stages.')
+  else
+    WriteLn('[encodec] decode: thread pool = 1 (single-threaded), ',
+      Length(FDecStages), ' decoder stages.');
   Dm := FConfig.HiddenSize;
   DmM1 := Dm - 1;
   NQ := Length(Codes);
@@ -33813,6 +33930,7 @@ begin
   DecStagesM1 := Length(FDecStages) - 1;
   for s := 0 to DecStagesM1 do
   begin
+    tStageTick := GetTickCount64;
     if FDecStages[s].Kind = eskLSTM then
       RunEnCodecLSTM(FDecLSTM, Sig)
     else
@@ -33820,6 +33938,11 @@ begin
       RunStage(FDecStages[s], Sig, Nxt);
       Sig := Nxt;
     end;
+    // The LSTM stage cannot thread over the time axis (sequential recurrence),
+    // so it is a likely serial bottleneck; per-stage ms makes that visible.
+    WriteLn('[encodec]   stage ', s, '/', DecStagesM1, ' ',
+      EnCodecStageKindName(FDecStages[s].Kind), ': ',
+      (GetTickCount64 - tStageTick), ' ms');
   end;
   // Mono output.
   SetLength(Waveform, Length(Sig[0]));
