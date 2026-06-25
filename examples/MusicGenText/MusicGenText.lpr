@@ -189,6 +189,20 @@ var
 begin
   WriteLn('MusicGen TEXT-CONDITIONED generation - prompt -> T5 -> music -> WAV');
   WriteLn('==================================================================');
+  // Build-flags banner. The EnCodec LSTM / matmul speed depends ENTIRELY on
+  // whether an AVX define reached the compiler: AVX2/AVX/AVX512 (+CPU64) turn on
+  // AVXANY, which selects the hand-written asm dot-product; without them the
+  // SCALAR fallback is compiled and DotProduct runs no faster than a plain loop.
+  // If none of these print, the build is scalar - rebuild with -dAVX2.
+  Write('[build] flags:');
+  {$IFDEF AVX2}    Write(' AVX2');    {$ENDIF}
+  {$IFDEF AVX}     Write(' AVX');     {$ENDIF}
+  {$IFDEF AVX512}  Write(' AVX512');  {$ENDIF}
+  {$IFDEF CPU64}   Write(' CPU64');   {$ENDIF}
+  {$IFDEF OpenCL}  Write(' OpenCL');  {$ENDIF}
+  {$IFDEF Release} Write(' Release'); {$ENDIF}
+  {$IFDEF Debug}   Write(' Debug');   {$ENDIF}
+  WriteLn;
 
   // ---- Mode selection ------------------------------------------------------
   RealMode := HasFlag('--download');
