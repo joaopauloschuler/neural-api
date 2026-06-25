@@ -14717,6 +14717,22 @@ type
         Sample: TNNetVolume;
         Iterations: integer = 50
       ): string;
+      // LayerClassTimingReport aggregates the per-layer forward-pass wall-clock
+      // cost ALREADY ACCUMULATED in each layer's FForwardTime, grouped by layer
+      // class name. Unlike LayerTimingReport it runs NO passes of its own and
+      // does NOT call ClearTime: it reports whatever has been timed since the
+      // last ClearTime, so callers drive a real workload (e.g. ChatTerminal's
+      // decode loop) and then read the rollup. Rows are one-per-class, sorted by
+      // total forward time descending, reporting the class name, the number of
+      // layer instances of that class, the summed forward microseconds, the mean
+      // microseconds per instance and the percent of total forward time (with an
+      // ASCII '#'-bar). A trailing total line sums the table. The class-level
+      // view is what you want when deciding which TNNetLayer class to optimize
+      // next (e.g. OpenCL): it ranks classes by aggregate cost rather than
+      // individual layer instances. Pure read-only diagnostic; leaves all timing
+      // accumulators untouched. Returns a short message (never crashes) when NN
+      // is nil or has no layers.
+      class function LayerClassTimingReport(NN: TNNet): string;
       // ProfileReport is a torch.profiler-lite: a single per-layer table that
       // fuses LayerTimingReport's wall-clock timing with
       // MemoryFootprintReport's parameter/activation accounting. It runs
@@ -79366,6 +79382,109 @@ begin
     Lines.Add(StringOfChar('-', 70));
     Lines.Add(Format('TOTAL: %.2f us/forward across %d layer(s)',
       [TotalUs / Iterations, NN.GetLastLayerIdx() + 1]));
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.LayerClassTimingReport(NN: TNNet): string;
+var
+  Lines: TStringList;
+  LayerCnt, NNLastIdx, i, j, ClassIdx, BarLen: integer;
+  Layer: TNNetLayer;
+  ClassNames: array of string;
+  ClassUs: array of double;
+  ClassCount: array of integer;
+  ClassQty: integer;
+  LayerClass: string;
+  TotalUs, Pct, MeanUs: double;
+  TmpUsD: double;
+  TmpQty: integer;
+  TmpName: string;
+const
+  // FForwardTime is a TDateTime span measured in days; convert to microseconds.
+  cUsPerDay = 24.0 * 60.0 * 60.0 * 1000.0 * 1000.0;
+begin
+  Result := '';
+  if NN = nil then
+  begin
+    Result := 'LayerClassTimingReport: NN is nil.' + sLineBreak;
+    Exit;
+  end;
+  if NN.GetLastLayerIdx() < 0 then
+  begin
+    Result := 'LayerClassTimingReport: NN has no layers.' + sLineBreak;
+    Exit;
+  end;
+  NNLastIdx := NN.GetLastLayerIdx();
+  ClassQty := 0;
+  SetLength(ClassNames, 0);
+  SetLength(ClassUs, 0);
+  SetLength(ClassCount, 0);
+  // Bucket each layer's accumulated forward time by class name.
+  for LayerCnt := 0 to NNLastIdx do
+  begin
+    Layer := NN.Layers[LayerCnt];
+    LayerClass := Layer.ClassName;
+    ClassIdx := -1;
+    for i := 0 to ClassQty - 1 do
+      if ClassNames[i] = LayerClass then
+      begin
+        ClassIdx := i;
+        Break;
+      end;
+    if ClassIdx < 0 then
+    begin
+      ClassIdx := ClassQty;
+      Inc(ClassQty);
+      SetLength(ClassNames, ClassQty);
+      SetLength(ClassUs, ClassQty);
+      SetLength(ClassCount, ClassQty);
+      ClassNames[ClassIdx] := LayerClass;
+      ClassUs[ClassIdx] := 0;
+      ClassCount[ClassIdx] := 0;
+    end;
+    ClassUs[ClassIdx] := ClassUs[ClassIdx] + Layer.ForwardTime * cUsPerDay;
+    ClassCount[ClassIdx] := ClassCount[ClassIdx] + 1;
+  end;
+  // Sort classes by total forward time descending (simple insertion sort;
+  // the class count is tiny).
+  for i := 1 to ClassQty - 1 do
+    for j := i downto 1 do
+      if ClassUs[j] > ClassUs[j - 1] then
+      begin
+        TmpUsD := ClassUs[j]; ClassUs[j] := ClassUs[j - 1]; ClassUs[j - 1] := TmpUsD;
+        TmpQty := ClassCount[j]; ClassCount[j] := ClassCount[j - 1]; ClassCount[j - 1] := TmpQty;
+        TmpName := ClassNames[j]; ClassNames[j] := ClassNames[j - 1]; ClassNames[j - 1] := TmpName;
+      end;
+  TotalUs := 0;
+  for i := 0 to ClassQty - 1 do TotalUs := TotalUs + ClassUs[i];
+  Lines := TStringList.Create;
+  try
+    Lines.Add('Layer Class Timing Report');
+    Lines.Add(StringOfChar('=', 25));
+    Lines.Add('Aggregated forward-pass time by layer class (accumulated since');
+    Lines.Add('the last ClearTime). Sorted by total cost descending.');
+    Lines.Add(Format('%-28s %5s %14s %14s %6s',
+      ['Layer class', 'Count', 'total us', 'us/instance', '%']));
+    Lines.Add(StringOfChar('-', 78));
+    for i := 0 to ClassQty - 1 do
+    begin
+      if ClassCount[i] > 0 then
+        MeanUs := ClassUs[i] / ClassCount[i]
+      else
+        MeanUs := 0;
+      Pct := 0;
+      if TotalUs > 0 then Pct := 100.0 * ClassUs[i] / TotalUs;
+      BarLen := Round(Pct / 5);
+      Lines.Add(Format('%-28s %5d %14.2f %14.2f %5.1f %s',
+        [ClassNames[i], ClassCount[i], ClassUs[i], MeanUs, Pct,
+         StringOfChar('#', BarLen)]));
+    end;
+    Lines.Add(StringOfChar('-', 78));
+    Lines.Add(Format('TOTAL: %.2f us across %d layer(s) in %d class(es)',
+      [TotalUs, NNLastIdx + 1, ClassQty]));
     Result := Lines.Text;
   finally
     Lines.Free;

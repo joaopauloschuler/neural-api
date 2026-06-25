@@ -129,6 +129,9 @@ type
     SelfTest: boolean;
     ShowHelp: boolean;
     Stats: boolean;              // per-turn timing to stderr (TTFT, tok/s)
+    Profile: boolean;            // per-layer-class forward timing to stderr after
+                                 // each turn (decode steps only); for picking the
+                                 // next layer class to optimize (e.g. OpenCL)
     NoCacheReuse: boolean;       // force full re-prefill every turn (A/B + debug)
     Gpu: boolean;                // offload conv/linear matmuls via OpenCL
     GpuPlatform: integer;        // OpenCL platform index (default 0)
@@ -167,6 +170,8 @@ begin
   WriteLn('  --gpu-platform N      OpenCL platform index (default 0)');
   WriteLn('  --gpu-device N        OpenCL device index within the platform (default 0)');
   WriteLn('  --stats               per-turn timing to stderr (TTFT, decode tok/s)');
+  WriteLn('  --profile             per-layer-class forward timing to stderr after each');
+  WriteLn('                        turn (decode steps only); ranks classes to optimize');
   WriteLn('  --no-cache-reuse      re-prefill the whole prompt each turn (default:');
   WriteLn('                        reuse the shared KV-cache prefix from last turn)');
   WriteLn('  --selftest            run the offline unit checks and exit');
@@ -196,6 +201,7 @@ begin
   Result.SelfTest := false;
   Result.ShowHelp := false;
   Result.Stats := false;
+  Result.Profile := false;
   Result.NoCacheReuse := false;
   // OpenCL offload defaults ON when the binary is built with -dOpenCL (the
   // default compilation), OFF otherwise; --no-gpu forces CPU either way.
@@ -269,6 +275,7 @@ begin
     else if Arg = '--low-memory' then Opt.LowMemory := true
     else if Arg = '--max-fast-memory' then Opt.LowMemory := false
     else if Arg = '--stats' then Opt.Stats := true
+    else if Arg = '--profile' then Opt.Profile := true
     else if Arg = '--no-cache-reuse' then Opt.NoCacheReuse := true
     else if Arg = '--gpu' then Opt.Gpu := true
     else if Arg = '--no-gpu' then Opt.Gpu := false
@@ -617,6 +624,10 @@ begin
       InV.FData[0] := Tokens[Cnt];
       Session.StepForward(InV, Cnt);
     end;
+    // --profile: discard the one-shot prefill timings so the per-layer-class
+    // report below reflects only the repeated single-token decode steps - the
+    // steady-state workload whose layer costs we want to rank for optimization.
+    if Opt.Profile then NN.ClearTime();
     for StepCnt := 1 to Opt.MaxNewTokens do
     begin
       if Len >= SeqLen then break;
@@ -688,6 +699,16 @@ begin
       WriteLn(StdErr);
       Flush(StdErr);
     end;
+    // --profile: per-layer-class forward timing accumulated over this turn's
+    // decode steps (prefill was cleared above). Printed to stderr so stdout
+    // stays pure model output. Ranks layer classes by aggregate forward cost -
+    // the actionable signal for picking the next class to optimize (e.g. OpenCL).
+    if Opt.Profile and (Produced > 0) then
+    begin
+      WriteLn(StdErr);
+      Write(StdErr, TNNet.LayerClassTimingReport(NN));
+      Flush(StdErr);
+    end;
   finally
     Row.Free;
     InV.Free;
@@ -739,6 +760,7 @@ begin
     Args.Add('--system'); Args.Add('Be brief.');
     Args.Add('--int8');
     Args.Add('--stats');
+    Args.Add('--profile');
     Check(ParseArgs(Args, Opt), 'full flag set parses');
     Check(Opt.ModelDir = '/tmp/model', 'model dir is the positional arg');
     Check(Abs(Opt.Temperature - 0.7) < 1e-6, '--temperature');
@@ -755,6 +777,7 @@ begin
     Check(Opt.SystemPrompt = 'Be brief.', '--system');
     Check(Opt.Int8, '--int8');
     Check(Opt.Stats, '--stats');
+    Check(Opt.Profile, '--profile');
 
     // fp32 is the default; --int8 opts into quantized weights.
     Args.Clear;
@@ -769,6 +792,11 @@ begin
     Args.Clear;
     Args.Add('/tmp/model');
     Check(ParseArgs(Args, Opt) and not Opt.Stats, 'stats off by default');
+
+    // --profile is off by default.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and not Opt.Profile, 'profile off by default');
 
     // Low-memory forward path is on by default; --max-fast-memory keeps the
     // concatenated weight cache; --low-memory re-enables the per-neuron path.
