@@ -349,7 +349,7 @@ begin
     mul  b           // rdx:rax = a * b
     mov  rlo, rax
     mov  rhi, rdx
-  end ['rax', 'rdx'];
+  end {$IFDEF FPC} ['rax', 'rdx']{$ENDIF};
   Result.lo := rlo;
   Result.hi := rhi;
 end;
@@ -1108,7 +1108,7 @@ asm
   mov [rdi+8], rax       // r.h
   setc al                // carry-out into AL
   movzx rax, al          // zero-extend to 64-bit Result (RAX)
-end ['rax'];
+end {$IFDEF FPC} ['rax']{$ENDIF};
 {$ENDIF}
 {$ELSE}
 function Add192Cy(out r: TInt64; const a, b: TInt64): UInt64; inline;
@@ -1356,7 +1356,7 @@ asm
 
   pop rdi
   pop rsi
-end ['rax', 'rcx', 'rdx', 'r8', 'r9', 'r10', 'rdi', 'rsi'];
+end {$IFDEF FPC} ['rax', 'rcx', 'rdx', 'r8', 'r9', 'r10', 'rdi', 'rsi']{$ENDIF};
 {$ELSE}
 procedure MulTInt(out r: TInt64; const a, b: TInt64); assembler; nostackframe;
 asm
@@ -1428,7 +1428,7 @@ asm
   mov [rdi+8],  r10             // r.h
   mov [rdi+0],  r9              // r.m
   mov [rdi+16], r8              // r.l
-end ['rax', 'rcx', 'rdx', 'r8', 'r9', 'r10'];
+end {$IFDEF FPC} ['rax', 'rcx', 'rdx', 'r8', 'r9', 'r10']{$ENDIF};
 {$ENDIF}
 {$ELSE}
 procedure MulTInt(out r: TInt64; const a, b: TInt64); inline;
