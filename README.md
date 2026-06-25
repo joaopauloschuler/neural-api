@@ -2,25 +2,25 @@
 <img align="right" src="docs/cai.png" height="192">
 
 **Everyone says Pascal died in the 90s.** Meanwhile, this Pascal library runs GPT-style transformers, Mixture-of-Experts, RWKV, xLSTM, spiking neurons, and normalizing flows, natively, with no Python nor CUDA lock-in. Your PyTorch project: 4GB of dependencies, a conda environment that breaks monthly. This: **compile to a single native binary with AVX**. This is deep learning the way systems programmers wish it worked.
-CAI NEURAL API is a pascal based deep learning neural network API optimized for AVX, AVX2 and AVX512 instruction sets plus OpenCL capable devices including AMD, Intel and NVIDIA. This API has been tested under Windows and Linux. 
 
-Some [trained neural networks](https://github.com/joaopauloschuler/pre-trained-neural-api-networks/) are available.
+**And it actually runs the real thing.** Point the [`ChatTerminal`](examples/ChatTerminal) example at a HuggingFace Qwen2 or Qwen2.5 instruct checkpoint and chat with a genuine LLM in your terminal: **OpenCL-accelerated**, **no Python**, **no CUDA** — with more architectures landing all the time. Then hand a text prompt to [`MusicGenText`](examples/MusicGenText) and watch the *same library* turn *"lo-fi hip-hop with a mellow piano"* into actual audio — T5 encoder and MusicGen decoder. One native binary, from a 20-line CIFAR demo to a billion-parameter transformer.
 
-## Intro Videos
-[![Watch the video](https://img.youtube.com/vi/aIy1S7clhQo/0.jpg)](https://youtu.be/aIy1S7clhQo) | [![Watch the video](https://img.youtube.com/vi/q56NcgUiAAk/0.jpg)](https://youtu.be/q56NcgUiAAk) | [![Watch the video](https://img.youtube.com/vi/PdNTgI_qSyo/0.jpg)](https://youtu.be/PdNTgI_qSyo)
---------------------------- | ------------------------------------- | -------------------------
-Basics of Neural Networks in Pascal - Loading and Saving | Neural Networks for Absolute Beginners! Learning a Simple Function | Coding a Neural Network in Pascal that Learns to Calculate the Hypotenuse
+CAI NEURAL API is a Pascal deep-learning library optimized for the AVX, AVX2 and AVX512 instruction sets and for OpenCL devices from AMD, Intel and NVIDIA. Tested on Windows and Linux.
 
-## Why Pascal?
-* The Pascal computer language is easy to learn. Pascal allows developers to make a readable and understandable source code.
-* You'll be able to make super-fast **native code** and at the same time have a readable code.
-* This API can outperform some major APIs in some architectures.
+## Highlights
+* 🗣️ **Run real LLMs, natively** — import a HuggingFace Qwen2/Qwen2.5 instruct checkpoint and chat from your terminal with [`ChatTerminal`](examples/ChatTerminal). No Python, no CUDA.
+* 🎵 **Text-to-music** — turn a text prompt into audio with [`MusicGenText`](examples/MusicGenText) (T5 encoder + MusicGen decoder).
+* 🔊 **More audio** — separate a song into stems with [`MusicSourceSeparation`](examples/MusicSourceSeparation), or talk to an audio-aware model with [`Qwen2AudioChat`](examples/Qwen2AudioChat).
+* 🧠 **Modern architectures, built in** — GPT-style transformers, Mixture-of-Experts, RWKV, xLSTM, spiking neurons and normalizing flows, all as native Pascal layers.
+* ⚡ **Fast everywhere** — AVX/AVX2/AVX512 CPU paths plus OpenCL offload for AMD, Intel and NVIDIA GPUs.
+* 📦 **Single-binary deploy** — compile to one self-contained native executable. No runtime, no dependency tree.
+* 📖 **Readable at native speed** — clean, easy-to-learn Pascal that compiles to fast native code. No trade-off between readable source and raw performance.
 
 ## Prerequisites
 You'll need [Lazarus](https://www.lazarus-ide.org/) development environment. If you have an OpenCL capable device, you'll need its OpenCL drivers. Many examples use the [CIFAR-10](https://www.cs.toronto.edu/~kriz/cifar.html) dataset. You'll also find examples for the [CIFAR-100](https://www.cs.toronto.edu/~kriz/cifar.html), [MNIST](http://yann.lecun.com/exdb/mnist/), [Fashion MNIST](https://www.kaggle.com/zalando-research/fashionmnist) and the [Places365-Standard Small images 256x256](http://places2.csail.mit.edu/download.html) dataset.
 
 ## Will It Work with Delphi?
-This project is [Lazarus](https://www.lazarus-ide.org/) based. That said, as of release [v2.0.0](https://github.com/joaopauloschuler/neural-api/releases/tag/v2.0.0), a number of units do compile with Delphi and you can create and run neural networks with Delphi. You'll be able to compile these units with Delphi: neuralvolume, neuralnetwork, neuralab, neuralabfun, neuralbit, neuralbyteprediction, neuralcache, neuraldatasets, neuralgeneric, neuralplanbuilder, Neural OpenCL, Neural Threading and neuralfit. 
+This project is [Lazarus](https://www.lazarus-ide.org/) based. That said, in release [v2.0.0](https://github.com/joaopauloschuler/neural-api/releases/tag/v2.0.0), a number of units do compile with Delphi and you can create and run neural networks with Delphi. You'll be able to compile these units with Delphi: neuralvolume, neuralnetwork, neuralab, neuralabfun, neuralbit, neuralbyteprediction, neuralcache, neuraldatasets, neuralgeneric, neuralplanbuilder, Neural OpenCL, Neural Threading and neuralfit. 
 
 ## Installation
 Clone this project, add the [**neural**](https://github.com/joaopauloschuler/neural-api/tree/master/neural) folder to your [Lazarus](https://www.lazarus-ide.org/) unit search path and you'll be ready to go!
@@ -46,6 +46,11 @@ The documentation covers:
 * [Normalization Cheat Sheet](docs/normalization.md)
 * [Layer Authoring Guide](docs/layer-authoring.md) — checklist for adding a new layer plus mini-guides on reading numerical-gradient failures and picking a tolerance
 * [Other scientific publications from the same author](#publications-from-the-author)
+
+## Intro Videos
+[![Watch the video](https://img.youtube.com/vi/aIy1S7clhQo/0.jpg)](https://youtu.be/aIy1S7clhQo) | [![Watch the video](https://img.youtube.com/vi/q56NcgUiAAk/0.jpg)](https://youtu.be/q56NcgUiAAk) | [![Watch the video](https://img.youtube.com/vi/PdNTgI_qSyo/0.jpg)](https://youtu.be/PdNTgI_qSyo)
+--------------------------- | ------------------------------------- | -------------------------
+Basics of Neural Networks in Pascal - Loading and Saving | Neural Networks for Absolute Beginners! Learning a Simple Function | Coding a Neural Network in Pascal that Learns to Calculate the Hypotenuse
 
 ### Easy Examples First Please!
 [![Watch the video](https://img.youtube.com/vi/PdNTgI_qSyo/0.jpg)](https://youtu.be/PdNTgI_qSyo)
@@ -1294,7 +1299,7 @@ property CustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn read 
 property MessageProc: TGetStrProc read FMessageProc write FMessageProc;
 property ErrorProc: TGetStrProc read FErrorProc write FErrorProc;
 ```
-On your own code, you could something is:
+On your own code, you could do something like this:
 ```
 MyFit.MessageProc := {$IFDEF FPC}@{$ENDIF}Self.MessageProc;
 MyFit.ErrorProc := {$IFDEF FPC}@{$ENDIF}Self.ErrorProc;

@@ -522,8 +522,11 @@ unit neuralpretrained;
 interface
 
 uses
+  {$IFDEF OpenCL}
+  cl,  // cl_platform_id / cl_device_id for TMusicGenModel.EnableOpenCL
+  {$ENDIF}
   Classes, SysUtils, Math, fpjson, jsonparser,
-  neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
+  neuralvolume, neuralnetwork, neuralthread, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralhftokenizer, neuralmxfp4, pascoremath32;
 
 type
@@ -4132,6 +4135,15 @@ type
     FEncStages, FDecStages: array of TEnCodecStage;
     FEncLSTM, FDecLSTM: TEnCodecLSTM;
     FCodebooks: array of TEnCodecMat;   // [NumQuantizers] each [size, dim]
+    // Worker pool for the conv kernels, sized like neuralfit (NeuralDefault
+    // ThreadCount, settable via MaxThreadNum). Built lazily on the first
+    // encode/decode and reused. NOTE: sized from NeuralDefaultThreadCount, NOT
+    // TThread.ProcessorCount - the latter under-reports (returns 1) in some
+    // container/OpenCL-POCL setups, which would silently serialize the threads.
+    FProcs: TNeuralThreadList;
+    FMaxThreadNum: integer;
+    // Builds FProcs on first use if more than one thread is available.
+    procedure EnsureThreadPool;
     // Applies one stage to a channel-major signal (Channels x Time arrays).
     procedure RunStage(const Stage: TEnCodecStage;
       const InSig: array of TNeuralFloatDynArr; out OutSig: TNNetFloatDynArr2D);
@@ -4139,6 +4151,9 @@ type
     constructor Create(const pConfig: TEnCodecConfig);
     destructor Destroy; override;
     property Config: TEnCodecConfig read FConfig;
+    // Conv worker-thread count (default NeuralDefaultThreadCount). Set before the
+    // first encode/decode; 1 disables conv threading.
+    property MaxThreadNum: integer read FMaxThreadNum write FMaxThreadNum;
     // Number of RVQ codebooks loaded.
     function NumCodebooks: integer;
     // Runs the conv encoder + RVQ on a mono waveform of NumSamples samples,
@@ -4863,6 +4878,16 @@ type
     FEncToDecW: TNNetVolume;               // hidden*textDModel row-major
     FEncToDecB: TNNetVolume;               // hidden
     FDecSeqLen, FEncSeqLen: integer;
+    {$IFDEF OpenCL}
+    // OpenCL offload state. When FGpuEnabled the prefill decoder (FDecoder) is
+    // already offloaded; the platform/device ids are retained so the lazily
+    // built width-1 step twins can be offloaded too as soon as they are created
+    // (EnsureStepDecoder[Uncond]) - the per-token decode loop runs on the twins,
+    // so without that the cached fast path would stay on the CPU.
+    FGpuEnabled: boolean;
+    FGpuPlatform: cl_platform_id;
+    FGpuDevice: cl_device_id;
+    {$ENDIF}
     // Builds FStepDecoder (the width-1 twin) on first use and copies weights
     // from FDecoder. No-op once built. Coded by Claude (AI).
     procedure EnsureStepDecoder;
@@ -4877,6 +4902,16 @@ type
     property Decoder: TNNet read FDecoder;
     property DecSeqLen: integer read FDecSeqLen;
     property EncSeqLen: integer read FEncSeqLen;
+    {$IFDEF OpenCL}
+    // Offloads the decoder conv/linear matmuls to the given OpenCL device. Must
+    // be called AFTER the model is built (FDecoder assigned). Offloads the
+    // prefill decoder immediately and arms the lazily built width-1 step twins
+    // (FStepDecoder / FStepDecoderUncond) so the KV-cache decode loop - which
+    // runs on those twins, not FDecoder - is offloaded too. The EnCodec audio
+    // codec is a separate hand-rolled conv path (not a TNNet) and stays on CPU.
+    // Coded by Claude (AI).
+    procedure EnableOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
+    {$ENDIF}
     // Projects raw T5 encoder hidden states (EncSeqLen x TextDModel) through
     // enc_to_dec_proj into Dst (EncSeqLen,1,Hidden).
     procedure ProjectEncoderStates(EncStates, Dst: TNNetVolume);
@@ -27411,6 +27446,9 @@ begin
   FDecoder := nil;
   FStepDecoder := nil;
   FStepDecoderUncond := nil;
+  {$IFDEF OpenCL}
+  FGpuEnabled := false;
+  {$ENDIF}
 end;
 
 destructor TMusicGenModel.Destroy;
@@ -27445,6 +27483,11 @@ begin
   // Layer-by-layer weight copy: the two nets have identical layer topology
   // (only the input SizeX differs), so every neuron weight transfers exactly.
   FStepDecoder.CopyWeights(FDecoder);
+  {$IFDEF OpenCL}
+  // The per-token cached decode loop runs on this twin, so it must be offloaded
+  // too when the model was GPU-enabled before the twin existed.
+  if FGpuEnabled then FStepDecoder.EnableOpenCL(FGpuPlatform, FGpuDevice);
+  {$ENDIF}
 end;
 
 procedure TMusicGenModel.EnsureStepDecoderUncond;
@@ -27460,7 +27503,29 @@ begin
   FStepDecoderUncond := BuildMusicGenDecoderNet(FConfig, FEncSeqLen, 1,
     {pTrainable=}false, StepBlocks, StepHeads, StepFinalLN);
   FStepDecoderUncond.CopyWeights(FDecoder);
+  {$IFDEF OpenCL}
+  if FGpuEnabled then FStepDecoderUncond.EnableOpenCL(FGpuPlatform, FGpuDevice);
+  {$ENDIF}
 end;
+
+{$IFDEF OpenCL}
+procedure TMusicGenModel.EnableOpenCL(platform_id: cl_platform_id;
+  device_id: cl_device_id);
+begin
+  FGpuPlatform := platform_id;
+  FGpuDevice := device_id;
+  FGpuEnabled := true;
+  // Offload the prefill / non-cached decoder now. The width-1 step twins are
+  // built lazily by GenerateEx; EnsureStepDecoder[Uncond] reads FGpuEnabled and
+  // offloads them on creation. If a twin already exists (model reused across
+  // calls), offload it here too so this stays idempotent.
+  if Assigned(FDecoder) then FDecoder.EnableOpenCL(platform_id, device_id);
+  if Assigned(FStepDecoder) then
+    FStepDecoder.EnableOpenCL(platform_id, device_id);
+  if Assigned(FStepDecoderUncond) then
+    FStepDecoderUncond.EnableOpenCL(platform_id, device_id);
+end;
+{$ENDIF}
 
 procedure TMusicGenModel.ProjectEncoderStates(EncStates, Dst: TNNetVolume);
 var
@@ -33255,16 +33320,83 @@ constructor TEnCodecModel.Create(const pConfig: TEnCodecConfig);
 begin
   inherited Create();
   FConfig := pConfig;
+  FProcs := nil;
+  // Default to the real CPU thread count (sched-affinity aware), like neuralfit.
+  FMaxThreadNum := NeuralDefaultThreadCount();
 end;
 
 destructor TEnCodecModel.Destroy;
 begin
+  FProcs.Free;   // TNeuralThreadList.Destroy stops the worker engine; nil-safe
   inherited Destroy;
+end;
+
+procedure TEnCodecModel.EnsureThreadPool;
+begin
+  if (FProcs = nil) and (FMaxThreadNum > 1) then
+    FProcs := TNeuralThreadList.Create(FMaxThreadNum);
 end;
 
 function TEnCodecModel.NumCodebooks: integer;
 begin
   Result := Length(FCodebooks);
+end;
+
+// Per-output-channel worker for the EnCodec conv kernels. EnCodec waveform
+// synthesis is dominated by the upsampled decode convolutions (millions of
+// samples through the SEANet stack); the output-channel loop is embarrassingly
+// parallel (each channel reads the shared read-only input + weights and writes
+// its OWN output row), so splitting the channels across the shared thread pool
+// is race-free and BIT-IDENTICAL to the serial scalar conv. Coded by Claude (AI).
+type
+  TEnCodecConvWorker = class
+  public
+    W, B: TNeuralFloatDynArr;
+    Padded, OutSig, InSig, Full: TNNetFloatDynArr2D;
+    InCh, OutCh, K, Stride, Dil, OutLen, InLen: integer;
+    procedure RunForward(index, threadnum: integer);
+    procedure RunTranspose(index, threadnum: integer);
+  end;
+
+procedure TEnCodecConvWorker.RunForward(index, threadnum: integer);
+var tStart, tFin, o, t, i, k2, src: integer; Acc: TNeuralFloat;
+begin
+  // Split the OUTPUT-TIME axis across threads. Every output position (o,t) is
+  // independent, so this is race-free and bit-identical to the serial conv - and
+  // unlike splitting over output channels it stays fully parallel for the
+  // high-resolution, LOW-channel decode stages where a SEANet decoder spends the
+  // bulk of its time (the final conv_out has OutCh=1 over ~1M samples; splitting
+  // its single output channel would have left it serial).
+  TNeuralThreadList.CalculateWorkingRange(index, threadnum, OutLen, tStart, tFin);
+  for o := 0 to OutCh - 1 do
+    for t := tStart to tFin do
+    begin
+      Acc := B[o];
+      for i := 0 to InCh - 1 do
+        for k2 := 0 to K - 1 do
+        begin
+          src := t * Stride + k2 * Dil;
+          Acc := Acc + W[o * InCh * K + i * K + k2] * Padded[i][src];
+        end;
+      OutSig[o][t] := Acc;
+    end;
+end;
+
+procedure TEnCodecConvWorker.RunTranspose(index, threadnum: integer);
+var oStart, oFin, o, t, i, k2, idx: integer;
+begin
+  TNeuralThreadList.CalculateWorkingRange(index, threadnum, OutCh, oStart, oFin);
+  // Full[o] was zeroed by the caller. Same i-major, t, k2 accumulation order per
+  // element as the serial scatter, so the overlap-add result is bit-identical.
+  for o := oStart to oFin do
+    for i := 0 to InCh - 1 do
+      for t := 0 to InLen - 1 do
+        for k2 := 0 to K - 1 do
+        begin
+          idx := t * Stride + k2;
+          Full[o][idx] := Full[o][idx] +
+            W[i * OutCh * K + o * K + k2] * InSig[i][t];
+        end;
 end;
 
 // Causal Conv1d / ConvTranspose1d on a channel-major signal. Reflect
@@ -33273,15 +33405,17 @@ end;
 // (trim_right_ratio 1.0 in the supported family). InSig[c][t], OutSig[c][t].
 procedure RunEnCodecConv(const Conv: TEnCodecConv;
   const InSig: array of TNeuralFloatDynArr; out OutSig: TNNetFloatDynArr2D;
-  Causal: boolean = true);
+  Causal: boolean = true; Pool: TNeuralThreadList = nil);
 var
   InCh, OutCh, K, Stride, Dil, InLen, o, i, t, k2, src, PadTotal, Extra: integer;
   NFrames, OutLen, idx, FullLen, PadLeft, PadRight, EffK: integer;
   InChM1, OutChM1, KM1, InLenM1: integer;
   PadLeftM1, PadRightM1, OutLenM1, FullLenM1: integer;
   Acc: TNeuralFloat;
-  Padded: array of TNeuralFloatDynArr;
-  Full: array of TNeuralFloatDynArr;
+  Padded: TNNetFloatDynArr2D;
+  Full: TNNetFloatDynArr2D;
+  InSigArr: TNNetFloatDynArr2D;
+  ConvWorker: TEnCodecConvWorker;
   RefIdx: integer;
 begin
   InCh := Conv.InCh;
@@ -33348,9 +33482,26 @@ begin
     if OutLen < 0 then OutLen := 0;
     OutLenM1 := OutLen - 1;
     SetLength(OutSig, OutCh);
-    for o := 0 to OutChM1 do
+    for o := 0 to OutChM1 do SetLength(OutSig[o], OutLen);
+    // The forward conv is parallelized over the OUTPUT-TIME axis (see RunForward):
+    // every output position is independent, so this is race-free and
+    // BIT-IDENTICAL to the serial scalar conv (each element accumulates the same
+    // way, in a register, with one write). Keying off the output LENGTH (not the
+    // channel count) keeps the heavy high-resolution decode stages parallel even
+    // when they have few channels. Tiny convs run inline.
+    if (Pool <> nil) and (Pool.Count > 1) and (OutLen >= 512) then
     begin
-      SetLength(OutSig[o], OutLen);
+      ConvWorker := TEnCodecConvWorker.Create;
+      ConvWorker.W := Conv.W;       ConvWorker.B := Conv.B;
+      ConvWorker.Padded := Padded;  ConvWorker.OutSig := OutSig;
+      ConvWorker.InCh := InCh;      ConvWorker.OutCh := OutCh;
+      ConvWorker.K := K;            ConvWorker.Stride := Stride;
+      ConvWorker.Dil := Dil;        ConvWorker.OutLen := OutLen;
+      Pool.StartProc({$IFDEF FPC}@ConvWorker.RunForward{$ELSE}ConvWorker.RunForward{$ENDIF});
+      ConvWorker.Free;
+    end
+    else
+    for o := 0 to OutChM1 do
       for t := 0 to OutLenM1 do
       begin
         Acc := Conv.B[o];
@@ -33362,7 +33513,6 @@ begin
           end;
         OutSig[o][t] := Acc;
       end;
-    end;
   end
   else
   begin
@@ -33376,6 +33526,26 @@ begin
       SetLength(Full[o], FullLen);
       for t := 0 to FullLenM1 do Full[o][t] := 0;
     end;
+    // Overlap-add upsample, parallelized over output channels. The o loop is
+    // hoisted outermost (vs. the original i,t,o,k2 nesting) so each thread owns a
+    // disjoint set of Full[o] arrays - race-free, and bit-identical because every
+    // Full[o][idx] still accumulates its (i,t,k2) contributions in the same
+    // i-major, t, k2 order. Tiny convs run inline.
+    if (Pool <> nil) and (Pool.Count > 1) and (OutCh >= 4) and (InLen >= 512) then
+    begin
+      // Mirror the open-array InSig into a dynamic 2D array (shares the inner
+      // channel rows by reference - no data copy) so the worker can hold it.
+      SetLength(InSigArr, InCh);
+      for i := 0 to InChM1 do InSigArr[i] := InSig[i];
+      ConvWorker := TEnCodecConvWorker.Create;
+      ConvWorker.W := Conv.W;       ConvWorker.InSig := InSigArr;
+      ConvWorker.Full := Full;      ConvWorker.InCh := InCh;
+      ConvWorker.OutCh := OutCh;    ConvWorker.K := K;
+      ConvWorker.Stride := Stride;  ConvWorker.InLen := InLen;
+      Pool.StartProc({$IFDEF FPC}@ConvWorker.RunTranspose{$ELSE}ConvWorker.RunTranspose{$ENDIF});
+      ConvWorker.Free;
+    end
+    else
     for i := 0 to InChM1 do
       for t := 0 to InLenM1 do
         for o := 0 to OutChM1 do
@@ -33498,7 +33668,7 @@ var
 begin
   InSigMax := Length(InSig) - 1;
   case Stage.Kind of
-    eskConv: RunEnCodecConv(Stage.Conv, InSig, OutSig, FConfig.UseCausalConv);
+    eskConv: RunEnCodecConv(Stage.Conv, InSig, OutSig, FConfig.UseCausalConv, FProcs);
     eskELU:
       begin
         SetLength(OutSig, Length(InSig));
@@ -33519,11 +33689,11 @@ begin
           for t := 0 to Length(InSig[c]) - 1 do
             Tmp[c][t] := EnCodecELU(InSig[c][t]);
         end;
-        RunEnCodecConv(Stage.Resnet.Conv1, Tmp, Res, FConfig.UseCausalConv);
+        RunEnCodecConv(Stage.Resnet.Conv1, Tmp, Res, FConfig.UseCausalConv, FProcs);
         ApplyEnCodecELU(Res);
-        RunEnCodecConv(Stage.Resnet.Conv2, Res, Tmp, FConfig.UseCausalConv);
+        RunEnCodecConv(Stage.Resnet.Conv2, Res, Tmp, FConfig.UseCausalConv, FProcs);
         if Stage.Resnet.HasShortcut then
-          RunEnCodecConv(Stage.Resnet.Shortcut, InSig, Shr_, FConfig.UseCausalConv)
+          RunEnCodecConv(Stage.Resnet.Shortcut, InSig, Shr_, FConfig.UseCausalConv, FProcs)
         else
         begin
           SetLength(Shr_, Length(InSig));
@@ -33552,6 +33722,7 @@ var
   Dist, BestDist, Diff: TNeuralFloat;
   Residual, Vec: TNeuralFloatDynArr;
 begin
+  EnsureThreadPool;
   // Channel-major input (mono): Sig[0][t] = waveform.
   SetLength(Sig, FConfig.AudioChannels);
   SetLength(Sig[0], Length(Waveform));
@@ -33614,6 +33785,7 @@ var
   s, q, t, d, Dm, Frames, NQ, code: integer;
   DmM1, FramesM1, NQM1, DecStagesM1, SigLenM1: integer;
 begin
+  EnsureThreadPool;
   Dm := FConfig.HiddenSize;
   DmM1 := Dm - 1;
   NQ := Length(Codes);

@@ -2927,6 +2927,28 @@ type
     // decode path can change the effective sequence length on the same instance.
     FdAttnBuf: array of TNeuralFloat;
     FdScoreBuf: array of TNeuralFloat;
+    {$IFDEF OpenCL}
+    // OpenCL offload of BOTH attention matmuls (prefill path only); masking and
+    // softmax stay on the CPU. All three reuse the single cai_dot_product kernel
+    // (the inherited FDotCL):
+    //  - scores Q.K^T: FKInterBuf = K interleaved (kernel A: As[a + i*SeqLen]),
+    //    FQRowBuf = Q row-major (kernel B: Bs[b*d_k + i]); the result lands in
+    //    FAttn's [query*SeqLen+key] layout.
+    //  - value sum P.V: FVRowBuf = V packed token-contiguous (kernel A:
+    //    As[d + key*d_k]), FAttn (now the softmax weights) is the kernel B
+    //    DIRECTLY; the result lands in FOutput's [query*d_k+d] layout.
+    // Coded by Claude (AI).
+    FQRowBuf: TNNetVolume;
+    FKInterBuf: TNNetVolume;
+    FVRowBuf: TNNetVolume;
+    procedure ComputeOpenCL();
+    {$ENDIF}
+    // True when score (query i, key j) is masked out (causal / sliding-window /
+    // bidirectional-window / segment / prefix-LM). Extracted so the CPU and
+    // OpenCL forwards share one mask definition and cannot drift.
+    // Coded by Claude (AI).
+    function ScoreIsMasked(i, j: integer; HasSeg: boolean; Seg: TNNetVolume;
+      SegI: integer): boolean;
     // Quantize Src[0..d_k-1] into the int8 cache row Slot (Codes/Scale arrays).
     procedure QuantizeCacheRow(Src: TNeuralFloatArrPtr;
       var Codes: array of ShortInt; var Scale: array of TNeuralFloat;
@@ -3004,6 +3026,12 @@ type
     function SaveStructureToString(): string; override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
+    {$IFDEF OpenCL}
+    // Allocates the shared dot-product kernel handle (inherited FDotCL) and the
+    // Q/K packing buffers, then flags this layer to offload the prefill score
+    // matmul. Coded by Claude (AI).
+    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    {$ENDIF}
     // Enable the KV-cache incremental-decode path. Preallocates the K and V
     // caches for at most MaxContext positions and starts an empty sequence.
     procedure BeginIncrementalDecode(MaxContext: integer);
@@ -24174,6 +24202,12 @@ begin
   FAttn.Free;
   SetLength(FdAttnBuf, 0);
   SetLength(FdScoreBuf, 0);
+  {$IFDEF OpenCL}
+  // FDotCL is freed by the inherited TNNetLayer.Destroy; free only our buffers.
+  if Assigned(FQRowBuf) then FQRowBuf.Free;
+  if Assigned(FKInterBuf) then FKInterBuf.Free;
+  if Assigned(FVRowBuf) then FVRowBuf.Free;
+  {$ENDIF}
   inherited Destroy();
 end;
 
@@ -24618,8 +24652,150 @@ begin
   end;
 end;
 
+function TNNetScaledDotProductAttention.ScoreIsMasked(i, j: integer;
+  HasSeg: boolean; Seg: TNNetVolume; SegI: integer): boolean;
+begin
+  // A key j is attendable for query i only when EVERY active mask permits it,
+  // so it is masked when any of these holds: strict-future causal (j>i) unless
+  // both sit in the prefix-LM bidirectional block; outside the sliding window
+  // (past, and future too when bidirectional); a different segment/document id
+  // (equality mode) or a later scale block (block-causal mode).
+  Result :=
+    (FCausal and (j > i) and
+       not ((FPrefixLen > 0) and (i < FPrefixLen) and (j < FPrefixLen))) or
+    ((FWindow > 0) and ((i - j >= FWindow) or
+     (FBidirectionalWindow and (j - i >= FWindow)))) or
+    (HasSeg and (not FBlockCausalSeg) and (Round(Seg[j, 0, 0]) <> SegI)) or
+    (HasSeg and FBlockCausalSeg and (Round(Seg[j, 0, 0]) > SegI));
+end;
+
+{$IFDEF OpenCL}
+procedure TNNetScaledDotProductAttention.EnableOpenCL(
+  DotProductKernel: TDotProductKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL, FDotProductKernel
+  if not Assigned(FDotCL) then
+  begin
+    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL.HideMessages();
+  end;
+  if not Assigned(FQRowBuf) then FQRowBuf := TNNetVolume.Create();
+  if not Assigned(FKInterBuf) then FKInterBuf := TNNetVolume.Create();
+  if not Assigned(FVRowBuf) then FVRowBuf := TNNetVolume.Create();
+  FShouldOpenCL := true;
+end;
+
+// Forward: BOTH matmuls (Q.K^T and P.V) on the device, masking + softmax on the
+// CPU in between. Mirrors the CPU Compute() math exactly (shared ScoreIsMasked,
+// same scale/soft-cap/softmax and all-masked-row zero policy). Coded by Claude (AI).
+procedure TNNetScaledDotProductAttention.ComputeOpenCL();
+const
+  cMaskFloor = -1e8; // matches Compute(): row max <= this => fully masked
+var
+  StartTime: double;
+  SeqLen, i, j, d: integer;
+  SeqLenM1, DkM1: integer;
+  Score, MaxScore, SumExp: TNeuralFloat;
+  Prev, Seg: TNNetVolume;
+  SegI, QBase, KBase, VBase: integer;
+  HasSeg: boolean;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  SeqLenM1 := SeqLen - 1;
+  DkM1 := FDk - 1;
+  HasSeg := Assigned(FSegLayer);
+  Seg := nil;
+  SegI := 0;
+  if HasSeg then Seg := FSegLayer.FOutput;
+
+  // 1) Unpack the depth-packed Q|K|V into the kernel's operand layouts.
+  //    Q row-major (scores' B: Bs[b*d_k + i]); K interleaved (scores' A:
+  //    As[a + i*SeqLen]); V token-contiguous (value sum's A: As[d + key*d_k]).
+  FQRowBuf.ReSize(SeqLen * FDk, 1, 1);
+  FKInterBuf.ReSize(SeqLen * FDk, 1, 1);
+  FVRowBuf.ReSize(SeqLen * FDk, 1, 1);
+  for i := 0 to SeqLenM1 do
+  begin
+    QBase := i * (3 * FDk);       // Q_i packed at depth [0, FDk)
+    KBase := QBase + FDk;         // K_i packed at depth [FDk, 2*FDk)
+    VBase := QBase + 2 * FDk;     // V_i packed at depth [2*FDk, 3*FDk)
+    for d := 0 to DkM1 do
+    begin
+      FQRowBuf.FData[i * FDk + d] := Prev.FData[QBase + d];
+      FKInterBuf.FData[i + d * SeqLen] := Prev.FData[KBase + d];
+      FVRowBuf.FData[i * FDk + d] := Prev.FData[VBase + d];
+    end;
+  end;
+
+  // 2) Scores Q_i . K_j on the device. The kernel writes Result[query*SeqLen +
+  //    key] = Q_query . K_key, which is exactly FAttn's raw [j,i] layout, so the
+  //    readback lands the RAW (unscaled, unmasked) scores straight into FAttn.
+  FDotCL.PrepareForCompute(FKInterBuf, FQRowBuf, FDk);
+  FDotCL.Compute(FKInterBuf, FQRowBuf, {ActFN}0, {NewVAs}true, {NewVBs}true);
+  FDotCL.FinishAndLoadResult(FAttn, 0);
+
+  // 3) Per query row: scale + soft-cap the unmasked scores (mask the rest),
+  //    numerically-stable softmax (with the all-masked-row zero policy). FAttn
+  //    now holds the softmax weights P[query, key]. (No value sum here - that is
+  //    the second device matmul below.)
+  for i := 0 to SeqLenM1 do
+  begin
+    if HasSeg then SegI := Round(Seg[i, 0, 0]);
+    MaxScore := -1e30;
+    for j := 0 to SeqLenM1 do
+    begin
+      if ScoreIsMasked(i, j, HasSeg, Seg, SegI) then
+        FAttn[j, i, 0] := -1e9
+      else
+      begin
+        Score := FAttn[j, i, 0] * FInvSqrtDk;
+        if FScoreSoftCap > 0 then
+          Score := FScoreSoftCap * pcr_tanhf(Score * FInvScoreSoftCap);
+        FAttn[j, i, 0] := Score;
+      end;
+      if FAttn[j, i, 0] > MaxScore then MaxScore := FAttn[j, i, 0];
+    end;
+    if MaxScore <= cMaskFloor then
+    begin
+      // Fully-masked query: zero weights => zero output row (the P.V matmul
+      // below then yields 0 for this row, matching the CPU policy).
+      for j := 0 to SeqLenM1 do
+        FAttn[j, i, 0] := 0;
+    end
+    else
+    begin
+      SumExp := 0;
+      for j := 0 to SeqLenM1 do
+      begin
+        Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
+        FAttn[j, i, 0] := Score;
+        SumExp := SumExp + Score;
+      end;
+      if SumExp > 0 then
+        for j := 0 to SeqLenM1 do
+          FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
+    end;
+  end;
+
+  // 4) Value sum O[i,d] = sum_key P[i,key] * V[key,d] on the device. Mapping
+  //    A = V (a = depth d, FNumAs = d_k), B = FAttn (b = query, FNumBs = SeqLen),
+  //    contraction = SeqLen: Result[b*FNumAs + a] = O[query, d] = FOutput's
+  //    native [query*d_k + d] layout, and FAttn is passed as B unchanged.
+  FDotCL.PrepareForCompute(FVRowBuf, FAttn, SeqLen);
+  FDotCL.Compute(FVRowBuf, FAttn, {ActFN}0, {NewVAs}true, {NewVBs}true);
+  FDotCL.FinishAndLoadResult(FOutput, 0);
+
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+{$ENDIF}
+
 procedure TNNetScaledDotProductAttention.Compute();
 const
+  // Minimum prefill sequence length to offload the score matmul to OpenCL;
+  // below this the kernel launch + Q/K upload cost outweighs the matmul.
+  csSDPAOpenCLMinSeqLen = 32;
   // Floor used to detect a fully-masked query row. The additive mask sentinel
   // is -1e9; real scaled dot products of normal activations are O(1), so any
   // row whose maximum score is <= -1e8 can only have come from every key being
@@ -24640,6 +24816,17 @@ begin
     ComputeIncremental();
     exit;
   end;
+  {$IFDEF OpenCL}
+  // Prefill score matmul on the device when OpenCL is enabled and the sequence
+  // is long enough to amortize the per-forward upload/dispatch (short prompts
+  // and the width-1 cached decode path stay on the CPU).
+  if FHasOpenCL and FShouldOpenCL and
+     (FPrevLayer.FOutput.SizeX >= csSDPAOpenCLMinSeqLen) then
+  begin
+    ComputeOpenCL();
+    exit;
+  end;
+  {$ENDIF}
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
@@ -24659,12 +24846,7 @@ begin
     MaxScore := -1e30;
     for j := 0 to SeqLenM1 do
     begin
-      if (FCausal and (j > i) and
-            not ((FPrefixLen > 0) and (i < FPrefixLen) and (j < FPrefixLen))) or
-         ((FWindow > 0) and ((i - j >= FWindow) or
-          (FBidirectionalWindow and (j - i >= FWindow)))) or
-         (HasSeg and (not FBlockCausalSeg) and (Round(Seg[j, 0, 0]) <> SegI)) or
-         (HasSeg and FBlockCausalSeg and (Round(Seg[j, 0, 0]) > SegI)) then
+      if ScoreIsMasked(i, j, HasSeg, Seg, SegI) then
       begin
         // Masked: strict future (causal) - EXCEPT when both query and key are in
         // the prefix-LM bidirectional block ([0..FPrefixLen-1] attend to each
@@ -98452,7 +98634,7 @@ begin
   LastLayerIdx := GetLastLayerIdx();
   for LayerCnt := 0 to LastLayerIdx do
   begin
-    FLayers[LayerCnt].SetTrainable(pTrainable);
+    FLayers[LayerCnt].SetTrainable(pTrainable, pLowMemory);
   end;
 end;
 
