@@ -23,6 +23,7 @@ examples/ColBERTSearch/ColBERTSearch
 examples/EmbeddingSearch/EmbeddingSearch
 examples/EnCodecRoundTrip/EnCodecRoundTrip
 examples/MusicGenSmoke/MusicGenSmoke
+examples/MusicGenText/MusicGenText
 examples/LotteryTicketIMP/LotteryTicketIMP
 examples/VQCodebookUsage/VQCodebookUsage
 examples/FourierMix/FourierMix

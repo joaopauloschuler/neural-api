@@ -59,7 +59,51 @@ Downloads (~3.5 GB total) are cached under `~/.cache/neural-api/hub`, so
 re-runs are **offline**. Repo overrides: `--musicgen-repo` / `--t5-repo` /
 `--encodec-repo`. For gated repos set `HF_TOKEN` in the environment.
 `--seconds N` sets the clip length (converted to EnCodec frames via the codec
-frame rate); `--guidance` defaults to MusicGen's 3.0 in `--download` mode.
+frame rate); `--frames N` overrides the frame count directly; `--guidance`
+defaults to MusicGen's 3.0 in `--download` mode.
+
+## Performance: GPU + AVX
+
+This example offloads its hot matmuls to the GPU and relies on AVX for the
+EnCodec codec. Both are **build-time** decisions, so the program prints a
+build-flags banner at startup (e.g. `[build] flags: AVX2 CPU64 OpenCL
+Release`) — if it shows no `AVX*` or no `OpenCL`, you are running the slow
+scalar/CPU path.
+
+### GPU (OpenCL)
+
+Built with `-dOpenCL` (the default `.lpi` config), the **T5 text encoder** and
+the **MusicGen decoder** offload their conv/linear matmuls to the GPU **by
+default** — including the width-1 step twins the KV-cache decode loop runs on
+(`TMusicGenModel.EnableOpenCL`). The EnCodec codec is a hand-rolled conv path
+(not a `TNNet`) and always synthesizes on **CPU**.
+
+| flag | effect |
+|------|--------|
+| *(none)* | GPU on by default when built with `-dOpenCL` |
+| `--no-gpu` | force CPU |
+| `--gpu-platform N` | pick the OpenCL platform (default 0) |
+| `--gpu-device N` | pick the OpenCL device (default 0) |
+
+Any device-selection failure falls back to CPU with a message. The pico demo's
+tiny layers fall below the per-layer GPU size threshold, so GPU mainly matters
+with `--download`.
+
+### AVX
+
+The EnCodec LSTM / matmul speed depends **entirely** on whether an AVX define
+reached the compiler. `-dAVX2` / `-dAVX` / `-dAVX512` (with `CPU64`) select the
+hand-written asm dot-product; without them the **scalar** fallback compiles and
+`DotProduct` runs no faster than a plain loop. If the banner prints no `AVX*`,
+rebuild with `-dAVX2`.
+
+### Instrumentation
+
+Every run prints always-on `[time] ...` lines for each load and pipeline step
+(tokenizer, T5 load + forward, MusicGen load + decode, EnCodec load + synthesis)
+and a per-codebook **code-stack health** summary (id range, distinct ids, and
+the most-repeated id) that flags a `COLLAPSED?` decode. `--print-model` (alias
+`--summary`) additionally dumps the per-layer weight tables.
 
 ## Fixtures
 
@@ -84,8 +128,14 @@ codes).
 
 * **Classifier-free guidance** (`--guidance`), **top-k / temperature sampling**
   (`--topk` / `--temperature`), and **KV-cache incremental decode** (greedy
-  default; `--no-cache` forces the full re-encode loop).
+  default; `--no-cache` forces the full re-encode loop). Under guidance the two
+  passes per step each keep their own KV-cache (dual-twin path).
 * **Real tokenizer + real downloaded checkpoint** via `--download` (above).
+* **GPU (OpenCL) offload** of the T5 encoder + MusicGen decoder, on by default
+  with `-dOpenCL` (`--no-gpu` / `--gpu-platform` / `--gpu-device`).
+* **AVX-vectorized EnCodec** path plus a startup **build-flags banner**,
+  always-on **timing** + **code-stack health** instrumentation, and a
+  `--print-model` weight-table dump. See *Performance: GPU + AVX* above.
 
 ## Follow-ups (deferred)
 
