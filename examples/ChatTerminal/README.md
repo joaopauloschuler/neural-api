@@ -63,10 +63,10 @@ guard, flushed per token so piped output streams too).
 | `--ctx N` | context window to build (`pSeqLen`) | model max |
 | `--format NAME` | `chatml`/`llama2`/`llama3`/`zephyr`/`gemma`/`phi3`/`mistral` override | autodetect |
 | `--system "msg"` | initial system prompt | none |
-| `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — slower, less RAM. **Not GPU-compatible** (see below) | fp32 (faster, more RAM) |
-| `--low-memory` | drop each conv/linear layer's concatenated weight cache (`FConcatedWeights`) and compute per-neuron straight from the weights — less RAM, somewhat slower forward (`pLowMemory`). **Not GPU-compatible** (see below) | **on** |
+| `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — slower, less RAM. **Overridden by `--gpu`** (see below) | fp32 (faster, more RAM) |
+| `--low-memory` | drop each conv/linear layer's concatenated weight cache (`FConcatedWeights`) and compute per-neuron straight from the weights — less RAM, somewhat slower forward (`pLowMemory`). **Overridden by `--gpu`** (see below) | **on** |
 | `--max-fast-memory` | keep the concatenated weight cache for a faster forward at the cost of more RAM — required for GPU offload | off |
-| `--gpu` | OpenCL offload of the conv/linear matmuls (only when built with `-dOpenCL`) — incompatible with `--int8` and `--low-memory` (see below) | **on** when built with `-dOpenCL`, else off |
+| `--gpu` | OpenCL offload of the conv/linear matmuls (only when built with `-dOpenCL`) — overrides `--int8` and `--low-memory` (see below) | **on** when built with `-dOpenCL`, else off |
 | `--no-gpu` | force CPU even when built with `-dOpenCL` | — |
 | `--gpu-platform N` | OpenCL platform index | 0 |
 | `--gpu-device N` | OpenCL device index within the platform | 0 |
@@ -91,20 +91,22 @@ default; `--no-gpu` forces CPU, and `--gpu-platform N` / `--gpu-device N`
 select the OpenCL device. A binary built without `-dOpenCL` is CPU-only and
 ignores the `--gpu*` flags.
 
-GPU offload is **incompatible with both `--int8` and `--low-memory`**, because
-the OpenCL kernel consumes each accelerated layer's concatenated weight cache,
-which neither path provides:
+GPU offload needs each accelerated layer's concatenated weight cache, which
+neither `--int8` nor `--low-memory` provides. When you combine either with
+`--gpu`, **`--gpu` wins**: the conflicting flag is ignored (with a notice) and
+the cache is built so the kernel can run.
 
 - **`--int8`** — the int8 path never builds the interleaved cache the kernel
-  reads, so combining it with `--gpu` is rejected: the GPU is disabled and the
-  model runs int8 on CPU (`[--gpu ignored: incompatible with --int8 - running
-  int8 on CPU]`). Use `--fp32` (the default) for GPU.
-- **`--low-memory`** (the default) drops exactly that weight cache. Enabling
-  `--gpu` therefore *overrides* it: the cache is rebuilt and the low-memory
-  forward is turned off on the accelerated layers (more RAM, the GPU's cost of
-  entry). Since both `--low-memory` and `--gpu` default to on, the default GPU
-  run keeps the cache; pass `--no-gpu` to honor low-memory on CPU, or
-  `--max-fast-memory` to keep the cache explicitly.
+  reads, so combining it with `--gpu` drops int8, not the GPU: int8 is disabled
+  and the model runs fp32 on the GPU (`[--int8 ignored: incompatible with
+  --gpu]`). To actually run int8, pass `--no-gpu` and keep it on CPU.
+- **`--low-memory`** (the default) drops exactly that weight cache. Combining it
+  with `--gpu` therefore *overrides* it (`[--low-memory ignored: incompatible
+  with --gpu]`): the cache is rebuilt and the low-memory forward is turned off
+  on the accelerated layers (more RAM, the GPU's cost of entry). Since both
+  `--low-memory` and `--gpu` default to on, the default GPU run keeps the cache;
+  pass `--no-gpu` to honor low-memory on CPU, or `--max-fast-memory` to keep the
+  cache explicitly.
 
 Temperature and the penalties run through a
 `TNNetLogitsProcessorChain` in the `TGenerationConfig` pipeline order
