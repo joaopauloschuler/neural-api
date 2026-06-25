@@ -12,6 +12,7 @@ CAI NEURAL API is a Pascal deep-learning library optimized for the AVX, AVX2 and
 * 🎵 **Text-to-music** — turn a text prompt into audio with [`MusicGenText`](examples/MusicGenText) (T5 encoder + MusicGen decoder).
 * 🔊 **More audio** — separate a song into stems with [`MusicSourceSeparation`](examples/MusicSourceSeparation), or talk to an audio-aware model with [`Qwen2AudioChat`](examples/Qwen2AudioChat).
 * 🧠 **Modern architectures, built in** — GPT-style transformers, Mixture-of-Experts, RWKV, xLSTM, spiking neurons and normalizing flows, all as native Pascal layers.
+* 🖼️ **Image super-resolution** — upscale images with a trained network via the [`SuperResolution`](examples/SuperResolution) command-line tool (ships with a ready-to-use model).
 * ⚡ **Fast everywhere** — AVX/AVX2/AVX512 CPU paths plus OpenCL offload for AMD, Intel and NVIDIA GPUs.
 * 📦 **Single-binary deploy** — compile to one self-contained native executable. No runtime, no dependency tree.
 * 📖 **Readable at native speed** — clean, easy-to-learn Pascal that compiles to fast native code. No trade-off between readable source and raw performance.
