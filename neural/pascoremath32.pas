@@ -11,48 +11,57 @@ interface
 
 uses Math, pascoremathtypes, pascoremathhelperfuncs;
 
-function pcr_rsqrtf(x: Single): Single; inline;
-function pcr_tanhf(x: Single): Single; inline;
-function pcr_atanpif(x: Single): Single; inline;
-function pcr_cospif(x: Single): Single; inline;
-function pcr_acosf(x: Single): Single; inline;
-function pcr_cbrtf(x: Single): Single; inline;
-function pcr_sinpif(x: Single): Single; inline;
-function pcr_atanf(x: Single): Single; inline;
-function pcr_asinf(x: Single): Single; inline;
-function pcr_acospif(x: Single): Single; inline;
-function pcr_log2f(x: Single): Single; inline;
-function pcr_asinpif(x: Single): Single; inline;
-function pcr_tanpif(x: Single): Single; inline;
-function pcr_coshf(x: Single): Single; inline;
-function pcr_logf(x: Single): Single; inline;
-function pcr_exp2f(x: Single): Single; inline;
-function pcr_log1pf(x: Single): Single; inline;
-function pcr_exp2m1f(x: Single): Single; inline;
-function pcr_expm1f(x: Single): Single; inline;
-function pcr_exp10f(x: Single): Single; inline;
-function pcr_log10f(x: Single): Single; inline;
-function pcr_erfcf(x: Single): Single; inline;
-function pcr_log2p1f(x: Single): Single; inline;
-function pcr_erff(x: Single): Single; inline;
-function pcr_sinhf(x: Single): Single; inline;
-function pcr_expf(x: Single): Single; inline;
-function pcr_atanhf(x: Single): Single; inline;
-function pcr_exp10m1f(x: Single): Single; inline;
-function pcr_log10p1f(x: Single): Single; inline;
-function pcr_asinhf(x: Single): Single; inline;
-function pcr_acoshf(x: Single): Single; inline;
-function pcr_tgammaf(x: Single): Single; inline;
-function pcr_lgammaf(x: Single): Single; inline;
-function pcr_hypotf(x, y: Single): Single; inline;
-function pcr_atan2f(y, x: Single): Single; inline;
-function pcr_atan2pif(y, x: Single): Single; inline;
-function pcr_powf(x0, y0: Single): Single; inline;
-function pcr_compoundf(x, n: Single): Single; inline;
-function pcr_sinf(x: Single): Single; inline;
-function pcr_cosf(x: Single): Single; inline;
-procedure pcr_sincosf(x: Single; out s, c: Single); inline;
-function pcr_tanf(x: Single): Single; inline;
+function pcr_rsqrtf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_tanhf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_atanpif(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_cospif(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_acosf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_cbrtf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_sinpif(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_atanf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_asinf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_acospif(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_log2f(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_asinpif(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_tanpif(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_coshf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_logf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_exp2f(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_log1pf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_exp2m1f(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_expm1f(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_exp10f(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_log10f(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_erfcf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_log2p1f(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_erff(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_sinhf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_expf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_atanhf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_exp10m1f(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_log10p1f(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_asinhf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_acoshf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_tgammaf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_lgammaf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_hypotf(x, y: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_atan2f(y, x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_atan2pif(y, x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_powf(x0, y0: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_compoundf(x, n: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_sinf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+function pcr_cosf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+procedure pcr_sincosf(x: Single; out s, c: Single); {$IFDEF FPC} inline; {$ENDIF}
+function pcr_tanf(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
+
+{$IFNDEF FPC}
+function BsrDWord(Value: Cardinal): Integer;
+function BsrQWord(Value: UInt64): Integer;
+function BsfDWord(Value: Cardinal): Integer;
+function BsfQWord(Value: UInt64): Integer;
+function SarLongInt(Value: LongInt; Shift: Byte): LongInt;
+function SarInt64(Value: Int64; Shift: Byte): Int64;
+{$ENDIF}
 
 implementation
 
@@ -92,6 +101,164 @@ const
     -0.3826834323650898, -0.33688985339222005, -0.2902846772544624, -0.2429801799032639,
     -0.19509032201612828, -0.14673047445536175, -0.0980171403295606, -0.049067674327418015
   );
+
+{$IFNDEF FPC}
+{$IFDEF WIN32}
+function BsrDWord(Value: Cardinal): Integer;
+asm
+        test    eax, eax
+        jz      @@z
+        bsr     eax, eax
+        ret
+@@z:    mov     eax, -1
+end;
+
+function BsfDWord(Value: Cardinal): Integer;
+asm
+        test    eax, eax
+        jz      @@z
+        bsf     eax, eax
+        ret
+@@z:    mov     eax, -1
+end;
+
+function BsrQWord(Value: UInt64): Integer;
+asm
+        mov     ecx, edx
+        or      ecx, ecx
+        jnz     @@high
+        mov     ecx, eax
+        or      ecx, ecx
+        jz      @@zero
+        bsr     eax, ecx
+        ret
+@@high:
+        bsr     eax, ecx
+        add     eax, 32
+        ret
+@@zero:
+        mov     eax, -1
+end;
+
+function BsfQWord(Value: UInt64): Integer;
+asm
+        mov     ecx, eax
+        or      ecx, ecx
+        jnz     @@low
+        mov     ecx, edx
+        or      ecx, ecx
+        jz      @@zero
+        bsf     eax, ecx
+        add     eax, 32
+        ret
+@@low:
+        bsf     eax, ecx
+        ret
+@@zero:
+        mov     eax, -1
+end;
+
+function SarLongInt(Value: LongInt; Shift: Byte): LongInt;
+asm
+        cmp     dl, 32
+        jb      @@ok
+
+        cmp     eax, 0
+        jl      @@neg
+        xor     eax, eax
+        ret
+@@neg:  mov     eax, -1
+        ret
+@@ok:
+        mov     cl, dl
+        sar     eax, cl
+end;
+
+function SarInt64(Value: Int64; Shift: Byte): Int64;
+begin
+  if Shift >= 64 then
+    Result := -Int64(Value < 0)
+  else if Shift = 0 then
+    Result := Value
+  else
+    Result := Int64(UInt64(Value) shr Shift) or
+              (Int64(-Integer(Value < 0)) shl (64 - Shift));
+end;
+{$ENDIF}
+
+{$IFDEF WIN64}
+function BsrDWord(Value: Cardinal): Integer;
+asm
+        test    ecx, ecx
+        jz      @@z
+        bsr     eax, ecx
+        ret
+@@z:    mov     eax, -1
+end;
+
+function BsfDWord(Value: Cardinal): Integer;
+asm
+        test    ecx, ecx
+        jz      @@z
+        bsf     eax, ecx
+        ret
+@@z:    mov     eax, -1
+end;
+
+function BsrQWord(Value: UInt64): Integer;
+asm
+        test    rcx, rcx
+        jz      @@z
+        bsr     rax, rcx
+        ret
+@@z:    mov     eax, -1
+end;
+
+function BsfQWord(Value: UInt64): Integer;
+asm
+        test    rcx, rcx
+        jz      @@z
+        bsf     rax, rcx
+        ret
+@@z:    mov     eax, -1
+end;
+
+function SarLongInt(Value: LongInt; Shift: Byte): LongInt;
+asm
+        cmp     dl, 32
+        jb      @@ok
+
+        test    ecx, ecx
+        jns     @@pos
+        mov     eax, -1
+        ret
+@@pos:  xor     eax, eax
+        ret
+@@ok:
+        mov     eax, ecx
+        mov     cl, dl
+        sar     eax, cl
+end;
+
+function SarInt64(Value: Int64; Shift: Byte): Int64;
+asm
+        cmp     dl, 64
+        jb      @@ok
+
+        test    rcx, rcx
+        jns     @@pos
+        mov     rax, -1
+        ret
+@@pos:  xor     rax, rax
+        ret
+@@ok:
+        mov     rax, rcx
+        mov     cl, dl
+        sar     rax, cl
+end;
+{$ENDIF}
+
+{$ENDIF FPC}
 
 // ── 1.01 rsqrtf ──────────────────────────────────────────────────────────────
 function pcr_rsqrtf(x: Single): Single;
@@ -3880,7 +4047,7 @@ end;
 
 { ── pcr_atan2f_tiny: Taylor approx for tiny y/x ───────────────────────────── }
 
-function pcr_atan2f_tiny(y, x: Single): Single; inline;
+function pcr_atan2f_tiny(y, x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
 const
   c_third: Double = -0.3333333333333333;  { -0x1.5555555555555p-2 }
 var
@@ -4256,7 +4423,7 @@ end;
 
 { ── pcr_powf helpers ───────────────────────────────────────────────────── }
 
-function mulddd_pf(xh, xl, ch: Double; out l: Double): Double; inline;
+function mulddd_pf(xh, xl, ch: Double; out l: Double): Double; {$IFDEF FPC} inline; {$ENDIF}
 var ahlh, ahhh, ahhl: Double;
 begin
   ahlh := ch * xl;
@@ -4268,7 +4435,7 @@ begin
   Result := ch;
 end;
 
-function isint_pf(y0: Single): Boolean; inline;
+function isint_pf(y0: Single): Boolean; {$IFDEF FPC} inline; {$ENDIF}
 var wy: Tb32u32; ey, s: Int32;
 begin
   wy.f := y0;
@@ -4282,7 +4449,7 @@ begin
   Result := (wy.u shl 1) = 0;
 end;
 
-function isodd_pf(y0: Single): Boolean; inline;
+function isodd_pf(y0: Single): Boolean; {$IFDEF FPC} inline; {$ENDIF}
 var wy: Tb32u32; ey, s: Int32; oddb: UInt32;
 begin
   wy.f := y0;
@@ -4296,7 +4463,7 @@ begin
   Result := oddb <> 0;
 end;
 
-function is_signalingf_pf(x: Single): Boolean; inline;
+function is_signalingf_pf(x: Single): Boolean; {$IFDEF FPC} inline; {$ENDIF}
 var u: Tb32u32;
 begin
   u.f := x;
@@ -4304,7 +4471,7 @@ begin
   Result := (u.u and $7FFFFFFF) > $7FC00000;
 end;
 
-function is_exact_pf(x0, y0: Single): Int32; inline;
+function is_exact_pf(x0, y0: Single): Int32; {$IFDEF FPC} inline; {$ENDIF}
 const
   xmax_ie: array[0..15] of UInt32 = (0, $FFFFFF, 4095, 255, 63, 27, 15, 9,
                                       7, 5, 5, 3, 3, 3, 3, 3);
@@ -4715,7 +4882,11 @@ begin
         else Result := -x0;
         Exit;
       end;
+      {$IFDEF FPC}
       Result := (x_pf - x_pf) / (x_pf - x_pf); Exit;  { NaN }
+      {$ELSE}
+      Result := NaN; Exit;
+      {$ENDIF}
     end;
     { x = +1 }
     if is_signalingf_pf(y0) then Result := x0 + y0
@@ -4755,7 +4926,11 @@ begin
     end;
     if tx_pf.u > (UInt64($7FF) shl 52) then begin  { x <= 0 }
       if (not isint_pf(y0)) and (x_pf <> 0) then begin
+        {$IFDEF FPC}
         Result := (x_pf - x_pf) / (x_pf - x_pf); Exit;  { NaN }
+        {$ELSE}
+        Result := NaN; Exit;
+        {$ENDIF}
       end;
     end;
   end;
@@ -5052,7 +5227,7 @@ const
   );
 
 // ── is_signalingf ─────────────────────────────────────────────────────────────
-function cf_is_signalingf(x: Single): Boolean; inline;
+function cf_is_signalingf(x: Single): Boolean; {$IFDEF FPC} inline; {$ENDIF}
 var u_sig: Tb32u32;
 begin
   u_sig.f := x;
@@ -5061,7 +5236,7 @@ begin
 end;
 
 // ── isint: returns non-zero if y is an integer ────────────────────────────────
-function cf_isint(y: Single): Int32; inline;
+function cf_isint(y: Single): Int32; {$IFDEF FPC} inline; {$ENDIF}
 var wy_ii: Tb32u32;
     ey_ii, s_ii: Int32;
 begin
@@ -5078,7 +5253,7 @@ begin
 end;
 
 // ── p1: approximates log2(1+z) for |z|<=1/64 ─────────────────────────────────
-function cf_p1(z: Double): Double; inline;
+function cf_p1(z: Double): Double; {$IFDEF FPC} inline; {$ENDIF}
 var z2_p1, z4_p1, c5_p1, c3_p1, c1_p1: Double;
 begin
   z2_p1 := z * z;
@@ -5093,7 +5268,7 @@ begin
 end;
 
 // ── p2: double-double approx of log2(1+zh+zl) ────────────────────────────────
-procedure cf_p2(out h, l: Double; zh, zl: Double); inline;
+procedure cf_p2(out h, l: Double; zh, zl: Double); {$IFDEF FPC} inline; {$ENDIF}
 var t_p2: Double;
 begin
   h := CF_P2C_17; // degree 13
@@ -5125,7 +5300,7 @@ begin
 end;
 
 // ── q1: approximates 2^z for |z|<=2^-6 ──────────────────────────────────────
-function cf_q1(z: Double): Double; inline;
+function cf_q1(z: Double): Double; {$IFDEF FPC} inline; {$ENDIF}
 var z2_q1, c3_q1, c0_q1, c2_q1: Double;
 begin
   z2_q1 := z * z;
@@ -5136,7 +5311,7 @@ begin
 end;
 
 // ── q2: double-double approx of 2^(h+l) ──────────────────────────────────────
-procedure cf_q2(out qh, ql: Double; h, l: Double); inline;
+procedure cf_q2(out qh, ql: Double; h, l: Double); {$IFDEF FPC} inline; {$ENDIF}
 var h2_q2, c7_q2, c5_q2, t_q2: Double;
 begin
   h2_q2 := h * h;
@@ -5160,7 +5335,7 @@ begin
 end;
 
 // ── _log2p1 (fast approximation of log2(1+x)) ────────────────────────────────
-function cf_log2p1_fast(x: Double): Double; inline;
+function cf_log2p1_fast(x: Double): Double; {$IFDEF FPC} inline; {$ENDIF}
 var u_lp: Double;
     v_lp: Tb64u64;
     m_lp: UInt64;
@@ -5183,7 +5358,7 @@ begin
 end;
 
 // ── exp2_1: fast path 2^t → Single (returns -1 if rounding test fails) ────────
-function cf_exp2_1(t: Double): Single; {$IFNDEF AVX2} inline; {$ENDIF}
+function cf_exp2_1(t: Double): Single; {$IFNDEF AVX2} {$IFDEF FPC} inline; {$ENDIF} {$ENDIF}
 var k_e1: Double;
     r_e1: Double;
     v_e1, err_e1: Tb64u64;
@@ -5221,7 +5396,7 @@ begin
 end;
 
 // ── is_exact_or_midpoint ──────────────────────────────────────────────────────
-function cf_is_exact_or_midpoint(x, y: Single; var midpoint: Int32): Int32; inline;
+function cf_is_exact_or_midpoint(x, y: Single; var midpoint: Int32): Int32; {$IFDEF FPC} inline; {$ENDIF}
 var v_iem, w_iem: Tb32u32;
     vd_iem: Tb64u64;
     e_iem: Int32;
@@ -5352,7 +5527,7 @@ begin
 end;
 
 // ── exp2_2: accurate path for 2^(h+l) → Single ───────────────────────────────
-function cf_exp2_2(h, l: Double; x, y: Single; exact: Int32; flag: DWord): Single; {$IFNDEF AVX2} inline; {$ENDIF}
+function cf_exp2_2(h, l: Double; x, y: Single; exact: Int32; flag: DWord): Single; {$IFNDEF AVX2} {$IFDEF FPC} inline; {$ENDIF} {$ENDIF}
 const
   CF_ERR_E22_0: Double = 8.744365362193872e-26; // 0x1.b1p-84
   CF_ERR_E22_1: Double = 4.861355328424485e-29; // 0x1.edp-95
@@ -5427,7 +5602,7 @@ begin
 end;
 
 // ── log2p1_accurate: double-double approx of log2(1+x) ───────────────────────
-procedure cf_log2p1_accurate(out h, l: Double; x: Double); inline;
+procedure cf_log2p1_accurate(out h, l: Double; x: Double); {$IFDEF FPC} inline; {$ENDIF}
 var v_la: Tb64u64;
     m_la: UInt64;
     e_la: Int64;
@@ -5463,7 +5638,7 @@ begin
 end;
 
 // ── accurate_path ─────────────────────────────────────────────────────────────
-function cf_accurate_path(x, y: Single; exact: Int32; flag: DWord): Single; inline;
+function cf_accurate_path(x, y: Single; exact: Int32; flag: DWord): Single; {$IFDEF FPC} inline; {$ENDIF}
 var h_ap, l_ap: Double;
 begin
   cf_log2p1_accurate(h_ap, l_ap, Double(x));
@@ -5472,7 +5647,7 @@ begin
 end;
 
 // ── cf_special: handles special/edge cases ────────────────────────────────────
-function cf_special(x, y: Single): Single; inline;
+function cf_special(x, y: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
 var nx_sp, ny_sp: Tb32u32;
     ax_sp, ay_sp: UInt32;
     mone_sp: Tb32u32;
@@ -5541,7 +5716,7 @@ begin
 end;
 
 // ── pcr_compoundf: main entry point ──────────────────────────────────────────
-function pcr_compoundf(x, n: Single): Single; inline;
+function pcr_compoundf(x, n: Single): Single; {$IFDEF FPC} {$IFDEF FPC} inline; {$ENDIF} {$ENDif}
 var nx_cf, ny_cf: Tb32u32;
     mone_cf: Tb32u32;
     ax_cf, ay_cf: UInt32;
@@ -5783,7 +5958,7 @@ end;
 // ---- rltl0: range-reduction for medium arguments (double input) -----------
 // Uses arithmetic rounding trick: idh + C_BIG rounds to nearest-even integer
 // (IEEE 754 default), avoiding pcr_roundeven (asm, not inlinable in FPC).
-function sincos_rltl0(x: Double; q: PInteger): Double; inline;
+function sincos_rltl0(x: Double; q: PInteger): Double; {$IFDEF FPC} inline; {$ENDIF}
 const
   C_IDH: Double = 5.092958178940651;    // 0x1.45f306dc9c883p+2
   C_BIG: Double = 6755399441055744.0;   // 0x1.8p52
@@ -5800,7 +5975,7 @@ end;
 // ---- rltl: range-reduction for medium arguments (float input) -------------
 // Uses arithmetic rounding trick: idh + C_BIG rounds to nearest-even integer
 // (IEEE 754 default), avoiding pcr_roundeven (asm, not inlinable in FPC).
-function sincos_rltl(z: Single; q: PInteger): Double; inline;
+function sincos_rltl(z: Single; q: PInteger): Double; {$IFDEF FPC} inline; {$ENDIF}
 const
   C_IDL: Double = -3.1558305786379073e-09;  // -0x1.b1bbead603d8bp-29
   C_IDH: Double =  5.092958182096481;        // 0x1.45f306ep+2
@@ -5820,7 +5995,7 @@ end;
 // ---- sinf helpers ----------------------------------------------------------
 
 // copysign(1.0f, x) * rh + copysign(1.0f, x) * rl
-function sinf_add_sign(x, rh, rl: Single): Single; inline;
+function sinf_add_sign(x, rh, rl: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
 var
   t32: Tb32u32;
   sgn: Single;
@@ -5831,7 +6006,7 @@ begin
 end;
 
 // sinf database lookup for hard cases
-function sinf_db(x: Single; r: Double): Single; inline;
+function sinf_db(x: Single; r: Double): Single; {$IFDEF FPC} inline; {$ENDIF}
 const
   n = 4;
   // absolute-value bit patterns of the argument
@@ -5876,7 +6051,7 @@ begin
 end;
 
 // as_sinf_big: handles |x| > 2^26
-function sinf_big(x: Single): Single; inline;
+function sinf_big(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
 var
   t32: Tb32u32;
   ax: UInt32;
@@ -5910,7 +6085,7 @@ end;
 // ---- cosf helpers ----------------------------------------------------------
 
 // cosf database lookup for hard cases
-function cosf_db(x: Single; r: Double): Single; inline;
+function cosf_db(x: Single; r: Double): Single; {$IFDEF FPC} inline; {$ENDIF}
 const
   n = 5;
   db_uarg: array[0..n-1] of UInt32 = (
@@ -5955,7 +6130,7 @@ begin
 end;
 
 // as_cosf_big: handles |x| > 2^26
-function cosf_big(x: Single): Single; inline;
+function cosf_big(x: Single): Single; {$IFDEF FPC} inline; {$ENDIF}
 var
   t32: Tb32u32;
   t64: Tb64u64;
@@ -6200,7 +6375,7 @@ end;
 // tanf rltl: multiplies by 2/pi (different from sincos_rltl which uses 16/pi)
 // Uses arithmetic rounding trick: idh + C_BIG rounds to nearest-even integer
 // (IEEE 754 default), avoiding pcr_roundeven (asm, not inlinable in FPC).
-function tanf_rltl(z: Single; q: PInteger): Double; inline;
+function tanf_rltl(z: Single; q: PInteger): Double; {$IFDEF FPC} inline; {$ENDIF}
 const
   C_IDL: Double = -3.944788223297384e-10;  // -0x1.b1bbead603d8bp-32
   C_IDH: Double =  0.6366197727620602;      // 0x1.45f306ep-1
@@ -6295,7 +6470,7 @@ end;
 
 // Large-argument case for sincosf (|x| >= threshold)
 // Uses sincos_rbig (k=e-124 — correct for sincosf)
-procedure sincosf_big(x: Single; var sout, cout: Single); inline;
+procedure sincosf_big(x: Single; var sout, cout: Single); {$IFDEF FPC} inline; {$ENDIF}
 var
   t32: Tb32u32;
   ax: UInt32;

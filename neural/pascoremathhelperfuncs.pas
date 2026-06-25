@@ -16,7 +16,7 @@ uses
 // Pure-asm body uses System V AMD64 ABI (params in xmm0/1/2).
 function pcr_fmaf(x, y, z: Single): Single; {$IFNDEF AVX2} inline; {$ENDIF}
 function pcr_fma(x, y, z: Double): Double; {$IFNDEF AVX2} inline; {$ENDIF}
-function pcr_fma_pascal( a,b,c: Double ):Double; inline;
+function pcr_fma_pascal( a,b,c: Double ):Double; {$IFDEF FPC} inline; {$ENDIF}
 
 // Absolute value
 function pcr_fabsf(x: Single): Single; inline;
@@ -88,14 +88,14 @@ procedure pcr_set_mxcsr(flag: DWord);
 // ------- double-double and polynomial helpers (task 0.9, promoted from pascoremath32) -------
 
 // Degree-12 polynomial evaluator (used by acosf, asinf and their binary64 analogues).
-function pcr_poly12(z: Double; const c: array of Double): Double; inline;
+function pcr_poly12(z: Double; const c: array of Double): Double; {$IFDEF FPC} inline; {$ENDIF}
 
 // Double-double × double-double product: returns xh*ch + mixed terms, error in l.
 function pcr_muldd(xh, xl, ch, cl: Double; out l: Double): Double; inline;
 
 // Horner evaluation of a flat-array double-double polynomial.
 // c is flat: c[k*2] = high part, c[k*2+1] = low part.
-function pcr_polydd(xh, xl: Double; n: Int32; const c: array of Double; out l: Double): Double; inline;
+function pcr_polydd(xh, xl: Double; n: Int32; const c: array of Double; out l: Double): Double; {$IFDEF FPC} inline; {$ENDIF}
 
 // All four primitives below write their var outputs LAST (after all value-param
 // reads) so that callers may safely alias value params with var params.
@@ -494,7 +494,7 @@ begin
   Result := FinalizeDouble;
 end;
 
-function pcr_fma_pascal( a,b,c: Double ):Double; inline;
+function pcr_fma_pascal( a,b,c: Double ):Double; {$IFDEF FPC} inline; {$ENDIF}
 const
   cFmaDblMin: Tb64u64 = (u:$0010000000000000);  // 2^-1022 = DBL_MIN
 var
@@ -920,7 +920,7 @@ end;
 // Double-double and polynomial helpers (promoted from pascoremath32, task 0.9)
 // ---------------------------------------------------------------------------
 
-function pcr_poly12(z: Double; const c: array of Double): Double; inline;
+function pcr_poly12(z: Double; const c: array of Double): Double; {$IFDEF FPC} inline; {$ENDIF}
 var z2, z4, c0, c2, c4, c6, c8, c10: Double;
 begin
   z2 := z * z; z4 := z2 * z2;
@@ -951,7 +951,7 @@ begin
   Result := ch;
 end;
 
-function pcr_polydd(xh, xl: Double; n: Int32; const c: array of Double; out l: Double): Double; inline;
+function pcr_polydd(xh, xl: Double; n: Int32; const c: array of Double; out l: Double): Double; {$IFDEF FPC} inline; {$ENDIF}
 var
   i, i2: Int32;
   ch, cl, th, tl: Double;
