@@ -229,6 +229,14 @@ type
       FActivationFnDerivative: TNeuralActivationFunction;
       FForwardTime: double;
       FBackwardTime: double;
+      // Forward-pass dispatch counters: how many times Compute ran the GPU
+      // (OpenCL) path vs the CPU path. Only the OpenCL-capable layers
+      // (Convolution / FullConnect / SDPA) increment these; every other layer
+      // leaves both at zero. Reset by ClearTimes alongside the timers, so they
+      // cover the same window. Lets a profiler answer "are these layers really
+      // on the GPU?" rather than just "how long did they take?".
+      FForwardGPUCnt: integer;
+      FForwardCPUCnt: integer;
       FNeurons: TNNetNeuronList;
       FOutput: TNNetVolume;
       FOutputRaw: TNNetGroupedVolume;
@@ -530,6 +538,8 @@ type
       property SmoothErrorPropagation: boolean read FSmoothErrorPropagation write FSmoothErrorPropagation;
       property BackwardTime: double read FBackwardTime write FBackwardTime;
       property ForwardTime: double read FForwardTime write FForwardTime;
+      property ForwardGPUCnt: integer read FForwardGPUCnt write FForwardGPUCnt;
+      property ForwardCPUCnt: integer read FForwardCPUCnt write FForwardCPUCnt;
       property LinkedNeurons: boolean read FLinkedNeurons;
       {$IFDEF OpenCL}
       property HasOpenCL: boolean read FHasOpenCL;
@@ -24837,10 +24847,12 @@ begin
   if FHasOpenCL and FShouldOpenCL and
      (FPrevLayer.FOutput.SizeX >= csSDPAOpenCLMinSeqLen) then
   begin
+    Inc(FForwardGPUCnt);
     ComputeOpenCL();
     exit;
   end;
   {$ENDIF}
+  Inc(FForwardCPUCnt);
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
@@ -76147,13 +76159,16 @@ begin
     {$IFDEF OpenCL}
     if WillOpenCL() then
     begin
+      Inc(FForwardGPUCnt);
       ComputeOpenCL();
     end
     else
     begin
+      Inc(FForwardCPUCnt);
       ComputeOnCPU;
     end;
     {$ELSE}
+      Inc(FForwardCPUCnt);
       ComputeOnCPU;
     {$ENDIF}
     FForwardTime := FForwardTime + (Now() - StartTime);
@@ -77221,13 +77236,16 @@ begin
     {$IFDEF OpenCL}
     if Assigned(FDotCL) and FHasOpenCL and FShouldOpenCL then
     begin
+      Inc(FForwardGPUCnt);
       ComputeOpenCL();
     end
     else
     begin
+      Inc(FForwardCPUCnt);
       ComputeCPU();
     end;
     {$ELSE}
+    Inc(FForwardCPUCnt);
     ComputeCPU();
     {$ENDIF}
     FForwardTime := FForwardTime + (Now() - StartTime);
@@ -79391,16 +79409,21 @@ end;
 class function TNNet.LayerClassTimingReport(NN: TNNet): string;
 var
   Lines: TStringList;
-  LayerCnt, NNLastIdx, i, j, ClassIdx, BarLen: integer;
+  LayerCnt, NNLastIdx, i, j, ClassIdx: integer;
   Layer: TNNetLayer;
   ClassNames: array of string;
   ClassUs: array of double;
   ClassCount: array of integer;
+  ClassGPU: array of Int64;   // GPU forward dispatches summed over the class
+  ClassCPU: array of Int64;   // CPU forward dispatches summed over the class
   ClassQty: integer;
   LayerClass: string;
   TotalUs, Pct, MeanUs: double;
+  GpuPct: double;
+  GpuStr: string;
   TmpUsD: double;
   TmpQty: integer;
+  TmpI64: Int64;
   TmpName: string;
 const
   // FForwardTime is a TDateTime span measured in days; convert to microseconds.
@@ -79422,6 +79445,8 @@ begin
   SetLength(ClassNames, 0);
   SetLength(ClassUs, 0);
   SetLength(ClassCount, 0);
+  SetLength(ClassGPU, 0);
+  SetLength(ClassCPU, 0);
   // Bucket each layer's accumulated forward time by class name.
   for LayerCnt := 0 to NNLastIdx do
   begin
@@ -79441,12 +79466,18 @@ begin
       SetLength(ClassNames, ClassQty);
       SetLength(ClassUs, ClassQty);
       SetLength(ClassCount, ClassQty);
+      SetLength(ClassGPU, ClassQty);
+      SetLength(ClassCPU, ClassQty);
       ClassNames[ClassIdx] := LayerClass;
       ClassUs[ClassIdx] := 0;
       ClassCount[ClassIdx] := 0;
+      ClassGPU[ClassIdx] := 0;
+      ClassCPU[ClassIdx] := 0;
     end;
     ClassUs[ClassIdx] := ClassUs[ClassIdx] + Layer.ForwardTime * cUsPerDay;
     ClassCount[ClassIdx] := ClassCount[ClassIdx] + 1;
+    ClassGPU[ClassIdx] := ClassGPU[ClassIdx] + Layer.ForwardGPUCnt;
+    ClassCPU[ClassIdx] := ClassCPU[ClassIdx] + Layer.ForwardCPUCnt;
   end;
   // Sort classes by total forward time descending (simple insertion sort;
   // the class count is tiny).
@@ -79457,6 +79488,8 @@ begin
         TmpUsD := ClassUs[j]; ClassUs[j] := ClassUs[j - 1]; ClassUs[j - 1] := TmpUsD;
         TmpQty := ClassCount[j]; ClassCount[j] := ClassCount[j - 1]; ClassCount[j - 1] := TmpQty;
         TmpName := ClassNames[j]; ClassNames[j] := ClassNames[j - 1]; ClassNames[j - 1] := TmpName;
+        TmpI64 := ClassGPU[j]; ClassGPU[j] := ClassGPU[j - 1]; ClassGPU[j - 1] := TmpI64;
+        TmpI64 := ClassCPU[j]; ClassCPU[j] := ClassCPU[j - 1]; ClassCPU[j - 1] := TmpI64;
       end;
   TotalUs := 0;
   for i := 0 to ClassQty - 1 do TotalUs := TotalUs + ClassUs[i];
@@ -79465,10 +79498,13 @@ begin
     Lines.Add('Layer Class Timing Report');
     Lines.Add(StringOfChar('=', 25));
     Lines.Add('Aggregated forward-pass time by layer class (accumulated since');
-    Lines.Add('the last ClearTime). Sorted by total cost descending.');
-    Lines.Add(Format('%-28s %5s %14s %14s %6s',
-      ['Layer class', 'Count', 'total us', 'us/instance', '%']));
-    Lines.Add(StringOfChar('-', 78));
+    Lines.Add('the last ClearTime). Sorted by total cost descending. The GPU');
+    Lines.Add('column is the share of forward dispatches that took the OpenCL');
+    Lines.Add('path (only Convolution / FullConnect / SDPA can; "-" = no GPU');
+    Lines.Add('path / not dispatched).');
+    Lines.Add(Format('%-28s %5s %14s %14s %6s %8s',
+      ['Layer class', 'Count', 'total us', 'us/instance', '%', 'GPU']));
+    Lines.Add(StringOfChar('-', 86));
     for i := 0 to ClassQty - 1 do
     begin
       if ClassCount[i] > 0 then
@@ -79477,12 +79513,20 @@ begin
         MeanUs := 0;
       Pct := 0;
       if TotalUs > 0 then Pct := 100.0 * ClassUs[i] / TotalUs;
-      BarLen := Round(Pct / 5);
+      // GPU column: percent of this class's forward dispatches that ran on the
+      // OpenCL path. Layers with no GPU path never increment either counter, so
+      // they show "-" rather than a misleading 0%.
+      if (ClassGPU[i] + ClassCPU[i]) > 0 then
+      begin
+        GpuPct := 100.0 * ClassGPU[i] / (ClassGPU[i] + ClassCPU[i]);
+        GpuStr := Format('%6.0f%%', [GpuPct]);
+      end
+      else
+        GpuStr := Format('%7s', ['-']);
       Lines.Add(Format('%-28s %5d %14.2f %14.2f %5.1f %s',
-        [ClassNames[i], ClassCount[i], ClassUs[i], MeanUs, Pct,
-         StringOfChar('#', BarLen)]));
+        [ClassNames[i], ClassCount[i], ClassUs[i], MeanUs, Pct, GpuStr]));
     end;
-    Lines.Add(StringOfChar('-', 78));
+    Lines.Add(StringOfChar('-', 86));
     Lines.Add(Format('TOTAL: %.2f us across %d layer(s) in %d class(es)',
       [TotalUs, NNLastIdx + 1, ClassQty]));
     Result := Lines.Text;
@@ -101169,6 +101213,8 @@ procedure TNNetLayer.ClearTimes();
 begin
   FBackwardTime := 0;
   FForwardTime  := 0;
+  FForwardGPUCnt := 0;
+  FForwardCPUCnt := 0;
 end;
 
 procedure TNNetLayer.AddTimes(Origin: TNNetLayer);
