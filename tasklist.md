@@ -713,7 +713,15 @@ rather than acted on.
       existing parity tests (TestHiFiGANSynthesisParity / TestVitsSynthesisParity /
       EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
       before/after.
-- [ ] AVX-vectorize `TNNetTokenRMSNorm` (forward + backward) over the contiguous
+- [X] AVX-vectorize `TNNetTokenRMSNorm` (forward + backward) over the contiguous
+      Depth axis. LANDED: forward sum-of-squares via DotProduct(seg,seg), gain
+      multiply via Mul; backward SumDxHatXHat via DotProduct, gain-grad via 3-ptr
+      MulAdd into a Depth scratch then -LR-scaled MulAdd, input-grad via two MulAdds
+      (mirrors L2Normalize.*PerDepth). Verified < 1e-4 on scalar AND -dAVX2:
+      TokenRMSNorm forward parity + Llama/Qwen pico importers (TTestNeuralPretrained
+      346 tests) and QK-RMSNorm gradient (TTestNeuralNumerical 1198 tests) all green
+      on both; only failure is the pre-existing AVX2-only TestSetTrainableKeepsOutputs
+      ~1e-7 drift (tasklist line ~77), unrelated.
       Depth axis. This is the per-token RMSNorm used by EVERY imported Llama-family
       transformer (Llama/Qwen/Gemma/Mistral/Phi/OLMo/...): two-or-more per block,
       run once per token per forward pass, so it is on the hot path of all LLM

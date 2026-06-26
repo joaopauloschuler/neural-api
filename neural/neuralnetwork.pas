@@ -5709,6 +5709,7 @@ type
       FTokenRMSEpsilon: TNeuralFloat;
       FNormalized: TNNetVolume;   // x_hat = x * invRMS, same shape as input
       FInvRMS: TNNetVolume;       // per-token 1/sqrt(mean(x^2)+eps), X x Y x 1
+      FGainGradScratch: TNNetVolume; // Depth-length backward gain-grad accumulator
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); overload; override;
@@ -54060,6 +54061,7 @@ begin
   FFloatSt[0] := FTokenRMSEpsilon;
   FNormalized := TNNetVolume.Create();
   FInvRMS := TNNetVolume.Create();
+  FGainGradScratch := TNNetVolume.Create();
 end;
 
 constructor TNNetTokenRMSNorm.Create(pEpsilon: TNeuralFloat);
@@ -54071,6 +54073,7 @@ end;
 
 destructor TNNetTokenRMSNorm.Destroy();
 begin
+  FGainGradScratch.Free;
   FInvRMS.Free;
   FNormalized.Free;
   inherited Destroy();
@@ -54084,6 +54087,7 @@ begin
   SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
   FNormalized.ReSize(FOutput);
   FInvRMS.ReSize(FOutput.SizeX, FOutput.SizeY, 1);
+  FGainGradScratch.ReSize(1, 1, FOutput.Depth);
   SetOutputErrorSize(FOutput);
   InitDefault();
 end;
@@ -54091,34 +54095,38 @@ end;
 procedure TNNetTokenRMSNorm.Compute();
 var
   StartTime: double;
-  Depth, TokenCnt, TokenMax, ChannelCnt, BaseIdx, DepthM1: integer;
-  MeanSqr, InvRMSV, XHat: TNeuralFloat;
+  Depth, TokenCnt, TokenMax, BaseIdx: integer;
+  MeanSqr, InvRMSV: TNeuralFloat;
   Gain: TNNetVolume;
+  GainPtr, XPtr, XHatPtr, OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   inherited Compute;
   Depth := FOutput.Depth;
   // Token index runs over the flattened (X, Y) positions; the Depth axis is
   // contiguous in memory, so token t occupies FData[t*Depth .. t*Depth+Depth-1].
+  // Each per-token segment is depth-contiguous, so the sum-of-squares reduction
+  // and the gain-multiply write use the AVX-vectorized TNNetVolume primitives
+  // (mirrors TNNetL2Normalize.ComputePerDepth).
   TokenMax := (FOutput.Size div Depth) - 1;
-  DepthM1 := Depth - 1;
   Gain := FNeurons[0].FWeights;
+  GainPtr := Gain.GetRawPtr();
   for TokenCnt := 0 to TokenMax do
   begin
     BaseIdx := TokenCnt * Depth;
-    MeanSqr := 0;
-    for ChannelCnt := 0 to DepthM1 do
-      MeanSqr := MeanSqr +
-        FOutput.FData[BaseIdx + ChannelCnt] * FOutput.FData[BaseIdx + ChannelCnt];
-    MeanSqr := MeanSqr / Depth;
+    XPtr := FOutput.GetRawPtr(BaseIdx);
+    XHatPtr := FNormalized.GetRawPtr(BaseIdx);
+    OutPtr := XPtr; // FOutput written in place below, after x_hat is captured
+    // mean( x^2 ) via the vectorized dot product of the segment with itself.
+    MeanSqr := TNNetVolume.DotProduct(XPtr, XPtr, Depth) / Depth;
     InvRMSV := 1 / Sqrt(MeanSqr + FTokenRMSEpsilon);
     FInvRMS.FData[TokenCnt] := InvRMSV;
-    for ChannelCnt := 0 to DepthM1 do
-    begin
-      XHat := FOutput.FData[BaseIdx + ChannelCnt] * InvRMSV;
-      FNormalized.FData[BaseIdx + ChannelCnt] := XHat;
-      FOutput.FData[BaseIdx + ChannelCnt] := Gain.FData[ChannelCnt] * XHat;
-    end;
+    // x_hat = x * invRMS  (store normalized, then overwrite FOutput in place).
+    system.Move(XPtr^, XHatPtr^, Depth * SizeOf(TNeuralFloat));
+    TNNetVolume.Mul(XHatPtr, InvRMSV, Depth);
+    // FOutput = gain .* x_hat  (elementwise multiply over the depth segment).
+    system.Move(XHatPtr^, OutPtr^, Depth * SizeOf(TNeuralFloat));
+    TNNetVolume.Mul(OutPtr, GainPtr, Depth);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -54126,29 +54134,38 @@ end;
 procedure TNNetTokenRMSNorm.Backpropagate();
 var
   StartTime: double;
-  Depth, TokenCnt, TokenMax, ChannelCnt, BaseIdx, DepthM1: integer;
-  SumDxHatXHat, DxHat, InvRMSV: TNeuralFloat;
+  Depth, TokenCnt, TokenMax, BaseIdx: integer;
+  SumDxHatXHat, InvRMSV: TNeuralFloat;
   Gain: TNNetVolume;
+  GainPtr, DeltaPtr, ScratchPtr: TNeuralFloatArrPtr;
+  OEPtr, NormPtr, DxHatPtr, PrevErrPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
   StartTime := Now();
   Depth := FOutput.Depth;
+  // Per-token segments are depth-contiguous, so each reduction / accumulate
+  // runs through the AVX-vectorized TNNetVolume primitives (mirrors
+  // TNNetL2Normalize.BackpropagatePerDepth).
   TokenMax := (FOutput.Size div Depth) - 1;
-  DepthM1 := Depth - 1;
   Gain := FNeurons[0].FWeights;
+  GainPtr := Gain.GetRawPtr();
+  DeltaPtr := FNeurons[0].FDelta.GetRawPtr();
+  ScratchPtr := FGainGradScratch.GetRawPtr();
   // Gain gradient accumulates over all tokens:
   //   d(gain)[c] = sum_t OutputError[t,c] * x_hat[t,c]
+  // Accumulate the (positive) elementwise product sum into a depth scratch via
+  // the 3-pointer MulAdd (scratch += OE .* x_hat), then fold the -LR scale into
+  // FDelta in one vectorized MulAdd to preserve the exact scalar semantics.
+  FGainGradScratch.Fill(0);
   for TokenCnt := 0 to TokenMax do
   begin
     BaseIdx := TokenCnt * Depth;
-    for ChannelCnt := 0 to DepthM1 do
-      FNeurons[0].FDelta.FData[ChannelCnt] :=
-        FNeurons[0].FDelta.FData[ChannelCnt] - FLearningRate *
-        FOutputError.FData[BaseIdx + ChannelCnt] *
-        FNormalized.FData[BaseIdx + ChannelCnt];
+    TNNetVolume.MulAdd(ScratchPtr,
+      FOutputError.GetRawPtr(BaseIdx), FNormalized.GetRawPtr(BaseIdx), Depth);
   end;
+  TNNetVolume.MulAdd(DeltaPtr, ScratchPtr, -FLearningRate, Depth);
   if (not FBatchUpdate) then
   begin
     FNeurons[0].UpdateWeights(FInertia);
@@ -54164,23 +54181,18 @@ begin
     begin
       BaseIdx := TokenCnt * Depth;
       InvRMSV := FInvRMS.FData[TokenCnt];
-      SumDxHatXHat := 0;
-      for ChannelCnt := 0 to DepthM1 do
-      begin
-        DxHat := FOutputError.FData[BaseIdx + ChannelCnt] *
-          Gain.FData[ChannelCnt];
-        FOutputErrorDeriv.FData[BaseIdx + ChannelCnt] := DxHat;
-        SumDxHatXHat := SumDxHatXHat +
-          DxHat * FNormalized.FData[BaseIdx + ChannelCnt];
-      end;
-      SumDxHatXHat := SumDxHatXHat / Depth;
-      for ChannelCnt := 0 to DepthM1 do
-      begin
-        FPrevLayer.FOutputError.FData[BaseIdx + ChannelCnt] :=
-          FPrevLayer.FOutputError.FData[BaseIdx + ChannelCnt] +
-          InvRMSV * ( FOutputErrorDeriv.FData[BaseIdx + ChannelCnt] -
-            FNormalized.FData[BaseIdx + ChannelCnt] * SumDxHatXHat );
-      end;
+      OEPtr := FOutputError.GetRawPtr(BaseIdx);
+      NormPtr := FNormalized.GetRawPtr(BaseIdx);
+      DxHatPtr := FOutputErrorDeriv.GetRawPtr(BaseIdx);
+      PrevErrPtr := FPrevLayer.FOutputError.GetRawPtr(BaseIdx);
+      // dxhat = OutputError .* gain  (elementwise over the depth segment).
+      system.Move(OEPtr^, DxHatPtr^, Depth * SizeOf(TNeuralFloat));
+      TNNetVolume.Mul(DxHatPtr, GainPtr, Depth);
+      // mean_c( dxhat * x_hat ) via the vectorized dot product.
+      SumDxHatXHat := TNNetVolume.DotProduct(DxHatPtr, NormPtr, Depth) / Depth;
+      // prevErr += invRMS*dxhat - (invRMS*mean)*x_hat
+      TNNetVolume.MulAdd(PrevErrPtr, DxHatPtr, InvRMSV, Depth);
+      TNNetVolume.MulAdd(PrevErrPtr, NormPtr, -(InvRMSV * SumDxHatXHat), Depth);
     end;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
