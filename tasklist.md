@@ -391,6 +391,23 @@ rather than acted on.
       int8 weight-only storage instead of dequantize-then-requantize (the
       k-quant Q4_K/Q6_K/Q5_K/Q2_K dequant-at-load READ path has landed in
       neural/neuralgguf.pas).
+- [ ] FP16 (half-precision) OpenCL compute path for the dot-product/matmul
+      offload. Every GEMM kernel in `neural/neural.cl` (cai_dot_product,
+      simpleGEMMT, myGEMM5/6) is FP32 today, and the landed FP16/BF16 weight
+      storage is RAM-only — compute still runs the FP32 kernels (tasklist
+      note above is explicit). For GPU LLM decode the binding constraint is
+      device memory bandwidth, so a `cl_khr_fp16`-guarded half-precision
+      kernel variant (FP16 device-side weight/input buffers, FP32 accumulate)
+      would roughly halve buffer traffic and lift throughput on GPUs that
+      advertise the extension. Scope: detect `cl_khr_fp16` at device init,
+      add an opt-in FP16 buffer/kernel path in neuralopencl.pas wired through
+      the existing TDotProductSharedKernel offload (reuse the
+      NewVAs/weight-residency machinery), keep the FP32 kernel as the
+      fallback when the extension is absent, and add a numerical test that
+      checks the FP16 result matches the FP32 path within a half-precision
+      tolerance on a fixed fixture. Distinct from the int8 work (this is a
+      GPU compute path, not CPU storage) and from FP16 weight storage (this
+      is the missing compute half).
 - [ ] Tokenizer follow-ups for neuralhftokenizer.pas:
       (b) DONE — raw SentencePiece .model protobuf path landed
       (LoadSentencePieceModel; hand-decoded ModelProto wire format, no
