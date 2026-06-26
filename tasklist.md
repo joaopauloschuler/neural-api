@@ -741,9 +741,11 @@ rather than acted on.
   - [ ] real-checkpoint smoke: synthesize a sentence with a downloaded
         `facebook/mms-tts-eng` / `kakao-enterprise/vits-ljs` and write it via
         `SaveVolumeToWav16` (offline + RAM-gated here, so deferred).
-- [ ] Kokoro StyleTTS2 text-to-speech importer (`BuildKokoroFromSafeTensors[Ex]` +
+- [X] Kokoro StyleTTS2 text-to-speech importer (`BuildKokoroFromSafeTensors[Ex]` +
       `ReadKokoroConfigFromJSONFile`/`KokoroConfigToString` + a `TKokoroConfig`
-      record + a `TNNetKokoro` channel-major holder) — the 82M Apache-licensed
+      record + a `TNNetKokoro` channel-major holder) — LANDED (TNNetAdaIN leaf,
+      TestKokoroSynthesisParity, tiny_kokoro* fixture, examples/KokoroTTS); only the
+      real-checkpoint + voice-pack `.pt` follow-up below remains open. The 82M Apache-licensed
       `hexgrad/Kokoro-82M` model, a top-ranked open TTS. Architecturally DISTINCT
       from the landed VITS importer (no conditional-prior normalizing flow, no
       stochastic duration, no monotonic alignment search): Kokoro is the StyleTTS2
