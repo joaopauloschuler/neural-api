@@ -1338,6 +1338,19 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       stack matches the concatenation of independent per-document MHA runs (the
       builder-level analogue of TestSegmentMaskMatchesUnpackedBaseline). KV-cache
       incremental decode stays intentionally unmasked (single-stream = one doc).
+- [ ] AVX-vectorize the `TNNetDeconvolution.Compute` overlap-add scatter
+      (the real transposed convolution landed in commit 6b3318c). The inner
+      `for id := 0 to MaxInD do acc := acc + W.Get(kx,ky,id) * Prev.Get(ix,iy,id)`
+      is a dot product over the contiguous depth axis — exactly the
+      depth-axis-contiguous pattern the AVX `TNNetVolume` primitives target, yet it
+      is currently a scalar loop. Replace it with the existing SIMD dot-product /
+      `MulAdd` path (mirror how `TNNetConvolution`'s forward already vectorizes its
+      depth reduction) and likewise vectorize the symmetric weight/input-gradient
+      depth loops in `TNNetDeconvolution.Backpropagate`. Transposed conv is the
+      upsampling workhorse of GAN generators, autoencoder/VQ decoders and
+      segmentation heads in this repo, so the scalar path is a real throughput
+      floor for image-generative workloads. Gate behind a bit-tolerance assert that
+      the vectorized output matches the current scalar result on a fixed fixture.
 
 ## Tests / numerical-gradient audit
 
