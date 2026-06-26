@@ -3953,6 +3953,116 @@ function BuildWav2Vec2FromSafeTensors(const FileName: string;
   NumSamples: integer; pTrainable: boolean = true): TNNet;
 
 // ---------------------------------------------------------------------------
+// MERT MUSIC-REPRESENTATION ENCODER IMPORT (model_type "mert_model" /
+// "music2vec", architectures ["MERTModel"], e.g. m-a-p/MERT-v1-95M) - the
+// first MUSIC-understanding encoder, the audio analogue of a frozen vision
+// backbone. MERT is a SELF-SUPERVISED encoder pretrained on a music target;
+// with the released MERT-v1-95M config (feature_extractor_cqt False,
+// attention_relax -1.0, deepnorm False, do_stable_layer_norm False) its
+// forward is architecturally IDENTICAL to HuBERT: a raw-waveform strided
+// 1-D conv feature extractor -> feature_projection (LayerNorm + Linear) ->
+// conv relative positional embedding + encoder LayerNorm -> POST-LN
+// transformer blocks (the exact Wav2Vec2/HuBERT trunk, REUSED here). It is
+// distinct from the Wav2Vec2/HuBERT SPEECH encoders only in its pretraining
+// TARGET (music) - and in HOW the embedding is read out.
+//
+// The MERT-specific piece is the WEIGHTED-LAYER-SUM music embedding: the
+// deep weighted sum over ALL transformer hidden states (the embeddings
+// output PLUS each of the N block outputs = N+1 states) with a learned
+// per-layer weight vector, softmax-normalized (HF use_weighted_layer_sum,
+// the *ForSequenceClassification layer_weights head). The base MERTModel
+// ships no layer_weights, so this importer keeps them in the config
+// (LayerWeights, default uniform); the builder records the N+1 hidden-state
+// layers in HiddenStateLayers (an out array) and MERTWeightedLayerSum pools
+// them after a Compute() into the fixed (1,1,hidden) music embedding used
+// for tagging / genre / similarity.
+//
+// Tensors live at the TOP level (no "hubert."/"wav2vec2." prefix), and there
+// is NO lm_head / CTC head - the net's last layer is the encoder
+// last_hidden_state. Coded by Claude (AI).
+type
+  // The NumLayers+1 transformer hidden-state layers the MERT builder records
+  // for the weighted-layer-sum embedding (output_hidden_states order).
+  TMERTHiddenStateArray = array of TNNetLayer;
+
+  TMERTConfig = record
+    HiddenSize: integer;        // hidden_size (d_model)
+    NumLayers: integer;         // num_hidden_layers (N; N+1 hidden states)
+    NumHeads: integer;          // num_attention_heads
+    IntermediateSize: integer;  // intermediate_size (FFN width)
+    LayerNormEps: TNeuralFloat; // layer_norm_eps (default 1e-5)
+    NumConvLayers: integer;     // num_feat_extract_layers (= Length(ConvDim))
+    ConvDim: array of integer;  // conv_dim (per-conv output channels)
+    ConvStride: array of integer; // conv_stride
+    ConvKernel: array of integer; // conv_kernel
+    ConvBias: boolean;          // conv_bias (false in MERT-v1-95M)
+    NumPosConvEmbeddings: integer; // num_conv_pos_embeddings (kernel; even)
+    NumPosConvGroups: integer;  // num_conv_pos_embedding_groups
+    SampleRate: integer;        // sample_rate (24000 for MERT-v1-95M)
+    ModelType: string;          // 'mert_model' / 'music2vec'
+    // The learned per-layer weights for the weighted-layer-sum embedding
+    // (RAW, pre-softmax; length NumLayers+1). Defaults to all-zero (uniform
+    // softmax = 1/(N+1) each) when the config omits "layer_weights".
+    LayerWeights: array of TNeuralFloat;
+  end;
+
+// Reads a HF MERT config.json (model_type "mert_model" / "music2vec").
+// Required: hidden_size, num_hidden_layers, num_attention_heads,
+// intermediate_size, conv_dim, conv_stride, conv_kernel. Defaults follow
+// MERT-v1-95M: layer_norm_eps 1e-5, conv_bias false,
+// num_conv_pos_embeddings 128, num_conv_pos_embedding_groups 16,
+// feat_extract_norm "group", do_stable_layer_norm false, hidden_act "gelu",
+// sample_rate 24000. Optional "layer_weights" (raw, pre-softmax; length
+// num_hidden_layers+1) seeds the weighted-layer-sum (else uniform). Rejects
+// the unsupported feature_extractor_cqt / attention_relax / deepnorm /
+// "layer"-norm (stable-layer-norm) variants loudly.
+function ReadMERTConfigFromJSONFile(const FileName: string): TMERTConfig;
+
+function MERTConfigToString(const Config: TMERTConfig): string;
+
+// Computes the encoder sequence length the conv feature extractor produces
+// for a raw clip of NumSamples samples (identical conv arithmetic to
+// Wav2Vec2EncoderLength).
+function MERTEncoderLength(const Config: TMERTConfig;
+  NumSamples: integer): integer;
+
+// Builds the MERT music encoder described by Config: a single TNNetInput
+// (NumSamples,1,1) raw waveform in, (EncLen,1,hidden) last_hidden_state out
+// (EncLen = MERTEncoderLength(Config, NumSamples)), loading every weight from
+// the checkpoint at FileName. HiddenStateLayers returns the NumLayers+1
+// hidden-state layers (the encoder input after pos-conv+LayerNorm, then each
+// block's output) in the SAME order HF collects output_hidden_states - feed
+// them to MERTWeightedLayerSum after a Compute() to get the music embedding.
+// pTrainable = False frees training volumes during construction.
+function BuildMERTFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TMERTConfig; NumSamples: integer;
+  out HiddenStateLayers: TMERTHiddenStateArray;
+  pTrainable: boolean = true): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildMERTFromSafeTensorsEx(const FileName: string;
+  out Config: TMERTConfig; NumSamples: integer;
+  out HiddenStateLayers: TMERTHiddenStateArray;
+  pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildMERTFromSafeTensors(const FileName: string;
+  NumSamples: integer; pTrainable: boolean = true): TNNet;
+
+// Pools the NumLayers+1 transformer hidden states (each (EncLen,1,hidden),
+// taken from HiddenStateLayers[k].Output AFTER a Compute()) into the MERT
+// music embedding: a per-frame weighted-layer-sum with the softmax of
+// Config.LayerWeights, then a mean over the EncLen frames (the HF
+// *ForSequenceClassification pooled_output: weighted-layer-sum then mean
+// over the time axis). Embedding is resized to (1,1,hidden). Set
+// MeanPool = False to return the per-frame weighted sum (EncLen,1,hidden)
+// instead (the raw deep feature sequence, HF's pre-pooling hidden_states).
+procedure MERTWeightedLayerSum(const Config: TMERTConfig;
+  const HiddenStateLayers: TMERTHiddenStateArray; Embedding: TNNetVolume;
+  MeanPool: boolean = true);
+
+// ---------------------------------------------------------------------------
 // PYANNOTE SPEAKER-DIARIZATION IMPORT (model_type "pyannote", e.g.
 // pyannote/segmentation-3.0) - the FIRST "who speaks when" model: frame-level
 // MULTI-speaker activity, deliberately distinct from the transcription / CTC
@@ -34746,6 +34856,585 @@ var
 begin
   Result := BuildWav2Vec2FromSafeTensorsEx(FileName, Config, NumSamples,
     pTrainable);
+end;
+
+// ===========================================================================
+// MERT MUSIC-REPRESENTATION ENCODER IMPORT - see the interface header.
+// MERT-v1-95M (cqt off, attention_relax -1, deepnorm off) == HuBERT forward;
+// the conv front-end + POST-LN transformer trunk reuse the EXACT Wav2Vec2 /
+// HuBERT block math and weight loaders. The only deltas are: tensors at the
+// TOP level (no prefix), NO CTC head, the N+1 hidden-state layers recorded
+// for the weighted-layer-sum, and the music-embedding pooling helper.
+// ===========================================================================
+
+function ReadMERTConfigFromJSONFile(const FileName: string): TMERTConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, FeatNorm, ActFn: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('MERT import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('MERT import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+  procedure RequiredIntArray(const FieldName: string;
+    var Dst: array of integer; ExpectLen: integer);
+  var
+    Arr: TJSONArray;
+    k, ExpectM1: integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('MERT import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    if not (Obj.Find(FieldName) is TJSONArray) then
+      ImportError('MERT import: config field "' + FieldName +
+        '" must be an array.');
+    Arr := TJSONArray(Obj.Find(FieldName));
+    if Arr.Count <> ExpectLen then
+      ImportError('MERT import: config field "' + FieldName +
+        '" must have ' + IntToStr(ExpectLen) + ' entries (matching ' +
+        'conv_dim), got ' + IntToStr(Arr.Count) + '.');
+    ExpectM1 := ExpectLen - 1;
+    for k := 0 to ExpectM1 do
+    begin
+      Dst[k] := Arr.Items[k].AsInteger;
+      if Dst[k] <= 0 then
+        ImportError('MERT import: config "' + FieldName + '"[' +
+          IntToStr(k) + '] must be a positive integer.');
+    end;
+  end;
+
+var
+  Arr: TJSONArray;
+  k, NumConvM1, NumStates, NumStatesM1: integer;
+  AttnRelax: double;
+begin
+  if not FileExists(FileName) then
+    ImportError('MERT import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('MERT import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('MERT import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'mert_model');
+    if (ModelType <> 'mert_model') and (ModelType <> 'mert') and
+       (ModelType <> 'music2vec') then
+      ImportError('MERT import: config model_type is "' + ModelType +
+        '" - only "mert_model" / "mert" / "music2vec" are supported here.');
+    Result.ModelType := ModelType;
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1e-5);
+    Result.SampleRate := Obj.Get('sample_rate', 24000);
+    // conv_dim is the spine: conv_stride / conv_kernel must match its length.
+    if Obj.IndexOfName('conv_dim') < 0 then
+      ImportError('MERT import: config "' + FileName +
+        '" is missing the required field "conv_dim".');
+    if not (Obj.Find('conv_dim') is TJSONArray) then
+      ImportError('MERT import: config field "conv_dim" must be an array.');
+    Arr := TJSONArray(Obj.Find('conv_dim'));
+    Result.NumConvLayers := Arr.Count;
+    if Result.NumConvLayers < 1 then
+      ImportError('MERT import: conv_dim must be a non-empty array.');
+    SetLength(Result.ConvDim, Result.NumConvLayers);
+    SetLength(Result.ConvStride, Result.NumConvLayers);
+    SetLength(Result.ConvKernel, Result.NumConvLayers);
+    NumConvM1 := Result.NumConvLayers - 1;
+    for k := 0 to NumConvM1 do
+    begin
+      Result.ConvDim[k] := Arr.Items[k].AsInteger;
+      if Result.ConvDim[k] <= 0 then
+        ImportError('MERT import: conv_dim[' + IntToStr(k) +
+          '] must be a positive integer.');
+    end;
+    RequiredIntArray('conv_stride', Result.ConvStride, Result.NumConvLayers);
+    RequiredIntArray('conv_kernel', Result.ConvKernel, Result.NumConvLayers);
+    Result.ConvBias := Obj.Get('conv_bias', False);
+    Result.NumPosConvEmbeddings := Obj.Get('num_conv_pos_embeddings', 128);
+    Result.NumPosConvGroups := Obj.Get('num_conv_pos_embedding_groups', 16);
+    if Odd(Result.NumPosConvEmbeddings) then
+      ImportError('MERT import: num_conv_pos_embeddings must be EVEN ' +
+        '(the SamePad crop drops the extra frame an even kernel emits).');
+    if (Result.NumPosConvGroups < 1) or
+       (Result.HiddenSize mod Result.NumPosConvGroups <> 0) then
+      ImportError('MERT import: num_conv_pos_embedding_groups must divide ' +
+        'hidden_size.');
+    // Only the MERT-v1-95M base path is supported (the released checkpoint).
+    if Obj.Get('feature_extractor_cqt', False) then
+      ImportError('MERT import: feature_extractor_cqt=true (the MERT-v1-330M ' +
+        'CQT-fused front-end) is not supported yet - a documented follow-up.');
+    AttnRelax := Obj.Get('attention_relax', -1.0);
+    if AttnRelax > 0 then
+      ImportError('MERT import: attention_relax=' + FloatToStr(AttnRelax) +
+        ' (the HubertEncoder_extend relaxed-attention variant) is not ' +
+        'supported - the released MERT-v1-95M uses attention_relax=-1.0.');
+    if Obj.Get('deepnorm', False) then
+      ImportError('MERT import: deepnorm=true is not supported - the ' +
+        'released MERT-v1-95M uses deepnorm=false.');
+    if Obj.Get('do_stable_layer_norm', False) then
+      ImportError('MERT import: do_stable_layer_norm=true (the pre-norm ' +
+        'stable-layer-norm variant) is not supported yet - a follow-up.');
+    if not Obj.Get('feat_proj_layer_norm', True) then
+      ImportError('MERT import: feat_proj_layer_norm=false is not supported ' +
+        '- the released MERT-v1-95M projects through a feature LayerNorm.');
+    FeatNorm := Obj.Get('feat_extract_norm', 'group');
+    if FeatNorm <> 'group' then
+      ImportError('MERT import: feat_extract_norm "' + FeatNorm +
+        '" is not supported - only the "group" (MERT-v1-95M) variant is ' +
+        'implemented.');
+    ActFn := Obj.Get('hidden_act', 'gelu');
+    if ActFn <> 'gelu' then
+      ImportError('MERT import: hidden_act "' + ActFn + '" is not ' +
+        'supported - the released MERT checkpoints use exact erf "gelu".');
+    // Weighted-layer-sum weights (raw, pre-softmax; length NumLayers+1).
+    // Default uniform (all zero -> softmax = 1/(N+1)) when absent.
+    NumStates := Result.NumLayers + 1;
+    NumStatesM1 := NumStates - 1;
+    SetLength(Result.LayerWeights, NumStates);
+    for k := 0 to NumStatesM1 do Result.LayerWeights[k] := 0;
+    if Obj.IndexOfName('layer_weights') >= 0 then
+    begin
+      if not (Obj.Find('layer_weights') is TJSONArray) then
+        ImportError('MERT import: config field "layer_weights" must be an ' +
+          'array.');
+      Arr := TJSONArray(Obj.Find('layer_weights'));
+      if Arr.Count <> NumStates then
+        ImportError('MERT import: "layer_weights" must have ' +
+          IntToStr(NumStates) + ' entries (num_hidden_layers+1), got ' +
+          IntToStr(Arr.Count) + '.');
+      for k := 0 to NumStatesM1 do
+        Result.LayerWeights[k] := Arr.Items[k].AsFloat;
+    end;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function MERTConfigToString(const Config: TMERTConfig): string;
+var
+  k, NumConvM1: integer;
+  Dims, Strides, Kernels: string;
+begin
+  Dims := ''; Strides := ''; Kernels := '';
+  NumConvM1 := Config.NumConvLayers - 1;
+  for k := 0 to NumConvM1 do
+  begin
+    if k > 0 then begin Dims := Dims + ','; Strides := Strides + ',';
+      Kernels := Kernels + ','; end;
+    Dims := Dims + IntToStr(Config.ConvDim[k]);
+    Strides := Strides + IntToStr(Config.ConvStride[k]);
+    Kernels := Kernels + IntToStr(Config.ConvKernel[k]);
+  end;
+  Result := 'MERTConfig(model_type=' + Config.ModelType +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', inter=' + IntToStr(Config.IntermediateSize) +
+    ', conv_dim=[' + Dims + ']' +
+    ', conv_stride=[' + Strides + ']' +
+    ', conv_kernel=[' + Kernels + ']' +
+    ', conv_bias=' + BoolToStr(Config.ConvBias, True) +
+    ', pos_conv=' + IntToStr(Config.NumPosConvEmbeddings) +
+    '/' + IntToStr(Config.NumPosConvGroups) +
+    ', sample_rate=' + IntToStr(Config.SampleRate) +
+    ', weighted_layer_sum=' + IntToStr(Config.NumLayers + 1) + ' states)';
+end;
+
+function MERTEncoderLength(const Config: TMERTConfig;
+  NumSamples: integer): integer;
+var
+  k, NumConvM1: integer;
+begin
+  Result := NumSamples;
+  NumConvM1 := Config.NumConvLayers - 1;
+  for k := 0 to NumConvM1 do
+  begin
+    if Result < Config.ConvKernel[k] then
+      ImportError('MERT import: NumSamples=' + IntToStr(NumSamples) +
+        ' is too short - conv layer ' + IntToStr(k) + ' (kernel ' +
+        IntToStr(Config.ConvKernel[k]) + ') has no valid window.');
+    Result := (Result - Config.ConvKernel[k]) div Config.ConvStride[k] + 1;
+  end;
+  if Result < Config.NumPosConvEmbeddings then
+    ImportError('MERT import: encoder length ' + IntToStr(Result) +
+      ' for NumSamples=' + IntToStr(NumSamples) + ' is shorter than the ' +
+      'positional conv kernel ' + IntToStr(Config.NumPosConvEmbeddings) +
+      ' - feed a longer clip.');
+end;
+
+function BuildMERTFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TMERTConfig; NumSamples: integer;
+  out HiddenStateLayers: TMERTHiddenStateArray;
+  pTrainable: boolean = true): TNNet;
+var
+  ReaderMax: integer;
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  QKV, AttnDense, AttnLN, Inter, OutDense, OutLN: array of TNNetLayer;
+  ConvLayer, ConvGN: array of TNNetLayer;
+  FeatProjLN, FeatProj, PosConv, EncLN: TNNetLayer;
+  BranchInput, HiddenAct, PhiBranch, FeatInput, PreEncoder: TNNetLayer;
+  EncLen, InLen, BlockCnt, i, k, Pad: integer;
+  NumConvLayersM1, NumLayersM1: integer;
+  ConvPrefix, EncPrefix, BlockPrefix, TensorNameStr: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation -------------
+      if Config.NumHeads < 1 then
+        ImportError('MERT import: num_attention_heads must be >= 1.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('MERT import: hidden_size=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+          'num_attention_heads=' + IntToStr(Config.NumHeads) + '.');
+      // MERTModel tensors live at the TOP level (no "hubert."/"wav2vec2."
+      // prefix - the MERTModel IS the backbone), and there is NO CTC head.
+      if not Reader.HasTensor('feature_projection.projection.weight') then
+        ImportError('MERT import: "feature_projection.projection.weight" ' +
+          'not found in ' + Reader.FileName + ' - not a MERTModel ' +
+          'checkpoint?');
+      EncLen := MERTEncoderLength(Config, NumSamples);
+      NumConvLayersM1 := Config.NumConvLayers - 1;
+      NumLayersM1 := Config.NumLayers - 1;
+
+      // ---------------- Architecture (the HuBERT trunk) ----------------
+      NN := TNNet.Create();
+      FeatInput := NN.AddLayer( TNNetInput.Create(NumSamples, 1, 1) );
+      if FeatInput = nil then ; // (silence the unused-result warning)
+      SetLength(ConvLayer, Config.NumConvLayers);
+      SetLength(ConvGN, Config.NumConvLayers);
+      InLen := NumSamples;
+      for k := 0 to NumConvLayersM1 do
+      begin
+        ConvLayer[k] := NN.AddLayer( TNNetConvolutionLinear.Create(
+          Config.ConvDim[k], Config.ConvKernel[k], {Padding=}0,
+          Config.ConvStride[k], {SuppressBias=}1).SetTrainable(pTrainable) );
+        InLen := (InLen - Config.ConvKernel[k]) div Config.ConvStride[k] + 1;
+        if k = 0 then
+          // GroupNorm with num_groups = num_channels (the "group"
+          // feat_extract_norm): each channel its own group over the time axis.
+          ConvGN[k] := NN.AddLayer( TNNetGroupNorm.Create(Config.ConvDim[k]) );
+        AddWhisperExactGelu(NN); // exact erf GELU (feat_extract_activation)
+      end;
+      // Feature projection: LayerNorm then Linear C[-1] -> hidden.
+      FeatProjLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+      FeatProj := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
+      PreEncoder := NN.GetLastLayer();
+      // Positional conv embedding (grouped conv1d, even kernel + SamePad crop).
+      Pad := Config.NumPosConvEmbeddings div 2;
+      NN.AddLayer( TNNetPadXY.Create(Pad, 0) );
+      PosConv := NN.AddLayer( TNNetGroupedConvolutionLinear.Create(
+        Config.HiddenSize, Config.NumPosConvEmbeddings, {Padding=}0,
+        {Stride=}1, Config.NumPosConvGroups) );
+      NN.AddLayer( TNNetCrop.Create(0, 0, EncLen, 1) );
+      AddWhisperExactGelu(NN);
+      // hidden := encoder.layer_norm( projected_features + pos_embed ).
+      NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), PreEncoder]) );
+      EncLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
+      // The N+1 hidden states fed to the weighted-layer-sum: state 0 is the
+      // encoder input AFTER pos-conv add + LayerNorm (HF all_hidden_states[0],
+      // collected BEFORE block 0), states 1..N are each block's output.
+      SetLength(HiddenStateLayers, Config.NumLayers + 1);
+      HiddenStateLayers[0] := EncLN;
+      // ----- POST-LN transformer encoder blocks (BERT block math). -------
+      SetLength(QKV, Config.NumLayers);
+      SetLength(AttnDense, Config.NumLayers);
+      SetLength(AttnLN, Config.NumLayers);
+      SetLength(Inter, Config.NumLayers);
+      SetLength(OutDense, Config.NumLayers);
+      SetLength(OutLN, Config.NumLayers);
+      for BlockCnt := 0 to NumLayersM1 do
+      begin
+        BranchInput := NN.GetLastLayer();
+        QKV[BlockCnt] := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable) );
+        AttnDense[BlockCnt] := NN.AddMultiHeadSelfAttention(
+          Config.NumHeads, {CausalMask=}false);
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        AttnLN[BlockCnt] := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+        BranchInput := NN.GetLastLayer();
+        Inter[BlockCnt] := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
+        HiddenAct := NN.GetLastLayer();
+        NN.AddLayerAfter(
+          TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
+        NN.AddLayer( TNNetErf.Create() );
+        NN.AddLayer( TNNetAddConstant.Create(1.0) );
+        PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+        NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
+        NN.AddLayer( TNNetReGLU.Create() );
+        OutDense[BlockCnt] := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        OutLN[BlockCnt] := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+        HiddenStateLayers[BlockCnt + 1] := OutLN[BlockCnt];
+        if not pTrainable then NN.SetTrainable();
+      end;
+      // NO CTC head: the net's last layer is the encoder last_hidden_state.
+
+      // ---------------- Weights ----------------
+      ConvPrefix := 'feature_extractor.conv_layers.';
+      for k := 0 to NumConvLayersM1 do
+      begin
+        if k = 0 then InLen := 1 else InLen := Config.ConvDim[k - 1];
+        LoadWav2Vec2FeatureConv(Reader, ConvLayer[k],
+          ConvPrefix + IntToStr(k) + '.conv.weight',
+          InLen, Config.ConvDim[k], Config.ConvKernel[k], Consumed);
+        if k = 0 then
+        begin
+          LoadLayerNormWeights(Reader, ConvGN[0],
+            ConvPrefix + '0.layer_norm.weight',
+            ConvPrefix + '0.layer_norm.bias', Config.ConvDim[0]);
+          MarkConsumed(ConvPrefix + '0.layer_norm.weight');
+          MarkConsumed(ConvPrefix + '0.layer_norm.bias');
+        end;
+      end;
+      LoadLayerNormWeights(Reader, FeatProjLN,
+        'feature_projection.layer_norm.weight',
+        'feature_projection.layer_norm.bias',
+        Config.ConvDim[Config.NumConvLayers - 1]);
+      MarkConsumed('feature_projection.layer_norm.weight');
+      MarkConsumed('feature_projection.layer_norm.bias');
+      LoadLlamaLinearWeights(Reader, FeatProj,
+        'feature_projection.projection.weight',
+        Config.ConvDim[Config.NumConvLayers - 1], Config.HiddenSize, 0, -1, 0,
+        'feature_projection.projection.bias');
+      MarkConsumed('feature_projection.projection.weight');
+      MarkConsumed('feature_projection.projection.bias');
+      EncPrefix := 'encoder.';
+      LoadWav2Vec2PosConv(Reader, PosConv,
+        EncPrefix + 'pos_conv_embed.conv.parametrizations.weight.original0',
+        EncPrefix + 'pos_conv_embed.conv.parametrizations.weight.original1',
+        EncPrefix + 'pos_conv_embed.conv.bias',
+        Config.HiddenSize, Config.NumPosConvGroups,
+        Config.NumPosConvEmbeddings, Consumed);
+      LoadLayerNormWeights(Reader, EncLN,
+        EncPrefix + 'layer_norm.weight', EncPrefix + 'layer_norm.bias',
+        Config.HiddenSize);
+      MarkConsumed(EncPrefix + 'layer_norm.weight');
+      MarkConsumed(EncPrefix + 'layer_norm.bias');
+      for BlockCnt := 0 to NumLayersM1 do
+      begin
+        BlockPrefix := EncPrefix + 'layers.' + IntToStr(BlockCnt) + '.';
+        LoadLlamaLinearWeights(Reader, QKV[BlockCnt],
+          BlockPrefix + 'attention.q_proj.weight',
+          Config.HiddenSize, Config.HiddenSize, 0, 3 * Config.HiddenSize, 0,
+          BlockPrefix + 'attention.q_proj.bias');
+        MarkConsumed(BlockPrefix + 'attention.q_proj.weight');
+        MarkConsumed(BlockPrefix + 'attention.q_proj.bias');
+        LoadLlamaLinearWeights(Reader, QKV[BlockCnt],
+          BlockPrefix + 'attention.k_proj.weight',
+          Config.HiddenSize, Config.HiddenSize, Config.HiddenSize,
+          3 * Config.HiddenSize, 0, BlockPrefix + 'attention.k_proj.bias');
+        MarkConsumed(BlockPrefix + 'attention.k_proj.weight');
+        MarkConsumed(BlockPrefix + 'attention.k_proj.bias');
+        LoadLlamaLinearWeights(Reader, QKV[BlockCnt],
+          BlockPrefix + 'attention.v_proj.weight',
+          Config.HiddenSize, Config.HiddenSize, 2 * Config.HiddenSize,
+          3 * Config.HiddenSize, 0, BlockPrefix + 'attention.v_proj.bias');
+        MarkConsumed(BlockPrefix + 'attention.v_proj.weight');
+        MarkConsumed(BlockPrefix + 'attention.v_proj.bias');
+        LoadLlamaLinearWeights(Reader, AttnDense[BlockCnt],
+          BlockPrefix + 'attention.out_proj.weight',
+          Config.HiddenSize, Config.HiddenSize, 0, -1, 0,
+          BlockPrefix + 'attention.out_proj.bias');
+        MarkConsumed(BlockPrefix + 'attention.out_proj.weight');
+        MarkConsumed(BlockPrefix + 'attention.out_proj.bias');
+        LoadLayerNormWeights(Reader, AttnLN[BlockCnt],
+          BlockPrefix + 'layer_norm.weight', BlockPrefix + 'layer_norm.bias',
+          Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'layer_norm.weight');
+        MarkConsumed(BlockPrefix + 'layer_norm.bias');
+        LoadLlamaLinearWeights(Reader, Inter[BlockCnt],
+          BlockPrefix + 'feed_forward.intermediate_dense.weight',
+          Config.HiddenSize, Config.IntermediateSize, 0, -1, 0,
+          BlockPrefix + 'feed_forward.intermediate_dense.bias');
+        MarkConsumed(BlockPrefix + 'feed_forward.intermediate_dense.weight');
+        MarkConsumed(BlockPrefix + 'feed_forward.intermediate_dense.bias');
+        LoadLlamaLinearWeights(Reader, OutDense[BlockCnt],
+          BlockPrefix + 'feed_forward.output_dense.weight',
+          Config.IntermediateSize, Config.HiddenSize, 0, -1, 0,
+          BlockPrefix + 'feed_forward.output_dense.bias');
+        MarkConsumed(BlockPrefix + 'feed_forward.output_dense.weight');
+        MarkConsumed(BlockPrefix + 'feed_forward.output_dense.bias');
+        LoadLayerNormWeights(Reader, OutLN[BlockCnt],
+          BlockPrefix + 'final_layer_norm.weight',
+          BlockPrefix + 'final_layer_norm.bias', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'final_layer_norm.weight');
+        MarkConsumed(BlockPrefix + 'final_layer_norm.bias');
+      end;
+
+      // ---------------- Unexpected-tensor check ----------------
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        // masked_spec_embed: a pretraining-only SpecAugment mask buffer,
+        // never read at inference - a known ignorable.
+        if Pos('masked_spec_embed', TensorNameStr) > 0 then continue;
+        // The downstream classifier head (projector / classifier /
+        // layer_weights) is absent from the base MERTModel; if a fused
+        // checkpoint carries it, ignore those (we read layer_weights from
+        // the config, not the checkpoint).
+        if Pos('layer_weights', TensorNameStr) > 0 then continue;
+        if Pos('projector', TensorNameStr) > 0 then continue;
+        if Pos('classifier', TensorNameStr) > 0 then continue;
+        ImportError('MERT import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free; // non-nil only if an exception unwound the build
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildMERTFromSafeTensorsEx(const FileName: string;
+  out Config: TMERTConfig; NumSamples: integer;
+  out HiddenStateLayers: TMERTHiddenStateArray;
+  pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadMERTConfigFromJSONFile(ConfigPath);
+  Result := BuildMERTFromSafeTensorsWithConfig(FileName, Config,
+    NumSamples, HiddenStateLayers, pTrainable);
+end;
+
+function BuildMERTFromSafeTensors(const FileName: string;
+  NumSamples: integer; pTrainable: boolean = true): TNNet;
+var
+  Config: TMERTConfig;
+  HiddenStateLayers: TMERTHiddenStateArray;
+begin
+  Result := BuildMERTFromSafeTensorsEx(FileName, Config, NumSamples,
+    HiddenStateLayers, pTrainable);
+end;
+
+procedure MERTWeightedLayerSum(const Config: TMERTConfig;
+  const HiddenStateLayers: TMERTHiddenStateArray; Embedding: TNNetVolume;
+  MeanPool: boolean = true);
+var
+  NumStates, NumStatesM1, EncLen, Hidden, s, t, c, idx: integer;
+  EncLenM1, HiddenM1: integer;
+  W: array of TNeuralFloat;
+  MaxW, SumExp, Acc: TNeuralFloat;
+  Seq: TNNetVolume;
+begin
+  NumStates := Length(HiddenStateLayers);
+  if NumStates <> Config.NumLayers + 1 then
+    ImportError('MERT weighted sum: HiddenStateLayers has ' +
+      IntToStr(NumStates) + ' states, expected ' +
+      IntToStr(Config.NumLayers + 1) + ' (num_hidden_layers+1).');
+  if Length(Config.LayerWeights) <> NumStates then
+    ImportError('MERT weighted sum: Config.LayerWeights has ' +
+      IntToStr(Length(Config.LayerWeights)) + ' entries, expected ' +
+      IntToStr(NumStates) + '.');
+  NumStatesM1 := NumStates - 1;
+  EncLen := HiddenStateLayers[0].Output.SizeX;
+  Hidden := HiddenStateLayers[0].Output.Depth;
+  EncLenM1 := EncLen - 1;
+  HiddenM1 := Hidden - 1;
+  // Softmax over the N+1 raw layer weights (numerically stable).
+  SetLength(W, NumStates);
+  MaxW := Config.LayerWeights[0];
+  for s := 1 to NumStatesM1 do
+    if Config.LayerWeights[s] > MaxW then MaxW := Config.LayerWeights[s];
+  SumExp := 0;
+  for s := 0 to NumStatesM1 do
+  begin
+    W[s] := Exp(Config.LayerWeights[s] - MaxW);
+    SumExp := SumExp + W[s];
+  end;
+  if SumExp = 0 then SumExp := 1;
+  for s := 0 to NumStatesM1 do W[s] := W[s] / SumExp;
+  // Per-frame weighted sum over the N+1 hidden states into Seq (EncLen,1,H).
+  Seq := TNNetVolume.Create;
+  try
+    Seq.ReSize(EncLen, 1, Hidden);
+    Seq.Fill(0);
+    for s := 0 to NumStatesM1 do
+    begin
+      if (HiddenStateLayers[s].Output.SizeX <> EncLen) or
+         (HiddenStateLayers[s].Output.Depth <> Hidden) then
+        ImportError('MERT weighted sum: hidden state ' + IntToStr(s) +
+          ' shape mismatch.');
+      for idx := 0 to EncLen * Hidden - 1 do
+        Seq.FData[idx] := Seq.FData[idx] +
+          W[s] * HiddenStateLayers[s].Output.FData[idx];
+    end;
+    if MeanPool then
+    begin
+      // Mean over the EncLen frames -> (1,1,H) music embedding.
+      Embedding.ReSize(1, 1, Hidden);
+      Embedding.Fill(0);
+      for c := 0 to HiddenM1 do
+      begin
+        Acc := 0;
+        for t := 0 to EncLenM1 do Acc := Acc + Seq.FData[t * Hidden + c];
+        Embedding.FData[c] := Acc / EncLen;
+      end;
+    end
+    else
+    begin
+      Embedding.ReSize(EncLen, 1, Hidden);
+      for idx := 0 to EncLen * Hidden - 1 do
+        Embedding.FData[idx] := Seq.FData[idx];
+    end;
+  finally
+    Seq.Free;
+  end;
 end;
 
 // ===========================================================================

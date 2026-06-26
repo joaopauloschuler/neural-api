@@ -788,18 +788,35 @@ rather than acted on.
       input. Depends on the DAC importer landing first. Pico parity `< 1e-4` vs a
       float64 oracle (`tools/make_pico_parler_fixture.py`, `TestParlerTTSParity`),
       `examples/ParlerTTS`.
-- [ ] MERT music-representation encoder importer (`BuildMERTFromSafeTensors[Ex]` +
-      `TMERTConfig`, model_type `mert`/`music2vec`, e.g. m-a-p/MERT-v1-95M) — a
+- [X] MERT music-representation encoder importer (`BuildMERTFromSafeTensors[Ex]` +
+      `TMERTConfig`, model_type `mert_model`/`music2vec`, e.g. m-a-p/MERT-v1-95M) — a
       self-supervised MUSIC understanding encoder (the audio analogue of a frozen
-      vision backbone): a HuBERT-style 1D-conv feature front-end (reuse the Wav2Vec2
-      conv encoder already in-tree) + a transformer trunk, exposing the deep
-      weighted-layer-sum of hidden states as a fixed music embedding for tagging /
-      genre / similarity. Distinct from the Wav2Vec2/Whisper SPEECH encoders (music
-      pretraining target, mel+CQT reconstruction heads) and gives the repo a music
-      EMBEDDING capability it lacks. Pico parity `< 1e-4` vs the real `transformers`
-      `MERT`/`Wav2Vec2` float64 forward on a sliced fixture (the `make_pico_*` slicer
-      pattern), `TestMERTParity`, `examples/MusicTagging` printing the embedding +
-      cosine similarity between two synthesized clips.
+      vision backbone): a HuBERT-style 1D-conv feature front-end + transformer trunk,
+      exposing the deep weighted-layer-sum of hidden states as a fixed music
+      embedding. LANDED (`neuralpretrained.pas`): verified MERT-v1-95M (config
+      `feature_extractor_cqt=false`, `attention_relax=-1.0`, `deepnorm=false`,
+      `do_stable_layer_norm=false`) is architecturally IDENTICAL to HuBERT for the
+      forward, so the importer is PURE REUSE of the Wav2Vec2/HuBERT conv front-end +
+      POST-LN transformer trunk (`LoadWav2Vec2FeatureConv`/`LoadWav2Vec2PosConv`/
+      `LoadLlamaLinearWeights`/`LoadLayerNormWeights`) — NO new leaf layer. Deltas:
+      tensors at the TOP level (no `hubert.`/`wav2vec2.` prefix — MERTModel IS the
+      backbone), NO CTC head, and the MERT-specific WEIGHTED-LAYER-SUM
+      (`use_weighted_layer_sum`): the builder records the `num_hidden_layers+1`
+      hidden-state layers in an out array and `MERTWeightedLayerSum` pools them with
+      the softmax of `TMERTConfig.LayerWeights` (default uniform; base MERTModel ships
+      none) then a mean over frames (the HF `*ForSequenceClassification`
+      pooled_output). `ReadMERTConfigFromJSONFile`/`MERTConfigToString`/
+      `MERTEncoderLength`. Fixture is a committed RE-RANDOMIZED pico
+      HubertModel-with-weighted-layer-sum float64 oracle (`tools/
+      make_pico_mert_fixture.py` → `tests/fixtures/tiny_mert.*`; the real
+      m-a-p/MERT-v1-95M `pytorch_model.bin` download is a deferred follow-up).
+      `TestMERTParity` (+ `TestMERTConfigFromJSONFile`) pins the last_hidden_state
+      (max|diff| 2.27e-6), EACH raw transformer hidden state (2.56e-6, catches a
+      trunk transpose), AND the weighted-layer-sum embedding (2.40e-6) — all `< 1e-4`.
+      `examples/MusicTagging` prints the embedding + `CosineSimilarity` of two
+      synthesized clips. Follow-ups: MERT-v1-330M CQT-fused front-end
+      (`feature_extractor_cqt=true`), relaxed-attention / DeepNorm variants, and the
+      real-checkpoint download (all loudly rejected for now).
 - [ ] VITS / MMS-TTS end-to-end text-to-speech importer (`BuildVitsFromSafeTensors[Ex]`
       LANDED + `ReadVitsConfigFromJSONFile`/`VitsConfigToString` + the `TVitsConfig`
       record + the `TNNetVits` channel-major holder (Analyze / ExpandPrior /

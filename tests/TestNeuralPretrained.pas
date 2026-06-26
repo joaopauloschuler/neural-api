@@ -279,6 +279,8 @@ type
     procedure TestWav2Vec2ConfigFromJSONFile;
     procedure TestWav2Vec2CTCParity;
     procedure TestHubertCTCParity;
+    procedure TestMERTConfigFromJSONFile;
+    procedure TestMERTParity;
     // Pyannote speaker-diarization parity: raw waveform -> SincNet band-pass
     // front-end -> conv/pool/LayerNorm -> BiLSTM -> per-frame powerset logits,
     // vs a numpy float64 oracle on the committed pico fixture. Also exercises
@@ -12728,6 +12730,168 @@ end;
 procedure TTestNeuralPretrained.TestHubertCTCParity;
 begin
   AssertWav2Vec2CTCParity({IsHubert=}true);
+end;
+
+procedure TTestNeuralPretrained.TestMERTConfigFromJSONFile;
+var
+  Config: TMERTConfig;
+begin
+  Config := ReadMERTConfigFromJSONFile(FixturePath('tiny_mert_config.json'));
+  AssertEquals('model_type', 'mert_model', Config.ModelType);
+  AssertEquals('hidden', 16, Config.HiddenSize);
+  AssertEquals('layers', 3, Config.NumLayers);
+  AssertEquals('heads', 2, Config.NumHeads);
+  AssertEquals('inter', 32, Config.IntermediateSize);
+  AssertEquals('num conv layers', 3, Config.NumConvLayers);
+  AssertEquals('conv_dim[0]', 8, Config.ConvDim[0]);
+  AssertEquals('conv_stride[0]', 5, Config.ConvStride[0]);
+  AssertEquals('conv_kernel[0]', 10, Config.ConvKernel[0]);
+  AssertEquals('conv_bias', false, Config.ConvBias);
+  AssertEquals('pos conv kernel', 8, Config.NumPosConvEmbeddings);
+  AssertEquals('pos conv groups', 4, Config.NumPosConvGroups);
+  AssertEquals('sample rate', 24000, Config.SampleRate);
+  // N+1 = 4 weighted-layer-sum weights (planted, non-uniform).
+  AssertEquals('layer weights count', 4, Length(Config.LayerWeights));
+end;
+
+// MERT music-encoder parity: builds the importer net for the fixture clip
+// length, feeds every raw "clips" row of the reference JSON and asserts (1)
+// the encoder last_hidden_state, (2) EACH of the N+1 raw transformer hidden
+// states (catches a trunk transpose / a wrong hidden-state collection point),
+// and (3) the weighted-layer-sum MUSIC EMBEDDING (MERTWeightedLayerSum, the
+// MERT-specific readout) all match the HF float64 oracle to < 1e-4.
+procedure TTestNeuralPretrained.TestMERTParity;
+var
+  NN: TNNet;
+  Config: TMERTConfig;
+  HiddenLayers: TMERTHiddenStateArray;
+  RefRoot: TJSONData;
+  Clips, LastH, AllH, EmbArr, ClipArr, PosArr, RowArr, StateArr: TJSONArray;
+  Input, Output, Emb: TNNetVolume;
+  RefJson: TStringList;
+  ClipCnt, PosCnt, ChCnt, StateCnt, NumSamples, EncLen, expLen: integer;
+  NumStates: integer;
+  Diff, MaxLastDiff, MaxStateDiff, MaxEmbDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  Emb := TNNetVolume.Create;
+  RefRoot := nil;
+  NN := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_mert_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Clips := TJSONArray(TJSONObject(RefRoot).Find('clips'));
+    LastH := TJSONArray(TJSONObject(RefRoot).Find('last_hidden'));
+    AllH := TJSONArray(TJSONObject(RefRoot).Find('all_hidden'));
+    EmbArr := TJSONArray(TJSONObject(RefRoot).Find('embedding'));
+    expLen := TJSONObject(RefRoot).Get('enc_len', 0);
+    NumStates := TJSONObject(RefRoot).Get('num_hidden', 0);
+    AssertTrue('clips present', Clips <> nil);
+    AssertTrue('last_hidden present', LastH <> nil);
+    AssertTrue('all_hidden present', AllH <> nil);
+    AssertTrue('embedding present', EmbArr <> nil);
+    AssertTrue('at least 3 clips', Clips.Count >= 3);
+    NumSamples := TJSONArray(Clips.Items[0]).Count;
+
+    NN := BuildMERTFromSafeTensorsEx(
+      FixturePath('tiny_mert.safetensors'), Config, NumSamples, HiddenLayers,
+      {pTrainable=}true, FixturePath('tiny_mert_config.json'));
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('model_type from config', 'mert_model', Config.ModelType);
+
+    EncLen := MERTEncoderLength(Config, NumSamples);
+    AssertEquals('encoder length matches the oracle', expLen, EncLen);
+    AssertEquals('hidden state count', NumStates, Length(HiddenLayers));
+    AssertEquals('num_hidden_layers+1', Config.NumLayers + 1, NumStates);
+    AssertEquals('raw input length', NumSamples, NN.Layers[0].Output.SizeX);
+    AssertEquals('last_hidden_state shape', EncLen * Config.HiddenSize,
+      NN.GetLastLayer().Output.Size);
+
+    MaxLastDiff := 0;
+    MaxStateDiff := 0;
+    MaxEmbDiff := 0;
+    Input.ReSize(NumSamples, 1, 1);
+    for ClipCnt := 0 to Clips.Count - 1 do
+    begin
+      ClipArr := TJSONArray(Clips.Items[ClipCnt]);
+      AssertEquals('clip length', NumSamples, ClipArr.Count);
+      for PosCnt := 0 to NumSamples - 1 do
+        Input.FData[PosCnt] := ClipArr.Items[PosCnt].AsFloat;
+      NN.Compute(Input);
+      NN.GetOutput(Output);
+
+      // (1) last_hidden_state parity.
+      PosArr := TJSONArray(LastH.Items[ClipCnt]);
+      AssertEquals('last hidden frames', EncLen, PosArr.Count);
+      for PosCnt := 0 to EncLen - 1 do
+      begin
+        RowArr := TJSONArray(PosArr.Items[PosCnt]);
+        for ChCnt := 0 to Config.HiddenSize - 1 do
+        begin
+          Diff := Abs(Output.FData[PosCnt * Config.HiddenSize + ChCnt] -
+            RowArr.Items[ChCnt].AsFloat);
+          if Diff > MaxLastDiff then MaxLastDiff := Diff;
+        end;
+      end;
+
+      // (2) EACH raw transformer hidden state (the trunk transpose pin).
+      StateArr := TJSONArray(AllH.Items[ClipCnt]);
+      AssertEquals('hidden state rows', NumStates, StateArr.Count);
+      for StateCnt := 0 to NumStates - 1 do
+      begin
+        PosArr := TJSONArray(StateArr.Items[StateCnt]);
+        AssertEquals('hidden state frames', EncLen, PosArr.Count);
+        for PosCnt := 0 to EncLen - 1 do
+        begin
+          RowArr := TJSONArray(PosArr.Items[PosCnt]);
+          for ChCnt := 0 to Config.HiddenSize - 1 do
+          begin
+            Diff := Abs(HiddenLayers[StateCnt].Output.FData[
+              PosCnt * Config.HiddenSize + ChCnt] - RowArr.Items[ChCnt].AsFloat);
+            if Diff > MaxStateDiff then MaxStateDiff := Diff;
+          end;
+        end;
+      end;
+
+      // (3) the weighted-layer-sum MUSIC EMBEDDING (MERT-specific readout).
+      MERTWeightedLayerSum(Config, HiddenLayers, Emb, {MeanPool=}false);
+      AssertEquals('embedding seq length', EncLen, Emb.SizeX);
+      AssertEquals('embedding depth', Config.HiddenSize, Emb.Depth);
+      PosArr := TJSONArray(EmbArr.Items[ClipCnt]);
+      AssertEquals('embedding frames', EncLen, PosArr.Count);
+      for PosCnt := 0 to EncLen - 1 do
+      begin
+        RowArr := TJSONArray(PosArr.Items[PosCnt]);
+        for ChCnt := 0 to Config.HiddenSize - 1 do
+        begin
+          Diff := Abs(Emb.FData[PosCnt * Config.HiddenSize + ChCnt] -
+            RowArr.Items[ChCnt].AsFloat);
+          if Diff > MaxEmbDiff then MaxEmbDiff := Diff;
+        end;
+      end;
+
+      // The mean-pooled embedding must be (1,1,hidden).
+      MERTWeightedLayerSum(Config, HiddenLayers, Emb, {MeanPool=}true);
+      AssertEquals('pooled embedding size', Config.HiddenSize, Emb.Size);
+    end;
+
+    AssertTrue('MERT last_hidden parity: max |diff| = ' +
+      FloatToStr(MaxLastDiff) + ' must be < 1e-4', MaxLastDiff < 1e-4);
+    AssertTrue('MERT per-layer hidden parity: max |diff| = ' +
+      FloatToStr(MaxStateDiff) + ' must be < 1e-4', MaxStateDiff < 1e-4);
+    AssertTrue('MERT weighted-layer-sum parity: max |diff| = ' +
+      FloatToStr(MaxEmbDiff) + ' must be < 1e-4', MaxEmbDiff < 1e-4);
+  finally
+    NN.Free;
+    RefRoot.Free;
+    Emb.Free;
+    Output.Free;
+    Input.Free;
+    RefJson.Free;
+  end;
 end;
 
 procedure TTestNeuralPretrained.TestPyannoteParity;

@@ -1,0 +1,44 @@
+{
+ "model_type": "mert_model",
+ "architectures": [
+  "MERTModel"
+ ],
+ "hidden_size": 16,
+ "num_hidden_layers": 3,
+ "num_attention_heads": 2,
+ "intermediate_size": 32,
+ "conv_dim": [
+  8,
+  8,
+  8
+ ],
+ "conv_stride": [
+  5,
+  2,
+  2
+ ],
+ "conv_kernel": [
+  10,
+  3,
+  3
+ ],
+ "conv_bias": false,
+ "num_conv_pos_embeddings": 8,
+ "num_conv_pos_embedding_groups": 4,
+ "feat_extract_norm": "group",
+ "do_stable_layer_norm": false,
+ "feature_extractor_cqt": false,
+ "attention_relax": -1.0,
+ "deepnorm": false,
+ "feat_proj_layer_norm": true,
+ "hidden_act": "gelu",
+ "feat_extract_activation": "gelu",
+ "layer_norm_eps": 1e-05,
+ "sample_rate": 24000,
+ "layer_weights": [
+  -0.146795,
+  0.786141,
+  0.946822,
+  -1.114344
+ ]
+}
