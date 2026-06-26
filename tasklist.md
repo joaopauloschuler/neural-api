@@ -564,6 +564,16 @@ rather than acted on.
       serialized string. Assert the twin's logits match the source on a pinned
       input (the existing TestMakeUnconditionalTwinMatchesSourceLogits is the
       template).
+- [ ] Port transformers' `no_repeat_ngram_size` as a `TNNetLogitsProcessor` in the
+      landed processor chain (next to min-p / repetition-penalty / temperature). It
+      bans any next token that would complete an n-gram already seen in the running
+      context (the standard HF `NoRepeatNGramLogitsProcessor`): track the generated
+      ids, and for the current `(n-1)`-token suffix set the logit of every banned
+      continuation to `-inf` before sampling. Distinct from the existing repetition
+      PENALTY (which scales single-token logits) — this is exact n-gram blocking, the
+      single most-requested decode control still missing. Wire it into the streamed
+      and batched decode paths and `TGenerationConfig`, with a unit test pinning that
+      a forced-repeat prompt cannot re-emit a banned bigram/trigram.
 - [ ] Preference-optimization follow-ups on the landed DPO/GRPO trainers
       (TNeuralGRPOTrainer in neural/neuraldpo.pas LANDED: group-relative
       advantages + PG + DeepSeek-k3 per-token KL reusing the DPO softmax-backward
@@ -716,6 +726,72 @@ rather than acted on.
       existing parity tests (TestHiFiGANSynthesisParity / TestVitsSynthesisParity /
       EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
       before/after.
+- [ ] AVX-vectorize `TNNetTokenRMSNorm` (forward + backward) over the contiguous
+      Depth axis. This is the per-token RMSNorm used by EVERY imported Llama-family
+      transformer (Llama/Qwen/Gemma/Mistral/Phi/OLMo/...): two-or-more per block,
+      run once per token per forward pass, so it is on the hot path of all LLM
+      inference, yet `Compute` (neuralnetwork.pas ~54091) still does a scalar
+      `for ChannelCnt` sum-of-squares loop and a scalar gain multiply per token.
+      Each token occupies `FData[t*Depth .. t*Depth+Depth-1]` — depth-contiguous,
+      exactly the drop-in case for `TNNetVolume.GetSumSqr(ptr, Depth)` (mean-square)
+      and `Mul`/`MulAdd` (the `gain .* x_hat` write). Backward's per-token
+      `SumDxHatXHat` dot and the gain-gradient `MulAdd` accumulation are likewise
+      depth-contiguous. Gate on the existing TokenRMSNorm numerical-gradient tests
+      and importer parity (Llama/Qwen pico fixtures) staying `< 1e-4` on both the
+      scalar-fallback and real `-dAVX2` builds; this is the same depth-contiguous
+      pattern already landed for L2Normalize / LogitNormalize / DiagonalSSM.
+- [ ] Bark text-to-speech importer (`BuildBarkFromSafeTensors[Ex]` + `TBarkConfig`
+      / `ReadBarkConfigFromJSONFile`, model_type `bark`, e.g. suno/bark-small) — the
+      autoregressive GPT-style TTS family not yet in-tree (distinct from the
+      flow/diffusion and VITS paths the open audio tasks cover). Three stacked
+      GPT-2-style decoders chained: a SEMANTIC text->semantic-token model, a
+      COARSE-acoustic model, and a FINE-acoustic model (the fine model predicts the
+      remaining EnCodec codebooks NON-causally over the codebook axis given the
+      coarse ones), then the landed EnCodec decoder (reused from the MusicGen path)
+      turns the codes into a waveform. Reuse the existing TransformerDecoder / SDPA
+      stack + learned positional embedding; the only new wiring is the three-stage
+      token plumbing and Bark's merged text+semantic input embedding. Pico parity
+      `< 1e-4` vs a self-contained float64 numpy oracle on a committed re-randomized
+      fixture (`tools/make_pico_bark_fixture.py`, `TestBarkParity`), `examples/BarkTTS`
+      writing a WAV via `SaveVolumeToWav16`. Real suno/bark checkpoint key-mapping is
+      a network/RAM-gated follow-up.
+- [ ] DAC (Descript Audio Codec) neural-codec importer (`BuildDACFromSafeTensors[Ex]`
+      + `TDACConfig` / `ReadDACConfigFromJSONFile`, model_type `dac`, e.g.
+      descript/dac_44khz, the HF `DacModel`) — the RVQGAN-lineage codec that is
+      architecturally distinct from the landed EnCodec/Mimi codecs: it uses the
+      already-in-tree `TNNetSnake` activation throughout, and a residual vector
+      quantizer with FACTORIZED, L2-normalized low-dimensional codes (input/output
+      projections around each codebook). Encoder = strided Snake conv blocks ->
+      RVQ; decoder = the mirror ConvTranspose1d Snake stack (reuse the channel-major
+      conv1d / RunHiFiGANConv path the audio holders already share). Pico round-trip
+      parity `< 1e-4` vs a float64 oracle on a committed fixture
+      (`tools/make_pico_dac_fixture.py`, `TestDACRoundTripParity`), `examples/DACRoundTrip`
+      encoding then decoding a synthesized tone to a WAV. This also unblocks the
+      Parler-TTS importer below (DAC is its decode backend).
+- [ ] Parler-TTS importer (`BuildParlerTTSFromSafeTensors[Ex]` + `TParlerConfig`,
+      model_type `parler_tts`, e.g. parler-tts/parler-tts-mini-v1) — description-
+      conditioned TTS: a (By)T5 text encoder (reuse `BuildT5FromSafeTensors`) encodes
+      a free-text STYLE description, a cross-attention codec-LM decoder (reuse the
+      landed seq2seq cross-attention decoder stack — the same shape as the Marian/T5
+      decoder) autoregressively predicts the DELAY-PATTERNED multi-codebook DAC codes
+      conditioned on both the description and the transcript prompt tokens, and the
+      DAC decoder (task above) renders the waveform. New wiring is the delay-pattern
+      code interleave/de-interleave and the dual-prompt (description + transcript)
+      input. Depends on the DAC importer landing first. Pico parity `< 1e-4` vs a
+      float64 oracle (`tools/make_pico_parler_fixture.py`, `TestParlerTTSParity`),
+      `examples/ParlerTTS`.
+- [ ] MERT music-representation encoder importer (`BuildMERTFromSafeTensors[Ex]` +
+      `TMERTConfig`, model_type `mert`/`music2vec`, e.g. m-a-p/MERT-v1-95M) — a
+      self-supervised MUSIC understanding encoder (the audio analogue of a frozen
+      vision backbone): a HuBERT-style 1D-conv feature front-end (reuse the Wav2Vec2
+      conv encoder already in-tree) + a transformer trunk, exposing the deep
+      weighted-layer-sum of hidden states as a fixed music embedding for tagging /
+      genre / similarity. Distinct from the Wav2Vec2/Whisper SPEECH encoders (music
+      pretraining target, mel+CQT reconstruction heads) and gives the repo a music
+      EMBEDDING capability it lacks. Pico parity `< 1e-4` vs the real `transformers`
+      `MERT`/`Wav2Vec2` float64 forward on a sliced fixture (the `make_pico_*` slicer
+      pattern), `TestMERTParity`, `examples/MusicTagging` printing the embedding +
+      cosine similarity between two synthesized clips.
 - [ ] VITS / MMS-TTS end-to-end text-to-speech importer (`BuildVitsFromSafeTensors[Ex]`
       LANDED + `ReadVitsConfigFromJSONFile`/`VitsConfigToString` + the `TVitsConfig`
       record + the `TNNetVits` channel-major holder (Analyze / ExpandPrior /
@@ -1092,6 +1168,23 @@ rather than acted on.
         are available, incl. the real diffusers 3D RoPE frequency layout / temporal
         VAE up/down blocks and a real T5 encoder over a tokenized prompt feeding
         BuildT5FromSafeTensors instead of the synthetic text states.
+- [ ] Stable Video Diffusion IMAGE-to-video importer (`BuildSVDFromSafeTensors[Ex]`
+      + `TSVDConfig`, e.g. stabilityai/stable-video-diffusion-img2vid) — the
+      image-CONDITIONED video generator that complements the landed CogVideoX
+      TEXT-to-video DiT (different modality: an input frame, not a prompt, drives a
+      short clip). A spatio-temporal U-Net denoiser: reuse the landed SD/diffusion
+      2D conv-resnet + cross-attention blocks for the SPATIAL layers and add the
+      TEMPORAL mixing (per-pixel attention/conv across the frame axis + the
+      learnable per-block temporal mix factor) interleaved between them; CLIP-image
+      embedding conditioning (reuse `BuildClipVisionTower`) plus the
+      fps/motion-bucket/noise-aug micro-conditioning embeddings; EDM-preconditioned
+      denoiser + the temporal VAE decode (reuse the landed VAE decoder path). Pico
+      parity `< 1e-4` on one denoiser step + one VAE decode vs a first-principles
+      float64 oracle on a committed random pico config (the CogVideoX fixture
+      pattern), `tools/make_pico_svd_fixture.py` / `TestSVDParity`,
+      `examples/ImageToVideo` driving the pico denoiser through EDM sampling and
+      writing a per-frame PPM sequence. Real-checkpoint parity is the network/RAM-
+      gated follow-up.
 - [ ] VAR (Visual AutoRegressive, next-scale prediction) image-generation follow-ups
       (class-conditional v1 LANDED — BuildVARFromSafeTensors[Ex] + ReadVARConfigFromJSONFile
       + the TNNetScaledDotProductAttention.BlockCausalSegments scale-mask flag):
