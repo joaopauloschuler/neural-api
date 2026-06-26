@@ -845,6 +845,22 @@ rather than acted on.
       classifier-free-guidance tuning and long-form generation to a follow-up.
       The WAV writer + HiFi-GAN vocoder it builds on have landed; the open
       piece is the audio U-Net/DiT denoiser importer.
+- [ ] MusicGen MELODY-conditioned importer (BuildMusicGenMelodyFromSafeTensors[Ex],
+      facebook/musicgen-melody, model_type "musicgen_melody") — extends the landed
+      text-conditioned MusicGen (BuildMusicGenFromSafeTensors / TMusicGenModel) with a
+      genuinely new CAPABILITY: generate music that follows a reference MELODY hummed or
+      played by the user, optionally steered by a text prompt. The decoder, EnCodec
+      codec, delay-interleave pattern and T5 text conditioning all REUSE the landed path
+      unchanged; the new pieces are (a) a chromagram feature extractor in
+      neural/neuralaudio.pas (12-bin chroma over the reference 16 kHz waveform — STFT
+      magnitude -> map FFT bins to pitch classes -> per-frame argmax/one-hot of the
+      dominant chroma, matching HF MusicgenMelody's chroma front-end) and (b) wiring the
+      chroma sequence as a SECOND cross-attention conditioning source CONCATENATED on the
+      sequence axis with the T5 text states (audio_enc_to_dec_proj over the chroma).
+      Scope v1 inference-only on CPU: a short text+melody -> codes -> EnCodec decode ->
+      WAV clip, the same tail examples/MusicGenText already uses. Pico parity vs a float64
+      HF MusicgenMelodyForConditionalGeneration oracle (chroma extractor + one decoder
+      step, < 1e-4) and an examples/MusicGenMelody that conditions on a synthesized melody.
 - [ ] SeamlessM4T-v2 follow-ups deferred from the landed S2TT v1:
       (1) [X] position_embeddings_type="relative_key" — DONE: added
       TNNetConformerRelPosAttention (learnable distance-embedding score bias
