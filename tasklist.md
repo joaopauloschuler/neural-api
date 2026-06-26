@@ -871,11 +871,19 @@ rather than acted on.
         default TargetAccuracy and early-stops.
   - [ ] a 16 kHz resampler in neuralaudio so `--full` accepts non-16 kHz WAVs
         directly instead of requiring an ffmpeg pre-pass.
-- [ ] Moonshine GQA decoder/encoder pico fixture (follow-up to the landed
+- [X] Moonshine GQA decoder/encoder pico fixture (follow-up to the landed
       Moonshine encoder-decoder importer + examples/MoonshineTranscribe):
       decoder/encoder_num_key_value_heads != heads (the pico currently sets
       kv_heads == heads; the GQA slice path is wired but unexercised by an
       oracle — add a fixture with kv_heads < heads and assert parity).
+      DONE: tools/make_pico_moonshine_gqa_fixture.py (4 query heads / 2 kv
+      heads on BOTH towers, GroupSize=2) + tests/fixtures/tiny_moonshine_gqa*
+      + TestMoonshineGQAEncoderParity / TestMoonshineGQADecoderLogitParity
+      (<1e-4 HF float64 oracle; exercises the KVGroup := HeadCnt div GroupSize
+      broadcast in encoder self-attn, decoder self-attn AND cross-attn).
+      Note: transformers 5.11 MoonshineAttention reshapes the QUERY by
+      num_key_value_heads (an upstream GQA bug); the fixture monkeypatches
+      only that reshape to num_attention_heads to get a faithful oracle.
 - [ ] KV-cache O(1) incremental decode for the Moonshine decoder (self-attn cache +
       cross-attn states are constant across steps; reuse the SDPA Begin/EndIncrementalDecode
       machinery) so long transcripts don't re-run the whole prefix each step.

@@ -292,6 +292,14 @@ type
     // the next-token logit row against the HF float64
     // MoonshineForConditionalGeneration oracle (< 1e-4).
     procedure TestMoonshineDecoderLogitParity;
+    // Moonshine GROUPED-QUERY-ATTENTION parity: a pico fixture with
+    // num_key_value_heads (2) < num_attention_heads (4) on BOTH towers, so
+    // the importer's K/V-head replication slice path (KVGroup := HeadCnt div
+    // GroupSize, GroupSize=2) is exercised against an HF float64 oracle in
+    // the encoder, decoder self-attn AND cross-attn (the base pico leaves
+    // GroupSize=1, never verifying the broadcast).
+    procedure TestMoonshineGQAEncoderParity;
+    procedure TestMoonshineGQADecoderLogitParity;
     // EnCodec: round-trips three pinned waveforms through the imported codec
     // (waveform -> RVQ codes -> waveform) and asserts the codes match the HF
     // oracle EXACTLY and the reconstructed waveform matches < 1e-4.
@@ -12700,6 +12708,175 @@ begin
     end;
     // 1e-4 importer-parity gate. NEVER loosen - fix the model instead.
     AssertTrue('Moonshine decoder logit parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Dec.Free;
+    Enc.Free;
+    RefRoot.Free;
+    Logits.Free;
+    DecIn.Free;
+    EncOut.Free;
+    EncIn.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMoonshineGQAEncoderParity;
+var
+  NN: TNNet;
+  Config: TMoonshineConfig;
+  RefRoot: TJSONData;
+  WaveArr, Hidden, RowArr: TJSONArray;
+  Input, Output: TNNetVolume;
+  RefJson: TStringList;
+  PosCnt, ChCnt, NumSamples, EncLen, expLen: integer;
+  Diff, MaxHiddenDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  RefRoot := nil;
+  NN := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_moonshine_gqa_encoder.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    WaveArr := TJSONArray(TJSONObject(RefRoot).Find('waveform'));
+    Hidden := TJSONArray(TJSONObject(RefRoot).Find('enc_hidden'));
+    expLen := TJSONObject(RefRoot).Get('enc_len', 0);
+    AssertTrue('waveform present', WaveArr <> nil);
+    AssertTrue('enc_hidden present', Hidden <> nil);
+    NumSamples := WaveArr.Count;
+
+    NN := BuildMoonshineFromSafeTensorsEx(
+      FixturePath('tiny_moonshine_gqa.safetensors'), Config, NumSamples,
+      {pTrainable=}true, FixturePath('tiny_moonshine_gqa_config.json'));
+    AssertTrue('net built', NN <> nil);
+
+    // The whole point of this fixture: GQA (kv heads < query heads), so the
+    // K/V-head replication slice path actually fires (GroupSize > 1).
+    AssertTrue('encoder is GQA (kv heads < query heads)',
+      Config.NumEncoderKVHeads < Config.NumEncoderHeads);
+    AssertEquals('encoder query heads', 4, Config.NumEncoderHeads);
+    AssertEquals('encoder kv heads', 2, Config.NumEncoderKVHeads);
+
+    EncLen := MoonshineEncoderLength(NumSamples);
+    AssertEquals('encoder length matches the oracle', expLen, EncLen);
+    AssertEquals('raw input length', NumSamples, NN.Layers[0].Output.SizeX);
+    AssertEquals('encoder hidden shape', EncLen * Config.HiddenSize,
+      NN.GetLastLayer().Output.Size);
+
+    Input.ReSize(NumSamples, 1, 1);
+    for PosCnt := 0 to NumSamples - 1 do
+      Input.FData[PosCnt] := WaveArr.Items[PosCnt].AsFloat;
+    NN.Compute(Input);
+    NN.GetOutput(Output);
+
+    MaxHiddenDiff := 0;
+    AssertEquals('hidden frames', EncLen, Hidden.Count);
+    for PosCnt := 0 to EncLen - 1 do
+    begin
+      RowArr := TJSONArray(Hidden.Items[PosCnt]);
+      AssertEquals('hidden width', Config.HiddenSize, RowArr.Count);
+      for ChCnt := 0 to Config.HiddenSize - 1 do
+      begin
+        Diff := Abs(Output.FData[PosCnt * Config.HiddenSize + ChCnt] -
+          RowArr.Items[ChCnt].AsFloat);
+        if Diff > MaxHiddenDiff then MaxHiddenDiff := Diff;
+      end;
+    end;
+    // 1e-4 importer-parity gate. NEVER loosen - fix the model instead.
+    AssertTrue('Moonshine GQA encoder hidden parity: max |diff| = ' +
+      FloatToStr(MaxHiddenDiff) + ' must be < 1e-4', MaxHiddenDiff < 1e-4);
+  finally
+    NN.Free;
+    RefRoot.Free;
+    Output.Free;
+    Input.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMoonshineGQADecoderLogitParity;
+var
+  Enc, Dec: TNNet;
+  Config: TMoonshineConfig;
+  RefRoot: TJSONData;
+  WaveArr, PrefixArr, LogitsArr: TJSONArray;
+  EncIn, EncOut, DecIn, Logits: TNNetVolume;
+  EncStates: TNNetLayer;
+  RefJson: TStringList;
+  i, NumSamples, PrefixLen, DecSeqLen, Row: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  EncIn := TNNetVolume.Create;
+  EncOut := TNNetVolume.Create;
+  DecIn := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  Enc := nil;
+  Dec := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_moonshine_gqa_decoder.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    WaveArr := TJSONArray(TJSONObject(RefRoot).Find('waveform'));
+    PrefixArr := TJSONArray(TJSONObject(RefRoot).Find('dec_prefix'));
+    LogitsArr := TJSONArray(TJSONObject(RefRoot).Find('dec_logits'));
+    AssertTrue('waveform present', WaveArr <> nil);
+    AssertTrue('dec_prefix present', PrefixArr <> nil);
+    AssertTrue('dec_logits present', LogitsArr <> nil);
+    NumSamples := WaveArr.Count;
+    PrefixLen := PrefixArr.Count;
+    DecSeqLen := PrefixLen + 2;
+
+    BuildMoonshineEncoderDecoderFromSafeTensors(
+      FixturePath('tiny_moonshine_gqa.safetensors'), Enc, Dec, Config,
+      NumSamples, DecSeqLen, {pTrainable=}true,
+      FixturePath('tiny_moonshine_gqa_config.json'));
+    AssertTrue('encoder built', Enc <> nil);
+    AssertTrue('decoder built', Dec <> nil);
+    AssertEquals('vocab matches the logit oracle', LogitsArr.Count,
+      Config.VocabSize);
+
+    // Decoder GQA must be active: self-attn AND cross-attn replicate kv heads.
+    AssertTrue('decoder is GQA (kv heads < query heads)',
+      Config.NumDecoderKVHeads < Config.NumDecoderHeads);
+    AssertEquals('decoder query heads', 4, Config.NumDecoderHeads);
+    AssertEquals('decoder kv heads', 2, Config.NumDecoderKVHeads);
+
+    // 1) Encode the waveform.
+    EncIn.ReSize(NumSamples, 1, 1);
+    for i := 0 to NumSamples - 1 do EncIn.FData[i] := WaveArr.Items[i].AsFloat;
+    Enc.Compute(EncIn);
+    Enc.GetOutput(EncOut);
+
+    // 2) Copy the encoder states into the decoder's second TNNetInput.
+    EncStates := T5EncoderStatesInput(Dec);
+    AssertEquals('encoder states size matches decoder input',
+      EncStates.Output.Size, EncOut.Size);
+    EncStates.Output.Copy(EncOut);
+
+    // 3) Decoder tokens: prefix then padding with the start token.
+    DecIn.ReSize(DecSeqLen, 1, 1);
+    for i := 0 to DecSeqLen - 1 do
+      if i < PrefixLen then DecIn.FData[i] := PrefixArr.Items[i].AsFloat
+      else DecIn.FData[i] := PrefixArr.Items[0].AsFloat;
+    Dec.Compute(DecIn);
+    Dec.GetOutput(Logits);
+
+    // 4) Compare the next-token logit row (after the full prefix).
+    Row := PrefixLen - 1;
+    MaxDiff := 0;
+    for i := 0 to Config.VocabSize - 1 do
+    begin
+      Diff := Abs(Logits.FData[Row * Config.VocabSize + i] -
+        LogitsArr.Items[i].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    // 1e-4 importer-parity gate. NEVER loosen - fix the model instead.
+    AssertTrue('Moonshine GQA decoder logit parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     Dec.Free;
