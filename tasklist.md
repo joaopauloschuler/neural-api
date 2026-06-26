@@ -99,6 +99,28 @@ rather than acted on.
 
 ## Infrastructure / dev experience
 
+- [ ] AVX-vectorize TNNetGroupNorm + TNNetInstanceNorm per-group statistics.
+      Unlike the already-AVX'd whole-volume TNNetLayerNorm / TNNetRMSNorm, these
+      two still reduce mean/variance with scalar CntX/CntY/CntD triple loops
+      (neuralnetwork.pas ~54897). Within one group the depth sub-range
+      [DStart..DEnd] is contiguous, so per-(x,y) the mean/var reduction is a
+      drop-in `GetSumSqr(GetRawPtr(x,y,DStart), GroupDepth)` and the normalize +
+      backward bulk terms become `MulAdd` calls — the same depth-contiguous rule
+      from the AVX sweep. These layers are hot in the imported GAN / diffusion /
+      VAE stacks (CycleGAN, StyleGAN2, the SD VAE decoder). Must keep the
+      `-FLearningRate` convention and pass the existing numerical-gradient tests
+      on both scalar-fallback and `-dAVX2` builds.
+
+- [ ] `bad_words` / sequence-bias logits processor for neuraldecode.pas
+      (`TNNetSequenceBiasProcessor`). The chain already has Penalty / NoRepeatNGram
+      / Constraint / CFG / Watermark, but there is no way to additively bias (or
+      hard-ban via -inf) specific multi-token sequences — the transformers
+      `SequenceBiasLogitsProcessor` / `NoBadWordsLogitsProcessor` behaviour. It
+      should suppress a multi-token sequence's final token only when the preceding
+      tokens already match the generated suffix (prefix-match against history),
+      so single-token bans degrade to a plain logit bias. Add it to the chain
+      builder + a unit test that a banned word never appears in greedy output.
+
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] GGUF import beyond Llama — open follow-ups (core `BuildFromGGUF`/`BuildFromGGUFEx`
       arch dispatch with llama/qwen2/gemma2 LANDED & verified):
@@ -232,6 +254,39 @@ rather than acted on.
       and key-padding-masked MAP pooling. Not yet wired.
 
 ### Computer vision & generative models
+
+- [ ] Grounding DINO open-vocabulary detection importer
+      (`BuildGroundingDINOFromSafeTensors[Ex]`, model_type "grounding-dino",
+      e.g. IDEA-Research/grounding-dino-tiny). Distinct from the landed OWL-ViT
+      path: GDINO is a text-conditioned DETR with a Swin backbone, a BERT text
+      encoder, a cross-modality feature enhancer (deformable image self-attn +
+      bi-directional text<->image cross-attn) and a cross-modality decoder whose
+      queries attend to BOTH towers. Reuse BuildSwinFromSafeTensors (image),
+      BuildBertFromSafeTensors (text) and TNNetCrossAttention for the fusion;
+      output = boxes + per-query token-similarity logits scored against the
+      prompt's token spans. Pico-fixture parity + an examples/GroundingDINODetect
+      ("detect: a cat. a remote." -> boxes) demo.
+
+- [ ] SAM 2 promptable image + VIDEO segmentation importer
+      (`BuildSAM2FromSafeTensors[Ex]`, e.g. facebook/sam2-hiera-tiny). The landed
+      SAM v1 path covers the single-image ViT encoder + mask decoder; SAM 2 adds
+      the pieces that make it a distinct model: a Hiera hierarchical image
+      encoder, a memory-attention block that conditions the current frame on a
+      memory bank of past-frame embeddings + object pointers, and a memory
+      encoder that writes mask predictions back into the bank. v1 scope = single
+      image (skip the bank); follow-up = the streaming video loop. Reuse the SAM
+      prompt encoder + two-source TNNetCrossAttention. examples/SAM2Segment
+      (point/box prompt on one frame, then carry the mask across a short clip).
+
+- [ ] Depth Anything V2 monocular relative-depth importer
+      (`BuildDepthAnythingV2FromSafeTensors[Ex]`, depth_anything model_type,
+      e.g. depth-anything/Depth-Anything-V2-Small-hf). The config block already
+      sits as a comment near neuralpretrained.pas:10722 but there is no Build
+      function: wire the landed BuildDINOv2 ViT backbone (S/B/L) as the feature
+      extractor into the landed DPT reassemble + fusion head (the DPTConfig
+      neck/head already exist), reading the 4 selected hidden-state indices.
+      Pico-fixture parity + an examples/DepthAnythingV2 (image -> normalized
+      depth map -> PPM) demo distinct from the existing DPT DepthEstimation one.
 
 - [ ] ResNet importer follow-ups (BuildResNetFromSafeTensors[Ex] LANDED, commit
       317a19c: torchvision resnet18/50 state_dict, conv-BN fold at load, config
@@ -1265,6 +1320,16 @@ rather than acted on.
       parity follow-up via the structured-vision detection eval harness.
 
 ## Layer follow-ups that fix real limitations
+
+- [ ] Make TNNetMaxChannel (and TNNetMinChannel) work on RECTANGULAR feature
+      maps. Both currently inherit the TNNetMaxPool path that assumes square
+      maps (SizeX = SizeY) — flagged at neuralnetwork.pas:13039 (the CBAM channel
+      branch caveat) and in the DO-NOT-REINTRODUCE note for the deleted
+      TNNetGlobalMaxPool/TNNetGlobalMinPool (which had a direct (X,Y) loop that
+      handled non-square inputs). Add a true (x,y)-over-all-positions reduction
+      per depth so global max/min pooling is correct on non-square tensors, then
+      drop the square-only caveat. Add a gradient/forward test on a (W != H)
+      input that the square assumption would currently mis-index.
 
 (The sub-quadratic / chunked-forward family below is one coherent systems effort:
 every recurrence currently trains as a strict per-token left-to-right scan.)
