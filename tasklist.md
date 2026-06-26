@@ -805,26 +805,6 @@ rather than acted on.
       classifier-free-guidance tuning and long-form generation to a follow-up.
       The WAV writer + HiFi-GAN vocoder it builds on have landed; the open
       piece is the audio U-Net/DiT denoiser importer.
-- [X] Read generation_config.json for decode defaults (MusicGen + general).
-      LANDED commit b8c45b6: ReadGenerationDefaultsFromJSONFile/FromDir +
-      TGenerationDefaults record (Has* present-flags) in neuralpretrained.pas,
-      parsing top_k/top_p/temperature/do_sample/guidance_scale/max_length;
-      MusicGenText --download seeds from generation_config.json (CLI flags still
-      override, do_sample=false collapses to greedy); test
-      TestGenerationDefaultsFromJSONFile + tiny_generation_config.json fixture.
-      examples/MusicGenText currently HARDCODES MusicGen's intended sampling
-      recipe in --download mode (top_k=250, temperature=1.0, guidance_scale=3.0,
-      do_sample=true) -- these match facebook/musicgen-small's
-      generation_config.json exactly, but a non-standard MusicGen variant with
-      different generation defaults would not be picked up. Add a small
-      generation_config.json reader (top_k / top_p / temperature / do_sample /
-      guidance_scale / max_length) and have the example seed its defaults from
-      it when present (explicit --flags still override). NOTE: the greedy-vs-
-      sampling distinction matters a LOT here -- greedy argmax collapses MusicGen
-      into a repetitive drone; top_k sampling is what actually produces music
-      (root cause of the "not music" bug, fixed by defaulting --download to
-      top_k=250 in commit 882a75b). Generalizes beyond MusicGen to any imported
-      generative LM that ships a generation_config.json.
 - [ ] Stereo MusicGen (audio_channels=2, the 2K-codebook layout) -- the
       ReadMusicGenConfigFromJSONFile importer currently REJECTS audio_channels=2
       (the 2*K interleaved-codebook delay layout is a documented follow-up).
@@ -1159,12 +1139,6 @@ rather than acted on.
       LayerNorm + ReLU FFN, pre-/post-LN per do_layer_norm_before, optional
       final_layer_norm, BuildFromPretrained dispatch; TestOPTNextTokenLogitsParity
       < 1e-4 vs float64 HF OPTForCausalLM). Open follow-ups:
-  - [X] word_embed_proj_dim + POST-LN (opt-350m) pico parity — BOTH gaps closed
-        by ONE opt-350m-shaped fixture (commit 5bbf929): tiny_opt350.* (hidden 16,
-        word_embed_proj_dim 12, do_layer_norm_before=false → project_in/out +
-        post-LN block wiring + HasFinalLayerNorm=false). Test
-        TestOPT350ProjPostLNLogitParity < 1e-4 vs float64 HF oracle, re-randomized
-        O(1)-scale weights; generator tools/opt_proj_postln_tiny_fixture.py.
   - [ ] Wire OPT as the blip2-opt decode tail (the original motivation): feed
         the Q-Former query/text states into BuildOPTFromSafeTensors and verify
         a BLIP-2-OPT generation path.
@@ -1182,13 +1156,6 @@ rather than acted on.
       and the DPT fusion-block decoder are already landed and reusable. Real value:
       first sharp, boundary-accurate, metric-depth model in the tree. Pico-fixture
       smoke + a real-checkpoint parity follow-up.
-
-- [X] LCM sampler wiring into examples/LatentTextToImage. LANDED commit ea52a73:
-      opt-in `--lcm` few-step sampler drives TNNetLCMScheduler.LCMSample (single
-      conditional forward per step, no CFG double pass) over the pico PixArt + VAE;
-      DDIM/DPM-Solver++ CFG loop stays default. TestLatentTextToImageSmoke extended
-      with an LCM render assertion; examples/README documents --lcm + the
-      LCM-distillation consistency-loss note.
 
 - [ ] RT-DETR real-time detection-transformer importer
       (BuildRtDetrFromSafeTensors[Ex], e.g. PekingU/rtdetr_r50vd). A DISTINCT
@@ -1295,24 +1262,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       stack matches the concatenation of independent per-document MHA runs (the
       builder-level analogue of TestSegmentMaskMatchesUnpackedBaseline). KV-cache
       incremental decode stays intentionally unmasked (single-stream = one doc).
-- [X] AVX-vectorize the `TNNetDeconvolution.Compute` overlap-add scatter
-      (the real transposed convolution landed in commit 6b3318c). LANDED commit
-      22817d9: Compute depth dot-product via TNNetVolume.DotProduct, Backpropagate
-      dual depth MulAdds via TNNetVolume.MulAdd (hasInputGrad guard preserved);
-      equality test TestDeconvolutionDepthVectorEquality (InD=10 hits 8-wide SIMD
-      body + remainder), full suite 2259 tests green. The inner
-      `for id := 0 to MaxInD do acc := acc + W.Get(kx,ky,id) * Prev.Get(ix,iy,id)`
-      is a dot product over the contiguous depth axis — exactly the
-      depth-axis-contiguous pattern the AVX `TNNetVolume` primitives target, yet it
-      is currently a scalar loop. Replace it with the existing SIMD dot-product /
-      `MulAdd` path (mirror how `TNNetConvolution`'s forward already vectorizes its
-      depth reduction) and likewise vectorize the symmetric weight/input-gradient
-      depth loops in `TNNetDeconvolution.Backpropagate`. Transposed conv is the
-      upsampling workhorse of GAN generators, autoencoder/VQ decoders and
-      segmentation heads in this repo, so the scalar path is a real throughput
-      floor for image-generative workloads. Gate behind a bit-tolerance assert that
-      the vectorized output matches the current scalar result on a fixed fixture.
-
 ## Tests / numerical-gradient audit
 
 - [ ] Shared `LayerInputAndWeightGradientCheck(layer, inputShape)` helper
@@ -1338,17 +1287,10 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
 - [ ] Recurrent-style layer audit: TNNetEmbedding's weight-gradient path
       (sparse-update pattern — easy place for a silent broadcast/reduction
       bug), TNNetTokenAndPositionalEmbedding, etc.
-- [X] Layer-registry round-trip audit — LANDED commit 689eb0b:
-      tests/TestNeuralRegistry.pas builds a minimal net per registered layer,
-      SaveStructureToString -> LoadStructureFromString -> SaveStructureToString,
-      asserts bit-for-bit equality (375 builders, ~324 of ~404 canonical dispatch
-      names). Caught & fixed a REAL bug: TNNetSAMVisionAttention.SaveStructureToString
-      emitted a non-standard `SAMVisionAttention:...` string CreateLayer could not
-      parse (serialized-but-not-deserializable) — fixed to delegate to `inherited`.
-      Skip-list (documented in-code): multi-source/two-input layers (need a
-      multi-branch builder — own round-trip tests exist) + legacy aliases. Full
-      suite 2262 tests green. FOLLOW-UP: extend with a multi-branch builder to cover
-      the skipped two-source layers (Concat/Sum/CrossAttention/FiLM/HyperLinear/etc.).
+- [ ] Multi-branch layer-registry round-trip audit: extend the landed
+      single-source registry round-trip (tests/TestNeuralRegistry.pas) with a
+      multi-branch builder to cover the skipped two-source layers
+      (Concat/Sum/CrossAttention/FiLM/HyperLinear/etc.).
 - [ ] Shape-inference smoke test — instantiate every concrete layer at a
       small canonical input shape, assert declared output shape matches
       actual.
