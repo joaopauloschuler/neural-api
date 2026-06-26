@@ -20,7 +20,8 @@ uses
   TestNeuralHFTokenizer, TestNeuralHFHub, TestNeuralNumpy,
   TestNeuralTokenizer, TestNeuralImagePreprocess,
   TestNeuralDiffusion, TestNeuralImageMetrics, TestNeuralAudio,
-  TestNeuralAugment, TestNeuralRegistry, TestNeuralCallbacks;
+  TestNeuralAugment, TestNeuralRegistry, TestNeuralCallbacks,
+  TestNeuralSWA;
 
 type
   TMyTestRunner = class(TTestRunner)

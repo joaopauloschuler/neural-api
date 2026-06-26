@@ -517,16 +517,26 @@ rather than acted on.
       wired but UNVERIFIED end-to-end (lib not installed here; pico demo GGUF may
       be too small for llama.cpp) — confirm argmax/ranking agree on a real
       checkpoint once the lib is available.
-- [ ] Stochastic Weight Averaging (torch.optim.swa_utils port): equal-weight
+- [X] Stochastic Weight Averaging (torch.optim.swa_utils port): equal-weight
       running average of checkpoints over the schedule tail + a constant or
       cyclic SWA learning rate phase; swap averaged weights in for eval/save.
-      Distinct from the landed EMA shadow-weights wiring (running decay
-      average) but should share the shadow-weights machinery. NOTE: the EMA
-      task landed its trainer wiring
-      (TNeuralFitBase.EnableEMA + ApplyEMAWeights/RestoreLiveWeights store-and-
-      restore swap) on TNNetEMAWrapper; TNNetSWAWrapper already exists too, so
-      SWA is mostly a matter of wiring that wrapper into TNeuralFitBase reusing
-      the same Apply/Restore swap plumbing.
+      LANDED as a CALLBACK (TNeuralFitSWA in neuralfit.pas), NOT as
+      TNeuralFitBase fields: the new callback API already exposes the exact hook
+      SWA needs (OnEpochEnd), so the wrapper + live-weight stash + swap state all
+      live on the callback with no growth of TNeuralFitBase. Reuses
+      TNNetSWAWrapper for the averaging (Accumulate folds the equal-weight mean)
+      and mirrors the EMA store/load/restore plumbing via
+      ApplySWAWeights(pNN)/RestoreLiveWeights(pNN). Window = epochs >= StartEpoch,
+      every SnapshotEveryEpochs-th epoch. The constant/cyclic SWA-LR phase is
+      left to the existing LR machinery (CyclicalLearningRateLen / constant LR) -
+      the callback only averages/swaps weights, it never touches the LR.
+      BN-recompute (torch update_bn): SKIPPED - this lib's norm layers
+      (LayerNorm/RMSNorm/GroupNorm) compute stats per-forward from current
+      activations and carry no persistent running mean/var, so no recompute pass
+      is needed (documented in the class comment). Off by default (must register
+      the callback). Tests: tests/TestNeuralSWA.pas (mean==arithmetic mean,
+      apply/restore bit-identical, window/cadence gating, disabled-path unchanged
+      within the documented Clone()-RNG-shuffle tolerance).
 - [ ] Optimizer zoo expansion (SGD/Adam/AdamW + Lion + Adafactor exist now):
       Lion + Adafactor DONE (commit 89da1f9). TNeuralOptimizerLion (Chen et al.
       2023, sign-based update with ONE momentum buffer vs Adam's two; decoupled

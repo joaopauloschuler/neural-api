@@ -99,6 +99,83 @@ type
       property BestLoss: TNeuralFloat read FBestLoss;
     end;
 
+  // Stochastic Weight Averaging callback (a port of torch.optim.swa_utils).
+  // Maintains an EQUAL-WEIGHT running mean of the live network weights,
+  // snapshotting at the end of every epoch in the averaging window (epochs
+  // >= StartEpoch, every SnapshotEveryEpochs-th epoch). Unlike the EMA wiring
+  // (TNeuralFitBase.EnableEMA, a decayed running average), SWA is a plain mean
+  // of K snapshots over the schedule tail. The averaging math is delegated to
+  // TNNetSWAWrapper (neuralnetwork.pas) - it is NOT reimplemented here.
+  //
+  // Implemented as a CALLBACK (rather than as TNeuralFitBase fields like EMA)
+  // because the new callback API already exposes exactly the hook SWA needs -
+  // OnEpochEnd - so no growth of TNeuralFitBase is required; the wrapper, the
+  // live-weight stash and the swap state all live on the callback. The
+  // store/load/restore swap mirrors the EMA Apply/Restore plumbing
+  // (TNeuralFitBase.ApplyEMAWeights / RestoreLiveWeights): ApplySWAWeights
+  // stashes the live weights then copies the averaged shadow into the net so
+  // the caller can eval/save; RestoreLiveWeights puts the live weights back so
+  // training continues bit-identically.
+  //
+  // SWA constant/cyclic LR phase: the torch SWALR schedule (holding a constant
+  // SWA learning rate, or cycling it, during the averaging tail) is a learning
+  // -rate concern, not an averaging concern. It is supplied independently via
+  // the existing LR machinery (e.g. Fit.CyclicalLearningRateLen for a cyclic
+  // tail, or a custom/constant InitialLearningRate), so this callback does NOT
+  // touch the learning rate - it only accumulates and swaps weights.
+  //
+  // BatchNorm running-stats recompute (torch's update_bn): SKIPPED here. This
+  // library's normalization layers (TNNetLayerNorm / TNNetRMSNorm / TNNetGroupNorm)
+  // compute their statistics per-forward-pass from the current activations and
+  // carry NO persistent running mean/var that an averaged-weight forward pass
+  // would invalidate, so no BN-recompute pass is needed. If a running-stats BN
+  // layer is added later, a post-SWA recompute pass over the training data
+  // would have to be layered on.
+  // Coded by Claude (AI).
+  TNeuralFitSWA = class(TNeuralFitCallback)
+    private
+      FStartEpoch: integer;          // first (1-based) epoch to snapshot
+      FSnapshotEveryEpochs: integer; // snapshot cadence within the window
+      FSWA: TNNetSWAWrapper;         // averaging machinery (owned, lazy)
+      FSaved: TNNet;                 // live weights stashed during a swap (owned)
+      FSwapped: boolean;             // true while averaged weights are swapped in
+      FLastNN: TNNet;                // net the wrapper was created against
+    public
+      // pStartEpoch         = first 1-based epoch whose end-of-epoch weights are
+      //                       folded into the average (epochs before it are
+      //                       ignored). Defaults to 1 (average the whole run).
+      // pSnapshotEveryEpochs= snapshot cadence within the window (>=1). 1 means
+      //                       every epoch; 2 means every other epoch, etc.
+      constructor Create(pStartEpoch: integer = 1;
+        pSnapshotEveryEpochs: integer = 1);
+      destructor Destroy(); override;
+      // Resets the running mean (and any active swap) so the callback can be
+      // reused for a fresh fit.
+      procedure Reset();
+      // Folds the current live weights of Sender.NN into the running mean when
+      // the epoch is in the averaging window. Called automatically by the fit
+      // loop at the end of each epoch.
+      procedure OnEpochEnd(Sender: TNeuralFitBase; Epoch: integer); override;
+      // Swaps the averaged (SWA) weights INTO the live net for eval/save,
+      // stashing the live training weights so they can be restored. No-op
+      // (returns false) when no snapshot has been accumulated yet, or when a
+      // swap is already active. Pairs with RestoreLiveWeights.
+      function ApplySWAWeights(pNN: TNNet): boolean;
+      // Restores the live training weights stashed by ApplySWAWeights, leaving
+      // them bit-identical to before the swap. No-op if no swap is active.
+      procedure RestoreLiveWeights(pNN: TNNet);
+      // The shadow network holding the averaged weights (nil until the first
+      // snapshot; owned by the wrapper). Read-only convenience accessor.
+      function SWAShadowNet(): TNNet;
+      // Number of snapshots folded into the current average.
+      function SnapshotCount(): integer;
+      // True while the averaged weights are swapped into the live net.
+      property Swapped: boolean read FSwapped;
+      property StartEpoch: integer read FStartEpoch write FStartEpoch;
+      property SnapshotEveryEpochs: integer read FSnapshotEveryEpochs
+        write FSnapshotEveryEpochs;
+    end;
+
   // This is a base class for all optimizers
   TNeuralOptimizer = class(TMObject)
   private
@@ -2746,6 +2823,93 @@ begin
       end;
     end;
   end;
+end;
+
+{ TNeuralFitSWA }
+
+constructor TNeuralFitSWA.Create(pStartEpoch: integer;
+  pSnapshotEveryEpochs: integer);
+begin
+  inherited Create();
+  FStartEpoch := pStartEpoch;
+  if pSnapshotEveryEpochs < 1 then pSnapshotEveryEpochs := 1;
+  FSnapshotEveryEpochs := pSnapshotEveryEpochs;
+  FSWA := nil;
+  FSaved := nil;
+  FSwapped := false;
+  FLastNN := nil;
+end;
+
+destructor TNeuralFitSWA.Destroy();
+begin
+  if Assigned(FSWA) then FreeAndNil(FSWA);
+  if Assigned(FSaved) then FreeAndNil(FSaved);
+  inherited Destroy();
+end;
+
+procedure TNeuralFitSWA.Reset();
+begin
+  // Drop any active swap and the accumulated mean.
+  FSwapped := false;
+  if Assigned(FSWA) then FSWA.Reset();
+end;
+
+procedure TNeuralFitSWA.OnEpochEnd(Sender: TNeuralFitBase; Epoch: integer);
+begin
+  if not Assigned(Sender) then exit;
+  if not Assigned(Sender.NN) then exit;
+  // Only snapshot inside the averaging window: from StartEpoch onward, every
+  // SnapshotEveryEpochs-th epoch (counting from StartEpoch). Epoch is 1-based.
+  if Epoch < FStartEpoch then exit;
+  if ((Epoch - FStartEpoch) mod FSnapshotEveryEpochs) <> 0 then exit;
+  // Lazily create the wrapper against the live net. The wrapper clones the
+  // net (constructing layers whose initializers draw from the global RNG, then
+  // overwriting them via CopyWeights) - exactly the bounded RNG perturbation
+  // already documented for the EMA wiring; the optimization MATH is untouched
+  // because SWA never writes the live weights or deltas during training.
+  if (not Assigned(FSWA)) or (FLastNN <> Sender.NN) then
+  begin
+    if Assigned(FSWA) then FreeAndNil(FSWA);
+    FSWA := TNNetSWAWrapper.Create(Sender.NN);
+    FLastNN := Sender.NN;
+  end;
+  // Fold the current live weights into the equal-weight running mean.
+  FSWA.Accumulate();
+end;
+
+function TNeuralFitSWA.ApplySWAWeights(pNN: TNNet): boolean;
+begin
+  Result := false;
+  if (not Assigned(FSWA)) or (FSWA.Count = 0) or (not Assigned(pNN)) then exit;
+  if FSwapped then exit; // already swapped; ignore nested calls
+  // Stash the live training weights, then copy the SWA shadow into the net.
+  if not Assigned(FSaved)
+    then FSaved := pNN.Clone()
+    else FSaved.CopyWeights(pNN);
+  FSWA.CopyShadowTo(pNN);
+  FSwapped := true;
+  Result := true;
+end;
+
+procedure TNeuralFitSWA.RestoreLiveWeights(pNN: TNNet);
+begin
+  if not FSwapped then exit;
+  if Assigned(FSaved) and Assigned(pNN) then pNN.CopyWeights(FSaved);
+  FSwapped := false;
+end;
+
+function TNeuralFitSWA.SWAShadowNet(): TNNet;
+begin
+  if Assigned(FSWA)
+    then Result := FSWA.ShadowNet()
+    else Result := nil;
+end;
+
+function TNeuralFitSWA.SnapshotCount(): integer;
+begin
+  if Assigned(FSWA)
+    then Result := FSWA.Count
+    else Result := 0;
 end;
 
 procedure TNeuralFitBase.WaitUntilFinished;
