@@ -5281,6 +5281,52 @@ function BuildKokoroFromSafeTensorsWithConfig(const FileName: string;
   const Config: TKokoroConfig): TNNetKokoro;
 
 // ---------------------------------------------------------------------------
+// F5-TTS FLOW-MATCHING TEXT-TO-SPEECH IMPORT (SWivid/F5-TTS; Chen et al. 2024,
+// "F5-TTS: A Fairytaler that Fakes Fluent and Faithful Speech with Flow
+// Matching"). NON-autoregressive, NON-GAN voice cloner: it regresses a mel-
+// spectrogram by integrating a conditional-flow-matching ODE through a DiT
+// trunk, conditioned in-context on a masked reference mel + an embedded
+// character sequence. v1 imports the DiT VELOCITY FIELD (the genuinely new
+// importable piece); the mel output is paired with an already-landed vocoder
+// (Vocos / HiFi-GAN) downstream. Reuses the landed adaLN-zero DiT block, RoPE
+// SDPA and a ConvNeXt-V2 1-D text embedder. Coded by Claude (AI).
+// ---------------------------------------------------------------------------
+type
+  TF5Config = record
+    Dim: integer;             // transformer width
+    Depth: integer;           // number of DiT blocks
+    Heads: integer;           // attention heads (head_dim = Dim div Heads)
+    FFMult: integer;          // FFN multiplier (ff_dim = FFMult*Dim)
+    NMelChannels: integer;    // n_mel_channels (velocity-field width)
+    TextDim: integer;         // text embedding width (conv_text_dim)
+    TextNumEmbeds: integer;   // character vocab size (incl filler id 0)
+    ConvLayers: integer;      // ConvNeXt-V2 text blocks
+    ConvMult: integer;        // ConvNeXt inner mult
+    RopeTheta: TNeuralFloat;  // RoPE base
+    LayerNormEps: TNeuralFloat;
+    ModelType: string;        // 'f5tts'
+  end;
+
+// Reads an F5-TTS config JSON (model_type "f5tts"). Coded by Claude (AI).
+function ReadF5ConfigFromJSONFile(const FileName: string): TF5Config;
+
+function F5ConfigToString(const Config: TF5Config): string;
+
+// Builds the F5-TTS DiT velocity field from Reader (caller owns Reader). The
+// returned TNNet has four inputs: input0 = noised mel x_t (S,1,n_mel),
+// input1 = reference cond mel (S,1,n_mel), input2 = character ids (S,1,1),
+// input3 = scalar time t (1,1,1). It outputs the velocity field (S,1,n_mel).
+// Coded by Claude (AI).
+function BuildF5TTSFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  var Config: TF5Config; SeqLen: integer): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config. SeqLen is the mel/text sequence length
+// to build the static graph for. Coded by Claude (AI).
+function BuildF5TTSFromSafeTensors(const FileName: string; SeqLen: integer;
+  out Config: TF5Config; const ConfigFileName: string = ''): TNNet;
+
+// ---------------------------------------------------------------------------
 // DEMUCS TIME-DOMAIN MUSIC SOURCE-SEPARATION IMPORT (facebook/demucs, htdemucs
 // time branch; Defossez et al. 2019, "Music Source Separation in the Waveform
 // Domain", arXiv:1911.13254) - the FIRST audio source-separation model and a
@@ -69815,6 +69861,380 @@ procedure RunVideoMAELogits(Net: TNNet; ClipInput, Logits: TNNetVolume);
 begin
   Net.Compute(ClipInput);
   Logits.Copy(Net.GetLastLayer().Output);
+end;
+
+// ===========================================================================
+// F5-TTS FLOW-MATCHING TEXT-TO-SPEECH IMPORT
+// ===========================================================================
+
+function ReadF5ConfigFromJSONFile(const FileName: string): TF5Config;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType: string;
+
+  function OptInt(const Name: string; Def: integer): integer;
+  begin
+    if Obj.IndexOfName(Name) >= 0 then Result := Obj.Get(Name, Def)
+    else Result := Def;
+  end;
+  function OptFloat(const Name: string; Def: double): double;
+  begin
+    if Obj.IndexOfName(Name) >= 0 then Result := Obj.Get(Name, Def)
+    else Result := Def;
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('F5-TTS import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError('F5-TTS import: config "' + FileName + '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', '');
+    if (ModelType <> '') and (ModelType <> 'f5tts') and (ModelType <> 'f5-tts') then
+      ImportError('F5-TTS import: config model_type is "' + ModelType +
+        '", expected "f5tts".');
+    Result.ModelType := 'f5tts';
+    Result.Dim           := OptInt('dim', 1024);
+    Result.Depth         := OptInt('depth', 22);
+    Result.Heads         := OptInt('heads', 16);
+    Result.FFMult        := OptInt('ff_mult', 2);
+    Result.NMelChannels  := OptInt('n_mel_channels', 100);
+    Result.TextDim       := OptInt('text_dim', 512);
+    Result.TextNumEmbeds := OptInt('text_num_embeds', 256);
+    Result.ConvLayers    := OptInt('conv_layers', 4);
+    Result.ConvMult      := OptInt('conv_mult', 2);
+    Result.RopeTheta     := OptFloat('rope_theta', 10000.0);
+    Result.LayerNormEps  := OptFloat('layer_norm_eps', 1e-6);
+    if (Result.Dim mod Result.Heads) <> 0 then
+      ImportError('F5-TTS import: dim=' + IntToStr(Result.Dim) +
+        ' not divisible by heads=' + IntToStr(Result.Heads) + '.');
+  finally
+    if Root <> nil then Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function F5ConfigToString(const Config: TF5Config): string;
+begin
+  Result := Format('F5-TTS(dim=%d, depth=%d, heads=%d, ff_mult=%d, n_mel=%d, ' +
+    'text_dim=%d, vocab=%d, conv_layers=%d)',
+    [Config.Dim, Config.Depth, Config.Heads, Config.FFMult, Config.NMelChannels,
+     Config.TextDim, Config.TextNumEmbeds, Config.ConvLayers]);
+end;
+
+// Loads a depthwise 1-D conv (PyTorch nn.Conv1d weight [C,1,K] flattened to
+// [C,K]) onto a TNNetDepthwiseConv1D: neuron c gets row c (K taps) + bias c.
+procedure LoadF5DepthwiseConv1D(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BiasName: string; Channels, K: integer);
+var
+  W, B: TNNetVolume;
+  c, j, CM1, KM1: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('F5-TTS import: missing tensor "' + WName + '".');
+  if Reader.ElementCount(WName) <> Int64(Channels) * K then
+    ImportError('F5-TTS import: "' + WName + '" must have ' +
+      IntToStr(Channels * K) + ' elements, got ' +
+      IntToStr(Reader.ElementCount(WName)) + '.');
+  if Layer.Neurons.Count <> Channels then
+    ImportError('F5-TTS import: depthwise conv layer for "' + WName +
+      '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(Channels) + '.');
+  CM1 := Channels - 1; KM1 := K - 1;
+  W := TNNetVolume.Create; B := nil;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    if BiasName <> '' then
+    begin
+      if not Reader.HasTensor(BiasName) then
+        ImportError('F5-TTS import: missing tensor "' + BiasName + '".');
+      B := TNNetVolume.Create;
+      Reader.LoadTensorFlat(BiasName, B);
+    end;
+    for c := 0 to CM1 do
+    begin
+      for j := 0 to KM1 do
+        Layer.FArrNeurons[c].Weights.FData[j] := W.FData[c * K + j];
+      if B <> nil then Layer.FArrNeurons[c].BiasWeight := B.FData[c]
+      else Layer.FArrNeurons[c].BiasWeight := 0;
+    end;
+    Layer.FlushWeightCache();
+  finally
+    B.Free;
+    W.Free;
+  end;
+end;
+
+// Loads gamma|beta of a TNNetGRN (FNeurons[0]=gamma, FNeurons[1]=beta).
+procedure LoadF5GRN(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
+  const GammaName, BetaName: string; Channels: integer);
+var
+  V: TNNetVolume;
+  c, CM1: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  CM1 := Channels - 1;
+  V := TNNetVolume.Create;
+  try
+    if not Reader.HasTensor(GammaName) then
+      ImportError('F5-TTS import: missing tensor "' + GammaName + '".');
+    Reader.LoadTensorFlat(GammaName, V);
+    for c := 0 to CM1 do Layer.FArrNeurons[0].Weights.FData[c] := V.FData[c];
+    if not Reader.HasTensor(BetaName) then
+      ImportError('F5-TTS import: missing tensor "' + BetaName + '".');
+    Reader.LoadTensorFlat(BetaName, V);
+    for c := 0 to CM1 do Layer.FArrNeurons[1].Weights.FData[c] := V.FData[c];
+    Layer.FlushWeightCache();
+  finally
+    V.Free;
+  end;
+end;
+
+// One ConvNeXt-V2 1-D block over the (S,1,C) text sequence. Records the layers
+// that need weights loaded. Returns the block-output layer.
+type
+  TF5ConvNeXtLayers = record
+    DwConv, LN, PwConv1, GRN, PwConv2: TNNetLayer;
+  end;
+
+function AddF5ConvNeXtBlock(NN: TNNet; XInput: TNNetLayer;
+  const Config: TF5Config; var Block: TF5ConvNeXtLayers): TNNetLayer;
+var
+  Branch: TNNetLayer;
+  C, Inner: integer;
+begin
+  C := Config.TextDim;
+  Inner := Config.ConvMult * C;
+  Block.DwConv := NN.AddLayerAfter(
+    TNNetDepthwiseConv1D.Create(7, {pCausal=}false, {pSuppressBias=}0), XInput);
+  Block.LN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+  Block.PwConv1 := NN.AddLayer(TNNetPointwiseConvLinear.Create(Inner));
+  NN.AddLayer(TNNetGELUErf.Create());
+  Block.GRN := NN.AddLayer(TNNetGRN.Create());
+  Block.PwConv2 := NN.AddLayer(TNNetPointwiseConvLinear.Create(C));
+  Branch := NN.GetLastLayer();
+  Result := NN.AddLayer(TNNetSum.Create([Branch, XInput]));
+end;
+
+// One F5 DiT adaLN-zero block with RoPE self-attention. CondLayer is the
+// (1,1,dim) time conditioning vector c. XInput is the (S,1,dim) token sequence.
+type
+  TF5DiTBlockLayers = record
+    AdaLN: TNNetLayer;     // adaln Linear (dim -> 6*dim)
+    QKV: TNNetLayer;       // attn.qkv (dim -> 3*dim)
+    AttnProj: TNNetLayer;  // attn out-projection (dim -> dim)
+    Ff0: TNNetLayer;       // ff.0 (dim -> ff_dim)
+    Ff2: TNNetLayer;       // ff.2 (ff_dim -> dim)
+  end;
+
+function AddF5DiTBlock(NN: TNNet; XInput, CondLayer: TNNetLayer;
+  const Config: TF5Config; var Block: TF5DiTBlockLayers): TNNetLayer;
+var
+  d, FfHidden: integer;
+  SiluC, LN1, Mod1, FiLM1, Attn, Gate1Slice, Gated1, Res1: TNNetLayer;
+  LN2, Mod2, FiLM2, FfOut, Gate2Slice, Gated2: TNNetLayer;
+begin
+  d := Config.Dim;
+  FfHidden := Config.FFMult * d;
+  // adaLN_modulation: Linear(SiLU(c)) -> 6*dim.
+  SiluC := NN.AddLayerAfter(TNNetSiLU.Create(), CondLayer);
+  Block.AdaLN := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(6 * d), SiluC);
+  // chunk layout [shift_a, scale_a, gate_a, shift_f, scale_f, gate_f] each d.
+  // ---- attention sub-block ----
+  LN1 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps), XInput);
+  Mod1 := DiTModCond(NN, Block.AdaLN, {scale}1 * d, {shift}0 * d, d);
+  FiLM1 := NN.AddLayer(TNNetFiLM.Create([LN1, Mod1]));
+  Block.QKV := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(3 * d), FiLM1);
+  // RoPE SDPA self-attention; the out-projection is appended inside.
+  Block.AttnProj := NN.AddMultiHeadSelfAttention(Config.Heads,
+    {CausalMask=}false, {UseRoPE=}true);
+  Attn := NN.GetLastLayer();
+  Gate1Slice := NN.AddLayerAfter(TNNetSplitChannels.Create(2 * d, d), Block.AdaLN);
+  Gated1 := NN.AddLayer(TNNetChannelMulByLayer.Create(Attn, Gate1Slice));
+  Res1 := NN.AddLayer(TNNetSum.Create([Gated1, XInput]));
+  // ---- feed-forward sub-block ----
+  LN2 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps), Res1);
+  Mod2 := DiTModCond(NN, Block.AdaLN, {scale}4 * d, {shift}3 * d, d);
+  FiLM2 := NN.AddLayer(TNNetFiLM.Create([LN2, Mod2]));
+  Block.Ff0 := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(FfHidden), FiLM2);
+  NN.AddLayer(TNNetGELU.Create()); // tanh-approx GELU
+  Block.Ff2 := NN.AddLayer(TNNetPointwiseConvLinear.Create(d));
+  FfOut := NN.GetLastLayer();
+  Gate2Slice := NN.AddLayerAfter(TNNetSplitChannels.Create(5 * d, d), Block.AdaLN);
+  Gated2 := NN.AddLayer(TNNetChannelMulByLayer.Create(FfOut, Gate2Slice));
+  Result := NN.AddLayer(TNNetSum.Create([Gated2, Res1]));
+end;
+
+function BuildF5TTSFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  var Config: TF5Config; SeqLen: integer): TNNet;
+var
+  NN: TNNet;
+  XtInput, CondInput, TextInput, TimeInput: TNNetLayer;
+  TextEmbLayer, TextEmb, InCat, InProj, ConvA, ConvB, PosRes: TNNetLayer;
+  TSin, TFc0, TSilu, TFc2: TNNetLayer;
+  XLayer, FinalSilu, FinalMod, FinalLN, FinalFiLM, ProjOut: TNNetLayer;
+  FinalModLayer: TNNetLayer;
+  ConvBlocks: array of TF5ConvNeXtLayers;
+  Blocks: array of TF5DiTBlockLayers;
+  d, HeadDim, FfHidden, Inner, i, BlockCnt, DepthM1, ConvM1: integer;
+  RopeBase: TNeuralFloat;
+  p: string;
+begin
+  d := Config.Dim;
+  HeadDim := d div Config.Heads;
+  FfHidden := Config.FFMult * d;
+  Inner := Config.ConvMult * Config.TextDim;
+  DepthM1 := Config.Depth - 1;
+  ConvM1 := Config.ConvLayers - 1;
+  RopeBase := Config.RopeTheta;
+  if SeqLen < 1 then
+    ImportError('F5-TTS import: SeqLen must be >= 1, got ' + IntToStr(SeqLen) + '.');
+  NN := TNNet.Create();
+
+  // ---------------- Architecture ----------------
+  // ALL input layers MUST be the first layers (TNNet.Compute([...]) maps
+  // pInput[i] -> FLayers[i]): input0 = noised mel x_t (S,1,n_mel),
+  // input1 = reference cond mel (S,1,n_mel), input2 = character ids (S,1,1),
+  // input3 = scalar time t (1,1,1).
+  XtInput   := NN.AddLayer(TNNetInput.Create(SeqLen, 1, Config.NMelChannels));
+  CondInput := NN.AddLayer(TNNetInput.Create(SeqLen, 1, Config.NMelChannels));
+  TextInput := NN.AddLayer(TNNetInput.Create(SeqLen, 1, 1));
+  TimeInput := NN.AddLayer(TNNetInput.Create(1, 1, 1));
+
+  // text branch: char embedding -> ConvNeXt-V2 1D blocks.
+  TextEmbLayer := NN.AddLayerAfter(TNNetEmbedding.Create(Config.TextNumEmbeds,
+    Config.TextDim, {EncodeZero=}1, {ScaleEmbedding=}1.0), TextInput);
+  TextEmb := TextEmbLayer;
+  SetLength(ConvBlocks, Config.ConvLayers);
+  for i := 0 to ConvM1 do
+    TextEmb := AddF5ConvNeXtBlock(NN, TextEmb, Config, ConvBlocks[i]);
+  // input embedding: concat([x_t, cond, text_emb]) -> Linear(dim) + conv pos res
+  InCat := NN.AddLayer(TNNetDeepConcat.Create([XtInput, CondInput, TextEmb]));
+  InProj := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d), InCat);
+  ConvA := NN.AddLayerAfter(
+    TNNetDepthwiseConv1D.Create(7, {pCausal=}false, 0), InProj);
+  NN.AddLayer(TNNetGELUErf.Create());
+  ConvB := NN.AddLayer(TNNetDepthwiseConv1D.Create(7, {pCausal=}false, 0));
+  PosRes := NN.AddLayer(TNNetSum.Create([ConvB, InProj]));
+  XLayer := PosRes;
+
+  // time branch: scalar t -> sinusoidal -> MLP (attached to input3).
+  TSin := NN.AddLayerAfter(TNNetSinusoidalTimeEmbedding.Create(d), TimeInput);
+  TFc0 := NN.AddLayer(TNNetPointwiseConvLinear.Create(d));
+  TSilu := NN.AddLayer(TNNetSiLU.Create());
+  TFc2 := NN.AddLayer(TNNetPointwiseConvLinear.Create(d));
+
+  // ---- DiT blocks ----
+  SetLength(Blocks, Config.Depth);
+  for BlockCnt := 0 to DepthM1 do
+    XLayer := AddF5DiTBlock(NN, XLayer, TFc2, Config, Blocks[BlockCnt]);
+
+  // ---- final adaLN norm-out + proj_out ----
+  FinalSilu := NN.AddLayerAfter(TNNetSiLU.Create(), TFc2);
+  FinalModLayer := NN.AddLayer(TNNetPointwiseConvLinear.Create(2 * d)); // [shift,scale]
+  FinalLN := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps), XLayer);
+  FinalMod := DiTModCond(NN, FinalModLayer, {scale}1 * d, {shift}0 * d, d);
+  FinalFiLM := NN.AddLayer(TNNetFiLM.Create([FinalLN, FinalMod]));
+  ProjOut := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Config.NMelChannels), FinalFiLM);
+
+  NN.SetTrainable();
+  // The repo SDPA builder bakes RoPE base 10000 (the F5 default). A non-default
+  // rope_theta would need a custom rotary build; reject it loudly for now.
+  if Abs(RopeBase - 10000.0) > 1e-6 then
+    ImportError('F5-TTS import: rope_theta=' + FloatToStr(RopeBase) +
+      ' != 10000 is not supported by v1 (the SDPA RoPE base is fixed at ' +
+      '10000); open follow-up.');
+
+  // ---------------- Weights ----------------
+  // text char-embedding table.
+  LoadClipEmbeddingTable(Reader, TextEmbLayer,
+    'text_embed.weight', Config.TextNumEmbeds, Config.TextDim);
+
+  // ConvNeXt-V2 text blocks (LN is affine-free TNNetTokenLayerNorm; no norm
+  // weights to load).
+  for i := 0 to ConvM1 do
+  begin
+    p := 'text_conv.' + IntToStr(i) + '.';
+    LoadF5DepthwiseConv1D(Reader, ConvBlocks[i].DwConv,
+      p + 'dwconv.weight', p + 'dwconv.bias', Config.TextDim, 7);
+    LoadLlamaLinearWeights(Reader, ConvBlocks[i].PwConv1,
+      p + 'pwconv1.weight', Config.TextDim, Inner, 0, -1, 0, p + 'pwconv1.bias');
+    LoadF5GRN(Reader, ConvBlocks[i].GRN, p + 'grn.gamma', p + 'grn.beta', Inner);
+    LoadLlamaLinearWeights(Reader, ConvBlocks[i].PwConv2,
+      p + 'pwconv2.weight', Inner, Config.TextDim, 0, -1, 0, p + 'pwconv2.bias');
+  end;
+  // input embedding.
+  LoadLlamaLinearWeights(Reader, InProj, 'input_embed.proj.weight',
+    2 * Config.NMelChannels + Config.TextDim, d, 0, -1, 0, 'input_embed.proj.bias');
+  LoadF5DepthwiseConv1D(Reader, ConvA,
+    'input_embed.conv.0.weight', 'input_embed.conv.0.bias', d, 7);
+  LoadF5DepthwiseConv1D(Reader, ConvB,
+    'input_embed.conv.1.weight', 'input_embed.conv.1.bias', d, 7);
+  // time embedding MLP (sinusoidal order matches the framework [sin|cos]).
+  LoadLlamaLinearWeights(Reader, TFc0, 'time_embed.mlp.0.weight', d, d,
+    0, -1, 0, 'time_embed.mlp.0.bias');
+  LoadLlamaLinearWeights(Reader, TFc2, 'time_embed.mlp.2.weight', d, d,
+    0, -1, 0, 'time_embed.mlp.2.bias');
+  // DiT blocks.
+  for BlockCnt := 0 to DepthM1 do
+  begin
+    p := 'blocks.' + IntToStr(BlockCnt) + '.';
+    LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AdaLN,
+      p + 'adaln.weight', d, 6 * d, 0, -1, 0, p + 'adaln.bias');
+    // qkv slab [Q(d)|K(d)|V(d)]: Q,K get the rotate_half->interleaved permute.
+    LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV, p + 'attn.qkv.weight',
+      d, d, {NeuronBase}0, {ExpectedNeurons}3 * d, {RotaryHeadDim}HeadDim,
+      p + 'attn.qkv.bias', 1.0, {RotaryDims}HeadDim, {SrcRowBase}0, {SrcRows}3 * d);
+    LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV, p + 'attn.qkv.weight',
+      d, d, {NeuronBase}d, {ExpectedNeurons}3 * d, {RotaryHeadDim}HeadDim,
+      p + 'attn.qkv.bias', 1.0, {RotaryDims}HeadDim, {SrcRowBase}d, {SrcRows}3 * d);
+    LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV, p + 'attn.qkv.weight',
+      d, d, {NeuronBase}2 * d, {ExpectedNeurons}3 * d, {RotaryHeadDim}0,
+      p + 'attn.qkv.bias', 1.0, {RotaryDims}0, {SrcRowBase}2 * d, {SrcRows}3 * d);
+    LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttnProj,
+      p + 'attn.proj.weight', d, d, 0, -1, 0, p + 'attn.proj.bias');
+    LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Ff0,
+      p + 'ff.0.weight', d, FfHidden, 0, -1, 0, p + 'ff.0.bias');
+    LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Ff2,
+      p + 'ff.2.weight', FfHidden, d, 0, -1, 0, p + 'ff.2.bias');
+  end;
+  // final layer.
+  LoadLlamaLinearWeights(Reader, FinalModLayer, 'norm_out.weight',
+    d, 2 * d, 0, -1, 0, 'norm_out.bias');
+  LoadLlamaLinearWeights(Reader, ProjOut, 'proj_out.weight',
+    d, Config.NMelChannels, 0, -1, 0, 'proj_out.bias');
+
+  Result := NN;
+end;
+
+function BuildF5TTSFromSafeTensors(const FileName: string; SeqLen: integer;
+  out Config: TF5Config; const ConfigFileName: string = ''): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  CfgPath: string;
+begin
+  if ConfigFileName <> '' then CfgPath := ConfigFileName
+  else CfgPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadF5ConfigFromJSONFile(CfgPath);
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildF5TTSFromSafeTensorsEx(Reader, Config, SeqLen);
+  finally
+    Reader.Free;
+  end;
 end;
 
 end.

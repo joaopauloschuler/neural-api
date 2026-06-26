@@ -776,7 +776,7 @@ rather than acted on.
   - [ ] Mimi STREAMING chunk-at-a-time encode/decode (HF `MimiConv1dPaddingCache`
         per-conv padding cache + KV-cache transformer decode via the landed SDPA
         Begin/EndIncrementalDecode) for O(1) per-frame Moshi-style inference.
-- [ ] F5-TTS flow-matching text-to-speech importer (`BuildF5TTSFromSafeTensors[Ex]` +
+- [X] F5-TTS flow-matching text-to-speech importer (`BuildF5TTSFromSafeTensors[Ex]` +
       `TF5Config`/`ReadF5ConfigFromJSONFile`, model `SWivid/F5-TTS`) — the
       leading open NON-autoregressive, NON-GAN voice cloner, genuinely distinct
       from the landed VITS (GAN), Kokoro/StyleTTS2 (adversarial), Bark (codec-LM)
@@ -792,7 +792,19 @@ rather than acted on.
       (Vocos/HiFi-GAN) to reach waveform. Pico parity `< 1e-4` vs a float64 HF
       reference on the DiT velocity field (generator `tools/f5_tiny_fixture.py`,
       committed `tests/fixtures/tiny_f5.*`) + an `examples/F5TTS` voice-clone smoke.
-      Open follow-ups: real `SWivid/F5-TTS` checkpoint parity (offline/RAM-gated);
+      LANDED: `TF5Config`/`ReadF5ConfigFromJSONFile`/`F5ConfigToString` +
+      `BuildF5TTSFromSafeTensors[Ex]` (four-input DiT velocity field: ConvNeXt-V2
+      1-D text embed, in-context `DeepConcat([x_t,cond,text])` input embedding,
+      sinusoidal+MLP time cond, adaLN-zero RoPE-SDPA DiT trunk via the landed
+      `DiTModCond`/`TNNetFiLM` + qkv `rotate_half`->interleaved permute, adaLN
+      norm-out, NO new leaf layer); pico oracle `tools/f5_tiny_fixture.py` (numpy
+      float64 reimpl of the official `dit.py` forward, F5 not in transformers) +
+      `tiny_f5.*` (~29KB) + `TestF5TTSParity` max |diff| ~1.4e-5 < 1e-4;
+      `examples/F5TTS` Euler-ODE voice-clone smoke (outputs MEL; non-AR so no
+      KV-cache) + examples/README.md entry. Open follow-ups: real
+      `SWivid/F5-TTS` checkpoint key-mapping parity (offline/RAM-gated); the
+      mel->waveform Vocos/HiFi-GAN vocoder pairing (v1 emits mel); non-default
+      `rope_theta` (the SDPA RoPE base is fixed at 10000, rejected loudly);
       the E2-TTS flat-UNet variant (same flow-matching objective, simpler trunk);
       classifier-free-guidance strength sweep on the cond/uncond DiT pass.
 - [ ] CLAP audio-text contrastive importer (`BuildClapFromSafeTensors[Ex]` +

@@ -286,6 +286,12 @@ type
     // vs a numpy float64 oracle on the committed pico fixture. Also exercises
     // the powerset->per-speaker decode.
     procedure TestPyannoteParity;
+    // F5-TTS flow-matching DiT velocity-field parity: noised mel + reference
+    // cond mel + character ids + scalar time -> ConvNeXt-V2 text embed,
+    // in-context concat input embedding, RoPE adaLN-zero DiT trunk, adaLN
+    // norm-out -> mel-width velocity field, vs a numpy float64 oracle on the
+    // committed pico fixture.
+    procedure TestF5TTSParity;
     // ECAPA-TDNN speaker-embedding parity: log-mel frames -> conv_pre ->
     // 3x SE-Res2Block -> MFA -> attentive statistics pooling -> 192-d-style
     // embedding, vs a numpy float64 oracle on a re-randomized pico fixture;
@@ -12994,6 +13000,108 @@ begin
     NN.Free;
     Output.Free; Input.Free;
     RowToks.Free; WaveToks.Free; Header.Free; Lines.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestF5TTSParity;
+var
+  NN: TNNet;
+  Config: TF5Config;
+  Lines, Header, IdToks, XToks, CToks, RowToks: TStringList;
+  Xt, Cond, Text, Time, Output: TNNetVolume;
+  S, NMel, Vocab, r, c, i: integer;
+  TVal: double;
+  Diff, MaxDiff, Expected: double;
+  FS: TFormatSettings;
+begin
+  RandSeed := 424242;
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  Lines := TStringList.Create;
+  Header := TStringList.Create;
+  IdToks := TStringList.Create;
+  XToks := TStringList.Create;
+  CToks := TStringList.Create;
+  RowToks := TStringList.Create;
+  Xt := TNNetVolume.Create;
+  Cond := TNNetVolume.Create;
+  Text := TNNetVolume.Create;
+  Time := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  NN := nil;
+  try
+    Lines.LoadFromFile(FixturePath('tiny_f5_expected.txt'));
+    AssertTrue('expected file has header + ids + 2 inputs + frames',
+      Lines.Count >= 4);
+    // Line 0: "S n_mel vocab t".
+    Header.Delimiter := ' '; Header.StrictDelimiter := True;
+    Header.DelimitedText := Lines[0];
+    S := StrToInt(Header[0]);
+    NMel := StrToInt(Header[1]);
+    Vocab := StrToInt(Header[2]);
+    TVal := StrToFloat(Header[3], FS);
+
+    NN := BuildF5TTSFromSafeTensors(
+      FixturePath('tiny_f5.safetensors'), S, Config,
+      FixturePath('tiny_f5_config.json'));
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('model_type', 'f5tts', Config.ModelType);
+    AssertEquals('n_mel', NMel, Config.NMelChannels);
+    AssertEquals('vocab', Vocab, Config.TextNumEmbeds);
+    AssertEquals('velocity shape', S * NMel, NN.GetLastLayer().Output.Size);
+
+    // Line 1: character ids.
+    IdToks.Delimiter := ' '; IdToks.StrictDelimiter := True;
+    IdToks.DelimitedText := Lines[1];
+    AssertEquals('id count', S, IdToks.Count);
+    Text.ReSize(S, 1, 1);
+    for i := 0 to S - 1 do Text.FData[i] := StrToInt(IdToks[i]);
+    // Line 2: noised mel x_t (S*NMel). Line 3: reference cond mel (S*NMel).
+    XToks.Delimiter := ' '; XToks.StrictDelimiter := True;
+    XToks.DelimitedText := Lines[2];
+    CToks.Delimiter := ' '; CToks.StrictDelimiter := True;
+    CToks.DelimitedText := Lines[3];
+    AssertEquals('x_t length', S * NMel, XToks.Count);
+    AssertEquals('cond length', S * NMel, CToks.Count);
+    Xt.ReSize(S, 1, NMel);
+    Cond.ReSize(S, 1, NMel);
+    for i := 0 to S * NMel - 1 do
+    begin
+      Xt.FData[i] := StrToFloat(XToks[i], FS);
+      Cond.FData[i] := StrToFloat(CToks[i], FS);
+    end;
+    // F5/FlowMatching convention: the scalar time input is the continuous
+    // t in [0,1] PRE-SCALED by 1000 to land in the sinusoidal table's integer
+    // range (TNNetSinusoidalTimeEmbedding consumes the input verbatim).
+    Time.ReSize(1, 1, 1);
+    Time.FData[0] := TVal * 1000.0;
+
+    NN.Compute([Xt, Cond, Text, Time]);
+    NN.GetOutput(Output);
+
+    // Lines 4..: per-frame expected velocity (S rows x NMel).
+    MaxDiff := 0;
+    for r := 0 to S - 1 do
+    begin
+      RowToks.Delimiter := ' '; RowToks.StrictDelimiter := True;
+      RowToks.DelimitedText := Lines[4 + r];
+      AssertEquals('velocity row width', NMel, RowToks.Count);
+      for c := 0 to NMel - 1 do
+      begin
+        Expected := StrToFloat(RowToks[c], FS);
+        Diff := Abs(Output.FData[r * NMel + c] - Expected);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    // 1e-4 importer-parity gate (the committed-fixture convention). NEVER
+    // loosen - fix the model instead.
+    AssertTrue('F5-TTS velocity-field parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    WriteLn('F5-TTS velocity max abs diff: ', MaxDiff:0:10);
+  finally
+    NN.Free;
+    Output.Free; Time.Free; Text.Free; Cond.Free; Xt.Free;
+    RowToks.Free; CToks.Free; XToks.Free; IdToks.Free; Header.Free; Lines.Free;
   end;
 end;
 
