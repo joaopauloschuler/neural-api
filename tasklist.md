@@ -707,6 +707,24 @@ rather than acted on.
   - [ ] real-checkpoint smoke: resynthesize a clip with a downloaded `hifigan` /
         SpeechT5HifiGan generator (weight_norm fold path) and write it via
         SaveVolumeToWav16 (offline + RAM-gated here, so deferred).
+- [ ] AVX (and optional OpenCL) acceleration for the channel-major conv1d inner
+      loops in the self-contained audio holders — `TEnCodecModel`, `TNNetHiFiGAN`,
+      `TNNetVits`, `TNNetMimi`, and the MusicGen EnCodec decode path. These holders
+      deliberately do the conv1d / ConvTranspose1d math DIRECTLY on channel-major
+      arrays (not via TNNet layers), and those inner loops are currently scalar
+      Pascal. After the EnCodec LSTM was AVX'd (~12.9x, real-T4 profiled), the 1D
+      convolutions became the dominant cost of audio decode, so this is the next
+      profiled bottleneck rather than a speculative optimization. Channel-major
+      layout means the contraction (sum over in-channels for a fixed kernel tap)
+      is depth-axis-contiguous — exactly the case `TNNetVolume.DotProduct` /
+      `MulAdd` already vectorize — so the win is reusing the existing AVX volume
+      primitives (or a small im2col-into-DotProduct reshape) for the per-tap
+      accumulation instead of triple-nested scalar loops. Gate on the existing
+      parity tests (TestHiFiGANSynthesisParity / TestVitsSynthesisParity /
+      EnCodec round-trip) staying `< 1e-4` so the rewrite is provably behavior-
+      preserving, and re-profile decode wall-clock before/after. OpenCL offload of
+      the same accumulation (via the shared dot-product kernel, like FullConnect /
+      Convolution already do) is the optional follow-up once the AVX path lands.
 - [ ] VITS / MMS-TTS end-to-end text-to-speech importer (`BuildVitsFromSafeTensors[Ex]`
       LANDED + `ReadVitsConfigFromJSONFile`/`VitsConfigToString` + the `TVitsConfig`
       record + the `TNNetVits` channel-major holder (Analyze / ExpandPrior /
