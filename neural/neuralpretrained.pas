@@ -5633,6 +5633,130 @@ function BuildMusicGenMelodyFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TMusicGenMelodyModel;
 
 // ---------------------------------------------------------------------------
+// BARK TEXT-TO-SPEECH IMPORT (model_type "bark", suno/bark[-small]): the
+// autoregressive GPT-style TTS family. Bark chains THREE GPT-2-style decoders
+// then the LANDED EnCodec decoder (reused from the MusicGen path) to a
+// waveform:
+//   * SEMANTIC (BarkCausalModel): text+semantic tokens -> semantic logits.
+//   * COARSE   (BarkCausalModel): semantic tokens -> coarse EnCodec codebooks.
+//   * FINE     (BarkFineModel): predicts the remaining EnCodec codebooks
+//     NON-causally over time, conditioning on already-known codebooks 0..idx;
+//     ONE embedding table + ONE lm_head PER codebook (n_codes_total tables,
+//     n_codes_total-n_codes_given heads), summing the first idx+1 codebook
+//     embeddings as the merged input (HF BarkFineModel.forward).
+// Each sub-model is a PRE-norm GPT-2 block stack (x + out_proj(MHA(ln1(x))),
+// x + out_proj(gelu(in_proj(ln2(x))))) with a LEARNED positional embedding and
+// nn.GELU (EXACT erf). Unlike GPT-2's HF Conv1D [in,out], Bark uses nn.Linear
+// [out,in] (att_proj fused 3*hidden q|k|v, out_proj, mlp in/out), bias gated by
+// config.bias; lm_head[s] are bias-free. The holder computes the token/codebook
+// embedding (so the fine merged-sum and per-head selection live in Pascal),
+// feeds (seq,1,hidden) into a per-sub-model trunk TNNet (pos + blocks + ln_f),
+// and applies the head(s) as a matmul. Real suno/bark key-mapping (nested
+// "semantic"/"coarse_acoustics"/"fine_acoustics" prefixes in one checkpoint) is
+// a documented follow-up; the importer reads three separate sub-model files.
+// Coded by Claude (AI).
+// ---------------------------------------------------------------------------
+type
+  // One Bark GPT sub-model's shape (semantic / coarse / fine). Mirrors the HF
+  // BarkSubModelConfig fields. NCodesTotal / NCodesGiven are 0 for the causal
+  // (semantic, coarse) sub-models and set for the fine sub-model. Coded by
+  // Claude (AI).
+  TBarkSubConfig = record
+    Hidden: integer;          // hidden_size
+    NumLayers: integer;       // num_layers
+    NumHeads: integer;        // num_heads
+    InVocab: integer;         // input_vocab_size
+    OutVocab: integer;        // output_vocab_size
+    BlockSize: integer;       // block_size (max positions)
+    Bias: boolean;            // bias (att_proj/out_proj/mlp/ln have bias)
+    NCodesTotal: integer;     // fine only: n_codes_total (else 0)
+    NCodesGiven: integer;     // fine only: n_codes_given (else 0)
+    ModelType: string;        // 'semantic' / 'coarse_acoustics' / 'fine_acoustics'
+  end;
+
+  TBarkConfig = record
+    Semantic: TBarkSubConfig;
+    Coarse: TBarkSubConfig;
+    Fine: TBarkSubConfig;
+    ModelType: string;        // 'bark'
+  end;
+
+  { TBarkSubModel }
+  // One imported Bark GPT sub-model: the embedding table(s), positional table,
+  // a trunk TNNet (learned positions + pre-norm blocks + ln_f), and the
+  // lm_head(s). For semantic/coarse there is one table + one head; for fine
+  // there are NCodesTotal tables and NCodesTotal-NCodesGiven heads. The holder
+  // runs the embedding (incl. the fine codebook-sum) in Pascal so the merged
+  // input and per-head selection are explicit. Coded by Claude (AI).
+  TBarkSubModel = class
+  private
+    FConfig: TBarkSubConfig;
+    FTrunk: TNNet;                       // pos + blocks + ln_f
+    FEmbed: array of TNNetVolume;        // [tables] each InVocab*Hidden row-major
+    FHeadW: array of TNNetVolume;        // [heads] each OutVocab*Hidden row-major
+    FHeadB: array of TNNetVolume;        // [heads] each OutVocab (bias-free=zero)
+    FSeqLen: integer;
+  public
+    constructor Create(const pConfig: TBarkSubConfig; pSeqLen: integer);
+    destructor Destroy; override;
+    property Config: TBarkSubConfig read FConfig;
+    property Trunk: TNNet read FTrunk;
+    // Causal (semantic/coarse) forward: token ids (length SeqLen) -> per-position
+    // logits in Logits (SeqLen*OutVocab, row p*OutVocab+t). Coded by Claude (AI).
+    procedure ComputeLogits(const TokenIds: array of integer; Logits: TNNetVolume);
+    // Fine forward for one target codebook: Codes[t][c] are the known codebook
+    // ids (c in 0..NCodesTotal-1), CodebookIdx in NCodesGiven..NCodesTotal-1 is
+    // predicted. Sums embeddings of codebooks 0..CodebookIdx, runs the NON-causal
+    // trunk, applies head (CodebookIdx-NCodesGiven). Logits = SeqLen*OutVocab.
+    procedure ComputeFineLogits(const Codes: TNNetIntArr2D; CodebookIdx: integer;
+      Logits: TNNetVolume);
+  end;
+
+  { TBarkModel }
+  // Holds the three imported Bark GPT sub-models (semantic, coarse, fine). The
+  // EnCodec decode tail is NOT held here: callers feed the fine model's codes to
+  // a separately-built TEnCodecModel.DecodeCodesToAudio (the MusicGen tail), as
+  // examples/BarkTTS does. Built by BuildBarkFromSafeTensors[Ex]; caller-owned.
+  // Coded by Claude (AI).
+  TBarkModel = class
+  private
+    FConfig: TBarkConfig;
+    FSemantic: TBarkSubModel;
+    FCoarse: TBarkSubModel;
+    FFine: TBarkSubModel;
+  public
+    constructor Create(const pConfig: TBarkConfig);
+    destructor Destroy; override;
+    property Config: TBarkConfig read FConfig;
+    property Semantic: TBarkSubModel read FSemantic;
+    property Coarse: TBarkSubModel read FCoarse;
+    property Fine: TBarkSubModel read FFine;
+  end;
+
+// Reads a Bark config.json (model_type "bark") with nested "semantic_config" /
+// "coarse_acoustics_config" / "fine_acoustics_config" objects. Coded by Claude
+// (AI).
+function ReadBarkConfigFromJSONFile(const FileName: string): TBarkConfig;
+
+function BarkConfigToString(const Config: TBarkConfig): string;
+
+// Builds a TBarkModel from three separate sub-model safetensors readers (caller
+// owns the readers). SemSeqLen/CoarseSeqLen/FineSeqLen fix each sub-model's
+// sequence length. pTrainable=False frees training volumes. Coded by Claude
+// (AI).
+function BuildBarkFromSafeTensorsEx(SemReader, CoarseReader, FineReader:
+  TNNetSafeTensorsReader; const Config: TBarkConfig;
+  SemSeqLen, CoarseSeqLen, FineSeqLen: integer;
+  pTrainable: boolean = true): TBarkModel;
+
+// Same, from three sub-model files + a shared config file ('' = "config.json"
+// beside SemFileName). Coded by Claude (AI).
+function BuildBarkFromSafeTensors(const SemFileName, CoarseFileName,
+  FineFileName: string; out Config: TBarkConfig;
+  SemSeqLen, CoarseSeqLen, FineSeqLen: integer;
+  pTrainable: boolean = true; const ConfigFileName: string = ''): TBarkModel;
+
+// ---------------------------------------------------------------------------
 // RWKV-4 IMPORT (model_type "rwkv": RWKV/rwkv-4-169m-pile and siblings,
 // architectures ["RwkvForCausalLM"]) - the FIRST NON-TRANSFORMER importer:
 // a recurrent WKV mixer (Peng et al. 2023, arXiv:2305.13048) that decodes
@@ -30447,6 +30571,605 @@ begin
       DecSeqLen, pTrainable);
   finally
     Reader.Free;
+  end;
+end;
+
+// ==================== BARK TEXT-TO-SPEECH IMPLEMENTATION =================
+
+// Loads an HF nn.Linear weight [out, in] (+ optional bias [out]) into a
+// TNNetPointwiseConvLinear with OutDim neurons of InDim weights each. Unlike
+// LoadConv1DWeights (HF Conv1D stores [in, out]), nn.Linear stores [out, in]
+// row-major, so neuron j gets row j directly: Neuron[j].Weights[i] =
+// W[j*in + i]. HasBias=False (Bark config.bias=False / lm_head) zeroes biases.
+// Coded by Claude (AI).
+procedure LoadLinearWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string; InDim, OutDim: integer;
+  HasBias: boolean);
+var
+  W, B: TNNetVolume;
+  i, j, InDimM1, OutDimM1: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('Bark import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 2) or
+     (Reader.DimSize(WName, 0) <> OutDim) or
+     (Reader.DimSize(WName, 1) <> InDim) then
+    ImportError('Bark import: "' + WName + '" must have shape [' +
+      IntToStr(OutDim) + ', ' + IntToStr(InDim) + '] (nn.Linear stores ' +
+      '[out, in]), got ' + Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> OutDim then
+    ImportError('Bark import: internal error - layer for "' + WName +
+      '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutDim) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    if HasBias then
+    begin
+      if not Reader.HasTensor(BName) then
+        ImportError('Bark import: missing tensor "' + BName + '".');
+      if (Reader.DimCount(BName) <> 1) or (Reader.DimSize(BName, 0) <> OutDim) then
+        ImportError('Bark import: "' + BName + '" must have shape [' +
+          IntToStr(OutDim) + '], got ' + Reader.ShapeAsString(BName));
+      Reader.LoadTensorFlat(BName, B);
+    end;
+    InDimM1 := InDim - 1;
+    OutDimM1 := OutDim - 1;
+    for j := 0 to OutDimM1 do
+    begin
+      for i := 0 to InDimM1 do
+        Layer.FArrNeurons[j].Weights.FData[i] := W.FData[j * InDim + i];
+      if HasBias then
+        Layer.FArrNeurons[j].BiasWeight := B.FData[j]
+      else
+        Layer.FArrNeurons[j].BiasWeight := 0;
+    end;
+  finally
+    B.Free;
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+// Loads an HF nn.LayerNorm gamma/beta into a TNNetTokenLayerNorm. When the
+// sub-model has bias=False the LayerNorm still has weight but no bias (HF
+// nn.LayerNorm(..., bias=config.bias)); HasBias=False zeroes beta. Coded by
+// Claude (AI).
+procedure LoadBarkLayerNorm(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
+  const WName, BName: string; d_model: integer; HasBias: boolean);
+var
+  Tmp: TNNetVolume;
+  i, d_modelM1: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('Bark import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 1) or (Reader.DimSize(WName, 0) <> d_model) then
+    ImportError('Bark import: "' + WName + '" must have shape [' +
+      IntToStr(d_model) + '], got ' + Reader.ShapeAsString(WName));
+  Tmp := TNNetVolume.Create;
+  try
+    d_modelM1 := d_model - 1;
+    Reader.LoadTensorFlat(WName, Tmp);
+    for i := 0 to d_modelM1 do
+      Layer.FArrNeurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
+    if HasBias then
+    begin
+      if not Reader.HasTensor(BName) then
+        ImportError('Bark import: missing tensor "' + BName + '".');
+      Reader.LoadTensorFlat(BName, Tmp);
+      for i := 0 to d_modelM1 do
+        Layer.FArrNeurons[1].Weights.FData[i] := Tmp.FData[i]; // beta
+    end
+    else
+      for i := 0 to d_modelM1 do
+        Layer.FArrNeurons[1].Weights.FData[i] := 0;
+  finally
+    Tmp.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+// Builds one Bark GPT trunk TNNet: an embedding-vector input (seq,1,hidden) ->
+// learned positional embedding -> NumLayers pre-norm GPT-2 blocks (exact-erf
+// GELU) -> final LayerNorm. The token/codebook embedding and the lm_head(s)
+// live in the holder, so the trunk is identical for all three sub-models apart
+// from the causal-mask flag. Coded by Claude (AI).
+function BuildBarkTrunkNet(const Config: TBarkSubConfig; SeqLen: integer;
+  Causal: boolean; var Blocks: array of TGPT2BlockLayers;
+  out PosLayer, FinalLN: TNNetLayer; pTrainable: boolean): TNNet;
+var
+  NN: TNNet;
+  BlockCnt: integer;
+  BranchInput, GELUSource, PhiBranch: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  // Input carries precomputed embedding vectors as (SeqLen, 1, Hidden) so the
+  // sequence is the X axis (the learned positional embedding indexes table row
+  // x) and Hidden is the depth axis (matches TNNetEmbedding's output layout).
+  NN.AddLayer( TNNetInput.Create(SeqLen, 1, Config.Hidden) );
+  PosLayer := NN.AddLayer(
+    TNNetLearnedPositionalEmbedding.Create(Config.BlockSize).SetTrainable(pTrainable) );
+  for BlockCnt := 0 to Config.NumLayers - 1 do
+  begin
+    // Attention: x := x + out_proj(MHA(ln_1(x)))
+    BranchInput := NN.GetLastLayer();
+    Blocks[BlockCnt].LN1 := NN.AddLayer(
+      TNNetTokenLayerNorm.Create(1e-5).SetTrainable(pTrainable) );
+    Blocks[BlockCnt].CAttn := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(3 * Config.Hidden).SetTrainable(pTrainable) );
+    Blocks[BlockCnt].AttnProj := NN.AddMultiHeadSelfAttention(
+      Config.NumHeads, {CausalMask=}Causal);
+    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+    // MLP: x := x + out_proj(gelu(in_proj(ln_2(x)))) -- nn.GELU = exact erf.
+    BranchInput := NN.GetLastLayer();
+    Blocks[BlockCnt].LN2 := NN.AddLayer(
+      TNNetTokenLayerNorm.Create(1e-5).SetTrainable(pTrainable) );
+    Blocks[BlockCnt].CFc := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(4 * Config.Hidden).SetTrainable(pTrainable) );
+    GELUSource := NN.GetLastLayer();
+    NN.AddLayerAfter( TNNetMulByConstant.Create(0.7071067811865476), GELUSource );
+    NN.AddLayer( TNNetErf.Create() );
+    NN.AddLayer( TNNetAddConstant.Create(1.0) );
+    PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+    NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, GELUSource]) );
+    NN.AddLayer( TNNetReGLU.Create() );
+    Blocks[BlockCnt].MlpProj := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.Hidden).SetTrainable(pTrainable) );
+    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+  end;
+  FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-5).SetTrainable(pTrainable) );
+  Result := NN;
+end;
+
+{ TBarkSubModel }
+
+constructor TBarkSubModel.Create(const pConfig: TBarkSubConfig; pSeqLen: integer);
+var
+  NumTables, NumHeads, i: integer;
+begin
+  inherited Create;
+  FConfig := pConfig;
+  FSeqLen := pSeqLen;
+  if (pConfig.NCodesTotal > 0) then
+  begin
+    NumTables := pConfig.NCodesTotal;
+    NumHeads := pConfig.NCodesTotal - pConfig.NCodesGiven;
+  end
+  else
+  begin
+    NumTables := 1;
+    NumHeads := 1;
+  end;
+  SetLength(FEmbed, NumTables);
+  for i := 0 to NumTables - 1 do
+    FEmbed[i] := TNNetVolume.Create(pConfig.InVocab * pConfig.Hidden, 1, 1);
+  SetLength(FHeadW, NumHeads);
+  SetLength(FHeadB, NumHeads);
+  for i := 0 to NumHeads - 1 do
+  begin
+    FHeadW[i] := TNNetVolume.Create(pConfig.OutVocab * pConfig.Hidden, 1, 1);
+    FHeadB[i] := TNNetVolume.Create(pConfig.OutVocab, 1, 1);
+  end;
+end;
+
+destructor TBarkSubModel.Destroy;
+var
+  i: integer;
+begin
+  if Assigned(FTrunk) then FTrunk.Free;
+  for i := 0 to Length(FEmbed) - 1 do FEmbed[i].Free;
+  for i := 0 to Length(FHeadW) - 1 do FHeadW[i].Free;
+  for i := 0 to Length(FHeadB) - 1 do FHeadB[i].Free;
+  inherited Destroy;
+end;
+
+// Runs the trunk on a precomputed embedding tensor and applies head HeadIdx,
+// writing per-position logits to Logits (SeqLen*OutVocab). Coded by Claude (AI).
+procedure BarkApplyTrunkAndHead(SubModel: TBarkSubModel; Emb: TNNetVolume;
+  HeadIdx: integer; Logits: TNNetVolume);
+var
+  TrunkOut: TNNetVolume;
+  Hidden, OutVocab, SeqLen, p, t, k: integer;
+  Acc: TNeuralFloat;
+  HW, HB: TNNetVolume;
+begin
+  Hidden := SubModel.FConfig.Hidden;
+  OutVocab := SubModel.FConfig.OutVocab;
+  SeqLen := SubModel.FSeqLen;
+  SubModel.FTrunk.Compute(Emb);
+  TrunkOut := SubModel.FTrunk.GetLastLayer().Output; // (seq,1,hidden)
+  HW := SubModel.FHeadW[HeadIdx];
+  HB := SubModel.FHeadB[HeadIdx];
+  Logits.ReSize(SeqLen * OutVocab, 1, 1);
+  for p := 0 to SeqLen - 1 do
+    for t := 0 to OutVocab - 1 do
+    begin
+      Acc := HB.FData[t];
+      for k := 0 to Hidden - 1 do
+        Acc := Acc + TrunkOut.FData[p * Hidden + k] * HW.FData[t * Hidden + k];
+      Logits.FData[p * OutVocab + t] := Acc;
+    end;
+end;
+
+procedure TBarkSubModel.ComputeLogits(const TokenIds: array of integer;
+  Logits: TNNetVolume);
+var
+  Emb: TNNetVolume;
+  Hidden, p, k, tok: integer;
+begin
+  Hidden := FConfig.Hidden;
+  if Length(TokenIds) <> FSeqLen then
+    ImportError('Bark sub-model: expected ' + IntToStr(FSeqLen) +
+      ' token ids, got ' + IntToStr(Length(TokenIds)) + '.');
+  Emb := TNNetVolume.Create(FSeqLen, 1, Hidden);
+  try
+    for p := 0 to FSeqLen - 1 do
+    begin
+      tok := TokenIds[p];
+      if (tok < 0) or (tok >= FConfig.InVocab) then
+        ImportError('Bark sub-model: token id ' + IntToStr(tok) +
+          ' out of range [0,' + IntToStr(FConfig.InVocab) + ').');
+      for k := 0 to Hidden - 1 do
+        Emb.FData[p * Hidden + k] := FEmbed[0].FData[tok * Hidden + k];
+    end;
+    BarkApplyTrunkAndHead(Self, Emb, 0, Logits);
+  finally
+    Emb.Free;
+  end;
+end;
+
+procedure TBarkSubModel.ComputeFineLogits(const Codes: TNNetIntArr2D;
+  CodebookIdx: integer; Logits: TNNetVolume);
+var
+  Emb: TNNetVolume;
+  Hidden, p, k, c, code: integer;
+begin
+  Hidden := FConfig.Hidden;
+  if FConfig.NCodesTotal <= 0 then
+    ImportError('Bark: ComputeFineLogits called on a non-fine sub-model.');
+  if (CodebookIdx < FConfig.NCodesGiven) or
+     (CodebookIdx >= FConfig.NCodesTotal) then
+    ImportError('Bark fine: codebook_idx ' + IntToStr(CodebookIdx) +
+      ' out of range [' + IntToStr(FConfig.NCodesGiven) + ',' +
+      IntToStr(FConfig.NCodesTotal) + ').');
+  if Length(Codes) <> FSeqLen then
+    ImportError('Bark fine: expected ' + IntToStr(FSeqLen) +
+      ' code rows, got ' + IntToStr(Length(Codes)) + '.');
+  Emb := TNNetVolume.Create(FSeqLen, 1, Hidden);
+  try
+    // Merged input = sum of codebook embeddings 0..CodebookIdx (HF
+    // BarkFineModel.forward: inputs_embeds[..., :idx+1].sum(dim=-1)).
+    Emb.Fill(0);
+    for p := 0 to FSeqLen - 1 do
+    begin
+      if Length(Codes[p]) <> FConfig.NCodesTotal then
+        ImportError('Bark fine: row ' + IntToStr(p) + ' has ' +
+          IntToStr(Length(Codes[p])) + ' codes, expected ' +
+          IntToStr(FConfig.NCodesTotal) + '.');
+      for c := 0 to CodebookIdx do
+      begin
+        code := Codes[p][c];
+        if (code < 0) or (code >= FConfig.InVocab) then
+          ImportError('Bark fine: code ' + IntToStr(code) +
+            ' out of range [0,' + IntToStr(FConfig.InVocab) + ').');
+        for k := 0 to Hidden - 1 do
+          Emb.FData[p * Hidden + k] :=
+            Emb.FData[p * Hidden + k] + FEmbed[c].FData[code * Hidden + k];
+      end;
+    end;
+    BarkApplyTrunkAndHead(Self, Emb, CodebookIdx - FConfig.NCodesGiven, Logits);
+  finally
+    Emb.Free;
+  end;
+end;
+
+{ TBarkModel }
+
+constructor TBarkModel.Create(const pConfig: TBarkConfig);
+begin
+  inherited Create;
+  FConfig := pConfig;
+end;
+
+destructor TBarkModel.Destroy;
+begin
+  if Assigned(FSemantic) then FSemantic.Free;
+  if Assigned(FCoarse) then FCoarse.Free;
+  if Assigned(FFine) then FFine.Free;
+  inherited Destroy;
+end;
+
+// ---- config readers ----
+
+function BarkSubConfigToString(const C: TBarkSubConfig): string;
+begin
+  Result := '    model_type=' + C.ModelType + sLineBreak +
+    '    hidden_size=' + IntToStr(C.Hidden) + sLineBreak +
+    '    num_layers=' + IntToStr(C.NumLayers) + sLineBreak +
+    '    num_heads=' + IntToStr(C.NumHeads) + sLineBreak +
+    '    input_vocab_size=' + IntToStr(C.InVocab) + sLineBreak +
+    '    output_vocab_size=' + IntToStr(C.OutVocab) + sLineBreak +
+    '    block_size=' + IntToStr(C.BlockSize) + sLineBreak +
+    '    bias=' + BoolToStr(C.Bias, True) + sLineBreak;
+  if C.NCodesTotal > 0 then
+    Result := Result +
+      '    n_codes_total=' + IntToStr(C.NCodesTotal) + sLineBreak +
+      '    n_codes_given=' + IntToStr(C.NCodesGiven) + sLineBreak;
+end;
+
+function BarkConfigToString(const Config: TBarkConfig): string;
+begin
+  Result := 'Bark config (model_type=' + Config.ModelType + '):' + sLineBreak +
+    '  semantic:' + sLineBreak + BarkSubConfigToString(Config.Semantic) +
+    '  coarse:' + sLineBreak + BarkSubConfigToString(Config.Coarse) +
+    '  fine:' + sLineBreak + BarkSubConfigToString(Config.Fine);
+end;
+
+function ReadBarkConfigFromJSONFile(const FileName: string): TBarkConfig;
+var
+  JsonText: TStringList;
+  Root, SubObj: TJSONData;
+  Obj: TJSONObject;
+
+  function ReadSub(const Key, ExpectedType: string;
+    Fine: boolean): TBarkSubConfig;
+  var
+    S: TJSONObject;
+    function OptInt(const Name: string; Def: integer): integer;
+    begin
+      if S.IndexOfName(Name) >= 0 then Result := S.Get(Name, Def)
+      else Result := Def;
+    end;
+    function OptBool(const Name: string; Def: boolean): boolean;
+    begin
+      if S.IndexOfName(Name) >= 0 then Result := S.Get(Name, Def)
+      else Result := Def;
+    end;
+  begin
+    if Obj.IndexOfName(Key) < 0 then
+      ImportError('Bark import: config missing "' + Key + '" object.');
+    SubObj := Obj.Find(Key);
+    if not (SubObj is TJSONObject) then
+      ImportError('Bark import: "' + Key + '" must be a JSON object.');
+    S := TJSONObject(SubObj);
+    Result.ModelType := S.Get('model_type', ExpectedType);
+    Result.Hidden := OptInt('hidden_size', 0);
+    Result.NumLayers := OptInt('num_layers', 0);
+    Result.NumHeads := OptInt('num_heads', 0);
+    Result.InVocab := OptInt('input_vocab_size', 0);
+    Result.OutVocab := OptInt('output_vocab_size', 0);
+    Result.BlockSize := OptInt('block_size', 0);
+    Result.Bias := OptBool('bias', True);
+    if Fine then
+    begin
+      Result.NCodesTotal := OptInt('n_codes_total', 8);
+      Result.NCodesGiven := OptInt('n_codes_given', 1);
+    end
+    else
+    begin
+      Result.NCodesTotal := 0;
+      Result.NCodesGiven := 0;
+    end;
+    if (Result.Hidden <= 0) or (Result.NumLayers <= 0) or
+       (Result.NumHeads <= 0) or (Result.InVocab <= 0) or
+       (Result.OutVocab <= 0) or (Result.BlockSize <= 0) then
+      ImportError('Bark import: "' + Key + '" has missing/invalid fields.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Bark import: config file "' + FileName + '" not found.');
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError('Bark import: config root is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'bark');
+    if (Result.ModelType <> 'bark') then
+      ImportError('Bark import: model_type "' + Result.ModelType +
+        '" is not "bark".');
+    Result.Semantic := ReadSub('semantic_config', 'semantic', False);
+    Result.Coarse := ReadSub('coarse_acoustics_config', 'coarse_acoustics', False);
+    Result.Fine := ReadSub('fine_acoustics_config', 'fine_acoustics', True);
+  finally
+    if Assigned(Root) then Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+// ---- builders ----
+
+// Loads the shared per-block transformer weights (LN1, att_proj fused q|k|v,
+// out_proj, LN2, mlp in/out) for a Bark sub-model trunk. Coded by Claude (AI).
+procedure LoadBarkBlocks(Reader: TNNetSafeTensorsReader;
+  const Config: TBarkSubConfig; const Blocks: array of TGPT2BlockLayers);
+var
+  BlockCnt: integer;
+  BP: string;
+begin
+  for BlockCnt := 0 to Config.NumLayers - 1 do
+  begin
+    BP := 'layers.' + IntToStr(BlockCnt) + '.';
+    LoadBarkLayerNorm(Reader, Blocks[BlockCnt].LN1,
+      BP + 'layernorm_1.weight', BP + 'layernorm_1.bias', Config.Hidden,
+      Config.Bias);
+    LoadLinearWeights(Reader, Blocks[BlockCnt].CAttn,
+      BP + 'attn.att_proj.weight', BP + 'attn.att_proj.bias',
+      Config.Hidden, 3 * Config.Hidden, Config.Bias);
+    LoadLinearWeights(Reader, Blocks[BlockCnt].AttnProj,
+      BP + 'attn.out_proj.weight', BP + 'attn.out_proj.bias',
+      Config.Hidden, Config.Hidden, Config.Bias);
+    LoadBarkLayerNorm(Reader, Blocks[BlockCnt].LN2,
+      BP + 'layernorm_2.weight', BP + 'layernorm_2.bias', Config.Hidden,
+      Config.Bias);
+    LoadLinearWeights(Reader, Blocks[BlockCnt].CFc,
+      BP + 'mlp.in_proj.weight', BP + 'mlp.in_proj.bias',
+      Config.Hidden, 4 * Config.Hidden, Config.Bias);
+    LoadLinearWeights(Reader, Blocks[BlockCnt].MlpProj,
+      BP + 'mlp.out_proj.weight', BP + 'mlp.out_proj.bias',
+      4 * Config.Hidden, Config.Hidden, Config.Bias);
+  end;
+end;
+
+// Loads an embedding table tensor (InVocab*Hidden row-major) into Dst.
+procedure LoadBarkEmbedTable(Reader: TNNetSafeTensorsReader;
+  const Name: string; const Config: TBarkSubConfig; Dst: TNNetVolume);
+var
+  Tmp: TNNetVolume;
+begin
+  if not Reader.HasTensor(Name) then
+    ImportError('Bark import: missing tensor "' + Name + '".');
+  if (Reader.DimCount(Name) <> 2) or
+     (Reader.DimSize(Name, 0) <> Config.InVocab) or
+     (Reader.DimSize(Name, 1) <> Config.Hidden) then
+    ImportError('Bark import: "' + Name + '" must have shape [' +
+      IntToStr(Config.InVocab) + ', ' + IntToStr(Config.Hidden) + '], got ' +
+      Reader.ShapeAsString(Name));
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Name, Tmp);
+    Dst.Copy(Tmp);
+  finally
+    Tmp.Free;
+  end;
+end;
+
+// Loads an lm_head tensor (OutVocab*Hidden, nn.Linear bias-free) into HW/HB.
+procedure LoadBarkHead(Reader: TNNetSafeTensorsReader; const Name: string;
+  const Config: TBarkSubConfig; HW, HB: TNNetVolume);
+var
+  Tmp: TNNetVolume;
+begin
+  if not Reader.HasTensor(Name) then
+    ImportError('Bark import: missing tensor "' + Name + '".');
+  if (Reader.DimCount(Name) <> 2) or
+     (Reader.DimSize(Name, 0) <> Config.OutVocab) or
+     (Reader.DimSize(Name, 1) <> Config.Hidden) then
+    ImportError('Bark import: "' + Name + '" must have shape [' +
+      IntToStr(Config.OutVocab) + ', ' + IntToStr(Config.Hidden) + '], got ' +
+      Reader.ShapeAsString(Name));
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Name, Tmp);
+    HW.Copy(Tmp);
+    HB.Fill(0);  // lm_head is always bias-free in Bark
+  finally
+    Tmp.Free;
+  end;
+end;
+
+// Loads the positional table (BlockSize*Hidden) into a TNNetLearnedPositionalEmbedding.
+procedure LoadBarkPos(Reader: TNNetSafeTensorsReader; PosLayer: TNNetLayer;
+  const Config: TBarkSubConfig);
+var
+  Tmp: TNNetVolume;
+begin
+  if not Reader.HasTensor('position_embeds_layer.weight') then
+    ImportError('Bark import: missing tensor "position_embeds_layer.weight".');
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat('position_embeds_layer.weight', Tmp);
+    if PosLayer.FArrNeurons[0].Weights.Size < Tmp.Size then
+      ImportError('Bark import: position table too large for block_size.');
+    PosLayer.FArrNeurons[0].Weights.Copy(Tmp);
+    PosLayer.FlushWeightCache();
+  finally
+    Tmp.Free;
+  end;
+end;
+
+// Builds a causal (semantic/coarse) Bark sub-model from Reader.
+function BuildBarkCausalSubModel(Reader: TNNetSafeTensorsReader;
+  const Config: TBarkSubConfig; SeqLen: integer;
+  pTrainable: boolean): TBarkSubModel;
+var
+  Blocks: array of TGPT2BlockLayers;
+  PosLayer, FinalLN: TNNetLayer;
+begin
+  Result := TBarkSubModel.Create(Config, SeqLen);
+  SetLength(Blocks, Config.NumLayers);
+  Result.FTrunk := BuildBarkTrunkNet(Config, SeqLen, {Causal=}True,
+    Blocks, PosLayer, FinalLN, pTrainable);
+  if not pTrainable then Result.FTrunk.SetTrainable();
+  LoadBarkEmbedTable(Reader, 'input_embeds_layer.weight', Config, Result.FEmbed[0]);
+  LoadBarkPos(Reader, PosLayer, Config);
+  LoadBarkBlocks(Reader, Config, Blocks);
+  LoadBarkLayerNorm(Reader, FinalLN, 'layernorm_final.weight',
+    'layernorm_final.bias', Config.Hidden, Config.Bias);
+  LoadBarkHead(Reader, 'lm_head.weight', Config, Result.FHeadW[0], Result.FHeadB[0]);
+end;
+
+// Builds the NON-causal fine Bark sub-model (n_codes_total embedding tables,
+// n_codes_total-n_codes_given lm_heads). Coded by Claude (AI).
+function BuildBarkFineSubModel(Reader: TNNetSafeTensorsReader;
+  const Config: TBarkSubConfig; SeqLen: integer;
+  pTrainable: boolean): TBarkSubModel;
+var
+  Blocks: array of TGPT2BlockLayers;
+  PosLayer, FinalLN: TNNetLayer;
+  i: integer;
+begin
+  Result := TBarkSubModel.Create(Config, SeqLen);
+  SetLength(Blocks, Config.NumLayers);
+  Result.FTrunk := BuildBarkTrunkNet(Config, SeqLen, {Causal=}False,
+    Blocks, PosLayer, FinalLN, pTrainable);
+  if not pTrainable then Result.FTrunk.SetTrainable();
+  for i := 0 to Config.NCodesTotal - 1 do
+    LoadBarkEmbedTable(Reader, 'input_embeds_layers.' + IntToStr(i) + '.weight',
+      Config, Result.FEmbed[i]);
+  LoadBarkPos(Reader, PosLayer, Config);
+  LoadBarkBlocks(Reader, Config, Blocks);
+  LoadBarkLayerNorm(Reader, FinalLN, 'layernorm_final.weight',
+    'layernorm_final.bias', Config.Hidden, Config.Bias);
+  // lm_heads index 0..(n_codes_total-n_codes_given-1) predict codebooks
+  // n_codes_given..n_codes_total-1.
+  for i := 0 to Config.NCodesTotal - Config.NCodesGiven - 1 do
+    LoadBarkHead(Reader, 'lm_heads.' + IntToStr(i) + '.weight', Config,
+      Result.FHeadW[i], Result.FHeadB[i]);
+end;
+
+function BuildBarkFromSafeTensorsEx(SemReader, CoarseReader, FineReader:
+  TNNetSafeTensorsReader; const Config: TBarkConfig;
+  SemSeqLen, CoarseSeqLen, FineSeqLen: integer;
+  pTrainable: boolean = true): TBarkModel;
+begin
+  Result := TBarkModel.Create(Config);
+  Result.FSemantic := BuildBarkCausalSubModel(SemReader, Config.Semantic,
+    SemSeqLen, pTrainable);
+  Result.FCoarse := BuildBarkCausalSubModel(CoarseReader, Config.Coarse,
+    CoarseSeqLen, pTrainable);
+  Result.FFine := BuildBarkFineSubModel(FineReader, Config.Fine,
+    FineSeqLen, pTrainable);
+end;
+
+function BuildBarkFromSafeTensors(const SemFileName, CoarseFileName,
+  FineFileName: string; out Config: TBarkConfig;
+  SemSeqLen, CoarseSeqLen, FineSeqLen: integer;
+  pTrainable: boolean = true; const ConfigFileName: string = ''): TBarkModel;
+var
+  CfgFile: string;
+  SemReader, CoarseReader, FineReader: TNNetSafeTensorsReader;
+begin
+  if ConfigFileName <> '' then CfgFile := ConfigFileName
+  else CfgFile := ExtractFilePath(SemFileName) + 'config.json';
+  Config := ReadBarkConfigFromJSONFile(CfgFile);
+  SemReader := CreatePretrainedTensorReader(SemFileName);
+  CoarseReader := nil;
+  FineReader := nil;
+  try
+    CoarseReader := CreatePretrainedTensorReader(CoarseFileName);
+    FineReader := CreatePretrainedTensorReader(FineFileName);
+    Result := BuildBarkFromSafeTensorsEx(SemReader, CoarseReader, FineReader,
+      Config, SemSeqLen, CoarseSeqLen, FineSeqLen, pTrainable);
+  finally
+    SemReader.Free;
+    if Assigned(CoarseReader) then CoarseReader.Free;
+    if Assigned(FineReader) then FineReader.Free;
   end;
 end;
 

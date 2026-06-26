@@ -372,6 +372,12 @@ type
     // 1e-4, and the pure delay-pattern (de)interleave helpers round-trip and
     // match HF build_delay_pattern_mask exactly.
     procedure TestMusicGenDecoderParity;
+    // Bark TTS importer (model_type "bark"): the THREE GPT-style sub-models'
+    // forward logits (semantic, coarse, fine) vs a float64 HF oracle on a
+    // committed re-randomized pico fixture. The fine model's NON-causal forward
+    // (codebook-conditioned merged input embedding sum over codebooks 0..idx,
+    // bidirectional over time) is pinned per (sequence, codebook_idx) case.
+    procedure TestBarkParity;
     procedure TestMusicGenDelayPattern;
     // STEREO (audio_channels=2) MusicGen: the decoder doubles to 2*K
     // interleaved-codebook rows (row 2c=left codebook c, 2c+1=right) sharing
@@ -14331,6 +14337,144 @@ begin
     Model.Free;
     EncStates.Free;
     EncHidden.Free;
+    Logits.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestBarkParity;
+var
+  Model: TBarkModel;
+  Config: TBarkConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  RefObj, SubObj, CaseObj: TJSONObject;
+  SeqArr, LogitsArr, RowArr, CodeRowArr, CasesArr: TJSONArray;
+  Logits: TNNetVolume;
+  TokenIds: array of integer;
+  Codes: TNNetIntArr2D;
+  SemSeq, CoarseSeq, FineSeq, Vocab, NCases, NCodesTotal: integer;
+  s, p, v, c, CbIdx: integer;
+  MaxDiff, Diff: double;
+
+  function ReadSeqLen(const Key: string): integer;
+  var SO: TJSONObject; SA: TJSONArray;
+  begin
+    SO := TJSONObject(RefObj.Find(Key));
+    SA := TJSONArray(SO.Find('sequences'));
+    Result := TJSONArray(SA.Items[0]).Count;
+  end;
+
+  // Compares Logits (SeqLen*Vocab) row-major against oracle row s of SubObj.
+  procedure AccumDiff(const OracleLogits: TJSONArray; SeqLen: integer);
+  var
+    pp, vv: integer;
+    LocalRow: TJSONArray;
+    LocalDiff: double;
+  begin
+    for pp := 0 to SeqLen - 1 do
+    begin
+      LocalRow := TJSONArray(OracleLogits.Items[pp]);
+      for vv := 0 to Vocab - 1 do
+      begin
+        LocalDiff := Abs(Logits.FData[pp * Vocab + vv] -
+          LocalRow.Items[vv].AsFloat);
+        if LocalDiff > MaxDiff then MaxDiff := LocalDiff;
+      end;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  Logits := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_bark_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefObj := TJSONObject(RefRoot);
+    SemSeq := ReadSeqLen('semantic');
+    CoarseSeq := ReadSeqLen('coarse');
+    SubObj := TJSONObject(RefObj.Find('fine'));
+    CasesArr := TJSONArray(SubObj.Find('cases'));
+    FineSeq := TJSONArray(TJSONObject(CasesArr.Items[0]).Find('codes')).Count;
+
+    Model := BuildBarkFromSafeTensors(
+      FixturePath('tiny_bark_semantic.safetensors'),
+      FixturePath('tiny_bark_coarse.safetensors'),
+      FixturePath('tiny_bark_fine.safetensors'),
+      Config, SemSeq, CoarseSeq, FineSeq, {pTrainable=}true,
+      FixturePath('tiny_bark_config.json'));
+    AssertTrue('bark model built', Model <> nil);
+    AssertEquals('bark model_type', 'bark', Config.ModelType);
+    AssertEquals('fine n_codes_total', 6, Config.Fine.NCodesTotal);
+    AssertEquals('fine n_codes_given', 1, Config.Fine.NCodesGiven);
+
+    MaxDiff := 0;
+
+    // ---- SEMANTIC sub-model ----
+    SubObj := TJSONObject(RefObj.Find('semantic'));
+    Vocab := SubObj.Get('vocab', 0);
+    SeqArr := TJSONArray(SubObj.Find('sequences'));
+    LogitsArr := TJSONArray(SubObj.Find('logits'));
+    SetLength(TokenIds, SemSeq);
+    for s := 0 to SeqArr.Count - 1 do
+    begin
+      RowArr := TJSONArray(SeqArr.Items[s]);
+      for p := 0 to SemSeq - 1 do TokenIds[p] := RowArr.Items[p].AsInteger;
+      Model.Semantic.ComputeLogits(TokenIds, Logits);
+      AccumDiff(TJSONArray(LogitsArr.Items[s]), SemSeq);
+    end;
+    AssertTrue('Bark SEMANTIC logit parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // ---- COARSE sub-model ----
+    MaxDiff := 0;
+    SubObj := TJSONObject(RefObj.Find('coarse'));
+    Vocab := SubObj.Get('vocab', 0);
+    SeqArr := TJSONArray(SubObj.Find('sequences'));
+    LogitsArr := TJSONArray(SubObj.Find('logits'));
+    SetLength(TokenIds, CoarseSeq);
+    for s := 0 to SeqArr.Count - 1 do
+    begin
+      RowArr := TJSONArray(SeqArr.Items[s]);
+      for p := 0 to CoarseSeq - 1 do TokenIds[p] := RowArr.Items[p].AsInteger;
+      Model.Coarse.ComputeLogits(TokenIds, Logits);
+      AccumDiff(TJSONArray(LogitsArr.Items[s]), CoarseSeq);
+    end;
+    AssertTrue('Bark COARSE logit parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // ---- FINE sub-model (non-causal over codebooks) ----
+    MaxDiff := 0;
+    SubObj := TJSONObject(RefObj.Find('fine'));
+    Vocab := SubObj.Get('vocab', 0);
+    NCodesTotal := SubObj.Get('n_codes_total', 0);
+    CasesArr := TJSONArray(SubObj.Find('cases'));
+    LogitsArr := TJSONArray(SubObj.Find('logits'));
+    NCases := CasesArr.Count;
+    SetLength(Codes, FineSeq);
+    for s := 0 to NCases - 1 do
+    begin
+      CaseObj := TJSONObject(CasesArr.Items[s]);
+      CbIdx := CaseObj.Get('codebook_idx', 0);
+      CodeRowArr := TJSONArray(CaseObj.Find('codes')); // [seq][n_codes_total]
+      for p := 0 to FineSeq - 1 do
+      begin
+        RowArr := TJSONArray(CodeRowArr.Items[p]);
+        SetLength(Codes[p], NCodesTotal);
+        for c := 0 to NCodesTotal - 1 do
+          Codes[p][c] := RowArr.Items[c].AsInteger;
+      end;
+      Model.Fine.ComputeFineLogits(Codes, CbIdx, Logits);
+      AccumDiff(TJSONArray(LogitsArr.Items[s]), FineSeq);
+    end;
+    AssertTrue('Bark FINE logit parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Model.Free;
     Logits.Free;
     RefRoot.Free;
     RefJson.Free;

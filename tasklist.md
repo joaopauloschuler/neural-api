@@ -731,21 +731,30 @@ rather than acted on.
       and importer parity (Llama/Qwen pico fixtures) staying `< 1e-4` on both the
       scalar-fallback and real `-dAVX2` builds; this is the same depth-contiguous
       pattern already landed for L2Normalize / LogitNormalize / DiagonalSSM.
-- [ ] Bark text-to-speech importer (`BuildBarkFromSafeTensors[Ex]` + `TBarkConfig`
-      / `ReadBarkConfigFromJSONFile`, model_type `bark`, e.g. suno/bark-small) — the
-      autoregressive GPT-style TTS family not yet in-tree (distinct from the
-      flow/diffusion and VITS paths the open audio tasks cover). Three stacked
-      GPT-2-style decoders chained: a SEMANTIC text->semantic-token model, a
-      COARSE-acoustic model, and a FINE-acoustic model (the fine model predicts the
-      remaining EnCodec codebooks NON-causally over the codebook axis given the
-      coarse ones), then the landed EnCodec decoder (reused from the MusicGen path)
-      turns the codes into a waveform. Reuse the existing TransformerDecoder / SDPA
-      stack + learned positional embedding; the only new wiring is the three-stage
-      token plumbing and Bark's merged text+semantic input embedding. Pico parity
-      `< 1e-4` vs a self-contained float64 numpy oracle on a committed re-randomized
-      fixture (`tools/make_pico_bark_fixture.py`, `TestBarkParity`), `examples/BarkTTS`
-      writing a WAV via `SaveVolumeToWav16`. Real suno/bark checkpoint key-mapping is
-      a network/RAM-gated follow-up.
+- [X] Bark text-to-speech importer (`BuildBarkFromSafeTensors[Ex]` + `TBarkConfig`
+      / `ReadBarkConfigFromJSONFile` + `BarkConfigToString`, model_type `bark`).
+      LANDED in neuralpretrained.pas: a self-contained `TBarkModel` holder of three
+      `TBarkSubModel`s (semantic, coarse, fine). NO new leaf layer — each sub-model is
+      a pre-norm GPT-2 block stack reusing `TNNetLearnedPositionalEmbedding` +
+      `AddMultiHeadSelfAttention` + `TNNetTokenLayerNorm` with exact-erf `nn.GELU`. New
+      wiring: a transpose-free `LoadLinearWeights` (Bark `nn.Linear` `[out,in]` vs
+      GPT-2's HF `Conv1D` `[in,out]`, biases gated by `config.bias`, bias-free
+      `lm_head`s); the fine model's merged input embedding (one table per codebook,
+      `n_codes_total` tables / `n_codes_total-n_codes_given` heads, summing codebook
+      embeddings `0..idx` and running BIDIRECTIONAL over time — `ComputeFineLogits`
+      matches HF `BarkFineModel.forward`). The holder runs the embedding (incl. the
+      fine codebook-sum) + head matmul in Pascal; the trunk is a TNNet (pos + blocks +
+      ln_f). EnCodec decode tail reuses the landed MusicGen `tiny_musicgen_encodec.*`
+      codec. Pico parity (`tools/make_pico_bark_fixture.py`, `TestBarkParity`, fixtures
+      `tests/fixtures/tiny_bark_*`): all THREE sub-models' forward logits match the HF
+      float64 oracle to max|diff| ~0 (SEMANTIC, COARSE, FINE all PASS < 1e-4; the
+      generator's self-checks prove the positional embedding, fine codebook
+      conditioning, and fine bidirectional-over-time attention each move the oracle).
+      `examples/BarkTTS` runs SEMANTIC->COARSE->FINE->EnCodec end-to-end and writes a
+      WAV via `SaveVolumeToWav16` (untrained random weights -> noise). Real suno/bark
+      checkpoint key-mapping (one nested checkpoint with `semantic`/`coarse_acoustics`/
+      `fine_acoustics` prefixes), a real tokenizer + voice prompt, and full
+      autoregressive sampling are network/RAM-gated follow-ups.
 - [X] DAC (Descript Audio Codec) neural-codec importer (`BuildDACFromSafeTensors[Ex]`
       + `TDACConfig` / `ReadDACConfigFromJSONFile` + `DACConfigToString`, model_type
       `dac`, the HF `DacModel`). LANDED in neuralpretrained.pas: a self-contained
