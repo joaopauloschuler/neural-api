@@ -746,19 +746,27 @@ rather than acted on.
       fixture (`tools/make_pico_bark_fixture.py`, `TestBarkParity`), `examples/BarkTTS`
       writing a WAV via `SaveVolumeToWav16`. Real suno/bark checkpoint key-mapping is
       a network/RAM-gated follow-up.
-- [ ] DAC (Descript Audio Codec) neural-codec importer (`BuildDACFromSafeTensors[Ex]`
-      + `TDACConfig` / `ReadDACConfigFromJSONFile`, model_type `dac`, e.g.
-      descript/dac_44khz, the HF `DacModel`) — the RVQGAN-lineage codec that is
-      architecturally distinct from the landed EnCodec/Mimi codecs: it uses the
-      already-in-tree `TNNetSnake` activation throughout, and a residual vector
-      quantizer with FACTORIZED, L2-normalized low-dimensional codes (input/output
-      projections around each codebook). Encoder = strided Snake conv blocks ->
-      RVQ; decoder = the mirror ConvTranspose1d Snake stack (reuse the channel-major
-      conv1d / RunHiFiGANConv path the audio holders already share). Pico round-trip
-      parity `< 1e-4` vs a float64 oracle on a committed fixture
-      (`tools/make_pico_dac_fixture.py`, `TestDACRoundTripParity`), `examples/DACRoundTrip`
-      encoding then decoding a synthesized tone to a WAV. This also unblocks the
-      Parler-TTS importer below (DAC is its decode backend).
+- [X] DAC (Descript Audio Codec) neural-codec importer (`BuildDACFromSafeTensors[Ex]`
+      + `TDACConfig` / `ReadDACConfigFromJSONFile` + `DACConfigToString`, model_type
+      `dac`, the HF `DacModel`). LANDED in neuralpretrained.pas: a self-contained
+      channel-major `TNNetDAC` holder (`Encode`/`Decode`/`Reconstruct`, double-
+      precision signal, F32 weights) reusing `TEnCodecConv`/`TEnCodecMat` with its
+      own SYMMETRIC/non-causal conv runner `RunDACConv` (Conv1d pads both sides;
+      ConvTranspose trims both ends). NO new leaf layer: the in-tree `TNNetSnake` is
+      a parameter-free scalar, so the holder applies DAC's learnable PER-CHANNEL
+      snake `x + (1/(α+1e-9))·sin(α·x)²` directly (per-channel α loaded from the
+      `(1,C,1)` tensors). FACTORIZED L2-normalized RVQ: `in_proj`(1×1)→L2-norm latent
+      & codebook→argmax cosine→raw codebook lookup→`out_proj`(1×1)→add to sum,
+      subtract from residual in full hidden space; decode-from-codes sums
+      `out_proj(codebook[code])`. `LoadDACConv` handles fused `.weight` OR weight_norm
+      (`parametrizations.weight.original0/1` / legacy `weight_g`/`weight_v`).
+      Pico fixture `tools/make_pico_dac_fixture.py` (committed `tests/fixtures/tiny_dac.*`,
+      float64 HF oracle); `TestDACRoundTripParity` (in TestNeuralPretrained.pas)
+      OBSERVED: codes match the oracle EXACTLY (max code diff 0), reconstructed
+      waveform max |diff| ≈ 9.1e-10 (gate < 1e-4). `examples/DACRoundTrip`
+      (.lpr+.lpi+README) round-trips a synthesized tone to a WAV via
+      `SaveVolumeToWav16`. DEFERRED follow-up: real 44 kHz / 16 kHz checkpoint parity
+      (download). This unblocks the Parler-TTS importer below (DAC is its decode backend).
 - [ ] Parler-TTS importer (`BuildParlerTTSFromSafeTensors[Ex]` + `TParlerConfig`,
       model_type `parler_tts`, e.g. parler-tts/parler-tts-mini-v1) — description-
       conditioned TTS: a (By)T5 text encoder (reuse `BuildT5FromSafeTensors`) encodes

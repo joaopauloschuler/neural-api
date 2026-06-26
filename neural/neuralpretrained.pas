@@ -4510,6 +4510,144 @@ function BuildMimiFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNetMimi;
 
 // ---------------------------------------------------------------------------
+// DAC (DESCRIPT AUDIO CODEC) IMPORT (model_type "dac", e.g. descript/dac_44khz,
+// the HF DacModel) - the RVQGAN-lineage neural audio codec.
+//
+// DAC is the third codec landed here (after EnCodec and Mimi) and reuses the
+// same self-contained channel-major holder design: a TNNetDAC holding the
+// imported weights runs the conv / RVQ math directly on channel-major arrays
+// (DOUBLE precision, like Mimi, for ~1e-12 round-trip parity), NOT as a TNNet
+// layer graph. It reuses TEnCodecConv / TEnCodecMat verbatim, but with its own
+// conv runner (RunDACConv) because DAC's convs are SYMMETRIC / NON-causal
+// (PyTorch padding=pad on BOTH sides) - unlike EnCodec's causal reflect-left-pad
+// and Mimi's causal constant-left-pad.
+//
+// Pipeline (HF DacModel):
+//   ENCODER:
+//     Conv1d(1 -> encoder_hidden_size, k=7, pad=3)
+//     for stride_index, stride in enumerate(downsampling_ratios, start=1):
+//       dim := encoder_hidden_size * 2**stride_index
+//       ResidualUnit(dim/2, dilation 1), ResidualUnit(dim/2, dilation 3),
+//       Snake(dim/2); ResidualUnit(dim/2, dilation 9);  // snake before conv1
+//       Snake(dim/2); Conv1d(dim/2 -> dim, k=2*stride, stride=stride,
+//                            pad=ceil(stride/2))         // strided downsample
+//     Snake(hidden_size); Conv1d(d_model -> hidden_size, k=3, pad=1)
+//   ResidualUnit(dim): snake1; conv1(k=7,dilation,pad=((7-1)*dil)//2);
+//     snake2; conv2(k=1); center-crop the residual to the conv output length
+//     before the skip add.
+//   RVQ (factorized, L2-normalized; DacResidualVectorQuantize):
+//     residual := z; quantized := 0; for each quantizer i:
+//       p := in_proj(residual)                 // 1x1 conv hidden->codebook_dim
+//       L2-normalize p AND the codebook rows; idx := argmax_k cos(p, cb[k])
+//         (= argmin L2 of the normalized vectors);
+//       q_i := out_proj(cb_raw[idx])           // 1x1 conv codebook_dim->hidden
+//       quantized := quantized + q_i; residual := residual - q_i
+//     codes[i][t] := idx. Decode-from-codes: quantized := sum_i out_proj(
+//       cb_raw[codes[i]]).
+//   DECODER (mirror):
+//     Conv1d(hidden_size -> decoder_hidden_size, k=7, pad=3)
+//     for stride_index, stride in enumerate(upsampling_ratios):
+//       Snake(in_dim); ConvTranspose1d(in_dim -> out_dim, k=2*stride,
+//                            stride=stride, pad=ceil(stride/2))  // upsample
+//       ResidualUnit(out_dim, dilation 1/3/9)
+//     Snake(out_dim); Conv1d(out_dim -> 1, k=7, pad=3); Tanh
+//   where in_dim=decoder_hidden_size//2**i, out_dim=decoder_hidden_size//2**(i+1).
+//
+// Snake(x) = x + (1/(alpha+1e-9)) * sin(alpha*x)^2 with a LEARNABLE PER-CHANNEL
+// alpha of shape (1, C, 1). (The in-tree TNNetSnake is a parameter-free scalar
+// alpha, so the holder applies the per-channel snake math directly.)
+//
+// Conv weights may be stored as a fused .weight OR weight_norm-parametrized
+// (.parametrizations.weight.original0/1 or legacy .weight_g/.weight_v) - the
+// loader handles all three; the codebook embedding is a plain nn.Embedding.
+// v1 is INFERENCE-ONLY (waveform -> codes -> waveform); real 44 kHz / 16 kHz
+// checkpoint parity is a documented follow-up. Coded by Claude (AI).
+// ---------------------------------------------------------------------------
+type
+  // One DAC residual unit: snake1 -> conv1(k=7,dilated) -> snake2 -> conv2(k=1),
+  // with the input center-cropped to the conv output length before the skip add.
+  // Each snake carries its own learnable per-channel alpha. Coded by Claude (AI).
+  TDACResidualUnit = record
+    Snake1Alpha, Snake2Alpha: TNeuralFloatDynArr;
+    Conv1, Conv2: TEnCodecConv;
+  end;
+
+  TDACConfig = record
+    SamplingRate: integer;       // sampling_rate (44100 / 16000)
+    EncoderHiddenSize: integer;  // encoder_hidden_size (64)
+    DecoderHiddenSize: integer;  // decoder_hidden_size (1536)
+    DownsamplingRatios: array of integer; // downsampling_ratios ([2,4,8,8])
+    UpsamplingRatios: array of integer;   // = reversed(downsampling_ratios)
+    NumCodebooks: integer;       // n_codebooks (9)
+    CodebookSize: integer;       // codebook_size (1024)
+    CodebookDim: integer;        // codebook_dim (8)
+    HiddenSize: integer;         // = encoder_hidden_size * 2**len(ratios)
+    HopLength: integer;          // = prod(downsampling_ratios)
+    ModelType: string;           // 'dac'
+  end;
+
+  { TNNetDAC }
+  // Holds the imported DAC weights and runs the full waveform <-> codes round
+  // trip in inference. Built by BuildDACFromSafeTensors[Ex]; caller-owned.
+  // Coded by Claude (AI).
+  TNNetDAC = class
+  private
+    FConfig: TDACConfig;
+    // Encoder: conv1, then NumStages blocks, then snake+conv2. A block is three
+    // residual units + a snake-alpha + a downsample conv. Stored flat per block.
+    FEncConv1: TEnCodecConv;
+    FEncBlockRes: array of array of TDACResidualUnit; // [block][0..2]
+    FEncBlockSnakeAlpha: array of TNeuralFloatDynArr;  // [block] per-channel
+    FEncBlockConv: array of TEnCodecConv;              // [block] downsample
+    FEncSnakeAlpha: TNeuralFloatDynArr;
+    FEncConv2: TEnCodecConv;
+    // RVQ: per quantizer an in_proj (1x1), out_proj (1x1) and a raw codebook.
+    FInProj, FOutProj: array of TEnCodecConv;
+    FCodebooks: array of TEnCodecMat;                  // [size, codebook_dim]
+    // Decoder: conv1, then NumStages blocks, then snake+conv2(+tanh). A block is
+    // a snake-alpha + an upsample conv-transpose + three residual units.
+    FDecConv1: TEnCodecConv;
+    FDecBlockSnakeAlpha: array of TNeuralFloatDynArr;
+    FDecBlockConvT: array of TEnCodecConv;
+    FDecBlockRes: array of array of TDACResidualUnit;
+    FDecSnakeAlpha: TNeuralFloatDynArr;
+    FDecConv2: TEnCodecConv;
+    procedure RunResidualUnit(const RU: TDACResidualUnit;
+      var Sig: TMimiDblArr2D);
+    procedure RunSnake(const Alpha: TNeuralFloatDynArr; var Sig: TMimiDblArr2D);
+  public
+    constructor Create(const pConfig: TDACConfig);
+    destructor Destroy; override;
+    property Config: TDACConfig read FConfig;
+    function NumCodebooks: integer;
+    // Waveform -> discrete RVQ codes. Codes[q][t], q in 0..NumCodebooks-1.
+    procedure Encode(const Waveform: array of TNeuralFloat;
+      out Codes: TNNetIntArr2D; out FrameCount: integer);
+    // Codes -> reconstructed mono waveform (UseCodebooks<=0 = all stages).
+    procedure Decode(const Codes: TNNetIntArr2D;
+      out Waveform: TNeuralFloatDynArr; UseCodebooks: integer = 0);
+    // Convenience full round trip.
+    procedure Reconstruct(const Waveform: array of TNeuralFloat;
+      out ReconOut: TNeuralFloatDynArr);
+  end;
+
+// Reads a HF DAC config.json (model_type "dac"). Derives hidden_size and
+// upsampling_ratios if absent (HF computes them in __post_init__).
+function ReadDACConfigFromJSONFile(const FileName: string): TDACConfig;
+
+function DACConfigToString(const Config: TDACConfig): string;
+
+// Builds a TNNetDAC from Reader (caller owns Reader). Coded by Claude (AI).
+function BuildDACFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  var Config: TDACConfig): TNNetDAC;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+function BuildDACFromSafeTensors(const FileName: string;
+  out Config: TDACConfig;
+  const ConfigFileName: string = ''): TNNetDAC;
+
+// ---------------------------------------------------------------------------
 // HIFI-GAN NEURAL VOCODER IMPORT (model_type "hifigan" / the SpeechT5HifiGan
 // generator shipped with most TTS stacks - Tacotron2 / FastSpeech2 / SpeechT5
 // / Bark / VITS). Maps a log-mel spectrogram (model_in_dim mel bands over
@@ -37759,6 +37897,716 @@ begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
     Result := BuildMimiFromSafeTensorsEx(Reader, Config);
+  finally
+    Reader.Free;
+  end;
+end;
+
+// ============================ DAC (DESCRIPT AUDIO CODEC) IMPORT =============
+
+function ReadDACConfigFromJSONFile(const FileName: string): TDACConfig;
+var
+  LpMax: integer;
+  JsonText: TStringList;
+  Root, RatiosArr: TJSONData;
+  Obj: TJSONObject;
+  ModelType: string;
+  Arr: TJSONArray;
+  I, Prod, NRatios: integer;
+
+  function OptInt(const Name: string; Def: integer): integer;
+  begin
+    if Obj.IndexOfName(Name) >= 0 then Result := Obj.Get(Name, Def)
+    else Result := Def;
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('DAC import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError('DAC import: config "' + FileName + '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', '');
+    if (ModelType <> '') and (ModelType <> 'dac') then
+      ImportError('DAC import: config model_type is "' + ModelType +
+        '", expected "dac".');
+    Result.ModelType := 'dac';
+    Result.SamplingRate := OptInt('sampling_rate', 16000);
+    Result.EncoderHiddenSize := OptInt('encoder_hidden_size', 64);
+    Result.DecoderHiddenSize := OptInt('decoder_hidden_size', 1536);
+    Result.NumCodebooks := OptInt('n_codebooks', 9);
+    Result.CodebookSize := OptInt('codebook_size', 1024);
+    Result.CodebookDim := OptInt('codebook_dim', 8);
+    // downsampling_ratios is required.
+    RatiosArr := Obj.Find('downsampling_ratios');
+    if (RatiosArr = nil) or RatiosArr.IsNull or not (RatiosArr is TJSONArray) then
+      ImportError('DAC import: config "' + FileName +
+        '" requires a "downsampling_ratios" array.');
+    Arr := TJSONArray(RatiosArr);
+    NRatios := Arr.Count;
+    if NRatios < 1 then
+      ImportError('DAC import: "downsampling_ratios" array is empty.');
+    SetLength(Result.DownsamplingRatios, NRatios);
+    LpMax := NRatios - 1;
+    for I := 0 to LpMax do
+      Result.DownsamplingRatios[I] := Arr.Integers[I];
+    // upsampling_ratios = reversed(downsampling_ratios) (HF __post_init__); read
+    // it if explicitly present, else derive.
+    RatiosArr := Obj.Find('upsampling_ratios');
+    if (RatiosArr <> nil) and not RatiosArr.IsNull and (RatiosArr is TJSONArray)
+       and (TJSONArray(RatiosArr).Count = NRatios) then
+    begin
+      Arr := TJSONArray(RatiosArr);
+      SetLength(Result.UpsamplingRatios, NRatios);
+      for I := 0 to LpMax do Result.UpsamplingRatios[I] := Arr.Integers[I];
+    end
+    else
+    begin
+      SetLength(Result.UpsamplingRatios, NRatios);
+      for I := 0 to LpMax do
+        Result.UpsamplingRatios[I] := Result.DownsamplingRatios[LpMax - I];
+    end;
+    // hidden_size = encoder_hidden_size * 2**len(ratios); hop = prod(ratios).
+    Result.HiddenSize := OptInt('hidden_size', 0);
+    Prod := 1;
+    for I := 0 to LpMax do Prod := Prod * Result.DownsamplingRatios[I];
+    Result.HopLength := Prod;
+    if Result.HiddenSize <= 0 then
+    begin
+      Result.HiddenSize := Result.EncoderHiddenSize;
+      for I := 0 to LpMax do Result.HiddenSize := Result.HiddenSize * 2;
+    end;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function DACConfigToString(const Config: TDACConfig): string;
+var
+  I, RatiosM1: integer;
+  Ratios: string;
+begin
+  Ratios := '[';
+  RatiosM1 := Length(Config.DownsamplingRatios) - 1;
+  for I := 0 to RatiosM1 do
+  begin
+    if I > 0 then Ratios := Ratios + ',';
+    Ratios := Ratios + IntToStr(Config.DownsamplingRatios[I]);
+  end;
+  Ratios := Ratios + ']';
+  Result :=
+    'DAC(' + Config.ModelType + '): sampling_rate=' +
+    IntToStr(Config.SamplingRate) + ' enc_hidden=' +
+    IntToStr(Config.EncoderHiddenSize) + ' dec_hidden=' +
+    IntToStr(Config.DecoderHiddenSize) + ' ratios=' + Ratios +
+    ' hidden=' + IntToStr(Config.HiddenSize) + ' hop=' +
+    IntToStr(Config.HopLength) + ' n_codebooks=' +
+    IntToStr(Config.NumCodebooks) + ' codebook_size=' +
+    IntToStr(Config.CodebookSize) + ' codebook_dim=' +
+    IntToStr(Config.CodebookDim);
+end;
+
+// Symmetric (non-causal) Conv1d / ConvTranspose1d on a channel-major Double
+// signal, mirroring DAC's nn.Conv1d(padding=Pad) / nn.ConvTranspose1d(padding=
+// Pad). No groups (DAC convs are ungrouped). Reuses the im2col + contiguous
+// Double DotProduct design of RunMimiConv but with SYMMETRIC zero-padding (Pad
+// frames on both sides for Conv1d; the ConvTranspose trims Pad frames off both
+// ends of the full overlap-add output). Coded by Claude (AI).
+procedure RunDACConv(const Conv: TEnCodecConv; Pad: integer;
+  const InSig: TMimiDblArr2D; out OutSig: TMimiDblArr2D);
+var
+  InCh, OutCh, K, Stride, Dil, InLen, EffK, o, i, t, k2: integer;
+  PaddedLen, OutLen, FullLen, idx: integer;
+  InChM1, OutChM1, KM1, InLenM1, OutLenM1, FullLenM1, lp: integer;
+  Padded, Full: TMimiDblArr2D;
+  Patch, WD: TMimiDblArr;
+  InCK: integer;
+begin
+  InCh := Conv.InCh;
+  OutCh := Conv.OutCh;
+  K := Conv.Kernel;
+  Stride := Conv.Stride;
+  Dil := Conv.Dilation;
+  InLen := Length(InSig[0]);
+  InChM1 := InCh - 1;
+  OutChM1 := OutCh - 1;
+  KM1 := K - 1;
+  InLenM1 := InLen - 1;
+  EffK := (K - 1) * Dil + 1;
+  if not Conv.Transpose then
+  begin
+    PaddedLen := InLen + 2 * Pad;
+    SetLength(Padded, InCh);
+    for i := 0 to InChM1 do
+    begin
+      SetLength(Padded[i], PaddedLen);
+      for t := 0 to PaddedLen - 1 do Padded[i][t] := 0;
+      for t := 0 to InLenM1 do Padded[i][Pad + t] := InSig[i][t];
+    end;
+    OutLen := (PaddedLen - EffK) div Stride + 1;
+    if OutLen < 0 then OutLen := 0;
+    OutLenM1 := OutLen - 1;
+    InCK := InCh * K;
+    SetLength(OutSig, OutCh);
+    for o := 0 to OutChM1 do SetLength(OutSig[o], OutLen);
+    SetLength(WD, OutCh * InCK);
+    for lp := 0 to OutCh * InCK - 1 do WD[lp] := Conv.W[lp];
+    SetLength(Patch, InCK);
+    for t := 0 to OutLenM1 do
+    begin
+      for i := 0 to InChM1 do
+        for k2 := 0 to KM1 do
+          Patch[i * K + k2] := Padded[i][t * Stride + k2 * Dil];
+      for o := 0 to OutChM1 do
+        OutSig[o][t] := Conv.B[o] +
+          MimiDotProductD(@WD[o * InCK], @Patch[0], InCK);
+    end;
+  end
+  else
+  begin
+    // ConvTranspose1d, ungrouped. Weight [In, Out, K]. Full overlap-add output
+    // length (In-1)*Stride + EffK, then trim Pad off BOTH ends (symmetric pad).
+    FullLen := (InLen - 1) * Stride + EffK;
+    FullLenM1 := FullLen - 1;
+    SetLength(Full, OutCh);
+    for o := 0 to OutChM1 do
+    begin
+      SetLength(Full[o], FullLen);
+      for t := 0 to FullLenM1 do Full[o][t] := 0;
+    end;
+    // For each (out-channel o, tap k2) the contraction over input channels i is
+    // contiguous once the weight column W[i*Out*K + o*K + k2] is repacked in i.
+    SetLength(Patch, InCh);   // InSig column over channels at time t
+    SetLength(WD, InCh);
+    for t := 0 to InLenM1 do
+    begin
+      for i := 0 to InChM1 do Patch[i] := InSig[i][t];
+      for o := 0 to OutChM1 do
+        for k2 := 0 to KM1 do
+        begin
+          idx := t * Stride + k2 * Dil;
+          for i := 0 to InChM1 do
+            WD[i] := Conv.W[i * OutCh * K + o * K + k2];
+          Full[o][idx] := Full[o][idx] + MimiDotProductD(@WD[0], @Patch[0], InCh);
+        end;
+    end;
+    for o := 0 to OutChM1 do
+      for t := 0 to FullLenM1 do Full[o][t] := Full[o][t] + Conv.B[o];
+    OutLen := FullLen - 2 * Pad;
+    if OutLen < 0 then OutLen := 0;
+    OutLenM1 := OutLen - 1;
+    SetLength(OutSig, OutCh);
+    for o := 0 to OutChM1 do
+    begin
+      SetLength(OutSig[o], OutLen);
+      for t := 0 to OutLenM1 do OutSig[o][t] := Full[o][Pad + t];
+    end;
+  end;
+end;
+
+// Loads a DAC conv: accepts a fused .weight OR weight_norm parametrization
+// (.parametrizations.weight.original0/1 or legacy .weight_g/.weight_v); folds
+// w = g*v/||v|| (weight_norm dim=0) when parametrized. pTranspose selects the
+// [In,Out,K] ConvTranspose1d weight layout. Coded by Claude (AI).
+procedure LoadDACConv(Reader: TNNetSafeTensorsReader; const Prefix: string;
+  var Conv: TEnCodecConv; pTranspose: boolean; pStride, pDilation: integer;
+  Consumed: TStrings);
+var
+  LpMax: integer;
+  G, V: TNNetVolume;
+  D0, D1, K, o, i, k2, Base, Cnt, OutDim, InDim: integer;
+  OutDimM1, InDimM1, KM1: integer;
+  Norm: TNeuralFloat;
+  GName, VName, WName: string;
+  Parametrized: boolean;
+begin
+  G := TNNetVolume.Create;
+  V := TNNetVolume.Create;
+  try
+    Conv.Transpose := pTranspose;
+    Conv.Stride := pStride;
+    Conv.Dilation := pDilation;
+    Conv.Groups := 1;
+    Conv.PadMode := 'constant';
+    Parametrized := False;
+    GName := '';
+    VName := '';
+    if Reader.HasTensor(Prefix + '.weight') then
+    begin
+      WName := Prefix + '.weight';
+    end
+    else if Reader.HasTensor(Prefix + '.parametrizations.weight.original1') then
+    begin
+      Parametrized := True;
+      GName := Prefix + '.parametrizations.weight.original0';
+      VName := Prefix + '.parametrizations.weight.original1';
+    end
+    else
+    begin
+      Parametrized := True;
+      GName := Prefix + '.weight_g';
+      VName := Prefix + '.weight_v';
+    end;
+
+    if not Parametrized then
+    begin
+      Reader.LoadTensorFlat(WName, V);
+      Consumed.Add(WName);
+      D0 := Reader.DimSize(WName, 0);
+      D1 := Reader.DimSize(WName, 1);
+      K := Reader.DimSize(WName, 2);
+      Conv.Kernel := K;
+      if pTranspose then begin Conv.InCh := D0; Conv.OutCh := D1; end
+      else begin Conv.InCh := D1; Conv.OutCh := D0; end;
+      SetLength(Conv.W, V.Size);
+      LpMax := V.Size - 1;
+      for o := 0 to LpMax do Conv.W[o] := V.FData[o];
+    end
+    else
+    begin
+      Reader.LoadTensorFlat(GName, G);
+      Reader.LoadTensorFlat(VName, V);
+      Consumed.Add(GName);
+      Consumed.Add(VName);
+      OutDim := Reader.DimSize(VName, 0); // weight_norm group axis (dim0)
+      InDim := Reader.DimSize(VName, 1);
+      K := Reader.DimSize(VName, 2);
+      OutDimM1 := OutDim - 1;
+      InDimM1 := InDim - 1;
+      KM1 := K - 1;
+      Conv.Kernel := K;
+      if pTranspose then begin Conv.InCh := OutDim; Conv.OutCh := InDim; end
+      else begin Conv.InCh := InDim; Conv.OutCh := OutDim; end;
+      Cnt := OutDim * InDim * K;
+      SetLength(Conv.W, Cnt);
+      for o := 0 to OutDimM1 do
+      begin
+        Base := o * InDim * K;
+        Norm := 0;
+        for i := 0 to InDimM1 do
+          for k2 := 0 to KM1 do Norm := Norm + Sqr(V.FData[Base + i * K + k2]);
+        Norm := Sqrt(Norm);
+        if Norm = 0 then Norm := 1;
+        for i := 0 to InDimM1 do
+          for k2 := 0 to KM1 do
+            Conv.W[Base + i * K + k2] :=
+              G.FData[o] * V.FData[Base + i * K + k2] / Norm;
+      end;
+    end;
+    // bias
+    Reader.LoadTensorFlat(Prefix + '.bias', G);
+    Consumed.Add(Prefix + '.bias');
+    SetLength(Conv.B, G.Size);
+    LpMax := G.Size - 1;
+    for o := 0 to LpMax do Conv.B[o] := G.FData[o];
+  finally
+    V.Free;
+    G.Free;
+  end;
+end;
+
+// Loads a Snake per-channel alpha tensor of shape (1, C, 1) into a flat [C] vec.
+procedure LoadDACSnakeAlpha(Reader: TNNetSafeTensorsReader; const Name: string;
+  out Alpha: TNeuralFloatDynArr; Consumed: TStrings);
+var
+  T: TNNetVolume;
+  I, LpMax: integer;
+begin
+  T := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Name, T);
+    SetLength(Alpha, T.Size);
+    LpMax := T.Size - 1;
+    for I := 0 to LpMax do Alpha[I] := T.FData[I];
+    Consumed.Add(Name);
+  finally
+    T.Free;
+  end;
+end;
+
+constructor TNNetDAC.Create(const pConfig: TDACConfig);
+begin
+  inherited Create;
+  FConfig := pConfig;
+end;
+
+destructor TNNetDAC.Destroy;
+begin
+  inherited Destroy;
+end;
+
+function TNNetDAC.NumCodebooks: integer;
+begin
+  Result := Length(FCodebooks);
+end;
+
+// Snake(x) = x + (1/(alpha+1e-9)) * sin(alpha*x)^2, per-channel alpha.
+procedure TNNetDAC.RunSnake(const Alpha: TNeuralFloatDynArr;
+  var Sig: TMimiDblArr2D);
+var
+  c, t, ChM1, TM1: integer;
+  a, inv, sx, x: double;
+begin
+  ChM1 := Length(Sig) - 1;
+  if ChM1 < 0 then Exit;
+  TM1 := Length(Sig[0]) - 1;
+  for c := 0 to ChM1 do
+  begin
+    a := Alpha[c];
+    inv := 1.0 / (a + 1e-9);
+    for t := 0 to TM1 do
+    begin
+      x := Sig[c][t];
+      sx := Sin(a * x);
+      Sig[c][t] := x + inv * sx * sx;
+    end;
+  end;
+end;
+
+// snake1 -> conv1 -> snake2 -> conv2, with the input center-cropped to the conv
+// output length before the skip add (HF DacResidualUnit).
+procedure TNNetDAC.RunResidualUnit(const RU: TDACResidualUnit;
+  var Sig: TMimiDblArr2D);
+var
+  H, Tmp: TMimiDblArr2D;
+  c, t, ChM1, InLen, OutLen, Padding, OutM1: integer;
+  Pad1: integer;
+begin
+  ChM1 := Length(Sig) - 1;
+  InLen := Length(Sig[0]);
+  // Work on a copy so the residual (Sig) is preserved for the crop+add.
+  SetLength(H, ChM1 + 1);
+  for c := 0 to ChM1 do
+  begin
+    SetLength(H[c], InLen);
+    for t := 0 to InLen - 1 do H[c][t] := Sig[c][t];
+  end;
+  RunSnake(RU.Snake1Alpha, H);
+  // conv1: k=7 dilated, pad = ((7-1)*dilation)//2.
+  Pad1 := ((RU.Conv1.Kernel - 1) * RU.Conv1.Dilation) div 2;
+  RunDACConv(RU.Conv1, Pad1, H, Tmp);
+  H := Tmp;
+  RunSnake(RU.Snake2Alpha, H);
+  RunDACConv(RU.Conv2, 0, H, Tmp); // k=1, no pad
+  H := Tmp;
+  OutLen := Length(H[0]);
+  Padding := (InLen - OutLen) div 2;
+  OutM1 := OutLen - 1;
+  // out = crop(Sig, padding) + H.
+  for c := 0 to ChM1 do
+    for t := 0 to OutM1 do
+      H[c][t] := Sig[c][Padding + t] + H[c][t];
+  // Resize Sig to OutLen and copy back.
+  for c := 0 to ChM1 do
+  begin
+    SetLength(Sig[c], OutLen);
+    for t := 0 to OutM1 do Sig[c][t] := H[c][t];
+  end;
+end;
+
+procedure TNNetDAC.Encode(const Waveform: array of TNeuralFloat;
+  out Codes: TNNetIntArr2D; out FrameCount: integer);
+var
+  Sig, Tmp: TMimiDblArr2D;
+  i, t, b, NumStages, ru, q, NQ, Cd, HiddenDim: integer;
+  Frames, FramesM1, Stride, Pad, Km: integer;
+  Residual, NormP: TMimiDblArr;
+  cbk, best: integer;
+  pn, cn, dot, BestSim: double;
+  CodebookNorms: TMimiDblArr2D; // L2-normalized codebook rows per quantizer
+  CbSize, d, CdM1: integer;
+begin
+  // input -> [1][T]
+  SetLength(Sig, 1);
+  SetLength(Sig[0], Length(Waveform));
+  for t := 0 to Length(Waveform) - 1 do Sig[0][t] := Waveform[t];
+
+  // encoder conv1 (k=7, pad=3).
+  RunDACConv(FEncConv1, 3, Sig, Tmp); Sig := Tmp;
+  NumStages := Length(FEncBlockConv);
+  for b := 0 to NumStages - 1 do
+  begin
+    // three residual units (dilations 1,3,9).
+    for ru := 0 to High(FEncBlockRes[b]) do
+      RunResidualUnit(FEncBlockRes[b][ru], Sig);
+    RunSnake(FEncBlockSnakeAlpha[b], Sig);
+    // strided downsample conv (k=2*stride, stride, pad=ceil(stride/2)).
+    Stride := FEncBlockConv[b].Stride;
+    Pad := (Stride + 1) div 2; // ceil(stride/2)
+    RunDACConv(FEncBlockConv[b], Pad, Sig, Tmp); Sig := Tmp;
+  end;
+  RunSnake(FEncSnakeAlpha, Sig);
+  RunDACConv(FEncConv2, 1, Sig, Tmp); Sig := Tmp; // k=3, pad=1
+
+  HiddenDim := Length(Sig);
+  Frames := Length(Sig[0]);
+  FrameCount := Frames;
+  FramesM1 := Frames - 1;
+
+  NQ := Length(FCodebooks);
+  Cd := FConfig.CodebookDim;
+  CdM1 := Cd - 1;
+  SetLength(Codes, NQ);
+  for q := 0 to NQ - 1 do SetLength(Codes[q], Frames);
+
+  // Pre-normalize each codebook's rows once (L2 over codebook_dim).
+  SetLength(CodebookNorms, NQ);
+  for q := 0 to NQ - 1 do
+  begin
+    CbSize := FCodebooks[q].Rows;
+    SetLength(CodebookNorms[q], CbSize * Cd);
+    for cbk := 0 to CbSize - 1 do
+    begin
+      cn := 0;
+      for d := 0 to CdM1 do
+        cn := cn + Sqr(FCodebooks[q].Data[cbk * Cd + d]);
+      cn := Sqrt(cn);
+      if cn = 0 then cn := 1e-12;
+      for d := 0 to CdM1 do
+        CodebookNorms[q][cbk * Cd + d] := FCodebooks[q].Data[cbk * Cd + d] / cn;
+    end;
+  end;
+
+  SetLength(Residual, HiddenDim);
+  SetLength(NormP, Cd);
+  for t := 0 to FramesM1 do
+  begin
+    for i := 0 to HiddenDim - 1 do Residual[i] := Sig[i][t];
+    for q := 0 to NQ - 1 do
+    begin
+      // in_proj: 1x1 conv hidden->codebook_dim. Residual is one frame; do the
+      // matmul (out[o] = bias + sum_i W[o,i]*residual[i]).
+      Km := FInProj[q].Kernel; // = 1
+      if Km = 0 then Km := 1;
+      for d := 0 to CdM1 do
+      begin
+        dot := FInProj[q].B[d];
+        for i := 0 to HiddenDim - 1 do
+          dot := dot + FInProj[q].W[d * HiddenDim + i] * Residual[i];
+        NormP[d] := dot;
+      end;
+      // L2-normalize the projected latent.
+      pn := 0;
+      for d := 0 to CdM1 do pn := pn + Sqr(NormP[d]);
+      pn := Sqrt(pn);
+      if pn = 0 then pn := 1e-12;
+      for d := 0 to CdM1 do NormP[d] := NormP[d] / pn;
+      // argmax cosine = argmin L2 of the normalized vectors against the
+      // normalized codebook (both unit-norm).
+      CbSize := FCodebooks[q].Rows;
+      best := 0; BestSim := -1e30;
+      for cbk := 0 to CbSize - 1 do
+      begin
+        dot := 0;
+        for d := 0 to CdM1 do
+          dot := dot + NormP[d] * CodebookNorms[q][cbk * Cd + d];
+        if dot > BestSim then begin BestSim := dot; best := cbk; end;
+      end;
+      Codes[q][t] := best;
+      // out_proj(raw codebook row) -> hidden, subtract from residual.
+      for i := 0 to HiddenDim - 1 do
+      begin
+        dot := FOutProj[q].B[i];
+        for d := 0 to CdM1 do
+          dot := dot + FOutProj[q].W[i * Cd + d] * FCodebooks[q].Data[best * Cd + d];
+        Residual[i] := Residual[i] - dot;
+      end;
+    end;
+  end;
+end;
+
+procedure TNNetDAC.Decode(const Codes: TNNetIntArr2D;
+  out Waveform: TNeuralFloatDynArr; UseCodebooks: integer);
+var
+  Sig, Tmp: TMimiDblArr2D;
+  i, t, b, NumStages, ru, q, NQ, Cd, HiddenDim, Frames, code, d: integer;
+  Stride, Pad, FramesM1, NUse, OutLen, CdM1: integer;
+  dot: double;
+begin
+  NQ := Length(FCodebooks);
+  if (UseCodebooks > 0) and (UseCodebooks < NQ) then NUse := UseCodebooks
+  else NUse := NQ;
+  Cd := FConfig.CodebookDim;
+  CdM1 := Cd - 1;
+  HiddenDim := FConfig.HiddenSize;
+  Frames := Length(Codes[0]);
+  FramesM1 := Frames - 1;
+
+  // from_codes: quantized = sum_q out_proj(codebook[codes[q]]).
+  SetLength(Sig, HiddenDim);
+  for i := 0 to HiddenDim - 1 do
+  begin
+    SetLength(Sig[i], Frames);
+    for t := 0 to FramesM1 do Sig[i][t] := 0;
+  end;
+  for q := 0 to NUse - 1 do
+    for t := 0 to FramesM1 do
+    begin
+      code := Codes[q][t];
+      for i := 0 to HiddenDim - 1 do
+      begin
+        dot := FOutProj[q].B[i];
+        for d := 0 to CdM1 do
+          dot := dot + FOutProj[q].W[i * Cd + d] * FCodebooks[q].Data[code * Cd + d];
+        Sig[i][t] := Sig[i][t] + dot;
+      end;
+    end;
+
+  // decoder conv1 (k=7, pad=3).
+  RunDACConv(FDecConv1, 3, Sig, Tmp); Sig := Tmp;
+  NumStages := Length(FDecBlockConvT);
+  for b := 0 to NumStages - 1 do
+  begin
+    RunSnake(FDecBlockSnakeAlpha[b], Sig);
+    Stride := FDecBlockConvT[b].Stride;
+    Pad := (Stride + 1) div 2; // ceil(stride/2)
+    RunDACConv(FDecBlockConvT[b], Pad, Sig, Tmp); Sig := Tmp;
+    for ru := 0 to High(FDecBlockRes[b]) do
+      RunResidualUnit(FDecBlockRes[b][ru], Sig);
+  end;
+  RunSnake(FDecSnakeAlpha, Sig);
+  RunDACConv(FDecConv2, 3, Sig, Tmp); Sig := Tmp; // k=7, pad=3 -> 1 channel
+
+  // tanh.
+  OutLen := Length(Sig[0]);
+  SetLength(Waveform, OutLen);
+  for t := 0 to OutLen - 1 do
+  begin
+    dot := Sig[0][t];
+    Waveform[t] := Tanh(dot);
+  end;
+end;
+
+procedure TNNetDAC.Reconstruct(const Waveform: array of TNeuralFloat;
+  out ReconOut: TNeuralFloatDynArr);
+var
+  Codes: TNNetIntArr2D;
+  Frames: integer;
+begin
+  Encode(Waveform, Codes, Frames);
+  Decode(Codes, ReconOut, 0);
+end;
+
+function BuildDACFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  var Config: TDACConfig): TNNetDAC;
+var
+  Model: TNNetDAC;
+  Consumed: TStringList;
+  NumStages, b, ru, q, NQ: integer;
+  Stride: integer;
+  EncPref, DecPref, RuPref, QPref: string;
+  Dilations: array[0..2] of integer = (1, 3, 9);
+
+  procedure LoadResUnit(const Pref: string; var RU: TDACResidualUnit;
+    Dil: integer);
+  begin
+    LoadDACSnakeAlpha(Reader, Pref + '.snake1.alpha', RU.Snake1Alpha, Consumed);
+    LoadDACConv(Reader, Pref + '.conv1', RU.Conv1, False, 1, Dil, Consumed);
+    LoadDACSnakeAlpha(Reader, Pref + '.snake2.alpha', RU.Snake2Alpha, Consumed);
+    LoadDACConv(Reader, Pref + '.conv2', RU.Conv2, False, 1, 1, Consumed);
+  end;
+
+begin
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  Model := nil;
+  try
+    Model := TNNetDAC.Create(Config);
+    NumStages := Length(Config.DownsamplingRatios);
+
+    // ---------------- ENCODER ----------------
+    LoadDACConv(Reader, 'encoder.conv1', Model.FEncConv1, False, 1, 1, Consumed);
+    SetLength(Model.FEncBlockRes, NumStages);
+    SetLength(Model.FEncBlockSnakeAlpha, NumStages);
+    SetLength(Model.FEncBlockConv, NumStages);
+    for b := 0 to NumStages - 1 do
+    begin
+      EncPref := 'encoder.block.' + IntToStr(b);
+      SetLength(Model.FEncBlockRes[b], 3);
+      for ru := 0 to 2 do
+      begin
+        RuPref := EncPref + '.res_unit' + IntToStr(ru + 1);
+        LoadResUnit(RuPref, Model.FEncBlockRes[b][ru], Dilations[ru]);
+      end;
+      LoadDACSnakeAlpha(Reader, EncPref + '.snake1.alpha',
+        Model.FEncBlockSnakeAlpha[b], Consumed);
+      // downsample conv1: stride = downsampling_ratios[b].
+      Stride := Config.DownsamplingRatios[b];
+      LoadDACConv(Reader, EncPref + '.conv1', Model.FEncBlockConv[b],
+        False, Stride, 1, Consumed);
+    end;
+    LoadDACSnakeAlpha(Reader, 'encoder.snake1.alpha', Model.FEncSnakeAlpha,
+      Consumed);
+    LoadDACConv(Reader, 'encoder.conv2', Model.FEncConv2, False, 1, 1, Consumed);
+
+    // ---------------- RVQ ----------------
+    NQ := Config.NumCodebooks;
+    SetLength(Model.FInProj, NQ);
+    SetLength(Model.FOutProj, NQ);
+    SetLength(Model.FCodebooks, NQ);
+    for q := 0 to NQ - 1 do
+    begin
+      QPref := 'quantizer.quantizers.' + IntToStr(q);
+      LoadDACConv(Reader, QPref + '.in_proj', Model.FInProj[q], False, 1, 1,
+        Consumed);
+      LoadDACConv(Reader, QPref + '.out_proj', Model.FOutProj[q], False, 1, 1,
+        Consumed);
+      LoadEnCodecMat(Reader, QPref + '.codebook.weight', Model.FCodebooks[q],
+        Consumed);
+    end;
+
+    // ---------------- DECODER ----------------
+    LoadDACConv(Reader, 'decoder.conv1', Model.FDecConv1, False, 1, 1, Consumed);
+    SetLength(Model.FDecBlockSnakeAlpha, NumStages);
+    SetLength(Model.FDecBlockConvT, NumStages);
+    SetLength(Model.FDecBlockRes, NumStages);
+    for b := 0 to NumStages - 1 do
+    begin
+      DecPref := 'decoder.block.' + IntToStr(b);
+      LoadDACSnakeAlpha(Reader, DecPref + '.snake1.alpha',
+        Model.FDecBlockSnakeAlpha[b], Consumed);
+      Stride := Config.UpsamplingRatios[b];
+      LoadDACConv(Reader, DecPref + '.conv_t1', Model.FDecBlockConvT[b],
+        True, Stride, 1, Consumed);
+      SetLength(Model.FDecBlockRes[b], 3);
+      for ru := 0 to 2 do
+      begin
+        RuPref := DecPref + '.res_unit' + IntToStr(ru + 1);
+        LoadResUnit(RuPref, Model.FDecBlockRes[b][ru], Dilations[ru]);
+      end;
+    end;
+    LoadDACSnakeAlpha(Reader, 'decoder.snake1.alpha', Model.FDecSnakeAlpha,
+      Consumed);
+    LoadDACConv(Reader, 'decoder.conv2', Model.FDecConv2, False, 1, 1, Consumed);
+
+    Result := Model;
+    Model := nil;
+  finally
+    Model.Free;
+    Consumed.Free;
+  end;
+end;
+
+function BuildDACFromSafeTensors(const FileName: string;
+  out Config: TDACConfig;
+  const ConfigFileName: string = ''): TNNetDAC;
+var
+  Reader: TNNetSafeTensorsReader;
+  CfgPath: string;
+begin
+  if ConfigFileName <> '' then CfgPath := ConfigFileName
+  else CfgPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadDACConfigFromJSONFile(CfgPath);
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildDACFromSafeTensorsEx(Reader, Config);
   finally
     Reader.Free;
   end;
