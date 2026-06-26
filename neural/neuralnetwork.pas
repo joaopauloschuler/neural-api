@@ -30509,9 +30509,14 @@ end;
 
 function TNNetSAMVisionAttention.SaveStructureToString(): string;
 begin
-  Result := StringReplace(ClassName, 'TNNet', '', []) + ':' +
-    IntToStr(FHeads) + ';' + IntToStr(FWindowSize) + ';' +
-    IntToStr(FHeadDim) + ';' + IntToStr(FChannels);
+  // The constructor mirrors all four hyperparameters into FStruct[0..3]
+  // (Heads, WindowSize, HeadDim, Channels), so the standard base-class
+  // serializer round-trips correctly through CreateLayer, which reconstructs
+  // via Create(St[0], St[1], St[2], St[3]). The previous bespoke format here
+  // both stripped the 'TNNet' class-name prefix and used a non-standard ':'
+  // layout that CreateLayer could not parse, so this layer serialized but
+  // failed to deserialize. Delegate to the inherited (correct) format.
+  Result := inherited SaveStructureToString();
 end;
 
 procedure TNNetSAMVisionAttention.AllocBuffers();
