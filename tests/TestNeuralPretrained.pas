@@ -339,6 +339,12 @@ type
     // committed char-vocab fixture; the expected ids come from the real HF
     // VitsTokenizer (cross-checked offline).
     procedure TestVitsTokenizerParity;
+    // Kokoro / StyleTTS2: per-stage parity (text-encoder hidden, style-
+    // conditioned log-durations + integer durations, length-regulator
+    // expansion, F0/energy prosody curves, iSTFTNet magnitude+phase, end-to-
+    // end waveform) vs a self-contained numpy float64 oracle on a pico fixture,
+    // with the reference style vector fed explicitly < 1e-4.
+    procedure TestKokoroSynthesisParity;
     // Demucs: separates two pinned mixed waveforms through the imported
     // time-domain U-Net (strided conv + GLU + bi-LSTM + transpose conv with
     // U-Net skips) and asserts the four stems match the self-contained numpy
@@ -13495,6 +13501,137 @@ begin
     CheckCase('HELLO', [0, 6, 0, 7, 0, 21, 0, 21, 0, 22, 0]);
   finally
     Tok.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestKokoroSynthesisParity;
+var
+  Model: TNNetKokoro;
+  Config: TKokoroConfig;
+  RefRoot: TJSONData;
+  RefObj: TJSONObject;
+  RefJson: TStringList;
+  IdArr, StyleArr, LdArr, DurArr, F0Arr, EnArr, MagArr, PhArr, WavArr,
+    RowArr: TJSONArray;
+  Ids: array of integer;
+  Style, LogDur, F0, Energy, Wave, SPred: TNeuralFloatDynArr;
+  Durations: TNeuralIntegerArray;
+  Hidden, Expanded, Magnitude, Phase: TNNetFloatDynArr2D;
+  DurI: array of integer;
+  H, T, OutLen, NBins, i, c, t2: integer;
+  Diff, MaxDiff, RefV: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_kokoro_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefObj := TJSONObject(RefRoot);
+    H := RefObj.Get('hidden_size', 0);
+    OutLen := RefObj.Get('out_len', 0);
+    NBins := RefObj.Get('n_bins', 0);
+
+    Model := BuildKokoroFromSafeTensors(FixturePath('tiny_kokoro.safetensors'),
+      Config, FixturePath('tiny_kokoro_config.json'));
+    AssertTrue('kokoro built', Model <> nil);
+    AssertEquals('hidden_size from config', H, Config.HiddenSize);
+
+    // ---- inputs: phoneme ids + style vector.
+    IdArr := TJSONArray(RefObj.Find('input_ids'));
+    T := IdArr.Count;
+    SetLength(Ids, T);
+    for i := 0 to T - 1 do Ids[i] := IdArr.Items[i].AsInteger;
+    StyleArr := TJSONArray(RefObj.Find('style'));
+    SetLength(Style, StyleArr.Count);
+    for i := 0 to StyleArr.Count - 1 do Style[i] := StyleArr.Items[i].AsFloat;
+    SetLength(SPred, H);
+    for i := 0 to H - 1 do SPred[i] := Style[i];
+
+    // ---- Stage: text encoder + duration predictor.
+    Model.RunTextEncoder(Ids, Hidden);
+    Model.RunDuration(Hidden, SPred, LogDur, Durations);
+
+    LdArr := TJSONArray(RefObj.Find('log_duration'));
+    MaxDiff := 0;
+    for i := 0 to T - 1 do
+    begin
+      Diff := Abs(LogDur[i] - LdArr.Items[i].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('Kokoro log-duration parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    DurArr := TJSONArray(RefObj.Find('durations'));
+    SetLength(DurI, T);
+    for i := 0 to T - 1 do
+    begin
+      DurI[i] := Round(DurArr.Items[i].AsFloat);
+      AssertEquals('Kokoro duration token ' + IntToStr(i),
+        DurI[i], Durations[i]);
+    end;
+
+    // ---- Stage: length-regulator expansion + prosody curves.
+    Model.ExpandHidden(Hidden, Durations, Expanded);
+    AssertEquals('Kokoro expanded length', OutLen, Length(Expanded[0]));
+    Model.RunProsody(Expanded, SPred, F0, Energy);
+
+    F0Arr := TJSONArray(RefObj.Find('f0'));
+    EnArr := TJSONArray(RefObj.Find('energy'));
+    MaxDiff := 0;
+    for i := 0 to OutLen - 1 do
+    begin
+      Diff := Abs(F0[i] - F0Arr.Items[i].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+      Diff := Abs(Energy[i] - EnArr.Items[i].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('Kokoro F0/energy parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // ---- Stage: iSTFTNet decoder magnitude + phase.
+    Model.RunDecoder(Expanded, F0, Energy,
+      Copy(Style, H, Config.StyleDim - H), Magnitude, Phase, Wave);
+    MagArr := TJSONArray(RefObj.Find('magnitude'));   // [NBINS][L]
+    PhArr := TJSONArray(RefObj.Find('phase'));
+    MaxDiff := 0;
+    for c := 0 to NBins - 1 do
+    begin
+      RowArr := TJSONArray(MagArr.Items[c]);
+      for t2 := 0 to OutLen - 1 do
+      begin
+        Diff := Abs(Magnitude[c][t2] - RowArr.Items[t2].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      RowArr := TJSONArray(PhArr.Items[c]);
+      for t2 := 0 to OutLen - 1 do
+      begin
+        Diff := Abs(Phase[c][t2] - RowArr.Items[t2].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('Kokoro magnitude/phase parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // ---- End-to-end: ids + style -> waveform.
+    Model.Synthesize(Ids, Style, Wave);
+    WavArr := TJSONArray(RefObj.Find('waveform'));
+    AssertEquals('Kokoro waveform length', WavArr.Count, Length(Wave));
+    MaxDiff := 0;
+    for i := 0 to WavArr.Count - 1 do
+    begin
+      RefV := WavArr.Items[i].AsFloat;
+      Diff := Abs(Wave[i] - RefV);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    // 1e-4 importer-parity gate. NEVER loosen - fix the model instead.
+    AssertTrue('Kokoro end-to-end waveform parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Model.Free;
+    RefRoot.Free;
+    RefJson.Free;
   end;
 end;
 

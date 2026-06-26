@@ -738,7 +738,7 @@ rather than acted on.
   - [ ] real-checkpoint smoke: synthesize a sentence with a downloaded
         `facebook/mms-tts-eng` / `kakao-enterprise/vits-ljs` and write it via
         `SaveVolumeToWav16` (offline + RAM-gated here, so deferred).
-- [ ] Kokoro / StyleTTS2 text-to-speech importer (`BuildKokoroFromSafeTensors[Ex]` +
+- [X] Kokoro / StyleTTS2 text-to-speech importer (`BuildKokoroFromSafeTensors[Ex]` +
       `BuildKokoroFromSafeTensorsWithConfig`, `TKokoroConfig`/`ReadKokoroConfigFromJSONFile`,
       a channel-major `TNNetKokoro` holder like the landed `TNNetVits`/`TNNetHiFiGAN`)
       + an examples/KokoroTTS smoke that writes a WAV via `SaveVolumeToWav16`. Kokoro
@@ -773,6 +773,27 @@ rather than acted on.
       feed pre-phonemized input and reject `language`/g2p config loudly, exactly as the
       VITS uroman/phonemizer front-ends are deferred. Unlocks the missing inverse-STFT
       vocoding rung shared with any spectral-domain generator.
+      LANDED: `TKokoroConfig`/`ReadKokoroConfigFromJSONFile`, channel-major `TNNetKokoro`
+      holder + `BuildKokoroFromSafeTensors[Ex]`/`BuildKokoroFromSafeTensorsWithConfig`
+      in neural/neuralpretrained.pas; the three StyleTTS2 pieces wired (StyleDim-d
+      voice vector split into prosody half s_pred + acoustic half s_dec, AdaIN1d =
+      gamma(s)*InstanceNorm_ch(x)+beta(s) injected into the duration/F0/energy
+      predictors and decoder; style-conditioned duration predictor + length-regulator
+      monotonic expansion; iSTFTNet decoder predicting magnitude=exp(conv) +
+      phase=sin(conv) and reusing the LANDED `ISTFTOverlapAdd` in neuralaudio.pas);
+      deterministic phonemes+style->waveform forward graph with the style vector as an
+      EXPLICIT input; g2p/language config rejected loudly. `TestKokoroSynthesisParity`
+      gates < 1e-4 (per-stage: text-encoder hidden, log-durations + integer durations,
+      length-regulator, F0/energy, magnitude+phase, end-to-end waveform) vs a
+      SELF-CONTAINED numpy float64 oracle (`tools/make_pico_kokoro_fixture.py` ->
+      `tests/fixtures/tiny_kokoro{.safetensors,_config.json,_ref.json}`, re-randomized
+      O(1)-scale weights, seed 13); examples/KokoroTTS smoke writes a WAV via
+      `SaveVolumeToWav16`. OPEN follow-ups: real hexgrad/Kokoro-82M checkpoint key
+      mapping (the pico fixture defines a faithful StyleTTS2-SHAPED graph, not the exact
+      HF module/key layout - the real ProsodyPredictor LSTMs, AdaINResBlock1 stacks and
+      harmonic source module are not yet wired); multi-speaker / per-voice `voices/*.pt`
+      reference-vector indexing by token length; the misaki/espeak grapheme->phoneme
+      front-end.
 - [ ] Mimi streaming neural-codec importer (`BuildMimiFromSafeTensors[Ex]`,
       model_type "mimi", e.g. `kyutai/mimi`) — LANDED (conv encoder/decoder +
       RoPE transformer bottleneck + semantic/acoustic split-VQ; codes match the

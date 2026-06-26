@@ -27,6 +27,8 @@ examples/MusicGenText/MusicGenText
 examples/MusicGenText/musicgen_text_demo.wav
 examples/LotteryTicketIMP/LotteryTicketIMP
 examples/LatentTextToImage/LatentTextToImage
+examples/KokoroTTS/KokoroTTS
+examples/KokoroTTS/kokoro_pico.wav
 examples/VQCodebookUsage/VQCodebookUsage
 examples/FourierMix/FourierMix
 examples/SpanCorruptionPretrain/SpanCorruptionPretrain

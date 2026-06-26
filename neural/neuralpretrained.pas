@@ -527,7 +527,7 @@ uses
   {$ENDIF}
   Classes, SysUtils, Math, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralthread, neuralsafetensors, neuraltorchbin,
-  neuralgguf, neuralhftokenizer, neuralmxfp4, pascoremath32;
+  neuralgguf, neuralhftokenizer, neuralmxfp4, neuralaudio, pascoremath32;
 
 type
   EPretrainedImportError = class(Exception);
@@ -4700,6 +4700,154 @@ function BuildVitsFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
 function BuildVitsFromSafeTensors(const FileName: string;
   out Config: TVitsConfig;
   const ConfigFileName: string = ''): TNNetVits;
+
+// ---------------------------------------------------------------------------
+// KOKORO / STYLETTS2 TEXT-TO-SPEECH IMPORT (model_type "kokoro";
+// hexgrad/Kokoro-82M, Apache-2.0 - the current best-in-class lightweight open
+// TTS model, a StyleTTS2 architecture NOT VITS). Like HiFi-GAN / VITS above it
+// is a self-contained channel-major holder (TNNetKokoro) running the synthesis
+// math directly. The three StyleTTS2 pieces that distinguish it from the VITS
+// path:
+//
+//   (1) STYLE-VECTOR CONDITIONING. A StyleDim-d voice/style vector (the
+//       per-voice reference embedding; an EXPLICIT input in v1) is split into
+//       a prosody half s_pred = style[0..H-1] and an acoustic/decoder half
+//       s_dec = style[H..StyleDim-1]. Each half is AdaIN/affine-injected:
+//           AdaIN1d(x, s) = gamma(s) * InstanceNorm_ch(x) + beta(s)
+//       where InstanceNorm_ch normalizes EACH channel across time (mean/var
+//       over the time axis, population variance) and [gamma; beta] = fc(s) is
+//       a learned linear map s -> 2*H (gamma = fc[0..H-1], beta = fc[H..2H-1]).
+//       This is the new conditioning math vs VITS's WaveNet `cond` convs.
+//
+//   (2) iSTFTNet DECODER. The generator predicts a magnitude + phase
+//       spectrogram and runs an INVERSE STFT (overlap-add) to the waveform
+//       rather than HiFi-GAN's transposed-conv upsampling. Reuses the LANDED
+//       ISTFTOverlapAdd(Mag, Phase, ...) primitive in neuralaudio.pas.
+//
+//   (3) PROSODY / DURATION STACK. A style-conditioned duration predictor emits
+//       per-token log-durations; duration = round(exp(log_dur)*speed) clamped
+//       >= 1; a length regulator expands the per-token text encoding along time
+//       (the monotonic alignment); then style-conditioned F0 and energy (N)
+//       predictors produce the prosody curves the decoder consumes.
+//
+// INFERENCE pipeline (phonemes + style -> waveform; deterministic, no
+// sampling):
+//   text encoder: embed[ids] -> Conv1d(k=enc_kernel,"same") -> ReLU -> [H][T].
+//   duration: AdaIN(s_pred) -> Conv1d(k=dur_kernel) ReLU -> proj(->1) ->
+//       log_dur; durations = round(exp(log_dur)*speed) (>= 1); length regulator
+//       expands [H][T] -> [H][L].
+//   F0 / energy: each AdaIN(s_pred) -> Conv1d(k=f0_kernel) ReLU -> proj(->1).
+//   decoder: concat([expanded; f0; energy]) -> Conv1d(k=dec_kernel) ReLU ->
+//       AdaIN(s_dec) -> magnitude head exp(Conv) + phase head sin(Conv) ->
+//       ISTFT(mag, phase, n_fft, hop_length) -> waveform.
+//
+// SCOPE v1: single deterministic forward graph with the reference style vector
+// as an EXPLICIT input. The grapheme->phoneme (misaki/espeak) front-end is OUT
+// OF SCOPE - pre-phonemized integer ids are the input and language/g2p config
+// is rejected loudly (exactly as the VITS uroman/phonemizer front-ends defer).
+// Coded by Claude (AI).
+// ---------------------------------------------------------------------------
+type
+  TKokoroConfig = record
+    HiddenSize: integer;            // hidden_size (H; per-AdaIN channel count)
+    StyleDim: integer;              // style_dim (2*H: s_pred half + s_dec half)
+    VocabSize: integer;             // vocab_size (phoneme vocab)
+    EncKernel: integer;             // text-encoder conv kernel
+    DurKernel: integer;             // duration-predictor conv kernel
+    F0Kernel: integer;              // F0 / energy conv kernel
+    DecKernel: integer;             // decoder conv kernel
+    NFFT: integer;                  // iSTFT n_fft (NFFT div 2 + 1 mag/phase bins)
+    HopLength: integer;             // iSTFT hop length
+    Speed: TNeuralFloat;            // length scale (duration multiplier)
+    LayerNormEps: TNeuralFloat;     // AdaIN InstanceNorm epsilon
+    SamplingRate: integer;          // sampling_rate (for the WAV writer)
+    ModelType: string;              // 'kokoro'
+  end;
+
+  // One AdaIN1d block: fc maps s (H,) -> [gamma(H); beta(H)] (2H,).
+  TKokoroAdaIN = record
+    FcW: TNeuralFloatDynArr;        // [2H, H] row-major
+    FcB: TNeuralFloatDynArr;        // [2H]
+  end;
+
+  { TNNetKokoro }
+  // Holds an imported Kokoro / StyleTTS2 model and runs the full
+  // phonemes + style -> waveform inference synthesis. Built by
+  // BuildKokoroFromSafeTensors[Ex]; caller-owned. Coded by Claude (AI).
+  TNNetKokoro = class
+  private
+    FConfig: TKokoroConfig;
+    FEmbed: TNeuralFloatDynArr;                   // embed [V, H]
+    FEncConv: THiFiGANConv;                       // text-encoder conv
+    FDurAdaIN: TKokoroAdaIN;
+    FDurConv, FDurProj: THiFiGANConv;
+    FF0AdaIN: TKokoroAdaIN;
+    FF0Conv, FF0Proj: THiFiGANConv;
+    FNAdaIN: TKokoroAdaIN;
+    FNConv, FNProj: THiFiGANConv;
+    FDecAdaIN: TKokoroAdaIN;
+    FDecConvIn, FDecMag, FDecPhase: THiFiGANConv;
+    // AdaIN1d over a channel-major [H][T] signal in place, conditioned on the
+    // H-d style half S.
+    procedure RunAdaIN(const AdaIN: TKokoroAdaIN; const S: TNeuralFloatDynArr;
+      var Sig: TNNetFloatDynArr2D);
+  public
+    constructor Create(const pConfig: TKokoroConfig);
+    destructor Destroy; override;
+    property Config: TKokoroConfig read FConfig;
+    // Text encoder: ids -> channel-major hidden [H][T]. Exposed for stage
+    // parity testing.
+    procedure RunTextEncoder(const Ids: array of integer;
+      out Hidden: TNNetFloatDynArr2D);
+    // Duration predictor: hidden [H][T] + prosody style s_pred -> per-token
+    // log-durations [T] and integer durations [T]. Exposed for stage parity.
+    procedure RunDuration(const Hidden: TNNetFloatDynArr2D;
+      const SPred: TNeuralFloatDynArr; out LogDur: TNeuralFloatDynArr;
+      out Durations: TNeuralIntegerArray);
+    // Length regulator: expand each column t of Hidden [H][T] Durations[t]
+    // times along the time axis -> [H][L]. Exposed for stage parity testing.
+    procedure ExpandHidden(const Hidden: TNNetFloatDynArr2D;
+      const Durations: array of integer; out Expanded: TNNetFloatDynArr2D);
+    // F0 + energy predictors on the expanded hidden [H][L] + prosody style
+    // s_pred -> F0 and energy curves [L]. Exposed for stage parity testing.
+    procedure RunProsody(const Expanded: TNNetFloatDynArr2D;
+      const SPred: TNeuralFloatDynArr; out F0, Energy: TNeuralFloatDynArr);
+    // iSTFTNet decoder: expanded hidden + F0/energy + acoustic style s_dec ->
+    // magnitude + phase spectrograms [NBINS][L] then ISTFT -> waveform.
+    // Exposed for stage parity testing.
+    procedure RunDecoder(const Expanded: TNNetFloatDynArr2D;
+      const F0, Energy, SDec: TNeuralFloatDynArr;
+      out Magnitude, Phase: TNNetFloatDynArr2D;
+      out Waveform: TNeuralFloatDynArr);
+    // Full inference: phoneme ids + StyleDim-d style vector -> waveform.
+    procedure Synthesize(const Ids: array of integer;
+      const Style: TNeuralFloatDynArr; out Waveform: TNeuralFloatDynArr);
+    // Convenience: synthesize and write a 16-bit WAV via SaveVolumeToWav16.
+    procedure SynthesizeToWav(const Ids: array of integer;
+      const Style: TNeuralFloatDynArr; const FileName: string);
+  end;
+
+// Reads a HF/kokoro config.json (model_type "kokoro"). Rejects language/g2p
+// config loudly (the g2p front-end is out of scope). Coded by Claude (AI).
+function ReadKokoroConfigFromJSONFile(const FileName: string): TKokoroConfig;
+
+function KokoroConfigToString(const Config: TKokoroConfig): string;
+
+// Builds a TNNetKokoro from Reader (the caller owns Reader). Coded by
+// Claude (AI).
+function BuildKokoroFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  var Config: TKokoroConfig): TNNetKokoro;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+function BuildKokoroFromSafeTensors(const FileName: string;
+  out Config: TKokoroConfig;
+  const ConfigFileName: string = ''): TNNetKokoro;
+
+// Same as BuildKokoroFromSafeTensorsEx but takes an explicit pre-read Config
+// (the "WithConfig" entry point, mirroring the other importers).
+function BuildKokoroFromSafeTensorsWithConfig(const FileName: string;
+  const Config: TKokoroConfig): TNNetKokoro;
 
 // ---------------------------------------------------------------------------
 // DEMUCS TIME-DOMAIN MUSIC SOURCE-SEPARATION IMPORT (facebook/demucs, htdemucs
@@ -38366,6 +38514,465 @@ begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
     Result := BuildVitsFromSafeTensorsEx(Reader, Config);
+  finally
+    Reader.Free;
+  end;
+end;
+
+// ===========================================================================
+// KOKORO / STYLETTS2 implementation.
+// ===========================================================================
+{ TNNetKokoro }
+
+constructor TNNetKokoro.Create(const pConfig: TKokoroConfig);
+begin
+  inherited Create;
+  FConfig := pConfig;
+end;
+
+destructor TNNetKokoro.Destroy;
+begin
+  inherited Destroy;
+end;
+
+procedure TNNetKokoro.RunTextEncoder(const Ids: array of integer;
+  out Hidden: TNNetFloatDynArr2D);
+var
+  H, Tlen, c, t, id, TM1, HM1: integer;
+  Emb, Conv: TNNetFloatDynArr2D;
+begin
+  H := FConfig.HiddenSize;
+  Tlen := Length(Ids);
+  HM1 := H - 1;
+  TM1 := Tlen - 1;
+  // embed -> channel-major [H][T].
+  SetLength(Emb, H);
+  for c := 0 to HM1 do SetLength(Emb[c], Tlen);
+  for t := 0 to TM1 do
+  begin
+    id := Ids[t];
+    for c := 0 to HM1 do Emb[c][t] := FEmbed[id * H + c];
+  end;
+  // conv (k=enc_kernel, "same") -> ReLU.
+  RunHiFiGANConv(FEncConv, Emb, Conv);
+  for c := 0 to HM1 do
+    for t := 0 to TM1 do if Conv[c][t] < 0 then Conv[c][t] := 0;
+  Hidden := Conv;
+end;
+
+// AdaIN1d: gamma * InstanceNorm_ch(x) + beta, [gamma; beta] = fc(s).
+// InstanceNorm normalizes EACH channel across time (population variance).
+procedure TNNetKokoro.RunAdaIN(const AdaIN: TKokoroAdaIN;
+  const S: TNeuralFloatDynArr; var Sig: TNNetFloatDynArr2D);
+var
+  H, Tlen, c, t, i, HM1, TM1: integer;
+  Mean, Variance, Acc, Gamma, Beta, Eps, InvStd: TNeuralFloat;
+begin
+  H := FConfig.HiddenSize;
+  Tlen := Length(Sig[0]);
+  HM1 := H - 1;
+  TM1 := Tlen - 1;
+  Eps := FConfig.LayerNormEps;
+  for c := 0 to HM1 do
+  begin
+    // fc row gamma = FcW[c], beta = FcW[H + c] (each a length-H dot with S).
+    Gamma := AdaIN.FcB[c];
+    Beta := AdaIN.FcB[H + c];
+    for i := 0 to HM1 do
+    begin
+      Gamma := Gamma + AdaIN.FcW[c * H + i] * S[i];
+      Beta := Beta + AdaIN.FcW[(H + c) * H + i] * S[i];
+    end;
+    // per-channel mean / population variance over time.
+    Mean := 0;
+    for t := 0 to TM1 do Mean := Mean + Sig[c][t];
+    Mean := Mean / Tlen;
+    Variance := 0;
+    for t := 0 to TM1 do
+    begin
+      Acc := Sig[c][t] - Mean;
+      Variance := Variance + Acc * Acc;
+    end;
+    Variance := Variance / Tlen;
+    InvStd := 1.0 / Sqrt(Variance + Eps);
+    for t := 0 to TM1 do
+      Sig[c][t] := Gamma * (Sig[c][t] - Mean) * InvStd + Beta;
+  end;
+end;
+
+procedure TNNetKokoro.RunDuration(const Hidden: TNNetFloatDynArr2D;
+  const SPred: TNeuralFloatDynArr; out LogDur: TNeuralFloatDynArr;
+  out Durations: TNeuralIntegerArray);
+var
+  H, Tlen, c, t, HM1, TM1, D: integer;
+  Sig, Conv, Pr: TNNetFloatDynArr2D;
+begin
+  H := FConfig.HiddenSize;
+  Tlen := Length(Hidden[0]);
+  HM1 := H - 1;
+  TM1 := Tlen - 1;
+  // copy hidden so AdaIN does not mutate the caller's tensor.
+  SetLength(Sig, H);
+  for c := 0 to HM1 do Sig[c] := Copy(Hidden[c]);
+  RunAdaIN(FDurAdaIN, SPred, Sig);
+  RunHiFiGANConv(FDurConv, Sig, Conv);
+  for c := 0 to HM1 do
+    for t := 0 to TM1 do if Conv[c][t] < 0 then Conv[c][t] := 0;
+  RunHiFiGANConv(FDurProj, Conv, Pr);   // 1 channel
+  SetLength(LogDur, Tlen);
+  SetLength(Durations, Tlen);
+  for t := 0 to TM1 do
+  begin
+    LogDur[t] := Pr[0][t];
+    D := Round(Exp(LogDur[t]) * FConfig.Speed);
+    if D < 1 then D := 1;
+    Durations[t] := D;
+  end;
+end;
+
+procedure TNNetKokoro.ExpandHidden(const Hidden: TNNetFloatDynArr2D;
+  const Durations: array of integer; out Expanded: TNNetFloatDynArr2D);
+var
+  H, Tlen, OutLen, tok, rep, col, c, HM1, TM1: integer;
+begin
+  H := FConfig.HiddenSize;
+  Tlen := Length(Hidden[0]);
+  HM1 := H - 1;
+  TM1 := Tlen - 1;
+  OutLen := 0;
+  for tok := 0 to TM1 do OutLen := OutLen + Durations[tok];
+  if OutLen < 1 then OutLen := 1;
+  SetLength(Expanded, H);
+  for c := 0 to HM1 do SetLength(Expanded[c], OutLen);
+  col := 0;
+  for tok := 0 to TM1 do
+    for rep := 0 to Durations[tok] - 1 do
+    begin
+      if col >= OutLen then Break;
+      for c := 0 to HM1 do Expanded[c][col] := Hidden[c][tok];
+      Inc(col);
+    end;
+end;
+
+// One style-conditioned curve predictor: copy -> AdaIN(s) -> conv ReLU ->
+// proj(->1). Used for both F0 and energy.
+procedure RunKokoroCurve(Owner: TNNetKokoro; const AdaIN: TKokoroAdaIN;
+  const Conv, Proj: THiFiGANConv; const Expanded: TNNetFloatDynArr2D;
+  const S: TNeuralFloatDynArr; out Curve: TNeuralFloatDynArr);
+var
+  H, L, c, t, HM1, LM1: integer;
+  Sig, Cv, Pr: TNNetFloatDynArr2D;
+begin
+  H := Owner.Config.HiddenSize;
+  L := Length(Expanded[0]);
+  HM1 := H - 1;
+  LM1 := L - 1;
+  SetLength(Sig, H);
+  for c := 0 to HM1 do Sig[c] := Copy(Expanded[c]);
+  Owner.RunAdaIN(AdaIN, S, Sig);
+  RunHiFiGANConv(Conv, Sig, Cv);
+  for c := 0 to HM1 do
+    for t := 0 to LM1 do if Cv[c][t] < 0 then Cv[c][t] := 0;
+  RunHiFiGANConv(Proj, Cv, Pr);
+  Curve := Copy(Pr[0]);
+end;
+
+procedure TNNetKokoro.RunProsody(const Expanded: TNNetFloatDynArr2D;
+  const SPred: TNeuralFloatDynArr; out F0, Energy: TNeuralFloatDynArr);
+begin
+  RunKokoroCurve(Self, FF0AdaIN, FF0Conv, FF0Proj, Expanded, SPred, F0);
+  RunKokoroCurve(Self, FNAdaIN, FNConv, FNProj, Expanded, SPred, Energy);
+end;
+
+procedure TNNetKokoro.RunDecoder(const Expanded: TNNetFloatDynArr2D;
+  const F0, Energy, SDec: TNeuralFloatDynArr;
+  out Magnitude, Phase: TNNetFloatDynArr2D;
+  out Waveform: TNeuralFloatDynArr);
+var
+  H, L, NBins, c, t, HM1, LM1, NBinsM1: integer;
+  DecIn, Mix, MagC, PhaseC: TNNetFloatDynArr2D;
+  MagVol, PhaseVol, WaveVol: TNNetVolume;
+begin
+  H := FConfig.HiddenSize;
+  L := Length(Expanded[0]);
+  HM1 := H - 1;
+  LM1 := L - 1;
+  NBins := FConfig.NFFT div 2 + 1;
+  NBinsM1 := NBins - 1;
+  // concat [expanded(H); f0(1); energy(1)] -> (H+2) channels.
+  SetLength(DecIn, H + 2);
+  for c := 0 to HM1 do DecIn[c] := Copy(Expanded[c]);
+  DecIn[H] := Copy(F0);
+  DecIn[H + 1] := Copy(Energy);
+  // conv_in -> ReLU -> AdaIN(s_dec).
+  RunHiFiGANConv(FDecConvIn, DecIn, Mix);
+  for c := 0 to HM1 do
+    for t := 0 to LM1 do if Mix[c][t] < 0 then Mix[c][t] := 0;
+  RunAdaIN(FDecAdaIN, SDec, Mix);
+  // magnitude head = exp(conv), phase head = sin(conv).
+  RunHiFiGANConv(FDecMag, Mix, MagC);
+  RunHiFiGANConv(FDecPhase, Mix, PhaseC);
+  SetLength(Magnitude, NBins);
+  SetLength(Phase, NBins);
+  for c := 0 to NBinsM1 do
+  begin
+    SetLength(Magnitude[c], L);
+    SetLength(Phase[c], L);
+    for t := 0 to LM1 do
+    begin
+      Magnitude[c][t] := Exp(MagC[c][t]);
+      Phase[c][t] := Sin(PhaseC[c][t]);
+    end;
+  end;
+  // ISTFT(mag, phase) -> waveform. ISTFTOverlapAdd consumes a (frames,1,bins)
+  // TNNetVolume (Depth = bins), so transpose [bins][frames] -> volume.
+  MagVol := TNNetVolume.Create(L, 1, NBins);
+  PhaseVol := TNNetVolume.Create(L, 1, NBins);
+  WaveVol := TNNetVolume.Create;
+  try
+    for t := 0 to LM1 do
+      for c := 0 to NBinsM1 do
+      begin
+        MagVol.FData[t * NBins + c] := Magnitude[c][t];
+        PhaseVol.FData[t * NBins + c] := Phase[c][t];
+      end;
+    ISTFTOverlapAdd(MagVol, PhaseVol, WaveVol, FConfig.NFFT, FConfig.HopLength);
+    SetLength(Waveform, WaveVol.Size);
+    for t := 0 to WaveVol.Size - 1 do Waveform[t] := WaveVol.FData[t];
+  finally
+    MagVol.Free;
+    PhaseVol.Free;
+    WaveVol.Free;
+  end;
+end;
+
+procedure TNNetKokoro.Synthesize(const Ids: array of integer;
+  const Style: TNeuralFloatDynArr; out Waveform: TNeuralFloatDynArr);
+var
+  H, i, HM1: integer;
+  Hidden, Expanded, Magnitude, Phase: TNNetFloatDynArr2D;
+  LogDur, F0, Energy, SPred, SDec: TNeuralFloatDynArr;
+  Durations: TNeuralIntegerArray;
+begin
+  H := FConfig.HiddenSize;
+  HM1 := H - 1;
+  if Length(Style) <> FConfig.StyleDim then
+    ImportError('Kokoro synthesize: style vector length ' +
+      IntToStr(Length(Style)) + ' must equal style_dim ' +
+      IntToStr(FConfig.StyleDim) + '.');
+  // split style into prosody half s_pred = style[0..H-1] and acoustic half
+  // s_dec = style[H..StyleDim-1].
+  SetLength(SPred, H);
+  SetLength(SDec, FConfig.StyleDim - H);
+  for i := 0 to HM1 do SPred[i] := Style[i];
+  for i := 0 to FConfig.StyleDim - H - 1 do SDec[i] := Style[H + i];
+  RunTextEncoder(Ids, Hidden);
+  RunDuration(Hidden, SPred, LogDur, Durations);
+  ExpandHidden(Hidden, Durations, Expanded);
+  RunProsody(Expanded, SPred, F0, Energy);
+  RunDecoder(Expanded, F0, Energy, SDec, Magnitude, Phase, Waveform);
+end;
+
+procedure TNNetKokoro.SynthesizeToWav(const Ids: array of integer;
+  const Style: TNeuralFloatDynArr; const FileName: string);
+var
+  Waveform: TNeuralFloatDynArr;
+  Vol: TNNetVolume;
+  i: integer;
+begin
+  Synthesize(Ids, Style, Waveform);
+  Vol := TNNetVolume.Create(Length(Waveform), 1, 1);
+  try
+    for i := 0 to Length(Waveform) - 1 do Vol.FData[i] := Waveform[i];
+    SaveVolumeToWav16(Vol, FileName, FConfig.SamplingRate);
+  finally
+    Vol.Free;
+  end;
+end;
+
+// Loads an AdaIN fc linear (Prefix.fc.weight [2H, H], Prefix.fc.bias [2H]).
+procedure LoadKokoroAdaIN(Reader: TNNetSafeTensorsReader; const Prefix: string;
+  var AdaIN: TKokoroAdaIN; Consumed: TStrings);
+var
+  V: TNNetVolume;
+  i, Cnt: integer;
+begin
+  V := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Prefix + '.fc.weight', V);
+    Consumed.Add(Prefix + '.fc.weight');
+    Cnt := V.Size;
+    SetLength(AdaIN.FcW, Cnt);
+    for i := 0 to Cnt - 1 do AdaIN.FcW[i] := V.FData[i];
+    Reader.LoadTensorFlat(Prefix + '.fc.bias', V);
+    Consumed.Add(Prefix + '.fc.bias');
+    Cnt := V.Size;
+    SetLength(AdaIN.FcB, Cnt);
+    for i := 0 to Cnt - 1 do AdaIN.FcB[i] := V.FData[i];
+  finally
+    V.Free;
+  end;
+end;
+
+function ReadKokoroConfigFromJSONFile(const FileName: string): TKokoroConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Kokoro import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Kokoro import: config field "' + FieldName +
+        '" must be a positive integer.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Kokoro import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Kokoro import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Kokoro import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'kokoro');
+    if ModelType <> 'kokoro' then
+      ImportError('Kokoro import: config model_type is "' + ModelType +
+        '" - only "kokoro" is supported.');
+    // The grapheme->phoneme front-end is OUT OF SCOPE: reject any g2p /
+    // language config loudly (exactly as VITS defers uroman/phonemizer).
+    if (Obj.IndexOfName('language') >= 0) or (Obj.IndexOfName('g2p') >= 0) or
+       (Obj.IndexOfName('phonemizer') >= 0) then
+      ImportError('Kokoro import: a "language"/"g2p"/"phonemizer" config key ' +
+        'is present, but the grapheme->phoneme front-end is OUT OF SCOPE in ' +
+        'v1 - feed PRE-PHONEMIZED integer ids instead.');
+    Result.ModelType := 'kokoro';
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.StyleDim := RequiredInt('style_dim');
+    if Result.StyleDim <> 2 * Result.HiddenSize then
+      ImportError('Kokoro import: v1 expects style_dim = 2*hidden_size ' +
+        '(prosody half + acoustic half).');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.EncKernel := RequiredInt('enc_kernel');
+    Result.DurKernel := RequiredInt('dur_kernel');
+    Result.F0Kernel := RequiredInt('f0_kernel');
+    Result.DecKernel := RequiredInt('dec_kernel');
+    Result.NFFT := RequiredInt('n_fft');
+    Result.HopLength := RequiredInt('hop_length');
+    Result.Speed := Obj.Get('speed', 1.0);
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1e-5);
+    Result.SamplingRate := Obj.Get('sampling_rate', 24000);
+  finally
+    if Root <> nil then Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function KokoroConfigToString(const Config: TKokoroConfig): string;
+begin
+  Result := Format('Kokoro(H=%d, style_dim=%d, vocab=%d, n_fft=%d, hop=%d, ' +
+    'sr=%d)', [Config.HiddenSize, Config.StyleDim, Config.VocabSize,
+    Config.NFFT, Config.HopLength, Config.SamplingRate]);
+end;
+
+function BuildKokoroFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  var Config: TKokoroConfig): TNNetKokoro;
+var
+  Model: TNNetKokoro;
+  Consumed: TStringList;
+  V: TNNetVolume;
+  i, Cnt: integer;
+begin
+  Model := TNNetKokoro.Create(Config);
+  Consumed := TStringList.Create;
+  V := TNNetVolume.Create;
+  try
+    // embedding [V, H].
+    Reader.LoadTensorFlat('embed', V);
+    Consumed.Add('embed');
+    Cnt := V.Size;
+    SetLength(Model.FEmbed, Cnt);
+    for i := 0 to Cnt - 1 do Model.FEmbed[i] := V.FData[i];
+    // text-encoder conv (k=enc_kernel, "same" pad).
+    LoadHiFiGANConv(Reader, 'text_encoder.conv', Model.FEncConv, False,
+      1, 1, Config.EncKernel div 2, Consumed);
+    // duration predictor.
+    LoadKokoroAdaIN(Reader, 'duration_predictor.adain', Model.FDurAdaIN,
+      Consumed);
+    LoadHiFiGANConv(Reader, 'duration_predictor.conv', Model.FDurConv, False,
+      1, 1, Config.DurKernel div 2, Consumed);
+    LoadHiFiGANConv(Reader, 'duration_predictor.proj', Model.FDurProj, False,
+      1, 1, 0, Consumed);
+    // F0 predictor.
+    LoadKokoroAdaIN(Reader, 'f0_predictor.adain', Model.FF0AdaIN, Consumed);
+    LoadHiFiGANConv(Reader, 'f0_predictor.conv', Model.FF0Conv, False,
+      1, 1, Config.F0Kernel div 2, Consumed);
+    LoadHiFiGANConv(Reader, 'f0_predictor.proj', Model.FF0Proj, False,
+      1, 1, 0, Consumed);
+    // energy predictor.
+    LoadKokoroAdaIN(Reader, 'energy_predictor.adain', Model.FNAdaIN, Consumed);
+    LoadHiFiGANConv(Reader, 'energy_predictor.conv', Model.FNConv, False,
+      1, 1, Config.F0Kernel div 2, Consumed);
+    LoadHiFiGANConv(Reader, 'energy_predictor.proj', Model.FNProj, False,
+      1, 1, 0, Consumed);
+    // decoder.
+    LoadKokoroAdaIN(Reader, 'decoder.adain', Model.FDecAdaIN, Consumed);
+    LoadHiFiGANConv(Reader, 'decoder.conv_in', Model.FDecConvIn, False,
+      1, 1, Config.DecKernel div 2, Consumed);
+    LoadHiFiGANConv(Reader, 'decoder.magnitude', Model.FDecMag, False,
+      1, 1, Config.DecKernel div 2, Consumed);
+    LoadHiFiGANConv(Reader, 'decoder.phase', Model.FDecPhase, False,
+      1, 1, Config.DecKernel div 2, Consumed);
+    Result := Model;
+  finally
+    V.Free;
+    Consumed.Free;
+  end;
+end;
+
+function BuildKokoroFromSafeTensors(const FileName: string;
+  out Config: TKokoroConfig;
+  const ConfigFileName: string = ''): TNNetKokoro;
+var
+  Reader: TNNetSafeTensorsReader;
+  CfgPath: string;
+begin
+  if ConfigFileName <> '' then CfgPath := ConfigFileName
+  else CfgPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadKokoroConfigFromJSONFile(CfgPath);
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildKokoroFromSafeTensorsEx(Reader, Config);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildKokoroFromSafeTensorsWithConfig(const FileName: string;
+  const Config: TKokoroConfig): TNNetKokoro;
+var
+  Reader: TNNetSafeTensorsReader;
+  Cfg: TKokoroConfig;
+begin
+  Cfg := Config;
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildKokoroFromSafeTensorsEx(Reader, Cfg);
   finally
     Reader.Free;
   end;
