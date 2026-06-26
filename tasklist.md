@@ -85,8 +85,6 @@ rather than acted on.
 - [ ] FFT-path FPU denormal/invalid-op traps in TNNetSpectralConv2D needed an
       example-side SetExceptionMask workaround — consider masking/guarding the
       denormals inside the layer's FFT so callers don't have to.
-- [ ] ulimit -v 3000000 ChatTerminal /path/to/Qwen2.5-0.5B-Instruct crashes using all RAM at loading the model
-      Tested with !git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q2
 - [ ] SentencePiece `.model` `precompiled_charsmap` parsing — the opaque
       per-model normalization trie (NOT standard NFKC) is still not
       parsed/applied. A tokenizer.json that declares a standard NFKC/NFKD
