@@ -458,6 +458,8 @@ type
     procedure TestBlipCaptionGreedy;
     procedure TestTrOCRConfigFromJSONFile;
     procedure TestTrOCRParity;
+    procedure TestFlorence2LocationTokens;
+    procedure TestFlorence2Parity;
     procedure TestInceptionV3ConfigFromJSONFile;
     procedure TestInceptionV3ImageClassificationParity;
     procedure TestInceptionV3FullParity;
@@ -18342,6 +18344,150 @@ begin
     DecToks.Free;
     Img.Free;
     RefJson.Free;
+    EncoderNet.Free;
+    DecoderNet.Free;
+  end;
+end;
+
+// Florence-2 location-token (de)quantization: a normalized coordinate <->
+// a <loc_> token id round-trip (the "spatial outputs as text" idea), checked
+// against the reference bins the fixture generator emits.
+procedure TTestNeuralPretrained.TestFlorence2LocationTokens;
+var
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  LocArr, BoxArr, BinArr: TJSONArray;
+  Item: TJSONObject;
+  NumBins, LocBase, i, GotId, RefBin, GotBin: integer;
+  Coord, GotCoord: double;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_florence2_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    NumBins := TJSONObject(RefRoot).Get('num_bins', 1000);
+    LocBase := TJSONObject(RefRoot).Get('loc_base', 0);
+    LocArr := TJSONArray(TJSONObject(RefRoot).Find('loc_examples'));
+    for i := 0 to LocArr.Count - 1 do
+    begin
+      Item := TJSONObject(LocArr.Items[i]);
+      Coord := Item.Get('coord', 0.0);
+      RefBin := Item.Get('bin', 0);
+      GotId := Florence2QuantizeCoord(Coord, NumBins, LocBase);
+      AssertEquals('loc bin for coord ' + FloatToStr(Coord),
+        LocBase + RefBin, GotId);
+      // Dequantize round-trips to within one bin width.
+      GotCoord := Florence2DequantizeCoord(GotId, NumBins, LocBase);
+      AssertTrue('loc dequant round-trip',
+        Abs(GotCoord - Coord) <= 1.0 / (NumBins - 1) + 1e-9);
+    end;
+    // A reference box maps to its 4 reference bins.
+    BoxArr := TJSONArray(TJSONObject(RefRoot).Find('ref_box'));
+    BinArr := TJSONArray(TJSONObject(RefRoot).Find('ref_box_bins'));
+    for i := 0 to BoxArr.Count - 1 do
+    begin
+      RefBin := BinArr.Items[i].AsInteger;
+      GotId := Florence2QuantizeCoord(BoxArr.Items[i].AsFloat,
+        NumBins, LocBase);
+      GotBin := GotId - LocBase;
+      AssertEquals('ref box bin ' + IntToStr(i), RefBin, GotBin);
+    end;
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Florence-2 unified-vision parity: the multimodal projector + the visual-
+// prefix BART encoder + the BART decoder pinned to the REAL HF Florence2
+// float64 oracle on the decoder logits for a fixed image-feature map + task
+// prompt + decoder prefix. The DaViT vision tower is the deferred gap: the
+// fixture supplies its last_hidden_state feature map as the precomputed input.
+// See tools/make_pico_florence2_fixture.py.
+procedure TTestNeuralPretrained.TestFlorence2Parity;
+var
+  EncoderNet, DecoderNet: TNNet;
+  Projector: TFlorence2Projector;
+  Config: TFlorence2Config;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  FmapArr, TaskArr, DecArr, LogArr, RowArr: TJSONArray;
+  Fmap, TaskToks, DecToks, Logits: TNNetVolume;
+  RefVal, GotVal, Diff, MaxDiff: double;
+  C, H, W, NumVisual, EncSeqLen, DecLen, ch, yy, xx, Vocab, Pos, v: integer;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  Fmap := TNNetVolume.Create;
+  TaskToks := TNNetVolume.Create;
+  DecToks := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  EncoderNet := nil;
+  DecoderNet := nil;
+  FillChar(Projector, SizeOf(Projector), 0);
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_florence2_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    C := TJSONObject(RefRoot).Get('feature_c', 0);
+    H := TJSONObject(RefRoot).Get('feature_h', 0);
+    W := TJSONObject(RefRoot).Get('feature_w', 0);
+    NumVisual := TJSONObject(RefRoot).Get('num_visual_tokens', 0);
+    FmapArr := TJSONArray(TJSONObject(RefRoot).Find('feature_map_chw'));
+    TaskArr := TJSONArray(TJSONObject(RefRoot).Find('task_ids'));
+    DecArr := TJSONArray(TJSONObject(RefRoot).Find('dec_ids'));
+    LogArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    DecLen := DecArr.Count;
+    EncSeqLen := NumVisual + TaskArr.Count;
+
+    BuildFlorence2FromSafeTensors(FixturePath('tiny_florence2.safetensors'),
+      EncoderNet, DecoderNet, Projector, Config, EncSeqLen, DecLen,
+      {pTrainable=}true, FixturePath('tiny_florence2_config.json'));
+    AssertTrue('encoder net built', EncoderNet <> nil);
+    AssertTrue('decoder net built', DecoderNet <> nil);
+    AssertEquals('feature channels', Config.FeatureChannels, C);
+
+    // feature map stored (C,H,W); CAI volume is (x=W, y=H, depth=C).
+    Fmap.ReSize(W, H, C);
+    for ch := 0 to C - 1 do
+      for yy := 0 to H - 1 do
+        for xx := 0 to W - 1 do
+          Fmap[xx, yy, ch] :=
+            TJSONArray(TJSONArray(FmapArr.Items[ch]).Items[yy]).Items[xx].AsFloat;
+    TaskToks.ReSize(TaskArr.Count, 1, 1);
+    for Pos := 0 to TaskArr.Count - 1 do
+      TaskToks.FData[Pos] := TaskArr.Items[Pos].AsInteger;
+    DecToks.ReSize(DecLen, 1, 1);
+    for Pos := 0 to DecLen - 1 do
+      DecToks.FData[Pos] := DecArr.Items[Pos].AsInteger;
+
+    RunFlorence2Logits(EncoderNet, DecoderNet, Config, Projector,
+      Fmap, TaskToks, DecToks, Logits);
+    Vocab := Config.Bart.VocabSize;
+    AssertEquals('logits vocab', Vocab, Logits.Depth);
+    for Pos := 0 to DecLen - 1 do
+    begin
+      RowArr := TJSONArray(LogArr.Items[Pos]);
+      for v := 0 to Vocab - 1 do
+      begin
+        RefVal := RowArr.Items[v].AsFloat;
+        GotVal := Logits[Pos, 0, v];
+        Diff := Abs(GotVal - RefVal);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('Florence-2 logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Logits.Free;
+    DecToks.Free;
+    TaskToks.Free;
+    Fmap.Free;
+    RefJson.Free;
+    FreeFlorence2Projector(Projector);
     EncoderNet.Free;
     DecoderNet.Free;
   end;

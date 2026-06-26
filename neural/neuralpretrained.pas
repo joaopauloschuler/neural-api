@@ -3123,6 +3123,112 @@ procedure BuildBartFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 
 // ---------------------------------------------------------------------------
+// FLORENCE-2 IMPORT (model_type "florence2": microsoft/Florence-2-base/-large)
+// - a UNIFIED vision-language model that does captioning, detection,
+// segmentation AND OCR through ONE task-prompted seq2seq head. The input is an
+// image + a short TASK TOKEN (<CAPTION>, <OD>, ...); a BART-style decoder emits
+// a text/coordinate token stream parsed per task. Boxes/polygons are quantized
+// LOCATION tokens <loc_0..loc_999> in the vocabulary (spatial outputs as text).
+//
+// Architecture (the genuinely new code vs the landed PaliGemma/LLaVA):
+//   - the ENCODER is a TEXT BART encoder fed a VISUAL-TOKEN PREFIX. The image
+//     features are projected to visual tokens (the multimodal projector), the
+//     task-prompt text tokens are embedded+scaled, and the whole [visual; text]
+//     sequence is run through the BART encoder. The BART decoder cross-attends
+//     to that. This is the two-net + RunT5/encoder-states convention.
+//   - the MULTIMODAL PROJECTOR: a learned 2D absolute position embedding (row
+//     table + column table) added to the DaViT feature map, flatten H*W, a
+//     fixed cosine 1D embed, the visual tokens = [spatial-mean; per-cell tokens]
+//     then a bias-free Linear + a biased LayerNorm.
+//   - LOCATION tokens: Florence2QuantizeCoord/Florence2DequantizeCoord map a
+//     normalized coordinate in [0,1] to/from a <loc_> token id (box/polygon
+//     parsing as text).
+//
+// SCOPE v1: <CAPTION> + <OD> inference. The DaViT vision tower is DEFERRED: the
+// importer takes the DaViT feature map (last_hidden_state, C*H*W) as a
+// PRECOMPUTED input (mirroring the tracked Qwen2-VL "merged visual tokens as
+// input v1"). The projector + visual-prefix encoder + BART decoder are pinned
+// to the REAL HF Florence2 float64 oracle (TestFlorence2Parity < 1e-4).
+type
+  TFlorence2Config = record
+    // text language model (BART)
+    Bart: TBartConfig;
+    ImageTokenId: integer;       // <image> placeholder id (scattered)
+    // multimodal projector / vision feature shape
+    FeatureChannels: integer;    // DaViT last_hidden_state channel count
+    FeatureHeight: integer;      // grid H
+    FeatureWidth: integer;       // grid W
+    ProjectionDim: integer;      // == d_model so visual tokens slot in
+    MaxTemporalEmbeddings: integer;
+    VisionMaxPositionEmbeddings: integer;
+    // location-token (de)quantization
+    LocNumBins: integer;         // 1000 for <loc_0..loc_999>
+    LocBase: integer;            // first <loc_> token id
+    ModelType: string;
+  end;
+
+  // The multimodal projector weights (held so RunFlorence2* can apply them).
+  TFlorence2Projector = record
+    RowEmbed: TNNetVolume;       // (max_pos, C div 2)
+    ColEmbed: TNNetVolume;       // (max_pos, C - C div 2)
+    Temporal: TNNetVolume;       // (max_temporal, C) fixed cosine table
+    ProjWeight: TNNetVolume;     // (ProjectionDim, C) bias-free Linear
+    NormGain: TNNetVolume;       // (ProjectionDim) LayerNorm gain
+    NormBias: TNNetVolume;       // (ProjectionDim) LayerNorm bias
+  end;
+
+// Maps a normalized coordinate in [0,1] to a <loc_> token id:
+//   bin = round(coord * (NumBins - 1)); id = LocBase + bin (clamped).
+function Florence2QuantizeCoord(Coord: TNeuralFloat;
+  NumBins, LocBase: integer): integer;
+// Inverse: a <loc_> token id back to a normalized coordinate (bin centre).
+function Florence2DequantizeCoord(TokenId, NumBins, LocBase: integer):
+  TNeuralFloat;
+
+// Reads a Florence-2 config.json (model_type "florence2"): the BART text_config
+// plus image_token_id, the vision feature shape, projection_dim and the
+// location-token bins. The DaViT vision-tower hyperparameters are NOT read (the
+// tower is deferred; the importer takes the feature map as a precomputed input).
+function ReadFlorence2ConfigFromJSONFile(const FileName: string):
+  TFlorence2Config;
+function Florence2ConfigToString(const Config: TFlorence2Config): string;
+
+// Builds the Florence-2 ENCODER + DECODER nets and the multimodal PROJECTOR
+// from the safetensors checkpoint. The encoder's FIRST input is the
+// precomputed inputs_embeds (EncSeqLen, 1, d_model); the decoder rides the
+// standard two-net convention (its second TNNetInput holds the encoder hidden
+// states). Run with RunFlorence2Logits. All nets/projector are caller-owned;
+// free the projector with FreeFlorence2Projector.
+procedure BuildFlorence2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TFlorence2Config; out EncoderNet, DecoderNet: TNNet;
+  out Projector: TFlorence2Projector; EncSeqLen, DecSeqLen: integer;
+  pTrainable: boolean = true);
+
+procedure BuildFlorence2FromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Projector: TFlorence2Projector;
+  out Config: TFlorence2Config; EncSeqLen, DecSeqLen: integer;
+  pTrainable: boolean = true; const ConfigFileName: string = '');
+
+procedure FreeFlorence2Projector(var Projector: TFlorence2Projector);
+
+// Applies the multimodal projector to a DaViT feature map (C,H,W stored as a
+// (W,H,C) CAI volume) producing VisualTokens of shape (N,1,ProjectionDim) with
+// N = H*W + 1 (the spatial-mean token is token 0).
+procedure RunFlorence2Projector(const Config: TFlorence2Config;
+  const Projector: TFlorence2Projector; FeatureMap: TNNetVolume;
+  VisualTokens: TNNetVolume);
+
+// Full Florence-2 forward to the decoder logits. FeatureMap is the DaViT
+// last_hidden_state ((W,H,C) CAI volume). TaskTokens are the text task-prompt
+// ids (a (T,1,1) volume). DecoderTokens are the decoder prefix ((DecSeqLen,1,1)
+// volume). The encoder runs over [projected visual tokens; embedded task
+// tokens]; EncSeqLen must equal (H*W + 1 + T). Logits come out (DecSeqLen,1,
+// vocab).
+procedure RunFlorence2Logits(EncoderNet, DecoderNet: TNNet;
+  const Config: TFlorence2Config; const Projector: TFlorence2Projector;
+  FeatureMap, TaskTokens, DecoderTokens: TNNetVolume; Logits: TNNetVolume);
+
+// ---------------------------------------------------------------------------
 // PEGASUS IMPORT (model_type "pegasus": the google/pegasus-* abstractive
 // summarization checkpoints; architectures ["PegasusForConditionalGeneration"])
 // - the close PRE-NORM cousin of BART (Zhang et al. 2019, arXiv:1912.08777).
@@ -27587,6 +27693,602 @@ begin
   Config := ReadBartConfigFromJSONFile(ConfigPath);
   BuildBartFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
     DecoderNet, EncSeqLen, DecSeqLen, pTrainable, pQuantizeInt8);
+end;
+
+// ===========================================================================
+// FLORENCE-2 IMPORT
+// ===========================================================================
+
+function Florence2QuantizeCoord(Coord: TNeuralFloat;
+  NumBins, LocBase: integer): integer;
+var
+  Bin: integer;
+begin
+  if Coord < 0 then Coord := 0;
+  if Coord > 1 then Coord := 1;
+  Bin := Round(Coord * (NumBins - 1));
+  if Bin < 0 then Bin := 0;
+  if Bin > NumBins - 1 then Bin := NumBins - 1;
+  Result := LocBase + Bin;
+end;
+
+function Florence2DequantizeCoord(TokenId, NumBins, LocBase: integer):
+  TNeuralFloat;
+var
+  Bin: integer;
+begin
+  Bin := TokenId - LocBase;
+  if Bin < 0 then Bin := 0;
+  if Bin > NumBins - 1 then Bin := NumBins - 1;
+  Result := Bin / (NumBins - 1);
+end;
+
+function ReadFlorence2ConfigFromJSONFile(const FileName: string):
+  TFlorence2Config;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, TextObj, LocObj: TJSONObject;
+  ModelType, ActFn: string;
+
+  function ReqInt(O: TJSONObject; const FieldName: string): integer;
+  begin
+    if O.IndexOfName(FieldName) < 0 then
+      ImportError('Florence-2 import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := O.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Florence-2 import: config field "' + FieldName +
+        '" must be a positive integer.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Florence-2 import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Florence-2 import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Florence-2 import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'florence2');
+    if ModelType <> 'florence2' then
+      ImportError('Florence-2 import: config model_type is "' + ModelType +
+        '" - only "florence2" is supported here.');
+    Result.ModelType := ModelType;
+    Result.ImageTokenId := Obj.Get('image_token_id', 51289);
+    Result.FeatureChannels := ReqInt(Obj, 'vision_feature_channels');
+    Result.FeatureHeight := ReqInt(Obj, 'vision_feature_height');
+    Result.FeatureWidth := ReqInt(Obj, 'vision_feature_width');
+    Result.ProjectionDim := ReqInt(Obj, 'projection_dim');
+    Result.MaxTemporalEmbeddings :=
+      Obj.Get('max_temporal_embeddings', 100);
+    Result.VisionMaxPositionEmbeddings :=
+      Obj.Get('vision_max_position_embeddings', 50);
+    // location tokens (defaults to the published <loc_0..loc_999>).
+    Result.LocNumBins := 1000;
+    Result.LocBase := 0;
+    if Obj.IndexOfName('location_token') >= 0 then
+    begin
+      LocObj := TJSONObject(Obj.Find('location_token'));
+      Result.LocNumBins := LocObj.Get('num_bins', 1000);
+      Result.LocBase := LocObj.Get('loc_base', 0);
+    end;
+    // The nested BART text_config.
+    if Obj.IndexOfName('text_config') < 0 then
+      ImportError('Florence-2 import: config "' + FileName +
+        '" is missing "text_config" (the BART language model).');
+    TextObj := TJSONObject(Obj.Find('text_config'));
+    Result.Bart.ModelType := 'bart';
+    Result.Bart.DModel := ReqInt(TextObj, 'd_model');
+    Result.Bart.EncoderLayers := ReqInt(TextObj, 'encoder_layers');
+    Result.Bart.DecoderLayers := ReqInt(TextObj, 'decoder_layers');
+    Result.Bart.EncoderHeads := ReqInt(TextObj, 'encoder_attention_heads');
+    Result.Bart.DecoderHeads := ReqInt(TextObj, 'decoder_attention_heads');
+    Result.Bart.EncoderFFNDim := ReqInt(TextObj, 'encoder_ffn_dim');
+    Result.Bart.DecoderFFNDim := ReqInt(TextObj, 'decoder_ffn_dim');
+    Result.Bart.VocabSize := ReqInt(TextObj, 'vocab_size');
+    Result.Bart.MaxPositionEmbeddings :=
+      TextObj.Get('max_position_embeddings', 1024);
+    Result.Bart.PadTokenId := TextObj.Get('pad_token_id', 1);
+    Result.Bart.BosTokenId := TextObj.Get('bos_token_id', 0);
+    Result.Bart.EosTokenId := TextObj.Get('eos_token_id', 2);
+    Result.Bart.DecoderStartTokenId :=
+      TextObj.Get('decoder_start_token_id', Result.Bart.EosTokenId);
+    Result.Bart.ScaleEmbedding := TextObj.Get('scale_embedding', False);
+    ActFn := TextObj.Get('activation_function', 'gelu');
+    if ActFn <> 'gelu' then
+      ImportError('Florence-2 import: text activation_function "' + ActFn +
+        '" is not supported - expected "gelu".');
+    if Result.ProjectionDim <> Result.Bart.DModel then
+      ImportError('Florence-2 import: projection_dim (' +
+        IntToStr(Result.ProjectionDim) + ') must equal text d_model (' +
+        IntToStr(Result.Bart.DModel) + ') so visual tokens slot into the ' +
+        'encoder sequence.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function Florence2ConfigToString(const Config: TFlorence2Config): string;
+begin
+  Result := 'florence2 config: ' + BartConfigToString(Config.Bart) +
+    '; image_token_id=' + IntToStr(Config.ImageTokenId) +
+    ', vision_feature=' + IntToStr(Config.FeatureChannels) + 'x' +
+    IntToStr(Config.FeatureHeight) + 'x' + IntToStr(Config.FeatureWidth) +
+    ', proj_dim=' + IntToStr(Config.ProjectionDim) +
+    ', loc_bins=' + IntToStr(Config.LocNumBins) +
+    ', loc_base=' + IntToStr(Config.LocBase);
+end;
+
+procedure FreeFlorence2Projector(var Projector: TFlorence2Projector);
+begin
+  Projector.RowEmbed.Free;     Projector.RowEmbed := nil;
+  Projector.ColEmbed.Free;     Projector.ColEmbed := nil;
+  Projector.Temporal.Free;     Projector.Temporal := nil;
+  Projector.ProjWeight.Free;   Projector.ProjWeight := nil;
+  Projector.NormGain.Free;     Projector.NormGain := nil;
+  Projector.NormBias.Free;     Projector.NormBias := nil;
+end;
+
+// Fills the (max_temporal, C) fixed cosine 1D table exactly as
+// Florence2VisionPositionalEmbeddingCosine1D: for half = C div 2,
+// freq_i = exp(-i * log(10000)/half); even depth slot 2i = sin(pos*freq_i),
+// odd depth slot 2i+1 = cos(pos*freq_i).
+procedure FillFlorence2TemporalTable(Tbl: TNNetVolume;
+  MaxPos, EmbedDim: integer);
+var
+  HalfDim, PosCnt, i: integer;
+  EmbStep, Freq, Angle: TNeuralFloat;
+begin
+  Tbl.ReSize(MaxPos, 1, EmbedDim);
+  Tbl.Fill(0);
+  HalfDim := EmbedDim div 2;
+  if HalfDim < 1 then exit;
+  EmbStep := Ln(10000.0) / HalfDim;
+  for PosCnt := 0 to MaxPos - 1 do
+    for i := 0 to HalfDim - 1 do
+    begin
+      Freq := Exp(-i * EmbStep);
+      Angle := PosCnt * Freq;
+      Tbl.FData[PosCnt * EmbedDim + 2 * i] := Sin(Angle);
+      if 2 * i + 1 < EmbedDim then
+        Tbl.FData[PosCnt * EmbedDim + 2 * i + 1] := Cos(Angle);
+    end;
+end;
+
+procedure RunFlorence2Projector(const Config: TFlorence2Config;
+  const Projector: TFlorence2Projector; FeatureMap: TNNetVolume;
+  VisualTokens: TNNetVolume);
+var
+  C, H, W, HalfC, RestC, hh, ww, ch, NumCells, CellIdx, ProjDim, k: integer;
+  PosFeat: TNNetVolume;     // (H*W, 1, C) position-added flattened tokens
+  Temporal: TNNetVolume;    // (C) the row-0 cosine vector
+  SpatialMean: TNNetVolume; // (C)
+  Acc, Mean, Variance, Inv, NormVal, Eps, Val: TNeuralFloat;
+begin
+  C := Config.FeatureChannels;
+  H := Config.FeatureHeight;
+  W := Config.FeatureWidth;
+  // FeatureMap is the DaViT last_hidden_state (B,C,H,W) stored CAI as a
+  // (W, H, C) volume: FeatureMap[x=ww, y=hh, depth=ch].
+  if (FeatureMap.SizeX <> W) or (FeatureMap.SizeY <> H) or
+     (FeatureMap.Depth <> C) then
+    ImportError('RunFlorence2Projector: feature map shape (' +
+      IntToStr(FeatureMap.SizeX) + ',' + IntToStr(FeatureMap.SizeY) + ',' +
+      IntToStr(FeatureMap.Depth) + ') does not match config (' +
+      IntToStr(W) + ',' + IntToStr(H) + ',' + IntToStr(C) + ').');
+  HalfC := C div 2;
+  RestC := C - HalfC;
+  NumCells := H * W;
+  ProjDim := Config.ProjectionDim;
+  Eps := 1e-5;
+
+  PosFeat := TNNetVolume.Create(NumCells, 1, C);
+  Temporal := TNNetVolume.Create(C, 1, 1);
+  SpatialMean := TNNetVolume.Create(C, 1, 1);
+  try
+    // position_features = feature_map + image_position_embed(feature_map),
+    // flattened in row-major (h, w) order (HF flatten(2) over H then W).
+    // pos embed for cell (h,w) = cat(column_embeddings[w][:HalfC],
+    //                                 row_embeddings[h][HalfC:]).
+    for hh := 0 to H - 1 do
+      for ww := 0 to W - 1 do
+      begin
+        CellIdx := hh * W + ww;
+        for ch := 0 to C - 1 do
+        begin
+          Val := FeatureMap[ww, hh, ch];
+          if ch < HalfC then
+            Val := Val + Projector.ColEmbed.FData[ww * HalfC + ch]
+          else
+            Val := Val + Projector.RowEmbed.FData[hh * RestC + (ch - HalfC)];
+          PosFeat.FData[CellIdx * C + ch] := Val;
+        end;
+      end;
+
+    // temporal embed = cosine table row 0 (single frame).
+    for ch := 0 to C - 1 do
+      Temporal.FData[ch] := Projector.Temporal.FData[ch];
+
+    // visual_token_features[cell] = position_features[cell] + temporal (row 0)
+    // spatial_image_features = mean over cells of visual_token_features.
+    for ch := 0 to C - 1 do
+    begin
+      Acc := 0;
+      for CellIdx := 0 to NumCells - 1 do
+        Acc := Acc + PosFeat.FData[CellIdx * C + ch] + Temporal.FData[ch];
+      SpatialMean.FData[ch] := Acc / NumCells;
+    end;
+
+    // image_features (pre-projection) = cat([spatial_mean ; per-cell tokens]).
+    // Token 0 = spatial mean; tokens 1..NumCells = visual_token_features.
+    // Each is then projected (bias-free Linear) and LayerNorm'd.
+    VisualTokens.ReSize(NumCells + 1, 1, ProjDim);
+    VisualTokens.Fill(0);
+
+    // helper applied per output token row: project then LayerNorm.
+    // We inline it for both the spatial-mean row and the per-cell rows.
+    for CellIdx := 0 to NumCells do
+    begin
+      // Build the C-dim source vector for this token into SpatialMean? no -
+      // use a local read. Project: out[k] = sum_ch src[ch]*ProjWeight[k][ch].
+      for k := 0 to ProjDim - 1 do
+      begin
+        Acc := 0;
+        if CellIdx = 0 then
+        begin
+          for ch := 0 to C - 1 do
+            Acc := Acc + SpatialMean.FData[ch] *
+              Projector.ProjWeight.FData[k * C + ch];
+        end
+        else
+        begin
+          for ch := 0 to C - 1 do
+            Acc := Acc + (PosFeat.FData[(CellIdx - 1) * C + ch] +
+              Temporal.FData[ch]) * Projector.ProjWeight.FData[k * C + ch];
+        end;
+        VisualTokens.FData[CellIdx * ProjDim + k] := Acc;
+      end;
+      // LayerNorm over the ProjDim depth of this token.
+      Mean := 0;
+      for k := 0 to ProjDim - 1 do
+        Mean := Mean + VisualTokens.FData[CellIdx * ProjDim + k];
+      Mean := Mean / ProjDim;
+      Variance := 0;
+      for k := 0 to ProjDim - 1 do
+      begin
+        NormVal := VisualTokens.FData[CellIdx * ProjDim + k] - Mean;
+        Variance := Variance + NormVal * NormVal;
+      end;
+      Variance := Variance / ProjDim;
+      Inv := 1.0 / Sqrt(Variance + Eps);
+      for k := 0 to ProjDim - 1 do
+      begin
+        NormVal := (VisualTokens.FData[CellIdx * ProjDim + k] - Mean) * Inv;
+        VisualTokens.FData[CellIdx * ProjDim + k] :=
+          NormVal * Projector.NormGain.FData[k] + Projector.NormBias.FData[k];
+      end;
+    end;
+  finally
+    PosFeat.Free;
+    Temporal.Free;
+    SpatialMean.Free;
+  end;
+end;
+
+procedure BuildFlorence2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TFlorence2Config; out EncoderNet, DecoderNet: TNNet;
+  out Projector: TFlorence2Projector; EncSeqLen, DecSeqLen: integer;
+  pTrainable: boolean = true);
+var
+  Reader: TNNetSafeTensorsReader;
+  Enc, Dec: TNNet;
+  EncBlocks, DecBlocks: TMarianBlockArray;
+  EncInput, EncPos, EncEmbLN: TNNetLayer;
+  DecTokenInput, EncStates, DecEmbed, DecPos, DecEmbLN, LMHead: TNNetLayer;
+  Consumed: TStringList;
+  Tmp: TNNetVolume;
+  i, j, VocabSizeM1, DModelM1B, ReaderMax, HalfC, RestC: integer;
+  EmbedScale: TNeuralFloat;
+  TensorNameStr: string;
+  MarianShim: TMarianConfig;
+  BC: TBartConfig;
+
+  procedure LoadBartPositions(PosLayer: TNNetLayer; const TName: string;
+    SeqLen: integer);
+  var
+    PosCnt, ElementCnt, SeqLenM1, DModelM1: integer;
+  begin
+    if not Reader.HasTensor(TName) then
+      ImportError('Florence-2 import: missing tensor "' + TName + '".');
+    Reader.LoadTensorFlat(TName, Tmp);
+    SeqLenM1 := SeqLen - 1;
+    DModelM1 := BC.DModel - 1;
+    for PosCnt := 0 to SeqLenM1 do
+      for ElementCnt := 0 to DModelM1 do
+        PosLayer.FArrNeurons[0].Weights.FData[PosCnt * BC.DModel +
+          ElementCnt] := Tmp.FData[(PosCnt + BartPositionOffset) *
+            BC.DModel + ElementCnt];
+    PosLayer.FlushWeightCache();
+    Consumed.Add(TName);
+  end;
+
+  procedure LoadProjVolume(Vol: TNNetVolume; const TName: string;
+    Rows, Cols: integer);
+  begin
+    if not Reader.HasTensor(TName) then
+      ImportError('Florence-2 import: missing tensor "' + TName + '".');
+    Reader.LoadTensorFlat(TName, Vol);
+    if Vol.Size <> Rows * Cols then
+      ImportError('Florence-2 import: "' + TName + '" element count ' +
+        IntToStr(Vol.Size) + ' <> expected ' + IntToStr(Rows * Cols) + '.');
+    Consumed.Add(TName);
+  end;
+
+begin
+  EncoderNet := nil;
+  DecoderNet := nil;
+  FillChar(Projector, SizeOf(Projector), 0);
+  BC := Config.Bart;
+  if EncSeqLen < 1 then
+    ImportError('Florence-2 import: EncSeqLen must be >= 1.');
+  if DecSeqLen < 1 then
+    ImportError('Florence-2 import: DecSeqLen must be >= 1.');
+  if (EncSeqLen > BC.MaxPositionEmbeddings) or
+     (DecSeqLen > BC.MaxPositionEmbeddings) then
+    ImportError('Florence-2 import: EncSeqLen/DecSeqLen must not exceed ' +
+      'text max_position_embeddings = ' +
+      IntToStr(BC.MaxPositionEmbeddings) + '.');
+  if (BC.DModel mod BC.EncoderHeads) <> 0 then
+    ImportError('Florence-2 import: encoder heads must divide d_model.');
+  if (BC.DModel mod BC.DecoderHeads) <> 0 then
+    ImportError('Florence-2 import: decoder heads must divide d_model.');
+
+  Reader := CreatePretrainedTensorReader(FileName);
+  Enc := nil;
+  Dec := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  HalfC := Config.FeatureChannels div 2;
+  RestC := Config.FeatureChannels - HalfC;
+  try
+    try
+      if not Reader.HasTensor('model.shared.weight') then
+        ImportError('Florence-2 import: "model.shared.weight" not found - ' +
+          'not a Florence-2 LM checkpoint (or wrong key remap)?');
+
+      // ---------------- Encoder (visual-prefix embeds-in) ----------------
+      // Unlike BART, the encoder's FIRST input is the precomputed
+      // inputs_embeds ([visual; embedded text], EncSeqLen x 1 x d_model). The
+      // token embedding + scatter happens in RunFlorence2Logits.
+      Enc := TNNet.Create();
+      EncInput := Enc.AddLayer(
+        TNNetInput.Create(EncSeqLen, 1, BC.DModel, 1) );
+      EncPos := Enc.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(EncSeqLen).SetTrainable(pTrainable) );
+      EncEmbLN := Enc.AddLayer(
+        TNNetTokenLayerNorm.Create(BartLayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then Enc.SetTrainable();
+      BuildBartStackBlocks(Enc, BC, BC.EncoderLayers,
+        BC.EncoderHeads, BC.EncoderFFNDim, {IsDecoder=}false,
+        nil, EncBlocks, pTrainable);
+      if EncInput = nil then ; // silence unused hint
+
+      // ---------------- Decoder (standard BART, two-net) ----------------
+      Dec := TNNet.Create();
+      DecTokenInput := Dec.AddLayer( TNNetInput.Create(DecSeqLen) );
+      EncStates := Dec.AddLayerAfter(
+        TNNetInput.Create(EncSeqLen, 1, BC.DModel, 1), 0);
+      DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
+        BC.VocabSize, BC.DModel, {EncodeZero=}1).SetTrainable(pTrainable),
+        DecTokenInput);
+      DecPos := Dec.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen).SetTrainable(pTrainable) );
+      DecEmbLN := Dec.AddLayer(
+        TNNetTokenLayerNorm.Create(BartLayerNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then Dec.SetTrainable();
+      BuildBartStackBlocks(Dec, BC, BC.DecoderLayers,
+        BC.DecoderHeads, BC.DecoderFFNDim, {IsDecoder=}true,
+        EncStates, DecBlocks, pTrainable);
+      LMHead := Dec.AddLayer(
+        TNNetPointwiseConvLinear.Create(BC.VocabSize).SetTrainable(pTrainable) );
+      if not pTrainable then Dec.SetTrainable();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat('model.shared.weight', Tmp);
+        if Config.Bart.ScaleEmbedding then EmbedScale := Sqrt(BC.DModel)
+        else EmbedScale := 1.0;
+        VocabSizeM1 := BC.VocabSize - 1;
+        DModelM1B := BC.DModel - 1;
+        for i := 0 to Tmp.Size - 1 do
+          DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+        DecEmbed.FlushWeightCache();
+        Consumed.Add('model.shared.weight');
+        // Tied head: logits = h . shared^T (Florence has NO final_logits_bias).
+        EnsureWritableImportWeights(LMHead);
+        for j := 0 to VocabSizeM1 do
+          for i := 0 to DModelM1B do
+            LMHead.FArrNeurons[j].Weights.FData[i] :=
+              Tmp.FData[j * BC.DModel + i];
+        for j := 0 to VocabSizeM1 do
+          LMHead.FArrNeurons[j].BiasWeight := 0;
+        LMHead.FlushWeightCache();
+        if Reader.HasTensor('lm_head.weight') then
+          Consumed.Add('lm_head.weight');
+        // learned +2 positions over the WHOLE [visual; text] sequence.
+        LoadBartPositions(EncPos,
+          'model.encoder.embed_positions.weight', EncSeqLen);
+        LoadBartPositions(DecPos,
+          'model.decoder.embed_positions.weight', DecSeqLen);
+      finally
+        Tmp.Free;
+      end;
+
+      LoadLayerNormWeights(Reader, EncEmbLN,
+        'model.encoder.layernorm_embedding.weight',
+        'model.encoder.layernorm_embedding.bias', BC.DModel);
+      Consumed.Add('model.encoder.layernorm_embedding.weight');
+      Consumed.Add('model.encoder.layernorm_embedding.bias');
+      LoadLayerNormWeights(Reader, DecEmbLN,
+        'model.decoder.layernorm_embedding.weight',
+        'model.decoder.layernorm_embedding.bias', BC.DModel);
+      Consumed.Add('model.decoder.layernorm_embedding.weight');
+      Consumed.Add('model.decoder.layernorm_embedding.bias');
+
+      MarianShim.DModel := BC.DModel;
+      LoadMarianStack(Reader, EncBlocks, 'model.encoder.layers.',
+        MarianShim, BC.EncoderFFNDim, {IsDecoder=}false, Consumed);
+      LoadMarianStack(Reader, DecBlocks, 'model.decoder.layers.',
+        MarianShim, BC.DecoderFFNDim, {IsDecoder=}true, Consumed);
+
+      // ---------------- Multimodal projector ----------------
+      Projector.RowEmbed := TNNetVolume.Create;
+      Projector.ColEmbed := TNNetVolume.Create;
+      Projector.ProjWeight := TNNetVolume.Create;
+      Projector.NormGain := TNNetVolume.Create;
+      Projector.NormBias := TNNetVolume.Create;
+      Projector.Temporal := TNNetVolume.Create;
+      LoadProjVolume(Projector.RowEmbed,
+        'multi_modal_projector.image_position_embed.row_embeddings.weight',
+        Config.VisionMaxPositionEmbeddings, RestC);
+      LoadProjVolume(Projector.ColEmbed,
+        'multi_modal_projector.image_position_embed.column_embeddings.weight',
+        Config.VisionMaxPositionEmbeddings, HalfC);
+      LoadProjVolume(Projector.ProjWeight,
+        'multi_modal_projector.image_projection.weight',
+        Config.ProjectionDim, Config.FeatureChannels);
+      LoadProjVolume(Projector.NormGain,
+        'multi_modal_projector.image_proj_norm.weight',
+        Config.ProjectionDim, 1);
+      LoadProjVolume(Projector.NormBias,
+        'multi_modal_projector.image_proj_norm.bias',
+        Config.ProjectionDim, 1);
+      // the fixed cosine temporal table is recomputed (a buffer, not learned).
+      FillFlorence2TemporalTable(Projector.Temporal,
+        Config.MaxTemporalEmbeddings, Config.FeatureChannels);
+      if Reader.HasTensor(
+        'multi_modal_projector.visual_temporal_embed.pos_idx_to_embed') then
+        Consumed.Add(
+          'multi_modal_projector.visual_temporal_embed.pos_idx_to_embed');
+
+      // ---------------- Unexpected-tensor check ----------------
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        // vision_tower.* is the deferred gap - tolerate any such tensor.
+        if Pos('vision_tower', TensorNameStr) > 0 then continue;
+        if Pos('embed_tokens', TensorNameStr) > 0 then continue;
+        ImportError('Florence-2 import: unexpected tensor "' +
+          TensorNameStr + '" in ' + FileName + '.');
+      end;
+
+      EncoderNet := Enc;
+      DecoderNet := Dec;
+      Enc := nil;
+      Dec := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    Enc.Free;
+    Dec.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+procedure BuildFlorence2FromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Projector: TFlorence2Projector;
+  out Config: TFlorence2Config; EncSeqLen, DecSeqLen: integer;
+  pTrainable: boolean = true; const ConfigFileName: string = '');
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadFlorence2ConfigFromJSONFile(ConfigPath);
+  BuildFlorence2FromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, Projector, EncSeqLen, DecSeqLen, pTrainable);
+end;
+
+procedure RunFlorence2Logits(EncoderNet, DecoderNet: TNNet;
+  const Config: TFlorence2Config; const Projector: TFlorence2Projector;
+  FeatureMap, TaskTokens, DecoderTokens: TNNetVolume; Logits: TNNetVolume);
+var
+  VisualTokens, Embeds, Shared: TNNetVolume;
+  EncStates, DecEmbedLayer: TNNetLayer;
+  NumVisual, NumTask, EncSeqLen, D, t, k, TokId: integer;
+  EmbedScale: TNeuralFloat;
+begin
+  D := Config.Bart.DModel;
+  EncSeqLen := EncoderNet.GetFirstLayer().Output.SizeX;
+  // 1) project the DaViT feature map into visual tokens.
+  VisualTokens := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create(EncSeqLen, 1, D);
+  try
+    RunFlorence2Projector(Config, Projector, FeatureMap, VisualTokens);
+    NumVisual := VisualTokens.SizeX;
+    NumTask := TaskTokens.SizeX;
+    if NumVisual + NumTask <> EncSeqLen then
+      ImportError('RunFlorence2Logits: visual tokens (' +
+        IntToStr(NumVisual) + ') + task tokens (' + IntToStr(NumTask) +
+        ') <> EncSeqLen (' + IntToStr(EncSeqLen) + ').');
+    Embeds.Fill(0);
+    // 2) prefix: copy the visual tokens into the first NumVisual rows.
+    for t := 0 to NumVisual - 1 do
+      for k := 0 to D - 1 do
+        Embeds.FData[t * D + k] := VisualTokens.FData[t * D + k];
+    // 3) embed + scale the task text tokens via the DECODER's shared table
+    //    (encoder/decoder share embeddings; the decoder net holds the only
+    //    embedding layer, already pre-scaled at import).
+    DecEmbedLayer := nil;
+    for t := 0 to DecoderNet.CountLayers() - 1 do
+      if DecoderNet.Layers[t] is TNNetEmbedding then
+      begin
+        DecEmbedLayer := DecoderNet.Layers[t];
+        break;
+      end;
+    if DecEmbedLayer = nil then
+      ImportError('RunFlorence2Logits: decoder embedding layer not found.');
+    Shared := DecEmbedLayer.FArrNeurons[0].Weights;
+    EmbedScale := 1.0; // table already carries sqrt(d) from import.
+    for t := 0 to NumTask - 1 do
+    begin
+      TokId := Round(TaskTokens.FData[t]);
+      for k := 0 to D - 1 do
+        Embeds.FData[(NumVisual + t) * D + k] :=
+          EmbedScale * Shared.FData[TokId * D + k];
+    end;
+    // 4) run the encoder over the [visual; text] embeds.
+    EncoderNet.Compute(Embeds);
+    EncStates := T5EncoderStatesInput(DecoderNet);
+    if EncoderNet.GetLastLayer().Output.Size <> EncStates.Output.Size then
+      ImportError('RunFlorence2Logits: encoder output size mismatch.');
+    EncStates.Output.Copy(EncoderNet.GetLastLayer().Output);
+    // 5) run the decoder and read the logits.
+    DecoderNet.Compute(DecoderTokens);
+    DecoderNet.GetOutput(Logits);
+  finally
+    VisualTokens.Free;
+    Embeds.Free;
+  end;
 end;
 
 // ===========================================================================

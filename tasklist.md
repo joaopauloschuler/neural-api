@@ -1097,21 +1097,45 @@ rather than acted on.
       outputs; reports a per-class table + a few visual overlays. Distinct from the
       logit-parity tests (those pin the math; this pins the end-to-end pipeline incl.
       preprocessing/decode). The missing import-VERIFICATION mirror of MMLUEval for vision.
-- [ ] Florence-2 unified vision importer (BuildFlorence2FromSafeTensors, e.g.
+- [X] Florence-2 unified vision importer (BuildFlorence2FromSafeTensors, e.g.
       microsoft/Florence-2-base) — a structurally DISTINCT VLM that does detection,
       segmentation, captioning AND OCR through ONE task-prompted seq2seq head, unlike the
-      tracked single-task PaliGemma (prefix-LM caption) and LLaVA (causal chat). The
-      input is an image + a short TASK TOKEN (e.g. <CAPTION>, <OD>, <OCR>) and the BART-
-      style decoder emits a text/coordinate token stream that is parsed per task (boxes
-      and polygons are encoded as quantized location tokens <loc_0..loc_999> in the
-      vocabulary — the genuinely new idea: spatial outputs as text). Reuses the landed
-      seq2seq enc-dec convention (T5EncoderStates two-net path, BART decoder as in TrOCR)
-      and a ViT-style image tower; the new code is the DaViT-or-ViT vision encoder feeding
-      visual tokens into the encoder prefix + the location-token (de)quantization for box/
-      polygon parsing. Scope v1 to <CAPTION> + <OD> (detection) inference. Pico parity vs
-      HF float64 on the decoder logits for a fixed image+task token + an examples/
-      Florence2 that captions and box-detects one tiny CPU image. First "spatial-output-
-      as-text" importer; complements the box/mask importers (DETR/SAM/Mask2Former).
+      tracked single-task PaliGemma (prefix-LM caption) and LLaVA (causal chat). LANDED:
+      BuildFlorence2FromSafeTensors[WithConfig] + TFlorence2Config +
+      ReadFlorence2ConfigFromJSONFile/Florence2ConfigToString + RunFlorence2Logits +
+      RunFlorence2Projector + the multimodal-projector record (TFlorence2Projector) +
+      Florence2QuantizeCoord/Florence2DequantizeCoord location tokens. The ENCODER is a
+      TEXT BART encoder fed a VISUAL-TOKEN PREFIX: the projector turns the DaViT feature
+      map into visual tokens (learned 2D row+column position embed added to the feature
+      map, flatten H*W, fixed cosine-1D temporal embed, visual tokens = [spatial-mean;
+      per-cell tokens], bias-free image_projection Linear + biased image_proj_norm
+      LayerNorm), those are prepended to the embedded+sqrt(d)-scaled task-prompt text and
+      run through the BART encoder (BuildBartStackBlocks REUSE); the BART decoder cross-
+      attends (T5EncoderStates two-net + RunT5-style feed). Boxes/polygons emitted as
+      quantized <loc_0..loc_999> tokens (spatial outputs as text). The whole projector +
+      visual-prefix encoder + BART decoder pinned to the REAL HF
+      Florence2ForConditionalGeneration float64 oracle: pico parity TestFlorence2Parity <
+      1e-4 on the decoder logits + TestFlorence2LocationTokens for the coord<->token
+      round-trip (tools/make_pico_florence2_fixture.py + tests/fixtures/tiny_florence2.*).
+      examples/Florence2 runs one greedy caption step + a sample <OD> box encoded/decoded
+      as <loc_> tokens, offline on the fixture. No new leaf layer added (pure builder
+      reuse). First "spatial-output-as-text" importer; complements DETR/SAM/Mask2Former.
+  - [ ] The DaViT vision tower itself is the DEFERRED gap: v1 takes the tower's
+        last_hidden_state feature map as a PRECOMPUTED input (like the tracked Qwen2-VL
+        "merged visual tokens as input v1"). Build the real DaViT: a 4-stage conv-embed
+        (kernel/stride/pad per stage, pre/post LayerNorm), per-block depthwise 3x3 convs
+        (TNNetDepthwiseConv), WINDOW attention (partition H*W into windows; reuse
+        TNNetWindowAttention), and the genuinely-new GROUPED CHANNEL attention (attention
+        ACROSS channels within groups, scale = num_tokens^-0.5 — NO existing Pascal layer,
+        needs a new leaf or a transposed-SDPA builder). Then drop the precomputed-feature
+        shortcut and add the patch_embed/window-partition reshape plumbing.
+  - [ ] Real-checkpoint parity (microsoft/Florence-2-base) + the real DaViT image
+        preprocessing + the Florence-2 tokenizer (post-processing the <loc_>/box token
+        stream into pixel boxes per task) + autoregressive DecodeFlorence2Greedy with a
+        proper caption/OD parse; v1 runs a single greedy step + the location-token math.
+  - [ ] <OCR>, <REFERRING_EXPRESSION_SEGMENTATION> (polygon <loc_> streams) and the other
+        task tokens beyond <CAPTION>/<OD>; the polygon (de)quantization reuses the same
+        per-coordinate <loc_> helpers but needs the polygon-point grouping parse.
 - [ ] Qwen2-VL / Qwen2.5-VL vision-language importer follow-ups (M-RoPE v1 LANDED —
       BuildQwen2VLFromSafeTensors[Ex] + TNNetMRotaryEmbedding + Qwen2VLRunLogits):
   - [ ] The native-dynamic-resolution VISION TOWER (Conv3d patch embed + window
