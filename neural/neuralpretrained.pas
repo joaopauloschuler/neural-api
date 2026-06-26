@@ -7843,6 +7843,20 @@ type
     StemWidth: integer;      // Conv2d_1a_3x3 out channels
     NumModules: integer;     // InceptionA modules stacked (Mixed_5b..)
     BnEps: TNeuralFloat;     // BatchNorm2d eps (1e-3 in torchvision inception)
+    FullArch: boolean;       // true = full torchvision inception_v3 (stem +
+                             // InceptionA/B/C/D/E sequence); false = the pico
+                             // InceptionA-only sub-net (legacy parity path). The
+                             // channel widths below are used by the pico path
+                             // only; the full path uses torchvision's fixed
+                             // canonical widths internally.
+    WidthDiv: integer;       // full path only: integer divisor applied to EVERY
+                             // torchvision channel width (1 = real 2048-d net).
+                             // >1 shrinks the net (topology unchanged) so a
+                             // committed parity fixture stays small.
+    Channel7x7: integer;     // InceptionC 7x7-factorized branch reduce width
+                             // (c7; torchvision Mixed_6b=128, 6c/6d=160, 6e=192).
+                             // Full path uses the per-module table; this stores
+                             // the FIRST (Mixed_6b) width for ToString display.
     // Per-InceptionA-module branch channel counts (config-driven so the pico
     // and a canonical config share one builder):
     Branch1x1: integer;
@@ -48013,6 +48027,94 @@ begin
   end;
 end;
 
+// Rectangular-kernel variant of LoadResNetConvFoldBN for torchvision Inception's
+// factorized asymmetric convs (1x7 / 7x1). The torchvision conv weight is
+// [OutCh, InCh, kh, kw]; CAI's TNNetConvolutionRectangular stores the kernel
+// with kx (== kw) as FeatureSizeX and ky (== kh) as FeatureSizeY, weight slot
+// (ky*Kw + kx)*InCh + c. No transpose -- the X axis is torch width/cols, the Y
+// axis is torch height/rows (matching the loader axis convention). Kh/Kw are the
+// torch kernel height/width; BN folded exactly as in the square loader.
+// Coded by Claude (AI).
+procedure LoadInceptionRectConvFoldBN(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const ConvWName, BnPrefix: string;
+  OutCh, InCh, Kh, Kw: integer; BnEps: TNeuralFloat);
+var
+  W, Gamma, Beta, Mean, Var_: TNNetVolume;
+  o, c, ky, kx: integer;
+  OutChM1, InChM1, KhM1, KwM1: integer;
+  Scale, Shift, Denom: TNeuralFloat;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(ConvWName) then
+    ImportError('Inception import: missing tensor "' + ConvWName + '".');
+  if (Reader.DimCount(ConvWName) <> 4) or
+     (Reader.DimSize(ConvWName, 0) <> OutCh) or
+     (Reader.DimSize(ConvWName, 1) <> InCh) or
+     (Reader.DimSize(ConvWName, 2) <> Kh) or
+     (Reader.DimSize(ConvWName, 3) <> Kw) then
+    ImportError('Inception import: "' + ConvWName + '" must have shape [' +
+      IntToStr(OutCh) + ', ' + IntToStr(InCh) + ', ' + IntToStr(Kh) + ', ' +
+      IntToStr(Kw) + '] (nn.Conv2d [out,in,kh,kw]), got ' +
+      Reader.ShapeAsString(ConvWName));
+  if Layer.Neurons.Count <> OutCh then
+    ImportError('Inception import: internal error - conv "' + ConvWName +
+      '" target has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutCh) + '.');
+  if Layer.FArrNeurons[0].Weights.Size <> Kh * Kw * InCh then
+    ImportError('Inception import: internal error - conv "' + ConvWName +
+      '" target neuron has ' + IntToStr(Layer.FArrNeurons[0].Weights.Size) +
+      ' weights, expected ' + IntToStr(Kh * Kw * InCh) + '.');
+  W := TNNetVolume.Create;
+  Gamma := TNNetVolume.Create;
+  Beta := TNNetVolume.Create;
+  Mean := TNNetVolume.Create;
+  Var_ := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(ConvWName, W);
+    if BnPrefix <> '' then
+    begin
+      if not Reader.HasTensor(BnPrefix + '.weight') then
+        ImportError('Inception import: missing BatchNorm tensor "' +
+          BnPrefix + '.weight".');
+      Reader.LoadTensorFlat(BnPrefix + '.weight', Gamma);
+      Reader.LoadTensorFlat(BnPrefix + '.bias', Beta);
+      Reader.LoadTensorFlat(BnPrefix + '.running_mean', Mean);
+      Reader.LoadTensorFlat(BnPrefix + '.running_var', Var_);
+      if (Gamma.Size <> OutCh) or (Beta.Size <> OutCh) or
+         (Mean.Size <> OutCh) or (Var_.Size <> OutCh) then
+        ImportError('Inception import: BatchNorm "' + BnPrefix +
+          '" parameters must each have ' + IntToStr(OutCh) + ' elements.');
+    end;
+    OutChM1 := OutCh - 1;
+    InChM1 := InCh - 1;
+    KhM1 := Kh - 1;
+    KwM1 := Kw - 1;
+    for o := 0 to OutChM1 do
+    begin
+      if BnPrefix <> '' then
+      begin
+        Denom := Sqrt(Var_.FData[o] + BnEps);
+        Scale := Gamma.FData[o] / Denom;
+        Shift := Beta.FData[o] - Gamma.FData[o] * Mean.FData[o] / Denom;
+      end
+      else
+      begin
+        Scale := 1.0;
+        Shift := 0.0;
+      end;
+      for ky := 0 to KhM1 do
+        for kx := 0 to KwM1 do
+          for c := 0 to InChM1 do
+            Layer.FArrNeurons[o].Weights.FData[(ky * Kw + kx) * InCh + c] :=
+              W.FData[((o * InCh + c) * Kh + ky) * Kw + kx] * Scale;
+      Layer.FArrNeurons[o].BiasWeight := Shift;
+    end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free; Gamma.Free; Beta.Free; Mean.Free; Var_.Free;
+  end;
+end;
+
 // Adds (architecture) one residual block to NN and returns the layer refs the
 // weight loader needs. AfterStem is the input to the block. For a BasicBlock:
 // conv1(3x3,stride)->relu->conv2(3x3,1), shortcut (identity or 1x1 downsample
@@ -49276,6 +49378,9 @@ begin
     Result.Branch3x3dblMid := Obj.Get('branch3x3dbl_mid', 96);
     Result.Branch3x3dbl := Obj.Get('branch3x3dbl', 96);
     Result.BranchPool := Obj.Get('branch_pool', 32);
+    Result.FullArch := Obj.Get('full_arch', False);
+    Result.WidthDiv := Obj.Get('width_div', 1);
+    Result.Channel7x7 := Obj.Get('channel_7x7', 128);
     Result.NumLabels := 0;
     if Obj.IndexOfName('num_labels') >= 0 then
       Result.NumLabels := Obj.Get('num_labels', 0);
@@ -49296,6 +49401,18 @@ function InceptionV3ConfigToString(const Config: TInceptionV3Config): string;
 begin
   if Config.ModelType = '' then Result := 'inception'
   else Result := Config.ModelType;
+  if Config.FullArch then
+  begin
+    Result := Result + '_v3 (FULL torchvision: stem + InceptionA x3 / B / C x4'
+      + ' / D / E x2, 2048-d pool';
+    if Config.WidthDiv > 1 then
+      Result := Result + ' / width_div=' + IntToStr(Config.WidthDiv);
+    Result := Result + '), image=' + IntToStr(Config.ImageSize) +
+      ', channels=' + IntToStr(Config.NumChannels) +
+      ', num_labels=' + IntToStr(Config.NumLabels) +
+      ', bn_eps=' + FloatToStr(Config.BnEps);
+    Exit;
+  end;
   Result := Result + '_v3 config: stem=' + IntToStr(Config.StemWidth) +
     ', modules(InceptionA)=' + IntToStr(Config.NumModules) +
     ', branches[1x1=' + IntToStr(Config.Branch1x1) +
@@ -49374,6 +49491,264 @@ begin
   NN.AddLayer( TNNetDeepConcat.Create([B1, B5, B3, BP]) );
 end;
 
+// ---------------------------------------------------------------------------
+// FULL torchvision inception_v3 builder. The pico path above exercises the
+// branch-concat builder on a single InceptionA shape; the helpers below build
+// the COMPLETE module sequence (stem Conv2d_1a..4a + maxpools, InceptionA x3,
+// the strided grid-reductions InceptionB/D, the 7x7-factorized InceptionC, and
+// the wide InceptionE) with REAL torchvision channel widths, loading every
+// BasicConv2d weight + folded BN as it goes. Square convs reuse
+// LoadResNetConvFoldBN; the asymmetric 1x7/7x1 convs use TNNetPadXY (for the
+// asymmetric (0,3)/(3,0) padding CAI's square-pad conv cannot express) +
+// TNNetConvolutionRectangular + LoadInceptionRectConvFoldBN. The pool branch is
+// the real count_include_pad=False average pool (TNNetGridAvgPool) -- the pico's
+// maxpool stand-in is no longer used on the full path.
+// Coded by Claude (AI).
+type
+  TInceptionCtx = record
+    NN: TNNet;
+    Reader: TNNetSafeTensorsReader;
+    BnEps: TNeuralFloat;
+    Trainable: boolean;
+    WidthDiv: integer;       // 1 = real torchvision widths (2048-d pool); >1
+                             // scales EVERY channel count down by this integer
+                             // divisor (topology/kernels/concat unchanged) so a
+                             // committed parity fixture stays small. The canonical
+                             // widths are all multiples of 32, so WidthDiv in
+                             // {1,2,4,8,16,32} divides exactly.
+  end;
+
+// Scales a torchvision channel width by Ctx.WidthDiv (>=1, exact for the
+// 32-multiple canonical widths).
+function IncW(var Ctx: TInceptionCtx; n: integer): integer;
+begin
+  if Ctx.WidthDiv <= 1 then Result := n
+  else Result := Max(1, n div Ctx.WidthDiv);
+end;
+
+// Adds a BasicConv2d (square KxK conv, bias for the folded BN shift, ReLU) on
+// top of After, loads conv+BN from prefix.{conv,bn}, returns the ReLU tail.
+// OutCh/InCh are RAW torchvision widths and are scaled by Ctx.WidthDiv here
+// (both the built conv AND the loader's shape expectation), EXCEPT InCh is left
+// raw when InChIsImage (the stem's input is the 3-channel image, never scaled).
+function IncBasicConv(var Ctx: TInceptionCtx; After: TNNetLayer;
+  const Prefix: string; OutCh, InCh, K, Pad, Stride: integer;
+  InChIsImage: boolean = false): TNNetLayer;
+var
+  Conv: TNNetLayer;
+  SOut, SIn: integer;
+begin
+  SOut := IncW(Ctx, OutCh);
+  if InChIsImage then SIn := InCh else SIn := IncW(Ctx, InCh);
+  Conv := Ctx.NN.AddLayerAfter(
+    [TNNetConvolutionLinear.Create(SOut, K, Pad, Stride, {suppressBias=}0)
+      .SetTrainable(Ctx.Trainable)], After);
+  Result := Ctx.NN.AddLayer( TNNetReLU.Create() );
+  LoadResNetConvFoldBN(Ctx.Reader, Conv, Prefix + '.conv.weight',
+    Prefix + '.bn', SOut, SIn, K, Ctx.BnEps);
+end;
+
+// Asymmetric BasicConv2d (Kh x Kw, torchvision padding (PadH,PadW)). The conv
+// itself runs with zero internal padding; a TNNetPadXY supplies the asymmetric
+// pad first (X == width/cols == PadW, Y == height/rows == PadH). ReLU tail.
+// OutCh/InCh are RAW torchvision widths, scaled by Ctx.WidthDiv here.
+function IncRectConv(var Ctx: TInceptionCtx; After: TNNetLayer;
+  const Prefix: string; OutCh, InCh, Kh, Kw, PadH, PadW: integer): TNNetLayer;
+var
+  Padded, Conv: TNNetLayer;
+  SOut, SIn: integer;
+begin
+  SOut := IncW(Ctx, OutCh);
+  SIn := IncW(Ctx, InCh);
+  Padded := After;
+  if (PadH > 0) or (PadW > 0) then
+    Padded := Ctx.NN.AddLayerAfter(
+      [TNNetPadXY.Create({PaddingX=}PadW, {PaddingY=}PadH)], After);
+  Conv := Ctx.NN.AddLayerAfter(
+    [TNNetConvolutionRectangular.Create(SOut, {X=Kw}Kw, {Y=Kh}Kh,
+      {pad=}0, {stride=}1, {suppressBias=}0).SetTrainable(Ctx.Trainable)], Padded);
+  Result := Ctx.NN.AddLayer( TNNetReLU.Create() );
+  LoadInceptionRectConvFoldBN(Ctx.Reader, Conv, Prefix + '.conv.weight',
+    Prefix + '.bn', SOut, SIn, Kh, Kw, Ctx.BnEps);
+end;
+
+// InceptionA (Mixed_5b/5c/5d): size-preserving. PoolFeat = pool_features
+// (32 for 5b, 64 for 5c/5d). InCh -> returns the new channel count (out).
+function IncModuleA(var Ctx: TInceptionCtx; const Prefix: string;
+  InCh, PoolFeat: integer): integer;
+var
+  Input, B1, B5, B3, BP: TNNetLayer;
+begin
+  Input := Ctx.NN.GetLastLayer();
+  B1 := IncBasicConv(Ctx, Input, Prefix + '.branch1x1', 64, InCh, 1, 0, 1);
+  B5 := IncBasicConv(Ctx, Input, Prefix + '.branch5x5_1', 48, InCh, 1, 0, 1);
+  B5 := IncBasicConv(Ctx, B5, Prefix + '.branch5x5_2', 64, 48, 5, 2, 1);
+  B3 := IncBasicConv(Ctx, Input, Prefix + '.branch3x3dbl_1', 64, InCh, 1, 0, 1);
+  B3 := IncBasicConv(Ctx, B3, Prefix + '.branch3x3dbl_2', 96, 64, 3, 1, 1);
+  B3 := IncBasicConv(Ctx, B3, Prefix + '.branch3x3dbl_3', 96, 96, 3, 1, 1);
+  BP := Ctx.NN.AddLayerAfter(
+    [TNNetGridAvgPool.Create({pool=}3, {stride=}1, {pad=}1)], Input);
+  BP := IncBasicConv(Ctx, BP, Prefix + '.branch_pool', PoolFeat, InCh, 1, 0, 1);
+  Ctx.NN.AddLayer( TNNetDeepConcat.Create([B1, B5, B3, BP]) );
+  Result := 64 + 64 + 96 + PoolFeat;
+end;
+
+// InceptionB (Mixed_6a): strided grid reduction. 3x3 stride-2 conv branch +
+// 3x3dbl stride-2 branch + stride-2 maxpool branch (no params). 288 -> 768.
+function IncModuleB(var Ctx: TInceptionCtx; const Prefix: string;
+  InCh: integer): integer;
+var
+  Input, B3, B3d, BP: TNNetLayer;
+begin
+  Input := Ctx.NN.GetLastLayer();
+  B3 := IncBasicConv(Ctx, Input, Prefix + '.branch3x3', 384, InCh, 3, 0, 2);
+  B3d := IncBasicConv(Ctx, Input, Prefix + '.branch3x3dbl_1', 64, InCh, 1, 0, 1);
+  B3d := IncBasicConv(Ctx, B3d, Prefix + '.branch3x3dbl_2', 96, 64, 3, 1, 1);
+  B3d := IncBasicConv(Ctx, B3d, Prefix + '.branch3x3dbl_3', 96, 96, 3, 0, 2);
+  BP := Ctx.NN.AddLayerAfter(
+    [TNNetMaxPoolPortable.Create({pool=}3, {stride=}2, {pad=}0)], Input);
+  Ctx.NN.AddLayer( TNNetDeepConcat.Create([B3, B3d, BP]) );
+  Result := 384 + 96 + InCh;
+end;
+
+// InceptionC (Mixed_6b/6c/6d/6e): 7x7-factorized, size-preserving. c7 is the
+// per-module 7x7 reduce width (128/160/160/192). 768 -> 768.
+function IncModuleC(var Ctx: TInceptionCtx; const Prefix: string;
+  InCh, C7: integer): integer;
+var
+  Input, B1, B7, B7d, BP: TNNetLayer;
+begin
+  Input := Ctx.NN.GetLastLayer();
+  B1 := IncBasicConv(Ctx, Input, Prefix + '.branch1x1', 192, InCh, 1, 0, 1);
+  // branch7x7: 1x1 -> 1x7 -> 7x1.
+  B7 := IncBasicConv(Ctx, Input, Prefix + '.branch7x7_1', C7, InCh, 1, 0, 1);
+  B7 := IncRectConv(Ctx, B7, Prefix + '.branch7x7_2', C7, C7, {Kh=}1, {Kw=}7, 0, 3);
+  B7 := IncRectConv(Ctx, B7, Prefix + '.branch7x7_3', 192, C7, {Kh=}7, {Kw=}1, 3, 0);
+  // branch7x7dbl: 1x1 -> 7x1 -> 1x7 -> 7x1 -> 1x7.
+  B7d := IncBasicConv(Ctx, Input, Prefix + '.branch7x7dbl_1', C7, InCh, 1, 0, 1);
+  B7d := IncRectConv(Ctx, B7d, Prefix + '.branch7x7dbl_2', C7, C7, 7, 1, 3, 0);
+  B7d := IncRectConv(Ctx, B7d, Prefix + '.branch7x7dbl_3', C7, C7, 1, 7, 0, 3);
+  B7d := IncRectConv(Ctx, B7d, Prefix + '.branch7x7dbl_4', C7, C7, 7, 1, 3, 0);
+  B7d := IncRectConv(Ctx, B7d, Prefix + '.branch7x7dbl_5', 192, C7, 1, 7, 0, 3);
+  BP := Ctx.NN.AddLayerAfter(
+    [TNNetGridAvgPool.Create({pool=}3, {stride=}1, {pad=}1)], Input);
+  BP := IncBasicConv(Ctx, BP, Prefix + '.branch_pool', 192, InCh, 1, 0, 1);
+  Ctx.NN.AddLayer( TNNetDeepConcat.Create([B1, B7, B7d, BP]) );
+  Result := 192 + 192 + 192 + 192;
+end;
+
+// InceptionD (Mixed_7a): strided grid reduction. 768 -> 1280.
+function IncModuleD(var Ctx: TInceptionCtx; const Prefix: string;
+  InCh: integer): integer;
+var
+  Input, B3, B7, BP: TNNetLayer;
+begin
+  Input := Ctx.NN.GetLastLayer();
+  B3 := IncBasicConv(Ctx, Input, Prefix + '.branch3x3_1', 192, InCh, 1, 0, 1);
+  B3 := IncBasicConv(Ctx, B3, Prefix + '.branch3x3_2', 320, 192, 3, 0, 2);
+  B7 := IncBasicConv(Ctx, Input, Prefix + '.branch7x7x3_1', 192, InCh, 1, 0, 1);
+  B7 := IncRectConv(Ctx, B7, Prefix + '.branch7x7x3_2', 192, 192, 1, 7, 0, 3);
+  B7 := IncRectConv(Ctx, B7, Prefix + '.branch7x7x3_3', 192, 192, 7, 1, 3, 0);
+  B7 := IncBasicConv(Ctx, B7, Prefix + '.branch7x7x3_4', 192, 192, 3, 0, 2);
+  BP := Ctx.NN.AddLayerAfter(
+    [TNNetMaxPoolPortable.Create({pool=}3, {stride=}2, {pad=}0)], Input);
+  Ctx.NN.AddLayer( TNNetDeepConcat.Create([B3, B7, BP]) );
+  Result := 320 + 192 + InCh;
+end;
+
+// InceptionE (Mixed_7b/7c): the final wide module. Two branches each SPLIT into
+// a 1x3 and a 3x1 sub-branch that are concatenated, so the module output is
+// 1x1(320) + 3x3-split(384+384) + 3x3dbl-split(384+384) + pool(192) = 2048.
+function IncModuleE(var Ctx: TInceptionCtx; const Prefix: string;
+  InCh: integer): integer;
+var
+  Input, B1, B3, B3a, B3b, B3d, B3da, B3db, BP: TNNetLayer;
+begin
+  Input := Ctx.NN.GetLastLayer();
+  B1 := IncBasicConv(Ctx, Input, Prefix + '.branch1x1', 320, InCh, 1, 0, 1);
+  // branch3x3: 1x1 -> split { 1x3 , 3x1 }.
+  B3 := IncBasicConv(Ctx, Input, Prefix + '.branch3x3_1', 384, InCh, 1, 0, 1);
+  B3a := IncRectConv(Ctx, B3, Prefix + '.branch3x3_2a', 384, 384, 1, 3, 0, 1);
+  B3b := IncRectConv(Ctx, B3, Prefix + '.branch3x3_2b', 384, 384, 3, 1, 1, 0);
+  // branch3x3dbl: 1x1 -> 3x3 -> split { 1x3 , 3x1 }.
+  B3d := IncBasicConv(Ctx, Input, Prefix + '.branch3x3dbl_1', 448, InCh, 1, 0, 1);
+  B3d := IncBasicConv(Ctx, B3d, Prefix + '.branch3x3dbl_2', 384, 448, 3, 1, 1);
+  B3da := IncRectConv(Ctx, B3d, Prefix + '.branch3x3dbl_3a', 384, 384, 1, 3, 0, 1);
+  B3db := IncRectConv(Ctx, B3d, Prefix + '.branch3x3dbl_3b', 384, 384, 3, 1, 1, 0);
+  BP := Ctx.NN.AddLayerAfter(
+    [TNNetGridAvgPool.Create({pool=}3, {stride=}1, {pad=}1)], Input);
+  BP := IncBasicConv(Ctx, BP, Prefix + '.branch_pool', 192, InCh, 1, 0, 1);
+  Ctx.NN.AddLayer( TNNetDeepConcat.Create([B1, B3a, B3b, B3da, B3db, BP]) );
+  Result := 320 + 384 + 384 + 384 + 384 + 192;
+end;
+
+// Builds + loads the FULL torchvision inception_v3 and returns it. Output is
+// (1,1,NumLabels) logits; PoolFeatureIdx is the global-avg-pool (2048-d FID
+// backbone tap).
+function BuildInceptionV3Full(Reader: TNNetSafeTensorsReader;
+  const Config: TInceptionV3Config; out PoolFeatureIdx: integer;
+  pTrainable: boolean): TNNet;
+var
+  Ctx: TInceptionCtx;
+  NN: TNNet;
+  Stem, FC: TNNetLayer;
+  InCh: integer;
+const
+  // Per-Mixed_6x 7x7-reduce widths (torchvision channels_7x7: 128,160,160,192).
+  C7Table: array[0..3] of integer = (128, 160, 160, 192);
+begin
+  NN := TNNet.Create();
+  try
+    Ctx.NN := NN;
+    Ctx.Reader := Reader;
+    Ctx.BnEps := Config.BnEps;
+    Ctx.Trainable := pTrainable;
+    Ctx.WidthDiv := Config.WidthDiv;
+    if Ctx.WidthDiv < 1 then Ctx.WidthDiv := 1;
+
+    NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels) );
+    Stem := NN.GetLastLayer();
+    // Stem: Conv2d_1a_3x3 s2, 2a_3x3 s1, 2b_3x3 s1 pad1, maxpool 3 s2,
+    //       3b_1x1 s1, 4a_3x3 s1, maxpool 3 s2.
+    Stem := IncBasicConv(Ctx, Stem, 'Conv2d_1a_3x3', 32, Config.NumChannels, 3, 0, 2,
+      {InChIsImage=}true);
+    Stem := IncBasicConv(Ctx, Stem, 'Conv2d_2a_3x3', 32, 32, 3, 0, 1);
+    Stem := IncBasicConv(Ctx, Stem, 'Conv2d_2b_3x3', 64, 32, 3, 1, 1);
+    Stem := NN.AddLayer( TNNetMaxPoolPortable.Create(3, 2, 0) );
+    Stem := IncBasicConv(Ctx, Stem, 'Conv2d_3b_1x1', 80, 64, 1, 0, 1);
+    Stem := IncBasicConv(Ctx, Stem, 'Conv2d_4a_3x3', 192, 80, 3, 0, 1);
+    NN.AddLayer( TNNetMaxPoolPortable.Create(3, 2, 0) );
+
+    InCh := 192;
+    InCh := IncModuleA(Ctx, 'Mixed_5b', InCh, 32);
+    InCh := IncModuleA(Ctx, 'Mixed_5c', InCh, 64);
+    InCh := IncModuleA(Ctx, 'Mixed_5d', InCh, 64);
+    InCh := IncModuleB(Ctx, 'Mixed_6a', InCh);
+    InCh := IncModuleC(Ctx, 'Mixed_6b', InCh, C7Table[0]);
+    InCh := IncModuleC(Ctx, 'Mixed_6c', InCh, C7Table[1]);
+    InCh := IncModuleC(Ctx, 'Mixed_6d', InCh, C7Table[2]);
+    InCh := IncModuleC(Ctx, 'Mixed_6e', InCh, C7Table[3]);
+    InCh := IncModuleD(Ctx, 'Mixed_7a', InCh);
+    InCh := IncModuleE(Ctx, 'Mixed_7b', InCh);
+    InCh := IncModuleE(Ctx, 'Mixed_7c', InCh);
+
+    // Head: global avg pool (FID tap) -> fc. InCh is the raw torchvision final
+    // width (2048); the actual pooled feature is the WidthDiv-scaled count.
+    InCh := IncW(Ctx, InCh);
+    PoolFeatureIdx := NN.AddLayer( TNNetAvgChannel.Create() ).LayerIdx;
+    FC := NN.AddLayer(
+      TNNetFullConnectLinear.Create(Config.NumLabels).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
+    LoadLlamaLinearWeights(Reader, FC, 'fc.weight',
+      InCh, Config.NumLabels, 0, -1, 0, 'fc.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
 function BuildInceptionV3(Reader: TNNetSafeTensorsReader;
   const Config: TInceptionV3Config; out PoolFeatureIdx: integer;
   pTrainable: boolean = true): TNNet;
@@ -49389,6 +49764,12 @@ begin
     ImportError('Inception import: num_channels must be >= 1.');
   if Config.NumLabels < 1 then
     ImportError('Inception import: num_labels must be >= 1.');
+  // Full torchvision inception_v3: stem + InceptionA/B/C/D/E sequence.
+  if Config.FullArch then
+  begin
+    Result := BuildInceptionV3Full(Reader, Config, PoolFeatureIdx, pTrainable);
+    Exit;
+  end;
   if Config.NumModules < 1 then
     ImportError('Inception import: num_modules must be >= 1.');
   ModOut := Config.Branch1x1 + Config.Branch5x5 + Config.Branch3x3dbl +

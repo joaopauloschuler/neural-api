@@ -526,6 +526,7 @@ begin
     // SAM vision attention: Channels must equal Heads*HeadDim (2*4=8), matching
     // the 8-channel image input; WindowSize 4 divides the 8x8 map.
     374: begin AddImgInput(ANet); Exit(L('TNNetSAMVisionAttention', TNNetSAMVisionAttention.Create(2, 4, 4, 8))); end;
+    375: begin AddImgInput(ANet); Exit(L('TNNetGridAvgPool', TNNetGridAvgPool.Create(3, 1, 1))); end;
     else
       Result := False;
   end;

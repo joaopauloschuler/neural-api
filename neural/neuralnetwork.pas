@@ -718,6 +718,30 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Grid-preserving average pooling with count_include_pad=False semantics
+  // (torchvision AvgPool2d(K, stride=1, padding=P, count_include_pad=False)).
+  // Unlike TNNetAvgPool (non-overlapping, stride==poolsize, divisor fixed at
+  // K*K) this slides a KxK window with stride 1 over the input padded by P on
+  // every side, and divides each output by the number of REAL (non-pad) input
+  // cells that fell inside the window -- exactly the count_include_pad=False
+  // divisor. With P=(K-1)/2 the output grid equals the input grid, so the
+  // result can be channel-concatenated with the other (size-preserving)
+  // branches of an Inception module. Padding is conceptual (no buffer is
+  // materialized): out-of-bounds taps are simply skipped and excluded from the
+  // divisor. This is the torchvision Inception-v3 pool branch.
+  // Pool/Stride/Padding round-trip via FStruct[0..2] (CreateLayer wires
+  // Create(St[0],St[1],St[2])).
+  // Coded by Claude (AI).
+  TNNetGridAvgPool = class(TNNetLayer)
+  private
+    FPoolSize, FStride, FPadding: integer;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pPoolSize: integer; pStride: integer = 1; pPadding: integer = 0); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   { TNNetCrop }
   TNNetCrop = class(TNNetLayer)
   private
@@ -37289,6 +37313,151 @@ begin
       {LenY=}FPrevLayer.OutputError.SizeY,
       FOutputError
     );
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetGridAvgPool }
+
+constructor TNNetGridAvgPool.Create(pPoolSize: integer; pStride: integer = 1;
+  pPadding: integer = 0);
+begin
+  inherited Create();
+  FPoolSize := pPoolSize;
+  FStride := pStride;
+  FPadding := pPadding;
+  FStruct[0] := pPoolSize;
+  FStruct[1] := pStride;
+  FStruct[2] := pPadding;
+end;
+
+procedure TNNetGridAvgPool.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  OutX, OutY: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  OutX := (pPrevLayer.Output.SizeX - FPoolSize + 2*FPadding) div FStride + 1;
+  OutY := (pPrevLayer.Output.SizeY - FPoolSize + 2*FPadding) div FStride + 1;
+  FOutput.ReSize(OutX, OutY, pPrevLayer.Output.Depth);
+  SetOutputErrorSize(OutX, OutY, pPrevLayer.Output.Depth);
+end;
+
+procedure TNNetGridAvgPool.Compute();
+var
+  StartTime: double;
+  PrevOut: TNNetVolume;
+  MaxD, MaxOutX, MaxOutY: integer;
+  OutX, OutY, CntD, KX, KY: integer;
+  InX0, InY0, InX, InY, Count: integer;
+  OutputRawPos, InputRawPtr: integer;
+  InvCount: TNeuralFloat;
+begin
+  StartTime := Now();
+  PrevOut := FPrevLayer.Output;
+  Output.Fill(0);
+  MaxD := PrevOut.Depth - 1;
+  MaxOutX := FOutput.SizeX - 1;
+  MaxOutY := FOutput.SizeY - 1;
+  for OutY := 0 to MaxOutY do
+  begin
+    InY0 := OutY * FStride - FPadding;
+    for OutX := 0 to MaxOutX do
+    begin
+      InX0 := OutX * FStride - FPadding;
+      // count_include_pad=False: divisor is the number of REAL cells in window.
+      Count := 0;
+      for KY := 0 to FPoolSize - 1 do
+      begin
+        InY := InY0 + KY;
+        if (InY < 0) or (InY >= PrevOut.SizeY) then continue;
+        for KX := 0 to FPoolSize - 1 do
+        begin
+          InX := InX0 + KX;
+          if (InX < 0) or (InX >= PrevOut.SizeX) then continue;
+          Inc(Count);
+          OutputRawPos := FOutput.GetRawPos(OutX, OutY);
+          InputRawPtr := PrevOut.GetRawPos(InX, InY);
+          for CntD := 0 to MaxD do
+          begin
+            FOutput.FData[OutputRawPos + CntD] :=
+              FOutput.FData[OutputRawPos + CntD] +
+              PrevOut.FData[InputRawPtr + CntD];
+          end;
+        end;
+      end;
+      if Count > 0 then
+      begin
+        InvCount := 1.0 / Count;
+        OutputRawPos := FOutput.GetRawPos(OutX, OutY);
+        for CntD := 0 to MaxD do
+          FOutput.FData[OutputRawPos + CntD] :=
+            FOutput.FData[OutputRawPos + CntD] * InvCount;
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGridAvgPool.Backpropagate();
+var
+  StartTime: double;
+  PrevErr, PrevOut: TNNetVolume;
+  MaxD, MaxOutX, MaxOutY: integer;
+  OutX, OutY, CntD, KX, KY: integer;
+  InX0, InY0, InX, InY, Count: integer;
+  OutputRawPos, PrevRawPos: integer;
+  InvCount: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  PrevOut := FPrevLayer.Output;
+  PrevErr := FPrevLayer.OutputError;
+  if (PrevOut.Size > 0) and (PrevOut.Size = PrevErr.Size) then
+  begin
+    StartTime := Now();
+    MaxD := PrevOut.Depth - 1;
+    MaxOutX := FOutput.SizeX - 1;
+    MaxOutY := FOutput.SizeY - 1;
+    for OutY := 0 to MaxOutY do
+    begin
+      InY0 := OutY * FStride - FPadding;
+      for OutX := 0 to MaxOutX do
+      begin
+        InX0 := OutX * FStride - FPadding;
+        // Recompute the real-cell count so the gradient is split evenly.
+        Count := 0;
+        for KY := 0 to FPoolSize - 1 do
+        begin
+          InY := InY0 + KY;
+          if (InY < 0) or (InY >= PrevOut.SizeY) then continue;
+          for KX := 0 to FPoolSize - 1 do
+          begin
+            InX := InX0 + KX;
+            if (InX >= 0) and (InX < PrevOut.SizeX) then Inc(Count);
+          end;
+        end;
+        if Count = 0 then continue;
+        InvCount := 1.0 / Count;
+        OutputRawPos := FOutput.GetRawPos(OutX, OutY);
+        for KY := 0 to FPoolSize - 1 do
+        begin
+          InY := InY0 + KY;
+          if (InY < 0) or (InY >= PrevOut.SizeY) then continue;
+          for KX := 0 to FPoolSize - 1 do
+          begin
+            InX := InX0 + KX;
+            if (InX < 0) or (InX >= PrevOut.SizeX) then continue;
+            PrevRawPos := PrevErr.GetRawPos(InX, InY);
+            for CntD := 0 to MaxD do
+              PrevErr.FData[PrevRawPos + CntD] :=
+                PrevErr.FData[PrevRawPos + CntD] +
+                FOutputError.FData[OutputRawPos + CntD] * InvCount;
+          end;
+        end;
+      end;
+    end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
@@ -95880,6 +96049,7 @@ begin
       'TNNetMaxPoolPortable' :      Result := TNNetMaxPoolPortable.Create(St[0], St[1], St[2]);
       'TNNetMinPool' :              Result := TNNetMinPool.Create(St[0], St[1], St[2]);
       'TNNetAvgPool' :              Result := TNNetAvgPool.Create(St[0]);
+      'TNNetGridAvgPool' :          Result := TNNetGridAvgPool.Create(St[0], St[1], St[2]);
       'TNNetLpPool' :               Result := TNNetLpPool.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetSoftPool' :             Result := TNNetSoftPool.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetStochasticPool' :       Result := TNNetStochasticPool.Create(St[0], St[1], St[2]);
@@ -96297,6 +96467,7 @@ begin
       if S[0] = 'TNNetMaxPoolPortable' then Result := TNNetMaxPoolPortable.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetMinPool' then Result := TNNetMinPool.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetAvgPool' then Result := TNNetAvgPool.Create(St[0]) else
+      if S[0] = 'TNNetGridAvgPool' then Result := TNNetGridAvgPool.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetLpPool' then Result := TNNetLpPool.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetSoftPool' then Result := TNNetSoftPool.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetStochasticPool' then Result := TNNetStochasticPool.Create(St[0], St[1], St[2]) else

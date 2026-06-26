@@ -428,6 +428,7 @@ type
     procedure TestTrOCRParity;
     procedure TestInceptionV3ConfigFromJSONFile;
     procedure TestInceptionV3ImageClassificationParity;
+    procedure TestInceptionV3FullParity;
     procedure TestMobileNetV3ConfigFromJSONFile;
     procedure TestMobileNetV3ImageClassificationParity;
     procedure TestEfficientNetConfigFromJSONFile;
@@ -17772,6 +17773,99 @@ begin
     // Pooled-feature (FID backbone) parity.
     MaxPoolDiff := 0;
     for ChanCnt := 0 to 12 do
+    begin
+      Diff := Abs(NN.Layers[PoolIdx].Output.FData[ChanCnt] -
+        PooledArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxPoolDiff then MaxPoolDiff := Diff;
+    end;
+    AssertTrue('pooled feature: max |diff| = ' + FloatToStr(MaxPoolDiff) +
+      ' must be < 1e-4', MaxPoolDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// FULL torchvision inception_v3 parity test: builds the COMPLETE module
+// sequence (stem Conv2d_1a..4a + maxpools, InceptionA x3, the strided
+// grid-reductions InceptionB/D, the 7x7-factorized InceptionC x4, and the wide
+// InceptionE x2) at the REAL torchvision channel widths and the real key scheme
+// (tiny_inceptionv3_full.*, full_arch=true). Exercises: TNNetGridAvgPool (the
+// real count_include_pad=False avg-pool branch), TNNetConvolutionRectangular +
+// TNNetPadXY (the asymmetric 1x7/7x1 convs), TNNetMaxPoolPortable stride-2
+// reductions, channel concat, and conv-BN fold. The 2048-d pooled feature is
+// the FID backbone tap. Logits + pooled feature must match the numpy float64
+// oracle (tools/inceptionv3_full_fixture.py) < 1e-4.
+procedure TTestNeuralPretrained.TestInceptionV3FullParity;
+var
+  NN: TNNet;
+  Config: TInceptionV3Config;
+  PoolIdx: integer;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, LogitsArr, PooledArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt, PoolDim: integer;
+  Diff, MaxDiff, MaxPoolDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildInceptionV3FromSafeTensors(
+    FixturePath('tiny_inceptionv3_full.safetensors'), Config, PoolIdx,
+    {pTrainable=}true, FixturePath('tiny_inceptionv3_full_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertTrue('full_arch flag', Config.FullArch);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output size = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Size);
+
+    RefJson.LoadFromFile(FixturePath('tiny_inceptionv3_full_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    LogitsArr := TJSONArray(TJSONArray(
+      TJSONObject(RefRoot).Find('logits')).Items[0]);
+    PooledArr := TJSONArray(TJSONObject(RefRoot).Find('pooled'));
+    PoolDim := TJSONObject(RefRoot).Get('pooled_dim', 0);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+    // The pooled-feature tap is the global-avg-pool (FID backbone): with
+    // width_div=8 the 2048-d torchvision feature scales to 256.
+    AssertTrue('pooled_dim from oracle > 0', PoolDim > 0);
+    AssertEquals('pool feature dim = oracle pooled_dim', PoolDim,
+      NN.Layers[PoolIdx].Output.Size);
+    AssertEquals('pooled width = oracle pooled_dim', PoolDim, PooledArr.Count);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ChanCnt] -
+        LogitsArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+    // Pooled-feature (FID backbone) parity.
+    MaxPoolDiff := 0;
+    for ChanCnt := 0 to PoolDim - 1 do
     begin
       Diff := Abs(NN.Layers[PoolIdx].Output.FData[ChanCnt] -
         PooledArr.Items[ChanCnt].AsFloat);

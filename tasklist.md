@@ -325,21 +325,36 @@ rather than acted on.
       with no generative face prior). Pico parity vs a float64 oracle on the SFT
       injection for a fixed latent + examples/FaceRestoration on a tiny CPU image.
 - [ ] Inception-v3 / GoogLeNet importer (BuildInceptionV3FromSafeTensors,
-      torchvision) — PARTIAL (commit 503540b): the branch-concatenation block
-      builder LANDED (AddInceptionAModule runs 4 parallel branches
-      1x1 / 5x5 / 3x3dbl=5x5-as-two-3x3 / pool concatenated on the channel axis
-      via TNNetDeepConcat), plus BuildInceptionV3 scaffold, config reader/ToString,
-      ResNet conv-BN fold reuse (LoadResNetConvFoldBN), pooled-feature (FID backbone)
-      tap via out PoolFeatureIdx, and a pico parity test <1e-4 vs a numpy float64
-      oracle on the InceptionA-shaped sub-net. NOT yet a usable real-checkpoint
-      importer. REMAINING to import a real torchvision inception_v3:
-  - [ ] Strided grid-reduction modules InceptionB / InceptionD (parallel
-        stride-2 conv + pool branches), the full stem (Conv2d_1a..4a + maxpools),
-        InceptionE, and the torchvision avg-pool branch (the pico used a
-        grid-preserving portable maxpool); wire the full module sequence + real
-        weight loading and parity-test against a full-size float64 oracle.
+      torchvision) — FULL torchvision inception_v3 now imports (config full_arch
+      = true -> BuildInceptionV3Full). The pico InceptionA-only path remains for
+      the legacy parity test. REMAINING: FID rewire (below).
+  - [X] Strided grid-reduction modules InceptionB / InceptionD (parallel
+        stride-2 conv + stride-2 maxpool branches), the full stem
+        (Conv2d_1a..4a + two stride-2 maxpools), InceptionC (7x7-factorized 1x7 /
+        7x1 asymmetric convs via TNNetConvolutionRectangular + TNNetPadXY +
+        LoadInceptionRectConvFoldBN), InceptionE (the wide 1x3||3x1 split module),
+        and the REAL torchvision avg-pool branch (new TNNetGridAvgPool, stride-1
+        count_include_pad=False average pool; the pico maxpool stand-in is no
+        longer used on the full path). BuildInceptionV3Full wires the complete
+        stem + InceptionA x3 / B / C x4 / D / E x2 sequence at the real
+        torchvision channel widths (2048-d pool) and loads every BasicConv2d
+        weight + folded BN. TestInceptionV3FullParity asserts logits AND the
+        2048-d pooled feature match a numpy float64 oracle (tools/
+        inceptionv3_full_fixture.py) < 1e-4. NOTE: at the canonical torch input
+        299 the InceptionE grid is 8x8; the fixture uses IMAGE=160 (E grid 3, C
+        grid 8) so every kernel runs at full size (CAI's TNNetConvolution
+        auto-shrinks a kernel to the input spatial size, so a 1x1 grid would
+        silently collapse the 3x3 E convs). The full-arch stem/Inception-module
+        maxpool branches use TNNetMaxPoolPortable (floor sizing = torchvision;
+        zero-pad == torchvision -inf pad for ReLU'd non-negative inputs). The
+        real net is ~24M params (~90MB f32) -- too big to commit -- so the
+        builder + fixture carry a width_div (config "width_div", default 1 =
+        real 2048-d net) that scales EVERY channel width down (topology / kernels
+        / concat unchanged); the committed fixture uses width_div=8 (256-d pool,
+        ~1.4MB safetensors). A real width_div=1 checkpoint loads identically.
   - [ ] Rewire neuralimagemetrics FID onto this backbone once the full net lands
-        (today FID uses placeholder features).
+        (today FID uses placeholder features). Now unblocked: BuildInceptionV3Full
+        exposes the 2048-d pooled feature via PoolFeatureIdx.
 - [ ] LPIPS follow-ups — the metric LANDED (ComputeLPIPSDistance /
       LPIPSStageDistance / LPIPSUnitNormalize in neuralpretrained.pas, reusing the
       VGG importer's 5 relu taps; unit-normalize -> squared-diff -> per-stage lin
