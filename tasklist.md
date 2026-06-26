@@ -716,18 +716,27 @@ rather than acted on.
       existing parity tests (TestHiFiGANSynthesisParity / TestVitsSynthesisParity /
       EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
       before/after.
-- [ ] Parler-TTS importer (`BuildParlerTTSFromSafeTensors[Ex]` + `TParlerConfig`,
-      model_type `parler_tts`, e.g. parler-tts/parler-tts-mini-v1) — description-
-      conditioned TTS: a (By)T5 text encoder (reuse `BuildT5FromSafeTensors`) encodes
-      a free-text STYLE description, a cross-attention codec-LM decoder (reuse the
-      landed seq2seq cross-attention decoder stack — the same shape as the Marian/T5
-      decoder) autoregressively predicts the DELAY-PATTERNED multi-codebook DAC codes
-      conditioned on both the description and the transcript prompt tokens, and the
-      landed DAC decoder renders the waveform. New wiring is the delay-pattern
-      code interleave/de-interleave and the dual-prompt (description + transcript)
-      input. Pico parity `< 1e-4` vs a
-      float64 oracle (`tools/make_pico_parler_fixture.py`, `TestParlerTTSParity`),
-      `examples/ParlerTTS`.
+- [X] Parler-TTS importer (`BuildParlerTTSFromSafeTensors[Ex]` + `TParlerConfig` +
+      `ReadParlerConfigFromJSONFile`/`ParlerConfigToString`, model_type `parler_tts`,
+      e.g. parler-tts/parler-tts-mini-v1) — description-conditioned TTS. LANDED: a
+      (By)T5 text encoder (reuse `BuildT5FromSafeTensors`) encodes a free-text STYLE
+      description for CROSS-ATTENTION; a codec-LM decoder (reuses the shared
+      `BuildMusicGenDecoderNet` — architecturally the Marian/MusicGen PRE-norm
+      cross-attention stack) autoregressively predicts the DELAY-PATTERNED
+      multi-codebook DAC codes; the landed DAC decoder renders the waveform. The
+      genuinely new wiring is the DUAL PROMPT — the transcript prompt token ids are
+      embedded by a separate learned table (`embed_prompts`) and PREPENDED on the
+      sequence axis before the codec frames; the delay-pattern interleave reuses
+      `MusicGenDelayInterleave`/`Deinterleave`. `TParlerTTSModel` holder
+      (`ProjectEncoderStates`/`ComputeLogits`/`Generate`) with the SDPA KV-cache
+      width-1-twin AR decode (bit-identical to the full re-encode, gated). Pico parity
+      `< 1e-4` vs a self-contained numpy float64 oracle (`tools/parler_tiny_fixture.py`,
+      `TestParlerTTSParity` — next-codebook logits AND KV-cache==full-decode),
+      `examples/ParlerTTS` smoke.
+  - [ ] follow-ups: pair the decoder with the real (By)T5 encoder + DAC decoder to a
+        WAVEFORM end-to-end (all three importable in-tree); the real
+        parler-tts-mini-v1 checkpoint key mapping + tokenizers; classifier-free
+        guidance; sampling controls.
 - [ ] VITS / MMS-TTS end-to-end text-to-speech importer (`BuildVitsFromSafeTensors[Ex]`
       LANDED + `ReadVitsConfigFromJSONFile`/`VitsConfigToString` + the `TVitsConfig`
       record + the `TNNetVits` channel-major holder (Analyze / ExpandPrior /

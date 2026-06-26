@@ -380,6 +380,14 @@ type
     // 1e-4, and the pure delay-pattern (de)interleave helpers round-trip and
     // match HF build_delay_pattern_mask exactly.
     procedure TestMusicGenDecoderParity;
+    // Parler-TTS importer (model_type "parler_tts"): the description-conditioned
+    // codec-LM DECODER forward logits vs a self-contained float64 oracle on a
+    // committed pico fixture. Pins the genuinely new Parler wiring - the
+    // transcript prompt PREFIX (embed_prompts) prepended on the sequence axis
+    // before the codec frames, with the K LM heads read at the codec positions
+    // while the blocks cross-attend the description states - to < 1e-4. Also
+    // checks the KV-cache greedy decode is bit-identical to the full re-encode.
+    procedure TestParlerTTSParity;
     // Bark TTS importer (model_type "bark"): the THREE GPT-style sub-models'
     // forward logits (semantic, coarse, fine) vs a float64 HF oracle on a
     // committed re-randomized pico fixture. The fine model's NON-causal forward
@@ -14605,6 +14613,120 @@ begin
     // 1e-4 importer-parity gate (committed-fixture convention). NEVER loosen.
     AssertTrue('MusicGen decoder logit parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Model.Free;
+    EncStates.Free;
+    EncHidden.Free;
+    Logits.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestParlerTTSParity;
+var
+  Model: TParlerTTSModel;
+  Config: TParlerConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  RefObj: TJSONObject;
+  EncStatesArr, RowArr, CodesArr, PromptArr, LogitsArr, KArr, TArr: TJSONArray;
+  EncStates, EncHidden, Logits: TNNetVolume;
+  Codes, GenCacheless, GenCached: TNNetIntArr2D;
+  PromptIds: array of integer;
+  EncSeq, PromptLen, CodecSeq, K, Vocab, TextD, t, k_i, v, i: integer;
+  MaxDiff, Diff: double;
+  Mismatch: boolean;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  EncStates := TNNetVolume.Create;
+  EncHidden := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_parler_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefObj := TJSONObject(RefRoot);
+    EncSeq := RefObj.Get('enc_seq_len', 0);
+    PromptLen := RefObj.Get('prompt_len', 0);
+    CodecSeq := RefObj.Get('codec_seq_len', 0);
+    K := RefObj.Get('num_codebooks', 0);
+    Vocab := RefObj.Get('vocab_size', 0);
+    TextD := RefObj.Get('text_d_model', 0);
+
+    Model := BuildParlerTTSFromSafeTensors(
+      FixturePath('tiny_parler.safetensors'), Config, EncSeq, PromptLen,
+      CodecSeq, {pTrainable=}true, FixturePath('tiny_parler_config.json'));
+    AssertTrue('parler decoder built', Model <> nil);
+    AssertEquals('model_type', 'parler_tts', Config.ModelType);
+    AssertEquals('num codebooks', K, Config.NumCodebooks);
+    AssertEquals('vocab size', Vocab, Config.VocabSize);
+    AssertEquals('text d_model', TextD, Config.TextDModel);
+
+    // Fixed description encoder hidden states (EncSeq x TextD).
+    EncStatesArr := TJSONArray(RefObj.Find('enc_states'));
+    EncStates.ReSize(EncSeq, 1, TextD);
+    for t := 0 to EncSeq - 1 do
+    begin
+      RowArr := TJSONArray(EncStatesArr.Items[t]);
+      for i := 0 to TextD - 1 do
+        EncStates.FData[t * TextD + i] := RowArr.Items[i].AsFloat;
+    end;
+
+    // Fixed transcript prompt ids.
+    PromptArr := TJSONArray(RefObj.Find('prompt_ids'));
+    SetLength(PromptIds, PromptLen);
+    for i := 0 to PromptLen - 1 do PromptIds[i] := PromptArr.Items[i].AsInteger;
+
+    // Fixed codec code stack (K x CodecSeq).
+    CodesArr := TJSONArray(RefObj.Find('codec_codes'));
+    SetLength(Codes, K);
+    for k_i := 0 to K - 1 do
+    begin
+      RowArr := TJSONArray(CodesArr.Items[k_i]);
+      SetLength(Codes[k_i], CodecSeq);
+      for t := 0 to CodecSeq - 1 do Codes[k_i][t] := RowArr.Items[t].AsInteger;
+    end;
+
+    Model.ProjectEncoderStates(EncStates, EncHidden);
+    Model.ComputeLogits(PromptIds, Codes, EncHidden, Logits);
+    AssertEquals('logits depth = K*vocab', K * Vocab, Logits.Depth);
+    AssertEquals('logits length = CodecSeq', CodecSeq, Logits.SizeX);
+
+    // Oracle logits [K][CodecSeq][Vocab]; Pascal layout is depth k*Vocab + v.
+    LogitsArr := TJSONArray(RefObj.Find('logits'));
+    MaxDiff := 0;
+    for k_i := 0 to K - 1 do
+    begin
+      KArr := TJSONArray(LogitsArr.Items[k_i]);
+      for t := 0 to CodecSeq - 1 do
+      begin
+        TArr := TJSONArray(KArr.Items[t]);
+        for v := 0 to Vocab - 1 do
+        begin
+          Diff := Abs(Logits.FData[t * (K * Vocab) + k_i * Vocab + v] -
+            TArr.Items[v].AsFloat);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('Parler-TTS decoder logit parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // KV-cache greedy decode must be bit-identical to the full re-encode path.
+    // Generate a handful of frames (CodecSeq - K + 1 fit in the built CodecLen).
+    Model.Generate(EncStates, PromptIds, CodecSeq - K, {UseCache=}false,
+      GenCacheless);
+    Model.Generate(EncStates, PromptIds, CodecSeq - K, {UseCache=}true,
+      GenCached);
+    Mismatch := false;
+    for k_i := 0 to K - 1 do
+      for t := 0 to Length(GenCacheless[k_i]) - 1 do
+        if GenCacheless[k_i][t] <> GenCached[k_i][t] then Mismatch := true;
+    AssertTrue('Parler KV-cache decode == full re-encode decode',
+      not Mismatch);
   finally
     Model.Free;
     EncStates.Free;

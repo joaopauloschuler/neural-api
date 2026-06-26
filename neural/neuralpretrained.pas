@@ -5789,6 +5789,135 @@ function BuildMusicGenMelodyFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TMusicGenMelodyModel;
 
 // ---------------------------------------------------------------------------
+// PARLER-TTS IMPORT (model_type "parler_tts": parler-tts/parler-tts-mini-v1 and
+// siblings, ParlerTTSForConditionalGeneration) - a DESCRIPTION-conditioned
+// text-to-speech model (Lyth & King 2024). It composes three landed pieces and
+// adds ONE genuinely new wiring step:
+//   * a (By)T5 text ENCODER (BuildT5FromSafeTensors) encodes a free-text STYLE
+//     DESCRIPTION ("a female speaker with a slightly low-pitched voice ...");
+//     its hidden states condition the decoder via CROSS-ATTENTION;
+//   * a codec-LM DECODER autoregressively predicts the DELAY-PATTERNED
+//     multi-codebook DAC code stack. It is architecturally the MusicGen decoder
+//     (PRE-norm cross-attention blocks reusing the Pegasus skeleton, BIAS-FREE
+//     q/k/v/out + fc1/fc2, K embedding tables summed at the input, the half-
+//     split sinusoidal position table, a final decoder LayerNorm, K untied LM
+//     heads, the standard MusicGen delay pattern);
+//   * the DAC decoder (BuildDACFromSafeTensors) renders the waveform.
+// The genuinely NEW Parler piece is the DUAL PROMPT: the TRANSCRIPT prompt
+// token ids (what to SAY, as opposed to the description's HOW) are embedded by a
+// SEPARATE learned table (embed_prompts) and PREPENDED on the sequence axis
+// before the codec frames, so the decoder self-attends over
+// [transcript_prefix | codec_frames] while ALSO cross-attending the description.
+// The K LM heads are read only at the codec-frame positions; the prefix is pure
+// conditioning context (like MusicGen-Melody's chroma prefix, but a learned
+// text-token embedding instead of a chromagram).
+//
+// v1 is INFERENCE-only on CPU. The decoder is built as ONE TNNet (input = the
+// full [prefix | frame] embedding sequence, second input = the projected
+// description states via T5EncoderStatesInput, output = K*vocab depth-
+// concatenated logits over the WHOLE sequence; the holder reads the last
+// CodecSeqLen positions). The autoregressive codec decode uses the SDPA
+// KV-cache incremental-decode machinery (the same width-1-twin path as
+// MusicGen). Coded by Claude (AI).
+// ---------------------------------------------------------------------------
+type
+  TParlerConfig = record
+    TextDModel: integer;        // text_encoder.d_model (enc_to_dec_proj in)
+    Hidden: integer;            // decoder.hidden_size
+    NumLayers: integer;         // decoder.num_hidden_layers
+    NumHeads: integer;          // decoder.num_attention_heads
+    FFNDim: integer;            // decoder.ffn_dim
+    VocabSize: integer;         // decoder.vocab_size (DAC codebook_size)
+    NumCodebooks: integer;      // decoder.num_codebooks (K)
+    MaxPositionEmbeddings: integer; // decoder.max_position_embeddings
+    PromptVocabSize: integer;   // embed_prompts table rows (transcript vocab)
+    ModelType: string;          // 'parler_tts'
+  end;
+
+  { TParlerTTSModel }
+  // Holds the imported Parler-TTS decoder: the K codec embedding tables, the
+  // transcript prompt embedding table (embed_prompts), the sinusoidal position
+  // table, enc_to_dec_proj, and the cross-attention decoder TNNet. The decoder
+  // input is the full [transcript_prefix | codec_frames] embedding sequence; the
+  // K LM heads are read at the codec-frame positions. Built by
+  // BuildParlerTTSFromSafeTensors[Ex]; caller-owned. Coded by Claude (AI).
+  TParlerTTSModel = class
+  private
+    FConfig: TParlerConfig;
+    FDecoder: TNNet;                       // the transformer-block net
+    FStepDecoder: TNNet;                   // lazily-built width-1 KV-cache twin
+    FEmbed: array of TNNetVolume;          // [K] each (vocab+1)*hidden flat
+    FPromptEmbed: TNNetVolume;             // promptVocab*hidden (embed_prompts)
+    FPosTable: TNNetVolume;                // (PromptLen+CodecLen)*hidden sinusoids
+    FEncToDecW: TNNetVolume;               // hidden*textDModel row-major
+    FEncToDecB: TNNetVolume;               // hidden
+    FDecSeqLen, FEncSeqLen, FPromptLen, FCodecLen: integer;
+    // Builds FStepDecoder (the width-1 twin) on first use; copies FDecoder's
+    // weights. No-op once built. Coded by Claude (AI).
+    procedure EnsureStepDecoder;
+  public
+    constructor Create(const pConfig: TParlerConfig;
+      EncSeqLen, PromptLen, CodecLen: integer);
+    destructor Destroy; override;
+    property Config: TParlerConfig read FConfig;
+    property Decoder: TNNet read FDecoder;
+    property DecSeqLen: integer read FDecSeqLen;
+    property EncSeqLen: integer read FEncSeqLen;
+    property PromptLen: integer read FPromptLen;
+    property CodecLen: integer read FCodecLen;
+    // Projects raw T5 encoder (description) hidden states (EncSeqLen x
+    // TextDModel) through enc_to_dec_proj into Dst (EncSeqLen,1,Hidden).
+    procedure ProjectEncoderStates(EncStates, Dst: TNNetVolume);
+    // Builds the decoder input embedding sequence (PromptLen+CodecLen,1,Hidden):
+    // the transcript prefix (embed_prompts[PromptIds]) followed by the codec
+    // frame sums (sum of K codebook lookups), plus the per-position sinusoid.
+    procedure BuildInputEmbeddings(const PromptIds: array of integer;
+      const Codes: TNNetIntArr2D; Dst: TNNetVolume);
+    // Computes the decoder logits for a codec code stack Codes[k][t] (k in
+    // [0,K-1], t in [0,CodecLen-1]) given the transcript PromptIds and the
+    // projected description states EncHidden. Logits is filled
+    // (CodecLen,1,K*VocabSize): codebook k's vocab vector at codec frame t lives
+    // in depth slot k*VocabSize..k*VocabSize+VocabSize-1.
+    procedure ComputeLogits(const PromptIds: array of integer;
+      const Codes: TNNetIntArr2D; EncHidden, Logits: TNNetVolume);
+    // Greedy autoregressive generation of NumFrames DAC frames using the delay
+    // pattern, conditioned on the description EncStates and the transcript
+    // PromptIds. Returns the UNDELAYED code stack Codes[k][t] (k in [0,K-1], t in
+    // [0,NumFrames-1]). UseCache=true drives the KV-cache width-1 twin (O(steps)
+    // self-attention) and is bit-identical to the full re-encode loop under
+    // greedy decoding. Coded by Claude (AI).
+    procedure Generate(EncStates: TNNetVolume;
+      const PromptIds: array of integer; NumFrames: integer; UseCache: boolean;
+      out Codes: TNNetIntArr2D);
+  end;
+
+// Reads a HF Parler-TTS config.json (model_type "parler_tts"). Pulls the decoder
+// sub-config (hidden_size, num_hidden_layers, num_attention_heads, ffn_dim,
+// vocab_size, num_codebooks, max_position_embeddings) and text_encoder.d_model
+// (for enc_to_dec_proj). The transcript prompt vocabulary size is read from
+// vocab_size at the top level (the LM's text tokenizer) or prompt_vocab_size in
+// the pico fixture. activation_function must be "gelu" (exact erf). Coded by
+// Claude (AI).
+function ReadParlerConfigFromJSONFile(const FileName: string): TParlerConfig;
+
+function ParlerConfigToString(const Config: TParlerConfig): string;
+
+// Builds a TParlerTTSModel (the codec decoder side) from Reader (caller owns
+// Reader). EncSeqLen/PromptLen/CodecLen fix the cross-attention, transcript-
+// prefix and codec sequence lengths. pTrainable=False frees training volumes
+// during construction. Coded by Claude (AI).
+function BuildParlerTTSFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  const Config: TParlerConfig; EncSeqLen, PromptLen, CodecLen: integer;
+  pTrainable: boolean = true): TParlerTTSModel;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+function BuildParlerTTSFromSafeTensors(const FileName: string;
+  out Config: TParlerConfig; EncSeqLen, PromptLen, CodecLen: integer;
+  pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TParlerTTSModel;
+
+// ---------------------------------------------------------------------------
 // BARK TEXT-TO-SPEECH IMPORT (model_type "bark", suno/bark[-small]): the
 // autoregressive GPT-style TTS family. Bark chains THREE GPT-2-style decoders
 // then the LANDED EnCodec decoder (reused from the MusicGen path) to a
@@ -30210,6 +30339,645 @@ begin
   try
     Result := BuildMusicGenFromSafeTensorsEx(Reader, Config, EncSeqLen,
       DecSeqLen, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+// ===========================================================================
+// PARLER-TTS IMPLEMENTATION (see the PARLER-TTS IMPORT section).
+// ===========================================================================
+
+function ReadParlerConfigFromJSONFile(const FileName: string): TParlerConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, DecObj, TextObj: TJSONObject;
+  Node: TJSONData;
+  ModelType, ActFn: string;
+
+  function GetInt(O: TJSONObject; const Name: string; Def: integer): integer;
+  begin
+    if (O <> nil) and (O.IndexOfName(Name) >= 0) then Result := O.Get(Name, Def)
+    else Result := Def;
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Parler-TTS import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError('Parler-TTS import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', '');
+    if (ModelType <> '') and (ModelType <> 'parler_tts') then
+      ImportError('Parler-TTS import: config model_type is "' + ModelType +
+        '", expected "parler_tts".');
+    Result.ModelType := 'parler_tts';
+    // Decoder sub-config: nested under "decoder" on real HF checkpoints; the
+    // pico fixture nests it too. Fall back to the top object if absent.
+    DecObj := Obj;
+    Node := Obj.Find('decoder');
+    if (Node <> nil) and (Node is TJSONObject) then DecObj := TJSONObject(Node);
+    // text_encoder.d_model (for enc_to_dec_proj). Pico fixture flattens this
+    // to "text_d_model" at the top level.
+    TextObj := nil;
+    Node := Obj.Find('text_encoder');
+    if (Node <> nil) and (Node is TJSONObject) then TextObj := TJSONObject(Node);
+    Result.TextDModel := GetInt(TextObj, 'd_model',
+      GetInt(Obj, 'text_d_model', 0));
+    Result.Hidden := GetInt(DecObj, 'hidden_size', 0);
+    Result.NumLayers := GetInt(DecObj, 'num_hidden_layers', 0);
+    Result.NumHeads := GetInt(DecObj, 'num_attention_heads', 0);
+    Result.FFNDim := GetInt(DecObj, 'ffn_dim', 0);
+    Result.VocabSize := GetInt(DecObj, 'vocab_size', 0);
+    Result.NumCodebooks := GetInt(DecObj, 'num_codebooks', 0);
+    Result.MaxPositionEmbeddings :=
+      GetInt(DecObj, 'max_position_embeddings', 4096);
+    // Transcript prompt vocabulary: pico flattens it to "prompt_vocab_size";
+    // real checkpoints carry it as top-level "vocab_size" (the LM tokenizer).
+    Result.PromptVocabSize := GetInt(Obj, 'prompt_vocab_size',
+      GetInt(Obj, 'vocab_size', 0));
+    ActFn := DecObj.Get('activation_function', 'gelu');
+    if (Result.TextDModel <= 0) or (Result.Hidden <= 0) or
+       (Result.NumLayers <= 0) or (Result.NumHeads <= 0) or
+       (Result.FFNDim <= 0) or (Result.VocabSize <= 0) or
+       (Result.NumCodebooks <= 0) or (Result.PromptVocabSize <= 0) then
+      ImportError('Parler-TTS import: config "' + FileName + '" is missing a ' +
+        'required field (text_d_model/d_model, hidden_size, ' +
+        'num_hidden_layers, num_attention_heads, ffn_dim, vocab_size, ' +
+        'num_codebooks, prompt_vocab_size).');
+    if ActFn <> 'gelu' then
+      ImportError('Parler-TTS import: activation_function "' + ActFn +
+        '" is not supported (only the exact-erf "gelu").');
+    if Odd(Result.Hidden) then
+      ImportError('Parler-TTS import: hidden_size must be EVEN (the half-split ' +
+        'sinusoidal table), got ' + IntToStr(Result.Hidden) + '.');
+    if (Result.Hidden mod Result.NumHeads) <> 0 then
+      ImportError('Parler-TTS import: num_attention_heads must divide ' +
+        'hidden_size.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function ParlerConfigToString(const Config: TParlerConfig): string;
+begin
+  Result := 'parler_tts config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', hidden=' + IntToStr(Config.Hidden) +
+    ', ffn=' + IntToStr(Config.FFNDim) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', codebooks=' + IntToStr(Config.NumCodebooks) +
+    ', prompt_vocab=' + IntToStr(Config.PromptVocabSize) +
+    ', text_d_model=' + IntToStr(Config.TextDModel) +
+    ', max_pos=' + IntToStr(Config.MaxPositionEmbeddings);
+end;
+
+{ TParlerTTSModel }
+
+// Maps a Parler config to the MusicGen decoder-net shim so the codec LM can be
+// built by the shared BuildMusicGenDecoderNet (the two decoders are
+// architecturally identical: PRE-norm cross-attention, K embedding sums, K LM
+// heads). AudioChannels=1 (Parler is mono).
+function ParlerToMusicGenConfig(const C: TParlerConfig): TMusicGenConfig;
+begin
+  Result.TextDModel := C.TextDModel;
+  Result.Hidden := C.Hidden;
+  Result.NumLayers := C.NumLayers;
+  Result.NumHeads := C.NumHeads;
+  Result.FFNDim := C.FFNDim;
+  Result.VocabSize := C.VocabSize;
+  Result.NumCodebooks := C.NumCodebooks;
+  Result.MaxPositionEmbeddings := C.MaxPositionEmbeddings;
+  Result.AudioChannels := 1;
+  Result.ModelType := 'musicgen';
+end;
+
+constructor TParlerTTSModel.Create(const pConfig: TParlerConfig;
+  EncSeqLen, PromptLen, CodecLen: integer);
+var
+  k_i, NumCodebooksM1: integer;
+begin
+  inherited Create;
+  FConfig := pConfig;
+  FEncSeqLen := EncSeqLen;
+  FPromptLen := PromptLen;
+  FCodecLen := CodecLen;
+  FDecSeqLen := PromptLen + CodecLen;
+  SetLength(FEmbed, FConfig.NumCodebooks);
+  NumCodebooksM1 := FConfig.NumCodebooks - 1;
+  for k_i := 0 to NumCodebooksM1 do
+    FEmbed[k_i] := TNNetVolume.Create;
+  FPromptEmbed := TNNetVolume.Create;
+  FPosTable := TNNetVolume.Create;
+  FEncToDecW := TNNetVolume.Create;
+  FEncToDecB := TNNetVolume.Create;
+  FDecoder := nil;
+  FStepDecoder := nil;
+end;
+
+destructor TParlerTTSModel.Destroy;
+var
+  k_i, FEmbedHi: integer;
+begin
+  FEmbedHi := High(FEmbed);
+  for k_i := 0 to FEmbedHi do FEmbed[k_i].Free;
+  SetLength(FEmbed, 0);
+  FPromptEmbed.Free;
+  FPosTable.Free;
+  FEncToDecW.Free;
+  FEncToDecB.Free;
+  FDecoder.Free;
+  FStepDecoder.Free;
+  inherited Destroy;
+end;
+
+procedure TParlerTTSModel.EnsureStepDecoder;
+var
+  ShimCfg: TMusicGenConfig;
+  StepBlocks: TMarianBlockArray;
+  StepHeads: array of TNNetLayer;
+  StepFinalLN: TNNetLayer;
+begin
+  if Assigned(FStepDecoder) then exit;
+  ShimCfg := ParlerToMusicGenConfig(FConfig);
+  SetLength(StepHeads, FConfig.NumCodebooks);
+  FStepDecoder := BuildMusicGenDecoderNet(ShimCfg, FEncSeqLen, 1,
+    {pTrainable=}false, StepBlocks, StepHeads, StepFinalLN);
+  FStepDecoder.CopyWeights(FDecoder);
+end;
+
+procedure TParlerTTSModel.ProjectEncoderStates(EncStates, Dst: TNNetVolume);
+var
+  t, o, i, FEncSeqLenM1, HiddenM1, TextDModelM1: integer;
+  Acc: TNeuralFloat;
+begin
+  FEncSeqLenM1 := FEncSeqLen - 1;
+  HiddenM1 := FConfig.Hidden - 1;
+  TextDModelM1 := FConfig.TextDModel - 1;
+  Dst.ReSize(FEncSeqLen, 1, FConfig.Hidden);
+  for t := 0 to FEncSeqLenM1 do
+    for o := 0 to HiddenM1 do
+    begin
+      Acc := FEncToDecB.FData[o];
+      for i := 0 to TextDModelM1 do
+        Acc := Acc + FEncToDecW.FData[o * FConfig.TextDModel + i] *
+          EncStates.FData[t * FConfig.TextDModel + i];
+      Dst.FData[t * FConfig.Hidden + o] := Acc;
+    end;
+end;
+
+procedure TParlerTTSModel.BuildInputEmbeddings(
+  const PromptIds: array of integer; const Codes: TNNetIntArr2D;
+  Dst: TNNetVolume);
+var
+  t, k_i, c, p, tok, NumCodebooksM1, HiddenM1, CodecLenM1, PromptLenM1: integer;
+begin
+  NumCodebooksM1 := FConfig.NumCodebooks - 1;
+  HiddenM1 := FConfig.Hidden - 1;
+  CodecLenM1 := FCodecLen - 1;
+  PromptLenM1 := FPromptLen - 1;
+  if Length(PromptIds) <> FPromptLen then
+    ImportError('Parler ComputeLogits: prompt has ' +
+      IntToStr(Length(PromptIds)) + ' ids, expected ' +
+      IntToStr(FPromptLen) + '.');
+  if Length(Codes) <> FConfig.NumCodebooks then
+    ImportError('Parler ComputeLogits: code stack has ' +
+      IntToStr(Length(Codes)) + ' codebooks, expected ' +
+      IntToStr(FConfig.NumCodebooks) + '.');
+  Dst.ReSize(FDecSeqLen, 1, FConfig.Hidden);
+  Dst.Fill(0);
+  // Transcript prefix: embed_prompts[PromptIds] in sequence slots 0..PromptLen-1.
+  for p := 0 to PromptLenM1 do
+  begin
+    tok := PromptIds[p];
+    if (tok < 0) or (tok >= FConfig.PromptVocabSize) then
+      ImportError('Parler ComputeLogits: prompt id ' + IntToStr(tok) +
+        ' out of range [0, ' + IntToStr(FConfig.PromptVocabSize - 1) + '].');
+    for c := 0 to HiddenM1 do
+      Dst.FData[p * FConfig.Hidden + c] :=
+        FPromptEmbed.FData[tok * FConfig.Hidden + c];
+  end;
+  // Codec frames: sum of the K codebook lookups, in slots PromptLen..end.
+  for t := 0 to CodecLenM1 do
+  begin
+    for k_i := 0 to NumCodebooksM1 do
+    begin
+      tok := Codes[k_i][t];
+      if (tok < 0) or (tok > FConfig.VocabSize) then
+        ImportError('Parler ComputeLogits: code ' + IntToStr(tok) +
+          ' out of range [0, ' + IntToStr(FConfig.VocabSize) + '].');
+      for c := 0 to HiddenM1 do
+        Dst.FData[(FPromptLen + t) * FConfig.Hidden + c] :=
+          Dst.FData[(FPromptLen + t) * FConfig.Hidden + c] +
+          FEmbed[k_i].FData[tok * FConfig.Hidden + c];
+    end;
+  end;
+  // Add the per-position sinusoid over the WHOLE [prefix | frames] sequence.
+  for p := 0 to FDecSeqLen - 1 do
+    for c := 0 to HiddenM1 do
+      Dst.FData[p * FConfig.Hidden + c] :=
+        Dst.FData[p * FConfig.Hidden + c] +
+        FPosTable.FData[p * FConfig.Hidden + c];
+end;
+
+procedure TParlerTTSModel.ComputeLogits(const PromptIds: array of integer;
+  const Codes: TNNetIntArr2D; EncHidden, Logits: TNNetVolume);
+var
+  InEmb, FullLogits: TNNetVolume;
+  EncStatesInput: TNNetLayer;
+  t, d, KV, CodecLenM1, KVm1: integer;
+begin
+  KV := FConfig.NumCodebooks * FConfig.VocabSize;
+  CodecLenM1 := FCodecLen - 1;
+  KVm1 := KV - 1;
+  InEmb := TNNetVolume.Create;
+  FullLogits := TNNetVolume.Create;
+  try
+    BuildInputEmbeddings(PromptIds, Codes, InEmb);
+    EncStatesInput := T5EncoderStatesInput(FDecoder);
+    if EncStatesInput.Output.Size <> EncHidden.Size then
+      ImportError('Parler ComputeLogits: encoder-states size mismatch.');
+    EncStatesInput.Output.Copy(EncHidden);
+    FDecoder.Compute(InEmb);
+    FullLogits.Copy(FDecoder.GetLastLayer().Output); // (DecSeqLen,1,K*Vocab)
+    // Read only the CODEC-FRAME positions (drop the transcript prefix rows).
+    Logits.ReSize(FCodecLen, 1, KV);
+    for t := 0 to CodecLenM1 do
+      for d := 0 to KVm1 do
+        Logits.FData[t * KV + d] :=
+          FullLogits.FData[(FPromptLen + t) * KV + d];
+  finally
+    InEmb.Free;
+    FullLogits.Free;
+  end;
+end;
+
+procedure TParlerTTSModel.Generate(EncStates: TNNetVolume;
+  const PromptIds: array of integer; NumFrames: integer; UseCache: boolean;
+  out Codes: TNNetIntArr2D);
+var
+  EncHidden, FrameEmb, StepLogits: TNNetVolume;
+  Delayed: TNNetIntArr2D;
+  EncStatesInput, Lay: TNNetLayer;
+  SDPAs: array of TNNetScaledDotProductAttention;
+  PadId, Steps, step, k_i, t, base, NumCodebooksM1, StepsM1, KV: integer;
+  i, n, LpMax, SDPAsHi, c, tok, HiddenM1, best, v, NumFramesM1, seqpos: integer;
+  bestVal, vv: TNeuralFloat;
+begin
+  PadId := FConfig.VocabSize;
+  NumCodebooksM1 := FConfig.NumCodebooks - 1;
+  HiddenM1 := FConfig.Hidden - 1;
+  KV := FConfig.NumCodebooks * FConfig.VocabSize;
+  // Decode runs Steps = NumFrames + K - 1 to fill every delay-shifted slot.
+  Steps := NumFrames + FConfig.NumCodebooks - 1;
+  StepsM1 := Steps - 1;
+  NumFramesM1 := NumFrames - 1;
+  // The final extraction reads Delayed[k][t + k + 1], whose largest index is
+  // (NumFrames-1) + (K-1) + 1 = NumFrames + K - 1 = Steps; it must be a valid
+  // column (< CodecLen), so NumFrames + K - 1 < CodecLen.
+  if Steps >= FCodecLen then
+    ImportError('Parler Generate: NumFrames + K - 1 = ' + IntToStr(Steps) +
+      ' must be < CodecLen ' + IntToStr(FCodecLen) +
+      ' (rebuild the model with a larger CodecLen).');
+
+  if not UseCache then
+  begin
+    // O(steps^2) full re-encode greedy loop (the reference path).
+    EncHidden := TNNetVolume.Create;
+    StepLogits := TNNetVolume.Create;
+    try
+      ProjectEncoderStates(EncStates, EncHidden);
+      SetLength(Delayed, FConfig.NumCodebooks);
+      for k_i := 0 to NumCodebooksM1 do
+      begin
+        SetLength(Delayed[k_i], FCodecLen);
+        for step := 0 to FCodecLen - 1 do Delayed[k_i][step] := PadId;
+      end;
+      for step := 0 to StepsM1 do
+      begin
+        ComputeLogits(PromptIds, Delayed, EncHidden, StepLogits);
+        t := step + 1; // delayed column predicted this step
+        for k_i := 0 to NumCodebooksM1 do
+          if (t < FCodecLen) and (t >= k_i + 1) and (t - k_i - 1 < NumFrames) then
+          begin
+            base := step * KV + k_i * FConfig.VocabSize;
+            best := 0; bestVal := StepLogits.FData[base];
+            for v := 1 to FConfig.VocabSize - 1 do
+            begin
+              vv := StepLogits.FData[base + v];
+              if vv > bestVal then begin bestVal := vv; best := v; end;
+            end;
+            Delayed[k_i][t] := best;
+          end;
+      end;
+      SetLength(Codes, FConfig.NumCodebooks);
+      for k_i := 0 to NumCodebooksM1 do
+      begin
+        SetLength(Codes[k_i], NumFrames);
+        for t := 0 to NumFramesM1 do Codes[k_i][t] := Delayed[k_i][t + k_i + 1];
+      end;
+    finally
+      EncHidden.Free;
+      StepLogits.Free;
+    end;
+    exit;
+  end;
+
+  // ---- KV-cache incremental-decode path (width-1 twin) ----------------------
+  EnsureStepDecoder;
+  EncHidden := TNNetVolume.Create;
+  FrameEmb := TNNetVolume.Create;
+  StepLogits := TNNetVolume.Create;
+  SetLength(SDPAs, 0);
+  try
+    ProjectEncoderStates(EncStates, EncHidden);
+    EncStatesInput := T5EncoderStatesInput(FStepDecoder);
+    if EncStatesInput.Output.Size <> EncHidden.Size then
+      ImportError('Parler Generate: encoder-states size mismatch.');
+    EncStatesInput.Output.Copy(EncHidden);
+    // Arm the KV-cache on every SELF-attention head (cross-attention re-reads the
+    // fixed description states each step, so it stays on the full-sequence path).
+    LpMax := FStepDecoder.Layers.Count - 1;
+    for i := 0 to LpMax do
+    begin
+      Lay := FStepDecoder.Layers[i];
+      if Lay is TNNetScaledDotProductAttention then
+      begin
+        n := Length(SDPAs);
+        SetLength(SDPAs, n + 1);
+        SDPAs[n] := TNNetScaledDotProductAttention(Lay);
+        SDPAs[n].BeginIncrementalDecode(FDecSeqLen);
+      end;
+    end;
+    SetLength(Delayed, FConfig.NumCodebooks);
+    for k_i := 0 to NumCodebooksM1 do
+    begin
+      SetLength(Delayed[k_i], FCodecLen);
+      for step := 0 to FCodecLen - 1 do Delayed[k_i][step] := PadId;
+    end;
+    FrameEmb.ReSize(1, 1, FConfig.Hidden);
+    // The decoder sequence is [transcript_prefix | codec_frames]; feed exactly
+    // ONE position per step (prefix tokens first, then codec frames), so the
+    // self-attention K/V cache fills [0..seqpos] just like the full forward.
+    for step := 0 to FPromptLen + StepsM1 do
+    begin
+      seqpos := step;
+      for c := 0 to HiddenM1 do
+        FrameEmb.FData[c] := FPosTable.FData[seqpos * FConfig.Hidden + c];
+      if seqpos < FPromptLen then
+      begin
+        // transcript prefix token
+        tok := PromptIds[seqpos];
+        for c := 0 to HiddenM1 do
+          FrameEmb.FData[c] := FrameEmb.FData[c] +
+            FPromptEmbed.FData[tok * FConfig.Hidden + c];
+      end
+      else
+      begin
+        // codec frame: sum of K codebook lookups for delayed column seqpos-PromptLen
+        for k_i := 0 to NumCodebooksM1 do
+        begin
+          tok := Delayed[k_i][seqpos - FPromptLen];
+          for c := 0 to HiddenM1 do
+            FrameEmb.FData[c] := FrameEmb.FData[c] +
+              FEmbed[k_i].FData[tok * FConfig.Hidden + c];
+        end;
+      end;
+      FStepDecoder.Compute(FrameEmb);
+      StepLogits.Copy(FStepDecoder.GetLastLayer().Output); // (1,1,K*Vocab)
+      // Logits at a codec position seqpos predict delayed codec column
+      // (seqpos-PromptLen)+1.
+      if seqpos >= FPromptLen then
+      begin
+        t := (seqpos - FPromptLen) + 1;
+        for k_i := 0 to NumCodebooksM1 do
+          if (t < FCodecLen) and (t >= k_i + 1) and (t - k_i - 1 < NumFrames) then
+          begin
+            base := k_i * FConfig.VocabSize;
+            best := 0; bestVal := StepLogits.FData[base];
+            for v := 1 to FConfig.VocabSize - 1 do
+            begin
+              vv := StepLogits.FData[base + v];
+              if vv > bestVal then begin bestVal := vv; best := v; end;
+            end;
+            Delayed[k_i][t] := best;
+          end;
+      end;
+    end;
+    SetLength(Codes, FConfig.NumCodebooks);
+    for k_i := 0 to NumCodebooksM1 do
+    begin
+      SetLength(Codes[k_i], NumFrames);
+      for t := 0 to NumFramesM1 do Codes[k_i][t] := Delayed[k_i][t + k_i + 1];
+    end;
+  finally
+    SDPAsHi := High(SDPAs);
+    for i := 0 to SDPAsHi do SDPAs[i].EndIncrementalDecode();
+    EncHidden.Free;
+    FrameEmb.Free;
+    StepLogits.Free;
+  end;
+end;
+
+function BuildParlerTTSFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  const Config: TParlerConfig; EncSeqLen, PromptLen, CodecLen: integer;
+  pTrainable: boolean = true): TParlerTTSModel;
+var
+  Model: TParlerTTSModel;
+  Dec: TNNet;
+  ShimCfg: TMusicGenConfig;
+  Blocks: TMarianBlockArray;
+  HeadLayers: array of TNNetLayer;
+  FinalLN: TNNetLayer;
+  Tmp: TNNetVolume;
+  k_i, j, i, BlockCnt, Half, PosCnt, ChCnt: integer;
+  NumCbM1, VocabM1, HiddenM1, DecSeqLen, DecSeqLenM1, HalfM1, BlocksHi: integer;
+  EmbConst, Angle: double;
+  TName, BP: string;
+begin
+  if EncSeqLen < 1 then ImportError('Parler-TTS import: EncSeqLen must be >= 1.');
+  if PromptLen < 1 then ImportError('Parler-TTS import: PromptLen must be >= 1.');
+  if CodecLen < 1 then ImportError('Parler-TTS import: CodecLen must be >= 1.');
+  DecSeqLen := PromptLen + CodecLen;
+  if DecSeqLen > Config.MaxPositionEmbeddings then
+    ImportError('Parler-TTS import: PromptLen + CodecLen = ' +
+      IntToStr(DecSeqLen) + ' must not exceed max_position_embeddings = ' +
+      IntToStr(Config.MaxPositionEmbeddings) + '.');
+
+  Model := TParlerTTSModel.Create(Config, EncSeqLen, PromptLen, CodecLen);
+  ShimCfg := ParlerToMusicGenConfig(Config);
+  Dec := nil;
+  try
+    SetLength(HeadLayers, Config.NumCodebooks);
+    FinalLN := nil;
+    Dec := BuildMusicGenDecoderNet(ShimCfg, EncSeqLen, DecSeqLen, pTrainable,
+      Blocks, HeadLayers, FinalLN);
+    Model.FDecoder := Dec;
+    NumCbM1 := Config.NumCodebooks - 1;
+    VocabM1 := Config.VocabSize - 1;
+    HiddenM1 := Config.Hidden - 1;
+
+    Tmp := TNNetVolume.Create;
+    try
+      // ----- K codec embedding tables (vocab+1 rows x hidden) -----
+      for k_i := 0 to NumCbM1 do
+      begin
+        TName := 'decoder.model.decoder.embed_tokens.' + IntToStr(k_i) +
+          '.weight';
+        if not Reader.HasTensor(TName) then
+          ImportError('Parler-TTS import: missing tensor "' + TName +
+            '" - not a ParlerTTSForConditionalGeneration checkpoint?');
+        if (Reader.DimCount(TName) <> 2) or
+           (Reader.DimSize(TName, 0) <> Config.VocabSize + 1) or
+           (Reader.DimSize(TName, 1) <> Config.Hidden) then
+          ImportError('Parler-TTS import: "' + TName + '" must have shape [' +
+            IntToStr(Config.VocabSize + 1) + ', ' + IntToStr(Config.Hidden) +
+            '], got ' + Reader.ShapeAsString(TName));
+        Reader.LoadTensorFlat(TName, Model.FEmbed[k_i]);
+      end;
+
+      // ----- transcript prompt embedding table (embed_prompts) -----
+      TName := 'embed_prompts.weight';
+      if not Reader.HasTensor(TName) then
+        ImportError('Parler-TTS import: missing tensor "' + TName +
+          '" (the transcript prompt embedding table).');
+      if (Reader.DimCount(TName) <> 2) or
+         (Reader.DimSize(TName, 0) <> Config.PromptVocabSize) or
+         (Reader.DimSize(TName, 1) <> Config.Hidden) then
+        ImportError('Parler-TTS import: "' + TName + '" must have shape [' +
+          IntToStr(Config.PromptVocabSize) + ', ' + IntToStr(Config.Hidden) +
+          '], got ' + Reader.ShapeAsString(TName));
+      Reader.LoadTensorFlat(TName, Model.FPromptEmbed);
+
+      // ----- enc_to_dec_proj (Linear with bias: hidden x text_d_model) -----
+      TName := 'enc_to_dec_proj.weight';
+      if not Reader.HasTensor(TName) then
+        ImportError('Parler-TTS import: missing tensor "' + TName + '".');
+      if (Reader.DimCount(TName) <> 2) or
+         (Reader.DimSize(TName, 0) <> Config.Hidden) or
+         (Reader.DimSize(TName, 1) <> Config.TextDModel) then
+        ImportError('Parler-TTS import: "' + TName + '" must have shape [' +
+          IntToStr(Config.Hidden) + ', ' + IntToStr(Config.TextDModel) +
+          '], got ' + Reader.ShapeAsString(TName));
+      Reader.LoadTensorFlat(TName, Model.FEncToDecW);
+      TName := 'enc_to_dec_proj.bias';
+      if not Reader.HasTensor(TName) then
+        ImportError('Parler-TTS import: missing tensor "' + TName + '".');
+      Reader.LoadTensorFlat(TName, Model.FEncToDecB);
+
+      // ----- K LM heads (untied, no bias: vocab x hidden) -----
+      for k_i := 0 to NumCbM1 do
+      begin
+        TName := 'decoder.lm_heads.' + IntToStr(k_i) + '.weight';
+        if not Reader.HasTensor(TName) then
+          ImportError('Parler-TTS import: missing tensor "' + TName + '".');
+        if (Reader.DimCount(TName) <> 2) or
+           (Reader.DimSize(TName, 0) <> Config.VocabSize) or
+           (Reader.DimSize(TName, 1) <> Config.Hidden) then
+          ImportError('Parler-TTS import: "' + TName + '" must have shape [' +
+            IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.Hidden) +
+            '], got ' + Reader.ShapeAsString(TName));
+        Reader.LoadTensorFlat(TName, Tmp);
+        EnsureWritableImportWeights(HeadLayers[k_i]);
+        for j := 0 to VocabM1 do
+        begin
+          for i := 0 to HiddenM1 do
+            HeadLayers[k_i].FArrNeurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.Hidden + i];
+          HeadLayers[k_i].FArrNeurons[j].BiasWeight := 0;
+        end;
+        HeadLayers[k_i].FlushWeightCache();
+      end;
+    finally
+      Tmp.Free;
+    end;
+
+    // ----- sinusoidal position table (HF cat([cos, sin]) half-split) -----
+    Model.FPosTable.ReSize(DecSeqLen, 1, Config.Hidden);
+    Half := Config.Hidden div 2;
+    EmbConst := Ln(10000.0) / (Half - 1);
+    DecSeqLenM1 := DecSeqLen - 1;
+    HalfM1 := Half - 1;
+    for PosCnt := 0 to DecSeqLenM1 do
+      for ChCnt := 0 to HalfM1 do
+      begin
+        Angle := PosCnt * Exp(-ChCnt * EmbConst);
+        Model.FPosTable.FData[PosCnt * Config.Hidden + ChCnt] := Cos(Angle);
+        Model.FPosTable.FData[PosCnt * Config.Hidden + Half + ChCnt] :=
+          Sin(Angle);
+      end;
+
+    // ----- per-block weights (BIAS-FREE q/k/v/out and fc1/fc2) -----
+    BlocksHi := High(Blocks);
+    for BlockCnt := 0 to BlocksHi do
+    begin
+      BP := 'decoder.model.decoder.layers.' + IntToStr(BlockCnt) + '.';
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SelfAttn.QProj,
+        BP + 'self_attn.q_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SelfAttn.KProj,
+        BP + 'self_attn.k_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SelfAttn.VProj,
+        BP + 'self_attn.v_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SelfAttn.OProj,
+        BP + 'self_attn.out_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLayerNormWeights(Reader, Blocks[BlockCnt].SelfAttn.Norm,
+        BP + 'self_attn_layer_norm.weight', BP + 'self_attn_layer_norm.bias',
+        Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].CrossAttn.QProj,
+        BP + 'encoder_attn.q_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].CrossAttn.KProj,
+        BP + 'encoder_attn.k_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].CrossAttn.VProj,
+        BP + 'encoder_attn.v_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].CrossAttn.OProj,
+        BP + 'encoder_attn.out_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLayerNormWeights(Reader, Blocks[BlockCnt].CrossAttn.Norm,
+        BP + 'encoder_attn_layer_norm.weight',
+        BP + 'encoder_attn_layer_norm.bias', Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc1,
+        BP + 'fc1.weight', Config.Hidden, Config.FFNDim);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc2,
+        BP + 'fc2.weight', Config.FFNDim, Config.Hidden);
+      LoadLayerNormWeights(Reader, Blocks[BlockCnt].FFNNorm,
+        BP + 'final_layer_norm.weight', BP + 'final_layer_norm.bias',
+        Config.Hidden);
+    end;
+
+    // ----- final decoder LayerNorm -----
+    LoadLayerNormWeights(Reader, FinalLN,
+      'decoder.model.decoder.layer_norm.weight',
+      'decoder.model.decoder.layer_norm.bias', Config.Hidden);
+
+    Result := Model;
+  except
+    Model.Free;
+    raise;
+  end;
+end;
+
+function BuildParlerTTSFromSafeTensors(const FileName: string;
+  out Config: TParlerConfig; EncSeqLen, PromptLen, CodecLen: integer;
+  pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TParlerTTSModel;
+var
+  Reader: TNNetSafeTensorsReader;
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadParlerConfigFromJSONFile(ConfigPath);
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildParlerTTSFromSafeTensorsEx(Reader, Config, EncSeqLen,
+      PromptLen, CodecLen, pTrainable);
   finally
     Reader.Free;
   end;
