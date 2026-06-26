@@ -761,6 +761,29 @@ rather than acted on.
   - [ ] real-checkpoint smoke: synthesize a sentence with a downloaded
         `facebook/mms-tts-eng` / `kakao-enterprise/vits-ljs` and write it via
         `SaveVolumeToWav16` (offline + RAM-gated here, so deferred).
+- [ ] Kokoro StyleTTS2 text-to-speech importer (`BuildKokoroFromSafeTensors[Ex]` +
+      `ReadKokoroConfigFromJSONFile`/`KokoroConfigToString` + a `TKokoroConfig`
+      record + a `TNNetKokoro` channel-major holder) — the 82M Apache-licensed
+      `hexgrad/Kokoro-82M` model, a top-ranked open TTS. Architecturally DISTINCT
+      from the landed VITS importer (no conditional-prior normalizing flow, no
+      stochastic duration, no monotonic alignment search): Kokoro is the StyleTTS2
+      synthesis path — a 256-d style vector conditions every block via AdaIN
+      (instance-norm scaled+shifted by a learned style-derived affine — a new
+      `TNNetAdaIN` leaf, the one genuinely new piece), a BERT-style prosody text
+      encoder feeds a duration predictor (LSTM + conv) whose integer durations drive
+      a length-regulator upsampler (reuse the deterministic expand, not VITS's flow),
+      and an F0/N predictor + a HiFi-GAN/iSTFTNet decoder render the waveform. The
+      decoder is mostly REUSE of the landed `TNNetHiFiGAN`/`BuildVitsDecoderInto`
+      conv-upsample + MRF backbone; the iSTFT head (predict magnitude+phase, inverse
+      STFT to waveform) reuses the `neuralaudio.pas` FFT path. Scope v1 to
+      inference: phoneme ids + a chosen voice-pack style vector -> waveform. Pico
+      parity `< 1e-4` on the synthesized waveform vs a float64 oracle
+      (`TestKokoroSynthesisParity`, `tools/make_pico_kokoro_fixture.py` ->
+      `tests/fixtures/tiny_kokoro*`); an examples/KokoroTTS that writes one spoken
+      sentence via `SaveVolumeToWav16`. The grapheme->phoneme (espeak/misaki)
+      frontend is OUT of scope for v1 — take pre-phonemized integer ids as input and
+      document the gap. Follow-up: real `hexgrad/Kokoro-82M` checkpoint + voice-pack
+      `.pt` style-tensor load (offline/RAM-gated here).
 - [ ] Mimi streaming neural-codec importer (`BuildMimiFromSafeTensors[Ex]`,
       model_type "mimi", e.g. `kyutai/mimi`) — LANDED (conv encoder/decoder +
       RoPE transformer bottleneck + semantic/acoustic split-VQ; codes match the
