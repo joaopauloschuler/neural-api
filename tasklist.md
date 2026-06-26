@@ -564,12 +564,6 @@ rather than acted on.
       serialized string. Assert the twin's logits match the source on a pinned
       input (the existing TestMakeUnconditionalTwinMatchesSourceLogits is the
       template).
-- [X] Port transformers' `no_repeat_ngram_size` as a `TNNetLogitsProcessor` in the
-      landed processor chain. LANDED: TNNetNoRepeatNGramProcessor (neuraldecode.pas,
-      prob-domain ban=0+renorm, zero-mass fallback) + TGenerationConfig.NoRepeatNGramSize
-      (0=off) threaded through BuildProcessorPipeline/BuildConfigPipeline so BOTH config
-      paths (GenerateTokensWithConfig streamed + GenerateStringWithConfig string) wire it;
-      test TestNoRepeatNGramBansSeenBigramAndTrigram (bigram+trigram+negative+Commit) green.
 - [ ] Preference-optimization follow-ups on the landed DPO/GRPO trainers
       (TNeuralGRPOTrainer in neural/neuraldpo.pas LANDED: group-relative
       advantages + PG + DeepSeek-k3 per-token KL reusing the DPO softmax-backward
@@ -709,28 +703,6 @@ rather than acted on.
       existing parity tests (TestHiFiGANSynthesisParity / TestVitsSynthesisParity /
       EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
       before/after.
-- [X] AVX-vectorize `TNNetTokenRMSNorm` (forward + backward) over the contiguous
-      Depth axis. LANDED: forward sum-of-squares via DotProduct(seg,seg), gain
-      multiply via Mul; backward SumDxHatXHat via DotProduct, gain-grad via 3-ptr
-      MulAdd into a Depth scratch then -LR-scaled MulAdd, input-grad via two MulAdds
-      (mirrors L2Normalize.*PerDepth). Verified < 1e-4 on scalar AND -dAVX2:
-      TokenRMSNorm forward parity + Llama/Qwen pico importers (TTestNeuralPretrained
-      346 tests) and QK-RMSNorm gradient (TTestNeuralNumerical 1198 tests) all green
-      on both; only failure is the pre-existing AVX2-only TestSetTrainableKeepsOutputs
-      ~1e-7 drift (tasklist line ~77), unrelated.
-      Depth axis. This is the per-token RMSNorm used by EVERY imported Llama-family
-      transformer (Llama/Qwen/Gemma/Mistral/Phi/OLMo/...): two-or-more per block,
-      run once per token per forward pass, so it is on the hot path of all LLM
-      inference, yet `Compute` (neuralnetwork.pas ~54091) still does a scalar
-      `for ChannelCnt` sum-of-squares loop and a scalar gain multiply per token.
-      Each token occupies `FData[t*Depth .. t*Depth+Depth-1]` — depth-contiguous,
-      exactly the drop-in case for `TNNetVolume.GetSumSqr(ptr, Depth)` (mean-square)
-      and `Mul`/`MulAdd` (the `gain .* x_hat` write). Backward's per-token
-      `SumDxHatXHat` dot and the gain-gradient `MulAdd` accumulation are likewise
-      depth-contiguous. Gate on the existing TokenRMSNorm numerical-gradient tests
-      and importer parity (Llama/Qwen pico fixtures) staying `< 1e-4` on both the
-      scalar-fallback and real `-dAVX2` builds; this is the same depth-contiguous
-      pattern already landed for L2Normalize / LogitNormalize / DiagonalSSM.
 - [X] Bark text-to-speech importer (`BuildBarkFromSafeTensors[Ex]` + `TBarkConfig`
       / `ReadBarkConfigFromJSONFile` + `BarkConfigToString`, model_type `bark`).
       LANDED in neuralpretrained.pas: a self-contained `TBarkModel` holder of three
