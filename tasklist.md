@@ -1025,25 +1025,38 @@ rather than acted on.
         sensible image, and consider a Karras-spaced / Euler-ancestral variant.
       Edit examples/README.md. Mind the 5-min/ulimit budget — default to a smoke run.
 
-- [ ] Mask R-CNN instance-segmentation importer + a RoIAlign primitive
-      (RoIAlign DEPENDENCY NOW SATISFIED — TNNetRoIAlign has landed in
-      neuralnetwork.pas; remaining work is the importer/FPN/heads below)
-      (BuildMaskRCNNFromSafeTensors, e.g. torchvision maskrcnn_resnet50_fpn) — the
+- [X] Mask R-CNN instance-segmentation importer + a RoIAlign primitive
+      (RoIAlign DEPENDENCY WAS ALREADY SATISFIED — TNNetRoIAlign had landed in
+      neuralnetwork.pas with full input numerical-gradient + forward + serialization
+      coverage in TestNeuralNumerical.pas; this task wired the importer/FPN/heads).
+      LANDED: BuildMaskRCNNFromSafeTensors[Ex] + BuildMaskRCNN + ReadMaskRCNNConfig
+      FromJSONFile/MaskRCNNConfigToString (TMaskRCNNConfig record) + RunMaskRCNN, the
       FIRST instance-segmentation vertical (per-OBJECT binary masks, distinct from
-      DETR's boxes-only, SegFormer's single dense class map, and SAM's prompt-driven
-      mask). Reuses two landed pieces — the ResNet-50 backbone importer and the
-      conv-BN-fold loader — and adds the FPN top-down feature pyramid (lateral 1x1 +
-      3x3 + nearest upsample, same blocks the tracked YOLO neck needs) plus the new
-      RoIAlign pooling primitive (bilinear-sampled fixed-size crop of a proposal box
-      from the chosen pyramid level — the genuinely new layer, sibling to the landed
-      DeformableConv bilinear sampler, with full input numerical-gradient coverage in
-      TestNeuralNumerical.pas). Scope v1 to INFERENCE with externally supplied
-      proposal boxes (skip training the RPN/anchors; feed a handful of boxes) ->
-      RoIAlign -> the box head (class + refined box) and the small mask head (4x conv
-      -> deconv -> per-class HxW mask). Pico parity vs a torchvision float64 oracle on
-      the mask-head logits for a fixed proposal + an examples/InstanceSegmentation that
-      overlays one object mask on a tiny CPU image. RoIAlign also unblocks any future
-      two-stage detector (Faster R-CNN box head).
+      DETR's boxes-only, SegFormer's single dense class map, SAM's prompt-driven mask).
+      Builds the FPN top-down pyramid (lateral 1x1 inner_blocks + nearest-2x upsample
+      via TNNetDeMaxPool + 3x3 layer_blocks smoothing), RoIAlign of one externally
+      supplied proposal box from the chosen P-level at box-pool 7 + mask-pool 14, the
+      box head (fc6->ReLU->fc7->ReLU -> parallel cls_score + bbox_pred; fc6 input
+      columns PERMUTED PyTorch channel-major -> CAI depth-major in LoadMaskRCNNBoxFC6),
+      and the mask head (4x 3x3 conv+ReLU -> ConvTranspose2d(2,stride2)+ReLU via
+      LoadMaskRCNNDeconv [I,O] axis swap -> 1x1 conv to per-class HxH mask logits).
+      TestMaskRCNNParity: mask-head logits max|diff| = 1.8e-6 (+ cls/bbox) < 1e-4 vs a
+      self-contained numpy float64 oracle (torchvision NOT in the venv — same stance
+      as the ResNet fixture); fixture tools/make_pico_maskrcnn_fixture.py ->
+      tests/fixtures/tiny_maskrcnn.{safetensors(14KB),config.json,ref.json}.
+      examples/InstanceSegmentation overlays the best class's mask on a tiny CPU image
+      and writes a PPM. RoIAlign also unblocks any future two-stage detector (Faster
+      R-CNN box head). Deferred follow-ups (v1 scope was bounded to the tested core):
+  - [ ] RPN / anchor generation + proposal NMS (v1 takes EXTERNALLY supplied proposal
+        boxes; the RPN head + anchor grid + objectness/box-delta decode + top-k/NMS
+        proposal selection are the missing front end for an end-to-end detector).
+  - [ ] wire the real ResNet-50 + FPN BACKBONE into one forward (v1 feeds the FPN-input
+        feature maps directly as TNNetInput levels; a full run should tap C2..C5 from
+        BuildResNetFromSafeTensors and feed all FPN levels, then route each proposal to
+        its FPN level by box area like torchvision's MultiScaleRoIAlign).
+  - [ ] real torchvision maskrcnn_resnet50_fpn checkpoint parity (the landed parity is
+        the hand-built pico numpy oracle only); + box-delta decode/clip + mask paste-to-
+        image + per-class NMS for a meaningful instance overlay on a real photo.
 
 - [ ] TrOCR optical-character-recognition importer follow-up (BuildTrOCRFromSafeTensors
       LANDED, commit 2000f69; DeiT encoder + Bart decoder on the T5EncoderStates two-net

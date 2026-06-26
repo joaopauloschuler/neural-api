@@ -98,6 +98,12 @@ examples/TinyNeRF/*.o
 examples/TinyNeRF/*.ppu
 examples/TinyNeRF/tinynerf_run.txt
 
+# Mask R-CNN instance-segmentation example: compiled binary + generated PPM
+examples/InstanceSegmentation/InstanceSegmentation
+examples/InstanceSegmentation/*.ppm
+examples/InstanceSegmentation/*.o
+examples/InstanceSegmentation/*.ppu
+
 # Python bytecode caches (fixture generators in tools/)
 __pycache__/
 *.pyc

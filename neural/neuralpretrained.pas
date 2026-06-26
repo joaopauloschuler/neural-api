@@ -8501,6 +8501,97 @@ function BuildResNetFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// MASK R-CNN INSTANCE-SEGMENTATION IMPORT (torchvision
+// maskrcnn_resnet50_fpn). The FIRST instance-segmentation vertical: per-OBJECT
+// binary masks (distinct from DETR boxes-only, SegFormer's single dense class
+// map and SAM's prompt-driven masks).
+//
+// SCOPE v1 (bounded, per the tasklist entry): INFERENCE with EXTERNALLY
+// supplied proposal boxes. The RPN / anchor generator is SKIPPED -- the
+// backbone FPN-input feature maps are fed directly (one TNNetInput per level)
+// and a single fixed proposal box is pooled. The ResNet-50 backbone itself is
+// the already-landed BuildResNetFromSafeTensors (its C2..C5 stage taps feed
+// these inputs); this importer is the FPN + RoIAlign + box/mask HEADS on top.
+//
+// The single net it builds is:
+//   * one (W,H,C) TNNetInput per FPN input level (coarse..fine, matching the
+//     config "levels" order);
+//   * FPN top-down: lateral 1x1 convs (inner_blocks) + nearest 2x upsample
+//     (TNNetDeMaxPool, FSpacing=0) + 3x3 smoothing convs (layer_blocks),
+//     producing P-levels;
+//   * RoIAlign (TNNetRoIAlign, torchvision aligned=True, sampling_ratio from
+//     config) of the proposal box from the chosen P-level, at BOTH the box
+//     pool size (7) and mask pool size (14);
+//   * box head: fc6 -> ReLU -> fc7 -> ReLU, then PARALLEL cls_score (num_classes
+//     logits) + bbox_pred (num_classes*4 deltas);
+//   * mask head: 4x (3x3 conv + ReLU) -> ConvTranspose2d(2,stride2) + ReLU ->
+//     1x1 conv to num_classes HxH mask logits.
+// The proposal box is rewritten between runs via RunMaskRCNN (SetBox on the two
+// RoIAlign layers), so a handful of proposals are scored by repeated forwards.
+//
+// torchvision RoIAlign sampling: aligned=True half-pixel offset is exactly
+// TNNetRoIAlign's convention (see its header). The box-head fc6 weight is
+// [rep, C*H*W] in PyTorch CHANNEL-MAJOR flatten order (c*H*W + y*W + x); CAI
+// volumes are DEPTH-MAJOR ((y*W+x)*C + c), so the loader PERMUTES fc6's input
+// columns -- see LoadMaskRCNNBoxFC6.
+type
+TMaskRCNNLevel = record
+  Name: string;
+  InChannels: integer;
+  Height: integer;
+  Width: integer;
+end;
+
+TMaskRCNNConfig = record
+  FpnOutChannels: integer;     // FPN out_channels (256 in torchvision)
+  NumClasses: integer;         // incl. background (91 for COCO)
+  BoxPoolSize: integer;        // box-head RoIAlign output (7)
+  MaskPoolSize: integer;       // mask-head RoIAlign output (14)
+  BoxRepSize: integer;         // box-head representation dim (1024)
+  SamplingRatio: integer;      // RoIAlign sampling_ratio (2)
+  NumLevels: integer;
+  Levels: array[0..7] of TMaskRCNNLevel; // coarse..fine, config order
+  BoxLevel: integer;           // P-level index the proposal is pooled from
+  ModelType: string;
+end;
+
+// Reads a Mask R-CNN config. Required: "levels" (array of {name,in_channels,
+// height,width}, coarse->fine) and "num_classes". Optional overrides match the
+// torchvision defaults: fpn_out_channels (256), box_pool_size (7),
+// mask_pool_size (14), box_representation_size (1024), sampling_ratio (2),
+// box_level (0).
+function ReadMaskRCNNConfigFromJSONFile(
+  const FileName: string): TMaskRCNNConfig;
+
+function MaskRCNNConfigToString(const Config: TMaskRCNNConfig): string;
+
+// Builds the FPN + RoIAlign + box/mask heads described by Config and loads
+// every weight from Reader (caller owns Reader). The net takes one (W,H,C)
+// feature-map input per level; outputs are read by name via RunMaskRCNN. The
+// proposal box is initialised to the whole chosen level and rewritten per-run.
+function BuildMaskRCNN(Reader: TNNetSafeTensorsReader;
+  const Config: TMaskRCNNConfig; pTrainable: boolean = true): TNNet;
+
+// Builds + loads from the checkpoint at FileName. Config is supplied (Ex) or
+// read from ConfigFileName ('' = "config.json" beside FileName) and returned.
+function BuildMaskRCNNFromSafeTensorsEx(const FileName: string;
+  const Config: TMaskRCNNConfig; pTrainable: boolean = true): TNNet;
+
+function BuildMaskRCNNFromSafeTensors(const FileName: string;
+  out Config: TMaskRCNNConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+
+// Runs ONE proposal box through a net built by BuildMaskRCNN. LevelFeats[i] is
+// the feature map for level i (coarse..fine, config order). Box is (x1,y1,x2,y2)
+// in the chosen P-level's feature coordinates. Fills (any may be nil):
+//   ClsLogits   (num_classes, 1, 1) class logits,
+//   BboxDeltas  (num_classes*4, 1, 1) box-regression deltas,
+//   MaskLogits  (Wm, Hm, num_classes) per-class mask logits (CAI depth-major).
+procedure RunMaskRCNN(NN: TNNet; const Config: TMaskRCNNConfig;
+  const LevelFeats: array of TNNetVolume; const Box: array of TNeuralFloat;
+  ClsLogits, BboxDeltas, MaskLogits: TNNetVolume);
+
+// ---------------------------------------------------------------------------
 // CONVNEXT v1 / v2 IMPORT (HF "convnext" / "convnextv2",
 // e.g. facebook/convnext-tiny-224 and facebook/convnextv2-tiny-1k-224).
 // A modern hierarchical CNN. Stem = 4x4 stride-4 patchify conv -> channel
@@ -54347,6 +54438,525 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadResNetConfigFromJSONFile(ConfigPath);
   Result := BuildResNetFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+// ===========================================================================
+// MASK R-CNN INSTANCE SEGMENTATION (torchvision maskrcnn_resnet50_fpn)
+// ===========================================================================
+
+// Loads a biased nn.Conv2d (weight [O,I,kh,kw] + bias [O], no BN fold) into a
+// CAI conv. Same depth-contiguous FData[(ky*K+kx)*I + c] layout as
+// LoadResNetConvFoldBN. (A local copy of the ConvNeXt loader so the Mask R-CNN
+// importer has no forward dependency on the later ConvNeXt section.)
+procedure LoadMaskRCNNConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string; OutCh, InCh, K: integer);
+var
+  W, B: TNNetVolume;
+  o, c, ky, kx, OutChM1, InChM1, KM1: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('Mask R-CNN import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 4) or
+     (Reader.DimSize(WName, 0) <> OutCh) or
+     (Reader.DimSize(WName, 1) <> InCh) or
+     (Reader.DimSize(WName, 2) <> K) or
+     (Reader.DimSize(WName, 3) <> K) then
+    ImportError('Mask R-CNN import: "' + WName + '" must have shape [' +
+      IntToStr(OutCh) + ', ' + IntToStr(InCh) + ', ' + IntToStr(K) + ', ' +
+      IntToStr(K) + '], got ' + Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> OutCh then
+    ImportError('Mask R-CNN import: conv "' + WName + '" target has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutCh) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    Reader.LoadTensorFlat(BName, B);
+    if B.Size <> OutCh then
+      ImportError('Mask R-CNN import: "' + BName + '" must have ' +
+        IntToStr(OutCh) + ' elements.');
+    OutChM1 := OutCh - 1;  InChM1 := InCh - 1;  KM1 := K - 1;
+    for o := 0 to OutChM1 do
+    begin
+      for ky := 0 to KM1 do
+        for kx := 0 to KM1 do
+          for c := 0 to InChM1 do
+            Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
+              W.FData[((o * InCh + c) * K + ky) * K + kx];
+      Layer.FArrNeurons[o].BiasWeight := B.FData[o];
+    end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free; B.Free;
+  end;
+end;
+
+function ReadMaskRCNNConfigFromJSONFile(
+  const FileName: string): TMaskRCNNConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, LvObj: TJSONObject;
+  ArrData: TJSONData;
+  Arr: TJSONArray;
+  i: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('Mask R-CNN import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Mask R-CNN import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Mask R-CNN import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'maskrcnn');
+    Result.FpnOutChannels := Obj.Get('fpn_out_channels', 256);
+    if Obj.IndexOfName('num_classes') < 0 then
+      ImportError('Mask R-CNN import: config "' + FileName +
+        '" is missing the required field "num_classes".');
+    Result.NumClasses := Obj.Get('num_classes', 0);
+    Result.BoxPoolSize := Obj.Get('box_pool_size', 7);
+    Result.MaskPoolSize := Obj.Get('mask_pool_size', 14);
+    Result.BoxRepSize := Obj.Get('box_representation_size', 1024);
+    Result.SamplingRatio := Obj.Get('sampling_ratio', 2);
+    Result.BoxLevel := Obj.Get('box_level', 0);
+    ArrData := Obj.Find('levels');
+    if (ArrData = nil) or not (ArrData is TJSONArray) then
+      ImportError('Mask R-CNN import: config "' + FileName +
+        '" is missing the required array "levels".');
+    Arr := TJSONArray(ArrData);
+    if (Arr.Count < 1) or (Arr.Count > 8) then
+      ImportError('Mask R-CNN import: "levels" must have 1..8 entries, got ' +
+        IntToStr(Arr.Count) + '.');
+    Result.NumLevels := Arr.Count;
+    for i := 0 to Arr.Count - 1 do
+    begin
+      if not (Arr.Items[i] is TJSONObject) then
+        ImportError('Mask R-CNN import: "levels[' + IntToStr(i) +
+          ']" is not an object.');
+      LvObj := TJSONObject(Arr.Items[i]);
+      Result.Levels[i].Name := LvObj.Get('name', 'level' + IntToStr(i));
+      Result.Levels[i].InChannels := LvObj.Get('in_channels', 0);
+      Result.Levels[i].Height := LvObj.Get('height', 0);
+      Result.Levels[i].Width := LvObj.Get('width', 0);
+      if (Result.Levels[i].InChannels <= 0) or
+         (Result.Levels[i].Height <= 0) or (Result.Levels[i].Width <= 0) then
+        ImportError('Mask R-CNN import: "levels[' + IntToStr(i) +
+          ']" needs positive in_channels/height/width.');
+    end;
+    if (Result.BoxLevel < 0) or (Result.BoxLevel >= Result.NumLevels) then
+      ImportError('Mask R-CNN import: box_level ' + IntToStr(Result.BoxLevel) +
+        ' out of range 0..' + IntToStr(Result.NumLevels - 1) + '.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function MaskRCNNConfigToString(const Config: TMaskRCNNConfig): string;
+var
+  i: integer;
+begin
+  if Config.ModelType = '' then Result := 'maskrcnn'
+  else Result := Config.ModelType;
+  Result := Result + ' config: fpn_out=' + IntToStr(Config.FpnOutChannels) +
+    ', num_classes=' + IntToStr(Config.NumClasses) +
+    ', box_pool=' + IntToStr(Config.BoxPoolSize) +
+    ', mask_pool=' + IntToStr(Config.MaskPoolSize) +
+    ', box_rep=' + IntToStr(Config.BoxRepSize) +
+    ', sampling_ratio=' + IntToStr(Config.SamplingRatio) +
+    ', box_level=' + IntToStr(Config.BoxLevel) + ', levels=[';
+  for i := 0 to Config.NumLevels - 1 do
+  begin
+    if i > 0 then Result := Result + ', ';
+    Result := Result + Config.Levels[i].Name + '(' +
+      IntToStr(Config.Levels[i].InChannels) + 'x' +
+      IntToStr(Config.Levels[i].Height) + 'x' +
+      IntToStr(Config.Levels[i].Width) + ')';
+  end;
+  Result := Result + ']';
+end;
+
+// Loads the box-head fc6 (PyTorch [rep, C*Hp*Wp]) into a CAI TNNetFullConnect
+// whose INPUT is the (Wp,Hp,C) RoIAlign output read DEPTH-MAJOR. PyTorch
+// flattens its conv input CHANNEL-MAJOR (col = c*Hp*Wp + y*Wp + x) but the CAI
+// volume the FC reads is DEPTH-MAJOR (col = (y*Wp + x)*C + c). We therefore
+// permute the input columns so the dot product matches. Bias is straight.
+procedure LoadMaskRCNNBoxFC6(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string;
+  Rep, Ch, Hp, Wp: integer);
+var
+  W, B: TNNetVolume;
+  o, c, y, x, srcCol, dstCol, InDim: integer;
+  OutM1: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  InDim := Ch * Hp * Wp;
+  if not Reader.HasTensor(WName) then
+    ImportError('Mask R-CNN import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 2) or
+     (Reader.DimSize(WName, 0) <> Rep) or
+     (Reader.DimSize(WName, 1) <> InDim) then
+    ImportError('Mask R-CNN import: "' + WName + '" must have shape [' +
+      IntToStr(Rep) + ', ' + IntToStr(InDim) + '], got ' +
+      Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> Rep then
+    ImportError('Mask R-CNN import: fc6 target has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(Rep) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    Reader.LoadTensorFlat(BName, B);
+    if B.Size <> Rep then
+      ImportError('Mask R-CNN import: "' + BName + '" must have ' +
+        IntToStr(Rep) + ' elements.');
+    OutM1 := Rep - 1;
+    for o := 0 to OutM1 do
+    begin
+      for c := 0 to Ch - 1 do
+        for y := 0 to Hp - 1 do
+          for x := 0 to Wp - 1 do
+          begin
+            srcCol := (c * Hp + y) * Wp + x;       // PyTorch channel-major
+            dstCol := (y * Wp + x) * Ch + c;       // CAI depth-major
+            Layer.FArrNeurons[o].Weights.FData[dstCol] :=
+              W.FData[o * InDim + srcCol];
+          end;
+      Layer.FArrNeurons[o].BiasWeight := B.FData[o];
+    end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free; B.Free;
+  end;
+end;
+
+// Loads a flat-input FC (PyTorch [Out, In] + bias [Out]) into a CAI
+// TNNetFullConnect whose input is already a flat (In,1,1) vector (no spatial
+// permutation needed -- fc7 / cls_score / bbox_pred).
+procedure LoadMaskRCNNFlatFC(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string; InDim, OutDim: integer);
+var
+  W, B: TNNetVolume;
+  o, i, OutM1: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('Mask R-CNN import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 2) or
+     (Reader.DimSize(WName, 0) <> OutDim) or
+     (Reader.DimSize(WName, 1) <> InDim) then
+    ImportError('Mask R-CNN import: "' + WName + '" must have shape [' +
+      IntToStr(OutDim) + ', ' + IntToStr(InDim) + '], got ' +
+      Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> OutDim then
+    ImportError('Mask R-CNN import: FC "' + WName + '" target has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutDim) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    Reader.LoadTensorFlat(BName, B);
+    if B.Size <> OutDim then
+      ImportError('Mask R-CNN import: "' + BName + '" must have ' +
+        IntToStr(OutDim) + ' elements.');
+    OutM1 := OutDim - 1;
+    for o := 0 to OutM1 do
+    begin
+      for i := 0 to InDim - 1 do
+        Layer.FArrNeurons[o].Weights.FData[i] := W.FData[o * InDim + i];
+      Layer.FArrNeurons[o].BiasWeight := B.FData[o];
+    end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free; B.Free;
+  end;
+end;
+
+// Loads a torchvision ConvTranspose2d (weight [I,O,kh,kw] + bias [O]) into a
+// TNNetDeconvolution. The CAI deconv per-neuron weight keeps the SAME
+// (FeatureSizeX, FeatureSizeY, InputDepth) layout as a convolution -- i.e.
+// FData[(ky*K + kx)*I + c] for output neuron o -- whereas PyTorch stores it
+// CHANNEL-FIRST as [in=c, out=o, ky, kx]. We transpose the (c,o) axes on load.
+procedure LoadMaskRCNNDeconv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string;
+  InCh, OutCh, K: integer);
+var
+  W, B: TNNetVolume;
+  o, c, ky, kx, OutM1, InM1, KM1: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('Mask R-CNN import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 4) or
+     (Reader.DimSize(WName, 0) <> InCh) or
+     (Reader.DimSize(WName, 1) <> OutCh) or
+     (Reader.DimSize(WName, 2) <> K) or
+     (Reader.DimSize(WName, 3) <> K) then
+    ImportError('Mask R-CNN import: ConvTranspose "' + WName +
+      '" must have shape [' + IntToStr(InCh) + ', ' + IntToStr(OutCh) + ', ' +
+      IntToStr(K) + ', ' + IntToStr(K) + '], got ' + Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> OutCh then
+    ImportError('Mask R-CNN import: deconv target has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutCh) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    Reader.LoadTensorFlat(BName, B);
+    if B.Size <> OutCh then
+      ImportError('Mask R-CNN import: "' + BName + '" must have ' +
+        IntToStr(OutCh) + ' elements.');
+    OutM1 := OutCh - 1;  InM1 := InCh - 1;  KM1 := K - 1;
+    for o := 0 to OutM1 do
+    begin
+      for ky := 0 to KM1 do
+        for kx := 0 to KM1 do
+          for c := 0 to InM1 do
+            Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
+              W.FData[((c * OutCh + o) * K + ky) * K + kx];
+      Layer.FArrNeurons[o].BiasWeight := B.FData[o];
+    end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free; B.Free;
+  end;
+end;
+
+function BuildMaskRCNN(Reader: TNNetSafeTensorsReader;
+  const Config: TMaskRCNNConfig; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  InputLayers: array[0..7] of TNNetLayer;
+  Laterals: array[0..7] of TNNetLayer;
+  Inner, Up, ChosenP: TNNetLayer;
+  RoIBox, RoIMask: TNNetLayer;
+  Fc6, Fc7, ClsHead, BboxHead, MaskConv, MaskDeconv, MaskLogits: TNNetLayer;
+  lv, k, ChosenW, ChosenH: integer;
+  C: integer;
+begin
+  NN := TNNet.Create();
+  C := Config.FpnOutChannels;
+
+  // --- one input per FPN level (coarse..fine, config order) -----------------
+  for lv := 0 to Config.NumLevels - 1 do
+    InputLayers[lv] := NN.AddLayer(TNNetInput.Create(
+      Config.Levels[lv].Width, Config.Levels[lv].Height,
+      Config.Levels[lv].InChannels));
+
+  // --- FPN lateral 1x1 convs (inner_blocks.{i}.0) ---------------------------
+  for lv := 0 to Config.NumLevels - 1 do
+  begin
+    Laterals[lv] := NN.AddLayerAfter(
+      TNNetConvolutionLinear.Create(C, 1, 0, 1, 0).SetTrainable(pTrainable),
+      InputLayers[lv]);
+    LoadMaskRCNNConv(Reader, Laterals[lv],
+      'backbone.fpn.inner_blocks.' + IntToStr(lv) + '.0.weight',
+      'backbone.fpn.inner_blocks.' + IntToStr(lv) + '.0.bias',
+      C, Config.Levels[lv].InChannels, 1);
+  end;
+
+  // --- FPN top-down + 3x3 smoothing (layer_blocks.{i}.0) --------------------
+  // P levels indexed by config order; build coarsest (last) first.
+  // We retain only the chosen level's smoothed output (ChosenP) -- it is the
+  // single proposal-pooling source in v1.
+  ChosenP := nil;
+  // coarsest level: P = smooth(lateral), no top-down add.
+  Inner := Laterals[Config.NumLevels - 1];
+  for lv := Config.NumLevels - 1 downto 0 do
+  begin
+    if lv < Config.NumLevels - 1 then
+    begin
+      // nearest 2x upsample of the coarser inner feature, then add lateral.
+      Up := NN.AddLayerAfter(TNNetDeMaxPool.Create(2), Inner);
+      Inner := NN.AddLayer(TNNetSum.Create([Laterals[lv], Up]));
+    end;
+    if lv = Config.BoxLevel then
+    begin
+      ChosenP := NN.AddLayerAfter(
+        TNNetConvolutionLinear.Create(C, 3, 1, 1, 0).SetTrainable(pTrainable),
+        Inner);
+      LoadMaskRCNNConv(Reader, ChosenP,
+        'backbone.fpn.layer_blocks.' + IntToStr(lv) + '.0.weight',
+        'backbone.fpn.layer_blocks.' + IntToStr(lv) + '.0.bias',
+        C, C, 3);
+    end;
+  end;
+  if ChosenP = nil then
+    ImportError('Mask R-CNN import: chosen box_level was not built.');
+  ChosenW := Config.Levels[Config.BoxLevel].Width;
+  ChosenH := Config.Levels[Config.BoxLevel].Height;
+
+  // ====== BOX HEAD ==========================================================
+  // RoIAlign at box pool size; box initialised to the whole level (rewritten
+  // per-run by RunMaskRCNN.SetBox).
+  RoIBox := NN.AddLayerAfter(TNNetRoIAlign.Create(
+    Config.BoxPoolSize, Config.BoxPoolSize, 0, 0, ChosenW, ChosenH,
+    1.0, Config.SamplingRatio), ChosenP);
+  // fc6 (flatten C*pool*pool -> rep), permuting columns to CAI depth-major.
+  Fc6 := NN.AddLayerAfter(
+    TNNetFullConnectReLU.Create(Config.BoxRepSize).SetTrainable(pTrainable),
+    RoIBox);
+  LoadMaskRCNNBoxFC6(Reader, Fc6,
+    'roi_heads.box_head.fc6.weight', 'roi_heads.box_head.fc6.bias',
+    Config.BoxRepSize, C, Config.BoxPoolSize, Config.BoxPoolSize);
+  Fc7 := NN.AddLayer(
+    TNNetFullConnectReLU.Create(Config.BoxRepSize).SetTrainable(pTrainable));
+  LoadMaskRCNNFlatFC(Reader, Fc7,
+    'roi_heads.box_head.fc7.weight', 'roi_heads.box_head.fc7.bias',
+    Config.BoxRepSize, Config.BoxRepSize);
+  // parallel cls_score + bbox_pred branches from fc7.
+  ClsHead := NN.AddLayerAfter(
+    TNNetFullConnectLinear.Create(Config.NumClasses).SetTrainable(pTrainable),
+    Fc7);
+  LoadMaskRCNNFlatFC(Reader, ClsHead,
+    'roi_heads.box_predictor.cls_score.weight',
+    'roi_heads.box_predictor.cls_score.bias',
+    Config.BoxRepSize, Config.NumClasses);
+  BboxHead := NN.AddLayerAfter(
+    TNNetFullConnectLinear.Create(Config.NumClasses * 4).SetTrainable(pTrainable),
+    Fc7);
+  LoadMaskRCNNFlatFC(Reader, BboxHead,
+    'roi_heads.box_predictor.bbox_pred.weight',
+    'roi_heads.box_predictor.bbox_pred.bias',
+    Config.BoxRepSize, Config.NumClasses * 4);
+
+  // ====== MASK HEAD =========================================================
+  RoIMask := NN.AddLayerAfter(TNNetRoIAlign.Create(
+    Config.MaskPoolSize, Config.MaskPoolSize, 0, 0, ChosenW, ChosenH,
+    1.0, Config.SamplingRatio), ChosenP);
+  // 4x 3x3 conv + ReLU (mask_head.{k}.0), spatial-preserving (pad 1).
+  for k := 0 to 3 do
+  begin
+    MaskConv := NN.AddLayer(
+      TNNetConvolutionReLU.Create(C, 3, 1, 1, 0).SetTrainable(pTrainable));
+    LoadMaskRCNNConv(Reader, MaskConv,
+      'roi_heads.mask_head.' + IntToStr(k) + '.0.weight',
+      'roi_heads.mask_head.' + IntToStr(k) + '.0.bias',
+      C, C, 3);
+  end;
+  // ConvTranspose2d kernel 2 stride 2 -> ReLU (mask_predictor.conv5_mask).
+  MaskDeconv := NN.AddLayer(
+    TNNetDeconvolutionReLU.Create(C, 2, 2, 0, 0).SetTrainable(pTrainable));
+  LoadMaskRCNNDeconv(Reader, MaskDeconv,
+    'roi_heads.mask_predictor.conv5_mask.weight',
+    'roi_heads.mask_predictor.conv5_mask.bias',
+    C, C, 2);
+  // 1x1 conv -> num_classes mask logits (mask_predictor.mask_fcn_logits).
+  MaskLogits := NN.AddLayer(
+    TNNetConvolutionLinear.Create(Config.NumClasses, 1, 0, 1, 0).SetTrainable(pTrainable));
+  LoadMaskRCNNConv(Reader, MaskLogits,
+    'roi_heads.mask_predictor.mask_fcn_logits.weight',
+    'roi_heads.mask_predictor.mask_fcn_logits.bias',
+    Config.NumClasses, C, 1);
+
+  // Heads are located by class+shape in RunMaskRCNN (no per-layer name API):
+  //   cls_score  = TNNetFullConnectLinear, Output.Size = num_classes
+  //   bbox_pred  = TNNetFullConnectLinear, Output.Size = num_classes*4
+  //   mask_logits= the LAST TNNetConvolutionLinear (Depth = num_classes, 28x28)
+  // Touch the locals so the compiler keeps them (build-time references).
+  if (RoIBox = nil) or (RoIMask = nil) or (MaskDeconv = nil) or
+     (ClsHead = nil) or (BboxHead = nil) or (Fc6 = nil) or (Inner = nil) then
+    ImportError('Mask R-CNN import: internal wiring error.');
+  Result := NN;
+end;
+
+function BuildMaskRCNNFromSafeTensorsEx(const FileName: string;
+  const Config: TMaskRCNNConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildMaskRCNN(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildMaskRCNNFromSafeTensors(const FileName: string;
+  out Config: TMaskRCNNConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadMaskRCNNConfigFromJSONFile(ConfigPath);
+  Result := BuildMaskRCNNFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+procedure RunMaskRCNN(NN: TNNet; const Config: TMaskRCNNConfig;
+  const LevelFeats: array of TNNetVolume; const Box: array of TNeuralFloat;
+  ClsLogits, BboxDeltas, MaskLogits: TNNetVolume);
+var
+  lv: integer;
+  Inputs: array of TNNetVolume;
+  L, ClsL, BboxL, MaskL: TNNetLayer;
+begin
+  if Length(LevelFeats) <> Config.NumLevels then
+    ImportError('RunMaskRCNN: expected ' + IntToStr(Config.NumLevels) +
+      ' level feature maps, got ' + IntToStr(Length(LevelFeats)) + '.');
+  if Length(Box) <> 4 then
+    ImportError('RunMaskRCNN: Box must be (x1,y1,x2,y2).');
+  // Rewrite the proposal box on every RoIAlign layer (box + mask heads).
+  for lv := 0 to NN.Layers.Count - 1 do
+    if NN.Layers[lv] is TNNetRoIAlign then
+      TNNetRoIAlign(NN.Layers[lv]).SetBox(Box[0], Box[1], Box[2], Box[3]);
+  // The level inputs are layers 0..NumLevels-1 (config order). The multi-input
+  // TNNet.Compute copies inputs 1..N then forwards from input[0].
+  SetLength(Inputs, Config.NumLevels);
+  for lv := 0 to Config.NumLevels - 1 do
+    Inputs[lv] := LevelFeats[lv];
+  NN.Compute(Inputs);
+
+  // Locate the head outputs by class + shape (no per-layer name API):
+  //   cls_score / bbox_pred = TNNetFullConnectLinear with Size num_classes /
+  //   num_classes*4; mask_logits = the LAST TNNetConvolutionLinear whose Depth
+  //   = num_classes (the 1x1 logits conv, after the 28x28 deconv).
+  ClsL := nil; BboxL := nil; MaskL := nil;
+  for lv := 0 to NN.Layers.Count - 1 do
+  begin
+    L := NN.Layers[lv];
+    if (L is TNNetFullConnectLinear) and not (L is TNNetFullConnectReLU) then
+    begin
+      if L.Output.Size = Config.NumClasses then ClsL := L
+      else if L.Output.Size = Config.NumClasses * 4 then BboxL := L;
+    end
+    else if (L.ClassType = TNNetConvolutionLinear) and
+            (L.Output.Depth = Config.NumClasses) and (L.Output.SizeX > 1) then
+      MaskL := L;
+  end;
+
+  if ClsLogits <> nil then
+  begin
+    if ClsL = nil then ImportError('RunMaskRCNN: cls_score layer missing.');
+    ClsLogits.Copy(ClsL.Output);
+  end;
+  if BboxDeltas <> nil then
+  begin
+    if BboxL = nil then ImportError('RunMaskRCNN: bbox_pred layer missing.');
+    BboxDeltas.Copy(BboxL.Output);
+  end;
+  if MaskLogits <> nil then
+  begin
+    if MaskL = nil then ImportError('RunMaskRCNN: mask_logits layer missing.');
+    MaskLogits.Copy(MaskL.Output);
+  end;
 end;
 
 // ===========================================================================

@@ -1,0 +1,27 @@
+{
+  "model_type": "maskrcnn",
+  "architectures": [
+    "MaskRCNN"
+  ],
+  "fpn_out_channels": 4,
+  "num_classes": 3,
+  "box_pool_size": 7,
+  "mask_pool_size": 14,
+  "box_representation_size": 8,
+  "sampling_ratio": 2,
+  "levels": [
+    {
+      "name": "c4",
+      "in_channels": 6,
+      "height": 8,
+      "width": 8
+    },
+    {
+      "name": "c5",
+      "in_channels": 6,
+      "height": 4,
+      "width": 4
+    }
+  ],
+  "box_level": 0
+}

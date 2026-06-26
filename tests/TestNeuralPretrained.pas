@@ -468,6 +468,8 @@ type
     procedure TestResNet18ImageClassificationParity;
     procedure TestResNet34ImageClassificationParity;
     procedure TestResNet50ImageClassificationParity;
+    procedure TestMaskRCNNConfigFromJSONFile;
+    procedure TestMaskRCNNParity;
     procedure TestConvNeXtConfigFromJSONFile;
     procedure TestConvNeXtV1ImageClassificationParity;
     procedure TestConvNeXtV2ImageClassificationParity;
@@ -17889,6 +17891,153 @@ end;
 procedure TTestNeuralPretrained.TestResNet50ImageClassificationParity;
 begin
   RunResNetParity('tiny_resnet50');
+end;
+
+// Verifies ReadMaskRCNNConfigFromJSONFile on the committed pico config.
+procedure TTestNeuralPretrained.TestMaskRCNNConfigFromJSONFile;
+var
+  Config: TMaskRCNNConfig;
+begin
+  Config := ReadMaskRCNNConfigFromJSONFile(
+    FixturePath('tiny_maskrcnn_config.json'));
+  AssertEquals('fpn out channels', 4, Config.FpnOutChannels);
+  AssertEquals('num classes', 3, Config.NumClasses);
+  AssertEquals('box pool', 7, Config.BoxPoolSize);
+  AssertEquals('mask pool', 14, Config.MaskPoolSize);
+  AssertEquals('box rep', 8, Config.BoxRepSize);
+  AssertEquals('sampling ratio', 2, Config.SamplingRatio);
+  AssertEquals('num levels', 2, Config.NumLevels);
+  AssertEquals('box level', 0, Config.BoxLevel);
+  AssertEquals('level0 in_ch', 6, Config.Levels[0].InChannels);
+  AssertEquals('level0 H', 8, Config.Levels[0].Height);
+  AssertEquals('level1 H', 4, Config.Levels[1].Height);
+  WriteLn('  ', MaskRCNNConfigToString(Config));
+end;
+
+// torchvision maskrcnn_resnet50_fpn FPN + RoIAlign + box/mask heads parity.
+// The RPN is skipped (v1 scope): two backbone FPN-input levels + a single fixed
+// proposal box are supplied directly; the oracle is a self-contained numpy
+// float64 forward (tools/make_pico_maskrcnn_fixture.py). The gate is on the
+// MASK-HEAD logits (the instance-segmentation deliverable) plus the box-head
+// class logits and box deltas, all < 1e-4.
+procedure TTestNeuralPretrained.TestMaskRCNNParity;
+var
+  NN: TNNet;
+  Config: TMaskRCNNConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  FeatsArr, LvArr, ChArr, RowArr, MaskArr, MClsArr, MRowArr: TJSONArray;
+  ClsArr, BboxArr, BoxArr: TJSONArray;
+  LevelFeats: array of TNNetVolume;
+  Box: array[0..3] of TNeuralFloat;
+  ClsOut, BboxOut, MaskOut: TNNetVolume;
+  lv, c, y, x, idx, Wm, Hm: integer;
+  Diff, MaxMask, MaxCls, MaxBbox, Ref: double;
+begin
+  RandSeed := 424242;
+  NN := BuildMaskRCNNFromSafeTensors(FixturePath('tiny_maskrcnn.safetensors'),
+    Config, {pTrainable=}true, FixturePath('tiny_maskrcnn_config.json'));
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  ClsOut := TNNetVolume.Create;
+  BboxOut := TNNetVolume.Create;
+  MaskOut := TNNetVolume.Create;
+  SetLength(LevelFeats, Config.NumLevels);
+  for lv := 0 to Config.NumLevels - 1 do
+    LevelFeats[lv] := TNNetVolume.Create;
+  try
+    AssertTrue('net built', NN <> nil);
+
+    RefJson.LoadFromFile(FixturePath('tiny_maskrcnn_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+
+    // --- load level feature maps (ref "feats" is [level][C][H][W]) ----------
+    FeatsArr := TJSONArray(TJSONObject(RefRoot).Find('feats'));
+    AssertEquals('feats levels', Config.NumLevels, FeatsArr.Count);
+    for lv := 0 to Config.NumLevels - 1 do
+    begin
+      LvArr := TJSONArray(FeatsArr.Items[lv]);
+      LevelFeats[lv].ReSize(Config.Levels[lv].Width,
+        Config.Levels[lv].Height, Config.Levels[lv].InChannels);
+      for c := 0 to Config.Levels[lv].InChannels - 1 do
+      begin
+        ChArr := TJSONArray(LvArr.Items[c]);
+        for y := 0 to Config.Levels[lv].Height - 1 do
+        begin
+          RowArr := TJSONArray(ChArr.Items[y]);
+          for x := 0 to Config.Levels[lv].Width - 1 do
+            LevelFeats[lv].FData[(y * Config.Levels[lv].Width + x) *
+              Config.Levels[lv].InChannels + c] := RowArr.Items[x].AsFloat;
+        end;
+      end;
+    end;
+
+    BoxArr := TJSONArray(TJSONObject(RefRoot).Find('box'));
+    for x := 0 to 3 do Box[x] := BoxArr.Items[x].AsFloat;
+
+    RunMaskRCNN(NN, Config, LevelFeats, Box, ClsOut, BboxOut, MaskOut);
+
+    // --- mask logits (PRIMARY gate). ref "mask_logits" = [cls][Hm][Wm]; CAI
+    //     MaskOut is depth-major (x,y,cls): (y*Wm+x)*NumClasses + cls. --------
+    MaskArr := TJSONArray(TJSONObject(RefRoot).Find('mask_logits'));
+    AssertEquals('mask classes', Config.NumClasses, MaskArr.Count);
+    MClsArr := TJSONArray(MaskArr.Items[0]);
+    Hm := MClsArr.Count;
+    Wm := TJSONArray(MClsArr.Items[0]).Count;
+    AssertEquals('mask out SizeX', Wm, MaskOut.SizeX);
+    AssertEquals('mask out SizeY', Hm, MaskOut.SizeY);
+    AssertEquals('mask out Depth', Config.NumClasses, MaskOut.Depth);
+    MaxMask := 0;
+    for c := 0 to Config.NumClasses - 1 do
+    begin
+      MClsArr := TJSONArray(MaskArr.Items[c]);
+      for y := 0 to Hm - 1 do
+      begin
+        MRowArr := TJSONArray(MClsArr.Items[y]);
+        for x := 0 to Wm - 1 do
+        begin
+          Ref := MRowArr.Items[x].AsFloat;
+          Diff := Abs(MaskOut.FData[(y * Wm + x) * Config.NumClasses + c] - Ref);
+          if Diff > MaxMask then MaxMask := Diff;
+        end;
+      end;
+    end;
+
+    // --- box-head class logits + box deltas ---------------------------------
+    ClsArr := TJSONArray(TJSONObject(RefRoot).Find('cls_logits'));
+    AssertEquals('cls width', Config.NumClasses, ClsArr.Count);
+    AssertEquals('cls out size', Config.NumClasses, ClsOut.Size);
+    MaxCls := 0;
+    for idx := 0 to Config.NumClasses - 1 do
+    begin
+      Diff := Abs(ClsOut.FData[idx] - ClsArr.Items[idx].AsFloat);
+      if Diff > MaxCls then MaxCls := Diff;
+    end;
+    BboxArr := TJSONArray(TJSONObject(RefRoot).Find('bbox_deltas'));
+    AssertEquals('bbox width', Config.NumClasses * 4, BboxArr.Count);
+    AssertEquals('bbox out size', Config.NumClasses * 4, BboxOut.Size);
+    MaxBbox := 0;
+    for idx := 0 to Config.NumClasses * 4 - 1 do
+    begin
+      Diff := Abs(BboxOut.FData[idx] - BboxArr.Items[idx].AsFloat);
+      if Diff > MaxBbox then MaxBbox := Diff;
+    end;
+
+    WriteLn('  Mask R-CNN parity: mask |diff|=', MaxMask:0:8,
+      ' cls |diff|=', MaxCls:0:8, ' bbox |diff|=', MaxBbox:0:8);
+    AssertTrue('mask logits: max |diff| = ' + FloatToStr(MaxMask) +
+      ' must be < 1e-4', MaxMask < 1e-4);
+    AssertTrue('cls logits: max |diff| = ' + FloatToStr(MaxCls) +
+      ' must be < 1e-4', MaxCls < 1e-4);
+    AssertTrue('bbox deltas: max |diff| = ' + FloatToStr(MaxBbox) +
+      ' must be < 1e-4', MaxBbox < 1e-4);
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+    ClsOut.Free; BboxOut.Free; MaskOut.Free;
+    for lv := 0 to Config.NumLevels - 1 do LevelFeats[lv].Free;
+    NN.Free;
+  end;
 end;
 
 // Verifies ReadConvNeXtConfigFromJSONFile on the committed v1 pico config.
