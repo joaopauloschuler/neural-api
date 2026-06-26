@@ -1910,6 +1910,41 @@ function DecodeMoonshineGreedyCached(EncoderNet, DecoderNet: TNNet;
   Waveform: TNNetVolume;
   StartTokenId, EOSTokenId, MaxNewTokens: integer): TNeuralIntegerArray;
 
+// KV-CACHE (O(1)-per-step) greedy decode driven by a PRE-COMPUTED encoder
+// states volume and an ARBITRARY FORCED TOKEN PROLOGUE - the Whisper-style
+// generalisation of DecodeMoonshineGreedyCached. The caller runs the encoder
+// itself (e.g. a mel-spectrogram encoder over a raw audio volume) ONCE and
+// passes the resulting hidden states in as EncoderStates; they are copied into
+// the decoder's second TNNetInput, constant across every step (the per-layer
+// CROSS-attention re-reads them unchanged - nothing to grow). Unlike
+// DecodeSeq2SeqGreedy / DecodeMoonshineGreedyCached, which start from a single
+// BOS, the decode is seeded by ForcedPrefix: an array of token ids fed verbatim
+// (e.g. Whisper's <|startoftranscript|><|en|><|transcribe|><|notimestamps|>).
+//
+// The forced tokens are PREFILLED one at a time into the self-attention KV cache
+// (advancing the absolute position and the partial-RoPE PositionOffset), then
+// the model autoregresses greedily from the logits row produced by the LAST
+// forced token. ForcedPrefix tokens are NOT included in the result (mirroring
+// the StartTokenId-excluded convention of DecodeSeq2SeqGreedy); only the
+// GENERATED ids are returned, with EOSTokenId appended and counted when emitted.
+//
+// EXACTNESS: per the TNNetStreamingDecoder contract the streamed argmax is
+// BIT-IDENTICAL to the naive loop that re-runs the FULL decoder over the whole
+// growing (ForcedPrefix ++ generated) prefix every step (no cache). The self-
+// attention SDPA caches grow one token per step (O(1)), so a length-L transcript
+// is O(L) total instead of O(L^2).
+//
+// DECODER SHAPE: the decoder's first TNNetInput (token ids) must be width 1
+// (built with DecSeqLen=1) - the cache, not the input width, carries context.
+// ForcedPrefix must be non-empty (it seeds the first logits row). The encoder
+// states / decoder-second-input size match is validated; mismatches and an empty
+// prefix raise EArgumentException. MaxNewTokens < 1 returns empty.
+// Coded by Claude (AI).
+function DecodeSeq2SeqForcedPrefixCached(DecoderNet: TNNet;
+  EncoderStates: TNNetVolume;
+  const ForcedPrefix: array of integer;
+  EOSTokenId, MaxNewTokens: integer): TNeuralIntegerArray;
+
 // Stochastic seq2seq decode: the step's logits row is divided by Temperature
 // (clamped to >= 1e-6; Temperature -> 0 degenerates to greedy argmax) and
 // softmaxed, then Sampler draws from the resulting distribution. Sampler =
@@ -7600,6 +7635,85 @@ begin
       Inc(AbsPos);
       if AbsPos >= MaxCache then break;
       StepIn.FData[0] := Next;
+    end;
+  finally
+    Session.Free;
+    StepIn.Free;
+  end;
+end;
+
+function DecodeSeq2SeqForcedPrefixCached(DecoderNet: TNNet;
+  EncoderStates: TNNetVolume;
+  const ForcedPrefix: array of integer;
+  EOSTokenId, MaxNewTokens: integer): TNeuralIntegerArray;
+var
+  EncStates: TNNetLayer;
+  Session: TNNetStreamingDecoder;
+  StepIn, Logits: TNNetVolume;
+  DecSeqLen, AbsPos, Next, MaxCache, PrefixHi, i: integer;
+begin
+  SetLength(Result, 0);
+  if MaxNewTokens < 1 then exit;
+  PrefixHi := High(ForcedPrefix);
+  if PrefixHi < 0 then
+    raise EArgumentException.Create('DecodeSeq2SeqForcedPrefixCached: ' +
+      'ForcedPrefix is empty - at least one forced token is required to seed ' +
+      'the first logits row.');
+  // (1) Cache the PRE-COMPUTED encoder states in the decoder's second
+  // TNNetInput - the caller already ran the encoder once. They are constant
+  // across every decode step, so the per-layer cross-attention re-reads them
+  // unchanged (nothing to grow).
+  EncStates := Seq2SeqEncoderStatesInput(DecoderNet);
+  if EncoderStates.Size <> EncStates.Output.Size then
+    raise EArgumentException.Create('DecodeSeq2SeqForcedPrefixCached: ' +
+      'encoder states size ' + IntToStr(EncoderStates.Size) +
+      ' does not match the decoder''s encoder-states input size ' +
+      IntToStr(EncStates.Output.Size) + ' (EncSeqLen/d_model mismatch?).');
+  EncStates.Output.Copy(EncoderStates);
+  // The incremental path feeds the decoder ONE token per step, so its first
+  // TNNetInput (the token ids) must be width 1; the cache carries context.
+  DecSeqLen := DecoderNet.GetFirstLayer().Output.Size;
+  if DecSeqLen <> 1 then
+    raise EArgumentException.Create('DecodeSeq2SeqForcedPrefixCached: the ' +
+      'decoder''s token input must be width 1 for incremental decode (built ' +
+      'at DecSeqLen=' + IntToStr(DecSeqLen) + '); build it with DecSeqLen=1.');
+  // Cache capacity: the whole forced prologue plus every generated token.
+  MaxCache := Length(ForcedPrefix) + MaxNewTokens;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  // (2) Arm the self-attn SDPA KV caches + RoPE PositionOffset (cross-attention
+  // is NOT a TNNetScaledDotProductAttention, so the scan skips it - its encoder
+  // K/V stay fixed). Prefill the forced prologue one token per StepForward, then
+  // autoregress from the LAST forced token's logits row.
+  Session := TNNetStreamingDecoder.Create(DecoderNet, MaxCache);
+  try
+    Session.Reset();
+    AbsPos := 0;
+    // Prefill all forced tokens. Each appends only its K/V to the cache; only
+    // the LAST one's output row seeds generation (earlier rows are discarded,
+    // exactly as a full forward over the prefix would discard non-final rows).
+    for i := 0 to PrefixHi do
+    begin
+      StepIn.FData[0] := ForcedPrefix[i];
+      Session.StepForward(StepIn, AbsPos);
+      if i < PrefixHi then Inc(AbsPos);
+    end;
+    // AbsPos now indexes the LAST forced token; its logits predict the first
+    // generated token.
+    while True do
+    begin
+      Logits := Session.Output();
+      // Width-1 step: the next-token distribution is the single output row 0
+      // (argmax ties to the lowest id, like GetClassOnPixel everywhere else).
+      Next := Logits.GetClassOnPixel(0, 0);
+      SetLength(Result, Length(Result) + 1);
+      Result[High(Result)] := Next;
+      if Next = EOSTokenId then break;
+      if Length(Result) >= MaxNewTokens then break;
+      // Cache capacity reached: the token just generated cannot be fed back.
+      Inc(AbsPos);
+      if AbsPos >= MaxCache then break;
+      StepIn.FData[0] := Next;
+      Session.StepForward(StepIn, AbsPos);
     end;
   finally
     Session.Free;

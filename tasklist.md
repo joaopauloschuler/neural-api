@@ -648,7 +648,7 @@ rather than acted on.
         its (kernel-1)-token ring buffer + in/out projections driven one token at a
         time, then wire into TNNetStreamingDecoder (mirrors the RWKV TokenShift
         block-integration follow-up).
-- [ ] Forced-prefix seq2seq decode + KV cache for Whisper-style decoders:
+- [X] Forced-prefix seq2seq decode + KV cache for Whisper-style decoders:
       DecodeSeq2SeqGreedy/Sampled assume a text encoder input and a
       single BOS start token, so examples/WhisperTranscribe hand-rolls
       its decode loop (mel-volume encoder input + the 4-token
