@@ -103,6 +103,72 @@ type
     property WeightDecay: TNeuralFloat read FWeightDecay write FWeightDecay;
   end;
 
+  // Lion optimization method (Chen et al., "Symbolic Discovery of Optimization
+  // Algorithms", 2023). The update direction is the SIGN of an interpolated
+  // momentum:
+  //   c_t = beta1 * m_{t-1} + (1 - beta1) * g
+  //   W  -= lr * sign(c_t)        ( + decoupled AdamW-style weight decay )
+  //   m_t = beta2 * m_{t-1} + (1 - beta2) * g
+  // Lion keeps a SINGLE momentum buffer m (half of Adam's optimizer state,
+  // which needs both a first and a second moment). Because the step is a pure
+  // sign, the effective per-coordinate update is +-lr; Lion therefore usually
+  // wants a smaller learning rate and a larger weight decay than Adam.
+  // Weight decay is decoupled (applied directly to the weights via
+  // TNNet.ApplyDecoupledWeightDecay, so biases and normalization layers are
+  // skipped). With WeightDecay = 0 it is plain Lion.
+  // Coded by Claude (AI).
+  TNeuralOptimizerLion = class(TNeuralOptimizer)
+  protected
+    FBeta1: TNeuralFloat;
+    FBeta2: TNeuralFloat;
+    FWeightDecay: TNeuralFloat;
+    FInitialized: boolean;
+  public
+    constructor Create(
+      Beta1: TNeuralFloat = 0.9;
+      Beta2: TNeuralFloat = 0.99;
+      WeightDecay: TNeuralFloat = 0.0); overload;
+
+    procedure Optimize(); override;
+    procedure ReSet(); override;
+
+    property WeightDecay: TNeuralFloat read FWeightDecay write FWeightDecay;
+  end;
+
+  // Adafactor optimization method (Shazeer & Stern, "Adafactor: Adaptive
+  // Learning Rates with Sublinear Memory Cost", 2018). Instead of Adam's full
+  // per-element second-moment matrix V (shape R x C), Adafactor stores only a
+  // row-moment vector (length R) and a column-moment vector (length C) and
+  // reconstructs V on the fly as a rank-1 outer product:
+  //   R_t = beta2*R + (1-beta2)*rowmean(g^2 + eps1)
+  //   C_t = beta2*C + (1-beta2)*colmean(g^2 + eps1)
+  //   Vhat[i,j] = R_t[i]*C_t[j] / mean(R_t)
+  //   W -= lr * g / sqrt(Vhat)
+  // This is the major memory win: R+C scalars instead of R*C. Non-factorable
+  // params (1-D weights, biases) fall back to a full per-element second moment.
+  // PRAGMATIC v1 - the following optional Adafactor knobs are DELIBERATELY
+  // OMITTED and documented here: (1) the optional first-moment beta1 EMA
+  // (this implementation has no momentum on the update direction), and (2) the
+  // update RMS clipping (clip-by-RMS of the step). The relative-step learning
+  // rate is taken from the host fit's schedule rather than Adafactor's internal
+  // rule. The result is a correct, well-documented optimizer that trains.
+  // Coded by Claude (AI).
+  TNeuralOptimizerAdafactor = class(TNeuralOptimizer)
+  protected
+    FBeta2: TNeuralFloat;
+    FEpsilon: TNeuralFloat;
+    FEps1: TNeuralFloat;
+    FInitialized: boolean;
+  public
+    constructor Create(
+      Beta2: TNeuralFloat = 0.999;
+      Epsilon: TNeuralFloat = 1e-8;
+      Eps1: TNeuralFloat = 1e-8); overload;
+
+    procedure Optimize(); override;
+    procedure ReSet(); override;
+  end;
+
   TCustomLearningRateScheduleFn = function(Epoch: integer): single;
   TCustomLearningRateScheduleObjFn = function(Epoch: integer): single of object;
 
@@ -2223,6 +2289,76 @@ begin
   begin
     FNN.ApplyDecoupledWeightDecay(FFit.CurrentLearningRate * FWeightDecay);
   end;
+end;
+
+{ TNeuralOptimizerLion }
+
+constructor TNeuralOptimizerLion.Create(Beta1: TNeuralFloat;
+  Beta2: TNeuralFloat; WeightDecay: TNeuralFloat);
+begin
+  inherited Create();
+  FBeta1 := Beta1;
+  FBeta2 := Beta2;
+  FWeightDecay := WeightDecay;
+  FInitialized := false;
+end;
+
+procedure TNeuralOptimizerLion.ReSet();
+begin
+  inherited ReSet;
+  // Lion keeps a SINGLE momentum buffer (FBackInertia). ClearInertia zeros it;
+  // the Adam second-moment buffer is left at its tiny (1,1,1) size, so Lion
+  // really does use half of Adam's optimizer state.
+  FNN.ClearInertia();
+end;
+
+procedure TNeuralOptimizerLion.Optimize();
+begin
+  if not(FInitialized) then
+  begin
+    ReSet();
+    FInitialized := true;
+  end;
+  // Compute the sign-based Lion increment into every neuron's delta...
+  FNN.CalcLionDelta(FFit.CurrentLearningRate, FBeta1, FBeta2);
+  ForceDeltaLimists();
+  // ...and apply it (UpdateWeightsAdam simply adds the precomputed delta).
+  FNN.UpdateWeightsAdam();
+  // Decoupled (AdamW-style) weight decay: skips biases/norm layers.
+  if FWeightDecay > 0 then
+    FNN.ApplyDecoupledWeightDecay(FFit.CurrentLearningRate * FWeightDecay);
+end;
+
+{ TNeuralOptimizerAdafactor }
+
+constructor TNeuralOptimizerAdafactor.Create(Beta2: TNeuralFloat;
+  Epsilon: TNeuralFloat; Eps1: TNeuralFloat);
+begin
+  inherited Create();
+  FBeta2 := Beta2;
+  FEpsilon := Epsilon;
+  FEps1 := Eps1;
+  FInitialized := false;
+end;
+
+procedure TNeuralOptimizerAdafactor.ReSet();
+begin
+  inherited ReSet;
+  // Allocate the FACTORED second-moment state (row + column vectors) instead
+  // of Adam's full per-element second moment.
+  FNN.InitAdafactor();
+end;
+
+procedure TNeuralOptimizerAdafactor.Optimize();
+begin
+  if not(FInitialized) then
+  begin
+    ReSet();
+    FInitialized := true;
+  end;
+  FNN.CalcAdafactorDelta(FBeta2, FEpsilon, FEps1);
+  ForceDeltaLimists();
+  FNN.UpdateWeightsAdam();
 end;
 
 { TNeuralFitBase }

@@ -27,6 +27,9 @@ type
     // Optimizer tests
     procedure TestSGDOptimizer;
     procedure TestAdamOptimizer;
+    procedure TestLionOptimizer;
+    procedure TestAdafactorOptimizer;
+    procedure TestAdafactorUsesFewerBuffersThanAdam;
     
     // Gradient checking
     procedure TestGradientNotZero;
@@ -653,6 +656,146 @@ begin
     NN.Free;
     Input.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestLionOptimizer;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  I: integer;
+  InitialError, FinalError: TNeuralFloat;
+begin
+  // Drives the actual Lion update path (TNNet.CalcLionDelta -> UpdateWeightsAdam)
+  // exactly as TNeuralOptimizerLion.Optimize does, minus the fit-level clipping.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  Desired := TNNetVolume.Create(2, 1, 1);
+  try
+    NN.AddLayer([
+      TNNetInput.Create(4),
+      TNNetFullConnectReLU.Create(8),
+      TNNetFullConnectLinear.Create(2)
+    ]);
+    NN.SetLearningRate(0.01, 0.9);
+    NN.SetBatchUpdate(true); // optimizer mode: backprop accumulates into Delta
+    NN.ClearInertia();       // Lion init: single momentum buffer zeroed.
+
+    Input.Fill(0.5);
+    Desired.Fill(0.8);
+
+    NN.Compute(Input);
+    InitialError := NN.GetLastLayer.Output.SumDiff(Desired);
+
+    for I := 1 to 100 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+      NN.CalcLionDelta(0.01, 0.9, 0.99);
+      NN.UpdateWeightsAdam();
+    end;
+
+    NN.Compute(Input);
+    FinalError := NN.GetLastLayer.Output.SumDiff(Desired);
+
+    AssertTrue('Lion should reduce error', FinalError < InitialError);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestAdafactorOptimizer;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  I: integer;
+  InitialError, FinalError: TNeuralFloat;
+begin
+  // Drives the actual Adafactor update path (InitAdafactor -> CalcAdafactorDelta
+  // -> UpdateWeightsAdam), the same sequence TNeuralOptimizerAdafactor uses.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 3);
+  Desired := TNNetVolume.Create(2, 1, 1);
+  try
+    NN.AddLayer([
+      TNNetInput.Create(8, 8, 3),
+      TNNetConvolutionReLU.Create(4, 3, 0, 1), // 3x3x3 factorable kernels
+      TNNetFullConnectLinear.Create(2)
+    ]);
+    NN.SetLearningRate(0.01, 0.9);
+    NN.SetBatchUpdate(true); // optimizer mode: backprop accumulates into Delta
+    NN.InitAdafactor();
+
+    Input.Fill(0.5);
+    Desired.Fill(0.8);
+
+    NN.Compute(Input);
+    InitialError := NN.GetLastLayer.Output.SumDiff(Desired);
+
+    for I := 1 to 80 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+      NN.CalcAdafactorDelta(0.999, 1e-8, 1e-8);
+      NN.UpdateWeightsAdam();
+    end;
+
+    NN.Compute(Input);
+    FinalError := NN.GetLastLayer.Output.SumDiff(Desired);
+
+    AssertTrue('Adafactor should reduce error', FinalError < InitialError);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestAdafactorUsesFewerBuffersThanAdam;
+var
+  AdamNN, FactorNN: TNNet;
+  N: TNNetNeuron;
+  AdamSecondMoment, FactoredState, FullWeights: integer;
+begin
+  // A 3x3 convolution over a depth-3 input gives each neuron a 3x3x3 = 27-element
+  // weight matrix that factors as R=SizeX=3 rows x C=9 cols. Adam needs a full
+  // 27-element second moment per neuron; Adafactor needs only R+C = 12 scalars.
+  AdamNN := TNNet.Create();
+  FactorNN := TNNet.Create();
+  try
+    AdamNN.AddLayer([
+      TNNetInput.Create(8, 8, 3),
+      TNNetConvolutionLinear.Create(4, 3, 0, 1)
+    ]);
+    FactorNN.AddLayer([
+      TNNetInput.Create(8, 8, 3),
+      TNNetConvolutionLinear.Create(4, 3, 0, 1)
+    ]);
+    AdamNN.SetLearningRate(0.01, 0.9);
+    FactorNN.SetLearningRate(0.01, 0.9);
+
+    AdamNN.Layers[1].InitAdam(0.9, 0.999, 1e-8);
+    FactorNN.InitAdafactor();
+
+    // First neuron of the trainable convolution layer (layer index 1).
+    N := AdamNN.Layers[1].Neurons[0];
+    FullWeights := N.Weights.Size;
+    AdamSecondMoment := N.BackInertia2.Size; // full per-element second moment
+
+    N := FactorNN.Layers[1].Neurons[0];
+    // Factored state = row vector (BackInertia) + col vector (BackInertia2).
+    FactoredState := N.BackInertia.Size + N.BackInertia2.Size;
+
+    AssertEquals('Full weight matrix has 27 elements', 27, FullWeights);
+    AssertEquals('Adam second moment is full size (27)', 27, AdamSecondMoment);
+    AssertEquals('Adafactor factored state is R+C = 12', 12, FactoredState);
+    AssertTrue('Adafactor uses fewer second-moment scalars than Adam',
+      FactoredState < AdamSecondMoment);
+  finally
+    AdamNN.Free;
+    FactorNN.Free;
   end;
 end;
 

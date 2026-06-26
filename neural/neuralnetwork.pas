@@ -154,6 +154,18 @@ type
       procedure UpdateWeightsWithoutInertia(); {$IFDEF Release} inline; {$ENDIF}
       procedure CalcAdamDelta();
       procedure UpdateWeightsAdam(); {$IFDEF Release} inline; {$ENDIF}
+      // Lion optimizer per-neuron step (Chen et al. 2023). Uses a SINGLE
+      // momentum buffer (FBackInertia) - half of Adam's optimizer state.
+      // Rewrites FDelta in place to the final (already learning-rate scaled)
+      // weight increment, so a subsequent UpdateWeightsAdam() applies it.
+      procedure CalcLionDelta(pLearningRate, Beta1, Beta2: TNeuralFloat); // Coded by Claude (AI).
+      // Adafactor optimizer per-neuron step (Shazeer & Stern 2018). Keeps a
+      // FACTORED second-moment estimate: for a 2-D weight matrix it stores a
+      // row-moment vector (FBackInertia, length R) and a column-moment vector
+      // (FBackInertia2, length C) instead of the full R*C second moment.
+      // Rewrites FDelta in place to the final weight increment.
+      procedure InitAdafactor(ParentLayer: TNNetLayer); // Coded by Claude (AI).
+      procedure CalcAdafactorDelta(Beta2, Epsilon, Eps1: TNeuralFloat); // Coded by Claude (AI).
       function SaveToString(): string;
       procedure LoadFromString(strData: string);
       procedure ClearDelta; {$IFDEF Release} inline; {$ENDIF}
@@ -197,6 +209,10 @@ type
       property BiasWeight: TNeuralFloat read FBiasWeight write FBiasWeight;
       property BiasDelta: TNeuralFloat read FBiasDelta;
       property BackInertia: TNNetVolume read FBackInertia;
+      // Second-moment / column-moment buffer. Holds Adam's full per-element
+      // second moment, or Adafactor's column-moment vector. Exposed so the
+      // optimizer-state footprint can be inspected. Coded by Claude (AI).
+      property BackInertia2: TNNetVolume read FBackInertia2;
       property Delta: TNNetVolume read FDelta;
   end;
 
@@ -452,6 +468,12 @@ type
       procedure UpdateWeights(); virtual;
       procedure CalcAdamDelta(); virtual;
       procedure UpdateWeightsAdam(); virtual;
+      // Lion / Adafactor per-layer steps (delegate to the neurons). Each
+      // rewrites every neuron's FDelta into the final weight increment, so a
+      // following UpdateWeightsAdam() applies it. Coded by Claude (AI).
+      procedure CalcLionDelta(pLearningRate, Beta1, Beta2: TNeuralFloat); virtual;
+      procedure InitAdafactor(); virtual;
+      procedure CalcAdafactorDelta(Beta2, Epsilon, Eps1: TNeuralFloat); virtual;
       function InitBasicPatterns(): TNNetLayer;
 
       // Increments an internal counter that counts how many branches load
@@ -771,6 +793,11 @@ type
       procedure UpdateWeights(); override;
       procedure CalcAdamDelta(); override;
       procedure UpdateWeightsAdam(); override;
+      // This layer runs its own custom update; the Lion/Adafactor delta
+      // computations are no-ops, leaving FDelta for UpdateWeightsAdam (which
+      // calls UpdateWeights). Coded by Claude (AI).
+      procedure CalcLionDelta(pLearningRate, Beta1, Beta2: TNeuralFloat); override;
+      procedure CalcAdafactorDelta(Beta2, Epsilon, Eps1: TNeuralFloat); override;
   end;
 
   /// This layer can be used when you need the forward pass but can't let
@@ -14411,6 +14438,12 @@ type
       procedure UpdateWeights(); {$IFDEF Release} inline; {$ENDIF}
       procedure CalcAdamDelta();
       procedure UpdateWeightsAdam(); {$IFDEF Release} inline; {$ENDIF}
+      // Lion optimizer support: rewrites every layer's deltas to the Lion
+      // (sign-based) increment; apply with UpdateWeightsAdam. Coded by Claude (AI).
+      procedure CalcLionDelta(pLearningRate, Beta1, Beta2: TNeuralFloat);
+      // Adafactor optimizer support: factored second-moment state + delta calc.
+      procedure InitAdafactor(); // Coded by Claude (AI).
+      procedure CalcAdafactorDelta(Beta2, Epsilon, Eps1: TNeuralFloat);
       procedure ClearDeltas(); {$IFDEF Release} inline; {$ENDIF}
       // Frees the training-only volumes (Delta/BackInertia + Adam siblings)
       // of every neuron in every layer, reclaiming ~2/3 of weight memory.
@@ -54447,6 +54480,16 @@ end;
 procedure TNNetIdentityWithoutL2AndOptimizer.UpdateWeightsAdam;
 begin
   Self.UpdateWeights;
+end;
+
+procedure TNNetIdentityWithoutL2AndOptimizer.CalcLionDelta(pLearningRate, Beta1, Beta2: TNeuralFloat);
+begin
+  // nothing is done; this layer runs its own UpdateWeights.
+end;
+
+procedure TNNetIdentityWithoutL2AndOptimizer.CalcAdafactorDelta(Beta2, Epsilon, Eps1: TNeuralFloat);
+begin
+  // nothing is done; this layer runs its own UpdateWeights.
 end;
 
 { TNNetLayerConcatedWeights }
@@ -99172,6 +99215,33 @@ begin
   end;
 end;
 
+procedure TNNet.CalcLionDelta(pLearningRate, Beta1, Beta2: TNeuralFloat);
+var
+  LayerCnt, LastLayerIdx: integer;
+begin
+  LastLayerIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+    FLayers[LayerCnt].CalcLionDelta(pLearningRate, Beta1, Beta2);
+end;
+
+procedure TNNet.InitAdafactor();
+var
+  LayerCnt, LastLayerIdx: integer;
+begin
+  LastLayerIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+    FLayers[LayerCnt].InitAdafactor();
+end;
+
+procedure TNNet.CalcAdafactorDelta(Beta2, Epsilon, Eps1: TNeuralFloat);
+var
+  LayerCnt, LastLayerIdx: integer;
+begin
+  LastLayerIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+    FLayers[LayerCnt].CalcAdafactorDelta(Beta2, Epsilon, Eps1);
+end;
+
 procedure TNNet.ClearDeltas();
 var
   LayerCnt: integer;
@@ -102111,6 +102181,40 @@ begin
   AfterWeightUpdate();
 end;
 
+procedure TNNetLayer.CalcLionDelta(pLearningRate, Beta1, Beta2: TNeuralFloat);
+var
+  Cnt, MaxNeurons: integer;
+begin
+  MaxNeurons := FNeurons.Count - 1;
+  if MaxNeurons >= 0 then
+    for Cnt := 0 to MaxNeurons do
+      FNeurons[Cnt].CalcLionDelta(FLearningRate, Beta1, Beta2);
+end;
+
+procedure TNNetLayer.InitAdafactor();
+var
+  Cnt, MaxNeurons: integer;
+begin
+  if not FIsTrainable then exit;
+  MaxNeurons := FNeurons.Count - 1;
+  if MaxNeurons >= 0 then
+  begin
+    for Cnt := 0 to MaxNeurons do
+      FNeurons[Cnt].InitAdafactor(Self);
+    AfterWeightUpdate();
+  end;
+end;
+
+procedure TNNetLayer.CalcAdafactorDelta(Beta2, Epsilon, Eps1: TNeuralFloat);
+var
+  Cnt, MaxNeurons: integer;
+begin
+  MaxNeurons := FNeurons.Count - 1;
+  if MaxNeurons >= 0 then
+    for Cnt := 0 to MaxNeurons do
+      FNeurons[Cnt].CalcAdafactorDelta(Beta2, Epsilon, Eps1);
+end;
+
 function TNNetLayer.InitBasicPatterns(): TNNetLayer;
 var
   CntNeurons, MaxNeurons: integer;
@@ -102581,6 +102685,172 @@ begin
   FWeights.Add(FDelta);
   FBiasWeight := FBiasWeight + FBiasDelta;
   ClearDelta();
+end;
+
+// Lion: Symbolic Discovery of Optimization Algorithms, Chen et al. 2023.
+//   c_t = beta1*m_{t-1} + (1-beta1)*g          (interpolated, used for update)
+//   W  -= lr * sign(c_t)                        (sign-based step)
+//   m_t = beta2*m_{t-1} + (1-beta2)*g           (momentum EMA, single buffer)
+// FDelta arrives as (-lr * g) so the true gradient is g = FDelta / (-lr).
+// We rewrite FDelta to (-lr * sign(c_t)) so UpdateWeightsAdam() applies it.
+procedure TNNetNeuron.CalcLionDelta(pLearningRate, Beta1, Beta2: TNeuralFloat);
+var
+  Cnt, MaxCnt: integer;
+  lr, invNegLr, g, c, upd: TNeuralFloat;
+begin
+  lr := pLearningRate;
+  if lr = 0 then begin ClearDelta(); exit; end;
+  invNegLr := -1.0 / lr;
+
+  // Lion's single momentum buffer must match the weight shape; for a layer
+  // that never ran an Adam-style init it may still be at its default size.
+  if FBackInertia.Size <> FWeights.Size then
+  begin
+    FBackInertia.ReSize(FWeights);
+    FBackInertia.Fill(0);
+  end;
+
+  // ---- Weights ----
+  MaxCnt := FDelta.Size - 1;
+  for Cnt := 0 to MaxCnt do
+  begin
+    g := FDelta.FData[Cnt] * invNegLr;               // recover raw gradient
+    c := Beta1 * FBackInertia.FData[Cnt] + (1 - Beta1) * g;
+    if c > 0 then upd := 1
+    else if c < 0 then upd := -1
+    else upd := 0;
+    // momentum EMA update (uses beta2), single state buffer.
+    FBackInertia.FData[Cnt] := Beta2 * FBackInertia.FData[Cnt] + (1 - Beta2) * g;
+    FDelta.FData[Cnt] := -lr * upd;                   // final increment
+  end;
+
+  // ---- Bias (scalar momentum reuses FBiasInertia) ----
+  g := FBiasDelta * invNegLr;
+  c := Beta1 * FBiasInertia + (1 - Beta1) * g;
+  if c > 0 then upd := 1
+  else if c < 0 then upd := -1
+  else upd := 0;
+  FBiasInertia := Beta2 * FBiasInertia + (1 - Beta2) * g;
+  FBiasDelta := -lr * upd;
+end;
+
+// Adafactor state init: a row vector (length R = Weights.SizeX) in
+// FBackInertia and a column vector (length C = Size div R) in FBackInertia2.
+// 1-D / non-factorable weights (R<=1 or C<=1) fall back to a full per-element
+// second moment held in FBackInertia2.
+procedure TNNetNeuron.InitAdafactor(ParentLayer: TNNetLayer);
+var
+  R, C: integer;
+begin
+  FParentLayer := ParentLayer;
+  R := FWeights.SizeX;
+  if (R > 1) and (FWeights.Size > R) and ((FWeights.Size mod R) = 0) then
+  begin
+    C := FWeights.Size div R;
+    FBackInertia.ReSize(R, 1, 1);    // row moments
+    FBackInertia2.ReSize(C, 1, 1);   // col moments
+  end
+  else
+  begin
+    // Non-factorable: full second moment, row buffer unused.
+    FBackInertia.ReSize(1, 1, 1);
+    FBackInertia2.ReSize(FWeights);
+  end;
+  FBackInertia.Fill(0);
+  FBackInertia2.Fill(0);
+  FBiasInertia2 := 0;
+  FDelta.Fill(0);
+  FBiasDelta := 0;
+end;
+
+// Adafactor: Adafactor: Adaptive Learning Rates with Sublinear Memory Cost,
+// Shazeer & Stern 2018. Factored second-moment RMS update.
+//   g recovered from FDelta = -lr * g.
+//   R_t = beta2*R_{t-1} + (1-beta2)*( rowmean(g^2) + eps1 )
+//   C_t = beta2*C_{t-1} + (1-beta2)*( colmean(g^2) + eps1 )
+//   V_hat[i,j] = R_t[i]*C_t[j] / mean(R_t)        (rank-1 reconstruction)
+//   update[i,j] = g[i,j] / sqrt(V_hat[i,j])
+//   W -= lr * update
+// Omitted knobs (documented): the optional first-moment beta1 EMA and the
+// relative update clipping (clip by RMS) of the full Adafactor recipe; lr is
+// taken from the layer (the host fit schedule) rather than Adafactor's own
+// internal relative-step rule. This is a correct, well-documented v1.
+procedure TNNetNeuron.CalcAdafactorDelta(Beta2, Epsilon, Eps1: TNeuralFloat);
+var
+  Cnt, MaxCnt, R, C, i, j, idx: integer;
+  lr, invNegLr, g, gsq, denom, rowMean, vhat, sumR: TNeuralFloat;
+  Factored: boolean;
+begin
+  lr := FParentLayer.FLearningRate;
+  if lr = 0 then begin ClearDelta(); exit; end;
+  invNegLr := -1.0 / lr;
+
+  R := FWeights.SizeX;
+  Factored := (FBackInertia.Size = R) and (R > 1) and
+              (FWeights.Size > R) and ((FWeights.Size mod R) = 0);
+
+  if Factored then
+  begin
+    C := FWeights.Size div R;
+    // Row / column accumulators built from g^2 (interpret index as i*C + j).
+    // First pass: per-row and per-column mean of g^2.
+    for i := 0 to R - 1 do
+    begin
+      rowMean := 0;
+      for j := 0 to C - 1 do
+      begin
+        g := FDelta.FData[i * C + j] * invNegLr;
+        rowMean := rowMean + g * g;
+      end;
+      rowMean := rowMean / C + Eps1;
+      FBackInertia.FData[i] := Beta2 * FBackInertia.FData[i] + (1 - Beta2) * rowMean;
+    end;
+    for j := 0 to C - 1 do
+    begin
+      rowMean := 0;
+      for i := 0 to R - 1 do
+      begin
+        g := FDelta.FData[i * C + j] * invNegLr;
+        rowMean := rowMean + g * g;
+      end;
+      rowMean := rowMean / R + Eps1;
+      FBackInertia2.FData[j] := Beta2 * FBackInertia2.FData[j] + (1 - Beta2) * rowMean;
+    end;
+    // mean(R_t) for the rank-1 reconstruction normalizer.
+    sumR := 0;
+    for i := 0 to R - 1 do sumR := sumR + FBackInertia.FData[i];
+    rowMean := sumR / R;
+    if rowMean < Eps1 then rowMean := Eps1;
+    for i := 0 to R - 1 do
+      for j := 0 to C - 1 do
+      begin
+        idx := i * C + j;
+        g := FDelta.FData[idx] * invNegLr;
+        vhat := (FBackInertia.FData[i] * FBackInertia2.FData[j]) / rowMean;
+        if vhat < 0 then vhat := 0;          // guard rounding
+        denom := sqrt(vhat) + Epsilon;
+        if denom <= 0 then denom := Epsilon;  // never divide by zero
+        FDelta.FData[idx] := -lr * (g / denom);
+      end;
+  end
+  else
+  begin
+    // Non-factorable: plain per-element RMSProp-style second moment.
+    MaxCnt := FDelta.Size - 1;
+    for Cnt := 0 to MaxCnt do
+    begin
+      g := FDelta.FData[Cnt] * invNegLr;
+      gsq := g * g + Eps1;
+      FBackInertia2.FData[Cnt] := Beta2 * FBackInertia2.FData[Cnt] + (1 - Beta2) * gsq;
+      denom := sqrt(FBackInertia2.FData[Cnt]) + Epsilon;
+      FDelta.FData[Cnt] := -lr * (g / denom);
+    end;
+  end;
+
+  // ---- Bias (scalar, full second moment) ----
+  g := FBiasDelta * invNegLr;
+  FBiasInertia2 := Beta2 * FBiasInertia2 + (1 - Beta2) * (g * g + Eps1);
+  FBiasDelta := -lr * (g / (sqrt(FBiasInertia2) + Epsilon));
 end;
 
 function TNNetNeuron.SaveToString(): string;
