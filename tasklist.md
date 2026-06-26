@@ -527,14 +527,26 @@ rather than acted on.
       restore swap) on TNNetEMAWrapper; TNNetSWAWrapper already exists too, so
       SWA is mostly a matter of wiring that wrapper into TNeuralFitBase reusing
       the same Apply/Restore swap plumbing.
-- [ ] Optimizer zoo expansion (only SGD/Adam/AdamW exist today):
-      Adafactor (factored second-moment estimate, drastically less optimizer
-      state — pairs with the "run big imported models on commodity RAM"
-      quantization theme), Lion (sign-based update, single momentum buffer,
-      half of Adam's state), and optionally Muon for 2-D weight matrices
-      (a hand-rolled Muon gradient-surgery demo already exists in
-      examples/MuonOptimizer; the optimizer-class port is what's missing).
-      Each is a small TNeuralOptimizer subclass in neuralfit.pas.
+- [ ] Optimizer zoo expansion (SGD/Adam/AdamW + Lion + Adafactor exist now):
+      Lion + Adafactor DONE (commit 89da1f9). TNeuralOptimizerLion (Chen et al.
+      2023, sign-based update with ONE momentum buffer vs Adam's two; decoupled
+      AdamW-style weight decay via TNNet.ApplyDecoupledWeightDecay) and
+      TNeuralOptimizerAdafactor (Shazeer & Stern 2018, factored R+C second-moment
+      vectors vs Adam's R*C — 12<27 buffers proven for a 3x3x3 kernel; full
+      per-element fallback for 1-D/non-factorable params) added to neuralfit.pas,
+      with the per-neuron math in neuralnetwork.pas mirroring the
+      CalcAdamDelta/UpdateWeightsAdam chain. Both require SetBatchUpdate(True)
+      (TNeuralFit already sets it). Tests TestLionOptimizer / TestAdafactorOptimizer
+      / TestAdafactorUsesFewerBuffersThanAdam (convergence + buffer count); full
+      suite 0/0. Adafactor knobs deliberately omitted (documented in the class
+      header): optional first-moment beta1 EMA + update RMS clipping; LR comes from
+      the host fit schedule, not Adafactor's internal relative-step rule.
+      REMAINING:
+  - [ ] Muon optimizer class for 2-D weight matrices (a hand-rolled Muon
+        gradient-surgery demo already exists in examples/MuonOptimizer; the
+        TNeuralOptimizer subclass port is what's missing).
+  - [ ] optional Adafactor follow-up: the omitted first-moment beta1 EMA + update
+        RMS clipping + internal relative-step LR rule if a real fine-tune needs them.
 - [ ] Trainer callbacks API (transformers TrainerCallback port): a
       TNeuralFitCallback with OnEpochBegin/End, OnStepEnd, OnEvaluate hooks
       registered on TNeuralFitBase. Early stopping, custom logging, and the
@@ -690,17 +702,34 @@ rather than acted on.
       arrays (not via TNNet layers), and those inner loops are currently scalar
       Pascal. After the EnCodec LSTM was AVX'd (~12.9x, real-T4 profiled), the 1D
       convolutions became the dominant cost of audio decode, so this is the next
-      profiled bottleneck rather than a speculative optimization. Channel-major
-      layout means the contraction (sum over in-channels for a fixed kernel tap)
-      is depth-axis-contiguous — exactly the case `TNNetVolume.DotProduct` /
-      `MulAdd` already vectorize — so the win is reusing the existing AVX volume
-      primitives (or a small im2col-into-DotProduct reshape) for the per-tap
-      accumulation instead of triple-nested scalar loops. Gate on the existing
-      parity tests (TestHiFiGANSynthesisParity / TestVitsSynthesisParity /
-      EnCodec round-trip) staying `< 1e-4` so the rewrite is provably behavior-
-      preserving, and re-profile decode wall-clock before/after. OpenCL offload of
-      the same accumulation (via the shared dot-product kernel, like FullConnect /
-      Convolution already do) is the optional follow-up once the AVX path lands.
+      profiled bottleneck rather than a speculative optimization.
+      FORWARD conv1d DONE (commit 8e15052): EnCodec (RunEnCodecConv serial +
+      threaded TEnCodecConvWorker — covers TEnCodecModel + MusicGen EnCodec decode)
+      and HiFiGAN/Vits (RunHiFiGANConv — covers TNNetHiFiGAN and the nested Vits
+      decoder) now gather an im2col receptive-field patch (size InCh*K) per output
+      position and run each output channel as one contiguous TNNetVolume.DotProduct;
+      all 17 audio parity tests stay < 1e-4 on both scalar-fallback and real -dAVX2
+      builds. REMAINING:
+  - [ ] ConvTranspose1d (upsample) paths — left SCALAR: the scatter/overlap-add
+        accumulation doesn't fit DotProduct's gather structure. These are the
+        DOMINANT cost of audio DECODE (the upsampling stages), so a col2im/gather
+        reformulation (or a transposed-im2col) is the highest-value remaining win.
+  - [ ] TNNetMimi (RunMimiConv) — left scalar: it uses a DOUBLE-precision
+        accumulator (TMimiDblArr2D); single-precision AVX DotProduct would be a
+        genuine precision regression vs a benign reassociation. Needs a
+        double-accumulate vectorized primitive or a parity re-pin before touching.
+  - [ ] OpenCL offload of the same accumulation (via the shared dot-product
+        kernel, like FullConnect/Convolution) — optional follow-up after the AVX
+        ConvTranspose1d path lands.
+      Design note (the landed forward path follows this): channel-major layout
+      means the contraction (sum over in-channels for a fixed kernel tap) is
+      depth-axis-contiguous — exactly the case `TNNetVolume.DotProduct` / `MulAdd`
+      already vectorize — so the win is reusing the existing AVX volume primitives
+      (or a small im2col-into-DotProduct reshape) for the per-tap accumulation
+      instead of triple-nested scalar loops. Gate any remaining rewrite on the
+      existing parity tests (TestHiFiGANSynthesisParity / TestVitsSynthesisParity /
+      EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
+      before/after.
 - [ ] VITS / MMS-TTS end-to-end text-to-speech importer (`BuildVitsFromSafeTensors[Ex]`
       LANDED + `ReadVitsConfigFromJSONFile`/`VitsConfigToString` + the `TVitsConfig`
       record + the `TNNetVits` channel-major holder (Analyze / ExpandPrior /
@@ -811,24 +840,62 @@ rather than acted on.
         real-data accuracy number (the synthetic smoke is trivially separable —
         validation saturates at epoch 2 — so it proves the path, not a hard
         benchmark).
-  - [ ] a harder synthetic task (overlapping classes / lower SNR / more keywords)
+  - [X] a harder synthetic task (overlapping classes / lower SNR / more keywords)
         so the smoke trains for more than ~2 epochs before validation hits the
-        default TargetAccuracy and early-stops.
-  - [ ] a 16 kHz resampler in neuralaudio so `--full` accepts non-16 kHz WAVs
-        directly instead of requiring an ffmpeg pre-pass.
-- [ ] KV-cache O(1) incremental decode for the Moonshine decoder (self-attn cache +
+        default TargetAccuracy and early-stops. DONE (commit 1e3cbfc): 6 -> 10
+        confusable classes (closely-spaced 430/470/510 Hz tones, two overlapping
+        two-tone chords, an AM tremolo tone, fast up/down chirps, two colored-noise
+        tilts) at low SNR (noiseAmp 0.18); validation now climbs gradually and
+        early-stops at epoch 17 (was ~2); held-out test acc 98.93% (chance 10%),
+        ~1m50s within ulimit -v 3000000.
+  - [X] a 16 kHz resampler in neuralaudio so `--full` accepts non-16 kHz WAVs
+        directly instead of requiring an ffmpeg pre-pass. DONE (commit 1e3cbfc):
+        windowed-sinc (Lanczos, 4-lobe) ResampleVolume / ResampleVolumeTo16k /
+        LoadWavResampledToVolume in neuralaudio.pas (downsample cutoff folds in the
+        anti-alias low-pass; equal-rate is a bit-identical Move fast path);
+        WhisperLogMelFromWavFile gained an opt-out Resample param; --full now uses
+        LoadWavResampledToVolume so any sample rate loads. 4 tests in
+        TestNeuralAudio (identity, 44.1k->16k length, 8k->16k 2x, 440 Hz
+        zero-crossing preservation, disk round-trip); suite 2277/0/0.
+- [X] KV-cache O(1) incremental decode for the Moonshine decoder (self-attn cache +
       cross-attn states are constant across steps; reuse the SDPA Begin/EndIncrementalDecode
-      machinery) so long transcripts don't re-run the whole prefix each step.
+      machinery) so long transcripts don't re-run the whole prefix each step. DONE
+      (commit 3b5430f): DecodeMoonshineGreedyCached in neural/neuraldecode.pas — a
+      focused reusable helper built on the existing TNNetStreamingDecoder session
+      API (no new class, no SDPA changes). Encode the waveform once, copy encoder
+      hidden states into the decoder's 2nd TNNetInput (constant -> cross-attn
+      re-reads unchanged), arm every self-attn SDPA's incremental KV cache +
+      partial-RoPE PositionOffset, prefill the start token at abs-pos 0, then feed
+      one new token per step. CRITICAL: the cached decoder must be built at
+      DecSeqLen=1 (width-1 token input) or TNNet.Compute rejects the step volume;
+      the helper raises EArgumentException otherwise. Bit-identical to the old
+      O(L^2) re-encode loop (TestMoonshineKVCacheDecodeParity, token-for-token);
+      wired into examples/MoonshineTranscribe.
+      OPEN follow-up: a GENERAL forced-prefix seq2seq decode + decoder KV cache
+      helper (this one is Moonshine-specific because the audio encoder takes a raw
+      waveform, not token ids, so DecodeSeq2SeqGreedy's token path doesn't apply) —
+      see the Whisper-style "Forced-prefix seq2seq decode + KV cache" task above.
 - [ ] Whisper word-timestamp follow-ups (v1 landed, scoped to one 30 s
-      greedy window): (a) median-filter smoothing of the score matrix before DTW
-      (openai-whisper's `median_filter`, default kernel 7) to suppress single-
-      frame spikes; (b) multi-window stitching for clips > 30 s (carry the
-      running time offset and merge the per-window word lists); (c) baked-in
-      alignment heads for the medium/large shapes + reading
-      generation_config.alignment_heads when present (v1 hardcodes tiny/base/small
-      and falls back to all-heads otherwise); (d) wire it into
-      examples/WhisperTranscribe behind a `--word-timestamps` flag and document
-      in examples/README; (e) optional per-word confidence (mean path attention).
+      greedy window). DONE in commit d0b27b9: (a)(e)(d) + partial (c) —
+      (a) median-filter smoothing (WhisperMedianFilterRow, odd-kernel reflect-
+      padded median along the audio-frame axis; optional MedianKernel param on
+      WhisperCollectCrossAttention + WhisperWordTimestamps, default 0 = disabled =
+      bit-identical to v1, 7 = openai-whisper default); (e) per-word confidence
+      (Confidence: TNeuralFloat field on TWhisperWordTimestamp = mean DTW-path
+      attention over the word's frame segment); (d) examples/WhisperTranscribe
+      `--word-timestamps` flag printing `start - end [confidence] word`, documented
+      in both READMEs; (c partial) baked-in alignment heads added for medium
+      (24L/16H) and large (32L/20H) shapes. Tests in TestWhisperWordTimestamps
+      (kernel-1 bit-identical to no-smoothing, kernel-7 monotonic non-decreasing
+      boundaries + valid prob rows, confidence in [0,1.0001], non-empty
+      medium/large head lists); suite 2273/0/0; example compiles (not run e2e — no
+      checkpoint). REMAINING:
+  - [ ] (b) multi-window stitching for clips > 30 s (carry the running time offset
+        and merge the per-window word lists).
+  - [ ] (c rest) read `generation_config.alignment_heads` from arbitrary model
+        configs when present (v1 still hardcodes the curated tiny/base/small/medium/
+        large head lists and falls back to all-heads otherwise; no config-plumbing
+        + fixture yet).
 - [ ] Speaker diarization importer (`BuildPyannoteSegmentationFromSafeTensors[Ex]` +
       `TPyannoteConfig`/`ReadPyannoteConfigFromJSONFile`, model_type `pyannote`) — LANDED.
       New leaf layer `TNNetSincConv1D` (SincNet band-pass, kernels materialized from two
