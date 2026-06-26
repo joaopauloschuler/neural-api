@@ -55662,6 +55662,124 @@ begin
   Layer.FlushWeightCache();
 end;
 
+// Loads a HF Conv2d (weight [OutCh,InCh,K,K] + bias [OutCh]) into a CAI
+// TNNetConvolutionLinear whose neuron o stores weights depth-contiguous as
+// FData[(ky*K + kx)*InCh + c] = W[o, c, ky, kx] and BiasWeight = bias[o]. Used
+// by the CLIPSeg complex-transposed head's leading 3x3 same-conv. The CAI X
+// axis is torch width/column (kx == kw), Y is torch height/row (ky == kh).
+// Coded by Claude (AI).
+procedure LoadCLIPSegConv2d(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string; OutCh, InCh, K: integer);
+var
+  W, B: TNNetVolume;
+  o, c, ky, kx: integer;
+  OutChM1, InChM1, KM1: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('CLIPSeg import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 4) or
+     (Reader.DimSize(WName, 0) <> OutCh) or
+     (Reader.DimSize(WName, 1) <> InCh) or
+     (Reader.DimSize(WName, 2) <> K) or
+     (Reader.DimSize(WName, 3) <> K) then
+    ImportError('CLIPSeg import: "' + WName + '" must have shape [' +
+      IntToStr(OutCh) + ', ' + IntToStr(InCh) + ', ' + IntToStr(K) + ', ' +
+      IntToStr(K) + '] (nn.Conv2d [out,in,kh,kw]), got ' +
+      Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> OutCh then
+    ImportError('CLIPSeg import: internal error - conv "' + WName +
+      '" target has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutCh) + '.');
+  if Layer.FArrNeurons[0].Weights.Size <> K * K * InCh then
+    ImportError('CLIPSeg import: internal error - conv "' + WName +
+      '" target neuron has ' + IntToStr(Layer.FArrNeurons[0].Weights.Size) +
+      ' weights, expected ' + IntToStr(K * K * InCh) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    Reader.LoadTensorFlat(BName, B);
+    if B.Size <> OutCh then
+      ImportError('CLIPSeg import: "' + BName + '" must have ' +
+        IntToStr(OutCh) + ' elements.');
+    OutChM1 := OutCh - 1;
+    InChM1 := InCh - 1;
+    KM1 := K - 1;
+    for o := 0 to OutChM1 do
+    begin
+      for ky := 0 to KM1 do
+        for kx := 0 to KM1 do
+          for c := 0 to InChM1 do
+            Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
+              W.FData[((o * InCh + c) * K + ky) * K + kx];
+      Layer.FArrNeurons[o].BiasWeight := B.FData[o];
+    end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free; B.Free;
+  end;
+end;
+
+// Loads a non-overlapping ConvTranspose2d(InCh, OutCh, P, stride=P) (HF weight
+// [InCh, OutCh, P, P], bias [OutCh]) into a TNNetPointwiseConvLinear(OutCh*P*P)
+// feeding a downstream TNNetDepthToSpace(P). DepthToSpace reads input depth
+// (sx*P + sy)*OutCh + oc into output cell (ix*P+sx, iy*P+sy, oc), so the
+// pointwise neuron k = (sx*P + sy)*OutCh + oc carries Weights[ic] =
+// W[ic, oc, sy, sx] and BiasWeight = bias[oc]. CAI X = torch col = sx,
+// CAI Y = torch row = sy. This generalizes LoadCLIPSegTransposedConv (which is
+// the OutCh = 1 special case) to the multi-channel stages of the complex head.
+// Coded by Claude (AI).
+procedure LoadCLIPSegTransposedConvMulti(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string; InCh, OutCh, P: integer);
+var
+  W, B: TNNetVolume;
+  ic, oc, sx, sy, k: integer;
+  InChM1, OutChM1, PM1: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('CLIPSeg import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 4) or
+     (Reader.DimSize(WName, 0) <> InCh) or
+     (Reader.DimSize(WName, 1) <> OutCh) or
+     (Reader.DimSize(WName, 2) <> P) or
+     (Reader.DimSize(WName, 3) <> P) then
+    ImportError('CLIPSeg import: "' + WName + '" must have shape [' +
+      IntToStr(InCh) + ', ' + IntToStr(OutCh) + ', ' + IntToStr(P) + ', ' +
+      IntToStr(P) + '] (ConvTranspose2d [in,out,kh,kw]), got ' +
+      Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> OutCh * P * P then
+    ImportError('CLIPSeg import: internal error - transposed conv "' + WName +
+      '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutCh * P * P) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    Reader.LoadTensorFlat(BName, B);
+    if B.Size <> OutCh then
+      ImportError('CLIPSeg import: "' + BName + '" must have ' +
+        IntToStr(OutCh) + ' elements.');
+    InChM1 := InCh - 1;
+    OutChM1 := OutCh - 1;
+    PM1 := P - 1;
+    for sx := 0 to PM1 do
+      for sy := 0 to PM1 do
+        for oc := 0 to OutChM1 do
+        begin
+          k := (sx * P + sy) * OutCh + oc;
+          for ic := 0 to InChM1 do
+            Layer.FArrNeurons[k].Weights.FData[ic] :=
+              W.FData[((ic * OutCh + oc) * P + sy) * P + sx];
+          Layer.FArrNeurons[k].BiasWeight := B.FData[oc];
+        end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free; B.Free;
+  end;
+end;
+
 procedure BuildCLIPSegFromSafeTensorsWithConfig(const FileName: string;
   var Config: TCLIPSegConfig; out VisionNet, TextNet, DecoderNet: TNNet;
   TextSeqLen: integer = 0; pTrainable: boolean = true);
@@ -55678,7 +55796,8 @@ var
   // decoder
   TapInputs, ReduceLayers: array of TNNetLayer;
   CondInput, FilmMul, FilmAdd, FilmCond, Acc, Reduced, FilmOut: TNNetLayer;
-  TransConv: TNNetLayer;
+  TransConv, CplxConv, CplxT0, CplxT1: TNNetLayer;
+  CplxK: integer;
   DecRefs: array of TCLIPSegDecoderRefs;
   SeqLen, Grid, NumPatches, NumTaps, i, TapBlock, ChanCnt, NumTokens: integer;
   NumTapsM1, VisionNumLayersM1, TextNumLayersM1, VisionHiddenSizeM1: integer;
@@ -55693,8 +55812,17 @@ begin
   if (Config.PatchSize < 1) or ((Config.ImageSize mod Config.PatchSize) <> 0) then
     ImportError('CLIPSeg import: image_size not a multiple of patch_size.');
   if Config.UseComplexTransposedConv then
-    ImportError('CLIPSeg import: use_complex_transposed_convolution=true is ' +
-      'not supported yet (v1 covers the single ConvTranspose2d upsample).');
+  begin
+    // The complex head uses ConvTranspose2d kernels = patch_size // 4 and a
+    // reduce_dim // 2 mid-channel count (HF CLIPSegDecoder), so both must be
+    // exact.
+    if (Config.PatchSize mod 4) <> 0 then
+      ImportError('CLIPSeg import: use_complex_transposed_convolution=true ' +
+        'requires patch_size divisible by 4 (transposed kernel = patch//4).');
+    if (Config.ReduceDim mod 2) <> 0 then
+      ImportError('CLIPSeg import: use_complex_transposed_convolution=true ' +
+        'requires reduce_dim divisible by 2 (mid channels = reduce_dim//2).');
+  end;
   Grid := Config.ImageSize div Config.PatchSize;
   NumPatches := Grid * Grid;
   NumTokens := NumPatches + 1;
@@ -55863,10 +55991,38 @@ begin
       // the (Grid,Grid,reduce_dim) spatial map.
       NN.AddLayer( TNNetCrop.Create(1, 0, NumPatches, 1) );
       NN.AddLayer( TNNetReshape.Create(Grid, Grid, Config.ReduceDim) );
-      // Non-overlapping ConvTranspose2d(reduce_dim,1,P,stride=P).
-      TransConv := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.PatchSize * Config.PatchSize).SetTrainable(pTrainable) );
-      NN.AddLayer( TNNetDepthToSpace.Create(Config.PatchSize) );
+      TransConv := nil;
+      CplxConv := nil; CplxT0 := nil; CplxT1 := nil; CplxK := 0;
+      if Config.UseComplexTransposedConv then
+      begin
+        // Complex head (HF CLIPSegDecoder use_complex_transposed_convolution):
+        //   Conv2d(reduce_dim, reduce_dim, 3, pad=1) -> ReLU
+        //   -> ConvTranspose2d(reduce_dim, reduce_dim//2, k, stride=k) -> ReLU
+        //   -> ConvTranspose2d(reduce_dim//2, 1, k, stride=k)
+        // with k = patch_size // 4. Each non-overlapping ConvTranspose2d is a
+        // PointwiseConvLinear (OutCh*k*k channels) + TNNetDepthToSpace(k).
+        CplxK := Config.PatchSize div 4;
+        // 3x3 same-conv (pad 1, stride 1), reduce_dim -> reduce_dim.
+        CplxConv := NN.AddLayer(
+          TNNetConvolutionLinear.Create(Config.ReduceDim, 3, 1, 1).SetTrainable(pTrainable) );
+        NN.AddLayer( TNNetReLU.Create() );
+        // Stage 0: ConvTranspose2d(reduce_dim, reduce_dim//2, k, stride=k).
+        CplxT0 := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create((Config.ReduceDim div 2) * CplxK * CplxK).SetTrainable(pTrainable) );
+        NN.AddLayer( TNNetDepthToSpace.Create(CplxK) );
+        NN.AddLayer( TNNetReLU.Create() );
+        // Stage 1: ConvTranspose2d(reduce_dim//2, 1, k, stride=k).
+        CplxT1 := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(1 * CplxK * CplxK).SetTrainable(pTrainable) );
+        NN.AddLayer( TNNetDepthToSpace.Create(CplxK) );
+      end
+      else
+      begin
+        // Non-overlapping ConvTranspose2d(reduce_dim,1,P,stride=P).
+        TransConv := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.PatchSize * Config.PatchSize).SetTrainable(pTrainable) );
+        NN.AddLayer( TNNetDepthToSpace.Create(Config.PatchSize) );
+      end;
       if not pTrainable then NN.SetTrainable();
 
       // Decoder weights. reduces[i] maps to tap input i (the REVERSED order
@@ -55885,10 +56041,28 @@ begin
         LoadCLIPSegDecoderBlock(Reader, DecRefs[i],
           'decoder.layers.' + IntToStr(i) + '.',
           Config.ReduceDim, Config.DecoderIntermediate);
-      LoadCLIPSegTransposedConv(Reader, TransConv,
-        'decoder.transposed_convolution.weight',
-        'decoder.transposed_convolution.bias',
-        Config.ReduceDim, Config.PatchSize);
+      if Config.UseComplexTransposedConv then
+      begin
+        // decoder.transposed_convolution is an nn.Sequential: index 0 = Conv2d,
+        // 2 = ConvTranspose2d, 4 = ConvTranspose2d (1/3 are ReLU, no params).
+        LoadCLIPSegConv2d(Reader, CplxConv,
+          'decoder.transposed_convolution.0.weight',
+          'decoder.transposed_convolution.0.bias',
+          Config.ReduceDim, Config.ReduceDim, 3);
+        LoadCLIPSegTransposedConvMulti(Reader, CplxT0,
+          'decoder.transposed_convolution.2.weight',
+          'decoder.transposed_convolution.2.bias',
+          Config.ReduceDim, Config.ReduceDim div 2, CplxK);
+        LoadCLIPSegTransposedConvMulti(Reader, CplxT1,
+          'decoder.transposed_convolution.4.weight',
+          'decoder.transposed_convolution.4.bias',
+          Config.ReduceDim div 2, 1, CplxK);
+      end
+      else
+        LoadCLIPSegTransposedConv(Reader, TransConv,
+          'decoder.transposed_convolution.weight',
+          'decoder.transposed_convolution.bias',
+          Config.ReduceDim, Config.PatchSize);
       DecoderNet := NN;
       NN := nil;
     except

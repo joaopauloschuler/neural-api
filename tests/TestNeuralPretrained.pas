@@ -487,6 +487,7 @@ type
     procedure TestSwinIRParity;
     procedure TestCLIPSegConfigFromJSONFile;
     procedure TestCLIPSegParity;
+    procedure TestCLIPSegComplexUpsampleParity;
     procedure TestStyleGAN2ConfigFromJSONFile;
     procedure TestStyleGAN2GeneratorParity;
     procedure TestDINOv2ConfigFromJSONFile;
@@ -20870,6 +20871,119 @@ begin
       end;
     end;
     AssertTrue('mask logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImgInput.Free;
+    TokenIds.Free;
+    Logits.Free;
+    RefJson.Free;
+    VisionNet.Free;
+    TextNet.Free;
+    DecoderNet.Free;
+  end;
+end;
+
+// Parity test for the COMPLEX transposed-conv upsample head
+// (use_complex_transposed_convolution=true): the rd64-refined decoder head is a
+// 3x3 Conv2d + ReLU + two non-overlapping ConvTranspose2d (each a DepthToSpace
+// upsample by k = patch_size // 4) ending at one channel, instead of the single
+// ConvTranspose2d v1 ships. Fixture tools/clipseg_complex_tiny_fixture.py
+// (patch_size 8 -> k 2, grid 2x2 -> 8x8 mask, reduce_dim 6). Asserts the mask
+// logits match the HF float64 oracle < 1e-4.
+procedure TTestNeuralPretrained.TestCLIPSegComplexUpsampleParity;
+var
+  VisionNet, TextNet, DecoderNet: TNNet;
+  Config: TCLIPSegConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  PixelArr, ChanArr, RowArr, LogitArr, IdArr, CondArr: TJSONArray;
+  ImgInput, TokenIds, Logits: TNNetVolume;
+  LogitSize, SeqLen: integer;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  BuildCLIPSegFromSafeTensors(
+    FixturePath('tiny_clipseg_complex.safetensors'),
+    VisionNet, TextNet, DecoderNet, Config,
+    {TextSeqLen=}5, {pTrainable=}true,
+    FixturePath('tiny_clipseg_complex_config.json'));
+  RefJson := TStringList.Create;
+  ImgInput := TNNetVolume.Create;
+  TokenIds := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('vision net built', VisionNet <> nil);
+    AssertTrue('text net built', TextNet <> nil);
+    AssertTrue('decoder net built', DecoderNet <> nil);
+    AssertTrue('complex head flag parsed', Config.UseComplexTransposedConv);
+    AssertEquals('tap count', 2, Length(Config.TapLayerIdx));
+
+    RefJson.LoadFromFile(FixturePath('tiny_clipseg_complex_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    PixelArr := TJSONArray(TJSONObject(RefRoot).Find('pixel'));
+    IdArr := TJSONArray(TJSONObject(RefRoot).Find('input_ids'));
+    LogitArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    CondArr := TJSONArray(TJSONObject(RefRoot).Find('cond'));
+    LogitSize := TJSONObject(RefRoot).Get('logit_size', 0);
+    // The complex head output is grid * k * k = (image/patch) * (patch//4)^2,
+    // NOT image_size; here 2 * 2 * 2 = 8.
+    AssertTrue('oracle logit size positive', LogitSize > 0);
+
+    ImgInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(PixelArr.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImgInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels + ChanCnt] :=
+            ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    SeqLen := IdArr.Count;
+    TokenIds.ReSize(SeqLen, 1, 1);
+    for XCnt := 0 to SeqLen - 1 do
+      TokenIds.FData[XCnt] := IdArr.Items[XCnt].AsInteger;
+
+    // Conditional embedding first.
+    TextNet.Compute(TokenIds);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.ProjectionDim - 1 do
+    begin
+      RefVal := CondArr.Items[ChanCnt].AsFloat;
+      GotVal := TextNet.GetLastLayer().Output[
+        ClipTextEosPosition(TokenIds, Config.EosTokenId), 0, ChanCnt];
+      Diff := Abs(GotVal - RefVal);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('conditional embed: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // Full pipeline through the complex head.
+    RunCLIPSeg(VisionNet, TextNet, DecoderNet, Config,
+      ImgInput, TokenIds, Logits);
+    AssertEquals('mask grid X', LogitSize, Logits.SizeX);
+    AssertEquals('mask grid Y', LogitSize, Logits.SizeY);
+    AssertEquals('mask depth', 1, Logits.Depth);
+
+    MaxDiff := 0;
+    for YCnt := 0 to LogitSize - 1 do
+    begin
+      RowArr := TJSONArray(LogitArr.Items[YCnt]);
+      for XCnt := 0 to LogitSize - 1 do
+      begin
+        RefVal := RowArr.Items[XCnt].AsFloat;
+        GotVal := Logits[XCnt, YCnt, 0];
+        Diff := Abs(GotVal - RefVal);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('complex mask logits: max |diff| = ' + FloatToStr(MaxDiff) +
       ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     RefRoot.Free;

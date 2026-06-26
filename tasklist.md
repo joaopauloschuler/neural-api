@@ -1160,10 +1160,21 @@ rather than acted on.
         already pins the math vs the real HF classes). Needs the ~600 MB checkpoint +
         CLIP tokenizer ids; also exercises the default extract_layers [3,6,9] and
         reduce_dim 64 (the pico uses [0,1]/6).
-  - [ ] Complex transposed-conv upsample (use_complex_transposed_convolution=true) —
+  - [X] Complex transposed-conv upsample (use_complex_transposed_convolution=true) —
         the rd64-refined head uses the 3-stage Conv2d(3x3)+ReLU+2× ConvTranspose2d
         decoder instead of the single ConvTranspose2d v1 ships; add the 3x3 conv + the
         two-stage DepthToSpace upsample and a pico parity for that branch.
+        LANDED: BuildCLIPSegFromSafeTensorsWithConfig now branches on the flag and
+        builds the HF CLIPSegDecoder complex head as TNNetConvolutionLinear(reduce_dim,
+        3,pad 1)+ReLU + two non-overlapping ConvTranspose2d, each a
+        PointwiseConvLinear(OutCh*k*k)+TNNetDepthToSpace(k)(+ReLU between), k=patch//4,
+        mid channels reduce_dim//2 (NO new leaf layers; reuses Conv/ReLU/PointwiseConv/
+        DepthToSpace). New loaders LoadCLIPSegConv2d + LoadCLIPSegTransposedConvMulti
+        (the OutCh-general sibling of LoadCLIPSegTransposedConv). Note: complex-head mask
+        is grid*k*k px (not image_size), and the grid must be >= 3 so CAI's conv does not
+        clamp the 3x3 kernel to the input width. Pico parity TestCLIPSegComplexUpsampleParity
+        (tools/clipseg_complex_tiny_fixture.py, patch 8/grid 3 -> 12px mask, reduce_dim 6)
+        < 1e-4 vs the REAL HF CLIPSegForImageSegmentation float64 oracle.
   - [ ] Image-prompt (visual) conditioning — CLIPSeg can also condition on a PROMPT
         IMAGE (conditional_pixel_values -> clip.get_image_features pooled embedding)
         instead of text; v1 does text only. Add a RunCLIPSegImagePrompt path reusing
