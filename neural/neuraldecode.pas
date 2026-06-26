@@ -733,6 +733,36 @@ type
       property Constraint: TNNetTokenConstraint read FConstraint;
   end;
 
+  { TNNetNoRepeatNGramProcessor }
+  // EXACT n-gram blocking - the port of transformers'
+  // NoRepeatNGramLogitsProcessor. DISTINCT from the repetition PENALTY (which
+  // SCALES single-token logits): this BANS any next token that would complete
+  // an n-gram (length NGramSize) already seen in the running context. State =
+  // the full generated id sequence (prompt + emitted), built in Reset and
+  // advanced in Commit. Each step it takes the current (NGramSize-1)-token
+  // suffix and, for every position in the history where that same suffix
+  // occurred, bans the token that FOLLOWED it (so the seen n-gram cannot be
+  // re-formed). NGramSize <= 1 is OFF (no n-gram is shorter than its own
+  // continuation); with a context shorter than NGramSize-1 nothing is banned.
+  // DOMAIN: probability-domain like its siblings - banning sets the prob to 0
+  // and renormalizes the surviving mass (HF's logit -> -inf before softmax has
+  // exactly this post-softmax image). If banning would zero ALL mass the row
+  // is left UNTOUCHED (the MaskAllowed zero-mass fallback).
+  // Coded by Claude (AI).
+  TNNetNoRepeatNGramProcessor = class(TNNetLogitsProcessor)
+    private
+      FNGramSize: integer;
+      FHistory: TNeuralIntegerArray;
+      FLen: integer;
+      procedure AppendToken(TokenId: integer);
+    public
+      constructor Create(pNGramSize: integer);
+      procedure Reset(const PromptTokens: array of integer); override;
+      procedure ProcessRow(Row: TNNetVolume); override;
+      procedure Commit(TokenId: integer); override;
+      property NGramSize: integer read FNGramSize;
+  end;
+
   { TNNetLogitsProcessorChain }
   // Ordered chain of processors; Reset/ProcessRow/Commit forward to every
   // item IN INSERTION ORDER (order matters: e.g. penalty-then-temperature
@@ -889,6 +919,12 @@ type
     Temperature: TNeuralFloat;
     Penalty: TNNetTokenHistoryPenalty;     // nil = off (not owned)
     Processors: TNNetLogitsProcessorChain; // nil = none (not owned)
+    // EXACT n-gram blocking (HF no_repeat_ngram_size). 0 (or <=1) = off; >1
+    // wires a TNNetNoRepeatNGramProcessor banning any token that would re-form
+    // an already-seen NoRepeatNGramSize-gram. Distinct from Penalty (which
+    // only scales single-token logits). It runs in the Processors slot order,
+    // BEFORE the Constraint (structural guarantees still run last).
+    NoRepeatNGramSize: integer;            // 0 = off
     Constraint: TNNetTokenConstraint;      // nil = off (not owned)
     // Sampler reading the processed probability row; nil = greedy argmax.
     Sampler: TNNetSamplerBase;             // not owned
@@ -4322,6 +4358,103 @@ begin
   FConstraint.Commit(TokenId);
 end;
 
+{ TNNetNoRepeatNGramProcessor }
+
+constructor TNNetNoRepeatNGramProcessor.Create(pNGramSize: integer);
+begin
+  inherited Create();
+  FNGramSize := pNGramSize;
+  SetLength(FHistory, 0);
+  FLen := 0;
+end;
+
+procedure TNNetNoRepeatNGramProcessor.AppendToken(TokenId: integer);
+begin
+  // Amortized growth: the history grows by emitted tokens only.
+  if FLen >= Length(FHistory) then
+    SetLength(FHistory, (FLen + 1) * 2);
+  FHistory[FLen] := TokenId;
+  Inc(FLen);
+end;
+
+procedure TNNetNoRepeatNGramProcessor.Reset(
+  const PromptTokens: array of integer);
+var
+  I, Hi: integer;
+begin
+  // Fresh sequence: the history is the WHOLE context (prompt tokens), so the
+  // first generated step already sees prompt n-grams (HF semantics).
+  FLen := 0;
+  Hi := High(PromptTokens);
+  for I := 0 to Hi do AppendToken(PromptTokens[I]);
+end;
+
+procedure TNNetNoRepeatNGramProcessor.ProcessRow(Row: TNNetVolume);
+var
+  I, J, K, Size, SuffixStart, Last, NM1, Banned: integer;
+  Match: boolean;
+  KeptMass: TNeuralFloat;
+  Ban: array of boolean;
+begin
+  // OFF: an n-gram of size <= 1 has no (n-1)-suffix to key on.
+  if FNGramSize <= 1 then exit;
+  NM1 := FNGramSize - 1;
+  // Need at least NM1 history tokens to form the suffix AND one preceding
+  // n-gram (a position p with the same suffix and a follower): the earliest
+  // such follower sits at index FNGramSize-1, so we need FLen >= FNGramSize.
+  if FLen < FNGramSize then exit;
+  Size := Row.Size;
+  SetLength(Ban, Size);
+  for I := 0 to Size - 1 do Ban[I] := false;
+  // Current (n-1)-token suffix is the LAST NM1 tokens of the history.
+  SuffixStart := FLen - NM1;
+  Banned := 0;
+  // Scan every position whose n-gram ENDS at or before the suffix start, i.e.
+  // its (n-1)-prefix could match the current suffix and its follower (the
+  // token at J+NM1) is the banned continuation. J ranges so that J+NM1 is a
+  // valid index BEFORE the current suffix (J+NM1 <= SuffixStart-1 would be too
+  // strict; the standard scan allows the follower up to FLen-1 of the prefix
+  // window, which is index FLen-NM1-1 + ... ). Concretely: for each start J
+  // with J in [0, SuffixStart-1], if history[J..J+NM1-1] = suffix then ban
+  // history[J+NM1].
+  for J := 0 to SuffixStart - 1 do
+  begin
+    Match := true;
+    for K := 0 to NM1 - 1 do
+      if FHistory[J + K] <> FHistory[SuffixStart + K] then
+      begin
+        Match := false;
+        break;
+      end;
+    if Match then
+    begin
+      Last := FHistory[J + NM1];
+      if (Last >= 0) and (Last < Size) and (not Ban[Last]) then
+      begin
+        Ban[Last] := true;
+        Inc(Banned);
+      end;
+    end;
+  end;
+  if Banned = 0 then exit;
+  // Probability-domain ban: zero the banned tokens and renormalize the
+  // surviving mass (image of logit -> -inf before softmax). Zero-mass
+  // fallback (every surviving token has zero prob, or all were banned): leave
+  // the row UNTOUCHED, mirroring MaskAllowed.
+  KeptMass := 0;
+  for I := 0 to Size - 1 do
+    if not Ban[I] then KeptMass := KeptMass + Row.Raw[I];
+  if KeptMass <= 0 then exit;
+  for I := 0 to Size - 1 do
+    if Ban[I] then Row.Raw[I] := 0
+    else Row.Raw[I] := Row.Raw[I] / KeptMass;
+end;
+
+procedure TNNetNoRepeatNGramProcessor.Commit(TokenId: integer);
+begin
+  AppendToken(TokenId);
+end;
+
 { TNNetWatermarkLogitsProcessor }
 
 // One round of the splitmix64 finalizer - a fast, well-mixing 64-bit hash.
@@ -4912,10 +5045,12 @@ end;
 // is off, so the caller can take the zero-overhead plain path.
 function BuildProcessorPipeline(Penalty: TNNetTokenHistoryPenalty;
   Temperature: TNeuralFloat; UserProcessors: TNNetLogitsProcessorChain;
-  Constraint: TNNetTokenConstraint): TNNetLogitsProcessorChain;
+  Constraint: TNNetTokenConstraint;
+  NoRepeatNGramSize: integer = 0): TNNetLogitsProcessorChain;
 begin
   if (Penalty = nil) and (Temperature = 1.0) and
     ((UserProcessors = nil) or (UserProcessors.Count = 0)) and
+    (NoRepeatNGramSize <= 1) and
     (Constraint = nil) then exit(nil);
   Result := TNNetLogitsProcessorChain.Create();
   if Assigned(Penalty) then
@@ -4924,6 +5059,9 @@ begin
     Result.Add(TNNetTemperatureProcessor.Create(Temperature), true);
   if Assigned(UserProcessors) and (UserProcessors.Count > 0) then
     Result.Add(UserProcessors, false);
+  // EXACT n-gram blocking runs in the Processors slot, BEFORE the Constraint.
+  if NoRepeatNGramSize > 1 then
+    Result.Add(TNNetNoRepeatNGramProcessor.Create(NoRepeatNGramSize), true);
   if Assigned(Constraint) then
     Result.Add(TNNetConstraintProcessor.Create(Constraint), true);
 end;
@@ -5356,6 +5494,7 @@ begin
   Result.Temperature := 1.0;
   Result.Penalty := nil;
   Result.Processors := nil;
+  Result.NoRepeatNGramSize := 0; // no-repeat n-gram blocking off
   Result.Constraint := nil;
   Result.Sampler := nil;
   Result.GuidanceScale := 1.0; // CFG off
@@ -5378,7 +5517,7 @@ var
   StdChain: TNNetLogitsProcessorChain;
 begin
   StdChain := BuildProcessorPipeline(Config.Penalty, Config.Temperature,
-    Config.Processors, Config.Constraint);
+    Config.Processors, Config.Constraint, Config.NoRepeatNGramSize);
   if Config.GuidanceScale = 1.0 then exit(StdChain); // CFG off: as before
   if not Assigned(Config.CFGUncond) then
     raise EArgumentException.Create(

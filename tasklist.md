@@ -564,16 +564,12 @@ rather than acted on.
       serialized string. Assert the twin's logits match the source on a pinned
       input (the existing TestMakeUnconditionalTwinMatchesSourceLogits is the
       template).
-- [ ] Port transformers' `no_repeat_ngram_size` as a `TNNetLogitsProcessor` in the
-      landed processor chain (next to min-p / repetition-penalty / temperature). It
-      bans any next token that would complete an n-gram already seen in the running
-      context (the standard HF `NoRepeatNGramLogitsProcessor`): track the generated
-      ids, and for the current `(n-1)`-token suffix set the logit of every banned
-      continuation to `-inf` before sampling. Distinct from the existing repetition
-      PENALTY (which scales single-token logits) — this is exact n-gram blocking, the
-      single most-requested decode control still missing. Wire it into the streamed
-      and batched decode paths and `TGenerationConfig`, with a unit test pinning that
-      a forced-repeat prompt cannot re-emit a banned bigram/trigram.
+- [X] Port transformers' `no_repeat_ngram_size` as a `TNNetLogitsProcessor` in the
+      landed processor chain. LANDED: TNNetNoRepeatNGramProcessor (neuraldecode.pas,
+      prob-domain ban=0+renorm, zero-mass fallback) + TGenerationConfig.NoRepeatNGramSize
+      (0=off) threaded through BuildProcessorPipeline/BuildConfigPipeline so BOTH config
+      paths (GenerateTokensWithConfig streamed + GenerateStringWithConfig string) wire it;
+      test TestNoRepeatNGramBansSeenBigramAndTrigram (bigram+trigram+negative+Commit) green.
 - [ ] Preference-optimization follow-ups on the landed DPO/GRPO trainers
       (TNeuralGRPOTrainer in neural/neuraldpo.pas LANDED: group-relative
       advantages + PG + DeepSeek-k3 per-token KL reusing the DPO softmax-backward

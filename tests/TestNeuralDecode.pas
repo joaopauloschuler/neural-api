@@ -202,6 +202,7 @@ type
     // Logits-processor chain + temperature + generation config.
     procedure TestTemperatureProcessorProbabilityDomainMath;
     procedure TestProcessorChainOrderMatters;
+    procedure TestNoRepeatNGramBansSeenBigramAndTrigram;
     procedure TestNoOpChainAndConfigBitIdenticalToPlainPath;
     procedure TestGenerateWithConfigMatchesHandAssembled;
     procedure TestTemperatureNearZeroWithSamplerMatchesGreedy;
@@ -3545,6 +3546,92 @@ begin
   finally
     Proc.Free;
     Row.Free;
+  end;
+end;
+
+// TNNetNoRepeatNGramProcessor: EXACT n-gram blocking (HF no_repeat_ngram_size).
+// With size=2, after a context ending in token "B" whose only prior
+// occurrence was followed by "C", the bigram (B,C) cannot be re-formed: prob
+// of C is zeroed and surviving mass renormalized. With size=3 only the FULL
+// 2-token suffix keys the ban (a token sharing just the 1-token suffix is NOT
+// blocked). Banning is in the probability domain (the post-softmax image of
+// logit -> -inf); a uniform row over the survivors integrates to 1.
+procedure TTestNeuralDecode.TestNoRepeatNGramBansSeenBigramAndTrigram;
+var
+  Proc: TNNetNoRepeatNGramProcessor;
+  Row: TNNetVolume;
+  I: integer;
+  Total: TNeuralFloat;
+begin
+  // ---- size=2: bigram blocking. Context: A B C B  (vocab 0..4: A=0..C=2).
+  // Seen bigram (B,C) = (3->4 indices): the only B at index 1 was followed by
+  // C. Current suffix is the trailing "B" (index 3); its prior occurrence was
+  // followed by C, so C (=2) must be banned for the next token.
+  Proc := TNNetNoRepeatNGramProcessor.Create(2);
+  Row := TNNetVolume.Create(5, 1, 1);
+  try
+    AssertTrue('declares the probability domain', Proc.ExpectsProbabilities());
+    Proc.Reset([0, 1, 2, 1]); // A B C B  (B=1, C=2)
+    for I := 0 to 4 do Row.Raw[I] := 0.2; // uniform
+    Proc.ProcessRow(Row);
+    AssertEquals('size=2 bans C (re-forms seen bigram B,C)', 0.0, Row.Raw[2],
+      0.0);
+    Total := 0;
+    for I := 0 to 4 do Total := Total + Row.Raw[I];
+    AssertEquals('survivors renormalize to 1', 1.0, Total, 1e-6);
+    AssertEquals('an unrelated token keeps non-zero mass (>0)', 0.25,
+      Row.Raw[0], 1e-6); // 0.2 / (4*0.2) = 0.25
+  finally
+    Row.Free;
+    Proc.Free;
+  end;
+
+  // ---- size=3: trigram blocking keys on the 2-token suffix. Context:
+  // A B C  A B  -> suffix "A B". The prior "A B" (indices 0,1) was followed by
+  // C, so C must be banned. A token that only shares the 1-token suffix "B"
+  // (e.g. via a (X,B,*) elsewhere) is NOT blocked - only the full (A,B,*).
+  Proc := TNNetNoRepeatNGramProcessor.Create(3);
+  Row := TNNetVolume.Create(5, 1, 1);
+  try
+    Proc.Reset([0, 1, 2, 0, 1]); // A B C A B
+    for I := 0 to 4 do Row.Raw[I] := 0.2;
+    Proc.ProcessRow(Row);
+    AssertEquals('size=3 bans C (re-forms seen trigram A,B,C)', 0.0,
+      Row.Raw[2], 0.0);
+    Total := 0;
+    for I := 0 to 4 do Total := Total + Row.Raw[I];
+    AssertEquals('trigram survivors renormalize to 1', 1.0, Total, 1e-6);
+
+    // Negative: with the SAME suffix "B" but a DIFFERENT preceding token, the
+    // (A,B,C) ban does not fire. Context: D B (suffix "B" only, no full 2-gram
+    // suffix repeated) -> with size=3 and FLen<3 nothing is banned.
+    Proc.Reset([3, 1]); // D B  (len 2 < 3)
+    for I := 0 to 4 do Row.Raw[I] := 0.2;
+    Proc.ProcessRow(Row);
+    for I := 0 to 4 do
+      AssertEquals('size=3 with short context bans nothing at ' + IntToStr(I),
+        0.2, Row.Raw[I], 1e-6);
+  finally
+    Row.Free;
+    Proc.Free;
+  end;
+
+  // ---- Commit advances state: after emitting a token the new suffix governs
+  // the next ban. Start "A B", emit C -> context "A B C"; with size=2 the
+  // suffix is now "C" (no prior C), so nothing banned; then the prior B,C is
+  // recorded so a later B would ban C.
+  Proc := TNNetNoRepeatNGramProcessor.Create(2);
+  Row := TNNetVolume.Create(5, 1, 1);
+  try
+    Proc.Reset([0, 1]); // A B
+    Proc.Commit(2);     // emit C -> A B C
+    Proc.Commit(1);     // emit B -> A B C B ; suffix B, prior B followed by C
+    for I := 0 to 4 do Row.Raw[I] := 0.2;
+    Proc.ProcessRow(Row);
+    AssertEquals('after Commit, suffix B bans C', 0.0, Row.Raw[2], 0.0);
+  finally
+    Row.Free;
+    Proc.Free;
   end;
 end;
 
