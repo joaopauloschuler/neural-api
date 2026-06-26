@@ -47,6 +47,15 @@ Optional trailing flags:
   --steps N      number of reverse steps (default 4)
   --cfg W        classifier-free guidance scale (default 4.0)
   --dpm          use DPM-Solver++(2M) instead of DDIM
+  --lcm          use the Latent Consistency Model few-step sampler
+                 (TNNetLCMScheduler): a SINGLE model pass per step, guidance
+                 BAKED IN (no cond/uncond double pass), ~4 steps. The matching
+                 training objective is LCM-distillation: a consistency loss that
+                 distills a many-step teacher (DDIM/DPM++) into this few-step
+                 student so f(x_t,t) maps any noised latent straight to x0. (The
+                 pico fixtures here are NOT LCM-distilled, so this is a wiring
+                 SMOKE -- it proves the few-step loop runs, not that 4 LCM steps
+                 match the teacher.)
   --smoke        run, assert finiteness, print OK/FAIL and exit (no PPM)
 
 OUTPUT
@@ -132,6 +141,26 @@ begin
   end;
 end;
 
+// Single-pass denoiser wrapper for the LCM few-step driver. TNNetLCMScheduler.
+// LCMSample wants a method-of-object callback (Xt,Output,Tt) that returns the
+// raw model output for ONE forward pass -- guidance is baked into a distilled
+// consistency model, so the LCM branch uses ONLY the conditional (prompt) pass,
+// no cond/uncond CFG. This object just closes over the net/config/prompt states.
+type
+  TLCMDenoiser = class
+  public
+    Net: TNNet;
+    Cfg: TPixArtConfig;
+    Prompt: TNNetVolume;
+    procedure Denoise(Xt, Output: TNNetVolume; Tt: integer);
+  end;
+
+procedure TLCMDenoiser.Denoise(Xt, Output: TNNetVolume; Tt: integer);
+begin
+  // ONE conditional model pass -- no classifier-free guidance in the LCM path.
+  PixArtDenoise(Net, Cfg, Xt, Tt, Prompt, Output);
+end;
+
 function AllFinite(V: TNNetVolume): boolean;
 var i: integer;
 begin
@@ -150,12 +179,14 @@ var
   PixCfg: TPixArtConfig;
   VaeCfg: TVaeDecoderConfig;
   Scheduler: TNNetDiffusionScheduler;
+  LCMScheduler: TNNetLCMScheduler;
+  LCMDenoiser: TLCMDenoiser;
   Latent, TextStates, NullStates, EpsCond, EpsUncond, EpsGuided, Image: TNNetVolume;
   PixST, PixCfgPath, VaeST, VaeCfgPath: string;
   Method: TNNetSamplerMethod;
   NumSteps, StepCnt, T, TPrev, i: integer;
   Guidance: TNeuralFloat;
-  SmokeMode, LatentOk, ImageOk: boolean;
+  SmokeMode, UseLCM, LatentOk, ImageOk: boolean;
   Arg: string;
 begin
   // ---- argument parsing ----
@@ -165,6 +196,7 @@ begin
   Guidance := 4.0;
   Method := smDDIM;
   SmokeMode := false;
+  UseLCM := false;
   // Positional checkpoint args (the first two non-flag args).
   i := 1;
   if (ParamCount >= 1) and (Copy(ParamStr(1), 1, 2) <> '--') then
@@ -189,6 +221,7 @@ begin
     if Arg = '--steps' then begin Inc(i); NumSteps := StrToIntDef(ParamStr(i), NumSteps); end
     else if Arg = '--cfg' then begin Inc(i); Guidance := StrToFloatDef(ParamStr(i), Guidance); end
     else if Arg = '--dpm' then Method := smDPMSolverPP2M
+    else if Arg = '--lcm' then UseLCM := true
     else if Arg = '--smoke' then SmokeMode := true
     else WriteLn('Ignoring unknown argument: ', Arg);
     Inc(i);
@@ -200,6 +233,8 @@ begin
   VaeNet := BuildVaeDecoderFromSafeTensors(VaeST, VaeCfg,
     {pTrainable=}false, VaeCfgPath);
   Scheduler := TNNetDiffusionScheduler.Create(100, dsLinear, dpEps);
+  LCMScheduler := TNNetLCMScheduler.Create(100, dsLinear, dpEps);
+  LCMDenoiser := TLCMDenoiser.Create;
   Latent := TNNetVolume.Create;
   TextStates := TNNetVolume.Create;
   NullStates := TNNetVolume.Create;
@@ -215,8 +250,12 @@ begin
       raise Exception.Create('PixArt in_channels must equal VAE latent_channels.');
     if PixCfg.SampleSize <> VaeCfg.LatentGrid then
       raise Exception.Create('PixArt sample_size must equal VAE latent grid.');
-    WriteLn('Sampler: ', BoolToStr(Method = smDPMSolverPP2M, 'DPM-Solver++(2M)',
-      'DDIM'), ', steps ', NumSteps, ', CFG ', Guidance:0:2);
+    if UseLCM then
+      WriteLn('Sampler: LCM (Latent Consistency Model, single pass/step, ',
+        'guidance baked in), steps ', NumSteps)
+    else
+      WriteLn('Sampler: ', BoolToStr(Method = smDPMSolverPP2M, 'DPM-Solver++(2M)',
+        'DDIM'), ', steps ', NumSteps, ', CFG ', Guidance:0:2);
 
     // Caller-supplied T5 states (Step 3 = a real T5 tower over a tokenized
     // prompt). Deterministic synthetic states stand in for the pico run.
@@ -234,21 +273,37 @@ begin
     EpsUncond.ReSize(PixCfg.SampleSize, PixCfg.SampleSize, PixCfg.InChannels);
     EpsGuided.ReSize(PixCfg.SampleSize, PixCfg.SampleSize, PixCfg.InChannels);
 
-    Scheduler.ResetMultistep;
-    for StepCnt := 0 to NumSteps - 1 do
+    if UseLCM then
     begin
-      T := Scheduler.NumTimesteps -
-        (StepCnt * Scheduler.NumTimesteps) div NumSteps;
-      if StepCnt = NumSteps - 1 then TPrev := 0
-      else TPrev := Scheduler.NumTimesteps -
-        ((StepCnt + 1) * Scheduler.NumTimesteps) div NumSteps;
-      // CFG: cond = prompt T5 states; uncond = null/empty caption (zeros).
-      PixArtDenoise(PixArtNet, PixCfg, Latent, T, TextStates, EpsCond);
-      PixArtDenoise(PixArtNet, PixCfg, Latent, T, NullStates, EpsUncond);
-      TNNetDiffusionScheduler.ApplyCFG(EpsCond, EpsUncond, EpsGuided, Guidance);
-      Scheduler.Step(Latent, EpsGuided, T, TPrev, Method, 0.0);
-      WriteLn('  step ', StepCnt + 1, '/', NumSteps, '  t=', T,
-        '  |latent|=', Latent.GetMagnitude():0:4);
+      // LCM few-step path: a SINGLE conditional model pass per step (guidance is
+      // baked into a distilled consistency model -- no cond/uncond CFG), driven
+      // by TNNetLCMScheduler.LCMSample over its boundary-scaling consistency
+      // function. The driver leaves the sampled x0 estimate in Latent.
+      LCMDenoiser.Net := PixArtNet;
+      LCMDenoiser.Cfg := PixCfg;
+      LCMDenoiser.Prompt := TextStates;
+      LCMScheduler.LCMSample(Latent, @LCMDenoiser.Denoise, NumSteps, tsUniform);
+      WriteLn('  LCM done in ', NumSteps, ' step(s)  |latent|=',
+        Latent.GetMagnitude():0:4);
+    end
+    else
+    begin
+      Scheduler.ResetMultistep;
+      for StepCnt := 0 to NumSteps - 1 do
+      begin
+        T := Scheduler.NumTimesteps -
+          (StepCnt * Scheduler.NumTimesteps) div NumSteps;
+        if StepCnt = NumSteps - 1 then TPrev := 0
+        else TPrev := Scheduler.NumTimesteps -
+          ((StepCnt + 1) * Scheduler.NumTimesteps) div NumSteps;
+        // CFG: cond = prompt T5 states; uncond = null/empty caption (zeros).
+        PixArtDenoise(PixArtNet, PixCfg, Latent, T, TextStates, EpsCond);
+        PixArtDenoise(PixArtNet, PixCfg, Latent, T, NullStates, EpsUncond);
+        TNNetDiffusionScheduler.ApplyCFG(EpsCond, EpsUncond, EpsGuided, Guidance);
+        Scheduler.Step(Latent, EpsGuided, T, TPrev, Method, 0.0);
+        WriteLn('  step ', StepCnt + 1, '/', NumSteps, '  t=', T,
+          '  |latent|=', Latent.GetMagnitude():0:4);
+      end;
     end;
 
     LatentOk := AllFinite(Latent);
@@ -289,6 +344,8 @@ begin
     NullStates.Free;
     TextStates.Free;
     Latent.Free;
+    LCMDenoiser.Free;
+    LCMScheduler.Free;
     Scheduler.Free;
     VaeNet.Free;
     PixArtNet.Free;

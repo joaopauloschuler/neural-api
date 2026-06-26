@@ -503,6 +503,23 @@ type
 
 implementation
 
+type
+  // Single-pass PixArt denoiser wrapper for the LCM smoke (TNNetLCMScheduler.
+  // LCMSample wants a method-of-object callback). The LCM path uses ONLY the
+  // conditional pass -- no classifier-free guidance double pass.
+  TLCMPixArtDenoiser = class
+  public
+    Net: TNNet;
+    Cfg: TPixArtConfig;
+    Prompt: TNNetVolume;
+    procedure Denoise(Xt, Output: TNNetVolume; Tt: integer);
+  end;
+
+procedure TLCMPixArtDenoiser.Denoise(Xt, Output: TNNetVolume; Tt: integer);
+begin
+  PixArtDenoise(Net, Cfg, Xt, Tt, Prompt, Output);
+end;
+
 // Writes a small JSON sidecar describing the GGUF the writer round-trip
 // test emitted, for tools/verify_gguf_writer.py to cross-check against the
 // python "gguf" package: the file path plus the llama.* hyperparameters
@@ -19148,6 +19165,9 @@ var
   PixCfg: TPixArtConfig;
   VaeCfg: TVaeDecoderConfig;
   Scheduler: TNNetDiffusionScheduler;
+  LCMScheduler: TNNetLCMScheduler;
+  LCMDenoiser: TLCMPixArtDenoiser;
+  LCMLatent, LCMImage: TNNetVolume;
   Latent, TextStates, NullStates, EpsCond, EpsUncond, EpsGuided, Image: TNNetVolume;
   StepCnt, T, TPrev, x, yy, c, HW: integer;
   AllFinite: boolean;
@@ -19160,6 +19180,10 @@ begin
     FixturePath('tiny_vae_decoder_ltt.safetensors'), VaeCfg,
     {pTrainable=}true, FixturePath('tiny_vae_decoder_ltt_config.json'));
   Scheduler := TNNetDiffusionScheduler.Create(100, dsLinear, dpEps);
+  LCMScheduler := TNNetLCMScheduler.Create(100, dsLinear, dpEps);
+  LCMDenoiser := TLCMPixArtDenoiser.Create;
+  LCMLatent := TNNetVolume.Create;
+  LCMImage := TNNetVolume.Create;
   Latent := TNNetVolume.Create;
   TextStates := TNNetVolume.Create;
   NullStates := TNNetVolume.Create;
@@ -19226,6 +19250,39 @@ begin
         for x := 0 to Image.SizeX - 1 do
           if not (Image[x, yy, c] = Image[x, yy, c]) then AllFinite := false;
     AssertTrue('decoded image is finite', AllFinite);
+
+    // ---- LCM few-step sampler path (opt-in --lcm in the example) ----
+    // TNNetLCMScheduler.LCMSample drives the consistency function with a SINGLE
+    // conditional model pass per step (guidance baked in -- NO cond/uncond CFG
+    // double pass), in ~4 steps over the SAME pico fixtures. The pico weights
+    // are not LCM-distilled, so this asserts the few-step loop RUNS and produces
+    // a finite, correctly-shaped latent/image (a wiring smoke), not teacher parity.
+    RandSeed := 424242;
+    LCMDenoiser.Net := PixArtNet;
+    LCMDenoiser.Cfg := PixCfg;
+    LCMDenoiser.Prompt := TextStates;
+    LCMLatent.ReSize(HW, HW, PixCfg.InChannels);
+    LCMLatent.RandomizeGaussian(1.0);
+    LCMScheduler.LCMSample(LCMLatent, @LCMDenoiser.Denoise, {NumSteps=}4, tsUniform);
+    AssertEquals('LCM latent grid', HW, LCMLatent.SizeX);
+    AssertEquals('LCM latent channels', PixCfg.InChannels, LCMLatent.Depth);
+    AllFinite := true;
+    for c := 0 to PixCfg.InChannels - 1 do
+      for yy := 0 to HW - 1 do
+        for x := 0 to HW - 1 do
+          if not (LCMLatent[x, yy, c] = LCMLatent[x, yy, c]) then AllFinite := false;
+    AssertTrue('LCM latent is finite', AllFinite);
+    // Decode the LCM latent through the same VAE -> finite RGB image.
+    VaeNet.Compute(LCMLatent);
+    LCMImage.Copy(VaeNet.GetLastLayer().Output);
+    AssertEquals('LCM image channels', VaeCfg.OutChannels, LCMImage.Depth);
+    AssertEquals('LCM image grid', HW * 2, LCMImage.SizeX);
+    AllFinite := true;
+    for c := 0 to LCMImage.Depth - 1 do
+      for yy := 0 to LCMImage.SizeY - 1 do
+        for x := 0 to LCMImage.SizeX - 1 do
+          if not (LCMImage[x, yy, c] = LCMImage[x, yy, c]) then AllFinite := false;
+    AssertTrue('LCM decoded image is finite', AllFinite);
   finally
     Image.Free;
     EpsGuided.Free;
@@ -19234,6 +19291,10 @@ begin
     NullStates.Free;
     TextStates.Free;
     Latent.Free;
+    LCMImage.Free;
+    LCMLatent.Free;
+    LCMDenoiser.Free;
+    LCMScheduler.Free;
     Scheduler.Free;
     VaeNet.Free;
     PixArtNet.Free;
