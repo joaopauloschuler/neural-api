@@ -837,11 +837,15 @@ rather than acted on.
       The WAV writer + HiFi-GAN vocoder it builds on have landed; the open
       piece is the audio U-Net/DiT denoiser importer.
 - [ ] SeamlessM4T-v2 follow-ups deferred from the landed S2TT v1:
-      (1) position_embeddings_type="relative_key" — the v2 conformer self-attn
-      distance-embedding attention bias (einsum("bhld,lrd->bhlr") added to the
-      scores, clamped to [-left_max, right_max]); needs a new relative-position
-      attention layer (the importer currently REJECTS "relative_key" and the
-      pico fixture pins it disabled). (2) the text-to-speech (T2ST) unit
+      (1) [X] position_embeddings_type="relative_key" — DONE: added
+      TNNetConformerRelPosAttention (learnable distance-embedding score bias
+      Q[i]·P[clamp(j-i,-L,R)+L] added to the scores before softmax, the
+      einsum("bhld,lrd->bhlr") math), with input+weight numerical-gradient tests
+      and serialization round-trip; wired into BuildSeamlessM4T (reads
+      left/right_max_position_embeddings, loads the per-layer distance_embedding
+      table into each head, swaps the ENCODER self-attn — the strided adapter
+      stays vanilla SDPA per HF use_position_embeddings=False); new relkey pico
+      fixture + parity test (< 1e-4). (2) the text-to-speech (T2ST) unit
       vocoder path (TextToUnit decoder + HiFi-GAN-style unit vocoder).
       (3) the UnitY2 two-pass decoding. (4) a real downloaded
       facebook/seamless-m4t-v2-large checkpoint + real SentencePiece tokenizer

@@ -3435,12 +3435,15 @@ procedure SaveM2M100ToSafeTensors(EncoderNet, DecoderNet: TNNet;
 // final layer_norm, tied lm_head). Run the pair with RunT5 / decode with
 // DecodeSeq2SeqGreedy (the shared two-net convention).
 //
-// v1 SCOPE NOTE: position_embeddings_type="relative_key" (the v2 conformer's
-// distance-embedding attention bias) is NOT yet wired - it needs a new
-// attention layer. The importer REJECTS "relative_key" and accepts the
-// disabled setting (""/"absolute"/"none"). The T2ST unit vocoder and the
-// UnitY2 two-pass decoding are deferred follow-ups (see tasklist.md).
-// Coded by Claude (AI).
+// SCOPE NOTE: position_embeddings_type="relative_key" (the v2 conformer's
+// distance-embedding attention bias) IS now wired: the conformer encoder
+// self-attention uses TNNetConformerRelPosAttention, which adds the learned
+// distance-embedding score bias (clamped to [-left_max, right_max]) before
+// softmax. left_max_position_embeddings / right_max_position_embeddings are
+// read from the config and the distance_embedding table is loaded per layer.
+// The disabled setting (""/"absolute"/"none") keeps plain SDPA. The T2ST unit
+// vocoder and the UnitY2 two-pass decoding remain deferred follow-ups (see
+// tasklist.md). Coded by Claude (AI).
 type
   TSeamlessM4Tv2Config = record
     HiddenSize: integer;            // hidden_size (d_model; must be EVEN)
@@ -3462,15 +3465,18 @@ type
     EosTokenId: integer;            // eos_token_id (default 3)
     DecoderStartTokenId: integer;   // decoder_start_token_id (default 3)
     ScaleEmbedding: boolean;        // scale_embedding (sqrt(hidden); default ON)
-    PositionEmbeddingsType: string; // must NOT be "relative_key" (v1 scope)
+    PositionEmbeddingsType: string; // ""/"absolute"/"none" or "relative_key"
+    LeftMaxPositionEmbeddings: integer;  // left_max_position_embeddings
+    RightMaxPositionEmbeddings: integer; // right_max_position_embeddings
     SpeechEncoderAct: string;       // speech_encoder_hidden_act ("swish")
     LayerNormEps: TNeuralFloat;     // layer_norm_eps (default 1e-5)
     ModelType: string;              // 'seamless_m4t_v2'
   end;
 
 // Reads a HF seamless_m4t_v2 config.json. Defaults follow the published
-// facebook/seamless-m4t-v2-large config. Rejects position_embeddings_type =
-// "relative_key" (the v1 scope cannot represent its attention bias yet).
+// facebook/seamless-m4t-v2-large config. position_embeddings_type =
+// "relative_key" is supported (the conformer distance-embedding attention bias,
+// via TNNetConformerRelPosAttention); "" / "absolute" / "none" keep plain SDPA.
 function ReadSeamlessM4Tv2ConfigFromJSONFile(
   const FileName: string): TSeamlessM4Tv2Config;
 
@@ -25498,6 +25504,9 @@ type
     Fc1, Fc2, FFNNorm: TNNetLayer;
   end;
   TMarianBlockArray = array of TMarianBlockLayers;
+  // Per-head conformer self-attention layers (for relative_key distance-table
+  // loading in the SeamlessM4T-v2 importer). Coded by Claude (AI).
+  TSeamlessAttnHeadArray = array of TNNetLayer;
 
 // Grows one Marian stack (encoder or decoder) onto NN after the embedding +
 // positional layers. POST-norm wiring: every sublayer reads the RAW stream,
@@ -29841,13 +29850,17 @@ begin
       Obj.Get('decoder_start_token_id', Result.EosTokenId);
     Result.ScaleEmbedding := Obj.Get('scale_embedding', True);
     PosType := Obj.Get('position_embeddings_type', 'relative_key');
-    if PosType = 'relative_key' then
-      ImportError('SeamlessM4T import: position_embeddings_type ' +
-        '"relative_key" (the v2 conformer distance-embedding attention bias) ' +
-        'is not supported in the v1 S2TT scope - it needs a new attention ' +
-        'layer (documented follow-up). Disable it ("" / "absolute" / "none") ' +
-        'or wait for the follow-up.');
+    if (PosType <> 'relative_key') and (PosType <> 'absolute') and
+       (PosType <> 'none') and (PosType <> '') then
+      ImportError('SeamlessM4T import: position_embeddings_type "' + PosType +
+        '" is not supported - expected "relative_key" (distance-embedding ' +
+        'bias) or "" / "absolute" / "none" (plain SDPA).');
     Result.PositionEmbeddingsType := PosType;
+    // left_max / right_max only matter for "relative_key" (HF defaults 64/8).
+    Result.LeftMaxPositionEmbeddings :=
+      Obj.Get('left_max_position_embeddings', 64);
+    Result.RightMaxPositionEmbeddings :=
+      Obj.Get('right_max_position_embeddings', 8);
     Act := Obj.Get('speech_encoder_hidden_act', 'swish');
     if (Act <> 'swish') and (Act <> 'silu') then
       ImportError('SeamlessM4T import: speech_encoder_hidden_act "' + Act +
@@ -29883,6 +29896,9 @@ begin
     ', dec_heads=' + IntToStr(Config.DecoderHeads) +
     ', dec_ffn=' + IntToStr(Config.DecoderFFNDim) +
     ', vocab=' + IntToStr(Config.VocabSize) +
+    ', pos_emb=' + Config.PositionEmbeddingsType +
+    ', left_max=' + IntToStr(Config.LeftMaxPositionEmbeddings) +
+    ', right_max=' + IntToStr(Config.RightMaxPositionEmbeddings) +
     ', scale_embedding=' + BoolToStr(Config.ScaleEmbedding, true) + ')';
 end;
 
@@ -29942,6 +29958,51 @@ end;
 // convention). Used for the conformer pointwise convs (K=1, no bias) and the
 // strided adapter pooling convs (K=AdaptorKernel, with bias). BiasName='' =>
 // no bias (left zero).
+// Loads the shared conformer relative_key distance-embedding table (HF
+// nn.Embedding distance_embedding.weight, shape [num_pos, head_size]) into the
+// single neuron of EVERY per-head TNNetConformerRelPosAttention layer. HF
+// shares ONE table across all heads (each head dots its own query slice against
+// the same [num_pos, head_size] table), so the same flat tensor is copied into
+// each head. The neuron weight volume is (num_pos, 1, head_size), the SAME flat
+// row-major layout as the HF tensor, so the copy is a flat assignment.
+// Coded by Claude (AI).
+procedure LoadSeamlessDistanceEmbedding(Reader: TNNetSafeTensorsReader;
+  const Heads: TSeamlessAttnHeadArray; const WName: string;
+  NumPos, HeadSize: integer);
+var
+  W: TNNetVolume;
+  hc, k, ExpectedSize: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('SeamlessM4T import: missing tensor "' + WName +
+      '" (relative_key distance_embedding).');
+  if (Reader.DimCount(WName) <> 2) or
+     (Reader.DimSize(WName, 0) <> NumPos) or
+     (Reader.DimSize(WName, 1) <> HeadSize) then
+    ImportError('SeamlessM4T import: "' + WName + '" must have shape [' +
+      IntToStr(NumPos) + ', ' + IntToStr(HeadSize) +
+      '] (distance_embedding [num_pos, head_size]), got ' +
+      Reader.ShapeAsString(WName));
+  ExpectedSize := NumPos * HeadSize;
+  W := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    for hc := 0 to Length(Heads) - 1 do
+    begin
+      EnsureWritableImportWeights(Heads[hc]);
+      if Heads[hc].Neurons[0].Weights.Size <> ExpectedSize then
+        ImportError('SeamlessM4T import: internal error - relpos head neuron ' +
+          'has ' + IntToStr(Heads[hc].Neurons[0].Weights.Size) +
+          ' weights, expected ' + IntToStr(ExpectedSize) + '.');
+      for k := 0 to ExpectedSize - 1 do
+        Heads[hc].Neurons[0].Weights.FData[k] := W.FData[k];
+      Heads[hc].FlushWeightCache();
+    end;
+  finally
+    W.Free;
+  end;
+end;
+
 procedure LoadSeamlessConv1D(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BiasName: string;
   InDim, OutDim, Kernel: integer; Consumed: TStringList);
@@ -30069,14 +30130,18 @@ var
   ResidualInput: TNNetLayer;
   QProj, KProj, VProj, OProj: TNNetLayer;
   Ffn1LN, Ffn1Fc1, Ffn1Fc2, AttnLN, Ffn2LN, Ffn2Fc1, Ffn2Fc2, LayLN: TNNetLayer;
-  LayerCnt, AdLayerCnt: integer;
+  LayerCnt, AdLayerCnt, HeadCnt: integer;
+  UseRelPos: boolean;
+  EncAttnHeads, AdAttnHeads: TSeamlessAttnHeadArray;
+  RelPosKey: string;
 
   // Builds one vanilla (no-position) multi-head SDPA over the layer Src whose
   // output is already the per-token query/key/value source (SizeX = seq).
   // Returns the OProj layer. Q/K/V are full biased Linears (HF nn.Linear) so
   // they are PointwiseConvLinear over (seq,1,hidden). NumHeadsLoc heads.
   procedure BuildConformerSDPA(Src: TNNetLayer; NumHeadsLoc: integer;
-    out Q, K, V, O: TNNetLayer);
+    out Q, K, V, O: TNNetLayer; UseRelPos: boolean;
+    pLeftMax, pRightMax: integer; out AttnHeads: TSeamlessAttnHeadArray);
   var
     hc, dd, NumHeadsM1, HDimM1: integer;
     HDim: integer;
@@ -30088,6 +30153,7 @@ var
     NumHeadsM1 := NumHeadsLoc - 1;
     HDimM1 := HDim - 1;
     SetLength(HArr, NumHeadsLoc);
+    SetLength(AttnHeads, NumHeadsLoc);
     SetLength(Slice, HDim);
     Q := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable), Src);
     K := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable), Src);
@@ -30099,8 +30165,19 @@ var
       ks := Enc.AddLayerAfter(TNNetSplitChannels.Create(Slice), K);
       vs := Enc.AddLayerAfter(TNNetSplitChannels.Create(Slice), V);
       hp := Enc.AddLayer(TNNetDeepConcat.Create([qs, ks, vs]));
-      HArr[hc] := Enc.AddLayerAfter(
-        TNNetScaledDotProductAttention.Create(HDim, {CausalMask=}false), hp);
+      // relative_key: per-head TNNetConformerRelPosAttention adds the learned
+      // distance-embedding score bias before softmax; the distance_embedding
+      // table is SHARED across heads in HF (same (num_pos, head_size) table
+      // every head dots its own query slice against), so each head's neuron is
+      // loaded with the SAME table by the caller. Otherwise plain SDPA.
+      if UseRelPos then
+        HArr[hc] := Enc.AddLayerAfter(
+          TNNetConformerRelPosAttention.Create(HDim, {CausalMask=}false,
+            pLeftMax, pRightMax).SetTrainable(pTrainable), hp)
+      else
+        HArr[hc] := Enc.AddLayerAfter(
+          TNNetScaledDotProductAttention.Create(HDim, {CausalMask=}false), hp);
+      AttnHeads[hc] := HArr[hc];
     end;
     Enc.AddLayer(TNNetDeepConcat.Create(HArr));
     O := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable));
@@ -30137,10 +30214,13 @@ begin
   if (Config.DecoderHeads < 1) or ((Hidden mod Config.DecoderHeads) <> 0) then
     ImportError('SeamlessM4T import: decoder_attention_heads must divide ' +
       'hidden_size.');
-  if Config.PositionEmbeddingsType = 'relative_key' then
-    ImportError('SeamlessM4T import: position_embeddings_type "relative_key" ' +
-      'is not supported in the v1 S2TT scope.');
+  if (Config.PositionEmbeddingsType = 'relative_key') and
+     ((Config.LeftMaxPositionEmbeddings < 0) or
+      (Config.RightMaxPositionEmbeddings < 0)) then
+    ImportError('SeamlessM4T import: left/right_max_position_embeddings must ' +
+      'be >= 0 for position_embeddings_type "relative_key".');
   AdaptedLen := SeamlessM4Tv2AdaptedLength(Config, SpeechFrames);
+  UseRelPos := (Config.PositionEmbeddingsType = 'relative_key');
 
   Reader := CreatePretrainedTensorReader(FileName);
   Enc := nil;
@@ -30195,7 +30275,9 @@ begin
         // ---- self-attention: h += SDPA(LN(h)) ----
         ResidualInput := Enc.GetLastLayer();
         AttnLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
-        BuildConformerSDPA(AttnLN, Heads, QProj, KProj, VProj, OProj);
+        BuildConformerSDPA(AttnLN, Heads, QProj, KProj, VProj, OProj,
+          UseRelPos, Config.LeftMaxPositionEmbeddings,
+          Config.RightMaxPositionEmbeddings, EncAttnHeads);
         Enc.AddLayer(TNNetSum.Create([OProj, ResidualInput]));
 
         // ---- conv module: h += ConvModule(h) ----
@@ -30260,6 +30342,17 @@ begin
           Hidden, Hidden, 0, -1, 0, SP + 'self_attn.linear_out.bias');
         Consumed.Add(SP + 'self_attn.linear_out.weight');
         Consumed.Add(SP + 'self_attn.linear_out.bias');
+        // relative_key: load the shared (num_pos, head_size) distance-embedding
+        // table into EVERY head's TNNetConformerRelPosAttention neuron (HF
+        // shares one table across heads). num_pos = left_max + right_max + 1.
+        if UseRelPos then
+        begin
+          RelPosKey := SP + 'self_attn.distance_embedding.weight';
+          LoadSeamlessDistanceEmbedding(Reader, EncAttnHeads, RelPosKey,
+            Config.LeftMaxPositionEmbeddings +
+            Config.RightMaxPositionEmbeddings + 1, Hidden div Heads);
+          Consumed.Add(RelPosKey);
+        end;
 
         LoadLayerNormWeights(Reader, ConvLN,
           SP + 'conv_module.layer_norm.weight',
@@ -30353,7 +30446,10 @@ begin
         AdAttnConv := Enc.AddLayer(TNNetConvolutionLinear.Create(
           2 * Hidden, Config.AdaptorKernel, 0, Config.AdaptorStride, 0).SetTrainable(pTrainable));
         AdAttnGLU := Enc.AddLayer(TNNetGLU.Create());
-        BuildConformerSDPA(AdAttnGLU, Heads, AdQ, AdK, AdV, AdO);
+        // The adapter self-attn ALWAYS uses use_position_embeddings=False in HF
+        // (no distance-embedding bias), so plain SDPA regardless of config.
+        BuildConformerSDPA(AdAttnGLU, Heads, AdQ, AdK, AdV, AdO,
+          {UseRelPos=}false, 0, 0, AdAttnHeads);
         Enc.AddLayer(TNNetSum.Create([AdO, AdResGLU]));
 
         // h += FFN(LN(h))  (relu)

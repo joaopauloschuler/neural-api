@@ -869,6 +869,8 @@ type
     procedure TestT5RelPosBiasAttentionSerializationRoundTrip;
     procedure TestDisentangledAttentionGradientCheck;
     procedure TestDisentangledAttentionSerializationRoundTrip;
+    procedure TestConformerRelPosAttentionGradientCheck;
+    procedure TestConformerRelPosAttentionSerializationRoundTrip;
     procedure TestALiBiSlopeMatchesReference;
     procedure TestALiBiAttentionGradientCheck;
     procedure TestALiBiAttentionZeroSlopeMatchesSDPA;
@@ -20951,6 +20953,165 @@ begin
 
     S2 := NN2.SaveToString();
     AssertEquals('Disentangled save->load->save string equality', S, S2);
+  finally
+    NN.Free;
+    if Assigned(NN2) then NN2.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConformerRelPosAttentionGradientCheck;
+// Central-difference check of BOTH the distance-embedding-table gradient and
+// the input gradient of a bidirectional TNNetConformerRelPosAttention (d_k=4,
+// SeqLen=6, LeftMax=3, RightMax=2, so a 6-row x d_k position table). With
+// learning rate 1 and batch update the analytical weight gradient is
+// -Neurons[0].Delta (Delta accumulates -lr*grad), matching the sibling
+// attention weight-grad tests. The input layer is built with the 4-arg ctor
+// (pError=1) so reads of Layers[0].OutputError are in-bounds.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Attn: TNNetConformerRelPosAttention;
+  SeqLen, Dk, LMax, RMax, NumPos: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, w: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var idx: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for idx := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[idx] - Desired.Raw[idx];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SeqLen := 6;
+  Dk := 4;
+  LMax := 3;
+  RMax := 2;
+  NumPos := LMax + RMax + 1;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetConformerRelPosAttention.Create(Dk, {Causal=}false, LMax, RMax);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    AssertEquals('relpos table has (LeftMax+RightMax+1)*d_k weights',
+      NumPos * Dk, Attn.Neurons[0].Weights.Size);
+
+    // Deterministic NON-zero distance table so the bias genuinely shapes the
+    // softmax (a zero table reduces to plain SDPA).
+    for w := 0 to Attn.Neurons[0].Weights.Size - 1 do
+      Attn.Neurons[0].Weights.Raw[w] := Sin((w + 1) * 0.37) * 0.5;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.8 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.27) * 0.5;
+
+    // ---- Distance-embedding-table gradient ----
+    for w := 0 to Attn.Neurons[0].Weights.Size - 1 do
+    begin
+      Attn.Neurons[0].Weights.Raw[w] := Attn.Neurons[0].Weights.Raw[w] + epsilon;
+      lossPlus := ComputeLoss;
+      Attn.Neurons[0].Weights.Raw[w] := Attn.Neurons[0].Weights.Raw[w] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      Attn.Neurons[0].Weights.Raw[w] := Attn.Neurons[0].Weights.Raw[w] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      Attn.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -Attn.Neurons[0].Delta.Raw[w];
+
+      AssertTrue('relpos table gradient[' + IntToStr(w) +
+        '] num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Input gradient ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      Input.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss;
+      Input.Raw[i] := Input.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      Input.Raw[i] := Input.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('relpos input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConformerRelPosAttentionSerializationRoundTrip;
+// SaveToString/LoadFromString must reconstruct a TNNetConformerRelPosAttention
+// (registered in BOTH dispatch tables) with NON-default hyperparams (d_k=4,
+// LeftMax=3, RightMax=2, Window=2), round-trip the TRAINED distance table and
+// reproduce Compute exactly. Also checks save->load->save string equality.
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Attn, Attn2: TNNetConformerRelPosAttention;
+  S, S2: string;
+  i, w: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := nil;
+  Input := TNNetVolume.Create(6, 1, 12);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 12, 1));
+    Attn := TNNetConformerRelPosAttention.Create(4, {Causal=}false, 3, 2, {Window=}2);
+    NN.AddLayer(Attn);
+    // Simulate a trained distance table so the round-trip has to carry it.
+    for w := 0 to Attn.Neurons[0].Weights.Size - 1 do
+      Attn.Neurons[0].Weights.Raw[w] := Sin((w + 1) * 0.43) * 0.7;
+
+    S := NN.SaveToString();
+    NN2 := TNNet.Create();
+    NN2.LoadFromString(S);
+
+    AssertTrue('Loaded layer is TNNetConformerRelPosAttention',
+      NN2.Layers[1] is TNNetConformerRelPosAttention);
+    Attn2 := NN2.Layers[1] as TNNetConformerRelPosAttention;
+    AssertEquals('relpos LeftMax round-trips', 3, Attn2.LeftMax);
+    AssertEquals('relpos RightMax round-trips', 2, Attn2.RightMax);
+    AssertEquals('relpos window round-trips', 2, Attn2.Window);
+    for w := 0 to Attn.Neurons[0].Weights.Size - 1 do
+      AssertEquals('relpos trained table round-trips at ' + IntToStr(w),
+        Attn.Neurons[0].Weights.Raw[w], Attn2.Neurons[0].Weights.Raw[w], 1e-5);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.29) * 0.8 - 0.1;
+    NN.Compute(Input);
+    NN2.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('relpos save/load Compute match at ' + IntToStr(i),
+        NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+
+    S2 := NN2.SaveToString();
+    AssertEquals('relpos save->load->save string equality', S, S2);
   finally
     NN.Free;
     if Assigned(NN2) then NN2.Free;

@@ -271,6 +271,8 @@ type
     procedure TestM2M100Parity;
     procedure TestSeamlessM4Tv2ConfigFromJSONFile;
     procedure TestSeamlessM4Tv2S2TTParity;
+    procedure TestSeamlessM4Tv2RelKeyConfigFromJSONFile;
+    procedure TestSeamlessM4Tv2RelKeyS2TTParity;
     procedure TestWhisperConfigFromJSONFile;
     procedure TestWhisperParity;
     procedure TestWhisperWordTimestamps;
@@ -11933,6 +11935,143 @@ begin
     AssertTrue('SeamlessM4T S2TT encoder hidden-state parity: max |diff| = ' +
       FloatToStr(MaxHiddenDiff) + ' must be < 1e-4', MaxHiddenDiff < 1e-4);
     AssertTrue('SeamlessM4T S2TT logit parity: max |diff| = ' +
+      FloatToStr(MaxLogitDiff) + ' must be < 1e-4', MaxLogitDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Logits.Free;
+    DecInput.Free;
+    EncInput.Free;
+    RefJson.Free;
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// Verifies ReadSeamlessM4Tv2ConfigFromJSONFile ACCEPTS
+// position_embeddings_type="relative_key" and reads the left/right max
+// position-embedding clamps (the v2 conformer distance-embedding bias).
+procedure TTestNeuralPretrained.TestSeamlessM4Tv2RelKeyConfigFromJSONFile;
+var
+  Config: TSeamlessM4Tv2Config;
+begin
+  Config := ReadSeamlessM4Tv2ConfigFromJSONFile(
+    FixturePath('tiny_seamless_m4t_v2_relkey_config.json'));
+  AssertEquals('model_type', 'seamless_m4t_v2', Config.ModelType);
+  AssertEquals('hidden_size', 16, Config.HiddenSize);
+  AssertEquals('position_embeddings_type', 'relative_key',
+    Config.PositionEmbeddingsType);
+  AssertEquals('left_max_position_embeddings', 4,
+    Config.LeftMaxPositionEmbeddings);
+  AssertEquals('right_max_position_embeddings', 2,
+    Config.RightMaxPositionEmbeddings);
+  AssertEquals('adapted length for 6 frames',
+    SeamlessM4Tv2AdaptedLength(Config, 6), 3);
+end;
+
+// SeamlessM4T-v2 S2TT parity with position_embeddings_type="relative_key": the
+// conformer ENCODER self-attention uses TNNetConformerRelPosAttention (the
+// learned distance-embedding score bias added before softmax, clamped to
+// [-left_max, right_max]); the strided ADAPTER self-attn stays vanilla SDPA
+// (HF use_position_embeddings=False). Checked vs a float64 HF
+// SeamlessM4Tv2ForSpeechToText oracle on the committed relkey pico fixture.
+// Encoder-only hidden-state parity AND full encoder-decoder logit parity, both
+// < 1e-4 (NEVER loosen past 1e-3).
+procedure TTestNeuralPretrained.TestSeamlessM4Tv2RelKeyS2TTParity;
+var
+  Enc, Dec: TNNet;
+  Config: TSeamlessM4Tv2Config;
+  RefRoot: TJSONData;
+  FeatArr, RowArr, SeqArr, HiddenArr, LogitsArr: TJSONArray;
+  EncInput, DecInput, Logits: TNNetVolume;
+  RefJson: TStringList;
+  FrameCnt, ChCnt, PosCnt, AdaptedLen: integer;
+  Diff, MaxHiddenDiff, MaxLogitDiff: double;
+  FoundRelPos: boolean;
+  LayerCnt: integer;
+const
+  SpeechFrames = 6;
+  DecLen = 5;
+begin
+  RandSeed := 424242;
+  BuildSeamlessM4TFromSafeTensors(
+    FixturePath('tiny_seamless_m4t_v2_relkey.safetensors'), Enc, Dec, Config,
+    SpeechFrames, DecLen, {pTrainable=}true,
+    FixturePath('tiny_seamless_m4t_v2_relkey_config.json'));
+  RefJson := TStringList.Create;
+  EncInput := TNNetVolume.Create;
+  DecInput := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('encoder built', Enc <> nil);
+    AssertTrue('decoder built', Dec <> nil);
+    AssertEquals('config carries relative_key', 'relative_key',
+      Config.PositionEmbeddingsType);
+    // The encoder must actually contain at least one relpos attention layer
+    // (otherwise the bias would silently be a no-op).
+    FoundRelPos := false;
+    for LayerCnt := 0 to Enc.Layers.Count - 1 do
+      if Enc.Layers[LayerCnt] is TNNetConformerRelPosAttention then
+        FoundRelPos := true;
+    AssertTrue('encoder uses TNNetConformerRelPosAttention', FoundRelPos);
+
+    AdaptedLen := SeamlessM4Tv2AdaptedLength(Config, SpeechFrames);
+
+    RefJson.LoadFromFile(
+      FixturePath('tiny_seamless_m4t_v2_relkey_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    FeatArr := TJSONArray(TJSONObject(RefRoot).Find('input_features'));
+    SeqArr := TJSONArray(TJSONObject(RefRoot).Find('dec_sequences'));
+    HiddenArr := TJSONArray(TJSONObject(RefRoot).Find('enc_hidden'));
+    LogitsArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    AssertTrue('input_features present', FeatArr <> nil);
+    AssertTrue('enc_hidden present', HiddenArr <> nil);
+    AssertTrue('logits present', LogitsArr <> nil);
+    AssertEquals('adapted_len rows', AdaptedLen, HiddenArr.Count);
+
+    EncInput.ReSize(SpeechFrames, 1, Config.FeatureProjInputDim);
+    for FrameCnt := 0 to SpeechFrames - 1 do
+    begin
+      RowArr := TJSONArray(FeatArr.Items[FrameCnt]);
+      for ChCnt := 0 to Config.FeatureProjInputDim - 1 do
+        EncInput.FData[FrameCnt * Config.FeatureProjInputDim + ChCnt] :=
+          RowArr.Items[ChCnt].AsFloat;
+    end;
+    DecInput.ReSize(DecLen, 1, 1);
+    for PosCnt := 0 to DecLen - 1 do
+      DecInput.FData[PosCnt] := SeqArr.Items[PosCnt].AsInteger;
+
+    // Encoder-only parity: adapted hidden states vs the HF float64 oracle.
+    Enc.Compute(EncInput);
+    MaxHiddenDiff := 0;
+    for PosCnt := 0 to AdaptedLen - 1 do
+    begin
+      RowArr := TJSONArray(HiddenArr.Items[PosCnt]);
+      for ChCnt := 0 to Config.HiddenSize - 1 do
+      begin
+        Diff := Abs(Enc.GetLastLayer().Output.FData[
+          PosCnt * Config.HiddenSize + ChCnt] - RowArr.Items[ChCnt].AsFloat);
+        if Diff > MaxHiddenDiff then MaxHiddenDiff := Diff;
+      end;
+    end;
+
+    // Full S2TT parity through RunT5.
+    RunT5(Enc, Dec, EncInput, DecInput, Logits);
+    AssertEquals('logits size', DecLen * Config.VocabSize, Logits.Size);
+    MaxLogitDiff := 0;
+    for PosCnt := 0 to DecLen - 1 do
+    begin
+      RowArr := TJSONArray(LogitsArr.Items[PosCnt]);
+      for ChCnt := 0 to Config.VocabSize - 1 do
+      begin
+        Diff := Abs(Logits.FData[PosCnt * Config.VocabSize + ChCnt] -
+          RowArr.Items[ChCnt].AsFloat);
+        if Diff > MaxLogitDiff then MaxLogitDiff := Diff;
+      end;
+    end;
+    AssertTrue('SeamlessM4T relkey encoder hidden-state parity: max |diff| = ' +
+      FloatToStr(MaxHiddenDiff) + ' must be < 1e-4', MaxHiddenDiff < 1e-4);
+    AssertTrue('SeamlessM4T relkey logit parity: max |diff| = ' +
       FloatToStr(MaxLogitDiff) + ' must be < 1e-4', MaxLogitDiff < 1e-4);
   finally
     RefRoot.Free;

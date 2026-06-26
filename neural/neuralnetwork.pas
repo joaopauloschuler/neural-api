@@ -279,10 +279,10 @@ type
       FLinkedNeurons: boolean;
       FCanNormalizeDelta: boolean;
       FCanSetNumWeightsForAllNeurons: boolean;
-      // When True, SetNumWeightsForAllNeurons skips allocating the per-neuron
+      // When False, SetNumWeightsForAllNeurons skips allocating the per-neuron
       // training-only buffers (BackInertia/Delta) so an inference-only net is
       // never built at the full ~5x weight footprint. Set by SetTrainable
-      // BEFORE the layer is attached (SetPrevLayer). Default False (trainable).
+      // BEFORE the layer is attached (SetPrevLayer). Default True (trainable).
       // Coded by Claude (AI).
       FIsTrainable: boolean;
       // When True (and FIsTrainable is False), CPU forward passes avoid
@@ -4255,6 +4255,56 @@ type
     property AttSpan: integer read FAttSpan;
     property PosBuckets: integer read FPosBuckets;
     property MaxRelPos: integer read FMaxRelPos;
+  end;
+
+  /// Conformer self-attention with a learnable RELATIVE-POSITION distance-
+  // embedding score bias (HF SeamlessM4Tv2ConformerSelfAttention with
+  // position_embeddings_type="relative_key"; the Transformer-XL "relative_key"
+  // style distance bias added to the logits BEFORE softmax). A drop-in variant
+  // of TNNetScaledDotProductAttention that adds, to every pre-softmax logit, the
+  // DOT PRODUCT of the query with a learned position embedding looked up by the
+  // CLAMPED relative distance of the (query i, key j) pair:
+  //   score[i,j] = ( Q[i].K[j] + Q[i].P[clamp(j-i, -L, R) + L] ) / sqrt(d_k)
+  // where P is a (L + R + 1) x d_k learned table (HF nn.Embedding
+  // distance_embedding) indexed by the clamped distance (j - i = key - query)
+  // plus the left offset L. This is exactly HF's
+  //   relative_position_attn_weights = einsum("bhld,lrd->bhlr", query, P_gather)
+  //   attn_weights = (Q.K^T + relative_position_attn_weights) / sqrt(d_k)
+  // so BOTH the content score AND the relative bias are divided by sqrt(d_k)
+  // (one shared scale). The bias is added only on UNMASKED logits, so causal /
+  // sliding-window masked positions stay masked (-1e9 sentinel); the parent's
+  // window (Window > 0) is honoured. Encoder layer (bidirectional by default);
+  // KV-cache incremental decode is NOT supported.
+  // Input layout (same as SDPA): SizeY = 1, SizeX = sequence length,
+  // Depth = 3 * d_k (depth axis = concatenation Q | K | V). Output shape:
+  // SizeX x 1 x d_k.
+  // Trainable parameters: the (L + R + 1) x d_k distance-embedding table lives
+  // in the single neuron FNeurons[0], so it round-trips through the base
+  // per-neuron save/load and steps with the optimizer. LeftMax is stored in
+  // FStruct[3] and RightMax in FStruct[4] (FStruct[0..2] = d_k / causal /
+  // window, as in the parent). The backward pass is the exact adjoint of the
+  // two score terms: it scatters dScore into dQ (the K[j] + P[idx] directions),
+  // dK and the distance-embedding table (dP[idx] += g * Q[i]).
+  // Coded by Claude (AI).
+  TNNetConformerRelPosAttention = class(TNNetScaledDotProductAttention)
+  private
+    FLeftMax: integer;   // left_max_position_embeddings (past clamp)
+    FRightMax: integer;  // right_max_position_embeddings (future clamp)
+    FSeqLen: integer;
+    // Row index into the distance-embedding table per (i,j) pair, built once
+    // per input width in SetPrevLayer: FPosIdx[i*SeqLen+j] =
+    // clamp(j - i, -L, R) + L, already in [0, L+R].
+    FPosIdx: array of integer;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(d_k: integer; pCausalMask: boolean = false;
+      pLeftMax: integer = 64; pRightMax: integer = 8;
+      pWindow: integer = 0); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    procedure InitDefault(); override;
+    property LeftMax: integer read FLeftMax;
+    property RightMax: integer read FRightMax;
   end;
 
   /// ALiBi attention (Press et al. 2022, "Train Short, Test Long: Attention
@@ -30189,6 +30239,211 @@ begin
   begin
     FNeurons[0].UpdateWeights(FInertia);
     FNeurons[1].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetConformerRelPosAttention }
+
+constructor TNNetConformerRelPosAttention.Create(d_k: integer;
+  pCausalMask: boolean; pLeftMax: integer; pRightMax: integer; pWindow: integer);
+begin
+  inherited Create(d_k, pCausalMask, pWindow);
+  FLeftMax := pLeftMax;
+  FRightMax := pRightMax;
+  if FLeftMax < 0 then
+    FErrorProc('TNNetConformerRelPosAttention requires LeftMax >= 0. LeftMax=' +
+      IntToStr(FLeftMax));
+  if FRightMax < 0 then
+    FErrorProc('TNNetConformerRelPosAttention requires RightMax >= 0. RightMax='
+      + IntToStr(FRightMax));
+  // FStruct[0..2] taken by the parent (d_k, causal flag, window).
+  FStruct[3] := FLeftMax;
+  FStruct[4] := FRightMax;
+end;
+
+procedure TNNetConformerRelPosAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  i, j, dist, NumPos, SeqLM1: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FSeqLen := pPrevLayer.FOutput.SizeX;
+  // ONE neuron: the (LeftMax + RightMax + 1) x d_k distance-embedding table
+  // (HF nn.Embedding distance_embedding). Storing it as neuron weights
+  // round-trips it through the base per-neuron save/load and steps it with the
+  // optimizer.
+  NumPos := FLeftMax + FRightMax + 1;
+  if FNeurons.Count < 1 then AddMissingNeurons(1 - FNeurons.Count);
+  SetNumWeightsForAllNeurons(NumPos, 1, FDk);
+  AfterWeightUpdate();
+  // Precompute the table row per (i,j) pair (HF gather math): distance =
+  // (key j) - (query i) = j - i, clamped to [-LeftMax, RightMax], index =
+  // distance + LeftMax in [0, LeftMax+RightMax].
+  SetLength(FPosIdx, FSeqLen * FSeqLen);
+  SeqLM1 := FSeqLen - 1;
+  for i := 0 to SeqLM1 do
+    for j := 0 to SeqLM1 do
+    begin
+      dist := j - i;
+      if dist < -FLeftMax then dist := -FLeftMax;
+      if dist > FRightMax then dist := FRightMax;
+      FPosIdx[i * FSeqLen + j] := dist + FLeftMax;
+    end;
+end;
+
+procedure TNNetConformerRelPosAttention.InitDefault();
+begin
+  // Small Gaussian init for the distance-embedding table (a real projection,
+  // like an nn.Embedding). The SeamlessM4T-v2 importer overwrites it with the
+  // checkpoint distance_embedding weight anyway.
+  if FNeurons.Count >= 1 then
+  begin
+    FNeurons[0].InitGaussian(0.02);
+    AfterWeightUpdate();
+  end;
+end;
+
+procedure TNNetConformerRelPosAttention.Compute();
+const
+  cMaskFloor = -1e8; // same all-masked-row floor as the parent
+var
+  StartTime: double;
+  SeqLen, i, j, d: integer;
+  SeqLenM1, DkM1: integer;
+  Score, MaxScore, SumExp, c2c, c2p: TNeuralFloat;
+  Prev: TNNetVolume;
+  OutPtr, Prow: TNeuralFloatArrPtr;
+  PosT: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  SeqLenM1 := SeqLen - 1;
+  DkM1 := FDk - 1;
+  PosT := FNeurons[0].FWeights; // distance-embedding table, row a at (a,0,0)
+  for i := 0 to SeqLenM1 do
+  begin
+    MaxScore := -1e30;
+    for j := 0 to SeqLenM1 do
+    begin
+      if ScoreIsMasked(i, j, false, nil, 0) then
+      begin
+        FAttn[j, i, 0] := -1e9;
+      end
+      else
+      begin
+        // Content-to-content: Q[i].K[j] (depth-contiguous AVX dot).
+        c2c := TNNetVolume.DotProduct(
+          Prev.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, FDk), FDk);
+        // Content-to-position: Q[i].P[idx(i,j)].
+        Prow := PosT.GetRawPtr(FPosIdx[i * SeqLen + j], 0, 0);
+        c2p := TNNetVolume.DotProduct(Prev.GetRawPtr(i, 0, 0), Prow, FDk);
+        Score := (c2c + c2p) * FInvSqrtDk;
+        FAttn[j, i, 0] := Score;
+      end;
+      if FAttn[j, i, 0] > MaxScore then MaxScore := FAttn[j, i, 0];
+    end;
+    if MaxScore <= cMaskFloor then
+    begin
+      for j := 0 to SeqLenM1 do
+        FAttn[j, i, 0] := 0;
+    end
+    else
+    begin
+      SumExp := 0;
+      for j := 0 to SeqLenM1 do
+      begin
+        Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
+        FAttn[j, i, 0] := Score;
+        SumExp := SumExp + Score;
+      end;
+      if SumExp > 0 then
+        for j := 0 to SeqLenM1 do
+          FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
+    end;
+    OutPtr := FOutput.GetRawPtr(i, 0, 0);
+    for d := 0 to DkM1 do
+      OutPtr^[d] := 0;
+    for j := 0 to SeqLenM1 do
+      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
+        FAttn[j, i, 0], FDk);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetConformerRelPosAttention.Backpropagate();
+var
+  StartTime: double;
+  SeqLen, i, j, kk: integer;
+  SeqLenM1: integer;
+  Prev, PrevErr, PosT, dPosT: TNNetVolume;
+  SumDAttnAttn, A, g: TNeuralFloat;
+  Prow: TNeuralFloatArrPtr;
+  a_idx: integer;
+  HasPrevErr: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  PrevErr := FPrevLayer.FOutputError;
+  PosT := FNeurons[0].FWeights;
+  dPosT := FNeurons[0].FDelta;
+  SeqLen := Prev.SizeX;
+  SeqLenM1 := SeqLen - 1;
+  HasPrevErr := (FPrevLayer.Output.Size > 0) and
+    (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size);
+  if Length(FdAttnBuf) <> SeqLen then SetLength(FdAttnBuf, SeqLen);
+  if Length(FdScoreBuf) <> SeqLen then SetLength(FdScoreBuf, SeqLen);
+  for i := 0 to SeqLenM1 do
+  begin
+    // ---- dV and dAttn (identical to the parent) ----
+    for j := 0 to SeqLenM1 do
+    begin
+      A := FAttn[j, i, 0];
+      if HasPrevErr then
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, 2 * FDk),
+          FOutputError.GetRawPtr(i, 0, 0), A, FDk);
+      FdAttnBuf[j] := TNNetVolume.DotProduct(
+        FOutputError.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, 2 * FDk), FDk);
+    end;
+    // ---- softmax Jacobian -> dScore ----
+    SumDAttnAttn := 0;
+    for kk := 0 to SeqLenM1 do
+      SumDAttnAttn := SumDAttnAttn + FdAttnBuf[kk] * FAttn[kk, i, 0];
+    for j := 0 to SeqLenM1 do
+      FdScoreBuf[j] := FAttn[j, i, 0] * (FdAttnBuf[j] - SumDAttnAttn);
+    // ---- scatter dScore into Q, K and the distance-embedding table ----
+    // score[i,j] = (Q_i.K_j + Q_i.P_a) * FInvSqrtDk.
+    //   dQ_i += g*(K_j + P_a);  dK_j += g*Q_i;  dP_a += g*Q_i.
+    //   (g = dScore * FInvSqrtDk)
+    for j := 0 to SeqLenM1 do
+    begin
+      g := FdScoreBuf[j] * FInvSqrtDk;
+      if g = 0 then continue;
+      a_idx := FPosIdx[i * SeqLen + j];
+      Prow := PosT.GetRawPtr(a_idx, 0, 0);
+      // Distance-embedding table grad (delta convention: += -lr * grad).
+      TNNetVolume.MulAdd(dPosT.GetRawPtr(a_idx, 0, 0),
+        Prev.GetRawPtr(i, 0, 0), -FLearningRate * g, FDk);
+      if HasPrevErr then
+      begin
+        // dQ_i += g*K_j + g*P_a
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(i, 0, 0),
+          Prev.GetRawPtr(j, 0, FDk), g, FDk);
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(i, 0, 0), Prow, g, FDk);
+        // dK_j += g*Q_i
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, FDk),
+          Prev.GetRawPtr(i, 0, 0), g, FDk);
+      end;
+    end;
+  end;
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
     AfterWeightUpdate();
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -95940,6 +96195,7 @@ begin
       'TNNetQKNormAttention' :      Result := TNNetQKNormAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetT5RelPosBiasAttention' : Result := TNNetT5RelPosBiasAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]);
       'TNNetDisentangledAttention' : Result := TNNetDisentangledAttention.Create(St[0], St[1] = 1, St[3], St[4], St[5]);
+      'TNNetConformerRelPosAttention' : Result := TNNetConformerRelPosAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]);
       'TNNetALiBiAttention' :       Result := TNNetALiBiAttention.Create(St[0], St[1] = 1, Ft[1], St[2]);
       'TNNetWindowAttention' :      Result := TNNetWindowAttention.Create(St[0], St[5]);
       'TNNetSAMVisionAttention' :   Result := TNNetSAMVisionAttention.Create(St[0], St[1], St[2], St[3]);
@@ -96356,6 +96612,7 @@ begin
       if S[0] = 'TNNetQKNormAttention' then Result := TNNetQKNormAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetT5RelPosBiasAttention' then Result := TNNetT5RelPosBiasAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]) else
       if S[0] = 'TNNetDisentangledAttention' then Result := TNNetDisentangledAttention.Create(St[0], St[1] = 1, St[3], St[4], St[5]) else
+      if S[0] = 'TNNetConformerRelPosAttention' then Result := TNNetConformerRelPosAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]) else
       if S[0] = 'TNNetALiBiAttention' then Result := TNNetALiBiAttention.Create(St[0], St[1] = 1, Ft[1], St[2]) else
       if S[0] = 'TNNetWindowAttention' then Result := TNNetWindowAttention.Create(St[0], St[5]) else
       if S[0] = 'TNNetSAMVisionAttention' then Result := TNNetSAMVisionAttention.Create(St[0], St[1], St[2], St[3]) else
