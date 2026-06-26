@@ -9164,6 +9164,117 @@ function ReadMMDiTConfigFromJSONFile(const FileName: string): TMMDiTConfig;
 function MMDiTConfigToString(const Config: TMMDiTConfig): string;
 
 // ---------------------------------------------------------------------------
+// CogVideoX NATIVE TEXT-TO-VIDEO IMPORT (THUDM/CogVideoX-2b, diffusers
+// CogVideoXTransformer3DModel + the 3D-causal-conv AutoencoderKLCogVideoX
+// decode tail; Yang et al. 2024, "CogVideoX", arXiv:2408.06072). A SELF-
+// CONTAINED native video generator: a flat MMDiT-style transformer over a
+// flattened (frame x height x width) latent token sequence with T5 text
+// conditioning + expert adaLN-Zero modulation, distinct from AnimateDiff
+// (which bolts a temporal module onto a frozen SD UNet). v1 scope: the DiT
+// denoiser forward + the 3D-causal VAE DECODE tail, to be driven by the landed
+// TNNetDiffusionScheduler DDIM / DPM-Solver++(2M) loop (no training).
+//
+// TWO genuinely-new primitives, both expressed by REUSING landed leaves:
+//   1. 3D causal-conv VAE: a depth-axis CAUSAL temporal convolution (left-pad
+//      the time axis, no peeking at future frames) over a (NumFrames, H*W, C)
+//      channel-major reshape -- the video analogue of the VideoMAE space<->time
+//      transpose, built from TNNetTransposeXD + TNNetCausalConv1D (no new leaf).
+//   2. 3D RoPE over (t,h,w)-factored positions, expressed by TNNetMRotaryEmbedding
+//      (the Qwen2-VL M-RoPE leaf) with mrope_section = (SectionT,SectionH,SectionW).
+// The adaLN-Zero modulation reuses DiTModCond / TNNetFiLM exactly as
+// MMDiT/PixArt/VAR; T5 text states are fed as the THIRD input (synthetic for the
+// pico parity, BuildT5FromSafeTensors at inference).
+//
+//   DENOISER (one block faithful to diffusers CogVideoXBlock):
+//     c   = SiLU(time_embed(t))            // cond vector, width hidden
+//     txt = text_proj(text_states)         // (TextSeqLen, hidden)
+//     vid = patch_embed(flat_latent)       // (T*H*W, hidden)
+//     // CogVideoXBlock: norm1 (CogVideoXLayerNormZero) -> 6*hidden chunked into
+//     //   (shift,scale,gate,enc_shift,enc_scale,enc_gate); video uses the first
+//     //   triple, text the second. Joint attention over [txt;vid] with 3D RoPE
+//     //   on the VIDEO portion of q,k only; gated residual; norm2 + FFN.
+//     // final: norm_out adaLN(SiLU(c)->2*hidden) + proj_out over the video part.
+//   VAE DECODE: causal temporal conv (CLAT->CLAT, kernel KT) over each spatial
+//     cell + SiLU + pointwise conv (CLAT->VOUT).
+// ---------------------------------------------------------------------------
+type
+  TCogVideoXConfig = record
+    HiddenSize: integer;        // num_attention_heads * attention_head_dim
+    NumLayers: integer;         // number of CogVideoXBlock transformer blocks
+    NumHeads: integer;          // num_attention_heads
+    HeadDim: integer;           // attention_head_dim
+    MlpHidden: integer;         // FFN inner width (4*hidden default)
+    NumFrames: integer;         // latent frames T
+    GridHeight: integer;        // latent grid H
+    GridWidth: integer;         // latent grid W
+    InChannels: integer;        // latent in-channels (denoiser input)
+    OutChannels: integer;       // denoiser eps out-channels
+    TextDim: integer;           // T5 text-encoder width (caption channels)
+    TextSeqLen: integer;        // number of text tokens
+    RopeBase: TNeuralFloat;     // 3D RoPE theta base (10000)
+    RopeSectionT: integer;      // mrope_section temporal pairs
+    RopeSectionH: integer;      // mrope_section height pairs
+    RopeSectionW: integer;      // mrope_section width pairs
+    LayerNormEps: TNeuralFloat; // 1e-5
+    // ---- 3D-causal-conv VAE decode tail ----
+    VaeLatentChannels: integer; // VAE latent channels (decode input)
+    VaeOutChannels: integer;    // decoded RGB channels
+    VaeTemporalKernel: integer; // temporal causal kernel size KT
+    ModelType: string;          // 'CogVideoXTransformer3DModel'
+  end;
+
+// Reads a CogVideoX pico config.json (the make_pico_cogvideox_fixture.py layout
+// or a real diffusers transformer_config + vae_config merge). Required:
+// hidden_size, num_attention_heads, attention_head_dim, num_layers, num_frames,
+// grid_height, grid_width, in_channels, text_dim, text_seq_len. Optional with
+// defaults: out_channels (= in_channels), mlp_hidden (= 4*hidden), rope_base
+// (10000), rope_section_{t,h,w} (split head_dim/2), layer_norm_eps (1e-5),
+// vae_* (decode tail). Coded by Claude (AI).
+function ReadCogVideoXConfigFromJSONFile(const FileName: string): TCogVideoXConfig;
+
+function CogVideoXConfigToString(const Config: TCogVideoXConfig): string;
+
+// Builds the CogVideoX denoiser described by Config and loads every weight from
+// Reader (caller owns Reader). THREE inputs (latent / scalar t / T5 states); it
+// outputs the (NumFrames*GridHeight*GridWidth flattened to (T,H,W,OutChannels))
+// raw eps prediction. Coded by Claude (AI).
+function BuildCogVideoX(Reader: TNNetSafeTensorsReader;
+  const Config: TCogVideoXConfig; pTrainable: boolean = true): TNNet;
+
+function BuildCogVideoXFromSafeTensorsEx(const FileName: string;
+  const Config: TCogVideoXConfig; pTrainable: boolean = true): TNNet;
+
+function BuildCogVideoXFromSafeTensors(const FileName: string;
+  out Config: TCogVideoXConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+
+// Builds the 3D-causal-conv VAE DECODE tail described by Config (a separate
+// TNNet): input (T,H*W,VaeLatentChannels) channel-major -> output
+// (T,H*W,VaeOutChannels). Coded by Claude (AI).
+function BuildCogVideoXVaeDecoderFromSafeTensorsEx(const FileName: string;
+  const Config: TCogVideoXConfig; pTrainable: boolean = true): TNNet;
+
+// Runs the 3D-causal-conv VAE decode tail over every spatial cell of a
+// (NumFrames, GridHeight*GridWidth, VaeLatentChannels) channel-major latent,
+// writing the decoded (NumFrames, GridHeight*GridWidth, VaeOutChannels) video.
+// VaeNet is the single-cell net from BuildCogVideoXVaeDecoderFromSafeTensorsEx.
+// Coded by Claude (AI).
+procedure DecodeCogVideoXVae(VaeNet: TNNet; const Config: TCogVideoXConfig;
+  Latent: TNNetVolume; DecodedOut: TNNetVolume);
+
+// Returns the CogVideoX denoiser's timestep input (the (1,1,1) scalar, the
+// SECOND TNNetInput) and T5 text-states input (the THIRD TNNetInput).
+function CogVideoXTimestepInput(Net: TNNet): TNNetLayer;
+function CogVideoXTextInput(Net: TNNet): TNNetLayer;
+
+// Fills the timestep input with t and copies TextStates ((TextSeqLen,1,TextDim))
+// into the text-states input, then sets the 3D M-RoPE positions on every
+// TNNetMRotaryEmbedding layer for the (NumFrames x GridHeight x GridWidth)
+// grid. Call before Net.Compute. Coded by Claude (AI).
+procedure CogVideoXConditioning(Net: TNNet; const Config: TCogVideoXConfig;
+  t: TNeuralFloat; TextStates: TNNetVolume);
+
+// ---------------------------------------------------------------------------
 // VQGAN / DISCRETE IMAGE-TOKENIZER IMPORT (diffusers VQModel, the encoder used
 // by autoregressive / masked image generators - MaskGIT, Parti, LlamaGen - to
 // turn an image into a grid of codebook token IDs and back).
@@ -65786,6 +65897,518 @@ begin
   finally
     Reader.Free;
   end;
+end;
+
+// ============================ CogVideoX IMPORT =============================
+// Coded by Claude (AI).
+
+function ReadCogVideoXConfigFromJSONFile(
+  const FileName: string): TCogVideoXConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  HalfPairs: integer;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('CogVideoX import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('CogVideoX import: config field "' + FieldName +
+        '" must be a positive integer.');
+  end;
+
+  function OptInt(const FieldName: string; Def: integer): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then Result := Def
+    else Result := Obj.Get(FieldName, Def);
+  end;
+
+  function OptFloat(const FieldName: string; Def: TNeuralFloat): TNeuralFloat;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then Result := Def
+    else Result := Obj.Get(FieldName, double(Def));
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('CogVideoX import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('CogVideoX import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('CogVideoX import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.HeadDim := RequiredInt('attention_head_dim');
+    Result.NumLayers := RequiredInt('num_layers');
+    Result.NumFrames := RequiredInt('num_frames');
+    Result.GridHeight := RequiredInt('grid_height');
+    Result.GridWidth := RequiredInt('grid_width');
+    Result.InChannels := RequiredInt('in_channels');
+    Result.TextDim := RequiredInt('text_dim');
+    Result.TextSeqLen := RequiredInt('text_seq_len');
+    Result.OutChannels := OptInt('out_channels', Result.InChannels);
+    Result.MlpHidden := OptInt('mlp_hidden', 4 * Result.HiddenSize);
+    Result.RopeBase := OptFloat('rope_base', 10000.0);
+    HalfPairs := Result.HeadDim div 2;
+    Result.RopeSectionT := OptInt('rope_section_t', HalfPairs - 2 * (HalfPairs div 4));
+    Result.RopeSectionH := OptInt('rope_section_h', HalfPairs div 4);
+    Result.RopeSectionW := OptInt('rope_section_w', HalfPairs div 4);
+    Result.LayerNormEps := OptFloat('layer_norm_eps', 1e-5);
+    Result.VaeLatentChannels := OptInt('vae_latent_channels', Result.InChannels);
+    Result.VaeOutChannels := OptInt('vae_out_channels', 3);
+    Result.VaeTemporalKernel := OptInt('vae_temporal_kernel', 3);
+    Result.ModelType := Obj.Get('_class_name', 'CogVideoXTransformer3DModel');
+    if Result.HiddenSize <> Result.NumHeads * Result.HeadDim then
+      ImportError('CogVideoX import: hidden_size must equal ' +
+        'num_attention_heads*attention_head_dim.');
+    if (Result.RopeSectionT + Result.RopeSectionH + Result.RopeSectionW) <>
+       HalfPairs then
+      ImportError('CogVideoX import: rope_section_{t,h,w} must sum to ' +
+        'head_dim/2 (' + IntToStr(HalfPairs) + ').');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function CogVideoXConfigToString(const Config: TCogVideoXConfig): string;
+begin
+  Result := 'CogVideoX(' + Config.ModelType + ' hidden=' +
+    IntToStr(Config.HiddenSize) + ' layers=' + IntToStr(Config.NumLayers) +
+    ' heads=' + IntToStr(Config.NumHeads) + ' frames=' +
+    IntToStr(Config.NumFrames) + ' grid=' + IntToStr(Config.GridHeight) + 'x' +
+    IntToStr(Config.GridWidth) + ' textL=' + IntToStr(Config.TextSeqLen) + ')';
+end;
+
+// Builds the joint per-head attention over [txt;vid] with 3D M-RoPE on the
+// VIDEO portion of Q,K only. Returns the (LT+LV,1,d) attended sequence (BEFORE
+// out-projection). The fused Q/K/V projections + out-proj are loaded by the
+// caller. d=hidden, LT=text tokens, LV=video tokens.
+function AddCogVideoXJointAttention(NN: TNNet;
+  QProj, KProj, VProj: TNNetLayer; const Config: TCogVideoXConfig;
+  LT, LV: integer): TNNetLayer;
+var
+  d, HeadDim, h, HeadDimM1: integer;
+  QSlice, KSlice, VSlice: TNNetLayer;
+  QTxt, QVid, KTxt, KVid, QRot, KRot, HeadPack: TNNetLayer;
+  HeadOuts: array of TNNetLayer;
+  SliceCh: array of integer;
+  dd: integer;
+begin
+  d := Config.HiddenSize;
+  HeadDim := Config.HeadDim;
+  HeadDimM1 := HeadDim - 1;
+  SetLength(HeadOuts, Config.NumHeads);
+  SetLength(SliceCh, HeadDim);
+  for h := 0 to Config.NumHeads - 1 do
+  begin
+    for dd := 0 to HeadDimM1 do SliceCh[dd] := h * HeadDim + dd;
+    QSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(SliceCh), QProj );
+    KSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(SliceCh), KProj );
+    VSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(SliceCh), VProj );
+    // split [txt | vid] on the sequence (X) axis; rotate the video part only.
+    QTxt := NN.AddLayerAfter( TNNetCrop.Create(0, 0, LT, 1), QSlice );
+    QVid := NN.AddLayerAfter( TNNetCrop.Create(LT, 0, LV, 1), QSlice );
+    QVid := NN.AddLayerAfter(
+      TNNetMRotaryEmbedding.Create(Config.RopeBase, Config.RopeSectionT,
+        Config.RopeSectionH, Config.RopeSectionW), QVid );
+    QRot := NN.AddLayer( TNNetConcat.Create(LT + LV, 1, HeadDim, [QTxt, QVid]) );
+    KTxt := NN.AddLayerAfter( TNNetCrop.Create(0, 0, LT, 1), KSlice );
+    KVid := NN.AddLayerAfter( TNNetCrop.Create(LT, 0, LV, 1), KSlice );
+    KVid := NN.AddLayerAfter(
+      TNNetMRotaryEmbedding.Create(Config.RopeBase, Config.RopeSectionT,
+        Config.RopeSectionH, Config.RopeSectionW), KVid );
+    KRot := NN.AddLayer( TNNetConcat.Create(LT + LV, 1, HeadDim, [KTxt, KVid]) );
+    // pack [Q|K|V] (width 3*head_dim) for one full (non-causal) SDPA.
+    HeadPack := NN.AddLayer( TNNetDeepConcat.Create([QRot, KRot, VSlice]) );
+    HeadOuts[h] := NN.AddLayerAfter(
+      TNNetScaledDotProductAttention.Create(HeadDim, {CausalMask=}false),
+      HeadPack );
+  end;
+  Result := NN.AddLayer( TNNetDeepConcat.Create(HeadOuts) );
+end;
+
+function BuildCogVideoX(Reader: TNNetSafeTensorsReader;
+  const Config: TCogVideoXConfig; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  LatentInput, TInput, TextInput: TNNetLayer;
+  TSin, TFc0, TSilu0, TFc2, CondSilu: TNNetLayer;
+  TextProj, PatchEmb, VidLayer, TxtLayer: TNNetLayer;
+  d, LV, LT, MlpHidden, BlockCnt, NumLayersM1: integer;
+  p: string;
+
+  // one CogVideoXBlock; updates VidLayer/TxtLayer in place.
+  procedure AddBlock(const Pfx: string);
+  var
+    Ada1, Ada2: TNNetLayer;
+    VLN1, TLN1, VFiLM1, TFiLM1, JointN1: TNNetLayer;
+    QP, KP, VP, Attn, AttOut: TNNetLayer;
+    VAttn, TAttn, VGate1, TGate1, VGated1, TGated1: TNNetLayer;
+    VLN2, TLN2, VFiLM2, TFiLM2, JointN2, Ff1, FfAct, Ff2: TNNetLayer;
+    VFf, TFf, VGate2, TGate2, VGated2, TGated2: TNNetLayer;
+  begin
+    // ---- attention sub-block: norm1 (CogVideoXLayerNormZero) -> 6*d ----
+    Ada1 := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(6 * d).SetTrainable(pTrainable), CondSilu);
+    // video uses chunk (shift0,scale1,gate2); text uses (shift3,scale4,gate5).
+    VLN1 := NN.AddLayerAfter(
+      TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), VidLayer);
+    VFiLM1 := NN.AddLayer( TNNetFiLM.Create(
+      [VLN1, DiTModCond(NN, Ada1, {scale}1 * d, {shift}0 * d, d)]) );
+    TLN1 := NN.AddLayerAfter(
+      TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), TxtLayer);
+    TFiLM1 := NN.AddLayer( TNNetFiLM.Create(
+      [TLN1, DiTModCond(NN, Ada1, {scale}4 * d, {shift}3 * d, d)]) );
+    // joint normed sequence (text first), then fused q/k/v.
+    JointN1 := NN.AddLayer( TNNetConcat.Create(LT + LV, 1, d, [TFiLM1, VFiLM1]) );
+    QP := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), JointN1);
+    KP := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), JointN1);
+    VP := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), JointN1);
+    Attn := AddCogVideoXJointAttention(NN, QP, KP, VP, Config, LT, LV);
+    AttOut := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), Attn);
+    // split attention output back per stream + gated residual.
+    TAttn := NN.AddLayerAfter( TNNetCrop.Create(0, 0, LT, 1), AttOut );
+    VAttn := NN.AddLayerAfter( TNNetCrop.Create(LT, 0, LV, 1), AttOut );
+    VGate1 := NN.AddLayerAfter( TNNetSplitChannels.Create(2 * d, d), Ada1 );
+    TGate1 := NN.AddLayerAfter( TNNetSplitChannels.Create(5 * d, d), Ada1 );
+    VGated1 := NN.AddLayer( TNNetChannelMulByLayer.Create(VAttn, VGate1) );
+    TGated1 := NN.AddLayer( TNNetChannelMulByLayer.Create(TAttn, TGate1) );
+    VidLayer := NN.AddLayer( TNNetSum.Create([VGated1, VidLayer]) );
+    TxtLayer := NN.AddLayer( TNNetSum.Create([TGated1, TxtLayer]) );
+
+    // ---- FFN sub-block: norm2 -> 6*d ----
+    Ada2 := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(6 * d).SetTrainable(pTrainable), CondSilu);
+    VLN2 := NN.AddLayerAfter(
+      TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), VidLayer);
+    VFiLM2 := NN.AddLayer( TNNetFiLM.Create(
+      [VLN2, DiTModCond(NN, Ada2, {scale}1 * d, {shift}0 * d, d)]) );
+    TLN2 := NN.AddLayerAfter(
+      TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), TxtLayer);
+    TFiLM2 := NN.AddLayer( TNNetFiLM.Create(
+      [TLN2, DiTModCond(NN, Ada2, {scale}4 * d, {shift}3 * d, d)]) );
+    JointN2 := NN.AddLayer( TNNetConcat.Create(LT + LV, 1, d, [TFiLM2, VFiLM2]) );
+    Ff1 := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(MlpHidden).SetTrainable(pTrainable), JointN2);
+    FfAct := NN.AddLayerAfter( TNNetGELU.Create(), Ff1 ); // gelu_tanh
+    Ff2 := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), FfAct);
+    TFf := NN.AddLayerAfter( TNNetCrop.Create(0, 0, LT, 1), Ff2 );
+    VFf := NN.AddLayerAfter( TNNetCrop.Create(LT, 0, LV, 1), Ff2 );
+    VGate2 := NN.AddLayerAfter( TNNetSplitChannels.Create(2 * d, d), Ada2 );
+    TGate2 := NN.AddLayerAfter( TNNetSplitChannels.Create(5 * d, d), Ada2 );
+    VGated2 := NN.AddLayer( TNNetChannelMulByLayer.Create(VFf, VGate2) );
+    TGated2 := NN.AddLayer( TNNetChannelMulByLayer.Create(TFf, TGate2) );
+    VidLayer := NN.AddLayer( TNNetSum.Create([VGated2, VidLayer]) );
+    TxtLayer := NN.AddLayer( TNNetSum.Create([TGated2, TxtLayer]) );
+
+    // ---- load weights ----
+    LoadLlamaLinearWeights(Reader, Ada1, Pfx + 'norm1.linear.weight',
+      d, 6 * d, 0, -1, 0, Pfx + 'norm1.linear.bias');
+    LoadLlamaLinearWeights(Reader, QP, Pfx + 'attn1.to_q.weight',
+      d, d, 0, -1, 0, Pfx + 'attn1.to_q.bias');
+    LoadLlamaLinearWeights(Reader, KP, Pfx + 'attn1.to_k.weight',
+      d, d, 0, -1, 0, Pfx + 'attn1.to_k.bias');
+    LoadLlamaLinearWeights(Reader, VP, Pfx + 'attn1.to_v.weight',
+      d, d, 0, -1, 0, Pfx + 'attn1.to_v.bias');
+    LoadLlamaLinearWeights(Reader, AttOut, Pfx + 'attn1.to_out.0.weight',
+      d, d, 0, -1, 0, Pfx + 'attn1.to_out.0.bias');
+    LoadLlamaLinearWeights(Reader, Ada2, Pfx + 'norm2.linear.weight',
+      d, 6 * d, 0, -1, 0, Pfx + 'norm2.linear.bias');
+    LoadLlamaLinearWeights(Reader, Ff1, Pfx + 'ff.net.0.proj.weight',
+      d, MlpHidden, 0, -1, 0, Pfx + 'ff.net.0.proj.bias');
+    LoadLlamaLinearWeights(Reader, Ff2, Pfx + 'ff.net.2.weight',
+      MlpHidden, d, 0, -1, 0, Pfx + 'ff.net.2.bias');
+  end;
+
+var
+  FinalAda, FinalLN, FinalFiLM, FinalLin: TNNetLayer;
+begin
+  d := Config.HiddenSize;
+  LV := Config.NumFrames * Config.GridHeight * Config.GridWidth;
+  LT := Config.TextSeqLen;
+  MlpHidden := Config.MlpHidden;
+  NumLayersM1 := Config.NumLayers - 1;
+  NN := TNNet.Create();
+  try
+    // input0: the (NumFrames*GridH*GridW, 1, in_channels) flattened latent.
+    LatentInput := NN.AddLayer( TNNetInput.Create(LV, 1, Config.InChannels) );
+    PatchEmb := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
+    VidLayer := PatchEmb;
+    // input1: scalar timestep t -> 256-d sinusoid -> MLP -> SiLU cond vector.
+    TInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
+    TSin := NN.AddLayerAfter( TNNetSinusoidalTimeEmbedding.Create(256), TInput );
+    TFc0 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
+    TSilu0 := NN.AddLayer( TNNetSiLU.Create() );
+    TFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
+    CondSilu := NN.AddLayer( TNNetSiLU.Create() ); // c = SiLU(time_embed(t))
+    // input2: T5 text states -> text_proj (TextDim -> d).
+    TextInput := NN.AddLayer( TNNetInput.Create(LT, 1, Config.TextDim) );
+    TextProj := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
+    TxtLayer := TextProj;
+    if not pTrainable then NN.SetTrainable();
+
+    for BlockCnt := 0 to NumLayersM1 do
+    begin
+      p := 'transformer_blocks.' + IntToStr(BlockCnt) + '.';
+      AddBlock(p);
+    end;
+
+    // ---- final layer: norm_out adaLN(SiLU(c)->2*d) + proj_out (video only) ----
+    FinalAda := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(2 * d).SetTrainable(pTrainable), CondSilu);
+    FinalLN := NN.AddLayerAfter(
+      TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), VidLayer);
+    FinalFiLM := NN.AddLayer( TNNetFiLM.Create(
+      [FinalLN, DiTModCond(NN, FinalAda, {scale}1 * d, {shift}0 * d, d)]) );
+    FinalLin := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.OutChannels).SetTrainable(pTrainable), FinalFiLM);
+    if not pTrainable then NN.SetTrainable();
+
+    // ---------------- Weights ----------------
+    LoadLlamaLinearWeights(Reader, PatchEmb, 'patch_embed.weight',
+      Config.InChannels, d, 0, -1, 0, 'patch_embed.bias');
+    LoadLlamaLinearWeights(Reader, TFc0, 'time_embedding.linear_1.weight',
+      256, d, 0, -1, 0, 'time_embedding.linear_1.bias');
+    SwapSinCosInputColumns(TFc0, 256);
+    LoadLlamaLinearWeights(Reader, TFc2, 'time_embedding.linear_2.weight',
+      d, d, 0, -1, 0, 'time_embedding.linear_2.bias');
+    LoadLlamaLinearWeights(Reader, TextProj, 'text_proj.weight',
+      Config.TextDim, d, 0, -1, 0, 'text_proj.bias');
+    LoadLlamaLinearWeights(Reader, FinalAda, 'norm_out.linear.weight',
+      d, 2 * d, 0, -1, 0, 'norm_out.linear.bias');
+    LoadLlamaLinearWeights(Reader, FinalLin, 'proj_out.weight',
+      d, Config.OutChannels, 0, -1, 0, 'proj_out.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildCogVideoXFromSafeTensorsEx(const FileName: string;
+  const Config: TCogVideoXConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildCogVideoX(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildCogVideoXFromSafeTensors(const FileName: string;
+  out Config: TCogVideoXConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadCogVideoXConfigFromJSONFile(ConfigPath);
+  Result := BuildCogVideoXFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+function BuildCogVideoXVaeDecoderFromSafeTensorsEx(const FileName: string;
+  const Config: TCogVideoXConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  InLayer, TConv, ActLayer, OutConv: TNNetLayer;
+  T, HW, Clat, Vout, KT, co, k, cprime, n: integer;
+  WV, BV: TNNetVolume;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  try
+    T := Config.NumFrames;
+    HW := Config.GridHeight * Config.GridWidth;
+    Clat := Config.VaeLatentChannels;
+    Vout := Config.VaeOutChannels;
+    KT := Config.VaeTemporalKernel;
+    NN := TNNet.Create();
+    // The 3D-causal VAE decode tail. Each SPATIAL cell is an independent
+    // temporal sequence: time rides the X axis, the C channels ride the Depth
+    // axis (the VideoMAE space<->time view). TNNetCausalConv1D requires SizeY=1,
+    // so this net decodes ONE cell (T,1,Clat) -> (T,1,Vout); the caller
+    // (DecodeCogVideoXVae) runs it once per cell over the H*W grid, reusing the
+    // same shared causal-conv weights -- exactly the diffusers
+    // CogVideoXCausalConv3d depth-axis causal temporal convolution (left pad
+    // KT-1, no future-frame leakage) followed by SiLU + a pointwise 1x1 conv.
+    InLayer := NN.AddLayer( TNNetInput.Create(T, 1, Clat) );
+    TConv := NN.AddLayer(
+      TNNetCausalConv1D.Create(Clat, KT, {SuppressBias=}0).SetTrainable(pTrainable) );
+    ActLayer := NN.AddLayer( TNNetSiLU.Create() );
+    OutConv := NN.AddLayer(
+      TNNetCausalConv1D.Create(Vout, 1, {SuppressBias=}0).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
+
+    // ---- weights ----
+    // temporal conv: decoder.conv_in.weight (Clat, KT, Clat) -> neuron co holds
+    // (KT,1,Clat) = Wt[co,k,c'] exactly (CausalConv1D index W[k,0,c']).
+    if not Reader.HasTensor('decoder.conv_in.weight') then
+      ImportError('CogVideoX VAE import: missing "decoder.conv_in.weight".');
+    EnsureWritableImportWeights(TConv);
+    WV := TNNetVolume.Create;
+    BV := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat('decoder.conv_in.weight', WV);
+      if WV.Size <> Clat * KT * Clat then
+        ImportError('CogVideoX VAE import: "decoder.conv_in.weight" size ' +
+          IntToStr(WV.Size) + ' <> ' + IntToStr(Clat * KT * Clat) + '.');
+      for co := 0 to Clat - 1 do
+      begin
+        n := 0;
+        for k := 0 to KT - 1 do
+          for cprime := 0 to Clat - 1 do
+          begin
+            TConv.FArrNeurons[co].Weights.FData[n] :=
+              WV.FData[(co * KT + k) * Clat + cprime];
+            Inc(n);
+          end;
+      end;
+      Reader.LoadTensorFlat('decoder.conv_in.bias', BV);
+      for co := 0 to Clat - 1 do TConv.FArrNeurons[co].BiasWeight := BV.FData[co];
+      TConv.FlushWeightCache();
+      // pointwise conv: decoder.conv_out.weight (Vout, Clat) -> neuron co holds
+      // (1,1,Clat).
+      Reader.LoadTensorFlat('decoder.conv_out.weight', WV);
+      Reader.LoadTensorFlat('decoder.conv_out.bias', BV);
+      EnsureWritableImportWeights(OutConv);
+      for co := 0 to Vout - 1 do
+      begin
+        for cprime := 0 to Clat - 1 do
+          OutConv.FArrNeurons[co].Weights.FData[cprime] :=
+            WV.FData[co * Clat + cprime];
+        OutConv.FArrNeurons[co].BiasWeight := BV.FData[co];
+      end;
+      OutConv.FlushWeightCache();
+    finally
+      WV.Free;
+      BV.Free;
+    end;
+    Result := NN;
+  except
+    NN.Free;
+    Reader.Free;
+    raise;
+  end;
+  Reader.Free;
+end;
+
+procedure DecodeCogVideoXVae(VaeNet: TNNet; const Config: TCogVideoXConfig;
+  Latent: TNNetVolume; DecodedOut: TNNetVolume);
+var
+  T, HW, Clat, Vout, cell, ti, c: integer;
+  CellIn: TNNetVolume;
+begin
+  T := Config.NumFrames;
+  HW := Config.GridHeight * Config.GridWidth;
+  Clat := Config.VaeLatentChannels;
+  Vout := Config.VaeOutChannels;
+  // Latent is (T, HW, Clat) channel-major; DecodedOut becomes (T, HW, Vout).
+  DecodedOut.ReSize(T, HW, Vout);
+  CellIn := TNNetVolume.Create(T, 1, Clat);
+  try
+    for cell := 0 to HW - 1 do
+    begin
+      // gather this cell's temporal column (T frames, Clat channels).
+      for ti := 0 to T - 1 do
+        for c := 0 to Clat - 1 do
+          CellIn.FData[ti * Clat + c] := Latent[ti, cell, c];
+      VaeNet.Compute(CellIn);
+      for ti := 0 to T - 1 do
+        for c := 0 to Vout - 1 do
+          DecodedOut[ti, cell, c] := VaeNet.GetLastLayer().Output[ti, 0, c];
+    end;
+  finally
+    CellIn.Free;
+  end;
+end;
+
+function CogVideoXTimestepInput(Net: TNNet): TNNetLayer;
+var
+  i, cnt: integer;
+begin
+  Result := nil;
+  cnt := 0;
+  for i := 0 to Net.CountLayers() - 1 do
+    if Net.Layers[i] is TNNetInput then
+    begin
+      if cnt = 1 then begin Result := Net.Layers[i]; exit; end;
+      Inc(cnt);
+    end;
+end;
+
+function CogVideoXTextInput(Net: TNNet): TNNetLayer;
+var
+  i, cnt: integer;
+begin
+  Result := nil;
+  cnt := 0;
+  for i := 0 to Net.CountLayers() - 1 do
+    if Net.Layers[i] is TNNetInput then
+    begin
+      if cnt = 2 then begin Result := Net.Layers[i]; exit; end;
+      Inc(cnt);
+    end;
+end;
+
+procedure CogVideoXConditioning(Net: TNNet; const Config: TCogVideoXConfig;
+  t: TNeuralFloat; TextStates: TNNetVolume);
+var
+  TInp, TextInp: TNNetLayer;
+  PosT, PosH, PosW: array of integer;
+  i, ft, hh, ww, LV: integer;
+begin
+  TInp := CogVideoXTimestepInput(Net);
+  TextInp := CogVideoXTextInput(Net);
+  if (TInp = nil) or (TextInp = nil) then
+    ImportError('CogVideoXConditioning: timestep/text inputs not found.');
+  TInp.Output.ReSize(1, 1, 1);
+  TInp.Output.FData[0] := t;
+  TextInp.Output.CopyNoChecks(TextStates);
+  // build the 3-D positions for the (NumFrames x GridH x GridW) video grid and
+  // stamp them on every TNNetMRotaryEmbedding layer (the per-head video Q/K).
+  LV := Config.NumFrames * Config.GridHeight * Config.GridWidth;
+  SetLength(PosT, LV);
+  SetLength(PosH, LV);
+  SetLength(PosW, LV);
+  i := 0;
+  for ft := 0 to Config.NumFrames - 1 do
+    for hh := 0 to Config.GridHeight - 1 do
+      for ww := 0 to Config.GridWidth - 1 do
+      begin
+        PosT[i] := ft; PosH[i] := hh; PosW[i] := ww;
+        Inc(i);
+      end;
+  for i := 0 to Net.CountLayers() - 1 do
+    if Net.Layers[i] is TNNetMRotaryEmbedding then
+      TNNetMRotaryEmbedding(Net.Layers[i]).SetPositions(PosT, PosH, PosW);
 end;
 
 // ============================ VideoMAE IMPORT ==============================

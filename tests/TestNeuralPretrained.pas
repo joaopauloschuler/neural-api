@@ -489,6 +489,7 @@ type
     procedure TestPixArtParity;
     procedure TestMMDiTConfigFromJSONFile;
     procedure TestMMDiTJointBlockParity;
+    procedure TestCogVideoXParity;
     procedure TestLatentTextToImageSmoke;
     procedure TestRRDBNetParity;
     procedure TestNAFNetConfigFromJSONFile;
@@ -20521,6 +20522,117 @@ begin
     CondInput.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestCogVideoXParity;
+var
+  NN, VaeNN: TNNet;
+  Config: TCogVideoXConfig;
+  Latent, TextStates, Decoded, VaeLatent: TNNetVolume;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  DenArr, VaeArr: TJSONArray;
+  CaseObj: TJSONObject;
+  LatArr, TextArr, EpsArr, VLatArr, DecArr: TJSONArray;
+  LV, T, GH, GW, CaseCnt, idx, i, ft, hh, ww, c: integer;
+  tval, RefVal, GotVal, Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  Config := ReadCogVideoXConfigFromJSONFile(
+    FixturePath('tiny_cogvideox_config.json'));
+  T := Config.NumFrames; GH := Config.GridHeight; GW := Config.GridWidth;
+  LV := T * GH * GW;
+  NN := BuildCogVideoXFromSafeTensorsEx(
+    FixturePath('tiny_cogvideox.safetensors'), Config, {pTrainable=}true);
+  VaeNN := BuildCogVideoXVaeDecoderFromSafeTensorsEx(
+    FixturePath('tiny_cogvideox.safetensors'), Config, {pTrainable=}true);
+  RefJson := TStringList.Create;
+  Latent := TNNetVolume.Create;
+  TextStates := TNNetVolume.Create;
+  Decoded := TNNetVolume.Create;
+  VaeLatent := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  try
+    AssertTrue('cogvideox denoiser built', NN <> nil);
+    AssertTrue('cogvideox vae built', VaeNN <> nil);
+    RefJson.LoadFromFile(FixturePath('tiny_cogvideox_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    // ---- (A) denoiser parity ----
+    DenArr := TJSONArray(TJSONObject(RefRoot).Find('denoiser'));
+    AssertTrue('denoiser cases present', DenArr <> nil);
+    for CaseCnt := 0 to DenArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(DenArr.Items[CaseCnt]);
+      LatArr := TJSONArray(CaseObj.Find('latent'));  // flat (T,GH,GW,Cin)
+      tval := CaseObj.Find('t').AsFloat;
+      TextArr := TJSONArray(CaseObj.Find('text'));   // flat (Lt,TextDim)
+      EpsArr := TJSONArray(CaseObj.Find('eps'));      // flat (T,GH,GW,Cout)
+      // latent -> (LV,1,Cin): flat (T,GH,GW,Cin) IS token-major already.
+      Latent.ReSize(LV, 1, Config.InChannels);
+      for i := 0 to LV * Config.InChannels - 1 do
+        Latent.FData[i] := LatArr.Items[i].AsFloat;
+      TextStates.ReSize(Config.TextSeqLen, 1, Config.TextDim);
+      for i := 0 to Config.TextSeqLen * Config.TextDim - 1 do
+        TextStates.FData[i] := TextArr.Items[i].AsFloat;
+      CogVideoXConditioning(NN, Config, tval, TextStates);
+      NN.Compute(Latent);
+      // output is (LV,1,Cout) token-major == flat (T,GH,GW,Cout).
+      for i := 0 to LV * Config.OutChannels - 1 do
+      begin
+        RefVal := EpsArr.Items[i].AsFloat;
+        GotVal := NN.GetLastLayer().Output.FData[i];
+        Diff := Abs(GotVal - RefVal);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('CogVideoX denoiser: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+    // ---- (B) VAE-decode parity ----
+    VaeArr := TJSONArray(TJSONObject(RefRoot).Find('vae'));
+    AssertTrue('vae cases present', VaeArr <> nil);
+    for CaseCnt := 0 to VaeArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(VaeArr.Items[CaseCnt]);
+      VLatArr := TJSONArray(CaseObj.Find('latent'));   // flat (T,GH,GW,Clat)
+      DecArr := TJSONArray(CaseObj.Find('decoded'));   // flat (T,GH,GW,Vout)
+      // pack into the (T, HW, Clat) channel-major layout DecodeCogVideoXVae wants.
+      VaeLatent.ReSize(T, GH * GW, Config.VaeLatentChannels);
+      idx := 0;
+      for ft := 0 to T - 1 do
+        for hh := 0 to GH - 1 do
+          for ww := 0 to GW - 1 do
+            for c := 0 to Config.VaeLatentChannels - 1 do
+            begin
+              VaeLatent[ft, hh * GW + ww, c] := VLatArr.Items[idx].AsFloat;
+              Inc(idx);
+            end;
+      DecodeCogVideoXVae(VaeNN, Config, VaeLatent, Decoded);
+      idx := 0;
+      for ft := 0 to T - 1 do
+        for hh := 0 to GH - 1 do
+          for ww := 0 to GW - 1 do
+            for c := 0 to Config.VaeOutChannels - 1 do
+            begin
+              RefVal := DecArr.Items[idx].AsFloat;
+              GotVal := Decoded[ft, hh * GW + ww, c];
+              Diff := Abs(GotVal - RefVal);
+              if Diff > MaxDiff then MaxDiff := Diff;
+              Inc(idx);
+            end;
+    end;
+    AssertTrue('CogVideoX denoiser+VAE: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Latent.Free;
+    TextStates.Free;
+    Decoded.Free;
+    VaeLatent.Free;
+    RefJson.Free;
+    NN.Free;
+    VaeNN.Free;
   end;
 end;
 
