@@ -5229,6 +5229,110 @@ function BuildMusicGenFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TMusicGenModel;
 
 // ---------------------------------------------------------------------------
+// MUSICGEN MELODY IMPORT (model_type "musicgen_melody", facebook/musicgen-
+// melody): MELODY-conditioned music generation. It REUSES the landed text-
+// MusicGen path for the T5 text encoder, the EnCodec codec, the delay-pattern
+// codebook interleaving, the K embedding tables / K LM heads, and the
+// sinusoidal positions. The genuinely NEW pieces are:
+//   (a) a CHROMA front-end (neuralaudio.ComputeMusicgenMelodyChroma): a 12-bin
+//       one-hot chromagram of a reference waveform;
+//   (b) a DECODER-ONLY architecture: unlike text-MusicGen's Marian/Pegasus
+//       CROSS-attention decoder, the melody decoder is a causal self-attention
+//       LM whose conditioning (chroma + text) is PREPENDED to the decoder
+//       sequence. The chroma is projected by audio_enc_to_dec_proj
+//       (num_chroma -> hidden), the text states by enc_to_dec_proj
+//       (text_d_model -> hidden), and the prefix is concat([chroma, text]) on
+//       the sequence axis (CHROMA FIRST), repeat-tiled/truncated to
+//       chroma_length frames for the chroma part. Logits are read only at the
+//       decoder-frame positions.
+// v1 is INFERENCE-only on CPU.
+// Coded by Claude (AI).
+type
+  TMusicGenMelodyConfig = record
+    TextDModel: integer;        // text_encoder.d_model (enc_to_dec_proj in)
+    Hidden: integer;            // decoder.hidden_size
+    NumLayers: integer;         // decoder.num_hidden_layers
+    NumHeads: integer;          // decoder.num_attention_heads
+    FFNDim: integer;            // decoder.ffn_dim
+    VocabSize: integer;         // decoder.vocab_size (codebook_size)
+    NumCodebooks: integer;      // decoder.num_codebooks
+    MaxPositionEmbeddings: integer; // decoder.max_position_embeddings
+    AudioChannels: integer;     // decoder.audio_channels (1 mono)
+    NumChroma: integer;         // config.num_chroma (12)
+    ChromaLength: integer;      // config.chroma_length (conditioning frames)
+    ModelType: string;          // 'musicgen_melody'
+  end;
+
+  { TMusicGenMelodyModel }
+  // Holds the imported MusicGen Melody decoder: the K embedding tables, the
+  // sinusoidal table, enc_to_dec_proj (text) and audio_enc_to_dec_proj
+  // (chroma), and the causal self-attention decoder TNNet (input = the full
+  // [prefix | frame] embedding sequence, output = K*vocab depth-concatenated
+  // logits over the WHOLE sequence; the caller reads the last DecSeqLen
+  // positions). Built by BuildMusicGenMelodyFromSafeTensors[Ex]; caller-owned.
+  // Coded by Claude (AI).
+  TMusicGenMelodyModel = class
+  private
+    FConfig: TMusicGenMelodyConfig;
+    FDecoder: TNNet;
+    FEmbed: array of TNNetVolume;          // [K] each (vocab+1)*hidden flat
+    FPosTable: TNNetVolume;                // (PrefixLen+MaxFrames)*hidden
+    FEncToDecW, FEncToDecB: TNNetVolume;   // text enc_to_dec_proj
+    FAudioW, FAudioB: TNNetVolume;         // chroma audio_enc_to_dec_proj
+    FDecSeqLen, FEncSeqLen, FPrefixLen: integer;
+  public
+    constructor Create(const pConfig: TMusicGenMelodyConfig;
+      EncSeqLen, DecSeqLen: integer);
+    destructor Destroy; override;
+    property Config: TMusicGenMelodyConfig read FConfig;
+    property Decoder: TNNet read FDecoder;
+    property DecSeqLen: integer read FDecSeqLen;
+    property EncSeqLen: integer read FEncSeqLen;
+    property PrefixLen: integer read FPrefixLen;
+    // Builds the conditioning PREFIX (chroma_length + EncSeqLen, 1, Hidden):
+    // ChromaCond is the one-hot chroma sequence (any length; repeat-tiled and
+    // truncated to ChromaLength), EncStates the RAW T5 text hidden states
+    // (EncSeqLen x TextDModel). Prefix[0..ChromaLength-1] = audio_enc_to_dec_proj
+    // (chroma); Prefix[ChromaLength..] = enc_to_dec_proj(text). Coded by Claude
+    // (AI).
+    procedure BuildConditioningPrefix(ChromaCond, EncStates, Prefix: TNNetVolume);
+    // Computes decoder logits for a code stack Codes[k][t] (k in [0,K-1], t in
+    // [0,DecSeqLen-1]) given the conditioning Prefix (from
+    // BuildConditioningPrefix). Logits is filled (DecSeqLen,1,K*VocabSize) at
+    // the decoder-frame positions: codebook k's vocab vector at frame t lives in
+    // depth slot k*VocabSize..k*VocabSize+VocabSize-1.
+    procedure ComputeLogits(const Codes: TNNetIntArr2D;
+      Prefix, Logits: TNNetVolume);
+    // Greedy autoregressive generation of NumFrames audio frames using the delay
+    // pattern, conditioned on Prefix. Returns the UNDELAYED code stack
+    // Codes[k][t]. Coded by Claude (AI).
+    procedure Generate(Prefix: TNNetVolume; NumFrames: integer;
+      out Codes: TNNetIntArr2D);
+  end;
+
+// Reads a HF MusicGen Melody config.json (model_type "musicgen_melody"). Pulls
+// the decoder sub-config + num_chroma / chroma_length + text_encoder.d_model.
+// activation_function must be "gelu" (exact erf). Coded by Claude (AI).
+function ReadMusicGenMelodyConfigFromJSONFile(
+  const FileName: string): TMusicGenMelodyConfig;
+function MusicGenMelodyConfigToString(
+  const Config: TMusicGenMelodyConfig): string;
+
+// Builds a TMusicGenMelodyModel (the decoder side) from Reader (caller owns
+// Reader). EncSeqLen/DecSeqLen fix the text-conditioning and decoder sequence
+// lengths. pTrainable=False frees training volumes. Coded by Claude (AI).
+function BuildMusicGenMelodyFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  const Config: TMusicGenMelodyConfig; EncSeqLen, DecSeqLen: integer;
+  pTrainable: boolean = true): TMusicGenMelodyModel;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+function BuildMusicGenMelodyFromSafeTensors(const FileName: string;
+  out Config: TMusicGenMelodyConfig; EncSeqLen, DecSeqLen: integer;
+  pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TMusicGenMelodyModel;
+
+// ---------------------------------------------------------------------------
 // RWKV-4 IMPORT (model_type "rwkv": RWKV/rwkv-4-169m-pile and siblings,
 // architectures ["RwkvForCausalLM"]) - the FIRST NON-TRANSFORMER importer:
 // a recurrent WKV mixer (Peng et al. 2023, arXiv:2305.13048) that decodes
@@ -27444,7 +27548,7 @@ procedure BuildPegasusStackBlocks(NN: TNNet; const Config: TPegasusConfig;
   NumBlocks, NumHeads, FFNDim: integer; IsDecoder: boolean;
   EncStates: TNNetLayer; var Blocks: TMarianBlockArray;
   pTrainable: boolean; pQuantizeInt8: boolean = false;
-  UseReluFFN: boolean = false);
+  UseReluFFN: boolean = false; pSelfAttnOnly: boolean = false);
 var
   HeadDim, BlockCnt, HeadCnt, d, NumBlocksM1, NumHeadsM1, HeadDimM1: integer;
   ResidualInput, NormedInput, HiddenAct, PhiBranch: TNNetLayer;
@@ -27497,7 +27601,11 @@ begin
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), ResidualInput]) );
 
     // ---- cross-attention sub-block (decoder only, PRE-norm) ----
-    if IsDecoder then
+    // pSelfAttnOnly suppresses it: MusicGen Melody is a DECODER-ONLY causal LM
+    // (the chroma+text conditioning is PREPENDED to the self-attention sequence,
+    // never read through cross-attention), so its blocks are causal-self-attn +
+    // FFN with NO encoder_attn sub-block (.CrossAttn stays nil).
+    if IsDecoder and (not pSelfAttnOnly) then
     begin
       ResidualInput := NN.GetLastLayer();
       Blocks[BlockCnt].CrossAttn.Norm := NN.AddLayer(
@@ -28814,6 +28922,521 @@ begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
     Result := BuildMusicGenFromSafeTensorsEx(Reader, Config, EncSeqLen,
+      DecSeqLen, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+// ===========================================================================
+// MUSICGEN MELODY IMPLEMENTATION (see the MUSICGEN MELODY IMPORT section).
+// ===========================================================================
+
+function ReadMusicGenMelodyConfigFromJSONFile(
+  const FileName: string): TMusicGenMelodyConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, DecObj, TextObj: TJSONObject;
+  Node: TJSONData;
+  ModelType, ActFn: string;
+
+  function GetInt(O: TJSONObject; const Name: string; Def: integer): integer;
+  begin
+    if (O <> nil) and (O.IndexOfName(Name) >= 0) then Result := O.Get(Name, Def)
+    else Result := Def;
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('MusicGen Melody import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError('MusicGen Melody import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', '');
+    if (ModelType <> '') and (ModelType <> 'musicgen_melody') then
+      ImportError('MusicGen Melody import: config model_type is "' + ModelType +
+        '", expected "musicgen_melody".');
+    Result.ModelType := 'musicgen_melody';
+    DecObj := Obj;
+    Node := Obj.Find('decoder');
+    if (Node <> nil) and (Node is TJSONObject) then DecObj := TJSONObject(Node);
+    TextObj := nil;
+    Node := Obj.Find('text_encoder');
+    if (Node <> nil) and (Node is TJSONObject) then TextObj := TJSONObject(Node);
+    Result.TextDModel := GetInt(TextObj, 'd_model',
+      GetInt(Obj, 'text_d_model', 0));
+    Result.Hidden := GetInt(DecObj, 'hidden_size', 0);
+    Result.NumLayers := GetInt(DecObj, 'num_hidden_layers', 0);
+    Result.NumHeads := GetInt(DecObj, 'num_attention_heads', 0);
+    Result.FFNDim := GetInt(DecObj, 'ffn_dim', 0);
+    Result.VocabSize := GetInt(DecObj, 'vocab_size', 0);
+    Result.NumCodebooks := GetInt(DecObj, 'num_codebooks', 0);
+    Result.MaxPositionEmbeddings :=
+      GetInt(DecObj, 'max_position_embeddings', 2048);
+    Result.AudioChannels := GetInt(DecObj, 'audio_channels', 1);
+    // num_chroma / chroma_length live on the TOP-level config (HF puts them on
+    // MusicgenMelodyConfig, not the decoder sub-config); the pico fixture also
+    // flattens them to the top.
+    Result.NumChroma := GetInt(Obj, 'num_chroma', 12);
+    Result.ChromaLength := GetInt(Obj, 'chroma_length', 235);
+    ActFn := DecObj.Get('activation_function', 'gelu');
+    if (Result.TextDModel <= 0) or (Result.Hidden <= 0) or
+       (Result.NumLayers <= 0) or (Result.NumHeads <= 0) or
+       (Result.FFNDim <= 0) or (Result.VocabSize <= 0) or
+       (Result.NumCodebooks <= 0) then
+      ImportError('MusicGen Melody import: config "' + FileName + '" is ' +
+        'missing a required field.');
+    if Result.AudioChannels <> 1 then
+      ImportError('MusicGen Melody import: only mono (audio_channels=1) is ' +
+        'supported in v1, got ' + IntToStr(Result.AudioChannels) + '.');
+    if (Result.NumChroma <= 0) or (Result.ChromaLength <= 0) then
+      ImportError('MusicGen Melody import: num_chroma and chroma_length must ' +
+        'be > 0.');
+    if ActFn <> 'gelu' then
+      ImportError('MusicGen Melody import: activation_function "' + ActFn +
+        '" is not supported (only exact-erf "gelu").');
+    if Odd(Result.Hidden) then
+      ImportError('MusicGen Melody import: hidden_size must be EVEN.');
+    if (Result.Hidden mod Result.NumHeads) <> 0 then
+      ImportError('MusicGen Melody import: num_attention_heads must divide ' +
+        'hidden_size.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function MusicGenMelodyConfigToString(
+  const Config: TMusicGenMelodyConfig): string;
+begin
+  Result := 'musicgen_melody config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', hidden=' + IntToStr(Config.Hidden) +
+    ', ffn=' + IntToStr(Config.FFNDim) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', codebooks=' + IntToStr(Config.NumCodebooks) +
+    ', num_chroma=' + IntToStr(Config.NumChroma) +
+    ', chroma_length=' + IntToStr(Config.ChromaLength) +
+    ', text_d_model=' + IntToStr(Config.TextDModel) +
+    ', max_pos=' + IntToStr(Config.MaxPositionEmbeddings);
+end;
+
+{ TMusicGenMelodyModel }
+
+constructor TMusicGenMelodyModel.Create(const pConfig: TMusicGenMelodyConfig;
+  EncSeqLen, DecSeqLen: integer);
+var
+  k_i, NumCbM1: integer;
+begin
+  inherited Create;
+  FConfig := pConfig;
+  FEncSeqLen := EncSeqLen;
+  FDecSeqLen := DecSeqLen;
+  FPrefixLen := pConfig.ChromaLength + EncSeqLen;
+  SetLength(FEmbed, FConfig.NumCodebooks);
+  NumCbM1 := FConfig.NumCodebooks - 1;
+  for k_i := 0 to NumCbM1 do FEmbed[k_i] := TNNetVolume.Create;
+  FPosTable := TNNetVolume.Create;
+  FEncToDecW := TNNetVolume.Create;
+  FEncToDecB := TNNetVolume.Create;
+  FAudioW := TNNetVolume.Create;
+  FAudioB := TNNetVolume.Create;
+  FDecoder := nil;
+end;
+
+destructor TMusicGenMelodyModel.Destroy;
+var
+  k_i, FEmbedHi: integer;
+begin
+  FEmbedHi := High(FEmbed);
+  for k_i := 0 to FEmbedHi do FEmbed[k_i].Free;
+  SetLength(FEmbed, 0);
+  FPosTable.Free;
+  FEncToDecW.Free;
+  FEncToDecB.Free;
+  FAudioW.Free;
+  FAudioB.Free;
+  FDecoder.Free;
+  inherited Destroy;
+end;
+
+procedure TMusicGenMelodyModel.BuildConditioningPrefix(
+  ChromaCond, EncStates, Prefix: TNNetVolume);
+var
+  t, o, i, c, srcT, nIn: integer;
+  HiddenM1, NumChromaM1, TextDModelM1, ChromaLenM1, EncSeqLenM1: integer;
+  Acc: TNeuralFloat;
+begin
+  HiddenM1 := FConfig.Hidden - 1;
+  NumChromaM1 := FConfig.NumChroma - 1;
+  TextDModelM1 := FConfig.TextDModel - 1;
+  ChromaLenM1 := FConfig.ChromaLength - 1;
+  EncSeqLenM1 := FEncSeqLen - 1;
+  Prefix.ReSize(FPrefixLen, 1, FConfig.Hidden);
+  // ---- chroma rows: repeat-tile ChromaCond to ChromaLength, then project ----
+  // HF repeats audio_hidden_states to chroma_length and truncates; equivalently
+  // chroma source row for prefix frame t is ChromaCond[t mod nIn].
+  nIn := ChromaCond.SizeX;
+  if nIn < 1 then
+    ImportError('MusicGen Melody: chroma conditioning has zero frames.');
+  if ChromaCond.Depth <> FConfig.NumChroma then
+    ImportError('MusicGen Melody: chroma conditioning depth must be num_chroma.');
+  for t := 0 to ChromaLenM1 do
+  begin
+    srcT := t mod nIn;
+    for o := 0 to HiddenM1 do
+    begin
+      Acc := FAudioB.FData[o];
+      for c := 0 to NumChromaM1 do
+        Acc := Acc + FAudioW.FData[o * FConfig.NumChroma + c] *
+          ChromaCond.FData[srcT * FConfig.NumChroma + c];
+      Prefix.FData[t * FConfig.Hidden + o] := Acc;
+    end;
+  end;
+  // ---- text rows: enc_to_dec_proj(EncStates), placed AFTER the chroma rows ----
+  if EncStates.Depth <> FConfig.TextDModel then
+    ImportError('MusicGen Melody: text states depth must be text_d_model.');
+  for t := 0 to EncSeqLenM1 do
+    for o := 0 to HiddenM1 do
+    begin
+      Acc := FEncToDecB.FData[o];
+      for i := 0 to TextDModelM1 do
+        Acc := Acc + FEncToDecW.FData[o * FConfig.TextDModel + i] *
+          EncStates.FData[t * FConfig.TextDModel + i];
+      Prefix.FData[(FConfig.ChromaLength + t) * FConfig.Hidden + o] := Acc;
+    end;
+end;
+
+procedure TMusicGenMelodyModel.ComputeLogits(const Codes: TNNetIntArr2D;
+  Prefix, Logits: TNNetVolume);
+var
+  InSeq: TNNetVolume;
+  FullLen, t, k_i, c, tok: integer;
+  NumCodebooksM1, HiddenM1, FDecSeqLenM1, PrefixLenM1, KV: integer;
+begin
+  NumCodebooksM1 := FConfig.NumCodebooks - 1;
+  HiddenM1 := FConfig.Hidden - 1;
+  FDecSeqLenM1 := FDecSeqLen - 1;
+  PrefixLenM1 := FPrefixLen - 1;
+  FullLen := FPrefixLen + FDecSeqLen;
+  if Length(Codes) <> FConfig.NumCodebooks then
+    ImportError('MusicGen Melody ComputeLogits: wrong codebook count.');
+  if Prefix.Size <> FPrefixLen * FConfig.Hidden then
+    ImportError('MusicGen Melody ComputeLogits: prefix size mismatch.');
+  InSeq := TNNetVolume.Create;
+  try
+    InSeq.ReSize(FullLen, 1, FConfig.Hidden);
+    // ---- prefix rows (conditioning) + their sinusoidal positions ----
+    for t := 0 to PrefixLenM1 do
+      for c := 0 to HiddenM1 do
+        InSeq.FData[t * FConfig.Hidden + c] :=
+          Prefix.FData[t * FConfig.Hidden + c] +
+          FPosTable.FData[t * FConfig.Hidden + c];
+    // ---- decoder frame rows: sum of K codebook lookups + sinusoidal pos ----
+    for t := 0 to FDecSeqLenM1 do
+    begin
+      for c := 0 to HiddenM1 do
+        InSeq.FData[(FPrefixLen + t) * FConfig.Hidden + c] :=
+          FPosTable.FData[(FPrefixLen + t) * FConfig.Hidden + c];
+      for k_i := 0 to NumCodebooksM1 do
+      begin
+        tok := Codes[k_i][t];
+        if (tok < 0) or (tok > FConfig.VocabSize) then
+          ImportError('MusicGen Melody ComputeLogits: code out of range.');
+        for c := 0 to HiddenM1 do
+          InSeq.FData[(FPrefixLen + t) * FConfig.Hidden + c] :=
+            InSeq.FData[(FPrefixLen + t) * FConfig.Hidden + c] +
+            FEmbed[k_i].FData[tok * FConfig.Hidden + c];
+      end;
+    end;
+    FDecoder.Compute(InSeq);
+    // The net emits logits over the WHOLE sequence; copy the last DecSeqLen
+    // (decoder-frame) positions into Logits (DecSeqLen,1,K*VocabSize).
+    KV := FConfig.NumCodebooks * FConfig.VocabSize;
+    Logits.ReSize(FDecSeqLen, 1, KV);
+    for t := 0 to FDecSeqLenM1 do
+      for c := 0 to KV - 1 do
+        Logits.FData[t * KV + c] :=
+          FDecoder.GetLastLayer().Output.FData[(FPrefixLen + t) * KV + c];
+  finally
+    InSeq.Free;
+  end;
+end;
+
+procedure TMusicGenMelodyModel.Generate(Prefix: TNNetVolume;
+  NumFrames: integer; out Codes: TNNetIntArr2D);
+var
+  Logits: TNNetVolume;
+  Delayed: TNNetIntArr2D;
+  PadId, Steps, step, k_i, v, best, t, base, NumCodebooksM1, VsM1: integer;
+  StepsM1, NumFramesM1, Off: integer;
+  bestVal, vv: TNeuralFloat;
+begin
+  PadId := FConfig.VocabSize;
+  Steps := NumFrames + FConfig.NumCodebooks - 1;  // mono: offset k for row k
+  NumCodebooksM1 := FConfig.NumCodebooks - 1;
+  StepsM1 := Steps - 1;
+  VsM1 := FConfig.VocabSize - 1;
+  NumFramesM1 := NumFrames - 1;
+  if Steps >= FDecSeqLen then
+    ImportError('MusicGen Melody Generate: NumFrames + K exceeds DecSeqLen.');
+  Logits := TNNetVolume.Create;
+  try
+    SetLength(Delayed, FConfig.NumCodebooks);
+    for k_i := 0 to NumCodebooksM1 do
+    begin
+      SetLength(Delayed[k_i], FDecSeqLen);
+      for step := 0 to FDecSeqLen - 1 do Delayed[k_i][step] := PadId;
+    end;
+    for step := 0 to StepsM1 do
+    begin
+      ComputeLogits(Delayed, Prefix, Logits);
+      t := step + 1;
+      for k_i := 0 to NumCodebooksM1 do
+      begin
+        Off := k_i;  // mono delay offset
+        if (t < FDecSeqLen) and (t >= Off + 1) and
+           (t - Off - 1 < NumFrames) then
+        begin
+          base := step * (FConfig.NumCodebooks * FConfig.VocabSize) +
+            k_i * FConfig.VocabSize;
+          best := 0;
+          bestVal := Logits.FData[base];
+          for v := 1 to VsM1 do
+          begin
+            vv := Logits.FData[base + v];
+            if vv > bestVal then begin bestVal := vv; best := v; end;
+          end;
+          Delayed[k_i][t] := best;
+        end;
+      end;
+    end;
+    SetLength(Codes, FConfig.NumCodebooks);
+    for k_i := 0 to NumCodebooksM1 do
+    begin
+      Off := k_i;
+      SetLength(Codes[k_i], NumFrames);
+      for t := 0 to NumFramesM1 do
+        Codes[k_i][t] := Delayed[k_i][t + Off + 1];
+    end;
+  finally
+    Logits.Free;
+  end;
+end;
+
+// Builds the melody decoder net: full-sequence input -> causal self-attn blocks
+// (NO cross-attention) -> final LN -> K LM heads depth-concatenated. The input
+// width FullSeqLen = ChromaLength + EncSeqLen + DecSeqLen carries the prepended
+// conditioning prefix and the decoder frames in ONE causal self-attention
+// stream. Coded by Claude (AI).
+function BuildMusicGenMelodyDecoderNet(const Config: TMusicGenMelodyConfig;
+  FullSeqLen: integer; pTrainable: boolean;
+  out Blocks: TMarianBlockArray;
+  out HeadLayers: array of TNNetLayer; out FinalLN: TNNetLayer): TNNet;
+var
+  Dec: TNNet;
+  DecInput: TNNetLayer;
+  PegShim: TPegasusConfig;
+  k_i, NumCbM1: integer;
+begin
+  Dec := TNNet.Create();
+  DecInput := Dec.AddLayer( TNNetInput.Create(FullSeqLen, 1, Config.Hidden) );
+  Dec.AddLayerAfter( TNNetIdentity.Create(), DecInput );
+  PegShim.DModel := Config.Hidden;
+  PegShim.VocabSize := Config.VocabSize;
+  // Self-attention-only decoder blocks (pSelfAttnOnly): causal self-attn + FFN,
+  // no encoder_attn. EncStates is nil (unused when pSelfAttnOnly).
+  BuildPegasusStackBlocks(Dec, PegShim, Config.NumLayers, Config.NumHeads,
+    Config.FFNDim, {IsDecoder=}true, {EncStates=}nil, Blocks, pTrainable,
+    {pQuantizeInt8=}false, {UseReluFFN=}false, {pSelfAttnOnly=}true);
+  FinalLN := Dec.AddLayer(
+    TNNetTokenLayerNorm.Create(PegasusLayerNormEps).SetTrainable(pTrainable) );
+  NumCbM1 := Config.NumCodebooks - 1;
+  for k_i := 0 to NumCbM1 do
+    HeadLayers[k_i] := Dec.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable),
+      FinalLN);
+  Dec.AddLayer( TNNetDeepConcat.Create(HeadLayers) );
+  if not pTrainable then Dec.SetTrainable();
+  Result := Dec;
+end;
+
+function BuildMusicGenMelodyFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  const Config: TMusicGenMelodyConfig; EncSeqLen, DecSeqLen: integer;
+  pTrainable: boolean = true): TMusicGenMelodyModel;
+var
+  Model: TMusicGenMelodyModel;
+  Dec: TNNet;
+  Blocks: TMarianBlockArray;
+  HeadLayers: array of TNNetLayer;
+  FinalLN: TNNetLayer;
+  Tmp: TNNetVolume;
+  k_i, j, i, BlockCnt, Half, PosCnt, ChCnt, FullSeqLen: integer;
+  NumCbM1, VocabM1, HiddenM1, FullSeqM1, HalfM1, BlocksHi: integer;
+  EmbConst, Angle: double;
+  TName, BP: string;
+begin
+  if EncSeqLen < 1 then ImportError('MusicGen Melody: EncSeqLen must be >= 1.');
+  if DecSeqLen < 1 then ImportError('MusicGen Melody: DecSeqLen must be >= 1.');
+  FullSeqLen := Config.ChromaLength + EncSeqLen + DecSeqLen;
+  if FullSeqLen > Config.MaxPositionEmbeddings then
+    ImportError('MusicGen Melody: chroma_length + EncSeqLen + DecSeqLen = ' +
+      IntToStr(FullSeqLen) + ' exceeds max_position_embeddings = ' +
+      IntToStr(Config.MaxPositionEmbeddings) + '.');
+
+  Model := TMusicGenMelodyModel.Create(Config, EncSeqLen, DecSeqLen);
+  Dec := nil;
+  try
+    SetLength(HeadLayers, Config.NumCodebooks);
+    FinalLN := nil;
+    Dec := BuildMusicGenMelodyDecoderNet(Config, FullSeqLen, pTrainable,
+      Blocks, HeadLayers, FinalLN);
+    Model.FDecoder := Dec;
+    NumCbM1 := Config.NumCodebooks - 1;
+    VocabM1 := Config.VocabSize - 1;
+    HiddenM1 := Config.Hidden - 1;
+
+    Tmp := TNNetVolume.Create;
+    try
+      // ----- K embedding tables (vocab+1 rows x hidden) -----
+      for k_i := 0 to NumCbM1 do
+      begin
+        TName := 'decoder.model.decoder.embed_tokens.' + IntToStr(k_i) +
+          '.weight';
+        if not Reader.HasTensor(TName) then
+          ImportError('MusicGen Melody import: missing "' + TName +
+            '" - not a MusicgenMelodyForConditionalGeneration checkpoint?');
+        if (Reader.DimCount(TName) <> 2) or
+           (Reader.DimSize(TName, 0) <> Config.VocabSize + 1) or
+           (Reader.DimSize(TName, 1) <> Config.Hidden) then
+          ImportError('MusicGen Melody import: "' + TName + '" bad shape ' +
+            Reader.ShapeAsString(TName));
+        Reader.LoadTensorFlat(TName, Model.FEmbed[k_i]);
+      end;
+
+      // ----- enc_to_dec_proj (text: hidden x text_d_model, biased) -----
+      TName := 'enc_to_dec_proj.weight';
+      if not Reader.HasTensor(TName) then
+        ImportError('MusicGen Melody import: missing "' + TName + '".');
+      if (Reader.DimCount(TName) <> 2) or
+         (Reader.DimSize(TName, 0) <> Config.Hidden) or
+         (Reader.DimSize(TName, 1) <> Config.TextDModel) then
+        ImportError('MusicGen Melody import: "' + TName + '" bad shape ' +
+          Reader.ShapeAsString(TName));
+      Reader.LoadTensorFlat(TName, Model.FEncToDecW);
+      Reader.LoadTensorFlat('enc_to_dec_proj.bias', Model.FEncToDecB);
+
+      // ----- audio_enc_to_dec_proj (chroma: hidden x num_chroma, biased) -----
+      TName := 'audio_enc_to_dec_proj.weight';
+      if not Reader.HasTensor(TName) then
+        ImportError('MusicGen Melody import: missing "' + TName +
+          '" - the melody chroma projection.');
+      if (Reader.DimCount(TName) <> 2) or
+         (Reader.DimSize(TName, 0) <> Config.Hidden) or
+         (Reader.DimSize(TName, 1) <> Config.NumChroma) then
+        ImportError('MusicGen Melody import: "' + TName + '" bad shape ' +
+          Reader.ShapeAsString(TName));
+      Reader.LoadTensorFlat(TName, Model.FAudioW);
+      Reader.LoadTensorFlat('audio_enc_to_dec_proj.bias', Model.FAudioB);
+
+      // ----- K LM heads (untied, no bias: vocab x hidden) -----
+      for k_i := 0 to NumCbM1 do
+      begin
+        TName := 'decoder.lm_heads.' + IntToStr(k_i) + '.weight';
+        if not Reader.HasTensor(TName) then
+          ImportError('MusicGen Melody import: missing "' + TName + '".');
+        if (Reader.DimCount(TName) <> 2) or
+           (Reader.DimSize(TName, 0) <> Config.VocabSize) or
+           (Reader.DimSize(TName, 1) <> Config.Hidden) then
+          ImportError('MusicGen Melody import: "' + TName + '" bad shape ' +
+            Reader.ShapeAsString(TName));
+        Reader.LoadTensorFlat(TName, Tmp);
+        EnsureWritableImportWeights(HeadLayers[k_i]);
+        for j := 0 to VocabM1 do
+        begin
+          for i := 0 to HiddenM1 do
+            HeadLayers[k_i].FArrNeurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.Hidden + i];
+          HeadLayers[k_i].FArrNeurons[j].BiasWeight := 0;
+        end;
+        HeadLayers[k_i].FlushWeightCache();
+      end;
+    finally
+      Tmp.Free;
+    end;
+
+    // ----- sinusoidal position table over the FULL sequence -----
+    Model.FPosTable.ReSize(FullSeqLen, 1, Config.Hidden);
+    Half := Config.Hidden div 2;
+    EmbConst := Ln(10000.0) / (Half - 1);
+    FullSeqM1 := FullSeqLen - 1;
+    HalfM1 := Half - 1;
+    for PosCnt := 0 to FullSeqM1 do
+      for ChCnt := 0 to HalfM1 do
+      begin
+        Angle := PosCnt * Exp(-ChCnt * EmbConst);
+        Model.FPosTable.FData[PosCnt * Config.Hidden + ChCnt] := Cos(Angle);
+        Model.FPosTable.FData[PosCnt * Config.Hidden + Half + ChCnt] :=
+          Sin(Angle);
+      end;
+
+    // ----- per-block weights (BIAS-FREE q/k/v/out + fc1/fc2; self-attn only) --
+    BlocksHi := High(Blocks);
+    for BlockCnt := 0 to BlocksHi do
+    begin
+      BP := 'decoder.model.decoder.layers.' + IntToStr(BlockCnt) + '.';
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SelfAttn.QProj,
+        BP + 'self_attn.q_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SelfAttn.KProj,
+        BP + 'self_attn.k_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SelfAttn.VProj,
+        BP + 'self_attn.v_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SelfAttn.OProj,
+        BP + 'self_attn.out_proj.weight', Config.Hidden, Config.Hidden);
+      LoadLayerNormWeights(Reader, Blocks[BlockCnt].SelfAttn.Norm,
+        BP + 'self_attn_layer_norm.weight', BP + 'self_attn_layer_norm.bias',
+        Config.Hidden);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc1,
+        BP + 'fc1.weight', Config.Hidden, Config.FFNDim);
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc2,
+        BP + 'fc2.weight', Config.FFNDim, Config.Hidden);
+      LoadLayerNormWeights(Reader, Blocks[BlockCnt].FFNNorm,
+        BP + 'final_layer_norm.weight', BP + 'final_layer_norm.bias',
+        Config.Hidden);
+    end;
+
+    LoadLayerNormWeights(Reader, FinalLN,
+      'decoder.model.decoder.layer_norm.weight',
+      'decoder.model.decoder.layer_norm.bias', Config.Hidden);
+
+    Result := Model;
+  except
+    Model.Free;
+    raise;
+  end;
+end;
+
+function BuildMusicGenMelodyFromSafeTensors(const FileName: string;
+  out Config: TMusicGenMelodyConfig; EncSeqLen, DecSeqLen: integer;
+  pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TMusicGenMelodyModel;
+var
+  Reader: TNNetSafeTensorsReader;
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadMusicGenMelodyConfigFromJSONFile(ConfigPath);
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildMusicGenMelodyFromSafeTensorsEx(Reader, Config, EncSeqLen,
       DecSeqLen, pTrainable);
   finally
     Reader.Free;

@@ -393,6 +393,12 @@ type
     // path is BIT-IDENTICAL to the un-cached GenerateCFG re-encode loop, for
     // both a distinct and a zeroed (null) unconditional condition.
     procedure TestMusicGenGuidedCache;
+    // MusicGen MELODY (model_type "musicgen_melody"): asserts (1) the chroma
+    // front-end (neuralaudio.ComputeMusicgenMelodyChroma) matches the HF
+    // MusicgenMelodyFeatureExtractor oracle exactly, and (2) ONE decoder step
+    // of the melody decoder (chroma+text conditioning PREPENDED to the causal
+    // self-attention sequence) matches the HF logits < 1e-4.
+    procedure TestMusicGenMelodyParity;
     procedure TestBlip2QFormerConfigFromJSONFile;
     procedure TestBlip2QFormerParity;
     procedure TestBlip2FullBridgeParity;
@@ -14761,6 +14767,165 @@ begin
     Uncond.Free;
     Zero.Free;
     Model.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMusicGenMelodyParity;
+var
+  Model: TMusicGenMelodyModel;
+  Config: TMusicGenMelodyConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  RefObj: TJSONObject;
+  WaveFreqs, WaveAmps, EncStatesArr, RowArr, CondArr, CodesArr, LogitsArr,
+    KArr, TArr, ChromaArr: TJSONArray;
+  Samples, Chroma, EncStates, ChromaCond, Prefix, Logits: TNNetVolume;
+  Codes: TNNetIntArr2D;
+  EncSeq, DecSeq, K, Vocab, TextD, NumChroma, ChromaLen, NSamp, SR: integer;
+  NumFrames, t, k_i, v, i, c, expArg, gotArg: integer;
+  MaxDiff, Diff, ww, tt, maxv: double;
+  ChromaMism: integer;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  Samples := TNNetVolume.Create;
+  Chroma := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create;
+  ChromaCond := TNNetVolume.Create;
+  Prefix := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_musicgen_melody_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefObj := TJSONObject(RefRoot);
+    EncSeq := RefObj.Get('enc_seq_len', 0);
+    DecSeq := RefObj.Get('dec_seq_len', 0);
+    K := RefObj.Get('num_codebooks', 0);
+    Vocab := RefObj.Get('vocab_size', 0);
+    TextD := RefObj.Get('text_d_model', 0);
+    NumChroma := RefObj.Get('num_chroma', 12);
+    ChromaLen := RefObj.Get('chroma_length', 0);
+    NSamp := RefObj.Get('wave_n_samples', 0);
+    SR := RefObj.Get('sampling_rate', 32000);
+    NumFrames := RefObj.Get('num_frames', 0);
+
+    // ---- (1) chroma front-end parity ----
+    // Re-synthesize the reference waveform from the recipe (the committed
+    // fixture stores freqs/amps, not the raw samples).
+    WaveFreqs := TJSONArray(RefObj.Find('wave_freqs'));
+    WaveAmps := TJSONArray(RefObj.Find('wave_amps'));
+    Samples.ReSize(NSamp, 1, 1);
+    for i := 0 to NSamp - 1 do
+    begin
+      tt := i / SR; ww := 0;
+      for c := 0 to WaveFreqs.Count - 1 do
+        ww := ww + WaveAmps.Items[c].AsFloat *
+          Sin(2 * Pi * WaveFreqs.Items[c].AsFloat * tt);
+      Samples.FData[i] := ww;
+    end;
+    ComputeMusicgenMelodyChroma(Samples, Chroma, SR,
+      RefObj.Get('n_fft', 16384), RefObj.Get('hop_length', 4096), NumChroma);
+    AssertEquals('chroma frame count', NumFrames, Chroma.SizeX);
+    AssertEquals('chroma depth = num_chroma', NumChroma, Chroma.Depth);
+    ChromaArr := TJSONArray(RefObj.Find('chroma'));
+    MaxDiff := 0;
+    ChromaMism := 0;
+    for t := 0 to NumFrames - 1 do
+    begin
+      RowArr := TJSONArray(ChromaArr.Items[t]);
+      // exact one-hot match (every entry, not just the argmax)
+      for c := 0 to NumChroma - 1 do
+      begin
+        Diff := Abs(Chroma.FData[t * NumChroma + c] - RowArr.Items[c].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      // belt-and-braces: argmax agreement
+      expArg := 0; maxv := RowArr.Items[0].AsFloat;
+      for c := 1 to NumChroma - 1 do
+        if RowArr.Items[c].AsFloat > maxv then
+        begin maxv := RowArr.Items[c].AsFloat; expArg := c; end;
+      gotArg := 0; maxv := Chroma.FData[t * NumChroma];
+      for c := 1 to NumChroma - 1 do
+        if Chroma.FData[t * NumChroma + c] > maxv then
+        begin maxv := Chroma.FData[t * NumChroma + c]; gotArg := c; end;
+      if expArg <> gotArg then Inc(ChromaMism);
+    end;
+    AssertEquals('chroma argmax matches HF oracle every frame', 0, ChromaMism);
+    AssertTrue('MusicGen Melody chroma parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // ---- (2) one decoder step parity ----
+    Model := BuildMusicGenMelodyFromSafeTensors(
+      FixturePath('tiny_musicgen_melody.safetensors'), Config, EncSeq, DecSeq,
+      {pTrainable=}true, FixturePath('tiny_musicgen_melody_config.json'));
+    AssertTrue('musicgen melody decoder built', Model <> nil);
+    AssertEquals('num codebooks', K, Config.NumCodebooks);
+    AssertEquals('vocab size', Vocab, Config.VocabSize);
+    AssertEquals('num_chroma', NumChroma, Config.NumChroma);
+    AssertEquals('chroma_length', ChromaLen, Config.ChromaLength);
+
+    EncStatesArr := TJSONArray(RefObj.Find('enc_states'));
+    EncStates.ReSize(EncSeq, 1, TextD);
+    for t := 0 to EncSeq - 1 do
+    begin
+      RowArr := TJSONArray(EncStatesArr.Items[t]);
+      for i := 0 to TextD - 1 do
+        EncStates.FData[t * TextD + i] := RowArr.Items[i].AsFloat;
+    end;
+
+    CondArr := TJSONArray(RefObj.Find('chroma_cond'));
+    ChromaCond.ReSize(CondArr.Count, 1, NumChroma);
+    for t := 0 to CondArr.Count - 1 do
+    begin
+      RowArr := TJSONArray(CondArr.Items[t]);
+      for c := 0 to NumChroma - 1 do
+        ChromaCond.FData[t * NumChroma + c] := RowArr.Items[c].AsFloat;
+    end;
+
+    CodesArr := TJSONArray(RefObj.Find('dec_codes'));
+    SetLength(Codes, K);
+    for k_i := 0 to K - 1 do
+    begin
+      RowArr := TJSONArray(CodesArr.Items[k_i]);
+      SetLength(Codes[k_i], DecSeq);
+      for t := 0 to DecSeq - 1 do Codes[k_i][t] := RowArr.Items[t].AsInteger;
+    end;
+
+    Model.BuildConditioningPrefix(ChromaCond, EncStates, Prefix);
+    Model.ComputeLogits(Codes, Prefix, Logits);
+    AssertEquals('logits depth = K*vocab', K * Vocab, Logits.Depth);
+    AssertEquals('logits length = DecSeq', DecSeq, Logits.SizeX);
+
+    LogitsArr := TJSONArray(RefObj.Find('logits'));
+    MaxDiff := 0;
+    for k_i := 0 to K - 1 do
+    begin
+      KArr := TJSONArray(LogitsArr.Items[k_i]);
+      for t := 0 to DecSeq - 1 do
+      begin
+        TArr := TJSONArray(KArr.Items[t]);
+        for v := 0 to Vocab - 1 do
+        begin
+          Diff := Abs(Logits.FData[t * (K * Vocab) + k_i * Vocab + v] -
+            TArr.Items[v].AsFloat);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('MusicGen Melody decoder logit parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Model.Free;
+    Samples.Free;
+    Chroma.Free;
+    EncStates.Free;
+    ChromaCond.Free;
+    Prefix.Free;
+    Logits.Free;
+    RefRoot.Free;
+    RefJson.Free;
   end;
 end;
 

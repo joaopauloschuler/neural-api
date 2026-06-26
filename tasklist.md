@@ -856,22 +856,31 @@ rather than acted on.
       classifier-free-guidance tuning and long-form generation to a follow-up.
       The WAV writer + HiFi-GAN vocoder it builds on have landed; the open
       piece is the audio U-Net/DiT denoiser importer.
-- [ ] MusicGen MELODY-conditioned importer (BuildMusicGenMelodyFromSafeTensors[Ex],
-      facebook/musicgen-melody, model_type "musicgen_melody") — extends the landed
-      text-conditioned MusicGen (BuildMusicGenFromSafeTensors / TMusicGenModel) with a
-      genuinely new CAPABILITY: generate music that follows a reference MELODY hummed or
-      played by the user, optionally steered by a text prompt. The decoder, EnCodec
-      codec, delay-interleave pattern and T5 text conditioning all REUSE the landed path
-      unchanged; the new pieces are (a) a chromagram feature extractor in
-      neural/neuralaudio.pas (12-bin chroma over the reference 16 kHz waveform — STFT
-      magnitude -> map FFT bins to pitch classes -> per-frame argmax/one-hot of the
-      dominant chroma, matching HF MusicgenMelody's chroma front-end) and (b) wiring the
-      chroma sequence as a SECOND cross-attention conditioning source CONCATENATED on the
-      sequence axis with the T5 text states (audio_enc_to_dec_proj over the chroma).
-      Scope v1 inference-only on CPU: a short text+melody -> codes -> EnCodec decode ->
-      WAV clip, the same tail examples/MusicGenText already uses. Pico parity vs a float64
-      HF MusicgenMelodyForConditionalGeneration oracle (chroma extractor + one decoder
-      step, < 1e-4) and an examples/MusicGenMelody that conditions on a synthesized melody.
+- [X] MusicGen MELODY-conditioned importer (BuildMusicGenMelodyFromSafeTensors[Ex],
+      facebook/musicgen-melody, model_type "musicgen_melody") — DONE. The new pieces:
+      (a) ComputeMusicgenMelodyChroma + BuildChromaFilterBank in neural/neuralaudio.pas
+      — a 12-bin one-hot chromagram matching HF MusicgenMelodyFeatureExtractor bit-for-bit
+      (power spectrogram n_fft=16384/hop=4096, periodic Hann, center=True reflect pad,
+      NORMALIZED by the window L2 energy = torchaudio Spectrogram(normalized=True); librosa
+      chroma_filter_bank tuning=0/power=2/weighting=(5,2)/start_at_c; per-frame inf-norm +
+      argmax one-hot; self-contained radix-2 FFT). (b) BuildMusicGenMelodyFromSafeTensors[Ex]
+      + TMusicGenMelodyModel in neural/neuralpretrained.pas.
+      ARCHITECTURE CORRECTION vs the original task note: MusicGen Melody is NOT a second
+      cross-attention source. The HF melody decoder is DECODER-ONLY (causal self-attention,
+      no encoder_attn); the conditioning is PREPENDED to the decoder sequence as
+      concat([audio_enc_to_dec_proj(chroma), enc_to_dec_proj(text)]) (CHROMA FIRST),
+      chroma repeat-tiled/truncated to chroma_length, sinusoidal positions over the whole
+      sequence, logits read at the decoder-frame positions. Implemented via a new
+      pSelfAttnOnly flag on BuildPegasusStackBlocks (suppresses the cross-attn sub-block).
+      EnCodec codec, delay-interleave, K embed tables / K LM heads, sinusoidal positions
+      reuse the landed path. Pico parity (tools/make_pico_musicgen_melody_fixture.py,
+      TestMusicGenMelodyParity): chroma matches the float64 HF oracle EXACTLY (one-hot,
+      max|diff|=0) and one decoder step (chroma+text prepended) < 1e-4. examples/MusicGenMelody
+      synthesizes an A4+E5 melody -> chroma -> codes -> EnCodec decode -> musicgen_melody_demo.wav
+      (pico smoke; random weights -> noise). Full suite 2302 tests, 0 failures.
+      DEFERRED FOLLOW-UPS: a --download real-checkpoint mode for facebook/musicgen-melody
+      (the example is pico-only) and a real-melody-conditioned smoke clip; stereo;
+      classifier-free guidance / KV-cache for the melody decoder (text-MusicGen has them).
 - [ ] SeamlessM4T-v2 follow-ups deferred from the landed S2TT v1:
       (1) the text-to-speech (T2ST) unit vocoder path (TextToUnit decoder +
       HiFi-GAN-style unit vocoder). (2) the UnitY2 two-pass decoding. (3) a real
