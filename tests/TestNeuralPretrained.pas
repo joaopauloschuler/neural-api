@@ -220,6 +220,7 @@ type
     procedure TestGPTNeoXSequentialLogitParity;
     procedure TestOPTConfigFromJSONFile;
     procedure TestOPTNextTokenLogitsParity;
+    procedure TestOPT350ProjPostLNLogitParity;
     procedure TestFalconConfigFromJSONFile;
     procedure TestFalconMultiQueryLogitParity;
     procedure TestFalconNewArchLogitParity;
@@ -8165,6 +8166,48 @@ begin
     AssertEquals('prefix', 'model.decoder.', Config.Prefix);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_opt_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the OPT import on the opt-350m-SHAPED pico fixture:
+// tests/fixtures/tiny_opt350.* is a randomly-initialized HF OPTForCausalLM
+// with word_embed_proj_dim (12) != hidden_size (16) and
+// do_layer_norm_before=False - the opt-350m architecture at pico dims. This
+// single fixture exercises the two importer paths the 125m-shaped tiny_opt
+// fixture leaves untested: (a) the bias-free project_in (embed -> hidden) and
+// project_out (hidden -> embed) projections, and (b) the POST-LN block wiring
+// (x := N(x + sublayer(x))). With do_layer_norm_before=False the decoder-level
+// final_layer_norm is absent (HasFinalLayerNorm=false), also distinct from the
+// 125m fixture. The generator boosts q/k and both projections so the new paths
+// genuinely matter and asserts project_in and post-LN-vs-pre-LN both move the
+// logits. Whole-sequence logits must match the float64 oracle to < 1e-4.
+procedure TTestNeuralPretrained.TestOPT350ProjPostLNLogitParity;
+var
+  NN: TNNet;
+  Config: TOPTConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildOPTFromSafeTensorsEx(
+    FixturePath('tiny_opt350.safetensors'),
+    Config, {SeqLen=}0, {pTrainable=}true,
+    FixturePath('tiny_opt350_config.json'));
+  try
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('vocab', 11, Config.VocabSize);
+    AssertEquals('hidden_size', 16, Config.HiddenSize);
+    // word_embed_proj_dim != hidden_size -> project_in/project_out present.
+    AssertEquals('word_embed_proj_dim', 12, Config.WordEmbedProjDim);
+    // opt-350m architecture: POST-LN.
+    AssertFalse('do_layer_norm_before', Config.DoLayerNormBefore);
+    // post-LN -> no decoder-level final_layer_norm.
+    AssertFalse('has final_layer_norm', Config.HasFinalLayerNorm);
+    AssertEquals('prefix', 'model.decoder.', Config.Prefix);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_opt350_logits.json'), Config.MaxPositions,
       Config.VocabSize);
   finally
     NN.Free;
