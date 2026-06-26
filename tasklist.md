@@ -544,11 +544,30 @@ rather than acted on.
       REMAINING:
   - [ ] optional Adafactor follow-up: the omitted first-moment beta1 EMA + update
         RMS clipping + internal relative-step LR rule if a real fine-tune needs them.
-- [ ] Trainer callbacks API (transformers TrainerCallback port): a
+- [X] Trainer callbacks API (transformers TrainerCallback port): a
       TNeuralFitCallback with OnEpochBegin/End, OnStepEnd, OnEvaluate hooks
       registered on TNeuralFitBase. Early stopping, custom logging, and the
       EMA/SWA tasks become small callbacks instead of ever more
       TNeuralFitBase fields.
+      LANDED: abstract TNeuralFitCallback (no-op virtual OnEpochBegin(Sender,
+      Epoch)/OnEpochEnd/OnStepEnd(Sender,GlobalStep)/OnEvaluate(Sender,Epoch,
+      ValLoss,ValAcc)) in neuralfit.pas, with Sender:TNeuralFitBase so callbacks
+      read live training state. TNeuralFitBase gained a lazy TList of callbacks +
+      AddCallback/CallbackCount + OwnsCallbacks (default false: caller owns) and
+      four Dispatch* helpers wired into BOTH fit loops (TNeuralDataLoadingFit and
+      TNeuralImageFit): epoch top, after Inc(FCurrentStep), right after the
+      validation metrics block, and next to FOnAfterEpoch. Empty list => cheap
+      no-op, so zero registered callbacks is bit-identical to before. Concrete
+      TNeuralFitEarlyStopping (Patience/MinDelta, lower-is-better val loss) sets
+      Sender.ShouldQuit when val loss fails to improve for Patience evals; the
+      loops' existing Not(FShouldQuit) guards then break early. Tests in
+      tests/TestNeuralCallbacks.pas (8, wired into RunTests.pas): counting
+      callback fires once/epoch for begin/end/evaluate over a 2-epoch XOR fit,
+      early stopping halts on a synthetic non-improving signal and stays quiet
+      while improving, zero-callback path trains the full budget, OwnsCallbacks
+      teardown. FOLLOW-UP: EMA/SWA (and custom CSV logging) can now be reframed
+      as TNeuralFitCallback subclasses instead of growing more TNeuralFitBase
+      fields.
 - [ ] True single-kernel batched forward (real batch axis + attention padding
       mask for left-pad) — the lockstep DecodeBatchGreedy orchestration landed,
       but NN.Compute has no SIMD batch axis on the char path, so each step still

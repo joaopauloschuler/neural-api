@@ -37,6 +37,67 @@ uses
 
 type
   TNeuralFitBase = class;
+  TNeuralFitCallback = class;
+
+  // Abstract base class for training-loop callbacks (a port of the
+  // HuggingFace transformers TrainerCallback concept). A callback is an
+  // object whose virtual hook methods are invoked by the fit loop at well
+  // defined points. All hooks are no-ops by default, so a subclass overrides
+  // only the events it cares about. Callbacks are registered on a
+  // TNeuralFitBase via AddCallback; the fit object does NOT own them by
+  // default (the caller is responsible for freeing them) - see
+  // TNeuralFitBase.OwnsCallbacks. Sender is the originating TNeuralFitBase so
+  // a callback can read live training state (CurrentEpoch, ValidationLoss,
+  // TrainingAccuracy, etc.) and, if needed, request an early stop by setting
+  // Sender.ShouldQuit := true.
+  // Coded by Claude (AI).
+  TNeuralFitCallback = class(TObject)
+    public
+      // Fired at the start of every epoch, BEFORE any training batch of that
+      // epoch runs. Epoch is the 0-based epoch index about to be trained.
+      procedure OnEpochBegin(Sender: TNeuralFitBase; Epoch: integer); virtual;
+      // Fired at the end of every epoch, AFTER validation/test for that epoch.
+      // Epoch is the 1-based count of epochs completed (matches CurrentEpoch).
+      procedure OnEpochEnd(Sender: TNeuralFitBase; Epoch: integer); virtual;
+      // Fired after every completed training step (optimizer cadence batch).
+      // GlobalStep is the running step count (matches CurrentStep).
+      procedure OnStepEnd(Sender: TNeuralFitBase; GlobalStep: integer); virtual;
+      // Fired once per epoch right after validation metrics are computed.
+      // ValLoss/ValAcc are the just-measured validation loss and accuracy
+      // (accuracy as a 0..1 rate, same convention as ValidationAccuracy).
+      procedure OnEvaluate(Sender: TNeuralFitBase; Epoch: integer;
+        ValLoss, ValAcc: TNeuralFloat); virtual;
+  end;
+
+  // Early-stopping callback (transformers EarlyStoppingCallback port). Monitors
+  // the validation loss reported at OnEvaluate; if it fails to improve by at
+  // least MinDelta for Patience consecutive evaluations, it requests an early
+  // abort by setting Sender.ShouldQuit := true. With Patience = 0 it never
+  // stops. Default MinDelta = 0 (any non-improvement counts). Lower-is-better
+  // (validation loss) semantics.
+  // Coded by Claude (AI).
+  TNeuralFitEarlyStopping = class(TNeuralFitCallback)
+    private
+      FPatience: integer;
+      FMinDelta: TNeuralFloat;
+      FBestLoss: TNeuralFloat;
+      FWaitCount: integer;
+      FHasBest: boolean;
+      FStopped: boolean;
+    public
+      constructor Create(pPatience: integer = 1; pMinDelta: TNeuralFloat = 0.0);
+      // Resets the internal best/wait state so the callback can be reused for a
+      // fresh fit. Called automatically nowhere - call it before re-fitting.
+      procedure Reset();
+      procedure OnEvaluate(Sender: TNeuralFitBase; Epoch: integer;
+        ValLoss, ValAcc: TNeuralFloat); override;
+      property Patience: integer read FPatience write FPatience;
+      property MinDelta: TNeuralFloat read FMinDelta write FMinDelta;
+      // True once the callback has fired a stop request.
+      property Stopped: boolean read FStopped;
+      // Best (lowest) validation loss seen so far.
+      property BestLoss: TNeuralFloat read FBestLoss;
+    end;
 
   // This is a base class for all optimizers
   TNeuralOptimizer = class(TMObject)
@@ -287,6 +348,12 @@ type
       FEMA: TNNetEMAWrapper;            // lazily created on the first update
       FEMASwapped: boolean;             // true while EMA weights are swapped in
       FEMASaved: TNNet;                 // live weights stashed during a swap
+      // Trainer callbacks (transformers TrainerCallback port). nil/empty by
+      // default so all hook dispatch is a cheap no-op and behaviour is
+      // unchanged. The fit object does not own the callbacks unless
+      // FOwnsCallbacks is set.
+      FCallbacks: TList;
+      FOwnsCallbacks: boolean;
       // Parameter-group (PyTorch param_groups) support. Off by default.
       FExcludeBiasAndNormFromWeightDecay: boolean;
       FNormAndBiasLearningRateMul: TNeuralFloat;
@@ -300,6 +367,13 @@ type
       procedure SetOptimizer(pOptimizer: TNeuralOptimizer);
       procedure SetClipDelta(Value: TNeuralFloat);
       procedure SetClipNorm(Value: TNeuralFloat);
+      // Trainer-callback dispatch helpers: invoke the matching hook on every
+      // registered callback. Each short-circuits immediately when no callback
+      // is present, so the empty-list path is a cheap no-op.
+      procedure DispatchEpochBegin(Epoch: integer);
+      procedure DispatchEpochEnd(Epoch: integer);
+      procedure DispatchStepEnd(GlobalStep: integer);
+      procedure DispatchEvaluate(Epoch: integer; ValLoss, ValAcc: TNeuralFloat);
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -435,6 +509,18 @@ type
       // them bit-identical to before the swap so training can continue. No-op if
       // no swap is currently active.
       procedure RestoreLiveWeights();
+      // Registers a trainer callback (transformers TrainerCallback port). The
+      // callback's hooks are invoked by the fit loop at epoch/step/evaluate
+      // boundaries. By default the caller retains ownership (the fit object
+      // will NOT free it); set OwnsCallbacks := true to have Destroy free all
+      // registered callbacks. Adding the same callback twice is allowed but
+      // it will then fire twice per hook.
+      procedure AddCallback(pCallback: TNeuralFitCallback);
+      // Number of currently registered callbacks.
+      function CallbackCount(): integer;
+      // When true, Destroy frees every registered callback. Default false:
+      // the caller owns the callbacks.
+      property OwnsCallbacks: boolean read FOwnsCallbacks write FOwnsCallbacks;
       property StaircaseEpochs: integer read FStaircaseEpochs write FStaircaseEpochs;
       property TargetAccuracy: single read FTargetAccuracy write FTargetAccuracy;
       property TestBestAtEnd: boolean read FTestBestAtEnd write FTestBestAtEnd;
@@ -1288,6 +1374,7 @@ begin
   globalStartTime := Now();
   while ( (FMaxEpochs > FCurrentEpoch) and Not(FShouldQuit) ) do
   begin
+    DispatchEpochBegin(FCurrentEpoch);
     FGlobalErrorSum := 0;
     startTime := Now();
     CheckLearningRate(FCurrentEpoch);
@@ -1341,6 +1428,7 @@ begin
       end;
       if Assigned(FOnAfterStep) then FOnAfterStep(Self);
       Inc(FCurrentStep);
+      DispatchStepEnd(FCurrentStep);
     end;
 
     Inc(FCurrentEpoch);
@@ -1375,6 +1463,7 @@ begin
           FValidationError := FGlobalErrorSum / FGlobalTotal;
           FValidationAccuracy := ValidationRate;
         end;
+        DispatchEvaluate(FCurrentEpoch, FValidationLoss, FValidationAccuracy);
 
         if (FSaveBest = SaveBestAccuracy) then
         begin
@@ -1490,6 +1579,7 @@ begin
       '. Working time: '+FloatToStrF(Round((Now() - globalStartTime)*2400)/100,ffFixed,4,2)+' hours.');
 
     if Assigned(FOnAfterEpoch) then FOnAfterEpoch(Self);
+    DispatchEpochEnd(FCurrentEpoch);
   end;
 
   if TestBestAtEnd and
@@ -2503,6 +2593,59 @@ begin
   FEMASaved := nil;
   FExcludeBiasAndNormFromWeightDecay := false;
   FNormAndBiasLearningRateMul := 1.0;
+  FCallbacks := nil;
+  FOwnsCallbacks := false;
+end;
+
+procedure TNeuralFitBase.AddCallback(pCallback: TNeuralFitCallback);
+begin
+  if not Assigned(pCallback) then exit;
+  if not Assigned(FCallbacks) then FCallbacks := TList.Create();
+  FCallbacks.Add(pCallback);
+end;
+
+function TNeuralFitBase.CallbackCount(): integer;
+begin
+  if Assigned(FCallbacks)
+  then Result := FCallbacks.Count
+  else Result := 0;
+end;
+
+procedure TNeuralFitBase.DispatchEpochBegin(Epoch: integer);
+var
+  I: integer;
+begin
+  if not Assigned(FCallbacks) then exit;
+  for I := 0 to FCallbacks.Count - 1 do
+    TNeuralFitCallback(FCallbacks[I]).OnEpochBegin(Self, Epoch);
+end;
+
+procedure TNeuralFitBase.DispatchEpochEnd(Epoch: integer);
+var
+  I: integer;
+begin
+  if not Assigned(FCallbacks) then exit;
+  for I := 0 to FCallbacks.Count - 1 do
+    TNeuralFitCallback(FCallbacks[I]).OnEpochEnd(Self, Epoch);
+end;
+
+procedure TNeuralFitBase.DispatchStepEnd(GlobalStep: integer);
+var
+  I: integer;
+begin
+  if not Assigned(FCallbacks) then exit;
+  for I := 0 to FCallbacks.Count - 1 do
+    TNeuralFitCallback(FCallbacks[I]).OnStepEnd(Self, GlobalStep);
+end;
+
+procedure TNeuralFitBase.DispatchEvaluate(Epoch: integer;
+  ValLoss, ValAcc: TNeuralFloat);
+var
+  I: integer;
+begin
+  if not Assigned(FCallbacks) then exit;
+  for I := 0 to FCallbacks.Count - 1 do
+    TNeuralFitCallback(FCallbacks[I]).OnEvaluate(Self, Epoch, ValLoss, ValAcc);
 end;
 
 procedure TNeuralFitBase.SetAccumulationSteps(Value: integer);
@@ -2518,11 +2661,91 @@ begin
   if FEMASwapped then RestoreLiveWeights();
   if Assigned(FEMA) then FreeAndNil(FEMA);
   if Assigned(FEMASaved) then FreeAndNil(FEMASaved);
+  if Assigned(FCallbacks) then
+  begin
+    if FOwnsCallbacks then
+      while FCallbacks.Count > 0 do
+      begin
+        TNeuralFitCallback(FCallbacks[FCallbacks.Count - 1]).Free;
+        FCallbacks.Delete(FCallbacks.Count - 1);
+      end;
+    FreeAndNil(FCallbacks);
+  end;
   {$IFDEF HASTHREADS}
   NeuralDoneCriticalSection(FCritSec);
   {$ENDIF}
   FFinishedThread.Free;
   inherited Destroy();
+end;
+
+{ TNeuralFitCallback }
+
+procedure TNeuralFitCallback.OnEpochBegin(Sender: TNeuralFitBase; Epoch: integer);
+begin
+  // no-op
+end;
+
+procedure TNeuralFitCallback.OnEpochEnd(Sender: TNeuralFitBase; Epoch: integer);
+begin
+  // no-op
+end;
+
+procedure TNeuralFitCallback.OnStepEnd(Sender: TNeuralFitBase; GlobalStep: integer);
+begin
+  // no-op
+end;
+
+procedure TNeuralFitCallback.OnEvaluate(Sender: TNeuralFitBase; Epoch: integer;
+  ValLoss, ValAcc: TNeuralFloat);
+begin
+  // no-op
+end;
+
+{ TNeuralFitEarlyStopping }
+
+constructor TNeuralFitEarlyStopping.Create(pPatience: integer;
+  pMinDelta: TNeuralFloat);
+begin
+  inherited Create();
+  FPatience := pPatience;
+  FMinDelta := pMinDelta;
+  Reset();
+end;
+
+procedure TNeuralFitEarlyStopping.Reset();
+begin
+  FBestLoss := 0;
+  FWaitCount := 0;
+  FHasBest := false;
+  FStopped := false;
+end;
+
+procedure TNeuralFitEarlyStopping.OnEvaluate(Sender: TNeuralFitBase;
+  Epoch: integer; ValLoss, ValAcc: TNeuralFloat);
+begin
+  if FStopped then exit;
+  if (not FHasBest) or (ValLoss < FBestLoss - FMinDelta) then
+  begin
+    // Improvement (or first measurement): reset the patience counter.
+    FBestLoss := ValLoss;
+    FHasBest := true;
+    FWaitCount := 0;
+  end
+  else
+  begin
+    Inc(FWaitCount);
+    if (FPatience > 0) and (FWaitCount >= FPatience) then
+    begin
+      FStopped := true;
+      if Assigned(Sender) then
+      begin
+        if Sender.Verbose then
+          Sender.MessageProc('Early stopping: validation loss did not improve for '
+            + IntToStr(FWaitCount) + ' evaluations.');
+        Sender.ShouldQuit := true;
+      end;
+    end;
+  end;
 end;
 
 procedure TNeuralFitBase.WaitUntilFinished;
@@ -2848,6 +3071,7 @@ begin
   globalStartTime := Now();
   while ( (FMaxEpochs > FCurrentEpoch) and Not(FShouldQuit) ) do
   begin
+    DispatchEpochBegin(FCurrentEpoch);
     FGlobalErrorSum := 0;
     startTime := Now();
     CheckLearningRate(FCurrentEpoch);
@@ -2914,6 +3138,7 @@ begin
       end;
       if Assigned(FOnAfterStep) then FOnAfterStep(Self);
       Inc(FCurrentStep);
+      DispatchStepEnd(FCurrentStep);
     end; // of epoch
     {$IFDEF Debug}
     FMessageProc(
@@ -2965,6 +3190,7 @@ begin
           FValidationError := FGlobalErrorSum / FGlobalTotal;
           FValidationAccuracy := ValidationRate;
         end;
+        DispatchEvaluate(FCurrentEpoch, FValidationLoss, FValidationAccuracy);
 
         if (FSaveBest = SaveBestAccuracy) then
         begin
