@@ -700,21 +700,6 @@ rather than acted on.
       posterior encoder (training-only) is dropped from the committed fixture and
       never required. Example writes a smoke WAV via `SaveVolumeToWav16`. Open
       follow-ups:
-  - [X] the STOCHASTIC duration predictor (`VitsStochasticDurationPredictor`, the
-        spline-flow `use_stochastic_duration_prediction=true` path used by
-        `kakao-enterprise/vits-ljs`) — `TNNetVits.StochasticDurationReverse` ports the
-        HF reverse path EXACTLY: the `VitsDilatedDepthSeparableConv` conditioner
-        (grouped dilated conv + LayerNorm + erf-GELU + pointwise + LayerNorm + GELU,
-        residual), the `[:-2]+[-1]` flow reversal (drop the first conv flow), per-step
-        channel flip, the `VitsElementwiseAffine` reverse and the unconstrained
-        rational-quadratic spline (`_unconstrained_rational_quadratic_spline`,
-        reverse=True: cumwidth/cumheight bin search, quadratic-root inverse). The
-        duration noise `z_dur` is an EXPLICIT input (`SetStochasticDurationNoise`) like
-        the prior noise `z`. `ReadVitsConfigFromJSONFile` now ACCEPTS
-        `use_stochastic_duration_prediction=true`; the deterministic readout (the
-        MMS-TTS default) is unchanged. Parity-gated `< 1e-4` vs the HF `VitsModel`
-        float64 oracle (`TestVitsStochasticDurationParity`,
-        `tools/make_pico_vits_sdp_fixture.py` -> `tests/fixtures/tiny_vits_sdp*`).
   - [ ] MULTI-SPEAKER models (`num_speakers>1` / `speaker_embedding_size!=0`, the
         global-conditioning `cond` convs into the WaveNet/duration/decoder) —
         rejected loudly.
@@ -784,18 +769,6 @@ rather than acted on.
       embeddings vs the float64 HF `ClapModel` oracle (`TestClapParity`, generator
       `tools/clap_tiny_fixture.py`, committed `tests/fixtures/tiny_clap.*`).
       Follow-ups:
-  - [X] freq_ratio > 1 (the real laion 1024-frame/64-mel `freq_ratio = 4` layout):
-        the `reshape_mel2img` mel-crop reorganization + the final group-2D-CNN reshape
-        before the avgpool were identity-only and loudly REJECTED. LANDED: the general
-        `reshape_mel2img` indexing is folded into `ClapBatchNormMelImage` (square
-        spec_size x spec_size image; pixel (W,H) reads mel[(H div mel)*spec_size + W]
-        [H mod mel]); the HF group-2D-CNN reshape is a permutation of the final feature
-        map followed by a mean over ALL of it, so it is permutation-invariant and the
-        existing token mean-pool reproduces it for any freq_ratio. Any integral
-        freq_ratio >= 1 now accepted (freq_ratio = 1 transpose path unchanged). Gated
-        by a freq_ratio=4 pico fixture (`tools/clap_tiny_fixture_fr4.py` ->
-        `tests/fixtures/tiny_clap_fr4.*`) + `TestClapFreqRatio4Parity` (< 1e-4 on BOTH
-        embeddings vs the float64 HF `ClapModel` oracle).
   - [ ] "fused" CLAP (`enable_fusion = true`, clap-htsat-FUSED): the local/global
         mel-fusion patch-embed (`mel_conv2d` + the attention-feature-fusion block) is
         rejected. Distinct windowing — own importer branch + fixture.
@@ -813,23 +786,8 @@ rather than acted on.
       HiFi-GAN vocode -> WAV tail. Scope v1 as: denoiser + scheduler loop producing a
       latent, decoded to a short (~5 s) clip written via the WAV writer; defer
       classifier-free-guidance tuning and long-form generation to a follow-up.
-      DEPENDS ON the WAV writer + HiFi-GAN vocoder tasks above.
-- [X] LANDED: real downloaded musicgen-small checkpoint + real tokenizer for
-      examples/MusicGenText. The example's --download mode fetches three
-      STANDARD public repos through the native Pascal Hub helper (neuralhfhub
-      HubFetchModel, no Python) and imports each directly with no split step:
-      facebook/musicgen-small (decoder; importer ignores the bundled
-      text/audio-encoder keys), t5-base (T5 encoder + SentencePiece tokenizer
-      via TNeuralHFTokenizer), facebook/encodec_32khz (32 kHz codec).
-      --prompt/--seconds/--guidance/--topk/--temperature wired; downloads
-      cached under ~/.cache/neural-api/hub. Also LANDED as part of this: the
-      EnCodec importer now supports use_causal_conv=false (the non-causal
-      32 kHz symmetric-pad variant) -- RunEnCodecConv branches on
-      Config.UseCausalConv (symmetric Conv1d pad + symmetric ConvTranspose
-      trim); verified by TestEnCodecNonCausalRoundTripParity (tiny HF oracle,
-      <1e-4) alongside the unchanged causal TestEnCodecRoundTripParity. NOT yet
-      run end-to-end on the real full-size model (host RAM-limited; see
-      memory).
+      The WAV writer + HiFi-GAN vocoder it builds on have landed; the open
+      piece is the audio U-Net/DiT denoiser importer.
 - [ ] Read generation_config.json for decode defaults (MusicGen + general).
       examples/MusicGenText currently HARDCODES MusicGen's intended sampling
       recipe in --download mode (top_k=250, temperature=1.0, guidance_scale=3.0,
@@ -902,7 +860,7 @@ rather than acted on.
       and falls back to all-heads otherwise); (d) wire it into
       examples/WhisperTranscribe behind a `--word-timestamps` flag and document
       in examples/README; (e) optional per-word confidence (mean path attention).
-- [X] Speaker diarization importer (`BuildPyannoteSegmentationFromSafeTensors[Ex]` +
+- [ ] Speaker diarization importer (`BuildPyannoteSegmentationFromSafeTensors[Ex]` +
       `TPyannoteConfig`/`ReadPyannoteConfigFromJSONFile`, model_type `pyannote`) — LANDED.
       New leaf layer `TNNetSincConv1D` (SincNet band-pass, kernels materialized from two
       scalars (low_freq, band) per filter, Hamming-windowed; full forward+BPTT, input &
@@ -1155,27 +1113,6 @@ rather than acted on.
         IMAGE (conditional_pixel_values -> clip.get_image_features pooled embedding)
         instead of text; v1 does text only. Add a RunCLIPSegImagePrompt path reusing
         the vision tower's pooled class-token embedding as the conditional vector.
-- [X] TinyNeRF novel-view-synthesis example (examples/TinyNeRF) — a brand-new
-      output modality for the tree: a learned implicit 3-D scene that renders an image
-      from an arbitrary camera pose, the first differentiable VOLUME RENDERER in the
-      repo. Distinct from every landed image generator (DiT/PixArt diffusion,
-      VisualGAN/StyleGAN2, MaskGIT token gen) and from the landed implicit-function
-      examples (SIREN/Fourier-feature image fitting are 2-D pixel regressions; this is
-      3-D ray integration). The genuinely new code is the volume-rendering compositing
-      step: cast rays from the camera, sample points along each ray, run a small
-      positional-encoded MLP (reuse the landed Fourier/positional-encoding feature map +
-      a couple of TNNetFullConnectReLU layers) to predict (RGB, density) per sample, then
-      alpha-composite along the ray (C = sum T_i (1 - exp(-sigma_i delta_i)) c_i) with
-      the standard transmittance weights — plus its analytic backward so the whole
-      render is trainable end-to-end by the existing TNeuralFit MSE loss against ground-
-      truth pixels. Scope v1 to a SINGLE tiny synthetic scene (a handful of posed low-res
-      views shipped as a fixture, e.g. a procedurally generated colored cube or the
-      classic tiny_nerf lego crop downsampled), train a few thousand steps on CPU, then
-      render one HELD-OUT pose and write it as a PPM next to the ground truth. Pure CPU,
-      ulimit/time-bounded smoke run; no importer, no external download. Establishes the
-      ray-marching + alpha-compositing primitive that any future 3-D / view-synthesis
-      work (instant-NGP hash grids, 3D Gaussian splatting) would build on.
-
 - [ ] BEiT / data2vec-vision ViT importer follow-ups (BuildBeitFromSafeTensors[Ex]
       /WithConfig + TBeitConfig + ReadBeitConfigFromJSONFile/BeitConfigToString
       LANDED, e.g. microsoft/beit-base-patch16-224, facebook/data2vec-vision-base —
