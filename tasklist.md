@@ -328,32 +328,8 @@ rather than acted on.
       torchvision) — FULL torchvision inception_v3 now imports (config full_arch
       = true -> BuildInceptionV3Full). The pico InceptionA-only path remains for
       the legacy parity test. REMAINING: FID rewire (below).
-  - [X] Strided grid-reduction modules InceptionB / InceptionD (parallel
-        stride-2 conv + stride-2 maxpool branches), the full stem
-        (Conv2d_1a..4a + two stride-2 maxpools), InceptionC (7x7-factorized 1x7 /
-        7x1 asymmetric convs via TNNetConvolutionRectangular + TNNetPadXY +
-        LoadInceptionRectConvFoldBN), InceptionE (the wide 1x3||3x1 split module),
-        and the REAL torchvision avg-pool branch (new TNNetGridAvgPool, stride-1
-        count_include_pad=False average pool; the pico maxpool stand-in is no
-        longer used on the full path). BuildInceptionV3Full wires the complete
-        stem + InceptionA x3 / B / C x4 / D / E x2 sequence at the real
-        torchvision channel widths (2048-d pool) and loads every BasicConv2d
-        weight + folded BN. TestInceptionV3FullParity asserts logits AND the
-        2048-d pooled feature match a numpy float64 oracle (tools/
-        inceptionv3_full_fixture.py) < 1e-4. NOTE: at the canonical torch input
-        299 the InceptionE grid is 8x8; the fixture uses IMAGE=160 (E grid 3, C
-        grid 8) so every kernel runs at full size (CAI's TNNetConvolution
-        auto-shrinks a kernel to the input spatial size, so a 1x1 grid would
-        silently collapse the 3x3 E convs). The full-arch stem/Inception-module
-        maxpool branches use TNNetMaxPoolPortable (floor sizing = torchvision;
-        zero-pad == torchvision -inf pad for ReLU'd non-negative inputs). The
-        real net is ~24M params (~90MB f32) -- too big to commit -- so the
-        builder + fixture carry a width_div (config "width_div", default 1 =
-        real 2048-d net) that scales EVERY channel width down (topology / kernels
-        / concat unchanged); the committed fixture uses width_div=8 (256-d pool,
-        ~1.4MB safetensors). A real width_div=1 checkpoint loads identically.
-  - [ ] Rewire neuralimagemetrics FID onto this backbone once the full net lands
-        (today FID uses placeholder features). Now unblocked: BuildInceptionV3Full
+  - [ ] Rewire neuralimagemetrics FID onto this backbone (today FID uses
+        placeholder features). Now unblocked: BuildInceptionV3Full
         exposes the 2048-d pooled feature via PoolFeatureIdx.
 - [ ] LPIPS follow-ups — the metric LANDED (ComputeLPIPSDistance /
       LPIPSStageDistance / LPIPSUnitNormalize in neuralpretrained.pas, reusing the
@@ -756,62 +732,6 @@ rather than acted on.
   - [ ] real-checkpoint smoke: synthesize a sentence with a downloaded
         `facebook/mms-tts-eng` / `kakao-enterprise/vits-ljs` and write it via
         `SaveVolumeToWav16` (offline + RAM-gated here, so deferred).
-- [X] Kokoro / StyleTTS2 text-to-speech importer (`BuildKokoroFromSafeTensors[Ex]` +
-      `BuildKokoroFromSafeTensorsWithConfig`, `TKokoroConfig`/`ReadKokoroConfigFromJSONFile`,
-      a channel-major `TNNetKokoro` holder like the landed `TNNetVits`/`TNNetHiFiGAN`)
-      + an examples/KokoroTTS smoke that writes a WAV via `SaveVolumeToWav16`. Kokoro
-      (`hexgrad/Kokoro-82M`, Apache-2.0, ~82M params) is the current best-in-class
-      *lightweight* open TTS model and a natural CPU-native fit, but is genuinely
-      DISTINCT from the landed VITS path so it is not a near-duplicate of an existing
-      importer: it is a **StyleTTS2** architecture, not VITS. Three new pieces to wire:
-      (1) a **style-vector-conditioned** generator — the 256-d voice/style embedding
-      (the per-voice `voices/*.pt` reference tensors, indexed by token length) is
-      AdaIN/affine-injected into the duration predictor, the F0/energy predictors and
-      the decoder, so the conditioning math is the new part vs VITS's WaveNet `cond`
-      convs; (2) an **iSTFTNet-style decoder** — the generator predicts magnitude +
-      phase and runs an INVERSE STFT to waveform rather than HiFi-GAN's pure transposed-
-      conv upsampling, so it needs an `ISTFT(mag, phase)` overlap-add primitive in
-      `neuralaudio.pas` (the inverse of the existing `WhisperLogMelFromWavFile` /
-      forward-STFT machinery — a genuinely missing DSP building block, also reusable by
-      future vocoders) — **the ISTFT primitive LANDED**: `ISTFTOverlapAdd(Mag, Phase,
-      Wave, NFFT, HopLength)` + `ISTFTOverlapAddReIm(Re, Im, ...)` in `neuralaudio.pas`
-      (COLA / window_sumsquare normalization, periodic-Hann synthesis mirroring the
-      forward CosTab/SinTab convention), with a forward-STFT->ISTFT round-trip test
-      `TestISTFTRoundTrip` (75% overlap, interior max-abs err 2.98e-8, float32-storage
-      limited); the rest of the iSTFTNet decoder wiring stays open; (3) a **prosody/duration stack** driving a length-regulator
-      expansion analogous to the VITS deterministic duration path but conditioned on the
-      style vector. Reuse where possible: the length-regulator / monotonic-expansion math
-      and `SaveVolumeToWav16` from the VITS path, and the conv/LSTM primitives already in
-      the library. SCOPE v1: single forward graph text(phonemes)->waveform with the
-      reference style vector as an EXPLICIT input (deterministic, no sampling) so a
-      parity test `TestKokoroSynthesisParity` can gate `< 1e-4` vs the HF/`kokoro`
-      float64 oracle on a pico fixture (`tools/make_pico_kokoro_fixture.py` ->
-      `tests/fixtures/tiny_kokoro*`, re-randomized O(1)-scale weights per the ModernBERT
-      fixture lesson). The grapheme->phoneme (misaki/espeak) front-end is OUT OF SCOPE —
-      feed pre-phonemized input and reject `language`/g2p config loudly, exactly as the
-      VITS uroman/phonemizer front-ends are deferred. Unlocks the missing inverse-STFT
-      vocoding rung shared with any spectral-domain generator.
-      LANDED: `TKokoroConfig`/`ReadKokoroConfigFromJSONFile`, channel-major `TNNetKokoro`
-      holder + `BuildKokoroFromSafeTensors[Ex]`/`BuildKokoroFromSafeTensorsWithConfig`
-      in neural/neuralpretrained.pas; the three StyleTTS2 pieces wired (StyleDim-d
-      voice vector split into prosody half s_pred + acoustic half s_dec, AdaIN1d =
-      gamma(s)*InstanceNorm_ch(x)+beta(s) injected into the duration/F0/energy
-      predictors and decoder; style-conditioned duration predictor + length-regulator
-      monotonic expansion; iSTFTNet decoder predicting magnitude=exp(conv) +
-      phase=sin(conv) and reusing the LANDED `ISTFTOverlapAdd` in neuralaudio.pas);
-      deterministic phonemes+style->waveform forward graph with the style vector as an
-      EXPLICIT input; g2p/language config rejected loudly. `TestKokoroSynthesisParity`
-      gates < 1e-4 (per-stage: text-encoder hidden, log-durations + integer durations,
-      length-regulator, F0/energy, magnitude+phase, end-to-end waveform) vs a
-      SELF-CONTAINED numpy float64 oracle (`tools/make_pico_kokoro_fixture.py` ->
-      `tests/fixtures/tiny_kokoro{.safetensors,_config.json,_ref.json}`, re-randomized
-      O(1)-scale weights, seed 13); examples/KokoroTTS smoke writes a WAV via
-      `SaveVolumeToWav16`. OPEN follow-ups: real hexgrad/Kokoro-82M checkpoint key
-      mapping (the pico fixture defines a faithful StyleTTS2-SHAPED graph, not the exact
-      HF module/key layout - the real ProsodyPredictor LSTMs, AdaINResBlock1 stacks and
-      harmonic source module are not yet wired); multi-speaker / per-voice `voices/*.pt`
-      reference-vector indexing by token length; the misaki/espeak grapheme->phoneme
-      front-end.
 - [ ] Mimi streaming neural-codec importer (`BuildMimiFromSafeTensors[Ex]`,
       model_type "mimi", e.g. `kyutai/mimi`) — LANDED (conv encoder/decoder +
       RoPE transformer bottleneck + semantic/acoustic split-VQ; codes match the
@@ -859,20 +779,6 @@ rather than acted on.
       classifier-free-guidance tuning and long-form generation to a follow-up.
       The WAV writer + HiFi-GAN vocoder it builds on have landed; the open
       piece is the audio U-Net/DiT denoiser importer.
-- [X] Stereo MusicGen (audio_channels=2, the 2K-codebook layout) --
-      ReadMusicGenConfigFromJSONFile now ACCEPTS audio_channels=2 (requires even
-      num_codebooks = 2*K_channel) and stores AudioChannels in TMusicGenConfig.
-      The 2*K interleaved-codebook delay layout is wired end-to-end: row k's
-      delay offset is (k div AudioChannels), so rows 2c/2c+1 (left/right codebook
-      c) share offset c, matching HF build_delay_pattern_mask audio_channels==2.
-      MusicGenDelayInterleave/Deinterleave gained an optional Channels arg, and
-      every GenerateCFG/GenerateEx decode loop (full-prefix, un-cached sampling,
-      KV-cache, dual-twin CFG) uses the generalized offset and Steps = NumFrames
-      + (NumCodebooks div Channels) - 1. The EnCodec stays MONO (each channel's
-      codebooks decode through the same codec, ::2 / 1::2 split). Pico stereo
-      fixtures (tiny_musicgen_stereo{.safetensors,_config.json,_ref.json}) +
-      TestMusicGenStereoDecoderParity (decoder forward <1e-4 vs HF float64) and
-      TestMusicGenStereoDelayPattern (stereo delay round-trip == HF oracle).
 - [ ] SeamlessM4T-v2 follow-ups deferred from the landed S2TT v1:
       (1) position_embeddings_type="relative_key" — the v2 conformer self-attn
       distance-embedding attention bias (einsum("bhld,lrd->bhlr") added to the
@@ -910,19 +816,6 @@ rather than acted on.
         default TargetAccuracy and early-stops.
   - [ ] a 16 kHz resampler in neuralaudio so `--full` accepts non-16 kHz WAVs
         directly instead of requiring an ffmpeg pre-pass.
-- [X] Moonshine GQA decoder/encoder pico fixture (follow-up to the landed
-      Moonshine encoder-decoder importer + examples/MoonshineTranscribe):
-      decoder/encoder_num_key_value_heads != heads (the pico currently sets
-      kv_heads == heads; the GQA slice path is wired but unexercised by an
-      oracle — add a fixture with kv_heads < heads and assert parity).
-      DONE: tools/make_pico_moonshine_gqa_fixture.py (4 query heads / 2 kv
-      heads on BOTH towers, GroupSize=2) + tests/fixtures/tiny_moonshine_gqa*
-      + TestMoonshineGQAEncoderParity / TestMoonshineGQADecoderLogitParity
-      (<1e-4 HF float64 oracle; exercises the KVGroup := HeadCnt div GroupSize
-      broadcast in encoder self-attn, decoder self-attn AND cross-attn).
-      Note: transformers 5.11 MoonshineAttention reshapes the QUERY by
-      num_key_value_heads (an upstream GQA bug); the fixture monkeypatches
-      only that reshape to num_attention_heads to get a faithful oracle.
 - [ ] KV-cache O(1) incremental decode for the Moonshine decoder (self-attn cache +
       cross-attn states are constant across steps; reuse the SDPA Begin/EndIncrementalDecode
       machinery) so long transcripts don't re-run the whole prefix each step.
@@ -1113,22 +1006,6 @@ rather than acted on.
 - [ ] VAR (Visual AutoRegressive, next-scale prediction) image-generation follow-ups
       (class-conditional v1 LANDED — BuildVARFromSafeTensors[Ex] + ReadVARConfigFromJSONFile
       + the TNNetScaledDotProductAttention.BlockCausalSegments scale-mask flag):
-  - [X] VAR full multi-scale autoregressive SAMPLING loop (next-scale interpolation/
-        up-sampling between predicted levels + residual-VQ decode to pixels via the
-        landed BuildVqModelFromSafeTensors family) + an examples/VARGenerate demo.
-        LANDED: VARGenerate (coarse-to-fine: per scale, forward over the partially-
-        filled multi-scale token sequence, read next-scale logits at the scale's
-        positions, argmax/temperature-sample, write back so finer scales attend via
-        the scale-block-causal mask) + DecodeVARTokensToImage (final-scale token grid
-        -> VqModel discrete decode to pixels) in neuralpretrained.pas; examples/
-        VARGenerate (.lpr/.lpi, P6 PPM) on the pico VAR + MATCHED pico VQ fixtures
-        (tools/make_pico_var_vqmodel_fixture.py, latent grid 3 = final patch_num,
-        codebook 12 = vocab); TestVARGenerateSmoke (deterministic shape + finite
-        image). Random-weight wiring SMOKE (not a real image). Note: the input
-        contract is plain codebook INDICES embedded by word_embed, so the cross-scale
-        residual-VQ feature accumulation (canonical f_hat up-sampling inside the VQ
-        tokenizer) is carried here purely by transformer attention over sampled
-        coarser tokens — full residual-VQ-tokenizer input embedding is a follow-up.
   - [ ] VAR text-conditioned (Infinity-style) variant — replace the single class token
         with caller-supplied text encoder states + cross-attention (the PixArt-style
         text-cond path), the analogue of the DiT->PixArt step.
