@@ -654,20 +654,23 @@ rather than acted on.
         its (kernel-1)-token ring buffer + in/out projections driven one token at a
         time, then wire into TNNetStreamingDecoder (mirrors the RWKV TokenShift
         block-integration follow-up).
-- [X] Forced-prefix seq2seq decode + KV cache for Whisper-style decoders:
-      DecodeSeq2SeqGreedy/Sampled assume a text encoder input and a
-      single BOS start token, so examples/WhisperTranscribe hand-rolls
-      its decode loop (mel-volume encoder input + the 4-token
-      <|startoftranscript|><|en|><|transcribe|><|notimestamps|>
-      prologue, full prefix re-encoded every step). Add a seq2seq decode
-      variant taking an arbitrary forced token prologue and a
-      pre-computed encoder-states volume, plus decoder-side KV caching
-      (the cross-attention K/V are fixed after encoding — cache them
-      once). Assert greedy output matches the re-encoding loop
-      bit-identically; would cut WhisperTranscribe's ~5 min CPU decode
-      substantially. Note: the WhisperTranscribe example needs ~4 GB
-      VIRTUAL memory (ulimit -v 4000000; the 3 GB test cap aborts during
-      build).
+- [X] Forced-prefix seq2seq decode + KV cache for Whisper-style decoders —
+      DONE (commit f940c95): `DecodeSeq2SeqForcedPrefixCached(DecoderNet,
+      EncoderStates, ForcedPrefix, EOSTokenId, MaxNewTokens)` in
+      neural/neuraldecode.pas. Takes an arbitrary forced token prologue + a
+      pre-computed encoder-states volume; prefills the self-attention KV cache
+      one token at a time via TNNetStreamingDecoder (cross-attention K/V are
+      fixed after encoding, so the streaming scan skips them). O(L) vs the old
+      O(L^2) re-encoding. TestForcedPrefixCachedMatchesFullReDecode asserts
+      bit-identical greedy output vs the naive re-decode loop on a synthetic
+      cross-attn encoder-decoder pair; + steering + arg-validation tests.
+      REMAINING:
+  - [ ] Refactor examples/WhisperTranscribe to USE the cached helper. NOT a
+        clean drop-in today: the word-timestamp cross-attention alignment step
+        needs a full-width forward over the wide decoder, so the width-1 cached
+        decode would have to either skip alignment or run a second full pass.
+        (The example still re-encodes the full prefix every step; needs ~4 GB
+        virtual memory, ulimit -v 4000000.)
 - [ ] Streaming corpus loader with shuffle buffer: the landed packing
       pipeline materializes the whole token stream in RAM (neuraldatasets
       builds one concatenated Stream array). Read large text/token files
