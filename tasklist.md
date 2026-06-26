@@ -954,6 +954,36 @@ rather than acted on.
   - [ ] Sliding-window inference + overlap stitching for clips longer than the model's
         receptive field, and turning the per-frame activity matrix into final diarized
         speaker turns (clustering across windows).
+- [ ] ECAPA-TDNN speaker-embedding / speaker-verification importer
+      (`BuildEcapaTdnnFromSafeTensors[Ex]` + `TEcapaTdnnConfig`, e.g.
+      speechbrain/spkrec-ecapa-voxceleb) — the missing COMPANION to the landed pyannote
+      SEGMENTATION model: pyannote answers "who speaks WHEN" within one window, but the
+      cross-window speaker clustering its own follow-up calls for (line above) needs a
+      fixed-length speaker EMBEDDING to compare turns — that embedding model is ECAPA-TDNN
+      and is not in-tree. Architecturally distinct from every audio model present (this is
+      a discriminative utterance->vector encoder, not an autoregressive codec LM, a
+      diffusion denoiser, or a per-frame segmenter). Genuinely new leaf pieces, on top of
+      log-mel features that already exist in neural/neuralaudio.pas:
+      (a) a dilated 1D **Res2Net** TDNN block (channel groups processed in a hierarchical
+      residual cascade so the effective receptive field grows within the block — NOT the
+      same as a plain grouped/depthwise conv1d), reusing the landed squeeze-excitation
+      SE block for the per-block channel gating (SE-Res2Block);
+      (b) **attentive statistics pooling** — a small per-frame attention head whose softmax
+      weights produce a context-weighted mean AND standard-deviation over the time axis,
+      concatenated into the utterance vector (distinct from the AvgChannel/MaxChannel and
+      AttentionPooling layers present, which compute neither a weighted std nor the
+      mean||std concat);
+      (c) multi-layer feature aggregation (concat the outputs of the SE-Res2Blocks before
+      pooling) -> linear -> the 192-d embedding, with AAM-softmax only needed for training
+      (inference reads the embedding directly).
+      Then expose speaker VERIFICATION as the natural capability: cosine score between two
+      utterance embeddings + a small `examples/SpeakerVerification` that embeds two
+      synthesized clips and prints same/different-speaker cosine similarity (and feeds the
+      pyannote diarization follow-up's cross-window clustering). Pico parity `< 1e-4` vs a
+      hand-written numpy float64 forward oracle on a re-randomized fixture
+      (`tools/make_pico_ecapa_fixture.py`; speechbrain is not installed here, mirror the
+      pyannote oracle approach), `TestEcapaParity`. Real speechbrain checkpoint
+      key-mapping + a VoxCeleb EER smoke run are network/RAM-gated follow-ups.
 - [ ] SAM mask decoder as a real TNNet layer graph (TNNetCrossAttention two-source
       wiring) instead of the plain-array RunSAMMaskDecoder forward, so the decoder is
       trainable / fine-tunable end-to-end (v1 is inference-only). Needs a builder that
