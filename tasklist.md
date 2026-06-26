@@ -710,10 +710,15 @@ rather than acted on.
       position and run each output channel as one contiguous TNNetVolume.DotProduct;
       all 17 audio parity tests stay < 1e-4 on both scalar-fallback and real -dAVX2
       builds. REMAINING:
-  - [ ] ConvTranspose1d (upsample) paths — left SCALAR: the scatter/overlap-add
-        accumulation doesn't fit DotProduct's gather structure. These are the
-        DOMINANT cost of audio DECODE (the upsampling stages), so a col2im/gather
-        reformulation (or a transposed-im2col) is the highest-value remaining win.
+  - [X] ConvTranspose1d (upsample) paths — DONE: transposed-im2col reformulation.
+        RunEnCodecConv (serial + TEnCodecConvWorker.RunTranspose, covers
+        TEnCodecModel + MusicGen EnCodec decode) and RunHiFiGANConv (TNNetHiFiGAN +
+        nested Vits decoder) now pack InSig as InT[t*InCh+i] and repack W as
+        WT[(o*K+k2)*InCh+i] so the per-tap in-channel contraction is one
+        InCh-contiguous TNNetVolume.DotProduct (AVX when InCh>=16). The (t,k2)
+        overlap-add order matches the original i,t,o,k2 scatter; only the inner
+        i-sum reassociates. All 8 audio + EnCodec/HiFiGAN/Vits/MusicGen parity
+        tests stay < 1e-4 on scalar-fallback AND -dAVX2 builds.
   - [ ] TNNetMimi (RunMimiConv) — left scalar: it uses a DOUBLE-precision
         accumulator (TMimiDblArr2D); single-precision AVX DotProduct would be a
         genuine precision regression vs a benign reassociation. Needs a

@@ -33916,6 +33916,12 @@ type
   public
     W, B: TNeuralFloatDynArr;
     Padded, OutSig, InSig, Full: TNNetFloatDynArr2D;
+    // Transposed-im2col buffers (built once by the caller, read-only here): InT
+    // is InSig packed [t*InCh + i] so each output column is InCh-contiguous; WT
+    // is W repacked [(o*K + k2)*InCh + i] so each (o,k2) tap weight column is
+    // InCh-contiguous. Lets the per-tap in-channel contraction reuse the AVX
+    // DotProduct primitive. Coded by Claude (AI).
+    InT, WT: TNeuralFloatDynArr;
     InCh, OutCh, K, Stride, Dil, OutLen, InLen: integer;
     procedure RunForward(index, threadnum: integer);
     procedure RunTranspose(index, threadnum: integer);
@@ -33947,20 +33953,24 @@ begin
 end;
 
 procedure TEnCodecConvWorker.RunTranspose(index, threadnum: integer);
-var oStart, oFin, o, t, i, k2, idx: integer;
+var oStart, oFin, o, t, k2, idx: integer; Contrib: TNeuralFloat;
 begin
   TNeuralThreadList.CalculateWorkingRange(index, threadnum, OutCh, oStart, oFin);
-  // Full[o] was zeroed by the caller. Same i-major, t, k2 accumulation order per
-  // element as the serial scatter, so the overlap-add result is bit-identical.
+  // Full[o] was zeroed by the caller; each thread owns a disjoint set of o.
+  // Transposed-im2col overlap-add: for each output channel o and tap k2, the
+  // in-channel contraction sum_i W[(o,k2),i]*InSig[i][t] is one InCh-contiguous
+  // DotProduct of WT against the t-th InT column. The (t,k2) overlap-add order
+  // into Full[o][idx] matches the original scatter; only the inner i-sum
+  // reassociates (AVX, parity < 1e-4). Coded by Claude (AI).
   for o := oStart to oFin do
-    for i := 0 to InCh - 1 do
-      for t := 0 to InLen - 1 do
-        for k2 := 0 to K - 1 do
-        begin
-          idx := t * Stride + k2;
-          Full[o][idx] := Full[o][idx] +
-            W[i * OutCh * K + o * K + k2] * InSig[i][t];
-        end;
+    for t := 0 to InLen - 1 do
+      for k2 := 0 to K - 1 do
+      begin
+        idx := t * Stride + k2;
+        Contrib := TNNetVolume.DotProduct(
+          Addr(WT[(o * K + k2) * InCh]), Addr(InT[t * InCh]), InCh);
+        Full[o][idx] := Full[o][idx] + Contrib;
+      end;
 end;
 
 // Causal Conv1d / ConvTranspose1d on a channel-major signal. Reflect
@@ -33978,8 +33988,9 @@ var
   Acc: TNeuralFloat;
   Padded: TNNetFloatDynArr2D;
   Full: TNNetFloatDynArr2D;
-  InSigArr: TNNetFloatDynArr2D;
   Patch: TNeuralFloatDynArr;
+  InT, WT: TNeuralFloatDynArr;
+  Contrib: TNeuralFloat;
   ConvWorker: TEnCodecConvWorker;
   RefIdx: integer;
 begin
@@ -34098,19 +34109,28 @@ begin
       SetLength(Full[o], FullLen);
       for t := 0 to FullLenM1 do Full[o][t] := 0;
     end;
-    // Overlap-add upsample, parallelized over output channels. The o loop is
-    // hoisted outermost (vs. the original i,t,o,k2 nesting) so each thread owns a
-    // disjoint set of Full[o] arrays - race-free, and bit-identical because every
-    // Full[o][idx] still accumulates its (i,t,k2) contributions in the same
-    // i-major, t, k2 order. Tiny convs run inline.
+    // Transposed-im2col overlap-add upsample. InT packs InSig as [t*InCh + i] so
+    // each t-column is InCh-contiguous; WT repacks W as [(o*K + k2)*InCh + i] so
+    // each (o,k2) tap is InCh-contiguous. The in-channel contraction then becomes
+    // one AVX DotProduct per (o,t,k2). The (t,k2) overlap-add order into
+    // Full[o][idx] matches the original i,t,o,k2 scatter; only the inner i-sum
+    // reassociates (parity < 1e-4, matches the forward AVX change). Coded by
+    // Claude (AI).
+    SetLength(InT, InLen * InCh);
+    for t := 0 to InLenM1 do
+      for i := 0 to InChM1 do
+        InT[t * InCh + i] := InSig[i][t];
+    SetLength(WT, OutCh * K * InCh);
+    for o := 0 to OutChM1 do
+      for k2 := 0 to KM1 do
+        for i := 0 to InChM1 do
+          WT[(o * K + k2) * InCh + i] := Conv.W[i * OutCh * K + o * K + k2];
+    // Parallelized over output channels: each thread owns a disjoint set of
+    // Full[o] arrays (race-free). Tiny convs run inline.
     if (Pool <> nil) and (Pool.Count > 1) and (OutCh >= 4) and (InLen >= 512) then
     begin
-      // Mirror the open-array InSig into a dynamic 2D array (shares the inner
-      // channel rows by reference - no data copy) so the worker can hold it.
-      SetLength(InSigArr, InCh);
-      for i := 0 to InChM1 do InSigArr[i] := InSig[i];
       ConvWorker := TEnCodecConvWorker.Create;
-      ConvWorker.W := Conv.W;       ConvWorker.InSig := InSigArr;
+      ConvWorker.InT := InT;        ConvWorker.WT := WT;
       ConvWorker.Full := Full;      ConvWorker.InCh := InCh;
       ConvWorker.OutCh := OutCh;    ConvWorker.K := K;
       ConvWorker.Stride := Stride;  ConvWorker.InLen := InLen;
@@ -34118,15 +34138,15 @@ begin
       ConvWorker.Free;
     end
     else
-    for i := 0 to InChM1 do
+    for o := 0 to OutChM1 do
       for t := 0 to InLenM1 do
-        for o := 0 to OutChM1 do
-          for k2 := 0 to KM1 do
-          begin
-            idx := t * Stride + k2;
-            Full[o][idx] := Full[o][idx] +
-              Conv.W[i * OutCh * K + o * K + k2] * InSig[i][t];
-          end;
+        for k2 := 0 to KM1 do
+        begin
+          idx := t * Stride + k2;
+          Contrib := TNNetVolume.DotProduct(
+            Addr(WT[(o * K + k2) * InCh]), Addr(InT[t * InCh]), InCh);
+          Full[o][idx] := Full[o][idx] + Contrib;
+        end;
     // Add bias across the whole (untrimmed) output.
     for o := 0 to OutChM1 do
       for t := 0 to FullLenM1 do Full[o][t] := Full[o][t] + Conv.B[o];
@@ -36133,6 +36153,7 @@ var
   InChM1, OutChM1, KM1, InLenM1, OutLenM1: integer;
   Acc: TNeuralFloat;
   Patch: TNeuralFloatDynArr;
+  InT, WT: TNeuralFloatDynArr;
 begin
   InCh := Conv.InCh;
   OutCh := Conv.OutCh;
@@ -36190,16 +36211,32 @@ begin
       SetLength(OutSig[o], OutLen);
       for t := 0 to OutLenM1 do OutSig[o][t] := Conv.B[o];
     end;
-    for i := 0 to InChM1 do
+    // Transposed-im2col overlap-add. InT packs InSig as [t*InCh + i] so each
+    // t-column is InCh-contiguous; WT repacks W as [(o*K + k2)*InCh + i] so each
+    // (o,k2) tap is InCh-contiguous. The in-channel contraction then becomes one
+    // AVX DotProduct per (o,t,k2) that lands in OutSig. The (t,k2) overlap-add
+    // order matches the original i,t,o,k2 scatter; only the inner i-sum
+    // reassociates (parity < 1e-4, matches the forward AVX change). Coded by
+    // Claude (AI).
+    SetLength(InT, InLen * InCh);
+    for t := 0 to InLenM1 do
+      for i := 0 to InChM1 do
+        InT[t * InCh + i] := InSig[i][t];
+    SetLength(WT, OutCh * K * InCh);
+    for o := 0 to OutChM1 do
+      for k2 := 0 to KM1 do
+        for i := 0 to InChM1 do
+          WT[(o * K + k2) * InCh + i] := Conv.W[i * OutCh * K + o * K + k2];
+    for o := 0 to OutChM1 do
       for t := 0 to InLenM1 do
         for k2 := 0 to KM1 do
         begin
           idx := t * Stride + k2;       // index into the FullLen buffer
           val := idx - Pad;             // index into the trimmed output
           if (val >= 0) and (val < OutLen) then
-            for o := 0 to OutChM1 do
-              OutSig[o][val] := OutSig[o][val] +
-                Conv.W[i * OutCh * K + o * K + k2] * InSig[i][t];
+            OutSig[o][val] := OutSig[o][val] +
+              TNNetVolume.DotProduct(
+                Addr(WT[(o * K + k2) * InCh]), Addr(InT[t * InCh]), InCh);
         end;
   end;
 end;
