@@ -73920,9 +73920,10 @@ begin
         for oc := 0 to MaxN do
         begin
           W := FNeurons[oc].FWeights;
-          acc := 0;
-          for id := 0 to MaxInD do
-            acc := acc + W.Get(kx, ky, id) * Prev.Get(ix, iy, id);
+          // Depth axis is contiguous: W column (kx,ky,:) and Prev column
+          // (ix,iy,:) are each InD contiguous floats. SIMD dot product.
+          acc := TNNetVolume.DotProduct(
+            W.GetRawPtr(kx, ky, 0), Prev.GetRawPtr(ix, iy, 0), InD);
           FOutputRaw.Add(ox, oy, oc, acc);
         end;
       end;
@@ -74018,13 +74019,13 @@ begin
           if d = 0 then continue;
           GW := FNeurons[oc].FDelta;
           W := FNeurons[oc].FWeights;
-          for id := 0 to MaxInD do
-          begin
-            xval := Prev.Get(ix, iy, id);
-            GW.Add(kx, ky, id, lr * d * xval);
-            if hasInputGrad then
-              PrevErr.Add(ix, iy, id, d * W.Get(kx, ky, id));
-          end;
+          // Depth axis is contiguous: scaled SIMD MulAdd of Prev's depth
+          // column into GW's (scale lr*d), and of W's into PrevErr's (scale d).
+          TNNetVolume.MulAdd(GW.GetRawPtr(kx, ky, 0),
+            Prev.GetRawPtr(ix, iy, 0), lr * d, InD);
+          if hasInputGrad then
+            TNNetVolume.MulAdd(PrevErr.GetRawPtr(ix, iy, 0),
+              W.GetRawPtr(kx, ky, 0), d, InD);
         end;
       end;
    end;

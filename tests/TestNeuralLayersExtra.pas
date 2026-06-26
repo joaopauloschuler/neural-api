@@ -17,6 +17,7 @@ type
     procedure TestDeconvolutionNumeric;
     procedure TestDeconvolutionGradient;
     procedure TestDeconvolutionLinear;
+    procedure TestDeconvolutionDepthVectorEquality;
     
     // DeLocalConnect tests
     procedure TestDeLocalConnectForward;
@@ -544,6 +545,154 @@ begin
       Tgt.Free;
     end;
   finally
+    NN.Free;
+    V.Free;
+  end;
+end;
+
+// Gates the AVX depth-axis vectorization of TNNetDeconvolution.Compute and
+// .Backpropagate against an independent scalar reference. Uses InD=10 (> the
+// 8-wide SIMD unroll, plus a 2-element remainder) so the vectorized depth
+// dot-product / scaled-MulAdd code paths and their tails are all exercised.
+// Identity activation keeps the reference math exact and isolates the loops
+// under test. Asserts forward output, weight gradient (Delta) and input
+// gradient (PrevLayer.OutputError) all match within a tight SIMD-reassociation
+// tolerance.
+procedure TTestNeuralLayersExtra.TestDeconvolutionDepthVectorEquality;
+const
+  InW = 3; InH = 3; InD = 10; NF = 4; K = 2; Stride = 2; Pad = 1;
+  Tol = 1e-5;
+var
+  NN: TNNet;
+  V, Tgt: TNNetVolume;
+  D: TNNetDeconvolution;
+  refOut, refGW, refPrevErr: TNNetVolume;
+  OutW, OutH, oc, ox, oy, ix, iy, id, kx, ky: integer;
+  acc, deriv, dval, xval, wval, lr, diff, maxOut, maxGW, maxPE: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  V := TNNetVolume.Create(InW, InH, InD);
+  try
+    NN.AddLayer(TNNetInput.Create(InW, InH, InD, 1));
+    D := TNNetDeconvolution.Create(NF, K, Stride, Pad, 0, 0);
+    NN.AddLayer(D);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.InitWeights;
+    D.ActivationFn := @Identity;
+    D.ActivationFnDerivative := @IdentityDerivative;
+    V.Randomize;
+    NN.Compute(V);
+
+    OutW := D.Output.SizeX; OutH := D.Output.SizeY;
+    lr := -D.LearningRate; // mirror lr := -FLearningRate in Backpropagate
+
+    // ---- Independent scalar reference: forward (overlap-add scatter). ----
+    refOut := TNNetVolume.Create(OutW, OutH, NF);
+    refOut.Fill(0);
+    for iy := 0 to InH - 1 do
+     for ky := 0 to K - 1 do
+     begin
+       oy := iy * Stride - Pad + ky;
+       if (oy < 0) or (oy >= OutH) then continue;
+       for ix := 0 to InW - 1 do
+        for kx := 0 to K - 1 do
+        begin
+          ox := ix * Stride - Pad + kx;
+          if (ox < 0) or (ox >= OutW) then continue;
+          for oc := 0 to NF - 1 do
+          begin
+            acc := 0;
+            for id := 0 to InD - 1 do
+              acc := acc + D.Neurons[oc].Weights.Get(kx, ky, id) *
+                V.Get(ix, iy, id);
+            refOut.Add(ox, oy, oc, acc); // no bias (FSuppressBias)
+          end;
+        end;
+     end;
+
+    // Compare forward output (identity activation => raw == output).
+    maxOut := 0;
+    for id := 0 to refOut.Size - 1 do
+    begin
+      diff := Abs(refOut.FData[id] - D.Output.FData[id]);
+      if diff > maxOut then maxOut := diff;
+    end;
+    AssertTrue('forward output matches scalar reference (maxdiff=' +
+      FloatToStr(maxOut) + ')', maxOut <= Tol);
+
+    // ---- Backward: build a target and run analytic backprop. ----
+    Tgt := TNNetVolume.Create(D.Output);
+    try
+      Tgt.Randomize;
+      D.SetBatchUpdate(True);
+      NN.ClearDeltas;
+      // Backpropagate zeroes the input layer's OutputError before scattering.
+      NN.Backpropagate(Tgt);
+
+      // Reference dL/dW and dL/dx. With identity activation and the suite's
+      // SSE-style loss, the framework's output error equals (output - target);
+      // mirror that exactly so deriv matches the layer's FOutputErrorDeriv.
+      refGW := TNNetVolume.Create(K, K, InD); refGW.Fill(0);
+      refPrevErr := TNNetVolume.Create(InW, InH, InD); refPrevErr.Fill(0);
+      try
+        for iy := 0 to InH - 1 do
+         for ky := 0 to K - 1 do
+         begin
+           oy := iy * Stride - Pad + ky;
+           if (oy < 0) or (oy >= OutH) then continue;
+           for ix := 0 to InW - 1 do
+            for kx := 0 to K - 1 do
+            begin
+              ox := ix * Stride - Pad + kx;
+              if (ox < 0) or (ox >= OutW) then continue;
+              // Reference uses neuron 0's grads only; accumulate per oc below
+              for oc := 0 to NF - 1 do
+              begin
+                deriv := D.OutputErrorDeriv.Get(ox, oy, oc);
+                if deriv = 0 then continue;
+                if oc = 0 then
+                  for id := 0 to InD - 1 do
+                  begin
+                    xval := V.Get(ix, iy, id);
+                    dval := deriv;
+                    refGW.Add(kx, ky, id, lr * dval * xval);
+                  end;
+                for id := 0 to InD - 1 do
+                begin
+                  wval := D.Neurons[oc].Weights.Get(kx, ky, id);
+                  refPrevErr.Add(ix, iy, id, deriv * wval);
+                end;
+              end;
+            end;
+         end;
+
+        maxGW := 0;
+        for id := 0 to refGW.Size - 1 do
+        begin
+          diff := Abs(refGW.FData[id] - D.Neurons[0].Delta.FData[id]);
+          if diff > maxGW then maxGW := diff;
+        end;
+        AssertTrue('weight gradient matches scalar reference (maxdiff=' +
+          FloatToStr(maxGW) + ')', maxGW <= Tol);
+
+        maxPE := 0;
+        for id := 0 to refPrevErr.Size - 1 do
+        begin
+          diff := Abs(refPrevErr.FData[id] -
+            NN.GetFirstLayer.OutputError.FData[id]);
+          if diff > maxPE then maxPE := diff;
+        end;
+        AssertTrue('input gradient matches scalar reference (maxdiff=' +
+          FloatToStr(maxPE) + ')', maxPE <= Tol);
+      finally
+        refGW.Free; refPrevErr.Free;
+      end;
+    finally
+      Tgt.Free;
+    end;
+  finally
+    refOut.Free;
     NN.Free;
     V.Free;
   end;
