@@ -39,6 +39,33 @@ fpc -Fu../../neural -Mobjfpc -Sh -O2 WhisperTranscribe.lpr
 ./WhisperTranscribe /tmp/whisper-tiny speech.wav
 ```
 
+### Word-level timestamps
+
+Add `--word-timestamps` (anywhere after the WAV path) to also emit a
+per-word audio span. After the greedy decode the decoder-to-encoder
+cross-attention of a curated set of "alignment heads" is averaged into a
+(token x audio-frame) score matrix, median-filtered (kernel 7, the
+openai-whisper default) to suppress single-frame spikes, then dynamic-time-
+warped into a monotonic token-to-frame path. One encoder frame = 20 ms.
+Each word also carries a `confidence` (the mean path attention over its
+segment, roughly in `[0,1]`):
+
+```bash
+./WhisperTranscribe /tmp/whisper-tiny speech.wav --word-timestamps
+```
+
+```
+Word timestamps (start - end  [confidence]  word):
+     0.00 -    0.36  [0.41]   And
+     0.36 -    0.62  [0.55]   so
+     ...
+```
+
+This is the single-30 s-window path (`WhisperWordTimestamps` in
+`neural/neuralpretrained.pas`); clips longer than 30 s are truncated like
+HF. The released tiny/base/small shapes use the baked-in alignment heads;
+other shapes fall back to all heads.
+
 Verified output on the classic `jfk.wav` sample (whisper.cpp's test file)
 with `openai/whisper-tiny`:
 

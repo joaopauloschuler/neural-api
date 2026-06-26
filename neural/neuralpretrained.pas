@@ -3650,6 +3650,10 @@ type
     Word: string;
     StartS: TNeuralFloat;
     EndS: TNeuralFloat;
+    // Mean cross-attention (path) weight over the word's DTW segment, a
+    // rough [0,1] alignment-confidence (openai-whisper's word probability
+    // proxy). 0 when the word has no aligned frames.
+    Confidence: TNeuralFloat;
   end;
   TWhisperWordTimestamps = array of TWhisperWordTimestamp;
 
@@ -3682,10 +3686,16 @@ function WhisperAllAlignmentHeads(NumDecoderLayers,
 // are already softmaxed, so this re-normalizes the average). DecoderNet must
 // have just been Computed on the decode prefix. The result is owned by the
 // caller.
+//   MedianKernel - width of a per-row (along the audio-frame/time axis)
+//                  median filter applied to the averaged scores BEFORE the
+//                  re-normalization, matching openai-whisper's median_filter
+//                  (it suppresses single-frame attention spikes). The default
+//                  0 (and 1) DISABLE smoothing - identical to the v1 result.
+//                  Even kernels are rounded up to the next odd width.
 function WhisperCollectCrossAttention(DecoderNet: TNNet;
   const Config: TWhisperConfig;
   const AlignmentHeads: TWhisperAlignmentHeads;
-  TextLen: integer): TNNetVolume;
+  TextLen: integer; MedianKernel: integer = 0): TNNetVolume;
 
 // Monotonic dynamic time warping over a (TextLen x EncFrames) COST matrix
 // (Cost = -Score, the openai-whisper convention). Fills PathTok / PathFrame
@@ -3706,13 +3716,18 @@ function WhisperDTW(Score: TNNetVolume;
 //                  surface begins with a leading space starts a new word).
 //   AlignmentHeads - the (layer, head) subset to average; pass
 //                  WhisperDefaultAlignmentHeads (or WhisperAllAlignmentHeads).
+//   MedianKernel - per-row median-filter width over the audio-frame axis,
+//                  passed through to WhisperCollectCrossAttention (0/1 =
+//                  disabled, the v1 behavior; 7 = openai-whisper default).
 // DecoderNet must have just been Computed on the full Tokens prefix. Returns
-// (word, start_s, end_s) tuples. v1 scope: single window, greedy decode, no
-// median-filter smoothing or multi-window stitching (a documented follow-up).
+// (word, start_s, end_s, confidence) tuples; Confidence is the mean path
+// attention over each word's DTW frame segment. Scope: single window, greedy
+// decode, no multi-window stitching (a documented follow-up).
 function WhisperWordTimestamps(DecoderNet: TNNet;
   const Config: TWhisperConfig; Tokenizer: TNeuralHFTokenizer;
   const Tokens: array of integer; TextStart: integer;
-  const AlignmentHeads: TWhisperAlignmentHeads): TWhisperWordTimestamps;
+  const AlignmentHeads: TWhisperAlignmentHeads;
+  MedianKernel: integer = 0): TWhisperWordTimestamps;
 
 // ============================ WAV2VEC2 / HUBERT CTC IMPORT =================
 // Wav2Vec2 / HuBERT (model_type "wav2vec2" / "hubert", architectures
@@ -31257,21 +31272,85 @@ begin
     Add(Result, 8, 4); Add(Result, 8, 7); Add(Result, 8, 8);
     Add(Result, 9, 0); Add(Result, 9, 7); Add(Result, 9, 9);
     Add(Result, 10, 5);
+  end
+  else if (NumDecoderLayers = 24) and (NumDecoderHeads = 16) then
+  begin
+    // whisper-medium / medium.en (openai-whisper _ALIGNMENT_HEADS, decoded)
+    Add(Result, 13, 15); Add(Result, 15, 4); Add(Result, 15, 15);
+    Add(Result, 16, 1); Add(Result, 20, 0); Add(Result, 23, 4);
+  end
+  else if (NumDecoderLayers = 32) and (NumDecoderHeads = 20) then
+  begin
+    // whisper-large-v2 / large-v3 (openai-whisper _ALIGNMENT_HEADS, decoded)
+    Add(Result, 7, 0); Add(Result, 10, 17); Add(Result, 12, 18);
+    Add(Result, 13, 12); Add(Result, 16, 1); Add(Result, 17, 14);
+    Add(Result, 19, 11); Add(Result, 21, 4); Add(Result, 24, 1);
+    Add(Result, 25, 6);
   end;
-  // Other sizes (medium / large variants) and the pico fixture fall back to
-  // "all heads" at the call site (Length(Result) = 0).
+  // The pico fixture and any other shape fall back to "all heads" at the
+  // call site (Length(Result) = 0).
+end;
+
+// Replaces each Row[0..Len-1] sample with the median of a centered window
+// of width Kernel (rounded up to odd), reflecting at the boundaries - the
+// openai-whisper median_filter along the time axis. Kernel <= 1 is a no-op.
+procedure WhisperMedianFilterRow(var Row: array of TNeuralFloat;
+  Len, Kernel: integer);
+var
+  Half, i, k, SrcIdx, w, a, b: integer;
+  Win: array of TNeuralFloat;
+  Orig: array of TNeuralFloat;
+  Tmp: TNeuralFloat;
+begin
+  if (Kernel <= 1) or (Len <= 1) then Exit;
+  if (Kernel and 1) = 0 then Inc(Kernel);  // force odd
+  if Kernel > Len then Kernel := Len - ((Len + 1) and 1);  // <= Len, odd
+  if Kernel <= 1 then Exit;
+  Half := Kernel div 2;
+  SetLength(Orig, Len);
+  for i := 0 to Len - 1 do Orig[i] := Row[i];
+  SetLength(Win, Kernel);
+  for i := 0 to Len - 1 do
+  begin
+    for k := 0 to Kernel - 1 do
+    begin
+      SrcIdx := i + k - Half;
+      // reflect into [0, Len-1] (mirror without repeating the edge sample)
+      while (SrcIdx < 0) or (SrcIdx >= Len) do
+      begin
+        if SrcIdx < 0 then SrcIdx := -SrcIdx
+        else if SrcIdx >= Len then SrcIdx := 2 * (Len - 1) - SrcIdx;
+      end;
+      Win[k] := Orig[SrcIdx];
+    end;
+    // insertion sort (Kernel is small)
+    for a := 1 to Kernel - 1 do
+    begin
+      Tmp := Win[a];
+      b := a - 1;
+      while (b >= 0) and (Win[b] > Tmp) do
+      begin
+        Win[b + 1] := Win[b];
+        Dec(b);
+      end;
+      Win[b + 1] := Tmp;
+    end;
+    w := Half;  // middle element = median (Kernel is odd)
+    Row[i] := Win[w];
+  end;
 end;
 
 function WhisperCollectCrossAttention(DecoderNet: TNNet;
   const Config: TWhisperConfig;
   const AlignmentHeads: TWhisperAlignmentHeads;
-  TextLen: integer): TNNetVolume;
+  TextLen: integer; MedianKernel: integer = 0): TNNetVolume;
 var
   CrossLeaves: array of TNNetCrossAttention;
   LeafCnt, LayerCnt, HeadCnt, EncFrames, AvgN: integer;
   i, j, h, GlobalIdx, LayersMax, HeadsHi, TextLenM1, EncFramesM1: integer;
   Leaf: TNNetCrossAttention;
   RowMax, SumExp, V: TNeuralFloat;
+  FiltRow: array of TNeuralFloat;
 begin
   // 1. Enumerate the decoder's per-head cross-attention leaves in build
   //    order: DecoderHeads of them per decode block, in head order.
@@ -31323,6 +31402,20 @@ begin
     ImportError('Whisper alignment: no valid alignment heads supplied.');
   end;
   Result.Mul(1.0 / AvgN);
+
+  // 3b. Optional median-filter smoothing along the audio-frame axis (per
+  //     token row), matching openai-whisper's median_filter; suppresses
+  //     single-frame attention spikes before the DTW. Disabled for k<=1.
+  if MedianKernel > 1 then
+  begin
+    SetLength(FiltRow, EncFrames);
+    for i := 0 to TextLenM1 do
+    begin
+      for j := 0 to EncFramesM1 do FiltRow[j] := Result[j, i, 0];
+      WhisperMedianFilterRow(FiltRow, EncFrames, MedianKernel);
+      for j := 0 to EncFramesM1 do Result[j, i, 0] := FiltRow[j];
+    end;
+  end;
 
   // 4. Per-row (per-token) softmax over frames - normalizes the averaged
   //    map back into a distribution along the audio axis.
@@ -31411,7 +31504,8 @@ end;
 function WhisperWordTimestamps(DecoderNet: TNNet;
   const Config: TWhisperConfig; Tokenizer: TNeuralHFTokenizer;
   const Tokens: array of integer; TextStart: integer;
-  const AlignmentHeads: TWhisperAlignmentHeads): TWhisperWordTimestamps;
+  const AlignmentHeads: TWhisperAlignmentHeads;
+  MedianKernel: integer = 0): TWhisperWordTimestamps;
 var
   Heads: TWhisperAlignmentHeads;
   Score: TNNetVolume;
@@ -31419,10 +31513,30 @@ var
   PathLen, NText, t, k, WordCnt: integer;
   ScoreXMax, NTextM1, PathLenM1: integer;
   TokStartFrame, TokEndFrame: array of integer;
+  TokAttnSum: array of TNeuralFloat;  // path-attention sum per token
+  TokAttnCnt: array of integer;       // path steps per token
   Surface: string;
   CurStart, CurEnd: integer;
+  CurAttnSum: TNeuralFloat;
+  CurAttnCnt: integer;
   HaveWord: boolean;
   CurWord: string;
+
+  // Stores the current word into Result; computes its confidence as the
+  // mean path attention over its accumulated tokens.
+  procedure FlushWord;
+  begin
+    SetLength(Result, WordCnt + 1);
+    Result[WordCnt].Word := CurWord;
+    Result[WordCnt].StartS := CurStart * WhisperSecondsPerFrame;
+    Result[WordCnt].EndS := (CurEnd + 1) * WhisperSecondsPerFrame;
+    if CurAttnCnt > 0 then
+      Result[WordCnt].Confidence := CurAttnSum / CurAttnCnt
+    else
+      Result[WordCnt].Confidence := 0;
+    Inc(WordCnt);
+  end;
+
 begin
   SetLength(Result, 0);
   NText := Length(Tokens) - TextStart;
@@ -31436,7 +31550,7 @@ begin
 
   // Cross-attention over the FULL prefix; we read only the text rows.
   Score := WhisperCollectCrossAttention(DecoderNet, Config, Heads,
-    Length(Tokens));
+    Length(Tokens), MedianKernel);
   try
     // Slice out the text-token rows into a compact (NText x EncFrames) map.
     if TextStart > 0 then
@@ -31454,13 +31568,18 @@ begin
     Score.ReSize(Score.SizeX, NText, 1);
     PathLen := WhisperDTW(Score, PathTok, PathFrame);
 
-    // Per-token frame span: first and last frame the path assigns to it.
+    // Per-token frame span: first and last frame the path assigns to it,
+    // plus the running sum of path attention (for word confidence).
     SetLength(TokStartFrame, NText);
     SetLength(TokEndFrame, NText);
+    SetLength(TokAttnSum, NText);
+    SetLength(TokAttnCnt, NText);
     for t := 0 to NTextM1 do
     begin
       TokStartFrame[t] := -1;
       TokEndFrame[t] := -1;
+      TokAttnSum[t] := 0;
+      TokAttnCnt[t] := 0;
     end;
     PathLenM1 := PathLen - 1;
     for k := 0 to PathLenM1 do
@@ -31470,6 +31589,10 @@ begin
       begin
         if TokStartFrame[t] < 0 then TokStartFrame[t] := PathFrame[k];
         TokEndFrame[t] := PathFrame[k];
+        // Score is the (re-normalized) attention; PathFrame[k] is the X
+        // (audio-frame) coordinate, t the (already re-packed) text row.
+        TokAttnSum[t] := TokAttnSum[t] + Score[PathFrame[k], t, 0];
+        Inc(TokAttnCnt[t]);
       end;
     end;
   finally
@@ -31483,6 +31606,8 @@ begin
   CurWord := '';
   CurStart := 0;
   CurEnd := 0;
+  CurAttnSum := 0;
+  CurAttnCnt := 0;
   WordCnt := 0;
   for t := 0 to NTextM1 do
   begin
@@ -31492,15 +31617,12 @@ begin
     if (TokStartFrame[t] < 0) then continue;
     if HaveWord and (Length(Surface) > 0) and (Surface[1] = ' ') then
     begin
-      // Flush the accumulated word.
-      SetLength(Result, WordCnt + 1);
-      Result[WordCnt].Word := CurWord;
-      Result[WordCnt].StartS := CurStart * WhisperSecondsPerFrame;
-      Result[WordCnt].EndS := (CurEnd + 1) * WhisperSecondsPerFrame;
-      Inc(WordCnt);
+      FlushWord;  // emit the accumulated word, then open a new one
       CurWord := Surface;
       CurStart := TokStartFrame[t];
       CurEnd := TokEndFrame[t];
+      CurAttnSum := TokAttnSum[t];
+      CurAttnCnt := TokAttnCnt[t];
     end
     else
     begin
@@ -31508,20 +31630,19 @@ begin
       begin
         CurWord := Surface;
         CurStart := TokStartFrame[t];
+        CurAttnSum := 0;
+        CurAttnCnt := 0;
       end
       else
         CurWord := CurWord + Surface;
       CurEnd := TokEndFrame[t];
+      CurAttnSum := CurAttnSum + TokAttnSum[t];
+      CurAttnCnt := CurAttnCnt + TokAttnCnt[t];
       HaveWord := true;
     end;
   end;
   if HaveWord then
-  begin
-    SetLength(Result, WordCnt + 1);
-    Result[WordCnt].Word := CurWord;
-    Result[WordCnt].StartS := CurStart * WhisperSecondsPerFrame;
-    Result[WordCnt].EndS := (CurEnd + 1) * WhisperSecondsPerFrame;
-  end;
+    FlushWord;
 end;
 
 // ============================ WAV2VEC2 / HUBERT CTC IMPORT =================

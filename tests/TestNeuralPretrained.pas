@@ -12153,10 +12153,15 @@ var
   MelArr: TJSONArray;
   RefJson, LogJson: TStringList;
   EncInput, DecInput, Logits, Score: TNNetVolume;
+  ScorePlain, ScoreK1, ScoreK7: TNNetVolume;
   Heads: TWhisperAlignmentHeads;
   PathTok, PathFrame: array of integer;
   SeqCnt, i, j, MelCnt, FrameCnt, PosCnt, PathLen, NTok, NSrc: integer;
-  Diff, MaxScoreDiff: double;
+  Diff, MaxScoreDiff, MaxK1Diff, RowSum: double;
+  Tokenizer: TNeuralHFTokenizer;
+  WTokens: array of integer;
+  WordTs: TWhisperWordTimestamps;
+  PrevEnd: TNeuralFloat;
 const
   DecLen = 6;
 begin
@@ -12292,11 +12297,102 @@ begin
     AssertTrue('Whisper alignment score parity: max |diff| = ' +
       FloatToStr(MaxScoreDiff) + ' must be < 1e-4', MaxScoreDiff < 1e-4);
 
+    // ---- (a) median-filter smoothing regression -------------------------
+    // The decoder is still Computed on the LAST sequence's prefix, so its
+    // cross-attention leaves are live. NTok/NSrc carry over from that
+    // sequence. Kernel 0 and 1 must be BIT-identical to no smoothing;
+    // kernel 7 must still yield a valid per-row distribution and monotonic
+    // word boundaries downstream.
+    ScorePlain := WhisperCollectCrossAttention(Dec, Config, Heads, NTok, 0);
+    ScoreK1 := WhisperCollectCrossAttention(Dec, Config, Heads, NTok, 1);
+    ScoreK7 := WhisperCollectCrossAttention(Dec, Config, Heads, NTok, 7);
+    try
+      MaxK1Diff := 0;
+      for i := 0 to NTok - 1 do
+        for j := 0 to NSrc - 1 do
+        begin
+          Diff := Abs(ScorePlain[j, i, 0] - ScoreK1[j, i, 0]);
+          if Diff > MaxK1Diff then MaxK1Diff := Diff;
+        end;
+      AssertTrue('median kernel 1 identical to no smoothing (max |diff| = ' +
+        FloatToStr(MaxK1Diff) + ')', MaxK1Diff = 0);
+      // kernel 7 stays a per-row probability distribution (softmaxed)
+      for i := 0 to NTok - 1 do
+      begin
+        RowSum := 0;
+        for j := 0 to NSrc - 1 do
+        begin
+          AssertTrue('median-7 row >= 0', ScoreK7[j, i, 0] >= 0);
+          RowSum := RowSum + ScoreK7[j, i, 0];
+        end;
+        AssertTrue('median-7 row sums to 1 (got ' + FloatToStr(RowSum) + ')',
+          Abs(RowSum - 1.0) < 1e-4);
+      end;
+    finally
+      ScoreK7.Free;
+      ScoreK1.Free;
+      ScorePlain.Free;
+    end;
+
+    // ---- (a)+(e) end-to-end word timestamps + confidence ----------------
+    // Drive WhisperWordTimestamps with a byte-level BPE tokenizer fixture
+    // (the GPT-2-style leading-space word rule Whisper uses). The exact
+    // surface text is irrelevant here; we assert STRUCTURE: monotonic
+    // non-decreasing boundaries and a present, sane confidence per word,
+    // for both no-smoothing and the kernel-7 default.
+    Tokenizer := TNeuralHFTokenizer.Create;
+    try
+      Tokenizer.LoadFromFile(
+        FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
+      // The last decode prefix's ids; treat position 0 as the (single)
+      // prologue token, the rest as "text". Map ids into the tokenizer's
+      // valid range so DecodeToken never returns empty.
+      SetLength(WTokens, DecLen);
+      RowArr := TJSONArray(DecSeqs.Items[AlignArr.Count - 1]);
+      for i := 0 to DecLen - 1 do
+        WTokens[i] := RowArr.Items[i].AsInteger mod Tokenizer.GetVocabSize();
+
+      // kernel 0 (v1) and kernel 7 (default) must both produce structurally
+      // valid output.
+      for PathLen := 0 to 1 do
+      begin
+        if PathLen = 0 then
+          WordTs := WhisperWordTimestamps(Dec, Config, Tokenizer,
+            WTokens, {TextStart=}1, Heads, {MedianKernel=}0)
+        else
+          WordTs := WhisperWordTimestamps(Dec, Config, Tokenizer,
+            WTokens, {TextStart=}1, Heads, {MedianKernel=}7);
+        PrevEnd := -1;
+        for i := 0 to High(WordTs) do
+        begin
+          AssertTrue('word start <= end', WordTs[i].StartS <= WordTs[i].EndS);
+          AssertTrue('word boundaries non-decreasing',
+            WordTs[i].StartS >= PrevEnd - 1e-6);
+          PrevEnd := WordTs[i].StartS;
+          // Confidence is the mean path attention -> a probability-ish value
+          // present for every word, in a sane [0,1.0001] range.
+          AssertTrue('confidence present and >= 0', WordTs[i].Confidence >= 0);
+          AssertTrue('confidence <= ~1 (got ' +
+            FloatToStr(WordTs[i].Confidence) + ')',
+            WordTs[i].Confidence <= 1.0001);
+        end;
+      end;
+    finally
+      Tokenizer.Free;
+    end;
+
     // The size-keyed default-head table: the released whisper-tiny shape
     // (4 layers, 6 heads) returns the baked-in openai-whisper subset; the
     // pico shape returns empty (callers fall back to all heads).
     Heads := WhisperDefaultAlignmentHeads(4, 6);
     AssertTrue('whisper-tiny default alignment heads non-empty',
+      Length(Heads) > 0);
+    // medium (24L,16H) and large (32L,20H) now have baked-in head lists too.
+    Heads := WhisperDefaultAlignmentHeads(24, 16);
+    AssertTrue('whisper-medium default alignment heads non-empty',
+      Length(Heads) > 0);
+    Heads := WhisperDefaultAlignmentHeads(32, 20);
+    AssertTrue('whisper-large default alignment heads non-empty',
       Length(Heads) > 0);
     Heads := WhisperDefaultAlignmentHeads(
       Config.DecoderLayers, Config.DecoderHeads);
