@@ -33801,27 +33801,28 @@ type
   end;
 
 procedure TEnCodecConvWorker.RunForward(index, threadnum: integer);
-var tStart, tFin, o, t, i, k2, src: integer; Acc: TNeuralFloat;
+var tStart, tFin, o, t, i, k2: integer; Patch: TNeuralFloatDynArr;
 begin
   // Split the OUTPUT-TIME axis across threads. Every output position (o,t) is
-  // independent, so this is race-free and bit-identical to the serial conv - and
-  // unlike splitting over output channels it stays fully parallel for the
-  // high-resolution, LOW-channel decode stages where a SEANet decoder spends the
-  // bulk of its time (the final conv_out has OutCh=1 over ~1M samples; splitting
-  // its single output channel would have left it serial).
+  // independent, so this is race-free - and unlike splitting over output channels
+  // it stays fully parallel for the high-resolution, LOW-channel decode stages
+  // where a SEANet decoder spends the bulk of its time (the final conv_out has
+  // OutCh=1 over ~1M samples; splitting its single output channel would have left
+  // it serial). Each thread holds its OWN im2col Patch buffer (a local, not a
+  // shared field) so the per-t gather + InCh*K DotProduct stays race-free; AVX
+  // reassociation matches the serial path (parity < 1e-4, not bit-identical to
+  // the old i-major,k2 scalar order). Coded by Claude (AI).
   TNeuralThreadList.CalculateWorkingRange(index, threadnum, OutLen, tStart, tFin);
-  for o := 0 to OutCh - 1 do
-    for t := tStart to tFin do
-    begin
-      Acc := B[o];
-      for i := 0 to InCh - 1 do
-        for k2 := 0 to K - 1 do
-        begin
-          src := t * Stride + k2 * Dil;
-          Acc := Acc + W[o * InCh * K + i * K + k2] * Padded[i][src];
-        end;
-      OutSig[o][t] := Acc;
-    end;
+  SetLength(Patch, InCh * K);
+  for t := tStart to tFin do
+  begin
+    for i := 0 to InCh - 1 do
+      for k2 := 0 to K - 1 do
+        Patch[i * K + k2] := Padded[i][t * Stride + k2 * Dil];
+    for o := 0 to OutCh - 1 do
+      OutSig[o][t] := B[o] +
+        TNNetVolume.DotProduct(Addr(W[o * InCh * K]), Addr(Patch[0]), InCh * K);
+  end;
 end;
 
 procedure TEnCodecConvWorker.RunTranspose(index, threadnum: integer);
@@ -33857,6 +33858,7 @@ var
   Padded: TNNetFloatDynArr2D;
   Full: TNNetFloatDynArr2D;
   InSigArr: TNNetFloatDynArr2D;
+  Patch: TNeuralFloatDynArr;
   ConvWorker: TEnCodecConvWorker;
   RefIdx: integer;
 begin
@@ -33943,18 +33945,25 @@ begin
       ConvWorker.Free;
     end
     else
-    for o := 0 to OutChM1 do
+    begin
+      // im2col: for each output position t, gather the (InCh*K) receptive-field
+      // patch in W's [i*K + k2] order, then accumulate every output channel as a
+      // single contiguous InCh*K dot product against W's [o*InCh*K..] row. The
+      // patch is built ONCE per t and reused across all o. DotProduct dispatches
+      // to AVX (InCh*K >= csMinAvxSize on the heavy decode stages); the SIMD
+      // reassociation matches the LSTM AVX change (parity < 1e-4, NOT
+      // bit-identical to the prior scalar i-major,k2 order). Coded by Claude (AI).
+      SetLength(Patch, InCh * K);
       for t := 0 to OutLenM1 do
       begin
-        Acc := Conv.B[o];
         for i := 0 to InChM1 do
           for k2 := 0 to KM1 do
-          begin
-            src := t * Stride + k2 * Dil;
-            Acc := Acc + Conv.W[o * InCh * K + i * K + k2] * Padded[i][src];
-          end;
-        OutSig[o][t] := Acc;
+            Patch[i * K + k2] := Padded[i][t * Stride + k2 * Dil];
+        for o := 0 to OutChM1 do
+          OutSig[o][t] := Conv.B[o] +
+            TNNetVolume.DotProduct(Addr(Conv.W[o * InCh * K]), Addr(Patch[0]), InCh * K);
       end;
+    end;
   end
   else
   begin
@@ -36002,6 +36011,7 @@ var
   OutLen, FullLen, idx, val: integer;
   InChM1, OutChM1, KM1, InLenM1, OutLenM1: integer;
   Acc: TNeuralFloat;
+  Patch: TNeuralFloatDynArr;
 begin
   InCh := Conv.InCh;
   OutCh := Conv.OutCh;
@@ -36020,21 +36030,29 @@ begin
     if OutLen < 0 then OutLen := 0;
     OutLenM1 := OutLen - 1;
     SetLength(OutSig, OutCh);
-    for o := 0 to OutChM1 do
+    for o := 0 to OutChM1 do SetLength(OutSig[o], OutLen);
+    // im2col: build the (InCh*K) receptive-field patch ONCE per output position t
+    // in W's [i*K + k2] order (taps that fall in the implicit zero pad stay 0),
+    // then accumulate every output channel as a single contiguous InCh*K dot
+    // product against W's [o*InCh*K..] row. DotProduct dispatches to AVX
+    // (InCh*K >= csMinAvxSize on the wide synthesis stages). The SIMD
+    // reassociation matches the EnCodec/LSTM AVX changes (parity < 1e-4, not
+    // bit-identical to the prior k2-major scalar order). Coded by Claude (AI).
+    SetLength(Patch, InCh * K);
+    for t := 0 to OutLenM1 do
     begin
-      SetLength(OutSig[o], OutLen);
-      for t := 0 to OutLenM1 do
-      begin
-        Acc := Conv.B[o];
+      for i := 0 to InChM1 do
         for k2 := 0 to KM1 do
         begin
           src := t * Stride + k2 * Dil - Pad; // implicit zero pad
           if (src >= 0) and (src < InLen) then
-            for i := 0 to InChM1 do
-              Acc := Acc + Conv.W[o * InCh * K + i * K + k2] * InSig[i][src];
+            Patch[i * K + k2] := InSig[i][src]
+          else
+            Patch[i * K + k2] := 0;
         end;
-        OutSig[o][t] := Acc;
-      end;
+      for o := 0 to OutChM1 do
+        OutSig[o][t] := Conv.B[o] +
+          TNNetVolume.DotProduct(Addr(Conv.W[o * InCh * K]), Addr(Patch[0]), InCh * K);
     end;
   end
   else
