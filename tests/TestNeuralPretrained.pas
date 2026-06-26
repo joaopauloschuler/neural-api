@@ -300,6 +300,11 @@ type
     // GroupSize=1, never verifying the broadcast).
     procedure TestMoonshineGQAEncoderParity;
     procedure TestMoonshineGQADecoderLogitParity;
+    // Moonshine KV-CACHE incremental decode (DecodeMoonshineGreedyCached): the
+    // O(1)-per-step streamed greedy decode must be BIT-IDENTICAL (token-for-
+    // token) to the O(L)-per-step re-encode-the-whole-prefix manual loop the
+    // example used to drive. Same pico fixture, same start/eos.
+    procedure TestMoonshineKVCacheDecodeParity;
     // EnCodec: round-trips three pinned waveforms through the imported codec
     // (waveform -> RVQ codes -> waveform) and asserts the codes match the HF
     // oracle EXACTLY and the reconstructed waveform matches < 1e-4.
@@ -12892,6 +12897,108 @@ begin
     Logits.Free;
     DecIn.Free;
     EncOut.Free;
+    EncIn.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMoonshineKVCacheDecodeParity;
+var
+  Enc, Dec, EncC, DecC: TNNet;
+  Config, ConfigC: TMoonshineConfig;
+  RefRoot: TJSONData;
+  WaveArr: TJSONArray;
+  EncIn, DecIn, Logits, Wave: TNNetVolume;
+  EncStates: TNNetLayer;
+  RefJson: TStringList;
+  RefTokens, CachedTokens: TNeuralIntegerArray;
+  i, NumSamples, DecSeqLen, StartId, EOSId, MaxNew, CurLen, Next: integer;
+begin
+  RandSeed := 424242;
+  StartId := 1;  // decoder_start_token_id (Moonshine default)
+  EOSId := 2;    // eos_token_id (Moonshine default)
+  DecSeqLen := 24;
+  MaxNew := DecSeqLen - 1;
+  RefJson := TStringList.Create;
+  EncIn := TNNetVolume.Create;
+  DecIn := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  Wave := TNNetVolume.Create;
+  RefRoot := nil;
+  Enc := nil;
+  Dec := nil;
+  EncC := nil;
+  DecC := nil;
+  try
+    // Reuse the committed decoder fixture's pinned waveform (token oracle not
+    // needed here - this test compares two DECODE PATHS, not against HF).
+    RefJson.LoadFromFile(FixturePath('tiny_moonshine_decoder.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    WaveArr := TJSONArray(TJSONObject(RefRoot).Find('waveform'));
+    AssertTrue('waveform present', WaveArr <> nil);
+    NumSamples := WaveArr.Count;
+
+    BuildMoonshineEncoderDecoderFromSafeTensors(
+      FixturePath('tiny_moonshine.safetensors'), Enc, Dec, Config,
+      NumSamples, DecSeqLen, {pTrainable=}true,
+      FixturePath('tiny_moonshine_config.json'));
+    AssertTrue('encoder built', Enc <> nil);
+    AssertTrue('decoder built', Dec <> nil);
+
+    Wave.ReSize(NumSamples, 1, 1);
+    for i := 0 to NumSamples - 1 do Wave.FData[i] := WaveArr.Items[i].AsFloat;
+
+    // ---- (A) REFERENCE: the manual re-encode-the-whole-prefix greedy loop
+    //      the example used to drive (O(L) per step). ----
+    EncIn.ReSize(NumSamples, 1, 1);
+    for i := 0 to NumSamples - 1 do EncIn.FData[i] := Wave.FData[i];
+    Enc.Compute(EncIn);
+    EncStates := T5EncoderStatesInput(Dec);
+    EncStates.Output.Copy(Enc.GetLastLayer().Output);
+    DecIn.ReSize(DecSeqLen, 1, 1);
+    SetLength(RefTokens, 0);
+    CurLen := 1;
+    DecIn.FData[0] := StartId;
+    while CurLen < DecSeqLen do
+    begin
+      for i := CurLen to DecSeqLen - 1 do DecIn.FData[i] := StartId;
+      Dec.Compute(DecIn);
+      Dec.GetOutput(Logits);
+      Next := Logits.GetClassOnPixel(CurLen - 1, 0);
+      SetLength(RefTokens, Length(RefTokens) + 1);
+      RefTokens[High(RefTokens)] := Next;
+      if Next = EOSId then break;
+      if Length(RefTokens) >= MaxNew then break;
+      DecIn.FData[CurLen] := Next;
+      Inc(CurLen);
+    end;
+
+    // ---- (B) KV-CACHE incremental decode (O(1) per step). The cached path
+    //      feeds ONE token at a time, so its decoder's token input must be
+    //      built at width 1 (same fixture weights, DecSeqLen=1). ----
+    BuildMoonshineEncoderDecoderFromSafeTensors(
+      FixturePath('tiny_moonshine.safetensors'), EncC, DecC, ConfigC,
+      NumSamples, {DecSeqLen=}1, {pTrainable=}true,
+      FixturePath('tiny_moonshine_config.json'));
+    CachedTokens := DecodeMoonshineGreedyCached(EncC, DecC, Wave,
+      StartId, EOSId, MaxNew);
+
+    // ---- BIT-IDENTITY: token-for-token equality, NEVER loosen. ----
+    AssertTrue('cached decode generated >= 1 token', Length(CachedTokens) >= 1);
+    AssertEquals('KV-cache decode length matches the full-prefix loop',
+      Length(RefTokens), Length(CachedTokens));
+    for i := 0 to Length(RefTokens) - 1 do
+      AssertEquals('KV-cache token[' + IntToStr(i) + '] bit-identical',
+        RefTokens[i], CachedTokens[i]);
+  finally
+    DecC.Free;
+    EncC.Free;
+    Dec.Free;
+    Enc.Free;
+    RefRoot.Free;
+    Wave.Free;
+    Logits.Free;
+    DecIn.Free;
     EncIn.Free;
     RefJson.Free;
   end;

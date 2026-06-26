@@ -1885,6 +1885,31 @@ function DecodeSeq2SeqGreedy(EncoderNet, DecoderNet: TNNet;
   const SourceTokens: array of integer;
   StartTokenId, EOSTokenId, MaxNewTokens: integer): TNeuralIntegerArray;
 
+// KV-CACHE (O(1)-per-step) greedy decode for an AUDIO encoder-decoder whose
+// encoder takes a RAW WAVEFORM volume (Moonshine), not token ids - so it
+// cannot use DecodeSeq2SeqGreedy (which assumes a token-id encoder). The
+// encoder runs ONCE; its hidden states are cached in the decoder's second
+// TNNetInput (constant across every decode step, so the per-layer CROSS-
+// attention re-reads them unchanged each step - there is nothing to grow). A
+// TNNetStreamingDecoder session arms every SELF-attention SDPA's incremental
+// KV cache and the partial-RoPE PositionOffset: the start token is prefilled
+// at absolute position 0, then each generated token is fed ONE AT A TIME at
+// its absolute position, appending only its K/V to the self-attn cache and
+// reading the single next-token logit row. This turns the per-step cost from
+// O(L) (re-run the whole StartTokenId-padded prefix) into O(1), so a length-L
+// transcript is O(L) total instead of O(L^2).
+//
+// EXACTNESS: per the TNNetStreamingDecoder contract the streamed argmax is
+// BIT-IDENTICAL to the full re-encode-the-prefix loop (DecodeSeq2SeqGreedy on
+// a token-id encoder, or the manual loop the Moonshine example used to drive).
+// Decode stops on EOSTokenId (appended and counted), at MaxNewTokens, or at
+// the session's MaxCacheLen capacity. The encoder/decoder state-size match is
+// validated (EArgumentException on mismatch). MaxNewTokens < 1 returns empty.
+// Coded by Claude (AI).
+function DecodeMoonshineGreedyCached(EncoderNet, DecoderNet: TNNet;
+  Waveform: TNNetVolume;
+  StartTokenId, EOSTokenId, MaxNewTokens: integer): TNeuralIntegerArray;
+
 // Stochastic seq2seq decode: the step's logits row is divided by Temperature
 // (clamped to >= 1e-6; Temperature -> 0 degenerates to greedy argmax) and
 // softmaxed, then Sampler draws from the resulting distribution. Sampler =
@@ -7515,6 +7540,71 @@ begin
   // the Temperature argument is irrelevant there).
   Result := DecodeSeq2SeqSampled(EncoderNet, DecoderNet, SourceTokens,
     StartTokenId, EOSTokenId, MaxNewTokens, nil);
+end;
+
+function DecodeMoonshineGreedyCached(EncoderNet, DecoderNet: TNNet;
+  Waveform: TNNetVolume;
+  StartTokenId, EOSTokenId, MaxNewTokens: integer): TNeuralIntegerArray;
+var
+  EncStates: TNNetLayer;
+  Session: TNNetStreamingDecoder;
+  StepIn, Logits: TNNetVolume;
+  DecSeqLen, AbsPos, Next, MaxCache: integer;
+begin
+  SetLength(Result, 0);
+  if MaxNewTokens < 1 then exit;
+  // (1) Encode the waveform ONCE and cache the hidden states in the decoder's
+  // second TNNetInput - they are constant across every decode step, so the
+  // per-layer cross-attention re-reads them unchanged (nothing to grow).
+  EncStates := Seq2SeqEncoderStatesInput(DecoderNet);
+  EncoderNet.Compute(Waveform);
+  if EncoderNet.GetLastLayer().Output.Size <> EncStates.Output.Size then
+    raise EArgumentException.Create('DecodeMoonshineGreedyCached: encoder ' +
+      'output size ' + IntToStr(EncoderNet.GetLastLayer().Output.Size) +
+      ' does not match the decoder''s encoder-states input size ' +
+      IntToStr(EncStates.Output.Size) + ' (frames/d_model mismatch?).');
+  EncStates.Output.Copy(EncoderNet.GetLastLayer().Output);
+  // The incremental path feeds the decoder ONE token per step, so its first
+  // TNNetInput (the token ids) must be built at width 1 - a wider decoder
+  // would have TNNet.Compute reject the width-1 step volume outright. Build
+  // the cached decoder with DecSeqLen = 1 (the cache, not the input width,
+  // carries the growing context).
+  DecSeqLen := DecoderNet.GetFirstLayer().Output.Size;
+  if DecSeqLen <> 1 then
+    raise EArgumentException.Create('DecodeMoonshineGreedyCached: the ' +
+      'decoder''s token input must be width 1 for incremental decode (built ' +
+      'at DecSeqLen=' + IntToStr(DecSeqLen) + '); build it with DecSeqLen=1.');
+  // The session's KV cache is the real context capacity.
+  MaxCache := MaxNewTokens + 1;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  // (2) Arm the self-attn SDPA KV caches + RoPE PositionOffset. The session
+  // feeds ONE token per StepForward at its absolute position, appending only
+  // that token's K/V - O(1) per step instead of re-running the whole prefix.
+  Session := TNNetStreamingDecoder.Create(DecoderNet, MaxCache);
+  try
+    Session.Reset();
+    AbsPos := 0;
+    StepIn.FData[0] := StartTokenId;
+    while True do
+    begin
+      Session.StepForward(StepIn, AbsPos);
+      Logits := Session.Output();
+      // Width-1 step: the next-token distribution is the single output row 0
+      // (argmax ties to the lowest id, like GetClassOnPixel everywhere else).
+      Next := Logits.GetClassOnPixel(0, 0);
+      SetLength(Result, Length(Result) + 1);
+      Result[High(Result)] := Next;
+      if Next = EOSTokenId then break;
+      if Length(Result) >= MaxNewTokens then break;
+      // Cache capacity reached: the token just generated cannot be fed back.
+      Inc(AbsPos);
+      if AbsPos >= MaxCache then break;
+      StepIn.FData[0] := Next;
+    end;
+  finally
+    Session.Free;
+    StepIn.Free;
+  end;
 end;
 
 function DecodeSeq2SeqSampled(EncoderNet, DecoderNet: TNNet;
