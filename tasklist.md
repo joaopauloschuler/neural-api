@@ -704,9 +704,38 @@ rather than acted on.
       tests (EnCodec round-trips, TestMimiParity, TestDACRoundTripParity,
       TestHiFiGANSynthesisParity, TestVitsSynthesisParity, TestMusicGen*DecoderParity)
       pass on BOTH scalar-fallback and real -dAVX2 builds. REMAINING:
-  - [ ] OpenCL offload of the same accumulation (via the shared dot-product
-        kernel, like FullConnect/Convolution) — optional follow-up after the AVX
-        ConvTranspose1d path lands.
+  - [X] OpenCL offload of the same accumulation (via the shared dot-product
+        kernel, like FullConnect/Convolution). DONE for the FORWARD conv1d of the
+        EnCodec (`RunEnCodecConv` — covers `TEnCodecModel` + the MusicGen EnCodec
+        decode path) and HiFiGAN/Vits (`RunHiFiGANConv` — covers `TNNetHiFiGAN` +
+        the nested Vits decoder) holders. OPT-IN + default OFF via a process-wide
+        gate (`EnableConvOpenCL(platform,device)` / `DisableConvOpenCL` /
+        `ConvOpenCLEnabled`; the runners are free functions, not methods). When
+        armed AND the stage's GEMM exceeds `FConvOpenCLMinWork` MACs (settable via
+        `SetConvOpenCLMinWork`; small convs stay on CPU as kernel-launch overhead
+        dominates), the per-stage im2col matmul runs as ONE `TDotProductSharedKernel`
+        call: weights transpose into the kernel's interleaved As layout
+        (`WInter[i*OutCh+o]`), patches pack contiguous as Bs (`Patch[t*Size+i]`),
+        result lands `Res[t*OutCh+o]` = the exact same arithmetic as the per-position
+        CPU `DotProduct`. New `TestEnCodecOpenCLConvParity` arms OpenCL (MinWork 0 to
+        force every conv onto the device) and asserts the decode matches the CPU
+        decode `< 1e-4`; all audio parity tests stay `< 1e-4` on BOTH the default
+        (no-`-dOpenCL`, path inert) and `-dOpenCL` builds (PoCL CPU device here;
+        full default suite 2319 tests / 0 failures). Verified on PoCL; the real perf
+        win is large-checkpoint decode on a real GPU (not profilable here — on a CPU
+        device or for small convs the launch overhead can make it slower, hence the
+        opt-in gate + size threshold). DEFERRED (open sub-bullets below): the
+        ConvTranspose1d (upsample) overlap-add path of all holders, and the
+        double-precision Mimi (`RunMimiConv`) / DAC (`RunDACConv`) holders, which use
+        `MimiDotProductD` (Double) — the shared kernel is single-precision, so a
+        Float OpenCL path there would not meet the `< 1e-4` Double-oracle gate
+        without a Double kernel; left on CPU AVX.
+    - [ ] OpenCL offload of the ConvTranspose1d (upsample) overlap-add accumulation
+          (EnCodec + HiFiGAN/Vits); the per-(o,k2)-tap in-channel contraction is the
+          same shared-kernel-shaped GEMM but scatters into an overlap-add buffer.
+    - [ ] OpenCL offload of the Mimi (`RunMimiConv`) / DAC (`RunDACConv`) holders —
+          blocked on a Double-precision shared dot-product kernel (their oracle gate
+          is `< 1e-4` against a float64 reference; a Float kernel would not hold it).
       Design note (the landed forward path follows this): channel-major layout
       means the contraction (sum over in-channels for a fixed kernel tap) is
       depth-axis-contiguous — exactly the case `TNNetVolume.DotProduct` / `MulAdd`

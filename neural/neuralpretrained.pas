@@ -523,7 +523,8 @@ interface
 
 uses
   {$IFDEF OpenCL}
-  cl,  // cl_platform_id / cl_device_id for TMusicGenModel.EnableOpenCL
+  cl,           // cl_platform_id / cl_device_id for TMusicGenModel.EnableOpenCL
+  neuralopencl, // TDotProductSharedKernel for the audio-holder conv OpenCL path
   {$ENDIF}
   Classes, SysUtils, Math, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralthread, neuralsafetensors, neuraltorchbin,
@@ -4471,6 +4472,28 @@ type
 function ReadEnCodecConfigFromJSONFile(const FileName: string): TEnCodecConfig;
 
 function EnCodecConfigToString(const Config: TEnCodecConfig): string;
+
+{$IFDEF OpenCL}
+// OPT-IN OpenCL offload for the channel-major conv1d inner loops of the
+// audio holders (RunEnCodecConv / RunHiFiGANConv). OFF by default: the CPU
+// AVX/scalar DotProduct path is used unless armed here. When armed, the
+// per-conv-stage im2col GEMM (interleaved weight matrix x contiguous patch
+// matrix) is routed through the SAME shared dot-product kernel that
+// TNNetFullConnect / TNNetConvolutionBase use for GPU offload
+// (TDotProductSharedKernel), with a CPU fallback for stages below a size
+// threshold (kernel-launch overhead dominates tiny convs). Parity with the
+// CPU path stays < 1e-4 (verified by TestEnCodecOpenCLConvParity). This is a
+// PROCESS-WIDE gate (the conv runners are free functions, not methods), so
+// call DisableConvOpenCL when done. Coded by Claude (AI).
+procedure EnableConvOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
+procedure DisableConvOpenCL();
+function ConvOpenCLEnabled(): boolean;
+// Conv stages with fewer than this many multiply-adds (OutCh*NumPos*Size) stay
+// on the CPU even when OpenCL is armed (kernel-launch overhead dominates tiny
+// convs). Default ~1M MACs; set 0 to force EVERY conv onto the device (used by
+// the parity test to guarantee the OpenCL path is exercised). Coded by Claude (AI).
+procedure SetConvOpenCLMinWork(MinMACs: int64);
+{$ENDIF}
 
 // Builds a TEnCodecModel from Reader (the caller owns Reader). Config.
 // NumQuantizers is detected from the checkpoint (the number of
@@ -38153,6 +38176,131 @@ end;
 // parallel (each channel reads the shared read-only input + weights and writes
 // its OWN output row), so splitting the channels across the shared thread pool
 // is race-free and BIT-IDENTICAL to the serial scalar conv. Coded by Claude (AI).
+
+{$IFDEF OpenCL}
+// --------------------------------------------------------------------------
+// OPT-IN OpenCL offload state for the audio-holder conv runners. Process-wide
+// (the runners are free functions), default OFF. FConvDotCL wraps the shared
+// dot-product kernel (the same one TNNetConvolutionBase uses). Coded by
+// Claude (AI).
+var
+  FConvOpenCLEnabled: boolean = false;
+  FConvDotKernel: TDotProductKernel = nil;
+  FConvDotCL: TDotProductSharedKernel = nil;
+  // Scratch operands reused across stages to avoid per-call allocation.
+  FConvWInter: TNNetVolume = nil;   // interleaved weights  As[i*OutCh + o]
+  FConvPatchMat: TNNetVolume = nil; // contiguous patches   Bs[t*Size  + i]
+  FConvResMat: TNNetVolume = nil;   // result               Res[t*OutCh + o]
+
+// Conv stages below this GEMM work (OutCh * NumPositions * Size multiply-adds)
+// stay on the CPU: the OpenCL kernel-launch + host<->device copy overhead
+// dominates tiny convs. Tuned conservatively; correctness is independent of it.
+// Settable via SetConvOpenCLMinWork (0 forces every conv onto the device).
+var
+  FConvOpenCLMinWork: int64 = 1 shl 20; // 1M MACs
+
+procedure SetConvOpenCLMinWork(MinMACs: int64);
+begin
+  FConvOpenCLMinWork := MinMACs;
+end;
+
+procedure EnableConvOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
+begin
+  if not Assigned(FConvDotKernel) then
+    FConvDotKernel := TDotProductCL.Create(platform_id, device_id);
+  if not Assigned(FConvDotCL) then
+  begin
+    FConvDotCL := TDotProductSharedKernel.Create(FConvDotKernel);
+    FConvDotCL.HideMessages();
+  end;
+  if not Assigned(FConvWInter)   then FConvWInter   := TNNetVolume.Create();
+  if not Assigned(FConvPatchMat) then FConvPatchMat := TNNetVolume.Create();
+  if not Assigned(FConvResMat)   then FConvResMat   := TNNetVolume.Create();
+  FConvOpenCLEnabled := true;
+end;
+
+procedure DisableConvOpenCL();
+begin
+  FConvOpenCLEnabled := false;
+  FreeAndNil(FConvResMat);
+  FreeAndNil(FConvPatchMat);
+  FreeAndNil(FConvWInter);
+  FreeAndNil(FConvDotCL);
+  FreeAndNil(FConvDotKernel);
+end;
+
+function ConvOpenCLEnabled(): boolean;
+begin
+  Result := FConvOpenCLEnabled and Assigned(FConvDotCL);
+end;
+
+// Runs the whole forward-conv im2col GEMM on the OpenCL device:
+//   OutSig[o][t0+t] = Bias[o] + sum_i WInter[i*OutCh+o] * Patch_t[i]
+// PatchOf is a callback gathering the Size-element receptive-field patch for
+// output position t into FConvPatchMat at offset t*Size (contiguous, the
+// kernel's B layout). Weights arrive in the CPU [o*Size + i] row-major order
+// and are transposed once into the interleaved As layout the kernel expects.
+// Caller has already screened the work size. Coded by Claude (AI).
+type
+  TConvPatchProc = procedure(t: integer; Dst: TNeuralFloatArrPtr) of object;
+
+procedure RunConvGemmOpenCL(const W, Bias: TNeuralFloatDynArr;
+  OutCh, Size, NumPos: integer; const PatchProc: TConvPatchProc;
+  var OutSig: TNNetFloatDynArr2D; OutBase: integer);
+var
+  o, i, t: integer;
+begin
+  FConvWInter.ReSize(OutCh * Size, 1, 1);
+  for o := 0 to OutCh - 1 do
+    for i := 0 to Size - 1 do
+      FConvWInter.FData[i * OutCh + o] := W[o * Size + i];
+  FConvPatchMat.ReSize(NumPos * Size, 1, 1);
+  for t := 0 to NumPos - 1 do
+    PatchProc(t, Addr(FConvPatchMat.FData[t * Size]));
+  FConvResMat.ReSize(NumPos * OutCh, 1, 1);
+  FConvDotCL.PrepareForCompute(FConvWInter, FConvPatchMat, Size);
+  FConvDotCL.Compute(FConvWInter, FConvPatchMat, {ActFN}0, true, true);
+  FConvDotCL.FinishAndLoadResult(FConvResMat, 0);
+  for t := 0 to NumPos - 1 do
+    for o := 0 to OutCh - 1 do
+      OutSig[o][OutBase + t] := Bias[o] + FConvResMat.FData[t * OutCh + o];
+end;
+{$ENDIF}
+
+type
+  // Helper object holding the gather closure for RunConvGemmOpenCL. Coded by
+  // Claude (AI).
+  TConvPatchGatherer = class
+  public
+    Src: TNNetFloatDynArr2D; // padded (EnCodec) or raw (HiFiGAN) input
+    InCh, K, Stride, Dil: integer;
+    InLen, Pad: integer;     // HiFiGAN implicit-pad params (Pad<0 => EnCodec, no bounds)
+    procedure GatherEnCodec(t: integer; Dst: TNeuralFloatArrPtr);
+    procedure GatherHiFiGAN(t: integer; Dst: TNeuralFloatArrPtr);
+  end;
+
+procedure TConvPatchGatherer.GatherEnCodec(t: integer; Dst: TNeuralFloatArrPtr);
+var i, k2: integer;
+begin
+  for i := 0 to InCh - 1 do
+    for k2 := 0 to K - 1 do
+      Dst^[i * K + k2] := Src[i][t * Stride + k2 * Dil];
+end;
+
+procedure TConvPatchGatherer.GatherHiFiGAN(t: integer; Dst: TNeuralFloatArrPtr);
+var i, k2, sp: integer;
+begin
+  for i := 0 to InCh - 1 do
+    for k2 := 0 to K - 1 do
+    begin
+      sp := t * Stride + k2 * Dil - Pad;
+      if (sp >= 0) and (sp < InLen) then
+        Dst^[i * K + k2] := Src[i][sp]
+      else
+        Dst^[i * K + k2] := 0;
+    end;
+end;
+
 type
   TEnCodecConvWorker = class
   public
@@ -38235,6 +38383,9 @@ var
   Contrib: TNeuralFloat;
   ConvWorker: TEnCodecConvWorker;
   RefIdx: integer;
+  {$IFDEF OpenCL}
+  Gatherer: TConvPatchGatherer;
+  {$ENDIF}
 begin
   InCh := Conv.InCh;
   OutCh := Conv.OutCh;
@@ -38307,6 +38458,27 @@ begin
     // way, in a register, with one write). Keying off the output LENGTH (not the
     // channel count) keeps the heavy high-resolution decode stages parallel even
     // when they have few channels. Tiny convs run inline.
+    {$IFDEF OpenCL}
+    // Opt-in OpenCL fast path: one device GEMM for the whole stage (same
+    // shared dot-product kernel TNNetConvolutionBase uses). The interleaved
+    // weight x contiguous patch matmul is the exact same arithmetic as the
+    // per-position CPU DotProduct (parity < 1e-4). Coded by Claude (AI).
+    if ConvOpenCLEnabled() and (OutLen > 0) and
+       (Int64(OutCh) * OutLen * (InCh * K) >= FConvOpenCLMinWork) then
+    begin
+      Gatherer := TConvPatchGatherer.Create;
+      try
+        Gatherer.Src := Padded;  Gatherer.InCh := InCh;  Gatherer.K := K;
+        Gatherer.Stride := Stride;  Gatherer.Dil := Dil;
+        RunConvGemmOpenCL(Conv.W, Conv.B, OutCh, InCh * K, OutLen,
+          {$IFDEF FPC}@Gatherer.GatherEnCodec{$ELSE}Gatherer.GatherEnCodec{$ENDIF},
+          OutSig, 0);
+      finally
+        Gatherer.Free;
+      end;
+    end
+    else
+    {$ENDIF}
     if (Pool <> nil) and (Pool.Count > 1) and (OutLen >= 512) then
     begin
       ConvWorker := TEnCodecConvWorker.Create;
@@ -41167,6 +41339,10 @@ var
   Acc: TNeuralFloat;
   Patch: TNeuralFloatDynArr;
   InT, WT: TNeuralFloatDynArr;
+  {$IFDEF OpenCL}
+  Gatherer: TConvPatchGatherer;
+  InSigRef: TNNetFloatDynArr2D;
+  {$ENDIF}
 begin
   InCh := Conv.InCh;
   OutCh := Conv.OutCh;
@@ -41186,6 +41362,29 @@ begin
     OutLenM1 := OutLen - 1;
     SetLength(OutSig, OutCh);
     for o := 0 to OutChM1 do SetLength(OutSig[o], OutLen);
+    {$IFDEF OpenCL}
+    // Opt-in OpenCL fast path: one device GEMM for the whole stage (shared
+    // dot-product kernel), same arithmetic as the per-position CPU DotProduct
+    // (parity < 1e-4). Coded by Claude (AI).
+    if ConvOpenCLEnabled() and (OutLen > 0) and
+       (Int64(OutCh) * OutLen * (InCh * K) >= FConvOpenCLMinWork) then
+    begin
+      SetLength(InSigRef, InCh);
+      for i := 0 to InChM1 do InSigRef[i] := InSig[i];
+      Gatherer := TConvPatchGatherer.Create;
+      try
+        Gatherer.Src := InSigRef;  Gatherer.InCh := InCh;  Gatherer.K := K;
+        Gatherer.Stride := Stride;  Gatherer.Dil := Dil;
+        Gatherer.InLen := InLen;    Gatherer.Pad := Pad;
+        RunConvGemmOpenCL(Conv.W, Conv.B, OutCh, InCh * K, OutLen,
+          {$IFDEF FPC}@Gatherer.GatherHiFiGAN{$ELSE}Gatherer.GatherHiFiGAN{$ENDIF},
+          OutSig, 0);
+      finally
+        Gatherer.Free;
+      end;
+      Exit;
+    end;
+    {$ENDIF}
     // im2col: build the (InCh*K) receptive-field patch ONCE per output position t
     // in W's [i*K + k2] order (taps that fall in the implicit zero pad stay 0),
     // then accumulate every output channel as a single contiguous InCh*K dot
@@ -71004,5 +71203,11 @@ begin
     Reader.Free;
   end;
 end;
+
+{$IFDEF OpenCL}
+finalization
+  // Release any process-wide conv OpenCL state the caller left armed.
+  DisableConvOpenCL();
+{$ENDIF}
 
 end.

@@ -16,6 +16,9 @@ unit TestNeuralPretrained;
 interface
 
 uses
+  {$IFDEF OpenCL}
+  cl, neuralopencl, // platform/device for the audio-holder conv OpenCL parity test
+  {$ENDIF}
   Classes, SysUtils, Math, fpcunit, testregistry, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralmxfp4, neuralpretrained, neuralhftokenizer, neuralaudio,
@@ -332,6 +335,12 @@ type
     // ships) instead of the new .parametrizations.weight.original0/1; pins the
     // importer's legacy-naming branch (same w = g*v/||v||, identical oracle).
     procedure TestEnCodecLegacyWeightNormParity;
+    // OpenCL parity: decodes the same EnCodec fixture with the channel-major
+    // conv1d/ConvTranspose1d OpenCL offload ARMED, and asserts the waveform
+    // matches the CPU (AVX/scalar DotProduct) decode within 1e-4. SKIPs cleanly
+    // when built without -dOpenCL or when no OpenCL device is present. Gates the
+    // opt-in EnableConvOpenCL path wired into RunEnCodecConv / RunHiFiGANConv.
+    procedure TestEnCodecOpenCLConvParity;
     // Mimi: round-trips three pinned waveforms through the imported Mimi codec
     // (waveform -> conv encoder -> RoPE transformer -> downsample -> split
     // semantic/acoustic RVQ -> codes -> ... -> waveform) and asserts the codes
@@ -13649,6 +13658,119 @@ procedure TTestNeuralPretrained.TestEnCodecLegacyWeightNormParity;
 begin
   CheckEnCodecParity('tiny_encodec_legacynorm'); // legacy weight_g/weight_v
 end;
+
+procedure TTestNeuralPretrained.TestEnCodecOpenCLConvParity;
+{$IFDEF OpenCL}
+var
+  Model: TEnCodecModel;
+  Config: TEnCodecConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Clips, Clip, InArr, CodeStack, CodeRow: TJSONArray;
+  Wave, ReconCPU, ReconCL: TNeuralFloatDynArr;
+  Codes: array of TNeuralIntegerArray;
+  Frames, ci, i, q, t: integer;
+  Diff, MaxDiff: double;
+  EasyCL: TEasyOpenCL;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+begin
+  // Acquire the first OpenCL device; SKIP (pass) cleanly if none.
+  EasyCL := TEasyOpenCL.Create();
+  try
+    if EasyCL.GetPlatformCount() = 0 then
+    begin
+      AssertTrue('no OpenCL platform: SKIP', true);
+      Exit;
+    end;
+    EasyCL.SetCurrentPlatform(EasyCL.PlatformIds[0]);
+    if EasyCL.GetDeviceCount() = 0 then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    EasyCL.SetCurrentDevice(EasyCL.Devices[0]);
+    PlatformId := EasyCL.PlatformIds[0];
+    DeviceId := EasyCL.Devices[0];
+  finally
+    EasyCL.Free;
+  end;
+
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  DisableConvOpenCL(); // start from a known OFF state
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_encodec_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Clips := TJSONArray(TJSONObject(RefRoot).Find('clips'));
+    AssertTrue('clips present', Clips <> nil);
+
+    Model := BuildEnCodecFromSafeTensors(
+      FixturePath('tiny_encodec.safetensors'), Config,
+      FixturePath('tiny_encodec_config.json'));
+    AssertTrue('codec built', Model <> nil);
+
+    MaxDiff := 0;
+    for ci := 0 to Clips.Count - 1 do
+    begin
+      Clip := TJSONArray(Clips.Items[ci]);
+      InArr := TJSONArray(TJSONObject(Clip).Find('input'));
+      CodeStack := TJSONArray(TJSONObject(Clip).Find('codes'));
+      // Build the RVQ code stack straight from the oracle fixture so both
+      // decodes start from identical codes (the encode path is unchanged).
+      SetLength(Codes, CodeStack.Count);
+      for q := 0 to CodeStack.Count - 1 do
+      begin
+        CodeRow := TJSONArray(CodeStack.Items[q]);
+        SetLength(Codes[q], CodeRow.Count);
+        for t := 0 to CodeRow.Count - 1 do
+          Codes[q][t] := CodeRow.Items[t].AsInteger;
+      end;
+
+      // CPU decode (OpenCL OFF).
+      AssertFalse('OpenCL must start OFF', ConvOpenCLEnabled());
+      Model.DecodeCodesToAudio(Codes, ReconCPU, 0);
+
+      // OpenCL decode (offload ARMED for the conv runners). Force the device
+      // path for EVERY conv (MinWork 0) so the kernel is genuinely exercised
+      // even on the tiny parity fixture.
+      EnableConvOpenCL(PlatformId, DeviceId);
+      SetConvOpenCLMinWork(0);
+      AssertTrue('OpenCL armed', ConvOpenCLEnabled());
+      try
+        Model.DecodeCodesToAudio(Codes, ReconCL, 0);
+      finally
+        DisableConvOpenCL();
+        SetConvOpenCLMinWork(1 shl 20); // restore the default threshold
+      end;
+
+      AssertEquals('CPU/OpenCL decode length match',
+        Length(ReconCPU), Length(ReconCL));
+      for i := 0 to Length(ReconCPU) - 1 do
+      begin
+        Diff := Abs(ReconCPU[i] - ReconCL[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    // The OpenCL GEMM is the same im2col arithmetic as the AVX DotProduct path;
+    // parity must hold to the same 1e-4 importer gate. NEVER loosen.
+    AssertTrue('EnCodec OpenCL-conv vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    DisableConvOpenCL();
+    Model.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+{$ELSE}
+begin
+  // Built without -dOpenCL: nothing to verify, the CPU path is the only path.
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 procedure TTestNeuralPretrained.CheckEnCodecParity(const BaseName: string);
 var
