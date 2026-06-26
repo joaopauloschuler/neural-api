@@ -342,6 +342,13 @@ type
     // match HF build_delay_pattern_mask exactly.
     procedure TestMusicGenDecoderParity;
     procedure TestMusicGenDelayPattern;
+    // STEREO (audio_channels=2) MusicGen: the decoder doubles to 2*K
+    // interleaved-codebook rows (row 2c=left codebook c, 2c+1=right) sharing
+    // delay offset c. Asserts the imported stereo DECODER forward matches the
+    // HF float64 oracle < 1e-4, and the stereo (Channels=2) delay-pattern
+    // (de)interleave round-trips and matches HF build_delay_pattern_mask.
+    procedure TestMusicGenStereoDecoderParity;
+    procedure TestMusicGenStereoDelayPattern;
     // End-to-end TEXT-CONDITIONED wiring (examples/MusicGenText): a fixed
     // prompt id sequence runs through the REAL T5 text encoder, conditions the
     // MusicGen decoder's delay-pattern generation, and the resulting code stack
@@ -13532,6 +13539,164 @@ begin
         if Abs(Back[k_i][t] - Raw[k_i][t]) > MaxDiff then
           MaxDiff := Abs(Back[k_i][t] - Raw[k_i][t]);
     AssertEquals('delay-pattern round-trip recovers raw codes (t>=1)',
+      0, MaxDiff);
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMusicGenStereoDecoderParity;
+var
+  Model: TMusicGenModel;
+  Config: TMusicGenConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  RefObj: TJSONObject;
+  EncStatesArr, RowArr, CodesArr, LogitsArr, KArr, TArr: TJSONArray;
+  EncStates, EncHidden, Logits: TNNetVolume;
+  Codes: TNNetIntArr2D;
+  EncSeq, DecSeq, K, Vocab, TextD, Chan, t, k_i, v, i: integer;
+  MaxDiff, Diff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  EncStates := TNNetVolume.Create;
+  EncHidden := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_musicgen_stereo_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefObj := TJSONObject(RefRoot);
+    EncSeq := RefObj.Get('enc_seq_len', 0);
+    DecSeq := RefObj.Get('dec_seq_len', 0);
+    K := RefObj.Get('num_codebooks', 0);        // 2*K_channel (stereo rows)
+    Vocab := RefObj.Get('vocab_size', 0);
+    TextD := RefObj.Get('text_d_model', 0);
+    Chan := RefObj.Get('audio_channels', 0);
+
+    Model := BuildMusicGenFromSafeTensors(
+      FixturePath('tiny_musicgen_stereo.safetensors'), Config, EncSeq, DecSeq,
+      {pTrainable=}true, FixturePath('tiny_musicgen_stereo_config.json'));
+    AssertTrue('stereo musicgen decoder built', Model <> nil);
+    AssertEquals('stereo audio_channels accepted', 2, Config.AudioChannels);
+    AssertEquals('stereo audio_channels matches oracle', Chan,
+      Config.AudioChannels);
+    AssertEquals('stereo num codebooks (2*K)', K, Config.NumCodebooks);
+    AssertEquals('stereo codebooks are even', 0, Config.NumCodebooks mod 2);
+    AssertEquals('stereo vocab size', Vocab, Config.VocabSize);
+
+    EncStatesArr := TJSONArray(RefObj.Find('enc_states'));
+    EncStates.ReSize(EncSeq, 1, TextD);
+    for t := 0 to EncSeq - 1 do
+    begin
+      RowArr := TJSONArray(EncStatesArr.Items[t]);
+      for i := 0 to TextD - 1 do
+        EncStates.FData[t * TextD + i] := RowArr.Items[i].AsFloat;
+    end;
+
+    CodesArr := TJSONArray(RefObj.Find('dec_codes'));
+    SetLength(Codes, K);
+    for k_i := 0 to K - 1 do
+    begin
+      RowArr := TJSONArray(CodesArr.Items[k_i]);
+      SetLength(Codes[k_i], DecSeq);
+      for t := 0 to DecSeq - 1 do
+        Codes[k_i][t] := RowArr.Items[t].AsInteger;
+    end;
+
+    Model.ProjectEncoderStates(EncStates, EncHidden);
+    Model.ComputeLogits(Codes, EncHidden, Logits);
+    AssertEquals('stereo logits depth = 2K*vocab', K * Vocab, Logits.Depth);
+    AssertEquals('stereo logits length = DecSeq', DecSeq, Logits.SizeX);
+
+    LogitsArr := TJSONArray(RefObj.Find('logits'));
+    MaxDiff := 0;
+    for k_i := 0 to K - 1 do
+    begin
+      KArr := TJSONArray(LogitsArr.Items[k_i]);
+      for t := 0 to DecSeq - 1 do
+      begin
+        TArr := TJSONArray(KArr.Items[t]);
+        for v := 0 to Vocab - 1 do
+        begin
+          Diff := Abs(Logits.FData[t * (K * Vocab) + k_i * Vocab + v] -
+            TArr.Items[v].AsFloat);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    // 1e-4 importer-parity gate (committed-fixture convention). NEVER loosen.
+    AssertTrue('Stereo MusicGen decoder logit parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Model.Free;
+    EncStates.Free;
+    EncHidden.Free;
+    Logits.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMusicGenStereoDelayPattern;
+var
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  DelayObj: TJSONObject;
+  RawArr, DelayedArr, RowArr: TJSONArray;
+  Raw, Delayed, Back: TNNetIntArr2D;
+  K, Len, PadId, Chan, Off, k_i, t, MaxDiff: integer;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_musicgen_stereo_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    DelayObj := TJSONObject(TJSONObject(RefRoot).Find('delay'));
+    PadId := DelayObj.Get('pad_id', 0);
+    Chan := DelayObj.Get('channels', 2);
+    AssertEquals('stereo delay channels = 2', 2, Chan);
+    RawArr := TJSONArray(DelayObj.Find('raw'));
+    DelayedArr := TJSONArray(DelayObj.Find('delayed'));
+    K := RawArr.Count;
+    Len := TJSONArray(RawArr.Items[0]).Count;
+    SetLength(Raw, K);
+    for k_i := 0 to K - 1 do
+    begin
+      RowArr := TJSONArray(RawArr.Items[k_i]);
+      SetLength(Raw[k_i], Len);
+      for t := 0 to Len - 1 do Raw[k_i][t] := RowArr.Items[t].AsInteger;
+    end;
+
+    // Stereo interleave (Channels=2): rows 2c,2c+1 share offset c. Must match
+    // HF build_delay_pattern_mask's delayed ids (audio_channels==2) exactly.
+    MusicGenDelayInterleave(Raw, PadId, Delayed, Chan);
+    MaxDiff := 0;
+    for k_i := 0 to K - 1 do
+    begin
+      RowArr := TJSONArray(DelayedArr.Items[k_i]);
+      for t := 0 to Len - 1 do
+        if Abs(Delayed[k_i][t] - RowArr.Items[t].AsInteger) > MaxDiff then
+          MaxDiff := Abs(Delayed[k_i][t] - RowArr.Items[t].AsInteger);
+    end;
+    AssertEquals('stereo delay-pattern interleave matches HF oracle', 0,
+      MaxDiff);
+
+    // Deinterleave with Channels=2 recovers raw[k][t] for t >= 1 over the
+    // recoverable region (out length = Len - max_offset, max_offset = K/2 - 1).
+    MusicGenDelayDeinterleave(Delayed, Len - (K div Chan - 1), Back, Chan);
+    MaxDiff := 0;
+    for k_i := 0 to K - 1 do
+    begin
+      Off := k_i div Chan;
+      for t := 1 to (Len - (K div Chan - 1)) - 1 do
+        if (t + Off < Len) and (Abs(Back[k_i][t] - Raw[k_i][t]) > MaxDiff) then
+          MaxDiff := Abs(Back[k_i][t] - Raw[k_i][t]);
+    end;
+    AssertEquals('stereo delay-pattern round-trip recovers raw codes (t>=1)',
       0, MaxDiff);
   finally
     RefRoot.Free;

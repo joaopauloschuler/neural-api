@@ -1,0 +1,16 @@
+{
+ "model_type": "musicgen",
+ "text_d_model": 12,
+ "decoder": {
+  "vocab_size": 16,
+  "hidden_size": 8,
+  "num_hidden_layers": 2,
+  "num_attention_heads": 2,
+  "ffn_dim": 16,
+  "num_codebooks": 8,
+  "max_position_embeddings": 64,
+  "activation_function": "gelu",
+  "scale_embedding": false,
+  "audio_channels": 2
+ }
+}

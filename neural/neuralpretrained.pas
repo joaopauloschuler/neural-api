@@ -4849,8 +4849,15 @@ type
     NumHeads: integer;          // decoder.num_attention_heads
     FFNDim: integer;            // decoder.ffn_dim
     VocabSize: integer;         // decoder.vocab_size (codebook_size)
-    NumCodebooks: integer;      // decoder.num_codebooks (K)
+    NumCodebooks: integer;      // decoder.num_codebooks (K total rows; 2*K_ch
+                                //   in stereo where rows interleave L/R)
     MaxPositionEmbeddings: integer; // decoder.max_position_embeddings
+    AudioChannels: integer;     // decoder.audio_channels (1 mono, 2 stereo). In
+                                //   stereo the K=NumCodebooks decoder rows are
+                                //   the two channels' per-channel codebooks
+                                //   interleaved (row 2c = left codebook c, row
+                                //   2c+1 = right codebook c) and the delay
+                                //   offset of a row is (row div AudioChannels).
     ModelType: string;          // 'musicgen'
   end;
 
@@ -4992,28 +4999,33 @@ type
   end;
 
 // Applies the MusicGen delay pattern to a raw code stack: Raw[k][t] (K rows,
-// each Len long) becomes Delayed[k][t] where codebook k is shifted RIGHT by k
-// positions, the leading k slots filled with PadId, truncated back to Len
-// columns (matches HF build_delay_pattern_mask's delayed input ids). Coded by
-// Claude (AI).
+// each Len long) becomes Delayed[k][t] where row k is shifted RIGHT by its
+// delay offset, the leading offset slots filled with PadId, truncated back to
+// Len columns (matches HF build_delay_pattern_mask's delayed input ids). The
+// delay offset of row k is (k div Channels): mono (Channels=1) gives the plain
+// k offset; stereo (Channels=2) interleaves the two channels' per-channel
+// codebooks, so rows 2c and 2c+1 share offset c (HF's left/right delay layout).
+// Coded by Claude (AI).
 procedure MusicGenDelayInterleave(const Raw: TNNetIntArr2D; PadId: integer;
-  out Delayed: TNNetIntArr2D);
+  out Delayed: TNNetIntArr2D; Channels: integer = 1);
 
 // Inverse of MusicGenDelayInterleave: recovers the raw code stack from the
-// delayed form by shifting codebook k LEFT by k positions (the last k columns
-// of each row, which held future/pad entries, are dropped). The output rows
-// are OutLen long; OutLen must be <= Len(Delayed[0]) - (K-1) for every
-// codebook to have a valid entry. Coded by Claude (AI).
+// delayed form by shifting row k LEFT by its delay offset (k div Channels); the
+// trailing columns (which held future/pad entries) are dropped. The output rows
+// are OutLen long; OutLen must be <= Len(Delayed[0]) - max_offset for every
+// row to have a valid entry. Coded by Claude (AI).
 procedure MusicGenDelayDeinterleave(const Delayed: TNNetIntArr2D;
-  OutLen: integer; out Raw: TNNetIntArr2D);
+  OutLen: integer; out Raw: TNNetIntArr2D; Channels: integer = 1);
 
 // Reads a HF MusicGen config.json (model_type "musicgen"). Pulls the decoder
 // sub-config (hidden_size, num_hidden_layers, num_attention_heads, ffn_dim,
 // vocab_size, num_codebooks, max_position_embeddings) and text_encoder.d_model
 // (for enc_to_dec_proj). The pico fixture flattens these to a small object;
 // real checkpoints nest them under "decoder" / "text_encoder". audio_channels
-// must be 1 (stereo's 2K-codebook layout is a documented follow-up);
-// activation_function must be "gelu" (exact erf). Coded by Claude (AI).
+// may be 1 (mono) or 2 (stereo; stereo requires an EVEN num_codebooks = 2*K
+// per-channel and packs the channels' codebooks interleaved with a shared delay
+// offset per pair); activation_function must be "gelu" (exact erf). Coded by
+// Claude (AI).
 function ReadMusicGenConfigFromJSONFile(const FileName: string): TMusicGenConfig;
 
 function MusicGenConfigToString(const Config: TMusicGenConfig): string;
@@ -27308,50 +27320,57 @@ end;
 // ===========================================================================
 
 procedure MusicGenDelayInterleave(const Raw: TNNetIntArr2D; PadId: integer;
-  out Delayed: TNNetIntArr2D);
+  out Delayed: TNNetIntArr2D; Channels: integer = 1);
 var
-  K, Len, k_i, t, KM1, LenM1: integer;
+  K, Len, k_i, t, KM1, LenM1, Off: integer;
 begin
   K := Length(Raw);
   if K = 0 then begin SetLength(Delayed, 0); exit; end;
+  if Channels < 1 then Channels := 1;
   Len := Length(Raw[0]);
   KM1 := K - 1;
   LenM1 := Len - 1;
   SetLength(Delayed, K);
   for k_i := 0 to KM1 do
   begin
+    // Delay offset of row k_i: k_i div Channels. Mono -> k_i; stereo -> the two
+    // interleaved channels (rows 2c, 2c+1) share offset c, matching HF's
+    // left/right delay layout (build_delay_pattern_mask, audio_channels==2).
+    Off := k_i div Channels;
     SetLength(Delayed[k_i], Len);
     for t := 0 to LenM1 do
-      // HF build_delay_pattern_mask: codebook k is placed at shifted columns
-      // [k .. seq_len+k) then the lower-triangular BOS mask pads columns
-      // [0 .. k] (k+1 leading slots), so the truncated delayed form is
-      // Delayed[k][t] = pad for t <= k, else raw[k][t-k] (raw[k][0] is the
+      // HF build_delay_pattern_mask: a row is placed at shifted columns
+      // [Off .. seq_len+Off) then the lower-triangular BOS mask pads columns
+      // [0 .. Off] (Off+1 leading slots), so the truncated delayed form is
+      // Delayed[k][t] = pad for t <= Off, else raw[k][t-Off] (raw[k][0] is the
       // dropped BOS slot - the model generates it, it is not an input id).
-      if t <= k_i then
+      if t <= Off then
         Delayed[k_i][t] := PadId
       else
-        Delayed[k_i][t] := Raw[k_i][t - k_i];
+        Delayed[k_i][t] := Raw[k_i][t - Off];
   end;
 end;
 
 procedure MusicGenDelayDeinterleave(const Delayed: TNNetIntArr2D;
-  OutLen: integer; out Raw: TNNetIntArr2D);
+  OutLen: integer; out Raw: TNNetIntArr2D; Channels: integer = 1);
 var
-  K, k_i, t, KM1, OutLenM1: integer;
+  K, k_i, t, KM1, OutLenM1, Off: integer;
 begin
   K := Length(Delayed);
   if K = 0 then begin SetLength(Raw, 0); exit; end;
+  if Channels < 1 then Channels := 1;
   KM1 := K - 1;
   OutLenM1 := OutLen - 1;
   SetLength(Raw, K);
   for k_i := 0 to KM1 do
   begin
+    Off := k_i div Channels;
     SetLength(Raw[k_i], OutLen);
     for t := 0 to OutLenM1 do
       // Inverse shift: raw[k][t] (for t >= 1) was placed at delayed column
-      // t + k by the interleave above; raw[k][0] is the dropped BOS slot, so
+      // t + Off by the interleave above; raw[k][0] is the dropped BOS slot, so
       // index 0 reads back the leading pad (callers ignore it / overwrite it).
-      Raw[k_i][t] := Delayed[k_i][t + k_i];
+      Raw[k_i][t] := Delayed[k_i][t + Off];
   end;
 end;
 
@@ -27408,6 +27427,7 @@ begin
     Result.MaxPositionEmbeddings :=
       GetInt(DecObj, 'max_position_embeddings', 2048);
     AudioChannels := GetInt(DecObj, 'audio_channels', 1);
+    Result.AudioChannels := AudioChannels;
     ActFn := DecObj.Get('activation_function', 'gelu');
     if (Result.TextDModel <= 0) or (Result.Hidden <= 0) or
        (Result.NumLayers <= 0) or (Result.NumHeads <= 0) or
@@ -27417,10 +27437,16 @@ begin
         'required field (text_d_model/d_model, hidden_size, ' +
         'num_hidden_layers, num_attention_heads, ffn_dim, vocab_size, ' +
         'num_codebooks).');
-    if AudioChannels <> 1 then
+    if (AudioChannels <> 1) and (AudioChannels <> 2) then
       ImportError('MusicGen import: audio_channels=' +
-        IntToStr(AudioChannels) + ' (stereo uses 2*K codebooks) is a ' +
-        'documented follow-up; only mono (1) is supported.');
+        IntToStr(AudioChannels) + ' is unsupported; only mono (1) and ' +
+        'stereo (2) are.');
+    // Stereo packs the two channels' per-channel codebooks interleaved into the
+    // decoder's NumCodebooks rows, so NumCodebooks must be even (= 2*K_channel).
+    if (AudioChannels = 2) and Odd(Result.NumCodebooks) then
+      ImportError('MusicGen import: audio_channels=2 (stereo) requires an ' +
+        'EVEN num_codebooks (= 2 * per-channel codebooks), got ' +
+        IntToStr(Result.NumCodebooks) + '.');
     if ActFn <> 'gelu' then
       ImportError('MusicGen import: activation_function "' + ActFn +
         '" is not supported (only the exact-erf "gelu"; every published ' +
@@ -27445,6 +27471,7 @@ begin
     ', ffn=' + IntToStr(Config.FFNDim) +
     ', vocab=' + IntToStr(Config.VocabSize) +
     ', codebooks=' + IntToStr(Config.NumCodebooks) +
+    ', audio_channels=' + IntToStr(Config.AudioChannels) +
     ', text_d_model=' + IntToStr(Config.TextDModel) +
     ', max_pos=' + IntToStr(Config.MaxPositionEmbeddings);
 end;
@@ -27743,10 +27770,16 @@ var
   EncHidden, UncondHidden, Logits, UncondLogits: TNNetVolume;
   Delayed: TNNetIntArr2D;
   PadId, Steps, step, k_i, v, best, t, base, idx, NumCodebooksM1, FDecSeqLenM1, StepsM1, VsM1, NumFramesM1: integer;
+  Chan, Off: integer;
   bestVal, vv, condVal, uncondVal: TNeuralFloat;
   UseGuidance: boolean;
 begin
   PadId := FConfig.VocabSize;
+  // Delay offset of decoder row k is (k div Chan): mono Chan=1 -> k; stereo
+  // Chan=2 -> the two interleaved channels (rows 2c, 2c+1) share offset c, so
+  // the max offset is (NumCodebooks div Chan)-1 channel-codebooks.
+  Chan := FConfig.AudioChannels;
+  if Chan < 1 then Chan := 1;
   // Guidance is active only when scaled above 1.0 AND an uncond prompt was
   // supplied; otherwise the loop is the plain greedy path (no second decode,
   // bit-identical output).
@@ -27755,7 +27788,7 @@ begin
   // 1..NumFrames+K-1 (codebook k's frame f at column f+k+1). The decode runs
   // Steps = NumFrames + K - 1 steps to fill them all (predicting column s+1
   // from the logits at position s).
-  Steps := NumFrames + FConfig.NumCodebooks - 1;
+  Steps := NumFrames + (FConfig.NumCodebooks div Chan) - 1;
   NumCodebooksM1 := FConfig.NumCodebooks - 1;
   FDecSeqLenM1 := FDecSeqLen - 1;
   StepsM1 := Steps - 1;
@@ -27795,11 +27828,12 @@ begin
       t := step + 1; // the delayed column being predicted this step
       for k_i := 0 to NumCodebooksM1 do
       begin
-        // Codebook k_i fills delayed column t only once its delay has started
-        // (t >= k_i + 1) and the column still maps to a real frame
-        // (frame f = t - k_i - 1 in [0, NumFrames)).
-        if (t < FDecSeqLen) and (t >= k_i + 1) and
-           (t - k_i - 1 < NumFrames) then
+        // Row k_i fills delayed column t only once its delay has started
+        // (t >= Off + 1) and the column still maps to a real frame
+        // (frame f = t - Off - 1 in [0, NumFrames)). Off = k_i div Chan.
+        Off := k_i div Chan;
+        if (t < FDecSeqLen) and (t >= Off + 1) and
+           (t - Off - 1 < NumFrames) then
         begin
           base := step * (FConfig.NumCodebooks * FConfig.VocabSize) +
             k_i * FConfig.VocabSize;
@@ -27831,14 +27865,15 @@ begin
         end;
       end;
     end;
-    // Undelay: code (k, frame f) lives at delayed column f + k + 1 (column 0
-    // is the shared BOS prompt).
+    // Undelay: code (row k, frame f) lives at delayed column f + Off + 1
+    // (column 0 is the shared BOS prompt), Off = k div Chan.
     SetLength(Codes, FConfig.NumCodebooks);
     for k_i := 0 to NumCodebooksM1 do
     begin
+      Off := k_i div Chan;
       SetLength(Codes[k_i], NumFrames);
       for t := 0 to NumFramesM1 do
-        Codes[k_i][t] := Delayed[k_i][t + k_i + 1];
+        Codes[k_i][t] := Delayed[k_i][t + Off + 1];
     end;
   finally
     EncHidden.Free;
@@ -27861,7 +27896,7 @@ var
   EncStatesInput: TNNetLayer;
   StepLogits: TNNetVolume;
   PadId, Steps, step, k_i, c, tok, t, base, vbest: integer;
-  i, n: integer;
+  i, n, Chan, Off: integer;
   // Cached classifier-free-guidance extras (the dual-twin path).
   UncondHidden, UncondLogits, GuidedLogits: TNNetVolume;
   SDPAsU: array of TNNetScaledDotProductAttention;
@@ -27922,7 +27957,11 @@ begin
     ImportError('MusicGen GenerateEx: Temperature must be > 0.');
 
   PadId := FConfig.VocabSize;
-  Steps := NumFrames + FConfig.NumCodebooks - 1;
+  // Delay offset of decoder row k is (k div Chan); stereo (Chan=2) interleaves
+  // the two channels so the max offset is (NumCodebooks div Chan)-1.
+  Chan := FConfig.AudioChannels;
+  if Chan < 1 then Chan := 1;
+  Steps := NumFrames + (FConfig.NumCodebooks div Chan) - 1;
   NumCodebooksM1 := FConfig.NumCodebooks - 1;
   HiddenM1 := FConfig.Hidden - 1;
   DecSeqLenM1 := FDecSeqLen - 1;
@@ -28043,12 +28082,15 @@ begin
 
         t := step + 1;
         for k_i := 0 to NumCodebooksM1 do
-          if (t < FDecSeqLen) and (t >= k_i + 1) and
-             (t - k_i - 1 < NumFrames) then
+        begin
+          Off := k_i div Chan;
+          if (t < FDecSeqLen) and (t >= Off + 1) and
+             (t - Off - 1 < NumFrames) then
           begin
             base := k_i * FConfig.VocabSize;
             Delayed[k_i][t] := SelectToken(GuidedLogits, base);
           end;
+        end;
       end;
 
       if StepCount > 0 then
@@ -28061,9 +28103,10 @@ begin
       SetLength(Codes, FConfig.NumCodebooks);
       for k_i := 0 to NumCodebooksM1 do
       begin
+        Off := k_i div Chan;
         SetLength(Codes[k_i], NumFrames);
         for t := 0 to NumFramesM1 do
-          Codes[k_i][t] := Delayed[k_i][t + k_i + 1];
+          Codes[k_i][t] := Delayed[k_i][t + Off + 1];
       end;
     finally
       SDPAsHi := High(SDPAs);
@@ -28128,13 +28171,16 @@ begin
             ((GetTickCount64 - tLoopStart) / StepCount):0:1, ' ms/step so far)');
         t := step + 1;
         for k_i := 0 to NumCodebooksM1 do
-          if (t < FDecSeqLen) and (t >= k_i + 1) and
-             (t - k_i - 1 < NumFrames) then
+        begin
+          Off := k_i div Chan;
+          if (t < FDecSeqLen) and (t >= Off + 1) and
+             (t - Off - 1 < NumFrames) then
           begin
             base := step * (FConfig.NumCodebooks * FConfig.VocabSize) +
               k_i * FConfig.VocabSize;
             Delayed[k_i][t] := SelectToken(StepLogits, base);
           end;
+        end;
       end;
       if StepCount > 0 then
         WriteLn('[decode] summary: ', StepCount, ' steps, ',
@@ -28143,9 +28189,10 @@ begin
       SetLength(Codes, FConfig.NumCodebooks);
       for k_i := 0 to NumCodebooksM1 do
       begin
+        Off := k_i div Chan;
         SetLength(Codes[k_i], NumFrames);
         for t := 0 to NumFramesM1 do
-          Codes[k_i][t] := Delayed[k_i][t + k_i + 1];
+          Codes[k_i][t] := Delayed[k_i][t + Off + 1];
       end;
     finally
       EncHidden.Free;
@@ -28243,8 +28290,9 @@ begin
       t := step + 1; // delayed column predicted this step
       for k_i := 0 to NumCodebooksM1 do
       begin
-        if (t < FDecSeqLen) and (t >= k_i + 1) and
-           (t - k_i - 1 < NumFrames) then
+        Off := k_i div Chan;
+        if (t < FDecSeqLen) and (t >= Off + 1) and
+           (t - Off - 1 < NumFrames) then
         begin
           base := k_i * FConfig.VocabSize;
           vbest := SelectToken(StepLogits, base);
@@ -28260,9 +28308,10 @@ begin
     SetLength(Codes, FConfig.NumCodebooks);
     for k_i := 0 to NumCodebooksM1 do
     begin
+      Off := k_i div Chan;
       SetLength(Codes[k_i], NumFrames);
       for t := 0 to NumFramesM1 do
-        Codes[k_i][t] := Delayed[k_i][t + k_i + 1];
+        Codes[k_i][t] := Delayed[k_i][t + Off + 1];
     end;
   finally
     // Restore the full-sequence forward on every head touched (so the step net

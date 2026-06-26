@@ -805,9 +805,20 @@ rather than acted on.
       classifier-free-guidance tuning and long-form generation to a follow-up.
       The WAV writer + HiFi-GAN vocoder it builds on have landed; the open
       piece is the audio U-Net/DiT denoiser importer.
-- [ ] Stereo MusicGen (audio_channels=2, the 2K-codebook layout) -- the
-      ReadMusicGenConfigFromJSONFile importer currently REJECTS audio_channels=2
-      (the 2*K interleaved-codebook delay layout is a documented follow-up).
+- [X] Stereo MusicGen (audio_channels=2, the 2K-codebook layout) --
+      ReadMusicGenConfigFromJSONFile now ACCEPTS audio_channels=2 (requires even
+      num_codebooks = 2*K_channel) and stores AudioChannels in TMusicGenConfig.
+      The 2*K interleaved-codebook delay layout is wired end-to-end: row k's
+      delay offset is (k div AudioChannels), so rows 2c/2c+1 (left/right codebook
+      c) share offset c, matching HF build_delay_pattern_mask audio_channels==2.
+      MusicGenDelayInterleave/Deinterleave gained an optional Channels arg, and
+      every GenerateCFG/GenerateEx decode loop (full-prefix, un-cached sampling,
+      KV-cache, dual-twin CFG) uses the generalized offset and Steps = NumFrames
+      + (NumCodebooks div Channels) - 1. The EnCodec stays MONO (each channel's
+      codebooks decode through the same codec, ::2 / 1::2 split). Pico stereo
+      fixtures (tiny_musicgen_stereo{.safetensors,_config.json,_ref.json}) +
+      TestMusicGenStereoDecoderParity (decoder forward <1e-4 vs HF float64) and
+      TestMusicGenStereoDelayPattern (stereo delay round-trip == HF oracle).
 - [ ] SeamlessM4T-v2 follow-ups deferred from the landed S2TT v1:
       (1) position_embeddings_type="relative_key" — the v2 conformer self-attn
       distance-embedding attention bias (einsum("bhld,lrd->bhlr") added to the
