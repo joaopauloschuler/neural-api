@@ -3916,6 +3916,62 @@ procedure PyannotePowersetDecode(const Logits: TNNetVolume; FrameIdx: integer;
   const Config: TPyannoteConfig; out Active: array of boolean);
 
 // ---------------------------------------------------------------------------
+// ECAPA-TDNN SPEAKER-EMBEDDING / SPEAKER-VERIFICATION IMPORT (e.g.
+// speechbrain/spkrec-ecapa-voxceleb). The COMPANION to the pyannote SEGMENTATION
+// importer: pyannote answers "who speaks WHEN" within one window; ECAPA-TDNN is
+// the discriminative utterance->vector encoder that turns a clip into a single
+// fixed-length speaker EMBEDDING so turns/windows can be COMPARED (cosine score).
+//
+// Architecture (on a (T,1,NumMel) log-mel frame sequence, time along SizeX):
+//   x := ReLU(TDNNConv(NumMel->Channels, k=5, d=1))         # conv_pre
+//   b1 := SE-Res2Block(x,  k, dilation=2, Scale)            # 3 stacked blocks
+//   b2 := SE-Res2Block(b1, k, dilation=3, Scale)
+//   b3 := SE-Res2Block(b2, k, dilation=4, Scale)
+//   mfa := ReLU(TDNNConv(3*Channels->MFAChannels, k=1))     # multi-layer agg
+//         over DeepConcat([b1,b2,b3])
+//   e   := TDNNConv(MFAChannels->MFAChannels, k=1)          # attention head:
+//          -> Tanh -> TDNNConv(MFAChannels->MFAChannels, k=1)  per-frame logits
+//   pooled := AttentiveStatsPooling(mfa, e)                 # (1,1,2*MFAChannels)
+//   emb := FullConnect(2*MFAChannels -> EmbDim)             # the 192-d embedding
+// AAM-softmax (ArcFace) is TRAINING-ONLY; inference reads `emb` directly. The
+// pico parity fixture re-randomizes these weights and a numpy float64 oracle
+// reimplements this exact forward. Coded by Claude (AI).
+type
+  TEcapaTdnnConfig = record
+    NumMel: integer;        // input log-mel feature bins
+    Channels: integer;      // TDNN / SE-Res2Block channel width
+    Kernel: integer;        // Res2Net conv kernel (odd, e.g. 3)
+    Scale: integer;         // Res2Net group count (Channels mod Scale = 0)
+    SEReduction: integer;   // SE bottleneck reduction ratio
+    MFAChannels: integer;   // multi-layer-aggregation conv out channels
+    AttChannels: integer;   // attention-head bottleneck channels
+    EmbDim: integer;        // speaker embedding dimension (e.g. 192)
+  end;
+
+// Reads an ECAPA config.json (all fields have a spkrec-ecapa-voxceleb-shaped
+// default, overridden when present). Coded by Claude (AI).
+function ReadEcapaTdnnConfigFromJSONFile(
+  const FileName: string): TEcapaTdnnConfig;
+
+// Builds the ECAPA-TDNN speaker encoder: TNNetInput (NumFrames,1,NumMel) log-mel
+// frames in, (1,1,EmbDim) L2-normalizable speaker embedding out, loading every
+// weight from FileName. Coded by Claude (AI).
+function BuildEcapaTdnnFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TEcapaTdnnConfig; NumFrames: integer;
+  pTrainable: boolean = true): TNNet;
+
+function BuildEcapaTdnnFromSafeTensorsEx(const FileName: string;
+  out Config: TEcapaTdnnConfig; NumFrames: integer;
+  pTrainable: boolean = true; const ConfigFileName: string = ''): TNNet;
+
+function BuildEcapaTdnnFromSafeTensors(const FileName: string;
+  NumFrames: integer; pTrainable: boolean = true): TNNet;
+
+// Cosine similarity between two utterance embeddings (the speaker-verification
+// score). Returns a value in [-1,1]; higher => more likely the SAME speaker.
+function EcapaCosineScore(EmbA, EmbB: TNNetVolume): TNeuralFloat;
+
+// ---------------------------------------------------------------------------
 // MOONSHINE STREAMING-ASR ENCODER IMPORT (model_type "moonshine", e.g.
 // UsefulSensors/moonshine-tiny | moonshine-base) - a SECOND speech-to-text
 // architecture, deliberately distinct from the landed Whisper importer.
@@ -33384,6 +33440,263 @@ var
 begin
   Result := BuildPyannoteSegmentationFromSafeTensorsEx(FileName, Config,
     NumSamples, pTrainable);
+end;
+
+// ===========================================================================
+// ECAPA-TDNN SPEAKER-EMBEDDING IMPORT - see the interface header.
+// ===========================================================================
+
+function ReadEcapaTdnnConfigFromJSONFile(
+  const FileName: string): TEcapaTdnnConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+begin
+  if not FileExists(FileName) then
+    ImportError('ECAPA import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('ECAPA import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('ECAPA import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    // spkrec-ecapa-voxceleb-shaped defaults; the pico fixture overrides them.
+    Result.NumMel      := Obj.Get('num_mel', 80);
+    Result.Channels    := Obj.Get('channels', 512);
+    Result.Kernel      := Obj.Get('kernel', 3);
+    Result.Scale       := Obj.Get('scale', 8);
+    Result.SEReduction := Obj.Get('se_reduction', 8);
+    Result.MFAChannels := Obj.Get('mfa_channels', 1536);
+    Result.AttChannels := Obj.Get('att_channels', 128);
+    Result.EmbDim      := Obj.Get('emb_dim', 192);
+    if (Result.Channels mod Result.Scale) <> 0 then
+      ImportError('ECAPA import: channels must be divisible by scale.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+// Loads a 1x1 / k-tap TDNNConv1D from an HF-style nn.Conv1d weight [out,in,k]
+// (+ optional bias). Weight layout matches the causal/TDNN conv neuron:
+// Neurons[o].Weights[kk*InDim+i] = W[o,i,kk]. Reuses LoadWav2Vec2FeatureConv
+// (which zeroes bias) then loads bias if present.
+procedure LoadEcapaConv(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
+  const Prefix: string; InDim, OutDim, Kernel: integer; Consumed: TStringList);
+begin
+  LoadWav2Vec2FeatureConv(Reader, Layer, Prefix + '.weight',
+    InDim, OutDim, Kernel, Consumed);
+  if Reader.HasTensor(Prefix + '.bias') then
+  begin
+    LoadPyannoteConvBias(Reader, Layer, Prefix + '.bias', OutDim);
+    Consumed.Add(Prefix + '.bias');
+  end;
+end;
+
+// Returns the ordered list of weight-bearing layers (TNNetTDNNConv1D and
+// TNNetFullConnect-family) created in layer-index range [FromIdx..ToIdx].
+function CollectEcapaWeighted(NN: TNNet; FromIdx, ToIdx: integer): TFPList;
+var
+  i: integer;
+  L: TNNetLayer;
+begin
+  Result := TFPList.Create;
+  for i := FromIdx to ToIdx do
+  begin
+    L := NN.Layers[i];
+    if (L is TNNetTDNNConv1D) or (L is TNNetFullConnect) then
+      Result.Add(L);
+  end;
+end;
+
+function BuildEcapaTdnnFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TEcapaTdnnConfig; NumFrames: integer;
+  pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  ConvPre, B1, B2, B3, MFA, AttHead, Logits, Pooled, Emb: TNNetLayer;
+  Consumed: TStringList;
+  C, blockStart: integer;
+  Weighted: TFPList;
+  bi: integer;
+
+  // Loads the SE-Res2Block convolution weights for the block whose layers
+  // occupy indices [blockStart..GetLastLayer] (in builder order):
+  //   conv1x1_expand (C->C, k1), Res2 convs (Scale-1 of them, w->w, k),
+  //   conv1x1_mix (C->C, k1), SE FCReLU (C->bottleneck), SE FCSigmoid (bot->C).
+  procedure LoadBlock(const Prefix: string; FromIdx: integer);
+  var
+    w, bottleneck, j: integer;
+    LL: TFPList;
+    idx: integer;
+  begin
+    w := Config.Channels div Config.Scale;
+    bottleneck := Config.Channels div Config.SEReduction;
+    if bottleneck < 1 then bottleneck := 1;
+    LL := CollectEcapaWeighted(NN, FromIdx, NN.GetLastLayer().LayerIdx);
+    try
+      idx := 0;
+      // conv1x1 expand.
+      LoadEcapaConv(Reader, TNNetLayer(LL[idx]), Prefix + '.conv_expand',
+        Config.Channels, Config.Channels, 1, Consumed); Inc(idx);
+      // Res2 convs (groups 1..Scale-1).
+      for j := 1 to Config.Scale - 1 do
+      begin
+        LoadEcapaConv(Reader, TNNetLayer(LL[idx]),
+          Prefix + '.res2_' + IntToStr(j), w, w, Config.Kernel, Consumed);
+        Inc(idx);
+      end;
+      // conv1x1 mix.
+      LoadEcapaConv(Reader, TNNetLayer(LL[idx]), Prefix + '.conv_mix',
+        Config.Channels, Config.Channels, 1, Consumed); Inc(idx);
+      // SE: FCReLU (C->bottleneck), FCSigmoid (bottleneck->C). FullConnect
+      // weight is [out,in] row-major (LoadLlamaLinearWeights convention).
+      LoadLlamaLinearWeights(Reader, TNNetLayer(LL[idx]),
+        Prefix + '.se_down.weight', Config.Channels, bottleneck, 0, -1, 0,
+        Prefix + '.se_down.bias'); Inc(idx);
+      Consumed.Add(Prefix + '.se_down.weight'); Consumed.Add(Prefix + '.se_down.bias');
+      LoadLlamaLinearWeights(Reader, TNNetLayer(LL[idx]),
+        Prefix + '.se_up.weight', bottleneck, Config.Channels, 0, -1, 0,
+        Prefix + '.se_up.bias'); Inc(idx);
+      Consumed.Add(Prefix + '.se_up.weight'); Consumed.Add(Prefix + '.se_up.bias');
+    finally
+      LL.Free;
+    end;
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Weighted := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      if not Reader.HasTensor('conv_pre.weight') then
+        ImportError('ECAPA import: "conv_pre.weight" not found in ' +
+          Reader.FileName + ' - not an ECAPA pico checkpoint?');
+      if NumFrames < Config.Kernel then
+        ImportError('ECAPA import: NumFrames too short.');
+      C := Config.Channels;
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(NumFrames, 1, Config.NumMel) );
+      // conv_pre: TDNN conv (NumMel->C, k=5 SAME) -> ReLU.
+      ConvPre := NN.AddLayer( TNNetTDNNConv1D.Create(C, 5, 0, 1).SetTrainable(pTrainable) );
+      NN.AddLayer( TNNetReLU.Create() );
+      // Three SE-Res2Blocks with growing dilation (2,3,4).
+      blockStart := NN.GetLastLayer().LayerIdx + 1;
+      B1 := NN.AddSERes2Block(NN.GetLastLayer(), C, Config.Kernel, 2,
+        Config.Scale, Config.SEReduction);
+      B2 := NN.AddSERes2Block(B1, C, Config.Kernel, 3, Config.Scale,
+        Config.SEReduction);
+      B3 := NN.AddSERes2Block(B2, C, Config.Kernel, 4, Config.Scale,
+        Config.SEReduction);
+      // Multi-layer feature aggregation: concat the 3 block outputs along depth
+      // then a 1x1 TDNN conv (3C -> MFAChannels) + ReLU.
+      NN.AddLayer( TNNetDeepConcat.Create([B1, B2, B3]) );
+      MFA := NN.AddLayer( TNNetTDNNConv1D.Create(Config.MFAChannels, 1, 0, 1).SetTrainable(pTrainable) );
+      NN.AddLayer( TNNetReLU.Create() );
+      MFA := NN.GetLastLayer();
+      // Attention head: 1x1 conv (MFA->Att) -> Tanh -> 1x1 conv (Att->MFA).
+      NN.AddLayerAfter( TNNetTDNNConv1D.Create(Config.AttChannels, 1, 0, 1).SetTrainable(pTrainable), MFA );
+      NN.AddLayer( TNNetHyperbolicTangent.Create() );
+      AttHead := NN.GetLastLayer().PrevLayer; // the Att-conv (for weight load)
+      Logits := NN.AddLayer( TNNetTDNNConv1D.Create(Config.MFAChannels, 1, 0, 1).SetTrainable(pTrainable) );
+      // Attentive statistics pooling over the MFA features, gated by Logits.
+      Pooled := NN.AddLayerAfter(
+        TNNetAttentiveStatsPooling.Create(Logits), MFA );
+      // Embedding linear: 2*MFAChannels -> EmbDim.
+      Emb := NN.AddLayerAfter(
+        TNNetFullConnectLinear.Create(Config.EmbDim).SetTrainable(pTrainable), Pooled );
+      if not pTrainable then NN.SetTrainable();
+
+      // ---------------- Weights ----------------
+      LoadEcapaConv(Reader, ConvPre, 'conv_pre', Config.NumMel, C, 5, Consumed);
+      // SE-Res2Blocks: locate each block's weighted-layer span by re-walking.
+      // Blocks were created back-to-back from blockStart; each block has a fixed
+      // weighted-layer count, so split the collected list per block.
+      Weighted := CollectEcapaWeighted(NN, blockStart, B3.LayerIdx);
+      // weighted-layers-per-block = 1(expand)+(Scale-1)(res2)+1(mix)+2(SE).
+      bi := (Config.Scale - 1) + 4;
+      LoadBlock('block1', TNNetLayer(Weighted[0]).LayerIdx);
+      LoadBlock('block2', TNNetLayer(Weighted[bi]).LayerIdx);
+      LoadBlock('block3', TNNetLayer(Weighted[2 * bi]).LayerIdx);
+      LoadEcapaConv(Reader, MFA.PrevLayer, 'mfa', 3 * C, Config.MFAChannels, 1, Consumed);
+      LoadEcapaConv(Reader, AttHead, 'att_down', Config.MFAChannels,
+        Config.AttChannels, 1, Consumed);
+      LoadEcapaConv(Reader, Logits, 'att_up', Config.AttChannels,
+        Config.MFAChannels, 1, Consumed);
+      LoadLlamaLinearWeights(Reader, Emb, 'emb.weight', 2 * Config.MFAChannels,
+        Config.EmbDim, 0, -1, 0, 'emb.bias');
+      Consumed.Add('emb.weight'); Consumed.Add('emb.bias');
+
+      Result := NN;
+    except
+      on E: Exception do
+      begin
+        if Assigned(NN) then NN.Free;
+        raise;
+      end;
+    end;
+  finally
+    if Assigned(Weighted) then Weighted.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildEcapaTdnnFromSafeTensorsEx(const FileName: string;
+  out Config: TEcapaTdnnConfig; NumFrames: integer;
+  pTrainable: boolean = true; const ConfigFileName: string = ''): TNNet;
+var
+  CfgFile: string;
+begin
+  if ConfigFileName <> '' then CfgFile := ConfigFileName
+  else CfgFile := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadEcapaTdnnConfigFromJSONFile(CfgFile);
+  Result := BuildEcapaTdnnFromSafeTensorsWithConfig(FileName, Config, NumFrames,
+    pTrainable);
+end;
+
+function BuildEcapaTdnnFromSafeTensors(const FileName: string;
+  NumFrames: integer; pTrainable: boolean = true): TNNet;
+var
+  Config: TEcapaTdnnConfig;
+begin
+  Result := BuildEcapaTdnnFromSafeTensorsEx(FileName, Config, NumFrames,
+    pTrainable);
+end;
+
+function EcapaCosineScore(EmbA, EmbB: TNNetVolume): TNeuralFloat;
+var
+  dot, na, nb: TNeuralFloat;
+  i, n: integer;
+begin
+  n := EmbA.Size;
+  if EmbB.Size < n then n := EmbB.Size;
+  dot := 0; na := 0; nb := 0;
+  for i := 0 to n - 1 do
+  begin
+    dot := dot + EmbA.FData[i] * EmbB.FData[i];
+    na := na + EmbA.FData[i] * EmbA.FData[i];
+    nb := nb + EmbB.FData[i] * EmbB.FData[i];
+  end;
+  if (na <= 0) or (nb <= 0) then Result := 0
+  else Result := dot / (Sqrt(na) * Sqrt(nb));
 end;
 
 // ===========================================================================

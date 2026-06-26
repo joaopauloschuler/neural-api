@@ -882,7 +882,7 @@ rather than acted on.
   - [ ] Sliding-window inference + overlap stitching for clips longer than the model's
         receptive field, and turning the per-frame activity matrix into final diarized
         speaker turns (clustering across windows).
-- [ ] ECAPA-TDNN speaker-embedding / speaker-verification importer
+- [X] ECAPA-TDNN speaker-embedding / speaker-verification importer
       (`BuildEcapaTdnnFromSafeTensors[Ex]` + `TEcapaTdnnConfig`, e.g.
       speechbrain/spkrec-ecapa-voxceleb) — the missing COMPANION to the landed pyannote
       SEGMENTATION model: pyannote answers "who speaks WHEN" within one window, but the
@@ -912,6 +912,19 @@ rather than acted on.
       (`tools/make_pico_ecapa_fixture.py`; speechbrain is not installed here, mirror the
       pyannote oracle approach), `TestEcapaParity`. Real speechbrain checkpoint
       key-mapping + a VoxCeleb EER smoke run are network/RAM-gated follow-ups.
+      LANDED: new leaf layers `TNNetTDNNConv1D` (non-causal SAME dilated TDNN conv,
+      sibling of `TNNetCausalConv1D`) + `TNNetAttentiveStatsPooling` (two-source
+      weighted mean‖std pooling), builder `TNNet.AddSERes2Block` (Res2Net cascade +
+      reused `AddSEBlock` gating), `BuildEcapaTdnnFromSafeTensors[Ex]` +
+      `TEcapaTdnnConfig` + `ReadEcapaTdnnConfigFromJSONFile` + `EcapaCosineScore`,
+      `examples/SpeakerVerification`, pico fixture + `TestEcapaParity` (<1e-4, observed
+      ~1e-5) + full input/weight numerical-gradient tests for both leaf layers. Note:
+      the pico SE block matches `TNNetAvgChannel`'s `/N²` (not `/N`) scaling quirk; a
+      real checkpoint would use BatchNorm1d (eval-mode affine) instead of the pico's
+      simplified per-block normalization, so the real-key-mapping follow-up must add a
+      BatchNorm/affine-scale loader. Remaining deferred:
+      - [ ] real speechbrain/spkrec-ecapa-voxceleb checkpoint key-mapping (BatchNorm1d
+            stats, SpeechBrain TDNN naming) + a VoxCeleb EER smoke (network/RAM-gated).
 - [ ] SAM mask decoder as a real TNNet layer graph (TNNetCrossAttention two-source
       wiring) instead of the plain-array RunSAMMaskDecoder forward, so the decoder is
       trainable / fine-tunable end-to-end (v1 is inference-only). Needs a builder that

@@ -613,6 +613,11 @@ type
     procedure TestSpatialGatingUnitSerializationRoundTrip;
     procedure TestCausalConv1DInputGradientCheck;
     procedure TestCausalConv1DWeightGradientCheck;
+    procedure TestTDNNConv1DInputGradientCheck;
+    procedure TestTDNNConv1DWeightGradientCheck;
+    procedure TestTDNNConv1DSerializationRoundTrip;
+    procedure TestAttentiveStatsPoolingFeatureGradientCheck;
+    procedure TestAttentiveStatsPoolingLogitGradientCheck;
     procedure TestCausalConv1DCausality;
     procedure TestCausalConv1DSerializationRoundTrip;
     procedure TestCausalConv1DDilatedForward;
@@ -40183,6 +40188,295 @@ begin
     NN.Free;
     Input.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTDNNConv1DInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LConv: TNNetTDNNConv1D;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+  SeqLen, InDepth, NumFeat, K, Dil: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k2: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k2 := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k2] - Desired.Raw[k2];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SeqLen := 6; InDepth := 3; NumFeat := 2; K := 3; Dil := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, InDepth);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, InDepth);
+  Desired := TNNetVolume.Create(SeqLen, 1, NumFeat);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+    LConv := TNNetTDNNConv1D.Create(NumFeat, K, 0, Dil);
+    NN.AddLayer(LConv);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 1.1 + 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.7;
+    for i := 0 to LConv.Neurons.Count - 1 do
+      LConv.Neurons[i].Weights.Raw[0] := LConv.Neurons[i].Weights.Raw[0] + 0.3;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('TDNNConv1D input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTDNNConv1DWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LConv: TNNetTDNNConv1D;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, n: integer;
+  SeqLen, InDepth, NumFeat, K, Dil: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k2: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k2 := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k2] - Desired.Raw[k2];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SeqLen := 6; InDepth := 3; NumFeat := 2; K := 3; Dil := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, InDepth);
+  Desired := TNNetVolume.Create(SeqLen, 1, NumFeat);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+    LConv := TNNetTDNNConv1D.Create(NumFeat, K, 0, Dil);
+    NN.AddLayer(LConv);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.45) * 1.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.35) * 0.6;
+    for i := 0 to LConv.Neurons.Count - 1 do
+      LConv.Neurons[i].Weights.Raw[0] := LConv.Neurons[i].Weights.Raw[0] + 0.25;
+
+    for n := 0 to LConv.Neurons.Count - 1 do
+      for i := 0 to LConv.Neurons[n].Weights.Size - 1 do
+      begin
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LConv.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -LConv.Neurons[n].Delta.Raw[i];
+
+        AssertTrue('TDNNConv1D weight gradient n=' + IntToStr(n) +
+          ' w=' + IntToStr(i) + ' num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTDNNConv1DSerializationRoundTrip;
+begin
+  // TDNNConv1D round-trips NumFeatures/K/SuppressBias/Dilation via FStruct
+  // [0],[1],[4],[5] plus the (K,1,InDepth) weight volume per neuron.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetTDNNConv1D.Create(2, 3, 0, 2), 'TDNNConv1D', 6, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestAttentiveStatsPoolingFeatureGradientCheck;
+var
+  NN: TNNet;
+  FeatInput, LogitInput, InputPlus, Desired: TNNetVolume;
+  Pool: TNNetAttentiveStatsPooling;
+  FeatIn, LogitIn: TNNetLayer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+  T, Ch: integer;
+
+  function ComputeLoss(AFeat: TNNetVolume): TNeuralFloat;
+  var
+    k2: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute([AFeat, LogitInput]);
+    Result := 0;
+    for k2 := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k2] - Desired.Raw[k2];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  T := 5; Ch := 3;
+  NN := TNNet.Create();
+  FeatInput := TNNetVolume.Create(T, 1, Ch);
+  LogitInput := TNNetVolume.Create(T, 1, Ch);
+  InputPlus := TNNetVolume.Create(T, 1, Ch);
+  Desired := TNNetVolume.Create(1, 1, 2 * Ch);
+  epsilon := 0.0005;
+  try
+    FeatIn := NN.AddLayer(TNNetInput.Create(T, 1, Ch, 1));
+    LogitIn := TNNetInput.Create(T, 1, Ch, 1);
+    NN.AddLayerAfter(LogitIn, FeatIn);
+    Pool := TNNetAttentiveStatsPooling.Create(LogitIn);
+    NN.AddLayerAfter(Pool, FeatIn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to FeatInput.Size - 1 do
+      FeatInput.Raw[i] := Sin(i * 0.6) * 1.1 + 0.2;
+    for i := 0 to LogitInput.Size - 1 do
+      LogitInput.Raw[i] := Cos(i * 0.5) * 0.8;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Sin(i * 0.4) * 0.5 + 0.1;
+
+    for i := 0 to FeatInput.Size - 1 do
+    begin
+      InputPlus.Copy(FeatInput);
+      InputPlus.Raw[i] := FeatInput.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := FeatInput.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute([FeatInput, LogitInput]);
+      FeatIn.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := FeatIn.OutputError.Raw[i];
+
+      AssertTrue('AttentiveStatsPooling feature gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free; FeatInput.Free; LogitInput.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAttentiveStatsPoolingLogitGradientCheck;
+var
+  NN: TNNet;
+  FeatInput, LogitInput, InputPlus, Desired: TNNetVolume;
+  Pool: TNNetAttentiveStatsPooling;
+  FeatIn, LogitIn: TNNetLayer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+  T, Ch: integer;
+
+  function ComputeLoss(ALogit: TNNetVolume): TNeuralFloat;
+  var
+    k2: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute([FeatInput, ALogit]);
+    Result := 0;
+    for k2 := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k2] - Desired.Raw[k2];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  T := 5; Ch := 3;
+  NN := TNNet.Create();
+  FeatInput := TNNetVolume.Create(T, 1, Ch);
+  LogitInput := TNNetVolume.Create(T, 1, Ch);
+  InputPlus := TNNetVolume.Create(T, 1, Ch);
+  Desired := TNNetVolume.Create(1, 1, 2 * Ch);
+  epsilon := 0.0005;
+  try
+    FeatIn := NN.AddLayer(TNNetInput.Create(T, 1, Ch, 1));
+    LogitIn := TNNetInput.Create(T, 1, Ch, 1);
+    NN.AddLayerAfter(LogitIn, FeatIn);
+    Pool := TNNetAttentiveStatsPooling.Create(LogitIn);
+    NN.AddLayerAfter(Pool, FeatIn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to FeatInput.Size - 1 do
+      FeatInput.Raw[i] := Sin(i * 0.6) * 1.1 + 0.2;
+    for i := 0 to LogitInput.Size - 1 do
+      LogitInput.Raw[i] := Cos(i * 0.5) * 0.8;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Sin(i * 0.4) * 0.5 + 0.1;
+
+    for i := 0 to LogitInput.Size - 1 do
+    begin
+      InputPlus.Copy(LogitInput);
+      InputPlus.Raw[i] := LogitInput.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := LogitInput.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute([FeatInput, LogitInput]);
+      LogitIn.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := LogitIn.OutputError.Raw[i];
+
+      AssertTrue('AttentiveStatsPooling logit gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free; FeatInput.Free; LogitInput.Free; InputPlus.Free; Desired.Free;
   end;
 end;
 

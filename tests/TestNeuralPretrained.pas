@@ -284,6 +284,11 @@ type
     // vs a numpy float64 oracle on the committed pico fixture. Also exercises
     // the powerset->per-speaker decode.
     procedure TestPyannoteParity;
+    // ECAPA-TDNN speaker-embedding parity: log-mel frames -> conv_pre ->
+    // 3x SE-Res2Block -> MFA -> attentive statistics pooling -> 192-d-style
+    // embedding, vs a numpy float64 oracle on a re-randomized pico fixture;
+    // also checks the cosine speaker-verification score (same vs different clip).
+    procedure TestEcapaParity;
     // Moonshine streaming-ASR ENCODER parity: raw waveform -> conv stem ->
     // partial-RoPE bidirectional transformer -> encoder hidden states, vs an
     // HF float64 oracle (a SECOND speech-to-text architecture, distinct from
@@ -12811,6 +12816,95 @@ begin
     NN.Free;
     Output.Free; Input.Free;
     RowToks.Free; WaveToks.Free; Header.Free; Lines.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestEcapaParity;
+var
+  NN: TNNet;
+  Config: TEcapaTdnnConfig;
+  Lines, Header, XToks, EToks, CosToks: TStringList;
+  Input, Output, EmbA, EmbB: TNNetVolume;
+  NumFrames, NumMel, EmbDim, clip, i, c: integer;
+  Diff, MaxDiff, Expected: double;
+  CosAA, CosAB, ExpCosAA, ExpCosAB: double;
+  FS: TFormatSettings;
+begin
+  RandSeed := 424242;
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  Lines := TStringList.Create;
+  Header := TStringList.Create;
+  XToks := TStringList.Create;
+  EToks := TStringList.Create;
+  CosToks := TStringList.Create;
+  Input := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  EmbA := TNNetVolume.Create;
+  EmbB := TNNetVolume.Create;
+  NN := nil;
+  try
+    Lines.LoadFromFile(FixturePath('tiny_ecapa_expected.txt'));
+    AssertTrue('expected file has header + 2 clips + cos line', Lines.Count >= 6);
+    Header.Delimiter := ' '; Header.StrictDelimiter := True;
+    Header.DelimitedText := Lines[0];
+    NumFrames := StrToInt(Header[0]);
+    NumMel := StrToInt(Header[1]);
+    EmbDim := StrToInt(Header[2]);
+
+    NN := BuildEcapaTdnnFromSafeTensorsEx(
+      FixturePath('tiny_ecapa.safetensors'), Config, NumFrames,
+      {pTrainable=}true, FixturePath('tiny_ecapa_config.json'));
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('num_mel', NumMel, Config.NumMel);
+    AssertEquals('emb_dim', EmbDim, Config.EmbDim);
+    AssertEquals('embedding shape', EmbDim, NN.GetLastLayer().Output.Size);
+
+    MaxDiff := 0;
+    for clip := 0 to 1 do
+    begin
+      // Input row (T*NumMel, row-major t-major) then embedding row.
+      XToks.Delimiter := ' '; XToks.StrictDelimiter := True;
+      XToks.DelimitedText := Lines[1 + clip * 2];
+      AssertEquals('input length', NumFrames * NumMel, XToks.Count);
+      Input.ReSize(NumFrames, 1, NumMel);
+      for i := 0 to NumFrames * NumMel - 1 do
+        Input.FData[i] := StrToFloat(XToks[i], FS);
+      NN.Compute(Input);
+      NN.GetOutput(Output);
+      if clip = 0 then EmbA.Copy(Output) else EmbB.Copy(Output);
+
+      EToks.Delimiter := ' '; EToks.StrictDelimiter := True;
+      EToks.DelimitedText := Lines[2 + clip * 2];
+      AssertEquals('embedding length', EmbDim, EToks.Count);
+      for c := 0 to EmbDim - 1 do
+      begin
+        Expected := StrToFloat(EToks[c], FS);
+        Diff := Abs(Output.FData[c] - Expected);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    // 1e-4 importer-parity gate (committed-fixture convention). NEVER loosen.
+    AssertTrue('ECAPA embedding parity: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // Speaker-verification cosine score: same clip ~1, different clip < same.
+    CosToks.Delimiter := ' '; CosToks.StrictDelimiter := True;
+    CosToks.DelimitedText := Lines[5];
+    ExpCosAA := StrToFloat(CosToks[0], FS);
+    ExpCosAB := StrToFloat(CosToks[1], FS);
+    CosAA := EcapaCosineScore(EmbA, EmbA);
+    CosAB := EcapaCosineScore(EmbA, EmbB);
+    AssertTrue('cos(A,A) parity', Abs(CosAA - ExpCosAA) < 1e-4);
+    AssertTrue('cos(A,B) parity', Abs(CosAB - ExpCosAB) < 1e-4);
+    AssertTrue('same-speaker score >= different-speaker score',
+      CosAA >= CosAB - 1e-6);
+    WriteLn('ECAPA embedding max abs diff: ', MaxDiff:0:10);
+    WriteLn('ECAPA cos(A,A)=', CosAA:0:6, ' cos(A,B)=', CosAB:0:6);
+  finally
+    NN.Free;
+    EmbB.Free; EmbA.Free; Output.Free; Input.Free;
+    CosToks.Free; EToks.Free; XToks.Free; Header.Free; Lines.Free;
   end;
 end;
 
