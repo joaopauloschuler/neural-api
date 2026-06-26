@@ -4854,6 +4854,23 @@ type
     ModelType: string;          // 'musicgen'
   end;
 
+  // Decode-default sampling knobs read from an HF-style generation_config.json.
+  // Generalizes beyond MusicGen: any imported generative LM that ships a
+  // generation_config.json can seed its sampling recipe from one. Every field
+  // carries a Has* flag so a caller can tell "present in file" from "default
+  // because the key was absent" -- the example uses that to let explicit CLI
+  // --flags still override file values. Found=False means the file was missing
+  // or unparsable (graceful, no exception).
+  TGenerationDefaults = record
+    Found: boolean;             // generation_config.json located + parsed
+    HasTopK: boolean;       TopK: integer;            // top_k
+    HasTopP: boolean;       TopP: TNeuralFloat;       // top_p
+    HasTemperature: boolean; Temperature: TNeuralFloat; // temperature
+    HasDoSample: boolean;   DoSample: boolean;        // do_sample
+    HasGuidanceScale: boolean; GuidanceScale: TNeuralFloat; // guidance_scale
+    HasMaxLength: boolean;  MaxLength: integer;       // max_length
+  end;
+
   { TMusicGenModel }
   // Holds the imported MusicGen decoder: the K embedding tables, the
   // sinusoidal position table, enc_to_dec_proj, and the transformer-block
@@ -5000,6 +5017,20 @@ procedure MusicGenDelayDeinterleave(const Delayed: TNNetIntArr2D;
 function ReadMusicGenConfigFromJSONFile(const FileName: string): TMusicGenConfig;
 
 function MusicGenConfigToString(const Config: TMusicGenConfig): string;
+
+// Reads decode-default sampling knobs from an HF-style generation_config.json
+// (top_k / top_p / temperature / do_sample / guidance_scale / max_length). A
+// MISSING or unparsable file is graceful: Result.Found = False and every Has*
+// flag is False (NO exception is raised). Each present key sets its value and
+// the matching Has* flag, so callers can override file values with explicit
+// flags. Use ReadGenerationDefaultsFromDir to look beside a checkpoint's
+// weights.
+function ReadGenerationDefaultsFromJSONFile(
+  const FileName: string): TGenerationDefaults;
+// Convenience: reads generation_config.json from inside ModelDir (the snapshot
+// directory beside model.safetensors). Returns a not-Found record if absent.
+function ReadGenerationDefaultsFromDir(
+  const ModelDir: string): TGenerationDefaults;
 
 // Builds a TMusicGenModel (the decoder side) from Reader (caller owns Reader).
 // EncSeqLen/DecSeqLen fix the cross-attention and decoder sequence lengths.
@@ -27416,6 +27447,63 @@ begin
     ', codebooks=' + IntToStr(Config.NumCodebooks) +
     ', text_d_model=' + IntToStr(Config.TextDModel) +
     ', max_pos=' + IntToStr(Config.MaxPositionEmbeddings);
+end;
+
+function ReadGenerationDefaultsFromJSONFile(
+  const FileName: string): TGenerationDefaults;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+begin
+  // Start fully "not present": missing/unparsable file is graceful, no raise.
+  FillChar(Result, SizeOf(Result), 0);
+  Result.Found := False;
+  if not FileExists(FileName) then Exit;
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    try
+      JsonText.LoadFromFile(FileName);
+      Root := GetJSON(JsonText.Text);
+    except
+      // Corrupt/unreadable JSON behaves the same as an absent file.
+      Root.Free;
+      JsonText.Free;
+      FillChar(Result, SizeOf(Result), 0);
+      Exit;
+    end;
+    if not (Root is TJSONObject) then Exit;
+    Obj := TJSONObject(Root);
+    Result.Found := True;
+    if Obj.IndexOfName('top_k') >= 0 then
+      begin Result.HasTopK := True; Result.TopK := Obj.Get('top_k', 0); end;
+    if Obj.IndexOfName('top_p') >= 0 then
+      begin Result.HasTopP := True;
+        Result.TopP := Obj.Get('top_p', TJSONFloat(0)); end;
+    if Obj.IndexOfName('temperature') >= 0 then
+      begin Result.HasTemperature := True;
+        Result.Temperature := Obj.Get('temperature', TJSONFloat(1)); end;
+    if Obj.IndexOfName('do_sample') >= 0 then
+      begin Result.HasDoSample := True;
+        Result.DoSample := Obj.Get('do_sample', False); end;
+    if Obj.IndexOfName('guidance_scale') >= 0 then
+      begin Result.HasGuidanceScale := True;
+        Result.GuidanceScale := Obj.Get('guidance_scale', TJSONFloat(1)); end;
+    if Obj.IndexOfName('max_length') >= 0 then
+      begin Result.HasMaxLength := True;
+        Result.MaxLength := Obj.Get('max_length', 0); end;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function ReadGenerationDefaultsFromDir(
+  const ModelDir: string): TGenerationDefaults;
+begin
+  Result := ReadGenerationDefaultsFromJSONFile(
+    IncludeTrailingPathDelimiter(ModelDir) + 'generation_config.json');
 end;
 
 { TMusicGenModel }

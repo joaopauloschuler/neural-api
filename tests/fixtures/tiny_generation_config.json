@@ -1,0 +1,12 @@
+{
+  "_from_model_config": true,
+  "bos_token_id": 2048,
+  "do_sample": true,
+  "guidance_scale": 3.0,
+  "max_length": 1500,
+  "pad_token_id": 2048,
+  "temperature": 1.0,
+  "top_k": 250,
+  "top_p": 0.0,
+  "transformers_version": "4.31.0"
+}

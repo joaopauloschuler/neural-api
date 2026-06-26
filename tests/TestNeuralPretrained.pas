@@ -498,6 +498,7 @@ type
     procedure TestPEFTLoRAAdapterLoadAndMerge;
     procedure TestRaftConfigFromJSONFile;
     procedure TestRaftOpticalFlowParity;
+    procedure TestGenerationDefaultsFromJSONFile;
   end;
 
 implementation
@@ -20944,6 +20945,40 @@ begin
     RefJson.Free;
     NN.Free;
   end;
+end;
+
+// generation_config.json decode-default reader. The fixture mirrors
+// facebook/musicgen-small's recipe (do_sample=true, top_k=250, temperature=1.0,
+// guidance_scale=3.0, max_length=1500, top_p=0.0). Also exercises the
+// missing-file graceful path: a non-existent file must return Found=False with
+// no exception.
+procedure TTestNeuralPretrained.TestGenerationDefaultsFromJSONFile;
+var
+  G: TGenerationDefaults;
+begin
+  G := ReadGenerationDefaultsFromJSONFile(
+    FixturePath('tiny_generation_config.json'));
+  AssertTrue('file found+parsed', G.Found);
+  AssertTrue('has top_k', G.HasTopK);
+  AssertEquals('top_k', 250, G.TopK);
+  AssertTrue('has top_p', G.HasTopP);
+  AssertEquals('top_p', 0.0, G.TopP, 1e-6);
+  AssertTrue('has temperature', G.HasTemperature);
+  AssertEquals('temperature', 1.0, G.Temperature, 1e-6);
+  AssertTrue('has do_sample', G.HasDoSample);
+  AssertTrue('do_sample', G.DoSample);
+  AssertTrue('has guidance_scale', G.HasGuidanceScale);
+  AssertEquals('guidance_scale', 3.0, G.GuidanceScale, 1e-6);
+  AssertTrue('has max_length', G.HasMaxLength);
+  AssertEquals('max_length', 1500, G.MaxLength);
+
+  // Missing file: graceful, no exception, Found=False, every Has* False.
+  G := ReadGenerationDefaultsFromJSONFile(
+    FixturePath('tiny_generation_config.json') + '.does-not-exist');
+  AssertFalse('missing file -> not Found', G.Found);
+  AssertFalse('missing -> no top_k', G.HasTopK);
+  AssertFalse('missing -> no temperature', G.HasTemperature);
+  AssertFalse('missing -> no do_sample', G.HasDoSample);
 end;
 
 initialization
