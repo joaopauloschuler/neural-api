@@ -788,7 +788,13 @@ rather than acted on.
       classifier-free-guidance tuning and long-form generation to a follow-up.
       The WAV writer + HiFi-GAN vocoder it builds on have landed; the open
       piece is the audio U-Net/DiT denoiser importer.
-- [ ] Read generation_config.json for decode defaults (MusicGen + general).
+- [X] Read generation_config.json for decode defaults (MusicGen + general).
+      LANDED commit b8c45b6: ReadGenerationDefaultsFromJSONFile/FromDir +
+      TGenerationDefaults record (Has* present-flags) in neuralpretrained.pas,
+      parsing top_k/top_p/temperature/do_sample/guidance_scale/max_length;
+      MusicGenText --download seeds from generation_config.json (CLI flags still
+      override, do_sample=false collapses to greedy); test
+      TestGenerationDefaultsFromJSONFile + tiny_generation_config.json fixture.
       examples/MusicGenText currently HARDCODES MusicGen's intended sampling
       recipe in --download mode (top_k=250, temperature=1.0, guidance_scale=3.0,
       do_sample=true) -- these match facebook/musicgen-small's
@@ -1136,13 +1142,12 @@ rather than acted on.
       LayerNorm + ReLU FFN, pre-/post-LN per do_layer_norm_before, optional
       final_layer_norm, BuildFromPretrained dispatch; TestOPTNextTokenLogitsParity
       < 1e-4 vs float64 HF OPTForCausalLM). Open follow-ups:
-  - [ ] word_embed_proj_dim real-checkpoint parity: the equal-dims pico
-        fixture leaves the project_in/project_out path (opt-350m) UNTESTED.
-        Add an opt-350m-shaped pico fixture (hidden != word_embed_proj_dim) to
-        exercise the two bias-free projections end-to-end.
-  - [ ] do_layer_norm_before=false (POST-LN, opt-350m) pico parity: the build
-        path is wired but only the PRE-LN (125m) wiring is covered by a
-        fixture. Add a post-LN pico fixture.
+  - [X] word_embed_proj_dim + POST-LN (opt-350m) pico parity — BOTH gaps closed
+        by ONE opt-350m-shaped fixture (commit 5bbf929): tiny_opt350.* (hidden 16,
+        word_embed_proj_dim 12, do_layer_norm_before=false → project_in/out +
+        post-LN block wiring + HasFinalLayerNorm=false). Test
+        TestOPT350ProjPostLNLogitParity < 1e-4 vs float64 HF oracle, re-randomized
+        O(1)-scale weights; generator tools/opt_proj_postln_tiny_fixture.py.
   - [ ] Wire OPT as the blip2-opt decode tail (the original motivation): feed
         the Q-Former query/text states into BuildOPTFromSafeTensors and verify
         a BLIP-2-OPT generation path.
@@ -1161,14 +1166,12 @@ rather than acted on.
       first sharp, boundary-accurate, metric-depth model in the tree. Pico-fixture
       smoke + a real-checkpoint parity follow-up.
 
-- [ ] LCM sampler wiring into examples/LatentTextToImage (TNNetLCMScheduler /
-      LCMStep/LCMSample multistep loop + boundary scalings LANDED in
-      neuraldiffusion.pas, commit 8557e99, tests in TestNeuralDiffusion.pas):
-      expose the LCM scheduler as an opt-in sampler in the examples/LatentTextToImage
-      pipeline so the landed pico PixArt/DiT + VAE renders in ~4 steps (no cond/uncond
-      double pass); add it to the example's regression smoke. A short note on the
-      matching LCM-distillation objective (consistency loss to a teacher) is enough
-      for v1.
+- [X] LCM sampler wiring into examples/LatentTextToImage. LANDED commit ea52a73:
+      opt-in `--lcm` few-step sampler drives TNNetLCMScheduler.LCMSample (single
+      conditional forward per step, no CFG double pass) over the pico PixArt + VAE;
+      DDIM/DPM-Solver++ CFG loop stays default. TestLatentTextToImageSmoke extended
+      with an LCM render assertion; examples/README documents --lcm + the
+      LCM-distillation consistency-loss note.
 
 - [ ] RT-DETR real-time detection-transformer importer
       (BuildRtDetrFromSafeTensors[Ex], e.g. PekingU/rtdetr_r50vd). A DISTINCT
@@ -1275,8 +1278,12 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       stack matches the concatenation of independent per-document MHA runs (the
       builder-level analogue of TestSegmentMaskMatchesUnpackedBaseline). KV-cache
       incremental decode stays intentionally unmasked (single-stream = one doc).
-- [ ] AVX-vectorize the `TNNetDeconvolution.Compute` overlap-add scatter
-      (the real transposed convolution landed in commit 6b3318c). The inner
+- [X] AVX-vectorize the `TNNetDeconvolution.Compute` overlap-add scatter
+      (the real transposed convolution landed in commit 6b3318c). LANDED commit
+      22817d9: Compute depth dot-product via TNNetVolume.DotProduct, Backpropagate
+      dual depth MulAdds via TNNetVolume.MulAdd (hasInputGrad guard preserved);
+      equality test TestDeconvolutionDepthVectorEquality (InD=10 hits 8-wide SIMD
+      body + remainder), full suite 2259 tests green. The inner
       `for id := 0 to MaxInD do acc := acc + W.Get(kx,ky,id) * Prev.Get(ix,iy,id)`
       is a dot product over the contiguous depth axis — exactly the
       depth-axis-contiguous pattern the AVX `TNNetVolume` primitives target, yet it
@@ -1314,11 +1321,17 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
 - [ ] Recurrent-style layer audit: TNNetEmbedding's weight-gradient path
       (sparse-update pattern — easy place for a silent broadcast/reduction
       bug), TNNetTokenAndPositionalEmbedding, etc.
-- [ ] Layer-registry round-trip audit — for every concrete TNNet* in the
-      LoadFromString/CreateLayer dispatch table, instantiate with defaults,
-      save, load, save again, assert bit-for-bit string equality. Highest-
-      leverage single test for the "added a layer but forgot to register
-      it" bug.
+- [X] Layer-registry round-trip audit — LANDED commit 689eb0b:
+      tests/TestNeuralRegistry.pas builds a minimal net per registered layer,
+      SaveStructureToString -> LoadStructureFromString -> SaveStructureToString,
+      asserts bit-for-bit equality (375 builders, ~324 of ~404 canonical dispatch
+      names). Caught & fixed a REAL bug: TNNetSAMVisionAttention.SaveStructureToString
+      emitted a non-standard `SAMVisionAttention:...` string CreateLayer could not
+      parse (serialized-but-not-deserializable) — fixed to delegate to `inherited`.
+      Skip-list (documented in-code): multi-source/two-input layers (need a
+      multi-branch builder — own round-trip tests exist) + legacy aliases. Full
+      suite 2262 tests green. FOLLOW-UP: extend with a multi-branch builder to cover
+      the skipped two-source layers (Concat/Sum/CrossAttention/FiLM/HyperLinear/etc.).
 - [ ] Shape-inference smoke test — instantiate every concrete layer at a
       small canonical input shape, assert declared output shape matches
       actual.
