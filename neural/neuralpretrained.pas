@@ -8683,6 +8683,10 @@ type
     SeqLen: integer;            // sum_s PatchNums[s]^2 (flattened length)
     LayerNormEps: TNeuralFloat; // layer_norm_eps (1e-6)
     ModelType: string;          // 'VAR'
+    // ---- text-conditioned (Infinity-style) variant ----
+    TextCond: boolean;          // true -> text-conditioned (cross-attn + pooled-text adaLN)
+    TextDim: integer;           // caller text-encoder width (e.g. T5 hidden); 0 if class-cond
+    TextSeqLen: integer;        // number of supplied text tokens; 0 if class-cond
   end;
 
 // Reads a VAR config.json. Required: hidden_size (or C/embed_dim), depth,
@@ -8728,6 +8732,35 @@ function VARScaleStart(const Config: TVARConfig; ScaleId: integer): integer;
 function VARTokenInput(Net: TNNet): TNNetLayer;
 function VARScaleInput(Net: TNNet): TNNetLayer;
 function VARClassInput(Net: TNNet): TNNetLayer;
+
+// ----- text-conditioned (Infinity-style) VAR -----
+// The PixArt-style text-cond analogue of the class-conditional VAR: the single
+// learned CLASS token is replaced by caller-supplied TEXT-ENCODER states (e.g.
+// T5/FLAN-T5, already importable here - this importer does NOT build the text
+// tower; the caller fills the states before Compute, the landed
+// T5EncoderStatesInput two-net convention). Conditioning enters two ways,
+// exactly the landed PixArt recipe:
+//   (a) CROSS-ATTENTION per block (inserted between the scale-block-causal SELF-
+//       attention and the FFN): image-scale tokens (query) attend to the
+//       caption-projected text states (key/value); unmodulated residual, no
+//       preceding norm, no gate (the PixArt attn2 recipe). The next-scale
+//       block-causal SELF-attention is UNCHANGED.
+//   (b) POOLED-TEXT adaLN: the conditioning vector c that drives every block's
+//       adaLN-Zero modulation is the mean of the caption-projected text states
+//       (a pooled (1,1,d) vector) instead of class_emb[y].
+// A caption_projection (Linear(text_dim->d) -> GELU -> Linear(d->d)) maps the
+// text width to the transformer width inside the net (PixArt-style). When
+// Config.TextCond is false BuildVAR builds the class-conditional v1 path
+// bit-identically (this whole variant is config-gated).
+//
+// The text-cond net has THREE inputs: input0 the token-index sequence
+// (SeqLen,1,1), input1 the scale-id side channel (SeqLen,1,1), input2 the
+// (TextSeqLen,1,TextDim) text-encoder states (filled manually before Compute).
+// VARTextInput returns input2 in the text-cond build. Set Config.TextCond,
+// Config.TextDim and Config.TextSeqLen then call BuildVAR* as usual; the
+// safetensors must carry the extra keys text_proj.linear_{1,2}.* and per-block
+// blocks.i.cross_attn.{to_q,to_k,to_v,to_out.0}.{weight,bias}.
+function VARTextInput(Net: TNNet): TNNetLayer;
 
 // The COARSE-TO-FINE next-scale autoregressive SAMPLING loop. Given a built VAR
 // net (BuildVAR*) and its Config, generates the full multi-scale token sequence
@@ -63492,6 +63525,10 @@ begin
     Result.MlpRatio := Obj.Get('mlp_ratio', Result.MlpRatio);
     Result.VocabSize := Obj.Get('vocab_size', 0);
     Result.NumClasses := Obj.Get('num_classes', 0);
+    // text-conditioned (Infinity-style) variant keys (all optional).
+    Result.TextCond := Obj.Get('text_cond', false);
+    Result.TextDim := Obj.Get('text_dim', 0);
+    Result.TextSeqLen := Obj.Get('text_seq_len', 0);
     Result.LayerNormEps := Obj.Get('layer_norm_eps', double(Result.LayerNormEps));
     if Obj.Find('_class_name') <> nil then
       Result.ModelType := Obj.Get('_class_name', Result.ModelType);
@@ -63515,10 +63552,16 @@ begin
     JsonText.Free;
   end;
   if (Result.HiddenSize <= 0) or (Result.NumLayers <= 0) or
-     (Result.NumHeads <= 0) or (Result.VocabSize <= 0) or
-     (Result.NumClasses <= 0) then
+     (Result.NumHeads <= 0) or (Result.VocabSize <= 0) then
     ImportError('VAR import: ' + FileName + ' is missing one of the required ' +
-      'keys hidden_size/depth/num_heads/vocab_size/num_classes.');
+      'keys hidden_size/depth/num_heads/vocab_size.');
+  if (not Result.TextCond) and (Result.NumClasses <= 0) then
+    ImportError('VAR import: ' + FileName + ' missing "num_classes" (the ' +
+      'class-conditional v1 path); set "text_cond":true for the Infinity-' +
+      'style text-conditioned variant.');
+  if Result.TextCond and ((Result.TextDim <= 0) or (Result.TextSeqLen <= 0)) then
+    ImportError('VAR import: text_cond=true requires positive "text_dim" and ' +
+      '"text_seq_len".');
   if (Result.HiddenSize mod Result.NumHeads) <> 0 then
     ImportError('VAR import: hidden_size=' + IntToStr(Result.HiddenSize) +
       ' not divisible by num_heads=' + IntToStr(Result.NumHeads) + '.');
@@ -63544,6 +63587,9 @@ begin
     ', classes=' + IntToStr(Config.NumClasses) +
     ', scales=[' + Pyramid + ']' +
     ', seq_len=' + IntToStr(Config.SeqLen);
+  if Config.TextCond then
+    Result := Result + ', text_cond(text_dim=' + IntToStr(Config.TextDim) +
+      ', text_len=' + IntToStr(Config.TextSeqLen) + ')';
 end;
 
 function VARScaleStart(const Config: TVARConfig; ScaleId: integer): integer;
@@ -63570,6 +63616,13 @@ end;
 
 function VARClassInput(Net: TNNet): TNNetLayer;
 begin
+  Result := DiTNthInput(Net, 2);
+end;
+
+function VARTextInput(Net: TNNet): TNNetLayer;
+begin
+  // In the text-conditioned build the THIRD TNNetInput holds the caller-supplied
+  // text-encoder states (TextSeqLen,1,TextDim).
   Result := DiTNthInput(Net, 2);
 end;
 
@@ -63602,21 +63655,81 @@ end;
 // BlockCausalSegments flag set, so token i (scale s) attends only to keys whose
 // scale <= s. Records the layers that need weights loaded.
 type
+  // Records the four projection layers of one VAR cross-attention (separate
+  // to_q/to_k/to_v + the out-projection to_out.0), mirroring the landed PixArt
+  // unfused-qkv attention so HF Infinity-style weights load straight in.
+  TVARCrossAttnLayers = record
+    QProj, KProj, VProj, OutProj: TNNetLayer;
+  end;
+
   TVARBlockLayers = record
     AdaLN: TNNetLayer;     // ada_lin / adaLN_modulation Linear (d -> 6*d)
     QKV: TNNetLayer;       // attn.qkv (d -> 3*d)
     AttnProj: TNNetLayer;  // attn.proj (d -> d)
     Fc1: TNNetLayer;       // ffn.fc1 (d -> mlp_hidden)
     Fc2: TNNetLayer;       // ffn.fc2 (mlp_hidden -> d)
+    HasCross: boolean;     // text-cond variant: cross-attention present
+    Cross: TVARCrossAttnLayers; // cross_attn.{to_q,to_k,to_v,to_out.0}
   end;
 
-function AddVARBlock(NN: TNNet; XInput, CondLayer, ScaleIdLayer: TNNetLayer;
+// Builds one VAR cross-attention head-stack from explicit Q-source (the image
+// scale tokens) and K|V-source (the caption-projected text states), capturing
+// the four projection refs (PixArt to_q/to_k/to_v/to_out.0). Rectangular scores
+// (SeqLen image queries x TextSeqLen text keys) via per-head TNNetCrossAttention
+// over packed K|V - the landed two-source cross-attention recipe. NO mask.
+// Coded by Claude (AI).
+function AddVARCrossAttention(NN: TNNet; d_model, Heads: integer;
+  QuerySource, KeyValueSource: TNNetLayer;
+  var Attn: TVARCrossAttnLayers; pTrainable: boolean): TNNetLayer;
+var
+  d_k, HeadCnt, dd, HeadsM1, d_kM1: integer;
+  QSlice, KSlice, VSlice, KVPack: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  QChannels, KVChannels: array of integer;
+begin
+  d_k := d_model div Heads;
+  HeadsM1 := Heads - 1;
+  d_kM1 := d_k - 1;
+  Attn.QProj := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(d_model).SetTrainable(pTrainable), QuerySource);
+  Attn.KProj := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(d_model).SetTrainable(pTrainable), KeyValueSource);
+  Attn.VProj := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(d_model).SetTrainable(pTrainable), KeyValueSource);
+  SetLength(HeadOutputs, Heads);
+  SetLength(QChannels, d_k);
+  SetLength(KVChannels, d_k);
+  for HeadCnt := 0 to HeadsM1 do
+  begin
+    for dd := 0 to d_kM1 do
+    begin
+      QChannels[dd]  := HeadCnt * d_k + dd;
+      KVChannels[dd] := HeadCnt * d_k + dd;
+    end;
+    QSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), Attn.QProj);
+    KSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(KVChannels), Attn.KProj);
+    VSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(KVChannels), Attn.VProj);
+    KVPack := NN.AddLayer(TNNetDeepConcat.Create([KSlice, VSlice]));
+    HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+      TNNetCrossAttention.Create(d_k, {CausalMask=}false, KVPack), QSlice);
+  end;
+  NN.AddLayer(TNNetDeepConcat.Create(HeadOutputs));
+  Attn.OutProj := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(d_model).SetTrainable(pTrainable));
+  Result := Attn.OutProj;
+  SetLength(HeadOutputs, 0);
+  SetLength(QChannels, 0);
+  SetLength(KVChannels, 0);
+end;
+
+function AddVARBlock(NN: TNNet; XInput, CondLayer, ScaleIdLayer,
+  TextStates: TNNetLayer;
   const Config: TVARConfig; var Block: TVARBlockLayers;
   pTrainable: boolean): TNNetLayer;
 var
   d, MlpHidden, i, AttnStart, LayersM1: integer;
   SiluC, LN1, Mod1, FiLM1, Attn, Gate1Slice, Gated1, Res1: TNNetLayer;
-  LN2, Mod2, FiLM2, Gate2Slice, Gated2: TNNetLayer;
+  LN2, Mod2, FiLM2, Gate2Slice, Gated2, CrossOut: TNNetLayer;
   L: TNNetLayer;
 begin
   d := Config.HiddenSize;
@@ -63651,6 +63764,16 @@ begin
   Gated1 := NN.AddLayer(
     TNNetChannelMulByLayer.Create(Attn, Gate1Slice) );
   Res1 := NN.AddLayer( TNNetSum.Create([Gated1, XInput]) );
+  // ---- cross-attention sub-block (text-conditioned variant only) ----
+  // image scale tokens (query, from Res1) attend to the caption-projected text
+  // states (key/value); unmodulated residual, no norm, no gate (PixArt attn2).
+  Block.HasCross := Config.TextCond and (TextStates <> nil);
+  if Block.HasCross then
+  begin
+    CrossOut := AddVARCrossAttention(NN, d, Config.NumHeads, Res1, TextStates,
+      Block.Cross, pTrainable);
+    Res1 := NN.AddLayer( TNNetSum.Create([CrossOut, Res1]) );
+  end;
   // ---- FFN sub-block ----
   LN2 := NN.AddLayerAfter(
     TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable), Res1);
@@ -63675,6 +63798,7 @@ var
   TokInput, ScaleInput, ClassInput: TNNetLayer;
   WordEmb, LvlEmb, ClassEmb, PosEmb, XLayer, CondLayer: TNNetLayer;
   FinalSilu, FinalModLayer, FinalMod, FinalLN, FinalFiLM, HeadLin: TNNetLayer;
+  TextInput, CapFc1, CapGelu, CapFc2, TextStates, TextPool: TNNetLayer;
   Blocks: array of TVARBlockLayers;
   d, MlpHidden, BlockCnt, NumLayersM1: integer;
   p: string;
@@ -63698,16 +63822,42 @@ begin
     PosEmb := NN.AddLayer(
       TNNetLearnedPositionalEmbedding.Create(Config.SeqLen).SetTrainable(pTrainable) );
     XLayer := PosEmb;
-    // input2: class id (1,1,1) -> class_emb -> conditioning vector c (1,1,d).
-    ClassInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
-    ClassEmb := NN.AddLayer( TNNetEmbedding.Create(Config.NumClasses, d,
-      {EncodeZero=}1, {ScaleEmbedding=}1.0).SetTrainable(pTrainable) );
-    CondLayer := ClassEmb;
+    ClassInput := nil; ClassEmb := nil;
+    TextInput := nil; CapFc1 := nil; CapFc2 := nil; TextStates := nil;
+    if Config.TextCond then
+    begin
+      // input2: caller-supplied text-encoder states (TextSeqLen,1,TextDim) ->
+      // caption_projection (Linear -> GELU -> Linear) -> (TextSeqLen,1,d). The
+      // conditioning vector c is the POOLED (mean) projected text - the Infinity
+      // text-cond analogue of the single class token.
+      if (Config.TextDim <= 0) or (Config.TextSeqLen <= 0) then
+        ImportError('VAR text-cond import: text_dim and text_seq_len must be ' +
+          'positive.');
+      TextInput := NN.AddLayer( TNNetInput.Create(Config.TextSeqLen, 1, Config.TextDim) );
+      CapFc1 := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
+      CapGelu := NN.AddLayer( TNNetGELU.Create() );
+      CapFc2 := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
+      TextStates := CapFc2;
+      // pooled text -> (1,1,d) cond. TNNetAvgChannel over the (TextSeqLen,1,d)
+      // stream returns sum / TextSeqLen^2 (see oracle, which matches exactly).
+      TextPool := NN.AddLayerAfter( TNNetAvgChannel.Create(), TextStates );
+      CondLayer := TextPool;
+    end
+    else
+    begin
+      // input2: class id (1,1,1) -> class_emb -> conditioning vector c (1,1,d).
+      ClassInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
+      ClassEmb := NN.AddLayer( TNNetEmbedding.Create(Config.NumClasses, d,
+        {EncodeZero=}1, {ScaleEmbedding=}1.0).SetTrainable(pTrainable) );
+      CondLayer := ClassEmb;
+    end;
     if not pTrainable then NN.SetTrainable();
 
     SetLength(Blocks, Config.NumLayers);
     for BlockCnt := 0 to NumLayersM1 do
-      XLayer := AddVARBlock(NN, XLayer, CondLayer, ScaleInput, Config,
+      XLayer := AddVARBlock(NN, XLayer, CondLayer, ScaleInput, TextStates, Config,
         Blocks[BlockCnt], pTrainable);
 
     // ---- final adaLN head -> per-token logits (SeqLen,1,VocabSize) ----
@@ -63727,8 +63877,17 @@ begin
       Config.VocabSize, d);
     LoadClipEmbeddingTable(Reader, LvlEmb, 'lvl_embed.weight',
       Config.NumScales, d);
-    LoadClipEmbeddingTable(Reader, ClassEmb, 'class_emb.weight',
-      Config.NumClasses, d);
+    if Config.TextCond then
+    begin
+      // caption_projection: linear_1 (text_dim->d), linear_2 (d->d).
+      LoadLlamaLinearWeights(Reader, CapFc1, 'text_proj.linear_1.weight',
+        Config.TextDim, d, 0, -1, 0, 'text_proj.linear_1.bias');
+      LoadLlamaLinearWeights(Reader, CapFc2, 'text_proj.linear_2.weight',
+        d, d, 0, -1, 0, 'text_proj.linear_2.bias');
+    end
+    else
+      LoadClipEmbeddingTable(Reader, ClassEmb, 'class_emb.weight',
+        Config.NumClasses, d);
     // pos_embed buffer [SeqLen, d] -> the learned table.
     LoadClipEmbeddingTable(Reader, PosEmb, 'pos_embed.weight',
       Config.SeqLen, d);
@@ -63745,6 +63904,18 @@ begin
         p + 'ffn.fc1.weight', d, MlpHidden, 0, -1, 0, p + 'ffn.fc1.bias');
       LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc2,
         p + 'ffn.fc2.weight', MlpHidden, d, 0, -1, 0, p + 'ffn.fc2.bias');
+      if Blocks[BlockCnt].HasCross then
+      begin
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Cross.QProj,
+          p + 'cross_attn.to_q.weight', d, d, 0, -1, 0, p + 'cross_attn.to_q.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Cross.KProj,
+          p + 'cross_attn.to_k.weight', d, d, 0, -1, 0, p + 'cross_attn.to_k.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Cross.VProj,
+          p + 'cross_attn.to_v.weight', d, d, 0, -1, 0, p + 'cross_attn.to_v.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Cross.OutProj,
+          p + 'cross_attn.to_out.0.weight', d, d, 0, -1, 0,
+          p + 'cross_attn.to_out.0.bias');
+      end;
     end;
     LoadLlamaLinearWeights(Reader, FinalModLayer, 'head_ada_lin.weight',
       d, 2 * d, 0, -1, 0, 'head_ada_lin.bias');

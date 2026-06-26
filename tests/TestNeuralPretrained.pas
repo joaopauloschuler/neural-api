@@ -472,6 +472,7 @@ type
     procedure TestDiTSchedulerSmoke;
     procedure TestVARConfigFromJSONFile;
     procedure TestVARParity;
+    procedure TestVARTextCondParity;
     procedure TestVARGenerateSmoke;
     procedure TestPixArtConfigFromJSONFile;
     procedure TestPixArtParity;
@@ -19856,6 +19857,88 @@ begin
   finally
     RefRoot.Free;
     TokInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Parity test for the TEXT-conditioned (Infinity-style) VAR importer
+// (BuildVARFromSafeTensors with text_cond=true) against the committed tiny
+// float64 numpy oracle (tools/make_pico_var_textcond_fixture.py: hidden 16,
+// depth 2, heads 2, vocab 12, pyramid [1,2] -> 5 tokens, text_dim 10, 3 text
+// tokens). The PixArt-style text-cond analogue of the class-conditional path:
+// the single class token is replaced by caller-supplied TEXT-ENCODER states fed
+// to the net's THIRD TNNetInput; conditioning enters via (a) per-block
+// CROSS-ATTENTION (image tokens attend to caption-projected text) and (b) a
+// POOLED-TEXT adaLN vector. The next-scale block-causal SELF-attention is
+// unchanged. Asserts < 1e-4 on EVERY scale's logits. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestVARTextCondParity;
+var
+  NN: TNNet;
+  Config: TVARConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, IdxArr, TextArr, LogitsArr: TJSONArray;
+  CaseObj: TJSONObject;
+  TokInput, TextStates, Output: TNNetVolume;
+  RefVal, GotVal, Diff, MaxDiff: double;
+  CaseCnt, pos, v, t, ch, FlatIdx: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildVARFromSafeTensors(
+    FixturePath('tiny_var_textcond.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_var_textcond_config.json'));
+  RefJson := TStringList.Create;
+  TokInput := TNNetVolume.Create;
+  TextStates := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertTrue('config is text-cond', Config.TextCond);
+    VARFillScaleIds(NN, Config);
+    RefJson.LoadFromFile(FixturePath('tiny_var_textcond_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertTrue('cases present', CasesArr <> nil);
+    for CaseCnt := 0 to CasesArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(CasesArr.Items[CaseCnt]);
+      IdxArr := TJSONArray(CaseObj.Find('idx'));
+      TextArr := TJSONArray(CaseObj.Find('text'));      // flat (TextSeqLen, TextDim)
+      LogitsArr := TJSONArray(CaseObj.Find('logits'));  // flat (SeqLen, vocab)
+      // input0: token index sequence (SeqLen,1,1).
+      TokInput.ReSize(Config.SeqLen, 1, 1);
+      for pos := 0 to Config.SeqLen - 1 do
+        TokInput.FData[pos] := IdxArr.Items[pos].AsInteger;
+      // input2: the text-encoder states (TextSeqLen,1,TextDim).
+      TextStates.ReSize(Config.TextSeqLen, 1, Config.TextDim);
+      for t := 0 to Config.TextSeqLen - 1 do
+        for ch := 0 to Config.TextDim - 1 do
+          TextStates.FData[t * Config.TextDim + ch] :=
+            TextArr.Items[t * Config.TextDim + ch].AsFloat;
+      VARTextInput(NN).Output.Copy(TextStates);
+      VARFillScaleIds(NN, Config);
+      NN.Compute(TokInput);
+      Output := NN.GetLastLayer().Output;
+      AssertEquals('logits seq', Config.SeqLen, Output.SizeX);
+      AssertEquals('logits vocab', Config.VocabSize, Output.Depth);
+      for pos := 0 to Config.SeqLen - 1 do
+        for v := 0 to Config.VocabSize - 1 do
+        begin
+          FlatIdx := pos * Config.VocabSize + v;
+          RefVal := LogitsArr.Items[FlatIdx].AsFloat;
+          GotVal := Output.FData[pos * Config.VocabSize + v];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+    end;
+    AssertTrue('VAR text-cond logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    TokInput.Free;
+    TextStates.Free;
     RefJson.Free;
     NN.Free;
   end;

@@ -1097,9 +1097,21 @@ rather than acted on.
 - [ ] VAR (Visual AutoRegressive, next-scale prediction) image-generation follow-ups
       (class-conditional v1 LANDED — BuildVARFromSafeTensors[Ex] + ReadVARConfigFromJSONFile
       + the TNNetScaledDotProductAttention.BlockCausalSegments scale-mask flag):
-  - [ ] VAR text-conditioned (Infinity-style) variant — replace the single class token
+  - [X] VAR text-conditioned (Infinity-style) variant — replace the single class token
         with caller-supplied text encoder states + cross-attention (the PixArt-style
         text-cond path), the analogue of the DiT->PixArt step.
+        LANDED: config-gated via TVARConfig.TextCond/TextDim/TextSeqLen ("text_cond":true
+        in config.json). When on, BuildVAR adds a caption_projection (text_proj.linear_{1,2}:
+        Linear->GELU->Linear, text_dim->d) over the net's THIRD TNNetInput (caller-supplied
+        text-encoder states, the T5EncoderStatesInput convention; VARTextInput returns it),
+        a per-block PixArt-style CROSS-ATTENTION (AddVARCrossAttention: per-head
+        TNNetCrossAttention over packed K|V, separate to_q/to_k/to_v/to_out.0, unmodulated
+        residual, no norm/gate) inserted between the unchanged next-scale block-causal SELF-
+        attention and the FFN, and a POOLED-TEXT adaLN cond (TNNetAvgChannel mean over the
+        projected text -> (1,1,d)) replacing class_emb. Class-conditional v1 stays bit-
+        identical when off (TestVARParity unchanged). Parity: TestVARTextCondParity vs a
+        first-principles float64 numpy oracle (tools/make_pico_var_textcond_fixture.py,
+        tiny_var_textcond.* fixtures), max|diff| < 1e-4; full suite 2301 tests, 0 failures.
   - [ ] VAR real-checkpoint parity (FoundationVision/var) — v1 parity is vs a
         first-principles float64 oracle on a random pico config; verify against a sliced
         real checkpoint once weights are available (the make_pico_*_fixture slicer
