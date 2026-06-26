@@ -61,7 +61,7 @@ unit neuralaudio;
 interface
 
 uses
-  Classes, SysUtils, neuralvolume;
+  Classes, SysUtils, Math, neuralvolume;
 
 // Reads a 16-bit PCM RIFF/WAVE file into Samples as mono floats in [-1, 1)
 // (multi-channel input is averaged). Samples is resized to (N, 1, 1).
@@ -78,17 +78,49 @@ function LoadWav16ToVolume(const FileName: string;
 procedure SaveVolumeToWav16(Samples: TNNetVolume; const FileName: string;
   SampleRate: integer = 16000);
 
+// Sample-rate conversion of a mono waveform (floats in [-1, 1], laid out
+// along FData as LoadWav16ToVolume reads them) from SourceRate to TargetRate.
+// Returns a NEWLY created TNNetVolume of shape (round(N * TargetRate /
+// SourceRate), 1, 1) - the CALLER OWNS and must Free it.
+//
+// Quality: a windowed-sinc (Lanczos, default A = csResampleLanczosA lobes)
+// polyphase-style kernel evaluated per output sample. For DOWNSAMPLING the
+// sinc cutoff is lowered to the output Nyquist (cutoff = TargetRate /
+// SourceRate in input-sample units), so the low-pass anti-alias filter is
+// folded into the interpolation kernel - no separate pre-filter needed. For
+// UPSAMPLING the cutoff stays at the input Nyquist (band-limited interp).
+// This is materially better than naive linear interpolation for downsampling
+// (linear leaves audible aliasing); the cost is O(N_out * 2*A/ratio) which is
+// negligible next to the STFT/mel that follows.
+//
+// FAST PATH: when SourceRate = TargetRate the input is copied bit-identically
+// (no kernel evaluated), so a 16 kHz -> 16 kHz call is a pure passthrough.
+function ResampleVolume(Wave: TNNetVolume; SourceRate, TargetRate: integer): TNNetVolume;
+
+// Convenience: ResampleVolume(Wave, SourceRate, 16000). Caller owns Result.
+function ResampleVolumeTo16k(Wave: TNNetVolume; SourceRate: integer): TNNetVolume;
+
+// Like LoadWav16ToVolume but the loaded waveform is resampled to TargetRate
+// (default 16000 Hz) mono. When the file is already at TargetRate this is
+// bit-identical to LoadWav16ToVolume. Returns TargetRate (always); Samples is
+// the resampled mono waveform (N, 1, 1).
+function LoadWavResampledToVolume(const FileName: string; Samples: TNNetVolume;
+  TargetRate: integer = 16000): integer;
+
 // HF WhisperFeatureExtractor log-mel spectrogram (see the unit header).
 // Samples: mono waveform at 16 kHz, any length (padded/truncated to
 // NumFrames*160 samples). Mel is resized to (NumFrames, 1, NumMelBins).
 procedure ComputeWhisperLogMel(Samples: TNNetVolume; Mel: TNNetVolume;
   NumMelBins: integer = 80; NumFrames: integer = 3000);
 
-// Convenience wrapper: LoadWav16ToVolume + ComputeWhisperLogMel. The WAV
-// must already be sampled at 16000 Hz (no resampler in this v1 - raises
-// Exception otherwise; convert first, e.g. ffmpeg -ar 16000 -ac 1).
+// Convenience wrapper: load a WAV + ComputeWhisperLogMel. By default
+// (Resample = True) a WAV at any sample rate is accepted and resampled to
+// 16000 Hz mono via ResampleVolume (a 16 kHz file passes through untouched).
+// Pass Resample = False to keep the strict v1 behaviour (raise Exception if
+// the file is not already 16000 Hz).
 procedure WhisperLogMelFromWavFile(const FileName: string; Mel: TNNetVolume;
-  NumMelBins: integer = 80; NumFrames: integer = 3000);
+  NumMelBins: integer = 80; NumFrames: integer = 3000;
+  Resample: boolean = True);
 
 // Inverse STFT overlap-add (OLA) synthesis - the exact inverse of the forward
 // real STFT used by ComputeWhisperLogMel (periodic Hann analysis window, same
@@ -135,6 +167,7 @@ const
   csWhisperHop = 160;       // hop (10 ms at 16 kHz)
   csWhisperSampleRate = 16000;
   csWhisperMaxFreq = 8000.0;
+  csResampleLanczosA = 4;   // sinc lobes per side for the resampler kernel
   csWhisperMelFloor = 1e-10;
 
 function LoadWav16ToVolume(const FileName: string;
@@ -237,6 +270,115 @@ begin
   finally
     FS.Free;
   end;
+end;
+
+function ResampleVolume(Wave: TNNetVolume; SourceRate, TargetRate: integer): TNNetVolume;
+var
+  NIn, NOut, OutCnt, J, JLo, JHi: integer;
+  Ratio, Cutoff, SrcPos, Center, X, Acc, WSum, W, PiX, PiXA: double;
+
+  // Lanczos-windowed sinc at offset T (in input-sample units), low-passed at
+  // Cutoff (cycles per input sample, <= 0.5). Returns the kernel weight.
+  function LanczosKernel(T: double): double;
+  begin
+    if Abs(T) < 1e-12 then
+    begin
+      Result := 2.0 * Cutoff;
+      exit;
+    end;
+    if Abs(T) >= csResampleLanczosA then
+    begin
+      Result := 0.0;
+      exit;
+    end;
+    // sinc(2*Cutoff*T) low-pass, windowed by the Lanczos lobe sinc(T/A).
+    PiX := Pi * 2.0 * Cutoff * T;
+    PiXA := Pi * T / csResampleLanczosA;
+    Result := 2.0 * Cutoff * (Sin(PiX) / PiX) * (Sin(PiXA) / PiXA);
+  end;
+
+begin
+  if (SourceRate <= 0) or (TargetRate <= 0) then
+    raise Exception.Create('ResampleVolume: sample rates must be positive.');
+  Result := TNNetVolume.Create;
+  NIn := Wave.Size;
+  // FAST PATH: identical rates -> bit-identical copy, no kernel evaluated.
+  if SourceRate = TargetRate then
+  begin
+    Result.ReSize(NIn, 1, 1);
+    if NIn > 0 then
+      Move(Wave.FData[0], Result.FData[0], NIn * SizeOf(Wave.FData[0]));
+    exit;
+  end;
+  NOut := Round(NIn * (TargetRate / SourceRate));
+  Result.ReSize(NOut, 1, 1);
+  if (NIn = 0) or (NOut = 0) then exit;
+
+  Ratio := TargetRate / SourceRate;
+  // Anti-alias cutoff: input Nyquist when upsampling (Ratio>=1, Cutoff=0.5),
+  // lowered to the OUTPUT Nyquist when downsampling (Cutoff=0.5*Ratio). The
+  // kernel half-width grows by 1/min(1,Ratio) so it still spans A output lobes.
+  if Ratio >= 1.0 then
+    Cutoff := 0.5
+  else
+    Cutoff := 0.5 * Ratio;
+
+  for OutCnt := 0 to NOut - 1 do
+  begin
+    // Position of this output sample expressed in INPUT-sample coordinates.
+    SrcPos := OutCnt / Ratio;
+    Center := SrcPos;
+    // Kernel support in input samples: A lobes scaled by the cutoff stretch.
+    if Ratio >= 1.0 then
+    begin
+      JLo := Floor(Center) - csResampleLanczosA + 1;
+      JHi := Floor(Center) + csResampleLanczosA;
+    end
+    else
+    begin
+      JLo := Floor(Center - csResampleLanczosA / Ratio);
+      JHi := Ceil(Center + csResampleLanczosA / Ratio);
+    end;
+    Acc := 0.0;
+    WSum := 0.0;
+    for J := JLo to JHi do
+    begin
+      if (J < 0) or (J > NIn - 1) then continue;
+      X := Center - J;
+      W := LanczosKernel(X);
+      if W = 0.0 then continue;
+      Acc := Acc + W * Wave.FData[J];
+      WSum := WSum + W;
+    end;
+    if WSum <> 0.0 then
+      Result.FData[OutCnt] := Acc / WSum
+    else
+      Result.FData[OutCnt] := 0.0;
+  end;
+end;
+
+function ResampleVolumeTo16k(Wave: TNNetVolume; SourceRate: integer): TNNetVolume;
+begin
+  Result := ResampleVolume(Wave, SourceRate, csWhisperSampleRate);
+end;
+
+function LoadWavResampledToVolume(const FileName: string; Samples: TNNetVolume;
+  TargetRate: integer = 16000): integer;
+var
+  SrcRate: integer;
+  Resampled: TNNetVolume;
+begin
+  SrcRate := LoadWav16ToVolume(FileName, Samples);
+  if SrcRate <> TargetRate then
+  begin
+    Resampled := ResampleVolume(Samples, SrcRate, TargetRate);
+    try
+      Samples.Copy(Resampled);
+    finally
+      Resampled.Free;
+    end;
+  end;
+  Result := TargetRate;
 end;
 
 procedure SaveVolumeToWav16(Samples: TNNetVolume; const FileName: string;
@@ -499,19 +641,24 @@ begin
 end;
 
 procedure WhisperLogMelFromWavFile(const FileName: string; Mel: TNNetVolume;
-  NumMelBins: integer = 80; NumFrames: integer = 3000);
+  NumMelBins: integer = 80; NumFrames: integer = 3000;
+  Resample: boolean = True);
 var
   Samples: TNNetVolume;
   SampleRate: integer;
 begin
   Samples := TNNetVolume.Create;
   try
-    SampleRate := LoadWav16ToVolume(FileName, Samples);
+    if Resample then
+      SampleRate := LoadWavResampledToVolume(FileName, Samples,
+        csWhisperSampleRate)
+    else
+      SampleRate := LoadWav16ToVolume(FileName, Samples);
     if SampleRate <> csWhisperSampleRate then
       raise Exception.Create('WhisperLogMelFromWavFile: ' + FileName +
         ' is sampled at ' + IntToStr(SampleRate) + ' Hz - Whisper needs ' +
-        '16000 Hz mono (convert first, e.g. ffmpeg -i in.wav -ar 16000 ' +
-        '-ac 1 out.wav).');
+        '16000 Hz mono (pass Resample=True, or convert first, e.g. ' +
+        'ffmpeg -i in.wav -ar 16000 -ac 1 out.wav).');
     ComputeWhisperLogMel(Samples, Mel, NumMelBins, NumFrames);
   finally
     Samples.Free;
