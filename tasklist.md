@@ -837,6 +837,25 @@ rather than acted on.
   - [ ] Mimi STREAMING chunk-at-a-time encode/decode (HF `MimiConv1dPaddingCache`
         per-conv padding cache + KV-cache transformer decode via the landed SDPA
         Begin/EndIncrementalDecode) for O(1) per-frame Moshi-style inference.
+- [ ] F5-TTS flow-matching text-to-speech importer (`BuildF5TTSFromSafeTensors[Ex]` +
+      `TF5Config`/`ReadF5ConfigFromJSONFile`, model `SWivid/F5-TTS`) — the
+      leading open NON-autoregressive, NON-GAN voice cloner, genuinely distinct
+      from the landed VITS (GAN), Kokoro/StyleTTS2 (adversarial), Bark (codec-LM)
+      and Parler (codec-LM) paths: it regresses a mel-spectrogram by integrating a
+      conditional-flow-matching ODE (the landed `examples/FlowMatching` +
+      `neuraldiffusion.pas` sampler machinery is the velocity-field driver) through a
+      DiT trunk that is conditioned, in-context, on a masked reference mel + the
+      ConvNeXt-V2-embedded character sequence (no phonemizer — raw chars/pinyin), so
+      the model "infills" the target speech in the reference speaker's voice. Reuses
+      the landed DiT/adaLN-zero blocks, RoPE SDPA and ConvNeXt blocks; the only
+      genuinely new wiring is the text+audio concat conditioning and the sway-sampled
+      timestep schedule. Pair the mel output with the already-landed vocoder path
+      (Vocos/HiFi-GAN) to reach waveform. Pico parity `< 1e-4` vs a float64 HF
+      reference on the DiT velocity field (generator `tools/f5_tiny_fixture.py`,
+      committed `tests/fixtures/tiny_f5.*`) + an `examples/F5TTS` voice-clone smoke.
+      Open follow-ups: real `SWivid/F5-TTS` checkpoint parity (offline/RAM-gated);
+      the E2-TTS flat-UNet variant (same flow-matching objective, simpler trunk);
+      classifier-free-guidance strength sweep on the cond/uncond DiT pass.
 - [ ] CLAP audio-text contrastive importer (`BuildClapFromSafeTensors[Ex]` +
       `BuildClapFromSafeTensorsWithConfig`, `TClapConfig`/`ReadClapConfigFromJSONFile`)
       + examples/ZeroShotAudioTag — LANDED. Audio-domain analogue of the CLIP
