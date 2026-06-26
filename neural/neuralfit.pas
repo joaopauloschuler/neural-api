@@ -169,6 +169,47 @@ type
     procedure ReSet(); override;
   end;
 
+  // Muon optimization method (Jordan et al. 2024, "Muon: MomentUm Orthogonalized
+  // by Newton-schulz", https://kellerjordan.github.io/posts/muon/). For each 2-D
+  // weight matrix W (FanOut x FanIn) of a dense layer, per step:
+  //   (1) momentum buffer  M <- mu*M + G            (G = accumulated gradient);
+  //   (2) ORTHOGONALIZE the update O <- NewtonSchulz5(M) - replace M by the
+  //       (approximately) nearest orthogonal matrix using NSIters quintic
+  //       Newton-Schulz iterations on the Frobenius-normalized X = M/||M||_F:
+  //           X <- a*X + b*(X X^T)X + c*(X X^T)^2 X   (a,b,c)=(3.4445,-4.7750,2.0315)
+  //   (3) apply  W <- W - lr*sqrt(max(rows,cols))*O. The sqrt(max(rows,cols))
+  //       factor makes the per-element update RMS roughly match Adam's, so the
+  //       same learning rate transfers.
+  // The 5-step quintic is a DELIBERATELY approximate orthogonalizer (stable
+  // fixed points sigma ~ 0.868 and ~1.264, f(1)=0.701): it produces a
+  // SEMI-orthogonal update with every singular value squeezed into ~[0.7,1.3],
+  // which is all Muon needs to make the update directions near-isotropic.
+  // Muon keeps a SINGLE momentum buffer (FBackInertia, like Lion). It applies
+  // the orthogonalized step ONLY to genuine 2-D weight matrices (FullConnect /
+  // linear layers, where neuron n owns a flat FanIn row); NON-matrix params
+  // (biases, and conv kernels whose per-neuron weights are not a flat row) fall
+  // back to plain SGD-momentum - mirroring real Muon, which routes vector
+  // params to a scalar optimizer (AdamW/SGD). Like the other optimizers here it
+  // REQUIRES SetBatchUpdate(True) so Backpropagate accumulates the gradient into
+  // Neurons[].Delta (TNeuralFit already sets it).
+  // Coded by Claude (AI).
+  TNeuralOptimizerMuon = class(TNeuralOptimizer)
+  protected
+    FMomentum: TNeuralFloat;
+    FNSIters: integer;
+    FInitialized: boolean;
+  public
+    constructor Create(
+      Momentum: TNeuralFloat = 0.95;
+      NSIters: integer = 5); overload;
+
+    procedure Optimize(); override;
+    procedure ReSet(); override;
+
+    property Momentum: TNeuralFloat read FMomentum write FMomentum;
+    property NSIters: integer read FNSIters write FNSIters;
+  end;
+
   TCustomLearningRateScheduleFn = function(Epoch: integer): single;
   TCustomLearningRateScheduleObjFn = function(Epoch: integer): single of object;
 
@@ -2358,6 +2399,38 @@ begin
   end;
   FNN.CalcAdafactorDelta(FBeta2, FEpsilon, FEps1);
   ForceDeltaLimists();
+  FNN.UpdateWeightsAdam();
+end;
+
+{ TNeuralOptimizerMuon }
+
+constructor TNeuralOptimizerMuon.Create(Momentum: TNeuralFloat; NSIters: integer);
+begin
+  inherited Create();
+  FMomentum := Momentum;
+  FNSIters := NSIters;
+  FInitialized := false;
+end;
+
+procedure TNeuralOptimizerMuon.ReSet();
+begin
+  inherited ReSet;
+  // Muon keeps a SINGLE momentum buffer (FBackInertia, like Lion). ClearInertia
+  // zeros it; the Adam second-moment buffer is left at its tiny default size.
+  FNN.ClearInertia();
+end;
+
+procedure TNeuralOptimizerMuon.Optimize();
+begin
+  if not(FInitialized) then
+  begin
+    ReSet();
+    FInitialized := true;
+  end;
+  // Compute the orthogonalized-momentum increment into every neuron's delta...
+  FNN.CalcMuonDelta(FMomentum, FNSIters);
+  ForceDeltaLimists();
+  // ...and apply it (UpdateWeightsAdam simply adds the precomputed delta).
   FNN.UpdateWeightsAdam();
 end;
 

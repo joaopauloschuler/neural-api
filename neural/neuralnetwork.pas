@@ -474,6 +474,17 @@ type
       procedure CalcLionDelta(pLearningRate, Beta1, Beta2: TNeuralFloat); virtual;
       procedure InitAdafactor(); virtual;
       procedure CalcAdafactorDelta(Beta2, Epsilon, Eps1: TNeuralFloat); virtual;
+      // Muon per-layer step (Jordan et al. 2024). Treats the FanOut x FanIn
+      // weight matrix (neuron n owns row n) as a single 2-D matrix: builds the
+      // momentum buffer (per-neuron FBackInertia), orthogonalizes it with
+      // NSIters quintic Newton-Schulz iterations, and rewrites every neuron's
+      // FDelta to the final increment (-lr*sqrt(max(rows,cols))*O_row). Layers
+      // whose per-neuron weights are NOT a flat FanIn row (convolutions,
+      // single-row matrices, bias-only layers) fall back to SGD-momentum on
+      // FDelta - mirroring real Muon, which routes non-matrix params to a
+      // scalar optimizer. A following UpdateWeightsAdam() applies it.
+      // Coded by Claude (AI).
+      procedure CalcMuonDelta(Momentum: TNeuralFloat; NSIters: integer); virtual;
       function InitBasicPatterns(): TNNetLayer;
 
       // Increments an internal counter that counts how many branches load
@@ -798,6 +809,7 @@ type
       // calls UpdateWeights). Coded by Claude (AI).
       procedure CalcLionDelta(pLearningRate, Beta1, Beta2: TNeuralFloat); override;
       procedure CalcAdafactorDelta(Beta2, Epsilon, Eps1: TNeuralFloat); override;
+      procedure CalcMuonDelta(Momentum: TNeuralFloat; NSIters: integer); override;
   end;
 
   /// This layer can be used when you need the forward pass but can't let
@@ -14494,6 +14506,9 @@ type
       // Adafactor optimizer support: factored second-moment state + delta calc.
       procedure InitAdafactor(); // Coded by Claude (AI).
       procedure CalcAdafactorDelta(Beta2, Epsilon, Eps1: TNeuralFloat);
+      // Muon optimizer support: orthogonalized-momentum delta calc on every
+      // 2-D weight-matrix layer; apply with UpdateWeightsAdam. Coded by Claude (AI).
+      procedure CalcMuonDelta(Momentum: TNeuralFloat; NSIters: integer);
       procedure ClearDeltas(); {$IFDEF Release} inline; {$ENDIF}
       // Frees the training-only volumes (Delta/BackInertia + Adam siblings)
       // of every neuron in every layer, reclaiming ~2/3 of weight memory.
@@ -54743,6 +54758,11 @@ begin
 end;
 
 procedure TNNetIdentityWithoutL2AndOptimizer.CalcAdafactorDelta(Beta2, Epsilon, Eps1: TNeuralFloat);
+begin
+  // nothing is done; this layer runs its own UpdateWeights.
+end;
+
+procedure TNNetIdentityWithoutL2AndOptimizer.CalcMuonDelta(Momentum: TNeuralFloat; NSIters: integer);
 begin
   // nothing is done; this layer runs its own UpdateWeights.
 end;
@@ -99499,6 +99519,15 @@ begin
     FLayers[LayerCnt].CalcAdafactorDelta(Beta2, Epsilon, Eps1);
 end;
 
+procedure TNNet.CalcMuonDelta(Momentum: TNeuralFloat; NSIters: integer);
+var
+  LayerCnt, LastLayerIdx: integer;
+begin
+  LastLayerIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+    FLayers[LayerCnt].CalcMuonDelta(Momentum, NSIters);
+end;
+
 procedure TNNet.ClearDeltas();
 var
   LayerCnt: integer;
@@ -102470,6 +102499,167 @@ begin
   if MaxNeurons >= 0 then
     for Cnt := 0 to MaxNeurons do
       FNeurons[Cnt].CalcAdafactorDelta(Beta2, Epsilon, Eps1);
+end;
+
+// --- Muon Newton-Schulz orthogonalization helpers (Jordan et al. 2024) ------
+// Matrices are packed row-major in a TNNetVolume (element [r,c] at r*Cols + c).
+// All matmuls go through TNNetVolume.DotProducts, which stores
+// out[b*NumAs + a] = dot(VAs row a, VBs row b); the MuonMatMul wrapper feeds
+// VAs = Q^T, VBs = P to recover an ordinary product P*Q. Coded by Claude (AI).
+procedure MuonMatTranspose(Dst, Src: TNNetVolume; Rows, Cols: integer);
+var
+  R, C: integer;
+begin
+  Dst.ReSize(Cols * Rows, 1, 1);
+  for R := 0 to Rows - 1 do
+    for C := 0 to Cols - 1 do
+      Dst.FData[C * Rows + R] := Src.FData[R * Cols + C];
+end;
+
+// Dst (R x C) := P (R x I) * Q (I x C). Qt scratch holds Q^T (C x I).
+procedure MuonMatMul(Dst, P, Q, Qt: TNNetVolume; R, I, C: integer);
+begin
+  MuonMatTranspose(Qt, Q, I, C);
+  Dst.ReSize(R * C, 1, 1);
+  Dst.Fill(0);
+  Dst.DotProducts({NumAs=}C, {NumBs=}R, {VectorSize=}I, {VAs=}Qt, {VBs=}P);
+end;
+
+// O := NewtonSchulz5(M), both packed (Rows x Cols). Drives the singular values
+// toward 1 (semi-orthogonal) with NSIters quintic iterations on the
+// Frobenius-normalized X = M/||M||_F:  X <- a*X + b*(X X^T)X + c*(X X^T)^2 X
+// with the paper's coefficients (a,b,c) = (3.4445, -4.7750, 2.0315).
+procedure MuonNewtonSchulz5(O, M: TNNetVolume; Rows, Cols, NSIters: integer);
+const
+  cNS_a = 3.4445; cNS_b = -4.7750; cNS_c = 2.0315;
+var
+  X, Xt, A, AX, A2X, B, Qt: TNNetVolume;
+  FroNorm: TNeuralFloat;
+  Iter: integer;
+begin
+  X   := TNNetVolume.Create();
+  Xt  := TNNetVolume.Create();
+  A   := TNNetVolume.Create();
+  AX  := TNNetVolume.Create();
+  A2X := TNNetVolume.Create();
+  B   := TNNetVolume.Create();
+  Qt  := TNNetVolume.Create();
+  try
+    X.Copy(M);
+    FroNorm := Sqrt(X.GetSumSqr());
+    if FroNorm < 1e-12 then FroNorm := 1e-12;
+    X.Mul(1.0 / FroNorm);
+
+    for Iter := 1 to NSIters do
+    begin
+      MuonMatTranspose(Xt, X, Rows, Cols);          // Xt = X^T (Cols x Rows)
+      MuonMatMul(A, X, Xt, Qt, Rows, Cols, Rows);   // A = X X^T (Rows x Rows)
+      MuonMatMul(AX, A, X, Qt, Rows, Rows, Cols);   // AX = A X
+      MuonMatMul(A2X, A, AX, Qt, Rows, Rows, Cols); // A2X = A (A X)
+      B.Copy(X);
+      B.Mul(cNS_a);
+      B.MulAdd(cNS_b, AX);
+      B.MulAdd(cNS_c, A2X);
+      X.Copy(B);
+    end;
+
+    O.Copy(X);
+  finally
+    X.Free; Xt.Free; A.Free; AX.Free; A2X.Free; B.Free; Qt.Free;
+  end;
+end;
+
+procedure TNNetLayer.CalcMuonDelta(Momentum: TNeuralFloat; NSIters: integer);
+var
+  MaxNeurons, Rows, Cols, NIdx, W: integer;
+  lr, invNegLr, g, Scale: TNeuralFloat;
+  IsMatrix: boolean;
+  Mmat, Omat: TNNetVolume;
+  Neuron: TNNetNeuron;
+begin
+  MaxNeurons := FNeurons.Count - 1;
+  if MaxNeurons < 0 then exit;
+  lr := FLearningRate;
+  if lr = 0 then begin ClearDeltas(); exit; end;
+  invNegLr := -1.0 / lr;
+
+  // Muon operates on the FanOut x FanIn weight matrix where neuron n owns row n
+  // (a flat FanIn-length Weights row: SizeX = Size, SizeY = Depth = 1). Other
+  // layouts (conv kernels with SizeY/Depth > 1, single-row matrices) are NOT
+  // 2-D weight matrices in Muon's sense and fall back to SGD-momentum.
+  Rows := MaxNeurons + 1;
+  Cols := FNeurons[0].FWeights.Size;
+  IsMatrix := (Rows > 1) and (Cols > 1) and
+              (FNeurons[0].FWeights.SizeY = 1) and
+              (FNeurons[0].FWeights.Depth = 1);
+  for NIdx := 0 to MaxNeurons do
+    if FNeurons[NIdx].FWeights.Size <> Cols then
+      IsMatrix := false;
+
+  // Ensure each neuron's single momentum buffer matches its weight shape.
+  for NIdx := 0 to MaxNeurons do
+    if FNeurons[NIdx].FBackInertia.Size <> FNeurons[NIdx].FWeights.Size then
+    begin
+      FNeurons[NIdx].FBackInertia.ReSize(FNeurons[NIdx].FWeights);
+      FNeurons[NIdx].FBackInertia.Fill(0);
+    end;
+
+  if not IsMatrix then
+  begin
+    // SGD-momentum fallback for non-matrix params (biases, conv kernels, etc.):
+    //   m <- mu*m + g ;  FDelta <- -lr*m  (g recovered from FDelta = -lr*g).
+    for NIdx := 0 to MaxNeurons do
+    begin
+      Neuron := FNeurons[NIdx];
+      for W := 0 to Neuron.FDelta.Size - 1 do
+      begin
+        g := Neuron.FDelta.FData[W] * invNegLr;
+        Neuron.FBackInertia.FData[W] := Momentum * Neuron.FBackInertia.FData[W] + g;
+        Neuron.FDelta.FData[W] := -lr * Neuron.FBackInertia.FData[W];
+      end;
+      // Bias uses the scalar momentum buffer.
+      g := Neuron.FBiasDelta * invNegLr;
+      Neuron.FBiasInertia := Momentum * Neuron.FBiasInertia + g;
+      Neuron.FBiasDelta := -lr * Neuron.FBiasInertia;
+    end;
+    exit;
+  end;
+
+  // --- 2-D weight matrix: orthogonalized momentum (Muon) ---
+  Scale := Sqrt(Max(Rows, Cols));
+  Mmat := TNNetVolume.Create();
+  Omat := TNNetVolume.Create();
+  try
+    Mmat.ReSize(Rows * Cols, 1, 1);
+    // M <- mu*M + G  (G = -FDelta/lr; the constant lr folds into the step scale
+    // below, so we accumulate -FDelta into the momentum buffer directly).
+    for NIdx := 0 to MaxNeurons do
+    begin
+      Neuron := FNeurons[NIdx];
+      for W := 0 to Cols - 1 do
+      begin
+        Neuron.FBackInertia.FData[W] :=
+          Momentum * Neuron.FBackInertia.FData[W] - Neuron.FDelta.FData[W];
+        Mmat.FData[NIdx * Cols + W] := Neuron.FBackInertia.FData[W];
+      end;
+    end;
+
+    MuonNewtonSchulz5(Omat, Mmat, Rows, Cols, NSIters);
+
+    // FDelta <- -lr * sqrt(max(rows,cols)) * O_row, so UpdateWeightsAdam applies
+    // W <- W - lr*Scale*O. Biases (1-D) get the SGD-momentum fallback.
+    for NIdx := 0 to MaxNeurons do
+    begin
+      Neuron := FNeurons[NIdx];
+      for W := 0 to Cols - 1 do
+        Neuron.FDelta.FData[W] := -lr * Scale * Omat.FData[NIdx * Cols + W];
+      g := Neuron.FBiasDelta * invNegLr;
+      Neuron.FBiasInertia := Momentum * Neuron.FBiasInertia + g;
+      Neuron.FBiasDelta := -lr * Neuron.FBiasInertia;
+    end;
+  finally
+    Mmat.Free; Omat.Free;
+  end;
 end;
 
 function TNNetLayer.InitBasicPatterns(): TNNetLayer;

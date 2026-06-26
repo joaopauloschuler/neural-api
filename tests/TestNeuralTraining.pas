@@ -30,6 +30,8 @@ type
     procedure TestLionOptimizer;
     procedure TestAdafactorOptimizer;
     procedure TestAdafactorUsesFewerBuffersThanAdam;
+    procedure TestMuonOptimizer;
+    procedure TestMuonOrthogonalizesUpdate;
     
     // Gradient checking
     procedure TestGradientNotZero;
@@ -796,6 +798,135 @@ begin
   finally
     AdamNN.Free;
     FactorNN.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestMuonOptimizer;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  I: integer;
+  InitialError, FinalError: TNeuralFloat;
+begin
+  // Drives the actual Muon update path (TNNet.CalcMuonDelta -> UpdateWeightsAdam)
+  // exactly as TNeuralOptimizerMuon.Optimize does, minus the fit-level clipping.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  Desired := TNNetVolume.Create(2, 1, 1);
+  try
+    NN.AddLayer([
+      TNNetInput.Create(4),
+      TNNetFullConnectReLU.Create(8),  // 8x4 weight matrix (orthogonalized)
+      TNNetFullConnectLinear.Create(2) // 2x8 weight matrix (orthogonalized)
+    ]);
+    NN.SetLearningRate(0.01, 0.9);
+    NN.SetBatchUpdate(true); // optimizer mode: backprop accumulates into Delta
+    NN.ClearInertia();       // Muon init: single momentum buffer zeroed.
+
+    Input.Fill(0.5);
+    Desired.Fill(0.8);
+
+    NN.Compute(Input);
+    InitialError := NN.GetLastLayer.Output.SumDiff(Desired);
+
+    for I := 1 to 100 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+      NN.CalcMuonDelta(0.95, 5);
+      NN.UpdateWeightsAdam();
+    end;
+
+    NN.Compute(Input);
+    FinalError := NN.GetLastLayer.Output.SumDiff(Desired);
+
+    AssertTrue('Muon should reduce error', FinalError < InitialError);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestMuonOrthogonalizesUpdate;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Layer: TNNetLayer;
+  Rows, Cols, R, C, K: integer;
+  O: TNNetVolume;
+  GramDiag, OffDiag, dot, expected, scale: TNeuralFloat;
+begin
+  // After one Muon step the per-neuron FDelta rows form an (approximately)
+  // semi-orthogonal matrix O (scaled by -lr*sqrt(max(rows,cols))). We pack the
+  // delta rows, undo the scale, and assert the Gram matrix O O^T (Rows<=Cols
+  // here) is close to the identity: diagonal ~1, off-diagonals small. This is
+  // the orthogonality guarantee of the Newton-Schulz orthogonalizer.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 1, 1);
+  Desired := TNNetVolume.Create(4, 1, 1);
+  O := TNNetVolume.Create();
+  try
+    NN.AddLayer([
+      TNNetInput.Create(8),
+      TNNetFullConnectLinear.Create(4) // 4x8 weight matrix
+    ]);
+    NN.SetLearningRate(0.01, 0.9);
+    NN.SetBatchUpdate(true);
+    NN.ClearInertia();
+
+    // A single sample's weight gradient is rank-1 (outer(error,input)); to get a
+    // FULL-rank (4xN) gradient matrix so orthogonalization can lift every
+    // singular value toward 1, accumulate several distinct samples in batch
+    // mode before computing the Muon step.
+    NN.ClearDeltas();
+    for K := 0 to 11 do
+    begin
+      for C := 0 to 7 do Input.FData[C] := Sin(0.7*K + 1.3*C) + 0.2*C;
+      for R := 0 to 3 do Desired.FData[R] := Cos(1.1*K + 0.9*R);
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.CalcMuonDelta(0.0, 5); // momentum 0 -> M = G; pure orthogonalized G
+
+    Layer := NN.Layers[1];
+    Rows := Layer.Neurons.Count;          // 4
+    Cols := Layer.Neurons[0].Weights.Size; // 8
+    AssertEquals('Muon test expects 4 rows', 4, Rows);
+    AssertEquals('Muon test expects 8 cols', 8, Cols);
+
+    // Pack the (scaled) update rows and undo the -lr*sqrt(max) scale.
+    scale := -0.01 * Sqrt(Cols);
+    O.ReSize(Rows * Cols, 1, 1);
+    for R := 0 to Rows - 1 do
+      for C := 0 to Cols - 1 do
+        O.FData[R * Cols + C] := Layer.Neurons[R].Delta.FData[C] / scale;
+
+    // Gram diagonal/off-diagonal of O O^T (Rows x Rows).
+    GramDiag := 0; OffDiag := 0;
+    for R := 0 to Rows - 1 do
+      for C := 0 to Rows - 1 do
+      begin
+        dot := 0;
+        for K := 0 to Cols - 1 do
+          dot := dot + O.FData[R * Cols + K] * O.FData[C * Cols + K];
+        if R = C then expected := 1.0 else expected := 0.0;
+        if R = C then GramDiag := GramDiag + Abs(dot - expected)
+        else OffDiag := OffDiag + Abs(dot - expected);
+      end;
+    GramDiag := GramDiag / Rows;            // mean |diag - 1|
+    OffDiag := OffDiag / (Rows*Rows - Rows); // mean |off-diag|
+
+    // The 5-step quintic is semi-orthogonal (singular values in ~[0.7,1.3]),
+    // so the diagonal lands near 1 and the off-diagonals near 0, but NOT
+    // exactly. Generous bands assert the orthogonalization actually happened.
+    AssertTrue('Muon update Gram diagonal near 1', GramDiag < 0.5);
+    AssertTrue('Muon update Gram off-diagonal near 0', OffDiag < 0.4);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+    O.Free;
   end;
 end;
 

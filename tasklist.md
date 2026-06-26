@@ -542,9 +542,15 @@ rather than acted on.
       header): optional first-moment beta1 EMA + update RMS clipping; LR comes from
       the host fit schedule, not Adafactor's internal relative-step rule.
       REMAINING:
-  - [ ] Muon optimizer class for 2-D weight matrices (a hand-rolled Muon
+  - [X] Muon optimizer class for 2-D weight matrices (a hand-rolled Muon
         gradient-surgery demo already exists in examples/MuonOptimizer; the
         TNeuralOptimizer subclass port is what's missing).
+        DONE: TNeuralOptimizerMuon (neuralfit.pas) + TNNet/TNNetLayer.CalcMuonDelta
+        (neuralnetwork.pas); single momentum buffer (FBackInertia, like Lion),
+        Newton-Schulz orthogonalized step on FullConnect/linear matrices,
+        SGD-momentum fallback on non-matrix params (biases, conv kernels).
+        Tests TestMuonOptimizer + TestMuonOrthogonalizesUpdate; example
+        MuonOptimizer refactored to drive the library path.
   - [ ] optional Adafactor follow-up: the omitted first-moment beta1 EMA + update
         RMS clipping + internal relative-step LR rule if a real fine-tune needs them.
 - [ ] Trainer callbacks API (transformers TrainerCallback port): a
