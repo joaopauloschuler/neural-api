@@ -459,6 +459,7 @@ type
     procedure TestDiTSchedulerSmoke;
     procedure TestVARConfigFromJSONFile;
     procedure TestVARParity;
+    procedure TestVARGenerateSmoke;
     procedure TestPixArtConfigFromJSONFile;
     procedure TestPixArtParity;
     procedure TestMMDiTConfigFromJSONFile;
@@ -19377,6 +19378,84 @@ begin
     TokInput.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// End-to-end smoke for the VAR coarse-to-fine next-scale SAMPLING loop
+// (VARGenerate) + the residual/discrete VQ decode to pixels
+// (DecodeVARTokensToImage), the same chain examples/VARGenerate runs. Uses the
+// pico VAR fixture (random weights) and the MATCHED pico VQModel
+// (tiny_var_vqmodel.*, latent grid 3 = VAR final patch_num, codebook 12 = VAR
+// vocab). With a fixed seed the loop must:
+//   - return a full SeqLen (14) token sequence with every token a legal vocab
+//     id and every legal VQ id;
+//   - decode that final 3x3 grid to a finite 6x6x3 RGB image;
+//   - be DETERMINISTIC across two runs at the same seed (greedy argmax).
+// This is a wiring/regression smoke (random weights -> not a real image), the
+// online-budget counterpart of TestLatentTextToImageSmoke. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestVARGenerateSmoke;
+var
+  VarNet: TNNet;
+  VarCfg: TVARConfig;
+  VqModel: TNNetVqModel;
+  VqCfg: TVqModelConfig;
+  Tokens, Tokens2: TNeuralIntegerArray;
+  Image: TNNetVolume;
+  i, FinalP, FinalStart: integer;
+  AllFinite, Deterministic: boolean;
+begin
+  VarNet := BuildVARFromSafeTensors(FixturePath('tiny_var.safetensors'), VarCfg,
+    {pTrainable=}false, FixturePath('tiny_var_config.json'));
+  VqModel := BuildVqModelFromSafeTensors(
+    FixturePath('tiny_var_vqmodel.safetensors'), VqCfg, {pTrainable=}false,
+    FixturePath('tiny_var_vqmodel_config.json'));
+  Image := TNNetVolume.Create;
+  try
+    AssertTrue('VAR net built', VarNet <> nil);
+    AssertTrue('VQ model built', VqModel <> nil);
+    FinalP := VarCfg.PatchNums[VarCfg.NumScales - 1];
+    AssertEquals('VQ grid = VAR final patch_num', FinalP, VqCfg.LatentGrid);
+    AssertTrue('VQ codebook >= VAR vocab',
+      VqCfg.NumVqEmbeddings >= VarCfg.VocabSize);
+
+    // ---- the coarse-to-fine next-scale sampling loop (greedy, deterministic) ----
+    RandSeed := 424242;
+    VARGenerate(VarNet, VarCfg, {ClassId=}0, Tokens, {Temperature=}0.0);
+    AssertEquals('token sequence length = SeqLen', VarCfg.SeqLen, Length(Tokens));
+    for i := 0 to High(Tokens) do
+    begin
+      AssertTrue('token ' + IntToStr(i) + ' >= 0', Tokens[i] >= 0);
+      AssertTrue('token ' + IntToStr(i) + ' < vocab', Tokens[i] < VarCfg.VocabSize);
+    end;
+
+    // ---- residual/discrete VQ decode of the final 3x3 token grid -> RGB ----
+    DecodeVARTokensToImage(VqModel, VarCfg, Tokens, Image);
+    AssertEquals('decoded image grid X', FinalP * 2, Image.SizeX);
+    AssertEquals('decoded image grid Y', FinalP * 2, Image.SizeY);
+    AssertEquals('decoded image channels', 3, Image.Depth);
+    AllFinite := true;
+    for i := 0 to Image.Size - 1 do
+      if (Image.FData[i] <> Image.FData[i]) or (Abs(Image.FData[i]) > 1e30) then
+        AllFinite := false;
+    AssertTrue('decoded image finite', AllFinite);
+
+    // ---- determinism: greedy argmax must repeat bit-for-bit at the same seed ----
+    RandSeed := 424242;
+    VARGenerate(VarNet, VarCfg, {ClassId=}0, Tokens2, {Temperature=}0.0);
+    AssertEquals('second run same length', Length(Tokens), Length(Tokens2));
+    Deterministic := true;
+    for i := 0 to High(Tokens) do
+      if Tokens[i] <> Tokens2[i] then Deterministic := false;
+    AssertTrue('greedy VARGenerate is deterministic', Deterministic);
+
+    // The final-scale tokens (the decoded VQ grid) are the last FinalP^2 entries.
+    FinalStart := VARScaleStart(VarCfg, VarCfg.NumScales - 1);
+    AssertEquals('final scale start offset', VarCfg.SeqLen - FinalP * FinalP,
+      FinalStart);
+  finally
+    Image.Free;
+    VqModel.Free;
+    VarNet.Free;
   end;
 end;
 

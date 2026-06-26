@@ -8560,6 +8560,34 @@ function VARTokenInput(Net: TNNet): TNNetLayer;
 function VARScaleInput(Net: TNNet): TNNetLayer;
 function VARClassInput(Net: TNNet): TNNetLayer;
 
+// The COARSE-TO-FINE next-scale autoregressive SAMPLING loop. Given a built VAR
+// net (BuildVAR*) and its Config, generates the full multi-scale token sequence
+// for class label ClassId, ONE pyramid level at a time:
+//   for scale s = 0 .. NumScales-1:
+//     - run the forward over the partially-filled token-index sequence (tokens
+//       of earlier scales already sampled, later scales still zero);
+//     - read the per-token next-scale logits at scale s's positions;
+//     - sample (Temperature<=0 -> argmax; else softmax(logits/Temperature) draw)
+//       the VocabSize-way token for every position of scale s;
+//     - write those tokens back into the sequence so the FINER scales attend to
+//       them through the scale-block-causal mask.
+// Returns the flat (SeqLen) token-index sequence in OutTokens. The final scale's
+// PatchNums[K-1]^2 tokens are the VQ token grid for DecodeVARTokensToImage.
+//
+// NOTE on faithfulness: canonical FoundationVision/var carries the cross-scale
+// residual-VQ feature accumulation (next-scale interpolation/up-sampling of the
+// running f_hat) INSIDE the VQ tokenizer that produces the input embeddings;
+// this importer's input contract is plain codebook INDICES embedded by
+// word_embed, so the coarse->fine information flow here is carried purely by the
+// transformer attention over the already-sampled coarser tokens. With the pico
+// fixture (random weights) the output is a wiring SMOKE, not a real image.
+// Coded by Claude (AI).
+procedure VARGenerate(Net: TNNet; const Config: TVARConfig; ClassId: integer;
+  out OutTokens: TNeuralIntegerArray; Temperature: TNeuralFloat = 0.0);
+
+// (DecodeVARTokensToImage is declared after TNNetVqModel, below the VQModel
+// importer, since it consumes a TNNetVqModel.)
+
 // ===========================================================================
 // PixArt-alpha IMPORT (text-conditioned Diffusion Transformer, Chen et al.
 // 2023, "PixArt-alpha: Fast Training of Diffusion Transformer for
@@ -8893,6 +8921,15 @@ function BuildVqModelFromSafeTensorsEx(const FileName: string;
 function BuildVqModelFromSafeTensors(const FileName: string;
   out Config: TVqModelConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNetVqModel;
+
+// Maps the VAR final-scale tokens (the last PatchNums[K-1]^2 entries of a
+// VARGenerate sequence) into the VqModel's row-major LatentGrid x LatentGrid
+// token grid and decodes them to an RGB image via VqModel.DecodeTokensToImage.
+// Requires VqModel.Config.LatentGrid = PatchNums[K-1] (matched fixtures) and
+// VqModel.Config.NumVqEmbeddings >= VocabSize. Coded by Claude (AI).
+procedure DecodeVARTokensToImage(VqModel: TNNetVqModel;
+  const Config: TVARConfig; const Tokens: array of integer;
+  OutImage: TNNetVolume);
 
 // ---------------------------------------------------------------------------
 // REAL-ESRGAN / ESRGAN SUPER-RESOLUTION IMPORT (RRDBNet, e.g.
@@ -62690,6 +62727,119 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadVARConfigFromJSONFile(ConfigPath);
   Result := BuildVARFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+procedure VARGenerate(Net: TNNet; const Config: TVARConfig; ClassId: integer;
+  out OutTokens: TNeuralIntegerArray; Temperature: TNeuralFloat = 0.0);
+var
+  TokInput, Logits: TNNetVolume;
+  s, Start, Stop, pos, v, BestV, ScalesM1, VocabM1: integer;
+  Best, LogitVal, MaxLogit, SumExp, Draw, Acc: TNeuralFloat;
+  Probs: array of TNeuralFloat;
+begin
+  if (ClassId < 0) or (ClassId >= Config.NumClasses) then
+    ImportError('VARGenerate: class id ' + IntToStr(ClassId) +
+      ' out of range [0,' + IntToStr(Config.NumClasses - 1) + '].');
+  SetLength(OutTokens, Config.SeqLen);
+  for pos := 0 to Config.SeqLen - 1 do OutTokens[pos] := 0;
+  SetLength(Probs, Config.VocabSize);
+  TokInput := TNNetVolume.Create;
+  try
+    TokInput.ReSize(Config.SeqLen, 1, 1);
+    // The class token (input2) is fixed for the whole generation.
+    VARClassInput(Net).Output.FData[0] := ClassId;
+    ScalesM1 := Config.NumScales - 1;
+    VocabM1 := Config.VocabSize - 1;
+    for s := 0 to ScalesM1 do
+    begin
+      // Feed the partially-filled token sequence (earlier scales sampled,
+      // later scales still zero) and the static scale-id side channel.
+      for pos := 0 to Config.SeqLen - 1 do
+        TokInput.FData[pos] := OutTokens[pos];
+      VARFillScaleIds(Net, Config);  // re-fill: Compute may resize buffers.
+      Net.Compute(TokInput);
+      Logits := Net.GetLastLayer().Output;  // (SeqLen,1,VocabSize)
+      // Sample the tokens of scale s at scale s's own positions.
+      Start := VARScaleStart(Config, s);
+      Stop := VARScaleStart(Config, s + 1) - 1;
+      for pos := Start to Stop do
+      begin
+        if Temperature <= 0.0 then
+        begin
+          // Greedy argmax over the vocab logits.
+          BestV := 0;
+          Best := Logits.FData[pos * Config.VocabSize];
+          for v := 1 to VocabM1 do
+          begin
+            LogitVal := Logits.FData[pos * Config.VocabSize + v];
+            if LogitVal > Best then begin Best := LogitVal; BestV := v; end;
+          end;
+          OutTokens[pos] := BestV;
+        end
+        else
+        begin
+          // Temperature softmax sample (stable: subtract max, cumulative draw).
+          MaxLogit := Logits.FData[pos * Config.VocabSize];
+          for v := 1 to VocabM1 do
+          begin
+            LogitVal := Logits.FData[pos * Config.VocabSize + v];
+            if LogitVal > MaxLogit then MaxLogit := LogitVal;
+          end;
+          SumExp := 0;
+          for v := 0 to VocabM1 do
+          begin
+            Probs[v] := Exp((Logits.FData[pos * Config.VocabSize + v] - MaxLogit)
+              / Temperature);
+            SumExp := SumExp + Probs[v];
+          end;
+          Draw := Random * SumExp;
+          Acc := 0;
+          BestV := VocabM1;
+          for v := 0 to VocabM1 do
+          begin
+            Acc := Acc + Probs[v];
+            if Draw <= Acc then begin BestV := v; Break; end;
+          end;
+          OutTokens[pos] := BestV;
+        end;
+      end;
+    end;
+  finally
+    TokInput.Free;
+  end;
+end;
+
+procedure DecodeVARTokensToImage(VqModel: TNNetVqModel;
+  const Config: TVARConfig; const Tokens: array of integer;
+  OutImage: TNNetVolume);
+var
+  FinalP, FinalCnt, Start, i, Id, VqM1: integer;
+  Grid: TNeuralIntegerArray;
+begin
+  FinalP := Config.PatchNums[Config.NumScales - 1];
+  FinalCnt := FinalP * FinalP;
+  if VqModel.Config.LatentGrid <> FinalP then
+    ImportError('DecodeVARTokensToImage: VqModel latent grid ' +
+      IntToStr(VqModel.Config.LatentGrid) + ' must equal VAR final patch_num ' +
+      IntToStr(FinalP) + '.');
+  if VqModel.Config.NumVqEmbeddings < Config.VocabSize then
+    ImportError('DecodeVARTokensToImage: VqModel codebook (' +
+      IntToStr(VqModel.Config.NumVqEmbeddings) + ') smaller than VAR vocab (' +
+      IntToStr(Config.VocabSize) + ').');
+  if Length(Tokens) < Config.SeqLen then
+    ImportError('DecodeVARTokensToImage: need a full SeqLen token sequence.');
+  Start := VARScaleStart(Config, Config.NumScales - 1);
+  VqM1 := VqModel.Config.NumVqEmbeddings - 1;
+  SetLength(Grid, FinalCnt);
+  for i := 0 to FinalCnt - 1 do
+  begin
+    Id := Tokens[Start + i];
+    if (Id < 0) or (Id > VqM1) then
+      ImportError('DecodeVARTokensToImage: token id ' + IntToStr(Id) +
+        ' out of VqModel codebook range.');
+    Grid[i] := Id;  // row-major (y*FinalP + x), same layout as VqModel decode.
+  end;
+  VqModel.DecodeTokensToImage(Grid, OutImage);
 end;
 
 // ============================ PixArt-alpha IMPORT ==========================

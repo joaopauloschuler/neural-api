@@ -1074,11 +1074,22 @@ rather than acted on.
 - [ ] VAR (Visual AutoRegressive, next-scale prediction) image-generation follow-ups
       (class-conditional v1 LANDED — BuildVARFromSafeTensors[Ex] + ReadVARConfigFromJSONFile
       + the TNNetScaledDotProductAttention.BlockCausalSegments scale-mask flag):
-  - [ ] VAR full multi-scale autoregressive SAMPLING loop (next-scale interpolation/
+  - [X] VAR full multi-scale autoregressive SAMPLING loop (next-scale interpolation/
         up-sampling between predicted levels + residual-VQ decode to pixels via the
-        landed BuildVqModelFromSafeTensors family) + an examples/VARGenerate demo. v1
-        only runs the forward producing one scale's logits; the coarse-to-fine
-        generation loop and pixel decode are deferred.
+        landed BuildVqModelFromSafeTensors family) + an examples/VARGenerate demo.
+        LANDED: VARGenerate (coarse-to-fine: per scale, forward over the partially-
+        filled multi-scale token sequence, read next-scale logits at the scale's
+        positions, argmax/temperature-sample, write back so finer scales attend via
+        the scale-block-causal mask) + DecodeVARTokensToImage (final-scale token grid
+        -> VqModel discrete decode to pixels) in neuralpretrained.pas; examples/
+        VARGenerate (.lpr/.lpi, P6 PPM) on the pico VAR + MATCHED pico VQ fixtures
+        (tools/make_pico_var_vqmodel_fixture.py, latent grid 3 = final patch_num,
+        codebook 12 = vocab); TestVARGenerateSmoke (deterministic shape + finite
+        image). Random-weight wiring SMOKE (not a real image). Note: the input
+        contract is plain codebook INDICES embedded by word_embed, so the cross-scale
+        residual-VQ feature accumulation (canonical f_hat up-sampling inside the VQ
+        tokenizer) is carried here purely by transformer attention over sampled
+        coarser tokens — full residual-VQ-tokenizer input embedding is a follow-up.
   - [ ] VAR text-conditioned (Infinity-style) variant — replace the single class token
         with caller-supplied text encoder states + cross-attention (the PixArt-style
         text-cond path), the analogue of the DiT->PixArt step.
