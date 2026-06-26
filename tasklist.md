@@ -863,41 +863,6 @@ rather than acted on.
         real-data accuracy number (the synthetic smoke is trivially separable —
         validation saturates at epoch 2 — so it proves the path, not a hard
         benchmark).
-  - [X] a harder synthetic task (overlapping classes / lower SNR / more keywords)
-        so the smoke trains for more than ~2 epochs before validation hits the
-        default TargetAccuracy and early-stops. DONE (commit 1e3cbfc): 6 -> 10
-        confusable classes (closely-spaced 430/470/510 Hz tones, two overlapping
-        two-tone chords, an AM tremolo tone, fast up/down chirps, two colored-noise
-        tilts) at low SNR (noiseAmp 0.18); validation now climbs gradually and
-        early-stops at epoch 17 (was ~2); held-out test acc 98.93% (chance 10%),
-        ~1m50s within ulimit -v 3000000.
-  - [X] a 16 kHz resampler in neuralaudio so `--full` accepts non-16 kHz WAVs
-        directly instead of requiring an ffmpeg pre-pass. DONE (commit 1e3cbfc):
-        windowed-sinc (Lanczos, 4-lobe) ResampleVolume / ResampleVolumeTo16k /
-        LoadWavResampledToVolume in neuralaudio.pas (downsample cutoff folds in the
-        anti-alias low-pass; equal-rate is a bit-identical Move fast path);
-        WhisperLogMelFromWavFile gained an opt-out Resample param; --full now uses
-        LoadWavResampledToVolume so any sample rate loads. 4 tests in
-        TestNeuralAudio (identity, 44.1k->16k length, 8k->16k 2x, 440 Hz
-        zero-crossing preservation, disk round-trip); suite 2277/0/0.
-- [X] KV-cache O(1) incremental decode for the Moonshine decoder (self-attn cache +
-      cross-attn states are constant across steps; reuse the SDPA Begin/EndIncrementalDecode
-      machinery) so long transcripts don't re-run the whole prefix each step. DONE
-      (commit 3b5430f): DecodeMoonshineGreedyCached in neural/neuraldecode.pas — a
-      focused reusable helper built on the existing TNNetStreamingDecoder session
-      API (no new class, no SDPA changes). Encode the waveform once, copy encoder
-      hidden states into the decoder's 2nd TNNetInput (constant -> cross-attn
-      re-reads unchanged), arm every self-attn SDPA's incremental KV cache +
-      partial-RoPE PositionOffset, prefill the start token at abs-pos 0, then feed
-      one new token per step. CRITICAL: the cached decoder must be built at
-      DecSeqLen=1 (width-1 token input) or TNNet.Compute rejects the step volume;
-      the helper raises EArgumentException otherwise. Bit-identical to the old
-      O(L^2) re-encode loop (TestMoonshineKVCacheDecodeParity, token-for-token);
-      wired into examples/MoonshineTranscribe.
-      OPEN follow-up: a GENERAL forced-prefix seq2seq decode + decoder KV cache
-      helper (this one is Moonshine-specific because the audio encoder takes a raw
-      waveform, not token ids, so DecodeSeq2SeqGreedy's token path doesn't apply) —
-      see the Whisper-style "Forced-prefix seq2seq decode + KV cache" task above.
 - [ ] Whisper word-timestamp follow-ups (v1 landed, scoped to one 30 s
       greedy window). DONE in commit d0b27b9: (a)(e)(d) + partial (c) —
       (a) median-filter smoothing (WhisperMedianFilterRow, odd-kernel reflect-
