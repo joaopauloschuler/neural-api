@@ -703,51 +703,6 @@ rather than acted on.
       existing parity tests (TestHiFiGANSynthesisParity / TestVitsSynthesisParity /
       EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
       before/after.
-- [X] Bark text-to-speech importer (`BuildBarkFromSafeTensors[Ex]` + `TBarkConfig`
-      / `ReadBarkConfigFromJSONFile` + `BarkConfigToString`, model_type `bark`).
-      LANDED in neuralpretrained.pas: a self-contained `TBarkModel` holder of three
-      `TBarkSubModel`s (semantic, coarse, fine). NO new leaf layer — each sub-model is
-      a pre-norm GPT-2 block stack reusing `TNNetLearnedPositionalEmbedding` +
-      `AddMultiHeadSelfAttention` + `TNNetTokenLayerNorm` with exact-erf `nn.GELU`. New
-      wiring: a transpose-free `LoadLinearWeights` (Bark `nn.Linear` `[out,in]` vs
-      GPT-2's HF `Conv1D` `[in,out]`, biases gated by `config.bias`, bias-free
-      `lm_head`s); the fine model's merged input embedding (one table per codebook,
-      `n_codes_total` tables / `n_codes_total-n_codes_given` heads, summing codebook
-      embeddings `0..idx` and running BIDIRECTIONAL over time — `ComputeFineLogits`
-      matches HF `BarkFineModel.forward`). The holder runs the embedding (incl. the
-      fine codebook-sum) + head matmul in Pascal; the trunk is a TNNet (pos + blocks +
-      ln_f). EnCodec decode tail reuses the landed MusicGen `tiny_musicgen_encodec.*`
-      codec. Pico parity (`tools/make_pico_bark_fixture.py`, `TestBarkParity`, fixtures
-      `tests/fixtures/tiny_bark_*`): all THREE sub-models' forward logits match the HF
-      float64 oracle to max|diff| ~0 (SEMANTIC, COARSE, FINE all PASS < 1e-4; the
-      generator's self-checks prove the positional embedding, fine codebook
-      conditioning, and fine bidirectional-over-time attention each move the oracle).
-      `examples/BarkTTS` runs SEMANTIC->COARSE->FINE->EnCodec end-to-end and writes a
-      WAV via `SaveVolumeToWav16` (untrained random weights -> noise). Real suno/bark
-      checkpoint key-mapping (one nested checkpoint with `semantic`/`coarse_acoustics`/
-      `fine_acoustics` prefixes), a real tokenizer + voice prompt, and full
-      autoregressive sampling are network/RAM-gated follow-ups.
-- [X] DAC (Descript Audio Codec) neural-codec importer (`BuildDACFromSafeTensors[Ex]`
-      + `TDACConfig` / `ReadDACConfigFromJSONFile` + `DACConfigToString`, model_type
-      `dac`, the HF `DacModel`). LANDED in neuralpretrained.pas: a self-contained
-      channel-major `TNNetDAC` holder (`Encode`/`Decode`/`Reconstruct`, double-
-      precision signal, F32 weights) reusing `TEnCodecConv`/`TEnCodecMat` with its
-      own SYMMETRIC/non-causal conv runner `RunDACConv` (Conv1d pads both sides;
-      ConvTranspose trims both ends). NO new leaf layer: the in-tree `TNNetSnake` is
-      a parameter-free scalar, so the holder applies DAC's learnable PER-CHANNEL
-      snake `x + (1/(α+1e-9))·sin(α·x)²` directly (per-channel α loaded from the
-      `(1,C,1)` tensors). FACTORIZED L2-normalized RVQ: `in_proj`(1×1)→L2-norm latent
-      & codebook→argmax cosine→raw codebook lookup→`out_proj`(1×1)→add to sum,
-      subtract from residual in full hidden space; decode-from-codes sums
-      `out_proj(codebook[code])`. `LoadDACConv` handles fused `.weight` OR weight_norm
-      (`parametrizations.weight.original0/1` / legacy `weight_g`/`weight_v`).
-      Pico fixture `tools/make_pico_dac_fixture.py` (committed `tests/fixtures/tiny_dac.*`,
-      float64 HF oracle); `TestDACRoundTripParity` (in TestNeuralPretrained.pas)
-      OBSERVED: codes match the oracle EXACTLY (max code diff 0), reconstructed
-      waveform max |diff| ≈ 9.1e-10 (gate < 1e-4). `examples/DACRoundTrip`
-      (.lpr+.lpi+README) round-trips a synthesized tone to a WAV via
-      `SaveVolumeToWav16`. DEFERRED follow-up: real 44 kHz / 16 kHz checkpoint parity
-      (download). This unblocks the Parler-TTS importer below (DAC is its decode backend).
 - [ ] Parler-TTS importer (`BuildParlerTTSFromSafeTensors[Ex]` + `TParlerConfig`,
       model_type `parler_tts`, e.g. parler-tts/parler-tts-mini-v1) — description-
       conditioned TTS: a (By)T5 text encoder (reuse `BuildT5FromSafeTensors`) encodes
@@ -755,40 +710,11 @@ rather than acted on.
       landed seq2seq cross-attention decoder stack — the same shape as the Marian/T5
       decoder) autoregressively predicts the DELAY-PATTERNED multi-codebook DAC codes
       conditioned on both the description and the transcript prompt tokens, and the
-      DAC decoder (task above) renders the waveform. New wiring is the delay-pattern
+      landed DAC decoder renders the waveform. New wiring is the delay-pattern
       code interleave/de-interleave and the dual-prompt (description + transcript)
-      input. Depends on the DAC importer landing first. Pico parity `< 1e-4` vs a
+      input. Pico parity `< 1e-4` vs a
       float64 oracle (`tools/make_pico_parler_fixture.py`, `TestParlerTTSParity`),
       `examples/ParlerTTS`.
-- [X] MERT music-representation encoder importer (`BuildMERTFromSafeTensors[Ex]` +
-      `TMERTConfig`, model_type `mert_model`/`music2vec`, e.g. m-a-p/MERT-v1-95M) — a
-      self-supervised MUSIC understanding encoder (the audio analogue of a frozen
-      vision backbone): a HuBERT-style 1D-conv feature front-end + transformer trunk,
-      exposing the deep weighted-layer-sum of hidden states as a fixed music
-      embedding. LANDED (`neuralpretrained.pas`): verified MERT-v1-95M (config
-      `feature_extractor_cqt=false`, `attention_relax=-1.0`, `deepnorm=false`,
-      `do_stable_layer_norm=false`) is architecturally IDENTICAL to HuBERT for the
-      forward, so the importer is PURE REUSE of the Wav2Vec2/HuBERT conv front-end +
-      POST-LN transformer trunk (`LoadWav2Vec2FeatureConv`/`LoadWav2Vec2PosConv`/
-      `LoadLlamaLinearWeights`/`LoadLayerNormWeights`) — NO new leaf layer. Deltas:
-      tensors at the TOP level (no `hubert.`/`wav2vec2.` prefix — MERTModel IS the
-      backbone), NO CTC head, and the MERT-specific WEIGHTED-LAYER-SUM
-      (`use_weighted_layer_sum`): the builder records the `num_hidden_layers+1`
-      hidden-state layers in an out array and `MERTWeightedLayerSum` pools them with
-      the softmax of `TMERTConfig.LayerWeights` (default uniform; base MERTModel ships
-      none) then a mean over frames (the HF `*ForSequenceClassification`
-      pooled_output). `ReadMERTConfigFromJSONFile`/`MERTConfigToString`/
-      `MERTEncoderLength`. Fixture is a committed RE-RANDOMIZED pico
-      HubertModel-with-weighted-layer-sum float64 oracle (`tools/
-      make_pico_mert_fixture.py` → `tests/fixtures/tiny_mert.*`; the real
-      m-a-p/MERT-v1-95M `pytorch_model.bin` download is a deferred follow-up).
-      `TestMERTParity` (+ `TestMERTConfigFromJSONFile`) pins the last_hidden_state
-      (max|diff| 2.27e-6), EACH raw transformer hidden state (2.56e-6, catches a
-      trunk transpose), AND the weighted-layer-sum embedding (2.40e-6) — all `< 1e-4`.
-      `examples/MusicTagging` prints the embedding + `CosineSimilarity` of two
-      synthesized clips. Follow-ups: MERT-v1-330M CQT-fused front-end
-      (`feature_extractor_cqt=true`), relaxed-attention / DeepNorm variants, and the
-      real-checkpoint download (all loudly rejected for now).
 - [ ] VITS / MMS-TTS end-to-end text-to-speech importer (`BuildVitsFromSafeTensors[Ex]`
       LANDED + `ReadVitsConfigFromJSONFile`/`VitsConfigToString` + the `TVitsConfig`
       record + the `TNNetVits` channel-major holder (Analyze / ExpandPrior /
