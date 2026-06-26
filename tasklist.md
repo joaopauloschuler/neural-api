@@ -685,10 +685,19 @@ rather than acted on.
       position and run each output channel as one contiguous TNNetVolume.DotProduct;
       all 17 audio parity tests stay < 1e-4 on both scalar-fallback and real -dAVX2
       builds. REMAINING:
-  - [ ] TNNetMimi (RunMimiConv) — left scalar: it uses a DOUBLE-precision
-        accumulator (TMimiDblArr2D); single-precision AVX DotProduct would be a
-        genuine precision regression vs a benign reassociation. Needs a
-        double-accumulate vectorized primitive or a parity re-pin before touching.
+  - [X] TNNetMimi (RunMimiConv) — DONE (Route A, no precision regression): added
+        a DOUBLE-accumulate dot-product primitive MimiDotProductD (4-wide unrolled
+        Double loop, contiguous operands -> FPC auto-vectorizes to packed-double
+        FMA on -dAVX2, scalar-bit-stable on the fallback). Both branches now gather
+        an im2col patch and contract per output channel via MimiDotProductD instead
+        of triple-nested scalar loops: forward gathers the [gi*K+k2] receptive
+        field once per (group,t) and reuses it across the group's OPG channels;
+        the ConvTranspose1d overlap-add gathers the IPG-wide InSig column per
+        (group,t) and dots it against a gi-contiguous repacked weight column.
+        Mimi round-trip parity is BIT-IDENTICAL before/after on BOTH builds
+        (max|recon diff| = 1.1586e-6 < 1e-4; split-VQ codes still match the oracle
+        EXACTLY) — encode codes depend only on forward convs, decode recon on both.
+        Kept the Double accumulator throughout (NOT the FP32 path), so no re-pin.
   - [ ] OpenCL offload of the same accumulation (via the shared dot-product
         kernel, like FullConnect/Convolution) — optional follow-up after the AVX
         ConvTranspose1d path lands.

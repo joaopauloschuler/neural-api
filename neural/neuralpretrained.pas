@@ -36785,9 +36785,48 @@ begin
   end;
 end;
 
+// DOUBLE-precision dot product (W single, X double, accumulate in Double).
+// Mimi's holder math accumulates in Double for ~1e-12 round-trip parity, so it
+// CANNOT borrow the single-precision TNNetVolume.DotProduct used by the
+// EnCodec/HiFiGAN forward paths without regressing precision (and possibly
+// flipping a quantizer code, which the parity test pins exactly). Instead this
+// keeps the Double accumulator and contracts over a depth-axis-contiguous run:
+// both operands are contiguous, so a tight unrolled loop lets FPC auto-vectorize
+// into packed-double FMA on -dAVX2 builds while staying scalar (and bit-stable)
+// on the fallback build. The 4-way unroll matches the reassociation the
+// auto-vectorizer would pick (4 doubles per ymm), so the result is identical
+// across scalar and AVX builds. Coded by Claude (AI).
+function MimiDotProductD(WD, XD: PDouble; N: integer): Double;
+var
+  i, n4: integer;
+  s0, s1, s2, s3: Double;
+begin
+  s0 := 0; s1 := 0; s2 := 0; s3 := 0;
+  n4 := N and (not 3);
+  i := 0;
+  while i < n4 do
+  begin
+    s0 := s0 + WD[i]   * XD[i];
+    s1 := s1 + WD[i+1] * XD[i+1];
+    s2 := s2 + WD[i+2] * XD[i+2];
+    s3 := s3 + WD[i+3] * XD[i+3];
+    Inc(i, 4);
+  end;
+  while i < N do
+  begin
+    s0 := s0 + WD[i] * XD[i];
+    Inc(i);
+  end;
+  Result := (s0 + s1) + (s2 + s3);
+end;
+
 // Causal Conv1d / grouped ConvTranspose1d on a channel-major signal, honoring
 // pad_mode 'constant' (zero left-pad) or 'replicate' (repeat first/last) and
 // arbitrary groups. Mirrors HF MimiConv1d / MimiConvTranspose1d forward.
+// The per-tap in-channel contraction is depth-axis-contiguous, so it gathers an
+// im2col patch (size IPG*K per output position) and runs each output channel as
+// one contiguous Double DotProduct (MimiDotProductD) - reusing the forward
+// EnCodec/HiFiGAN im2col design but in DOUBLE precision (parity stays ~1e-12).
 procedure RunMimiConv(const Conv: TEnCodecConv;
   const InSig: TMimiDblArr2D; out OutSig: TMimiDblArr2D);
 var
@@ -36798,6 +36837,8 @@ var
   OutLenM1, IPGM1, OPGM1, FullLenM1: integer;
   Acc: double;
   Padded, Full: TMimiDblArr2D;
+  Patch, WD: TMimiDblArr; // im2col gather + Double-packed weights
+  IPGK, lp: integer;
 begin
   InCh := Conv.InCh;
   OutCh := Conv.OutCh;
@@ -36847,27 +36888,35 @@ begin
     OutLenM1 := OutLen - 1;
     IPGM1 := IPG - 1;
     OPGM1 := OPG - 1;
+    IPGK := IPG * K;
     SetLength(OutSig, OutCh);
-    for o := 0 to OutChM1 do
-    begin
-      SetLength(OutSig[o], OutLen);
-      grp := o div OPG;
+    for o := 0 to OutChM1 do SetLength(OutSig[o], OutLen);
+    // Pre-pack the (single) Conv weights into a contiguous Double buffer once so
+    // the per-output-position contraction is a contiguous Double DotProduct.
+    SetLength(WD, OutCh * IPGK);
+    for lp := 0 to OutCh * IPGK - 1 do WD[lp] := Conv.W[lp];
+    // im2col over the OUTPUT-TIME axis. For a fixed (group, t) the receptive-field
+    // patch (ordered [gi*K + k2], matching the [Out,In/groups,K] weight layout)
+    // is shared by all OPG output channels in the group, so it is gathered once
+    // and reused. The in-channel/kernel-tap contraction is then one contiguous
+    // Double DotProduct per output channel.
+    SetLength(Patch, IPGK);
+    for grp := 0 to GM1 do
       for t := 0 to OutLenM1 do
       begin
-        Acc := Conv.B[o];
         for gi := 0 to IPGM1 do
         begin
           i := grp * IPG + gi;
           for k2 := 0 to KM1 do
-          begin
-            src := t * Stride + k2 * Dil;
-            // Conv1d weight [Out, In/groups, K]: W[o*IPG*K + gi*K + k2].
-            Acc := Acc + Conv.W[o * IPG * K + gi * K + k2] * Padded[i][src];
-          end;
+            Patch[gi * K + k2] := Padded[i][t * Stride + k2 * Dil];
         end;
-        OutSig[o][t] := Acc;
+        for co := 0 to OPGM1 do
+        begin
+          o := grp * OPG + co;
+          OutSig[o][t] := Conv.B[o] +
+            MimiDotProductD(@WD[o * IPGK], @Patch[0], IPGK);
+        end;
       end;
-    end;
   end
   else
   begin
@@ -36885,22 +36934,34 @@ begin
       SetLength(Full[o], FullLen);
       for t := 0 to FullLenM1 do Full[o][t] := 0;
     end;
+    // Transposed-im2col overlap-add (decode-only; recon-gated < 1e-4). For a
+    // fixed (group, out-channel-in-group o, tap k2) the contraction over the
+    // group's input channels gi is depth-contiguous in InSig once the matching
+    // weight column W[(grp*IPG+gi)*OPG*K + o*K + k2] is repacked contiguous in gi
+    // (it is otherwise strided by OPG*K). The per-t InSig column [gi]=InSig[ci][t]
+    // is gathered once per (group,t) and reused across all (o,k2). Each
+    // (o,k2,t) contribution is one contiguous Double DotProduct, overlap-added
+    // into Full[co][idx] in the SAME (gi-reduced) per-slot order as the scalar
+    // scatter; only the inner gi-sum reassociates (4-wide). Coded by Claude (AI).
+    SetLength(Patch, IPG);     // InSig column over the group, [gi]
+    SetLength(WD, IPG);        // weight column over the group for one (o,k2)
     for grp := 0 to GM1 do
-      for gi := 0 to IPGM1 do
+      for t := 0 to InLenM1 do
       begin
-        ci := grp * IPG + gi;
-        for t := 0 to InLenM1 do
-          for o := 0 to OPGM1 do
+        for gi := 0 to IPGM1 do Patch[gi] := InSig[grp * IPG + gi][t];
+        for o := 0 to OPGM1 do
+        begin
+          co := grp * OPG + o;
+          for k2 := 0 to KM1 do
           begin
-            co := grp * OPG + o;
-            for k2 := 0 to KM1 do
-            begin
-              idx := t * Stride + k2;
-              // W[ci, o, k2] = W[ci*OPG*K + o*K + k2].
-              Full[co][idx] := Full[co][idx] +
-                Conv.W[ci * OPG * K + o * K + k2] * InSig[ci][t];
-            end;
+            idx := t * Stride + k2;
+            // W[ci, o, k2] = W[ci*OPG*K + o*K + k2]; gather the gi column.
+            for gi := 0 to IPGM1 do
+              WD[gi] := Conv.W[(grp * IPG + gi) * OPG * K + o * K + k2];
+            Full[co][idx] := Full[co][idx] +
+              MimiDotProductD(@WD[0], @Patch[0], IPG);
           end;
+        end;
       end;
     for o := 0 to OutChM1 do
       for t := 0 to FullLenM1 do Full[o][t] := Full[o][t] + Conv.B[o];
