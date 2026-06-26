@@ -517,26 +517,6 @@ rather than acted on.
       wired but UNVERIFIED end-to-end (lib not installed here; pico demo GGUF may
       be too small for llama.cpp) — confirm argmax/ranking agree on a real
       checkpoint once the lib is available.
-- [X] Stochastic Weight Averaging (torch.optim.swa_utils port): equal-weight
-      running average of checkpoints over the schedule tail + a constant or
-      cyclic SWA learning rate phase; swap averaged weights in for eval/save.
-      LANDED as a CALLBACK (TNeuralFitSWA in neuralfit.pas), NOT as
-      TNeuralFitBase fields: the new callback API already exposes the exact hook
-      SWA needs (OnEpochEnd), so the wrapper + live-weight stash + swap state all
-      live on the callback with no growth of TNeuralFitBase. Reuses
-      TNNetSWAWrapper for the averaging (Accumulate folds the equal-weight mean)
-      and mirrors the EMA store/load/restore plumbing via
-      ApplySWAWeights(pNN)/RestoreLiveWeights(pNN). Window = epochs >= StartEpoch,
-      every SnapshotEveryEpochs-th epoch. The constant/cyclic SWA-LR phase is
-      left to the existing LR machinery (CyclicalLearningRateLen / constant LR) -
-      the callback only averages/swaps weights, it never touches the LR.
-      BN-recompute (torch update_bn): SKIPPED - this lib's norm layers
-      (LayerNorm/RMSNorm/GroupNorm) compute stats per-forward from current
-      activations and carry no persistent running mean/var, so no recompute pass
-      is needed (documented in the class comment). Off by default (must register
-      the callback). Tests: tests/TestNeuralSWA.pas (mean==arithmetic mean,
-      apply/restore bit-identical, window/cadence gating, disabled-path unchanged
-      within the documented Clone()-RNG-shuffle tolerance).
 - [ ] Optimizer zoo expansion (SGD/Adam/AdamW + Lion + Adafactor exist now):
       Lion + Adafactor DONE (commit 89da1f9). TNeuralOptimizerLion (Chen et al.
       2023, sign-based update with ONE momentum buffer vs Adam's two; decoupled
@@ -554,30 +534,6 @@ rather than acted on.
       REMAINING:
   - [ ] optional Adafactor follow-up: the omitted first-moment beta1 EMA + update
         RMS clipping + internal relative-step LR rule if a real fine-tune needs them.
-- [X] Trainer callbacks API (transformers TrainerCallback port): a
-      TNeuralFitCallback with OnEpochBegin/End, OnStepEnd, OnEvaluate hooks
-      registered on TNeuralFitBase. Early stopping, custom logging, and the
-      EMA/SWA tasks become small callbacks instead of ever more
-      TNeuralFitBase fields.
-      LANDED: abstract TNeuralFitCallback (no-op virtual OnEpochBegin(Sender,
-      Epoch)/OnEpochEnd/OnStepEnd(Sender,GlobalStep)/OnEvaluate(Sender,Epoch,
-      ValLoss,ValAcc)) in neuralfit.pas, with Sender:TNeuralFitBase so callbacks
-      read live training state. TNeuralFitBase gained a lazy TList of callbacks +
-      AddCallback/CallbackCount + OwnsCallbacks (default false: caller owns) and
-      four Dispatch* helpers wired into BOTH fit loops (TNeuralDataLoadingFit and
-      TNeuralImageFit): epoch top, after Inc(FCurrentStep), right after the
-      validation metrics block, and next to FOnAfterEpoch. Empty list => cheap
-      no-op, so zero registered callbacks is bit-identical to before. Concrete
-      TNeuralFitEarlyStopping (Patience/MinDelta, lower-is-better val loss) sets
-      Sender.ShouldQuit when val loss fails to improve for Patience evals; the
-      loops' existing Not(FShouldQuit) guards then break early. Tests in
-      tests/TestNeuralCallbacks.pas (8, wired into RunTests.pas): counting
-      callback fires once/epoch for begin/end/evaluate over a 2-epoch XOR fit,
-      early stopping halts on a synthetic non-improving signal and stays quiet
-      while improving, zero-callback path trains the full budget, OwnsCallbacks
-      teardown. FOLLOW-UP: EMA/SWA (and custom CSV logging) can now be reframed
-      as TNeuralFitCallback subclasses instead of growing more TNeuralFitBase
-      fields.
 - [ ] True single-kernel batched forward (real batch axis + attention padding
       mask for left-pad) — the lockstep DecodeBatchGreedy orchestration landed,
       but NN.Compute has no SIMD batch axis on the char path, so each step still
@@ -674,23 +630,13 @@ rather than acted on.
         its (kernel-1)-token ring buffer + in/out projections driven one token at a
         time, then wire into TNNetStreamingDecoder (mirrors the RWKV TokenShift
         block-integration follow-up).
-- [X] Forced-prefix seq2seq decode + KV cache for Whisper-style decoders —
-      DONE (commit f940c95): `DecodeSeq2SeqForcedPrefixCached(DecoderNet,
-      EncoderStates, ForcedPrefix, EOSTokenId, MaxNewTokens)` in
-      neural/neuraldecode.pas. Takes an arbitrary forced token prologue + a
-      pre-computed encoder-states volume; prefills the self-attention KV cache
-      one token at a time via TNNetStreamingDecoder (cross-attention K/V are
-      fixed after encoding, so the streaming scan skips them). O(L) vs the old
-      O(L^2) re-encoding. TestForcedPrefixCachedMatchesFullReDecode asserts
-      bit-identical greedy output vs the naive re-decode loop on a synthetic
-      cross-attn encoder-decoder pair; + steering + arg-validation tests.
-      REMAINING:
-  - [ ] Refactor examples/WhisperTranscribe to USE the cached helper. NOT a
-        clean drop-in today: the word-timestamp cross-attention alignment step
-        needs a full-width forward over the wide decoder, so the width-1 cached
-        decode would have to either skip alignment or run a second full pass.
-        (The example still re-encodes the full prefix every step; needs ~4 GB
-        virtual memory, ulimit -v 4000000.)
+- [ ] Refactor examples/WhisperTranscribe to USE the landed cached forced-prefix
+      seq2seq decode helper (`DecodeSeq2SeqForcedPrefixCached`, neural/neuraldecode.pas).
+      NOT a clean drop-in today: the word-timestamp cross-attention alignment step
+      needs a full-width forward over the wide decoder, so the width-1 cached
+      decode would have to either skip alignment or run a second full pass.
+      (The example still re-encodes the full prefix every step; needs ~4 GB
+      virtual memory, ulimit -v 4000000.)
 - [ ] Streaming corpus loader with shuffle buffer: the landed packing
       pipeline materializes the whole token stream in RAM (neuraldatasets
       builds one concatenated Stream array). Read large text/token files
@@ -856,31 +802,13 @@ rather than acted on.
       classifier-free-guidance tuning and long-form generation to a follow-up.
       The WAV writer + HiFi-GAN vocoder it builds on have landed; the open
       piece is the audio U-Net/DiT denoiser importer.
-- [X] MusicGen MELODY-conditioned importer (BuildMusicGenMelodyFromSafeTensors[Ex],
-      facebook/musicgen-melody, model_type "musicgen_melody") — DONE. The new pieces:
-      (a) ComputeMusicgenMelodyChroma + BuildChromaFilterBank in neural/neuralaudio.pas
-      — a 12-bin one-hot chromagram matching HF MusicgenMelodyFeatureExtractor bit-for-bit
-      (power spectrogram n_fft=16384/hop=4096, periodic Hann, center=True reflect pad,
-      NORMALIZED by the window L2 energy = torchaudio Spectrogram(normalized=True); librosa
-      chroma_filter_bank tuning=0/power=2/weighting=(5,2)/start_at_c; per-frame inf-norm +
-      argmax one-hot; self-contained radix-2 FFT). (b) BuildMusicGenMelodyFromSafeTensors[Ex]
-      + TMusicGenMelodyModel in neural/neuralpretrained.pas.
-      ARCHITECTURE CORRECTION vs the original task note: MusicGen Melody is NOT a second
-      cross-attention source. The HF melody decoder is DECODER-ONLY (causal self-attention,
-      no encoder_attn); the conditioning is PREPENDED to the decoder sequence as
-      concat([audio_enc_to_dec_proj(chroma), enc_to_dec_proj(text)]) (CHROMA FIRST),
-      chroma repeat-tiled/truncated to chroma_length, sinusoidal positions over the whole
-      sequence, logits read at the decoder-frame positions. Implemented via a new
-      pSelfAttnOnly flag on BuildPegasusStackBlocks (suppresses the cross-attn sub-block).
-      EnCodec codec, delay-interleave, K embed tables / K LM heads, sinusoidal positions
-      reuse the landed path. Pico parity (tools/make_pico_musicgen_melody_fixture.py,
-      TestMusicGenMelodyParity): chroma matches the float64 HF oracle EXACTLY (one-hot,
-      max|diff|=0) and one decoder step (chroma+text prepended) < 1e-4. examples/MusicGenMelody
-      synthesizes an A4+E5 melody -> chroma -> codes -> EnCodec decode -> musicgen_melody_demo.wav
-      (pico smoke; random weights -> noise). Full suite 2302 tests, 0 failures.
-      DEFERRED FOLLOW-UPS: a --download real-checkpoint mode for facebook/musicgen-melody
-      (the example is pico-only) and a real-melody-conditioned smoke clip; stereo;
-      classifier-free guidance / KV-cache for the melody decoder (text-MusicGen has them).
+- [ ] MusicGen MELODY decoder follow-ups (BuildMusicGenMelodyFromSafeTensors[Ex],
+      facebook/musicgen-melody, model_type "musicgen_melody" LANDED — decoder-only
+      chroma+text prepended conditioning, ComputeMusicgenMelodyChroma chromagram,
+      pico parity TestMusicGenMelodyParity, examples/MusicGenMelody smoke):
+  - [ ] a --download real-checkpoint mode for facebook/musicgen-melody (the example
+        is pico-only) + a real-melody-conditioned smoke clip; stereo; classifier-free
+        guidance / KV-cache for the melody decoder (text-MusicGen has them).
 - [ ] SeamlessM4T-v2 follow-ups deferred from the landed S2TT v1:
       (1) the text-to-speech (T2ST) unit vocoder path (TextToUnit decoder +
       HiFi-GAN-style unit vocoder). (2) the UnitY2 two-pass decoding. (3) a real
@@ -1136,21 +1064,6 @@ rather than acted on.
 - [ ] VAR (Visual AutoRegressive, next-scale prediction) image-generation follow-ups
       (class-conditional v1 LANDED — BuildVARFromSafeTensors[Ex] + ReadVARConfigFromJSONFile
       + the TNNetScaledDotProductAttention.BlockCausalSegments scale-mask flag):
-  - [X] VAR text-conditioned (Infinity-style) variant — replace the single class token
-        with caller-supplied text encoder states + cross-attention (the PixArt-style
-        text-cond path), the analogue of the DiT->PixArt step.
-        LANDED: config-gated via TVARConfig.TextCond/TextDim/TextSeqLen ("text_cond":true
-        in config.json). When on, BuildVAR adds a caption_projection (text_proj.linear_{1,2}:
-        Linear->GELU->Linear, text_dim->d) over the net's THIRD TNNetInput (caller-supplied
-        text-encoder states, the T5EncoderStatesInput convention; VARTextInput returns it),
-        a per-block PixArt-style CROSS-ATTENTION (AddVARCrossAttention: per-head
-        TNNetCrossAttention over packed K|V, separate to_q/to_k/to_v/to_out.0, unmodulated
-        residual, no norm/gate) inserted between the unchanged next-scale block-causal SELF-
-        attention and the FFN, and a POOLED-TEXT adaLN cond (TNNetAvgChannel mean over the
-        projected text -> (1,1,d)) replacing class_emb. Class-conditional v1 stays bit-
-        identical when off (TestVARParity unchanged). Parity: TestVARTextCondParity vs a
-        first-principles float64 numpy oracle (tools/make_pico_var_textcond_fixture.py,
-        tiny_var_textcond.* fixtures), max|diff| < 1e-4; full suite 2301 tests, 0 failures.
   - [ ] VAR real-checkpoint parity (FoundationVision/var) — v1 parity is vs a
         first-principles float64 oracle on a random pico config; verify against a sliced
         real checkpoint once weights are available (the make_pico_*_fixture slicer
@@ -1211,21 +1124,6 @@ rather than acted on.
         already pins the math vs the real HF classes). Needs the ~600 MB checkpoint +
         CLIP tokenizer ids; also exercises the default extract_layers [3,6,9] and
         reduce_dim 64 (the pico uses [0,1]/6).
-  - [X] Complex transposed-conv upsample (use_complex_transposed_convolution=true) —
-        the rd64-refined head uses the 3-stage Conv2d(3x3)+ReLU+2× ConvTranspose2d
-        decoder instead of the single ConvTranspose2d v1 ships; add the 3x3 conv + the
-        two-stage DepthToSpace upsample and a pico parity for that branch.
-        LANDED: BuildCLIPSegFromSafeTensorsWithConfig now branches on the flag and
-        builds the HF CLIPSegDecoder complex head as TNNetConvolutionLinear(reduce_dim,
-        3,pad 1)+ReLU + two non-overlapping ConvTranspose2d, each a
-        PointwiseConvLinear(OutCh*k*k)+TNNetDepthToSpace(k)(+ReLU between), k=patch//4,
-        mid channels reduce_dim//2 (NO new leaf layers; reuses Conv/ReLU/PointwiseConv/
-        DepthToSpace). New loaders LoadCLIPSegConv2d + LoadCLIPSegTransposedConvMulti
-        (the OutCh-general sibling of LoadCLIPSegTransposedConv). Note: complex-head mask
-        is grid*k*k px (not image_size), and the grid must be >= 3 so CAI's conv does not
-        clamp the 3x3 kernel to the input width. Pico parity TestCLIPSegComplexUpsampleParity
-        (tools/clipseg_complex_tiny_fixture.py, patch 8/grid 3 -> 12px mask, reduce_dim 6)
-        < 1e-4 vs the REAL HF CLIPSegForImageSegmentation float64 oracle.
   - [ ] Image-prompt (visual) conditioning — CLIPSeg can also condition on a PROMPT
         IMAGE (conditional_pixel_values -> clip.get_image_features pooled embedding)
         instead of text; v1 does text only. Add a RunCLIPSegImagePrompt path reusing
