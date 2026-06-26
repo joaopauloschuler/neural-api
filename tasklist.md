@@ -701,19 +701,6 @@ rather than acted on.
       position and run each output channel as one contiguous TNNetVolume.DotProduct;
       all 17 audio parity tests stay < 1e-4 on both scalar-fallback and real -dAVX2
       builds. REMAINING:
-  - [X] TNNetMimi (RunMimiConv) — DONE (Route A, no precision regression): added
-        a DOUBLE-accumulate dot-product primitive MimiDotProductD (4-wide unrolled
-        Double loop, contiguous operands -> FPC auto-vectorizes to packed-double
-        FMA on -dAVX2, scalar-bit-stable on the fallback). Both branches now gather
-        an im2col patch and contract per output channel via MimiDotProductD instead
-        of triple-nested scalar loops: forward gathers the [gi*K+k2] receptive
-        field once per (group,t) and reuses it across the group's OPG channels;
-        the ConvTranspose1d overlap-add gathers the IPG-wide InSig column per
-        (group,t) and dots it against a gi-contiguous repacked weight column.
-        Mimi round-trip parity is BIT-IDENTICAL before/after on BOTH builds
-        (max|recon diff| = 1.1586e-6 < 1e-4; split-VQ codes still match the oracle
-        EXACTLY) — encode codes depend only on forward convs, decode recon on both.
-        Kept the Double accumulator throughout (NOT the FP32 path), so no re-pin.
   - [ ] OpenCL offload of the same accumulation (via the shared dot-product
         kernel, like FullConnect/Convolution) — optional follow-up after the AVX
         ConvTranspose1d path lands.
@@ -823,31 +810,12 @@ rather than acted on.
   - [ ] real-checkpoint smoke: synthesize a sentence with a downloaded
         `facebook/mms-tts-eng` / `kakao-enterprise/vits-ljs` and write it via
         `SaveVolumeToWav16` (offline + RAM-gated here, so deferred).
-- [X] Kokoro StyleTTS2 text-to-speech importer (`BuildKokoroFromSafeTensors[Ex]` +
-      `ReadKokoroConfigFromJSONFile`/`KokoroConfigToString` + a `TKokoroConfig`
-      record + a `TNNetKokoro` channel-major holder) — LANDED (TNNetAdaIN leaf,
-      TestKokoroSynthesisParity, tiny_kokoro* fixture, examples/KokoroTTS); only the
-      real-checkpoint + voice-pack `.pt` follow-up below remains open. The 82M Apache-licensed
-      `hexgrad/Kokoro-82M` model, a top-ranked open TTS. Architecturally DISTINCT
-      from the landed VITS importer (no conditional-prior normalizing flow, no
-      stochastic duration, no monotonic alignment search): Kokoro is the StyleTTS2
-      synthesis path — a 256-d style vector conditions every block via AdaIN
-      (instance-norm scaled+shifted by a learned style-derived affine — a new
-      `TNNetAdaIN` leaf, the one genuinely new piece), a BERT-style prosody text
-      encoder feeds a duration predictor (LSTM + conv) whose integer durations drive
-      a length-regulator upsampler (reuse the deterministic expand, not VITS's flow),
-      and an F0/N predictor + a HiFi-GAN/iSTFTNet decoder render the waveform. The
-      decoder is mostly REUSE of the landed `TNNetHiFiGAN`/`BuildVitsDecoderInto`
-      conv-upsample + MRF backbone; the iSTFT head (predict magnitude+phase, inverse
-      STFT to waveform) reuses the `neuralaudio.pas` FFT path. Scope v1 to
-      inference: phoneme ids + a chosen voice-pack style vector -> waveform. Pico
-      parity `< 1e-4` on the synthesized waveform vs a float64 oracle
-      (`TestKokoroSynthesisParity`, `tools/make_pico_kokoro_fixture.py` ->
-      `tests/fixtures/tiny_kokoro*`); an examples/KokoroTTS that writes one spoken
-      sentence via `SaveVolumeToWav16`. The grapheme->phoneme (espeak/misaki)
-      frontend is OUT of scope for v1 — take pre-phonemized integer ids as input and
-      document the gap. Follow-up: real `hexgrad/Kokoro-82M` checkpoint + voice-pack
-      `.pt` style-tensor load (offline/RAM-gated here).
+- [ ] Kokoro StyleTTS2 TTS real-checkpoint follow-up (`BuildKokoroFromSafeTensors[Ex]`
+      + `TNNetAdaIN` leaf + `TNNetKokoro` holder + examples/KokoroTTS LANDED, pico
+      parity TestKokoroSynthesisParity < 1e-4): real `hexgrad/Kokoro-82M` checkpoint +
+      voice-pack `.pt` style-tensor load (offline/RAM-gated here); also the
+      grapheme->phoneme (espeak/misaki) frontend dropped from v1 (v1 takes
+      pre-phonemized integer ids).
 - [ ] Mimi streaming neural-codec importer (`BuildMimiFromSafeTensors[Ex]`,
       model_type "mimi", e.g. `kyutai/mimi`) — LANDED (conv encoder/decoder +
       RoPE transformer bottleneck + semantic/acoustic split-VQ; codes match the
@@ -975,49 +943,13 @@ rather than acted on.
   - [ ] Sliding-window inference + overlap stitching for clips longer than the model's
         receptive field, and turning the per-frame activity matrix into final diarized
         speaker turns (clustering across windows).
-- [X] ECAPA-TDNN speaker-embedding / speaker-verification importer
-      (`BuildEcapaTdnnFromSafeTensors[Ex]` + `TEcapaTdnnConfig`, e.g.
-      speechbrain/spkrec-ecapa-voxceleb) — the missing COMPANION to the landed pyannote
-      SEGMENTATION model: pyannote answers "who speaks WHEN" within one window, but the
-      cross-window speaker clustering its own follow-up calls for (line above) needs a
-      fixed-length speaker EMBEDDING to compare turns — that embedding model is ECAPA-TDNN
-      and is not in-tree. Architecturally distinct from every audio model present (this is
-      a discriminative utterance->vector encoder, not an autoregressive codec LM, a
-      diffusion denoiser, or a per-frame segmenter). Genuinely new leaf pieces, on top of
-      log-mel features that already exist in neural/neuralaudio.pas:
-      (a) a dilated 1D **Res2Net** TDNN block (channel groups processed in a hierarchical
-      residual cascade so the effective receptive field grows within the block — NOT the
-      same as a plain grouped/depthwise conv1d), reusing the landed squeeze-excitation
-      SE block for the per-block channel gating (SE-Res2Block);
-      (b) **attentive statistics pooling** — a small per-frame attention head whose softmax
-      weights produce a context-weighted mean AND standard-deviation over the time axis,
-      concatenated into the utterance vector (distinct from the AvgChannel/MaxChannel and
-      AttentionPooling layers present, which compute neither a weighted std nor the
-      mean||std concat);
-      (c) multi-layer feature aggregation (concat the outputs of the SE-Res2Blocks before
-      pooling) -> linear -> the 192-d embedding, with AAM-softmax only needed for training
-      (inference reads the embedding directly).
-      Then expose speaker VERIFICATION as the natural capability: cosine score between two
-      utterance embeddings + a small `examples/SpeakerVerification` that embeds two
-      synthesized clips and prints same/different-speaker cosine similarity (and feeds the
-      pyannote diarization follow-up's cross-window clustering). Pico parity `< 1e-4` vs a
-      hand-written numpy float64 forward oracle on a re-randomized fixture
-      (`tools/make_pico_ecapa_fixture.py`; speechbrain is not installed here, mirror the
-      pyannote oracle approach), `TestEcapaParity`. Real speechbrain checkpoint
-      key-mapping + a VoxCeleb EER smoke run are network/RAM-gated follow-ups.
-      LANDED: new leaf layers `TNNetTDNNConv1D` (non-causal SAME dilated TDNN conv,
-      sibling of `TNNetCausalConv1D`) + `TNNetAttentiveStatsPooling` (two-source
-      weighted mean‖std pooling), builder `TNNet.AddSERes2Block` (Res2Net cascade +
-      reused `AddSEBlock` gating), `BuildEcapaTdnnFromSafeTensors[Ex]` +
-      `TEcapaTdnnConfig` + `ReadEcapaTdnnConfigFromJSONFile` + `EcapaCosineScore`,
-      `examples/SpeakerVerification`, pico fixture + `TestEcapaParity` (<1e-4, observed
-      ~1e-5) + full input/weight numerical-gradient tests for both leaf layers. Note:
-      the pico SE block matches `TNNetAvgChannel`'s `/N²` (not `/N`) scaling quirk; a
-      real checkpoint would use BatchNorm1d (eval-mode affine) instead of the pico's
-      simplified per-block normalization, so the real-key-mapping follow-up must add a
-      BatchNorm/affine-scale loader. Remaining deferred:
-      - [ ] real speechbrain/spkrec-ecapa-voxceleb checkpoint key-mapping (BatchNorm1d
-            stats, SpeechBrain TDNN naming) + a VoxCeleb EER smoke (network/RAM-gated).
+- [ ] ECAPA-TDNN speaker-verification real-checkpoint follow-up
+      (`BuildEcapaTdnnFromSafeTensors[Ex]` + `TEcapaTdnnConfig` + `EcapaCosineScore`,
+      new leaves `TNNetTDNNConv1D`/`TNNetAttentiveStatsPooling`, builder
+      `TNNet.AddSERes2Block`, examples/SpeakerVerification, pico parity TestEcapaParity
+      <1e-4 LANDED): real speechbrain/spkrec-ecapa-voxceleb checkpoint key-mapping
+      (BatchNorm1d eval-mode stats, SpeechBrain TDNN naming — the pico SE block uses
+      the simplified `/N²` AvgChannel scaling) + a VoxCeleb EER smoke (network/RAM-gated).
 - [ ] SAM mask decoder as a real TNNet layer graph (TNNetCrossAttention two-source
       wiring) instead of the plain-array RunSAMMaskDecoder forward, so the decoder is
       trainable / fine-tunable end-to-end (v1 is inference-only). Needs a builder that
@@ -1144,30 +1076,15 @@ rather than acted on.
       examples/TextToVideo that writes a short animated GIF/PPM sequence on CPU once the
       base UNet lands. Note: the cheaper no-UNet route to video is bolting the same
       temporal block onto the landed PixArt DiT — worth scoping if SD UNet stays blocked.
-- [X] CogVideoX native text-to-VIDEO DiT importer (BuildCogVideoXFromSafeTensors[Ex] +
-      TCogVideoXConfig / ReadCogVideoXConfigFromJSONFile in neuralpretrained.pas, e.g.
-      THUDM/CogVideoX-2b) — LANDED. Flat MMDiT-style denoiser over a flattened
-      (frame x height x width) latent token sequence: time-embed cond -> expert
-      adaLN-Zero (DiTModCond/TNNetFiLM, video+text triples from one 6*d Linear per
-      CogVideoXLayerNormZero) -> joint attention over [txt;vid] with 3D RoPE on the
-      VIDEO portion of Q/K only -> gated residual + FFN -> norm_out adaLN + proj_out.
-      The TWO new primitives are REUSED LANDED LEAVES (no new TNNet* leaf added):
-      3D RoPE = TNNetMRotaryEmbedding (Qwen2-VL M-RoPE, section=(t,h,w)); 3D causal
-      VAE = TNNetCausalConv1D over the VideoMAE space<->time view (per-cell causal
-      temporal conv + SiLU + pointwise conv), decoded by DecodeCogVideoXVae over the
-      grid. Pico parity TestCogVideoXParity asserts < 1e-4 on ONE denoiser step AND
-      one VAE-decode vs a self-contained float64 numpy oracle (diffusers not used);
-      committed fixture tests/fixtures/tiny_cogvideox.* + tools/make_pico_cogvideox_fixture.py
-      (hidden 16, 1 block, 2 heads, 2-frame 2x2 latent). examples/TextToVideo drives
-      the pico denoiser through DDIM/DPM++ + VAE decode and writes a per-frame PPM
-      sequence (--smoke build-exercised); documented in examples/README.md. Full
-      regression suite green (2309 tests, 0 fail). Remaining follow-ups:
-  - [ ] CogVideoX real-checkpoint parity (THUDM/CogVideoX-2b) — v1 parity is vs a
-        first-principles float64 oracle on a random pico config; verify against a
-        sliced real checkpoint (the make_pico_*_fixture slicer pattern) once weights
-        are available, incl. the real diffusers 3D RoPE frequency layout / temporal
-        VAE up/down blocks and a real T5 encoder over a tokenized prompt feeding
-        BuildT5FromSafeTensors instead of the synthetic text states.
+- [ ] CogVideoX text-to-VIDEO DiT real-checkpoint follow-up
+      (BuildCogVideoXFromSafeTensors[Ex] + TCogVideoXConfig + DecodeCogVideoXVae +
+      examples/TextToVideo LANDED, reusing TNNetMRotaryEmbedding 3D RoPE +
+      TNNetCausalConv1D temporal VAE, no new leaf; pico parity TestCogVideoXParity
+      < 1e-4): real-checkpoint parity (THUDM/CogVideoX-2b) vs a sliced real checkpoint
+      (the make_pico_*_fixture slicer pattern) once weights are available, incl. the
+      real diffusers 3D RoPE frequency layout / temporal VAE up/down blocks and a real
+      T5 encoder over a tokenized prompt feeding BuildT5FromSafeTensors instead of the
+      synthetic text states.
 - [ ] Stable Video Diffusion IMAGE-to-video importer (`BuildSVDFromSafeTensors[Ex]`
       + `TSVDConfig`, e.g. stabilityai/stable-video-diffusion-img2vid) — the
       image-CONDITIONED video generator that complements the landed CogVideoX
@@ -1207,29 +1124,12 @@ rather than acted on.
       outputs; reports a per-class table + a few visual overlays. Distinct from the
       logit-parity tests (those pin the math; this pins the end-to-end pipeline incl.
       preprocessing/decode). The missing import-VERIFICATION mirror of MMLUEval for vision.
-- [X] Florence-2 unified vision importer (BuildFlorence2FromSafeTensors, e.g.
-      microsoft/Florence-2-base) — a structurally DISTINCT VLM that does detection,
-      segmentation, captioning AND OCR through ONE task-prompted seq2seq head, unlike the
-      tracked single-task PaliGemma (prefix-LM caption) and LLaVA (causal chat). LANDED:
-      BuildFlorence2FromSafeTensors[WithConfig] + TFlorence2Config +
-      ReadFlorence2ConfigFromJSONFile/Florence2ConfigToString + RunFlorence2Logits +
-      RunFlorence2Projector + the multimodal-projector record (TFlorence2Projector) +
-      Florence2QuantizeCoord/Florence2DequantizeCoord location tokens. The ENCODER is a
-      TEXT BART encoder fed a VISUAL-TOKEN PREFIX: the projector turns the DaViT feature
-      map into visual tokens (learned 2D row+column position embed added to the feature
-      map, flatten H*W, fixed cosine-1D temporal embed, visual tokens = [spatial-mean;
-      per-cell tokens], bias-free image_projection Linear + biased image_proj_norm
-      LayerNorm), those are prepended to the embedded+sqrt(d)-scaled task-prompt text and
-      run through the BART encoder (BuildBartStackBlocks REUSE); the BART decoder cross-
-      attends (T5EncoderStates two-net + RunT5-style feed). Boxes/polygons emitted as
-      quantized <loc_0..loc_999> tokens (spatial outputs as text). The whole projector +
-      visual-prefix encoder + BART decoder pinned to the REAL HF
-      Florence2ForConditionalGeneration float64 oracle: pico parity TestFlorence2Parity <
-      1e-4 on the decoder logits + TestFlorence2LocationTokens for the coord<->token
-      round-trip (tools/make_pico_florence2_fixture.py + tests/fixtures/tiny_florence2.*).
-      examples/Florence2 runs one greedy caption step + a sample <OD> box encoded/decoded
-      as <loc_> tokens, offline on the fixture. No new leaf layer added (pure builder
-      reuse). First "spatial-output-as-text" importer; complements DETR/SAM/Mask2Former.
+- [ ] Florence-2 unified vision importer follow-ups (BuildFlorence2FromSafeTensors
+      [WithConfig] + TFlorence2Config + RunFlorence2Logits/RunFlorence2Projector +
+      Florence2Quantize/DequantizeCoord location tokens + examples/Florence2 LANDED —
+      visual-prefix BART encoder + BART seq2seq decoder, pure builder reuse, no new leaf;
+      pico parity TestFlorence2Parity < 1e-4 + TestFlorence2LocationTokens vs the real HF
+      Florence2ForConditionalGeneration float64 oracle):
   - [ ] The DaViT vision tower itself is the DEFERRED gap: v1 takes the tower's
         last_hidden_state feature map as a PRECOMPUTED input (like the tracked Qwen2-VL
         "merged visual tokens as input v1"). Build the real DaViT: a 4-stage conv-embed
