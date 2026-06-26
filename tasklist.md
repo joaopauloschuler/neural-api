@@ -74,6 +74,12 @@ rather than acted on.
 
 ## Bugs
 
+- [ ] `TestSetTrainableKeepsOutputs` fails ONLY on `-dAVX2` builds (~1e-7 logit
+      drift) — pre-existing, unrelated to audio/Mimi (confirmed by `git stash`
+      during the RunMimiConv AVX work, commit 30c2342). The scalar build passes.
+      Likely an AVX-vs-scalar reassociation crossing the test's exact-equality
+      tolerance; either loosen that one assertion to a small epsilon or pin the
+      reassociation. Whole suite is otherwise 0/0 on both builds.
 - [ ] `TNNetFlipX.Backpropagate` (and likely `TNNetFlipY`) range-check
       overflow when the NEXT layer is a padded convolution: the flip layer's
       `OutputError` is sized exactly to its output, but a padded conv writes a
