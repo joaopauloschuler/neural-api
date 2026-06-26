@@ -690,7 +690,20 @@ rather than acted on.
       decoder) now gather an im2col receptive-field patch (size InCh*K) per output
       position and run each output channel as one contiguous TNNetVolume.DotProduct;
       all 17 audio parity tests stay < 1e-4 on both scalar-fallback and real -dAVX2
-      builds. REMAINING:
+      builds.
+      CONVTRANSPOSE1D (upsample) DONE (commit 2873a1f for EnCodec + HiFiGAN/Vits;
+      Mimi grouped transpose in 30c2342 and DAC ungrouped transpose in 8277d25 were
+      vectorized inline when those holders landed): the overlap-add scatter is now a
+      transposed-im2col — InT packs InSig as [t*InCh+i] (each output column
+      InCh-contiguous) and WT repacks W as [(o*K+k2)*InCh+i] (each (o,k2) tap
+      InCh-contiguous), so Full[o][t*Stride+k2] += DotProduct(WT_{o,k2}, InT_t, InCh)
+      dispatches to AVX (Mimi/DAC use the Double-precision MimiDotProductD per group).
+      EnCodec's threaded TEnCodecConvWorker.RunTranspose splits over output channels.
+      The (t,k2) overlap-add order matches the original scatter; only the inner
+      in-channel sum reassociates (parity < 1e-4). Re-verified all 17 audio parity
+      tests (EnCodec round-trips, TestMimiParity, TestDACRoundTripParity,
+      TestHiFiGANSynthesisParity, TestVitsSynthesisParity, TestMusicGen*DecoderParity)
+      pass on BOTH scalar-fallback and real -dAVX2 builds. REMAINING:
   - [ ] OpenCL offload of the same accumulation (via the shared dot-product
         kernel, like FullConnect/Convolution) — optional follow-up after the AVX
         ConvTranspose1d path lands.
