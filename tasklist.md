@@ -542,15 +542,6 @@ rather than acted on.
       header): optional first-moment beta1 EMA + update RMS clipping; LR comes from
       the host fit schedule, not Adafactor's internal relative-step rule.
       REMAINING:
-  - [X] Muon optimizer class for 2-D weight matrices (a hand-rolled Muon
-        gradient-surgery demo already exists in examples/MuonOptimizer; the
-        TNeuralOptimizer subclass port is what's missing).
-        DONE: TNeuralOptimizerMuon (neuralfit.pas) + TNNet/TNNetLayer.CalcMuonDelta
-        (neuralnetwork.pas); single momentum buffer (FBackInertia, like Lion),
-        Newton-Schulz orthogonalized step on FullConnect/linear matrices,
-        SGD-momentum fallback on non-matrix params (biases, conv kernels).
-        Tests TestMuonOptimizer + TestMuonOrthogonalizesUpdate; example
-        MuonOptimizer refactored to drive the library path.
   - [ ] optional Adafactor follow-up: the omitted first-moment beta1 EMA + update
         RMS clipping + internal relative-step LR rule if a real fine-tune needs them.
 - [ ] Trainer callbacks API (transformers TrainerCallback port): a
@@ -719,15 +710,6 @@ rather than acted on.
       position and run each output channel as one contiguous TNNetVolume.DotProduct;
       all 17 audio parity tests stay < 1e-4 on both scalar-fallback and real -dAVX2
       builds. REMAINING:
-  - [X] ConvTranspose1d (upsample) paths — DONE: transposed-im2col reformulation.
-        RunEnCodecConv (serial + TEnCodecConvWorker.RunTranspose, covers
-        TEnCodecModel + MusicGen EnCodec decode) and RunHiFiGANConv (TNNetHiFiGAN +
-        nested Vits decoder) now pack InSig as InT[t*InCh+i] and repack W as
-        WT[(o*K+k2)*InCh+i] so the per-tap in-channel contraction is one
-        InCh-contiguous TNNetVolume.DotProduct (AVX when InCh>=16). The (t,k2)
-        overlap-add order matches the original i,t,o,k2 scatter; only the inner
-        i-sum reassociates. All 8 audio + EnCodec/HiFiGAN/Vits/MusicGen parity
-        tests stay < 1e-4 on scalar-fallback AND -dAVX2 builds.
   - [ ] TNNetMimi (RunMimiConv) — left scalar: it uses a DOUBLE-precision
         accumulator (TMimiDblArr2D); single-precision AVX DotProduct would be a
         genuine precision regression vs a benign reassociation. Needs a
@@ -862,19 +844,10 @@ rather than acted on.
       HF MusicgenMelodyForConditionalGeneration oracle (chroma extractor + one decoder
       step, < 1e-4) and an examples/MusicGenMelody that conditions on a synthesized melody.
 - [ ] SeamlessM4T-v2 follow-ups deferred from the landed S2TT v1:
-      (1) [X] position_embeddings_type="relative_key" — DONE: added
-      TNNetConformerRelPosAttention (learnable distance-embedding score bias
-      Q[i]·P[clamp(j-i,-L,R)+L] added to the scores before softmax, the
-      einsum("bhld,lrd->bhlr") math), with input+weight numerical-gradient tests
-      and serialization round-trip; wired into BuildSeamlessM4T (reads
-      left/right_max_position_embeddings, loads the per-layer distance_embedding
-      table into each head, swaps the ENCODER self-attn — the strided adapter
-      stays vanilla SDPA per HF use_position_embeddings=False); new relkey pico
-      fixture + parity test (< 1e-4). (2) the text-to-speech (T2ST) unit
-      vocoder path (TextToUnit decoder + HiFi-GAN-style unit vocoder).
-      (3) the UnitY2 two-pass decoding. (4) a real downloaded
-      facebook/seamless-m4t-v2-large checkpoint + real SentencePiece tokenizer
-      + a runnable examples/SeamlessTranslate S2TT end-to-end demo.
+      (1) the text-to-speech (T2ST) unit vocoder path (TextToUnit decoder +
+      HiFi-GAN-style unit vocoder). (2) the UnitY2 two-pass decoding. (3) a real
+      downloaded facebook/seamless-m4t-v2-large checkpoint + real SentencePiece
+      tokenizer + a runnable examples/SeamlessTranslate S2TT end-to-end demo.
 - [ ] examples/SpeechCommands keyword-spotting trainer — the audio analogue of
       SimpleImageClassifier and the first FROM-SCRATCH (no-import) audio training
       example. Feed the existing log-mel frontend (neuralaudio.pas) into a small
