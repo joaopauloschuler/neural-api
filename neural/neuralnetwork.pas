@@ -10672,6 +10672,14 @@ type
     protected
       procedure BackpropagateAtOutputPos(pCanBackpropOnPos: boolean; OutputRawPos, OutputX, OutputY, OutputD, PrevX, PrevY: integer); {$IFDEF Release} inline; {$ENDIF}
     private
+      // Winograd F(2x2,3x3) fast-conv scratch (opt-in via FStruct[7]).
+      FWinogradKernels: TNNetVolume;   // (16, NumNeurons, InputDepth): U[p,o,:] = (G g G^T) packed depth-contiguous per tile-pos p, neuron o
+      FWinogradInput: TNNetVolume;     // (16, NumTiles, InputDepth): V[p,tile,:] = (B^T d B) packed depth-contiguous
+      FWinogradM: TNNetVolume;         // (16, NumTiles, NumNeurons): per-tile transformed products M[p,tile,o]
+      FWinogradKernelsValid: boolean;  // cache flag invalidated by AfterWeightUpdate
+      function WinogradEligible(): boolean; {$IFDEF Release} inline; {$ENDIF}
+      procedure BuildWinogradKernels();
+      procedure ComputeWinogradCPU();
       procedure ComputeCPU();
       procedure ComputeTiledCPU();
       procedure ComputeInterleaved();
@@ -10699,8 +10707,15 @@ type
       function ComputeNeuronAtPreparedInput(NeuronIdx, x, y: integer): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       {$ENDIF}
     public
+      destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
+      // Opt-in Winograd F(2x2,3x3) fast forward path. Only takes effect for
+      // 3x3, stride-1 convolutions (any padding); otherwise the exact direct
+      // path is used unchanged. Default OFF. Forward inference only - backward
+      // always uses the exact direct path.
+      procedure EnableWinograd(pEnable: boolean = true);
+      function WinogradEnabled(): boolean;
   end;
 
   TNNetConvolutionSharedWeights = class(TNNetConvolution)
@@ -77388,10 +77403,265 @@ begin
   inherited Destroy;
 end;
 
+destructor TNNetConvolution.Destroy();
+begin
+  // Winograd scratch is lazily allocated; nil-Free is safe when never enabled.
+  FWinogradKernels.Free;
+  FWinogradInput.Free;
+  FWinogradM.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetConvolution.EnableWinograd(pEnable: boolean = true);
+begin
+  if pEnable
+    then FStruct[7] := 1
+    else FStruct[7] := 0;
+  FWinogradKernelsValid := false;
+end;
+
+function TNNetConvolution.WinogradEnabled(): boolean;
+begin
+  Result := (FStruct[7] = 1);
+end;
+
+function TNNetConvolution.WinogradEligible(): boolean;
+begin
+  // Opt-in AND the exact shape Winograd F(2x2,3x3) handles: square 3x3 kernel,
+  // stride 1. Padding is fine (handled by FInputCopy). Quant/low-memory/OpenCL
+  // forwards keep the exact direct path.
+  Result :=
+    (FStruct[7] = 1) and
+    (FFeatureSizeX = 3) and (FFeatureSizeY = 3) and
+    (FStride = 1) and
+    (not FQuantInt8) and
+    (not ActiveLowMemory());
+end;
+
+procedure TNNetConvolution.BuildWinogradKernels();
+// Pre-transform every neuron kernel once: U = G g G^T (4x4) per (neuron, input
+// channel). Packed as FWinogradKernels of shape (16, NumNeurons, InputDepth) so
+// that, for a fixed tile position p (0..15) and neuron o, U[p,o,:] is a
+// depth-contiguous vector over input channels - the axis the channel reduction
+// vectorizes over.
+var
+  NeuronCnt, NeuronMax, InDepth, OutChannel, InChannel: integer;
+  Weights: TNNetVolume;
+  // G (4x3) and G^T (3x4) constants for F(2,3).
+  g: array[0..2, 0..2] of TNeuralFloat; // raw 3x3 kernel for one (o,c)
+  Gg: array[0..3, 0..2] of TNeuralFloat; // G * g  (4x3)
+  U: array[0..3, 0..3] of TNeuralFloat;  // G g G^T (4x4)
+  i, j, p: integer;
+begin
+  NeuronCnt := FNeurons.Count;
+  if NeuronCnt = 0 then Exit;
+  InDepth := FNeurons[0].Weights.Depth;
+  NeuronMax := NeuronCnt - 1;
+
+  if (FWinogradKernels = nil) then FWinogradKernels := TNNetVolume.Create;
+  FWinogradKernels.ReSize(16, NeuronCnt, InDepth);
+
+  for OutChannel := 0 to NeuronMax do
+  begin
+    Weights := FNeurons[OutChannel].Weights; // (3,3,InDepth)
+    for InChannel := 0 to InDepth - 1 do
+    begin
+      // Gather the 3x3 kernel for this (output,input) channel pair.
+      for i := 0 to 2 do
+        for j := 0 to 2 do
+          g[i][j] := Weights.Get(j, i, InChannel); // Get(x,y,d): x=col j, y=row i
+
+      // Gg = G * g, with G rows: [1,0,0],[.5,.5,.5],[.5,-.5,.5],[0,0,1]
+      for j := 0 to 2 do
+      begin
+        Gg[0][j] := g[0][j];
+        Gg[1][j] := 0.5 * (g[0][j] + g[1][j] + g[2][j]);
+        Gg[2][j] := 0.5 * (g[0][j] - g[1][j] + g[2][j]);
+        Gg[3][j] := g[2][j];
+      end;
+      // U = Gg * G^T, G^T columns same coefficients applied on the j axis.
+      for i := 0 to 3 do
+      begin
+        U[i][0] := Gg[i][0];
+        U[i][1] := 0.5 * (Gg[i][0] + Gg[i][1] + Gg[i][2]);
+        U[i][2] := 0.5 * (Gg[i][0] - Gg[i][1] + Gg[i][2]);
+        U[i][3] := Gg[i][2];
+      end;
+      // Scatter into the depth-contiguous pack: p = i*4 + j.
+      for i := 0 to 3 do
+        for j := 0 to 3 do
+        begin
+          p := i * 4 + j;
+          FWinogradKernels.FData[FWinogradKernels.GetRawPos(p, OutChannel, InChannel)] := U[i][j];
+        end;
+    end;
+  end;
+  FWinogradKernelsValid := true;
+end;
+
+procedure TNNetConvolution.ComputeWinogradCPU();
+// Winograd F(2x2,3x3) forward. FInputCopy is the (already padded) input. We tile
+// the input into overlapping 4x4 tiles (stride 2) producing 2x2 output blocks,
+// run V = B^T d B per tile, accumulate the per-tile-position channel reduction
+// M[p,tile,o] = sum_c U[p,o,c]*V[p,tile,c] (depth-contiguous AVX DotProduct),
+// then Y = A^T M A scattered into FOutputRaw. The ragged right/bottom edge (odd
+// output size) is produced by tiles whose 2x2 block partially lands inside the
+// output; out-of-range output cells are simply not written.
+var
+  InDepth, NeuronCnt, NeuronMax: integer;
+  TilesX, TilesY, NumTiles, MaxC: integer;
+  tx, ty, tile, baseX, baseY: integer;
+  sx, sy, ix, iy: integer;
+  c, p, o: integer;
+  // 4x4 input tile per channel, then V = B^T d B per channel; we build V[p,c]
+  // packed depth-contiguous straight into FWinogradInput.
+  d: array[0..3, 0..3] of TNeuralFloat;
+  Bd: array[0..3, 0..3] of TNeuralFloat; // B^T d
+  V: array[0..3, 0..3] of TNeuralFloat;  // B^T d B
+  vPtr, uPtr, mPtr: TNeuralFloatArrPtr;
+  M: array[0..3, 0..3] of TNeuralFloat;
+  AM: array[0..1, 0..3] of TNeuralFloat; // A^T M  (2x4)
+  Y: array[0..1, 0..1] of TNeuralFloat;  // A^T M A (2x2)
+  i, j: integer;
+  outX, outY: integer;
+begin
+  if (not FWinogradKernelsValid) then BuildWinogradKernels();
+
+  InDepth := FInputCopy.Depth;
+  NeuronCnt := FNeurons.Count;
+  NeuronMax := NeuronCnt - 1;
+  MaxC := InDepth - 1;
+
+  // Number of 2x2 output blocks needed to cover the output, rounded up.
+  TilesX := (FOutputSizeX + 1) div 2;
+  TilesY := (FOutputSizeY + 1) div 2;
+  NumTiles := TilesX * TilesY;
+
+  if (FWinogradInput = nil) then FWinogradInput := TNNetVolume.Create;
+  if (FWinogradM = nil) then FWinogradM := TNNetVolume.Create;
+  FWinogradInput.ReSize(16, NumTiles, InDepth);
+  FWinogradM.ReSize(16, NumTiles, NeuronCnt);
+
+  // --- Input transform: build V[p, tile, :] (depth-contiguous over channels). ---
+  for ty := 0 to TilesY - 1 do
+  begin
+    baseY := ty * 2; // top-left output row of this block; input tile top = same (padding already in FInputCopy)
+    for tx := 0 to TilesX - 1 do
+    begin
+      baseX := tx * 2;
+      tile := ty * TilesX + tx;
+      for c := 0 to MaxC do
+      begin
+        // Gather 4x4 input tile (zero outside the padded input bounds).
+        for sy := 0 to 3 do
+        begin
+          iy := baseY + sy;
+          for sx := 0 to 3 do
+          begin
+            ix := baseX + sx;
+            if (ix >= 0) and (ix < FInputCopy.SizeX) and
+               (iy >= 0) and (iy < FInputCopy.SizeY)
+              then d[sy][sx] := FInputCopy.Get(ix, iy, c)
+              else d[sy][sx] := 0;
+          end;
+        end;
+        // Bd = B^T d, B^T rows: [1,0,-1,0],[0,1,1,0],[0,-1,1,0],[0,1,0,-1]
+        for j := 0 to 3 do
+        begin
+          Bd[0][j] := d[0][j] - d[2][j];
+          Bd[1][j] := d[1][j] + d[2][j];
+          Bd[2][j] := -d[1][j] + d[2][j];
+          Bd[3][j] := d[1][j] - d[3][j];
+        end;
+        // V = Bd * B  (B = (B^T)^T, same coefficients on the column axis)
+        for i := 0 to 3 do
+        begin
+          V[i][0] := Bd[i][0] - Bd[i][2];
+          V[i][1] := Bd[i][1] + Bd[i][2];
+          V[i][2] := -Bd[i][1] + Bd[i][2];
+          V[i][3] := Bd[i][1] - Bd[i][3];
+        end;
+        for i := 0 to 3 do
+          for j := 0 to 3 do
+          begin
+            p := i * 4 + j;
+            FWinogradInput.FData[FWinogradInput.GetRawPos(p, tile, c)] := V[i][j];
+          end;
+      end;
+    end;
+  end;
+
+  // --- Channel reduction: M[p,tile,o] = sum_c U[p,o,c] * V[p,tile,c]. ---
+  // The inner reduction is over the depth-contiguous channel axis, evaluated by
+  // the AVX class DotProduct primitive (the depth-contiguity rule the im2col
+  // conv path follows). This is the MAC-count win: 16 dot products of length
+  // InDepth produce a 2x2x... output block instead of 9 per output cell.
+  for tile := 0 to NumTiles - 1 do
+    for o := 0 to NeuronMax do
+      for p := 0 to 15 do
+      begin
+        uPtr := FWinogradKernels.GetRawPtr(p, o, 0);
+        vPtr := FWinogradInput.GetRawPtr(p, tile, 0);
+        FWinogradM.FData[FWinogradM.GetRawPos(p, tile, o)] :=
+          TNNetVolume.DotProduct(uPtr, vPtr, InDepth);
+      end;
+
+  // --- Output transform Y = A^T M A and scatter into FOutputRaw. ---
+  // A^T (2x4): [1,1,1,0],[0,1,-1,-1]
+  for ty := 0 to TilesY - 1 do
+  begin
+    baseY := ty * 2;
+    for tx := 0 to TilesX - 1 do
+    begin
+      baseX := tx * 2;
+      tile := ty * TilesX + tx;
+      for o := 0 to NeuronMax do
+      begin
+        mPtr := FWinogradM.GetRawPtr(0, tile, o);
+        // Read M[i][j] = mPtr[(i*4+j)*NeuronCnt]  (depth axis = neuron).
+        for i := 0 to 3 do
+          for j := 0 to 3 do
+            M[i][j] := mPtr^[(i * 4 + j) * NeuronCnt];
+        // AM = A^T M (2x4)
+        for j := 0 to 3 do
+        begin
+          AM[0][j] := M[0][j] + M[1][j] + M[2][j];
+          AM[1][j] := M[1][j] - M[2][j] - M[3][j];
+        end;
+        // Y = AM * A  (A = (A^T)^T)
+        for i := 0 to 1 do
+        begin
+          Y[i][0] := AM[i][0] + AM[i][1] + AM[i][2];
+          Y[i][1] := AM[i][1] - AM[i][2] - AM[i][3];
+        end;
+        // Scatter the 2x2 block, dropping cells past the (possibly odd) edge.
+        for i := 0 to 1 do
+        begin
+          outY := baseY + i;
+          if outY >= FOutputSizeY then Continue;
+          for j := 0 to 1 do
+          begin
+            outX := baseX + j;
+            if outX >= FOutputSizeX then Continue;
+            FOutputRaw.FData[FOutputRaw.GetRawPos(outX, outY, o)] := Y[i][j];
+          end;
+        end;
+      end;
+    end;
+  end;
+
+  if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
+  ApplyActivationFunctionToOutput();
+end;
+
 procedure TNNetConvolution.Compute();
   procedure ComputeOnCPU;
   begin
-    if FQuantInt8 then
+    if WinogradEligible() then
+    begin
+      ComputeWinogradCPU();
+    end
+    else if FQuantInt8 then
     begin
       // int8-quantized inference: dequantize the whole layer into the
       // concatenated-weight cache (the exact FP32 layout the AVX dot-product
@@ -104085,6 +104355,10 @@ begin
   // ourselves here (SetNumWeightsForAllNeurons calls this BEFORE FOutputRaw is
   // sized, and an early BuildBiasOutput writes out of bounds).
   inherited AfterWeightUpdate();
+  // Any weight change invalidates the cached Winograd kernel transform; it is
+  // rebuilt lazily on the next eligible forward. (Every weight mutation - train
+  // step, InitWeights, importer load, FlushWeightCache - funnels through here.)
+  FWinogradKernelsValid := false;
   if ActiveLowMemory() then
   begin
     // Release the persistent weight caches the per-neuron forward does not need.

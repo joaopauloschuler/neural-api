@@ -17,6 +17,7 @@ type
   published
     procedure TestFullyConnectedForward;
     procedure TestConvolutionForward;
+    procedure TestWinogradConvolutionParity;
     procedure TestMaxPoolForward;
     procedure TestNetworkSaveLoad;
     procedure TestSimpleXORLearning;
@@ -176,6 +177,71 @@ begin
     NN.Free;
     Input.Free;
   end;
+end;
+
+procedure TTestNeuralLayers.TestWinogradConvolutionParity;
+
+  // Builds a 3x3 stride-1 conv (linear activation), random weights+input, then
+  // compares the exact direct forward against the opt-in Winograd path. Winograd
+  // reassociates the channel sum so float32 differs slightly; tolerance 1e-4.
+  function MaxDiffFor(InW, InH, InD, OutD, Pad: integer): TNeuralFloat;
+  var
+    NN: TNNet;
+    Input, DirectOut: TNNetVolume;
+    Conv: TNNetConvolutionLinear;
+    I: integer;
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(InW, InH, InD);
+    DirectOut := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(InW, InH, InD));
+      Conv := TNNetConvolutionLinear.Create(OutD, 3, Pad, 1);
+      NN.AddLayer(Conv);
+      NN.InitWeights();
+      // Random input in a reasonable range.
+      for I := 0 to Input.Size - 1 do
+        Input.Raw[I] := (Random - 0.5) * 4;
+
+      // Exact direct path (Winograd default OFF).
+      NN.Compute(Input);
+      DirectOut.Copy(NN.GetLastLayer.Output);
+
+      // Same weights, Winograd path ON.
+      Conv.EnableWinograd(true);
+      AssertTrue('Winograd should report enabled', Conv.WinogradEnabled());
+      NN.Compute(Input);
+
+      Result := 0;
+      for I := 0 to DirectOut.Size - 1 do
+        Result := Max(Result, Abs(DirectOut.Raw[I] - NN.GetLastLayer.Output.Raw[I]));
+    finally
+      NN.Free;
+      Input.Free;
+      DirectOut.Free;
+    end;
+  end;
+
+var
+  D: TNeuralFloat;
+begin
+  // Padded same-size output (pad=1): even output size 8x8.
+  D := MaxDiffFor(8, 8, 4, 6, 1);
+  AssertTrue('Winograd parity (padded 8x8) max|diff|<1e-4, got ' + FloatToStr(D), D < 1e-4);
+
+  // Unpadded (pad=0): output 6x6 (even), boundary tiles read zeros outside.
+  D := MaxDiffFor(8, 8, 4, 6, 0);
+  AssertTrue('Winograd parity (unpadded 6x6) max|diff|<1e-4, got ' + FloatToStr(D), D < 1e-4);
+
+  // Odd output size to exercise the ragged right/bottom edge: 7x7 input, pad=1
+  // -> output 7x7 (odd), so the last 2x2 block straddles the edge.
+  D := MaxDiffFor(7, 7, 3, 5, 1);
+  AssertTrue('Winograd parity (odd 7x7) max|diff|<1e-4, got ' + FloatToStr(D), D < 1e-4);
+
+  // Unpadded odd output: 8x8 input pad=0 already even; use 9x9 -> output 7x7 odd.
+  D := MaxDiffFor(9, 9, 5, 4, 0);
+  AssertTrue('Winograd parity (unpadded odd 7x7) max|diff|<1e-4, got ' + FloatToStr(D), D < 1e-4);
 end;
 
 procedure TTestNeuralLayers.TestMaxPoolForward;

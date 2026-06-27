@@ -90,23 +90,27 @@ rather than acted on.
 
 ## Infrastructure / dev experience
 
-- [ ] Winograd F(2x2,3x3) fast convolution AVX path for 3x3 stride-1 convs —
-      the single most common conv shape in the vision backbones (ResNet/VGG/
-      ConvNeXt/YOLO/SD UNet). Winograd trades the direct 9-multiply-per-output
-      inner product for 16 element-wise multiplies over a 4x4 tile that produce a
-      2x2 output block (4 outputs), i.e. 4 mults/output vs 9 — a ~2.25x MAC
-      reduction, with the input/output/kernel transforms being cheap fixed
-      add/shift matrices. Scope: an opt-in fast path inside TNNetConvolution
-      (FeatureSize=3, Stride=1, padding handled) that pre-transforms the kernels
-      once at first forward (G g G^T), transforms each input tile (B^T d B), runs
-      the per-tile element-wise product as a depth-axis-contiguous DotProduct/MulAdd
-      (reusing the existing AVX volume primitives, the depth-contiguity rule the
-      conv im2col path already follows), then the output transform (A^T m A). Gate
-      it behind a flag (default off = the exact direct path) and a
-      Winograd-vs-direct equivalence assert < 1e-4 on a fixed fixture (Winograd
-      reassociates the sum, so it is approximate in float32). Distinct from the
-      landed im2col+DotProduct conv (that vectorizes the SAME 9-mult contraction;
-      Winograd reduces the MAC COUNT). Re-profile a ResNet/VGG forward before/after.
+- [X] Winograd F(2x2,3x3) fast convolution path for 3x3 stride-1 convs. LANDED:
+      opt-in forward path inside TNNetConvolution behind FStruct[7] flag set via
+      EnableWinograd (default OFF = exact direct path, zero behaviour change).
+      Eligibility: 3x3 + stride-1 + not int8 + not low-memory (any padding;
+      FInputCopy is already padded). Kernel transform U=G g G^T cached per
+      (neuron,channel) in FWinogradKernels (16,NumNeurons,InputDepth), rebuilt
+      lazily and invalidated by AfterWeightUpdate (every weight mutation funnels
+      through it). Input transform V=B^T d B over overlapping 4x4 tiles (stride 2),
+      ragged odd-output edge handled by dropping out-of-range output cells. Channel
+      reduction M[p,tile,o]=sum_c U[p,o,c]*V[p,tile,c] uses the depth-contiguous AVX
+      class TNNetVolume.DotProduct primitive (the win is the MAC-count reduction).
+      Output transform A^T M A scattered into FOutputRaw, then bias+activation as the
+      direct path. Backward unchanged (forward-inference only). Parity vs direct:
+      max|diff| ~7.2e-7 on BOTH scalar and -dAVX2 builds (tol 1e-4). Test:
+      TestNeuralLayers.TestWinogradConvolutionParity (RandSeed 424242; padded even,
+      unpadded even, padded-odd 7x7, unpadded-odd 7x7 ragged-edge cases).
+      NOTE v1 PERF: vectorized only on the channel reduction; tile/kernel transforms
+      and the per-(tile,neuron,16-pos) dot-product dispatch are scalar, so on a
+      32x32x64->64 conv it is currently ~2x SLOWER than the tuned tiled-interleaved
+      AVX GEMM direct path (330ms vs 161ms / 20 fwd, AVX2). Correctness-first; a
+      batched-GEMM elementwise-multiply rewrite is the follow-up perf win.
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] GGUF import beyond Llama — open follow-ups (core `BuildFromGGUF`/`BuildFromGGUFEx`
       arch dispatch with llama/qwen2/gemma2 LANDED & verified):
