@@ -71161,16 +71161,14 @@ begin
   for ReflIdx := FNumReflections - 1 downto 0 do
   begin
     V := FArrNeurons[ReflIdx].FWeights;
-    // Cache the input to this reflection BEFORE applying it.
+    // Cache the input to this reflection BEFORE applying it. The cache row has
+    // stride FNumReflections along the depth axis, so this scatter stays scalar.
     for j := 0 to MaxN do
       FCache.FData[ReflIdx + j * FNumReflections] := FOutput.FData[j];
-    beta := 0;
-    dot := 0;
-    for j := 0 to MaxN do
-    begin
-      beta := beta + V.FData[j] * V.FData[j];
-      dot := dot + V.FData[j] * FOutput.FData[j];
-    end;
+    // beta = v.v and dot = v.u are contiguous length-N reductions, mapped onto
+    // the depth-contiguous TNNetVolume.DotProduct primitive.
+    beta := TNNetVolume.DotProduct(@V.FData[0], @V.FData[0], N);
+    dot := TNNetVolume.DotProduct(@V.FData[0], @FOutput.FData[0], N);
     if beta < HOUSEHOLDER_MIN_BETA then continue; // degenerate -> identity
     scale := 2.0 * dot / beta;
     FOutput.MulAdd(-scale, V);
@@ -71225,25 +71223,25 @@ begin
     V := FArrNeurons[ReflIdx].FWeights;
     VDelta := FArrNeurons[ReflIdx].FDelta;
     U := FCache; // row ReflIdx along depth axis = u = x_{i+1}
-    beta := 0; dgv := 0; duv := 0;
+    // beta = v.v and dgv = v.g are contiguous length-N reductions -> DotProduct.
+    // duv = v.u walks the cache with stride FNumReflections, so it stays scalar.
+    beta := TNNetVolume.DotProduct(@V.FData[0], @V.FData[0], N);
+    dgv := TNNetVolume.DotProduct(@V.FData[0], @FgBuf[0], N);
+    duv := 0;
     for j := 0 to MaxN do
-    begin
-      beta := beta + V.FData[j] * V.FData[j];
-      dgv := dgv + V.FData[j] * FgBuf[j];
       duv := duv + V.FData[j] * U.FData[ReflIdx + j * FNumReflections];
-    end;
     if beta < HOUSEHOLDER_MIN_BETA then continue; // identity -> no grad, g unchanged
     s := 2.0 / beta;
     coef := 2.0 * duv * dgv / beta;
-    // dL/dv accumulated (Delta carries -LearningRate * gradient).
+    // dL/dv accumulated (Delta carries -LearningRate * gradient). The u-term is
+    // strided through the cache, so this accumulation stays scalar.
     for j := 0 to MaxN do
       VDelta.FData[j] := VDelta.FData[j]
         - FLearningRate *
           ( -s * ( dgv * U.FData[ReflIdx + j * FNumReflections]
                    + duv * FgBuf[j] - coef * V.FData[j] ) );
-    // Advance g <- H_i * g.
-    for j := 0 to MaxN do
-      FgBuf[j] := FgBuf[j] - s * dgv * V.FData[j];
+    // Advance g <- H_i * g (contiguous MulAdd: g += (-s*dgv)*v).
+    TNNetVolume.MulAdd(@FgBuf[0], @V.FData[0], -s * dgv, N);
   end;
 
   if not FBatchUpdate then
@@ -71272,16 +71270,12 @@ begin
   for ReflIdx := 0 to MaxRefl do
   begin
     V := FArrNeurons[ReflIdx].FWeights;
-    beta := 0; dgv := 0;
-    for j := 0 to MaxN do
-    begin
-      beta := beta + V.FData[j] * V.FData[j];
-      dgv := dgv + V.FData[j] * FgBuf[j];
-    end;
+    // Contiguous length-N reductions and g-update -> depth-contiguous primitives.
+    beta := TNNetVolume.DotProduct(@V.FData[0], @V.FData[0], N);
+    dgv := TNNetVolume.DotProduct(@V.FData[0], @FgBuf[0], N);
     if beta < HOUSEHOLDER_MIN_BETA then continue;
     s := 2.0 / beta;
-    for j := 0 to MaxN do
-      FgBuf[j] := FgBuf[j] - s * dgv * V.FData[j];
+    TNNetVolume.MulAdd(@FgBuf[0], @V.FData[0], -s * dgv, N);
   end;
   for j := 0 to MaxN do
     LocalPrevError.FData[j] := LocalPrevError.FData[j] + FgBuf[j];
