@@ -515,6 +515,8 @@ type
     procedure TestVaeDecoderConfigFromJSONFile;
     procedure TestVaeDecoderParity;
     procedure TestVaeEncoderParity;
+    procedure TestSDUNetConfigFromJSONFile;
+    procedure TestSDUNetParity;
     procedure TestVaeRoundTrip;
     procedure TestVqModelEncodeParity;
     procedure TestVqModelDecodeParity;
@@ -20682,6 +20684,131 @@ begin
   finally
     RefRoot.Free;
     ImgInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestSDUNetConfigFromJSONFile;
+var
+  Config: TSDUNetConfig;
+begin
+  Config := ReadSDUNetConfigFromJSONFile(FixturePath('tiny_sd_unet_config.json'));
+  AssertEquals('model type', 'UNet2DConditionModel', Config.ModelType);
+  AssertEquals('num block out', 2, Config.NumBlockOut);
+  AssertEquals('block out 0', 16, Config.BlockOutChannels[0]);
+  AssertEquals('block out 1', 32, Config.BlockOutChannels[1]);
+  AssertEquals('layers per block', 1, Config.LayersPerBlock);
+  AssertEquals('cross dim', 12, Config.CrossAttentionDim);
+  AssertEquals('num heads', 2, Config.NumHeads);
+  AssertEquals('norm groups', 4, Config.NormNumGroups);
+  AssertEquals('latent grid', 8, Config.LatentGrid);
+  AssertEquals('time embed dim', 64, Config.TimeEmbedDim);
+  AssertTrue('down0 has attn', Config.DownHasAttn[0]);
+  AssertTrue('down1 no attn', not Config.DownHasAttn[1]);
+  AssertTrue('up0 no attn', not Config.UpHasAttn[0]);
+  AssertTrue('up1 has attn', Config.UpHasAttn[1]);
+end;
+
+// Stable Diffusion UNet parity test (diffusers UNet2DConditionModel).
+// tests/fixtures/tiny_sd_unet.* is a pico randomly-initialized UNet
+// (block_out_channels [16,32], down [CrossAttnDownBlock2D, DownBlock2D],
+// up [UpBlock2D, CrossAttnUpBlock2D], layers_per_block 1, cross_dim 12,
+// 2 heads, norm_num_groups 4, 8x8 latent, 4 in/out channels, text seq 5).
+// The generator tools/sd_unet_tiny_fixture.py builds a self-contained numpy
+// float64 oracle (diffusers is not installed) of the exact UNet forward. This
+// exercises conv_in, the sinusoidal+MLP timestep embedding with the [sin|cos]
+// -> [cos|sin] swap, the additive time injection inside each ResnetBlock2D,
+// the Transformer2DModel (proj_in/out + self-attn + text CROSS-attn over the
+// second TNNetInput + GEGLU FFN), down-path skip collection, the mid
+// resnet/cross-attn/resnet, the up-path skip concat + nearest upsample, and
+// conv_norm_out -> SiLU -> conv_out, end to end < 1e-4 vs the oracle on the
+// predicted noise for a fixed (latent, timestep, text-states) triple.
+procedure TTestNeuralPretrained.TestSDUNetParity;
+var
+  NN: TNNet;
+  Config: TSDUNetConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Latent, ChanArr, RowArr, NoiseArr, EncArr, EncRow: TJSONArray;
+  LatentInput, EncStates, Noise: TNNetVolume;
+  t: double;
+  Grid, ChanCnt, YCnt, XCnt, SCnt, DCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildSDUNetFromSafeTensors(
+    FixturePath('tiny_sd_unet.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_sd_unet_config.json'));
+  RefJson := TStringList.Create;
+  LatentInput := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    Grid := Config.LatentGrid;
+    AssertEquals('latent grid', Grid, NN.Layers[0].Output.SizeX);
+    RefJson.LoadFromFile(FixturePath('tiny_sd_unet_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Latent := TJSONArray(TJSONObject(RefRoot).Find('latent'));
+    NoiseArr := TJSONArray(TJSONObject(RefRoot).Find('noise'));
+    EncArr := TJSONArray(TJSONObject(RefRoot).Find('encoder_hidden_states'));
+    t := TJSONObject(RefRoot).Get('timestep', 0.0);
+    AssertTrue('latent present', Latent <> nil);
+    AssertEquals('output grid', Grid, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output channels', Config.OutChannels,
+      NN.GetLastLayer().Output.Depth);
+
+    // latent (C,H,W) -> CAI (x,y,depth) volume.
+    LatentInput.ReSize(Grid, Grid, Config.InChannels);
+    for ChanCnt := 0 to Config.InChannels - 1 do
+    begin
+      RowArr := TJSONArray(Latent.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+          LatentInput.FData[(YCnt * Grid + XCnt) * Config.InChannels + ChanCnt]
+            := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    // encoder_hidden_states (TextSeqLen, CrossDim) -> (SeqLen,1,CrossDim) volume.
+    EncStates.ReSize(Config.TextSeqLen, 1, Config.CrossAttentionDim);
+    for SCnt := 0 to Config.TextSeqLen - 1 do
+    begin
+      EncRow := TJSONArray(EncArr.Items[SCnt]);
+      for DCnt := 0 to Config.CrossAttentionDim - 1 do
+        EncStates.FData[SCnt * Config.CrossAttentionDim + DCnt] :=
+          EncRow.Items[DCnt].AsFloat;
+    end;
+
+    SDUNetDenoise(NN, Config, LatentInput, EncStates, t, Noise);
+
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.OutChannels - 1 do
+    begin
+      RowArr := TJSONArray(NoiseArr.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+        begin
+          RefVal := ChanArr.Items[XCnt].AsFloat;
+          GotVal := Noise.FData[(YCnt * Grid + XCnt) * Config.OutChannels +
+            ChanCnt];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('predicted noise: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    LatentInput.Free;
+    EncStates.Free;
+    Noise.Free;
     RefJson.Free;
     NN.Free;
   end;

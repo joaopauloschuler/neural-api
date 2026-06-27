@@ -278,7 +278,35 @@ rather than acted on.
       diffusers eps 1e-6); TestVaeDecoderParity <1e-4 vs a numpy float64 oracle):
   - [ ] real-checkpoint (stabilityai/sd-vae-ft-mse) parity once diffusers is
         installable; SDXL VAE uses different group counts / multi-head attention.
-  - [ ] the SD UNet itself (the remaining piece for end-to-end latent text-to-image).
+  - [X] the SD UNet itself (the remaining piece for end-to-end latent text-to-image).
+        DONE: BuildSDUNetFromSafeTensors[Ex] + ReadSDUNetConfigFromJSONFile +
+        SDUNetConfigToString + SDUNetDenoise in neuralpretrained.pas (full
+        UNet2DConditionModel v1: conv_in -> down blocks [ResnetBlock2D + optional
+        Transformer2DModel self+text-cross attn + downsample] -> mid
+        [resnet/cross-attn/resnet] -> up blocks [skip-concat + nearest upsample]
+        -> conv_norm_out/SiLU/conv_out; sinusoidal+MLP timestep embed with the
+        [sin|cos]->[cos|sin] swap; additive time injection via a FiLM
+        [ones|time_emb_proj] modulation; GroupNorm eps 1e-5 (resnet) vs 1e-6
+        (transformer); bias-free attn q/k/v; erf-GEGLU FFN; three TNNetInputs
+        latent/timestep/text-states). New helper procs AddSDResnetBlock /
+        AddSDTransformer2D (Coded by Claude). pico fixture
+        tools/sd_unet_tiny_fixture.py (numpy float64 oracle; diffusers not
+        installed) + TestSDUNetParity (max|diff| 2.75e-6 < 1e-4) + the config
+        reader test. DEFERRED follow-ups:
+    - [ ] real-checkpoint parity (runwayml/stable-diffusion-v1-5 unet) once
+          diffusers is installable; verify the SD attention_head_dim->num_heads
+          interpretation on the real config (the importer derives NumHeads =
+          block_out_channels[0]/attention_head_dim and assumes a constant head
+          count across blocks — SD1.5's 8-heads-everywhere case holds, but SDXL /
+          configs with a per-block attention_head_dim list need a per-block heads
+          array wired through TSDUNetConfig).
+    - [ ] use_linear_projection=True variant (SD2.x / SDXL use Linear proj_in/out
+          instead of 1x1 conv) + transformer_layers_per_block > 1 (SDXL stacks
+          several BasicTransformerBlocks per Transformer2DModel) — the v1 importer
+          hardcodes a 1x1-conv proj and exactly one transformer block.
+    - [ ] add_embedding / class/time-aug conditioning (SDXL micro-conditioning),
+          and the end-to-end LatentTextToImage capstone (CLIP text -> this UNet
+          -> scheduler loop -> VAE decoder).
 - [ ] Mask2Former universal-segmentation importer
       (BuildMask2FormerFromSafeTensors, e.g. facebook/mask2former-swin-tiny-*-semantic)
       — a third, architecturally DISTINCT segmentation vertical: mask-classification

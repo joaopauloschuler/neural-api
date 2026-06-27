@@ -9386,6 +9386,92 @@ function BuildVaeDecoderFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// STABLE DIFFUSION UNet IMPORT (diffusers UNet2DConditionModel - the text-
+// conditioned latent DENOISER behind Stable Diffusion v1.x / v2.x). This is
+// the convolutional U-Net that the DiT importer's transformer backbone is the
+// modern alternative to; importing it (plus the landed VAE decoder and a CLIP
+// text encoder) completes the classic latent text-to-image pipeline and
+// unblocks ControlNet / AnimateDiff / the LatentTextToImage capstone.
+//
+// v1 SCOPE (inference): the full SD1.5 UNet2DConditionModel topology -
+//   conv_in (3x3) -> N down blocks -> mid block -> N up blocks (with skip
+//   concat) -> conv_norm_out/SiLU -> conv_out (3x3). Each down/up block is a
+//   stack of ResnetBlock2D (additive timestep-embedding injection) optionally
+//   interleaved with Transformer2DModel spatial-self + text-CROSS attention;
+//   CrossAttn*Block2D vs plain Down/UpBlock2D is chosen per-block by
+//   down_block_types/up_block_types. The mid block is UNetMidBlock2DCrossAttn
+//   (resnet -> cross-attn transformer -> resnet). Time embedding =
+//   sinusoidal(t) -> Linear -> SiLU -> Linear. Almost every leaf reuses the
+//   VAE-decoder helpers (LoadVaeConv, GroupNorm, ResnetBlock2D builder); the
+//   genuinely-new pieces are the timestep MLP, the additive FiLM-style time
+//   injection inside each ResNet, the Transformer2DModel (proj_in/out 1x1 conv
+//   + a pre-norm BasicTransformerBlock with self-attn, text cross-attn over a
+//   SECOND TNNetInput, and a GEGLU feed-forward), and the down/up skip wiring.
+//
+// THREE TNNetInputs (the T5EncoderStatesInput multi-input convention, all
+// filled before Compute): input0 = the (LatentGrid,LatentGrid,InChannels)
+// noisy latent; input1 = the (1,1,1) scalar timestep t (the sinusoidal+MLP
+// runs INSIDE the net); input2 = the (TextSeqLen,1,CrossAttentionDim) text
+// encoder_hidden_states (CLIP). SDUNetDenoise fills all three, Computes, and
+// reads the (InChannels) predicted-noise volume. Exact diffusers conventions:
+//   * timestep embedding flip_sin_to_cos=True -> [cos|sin]; the framework
+//     TNNetSinusoidalTimeEmbedding emits [sin|cos], so the importer SWAPS the
+//     two halves of time_embedding.linear_1's input columns at load (as DiT).
+//   * ResnetBlock2D GroupNorm / conv_norm_out eps = 1e-5; the Transformer2DModel
+//     pre-norm GroupNorm eps = 1e-6 (DISTINCT - diffusers uses both).
+//   * attention to_q/to_k/to_v are bias-FREE; to_out.0 is biased; 1/sqrt(head)
+//     scale; heads = channels div attention_head_dim's per-head size (SD1.5
+//     interprets the config field so num_heads is fixed per block).
+//   * GEGLU feed-forward uses EXACT erf GELU (TNNetGEGLUErf); inner = 4*dim.
+//   * Downsample2D = symmetric pad=1 stride-2 3x3 conv (NOT the VAE encoder's
+//     asymmetric pad); Upsample2D = nearest-2x (TNNetDeMaxPool) + 3x3 conv.
+// ---------------------------------------------------------------------------
+type
+  TSDUNetConfig = record
+    InChannels: integer;                      // latent in_channels (4)
+    OutChannels: integer;                     // predicted-noise channels (4)
+    NumBlockOut: integer;                     // length of BlockOutChannels
+    BlockOutChannels: array[0..7] of integer; // diffusers block_out_channels
+    DownHasAttn: array[0..7] of boolean;      // CrossAttnDownBlock2D? per down
+    UpHasAttn: array[0..7] of boolean;        // CrossAttnUpBlock2D? per up
+    LayersPerBlock: integer;                  // resnets per down block
+    CrossAttentionDim: integer;               // text encoder width (768)
+    NumHeads: integer;                        // attention heads (per layer)
+    NormNumGroups: integer;                   // GroupNorm groups (32)
+    LatentGrid: integer;                      // latent H=W for the Input
+    TextSeqLen: integer;                      // encoder_hidden_states length
+    TimeEmbedDim: integer;                    // 4*BlockOutChannels[0]
+    ModelType: string;                        // 'UNet2DConditionModel'
+  end;
+
+function ReadSDUNetConfigFromJSONFile(const FileName: string): TSDUNetConfig;
+
+function SDUNetConfigToString(const Config: TSDUNetConfig): string;
+
+// Builds the UNet2DConditionModel described by Config and loads every weight
+// from Reader (caller owns Reader). Three TNNetInputs (latent, timestep, text
+// states). See SDUNetDenoise for the driver.
+function BuildSDUNet(Reader: TNNetSafeTensorsReader;
+  const Config: TSDUNetConfig; pTrainable: boolean = true): TNNet;
+
+function BuildSDUNetFromSafeTensorsEx(const FileName: string;
+  const Config: TSDUNetConfig; pTrainable: boolean = true): TNNet;
+
+function BuildSDUNetFromSafeTensors(const FileName: string;
+  out Config: TSDUNetConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+
+// Returns the timestep (input1) / text-states (input2) TNNetInput of a UNet.
+function SDUNetTimestepInput(Net: TNNet): TNNetLayer;
+function SDUNetTextStatesInput(Net: TNNet): TNNetLayer;
+
+// Fills all three inputs, runs one forward, and copies the predicted noise
+// (InChannels, LatentGrid, LatentGrid) into Noise. Latent/EncStates are
+// (InChannels,Grid,Grid)/(TextSeqLen,1,CrossDim) volumes.
+procedure SDUNetDenoise(Net: TNNet; const Config: TSDUNetConfig;
+  Latent, EncStates: TNNetVolume; t: TNeuralFloat; Noise: TNNetVolume);
+
+// ---------------------------------------------------------------------------
 // STABLE DIFFUSION VAE ENCODER IMPORT (diffusers AutoencoderKL ENCODER), the
 // mirror image of the decoder above; together they form a full AutoencoderKL
 // round-trip. The encoder maps an RGB image to the latent moments and reuses
@@ -59262,6 +59348,702 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadVaeDecoderConfigFromJSONFile(ConfigPath);
   Result := BuildVaeDecoderFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+// ===========================================================================
+// STABLE DIFFUSION UNet IMPORT (diffusers UNet2DConditionModel) -- see the
+// interface header for the full architecture / convention notes.
+// ===========================================================================
+const
+  SDUNET_RES_EPS = 0.00001;   // ResnetBlock2D / conv_norm_out GroupNorm eps
+  SDUNET_TR_EPS  = 0.000001;  // Transformer2DModel pre-norm GroupNorm eps
+
+function ReadSDUNetConfigFromJSONFile(const FileName: string): TSDUNetConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ArrData: TJSONData;
+  Arr: TJSONArray;
+  ClassName, s: string;
+  i, AttnHeadDim, SampleSize, LpMax: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('SD UNet import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('SD UNet import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('SD UNet import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ClassName := Obj.Get('_class_name', Obj.Get('model_type',
+      'UNet2DConditionModel'));
+    if ClassName <> 'UNet2DConditionModel' then
+      ImportError('SD UNet import: _class_name is "' + ClassName +
+        '" - only UNet2DConditionModel is supported here.');
+    Result.ModelType := ClassName;
+    // block_out_channels (REQUIRED).
+    ArrData := Obj.Find('block_out_channels');
+    if (ArrData = nil) or not (ArrData is TJSONArray) then
+      ImportError('SD UNet import: missing required array "block_out_channels".');
+    Arr := TJSONArray(ArrData);
+    if (Arr.Count < 2) or (Arr.Count > 8) then
+      ImportError('SD UNet import: "block_out_channels" must have 2..8 entries, '
+        + 'got ' + IntToStr(Arr.Count) + '.');
+    Result.NumBlockOut := Arr.Count;
+    LpMax := Arr.Count - 1;
+    for i := 0 to LpMax do Result.BlockOutChannels[i] := Arr.Integers[i];
+    // down_block_types / up_block_types -> per-block attention flags.
+    ArrData := Obj.Find('down_block_types');
+    if (ArrData = nil) or not (ArrData is TJSONArray) or
+       (TJSONArray(ArrData).Count <> Result.NumBlockOut) then
+      ImportError('SD UNet import: "down_block_types" must be an array of ' +
+        IntToStr(Result.NumBlockOut) + ' entries.');
+    Arr := TJSONArray(ArrData);
+    for i := 0 to LpMax do
+    begin
+      s := Arr.Strings[i];
+      if s = 'CrossAttnDownBlock2D' then Result.DownHasAttn[i] := true
+      else if s = 'DownBlock2D' then Result.DownHasAttn[i] := false
+      else ImportError('SD UNet import: unsupported down_block_types[' +
+        IntToStr(i) + '] = "' + s + '" (need CrossAttnDownBlock2D/DownBlock2D).');
+    end;
+    ArrData := Obj.Find('up_block_types');
+    if (ArrData = nil) or not (ArrData is TJSONArray) or
+       (TJSONArray(ArrData).Count <> Result.NumBlockOut) then
+      ImportError('SD UNet import: "up_block_types" must be an array of ' +
+        IntToStr(Result.NumBlockOut) + ' entries.');
+    Arr := TJSONArray(ArrData);
+    for i := 0 to LpMax do
+    begin
+      s := Arr.Strings[i];
+      if s = 'CrossAttnUpBlock2D' then Result.UpHasAttn[i] := true
+      else if s = 'UpBlock2D' then Result.UpHasAttn[i] := false
+      else ImportError('SD UNet import: unsupported up_block_types[' +
+        IntToStr(i) + '] = "' + s + '" (need CrossAttnUpBlock2D/UpBlock2D).');
+    end;
+    if Obj.IndexOfName('layers_per_block') < 0 then
+      ImportError('SD UNet import: missing required "layers_per_block".');
+    Result.LayersPerBlock := Obj.Get('layers_per_block', 0);
+    if Result.LayersPerBlock < 1 then
+      ImportError('SD UNet import: "layers_per_block" must be >= 1.');
+    Result.InChannels := Obj.Get('in_channels', 4);
+    Result.OutChannels := Obj.Get('out_channels', 4);
+    Result.CrossAttentionDim := Obj.Get('cross_attention_dim', 768);
+    Result.NormNumGroups := Obj.Get('norm_num_groups', 32);
+    Result.TimeEmbedDim := 4 * Result.BlockOutChannels[0];
+    Result.TextSeqLen := Obj.Get('text_seq_len', Obj.Get('max_position_embeddings', 77));
+    // attention_head_dim: SD interprets this so heads is FIXED per block;
+    // diffusers num_heads = channels div attention_head_dim is NOT how SD1.5
+    // behaves (it uses 8 heads everywhere). We treat the field as the per-head
+    // DIM only when it divides every block width and yields a consistent head
+    // count; the pico fixture pins a clean value. heads[block] = C[block]/dim.
+    AttnHeadDim := Obj.Get('attention_head_dim', 8);
+    if AttnHeadDim < 1 then
+      ImportError('SD UNet import: attention_head_dim must be >= 1.');
+    // Derive a single NumHeads from the FIRST attended block (the importer
+    // builds each Transformer2D with C/AttnHeadDim heads via NumHeads recompute
+    // below; for the common SD configs NumHeads is constant). Store the per-head
+    // dim in NumHeads-as-divisor form: we keep NumHeads = BlockOut[0]/dim.
+    if (Result.BlockOutChannels[0] mod AttnHeadDim) <> 0 then
+      ImportError('SD UNet import: block_out_channels[0]=' +
+        IntToStr(Result.BlockOutChannels[0]) + ' not divisible by ' +
+        'attention_head_dim=' + IntToStr(AttnHeadDim) + '.');
+    Result.NumHeads := Result.BlockOutChannels[0] div AttnHeadDim;
+    if Result.NumHeads < 1 then Result.NumHeads := 1;
+    // Latent grid: pico fixture pins it via "latent_size"; a real config gives
+    // "sample_size" (the latent spatial size for the UNet, already in latent
+    // space, so latent_grid = sample_size directly).
+    if Obj.IndexOfName('latent_size') >= 0 then
+      Result.LatentGrid := Obj.Get('latent_size', 0)
+    else
+    begin
+      SampleSize := Obj.Get('sample_size', 0);
+      if SampleSize <= 0 then
+        ImportError('SD UNet import: config needs "latent_size" or "sample_size".');
+      Result.LatentGrid := SampleSize;
+    end;
+    if Result.LatentGrid < 1 then
+      ImportError('SD UNet import: resolved latent grid is ' +
+        IntToStr(Result.LatentGrid) + ' (must be >= 1).');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function SDUNetConfigToString(const Config: TSDUNetConfig): string;
+var
+  i, NumBlockOutM1: integer;
+begin
+  Result := Config.ModelType + ': block_out_channels=[';
+  NumBlockOutM1 := Config.NumBlockOut - 1;
+  for i := 0 to NumBlockOutM1 do
+  begin
+    if i > 0 then Result := Result + ',';
+    Result := Result + IntToStr(Config.BlockOutChannels[i]);
+  end;
+  Result := Result + '], layers_per_block=' + IntToStr(Config.LayersPerBlock) +
+    ', in/out=' + IntToStr(Config.InChannels) + '/' +
+    IntToStr(Config.OutChannels) +
+    ', cross_dim=' + IntToStr(Config.CrossAttentionDim) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', groups=' + IntToStr(Config.NormNumGroups) +
+    ', latent_grid=' + IntToStr(Config.LatentGrid) +
+    ', text_seq=' + IntToStr(Config.TextSeqLen);
+end;
+
+type
+  TSDResnetLayers = record
+    GN1, Conv1, TimeProj, GN2, Conv2, Shortcut: TNNetLayer;
+  end;
+  TSDAttnLayers = record
+    GN, ProjIn, ProjOut: TNNetLayer;
+    LN1, LN2, LN3: TNNetLayer;
+    Self_QKV, Self_Out: TNNetLayer;
+    Cross_Q, Cross_K, Cross_V, Cross_Out: TNNetLayer;
+    FfProj, FfOut: TNNetLayer;
+  end;
+
+// One diffusers ResnetBlock2D with ADDITIVE timestep injection. Same pre-norm
+// residual idiom as AddVaeResnetBlock, but after conv1 the (1,1,out_ch)
+// projection of SiLU(temb) is added to every spatial position via a FiLM
+// modulation [gamma=1 | beta=time_proj] (FiLM broadcasts beta across X,Y).
+// Coded by Claude (AI).
+procedure AddSDResnetBlock(NN: TNNet; const Config: TSDUNetConfig;
+  TimeCond, Input: TNNetLayer; InCh, OutCh: integer; pTrainable: boolean;
+  out Refs: TSDResnetLayers);
+var
+  Branch, TSilu, ModVec, Conv1Out, Injected: TNNetLayer;
+  Groups: integer;
+begin
+  Refs.GN1 := nil; Refs.Conv1 := nil; Refs.TimeProj := nil; Refs.GN2 := nil;
+  Refs.Conv2 := nil; Refs.Shortcut := nil;
+  Groups := Config.NormNumGroups;
+  Refs.GN1 := NN.AddLayerAfter( TNNetGroupNorm.Create(Groups), Input );
+  NN.AddLayer( TNNetSiLU.Create() );
+  Refs.Conv1 := NN.AddLayer(
+    TNNetConvolutionLinear.Create(OutCh, 3, 1, 1, 0).SetTrainable(pTrainable) );
+  Conv1Out := NN.GetLastLayer();
+  // time injection: a (1,1,2*OutCh) [gamma|beta] modulation, FiLM-broadcast
+  // over the spatial grid -> gamma*h + beta. gamma is loaded as the CONSTANT
+  // ones vector (zero weights, bias 1.0) so FiLM reduces to the diffusers
+  // ADDITIVE injection h + time_emb_proj(SiLU(temb)); beta = time_emb_proj.
+  TSilu := NN.AddLayerAfter( TNNetSiLU.Create(), TimeCond );
+  Refs.TimeProj := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(2 * OutCh).SetTrainable(pTrainable) );
+  ModVec := Refs.TimeProj;
+  Injected := NN.AddLayer( TNNetFiLM.Create([Conv1Out, ModVec]) );
+  // continue the main path from the injected hidden state.
+  NN.AddLayerAfter( TNNetGroupNorm.Create(Groups), Injected );
+  Refs.GN2 := NN.GetLastLayer();
+  NN.AddLayer( TNNetSiLU.Create() );
+  Refs.Conv2 := NN.AddLayer(
+    TNNetConvolutionLinear.Create(OutCh, 3, 1, 1, 0).SetTrainable(pTrainable) );
+  Branch := NN.GetLastLayer();
+  if InCh <> OutCh then
+  begin
+    Refs.Shortcut := NN.AddLayerAfter(
+      [TNNetConvolutionLinear.Create(OutCh, 1, 0, 1, 0).SetTrainable(pTrainable)], Input);
+    NN.AddLayer( TNNetSum.Create([Branch, Refs.Shortcut]) );
+  end
+  else
+    NN.AddLayer( TNNetSum.Create([Branch, Input]) );
+end;
+
+procedure LoadSDResnetBlock(Reader: TNNetSafeTensorsReader;
+  const Refs: TSDResnetLayers; const Prefix: string;
+  InCh, OutCh: integer; const Config: TSDUNetConfig);
+var
+  gi: integer;
+begin
+  LoadVaeGroupNorm(Reader, Refs.GN1, Prefix + 'norm1', InCh, SDUNET_RES_EPS);
+  LoadVaeConv(Reader, Refs.Conv1, Prefix + 'conv1.weight', Prefix + 'conv1.bias',
+    OutCh, InCh, 3);
+  // TimeProj is a 2*OutCh PointwiseConvLinear holding [gamma | beta]: the first
+  // OutCh neurons are the CONSTANT ones vector (zero weights, bias 1.0); the
+  // next OutCh neurons load time_emb_proj (the additive beta).
+  for gi := 0 to OutCh - 1 do
+  begin
+    Refs.TimeProj.FArrNeurons[gi].Weights.Fill(0.0);
+    Refs.TimeProj.FArrNeurons[gi].BiasWeight := 1.0;
+  end;
+  LoadLlamaLinearWeights(Reader, Refs.TimeProj, Prefix + 'time_emb_proj.weight',
+    Config.TimeEmbedDim, OutCh, {NeuronBase=}OutCh, {ExpectedNeurons=}2 * OutCh,
+    0, Prefix + 'time_emb_proj.bias');
+  Refs.TimeProj.FlushWeightCache();
+  LoadVaeGroupNorm(Reader, Refs.GN2, Prefix + 'norm2', OutCh, SDUNET_RES_EPS);
+  LoadVaeConv(Reader, Refs.Conv2, Prefix + 'conv2.weight', Prefix + 'conv2.bias',
+    OutCh, OutCh, 3);
+  if Refs.Shortcut <> nil then
+    LoadVaeConv(Reader, Refs.Shortcut, Prefix + 'conv_shortcut.weight',
+      Prefix + 'conv_shortcut.bias', OutCh, InCh, 1);
+end;
+
+// One diffusers Transformer2DModel: GroupNorm(eps 1e-6) -> proj_in(1x1) ->
+// flatten (H,W,C)->(H*W,1,C) -> a single pre-norm BasicTransformerBlock
+// (self-attn, text cross-attn over TextStates, GEGLU FFN) -> reshape ->
+// proj_out(1x1) -> + residual(input). Self-attn is built per-head exactly like
+// the VAE mid-attention but with token LayerNorm; cross-attn uses per-head
+// TNNetCrossAttention over the projected text states (the landed two-source
+// recipe).
+// Coded by Claude (AI).
+procedure AddSDTransformer2D(NN: TNNet; const Config: TSDUNetConfig;
+  TextStates, Input: TNNetLayer; Channels: integer; pTrainable: boolean;
+  out Refs: TSDAttnLayers);
+var
+  ResidualIn, Tokens, X1, X2, X3, AttnOut, CrossOut, FfHidden: TNNetLayer;
+  KSlice, VSlice, QSlice, KVPack, KProjFull, VProjFull, QProjFull: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  QChannels: array of integer;
+  H, W, HeadDim, Heads, hh, dd, Inner, HeadsM1, HeadDimM1: integer;
+begin
+  ResidualIn := Input;
+  H := ResidualIn.Output.SizeY;
+  W := ResidualIn.Output.SizeX;
+  Heads := Config.NumHeads;
+  HeadDim := Channels div Heads;
+  HeadsM1 := Heads - 1;
+  HeadDimM1 := HeadDim - 1;
+  Inner := 4 * Channels;
+  Refs.GN := NN.AddLayerAfter( TNNetGroupNorm.Create(Config.NormNumGroups), Input );
+  Refs.ProjIn := NN.AddLayer(
+    TNNetConvolutionLinear.Create(Channels, 1, 0, 1, 0).SetTrainable(pTrainable) );
+  // flatten the spatial grid row-major to (H*W,1,C) tokens.
+  NN.AddLayer( TNNetReshape.Create(H * W, 1, Channels) );
+  Tokens := NN.GetLastLayer();
+  SetLength(HeadOutputs, Heads);
+  SetLength(QChannels, HeadDim);
+
+  // ---- self-attention (pre-norm) ----
+  Refs.LN1 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), Tokens);
+  Refs.Self_QKV := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(3 * Channels, {SuppressBias=}1).SetTrainable(pTrainable) );
+  AttnOut := NN.AddMultiHeadSelfAttention(Heads, {CausalMask=}false);
+  Refs.Self_Out := NN.GetLastLayer();
+  X1 := NN.AddLayer( TNNetSum.Create([Refs.Self_Out, Tokens]) );
+
+  // ---- cross-attention (pre-norm; K|V from text states) ----
+  Refs.LN2 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), X1);
+  QProjFull := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Channels, {SuppressBias=}1).SetTrainable(pTrainable), Refs.LN2);
+  Refs.Cross_Q := QProjFull;
+  KProjFull := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Channels, {SuppressBias=}1).SetTrainable(pTrainable), TextStates);
+  Refs.Cross_K := KProjFull;
+  VProjFull := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Channels, {SuppressBias=}1).SetTrainable(pTrainable), TextStates);
+  Refs.Cross_V := VProjFull;
+  for hh := 0 to HeadsM1 do
+  begin
+    for dd := 0 to HeadDimM1 do QChannels[dd] := hh * HeadDim + dd;
+    QSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), QProjFull);
+    KSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), KProjFull);
+    VSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), VProjFull);
+    KVPack := NN.AddLayer(TNNetDeepConcat.Create([KSlice, VSlice]));
+    HeadOutputs[hh] := NN.AddLayerAfter(
+      TNNetCrossAttention.Create(HeadDim, {CausalMask=}false, KVPack), QSlice);
+  end;
+  NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+  Refs.Cross_Out := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Channels).SetTrainable(pTrainable) );
+  CrossOut := NN.GetLastLayer();
+  X2 := NN.AddLayer( TNNetSum.Create([CrossOut, X1]) );
+
+  // ---- GEGLU feed-forward (pre-norm) ----
+  Refs.LN3 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), X2);
+  Refs.FfProj := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(2 * Inner).SetTrainable(pTrainable) );
+  NN.AddLayer( TNNetGEGLUErf.Create() );
+  FfHidden := NN.GetLastLayer();
+  Refs.FfOut := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Channels).SetTrainable(pTrainable) );
+  X3 := NN.AddLayer( TNNetSum.Create([Refs.FfOut, X2]) );
+
+  // ---- fold tokens back to (W,H,C), proj_out, + residual ----
+  NN.AddLayerAfter( TNNetReshape.Create(W, H, Channels), X3 );
+  Refs.ProjOut := NN.AddLayer(
+    TNNetConvolutionLinear.Create(Channels, 1, 0, 1, 0).SetTrainable(pTrainable) );
+  NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), ResidualIn]) );
+  SetLength(HeadOutputs, 0);
+  SetLength(QChannels, 0);
+end;
+
+procedure LoadSDTransformer2D(Reader: TNNetSafeTensorsReader;
+  const Refs: TSDAttnLayers; const Prefix: string;
+  Channels: integer; const Config: TSDUNetConfig);
+var
+  d, Inner: integer;
+  P, TB: string;
+begin
+  d := Channels;
+  Inner := 4 * Channels;
+  P := Prefix;
+  TB := Prefix + 'transformer_blocks.0.';
+  LoadVaeGroupNorm(Reader, Refs.GN, P + 'norm', d, SDUNET_TR_EPS);
+  LoadVaeConv(Reader, Refs.ProjIn, P + 'proj_in.weight', P + 'proj_in.bias',
+    d, d, 1);
+  LoadVaeConv(Reader, Refs.ProjOut, P + 'proj_out.weight', P + 'proj_out.bias',
+    d, d, 1);
+  // norms (token LayerNorm gain/bias).
+  LoadLayerNormWeights(Reader, Refs.LN1, TB + 'norm1.weight', TB + 'norm1.bias', d);
+  LoadLayerNormWeights(Reader, Refs.LN2, TB + 'norm2.weight', TB + 'norm2.bias', d);
+  LoadLayerNormWeights(Reader, Refs.LN3, TB + 'norm3.weight', TB + 'norm3.bias', d);
+  // self-attention: q/k/v bias-free -> fused Q|K|V slab; to_out.0 biased.
+  LoadLlamaLinearWeights(Reader, Refs.Self_QKV, TB + 'attn1.to_q.weight',
+    d, d, 0, 3 * d, 0, '');
+  LoadLlamaLinearWeights(Reader, Refs.Self_QKV, TB + 'attn1.to_k.weight',
+    d, d, d, 3 * d, 0, '');
+  LoadLlamaLinearWeights(Reader, Refs.Self_QKV, TB + 'attn1.to_v.weight',
+    d, d, 2 * d, 3 * d, 0, '');
+  LoadLlamaLinearWeights(Reader, Refs.Self_Out, TB + 'attn1.to_out.0.weight',
+    d, d, 0, -1, 0, TB + 'attn1.to_out.0.bias');
+  // cross-attention: to_q over image (d->d), to_k/to_v over text (cross->d),
+  // all bias-free; to_out.0 biased.
+  LoadLlamaLinearWeights(Reader, Refs.Cross_Q, TB + 'attn2.to_q.weight',
+    d, d, 0, -1, 0, '');
+  LoadLlamaLinearWeights(Reader, Refs.Cross_K, TB + 'attn2.to_k.weight',
+    Config.CrossAttentionDim, d, 0, -1, 0, '');
+  LoadLlamaLinearWeights(Reader, Refs.Cross_V, TB + 'attn2.to_v.weight',
+    Config.CrossAttentionDim, d, 0, -1, 0, '');
+  LoadLlamaLinearWeights(Reader, Refs.Cross_Out, TB + 'attn2.to_out.0.weight',
+    d, d, 0, -1, 0, TB + 'attn2.to_out.0.bias');
+  // GEGLU ff: net.0.proj (d -> 2*inner) biased; net.2 (inner -> d) biased.
+  // TNNetGEGLUErf consumes [hidden|gate] in the same chunk(2) order.
+  LoadLlamaLinearWeights(Reader, Refs.FfProj, TB + 'ff.net.0.proj.weight',
+    d, 2 * Inner, 0, -1, 0, TB + 'ff.net.0.proj.bias');
+  LoadLlamaLinearWeights(Reader, Refs.FfOut, TB + 'ff.net.2.weight',
+    Inner, d, 0, -1, 0, TB + 'ff.net.2.bias');
+end;
+
+function BuildSDUNet(Reader: TNNetSafeTensorsReader;
+  const Config: TSDUNetConfig; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  LatentInput, TInput, TextInput, ConvIn, TSin, TFc0, TSilu, TFc2: TNNetLayer;
+  TimeCond, NormOut, ConvOut, HLayer: TNNetLayer;
+  WVol: TNNetVolume;
+  SwapTmp: TNeuralFloat;
+  d0, half, halfM1, n, nM1, NumResnet, i, j, ci, b: integer;
+  InCh, OutCh, MidCh, RevIdx, PrevOut, InputCh, ResSkip, ResnetIn: integer;
+  Prefix: string;
+  // skip stack (down-path res samples) + per-block layer refs.
+  Skips: array of TNNetLayer;
+  SkipCh: array of integer;
+  SkipTop: integer;
+  DownRes: array of array of TSDResnetLayers;
+  DownAttn: array of array of TSDAttnLayers;
+  DownSamp: array of TNNetLayer;
+  MidRes1, MidRes2: TSDResnetLayers;
+  MidAttn: TSDAttnLayers;
+  UpRes: array of array of TSDResnetLayers;
+  UpAttn: array of array of TSDAttnLayers;
+  UpSamp: array of TNNetLayer;
+  PoppedCh: integer;
+begin
+  n := Config.NumBlockOut;
+  nM1 := n - 1;
+  d0 := Config.BlockOutChannels[0];
+  NumResnet := Config.LayersPerBlock;
+  if (Config.NumHeads < 1) then
+    ImportError('SD UNet import: num_heads must be >= 1.');
+  NN := TNNet.Create();
+  try
+    SetLength(DownRes, n);
+    SetLength(DownAttn, n);
+    SetLength(DownSamp, n);
+    SetLength(UpRes, n);
+    SetLength(UpAttn, n);
+    SetLength(UpSamp, n);
+    SetLength(Skips, 64);
+    SetLength(SkipCh, 64);
+    SkipTop := 0;
+
+    // ---------------- Architecture ----------------
+    // input0: noisy latent.
+    LatentInput := NN.AddLayer( TNNetInput.Create(Config.LatentGrid,
+      Config.LatentGrid, Config.InChannels) );
+    ConvIn := NN.AddLayer(
+      TNNetConvolutionLinear.Create(d0, 3, 1, 1, 0).SetTrainable(pTrainable) );
+    HLayer := ConvIn;
+    Skips[SkipTop] := HLayer; SkipCh[SkipTop] := d0; Inc(SkipTop);
+
+    // input1: scalar timestep -> sinusoidal -> 2-layer MLP -> TimeCond.
+    TInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
+    TSin := NN.AddLayer( TNNetSinusoidalTimeEmbedding.Create(d0) );
+    TFc0 := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.TimeEmbedDim).SetTrainable(pTrainable) );
+    TSilu := NN.AddLayer( TNNetSiLU.Create() );
+    TFc2 := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.TimeEmbedDim).SetTrainable(pTrainable) );
+    TimeCond := TFc2;
+
+    // input2: text encoder states (TextSeqLen,1,CrossDim).
+    TextInput := NN.AddLayer( TNNetInput.Create(Config.TextSeqLen, 1,
+      Config.CrossAttentionDim) );
+
+    if not pTrainable then NN.SetTrainable();
+
+    // ---- DOWN blocks ----
+    InCh := d0;
+    for i := 0 to nM1 do
+    begin
+      OutCh := Config.BlockOutChannels[i];
+      SetLength(DownRes[i], NumResnet);
+      SetLength(DownAttn[i], NumResnet);
+      for j := 0 to NumResnet - 1 do
+      begin
+        if j = 0 then b := InCh else b := OutCh;
+        AddSDResnetBlock(NN, Config, TimeCond, HLayer, b, OutCh, pTrainable,
+          DownRes[i][j]);
+        HLayer := NN.GetLastLayer();
+        if Config.DownHasAttn[i] then
+        begin
+          AddSDTransformer2D(NN, Config, TextInput, HLayer, OutCh, pTrainable,
+            DownAttn[i][j]);
+          HLayer := NN.GetLastLayer();
+        end;
+        Skips[SkipTop] := HLayer; SkipCh[SkipTop] := OutCh; Inc(SkipTop);
+      end;
+      InCh := OutCh;
+      if i < nM1 then
+      begin
+        // Downsample2D: symmetric pad-1 stride-2 3x3 conv.
+        DownSamp[i] := NN.AddLayerAfter(
+          [TNNetConvolutionLinear.Create(OutCh, 3, 1, 2, 0).SetTrainable(pTrainable)],
+          HLayer);
+        HLayer := NN.GetLastLayer();
+        Skips[SkipTop] := HLayer; SkipCh[SkipTop] := OutCh; Inc(SkipTop);
+      end
+      else
+        DownSamp[i] := nil;
+    end;
+
+    // ---- MID block (resnet -> cross-attn transformer -> resnet) ----
+    MidCh := Config.BlockOutChannels[nM1];
+    AddSDResnetBlock(NN, Config, TimeCond, HLayer, MidCh, MidCh, pTrainable,
+      MidRes1);
+    HLayer := NN.GetLastLayer();
+    AddSDTransformer2D(NN, Config, TextInput, HLayer, MidCh, pTrainable, MidAttn);
+    HLayer := NN.GetLastLayer();
+    AddSDResnetBlock(NN, Config, TimeCond, HLayer, MidCh, MidCh, pTrainable,
+      MidRes2);
+    HLayer := NN.GetLastLayer();
+
+    // ---- UP blocks ----
+    PrevOut := Config.BlockOutChannels[nM1];
+    for i := 0 to nM1 do
+    begin
+      RevIdx := nM1 - i;
+      OutCh := Config.BlockOutChannels[RevIdx];
+      if RevIdx - 1 >= 0 then InputCh := Config.BlockOutChannels[RevIdx - 1]
+      else InputCh := Config.BlockOutChannels[0];
+      SetLength(UpRes[i], NumResnet + 1);
+      SetLength(UpAttn[i], NumResnet + 1);
+      for j := 0 to NumResnet do
+      begin
+        // pop the LIFO skip, concat on channels, then resnet.
+        Dec(SkipTop);
+        PoppedCh := SkipCh[SkipTop];
+        if j = 0 then ResnetIn := PrevOut else ResnetIn := OutCh;
+        NN.AddLayerAfter( [TNNetDeepConcat.Create([HLayer, Skips[SkipTop]])], HLayer );
+        HLayer := NN.GetLastLayer();
+        AddSDResnetBlock(NN, Config, TimeCond, HLayer, ResnetIn + PoppedCh,
+          OutCh, pTrainable, UpRes[i][j]);
+        HLayer := NN.GetLastLayer();
+        if Config.UpHasAttn[i] then
+        begin
+          AddSDTransformer2D(NN, Config, TextInput, HLayer, OutCh, pTrainable,
+            UpAttn[i][j]);
+          HLayer := NN.GetLastLayer();
+        end;
+      end;
+      PrevOut := OutCh;
+      if i < nM1 then
+      begin
+        NN.AddLayer( TNNetDeMaxPool.Create(2) );
+        UpSamp[i] := NN.AddLayer(
+          TNNetConvolutionLinear.Create(OutCh, 3, 1, 1, 0).SetTrainable(pTrainable) );
+        HLayer := NN.GetLastLayer();
+      end
+      else
+        UpSamp[i] := nil;
+    end;
+
+    // ---- OUT ----
+    NormOut := NN.AddLayer( TNNetGroupNorm.Create(Config.NormNumGroups) );
+    NN.AddLayer( TNNetSiLU.Create() );
+    ConvOut := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Config.OutChannels, 3, 1, 1, 0).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
+
+    // ---------------- Weights ----------------
+    LoadVaeConv(Reader, ConvIn, 'conv_in.weight', 'conv_in.bias', d0,
+      Config.InChannels, 3);
+    // time MLP. linear_1 input columns are [sin|cos] (framework) but diffusers
+    // wants [cos|sin]; swap the two halves at load.
+    half := d0 div 2;
+    halfM1 := half - 1;
+    LoadLlamaLinearWeights(Reader, TFc0, 'time_embedding.linear_1.weight',
+      d0, Config.TimeEmbedDim, 0, -1, 0, 'time_embedding.linear_1.bias');
+    for i := 0 to Config.TimeEmbedDim - 1 do
+    begin
+      WVol := TFc0.FArrNeurons[i].Weights;
+      for ci := 0 to halfM1 do
+      begin
+        SwapTmp := WVol.FData[ci];
+        WVol.FData[ci] := WVol.FData[half + ci];
+        WVol.FData[half + ci] := SwapTmp;
+      end;
+    end;
+    TFc0.FlushWeightCache();
+    LoadLlamaLinearWeights(Reader, TFc2, 'time_embedding.linear_2.weight',
+      Config.TimeEmbedDim, Config.TimeEmbedDim, 0, -1, 0,
+      'time_embedding.linear_2.bias');
+
+    // down blocks.
+    InCh := d0;
+    for i := 0 to nM1 do
+    begin
+      OutCh := Config.BlockOutChannels[i];
+      for j := 0 to NumResnet - 1 do
+      begin
+        if j = 0 then b := InCh else b := OutCh;
+        Prefix := 'down_blocks.' + IntToStr(i) + '.resnets.' + IntToStr(j) + '.';
+        LoadSDResnetBlock(Reader, DownRes[i][j], Prefix, b, OutCh, Config);
+        if Config.DownHasAttn[i] then
+          LoadSDTransformer2D(Reader, DownAttn[i][j],
+            'down_blocks.' + IntToStr(i) + '.attentions.' + IntToStr(j) + '.',
+            OutCh, Config);
+      end;
+      InCh := OutCh;
+      if DownSamp[i] <> nil then
+        LoadVaeConv(Reader, DownSamp[i],
+          'down_blocks.' + IntToStr(i) + '.downsamplers.0.conv.weight',
+          'down_blocks.' + IntToStr(i) + '.downsamplers.0.conv.bias',
+          OutCh, OutCh, 3);
+    end;
+
+    // mid block.
+    LoadSDResnetBlock(Reader, MidRes1, 'mid_block.resnets.0.', MidCh, MidCh, Config);
+    LoadSDTransformer2D(Reader, MidAttn, 'mid_block.attentions.0.', MidCh, Config);
+    LoadSDResnetBlock(Reader, MidRes2, 'mid_block.resnets.1.', MidCh, MidCh, Config);
+
+    // up blocks.
+    PrevOut := Config.BlockOutChannels[nM1];
+    for i := 0 to nM1 do
+    begin
+      RevIdx := nM1 - i;
+      OutCh := Config.BlockOutChannels[RevIdx];
+      if RevIdx - 1 >= 0 then InputCh := Config.BlockOutChannels[RevIdx - 1]
+      else InputCh := Config.BlockOutChannels[0];
+      for j := 0 to NumResnet do
+      begin
+        if j = NumResnet then ResSkip := InputCh else ResSkip := OutCh;
+        if j = 0 then ResnetIn := PrevOut else ResnetIn := OutCh;
+        Prefix := 'up_blocks.' + IntToStr(i) + '.resnets.' + IntToStr(j) + '.';
+        LoadSDResnetBlock(Reader, UpRes[i][j], Prefix, ResnetIn + ResSkip,
+          OutCh, Config);
+        if Config.UpHasAttn[i] then
+          LoadSDTransformer2D(Reader, UpAttn[i][j],
+            'up_blocks.' + IntToStr(i) + '.attentions.' + IntToStr(j) + '.',
+            OutCh, Config);
+      end;
+      PrevOut := OutCh;
+      if UpSamp[i] <> nil then
+        LoadVaeConv(Reader, UpSamp[i],
+          'up_blocks.' + IntToStr(i) + '.upsamplers.0.conv.weight',
+          'up_blocks.' + IntToStr(i) + '.upsamplers.0.conv.bias',
+          OutCh, OutCh, 3);
+    end;
+
+    LoadVaeGroupNorm(Reader, NormOut, 'conv_norm_out', d0, SDUNET_RES_EPS);
+    LoadVaeConv(Reader, ConvOut, 'conv_out.weight', 'conv_out.bias',
+      Config.OutChannels, d0, 3);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildSDUNetFromSafeTensorsEx(const FileName: string;
+  const Config: TSDUNetConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildSDUNet(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildSDUNetFromSafeTensors(const FileName: string;
+  out Config: TSDUNetConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadSDUNetConfigFromJSONFile(ConfigPath);
+  Result := BuildSDUNetFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+function SDUNetNthInput(Net: TNNet; N: integer): TNNetLayer;
+var
+  i, Cnt, LayersM1: integer;
+begin
+  Result := nil;
+  Cnt := 0;
+  LayersM1 := Net.CountLayers() - 1;
+  for i := 0 to LayersM1 do
+    if Net.Layers[i] is TNNetInput then
+    begin
+      if Cnt = N then begin Result := Net.Layers[i]; Exit; end;
+      Inc(Cnt);
+    end;
+  ImportError('SD UNet: net has no TNNetInput #' + IntToStr(N) + '.');
+end;
+
+function SDUNetTimestepInput(Net: TNNet): TNNetLayer;
+begin
+  Result := SDUNetNthInput(Net, 1);
+end;
+
+function SDUNetTextStatesInput(Net: TNNet): TNNetLayer;
+begin
+  Result := SDUNetNthInput(Net, 2);
+end;
+
+procedure SDUNetDenoise(Net: TNNet; const Config: TSDUNetConfig;
+  Latent, EncStates: TNNetVolume; t: TNeuralFloat; Noise: TNNetVolume);
+var
+  TextIn: TNNetLayer;
+begin
+  SDUNetTimestepInput(Net).Output.FData[0] := t;
+  TextIn := SDUNetTextStatesInput(Net);
+  if EncStates.Size <> TextIn.Output.Size then
+    ImportError('SDUNetDenoise: encoder_hidden_states size ' +
+      IntToStr(EncStates.Size) + ' <> the net text input size ' +
+      IntToStr(TextIn.Output.Size) + ' (TextSeqLen/CrossDim mismatch?).');
+  TextIn.Output.Copy(EncStates);
+  Net.Compute(Latent);
+  Net.GetOutput(Noise);
 end;
 
 // ===========================================================================
