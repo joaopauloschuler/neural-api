@@ -185,6 +185,15 @@ type
     procedure MulAdd(Original1, Original2: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
     class procedure MulAdd(PtrA, PtrB: TNeuralFloatArrPtr; Value: T; pSize: integer); overload; {$IFDEF Release} inline; {$ENDIF}
     class procedure MulAdd(PtrA, PtrB, PtrC: TNeuralFloatArrPtr; pSize: integer); overload; {$IFDEF Release} inline; {$ENDIF}
+    // Rank-1 state/weight carry: Dst[i] := AlphaScale*Prev[i] + BScale*B[i].
+    // Prev may be nil (the t=0 case: Prev is treated as the zero row), in which
+    // case Dst[i] := BScale*B[i]. Prev may alias Dst (in-place carry). Routes
+    // through the AVX Mul/MulAdd primitives so each row update is vectorized over
+    // its (contiguous) inner axis. Shared by the rank-1 linear-attention state
+    // updates (TNNetDeltaNet / TNNetGatedLinearAttention) and the test-time
+    // inner-optimizer weight updates (TNNetTestTimeTraining / TNNetTitansMemory).
+    class procedure RankOneUpdateRow(PtrDst, PtrPrev, PtrB: TNeuralFloatArrPtr;
+      AlphaScale, BScale: T; pSize: integer); {$IFDEF Release} inline; {$ENDIF}
     procedure Divi(x, y, d: integer; Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure Divi(Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure Divi(Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -5436,6 +5445,24 @@ class procedure TVolume.MulAdd(PtrA, PtrB: TNeuralFloatArrPtr; Value: T;
   pSize: integer);
 begin
   Self.MulAddPPVS(PtrA, PtrB, Value, pSize);
+end;
+
+class procedure TVolume.RankOneUpdateRow(PtrDst, PtrPrev, PtrB: TNeuralFloatArrPtr;
+  AlphaScale, BScale: T; pSize: integer);
+begin
+  // Dst := AlphaScale*Prev + BScale*B, with Prev=nil meaning the zero row.
+  if (PtrPrev = nil) or (AlphaScale = 0) then
+  begin
+    // Dst := BScale*B (no prev carry).
+    Move(PtrB^, PtrDst^, pSize * SizeOf(T));
+    TVolume.Mul(PtrDst, BScale, pSize);
+  end
+  else
+  begin
+    if PtrPrev <> PtrDst then Move(PtrPrev^, PtrDst^, pSize * SizeOf(T));
+    TVolume.Mul(PtrDst, AlphaScale, pSize);  // Dst := AlphaScale*Prev
+    TVolume.MulAdd(PtrDst, PtrB, BScale, pSize);  // Dst += BScale*B
+  end;
 end;
 
 class procedure TVolume.MulAdd(PtrA, PtrB, PtrC: TNeuralFloatArrPtr;

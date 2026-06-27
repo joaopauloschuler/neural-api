@@ -1426,7 +1426,12 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       builder-level analogue of TestSegmentMaskMatchesUnpackedBaseline). KV-cache
       incremental decode stays intentionally unmasked (single-stream = one doc).
 
-- [ ] AVX-vectorize the rank-1 outer-product state update in TNNetDeltaNet and
+- [X] AVX-vectorize the rank-1 outer-product state update in TNNetDeltaNet and
+      TNNetGatedLinearAttention. DONE: added the shared `TVolume.RankOneUpdateRow`
+      primitive (neuralvolume.pas) used by all four layers; DeltaNet/GLA forward
+      state writes + backward dS/dk/dv now route through RankOneUpdateRow /
+      MulAdd / DotProduct / Mul over the depth-contiguous `e` axis.
+      AVX-vectorize the rank-1 outer-product state update in TNNetDeltaNet and
       TNNetGatedLinearAttention. Both already use the AVX `DotProduct` for the
       per-timestep input/key/value/gate projections, but the state matrix carry
       itself is a fully scalar nested `for d, e: S[d,e] := alpha*S[d,e] + beta*k[d]*v[e]`
@@ -1441,7 +1446,12 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       correctness. (TNNetTitansMemory / TNNetTestTimeTraining share the identical
       per-row pattern and can reuse the same helper — see the next entry.)
 
-- [ ] AVX-vectorize the test-time inner-optimizer weight-matrix updates in
+- [X] AVX-vectorize the test-time inner-optimizer weight-matrix updates in
+      TNNetTestTimeTraining and TNNetTitansMemory. DONE: TTT W_lin/W1/W2 inner GD
+      steps and Titans S1/S2 momentum + (1-forget) weight writes now use the same
+      shared `TVolume.RankOneUpdateRow(Dst, Prev, B, AlphaScale, BScale, n)` helper
+      over the contiguous inner axis (one helper, four layers; not four copies).
+      AVX-vectorize the test-time inner-optimizer weight-matrix updates in
       TNNetTestTimeTraining and TNNetTitansMemory. The per-timestep gradient-descent
       step on the inner memory (`W_lin -= eta*r outer k`, and for TitansMemory the
       momentum + forget-gated `S := (1-forget)*S + momentum*grad` over the D x H

@@ -49511,7 +49511,7 @@ var
   SeqLenM1, DepthM1: integer;
   accQ, accK, accV, accBeta, xj, betav, knrm, ss, predE: TNeuralFloat;
   XtPtr, OutPtr: TNeuralFloatArrPtr;
-  WqR, WkR, WvR: TNeuralFloatArrPtr;
+  WqR, WkR, WvR, PrevRow: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Wq := FNeurons[0].FWeights; Wk := FNeurons[1].FWeights;
@@ -49555,14 +49555,14 @@ begin
           predE := predE + FS.FData[baseS - Depth * Depth + d * Depth + e] * FKey.FData[baseT + d];
       FErr.FData[baseT + e] := FV.FData[baseT + e] - predE;
     end;
+    // Rank-1 corrective write, vectorized per output row d (contiguous over e).
     for d := 0 to DepthM1 do
-      for e := 0 to DepthM1 do
-      begin
-        if t > 0 then ss := FS.FData[baseS - Depth * Depth + d * Depth + e]
-        else ss := 0;
-        ss := ss + betav * FKey.FData[baseT + d] * FErr.FData[baseT + e];
-        FS.FData[baseS + d * Depth + e] := ss;
-      end;
+    begin
+      if t > 0 then PrevRow := @FS.FData[baseS - Depth * Depth + d * Depth]
+      else PrevRow := nil;
+      TNNetVolume.RankOneUpdateRow(@FS.FData[baseS + d * Depth], PrevRow,
+        @FErr.FData[baseT], 1.0, betav * FKey.FData[baseT + d], Depth);
+    end;
     // Read-out y_t[e] = sum_d S_t[d,e] q_t[d].
     for e := 0 to DepthM1 do
     begin
@@ -49619,37 +49619,38 @@ begin
     begin
       FgqBuf[d] := 0; FgvBuf[d] := 0; FgknBuf[d] := 0; FgkrawBuf[d] := 0;
     end;
-    // Read-out y_t[e] = sum_d S_t[d,e] q_t[d]: scatter into dL/dS_t (+carry) and dL/dq.
-    for e := 0 to DepthM1 do
-      for d := 0 to DepthM1 do
-      begin
-        FGS.FData[d * Depth + e] := FGS.FData[d * Depth + e] + GyPtr^[e] * FQ.FData[baseT + d];
-        FgqBuf[d] := FgqBuf[d] + GyPtr^[e] * FS.FData[baseS + d * Depth + e];
-      end;
+    // Read-out y_t[e] = sum_d S_t[d,e] q_t[d]: scatter into dL/dS_t (+carry) and
+    // dL/dq, vectorized per row d (FGS row + FS row contiguous over e).
+    for d := 0 to DepthM1 do
+    begin
+      TNNetVolume.MulAdd(@FGS.FData[d * Depth], @GyPtr^[0], FQ.FData[baseT + d], Depth);
+      FgqBuf[d] := FgqBuf[d] +
+        TNNetVolume.DotProduct(@GyPtr^[0], @FS.FData[baseS + d * Depth], Depth);
+    end;
     // Now FGS = dL/dS_t (full). Write: S_t[d,e] = S_{t-1}[d,e] + beta*k[d]*err[e].
     // dL/dbeta, dL/dk (via write), dL/derr, and the carry dL/dS_{t-1} = FGS
     // (the S_{t-1} term passes through with coeff 1; mutated below after using it).
+    // Each FGS row d is contiguous over e -> dot with err and scatter into FgvBuf.
     gbetav := 0;
     for d := 0 to DepthM1 do
-      for e := 0 to DepthM1 do
-      begin
-        gbetav := gbetav + FGS.FData[d * Depth + e] * FKey.FData[baseT + d] * FErr.FData[baseT + e];
-        FgknBuf[d] := FgknBuf[d] + FGS.FData[d * Depth + e] * betav * FErr.FData[baseT + e];
-        FgvBuf[e] := FgvBuf[e] + FGS.FData[d * Depth + e] * betav * FKey.FData[baseT + d]; // via err=v-pred
-      end;
+    begin
+      FgknBuf[d] := FgknBuf[d] +
+        betav * TNNetVolume.DotProduct(@FGS.FData[d * Depth], @FErr.FData[baseT], Depth);
+      gbetav := gbetav + FKey.FData[baseT + d] *
+        TNNetVolume.DotProduct(@FGS.FData[d * Depth], @FErr.FData[baseT], Depth);
+      TNNetVolume.MulAdd(@FgvBuf[0], @FGS.FData[d * Depth], betav * FKey.FData[baseT + d], Depth);
+    end;
     // err_t = v_t - S_{t-1}^T k_t. The -pred term feeds dL/dk and dL/dS_{t-1}.
     // gerr[e] (= FgvBuf[e] here, since d err/d v = +1) propagates: pred[e]=sum_d S_{t-1}[d,e] k[d].
     if t > 0 then
     begin
-      for e := 0 to DepthM1 do
-        for d := 0 to DepthM1 do
-        begin
-          sPrev := FS.FData[baseS - Depth * Depth + d * Depth + e];
-          // d pred[e]/d k[d] = S_{t-1}[d,e]; err = v - pred -> chain -FgvBuf[e].
-          FgknBuf[d] := FgknBuf[d] - FgvBuf[e] * sPrev;
-          // d pred[e]/d S_{t-1}[d,e] = k[d]; carry into dL/dS_{t-1}.
-          FGS.FData[d * Depth + e] := FGS.FData[d * Depth + e] - FgvBuf[e] * FKey.FData[baseT + d];
-        end;
+      // Per row d (S_{t-1} row + FGS row contiguous over e).
+      for d := 0 to DepthM1 do
+      begin
+        FgknBuf[d] := FgknBuf[d] - TNNetVolume.DotProduct(@FgvBuf[0],
+          @FS.FData[baseS - Depth * Depth + d * Depth], Depth);
+        TNNetVolume.MulAdd(@FGS.FData[d * Depth], @FgvBuf[0], -FKey.FData[baseT + d], Depth);
+      end;
     end;
     // (FGS now holds dL/dS_{t-1}: the +S_{t-1} write term contributes identity,
     //  the -pred term contributed the -gv*k correction just applied.)
@@ -50071,7 +50072,7 @@ var
   SeqLenM1, DepthM1: integer;
   accQ, accK, accV, accA, xj, knrm, ss: TNeuralFloat;
   XtPtr, OutPtr: TNeuralFloatArrPtr;
-  WqR, WkR, WvR, WaR: TNeuralFloatArrPtr;
+  WqR, WkR, WvR, WaR, PrevRow: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Wq := FNeurons[0].FWeights; Wk := FNeurons[1].FWeights;
@@ -50105,14 +50106,14 @@ begin
     FKnorm.FData[t] := knrm;
     for d := 0 to DepthM1 do FKey.FData[baseT + d] := FKraw.FData[baseT + d] / knrm;
     // Gated write S_t[d,e] = alpha_t[d]*S_{t-1}[d,e] + k_t[d]*v_t[e].
+    // Rank-1 outer product, vectorized per row d (contiguous over e).
     for d := 0 to DepthM1 do
-      for e := 0 to DepthM1 do
-      begin
-        if t > 0 then ss := FAlpha.FData[baseT + d] * FS.FData[baseS - Depth * Depth + d * Depth + e]
-        else ss := 0;
-        ss := ss + FKey.FData[baseT + d] * FV.FData[baseT + e];
-        FS.FData[baseS + d * Depth + e] := ss;
-      end;
+    begin
+      if t > 0 then PrevRow := @FS.FData[baseS - Depth * Depth + d * Depth]
+      else PrevRow := nil;
+      TNNetVolume.RankOneUpdateRow(@FS.FData[baseS + d * Depth], PrevRow,
+        @FV.FData[baseT], FAlpha.FData[baseT + d], FKey.FData[baseT + d], Depth);
+    end;
     // Read-out y_t[e] = sum_d q_t[d] * S_t[d,e].
     for e := 0 to DepthM1 do
     begin
@@ -50170,33 +50171,30 @@ begin
     begin
       FgqBuf[d] := 0; FgvBuf[d] := 0; FgknBuf[d] := 0; FgkrawBuf[d] := 0; FgaBuf[d] := 0;
     end;
-    // Read-out y_t[e] = sum_d q_t[d]*S_t[d,e]: scatter into dL/dS_t (+carry) and dL/dq.
-    for e := 0 to DepthM1 do
-      for d := 0 to DepthM1 do
-      begin
-        FGS.FData[d * Depth + e] := FGS.FData[d * Depth + e] + GyPtr^[e] * FQ.FData[baseT + d];
-        FgqBuf[d] := FgqBuf[d] + GyPtr^[e] * FS.FData[baseS + d * Depth + e];
-      end;
+    // Read-out y_t[e] = sum_d q_t[d]*S_t[d,e]: scatter into dL/dS_t (+carry) and
+    // dL/dq, vectorized per row d (FGS row + FS row contiguous over e).
+    for d := 0 to DepthM1 do
+    begin
+      TNNetVolume.MulAdd(@FGS.FData[d * Depth], @GyPtr^[0], FQ.FData[baseT + d], Depth);
+      FgqBuf[d] := FgqBuf[d] +
+        TNNetVolume.DotProduct(@GyPtr^[0], @FS.FData[baseS + d * Depth], Depth);
+    end;
     // Now FGS = dL/dS_t (full). Write: S_t[d,e] = alpha[d]*S_{t-1}[d,e] + k[d]*v[e].
     // dL/dk, dL/dv (via the outer product), dL/dalpha and the carry dL/dS_{t-1}
-    // (= alpha[d]*FGS[d,e], a per-row scaling by the gate).
+    // (= alpha[d]*FGS[d,e], a per-row scaling by the gate). Per row d (contig over e).
     for d := 0 to DepthM1 do
     begin
       alphad := FAlpha.FData[baseT + d];
-      for e := 0 to DepthM1 do
-      begin
-        FgknBuf[d] := FgknBuf[d] + FGS.FData[d * Depth + e] * FV.FData[baseT + e];
-        FgvBuf[e] := FgvBuf[e] + FGS.FData[d * Depth + e] * FKey.FData[baseT + d];
-        if t > 0 then
-        begin
-          sPrev := FS.FData[baseS - Depth * Depth + d * Depth + e];
-          FgaBuf[d] := FgaBuf[d] + FGS.FData[d * Depth + e] * sPrev;
-        end;
-      end;
-      // Carry dL/dS_{t-1}[d,e] = alpha[d] * dL/dS_t[d,e] (row-scaled by the gate).
+      FgknBuf[d] := FgknBuf[d] +
+        TNNetVolume.DotProduct(@FGS.FData[d * Depth], @FV.FData[baseT], Depth);
+      TNNetVolume.MulAdd(@FgvBuf[0], @FGS.FData[d * Depth], FKey.FData[baseT + d], Depth);
       if t > 0 then
-        for e := 0 to DepthM1 do
-          FGS.FData[d * Depth + e] := FGS.FData[d * Depth + e] * alphad;
+      begin
+        FgaBuf[d] := FgaBuf[d] + TNNetVolume.DotProduct(@FGS.FData[d * Depth],
+          @FS.FData[baseS - Depth * Depth + d * Depth], Depth);
+        // Carry dL/dS_{t-1}[d,e] = alpha[d] * dL/dS_t[d,e] (row-scaled by the gate).
+        TNNetVolume.Mul(@FGS.FData[d * Depth], alphad, Depth);
+      end;
     end;
     // alpha_t[d] = sigmoid(pre): pre = b_a[d] + (W_a x_t)[d].
     for d := 0 to DepthM1 do
@@ -50923,15 +50921,13 @@ begin
           acc := TNNetVolume.DotProduct(@FWlin.FData[baseW - Depth * Depth + o * Depth], @FK.FData[baseT], Depth);
         FResid.FData[baseT + o] := acc - FVv.FData[baseT + o];
       end;
+      // Inner GD step W_t[o,:] = W_{t-1}[o,:] - eta*r[o]*k, vectorized per row o.
       for o := 0 to DepthM1 do
       begin
-        rj := FResid.FData[baseT + o];
-        for i := 0 to DepthM1 do
-        begin
-          if t > 0 then acc := FWlin.FData[baseW - Depth * Depth + o * Depth + i]
-          else acc := 0;
-          FWlin.FData[baseW + o * Depth + i] := acc - eta * rj * FK.FData[baseT + i];
-        end;
+        if t > 0 then ThR := @FWlin.FData[baseW - Depth * Depth + o * Depth]
+        else ThR := nil;
+        TNNetVolume.RankOneUpdateRow(@FWlin.FData[baseW + o * Depth], ThR,
+          @FK.FData[baseT], 1.0, -eta * FResid.FData[baseT + o], Depth);
       end;
       for o := 0 to DepthM1 do
       begin
@@ -50958,14 +50954,14 @@ begin
         else acc := TNNetVolume.DotProduct(@W2init.FData[o * Hd], @FH1k.FData[t * Hd], Hd);
         FRr.FData[baseT + o] := acc - FVv.FData[baseT + o];
       end;
-      // W2 update
+      // W2 update W2_t[o,:] = W2p[o,:] - eta*r[o]*h1, vectorized per row o (over j).
       for o := 0 to DepthM1 do
-        for j := 0 to HdM1 do
-        begin
-          if t > 0 then acc := FW2.FData[baseW2 - Depth * Hd + o * Hd + j]
-          else acc := W2init.FData[o * Hd + j];
-          FW2.FData[baseW2 + o * Hd + j] := acc - eta * FRr.FData[baseT + o] * FH1k.FData[t * Hd + j];
-        end;
+      begin
+        if t > 0 then ThR := @FW2.FData[baseW2 - Depth * Hd + o * Hd]
+        else ThR := @W2init.FData[o * Hd];
+        TNNetVolume.RankOneUpdateRow(@FW2.FData[baseW2 + o * Hd], ThR,
+          @FH1k.FData[t * Hd], 1.0, -eta * FRr.FData[baseT + o], Hd);
+      end;
       // W1 update via da1[j] = g1(a1)*S, S = (W2_{t-1}^T r)[j]
       for j := 0 to HdM1 do
       begin
@@ -50975,12 +50971,11 @@ begin
           if t > 0 then S := S + FW2.FData[baseW2 - Depth * Hd + o * Hd + j] * FRr.FData[baseT + o]
           else S := S + W2init.FData[o * Hd + j] * FRr.FData[baseT + o];
         rj := g1 * S; // da1[j]
-        for i := 0 to DepthM1 do
-        begin
-          if t > 0 then acc := FW1.FData[baseW1 - Hd * Depth + j * Depth + i]
-          else acc := W1init.FData[j * Depth + i];
-          FW1.FData[baseW1 + j * Depth + i] := acc - eta * rj * FK.FData[baseT + i];
-        end;
+        // W1 update W1_t[j,:] = W1p[j,:] - eta*da1[j]*k, vectorized per row j (over i).
+        if t > 0 then ThR := @FW1.FData[baseW1 - Hd * Depth + j * Depth]
+        else ThR := @W1init.FData[j * Depth];
+        TNNetVolume.RankOneUpdateRow(@FW1.FData[baseW1 + j * Depth], ThR,
+          @FK.FData[baseT], 1.0, -eta * rj, Depth);
       end;
       // read-out using W1_t, W2_t
       for j := 0 to HdM1 do
@@ -51439,15 +51434,16 @@ begin
       etao   := Sigmoid(EtaR.FData[o]);
       thetao := Sigmoid(ThetaR.FData[o]);
       alphao := FAlpha.FData[baseT + o];
-      for j := 0 to HdM1 do
-      begin
-        if t > 0 then Ss := FS2.FData[baseW2 - Depth * Hd + o * Hd + j] else Ss := 0;
-        Ss := etao * Ss - thetao * FRr.FData[baseT + o] * FH1k.FData[t * Hd + j];
-        FS2.FData[baseW2 + o * Hd + j] := Ss;
-        if t > 0 then acc := FW2.FData[baseW2 - Depth * Hd + o * Hd + j]
-        else acc := W2init.FData[o * Hd + j];
-        FW2.FData[baseW2 + o * Hd + j] := (1 - alphao) * acc + Ss;
-      end;
+      // Momentum+forget S2_t[o,:] = eta*S2p[o,:] - theta*r[o]*h1, per row o (over j).
+      if t > 0 then ThR := @FS2.FData[baseW2 - Depth * Hd + o * Hd]
+      else ThR := nil;
+      TNNetVolume.RankOneUpdateRow(@FS2.FData[baseW2 + o * Hd], ThR,
+        @FH1k.FData[t * Hd], etao, -thetao * FRr.FData[baseT + o], Hd);
+      // Forget-gated weight W2_t[o,:] = (1-alpha)*W2p[o,:] + S2_t[o,:].
+      if t > 0 then ThR := @FW2.FData[baseW2 - Depth * Hd + o * Hd]
+      else ThR := @W2init.FData[o * Hd];
+      TNNetVolume.RankOneUpdateRow(@FW2.FData[baseW2 + o * Hd], ThR,
+        @FS2.FData[baseW2 + o * Hd], 1 - alphao, 1.0, Hd);
     end;
     // momentum + forget update of W1: gW1[j,i]=da1[j]*k[i],
     // da1[j]=g1(a1[j])*(W2_{t-1}^T r)[j]. Gate row j by gj = j mod Depth.
@@ -51463,15 +51459,16 @@ begin
         if t > 0 then Ss := Ss + FW2.FData[baseW2 - Depth * Hd + o * Hd + j] * FRr.FData[baseT + o]
         else Ss := Ss + W2init.FData[o * Hd + j] * FRr.FData[baseT + o];
       rj := g1 * Ss; // da1[j]
-      for i := 0 to DepthM1 do
-      begin
-        if t > 0 then Ss := FS1.FData[baseW1 - Hd * Depth + j * Depth + i] else Ss := 0;
-        Ss := etao * Ss - thetao * rj * FK.FData[baseT + i];
-        FS1.FData[baseW1 + j * Depth + i] := Ss;
-        if t > 0 then acc := FW1.FData[baseW1 - Hd * Depth + j * Depth + i]
-        else acc := W1init.FData[j * Depth + i];
-        FW1.FData[baseW1 + j * Depth + i] := (1 - alphao) * acc + Ss;
-      end;
+      // Momentum+forget S1_t[j,:] = eta*S1p[j,:] - theta*da1[j]*k, per row j (over i).
+      if t > 0 then ThR := @FS1.FData[baseW1 - Hd * Depth + j * Depth]
+      else ThR := nil;
+      TNNetVolume.RankOneUpdateRow(@FS1.FData[baseW1 + j * Depth], ThR,
+        @FK.FData[baseT], etao, -thetao * rj, Depth);
+      // Forget-gated weight W1_t[j,:] = (1-alpha)*W1p[j,:] + S1_t[j,:].
+      if t > 0 then ThR := @FW1.FData[baseW1 - Hd * Depth + j * Depth]
+      else ThR := @W1init.FData[j * Depth];
+      TNNetVolume.RankOneUpdateRow(@FW1.FData[baseW1 + j * Depth], ThR,
+        @FS1.FData[baseW1 + j * Depth], 1 - alphao, 1.0, Depth);
     end;
     // read-out using M_t: a1q=W1_t q, h1q=GeLU(a1q), y=W2_t h1q.
     for j := 0 to HdM1 do
