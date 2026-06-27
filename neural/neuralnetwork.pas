@@ -48917,27 +48917,17 @@ begin
     baseS := t * Depth * Depth;
     // q_t, raw k_t, v_t projections, and the scalar beta argument.
     accBeta := FNeurons[4].FWeights.FData[0]; // b_beta
-    for j := 0 to DepthM1 do
-      accBeta := accBeta + Wb.FData[j] * XtPtr^[j];
+    accBeta := accBeta + TNNetVolume.DotProduct(@Wb.FData[0], @XtPtr^[0], Depth);
     for d := 0 to DepthM1 do
     begin
       WqR := Wq.GetRawPtr(d, 0, 0); WkR := Wk.GetRawPtr(d, 0, 0);
       WvR := Wv.GetRawPtr(d, 0, 0);
-      accQ := 0; accK := 0; accV := 0;
-      for j := 0 to DepthM1 do
-      begin
-        xj := XtPtr^[j];
-        accQ := accQ + WqR^[j] * xj;
-        accK := accK + WkR^[j] * xj;
-        accV := accV + WvR^[j] * xj;
-      end;
-      FQ.FData[baseT + d] := accQ * FScale;
-      FKraw.FData[baseT + d] := accK;
-      FV.FData[baseT + d] := accV;
+      FQ.FData[baseT + d] := TNNetVolume.DotProduct(@WqR^[0], @XtPtr^[0], Depth) * FScale;
+      FKraw.FData[baseT + d] := TNNetVolume.DotProduct(@WkR^[0], @XtPtr^[0], Depth);
+      FV.FData[baseT + d] := TNNetVolume.DotProduct(@WvR^[0], @XtPtr^[0], Depth);
     end;
     // L2-normalize the key (eps-free; raw norm cached for the backward divide).
-    knrm := 0;
-    for d := 0 to DepthM1 do knrm := knrm + FKraw.FData[baseT + d] * FKraw.FData[baseT + d];
+    knrm := TNNetVolume.DotProduct(@FKraw.FData[baseT], @FKraw.FData[baseT], Depth);
     knrm := Sqrt(knrm);
     if knrm < 1e-12 then knrm := 1e-12;
     FKnorm.FData[t] := knrm;
@@ -49491,23 +49481,14 @@ begin
     begin
       WqR := Wq.GetRawPtr(d, 0, 0); WkR := Wk.GetRawPtr(d, 0, 0);
       WvR := Wv.GetRawPtr(d, 0, 0); WaR := Wa.GetRawPtr(d, 0, 0);
-      accQ := 0; accK := 0; accV := 0; accA := Ba.FData[d];
-      for j := 0 to DepthM1 do
-      begin
-        xj := XtPtr^[j];
-        accQ := accQ + WqR^[j] * xj;
-        accK := accK + WkR^[j] * xj;
-        accV := accV + WvR^[j] * xj;
-        accA := accA + WaR^[j] * xj;
-      end;
-      FQ.FData[baseT + d] := accQ * FScale;
-      FKraw.FData[baseT + d] := accK;
-      FV.FData[baseT + d] := accV;
+      accA := Ba.FData[d] + TNNetVolume.DotProduct(@WaR^[0], @XtPtr^[0], Depth);
+      FQ.FData[baseT + d] := TNNetVolume.DotProduct(@WqR^[0], @XtPtr^[0], Depth) * FScale;
+      FKraw.FData[baseT + d] := TNNetVolume.DotProduct(@WkR^[0], @XtPtr^[0], Depth);
+      FV.FData[baseT + d] := TNNetVolume.DotProduct(@WvR^[0], @XtPtr^[0], Depth);
       FAlpha.FData[baseT + d] := Sigmoid(accA);
     end;
     // L2-normalize the key (eps-free; raw norm cached for the backward divide).
-    knrm := 0;
-    for d := 0 to DepthM1 do knrm := knrm + FKraw.FData[baseT + d] * FKraw.FData[baseT + d];
+    knrm := TNNetVolume.DotProduct(@FKraw.FData[baseT], @FKraw.FData[baseT], Depth);
     knrm := Sqrt(knrm);
     if knrm < 1e-12 then knrm := 1e-12;
     FKnorm.FData[t] := knrm;
@@ -50314,15 +50295,12 @@ begin
     baseT := t * Depth;
     for o := 0 to DepthM1 do
     begin
-      ThR := ThK.GetRawPtr(o, 0, 0); acc := 0;
-      for i := 0 to DepthM1 do acc := acc + ThR^[i] * XtPtr^[i];
-      FK.FData[baseT + o] := acc;
-      ThR := ThV.GetRawPtr(o, 0, 0); acc := 0;
-      for i := 0 to DepthM1 do acc := acc + ThR^[i] * XtPtr^[i];
-      FVv.FData[baseT + o] := acc;
-      ThR := ThQ.GetRawPtr(o, 0, 0); acc := 0;
-      for i := 0 to DepthM1 do acc := acc + ThR^[i] * XtPtr^[i];
-      FQ.FData[baseT + o] := acc * FScaleQ;
+      ThR := ThK.GetRawPtr(o, 0, 0);
+      FK.FData[baseT + o] := TNNetVolume.DotProduct(@ThR^[0], @XtPtr^[0], Depth);
+      ThR := ThV.GetRawPtr(o, 0, 0);
+      FVv.FData[baseT + o] := TNNetVolume.DotProduct(@ThR^[0], @XtPtr^[0], Depth);
+      ThR := ThQ.GetRawPtr(o, 0, 0);
+      FQ.FData[baseT + o] := TNNetVolume.DotProduct(@ThR^[0], @XtPtr^[0], Depth) * FScaleQ;
     end;
     if not FIsMLP then
     begin
@@ -50331,8 +50309,7 @@ begin
       begin
         acc := 0;
         if t > 0 then
-          for i := 0 to DepthM1 do
-            acc := acc + FWlin.FData[baseW - Depth * Depth + o * Depth + i] * FK.FData[baseT + i];
+          acc := TNNetVolume.DotProduct(@FWlin.FData[baseW - Depth * Depth + o * Depth], @FK.FData[baseT], Depth);
         FResid.FData[baseT + o] := acc - FVv.FData[baseT + o];
       end;
       for o := 0 to DepthM1 do
@@ -50347,9 +50324,7 @@ begin
       end;
       for o := 0 to DepthM1 do
       begin
-        acc := 0;
-        for i := 0 to DepthM1 do
-          acc := acc + FWlin.FData[baseW + o * Depth + i] * FQ.FData[baseT + i];
+        acc := TNNetVolume.DotProduct(@FWlin.FData[baseW + o * Depth], @FQ.FData[baseT], Depth);
         OutPtr^[o] := acc;
       end;
     end
@@ -50360,20 +50335,16 @@ begin
       // inner forward at k (using W1_{t-1}, W2_{t-1})
       for j := 0 to HdM1 do
       begin
-        acc := 0;
-        for i := 0 to DepthM1 do
-          if t > 0 then acc := acc + FW1.FData[baseW1 - Hd * Depth + j * Depth + i] * FK.FData[baseT + i]
-          else acc := acc + W1init.FData[j * Depth + i] * FK.FData[baseT + i];
+        if t > 0 then acc := TNNetVolume.DotProduct(@FW1.FData[baseW1 - Hd * Depth + j * Depth], @FK.FData[baseT], Depth)
+        else acc := TNNetVolume.DotProduct(@W1init.FData[j * Depth], @FK.FData[baseT], Depth);
         FA1k.FData[t * Hd + j] := acc;
         TTTGelu(acc, gg, g1, g2);
         FH1k.FData[t * Hd + j] := gg;
       end;
       for o := 0 to DepthM1 do
       begin
-        acc := 0;
-        for j := 0 to HdM1 do
-          if t > 0 then acc := acc + FW2.FData[baseW2 - Depth * Hd + o * Hd + j] * FH1k.FData[t * Hd + j]
-          else acc := acc + W2init.FData[o * Hd + j] * FH1k.FData[t * Hd + j];
+        if t > 0 then acc := TNNetVolume.DotProduct(@FW2.FData[baseW2 - Depth * Hd + o * Hd], @FH1k.FData[t * Hd], Hd)
+        else acc := TNNetVolume.DotProduct(@W2init.FData[o * Hd], @FH1k.FData[t * Hd], Hd);
         FRr.FData[baseT + o] := acc - FVv.FData[baseT + o];
       end;
       // W2 update
@@ -50403,20 +50374,13 @@ begin
       // read-out using W1_t, W2_t
       for j := 0 to HdM1 do
       begin
-        acc := 0;
-        for i := 0 to DepthM1 do
-          acc := acc + FW1.FData[baseW1 + j * Depth + i] * FQ.FData[baseT + i];
+        acc := TNNetVolume.DotProduct(@FW1.FData[baseW1 + j * Depth], @FQ.FData[baseT], Depth);
         FA1q.FData[t * Hd + j] := acc;
         TTTGelu(acc, gg, g1, g2);
         FH1q.FData[t * Hd + j] := gg;
       end;
       for o := 0 to DepthM1 do
-      begin
-        acc := 0;
-        for j := 0 to HdM1 do
-          acc := acc + FW2.FData[baseW2 + o * Hd + j] * FH1q.FData[t * Hd + j];
-        OutPtr^[o] := acc;
-      end;
+        OutPtr^[o] := TNNetVolume.DotProduct(@FW2.FData[baseW2 + o * Hd], @FH1q.FData[t * Hd], Hd);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -50833,36 +50797,29 @@ begin
     // view projections k/v/q and the data-dependent forget gate alpha_t.
     for o := 0 to DepthM1 do
     begin
-      ThR := ThK.GetRawPtr(o, 0, 0); acc := 0;
-      for i := 0 to DepthM1 do acc := acc + ThR^[i] * XtPtr^[i];
-      FK.FData[baseT + o] := acc;
-      ThR := ThV.GetRawPtr(o, 0, 0); acc := 0;
-      for i := 0 to DepthM1 do acc := acc + ThR^[i] * XtPtr^[i];
-      FVv.FData[baseT + o] := acc;
-      ThR := ThQ.GetRawPtr(o, 0, 0); acc := 0;
-      for i := 0 to DepthM1 do acc := acc + ThR^[i] * XtPtr^[i];
-      FQ.FData[baseT + o] := acc * FScaleQ;
-      ThR := Walpha.GetRawPtr(o, 0, 0); acc := AlphaR.FData[o];
-      for i := 0 to DepthM1 do acc := acc + ThR^[i] * XtPtr^[i];
+      ThR := ThK.GetRawPtr(o, 0, 0);
+      FK.FData[baseT + o] := TNNetVolume.DotProduct(@ThR^[0], @XtPtr^[0], Depth);
+      ThR := ThV.GetRawPtr(o, 0, 0);
+      FVv.FData[baseT + o] := TNNetVolume.DotProduct(@ThR^[0], @XtPtr^[0], Depth);
+      ThR := ThQ.GetRawPtr(o, 0, 0);
+      FQ.FData[baseT + o] := TNNetVolume.DotProduct(@ThR^[0], @XtPtr^[0], Depth) * FScaleQ;
+      ThR := Walpha.GetRawPtr(o, 0, 0);
+      acc := AlphaR.FData[o] + TNNetVolume.DotProduct(@ThR^[0], @XtPtr^[0], Depth);
       FAlpha.FData[baseT + o] := Sigmoid(acc);
     end;
     // inner forward at k (M_{t-1}): a1=W1p k, h1=GeLU(a1), f=W2p h1, r=f-v.
     for j := 0 to HdM1 do
     begin
-      acc := 0;
-      for i := 0 to DepthM1 do
-        if t > 0 then acc := acc + FW1.FData[baseW1 - Hd * Depth + j * Depth + i] * FK.FData[baseT + i]
-        else acc := acc + W1init.FData[j * Depth + i] * FK.FData[baseT + i];
+      if t > 0 then acc := TNNetVolume.DotProduct(@FW1.FData[baseW1 - Hd * Depth + j * Depth], @FK.FData[baseT], Depth)
+      else acc := TNNetVolume.DotProduct(@W1init.FData[j * Depth], @FK.FData[baseT], Depth);
       FA1k.FData[t * Hd + j] := acc;
       TTTGelu(acc, gg, g1, g2);
       FH1k.FData[t * Hd + j] := gg;
     end;
     for o := 0 to DepthM1 do
     begin
-      acc := 0;
-      for j := 0 to HdM1 do
-        if t > 0 then acc := acc + FW2.FData[baseW2 - Depth * Hd + o * Hd + j] * FH1k.FData[t * Hd + j]
-        else acc := acc + W2init.FData[o * Hd + j] * FH1k.FData[t * Hd + j];
+      if t > 0 then acc := TNNetVolume.DotProduct(@FW2.FData[baseW2 - Depth * Hd + o * Hd], @FH1k.FData[t * Hd], Hd)
+      else acc := TNNetVolume.DotProduct(@W2init.FData[o * Hd], @FH1k.FData[t * Hd], Hd);
       FRr.FData[baseT + o] := acc - FVv.FData[baseT + o];
     end;
     // momentum + forget update of W2: gW2[o,j]=r[o]*h1[j].
@@ -50908,20 +50865,13 @@ begin
     // read-out using M_t: a1q=W1_t q, h1q=GeLU(a1q), y=W2_t h1q.
     for j := 0 to HdM1 do
     begin
-      acc := 0;
-      for i := 0 to DepthM1 do
-        acc := acc + FW1.FData[baseW1 + j * Depth + i] * FQ.FData[baseT + i];
+      acc := TNNetVolume.DotProduct(@FW1.FData[baseW1 + j * Depth], @FQ.FData[baseT], Depth);
       FA1q.FData[t * Hd + j] := acc;
       TTTGelu(acc, gg, g1, g2);
       FH1q.FData[t * Hd + j] := gg;
     end;
     for o := 0 to DepthM1 do
-    begin
-      acc := 0;
-      for j := 0 to HdM1 do
-        acc := acc + FW2.FData[baseW2 + o * Hd + j] * FH1q.FData[t * Hd + j];
-      OutPtr^[o] := acc;
-    end;
+      OutPtr^[o] := TNNetVolume.DotProduct(@FW2.FData[baseW2 + o * Hd], @FH1q.FData[t * Hd], Hd);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
