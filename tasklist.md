@@ -1560,6 +1560,21 @@ rather than acted on.
       input_size==Hidden; the importer REJECTS the projection case loudly
       (`TestTorchRNNImportRejectsProjection`). Also out of scope, rejected:
       batch_first, proj_size (`weight_hr_l*`), peephole.
+  - [ ] Faithful STACKED-BIDIRECTIONAL torch import follow-up: the
+        `AddBidirectionalRecurrentStack` engine inserts a learned
+        `TNNetPointwiseConvLinear` projection on every incoming Depth≠Hidden feed
+        (layer-0 input_size≠Hidden, and the 2*Hidden→Hidden feed above each
+        bidirectional layer). torch nn.LSTM/nn.GRU has NO such projection — layer
+        k's `weight_ih_l{k}` is a plain `[gates*Hidden, 2*Hidden]` slab consuming
+        the concatenated [forward;backward] hidden directly. To import a real
+        multi-layer bidirectional checkpoint, add an opt-in builder mode that
+        feeds the 2*Hidden concat straight into the next layer's cell (cell
+        input_size = 2*Hidden, no projection) so the torch `weight_ih_l{k}` rows
+        map 1:1. Then extend `LoadTorchLSTMInto`/`LoadTorchGRUInto` to accept that
+        projection-free stack and drop the loud rejection; add a 2-layer
+        bidirectional pico-oracle parity fixture (the generator already supports
+        the shape — `tools/torch_rnn_tiny_fixture.py`). Unblocks the pyannote
+        `segmentation-3.0` real bidirectional-LSTM trunk drop-in.
 
 - [ ] OpenCL forward offload for `TNNetCausalLinearAttention` (the non-causal global
       `TNNetLinearAttention` is now DONE — `ComputeOpenCL` two-GEMM offload behind
