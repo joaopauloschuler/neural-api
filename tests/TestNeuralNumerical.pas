@@ -315,6 +315,10 @@ type
     // OpenCL two-GEMM forward offload parity (vs CPU/AVX) for the RECTANGULAR
     // TNNetCrossAttention (Q from one source, packed K|V from a second source).
     procedure CrossAttentionOpenCLParity;
+    // OpenCL input-projection GEMM forward offload parity (vs CPU/AVX) for the
+    // dense recurrent cells TNNetLSTMCell / TNNetGRUCell.
+    procedure LSTMCellOpenCLParity;
+    procedure GRUCellOpenCLParity;
     // OpenCL all-pairs correlation GEMM forward offload parity (vs CPU/AVX) for
     // TNNetCorrelationVolume (RAFT).
     procedure CorrelationVolumeOpenCLParity;
@@ -59661,6 +59665,134 @@ begin
     OutCPU.Free;
     KVData.Free;
     QData.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetLSTMCell offloads ONLY the recurrence-independent input projections
+// W_i* x_t (one [4*Depth,Depth] x [Depth,SeqLen] GEMM); the per-step recurrent
+// projection W_h* h_{t-1} and all gate/cell-state math stay on the CPU. Depth=40
+// (>= csLSTMOpenCLMinDepth=32) so the device path fires. With random weights and
+// a bounded sinusoidal input, the only divergence from the CPU/AVX path is FP32
+// GEMM accumulation order, so a tight 1e-4 gate holds (PoCL CPU-backed ~ 1e-6).
+procedure TTestNeuralNumerical.LSTMCellOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 16; Depth = 40; // Depth >= csLSTMOpenCLMinDepth (32)
+var
+  NN: TNNet;
+  XData, OutCPU: TNNetVolume;
+  InputLayer: TNNetLayer;
+  Cell: TNNetLSTMCell;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SeqLen, 1, Depth);
+  OutCPU := TNNetVolume.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    Cell := TNNetLSTMCell.Create();
+    NN.AddLayerAfter(Cell, InputLayer);
+    // Bounded input so gate pre-activations stay O(1) and 1e-4 is meaningful.
+    for i := 0 to XData.Size - 1 do
+      XData.Raw[i] := 0.5 * Sin(i * 0.3) + 0.2 * Cos(i * 0.11);
+
+    // CPU forward (OpenCL OFF).
+    NN.Compute(XData);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    // Device forward (input-projection offload ARMED).
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(XData);
+
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    MaxDiff := 0;
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  LSTMCell OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('LSTMCell OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    XData.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetGRUCell twin of LSTMCellOpenCLParity: offloads the three input
+// projections W_i* x_t (one [3*Depth,Depth] x [Depth,SeqLen] GEMM); the per-step
+// recurrent projections and the r/z/n gate recurrence stay on the CPU.
+procedure TTestNeuralNumerical.GRUCellOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 16; Depth = 40; // Depth >= csGRUOpenCLMinDepth (32)
+var
+  NN: TNNet;
+  XData, OutCPU: TNNetVolume;
+  InputLayer: TNNetLayer;
+  Cell: TNNetGRUCell;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SeqLen, 1, Depth);
+  OutCPU := TNNetVolume.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    Cell := TNNetGRUCell.Create();
+    NN.AddLayerAfter(Cell, InputLayer);
+    for i := 0 to XData.Size - 1 do
+      XData.Raw[i] := 0.5 * Sin(i * 0.3) + 0.2 * Cos(i * 0.11);
+
+    NN.Compute(XData);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(XData);
+
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    MaxDiff := 0;
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  GRUCell OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('GRUCell OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    XData.Free;
     NN.Free;
   end;
 end;

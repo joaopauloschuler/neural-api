@@ -7466,6 +7466,21 @@ type
       FGhNext: TNNetVolume;            // dL/dh_{t-1} accumulator built during step t
       FGradW: array[0..7] of TNNetVolume;  // DepthxDepth grad accumulators
       FGradB: array[0..3] of TNNetVolume;  // Depth-long grad accumulators
+      {$IFDEF OpenCL}
+      // OpenCL offload (forward-only) of just the RECURRENCE-INDEPENDENT input
+      // projections W_i* x_t. The four input weight matrices [0..3] are packed
+      // into one [4*Depth, Depth] slab (FWiPacked) and multiplied against the
+      // whole input sequence in a single cai_dot_product GEMM (inherited FDotCL):
+      // kernel A = FWiPacked (As[in + m*Depth]), kernel B = the native prev
+      // output (Bs[in + t*Depth]); the result lands in FIxProj as
+      // [t*(4*Depth) + (gate*Depth + d)]. The bias add, the per-step recurrent
+      // projection W_h* h_{t-1} (sequential, cannot be batched), the i/f/g/o
+      // sigmoid/tanh and the c_t/h_t recurrence all stay on the CPU exactly as
+      // the CPU/AVX path. Backward is untouched (CPU-only).
+      FWiPacked: TNNetVolume;  // [4*Depth,1,Depth] concat of W_ii/W_if/W_ig/W_io
+      FIxProj: TNNetVolume;    // [SeqLen*4*Depth] device result, input projections
+      procedure ComputeOpenCL();
+      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
@@ -7473,6 +7488,12 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+      {$IFDEF OpenCL}
+      // Allocates the shared dot-product kernel (inherited FDotCL) and the
+      // packed-weight / projection buffers, then arms the input-projection
+      // offload. Mirrors TNNetFullConnect/TNNetCrossAttention.
+      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      {$ENDIF}
   end;
 
   /// TNNetGRUCell: the CLASSIC fully-connected GRU cell with TRUE recurrent
@@ -7514,6 +7535,21 @@ type
       FGhNext: TNNetVolume;        // dL/dh_{t-1} accumulator built during step t
       FGradW: array[0..5] of TNNetVolume;  // DepthxDepth grad accumulators
       FGradB: array[0..3] of TNNetVolume;  // Depth-long grad accumulators (b_r,b_z,b_in,b_hn)
+      {$IFDEF OpenCL}
+      // OpenCL offload (forward-only) of just the RECURRENCE-INDEPENDENT input
+      // projections W_i* x_t. The three input weight matrices [0..2] are packed
+      // into one [3*Depth, Depth] slab (FWiPacked) and multiplied against the
+      // whole input sequence in a single cai_dot_product GEMM (inherited FDotCL):
+      // kernel A = FWiPacked (As[in + m*Depth]), kernel B = the native prev
+      // output (Bs[in + t*Depth]); the result lands in FIxProj as
+      // [t*(3*Depth) + (gate*Depth + d)]. The bias add, the per-step recurrent
+      // projection W_h* h_{t-1} (sequential, cannot be batched), the r/z/n
+      // sigmoid/tanh and the h_t recurrence all stay on the CPU exactly as the
+      // CPU/AVX path. Backward is untouched (CPU-only).
+      FWiPacked: TNNetVolume;  // [3*Depth,1,Depth] concat of W_ir/W_iz/W_in
+      FIxProj: TNNetVolume;    // [SeqLen*3*Depth] device result, input projections
+      procedure ComputeOpenCL();
+      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
@@ -7521,6 +7557,12 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+      {$IFDEF OpenCL}
+      // Allocates the shared dot-product kernel (inherited FDotCL) and the
+      // packed-weight / projection buffers, then arms the input-projection
+      // offload. Mirrors TNNetFullConnect/TNNetCrossAttention.
+      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      {$ENDIF}
   end;
 
   /// TNNetConvLSTMCell: a CONVOLUTIONAL LSTM cell (Shi, Chen, Wang, Yeung, Wong &
@@ -51630,6 +51672,11 @@ begin
   FGhNext.Free; FGh.Free; FGc.Free;
   FHprev.Free; FH.Free; FHt.Free; FTanhC.Free; FC.Free;
   FOg.Free; FGg.Free; FFg.Free; FIg.Free;
+  {$IFDEF OpenCL}
+  // FDotCL is freed by the inherited TNNetLayer.Destroy; free only our buffers.
+  if Assigned(FWiPacked) then FWiPacked.Free;
+  if Assigned(FIxProj) then FIxProj.Free;
+  {$ENDIF}
   inherited Destroy();
 end;
 
@@ -51665,7 +51712,114 @@ begin
   InitDefault();
 end;
 
+{$IFDEF OpenCL}
+procedure TNNetLSTMCell.EnableOpenCL(DotProductKernel: TDotProductKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL, FDotProductKernel
+  if not Assigned(FDotCL) then
+  begin
+    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL.HideMessages();
+  end;
+  if not Assigned(FWiPacked) then FWiPacked := TNNetVolume.Create();
+  if not Assigned(FIxProj) then FIxProj := TNNetVolume.Create();
+  FShouldOpenCL := true;
+end;
+
+// Forward: ONLY the four recurrence-independent input projections W_i* x_t are
+// offloaded as one [4*Depth, Depth] x [Depth, SeqLen] GEMM; everything that
+// depends on h_{t-1} (the recurrent projections W_h* h_{t-1}, the gates and the
+// c_t/h_t recurrence) stays on the CPU exactly like the CPU/AVX Compute().
+// Coded by Claude (AI).
+procedure TNNetLSTMCell.ComputeOpenCL();
+var
+  StartTime: double;
+  Whi, Whf, Whg, Who, Bi, Bf, Bg, Bo, Prev, Wsrc: TNNetVolume;
+  SeqLen, Depth, t, d, baseT, baseX, g4d: integer;
+  SeqLenM1, DepthM1: integer;
+  g, outd, inn, m, srcBase: integer;
+  accI, accF, accG, accO, iv, fv, gv, ovv, cPrev, cv, tc: TNeuralFloat;
+  OutPtr, HprevPtr: TNeuralFloatArrPtr;
+  WhiR, WhfR, WhgR, WhoR: TNeuralFloatArrPtr;
+  ixBase: integer;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  Whi := FNeurons[4].FWeights; Whf := FNeurons[5].FWeights;
+  Whg := FNeurons[6].FWeights; Who := FNeurons[7].FWeights;
+  Bi := FNeurons[8].FWeights;  Bf := FNeurons[9].FWeights;
+  Bg := FNeurons[10].FWeights; Bo := FNeurons[11].FWeights;
+  SeqLen := FOutput.SizeX; Depth := FOutput.Depth;
+  SeqLenM1 := SeqLen - 1; DepthM1 := Depth - 1;
+  g4d := 4 * Depth;
+
+  // Pack the four input-weight matrices into one [4*Depth,1,Depth] slab in the
+  // kernel's INTERLEAVED A layout As[m + in*FNumAs] (FNumAs=4*Depth, FSize=Depth):
+  // output-channel m = gate*Depth + outd, input in. Each W_i* is row-major
+  // [out,0,in], so W_i*[outd,in] sits at FData[outd*Depth + in].
+  FWiPacked.ReSize(g4d, 1, Depth);
+  for g := 0 to 3 do
+  begin
+    Wsrc := FNeurons[g].FWeights;
+    for outd := 0 to DepthM1 do
+    begin
+      m := g * Depth + outd;
+      srcBase := outd * Depth;
+      for inn := 0 to DepthM1 do
+        FWiPacked.FData[m + inn * g4d] := Wsrc.FData[srcBase + inn];
+    end;
+  end;
+
+  // One GEMM: result[t*4*Depth + m] = sum_in W_packed[m,in] * x_t[in]. B is the
+  // native prev output (Bs[in + t*Depth], FNumBs=SeqLen, FSize=Depth).
+  FDotCL.PrepareForCompute(FWiPacked, Prev, Depth);
+  FDotCL.Compute(FWiPacked, Prev, {ActFN}0, {NewVAs}true, {NewVBs}true);
+  FDotCL.FinishAndLoadResult(FIxProj, 0);
+
+  // CPU: add bias, the per-step recurrent projection and the gate recurrence.
+  FHprev.Fill(0);
+  HprevPtr := FHprev.GetRawPtr(0, 0, 0);
+  for t := 0 to SeqLenM1 do
+  begin
+    OutPtr := FOutput.GetRawPtr(t, 0, 0);
+    baseT := t * Depth;
+    baseX := t * g4d;
+    for d := 0 to DepthM1 do
+    begin
+      WhiR := Whi.GetRawPtr(d, 0, 0); WhfR := Whf.GetRawPtr(d, 0, 0);
+      WhgR := Whg.GetRawPtr(d, 0, 0); WhoR := Who.GetRawPtr(d, 0, 0);
+      ixBase := baseX + d;
+      accI := Bi.FData[d] + FIxProj.FData[ixBase]
+            + TNNetVolume.DotProduct(WhiR, HprevPtr, Depth);
+      accF := Bf.FData[d] + FIxProj.FData[ixBase + Depth]
+            + TNNetVolume.DotProduct(WhfR, HprevPtr, Depth);
+      accG := Bg.FData[d] + FIxProj.FData[ixBase + 2 * Depth]
+            + TNNetVolume.DotProduct(WhgR, HprevPtr, Depth);
+      accO := Bo.FData[d] + FIxProj.FData[ixBase + 3 * Depth]
+            + TNNetVolume.DotProduct(WhoR, HprevPtr, Depth);
+      iv := Sigmoid(accI); fv := Sigmoid(accF);
+      gv := pcr_tanhf(accG); ovv := Sigmoid(accO);
+      if t > 0 then cPrev := FC.FData[baseT - Depth + d] else cPrev := 0;
+      cv := fv * cPrev + iv * gv;
+      tc := pcr_tanhf(cv);
+      FIg.FData[baseT + d] := iv; FFg.FData[baseT + d] := fv;
+      FGg.FData[baseT + d] := gv; FOg.FData[baseT + d] := ovv;
+      FC.FData[baseT + d] := cv;  FTanhC.FData[baseT + d] := tc;
+      FH.FData[d] := ovv * tc;
+      FHt.FData[baseT + d] := FH.FData[d];
+      OutPtr^[d] := FH.FData[d];
+    end;
+    FHprev.Copy(FH);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+{$ENDIF}
+
 procedure TNNetLSTMCell.Compute();
+const
+  // Minimum head dim to offload: below this the GEMM is too small to amortize
+  // the per-forward upload/dispatch (the input projection is O(SeqLen*Depth^2)).
+  csLSTMOpenCLMinDepth = 32;
 var
   StartTime: double;
   Wii, Wif, Wig, Wio, Whi, Whf, Whg, Who, Bi, Bf, Bg, Bo, Prev: TNNetVolume;
@@ -51675,6 +51829,14 @@ var
   XtPtr, OutPtr, HprevPtr: TNeuralFloatArrPtr;
   WiiR, WifR, WigR, WioR, WhiR, WhfR, WhgR, WhoR: TNeuralFloatArrPtr;
 begin
+  {$IFDEF OpenCL}
+  if FHasOpenCL and FShouldOpenCL and
+     (FOutput.Depth >= csLSTMOpenCLMinDepth) then
+  begin
+    ComputeOpenCL();
+    exit;
+  end;
+  {$ENDIF}
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   Wii := FNeurons[0].FWeights; Wif := FNeurons[1].FWeights;
@@ -51894,6 +52056,11 @@ begin
   FGhNext.Free; FGh.Free;
   FHprev.Free; FH.Free; FHt.Free; FWhn.Free;
   FN.Free; FZ.Free; FR.Free;
+  {$IFDEF OpenCL}
+  // FDotCL is freed by the inherited TNNetLayer.Destroy; free only our buffers.
+  if Assigned(FWiPacked) then FWiPacked.Free;
+  if Assigned(FIxProj) then FIxProj.Free;
+  {$ENDIF}
   inherited Destroy();
 end;
 
@@ -51928,7 +52095,106 @@ begin
   InitDefault();
 end;
 
+{$IFDEF OpenCL}
+procedure TNNetGRUCell.EnableOpenCL(DotProductKernel: TDotProductKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL, FDotProductKernel
+  if not Assigned(FDotCL) then
+  begin
+    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL.HideMessages();
+  end;
+  if not Assigned(FWiPacked) then FWiPacked := TNNetVolume.Create();
+  if not Assigned(FIxProj) then FIxProj := TNNetVolume.Create();
+  FShouldOpenCL := true;
+end;
+
+// Forward: ONLY the three recurrence-independent input projections W_i* x_t are
+// offloaded as one [3*Depth, Depth] x [Depth, SeqLen] GEMM; everything that
+// depends on h_{t-1} (the recurrent projections W_h* h_{t-1}, the gates and the
+// h_t recurrence) stays on the CPU exactly like the CPU/AVX Compute().
+// Coded by Claude (AI).
+procedure TNNetGRUCell.ComputeOpenCL();
+var
+  StartTime: double;
+  Whr, Whz, Whn, Br, Bz, Bin, Bhn, Prev, Wsrc: TNNetVolume;
+  SeqLen, Depth, t, d, baseT, baseX, g3d: integer;
+  SeqLenM1, DepthM1: integer;
+  g, outd, inn, m, srcBase: integer;
+  accR, accZ, accIn, accHn, rv, zv, nv, whnv, hPrev: TNeuralFloat;
+  OutPtr, HprevPtr: TNeuralFloatArrPtr;
+  WhrR, WhzR, WhnR: TNeuralFloatArrPtr;
+  ixBase: integer;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  Whr := FNeurons[3].FWeights; Whz := FNeurons[4].FWeights;
+  Whn := FNeurons[5].FWeights;
+  Br := FNeurons[6].FWeights;  Bz := FNeurons[7].FWeights;
+  Bin := FNeurons[8].FWeights; Bhn := FNeurons[9].FWeights;
+  SeqLen := FOutput.SizeX; Depth := FOutput.Depth;
+  SeqLenM1 := SeqLen - 1; DepthM1 := Depth - 1;
+  g3d := 3 * Depth;
+
+  // Pack W_ir/W_iz/W_in into one [3*Depth,1,Depth] slab in the kernel's
+  // INTERLEAVED A layout As[m + in*FNumAs] (FNumAs=3*Depth, FSize=Depth):
+  // output-channel m = gate*Depth + outd, input in.
+  FWiPacked.ReSize(g3d, 1, Depth);
+  for g := 0 to 2 do
+  begin
+    Wsrc := FNeurons[g].FWeights;
+    for outd := 0 to DepthM1 do
+    begin
+      m := g * Depth + outd;
+      srcBase := outd * Depth;
+      for inn := 0 to DepthM1 do
+        FWiPacked.FData[m + inn * g3d] := Wsrc.FData[srcBase + inn];
+    end;
+  end;
+
+  // One GEMM: result[t*3*Depth + m] = sum_in W_packed[m,in] * x_t[in].
+  FDotCL.PrepareForCompute(FWiPacked, Prev, Depth);
+  FDotCL.Compute(FWiPacked, Prev, {ActFN}0, {NewVAs}true, {NewVBs}true);
+  FDotCL.FinishAndLoadResult(FIxProj, 0);
+
+  // CPU: bias, per-step recurrent projection and the GRU gate recurrence.
+  FHprev.Fill(0);
+  HprevPtr := FHprev.GetRawPtr(0, 0, 0);
+  for t := 0 to SeqLenM1 do
+  begin
+    OutPtr := FOutput.GetRawPtr(t, 0, 0);
+    baseT := t * Depth;
+    baseX := t * g3d;
+    for d := 0 to DepthM1 do
+    begin
+      WhrR := Whr.GetRawPtr(d, 0, 0); WhzR := Whz.GetRawPtr(d, 0, 0);
+      WhnR := Whn.GetRawPtr(d, 0, 0);
+      ixBase := baseX + d;
+      accR := Br.FData[d] + FIxProj.FData[ixBase]
+            + TNNetVolume.DotProduct(WhrR, HprevPtr, Depth);
+      accZ := Bz.FData[d] + FIxProj.FData[ixBase + Depth]
+            + TNNetVolume.DotProduct(WhzR, HprevPtr, Depth);
+      accIn := Bin.FData[d] + FIxProj.FData[ixBase + 2 * Depth];
+      accHn := Bhn.FData[d] + TNNetVolume.DotProduct(WhnR, HprevPtr, Depth);
+      rv := Sigmoid(accR); zv := Sigmoid(accZ);
+      whnv := accHn;
+      nv := pcr_tanhf(accIn + rv * whnv);
+      hPrev := FHprev.FData[d];
+      FR.FData[baseT + d] := rv; FZ.FData[baseT + d] := zv;
+      FN.FData[baseT + d] := nv; FWhn.FData[baseT + d] := whnv;
+      FH.FData[d] := (1 - zv) * nv + zv * hPrev;
+      FHt.FData[baseT + d] := FH.FData[d];
+      OutPtr^[d] := FH.FData[d];
+    end;
+    FHprev.Copy(FH);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+{$ENDIF}
+
 procedure TNNetGRUCell.Compute();
+const
+  csGRUOpenCLMinDepth = 32; // min head dim to amortize upload/dispatch
 var
   StartTime: double;
   Wir, Wiz, Win, Whr, Whz, Whn, Br, Bz, Bin, Bhn, Prev: TNNetVolume;
@@ -51938,6 +52204,14 @@ var
   XtPtr, OutPtr, HprevPtr: TNeuralFloatArrPtr;
   WirR, WizR, WinR, WhrR, WhzR, WhnR: TNeuralFloatArrPtr;
 begin
+  {$IFDEF OpenCL}
+  if FHasOpenCL and FShouldOpenCL and
+     (FOutput.Depth >= csGRUOpenCLMinDepth) then
+  begin
+    ComputeOpenCL();
+    exit;
+  end;
+  {$ENDIF}
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   Wir := FNeurons[0].FWeights; Wiz := FNeurons[1].FWeights;
