@@ -39399,10 +39399,12 @@ end;
 
 procedure TNNetBilinearUpsample.Backpropagate();
 var
-  s, OutX, OutY, D, ox, oy, c: integer;
-  OutXM1, OutYM1, DM1: integer;
+  s, OutX, OutY, D, ox, oy: integer;
+  OutXM1, OutYM1: integer;
   ix0, ix1, iy0, iy1: integer;
-  wx1, wy1, g: TNeuralFloat;
+  wx1, wy1, w00, w10, w01, w11: TNeuralFloat;
+  GradPtr: TNeuralFloatArrPtr;
+  PrevError: TNNetVolume;
   StartTime: double;
 begin
   StartTime := Now();
@@ -39410,22 +39412,28 @@ begin
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
   s := FStruct[0];
+  PrevError := FPrevLayer.OutputError;
   OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
-  OutXM1 := OutX - 1; OutYM1 := OutY - 1; DM1 := D - 1;
+  OutXM1 := OutX - 1; OutYM1 := OutY - 1;
   for oy := 0 to OutYM1 do
   begin
     BilinearMap(oy, s, FPrevLayer.Output.SizeY, iy0, iy1, wy1);
     for ox := 0 to OutXM1 do
     begin
       BilinearMap(ox, s, FPrevLayer.Output.SizeX, ix0, ix1, wx1);
-      for c := 0 to DM1 do
-      begin
-        g := FOutputError[ox, oy, c];
-        FPrevLayer.OutputError.Add(ix0, iy0, c, (1 - wy1) * (1 - wx1) * g);
-        FPrevLayer.OutputError.Add(ix1, iy0, c, (1 - wy1) * wx1 * g);
-        FPrevLayer.OutputError.Add(ix0, iy1, c, wy1 * (1 - wx1) * g);
-        FPrevLayer.OutputError.Add(ix1, iy1, c, wy1 * wx1 * g);
-      end;
+      // Transpose of the forward four-corner weighted read: each output pixel's
+      // depth vector is the same Depth-long contiguous run as the forward source
+      // columns, so the per-channel scatter into the four source corners becomes
+      // an AVX MulAdd accumulation (prevError += grad * cornerWeight).
+      w00 := (1 - wy1) * (1 - wx1);
+      w10 := (1 - wy1) * wx1;
+      w01 := wy1 * (1 - wx1);
+      w11 := wy1 * wx1;
+      GradPtr := FOutputError.GetRawPtr(ox, oy, 0);
+      TNNetVolume.MulAdd(PrevError.GetRawPtr(ix0, iy0, 0), GradPtr, w00, D);
+      TNNetVolume.MulAdd(PrevError.GetRawPtr(ix1, iy0, 0), GradPtr, w10, D);
+      TNNetVolume.MulAdd(PrevError.GetRawPtr(ix0, iy1, 0), GradPtr, w01, D);
+      TNNetVolume.MulAdd(PrevError.GetRawPtr(ix1, iy1, 0), GradPtr, w11, D);
     end;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);

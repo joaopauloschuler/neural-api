@@ -1531,7 +1531,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
   - [ ] TNNetTestTimeTraining / TNNetTitansMemory backward "undo" loops (interleaved
         scalar etaGrad/dEta/dTheta accumulation) — the per-token forward rank-1 writes
         are vectorized; this is the lower-value remainder.
-  - [ ] TNNetBilinearUpsample.Backpropagate gradient scatter. The forward landed
+  - [X] TNNetBilinearUpsample.Backpropagate gradient scatter. The forward landed
         AVX'd (commit 61eb37b: four-corner Move+Mul(w00)+3x MulAdd over the
         depth-contiguous source columns; parity test TestBilinearUpsampleForwardParity),
         but the backward path still scatters each output pixel's depth vector into the

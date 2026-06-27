@@ -1308,6 +1308,7 @@ type
     procedure TestBitProcessingSerializationRoundTrip;
     procedure TestPointwiseBitProcessingShapeRoundTripGradient;
     procedure TestBilinearUpsampleForwardParity;
+    procedure TestBilinearUpsampleBackwardParity;
   end;
 
 implementation
@@ -63327,6 +63328,106 @@ begin
   finally
     NN.Free;
     Input.Free;
+    Ref.Free;
+  end;
+end;
+
+// Backward (gradient-scatter) parity for TNNetBilinearUpsample: the AVX'd
+// four-corner MulAdd scatter must match an independent scalar per-channel
+// reference accumulation of the same output-error grad.
+procedure TTestNeuralNumerical.TestBilinearUpsampleBackwardParity;
+const
+  cInX = 5; cInY = 4; cD = 11; cFactor = 3;
+var
+  NN: TNNet;
+  Input, Desired, Grad, Ref: TNNetVolume;
+  Up: TNNetBilinearUpsample;
+  InLayer: TNNetLayer;
+  s, OutX, OutY, ox, oy, c: integer;
+  ix0, ix1, iy0, iy1: integer;
+  wx1, wy1, w00, w10, w01, w11, g, MaxDiff, Diff: TNeuralFloat;
+
+  // Mirror of BilinearMap in neuralnetwork.pas (align_corners=False).
+  procedure Map(o, sc, InSize: integer; out i0, i1: integer; out w1: TNeuralFloat);
+  var sf, fr: TNeuralFloat;
+  begin
+    sf := (o + 0.5) / sc - 0.5;
+    if sf < 0 then sf := 0;
+    i0 := Trunc(sf);
+    fr := sf - i0;
+    i1 := i0 + 1;
+    if i1 > InSize - 1 then i1 := InSize - 1;
+    if i0 > InSize - 1 then i0 := InSize - 1;
+    w1 := fr;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cInX, cInY, cD);
+  Desired := nil;
+  Grad := nil;
+  Ref := nil;
+  try
+    InLayer := NN.AddLayer(TNNetInput.Create(cInX, cInY, cD, 1));
+    Up := TNNetBilinearUpsample(NN.AddLayer(TNNetBilinearUpsample.Create(cFactor)));
+    NN.SetBatchUpdate(true);
+
+    s := cFactor;
+    OutX := cInX * s; OutY := cInY * s;
+
+    for c := 0 to Input.Size - 1 do Input.Raw[c] := Random() - 0.5;
+    NN.Compute(Input);
+
+    // Drive a random output-error gradient through the upsample layer.
+    Desired := TNNetVolume.Create(OutX, OutY, cD);
+    for c := 0 to Desired.Size - 1 do
+      Desired.Raw[c] := Up.Output.Raw[c] - (Random() - 0.5);
+
+    InLayer.OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+
+    // Capture the exact grad fed into the upsample layer, then recompute the
+    // scalar reference scatter into a fresh input-shaped volume.
+    Grad := TNNetVolume.Create(OutX, OutY, cD);
+    Grad.Copy(Up.OutputError);
+
+    Ref := TNNetVolume.Create(cInX, cInY, cD);
+    Ref.Fill(0);
+    for oy := 0 to OutY - 1 do
+    begin
+      Map(oy, s, cInY, iy0, iy1, wy1);
+      for ox := 0 to OutX - 1 do
+      begin
+        Map(ox, s, cInX, ix0, ix1, wx1);
+        w00 := (1 - wy1) * (1 - wx1);
+        w10 := (1 - wy1) * wx1;
+        w01 := wy1 * (1 - wx1);
+        w11 := wy1 * wx1;
+        for c := 0 to cD - 1 do
+        begin
+          g := Grad[ox, oy, c];
+          Ref.Add(ix0, iy0, c, w00 * g);
+          Ref.Add(ix1, iy0, c, w10 * g);
+          Ref.Add(ix0, iy1, c, w01 * g);
+          Ref.Add(ix1, iy1, c, w11 * g);
+        end;
+      end;
+    end;
+
+    MaxDiff := 0;
+    for c := 0 to Ref.Size - 1 do
+    begin
+      Diff := Abs(Ref.Raw[c] - InLayer.OutputError.Raw[c]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('BilinearUpsample backward parity, max diff=' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+    Grad.Free;
     Ref.Free;
   end;
 end;
