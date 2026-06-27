@@ -279,6 +279,7 @@ type
     // OpenCL im2col-GEMM offload parity (vs CPU) for DeformableConv / GroupConvP4
     procedure TestDeformableConvOpenCLParity;
     procedure TestGroupConvP4OpenCLParity;
+    procedure TestDeconvolutionOpenCLParity;
     procedure TestRoIAlignForward;
     procedure TestRoIAlignInputGradientCheck;
     procedure TestRoIAlignShapeInference;
@@ -57968,6 +57969,72 @@ begin
       SetNeuralConvOpenCLMinWork(1 shl 20);
     end;
     AssertTrue('GroupConvP4 OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Transposed-convolution (TNNetDeconvolution) device "scatter GEMM" parity.
+// Same shape as the conv parity tests: build the deconv, compute on the CPU,
+// then force the device path (MinWork 0) and assert the upsampled output
+// matches within the importer gate. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestDeconvolutionOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  DC: TNNetDeconvolution;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InSize: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 4);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 4, 1));
+    // 5 features, 3x3, stride2, pad1 -> upsample 8x8 -> 15x15, contraction 4.
+    DC := TNNetDeconvolution.Create(5, 3, 2, 1, 0);
+    NN.AddLayer(DC);
+    InSize := Input.Size;
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := 0.05 * i - 0.3;
+
+    // CPU forward.
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    // Device forward (force the scatter-GEMM path).
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      MaxDiff := 0;
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    AssertTrue('Deconvolution OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free;

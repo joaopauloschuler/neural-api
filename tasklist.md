@@ -497,7 +497,7 @@ rather than acted on.
       so removing the redundant copies should lift tokens/sec materially. Guard
       everything behind the existing `FShouldOpenCL`, keep the host round-trip as the
       fallback, and pin parity with the SDPAOpenCLParity-style exact-vs-CPU test.
-- [ ] OpenCL offload of `TNNetDeconvolution.Compute` (transposed convolution).
+- [X] OpenCL offload of `TNNetDeconvolution.Compute` (transposed convolution).
       Unlike `TNNetConvolution`, the deconv forward overrides Compute with its own
       overlap-add scatter and does NOT route through the conv OpenCL GEMM — the
       inner loop is already AVX (depth-axis `TNNetVolume.DotProduct` over `InD`
