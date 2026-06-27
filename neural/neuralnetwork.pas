@@ -27986,7 +27986,7 @@ var
   th: array[0..5] of TNeuralFloat;
   Theta, Src: TNNetVolume;
   xn, yn, xp, yp, sx, sy, fx, fy, w00, w01, w10, w11: TNeuralFloat;
-  acc: TNeuralFloat;
+  OutPtr: TNeuralFloatArrPtr;
   inX0, inX1, inY0, inY1: boolean;
 begin
   StartTime := Now();
@@ -28017,15 +28017,15 @@ begin
       inX1 := (x1 >= 0) and (x1 < W);
       inY0 := (y0 >= 0) and (y0 < H);
       inY1 := (y1 >= 0) and (y1 < H);
-      for dd := 0 to DM1 do
-      begin
-        acc := 0;
-        if inX0 and inY0 then acc := acc + w00 * Src.Get(x0, y0, dd);
-        if inX1 and inY0 then acc := acc + w10 * Src.Get(x1, y0, dd);
-        if inX0 and inY1 then acc := acc + w01 * Src.Get(x0, y1, dd);
-        if inX1 and inY1 then acc := acc + w11 * Src.Get(x1, y1, dd);
-        FOutput.Store(ox, oy, dd, acc);
-      end;
+      // Zero-padding outside the source: each in-bounds tap is a contiguous
+      // Depth-long column, so the per-channel blend is an AVX MulAdd
+      // accumulation (out-of-bounds taps contribute 0 and are skipped).
+      OutPtr := FOutput.GetRawPtr(ox, oy, 0);
+      FillDWord(OutPtr^, D, 0);
+      if inX0 and inY0 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y0, 0), w00, D);
+      if inX1 and inY0 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y0, 0), w10, D);
+      if inX0 and inY1 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y1, 0), w01, D);
+      if inX1 and inY1 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y1, 0), w11, D);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -28178,17 +28178,18 @@ end;
 procedure TNNetFlowWarp.Compute();
 var
   StartTime: double;
-  W, H, D, ox, oy, dd: integer;
-  WM1, HM1, DM1: integer;
+  W, H, D, ox, oy: integer;
+  WM1, HM1: integer;
   x0, y0, x1, y1: integer;
   Flow, Src: TNNetVolume;
-  sx, sy, fx, fy, w00, w01, w10, w11, acc: TNeuralFloat;
+  sx, sy, fx, fy, w00, w01, w10, w11: TNeuralFloat;
+  OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Src := FPrevLayer.FOutput;
   Flow := FFlowLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
-  WM1 := W - 1; HM1 := H - 1; DM1 := D - 1;
+  WM1 := W - 1; HM1 := H - 1;
   for oy := 0 to HM1 do
   for ox := 0 to WM1 do
   begin
@@ -28207,14 +28208,15 @@ begin
     if x1 < 0 then x1 := 0 else if x1 > W - 1 then x1 := W - 1;
     if y0 < 0 then y0 := 0 else if y0 > H - 1 then y0 := H - 1;
     if y1 < 0 then y1 := 0 else if y1 > H - 1 then y1 := H - 1;
-    for dd := 0 to DM1 do
-    begin
-      acc := w00 * Src.Get(x0, y0, dd)
-           + w10 * Src.Get(x1, y0, dd)
-           + w01 * Src.Get(x0, y1, dd)
-           + w11 * Src.Get(x1, y1, dd);
-      FOutput.Store(ox, oy, dd, acc);
-    end;
+    // The four neighbours are clamped to valid columns, so the depth axis is a
+    // contiguous Depth-long run and the per-channel blend is an AVX MulAdd
+    // accumulation (same idiom as TNNetBilinearUpsample.Compute).
+    OutPtr := FOutput.GetRawPtr(ox, oy, 0);
+    Move(Src.GetRawPtr(x0, y0, 0)^, OutPtr^, D * SizeOf(TNeuralFloat));
+    TNNetVolume.Mul(OutPtr, w00, D);
+    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y0, 0), w10, D);
+    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y1, 0), w01, D);
+    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y1, 0), w11, D);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -28350,17 +28352,18 @@ end;
 procedure TNNetBackwardWarp.Compute();
 var
   StartTime: double;
-  W, H, D, ox, oy, dd: integer;
-  WM1, HM1, DM1: integer;
+  W, H, D, ox, oy: integer;
+  WM1, HM1: integer;
   x0, y0, x1, y1: integer;
   Flow, Src: TNNetVolume;
-  sx, sy, fx, fy, w00, w01, w10, w11, acc: TNeuralFloat;
+  sx, sy, fx, fy, w00, w01, w10, w11: TNeuralFloat;
+  OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Src := FPrevLayer.FOutput;
   Flow := FFlowLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
-  WM1 := W - 1; HM1 := H - 1; DM1 := D - 1;
+  WM1 := W - 1; HM1 := H - 1;
   for oy := 0 to HM1 do
   for ox := 0 to WM1 do
   begin
@@ -28379,14 +28382,15 @@ begin
     if x1 < 0 then x1 := 0 else if x1 > W - 1 then x1 := W - 1;
     if y0 < 0 then y0 := 0 else if y0 > H - 1 then y0 := H - 1;
     if y1 < 0 then y1 := 0 else if y1 > H - 1 then y1 := H - 1;
-    for dd := 0 to DM1 do
-    begin
-      acc := w00 * Src.Get(x0, y0, dd)
-           + w10 * Src.Get(x1, y0, dd)
-           + w01 * Src.Get(x0, y1, dd)
-           + w11 * Src.Get(x1, y1, dd);
-      FOutput.Store(ox, oy, dd, acc);
-    end;
+    // The four neighbours are clamped to valid columns, so the depth axis is a
+    // contiguous Depth-long run and the per-channel blend is an AVX MulAdd
+    // accumulation (same idiom as TNNetBilinearUpsample.Compute).
+    OutPtr := FOutput.GetRawPtr(ox, oy, 0);
+    Move(Src.GetRawPtr(x0, y0, 0)^, OutPtr^, D * SizeOf(TNeuralFloat));
+    TNNetVolume.Mul(OutPtr, w00, D);
+    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y0, 0), w10, D);
+    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y1, 0), w01, D);
+    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y1, 0), w11, D);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;

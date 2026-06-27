@@ -556,19 +556,19 @@ rather than acted on.
       int8 weight-only storage instead of dequantize-then-requantize (the
       k-quant Q4_K/Q6_K/Q5_K/Q2_K dequant-at-load READ path has landed in
       neural/neuralgguf.pas).
-- [ ] OpenCL forward offload (and an AVX inner loop) for the bilinear-resample
-      layer family: `TNNetBilinearUpsample`, `TNNetAffineGridSample`,
-      `TNNetFlowWarp` and `TNNetBackwardWarp`. Today only `TNNetDeformableConv`
-      has an OpenCL path (`TNNetDeformableConv.ComputeOpenCL`); these per-output-
-      pixel bilinear-gather layers — exercised by the OpticalFlow,
-      VideoFrameInterpolation, FrameInterpolation, SpatialTransformer and
-      super-resolution examples — run a scalar (x,y)-over-output loop. The gather
-      (4 source taps × clamped coords × bilinear weights) is embarrassingly
-      parallel per output position and depth-contiguous, so it maps cleanly onto
-      a workgroup-per-output-pixel kernel mirroring the DeformableConv offload,
-      and the CPU fallback can vectorize the depth-axis tap blend with the
-      existing AVX `MulAdd` primitive. Gate behind the existing
-      `EnableOpenCL`/`WillOpenCL` plumbing and parity-check vs the scalar forward.
+- [ ] OpenCL forward offload for the bilinear-resample layer family:
+      `TNNetBilinearUpsample`, `TNNetAffineGridSample`, `TNNetFlowWarp` and
+      `TNNetBackwardWarp`. Today only `TNNetDeformableConv` has an OpenCL path
+      (`TNNetDeformableConv.ComputeOpenCL`); these per-output-pixel bilinear-gather
+      layers — exercised by the OpticalFlow, VideoFrameInterpolation,
+      FrameInterpolation, SpatialTransformer and super-resolution examples —
+      map cleanly onto a workgroup-per-output-pixel kernel mirroring the
+      DeformableConv offload. Gate behind the existing `EnableOpenCL`/`WillOpenCL`
+      plumbing and parity-check vs the scalar forward.
+      AVX inner loop DONE (commit below): the depth-axis tap blend in all three
+      sampler `Compute()`s now uses the contiguous `Mul`/`MulAdd` idiom (same as
+      `TNNetBilinearUpsample`, which was already AVX'd) — bit-parity, full suite
+      2387/2387 green. OpenCL offload deferred as the larger/riskier follow-up.
 - [ ] FP16 (half-precision) OpenCL compute path for the dot-product/matmul
       offload. ENV NOTE (2026-06-27): the only OpenCL device available here is
       PoCL on the host CPU, which does NOT advertise `cl_khr_fp16` (clinfo shows
