@@ -1762,36 +1762,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
   - [ ] TNNetTestTimeTraining / TNNetTitansMemory backward "undo" loops (interleaved
         scalar etaGrad/dEta/dTheta accumulation) — the per-token forward rank-1 writes
         are vectorized; this is the lower-value remainder.
-- [ ] AVX-vectorize the scalar inner loops in the computer-vision layers below.
-      Each hot loop is a plain `for d := ... acc := acc + a[d]*b[d]` (or
-      `dst[d] := dst[d] + s*c[d]`) over a CONTIGUOUS depth/feature axis, so the
-      fix mirrors the landed strided-state-readout work: swap the scalar loop for
-      `TNNetVolume.DotProduct` / `TNNetVolume.MulAdd` over the contiguous axis.
-      Pin exact parity vs the current scalar output on each layer's numerical
-      test, on BOTH scalar-fallback and `-dAVX2` builds.
-  - [X] `TNNetSAMVisionAttention.Compute` (neuralnetwork.pas ~33149-33180): the
-        per-query Q·K score (`Score += QPtr[d]·KPtr[d]` over FHeadDim), the two
-        decomposed relative-position dot products (`Q·rel_pos_h`, `Q·rel_pos_w`),
-        and the weighted-value accumulation (`FCtx[..d] += Score·VPtr[d]`) are all
-        contiguous over the head dimension — clean DotProduct (scores) + MulAdd
-        (value mix). Highest-value of the set: it is the Segment-Anything ViT
-        attention inner loop, run per window token per head.
-  - [X] `TNNetCapsuleConv` / `TNNetCapsules.Compute` prediction-vector loop
-        (~43380): `acc += W.Raw[o*FInDim+k]·Prev.Raw[i*FInDim+k]` over k is a
-        contiguous length-InDim dot product per (i,j,o) — direct DotProduct swap;
-        the routing-agreement weighted sum is the lower-value remainder.
-  - [X] `TNNetConvGRUCell.GateConv` inner tap loop (~29714): the innermost
-        `acc += WR[tap+zi]·SPtr[zi]` over the contiguous channel dimension (ZC
-        floats) is a 1:1 `DotProduct(WR@tap, SPtr, ZC)` replacement, accumulated
-        across taps.
-  - [X] `TNNetGramMatrix.Compute` (~18927-18940) — distinct from the others: the
-        channel-pair accumulation walks spatial positions STRIDED by C, so it is
-        NOT a direct DotProduct. Buffer the prev-layer activations into a
-        channel-major (C rows × H*W contiguous) scratch ONCE per forward, then
-        each Gram entry G[i,j] becomes `DotProduct(rowI, rowJ, H*W)` over the
-        contiguous spatial axis (and the symmetric backward mirrors it). Speeds up
-        the style-transfer / AdaIN Gram path; document the scratch alloc in
-        SetPrevLayer per the preallocated-scratch convention.
 - [ ] AVX-vectorize the elementwise transcendental hot loops (exp / tanh /
       erf). Today every activation and softmax applies its transcendental
       SCALAR per element via the precise RTL-compatible `pcr_expf` / `pcr_tanhf`
@@ -1810,24 +1780,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       DotProduct-based norm reductions and the strided state read-outs are
       already AVX'd — the transcendental element loops are the remaining scalar
       hot spot.)
-- [X] Add missing `README.md` to example folders that ship a `.lpr` but no
-      README (the CV/generative six — VQGAN, TinyNeRF, VideoFrameInterpolation,
-      VideoPrediction, VideoAction, VideoActionTiny — LANDED commit 0cf2ea59).
-      DONE: every example folder shipping a `.lpr` now has a README. The final
-      three were WeightDriftReport, YoloDetect and ZeroShotAudioTag (written
-      strictly from their `.lpr`, matching existing example-README style).
-      Remaining folders still lacking a README (write each strictly from the
-      `.lpr`, matching existing example-README style; no source edits):
-  - [X] NLP/decoding: BeamSearchDecode, SpanCorruptionPretrain, sentimentAnalysis,
-        GroupedQueryAttention, GumbelSoftmaxDemo, MixtureOfExperts, PonderNet,
-        DiagonalSSM, LegendreMemoryUnit, LinearRecurrentUnit, MinimalRNN, RWKV,
-        TitansMemory, DebertaReranker (all 14 READMEs LANDED)
-  - [X] Audio/speech: F5TTS, KokoroTTS, ParlerTTS, Qwen2AudioChat, Wav2Vec2Transcribe,
-        MusicGenProbe, MusicTagging, OCRTranscribe, SpeakerDiarization,
-        SpeakerVerification, DACRoundTrip (all 11 READMEs LANDED)
-  - [X] Misc/training: CaiOptimizedDenseNet, MagnitudePruneFineTune, OnlyTwoLayers,
-        SelfTest, SDPAOpenCLParity, OctonionConv, QuaternionConv, QuaternionLinear,
-        HopfieldAssociativeMemory (all 9 READMEs LANDED)
 
 ## Tests / numerical-gradient audit
 
