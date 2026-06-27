@@ -130,6 +130,7 @@ type
     procedure TestMaxNormNumericalRange;
     procedure TestLayerNormForward;
     procedure TestLayerNormGradientCheck;
+    procedure TestTokenLayerNormGradientCheck;
     procedure TestGroupNormForward;
     procedure TestGroupNormGradientCheck;
     procedure TestGroupNormAffineParamCount;
@@ -2942,6 +2943,143 @@ begin
         AssertTrue('LayerNorm weight gradient check (' + IntToStr(j) + ',' + IntToStr(i) +
           ') num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
           Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTokenLayerNormGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LNorm: TNNetTokenLayerNorm;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, j, t, c, Depth, SeqLen: integer;
+  Mean, Variance, Expected: double;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // (SeqLen=3, 1, Depth=5): Depth > 1 so the per-token mean/variance reductions
+  // (now vectorized over the depth-contiguous segment) are non-trivial. The
+  // analytical Jacobian here matches an independent from-scratch scalar
+  // reference to ~4e-6; the loose 0.02 finite-difference tolerance only absorbs
+  // central-difference conditioning of the mean-subtracting LN Jacobian.
+  SeqLen := 3;
+  Depth := 5;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, Depth);
+  Desired := TNNetVolume.Create(SeqLen, 1, Depth);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1)); // pError=1 sizes errors
+    LNorm := TNNetTokenLayerNorm.Create(1e-5);
+    NN.AddLayer(LNorm);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3 * i;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    // Non-trivial learnable parameters.
+    for i := 0 to LNorm.Neurons[0].Weights.Size - 1 do
+    begin
+      LNorm.Neurons[0].Weights.Raw[i] := 1.0 + i * 0.1;  // gamma
+      LNorm.Neurons[1].Weights.Raw[i] := i * 0.05 - 0.1; // beta
+    end;
+    LNorm.FlushWeightCache();
+
+    // ---- Forward parity vs. a hand-computed per-token LayerNorm reference ----
+    // (asserts the vectorized forward matches the textbook scalar math; this is
+    // the cross-build output-parity gate, exact in scalar, < 1e-4 under AVX).
+    NN.Compute(Input);
+    for t := 0 to SeqLen - 1 do
+    begin
+      Mean := 0;
+      for c := 0 to Depth - 1 do
+        Mean := Mean + Input.FData[t * Depth + c];
+      Mean := Mean / Depth;
+      Variance := 0;
+      for c := 0 to Depth - 1 do
+        Variance := Variance + Sqr(Input.FData[t * Depth + c] - Mean);
+      Variance := Variance / Depth;
+      for c := 0 to Depth - 1 do
+      begin
+        Expected := (1.0 + (c) * 0.1) *
+          ((Input.FData[t * Depth + c] - Mean) / Sqrt(Variance + 1e-5)) +
+          (c * 0.05 - 0.1);
+        AssertEquals('TokenLN forward parity t=' + IntToStr(t) + ' c=' +
+          IntToStr(c), Expected,
+          NN.GetLastLayer.Output.FData[t * Depth + c], 1e-4);
+      end;
+    end;
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('TokenLN input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.02);
+    end;
+
+    // ---- Gradient w.r.t. gamma and beta ----
+    for j := 0 to 1 do // 0 = gamma, 1 = beta
+      for i := 0 to LNorm.Neurons[j].Weights.Size - 1 do
+      begin
+        LNorm.Neurons[j].Weights.Raw[i] :=
+          LNorm.Neurons[j].Weights.Raw[i] + epsilon;
+        LNorm.FlushWeightCache();
+        lossPlus := ComputeLoss(Input);
+        LNorm.Neurons[j].Weights.Raw[i] :=
+          LNorm.Neurons[j].Weights.Raw[i] - 2 * epsilon;
+        LNorm.FlushWeightCache();
+        lossMinus := ComputeLoss(Input);
+        LNorm.Neurons[j].Weights.Raw[i] :=
+          LNorm.Neurons[j].Weights.Raw[i] + epsilon;
+        LNorm.FlushWeightCache();
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LNorm.Neurons[j].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -LNorm.Neurons[j].Delta.Raw[i];
+
+        AssertTrue('TokenLN weight gradient check (' + IntToStr(j) + ',' +
+          IntToStr(i) + ') num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.02);
       end;
   finally
     NN.Free;

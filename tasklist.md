@@ -1661,7 +1661,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
         scalar etaGrad/dEta/dTheta accumulation) — the per-token forward rank-1 writes
         are vectorized; this is the lower-value remainder.
 
-- [ ] AVX-vectorize `TNNetTokenLayerNorm` forward + backward (the per-token loops
+- [X] AVX-vectorize `TNNetTokenLayerNorm` forward + backward (the per-token loops
       are still pure SCALAR — forward mean/variance accumulation and the backward
       Jacobian both iterate the channel axis one float at a time). Its sibling
       `TNNetTokenRMSNorm` is ALREADY fully vectorized over the exact same
