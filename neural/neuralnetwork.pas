@@ -11876,6 +11876,14 @@ type
     FOffOut: integer;      // offset-head output channels: 2*KK, or 3*KK if modulated
     FModulated: integer;   // 0 = plain deformable conv (v1), 1 = DCNv2 modulated
     FOffMap: TNNetVolume;  // cached offset maps (FOutputSizeX,Y, FOffOut)
+    {$IFDEF OpenCL}
+    // Scratch operands for the device im2col GEMM (interleaved weights, gathered
+    // per-position bilinear patches, result). The bilinear GATHER stays on the
+    // CPU (FGemmPatch); only the dense patch x weight contraction goes to the
+    // device, exactly mirroring the EnCodec/HiFiGAN conv-offload path.
+    FGemmWInter, FGemmPatch, FGemmRes: TNNetVolume;
+    procedure ComputeOpenCL();
+    {$ENDIF}
     function SampleBilinear(PrevOut: TNNetVolume; px, py: TNeuralFloat;
       ci: integer): TNeuralFloat;
     procedure ComputeCPU();
@@ -11888,6 +11896,9 @@ type
     procedure InitDefault(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
+    {$IFDEF OpenCL}
+    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    {$ENDIF}
     property InDepth: integer read FInDepth;
     property OutDepth: integer read FOutDepth;
     property Modulated: integer read FModulated;
@@ -11935,6 +11946,14 @@ type
     FFeaturesCount: integer;  // co count (output Depth = 4*FeaturesCount)
     FKSize: integer;          // per-filter weight count (K*K*InDepth)
     FRotMap: array of integer; // FRotMap[r*FKSize + tap] = base tap of rot-r view
+    {$IFDEF OpenCL}
+    // Scratch operands for the device im2col GEMM. The rotation weight-FOLDING
+    // (the 4 rot-tied filter views read through FRotMap) is materialised on the
+    // CPU into FGemmWInter; only the dense patch x weight contraction goes to
+    // the device, mirroring the EnCodec/HiFiGAN conv-offload path.
+    FGemmWInter, FGemmPatch, FGemmRes: TNNetVolume;
+    procedure ComputeOpenCL();
+    {$ENDIF}
     procedure BuildRotMap();
     procedure ComputeCPU();
     procedure BackpropagateCPU();
@@ -11945,6 +11964,10 @@ type
     procedure Compute(); override;
     procedure Backpropagate(); override;
     procedure InitDefault(); override;
+    {$IFDEF OpenCL}
+    destructor Destroy(); override;
+    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    {$ENDIF}
     property InDepth: integer read FInDepth;
     property FeaturesCount: integer read FFeaturesCount;
   end;
@@ -17468,6 +17491,13 @@ type
   {$IFDEF OpenCL}
   procedure TestConvolutionOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
   procedure TestFullConnectOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
+  // Minimum GEMM work (output-element multiply-adds) below which the spatial
+  // im2col GEMM of TNNetDeformableConv / TNNetGroupConvP4 stays on the CPU even
+  // when OpenCL is armed - the kernel launch + host<->device copy dominates tiny
+  // convs. Mirrors SetConvOpenCLMinWork for the audio conv path. 0 forces every
+  // such conv onto the device (used by the parity tests). Coded by Claude (AI).
+  procedure SetNeuralConvOpenCLMinWork(MinMACs: int64);
+  function NeuralConvOpenCLMinWorkValue(): int64;
   {$ENDIF}
 
   procedure RebuildPatternOnPreviousPatterns
@@ -17490,6 +17520,25 @@ type
   );
 
 implementation
+
+{$IFDEF OpenCL}
+// Work threshold (output-element MACs) gating the DeformableConv / GroupConvP4
+// device offload. Tuned conservatively; correctness is independent of it (the
+// CPU path is byte-identical). Settable via SetNeuralConvOpenCLMinWork (0 forces
+// every such conv onto the device). Coded by Claude (AI).
+var
+  NeuralConvOpenCLMinWork: int64 = 1 shl 20; // 1M MACs
+
+procedure SetNeuralConvOpenCLMinWork(MinMACs: int64);
+begin
+  NeuralConvOpenCLMinWork := MinMACs;
+end;
+
+function NeuralConvOpenCLMinWorkValue(): int64;
+begin
+  Result := NeuralConvOpenCLMinWork;
+end;
+{$ENDIF}
 
 function BoolToString(B: Boolean; const TrueS, FalseS: string): String; inline;
 begin
@@ -65384,6 +65433,11 @@ end;
 destructor TNNetDeformableConv.Destroy();
 begin
   FOffMap.Free;
+  {$IFDEF OpenCL}
+  FGemmWInter.Free;
+  FGemmPatch.Free;
+  FGemmRes.Free;
+  {$ENDIF}
   inherited Destroy();
 end;
 
@@ -65532,6 +65586,21 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  {$IFDEF OpenCL}
+  // Offload the dense main-conv im2col GEMM to the device when OpenCL is armed
+  // and the contraction is large enough to amortise the upload/dispatch. The
+  // offset head and the bilinear GATHER stay on the CPU (see ComputeOpenCL);
+  // below the work threshold (or when OpenCL is off) the whole conv runs on the
+  // CPU - byte-identical to the gate-OFF path.
+  if FHasOpenCL and FShouldOpenCL and Assigned(FDotCL) and
+     (Int64(FOutDepth) * (FOutputSizeX * FOutputSizeY) *
+      (FNumTaps * FInDepth) >= NeuralConvOpenCLMinWork) then
+  begin
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -65611,6 +65680,142 @@ begin
       FOutput.FData[FOutput.GetRawPos(ox, oy, co)] := acc;
     end;
 end;
+
+{$IFDEF OpenCL}
+procedure TNNetDeformableConv.EnableOpenCL(DotProductKernel: TDotProductKernel);
+begin
+  // Deliberately do NOT chain through TNNetConvolutionBase.EnableOpenCL: that
+  // path concats/interleaves a per-feature-neuron weight bank and arms the
+  // standard conv GEMM, which is meaningless for our custom 4-neuron layout.
+  // We only need the bare TNNetLayer arming (FHasOpenCL + the shared kernel) and
+  // our own scratch buffers; the offload runs through ComputeOpenCL.
+  FHasOpenCL := true;
+  FDotProductKernel := DotProductKernel;
+  if not Assigned(FDotCL) then
+  begin
+    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL.HideMessages();
+  end;
+  if not Assigned(FGemmWInter) then FGemmWInter := TNNetVolume.Create();
+  if not Assigned(FGemmPatch)  then FGemmPatch  := TNNetVolume.Create();
+  if not Assigned(FGemmRes)    then FGemmRes    := TNNetVolume.Create();
+  FShouldOpenCL := true;
+end;
+
+// Device im2col GEMM for the deformable MAIN conv. The offset head and the
+// per-tap bilinear GATHER (+ DCNv2 modulation) stay on the CPU: only the dense
+// patch x weight contraction goes to the device. The CPU ComputeCPU is the
+// fallback whenever OpenCL is off or below the work threshold.
+//
+// Output GEMM:  Out[co][t] = Bias[co] + sum_i mW[i*OutDepth+co] * Patch_t[i]
+//   N rows    = FOutDepth (output channels)
+//   T columns = NumPos    = OutputSizeX*OutputSizeY (one per output position)
+//   Size      = FNumTaps*FInDepth (contraction = sampled receptive field)
+// mW is ALREADY stored [(tap*InDepth+ci)*OutDepth + co] = [i*N + co], which is
+// exactly the kernel's interleaved A layout, so the weight copy is a verbatim
+// move. Patch_t[i] = SampleBilinear(...)*modM is gathered on the CPU into the
+// kernel's contiguous B layout [t*Size + i]. The kernel returns
+// Res[t*N + co], read back with the bias add (matching ComputeCPU exactly).
+procedure TNNetDeformableConv.ComputeOpenCL();
+var
+  ox, oy, co, fx, fy, ci, tap, t, i: integer;
+  MaxOY, MaxOX, MaxOffOut, MaxFY, MaxFX, MaxCI, MaxCO: integer;
+  NumPos, Sz, oc: integer;
+  prevX0, prevY0: integer;
+  PrevOut, mW, mB, oW, oB: TNNetVolume;
+  dx, dy, px, py, sampled, offv, modM: TNeuralFloat;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  mW := FArrNeurons[0].FWeights;
+  mB := FArrNeurons[1].FWeights;
+  oW := FArrNeurons[2].FWeights;
+  oB := FArrNeurons[3].FWeights;
+
+  MaxOY := FOutputSizeY - 1;
+  MaxOX := FOutputSizeX - 1;
+  MaxOffOut := FOffOut - 1;
+  MaxFY := FFeatureSizeY - 1;
+  MaxFX := FFeatureSizeX - 1;
+  MaxCI := FInDepth - 1;
+  MaxCO := FOutDepth - 1;
+  NumPos := FOutputSizeX * FOutputSizeY;
+  Sz := FNumTaps * FInDepth;
+
+  // 1. Offset head: ordinary conv (same kernel/pad/stride) -> 2*KK offset maps.
+  //    Identical to ComputeCPU step 1 (stays on the CPU).
+  for oy := 0 to MaxOY do
+  for ox := 0 to MaxOX do
+    for oc := 0 to MaxOffOut do
+    begin
+      offv := oB.FData[oc];
+      for fy := 0 to MaxFY do
+      begin
+        prevY0 := oy * FStride + fy - FPadding;
+        if (prevY0 < 0) or (prevY0 >= PrevOut.SizeY) then continue;
+        for fx := 0 to MaxFX do
+        begin
+          prevX0 := ox * FStride + fx - FPadding;
+          if (prevX0 < 0) or (prevX0 >= PrevOut.SizeX) then continue;
+          for ci := 0 to MaxCI do
+          begin
+            tap := ((fy * FFeatureSizeX + fx) * FInDepth + ci) * FOffOut + oc;
+            offv := offv + oW.FData[tap] * PrevOut.Get(prevX0, prevY0, ci);
+          end;
+        end;
+      end;
+      FOffMap.FData[FOffMap.GetRawPos(ox, oy, oc)] := offv;
+    end;
+
+  // 2. Interleaved weights A[i*OutDepth + co] = mW (verbatim - already that
+  //    layout). One copy per forward (weights may have changed via training).
+  FGemmWInter.ReSize(FOutDepth * Sz, 1, 1);
+  for i := 0 to FOutDepth * Sz - 1 do
+    FGemmWInter.FData[i] := mW.FData[i];
+
+  // 3. Gather the bilinear-sampled (+modulated) patch for every output position
+  //    into the kernel's contiguous B layout [t*Sz + i], i = tap*InDepth+ci.
+  FGemmPatch.ReSize(NumPos * Sz, 1, 1);
+  for oy := 0 to MaxOY do
+  for ox := 0 to MaxOX do
+  begin
+    t := oy * FOutputSizeX + ox;
+    for fy := 0 to MaxFY do
+    for fx := 0 to MaxFX do
+    begin
+      tap := fy * FFeatureSizeX + fx;
+      dx := FOffMap.Get(ox, oy, 2 * tap);
+      dy := FOffMap.Get(ox, oy, 2 * tap + 1);
+      px := ox * FStride + fx - FPadding + dx;
+      py := oy * FStride + fy - FPadding + dy;
+      if FModulated <> 0 then
+        modM := 1.0 / (1.0 + Exp(-FOffMap.Get(ox, oy, 2 * FNumTaps + tap)))
+      else
+        modM := 1.0;
+      for ci := 0 to MaxCI do
+      begin
+        sampled := SampleBilinear(PrevOut, px, py, ci) * modM;
+        FGemmPatch.FData[t * Sz + (tap * FInDepth + ci)] := sampled;
+      end;
+    end;
+  end;
+
+  // 4. Device GEMM: Res[t*OutDepth + co] = sum_i A[i*OutDepth+co] * Patch[t*Sz+i].
+  FGemmRes.ReSize(NumPos * FOutDepth, 1, 1);
+  FDotCL.PrepareForCompute(FGemmWInter, FGemmPatch, Sz);
+  FDotCL.Compute(FGemmWInter, FGemmPatch, {ActFN}0, {NewVAs}true, {NewVBs}true);
+  FDotCL.FinishAndLoadResult(FGemmRes, 0);
+
+  // 5. Read back with the bias add, into the native [ox,oy,co] output layout.
+  for oy := 0 to MaxOY do
+  for ox := 0 to MaxOX do
+  begin
+    t := oy * FOutputSizeX + ox;
+    for co := 0 to MaxCO do
+      FOutput.FData[FOutput.GetRawPos(ox, oy, co)] :=
+        mB.FData[co] + FGemmRes.FData[t * FOutDepth + co];
+  end;
+end;
+{$ENDIF}
 
 procedure TNNetDeformableConv.Backpropagate();
 var
@@ -65955,6 +66160,21 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  {$IFDEF OpenCL}
+  // Offload the dense rotation-tied im2col GEMM to the device when OpenCL is
+  // armed and the work is large enough to amortise the upload/dispatch. The
+  // rotation weight-FOLDING (the 4 rot-tied filter views) is materialised on the
+  // CPU; only the patch x weight contraction goes to the device. Below the work
+  // threshold (or OpenCL off) the whole conv runs on the CPU - byte-identical.
+  if FHasOpenCL and FShouldOpenCL and Assigned(FDotCL) and
+     (Int64(4 * FFeaturesCount) * (FOutputSizeX * FOutputSizeY) * FKSize
+      >= NeuralConvOpenCLMinWork) then
+  begin
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -66011,6 +66231,133 @@ begin
       end;
     end;
 end;
+
+{$IFDEF OpenCL}
+destructor TNNetGroupConvP4.Destroy();
+begin
+  FGemmWInter.Free;
+  FGemmPatch.Free;
+  FGemmRes.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetGroupConvP4.EnableOpenCL(DotProductKernel: TDotProductKernel);
+begin
+  // As with TNNetDeformableConv, bypass the standard conv concated-weight
+  // arming (our shared-bank neuron layout is not the per-output-feature layout
+  // that path expects). Arm only the bare layer + shared kernel + scratch.
+  FHasOpenCL := true;
+  FDotProductKernel := DotProductKernel;
+  if not Assigned(FDotCL) then
+  begin
+    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL.HideMessages();
+  end;
+  if not Assigned(FGemmWInter) then FGemmWInter := TNNetVolume.Create();
+  if not Assigned(FGemmPatch)  then FGemmPatch  := TNNetVolume.Create();
+  if not Assigned(FGemmRes)    then FGemmRes    := TNNetVolume.Create();
+  FShouldOpenCL := true;
+end;
+
+// Device im2col GEMM for the p4 lifting conv. The rotation weight-FOLDING (the
+// 4 rot-{0,90,180,270} views of each shared filter, read through FRotMap) is
+// materialised on the CPU into the kernel's interleaved A operand; only the
+// dense patch x weight contraction goes to the device. ComputeCPU is the
+// fallback whenever OpenCL is off or below the work threshold.
+//
+// Output GEMM:  Out[oc][t] = sum_i A[i*N + oc] * Patch_t[i]   (+ bias)
+//   N rows    = 4*FFeaturesCount, row index oc = co*4 + r (matches output Depth)
+//   T columns = NumPos = OutputSizeX*OutputSizeY
+//   Size      = FKSize (plain im2col receptive field, zero-padded)
+// A[i*N + (co*4+r)] = W_co[FRotMap[r*FKSize + i]]  (the rotated filter view).
+// Patch_t[i] is the SAME plain im2col patch for every (co,r) at position t, so
+// it is gathered once per position. The kernel returns Res[t*N + oc]; the
+// per-FEATURE bias (shared across r) is added on readback (matching ComputeCPU).
+procedure TNNetGroupConvP4.ComputeOpenCL();
+var
+  ox, oy, co, r, fx, fy, ci, t, i, oc, rBase, dstTap: integer;
+  MaxOY, MaxOX, MaxFeat, MaxFY, MaxFX, MaxCI: integer;
+  NumPos, NRows, prevX, prevY, prevSizeX, prevSizeY: integer;
+  b: TNeuralFloat;
+  W, PrevOut, Bias: TNNetVolume;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  Bias := FArrNeurons[FFeaturesCount].FWeights;
+  prevSizeX := PrevOut.SizeX;
+  prevSizeY := PrevOut.SizeY;
+  MaxOY := FOutputSizeY - 1;
+  MaxOX := FOutputSizeX - 1;
+  MaxFeat := FFeaturesCount - 1;
+  MaxFY := FFeatureSizeY - 1;
+  MaxFX := FFeatureSizeX - 1;
+  MaxCI := FInDepth - 1;
+  NumPos := FOutputSizeX * FOutputSizeY;
+  NRows := 4 * FFeaturesCount;
+
+  // 1. Interleaved A: row oc = co*4+r holds the rot-r view of filter co, laid
+  //    out A[i*NRows + oc] = W_co[FRotMap[r*FKSize + i]].
+  FGemmWInter.ReSize(NRows * FKSize, 1, 1);
+  for co := 0 to MaxFeat do
+  begin
+    W := FArrNeurons[co].FWeights;
+    for r := 0 to 3 do
+    begin
+      rBase := r * FKSize;
+      oc := co * 4 + r;
+      for i := 0 to FKSize - 1 do
+        FGemmWInter.FData[i * NRows + oc] := W.FData[FRotMap[rBase + i]];
+    end;
+  end;
+
+  // 2. Plain im2col patch (zero-padded) per output position into B[t*FKSize + i],
+  //    i = (fy*K+fx)*InDepth + ci. Shared across all (co,r) at the position.
+  FGemmPatch.ReSize(NumPos * FKSize, 1, 1);
+  FGemmPatch.Fill(0); // out-of-bounds taps stay zero (zero padding)
+  for oy := 0 to MaxOY do
+  for ox := 0 to MaxOX do
+  begin
+    t := oy * FOutputSizeX + ox;
+    for fy := 0 to MaxFY do
+    begin
+      prevY := oy * FStride + fy - FPadding;
+      if (prevY < 0) or (prevY >= prevSizeY) then continue;
+      for fx := 0 to MaxFX do
+      begin
+        prevX := ox * FStride + fx - FPadding;
+        if (prevX < 0) or (prevX >= prevSizeX) then continue;
+        for ci := 0 to MaxCI do
+        begin
+          dstTap := (fy * FFeatureSizeX + fx) * FInDepth + ci;
+          FGemmPatch.FData[t * FKSize + dstTap] := PrevOut.Get(prevX, prevY, ci);
+        end;
+      end;
+    end;
+  end;
+
+  // 3. Device GEMM: Res[t*NRows + oc] = sum_i A[i*NRows+oc] * Patch[t*FKSize+i].
+  FGemmRes.ReSize(NumPos * NRows, 1, 1);
+  FDotCL.PrepareForCompute(FGemmWInter, FGemmPatch, FKSize);
+  FDotCL.Compute(FGemmWInter, FGemmPatch, {ActFN}0, {NewVAs}true, {NewVBs}true);
+  FDotCL.FinishAndLoadResult(FGemmRes, 0);
+
+  // 4. Read back with the shared per-feature bias add into channel oc = co*4+r.
+  for oy := 0 to MaxOY do
+  for ox := 0 to MaxOX do
+  begin
+    t := oy * FOutputSizeX + ox;
+    for co := 0 to MaxFeat do
+    begin
+      if FSuppressBias = 0 then b := Bias.FData[co] else b := 0;
+      for r := 0 to 3 do
+      begin
+        oc := co * 4 + r;
+        FOutput.FData[FOutput.GetRawPos(ox, oy, oc)] :=
+          FGemmRes.FData[t * NRows + oc] + b;
+      end;
+    end;
+  end;
+end;
+{$ENDIF}
 
 procedure TNNetGroupConvP4.Backpropagate();
 var

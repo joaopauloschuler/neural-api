@@ -1487,7 +1487,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       hot path; keep the Modes low-pass truncation and the learnable-complex-weight
       gradient exactly as-is, pinned by the existing numerical-gradient test.
 
-- [ ] OpenCL offload for the spatial im2col GEMM of TNNetDeformableConv and
+- [X] OpenCL offload for the spatial im2col GEMM of TNNetDeformableConv and
       TNNetGroupConvP4. Both spend their forward in a scalar
       `for oy, ox, co, fy, fx, ci` convolution accumulation (DeformableConv with a
       bilinear-sampled patch per tap, GroupConvP4 with the 4 rotation-tied weight
