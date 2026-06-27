@@ -1695,6 +1695,12 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       (the forward + cleanly-mappable backward paths are done; these are the
       strided-on-one-operand remainders that a single DotProduct/MulAdd cannot cover
       without an extra gather):
+  - [X] TNNetDeformableConv / DCNv2 backward — per-(ox,oy,tap) gather of the raw-
+        sample + dS/dpx + dS/dpy ci-columns ONCE (reused across co), main-/offset-
+        weight grads via ci-contiguous deltas (FMWDeltaCI/FOWDeltaCI, transposed
+        back), input-grad MulAdd of FWeightCI/FOWeightCI rows into the contiguous
+        PrevErr corner columns, offset/dMod grads via DotProduct. Main-weight grad
+        bit-identical scalar; input/offset ~1e-6. Suite green scalar + -dAVX2.
   - [ ] TNNetTestTimeTraining / TNNetTitansMemory backward "undo" loops (interleaved
         scalar etaGrad/dEta/dTheta accumulation) — the per-token forward rank-1 writes
         are vectorized; this is the lower-value remainder.

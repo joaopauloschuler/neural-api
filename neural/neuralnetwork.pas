@@ -12175,6 +12175,19 @@ type
     // a contiguous AVX DotProduct. Both rebuilt each forward.
     FSampledCol: TNNetVolume;
     FWeightCI: TNNetVolume;
+    // AVX scratch for the BACKWARD pass. The main- and offset-weight gradients
+    // are stored ci-fastest (mWDelta/oWDelta are co-/oc-fastest, i.e. STRIDED in
+    // ci) so the per-(co,oc) ci-reduction accumulates with a contiguous MulAdd;
+    // they are transposed back into the strided neuron Delta layout at the end of
+    // the pass (the TNNetMonarchLinear strided-weight-grad pattern). FOWeightCI is
+    // oW transposed ci-contiguous for the offset-head input-grad MulAdd. FBwScol /
+    // FBwDSpx / FBwDSpy hold per-tap contiguous ci columns of the raw bilinear
+    // sample and its dpx/dpy derivatives (gathered ONCE per (ox,oy,tap), reused
+    // across co). All rebuilt each backward; allocated in SetPrevLayer.
+    FMWDeltaCI: TNNetVolume;   // [(tap*FOutDepth+co)*FInDepth+ci]
+    FOWDeltaCI: TNNetVolume;   // [(tap*FOffOut+oc)*FInDepth+ci]
+    FOWeightCI: TNNetVolume;   // ci-contiguous transpose of oW
+    FBwScol, FBwDSpx, FBwDSpy: TNNetVolume; // length FInDepth scratch columns
     {$IFDEF OpenCL}
     // Scratch operands for the device im2col GEMM (interleaved weights, gathered
     // per-position bilinear patches, result). The bilinear GATHER stays on the
@@ -67297,6 +67310,12 @@ begin
   FOffMap := TNNetVolume.Create();
   FSampledCol := TNNetVolume.Create();
   FWeightCI := TNNetVolume.Create();
+  FMWDeltaCI := TNNetVolume.Create();
+  FOWDeltaCI := TNNetVolume.Create();
+  FOWeightCI := TNNetVolume.Create();
+  FBwScol := TNNetVolume.Create();
+  FBwDSpx := TNNetVolume.Create();
+  FBwDSpy := TNNetVolume.Create();
   // Neurons are sized in SetPrevLayer once InDepth is known.
 end;
 
@@ -67305,6 +67324,12 @@ begin
   FOffMap.Free;
   FSampledCol.Free;
   FWeightCI.Free;
+  FMWDeltaCI.Free;
+  FOWDeltaCI.Free;
+  FOWeightCI.Free;
+  FBwScol.Free;
+  FBwDSpx.Free;
+  FBwDSpy.Free;
   {$IFDEF OpenCL}
   FGemmWInter.Free;
   FGemmPatch.Free;
@@ -67395,6 +67420,13 @@ begin
   FOffMap.ReSize(FOutputSizeX, FOutputSizeY, FOffOut);
   FSampledCol.ReSize(1, 1, FInDepth);
   FWeightCI.ReSize(1, 1, FMainSize);  // ci-contiguous transpose of mW
+  // Backward scratch (see field comments).
+  FMWDeltaCI.ReSize(1, 1, FMainSize);
+  FOWDeltaCI.ReSize(1, 1, FOffSize);
+  FOWeightCI.ReSize(1, 1, FOffSize);
+  FBwScol.ReSize(1, 1, FInDepth);
+  FBwDSpx.ReSize(1, 1, FInDepth);
+  FBwDSpy.ReSize(1, 1, FInDepth);
 
   InitDefault();
   RefreshCalculatePrevLayerError();
@@ -67732,19 +67764,14 @@ var
   MaxOY, MaxOX, MaxCO, MaxFY, MaxFX, MaxCI, MaxOffOut: integer;
   PrevOut, PrevErr, mW, oW: TNNetVolume;
   mWDelta, mBDelta, oWDelta, oBDelta: TNNetVolume;
-  dy_out, dx, dyo, px, py, fxr, fyr, wgt, sampled, dval: TNeuralFloat;
-  w00, w01, w10, w11, dSdpx, dSdpy, ddx, ddy, dOff, lr: TNeuralFloat;
-  modM, dModAcc: TNeuralFloat;
-  HasPrevError: boolean;
+  dy_out, dx, dyo, px, py, fxr, fyr, dOff, lr: TNeuralFloat;
+  w00, w01, w10, w11: TNeuralFloat;
+  modM, dModAcc, coef, wdpx, wdpy: TNeuralFloat;
+  HasPrevError, b00, b01, b10, b11: boolean;
+  wciBase, mdBase, owBase, owDBase, scl: integer;
+  pScol, pDSpx, pDSpy, pWrow, pPrev00, pPrev01, pPrev10, pPrev11: TNeuralFloatArrPtr;
   // dL/d(offset map) accumulator (FOutputSizeX,Y, 2*KK).
   dOffMap: TNNetVolume;
-
-  procedure ScatterCorner(xx, yy: integer; coef: TNeuralFloat; cci: integer);
-  begin
-    // Accumulate input gradient into corner (xx,yy) if in bounds.
-    if HasPrevError and (xx >= 0) and (xx < sx) and (yy >= 0) and (yy < sy) then
-      PrevErr.Add(xx, yy, cci, coef);
-  end;
 
 begin
   PrevOut := FPrevLayer.FOutput;
@@ -67768,113 +67795,153 @@ begin
   MaxCI := FInDepth - 1;
   MaxOffOut := FOffOut - 1;
 
+  // Rebuild the ci-contiguous main-weight transpose (forward already maintains
+  // FWeightCI, but rebuild defensively so backward is self-contained: weights
+  // are constant between the matching forward and this backward).
+  // FWeightCI[(tap*FOutDepth+co)*FInDepth+ci] = mW[(tap*FInDepth+ci)*FOutDepth+co]
+  for tap := 0 to FNumTaps - 1 do
+    for co := 0 to MaxCO do
+      for ci := 0 to MaxCI do
+        FWeightCI.FData[(tap * FOutDepth + co) * FInDepth + ci] :=
+          mW.FData[(tap * FInDepth + ci) * FOutDepth + co];
+  // ci-contiguous accumulators for the strided main-/offset-weight deltas; we
+  // accumulate ci-fastest (AVX) then transpose back into the neuron Delta layout.
+  FMWDeltaCI.Fill(0);
+
   dOffMap := TNNetVolume.Create(FOutputSizeX, FOutputSizeY, FOffOut);
   dOffMap.Fill(0);
 
   // --- Main deformable conv backward ---
   // For each output (ox,oy,co): accumulate main-weight grad, main-bias grad,
   // input grad through the 4 bilinear corners, and offset-map grad through the
-  // interpolation coefficients' dependence on (px,py).
+  // interpolation coefficients' dependence on (px,py). The per-tap raw bilinear
+  // sample column (FBwScol) and its dpx/dpy derivative columns (FBwDSpx/DSpy) are
+  // CONTIGUOUS over ci and gathered ONCE per (ox,oy,tap) -- independent of co --
+  // then every co-reduction over ci becomes an AVX DotProduct / MulAdd. The
+  // bilinear GATHER itself is the same in-bounds-corner add order as the scalar
+  // reference (zero corners are skipped, not added), so the column build is
+  // bit-identical to the prior per-ci recompute.
+  pScol := FBwScol.GetRawPtr(0);
+  pDSpx := FBwDSpx.GetRawPtr(0);
+  pDSpy := FBwDSpy.GetRawPtr(0);
+  scl := FInDepth;
   for oy := 0 to MaxOY do
   for ox := 0 to MaxOX do
-    for co := 0 to MaxCO do
+  begin
+    for fy := 0 to MaxFY do
+    for fx := 0 to MaxFX do
     begin
-      dy_out := FOutputError.Get(ox, oy, co);
-      if dy_out = 0 then continue;
-      // main bias gradient
-      if FStruct[4] = 0 then
-        mBDelta.FData[co] := mBDelta.FData[co] + lr * dy_out;
-      for fy := 0 to MaxFY do
-      for fx := 0 to MaxFX do
+      tap := fy * FFeatureSizeX + fx;
+      dx := FOffMap.Get(ox, oy, 2 * tap);
+      dyo := FOffMap.Get(ox, oy, 2 * tap + 1);
+      px := ox * FStride + fx - FPadding + dx;
+      py := oy * FStride + fy - FPadding + dyo;
+      // DCNv2: per-tap modulation m = sigmoid(logit).
+      if FModulated <> 0 then
+        modM := 1.0 / (1.0 + Exp(-FOffMap.Get(ox, oy, 2 * FNumTaps + tap)))
+      else
+        modM := 1.0;
+      x0 := Floor(px); y0 := Floor(py);
+      x1 := x0 + 1;    y1 := y0 + 1;
+      fxr := px - x0;  fyr := py - y0;
+      w00 := (1 - fxr) * (1 - fyr);
+      w01 := fxr * (1 - fyr);
+      w10 := (1 - fxr) * fyr;
+      w11 := fxr * fyr;
+      b00 := (x0 >= 0) and (x0 < sx) and (y0 >= 0) and (y0 < sy);
+      b01 := (x1 >= 0) and (x1 < sx) and (y0 >= 0) and (y0 < sy);
+      b10 := (x0 >= 0) and (x0 < sx) and (y1 >= 0) and (y1 < sy);
+      b11 := (x1 >= 0) and (x1 < sx) and (y1 >= 0) and (y1 < sy);
+      // Contiguous corner-column base pointers (only dereferenced if in bounds).
+      pPrev00 := nil; pPrev01 := nil; pPrev10 := nil; pPrev11 := nil;
+      if b00 then pPrev00 := PrevOut.GetRawPtr(x0, y0, 0);
+      if b01 then pPrev01 := PrevOut.GetRawPtr(x1, y0, 0);
+      if b10 then pPrev10 := PrevOut.GetRawPtr(x0, y1, 0);
+      if b11 then pPrev11 := PrevOut.GetRawPtr(x1, y1, 0);
+      // FBwScol[ci] = raw bilinear sample (in-bounds corners only, w-order).
+      FBwScol.Fill(0);
+      if b00 then TNNetVolume.MulAdd(pScol, pPrev00, w00, scl);
+      if b01 then TNNetVolume.MulAdd(pScol, pPrev01, w01, scl);
+      if b10 then TNNetVolume.MulAdd(pScol, pPrev10, w10, scl);
+      if b11 then TNNetVolume.MulAdd(pScol, pPrev11, w11, scl);
+      // dS/dpx and dS/dpy corner coefficients (same in-bounds add order).
+      //   dS/dpx: x0y0:-(1-fyr) x1y0:+(1-fyr) x0y1:-fyr  x1y1:+fyr
+      //   dS/dpy: x0y0:-(1-fxr) x1y0:-fxr     x0y1:+(1-fxr) x1y1:+fxr
+      FBwDSpx.Fill(0);
+      if b00 then TNNetVolume.MulAdd(pDSpx, pPrev00, -(1 - fyr), scl);
+      if b01 then TNNetVolume.MulAdd(pDSpx, pPrev01,  (1 - fyr), scl);
+      if b10 then TNNetVolume.MulAdd(pDSpx, pPrev10, -fyr,       scl);
+      if b11 then TNNetVolume.MulAdd(pDSpx, pPrev11,  fyr,       scl);
+      FBwDSpy.Fill(0);
+      if b00 then TNNetVolume.MulAdd(pDSpy, pPrev00, -(1 - fxr), scl);
+      if b01 then TNNetVolume.MulAdd(pDSpy, pPrev01, -fxr,       scl);
+      if b10 then TNNetVolume.MulAdd(pDSpy, pPrev10,  (1 - fxr), scl);
+      if b11 then TNNetVolume.MulAdd(pDSpy, pPrev11,  fxr,       scl);
+
+      dModAcc := 0;  // dL/dm for this tap, summed over output AND input channels
+      for co := 0 to MaxCO do
       begin
-        tap := fy * FFeatureSizeX + fx;
-        dx := FOffMap.Get(ox, oy, 2 * tap);
-        dyo := FOffMap.Get(ox, oy, 2 * tap + 1);
-        px := ox * FStride + fx - FPadding + dx;
-        py := oy * FStride + fy - FPadding + dyo;
-        // DCNv2: per-tap modulation m = sigmoid(logit).
+        dy_out := FOutputError.Get(ox, oy, co);
+        if dy_out = 0 then continue;
+        // main bias gradient (once per (ox,oy,co); guarded to first tap).
+        if (FStruct[4] = 0) and (tap = 0) then
+          mBDelta.FData[co] := mBDelta.FData[co] + lr * dy_out;
+        wciBase := (tap * FOutDepth + co) * FInDepth;  // FWeightCI row base
+        pWrow := FWeightCI.GetRawPtr(0, 0, wciBase);
+        // main-weight gradient (ci-contiguous accumulator): dW += lr*dy_out*modM*S
+        mdBase := (tap * FOutDepth + co) * FInDepth;
+        TNNetVolume.MulAdd(FMWDeltaCI.GetRawPtr(0, 0, mdBase), pScol,
+          lr * dy_out * modM, scl);
+        // DCNv2: dL/dm += dy_out * <wgt, raw_sample>.
         if FModulated <> 0 then
-          modM := 1.0 / (1.0 + Exp(-FOffMap.Get(ox, oy, 2 * FNumTaps + tap)))
-        else
-          modM := 1.0;
-        x0 := Floor(px); y0 := Floor(py);
-        x1 := x0 + 1;    y1 := y0 + 1;
-        fxr := px - x0;  fyr := py - y0;
-        w00 := (1 - fxr) * (1 - fyr);
-        w01 := fxr * (1 - fyr);
-        w10 := (1 - fxr) * fyr;
-        w11 := fxr * fyr;
-        dModAcc := 0;  // dL/dm for this tap, summed over input channels
-        for ci := 0 to MaxCI do
+          dModAcc := dModAcc + dy_out *
+            TNNetVolume.DotProduct(pWrow, pScol, scl);
+        // input gradient via the 4 bilinear corners: dInput_corner += coef*wgt,
+        // with coef = dy_out*modM*cornerWeight. Corner columns are contiguous in
+        // ci, FWeightCI row is contiguous in ci -> MulAdd over ci.
+        if HasPrevError then
         begin
-          wgt := mW.FData[(tap * FInDepth + ci) * FOutDepth + co];
-          // recompute the RAW sampled value (before modulation).
-          sampled := 0;
-          if (x0 >= 0) and (x0 < sx) and (y0 >= 0) and (y0 < sy) then
-            sampled := sampled + w00 * PrevOut.Get(x0, y0, ci);
-          if (x1 >= 0) and (x1 < sx) and (y0 >= 0) and (y0 < sy) then
-            sampled := sampled + w01 * PrevOut.Get(x1, y0, ci);
-          if (x0 >= 0) and (x0 < sx) and (y1 >= 0) and (y1 < sy) then
-            sampled := sampled + w10 * PrevOut.Get(x0, y1, ci);
-          if (x1 >= 0) and (x1 < sx) and (y1 >= 0) and (y1 < sy) then
-            sampled := sampled + w11 * PrevOut.Get(x1, y1, ci);
-          // main-weight gradient: dL/dW = dy_out * (modM * sampled)
-          mWDelta.FData[(tap * FInDepth + ci) * FOutDepth + co] :=
-            mWDelta.FData[(tap * FInDepth + ci) * FOutDepth + co] +
-            lr * dy_out * modM * sampled;
-          // dL/dm contribution: dy_out * wgt * raw_sampled
-          dModAcc := dModAcc + dy_out * wgt * sampled;
-          // dval = dL/d(raw sampled) = dy_out * wgt * modM
-          dval := dy_out * wgt * modM;
-          // input gradient via bilinear corners (zero-padding: skip OOB)
-          ScatterCorner(x0, y0, dval * w00, ci);
-          ScatterCorner(x1, y0, dval * w01, ci);
-          ScatterCorner(x0, y1, dval * w10, ci);
-          ScatterCorner(x1, y1, dval * w11, ci);
-          // offset gradient via d(sampled)/d(px), d(sampled)/d(py).
-          // dS/dpx = (1-fy)*(I(x1,y0)-I(x0,y0)) + fy*(I(x1,y1)-I(x0,y1))
-          // dS/dpy = (1-fx)*(I(x0,y1)-I(x0,y0)) + fx*(I(x1,y1)-I(x1,y0))
-          dSdpx := 0; dSdpy := 0;
-          // term I(x0,y0)
-          if (x0 >= 0) and (x0 < sx) and (y0 >= 0) and (y0 < sy) then
-          begin
-            dSdpx := dSdpx - (1 - fyr) * PrevOut.Get(x0, y0, ci);
-            dSdpy := dSdpy - (1 - fxr) * PrevOut.Get(x0, y0, ci);
-          end;
-          // term I(x1,y0)
-          if (x1 >= 0) and (x1 < sx) and (y0 >= 0) and (y0 < sy) then
-          begin
-            dSdpx := dSdpx + (1 - fyr) * PrevOut.Get(x1, y0, ci);
-            dSdpy := dSdpy - fxr * PrevOut.Get(x1, y0, ci);
-          end;
-          // term I(x0,y1)
-          if (x0 >= 0) and (x0 < sx) and (y1 >= 0) and (y1 < sy) then
-          begin
-            dSdpx := dSdpx - fyr * PrevOut.Get(x0, y1, ci);
-            dSdpy := dSdpy + (1 - fxr) * PrevOut.Get(x0, y1, ci);
-          end;
-          // term I(x1,y1)
-          if (x1 >= 0) and (x1 < sx) and (y1 >= 0) and (y1 < sy) then
-          begin
-            dSdpx := dSdpx + fyr * PrevOut.Get(x1, y1, ci);
-            dSdpy := dSdpy + fxr * PrevOut.Get(x1, y1, ci);
-          end;
-          // px = base + dx  -> d/d(dx) = dS/dpx ; same for dy.
-          ddx := dval * dSdpx;
-          ddy := dval * dSdpy;
-          dOffMap.Add(ox, oy, 2 * tap,     ddx);
-          dOffMap.Add(ox, oy, 2 * tap + 1, ddy);
+          coef := dy_out * modM;
+          if b00 then TNNetVolume.MulAdd(PrevErr.GetRawPtr(x0, y0, 0), pWrow, coef * w00, scl);
+          if b01 then TNNetVolume.MulAdd(PrevErr.GetRawPtr(x1, y0, 0), pWrow, coef * w01, scl);
+          if b10 then TNNetVolume.MulAdd(PrevErr.GetRawPtr(x0, y1, 0), pWrow, coef * w10, scl);
+          if b11 then TNNetVolume.MulAdd(PrevErr.GetRawPtr(x1, y1, 0), pWrow, coef * w11, scl);
         end;
-        // DCNv2: modulation-logit gradient = dL/dm * dm/dlogit, with
-        // dm/dlogit = m*(1-m). Routed through the offset head's mod channel.
-        if FModulated <> 0 then
-          dOffMap.Add(ox, oy, 2 * FNumTaps + tap, dModAcc * modM * (1 - modM));
+        // offset gradient: dOff += dy_out*modM*<wgt, dS/dp>.
+        wdpx := TNNetVolume.DotProduct(pWrow, pDSpx, scl);
+        wdpy := TNNetVolume.DotProduct(pWrow, pDSpy, scl);
+        dOffMap.Add(ox, oy, 2 * tap,     dy_out * modM * wdpx);
+        dOffMap.Add(ox, oy, 2 * tap + 1, dy_out * modM * wdpy);
       end;
+      // DCNv2: modulation-logit gradient = dL/dm * dm/dlogit, dm/dlogit=m*(1-m).
+      if FModulated <> 0 then
+        dOffMap.Add(ox, oy, 2 * FNumTaps + tap, dModAcc * modM * (1 - modM));
     end;
+  end;
+
+  // Transpose the ci-contiguous main-weight delta back into the strided neuron
+  // Delta layout: mWDelta[(tap*FInDepth+ci)*FOutDepth+co] += FMWDeltaCI[...].
+  for tap := 0 to FNumTaps - 1 do
+    for co := 0 to MaxCO do
+      for ci := 0 to MaxCI do
+        mWDelta.FData[(tap * FInDepth + ci) * FOutDepth + co] :=
+          mWDelta.FData[(tap * FInDepth + ci) * FOutDepth + co] +
+          FMWDeltaCI.FData[(tap * FOutDepth + co) * FInDepth + ci];
 
   // --- Offset head backward (ordinary conv) ---
   // dL/d(offmap[ox,oy,oc]) is in dOffMap. Backprop through the offset conv to
-  // its weights, bias, and the input.
+  // its weights, bias, and the input. The ci-reduction is over the input Depth,
+  // contiguous, so the weight-grad accumulates into a ci-contiguous delta
+  // (FOWDeltaCI, transposed back below) and the input-grad reads a ci-contiguous
+  // offset-weight transpose (FOWeightCI) -- both AVX MulAdds over ci.
+  // Build FOWeightCI[((fy*FX+fx)*FOffOut+oc)*FInDepth+ci] = oW[((fy*FX+fx)*FInDepth+ci)*FOffOut+oc].
+  if HasPrevError then
+    for tap := 0 to FNumTaps - 1 do
+      for oc := 0 to MaxOffOut do
+        for ci := 0 to MaxCI do
+          FOWeightCI.FData[(tap * FOffOut + oc) * FInDepth + ci] :=
+            oW.FData[(tap * FInDepth + ci) * FOffOut + oc];
+  FOWDeltaCI.Fill(0);
   for oy := 0 to MaxOY do
   for ox := 0 to MaxOX do
     for oc := 0 to MaxOffOut do
@@ -67890,17 +67957,28 @@ begin
         begin
           prevX0 := ox * FStride + fx - FPadding;
           if (prevX0 < 0) or (prevX0 >= sx) then continue;
-          for ci := 0 to MaxCI do
+          tap := fy * FFeatureSizeX + fx;
+          owDBase := (tap * FOffOut + oc) * FInDepth;  // FOWDeltaCI row
+          // weight grad (ci-contiguous): oWDelta += lr*dOff*PrevOut_col.
+          TNNetVolume.MulAdd(FOWDeltaCI.GetRawPtr(0, 0, owDBase),
+            PrevOut.GetRawPtr(prevX0, prevY0, 0), lr * dOff, scl);
+          // input grad: PrevErr_col += dOff*oW_col (ci-contiguous transpose).
+          if HasPrevError then
           begin
-            tap := ((fy * FFeatureSizeX + fx) * FInDepth + ci) * FOffOut + oc;
-            oWDelta.FData[tap] := oWDelta.FData[tap] +
-              lr * dOff * PrevOut.Get(prevX0, prevY0, ci);
-            if HasPrevError then
-              PrevErr.Add(prevX0, prevY0, ci, dOff * oW.FData[tap]);
+            owBase := (tap * FOffOut + oc) * FInDepth;
+            TNNetVolume.MulAdd(PrevErr.GetRawPtr(prevX0, prevY0, 0),
+              FOWeightCI.GetRawPtr(0, 0, owBase), dOff, scl);
           end;
         end;
       end;
     end;
+  // Transpose the ci-contiguous offset-weight delta back into neuron layout.
+  for tap := 0 to FNumTaps - 1 do
+    for oc := 0 to MaxOffOut do
+      for ci := 0 to MaxCI do
+        oWDelta.FData[(tap * FInDepth + ci) * FOffOut + oc] :=
+          oWDelta.FData[(tap * FInDepth + ci) * FOffOut + oc] +
+          FOWDeltaCI.FData[(tap * FOffOut + oc) * FInDepth + ci];
 
   dOffMap.Free;
 
