@@ -21330,29 +21330,27 @@ const
   cEps: TNeuralFloat = 1e-12;
 var
   StartTime: double;
-  MaxX, MaxY, MaxD: integer;
-  X, Y, D, HalfDepth: integer;
-  a, b, dot, sa, sb, na, nb: TNeuralFloat;
+  MaxX, MaxY: integer;
+  X, Y, HalfDepth: integer;
+  dot, sa, sb, na, nb: TNeuralFloat;
+  aPtr, bPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   HalfDepth := FPrevLayer.FOutput.Depth div 2;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
-  MaxD := HalfDepth - 1;
+  // The two depth-half vectors a (offset 0) and b (offset HalfDepth) are each
+  // a contiguous depth-axis run, so the three scalar reductions map 1:1 onto
+  // the depth-contiguous TNNetVolume.DotProduct primitive (mirrors
+  // TNNetPixelNorm / TNNetCosineSimilarityAttention).
   for X := 0 to MaxX do
     for Y := 0 to MaxY do
     begin
-      dot := 0;
-      sa := 0;
-      sb := 0;
-      for D := 0 to MaxD do
-      begin
-        a := FPrevLayer.FOutput[X, Y, D];
-        b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
-        dot := dot + a * b;
-        sa := sa + a * a;
-        sb := sb + b * b;
-      end;
+      aPtr := FPrevLayer.FOutput.GetRawPtr(X, Y, 0);
+      bPtr := FPrevLayer.FOutput.GetRawPtr(X, Y, HalfDepth);
+      dot := TNNetVolume.DotProduct(aPtr, bPtr, HalfDepth);
+      sa := TNNetVolume.DotProduct(aPtr, aPtr, HalfDepth);
+      sb := TNNetVolume.DotProduct(bPtr, bPtr, HalfDepth);
       na := Sqrt(sa + cEps);
       nb := Sqrt(sb + cEps);
       FOutput[X, Y, 0] := dot / (na * nb + cEps);
@@ -21365,9 +21363,10 @@ const
   cEps: TNeuralFloat = 1e-12;
 var
   StartTime: double;
-  MaxX, MaxY, MaxD: integer;
-  X, Y, D, HalfDepth: integer;
-  a, b, dot, sa, sb, na, nb, c, err, invNaNb, invNa2, invNb2: TNeuralFloat;
+  MaxX, MaxY: integer;
+  X, Y, HalfDepth: integer;
+  dot, sa, sb, na, nb, c, err, invNaNb, invNa2, invNb2: TNeuralFloat;
+  aPtr, bPtr, errAPtr, errBPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -21379,21 +21378,14 @@ begin
     HalfDepth := FPrevLayer.FOutput.Depth div 2;
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
-    MaxD := HalfDepth - 1;
     for X := 0 to MaxX do
       for Y := 0 to MaxY do
       begin
-        dot := 0;
-        sa := 0;
-        sb := 0;
-        for D := 0 to MaxD do
-        begin
-          a := FPrevLayer.FOutput[X, Y, D];
-          b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
-          dot := dot + a * b;
-          sa := sa + a * a;
-          sb := sb + b * b;
-        end;
+        aPtr := FPrevLayer.FOutput.GetRawPtr(X, Y, 0);
+        bPtr := FPrevLayer.FOutput.GetRawPtr(X, Y, HalfDepth);
+        dot := TNNetVolume.DotProduct(aPtr, bPtr, HalfDepth);
+        sa := TNNetVolume.DotProduct(aPtr, aPtr, HalfDepth);
+        sb := TNNetVolume.DotProduct(bPtr, bPtr, HalfDepth);
         na := Sqrt(sa + cEps);
         nb := Sqrt(sb + cEps);
         invNaNb := 1.0 / (na * nb + cEps);
@@ -21401,17 +21393,16 @@ begin
         invNa2 := 1.0 / (sa + cEps);
         invNb2 := 1.0 / (sb + cEps);
         err := FOutputError[X, Y, 0];
-        for D := 0 to MaxD do
-        begin
-          a := FPrevLayer.FOutput[X, Y, D];
-          b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
-          // dL/da_i = err * (b_i/(na*nb) - c * a_i/na^2)
-          FPrevLayer.FOutputError.Add(X, Y, D,
-            err * (b * invNaNb - c * a * invNa2));
-          // dL/db_i = err * (a_i/(na*nb) - c * b_i/nb^2)
-          FPrevLayer.FOutputError.Add(X, Y, D + HalfDepth,
-            err * (a * invNaNb - c * b * invNb2));
-        end;
+        // dL/da_i = err*(b_i/(na*nb) - c*a_i/na^2); the two terms over the
+        // contiguous a-half fold into two depth-contiguous MulAdd accumulations
+        // (and symmetrically for the b-half), mirroring
+        // TNNetPixelNorm.Backpropagate / TNNetL2Normalize.BackpropagatePerDepth.
+        errAPtr := FPrevLayer.FOutputError.GetRawPtr(X, Y, 0);
+        errBPtr := FPrevLayer.FOutputError.GetRawPtr(X, Y, HalfDepth);
+        TNNetVolume.MulAdd(errAPtr, bPtr, err * invNaNb, HalfDepth);
+        TNNetVolume.MulAdd(errAPtr, aPtr, -(err * c * invNa2), HalfDepth);
+        TNNetVolume.MulAdd(errBPtr, aPtr, err * invNaNb, HalfDepth);
+        TNNetVolume.MulAdd(errBPtr, bPtr, -(err * c * invNb2), HalfDepth);
       end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
