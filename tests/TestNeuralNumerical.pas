@@ -280,6 +280,9 @@ type
     procedure TestDeformableConvOpenCLParity;
     procedure TestGroupConvP4OpenCLParity;
     procedure TestDeconvolutionOpenCLParity;
+    // OpenCL forward offload parity (vs CPU) for the depthwise convolutions.
+    procedure TestDepthwiseConvOpenCLParity;
+    procedure TestDepthwiseConv1DOpenCLParity;
     // OpenCL backward-GEMM offload parity (vs CPU) for the general convolution.
     procedure TestConvolutionBackwardOpenCLParity;
     // OpenCL two-GEMM forward offload parity (vs CPU) for the non-causal global
@@ -58280,6 +58283,138 @@ begin
       SetNeuralConvOpenCLMinWork(1 shl 20);
     end;
     AssertTrue('GroupConvP4 OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Depthwise 2-D conv (TNNetDepthwiseConv) device depth-diagonal-GEMV parity.
+// Build the depthwise conv (multiplier>1, pad, stride), compute on the CPU,
+// then force the device path (SetNeuralConvOpenCLMinWork(0)) and assert the
+// outputs match within 1e-4. Skips gracefully when no OpenCL device is present.
+procedure TTestNeuralNumerical.TestDepthwiseConvOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  DW: TNNetDepthwiseConvLinear;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InSize: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(7, 7, 5);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(7, 7, 5, 1));
+    // multiplier 3, 3x3 feature, pad 1, stride 2 -> output depth 5*3=15.
+    // Linear activation so the parity gate is on the raw multiply-add sum.
+    DW := TNNetDepthwiseConvLinear.Create(3, 3, 1, 2);
+    NN.AddLayer(DW);
+    InSize := Input.Size;
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := 0.05 * i - 0.3;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      MaxDiff := 0;
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    WriteLn('  DepthwiseConv OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('DepthwiseConv OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Depthwise 1-D causal conv (TNNetDepthwiseConv1D) device diagonal-GEMV parity.
+procedure TTestNeuralNumerical.TestDepthwiseConv1DOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  DW: TNNetDepthwiseConv1D;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InSize: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  // (SeqLen=20, 1, Channels=6).
+  Input := TNNetVolume.Create(20, 1, 6);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(20, 1, 6, 1));
+    // Causal kernel size 4, bias ON (exercises the per-channel bias add).
+    DW := TNNetDepthwiseConv1D.Create(4, {causal}true, {suppressBias}0);
+    NN.AddLayer(DW);
+    // Give biases a non-zero spread so the bias-add path is meaningful.
+    for i := 0 to DW.Neurons.Count - 1 do
+      DW.Neurons[i].BiasWeight := 0.1 * i - 0.25;
+    InSize := Input.Size;
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := 0.5 * Sin(i * 0.3) + 0.2 * Cos(i * 0.11);
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      MaxDiff := 0;
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    WriteLn('  DepthwiseConv1D OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('DepthwiseConv1D OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free;

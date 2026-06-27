@@ -6709,12 +6709,26 @@ type
     private
       FKernelSize: integer; // kernel size K
       FCausal: boolean;     // true = left-only pad (causal); false = centred SAME
+      {$IFDEF OpenCL}
+      // Scratch operands for the per-channel diagonal-GEMV offload (ComputeOpenCL).
+      FGemmWChan: TNNetVolume; // A: C weight vectors, each length K
+      FGemmWin:   TNNetVolume; // B: C*SeqLen window vectors, each length K
+      FGemmRes:   TNNetVolume; // result NumAs*NumBs = C*(C*SeqLen)
+      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure ComputeCPU(); {$IFDEF Release} inline; {$ENDIF}
+      {$IFDEF OpenCL}
+      procedure ComputeOpenCL();
+      {$ENDIF}
     public
       constructor Create(pKernelSize: integer; pCausal: boolean = true; pSuppressBias: integer = 0); overload;
+      destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+      {$IFDEF OpenCL}
+      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      {$ENDIF}
   end;
 
   /// TNNetConvolution3D: a learnable 3-D (spatiotemporal / volumetric)
@@ -10771,6 +10785,12 @@ type
   /// This class does a depthwise convolution.
   TNNetDepthwiseConv = class(TNNetConvolutionAbstract)
   private
+    {$IFDEF OpenCL}
+    // Scratch operands for the depth-diagonal-GEMV offload (ComputeOpenCL).
+    FGemmWDw:  TNNetVolume; // A: (Multiplier*InDepth) spatial-tap weight vectors
+    FGemmPatchDw: TNNetVolume; // B: (NumPos*InDepth) spatial-tap input vectors
+    FGemmResDw: TNNetVolume; // result NumAs*NumBs
+    {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure BackpropagateCPU(); {$IFDEF Release} inline; {$ENDIF}
     procedure BackpropagateCPUFast();
@@ -10778,11 +10798,18 @@ type
     procedure ComputeCPU(); {$IFDEF Release} inline; {$ENDIF}
     procedure ComputeCPUAtOutputPos(NeuronIdx, OutputX, OutputY: integer); {$IFDEF Release} inline; {$ENDIF}
     procedure ComputeCPUFast();
+    {$IFDEF OpenCL}
+    procedure ComputeOpenCL();
+    {$ENDIF}
   public
     constructor Create(pMultiplier, pFeatureSize, pInputPadding, pStride: integer); overload; virtual;
+    destructor Destroy(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     procedure InitDefault(); override;
+    {$IFDEF OpenCL}
+    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    {$ENDIF}
   end;
 
   /// Depthwise Convolutional layer with Linear activation function.
@@ -40921,13 +40948,160 @@ begin
     FSizeXDepth := FFeatureSizeX * FInputCopy.Depth;
     FSizeXDepthBytes := FSizeXDepth * SizeOf(TNeuralFloat);
     RefreshPrevSizeXDepthBytes();
+    {$IFDEF OpenCL}
+    // Offload the per-channel spatial-tap sweep to the device when OpenCL is
+    // armed and the work is large enough to amortise upload/dispatch. CPU
+    // (ComputeCPUFast) is the byte-comparable fallback otherwise. FInputCopy is
+    // already (zero-)padded above, so ComputeOpenCL needs no bounds checks.
+    if FHasOpenCL and FShouldOpenCL and Assigned(FDotCL) and
+       (Int64(FOutput.Size) * (FFeatureSizeX * FFeatureSizeY) >= NeuralConvOpenCLMinWork) then
+    begin
+      ComputeOpenCL();
+    end
+    else
+    begin
+      ComputeCPUFast();
+    end;
+    {$ELSE}
     ComputeCPUFast();
+    {$ENDIF}
     FForwardTime := FForwardTime + (Now() - StartTime);
   end
   else
   begin
     FErrorProc('TNNetDepthwiseConv.Compute - neuronal layer contains no neuron:'+ IntToStr(FNeurons.Count));
   end;
+end;
+
+{$IFDEF OpenCL}
+procedure TNNetDepthwiseConv.EnableOpenCL(DotProductKernel: TDotProductKernel);
+begin
+  // Bare TNNetLayer arming only (FHasOpenCL + the shared dot-product kernel) plus
+  // our own scratch operands. The depthwise per-channel sweep does NOT match the
+  // standard conv interleaved-weight GEMM (output channel d multiplies ONLY input
+  // channel d), so we map it onto cai_dot_product as a depth-diagonal GEMV in
+  // ComputeOpenCL rather than chaining TNNetConvolutionBase.EnableOpenCL.
+  FHasOpenCL := true;
+  FDotProductKernel := DotProductKernel;
+  if not Assigned(FDotCL) then
+  begin
+    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL.HideMessages();
+  end;
+  if not Assigned(FGemmWDw)      then FGemmWDw      := TNNetVolume.Create();
+  if not Assigned(FGemmPatchDw)  then FGemmPatchDw  := TNNetVolume.Create();
+  if not Assigned(FGemmResDw)    then FGemmResDw    := TNNetVolume.Create();
+  FShouldOpenCL := true;
+end;
+
+// Device per-channel sweep, mapped onto the shared cai_dot_product GEMV.
+//
+//   Raw[ox,oy, n*InDepth + d] =
+//       sum_{tap}  W_n[tap, d] * InputCopy[ox*S + tapX, oy*S + tapY, d]
+//
+// Reduction is over the FT = FeatureSizeX*FeatureSizeY spatial taps; depth d is a
+// FREE (output) index that must match between weight and input (depthwise). We
+// pack one length-FT dot product per matching depth:
+//   A = (Multiplier*InDepth) weight vectors, A[(n*InDepth + d)*FT + tap]
+//   B = (NumPos*InDepth)     input  vectors, B[(p*InDepth + d)*FT + tap]
+// cai_dot_product returns Res[bIdx*NumAs + aIdx] = <A_aIdx, B_bIdx>; we read the
+// DEPTH-DIAGONAL entries (aIdx and bIdx sharing depth d) into FOutputRaw, then
+// ApplyActivationFunctionToOutput (no bias, matching the CPU path exactly). The
+// cross-depth products are computed and discarded - correct, at an InDepth-fold
+// overspend the work-threshold gate keeps in check.
+procedure TNNetDepthwiseConv.ComputeOpenCL();
+var
+  InDepth, Mult, NumPos, FT, NumAs, NumBs: integer;
+  ox, oy, n, d, cntx, cnty, tap, p, aIdx, bIdx: integer;
+  InputX, InputY: integer;
+  MaxX, MaxY, MaxN, MaxD, FxM1, FyM1: integer;
+  LocalW: TNNetVolume;
+begin
+  InDepth := FInputCopy.Depth;
+  Mult := FNeurons.Count;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxN := Mult - 1;
+  MaxD := InDepth - 1;
+  FxM1 := FFeatureSizeX - 1;
+  FyM1 := FFeatureSizeY - 1;
+  NumPos := FOutput.SizeX * FOutput.SizeY;
+  FT := FFeatureSizeX * FFeatureSizeY;
+  NumAs := Mult * InDepth;
+  NumBs := NumPos * InDepth;
+
+  // A: spatial-tap weight vectors in the kernel's COLUMN-INTERLEAVED layout
+  // (element tap of vector aIdx at [aIdx + tap*NumAs]), matching
+  // cai_dot_product's FInputBufferAs[a_id + i*FNumAs] access. aIdx = n*InDepth+d.
+  FGemmWDw.ReSize(NumAs * FT, 1, 1);
+  for n := 0 to MaxN do
+  begin
+    LocalW := FArrNeurons[n].Weights;
+    for d := 0 to MaxD do
+    begin
+      aIdx := n * InDepth + d;
+      for cntx := 0 to FxM1 do
+        for cnty := 0 to FyM1 do
+        begin
+          tap := cnty * FFeatureSizeX + cntx;
+          FGemmWDw.FData[aIdx + tap * NumAs] := LocalW.Get(cntx, cnty, d);
+        end;
+    end;
+  end;
+
+  // B: spatial-tap input vectors per (output position p, depth d),
+  //    [(p*InDepth + d)*FT + tap]. FInputCopy is already padded.
+  FGemmPatchDw.ReSize(NumBs * FT, 1, 1);
+  for ox := 0 to MaxX do
+  begin
+    InputX := ox * FStride;
+    for oy := 0 to MaxY do
+    begin
+      InputY := oy * FStride;
+      p := oy * FOutput.SizeX + ox;
+      for d := 0 to MaxD do
+        for cntx := 0 to FxM1 do
+          for cnty := 0 to FyM1 do
+          begin
+            tap := cnty * FFeatureSizeX + cntx;
+            FGemmPatchDw.FData[(p * InDepth + d) * FT + tap] :=
+              FInputCopy.Get(InputX + cntx, InputY + cnty, d);
+          end;
+    end;
+  end;
+
+  // Device GEMV: Res[bIdx*NumAs + aIdx] = <A_aIdx, B_bIdx>.
+  FGemmResDw.ReSize(NumAs * NumBs, 1, 1);
+  FDotCL.PrepareForCompute(FGemmWDw, FGemmPatchDw, FT);
+  FDotCL.Compute(FGemmWDw, FGemmPatchDw, {ActFN}0, {NewVAs}true, {NewVBs}true);
+  FDotCL.FinishAndLoadResult(FGemmResDw, 0);
+
+  // Read back the depth-diagonal entries into the raw output, then activate.
+  for ox := 0 to MaxX do
+  for oy := 0 to MaxY do
+  begin
+    p := oy * FOutput.SizeX + ox;
+    for n := 0 to MaxN do
+      for d := 0 to MaxD do
+      begin
+        aIdx := n * InDepth + d;
+        bIdx := p * InDepth + d;
+        FOutputRaw.FData[FOutputRaw.GetRawPos(ox, oy, n * InDepth + d)] :=
+          FGemmResDw.FData[bIdx * NumAs + aIdx];
+      end;
+  end;
+  ApplyActivationFunctionToOutput();
+end;
+{$ENDIF}
+
+destructor TNNetDepthwiseConv.Destroy();
+begin
+  {$IFDEF OpenCL}
+  if Assigned(FGemmWDw)     then FGemmWDw.Free;
+  if Assigned(FGemmPatchDw) then FGemmPatchDw.Free;
+  if Assigned(FGemmResDw)   then FGemmResDw.Free;
+  {$ENDIF}
+  inherited Destroy();
 end;
 
 procedure TNNetDepthwiseConv.Backpropagate();
@@ -43940,6 +44114,27 @@ end;
 procedure TNNetDepthwiseConv1D.Compute();
 var
   StartTime: double;
+begin
+  StartTime := Now();
+  {$IFDEF OpenCL}
+  // Offload the per-channel kernel sweep to the device when OpenCL is armed and
+  // the contraction is large enough to amortise the upload/dispatch. The CPU
+  // path (ComputeCPU) is the byte-comparable fallback whenever OpenCL is off or
+  // below the work threshold.
+  if FHasOpenCL and FShouldOpenCL and Assigned(FDotCL) and
+     (Int64(FNeurons.Count) * FOutput.SizeX * FKernelSize >= NeuralConvOpenCLMinWork) then
+  begin
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  {$ENDIF}
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetDepthwiseConv1D.ComputeCPU();
+var
   Prev: TNNetVolume;
   SeqLen, Channels, Ksize, t, c, kk, srcT, off: integer;
   MaxC, MaxT, MaxK: integer;
@@ -43947,7 +44142,6 @@ var
   sum: TNeuralFloat;
   localNeuron: TNNetNeuron;
 begin
-  StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   Channels := FNeurons.Count;
@@ -43976,7 +44170,116 @@ begin
       FOutput[t, 0, c] := sum;
     end;
   end;
-  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{$IFDEF OpenCL}
+procedure TNNetDepthwiseConv1D.EnableOpenCL(DotProductKernel: TDotProductKernel);
+begin
+  // Bare TNNetLayer arming only (FHasOpenCL + the shared dot-product kernel) plus
+  // our own scratch operands. The per-channel sweep does not match the standard
+  // conv interleaved-weight GEMM, so we map it onto cai_dot_product directly in
+  // ComputeOpenCL (a diagonal GEMV: one dot-product per (channel, time)).
+  FHasOpenCL := true;
+  FDotProductKernel := DotProductKernel;
+  if not Assigned(FDotCL) then
+  begin
+    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL.HideMessages();
+  end;
+  if not Assigned(FGemmWChan) then FGemmWChan := TNNetVolume.Create();
+  if not Assigned(FGemmWin)   then FGemmWin   := TNNetVolume.Create();
+  if not Assigned(FGemmRes)   then FGemmRes   := TNNetVolume.Create();
+  FShouldOpenCL := true;
+end;
+
+// Device per-channel kernel sweep, mapped onto the shared cai_dot_product GEMV.
+//
+//   out[t,c] = bias_c + sum_kk W_c[kk] * x[t - off + kk, c]   (zero-pad taps OOB)
+//
+// Each (channel c, time t) output is a length-K dot product between channel c's
+// weight vector and channel c's length-K input window. We pack:
+//   A = the C weight vectors          (NumAs = C,            Size = K)
+//   B = the C*SeqLen input windows     (NumBs = C*SeqLen,     Size = K)
+//       window index b = c*SeqLen + t holds channel c's window at time t,
+//       with OOB taps pre-zeroed on the host (matching the CPU zero-pad).
+// cai_dot_product returns Res[b*NumAs + a] = <A_a , B_b>; we read the DIAGONAL
+// entry a = c (the matching channel) for each (c,t) and add the bias on the
+// host. The off-diagonal A_a*B_b products are computed but discarded - correct,
+// at a C-fold compute overspend that the work-threshold gate keeps in check.
+procedure TNNetDepthwiseConv1D.ComputeOpenCL();
+var
+  Prev: TNNetVolume;
+  SeqLen, Channels, Ksize, t, c, kk, srcT, off: integer;
+  MaxC, MaxT, MaxK: integer;
+  W: TNNetVolume;
+  localNeuron: TNNetNeuron;
+  b: integer;
+begin
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  Channels := FNeurons.Count;
+  Ksize := FKernelSize;
+  MaxC := Channels - 1;
+  MaxT := SeqLen - 1;
+  MaxK := Ksize - 1;
+  if FCausal then off := Ksize - 1 else off := Ksize div 2;
+
+  // A: per-channel weight vectors in the kernel's COLUMN-INTERLEAVED layout
+  // (element kk of vector a is at [a + kk*NumAs], NumAs = Channels), matching
+  // cai_dot_product's FInputBufferAs[a_id + i*FNumAs] access.
+  FGemmWChan.ReSize(Channels * Ksize, 1, 1);
+  for c := 0 to MaxC do
+  begin
+    W := FNeurons[c].FWeights;
+    for kk := 0 to MaxK do
+      FGemmWChan.FData[c + kk * Channels] := W.FData[kk];
+  end;
+
+  // B: per (channel, time) input windows [(c*SeqLen + t)*K + kk], OOB taps = 0.
+  FGemmWin.ReSize(Channels * SeqLen * Ksize, 1, 1);
+  FGemmWin.Fill(0.0);
+  for c := 0 to MaxC do
+  for t := 0 to MaxT do
+  begin
+    b := c * SeqLen + t;
+    for kk := 0 to MaxK do
+    begin
+      srcT := t - off + kk;
+      if (srcT < 0) or (srcT >= SeqLen) then continue; // zero pad
+      FGemmWin.FData[b * Ksize + kk] := Prev[srcT, 0, c];
+    end;
+  end;
+
+  // Device GEMV: Res[b*Channels + a] = <A_a, B_b>, a = channel of A.
+  FGemmRes.ReSize(Channels * (Channels * SeqLen), 1, 1);
+  FDotCL.PrepareForCompute(FGemmWChan, FGemmWin, Ksize);
+  FDotCL.Compute(FGemmWChan, FGemmWin, {ActFN}0, {NewVAs}true, {NewVBs}true);
+  FDotCL.FinishAndLoadResult(FGemmRes, 0);
+
+  // Read back the diagonal a = c, add per-channel bias (linear, no activation).
+  for c := 0 to MaxC do
+  begin
+    localNeuron := FNeurons[c];
+    for t := 0 to MaxT do
+    begin
+      b := c * SeqLen + t;
+      if FSuppressBias = 0 then
+        FOutput[t, 0, c] := localNeuron.FBiasWeight + FGemmRes.FData[b * Channels + c]
+      else
+        FOutput[t, 0, c] := FGemmRes.FData[b * Channels + c];
+    end;
+  end;
+end;
+{$ENDIF}
+
+destructor TNNetDepthwiseConv1D.Destroy();
+begin
+  {$IFDEF OpenCL}
+  if Assigned(FGemmWChan) then FGemmWChan.Free;
+  if Assigned(FGemmWin)   then FGemmWin.Free;
+  if Assigned(FGemmRes)   then FGemmRes.Free;
+  {$ENDIF}
+  inherited Destroy();
 end;
 
 procedure TNNetDepthwiseConv1D.Backpropagate();
