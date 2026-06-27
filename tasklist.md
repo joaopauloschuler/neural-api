@@ -437,14 +437,24 @@ rather than acted on.
           (Heads loop) but only parity-verified at Heads=1;
       (d) a real-checkpoint smoke once a swin-tiny-semantic checkpoint is obtainable
           offline (the importer is config-driven and ready).
-- [ ] Real-ESRGAN / ESRGAN importer follow-ups (BuildRRDBNet[FromSafeTensors][Ex]
+- [X] Real-ESRGAN / ESRGAN importer follow-ups (BuildRRDBNet[FromSafeTensors][Ex]
       + TRRDBNetConfig LANDED in neuralpretrained.pas; RRDBNet x4 with
       NEAREST-interpolate conv upsampling via TNNetDeMaxPool(2), parametrized
       TNNetLeakyReLU.Create(pAlpha) 0.2 slope; pico parity TestRRDBNetParity
-      max|diff| < 1e-4 vs a numpy float64 oracle): (a) realesrgan .pth pickle load
-      (TNNetTorchBinReader path); (b) real x4 upscale of a tiny PNG end-to-end
-      example; (c) scale=2 / other scales (currently only scale=4 = two upsample
-      stages wired).
+      max|diff| < 1e-4 vs a numpy float64 oracle):
+  - [X] (a) realesrgan .pth pickle load (TNNetTorchBinReader path): the .pth
+        dispatch in CreatePretrainedTensorReader reaches RRDBNet; added a
+        params_ema/params/state_dict/model wrapper-dict UNWRAP to
+        TNNetTorchBinReader.Unpickle (Real-ESRGAN nests its state_dict under
+        'params_ema'). TestRRDBNetParityPth loads tiny_rrdbnet.pth (params_ema-
+        wrapped) and matches the safetensors oracle < 1e-4.
+  - [X] (b) end-to-end tiny PNG upscale example examples/RealESRGANUpscale:
+        builds the committed pico RRDBNet, writes/reads a 6x6 PNG via
+        neuraldatasets Save/LoadImageFromVolumeIntoFile, x4 (6x6->24x24) and x2
+        (6x6->12x12) upscale, writes output PNGs. Listed in examples/README.md.
+  - [X] (c) scale=2 support: TRRDBNetConfig.Scale threaded so scale=2 builds one
+        upsample stage (conv_up1 only) and scale=4 builds two (bit-identical to
+        before). TestRRDBNetParityScale2 vs a numpy float64 oracle < 1e-4.
 - [ ] NAFNet image-restoration importer follow-ups (BuildNAFNetFromSafeTensors[Ex]
       + TNAFNetConfig LANDED — TNNetSimpleGate gate layer + Simplified Channel
       Attention + U-Net of NAFBlocks with LayerNorm2d / depthwise 3x3 / PixelShuffle;

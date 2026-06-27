@@ -110,6 +110,10 @@ type
     procedure AssertInt8DriftSeq2Seq(const FamilyName: string;
       EncF, DecF, EncQ, DecQ: TNNet; EncSeqLen, DecSeqLen, VocabRange,
       MinQuantLayers: integer; MaxRelDrift: double);
+    // Shared RRDBNet parity body: compares NN.Compute(io.input) against the
+    // io.json oracle image (< 1e-4). PRIVATE (parameterized; not auto-run).
+    procedure RunRRDBNetParity(NN: TNNet; const Config: TRRDBNetConfig;
+      const IoFixture: string);
   published
     procedure TestTokenLayerNormForwardAndSaveLoad;
     procedure TestLearnedPositionalEmbeddingForwardAndSaveLoad;
@@ -566,6 +570,8 @@ type
     procedure TestCogVideoXParity;
     procedure TestLatentTextToImageSmoke;
     procedure TestRRDBNetParity;
+    procedure TestRRDBNetParityPth;
+    procedure TestRRDBNetParityScale2;
     procedure TestNAFNetConfigFromJSONFile;
     procedure TestNAFNetParity;
     procedure TestRIFEConfigFromJSONFile;
@@ -23656,10 +23662,11 @@ end;
 
 // Parity test for the Real-ESRGAN / ESRGAN RRDBNet (scale x4) importer against
 // the committed tiny float64 numpy oracle (tools/rrdbnet_tiny_fixture.py).
-procedure TTestNeuralPretrained.TestRRDBNetParity;
+// Shared body: compares NN.Compute(io.input) against the io oracle image.
+// Caller owns NN (freed here). IoFixture is the io.json fixture stem.
+procedure TTestNeuralPretrained.RunRRDBNetParity(NN: TNNet;
+  const Config: TRRDBNetConfig; const IoFixture: string);
 var
-  NN: TNNet;
-  Config: TRRDBNetConfig;
   RefRoot: TJSONData;
   RefJson: TStringList;
   InputArr, ChanArr, RowArr, ImgArr: TJSONArray;
@@ -23668,17 +23675,13 @@ var
   ChanCnt, YCnt, XCnt: integer;
   Diff, MaxDiff, RefVal, GotVal: double;
 begin
-  RandSeed := 424242;
-  NN := BuildRRDBNetFromSafeTensors(
-    FixturePath('tiny_rrdbnet.safetensors'), Config,
-    {pTrainable=}true, FixturePath('tiny_rrdbnet_config.json'));
   RefJson := TStringList.Create;
   ImgInput := TNNetVolume.Create;
   RefRoot := nil;
   try
     AssertTrue('net built', NN <> nil);
     AssertEquals('input grid', Config.InputSize, NN.Layers[0].Output.SizeX);
-    RefJson.LoadFromFile(FixturePath('tiny_rrdbnet_io.json'));
+    RefJson.LoadFromFile(FixturePath(IoFixture));
     RefRoot := GetJSON(RefJson.Text);
     InputArr := TJSONArray(TJSONObject(RefRoot).Find('input'));
     ImgArr := TJSONArray(TJSONObject(RefRoot).Find('image'));
@@ -23732,6 +23735,44 @@ begin
     RefJson.Free;
     NN.Free;
   end;
+end;
+
+procedure TTestNeuralPretrained.TestRRDBNetParity;
+var
+  Config: TRRDBNetConfig;
+begin
+  RandSeed := 424242;
+  RunRRDBNetParity(BuildRRDBNetFromSafeTensors(
+    FixturePath('tiny_rrdbnet.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_rrdbnet_config.json')),
+    Config, 'tiny_rrdbnet_io.json');
+end;
+
+// Same scale x4 net, but loaded from a Real-ESRGAN-style .pth whose state_dict
+// is nested under a 'params_ema' top-level key (TNNetTorchBinReader unwrap).
+// Must match the SAME oracle as the safetensors path (< 1e-4).
+procedure TTestNeuralPretrained.TestRRDBNetParityPth;
+var
+  Config: TRRDBNetConfig;
+begin
+  RandSeed := 424242;
+  RunRRDBNetParity(BuildRRDBNetFromSafeTensors(
+    FixturePath('tiny_rrdbnet.pth'), Config,
+    {pTrainable=}true, FixturePath('tiny_rrdbnet_config.json')),
+    Config, 'tiny_rrdbnet_io.json');
+end;
+
+// scale x2 RRDBNet (one upsample stage; conv_up2 absent) vs its float64 oracle.
+procedure TTestNeuralPretrained.TestRRDBNetParityScale2;
+var
+  Config: TRRDBNetConfig;
+begin
+  RandSeed := 424242;
+  RunRRDBNetParity(BuildRRDBNetFromSafeTensors(
+    FixturePath('tiny_rrdbnet_x2.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_rrdbnet_x2_config.json')),
+    Config, 'tiny_rrdbnet_x2_io.json');
+  AssertEquals('scale is 2', 2, Config.Scale);
 end;
 
 // Verifies ReadNAFNetConfigFromJSONFile on the committed pico config.

@@ -10751,8 +10751,10 @@ procedure DecodeVARTokensToImage(VqModel: TNNetVqModel;
 //   conv_hr (3x3, nf -> nf) + LeakyReLU(0.2); conv_last (3x3, nf -> out_ch).
 // state_dict keys: conv_first.{weight,bias}, body.{i}.rdb{1,2,3}.conv{1..5}.*,
 // conv_body.*, conv_up1.*, conv_up2.*, conv_hr.*, conv_last.*.
-// Only scale=4 (two upsample stages) is wired in v1; the realesrgan .pth pickle
-// load is a follow-up (use safetensors here).
+// scale=4 uses two upsample stages (conv_up1, conv_up2); scale=2 uses one
+// (conv_up1 only). Real-ESRGAN .pth pickle checkpoints load through the same
+// CreatePretrainedTensorReader path (TNNetTorchBinReader unwraps the
+// 'params_ema'/'params' top-level wrapper dict automatically).
 type
   TRRDBNetConfig = record
     NumInCh: integer;     // input channels (3)
@@ -64509,11 +64511,13 @@ begin
     ImportError('RRDBNet import: num_block must be >= 1.');
   if Config.InputSize < 1 then
     ImportError('RRDBNet import: input_size must be >= 1.');
-  if Config.Scale <> 4 then
-    ImportError('RRDBNet import: only scale=4 is supported in v1, got ' +
+  if (Config.Scale <> 4) and (Config.Scale <> 2) then
+    ImportError('RRDBNet import: only scale=2 and scale=4 are supported, got ' +
       IntToStr(Config.Scale) + '.');
   nf := Config.NumFeat;
-  UpStages := 2;  // scale 4 = two 2x nearest-upsample stages.
+  // scale 4 = two 2x nearest-upsample stages (conv_up1, conv_up2);
+  // scale 2 = one 2x stage (conv_up1 only).
+  if Config.Scale = 4 then UpStages := 2 else UpStages := 1;
   NumBlockM1 := Config.NumBlock - 1;
   UpStagesM1 := UpStages - 1;
   SetLength(Blocks, Config.NumBlock);
@@ -64563,7 +64567,8 @@ begin
     LoadVaeConv(Reader, ConvBody, 'conv_body.weight', 'conv_body.bias',
       nf, nf, 3);
     LoadVaeConv(Reader, ConvUp1, 'conv_up1.weight', 'conv_up1.bias', nf, nf, 3);
-    LoadVaeConv(Reader, ConvUp2, 'conv_up2.weight', 'conv_up2.bias', nf, nf, 3);
+    if UpStages >= 2 then
+      LoadVaeConv(Reader, ConvUp2, 'conv_up2.weight', 'conv_up2.bias', nf, nf, 3);
     LoadVaeConv(Reader, ConvHR, 'conv_hr.weight', 'conv_hr.bias', nf, nf, 3);
     LoadVaeConv(Reader, ConvLast, 'conv_last.weight', 'conv_last.bias',
       Config.NumOutCh, nf, 3);
