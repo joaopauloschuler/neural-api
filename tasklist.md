@@ -1547,10 +1547,18 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
         Monarch dx/dxR use new FColBuf2 scratch; Kronecker G uses FGBuf, dA/dX write
         deltas/prev-error directly. Bit-identical on scalar, parity tests pass on
         scalar + -dAVX2.
-  - [ ] TNNetSpectralConv1D weight-gradient: kept scalar in Double over the original
-        strided interleaved `[m][ci][co][Re,Im]` storage so the saved-weight gradient
-        stays byte-identical; vectorize via a contiguous Re/Im gradient-plane scatter
-        if the FNO weight-grad becomes a profiled hot path.
+  - [X] TNNetSpectralConv1D weight-gradient: AVX-vectorized via contiguous Re/Im
+        gradient-plane accumulation. New FdWrPlane/FdWiPlane scratch (laid out like
+        FWrPlane, (co,m)-major ci-minor) accumulate the per-output weight delta with
+        four `TNNetVolume.MulAdd` calls over the already-contiguous FxrPlane/FximPlane
+        input spectra (-FLearningRate folded into the scalar factors), then a final
+        scatter writes them back into the strided interleaved `[m][ci][co][Re,Im]`
+        persistent WDelta so the saved-weight gradient layout is unchanged. The accum
+        moves Double->Single AVX (like the forward DotProduct path), but the existing
+        gradient-check max-abs-error is FD-truncation dominated and stayed identical at
+        0.00082132 (tol 0.01, ~12x margin) on BOTH scalar and -dAVX2 — no tolerance
+        loosened. Scratch allocated in SetPrevLayer (trainable only), freed in
+        FreeBackpropScratch/Destroy.
   - [ ] TNNetTestTimeTraining / TNNetTitansMemory backward "undo" loops (interleaved
         scalar etaGrad/dEta/dTheta accumulation) — the per-token forward rank-1 writes
         are vectorized; this is the lower-value remainder.

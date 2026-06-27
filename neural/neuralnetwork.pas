@@ -11283,6 +11283,12 @@ type
     FxrPlane, FximPlane: array of TNeuralFloat;
     // BackpropagateCPU contiguous input-spectrum gradient, index m*FInDepth + ci.
     FdXrePlane, FdXimPlane: array of TNeuralFloat;
+    // BackpropagateCPU contiguous weight-gradient planes, laid out like
+    // FWrPlane/FWiPlane (index (co*FModes+m)*FInDepth+ci) so the per-output
+    // InDepth weight-delta accumulation is a contiguous AVX MulAdd over the
+    // already-contiguous FxrPlane/FximPlane input spectra. Scattered back into
+    // the strided interleaved persistent WDelta at the end of the pass.
+    FdWrPlane, FdWiPlane: array of TNeuralFloat;
     procedure ComputeCPU();
     procedure BackpropagateCPU();
     function WBase(m, ci, co: integer): integer;
@@ -62806,6 +62812,8 @@ begin
   SetLength(FdXimBuf, 0);
   SetLength(FdXrePlane, 0);
   SetLength(FdXimPlane, 0);
+  SetLength(FdWrPlane, 0);
+  SetLength(FdWiPlane, 0);
 end;
 
 function TNNetSpectralConv1D.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
@@ -62882,6 +62890,8 @@ begin
     SetLength(FdXimBuf, FInDepth, FModes);
     SetLength(FdXrePlane, FModes * FInDepth);
     SetLength(FdXimPlane, FModes * FInDepth);
+    SetLength(FdWrPlane, FOutDepth * FModes * FInDepth);
+    SetLength(FdWiPlane, FOutDepth * FModes * FInDepth);
   end;
 
   InitDefault();
@@ -63035,12 +63045,11 @@ end;
 procedure TNNetSpectralConv1D.BackpropagateCPU();
 var
   ci, co, m, n, b: integer;
-  W, WDelta, LocalPrevError: TNNetVolume;
-  invL, xr, xi, gyr, gyi, contrib: Double;
+  WDelta, LocalPrevError: TNNetVolume;
+  invL, gyr, gyi, contrib, lrGyr, lrGyi: Double;
   InDepthM1, OutDepthM1, SeqLenM1, ModesM1: integer;
-  wBaseIdx, xBaseIdx, planeSize: integer;
+  wBaseIdx, xBaseIdx, planeSize, wPlaneSize: integer;
 begin
-  W := FArrNeurons[0].FWeights;
   WDelta := FArrNeurons[0].FDelta;
   invL := 1.0 / FSeqLen;
   InDepthM1 := FInDepth - 1;
@@ -63053,6 +63062,15 @@ begin
   begin
     FdXrePlane[n] := 0;
     FdXimPlane[n] := 0;
+  end;
+  // Contiguous weight-gradient planes (co,m)-major, ci-minor -- the AVX MulAdd
+  // accumulation target mirroring FWrPlane/FWiPlane. Scattered into the strided
+  // interleaved WDelta after the pass.
+  wPlaneSize := FOutDepth * FModes * FInDepth;
+  for n := 0 to wPlaneSize - 1 do
+  begin
+    FdWrPlane[n] := 0;
+    FdWiPlane[n] := 0;
   end;
 
   for co := 0 to OutDepthM1 do
@@ -63068,31 +63086,45 @@ begin
     begin
       gyr := invL * FGreBuf[m];
       gyi := invL * FGimBuf[m];
-      // Weight gradient: strided writes into the interleaved persistent storage,
-      // kept scalar (and in Double, reading the Double FFT spectra) so the saved
-      // weights and their gradient are byte-for-byte the original layout.
-      for ci := 0 to InDepthM1 do
-      begin
-        b := WBase(m, ci, co);
-        xr := FXre[ci][m];
-        xi := FXim[ci][m];
-        // Yre=a*xr-bb*xi, Yim=a*xi+bb*xr.
-        WDelta.FData[b]     := WDelta.FData[b]     +
-          (-FLearningRate) * (gyr * xr + gyi * xi);
-        WDelta.FData[b + 1] := WDelta.FData[b + 1] +
-          (-FLearningRate) * (-gyr * xi + gyi * xr);
-      end;
+      wBaseIdx := (co * FModes + m) * FInDepth;
+      xBaseIdx := m * FInDepth;
+      // Weight gradient: contiguous AVX MulAdd accumulation into the Re/Im
+      // weight-gradient planes over the ci axis (input spectra FxrPlane/FximPlane
+      // are already (m,ci)-contiguous Single mirrors, as the forward path uses).
+      // Math is the transpose of the forward complex GEMM, identical to the old
+      // strided-scalar loop with -FLearningRate folded into the scalar factors:
+      //   dWr[ci] += -LR*gyr * xr[ci] + -LR*gyi * xi[ci]
+      //   dWi[ci] += -LR*gyi * xr[ci] +  LR*gyr * xi[ci]
+      lrGyr := -FLearningRate * gyr;
+      lrGyi := -FLearningRate * gyi;
+      TNNetVolume.MulAdd(@FdWrPlane[wBaseIdx], @FxrPlane[xBaseIdx], lrGyr, FInDepth);
+      TNNetVolume.MulAdd(@FdWrPlane[wBaseIdx], @FximPlane[xBaseIdx], lrGyi, FInDepth);
+      TNNetVolume.MulAdd(@FdWiPlane[wBaseIdx], @FxrPlane[xBaseIdx], lrGyi, FInDepth);
+      TNNetVolume.MulAdd(@FdWiPlane[wBaseIdx], @FximPlane[xBaseIdx], -lrGyr, FInDepth);
       // Input-spectrum gradient (sum over co): contiguous AXPY over the ci axis.
       //   dXre[ci] += gyr*Wr[ci] + gyi*Wi[ci]
       //   dXim[ci] += -gyr*Wi[ci] + gyi*Wr[ci]
-      wBaseIdx := (co * FModes + m) * FInDepth;
-      xBaseIdx := m * FInDepth;
       TNNetVolume.MulAdd(@FdXrePlane[xBaseIdx], @FWrPlane[wBaseIdx], gyr, FInDepth);
       TNNetVolume.MulAdd(@FdXrePlane[xBaseIdx], @FWiPlane[wBaseIdx], gyi, FInDepth);
       TNNetVolume.MulAdd(@FdXimPlane[xBaseIdx], @FWiPlane[wBaseIdx], -gyr, FInDepth);
       TNNetVolume.MulAdd(@FdXimPlane[xBaseIdx], @FWrPlane[wBaseIdx], gyi, FInDepth);
     end;
   end;
+
+  // Scatter the contiguous weight-gradient planes back into the strided
+  // interleaved persistent WDelta ([m][ci][co][Re,Im]) so the saved-weight
+  // gradient layout is unchanged.
+  for co := 0 to OutDepthM1 do
+    for m := 0 to ModesM1 do
+    begin
+      wBaseIdx := (co * FModes + m) * FInDepth;
+      for ci := 0 to InDepthM1 do
+      begin
+        b := WBase(m, ci, co);
+        WDelta.FData[b]     := WDelta.FData[b]     + FdWrPlane[wBaseIdx + ci];
+        WDelta.FData[b + 1] := WDelta.FData[b + 1] + FdWiPlane[wBaseIdx + ci];
+      end;
+    end;
 
   // Scatter the contiguous (m,ci) input-spectrum gradient back to the [ci][m]
   // scratch the per-channel IFFT below consumes.
