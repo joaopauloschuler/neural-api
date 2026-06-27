@@ -1782,10 +1782,10 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       VideoPrediction, VideoAction, VideoActionTiny — LANDED commit 0cf2ea59).
       Remaining folders still lacking a README (write each strictly from the
       `.lpr`, matching existing example-README style; no source edits):
-  - [ ] NLP/decoding: BeamSearchDecode, SpanCorruptionPretrain, sentimentAnalysis,
+  - [X] NLP/decoding: BeamSearchDecode, SpanCorruptionPretrain, sentimentAnalysis,
         GroupedQueryAttention, GumbelSoftmaxDemo, MixtureOfExperts, PonderNet,
         DiagonalSSM, LegendreMemoryUnit, LinearRecurrentUnit, MinimalRNN, RWKV,
-        TitansMemory, DebertaReranker
+        TitansMemory, DebertaReranker (all 14 READMEs LANDED)
   - [ ] Audio/speech: F5TTS, KokoroTTS, ParlerTTS, Qwen2AudioChat, Wav2Vec2Transcribe,
         MusicGenProbe, MusicTagging, OCRTranscribe, SpeakerDiarization,
         SpeakerVerification, DACRoundTrip
