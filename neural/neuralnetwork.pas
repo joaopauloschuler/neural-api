@@ -5811,6 +5811,7 @@ type
       FInvStdDev: array of TNeuralFloat;
       FNormalized: TNNetVolume;
       FAuxChannel: TNNetVolume; // per-channel gradient reduction (per-channel affine)
+      FOnes: TNNetVolume; // FChannelsPerGroup ones, for AVX dot-product reductions
     public
       constructor Create(Groups: integer; PerChannelAffine: boolean = True); overload;
       destructor Destroy(); override;
@@ -54836,6 +54837,7 @@ begin
   FChannelsPerGroup := 0;
   FNormalized := TNNetVolume.Create();
   FAuxChannel := TNNetVolume.Create();
+  FOnes := TNNetVolume.Create();
 end;
 
 destructor TNNetGroupNorm.Destroy();
@@ -54843,6 +54845,7 @@ begin
   SetLength(FInvStdDev, 0);
   FNormalized.Free;
   FAuxChannel.Free;
+  FOnes.Free;
   inherited Destroy();
 end;
 
@@ -54853,6 +54856,10 @@ begin
   if (FGroups < 1) or (FOutput.Depth mod FGroups <> 0) then FGroups := 1;
   FChannelsPerGroup := FOutput.Depth div FGroups;
   SetLength(FInvStdDev, FGroups);
+  // Ones vector spanning one group's contiguous depth sub-range, used as the
+  // second operand of AVX DotProduct/MulAdd to reduce/broadcast a scalar.
+  FOnes.ReSize(1, 1, FChannelsPerGroup);
+  FOnes.Fill(1);
   if FNeurons.Count < 2 then AddMissingNeurons(2);
   // FNeurons[0] holds gamma (scale), FNeurons[1] holds beta (bias).
   if FPerChannelAffine then
@@ -54871,53 +54878,55 @@ end;
 
 procedure TNNetGroupNorm.Compute();
 var
-  LpBnd73: integer;
-  LpBnd74: integer;
-  LpBnd75: integer;
-  LpBnd76: integer;
-  LpBnd77: integer;
-  LpBnd78: integer;
+  LpBndX: integer;
+  LpBndY: integer;
   StartTime: double;
-  Mean, Variance: TNeuralFloat;
-  GroupCnt, GroupSize, FGroupsM1: integer;
-  CntX, CntY, CntD, DStart, DEnd: integer;
+  Mean, Variance, InvStd: TNeuralFloat;
+  GroupCnt, GroupSize, FGroupsM1, GroupDepth: integer;
+  CntX, CntY, DStart: integer;
+  ColPtr, OnesPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   inherited Compute;
-  GroupSize := FOutput.SizeX * FOutput.SizeY * FChannelsPerGroup;
+  GroupDepth := FChannelsPerGroup;
+  GroupSize := FOutput.SizeX * FOutput.SizeY * GroupDepth;
   FGroupsM1 := FGroups - 1;
+  LpBndX := FOutput.SizeX - 1;
+  LpBndY := FOutput.SizeY - 1;
+  OnesPtr := TNeuralFloatArrPtr(FOnes.GetRawPtr(0));
   for GroupCnt := 0 to FGroupsM1 do
   begin
     DStart := GroupCnt * FChannelsPerGroup;
-    DEnd := DStart + FChannelsPerGroup - 1;
-    // Mean of this group.
+    // Mean of this group. Each (x,y) column over [DStart..DStart+GroupDepth-1]
+    // is contiguous in memory, so the per-column reduction is an AVX dot
+    // product against a ones vector.
     Mean := 0;
-    LpBnd73 := FOutput.SizeX - 1;
-    LpBnd74 := FOutput.SizeY - 1;
-    for CntX := 0 to LpBnd73 do
-      for CntY := 0 to LpBnd74 do
-        for CntD := DStart to DEnd do
-          Mean := Mean + FOutput[CntX, CntY, CntD];
+    for CntX := 0 to LpBndX do
+      for CntY := 0 to LpBndY do
+      begin
+        ColPtr := TNeuralFloatArrPtr(FOutput.GetRawPtr(CntX, CntY, DStart));
+        Mean := Mean + TNNetVolume.DotProduct(ColPtr, OnesPtr, GroupDepth);
+      end;
     Mean := Mean / GroupSize;
-    // Subtract the mean and accumulate the variance.
+    // Subtract the mean (MulAdd with the ones vector) and accumulate the
+    // variance (sum of squares = self dot product).
     Variance := 0;
-    LpBnd75 := FOutput.SizeX - 1;
-    LpBnd76 := FOutput.SizeY - 1;
-    for CntX := 0 to LpBnd75 do
-      for CntY := 0 to LpBnd76 do
-        for CntD := DStart to DEnd do
-        begin
-          FOutput[CntX, CntY, CntD] := FOutput[CntX, CntY, CntD] - Mean;
-          Variance := Variance + FOutput[CntX, CntY, CntD] * FOutput[CntX, CntY, CntD];
-        end;
+    for CntX := 0 to LpBndX do
+      for CntY := 0 to LpBndY do
+      begin
+        ColPtr := TNeuralFloatArrPtr(FOutput.GetRawPtr(CntX, CntY, DStart));
+        TNNetVolume.MulAdd(ColPtr, OnesPtr, -Mean, GroupDepth);
+        Variance := Variance + TNNetVolume.DotProduct(ColPtr, ColPtr, GroupDepth);
+      end;
     Variance := Variance / GroupSize;
-    FInvStdDev[GroupCnt] := pcr_rsqrtf(Variance + FGroupNormEpsilon);
-    LpBnd77 := FOutput.SizeX - 1;
-    LpBnd78 := FOutput.SizeY - 1;
-    for CntX := 0 to LpBnd77 do
-      for CntY := 0 to LpBnd78 do
-        for CntD := DStart to DEnd do
-          FOutput[CntX, CntY, CntD] := FOutput[CntX, CntY, CntD] * FInvStdDev[GroupCnt];
+    InvStd := pcr_rsqrtf(Variance + FGroupNormEpsilon);
+    FInvStdDev[GroupCnt] := InvStd;
+    for CntX := 0 to LpBndX do
+      for CntY := 0 to LpBndY do
+      begin
+        ColPtr := TNeuralFloatArrPtr(FOutput.GetRawPtr(CntX, CntY, DStart));
+        TNNetVolume.Mul(ColPtr, InvStd, GroupDepth);
+      end;
   end;
   // Keep the normalized values for the backward pass.
   FNormalized.Copy(FOutput);
@@ -54937,14 +54946,13 @@ end;
 
 procedure TNNetGroupNorm.Backpropagate();
 var
-  LpBnd79: integer;
-  LpBnd80: integer;
-  LpBnd81: integer;
-  LpBnd82: integer;
+  LpBndX: integer;
+  LpBndY: integer;
   StartTime: double;
-  GroupCnt, GroupSize, FGroupsM1: integer;
-  CntX, CntY, CntD, DStart, DEnd, RawPos: integer;
-  SumDxHat, SumDxHatXHat, FloatGroupSize, DxHat: TNeuralFloat;
+  GroupCnt, GroupSize, FGroupsM1, GroupDepth: integer;
+  CntX, CntY, DStart: integer;
+  SumDxHat, SumDxHatXHat, FloatGroupSize, InvStd: TNeuralFloat;
+  ColDeriv, ColNorm, ColPrev, OnesPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -54980,49 +54988,52 @@ begin
   if Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FOutputError.Size) then
   begin
-    GroupSize := FOutput.SizeX * FOutput.SizeY * FChannelsPerGroup;
+    GroupDepth := FChannelsPerGroup;
+    GroupSize := FOutput.SizeX * FOutput.SizeY * GroupDepth;
     FloatGroupSize := GroupSize;
+    LpBndX := FOutput.SizeX - 1;
+    LpBndY := FOutput.SizeY - 1;
+    OnesPtr := TNeuralFloatArrPtr(FOnes.GetRawPtr(0));
     // dxhat = OutputError * gamma
     // dx = invStdDev * ( dxhat - mean(dxhat) - xhat * mean(dxhat*xhat) )
-    // computed independently per group.
+    // computed independently per group. Each (x,y) column over the group's
+    // contiguous depth sub-range vectorizes via AVX dot/MulAdd primitives.
+    // dxhat = OutputError .* gamma, computed once over the whole volume with
+    // AVX. Per-channel affine broadcasts gamma by channel; the legacy affine
+    // indexes gamma per element.
+    FOutputErrorDeriv.Copy(FOutputError);
+    if FPerChannelAffine then
+      FOutputErrorDeriv.MulChannels(FNeurons[0].FWeights)
+    else
+      FOutputErrorDeriv.Mul(FNeurons[0].FWeights);
     FGroupsM1 := FGroups - 1;
     for GroupCnt := 0 to FGroupsM1 do
     begin
       DStart := GroupCnt * FChannelsPerGroup;
-      DEnd := DStart + FChannelsPerGroup - 1;
+      InvStd := FInvStdDev[GroupCnt];
       SumDxHat := 0;
       SumDxHatXHat := 0;
-      LpBnd79 := FOutput.SizeX - 1;
-      LpBnd80 := FOutput.SizeY - 1;
-      for CntX := 0 to LpBnd79 do
-        for CntY := 0 to LpBnd80 do
-          for CntD := DStart to DEnd do
-          begin
-            RawPos := FOutput.GetRawPos(CntX, CntY, CntD);
-            // Per-channel affine broadcasts gamma by channel (FData[CntD]);
-            // the legacy affine indexes gamma per element (FData[RawPos]).
-            if FPerChannelAffine then
-              DxHat := FOutputError.FData[RawPos] * FNeurons[0].FWeights.FData[CntD]
-            else
-              DxHat := FOutputError.FData[RawPos] * FNeurons[0].FWeights.FData[RawPos];
-            FOutputErrorDeriv.FData[RawPos] := DxHat;
-            SumDxHat := SumDxHat + DxHat;
-            SumDxHatXHat := SumDxHatXHat + DxHat * FNormalized.FData[RawPos];
-          end;
+      for CntX := 0 to LpBndX do
+        for CntY := 0 to LpBndY do
+        begin
+          ColDeriv := TNeuralFloatArrPtr(FOutputErrorDeriv.GetRawPtr(CntX, CntY, DStart));
+          ColNorm := TNeuralFloatArrPtr(FNormalized.GetRawPtr(CntX, CntY, DStart));
+          SumDxHat := SumDxHat + TNNetVolume.DotProduct(ColDeriv, OnesPtr, GroupDepth);
+          SumDxHatXHat := SumDxHatXHat + TNNetVolume.DotProduct(ColDeriv, ColNorm, GroupDepth);
+        end;
       SumDxHat := SumDxHat / FloatGroupSize;
       SumDxHatXHat := SumDxHatXHat / FloatGroupSize;
-      LpBnd81 := FOutput.SizeX - 1;
-      LpBnd82 := FOutput.SizeY - 1;
-      for CntX := 0 to LpBnd81 do
-        for CntY := 0 to LpBnd82 do
-          for CntD := DStart to DEnd do
-          begin
-            RawPos := FOutput.GetRawPos(CntX, CntY, CntD);
-            FPrevLayer.FOutputError.FData[RawPos] :=
-              FPrevLayer.FOutputError.FData[RawPos] +
-              FInvStdDev[GroupCnt] * ( FOutputErrorDeriv.FData[RawPos] - SumDxHat -
-                FNormalized.FData[RawPos] * SumDxHatXHat );
-          end;
+      for CntX := 0 to LpBndX do
+        for CntY := 0 to LpBndY do
+        begin
+          ColDeriv := TNeuralFloatArrPtr(FOutputErrorDeriv.GetRawPtr(CntX, CntY, DStart));
+          ColNorm := TNeuralFloatArrPtr(FNormalized.GetRawPtr(CntX, CntY, DStart));
+          ColPrev := TNeuralFloatArrPtr(FPrevLayer.FOutputError.GetRawPtr(CntX, CntY, DStart));
+          // prev += invStd*deriv - invStd*SumDxHat - invStd*SumDxHatXHat*norm
+          TNNetVolume.MulAdd(ColPrev, ColDeriv, InvStd, GroupDepth);
+          TNNetVolume.MulAdd(ColPrev, OnesPtr, -InvStd * SumDxHat, GroupDepth);
+          TNNetVolume.MulAdd(ColPrev, ColNorm, -InvStd * SumDxHatXHat, GroupDepth);
+        end;
     end;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
