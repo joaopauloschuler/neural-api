@@ -1574,18 +1574,6 @@ rather than acted on.
       multi-axis (local block + sparse grid) attention is architecturally distinct from
       the landed Swin (shifted-window) and ConvNeXt (pure-conv) backbones, adding another
       feature extractor for the landed ImageNet eval harness.
-- [ ] GGUF Q3_K + legacy Q4_0/Q4_1/Q5_0/Q5_1 dequantization in the reader
-      (`neural/neuralgguf.pas`). The reader already dequantizes F32/F16/Q8_0 and the
-      k-quants Q2_K/Q4_K/Q5_K/Q6_K (the dominant `Q4_K_M`/`Q5_K_M`/`Q6_K` mixes) but
-      raises `EGGUFError` on Q3_K and the legacy round-to-nearest quants. Port ggml's
-      `dequantize_row_q3_K` (super-block of 16 sub-blocks of 16: 32 bytes hmask for the
-      3rd bit-plane, 64 bytes 2-bit quants, 12 bytes 6-bit packed scales, f16 d) and the
-      simple legacy block layouts (`q4_0` = f16 d + 32 nibbles; `q4_1` adds f16 m; `q5_0`
-      adds a 5th-bit plane; `q5_1` adds f16 m), dequantizing to FP32 on load like the
-      existing paths. Round-trip / value test against a tiny known tensor per type. Real
-      value: `Q3_K_M` is a common low-RAM quant for local LLMs and `q4_0` still appears
-      on older GGUFs, so this lets `BuildLlamaFromGGUF` (and the GGUF dispatch) load
-      several checkpoints the reader currently rejects.
 
 ## Layer follow-ups that fix real limitations
 

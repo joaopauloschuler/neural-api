@@ -178,6 +178,7 @@ type
     procedure TestGGUFReaderMetadataAndTensors;
     procedure TestGGUFTensorDecodeParity;
     procedure TestGGUFKQuantDecodeParity;
+    procedure TestGGUFQ3KAndLegacyDecodeParity;
     procedure TestGGUFLlamaLogitParity;
     procedure TestGGUFLlamaQ8AndF16ImportDrift;
     procedure TestGGUFWriterRoundTrip;
@@ -4751,6 +4752,288 @@ begin
   finally
     RefRoot.Free;
     RefJson.Free;
+    V.Free;
+  end;
+end;
+
+// GGUF Q3_K + legacy Q4_0/Q4_1/Q5_0/Q5_1 dequant-at-load value test. The
+// reader's quant paths are gated against tiny_kquant.gguf for the k-quants;
+// this test covers the NEWLY added types with self-contained byte buffers
+// built here in Pascal (no committed binary fixture). For each type it
+// hand-rolls one block/super-block in the EXACT ggml byte layout from
+// chosen quant codes + scales, writes a minimal GGUF file, reads it back
+// and asserts the dequantized FP32 values equal the closed-form expected
+// value (computed here directly from the chosen codes, independent of the
+// reader's unpacking) to f32 rounding.
+procedure TTestNeuralPretrained.TestGGUFQ3KAndLegacyDecodeParity;
+var
+  Path: string;
+
+  // Writes a single-tensor GGUF v3 file (alignment 32, no metadata) with the
+  // given raw payload as ggml dtype TypeId, contiguous dim = NumElems (so the
+  // served row-major shape is [1, NumElems]).
+  procedure WriteOneTensorGGUF(TypeId: integer; NumElems: integer;
+    const Payload: array of byte);
+  var
+    FS: TFileStream;
+    U32: cardinal;
+    U64: QWord;
+    NameLen: QWord;
+    NameB: TBytes;
+    HeaderEnd, DataStart, PadLen: Int64;
+    Zero: byte;
+    i: integer;
+    Name: ansistring;
+  begin
+    FS := TFileStream.Create(Path, fmCreate);
+    try
+      U32 := $46554747; FS.WriteBuffer(U32, 4);     // 'GGUF'
+      U32 := 3; FS.WriteBuffer(U32, 4);             // version 3
+      U64 := 1; FS.WriteBuffer(U64, 8);             // tensor count
+      U64 := 0; FS.WriteBuffer(U64, 8);             // kv count
+      // tensor info: name, n_dims=1, dim[0]=NumElems, type, offset=0
+      Name := 'w';
+      NameLen := Length(Name);
+      FS.WriteBuffer(NameLen, 8);
+      SetLength(NameB, Length(Name));
+      for i := 1 to Length(Name) do NameB[i - 1] := byte(Name[i]);
+      FS.WriteBuffer(NameB[0], Length(NameB));
+      U32 := 1; FS.WriteBuffer(U32, 4);             // n_dims
+      U64 := QWord(NumElems); FS.WriteBuffer(U64, 8);
+      U32 := cardinal(TypeId); FS.WriteBuffer(U32, 4);
+      U64 := 0; FS.WriteBuffer(U64, 8);             // data offset
+      // align to 32 before the data section
+      HeaderEnd := FS.Position;
+      DataStart := ((HeaderEnd + 31) div 32) * 32;
+      PadLen := DataStart - HeaderEnd;
+      Zero := 0;
+      while PadLen > 0 do begin FS.WriteBuffer(Zero, 1); Dec(PadLen); end;
+      if Length(Payload) > 0 then
+        FS.WriteBuffer(Payload[0], Length(Payload));
+    finally
+      FS.Free;
+    end;
+  end;
+
+  // Stores V as f16 little-endian AND returns the f16-rounded value, so the
+  // closed-form expected uses the SAME d/m the reader decodes (f16 isn't
+  // exact, e.g. 0.3 -> 0.30005).
+  function PutF16(var Buf: array of byte; Ofs: integer; V: single): single;
+  var
+    W: word;
+  begin
+    W := EncodeF16(V);
+    Buf[Ofs] := byte(W and $FF);
+    Buf[Ofs + 1] := byte((W shr 8) and $FF);
+    Result := DecodeF16(W);
+  end;
+
+var
+  GGUF: TNNetGGUFReader;
+  V: TNNetVolume;
+  Q40, Q41, Q50, Q51: array[0..23] of byte;  // max legacy block = 24 bytes
+  Q3K: array[0..GGUF_Q3_K_BLOCK_BYTES - 1] of byte;
+  e, sb, j: integer;
+  d, m: single;
+  code: integer;
+  expv: single;
+  scales: array[0..15] of integer;
+  qcode: array[0..255] of integer;  // 2-bit low code per element
+  hbit: array[0..255] of integer;   // 3rd-bit-plane bit per element
+  h0, p, s: integer;
+  by: integer;
+  lo4, hi2: integer;
+begin
+  V := TNNetVolume.Create;
+  Path := GetTempDir(false) + 'cai_gguf_legacy_' + IntToStr(Random(1000000)) +
+    '.gguf';
+  try
+    // ---- Q4_0 (type 2): f16 d + 16 nibbles; x = d*(nibble-8). One block. ----
+    FillChar(Q40, SizeOf(Q40), 0);
+    d := 0.5;
+    d := PutF16(Q40, 0, d);
+    // element e gets nibble code (e mod 16); low nibble = e<16, high = e>=16.
+    for e := 0 to 31 do
+    begin
+      code := e mod 16;
+      if e < 16 then
+        Q40[2 + e] := Q40[2 + e] or byte(code)
+      else
+        Q40[2 + (e - 16)] := Q40[2 + (e - 16)] or byte(code shl 4);
+    end;
+    WriteOneTensorGGUF(GGML_TYPE_Q4_0, 32, Q40);
+    GGUF := TNNetGGUFReader.Create(Path);
+    try
+      AssertEquals('Q4_0 dtype', 'Q4_0', GGUF.GetDType('w'));
+      GGUF.LoadTensorFlat('w', V);
+      AssertEquals('Q4_0 count', 32, V.Size);
+      for e := 0 to 31 do
+      begin
+        expv := d * ((e mod 16) - 8);
+        AssertTrue('Q4_0 elem ' + IntToStr(e) + ' = ' + FloatToStr(V.FData[e]) +
+          ' exp ' + FloatToStr(expv), Abs(V.FData[e] - expv) < 1e-4);
+      end;
+    finally
+      GGUF.Free;
+    end;
+
+    // ---- Q4_1 (type 3): f16 d, f16 m + nibbles; x = d*nibble + m. ----
+    FillChar(Q41, SizeOf(Q41), 0);
+    d := 0.25; m := -1.5;
+    d := PutF16(Q41, 0, d);
+    m := PutF16(Q41, 2, m);
+    for e := 0 to 31 do
+    begin
+      code := e mod 16;
+      if e < 16 then
+        Q41[4 + e] := Q41[4 + e] or byte(code)
+      else
+        Q41[4 + (e - 16)] := Q41[4 + (e - 16)] or byte(code shl 4);
+    end;
+    WriteOneTensorGGUF(GGML_TYPE_Q4_1, 32, Q41);
+    GGUF := TNNetGGUFReader.Create(Path);
+    try
+      AssertEquals('Q4_1 dtype', 'Q4_1', GGUF.GetDType('w'));
+      GGUF.LoadTensorFlat('w', V);
+      for e := 0 to 31 do
+      begin
+        expv := d * (e mod 16) + m;
+        AssertTrue('Q4_1 elem ' + IntToStr(e) + ' = ' + FloatToStr(V.FData[e]) +
+          ' exp ' + FloatToStr(expv), Abs(V.FData[e] - expv) < 1e-4);
+      end;
+    finally
+      GGUF.Free;
+    end;
+
+    // ---- Q5_0 (type 6): f16 d, 4-byte qh + nibbles; ----
+    //   x = d*((nibble | (qh_bit<<4)) - 16). 5-bit code = e (0..31), low 4
+    //   bits in the nibble, bit 5 in qh bit e.
+    FillChar(Q50, SizeOf(Q50), 0);
+    d := 0.3;
+    d := PutF16(Q50, 0, d);
+    for e := 0 to 31 do
+    begin
+      code := e;                       // 5-bit code 0..31
+      lo4 := code and $0F;
+      if (code shr 4) and $01 = 1 then
+        // set qh bit e (4-byte LE plane starting at offset 2)
+        Q50[2 + (e div 8)] := Q50[2 + (e div 8)] or byte(1 shl (e mod 8));
+      if e < 16 then
+        Q50[6 + e] := Q50[6 + e] or byte(lo4)
+      else
+        Q50[6 + (e - 16)] := Q50[6 + (e - 16)] or byte(lo4 shl 4);
+    end;
+    WriteOneTensorGGUF(GGML_TYPE_Q5_0, 32, Q50);
+    GGUF := TNNetGGUFReader.Create(Path);
+    try
+      AssertEquals('Q5_0 dtype', 'Q5_0', GGUF.GetDType('w'));
+      GGUF.LoadTensorFlat('w', V);
+      for e := 0 to 31 do
+      begin
+        expv := d * (e - 16);
+        AssertTrue('Q5_0 elem ' + IntToStr(e) + ' = ' + FloatToStr(V.FData[e]) +
+          ' exp ' + FloatToStr(expv), Abs(V.FData[e] - expv) < 1e-4);
+      end;
+    finally
+      GGUF.Free;
+    end;
+
+    // ---- Q5_1 (type 7): f16 d, f16 m, 4-byte qh + nibbles; ----
+    //   x = d*(nibble | (qh_bit<<4)) + m.
+    FillChar(Q51, SizeOf(Q51), 0);
+    d := 0.2; m := 2.0;
+    d := PutF16(Q51, 0, d);
+    m := PutF16(Q51, 2, m);
+    for e := 0 to 31 do
+    begin
+      code := e;                       // 5-bit code 0..31
+      lo4 := code and $0F;
+      if (code shr 4) and $01 = 1 then
+        Q51[4 + (e div 8)] := Q51[4 + (e div 8)] or byte(1 shl (e mod 8));
+      if e < 16 then
+        Q51[8 + e] := Q51[8 + e] or byte(lo4)
+      else
+        Q51[8 + (e - 16)] := Q51[8 + (e - 16)] or byte(lo4 shl 4);
+    end;
+    WriteOneTensorGGUF(GGML_TYPE_Q5_1, 32, Q51);
+    GGUF := TNNetGGUFReader.Create(Path);
+    try
+      AssertEquals('Q5_1 dtype', 'Q5_1', GGUF.GetDType('w'));
+      GGUF.LoadTensorFlat('w', V);
+      for e := 0 to 31 do
+      begin
+        expv := d * e + m;
+        AssertTrue('Q5_1 elem ' + IntToStr(e) + ' = ' + FloatToStr(V.FData[e]) +
+          ' exp ' + FloatToStr(expv), Abs(V.FData[e] - expv) < 1e-4);
+      end;
+    finally
+      GGUF.Free;
+    end;
+
+    // ---- Q3_K (type 11): one super-block of 256. ----
+    //   Layout: 32 bytes hmask, 64 bytes qs (2-bit), 12 bytes 6-bit packed
+    //   scales, f16 d. 16 sub-blocks of 16. dl[sb]=d*(scale[sb]-32);
+    //   q = qcode - ((1 xor hbit)<<2); x = dl*q.
+    //   Chosen codes: scale[sb] (the value BEFORE -32 offset) = sb+24 so the
+    //   signed scale spans -8..+7; qcode[e] = (e mod 4); hbit alternates.
+    FillChar(Q3K, SizeOf(Q3K), 0);
+    d := 0.1;
+    d := PutF16(Q3K, 108, d);
+    for sb := 0 to 15 do scales[sb] := sb + 24;   // the 6-bit packed value
+    for e := 0 to 255 do
+    begin
+      qcode[e] := e mod 4;
+      hbit[e] := (e mod 3) and $01;               // some 0s and 1s
+    end;
+    // pack qs: byte (h0*32 + p) holds the 2-bit field at shift 2*s.
+    for e := 0 to 255 do
+    begin
+      h0 := e div 128;
+      p := e mod 32;
+      s := (e mod 128) div 32;
+      by := 32 + (h0 * 32 + p);                    // qs starts at offset 32
+      Q3K[by] := Q3K[by] or byte(qcode[e] shl (2 * s));
+    end;
+    // pack hmask: bit (e div 32) of byte (e mod 32), hmask starts at offset 0.
+    for e := 0 to 255 do
+      if hbit[e] = 1 then
+        Q3K[e mod 32] := Q3K[e mod 32] or byte(1 shl (e div 32));
+    // pack scales (6-bit each) into 12 bytes at offset 96: low nibble of
+    // byte (j mod 8) carries scale low4 for j<8 / high nibble for j>=8; high
+    // 2 bits in byte 8+(j mod 4) at shift 2*(j div 4).
+    for j := 0 to 15 do
+    begin
+      lo4 := scales[j] and $0F;
+      hi2 := (scales[j] shr 4) and $03;
+      if j < 8 then
+        Q3K[96 + j] := Q3K[96 + j] or byte(lo4)
+      else
+        Q3K[96 + (j - 8)] := Q3K[96 + (j - 8)] or byte(lo4 shl 4);
+      Q3K[96 + 8 + (j mod 4)] :=
+        Q3K[96 + 8 + (j mod 4)] or byte(hi2 shl (2 * (j div 4)));
+    end;
+    WriteOneTensorGGUF(GGML_TYPE_Q3_K, 256, Q3K);
+    GGUF := TNNetGGUFReader.Create(Path);
+    try
+      AssertEquals('Q3_K dtype', 'Q3_K', GGUF.GetDType('w'));
+      AssertTrue('Q3_K ggml type',
+        GGUF.TensorGGMLType('w') = GGML_TYPE_Q3_K);
+      GGUF.LoadTensorFlat('w', V);
+      AssertEquals('Q3_K count', 256, V.Size);
+      for e := 0 to 255 do
+      begin
+        sb := e div 16;
+        // closed form, independent of the reader's unpacking
+        code := qcode[e] - ((1 xor hbit[e]) shl 2);
+        expv := d * (scales[sb] - 32) * code;
+        AssertTrue('Q3_K elem ' + IntToStr(e) + ' = ' + FloatToStr(V.FData[e]) +
+          ' exp ' + FloatToStr(expv), Abs(V.FData[e] - expv) < 1e-4);
+      end;
+    finally
+      GGUF.Free;
+    end;
+  finally
+    if FileExists(Path) then DeleteFile(Path);
     V.Free;
   end;
 end;
