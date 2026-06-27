@@ -4465,6 +4465,32 @@ type
     property SeqLen: integer read FSeqLen;
   end;
 
+  /// Swin Transformer V2 window attention (Liu et al. 2022, "Swin Transformer
+  // V2", https://arxiv.org/abs/2111.09883). Same per-(head,window) layout as
+  // TNNetWindowAttention but swaps SCALED-DOT-PRODUCT for COSINE attention:
+  // scores = logit_scale * (Qhat . Khat) where Qhat,Khat are the L2-normalized
+  // Q,K rows (over d_k) and logit_scale is the per-head, already-clamped-and-
+  // exp'd temperature (HF: clamp(raw, max=log(1/0.01)).exp(), folded in at load
+  // time). The additive bias matrix supplied via SetBiasMatrix already carries
+  // the continuous-position-bias 16*sigmoid(cpb_mlp(coords)) PLUS the cyclic-
+  // shift mask, so Compute() just adds it after the cosine score. NO 1/sqrt(dk)
+  // scaling (the cosine normalization replaces it).
+  // Coded by Claude (AI).
+  TNNetSwinV2WindowAttention = class(TNNetWindowAttention)
+  private
+    FQNorm: TNNetVolume; // L2-normalized query rows, [SeqLen,1,d_k]
+    FKNorm: TNNetVolume; // L2-normalized key rows,   [SeqLen,1,d_k]
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(d_k: integer; pSeqLen: integer); overload;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    // Per-head cosine logit_scale (HF clamp(raw,max=log(1/0.01)).exp()). Set at
+    // load time; persisted in FFloatSt[1] so it round-trips through save/load.
+    procedure SetLogitScale(pScale: TNeuralFloat);
+    function LogitScale(): TNeuralFloat;
+  end;
+
   /// Segment-Anything (SAM) ViT image-encoder self-attention block
   // (Kirillov et al. 2023, "Segment Anything", https://arxiv.org/abs/2304.02643;
   // the ViT-det backbone with 2-D decomposed relative position embeddings from
@@ -31298,6 +31324,117 @@ begin
   // post-softmax weights FAttn are already cached, so the score/Q/K/V backward
   // is byte-identical to the parent SDPA. The bias neuron is never stepped.
   inherited Backpropagate();
+end;
+
+{ TNNetSwinV2WindowAttention }
+
+constructor TNNetSwinV2WindowAttention.Create(d_k: integer; pSeqLen: integer);
+begin
+  inherited Create(d_k, pSeqLen);
+  FFloatSt[1] := 1.0; // default logit_scale (overwritten at load time)
+  FQNorm := TNNetVolume.Create();
+  FKNorm := TNNetVolume.Create();
+end;
+
+destructor TNNetSwinV2WindowAttention.Destroy();
+begin
+  FQNorm.Free;
+  FKNorm.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetSwinV2WindowAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // One L2-normalized vector per sequence position, depth = d_k.
+  FQNorm.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
+  FKNorm.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
+end;
+
+procedure TNNetSwinV2WindowAttention.SetLogitScale(pScale: TNeuralFloat);
+begin
+  FFloatSt[1] := pScale;
+end;
+
+function TNNetSwinV2WindowAttention.LogitScale(): TNeuralFloat;
+begin
+  Result := FFloatSt[1];
+end;
+
+procedure TNNetSwinV2WindowAttention.Compute();
+const
+  cMaskFloor = -1e8; // same all-masked-row floor as the parent
+  cEps = 1e-12;      // matches TNNetCosineSimilarityAttention
+var
+  StartTime: double;
+  SeqN, i, j, d: integer;
+  SeqNM1, FDkM1: integer;
+  Score, MaxScore, SumExp, SumSq, InvN, Scale: TNeuralFloat;
+  Prev: TNNetVolume;
+  OutPtr, Bias, BiasRow: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqN := Prev.SizeX;
+  SeqNM1 := SeqN - 1;
+  FDkM1 := FDk - 1;
+  Scale := FFloatSt[1];
+  Bias := FNeurons[0].FWeights.GetRawPtr(0, 0, 0);
+  // 1) L2-normalize each Q and K row over the contiguous d_k depth axis.
+  for i := 0 to SeqNM1 do
+  begin
+    SumSq := TNNetVolume.DotProduct(
+      Prev.GetRawPtr(i, 0, 0), Prev.GetRawPtr(i, 0, 0), FDk);
+    InvN := pcr_rsqrtf(SumSq + cEps);
+    Move(Prev.GetRawPtr(i, 0, 0)^, FQNorm.GetRawPtr(i, 0, 0)^,
+      FDk * SizeOf(TNeuralFloat));
+    TNNetVolume.Mul(FQNorm.GetRawPtr(i, 0, 0), InvN, FDk);
+    SumSq := TNNetVolume.DotProduct(
+      Prev.GetRawPtr(i, 0, FDk), Prev.GetRawPtr(i, 0, FDk), FDk);
+    InvN := pcr_rsqrtf(SumSq + cEps);
+    Move(Prev.GetRawPtr(i, 0, FDk)^, FKNorm.GetRawPtr(i, 0, 0)^,
+      FDk * SizeOf(TNeuralFloat));
+    TNNetVolume.Mul(FKNorm.GetRawPtr(i, 0, 0), InvN, FDk);
+  end;
+  // 2) cosine score * logit_scale + bias, softmax, weighted sum of V.
+  for i := 0 to SeqNM1 do
+  begin
+    BiasRow := @Bias^[i * SeqN];
+    MaxScore := -1e30;
+    for j := 0 to SeqNM1 do
+    begin
+      Score := TNNetVolume.DotProduct(
+        FQNorm.GetRawPtr(i, 0, 0), FKNorm.GetRawPtr(j, 0, 0), FDk);
+      Score := Score * Scale + BiasRow^[j];
+      FAttn[j, i, 0] := Score;
+      if Score > MaxScore then MaxScore := Score;
+    end;
+    if MaxScore <= cMaskFloor then
+    begin
+      for j := 0 to SeqNM1 do
+        FAttn[j, i, 0] := 0;
+    end
+    else
+    begin
+      SumExp := 0;
+      for j := 0 to SeqNM1 do
+      begin
+        Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
+        FAttn[j, i, 0] := Score;
+        SumExp := SumExp + Score;
+      end;
+      if SumExp > 0 then
+        for j := 0 to SeqNM1 do
+          FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
+    end;
+    OutPtr := FOutput.GetRawPtr(i, 0, 0);
+    for d := 0 to FDkM1 do
+      OutPtr^[d] := 0;
+    for j := 0 to SeqNM1 do
+      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
+        FAttn[j, i, 0], FDk);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 { TNNetSAMVisionAttention }
@@ -98587,6 +98724,7 @@ begin
       'TNNetConformerRelPosAttention' : Result := TNNetConformerRelPosAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]);
       'TNNetALiBiAttention' :       Result := TNNetALiBiAttention.Create(St[0], St[1] = 1, Ft[1], St[2]);
       'TNNetWindowAttention' :      Result := TNNetWindowAttention.Create(St[0], St[5]);
+      'TNNetSwinV2WindowAttention' : Result := TNNetSwinV2WindowAttention.Create(St[0], St[5]);
       'TNNetSAMVisionAttention' :   Result := TNNetSAMVisionAttention.Create(St[0], St[1], St[2], St[3]);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetGptOssSinkAttention' :  Result := TNNetGptOssSinkAttention.Create(St[0], St[1] = 1, St[2]);
@@ -99011,6 +99149,7 @@ begin
       if S[0] = 'TNNetConformerRelPosAttention' then Result := TNNetConformerRelPosAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]) else
       if S[0] = 'TNNetALiBiAttention' then Result := TNNetALiBiAttention.Create(St[0], St[1] = 1, Ft[1], St[2]) else
       if S[0] = 'TNNetWindowAttention' then Result := TNNetWindowAttention.Create(St[0], St[5]) else
+      if S[0] = 'TNNetSwinV2WindowAttention' then Result := TNNetSwinV2WindowAttention.Create(St[0], St[5]) else
       if S[0] = 'TNNetSAMVisionAttention' then Result := TNNetSAMVisionAttention.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetGptOssSinkAttention' then Result := TNNetGptOssSinkAttention.Create(St[0], St[1] = 1, St[2]) else

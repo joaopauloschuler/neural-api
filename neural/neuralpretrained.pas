@@ -9092,6 +9092,29 @@ function BuildSwinFromSafeTensors(const FileName: string;
   out Config: TSwinConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet; overload;
 
+// Reads a HF "swinv2" config.json. Reuses TSwinConfig (same fields); ModelType
+// is "swinv2". pretrained_window_sizes default to 0 (the standard public
+// checkpoints), which selects the (window-1) coordinate normalization.
+function ReadSwinV2ConfigFromJSONFile(const FileName: string): TSwinConfig;
+
+// Builds the Swin Transformer V2 classifier (model_type "swinv2", e.g.
+// microsoft/swinv2-tiny-patch4-window8-256) from Reader (caller owns Reader).
+// SwinV2 differs from Swin: cosine attention with a per-head clamped logit-scale
+// temperature, a continuous-position-bias MLP (cpb_mlp) producing the bias grid
+// at LOAD time, post-norm residual ordering, and reduction-then-norm patch
+// merging. Everything else reuses the Swin window-partition/shifted-window
+// machinery. Takes an (ImageSize, ImageSize, NumChannels) RGB volume; outputs
+// (1, 1, NumLabels) logits.
+function BuildSwinV2FromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TSwinConfig; pTrainable: boolean = true): TNNet; overload;
+
+function BuildSwinV2FromSafeTensorsEx(const FileName: string;
+  const Config: TSwinConfig; pTrainable: boolean = true): TNNet;
+
+function BuildSwinV2FromSafeTensors(const FileName: string;
+  out Config: TSwinConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet; overload;
+
 // ---------------------------------------------------------------------------
 // SEGMENT ANYTHING (SAM) IMAGE-ENCODER IMPORT (facebook/sam-vit-base) — the
 // first PROMPTABLE-segmentation importer. v1 lands the ViT-det image encoder
@@ -58900,6 +58923,383 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadSwinConfigFromJSONFile(ConfigPath);
   Result := BuildSwinFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+// ===========================================================================
+// SWIN TRANSFORMER V2 IMPORT (model_type "swinv2")
+// ===========================================================================
+
+function ReadSwinV2ConfigFromJSONFile(const FileName: string): TSwinConfig;
+begin
+  // Same JSON schema as Swin (depths/num_heads/embed_dim/window_size/...) with
+  // model_type "swinv2". The reader keeps whatever model_type the file states.
+  Result := ReadSwinConfigFromJSONFile(FileName);
+end;
+
+// Builds the per-head continuous-position-bias matrix for ONE shifted/unshifted
+// window and copies it into each of this block's NumHeads SwinV2 window-attention
+// layers (also setting the per-head clamped exp(logit_scale)). The bias grid is
+// produced at LOAD time by running the loaded cpb_mlp over HF's log-spaced
+// relative-coordinate table (get_relative_coords_table), then 16*sigmoid, then
+// gathered by RelPosIndex; the cyclic-shift mask (-1e9 for cross-region pairs)
+// is added per window exactly like the Swin path. Coded by Claude (AI).
+procedure SwinV2SetContinuousPositionBias(
+  Reader: TNNetSafeTensorsReader; const BPrefix: string;
+  WinAttnLayers: array of TNNetLayer; LayersBase: integer;
+  const RelPosIndex, RegionId: TNeuralIntegerArray;
+  NumWindows, NumHeads, WindowSize: integer);
+var
+  Mlp0W, Mlp0B, Mlp2W, LogitRaw: TNNetVolume;
+  Hidden, NumCoords, ws2, c, hdn, h, i, j, idx, wIdx, ci, cy, cx: integer;
+  coord0, coord1, acc, biasVal, denom, logScale, clampMax: TNeuralFloat;
+  Coord: array[0..1] of TNeuralFloat;
+  HiddenAct: TNNetVolume;     // ReLU(MLP0) for one coord, length Hidden
+  BiasTable: TNNetVolume;     // [NumCoords, NumHeads] = 16*sigmoid(cpb_mlp(coords))
+  Mat: TNNetVolume;
+  qReg, kReg, RegBase: integer;
+  side, sideM1: integer;
+begin
+  ws2 := WindowSize * WindowSize;
+  side := 2 * WindowSize - 1;
+  sideM1 := side - 1;
+  NumCoords := side * side;
+  Mlp0W := TNNetVolume.Create;   // [Hidden, 2]
+  Mlp0B := TNNetVolume.Create;   // [Hidden]
+  Mlp2W := TNNetVolume.Create;   // [NumHeads, Hidden]
+  LogitRaw := TNNetVolume.Create;// [NumHeads, 1, 1]
+  HiddenAct := TNNetVolume.Create;
+  BiasTable := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(BPrefix +
+      'attention.self.continuous_position_bias_mlp.0.weight', Mlp0W);
+    Reader.LoadTensorFlat(BPrefix +
+      'attention.self.continuous_position_bias_mlp.0.bias', Mlp0B);
+    Reader.LoadTensorFlat(BPrefix +
+      'attention.self.continuous_position_bias_mlp.2.weight', Mlp2W);
+    Reader.LoadTensorFlat(BPrefix + 'attention.self.logit_scale', LogitRaw);
+    Hidden := Mlp0B.Size;        // 512 in HF
+    HiddenAct.ReSize(Hidden, 1, 1);
+    BiasTable.ReSize(NumCoords, 1, NumHeads);
+
+    // ---- HF get_relative_coords_table (log-spaced, normalized to [-8,8]) ----
+    // coords run dy,dx in [-(ws-1) .. ws-1]; normalized by (ws-1), *8, then
+    // sign(x)*log2(|x|+1)/log2(8). Row-major over (dy outer, dx inner) matches
+    // relative_position_index = dy*(2*ws-1)+dx built by SwinBuildWindowLayout.
+    if WindowSize > 1 then denom := WindowSize - 1 else denom := 1;
+    for cy := 0 to sideM1 do
+      for cx := 0 to sideM1 do
+      begin
+        c := cy * side + cx;
+        // raw relative coordinate value, normalized + log-spaced
+        coord0 := (cy - (WindowSize - 1));
+        coord1 := (cx - (WindowSize - 1));
+        if WindowSize > 1 then
+        begin
+          coord0 := coord0 / denom;
+          coord1 := coord1 / denom;
+        end;
+        coord0 := coord0 * 8;
+        coord1 := coord1 * 8;
+        if coord0 >= 0 then
+          Coord[0] := Ln(Abs(coord0) + 1.0) / Ln(8.0)
+        else
+          Coord[0] := -Ln(Abs(coord0) + 1.0) / Ln(8.0);
+        if coord1 >= 0 then
+          Coord[1] := Ln(Abs(coord1) + 1.0) / Ln(8.0)
+        else
+          Coord[1] := -Ln(Abs(coord1) + 1.0) / Ln(8.0);
+        // MLP layer 0: Linear(2 -> Hidden) + bias, then ReLU
+        for hdn := 0 to Hidden - 1 do
+        begin
+          acc := Mlp0B.FData[hdn] +
+            Mlp0W.FData[hdn * 2 + 0] * Coord[0] +
+            Mlp0W.FData[hdn * 2 + 1] * Coord[1];
+          if acc < 0 then acc := 0;
+          HiddenAct.FData[hdn] := acc;
+        end;
+        // MLP layer 2: Linear(Hidden -> NumHeads), no bias; then 16*sigmoid.
+        for h := 0 to NumHeads - 1 do
+        begin
+          acc := 0;
+          for hdn := 0 to Hidden - 1 do
+            acc := acc + Mlp2W.FData[h * Hidden + hdn] * HiddenAct.FData[hdn];
+          biasVal := 16.0 / (1.0 + Exp(-acc));
+          BiasTable.FData[c * NumHeads + h] := biasVal;
+        end;
+      end;
+
+    // ---- per (window, head): gather bias by RelPosIndex, add shift mask ----
+    clampMax := Ln(1.0 / 0.01); // HF: clamp(logit_scale, max=log(1/0.01))
+    Mat := TNNetVolume.Create(ws2 * ws2, 1, 1);
+    try
+      for wIdx := 0 to NumWindows - 1 do
+      begin
+        RegBase := wIdx * ws2;
+        for h := 0 to NumHeads - 1 do
+        begin
+          for i := 0 to ws2 - 1 do
+            for j := 0 to ws2 - 1 do
+            begin
+              idx := RelPosIndex[i * ws2 + j];
+              biasVal := BiasTable.FData[idx * NumHeads + h];
+              qReg := RegionId[RegBase + i];
+              kReg := RegionId[RegBase + j];
+              if qReg <> kReg then biasVal := biasVal - 1e9;
+              Mat.FData[i * ws2 + j] := biasVal;
+            end;
+          ci := LayersBase + wIdx * NumHeads + h;
+          TNNetSwinV2WindowAttention(WinAttnLayers[ci]).SetBiasMatrix(Mat);
+          // per-head clamped exp(logit_scale)
+          logScale := LogitRaw.FData[h];
+          if logScale > clampMax then logScale := clampMax;
+          TNNetSwinV2WindowAttention(WinAttnLayers[ci]).SetLogitScale(
+            Exp(logScale));
+        end;
+      end;
+    finally
+      Mat.Free;
+    end;
+  finally
+    Mlp0W.Free; Mlp0B.Free; Mlp2W.Free; LogitRaw.Free;
+    HiddenAct.Free; BiasTable.Free;
+  end;
+end;
+
+function BuildSwinV2FromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TSwinConfig; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  PatchConv, EmbNorm, FinalNorm, Classifier, Pooled, GridMap: TNNetLayer;
+  StageIn: TNNetLayer;
+  NumStages, StageIdx, BlockIdx, Grid, Dim, Heads, HeadDim, ws, NumWindows: integer;
+  ShiftSize, EffWindow, EffShift: integer;
+  Shifted: boolean;
+  ws2, h, wIdx, ci, NumTokens, MlpHidden: integer;
+  Prefix, BPrefix: string;
+  TokenPerm, InvPerm, RelPosIndex, RegionId, Channels: TNeuralIntegerArray;
+  ShortcutA, NormBefore, WinSlice, QProj, KProj, VProj: TNNetLayer;
+  QSlice, KSlice, VSlice, QKV, HeadAttn, AttnConcat, OProj: TNNetLayer;
+  WindowOuts: array of TNNetLayer;
+  HeadOuts: array of TNNetLayer;
+  WinAttnLayers: array of TNNetLayer;
+  AllWindowConcat, ReorderBack, NormBeforeOut, AttnResidual: TNNetLayer;
+  NormAfter, Fc1, Fc2, MlpResidual: TNNetLayer;
+  MergeNorm, MergeReduce: TNNetLayer;
+  MergePerm: TNeuralIntegerArray;
+  gy, gx, ny, nx, half: integer;
+  PatchGrid, LayersBase: integer;
+  NumStagesM1, HeadsM1, HeadDimM1, NumWindowsM1, halfM1: integer;
+begin
+  NumStages := Length(Config.Depths);
+  NumStagesM1 := NumStages - 1;
+  if (Config.EmbedDim < 1) or (Config.NumHeads[0] < 1) or
+     ((Config.EmbedDim mod Config.NumHeads[0]) <> 0) then
+    ImportError('SwinV2 import: embed_dim=' + IntToStr(Config.EmbedDim) +
+      ' must be divisible by num_heads[0].');
+  if (Config.PatchSize < 1) or ((Config.ImageSize mod Config.PatchSize) <> 0) then
+    ImportError('SwinV2 import: image_size not a multiple of patch_size.');
+  PatchGrid := Config.ImageSize div Config.PatchSize;
+  ws := Config.WindowSize;
+  NN := TNNet.Create();
+  SetLength(WinAttnLayers, 0);
+  try
+    // ---------------- Patch embedding ----------------
+    NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels) );
+    PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      Config.EmbedDim, Config.PatchSize, 0, Config.PatchSize, 0).SetTrainable(pTrainable) );
+    NN.AddLayer( TNNetReshape.Create(PatchGrid * PatchGrid, 1, Config.EmbedDim) );
+    EmbNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+    StageIn := EmbNorm;
+    Grid := PatchGrid;
+    Dim := Config.EmbedDim;
+
+    // ---------------- Stages ----------------
+    for StageIdx := 0 to NumStagesM1 do
+    begin
+      Heads := Config.NumHeads[StageIdx];
+      HeadDim := Dim div Heads;
+      HeadsM1 := Heads - 1;
+      HeadDimM1 := HeadDim - 1;
+      if Grid <= ws then
+      begin
+        EffWindow := Grid;
+        ShiftSize := 0;
+      end
+      else
+      begin
+        EffWindow := ws;
+        ShiftSize := ws div 2;
+      end;
+      ws2 := EffWindow * EffWindow;
+      Prefix := 'encoder.layers.' + IntToStr(StageIdx) + '.';
+      for BlockIdx := 0 to Config.Depths[StageIdx] - 1 do
+      begin
+        Shifted := (Odd(BlockIdx)) and (ShiftSize > 0);
+        if Shifted then EffShift := ShiftSize else EffShift := 0;
+        BPrefix := Prefix + 'blocks.' + IntToStr(BlockIdx) + '.';
+        SwinBuildWindowLayout(Grid, EffWindow, EffShift, Shifted,
+          TokenPerm, InvPerm, RelPosIndex, RegionId, NumWindows);
+        NumWindowsM1 := NumWindows - 1;
+
+        ShortcutA := StageIn;
+        // SwinV2 attention is over the RAW tokens (post-norm: the layernorm is
+        // applied to the attention OUTPUT, not the input). So no pre-LN here.
+        // Reorder tokens into window-contiguous (and shifted) order.
+        ReorderBack := NN.AddLayerAfter( TNNetGatherTokens.Create(TokenPerm), StageIn);
+        LayersBase := Length(WinAttnLayers);
+        SetLength(WindowOuts, NumWindows);
+        for wIdx := 0 to NumWindowsM1 do
+        begin
+          WinSlice := NN.AddLayerAfter( TNNetCrop.Create(wIdx * ws2, 0, ws2, 1), ReorderBack );
+          QProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim).SetTrainable(pTrainable), WinSlice );
+          KProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim).SetTrainable(pTrainable), WinSlice);
+          VProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim).SetTrainable(pTrainable), WinSlice);
+          SetLength(HeadOuts, Heads);
+          SetLength(Channels, HeadDim);
+          for h := 0 to HeadsM1 do
+          begin
+            for ci := 0 to HeadDimM1 do Channels[ci] := h * HeadDim + ci;
+            QSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), QProj);
+            KSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), KProj);
+            VSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), VProj);
+            QKV := NN.AddLayer( TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
+            HeadAttn := NN.AddLayer( TNNetSwinV2WindowAttention.Create(HeadDim, ws2) );
+            SetLength(WinAttnLayers, Length(WinAttnLayers) + 1);
+            WinAttnLayers[High(WinAttnLayers)] := HeadAttn;
+            HeadOuts[h] := HeadAttn;
+          end;
+          AttnConcat := NN.AddLayer( TNNetDeepConcat.Create(HeadOuts) );
+          OProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).SetTrainable(pTrainable) );
+          WindowOuts[wIdx] := OProj;
+          // SwinV2 q/v have bias, k has NO bias. o_proj (attention.output.dense)
+          // has bias.
+          LoadLlamaLinearWeights(Reader, QProj, BPrefix + 'attention.self.query.weight',
+            Dim, Dim, 0, -1, 0, BPrefix + 'attention.self.query.bias');
+          LoadLlamaLinearWeights(Reader, KProj, BPrefix + 'attention.self.key.weight',
+            Dim, Dim, 0, -1, 0, '');
+          LoadLlamaLinearWeights(Reader, VProj, BPrefix + 'attention.self.value.weight',
+            Dim, Dim, 0, -1, 0, BPrefix + 'attention.self.value.bias');
+          LoadLlamaLinearWeights(Reader, OProj, BPrefix + 'attention.output.dense.weight',
+            Dim, Dim, 0, -1, 0, BPrefix + 'attention.output.dense.bias');
+        end;
+        AllWindowConcat := NN.AddLayer(
+          TNNetConcat.Create(NumWindows * ws2, 1, Dim, WindowOuts) );
+        ReorderBack := NN.AddLayer( TNNetGatherTokens.Create(InvPerm) );
+        // POST-NORM: layernorm_before is applied to the attention output, THEN
+        // the residual is added (HF: shortcut + LN_before(attn)).
+        NormBefore := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+        NormBeforeOut := NormBefore;
+        AttnResidual := NN.AddLayer( TNNetSum.Create([NormBeforeOut, ShortcutA]) );
+
+        // --- MLP (post-norm: hidden + LN_after(MLP(hidden))) ---
+        MlpHidden := Round(Dim * Config.MlpRatio);
+        Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden).SetTrainable(pTrainable) );
+        NN.AddLayer( TNNetGELU.Create() );
+        Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim).SetTrainable(pTrainable) );
+        NormAfter := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+        MlpResidual := NN.AddLayer( TNNetSum.Create([NormAfter, AttnResidual]) );
+        StageIn := MlpResidual;
+
+        // continuous-position bias + per-head logit_scale for this block
+        SwinV2SetContinuousPositionBias(Reader, BPrefix, WinAttnLayers,
+          LayersBase, RelPosIndex, RegionId, NumWindows, Heads, EffWindow);
+
+        // layernorms + mlp
+        LoadLayerNormWeights(Reader, NormBefore,
+          BPrefix + 'layernorm_before.weight', BPrefix + 'layernorm_before.bias', Dim);
+        LoadLayerNormWeights(Reader, NormAfter,
+          BPrefix + 'layernorm_after.weight', BPrefix + 'layernorm_after.bias', Dim);
+        LoadLlamaLinearWeights(Reader, Fc1, BPrefix + 'intermediate.dense.weight',
+          Dim, MlpHidden, 0, -1, 0, BPrefix + 'intermediate.dense.bias');
+        LoadLlamaLinearWeights(Reader, Fc2, BPrefix + 'output.dense.weight',
+          MlpHidden, Dim, 0, -1, 0, BPrefix + 'output.dense.bias');
+      end;
+
+      // ---------------- Patch merging (between stages) ----------------
+      if StageIdx < NumStages - 1 then
+      begin
+        half := Grid div 2;
+        halfM1 := half - 1;
+        // HF cat order: [0::2,0::2],[1::2,0::2],[0::2,1::2],[1::2,1::2].
+        SetLength(MergePerm, Grid * Grid);
+        ci := 0;
+        for ny := 0 to halfM1 do
+          for nx := 0 to halfM1 do
+          begin
+            gy := 2 * ny;     gx := 2 * nx;     MergePerm[ci] := gy * Grid + gx; Inc(ci);
+            gy := 2 * ny + 1; gx := 2 * nx;     MergePerm[ci] := gy * Grid + gx; Inc(ci);
+            gy := 2 * ny;     gx := 2 * nx + 1; MergePerm[ci] := gy * Grid + gx; Inc(ci);
+            gy := 2 * ny + 1; gx := 2 * nx + 1; MergePerm[ci] := gy * Grid + gx; Inc(ci);
+          end;
+        NN.AddLayer( TNNetGatherTokens.Create(MergePerm) );
+        NN.AddLayer( TNNetReshape.Create(half * half, 1, 4 * Dim) );
+        // SwinV2: reduction (4*Dim -> 2*Dim, no bias) THEN norm(2*Dim).
+        MergeReduce := NN.AddLayer( TNNetPointwiseConvLinear.Create(2 * Dim).SetTrainable(pTrainable) );
+        MergeNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+        LoadLlamaLinearWeights(Reader, MergeReduce,
+          Prefix + 'downsample.reduction.weight', 4 * Dim, 2 * Dim);
+        LoadLayerNormWeights(Reader, MergeNorm,
+          Prefix + 'downsample.norm.weight', Prefix + 'downsample.norm.bias', 2 * Dim);
+        StageIn := MergeNorm;
+        Grid := half;
+        Dim := 2 * Dim;
+      end;
+    end;
+
+    // ---------------- Head ----------------
+    FinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+    NumTokens := Grid * Grid;
+    GridMap := NN.AddLayer( TNNetReshape.Create(Grid, Grid, Dim) );
+    Pooled := NN.AddLayer( TNNetAvgChannel.Create() );
+    Classifier := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels).SetTrainable(pTrainable) );
+    LoadLayerNormWeights(Reader, FinalNorm,
+      'layernorm.weight', 'layernorm.bias', Dim);
+    LoadLlamaLinearWeights(Reader, Classifier, 'classifier.weight',
+      Dim, Config.NumLabels, 0, -1, 0, 'classifier.bias');
+
+    LoadClipPatchConv(Reader, PatchConv,
+      'embeddings.patch_embeddings.projection.weight',
+      Config.NumChannels, Config.PatchSize, Config.EmbedDim);
+    LoadSwinPatchConvBias(Reader, PatchConv,
+      'embeddings.patch_embeddings.projection.bias', Config.EmbedDim);
+    LoadLayerNormWeights(Reader, EmbNorm,
+      'embeddings.norm.weight', 'embeddings.norm.bias', Config.EmbedDim);
+
+    if not pTrainable then NN.SetTrainable();
+    if (GridMap = nil) or (Pooled = nil) or (NumTokens < 0) or
+       (AllWindowConcat = nil) or (ReorderBack = nil) or (QKV = nil) or
+       (AttnConcat = nil) then ; // silence unused
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildSwinV2FromSafeTensorsEx(const FileName: string;
+  const Config: TSwinConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildSwinV2FromSafeTensors(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildSwinV2FromSafeTensors(const FileName: string;
+  out Config: TSwinConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadSwinV2ConfigFromJSONFile(ConfigPath);
+  Result := BuildSwinV2FromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================

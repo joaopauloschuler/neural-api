@@ -1390,7 +1390,7 @@ rather than acted on.
       ImageToImage/Inpainting example stubs. Pico parity: VAE-encode round-trip <
       1e-4 vs a float64 HF AutoencoderKL.encode, and a fixed-seed img2img latent
       trajectory matching diffusers `StableDiffusionImg2ImgPipeline` step-for-step.
-- [ ] Swin Transformer V2 backbone importer (BuildSwinV2FromSafeTensors[Ex],
+- [X] Swin Transformer V2 backbone importer (BuildSwinV2FromSafeTensors[Ex],
       model_type "swinv2", e.g. microsoft/swinv2-tiny-patch4-window8-256). DISTINCT
       from the landed Swin / SwinIR window-attention blocks, which use additive
       learned relative-position-bias tables and plain scaled-dot-product: SwinV2
