@@ -8893,6 +8893,60 @@ function BuildEfficientNetFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// MOBILEVIT IMPORT (transformers model_type "mobilevit", e.g.
+// apple/mobilevit-small, apple/mobilevit-x-small). Hybrid CNN + transformer:
+// a MobileNetV2-style inverted-residual conv backbone interleaved with three
+// "MobileViT blocks" (local conv -> unfold to 2x2-patch sequences -> L
+// transformer layers -> fold -> fusion conv). Builder is mostly WIRING over
+// shipped layers: TNNetConvolutionLinear (+folded BN bias) for the convs,
+// TNNetDepthwiseConvLinear (+TNNetChannelBias) for depthwise, the new
+// TNNetMobileViTUnfold/Fold leaves for the patch (un)folding, and the SDPA
+// segment side channel (TNNetMobileViTPatchSegments) for MobileViT's per-
+// sub-position block-diagonal attention. Five encoder stages (the fixed
+// mobilevit topology); the three transformer stages carry 2/4/3 layers.
+// ---------------------------------------------------------------------------
+type
+  TMobileViTConfig = record
+    ImageSize: integer;       // image_size (256 canonical)
+    NumChannels: integer;     // num_channels (3)
+    PatchSize: integer;       // patch_size (2)
+    NumLabels: integer;       // num_labels (1000 ImageNet-1k)
+    NumHeads: integer;        // num_attention_heads (4)
+    MlpRatio: TNeuralFloat;   // mlp_ratio (2.0)
+    ExpandRatio: TNeuralFloat;// expand_ratio (4.0)
+    ConvKernel: integer;      // conv_kernel_size (3)
+    LayerNormEps: TNeuralFloat; // layer_norm_eps (1e-5)
+    BnEps: TNeuralFloat;      // BatchNorm2d eps (hardcoded 1e-5 in HF)
+    QkvBias: boolean;         // qkv_bias (true)
+    HiddenSizes: array[0..2] of integer;   // hidden_sizes [144,192,240]
+    NeckHiddenSizes: array[0..6] of integer; // neck_hidden_sizes [16..640]
+    TransformerLayers: array[0..2] of integer; // L per MobileViT stage [2,4,3]
+    ModelType: string;
+  end;
+
+// Reads a transformers MobileViT config.json. Optional overrides for every
+// field above; the stage topology (num_stages per encoder layer) and the
+// per-transformer-layer counts come from the canonical mobilevit family.
+function ReadMobileViTConfigFromJSONFile(
+  const FileName: string): TMobileViTConfig;
+
+function MobileViTConfigToString(const Config: TMobileViTConfig): string;
+
+// Builds the MobileViT described by Config and loads every weight from Reader
+// (caller owns Reader), folding each BatchNorm into its conv. The net takes an
+// (ImageSize, ImageSize, NumChannels) ImageNet-normalized RGB volume and
+// outputs (1, 1, NumLabels) class logits.
+function BuildMobileViT(Reader: TNNetSafeTensorsReader;
+  const Config: TMobileViTConfig; pTrainable: boolean = true): TNNet;
+
+function BuildMobileViTFromSafeTensorsEx(const FileName: string;
+  const Config: TMobileViTConfig; pTrainable: boolean = true): TNNet;
+
+function BuildMobileViTFromSafeTensors(const FileName: string;
+  out Config: TMobileViTConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+
+// ---------------------------------------------------------------------------
 // INCEPTION-V3 IMPORT (torchvision "inception_v3"). Structurally distinct from
 // every other landed CNN: the body is a stack of parallel MULTI-BRANCH
 // Inception modules whose branch outputs are concatenated on the CHANNEL
@@ -57836,6 +57890,471 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadEfficientNetConfigFromJSONFile(ConfigPath);
   Result := BuildEfficientNetFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+// ===========================================================================
+// MOBILEVIT IMPORT
+// ===========================================================================
+
+// HF make_divisible(value, divisor=8): rounds channel counts to a multiple of
+// the divisor (the MobileNetV2 expansion-width rule). Replicated exactly.
+function MobileViTMakeDivisible(Value: TNeuralFloat; Divisor: integer): integer;
+var
+  NewValue: integer;
+begin
+  NewValue := (Trunc(Value + Divisor / 2) div Divisor) * Divisor;
+  if NewValue < Divisor then NewValue := Divisor;
+  if NewValue < 0.9 * Value then Inc(NewValue, Divisor);
+  Result := NewValue;
+end;
+
+function ReadMobileViTConfigFromJSONFile(
+  const FileName: string): TMobileViTConfig;
+var
+  JsonText: TStringList;
+  Root, Arr, LabelObj: TJSONData;
+  Obj: TJSONObject;
+  i: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('MobileViT import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('MobileViT import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('MobileViT import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'mobilevit');
+    Result.ImageSize := Obj.Get('image_size', 256);
+    Result.NumChannels := Obj.Get('num_channels', 3);
+    Result.PatchSize := Obj.Get('patch_size', 2);
+    Result.NumHeads := Obj.Get('num_attention_heads', 4);
+    Result.MlpRatio := Obj.Get('mlp_ratio', 2.0);
+    Result.ExpandRatio := Obj.Get('expand_ratio', 4.0);
+    Result.ConvKernel := Obj.Get('conv_kernel_size', 3);
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1e-5);
+    Result.BnEps := Obj.Get('bn_eps', 1e-5); // HF hardcodes BatchNorm2d eps=1e-5
+    Result.QkvBias := Obj.Get('qkv_bias', true);
+    // hidden_sizes (3) and neck_hidden_sizes (7). Defaults = mobilevit-small.
+    Result.HiddenSizes[0] := 144; Result.HiddenSizes[1] := 192;
+    Result.HiddenSizes[2] := 240;
+    Arr := Obj.Find('hidden_sizes');
+    if (Arr <> nil) and (Arr is TJSONArray) then
+    begin
+      if TJSONArray(Arr).Count <> 3 then
+        ImportError('MobileViT import: hidden_sizes must have 3 entries.');
+      for i := 0 to 2 do
+        Result.HiddenSizes[i] := TJSONArray(Arr).Integers[i];
+    end;
+    Result.NeckHiddenSizes[0] := 16;  Result.NeckHiddenSizes[1] := 32;
+    Result.NeckHiddenSizes[2] := 64;  Result.NeckHiddenSizes[3] := 96;
+    Result.NeckHiddenSizes[4] := 128; Result.NeckHiddenSizes[5] := 160;
+    Result.NeckHiddenSizes[6] := 640;
+    Arr := Obj.Find('neck_hidden_sizes');
+    if (Arr <> nil) and (Arr is TJSONArray) then
+    begin
+      if TJSONArray(Arr).Count <> 7 then
+        ImportError('MobileViT import: neck_hidden_sizes must have 7 entries.');
+      for i := 0 to 6 do
+        Result.NeckHiddenSizes[i] := TJSONArray(Arr).Integers[i];
+    end;
+    // Fixed mobilevit transformer-layer counts per MobileViT stage.
+    Result.TransformerLayers[0] := 2;
+    Result.TransformerLayers[1] := 4;
+    Result.TransformerLayers[2] := 3;
+    Arr := Obj.Find('transformer_layers');
+    if (Arr <> nil) and (Arr is TJSONArray) then
+    begin
+      if TJSONArray(Arr).Count <> 3 then
+        ImportError('MobileViT import: transformer_layers must have 3 entries.');
+      for i := 0 to 2 do
+        Result.TransformerLayers[i] := TJSONArray(Arr).Integers[i];
+    end;
+    Result.NumLabels := 0;
+    if Obj.IndexOfName('num_labels') >= 0 then
+      Result.NumLabels := Obj.Get('num_labels', 0);
+    if Result.NumLabels <= 0 then
+    begin
+      LabelObj := Obj.Find('id2label');
+      if (LabelObj <> nil) and (LabelObj is TJSONObject) then
+        Result.NumLabels := TJSONObject(LabelObj).Count;
+    end;
+    if Result.NumLabels <= 0 then Result.NumLabels := 1000;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function MobileViTConfigToString(const Config: TMobileViTConfig): string;
+begin
+  Result := 'mobilevit config: image=' + IntToStr(Config.ImageSize) +
+    ', patch=' + IntToStr(Config.PatchSize) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', hidden_sizes=[' + IntToStr(Config.HiddenSizes[0]) + ',' +
+    IntToStr(Config.HiddenSizes[1]) + ',' + IntToStr(Config.HiddenSizes[2]) +
+    '], neck[0/6]=' + IntToStr(Config.NeckHiddenSizes[0]) + '/' +
+    IntToStr(Config.NeckHiddenSizes[6]) +
+    ', L=[' + IntToStr(Config.TransformerLayers[0]) + ',' +
+    IntToStr(Config.TransformerLayers[1]) + ',' +
+    IntToStr(Config.TransformerLayers[2]) + ']' +
+    ', num_labels=' + IntToStr(Config.NumLabels);
+end;
+
+type
+  // Layer refs for one MobileViTConvLayer (conv + optional folded BN). A
+  // depthwise conv additionally carries a TNNetChannelBias for the BN shift.
+  TMobViTConvRefs = record
+    Conv: TNNetLayer;       // TNNetConvolutionLinear or TNNetDepthwiseConvLinear
+    DwBias: TNNetLayer;     // TNNetChannelBias when depthwise; nil otherwise
+    OutCh, InCh, K: integer;
+    Depthwise, HasBN: boolean;
+  end;
+
+  TMobViTInvResRefs = record
+    Expand, Dw, DwBias, Reduce: TMobViTConvRefs;
+    HasExpand, HasResidual: boolean;
+  end;
+
+  TMobViTTxLayerRefs = record
+    LN1, QKV, AttnOut, LN2, Inter, OutDense: TNNetLayer;
+  end;
+
+// Adds a MobileViTConvLayer: TNNetConvolutionLinear (BN folded into bias) and
+// optionally a SiLU activation. Depthwise convs use TNNetDepthwiseConvLinear +
+// TNNetChannelBias (the BN shift cannot fold into a depthwise conv's bias).
+procedure AddMobViTConv(NN: TNNet; OutCh, InCh, K, Stride: integer;
+  Depthwise, UseBN, UseAct: boolean; pTrainable: boolean;
+  out Refs: TMobViTConvRefs);
+var
+  Pad: integer;
+begin
+  FillChar(Refs, SizeOf(Refs), 0);
+  Refs.OutCh := OutCh; Refs.InCh := InCh; Refs.K := K;
+  Refs.Depthwise := Depthwise; Refs.HasBN := UseBN;
+  Pad := (K - 1) div 2;
+  if Depthwise then
+  begin
+    Refs.Conv := NN.AddLayer(
+      TNNetDepthwiseConvLinear.Create(1, K, Pad, Stride).SetTrainable(pTrainable));
+    Refs.DwBias := NN.AddLayer(TNNetChannelBias.Create().SetTrainable(pTrainable));
+  end
+  else
+    Refs.Conv := NN.AddLayer(
+      TNNetConvolutionLinear.Create(OutCh, K, Pad, Stride, 0).SetTrainable(pTrainable));
+  if UseAct then NN.AddLayer(TNNetSwish.Create());
+end;
+
+// Loads one MobileViTConvLayer's weights (folding BN when present).
+procedure LoadMobViTConv(Reader: TNNetSafeTensorsReader;
+  const Refs: TMobViTConvRefs; const Prefix: string; BnEps: TNeuralFloat);
+var
+  Shift: TNNetVolume;
+  BnName: string;
+begin
+  if Refs.HasBN then BnName := Prefix + '.normalization' else BnName := '';
+  if Refs.Depthwise then
+  begin
+    LoadMobileNetDepthwiseFoldBN(Reader, Refs.Conv,
+      Prefix + '.convolution.weight', BnName, Refs.OutCh, Refs.K, BnEps, Shift);
+    LoadChannelBiasFromShift(Refs.DwBias, Shift);
+  end
+  else
+    LoadResNetConvFoldBN(Reader, Refs.Conv, Prefix + '.convolution.weight',
+      BnName, Refs.OutCh, Refs.InCh, Refs.K, BnEps);
+end;
+
+// Adds one MobileViTInvertedResidual (expand 1x1 +BN+SiLU -> depthwise KxK
+// +BN+SiLU -> reduce 1x1 +BN NO act, + residual when stride==1 and in==out).
+procedure AddMobViTInvRes(NN: TNNet; const Config: TMobileViTConfig;
+  InCh, OutCh, Stride: integer; pTrainable: boolean;
+  out Refs: TMobViTInvResRefs);
+var
+  Input: TNNetLayer;
+  ExpCh: integer;
+begin
+  FillChar(Refs, SizeOf(Refs), 0);
+  ExpCh := MobileViTMakeDivisible(InCh * Config.ExpandRatio, 8);
+  Refs.HasExpand := ExpCh <> InCh;
+  Refs.HasResidual := (Stride = 1) and (InCh = OutCh);
+  Input := NN.GetLastLayer();
+  if Refs.HasExpand then
+    AddMobViTConv(NN, ExpCh, InCh, 1, 1, false, true, true, pTrainable, Refs.Expand)
+  else
+    Refs.Expand.Conv := nil;
+  AddMobViTConv(NN, ExpCh, ExpCh, Config.ConvKernel, Stride, true, true, true,
+    pTrainable, Refs.Dw);
+  AddMobViTConv(NN, OutCh, ExpCh, 1, 1, false, true, false, pTrainable, Refs.Reduce);
+  if Refs.HasResidual then
+    NN.AddLayer(TNNetSum.Create([NN.GetLastLayer(), Input]));
+end;
+
+procedure LoadMobViTInvRes(Reader: TNNetSafeTensorsReader;
+  const Refs: TMobViTInvResRefs; const Prefix: string; BnEps: TNeuralFloat);
+begin
+  if Refs.HasExpand then
+    LoadMobViTConv(Reader, Refs.Expand, Prefix + '.expand_1x1', BnEps);
+  LoadMobViTConv(Reader, Refs.Dw, Prefix + '.conv_3x3', BnEps);
+  LoadMobViTConv(Reader, Refs.Reduce, Prefix + '.reduce_1x1', BnEps);
+end;
+
+// Adds one MobileViT transformer layer (pre-LN: LN -> MHA (segment-masked) ->
+// residual -> LN -> FFN(fc1 SiLU fc2) -> residual). SegSrc carries the per-
+// sub-position block-diagonal segment ids.
+procedure AddMobViTTxLayer(NN: TNNet; const Config: TMobileViTConfig;
+  Hidden: integer; SegSrc: TNNetLayer; pTrainable: boolean;
+  out Refs: TMobViTTxLayerRefs; PrevOverride: TNNetLayer = nil);
+var
+  BranchInput: TNNetLayer;
+  Inter: integer;
+begin
+  Inter := Trunc(Hidden * Config.MlpRatio);
+  if Assigned(PrevOverride) then BranchInput := PrevOverride
+  else BranchInput := NN.GetLastLayer();
+  Refs.LN1 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable),
+    BranchInput);
+  Refs.QKV := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(3 * Hidden).SetTrainable(pTrainable));
+  Refs.AttnOut := NN.AddMultiHeadSelfAttention(Config.NumHeads, false, false,
+    avSDPA, 1, 0, 32, 128, false, SegSrc);
+  NN.AddLayer(TNNetSum.Create([NN.GetLastLayer(), BranchInput]));
+  BranchInput := NN.GetLastLayer();
+  Refs.LN2 := NN.AddLayer(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
+  Refs.Inter := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Inter).SetTrainable(pTrainable));
+  NN.AddLayer(TNNetSwish.Create());
+  Refs.OutDense := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable));
+  NN.AddLayer(TNNetSum.Create([NN.GetLastLayer(), BranchInput]));
+end;
+
+procedure LoadMobViTTxLayer(Reader: TNNetSafeTensorsReader;
+  const Refs: TMobViTTxLayerRefs; const Prefix: string; Hidden: integer;
+  const Config: TMobileViTConfig);
+var
+  d, Inter: integer;
+  QB, KB, VB: string;
+begin
+  d := Hidden;
+  Inter := Trunc(Hidden * Config.MlpRatio);
+  LoadLayerNormWeights(Reader, Refs.LN1,
+    Prefix + 'layernorm_before.weight', Prefix + 'layernorm_before.bias', d);
+  if Config.QkvBias then
+  begin
+    QB := Prefix + 'attention.attention.query.bias';
+    KB := Prefix + 'attention.attention.key.bias';
+    VB := Prefix + 'attention.attention.value.bias';
+  end
+  else begin QB := ''; KB := ''; VB := ''; end;
+  LoadLlamaLinearWeights(Reader, Refs.QKV,
+    Prefix + 'attention.attention.query.weight', d, d, 0, 3 * d, 0, QB);
+  LoadLlamaLinearWeights(Reader, Refs.QKV,
+    Prefix + 'attention.attention.key.weight', d, d, d, 3 * d, 0, KB);
+  LoadLlamaLinearWeights(Reader, Refs.QKV,
+    Prefix + 'attention.attention.value.weight', d, d, 2 * d, 3 * d, 0, VB);
+  LoadLlamaLinearWeights(Reader, Refs.AttnOut,
+    Prefix + 'attention.output.dense.weight', d, d, 0, -1, 0,
+    Prefix + 'attention.output.dense.bias');
+  LoadLayerNormWeights(Reader, Refs.LN2,
+    Prefix + 'layernorm_after.weight', Prefix + 'layernorm_after.bias', d);
+  LoadLlamaLinearWeights(Reader, Refs.Inter,
+    Prefix + 'intermediate.dense.weight', d, Inter, 0, -1, 0,
+    Prefix + 'intermediate.dense.bias');
+  LoadLlamaLinearWeights(Reader, Refs.OutDense,
+    Prefix + 'output.dense.weight', Inter, d, 0, -1, 0,
+    Prefix + 'output.dense.bias');
+end;
+
+type
+  TMobViTBlockRefs = record
+    Down: TMobViTInvResRefs;        // downsampling inverted residual (stride 2)
+    HasDown: boolean;
+    ConvKxK, Conv1x1, ConvProj, Fusion: TMobViTConvRefs;
+    Tx: array of TMobViTTxLayerRefs;
+    LN: TNNetLayer;                 // post-transformer LayerNorm
+    Hidden: integer;
+  end;
+
+// Adds one MobileViTLayer (the MobileViT block). Spatial size at entry is
+// (InSize x InSize); after the stride-2 downsample it is OutSize = InSize/2.
+procedure AddMobViTBlock(NN: TNNet; const Config: TMobileViTConfig;
+  InCh, OutCh, Hidden, NumTx, InSize: integer; pTrainable: boolean;
+  out Refs: TMobViTBlockRefs);
+var
+  Residual, SegSrc, UnfoldLayer: TNNetLayer;
+  OutSize, NumPatches, j: integer;
+begin
+  FillChar(Refs, SizeOf(Refs), 0);
+  Refs.Hidden := Hidden;
+  // Downsampling inverted residual (stride 2): InCh -> OutCh, halves spatial.
+  Refs.HasDown := true;
+  AddMobViTInvRes(NN, Config, InCh, OutCh, 2, pTrainable, Refs.Down);
+  // Use the ACTUAL post-downsample spatial size (CAI's strided-conv output
+  // formula, like HF's, can differ from a naive InSize div 2 on small maps).
+  OutSize := NN.GetLastLayer().Output.SizeX;
+  Residual := NN.GetLastLayer();  // post-downsample feature map (OutCh)
+  // Local representation: conv_kxk (OutCh, BN, SiLU) -> conv_1x1 (Hidden, NO BN/act).
+  AddMobViTConv(NN, OutCh, OutCh, Config.ConvKernel, 1, false, true, true,
+    pTrainable, Refs.ConvKxK);
+  AddMobViTConv(NN, Hidden, OutCh, 1, 1, false, false, false,
+    pTrainable, Refs.Conv1x1);
+  // Unfold (OutSize x OutSize x Hidden) -> (num_patches*patch_area, 1, Hidden).
+  NumPatches := (OutSize div Config.PatchSize) * (OutSize div Config.PatchSize);
+  UnfoldLayer := NN.AddLayer(TNNetMobileViTUnfold.Create(Config.PatchSize));
+  // Block-diagonal segment ids (one per intra-cell sub-position).
+  SegSrc := NN.AddLayerAfter(
+    TNNetMobileViTPatchSegments.Create(NumPatches), UnfoldLayer);
+  SetLength(Refs.Tx, NumTx);
+  // First tx layer re-anchors the main chain to the unfold output (the seg
+  // layer was the last-added but is a side branch, not on the main path).
+  for j := 0 to NumTx - 1 do
+    if j = 0 then
+      AddMobViTTxLayer(NN, Config, Hidden, SegSrc, pTrainable, Refs.Tx[j],
+        UnfoldLayer)
+    else
+      AddMobViTTxLayer(NN, Config, Hidden, SegSrc, pTrainable, Refs.Tx[j]);
+  Refs.LN := NN.AddLayer(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable));
+  // Fold back to (OutSize x OutSize x Hidden).
+  NN.AddLayer(TNNetMobileViTFold.Create(Config.PatchSize, OutSize, OutSize));
+  // conv_projection 1x1 (OutCh, BN, SiLU).
+  AddMobViTConv(NN, OutCh, Hidden, 1, 1, false, true, true, pTrainable,
+    Refs.ConvProj);
+  // Fusion: concat(residual, projected) along depth -> conv_kxk (OutCh, BN, SiLU).
+  NN.AddLayer(TNNetDeepConcat.Create([Residual, NN.GetLastLayer()]));
+  AddMobViTConv(NN, OutCh, 2 * OutCh, Config.ConvKernel, 1, false, true, true,
+    pTrainable, Refs.Fusion);
+end;
+
+procedure LoadMobViTBlock(Reader: TNNetSafeTensorsReader;
+  const Refs: TMobViTBlockRefs; const Prefix: string;
+  const Config: TMobileViTConfig);
+var
+  j: integer;
+begin
+  if Refs.HasDown then
+    LoadMobViTInvRes(Reader, Refs.Down, Prefix + 'downsampling_layer', Config.BnEps);
+  LoadMobViTConv(Reader, Refs.ConvKxK, Prefix + 'conv_kxk', Config.BnEps);
+  LoadMobViTConv(Reader, Refs.Conv1x1, Prefix + 'conv_1x1', Config.BnEps);
+  for j := 0 to Length(Refs.Tx) - 1 do
+    LoadMobViTTxLayer(Reader, Refs.Tx[j],
+      Prefix + 'transformer.layer.' + IntToStr(j) + '.', Refs.Hidden, Config);
+  LoadLayerNormWeights(Reader, Refs.LN,
+    Prefix + 'layernorm.weight', Prefix + 'layernorm.bias', Refs.Hidden);
+  LoadMobViTConv(Reader, Refs.ConvProj, Prefix + 'conv_projection', Config.BnEps);
+  LoadMobViTConv(Reader, Refs.Fusion, Prefix + 'fusion', Config.BnEps);
+end;
+
+function BuildMobileViT(Reader: TNNetSafeTensorsReader;
+  const Config: TMobileViTConfig; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  Stem: TMobViTConvRefs;
+  ConvExp: TMobViTConvRefs;
+  L0: TMobViTInvResRefs;
+  L1: array[0..2] of TMobViTInvResRefs;
+  Blocks: array[0..2] of TMobViTBlockRefs;
+  FC: TNNetLayer;
+  Size, j: integer;
+  Pfx: string;
+begin
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer(TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels));
+    Size := Config.ImageSize;
+    // conv_stem: 3x3 stride2 -> neck[0], BN, SiLU.
+    AddMobViTConv(NN, Config.NeckHiddenSizes[0], Config.NumChannels,
+      Config.ConvKernel, 2, false, true, true, pTrainable, Stem);
+    Size := Size div 2;
+    // encoder.layer.0: MobileNet, neck[0]->neck[1], stride1, 1 inverted residual.
+    AddMobViTInvRes(NN, Config, Config.NeckHiddenSizes[0],
+      Config.NeckHiddenSizes[1], 1, pTrainable, L0);
+    // encoder.layer.1: MobileNet, neck[1]->neck[2], 3 inverted residuals (first s2).
+    AddMobViTInvRes(NN, Config, Config.NeckHiddenSizes[1],
+      Config.NeckHiddenSizes[2], 2, pTrainable, L1[0]);
+    Size := Size div 2;
+    for j := 1 to 2 do
+      AddMobViTInvRes(NN, Config, Config.NeckHiddenSizes[2],
+        Config.NeckHiddenSizes[2], 1, pTrainable, L1[j]);
+    // encoder.layer.2..4: MobileViT blocks (each stride2 downsample inside).
+    AddMobViTBlock(NN, Config, Config.NeckHiddenSizes[2],
+      Config.NeckHiddenSizes[3], Config.HiddenSizes[0],
+      Config.TransformerLayers[0], Size, pTrainable, Blocks[0]);
+    Size := Size div 2;
+    AddMobViTBlock(NN, Config, Config.NeckHiddenSizes[3],
+      Config.NeckHiddenSizes[4], Config.HiddenSizes[1],
+      Config.TransformerLayers[1], Size, pTrainable, Blocks[1]);
+    Size := Size div 2;
+    AddMobViTBlock(NN, Config, Config.NeckHiddenSizes[4],
+      Config.NeckHiddenSizes[5], Config.HiddenSizes[2],
+      Config.TransformerLayers[2], Size, pTrainable, Blocks[2]);
+    Size := Size div 2;
+    // conv_1x1_exp: neck[5]->neck[6], 1x1, BN, SiLU.
+    AddMobViTConv(NN, Config.NeckHiddenSizes[6], Config.NeckHiddenSizes[5],
+      1, 1, false, true, true, pTrainable, ConvExp);
+    // global average pool over (H,W) -> (1,1,neck[6]) -> classifier.
+    NN.AddLayer(TNNetAvgChannel.Create());
+    FC := NN.AddLayer(
+      TNNetFullConnectLinear.Create(Config.NumLabels).SetTrainable(pTrainable));
+    if not pTrainable then NN.SetTrainable();
+
+    // ---------------- Weights ----------------
+    LoadMobViTConv(Reader, Stem, 'mobilevit.conv_stem', Config.BnEps);
+    LoadMobViTInvRes(Reader, L0, 'mobilevit.encoder.layer.0.layer.0', Config.BnEps);
+    for j := 0 to 2 do
+      LoadMobViTInvRes(Reader, L1[j],
+        'mobilevit.encoder.layer.1.layer.' + IntToStr(j), Config.BnEps);
+    for j := 0 to 2 do
+    begin
+      Pfx := 'mobilevit.encoder.layer.' + IntToStr(j + 2) + '.';
+      LoadMobViTBlock(Reader, Blocks[j], Pfx, Config);
+    end;
+    LoadMobViTConv(Reader, ConvExp, 'mobilevit.conv_1x1_exp', Config.BnEps);
+    LoadLlamaLinearWeights(Reader, FC, 'classifier.weight',
+      Config.NeckHiddenSizes[6], Config.NumLabels, 0, -1, 0, 'classifier.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildMobileViTFromSafeTensorsEx(const FileName: string;
+  const Config: TMobileViTConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildMobileViT(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildMobileViTFromSafeTensors(const FileName: string;
+  out Config: TMobileViTConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadMobileViTConfigFromJSONFile(ConfigPath);
+  Result := BuildMobileViTFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================

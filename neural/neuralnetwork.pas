@@ -9074,6 +9074,65 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Parameter-free MobileViT patch UNFOLD layer (Mehta & Rastegari 2021,
+  // "MobileViT", https://arxiv.org/abs/2110.02178). Reproduces exactly the
+  // tensor algebra of transformers' MobileViTLayer.unfolding: a feature map
+  // (SizeX=W, SizeY=H, Depth=C) is cut into non-overlapping P x P cells
+  // (P = patch size, W and H must be multiples of P). With npw = W div P,
+  // nph = H div P, num_patches = nph*npw, patch_area = P*P, the output is a
+  // (num_patches*patch_area, 1, C) sequence so that CAI's X-axis attention can
+  // run over the num_patches cells INDEPENDENTLY for each of the patch_area
+  // intra-cell sub-positions (HF puts those sub-positions on the batch axis;
+  // here they become contiguous segment blocks, masked block-diagonally via
+  // TNNetMobileViTPatchSegments + the SDPA segment side channel). For a pixel
+  // (x, y, c): pw=x div P, dx=x mod P, ph=y div P, dy=y mod P, p=ph*npw+pw,
+  // a=dy*P+dx, sequence index s = a*num_patches + p, and
+  //   Output[s, 0, c] := Input[x, y, c].
+  // Backward scatters OutputError back to the pixel grid. No parameters.
+  // Coded by Claude (AI).
+  TNNetMobileViTUnfold = class(TNNetLayer)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pPatchSize: integer); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
+  /// Parameter-free inverse of TNNetMobileViTUnfold (transformers'
+  // MobileViTLayer.folding). Takes the (num_patches*patch_area, 1, C) patch
+  // sequence and rebuilds the (OutW, OutH, C) feature map with OutW, OutH the
+  // pre-unfold spatial size (multiples of patch size P). Uses the identical
+  // index algebra as the unfold, applied in reverse. No parameters.
+  // Coded by Claude (AI).
+  TNNetMobileViTFold = class(TNNetLayer)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pPatchSize, pOutW, pOutH: integer); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
+  /// Parameter-free MobileViT segment-id source for block-diagonal attention.
+  // Given the (SeqLen, 1, *) patch sequence produced by TNNetMobileViTUnfold
+  // (laid out as s = a*NumPatches + p), emits a (SeqLen, 1, 1) volume whose
+  // value at position s is the intra-cell sub-position a = s div NumPatches.
+  // Fed as the SDPA SegmentSource it makes attention block-diagonal over the
+  // patch_area groups: query i may attend key j only when a_i = a_j, i.e. each
+  // of the patch_area sub-positions attends over its own num_patches cells and
+  // no others - EXACTLY MobileViT's per-sub-position attention. The ids are
+  // discrete labels and carry no gradient. No parameters.
+  // Coded by Claude (AI).
+  TNNetMobileViTPatchSegments = class(TNNetLayer)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pNumPatches: integer); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// Parameter-free CoordConv layer (Liu et al. 2018,
   // "An intriguing failing of convolutional neural networks and the
   // CoordConv solution", https://arxiv.org/abs/1807.03247). Given an
@@ -35877,6 +35936,265 @@ begin
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetMobileViTUnfold }
+
+constructor TNNetMobileViTUnfold.Create(pPatchSize: integer);
+begin
+  inherited Create();
+  FStruct[0] := pPatchSize;
+end;
+
+procedure TNNetMobileViTUnfold.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  P, NumPatches: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  P := FStruct[0];
+  if P <= 0 then
+  begin
+    FErrorProc('TNNetMobileViTUnfold requires PatchSize>0, got ' + IntToStr(P));
+    Exit;
+  end;
+  if (pPrevLayer.Output.SizeX mod P) <> 0 then
+  begin
+    FErrorProc('TNNetMobileViTUnfold requires SizeX divisible by PatchSize, got SizeX=' +
+      IntToStr(pPrevLayer.Output.SizeX) + ' PatchSize=' + IntToStr(P));
+    Exit;
+  end;
+  if (pPrevLayer.Output.SizeY mod P) <> 0 then
+  begin
+    FErrorProc('TNNetMobileViTUnfold requires SizeY divisible by PatchSize, got SizeY=' +
+      IntToStr(pPrevLayer.Output.SizeY) + ' PatchSize=' + IntToStr(P));
+    Exit;
+  end;
+  NumPatches := (pPrevLayer.Output.SizeX div P) * (pPrevLayer.Output.SizeY div P);
+  FOutput.ReSize(NumPatches * P * P, 1, pPrevLayer.Output.Depth);
+  SetOutputErrorSize(FOutput);
+end;
+
+procedure TNNetMobileViTUnfold.Compute();
+var
+  P, C, NPW, NumPatches: integer;
+  X, Y, IC, PW, DX, PH, DY, Pidx, A, S: integer;
+  MaxX, MaxY, MaxC: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  P := FStruct[0];
+  C := FPrevLayer.Output.Depth;
+  NPW := FPrevLayer.Output.SizeX div P;
+  NumPatches := NPW * (FPrevLayer.Output.SizeY div P);
+  MaxX := FPrevLayer.Output.SizeX - 1;
+  MaxY := FPrevLayer.Output.SizeY - 1;
+  MaxC := C - 1;
+  for X := 0 to MaxX do
+  begin
+    PW := X div P; DX := X mod P;
+    for Y := 0 to MaxY do
+    begin
+      PH := Y div P; DY := Y mod P;
+      Pidx := PH * NPW + PW;
+      A := DY * P + DX;
+      S := A * NumPatches + Pidx;
+      for IC := 0 to MaxC do
+        FOutput[S, 0, IC] := FPrevLayer.FOutput[X, Y, IC];
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMobileViTUnfold.Backpropagate();
+var
+  P, C, NPW, NumPatches: integer;
+  X, Y, IC, PW, DX, PH, DY, Pidx, A, S: integer;
+  MaxX, MaxY, MaxC: integer;
+  StartTime, LocalNow: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutputError.Size > 0) and
+     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) then
+  begin
+    P := FStruct[0];
+    C := FPrevLayer.Output.Depth;
+    NPW := FPrevLayer.Output.SizeX div P;
+    NumPatches := NPW * (FPrevLayer.Output.SizeY div P);
+    MaxX := FPrevLayer.Output.SizeX - 1;
+    MaxY := FPrevLayer.Output.SizeY - 1;
+    MaxC := C - 1;
+    for X := 0 to MaxX do
+    begin
+      PW := X div P; DX := X mod P;
+      for Y := 0 to MaxY do
+      begin
+        PH := Y div P; DY := Y mod P;
+        Pidx := PH * NPW + PW;
+        A := DY * P + DX;
+        S := A * NumPatches + Pidx;
+        for IC := 0 to MaxC do
+          FPrevLayer.OutputError.Add(X, Y, IC, FOutputError[S, 0, IC]);
+      end;
+    end;
+  end;
+  LocalNow := Now();
+  FBackwardTime := FBackwardTime + (LocalNow - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetMobileViTFold }
+
+constructor TNNetMobileViTFold.Create(pPatchSize, pOutW, pOutH: integer);
+begin
+  inherited Create();
+  FStruct[0] := pPatchSize;
+  FStruct[1] := pOutW;
+  FStruct[2] := pOutH;
+end;
+
+procedure TNNetMobileViTFold.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  P, OutW, OutH, NumPatches: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  P := FStruct[0];
+  OutW := FStruct[1];
+  OutH := FStruct[2];
+  if (P <= 0) or (OutW <= 0) or (OutH <= 0) then
+  begin
+    FErrorProc('TNNetMobileViTFold requires PatchSize/OutW/OutH > 0.');
+    Exit;
+  end;
+  if (OutW mod P <> 0) or (OutH mod P <> 0) then
+  begin
+    FErrorProc('TNNetMobileViTFold requires OutW and OutH divisible by PatchSize.');
+    Exit;
+  end;
+  NumPatches := (OutW div P) * (OutH div P);
+  if pPrevLayer.Output.SizeX <> NumPatches * P * P then
+  begin
+    FErrorProc('TNNetMobileViTFold input SizeX=' + IntToStr(pPrevLayer.Output.SizeX) +
+      ' does not match num_patches*patch_area=' + IntToStr(NumPatches * P * P));
+    Exit;
+  end;
+  FOutput.ReSize(OutW, OutH, pPrevLayer.Output.Depth);
+  SetOutputErrorSize(FOutput);
+end;
+
+procedure TNNetMobileViTFold.Compute();
+var
+  P, C, NPW, NumPatches: integer;
+  X, Y, IC, PW, DX, PH, DY, Pidx, A, S: integer;
+  MaxX, MaxY, MaxC: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  P := FStruct[0];
+  C := FOutput.Depth;
+  NPW := FOutput.SizeX div P;
+  NumPatches := NPW * (FOutput.SizeY div P);
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxC := C - 1;
+  for X := 0 to MaxX do
+  begin
+    PW := X div P; DX := X mod P;
+    for Y := 0 to MaxY do
+    begin
+      PH := Y div P; DY := Y mod P;
+      Pidx := PH * NPW + PW;
+      A := DY * P + DX;
+      S := A * NumPatches + Pidx;
+      for IC := 0 to MaxC do
+        FOutput[X, Y, IC] := FPrevLayer.FOutput[S, 0, IC];
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMobileViTFold.Backpropagate();
+var
+  P, C, NPW, NumPatches: integer;
+  X, Y, IC, PW, DX, PH, DY, Pidx, A, S: integer;
+  MaxX, MaxY, MaxC: integer;
+  StartTime, LocalNow: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutputError.Size > 0) and
+     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) then
+  begin
+    P := FStruct[0];
+    C := FOutput.Depth;
+    NPW := FOutput.SizeX div P;
+    NumPatches := NPW * (FOutput.SizeY div P);
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxC := C - 1;
+    for X := 0 to MaxX do
+    begin
+      PW := X div P; DX := X mod P;
+      for Y := 0 to MaxY do
+      begin
+        PH := Y div P; DY := Y mod P;
+        Pidx := PH * NPW + PW;
+        A := DY * P + DX;
+        S := A * NumPatches + Pidx;
+        for IC := 0 to MaxC do
+          FPrevLayer.OutputError.Add(S, 0, IC, FOutputError[X, Y, IC]);
+      end;
+    end;
+  end;
+  LocalNow := Now();
+  FBackwardTime := FBackwardTime + (LocalNow - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetMobileViTPatchSegments }
+
+constructor TNNetMobileViTPatchSegments.Create(pNumPatches: integer);
+begin
+  inherited Create();
+  FStruct[0] := pNumPatches;
+end;
+
+procedure TNNetMobileViTPatchSegments.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if FStruct[0] <= 0 then
+  begin
+    FErrorProc('TNNetMobileViTPatchSegments requires NumPatches>0, got ' +
+      IntToStr(FStruct[0]));
+    Exit;
+  end;
+  FOutput.ReSize(pPrevLayer.Output.SizeX, 1, 1);
+  SetOutputErrorSize(FOutput);
+end;
+
+procedure TNNetMobileViTPatchSegments.Compute();
+var
+  NumPatches, S, MaxS: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  NumPatches := FStruct[0];
+  MaxS := FOutput.SizeX - 1;
+  for S := 0 to MaxS do
+    FOutput[S, 0, 0] := S div NumPatches;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMobileViTPatchSegments.Backpropagate();
+begin
+  // Discrete segment ids carry no gradient.
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
@@ -98443,6 +98761,9 @@ begin
       'TNNetInterleaveChannels' :   Result := TNNetInterleaveChannels.Create(St[0]);
       'TNNetSpaceToDepth' :         Result := TNNetSpaceToDepth.Create(St[0]);
       'TNNetDepthToSpace' :         Result := TNNetDepthToSpace.Create(St[0]);
+      'TNNetMobileViTUnfold' :      Result := TNNetMobileViTUnfold.Create(St[0]);
+      'TNNetMobileViTFold' :        Result := TNNetMobileViTFold.Create(St[0], St[1], St[2]);
+      'TNNetMobileViTPatchSegments': Result := TNNetMobileViTPatchSegments.Create(St[0]);
       'TNNetCoordConv' :            Result := TNNetCoordConv.Create();
       'TNNetSparsemax' :            Result := TNNetSparsemax.Create();
       'TNNetChannelShuffle' :       Result := TNNetChannelShuffle.Create(St[0]);
@@ -98865,6 +99186,9 @@ begin
       if S[0] = 'TNNetInterleaveChannels' then Result := TNNetInterleaveChannels.Create(St[0]) else
       if S[0] = 'TNNetSpaceToDepth' then Result := TNNetSpaceToDepth.Create(St[0]) else
       if S[0] = 'TNNetDepthToSpace' then Result := TNNetDepthToSpace.Create(St[0]) else
+      if S[0] = 'TNNetMobileViTUnfold' then Result := TNNetMobileViTUnfold.Create(St[0]) else
+      if S[0] = 'TNNetMobileViTFold' then Result := TNNetMobileViTFold.Create(St[0], St[1], St[2]) else
+      if S[0] = 'TNNetMobileViTPatchSegments' then Result := TNNetMobileViTPatchSegments.Create(St[0]) else
       if S[0] = 'TNNetCoordConv' then Result := TNNetCoordConv.Create() else
       if S[0] = 'TNNetSparsemax' then Result := TNNetSparsemax.Create() else
       if S[0] = 'TNNetChannelShuffle' then Result := TNNetChannelShuffle.Create(St[0]) else

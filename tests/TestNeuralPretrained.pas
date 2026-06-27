@@ -513,6 +513,8 @@ type
     procedure TestMobileNetV3ImageClassificationParity;
     procedure TestEfficientNetConfigFromJSONFile;
     procedure TestEfficientNetImageClassificationParity;
+    procedure TestMobileViTConfigFromJSONFile;
+    procedure TestMobileViTImageClassificationParity;
     procedure TestSwinConfigFromJSONFile;
     procedure TestSwinImageClassificationParity;
     procedure TestVGGConfigParity;
@@ -20358,6 +20360,109 @@ begin
       NN.GetLastLayer().Output.Size);
 
     RefJson.LoadFromFile(FixturePath('tiny_efficientnet_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    LogitsArr := TJSONArray(TJSONArray(
+      TJSONObject(RefRoot).Find('logits')).Items[0]);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ChanCnt] -
+        LogitsArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadMobileViTConfigFromJSONFile on the committed pico config.
+procedure TTestNeuralPretrained.TestMobileViTConfigFromJSONFile;
+var
+  Config: TMobileViTConfig;
+begin
+  Config := ReadMobileViTConfigFromJSONFile(
+    FixturePath('tiny_mobilevit_config.json'));
+  AssertEquals('model_type', 'mobilevit', Config.ModelType);
+  AssertEquals('image_size', 128, Config.ImageSize);
+  AssertEquals('num_channels', 3, Config.NumChannels);
+  AssertEquals('patch_size', 2, Config.PatchSize);
+  AssertEquals('num_labels', 5, Config.NumLabels);
+  AssertEquals('num_heads', 2, Config.NumHeads);
+  AssertEquals('conv_kernel', 3, Config.ConvKernel);
+  AssertTrue('qkv_bias', Config.QkvBias);
+  AssertTrue('mlp_ratio = 2', Abs(Config.MlpRatio - 2.0) < 1e-9);
+  AssertTrue('expand_ratio = 2', Abs(Config.ExpandRatio - 2.0) < 1e-9);
+  AssertEquals('hidden0', 8, Config.HiddenSizes[0]);
+  AssertEquals('hidden2', 12, Config.HiddenSizes[2]);
+  AssertEquals('neck0', 4, Config.NeckHiddenSizes[0]);
+  AssertEquals('neck6', 16, Config.NeckHiddenSizes[6]);
+  AssertEquals('tx layers0', 1, Config.TransformerLayers[0]);
+end;
+
+// MobileViT image-classification parity test. tests/fixtures/tiny_mobilevit.* is
+// a pico random-init MobileViT (image 64, patch 2, neck [4,6,8,10,12,14,16],
+// hidden [8,10,12], 1 transformer layer per MobileViT block, 5 labels) whose
+// state_dict mirrors transformers' exact mobilevit key scheme. It exercises
+// every importer branch: conv stem, the two MobileNet inverted-residual stages
+// (expand / depthwise+BN-shift / project / residual), the three MobileViT
+// blocks (downsample inv-res -> local conv_kxk -> conv_1x1 with NO BN/act ->
+// TNNetMobileViTUnfold 2x2 patches -> per-sub-position BLOCK-DIAGONAL attention
+// via TNNetMobileViTPatchSegments + the SDPA segment side channel -> post
+// LayerNorm -> TNNetMobileViTFold -> conv_projection -> fusion concat+conv),
+// conv_1x1_exp, global avg pool and the classifier Linear. Each BatchNorm
+// (eps 1e-5) is FOLDED into its conv at load (depthwise shift rides a
+// TNNetChannelBias). tools/make_pico_mobilevit_fixture.py computes the
+// reference logits with a self-contained numpy float64 first-principles oracle
+// (transformers is not installed). Asserts the (1,1,num_labels) logits match
+// the oracle < 1e-4 -- in particular validating the unfold/fold reshape.
+procedure TTestNeuralPretrained.TestMobileViTImageClassificationParity;
+var
+  NN: TNNet;
+  Config: TMobileViTConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, LogitsArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildMobileViTFromSafeTensors(
+    FixturePath('tiny_mobilevit.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_mobilevit_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output size = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Size);
+
+    RefJson.LoadFromFile(FixturePath('tiny_mobilevit_logits.json'));
     RefRoot := GetJSON(RefJson.Text);
     Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
     LogitsArr := TJSONArray(TJSONArray(

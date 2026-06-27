@@ -1406,7 +1406,7 @@ rather than acted on.
       machinery. Real value: SwinV2 is the higher-resolution, more-stable Swin used
       as a detection/segmentation backbone and unblocks larger-window ViT necks.
       Pico-fixture parity < 1e-4 vs a float64 HF Swinv2Model.forward.
-- [ ] MobileViT hybrid CNN+transformer backbone importer
+- [X] MobileViT hybrid CNN+transformer backbone importer
       (BuildMobileViTFromSafeTensors[Ex], model_type "mobilevit", e.g.
       apple/mobilevit-small). Fills the mobile-vision-backbone gap (the landed
       EfficientNet / MobileNetV2-style and ViT importers are pure-CNN or pure-ViT;

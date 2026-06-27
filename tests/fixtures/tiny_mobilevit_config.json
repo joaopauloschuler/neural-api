@@ -1,0 +1,33 @@
+{
+ "model_type": "mobilevit",
+ "image_size": 128,
+ "num_channels": 3,
+ "num_labels": 5,
+ "patch_size": 2,
+ "num_attention_heads": 2,
+ "mlp_ratio": 2.0,
+ "expand_ratio": 2.0,
+ "conv_kernel_size": 3,
+ "layer_norm_eps": 1e-05,
+ "bn_eps": 1e-05,
+ "qkv_bias": true,
+ "hidden_sizes": [
+  8,
+  10,
+  12
+ ],
+ "neck_hidden_sizes": [
+  4,
+  6,
+  8,
+  10,
+  12,
+  14,
+  16
+ ],
+ "transformer_layers": [
+  1,
+  1,
+  1
+ ]
+}
