@@ -246,25 +246,13 @@ rather than acted on.
       CLIP vision tower and Llama/Vicuna decoder; `examples/LlavaNextDescribe`
       caption. Pico-fixture parity < 1e-4 on the merged visual-token features.
 
-- [X] OpenCLIP / timm vision-tower importer `BuildOpenClipVisionTower` LANDED
-      (commit 794a10ce, neuralpretrained.pas): a `TNNetOpenClipReader`
-      (TNNetSafeTensorsReader subclass, synthetic-table pattern like
-      TNNetInternLM2Reader) maps flat `visual.*` open_clip keys onto the HF
-      `vision_model.*` names the existing `BuildClipVisionTower` graph reads —
-      three non-trivial translations: (a) split fused `attn.in_proj_{weight,bias}`
-      [3*width,width] into q/k/v slabs; (b) transpose bias-free `visual.proj`
-      [width,out] into nn.Linear `visual_projection.weight` [out,width];
-      (c) serve `class_embedding`/`positional_embedding` under HF names so the
-      builder folds CLS into pos row 0. Activation configurable (chaQuickGelu for
-      OpenAI-style vs chaGeluExact for LAION ViT-B/g) via promoted
-      `ClipHiddenActFromString`. `TestOpenClipVisionTowerParity` matches a
-      self-contained numpy float64 pre-LN ViT oracle <1e-4
-      (tools/make_pico_openclip_fixture.py; tests/fixtures/tiny_openclip.* 63KB,
-      in line with the existing 60KB tiny_clip fixture); full suite green.
-  - [ ] real-checkpoint round-trip vs the actual `open_clip` reference (laion
-        ViT-L/14, ViT-g/14) deferred — open_clip lib + LAION weights unavailable
-        offline; the pico fixture covers the key-translation surface end-to-end on
-        top of the already-parity-verified CLIP vision graph.
+- [ ] OpenCLIP / timm vision-tower real-checkpoint round-trip follow-up
+      (`BuildOpenClipVisionTower` LANDED, commit 794a10ce, neuralpretrained.pas —
+      `TNNetOpenClipReader` maps flat `visual.*` open_clip keys onto the HF
+      `vision_model.*` graph `BuildClipVisionTower` reads; pico parity
+      TestOpenClipVisionTowerParity < 1e-4 on the already-parity-verified CLIP
+      vision graph): verify against the actual `open_clip` reference (laion
+      ViT-L/14, ViT-g/14) — open_clip lib + LAION weights unavailable offline.
 
 - [ ] Janus-Pro unified multimodal importer (`BuildJanusProFromSafeTensors[Ex]`,
       deepseek-ai/Janus-Pro-1B and Janus-Pro-7B). Architecturally distinct from
@@ -378,22 +366,17 @@ rather than acted on.
       into a Qwen2 / InternLM2 decoder (both importers already landed). The reusable
       new piece is the pixel-unshuffle token reducer + dynamic-tiling image
       preprocessor; verify on the 1B checkpoint against a transformers reference.
-- [X] DINOv3 self-supervised ViT backbone importer LANDED
-      (`BuildDINOv3FromSafeTensors[Ex/WithConfig]`, HF model_type "dinov3_vit",
-      facebook/dinov3-*). Successor to the landed DINOv2 tower: same pre-LN ViT
-      body + LayerScale, but with 2-D AXIAL RoPE on the patch tokens (new
-      TNNetVisionRoPE2D leaf + AddMultiHeadVisionRoPE2DAttention builder; base
-      rope_theta, CLS+register prefix tokens unrotated, same cos/sin across
-      layers), register tokens prepended after CLS (learned per-row table into
-      zero-padded prefix slots), BERT-unfused q/k/v/o_proj with UNbiased key,
-      and Gram-anchoring weights. Parity tested < 1e-4 vs a float64 HF
-      DINOv3ViTModel oracle (tools/dinov3_tiny_fixture.py; transformers 5.11
-      ships dinov3_vit so the oracle is real, no hand-roll). Scalar + AVX2 green.
-      Deferred follow-ups: use_gated_mlp (SwiGLU giant) variant rejected (only
-      plain up_proj/down_proj+gelu wired); non-square / non-native image_size
-      (dynamic RoPE grid) not yet plumbed - TNNetVisionRoPE2D is fixed to the
-      build-time grid. Still unblocks DINOv3-backed dense-prediction once the
-      "register-token DINOv2 backbones rejected by BuildDPT" follow-up lands.
+- [ ] DINOv3 ViT backbone importer follow-ups (`BuildDINOv3FromSafeTensors[Ex/WithConfig]`
+      LANDED, HF model_type "dinov3_vit", facebook/dinov3-*; pre-LN ViT + LayerScale +
+      2-D AXIAL RoPE on patch tokens (TNNetVisionRoPE2D + AddMultiHeadVisionRoPE2DAttention),
+      register tokens prepended after CLS, BERT-unfused q/k/v/o_proj with UNbiased key;
+      parity < 1e-4 vs a float64 HF DINOv3ViTModel oracle, scalar + AVX2 green):
+  - [ ] use_gated_mlp (SwiGLU giant) variant rejected (only plain
+        up_proj/down_proj+gelu wired).
+  - [ ] non-square / non-native image_size (dynamic RoPE grid) not yet plumbed —
+        TNNetVisionRoPE2D is fixed to the build-time grid. Still unblocks
+        DINOv3-backed dense-prediction once the "register-token DINOv2 backbones
+        rejected by BuildDPT" follow-up lands.
 
 - [ ] Kandinsky 2.2 unCLIP text-to-image importer
       (`BuildKandinskyPriorFromSafeTensors[Ex]` + `BuildKandinskyDecoderFromSafeTensors[Ex]`,
@@ -1764,23 +1747,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
   - [ ] TNNetTestTimeTraining / TNNetTitansMemory backward "undo" loops (interleaved
         scalar etaGrad/dEta/dTheta accumulation) — the per-token forward rank-1 writes
         are vectorized; this is the lower-value remainder.
-- [X] AVX-vectorize the strided STATE-READOUT forward loops in the
-      linear-attention / state-space family. Several layers compute the output
-      `y_t[e] = sum_d q_t[d]·S_t[d,e]` (or the SSM analogue
-      `y += C[s]·h_new[s]`) with a SCALAR inner loop where one operand is
-      strided: `TNNetGatedLinearAttention.Compute` (neuralnetwork.pas ~52881-52882,
-      `ss += FQ[baseT+d]·FS[baseS + d*Depth + e]` — FS strided by Depth over d),
-      `TNNetDeltaNet.Compute` (same shape), and the state-axis readouts in
-      `TNNetMamba2.Compute` / `TNNetSelectiveSSM.ComputeMultiState`
-      (`accY += C_row[s]·h_new[s]` over StateSize). The matching BACKWARD paths
-      already vectorize the symmetric op via `TNNetVolume.MulAdd` over the
-      contiguous axis (e.g. GLA backward ~52938), so the fix mirrors that:
-      buffer the strided state row (or the per-head `h_new` slice) into a small
-      contiguous scratch, then issue `TNNetVolume.DotProduct` over the
-      depth/state axis. Reuse the per-pass preallocated scratch-field convention.
-      Pin exact parity vs the current scalar output on each layer's numerical
-      test. Distinct from the existing chunked/parallel-forward items for these
-      layers (those change the ALGORITHM; this vectorizes the sequential readout).
 - [ ] AVX-vectorize the scalar inner loops in the computer-vision layers below.
       Each hot loop is a plain `for d := ... acc := acc + a[d]*b[d]` (or
       `dst[d] := dst[d] + s*c[d]`) over a CONTIGUOUS depth/feature axis, so the
@@ -1811,29 +1777,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
         contiguous spatial axis (and the symmetric backward mirrors it). Speeds up
         the style-transfer / AdaIN Gram path; document the scratch alloc in
         SetPrevLayer per the preallocated-scratch convention.
-- [X] Refactor `examples/MixtureDensityNetwork` to use the real
-      `TNNetMixtureDensity` layer + its log-sum-exp NLL instead of the
-      hand-coded mixture math. The example currently re-implements the whole
-      head in local procedures (`DecodeMix` softmax over mixture weights,
-      `MixtureNLL` mixture-of-Gaussians likelihood, `MixtureNLLGrad` manual
-      gradient) and never references `TNNetMixtureDensity`, even though that
-      layer (and the depth-axis packing convention) already exists in
-      neuralnetwork.pas. Rebuild the net so the K-Gaussian head is the library
-      layer and training uses its loss path; keep the example's data + plotting
-      so the before/after fit is comparable. Removes a duplicated
-      implementation of math the library already owns and exercises the real
-      layer end-to-end in an example.
-- [X] Refactor `examples/HopfieldRetrieval` to use the real modern-Hopfield
-      retrieval path (`AddModernHopfieldRetrieval` / `TNNetModernHopfield`, or
-      `TNNetScaledDotProductAttention` for the single-step `softmax(beta·X·q)·X`
-      update) instead of the hand-coded `HopfieldStep` procedure. The example
-      manually implements the scaled dot-product scores, numerically-stable
-      softmax, and weighted-sum retrieval in inline loops and never references
-      the library layer/builder, both of which already exist. Wire the
-      iterated associative-memory step through the real layer so the example
-      demonstrates the shipped API; keep the stored-pattern recall demo and its
-      reported recall metric so the refactor is verifiable.
-
 - [ ] Add missing `README.md` to example folders that ship a `.lpr` but no
       README (the CV/generative six — VQGAN, TinyNeRF, VideoFrameInterpolation,
       VideoPrediction, VideoAction, VideoActionTiny — LANDED commit 0cf2ea59).
