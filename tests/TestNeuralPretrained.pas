@@ -30,6 +30,7 @@ type
     function FixturePath(const FileName: string): string;
     procedure RunConvNeXtParity(const Base: string);
     procedure RunResNetParity(const Base: string);
+    procedure RunRepVGGParity(const Base: string);
     // Composes a minimal safetensors byte stream into a temp file and
     // returns its path. HeaderJson is written verbatim (preceded by its
     // 8-byte little-endian length); Payload is the raw data section.
@@ -474,6 +475,8 @@ type
     procedure TestResNet18ImageClassificationParity;
     procedure TestResNet34ImageClassificationParity;
     procedure TestResNet50ImageClassificationParity;
+    procedure TestRepVGGConfigFromJSONFile;
+    procedure TestRepVGGParity;
     procedure TestMaskRCNNConfigFromJSONFile;
     procedure TestMaskRCNNParity;
     procedure TestConvNeXtConfigFromJSONFile;
@@ -18028,6 +18031,100 @@ end;
 procedure TTestNeuralPretrained.TestResNet50ImageClassificationParity;
 begin
   RunResNetParity('tiny_resnet50');
+end;
+
+// Shared driver for the RepVGG fusion-parity check. Loads the pico fixture
+// (importer FUSES each multi-branch training block into one 3x3 conv at load
+// time), runs the CAI forward, and asserts it matches the numpy float64 oracle
+// -- which computes the MULTI-BRANCH TRAINING forward (3x3 conv-BN + 1x1
+// conv-BN + identity-BN, summed, then ReLU). max|diff| < 1e-4 is the proof
+// that load-time re-parameterization is numerically exact.
+procedure TTestNeuralPretrained.RunRepVGGParity(const Base: string);
+var
+  NN: TNNet;
+  Config: TRepVGGConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, LogitsArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildRepVGGFromSafeTensors(FixturePath(Base + '.safetensors'),
+    Config, {pTrainable=}true, FixturePath(Base + '_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output size = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Size);
+
+    RefJson.LoadFromFile(FixturePath(Base + '_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    LogitsArr := TJSONArray(TJSONArray(
+      TJSONObject(RefRoot).Find('logits')).Items[0]);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ChanCnt] -
+        LogitsArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadRepVGGConfigFromJSONFile on the committed pico config.
+procedure TTestNeuralPretrained.TestRepVGGConfigFromJSONFile;
+var
+  Config: TRepVGGConfig;
+begin
+  Config := ReadRepVGGConfigFromJSONFile(FixturePath('tiny_repvgg_config.json'));
+  AssertEquals('model_type', 'repvgg', Config.ModelType);
+  AssertEquals('stage1 width', 8, Config.StageWidths[0]);
+  AssertEquals('stage4 width', 24, Config.StageWidths[3]);
+  AssertEquals('stage1 blocks', 2, Config.NumBlocksPerStage[0]);
+  AssertEquals('stage4 blocks', 1, Config.NumBlocksPerStage[3]);
+  AssertEquals('stem width', 6, Config.StemWidth);
+  AssertEquals('num_labels', 5, Config.NumLabels);
+  AssertTrue('ToString non-empty', Length(RepVGGConfigToString(Config)) > 0);
+end;
+
+// RepVGG load-time structural re-parameterization parity: the FUSED single-3x3
+// inference net must match the multi-branch training oracle to < 1e-4. Pico
+// fixture tiny_repvgg.* exercises the stem (no identity), stride-2 width-change
+// blocks (no identity, 1x1 zero-pad), and stride-1 same-width blocks (all three
+// branches incl. the identity centred-kernel term).
+procedure TTestNeuralPretrained.TestRepVGGParity;
+begin
+  RunRepVGGParity('tiny_repvgg');
 end;
 
 // Verifies ReadMaskRCNNConfigFromJSONFile on the committed pico config.

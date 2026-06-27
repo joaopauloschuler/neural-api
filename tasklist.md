@@ -266,17 +266,20 @@ rather than acted on.
       the 2-D-RoPE variable-resolution vision tower + the patch-token splicing
       position builder; verify the tower against a transformers reference and the
       decoder against the landed Mistral parity fixture.
-- [ ] RepVGG classification-backbone importer with load-time structural
+- [X] RepVGG classification-backbone importer with load-time structural
       re-parameterization (`BuildRepVGGFromSafeTensors[Ex]`, the timm / official
       `RepVGG-A0..B3` family). The training graph is a multi-branch block
       (3x3 conv-BN + 1x1 conv-BN + an identity BN), but inference FUSES all three
-      branches into a SINGLE plain 3x3 `TNNetConvolution` per block. Implement the
-      fusion at LOAD time — fold each branch's BN into its conv kernel/bias, zero-pad
-      the 1x1 kernel to 3x3, add the identity branch as a centered 3x3 — so the
+      branches into a SINGLE plain 3x3 `TNNetConvolution` per block. Implemented the
+      fusion at LOAD time (ReparamRepVGGBlock: fold each branch's BN into its conv
+      kernel/bias, zero-pad the 1x1 kernel into the 3x3 centre, add the identity
+      branch as a centred 3x3 identity kernel, sum the three kernels+biases) — the
       imported net is a pure VGG-style stack of `TNNetConvolutionReLU` with no
-      runtime branch overhead. The reusable new piece is the BN-fold + branch-add
-      reparameterization helper (also applicable to MobileOne / other rep-style
-      nets); verify the fused forward against the unfused torch reference < 1e-4.
+      runtime branch overhead. The reusable BN-fold + branch-add reparameterization
+      helper is also applicable to MobileOne / other rep-style nets. Pico numpy
+      float64 multi-branch TRAINING oracle parity vs the FUSED inference net < 1e-4
+      (TestRepVGGParity). .pth-pickle checkpoint loading deferred (safetensors +
+      sharded index / pytorch_model.bin supported via the shared reader).
 - [ ] Sana text-to-image importer (`BuildSanaFromSafeTensors[Ex]`, NVIDIA /
       Efficient-Large-Model `Sana_*`). A genuinely different image-generation
       stack from the landed PixArt/MMDiT path: a LINEAR-attention DiT denoiser

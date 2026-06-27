@@ -1,0 +1,23 @@
+{
+ "model_type": "repvgg",
+ "architectures": [
+  "RepVGGForImageClassification"
+ ],
+ "image_size": 64,
+ "num_channels": 3,
+ "num_labels": 5,
+ "widths": [
+  8,
+  12,
+  16,
+  24
+ ],
+ "num_blocks": [
+  2,
+  2,
+  2,
+  1
+ ],
+ "stem_width": 6,
+ "bn_eps": 1e-05
+}

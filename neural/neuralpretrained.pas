@@ -8501,6 +8501,63 @@ function BuildResNetFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// REPVGG CLASSIFICATION-BACKBONE IMPORT with LOAD-TIME STRUCTURAL
+// RE-PARAMETERIZATION (official RepVGG / timm RepVGG-A0..B3 family).
+//
+// The TRAINING graph of a RepVGG block is multi-branch:
+//   y = ReLU( dense(x) + onexone(x) + identity(x) )
+// where dense = 3x3 conv-BN, onexone = 1x1 conv-BN, and identity = a plain
+// BN (present only when in_ch == out_ch and stride == 1). At INFERENCE all
+// three branches FUSE into a SINGLE plain 3x3 conv per block (Ding et al.,
+// "RepVGG: Making VGG-style ConvNets Great Again", CVPR 2021). This importer
+// performs that fusion at LOAD time, so the imported net is a pure VGG-style
+// stack of TNNetConvolutionReLU with no runtime branch overhead.
+//
+// The fusion (see ReparamRepVGGBlock): fold each branch's BN into its conv
+// kernel/bias, zero-pad the 1x1 kernel into the centre of a 3x3 kernel, turn
+// the identity BN into a centred 3x3 identity kernel (per-channel BN scale on
+// the centre tap), then sum the three 3x3 kernels and the three biases. The
+// reusable BN-fold + branch-add helper is also applicable to MobileOne and
+// other rep-style nets.
+//
+// SCOPE v1: safetensors (+ sharded index / pytorch_model.bin via the shared
+// reader) and the pico numpy-oracle parity test. Real .pth-pickle RepVGG
+// checkpoints are a follow-up.
+// ---------------------------------------------------------------------------
+type
+  TRepVGGConfig = record
+    NumBlocksPerStage: array[0..3] of integer; // stage1..stage4 block counts
+    StageWidths: array[0..3] of integer;        // OUTPUT width of each stage
+    StemWidth: integer;             // stage0 (stem) out channels = min(64,W0)
+    ImageSize: integer;             // 224 for ImageNet
+    NumChannels: integer;           // 3
+    NumLabels: integer;             // linear head out width (1000 ImageNet-1k)
+    BnEps: TNeuralFloat;            // BatchNorm2d eps (1e-5 official)
+    ModelType: string;              // 'repvgg'
+  end;
+
+function ReadRepVGGConfigFromJSONFile(const FileName: string): TRepVGGConfig;
+function RepVGGConfigToString(const Config: TRepVGGConfig): string;
+
+// Builds the RepVGG described by Config and loads every weight from Reader
+// (caller owns Reader), FUSING each multi-branch training block into a single
+// 3x3 conv at load time. The net takes an (ImageSize, ImageSize, NumChannels)
+// ImageNet-normalized RGB volume and outputs (1, 1, NumLabels) class logits.
+function BuildRepVGG(Reader: TNNetSafeTensorsReader;
+  const Config: TRepVGGConfig; pTrainable: boolean = true): TNNet;
+
+// Builds + loads the RepVGG classifier from the checkpoint at FileName
+// (.safetensors / sharded index / pytorch_model.bin). Config supplied by the
+// caller (Ex) or read from ConfigFileName ('' = "config.json" beside FileName)
+// and returned. Net owned by caller. Output: (1,1,num_labels).
+function BuildRepVGGFromSafeTensorsEx(const FileName: string;
+  const Config: TRepVGGConfig; pTrainable: boolean = true): TNNet;
+
+function BuildRepVGGFromSafeTensors(const FileName: string;
+  out Config: TRepVGGConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+
+// ---------------------------------------------------------------------------
 // MASK R-CNN INSTANCE-SEGMENTATION IMPORT (torchvision
 // maskrcnn_resnet50_fpn). The FIRST instance-segmentation vertical: per-OBJECT
 // binary masks (distinct from DETR boxes-only, SegFormer's single dense class
@@ -55156,6 +55213,331 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadResNetConfigFromJSONFile(ConfigPath);
   Result := BuildResNetFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+// ===========================================================================
+// REPVGG CLASSIFICATION BACKBONE (load-time structural re-parameterization)
+// ===========================================================================
+
+function ReadRepVGGConfigFromJSONFile(const FileName: string): TRepVGGConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ArrData: TJSONData;
+  Arr: TJSONArray;
+  i: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('RepVGG import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('RepVGG import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('RepVGG import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'repvgg');
+    // OUTPUT width of each of the 4 main stages (already scaled by the
+    // width-multipliers a/b for the chosen RepVGG-A0..B3 variant). REQUIRED.
+    ArrData := Obj.Find('widths');
+    if (ArrData = nil) or not (ArrData is TJSONArray) or
+       (TJSONArray(ArrData).Count <> 4) then
+      ImportError('RepVGG import: config "' + FileName +
+        '" needs a 4-int "widths" array (stage1..stage4 output channels).');
+    Arr := TJSONArray(ArrData);
+    for i := 0 to 3 do Result.StageWidths[i] := Arr.Items[i].AsInteger;
+    ArrData := Obj.Find('num_blocks');
+    if (ArrData = nil) or not (ArrData is TJSONArray) or
+       (TJSONArray(ArrData).Count <> 4) then
+      ImportError('RepVGG import: config "' + FileName +
+        '" needs a 4-int "num_blocks" array (stage1..stage4 block counts).');
+    Arr := TJSONArray(ArrData);
+    for i := 0 to 3 do Result.NumBlocksPerStage[i] := Arr.Items[i].AsInteger;
+    // Official RepVGG stem out = min(64, width0). Overridable for pico fixtures.
+    if Result.StageWidths[0] < 64 then Result.StemWidth := Result.StageWidths[0]
+    else Result.StemWidth := 64;
+    Result.StemWidth := Obj.Get('stem_width', Result.StemWidth);
+    Result.ImageSize := Obj.Get('image_size', 224);
+    Result.NumChannels := Obj.Get('num_channels', 3);
+    Result.NumLabels := Obj.Get('num_labels', 1000);
+    Result.BnEps := Obj.Get('bn_eps', 1.0E-5);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function RepVGGConfigToString(const Config: TRepVGGConfig): string;
+begin
+  if Config.ModelType = '' then Result := 'repvgg'
+  else Result := Config.ModelType;
+  Result := Result + ' config: stem=' + IntToStr(Config.StemWidth) +
+    ', widths=[' + IntToStr(Config.StageWidths[0]) + ',' +
+    IntToStr(Config.StageWidths[1]) + ',' +
+    IntToStr(Config.StageWidths[2]) + ',' +
+    IntToStr(Config.StageWidths[3]) + ']' +
+    ', num_blocks=[' + IntToStr(Config.NumBlocksPerStage[0]) + ',' +
+    IntToStr(Config.NumBlocksPerStage[1]) + ',' +
+    IntToStr(Config.NumBlocksPerStage[2]) + ',' +
+    IntToStr(Config.NumBlocksPerStage[3]) + ']' +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', channels=' + IntToStr(Config.NumChannels) +
+    ', num_labels=' + IntToStr(Config.NumLabels);
+end;
+
+// Reusable rep-style re-parameterization helper (also applicable to MobileOne
+// and other multi-branch conv nets). FUSES a RepVGG block's three training
+// branches into the SINGLE 3x3 conv of Layer (a TNNetConvolutionReLU storing
+// each neuron depth-contiguous as FData[(ky*3 + kx)*InCh + c]):
+//
+//   * rbr_dense: 3x3 conv-BN -> fold BN into a 3x3 kernel/bias (as ResNet).
+//   * rbr_1x1:   1x1 conv-BN -> fold BN, then ZERO-PAD the 1x1 kernel into
+//                the CENTRE (ky=kx=1) of a 3x3 kernel.
+//   * rbr_identity: a plain BN (present only when InCh = OutCh and stride 1)
+//                -> a CENTRED 3x3 identity kernel: for input channel c the
+//                centre tap of output channel c = gamma_c/sqrt(var_c+eps);
+//                bias = beta_c - gamma_c*mean_c/sqrt(var_c+eps). Equivalent to
+//                folding BN over a 1x1 identity conv (W[o,c]=delta_oc).
+//
+// The three 3x3 kernels and the three biases are SUMMED, giving exactly the
+// pre-ReLU output of dense(x)+onexone(x)+identity(x). HasIdentity selects
+// whether the identity branch exists. The 1x1 branch is always present in
+// RepVGG; Has1x1 lets the helper be reused where it is absent.
+// Coded by Claude (AI).
+procedure ReparamRepVGGBlock(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const Prefix: string;
+  OutCh, InCh: integer; Has1x1, HasIdentity: boolean; BnEps: TNeuralFloat);
+var
+  Wd, W1, Gd, Bd, Md, Vd, G1, B1, M1, V1, Gi, Bi, Mi, Vi: TNNetVolume;
+  o, c, ky, kx, OutChM1, InChM1: integer;
+  Sd, Sh, Den, S1, H1, Si, Hi, Acc: TNeuralFloat;
+
+  procedure NeedBN(const P: string; Ga, Be, Me, Va: TNNetVolume);
+  begin
+    if not Reader.HasTensor(P + '.weight') then
+      ImportError('RepVGG import: missing BatchNorm tensor "' + P + '.weight".');
+    Reader.LoadTensorFlat(P + '.weight', Ga);
+    Reader.LoadTensorFlat(P + '.bias', Be);
+    Reader.LoadTensorFlat(P + '.running_mean', Me);
+    Reader.LoadTensorFlat(P + '.running_var', Va);
+    if (Ga.Size <> OutCh) or (Be.Size <> OutCh) or
+       (Me.Size <> OutCh) or (Va.Size <> OutCh) then
+      ImportError('RepVGG import: BatchNorm "' + P +
+        '" parameters must each have ' + IntToStr(OutCh) + ' elements.');
+  end;
+
+begin
+  EnsureWritableImportWeights(Layer);
+  if Layer.Neurons.Count <> OutCh then
+    ImportError('RepVGG import: internal error - block "' + Prefix +
+      '" target has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutCh) + '.');
+  if Layer.FArrNeurons[0].Weights.Size <> 3 * 3 * InCh then
+    ImportError('RepVGG import: internal error - block "' + Prefix +
+      '" target neuron has ' + IntToStr(Layer.FArrNeurons[0].Weights.Size) +
+      ' weights, expected ' + IntToStr(3 * 3 * InCh) + '.');
+  // dense 3x3 conv must exist with shape [OutCh, InCh, 3, 3].
+  if not Reader.HasTensor(Prefix + '.rbr_dense.conv.weight') then
+    ImportError('RepVGG import: missing tensor "' + Prefix +
+      '.rbr_dense.conv.weight".');
+  if (Reader.DimCount(Prefix + '.rbr_dense.conv.weight') <> 4) or
+     (Reader.DimSize(Prefix + '.rbr_dense.conv.weight', 0) <> OutCh) or
+     (Reader.DimSize(Prefix + '.rbr_dense.conv.weight', 1) <> InCh) or
+     (Reader.DimSize(Prefix + '.rbr_dense.conv.weight', 2) <> 3) or
+     (Reader.DimSize(Prefix + '.rbr_dense.conv.weight', 3) <> 3) then
+    ImportError('RepVGG import: "' + Prefix + '.rbr_dense.conv.weight" must ' +
+      'have shape [' + IntToStr(OutCh) + ', ' + IntToStr(InCh) + ', 3, 3], got ' +
+      Reader.ShapeAsString(Prefix + '.rbr_dense.conv.weight'));
+  Wd := TNNetVolume.Create; W1 := TNNetVolume.Create;
+  Gd := TNNetVolume.Create; Bd := TNNetVolume.Create;
+  Md := TNNetVolume.Create; Vd := TNNetVolume.Create;
+  G1 := TNNetVolume.Create; B1 := TNNetVolume.Create;
+  M1 := TNNetVolume.Create; V1 := TNNetVolume.Create;
+  Gi := TNNetVolume.Create; Bi := TNNetVolume.Create;
+  Mi := TNNetVolume.Create; Vi := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Prefix + '.rbr_dense.conv.weight', Wd);
+    NeedBN(Prefix + '.rbr_dense.bn', Gd, Bd, Md, Vd);
+    if Has1x1 then
+    begin
+      if not Reader.HasTensor(Prefix + '.rbr_1x1.conv.weight') then
+        ImportError('RepVGG import: missing tensor "' + Prefix +
+          '.rbr_1x1.conv.weight".');
+      if (Reader.DimCount(Prefix + '.rbr_1x1.conv.weight') <> 4) or
+         (Reader.DimSize(Prefix + '.rbr_1x1.conv.weight', 0) <> OutCh) or
+         (Reader.DimSize(Prefix + '.rbr_1x1.conv.weight', 1) <> InCh) or
+         (Reader.DimSize(Prefix + '.rbr_1x1.conv.weight', 2) <> 1) or
+         (Reader.DimSize(Prefix + '.rbr_1x1.conv.weight', 3) <> 1) then
+        ImportError('RepVGG import: "' + Prefix + '.rbr_1x1.conv.weight" must ' +
+          'have shape [' + IntToStr(OutCh) + ', ' + IntToStr(InCh) +
+          ', 1, 1], got ' + Reader.ShapeAsString(Prefix + '.rbr_1x1.conv.weight'));
+      Reader.LoadTensorFlat(Prefix + '.rbr_1x1.conv.weight', W1);
+      NeedBN(Prefix + '.rbr_1x1.bn', G1, B1, M1, V1);
+    end;
+    if HasIdentity then
+    begin
+      if InCh <> OutCh then
+        ImportError('RepVGG import: identity branch in "' + Prefix +
+          '" requires InCh = OutCh.');
+      NeedBN(Prefix + '.rbr_identity', Gi, Bi, Mi, Vi);
+    end;
+    OutChM1 := OutCh - 1;
+    InChM1 := InCh - 1;
+    for o := 0 to OutChM1 do
+    begin
+      // dense BN fold scale/shift.
+      Den := Sqrt(Vd.FData[o] + BnEps);
+      Sd := Gd.FData[o] / Den;
+      Sh := Bd.FData[o] - Gd.FData[o] * Md.FData[o] / Den;
+      // 1x1 BN fold scale/shift (centre tap only).
+      if Has1x1 then
+      begin
+        Den := Sqrt(V1.FData[o] + BnEps);
+        S1 := G1.FData[o] / Den;
+        H1 := B1.FData[o] - G1.FData[o] * M1.FData[o] / Den;
+      end
+      else begin S1 := 0.0; H1 := 0.0; end;
+      // identity BN fold scale/shift (centre tap of channel o == o).
+      if HasIdentity then
+      begin
+        Den := Sqrt(Vi.FData[o] + BnEps);
+        Si := Gi.FData[o] / Den;
+        Hi := Bi.FData[o] - Gi.FData[o] * Mi.FData[o] / Den;
+      end
+      else begin Si := 0.0; Hi := 0.0; end;
+      for ky := 0 to 2 do
+        for kx := 0 to 2 do
+          for c := 0 to InChM1 do
+          begin
+            // dense 3x3 kernel (torch [o,c,ky,kx]).
+            Acc := Wd.FData[((o * InCh + c) * 3 + ky) * 3 + kx] * Sd;
+            // 1x1 zero-padded into the centre tap.
+            if Has1x1 and (ky = 1) and (kx = 1) then
+              Acc := Acc + W1.FData[o * InCh + c] * S1;
+            // identity centred 3x3 identity kernel.
+            if HasIdentity and (ky = 1) and (kx = 1) and (c = o) then
+              Acc := Acc + Si;
+            Layer.FArrNeurons[o].Weights.FData[(ky * 3 + kx) * InCh + c] := Acc;
+          end;
+      Layer.FArrNeurons[o].BiasWeight := Sh + H1 + Hi;
+    end;
+    Layer.FlushWeightCache();
+  finally
+    Wd.Free; W1.Free; Gd.Free; Bd.Free; Md.Free; Vd.Free;
+    G1.Free; B1.Free; M1.Free; V1.Free;
+    Gi.Free; Bi.Free; Mi.Free; Vi.Free;
+  end;
+end;
+
+function BuildRepVGG(Reader: TNNetSafeTensorsReader;
+  const Config: TRepVGGConfig; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  Blocks: array of TNNetLayer;
+  RefCount, Stage, BlockIdx, Stride, InWidth, OutWidth, NCount: integer;
+  HasIdent: boolean;
+  Prefix: string;
+  FC: TNNetLayer;
+begin
+  if Config.NumChannels < 1 then
+    ImportError('RepVGG import: num_channels must be >= 1.');
+  if Config.NumLabels < 1 then
+    ImportError('RepVGG import: num_labels must be >= 1.');
+  // 1 (stem) + sum of the 4 main stages.
+  RefCount := 1;
+  for Stage := 0 to 3 do RefCount := RefCount + Config.NumBlocksPerStage[Stage];
+  SetLength(Blocks, RefCount);
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels) );
+    // Every fused block is a plain 3x3 conv (pad 1) + ReLU. Stem strides 2;
+    // each main stage's FIRST block strides 2 (the rest stride 1).
+    NCount := 0;
+    Blocks[NCount] := NN.AddLayer( TNNetConvolutionReLU.Create(
+      Config.StemWidth, 3, {pad=}1, {stride=}2, {suppressBias=}0)
+      .SetTrainable(pTrainable) );
+    Inc(NCount);
+    for Stage := 0 to 3 do
+      for BlockIdx := 0 to Config.NumBlocksPerStage[Stage] - 1 do
+      begin
+        if BlockIdx = 0 then Stride := 2 else Stride := 1;
+        Blocks[NCount] := NN.AddLayer( TNNetConvolutionReLU.Create(
+          Config.StageWidths[Stage], 3, 1, Stride, 0).SetTrainable(pTrainable) );
+        Inc(NCount);
+      end;
+    // Head: global average pool over the spatial grid -> linear -> logits.
+    NN.AddLayer( TNNetAvgChannel.Create() );
+    FC := NN.AddLayer( TNNetFullConnectLinear.Create(
+      Config.NumLabels).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
+
+    // ---------------- Weights (fuse each block at load time) ----------------
+    NCount := 0;
+    // Stem (stage0): channels change 3 -> StemWidth, stride 2 => NO identity.
+    ReparamRepVGGBlock(Reader, Blocks[NCount], 'stage0',
+      Config.StemWidth, Config.NumChannels, {Has1x1=}true, {HasIdentity=}false,
+      Config.BnEps);
+    Inc(NCount);
+    InWidth := Config.StemWidth;
+    for Stage := 0 to 3 do
+    begin
+      OutWidth := Config.StageWidths[Stage];
+      for BlockIdx := 0 to Config.NumBlocksPerStage[Stage] - 1 do
+      begin
+        if BlockIdx = 0 then Stride := 2 else Stride := 1;
+        // identity branch exists iff width unchanged AND stride 1.
+        HasIdent := (Stride = 1) and (InWidth = OutWidth);
+        Prefix := 'stage' + IntToStr(Stage + 1) + '.' + IntToStr(BlockIdx);
+        ReparamRepVGGBlock(Reader, Blocks[NCount], Prefix,
+          OutWidth, InWidth, {Has1x1=}true, HasIdent, Config.BnEps);
+        Inc(NCount);
+        InWidth := OutWidth;
+      end;
+    end;
+    // linear head: torch Linear [num_labels, last_width] with bias.
+    LoadLlamaLinearWeights(Reader, FC, 'linear.weight',
+      Config.StageWidths[3], Config.NumLabels, 0, -1, 0, 'linear.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildRepVGGFromSafeTensorsEx(const FileName: string;
+  const Config: TRepVGGConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildRepVGG(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildRepVGGFromSafeTensors(const FileName: string;
+  out Config: TRepVGGConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadRepVGGConfigFromJSONFile(ConfigPath);
+  Result := BuildRepVGGFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
