@@ -618,6 +618,12 @@ type
   // neuraldatasets, layered on top of the built-in flip+crop pipeline.
   TNNetImageAugmentationFn = procedure(pInput: TNNetVolume; ThreadId: integer) of object;
 
+  // Batch-level (sample-pairing) augmentation mode for the image fit loop.
+  //   bamNone   - disabled (default); targets stay hard one-hot.
+  //   bamMixup  - blend lam*x_i+(1-lam)*x_j with the same convex label blend.
+  //   bamCutMix - paste a partner rectangle into x_i; label blend by area.
+  TNeuralBatchAugMode = (bamNone, bamMixup, bamCutMix);
+
   { TNeuralFitWithImageBase }
 
   TNeuralFitWithImageBase = class(TNeuralFitBase)
@@ -631,6 +637,9 @@ type
       FColorEncoding: integer;
       FChannelShiftRate: TNeuralFloat;
       FImageAugmentationFn: TNNetImageAugmentationFn;
+      FBatchAugMode: TNeuralBatchAugMode;
+      FBatchAugAlpha: TNeuralFloat;
+      FBatchAugProb: TNeuralFloat;
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -650,6 +659,18 @@ type
       // Optional opt-in single-image augmentation policy applied AFTER the
       // built-in flip/crop pipeline (nil = disabled, the default).
       property ImageAugmentationFn: TNNetImageAugmentationFn read FImageAugmentationFn write FImageAugmentationFn;
+      // Batch-level mixup / CutMix augmentation. bamNone (default) keeps hard
+      // one-hot targets. When enabled, after the per-image policy runs, each
+      // sample is (with probability BatchAugProb) paired with another randomly
+      // drawn training sample and both the input volume and the (now soft)
+      // target are rewritten as a convex blend before the forward pass.
+      property BatchAugMode: TNeuralBatchAugMode read FBatchAugMode write FBatchAugMode;
+      // Beta(Alpha, Alpha) parameter for the mixing coefficient lambda. The
+      // common practical default 1.0 yields Uniform(0,1).
+      property BatchAugAlpha: TNeuralFloat read FBatchAugAlpha write FBatchAugAlpha;
+      // Per-sample probability of applying the batch-level mix (0..1). 1.0 mixes
+      // every sample; the default 1.0 is only active once BatchAugMode <> bamNone.
+      property BatchAugProb: TNeuralFloat read FBatchAugProb write FBatchAugProb;
   end;
 
   TNNetDataAugmentationFn = procedure(pInput: TNNetVolume; ThreadId: integer) of object;
@@ -787,6 +808,14 @@ type
         pNumClasses, pBatchSize, Epochs: integer);
       procedure RunNNThread(index, threadnum: integer);
       procedure TestNNThread(index, threadnum: integer);
+      // Builds the batch-level mixup/CutMix SOFT target into TargetVolume:
+      //   target := Lambda*onehot(TagA) + (1-Lambda)*onehot(TagB)
+      // (then remapped to the +0.9/-0.1 convention when not softmax). With
+      // Lambda = 1 this is exactly the unaugmented one-hot target for TagA. The
+      // softmax-convention row sums to 1. This is the exact rewrite used inside
+      // RunNNThread; exposed so the property can be unit-tested directly.
+      procedure BuildMixedSoftTarget(TargetVolume: TNNetVolume;
+        TagA, TagB: integer; Lambda: TNeuralFloat);
   end;
 
   function MonopolarCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
@@ -1194,6 +1223,9 @@ begin
   FMultipleSamplesAtValidation := false;
   FChannelShiftRate := 0;
   FImageAugmentationFn := nil;
+  FBatchAugMode := bamNone;
+  FBatchAugAlpha := 1.0;
+  FBatchAugProb := 1.0;
 end;
 
 destructor TNeuralFitWithImageBase.Destroy();
@@ -3519,21 +3551,43 @@ begin
   FRunning := false;
 end;
 
+procedure TNeuralImageFit.BuildMixedSoftTarget(TargetVolume: TNNetVolume;
+  TagA, TagB: integer; Lambda: TNeuralFloat);
+begin
+  // Soft target := Lambda*onehot(TagA) + (1-Lambda)*onehot(TagB). Adding the
+  // two scaled one-hot rows yields a (softmax-convention) row that sums to 1
+  // by construction, regardless of whether TagA = TagB. Lambda = 1 reduces to
+  // a pure one-hot(TagA), i.e. the unaugmented target.
+  TargetVolume.Fill(0);
+  TargetVolume.FData[TagA] := TargetVolume.FData[TagA] + Lambda;
+  TargetVolume.FData[TagB] := TargetVolume.FData[TagB] + (1.0 - Lambda);
+  if not FIsSoftmax then
+  begin
+    // Match the hard-target convention (positive +0.9 / negative -0.1) used by
+    // SetClass(Tag, +0.9, -0.1): remap [0,1] -> [-0.1, 0.9] via value - 0.1.
+    TargetVolume.Add(-0.1);
+  end;
+end;
+
 procedure TNeuralImageFit.RunNNThread(index, threadnum: integer);
 var
   BlockSize, BlockSizeRest, CropSizeX, CropSizeY: integer;
   LocalNN: TNNet;
-  ImgInput, ImgInputCp: TNNetVolume;
+  ImgInput, ImgInputCp, PartnerInput: TNNetVolume;
   pOutput, vOutput: TNNetVolume;
-  I, ImgIdx: integer;
+  I, ImgIdx, PartnerIdx, PartnerTag: integer;
   OutputValue, CurrentLoss: TNeuralFloat;
   LocalHit, LocalMiss: integer;
   LocalTotalLoss, LocalErrorSum, CurrentError: TNeuralFloat;
   DepthCnt, DepthM1: integer;
   LocalChannelShiftRate: TNeuralFloat;
+  MixLambda: TNeuralFloat;
+  DidBatchMix: boolean;
+  CutX0, CutY0, CutBoxW, CutBoxH, CutX, CutY, CutD, CutXMax, CutYMax: integer;
 begin
   ImgInput := TNNetVolume.Create();
   ImgInputCp := TNNetVolume.Create();
+  PartnerInput := TNNetVolume.Create();
   pOutput := TNNetVolume.Create(FNumClasses,1,1);
   vOutput := TNNetVolume.Create(FNumClasses,1,1);
 
@@ -3628,10 +3682,62 @@ begin
       Continue;
     end;
 
+    // Batch-level mixup / CutMix (opt-in). After the per-image policy ran, pair
+    // this sample with another randomly drawn training sample and rewrite both
+    // the input volume and the (now soft) target as a convex blend. lambda=1
+    // (or a no-op CutMix box) reduces EXACTLY to the unaugmented batch.
+    DidBatchMix := false;
+    MixLambda := 1.0;
+    PartnerTag := ImgInput.Tag;
+    if FDataAugmentation and (FBatchAugMode <> bamNone) and (FNumClasses > 1)
+       and (FImgVolumes.Count > 1)
+       and ( (FBatchAugProb >= 1.0) or (Random() < FBatchAugProb) ) then
+    begin
+      PartnerIdx := Random(FImgVolumes.Count);
+      PartnerInput.Copy(FImgVolumes[PartnerIdx]);
+      PartnerTag := FImgVolumes[PartnerIdx].Tag;
+      if (PartnerTag < FNumClasses)
+         and (PartnerInput.SizeX = ImgInput.SizeX)
+         and (PartnerInput.SizeY = ImgInput.SizeY)
+         and (PartnerInput.Depth = ImgInput.Depth) then
+      begin
+        MixLambda := RandomBetaValue(FBatchAugAlpha);
+        if FBatchAugMode = bamMixup then
+        begin
+          // ImgInput := lambda*ImgInput + (1-lambda)*Partner
+          MixVolumes(ImgInput, ImgInput, PartnerInput, MixLambda);
+          DidBatchMix := true;
+        end
+        else // bamCutMix
+        begin
+          ComputeCutMixBox(ImgInput.SizeX, ImgInput.SizeY, MixLambda,
+            Random(), Random(), CutX0, CutY0, CutBoxW, CutBoxH);
+          if (CutBoxW > 0) and (CutBoxH > 0) then
+          begin
+            CutXMax := CutX0 + CutBoxW - 1;
+            CutYMax := CutY0 + CutBoxH - 1;
+            DepthM1 := ImgInput.Depth - 1;
+            for CutX := CutX0 to CutXMax do
+              for CutY := CutY0 to CutYMax do
+                for CutD := 0 to DepthM1 do
+                  ImgInput[CutX, CutY, CutD] := PartnerInput[CutX, CutY, CutD];
+          end;
+          // True pasted-area fraction (clamped box may shrink at borders).
+          MixLambda := 1.0 -
+            (CutBoxW * CutBoxH) / (ImgInput.SizeX * ImgInput.SizeY);
+          DidBatchMix := true;
+        end;
+      end;
+    end;
+
     LocalNN.Compute( ImgInput );
     LocalNN.GetOutput( pOutput );
 
-    if FIsSoftmax
+    if DidBatchMix and (MixLambda < 1.0) then
+    begin
+      BuildMixedSoftTarget(vOutput, ImgInput.Tag, PartnerTag, MixLambda);
+    end
+    else if FIsSoftmax
       then vOutput.SetClassForSoftMax( ImgInput.Tag )
       else vOutput.SetClass( ImgInput.Tag, +0.9, -0.1);
     // Optional label smoothing on the TRAINING target only (no-op when
@@ -3744,6 +3850,7 @@ begin
   {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSec);{$ENDIF}
   ImgInputCp.Free;
   ImgInput.Free;
+  PartnerInput.Free;
   vOutput.Free;
   pOutput.Free;
 end;

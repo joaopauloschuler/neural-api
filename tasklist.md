@@ -224,7 +224,7 @@ rather than acted on.
 
 ### Computer vision & generative models
 
-- [ ] mixup + CutMix batch-level augmentation (Zhang et al. 2018 / Yun et al.
+- [X] mixup + CutMix batch-level augmentation (Zhang et al. 2018 / Yun et al.
       2019, the timm/torchvision training staple). The landed augmentation stack
       (NeuralRandAugment / TrivialAugment, TNeuralAugPolicy in neuraldatasets.pas)
       is SINGLE-IMAGE only — it never mixes two examples or touches the label.
