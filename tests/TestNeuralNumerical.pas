@@ -279,6 +279,12 @@ type
     // OpenCL im2col-GEMM offload parity (vs CPU) for DeformableConv / GroupConvP4
     procedure TestDeformableConvOpenCLParity;
     procedure TestGroupConvP4OpenCLParity;
+    // OpenCL per-output-pixel bilinear-gather forward offload parity (vs CPU)
+    // for the bilinear resampler layers.
+    procedure TestFlowWarpOpenCLParity;
+    procedure TestBackwardWarpOpenCLParity;
+    procedure TestAffineGridSampleOpenCLParity;
+    procedure TestBilinearUpsampleOpenCLParity;
     procedure TestDeconvolutionOpenCLParity;
     // OpenCL forward offload parity (vs CPU) for the depthwise convolutions.
     procedure TestDepthwiseConvOpenCLParity;
@@ -58231,6 +58237,264 @@ begin
     OutCPU.Free;
     Input.Free;
     NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Forward parity for the per-output-pixel bilinear-gather OpenCL offload of the
+// resampler layers: the device gather must match the scalar+AVX CPU forward to
+// well under 1e-5. SetNeuralConvOpenCLMinWork(0) forces every output pixel onto
+// the device. Fractional flow keeps all four bilinear weights nonzero.
+procedure TTestNeuralNumerical.TestFlowWarpOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  ImgInput, FlowInput: TNNetLayer;
+  Img, Flow, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  W, H, D, x, y, i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  W := 12; H := 10; D := 5;
+  NN := TNNet.Create();
+  Img := TNNetVolume.Create(W, H, D);
+  Flow := TNNetVolume.Create(W, H, 2);
+  OutCPU := TNNetVolume.Create();
+  try
+    ImgInput  := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    FlowInput := NN.AddLayerAfter(TNNetInput.Create(W, H, 2, 1), 0);
+    NN.AddLayerAfter(TNNetFlowWarp.Create(FlowInput), ImgInput);
+    for i := 0 to Img.Size - 1 do Img.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for y := 0 to H - 1 do
+    for x := 0 to W - 1 do
+    begin
+      // Mix interior and border-saturating displacements to exercise clamp.
+      Flow.Store(x, y, 0, 1.3 * Sin(0.7 * x + 1.1 * y) + 0.4);
+      Flow.Store(x, y, 1, 1.1 * Cos(0.5 * x - 0.9 * y) - 0.3);
+    end;
+
+    ImgInput.Output.Copy(Img);
+    FlowInput.Output.Copy(Flow);
+    NN.Compute(ImgInput.Output);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      ImgInput.Output.Copy(Img);
+      FlowInput.Output.Copy(Flow);
+      NN.Compute(ImgInput.Output);
+      MaxDiff := 0;
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    AssertTrue('FlowWarp OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    OutCPU.Free; Flow.Free; Img.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestBackwardWarpOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  ImgInput, FlowInput: TNNetLayer;
+  Img, Flow, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  W, H, D, x, y, i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  W := 12; H := 10; D := 5;
+  NN := TNNet.Create();
+  Img := TNNetVolume.Create(W, H, D);
+  Flow := TNNetVolume.Create(W, H, 2);
+  OutCPU := TNNetVolume.Create();
+  try
+    ImgInput  := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    FlowInput := NN.AddLayerAfter(TNNetInput.Create(W, H, 2, 1), 0);
+    NN.AddLayerAfter(TNNetBackwardWarp.Create(FlowInput), ImgInput);
+    for i := 0 to Img.Size - 1 do Img.Raw[i] := Cos(i * 0.41) * 0.8 - 0.2;
+    for y := 0 to H - 1 do
+    for x := 0 to W - 1 do
+    begin
+      Flow.Store(x, y, 0, 1.4 * Cos(0.6 * x + 0.9 * y) - 0.5);
+      Flow.Store(x, y, 1, 1.2 * Sin(0.4 * x - 0.7 * y) + 0.35);
+    end;
+
+    ImgInput.Output.Copy(Img);
+    FlowInput.Output.Copy(Flow);
+    NN.Compute(ImgInput.Output);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      ImgInput.Output.Copy(Img);
+      FlowInput.Output.Copy(Flow);
+      NN.Compute(ImgInput.Output);
+      MaxDiff := 0;
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    AssertTrue('BackwardWarp OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    OutCPU.Free; Flow.Free; Img.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestAffineGridSampleOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  ImgInput, ThetaInput: TNNetLayer;
+  Img, Theta, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  W, H, D, i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  W := 12; H := 10; D := 5;
+  NN := TNNet.Create();
+  Img := TNNetVolume.Create(W, H, D);
+  Theta := TNNetVolume.Create(6, 1, 1);
+  OutCPU := TNNetVolume.Create();
+  try
+    ImgInput   := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    ThetaInput := NN.AddLayerAfter(TNNetInput.Create(6, 1, 1, 1), 0);
+    NN.AddLayerAfter(TNNetAffineGridSample.Create(ThetaInput), ImgInput);
+    for i := 0 to Img.Size - 1 do Img.Raw[i] := Sin(i * 0.47) * 0.7 + 0.05;
+    // Scale+rotate+translate theta whose back-warp pushes some samples out of
+    // bounds, exercising the zero-pad (masked-corner) path on the device.
+    Theta.Raw[0] := 1.15;  Theta.Raw[1] := -0.25; Theta.Raw[2] := 0.18;
+    Theta.Raw[3] := 0.22;  Theta.Raw[4] := 1.10;  Theta.Raw[5] := -0.30;
+
+    ImgInput.Output.Copy(Img);
+    ThetaInput.Output.Copy(Theta);
+    NN.Compute(ImgInput.Output);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      ImgInput.Output.Copy(Img);
+      ThetaInput.Output.Copy(Theta);
+      NN.Compute(ImgInput.Output);
+      MaxDiff := 0;
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    AssertTrue('AffineGridSample OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    OutCPU.Free; Theta.Free; Img.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestBilinearUpsampleOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  W, H, D, i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  W := 7; H := 6; D := 5;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(W, H, D);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    NN.AddLayer(TNNetBilinearUpsample.Create(3)); // 3x -> 21x18 output grid
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.39) * 0.85 - 0.1;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      MaxDiff := 0;
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    AssertTrue('BilinearUpsample OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
   end;
 end;
 {$ELSE}

@@ -531,3 +531,44 @@ __kernel void volume_operations
      FAs[g_id] = FAs[g_id] * FA + FBs[g_id] * FB;
   }
 }
+
+// CAI Bilinear Gather
+// Embarrassingly-parallel depth-blend resampler shared by the bilinear-gather
+// sampler layers (TNNetFlowWarp / TNNetBackwardWarp / TNNetAffineGridSample /
+// TNNetBilinearUpsample). The 4 source corner indices and the 4 bilinear blend
+// weights for every output pixel are precomputed ON THE CPU (exact floor /
+// border-clamp / zero-pad logic, byte-identical to the scalar forward) and
+// uploaded; this kernel only does the heavy memory-bound blend of the four
+// Depth-long source columns into the output column.
+//   FSrc      : source feature map, raw [(y*W + x)*Depth + d]    (Depth = FDepth)
+//   FCorners  : 4 source linear pixel offsets per output pixel (stored as float,
+//               exact for any realistic pixel count), [outpix*4 + corner], each =
+//               (y*W + x) for an in-bounds corner or -1 for a masked (zero-pad /
+//               out-of-range) corner.
+//   FWeights  : 4 blend weights per output pixel, [outpix*4 + corner].
+//   FDst      : output feature map, raw [outpix*Depth + d].
+// One work-item per (outpix, d): global size = FNumOut * FDepth (dim 0).
+__kernel void cai_bilinear_gather
+(
+  const int FNumOut,
+  const int FDepth,
+  __global const float* FCorners,
+  __global const float* FWeights,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FNumOut * FDepth) return;
+  const int outpix = g_id / FDepth;
+  const int d      = g_id - outpix * FDepth;
+  const int cbase  = outpix * 4;
+  float acc = 0.0f;
+  for (int c = 0; c < 4; c++)
+  {
+    const int corner = (int)FCorners[cbase + c];
+    if (corner >= 0)
+      acc += FWeights[cbase + c] * FSrc[corner * FDepth + d];
+  }
+  FDst[g_id] = acc;
+}

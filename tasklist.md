@@ -556,19 +556,26 @@ rather than acted on.
       int8 weight-only storage instead of dequantize-then-requantize (the
       k-quant Q4_K/Q6_K/Q5_K/Q2_K dequant-at-load READ path has landed in
       neural/neuralgguf.pas).
-- [ ] OpenCL forward offload for the bilinear-resample layer family:
+- [X] OpenCL forward offload for the bilinear-resample layer family:
       `TNNetBilinearUpsample`, `TNNetAffineGridSample`, `TNNetFlowWarp` and
-      `TNNetBackwardWarp`. Today only `TNNetDeformableConv` has an OpenCL path
-      (`TNNetDeformableConv.ComputeOpenCL`); these per-output-pixel bilinear-gather
-      layers — exercised by the OpticalFlow, VideoFrameInterpolation,
-      FrameInterpolation, SpatialTransformer and super-resolution examples —
-      map cleanly onto a workgroup-per-output-pixel kernel mirroring the
-      DeformableConv offload. Gate behind the existing `EnableOpenCL`/`WillOpenCL`
-      plumbing and parity-check vs the scalar forward.
-      AVX inner loop DONE (commit below): the depth-axis tap blend in all three
-      sampler `Compute()`s now uses the contiguous `Mul`/`MulAdd` idiom (same as
-      `TNNetBilinearUpsample`, which was already AVX'd) — bit-parity, full suite
-      2387/2387 green. OpenCL offload deferred as the larger/riskier follow-up.
+      `TNNetBackwardWarp`. ALL FOUR DONE (commit below). New custom kernel
+      `cai_bilinear_gather` in `neural/neural.cl` (one work-item per
+      (output-pixel, depth) channel — the embarrassingly-parallel depth-blend of
+      the four source corner columns) driven by the shared helper class
+      `TNNetBilinearGatherCL`. Each layer's `ComputeOpenCL` computes the four
+      corner pixel offsets + bilinear weights ON THE CPU (exact floor /
+      border-clamp / zero-pad logic, byte-identical to its scalar+AVX forward)
+      and hands them to the device for the blend; the zero-pad (out-of-bounds)
+      corners of `TNNetAffineGridSample` are encoded as corner offset -1 which the
+      kernel skips, matching the in-bounds-only CPU MulAdd exactly. Gated behind
+      the same `EnableOpenCL`/`FShouldOpenCL` plumbing as `TNNetDeformableConv`
+      (default off / falls back to the CPU forward, work-threshold
+      `NeuralConvOpenCLMinWork`). Per-layer parity tests added
+      (`Test{FlowWarp,BackwardWarp,AffineGridSample,BilinearUpsample}OpenCLParity`
+      in TestNeuralNumerical) all pass vs the CPU forward at < 1e-5 on the PoCL
+      FP32 device; full suite 2391/2391 green under both the default and
+      `-dOpenCL` builds. AVX inner loop was DONE in a prior commit (the depth-axis
+      tap blend uses the contiguous `Mul`/`MulAdd` idiom in every sampler).
 - [ ] FP16 (half-precision) OpenCL compute path for the dot-product/matmul
       offload. ENV NOTE (2026-06-27): the only OpenCL device available here is
       PoCL on the host CPU, which does NOT advertise `cl_khr_fp16` (clinfo shows
