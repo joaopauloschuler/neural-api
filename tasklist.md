@@ -1545,6 +1545,60 @@ rather than acted on.
       used CV backbone family distinct from the landed ResNet and EfficientNet
       importers (RegNet's grouped-bottleneck design space sits between them), giving
       another drop-in ImageNet feature extractor for the landed eval harness.
+- [ ] Qwen-Image text-to-image MMDiT importer (`BuildQwenImageFromSafeTensors[Ex]`,
+      Qwen/Qwen-Image, model_type `qwen_image`). The 2025 flagship open text-to-image
+      model: a Qwen2.5-VL text encoder (LANDED — `BuildQwen2VL`-family) feeds an
+      MMDiT-style double-stream diffusion transformer over packed VAE latents, with a
+      16-channel VAE decoder (the landed `BuildVaeDecoder` path) producing the image.
+      Almost entirely a wiring job over already-landed pieces: the MMDiT joint-attention
+      blocks (the SD3/FLUX `MMDiT` task's building blocks), the landed
+      `TNNetDiffusionScheduler` (flow-matching/Euler sampling already supported), the
+      VAE decoder and the Qwen2.5-VL prompt encoder. New work is the config-driven
+      block stacking + the modulation (AdaLN-Zero) timestep/text conditioning wiring and
+      the 2-D RoPE over latent patches. Pico fixture + `TestQwenImage*Parity` < 1e-4 vs a
+      float64 HF `QwenImagePipeline` transformer forward on a fixed latent/text pair.
+      Real value: a current state-of-the-art open text-to-image generator runnable as a
+      single native binary, reusing the diffusion + VAE + Qwen-VL infrastructure already
+      in the repo.
+- [ ] MaxViT image-classification backbone importer (`BuildMaxViTFromSafeTensors[Ex]`,
+      timm `maxvit_*` / `coatnet_*`, e.g. timm/maxvit_tiny_tf_224). Tu et al. 2022
+      (*MaxViT: Multi-Axis Vision Transformer*): a stem + 4 stages, each MaxViT block
+      being MBConv (depthwise-separable + SE, all landed layers) followed by **block
+      attention** (window-local self-attention, the landed sliding-window SDPA path) and
+      **grid attention** (dilated/strided global self-attention over a sparse grid — the
+      same windowed-SDPA layer applied on a transposed/grid-gathered token layout). The
+      only genuinely new wiring is the grid-gather/scatter token reshape feeding the
+      landed attention layer + relative-position bias; everything else (MBConv, SE,
+      LayerNorm, MLP) is drop-in. Pico fixture + `TestMaxViTLogitParity` < 1e-4 vs a
+      float64 HF/timm forward. Real value: a strong hybrid conv+attention backbone whose
+      multi-axis (local block + sparse grid) attention is architecturally distinct from
+      the landed Swin (shifted-window) and ConvNeXt (pure-conv) backbones, adding another
+      feature extractor for the landed ImageNet eval harness.
+- [ ] `TNNetBicubicUpsample` layer — arbitrary-factor bicubic image upsampling, the
+      cubic-convolution (Keys a=-0.5) sibling of the landed `TNNetBilinearUpsample` and
+      `TNNetNearestNeighbor`/`TNNetUpsample`. Per output pixel, gather the 4x4 source
+      neighbourhood and combine with the separable cubic weights (row cubic then column
+      cubic). Forward and backward both AVX-vectorize the same way the bilinear layer
+      already does — the inner combination is `Move + 3x MulAdd` over Depth-contiguous
+      source columns per cubic tap (per the depth-contiguous rule), and the backward is
+      the transpose scatter. Match PyTorch `F.interpolate(mode='bicubic',
+      align_corners=False)` (and an `align_corners=True` flag) so importer paths that
+      need bicubic resize (several super-resolution / detection preprocessors) stop
+      falling back to bilinear. Numerical-gradient input test + a forward-parity test vs
+      a float64 reference (the same `TestBilinearUpsample*Parity` shape). Real value: a
+      missing-but-standard CV resize primitive that several torch vision pipelines assume.
+- [ ] GGUF Q3_K + legacy Q4_0/Q4_1/Q5_0/Q5_1 dequantization in the reader
+      (`neural/neuralgguf.pas`). The reader already dequantizes F32/F16/Q8_0 and the
+      k-quants Q2_K/Q4_K/Q5_K/Q6_K (the dominant `Q4_K_M`/`Q5_K_M`/`Q6_K` mixes) but
+      raises `EGGUFError` on Q3_K and the legacy round-to-nearest quants. Port ggml's
+      `dequantize_row_q3_K` (super-block of 16 sub-blocks of 16: 32 bytes hmask for the
+      3rd bit-plane, 64 bytes 2-bit quants, 12 bytes 6-bit packed scales, f16 d) and the
+      simple legacy block layouts (`q4_0` = f16 d + 32 nibbles; `q4_1` adds f16 m; `q5_0`
+      adds a 5th-bit plane; `q5_1` adds f16 m), dequantizing to FP32 on load like the
+      existing paths. Round-trip / value test against a tiny known tensor per type. Real
+      value: `Q3_K_M` is a common low-RAM quant for local LLMs and `q4_0` still appears
+      on older GGUFs, so this lets `BuildLlamaFromGGUF` (and the GGUF dispatch) load
+      several checkpoints the reader currently rejects.
 
 ## Layer follow-ups that fix real limitations
 
