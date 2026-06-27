@@ -1306,6 +1306,7 @@ type
     procedure TestBitProcessingClippingGradient;
     procedure TestBitProcessingSerializationRoundTrip;
     procedure TestPointwiseBitProcessingShapeRoundTripGradient;
+    procedure TestBilinearUpsampleForwardParity;
   end;
 
 implementation
@@ -63175,6 +63176,91 @@ begin
     NN.Free;
     Input.Free;
     Target.Free;
+  end;
+end;
+
+// Forward parity for the AVX-vectorized TNNetBilinearUpsample.Compute: compares
+// the layer output against an independent scalar reference using the SAME
+// factored corner-weight math (w00*src00 + w10*src10 + w01*src01 + w11*src11)
+// the vectorized MulAdd path uses, so it is bit-identical on the scalar build
+// and within 1e-6 on -dAVX2.
+procedure TTestNeuralNumerical.TestBilinearUpsampleForwardParity;
+const
+  cInX = 5; cInY = 4; cD = 11; cFactor = 3;
+var
+  NN: TNNet;
+  Input, Ref: TNNetVolume;
+  Up: TNNetBilinearUpsample;
+  s, OutX, OutY, ox, oy, c: integer;
+  ix0, ix1, iy0, iy1: integer;
+  wx1, wy1, w00, w10, w01, w11, v, MaxDiff, Diff: TNeuralFloat;
+
+  // Mirror of BilinearMap in neuralnetwork.pas (align_corners=False).
+  procedure Map(o, sc, InSize: integer; out i0, i1: integer; out w1: TNeuralFloat);
+  var sf, fr: TNeuralFloat;
+  begin
+    sf := (o + 0.5) / sc - 0.5;
+    if sf < 0 then sf := 0;
+    i0 := Trunc(sf);
+    fr := sf - i0;
+    i1 := i0 + 1;
+    if i1 > InSize - 1 then i1 := InSize - 1;
+    if i0 > InSize - 1 then i0 := InSize - 1;
+    w1 := fr;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cInX, cInY, cD);
+  Ref := nil;
+  try
+    NN.AddLayer(TNNetInput.Create(cInX, cInY, cD, 1));
+    Up := TNNetBilinearUpsample(NN.AddLayer(TNNetBilinearUpsample.Create(cFactor)));
+
+    for c := 0 to Input.Size - 1 do Input.Raw[c] := Random() - 0.5;
+    NN.Compute(Input);
+
+    s := cFactor;
+    OutX := cInX * s; OutY := cInY * s;
+    AssertEquals('Output SizeX', OutX, Up.Output.SizeX);
+    AssertEquals('Output SizeY', OutY, Up.Output.SizeY);
+    AssertEquals('Output Depth', cD, Up.Output.Depth);
+
+    Ref := TNNetVolume.Create(OutX, OutY, cD);
+    for oy := 0 to OutY - 1 do
+    begin
+      Map(oy, s, cInY, iy0, iy1, wy1);
+      for ox := 0 to OutX - 1 do
+      begin
+        Map(ox, s, cInX, ix0, ix1, wx1);
+        w00 := (1 - wy1) * (1 - wx1);
+        w10 := (1 - wy1) * wx1;
+        w01 := wy1 * (1 - wx1);
+        w11 := wy1 * wx1;
+        for c := 0 to cD - 1 do
+        begin
+          v := w00 * Input[ix0, iy0, c];
+          v := v + w10 * Input[ix1, iy0, c];
+          v := v + w01 * Input[ix0, iy1, c];
+          v := v + w11 * Input[ix1, iy1, c];
+          Ref[ox, oy, c] := v;
+        end;
+      end;
+    end;
+
+    MaxDiff := 0;
+    for c := 0 to Ref.Size - 1 do
+    begin
+      Diff := Abs(Ref.Raw[c] - Up.Output.Raw[c]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('BilinearUpsample forward parity, max diff=' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+    Ref.Free;
   end;
 end;
 

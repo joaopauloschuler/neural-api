@@ -38888,30 +38888,39 @@ end;
 
 procedure TNNetBilinearUpsample.Compute();
 var
-  s, OutX, OutY, D, ox, oy, c: integer;
-  OutXM1, OutYM1, DM1: integer;
+  s, OutX, OutY, D, ox, oy: integer;
+  OutXM1, OutYM1: integer;
   ix0, ix1, iy0, iy1: integer;
-  wx1, wy1, v: TNeuralFloat;
+  wx1, wy1, w00, w10, w01, w11: TNeuralFloat;
+  OutPtr: TNeuralFloatArrPtr;
+  PrevOutput: TNNetVolume;
   StartTime: double;
 begin
   StartTime := Now();
   s := FStruct[0];
+  PrevOutput := FPrevLayer.Output;
   OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
-  OutXM1 := OutX - 1; OutYM1 := OutY - 1; DM1 := D - 1;
+  OutXM1 := OutX - 1; OutYM1 := OutY - 1;
   for oy := 0 to OutYM1 do
   begin
-    BilinearMap(oy, s, FPrevLayer.Output.SizeY, iy0, iy1, wy1);
+    BilinearMap(oy, s, PrevOutput.SizeY, iy0, iy1, wy1);
     for ox := 0 to OutXM1 do
     begin
-      BilinearMap(ox, s, FPrevLayer.Output.SizeX, ix0, ix1, wx1);
-      for c := 0 to DM1 do
-      begin
-        v := (1 - wy1) * ((1 - wx1) * FPrevLayer.Output[ix0, iy0, c] +
-                          wx1 * FPrevLayer.Output[ix1, iy0, c]) +
-             wy1 * ((1 - wx1) * FPrevLayer.Output[ix0, iy1, c] +
-                    wx1 * FPrevLayer.Output[ix1, iy1, c]);
-        FOutput[ox, oy, c] := v;
-      end;
+      BilinearMap(ox, s, PrevOutput.SizeX, ix0, ix1, wx1);
+      // Bilinear corner weights computed once per output pixel; the depth axis
+      // is contiguous so each source column is a Depth-long contiguous run and
+      // the per-channel blend becomes an AVX MulAdd accumulation.
+      w00 := (1 - wy1) * (1 - wx1);
+      w10 := (1 - wy1) * wx1;
+      w01 := wy1 * (1 - wx1);
+      w11 := wy1 * wx1;
+      OutPtr := FOutput.GetRawPtr(ox, oy, 0);
+      // OutCol := w00*src00; then += w10*src10 + w01*src01 + w11*src11.
+      Move(PrevOutput.GetRawPtr(ix0, iy0, 0)^, OutPtr^, D * SizeOf(TNeuralFloat));
+      TNNetVolume.Mul(OutPtr, w00, D);
+      TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ix1, iy0, 0), w10, D);
+      TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ix0, iy1, 0), w01, D);
+      TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ix1, iy1, 0), w11, D);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);

@@ -513,7 +513,7 @@ rather than acted on.
       part that must stay on host, or fold the stride/pad addressing into the
       kernel). Guard behind `FShouldOpenCL`, keep the AVX scatter as the fallback,
       and pin an SDPAOpenCLParity-style exact-vs-CPU test on a fixed deconv fixture.
-- [ ] AVX-vectorize `TNNetBilinearUpsample.Compute`. The bilinear blend's innermost
+- [X] AVX-vectorize `TNNetBilinearUpsample.Compute`. The bilinear blend's innermost
       loop runs over the depth channel `c` (`FOutput[ox,oy,c] := (1-wy)*((1-wx)*a +
       wx*b) + wy*(...)`), and the four sampled source columns `Prev[ix0,iy0,:]`,
       `Prev[ix1,iy0,:]`, `Prev[ix0,iy1,:]`, `Prev[ix1,iy1,:]` are each `Depth`
