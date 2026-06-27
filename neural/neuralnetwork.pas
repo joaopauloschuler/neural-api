@@ -13390,6 +13390,38 @@ type
       {$ENDIF}
   end;
 
+  /// Spatial BICUBIC upsample by an INTEGER factor, matching PyTorch's
+  // nn.functional.interpolate(mode='bicubic', align_corners=...). Given an input
+  // (W,H,C) and factor s it produces (W*s, H*s, C). This is the cubic-convolution
+  // (Keys) sibling of TNNetBilinearUpsample: per output pixel it gathers the 4x4
+  // source neighbourhood and combines it with the SEPARABLE cubic weights (one
+  // cubic kernel along X, one along Y). The 4 fractional taps use the standard
+  // Keys coefficients with A = -0.75 (the value PyTorch's bicubic resampler uses,
+  // NOT the -0.5 Catmull-Rom variant), so the forward output matches
+  // F.interpolate(mode='bicubic') bit-for-bit (within float rounding).
+  // Source-coordinate maps:
+  //   align_corners=False : src = (o+0.5)/s - 0.5            (PyTorch default)
+  //   align_corners=True  : src = o*(InSize-1)/(OutSize-1)   (OutSize=InSize*s)
+  // The 4 source rows/cols floor(src)-1..floor(src)+2 are CLAMPED to [0,n-1]
+  // (replicate edge), exactly like PyTorch's bicubic border handling. Applied
+  // independently per channel; no trainable parameters. The factor is serialized
+  // in FStruct[0] and the align_corners flag in FStruct[1] so the layer
+  // round-trips through Save/LoadFromString. Both forward and backward AVX-
+  // vectorize over the Depth-contiguous source columns the same way the bilinear
+  // layer does: the inner per-tap combination is a Move + 3x MulAdd over the
+  // Depth-long contiguous run, and backward is the transpose scatter (the exact
+  // adjoint) accumulating grad*weight into each of the 16 source columns.
+  // Coded by Claude (AI).
+  TNNetBicubicUpsample = class(TNNetLayer)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pFactor: integer = 2;
+        pAlignCorners: integer = 0); reintroduce; overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// Spatial BILINEAR resize to an ABSOLUTE target (W,H), matching PyTorch's
   // nn.functional.interpolate(mode='bilinear', size=(H,W), align_corners=...).
   // Unlike TNNetBilinearUpsample (integer up-only factor, align_corners=False),
@@ -40559,6 +40591,177 @@ begin
       TNNetVolume.MulAdd(PrevError.GetRawPtr(ix1, iy0, 0), GradPtr, w10, D);
       TNNetVolume.MulAdd(PrevError.GetRawPtr(ix0, iy1, 0), GradPtr, w01, D);
       TNNetVolume.MulAdd(PrevError.GetRawPtr(ix1, iy1, 0), GradPtr, w11, D);
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetBicubicUpsample }
+constructor TNNetBicubicUpsample.Create(pFactor, pAlignCorners: integer);
+begin
+  inherited Create();
+  if pFactor < 1 then pFactor := 1;
+  FStruct[0] := pFactor;
+  if pAlignCorners <> 0 then FStruct[1] := 1 else FStruct[1] := 0;
+end;
+
+procedure TNNetBicubicUpsample.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  s: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  s := FStruct[0];
+  if s < 1 then s := 1;
+  FOutput.ReSize(pPrevLayer.Output.SizeX * s,
+                 pPrevLayer.Output.SizeY * s,
+                 pPrevLayer.Output.Depth);
+  SetOutputErrorSize(FOutput);
+end;
+
+// Keys cubic-convolution kernel with A=-0.75 (PyTorch bicubic). For fractional
+// t in [0,1) returns the 4 tap weights for the source offsets -1,0,+1,+2 from
+// floor(src). The weights sum to 1.
+procedure CubicWeights(t: TNeuralFloat; out w0, w1, w2, w3: TNeuralFloat); inline;
+const
+  A = -0.75;
+var
+  t2, t3: TNeuralFloat;
+begin
+  // Distances of the four taps to the sample point are (t+1), t, (1-t), (2-t).
+  // Using the standard expansion of the Keys kernel at those distances:
+  t2 := t * t;
+  t3 := t2 * t;
+  w0 := A * (t3 - 2 * t2 + t);                                 // tap at offset -1
+  w1 := (A + 2) * t3 - (A + 3) * t2 + 1;                       // tap at offset  0
+  w2 := -(A + 2) * t3 + (2 * A + 3) * t2 - A * t;              // tap at offset +1
+  w3 := -A * (t3 - t2);                                        // tap at offset +2
+end;
+
+// Bicubic source geometry along one axis: for output index o (axis output size
+// OutSize, source size InSize, factor s) returns the 4 CLAMPED source indices
+// i0..i3 (floor(src)-1..+2, replicate edge) and the 4 cubic tap weights.
+procedure BicubicMap(o, s, InSize, OutSize, AlignCorners: integer;
+  out i0, i1, i2, i3: integer; out w0, w1, w2, w3: TNeuralFloat); inline;
+var
+  src, t: TNeuralFloat;
+  ib: integer;
+
+  function Clamp(i: integer): integer; inline;
+  begin
+    if i < 0 then Result := 0
+    else if i > InSize - 1 then Result := InSize - 1
+    else Result := i;
+  end;
+
+begin
+  if AlignCorners <> 0 then
+  begin
+    if OutSize > 1 then src := o * ((InSize - 1) / (OutSize - 1))
+    else src := 0;
+  end
+  else
+    src := (o + 0.5) / s - 0.5;
+  ib := Floor(src);
+  t := src - ib;
+  CubicWeights(t, w0, w1, w2, w3);
+  i0 := Clamp(ib - 1);
+  i1 := Clamp(ib);
+  i2 := Clamp(ib + 1);
+  i3 := Clamp(ib + 2);
+end;
+
+procedure TNNetBicubicUpsample.Compute();
+var
+  s, OutX, OutY, D, ox, oy, ac, r: integer;
+  iy: array[0..3] of integer;
+  i0, i1, i2, i3: integer;
+  wx0, wx1, wx2, wx3, wy0, wy1, wy2, wy3: TNeuralFloat;
+  wy: array[0..3] of TNeuralFloat;
+  ixc: array[0..3] of integer;
+  OutPtr: TNeuralFloatArrPtr;
+  PrevOutput: TNNetVolume;
+  StartTime: double;
+begin
+  StartTime := Now();
+  s := FStruct[0];
+  ac := FStruct[1];
+  PrevOutput := FPrevLayer.Output;
+  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
+  for oy := 0 to OutY - 1 do
+  begin
+    BicubicMap(oy, s, PrevOutput.SizeY, OutY, ac,
+      iy[0], iy[1], iy[2], iy[3], wy0, wy1, wy2, wy3);
+    wy[0] := wy0; wy[1] := wy1; wy[2] := wy2; wy[3] := wy3;
+    for ox := 0 to OutX - 1 do
+    begin
+      BicubicMap(ox, s, PrevOutput.SizeX, OutX, ac,
+        i0, i1, i2, i3, wx0, wx1, wx2, wx3);
+      ixc[0] := i0; ixc[1] := i1; ixc[2] := i2; ixc[3] := i3;
+      // Separable cubic: for each of the 4 source rows, blend its 4 columns into
+      // a temporary then accumulate with the row weight. The depth axis is
+      // contiguous, so each source column is a Depth-long run and the per-channel
+      // blend becomes a Move + 3x MulAdd over Depth (AVX MulAdd accumulation).
+      OutPtr := FOutput.GetRawPtr(ox, oy, 0);
+      // Initialise the output column from the FIRST (row 0) cubic combination
+      // scaled by wy[0], then accumulate the remaining 3 rows.
+      Move(PrevOutput.GetRawPtr(ixc[0], iy[0], 0)^, OutPtr^, D * SizeOf(TNeuralFloat));
+      TNNetVolume.Mul(OutPtr, wx0 * wy[0], D);
+      TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ixc[1], iy[0], 0), wx1 * wy[0], D);
+      TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ixc[2], iy[0], 0), wx2 * wy[0], D);
+      TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ixc[3], iy[0], 0), wx3 * wy[0], D);
+      for r := 1 to 3 do
+      begin
+        TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ixc[0], iy[r], 0), wx0 * wy[r], D);
+        TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ixc[1], iy[r], 0), wx1 * wy[r], D);
+        TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ixc[2], iy[r], 0), wx2 * wy[r], D);
+        TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ixc[3], iy[r], 0), wx3 * wy[r], D);
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetBicubicUpsample.Backpropagate();
+var
+  s, OutX, OutY, D, ox, oy, ac, r: integer;
+  ix0, ix1, ix2, ix3: integer;
+  iy: array[0..3] of integer;
+  wx: array[0..3] of TNeuralFloat;
+  wy: array[0..3] of TNeuralFloat;
+  ixc: array[0..3] of integer;
+  GradPtr: TNeuralFloatArrPtr;
+  PrevError: TNNetVolume;
+  StartTime: double;
+  cc: integer;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  s := FStruct[0];
+  ac := FStruct[1];
+  PrevError := FPrevLayer.OutputError;
+  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
+  for oy := 0 to OutY - 1 do
+  begin
+    BicubicMap(oy, s, FPrevLayer.Output.SizeY, OutY, ac,
+      iy[0], iy[1], iy[2], iy[3], wy[0], wy[1], wy[2], wy[3]);
+    for ox := 0 to OutX - 1 do
+    begin
+      BicubicMap(ox, s, FPrevLayer.Output.SizeX, OutX, ac,
+        ix0, ix1, ix2, ix3, wx[0], wx[1], wx[2], wx[3]);
+      ixc[0] := ix0; ixc[1] := ix1; ixc[2] := ix2; ixc[3] := ix3;
+      // Transpose of the forward 4x4 weighted read: scatter the output pixel's
+      // depth-vector grad into all 16 source columns weighted by wy[r]*wx[c].
+      // Each source column is the same Depth-long contiguous run, so the scatter
+      // is an AVX MulAdd accumulation (prevError += grad * (wy*wx)). Clamped
+      // border indices naturally accumulate multiple taps into the same column.
+      GradPtr := FOutputError.GetRawPtr(ox, oy, 0);
+      for r := 0 to 3 do
+        for cc := 0 to 3 do
+          TNNetVolume.MulAdd(PrevError.GetRawPtr(ixc[cc], iy[r], 0),
+            GradPtr, wy[r] * wx[cc], D);
     end;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -101404,6 +101607,7 @@ begin
       'TNNetUpsample' :             Result := TNNetUpsample.Create();
       'TNNetPixelShuffle' :         Result := TNNetPixelShuffle.Create(St[0]);
       'TNNetBilinearUpsample' :     Result := TNNetBilinearUpsample.Create(St[0]);
+      'TNNetBicubicUpsample' :      Result := TNNetBicubicUpsample.Create(St[0], St[1]);
       'TNNetBilinearResize' :       Result := TNNetBilinearResize.Create(St[0], St[1], St[2]);
       'TNNetLayerMaxNormalization': Result := TNNetLayerMaxNormalization.Create();
       'TNNetLayerStdNormalization': Result := TNNetLayerStdNormalization.Create();
@@ -101831,6 +102035,7 @@ begin
       if S[0] = 'TNNetUpsample' then Result := TNNetUpsample.Create() else
       if S[0] = 'TNNetPixelShuffle' then Result := TNNetPixelShuffle.Create(St[0]) else
       if S[0] = 'TNNetBilinearUpsample' then Result := TNNetBilinearUpsample.Create(St[0]) else
+      if S[0] = 'TNNetBicubicUpsample' then Result := TNNetBicubicUpsample.Create(St[0], St[1]) else
       if S[0] = 'TNNetBilinearResize' then Result := TNNetBilinearResize.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetLayerMaxNormalization' then Result := TNNetLayerMaxNormalization.Create() else
       if S[0] = 'TNNetLayerStdNormalization' then Result := TNNetLayerStdNormalization.Create() else

@@ -1574,19 +1574,6 @@ rather than acted on.
       multi-axis (local block + sparse grid) attention is architecturally distinct from
       the landed Swin (shifted-window) and ConvNeXt (pure-conv) backbones, adding another
       feature extractor for the landed ImageNet eval harness.
-- [ ] `TNNetBicubicUpsample` layer — arbitrary-factor bicubic image upsampling, the
-      cubic-convolution (Keys a=-0.5) sibling of the landed `TNNetBilinearUpsample` and
-      `TNNetNearestNeighbor`/`TNNetUpsample`. Per output pixel, gather the 4x4 source
-      neighbourhood and combine with the separable cubic weights (row cubic then column
-      cubic). Forward and backward both AVX-vectorize the same way the bilinear layer
-      already does — the inner combination is `Move + 3x MulAdd` over Depth-contiguous
-      source columns per cubic tap (per the depth-contiguous rule), and the backward is
-      the transpose scatter. Match PyTorch `F.interpolate(mode='bicubic',
-      align_corners=False)` (and an `align_corners=True` flag) so importer paths that
-      need bicubic resize (several super-resolution / detection preprocessors) stop
-      falling back to bilinear. Numerical-gradient input test + a forward-parity test vs
-      a float64 reference (the same `TestBilinearUpsample*Parity` shape). Real value: a
-      missing-but-standard CV resize primitive that several torch vision pipelines assume.
 - [ ] GGUF Q3_K + legacy Q4_0/Q4_1/Q5_0/Q5_1 dequantization in the reader
       (`neural/neuralgguf.pas`). The reader already dequantizes F32/F16/Q8_0 and the
       k-quants Q2_K/Q4_K/Q5_K/Q6_K (the dominant `Q4_K_M`/`Q5_K_M`/`Q6_K` mixes) but

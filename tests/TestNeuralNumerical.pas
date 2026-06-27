@@ -1344,6 +1344,8 @@ type
     procedure TestPointwiseBitProcessingShapeRoundTripGradient;
     procedure TestBilinearUpsampleForwardParity;
     procedure TestBilinearUpsampleBackwardParity;
+    procedure TestBicubicUpsampleForwardParity;
+    procedure TestBicubicUpsampleInputGradientCheck;
   end;
 
 implementation
@@ -64875,6 +64877,222 @@ begin
     Desired.Free;
     Grad.Free;
     Ref.Free;
+  end;
+end;
+
+// Forward parity for TNNetBicubicUpsample.Compute against a float64 separable
+// cubic-convolution reference (Keys A=-0.75, the PyTorch bicubic constant) and
+// against a handful of golden values produced by
+// torch.nn.functional.interpolate(mode='bicubic', align_corners=...). The same
+// input grid (1,2,4,5) -> factor 3 is used in both align_corners conventions.
+procedure TTestNeuralNumerical.TestBicubicUpsampleForwardParity;
+const
+  cInX = 5; cInY = 4; cD = 2; cFactor = 3;
+  A = -0.75;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Up: TNNetBicubicUpsample;
+  OutX, OutY, ox, oy, c, m, n, acFlag: integer;
+  ix, iy: array[0..3] of integer;
+  wx, wy: array[0..3] of Double;
+  refv, vv, MaxDiff, Diff: Double;
+
+  procedure CubicW(t: Double; out w0, w1, w2, w3: Double);
+  var t2, t3: Double;
+  begin
+    t2 := t * t; t3 := t2 * t;
+    w0 := A * (t3 - 2 * t2 + t);
+    w1 := (A + 2) * t3 - (A + 3) * t2 + 1;
+    w2 := -(A + 2) * t3 + (2 * A + 3) * t2 - A * t;
+    w3 := -A * (t3 - t2);
+  end;
+
+  function Clamp(i, lim: integer): integer;
+  begin
+    if i < 0 then Result := 0
+    else if i > lim - 1 then Result := lim - 1
+    else Result := i;
+  end;
+
+  procedure Map(o, s, InSize, OutSize, ac: integer;
+    out i0, i1, i2, i3: integer; out w0, w1, w2, w3: Double);
+  var src, t: Double; ib: integer;
+  begin
+    if ac <> 0 then
+    begin
+      if OutSize > 1 then src := o * ((InSize - 1) / (OutSize - 1)) else src := 0;
+    end
+    else src := (o + 0.5) / s - 0.5;
+    ib := Floor(src);
+    t := src - ib;
+    CubicW(t, w0, w1, w2, w3);
+    i0 := Clamp(ib - 1, InSize); i1 := Clamp(ib, InSize);
+    i2 := Clamp(ib + 1, InSize); i3 := Clamp(ib + 2, InSize);
+  end;
+
+begin
+  RandSeed := 424242;
+  for acFlag := 0 to 1 do
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(cInX, cInY, cD);
+    try
+      NN.AddLayer(TNNetInput.Create(cInX, cInY, cD, 1));
+      Up := TNNetBicubicUpsample(NN.AddLayer(
+        TNNetBicubicUpsample.Create(cFactor, acFlag)));
+      OutX := cInX * cFactor; OutY := cInY * cFactor;
+
+      // Same deterministic ramp used to derive the PyTorch goldens below.
+      for c := 0 to cInX * cInY * cD - 1 do
+        Input.Raw[c] := c / 7.0 - 1.0;
+      NN.Compute(Input);
+
+      AssertEquals('Bicubic Output SizeX', OutX, Up.Output.SizeX);
+      AssertEquals('Bicubic Output SizeY', OutY, Up.Output.SizeY);
+      AssertEquals('Bicubic Output Depth', cD, Up.Output.Depth);
+
+      MaxDiff := 0;
+      for oy := 0 to OutY - 1 do
+      begin
+        Map(oy, cFactor, cInY, OutY, acFlag, iy[0], iy[1], iy[2], iy[3],
+          wy[0], wy[1], wy[2], wy[3]);
+        for ox := 0 to OutX - 1 do
+        begin
+          Map(ox, cFactor, cInX, OutX, acFlag, ix[0], ix[1], ix[2], ix[3],
+            wx[0], wx[1], wx[2], wx[3]);
+          for c := 0 to cD - 1 do
+          begin
+            refv := 0;
+            for m := 0 to 3 do
+              for n := 0 to 3 do
+                refv := refv + wy[m] * wx[n] * Input[ix[n], iy[m], c];
+            vv := Up.Output[ox, oy, c];
+            Diff := Abs(refv - vv);
+            if Diff > MaxDiff then MaxDiff := Diff;
+          end;
+        end;
+      end;
+      AssertTrue('Bicubic forward parity (ac=' + IntToStr(acFlag) +
+        ') vs float64 ref, max diff=' + FloatToStr(MaxDiff), MaxDiff < 1e-4);
+    finally
+      NN.Free;
+      Input.Free;
+    end;
+  end;
+
+  // PyTorch golden pins (F.interpolate, A=-0.75). Input ramp c/7-1, factor 3.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cInX, cInY, cD);
+  try
+    NN.AddLayer(TNNetInput.Create(cInX, cInY, cD, 1));
+    Up := TNNetBicubicUpsample(NN.AddLayer(TNNetBicubicUpsample.Create(cFactor, 0)));
+    for c := 0 to cInX * cInY * cD - 1 do Input.Raw[c] := c / 7.0 - 1.0;
+    NN.Compute(Input);
+    AssertTrue('Bicubic golden ac=0 (0,0,0)',
+      Abs(Up.Output[0, 0, 0] - (-1.1904761905)) < 1e-5);
+    AssertTrue('Bicubic golden ac=0 (7,5,0)',
+      Abs(Up.Output[7, 5, 0] - 1.5291005291) < 1e-5);
+    AssertTrue('Bicubic golden ac=0 (14,11,1)',
+      Abs(Up.Output[14, 11, 1] - 4.7619047619) < 1e-5);
+    AssertTrue('Bicubic golden ac=0 (2,3,1)',
+      Abs(Up.Output[2, 3, 1] - 0.0370370370) < 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cInX, cInY, cD);
+  try
+    NN.AddLayer(TNNetInput.Create(cInX, cInY, cD, 1));
+    Up := TNNetBicubicUpsample(NN.AddLayer(TNNetBicubicUpsample.Create(cFactor, 1)));
+    for c := 0 to cInX * cInY * cD - 1 do Input.Raw[c] := c / 7.0 - 1.0;
+    NN.Compute(Input);
+    AssertTrue('Bicubic golden ac=1 (0,0,0)',
+      Abs(Up.Output[0, 0, 0] - (-1.0000000000)) < 1e-5);
+    AssertTrue('Bicubic golden ac=1 (7,5,0)',
+      Abs(Up.Output[7, 5, 0] - 1.5645594075) < 1e-5);
+    AssertTrue('Bicubic golden ac=1 (14,11,1)',
+      Abs(Up.Output[14, 11, 1] - 4.5714285714) < 1e-5);
+    AssertTrue('Bicubic golden ac=1 (2,3,1)',
+      Abs(Up.Output[2, 3, 1] - 0.3508674541) < 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Finite-difference vs analytic INPUT gradient for TNNetBicubicUpsample. The
+// resample is exactly linear in the input, so the central difference is accurate
+// (bicubic taps can be negative, so the 1e-2 tolerance gives headroom against
+// float32 cancellation). Shared RNG -> reseed.
+procedure TTestNeuralNumerical.TestBicubicUpsampleInputGradientCheck;
+const
+  cInX = 5; cInY = 4; cD = 2; cFactor = 2;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, InSize, OutSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  InSize := cInX * cInY * cD;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cInX, cInY, cD);
+  InputPlus := TNNetVolume.Create(cInX, cInY, cD);
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(cInX, cInY, cD, 1)); // 1 = collect input error
+    NN.AddLayer(TNNetBicubicUpsample.Create(cFactor, 0));
+    OutSize := NN.GetLastLayer.Output.Size;
+    Desired := TNNetVolume.Create(OutSize, 1, 1);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to InSize - 1 do Input.Raw[i] := Sin(i * 0.7) * 0.4 + 0.05;
+    for i := 0 to OutSize - 1 do Desired.Raw[i] := Cos(i * 0.5) * 0.4;
+
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+
+      AssertTrue('Bicubic input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  Bicubic input gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
   end;
 end;
 
