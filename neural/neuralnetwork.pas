@@ -29083,8 +29083,8 @@ end;
 procedure TNNetCorrelationVolume.Compute();
 var
   StartTime: double;
-  W, H, C, ix, iy, jx, jy, dd, ch: integer;
-  WM1, HM1, CM1: integer;
+  W, H, C, ix, iy, jx, jy, ch: integer;
+  WM1, HM1: integer;
   f1, f2: TNNetVolume;
   acc, invSqrtC: TNeuralFloat;
 begin
@@ -29092,16 +29092,18 @@ begin
   f1 := FPrevLayer.FOutput;
   f2 := FF2Layer.FOutput;
   W := f1.SizeX; H := f1.SizeY; C := f1.Depth;
-  WM1 := W - 1; HM1 := H - 1; CM1 := C - 1;
+  WM1 := W - 1; HM1 := H - 1;
   if C > 0 then invSqrtC := 1.0 / Sqrt(C) else invSqrtC := 1.0;
   for iy := 0 to HM1 do
   for ix := 0 to WM1 do
     for jy := 0 to HM1 do
     for jx := 0 to WM1 do
     begin
-      acc := 0;
-      for dd := 0 to CM1 do
-        acc := acc + f1.Get(ix, iy, dd) * f2.Get(jx, jy, dd);
+      // f1 column (ix,iy) and f2 column (jx,jy) are depth-axis-contiguous runs
+      // of C floats starting at GetRawPtr(x,y,0); this is exactly the AVX dot
+      // product over a contiguous channel column.
+      acc := TNNetVolume.DotProduct(f1.GetRawPtr(ix, iy, 0),
+                                    f2.GetRawPtr(jx, jy, 0), C);
       ch := jy * W + jx;
       FOutput.Store(ix, iy, ch, acc * invSqrtC);
     end;
