@@ -1430,38 +1430,18 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       TNNetGatedLinearAttention. DONE: added the shared `TVolume.RankOneUpdateRow`
       primitive (neuralvolume.pas) used by all four layers; DeltaNet/GLA forward
       state writes + backward dS/dk/dv now route through RankOneUpdateRow /
-      MulAdd / DotProduct / Mul over the depth-contiguous `e` axis.
-      AVX-vectorize the rank-1 outer-product state update in TNNetDeltaNet and
-      TNNetGatedLinearAttention. Both already use the AVX `DotProduct` for the
-      per-timestep input/key/value/gate projections, but the state matrix carry
-      itself is a fully scalar nested `for d, e: S[d,e] := alpha*S[d,e] + beta*k[d]*v[e]`
-      double loop in BOTH forward and backward. With the state laid out row-major
-      (depth-contiguous in `e`) each output-row update is exactly one
-      `MulAdd(ptrS_row, ptrV, beta*k[d], D)` after an optional `Mul` by the
-      forget scale — a drop-in over the existing neuralvolume primitives, with the
-      backward `dS`/`dk`/`dv` accumulation mapping onto `DotProduct`/`MulAdd` the
-      same way. These O(SeqLen*D^2) state writes dominate the layer cost, so this is
-      the largest remaining scalar hot loop in the linear-attention family. Preserve
-      the `-FLearningRate` convention; the landed numerical-gradient tests pin
-      correctness. (TNNetTitansMemory / TNNetTestTimeTraining share the identical
-      per-row pattern and can reuse the same helper — see the next entry.)
+      MulAdd / DotProduct / Mul over the depth-contiguous `e` axis. These
+      O(SeqLen*D^2) state writes dominated the layer cost — the largest scalar hot
+      loop in the linear-attention family. `-FLearningRate` convention preserved;
+      numerical-gradient tests pin correctness.
 
 - [X] AVX-vectorize the test-time inner-optimizer weight-matrix updates in
       TNNetTestTimeTraining and TNNetTitansMemory. DONE: TTT W_lin/W1/W2 inner GD
       steps and Titans S1/S2 momentum + (1-forget) weight writes now use the same
       shared `TVolume.RankOneUpdateRow(Dst, Prev, B, AlphaScale, BScale, n)` helper
       over the contiguous inner axis (one helper, four layers; not four copies).
-      AVX-vectorize the test-time inner-optimizer weight-matrix updates in
-      TNNetTestTimeTraining and TNNetTitansMemory. The per-timestep gradient-descent
-      step on the inner memory (`W_lin -= eta*r outer k`, and for TitansMemory the
-      momentum + forget-gated `S := (1-forget)*S + momentum*grad` over the D x H
-      weight slabs) is the same rank-1 row-wise update as the DeltaNet/GLA entry
-      above, currently a scalar nested loop forward and backward. Route each weight
-      row through `MulAdd`/`Mul`/`DotProduct` over the contiguous H axis; share one
-      `RankOneUpdate(ptrW, ptrA, ptrB, scale, rows, cols)` helper between this and
-      the DeltaNet/GLA work so there is a single vectorized primitive, not four
-      copies. These layers run an optimizer step per token, so the inner matmul is
-      the dominant cost. Numerical-gradient tests stay the correctness oracle.
+      These layers run an optimizer step per token, so the inner matmul was the
+      dominant cost. Numerical-gradient tests stay the correctness oracle.
 
 - [X] AVX-vectorize the block / factor GEMMs of TNNetMonarchLinear and
       TNNetKroneckerLinear. Both never materialize the full weight, so their forward
@@ -1498,6 +1478,22 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       round-trip as the fallback). Keep the bilinear-sample gather and the rotation
       weight-folding on the CPU; only the dense contraction goes to the device.
       Pin parity with a SDPAOpenCLParity-style exact-vs-CPU test on the PoCL device.
+
+- [ ] Residual scalar backward loops left by the AVX/OpenCL vectorization batch
+      (the forward + cleanly-mappable backward paths are done; these are the
+      strided-on-one-operand remainders that a single DotProduct/MulAdd cannot cover
+      without an extra gather):
+  - [ ] TNNetMonarchLinear `dzP`/`dx` backward loops (both operands stride the inner
+        index) and TNNetKroneckerLinear `dA`/`G`/`dX` backward loops — gather the
+        strided run into a temp buffer first, then DotProduct/MulAdd, as was done for
+        the Monarch forward L-block column gather (FColBuf).
+  - [ ] TNNetSpectralConv1D weight-gradient: kept scalar in Double over the original
+        strided interleaved `[m][ci][co][Re,Im]` storage so the saved-weight gradient
+        stays byte-identical; vectorize via a contiguous Re/Im gradient-plane scatter
+        if the FNO weight-grad becomes a profiled hot path.
+  - [ ] TNNetTestTimeTraining / TNNetTitansMemory backward "undo" loops (interleaved
+        scalar etaGrad/dEta/dTheta accumulation) — the per-token forward rank-1 writes
+        are vectorized; this is the lower-value remainder.
 
 ## Tests / numerical-gradient audit
 
