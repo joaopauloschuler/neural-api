@@ -471,6 +471,11 @@ type
     procedure TestGRUCellInputGradientCheck;
     procedure TestGRUCellWeightGradientCheck;
     procedure TestGRUCellSerializationRoundTrip;
+    procedure TestAddBidirectionalLSTMBuilder;
+    procedure TestAddBidirectionalGRUBuilder;
+    procedure TestBidirectionalLSTMUnidirectionalEquivalence;
+    procedure TestBidirectionalLSTMForwardHalfEquivalence;
+    procedure TestBidirectionalLSTMStackGradientCheck;
     procedure TestSincConv1DInputGradientCheck;
     procedure TestSincConv1DWeightGradientCheck;
     procedure TestSincConv1DSerializationRoundTrip;
@@ -34905,6 +34910,306 @@ begin
   RandSeed := 424242;
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetGRUCell.Create(), 'GRUCell', 4, 1, 3, 1e-5);
+end;
+
+// --- TNNet.AddBidirectionalLSTM / AddBidirectionalGRU stacking builders -------
+
+procedure TTestNeuralNumerical.TestAddBidirectionalLSTMBuilder;
+var
+  NN, NN2: TNNet;
+  Input, Desired: TNNetVolume;
+  Saved, Saved2: string;
+  i, CellCount, FlipCount, ConcatCount: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+begin
+  // End-to-end: a 2-layer BIDIRECTIONAL LSTM stack (Hidden=4) over a (5,1,3)
+  // sequence. Verifies (1) the wiring count: per bidirectional layer = 2 cells +
+  // 2 FlipX + 1 DeepConcat; (2) SeqLen preserved and output Depth = 2*Hidden;
+  // (3) one short run reduces the loss; (4) SaveToString round-trips identically.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 3);
+  Desired := TNNetVolume.Create(5, 1, 8);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 3));
+    NN.AddBidirectionalLSTM(4, 2, {Bidirectional=}True);
+    NN.SetLearningRate(0.05, 0.0);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.3) * 1.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.7) * 0.4;
+    NN.Compute(Input);
+    AssertEquals('BiLSTM output SizeX preserved', 5, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('BiLSTM output Depth = 2*Hidden', 8, NN.GetLastLayer.Output.Depth);
+    AssertTrue('BiLSTM last layer is a DeepConcat',
+      NN.GetLastLayer is TNNetDeepConcat);
+
+    CellCount := 0; FlipCount := 0; ConcatCount := 0;
+    for i := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[i] is TNNetLSTMCell then Inc(CellCount);
+      if NN.Layers[i] is TNNetFlipX then Inc(FlipCount);
+      if NN.Layers[i] is TNNetDeepConcat then Inc(ConcatCount);
+    end;
+    AssertEquals('BiLSTM built 2 layers * 2 directions = 4 cells', 4, CellCount);
+    AssertEquals('BiLSTM built 2 layers * 2 FlipX = 4 FlipX', 4, FlipCount);
+    AssertEquals('BiLSTM built one DeepConcat per layer', 2, ConcatCount);
+
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 49 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('BiLSTM training reduces loss (' + FloatToStr(LossBefore) +
+      ' -> ' + FloatToStr(LossAfter) + ')', LossAfter < LossBefore);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('BiLSTM round-trip last layer is DeepConcat',
+        NN2.GetLastLayer is TNNetDeepConcat);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('BiLSTM SaveToString round-trip equality', Saved, Saved2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddBidirectionalGRUBuilder;
+var
+  NN, NN2: TNNet;
+  Input, Desired: TNNetVolume;
+  Saved, Saved2: string;
+  i, CellCount, FlipCount, ConcatCount: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+begin
+  // GRU twin of the BiLSTM builder test: 2-layer bidirectional GRU, same checks.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 3);
+  Desired := TNNetVolume.Create(5, 1, 8);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 3));
+    NN.AddBidirectionalGRU(4, 2, {Bidirectional=}True);
+    NN.SetLearningRate(0.05, 0.0);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.3) * 1.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.7) * 0.4;
+    NN.Compute(Input);
+    AssertEquals('BiGRU output SizeX preserved', 5, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('BiGRU output Depth = 2*Hidden', 8, NN.GetLastLayer.Output.Depth);
+
+    CellCount := 0; FlipCount := 0; ConcatCount := 0;
+    for i := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[i] is TNNetGRUCell then Inc(CellCount);
+      if NN.Layers[i] is TNNetFlipX then Inc(FlipCount);
+      if NN.Layers[i] is TNNetDeepConcat then Inc(ConcatCount);
+    end;
+    AssertEquals('BiGRU built 4 cells', 4, CellCount);
+    AssertEquals('BiGRU built 4 FlipX', 4, FlipCount);
+    AssertEquals('BiGRU built 2 DeepConcat', 2, ConcatCount);
+
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 49 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('BiGRU training reduces loss (' + FloatToStr(LossBefore) +
+      ' -> ' + FloatToStr(LossAfter) + ')', LossAfter < LossBefore);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('BiGRU SaveToString round-trip equality', Saved, Saved2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBidirectionalLSTMUnidirectionalEquivalence;
+var
+  NN, NNRef: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+  Builder, RefCell: TNNetLSTMCell;
+  maxDiff, d: TNeuralFloat;
+begin
+  // A single-layer UNIDIRECTIONAL AddBidirectionalLSTM(Hidden=Depth, 1, false)
+  // is exactly a bare TNNetLSTMCell (no projection inserted because incoming
+  // Depth already equals Hidden, no reverse branch, no concat). With identical
+  // seeded weights the two outputs must match to the bit.
+  RandSeed := 424242;
+  Input := TNNetVolume.Create(4, 1, 3);
+  NN := TNNet.Create();
+  NNRef := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3));
+    NN.AddBidirectionalLSTM(3, 1, {Bidirectional=}False);
+    // The builder must NOT have inserted a projection (Depth already = Hidden).
+    AssertTrue('Unidir BiLSTM(1 layer) last layer is a bare LSTMCell',
+      NN.GetLastLayer is TNNetLSTMCell);
+    Builder := NN.GetLastLayer as TNNetLSTMCell;
+
+    NNRef.AddLayer(TNNetInput.Create(4, 1, 3));
+    RefCell := TNNetLSTMCell.Create();
+    NNRef.AddLayer(RefCell);
+
+    SeedLSTMCell(Builder, 3);
+    SeedLSTMCell(RefCell, 3);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.5 + 0.2;
+    NN.Compute(Input);
+    NNRef.Compute(Input);
+
+    maxDiff := 0;
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      d := Abs(NN.GetLastLayer.Output.Raw[i] - NNRef.GetLastLayer.Output.Raw[i]);
+      if d > maxDiff then maxDiff := d;
+    end;
+    AssertTrue('Unidir BiLSTM(1 layer) == bare LSTMCell (maxDiff=' +
+      FloatToStr(maxDiff) + ')', maxDiff < 1e-6);
+  finally
+    NN.Free; NNRef.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBidirectionalLSTMForwardHalfEquivalence;
+var
+  NN, NNRef: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+  FwdCell, RefCell: TNNetLSTMCell;
+  Concat: TNNetLayer;
+  maxDiff, d: TNeuralFloat;
+begin
+  // The forward HALF (first Hidden channels) of a single-layer bidirectional
+  // builder output must equal a plain forward LSTMCell run alone with the same
+  // weights - this pins the torch [forward ; backward] concat ordering.
+  RandSeed := 424242;
+  Input := TNNetVolume.Create(4, 1, 3);
+  NN := TNNet.Create();
+  NNRef := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3));
+    Concat := NN.AddBidirectionalLSTM(3, 1, {Bidirectional=}True);
+    AssertTrue('BiLSTM forward-half: builder returns a DeepConcat',
+      Concat is TNNetDeepConcat);
+    // The FIRST LSTMCell in the net is the forward direction.
+    FwdCell := nil;
+    for i := 0 to NN.Layers.Count - 1 do
+      if (FwdCell = nil) and (NN.Layers[i] is TNNetLSTMCell) then
+        FwdCell := NN.Layers[i] as TNNetLSTMCell;
+
+    NNRef.AddLayer(TNNetInput.Create(4, 1, 3));
+    RefCell := TNNetLSTMCell.Create();
+    NNRef.AddLayer(RefCell);
+
+    SeedLSTMCell(FwdCell, 3);
+    SeedLSTMCell(RefCell, 3);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.5 + 0.2;
+    NN.Compute(Input);
+    NNRef.Compute(Input);
+
+    // Concat output is (4,1,6): channels [0..2] = forward, [3..5] = backward.
+    maxDiff := 0;
+    for i := 0 to 3 do  // SeqLen positions
+    begin
+      d := Abs(NN.GetLastLayer.Output[i, 0, 0] - NNRef.GetLastLayer.Output[i, 0, 0]);
+      if d > maxDiff then maxDiff := d;
+      d := Abs(NN.GetLastLayer.Output[i, 0, 1] - NNRef.GetLastLayer.Output[i, 0, 1]);
+      if d > maxDiff then maxDiff := d;
+      d := Abs(NN.GetLastLayer.Output[i, 0, 2] - NNRef.GetLastLayer.Output[i, 0, 2]);
+      if d > maxDiff then maxDiff := d;
+    end;
+    AssertTrue('BiLSTM forward-half (channels 0..2) == forward cell alone ' +
+      '(maxDiff=' + FloatToStr(maxDiff) + ')', maxDiff < 1e-6);
+  finally
+    NN.Free; NNRef.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBidirectionalLSTMStackGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Numerical input-gradient check for the WHOLE composed bidirectional 2-layer
+  // stack (projections + forward/reverse cells + FlipX involutions + per-layer
+  // DeepConcat). This verifies the gradient routes correctly through every
+  // composed piece. Input layer is (4,1,2,1) so OutputError is allocated.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 2);
+  InputPlus := TNNetVolume.Create(4, 1, 2);
+  Desired := TNNetVolume.Create(4, 1, 6);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 2, 1));
+    NN.AddBidirectionalLSTM(3, 2, {Bidirectional=}True);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.1 + 0.3) * 1.0;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.9 - 0.2) * 0.5;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('BiLSTM stack input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('BiLSTM stack input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
 end;
 
 // --- TNNetSincConv1D (parametrized SincNet band-pass front-end) --------------

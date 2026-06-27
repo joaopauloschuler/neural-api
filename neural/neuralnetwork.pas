@@ -14172,6 +14172,37 @@ type
       // token-wise projection back to Depth afterwards if a residual is wanted.
       // Returns the DeepConcat layer. Coded by Claude (AI).
       function AddBidirectionalClosedFormContinuous(): TNNetLayer;
+      // MULTI-LAYER and/or BIDIRECTIONAL stack of classic LSTM cells
+      // (TNNetLSTMCell) over a (SeqLen,1,Depth) token tensor (GetLastLayer,
+      // SizeY=1), a drop-in for torch nn.LSTM(num_layers, bidirectional). Pure
+      // composition of existing layers (cells + TNNetFlipX reversal +
+      // TNNetDeepConcat), no new leaf layer. Hidden is the per-direction hidden
+      // size; every cell is shape-preserving so the input Depth must equal Hidden
+      // (project to Hidden first if it differs).
+      //   Unidirectional layer:  h = LSTM(x)
+      //   Bidirectional layer:   fwd = LSTM(x); rev = FlipX(LSTM(FlipX(x)));
+      //                          h = DeepConcat([fwd, rev])  (Depth 2*Hidden)
+      // Multi-layer feeds the output of layer k as the input of layer k+1 (torch
+      // semantics); for a bidirectional stack each subsequent layer therefore
+      // consumes a 2*Hidden input and its own forward/reverse cells must also be
+      // 2*Hidden wide, EXCEPT the per-direction Hidden stays Hidden - so a
+      // 2*Hidden->Hidden token-wise projection (TNNetPointwiseConvLinear) feeds
+      // each direction, matching nn.LSTM where layer k>0 input_size = 2*hidden.
+      // The bidirectional concat ordering is torch's [forward ; backward]. Each
+      // cell owns its OWN weights (never shared). Returns the final layer (the
+      // top DeepConcat if bidirectional, else the top cell). Coded by Claude (AI).
+      // Shared engine behind AddBidirectionalLSTM/AddBidirectionalGRU (UseGRU
+      // picks the cell class). Coded by Claude (AI).
+      function AddBidirectionalRecurrentStack(Hidden, NumLayers: integer;
+        Bidirectional, UseGRU: boolean): TNNetLayer;
+      function AddBidirectionalLSTM(Hidden, NumLayers: integer;
+        Bidirectional: boolean): TNNetLayer;
+      // MULTI-LAYER and/or BIDIRECTIONAL stack of classic GRU cells
+      // (TNNetGRUCell), the GRU twin of AddBidirectionalLSTM - same torch
+      // nn.GRU(num_layers, bidirectional) semantics, same [forward ; backward]
+      // concat ordering and same layer-k->layer-(k+1) feed. Coded by Claude (AI).
+      function AddBidirectionalGRU(Hidden, NumLayers: integer;
+        Bidirectional: boolean): TNNetLayer;
       // sLSTM (xLSTM scalar-memory exp-gated recurrent cell, Beck et al. 2024)
       // wrapped in an RMSNorm pre-norm residual over a (SeqLen,1,Depth) token
       // tensor: y = x + sLSTM(RMSNorm(x)). The cell is shape-preserving and
@@ -59571,6 +59602,80 @@ begin
   ReverseCell := AddLayer(TNNetFlipX.Create());
   // Concatenate the two directions along Depth -> output Depth = 2*d.
   Result := AddLayer(TNNetDeepConcat.Create([ForwardCell, ReverseCell]));
+end;
+
+// Shared engine for AddBidirectionalLSTM / AddBidirectionalGRU. UseGRU selects
+// the cell class; everything else (layer stacking, bidirectional reverse-concat,
+// per-direction Hidden projection) is identical. A cell is shape-preserving and
+// reads its Depth from the previous layer, so each direction is fed a token-wise
+// projection to Hidden (TNNetPointwiseConvLinear) whenever the incoming Depth
+// differs from Hidden - this covers both the very first layer (input Depth may
+// not equal Hidden) and every layer above a bidirectional one (incoming Depth =
+// 2*Hidden, but each direction stays Hidden wide), exactly like torch nn.LSTM
+// where layer k>0 has input_size = num_directions*hidden.
+function TNNet.AddBidirectionalRecurrentStack(Hidden, NumLayers: integer;
+  Bidirectional, UseGRU: boolean): TNNetLayer;
+var
+  SourceLayer, ForwardCell, ReverseCell: TNNetLayer;
+  LayerIdx: integer;
+
+  function MakeCell(): TNNetLayer;
+  begin
+    if UseGRU then Result := TNNetGRUCell.Create()
+    else Result := TNNetLSTMCell.Create();
+  end;
+
+begin
+  if Hidden < 1 then
+    FErrorProc('AddBidirectionalRecurrentStack requires Hidden >= 1. Got ' +
+      IntToStr(Hidden));
+  if NumLayers < 1 then
+    FErrorProc('AddBidirectionalRecurrentStack requires NumLayers >= 1. Got ' +
+      IntToStr(NumLayers));
+  SourceLayer := GetLastLayer();
+  if SourceLayer.Output.SizeY <> 1 then
+    FErrorProc('AddBidirectionalRecurrentStack requires a (SeqLen,1,d) token ' +
+      'tensor (SizeY=1). SizeY=' + IntToStr(SourceLayer.Output.SizeY));
+  Result := SourceLayer;
+  for LayerIdx := 0 to NumLayers - 1 do
+  begin
+    // SourceLayer is this layer's input (output of the previous recurrent layer,
+    // or the original sequence for layer 0).
+    SourceLayer := Result;
+    // Forward direction: project the incoming Depth to Hidden (if needed) then a
+    // left-to-right cell over it.
+    if SourceLayer.Output.Depth <> Hidden then
+      AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden), SourceLayer);
+    ForwardCell := AddLayer(MakeCell());
+    if not Bidirectional then
+    begin
+      Result := ForwardCell;
+      continue;
+    end;
+    // Reverse direction: flip time -> project to Hidden -> sweep -> flip back so
+    // the t-th reverse output aligns with the t-th forward output.
+    AddLayerAfter(TNNetFlipX.Create(), SourceLayer);
+    if SourceLayer.Output.Depth <> Hidden then
+      AddLayer(TNNetPointwiseConvLinear.Create(Hidden));
+    AddLayer(MakeCell());
+    ReverseCell := AddLayer(TNNetFlipX.Create());
+    // torch ordering: [forward ; backward] along Depth -> output Depth 2*Hidden.
+    Result := AddLayer(TNNetDeepConcat.Create([ForwardCell, ReverseCell]));
+  end;
+end;
+
+function TNNet.AddBidirectionalLSTM(Hidden, NumLayers: integer;
+  Bidirectional: boolean): TNNetLayer;
+begin
+  Result := AddBidirectionalRecurrentStack(Hidden, NumLayers, Bidirectional,
+    {UseGRU=}False);
+end;
+
+function TNNet.AddBidirectionalGRU(Hidden, NumLayers: integer;
+  Bidirectional: boolean): TNNetLayer;
+begin
+  Result := AddBidirectionalRecurrentStack(Hidden, NumLayers, Bidirectional,
+    {UseGRU=}True);
 end;
 
 function TNNet.AddModernHopfieldRetrieval(NumPatterns, KSteps: integer;

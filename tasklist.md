@@ -1414,14 +1414,25 @@ rather than acted on.
 
 ## Layer follow-ups that fix real limitations
 
-- [ ] Bidirectional + multi-layer stacking for `TNNetLSTMCell` / `TNNetGRUCell`
+- [~] Bidirectional + multi-layer stacking for `TNNetLSTMCell` / `TNNetGRUCell`
       (and a real `nn.LSTM`/`nn.GRU` num_layers>1 / bidirectional=True checkpoint
       importer). The single-cell `TNNetLSTMCell`/`TNNetGRUCell` (torch fused
-      `weight_ih`/`weight_hh` gate layout, full forward + exact BPTT) have landed;
-      reuse the existing forward + time-reversed-concat builder idiom from the
-      MinLSTM trunk — no new layer math, just a stacking/reverse builder and the
-      per-direction/per-layer weight-slab wiring. Unblocks the pyannote
-      `segmentation-3.0` bidirectional-LSTM trunk drop-in (lines ~977-995).
+      `weight_ih`/`weight_hh` gate layout, full forward + exact BPTT) have landed.
+      DONE: `TNNet.AddBidirectionalLSTM(Hidden,NumLayers,Bidirectional)` and
+      `AddBidirectionalGRU(...)` builders (shared `AddBidirectionalRecurrentStack`
+      engine) — pure composition of cells + `TNNetFlipX` reversal + `TNNetDeepConcat`
+      ([forward;backward] torch concat order); multi-layer feeds layer k's output
+      into k+1, each direction gets a `TNNetPointwiseConvLinear` projection to
+      Hidden when incoming Depth≠Hidden (covers layer 0 and the 2*Hidden→Hidden
+      feed above a bidirectional layer, matching nn.LSTM input_size). Tests:
+      builder wiring/shape/SaveToString round-trip (LSTM+GRU), unidirectional
+      1-layer == bare cell equivalence, bidirectional forward-half == forward cell
+      alone (pins concat order), and a 2-layer bidirectional stack input-gradient
+      check (all in TestNeuralNumerical, passing; full suite green 2376/0/0). This
+      UNBLOCKS the pyannote `segmentation-3.0` bidirectional-LSTM trunk drop-in
+      (lines ~977-995) — the trunk can now swap from MinLSTM to true nn.LSTM cells.
+      STILL OPEN: the actual safetensors importer that loads real nn.LSTM/nn.GRU
+      `weight_ih_l{k}`/`weight_hh_l{k}`(`_reverse`) slabs into the stacked cells.
 
 - [ ] AVX-vectorize `TNNetLSTMCell` + `TNNetGRUCell` gate matmuls. Both forwards
       are today fully scalar (verified: zero `DotProduct`/`MulAdd` calls in
