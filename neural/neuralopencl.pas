@@ -224,6 +224,11 @@ type
       function PrepareForCompute(VAs, VBs: TNNetVolume; pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0): integer;
       procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint; NewVAs:boolean = true; NewVBs:boolean = true);
       procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
+
+      /// The underlying device kernel shared by this instance. Exposed so a layer
+      /// can spin up a second TDotProductSharedKernel (e.g. a dedicated backward
+      /// instance) bound to the same kernel without re-deriving it.
+      property DotProductKernel: TDotProductKernel read FDotProductKernel;
   end;
 
   /// Class that does dot products via OpenCL

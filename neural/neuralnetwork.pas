@@ -11064,6 +11064,12 @@ type
       FBpWByK: TNNetVolume;         // weights^T, FVectorSize rows x N
       FBpWGradRes: TNNetVolume;     // weight-grad GEMM result [od*FVectorSize+k]
       FBpPrevErrCol: TNNetVolume;   // input-grad GEMM result [pos*FVectorSize+k]
+      // Dedicated backward dot-product kernel instance. The backward GEMMs use
+      // different operand shapes than the forward pass, so they MUST NOT reuse
+      // the forward FDotCL: PrepareForCompute reallocates buffers and overwrites
+      // FNumAs/FNumBs/FSize, which would clobber the once-only forward
+      // preparation done in EnableOpenCL and break the next ComputeOpenCL.
+      FBpDotCL: TDotProductSharedKernel;
       {$ENDIF}
       function WinogradEligible(): boolean; {$IFDEF Release} inline; {$ENDIF}
       procedure BuildWinogradKernels();
@@ -81019,6 +81025,7 @@ begin
   FBpWByK.Free;
   FBpWGradRes.Free;
   FBpPrevErrCol.Free;
+  FBpDotCL.Free;
   {$ENDIF}
   inherited Destroy();
 end;
@@ -82496,6 +82503,10 @@ begin
   if not Assigned(FBpWByK)       then FBpWByK       := TNNetVolume.Create();
   if not Assigned(FBpWGradRes)   then FBpWGradRes   := TNNetVolume.Create();
   if not Assigned(FBpPrevErrCol) then FBpPrevErrCol := TNNetVolume.Create();
+  // The backward GEMMs need their own kernel instance so they never disturb the
+  // forward FDotCL preparation (see FBpDotCL declaration).
+  if not Assigned(FBpDotCL) then
+    FBpDotCL := TDotProductSharedKernel.Create(FDotCL.DotProductKernel);
 
   // --- Step 1: activation derivative + bias delta (CPU, exact CPU branch). ---
   // OED is stored into FOutputErrorDeriv (native pos-major, depth-contiguous),
@@ -82560,9 +82571,9 @@ begin
   end;
 
   FBpWGradRes.ReSize(NCnt * VSize, 1, 1);
-  FDotCL.PrepareForCompute(FOutputErrorDeriv, FBpPatchByK, NumPos);
-  FDotCL.Compute(FOutputErrorDeriv, FBpPatchByK, {ActFN}0, {NewVAs}true, {NewVBs}true);
-  FDotCL.FinishAndLoadResult(FBpWGradRes, 0);
+  FBpDotCL.PrepareForCompute(FOutputErrorDeriv, FBpPatchByK, NumPos);
+  FBpDotCL.Compute(FOutputErrorDeriv, FBpPatchByK, {ActFN}0, {NewVAs}true, {NewVBs}true);
+  FBpDotCL.FinishAndLoadResult(FBpWGradRes, 0);
   // The kernel writes Res[b*FNumAs + a] (b-major), so with a = od (FNumAs=NCnt)
   // and b = k (FNumBs=VSize) the layout is Res_w[k*NCnt + od]. Accumulate into
   // the neuron deltas with (-LR).
@@ -82600,9 +82611,9 @@ begin
         FBpWByK.FData[kk * NCnt + od] := LocalWeight.FData[kk];
     end;
     FBpPrevErrCol.ReSize(NumPos * VSize, 1, 1);
-    FDotCL.PrepareForCompute(FBpOEDByDepth, FBpWByK, NCnt);
-    FDotCL.Compute(FBpOEDByDepth, FBpWByK, {ActFN}0, {NewVAs}true, {NewVBs}true);
-    FDotCL.FinishAndLoadResult(FBpPrevErrCol, 0);
+    FBpDotCL.PrepareForCompute(FBpOEDByDepth, FBpWByK, NCnt);
+    FBpDotCL.Compute(FBpOEDByDepth, FBpWByK, {ActFN}0, {NewVAs}true, {NewVBs}true);
+    FBpDotCL.FinishAndLoadResult(FBpPrevErrCol, 0);
 
     // The kernel writes Res[b*FNumAs + a] (b-major), so with a = pos
     // (FNumAs=NumPos) and b = k (FNumBs=VSize) the layout is Res_p[k*NumPos+pos].
