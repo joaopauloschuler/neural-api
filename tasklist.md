@@ -224,6 +224,41 @@ rather than acted on.
 
 ### Computer vision & generative models
 
+- [ ] Sana text-to-image importer (`BuildSanaFromSafeTensors[Ex]`, NVIDIA /
+      Efficient-Large-Model `Sana_*`). A genuinely different image-generation
+      stack from the landed PixArt/MMDiT path: a LINEAR-attention DiT denoiser
+      (Sana's "linear DiT" replaces softmax SDPA with the landed
+      `TNNetLinearAttention` plus a Mix-FFN), a Gemma decoder-only text encoder
+      (reuse the landed Gemma importer), and a deep-compression autoencoder
+      (DC-AE, f32 spatial compression) in place of the SD VAE. High-value because
+      it exercises the linear-attention path end-to-end in a real generative model
+      and reuses three already-landed subsystems; scope a small `Sana-0.6B` /
+      `Sana-Sprint` parity fixture like the other importers.
+- [ ] InternVL vision-language importer (`BuildInternVLFromSafeTensors[Ex]`,
+      model_type "internvl_chat", e.g. OpenGVLab/InternVL2-1B). Distinct from the
+      landed LLaVA / PaliGemma / Qwen2-VL VLMs: an InternViT vision tower + a
+      PIXEL-UNSHUFFLE downsampler (`TNNetSpaceToDepth`) feeding an MLP projector
+      into a Qwen2 / InternLM2 decoder (both importers already landed). The reusable
+      new piece is the pixel-unshuffle token reducer + dynamic-tiling image
+      preprocessor; verify on the 1B checkpoint against a transformers reference.
+- [ ] DINOv3 self-supervised ViT backbone importer
+      (`BuildDINOv3FromSafeTensors[Ex]`, facebook/dinov3-*). Successor to the
+      landed DINOv2 tower: same ViT body but with Gram-anchoring-trained weights,
+      RoPE-based position embedding (reuse the landed RoPE) and register tokens.
+      Reuse the DINOv2/ViT tower; the new bits are the position-embedding swap and
+      register-token handling. Pairs with the open "register-token DINOv2 backbones
+      rejected by BuildDPT" follow-up and unblocks DINOv3-backed dense-prediction.
+
+- [ ] Replace the hand-rolled Snake activation and AdaIN in `neuralpretrained.pas`
+      with the landed `TNNetSnake` / `TNNetAdaIN` layers. Verified: `TNNetSnake`
+      (Snake(x) = x + (1/α)·sin²(αx)) and `TNNetAdaIN` already exist as real layers,
+      yet the codec/TTS inference paths re-implement the same math as flat-array
+      record procedures — `TNNetDAC.RunSnake` and the Mimi `RunSnake`, plus Kokoro's
+      `TKokoroAdaIN`/`RunAdaIN`. Porting these inference paths onto the real layers
+      removes duplicated math and lets them inherit the AVX (and, where applicable,
+      OpenCL) paths already wired into the layer versions; pin codec/TTS output
+      parity with the existing `TestEnCodec*`/codec round-trip checks.
+
 - [X] mixup + CutMix batch-level augmentation (Zhang et al. 2018 / Yun et al.
       2019, the timm/torchvision training staple). The landed augmentation stack
       (NeuralRandAugment / TrivialAugment, TNeuralAugPolicy in neuraldatasets.pas)
@@ -1444,6 +1479,38 @@ rather than acted on.
       MinLSTM trunk — no new layer math, just a stacking/reverse builder and the
       per-direction/per-layer weight-slab wiring. Unblocks the pyannote
       `segmentation-3.0` bidirectional-LSTM trunk drop-in (lines ~977-995).
+
+- [ ] AVX-vectorize `TNNetLSTMCell` + `TNNetGRUCell` gate matmuls. Both forwards
+      are today fully scalar (verified: zero `DotProduct`/`MulAdd` calls in
+      `TNNetLSTMCell.Compute`): the per-timestep, per-channel inner `for j` loop
+      accumulates `acc += W_x[j]*x_t[j] + W_h[j]*h_{t-1}[j]` over the CONTIGUOUS
+      depth axis, which is exactly two `TNNetVolume.DotProduct(W_row, vec, Depth)`
+      calls — the gate weight rows are depth-contiguous via `GetRawPtr(d,0,0)` and
+      both `x_t` and the frozen `FHprev` are contiguous. Replace the four (LSTM:
+      i/f/g/o) / three (GRU: r/z/n) scalar inner accumulations with `DotProduct`
+      over `x_t` and `h_{t-1}`, and mirror it in the backward weight-gradient
+      accumulation with `MulAdd(GW_row, vec, grad, Depth)`. Single-cell forward is
+      the un-threaded 1-core suspect on imported recurrent models (pyannote LSTM
+      trunk, classic seq models); the EnCodec LSTM was already AVX'd separately
+      (~12.9x) by hand-rolled `DotProduct`, so the speedup is proven for this exact
+      shape. Pin parity with the existing numerical-gradient cell tests.
+- [ ] AVX-vectorize `TNNetMLSTMCell` / `TNNetSLSTMCell` matrix-memory updates.
+      `TNNetMLSTMCell.Compute` is fully scalar (verified: zero `DotProduct`/`MulAdd`,
+      ten scalar `for` loops): the covariance write `C_t += i_t * (v_t k_tᵀ)` is a
+      depth-contiguous outer-product scatter mappable to per-row
+      `MulAdd(C_row, k_t, i_t*v_t[row], Depth)`, and the readout
+      `h_t = (C_t q_t) / max(|n_tᵀ q_t|, 1)` is a per-row `DotProduct(C_row, q_t,
+      Depth)`. `TNNetSLSTMCell` shares the exp-gated structure (its frozen-h_{t-1}
+      gate matmul is the same shape as the LSTM/GRU task above). Mirror the matrix
+      gradients in the backward with `MulAdd`; gate behind the existing cell
+      numerical-gradient tests (scalar build must stay bit-identical).
+- [ ] OpenCL forward offload for `TNNetLinearAttention` / `TNNetCausalLinearAttention`
+      (both are AVX'd but CPU-only — `TNNetScaledDotProductAttention` already has a
+      `ComputeOpenCL` + `SDPAOpenCLParity` exact-vs-CPU test, these siblings do not).
+      The non-causal global form is two GEMMs (`S = ϕ(K)ᵀ V`, then `ϕ(Q) S`) that
+      map cleanly onto the existing `FDotCL` matmul offload behind `FShouldOpenCL`,
+      keeping the host round-trip as the fallback. Pin parity with an exact-vs-CPU
+      test mirroring `SDPAOpenCLParity`.
 
 (The sub-quadratic / chunked-forward family below is one coherent systems effort:
 every recurrence currently trains as a strict per-token left-to-right scan.)
