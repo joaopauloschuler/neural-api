@@ -1702,57 +1702,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
         scalar etaGrad/dEta/dTheta accumulation) — the per-token forward rank-1 writes
         are vectorized; this is the lower-value remainder.
 
-- [X] AVX-vectorize `TNNetTokenLayerNorm` forward + backward (the per-token loops
-      are still pure SCALAR — forward mean/variance accumulation and the backward
-      Jacobian both iterate the channel axis one float at a time). Its sibling
-      `TNNetTokenRMSNorm` is ALREADY fully vectorized over the exact same
-      per-token, depth-contiguous layout: forward does
-      `MeanSqr = TNNetVolume.DotProduct(XPtr, XPtr, Depth)` then
-      `TNNetVolume.Mul(XHatPtr, InvRMSV, Depth)`, and backward reduces with
-      `TNNetVolume.DotProduct` + scatters with `TNNetVolume.MulAdd` per token
-      (a free template — the only delta is LayerNorm subtracts the per-token MEAN
-      first, so add a mean reduction via `DotProduct(XPtr, OnesPtr, Depth)` or the
-      existing column average, then reuse the variance/normalize/gain math). The
-      channel axis is depth-contiguous per token, so this is the exact
-      depth-axis-contiguous case the volume primitives vectorize. Real value:
-      TokenLayerNorm sits in the inner loop of every imported BERT/ViT/encoder and
-      pre-LN transformer block, so it is hot on the ChatTerminal-class decode and
-      vision-tower paths. Gate on the existing `TestNeuralNumerical` TokenLayerNorm
-      gradient test staying green and assert bit-identical (scalar) / `< 1e-5`
-      (-dAVX2) output vs the current scalar path on a fixed (SeqLen, 1, Depth)
-      fixture.
-
-- [X] AVX-vectorize `TNNetMaxPool` forward (and the backward argmax scatter) over
-      the depth axis. The forward is currently a pure SCALAR triple loop comparing
-      `InputRawPtr^ > FOutput.FData[OutputRawPos]` one channel at a time in both the
-      default-stride and custom-stride paths; the depth (`CntD`) axis it iterates is
-      contiguous. Its sibling `TNNetAvgPool` already vectorizes the same window
-      reduction with a depth-contiguous `FOutput.Add(OutPtr, InPtr, Depth)`, so the
-      shape of the fix is identical — but there is no element-wise MAX volume
-      primitive yet, so first add a depth-contiguous `TNNetVolume.Max(PtrA, PtrB,
-      pSize)` class method (and an argmax-tracking `MaxWithIndex` for the backward
-      router) next to the existing `Mul`/`Add` class methods in neuralvolume.pas,
-      AVX-vectorized like its siblings. Real value: max-pool is in the down-path of
-      essentially every CNN classifier (SimpleImageClassifier, ResNet/VGG/EfficientNet
-      importers, the SpeechCommands/audio front-ends) and many image-restoration
-      encoders, so it is one of the most-executed scalar layers left. Gate on the
-      MaxPool input-gradient test staying green and the pooled output staying
-      bit-identical to the scalar path (max is exact — no reassociation), on both
-      scalar-fallback and real -dAVX2 builds.
-      DONE (commit fa3b33e9): new `TNNetVolume.MaxElements(PtrA, PtrB, pSize)`
-      depth-contiguous element-wise max primitive (named `MaxElements`, NOT `Max`,
-      to avoid shadowing the global `Math.Max` used ~34× in neuralvolume.pas;
-      AVXMax via `vmaxps`/`maxps` in both AVX32 + AVX64/AVX512 blocks, scalar
-      fallback), `TNNetMaxPool` forward (both stride paths) folds each window strip
-      over depth via it; bit-EXACT parity (delta 0) in `TestMaxPoolVectorizedExactParity`.
-      DELIBERATE SKIP: the backward argmax SCATTER stays scalar — each depth channel
-      records its own winning (X,Y) and the gradient gathers from independent
-      positions, which can't be SIMD'd without a gather; the value reduction is
-      vectorized, the index tracking is a scalar pre-pass preserving the original
-      strict-`>` first-winner tie-break exactly. Not worth a gather rewrite.
-      REUSE NOTE: `TNNetVolume.MaxElements` is now available for any other
-      depth-contiguous max reduction (e.g. a future `TNNetMaxChannel` forward AVX pass).
-
 ## Tests / numerical-gradient audit
 
 - [ ] Shared `LayerInputAndWeightGradientCheck(layer, inputShape)` helper
@@ -1868,15 +1817,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       Backpropagate, opt cross-entropy training paths into the cheap
       (y - target) shortcut explicitly, and add a regression test that
       checks the shortcut and the full-Jacobian path agree to 1e-5.
-- [X] TNNetSoftmaxTemperature refactor attempt: extract a shared softmax-
-      Jacobian helper so SoftMax / PointwiseSoftMax / SoftmaxTemperature
-      reduce to one Backpropagate body parameterised by axis +
-      inv-temperature. Pure refactor, gradient tests pin behavior.
-      DONE: protected TNNetPointwiseSoftMax.BackpropagateSoftMaxJacobian(
-      GroupLen, InvScale) iterates contiguous groups (Depth for pointwise,
-      Size for whole-volume) applying y*(g - y.g)*InvScale. All three
-      Backpropagate bodies now call it. Suite green (AVX2 modulo the known
-      TestSetTrainableKeepsOutputs flake).
 - [ ] Cross-entropy regression-style check: confirm classification
       examples (SimpleImage CIFAR) converge to the same loss curve they
       did before the TNNetSoftMax.Backpropagate exact-Jacobian change.
