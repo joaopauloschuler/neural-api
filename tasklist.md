@@ -1480,39 +1480,33 @@ rather than acted on.
       STILL OPEN: the actual safetensors importer that loads real nn.LSTM/nn.GRU
       `weight_ih_l{k}`/`weight_hh_l{k}`(`_reverse`) slabs into the stacked cells.
 
-- [ ] AVX-vectorize `TNNetDeformableConv` / DCNv2 forward. `ComputeCPU` is a pure
-      scalar loop: the main-conv accumulation `acc := acc + mW.FData[(tap*FInDepth+ci)*FOutDepth+co] * sampled`
-      runs one MUL/ADD per input channel. The accumulation over `ci` is a dot
-      product of a weight row against the bilinearly-sampled input column, so it
-      maps onto the same AVX `DotProduct`/`MulAdd` volume primitives the dense
-      convolutions already use (the offsets/sampling positions are precomputed,
-      so the inner depth loop is contiguous). Keep the bilinear gather scalar,
-      vectorize only the channel reduction; gate on the existing DeformableConv
-      numerical-gradient tests staying bit-identical on the scalar build.
-- [ ] AVX-vectorize `TNNetGroupConvP4` / `TNNetGroupPoolP4` forward. `ComputeCPU`
-      accumulates `acc := acc + W.FData[FRotMap[rBase+dstTap]] * PrevOut.Get(prevX,prevY,ci)`
-      one scalar MUL/ADD at a time over the input-channel axis. Pre-gather the
-      rotation-permuted weights for a given (tap, rotation) into a contiguous
-      scratch row once, then reduce over `ci` with the AVX `DotProduct` primitive
-      — the rotation-equivariant lifting conv currently gets none of the AVX win
-      the plain conv path enjoys. Gate on the EquivarianceReport / group-conv
-      tests staying numerically identical on the scalar build.
-- [ ] AVX-vectorize `TNNetKANConv` forward. The Chebyshev/B-spline edge-function
-      evaluation in `ComputeCPU` reduces to `acc := acc + W.FData[base+kk] * FBVal[kk]`
-      over the per-edge basis-coefficient axis — a dot product of a contiguous
-      weight row against the precomputed basis vector `FBVal`/`FT`. Vectorize that
-      inner reduction with `DotProduct`; the basis evaluation itself stays scalar.
-      Gate on the KANConv B-spline + Chebyshev numerical-gradient tests staying
-      bit-identical on the scalar build.
-- [ ] OpenCL forward offload for `TNNetDepthwiseConv` / `TNNetDepthwiseConv1D`.
-      The depthwise (per-channel) convolutions used by the MobileNetV3 / MobileViT
-      importers (2-D) and the Mamba/EnCodec/audio codec stacks (1-D causal
-      `TNNetDepthwiseConv1D.Compute`) currently run their `sum := sum + W.FData[kk]*Prev[...]`
-      kernel loop entirely on the CPU — `TNNetConvolution` already offloads but
-      these siblings do not. Add an `EnableConvOpenCL`-gated `ComputeOpenCL` that
-      maps the per-channel kernel sweep onto the existing dot-product kernel
-      (one channel per work-item / a strided GEMV), keep the host round-trip as the
-      fallback, and pin an exact-vs-CPU parity test in the SDPAOpenCLParity style.
+- [X] AVX-vectorize `TNNetDeformableConv` / DCNv2 forward (commit bfb611a). DONE:
+      bilinear gather stays scalar; the sampled+modulated input column is gathered
+      ONCE per (ox,oy,tap) into `FSampledCol`, weights transposed each forward into
+      ci-contiguous `FWeightCI` so each co's ci-reduction is one `DotProduct`; suite
+      2376/0/0 on scalar + -dAVX2.
+- [X] AVX-vectorize `TNNetGroupConvP4` forward (commit ec7c7dc). DONE: BuildRotMap
+      already maps a ci-contiguous dstTap to a ci-contiguous srcTap and the input is
+      depth-fastest, so the inner ci loop became a direct `DotProduct` over FInDepth
+      with no scratch gather. `TNNetGroupPoolP4` SKIPPED — it reduces only the 4
+      orientation channels via max+argmax (not an input-depth reduction), so
+      DotProduct does not apply. Equivariance/group-conv tests green on both builds.
+- [X] AVX-vectorize `TNNetKANConv` forward (commit aa0209c). DONE: basis evaluation
+      (Chebyshev recurrence / EvalBSpline) stays scalar; the per-edge
+      `W.FData[base+kk] * FBVal[kk]`/`* FT[kk]` reduction over the contiguous
+      FCoeffsPerEdge coefficients is now one `DotProduct`. Chebyshev + B-spline
+      gradient/serialization tests green on scalar + -dAVX2.
+- [X] OpenCL forward offload for `TNNetDepthwiseConv` / `TNNetDepthwiseConv1D`
+      (commit 800ecfc). DONE: both layers got an `EnableOpenCL` override + an
+      `EnableConvOpenCL`/`NeuralConvOpenCLMinWork`-gated `ComputeOpenCL` mapping the
+      per-channel sweep onto the existing shared `cai_dot_product` kernel as a
+      diagonal GEMV (operand A column-interleaved as the kernel expects), CPU path
+      as fallback; skip-guarded exact-vs-CPU parity tests TestDepthwiseConvOpenCLParity
+      (2-D, max|diff| 1.9e-6) / TestDepthwiseConv1DOpenCLParity (1-D, 1.2e-7),
+      PoCL-verified. FOLLOW-UP: the diagonal-GEMV reads only the diagonal of a dense
+      outer product = a C-fold (resp. InDepth-fold) compute overspend; held in check
+      by the work-threshold gate but a dedicated strided/grouped `.cl` kernel would
+      remove it (worth doing if depthwise becomes a profiled GPU bottleneck).
 - [ ] OpenCL forward offload for `TNNetCausalLinearAttention` (the non-causal global
       `TNNetLinearAttention` is now DONE — `ComputeOpenCL` two-GEMM offload behind
       `FShouldOpenCL` + `LinearAttentionOpenCLParity` exact-vs-CPU test, PoCL-verified
