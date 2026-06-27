@@ -305,6 +305,27 @@ rather than acted on.
       register-token handling. Pairs with the open "register-token DINOv2 backbones
       rejected by BuildDPT" follow-up and unblocks DINOv3-backed dense-prediction.
 
+- [ ] Kandinsky 2.2 unCLIP text-to-image importer
+      (`BuildKandinskyPriorFromSafeTensors[Ex]` + `BuildKandinskyDecoderFromSafeTensors[Ex]`,
+      kandinsky-community `kandinsky-2-2-prior` + `kandinsky-2-2-decoder`). Distinct
+      from every landed diffusion stack (SD UNet / PixArt / DiT / MMDiT block), which
+      denoise in a VAE LATENT conditioned on a TEXT SEQUENCE: Kandinsky is a two-stage
+      unCLIP pipeline. Stage 1 is a DIFFUSION PRIOR — a small transformer
+      (`PriorTransformer`) that denoises a single CLIP IMAGE embedding vector
+      conditioned on the CLIP TEXT embedding + pooled text (the genuinely-new piece:
+      the model's "tokens" are [text-emb, pooled-text, time-emb, noised-image-emb,
+      learnable-final] and the target is the clean image embedding, NOT a spatial
+      latent). Stage 2 is a UNet decoder conditioned on that predicted image embedding
+      (via an `image_embeds` add-embedding, no cross-attn text stream) denoising in a
+      MoVQ (VQ-VAE) latent. Reuse: the landed CLIP text/image towers (image-emb
+      conditioning), `BuildSDUNetFromSafeTensors` for the decoder UNet trunk (add the
+      image-embeds projection path behind a config flag), `BuildVqModelFromSafeTensors`
+      / VQ decode for MoVQ, and an existing DDIM/UniPC scheduler for both diffusion
+      loops. The reusable new code is the `PriorTransformer` (a sequence-of-embeddings
+      denoiser) + the image-embedding add-conditioning on the decoder UNet. Scope a
+      pico parity fixture for each stage against a diffusers float64 oracle and an
+      `examples/KandinskyGenerate` end-to-end ("a red fox in snow" -> tiny CPU image).
+
 - [ ] Llama 3.2 Vision (mllama) cross-attention VLM importer
       (BuildMllamaFromSafeTensors[Ex], model_type "mllama", e.g.
       meta-llama/Llama-3.2-11B-Vision-Instruct). DISTINCT from the landed
@@ -891,6 +912,34 @@ rather than acted on.
       existing parity tests (TestHiFiGANSynthesisParity / TestVitsSynthesisParity /
       EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
       before/after.
+- [ ] OpenCL forward offload for `TNNetKANConv` via the shared `cai_dot_product`
+      GEMV kernel. The AVX sweep already reduced each edge's basis-coefficient
+      accumulation (`W * FBVal` / `W * FT` over the contiguous `FCoeffsPerEdge`
+      span) to a single `TNNetVolume.DotProduct` — structurally the SAME
+      depth-contiguous per-output dot product that `TNNetDepthwiseConv` /
+      `TNNetGroupConvP4` already offload to OpenCL through the bare-`TNNetLayer`
+      arming (`FHasOpenCL` + shared kernel) + a `ComputeOpenCL` that batches the
+      per-edge reductions onto `cai_dot_product` (commits 800ecfc / 67392). Add the
+      same `EnableOpenCL`/`ComputeOpenCL` override to `TNNetKANConv` (basis eval
+      stays on the CPU; only the coefficient GEMV moves to the device), gate it on
+      the existing KANConv numerical-gradient/forward tests staying bit-close on the
+      scalar fallback and `< 1e-5` on the device path. Closes a remaining gap in the
+      "dot-product-amenable conv layers are OpenCL-armed" set.
+- [ ] Multi-core threading of the single-sample `TNNetFullConnect` forward (and the
+      per-token projection it dominates) for imported-model CPU inference. Today
+      `TNNet` single-sample forward is inherently 1-core — parallelism lives only at
+      BATCH level inside `neuralfit` — so an imported LLM / TTS decoder generating one
+      token at a time pins a single core through its largest matmuls (profiled as a
+      top single-core suspect in the MusicGen / EnCodec decode work, alongside the
+      already-AVX'd inner dot products). Split the output-neuron range of
+      `TNNetFullConnect.Compute` across a `TNeuralThreadList` sized via
+      `NeuralDefaultThreadCount()` (NOT `TThread.ProcessorCount`, which returns 1 in
+      the POCL container — see the EnCodec threading gotcha), gated by a minimum
+      work threshold (Neurons * InputSize) so small layers stay serial, off by default
+      behind a setter the inference holders opt into. Bit-identical vs serial
+      (forced-thread A/B checksum like the EnCodec conv threading), re-profile
+      one-token decode wall-clock before/after on a real imported decoder. Generic win
+      across ChatTerminal / MusicGenText / every `BuildFromSafeTensors` model run on CPU.
 - [ ] Parler-TTS importer end-to-end follow-up (`BuildParlerTTSFromSafeTensors[Ex]`
       + `TParlerConfig` + `TParlerTTSModel` holder + `examples/ParlerTTS` LANDED,
       model_type `parler_tts`; (By)T5 description encoder cross-attention + shared
