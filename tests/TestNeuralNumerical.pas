@@ -70,6 +70,16 @@ type
     procedure TestSqueezeAxisLoadFromString;
     procedure TestSqueezeAxisGradientCheck;
 
+    // Non-zero padding modes (TNNetPadXY / TNNetPad)
+    procedure TestPadXYReflectForward;
+    procedure TestPadXYReplicateForward;
+    procedure TestPadXYCircularForward;
+    procedure TestPadXYReflectGradientCheck;
+    procedure TestPadXYReplicateGradientCheck;
+    procedure TestPadXYCircularGradientCheck;
+    procedure TestPadReflectGradientCheck;
+    procedure TestPadXYPadModeLoadFromString;
+
     // Single-channel gather layer (TNNetGather)
     procedure TestGatherForward;
     procedure TestGatherGradientCheck;
@@ -8585,6 +8595,260 @@ begin
   // probed input shape is (1, N, 1).
   LayerInputGradientCheck(Self, TNNetSqueeze.Create(1),
     'Squeeze(axis=1)', 1, 5, 1, 0.01);
+end;
+
+// Relative-tolerance input-gradient check for the padding layers. Reflect /
+// replicate / circular border cells scatter their gradient back onto the same
+// interior cell, so a single source cell can accumulate the contribution of
+// many output cells -- its gradient (and the FP32 central-difference truncation
+// error, which grows with the gradient magnitude) is several times larger than
+// for an identity layer. A pure absolute tolerance would therefore have to be
+// loosened to the point of being meaningless, so this uses a combined
+// relative+absolute bound which still pins a mis-routed scatter (those land on
+// the WRONG cell and differ by O(magnitude), not O(0.5%)).
+procedure PadLayerInputGradientCheck(ATestCase: TTestCase; ALayer: TNNetLayer;
+  const AName: string; ASizeX, ASizeY, ASizeD: integer);
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  tol: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): Double;
+  var
+    k: integer;
+    diff: Double;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // A larger epsilon than the identity-layer checks: the loss is accumulated in
+  // FP32 inside the network, so a too-small epsilon makes lossPlus-lossMinus
+  // lose most of its significant digits to round-off. 1e-2 keeps the central
+  // difference well-conditioned while staying in the layer's linear regime.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(ASizeX, ASizeY, ASizeD);
+  InputPlus := TNNetVolume.Create(ASizeX, ASizeY, ASizeD);
+  epsilon := 0.01;
+  try
+    NN.AddLayer(TNNetInput.Create(ASizeX, ASizeY, ASizeD, 1));
+    NN.AddLayer(ALayer);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      tol := 0.01 + 0.01 * Abs(analyticalGrad); // absolute floor + 1% relative
+      ATestCase.AssertTrue(AName + ' input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < tol);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPadXYReflectForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  // Reflect padding mirrors the interior WITHOUT repeating the edge sample
+  // (torch ReflectionPad2d). A 1-D row [a,b,c,d] padded by 2 on X becomes
+  // [c,b, a,b,c,d, c,b]. Probe a single row (4,1,1) padded by (2,0).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    Input[0, 0, 0] := 10;
+    Input[1, 0, 0] := 20;
+    Input[2, 0, 0] := 30;
+    Input[3, 0, 0] := 40;
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetPadXY.Create(2, 0, pmReflect));
+    NN.Compute(Input);
+    AssertEquals('Reflect output SizeX', 8, NN.GetLastLayer.Output.SizeX);
+    // Expected: index 0..7 -> [30,20,10,20,30,40,30,20]
+    AssertEquals('Reflect x0', 30, NN.GetLastLayer.Output[0, 0, 0], 1e-6);
+    AssertEquals('Reflect x1', 20, NN.GetLastLayer.Output[1, 0, 0], 1e-6);
+    AssertEquals('Reflect x2', 10, NN.GetLastLayer.Output[2, 0, 0], 1e-6);
+    AssertEquals('Reflect x3', 20, NN.GetLastLayer.Output[3, 0, 0], 1e-6);
+    AssertEquals('Reflect x4', 30, NN.GetLastLayer.Output[4, 0, 0], 1e-6);
+    AssertEquals('Reflect x5', 40, NN.GetLastLayer.Output[5, 0, 0], 1e-6);
+    AssertEquals('Reflect x6', 30, NN.GetLastLayer.Output[6, 0, 0], 1e-6);
+    AssertEquals('Reflect x7', 20, NN.GetLastLayer.Output[7, 0, 0], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPadXYReplicateForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  // Replicate padding clamps to the edge sample (torch ReplicationPad2d).
+  // [a,b,c,d] padded by 2 -> [a,a, a,b,c,d, d,d].
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    Input[0, 0, 0] := 10;
+    Input[1, 0, 0] := 20;
+    Input[2, 0, 0] := 30;
+    Input[3, 0, 0] := 40;
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetPadXY.Create(2, 0, pmReplicate));
+    NN.Compute(Input);
+    AssertEquals('Replicate x0', 10, NN.GetLastLayer.Output[0, 0, 0], 1e-6);
+    AssertEquals('Replicate x1', 10, NN.GetLastLayer.Output[1, 0, 0], 1e-6);
+    AssertEquals('Replicate x2', 10, NN.GetLastLayer.Output[2, 0, 0], 1e-6);
+    AssertEquals('Replicate x5', 40, NN.GetLastLayer.Output[5, 0, 0], 1e-6);
+    AssertEquals('Replicate x6', 40, NN.GetLastLayer.Output[6, 0, 0], 1e-6);
+    AssertEquals('Replicate x7', 40, NN.GetLastLayer.Output[7, 0, 0], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPadXYCircularForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  // Circular padding wraps around (circular F.pad).
+  // [a,b,c,d] padded by 2 -> [c,d, a,b,c,d, a,b].
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    Input[0, 0, 0] := 10;
+    Input[1, 0, 0] := 20;
+    Input[2, 0, 0] := 30;
+    Input[3, 0, 0] := 40;
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetPadXY.Create(2, 0, pmCircular));
+    NN.Compute(Input);
+    AssertEquals('Circular x0', 30, NN.GetLastLayer.Output[0, 0, 0], 1e-6);
+    AssertEquals('Circular x1', 40, NN.GetLastLayer.Output[1, 0, 0], 1e-6);
+    AssertEquals('Circular x2', 10, NN.GetLastLayer.Output[2, 0, 0], 1e-6);
+    AssertEquals('Circular x5', 40, NN.GetLastLayer.Output[5, 0, 0], 1e-6);
+    AssertEquals('Circular x6', 10, NN.GetLastLayer.Output[6, 0, 0], 1e-6);
+    AssertEquals('Circular x7', 20, NN.GetLastLayer.Output[7, 0, 0], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPadXYReflectGradientCheck;
+begin
+  // Reflect border cells copy interior samples; backward must scatter their
+  // gradient back onto those interior cells. Verify the input gradient matches
+  // finite differences on a (4,3,2) volume padded by (2,1). Several output
+  // cells scatter onto the same interior cell, so the accumulated gradient (and
+  // hence the FP32 central-difference truncation error) is a few times larger
+  // than for an identity layer, so this uses the relative-tolerance helper.
+  PadLayerInputGradientCheck(Self, TNNetPadXY.Create(2, 1, pmReflect),
+    'PadXY reflect', 4, 3, 2);
+end;
+
+procedure TTestNeuralNumerical.TestPadXYReplicateGradientCheck;
+begin
+  PadLayerInputGradientCheck(Self, TNNetPadXY.Create(2, 1, pmReplicate),
+    'PadXY replicate', 4, 3, 2);
+end;
+
+procedure TTestNeuralNumerical.TestPadXYCircularGradientCheck;
+begin
+  PadLayerInputGradientCheck(Self, TNNetPadXY.Create(2, 1, pmCircular),
+    'PadXY circular', 4, 3, 2);
+end;
+
+procedure TTestNeuralNumerical.TestPadReflectGradientCheck;
+begin
+  // Same scatter-adjoint check for the square-padding sibling TNNetPad.
+  PadLayerInputGradientCheck(Self, TNNetPad.Create(2, pmReflect),
+    'Pad reflect', 4, 4, 2);
+end;
+
+procedure TTestNeuralNumerical.TestPadXYPadModeLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // The NON-default pad mode lives in FStruct[2] (TNNetPadXY) and FStruct[1]
+  // (TNNetPad). SaveToString -> LoadFromString -> SaveToString must be
+  // byte-identical, proving the mode survives serialization and the reloaded
+  // layer reconstructs the non-zero padding behaviour.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 3, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 3, 2, 1));
+    NN.AddLayer(TNNetPadXY.Create(2, 1, pmReflect));
+    NN.AddLayer(TNNetPad.Create(1, pmCircular));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('PadXY mode round-trip class identity',
+        NN2.Layers[1] is TNNetPadXY);
+      AssertTrue('Pad mode round-trip class identity',
+        NN2.GetLastLayer is TNNetPad);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('PadMode SaveToString round-trip equality', Saved, Saved2);
+
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('PadMode round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestGatherForward;

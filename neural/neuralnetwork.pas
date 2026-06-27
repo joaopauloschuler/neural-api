@@ -95,6 +95,13 @@ type
   // independent of Steps AND of Method.
   TNNetODEMethod = (odeEuler, odeMidpoint);
 
+  // Border-fill mode for the padding layers TNNetPad / TNNetPadXY. pmZero keeps
+  // the historical behaviour (border filled with zeros) and is the default so
+  // legacy serialized models load unchanged. pmReflect mirrors the interior
+  // (torch ReflectionPad2d), pmReplicate clamps to the edge row/column (torch
+  // ReplicationPad2d) and pmCircular wraps around (circular F.pad).
+  TNNetPadMode = (pmZero, pmReflect, pmReplicate, pmCircular);
+
   // Per-head attention variant selector for TNNet.AddMultiHeadSelfAttention /
   // AddMultiHeadSDPAConcat. Each head is an independent SDPA-family layer with
   // the SAME (SeqLen,1,3*d_k) Q|K|V input and (SeqLen,1,d_k) output, so the
@@ -729,9 +736,11 @@ type
   TNNetPad = class(TNNetLayer)
   private
     FPadding: integer;
+    FPadMode: TNNetPadMode;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(Padding: integer); overload;
+    constructor Create(Padding: integer; PadMode: TNNetPadMode); overload;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -744,9 +753,11 @@ type
   TNNetPadXY = class(TNNetLayer)
   private
     FPaddingX, FPaddingY: integer;
+    FPadMode: TNNetPadMode;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(PaddingX, PaddingY: integer); overload;
+    constructor Create(PaddingX, PaddingY: integer; PadMode: TNNetPadMode); overload;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -18967,6 +18978,54 @@ begin
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
+// Maps an output coordinate Pos (0..outLen-1) of a padding layer back onto the
+// source coordinate (0..SrcLen-1) it was copied from, for a given border-fill
+// mode. Returns -1 for pmZero border cells (those are filled with zeros and
+// have no source). Used by both forward (copy) and backward (scatter) so the
+// two are exact adjoints of each other. SrcLen must be >= 1.
+// Coded by Claude (AI).
+function NeuralPadSourceIndex(Pos, Pad, SrcLen: integer;
+  PadMode: TNNetPadMode): integer;
+var
+  Idx, Period: integer;
+begin
+  Idx := Pos - Pad;
+  if (Idx >= 0) and (Idx < SrcLen) then
+  begin
+    Result := Idx;
+    exit;
+  end;
+  case PadMode of
+    pmReplicate:
+    begin
+      if Idx < 0 then Result := 0 else Result := SrcLen - 1;
+    end;
+    pmCircular:
+    begin
+      Result := ((Idx mod SrcLen) + SrcLen) mod SrcLen;
+    end;
+    pmReflect:
+    begin
+      if SrcLen = 1 then
+      begin
+        Result := 0;
+      end
+      else
+      begin
+        // Reflect without repeating the edge sample (torch ReflectionPad2d):
+        // period 2*(SrcLen-1) triangle wave.
+        Period := 2 * (SrcLen - 1);
+        Idx := ((Idx mod Period) + Period) mod Period;
+        if Idx >= SrcLen then Idx := Period - Idx;
+        Result := Idx;
+      end;
+    end;
+  else
+    // pmZero: border cell has no source.
+    Result := -1;
+  end;
+end;
+
 { TNNetPadXY }
 
 procedure TNNetPadXY.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -18978,16 +19037,25 @@ end;
 
 constructor TNNetPadXY.Create(PaddingX, PaddingY: integer);
 begin
+  Create(PaddingX, PaddingY, pmZero);
+end;
+
+constructor TNNetPadXY.Create(PaddingX, PaddingY: integer; PadMode: TNNetPadMode);
+begin
   inherited Create();
   FStruct[0] := PaddingX;
   FStruct[1] := PaddingY;
+  FStruct[2] := Ord(PadMode);
   FPaddingX := PaddingX;
   FPaddingY := PaddingY;
+  FPadMode := PadMode;
 end;
 
 procedure TNNetPadXY.Compute;
 var
   StartTime: double;
+  OutX, OutY, D, SrcX, SrcY: integer;
+  MaxX, MaxY, MaxD: integer;
 begin
   StartTime := Now();
   if
@@ -18995,13 +19063,34 @@ begin
     (FOutput.Size <> FOutputError.Size)
     then
     SetOutputErrorSize(FOutput);
-  FOutput.CopyPadding(FPrevLayer.FOutput, FPaddingX, FPaddingY);
+  if FPadMode = pmZero then
+  begin
+    FOutput.CopyPadding(FPrevLayer.FOutput, FPaddingX, FPaddingY);
+  end
+  else
+  begin
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := FOutput.Depth - 1;
+    for OutY := 0 to MaxY do
+    begin
+      SrcY := NeuralPadSourceIndex(OutY, FPaddingY, FPrevLayer.FOutput.SizeY, FPadMode);
+      for OutX := 0 to MaxX do
+      begin
+        SrcX := NeuralPadSourceIndex(OutX, FPaddingX, FPrevLayer.FOutput.SizeX, FPadMode);
+        for D := 0 to MaxD do
+          FOutput[OutX, OutY, D] := FPrevLayer.FOutput[SrcX, SrcY, D];
+      end;
+    end;
+  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetPadXY.Backpropagate;
 var
   StartTime: double;
+  OutX, OutY, D, SrcX, SrcY: integer;
+  MaxX, MaxY, MaxD: integer;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -19009,16 +19098,38 @@ begin
   if (FPrevLayer.Output.Size > 0) and (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
   begin
     StartTime := Now();
-    FPrevLayer.FOutputError.AddArea
-    (
-      {DestX=}0,
-      {DestY=}0,
-      {OriginX=}FPaddingX,
-      {OriginY=}FPaddingY,
-      {LenX=}FPrevLayer.OutputError.SizeX,
-      {LenY=}FPrevLayer.OutputError.SizeY,
-      FOutputError
-    );
+    if FPadMode = pmZero then
+    begin
+      FPrevLayer.FOutputError.AddArea
+      (
+        {DestX=}0,
+        {DestY=}0,
+        {OriginX=}FPaddingX,
+        {OriginY=}FPaddingY,
+        {LenX=}FPrevLayer.OutputError.SizeX,
+        {LenY=}FPrevLayer.OutputError.SizeY,
+        FOutputError
+      );
+    end
+    else
+    begin
+      // Scatter each output cell's gradient back onto the source cell it was
+      // copied from. Reflect/replicate accumulate onto interior/edge cells,
+      // circular wraps -- exact adjoint of the forward copy above.
+      MaxX := FOutput.SizeX - 1;
+      MaxY := FOutput.SizeY - 1;
+      MaxD := FOutput.Depth - 1;
+      for OutY := 0 to MaxY do
+      begin
+        SrcY := NeuralPadSourceIndex(OutY, FPaddingY, FPrevLayer.FOutput.SizeY, FPadMode);
+        for OutX := 0 to MaxX do
+        begin
+          SrcX := NeuralPadSourceIndex(OutX, FPaddingX, FPrevLayer.FOutput.SizeX, FPadMode);
+          for D := 0 to MaxD do
+            FPrevLayer.FOutputError.Add(SrcX, SrcY, D, FOutputError[OutX, OutY, D]);
+        end;
+      end;
+    end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
@@ -39378,14 +39489,23 @@ end;
 
 constructor TNNetPad.Create(Padding: integer);
 begin
+  Create(Padding, pmZero);
+end;
+
+constructor TNNetPad.Create(Padding: integer; PadMode: TNNetPadMode);
+begin
   inherited Create();
   FStruct[0] := Padding;
+  FStruct[1] := Ord(PadMode);
   FPadding := Padding;
+  FPadMode := PadMode;
 end;
 
 procedure TNNetPad.Compute();
 var
   StartTime: double;
+  OutX, OutY, D, SrcX, SrcY: integer;
+  MaxX, MaxY, MaxD: integer;
 begin
   StartTime := Now();
   if
@@ -39393,13 +39513,34 @@ begin
     (FOutput.Size <> FOutputError.Size)
     then
     SetOutputErrorSize(FOutput);
-  FOutput.CopyPadding(FPrevLayer.FOutput, FPadding);
+  if FPadMode = pmZero then
+  begin
+    FOutput.CopyPadding(FPrevLayer.FOutput, FPadding);
+  end
+  else
+  begin
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := FOutput.Depth - 1;
+    for OutY := 0 to MaxY do
+    begin
+      SrcY := NeuralPadSourceIndex(OutY, FPadding, FPrevLayer.FOutput.SizeY, FPadMode);
+      for OutX := 0 to MaxX do
+      begin
+        SrcX := NeuralPadSourceIndex(OutX, FPadding, FPrevLayer.FOutput.SizeX, FPadMode);
+        for D := 0 to MaxD do
+          FOutput[OutX, OutY, D] := FPrevLayer.FOutput[SrcX, SrcY, D];
+      end;
+    end;
+  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetPad.Backpropagate();
 var
   StartTime: double;
+  OutX, OutY, D, SrcX, SrcY: integer;
+  MaxX, MaxY, MaxD: integer;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -39407,16 +39548,35 @@ begin
   if (FPrevLayer.Output.Size > 0) and (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
   begin
     StartTime := Now();
-    FPrevLayer.FOutputError.AddArea
-    (
-      {DestX=}0,
-      {DestY=}0,
-      {OriginX=}FPadding,
-      {OriginY=}FPadding,
-      {LenX=}FPrevLayer.OutputError.SizeX,
-      {LenY=}FPrevLayer.OutputError.SizeY,
-      FOutputError
-    );
+    if FPadMode = pmZero then
+    begin
+      FPrevLayer.FOutputError.AddArea
+      (
+        {DestX=}0,
+        {DestY=}0,
+        {OriginX=}FPadding,
+        {OriginY=}FPadding,
+        {LenX=}FPrevLayer.OutputError.SizeX,
+        {LenY=}FPrevLayer.OutputError.SizeY,
+        FOutputError
+      );
+    end
+    else
+    begin
+      MaxX := FOutput.SizeX - 1;
+      MaxY := FOutput.SizeY - 1;
+      MaxD := FOutput.Depth - 1;
+      for OutY := 0 to MaxY do
+      begin
+        SrcY := NeuralPadSourceIndex(OutY, FPadding, FPrevLayer.FOutput.SizeY, FPadMode);
+        for OutX := 0 to MaxX do
+        begin
+          SrcX := NeuralPadSourceIndex(OutX, FPadding, FPrevLayer.FOutput.SizeX, FPadMode);
+          for D := 0 to MaxD do
+            FPrevLayer.FOutputError.Add(SrcX, SrcY, D, FOutputError[OutX, OutY, D]);
+        end;
+      end;
+    end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
@@ -100899,8 +101059,8 @@ begin
       'TNNetTransposeYD' :          Result := TNNetTransposeYD.Create();
       'TNNetDebug' :                Result := TNNetDebug.Create(St[0], St[1]);
       'TNNetDotProducts' :          Result := TNNetDotProducts.Create(St[0], St[1], St[2]);
-      'TNNetPad' :                  Result := TNNetPad.Create(St[0]);
-      'TNNetPadXY' :                Result := TNNetPadXY.Create(St[0], St[1]);
+      'TNNetPad' :                  Result := TNNetPad.Create(St[0], TNNetPadMode(St[1]));
+      'TNNetPadXY' :                Result := TNNetPadXY.Create(St[0], St[1], TNNetPadMode(St[2]));
       'TNNetCrop' :                 Result := TNNetCrop.Create(St[0], St[1], St[2], St[3]);
       'TNNetIdentityWithoutBackprop': Result := TNNetIdentityWithoutBackprop.Create();
       'TNNetReLU' :                 Result := TNNetReLU.Create();
@@ -101324,8 +101484,8 @@ begin
       if S[0] = 'TNNetTransposeYD' then Result := TNNetTransposeYD.Create() else
       if S[0] = 'TNNetDebug' then Result := TNNetDebug.Create(St[0], St[1]) else
       if S[0] = 'TNNetDotProducts' then Result := TNNetDotProducts.Create(St[0], St[1], St[2]) else
-      if S[0] = 'TNNetPad' then Result := TNNetPad.Create(St[0]) else
-      if S[0] = 'TNNetPadXY' then Result := TNNetPadXY.Create(St[0], St[1]) else
+      if S[0] = 'TNNetPad' then Result := TNNetPad.Create(St[0], TNNetPadMode(St[1])) else
+      if S[0] = 'TNNetPadXY' then Result := TNNetPadXY.Create(St[0], St[1], TNNetPadMode(St[2])) else
       if S[0] = 'TNNetCrop' then Result := TNNetCrop.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetIdentityWithoutBackprop' then Result := TNNetIdentityWithoutBackprop.Create() else
       if S[0] = 'TNNetReLU' then Result := TNNetReLU.Create() else
