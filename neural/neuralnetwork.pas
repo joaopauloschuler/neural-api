@@ -36978,9 +36978,12 @@ begin
     for OY := 0 to MaxOY do
       for SX := 0 to PM1 do
         for SY := 0 to PM1 do
-          for IC := 0 to MaxC do
-            FOutput[OX, OY, (SX * P + SY) * C + IC] :=
-              FPrevLayer.FOutput[OX * P + SX, OY * P + SY, IC];
+          // The IC run is contiguous in depth in BOTH source and destination
+          // (depth is the fastest axis), so copy all C floats at once.
+          system.Move(
+            FPrevLayer.FOutput.GetRawPtr(OX * P + SX, OY * P + SY, 0)^,
+            FOutput.GetRawPtr(OX, OY, (SX * P + SY) * C)^,
+            C * SizeOf(TNeuralFloat));
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -37009,9 +37012,13 @@ begin
       for OY := 0 to MaxOY do
         for SX := 0 to PM1 do
           for SY := 0 to PM1 do
-            for IC := 0 to MaxC do
-              FPrevLayer.OutputError.Add(OX * P + SX, OY * P + SY, IC,
-                FOutputError[OX, OY, (SX * P + SY) * C + IC]);
+            // Bijective routing: the contiguous depth run is accumulated once
+            // (no overlap), so the per-element Add over C floats is an AVX
+            // vector accumulate that preserves exact += semantics.
+            TNNetVolume.Add(
+              FPrevLayer.OutputError.GetRawPtr(OX * P + SX, OY * P + SY, 0),
+              FOutputError.GetRawPtr(OX, OY, (SX * P + SY) * C),
+              C);
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
@@ -37068,9 +37075,12 @@ begin
     for IY := 0 to MaxIY do
       for SX := 0 to PM1 do
         for SY := 0 to PM1 do
-          for IC := 0 to MaxC do
-            FOutput[IX * P + SX, IY * P + SY, IC] :=
-              FPrevLayer.FOutput[IX, IY, (SX * P + SY) * C + IC];
+          // The IC run is contiguous in depth in BOTH source and destination
+          // (depth is the fastest axis), so copy all C floats at once.
+          system.Move(
+            FPrevLayer.FOutput.GetRawPtr(IX, IY, (SX * P + SY) * C)^,
+            FOutput.GetRawPtr(IX * P + SX, IY * P + SY, 0)^,
+            C * SizeOf(TNeuralFloat));
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -37099,9 +37109,13 @@ begin
       for IY := 0 to MaxIY do
         for SX := 0 to PM1 do
           for SY := 0 to PM1 do
-            for IC := 0 to MaxC do
-              FPrevLayer.OutputError.Add(IX, IY, (SX * P + SY) * C + IC,
-                FOutputError[IX * P + SX, IY * P + SY, IC]);
+            // Bijective routing: the contiguous depth run is accumulated once
+            // (no overlap), so the per-element Add over C floats is an AVX
+            // vector accumulate that preserves exact += semantics.
+            TNNetVolume.Add(
+              FPrevLayer.OutputError.GetRawPtr(IX, IY, (SX * P + SY) * C),
+              FOutputError.GetRawPtr(IX * P + SX, IY * P + SY, 0),
+              C);
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
