@@ -754,22 +754,12 @@ rather than acted on.
       but NN.Compute has no SIMD batch axis on the char path, so each step still
       pays one forward per running row. The vectorized batch is the actual
       prerequisite for an efficient speculative-decoding verify step.
-- [X] FlashAttention-style tiled online-softmax SDPA forward: opt-in fast
-      mode — not for GPU speed but for O(L*d) vs O(L^2) attention-score
-      MEMORY on long sequences; gate behind an exact-vs-naive equivalence
-      assert, same pattern as the chunked-forward recurrence family.
-      DONE (v1): TNNetScaledDotProductAttention.EnableTiledForward(TileBc) gates
-      the FlashAttention-1 tiling (ComputeTiled: running max/denominator/output
-      per query, keys streamed in tiles, L x L scores never materialized; off by
-      default -> bit-identical naive path). v1 scope = STANDARD softmax variant
-      only (plain scale + causal/sliding/bidirectional-window); falls back to the
-      naive path for soft-cap / segment / prefix-LM / block-causal / KV-cache,
-      and the exotic subclasses (differential/sink/ALiBi/cosine-sim/T5/...) keep
-      their own Compute and never reach it. FORWARD-ONLY: does not build FAttn,
-      so Backpropagate after a tiled forward is rejected. Parity test
-      TestSDPATiledOnlineSoftmaxParity asserts max|diff| < 1e-5 vs naive across
-      SeqLen/Dk/window/causal/tile configs (observed ~1e-7). FOLLOW-UPS: exotic
-      variants + tiled backward (recompute-scores) still open.
+- [ ] FlashAttention tiled online-softmax SDPA follow-ups (opt-in
+      EnableTiledForward/ComputeTiled v1 LANDED — STANDARD-softmax forward only,
+      forward-only, parity-gated TestSDPATiledOnlineSoftmaxParity < 1e-5): the
+      exotic attention subclasses (differential/sink/ALiBi/cosine-sim/T5/soft-cap/
+      segment/prefix-LM/block-causal/KV-cache) and the tiled (recompute-scores)
+      BACKWARD are still open.
 - [ ] longrope short-factor / dynamic switching follow-up (static long-context
       import landed): the import statically picks the long_factor table + long
       attention scaling. HF switches to short_factor when seq_len <=
@@ -939,37 +929,12 @@ rather than acted on.
       existing parity tests (TestHiFiGANSynthesisParity / TestVitsSynthesisParity /
       EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
       before/after.
-- [X] OpenCL forward offload for `TNNetKANConv` via the shared `cai_dot_product`
-      GEMV kernel. The AVX sweep already reduced each edge's basis-coefficient
-      accumulation (`W * FBVal` / `W * FT` over the contiguous `FCoeffsPerEdge`
-      span) to a single `TNNetVolume.DotProduct` — structurally the SAME
-      depth-contiguous per-output dot product that `TNNetDepthwiseConv` /
-      `TNNetGroupConvP4` already offload to OpenCL through the bare-`TNNetLayer`
-      arming (`FHasOpenCL` + shared kernel) + a `ComputeOpenCL` that batches the
-      per-edge reductions onto `cai_dot_product` (commits 800ecfc / 67392). Add the
-      same `EnableOpenCL`/`ComputeOpenCL` override to `TNNetKANConv` (basis eval
-      stays on the CPU; only the coefficient GEMV moves to the device), gate it on
-      the existing KANConv numerical-gradient/forward tests staying bit-close on the
-      scalar fallback and `< 1e-5` on the device path. Closes a remaining gap in the
-      "dot-product-amenable conv layers are OpenCL-armed" set.
-- [X] Multi-core threading of the single-sample `TNNetFullConnect` forward (and the
-      per-token projection it dominates) for imported-model CPU inference. LANDED:
-      `ComputeCPU` of `TNNetFullConnect` (FActivationFn), `TNNetFullConnectLinear`
-      (activation-free q/k/v/o + gate/up/down) and `TNNetFullConnectReLU` (inlined
-      ReLU FFN) now split their independent OUTPUT-NEURON range across a shared
-      `TNeuralThreadList` sized via `NeuralDefaultThreadCount()` (NOT
-      `TThread.ProcessorCount` — the POCL-returns-1 EnCodec gotcha). Each thread owns
-      a disjoint neuron slice and writes only its own `FOutputRaw`/`FOutput` slots, so
-      it is BIT-IDENTICAL to the serial path (per-neuron reduction order unchanged;
-      verified by `TestFullConnectThreadingParity` with `=` equality on both the
-      Linear and ReLU variants, plain + `-dAVX2` builds, forced-thread via
-      `SetFullConnectThreadingMinWork(0)`). OFF by default behind
-      `EnableFullConnectThreading`; gated by a work threshold (Neurons*InputSize MACs,
-      default 256K) via `SetFullConnectThreadingMinWork` so small projections stay
-      serial; the batched neuralfit path is untouched (only the batch-1 CPU
-      `ComputeCPU` is threaded). Pool created lazily, freed in unit finalization.
-      FOLLOW-UPS: (a) the per-token projection HOLDERS (ChatTerminal /
-      MusicGenText / `RunLlama`-style decoders) still need to call
+- [ ] Single-sample `TNNetFullConnect` forward threading follow-ups (opt-in
+      `EnableFullConnectThreading` multi-core `ComputeCPU` v1 LANDED for
+      FullConnect/FullConnectLinear/FullConnectReLU — off by default, bit-identical
+      to serial, work-thresholded via `SetFullConnectThreadingMinWork`):
+      (a) the per-token projection HOLDERS (ChatTerminal / MusicGenText /
+      `RunLlama`-style decoders) still need to call
       `EnableFullConnectThreading(true)` to opt in — wire it into the imported-model
       run paths; (b) re-profile one-token decode wall-clock before/after on a real
       imported decoder to tune the default threshold; (c) the int8-quantized
@@ -1583,27 +1548,6 @@ rather than acted on.
       check (all in TestNeuralNumerical, passing; full suite green 2376/0/0). This
       UNBLOCKS the pyannote `segmentation-3.0` bidirectional-LSTM trunk drop-in
       (lines ~977-995) — the trunk can now swap from MinLSTM to true nn.LSTM cells.
-  [X] DONE: the generic safetensors importer that loads real torch nn.LSTM/nn.GRU
-      `weight_ih_l{k}`/`weight_hh_l{k}`/`bias_ih_l{k}`/`bias_hh_l{k}`(`_reverse`)
-      slabs into the stacked cells — `LoadTorchLSTMInto`/`LoadTorchGRUInto`
-      (into an existing builder sub-stack under a key prefix) + standalone
-      `BuildLSTMFromSafeTensors`/`BuildGRUFromSafeTensors` (neuralpretrained.pas).
-      Splits the torch fused gate slab into the cell's per-gate tensors in torch
-      order (LSTM i,f,g,o; GRU r,z,n); LSTM bias = bias_ih+bias_hh summed; GRU
-      sums r,z biases but keeps b_in (bias_ih) and b_hn (bias_hh) SEPARATE to
-      match the cell's `n=tanh(W_in x+b_in+r*(W_hn h+b_hn))`. Pico torch oracle
-      fixtures (`tools/torch_rnn_tiny_fixture.py`,
-      `tests/fixtures/tiny_torch_{lstm,gru}_{uni_l1,uni_l2,bi_l1}.*`) +
-      `TestTorch{LSTM,GRU}ImportParity` assert full output-sequence parity < 1e-4
-      (LSTM/GRU × 1-layer uni, 2-layer uni, 1-layer bidir). DEFERRED: the builder
-      inserts a learned `TNNetPointwiseConvLinear` projection whenever an incoming
-      Depth≠Hidden (layer-0 with input_size≠Hidden, or ANY layer above a
-      bidirectional one); that projection has no torch counterpart, so torch
-      weights are NOT faithfully importable through it. Supported (faithful):
-      unidirectional stacks and single bidirectional layers with
-      input_size==Hidden; the importer REJECTS the projection case loudly
-      (`TestTorchRNNImportRejectsProjection`). Also out of scope, rejected:
-      batch_first, proj_size (`weight_hr_l*`), peephole.
   - [ ] Faithful STACKED-BIDIRECTIONAL torch import follow-up: the
         `AddBidirectionalRecurrentStack` engine inserts a learned
         `TNNetPointwiseConvLinear` projection on every incoming Depth≠Hidden feed
