@@ -266,20 +266,6 @@ rather than acted on.
       the 2-D-RoPE variable-resolution vision tower + the patch-token splicing
       position builder; verify the tower against a transformers reference and the
       decoder against the landed Mistral parity fixture.
-- [X] RepVGG classification-backbone importer with load-time structural
-      re-parameterization (`BuildRepVGGFromSafeTensors[Ex]`, the timm / official
-      `RepVGG-A0..B3` family). The training graph is a multi-branch block
-      (3x3 conv-BN + 1x1 conv-BN + an identity BN), but inference FUSES all three
-      branches into a SINGLE plain 3x3 `TNNetConvolution` per block. Implemented the
-      fusion at LOAD time (ReparamRepVGGBlock: fold each branch's BN into its conv
-      kernel/bias, zero-pad the 1x1 kernel into the 3x3 centre, add the identity
-      branch as a centred 3x3 identity kernel, sum the three kernels+biases) — the
-      imported net is a pure VGG-style stack of `TNNetConvolutionReLU` with no
-      runtime branch overhead. The reusable BN-fold + branch-add reparameterization
-      helper is also applicable to MobileOne / other rep-style nets. Pico numpy
-      float64 multi-branch TRAINING oracle parity vs the FUSED inference net < 1e-4
-      (TestRepVGGParity). .pth-pickle checkpoint loading deferred (safetensors +
-      sharded index / pytorch_model.bin supported via the shared reader).
 - [ ] Sana text-to-image importer (`BuildSanaFromSafeTensors[Ex]`, NVIDIA /
       Efficient-Large-Model `Sana_*`). A genuinely different image-generation
       stack from the landed PixArt/MMDiT path: a LINEAR-attention DiT denoiser
@@ -1529,33 +1515,6 @@ rather than acted on.
       STILL OPEN: the actual safetensors importer that loads real nn.LSTM/nn.GRU
       `weight_ih_l{k}`/`weight_hh_l{k}`(`_reverse`) slabs into the stacked cells.
 
-- [X] AVX-vectorize `TNNetDeformableConv` / DCNv2 forward (commit bfb611a). DONE:
-      bilinear gather stays scalar; the sampled+modulated input column is gathered
-      ONCE per (ox,oy,tap) into `FSampledCol`, weights transposed each forward into
-      ci-contiguous `FWeightCI` so each co's ci-reduction is one `DotProduct`; suite
-      2376/0/0 on scalar + -dAVX2.
-- [X] AVX-vectorize `TNNetGroupConvP4` forward (commit ec7c7dc). DONE: BuildRotMap
-      already maps a ci-contiguous dstTap to a ci-contiguous srcTap and the input is
-      depth-fastest, so the inner ci loop became a direct `DotProduct` over FInDepth
-      with no scratch gather. `TNNetGroupPoolP4` SKIPPED — it reduces only the 4
-      orientation channels via max+argmax (not an input-depth reduction), so
-      DotProduct does not apply. Equivariance/group-conv tests green on both builds.
-- [X] AVX-vectorize `TNNetKANConv` forward (commit aa0209c). DONE: basis evaluation
-      (Chebyshev recurrence / EvalBSpline) stays scalar; the per-edge
-      `W.FData[base+kk] * FBVal[kk]`/`* FT[kk]` reduction over the contiguous
-      FCoeffsPerEdge coefficients is now one `DotProduct`. Chebyshev + B-spline
-      gradient/serialization tests green on scalar + -dAVX2.
-- [X] OpenCL forward offload for `TNNetDepthwiseConv` / `TNNetDepthwiseConv1D`
-      (commit 800ecfc). DONE: both layers got an `EnableOpenCL` override + an
-      `EnableConvOpenCL`/`NeuralConvOpenCLMinWork`-gated `ComputeOpenCL` mapping the
-      per-channel sweep onto the existing shared `cai_dot_product` kernel as a
-      diagonal GEMV (operand A column-interleaved as the kernel expects), CPU path
-      as fallback; skip-guarded exact-vs-CPU parity tests TestDepthwiseConvOpenCLParity
-      (2-D, max|diff| 1.9e-6) / TestDepthwiseConv1DOpenCLParity (1-D, 1.2e-7),
-      PoCL-verified. FOLLOW-UP: the diagonal-GEMV reads only the diagonal of a dense
-      outer product = a C-fold (resp. InDepth-fold) compute overspend; held in check
-      by the work-threshold gate but a dedicated strided/grouped `.cl` kernel would
-      remove it (worth doing if depthwise becomes a profiled GPU bottleneck).
 - [ ] OpenCL forward offload for `TNNetCausalLinearAttention` (the non-causal global
       `TNNetLinearAttention` is now DONE — `ComputeOpenCL` two-GEMM offload behind
       `FShouldOpenCL` + `LinearAttentionOpenCLParity` exact-vs-CPU test, PoCL-verified
