@@ -224,6 +224,19 @@ rather than acted on.
 
 ### Computer vision & generative models
 
+- [ ] `TNNetGramMatrix` reusable layer — channel-wise Gram matrix
+      `G[i][j] = (1/(H·W)) · Σ_{x,y} A[x,y,i]·A[x,y,j]` over a feature map, the
+      core style-loss / second-order texture statistic. It is currently
+      re-implemented BY HAND as a `ComputeGram` nested-loop procedure in THREE
+      examples — `examples/StyleTransfer`, `examples/AdaINStyleTransfer` and
+      `examples/CycleGAN` — so a single layer removes that triplication and gives
+      a vectorizable home for it (each `G[i][j]` is a depth-pair dot product over
+      the contiguous spatial run, so the forward maps onto `TNNetVolume.DotProduct`
+      and the backward `dA = 2·A·dG` onto `MulAdd`). Output is a Depth×Depth map
+      (SizeX=SizeY=Depth_in, one channel) so it composes as a normal layer.
+      Scope: the layer + numerical-gradient + serialization tests, then port the
+      three named examples off their hand-made `ComputeGram` onto it.
+
 - [ ] FastSAM real-time segment-anything importer (`BuildFastSAMFromSafeTensors[Ex]`,
       ultralytics FastSAM-s / FastSAM-x). Architecturally distinct from the landed
       ViT-encoder SAM path: FastSAM reframes "segment everything" as a YOLOv8
@@ -991,6 +1004,29 @@ rather than acted on.
       contiguous depth `+=` preserves exact gradient-accumulation). All 1235
       numerical tests (incl. SpaceToDepthForward / DepthToSpaceOfSpaceToDepth /
       SpaceToDepthGradientCheck) pass on both scalar and -dAVX2 builds.
+
+- [ ] AVX-vectorize `TNNetPixelNorm` (StyleGAN per-pixel feature-vector
+      normalization, neuralnetwork.pas ~line 57620). The forward Compute inner
+      loop is a per-(x,y) scalar `SumSqr += FData[base+c]^2` over the contiguous
+      depth axis followed by a scalar `FData[base+c] *= InvRMS` rescale — both
+      drop straight onto the existing depth-contiguous primitives
+      (`TNNetVolume.GetSumSqr(ptr, Depth)` for the norm, `Mul(ptr, InvRMS, Depth)`
+      for the rescale). The Backpropagate per-pixel loop is the same shape:
+      a `DotProduct(dy, normalized, Depth)` for the `SumDyY` projection term then
+      two `MulAdd` over the contiguous depth column. Mirror the
+      `TNNetL2Normalize` / `TNNetLogitNormalize` AVX work already landed; pin with
+      a forward-parity + gradient-check test green on scalar and -dAVX2.
+
+- [ ] OpenCL offload of `TNNetCorrelationVolume.Compute` (RAFT all-pairs
+      correlation, neuralnetwork.pas; AVX forward already landed, commit
+      f598146d / 346c1b4e). The forward is W²·H² depth-axis dot products
+      (`DotProduct(f1[ix,iy,:], f2[jx,jy,:], C)`) — a GEMM-shaped, embarrassingly
+      parallel kernel that grows quadratically in the spatial size and dominates
+      RAFT cost at higher resolution, so it amortizes a host round-trip well.
+      Wire a `ComputeOpenCL` reusing the `cai_dot_product` GEMM scaffolding (one
+      work-item per (output-position, displacement) pair), gate behind
+      `FShouldOpenCL`, keep the AVX path as the no-OpenCL fallback, and pin parity
+      with an exact-vs-CPU test in the SDPAOpenCLParity style.
 
 - [ ] OpenCL offload of `TNNetCorrelationLookup.Compute` (RAFT local lookup of
       the all-pairs correlation, neuralnetwork.pas ~line 29120). The per-pixel
