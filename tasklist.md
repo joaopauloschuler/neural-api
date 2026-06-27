@@ -979,7 +979,7 @@ rather than acted on.
       EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
       before/after.
 
-- [ ] AVX-vectorize `TNNetCosineSimilarity` (Compute + Backpropagate). Both are
+- [X] AVX-vectorize `TNNetCosineSimilarity` (Compute + Backpropagate). Both are
       still raw scalar `for D` reductions over a depth-contiguous column (the two
       halves of the previous layer's depth axis are contiguous: a at offset 0, b
       at offset HalfDepth). Forward does three sum reductions per (X,Y) —
@@ -994,7 +994,7 @@ rather than acted on.
       the existing `TestCosineSimilarityForward` / `TestCosineSimilarityGradientCheck`
       gate parity on scalar AND `-dAVX2 -B` builds.
 
-- [ ] AVX-vectorize `TNNetHouseholderLinear` (ComputeCPU + BackpropagateCPU).
+- [X] AVX-vectorize `TNNetHouseholderLinear` (ComputeCPU + BackpropagateCPU).
       Each of the K reflections recomputes `beta=v·v` and `dot=v·u` (and in
       backward `dgv=v·g`, `duv=v·u`) as raw scalar `for j` loops over the
       contiguous length-N reflection/working vectors, even though the reflection
