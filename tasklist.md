@@ -478,6 +478,18 @@ rather than acted on.
     - [ ] the end-to-end LatentTextToImage capstone (CLIP text -> this UNet ->
           scheduler loop -> VAE decoder), incl. the SDXL dual-text-encoder pooled
           embedding + real-checkpoint parity.
+- [ ] CogVLM / CogVLM2 vision-language importer (`BuildCogVLMFromSafeTensors[Ex]`,
+      model_type "cogvlm"/"cogvlm2"). Architecturally distinct from the
+      shared-trunk VLMs already imported (LLaVA / Florence2 / Blip2 / Pixtral):
+      CogVLM routes IMAGE tokens and TEXT tokens through SEPARATE per-block
+      weights — a dedicated "visual expert" with its own QKV and FFN matrices
+      running in parallel with the language QKV/FFN, selected per token by
+      modality. The importer needs a token-type-routed block builder (text
+      experts vs vision experts sharing the attention score space), the EVA-CLIP
+      ViT image encoder + MLP adapter, and a pico safetensors parity fixture
+      (`make_pico_cogvlm_fixture.py`, reusing the slice-real-checkpoint pattern)
+      checked < 1e-4 vs a transformers float64 oracle. Add a CV captioning /
+      VQA smoke under examples/ once a small checkpoint is obtainable offline.
 - [ ] Mask2Former universal-segmentation importer LANDED
       (BuildMask2FormerFromSafeTensors[Ex], model_type "mask2former";
       masked-attention decoder + per-query mask/class heads, RunMask2FormerSemantic +
@@ -1696,6 +1708,39 @@ rather than acted on.
       does not map onto the `FDotCL` matmul kernel without a chunked-scan rewrite.
       Tackle it with the chunked-forward family below (intra-chunk dense GEMM +
       inter-chunk running state), then add a causal parity test alongside.
+
+- [ ] OpenCL forward offload for `TNNetCrossAttention`. It currently has a
+      CPU/AVX `Compute` only; the sibling `TNNetScaledDotProductAttention`
+      already has a `ComputeOpenCL` two-GEMM offload (Q·Kᵀ then scores·V on the
+      `FDotCL` matmul kernel, behind `FShouldOpenCL`). Cross-attention is the
+      same pair of dense GEMMs, just RECTANGULAR (Q seqlen ≠ K|V seqlen, which
+      `FDotCL` already supports as an arbitrary M×K×N matmul), so it maps onto
+      the same kernel — only the score-matrix shape and the packed-K|V source
+      wiring differ. Mirror SDPA's `ComputeOpenCL` + add a
+      `CrossAttentionOpenCLParity` exact-vs-CPU test (PoCL-verified, target
+      max|diff| < 1e-4 like the existing attention parity tests). Unblocks
+      GPU-offloaded dual-stream / encoder-decoder cross-attention stacks.
+- [ ] OpenCL forward offload for the gate projections of `TNNetLSTMCell` /
+      `TNNetGRUCell`. Each cell's per-step work is dominated by dense
+      input-projection + recurrent-projection matmuls (4 gates for LSTM, 3 for
+      GRU) — exactly the `FDotCL` GEMM shape that `TNNetFullConnect` /
+      `TNNetScaledDotProductAttention` already offload. Offload the projections
+      behind an `FShouldOpenCL` gate (the elementwise gate nonlinearities and
+      the cell-state recurrence stay on CPU), with an exact-vs-CPU parity test.
+- [ ] AVX-vectorize the remaining scalar transcendental activation FORWARD
+      loops, completing the documented deferral from the landed `AVXExp` /
+      `VectorExp` / `VectorSigmoid` batch (which routed only `PointwiseSoftMax`
+      and `TNNetSwish`). Still strictly per-element scalar: `TNNetGELU`
+      (tanh path), `TNNetGELUErf` (exact-erf path), `TNNetMish`, `TNNetPhish`,
+      `TNNetSerf`, `TNNetSmish`, `TNNetLogCoshActivation`, `TNNetLisht`, plus
+      `TNNetSin` / `TNNetCos` / `TNNetSinhAct` / `TNNetArcSinh`. The original
+      deferral was because forward and derivative are computed interleaved per
+      element; resolve it with the documented two-pass scratch approach (fill
+      the activation with one vectorized forward pass via `VectorExp` /
+      `VectorSigmoid` and new `VectorTanh` / `VectorErf` 8-wide primitives
+      declared alongside them, then a second pass for `FOutputErrorDeriv`).
+      Add per-activation `< 1e-4` parity tests that stay green on BOTH the
+      scalar-fallback and `-dAVX2` builds (mirror `TestVectorExpScalarParity`).
 
 (The sub-quadratic / chunked-forward family below is one coherent systems effort:
 every recurrence currently trains as a strict per-token left-to-right scan.)
