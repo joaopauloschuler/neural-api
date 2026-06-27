@@ -1462,11 +1462,18 @@ rather than acted on.
       init-latent setup. Pico fixture (tools/vae_encoder_tiny_fixture.py ->
       tests/fixtures/tiny_vae_encoder*) + TestVaeEncoderParity (numpy float64
       oracle, max|diff| < 1e-4) + TestVaeRoundTrip (encode->decode end to end).
-      STILL OPEN: (1) full sampler-loop img2img — start the existing sampler at
-      timestep int(strength*num_steps) with scheduler.add_noise on the init latents
-      (alphas_cumprod schedule already exists); (2) the non-deterministic
-      reparameterize head (mean+exp(0.5*logvar)*noise); (3) inpainting blend +
-      9-channel inpaint conv_in widening.
+      DONE (img2img sampler loop): examples/ImageToImage drives the full
+      encode->partial-noise->denoise->decode SDEdit trajectory (strength knob).
+      DONE (blended inpainting): SDUNetDenoiseInpaint (neuralpretrained.pas) runs a
+      complete reverse loop on the standard 4-channel SD UNet and at EVERY step
+      blends the known region back in (latents = mask*denoised + (1-mask)*AddNoise(
+      z0,t)); examples/DiffusionInpainting smoke-runs it on the pico VAE+SD-UNet
+      fixtures (right-half hole), writing masked_input.ppm/inpainted.ppm, and
+      TestDiffusionInpaintSmoke asserts the kept latent region equals z0 exactly
+      while the masked hole changes. This is the no-retrain blended mode.
+      STILL OPEN: (1) the non-deterministic VAE reparameterize head
+      (mean+exp(0.5*logvar)*noise); (2) the 9-channel inpaint-specialized UNet
+      (conv_in widened to 4 latent + 1 mask + 4 masked-latent) importer support.
       ORIGINAL NOTE — The landed SD path
       (BuildVaeDecoderFromSafeTensors + BuildSDUNetFromSafeTensors + SDUNetDenoise +
       the neuraldiffusion sampler zoo) does text-to-image only — it starts denoising

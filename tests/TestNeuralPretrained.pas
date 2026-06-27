@@ -531,6 +531,7 @@ type
     procedure TestVaeEncoderParity;
     procedure TestSDUNetConfigFromJSONFile;
     procedure TestSDUNetParity;
+    procedure TestDiffusionInpaintSmoke;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
@@ -21365,6 +21366,100 @@ begin
     Noise.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// Blended-diffusion inpainting smoke (SDUNetDenoiseInpaint): VAE-encode a
+// synthetic source to z0, downsample a right-half-hole mask to the latent grid,
+// run the blended reverse loop on the pico SD UNet, then assert the KEPT region
+// of the final latent equals z0 exactly (pixel-faithful by the final composite)
+// and the masked HOLE region was changed by the denoiser. Mirrors the
+// TestSDUNetParity / TestVaeRoundTrip pico-fixture pattern; the nets are random
+// so this validates the driver path, not photorealism.
+procedure TTestNeuralPretrained.TestDiffusionInpaintSmoke;
+const
+  cT = 50;
+  cSteps = 4;
+var
+  Enc: TNNet;
+  UNet: TNNet;
+  EncCfg: TVaeDecoderConfig;
+  UCfg: TSDUNetConfig;
+  Sched: TNNetDiffusionScheduler;
+  ImgIn, Z0, Mask, EncStates, Latents, Scratch, KnownNoised: TNNetVolume;
+  Schedule: array of integer;
+  ImgGrid, i, x, y, c, sIdx: integer;
+  m, d, maxKeepErr, maskedDiff: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  Enc := BuildVaeEncoderFromSafeTensors(
+    FixturePath('tiny_vae_encoder.safetensors'), EncCfg,
+    {pTrainable=}true, FixturePath('tiny_vae_encoder_config.json'));
+  UNet := BuildSDUNetFromSafeTensors(
+    FixturePath('tiny_sd_unet.safetensors'), UCfg,
+    {pTrainable=}true, FixturePath('tiny_sd_unet_config.json'));
+  Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps);
+  ImgGrid := EncCfg.LatentGrid shl (EncCfg.NumBlockOut - 1);
+  ImgIn := TNNetVolume.Create(ImgGrid, ImgGrid, EncCfg.OutChannels);
+  Z0 := TNNetVolume.Create;
+  Mask := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create(UCfg.TextSeqLen, 1, UCfg.CrossAttentionDim);
+  Latents := TNNetVolume.Create;
+  Scratch := TNNetVolume.Create;
+  KnownNoised := TNNetVolume.Create;
+  Schedule := nil;
+  try
+    AssertEquals('VAE latent grid matches UNet grid',
+      UCfg.LatentGrid, EncCfg.LatentGrid);
+    // synthetic source ramp.
+    for y := 0 to ImgGrid - 1 do
+      for x := 0 to ImgGrid - 1 do
+      begin
+        ImgIn[x, y, 0] := (x / Max(1, ImgGrid - 1)) * 2.0 - 1.0;
+        ImgIn[x, y, 1] := (y / Max(1, ImgGrid - 1)) * 2.0 - 1.0;
+        ImgIn[x, y, 2] := Sin((x + y) * 0.6) * 0.8;
+      end;
+    Enc.Compute(ImgIn);
+    Z0.Copy(Enc.GetLastLayer().Output);
+    AssertEquals('z0 grid', UCfg.LatentGrid, Z0.SizeX);
+    // mask: right half = hole (1), left half = keep (0).
+    Mask.ReSize(Z0);
+    for y := 0 to Z0.SizeY - 1 do
+      for x := 0 to Z0.SizeX - 1 do
+        for c := 0 to Z0.Depth - 1 do
+          if x >= (Z0.SizeX div 2) then Mask[x, y, c] := 1.0
+          else Mask[x, y, c] := 0.0;
+    for i := 0 to EncStates.Size - 1 do
+      EncStates.FData[i] := RandG(0, 1) * 0.5;
+    SetLength(Schedule, cSteps + 1);
+    for sIdx := 0 to cSteps do
+      Schedule[sIdx] := Round(cT * (1.0 - sIdx / cSteps));
+
+    SDUNetDenoiseInpaint(UNet, UCfg, Z0, Mask, EncStates, Sched,
+      Schedule, smDDIM, 0.0, Latents, Scratch, KnownNoised);
+
+    maxKeepErr := 0;
+    maskedDiff := 0;
+    for i := 0 to Latents.Size - 1 do
+    begin
+      m := Mask.FData[i];
+      d := Abs(Latents.FData[i] - Z0.FData[i]);
+      if m < 0.5 then begin if d > maxKeepErr then maxKeepErr := d; end
+      else maskedDiff := maskedDiff + d;
+    end;
+    AssertTrue('kept region pixel-faithful: max|diff| = ' +
+      FloatToStr(maxKeepErr) + ' must be < 1e-4', maxKeepErr < 1e-4);
+    AssertTrue('masked hole regenerated: total change = ' +
+      FloatToStr(maskedDiff) + ' must be > 1e-6', maskedDiff > 1e-6);
+    // no NaN/Inf in the result.
+    for i := 0 to Latents.Size - 1 do
+      AssertTrue('finite latent',
+        not (IsNan(Latents.FData[i]) or IsInfinite(Latents.FData[i])));
+  finally
+    SetLength(Schedule, 0);
+    ImgIn.Free; Z0.Free; Mask.Free; EncStates.Free;
+    Latents.Free; Scratch.Free; KnownNoised.Free;
+    Sched.Free; Enc.Free; UNet.Free;
   end;
 end;
 
