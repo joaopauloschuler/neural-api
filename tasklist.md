@@ -79,16 +79,6 @@ rather than acted on.
       Likely an AVX-vs-scalar reassociation crossing the test's exact-equality
       tolerance; either loosen that one assertion to a small epsilon or pin the
       reassociation. Whole suite is otherwise 0/0 on both builds.
-- [X] `TNNetFlipX.Backpropagate` (and `TNNetFlipY`) padded-conv regression.
-      Added `Input -> FlipX/FlipY -> padded Conv -> head` forward+backward
-      tests (TestFlipX/YPaddedConvBackprop in TestNeuralLayers); both pass with
-      finite input gradients and NO range-check overflow. Root cause as
-      originally feared (padded conv overflowing the flip's OutputError) does
-      NOT occur on current code: a padded conv backprops through its own
-      `FPrevLayerErrorPadded` scratch and copies only the unpadded interior back
-      via `AddArea`, and the flip backward reads strictly within its own
-      output-sized error buffer (`MaxX := FOutput.SizeX-1`). Regression tests
-      added to lock this in.
 - [ ] FFT-path FPU denormal/invalid-op traps in TNNetSpectralConv2D needed an
       example-side SetExceptionMask workaround — consider masking/guarding the
       denormals inside the layer's FFT so callers don't have to.
@@ -99,29 +89,6 @@ rather than acted on.
       landed); only the embedded charsmap is unhandled.
 
 ## Infrastructure / dev experience
-
-- [X] AVX-vectorize TNNetGroupNorm + TNNetInstanceNorm per-group statistics.
-      DONE (commit 3f0917b): per-group mean/var/normalize + backward bulk now run
-      via DotProduct/MulAdd/Mul over contiguous depth slices (FOnes scratch);
-      TNNetInstanceNorm inherits the rewrite. Green on scalar + -dAVX2 (lone AVX2
-      failure is the pre-existing TestSetTrainableKeepsOutputs flake).
-      Unlike the already-AVX'd whole-volume TNNetLayerNorm / TNNetRMSNorm, these
-      two still reduce mean/variance with scalar CntX/CntY/CntD triple loops
-      (neuralnetwork.pas ~54897). Within one group the depth sub-range
-      [DStart..DEnd] is contiguous, so per-(x,y) the mean/var reduction is a
-      drop-in `GetSumSqr(GetRawPtr(x,y,DStart), GroupDepth)` and the normalize +
-      backward bulk terms become `MulAdd` calls — the same depth-contiguous rule
-      from the AVX sweep. These layers are hot in the imported GAN / diffusion /
-      VAE stacks (CycleGAN, StyleGAN2, the SD VAE decoder). Must keep the
-      `-FLearningRate` convention and pass the existing numerical-gradient tests
-      on both scalar-fallback and `-dAVX2` builds.
-
-- [X] `bad_words` / sequence-bias logits processor for neuraldecode.pas
-      (`TNNetSequenceBiasProcessor`). DONE: prob-domain processor (p*=exp(bias),
-      renormalize; AddBadWord => -inf hard ban). Biases a sequence's final token
-      only when its (k-1)-prefix is a suffix of the generated history (single-token
-      = unconditional bias). Used via the Processors chain slot like Watermark/CFG;
-      3 unit tests incl. "banned multi-token word never appears in greedy output".
 
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] GGUF import beyond Llama — open follow-ups (core `BuildFromGGUF`/`BuildFromGGUFEx`
@@ -280,27 +247,16 @@ rather than acted on.
       prompt encoder + two-source TNNetCrossAttention. examples/SAM2Segment
       (point/box prompt on one frame, then carry the mask across a short clip).
 
-- [X] Depth Anything V2 monocular relative-depth importer
-      (`BuildDepthAnythingV2FromSafeTensors[Ex]`, depth_anything model_type,
-      e.g. depth-anything/Depth-Anything-V2-Small-hf). DONE: the named entry
-      points (Reader / FileName+Config / FileName+out-Config overloads) assert
-      model_type "depth_anything" and delegate to the landed BuildDPT, which
-      already wires the BuildDINOv2 ViT backbone into the DPT reassemble+fusion
-      neck + 3-conv depth head. NEW: TDPTConfig.OutIndices + ReadDPTOutIndices
-      read backbone_config.out_indices (1-based stageK = encoder block K-1;
-      out_features "stage{K}" fallback; default last-4 [N-3..N]); the builder now
-      taps the SELECTED blocks (was hardcoded last-4). Pico fixture
-      tests/fixtures/tiny_depth_anything_v2.* hooks NON-last-4 stages
-      out_indices=[2,3,5,6] to exercise the wiring; TestDepthAnythingV2Parity
-      max|diff|<1e-4 vs transformers float64 DepthAnythingForDepthEstimation
-      (oracle); generator tools/make_pico_depthanythingv2_fixture.py. Example
-      examples/DepthAnythingV2 writes a normalized PGM(P5)+color PPM(P6) depth
-      image (distinct from the ASCII-ramp DepthEstimation DPT demo), pico smoke
-      default + optional real-checkpoint argv path.
-      Follow-ups: real-checkpoint parity not run (no weights downloaded);
-      metric-depth Depth-Anything-V2 (indoor/outdoor, depth_estimation_type
-      "metric") untested on a real ckpt; register-token / SwiGLU DINOv2 backbones
-      still rejected by BuildDPT.
+- [ ] Depth Anything V2 importer follow-ups (BuildDepthAnythingV2FromSafeTensors[Ex]
+      LANDED, commit 51036f9, depth_anything model_type, e.g.
+      depth-anything/Depth-Anything-V2-Small-hf — DINOv2 ViT backbone -> DPT
+      reassemble+fusion neck + 3-conv depth head, TDPTConfig.OutIndices block
+      selection, pico parity TestDepthAnythingV2Parity max|diff|<1e-4 vs
+      transformers float64 DepthAnythingForDepthEstimation; examples/DepthAnythingV2):
+  - [ ] real-checkpoint parity not run (no weights downloaded).
+  - [ ] metric-depth Depth-Anything-V2 (indoor/outdoor, depth_estimation_type
+        "metric") untested on a real ckpt.
+  - [ ] register-token / SwiGLU DINOv2 backbones still rejected by BuildDPT.
 
 - [ ] ResNet importer follow-ups (BuildResNetFromSafeTensors[Ex] LANDED, commit
       317a19c: torchvision resnet18/50 state_dict, conv-BN fold at load, config
@@ -399,15 +355,6 @@ rather than acted on.
       synthesis backbone is reuse. Distinct from NAFNet/SwinIR (generic restoration
       with no generative face prior). Pico parity vs a float64 oracle on the SFT
       injection for a fixed latent + examples/FaceRestoration on a tiny CPU image.
-- [ ] Inception-v3 / GoogLeNet importer (BuildInceptionV3FromSafeTensors,
-      torchvision) — FULL torchvision inception_v3 now imports (config full_arch
-      = true -> BuildInceptionV3Full). The pico InceptionA-only path remains for
-      the legacy parity test. REMAINING: FID rewire (below).
-  - [X] Rewire neuralimagemetrics FID onto this backbone. DONE: added
-        ExtractInceptionFeature / AccumulateInceptionFeatures /
-        ComputeInceptionFID in neuralimagemetrics.pas (tap PoolFeatureIdx pooled
-        feature, ImageNet-normalised volumes); pico-fixture test asserts
-        FID(X,X)=0 + monotone growth with perturbation.
 - [ ] LPIPS follow-ups — the metric LANDED (ComputeLPIPSDistance /
       LPIPSStageDistance / LPIPSUnitNormalize in neuralpretrained.pas, reusing the
       VGG importer's 5 relu taps; unit-normalize -> squared-diff -> per-stage lin
@@ -1269,16 +1216,6 @@ rather than acted on.
       parity follow-up via the structured-vision detection eval harness.
 
 ## Layer follow-ups that fix real limitations
-
-- [X] Make TNNetMaxChannel (and TNNetMinChannel) work on RECTANGULAR feature
-      maps. Gave both a dedicated Compute + Backpropagate that reduce over the
-      FULL (x,y) grid per depth channel into a (1,1,Depth) output (winner-position
-      gradient routing), and made SetPrevLayer span the larger axis so the output
-      collapses to 1 on both axes even when SizeX <> SizeY (the old SizeX-only
-      pool size mis-indexed output rows). Square case verified bit-identical.
-      Dropped the square-only CBAM caveat + the DO-NOT-REINTRODUCE caveat. Tests:
-      TestMaxChannelRectangular / TestMinChannelRectangular (W<>H forward+gradient)
-      + TestMaxChannelSquareRegression in TestNeuralLayers.
 
 - [ ] Vanilla `TNNetLSTMCell` + `TNNetGRUCell` — the standard fully-connected
       recurrent cells with TRUE recurrent gating (each gate sees the previous
