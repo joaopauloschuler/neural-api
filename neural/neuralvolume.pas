@@ -488,6 +488,13 @@ type
       // Stegun 7.1.26 approximation (|err| < 1.5e-7, i.e. matches pcr_erff to
       // ~1e-6). Built on VectorExp so it inherits the AVX2 path. dst may alias src.
       class procedure VectorErf(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // VectorSinh writes dst[0..N-1] := sinh(src[0..N-1]) via
+      // sinh(x) = (exp(x) - exp(-x)) / 2, so it inherits VectorExp's AVX2 path.
+      // exp(x) and exp(-x) are produced by two vectorized VectorExp passes into a
+      // local scratch (NOT pDst) so pSrc is never clobbered; hence dst may alias
+      // src. The clamped arg keeps exp finite; sinh stays accurate to ~1e-6 vs
+      // pcr_sinhf over the activation parity range.
+      class procedure VectorSinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
       procedure AddArea(DestX, DestY, OriginX, OriginY, LenX, LenY: integer; Original: TNNetVolume);
       function HasAVX: boolean; {$IFDEF Release} inline; {$ENDIF}
       function HasAVX2: boolean; {$IFDEF Release} inline; {$ENDIF}
@@ -7531,6 +7538,38 @@ begin
       pDst^[I] := -(1 - Poly * E)
     else
       pDst^[I] := 1 - Poly * E;
+  end;
+end;
+
+class procedure TNNetVolume.VectorSinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+var
+  I: integer;
+  X, EPos, ENeg: TNeuralFloat;
+  PosBuf, NegBuf: array of TNeuralFloat;
+begin
+  if N <= 0 then exit;
+  // sinh(x) = (exp(x) - exp(-x)) / 2. Both exponentials are produced by single
+  // vectorized VectorExp passes into local scratch buffers (NOT pDst), so pSrc --
+  // read for nothing past the fill below -- is never clobbered and dst may alias
+  // src. The arg is clamped into [-88, 88] so exp neither overflows nor underflows
+  // (sinh would overflow to +/-Inf there anyway, matching the scalar pcr_sinhf).
+  SetLength(PosBuf, N);
+  SetLength(NegBuf, N);
+  for I := 0 to N - 1 do
+  begin
+    X := pSrc^[I];
+    if X > 88 then X := 88
+    else if X < -88 then X := -88;
+    PosBuf[I] := X;
+    NegBuf[I] := -X;
+  end;
+  VectorExp(TNeuralFloatArrPtr(@PosBuf[0]), TNeuralFloatArrPtr(@PosBuf[0]), N);
+  VectorExp(TNeuralFloatArrPtr(@NegBuf[0]), TNeuralFloatArrPtr(@NegBuf[0]), N);
+  for I := 0 to N - 1 do
+  begin
+    EPos := PosBuf[I]; // exp(x)
+    ENeg := NegBuf[I]; // exp(-x)
+    pDst^[I] := (EPos - ENeg) * 0.5;
   end;
 end;
 

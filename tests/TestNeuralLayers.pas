@@ -26,6 +26,7 @@ type
     procedure TestVectorSigmoidScalarParity;
     procedure TestVectorTanhScalarParity;
     procedure TestVectorErfScalarParity;
+    procedure TestVectorSinhScalarParity;
     procedure TestPointwiseSoftMaxVectorizedParity;
     procedure TestNetworkSaveLoad;
     procedure TestSimpleXORLearning;
@@ -615,6 +616,57 @@ begin
     end;
     AssertTrue('VectorErf vs pcr_erff max abs err ' + FloatToStr(maxErr) +
       ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+  finally
+    Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestVectorSinhScalarParity;
+// VectorSinh (sinh built on the AVX2 VectorExp) must match the scalar pcr_sinhf
+// reference within tolerance on every build. N=131 straddles the 8-wide exp body
+// and the (N mod 8) scalar tail; range [-12,12] matches the SinhAct parity band.
+// A second pass with dst aliasing src guards against the buffer-aliasing bug that
+// was fixed in VectorTanh/VectorErf.
+const
+  N = 131;
+  RelTol = 1e-4;
+var
+  Src, Dst: TNNetVolume;
+  I: integer;
+  x, e, denom, maxRel: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  try
+    for I := 0 to N - 1 do
+      Src.FData[I] := -12.0 + 24.0 * I / (N - 1);
+    // Distinct dst.
+    TNNetVolume.VectorSinh(Dst.DataPtr, Src.DataPtr, N);
+    maxRel := 0;
+    for I := 0 to N - 1 do
+    begin
+      x := Src.FData[I];
+      denom := Abs(pcr_sinhf(x));
+      if denom < 1e-20 then denom := 1e-20;
+      e := Abs(Dst.FData[I] - pcr_sinhf(x)) / denom;
+      if e > maxRel then maxRel := e;
+    end;
+    AssertTrue('VectorSinh vs pcr_sinhf max rel err ' + FloatToStr(maxRel) +
+      ' must be < ' + FloatToStr(RelTol), maxRel < RelTol);
+    // dst aliasing src.
+    TNNetVolume.VectorSinh(Src.DataPtr, Src.DataPtr, N);
+    maxRel := 0;
+    for I := 0 to N - 1 do
+    begin
+      // Recompute the original x from the index (Src has been overwritten).
+      x := -12.0 + 24.0 * I / (N - 1);
+      denom := Abs(pcr_sinhf(x));
+      if denom < 1e-20 then denom := 1e-20;
+      e := Abs(Src.FData[I] - pcr_sinhf(x)) / denom;
+      if e > maxRel then maxRel := e;
+    end;
+    AssertTrue('VectorSinh (aliased) vs pcr_sinhf max rel err ' + FloatToStr(maxRel) +
+      ' must be < ' + FloatToStr(RelTol), maxRel < RelTol);
   finally
     Src.Free; Dst.Free;
   end;

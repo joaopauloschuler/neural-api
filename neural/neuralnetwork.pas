@@ -36462,20 +36462,18 @@ begin
   SizeM1 := LocalPrevOutput.Size - 1;
 
   // SinhAct(x) = sinh(x). Derivative is cosh(x).
+  // Two-pass: vectorize sinh(x) into FOutput via TNNetVolume.VectorSinh (built on
+  // the AVX2 VectorExp), then a scalar finishing pass fills the cosh derivative
+  // (read back from LocalPrevOutput, so backward math is byte-identical).
+  TNNetVolume.VectorSinh(@FOutput.FData[0], @LocalPrevOutput.FData[0],
+    LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := pcr_sinhf(x);
       FOutputErrorDeriv.FData[OutputCnt] := pcr_coshf(x);
     end;
-  end
-  else
-  begin
-    // can't calculate error on input layers.
-    for OutputCnt := 0 to SizeM1 do
-      FOutput.FData[OutputCnt] := pcr_sinhf(LocalPrevOutput.FData[OutputCnt]);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
