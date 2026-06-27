@@ -988,35 +988,6 @@ rather than acted on.
       EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
       before/after.
 
-- [X] AVX-vectorize `TNNetCosineSimilarity` (Compute + Backpropagate). Both are
-      still raw scalar `for D` reductions over a depth-contiguous column (the two
-      halves of the previous layer's depth axis are contiguous: a at offset 0, b
-      at offset HalfDepth). Forward does three sum reductions per (X,Y) —
-      `dot=Σ a·b`, `sa=Σ a²`, `sb=Σ b²` — which map 1:1 onto
-      `TNNetVolume.DotProduct(ptrA, ptrB, HalfDepth)` / `DotProduct(ptrA, ptrA, …)` /
-      `DotProduct(ptrB, ptrB, …)`; backward scatters `err·(b/(na·nb) − c·a/na²)`
-      and the symmetric b-term, which fold into two `MulAdd` accumulations over the
-      contiguous a- and b-halves (mirrors the landed `TNNetPixelNorm` /
-      `TNNetL2Normalize.BackpropagatePerDepth` vectorizations). NOTE: the sibling
-      `TNNetCosineSimilarityAttention` already runs on DotProduct/Mul — this
-      standalone layer was simply missed. Keep InvNorm/epsilon byte-identical;
-      the existing `TestCosineSimilarityForward` / `TestCosineSimilarityGradientCheck`
-      gate parity on scalar AND `-dAVX2 -B` builds.
-
-- [X] AVX-vectorize `TNNetHouseholderLinear` (ComputeCPU + BackpropagateCPU).
-      Each of the K reflections recomputes `beta=v·v` and `dot=v·u` (and in
-      backward `dgv=v·g`, `duv=v·u`) as raw scalar `for j` loops over the
-      contiguous length-N reflection/working vectors, even though the reflection
-      update itself already uses the vectorized `FOutput.MulAdd(-scale, V)`. Swap
-      those reductions to `TNNetVolume.DotProduct(V.FData, FOutput.FData, N)` etc.,
-      and replace the per-element cache-copy loop
-      (`FCache[ReflIdx + j*FNumReflections] := FOutput[j]`) — its stride is
-      FNumReflections, so vectorize only if the cache is re-laid-out contiguous,
-      otherwise leave it scalar. Net win scales with K·N. HOUSEHOLDER_MIN_BETA
-      degenerate-skip and the `2·dot/beta` scaling stay byte-identical; gate on the
-      existing HouseholderLinear gradient-check + serialization tests across
-      scalar and `-dAVX2` builds.
-
 - [ ] Single-sample `TNNetFullConnect` forward threading follow-ups (opt-in
       `EnableFullConnectThreading` multi-core `ComputeCPU` v1 LANDED for
       FullConnect/FullConnectLinear/FullConnectReLU — off by default, bit-identical
