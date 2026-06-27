@@ -1920,3 +1920,47 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       with loss-difference direction >90% of the time across a small grid.
 - [ ] Coverage matrix at the top of TestNeuralNumerical.pas: per-class
       `[grad] [serialize]` block, written by a small script.
+
+## Vision / generative & accelerator batch 2026-06-27
+
+(All four verified absent in source before listing: the OpenCL targets carry
+no `FShouldOpenCL` path in their `Compute`, and the loss heads exist only as
+eval-time metric helpers, not as trainable `TNNet*Loss` layers.)
+
+- [ ] OpenCL forward offload for `TNNetTokenRMSNorm` and `TNNetLayerNorm`.
+      Today only Dense/Conv/Attention layers set `FShouldOpenCL`, so in an
+      OpenCL LLM run (ChatTerminal) the per-token RMSNorm/LayerNorm between
+      every attention and FFN block executes on the CPU, forcing a
+      GPU→CPU→GPU round-trip of the activation tensor twice per transformer
+      block. Add a `ComputeOpenCL()` that does the depth-axis reduction
+      (sum-of-squares / mean+var) and the gain (+bias) multiply as an OpenCL
+      kernel so activations stay resident on the device. Reuse the existing
+      device-buffer plumbing from the dense/attention path; gate on
+      `NeuralConvOpenCLMinWork` like the other layers. Forward-only is enough
+      (training stays on CPU). Validate against the CPU path with an
+      `SDPAOpenCLParity`-style example.
+- [ ] OpenCL forward offload for `TNNetBilinearResize`. `TNNetBilinearUpsample`
+      already has a `ComputeOpenCL()` (gather kernel via `FGatherCL`), but the
+      arbitrary-target-size `TNNetBilinearResize` used in segmentation /
+      super-resolution decoders is still a scalar triple-nested loop. Mirror
+      the `TNNetBilinearUpsample` gather-kernel approach (precompute the four
+      source taps + interpolation weights per output pixel, gather on device)
+      so resize-heavy decoder stacks run on the GPU.
+- [ ] Differentiable SSIM / MS-SSIM loss head `TNNetSSIMLoss` (loss-layer
+      pattern: Identity passthrough forward + Backpropagate that writes the
+      gradient). SSIM currently lives only as the eval-time
+      `ComputeSSIMLossAndGradient` helper in `neuralimagemetrics.pas`, which
+      already returns both the loss and its per-pixel gradient — wrap that
+      helper as the backward so there is no duplicated SSIM math. Gives
+      super-resolution / restoration / diffusion examples (SuperResolution,
+      SubPixelSuperRes, SwinIRRestore, ImageRestoration) a perceptually-aligned
+      training objective instead of pure L1/L2. Add a numerical-gradient test
+      and a small training-curve example.
+- [ ] Perceptual / deep-feature-matching loss for image generation
+      (`TNNetPerceptualLoss`, LPIPS-style). Reuse the existing frozen
+      `BuildVGG` / `BuildInceptionV3` feature extractors (already importable
+      from safetensors) to compute an L2/cosine distance between generated and
+      target activations at chosen layers; optionally a learned 1x1 linear
+      head over the feature differences for the LPIPS variant. Wire it into a
+      super-resolution / GAN / diffusion training example so generators can be
+      trained with a perceptual objective rather than pixel loss alone.
