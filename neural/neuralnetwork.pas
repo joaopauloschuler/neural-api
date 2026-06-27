@@ -71876,19 +71876,23 @@ begin
             u := pcr_tanhf(xv);
             tap := (fy * FFeatureSizeX + fx) * FInDepth + ic;
             base := tap * FCoeffsPerEdge;
+            // Basis evaluation stays scalar; the per-edge coefficient reduction
+            // (a dot of the contiguous weight row W.FData[base..] against the
+            // contiguous basis vector FBVal/FT) is an AVX DotProduct over the
+            // FCoeffsPerEdge basis coefficients.
             if FBasis = csKANBasisBSpline then
             begin
               EvalBSpline(u, false);
-              for kk := 0 to coeffsMax do
-                acc := acc + W.FData[base + kk] * FBVal[kk];
+              acc := acc + TNNetVolume.DotProduct(
+                @W.FData[base], @FBVal[0], FCoeffsPerEdge);
             end
             else
             begin
               FT[0] := 1;
               if FDegree >= 1 then FT[1] := u;
               for kk := 2 to FDegree do FT[kk] := 2 * u * FT[kk - 1] - FT[kk - 2];
-              for kk := 0 to FDegree do
-                acc := acc + W.FData[base + kk] * FT[kk];
+              acc := acc + TNNetVolume.DotProduct(
+                @W.FData[base], @FT[0], FCoeffsPerEdge);
             end;
           end;
         end;
