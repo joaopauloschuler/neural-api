@@ -12479,6 +12479,8 @@ type
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
   end;
 
   /// This layer gets the manimum number from the entire channel.
@@ -12487,6 +12489,8 @@ type
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
   end;
 
   /// Common avgpool layer.
@@ -13036,8 +13040,9 @@ type
       //     rather than the paper's fixed avg+max over the channel axis, because
       //     no fixed avg-over-depth / max-over-depth primitive exists as a layer.
       // ReductionRatio and SpatialKernelSize are clamped to safe values.
-      // NOTE: the spatial branch uses TNNetMaxChannel-free primitives, but the
-      // CHANNEL branch's TNNetMaxChannel assumes square maps (SizeX=SizeY).
+      // NOTE: the spatial branch uses TNNetMaxChannel-free primitives. The
+      // CHANNEL branch's TNNetMaxChannel now reduces over the full (x,y) grid,
+      // so it is correct on rectangular (SizeX <> SizeY) feature maps too.
       function AddCBAM(InputLayer: TNNetLayer; ReductionRatio: integer = 16;
         SpatialKernelSize: integer = 7): TNNetLayer;
       // Symmetric convolutional encoder-decoder U-Net (Ronneberger et al. 2015)
@@ -53326,7 +53331,9 @@ end;
 { TNNetMinChannel }
 procedure TNNetMinChannel.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
-  FPoolSize := pPrevLayer.Output.SizeX;
+  // See TNNetMaxChannel.SetPrevLayer: span the larger axis so the output is
+  // (1,1,Depth) on rectangular maps; the reduction below scans all positions.
+  FPoolSize := Max(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY);
   FStride := FPoolSize;
   FPadding := 0;
 
@@ -53336,6 +53343,73 @@ end;
 constructor TNNetMinChannel.Create();
 begin
   inherited Create(2);
+end;
+
+procedure TNNetMinChannel.Compute();
+var
+  StartTime: double;
+  CntX, CntY, CntD: integer;
+  MaxX, MaxY, MaxD: integer;
+  OutputRawPos: integer;
+  InputRawPtr: TNeuralFloatPtr;
+begin
+  StartTime := Now();
+  Output.Fill(1000000);
+  MaxX := FPrevLayer.Output.SizeX - 1;
+  MaxY := FPrevLayer.Output.SizeY - 1;
+  MaxD := FPrevLayer.Output.Depth - 1;
+
+  // True global min over EVERY (x,y) position per depth channel.
+  for CntY := 0 to MaxY do
+  begin
+    for CntX := 0 to MaxX do
+    begin
+      InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
+      OutputRawPos := 0;
+      for CntD := 0 to MaxD do
+      begin
+        if InputRawPtr^ < FOutput.FData[OutputRawPos] then
+        begin
+          FOutput.FData[OutputRawPos] := InputRawPtr^;
+          FMaxPosX[OutputRawPos] := CntX;
+          FMaxPosY[OutputRawPos] := CntY;
+        end;
+        Inc(OutputRawPos);
+        Inc(InputRawPtr);
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMinChannel.Backpropagate();
+var
+  StartTime: double;
+  CntD, MaxD: integer;
+  PrevRawPos: integer;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (Assigned(FPrevLayer) and
+      (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size)) then
+  begin
+    StartTime := Now();
+    MaxD := FPrevLayer.Output.Depth - 1;
+    for CntD := 0 to MaxD do
+    begin
+      PrevRawPos :=
+        FPrevLayer.OutputError.GetRawPos(FMaxPosX[CntD], FMaxPosY[CntD], CntD);
+      {$IFDEF FPC}
+      FPrevLayer.OutputError.FData[PrevRawPos] += FOutputError.FData[CntD];
+      {$ELSE}
+      FPrevLayer.OutputError.FData[PrevRawPos] :=
+        FPrevLayer.OutputError.FData[PrevRawPos] + FOutputError.FData[CntD];
+      {$ENDIF}
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+    FPrevLayer.Backpropagate();
+  end;
 end;
 
 { TNNetMinPool }
@@ -56072,7 +56146,12 @@ end;
 { TNNetMaxChannel }
 procedure TNNetMaxChannel.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
-  FPoolSize := pPrevLayer.Output.SizeX;
+  // A channel (global) reduction collapses the entire (x,y) grid per depth.
+  // Use a pool size that spans the larger spatial axis so the inherited
+  // CalcOutputSize yields exactly 1 along BOTH axes even when SizeX <> SizeY
+  // (rectangular feature maps). The actual reduction below is a true
+  // all-positions scan, so the square assumption no longer applies.
+  FPoolSize := Max(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY);
   FStride := FPoolSize;
   FPadding := 0;
 
@@ -56082,6 +56161,76 @@ end;
 constructor TNNetMaxChannel.Create();
 begin
   inherited Create(2);
+end;
+
+procedure TNNetMaxChannel.Compute();
+var
+  StartTime: double;
+  CntX, CntY, CntD: integer;
+  MaxX, MaxY, MaxD: integer;
+  OutputRawPos: integer;
+  InputRawPtr: TNeuralFloatPtr;
+begin
+  StartTime := Now();
+  Output.Fill(-1000000);
+  // Channel layers never pad; reduce directly over the previous output.
+  MaxX := FPrevLayer.Output.SizeX - 1;
+  MaxY := FPrevLayer.Output.SizeY - 1;
+  MaxD := FPrevLayer.Output.Depth - 1;
+
+  // True global max over EVERY (x,y) position per depth channel. Output is
+  // (1,1,Depth) so OutputRawPos is just the depth index.
+  for CntY := 0 to MaxY do
+  begin
+    for CntX := 0 to MaxX do
+    begin
+      InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
+      OutputRawPos := 0;
+      for CntD := 0 to MaxD do
+      begin
+        if InputRawPtr^ > FOutput.FData[OutputRawPos] then
+        begin
+          FOutput.FData[OutputRawPos] := InputRawPtr^;
+          FMaxPosX[OutputRawPos] := CntX;
+          FMaxPosY[OutputRawPos] := CntY;
+        end;
+        Inc(OutputRawPos);
+        Inc(InputRawPtr);
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMaxChannel.Backpropagate();
+var
+  StartTime: double;
+  CntD, MaxD: integer;
+  PrevRawPos: integer;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (Assigned(FPrevLayer) and
+      (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size)) then
+  begin
+    StartTime := Now();
+    MaxD := FPrevLayer.Output.Depth - 1;
+    // Route each channel's error to its winning (x,y) position.
+    for CntD := 0 to MaxD do
+    begin
+      PrevRawPos :=
+        FPrevLayer.OutputError.GetRawPos(FMaxPosX[CntD], FMaxPosY[CntD], CntD);
+      {$IFDEF FPC}
+      FPrevLayer.OutputError.FData[PrevRawPos] += FOutputError.FData[CntD];
+      {$ELSE}
+      FPrevLayer.OutputError.FData[PrevRawPos] :=
+        FPrevLayer.OutputError.FData[PrevRawPos] + FOutputError.FData[CntD];
+      {$ENDIF}
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+    FPrevLayer.Backpropagate();
+  end;
 end;
 
 { TNNetAvgChannel }

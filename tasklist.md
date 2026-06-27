@@ -50,14 +50,13 @@ duplicated the forward pass of existing layers:
 - `TNNetGlobalAvgPool` — empty-body subclass of `TNNetAvgChannel`. Use
   `TNNetAvgChannel` for global average pooling.
 - `TNNetGlobalMaxPool` — overlapped `TNNetMaxChannel`. Use
-  `TNNetMaxChannel` for global max pooling. Note: `TNNetMaxChannel`
-  currently assumes square feature maps (`SizeX == SizeY`); the deleted
-  `TNNetGlobalMaxPool` had a direct (X, Y) loop that also worked on
-  rectangular inputs. If you ever need global max on a non-square
-  tensor, fix `TNNetMaxChannel` rather than reintroducing this class.
+  `TNNetMaxChannel` for global max pooling. `TNNetMaxChannel` now does a
+  true (x, y)-over-all-positions reduction per depth channel, so it is
+  correct on RECTANGULAR (`SizeX <> SizeY`) inputs too — no reason to
+  reintroduce this class.
 - `TNNetGlobalMinPool` — overlapped `TNNetMinChannel`. Use
-  `TNNetMinChannel` for global min pooling. Same square-only caveat as
-  `TNNetMaxChannel` above.
+  `TNNetMinChannel` for global min pooling. `TNNetMinChannel` is now
+  rectangular-correct as well (see `TNNetMaxChannel` above).
 - `TNNetThresholdedReLU` — strict subset of `TNNetThreshold`.
   `ThresholdedReLU(x; θ)` is `TNNetThreshold.Create(theta=θ, value=0)`.
   Use `TNNetThreshold` directly.
@@ -80,14 +79,16 @@ rather than acted on.
       Likely an AVX-vs-scalar reassociation crossing the test's exact-equality
       tolerance; either loosen that one assertion to a small epsilon or pin the
       reassociation. Whole suite is otherwise 0/0 on both builds.
-- [ ] `TNNetFlipX.Backpropagate` (and likely `TNNetFlipY`) range-check
-      overflow when the NEXT layer is a padded convolution: the flip layer's
-      `OutputError` is sized exactly to its output, but a padded conv writes a
-      larger (padded) error region into it, overflowing. Surfaced while wiring
-      an `Input -> FlipX -> Conv -> ...` flip-invariant net for
-      EquivarianceReport (worked around by using a global-avg construction
-      instead). Add a numerical-gradient / forward+backward regression test
-      for `FlipX -> padded Conv` and fix the unpad sizing.
+- [X] `TNNetFlipX.Backpropagate` (and `TNNetFlipY`) padded-conv regression.
+      Added `Input -> FlipX/FlipY -> padded Conv -> head` forward+backward
+      tests (TestFlipX/YPaddedConvBackprop in TestNeuralLayers); both pass with
+      finite input gradients and NO range-check overflow. Root cause as
+      originally feared (padded conv overflowing the flip's OutputError) does
+      NOT occur on current code: a padded conv backprops through its own
+      `FPrevLayerErrorPadded` scratch and copies only the unpadded interior back
+      via `AddArea`, and the flip backward reads strictly within its own
+      output-sized error buffer (`MaxX := FOutput.SizeX-1`). Regression tests
+      added to lock this in.
 - [ ] FFT-path FPU denormal/invalid-op traps in TNNetSpectralConv2D needed an
       example-side SetExceptionMask workaround — consider masking/guarding the
       denormals inside the layer's FFT so callers don't have to.
@@ -1258,15 +1259,15 @@ rather than acted on.
 
 ## Layer follow-ups that fix real limitations
 
-- [ ] Make TNNetMaxChannel (and TNNetMinChannel) work on RECTANGULAR feature
-      maps. Both currently inherit the TNNetMaxPool path that assumes square
-      maps (SizeX = SizeY) — flagged at neuralnetwork.pas:13039 (the CBAM channel
-      branch caveat) and in the DO-NOT-REINTRODUCE note for the deleted
-      TNNetGlobalMaxPool/TNNetGlobalMinPool (which had a direct (X,Y) loop that
-      handled non-square inputs). Add a true (x,y)-over-all-positions reduction
-      per depth so global max/min pooling is correct on non-square tensors, then
-      drop the square-only caveat. Add a gradient/forward test on a (W != H)
-      input that the square assumption would currently mis-index.
+- [X] Make TNNetMaxChannel (and TNNetMinChannel) work on RECTANGULAR feature
+      maps. Gave both a dedicated Compute + Backpropagate that reduce over the
+      FULL (x,y) grid per depth channel into a (1,1,Depth) output (winner-position
+      gradient routing), and made SetPrevLayer span the larger axis so the output
+      collapses to 1 on both axes even when SizeX <> SizeY (the old SizeX-only
+      pool size mis-indexed output rows). Square case verified bit-identical.
+      Dropped the square-only CBAM caveat + the DO-NOT-REINTRODUCE caveat. Tests:
+      TestMaxChannelRectangular / TestMinChannelRectangular (W<>H forward+gradient)
+      + TestMaxChannelSquareRegression in TestNeuralLayers.
 
 (The sub-quadratic / chunked-forward family below is one coherent systems effort:
 every recurrence currently trains as a strict per-token left-to-right scan.)

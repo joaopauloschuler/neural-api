@@ -75,6 +75,12 @@ type
     // Embedding layers
     procedure TestEmbeddingLayer;
     procedure TestTokenAndPositionalEmbedding;
+    // Rectangular (W <> H) channel reductions + flip/padded-conv regressions
+    procedure TestMaxChannelRectangular;
+    procedure TestMinChannelRectangular;
+    procedure TestMaxChannelSquareRegression;
+    procedure TestFlipXPaddedConvBackprop;
+    procedure TestFlipYPaddedConvBackprop;
   end;
 
 implementation
@@ -1727,6 +1733,210 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+// Regression: TNNetMaxChannel global max over a RECTANGULAR (SizeX <> SizeY)
+// feature map. The old square-only pooling path mis-indexed the output rows
+// when SizeY <> SizeX; the reduction must collapse the WHOLE grid to (1,1,D)
+// and route the gradient to the true winning (x,y) position per channel.
+procedure TTestNeuralLayers.TestMaxChannelRectangular;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ChannelLayer: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 5, 2); // W=3, H=5 (rectangular)
+  try
+    NN.AddLayer(TNNetInput.Create(3, 5, 2, 1));
+    ChannelLayer := NN.AddLayer(TNNetMaxChannel.Create());
+
+    // Baseline values per channel, then plant a single distinct maximum.
+    Input.FillAtDepth(0, 1.0);
+    Input.FillAtDepth(1, -4.0);
+    // Channel 0 max at (x=2,y=4); channel 1 max at (x=0,y=3).
+    Input[2, 4, 0] := 9.0;
+    Input[0, 3, 1] := 7.0;
+
+    NN.Compute(Input);
+
+    AssertEquals('Output collapses to (1,1,Depth)=2 elements',
+      2, ChannelLayer.Output.Size);
+    AssertEquals('Output SizeX must be 1', 1, ChannelLayer.Output.SizeX);
+    AssertEquals('Output SizeY must be 1', 1, ChannelLayer.Output.SizeY);
+    AssertEquals('Global max of channel 0', 9.0, ChannelLayer.Output.Raw[0], 0.0001);
+    AssertEquals('Global max of channel 1', 7.0, ChannelLayer.Output.Raw[1], 0.0001);
+
+    // Backward: gradient routes to the winning position only.
+    ChannelLayer.OutputError.Fill(0);
+    ChannelLayer.OutputError.Raw[0] := 1.0;
+    ChannelLayer.OutputError.Raw[1] := 2.0;
+    NN.GetFirstLayer.OutputError.Fill(0);
+    ChannelLayer.IncDepartingBranchesCnt();
+    ChannelLayer.Backpropagate();
+
+    AssertEquals('Grad lands on channel-0 winner (2,4,0)',
+      1.0, NN.GetFirstLayer.OutputError[2, 4, 0], 0.0001);
+    AssertEquals('Grad lands on channel-1 winner (0,3,1)',
+      2.0, NN.GetFirstLayer.OutputError[0, 3, 1], 0.0001);
+    // A non-winning cell receives nothing.
+    AssertEquals('No grad at a non-winning cell',
+      0.0, NN.GetFirstLayer.OutputError[0, 0, 0], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Regression: TNNetMinChannel global min over a RECTANGULAR feature map.
+procedure TTestNeuralLayers.TestMinChannelRectangular;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ChannelLayer: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 2, 2); // W=6, H=2 (wide rectangular)
+  try
+    NN.AddLayer(TNNetInput.Create(6, 2, 2, 1));
+    ChannelLayer := NN.AddLayer(TNNetMinChannel.Create());
+
+    Input.FillAtDepth(0, 3.0);
+    Input.FillAtDepth(1, 8.0);
+    Input[5, 1, 0] := -2.0; // channel 0 min
+    Input[1, 0, 1] := 0.5;  // channel 1 min
+
+    NN.Compute(Input);
+
+    AssertEquals('Output collapses to 2 elements', 2, ChannelLayer.Output.Size);
+    AssertEquals('Global min of channel 0', -2.0, ChannelLayer.Output.Raw[0], 0.0001);
+    AssertEquals('Global min of channel 1', 0.5, ChannelLayer.Output.Raw[1], 0.0001);
+
+    ChannelLayer.OutputError.Fill(0);
+    ChannelLayer.OutputError.Raw[0] := 5.0;
+    ChannelLayer.OutputError.Raw[1] := -1.0;
+    NN.GetFirstLayer.OutputError.Fill(0);
+    ChannelLayer.IncDepartingBranchesCnt();
+    ChannelLayer.Backpropagate();
+
+    AssertEquals('Grad lands on channel-0 min winner (5,1,0)',
+      5.0, NN.GetFirstLayer.OutputError[5, 1, 0], 0.0001);
+    AssertEquals('Grad lands on channel-1 min winner (1,0,1)',
+      -1.0, NN.GetFirstLayer.OutputError[1, 0, 1], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// The SQUARE case must be unchanged by the rectangular fix.
+procedure TTestNeuralLayers.TestMaxChannelSquareRegression;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ChannelLayer: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 3, 1)); // pError=1 sizes error volumes
+    ChannelLayer := NN.AddLayer(TNNetMaxChannel.Create());
+
+    Input.FillAtDepth(0, 1.0);
+    Input.FillAtDepth(1, 2.0);
+    Input.FillAtDepth(2, 3.0);
+    Input[1, 2, 2] := 11.0; // a plain maximum in channel 2
+
+    NN.Compute(Input);
+
+    AssertEquals('Square output still 3 elements', 3, ChannelLayer.Output.Size);
+    AssertEquals('Square max channel 0', 1.0, ChannelLayer.Output.Raw[0], 0.0001);
+    AssertEquals('Square max channel 1', 2.0, ChannelLayer.Output.Raw[1], 0.0001);
+    AssertEquals('Square max channel 2', 11.0, ChannelLayer.Output.Raw[2], 0.0001);
+
+    ChannelLayer.OutputError.Fill(0);
+    ChannelLayer.OutputError.Raw[2] := 1.0;
+    NN.GetFirstLayer.OutputError.Fill(0);
+    ChannelLayer.IncDepartingBranchesCnt();
+    ChannelLayer.Backpropagate();
+    AssertEquals('Square grad routes to winner (1,2,2)',
+      1.0, NN.GetFirstLayer.OutputError[1, 2, 2], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Regression for FlipX -> padded convolution: a padded conv writes its error
+// back into the flip layer's output-sized error buffer; the flip backward must
+// stay within bounds and produce finite gradients (no range-check overflow).
+procedure TTestNeuralLayers.TestFlipXPaddedConvBackprop;
+var
+  NN: TNNet;
+  Input, Expected: TNNetVolume;
+  I: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 7, 2); // rectangular to exercise both axes
+  Expected := TNNetVolume.Create(3);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 7, 2, 1));
+    NN.AddLayer(TNNetFlipX.Create());
+    // Padded (FeatureSize 3, Padding 1) conv keeps spatial size; its backward
+    // routes a padded error region into the flip layer.
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    Input.Randomize();
+    Expected.Raw[0] := 0.5; Expected.Raw[1] := -0.3; Expected.Raw[2] := 0.1;
+
+    NN.Compute(Input);
+    NN.Backpropagate(Expected);
+
+    // Assert input gradients are finite (no overflow / NaN).
+    for I := 0 to NN.GetFirstLayer.OutputError.Size - 1 do
+      AssertTrue('Input grad must be finite',
+        not (IsNan(NN.GetFirstLayer.OutputError.Raw[I]) or
+             IsInfinite(NN.GetFirstLayer.OutputError.Raw[I])));
+    AssertEquals('Head output size is 3', 3, NN.GetLastLayer.Output.Size);
+  finally
+    NN.Free;
+    Input.Free;
+    Expected.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestFlipYPaddedConvBackprop;
+var
+  NN: TNNet;
+  Input, Expected: TNNetVolume;
+  I: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(7, 5, 2);
+  Expected := TNNetVolume.Create(3);
+  try
+    NN.AddLayer(TNNetInput.Create(7, 5, 2, 1));
+    NN.AddLayer(TNNetFlipY.Create());
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    Input.Randomize();
+    Expected.Raw[0] := -0.2; Expected.Raw[1] := 0.4; Expected.Raw[2] := 0.0;
+
+    NN.Compute(Input);
+    NN.Backpropagate(Expected);
+
+    for I := 0 to NN.GetFirstLayer.OutputError.Size - 1 do
+      AssertTrue('Input grad must be finite',
+        not (IsNan(NN.GetFirstLayer.OutputError.Raw[I]) or
+             IsInfinite(NN.GetFirstLayer.OutputError.Raw[I])));
+    AssertEquals('Head output size is 3', 3, NN.GetLastLayer.Output.Size);
+  finally
+    NN.Free;
+    Input.Free;
+    Expected.Free;
   end;
 end;
 
