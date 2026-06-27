@@ -224,6 +224,47 @@ rather than acted on.
 
 ### Computer vision & generative models
 
+- [ ] Janus-Pro unified multimodal importer (`BuildJanusProFromSafeTensors[Ex]`,
+      deepseek-ai/Janus-Pro-1B and Janus-Pro-7B). Architecturally distinct from
+      every landed VLM (LLaVA / BLIP-2 / Qwen2-VL / PaliGemma / Florence-2) and
+      from the diffusion image-generation stacks: Janus-Pro is a SINGLE
+      autoregressive Llama-backbone transformer with TWO decoupled vision paths
+      sharing one token stream — a SigLIP "understanding" encoder (reuse
+      `BuildClipVisionTower` / SigLIP path) projected in for image→text, and a
+      VQ "generation" path (`gen_vision_model` VQ tokenizer + `gen_embed` +
+      `gen_head`) that emits DISCRETE image tokens decoded back to pixels.
+      v1 scope: the understanding path (image-conditioned text, an
+      `examples/JanusDescribe` caption) reusing the landed Llama decoder + VQ
+      codebook layers. Image-GENERATION head (sample image tokens, VQ-decode to
+      an RGB grid) as the noted follow-up. Pico-fixture parity < 1e-4 vs a
+      float64 transformers oracle on the understanding logits.
+
+- [ ] VMamba / Vision Mamba (Vim) state-space vision-backbone importer
+      (`BuildVMambaFromSafeTensors[Ex]`, state-spaces / MzeroMiko VMamba and
+      hustvl/Vim-* checkpoints). Ports the 2-D selective-scan vision backbone on
+      top of the already-landed `TNNetSelectiveSSM` / `AddMambaBlock`: patch-embed
+      stem → stacked SS2D blocks that run the selective scan over FOUR directional
+      flattenings of the (H,W) grid (the cross-scan) and merge them, with the
+      hierarchical down-sampling stages of a classification backbone. The reusable
+      new piece is the 2-D cross-scan wrapper (four directional traversals of a
+      depth-contiguous feature map feeding the existing 1-D SSM, then summed);
+      everything downstream reuses the landed Mamba layer + classifier head.
+      Pico-fixture top-1 parity vs a float64 oracle, plus reuse of the tracked
+      ImageNet-val eval harness on a sliced real checkpoint.
+
+- [ ] HunyuanVideo / Mochi-1 text-to-VIDEO DiT importer
+      (`BuildHunyuanVideoFromSafeTensors[Ex]`, tencent/HunyuanVideo and the
+      genmo/mochi-1 sibling). Distinct from the landed CogVideoX / Wan / SVD /
+      AnimateDiff video stacks: a dual-stream → single-stream MMDiT (separate
+      image- and text-stream blocks that later fuse into joint blocks, like
+      FLUX's MMDiT but over a spatio-temporal latent) with 3-D RoPE over the
+      (T,H,W) token grid and a 3-D causal-VAE latent space. v1 scope: the
+      transformer denoiser fed pre-computed text embeddings + a random latent,
+      reusing the landed diffusion schedulers (`TNNetDiffusionScheduler` flow /
+      DPM paths) for the sampling loop; the 3-D causal VAE decoder as a noted
+      follow-up (a few latent frames → pixel frames). Pico-fixture parity < 1e-4
+      vs a float64 transformers/diffusers oracle on one denoise step.
+
 - [ ] BiRefNet / RMBG-2.0 background-removal (dichotomous high-resolution image
       segmentation) importer (`BuildBiRefNetFromSafeTensors[Ex]`,
       ZhengPeng7/BiRefNet and briaai/RMBG-2.0, which ships the same BiRefNet
