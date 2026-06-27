@@ -90,27 +90,6 @@ rather than acted on.
 
 ## Infrastructure / dev experience
 
-- [X] Winograd F(2x2,3x3) fast convolution path for 3x3 stride-1 convs. LANDED:
-      opt-in forward path inside TNNetConvolution behind FStruct[7] flag set via
-      EnableWinograd (default OFF = exact direct path, zero behaviour change).
-      Eligibility: 3x3 + stride-1 + not int8 + not low-memory (any padding;
-      FInputCopy is already padded). Kernel transform U=G g G^T cached per
-      (neuron,channel) in FWinogradKernels (16,NumNeurons,InputDepth), rebuilt
-      lazily and invalidated by AfterWeightUpdate (every weight mutation funnels
-      through it). Input transform V=B^T d B over overlapping 4x4 tiles (stride 2),
-      ragged odd-output edge handled by dropping out-of-range output cells. Channel
-      reduction M[p,tile,o]=sum_c U[p,o,c]*V[p,tile,c] uses the depth-contiguous AVX
-      class TNNetVolume.DotProduct primitive (the win is the MAC-count reduction).
-      Output transform A^T M A scattered into FOutputRaw, then bias+activation as the
-      direct path. Backward unchanged (forward-inference only). Parity vs direct:
-      max|diff| ~7.2e-7 on BOTH scalar and -dAVX2 builds (tol 1e-4). Test:
-      TestNeuralLayers.TestWinogradConvolutionParity (RandSeed 424242; padded even,
-      unpadded even, padded-odd 7x7, unpadded-odd 7x7 ragged-edge cases).
-      NOTE v1 PERF: vectorized only on the channel reduction; tile/kernel transforms
-      and the per-(tile,neuron,16-pos) dot-product dispatch are scalar, so on a
-      32x32x64->64 conv it is currently ~2x SLOWER than the tuned tiled-interleaved
-      AVX GEMM direct path (330ms vs 161ms / 20 fwd, AVX2). Correctness-first; a
-      batched-GEMM elementwise-multiply rewrite is the follow-up perf win.
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] GGUF import beyond Llama — open follow-ups (core `BuildFromGGUF`/`BuildFromGGUFEx`
       arch dispatch with llama/qwen2/gemma2 LANDED & verified):
@@ -245,36 +224,6 @@ rather than acted on.
 
 ### Computer vision & generative models
 
-- [X] LANDED IP-Adapter image-prompt importer (BuildIPAdapterFromSafeTensors[Ex],
-      h94/IP-Adapter ip-adapter_sd15 key scheme) — a DISTINCT conditioning
-      mechanism from the landed ControlNet (spatial feature injection) and
-      T2I-Adapter: IP-Adapter conditions a frozen SD/SDXL UNet on a PROMPT IMAGE
-      via DECOUPLED cross-attention. A CLIP image encoder (reuse BuildClipVisionTower)
-      -> a small image-projection MLP (image_proj.*) produces N image tokens, and
-      every UNet cross-attention block gains an EXTRA set of K/V projections
-      (to_k_ip / to_v_ip, the ip_adapter.* weights) whose attention output is added
-      to the text-cross-attention output (out = Attn(Q,K_txt,V_txt) +
-      scale*Attn(Q,K_img,V_img)). Genuinely-new code: the image_proj loader + the
-      decoupled second-K/V cross-attention path tapped into the SD UNet cross-attn
-      builder (AddSDTransformer2D), reusing TNNetCrossAttention for the image stream;
-      everything else (CLIP tower, UNet) is reuse. v1 scope: the plain (non-Plus)
-      ip-adapter_sd15 with a fixed conditioning_scale. Pico float64 oracle
-      (diffusers absent, mirror the ControlNet/SD-UNet fixture pattern) ->
-      TestIPAdapterParity max|diff| < 1e-4 on the combined cross-attention output.
-      Follow-ups: IP-Adapter-Plus (patch-token Resampler/PerceiverAttention image
-      projection), FaceID variants (insightface embedding input), SDXL key scheme.
-      v1 LANDED: BuildIPAdapter[FromSafeTensors[Ex]] + TIPAdapterConfig +
-      ReadIPAdapterConfigFromJSONFile + IPAdapterCrossAttention driver. Builds the
-      image_proj module (diffusers ImageProjModel: proj Linear -> reshape to N
-      tokens -> norm LayerNorm) + ONE isolated decoupled cross-attn block (shared
-      base-UNet Q/text-K/V/out + the extra to_k_ip/to_v_ip image K/V, image stream
-      scaled by the fixed conditioning_scale via TNNetMulByConstant, image stream
-      reusing TNNetCrossAttention). The two genuinely-new pieces (image_proj loader
-      + decoupled second-K/V path) are verified end to end. TestIPAdapterParity
-      max|diff| < 1e-4 vs the numpy float64 oracle (tools/ip_adapter_tiny_fixture.py;
-      diffusers absent). FULL per-block tapping into BuildSDUNet is the remaining
-      follow-up (isolated block fully exercises the new code; no fragile UNet hack).
-
 - [ ] Llama 3.2 Vision (mllama) cross-attention VLM importer
       (BuildMllamaFromSafeTensors[Ex], model_type "mllama", e.g.
       meta-llama/Llama-3.2-11B-Vision-Instruct). DISTINCT from the landed
@@ -292,31 +241,6 @@ rather than acted on.
       precomputed TNNetInput (the Qwen2-VL "merged tokens as input v1" stance), then
       drop the shortcut. Pico parity < 1e-4 vs a float64 HF MllamaForConditionalGeneration
       oracle + an examples/LlamaVisionDescribe captioning a tiny CPU image.
-
-- [X] UniPC (UniPCMultistepScheduler) diffusion sampler — LANDED. smUniPC added
-      to TNNetDiffusionScheduler (neuraldiffusion.pas): order-2 bh2 predictor-
-      corrector (predict_x0=True, thresholding=False, lower_order_final=True),
-      reusing the lambda/sigma/alpha plumbing + a 2-deep x0/timestep history plus
-      the previous sample for the corrector. Wired into Step/Sample dispatch and
-      ResetMultistep. Gated by TestUniPCVsOracle (TestNeuralDiffusion.pas) against
-      a self-contained numpy float64 oracle (tools/unipc_scheduler_oracle.py,
-      fixture tests/fixtures/unipc_oracle.json — diffusers absent, so a faithful
-      reimplementation of multistep_uni_{p,c}_bh_update), parity < 1e-4; the UniPC
-      final (-1.0914) is distinct from DDIM (-0.8798) and DPM++(2M) (-5.69) on the
-      same toy trace. Opt-in --unipc flag added to the LatentTextToImage capstone.
-      Full suite green (2342 tests). Original spec below:
-- [ ] UniPC (UniPCMultistepScheduler) diffusion sampler — a genuinely distinct
-      few-step ODE solver to add to TNNetDiffusionScheduler (smUniPC), NOT a
-      near-duplicate of the landed DDIM/DPM-Solver++(2M)/Euler-a/LCM samplers: UniPC
-      (Zhao et al. 2023, arXiv:2302.04867) is a unified PREDICTOR-CORRECTOR of
-      arbitrary order B(h) that REUSES the previous step's model output as a
-      free corrector, giving noticeably better quality at very low step counts
-      (5-10) than the multistep DPM++ predictor alone. Add the smUniPC method to
-      the existing Step/Sample dispatch (it needs the same stored prev-output
-      history DPM++(2M) already keeps, plus the corrector update), default order 2
-      (bh2 variant). Gate with a parity test vs a diffusers float64 UniPC reference
-      on a fixed noise-prediction trace, and wire it as an opt-in method into the
-      LatentTextToImage capstone for the low-step regime.
 
 - [ ] Grounding DINO open-vocabulary detection importer
       (`BuildGroundingDINOFromSafeTensors[Ex]`, model_type "grounding-dino",
