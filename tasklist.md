@@ -90,6 +90,23 @@ rather than acted on.
 
 ## Infrastructure / dev experience
 
+- [ ] Winograd F(2x2,3x3) fast convolution AVX path for 3x3 stride-1 convs —
+      the single most common conv shape in the vision backbones (ResNet/VGG/
+      ConvNeXt/YOLO/SD UNet). Winograd trades the direct 9-multiply-per-output
+      inner product for 16 element-wise multiplies over a 4x4 tile that produce a
+      2x2 output block (4 outputs), i.e. 4 mults/output vs 9 — a ~2.25x MAC
+      reduction, with the input/output/kernel transforms being cheap fixed
+      add/shift matrices. Scope: an opt-in fast path inside TNNetConvolution
+      (FeatureSize=3, Stride=1, padding handled) that pre-transforms the kernels
+      once at first forward (G g G^T), transforms each input tile (B^T d B), runs
+      the per-tile element-wise product as a depth-axis-contiguous DotProduct/MulAdd
+      (reusing the existing AVX volume primitives, the depth-contiguity rule the
+      conv im2col path already follows), then the output transform (A^T m A). Gate
+      it behind a flag (default off = the exact direct path) and a
+      Winograd-vs-direct equivalence assert < 1e-4 on a fixed fixture (Winograd
+      reassociates the sum, so it is approximate in float32). Distinct from the
+      landed im2col+DotProduct conv (that vectorizes the SAME 9-mult contraction;
+      Winograd reduces the MAC COUNT). Re-profile a ResNet/VGG forward before/after.
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] GGUF import beyond Llama — open follow-ups (core `BuildFromGGUF`/`BuildFromGGUFEx`
       arch dispatch with llama/qwen2/gemma2 LANDED & verified):
@@ -223,6 +240,56 @@ rather than acted on.
       and key-padding-masked MAP pooling. Not yet wired.
 
 ### Computer vision & generative models
+
+- [ ] IP-Adapter image-prompt importer (BuildIPAdapterFromSafeTensors[Ex],
+      h94/IP-Adapter ip-adapter_sd15 key scheme) — a DISTINCT conditioning
+      mechanism from the landed ControlNet (spatial feature injection) and
+      T2I-Adapter: IP-Adapter conditions a frozen SD/SDXL UNet on a PROMPT IMAGE
+      via DECOUPLED cross-attention. A CLIP image encoder (reuse BuildClipVisionTower)
+      -> a small image-projection MLP (image_proj.*) produces N image tokens, and
+      every UNet cross-attention block gains an EXTRA set of K/V projections
+      (to_k_ip / to_v_ip, the ip_adapter.* weights) whose attention output is added
+      to the text-cross-attention output (out = Attn(Q,K_txt,V_txt) +
+      scale*Attn(Q,K_img,V_img)). Genuinely-new code: the image_proj loader + the
+      decoupled second-K/V cross-attention path tapped into the SD UNet cross-attn
+      builder (AddSDTransformer2D), reusing TNNetCrossAttention for the image stream;
+      everything else (CLIP tower, UNet) is reuse. v1 scope: the plain (non-Plus)
+      ip-adapter_sd15 with a fixed conditioning_scale. Pico float64 oracle
+      (diffusers absent, mirror the ControlNet/SD-UNet fixture pattern) ->
+      TestIPAdapterParity max|diff| < 1e-4 on the combined cross-attention output.
+      Follow-ups: IP-Adapter-Plus (patch-token Resampler/PerceiverAttention image
+      projection), FaceID variants (insightface embedding input), SDXL key scheme.
+
+- [ ] Llama 3.2 Vision (mllama) cross-attention VLM importer
+      (BuildMllamaFromSafeTensors[Ex], model_type "mllama", e.g.
+      meta-llama/Llama-3.2-11B-Vision-Instruct). DISTINCT from the landed
+      Qwen2-VL / Florence-2 / LLaVA paths, which fuse vision by PREPENDING visual
+      tokens into the text sequence: mllama interleaves dedicated CROSS-ATTENTION
+      decoder layers (cross_attn_layers) that let the text stream attend to a frozen
+      ViT vision tower's patch features, gated by a learnable tanh gate
+      (cross_attn_attn_gate / cross_attn_mlp_gate, zero-init so the base LM is
+      unchanged at start). Genuinely-new code: the vision tower (a ViT with a
+      pre/post tile-position embedding + global+local transformer stack over image
+      TILES) feeding the cross-attention layers, the tanh-gated cross-attn residual
+      injection (reuse TNNetCrossAttention + a learnable scalar gate), and the
+      per-layer self-attn-vs-cross-attn schedule; the text self-attention decoder is
+      the landed Llama backbone. v1 may take the vision tower's tile features as a
+      precomputed TNNetInput (the Qwen2-VL "merged tokens as input v1" stance), then
+      drop the shortcut. Pico parity < 1e-4 vs a float64 HF MllamaForConditionalGeneration
+      oracle + an examples/LlamaVisionDescribe captioning a tiny CPU image.
+
+- [ ] UniPC (UniPCMultistepScheduler) diffusion sampler — a genuinely distinct
+      few-step ODE solver to add to TNNetDiffusionScheduler (smUniPC), NOT a
+      near-duplicate of the landed DDIM/DPM-Solver++(2M)/Euler-a/LCM samplers: UniPC
+      (Zhao et al. 2023, arXiv:2302.04867) is a unified PREDICTOR-CORRECTOR of
+      arbitrary order B(h) that REUSES the previous step's model output as a
+      free corrector, giving noticeably better quality at very low step counts
+      (5-10) than the multistep DPM++ predictor alone. Add the smUniPC method to
+      the existing Step/Sample dispatch (it needs the same stored prev-output
+      history DPM++(2M) already keeps, plus the corrector update), default order 2
+      (bh2 variant). Gate with a parity test vs a diffusers float64 UniPC reference
+      on a fixed noise-prediction trace, and wire it as an opt-in method into the
+      LatentTextToImage capstone for the low-step regime.
 
 - [ ] Grounding DINO open-vocabulary detection importer
       (`BuildGroundingDINOFromSafeTensors[Ex]`, model_type "grounding-dino",
@@ -406,18 +473,28 @@ rather than acted on.
       offline here); (b) expose LPIPS as a backprop TRAINING LOSS head so the SR
       examples can opt into perceptual fine-tuning (the VGG build already enables
       input/error collection, so the gradient path exists).
-- [ ] ControlNet spatial-conditioning importer (BuildControlNetFromSafeTensors, e.g.
-      lllyasviel/sd-controlnet-canny) — adds spatial control (edge / depth / pose
-      map -> image) to latent diffusion: a trainable COPY of the SD UNet encoder +
-      mid block whose per-resolution residuals are added into the frozen base UNet
-      via zero-initialised 1x1 convs, plus a small conv "hint" stem that embeds the
-      control image into the latent grid. Genuinely new code is only the zero-conv
-      residual injection wiring and the hint encoder; the encoder blocks reuse the
-      SD UNet importer path. DEPENDS ON the open SD UNet importer (the VAE-decoder
-      follow-up's deferred piece) — track as its natural successor. Pico parity vs a
-      diffusers float64 oracle on the down/mid residual tensors for a fixed control
-      image; an examples/ControlNetCanny that conditions generation on a hand-drawn
-      edge map once the base UNet lands. First conditioning-by-feature-injection model.
+- [X] ControlNet spatial-conditioning importer (BuildControlNetFromSafeTensors[Ex],
+      lllyasviel/sd-controlnet-canny key scheme) — LANDED. TControlNetConfig wraps
+      the SD UNet TSDUNetConfig (encoder + mid block REUSE AddSDResnetBlock /
+      AddSDTransformer2D verbatim; ControlNet has NO up blocks) plus cond fields.
+      Genuinely-new code: the controlnet_cond_embedding hint stem
+      (AddControlNetHintStem: conv_in + (conv, stride-2 conv) pairs w/ SiLU +
+      conv_out, ADDED to conv_in before the down blocks) and the per-resolution
+      zero-conv residual taps (1x1 PointwiseConvLinear off conv_in(+hint), each down
+      resnet(+attn), each downsampler, and the mid output). ControlNetResiduals
+      driver (4 TNNetInputs: latent/timestep/text/control-image) returns the
+      down_block_res_samples + mid_block_res_sample. Pico float64 oracle
+      (tools/controlnet_tiny_fixture.py, diffusers absent) -> TestControlNetParity
+      max|diff| = 2.89e-6 (< 1e-4) on all 4 down residuals + the mid residual; also
+      TestControlNetConfigFromJSONFile. First conditioning-by-feature-injection model.
+      DEFERRED follow-ups: (a) end-to-end base-UNet-plus-ControlNet generation
+      (inject the residuals into a frozen BuildSDUNet decoder — needs a residual-add
+      hook on the SD UNet up-block skip Sums) + an examples/ControlNetCanny smoke
+      once that lands; (b) real-checkpoint slicer (slice sd-controlnet-canny like
+      slice_llama.py) for parity vs real weights on top of the synthetic fixture;
+      (c) the diffusers per-residual conditioning_scale multiplier (constant 1.0
+      here); (d) T2I-Adapter (lighter feature-injection sibling) as its natural
+      successor.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
       for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
       parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful
