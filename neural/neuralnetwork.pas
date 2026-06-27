@@ -11657,11 +11657,20 @@ type
     FSreBuf, FSimBuf: TSpectralConv2DMatrix;     // ComputeCPU spectrum [FSizeX][FSizeY]
     FGreBuf, FGimBuf: TSpectralConv2DMatrix;     // BackpropagateCPU FFT scratch [FSizeX][FSizeY]
     FdXreBuf, FdXimBuf: array of TSpectralConv2DMatrix; // BackpropagateCPU input-spectrum grad [FInDepth][FModesX][FModesY]
+    // AVX-contiguous mirrors of the spectral weights, rebuilt from the strided
+    // interleaved W.FData (where the ci axis has stride FOutDepth*2 -- NOT
+    // contiguous). Layout: index ((co*FModesX + mx)*FModesY + my)*FInDepth + ci
+    // so that, for a fixed (co,mx,my), the InDepth reduction over ci is a
+    // contiguous DotProduct (the 4-multiply complex GEMM). Single precision (AVX).
+    FWrPlane, FWiPlane: array of TNeuralFloat;
+    // Per-mode contiguous input spectra, index (mx*FModesY + my)*FInDepth + ci.
+    FxrPlane, FximPlane: array of TNeuralFloat;
     procedure ComputeCPU();
     procedure BackpropagateCPU();
     function WBase(mx, my, ci, co: integer): integer;
     // 2-D FFT helpers on a [x][y] grid (in-place); reuse FourierMixFFT per axis.
     procedure FFT2D(var Re, Im: TSpectralConv2DMatrix; Inverse: boolean);
+    procedure RebuildWeightPlanes();
     procedure FreeBackpropScratch();
   public
     constructor Create(pOutDepth, pModesX, pModesY: integer); overload;
@@ -11669,6 +11678,7 @@ type
     function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure InitDefault(); override;
+    procedure AfterWeightUpdate(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     property ModesX: integer read FModesX;
@@ -66191,6 +66201,10 @@ begin
   SetLength(FXim, 0);
   SetLength(FSreBuf, 0);
   SetLength(FSimBuf, 0);
+  SetLength(FWrPlane, 0);
+  SetLength(FWiPlane, 0);
+  SetLength(FxrPlane, 0);
+  SetLength(FximPlane, 0);
   FreeBackpropScratch();
   inherited Destroy();
 end;
@@ -66288,6 +66302,11 @@ begin
   // FSreBuf/FSimBuf are forward Compute scratch; the rest is backprop-only.
   SetLength(FSreBuf, FSizeX, FSizeY);
   SetLength(FSimBuf, FSizeX, FSizeY);
+  // AVX-contiguous weight + input-spectrum planes (forward path).
+  SetLength(FWrPlane, FOutDepth * FModesX * FModesY * FInDepth);
+  SetLength(FWiPlane, FOutDepth * FModesX * FModesY * FInDepth);
+  SetLength(FxrPlane, FModesX * FModesY * FInDepth);
+  SetLength(FximPlane, FModesX * FModesY * FInDepth);
   if FIsTrainable then
   begin
     SetLength(FGreBuf, FSizeX, FSizeY);
@@ -66316,6 +66335,43 @@ begin
     W.FData[i] := scale * (Random - 0.5) * 2;
 end;
 
+// Scatter the strided interleaved [mx][my][ci][co][Re,Im] persistent weights into
+// the AVX-contiguous Re/Im planes laid out (co,mx,my)-major, ci-minor so the
+// per-output InDepth contraction is a contiguous DotProduct. The persistent
+// storage and its save/load layout are untouched; these planes are a pure
+// read-only mirror.
+procedure TNNetSpectralConv2D.RebuildWeightPlanes();
+var
+  ci, co, mx, my, b, dst: integer;
+  InDepthM1, OutDepthM1, ModesXM1, ModesYM1: integer;
+  W: TNNetVolume;
+begin
+  if (FInDepth <= 0) or (Length(FWrPlane) = 0) then exit;
+  W := FArrNeurons[0].FWeights;
+  InDepthM1 := FInDepth - 1;
+  OutDepthM1 := FOutDepth - 1;
+  ModesXM1 := FModesX - 1;
+  ModesYM1 := FModesY - 1;
+  for co := 0 to OutDepthM1 do
+    for mx := 0 to ModesXM1 do
+      for my := 0 to ModesYM1 do
+      begin
+        dst := ((co * FModesX + mx) * FModesY + my) * FInDepth;
+        for ci := 0 to InDepthM1 do
+        begin
+          b := WBase(mx, my, ci, co);
+          FWrPlane[dst + ci] := W.FData[b];
+          FWiPlane[dst + ci] := W.FData[b + 1];
+        end;
+      end;
+end;
+
+procedure TNNetSpectralConv2D.AfterWeightUpdate();
+begin
+  inherited AfterWeightUpdate();
+  RebuildWeightPlanes();
+end;
+
 procedure TNNetSpectralConv2D.Compute();
 var
   StartTime: double;
@@ -66329,18 +66385,21 @@ procedure TNNetSpectralConv2D.ComputeCPU();
 var
   ci, co, mx, my, ix, iy: integer;
   InDepthM1, OutDepthM1, SizeXM1, SizeYM1, ModesXM1, ModesYM1: integer;
-  PrevOut, W: TNNetVolume;
-  a, bb, xr, xi, yr, yi: Double;
-  b: integer;
+  wBaseIdx, xBaseIdx: integer;
+  PrevOut: TNNetVolume;
 begin
   PrevOut := FPrevLayer.FOutput;
-  W := FArrNeurons[0].FWeights;
   InDepthM1 := FInDepth - 1;
   OutDepthM1 := FOutDepth - 1;
   SizeXM1 := FSizeX - 1;
   SizeYM1 := FSizeY - 1;
   ModesXM1 := FModesX - 1;
   ModesYM1 := FModesY - 1;
+  // Refresh the contiguous weight mirror so a directly hand-edited weight (a
+  // finite-difference perturbation, a freshly LoadFromString'd net, etc.) is
+  // honoured even without an intervening AfterWeightUpdate. Cost is a single
+  // weight-sized copy -- cheap next to the FFTs and the vectorized contraction.
+  RebuildWeightPlanes();
   // 1. 2-D FFT of every input channel.
   for ci := 0 to InDepthM1 do
   begin
@@ -66352,7 +66411,22 @@ begin
       end;
     FFT2D(FXre[ci], FXim[ci], false);
   end;
+  // Pack the kept-mode input spectra into contiguous (mx,my,ci) Single planes so
+  // the InDepth contraction below is a vectorizable DotProduct.
+  for mx := 0 to ModesXM1 do
+    for my := 0 to ModesYM1 do
+    begin
+      xBaseIdx := (mx * FModesY + my) * FInDepth;
+      for ci := 0 to InDepthM1 do
+      begin
+        FxrPlane[xBaseIdx + ci] := FXre[ci][mx][my];
+        FximPlane[xBaseIdx + ci] := FXim[ci][mx][my];
+      end;
+    end;
   // 2./3./4. Per output channel: spectral matmul over kept 2-D modes, then IFFT.
+  // The InDepth complex contraction is the 4-multiply complex GEMM, each real
+  // reduction an AVX DotProduct over the contiguous ci axis:
+  //   Yre = Wr.xr - Wi.xi ;  Yim = Wr.xi + Wi.xr.
   for co := 0 to OutDepthM1 do
   begin
     for ix := 0 to SizeXM1 do
@@ -66364,21 +66438,14 @@ begin
     for mx := 0 to ModesXM1 do
       for my := 0 to ModesYM1 do
       begin
-        yr := 0;
-        yi := 0;
-        for ci := 0 to InDepthM1 do
-        begin
-          b := WBase(mx, my, ci, co);
-          a := W.FData[b];        // Re R
-          bb := W.FData[b + 1];   // Im R
-          xr := FXre[ci][mx][my];
-          xi := FXim[ci][mx][my];
-          // (a + bb i)(xr + xi i)
-          yr := yr + (a * xr - bb * xi);
-          yi := yi + (a * xi + bb * xr);
-        end;
-        FSreBuf[mx][my] := yr;
-        FSimBuf[mx][my] := yi;
+        wBaseIdx := ((co * FModesX + mx) * FModesY + my) * FInDepth;
+        xBaseIdx := (mx * FModesY + my) * FInDepth;
+        FSreBuf[mx][my] :=
+          TNNetVolume.DotProduct(@FWrPlane[wBaseIdx], @FxrPlane[xBaseIdx], FInDepth) -
+          TNNetVolume.DotProduct(@FWiPlane[wBaseIdx], @FximPlane[xBaseIdx], FInDepth);
+        FSimBuf[mx][my] :=
+          TNNetVolume.DotProduct(@FWrPlane[wBaseIdx], @FximPlane[xBaseIdx], FInDepth) +
+          TNNetVolume.DotProduct(@FWiPlane[wBaseIdx], @FxrPlane[xBaseIdx], FInDepth);
       end;
     FFT2D(FSreBuf, FSimBuf, true);  // inverse 2-D FFT (includes 1/(FSizeX*FSizeY))
     for ix := 0 to SizeXM1 do

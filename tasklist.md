@@ -1764,21 +1764,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
   - [ ] TNNetTestTimeTraining / TNNetTitansMemory backward "undo" loops (interleaved
         scalar etaGrad/dEta/dTheta accumulation) — the per-token forward rank-1 writes
         are vectorized; this is the lower-value remainder.
-- [ ] AVX-vectorize the `TNNetSpectralConv2D` forward inner contraction.
-      `ComputeCPU` still accumulates the per-mode complex matmul with a SCALAR
-      loop over the input-channel axis (neuralnetwork.pas ~66377-66378:
-      `yr := yr + (a*xr - bb*xi); yi := yi + (a*xi + bb*xr)` for `ci := 0 to
-      InDepthM1`). The sibling `TNNetSpectralConv1D` ALREADY vectorizes the
-      identical contraction (neuralnetwork.pas ~65418-65422) by staging the
-      real/imag weights and inputs into ci-contiguous PLANAR buffers
-      (`FWrPlane`/`FWiPlane`/`FxrPlane`/`FximPlane`) and issuing four
-      `TNNetVolume.DotProduct` calls (yr = Wr·xr − Wi·xim, yi = Wr·xim + Wi·xr).
-      The ci axis is already contiguous on all 2-D weight/input arrays, so port
-      the 1-D planar-buffer + DotProduct pattern to the 2-D
-      (ModesX × ModesY)-mode loop. Pin parity against the existing scalar path
-      with the SpectralConv2D numerical test before/after, and keep the scalar
-      loop as a fallback for non-contiguous edge shapes. Distinct from the FFT
-      FPU-trap item above (that is numerical-stability, this is throughput).
 - [ ] AVX-vectorize the strided STATE-READOUT forward loops in the
       linear-attention / state-space family. Several layers compute the output
       `y_t[e] = sum_d q_t[d]·S_t[d,e]` (or the SSM analogue
