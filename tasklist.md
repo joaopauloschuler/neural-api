@@ -1155,6 +1155,19 @@ rather than acted on.
       real diffusers 3D RoPE frequency layout / temporal VAE up/down blocks and a real
       T5 encoder over a tokenized prompt feeding BuildT5FromSafeTensors instead of the
       synthetic text states.
+- [ ] Wan 2.1 text-to-VIDEO DiT importer (`BuildWanFromSafeTensors[Ex]` +
+      `TWanConfig`, model_type "wan", e.g. Wan-AI/Wan2.1-T2V-1.3B) — the current
+      most-downloaded open text-to-video model, a flow-matching MMDiT distinct from
+      the landed CogVideoX (Wan uses a 3D causal-VAE latent + a different DiT block:
+      self-attn + cross-attn to a T5/umT5 text encoder + a per-block time-modulated
+      AdaLN, no QK-norm). Reuse the landed MMDiT/DiT cross-attention + AdaLN
+      modulation blocks and the 3D-RoPE / TNNetCausalConv1D temporal-VAE primitives
+      from the CogVideoX path; add only the Wan-specific patch-embed (1 x 2 x 2
+      patchify), the flow-matching sampler, and the Wan VAE decoder key mapping.
+      Pico parity TestWanParity < 1e-4 vs a float64 HF WanTransformer3DModel; defer
+      real Wan-AI/Wan2.1 weights (network/RAM-gated) to a slicer follow-up, plus an
+      examples/TextToVideo --wan mode. Note: distinct enough from CogVideoX that the
+      MMDiT-video path is reused, not duplicated.
 - [ ] Stable Video Diffusion IMAGE-to-video importer (`BuildSVDFromSafeTensors[Ex]`
       + `TSVDConfig`, e.g. stabilityai/stable-video-diffusion-img2vid) — the
       image-CONDITIONED video generator that complements the landed CogVideoX
@@ -1482,6 +1495,70 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       stack matches the concatenation of independent per-document MHA runs (the
       builder-level analogue of TestSegmentMaskMatchesUnpackedBaseline). KV-cache
       incremental decode stays intentionally unmasked (single-stream = one doc).
+
+- [ ] AVX-vectorize the rank-1 outer-product state update in TNNetDeltaNet and
+      TNNetGatedLinearAttention. Both already use the AVX `DotProduct` for the
+      per-timestep input/key/value/gate projections, but the state matrix carry
+      itself is a fully scalar nested `for d, e: S[d,e] := alpha*S[d,e] + beta*k[d]*v[e]`
+      double loop in BOTH forward and backward. With the state laid out row-major
+      (depth-contiguous in `e`) each output-row update is exactly one
+      `MulAdd(ptrS_row, ptrV, beta*k[d], D)` after an optional `Mul` by the
+      forget scale — a drop-in over the existing neuralvolume primitives, with the
+      backward `dS`/`dk`/`dv` accumulation mapping onto `DotProduct`/`MulAdd` the
+      same way. These O(SeqLen*D^2) state writes dominate the layer cost, so this is
+      the largest remaining scalar hot loop in the linear-attention family. Preserve
+      the `-FLearningRate` convention; the landed numerical-gradient tests pin
+      correctness. (TNNetTitansMemory / TNNetTestTimeTraining share the identical
+      per-row pattern and can reuse the same helper — see the next entry.)
+
+- [ ] AVX-vectorize the test-time inner-optimizer weight-matrix updates in
+      TNNetTestTimeTraining and TNNetTitansMemory. The per-timestep gradient-descent
+      step on the inner memory (`W_lin -= eta*r outer k`, and for TitansMemory the
+      momentum + forget-gated `S := (1-forget)*S + momentum*grad` over the D x H
+      weight slabs) is the same rank-1 row-wise update as the DeltaNet/GLA entry
+      above, currently a scalar nested loop forward and backward. Route each weight
+      row through `MulAdd`/`Mul`/`DotProduct` over the contiguous H axis; share one
+      `RankOneUpdate(ptrW, ptrA, ptrB, scale, rows, cols)` helper between this and
+      the DeltaNet/GLA work so there is a single vectorized primitive, not four
+      copies. These layers run an optimizer step per token, so the inner matmul is
+      the dominant cost. Numerical-gradient tests stay the correctness oracle.
+
+- [ ] AVX-vectorize the block / factor GEMMs of TNNetMonarchLinear and
+      TNNetKroneckerLinear. Both never materialize the full weight, so their forward
+      and backward are small dense matrix-vector products inside nested scalar
+      `for row, col: acc += W[row,col]*x[col]` loops (Monarch's two per-block m x m
+      butterflies, Kronecker's B-then-A two-phase contraction). Each inner
+      accumulation is a contiguous dot product once the block/factor rows are walked
+      row-contiguous, so they map onto `DotProduct` (forward) and `MulAdd` (backward
+      weight/input gradient scatter) directly; where the natural axis is strided
+      (Monarch's P / P^T permutes), reorder to the contiguous run first as was done
+      for the attention output-accumulation loops. These structured-dense layers are
+      pitched as a cheaper FullConnect, but the scalar inner loop currently gives up
+      most of that win on AVX builds.
+
+- [ ] AVX-vectorize the complex spectral matmul of TNNetSpectralConv1D. The FFT
+      forward/inverse are already vectorized, but the channel-mixing contraction in
+      the frequency domain is a scalar nested `for co, m, ci` complex multiply-add
+      (`yr += Wr*xr - Wi*xi; yi += Wr*xi + Wi*xr`) in both ComputeCPU and
+      BackpropagateCPU. With the real and imaginary mode weights stored as separate
+      contiguous planes the per-output-channel reduction over input channels becomes
+      four real `DotProduct`s (the standard 4-multiply complex GEMM), turning the
+      O(Modes*InDepth*OutDepth) inner loop into AVX dot products. This is the FNO
+      hot path; keep the Modes low-pass truncation and the learnable-complex-weight
+      gradient exactly as-is, pinned by the existing numerical-gradient test.
+
+- [ ] OpenCL offload for the spatial im2col GEMM of TNNetDeformableConv and
+      TNNetGroupConvP4. Both spend their forward in a scalar
+      `for oy, ox, co, fy, fx, ci` convolution accumulation (DeformableConv with a
+      bilinear-sampled patch per tap, GroupConvP4 with the 4 rotation-tied weight
+      copies). Once the (possibly sampled) input patch is gathered into an im2col
+      buffer the accumulation is an ordinary patch x weight GEMM, so it can reuse the
+      same `EnableConvOpenCL` / `SetConvOpenCLMinWork` gated kernel path already
+      landed for the EnCodec/HiFiGAN conv1d and ConvTranspose1d offload (host
+      round-trip as the fallback). Keep the bilinear-sample gather and the rotation
+      weight-folding on the CPU; only the dense contraction goes to the device.
+      Pin parity with a SDPAOpenCLParity-style exact-vs-CPU test on the PoCL device.
+
 ## Tests / numerical-gradient audit
 
 - [ ] Shared `LayerInputAndWeightGradientCheck(layer, inputShape)` helper
