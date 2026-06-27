@@ -796,37 +796,11 @@ rather than acted on.
       tests (EnCodec round-trips, TestMimiParity, TestDACRoundTripParity,
       TestHiFiGANSynthesisParity, TestVitsSynthesisParity, TestMusicGen*DecoderParity)
       pass on BOTH scalar-fallback and real -dAVX2 builds. REMAINING:
-  - [X] OpenCL offload of the same accumulation (via the shared dot-product kernel,
-        like FullConnect/Convolution). FORWARD conv1d LANDED: EnCodec (`RunEnCodecConv`
-        — `TEnCodecModel` + MusicGen EnCodec decode) and HiFiGAN/Vits (`RunHiFiGANConv`)
-        run the per-stage im2col GEMM as one `TDotProductSharedKernel` call, opt-in +
-        default OFF via the `EnableConvOpenCL`/`SetConvOpenCLMinWork` gate.
-        `TestEnCodecOpenCLConvParity` GREEN on BOTH the default (CPU==CPU, trivially
-        exact) and `-dOpenCL` builds. Verified on the real PoCL CPU device (FP32):
-        end-to-end EnCodec decode max|diff| = 5.96e-8 << 1e-4 (per-stage forward conv
-        GEMM matched the AVX DotProduct to < 2e-7). `EnableConvOpenCL` now self-tests
-        the device kernel with a tiny known dot product and stays OFF (graceful CPU
-        fallback, no crash) if it can't compute — covers the case where the kernel
-        source `neural.cl` is not reachable from the run dir (added `../neural` and
-        `../../neural` repo-relative lookups so the tests/examples dirs find it).
-        REMAINING:
-    - [X] OpenCL offload of the ConvTranspose1d (upsample) overlap-add accumulation
-          (EnCodec + HiFiGAN/Vits); the per-(o,k2)-tap in-channel contraction is the
-          same shared-kernel-shaped GEMM but scatters into an overlap-add buffer.
-          DONE: RunConvTransposeGemmOpenCL runs the transposed-im2col GEMM as ONE
-          TDotProductSharedKernel call (As = WT repacked [i*(OutCh*K)+(o*K+k2)],
-          Bs = InT [t*InCh+i], Size=InCh, rows=OutCh*K, cols=InLen); the result
-          Res[t*(OutCh*K)+(o*K+k2)] then scatters overlap-add into Full (EnCodec)
-          / bias-preset Pad-trimmed OutSig (HiFiGAN) at stride positions. Same
-          opt-in EnableConvOpenCL / SetConvOpenCLMinWork gate + ConvOpenCLSelfTest
-          graceful-fallback as the forward path; AVX/CPU stays the fallback.
-          TestEnCodecOpenCLConvParity (decoder upsamplers) + new
-          TestHiFiGANOpenCLConvParity exercise the genuine PoCL FP32 device path
-          (ConvOpenCLEnabled=TRUE): EnCodec end-to-end max|diff| 5.96e-8, HiFiGAN
-          1.79e-7, both << 1e-4. Full suite green on default AND -dOpenCL builds.
-    - [ ] OpenCL offload of the Mimi (`RunMimiConv`) / DAC (`RunDACConv`) holders —
-          blocked on a Double-precision shared dot-product kernel (their oracle gate
-          is `< 1e-4` against a float64 reference; a Float kernel would not hold it).
+  - [ ] OpenCL offload of the Mimi (`RunMimiConv`) / DAC (`RunDACConv`) holders —
+        blocked on a Double-precision shared dot-product kernel (their oracle gate
+        is `< 1e-4` against a float64 reference; a Float kernel would not hold it).
+        (Forward conv1d + ConvTranspose1d OpenCL offload for EnCodec/HiFiGAN/Vits
+        has landed via the `EnableConvOpenCL`/`SetConvOpenCLMinWork` gated path.)
       Design note (the landed forward path follows this): channel-major layout
       means the contraction (sum over in-channels for a fixed kernel tap) is
       depth-axis-contiguous — exactly the case `TNNetVolume.DotProduct` / `MulAdd`
@@ -1015,7 +989,8 @@ rather than acted on.
         package is available.
   - [ ] Swap the `TNNetMinLSTM` trunk (gates depend on x_t only) for a VANILLA LSTM with a
         true cell state + recurrent gate feed (pyannote uses `nn.LSTM`), so real weights
-        load without re-training; needs a landed vanilla-LSTM cell first.
+        load without re-training, using the landed `TNNetLSTMCell` (the bidirectional
+        multi-layer stacking builder is the remaining piece).
   - [ ] Sliding-window inference + overlap stitching for clips longer than the model's
         receptive field, and turning the per-frame activity matrix into final diarized
         speaker turns (clustering across windows).
@@ -1354,59 +1329,14 @@ rather than acted on.
 
 ## Layer follow-ups that fix real limitations
 
-- [X] AVX-vectorize the scalar backward Jacobian of TNNetRMSNorm and
-      TNNetLayerNorm. Their `Compute` already uses the AVX `GetSumSqr`/`Mul`
-      primitives, but `Backpropagate` still walks `FData[Cnt]` element-by-element
-      to form `dxhat = OutputError .* gamma`, the running reductions
-      (`SumDxHat`, `SumDxHatXHat`) and the final
-      `dx = invRMS*(dxhat - xhat*mean(dxhat*xhat))` scatter. The whole-volume case
-      is contiguous, so each loop maps onto the existing neuralvolume primitives:
-      `Mul` for the elementwise gate, `DotProduct(dxhat, xhat)` (and a plain
-      `GetSum`/`DotProduct` against a ones-style accumulation for LayerNorm's
-      mean-subtraction term), then two `MulAdd` writes into
-      `FPrevLayer.FOutputError` — exactly the rewrite already landed for the
-      per-token sibling `TNNetTokenRMSNorm.Backpropagate`, which can be copied as
-      the template. Preserve the `-FLearningRate` convention and the gamma/beta
-      delta path; the existing numerical-gradient tests pin correctness. Real value:
-      RMSNorm/LayerNorm sit on the hot path of every transformer and ConvNeXt-style
-      vision block, and the backward pass is currently the only scalar half left.
-
-- [X] Port torch `nn.LSTMCell` / `nn.GRUCell` — the standard fully-connected
-      recurrent cells with TRUE recurrent gating (each gate sees the previous
-      hidden state h_{t-1}, and the LSTM carries a separate cell state c_t), i.e.
-      a direct port of torch `nn.LSTMCell`/`nn.GRUCell`. This is a genuine gap, NOT
-      a near-duplicate of anything in tree: `TNNetMinLSTM`/`TNNetMinGRU` deliberately
-      make the gates depend on x_t ONLY (so they parallel-scan), `TNNetSLSTMCell`/
-      `TNNetMLSTMCell` are the xLSTM exp-gated / matrix-memory variants, and
-      `TNNetConvLSTMCell`/`TNNetConvGRUCell` are convolutional. None implement the
-      classic Hochreiter/Cho gates `i,f,o,c̃ = σ/tanh(W_x·x_t + W_h·h_{t-1} + b)`
-      with a real recurrent W_h. Full forward + BPTT (the frozen-h_{t-1} forward
-      gotcha noted for sLSTM applies), input & weight numerical-gradient tests, and
-      a weight layout that maps the torch fused `weight_ih`/`weight_hh` (4·hidden /
-      3·hidden row-packed i,f,g,o gate order) so real `nn.LSTM`/`nn.GRU` checkpoints
-      load without re-training. Immediate payoff: UNBLOCKS the pyannote
-      real-checkpoint follow-up (lines 977-979, which needs exactly this to drop in
-      `pyannote/segmentation-3.0`'s `nn.LSTM` trunk) and any future speech / seq2seq
-      importer whose recurrent core is a stock LSTM/GRU. Bidirectional + multi-layer
-      stacking reuse the existing forward+time-reversed-concat builder idiom used for
-      the MinLSTM trunk (no new wiring needed).
-      DONE: `TNNetLSTMCell` (torch i,f,g,o gate order, 12 tensors: `W_i*`/`W_h*`
-      Depth×Depth + folded ih+hh biases, `b_f` init +1, separate cell state `c_t`)
-      and `TNNetGRUCell` (torch r,z,n order, 11 tensors: `W_i*`/`W_h*` + folded
-      `b_r`/`b_z`, SEPARATE `b_in`/`b_hn` because `b_hn` rides inside the reset-gated
-      candidate term, 1 spare bias) in `neural/neuralnetwork.pas`. Both: full forward
-      with frozen-`h_{t-1}` snapshot + exact BPTT (`dL/dc_t`+`dL/dh_t` for LSTM,
-      `dL/dh_t` incl. `z_t⊙h_{t-1}` leakage and `r_t`/`whn` coupling for GRU);
-      registered in both `CreateLayer` dispatch tables; input + weight
-      numerical-gradient tests + serialization round-trip in `TestNeuralNumerical`
-      (max abs grad err ~1.7e-3, well under 1e-2). README rows added.
-      - [ ] FOLLOW-UP (still open): bidirectional + multi-layer stacking for
-            `TNNetLSTMCell`/`TNNetGRUCell` (and a real `nn.LSTM`/`nn.GRU`
-            num_layers>1 / bidirectional=True checkpoint importer). Reuse the
-            existing forward + time-reversed-concat builder idiom from the MinLSTM
-            trunk; no new layer math is needed, just a stacking/reverse builder and
-            the per-direction/per-layer weight-slab wiring. Unblocks the pyannote
-            `segmentation-3.0` bidirectional-LSTM trunk drop-in (lines ~977-995).
+- [ ] Bidirectional + multi-layer stacking for `TNNetLSTMCell` / `TNNetGRUCell`
+      (and a real `nn.LSTM`/`nn.GRU` num_layers>1 / bidirectional=True checkpoint
+      importer). The single-cell `TNNetLSTMCell`/`TNNetGRUCell` (torch fused
+      `weight_ih`/`weight_hh` gate layout, full forward + exact BPTT) have landed;
+      reuse the existing forward + time-reversed-concat builder idiom from the
+      MinLSTM trunk — no new layer math, just a stacking/reverse builder and the
+      per-direction/per-layer weight-slab wiring. Unblocks the pyannote
+      `segmentation-3.0` bidirectional-LSTM trunk drop-in (lines ~977-995).
 
 (The sub-quadratic / chunked-forward family below is one coherent systems effort:
 every recurrence currently trains as a strict per-token left-to-right scan.)
