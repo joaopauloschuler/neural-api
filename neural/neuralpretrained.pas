@@ -9271,6 +9271,62 @@ function BuildSwinV2FromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet; overload;
 
 // ---------------------------------------------------------------------------
+// MAXVIT / COATNET IMAGE-CLASSIFICATION BACKBONE IMPORT (Tu et al. 2022,
+// *MaxViT: Multi-Axis Vision Transformer*; timm maxvit_* / coatnet_*). A conv
+// stem feeds MaxViT blocks, each = MBConv (depthwise-separable inverted
+// bottleneck + squeeze-excite, all landed layers) -> BLOCK attention
+// (window-local self-attention over HxW partitioned into local windows) ->
+// GRID attention (the SAME windowed-SDPA layer applied over a strided/dilated
+// sparse grid of tokens). Both attentions are pre-norm (channel LayerNorm) +
+// relative-position bias + a post-norm MLP, each with a residual.
+//
+// The ONLY architecturally-new wiring vs the landed Swin importer is the
+// grid-gather/scatter token PERMUTATION fed to TNNetGatherTokens: block
+// attention groups HxW into local windows (window[wy,wx][iy,ix] =
+// (wy*P+iy, wx*P+ix)); grid attention groups it into a strided grid
+// (window[a,b][gy,gx] = (gy*sy+a, gx*sx+b), sy=H/G). Both feed the identical
+// TNNetWindowAttention + relative-position-bias path -- only the permutation
+// index differs. MBConv / SE / LayerNorm / MLP / conv-BN-fold are all drop-in.
+//
+// v1 scope: a SELF-CONTAINED first-principles pico fixture (timm/coatnet are
+// not installed offline and MaxViT is not in transformers) exercising a single
+// MaxViT block (stem -> MBConv+SE -> block-attn -> grid-attn -> head) with a
+// float64 numpy oracle (tools/maxvit_tiny_fixture.py). Multi-stage stacking +
+// real timm key mapping is a documented follow-up in tasklist.md.
+type
+  TMaxViTConfig = record
+    ImageSize: integer;     // input H=W (8 in pico)
+    NumChannels: integer;   // 3
+    StemCh: integer;        // stem conv output channels
+    ExpandCh: integer;      // MBConv inverted-bottleneck hidden channels
+    SeCh: integer;          // squeeze-excite reduced channels
+    ProjectCh: integer;     // MBConv output channels == attention Dim
+    NumHeads: integer;      // attention heads
+    Window: integer;        // block-attention window size
+    Grid: integer;          // grid-attention grid size
+    MlpRatio: integer;      // MLP hidden = Dim * MlpRatio
+    NumLabels: integer;     // classifier width
+    LayerNormEps: TNeuralFloat;
+    BatchNormEps: TNeuralFloat;
+  end;
+
+// Reads the pico maxvit config.json (tools/maxvit_tiny_fixture.py output).
+function ReadMaxViTConfigFromJSONFile(const FileName: string): TMaxViTConfig;
+
+// Builds the MaxViT backbone described by Config and loads every weight from
+// Reader (caller owns Reader). Input (ImageSize,ImageSize,NumChannels) RGB
+// volume; output (1,1,NumLabels) class logits.
+function BuildMaxViTFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TMaxViTConfig; pTrainable: boolean = true): TNNet; overload;
+
+function BuildMaxViTFromSafeTensorsEx(const FileName: string;
+  const Config: TMaxViTConfig; pTrainable: boolean = true): TNNet;
+
+function BuildMaxViTFromSafeTensors(const FileName: string;
+  out Config: TMaxViTConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet; overload;
+
+// ---------------------------------------------------------------------------
 // SEGMENT ANYTHING (SAM) IMAGE-ENCODER IMPORT (facebook/sam-vit-base) — the
 // first PROMPTABLE-segmentation importer. v1 lands the ViT-det image encoder
 // (windowed + global decomposed-rel-pos attention + the 1x1/3x3 conv neck) to
@@ -60663,6 +60719,395 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadSwinV2ConfigFromJSONFile(ConfigPath);
   Result := BuildSwinV2FromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+// ===========================================================================
+// MAXVIT / COATNET IMPORT - implementation
+// ===========================================================================
+
+function ReadMaxViTConfigFromJSONFile(const FileName: string): TMaxViTConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+begin
+  if not FileExists(FileName) then
+    ImportError('MaxViT import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('MaxViT import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('MaxViT import: config "' + FileName + '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ImageSize := Obj.Get('image_size', 8);
+    Result.NumChannels := Obj.Get('num_channels', 3);
+    Result.StemCh := Obj.Get('stem_ch', 4);
+    Result.ExpandCh := Obj.Get('expand_ch', 8);
+    Result.SeCh := Obj.Get('se_ch', 2);
+    Result.ProjectCh := Obj.Get('project_ch', 6);
+    Result.NumHeads := Obj.Get('num_heads', 2);
+    Result.Window := Obj.Get('window', 4);
+    Result.Grid := Obj.Get('grid', 4);
+    Result.MlpRatio := Obj.Get('mlp_ratio', 2);
+    Result.NumLabels := Obj.Get('num_labels', 5);
+    Result.LayerNormEps := Obj.Get('ln_eps', 1e-5);
+    Result.BatchNormEps := Obj.Get('bn_eps', 1e-5);
+  finally
+    if Assigned(Root) then Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+// Builds the flat token permutation for a P x P window partition of a HxH grid
+// (row-major y*H+x token layout). Output token (window w, position p) maps to
+// input token Perm[w*P*P + p]:
+//   BLOCK partition: window (wy,wx), position (iy,ix) -> (wy*P+iy, wx*P+ix)
+//   GRID  partition: window (a,b),  position (gy,gx) -> (gy*sy+a, gx*sx+b),
+//                    sy=sx=H/P (strided/dilated grid).
+// InvPerm scatters the per-window attention output back to grid order.
+procedure MaxViTBuildPartition(H, P: integer; IsGrid: boolean;
+  out Perm, InvPerm: TNeuralIntegerArray; out NumWindows: integer);
+var
+  side, p2, outPos, wy, wx, iy, ix, srcY, srcX, i, HHM1: integer;
+begin
+  side := H div P;                 // windows per side
+  NumWindows := side * side;
+  p2 := P * P;
+  SetLength(Perm, H * H);
+  SetLength(InvPerm, H * H);
+  outPos := 0;
+  for wy := 0 to side - 1 do
+    for wx := 0 to side - 1 do
+      for iy := 0 to P - 1 do
+        for ix := 0 to P - 1 do
+        begin
+          if IsGrid then
+          begin
+            // window index (wy,wx) == (a,b); position (iy,ix) == (gy,gx)
+            srcY := iy * side + wy;
+            srcX := ix * side + wx;
+          end
+          else
+          begin
+            srcY := wy * P + iy;
+            srcX := wx * P + ix;
+          end;
+          Perm[outPos] := srcY * H + srcX;
+          Inc(outPos);
+        end;
+  HHM1 := H * H - 1;
+  for i := 0 to HHM1 do
+    InvPerm[Perm[i]] := i;
+end;
+
+// Builds the within-window relative-position index (P*P x P*P) into a
+// (2P-1)^2 bias table - identical convention to SwinBuildWindowLayout's
+// RelPosIndex (row-major query i, key j).
+procedure MaxViTBuildRelPosIndex(P: integer;
+  out RelPosIndex: TNeuralIntegerArray);
+var
+  p2, qy, qx, ky, kx, i, j, dy, dx, idx: integer;
+begin
+  p2 := P * P;
+  SetLength(RelPosIndex, p2 * p2);
+  for qy := 0 to P - 1 do
+    for qx := 0 to P - 1 do
+      for ky := 0 to P - 1 do
+        for kx := 0 to P - 1 do
+        begin
+          i := qy * P + qx;
+          j := ky * P + kx;
+          dy := (qy - ky) + (P - 1);
+          dx := (qx - kx) + (P - 1);
+          idx := dy * (2 * P - 1) + dx;
+          RelPosIndex[i * p2 + j] := idx;
+        end;
+end;
+
+// Loads the per-head relative-position bias into a TNNetWindowAttention layer.
+// BiasTable is the flat [(2P-1)^2, NumHeads] table (row-major idx*NumHeads+head).
+procedure MaxViTSetWindowBias(WinAttn: TNNetLayer; BiasTable: TNNetVolume;
+  const RelPosIndex: TNeuralIntegerArray; HeadIdx, NumHeads, P: integer);
+var
+  p2, p2M1, i, j, idx: integer;
+  Mat: TNNetVolume;
+begin
+  p2 := P * P;
+  p2M1 := p2 - 1;
+  // Bias table must be [(2P-1)^2, NumHeads]; guard against a checkpoint whose
+  // table was baked for a different window size (would read OOB below).
+  if BiasTable.Size < Sqr(2 * P - 1) * NumHeads then
+    ImportError('MaxViT import: relative-position bias table has ' +
+      IntToStr(BiasTable.Size) + ' elements, expected at least ' +
+      IntToStr(Sqr(2 * P - 1) * NumHeads) + ' for window/grid size ' +
+      IntToStr(P) + ' x ' + IntToStr(NumHeads) + ' heads.');
+  Mat := TNNetVolume.Create(p2 * p2, 1, 1);
+  try
+    for i := 0 to p2M1 do
+      for j := 0 to p2M1 do
+      begin
+        idx := RelPosIndex[i * p2 + j];
+        Mat.FData[i * p2 + j] := BiasTable.FData[idx * NumHeads + HeadIdx];
+      end;
+    TNNetWindowAttention(WinAttn).SetBiasMatrix(Mat);
+  finally
+    Mat.Free;
+  end;
+end;
+
+function BuildMaxViTFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TMaxViTConfig; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  H, Dim, HeadDim, ws2: integer;
+  StemConv, ExpandConv, DwConv, SeReduce, SeExpand, ProjectConv: TNNetLayer;
+  DwShift: TNNetVolume;
+  MbBranch, SeGate, FmapTokens: TNNetLayer;
+
+  // builds one transformer block (block OR grid attention) over FmapTokens
+  // which is a (H*H, 1, Dim) token sequence; returns the (H*H,1,Dim) output.
+  function AddAttnBlock(InTokens: TNNetLayer; const Prefix: string;
+    P: integer; IsGrid: boolean; AH, ADim, AHeadDim: integer): TNNetLayer;
+  var
+    Perm, InvPerm, RelPosIndex, Channels: TNeuralIntegerArray;
+    NW, wIdx, h, ci, MlpHidden: integer;
+    Norm1, Reordered, AttnConcat, OProj, ReorderBack, AttnResidual: TNNetLayer;
+    Norm2, Fc1, Fc2, MlpResidual, WinSlice, QProj, KProj, VProj: TNNetLayer;
+    QSlice, KSlice, VSlice, QKV, HeadAttn: TNNetLayer;
+    WindowOuts, HeadOuts: array of TNNetLayer;
+    WinAttnLayers: array of TNNetLayer;
+    BiasTable: TNNetVolume;
+  begin
+    MaxViTBuildPartition(AH, P, IsGrid, Perm, InvPerm, NW);
+    MaxViTBuildRelPosIndex(P, RelPosIndex);
+    ws2 := P * P;
+    SetLength(WinAttnLayers, 0);
+
+    // pre-norm (channel/token LayerNorm over Dim)
+    Norm1 := NN.AddLayerAfter(
+      TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable),
+      InTokens);
+    // window/grid partition gather
+    Reordered := NN.AddLayer( TNNetGatherTokens.Create(Perm) );
+
+    SetLength(WindowOuts, NW);
+    for wIdx := 0 to NW - 1 do
+    begin
+      WinSlice := NN.AddLayerAfter(
+        TNNetCrop.Create(wIdx * ws2, 0, ws2, 1), Reordered);
+      QProj := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(ADim).SetTrainable(pTrainable) );
+      KProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(ADim).SetTrainable(pTrainable), WinSlice);
+      VProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(ADim).SetTrainable(pTrainable), WinSlice);
+      SetLength(HeadOuts, Config.NumHeads);
+      for h := 0 to Config.NumHeads - 1 do
+      begin
+        SetLength(Channels, AHeadDim);
+        for ci := 0 to AHeadDim - 1 do Channels[ci] := h * AHeadDim + ci;
+        QSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), QProj);
+        KSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), KProj);
+        VSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), VProj);
+        QKV := NN.AddLayer( TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
+        HeadAttn := NN.AddLayer( TNNetWindowAttention.Create(AHeadDim, ws2) );
+        SetLength(WinAttnLayers, Length(WinAttnLayers) + 1);
+        WinAttnLayers[High(WinAttnLayers)] := HeadAttn;
+        HeadOuts[h] := HeadAttn;
+      end;
+      AttnConcat := NN.AddLayer( TNNetDeepConcat.Create(HeadOuts) );
+      OProj := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(ADim).SetTrainable(pTrainable) );
+      WindowOuts[wIdx] := OProj;
+      // q/k/v sliced out of the packed [3*Dim, Dim] qkv slab; o_proj plain.
+      LoadLlamaLinearWeights(Reader, QProj, Prefix + '.attn.qkv.weight',
+        ADim, ADim, 0, -1, 0, Prefix + '.attn.qkv.bias', 1.0, 0, 0, 3 * ADim);
+      LoadLlamaLinearWeights(Reader, KProj, Prefix + '.attn.qkv.weight',
+        ADim, ADim, 0, -1, 0, Prefix + '.attn.qkv.bias', 1.0, 0, ADim, 3 * ADim);
+      LoadLlamaLinearWeights(Reader, VProj, Prefix + '.attn.qkv.weight',
+        ADim, ADim, 0, -1, 0, Prefix + '.attn.qkv.bias', 1.0, 0, 2 * ADim, 3 * ADim);
+      LoadLlamaLinearWeights(Reader, OProj, Prefix + '.attn.proj.weight',
+        ADim, ADim, 0, -1, 0, Prefix + '.attn.proj.bias');
+    end;
+    AttnConcat := NN.AddLayer(
+      TNNetConcat.Create(NW * ws2, 1, ADim, WindowOuts) );
+    ReorderBack := NN.AddLayer( TNNetGatherTokens.Create(InvPerm) );
+    AttnResidual := NN.AddLayer( TNNetSum.Create([ReorderBack, InTokens]) );
+
+    // post-norm MLP
+    Norm2 := NN.AddLayer(
+      TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+    MlpHidden := ADim * Config.MlpRatio;
+    Fc1 := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(MlpHidden).SetTrainable(pTrainable) );
+    NN.AddLayer( TNNetGELUErf.Create() );
+    Fc2 := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(ADim).SetTrainable(pTrainable) );
+    MlpResidual := NN.AddLayer( TNNetSum.Create([Fc2, AttnResidual]) );
+
+    LoadLayerNormWeights(Reader, Norm1,
+      Prefix + '.norm1.weight', Prefix + '.norm1.bias', ADim);
+    LoadLayerNormWeights(Reader, Norm2,
+      Prefix + '.norm2.weight', Prefix + '.norm2.bias', ADim);
+    LoadLlamaLinearWeights(Reader, Fc1, Prefix + '.mlp.fc1.weight',
+      ADim, MlpHidden, 0, -1, 0, Prefix + '.mlp.fc1.bias');
+    LoadLlamaLinearWeights(Reader, Fc2, Prefix + '.mlp.fc2.weight',
+      MlpHidden, ADim, 0, -1, 0, Prefix + '.mlp.fc2.bias');
+
+    // relative-position bias per (window, head)
+    BiasTable := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(Prefix + '.attn.rel_pos_bias_table', BiasTable);
+      for wIdx := 0 to NW - 1 do
+        for h := 0 to Config.NumHeads - 1 do
+        begin
+          ci := wIdx * Config.NumHeads + h;
+          MaxViTSetWindowBias(WinAttnLayers[ci], BiasTable,
+            RelPosIndex, h, Config.NumHeads, P);
+        end;
+    finally
+      BiasTable.Free;
+    end;
+
+    if AttnConcat = nil then ; // silence
+    Result := MlpResidual;
+  end;
+
+begin
+  Dim := Config.ProjectCh;
+  HeadDim := Dim div Config.NumHeads;
+  H := Config.ImageSize;   // stem conv keeps spatial size (3x3 stride1 pad1)
+  // The partition gather/scatter requires the feature map to tile exactly into
+  // windows (block) and into a strided grid (grid); a non-multiple would leave
+  // InvPerm slots uninitialized and silently corrupt the scatter.
+  if (Config.Window <= 0) or (H mod Config.Window <> 0) then
+    ImportError('MaxViT import: image_size (' + IntToStr(H) +
+      ') must be a positive multiple of window (' + IntToStr(Config.Window) + ').');
+  if (Config.Grid <= 0) or (H mod Config.Grid <> 0) then
+    ImportError('MaxViT import: image_size (' + IntToStr(H) +
+      ') must be a positive multiple of grid (' + IntToStr(Config.Grid) + ').');
+  if (Config.NumHeads <= 0) or (Dim mod Config.NumHeads <> 0) then
+    ImportError('MaxViT import: project_ch (' + IntToStr(Dim) +
+      ') must be a positive multiple of num_heads (' +
+      IntToStr(Config.NumHeads) + ').');
+  DwShift := nil;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer( TNNetInput.Create(
+      Config.ImageSize, Config.ImageSize, Config.NumChannels) );
+
+    // ---- conv stem (3x3 stride1 pad1, BN folded) ----
+    StemConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      Config.StemCh, 3, 1, 1, 0).SetTrainable(pTrainable) );
+
+    // ---- MBConv: expand 1x1 -> GELU -> depthwise 3x3 -> GELU -> SE -> proj ----
+    ExpandConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      Config.ExpandCh, 1, 0, 1, 0).SetTrainable(pTrainable) );
+    NN.AddLayer( TNNetGELUErf.Create() );
+    DwConv := NN.AddLayer( TNNetDepthwiseConvLinear.Create(
+      1, 3, 1, 1).SetTrainable(pTrainable) );
+    NN.AddLayer( TNNetChannelBias.Create() );  // folded depthwise BN shift
+    NN.AddLayer( TNNetGELUErf.Create() );
+    // squeeze-excite
+    MbBranch := NN.GetLastLayer();
+    NN.AddLayerAfter( TNNetAvgChannel.Create(), MbBranch );
+    SeReduce := NN.AddLayer( TNNetConvolutionLinear.Create(
+      Config.SeCh, 1, 0, 1, 0).SetTrainable(pTrainable) );
+    NN.AddLayer( TNNetGELUErf.Create() );
+    SeExpand := NN.AddLayer( TNNetConvolutionLinear.Create(
+      Config.ExpandCh, 1, 0, 1, 0).SetTrainable(pTrainable) );
+    SeGate := NN.AddLayer( TNNetSigmoid.Create() );
+    NN.AddLayer( TNNetChannelMulByLayer.Create(MbBranch, SeGate) );
+    // project 1x1 (no activation, no residual: in StemCh != out ProjectCh)
+    ProjectConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      Config.ProjectCh, 1, 0, 1, 0).SetTrainable(pTrainable) );
+
+    // flatten (H,H,Dim) feature map -> (H*H,1,Dim) token sequence
+    FmapTokens := NN.AddLayer( TNNetReshape.Create(H * H, 1, Dim) );
+
+    // ---- block attention then grid attention ----
+    FmapTokens := AddAttnBlock(FmapTokens, 'block_attn', Config.Window, false,
+      H, Dim, HeadDim);
+    FmapTokens := AddAttnBlock(FmapTokens, 'grid_attn', Config.Grid, true,
+      H, Dim, HeadDim);
+
+    // ---- head: global token mean -> LayerNorm -> Linear ----
+    // (timm MaxViT order: global_pool BEFORE norm). mean over tokens: reshape
+    // the (H*H,1,Dim) sequence to (H,H,Dim) so AvgChannel divides by H*H.
+    NN.AddLayer( TNNetReshape.Create(H, H, Dim) );
+    NN.AddLayer( TNNetAvgChannel.Create() );  // -> (1,1,Dim)
+    NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+    NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels).SetTrainable(pTrainable) );
+
+    // ---- load conv-stack weights (BN folded) ----
+    LoadResNetConvFoldBN(Reader, StemConv,
+      'stem.conv.weight', 'stem.bn', Config.StemCh, Config.NumChannels, 3,
+      Config.BatchNormEps);
+    LoadResNetConvFoldBN(Reader, ExpandConv,
+      'mbconv.expand.conv.weight', 'mbconv.expand.bn',
+      Config.ExpandCh, Config.StemCh, 1, Config.BatchNormEps);
+    LoadMobileNetDepthwiseFoldBN(Reader, DwConv,
+      'mbconv.dw.conv.weight', 'mbconv.dw.bn',
+      Config.ExpandCh, 3, Config.BatchNormEps, DwShift);
+    // LoadChannelBiasFromShift consumes (frees) DwShift.
+    LoadChannelBiasFromShift(NN.Layers[DwConv.LayerIdx + 1], DwShift);
+    LoadMobileNetSEConv(Reader, SeReduce,
+      'mbconv.se.reduce.weight', 'mbconv.se.reduce.bias',
+      Config.SeCh, Config.ExpandCh);
+    LoadMobileNetSEConv(Reader, SeExpand,
+      'mbconv.se.expand.weight', 'mbconv.se.expand.bias',
+      Config.ExpandCh, Config.SeCh);
+    LoadResNetConvFoldBN(Reader, ProjectConv,
+      'mbconv.project.conv.weight', 'mbconv.project.bn',
+      Config.ProjectCh, Config.ExpandCh, 1, Config.BatchNormEps);
+
+    // head weights (norm is the layer right before the final classifier:
+    // Reshape -> AvgChannel -> TokenLayerNorm -> FullConnectLinear)
+    LoadLayerNormWeights(Reader,
+      NN.Layers[NN.GetLastLayer().LayerIdx - 1],
+      'head.norm.weight', 'head.norm.bias', Dim);
+    LoadLlamaLinearWeights(Reader, NN.GetLastLayer(), 'head.fc.weight',
+      Dim, Config.NumLabels, 0, -1, 0, 'head.fc.bias');
+
+    if not pTrainable then NN.SetTrainable();
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildMaxViTFromSafeTensorsEx(const FileName: string;
+  const Config: TMaxViTConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildMaxViTFromSafeTensors(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildMaxViTFromSafeTensors(const FileName: string;
+  out Config: TMaxViTConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadMaxViTConfigFromJSONFile(ConfigPath);
+  Result := BuildMaxViTFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================

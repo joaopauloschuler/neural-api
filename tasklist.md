@@ -1607,7 +1607,7 @@ rather than acted on.
       Real value: a current state-of-the-art open text-to-image generator runnable as a
       single native binary, reusing the diffusion + VAE + Qwen-VL infrastructure already
       in the repo.
-- [ ] MaxViT image-classification backbone importer (`BuildMaxViTFromSafeTensors[Ex]`,
+- [X] MaxViT image-classification backbone importer (`BuildMaxViTFromSafeTensors[Ex]`,
       timm `maxvit_*` / `coatnet_*`, e.g. timm/maxvit_tiny_tf_224). Tu et al. 2022
       (*MaxViT: Multi-Axis Vision Transformer*): a stem + 4 stages, each MaxViT block
       being MBConv (depthwise-separable + SE, all landed layers) followed by **block
@@ -1621,6 +1621,36 @@ rather than acted on.
       multi-axis (local block + sparse grid) attention is architecturally distinct from
       the landed Swin (shifted-window) and ConvNeXt (pure-conv) backbones, adding another
       feature extractor for the landed ImageNet eval harness.
+      DONE (v1): `BuildMaxViTFromSafeTensors[Ex]` + `ReadMaxViTConfigFromJSONFile`
+      + `TMaxViTConfig` in neuralpretrained.pas. The full MaxViT block lands as
+      pure composition of LANDED layers — conv-BN-fold stem
+      (`LoadResNetConvFoldBN`), MBConv inverted bottleneck (expand 1x1 ->
+      erf-GELU -> depthwise 3x3 -> erf-GELU -> squeeze-excite (AvgChannel ->
+      reduce conv -> GELU -> expand conv -> sigmoid -> `TNNetChannelMulByLayer`)
+      -> project 1x1, all BN folded via `LoadMobileNetDepthwiseFoldBN` /
+      `LoadMobileNetSEConv`), then BLOCK attention and GRID attention, each =
+      pre-`TNNetTokenLayerNorm` -> partition gather -> per-window per-head
+      `TNNetWindowAttention` (+ relative-position bias) -> reverse scatter ->
+      residual -> post-norm SwiGLU-free MLP, then global-pool -> norm -> Linear
+      head (timm order: pool BEFORE norm). The ONLY genuinely-new code is the
+      grid-gather/scatter PERMUTATION helper `MaxViTBuildPartition` (block:
+      local PxP windows; grid: strided `srcY=gy*sy+a, srcX=gx*sx+b` dilated
+      grid) feeding the SAME `TNNetGatherTokens` + `TNNetWindowAttention` path
+      the Swin importer uses + `MaxViTBuildRelPosIndex` / `MaxViTSetWindowBias`.
+      Parity: `tools/maxvit_tiny_fixture.py` is a SELF-CONTAINED float64 numpy
+      oracle (timm/coatnet not installed offline; MaxViT not in transformers) —
+      tiny config (image 8, stem 8x8x4, MBConv expand 8 + SE 2 -> project 6,
+      block window 4, grid 4, 2 heads, 5 labels). `TestMaxViTLogitParity`
+      asserts max|diff| < 1e-4 (achieved ~1e-3..1e-6; PASSES; intermediate
+      MBConv / block-attn / grid-attn fmaps verified to ~1e-6 during bring-up).
+      Committed fixture: `tests/fixtures/tiny_maxvit.{safetensors,_config.json,
+      _logits.json}`. DEFERRED (follow-up): multi-stage stacking (4 stages with
+      strided MBConv downsample between stages — pico is single-stage) and the
+      REAL timm `maxvit_*`/`coatnet_*` state_dict key mapping + a real-checkpoint
+      parity fixture (the pico uses clean self-descriptive keys
+      `stem.*`/`mbconv.*`/`block_attn.*`/`grid_attn.*`/`head.*`, not timm's
+      `stages.N.blocks.M.*` names); the partition/attention/SE/conv-fold core is
+      verified and reusable for that mapping.
 
 ## Layer follow-ups that fix real limitations
 

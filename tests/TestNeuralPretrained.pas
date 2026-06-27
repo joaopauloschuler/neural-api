@@ -537,6 +537,7 @@ type
     procedure TestMobileViTImageClassificationParity;
     procedure TestSwinConfigFromJSONFile;
     procedure TestSwinImageClassificationParity;
+    procedure TestMaxViTLogitParity;
     procedure TestSwinV2ConfigFromJSONFile;
     procedure TestSwinV2ImageClassificationParity;
     procedure TestVGGConfigParity;
@@ -21288,6 +21289,78 @@ begin
     Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
     LogitsArr := TJSONArray(TJSONArray(
       TJSONObject(RefRoot).Find('logits')).Items[0]);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ChanCnt] -
+        LogitsArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// MaxViT image-classification parity test. tests/fixtures/tiny_maxvit.* is a
+// pico random-init MaxViT (image 8, stem 3x3 -> 8x8x4, MBConv expand 8 + SE 2
+// -> project 6, block attention window 4, grid attention grid 4, 2 heads, 5
+// labels). The fixture (tools/maxvit_tiny_fixture.py) is a SELF-CONTAINED
+// float64 numpy oracle (timm/coatnet are not installed offline; MaxViT is not
+// in transformers). Exercises the conv-BN-fold stem + MBConv + SE, BLOCK
+// attention (window-local partition), GRID attention (the strided/dilated grid
+// partition - the genuinely-new TNNetGatherTokens permutation), the
+// relative-position bias, and the head. Asserts the (1,1,num_labels) logits
+// match the oracle < 1e-4.
+procedure TTestNeuralPretrained.TestMaxViTLogitParity;
+var
+  NN: TNNet;
+  Config: TMaxViTConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, LogitsArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildMaxViTFromSafeTensors(
+    FixturePath('tiny_maxvit.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_maxvit_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output size = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Size);
+
+    RefJson.LoadFromFile(FixturePath('tiny_maxvit_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    LogitsArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
     AssertTrue('pixels present', Pixels <> nil);
     AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
 
