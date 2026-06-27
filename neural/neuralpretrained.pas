@@ -10712,6 +10712,9 @@ type
     DepthEstimationType: string;      // 'relative' (ReLU) or 'metric' (Sigmoid)
     MaxDepth: double;                 // max_depth (scales the metric output)
     ModelType: string;                // 'depth_anything' or 'dpt'
+    OutIndices: array[0..3] of integer;  // backbone out_indices (1-based stages;
+                                         // stageK = encoder block K-1). Default =
+                                         // last 4 blocks (HF [N-3..N]).
   end;
 
 // Reads a HF Depth-Anything / DPT config.json (model_type "depth_anything" or
@@ -10744,6 +10747,31 @@ function BuildDPTFromSafeTensorsEx(const FileName: string;
   const Config: TDPTConfig; pTrainable: boolean = true): TNNet;
 
 function BuildDPTFromSafeTensors(const FileName: string;
+  out Config: TDPTConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet; overload;
+
+// ---------------------------------------------------------------------------
+// Depth Anything V2 monocular RELATIVE-depth importer (model_type
+// "depth_anything", e.g. depth-anything/Depth-Anything-V2-Small/Base/Large-hf).
+// Depth Anything V2 is exactly the DPT depth-estimation stack with a DINOv2 ViT
+// backbone (S/B/L) feeding the DPT reassemble + RefineNet fusion neck and the
+// 3-conv depth head; the build path is therefore BuildDPT, and these are thin
+// wrappers that ASSERT the config's model_type is "depth_anything". The 4 hooked
+// backbone stages come from backbone_config.out_indices (1-based stages, default
+// [N-3..N]); the net outputs a single-channel (ImageSize, ImageSize, 1) relative
+// depth map at full input resolution (HF's predicted_depth). Caller owns Reader.
+function BuildDepthAnythingV2FromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TDPTConfig; pTrainable: boolean = true): TNNet;
+
+// Builds + loads the Depth Anything V2 net from the checkpoint at FileName with a
+// caller-supplied Config (asserts model_type "depth_anything"). Caller owns the
+// returned net. Output: (ImageSize, ImageSize, 1) relative depth map.
+function BuildDepthAnythingV2FromSafeTensorsEx(const FileName: string;
+  const Config: TDPTConfig; pTrainable: boolean = true): TNNet;
+
+// Reads config.json beside FileName ('' = "config.json" next to it), asserts
+// model_type "depth_anything", builds + loads the net and returns the Config.
+function BuildDepthAnythingV2FromSafeTensors(const FileName: string;
   out Config: TDPTConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet; overload;
 
@@ -64064,6 +64092,62 @@ begin
   Result.UseSwiGLUFFN := Obj.Get('use_swiglu_ffn', false);
 end;
 
+// Reads the 4 backbone stage hooks the DPT neck consumes from a dinov2
+// backbone_config: prefers "out_indices" (a 4-entry array of 1-based stage
+// numbers, e.g. [9,10,11,12] for Depth-Anything-V2-Small), else "out_features"
+// (["stage9",...]); failing both, defaults to the last 4 stages [N-3..N]. The
+// 1-based stageK maps to 0-based encoder block K-1. Validates count=4, range
+// 1..N, and strictly increasing (the fusion stage assumes coarse->fine order).
+procedure ReadDPTOutIndices(Bc: TJSONObject; NumLayers: integer;
+  out OutIndices: array of integer);
+var
+  d: TJSONData;
+  a: TJSONArray;
+  k, v: integer;
+  s: string;
+begin
+  d := Bc.Find('out_indices');
+  if (d <> nil) and (d is TJSONArray) and (TJSONArray(d).Count = 4) then
+  begin
+    a := TJSONArray(d);
+    for k := 0 to 3 do
+    begin
+      v := a.Integers[k];
+      // HF allows negative stage indices (Python-style); normalize.
+      if v < 0 then v := NumLayers + 1 + v;
+      OutIndices[k] := v;
+    end;
+  end
+  else
+  begin
+    d := Bc.Find('out_features');
+    if (d <> nil) and (d is TJSONArray) and (TJSONArray(d).Count = 4) then
+    begin
+      a := TJSONArray(d);
+      for k := 0 to 3 do
+      begin
+        s := a.Strings[k];
+        if Copy(s, 1, 5) <> 'stage' then
+          ImportError('DPT import: out_features entry "' + s +
+            '" is not "stage{K}".');
+        OutIndices[k] := StrToInt(Copy(s, 6, Length(s) - 5));
+      end;
+    end
+    else
+      // default: the last 4 stages (1-based [N-3 .. N]).
+      for k := 0 to 3 do OutIndices[k] := NumLayers - 3 + k;
+  end;
+  for k := 0 to 3 do
+  begin
+    if (OutIndices[k] < 1) or (OutIndices[k] > NumLayers) then
+      ImportError('DPT import: out_indices stage ' + IntToStr(OutIndices[k]) +
+        ' out of range 1..' + IntToStr(NumLayers) + '.');
+    if (k > 0) and (OutIndices[k] <= OutIndices[k - 1]) then
+      ImportError('DPT import: out_indices must be strictly increasing ' +
+        '(coarse->fine), got a non-increasing pair.');
+  end;
+end;
+
 function ReadDPTConfigFromJSONFile(const FileName: string): TDPTConfig;
 var
   JsonText: TStringList;
@@ -64114,6 +64198,12 @@ begin
       ImportError('DPT import: config is missing the "backbone_config" object.');
     Bc := TJSONObject(BcData);
     Result.Backbone := ReadDINOv2ConfigFromObject(Bc, 'DPT import');
+    // backbone out_indices: which 4 encoder stages feed the DPT neck. HF stores
+    // 1-based stage indices in backbone_config.out_indices (or out_features as
+    // "stage{K}"). stageK = the output of 0-based encoder block K-1. Default =
+    // the last 4 blocks ([N-3 .. N], 1-based), matching the all-N pico fixture
+    // and HF's default [N-3,N-2,N-1,N].
+    ReadDPTOutIndices(Bc, Result.Backbone.NumLayers, Result.OutIndices);
     Result.PatchSize := Obj.Get('patch_size', Result.Backbone.PatchSize);
     Result.ReassembleHiddenSize :=
       Obj.Get('reassemble_hidden_size', Result.Backbone.HiddenSize);
@@ -64153,6 +64243,9 @@ begin
     ', fusion=' + IntToStr(Config.FusionHiddenSize) +
     ', head_hidden=' + IntToStr(Config.HeadHiddenSize) +
     ', head_in_index=' + IntToStr(Config.HeadInIndex) +
+    ', out_indices=[' + IntToStr(Config.OutIndices[0]) + ',' +
+    IntToStr(Config.OutIndices[1]) + ',' + IntToStr(Config.OutIndices[2]) + ',' +
+    IntToStr(Config.OutIndices[3]) + ']' +
     ', type=' + Config.DepthEstimationType +
     ', max_depth=' + FloatToStr(Config.MaxDepth);
 end;
@@ -64386,9 +64479,11 @@ begin
     // LayerNorm on the hooked sequence, drop the CLS row, reshape to (Grid,Grid).
     for i := 0 to 3 do
     begin
+      // tap the encoder block selected by out_indices (1-based stageK = block
+      // K-1); HF applies the SHARED final LayerNorm to each hooked stage.
       StageLN[i] := NN.AddLayerAfter(
         TNNetTokenLayerNorm.Create(Bk.LayerNormEps).SetTrainable(pTrainable),
-        BlockOut[Bk.NumLayers - 4 + i]);
+        BlockOut[Config.OutIndices[i] - 1]);
       // drop the CLS row (sequence index 0 along X), keep patch rows 1..N.
       NN.AddLayer(TNNetCrop.Create(1, 0, NumPatches, 1));
       Reassembled[i] := NN.AddLayer(TNNetReshape.Create(Grid, Grid, d));
@@ -66230,6 +66325,48 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadDPTConfigFromJSONFile(ConfigPath);
   Result := BuildDPTFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+// --------------------------- Depth Anything V2 -----------------------------
+// Depth Anything V2 = the DPT depth stack on a DINOv2 backbone; build via
+// BuildDPT after asserting the config is the depth_anything family (a clear,
+// named entry point distinct from generic DPT, and a guard against accidentally
+// passing a plain "dpt" config that wires a different backbone family).
+function BuildDepthAnythingV2FromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TDPTConfig; pTrainable: boolean): TNNet;
+begin
+  if LowerCase(Config.ModelType) <> 'depth_anything' then
+    ImportError('Depth Anything V2 import: model_type is "' + Config.ModelType +
+      '", expected "depth_anything".');
+  Result := BuildDPT(Reader, Config, pTrainable);
+end;
+
+function BuildDepthAnythingV2FromSafeTensorsEx(const FileName: string;
+  const Config: TDPTConfig; pTrainable: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  if LowerCase(Config.ModelType) <> 'depth_anything' then
+    ImportError('Depth Anything V2 import: model_type is "' + Config.ModelType +
+      '", expected "depth_anything".');
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildDPT(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildDepthAnythingV2FromSafeTensors(const FileName: string;
+  out Config: TDPTConfig; pTrainable: boolean;
+  const ConfigFileName: string): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadDPTConfigFromJSONFile(ConfigPath);
+  Result := BuildDepthAnythingV2FromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 function ReadClipImageProcessorConfig(

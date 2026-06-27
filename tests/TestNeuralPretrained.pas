@@ -477,6 +477,7 @@ type
     procedure TestSegformerSemanticSegmentationParity;
     procedure TestDPTConfigFromJSONFile;
     procedure TestDPTDepthEstimationParity;
+    procedure TestDepthAnythingV2Parity;
     procedure TestVideoMAEConfigFromJSONFile;
     procedure TestVideoMAEClassificationParity;
     procedure TestViTPoseConfigFromJSONFile;
@@ -18356,6 +18357,91 @@ begin
         end;
     end;
     AssertTrue('DPT depth: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Img.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Depth Anything V2 monocular relative-depth importer parity. tiny_depth_anything
+// _v2.* is a pico DepthAnythingForDepthEstimation built via the named
+// BuildDepthAnythingV2FromSafeTensors entry point. Distinct from the DPT fixture:
+// the DINOv2 backbone has 6 layers and hooks NON-contiguous, NON-last-4 stages
+// out_indices=[2,3,5,6] (0-based blocks 1,2,4,5), exercising the importer's
+// out_indices wiring (tap the SELECTED encoder blocks + shared final LayerNorm)
+// rather than a hardcoded last-4 tap. The reference per-pixel depth map comes
+// from the REAL transformers float64 forward; asserts max |diff| < 1e-4 over the
+// whole (H, W) map.
+procedure TTestNeuralPretrained.TestDepthAnythingV2Parity;
+var
+  NN: TNNet;
+  Config: TDPTConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, OutArr, InArr: TJSONArray;
+  CaseObj: TJSONObject;
+  Img: TNNetVolume;
+  Output: TNNetVolume;
+  RefVal, GotVal, Diff, MaxDiff: double;
+  CaseCnt, x, yy, c, FlatIdx, GW, GH, W, H, NumCh: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildDepthAnythingV2FromSafeTensors(
+    FixturePath('tiny_depth_anything_v2.safetensors'),
+    Config, {pTrainable=}true,
+    FixturePath('tiny_depth_anything_v2_config.json'));
+  RefJson := TStringList.Create;
+  Img := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  W := Config.Backbone.ImageSize; H := Config.Backbone.ImageSize;
+  NumCh := Config.Backbone.NumChannels;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('model_type', 'depth_anything', Config.ModelType);
+    // the non-default stage hooks must have been read from the config.
+    AssertEquals('out_indices[0]', 2, Config.OutIndices[0]);
+    AssertEquals('out_indices[1]', 3, Config.OutIndices[1]);
+    AssertEquals('out_indices[2]', 5, Config.OutIndices[2]);
+    AssertEquals('out_indices[3]', 6, Config.OutIndices[3]);
+    RefJson.LoadFromFile(FixturePath('tiny_depth_anything_v2_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertTrue('cases present', CasesArr <> nil);
+    for CaseCnt := 0 to CasesArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(CasesArr.Items[CaseCnt]);
+      InArr := TJSONArray(CaseObj.Find('input'));
+      OutArr := TJSONArray(CaseObj.Find('output'));
+      GW := CaseObj.Get('out_grid_w', 0);
+      GH := CaseObj.Get('out_grid_h', 0);
+      Img.ReSize(W, H, NumCh);
+      for yy := 0 to H - 1 do
+        for x := 0 to W - 1 do
+          for c := 0 to NumCh - 1 do
+          begin
+            FlatIdx := (yy * W + x) * NumCh + c;
+            Img.FData[(yy * W + x) * NumCh + c] := InArr.Items[FlatIdx].AsFloat;
+          end;
+      NN.Compute(Img);
+      Output := NN.GetLastLayer().Output;
+      AssertEquals('depth grid w', GW, Output.SizeX);
+      AssertEquals('depth grid h', GH, Output.SizeY);
+      AssertEquals('depth channels', 1, Output.Depth);
+      for yy := 0 to GH - 1 do
+        for x := 0 to GW - 1 do
+        begin
+          FlatIdx := yy * GW + x;
+          RefVal := OutArr.Items[FlatIdx].AsFloat;
+          GotVal := Output.FData[(yy * GW + x)];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+    end;
+    AssertTrue('Depth Anything V2: max |diff| = ' + FloatToStr(MaxDiff) +
       ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     RefRoot.Free;

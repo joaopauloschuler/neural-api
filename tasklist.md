@@ -280,15 +280,27 @@ rather than acted on.
       prompt encoder + two-source TNNetCrossAttention. examples/SAM2Segment
       (point/box prompt on one frame, then carry the mask across a short clip).
 
-- [ ] Depth Anything V2 monocular relative-depth importer
+- [X] Depth Anything V2 monocular relative-depth importer
       (`BuildDepthAnythingV2FromSafeTensors[Ex]`, depth_anything model_type,
-      e.g. depth-anything/Depth-Anything-V2-Small-hf). The config block already
-      sits as a comment near neuralpretrained.pas:10722 but there is no Build
-      function: wire the landed BuildDINOv2 ViT backbone (S/B/L) as the feature
-      extractor into the landed DPT reassemble + fusion head (the DPTConfig
-      neck/head already exist), reading the 4 selected hidden-state indices.
-      Pico-fixture parity + an examples/DepthAnythingV2 (image -> normalized
-      depth map -> PPM) demo distinct from the existing DPT DepthEstimation one.
+      e.g. depth-anything/Depth-Anything-V2-Small-hf). DONE: the named entry
+      points (Reader / FileName+Config / FileName+out-Config overloads) assert
+      model_type "depth_anything" and delegate to the landed BuildDPT, which
+      already wires the BuildDINOv2 ViT backbone into the DPT reassemble+fusion
+      neck + 3-conv depth head. NEW: TDPTConfig.OutIndices + ReadDPTOutIndices
+      read backbone_config.out_indices (1-based stageK = encoder block K-1;
+      out_features "stage{K}" fallback; default last-4 [N-3..N]); the builder now
+      taps the SELECTED blocks (was hardcoded last-4). Pico fixture
+      tests/fixtures/tiny_depth_anything_v2.* hooks NON-last-4 stages
+      out_indices=[2,3,5,6] to exercise the wiring; TestDepthAnythingV2Parity
+      max|diff|<1e-4 vs transformers float64 DepthAnythingForDepthEstimation
+      (oracle); generator tools/make_pico_depthanythingv2_fixture.py. Example
+      examples/DepthAnythingV2 writes a normalized PGM(P5)+color PPM(P6) depth
+      image (distinct from the ASCII-ramp DepthEstimation DPT demo), pico smoke
+      default + optional real-checkpoint argv path.
+      Follow-ups: real-checkpoint parity not run (no weights downloaded);
+      metric-depth Depth-Anything-V2 (indoor/outdoor, depth_estimation_type
+      "metric") untested on a real ckpt; register-token / SwiGLU DINOv2 backbones
+      still rejected by BuildDPT.
 
 - [ ] ResNet importer follow-ups (BuildResNetFromSafeTensors[Ex] LANDED, commit
       317a19c: torchvision resnet18/50 state_dict, conv-BN fold at load, config
