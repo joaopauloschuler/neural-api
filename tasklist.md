@@ -1619,50 +1619,6 @@ rather than acted on.
       Real value: a current state-of-the-art open text-to-image generator runnable as a
       single native binary, reusing the diffusion + VAE + Qwen-VL infrastructure already
       in the repo.
-- [X] MaxViT image-classification backbone importer (`BuildMaxViTFromSafeTensors[Ex]`,
-      timm `maxvit_*` / `coatnet_*`, e.g. timm/maxvit_tiny_tf_224). Tu et al. 2022
-      (*MaxViT: Multi-Axis Vision Transformer*): a stem + 4 stages, each MaxViT block
-      being MBConv (depthwise-separable + SE, all landed layers) followed by **block
-      attention** (window-local self-attention, the landed sliding-window SDPA path) and
-      **grid attention** (dilated/strided global self-attention over a sparse grid — the
-      same windowed-SDPA layer applied on a transposed/grid-gathered token layout). The
-      only genuinely new wiring is the grid-gather/scatter token reshape feeding the
-      landed attention layer + relative-position bias; everything else (MBConv, SE,
-      LayerNorm, MLP) is drop-in. Pico fixture + `TestMaxViTLogitParity` < 1e-4 vs a
-      float64 HF/timm forward. Real value: a strong hybrid conv+attention backbone whose
-      multi-axis (local block + sparse grid) attention is architecturally distinct from
-      the landed Swin (shifted-window) and ConvNeXt (pure-conv) backbones, adding another
-      feature extractor for the landed ImageNet eval harness.
-      DONE (v1): `BuildMaxViTFromSafeTensors[Ex]` + `ReadMaxViTConfigFromJSONFile`
-      + `TMaxViTConfig` in neuralpretrained.pas. The full MaxViT block lands as
-      pure composition of LANDED layers — conv-BN-fold stem
-      (`LoadResNetConvFoldBN`), MBConv inverted bottleneck (expand 1x1 ->
-      erf-GELU -> depthwise 3x3 -> erf-GELU -> squeeze-excite (AvgChannel ->
-      reduce conv -> GELU -> expand conv -> sigmoid -> `TNNetChannelMulByLayer`)
-      -> project 1x1, all BN folded via `LoadMobileNetDepthwiseFoldBN` /
-      `LoadMobileNetSEConv`), then BLOCK attention and GRID attention, each =
-      pre-`TNNetTokenLayerNorm` -> partition gather -> per-window per-head
-      `TNNetWindowAttention` (+ relative-position bias) -> reverse scatter ->
-      residual -> post-norm SwiGLU-free MLP, then global-pool -> norm -> Linear
-      head (timm order: pool BEFORE norm). The ONLY genuinely-new code is the
-      grid-gather/scatter PERMUTATION helper `MaxViTBuildPartition` (block:
-      local PxP windows; grid: strided `srcY=gy*sy+a, srcX=gx*sx+b` dilated
-      grid) feeding the SAME `TNNetGatherTokens` + `TNNetWindowAttention` path
-      the Swin importer uses + `MaxViTBuildRelPosIndex` / `MaxViTSetWindowBias`.
-      Parity: `tools/maxvit_tiny_fixture.py` is a SELF-CONTAINED float64 numpy
-      oracle (timm/coatnet not installed offline; MaxViT not in transformers) —
-      tiny config (image 8, stem 8x8x4, MBConv expand 8 + SE 2 -> project 6,
-      block window 4, grid 4, 2 heads, 5 labels). `TestMaxViTLogitParity`
-      asserts max|diff| < 1e-4 (achieved ~1e-3..1e-6; PASSES; intermediate
-      MBConv / block-attn / grid-attn fmaps verified to ~1e-6 during bring-up).
-      Committed fixture: `tests/fixtures/tiny_maxvit.{safetensors,_config.json,
-      _logits.json}`. DEFERRED (follow-up): multi-stage stacking (4 stages with
-      strided MBConv downsample between stages — pico is single-stage) and the
-      REAL timm `maxvit_*`/`coatnet_*` state_dict key mapping + a real-checkpoint
-      parity fixture (the pico uses clean self-descriptive keys
-      `stem.*`/`mbconv.*`/`block_attn.*`/`grid_attn.*`/`head.*`, not timm's
-      `stages.N.blocks.M.*` names); the partition/attention/SE/conv-fold core is
-      verified and reusable for that mapping.
 
 ## Layer follow-ups that fix real limitations
 
@@ -1837,48 +1793,9 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
   - [ ] TNNetTestTimeTraining / TNNetTitansMemory backward "undo" loops (interleaved
         scalar etaGrad/dEta/dTheta accumulation) — the per-token forward rank-1 writes
         are vectorized; this is the lower-value remainder.
-- [X] AVX-vectorize the elementwise transcendental hot loops (exp / tanh /
-      erf). Added `AVXExp` (8-wide AVX2 range-reduce + degree-6 minimax exp,
-      both AVX32 and AVX64 inline-asm blocks, FMA/integer-vector body gated by
-      `{$IFDEF AVX2}`, scalar `pcr_expf` remainder for the N mod 8 tail; max
-      rel err ~1e-6 vs RTL exp). Thin wrappers `TNNetVolume.VectorExp` and
-      `VectorSigmoid` (declared outside the AVXANY guard so the scalar-fallback
-      build also has them; `AVXExp` forward-declared at INTERFACE scope so the
-      generic `TVolume.PointwiseSoftMax` may call it — a generic template can't
-      reference an implementation-private symbol). Routed: `PointwiseSoftMax`
-      exp loop (clamp depth segment in place, then 8-wide AVXExp) and BOTH
-      `TNNetSwish` branches (sigmoid via VectorSigmoid; both branches share the
-      same approximation so trainable/inference builds stay consistent). Parity
-      tests added in TestNeuralLayers: `TestVectorExpScalarParity`,
-      `TestVectorSigmoidScalarParity`, `TestPointwiseSoftMaxVectorizedParity`
-      (all < 1e-4 vs scalar pcr reference, green on both scalar and `-dAVX2`
-      builds). DEFERRED (documented, partial per task guidance): `TNNetGELU`
-      tanh path, `TNNetGELUErf` exact-erf path, and the derivative-coupled
-      branches were left scalar — their forward+derivative are computed
-      interleaved per element, so a clean VectorExp route would need a scratch
-      pass; lower value than softmax/Swish. `TNNetVolume.Sigmoid` is a single-
-      scalar function used through a per-element function pointer
-      (`ApplyActivationFunctionToOutput`), so vectorizing TNNetSigmoid would
-      require restructuring the activation dispatch — also deferred. (Note: the
-      `-dAVX2` build has ONE pre-existing failure, `TestSetTrainableKeepsOutputs`,
-      verified present on clean master with `-dAVX2` and unrelated to this change
-      — FMA nondeterminism between trainable/inference builds.)
 
 ## Tests / numerical-gradient audit
 
-- [X] Shared `LayerInputAndWeightGradientCheck(layer, inputShape)` helper
-      in tests/TestNeuralNumerical.pas. Three-line tests instead of
-      copy-pasted blocks. Should handle both input and weight central-
-      difference checks with a `Tolerance` parameter (default 1e-2), and
-      promote DeMaxPoolFamilyGradientCheck's Double-precision SSE
-      accumulator into it (sum the SSE in Double; eps and tolerance stay
-      TNeuralFloat) so it can be opted into per-test. DATA POINT:
-      TNNetAdaptiveMaxPool's gradient check hit the same float32
-      subtractive-cancellation issue (a single cell carrying the whole
-      window error, num=1.2588 vs ana=1.2709) and had to be loosened to
-      tol 0.02 with an in-code comment — verified NOT a layer bug
-      (double-precision central difference matches analytic exactly); a
-      strong candidate to convert once this helper lands.
 - [ ] Property-based gradient harness v0: randomize input shape (keeping
       layer type fixed) for the 6 most recently landed layers. Catches
       shape-edge bugs hand-written tests miss.
