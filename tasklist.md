@@ -240,18 +240,34 @@ rather than acted on.
       `examples/BackgroundRemoval` cutting a subject out of a tiny CPU image
       (sigmoid mask -> RGBA composite).
 
-- [ ] SDXL conditioning support for the landed SD UNet importer
-      (`BuildSDUNetFromSafeTensors`). The current importer scopes to SD-1.x/2.x
-      UNets; the SDXL UNet additionally feeds a pooled CLIP text-embedding plus a
-      Fourier-encoded `time_ids` vector (original size / crop coords / target
-      size) through an `add_embedding` MLP that is SUMMED into the timestep
-      embedding, uses the dual text-encoder cross-attention width (2048), and the
-      SDXL block layout (no self/cross-attn at the highest resolution, 2/10
-      transformer-depth at the lower ones). Add the addition-embedding path + the
-      wider cross-attn + the SDXL down/up block schedule behind a config flag so
-      a `stabilityai/stable-diffusion-xl-base-1.0` UNet loads on the same code
-      path; scope a pico parity fixture like the SD-1.x one. (Noted as a
-      deferred follow-up next to the landed IP-Adapter wiring.)
+- [X] SDXL conditioning support for the landed SD UNet importer
+      (`BuildSDUNetFromSafeTensors`). The `add_embedding` micro-conditioning path
+      (addition_embed_type=="text_time") is now wired behind a config flag,
+      default OFF so SD-1.x/2.x stays BIT-IDENTICAL (TestSDUNetParity /
+      TestSDUNetLinearProjParity unchanged). TSDUNetConfig gains UseAddEmbedding,
+      AdditionTimeEmbedDim, AdditionEmbedTextDim, AddEmbedsInputDim (parsed from
+      addition_embed_type / addition_time_embed_dim /
+      projection_class_embeddings_input_dim; reported in SDUNetConfigToString). On:
+      the importer adds a 4th TNNetInput carrying add_embeds and an in-net
+      add_embedding MLP (PointwiseConvLinear -> SiLU -> PointwiseConvLinear ->
+      TimeEmbedDim) whose output is TNNetSum'd into the timestep embedding before
+      the down/mid/up ResNet blocks. New driver SDUNetDenoiseSDXL(Latent, EncStates,
+      PooledText, t, TimeIds[6], Noise) expands the 6-vector time_ids on the host
+      with the SAME sinusoidal projection as the diffusion timestep
+      (SDUNetFillAddEmbeds, diffusers [cos|sin] order), concatenates
+      [pooled_text | time_ids_emb] into the add_embeds input. Control/adapter skip
+      inputs shift via SDUNetSkipInputBase (3 -> 4 when add_embedding on). New pico
+      fixture tools/sd_unet_sdxl_tiny_fixture.py (time_embed_dim 32,
+      addition_time_embed_dim 8, pooled 12) + TestSDUNetSDXLParity match the numpy
+      float64 oracle < 1e-4. Full suite 2393 tests, 0 failures.
+    - [ ] SDXL residual: real stabilityai/stable-diffusion-xl-base-1.0 checkpoint
+          parity still deferred (only the pico oracle is verified). The 2048 cross
+          width is already just CrossAttentionDim, and the highest-res "no attn"
+          block layout is handled by down_block_types=DownBlock2D (DownHasAttn=false
+          skips the Transformer2DModel) — transformer_layers_per_block list (e.g.
+          [1,2,10]) already supported; no depth=0 special case needed. The dual
+          text-encoder concatenation lives in the (still-deferred) SDXL pipeline
+          driver, not the UNet importer.
 - [ ] Hunyuan-DiT bilingual text-to-image importer
       (`BuildHunyuanDiTFromSafeTensors[Ex]`, Tencent `Hunyuan-DiT`). A distinct
       DiT from the landed PixArt/MMDiT/Sana stacks: a cross-attention DiT
@@ -425,9 +441,13 @@ rather than acted on.
           TestSDUNetParity unchanged. New fixture tools/sd_unet_linproj_tiny_fixture.py
           + TestSDUNetLinearProjParity (use_linear_projection=true,
           transformer_layers_per_block=2) match the numpy oracle < 1e-4.
-    - [ ] add_embedding / class/time-aug conditioning (SDXL micro-conditioning),
-          and the end-to-end LatentTextToImage capstone (CLIP text -> this UNet
-          -> scheduler loop -> VAE decoder).
+    - [X] add_embedding / class/time-aug conditioning (SDXL micro-conditioning):
+          UseAddEmbedding flag + SDUNetDenoiseSDXL + add_embedding MLP summed into
+          the timestep embedding; TestSDUNetSDXLParity < 1e-4 (see the SDXL entry
+          above for full detail).
+    - [ ] the end-to-end LatentTextToImage capstone (CLIP text -> this UNet ->
+          scheduler loop -> VAE decoder), incl. the SDXL dual-text-encoder pooled
+          embedding + real-checkpoint parity.
 - [ ] Mask2Former universal-segmentation importer LANDED
       (BuildMask2FormerFromSafeTensors[Ex], model_type "mask2former";
       masked-attention decoder + per-query mask/class heads, RunMask2FormerSemantic +

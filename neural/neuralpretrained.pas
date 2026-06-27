@@ -9585,6 +9585,19 @@ type
                                               // not a 1x1 conv ([O,I,1,1])
     TransformerLayersPerBlock: array[0..7] of integer; // BasicTransformerBlocks
                                               // per Transformer2DModel, per resolution
+    // SDXL micro-conditioning (addition_embed_type=="text_time"). Default OFF so
+    // SD1.x/2.x stay BIT-IDENTICAL. When on, SDUNetDenoiseSDXL feeds a pooled CLIP
+    // text vector + a 6-vector time_ids; the importer expands time_ids with the
+    // SAME sinusoidal projection used for the diffusion timestep (add_time_proj,
+    // dim AdditionTimeEmbedDim), concatenates [text_embeds | time_ids_emb] into an
+    // add_embeds vector, runs add_embedding (Linear->SiLU->Linear -> TimeEmbedDim),
+    // and ADDS that into the timestep embedding before the ResNet blocks.
+    UseAddEmbedding: boolean;                 // addition_embed_type=="text_time"
+    AdditionTimeEmbedDim: integer;            // add_time_proj dim per time_id (256)
+    AdditionEmbedTextDim: integer;            // pooled text_embeds width (1280)
+    // add_embeds input width = AdditionEmbedTextDim + 6*AdditionTimeEmbedDim,
+    // i.e. projection_class_embeddings_input_dim (2816 for SDXL).
+    AddEmbedsInputDim: integer;
   end;
 
 function ReadSDUNetConfigFromJSONFile(const FileName: string): TSDUNetConfig;
@@ -9636,6 +9649,17 @@ function SDUNetTextStatesInput(Net: TNNet): TNNetLayer;
 // (InChannels,Grid,Grid)/(TextSeqLen,1,CrossDim) volumes.
 procedure SDUNetDenoise(Net: TNNet; const Config: TSDUNetConfig;
   Latent, EncStates: TNNetVolume; t: TNeuralFloat; Noise: TNNetVolume);
+
+// SDXL single-step denoise for a UNet built with addition_embed_type=="text_time"
+// (Config.UseAddEmbedding=true). PooledText is the (AdditionEmbedTextDim) pooled
+// CLIP text vector (text_embeds); TimeIds is the 6-vector [orig_h, orig_w,
+// crop_top, crop_left, target_h, target_w]. The host expands TimeIds with the
+// sinusoidal add_time_proj, concatenates [PooledText | time_ids_emb] into the
+// add_embeds input, and the in-net add_embedding MLP adds it into the timestep
+// embedding. Use plain SDUNetDenoise for SD1.x/2.x.
+procedure SDUNetDenoiseSDXL(Net: TNNet; const Config: TSDUNetConfig;
+  Latent, EncStates, PooledText: TNNetVolume; t: TNeuralFloat;
+  const TimeIds: array of TNeuralFloat; Noise: TNNetVolume);
 
 // Blended-diffusion (latent-space) INPAINTING: run a complete reverse trajectory
 // on the standard 4-channel SD UNet, but at EVERY step blend the KNOWN region
@@ -61450,6 +61474,35 @@ begin
           Result.TransformerLayersPerBlock[i] := AttnHeadDim;
       end;
     end;
+    // SDXL micro-conditioning: addition_embed_type=="text_time" turns on the
+    // add_embedding path (default off -> SD1.x/2.x bit-identical).
+    Result.UseAddEmbedding := false;
+    Result.AdditionTimeEmbedDim := Obj.Get('addition_time_embed_dim', 256);
+    Result.AdditionEmbedTextDim := 0;
+    Result.AddEmbedsInputDim := 0;
+    s := Obj.Get('addition_embed_type', '');
+    if s = 'text_time' then
+    begin
+      Result.UseAddEmbedding := true;
+      if (Result.AdditionTimeEmbedDim < 2) or
+         ((Result.AdditionTimeEmbedDim mod 2) <> 0) then
+        ImportError('SD UNet import: addition_time_embed_dim must be even >= 2, '
+          + 'got ' + IntToStr(Result.AdditionTimeEmbedDim) + '.');
+      // add_embeds input width = projection_class_embeddings_input_dim
+      // (text_embeds width + 6*addition_time_embed_dim). The pooled-text width
+      // is then the remainder after subtracting the 6 time_ids projections.
+      Result.AddEmbedsInputDim := Obj.Get('projection_class_embeddings_input_dim', 0);
+      if Result.AddEmbedsInputDim <= 6 * Result.AdditionTimeEmbedDim then
+        ImportError('SD UNet import: projection_class_embeddings_input_dim=' +
+          IntToStr(Result.AddEmbedsInputDim) + ' must exceed 6*' +
+          'addition_time_embed_dim=' + IntToStr(6 * Result.AdditionTimeEmbedDim) +
+          ' (SDXL text_time).');
+      Result.AdditionEmbedTextDim :=
+        Result.AddEmbedsInputDim - 6 * Result.AdditionTimeEmbedDim;
+    end
+    else if (s <> '') then
+      ImportError('SD UNet import: addition_embed_type "' + s +
+        '" unsupported (only "text_time" / absent).');
   finally
     Root.Free;
     JsonText.Free;
@@ -61483,6 +61536,11 @@ begin
     Result := Result + IntToStr(Config.TransformerLayersPerBlock[i]);
   end;
   Result := Result + ']';
+  if Config.UseAddEmbedding then
+    Result := Result + ', add_embed(text_time): time_proj=' +
+      IntToStr(Config.AdditionTimeEmbedDim) + ', text=' +
+      IntToStr(Config.AdditionEmbedTextDim) + ', add_embeds_in=' +
+      IntToStr(Config.AddEmbedsInputDim);
 end;
 
 type
@@ -61791,6 +61849,7 @@ var
   AdapterTop: integer;
   LatentInput, TInput, TextInput, ConvIn, TSin, TFc0, TSilu, TFc2: TNNetLayer;
   TimeCond, NormOut, ConvOut, HLayer: TNNetLayer;
+  AddEmbInput, AddFc0, AddSilu, AddFc2: TNNetLayer;
   WVol: TNNetVolume;
   SwapTmp: TNeuralFloat;
   d0, half, halfM1, n, nM1, NumResnet, i, j, ci, b: integer;
@@ -61859,6 +61918,28 @@ begin
     // input2: text encoder states (TextSeqLen,1,CrossDim).
     TextInput := NN.AddLayer( TNNetInput.Create(Config.TextSeqLen, 1,
       Config.CrossAttentionDim) );
+
+    // SDXL micro-conditioning (addition_embed_type=="text_time"): input3 carries
+    // the precomputed add_embeds vector [pooled_text(AdditionEmbedTextDim) |
+    // time_ids_emb(6*AdditionTimeEmbedDim)] (the sinusoidal time_ids expansion is
+    // done on the HOST in SDUNetDenoiseSDXL, mirroring TNNetSinusoidalTimeEmbedding
+    // with diffusers' [cos|sin] order). add_embedding = Linear->SiLU->Linear maps
+    // it to TimeEmbedDim, then it is ADDED into the timestep embedding so the
+    // down/mid/up ResNet blocks see emb = emb + aug_emb. When this input exists it
+    // sits at TNNetInput #3, so the control/adapter skip inputs shift to #4+.
+    AddEmbInput := nil; AddFc0 := nil; AddSilu := nil; AddFc2 := nil;
+    if Config.UseAddEmbedding then
+    begin
+      AddEmbInput := NN.AddLayer(
+        TNNetInput.Create(1, 1, Config.AddEmbedsInputDim) );
+      AddFc0 := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.TimeEmbedDim).SetTrainable(pTrainable) );
+      AddSilu := NN.AddLayer( TNNetSiLU.Create() );
+      AddFc2 := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.TimeEmbedDim).SetTrainable(pTrainable) );
+      // emb = time_emb + aug_emb (FiLM-free additive injection).
+      TimeCond := NN.AddLayerAfter( [TNNetSum.Create([TFc2, AddFc2])], AddFc2 );
+    end;
 
     if not pTrainable then NN.SetTrainable();
 
@@ -62002,6 +62083,19 @@ begin
       Config.TimeEmbedDim, Config.TimeEmbedDim, 0, -1, 0,
       'time_embedding.linear_2.bias');
 
+    // SDXL add_embedding MLP. Both layers are plain nn.Linear -- NO column swap:
+    // the sinusoidal time_ids expansion (and its [cos|sin] order) is done on the
+    // host into add_embeds, so the linear_1 input layout already matches diffusers.
+    if Config.UseAddEmbedding then
+    begin
+      LoadLlamaLinearWeights(Reader, AddFc0, 'add_embedding.linear_1.weight',
+        Config.AddEmbedsInputDim, Config.TimeEmbedDim, 0, -1, 0,
+        'add_embedding.linear_1.bias');
+      LoadLlamaLinearWeights(Reader, AddFc2, 'add_embedding.linear_2.weight',
+        Config.TimeEmbedDim, Config.TimeEmbedDim, 0, -1, 0,
+        'add_embedding.linear_2.bias');
+    end;
+
     // down blocks.
     InCh := d0;
     for i := 0 to nM1 do
@@ -62115,6 +62209,66 @@ begin
   Result := SDUNetNthInput(Net, 1);
 end;
 
+// First TNNetInput index of the control/adapter skip inputs. They follow the
+// latent(#0)/timestep(#1)/text(#2) inputs, and -- when SDXL add_embedding is on
+// -- the add_embeds input (#3). So the base is 3 (or 4 with add_embedding).
+function SDUNetSkipInputBase(const Config: TSDUNetConfig): integer;
+begin
+  Result := 3;
+  if Config.UseAddEmbedding then Inc(Result);
+end;
+
+// Fills the SDXL add_embeds input (#3) for an add_embedding-enabled UNet:
+// expands the 6-vector time_ids with the SAME sinusoidal projection diffusers'
+// add_time_proj uses (Timesteps(addition_time_embed_dim), flip_sin_to_cos=True,
+// downscale_freq_shift=0 -> [cos|sin] per id), concatenates [pooled_text |
+// time_ids_emb] in that order, and copies it into the input. The host mirrors
+// TNNetSinusoidalTimeEmbedding's frequency table exactly (freq[i] =
+// exp(-ln(10000)*i/half)); the cos-first order matches diffusers.
+procedure SDUNetFillAddEmbeds(Net: TNNet; const Config: TSDUNetConfig;
+  PooledText: TNNetVolume; const TimeIds: array of TNeuralFloat);
+var
+  AddIn: TNNetLayer;
+  Vec: TNNetVolume;
+  half, halfM1, i, k, base: integer;
+  LogMax, freq, angle: TNeuralFloat;
+begin
+  if not Config.UseAddEmbedding then
+    ImportError('SDUNetFillAddEmbeds: this UNet was not built with add_embedding.');
+  if Length(TimeIds) <> 6 then
+    ImportError('SDUNetFillAddEmbeds: time_ids must have exactly 6 entries, got ' +
+      IntToStr(Length(TimeIds)) + '.');
+  if PooledText.Size <> Config.AdditionEmbedTextDim then
+    ImportError('SDUNetFillAddEmbeds: pooled text size ' +
+      IntToStr(PooledText.Size) + ' <> AdditionEmbedTextDim ' +
+      IntToStr(Config.AdditionEmbedTextDim) + '.');
+  AddIn := SDUNetNthInput(Net, 3);
+  Vec := AddIn.Output;
+  if Vec.Size <> Config.AddEmbedsInputDim then
+    ImportError('SDUNetFillAddEmbeds: add_embeds input size ' +
+      IntToStr(Vec.Size) + ' <> AddEmbedsInputDim ' +
+      IntToStr(Config.AddEmbedsInputDim) + '.');
+  // [ pooled_text | time_ids_emb ] -- pooled first (diffusers cat order).
+  for i := 0 to Config.AdditionEmbedTextDim - 1 do
+    Vec.FData[i] := PooledText.FData[i];
+  half := Config.AdditionTimeEmbedDim div 2;
+  halfM1 := half - 1;
+  LogMax := Ln(10000.0);
+  base := Config.AdditionEmbedTextDim;
+  for k := 0 to 5 do
+  begin
+    for i := 0 to halfM1 do
+    begin
+      freq := Exp(-LogMax * i / half);
+      angle := TimeIds[k] * freq;
+      // diffusers flip_sin_to_cos=True -> [cos | sin].
+      Vec.FData[base + i] := Cos(angle);
+      Vec.FData[base + half + i] := Sin(angle);
+    end;
+    base := base + Config.AdditionTimeEmbedDim;
+  end;
+end;
+
 function SDUNetTextStatesInput(Net: TNNet): TNNetLayer;
 begin
   Result := SDUNetNthInput(Net, 2);
@@ -62132,6 +62286,27 @@ begin
       IntToStr(EncStates.Size) + ' <> the net text input size ' +
       IntToStr(TextIn.Output.Size) + ' (TextSeqLen/CrossDim mismatch?).');
   TextIn.Output.Copy(EncStates);
+  Net.Compute(Latent);
+  Net.GetOutput(Noise);
+end;
+
+procedure SDUNetDenoiseSDXL(Net: TNNet; const Config: TSDUNetConfig;
+  Latent, EncStates, PooledText: TNNetVolume; t: TNeuralFloat;
+  const TimeIds: array of TNeuralFloat; Noise: TNNetVolume);
+var
+  TextIn: TNNetLayer;
+begin
+  if not Config.UseAddEmbedding then
+    ImportError('SDUNetDenoiseSDXL: Config.UseAddEmbedding is false (use ' +
+      'SDUNetDenoise for SD1.x/2.x, or build with addition_embed_type="text_time").');
+  SDUNetTimestepInput(Net).Output.FData[0] := t;
+  TextIn := SDUNetTextStatesInput(Net);
+  if EncStates.Size <> TextIn.Output.Size then
+    ImportError('SDUNetDenoiseSDXL: encoder_hidden_states size ' +
+      IntToStr(EncStates.Size) + ' <> the net text input size ' +
+      IntToStr(TextIn.Output.Size) + ' (TextSeqLen/CrossDim mismatch?).');
+  TextIn.Output.Copy(EncStates);
+  SDUNetFillAddEmbeds(Net, Config, PooledText, TimeIds);
   Net.Compute(Latent);
   Net.GetOutput(Noise);
 end;
@@ -62212,7 +62387,7 @@ begin
   // conv_in, per down resnet, per downsampler) then the mid input LAST.
   for i := 0 to DownCnt - 1 do
   begin
-    InputIdx := 3 + i;
+    InputIdx := SDUNetSkipInputBase(Config) + i;
     CtrlLayer := SDUNetNthInput(Net, InputIdx);
     if DownResiduals[i].Size <> CtrlLayer.Output.Size then
       ImportError('SDUNetDenoiseWithControl: down residual ' + IntToStr(i) +
@@ -62220,7 +62395,7 @@ begin
         IntToStr(InputIdx) + ' size ' + IntToStr(CtrlLayer.Output.Size) + '.');
     CtrlLayer.Output.Copy(DownResiduals[i]);
   end;
-  CtrlLayer := SDUNetNthInput(Net, 3 + DownCnt); // mid control input (last)
+  CtrlLayer := SDUNetNthInput(Net, SDUNetSkipInputBase(Config) + DownCnt); // mid control input (last)
   if MidResidual.Size <> CtrlLayer.Output.Size then
     ImportError('SDUNetDenoiseWithControl: mid residual size ' +
       IntToStr(MidResidual.Size) + ' <> mid control input size ' +
@@ -62258,7 +62433,7 @@ begin
   // Adapter inputs are TNNetInputs #3.. : one per down block, in build order.
   for i := 0 to Cnt - 1 do
   begin
-    InputIdx := 3 + i;
+    InputIdx := SDUNetSkipInputBase(Config) + i;
     AdpLayer := SDUNetNthInput(Net, InputIdx);
     if AdapterFeatures[i].Size <> AdpLayer.Output.Size then
       ImportError('SDUNetDenoiseWithAdapter: adapter feature ' + IntToStr(i) +

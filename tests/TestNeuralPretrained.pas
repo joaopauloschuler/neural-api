@@ -537,6 +537,7 @@ type
     procedure TestSDUNetConfigFromJSONFile;
     procedure TestSDUNetParity;
     procedure TestSDUNetLinearProjParity;
+    procedure TestSDUNetSDXLParity;
     procedure TestDiffusionInpaintSmoke;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
@@ -21471,6 +21472,116 @@ begin
     RefRoot.Free;
     LatentInput.Free;
     EncStates.Free;
+    Noise.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// SDXL micro-conditioning parity: addition_embed_type=="text_time" turns on the
+// add_embedding path -- time_ids (6-vector) are sinusoidally projected, concat'd
+// with the pooled CLIP text embedding into add_embeds, mapped by a 2-layer MLP
+// (Linear->SiLU->Linear) and ADDED into the timestep embedding before the ResNet
+// blocks. The oracle in tools/sd_unet_sdxl_tiny_fixture.py mirrors that path.
+// Verifies the config knobs parse (UseAddEmbedding / AdditionTimeEmbedDim /
+// AdditionEmbedTextDim / AddEmbedsInputDim), the extra add_embeds input exists,
+// and SDUNetDenoiseSDXL's predicted noise matches the numpy float64 oracle (<1e-4).
+procedure TTestNeuralPretrained.TestSDUNetSDXLParity;
+var
+  NN: TNNet;
+  Config: TSDUNetConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Latent, ChanArr, RowArr, NoiseArr, EncArr, EncRow, TidArr, PoolArr: TJSONArray;
+  LatentInput, EncStates, PooledText, Noise: TNNetVolume;
+  t: double;
+  TimeIds: array[0..5] of TNeuralFloat;
+  Grid, ChanCnt, YCnt, XCnt, SCnt, DCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildSDUNetFromSafeTensors(
+    FixturePath('tiny_sd_unet_sdxl.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_sd_unet_sdxl_config.json'));
+  RefJson := TStringList.Create;
+  LatentInput := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create;
+  PooledText := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertTrue('addition_embed_type parsed', Config.UseAddEmbedding);
+    AssertEquals('addition_time_embed_dim', 8, Config.AdditionTimeEmbedDim);
+    AssertEquals('pooled text dim', 12, Config.AdditionEmbedTextDim);
+    AssertEquals('add_embeds input dim', 60, Config.AddEmbedsInputDim);
+    Grid := Config.LatentGrid;
+    AssertEquals('latent grid', Grid, NN.Layers[0].Output.SizeX);
+    RefJson.LoadFromFile(FixturePath('tiny_sd_unet_sdxl_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Latent := TJSONArray(TJSONObject(RefRoot).Find('latent'));
+    NoiseArr := TJSONArray(TJSONObject(RefRoot).Find('noise'));
+    EncArr := TJSONArray(TJSONObject(RefRoot).Find('encoder_hidden_states'));
+    TidArr := TJSONArray(TJSONObject(RefRoot).Find('time_ids'));
+    PoolArr := TJSONArray(TJSONObject(RefRoot).Find('pooled_text'));
+    t := TJSONObject(RefRoot).Get('timestep', 0.0);
+    AssertTrue('latent present', Latent <> nil);
+    AssertEquals('output grid', Grid, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output channels', Config.OutChannels,
+      NN.GetLastLayer().Output.Depth);
+
+    LatentInput.ReSize(Grid, Grid, Config.InChannels);
+    for ChanCnt := 0 to Config.InChannels - 1 do
+    begin
+      RowArr := TJSONArray(Latent.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+          LatentInput.FData[(YCnt * Grid + XCnt) * Config.InChannels + ChanCnt]
+            := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    EncStates.ReSize(Config.TextSeqLen, 1, Config.CrossAttentionDim);
+    for SCnt := 0 to Config.TextSeqLen - 1 do
+    begin
+      EncRow := TJSONArray(EncArr.Items[SCnt]);
+      for DCnt := 0 to Config.CrossAttentionDim - 1 do
+        EncStates.FData[SCnt * Config.CrossAttentionDim + DCnt] :=
+          EncRow.Items[DCnt].AsFloat;
+    end;
+    PooledText.ReSize(1, 1, Config.AdditionEmbedTextDim);
+    for DCnt := 0 to Config.AdditionEmbedTextDim - 1 do
+      PooledText.FData[DCnt] := PoolArr.Items[DCnt].AsFloat;
+    for DCnt := 0 to 5 do TimeIds[DCnt] := TidArr.Items[DCnt].AsFloat;
+
+    SDUNetDenoiseSDXL(NN, Config, LatentInput, EncStates, PooledText, t,
+      TimeIds, Noise);
+
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.OutChannels - 1 do
+    begin
+      RowArr := TJSONArray(NoiseArr.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+        begin
+          RefVal := ChanArr.Items[XCnt].AsFloat;
+          GotVal := Noise.FData[(YCnt * Grid + XCnt) * Config.OutChannels +
+            ChanCnt];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('predicted noise: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    LatentInput.Free;
+    EncStates.Free;
+    PooledText.Free;
     Noise.Free;
     RefJson.Free;
     NN.Free;
