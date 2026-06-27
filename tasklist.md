@@ -497,6 +497,35 @@ rather than acted on.
       so removing the redundant copies should lift tokens/sec materially. Guard
       everything behind the existing `FShouldOpenCL`, keep the host round-trip as the
       fallback, and pin parity with the SDPAOpenCLParity-style exact-vs-CPU test.
+- [ ] OpenCL offload of `TNNetDeconvolution.Compute` (transposed convolution).
+      Unlike `TNNetConvolution`, the deconv forward overrides Compute with its own
+      overlap-add scatter and does NOT route through the conv OpenCL GEMM — the
+      inner loop is already AVX (depth-axis `TNNetVolume.DotProduct` over `InD`
+      contiguous floats), but the whole (input-cell × kernel-tap × output-channel)
+      scatter still runs on the CPU. This is the generative-decoder hot path:
+      transposed conv is the upsampling primitive in the SD VAE decoder, GAN
+      generators (VisualGAN/StyleGAN2/CycleGAN), and learned super-resolution.
+      Scope: reformulate the overlap-add scatter as a single im2col-style GEMM
+      (the same trick the landed DeformableConv / GroupConvP4 spatial-im2col
+      offload uses — commit c6a6f91), upload the prev-output column matrix +
+      stacked neuron weights to `cl_mem`, run the existing `myGEMM`/`cai_dot_product`
+      kernel, then scatter-add the GEMM result back into `FOutputRaw` (the only
+      part that must stay on host, or fold the stride/pad addressing into the
+      kernel). Guard behind `FShouldOpenCL`, keep the AVX scatter as the fallback,
+      and pin an SDPAOpenCLParity-style exact-vs-CPU test on a fixed deconv fixture.
+- [ ] AVX-vectorize `TNNetBilinearUpsample.Compute`. The bilinear blend's innermost
+      loop runs over the depth channel `c` (`FOutput[ox,oy,c] := (1-wy)*((1-wx)*a +
+      wx*b) + wy*(...)`), and the four sampled source columns `Prev[ix0,iy0,:]`,
+      `Prev[ix1,iy0,:]`, `Prev[ix0,iy1,:]`, `Prev[ix1,iy1,:]` are each `Depth`
+      contiguous floats — the depth-axis-contiguous rule that makes a layer
+      AVX-friendly. Replace the scalar per-channel loop with a four-input weighted
+      `MulAdd` over the depth vector (reuse the shared AVX MulAdd helper the recent
+      vectorization batch standardized on), computing the `(1-wx)/wx/(1-wy)/wy`
+      bilinear weights once per output pixel. Real value: bilinear upsampling is the
+      decoder-side resize in segmentation heads (UNetSegmentation, SemanticSegmentation),
+      super-resolution, and feature-pyramid necks, where it currently runs scalar.
+      Add it to the AVX-vectorization-sweep coverage note and pin an exact-vs-scalar
+      forward parity test (bit-identical on the scalar build, epsilon on `-dAVX2`).
 - [ ] Tokenizer follow-ups for neuralhftokenizer.pas:
       (b) DONE — raw SentencePiece .model protobuf path landed
       (LoadSentencePieceModel; hand-decoded ModelProto wire format, no
@@ -1326,6 +1355,71 @@ rather than acted on.
       document. Real value: first document-AI (forms, receipts, scientific-PDF
       transcription) importer; reuses Swin + mBART that already ship. Pico-fixture
       cross-entropy parity < 1e-4 vs a float64 HF VisionEncoderDecoderModel.
+
+- [ ] Stable Diffusion img2img + inpainting pipelines. The landed SD path
+      (BuildVaeDecoderFromSafeTensors + BuildSDUNetFromSafeTensors + SDUNetDenoise +
+      the neuraldiffusion sampler zoo) does text-to-image only — it starts denoising
+      from pure Gaussian latents. The two highest-value missing modes reuse ALL of
+      that and add only the latent setup/blend: (a) img2img — VAE-ENCODE an init
+      image to latents (the VAE decoder importer's encoder twin is the gap; add
+      BuildVaeEncoderFromSafeTensors for the down-blocks + the
+      `mean,logvar`->reparameterize sampling head), then start the existing sampler
+      at timestep `int(strength * num_steps)` with noise added to those latents
+      (`scheduler.add_noise` — already have the alphas_cumprod schedule); (b)
+      inpainting — keep img2img's noised init but at every denoise step BLEND the
+      known region back in (`latents = mask*denoised + (1-mask)*noised_known`), and
+      support the 9-channel inpaint UNet (4 latent + 1 mask + 4 masked-latent in
+      `conv_in`) by widening the importer's first-conv loader. Real value: img2img
+      and inpainting are the two most-used SD modes after txt2img and unlock the
+      ImageToImage/Inpainting example stubs. Pico parity: VAE-encode round-trip <
+      1e-4 vs a float64 HF AutoencoderKL.encode, and a fixed-seed img2img latent
+      trajectory matching diffusers `StableDiffusionImg2ImgPipeline` step-for-step.
+- [ ] Swin Transformer V2 backbone importer (BuildSwinV2FromSafeTensors[Ex],
+      model_type "swinv2", e.g. microsoft/swinv2-tiny-patch4-window8-256). DISTINCT
+      from the landed Swin / SwinIR window-attention blocks, which use additive
+      learned relative-position-bias tables and plain scaled-dot-product: SwinV2
+      swaps in (1) COSINE attention with a per-head learnable, clamped logit-scale
+      temperature (`logit_scale = clamp(scale, max=log(1/0.01))`), and (2) a
+      log-spaced CONTINUOUS relative position bias produced by a tiny 2-layer MLP
+      over the (log-scaled) relative coordinate grid instead of a lookup table,
+      plus post-norm residual ordering and a patch-merging change. Genuinely-new
+      code: the cosine-similarity attention variant (avCosineSimilarity already
+      exists as an MHA flag — wire the clamped per-head temperature) and the
+      continuous-position-bias MLP that generates the bias grid at load time;
+      everything else reuses the landed Swin window-partition / shifted-window
+      machinery. Real value: SwinV2 is the higher-resolution, more-stable Swin used
+      as a detection/segmentation backbone and unblocks larger-window ViT necks.
+      Pico-fixture parity < 1e-4 vs a float64 HF Swinv2Model.forward.
+- [ ] MobileViT hybrid CNN+transformer backbone importer
+      (BuildMobileViTFromSafeTensors[Ex], model_type "mobilevit", e.g.
+      apple/mobilevit-small). Fills the mobile-vision-backbone gap (the landed
+      EfficientNet / MobileNetV2-style and ViT importers are pure-CNN or pure-ViT;
+      MobileViT INTERLEAVES MobileNetV2 inverted-residual conv blocks with a
+      "MobileViT block" that unfolds the feature map into non-overlapping patches,
+      runs a small transformer over the patch sequence, folds back, and fuses with
+      the input via concat+conv). New code is mostly wiring over layers that already
+      ship: the inverted-residual block (TNNetConvolution depthwise + pointwise,
+      already expressible), and the unfold/transformer/fold MobileViT block (reuse
+      TNNetReshape/SpaceToDepth for the unfold, the landed EncoderBlock for the
+      transformer, the inverse reshape for the fold). Real value: covers the
+      efficient-on-CPU hybrid family that is a natural fit for this library's
+      single-binary edge-deployment story. Pico-fixture parity < 1e-4 vs a float64
+      HF MobileViTModel.forward + a top-1 smoke on a tiny CPU image.
+- [ ] Kosmos-2 grounded vision-language importer (BuildKosmos2FromSafeTensors[Ex],
+      model_type "kosmos-2", e.g. microsoft/kosmos-2-patch14-224). DISTINCT from the
+      landed caption VLMs (LLaVA/Blip2/Florence-2 fuse image features as prepended
+      tokens for free-form text): Kosmos-2 emits GROUNDED text where phrases are
+      tied to image regions via special `<grounding>`/`<phrase>`/`<object>` tokens
+      whose `<patch_index_NNN>` ids decode to bounding boxes over the patch grid.
+      It pairs a CLIP ViT image encoder (landed BuildClipVisionTower) with a Magneto
+      transformer decoder (a Llama-ish stack with a sub-LayerNorm / scaled residual
+      variant) and an image-to-text projection. New code: the Magneto decoder block
+      (the extra normalization placement vs the landed Llama backbone) and the
+      grounding token-id <-> patch-index <-> bbox decode helper + an
+      examples/Kosmos2Ground demo that prints phrase->box pairs. Real value: first
+      grounded-captioning / phrase-localization importer, a different capability
+      from the landed open-vocabulary DETECTION and free-form caption paths.
+      Pico-fixture parity < 1e-4 vs a float64 HF Kosmos2ForConditionalGeneration.
 
 ## Layer follow-ups that fix real limitations
 
