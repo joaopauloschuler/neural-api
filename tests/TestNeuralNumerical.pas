@@ -312,6 +312,9 @@ type
     // OpenCL two-GEMM forward offload parity (vs CPU) for the non-causal global
     // TNNetLinearAttention.
     procedure LinearAttentionOpenCLParity;
+    // OpenCL all-pairs correlation GEMM forward offload parity (vs CPU/AVX) for
+    // TNNetCorrelationVolume (RAFT).
+    procedure CorrelationVolumeOpenCLParity;
     // OpenCL Winograd F(2x2,3x3) M-stage forward offload parity (vs CPU Winograd).
     procedure WinogradOpenCLParity;
     procedure TestRoIAlignForward;
@@ -59480,6 +59483,86 @@ begin
   finally
     OutCPU.Free;
     Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetCorrelationVolume (RAFT all-pairs correlation) is W^2*H^2 depth-axis dot
+// products: corr(i,j) = <f1(i),f2(j)>/sqrt(C). ComputeOpenCL maps the whole
+// volume onto a single cai_dot_product GEMM (A = f1 transposed column-major,
+// B = f2 native, contraction C) and applies the 1/sqrt(C) scale on the CPU.
+// This pins the device forward bit-close to the CPU/AVX forward on a fixed
+// bounded fixture; the only divergence is FP32 GEMM accumulation order, so a
+// tight 1e-4 gate (PoCL CPU-backed -> typically ~1e-6).
+procedure TTestNeuralNumerical.CorrelationVolumeOpenCLParity;
+{$IFDEF OpenCL}
+const
+  W = 5; H = 4; C = 12; // W*H = 20 >= csCorrVolOpenCLMinPositions (16)
+var
+  NN: TNNet;
+  F1Data, F2Data, OutCPU: TNNetVolume;
+  F1In, F2In: TNNetLayer;
+  Corr: TNNetCorrelationVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  F1Data := TNNetVolume.Create(W, H, C);
+  F2Data := TNNetVolume.Create(W, H, C);
+  OutCPU := TNNetVolume.Create();
+  try
+    F1In := NN.AddLayer(TNNetInput.Create(W, H, C, 1));        // f1 (PrevLayer)
+    F2In := NN.AddLayerAfter(TNNetInput.Create(W, H, C, 1), 0); // f2 (2nd source)
+    Corr := TNNetCorrelationVolume.Create(F2In);
+    NN.AddLayerAfter(Corr, F1In); // re-point Corr's prev to f1
+
+    // Bounded feature maps so the dot products stay O(1) and the 1e-4 absolute
+    // gate is meaningful.
+    for i := 0 to F1Data.Size - 1 do
+      F1Data.Raw[i] := 0.5 * Sin(i * 0.3) + 0.2 * Cos(i * 0.11);
+    for i := 0 to F2Data.Size - 1 do
+      F2Data.Raw[i] := 0.4 * Cos(i * 0.27) - 0.3 * Sin(i * 0.07);
+
+    // CPU/AVX forward (OpenCL OFF).
+    F1In.Output.Copy(F1Data);
+    F2In.Output.Copy(F2Data);
+    NN.Compute(F1In.Output);
+    OutCPU.Copy(Corr.Output);
+
+    // Device forward (all-pairs GEMM offloaded).
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    AssertTrue('CorrelationVolume OpenCL armed', Corr.ShouldOpenCL);
+    F1In.Output.Copy(F1Data);
+    F2In.Output.Copy(F2Data);
+    NN.Compute(F1In.Output);
+
+    AssertEquals('output size match', OutCPU.Size, Corr.Output.Size);
+    MaxDiff := 0;
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - Corr.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  CorrelationVolume OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('CorrelationVolume OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    F2Data.Free;
+    F1Data.Free;
     NN.Free;
   end;
 end;

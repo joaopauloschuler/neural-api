@@ -3590,6 +3590,22 @@ type
   TNNetCorrelationVolume = class(TNNetLayer)
   private
     FF2Layer: TNNetLayer; // second feature map f2
+    {$IFDEF OpenCL}
+    // OpenCL forward offload of the W^2*H^2 depth-axis dot products onto the
+    // shared cai_dot_product kernel (inherited FDotCL). The whole correlation
+    // volume is a single GEMM: corr(a,b) = sum_c f1[a,c]*f2[b,c] over source
+    // pixel a in [0,N) and target pixel b in [0,N), N = W*H, contraction C.
+    //  - A operand = f1 transposed to column-major FA1ColBuf[c*N + a] (the
+    //    kernel reads As[a + i*FNumAs] = As[a + c*N], i.e. A is (C x N)).
+    //  - B operand = f2 passed DIRECTLY: its native depth-contiguous layout
+    //    FData[b*C + c] is exactly the kernel's contiguous B read Bs[b*C + c].
+    //  - Result lands as FCorrBuf[b*N + a] = corr(a,b); transposed + scaled by
+    //    1/sqrt(C) into FOutput native [a*N + b] (= Store(ix,iy,jy*W+jx)).
+    // Coded by Claude (AI).
+    FA1ColBuf: TNNetVolume;
+    FCorrBuf: TNNetVolume;
+    procedure ComputeOpenCL();
+    {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(F2Source: TNNetLayer); overload;
@@ -3597,6 +3613,11 @@ type
     function SaveStructureToString(): string; override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
+    {$IFDEF OpenCL}
+    // Allocates the shared dot-product kernel (inherited FDotCL) plus the
+    // transpose buffers, then flags this layer to offload its forward GEMM.
+    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    {$ENDIF}
     property F2Source: TNNetLayer read FF2Layer;
   end;
 
@@ -29167,8 +29188,72 @@ end;
 
 destructor TNNetCorrelationVolume.Destroy();
 begin
+  {$IFDEF OpenCL}
+  // FDotCL is freed by the inherited TNNetLayer.Destroy; free only our buffers.
+  if Assigned(FA1ColBuf) then FA1ColBuf.Free;
+  if Assigned(FCorrBuf) then FCorrBuf.Free;
+  {$ENDIF}
   inherited Destroy();
 end;
+
+{$IFDEF OpenCL}
+procedure TNNetCorrelationVolume.EnableOpenCL(
+  DotProductKernel: TDotProductKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL, FDotProductKernel
+  if not Assigned(FDotCL) then
+  begin
+    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL.HideMessages();
+  end;
+  if not Assigned(FA1ColBuf) then FA1ColBuf := TNNetVolume.Create();
+  if not Assigned(FCorrBuf) then FCorrBuf := TNNetVolume.Create();
+  FShouldOpenCL := true;
+end;
+
+// Forward: the single all-pairs GEMM on the device, the 1/sqrt(C) scale on the
+// CPU. Mirrors the CPU/AVX Compute() math exactly (same DotProduct contraction,
+// same invSqrtC). Coded by Claude (AI).
+procedure TNNetCorrelationVolume.ComputeOpenCL();
+var
+  StartTime: double;
+  W, H, Chan, N, NM1, ChanM1, a, b, ch: integer;
+  f1, f2: TNNetVolume;
+  invSqrtC: TNeuralFloat;
+begin
+  StartTime := Now();
+  f1 := FPrevLayer.FOutput;
+  f2 := FF2Layer.FOutput;
+  W := f1.SizeX; H := f1.SizeY; Chan := f1.Depth;
+  N := W * H;
+  NM1 := N - 1; ChanM1 := Chan - 1;
+  if Chan > 0 then invSqrtC := 1.0 / Sqrt(Chan) else invSqrtC := 1.0;
+
+  // 1) Transpose f1 into column-major FA1ColBuf[c*N + a] (the kernel's A read
+  //    As[a + c*N]). f2's native depth-contiguous FData[b*C + c] is already the
+  //    kernel's contiguous B read, so f2 is passed straight in as B.
+  FA1ColBuf.ReSize(Chan * N, 1, 1);
+  for a := 0 to NM1 do
+    for ch := 0 to ChanM1 do
+      FA1ColBuf.FData[ch * N + a] := f1.FData[a * Chan + ch];
+
+  // 2) GEMM on device: corr[a,b] = sum_c f1[a,c]*f2[b,c]. A = FA1ColBuf
+  //    (a count = FNumAs = N, interleaved As[a + c*N]); B = f2 (b count =
+  //    FNumBs = N, contiguous Bs[b*C + c]); contraction FSize = C.
+  //    Result[b*N + a] = corr(a,b) lands raw in FCorrBuf.
+  FDotCL.PrepareForCompute(FA1ColBuf, f2, Chan);
+  FDotCL.Compute(FA1ColBuf, f2, {ActFN}0, {NewVAs}true, {NewVBs}true);
+  FDotCL.FinishAndLoadResult(FCorrBuf, 0);
+
+  // 3) Transpose FCorrBuf[b*N + a] into FOutput native [a*N + b] (= channel
+  //    ch = b for source pixel a) and apply the 1/sqrt(C) scale.
+  for a := 0 to NM1 do
+    for b := 0 to NM1 do
+      FOutput.FData[a * N + b] := FCorrBuf.FData[b * N + a] * invSqrtC;
+
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+{$ENDIF}
 
 function TNNetCorrelationVolume.SaveStructureToString(): string;
 begin
@@ -29202,7 +29287,20 @@ var
   WM1, HM1: integer;
   f1, f2: TNNetVolume;
   acc, invSqrtC: TNeuralFloat;
+const
+  // Minimum number of output positions (W*H) to offload the all-pairs GEMM to
+  // OpenCL; below this the kernel launch + upload cost outweighs the matmul.
+  csCorrVolOpenCLMinPositions = 16;
 begin
+  {$IFDEF OpenCL}
+  if FHasOpenCL and FShouldOpenCL and Assigned(FDotCL) and
+     (FPrevLayer.FOutput.SizeX * FPrevLayer.FOutput.SizeY
+       >= csCorrVolOpenCLMinPositions) then
+  begin
+    ComputeOpenCL();
+    exit;
+  end;
+  {$ENDIF}
   StartTime := Now();
   f1 := FPrevLayer.FOutput;
   f2 := FF2Layer.FOutput;
