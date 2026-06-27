@@ -1781,6 +1781,36 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       Pin exact parity vs the current scalar output on each layer's numerical
       test. Distinct from the existing chunked/parallel-forward items for these
       layers (those change the ALGORITHM; this vectorizes the sequential readout).
+- [ ] AVX-vectorize the scalar inner loops in the computer-vision layers below.
+      Each hot loop is a plain `for d := ... acc := acc + a[d]*b[d]` (or
+      `dst[d] := dst[d] + s*c[d]`) over a CONTIGUOUS depth/feature axis, so the
+      fix mirrors the landed strided-state-readout work: swap the scalar loop for
+      `TNNetVolume.DotProduct` / `TNNetVolume.MulAdd` over the contiguous axis.
+      Pin exact parity vs the current scalar output on each layer's numerical
+      test, on BOTH scalar-fallback and `-dAVX2` builds.
+  - [ ] `TNNetSAMVisionAttention.Compute` (neuralnetwork.pas ~33149-33180): the
+        per-query Q·K score (`Score += QPtr[d]·KPtr[d]` over FHeadDim), the two
+        decomposed relative-position dot products (`Q·rel_pos_h`, `Q·rel_pos_w`),
+        and the weighted-value accumulation (`FCtx[..d] += Score·VPtr[d]`) are all
+        contiguous over the head dimension — clean DotProduct (scores) + MulAdd
+        (value mix). Highest-value of the set: it is the Segment-Anything ViT
+        attention inner loop, run per window token per head.
+  - [ ] `TNNetCapsuleConv` / `TNNetCapsules.Compute` prediction-vector loop
+        (~43380): `acc += W.Raw[o*FInDim+k]·Prev.Raw[i*FInDim+k]` over k is a
+        contiguous length-InDim dot product per (i,j,o) — direct DotProduct swap;
+        the routing-agreement weighted sum is the lower-value remainder.
+  - [ ] `TNNetConvGRUCell.GateConv` inner tap loop (~29714): the innermost
+        `acc += WR[tap+zi]·SPtr[zi]` over the contiguous channel dimension (ZC
+        floats) is a 1:1 `DotProduct(WR@tap, SPtr, ZC)` replacement, accumulated
+        across taps.
+  - [ ] `TNNetGramMatrix.Compute` (~18927-18940) — distinct from the others: the
+        channel-pair accumulation walks spatial positions STRIDED by C, so it is
+        NOT a direct DotProduct. Buffer the prev-layer activations into a
+        channel-major (C rows × H*W contiguous) scratch ONCE per forward, then
+        each Gram entry G[i,j] becomes `DotProduct(rowI, rowJ, H*W)` over the
+        contiguous spatial axis (and the symmetric backward mirrors it). Speeds up
+        the style-transfer / AdaIN Gram path; document the scratch alloc in
+        SetPrevLayer per the preallocated-scratch convention.
 - [X] Refactor `examples/MixtureDensityNetwork` to use the real
       `TNNetMixtureDensity` layer + its log-sum-exp NLL instead of the
       hand-coded mixture math. The example currently re-implements the whole
