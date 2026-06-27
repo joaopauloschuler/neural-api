@@ -224,18 +224,16 @@ rather than acted on.
 
 ### Computer vision & generative models
 
-- [ ] `TNNetGramMatrix` reusable layer — channel-wise Gram matrix
-      `G[i][j] = (1/(H·W)) · Σ_{x,y} A[x,y,i]·A[x,y,j]` over a feature map, the
-      core style-loss / second-order texture statistic. It is currently
-      re-implemented BY HAND as a `ComputeGram` nested-loop procedure in THREE
-      examples — `examples/StyleTransfer`, `examples/AdaINStyleTransfer` and
-      `examples/CycleGAN` — so a single layer removes that triplication and gives
-      a vectorizable home for it (each `G[i][j]` is a depth-pair dot product over
-      the contiguous spatial run, so the forward maps onto `TNNetVolume.DotProduct`
-      and the backward `dA = 2·A·dG` onto `MulAdd`). Output is a Depth×Depth map
-      (SizeX=SizeY=Depth_in, one channel) so it composes as a normal layer.
-      Scope: the layer + numerical-gradient + serialization tests, then port the
-      three named examples off their hand-made `ComputeGram` onto it.
+- [X] `TNNetGramMatrix` reusable layer — channel-wise Gram matrix LANDED
+      (commit 19ec9be0; `G[i,j] = (1/(C·H·W)) · Σ_{x,y} A[x,y,i]·A[x,y,j]`,
+      output Depth×Depth×1, symmetrized analytic backward correct for
+      non-symmetric incoming dG; registered in both CreateLayer dispatch paths;
+      `// Coded by Claude (AI).`; README layer row; `TestGramMatrixGradientCheck`
+      + `TestGramMatrixLoadFromString`). SCOPE CORRECTION: only
+      `examples/StyleTransfer` actually had a hand-made `ComputeGram` (ported onto
+      the layer, style loss 9.82→0.68 unchanged); `AdaINStyleTransfer` uses
+      `TNNetAdaIN` (no Gram) and `CycleGAN` has no Gram statistic — neither
+      needed changes.
 
 - [ ] FastSAM real-time segment-anything importer (`BuildFastSAMFromSafeTensors[Ex]`,
       ultralytics FastSAM-s / FastSAM-x). Architecturally distinct from the landed
@@ -259,15 +257,25 @@ rather than acted on.
       CLIP vision tower and Llama/Vicuna decoder; `examples/LlavaNextDescribe`
       caption. Pico-fixture parity < 1e-4 on the merged visual-token features.
 
-- [ ] OpenCLIP / timm vision-tower importer (`BuildOpenClipVisionTower`,
-      laion/CLIP-ViT-* and timm `vit_*.openclip` checkpoints). The landed
-      `BuildClipFromSafeTensors` covers the OpenAI key layout; OpenCLIP/timm
-      checkpoints use a different parameter naming and ship the high-quality
-      ViT-L/14 and ViT-g/14 LAION-trained towers used as the de-facto image
-      encoder for many open generative and retrieval stacks. v1 scope: load the
-      OpenCLIP key layout into the existing `BuildClipVisionTower` graph (reusing
-      the CLIP path), with a real-checkpoint embedding round-trip vs the HF
-      `open_clip` reference < 1e-3 cosine.
+- [X] OpenCLIP / timm vision-tower importer `BuildOpenClipVisionTower` LANDED
+      (commit 794a10ce, neuralpretrained.pas): a `TNNetOpenClipReader`
+      (TNNetSafeTensorsReader subclass, synthetic-table pattern like
+      TNNetInternLM2Reader) maps flat `visual.*` open_clip keys onto the HF
+      `vision_model.*` names the existing `BuildClipVisionTower` graph reads —
+      three non-trivial translations: (a) split fused `attn.in_proj_{weight,bias}`
+      [3*width,width] into q/k/v slabs; (b) transpose bias-free `visual.proj`
+      [width,out] into nn.Linear `visual_projection.weight` [out,width];
+      (c) serve `class_embedding`/`positional_embedding` under HF names so the
+      builder folds CLS into pos row 0. Activation configurable (chaQuickGelu for
+      OpenAI-style vs chaGeluExact for LAION ViT-B/g) via promoted
+      `ClipHiddenActFromString`. `TestOpenClipVisionTowerParity` matches a
+      self-contained numpy float64 pre-LN ViT oracle <1e-4
+      (tools/make_pico_openclip_fixture.py; tests/fixtures/tiny_openclip.* 63KB,
+      in line with the existing 60KB tiny_clip fixture); full suite green.
+  - [ ] real-checkpoint round-trip vs the actual `open_clip` reference (laion
+        ViT-L/14, ViT-g/14) deferred — open_clip lib + LAION weights unavailable
+        offline; the pico fixture covers the key-translation surface end-to-end on
+        top of the already-parity-verified CLIP vision graph.
 
 - [ ] Janus-Pro unified multimodal importer (`BuildJanusProFromSafeTensors[Ex]`,
       deepseek-ai/Janus-Pro-1B and Janus-Pro-7B). Architecturally distinct from
@@ -982,37 +990,36 @@ rather than acted on.
       EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
       before/after.
 
-- [ ] AVX-vectorize `TNNetPixelNorm` (StyleGAN per-pixel feature-vector
-      normalization, neuralnetwork.pas ~line 57620). The forward Compute inner
-      loop is a per-(x,y) scalar `SumSqr += FData[base+c]^2` over the contiguous
-      depth axis followed by a scalar `FData[base+c] *= InvRMS` rescale — both
-      drop straight onto the existing depth-contiguous primitives
-      (`TNNetVolume.GetSumSqr(ptr, Depth)` for the norm, `Mul(ptr, InvRMS, Depth)`
-      for the rescale). The Backpropagate per-pixel loop is the same shape:
-      a `DotProduct(dy, normalized, Depth)` for the `SumDyY` projection term then
-      two `MulAdd` over the contiguous depth column. Mirror the
-      `TNNetL2Normalize` / `TNNetLogitNormalize` AVX work already landed; pin with
-      a forward-parity + gradient-check test green on scalar and -dAVX2.
+- [X] AVX-vectorize `TNNetPixelNorm` LANDED (commit 52a99b2e): forward
+      sum-of-squares via `DotProduct(OutPtr,OutPtr,Depth)` + rescale via
+      `Mul(OutPtr,InvRMS,Depth)`; backward via `DotProduct(gy,y,Depth)/Depth`
+      projection + two `MulAdd` over the contiguous depth column (mirrors
+      `TNNetL2Normalize.BackpropagatePerDepth`); InvRMS/epsilon kept byte-identical
+      to the scalar path. `TestPixelNorm{Forward,GradientCheck,SerializationRoundTrip}`
+      green on scalar AND clean `-dAVX2 -B` builds (the only AVX failure is the
+      pre-existing `TestSetTrainableKeepsOutputs` FP-ordering flake in the Bugs
+      section, confirmed unrelated via git stash).
 
-- [ ] OpenCL offload of `TNNetCorrelationVolume.Compute` (RAFT all-pairs
-      correlation, neuralnetwork.pas; AVX forward already landed, commit
-      f598146d / 346c1b4e). The forward is W²·H² depth-axis dot products
-      (`DotProduct(f1[ix,iy,:], f2[jx,jy,:], C)`) — a GEMM-shaped, embarrassingly
-      parallel kernel that grows quadratically in the spatial size and dominates
-      RAFT cost at higher resolution, so it amortizes a host round-trip well.
-      Wire a `ComputeOpenCL` reusing the `cai_dot_product` GEMM scaffolding (one
-      work-item per (output-position, displacement) pair), gate behind
-      `FShouldOpenCL`, keep the AVX path as the no-OpenCL fallback, and pin parity
-      with an exact-vs-CPU test in the SDPAOpenCLParity style.
+- [X] OpenCL offload of `TNNetCorrelationVolume.Compute` LANDED (commit 71b22484):
+      the whole W²·H² correlation maps onto one `cai_dot_product` GEMM via the
+      inherited shared `FDotCL: TDotProductSharedKernel` (A = f1 transposed
+      column-major, B = f2 passed directly in its native depth-contiguous layout,
+      result transposed + 1/sqrt(C) scaled into FOutput). `EnableOpenCL` override
+      + `FShouldOpenCL` gate (dispatches only when W*H>=16), AVX/scalar path is
+      the unchanged fallback. `CorrelationVolumeOpenCLParity` asserts ShouldOpenCL
+      and matches CPU max|diff|=1.19e-7 on PoCL CPU; full suite green on default
+      and `-dOpenCL` builds.
 
-- [ ] OpenCL offload of `TNNetCorrelationLookup.Compute` (RAFT local lookup of
-      the all-pairs correlation, neuralnetwork.pas ~line 29120). The per-pixel
-      bilinear grid-sample over a (2R+1)x(2R+1) window is a simple, embarrassingly
-      parallel kernel called once per RAFT refinement iteration — a natural
-      `ComputeOpenCL` candidate (one work-item per output position). Reuse the
-      bilinear-sampler OpenCL scaffolding already shared by the gather layers;
-      gate on the RAFT optical-flow parity test and keep the scalar path as the
-      no-OpenCL fallback.
+- [X] OpenCL offload of `TNNetCorrelationLookup.Compute` LANDED (commit 92780ac7):
+      reuses the existing shared `cai_bilinear_gather` kernel (via
+      `TNNetBilinearGatherCL`) — each output element samples a scalar from the
+      correlation volume, so the gather runs Depth=1 with the 4 corners as full
+      flat indices into the volume's FData and masked taps→-1 (kernel emits 0);
+      device raster order matches the output so the result Moves straight into
+      FOutput. No new kernel/host machinery. `EnableOpenCL` + `FShouldOpenCL` gate
+      on `>= NeuralConvOpenCLMinWork`, scalar path is the fallback.
+      `CorrelationLookupOpenCLParity` asserts ShouldOpenCL and matches CPU
+      max|diff|=6.0e-8 on PoCL CPU; full suite green on default and `-dOpenCL`.
 
 - [ ] Single-sample `TNNetFullConnect` forward threading follow-ups (opt-in
       `EnableFullConnectThreading` multi-core `ComputeCPU` v1 LANDED for
