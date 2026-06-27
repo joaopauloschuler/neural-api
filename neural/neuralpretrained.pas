@@ -4070,16 +4070,18 @@ procedure MERTWeightedLayerSum(const Config: TMERTConfig;
 // MULTI-speaker activity, deliberately distinct from the transcription / CTC
 // paths (Whisper, Wav2Vec2). A SincNet learnable band-pass front-end
 // (TNNetSincConv1D) feeds a small conv stack, a bidirectional-LSTM temporal
-// trunk (TNNetMinLSTM forward + reverse, concatenated) and a per-frame POWERSET
+// trunk (TNNetLSTMCell forward + reverse, concatenated) and a per-frame POWERSET
 // multilabel head (the 3.0 model emits the 7 powerset classes covering all
 // subsets of <=3 concurrent speakers; decode back to a per-speaker binary
 // activity matrix with PyannotePowersetDecode).
 //
 // v1 SCOPE: inference-only, CPU, raw mono waveform in. The architecture is the
 // pyannote/segmentation-3.0 SHAPE (SincNet -> MaxPool/LayerNorm -> conv block ->
-// BiLSTM -> Linear -> powerset). The temporal trunk uses the landed minimal
-// LSTM cell (TNNetMinLSTM) rather than a vanilla LSTM; the parity oracle
-// reimplements this exact forward math. ----------------------------------------
+// BiLSTM -> Linear -> powerset). The temporal trunk uses the landed VANILLA LSTM
+// cell (TNNetLSTMCell, a true cell state with recurrent gate feed - the layout
+// TNNet.AddBidirectionalLSTM builds), so a real pyannote nn.LSTM weight set
+// (weight_ih_l0/weight_hh_l0/bias_ih_l0/bias_hh_l0 + _reverse) loads without
+// re-training; the parity oracle reimplements this exact forward math. ----------
 type
   TPyannoteConfig = record
     SampleRate: TNeuralFloat;   // sample_rate (e.g. 16000)
@@ -37213,50 +37215,73 @@ begin
   Layer.FlushWeightCache();
 end;
 
-// Loads a TNNetMinLSTM direction from x-only gate weights. The checkpoint
-// stores W_f/W_i/W_h as [Hidden,Hidden] (out,in) and b_f/b_i/b_h as [Hidden].
-procedure LoadPyannoteMinLSTM(Reader: TNNetSafeTensorsReader;
+// Loads one vanilla nn.LSTM direction (a TNNetLSTMCell) from the standard torch
+// fused tensors weight_ih (4H,In), weight_hh (4H,H), bias_ih (4H), bias_hh (4H).
+// torch packs the 4H rows in gate order i,f,g,o - EXACTLY TNNetLSTMCell's neuron
+// layout: input projections W_ii/W_if/W_ig/W_io -> Neurons[0..3], recurrent
+// projections W_hi/W_hf/W_hg/W_ho -> Neurons[4..7], and the folded bias sum
+// b_ih+b_hh (per gate) -> Neurons[8..11]. Each W_i* row slice is HxIn and each
+// W_h* slice is HxH; all stored [out,0,in].
+procedure LoadPyannoteLSTM(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const Prefix: string; Hidden, InDim: integer;
   Consumed: TStringList);
 var
-  W: TNNetVolume;
-  GateNames: array[0..2] of string;
-  BiasNames: array[0..2] of string;
+  Wih, Whh, Bih, Bhh: TNNetVolume;
   g, o, i: integer;
   HiddenM1, InDimM1: integer;
-  WName, BName: string;
+  IhName, HhName, BihName, BhhName: string;
 begin
   HiddenM1 := Hidden - 1;
   InDimM1 := InDim - 1;
-  GateNames[0] := 'W_f'; GateNames[1] := 'W_i'; GateNames[2] := 'W_h';
-  BiasNames[0] := 'b_f'; BiasNames[1] := 'b_i'; BiasNames[2] := 'b_h';
-  W := TNNetVolume.Create;
+  IhName := Prefix + 'weight_ih';
+  HhName := Prefix + 'weight_hh';
+  BihName := Prefix + 'bias_ih';
+  BhhName := Prefix + 'bias_hh';
+  if not Reader.HasTensor(IhName) then
+    ImportError('Pyannote import: missing tensor "' + IhName + '".');
+  if (Reader.DimSize(IhName, 0) <> 4 * Hidden) or
+     (Reader.DimSize(IhName, 1) <> InDim) then
+    ImportError('Pyannote import: "' + IhName + '" must be [' +
+      IntToStr(4 * Hidden) + ',' + IntToStr(InDim) + '], got ' +
+      Reader.ShapeAsString(IhName));
+  if not Reader.HasTensor(HhName) then
+    ImportError('Pyannote import: missing tensor "' + HhName + '".');
+  if (Reader.DimSize(HhName, 0) <> 4 * Hidden) or
+     (Reader.DimSize(HhName, 1) <> Hidden) then
+    ImportError('Pyannote import: "' + HhName + '" must be [' +
+      IntToStr(4 * Hidden) + ',' + IntToStr(Hidden) + '], got ' +
+      Reader.ShapeAsString(HhName));
+  Wih := TNNetVolume.Create;
+  Whh := TNNetVolume.Create;
+  Bih := TNNetVolume.Create;
+  Bhh := TNNetVolume.Create;
   try
-    for g := 0 to 2 do
+    Reader.LoadTensorFlat(IhName, Wih);   // row-major [4H,In], gate order i,f,g,o
+    Reader.LoadTensorFlat(HhName, Whh);   // row-major [4H,H]
+    Reader.LoadTensorFlat(BihName, Bih);  // [4H]
+    Reader.LoadTensorFlat(BhhName, Bhh);  // [4H]
+    Consumed.Add(IhName); Consumed.Add(HhName);
+    Consumed.Add(BihName); Consumed.Add(BhhName);
+    // For each gate g in {i,f,g,o} the rows [g*H .. g*H+H) of the fused tensors
+    // are this gate's H output rows.
+    for g := 0 to 3 do
     begin
-      WName := Prefix + GateNames[g];
-      BName := Prefix + BiasNames[g];
-      if not Reader.HasTensor(WName) then
-        ImportError('Pyannote import: missing tensor "' + WName + '".');
-      if (Reader.DimSize(WName, 0) <> Hidden) or
-         (Reader.DimSize(WName, 1) <> InDim) then
-        ImportError('Pyannote import: "' + WName + '" must be [' +
-          IntToStr(Hidden) + ',' + IntToStr(InDim) + '], got ' +
-          Reader.ShapeAsString(WName));
-      Reader.LoadTensorFlat(WName, W);   // row-major [out,in]
-      // TNNetMinLSTM stores gate g in Neurons[g] as (InDim,1,Hidden) [out,0,in].
+      // input projection -> Neurons[g]; recurrent projection -> Neurons[4+g].
       for o := 0 to HiddenM1 do
+      begin
         for i := 0 to InDimM1 do
-          Layer.FArrNeurons[g].Weights[o, 0, i] := W.FData[o * InDim + i];
-      Consumed.Add(WName);
-      // Bias.
-      Reader.LoadTensorFlat(BName, W);
-      for o := 0 to HiddenM1 do
-        Layer.FArrNeurons[3 + g].Weights.FData[o] := W.FData[o];
-      Consumed.Add(BName);
+          Layer.FArrNeurons[g].Weights[o, 0, i] :=
+            Wih.FData[(g * Hidden + o) * InDim + i];
+        for i := 0 to HiddenM1 do
+          Layer.FArrNeurons[4 + g].Weights[o, 0, i] :=
+            Whh.FData[(g * Hidden + o) * Hidden + i];
+        // folded bias sum b_ih + b_hh -> Neurons[8+g].
+        Layer.FArrNeurons[8 + g].Weights.FData[o] :=
+          Bih.FData[g * Hidden + o] + Bhh.FData[g * Hidden + o];
+      end;
     end;
   finally
-    W.Free;
+    Bhh.Free; Bih.Free; Whh.Free; Wih.Free;
   end;
   Layer.FlushWeightCache();
 end;
@@ -37345,12 +37370,16 @@ begin
       NN.AddLayer( TNNetReLU.Create() );
       NN.AddLayer( TNNetMaxPool.Create(Config.Pool2, Config.Pool2, 0) );
       LN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
-      // Bidirectional minimal-LSTM temporal trunk (forward + time-reversed),
-      // concatenated along Depth -> 2*LSTMHidden channels per frame.
+      // Bidirectional vanilla-LSTM temporal trunk (forward + time-reversed),
+      // concatenated along Depth -> 2*LSTMHidden channels per frame. This is the
+      // exact layer layout TNNet.AddBidirectionalLSTM(ConvChannels, 1, True)
+      // builds (Depth == Hidden == ConvChannels, so no per-direction projection
+      // is inserted); spelled out here to keep direct refs to the two TNNetLSTMCell
+      // layers for weight loading.
       Source := NN.GetLastLayer();
-      FwdCell := NN.AddLayerAfter(TNNetMinLSTM.Create(), Source);
+      FwdCell := NN.AddLayerAfter(TNNetLSTMCell.Create(), Source);
       NN.AddLayerAfter( TNNetFlipX.Create(), Source );
-      NN.AddLayer( TNNetMinLSTM.Create() );
+      NN.AddLayer( TNNetLSTMCell.Create() );
       RevCell := NN.AddLayer( TNNetFlipX.Create() );
       NN.AddLayer( TNNetDeepConcat.Create([FwdCell, RevCell]) );
       // Per-frame powerset head: Linear (2*Hidden -> NumPowersetClasses).
@@ -37375,14 +37404,14 @@ begin
       LoadLayerNormWeights(Reader, LN2, 'ln2.weight', 'ln2.bias',
         Config.ConvChannels);
       MarkConsumed('ln2.weight'); MarkConsumed('ln2.bias');
-      // TNNetMinLSTM is a SAME-SHAPE recurrence: its hidden size equals the
-      // input depth (ConvChannels). Each gate matrix is therefore
-      // ConvChannels x ConvChannels and the BiLSTM trunk emits 2*ConvChannels.
-      LoadPyannoteMinLSTM(Reader, FwdCell, 'lstm.fwd.', Config.ConvChannels,
+      // TNNetLSTMCell is a SAME-SHAPE recurrence: its hidden size equals the
+      // input depth (ConvChannels). Each fused gate slab is therefore
+      // (4*ConvChannels x ConvChannels) and the BiLSTM trunk emits 2*ConvChannels.
+      LoadPyannoteLSTM(Reader, FwdCell, 'lstm.fwd.', Config.ConvChannels,
         Config.ConvChannels, Consumed);
-      // Reverse cell layer = the TNNetMinLSTM before the final FlipX. It is the
+      // Reverse cell layer = the TNNetLSTMCell before the final FlipX. It is the
       // PrevLayer of RevCell (RevCell is the FlipX).
-      LoadPyannoteMinLSTM(Reader, RevCell.PrevLayer, 'lstm.rev.',
+      LoadPyannoteLSTM(Reader, RevCell.PrevLayer, 'lstm.rev.',
         Config.ConvChannels, Config.ConvChannels, Consumed);
       LoadLlamaLinearWeights(Reader, Head, 'head.weight',
         2 * Config.ConvChannels, Config.NumPowersetClasses, 0, -1, 0,
