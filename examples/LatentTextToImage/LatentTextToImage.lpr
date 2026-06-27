@@ -47,6 +47,7 @@ Optional trailing flags:
   --steps N      number of reverse steps (default 4)
   --cfg W        classifier-free guidance scale (default 4.0)
   --dpm          use DPM-Solver++(2M) instead of DDIM
+  --unipc        use UniPC (order-2 bh2 predictor-corrector; better at 5-10 steps)
   --lcm          use the Latent Consistency Model few-step sampler
                  (TNNetLCMScheduler): a SINGLE model pass per step, guidance
                  BAKED IN (no cond/uncond double pass), ~4 steps. The matching
@@ -221,6 +222,7 @@ begin
     if Arg = '--steps' then begin Inc(i); NumSteps := StrToIntDef(ParamStr(i), NumSteps); end
     else if Arg = '--cfg' then begin Inc(i); Guidance := StrToFloatDef(ParamStr(i), Guidance); end
     else if Arg = '--dpm' then Method := smDPMSolverPP2M
+    else if Arg = '--unipc' then Method := smUniPC
     else if Arg = '--lcm' then UseLCM := true
     else if Arg = '--smoke' then SmokeMode := true
     else WriteLn('Ignoring unknown argument: ', Arg);
@@ -254,8 +256,16 @@ begin
       WriteLn('Sampler: LCM (Latent Consistency Model, single pass/step, ',
         'guidance baked in), steps ', NumSteps)
     else
-      WriteLn('Sampler: ', BoolToStr(Method = smDPMSolverPP2M, 'DPM-Solver++(2M)',
-        'DDIM'), ', steps ', NumSteps, ', CFG ', Guidance:0:2);
+    begin
+      case Method of
+        smUniPC:         WriteLn('Sampler: UniPC (order-2 bh2 predictor-corrector,',
+          ' few-step), steps ', NumSteps, ', CFG ', Guidance:0:2);
+        smDPMSolverPP2M: WriteLn('Sampler: DPM-Solver++(2M), steps ', NumSteps,
+          ', CFG ', Guidance:0:2);
+        else             WriteLn('Sampler: DDIM, steps ', NumSteps,
+          ', CFG ', Guidance:0:2);
+      end;
+    end;
 
     // Caller-supplied T5 states (Step 3 = a real T5 tower over a tokenized
     // prompt). Deterministic synthetic states stand in for the pico run.

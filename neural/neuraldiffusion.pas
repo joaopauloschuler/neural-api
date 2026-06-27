@@ -73,7 +73,17 @@ type
   // Reverse-process update family.
   //   smEulerAncestral : deterministic Euler drift in sigma-space + per-step
   //     ancestral Gaussian noise injection (Karras et al. 2022 "Euler a").
-  TNNetSamplerMethod = (smDDPM, smDDIM, smDPMSolverPP2M, smEulerAncestral);
+  //   smUniPC : UniPC (UniPCMultistepScheduler, Zhao et al. 2023,
+  //     arXiv:2302.04867). A unified PREDICTOR-CORRECTOR ODE solver of order
+  //     B(h). Unlike the DPM-Solver++(2M) predictor it REUSES the previous
+  //     step's model output a SECOND time as a free corrector before the
+  //     predictor, giving noticeably better quality at very low step counts
+  //     (5-10). This implements the order-2 bh2 variant (predict_x0=True,
+  //     thresholding=False, lower_order_final=True). Shares the same
+  //     lambda/sigma/alpha schedule plumbing and prev-output history that
+  //     DPM-Solver++(2M) keeps, plus the previous sample for the corrector.
+  TNNetSamplerMethod = (smDDPM, smDDIM, smDPMSolverPP2M, smEulerAncestral,
+    smUniPC);
 
   // Timestep SPACING for the Sample() driver.
   //   tsUniform : evenly strided timesteps in 1..T (the original behaviour).
@@ -104,6 +114,20 @@ type
     FHasPrev: boolean;
     FPrevX0: TNNetVolume;
     FPrevLambda: TNeuralFloat;
+    // UniPC predictor-corrector extra state. FUniPrevT is the integer timestep
+    // of the previous step (s0 of the corrector), FUniPrevSample is that step's
+    // (corrected) output sample x_{s0}, FUniLowerOrderNums counts how many
+    // model outputs have accumulated (caps the per-step order during warm-up),
+    // and FUniThisOrder is the order the PREVIOUS predictor used (= the order
+    // the current corrector must use, matching diffusers' self.this_order).
+    FUniThisOrder: integer;
+    FUniLowerOrderNums: integer;
+    FUniPrevSample: TNNetVolume;
+    // Two-deep UniPC model-output history (x0 predictions + their timesteps),
+    // newest at index 1. FUniHistLen counts valid entries (0..2).
+    FUniHistX0: array[0..1] of TNNetVolume;
+    FUniHistT: array[0..1] of integer;
+    FUniHistLen: integer;
     procedure BuildTables(Beta1, BetaT, CosineS: TNeuralFloat);
     function GetBeta(Tt: integer): TNeuralFloat;
     function GetAlpha(Tt: integer): TNeuralFloat;
@@ -238,12 +262,21 @@ begin
   SetLength(FSqrtOneMinusAlphaBar, FT + 1);
   BuildTables(Beta1, BetaT, CosineS);
   FPrevX0 := nil;
+  FUniPrevSample := nil;
+  FUniHistX0[0] := nil;
+  FUniHistX0[1] := nil;
   FHasPrev := false;
+  FUniThisOrder := 1;
+  FUniLowerOrderNums := 0;
+  FUniHistLen := 0;
 end;
 
 destructor TNNetDiffusionScheduler.Destroy;
 begin
   if Assigned(FPrevX0) then FPrevX0.Free;
+  if Assigned(FUniPrevSample) then FUniPrevSample.Free;
+  if Assigned(FUniHistX0[0]) then FUniHistX0[0].Free;
+  if Assigned(FUniHistX0[1]) then FUniHistX0[1].Free;
   inherited Destroy;
 end;
 
@@ -480,6 +513,9 @@ end;
 procedure TNNetDiffusionScheduler.ResetMultistep;
 begin
   FHasPrev := false;
+  FUniThisOrder := 1;
+  FUniLowerOrderNums := 0;
+  FUniHistLen := 0;
 end;
 
 procedure TNNetDiffusionScheduler.Step(Xt, RawPred: TNNetVolume;
@@ -493,6 +529,10 @@ var
   // DPM-Solver++ locals.
   lamT, lamPrev, h, hLast, r0: TNeuralFloat;
   curX0, dCoef: TNeuralFloat;
+  // UniPC locals (order-2 bh2, predict_x0).
+  alphaT, sigmaTuni, sigmaS0, hh, hphi1, Bh, rk, rhoC0, rhoC1: TNeuralFloat;
+  detR, sigRatio, m0v, mtv, D1: TNeuralFloat;
+  cOrder, pOrder: integer;
 begin
   Eps := TNNetVolume.Create(Xt);
   try
@@ -644,6 +684,153 @@ begin
           if not Assigned(FPrevX0) then FPrevX0 := TNNetVolume.Create(Xt);
           FPrevX0.Copy(Eps);   // Eps currently holds curX0
           FPrevLambda := lamT;
+          FHasPrev := true;
+        end;
+      smUniPC:
+        begin
+          // UniPC order-2 bh2 predictor-corrector (Zhao et al. 2023), data
+          // (x0) prediction form, mirroring diffusers UniPCMultistepScheduler
+          // (multistep_uni_c_bh_update then multistep_uni_p_bh_update).
+          //   alpha_t = sqrt(ab_t), sigma_t = sqrt(1-ab_t),
+          //   lambda_t = log(alpha_t/sigma_t) (= Lambda()), increases as Tt falls.
+          //   h  = lambda_target - lambda_current,  hh = -h (predict_x0),
+          //   h_phi_1 = expm1(hh),  B_h = expm1(hh) (bh2).
+          // 1. Convert current eps -> current x0 prediction m_t (reuse Eps).
+          abT := FAlphaBar[Tt];
+          for i := 0 to XtSizeM1 do
+            Eps.FData[i] := (Xt.FData[i] - FSqrtOneMinusAlphaBar[Tt] * Eps.FData[i]) / Sqrt(abT);
+          lamT := Lambda(Tt);
+
+          // 2. CORRECTOR: uses the PREVIOUS step's stored output (m0 = the
+          //    newest history entry FUniHistX0[FUniHistLen-1] at FUniHistT),
+          //    the previous (corrected) sample FUniPrevSample = x_{s0}, and
+          //    m_t (this step's x0). Order = FUniThisOrder (the order the
+          //    previous predictor used). Runs from step 1 onward. The model is
+          //    NOT re-run; m_t (Eps) is left unchanged for the history push.
+          if FHasPrev then
+          begin
+            sigmaTuni := FSqrtOneMinusAlphaBar[Tt];        // sigma at this Tt
+            alphaT := Sqrt(abT);                           // alpha at this Tt
+            lamPrev := Lambda(FUniHistT[FUniHistLen - 1]); // lambda at s0
+            sigmaS0 := FSqrtOneMinusAlphaBar[FUniHistT[FUniHistLen - 1]];
+            h := lamT - lamPrev;
+            hh := -h;
+            hphi1 := Exp(hh) - 1.0;
+            Bh := hphi1;                                   // bh2
+            sigRatio := sigmaTuni / sigmaS0;
+            cOrder := FUniThisOrder;
+            if cOrder >= 2 then
+            begin
+              // rk for the second history point (FUniHistX0[FUniHistLen-2] at
+              // FUniHistT[FUniHistLen-2]); D1 = (m1 - m0)/rk.
+              rk := (Lambda(FUniHistT[FUniHistLen - 2]) - lamPrev) / h;
+              // Solve the 2x2 system R*rhos = b for the corrector weights.
+              //   R = [[1, 1],[rk, 1]], b = [hphi1/hh - 1, ...]/Bh-scaled terms.
+              //   b1 = (hphi1/hh - 1)/Bh,
+              //   b2 = ((hphi1/hh - 1)/hh - 1/2)*2/Bh.
+              rhoC0 := (hphi1 / hh - 1.0) / Bh;                       // b1
+              rhoC1 := ((hphi1 / hh - 1.0) / hh - 0.5) * 2.0 / Bh;    // b2
+              detR := 1.0 - rk;   // det([[1,1],[rk,1]]) = 1 - rk
+              // rhos = R^{-1} b ; R^{-1} = 1/detR * [[1,-1],[-rk,1]].
+              curX0 := (rhoC0 - rhoC1) / detR;        // rhos_c[0]
+              dCoef := (-rk * rhoC0 + rhoC1) / detR;  // rhos_c[1] (multiplies D1_t)
+              for i := 0 to XtSizeM1 do
+              begin
+                m0v := FUniHistX0[FUniHistLen - 1].FData[i];
+                mtv := Eps.FData[i];
+                D1 := (FUniHistX0[FUniHistLen - 2].FData[i] - m0v) / rk;
+                Xt.FData[i] := sigRatio * FUniPrevSample.FData[i]
+                  - alphaT * hphi1 * m0v
+                  - alphaT * Bh * (curX0 * D1 + dCoef * (mtv - m0v));
+              end;
+            end
+            else
+            begin
+              // First-order corrector: rhos_c = [0.5].
+              for i := 0 to XtSizeM1 do
+              begin
+                m0v := FUniHistX0[FUniHistLen - 1].FData[i];
+                mtv := Eps.FData[i];
+                Xt.FData[i] := sigRatio * FUniPrevSample.FData[i]
+                  - alphaT * hphi1 * m0v
+                  - alphaT * Bh * 0.5 * (mtv - m0v);
+              end;
+            end;
+          end;
+
+          // 3. Push m_t (pre-correction x0) + Tt into the 2-deep history.
+          if FUniHistLen = 2 then
+          begin
+            // Drop oldest: shift [1] -> [0], free/reuse [1] for the new entry.
+            FUniHistX0[0].Copy(FUniHistX0[1]);
+            FUniHistT[0] := FUniHistT[1];
+            FUniHistX0[1].Copy(Eps);
+            FUniHistT[1] := Tt;
+          end
+          else
+          begin
+            if not Assigned(FUniHistX0[FUniHistLen]) then
+              FUniHistX0[FUniHistLen] := TNNetVolume.Create(Xt);
+            FUniHistX0[FUniHistLen].Copy(Eps);
+            FUniHistT[FUniHistLen] := Tt;
+            Inc(FUniHistLen);
+          end;
+
+          // 4. Determine this step's predictor order (lower_order_final clamps
+          //    the FINAL step -- TtPrev=0 -- to first order), then store it as
+          //    FUniThisOrder for the next step's corrector. Save the current
+          //    sample as last_sample for that corrector BEFORE the predictor
+          //    overwrites Xt.
+          if TtPrev = 0 then pOrder := 1
+          else pOrder := 2;
+          if pOrder > FUniLowerOrderNums + 1 then pOrder := FUniLowerOrderNums + 1;
+          FUniThisOrder := pOrder;
+          if not Assigned(FUniPrevSample) then FUniPrevSample := TNNetVolume.Create(Xt);
+          FUniPrevSample.Copy(Xt);
+
+          // 5. PREDICTOR: produce x_{TtPrev}. m0 = m_t (Eps, the newest output).
+          if TtPrev = 0 then
+          begin
+            // Final hop to the clean image. With sigma_target=0, alpha_target=1,
+            // h -> +inf, h_phi_1 -> -1, so x = m0 (the x0 prediction).
+            Xt.Copy(Eps);
+          end
+          else
+          begin
+            abPrev := FAlphaBar[TtPrev];
+            alphaT := Sqrt(abPrev);                  // alpha at target
+            sigmaTuni := FSqrtOneMinusAlphaBar[TtPrev];
+            sigmaS0 := FSqrtOneMinusAlphaBar[Tt];
+            lamPrev := Lambda(TtPrev);
+            h := lamPrev - lamT;
+            hh := -h;
+            hphi1 := Exp(hh) - 1.0;
+            Bh := hphi1;                             // bh2
+            sigRatio := sigmaTuni / sigmaS0;
+            if (pOrder >= 2) and (FUniHistLen >= 2) then
+            begin
+              // Predictor D1 from the previous history entry (rhos_p = [0.5]).
+              //   rk = (lambda_{prev hist} - lambda_t)/h.
+              rk := (Lambda(FUniHistT[FUniHistLen - 2]) - lamT) / h;
+              for i := 0 to XtSizeM1 do
+              begin
+                m0v := Eps.FData[i];
+                D1 := (FUniHistX0[FUniHistLen - 2].FData[i] - m0v) / rk;
+                Xt.FData[i] := sigRatio * FUniPrevSample.FData[i]
+                  - alphaT * hphi1 * m0v
+                  - alphaT * Bh * 0.5 * D1;
+              end;
+            end
+            else
+            begin
+              // First-order predictor (no correction term).
+              for i := 0 to XtSizeM1 do
+                Xt.FData[i] := sigRatio * FUniPrevSample.FData[i]
+                  - alphaT * hphi1 * Eps.FData[i];
+            end;
+          end;
+
+          if FUniLowerOrderNums < 2 then Inc(FUniLowerOrderNums);
           FHasPrev := true;
         end;
     end;

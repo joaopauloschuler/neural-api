@@ -278,6 +278,18 @@ rather than acted on.
       drop the shortcut. Pico parity < 1e-4 vs a float64 HF MllamaForConditionalGeneration
       oracle + an examples/LlamaVisionDescribe captioning a tiny CPU image.
 
+- [X] UniPC (UniPCMultistepScheduler) diffusion sampler — LANDED. smUniPC added
+      to TNNetDiffusionScheduler (neuraldiffusion.pas): order-2 bh2 predictor-
+      corrector (predict_x0=True, thresholding=False, lower_order_final=True),
+      reusing the lambda/sigma/alpha plumbing + a 2-deep x0/timestep history plus
+      the previous sample for the corrector. Wired into Step/Sample dispatch and
+      ResetMultistep. Gated by TestUniPCVsOracle (TestNeuralDiffusion.pas) against
+      a self-contained numpy float64 oracle (tools/unipc_scheduler_oracle.py,
+      fixture tests/fixtures/unipc_oracle.json — diffusers absent, so a faithful
+      reimplementation of multistep_uni_{p,c}_bh_update), parity < 1e-4; the UniPC
+      final (-1.0914) is distinct from DDIM (-0.8798) and DPM++(2M) (-5.69) on the
+      same toy trace. Opt-in --unipc flag added to the LatentTextToImage capstone.
+      Full suite green (2342 tests). Original spec below:
 - [ ] UniPC (UniPCMultistepScheduler) diffusion sampler — a genuinely distinct
       few-step ODE solver to add to TNNetDiffusionScheduler (smUniPC), NOT a
       near-duplicate of the landed DDIM/DPM-Solver++(2M)/Euler-a/LCM samplers: UniPC

@@ -54,6 +54,7 @@ type
     procedure TestVPredictionToEps;
     procedure TestDDIMTrajectoryVsOracle;
     procedure TestDPMSolverVsOracle;
+    procedure TestUniPCVsOracle;
     procedure TestDDPMRunsNoNaN;
     procedure TestEulerAncestralZeroEtaMatchesDDIM;
     procedure TestKarrasSpacingSigmaMonotone;
@@ -88,6 +89,12 @@ const
     (-5.69458245535186, -4.270936841513894, -2.84729122767593,
      -1.423645613837965, 0.0, 1.423645613837965,
       2.84729122767593, 4.270936841513894);
+  // UniPC (order-2 bh2, predict_x0) final from the float64 numpy oracle
+  // tools/unipc_scheduler_oracle.py (same toy model, start & uniform schedule).
+  cOracleUniPC: array[0..7] of double =
+    (-1.0913574282060237, -0.8185180711545179, -0.5456787141030118,
+     -0.2728393570515059, 0.0, 0.2728393570515059,
+      0.5456787141030118, 0.8185180711545179);
 
 procedure TTestNeuralDiffusion.ToyModel(Xt, Output: TNNetVolume; Tt: integer);
 var i: integer; s: TNeuralFloat;
@@ -318,6 +325,32 @@ begin
         IsNan(X.FData[i]) or IsInfinite(X.FData[i]));
       AssertEquals('dpm++ vs oracle @ ' + IntToStr(i),
         cOracleDPM[i], X.FData[i], 1e-2);
+    end;
+  finally
+    Sched.Free; X.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestUniPCVsOracle;
+var
+  Sched: TNNetDiffusionScheduler;
+  X: TNNetVolume;
+  i: integer;
+begin
+  Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  X := TNNetVolume.Create(cN, 1, 1);
+  try
+    for i := 0 to cN - 1 do X.FData[i] := (i - cN / 2) * 0.3;
+    Sched.Sample(X, @ToyModel, cSteps, smUniPC, 0.0);
+    // Match the numpy UniPC (order-2 bh2) float64 oracle to <1e-4. UniPC is a
+    // genuinely distinct predictor-corrector trajectory: it differs from both
+    // the DDIM and DPM-Solver++(2M) finals on the SAME toy model & start.
+    for i := 0 to cN - 1 do
+    begin
+      AssertFalse('unipc no NaN @ ' + IntToStr(i),
+        IsNan(X.FData[i]) or IsInfinite(X.FData[i]));
+      AssertEquals('unipc vs oracle @ ' + IntToStr(i),
+        cOracleUniPC[i], X.FData[i], 1e-4);
     end;
   finally
     Sched.Free; X.Free;
