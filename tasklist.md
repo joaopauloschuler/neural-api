@@ -981,29 +981,6 @@ rather than acted on.
       existing parity tests (TestHiFiGANSynthesisParity / TestVitsSynthesisParity /
       EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
       before/after.
-- [X] AVX vectorization of `TNNetCorrelationVolume.Compute` (RAFT all-pairs
-      correlation). DONE (commit 346c1b4): the inner `dd` accumulation is now
-      `TNNetVolume.DotProduct(f1.GetRawPtr(ix,iy,0), f2.GetRawPtr(jx,jy,0), C)`
-      over the depth-contiguous f1/f2 channel columns. Backpropagate left scalar
-      because TNNetCorrelationVolume is inference-only (no gradient scatter into
-      f1/f2). RAFT optical-flow parity (TestRaftOpticalFlowParity) passes on both
-      scalar (max|diff| 5.5e-6) and -dAVX2 (3.7e-6) builds, gate < 1e-4.
-
-- [X] AVX vectorization of `TNNetSimpleGate.Compute` (NAFNet/SimpleGate GLU).
-      DONE (commit a1e077fb): forward does per-(x,y) `Move` of the first half into
-      the output column then `TNNetVolume.Mul(OutPtr, SecondPtr, HalfDepth)`
-      (AVXMul); backward cross-multiply is two `TNNetVolume.MulAdd` calls per
-      (x,y) (AVXMulAdd). TestSimpleGateForward / GradientCheck / Serialization
-      pass on both scalar and -dAVX2 builds.
-
-- [X] AVX bulk-copy for `TNNetSpaceToDepth` (pixel-unshuffle) and its inverse
-      `TNNetDepthToSpace`. DONE (commit 4fa37e81): forward Compute is a single
-      `system.Move` of `C` floats per (OX,OY,SX,SY) position (contiguous IC run);
-      both Backpropagate paths use AVX `TNNetVolume.Add(dstPtr, srcPtr, C)` since
-      the routing is a bijection (each prev-error element written once, so the
-      contiguous depth `+=` preserves exact gradient-accumulation). All 1235
-      numerical tests (incl. SpaceToDepthForward / DepthToSpaceOfSpaceToDepth /
-      SpaceToDepthGradientCheck) pass on both scalar and -dAVX2 builds.
 
 - [ ] AVX-vectorize `TNNetPixelNorm` (StyleGAN per-pixel feature-vector
       normalization, neuralnetwork.pas ~line 57620). The forward Compute inner
