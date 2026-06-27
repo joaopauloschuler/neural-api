@@ -541,6 +541,27 @@ rather than acted on.
       tolerance on a fixed fixture. Distinct from the int8 work (this is a
       GPU compute path, not CPU storage) and from FP16 weight storage (this
       is the missing compute half).
+- [ ] Keep activations resident on the OpenCL device across consecutive offloaded
+      matmul/SDPA layers (eliminate the per-layer host round-trip during decode).
+      Today each offloaded layer copies its input host->device, runs the kernel, and
+      reads the result device->host (`FInputPrepared` in, `FOutput` out); the next
+      offloaded layer immediately re-uploads that same buffer. For an LLM decode step
+      a single block is qkv-proj -> SDPA -> o-proj -> FFN-up -> FFN-down, i.e. ~5
+      back-to-back GEMM/attention layers whose intermediate tensors never need to
+      touch the host. The weight buffers are already device-resident (the
+      TDotProductSharedKernel weight-residency machinery the FP16 note references);
+      this is the missing ACTIVATION half. Scope: add an opt-in "device output
+      handle" so a layer can leave its result in a `cl_mem` buffer and the next
+      offloaded layer can consume that buffer directly, with an automatic
+      read-back only when the consumer is a CPU layer (norm, softmax, activation)
+      or when the caller reads `.Output`. The non-offloaded layers in between
+      (RMSNorm, RoPE, residual add) still run on host, so a first cut can fuse just
+      the adjacent GEMM pairs (qkv->split, up->down) and measure; a full
+      block-resident path is the stretch goal. Real value: device<->host traffic,
+      not FLOPs, dominates the GPU decode wall-clock for ChatTerminal-scale models,
+      so removing the redundant copies should lift tokens/sec materially. Guard
+      everything behind the existing `FShouldOpenCL`, keep the host round-trip as the
+      fallback, and pin parity with the SDPAOpenCLParity-style exact-vs-CPU test.
 - [ ] Tokenizer follow-ups for neuralhftokenizer.pas:
       (b) DONE — raw SentencePiece .model protobuf path landed
       (LoadSentencePieceModel; hand-decoded ModelProto wire format, no
@@ -1336,9 +1357,62 @@ rather than acted on.
       not deployable speed). Pico-fixture smoke + a real-checkpoint top-1/box
       parity follow-up via the structured-vision detection eval harness.
 
+- [ ] Fuyu decoder-only multimodal importer (BuildFuyuFromSafeTensors[Ex],
+      model_type "fuyu", e.g. adept/fuyu-8b). Architecturally DISTINCT from every
+      landed vision-language importer (CLIP/SigLIP-ViT tower + projector feeding a
+      decoder — LLaVA, Qwen2-VL, PaliGemma, BLIP-2, Florence-2): Fuyu has NO
+      separate vision encoder at all. Raw image patches are unfolded
+      (patch_size x patch_size x channels), linearly projected by a single
+      `vision_embed_tokens` dense layer straight into the decoder's token stream,
+      interleaved with text tokens via `|SPEAKER|`/`|NEWLINE|` image-newline
+      markers. The decoder is a Persimmon stack (standard RoPE attention with a
+      QK-LayerNorm, square-ReLU MLP, separate qkv proj). New code is: the
+      patchify+linear-projection input adapter (reuse TNNetReshape/SpaceToDepth for
+      the unfold + a FullConnect for the projection) and the Persimmon block wiring
+      (QK-LayerNorm before RoPE, ReLU^2 FFN — TNNetReGLUSquared already exists). Real
+      value: covers the "patches-as-tokens" multimodal family (Fuyu, and the recipe
+      generalizes to UI/document screenshots) that the encoder-tower importers
+      cannot express. Pico-fixture parity < 1e-4 vs a float64 HF
+      FuyuForCausalLM.forward, then a real adept/fuyu-8b caption smoke.
+
+- [ ] Donut / Nougat OCR-free document-understanding importer
+      (BuildDonutFromSafeTensors[Ex], model_type "vision-encoder-decoder" with a
+      Donut-Swin encoder, e.g. naver-clova-ix/donut-base / facebook/nougat-base).
+      A DISTINCT task family from the landed TrOCR (ViT encoder + text decoder for
+      single-line OCR) and the caption VLMs: Donut/Nougat read a FULL document image
+      and autoregressively emit STRUCTURED output (Donut: a `<s_...>` key-value
+      sequence for receipts/forms; Nougat: Markdown+LaTeX for scientific PDFs) with
+      NO external OCR step. New code is mostly wiring: the encoder is a Swin
+      transformer (reuse the landed Swin/SwinIR window-attention blocks) and the
+      decoder is an MBart cross-attention stack (reuse the landed mBART importer);
+      the importer maps the `encoder.`/`decoder.` HF key namespaces and the
+      shifted-token-id generation prompt. The genuinely new pieces are the
+      Donut-Swin patch-embed/relative-position-index loading and the
+      task-prompt-conditioned `RunSeq2Seq`-style greedy/beam decode over the
+      document. Real value: first document-AI (forms, receipts, scientific-PDF
+      transcription) importer; reuses Swin + mBART that already ship. Pico-fixture
+      cross-entropy parity < 1e-4 vs a float64 HF VisionEncoderDecoderModel.
+
 ## Layer follow-ups that fix real limitations
 
-- [ ] Vanilla `TNNetLSTMCell` + `TNNetGRUCell` — the standard fully-connected
+- [ ] AVX-vectorize the scalar backward Jacobian of TNNetRMSNorm and
+      TNNetLayerNorm. Their `Compute` already uses the AVX `GetSumSqr`/`Mul`
+      primitives, but `Backpropagate` still walks `FData[Cnt]` element-by-element
+      to form `dxhat = OutputError .* gamma`, the running reductions
+      (`SumDxHat`, `SumDxHatXHat`) and the final
+      `dx = invRMS*(dxhat - xhat*mean(dxhat*xhat))` scatter. The whole-volume case
+      is contiguous, so each loop maps onto the existing neuralvolume primitives:
+      `Mul` for the elementwise gate, `DotProduct(dxhat, xhat)` (and a plain
+      `GetSum`/`DotProduct` against a ones-style accumulation for LayerNorm's
+      mean-subtraction term), then two `MulAdd` writes into
+      `FPrevLayer.FOutputError` — exactly the rewrite already landed for the
+      per-token sibling `TNNetTokenRMSNorm.Backpropagate`, which can be copied as
+      the template. Preserve the `-FLearningRate` convention and the gamma/beta
+      delta path; the existing numerical-gradient tests pin correctness. Real value:
+      RMSNorm/LayerNorm sit on the hot path of every transformer and ConvNeXt-style
+      vision block, and the backward pass is currently the only scalar half left.
+
+ — the standard fully-connected
       recurrent cells with TRUE recurrent gating (each gate sees the previous
       hidden state h_{t-1}, and the LSTM carries a separate cell state c_t), i.e.
       a direct port of torch `nn.LSTMCell`/`nn.GRUCell`. This is a genuine gap, NOT
