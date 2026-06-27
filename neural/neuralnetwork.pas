@@ -29684,8 +29684,8 @@ procedure TNNetConvGRUCell.GateConv(NeuronBase: integer; Src: TNNetVolume;
   Dst: TNNetVolume);
 var
   W, KW, Bias: TNNetVolume;
-  x, y, oc, ky, kx, sy, sx, tap, zi, ZC, ocBase: integer;
-  FHM1, FWM1, HiddenCM1, FeatureM1, ZCM1: integer;
+  x, y, oc, ky, kx, sy, sx, tap, ZC, ocBase: integer;
+  FHM1, FWM1, HiddenCM1, FeatureM1: integer;
   acc: TNeuralFloat;
   WR, SPtr: TNeuralFloatArrPtr;
 begin
@@ -29693,7 +29693,7 @@ begin
   Bias := FNeurons[NeuronBase + 3].FWeights;
   ZC := Src.Depth;
   FHM1 := FH - 1; FWM1 := FW - 1; HiddenCM1 := FHiddenC - 1;
-  FeatureM1 := FFeature - 1; ZCM1 := ZC - 1;
+  FeatureM1 := FFeature - 1;
   WR := KW.GetRawPtr(); // flat: neuron oc owns the contiguous (K*K*ZC) block at oc*K*K*ZC
   for y := 0 to FHM1 do
   for x := 0 to FWM1 do
@@ -29711,8 +29711,8 @@ begin
           if (sx < 0) or (sx >= FW) then continue;
           tap := ocBase + (ky * FFeature + kx) * ZC;
           SPtr := Src.GetRawPtr(sx, sy, 0); // GetRawPtr(x=col, y=row, d)
-          for zi := 0 to ZCM1 do
-            acc := acc + WR^[tap + zi] * SPtr^[zi];
+          // contiguous length-ZC channel dot per tap; maps 1:1 onto DotProduct.
+          acc := acc + TNNetVolume.DotProduct(@WR^[tap], SPtr, ZC);
         end;
       end;
       Dst.Store(x, y, oc, acc); // Store(x, y, d) - x is the FIRST index
@@ -43348,9 +43348,10 @@ procedure TNNetCapsuleRouting.Compute();
 var
   StartTime: double;
   Prev: TNNetVolume;
-  i, j, o, k, it, nIdx: integer;
-  NumInCapsM1, NumOutCapsM1, OutDimM1, InDimM1, TotalCapsM1: integer;
+  i, j, o, it, nIdx: integer;
+  NumInCapsM1, NumOutCapsM1, OutDimM1, TotalCapsM1: integer;
   W: TNNetVolume;
+  uPtr: TNeuralFloatArrPtr;
   acc, sumSq, n, fOverN, Eps, maxB, sumExp, c, agree: TNeuralFloat;
 begin
   StartTime := Now();
@@ -43359,7 +43360,6 @@ begin
   NumInCapsM1 := FNumInCaps - 1;
   NumOutCapsM1 := FNumOutCaps - 1;
   OutDimM1 := FOutDim - 1;
-  InDimM1 := FInDim - 1;
   TotalCapsM1 := FNumInCaps * FNumOutCaps - 1;
 
   // 1) Prediction vectors u_hat_{j|i} = W_ij * u_i.
@@ -43368,13 +43368,11 @@ begin
     begin
       nIdx := i * FNumOutCaps + j;
       W := FNeurons[nIdx].FWeights;
+      // u_hat row o is the length-FInDim contiguous dot of W row o with the
+      // input capsule i; maps 1:1 onto the depth-contiguous DotProduct primitive.
+      uPtr := Prev.GetRawPtr(i * FInDim);
       for o := 0 to OutDimM1 do
-      begin
-        acc := 0;
-        for k := 0 to InDimM1 do
-          acc := acc + W.Raw[o * FInDim + k] * Prev.Raw[i * FInDim + k];
-        FUHat[j, i, o] := acc;
-      end;
+        FUHat[j, i, o] := TNNetVolume.DotProduct(W.GetRawPtr(o * FInDim), uPtr, FInDim);
     end;
 
   // 2) Routing-by-agreement. Coupling logits b_ij RESET to 0 each forward.

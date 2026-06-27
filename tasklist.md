@@ -1761,11 +1761,11 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
         contiguous over the head dimension — clean DotProduct (scores) + MulAdd
         (value mix). Highest-value of the set: it is the Segment-Anything ViT
         attention inner loop, run per window token per head.
-  - [ ] `TNNetCapsuleConv` / `TNNetCapsules.Compute` prediction-vector loop
+  - [X] `TNNetCapsuleConv` / `TNNetCapsules.Compute` prediction-vector loop
         (~43380): `acc += W.Raw[o*FInDim+k]·Prev.Raw[i*FInDim+k]` over k is a
         contiguous length-InDim dot product per (i,j,o) — direct DotProduct swap;
         the routing-agreement weighted sum is the lower-value remainder.
-  - [ ] `TNNetConvGRUCell.GateConv` inner tap loop (~29714): the innermost
+  - [X] `TNNetConvGRUCell.GateConv` inner tap loop (~29714): the innermost
         `acc += WR[tap+zi]·SPtr[zi]` over the contiguous channel dimension (ZC
         floats) is a 1:1 `DotProduct(WR@tap, SPtr, ZC)` replacement, accumulated
         across taps.
