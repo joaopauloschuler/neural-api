@@ -67059,12 +67059,16 @@ begin
           begin
             prevX := ox * FStride + fx - FPadding;
             if (prevX < 0) or (prevX >= prevSizeX) then continue;
-            for ci := 0 to MaxCI do
-            begin
-              dstTap := (fy * FFeatureSizeX + fx) * FInDepth + ci;
-              acc := acc + W.FData[FRotMap[rBase + dstTap]] *
-                PrevOut.Get(prevX, prevY, ci);
-            end;
+            // Both operands are ci-contiguous: the rotation-permuted weight
+            // FRotMap[rBase + tapBase + ci] increments by 1 in ci (BuildRotMap
+            // maps a ci-contiguous dstTap to a ci-contiguous srcTap), and the
+            // input column PrevOut[prevX,prevY,ci] is depth-fastest. Reduce over
+            // ci with the AVX DotProduct primitive instead of scalar MUL/ADD.
+            dstTap := (fy * FFeatureSizeX + fx) * FInDepth;  // ci=0 tap base
+            acc := acc + TNNetVolume.DotProduct(
+              @W.FData[FRotMap[rBase + dstTap]],
+              @PrevOut.FData[PrevOut.GetRawPos(prevX, prevY, 0)],
+              FInDepth);
           end;
         end;
         oc := co * 4 + r;
