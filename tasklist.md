@@ -1442,15 +1442,6 @@ rather than acted on.
         all layers) is rejected; only the per-layer table is wired.
   - [ ] use_absolute_position_embeddings=true and use_relative_position_bias=
         false variants rejected (the published checkpoints don't use them).
-  - [X] Classifier head + pooler + ForImageClassification wrapper LANDED:
-        BuildBeitFromSafeTensorsForImageClassification[Ex/WithConfig] append the
-        HF BeitPooler (use_mean_pooling=true -> patch-token mean + pooler.layernorm;
-        false -> cls row, encoder final LN) + classifier nn.Linear -> (1,1,num_labels)
-        logits; parity tools/beit_cls_tiny_fixture.py + tests/fixtures/tiny_beit_cls_*
-        (BOTH modes, <1e-4 vs HF BeitForImageClassification). No central
-        BuildFromPretrained dispatch entry (mirrors ViT/RegNet/EfficientNet/ResNet:
-        vision classifiers stay standalone *WithConfig builders, not in the
-        text/encoder dispatcher).
   - [ ] BEiTv2 (vector-quantized) not validated.
 
 - [ ] OPT decoder importer (BuildOPTFromSafeTensors[Ex], model_type "opt", e.g.
@@ -1643,8 +1634,8 @@ rather than acted on.
       1-layer == bare cell equivalence, bidirectional forward-half == forward cell
       alone (pins concat order), and a 2-layer bidirectional stack input-gradient
       check (all in TestNeuralNumerical, passing; full suite green 2376/0/0). This
-      UNBLOCKS the pyannote `segmentation-3.0` bidirectional-LSTM trunk drop-in
-      (lines ~977-995) — the trunk can now swap from MinLSTM to true nn.LSTM cells.
+      was applied to the pyannote `segmentation-3.0` trunk, which now uses true
+      nn.LSTM cells.
   - [ ] Faithful STACKED-BIDIRECTIONAL torch import follow-up: the
         `AddBidirectionalRecurrentStack` engine inserts a learned
         `TNNetPointwiseConvLinear` projection on every incoming Depth≠Hidden feed
