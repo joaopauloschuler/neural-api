@@ -711,6 +711,23 @@ type
       procedure Backpropagate(); override;
   end;
 
+  // This layer computes the channel-wise Gram matrix of its input feature map:
+  //   G[i,j] = (1/(C*H*W)) * sum_{x,y} A[x,y,i] * A[x,y,j]
+  // where C = input Depth and H*W = input SizeY*SizeX. The output is a
+  // (C, C, 1) volume (G is symmetric), so the layer composes like any other.
+  // This is the second-order texture / style statistic used by neural style
+  // transfer. The 1/(C*H*W) normalization matches the hand-made ComputeGram in
+  // examples/StyleTransfer so the ported example stays numerically equivalent.
+  // No trainable params.
+  // Coded by Claude (AI).
+  TNNetGramMatrix = class(TNNetLayer)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// This layer copies the input to the output and can be used as a base class
   // to your new layers.
   TNNetIdentity = class(TNNetLayer)
@@ -18772,6 +18789,104 @@ begin
   begin
     FPrevLayer.FOutputError.AddTransposingXD(FOutputError);
   end;
+  FPrevLayer.Backpropagate();
+end;
+
+{ TNNetGramMatrix }
+
+procedure TNNetGramMatrix.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  C: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  C := pPrevLayer.Output.Depth;
+  // Output is the (C, C, 1) Gram matrix.
+  FOutput.ReSize(C, C, 1);
+  // Size from FOutput, not pPrevLayer's error buffer (collapsed when the prev
+  // layer is inference-only).
+  SetOutputErrorSize(FOutput);
+end;
+
+procedure TNNetGramMatrix.Compute;
+var
+  StartTime: double;
+  A: TNNetVolume;
+  C, HW, x, y, i, j, base: integer;
+  norm, acc: TNeuralFloat;
+begin
+  StartTime := Now();
+  A := FPrevLayer.FOutput;
+  C := A.Depth;
+  HW := A.SizeX * A.SizeY;
+  FOutput.ReSize(C, C, 1);
+  if (C = 0) or (HW = 0) then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  norm := 1.0 / (C * HW);
+  // Memory layout is depth-contiguous, so A[x,y,i] for fixed (x,y) lives at
+  // base+i with base = (y*SizeX + x)*C. The Gram sum for a channel pair (i,j)
+  // walks the spatial positions, which are strided by C.
+  for i := 0 to C - 1 do
+    for j := i to C - 1 do
+    begin
+      acc := 0;
+      for y := 0 to A.SizeY - 1 do
+        for x := 0 to A.SizeX - 1 do
+        begin
+          base := (y * A.SizeX + x) * C;
+          acc := acc + A.FData[base + i] * A.FData[base + j];
+        end;
+      acc := acc * norm;
+      FOutput.FData[i * C + j] := acc;
+      FOutput.FData[j * C + i] := acc; // symmetric
+    end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGramMatrix.Backpropagate;
+var
+  StartTime: double;
+  A, PrevErr: TNNetVolume;
+  C, HW, x, y, i, j, base: integer;
+  norm, gv, sym: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    A := FPrevLayer.FOutput;
+    PrevErr := FPrevLayer.FOutputError;
+    C := A.Depth;
+    HW := A.SizeX * A.SizeY;
+    if (C > 0) and (HW > 0) then
+    begin
+      norm := 1.0 / (C * HW);
+      // G[i,j] = norm * sum_{x,y} A[x,y,i]*A[x,y,j]  (symmetric).
+      // dA[x,y,k] = norm * sum_j (dG[k,j] + dG[j,k]) * A[x,y,j].
+      for y := 0 to A.SizeY - 1 do
+        for x := 0 to A.SizeX - 1 do
+        begin
+          base := (y * A.SizeX + x) * C;
+          for i := 0 to C - 1 do
+          begin
+            gv := 0;
+            for j := 0 to C - 1 do
+            begin
+              sym := FOutputError.FData[i * C + j] + FOutputError.FData[j * C + i];
+              gv := gv + sym * A.FData[base + j];
+            end;
+            PrevErr.FData[base + i] := PrevErr.FData[base + i] + norm * gv;
+          end;
+        end;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
   FPrevLayer.Backpropagate();
 end;
 
@@ -101298,6 +101413,7 @@ begin
       'TNNetIdentity' :             Result := TNNetIdentity.Create();
       'TNNetTransposeXD' :          Result := TNNetTransposeXD.Create();
       'TNNetTransposeYD' :          Result := TNNetTransposeYD.Create();
+      'TNNetGramMatrix' :           Result := TNNetGramMatrix.Create();
       'TNNetDebug' :                Result := TNNetDebug.Create(St[0], St[1]);
       'TNNetDotProducts' :          Result := TNNetDotProducts.Create(St[0], St[1], St[2]);
       'TNNetPad' :                  Result := TNNetPad.Create(St[0], TNNetPadMode(St[1]));
@@ -101724,6 +101840,7 @@ begin
       if S[0] = 'TNNetIdentity' then Result := TNNetIdentity.Create() else
       if S[0] = 'TNNetTransposeXD' then Result := TNNetTransposeXD.Create() else
       if S[0] = 'TNNetTransposeYD' then Result := TNNetTransposeYD.Create() else
+      if S[0] = 'TNNetGramMatrix' then Result := TNNetGramMatrix.Create() else
       if S[0] = 'TNNetDebug' then Result := TNNetDebug.Create(St[0], St[1]) else
       if S[0] = 'TNNetDotProducts' then Result := TNNetDotProducts.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetPad' then Result := TNNetPad.Create(St[0], TNNetPadMode(St[1])) else

@@ -70,6 +70,10 @@ type
     procedure TestSqueezeAxisLoadFromString;
     procedure TestSqueezeAxisGradientCheck;
 
+    // TNNetGramMatrix (channel-wise Gram / style statistic)
+    procedure TestGramMatrixGradientCheck;
+    procedure TestGramMatrixLoadFromString;
+
     // Non-zero padding modes (TNNetPadXY / TNNetPad)
     procedure TestPadXYReflectForward;
     procedure TestPadXYReplicateForward;
@@ -8579,6 +8583,63 @@ begin
       NN2.Compute(Input);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('Squeeze(axis) round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGramMatrixGradientCheck;
+begin
+  // TNNetGramMatrix maps a (X,Y,C) feature map to its (C,C,1) channel-wise Gram
+  // matrix G[i,j] = (1/(C*H*W))*sum_{x,y} A[x,y,i]*A[x,y,j]. The op is a smooth
+  // quadratic in the input, so the FP32 central difference is well-conditioned
+  // and the 0.01 default tolerance holds. The 1/(C*H*W) normalization keeps the
+  // Gram entries (and hence the gradient magnitude) O(1) for this 3x3x4 shape.
+  LayerInputGradientCheck(Self, TNNetGramMatrix.Create(),
+    'GramMatrix', 3, 3, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestGramMatrixLoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // SaveToString -> LoadFromString -> SaveToString must be byte-identical for a
+  // net containing TNNetGramMatrix, proving the (param-free) layer round-trips
+  // through both CreateLayer dispatch paths and the reloaded layer recomputes
+  // the same (C,C,1) Gram output.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 4, 1));
+    NN.AddLayer(TNNetGramMatrix.Create());
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+    AssertEquals('GramMatrix output SizeX', 4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('GramMatrix output SizeY', 4, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('GramMatrix output Depth', 1, NN.GetLastLayer.Output.Depth);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('GramMatrix round-trip class identity',
+        NN2.GetLastLayer is TNNetGramMatrix);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('GramMatrix SaveToString round-trip equality', Saved, Saved2);
+
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('GramMatrix round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
     finally
       NN2.Free;

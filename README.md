@@ -746,6 +746,7 @@ These layers are implemented with both forward (Compute) and backward (Backpropa
 |-----------------------------|-----------------------------|-------------------------------------------------------------------------------------------------------|
 | `TNNetTransposeXD`          | 2D or 3D                    | It transposes the X and Depth axes of the input data. It swaps the spatial dimension along the width (X-axis) with the channel or feature dimension (Depth axis).|
 | `TNNetTransposeYD`          | 2D or 3D                    | It transposes the Y and Depth axes of the input data. It swaps the spatial dimension along the height (Y-axis) with the channel or feature dimension (Depth axis).|
+| `TNNetGramMatrix`           | 2D or 3D in, 2D out         | Computes the channel-wise **Gram matrix** of the input feature map — the second-order texture / style statistic used by neural style transfer. For an input with `C` channels and `H*W` spatial positions it outputs the `(C, C, 1)` matrix `G[i,j] = (1/(C*H*W)) * sum_{x,y} A[x,y,i]*A[x,y,j]` (`G` is symmetric). No trainable parameters. Created with `TNNetGramMatrix.Create()`. See `examples/StyleTransfer`. |
 
 ### Layers with Activation Functions and no Trainable Parameter
 Activation functions are a fundamental component of neural networks. These functions play several crucial roles in neural networks:

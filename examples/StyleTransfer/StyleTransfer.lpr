@@ -55,34 +55,38 @@ type
   end;
 
 // ---------------------------------------------------------------------------
-// Gram-matrix helper (the new piece of code). Given a feature map
-// V of shape (W, H, C) (depth-contiguous in V.FData), compute the normalised
-// Gram matrix G[i,j] = (1/(C*H*W)) * sum_{x,y} V[x,y,i] * V[x,y,j].  G is
+// Gram-matrix helper. Given a feature map V of shape (W, H, C) (depth-contiguous
+// in V.FData), compute the normalised Gram matrix
+//   G[i,j] = (1/(C*H*W)) * sum_{x,y} V[x,y,i] * V[x,y,j]
 // returned as a (C, C, 1) volume (G.FData[i*C + j]).
+//
+// The Gram math now lives in the reusable TNNetGramMatrix layer
+// (neural/neuralnetwork.pas) instead of a hand-rolled nested loop; this helper
+// just drives it through a tiny one-layer feeder net so the call sites below are
+// unchanged. The layer uses the same 1/(C*H*W) normalization, so the numerics
+// are identical to the previous hand-made version.
 // ---------------------------------------------------------------------------
-procedure ComputeGram(V: TNNetVolume; G: TNNetVolume);
 var
-  C, HW, x, y, i, j, base: integer;
-  norm, acc: TNeuralFloat;
+  GramNet: TNNet = nil;          // lazily-built input -> TNNetGramMatrix feeder
+  GramInput: TNNetLayer = nil;   // input layer of GramNet (reshaped per call)
+
+procedure ComputeGram(V: TNNetVolume; G: TNNetVolume);
 begin
-  C := V.Depth;
-  HW := V.SizeX * V.SizeY;
-  G.ReSize(C, C, 1);
-  norm := 1.0 / (C * HW);
-  for i := 0 to C - 1 do
-    for j := i to C - 1 do
-    begin
-      acc := 0;
-      for y := 0 to V.SizeY - 1 do
-        for x := 0 to V.SizeX - 1 do
-        begin
-          base := (y * V.SizeX + x) * C;
-          acc := acc + V.FData[base + i] * V.FData[base + j];
-        end;
-      acc := acc * norm;
-      G.FData[i * C + j] := acc;
-      G.FData[j * C + i] := acc; // symmetric
-    end;
+  // (Re)build the one-layer feeder when the tap geometry changes. Each of the
+  // five style taps has its own fixed shape, so this rebuilds at most a handful
+  // of times across the whole run.
+  if (GramNet = nil) or
+     (GramInput.Output.SizeX <> V.SizeX) or
+     (GramInput.Output.SizeY <> V.SizeY) or
+     (GramInput.Output.Depth <> V.Depth) then
+  begin
+    GramNet.Free;
+    GramNet := TNNet.Create();
+    GramInput := GramNet.AddLayer(TNNetInput.Create(V.SizeX, V.SizeY, V.Depth, 1));
+    GramNet.AddLayer(TNNetGramMatrix.Create());
+  end;
+  GramNet.Compute(V);
+  G.Copy(GramNet.GetLastLayer.Output);
 end;
 
 // Accumulate the style-loss gradient w.r.t. the feature map V into Dst.
@@ -402,4 +406,5 @@ begin
   App.Title := 'StyleTransfer';
   App.Run;
   App.Free;
+  GramNet.Free; // release the lazily-built Gram feeder net
 end.
