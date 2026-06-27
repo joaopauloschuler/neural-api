@@ -1793,6 +1793,60 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
   - [ ] TNNetTestTimeTraining / TNNetTitansMemory backward "undo" loops (interleaved
         scalar etaGrad/dEta/dTheta accumulation) — the per-token forward rank-1 writes
         are vectorized; this is the lower-value remainder.
+- [ ] AVX-vectorize the `TNNetSpectralConv2D` forward inner contraction.
+      `ComputeCPU` still accumulates the per-mode complex matmul with a SCALAR
+      loop over the input-channel axis (neuralnetwork.pas ~66377-66378:
+      `yr := yr + (a*xr - bb*xi); yi := yi + (a*xi + bb*xr)` for `ci := 0 to
+      InDepthM1`). The sibling `TNNetSpectralConv1D` ALREADY vectorizes the
+      identical contraction (neuralnetwork.pas ~65418-65422) by staging the
+      real/imag weights and inputs into ci-contiguous PLANAR buffers
+      (`FWrPlane`/`FWiPlane`/`FxrPlane`/`FximPlane`) and issuing four
+      `TNNetVolume.DotProduct` calls (yr = Wr·xr − Wi·xim, yi = Wr·xim + Wi·xr).
+      The ci axis is already contiguous on all 2-D weight/input arrays, so port
+      the 1-D planar-buffer + DotProduct pattern to the 2-D
+      (ModesX × ModesY)-mode loop. Pin parity against the existing scalar path
+      with the SpectralConv2D numerical test before/after, and keep the scalar
+      loop as a fallback for non-contiguous edge shapes. Distinct from the FFT
+      FPU-trap item above (that is numerical-stability, this is throughput).
+- [ ] AVX-vectorize the strided STATE-READOUT forward loops in the
+      linear-attention / state-space family. Several layers compute the output
+      `y_t[e] = sum_d q_t[d]·S_t[d,e]` (or the SSM analogue
+      `y += C[s]·h_new[s]`) with a SCALAR inner loop where one operand is
+      strided: `TNNetGatedLinearAttention.Compute` (neuralnetwork.pas ~52881-52882,
+      `ss += FQ[baseT+d]·FS[baseS + d*Depth + e]` — FS strided by Depth over d),
+      `TNNetDeltaNet.Compute` (same shape), and the state-axis readouts in
+      `TNNetMamba2.Compute` / `TNNetSelectiveSSM.ComputeMultiState`
+      (`accY += C_row[s]·h_new[s]` over StateSize). The matching BACKWARD paths
+      already vectorize the symmetric op via `TNNetVolume.MulAdd` over the
+      contiguous axis (e.g. GLA backward ~52938), so the fix mirrors that:
+      buffer the strided state row (or the per-head `h_new` slice) into a small
+      contiguous scratch, then issue `TNNetVolume.DotProduct` over the
+      depth/state axis. Reuse the per-pass preallocated scratch-field convention.
+      Pin exact parity vs the current scalar output on each layer's numerical
+      test. Distinct from the existing chunked/parallel-forward items for these
+      layers (those change the ALGORITHM; this vectorizes the sequential readout).
+- [ ] Refactor `examples/MixtureDensityNetwork` to use the real
+      `TNNetMixtureDensity` layer + its log-sum-exp NLL instead of the
+      hand-coded mixture math. The example currently re-implements the whole
+      head in local procedures (`DecodeMix` softmax over mixture weights,
+      `MixtureNLL` mixture-of-Gaussians likelihood, `MixtureNLLGrad` manual
+      gradient) and never references `TNNetMixtureDensity`, even though that
+      layer (and the depth-axis packing convention) already exists in
+      neuralnetwork.pas. Rebuild the net so the K-Gaussian head is the library
+      layer and training uses its loss path; keep the example's data + plotting
+      so the before/after fit is comparable. Removes a duplicated
+      implementation of math the library already owns and exercises the real
+      layer end-to-end in an example.
+- [ ] Refactor `examples/HopfieldRetrieval` to use the real modern-Hopfield
+      retrieval path (`AddModernHopfieldRetrieval` / `TNNetModernHopfield`, or
+      `TNNetScaledDotProductAttention` for the single-step `softmax(beta·X·q)·X`
+      update) instead of the hand-coded `HopfieldStep` procedure. The example
+      manually implements the scaled dot-product scores, numerically-stable
+      softmax, and weighted-sum retrieval in inline loops and never references
+      the library layer/builder, both of which already exist. Wire the
+      iterated associative-memory step through the real layer so the example
+      demonstrates the shipped API; keep the stored-pattern recall demo and its
+      reported recall metric so the refactor is verifiable.
 
 ## Tests / numerical-gradient audit
 
