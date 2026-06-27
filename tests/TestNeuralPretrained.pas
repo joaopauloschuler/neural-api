@@ -521,6 +521,8 @@ type
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
+    procedure TestIPAdapterConfigFromJSONFile;
+    procedure TestIPAdapterParity;
     procedure TestVaeRoundTrip;
     procedure TestVqModelEncodeParity;
     procedure TestVqModelDecodeParity;
@@ -21112,6 +21114,121 @@ begin
     Cond.Free;
     MidResidual.Free;
     for ri := 0 to Config.NumDownResiduals - 1 do DownResiduals[ri].Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestIPAdapterConfigFromJSONFile;
+var
+  Config: TIPAdapterConfig;
+begin
+  Config := ReadIPAdapterConfigFromJSONFile(
+    FixturePath('tiny_ip_adapter_config.json'));
+  AssertEquals('model type', 'IPAdapterModel', Config.ModelType);
+  AssertEquals('clip dim', 10, Config.ClipEmbeddingsDim);
+  AssertEquals('cross dim', 6, Config.CrossAttentionDim);
+  AssertEquals('num image tokens', 4, Config.NumImageTokens);
+  AssertEquals('channels', 8, Config.Channels);
+  AssertEquals('num heads', 2, Config.NumHeads);
+  AssertEquals('hidden tokens', 9, Config.HiddenTokens);
+  AssertEquals('text seq len', 5, Config.TextSeqLen);
+  AssertEquals('attn index', 1, Config.AttnIndex);
+  AssertTrue('conditioning scale ~0.7',
+    Abs(Config.ConditioningScale - 0.7) < 1e-6);
+end;
+
+// IP-Adapter decoupled-cross-attention parity test (h94/IP-Adapter
+// ip-adapter_sd15, the plain non-Plus variant). tests/fixtures/tiny_ip_adapter.*
+// is a pico randomly-initialized IP-Adapter: the diffusers ImageProjModel
+// (image_proj.proj Linear + norm LayerNorm) plus ONE isolated decoupled
+// cross-attention block (the shared base-UNet Q/text-K/V/out + the EXTRA
+// to_k_ip / to_v_ip image K/V). The generator tools/ip_adapter_tiny_fixture.py
+// builds a self-contained numpy float64 oracle (diffusers is not installed) of
+//   out = Attn(Q,K_txt,V_txt) + scale*Attn(Q,K_img,V_img)
+// for a fixed (image_embed, unet hidden state, text states) tuple and pins the
+// image tokens + the combined cross-attn output. This exercises the two
+// genuinely-new pieces -- the image_proj loader and the decoupled second-K/V
+// cross-attention path (TNNetCrossAttention reused for the image stream) -- end
+// to end < 1e-4 vs the oracle. v1 scope: isolated block; full per-block UNet
+// tapping is a follow-up.
+procedure TTestNeuralPretrained.TestIPAdapterParity;
+var
+  NN: TNNet;
+  Config: TIPAdapterConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  HidArr, HidRow, TxtArr, TxtRow, ImgArr, OutArr, OutRow: TJSONArray;
+  Hidden, Text, ImageEmbed, Output: TNNetVolume;
+  SCnt, DCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildIPAdapterFromSafeTensors(
+    FixturePath('tiny_ip_adapter.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_ip_adapter_config.json'));
+  RefJson := TStringList.Create;
+  Hidden := TNNetVolume.Create;
+  Text := TNNetVolume.Create;
+  ImageEmbed := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    RefJson.LoadFromFile(FixturePath('tiny_ip_adapter_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    HidArr := TJSONArray(TJSONObject(RefRoot).Find('hidden_state'));
+    TxtArr := TJSONArray(TJSONObject(RefRoot).Find('text_states'));
+    ImgArr := TJSONArray(TJSONObject(RefRoot).Find('image_embeds'));
+    OutArr := TJSONArray(TJSONObject(RefRoot).Find('cross_attn_output'));
+    AssertTrue('hidden present', HidArr <> nil);
+
+    // hidden_state (HiddenTokens, Channels) -> (HiddenTokens,1,Channels).
+    Hidden.ReSize(Config.HiddenTokens, 1, Config.Channels);
+    for SCnt := 0 to Config.HiddenTokens - 1 do
+    begin
+      HidRow := TJSONArray(HidArr.Items[SCnt]);
+      for DCnt := 0 to Config.Channels - 1 do
+        Hidden.FData[SCnt * Config.Channels + DCnt] :=
+          HidRow.Items[DCnt].AsFloat;
+    end;
+    // text_states (TextSeqLen, CrossDim) -> (TextSeqLen,1,CrossDim).
+    Text.ReSize(Config.TextSeqLen, 1, Config.CrossAttentionDim);
+    for SCnt := 0 to Config.TextSeqLen - 1 do
+    begin
+      TxtRow := TJSONArray(TxtArr.Items[SCnt]);
+      for DCnt := 0 to Config.CrossAttentionDim - 1 do
+        Text.FData[SCnt * Config.CrossAttentionDim + DCnt] :=
+          TxtRow.Items[DCnt].AsFloat;
+    end;
+    // image_embeds (ClipDim,) -> (ClipDim,1,1).
+    ImageEmbed.ReSize(Config.ClipEmbeddingsDim, 1, 1);
+    for DCnt := 0 to Config.ClipEmbeddingsDim - 1 do
+      ImageEmbed.FData[DCnt] := ImgArr.Items[DCnt].AsFloat;
+
+    IPAdapterCrossAttention(NN, Config, Hidden, Text, ImageEmbed, Output);
+
+    // combined cross-attn output (HiddenTokens, Channels).
+    MaxDiff := 0;
+    for SCnt := 0 to Config.HiddenTokens - 1 do
+    begin
+      OutRow := TJSONArray(OutArr.Items[SCnt]);
+      for DCnt := 0 to Config.Channels - 1 do
+      begin
+        RefVal := OutRow.Items[DCnt].AsFloat;
+        GotVal := Output.FData[SCnt * Config.Channels + DCnt];
+        Diff := Abs(GotVal - RefVal);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('ip-adapter cross-attn: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Hidden.Free;
+    Text.Free;
+    ImageEmbed.Free;
+    Output.Free;
     RefJson.Free;
     NN.Free;
   end;

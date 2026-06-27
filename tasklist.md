@@ -241,7 +241,7 @@ rather than acted on.
 
 ### Computer vision & generative models
 
-- [ ] IP-Adapter image-prompt importer (BuildIPAdapterFromSafeTensors[Ex],
+- [X] LANDED IP-Adapter image-prompt importer (BuildIPAdapterFromSafeTensors[Ex],
       h94/IP-Adapter ip-adapter_sd15 key scheme) — a DISTINCT conditioning
       mechanism from the landed ControlNet (spatial feature injection) and
       T2I-Adapter: IP-Adapter conditions a frozen SD/SDXL UNet on a PROMPT IMAGE
@@ -259,6 +259,17 @@ rather than acted on.
       TestIPAdapterParity max|diff| < 1e-4 on the combined cross-attention output.
       Follow-ups: IP-Adapter-Plus (patch-token Resampler/PerceiverAttention image
       projection), FaceID variants (insightface embedding input), SDXL key scheme.
+      v1 LANDED: BuildIPAdapter[FromSafeTensors[Ex]] + TIPAdapterConfig +
+      ReadIPAdapterConfigFromJSONFile + IPAdapterCrossAttention driver. Builds the
+      image_proj module (diffusers ImageProjModel: proj Linear -> reshape to N
+      tokens -> norm LayerNorm) + ONE isolated decoupled cross-attn block (shared
+      base-UNet Q/text-K/V/out + the extra to_k_ip/to_v_ip image K/V, image stream
+      scaled by the fixed conditioning_scale via TNNetMulByConstant, image stream
+      reusing TNNetCrossAttention). The two genuinely-new pieces (image_proj loader
+      + decoupled second-K/V path) are verified end to end. TestIPAdapterParity
+      max|diff| < 1e-4 vs the numpy float64 oracle (tools/ip_adapter_tiny_fixture.py;
+      diffusers absent). FULL per-block tapping into BuildSDUNet is the remaining
+      follow-up (isolated block fully exercises the new code; no fragile UNet hack).
 
 - [ ] Llama 3.2 Vision (mllama) cross-attention VLM importer
       (BuildMllamaFromSafeTensors[Ex], model_type "mllama", e.g.

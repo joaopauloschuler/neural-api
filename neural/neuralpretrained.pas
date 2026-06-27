@@ -9571,6 +9571,83 @@ procedure ControlNetResiduals(Net: TNNet; const Config: TControlNetConfig;
   DownResiduals: array of TNNetVolume; MidResidual: TNNetVolume);
 
 // ---------------------------------------------------------------------------
+// IP-ADAPTER IMAGE-PROMPT IMPORT (h94/IP-Adapter ip-adapter_sd15, the plain
+// non-Plus variant). IP-Adapter conditions a FROZEN SD/SDXL UNet on a PROMPT
+// IMAGE via DECOUPLED cross-attention -- a DISTINCT mechanism from the landed
+// ControlNet (spatial feature injection) and T2I-Adapter. A CLIP image encoder
+// (reuse BuildClipVisionTower; out of scope here -- the pooled image embedding
+// is taken as a precomputed input) feeds a small image-projection MLP that
+// produces N image tokens, and every UNet cross-attention block gains an EXTRA
+// set of K/V projections (to_k_ip / to_v_ip) whose attention output is ADDED to
+// the text-cross-attention output:
+//   out = Attn(Q, K_txt, V_txt) + scale * Attn(Q, K_img, V_img)
+// Q (the shared UNet to_q over the hidden state) and to_out.0 are reused from
+// the base UNet cross-attn; only to_k_ip / to_v_ip (and the image_proj module)
+// are new IP-Adapter weights.
+//
+// The two genuinely-new pieces this importer adds (and that the parity test
+// isolates) are:
+//   (1) image_proj = diffusers ImageProjModel: from the POOLED CLIP image
+//       embedding a single Linear `proj` (WITH bias) -> reshape to N tokens of
+//       dim cross_attention_dim -> LayerNorm `norm`.
+//   (2) the decoupled second-K/V cross-attention path, reusing
+//       TNNetCrossAttention for the image stream (per head: K|V packed from the
+//       to_k_ip / to_v_ip slices) added to the text stream and scaled by the
+//       fixed conditioning_scale.
+//
+// v1 scope: BuildIPAdapter builds the image_proj module + ONE isolated
+// decoupled cross-attention block (the SAME multi-head construction the SD UNet
+// cross-attn uses, with the extra image K/V tapped in) so the new math is
+// verified end-to-end on the pico oracle (TestIPAdapterParity, max|diff|<1e-4).
+// FULL per-block tapping into BuildSDUNet is a follow-up (the new code is fully
+// exercised by the isolated block). Follow-ups: IP-Adapter-Plus, FaceID, SDXL.
+type
+  TIPAdapterConfig = record
+    ClipEmbeddingsDim: integer;   // pooled CLIP image-embedding dim
+    CrossAttentionDim: integer;   // text encoder width (image tokens dim too)
+    NumImageTokens: integer;      // clip_extra_context_tokens (4 standard)
+    Channels: integer;            // UNet cross-attn block hidden dim
+    NumHeads: integer;            // attention heads
+    HiddenTokens: integer;        // UNet hidden-state token count (H*W)
+    TextSeqLen: integer;          // text encoder_hidden_states length
+    ConditioningScale: TNeuralFloat; // fixed image-stream weight
+    AttnIndex: integer;           // ip_adapter.<idx>.* key index
+    ModelType: string;            // 'IPAdapterModel'
+  end;
+
+function ReadIPAdapterConfigFromJSONFile(const FileName: string): TIPAdapterConfig;
+
+function IPAdapterConfigToString(const Config: TIPAdapterConfig): string;
+
+// Builds the image_proj module + one isolated decoupled cross-attention block
+// and loads every weight from Reader (caller owns Reader). THREE TNNetInputs:
+//   input0 = UNet hidden state (HiddenTokens,1,Channels)  -- the Q source
+//   input1 = text states       (TextSeqLen,1,CrossAttentionDim)
+//   input2 = pooled CLIP image embedding (1,1,ClipEmbeddingsDim)
+// The net's final layer is the combined cross-attn output (HiddenTokens,1,
+// Channels). See IPAdapterCrossAttention for the driver.
+function BuildIPAdapter(Reader: TNNetSafeTensorsReader;
+  const Config: TIPAdapterConfig; pTrainable: boolean = true): TNNet;
+
+function BuildIPAdapterFromSafeTensorsEx(const FileName: string;
+  const Config: TIPAdapterConfig; pTrainable: boolean = true): TNNet;
+
+function BuildIPAdapterFromSafeTensors(const FileName: string;
+  out Config: TIPAdapterConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+
+// Returns the text-states (input1) / image-embed (input2) TNNetInput.
+function IPAdapterTextStatesInput(Net: TNNet): TNNetLayer;
+function IPAdapterImageEmbedInput(Net: TNNet): TNNetLayer;
+
+// Fills the three inputs, runs one forward, and copies the combined cross-attn
+// output (HiddenTokens,1,Channels) into Output (resized here, caller owns it).
+// Hidden is (HiddenTokens,1,Channels); Text is (TextSeqLen,1,CrossAttentionDim);
+// ImageEmbed is (1,1,ClipEmbeddingsDim).
+procedure IPAdapterCrossAttention(Net: TNNet; const Config: TIPAdapterConfig;
+  Hidden, Text, ImageEmbed, Output: TNNetVolume);
+
+// ---------------------------------------------------------------------------
 // STABLE DIFFUSION VAE ENCODER IMPORT (diffusers AutoencoderKL ENCODER), the
 // mirror image of the decoder above; together they form a full AutoencoderKL
 // round-trip. The encoder maps an RGB image to the latent moments and reuses
@@ -60840,6 +60917,245 @@ begin
   for i := 0 to Config.NumDownResiduals - 1 do
     DownResiduals[i].Copy(Taps[i].Output);
   MidResidual.Copy(Taps[Config.NumDownResiduals].Output);
+end;
+
+// ===========================================================================
+// IP-ADAPTER IMAGE-PROMPT IMPORT (h94/IP-Adapter ip-adapter_sd15)
+// ===========================================================================
+
+function ReadIPAdapterConfigFromJSONFile(
+  const FileName: string): TIPAdapterConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ClassName: string;
+begin
+  if not FileExists(FileName) then
+    ImportError('IP-Adapter import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('IP-Adapter import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('IP-Adapter import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ClassName := Obj.Get('_class_name', Obj.Get('model_type', 'IPAdapterModel'));
+    if ClassName <> 'IPAdapterModel' then
+      ImportError('IP-Adapter import: _class_name is "' + ClassName +
+        '" - only IPAdapterModel is supported here.');
+    Result.ModelType := ClassName;
+    Result.ClipEmbeddingsDim := Obj.Get('clip_embeddings_dim', 0);
+    Result.CrossAttentionDim := Obj.Get('cross_attention_dim', 0);
+    Result.NumImageTokens := Obj.Get('clip_extra_context_tokens', 4);
+    Result.Channels := Obj.Get('channels', 0);
+    Result.NumHeads := Obj.Get('num_heads', 0);
+    Result.HiddenTokens := Obj.Get('hidden_tokens', 0);
+    Result.TextSeqLen := Obj.Get('text_seq_len', 0);
+    Result.ConditioningScale := Obj.Get('conditioning_scale', 1.0);
+    Result.AttnIndex := Obj.Get('attn_index', 1);
+    if (Result.ClipEmbeddingsDim < 1) or (Result.CrossAttentionDim < 1) or
+       (Result.NumImageTokens < 1) or (Result.Channels < 1) or
+       (Result.NumHeads < 1) or (Result.HiddenTokens < 1) or
+       (Result.TextSeqLen < 1) then
+      ImportError('IP-Adapter import: config has a non-positive required field.');
+    if (Result.Channels mod Result.NumHeads) <> 0 then
+      ImportError('IP-Adapter import: channels (' + IntToStr(Result.Channels) +
+        ') not divisible by num_heads (' + IntToStr(Result.NumHeads) + ').');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function IPAdapterConfigToString(const Config: TIPAdapterConfig): string;
+begin
+  Result := Format('IPAdapter(%s clip=%d cross=%d tokens=%d ch=%d heads=%d ' +
+    'hidden=%d textseq=%d scale=%.4f idx=%d)',
+    [Config.ModelType, Config.ClipEmbeddingsDim, Config.CrossAttentionDim,
+     Config.NumImageTokens, Config.Channels, Config.NumHeads,
+     Config.HiddenTokens, Config.TextSeqLen, Config.ConditioningScale,
+     Config.AttnIndex]);
+end;
+
+function BuildIPAdapter(Reader: TNNetSafeTensorsReader;
+  const Config: TIPAdapterConfig; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  HiddenIn, TextIn, ImgEmbIn: TNNetLayer;
+  ImgProj, ImgTokens: TNNetLayer;
+  QProj, KTxt, VTxt, KImg, VImg: TNNetLayer;
+  QSlice, KTxtSlice, VTxtSlice, KImgSlice, VImgSlice: TNNetLayer;
+  KVTxtPack, KVImgPack, TxtHead, ImgHead, ScaledImg, Combined: TNNetLayer;
+  TxtHeads, ImgHeads: array of TNNetLayer;
+  QChannels: array of integer;
+  AttnPrefix: string;
+  d, Cross, Heads, HeadDim, hh, dd, HeadsM1, HeadDimM1: integer;
+begin
+  d := Config.Channels;
+  Cross := Config.CrossAttentionDim;
+  Heads := Config.NumHeads;
+  HeadDim := d div Heads;
+  HeadsM1 := Heads - 1;
+  HeadDimM1 := HeadDim - 1;
+  AttnPrefix := 'unet.attn2.';
+  NN := TNNet.Create;
+  SetLength(TxtHeads, Heads);
+  SetLength(ImgHeads, Heads);
+  SetLength(QChannels, HeadDim);
+
+  // input0 = UNet hidden state (Q source); input1 = text states; input2 = the
+  // pooled CLIP image embedding (single token).
+  // input0 (TNNetInput #0) = UNet hidden state tokens (SizeX=HiddenTokens,1,d);
+  // #1 = text-state tokens; #2 = the pooled CLIP image embedding (single
+  // token). Built in that order so the Nth-input accessors resolve positionally
+  // (mirrors the SD UNet / ControlNet input convention). Inputs are already in
+  // (SeqLen,1,Depth) token shape -- no reshape needed for the attention path.
+  HiddenIn := NN.AddLayer(TNNetInput.Create(Config.HiddenTokens, 1, d));
+  TextIn := NN.AddLayer(TNNetInput.Create(Config.TextSeqLen, 1, Cross));
+  ImgEmbIn := NN.AddLayer(TNNetInput.Create(Config.ClipEmbeddingsDim, 1, 1));
+
+  // ---- image_proj (diffusers ImageProjModel): Linear (clip -> N*cross, WITH
+  //      bias) -> reshape to N tokens of dim cross -> LayerNorm. ----
+  ImgProj := NN.AddLayerAfter(
+    TNNetFullConnectLinear.Create(Config.NumImageTokens * Cross).
+      SetTrainable(pTrainable), ImgEmbIn);
+  NN.AddLayer(TNNetReshape.Create(Config.NumImageTokens, 1, Cross));
+  ImgTokens := NN.AddLayer(
+    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable));
+
+  // ---- decoupled cross-attention (the SAME multi-head construction the SD
+  //      UNet cross-attn uses, with the EXTRA image K/V tapped in). ----
+  QProj := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(d, {SuppressBias=}1).SetTrainable(pTrainable),
+    HiddenIn);
+  KTxt := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(d, {SuppressBias=}1).SetTrainable(pTrainable),
+    TextIn);
+  VTxt := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(d, {SuppressBias=}1).SetTrainable(pTrainable),
+    TextIn);
+  KImg := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(d, {SuppressBias=}1).SetTrainable(pTrainable),
+    ImgTokens);
+  VImg := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(d, {SuppressBias=}1).SetTrainable(pTrainable),
+    ImgTokens);
+  for hh := 0 to HeadsM1 do
+  begin
+    for dd := 0 to HeadDimM1 do QChannels[dd] := hh * HeadDim + dd;
+    QSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), QProj);
+    KTxtSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), KTxt);
+    VTxtSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), VTxt);
+    KImgSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), KImg);
+    VImgSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), VImg);
+    KVTxtPack := NN.AddLayer(TNNetDeepConcat.Create([KTxtSlice, VTxtSlice]));
+    TxtHeads[hh] := NN.AddLayerAfter(
+      TNNetCrossAttention.Create(HeadDim, {CausalMask=}false, KVTxtPack), QSlice);
+    KVImgPack := NN.AddLayer(TNNetDeepConcat.Create([KImgSlice, VImgSlice]));
+    ImgHeads[hh] := NN.AddLayerAfter(
+      TNNetCrossAttention.Create(HeadDim, {CausalMask=}false, KVImgPack), QSlice);
+  end;
+  TxtHead := NN.AddLayer(TNNetDeepConcat.Create(TxtHeads));
+  ImgHead := NN.AddLayer(TNNetDeepConcat.Create(ImgHeads));
+  // image stream scaled by the fixed conditioning_scale, then summed with text.
+  ScaledImg := NN.AddLayerAfter(
+    TNNetMulByConstant.Create(Config.ConditioningScale), ImgHead);
+  Combined := NN.AddLayer(TNNetSum.Create([TxtHead, ScaledImg]));
+  // shared to_out.0 (biased) over the combined per-head output.
+  NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), Combined);
+
+  // ---- weight loading ----
+  // image_proj.proj: Linear (clip -> N*cross) WITH bias.
+  LoadLlamaLinearWeights(Reader, ImgProj, 'image_proj.proj.weight',
+    Config.ClipEmbeddingsDim, Config.NumImageTokens * Cross, 0, -1, 0,
+    'image_proj.proj.bias');
+  LoadLayerNormWeights(Reader, ImgTokens,
+    'image_proj.norm.weight', 'image_proj.norm.bias', Cross);
+  // base UNet attn2 (shared Q + text K/V + out), all bias-free except to_out.0.
+  LoadLlamaLinearWeights(Reader, QProj, AttnPrefix + 'to_q.weight', d, d, 0, -1, 0, '');
+  LoadLlamaLinearWeights(Reader, KTxt, AttnPrefix + 'to_k.weight', Cross, d, 0, -1, 0, '');
+  LoadLlamaLinearWeights(Reader, VTxt, AttnPrefix + 'to_v.weight', Cross, d, 0, -1, 0, '');
+  LoadLlamaLinearWeights(Reader, NN.GetLastLayer(),
+    AttnPrefix + 'to_out.0.weight', d, d, 0, -1, 0, AttnPrefix + 'to_out.0.bias');
+  // ip_adapter extra K/V (bias-free).
+  LoadLlamaLinearWeights(Reader, KImg,
+    'ip_adapter.' + IntToStr(Config.AttnIndex) + '.to_k_ip.weight',
+    Cross, d, 0, -1, 0, '');
+  LoadLlamaLinearWeights(Reader, VImg,
+    'ip_adapter.' + IntToStr(Config.AttnIndex) + '.to_v_ip.weight',
+    Cross, d, 0, -1, 0, '');
+
+  SetLength(TxtHeads, 0);
+  SetLength(ImgHeads, 0);
+  SetLength(QChannels, 0);
+  Result := NN;
+end;
+
+function BuildIPAdapterFromSafeTensorsEx(const FileName: string;
+  const Config: TIPAdapterConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := TNNetSafeTensorsReader.Create(FileName);
+  try
+    Result := BuildIPAdapter(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildIPAdapterFromSafeTensors(const FileName: string;
+  out Config: TIPAdapterConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+var
+  CfgFile: string;
+begin
+  CfgFile := ConfigFileName;
+  if CfgFile = '' then
+    CfgFile := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadIPAdapterConfigFromJSONFile(CfgFile);
+  Result := BuildIPAdapterFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+function IPAdapterTextStatesInput(Net: TNNet): TNNetLayer;
+begin
+  Result := SDUNetNthInput(Net, 1);
+end;
+
+function IPAdapterImageEmbedInput(Net: TNNet): TNNetLayer;
+begin
+  Result := SDUNetNthInput(Net, 2);
+end;
+
+procedure IPAdapterCrossAttention(Net: TNNet; const Config: TIPAdapterConfig;
+  Hidden, Text, ImageEmbed, Output: TNNetVolume);
+var
+  TextIn, ImgIn: TNNetLayer;
+begin
+  TextIn := IPAdapterTextStatesInput(Net);
+  if Text.Size <> TextIn.Output.Size then
+    ImportError('IPAdapterCrossAttention: text-states size ' +
+      IntToStr(Text.Size) + ' <> net text input size ' +
+      IntToStr(TextIn.Output.Size) + '.');
+  TextIn.Output.Copy(Text);
+  ImgIn := IPAdapterImageEmbedInput(Net);
+  if ImageEmbed.Size <> ImgIn.Output.Size then
+    ImportError('IPAdapterCrossAttention: image-embed size ' +
+      IntToStr(ImageEmbed.Size) + ' <> net image input size ' +
+      IntToStr(ImgIn.Output.Size) + '.');
+  ImgIn.Output.Copy(ImageEmbed);
+  Net.Compute(Hidden);
+  Output.Copy(Net.GetLastLayer().Output);
 end;
 
 // ===========================================================================
