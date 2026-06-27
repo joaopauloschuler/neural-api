@@ -996,18 +996,28 @@ rather than acted on.
       examples/TreeSpeculativeDecoding demo reporting the accepted-tokens/forward
       speedup vs the linear self-speculative baseline.
 
-- [ ] ImageNet top-1 / top-5 parity eval harness for the imported vision backbones
-      (EvaluateImageNet + ImageNetReport in neuralimagemetrics.pas or a sibling, plus
-      examples/ImageNetEval). Today there is NO end-to-end accuracy check for the
-      landed classifier importers (ResNet / ViT / Swin / DINOv2 / MobileNetV3 / VGG /
-      Inception-v3): each importer's parity test only compares raw logits on one or
-      two tensors, which catches a transposed weight but NOT a wrong preprocessing
-      pipeline (resize/crop/normalize) or a label-permutation. The harness loads a
-      small folder of labelled ImageNet-val JPEGs, applies the importer's declared
-      ImageSize + csImageNetMean/csImageNetStd (already in neuraldatasets.pas) with
-      the correct resize-then-center-crop, runs the net, and reports top-1 / top-5
-      accuracy with a confusion sample. This is the missing import-VERIFICATION
-      backstop mirroring what MMLUEval/PerplexityEval do for the LLM side.
+- [X] ImageNet top-1 / top-5 parity eval harness for the imported vision backbones
+      (EvaluateImageNet + ImageNetReport + TopKIndices + TNNetImageNetSample/Stats in
+      neuralimagemetrics.pas, plus examples/ImageNetEval). LANDED: the harness takes
+      already-preprocessed network-ready volumes + gold labels (decoupled like
+      EvaluateMMLU), runs NN.Compute, forms top-1/top-K via TopKIndices (first-max
+      tie-break), tallies top-1 (argmax==gold) and top-K (gold in top-K) accuracy,
+      and retains up to MaxConfusion top-1 misses (each flagged top-K hit/miss) for a
+      confusion sample; ImageNetReport formats it. The example's default SMOKE trains
+      a small CNN on a deterministic synthetic 6-class set rendered LARGE and pushed
+      through the REAL neuraldatasets.PreprocessImageForVisionModel transform
+      (shorter-side resize -> center-crop -> csImageNetMean/csImageNetStd), exercising
+      the real transform + harness end to end (reports 1.0000/1.0000 on the separable
+      synthetic classes). A --full <dir> hook prints the documented real-ImageNet-val
+      recipe (labels.txt + JPEGs; LoadImageForVisionModel with the importer's
+      ImageSize + ImageNet mean/std; EvaluateImageNet(NN, Samples, 1000, 5)). Tests
+      TestTopKIndices / TestEvaluateImageNetCounting / TestEvaluateImageNetSkipAndConfusion
+      / TestImageNetReportFormat / TestPreprocessTransformMath pin the harness logic +
+      transform math (TestNeuralImageMetrics, full suite 2339 green).
+  - [ ] Run against REAL ImageNet-val: wire one landed classifier importer
+        (BuildResNetFromSafeTensors etc.) over a real checkpoint + the 50k-image
+        ImageNet-val set and compare top-1/top-5 to the published torchvision numbers
+        (the smoke is synthetic-only by design). Mind the multi-GB RAM budget.
 
 - [ ] End-to-end latent text-to-image generation example (examples/LatentTextToImage)
       that finally CHAINS the imported generative pieces into one pipeline on CPU.

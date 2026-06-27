@@ -26,7 +26,8 @@ interface
 
 uses
   Classes, SysUtils, Math, fpcunit, testregistry, fpjson, jsonparser,
-  neuralvolume, neuralnetwork, neuralimagemetrics, neuralpretrained;
+  neuralvolume, neuralnetwork, neuralimagemetrics, neuralpretrained,
+  neuraldatasets;
 
 type
   TTestNeuralImageMetrics = class(TTestCase)
@@ -72,6 +73,21 @@ type
     // against ITSELF is ~0, and FID grows monotonically as the generated set is
     // perturbed further from the real set.
     procedure TestInceptionFIDSelfZeroAndMonotone;
+    // --- ImageNet top-1 / top-5 accuracy harness ---
+    // TopKIndices returns the K largest indices, most-confident first, with a
+    // first-max (lowest-index) tie-break.
+    procedure TestTopKIndices;
+    // End-to-end top-1 / top-5 counting on a stub identity net with pinned
+    // class-score volumes (deterministic, asserted accuracy numbers).
+    procedure TestEvaluateImageNetCounting;
+    // GoldLabel outside 0..NumClasses-1 is skipped; the confusion sample is
+    // capped at MaxConfusion and records the top-K-hit flag.
+    procedure TestEvaluateImageNetSkipAndConfusion;
+    // The report formats top-1 / top-5 lines and the confusion sample.
+    procedure TestImageNetReportFormat;
+    // The resize-shorter-side + center-crop + mean/std transform math
+    // (PreprocessImageForVisionModel) is exact on a pinned synthetic image.
+    procedure TestPreprocessTransformMath;
   end;
 
 implementation
@@ -622,6 +638,209 @@ begin
   finally
     realSet.Free; genSame.Free; genNear.Free; genFar.Free;
     NN.Free;
+  end;
+end;
+
+{ ImageNet accuracy harness }
+
+// A stub net whose output IS its input: a single Input layer of the class-score
+// shape. Compute(V) copies V into the output, so feeding a hand-built score
+// volume pins the net's logits exactly -> deterministic top-1 / top-5 counts.
+function MakeScoreStubNet(NumClasses: integer): TNNet;
+begin
+  Result := TNNet.Create;
+  Result.AddLayer(TNNetInput.Create(1, 1, NumClasses));
+  // TNNet.Compute requires >= 2 layers; Identity preserves the score volume.
+  Result.AddLayer(TNNetIdentity.Create);
+end;
+
+// Build a score volume (1,1,NumClasses) whose argmax is TopClass with a
+// descending ramp, then bump RunnerUp so the SECOND-place class is controlled
+// (used to engineer top-1-miss-but-top-5-hit cases). RunnerUp < 0 disables.
+function MakeScoreVolume(NumClasses, TopClass, RunnerUp: integer): TNNetVolume;
+var
+  c: integer;
+begin
+  Result := TNNetVolume.Create(1, 1, NumClasses);
+  for c := 0 to NumClasses - 1 do Result.FData[c] := 0.1;
+  Result.FData[TopClass] := 10.0;       // clear argmax
+  if (RunnerUp >= 0) and (RunnerUp < NumClasses) and (RunnerUp <> TopClass) then
+    Result.FData[RunnerUp] := 5.0;      // clear second place
+end;
+
+procedure TTestNeuralImageMetrics.TestTopKIndices;
+var
+  Scores: array[0..5] of TNeuralFloat;
+  Pred: array[0..2] of integer;
+  Ties: array[0..3] of TNeuralFloat;
+  TiePred: array[0..1] of integer;
+begin
+  // Distinct values: 0.1 0.9 0.3 0.7 0.2 0.5 -> top-3 = 1,3,5.
+  Scores[0] := 0.1; Scores[1] := 0.9; Scores[2] := 0.3;
+  Scores[3] := 0.7; Scores[4] := 0.2; Scores[5] := 0.5;
+  TopKIndices(Scores, 6, 3, Pred);
+  AssertEquals('top-1 index', 1, Pred[0]);
+  AssertEquals('top-2 index', 3, Pred[1]);
+  AssertEquals('top-3 index', 5, Pred[2]);
+
+  // Exact ties: first-max tie-break keeps the LOWEST index first.
+  Ties[0] := 1.0; Ties[1] := 1.0; Ties[2] := 0.0; Ties[3] := 1.0;
+  TopKIndices(Ties, 4, 2, TiePred);
+  AssertEquals('tie top-1 lowest index', 0, TiePred[0]);
+  AssertEquals('tie top-2 next index', 1, TiePred[1]);
+end;
+
+procedure TTestNeuralImageMetrics.TestEvaluateImageNetCounting;
+const
+  cNumClasses = 10;
+var
+  NN: TNNet;
+  Samples: TNNetImageNetSampleArray;
+  Stats: TNNetImageNetStats;
+  i: integer;
+begin
+  NN := MakeScoreStubNet(cNumClasses);
+  SetLength(Samples, 4);
+  // s0: top1 = gold (3)              -> top1 hit, top5 hit
+  // s1: top1 = gold (7)              -> top1 hit, top5 hit
+  // s2: top1 = 0, gold = 1 runner-up -> top1 MISS, top5 hit
+  // s3: top1 = 9, gold = 4 (buried)  -> top1 MISS, top5 MISS
+  Samples[0].Image := MakeScoreVolume(cNumClasses, 3, -1); Samples[0].GoldLabel := 3;
+  Samples[1].Image := MakeScoreVolume(cNumClasses, 7, -1); Samples[1].GoldLabel := 7;
+  Samples[2].Image := MakeScoreVolume(cNumClasses, 0, 1);  Samples[2].GoldLabel := 1;
+  Samples[3].Image := MakeScoreVolume(cNumClasses, 9, -1); Samples[3].GoldLabel := 4;
+  try
+    Stats := EvaluateImageNet(NN, Samples, cNumClasses, 5, 16);
+    AssertEquals('items scored', 4, Stats.ItemCount);
+    AssertEquals('K used', 5, Stats.K);
+    AssertEquals('top-1 correct', 2, Stats.Top1Correct);
+    AssertEquals('top-5 correct', 3, Stats.TopKCorrect);
+    AssertEquals('top-1 accuracy', 0.5, Stats.Top1Accuracy, 1e-6);
+    AssertEquals('top-5 accuracy', 0.75, Stats.TopKAccuracy, 1e-6);
+  finally
+    for i := 0 to High(Samples) do Samples[i].Image.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralImageMetrics.TestEvaluateImageNetSkipAndConfusion;
+const
+  cNumClasses = 10;
+var
+  NN: TNNet;
+  Samples: TNNetImageNetSampleArray;
+  Stats: TNNetImageNetStats;
+  i: integer;
+begin
+  NN := MakeScoreStubNet(cNumClasses);
+  SetLength(Samples, 4);
+  // s0 gold=99 (out of range) -> SKIPPED
+  // s1 top1=2 gold=2          -> hit (no confusion row)
+  // s2 top1=0 gold=1 runner   -> top1 miss, top5 hit  (confusion row, InTopK)
+  // s3 top1=9 gold=5 buried   -> top1 miss, top5 miss (confusion row)
+  Samples[0].Image := MakeScoreVolume(cNumClasses, 0, -1); Samples[0].GoldLabel := 99;
+  Samples[0].SourceName := 'skip.jpg';
+  Samples[1].Image := MakeScoreVolume(cNumClasses, 2, -1); Samples[1].GoldLabel := 2;
+  Samples[1].SourceName := 'hit.jpg';
+  Samples[2].Image := MakeScoreVolume(cNumClasses, 0, 1);  Samples[2].GoldLabel := 1;
+  Samples[2].SourceName := 'near.jpg';
+  Samples[3].Image := MakeScoreVolume(cNumClasses, 9, -1); Samples[3].GoldLabel := 5;
+  Samples[3].SourceName := 'far.jpg';
+  try
+    // MaxConfusion = 1: only the FIRST top-1 miss is retained.
+    Stats := EvaluateImageNet(NN, Samples, cNumClasses, 5, 1);
+    AssertEquals('out-of-range gold skipped', 3, Stats.ItemCount);
+    AssertEquals('top-1 correct', 1, Stats.Top1Correct);
+    AssertEquals('top-5 correct', 2, Stats.TopKCorrect);
+    AssertEquals('confusion capped at MaxConfusion', 1, Length(Stats.Confusion));
+    AssertEquals('confusion source', 'near.jpg', Stats.Confusion[0].SourceName);
+    AssertEquals('confusion gold', 1, Stats.Confusion[0].GoldLabel);
+    AssertEquals('confusion pred (top1)', 0, Stats.Confusion[0].PredLabel);
+    AssertTrue('confusion InTopK flag', Stats.Confusion[0].InTopK);
+  finally
+    for i := 0 to High(Samples) do Samples[i].Image.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralImageMetrics.TestImageNetReportFormat;
+const
+  cNumClasses = 10;
+var
+  NN: TNNet;
+  Samples: TNNetImageNetSampleArray;
+  Stats: TNNetImageNetStats;
+  Names: array of string;
+  Report: string;
+  i: integer;
+begin
+  NN := MakeScoreStubNet(cNumClasses);
+  SetLength(Samples, 2);
+  Samples[0].Image := MakeScoreVolume(cNumClasses, 3, -1); Samples[0].GoldLabel := 3;
+  Samples[0].SourceName := 'cat.jpg';
+  Samples[1].Image := MakeScoreVolume(cNumClasses, 9, -1); Samples[1].GoldLabel := 4;
+  Samples[1].SourceName := 'dog.jpg';
+  SetLength(Names, cNumClasses);
+  for i := 0 to cNumClasses - 1 do Names[i] := 'class' + IntToStr(i);
+  try
+    Stats := EvaluateImageNet(NN, Samples, cNumClasses, 5, 16);
+    Report := ImageNetReport(Stats, Names, 'StubNet');
+    AssertTrue('title in report', Pos('StubNet top-1 / top-5', Report) > 0);
+    AssertTrue('top-1 line', Pos('top-1', Report) > 0);
+    AssertTrue('top-5 line', Pos('top-5', Report) > 0);
+    AssertTrue('images scored line', Pos('images scored : 2', Report) > 0);
+    AssertTrue('confusion sample present', Pos('confusion sample', Report) > 0);
+    AssertTrue('confusion row names class', Pos('class4', Report) > 0);
+    AssertTrue('confusion flags top-K miss', Pos('top-K miss', Report) > 0);
+  finally
+    for i := 0 to High(Samples) do Samples[i].Image.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralImageMetrics.TestPreprocessTransformMath;
+var
+  Src, Dst: TNNetVolume;
+  Mean, Std: array[0..2] of TNeuralFloat;
+  x, y, c: integer;
+  expect: TNeuralFloat;
+begin
+  // A 6x4 image (W=6 wider, H=4 shorter): shorter side resized to 4 is a no-op
+  // on H; width is unchanged, so the resize stage is identity (SizeX/SizeY both
+  // pass through when already at target). We instead use a SQUARE 4x4 image so
+  // ResizeShorterSide=4 is exactly identity, then center-crop 2x2 + normalize is
+  // pure arithmetic we can assert to the bit.
+  Src := TNNetVolume.Create(4, 4, 3);
+  Dst := TNNetVolume.Create;
+  Mean[0] := 0.5; Mean[1] := 0.25; Mean[2] := 0.0;
+  Std[0] := 0.5;  Std[1] := 1.0;   Std[2] := 2.0;
+  try
+    // Fill with a deterministic pattern in 0..255 byte range.
+    for y := 0 to 3 do
+      for x := 0 to 3 do
+        for c := 0 to 2 do
+          Src[x, y, c] := (x * 16 + y * 4 + c * 64) mod 256;
+
+    // Resize shorter side -> 4 (identity for a 4x4 src), center-crop 2x2.
+    PreprocessImageForVisionModel(Src, Dst, 4, 2, Mean, Std);
+
+    AssertEquals('crop width', 2, Dst.SizeX);
+    AssertEquals('crop height', 2, Dst.SizeY);
+    AssertEquals('crop depth', 3, Dst.Depth);
+
+    // Center crop offset for 4 -> 2 is (4-2) div 2 = 1, so Dst[x,y] = Src[x+1,y+1],
+    // then (v/255 - mean)/std. Assert every cropped pixel exactly.
+    for y := 0 to 1 do
+      for x := 0 to 1 do
+        for c := 0 to 2 do
+        begin
+          expect := (Src[x + 1, y + 1, c] / 255.0 - Mean[c]) / Std[c];
+          AssertEquals(Format('pixel (%d,%d,%d)', [x, y, c]),
+            expect, Dst[x, y, c], 1e-6);
+        end;
+  finally
+    Src.Free;
+    Dst.Free;
   end;
 end;
 
