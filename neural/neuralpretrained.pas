@@ -8960,6 +8960,66 @@ function BuildEfficientNetFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// REGNET IMAGE-CLASSIFICATION BACKBONE IMPORT (transformers model_type
+// "regnet", e.g. facebook/regnet-y-040 / facebook/regnet-x-040). The
+// AnyNet/RegNet design-space CNN: a 3x3-stride2 stem then 4 stages of
+// bottleneck blocks. Each block is a ResNet-style residual unit:
+//   layer.0 = 1x1 conv+BN+ReLU (in -> out)
+//   layer.1 = grouped 3x3 conv+BN+ReLU (out -> out, groups = out/group_width,
+//             stride on the first block of each stage)
+//   [regnet_y only] SE gate (pool -> 1x1 reduce +bias -> ReLU -> 1x1 expand
+//             +bias -> sigmoid -> per-channel scale)
+//   last   = 1x1 conv+BN (no activation)
+//   shortcut (first block of a stage only) = 1x1 stride conv+BN.
+// Every conv+BN is folded at load time exactly like the ResNet importer; the
+// builder is config-driven block-width/depth wiring over already-landed
+// layers (AddGroupedConvolution, TNNetConvolutionLinear, the EfficientNet-style
+// SE gate, the ResNet identity residual) -- no new leaf layers.
+// ---------------------------------------------------------------------------
+type
+  TRegNetConfig = record
+    EmbeddingSize: integer;                 // stem out channels (32 default)
+    HiddenSizes: array[0..3] of integer;    // per-stage output widths
+    Depths: array[0..3] of integer;         // per-stage block counts
+    GroupsWidth: integer;                   // channels per group (3x3 conv)
+    HasSE: boolean;                         // layer_type 'y' = true, 'x' = false
+    DownsampleInFirstStage: boolean;        // stage0 first block strides 2?
+    ImageSize: integer;                     // 224 canonical
+    NumChannels: integer;                   // 3
+    NumLabels: integer;                     // classifier out width (1000)
+    BnEps: TNeuralFloat;                    // BatchNorm2d eps (1e-5)
+    ModelType: string;                      // 'regnet'
+  end;
+
+// Reads a transformers RegNetConfig. REQUIRED: "hidden_sizes" (4-int) and
+// "depths" (4-int). Optional: embedding_size (32), groups_width (64),
+// layer_type ('y' => SE / 'x' => no SE), downsample_in_first_stage (true),
+// image_size (224), num_channels (3), num_labels/id2label/label2id (1000),
+// bn_eps (1e-5). Anything else is ignored.
+function ReadRegNetConfigFromJSONFile(
+  const FileName: string): TRegNetConfig;
+
+function RegNetConfigToString(const Config: TRegNetConfig): string;
+
+// Builds the RegNet described by Config and loads every weight from Reader
+// (caller owns Reader), folding each BatchNorm into its conv. The net takes an
+// (ImageSize, ImageSize, NumChannels) ImageNet-normalized RGB volume and
+// outputs (1, 1, NumLabels) class logits.
+function BuildRegNet(Reader: TNNetSafeTensorsReader;
+  const Config: TRegNetConfig; pTrainable: boolean = true): TNNet;
+
+// Builds + loads the RegNet classifier from the checkpoint at FileName
+// (.safetensors / sharded index / pytorch_model.bin). Config is supplied by the
+// caller (Ex) or read from ConfigFileName ('' = "config.json" beside FileName)
+// and returned. Net owned by caller. Output: (1,1,num_labels).
+function BuildRegNetFromSafeTensorsEx(const FileName: string;
+  const Config: TRegNetConfig; pTrainable: boolean = true): TNNet;
+
+function BuildRegNetFromSafeTensors(const FileName: string;
+  out Config: TRegNetConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+
+// ---------------------------------------------------------------------------
 // MOBILEVIT IMPORT (transformers model_type "mobilevit", e.g.
 // apple/mobilevit-small, apple/mobilevit-x-small). Hybrid CNN + transformer:
 // a MobileNetV2-style inverted-residual conv backbone interleaved with three
@@ -58499,6 +58559,416 @@ begin
 end;
 
 // ===========================================================================
+// REGNET IMAGE-CLASSIFICATION BACKBONE
+// ===========================================================================
+
+function ReadRegNetConfigFromJSONFile(
+  const FileName: string): TRegNetConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  LabelObj, ArrData: TJSONData;
+  Arr: TJSONArray;
+  LayerType: string;
+  i: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('RegNet import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('RegNet import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('RegNet import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'regnet');
+    // hidden_sizes (per-stage output widths). REQUIRED, exactly 4.
+    ArrData := Obj.Find('hidden_sizes');
+    if (ArrData = nil) or not (ArrData is TJSONArray) or
+       (TJSONArray(ArrData).Count <> 4) then
+      ImportError('RegNet import: config "' + FileName +
+        '" needs a 4-int "hidden_sizes" array (stage1..stage4 output widths).');
+    Arr := TJSONArray(ArrData);
+    for i := 0 to 3 do Result.HiddenSizes[i] := Arr.Integers[i];
+    // depths (per-stage block counts). REQUIRED, exactly 4.
+    ArrData := Obj.Find('depths');
+    if (ArrData = nil) or not (ArrData is TJSONArray) or
+       (TJSONArray(ArrData).Count <> 4) then
+      ImportError('RegNet import: config "' + FileName +
+        '" needs a 4-int "depths" array (stage1..stage4 block counts).');
+    Arr := TJSONArray(ArrData);
+    for i := 0 to 3 do Result.Depths[i] := Arr.Integers[i];
+    Result.EmbeddingSize := Obj.Get('embedding_size', 32);
+    Result.GroupsWidth := Obj.Get('groups_width', 64);
+    LayerType := Obj.Get('layer_type', 'y');
+    if (LayerType <> 'x') and (LayerType <> 'y') then
+      ImportError('RegNet import: layer_type must be "x" or "y", got "' +
+        LayerType + '".');
+    Result.HasSE := LayerType = 'y';
+    Result.DownsampleInFirstStage := Obj.Get('downsample_in_first_stage', true);
+    Result.ImageSize := Obj.Get('image_size', 224);
+    Result.NumChannels := Obj.Get('num_channels', 3);
+    Result.BnEps := Obj.Get('bn_eps', 0.00001);
+    // num_labels: explicit field, else len(id2label), else len(label2id),
+    // else ImageNet-1k 1000.
+    Result.NumLabels := 0;
+    if Obj.IndexOfName('num_labels') >= 0 then
+      Result.NumLabels := Obj.Get('num_labels', 0);
+    if Result.NumLabels <= 0 then
+    begin
+      LabelObj := Obj.Find('id2label');
+      if (LabelObj <> nil) and (LabelObj is TJSONObject) then
+        Result.NumLabels := TJSONObject(LabelObj).Count;
+    end;
+    if Result.NumLabels <= 0 then
+    begin
+      LabelObj := Obj.Find('label2id');
+      if (LabelObj <> nil) and (LabelObj is TJSONObject) then
+        Result.NumLabels := TJSONObject(LabelObj).Count;
+    end;
+    if Result.NumLabels <= 0 then Result.NumLabels := 1000;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function RegNetConfigToString(const Config: TRegNetConfig): string;
+begin
+  if Config.ModelType = '' then Result := 'regnet'
+  else Result := Config.ModelType;
+  if Config.HasSE then Result := Result + ' (y/SE)'
+  else Result := Result + ' (x)';
+  Result := Result + ' config: embed=' + IntToStr(Config.EmbeddingSize) +
+    ', hidden_sizes=[' + IntToStr(Config.HiddenSizes[0]) + ',' +
+    IntToStr(Config.HiddenSizes[1]) + ',' +
+    IntToStr(Config.HiddenSizes[2]) + ',' +
+    IntToStr(Config.HiddenSizes[3]) + ']' +
+    ', depths=[' + IntToStr(Config.Depths[0]) + ',' +
+    IntToStr(Config.Depths[1]) + ',' +
+    IntToStr(Config.Depths[2]) + ',' +
+    IntToStr(Config.Depths[3]) + ']' +
+    ', group_width=' + IntToStr(Config.GroupsWidth) +
+    ', downsample_first=' + BoolToStr(Config.DownsampleInFirstStage, true) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', channels=' + IntToStr(Config.NumChannels) +
+    ', num_labels=' + IntToStr(Config.NumLabels);
+end;
+
+// Loads one GROUP's slice of a torch grouped Conv2d (full weight [O, I/G, k, k],
+// bias=False) into a single CAI conv that handles output channels
+// [GroupIdx*FpG .. ) of that group, folding the following BatchNorm2d (over ALL
+// O channels) per channel. The CAI conv stores weights depth-contiguous as
+// FData[(ky*K+kx)*InPerGroup + c]; W rows for this group are the O-rows
+// [GroupIdx*FpG .. (GroupIdx+1)*FpG); each row already carries exactly I/G input
+// channels in torch.
+procedure LoadRegNetGroupedConvFoldBN(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const ConvWName, BnPrefix: string;
+  OutCh, InCh, Groups, K, GroupIdx: integer; BnEps: TNeuralFloat);
+var
+  W, Gamma, Beta, Mean, Var_: TNNetVolume;
+  FpG, IpG, oLocal, oGlobal, c, ky, kx: integer;
+  Scale, Shift, Denom: TNeuralFloat;
+begin
+  EnsureWritableImportWeights(Layer);
+  FpG := OutCh div Groups;   // output channels (= neurons) for this group
+  IpG := InCh div Groups;    // torch in-channels per group (= I/G dim of W)
+  if not Reader.HasTensor(ConvWName) then
+    ImportError('RegNet import: missing tensor "' + ConvWName + '".');
+  if (Reader.DimCount(ConvWName) <> 4) or
+     (Reader.DimSize(ConvWName, 0) <> OutCh) or
+     (Reader.DimSize(ConvWName, 1) <> IpG) or
+     (Reader.DimSize(ConvWName, 2) <> K) or
+     (Reader.DimSize(ConvWName, 3) <> K) then
+    ImportError('RegNet import: grouped conv "' + ConvWName + '" must have ' +
+      'shape [' + IntToStr(OutCh) + ', ' + IntToStr(IpG) + ', ' + IntToStr(K) +
+      ', ' + IntToStr(K) + '], got ' + Reader.ShapeAsString(ConvWName));
+  if Layer.Neurons.Count <> FpG then
+    ImportError('RegNet import: internal error - grouped conv "' + ConvWName +
+      '" group target has ' + IntToStr(Layer.Neurons.Count) +
+      ' neurons, expected ' + IntToStr(FpG) + '.');
+  if Layer.FArrNeurons[0].Weights.Size <> K * K * IpG then
+    ImportError('RegNet import: internal error - grouped conv "' + ConvWName +
+      '" neuron has ' + IntToStr(Layer.FArrNeurons[0].Weights.Size) +
+      ' weights, expected ' + IntToStr(K * K * IpG) + '.');
+  W := TNNetVolume.Create;
+  Gamma := TNNetVolume.Create; Beta := TNNetVolume.Create;
+  Mean := TNNetVolume.Create; Var_ := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(ConvWName, W);
+    Reader.LoadTensorFlat(BnPrefix + '.weight', Gamma);
+    Reader.LoadTensorFlat(BnPrefix + '.bias', Beta);
+    Reader.LoadTensorFlat(BnPrefix + '.running_mean', Mean);
+    Reader.LoadTensorFlat(BnPrefix + '.running_var', Var_);
+    if (Gamma.Size <> OutCh) or (Beta.Size <> OutCh) or
+       (Mean.Size <> OutCh) or (Var_.Size <> OutCh) then
+      ImportError('RegNet import: BatchNorm "' + BnPrefix +
+        '" parameters must each have ' + IntToStr(OutCh) + ' elements.');
+    for oLocal := 0 to FpG - 1 do
+    begin
+      oGlobal := GroupIdx * FpG + oLocal;
+      Denom := Sqrt(Var_.FData[oGlobal] + BnEps);
+      Scale := Gamma.FData[oGlobal] / Denom;
+      Shift := Beta.FData[oGlobal] - Gamma.FData[oGlobal] * Mean.FData[oGlobal] / Denom;
+      for ky := 0 to K - 1 do
+        for kx := 0 to K - 1 do
+          for c := 0 to IpG - 1 do
+            Layer.FArrNeurons[oLocal].Weights.FData[(ky * K + kx) * IpG + c] :=
+              W.FData[((oGlobal * IpG + c) * K + ky) * K + kx] * Scale;
+      Layer.FArrNeurons[oLocal].BiasWeight := Shift;
+    end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free; Gamma.Free; Beta.Free; Mean.Free; Var_.Free;
+  end;
+end;
+
+type
+  TRegNetGroupConvRefs = array of TNNetLayer; // one conv ref per group
+  TRegNetBlockLayers = record
+    Conv1, Conv3, SEReduce, SEExpand, Shortcut: TNNetLayer;
+    GroupConvs: TRegNetGroupConvRefs;  // the grouped 3x3 (Groups conv refs)
+    Groups: integer;
+    HasShortcut: boolean;
+  end;
+
+// Builds a single RegNet residual block onto NN (main path then shortcut),
+// returning the layer refs needed for weight loading. Mirrors RegNetXLayer /
+// RegNetYLayer: 1x1(in->out)+ReLU -> grouped 3x3(out->out,stride)+ReLU ->
+// [SE] -> 1x1(out->out, no act) -> add(shortcut) -> ReLU.
+procedure AddRegNetBlock(NN: TNNet; const Config: TRegNetConfig;
+  InChannels, OutChannels, Stride: integer; out Refs: TRegNetBlockLayers);
+var
+  Input, Branch, GroupedInput, Pooled, Gate, MainOut: TNNetLayer;
+  Groups, FpG, IpG, g, SEReduced: integer;
+  GroupConv: TNNetLayer;
+begin
+  FillChar(Refs, SizeOf(Refs), 0);
+  Refs.GroupConvs := nil;
+  Refs.HasShortcut := (InChannels <> OutChannels) or (Stride <> 1);
+  Groups := OutChannels div Config.GroupsWidth;
+  if Groups < 1 then Groups := 1;
+  Refs.Groups := Groups;
+  Input := NN.GetLastLayer();
+  // layer.0: 1x1 conv (in -> out) + BN(folded) + ReLU.
+  Refs.Conv1 := NN.AddLayer(
+    TNNetConvolutionLinear.Create(OutChannels, 1, 0, 1, 0).SetTrainable(true));
+  NN.AddLayer(TNNetReLU.Create());
+  // layer.1: grouped 3x3 conv (out -> out), stride, pad 1 + BN(folded) + ReLU.
+  // Built inline (replicating AddGroupedConvolution, ChannelInterleaving=false)
+  // so each group's conv ref is captured for weight loading.
+  FpG := OutChannels div Groups;
+  IpG := OutChannels div Groups;
+  if Groups = 1 then
+  begin
+    GroupConv := NN.AddLayer(
+      TNNetConvolutionLinear.Create(FpG, 3, {pad=}1, Stride, 0).SetTrainable(true));
+    SetLength(Refs.GroupConvs, 1);
+    Refs.GroupConvs[0] := GroupConv;
+  end
+  else
+  begin
+    GroupedInput := NN.GetLastLayer();
+    SetLength(Refs.GroupConvs, Groups);
+    for g := 0 to Groups - 1 do
+    begin
+      NN.AddLayerAfter(
+        TNNetSplitChannels.Create(g * IpG, IpG), GroupedInput);
+      GroupConv := NN.AddLayer(
+        TNNetConvolutionLinear.Create(FpG, 3, {pad=}1, Stride, 0).SetTrainable(true));
+      Refs.GroupConvs[g] := GroupConv;
+    end;
+    NN.AddLayer(TNNetDeepConcat.Create(Refs.GroupConvs));
+  end;
+  NN.AddLayer(TNNetReLU.Create());
+  // optional SE gate (regnet_y): pool -> 1x1 reduce(+bias) -> ReLU ->
+  // 1x1 expand(+bias) -> sigmoid -> per-channel scale. reduced =
+  // round(in_channels / 4).
+  if Config.HasSE then
+  begin
+    Branch := NN.GetLastLayer();
+    SEReduced := Round(InChannels / 4.0);
+    if SEReduced < 1 then SEReduced := 1;
+    Pooled := NN.AddLayerAfter(TNNetAvgChannel.Create(), Branch);
+    Refs.SEReduce := NN.AddLayer(
+      TNNetConvolutionLinear.Create(SEReduced, 1, 0, 1, 0).SetTrainable(true));
+    NN.AddLayer(TNNetReLU.Create());
+    Refs.SEExpand := NN.AddLayer(
+      TNNetConvolutionLinear.Create(OutChannels, 1, 0, 1, 0).SetTrainable(true));
+    Gate := NN.AddLayer(TNNetSigmoid.Create());
+    NN.AddLayer(TNNetChannelMulByLayer.Create(Branch, Gate));
+  end;
+  // last: 1x1 conv (out -> out) + BN(folded), NO activation.
+  Refs.Conv3 := NN.AddLayer(
+    TNNetConvolutionLinear.Create(OutChannels, 1, 0, 1, 0).SetTrainable(true));
+  MainOut := NN.GetLastLayer();
+  // residual add (shortcut 1x1 stride conv+BN when shape changes, else identity)
+  if Refs.HasShortcut then
+  begin
+    Refs.Shortcut := NN.AddLayerAfter(
+      [TNNetConvolutionLinear.Create(OutChannels, 1, 0, Stride, 0).SetTrainable(true)],
+      Input);
+    NN.AddLayer(TNNetSum.Create([MainOut, Refs.Shortcut]));
+  end
+  else
+    NN.AddLayer(TNNetSum.Create([MainOut, Input]));
+  NN.AddLayer(TNNetReLU.Create());
+end;
+
+function BuildRegNet(Reader: TNNetSafeTensorsReader;
+  const Config: TRegNetConfig; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  StemConv, FC: TNNetLayer;
+  BlockRefs: array of TRegNetBlockLayers;
+  RefCount, Stage, BlockIdx, Stride, InWidth, OutWidth, g: integer;
+  Prefix, LayerPrefix, GroupedPrefix, SEPrefix, LastPrefix: string;
+begin
+  if Config.NumChannels < 1 then
+    ImportError('RegNet import: num_channels must be >= 1.');
+  if Config.NumLabels < 1 then
+    ImportError('RegNet import: num_labels must be >= 1.');
+  if Config.GroupsWidth < 1 then
+    ImportError('RegNet import: groups_width must be >= 1.');
+  RefCount := 0;
+  for Stage := 0 to 3 do RefCount := RefCount + Config.Depths[Stage];
+  SetLength(BlockRefs, RefCount);
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer(TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels));
+    // Stem (embedder): conv 3x3 stride2 pad1 (+folded BN bias) -> ReLU.
+    StemConv := NN.AddLayer(TNNetConvolutionLinear.Create(
+      Config.EmbeddingSize, 3, {pad=}1, {stride=}2, {suppressBias=}0).SetTrainable(pTrainable));
+    NN.AddLayer(TNNetReLU.Create());
+    RefCount := 0;
+    InWidth := Config.EmbeddingSize;
+    for Stage := 0 to 3 do
+    begin
+      OutWidth := Config.HiddenSizes[Stage];
+      for BlockIdx := 0 to Config.Depths[Stage] - 1 do
+      begin
+        if BlockIdx <> 0 then Stride := 1
+        else if Stage = 0 then
+        begin
+          if Config.DownsampleInFirstStage then Stride := 2 else Stride := 1;
+        end
+        else Stride := 2;
+        AddRegNetBlock(NN, Config, InWidth, OutWidth, Stride,
+          BlockRefs[RefCount]);
+        Inc(RefCount);
+        InWidth := OutWidth;
+      end;
+    end;
+    // Head: global average pool -> Linear(num_labels) (classifier.1).
+    NN.AddLayer(TNNetAvgChannel.Create());
+    FC := NN.AddLayer(TNNetFullConnectLinear.Create(Config.NumLabels).SetTrainable(pTrainable));
+    if not pTrainable then NN.SetTrainable();
+
+    // ---------------- Weights ----------------
+    // Stem keys: regnet.embedder.embedder.convolution / .normalization.
+    LoadResNetConvFoldBN(Reader, StemConv,
+      'regnet.embedder.embedder.convolution.weight',
+      'regnet.embedder.embedder.normalization',
+      Config.EmbeddingSize, Config.NumChannels, 3, Config.BnEps);
+    RefCount := 0;
+    InWidth := Config.EmbeddingSize;
+    for Stage := 0 to 3 do
+    begin
+      OutWidth := Config.HiddenSizes[Stage];
+      for BlockIdx := 0 to Config.Depths[Stage] - 1 do
+      begin
+        Prefix := 'regnet.encoder.stages.' + IntToStr(Stage) + '.layers.' +
+          IntToStr(BlockIdx);
+        // layer.0 = 1x1 conv+BN (in -> out).
+        LayerPrefix := Prefix + '.layer.0';
+        LoadResNetConvFoldBN(Reader, BlockRefs[RefCount].Conv1,
+          LayerPrefix + '.convolution.weight',
+          LayerPrefix + '.normalization',
+          OutWidth, InWidth, 1, Config.BnEps);
+        // layer.1 = grouped 3x3 conv+BN (out -> out), per-group slices.
+        GroupedPrefix := Prefix + '.layer.1';
+        for g := 0 to BlockRefs[RefCount].Groups - 1 do
+          LoadRegNetGroupedConvFoldBN(Reader, BlockRefs[RefCount].GroupConvs[g],
+            GroupedPrefix + '.convolution.weight',
+            GroupedPrefix + '.normalization',
+            OutWidth, OutWidth, BlockRefs[RefCount].Groups, 3, g, Config.BnEps);
+        if Config.HasSE then
+        begin
+          // layer.2 = SE: .attention.0 reduce (+bias), .attention.2 expand
+          // (+bias). 1x1 convs WITH bias.
+          SEPrefix := Prefix + '.layer.2.attention';
+          LoadMobileNetSEConv(Reader, BlockRefs[RefCount].SEReduce,
+            SEPrefix + '.0.weight', SEPrefix + '.0.bias',
+            BlockRefs[RefCount].SEReduce.Neurons.Count, OutWidth);
+          LoadMobileNetSEConv(Reader, BlockRefs[RefCount].SEExpand,
+            SEPrefix + '.2.weight', SEPrefix + '.2.bias',
+            OutWidth, BlockRefs[RefCount].SEReduce.Neurons.Count);
+          LastPrefix := Prefix + '.layer.3';  // y: SE is .2, last conv is .3
+        end
+        else
+          LastPrefix := Prefix + '.layer.2';  // x: last conv is .2
+        // last = 1x1 conv+BN (out -> out), no activation.
+        LoadResNetConvFoldBN(Reader, BlockRefs[RefCount].Conv3,
+          LastPrefix + '.convolution.weight',
+          LastPrefix + '.normalization',
+          OutWidth, OutWidth, 1, Config.BnEps);
+        // shortcut (first block of a stage when shape changes).
+        if BlockRefs[RefCount].HasShortcut then
+          LoadResNetConvFoldBN(Reader, BlockRefs[RefCount].Shortcut,
+            Prefix + '.shortcut.convolution.weight',
+            Prefix + '.shortcut.normalization',
+            OutWidth, InWidth, 1, Config.BnEps);
+        Inc(RefCount);
+        InWidth := OutWidth;
+      end;
+    end;
+    // classifier.1: Linear [num_labels, last_hidden] with bias.
+    LoadLlamaLinearWeights(Reader, FC, 'classifier.1.weight',
+      Config.HiddenSizes[3], Config.NumLabels, 0, -1, 0, 'classifier.1.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildRegNetFromSafeTensorsEx(const FileName: string;
+  const Config: TRegNetConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildRegNet(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildRegNetFromSafeTensors(const FileName: string;
+  out Config: TRegNetConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadRegNetConfigFromJSONFile(ConfigPath);
+  Result := BuildRegNetFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+// ===========================================================================
 // MOBILEVIT IMPORT
 // ===========================================================================
 
@@ -74029,6 +74499,14 @@ begin
       'AUDIO CODEC holder - call BuildMimiFromSafeTensors (returns a ' +
       'TNNetMimi; round-trip waveform <-> codes with Encode / Decode) ' +
       'instead of this single-net dispatch.');
+  end
+  else if ModelType = 'regnet' then
+  begin
+    // RegNet image-classification backbone (regnet_x / regnet_y). Returns a
+    // single TNNet of class logits (1,1,num_labels). Config read from
+    // ConfigPath; discard the returned record.
+    Result := BuildRegNetFromSafeTensorsEx(WeightsPath,
+      ReadRegNetConfigFromJSONFile(ConfigPath), pTrainable);
   end
   else
   begin

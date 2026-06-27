@@ -30,6 +30,7 @@ type
     function FixturePath(const FileName: string): string;
     procedure RunConvNeXtParity(const Base: string);
     procedure RunResNetParity(const Base: string);
+    procedure RunRegNetParity(const Base: string);
     procedure RunRepVGGParity(const Base: string);
     // Composes a minimal safetensors byte stream into a temp file and
     // returns its path. HeaderJson is written verbatim (preceded by its
@@ -528,6 +529,9 @@ type
     procedure TestMobileNetV3ImageClassificationParity;
     procedure TestEfficientNetConfigFromJSONFile;
     procedure TestEfficientNetImageClassificationParity;
+    procedure TestRegNetConfigFromJSONFile;
+    procedure TestRegNetXImageClassificationParity;
+    procedure TestRegNetYImageClassificationParity;
     procedure TestMobileViTConfigFromJSONFile;
     procedure TestMobileViTImageClassificationParity;
     procedure TestSwinConfigFromJSONFile;
@@ -18337,6 +18341,102 @@ end;
 procedure TTestNeuralPretrained.TestResNet50ImageClassificationParity;
 begin
   RunResNetParity('tiny_resnet50');
+end;
+
+// transformers RegNet image-classification parity (BuildRegNet). The fixture
+// tiny_regnet_{x,y}.* is a pico RANDOM-init transformers
+// RegNetForImageClassification whose safetensors carry the exact
+// "regnet."-prefixed HF key scheme and whose reference logits come from a REAL
+// float64 HF forward (tools/make_pico_regnet_fixture.py). The pinned input is
+// the deterministic dyadic formula regenerated bit-for-bit here (NOT stored, to
+// keep the committed fixture tiny). regnet_x has NO SE; regnet_y adds the SE
+// gate. Both keep every spatial map square (image 64,
+// downsample_in_first_stage=false) so TNNetAvgChannel is an exact global mean,
+// and group_width 4 divides every hidden size so the grouped 3x3 conv has
+// groups > 1 (exercising the per-group weight-slice loader).
+procedure TTestNeuralPretrained.RunRegNetParity(const Base: string);
+var
+  NN: TNNet;
+  Config: TRegNetConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  LogitsArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt, ImgSz, NumCh: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildRegNetFromSafeTensors(FixturePath(Base + '.safetensors'),
+    Config, {pTrainable=}true, FixturePath(Base + '_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output size = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Size);
+
+    RefJson.LoadFromFile(FixturePath(Base + '_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    LogitsArr := TJSONArray(TJSONArray(
+      TJSONObject(RefRoot).Find('logits')).Items[0]);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+
+    // Regenerate the pinned pixels: (((c*4096 + y*W + x)*5) mod 17 - 8)/8.
+    // CAI input volume packs depth-contiguous: FData[(y*W + x)*C + c].
+    ImgSz := Config.ImageSize;
+    NumCh := Config.NumChannels;
+    ImageInput.ReSize(ImgSz, ImgSz, NumCh);
+    for ChanCnt := 0 to NumCh - 1 do
+      for YCnt := 0 to ImgSz - 1 do
+        for XCnt := 0 to ImgSz - 1 do
+          ImageInput.FData[(YCnt * ImgSz + XCnt) * NumCh + ChanCnt] :=
+            (((ChanCnt * 4096 + YCnt * ImgSz + XCnt) * 5) mod 17 - 8) / 8.0;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ChanCnt] -
+        LogitsArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestRegNetConfigFromJSONFile;
+var
+  Config: TRegNetConfig;
+begin
+  Config := ReadRegNetConfigFromJSONFile(FixturePath('tiny_regnet_y_config.json'));
+  AssertEquals('model_type', 'regnet', Config.ModelType);
+  AssertEquals('embedding_size', 8, Config.EmbeddingSize);
+  AssertEquals('groups_width', 4, Config.GroupsWidth);
+  AssertEquals('hidden_sizes[3]', 24, Config.HiddenSizes[3]);
+  AssertEquals('depths[1]', 2, Config.Depths[1]);
+  AssertTrue('layer_type y => HasSE', Config.HasSE);
+  AssertTrue('downsample_in_first_stage false',
+    not Config.DownsampleInFirstStage);
+  AssertEquals('num_labels', 5, Config.NumLabels);
+end;
+
+// regnet_x: bottleneck blocks with grouped 3x3 and NO squeeze-excite.
+procedure TTestNeuralPretrained.TestRegNetXImageClassificationParity;
+begin
+  RunRegNetParity('tiny_regnet_x');
+end;
+
+// regnet_y: regnet_x plus the squeeze-and-excite gate on each block.
+procedure TTestNeuralPretrained.TestRegNetYImageClassificationParity;
+begin
+  RunRegNetParity('tiny_regnet_y');
 end;
 
 // torchvision .pth (PyTorch pickle / ZIP) load path parity. The SAME pico

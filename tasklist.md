@@ -1531,20 +1531,28 @@ rather than acted on.
       examples/SmolVLM2Describe demo (one image, then a short clip). Real value:
       the landed caption VLMs (LLaVA/Blip2/Florence-2/PaliGemma) are image-only;
       this is the efficient pixel-shuffle-connector + native short-VIDEO path.
-- [ ] RegNet image-classification backbone importer (`BuildRegNetFromSafeTensors[Ex]`,
-      timm/torchvision `regnet_y_*`/`regnet_x_*`, e.g. facebook/regnet-y-040). The
-      AnyNet/RegNet design-space CNN (Radosavovic et al. 2020, *Designing Network
-      Design Spaces*): a simple stem + 4 stages of bottleneck blocks, each block a
-      1x1 → **grouped 3x3** → 1x1 residual unit (the `regnet_y` variant adds a
-      Squeeze-and-Excitation gate). Reuses landed layers end-to-end — grouped conv
-      (`AddGroupedConvolution`), pointwise convs, the SE block and the ResNet-style
-      identity residual — so the importer is mostly config-driven block-width/depth
-      wiring (`widths`/`depths`/`group_width` per stage) plus the BN-fold the landed
-      ResNet importer already does. Pico fixture + `TestRegNetLogitParity` < 1e-4 vs
-      a float64 HF `RegNetForImageClassification`. Real value: a classic, widely
-      used CV backbone family distinct from the landed ResNet and EfficientNet
-      importers (RegNet's grouped-bottleneck design space sits between them), giving
-      another drop-in ImageNet feature extractor for the landed eval harness.
+- [X] RegNet image-classification backbone importer (`BuildRegNetFromSafeTensors[Ex]`,
+      transformers model_type `regnet`, e.g. facebook/regnet-y-040 / regnet-x-040).
+      LANDED: `TRegNetConfig` + `ReadRegNetConfigFromJSONFile`/`RegNetConfigToString`
+      + `BuildRegNet`/`BuildRegNetFromSafeTensors[Ex]` in neuralpretrained.pas, plus
+      `regnet` wired into `BuildFromPretrained`. HF key scheme:
+      `regnet.embedder.embedder.{convolution,normalization}` stem;
+      `regnet.encoder.stages.{s}.layers.{l}.layer.{0}` 1x1, `.layer.1` grouped 3x3,
+      regnet_y `.layer.2.attention.{0,2}` SE (reduce/expand convs WITH bias,
+      reduced = round(in/4)), last conv `.layer.{2|3}`, `.shortcut.{convolution,
+      normalization}`; `classifier.1.{weight,bias}`. Every conv+BN folded at load
+      (LoadResNetConvFoldBN); grouped 3x3 built inline (per-group SplitChannels +
+      conv + DeepConcat, ChannelInterleaving=false) with a per-group BN-fold slice
+      loader (`LoadRegNetGroupedConvFoldBN`); SE reuses the EfficientNet pool ->
+      reduce -> ReLU -> expand -> sigmoid -> ChannelMulByLayer gate. NO new leaf
+      layers. Pico fixtures tests/fixtures/tiny_regnet_{x,y}.* built by
+      tools/make_pico_regnet_fixture.py from a REAL float64 HF
+      RegNetForImageClassification (pixels regenerated in-test to keep fixtures
+      tiny). `TestRegNet{Config,XImageClassification,YImageClassification}Parity`
+      green, max|diff| < 1e-4 for both x (no SE) and y (SE). Open follow-ups:
+      real-checkpoint top-1 sweep (facebook/regnet-y-040 / regnet-x-040 needs the
+      HF image-processor preprocessing path); timm naming variant; downsample-in-
+      first-stage=true real configs (code handles it, untested on a real ckpt).
 - [ ] Qwen-Image text-to-image MMDiT importer (`BuildQwenImageFromSafeTensors[Ex]`,
       Qwen/Qwen-Image, model_type `qwen_image`). The 2025 flagship open text-to-image
       model: a Qwen2.5-VL text encoder (LANDED — `BuildQwen2VL`-family) feeds an
