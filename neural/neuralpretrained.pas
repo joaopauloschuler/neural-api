@@ -9472,6 +9472,71 @@ procedure SDUNetDenoise(Net: TNNet; const Config: TSDUNetConfig;
   Latent, EncStates: TNNetVolume; t: TNeuralFloat; Noise: TNNetVolume);
 
 // ---------------------------------------------------------------------------
+// CONTROLNET SPATIAL-CONDITIONING IMPORT (diffusers ControlNetModel, e.g.
+// lllyasviel/sd-controlnet-canny). ControlNet adds spatial control (a canny
+// edge / depth / pose map -> image) to latent diffusion. It is a trainable
+// COPY of the SD UNet ENCODER (conv_in + time_embedding + down blocks) + the
+// MID block (NO up blocks). A small conv "hint" stem
+// (controlnet_cond_embedding) embeds the control image into the latent grid;
+// its output is ADDED to the conv_in output before the down blocks. The
+// conv_in(+hint) output and every down-block / downsampler / mid output is
+// tapped through a 1x1 conv (controlnet_down_blocks.* / controlnet_mid_block)
+// to produce the down_block_res_samples + mid_block_res_sample that get added
+// into the frozen base UNet's decoder skip connections.
+//
+// FOUR TNNetInputs (the multi-input convention, all filled before Compute):
+// input0 = the (LatentGrid,LatentGrid,InChannels) noisy latent; input1 = the
+// (1,1,1) scalar timestep; input2 = the (TextSeqLen,1,CrossDim) text states;
+// input3 = the (CondGrid,CondGrid,CondChannels) control image. The encoder /
+// mid blocks REUSE the SD UNet block builders verbatim. Genuinely-new code is
+// only the zero-conv residual taps (1x1 PointwiseConvLinear off each skip /
+// mid) and the hint encoder conv stem. SCOPE v1: inference-only, parity on the
+// residual tensors; the end-to-end base-UNet-plus-ControlNet decode loop is a
+// documented follow-up.
+// ---------------------------------------------------------------------------
+type
+  TControlNetConfig = record
+    Base: TSDUNetConfig;                      // shared encoder/mid config
+    CondChannels: integer;                    // control image channels (RGB=3)
+    NumCondEmbedOut: integer;                 // length of CondEmbedOut
+    CondEmbedOut: array[0..7] of integer;     // conditioning_embedding_out_chs
+    CondGrid: integer;                        // control image H=W for the Input
+    NumDownResiduals: integer;                // count of down-block tap convs
+  end;
+
+function ReadControlNetConfigFromJSONFile(const FileName: string): TControlNetConfig;
+
+function ControlNetConfigToString(const Config: TControlNetConfig): string;
+
+// Builds the ControlNetModel described by Config and loads every weight from
+// Reader (caller owns Reader). Four TNNetInputs (latent, timestep, text states,
+// control image). See ControlNetResiduals for the driver.
+function BuildControlNet(Reader: TNNetSafeTensorsReader;
+  const Config: TControlNetConfig; pTrainable: boolean = true): TNNet;
+
+function BuildControlNetFromSafeTensorsEx(const FileName: string;
+  const Config: TControlNetConfig; pTrainable: boolean = true): TNNet;
+
+function BuildControlNetFromSafeTensors(const FileName: string;
+  out Config: TControlNetConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+
+// Returns the timestep (input1) / text-states (input2) / control-image (input3)
+// TNNetInput of a ControlNet built above.
+function ControlNetTimestepInput(Net: TNNet): TNNetLayer;
+function ControlNetTextStatesInput(Net: TNNet): TNNetLayer;
+function ControlNetCondInput(Net: TNNet): TNNetLayer;
+
+// Fills all four inputs, runs one forward, and copies the residual outputs:
+// DownResiduals[0..NumDownResiduals-1] receive the down_block_res_samples
+// (each a (Ch,H,W) volume) and MidResidual receives the mid_block_res_sample.
+// The caller owns / pre-creates the volumes (resized here). Latent/EncStates/
+// Cond are (InCh,Grid,Grid)/(TextSeqLen,1,CrossDim)/(CondCh,CondGrid,CondGrid).
+procedure ControlNetResiduals(Net: TNNet; const Config: TControlNetConfig;
+  Latent, EncStates, Cond: TNNetVolume; t: TNeuralFloat;
+  DownResiduals: array of TNNetVolume; MidResidual: TNNetVolume);
+
+// ---------------------------------------------------------------------------
 // STABLE DIFFUSION VAE ENCODER IMPORT (diffusers AutoencoderKL ENCODER), the
 // mirror image of the decoder above; together they form a full AutoencoderKL
 // round-trip. The encoder maps an RGB image to the latent moments and reuses
@@ -60144,6 +60209,502 @@ begin
   TextIn.Output.Copy(EncStates);
   Net.Compute(Latent);
   Net.GetOutput(Noise);
+end;
+
+// ===========================================================================
+// CONTROLNET SPATIAL-CONDITIONING IMPORT (diffusers ControlNetModel)
+// ===========================================================================
+
+// Reads a diffusers ControlNetModel config. The encoder/mid portion is the SD
+// UNet config (block_out_channels, down_block_types, layers_per_block,
+// cross_attention_dim, attention_head_dim, norm_num_groups, latent grid, text
+// seq); ControlNet has NO up blocks, so up_block_types is synthesised as the
+// mirror of down_block_types (the SD UNet reader requires it but ControlNet
+// never builds up blocks). Adds conditioning_channels (RGB=3),
+// conditioning_embedding_out_channels (the hint stem dims) and the control
+// image grid (pico "cond_size"; a real config gives no explicit grid so the
+// importer derives it from the down-sample factor of the cond stem).
+function ReadControlNetConfigFromJSONFile(
+  const FileName: string): TControlNetConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ArrData: TJSONData;
+  Arr: TJSONArray;
+  ClassName, MirrorJson, s: string;
+  i, NumStride2, Factor, BaseDownTaps: integer;
+  PatchedFile: TStringList;
+  TmpPath: string;
+begin
+  if not FileExists(FileName) then
+    ImportError('ControlNet import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  PatchedFile := nil;
+  TmpPath := '';
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('ControlNet import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('ControlNet import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ClassName := Obj.Get('_class_name', Obj.Get('model_type', 'ControlNetModel'));
+    if ClassName <> 'ControlNetModel' then
+      ImportError('ControlNet import: _class_name is "' + ClassName +
+        '" - only ControlNetModel is supported here.');
+    // The SD UNet config reader REQUIRES up_block_types of the same length as
+    // block_out_channels and a UNet2DConditionModel class name. ControlNet
+    // configs have neither. Synthesise both by patching the JSON in memory,
+    // then reuse ReadSDUNetConfigFromJSONFile for the encoder/mid portion.
+    ArrData := Obj.Find('down_block_types');
+    if (ArrData = nil) or not (ArrData is TJSONArray) then
+      ImportError('ControlNet import: missing required array "down_block_types".');
+    Arr := TJSONArray(ArrData);
+    MirrorJson := '[';
+    for i := 0 to Arr.Count - 1 do
+    begin
+      if i > 0 then MirrorJson := MirrorJson + ',';
+      // any valid up type works (never built); use the matching attn flag.
+      if Arr.Strings[i] = 'CrossAttnDownBlock2D' then
+        MirrorJson := MirrorJson + '"CrossAttnUpBlock2D"'
+      else
+        MirrorJson := MirrorJson + '"UpBlock2D"';
+    end;
+    MirrorJson := MirrorJson + ']';
+    if Obj.IndexOfName('up_block_types') >= 0 then
+      Obj.Delete('up_block_types');
+    Obj.Add('up_block_types', GetJSON(MirrorJson));
+    if Obj.IndexOfName('_class_name') >= 0 then Obj.Delete('_class_name');
+    Obj.Add('_class_name', 'UNet2DConditionModel');
+    // out_channels is irrelevant for ControlNet (no conv_out) but the SD reader
+    // defaults it; leave as-is.
+    TmpPath := GetTempDir(False) + 'cai_controlnet_cfg_' +
+      IntToStr(Random(1000000)) + '.json';
+    PatchedFile := TStringList.Create;
+    PatchedFile.Text := Obj.AsJSON;
+    PatchedFile.SaveToFile(TmpPath);
+    Result.Base := ReadSDUNetConfigFromJSONFile(TmpPath);
+
+    // ---- ControlNet-specific fields ----
+    Result.CondChannels := Obj.Get('conditioning_channels', 3);
+    if Result.CondChannels < 1 then
+      ImportError('ControlNet import: conditioning_channels must be >= 1.');
+    ArrData := Obj.Find('conditioning_embedding_out_channels');
+    if (ArrData = nil) or not (ArrData is TJSONArray) or
+       (TJSONArray(ArrData).Count < 1) then
+      ImportError('ControlNet import: missing required array ' +
+        '"conditioning_embedding_out_channels".');
+    Arr := TJSONArray(ArrData);
+    if Arr.Count > 8 then
+      ImportError('ControlNet import: conditioning_embedding_out_channels ' +
+        'must have 1..8 entries.');
+    Result.NumCondEmbedOut := Arr.Count;
+    for i := 0 to Arr.Count - 1 do Result.CondEmbedOut[i] := Arr.Integers[i];
+    // The cond stem down-samples by 2 once per (interior) embed-out transition;
+    // the diffusers ControlNetConditioningEmbedding uses len(dims)-1 stride-2
+    // blocks. The control image grid is latent_grid * 2^NumStride2.
+    NumStride2 := Result.NumCondEmbedOut - 1;
+    Factor := 1;
+    for i := 1 to NumStride2 do Factor := Factor * 2;
+    if Obj.IndexOfName('cond_size') >= 0 then
+      Result.CondGrid := Obj.Get('cond_size', 0)
+    else
+      Result.CondGrid := Result.Base.LatentGrid * Factor;
+    if Result.CondGrid <> Result.Base.LatentGrid * Factor then
+      ImportError('ControlNet import: cond_size ' + IntToStr(Result.CondGrid) +
+        ' is not latent_grid*' + IntToStr(Factor) + ' (cond stem must map the ' +
+        'control image down to the latent grid).');
+    // number of down-block residual taps: conv_in(+hint) + one per down
+    // resnet(+attn) + one per downsampler.
+    BaseDownTaps := 1; // conv_in(+hint)
+    for i := 0 to Result.Base.NumBlockOut - 1 do
+    begin
+      BaseDownTaps := BaseDownTaps + Result.Base.LayersPerBlock;
+      if i < Result.Base.NumBlockOut - 1 then Inc(BaseDownTaps);
+    end;
+    Result.NumDownResiduals := BaseDownTaps;
+    s := ''; if s = '' then ; // silence unused
+  finally
+    Root.Free;
+    JsonText.Free;
+    if PatchedFile <> nil then PatchedFile.Free;
+    if (TmpPath <> '') and FileExists(TmpPath) then DeleteFile(TmpPath);
+  end;
+end;
+
+function ControlNetConfigToString(const Config: TControlNetConfig): string;
+var
+  i: integer;
+begin
+  Result := 'ControlNetModel: ' + SDUNetConfigToString(Config.Base) +
+    '; cond_channels=' + IntToStr(Config.CondChannels) +
+    ', cond_embed_out=[';
+  for i := 0 to Config.NumCondEmbedOut - 1 do
+  begin
+    if i > 0 then Result := Result + ',';
+    Result := Result + IntToStr(Config.CondEmbedOut[i]);
+  end;
+  Result := Result + '], cond_grid=' + IntToStr(Config.CondGrid) +
+    ', down_residuals=' + IntToStr(Config.NumDownResiduals);
+end;
+
+// Builds the controlnet_cond_embedding hint stem on CondInput and returns the
+// final (LatentGrid,LatentGrid,block0) hidden layer. Refs receive the conv
+// layers in load order: conv_in, then the blocks pair-by-pair, then conv_out.
+procedure AddControlNetHintStem(NN: TNNet; const Config: TControlNetConfig;
+  CondInput: TNNetLayer; pTrainable: boolean; out Refs: array of TNNetLayer;
+  out RefCount: integer);
+var
+  i, ridx: integer;
+  ChIn, ChOut: integer;
+begin
+  ridx := 0;
+  // conv_in: 3x3 pad1 -> CondEmbedOut[0].
+  Refs[ridx] := NN.AddLayerAfter(
+    [TNNetConvolutionLinear.Create(Config.CondEmbedOut[0], 3, 1, 1, 0).SetTrainable(pTrainable)],
+    CondInput);
+  Inc(ridx);
+  NN.AddLayer( TNNetSiLU.Create() );
+  // blocks: (conv same-dim 3x3 pad1, conv stride2 3x3 pad1) per transition.
+  for i := 0 to Config.NumCondEmbedOut - 2 do
+  begin
+    ChIn := Config.CondEmbedOut[i];
+    ChOut := Config.CondEmbedOut[i + 1];
+    Refs[ridx] := NN.AddLayer(
+      TNNetConvolutionLinear.Create(ChIn, 3, 1, 1, 0).SetTrainable(pTrainable) );
+    Inc(ridx);
+    NN.AddLayer( TNNetSiLU.Create() );
+    Refs[ridx] := NN.AddLayer(
+      TNNetConvolutionLinear.Create(ChOut, 3, 1, 2, 0).SetTrainable(pTrainable) );
+    Inc(ridx);
+    NN.AddLayer( TNNetSiLU.Create() );
+  end;
+  // conv_out: 3x3 pad1 -> block_out[0] (no SiLU).
+  Refs[ridx] := NN.AddLayer(
+    TNNetConvolutionLinear.Create(Config.Base.BlockOutChannels[0], 3, 1, 1, 0).SetTrainable(pTrainable) );
+  Inc(ridx);
+  RefCount := ridx;
+end;
+
+function BuildControlNet(Reader: TNNetSafeTensorsReader;
+  const Config: TControlNetConfig; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  Cfg: TSDUNetConfig;
+  LatentInput, TInput, TextInput, CondInput, ConvIn, ConvInPlusHint: TNNetLayer;
+  TSin, TFc0, TSilu, TFc2, TimeCond, HLayer, HintOut: TNNetLayer;
+  WVol: TNNetVolume;
+  SwapTmp: TNeuralFloat;
+  d0, half, halfM1, n, nM1, NumResnet, i, j, ci, b: integer;
+  InCh, OutCh, MidCh: integer;
+  Prefix: string;
+  Skips: array of TNNetLayer;
+  SkipCh: array of integer;
+  SkipTop: integer;
+  DownRes: array of array of TSDResnetLayers;
+  DownAttn: array of array of TSDAttnLayers;
+  DownSamp: array of TNNetLayer;
+  MidRes1, MidRes2: TSDResnetLayers;
+  MidAttn: TSDAttnLayers;
+  HintRefs: array[0..31] of TNNetLayer;
+  HintCount, HintBi: integer;
+  DownTaps: array of TNNetLayer;
+  MidTap: TNNetLayer;
+  TapTop: integer;
+begin
+  Cfg := Config.Base;
+  n := Cfg.NumBlockOut;
+  nM1 := n - 1;
+  d0 := Cfg.BlockOutChannels[0];
+  NumResnet := Cfg.LayersPerBlock;
+  if (Cfg.NumHeads < 1) then
+    ImportError('ControlNet import: num_heads must be >= 1.');
+  NN := TNNet.Create();
+  try
+    SetLength(DownRes, n);
+    SetLength(DownAttn, n);
+    SetLength(DownSamp, n);
+    SetLength(Skips, 64);
+    SetLength(SkipCh, 64);
+    SetLength(DownTaps, Config.NumDownResiduals);
+    SkipTop := 0;
+    TapTop := 0;
+
+    // ---------------- Architecture ----------------
+    // input0: noisy latent.
+    LatentInput := NN.AddLayer( TNNetInput.Create(Cfg.LatentGrid,
+      Cfg.LatentGrid, Cfg.InChannels) );
+    ConvIn := NN.AddLayer(
+      TNNetConvolutionLinear.Create(d0, 3, 1, 1, 0).SetTrainable(pTrainable) );
+
+    // input1: scalar timestep -> sinusoidal -> 2-layer MLP -> TimeCond.
+    TInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
+    TSin := NN.AddLayer( TNNetSinusoidalTimeEmbedding.Create(d0) );
+    TFc0 := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Cfg.TimeEmbedDim).SetTrainable(pTrainable) );
+    TSilu := NN.AddLayer( TNNetSiLU.Create() );
+    TFc2 := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Cfg.TimeEmbedDim).SetTrainable(pTrainable) );
+    TimeCond := TFc2;
+
+    // input2: text encoder states (TextSeqLen,1,CrossDim).
+    TextInput := NN.AddLayer( TNNetInput.Create(Cfg.TextSeqLen, 1,
+      Cfg.CrossAttentionDim) );
+
+    // input3: control image (CondGrid,CondGrid,CondChannels) -> hint stem.
+    CondInput := NN.AddLayer( TNNetInput.Create(Config.CondGrid,
+      Config.CondGrid, Config.CondChannels) );
+    AddControlNetHintStem(NN, Config, CondInput, pTrainable, HintRefs, HintCount);
+    HintOut := NN.GetLastLayer();
+
+    if not pTrainable then NN.SetTrainable();
+
+    // conv_in + hint -> first hidden state and first residual tap source.
+    ConvInPlusHint := NN.AddLayer( TNNetSum.Create([ConvIn, HintOut]) );
+    HLayer := ConvInPlusHint;
+    Skips[SkipTop] := HLayer; SkipCh[SkipTop] := d0; Inc(SkipTop);
+
+    // ---- DOWN blocks ----
+    InCh := d0;
+    for i := 0 to nM1 do
+    begin
+      OutCh := Cfg.BlockOutChannels[i];
+      SetLength(DownRes[i], NumResnet);
+      SetLength(DownAttn[i], NumResnet);
+      for j := 0 to NumResnet - 1 do
+      begin
+        if j = 0 then b := InCh else b := OutCh;
+        AddSDResnetBlock(NN, Cfg, TimeCond, HLayer, b, OutCh, pTrainable,
+          DownRes[i][j]);
+        HLayer := NN.GetLastLayer();
+        if Cfg.DownHasAttn[i] then
+        begin
+          AddSDTransformer2D(NN, Cfg, TextInput, HLayer, OutCh, pTrainable,
+            DownAttn[i][j]);
+          HLayer := NN.GetLastLayer();
+        end;
+        Skips[SkipTop] := HLayer; SkipCh[SkipTop] := OutCh; Inc(SkipTop);
+      end;
+      InCh := OutCh;
+      if i < nM1 then
+      begin
+        DownSamp[i] := NN.AddLayerAfter(
+          [TNNetConvolutionLinear.Create(OutCh, 3, 1, 2, 0).SetTrainable(pTrainable)],
+          HLayer);
+        HLayer := NN.GetLastLayer();
+        Skips[SkipTop] := HLayer; SkipCh[SkipTop] := OutCh; Inc(SkipTop);
+      end
+      else
+        DownSamp[i] := nil;
+    end;
+
+    // ---- MID block (resnet -> cross-attn transformer -> resnet) ----
+    MidCh := Cfg.BlockOutChannels[nM1];
+    AddSDResnetBlock(NN, Cfg, TimeCond, HLayer, MidCh, MidCh, pTrainable, MidRes1);
+    HLayer := NN.GetLastLayer();
+    AddSDTransformer2D(NN, Cfg, TextInput, HLayer, MidCh, pTrainable, MidAttn);
+    HLayer := NN.GetLastLayer();
+    AddSDResnetBlock(NN, Cfg, TimeCond, HLayer, MidCh, MidCh, pTrainable, MidRes2);
+    HLayer := NN.GetLastLayer();
+
+    if SkipTop <> Config.NumDownResiduals then
+      ImportError('ControlNet import: internal skip/tap count mismatch (' +
+        IntToStr(SkipTop) + ' vs ' + IntToStr(Config.NumDownResiduals) + ').');
+
+    // ---- ZERO-CONV residual taps (1x1 PointwiseConvLinear off each skip) ----
+    for i := 0 to SkipTop - 1 do
+    begin
+      DownTaps[i] := NN.AddLayerAfter(
+        [TNNetPointwiseConvLinear.Create(SkipCh[i]).SetTrainable(pTrainable)],
+        Skips[i]);
+      Inc(TapTop);
+    end;
+    MidTap := NN.AddLayerAfter(
+      [TNNetPointwiseConvLinear.Create(MidCh).SetTrainable(pTrainable)], HLayer);
+
+    if not pTrainable then NN.SetTrainable();
+
+    // No sink layer: TNNet.Compute runs EVERY layer in Net.Layers order
+    // (regardless of graph connectivity), so each tap is computed and its
+    // Output read directly by ControlNetResiduals. The taps are built
+    // CONSECUTIVELY (all down taps, then the mid tap) and are therefore the
+    // last NumDownResiduals+1 layers of the net.
+
+    // ---------------- Weights ----------------
+    LoadVaeConv(Reader, ConvIn, 'conv_in.weight', 'conv_in.bias', d0,
+      Cfg.InChannels, 3);
+    // time MLP. linear_1 input columns [sin|cos] -> [cos|sin] swap (as SDUNet).
+    half := d0 div 2;
+    halfM1 := half - 1;
+    LoadLlamaLinearWeights(Reader, TFc0, 'time_embedding.linear_1.weight',
+      d0, Cfg.TimeEmbedDim, 0, -1, 0, 'time_embedding.linear_1.bias');
+    for i := 0 to Cfg.TimeEmbedDim - 1 do
+    begin
+      WVol := TFc0.FArrNeurons[i].Weights;
+      for ci := 0 to halfM1 do
+      begin
+        SwapTmp := WVol.FData[ci];
+        WVol.FData[ci] := WVol.FData[half + ci];
+        WVol.FData[half + ci] := SwapTmp;
+      end;
+    end;
+    TFc0.FlushWeightCache();
+    LoadLlamaLinearWeights(Reader, TFc2, 'time_embedding.linear_2.weight',
+      Cfg.TimeEmbedDim, Cfg.TimeEmbedDim, 0, -1, 0, 'time_embedding.linear_2.bias');
+
+    // hint stem. Refs in load order: conv_in, then per-transition (same, down),
+    // then conv_out.
+    LoadVaeConv(Reader, HintRefs[0], 'controlnet_cond_embedding.conv_in.weight',
+      'controlnet_cond_embedding.conv_in.bias', Config.CondEmbedOut[0],
+      Config.CondChannels, 3);
+    HintBi := 1;
+    for i := 0 to Config.NumCondEmbedOut - 2 do
+    begin
+      LoadVaeConv(Reader, HintRefs[HintBi],
+        'controlnet_cond_embedding.blocks.' + IntToStr(2 * i) + '.weight',
+        'controlnet_cond_embedding.blocks.' + IntToStr(2 * i) + '.bias',
+        Config.CondEmbedOut[i], Config.CondEmbedOut[i], 3);
+      Inc(HintBi);
+      LoadVaeConv(Reader, HintRefs[HintBi],
+        'controlnet_cond_embedding.blocks.' + IntToStr(2 * i + 1) + '.weight',
+        'controlnet_cond_embedding.blocks.' + IntToStr(2 * i + 1) + '.bias',
+        Config.CondEmbedOut[i + 1], Config.CondEmbedOut[i], 3);
+      Inc(HintBi);
+    end;
+    LoadVaeConv(Reader, HintRefs[HintBi],
+      'controlnet_cond_embedding.conv_out.weight',
+      'controlnet_cond_embedding.conv_out.bias', d0,
+      Config.CondEmbedOut[Config.NumCondEmbedOut - 1], 3);
+    if HintBi + 1 <> HintCount then
+      ImportError('ControlNet import: internal hint ref count mismatch.');
+
+    // down blocks.
+    InCh := d0;
+    for i := 0 to nM1 do
+    begin
+      OutCh := Cfg.BlockOutChannels[i];
+      for j := 0 to NumResnet - 1 do
+      begin
+        if j = 0 then b := InCh else b := OutCh;
+        Prefix := 'down_blocks.' + IntToStr(i) + '.resnets.' + IntToStr(j) + '.';
+        LoadSDResnetBlock(Reader, DownRes[i][j], Prefix, b, OutCh, Cfg);
+        if Cfg.DownHasAttn[i] then
+          LoadSDTransformer2D(Reader, DownAttn[i][j],
+            'down_blocks.' + IntToStr(i) + '.attentions.' + IntToStr(j) + '.',
+            OutCh, Cfg);
+      end;
+      InCh := OutCh;
+      if DownSamp[i] <> nil then
+        LoadVaeConv(Reader, DownSamp[i],
+          'down_blocks.' + IntToStr(i) + '.downsamplers.0.conv.weight',
+          'down_blocks.' + IntToStr(i) + '.downsamplers.0.conv.bias',
+          OutCh, OutCh, 3);
+    end;
+
+    // mid block.
+    LoadSDResnetBlock(Reader, MidRes1, 'mid_block.resnets.0.', MidCh, MidCh, Cfg);
+    LoadSDTransformer2D(Reader, MidAttn, 'mid_block.attentions.0.', MidCh, Cfg);
+    LoadSDResnetBlock(Reader, MidRes2, 'mid_block.resnets.1.', MidCh, MidCh, Cfg);
+
+    // zero-conv taps (1x1 convs, [out,in,1,1]).
+    for i := 0 to Config.NumDownResiduals - 1 do
+      LoadVaeConv(Reader, DownTaps[i],
+        'controlnet_down_blocks.' + IntToStr(i) + '.weight',
+        'controlnet_down_blocks.' + IntToStr(i) + '.bias',
+        SkipCh[i], SkipCh[i], 1);
+    LoadVaeConv(Reader, MidTap, 'controlnet_mid_block.weight',
+      'controlnet_mid_block.bias', MidCh, MidCh, 1);
+
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildControlNetFromSafeTensorsEx(const FileName: string;
+  const Config: TControlNetConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildControlNet(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildControlNetFromSafeTensors(const FileName: string;
+  out Config: TControlNetConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadControlNetConfigFromJSONFile(ConfigPath);
+  Result := BuildControlNetFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+function ControlNetTimestepInput(Net: TNNet): TNNetLayer;
+begin
+  Result := SDUNetNthInput(Net, 1);
+end;
+
+function ControlNetTextStatesInput(Net: TNNet): TNNetLayer;
+begin
+  Result := SDUNetNthInput(Net, 2);
+end;
+
+function ControlNetCondInput(Net: TNNet): TNNetLayer;
+begin
+  Result := SDUNetNthInput(Net, 3);
+end;
+
+procedure ControlNetResiduals(Net: TNNet; const Config: TControlNetConfig;
+  Latent, EncStates, Cond: TNNetVolume; t: TNeuralFloat;
+  DownResiduals: array of TNNetVolume; MidResidual: TNNetVolume);
+var
+  TextIn, CondIn: TNNetLayer;
+  Taps: array of TNNetLayer;
+  TapCount, i: integer;
+begin
+  if Length(DownResiduals) < Config.NumDownResiduals then
+    ImportError('ControlNetResiduals: DownResiduals has ' +
+      IntToStr(Length(DownResiduals)) + ' slots, need ' +
+      IntToStr(Config.NumDownResiduals) + '.');
+  ControlNetTimestepInput(Net).Output.FData[0] := t;
+  TextIn := ControlNetTextStatesInput(Net);
+  if EncStates.Size <> TextIn.Output.Size then
+    ImportError('ControlNetResiduals: encoder_hidden_states size ' +
+      IntToStr(EncStates.Size) + ' <> net text input size ' +
+      IntToStr(TextIn.Output.Size) + '.');
+  TextIn.Output.Copy(EncStates);
+  CondIn := ControlNetCondInput(Net);
+  if Cond.Size <> CondIn.Output.Size then
+    ImportError('ControlNetResiduals: control image size ' +
+      IntToStr(Cond.Size) + ' <> net cond input size ' +
+      IntToStr(CondIn.Output.Size) + '.');
+  CondIn.Output.Copy(Cond);
+  Net.Compute(Latent);
+  // The residual taps are the LAST NumDownResiduals+1 layers of the net, built
+  // CONSECUTIVELY as [down taps..., mid tap] (no sink layer follows them).
+  TapCount := Config.NumDownResiduals + 1;
+  SetLength(Taps, TapCount);
+  for i := 0 to TapCount - 1 do
+    Taps[i] := Net.Layers[Net.CountLayers() - TapCount + i];
+  for i := 0 to Config.NumDownResiduals - 1 do
+    DownResiduals[i].Copy(Taps[i].Output);
+  MidResidual.Copy(Taps[Config.NumDownResiduals].Output);
 end;
 
 // ===========================================================================

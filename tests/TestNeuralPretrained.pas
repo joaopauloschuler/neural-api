@@ -518,6 +518,8 @@ type
     procedure TestVaeEncoderParity;
     procedure TestSDUNetConfigFromJSONFile;
     procedure TestSDUNetParity;
+    procedure TestControlNetConfigFromJSONFile;
+    procedure TestControlNetParity;
     procedure TestVaeRoundTrip;
     procedure TestVqModelEncodeParity;
     procedure TestVqModelDecodeParity;
@@ -20935,6 +20937,180 @@ begin
     LatentInput.Free;
     EncStates.Free;
     Noise.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestControlNetConfigFromJSONFile;
+var
+  Config: TControlNetConfig;
+begin
+  Config := ReadControlNetConfigFromJSONFile(
+    FixturePath('tiny_controlnet_config.json'));
+  AssertEquals('base model type', 'UNet2DConditionModel', Config.Base.ModelType);
+  AssertEquals('num block out', 2, Config.Base.NumBlockOut);
+  AssertEquals('block out 0', 16, Config.Base.BlockOutChannels[0]);
+  AssertEquals('block out 1', 32, Config.Base.BlockOutChannels[1]);
+  AssertEquals('layers per block', 1, Config.Base.LayersPerBlock);
+  AssertEquals('cross dim', 12, Config.Base.CrossAttentionDim);
+  AssertEquals('num heads', 2, Config.Base.NumHeads);
+  AssertEquals('latent grid', 8, Config.Base.LatentGrid);
+  AssertTrue('down0 has attn', Config.Base.DownHasAttn[0]);
+  AssertTrue('down1 no attn', not Config.Base.DownHasAttn[1]);
+  AssertEquals('cond channels', 3, Config.CondChannels);
+  AssertEquals('num cond embed out', 2, Config.NumCondEmbedOut);
+  AssertEquals('cond embed out 0', 8, Config.CondEmbedOut[0]);
+  AssertEquals('cond embed out 1', 16, Config.CondEmbedOut[1]);
+  AssertEquals('cond grid', 16, Config.CondGrid);
+  // taps: conv_in + 1 down resnet(attn) + 1 downsampler + 1 down resnet = 4.
+  AssertEquals('num down residuals', 4, Config.NumDownResiduals);
+end;
+
+// ControlNet spatial-conditioning parity test (diffusers ControlNetModel).
+// tests/fixtures/tiny_controlnet.* is a pico randomly-initialized ControlNet
+// (the SD UNet encoder + mid block copy, a controlnet_cond_embedding hint stem,
+// and zero-conv residual taps filled with small random weights). The generator
+// tools/controlnet_tiny_fixture.py builds a self-contained numpy float64 oracle
+// (diffusers is not installed) of the exact ControlNet forward and pins the
+// down_block_res_samples + mid_block_res_sample for a fixed (latent, timestep,
+// text-states, control-image) tuple. This exercises conv_in + the hint stem
+// (added to conv_in), the encoder down/mid blocks (REUSE of the SD UNet block
+// builders), and the per-resolution zero-conv taps, end to end < 1e-4 vs the
+// oracle on the residual tensors that get injected into the frozen base UNet.
+procedure TTestNeuralPretrained.TestControlNetParity;
+var
+  NN: TNNet;
+  Config: TControlNetConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Latent, ChanArr, RowArr, EncArr, EncRow, CondArr, DownArr, ResEntry: TJSONArray;
+  MidArr: TJSONArray;
+  LatentInput, EncStates, Cond, MidResidual: TNNetVolume;
+  DownResiduals: array of TNNetVolume;
+  t: double;
+  Grid, CondGrid, ChanCnt, YCnt, XCnt, SCnt, DCnt, ri, Ch, Hh, Ww: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildControlNetFromSafeTensors(
+    FixturePath('tiny_controlnet.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_controlnet_config.json'));
+  RefJson := TStringList.Create;
+  LatentInput := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create;
+  Cond := TNNetVolume.Create;
+  MidResidual := TNNetVolume.Create;
+  RefRoot := nil;
+  SetLength(DownResiduals, Config.NumDownResiduals);
+  for ri := 0 to Config.NumDownResiduals - 1 do
+    DownResiduals[ri] := TNNetVolume.Create;
+  try
+    AssertTrue('net built', NN <> nil);
+    Grid := Config.Base.LatentGrid;
+    CondGrid := Config.CondGrid;
+    RefJson.LoadFromFile(FixturePath('tiny_controlnet_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Latent := TJSONArray(TJSONObject(RefRoot).Find('latent'));
+    EncArr := TJSONArray(TJSONObject(RefRoot).Find('encoder_hidden_states'));
+    CondArr := TJSONArray(TJSONObject(RefRoot).Find('controlnet_cond'));
+    DownArr := TJSONArray(TJSONObject(RefRoot).Find('down_block_res_samples'));
+    MidArr := TJSONArray(TJSONObject(RefRoot).Find('mid_block_res_sample'));
+    t := TJSONObject(RefRoot).Get('timestep', 0.0);
+    AssertTrue('latent present', Latent <> nil);
+    AssertEquals('down residual count', Config.NumDownResiduals, DownArr.Count);
+
+    // latent (C,H,W) -> CAI (x,y,depth) volume.
+    LatentInput.ReSize(Grid, Grid, Config.Base.InChannels);
+    for ChanCnt := 0 to Config.Base.InChannels - 1 do
+    begin
+      RowArr := TJSONArray(Latent.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+          LatentInput.FData[(YCnt * Grid + XCnt) * Config.Base.InChannels + ChanCnt]
+            := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    // encoder_hidden_states (TextSeqLen, CrossDim) -> (SeqLen,1,CrossDim).
+    EncStates.ReSize(Config.Base.TextSeqLen, 1, Config.Base.CrossAttentionDim);
+    for SCnt := 0 to Config.Base.TextSeqLen - 1 do
+    begin
+      EncRow := TJSONArray(EncArr.Items[SCnt]);
+      for DCnt := 0 to Config.Base.CrossAttentionDim - 1 do
+        EncStates.FData[SCnt * Config.Base.CrossAttentionDim + DCnt] :=
+          EncRow.Items[DCnt].AsFloat;
+    end;
+    // controlnet_cond (C,H,W) -> (x,y,depth) volume.
+    Cond.ReSize(CondGrid, CondGrid, Config.CondChannels);
+    for ChanCnt := 0 to Config.CondChannels - 1 do
+    begin
+      RowArr := TJSONArray(CondArr.Items[ChanCnt]);
+      for YCnt := 0 to CondGrid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to CondGrid - 1 do
+          Cond.FData[(YCnt * CondGrid + XCnt) * Config.CondChannels + ChanCnt]
+            := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+
+    ControlNetResiduals(NN, Config, LatentInput, EncStates, Cond, t,
+      DownResiduals, MidResidual);
+
+    MaxDiff := 0;
+    // down_block_res_samples: each (Ch,H,W).
+    for ri := 0 to Config.NumDownResiduals - 1 do
+    begin
+      ResEntry := TJSONArray(DownArr.Items[ri]);
+      Ch := ResEntry.Count;
+      for ChanCnt := 0 to Ch - 1 do
+      begin
+        RowArr := TJSONArray(ResEntry.Items[ChanCnt]);
+        Hh := RowArr.Count;
+        for YCnt := 0 to Hh - 1 do
+        begin
+          ChanArr := TJSONArray(RowArr.Items[YCnt]);
+          Ww := ChanArr.Count;
+          for XCnt := 0 to Ww - 1 do
+          begin
+            RefVal := ChanArr.Items[XCnt].AsFloat;
+            GotVal := DownResiduals[ri].FData[(YCnt * Ww + XCnt) * Ch + ChanCnt];
+            Diff := Abs(GotVal - RefVal);
+            if Diff > MaxDiff then MaxDiff := Diff;
+          end;
+        end;
+      end;
+    end;
+    // mid_block_res_sample (Ch,H,W).
+    Ch := MidArr.Count;
+    for ChanCnt := 0 to Ch - 1 do
+    begin
+      RowArr := TJSONArray(MidArr.Items[ChanCnt]);
+      Hh := RowArr.Count;
+      for YCnt := 0 to Hh - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        Ww := ChanArr.Count;
+        for XCnt := 0 to Ww - 1 do
+        begin
+          RefVal := ChanArr.Items[XCnt].AsFloat;
+          GotVal := MidResidual.FData[(YCnt * Ww + XCnt) * Ch + ChanCnt];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('controlnet residuals: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    LatentInput.Free;
+    EncStates.Free;
+    Cond.Free;
+    MidResidual.Free;
+    for ri := 0 to Config.NumDownResiduals - 1 do DownResiduals[ri].Free;
     RefJson.Free;
     NN.Free;
   end;
