@@ -11433,6 +11433,7 @@ type
     UseSharedRelPosBias: boolean; // use_shared_relative_position_bias (rejected)
     UseAbsPos: boolean;         // use_absolute_position_embeddings (rejected)
     UseMeanPooling: boolean;    // use_mean_pooling (pooler vs final LayerNorm)
+    NumLabels: integer;         // classifier out width (image-classification head)
     ModelType: string;          // 'beit' / 'data2vec-vision'
   end;
 
@@ -11463,6 +11464,32 @@ function BuildBeitFromSafeTensorsEx(const FileName: string;
   const Config: TBeitConfig; pTrainable: boolean = true): TNNet;
 
 function BuildBeitFromSafeTensorsWithConfig(const FileName: string;
+  out Config: TBeitConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+
+// Builds the BEiT IMAGE-CLASSIFICATION net (BeitForImageClassification, e.g.
+// microsoft/beit-base-patch16-224, facebook/data2vec-vision-base-ft1k): the
+// BEiT encoder (built by BuildBeitFromSafeTensors) + the HF BeitPooler + a
+// single classifier nn.Linear -> (1,1,NumLabels) class logits. The pooler
+// reproduces BeitPooler EXACTLY (HF: layernorm(hidden[:,1:].mean(1)) if
+// use_mean_pooling else hidden[:,0]):
+//   - use_mean_pooling=true  -> MEAN-pool the PATCH tokens (cls excluded),
+//     then the pooler LayerNorm ('pooler.layernorm.{weight,bias}'); the encoder
+//     final 'layernorm' is Identity in this mode (the encoder builder skips it);
+//   - use_mean_pooling=false -> take the cls token (row 0) after the encoder's
+//     final 'layernorm' (no pooler LayerNorm).
+// Config.NumLabels sets the head width. The caller owns Reader.
+function BuildBeitFromSafeTensorsForImageClassification(
+  Reader: TNNetSafeTensorsReader;
+  const Config: TBeitConfig; pTrainable: boolean = true): TNNet;
+
+// Builds + loads the BEiT classifier from the checkpoint at FileName. Config is
+// supplied by the caller (Ex) or read from ConfigFileName ('' = "config.json"
+// beside FileName) and returned. Output: (1,1,num_labels) class logits.
+function BuildBeitForImageClassificationEx(const FileName: string;
+  const Config: TBeitConfig; pTrainable: boolean = true): TNNet;
+
+function BuildBeitForImageClassificationWithConfig(const FileName: string;
   out Config: TBeitConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
@@ -69579,6 +69606,7 @@ var
   Root: TJSONData;
   Obj: TJSONObject;
   ModelType: string;
+  LabelObj: TJSONData;
 
   function RequiredInt(const FieldName: string): integer;
   begin
@@ -69631,6 +69659,24 @@ begin
       Obj.Get('use_shared_relative_position_bias', false);
     Result.UseAbsPos := Obj.Get('use_absolute_position_embeddings', false);
     Result.UseMeanPooling := Obj.Get('use_mean_pooling', true);
+    // num_labels (image-classification head width): explicit field, else
+    // len(id2label), else len(label2id), else the ImageNet-1k default of 1000.
+    Result.NumLabels := 0;
+    if Obj.IndexOfName('num_labels') >= 0 then
+      Result.NumLabels := Obj.Get('num_labels', 0);
+    if Result.NumLabels <= 0 then
+    begin
+      LabelObj := Obj.Find('id2label');
+      if (LabelObj <> nil) and (LabelObj is TJSONObject) then
+        Result.NumLabels := TJSONObject(LabelObj).Count;
+    end;
+    if Result.NumLabels <= 0 then
+    begin
+      LabelObj := Obj.Find('label2id');
+      if (LabelObj <> nil) and (LabelObj is TJSONObject) then
+        Result.NumLabels := TJSONObject(LabelObj).Count;
+    end;
+    if Result.NumLabels <= 0 then Result.NumLabels := 1000;
   finally
     Root.Free;
     JsonText.Free;
@@ -69983,6 +70029,100 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadBeitConfigFromJSONFile(ConfigPath);
   Result := BuildBeitFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+function BuildBeitFromSafeTensorsForImageClassification(
+  Reader: TNNetSafeTensorsReader;
+  const Config: TBeitConfig; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  Pooler, Classifier: TNNetLayer;
+  Grid, NumPatches, d: integer;
+  Pfx: string;
+begin
+  if Config.NumLabels < 1 then
+    ImportError('BEiT import: num_labels must be >= 1, got ' +
+      IntToStr(Config.NumLabels) + '.');
+  d := Config.HiddenSize;
+  Grid := Config.ImageSize div Config.PatchSize;
+  NumPatches := Grid * Grid;
+  // Build the encoder (token hidden states, row 0 = cls). When
+  // use_mean_pooling=false the encoder already applied its final 'layernorm';
+  // when true it returns the raw encoder output (BeitModel.layernorm is Identity
+  // in that mode - the LayerNorm lives in the pooler instead).
+  NN := BuildBeitFromSafeTensors(Reader, Config, pTrainable);
+  try
+    // ---------------- Pooler + head (BeitPooler, then classifier) ----------
+    if Config.UseMeanPooling then
+    begin
+      // HF: layernorm(hidden_states[:, 1:, :].mean(1)). Drop the cls row, then
+      // MEAN-pool the patch tokens. Reshape the (NumPatches,1,d) patch sequence
+      // to the (Grid,Grid,d) grid so TNNetAvgChannel divides by Grid*Grid =
+      // NumPatches (an (N,1,F) bag would divide by N*N - see AvgChannel pool
+      // scaling); the patch order is exactly the row-major (y,x) grid.
+      NN.AddLayer( TNNetCrop.Create({StartX=}1, {StartY=}0, {LenX=}NumPatches, {LenY=}1) );
+      NN.AddLayer( TNNetReshape.Create(Grid, Grid, d) );
+      NN.AddLayer( TNNetAvgChannel.Create() );  // -> (1,1,d)
+      Pooler := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+    end
+    else
+    begin
+      // HF: hidden_states[:, 0] - take the cls row (the encoder's final
+      // 'layernorm' was already applied to it). No pooler LayerNorm.
+      NN.AddLayer( TNNetCrop.Create({StartX=}0, {StartY=}0, {LenX=}1, {LenY=}1) );
+      Pooler := nil;
+    end;
+    Classifier := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.NumLabels).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
+
+    // ---------------- Weights ----------------
+    // Prefix probe matches the encoder builder: 'beit.' / 'data2vec_vision.' /
+    // '' depending on whether the classifier checkpoint wraps the backbone.
+    if Reader.HasTensor('beit.embeddings.cls_token') then
+      Pfx := 'beit.'
+    else if Reader.HasTensor('data2vec_vision.embeddings.cls_token') then
+      Pfx := 'data2vec_vision.'
+    else
+      Pfx := '';
+    if Pooler <> nil then
+      LoadLayerNormWeights(Reader, Pooler,
+        Pfx + 'pooler.layernorm.weight', Pfx + 'pooler.layernorm.bias', d);
+    // classifier nn.Linear (hidden -> num_labels), NOT under the backbone prefix.
+    LoadLlamaLinearWeights(Reader, Classifier, 'classifier.weight',
+      d, Config.NumLabels, 0, -1, 0, 'classifier.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildBeitForImageClassificationEx(const FileName: string;
+  const Config: TBeitConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildBeitFromSafeTensorsForImageClassification(
+      Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildBeitForImageClassificationWithConfig(const FileName: string;
+  out Config: TBeitConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadBeitConfigFromJSONFile(ConfigPath);
+  Result := BuildBeitForImageClassificationEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================

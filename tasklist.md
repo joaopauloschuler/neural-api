@@ -1442,9 +1442,15 @@ rather than acted on.
         all layers) is rejected; only the per-layer table is wired.
   - [ ] use_absolute_position_embeddings=true and use_relative_position_bias=
         false variants rejected (the published checkpoints don't use them).
-  - [ ] No top-level BuildFromPretrained dispatch entry / classifier head /
-        ForImageClassification wrapper yet (builder returns token hidden states;
-        use_mean_pooling pooler LayerNorm + patch mean left to the caller).
+  - [X] Classifier head + pooler + ForImageClassification wrapper LANDED:
+        BuildBeitFromSafeTensorsForImageClassification[Ex/WithConfig] append the
+        HF BeitPooler (use_mean_pooling=true -> patch-token mean + pooler.layernorm;
+        false -> cls row, encoder final LN) + classifier nn.Linear -> (1,1,num_labels)
+        logits; parity tools/beit_cls_tiny_fixture.py + tests/fixtures/tiny_beit_cls_*
+        (BOTH modes, <1e-4 vs HF BeitForImageClassification). No central
+        BuildFromPretrained dispatch entry (mirrors ViT/RegNet/EfficientNet/ResNet:
+        vision classifiers stay standalone *WithConfig builders, not in the
+        text/encoder dispatcher).
   - [ ] BEiTv2 (vector-quantized) not validated.
 
 - [ ] OPT decoder importer (BuildOPTFromSafeTensors[Ex], model_type "opt", e.g.

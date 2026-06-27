@@ -596,6 +596,7 @@ type
     procedure TestDINOv3Parity;
     procedure TestBeitConfigFromJSONFile;
     procedure TestBeitParity;
+    procedure TestBeitImageClassificationParity;
     procedure TestSAMEncoderParity;
     procedure TestSAMMaskDecoderParity;
     procedure TestSAMMaskDecoderV2Parity;
@@ -25305,6 +25306,90 @@ begin
     ImageInput.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// BEiT IMAGE-CLASSIFICATION parity test: tests/fixtures/tiny_beit_cls_{mean,cls}
+// is a pico randomly-initialized HF BeitForImageClassification (image 12, patch
+// 4 -> 9 patches + 1 cls = 10 tokens, 2 layers, 4 heads, d 16, ffn 64, 5 labels)
+// re-keyed to the CLASSIC published key scheme, plus a pooler + classifier head.
+// It exercises BuildBeitFromSafeTensorsForImageClassification (the encoder + the
+// HF BeitPooler + classifier nn.Linear) for BOTH pooling modes:
+//   _mean: use_mean_pooling=true  -> layernorm(hidden[:,1:].mean(1)) (PATCH-token
+//          mean, cls excluded, then pooler.layernorm; encoder final LN = Identity)
+//   _cls : use_mean_pooling=false -> hidden[:,0] (cls row, encoder final LN);
+//          no pooler LayerNorm.
+// tools/beit_cls_tiny_fixture.py asserts the head + pooler matter in the float64
+// oracle. Compares the (1,1,num_labels) class logits < 1e-4 vs HF.
+procedure TTestNeuralPretrained.TestBeitImageClassificationParity;
+const
+  Modes: array[0..1] of string = ('mean', 'cls');
+var
+  NN: TNNet;
+  Config: TBeitConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, LogitsArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt, LblCnt, NumLabels, ModeCnt: integer;
+  Diff, MaxDiff: double;
+  Stem: string;
+begin
+  for ModeCnt := 0 to High(Modes) do
+  begin
+    RandSeed := 424242;
+    Stem := 'tiny_beit_cls_' + Modes[ModeCnt];
+    NN := BuildBeitForImageClassificationWithConfig(
+      FixturePath(Stem + '.safetensors'),
+      Config, {pTrainable=}true, FixturePath(Stem + '_config.json'));
+    RefJson := TStringList.Create;
+    ImageInput := TNNetVolume.Create;
+    RefRoot := nil;
+    try
+      AssertTrue(Stem + ': net built', NN <> nil);
+      AssertEquals(Stem + ': num_labels = 5', 5, Config.NumLabels);
+      AssertEquals(Stem + ': output depth = num_labels', Config.NumLabels,
+        NN.GetLastLayer().Output.Depth);
+      AssertEquals(Stem + ': output is a single row', 1,
+        NN.GetLastLayer().Output.SizeX);
+
+      RefJson.LoadFromFile(FixturePath(Stem + '_logits.json'));
+      RefRoot := GetJSON(RefJson.Text);
+      Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+      LogitsArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+      NumLabels := TJSONObject(RefRoot).Get('num_labels', 0);
+      AssertTrue(Stem + ': pixels present', Pixels <> nil);
+      AssertEquals(Stem + ': oracle label count', NumLabels, LogitsArr.Count);
+
+      ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+      for ChanCnt := 0 to Config.NumChannels - 1 do
+      begin
+        RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+        for YCnt := 0 to Config.ImageSize - 1 do
+        begin
+          ChanArr := TJSONArray(RowArr.Items[YCnt]);
+          for XCnt := 0 to Config.ImageSize - 1 do
+            ImageInput.FData[
+              (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+              ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+        end;
+      end;
+      NN.Compute(ImageInput);
+      MaxDiff := 0;
+      for LblCnt := 0 to NumLabels - 1 do
+      begin
+        Diff := Abs(NN.GetLastLayer().Output.FData[LblCnt] -
+          LogitsArr.Items[LblCnt].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      AssertTrue(Stem + ': class logits max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      RefRoot.Free;
+      ImageInput.Free;
+      RefJson.Free;
+      NN.Free;
+    end;
   end;
 end;
 
