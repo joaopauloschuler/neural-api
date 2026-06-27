@@ -1602,29 +1602,10 @@ rather than acted on.
 
 ## Layer follow-ups that fix real limitations
 
-- [X] Non-zero padding modes for `TNNetPadXY` (and `TNNetPad`): add a
-      `TNNetPadMode` argument — `pmZero` (current behaviour, default), `pmReflect`,
-      `pmReplicate` (edge-clamp) and `pmCircular` — porting `torch.nn.ReflectionPad2d`
-      / `ReplicationPad2d` / circular `F.pad`. Forward copies the mirrored / clamped
-      / wrapped border columns instead of zeros; backward SCATTERS each padded
-      output cell's gradient back onto the real source column it was copied from
-      (reflect/replicate accumulate onto interior/edge columns, circular wraps),
-      so it stays a parameter-free differentiable layer. High value because reflect
-      and replicate padding are the standard CV-generator padding (style-transfer
-      / SR generators) AND it lets the hand-rolled reflect/replicate left-padding
-      inside the EnCodec / Mimi / DAC / HiFi-GAN codec convs in
-      `neural/neuralpretrained.pas` (their `PadMode` 'reflect'/'replicate' branches)
-      be expressed with a real layer rather than bespoke array code. Numerical-
-      gradient test per mode; serialization round-trip for the new enum arg.
-      DONE: `TNNetPadMode` enum (pmZero default), mode arg on both
-      `TNNetPad.Create`/`TNNetPadXY.Create` (FStruct[1]/FStruct[2]; legacy =
-      pmZero), shared `NeuralPadSourceIndex` mapping drives both the forward copy
-      and the exact backward scatter-adjoint, both deserializers wired,
-      per-mode numerical-gradient + forward + SaveToString round-trip tests in
-      TestNeuralNumerical.pas (all green; full suite 2409 pass).
-      REMAINING (separate follow-up, intentionally NOT done here): rewrite the
-      EnCodec/Mimi/DAC/HiFi-GAN codec reflect/replicate left-padding in
-      `neural/neuralpretrained.pas` to use this layer instead of bespoke arrays.
+- [ ] Rewrite the EnCodec/Mimi/DAC/HiFi-GAN codec reflect/replicate left-padding
+      in `neural/neuralpretrained.pas` to use the landed `TNNetPadXY`/`TNNetPad`
+      padding-mode layer (`pmReflect`/`pmReplicate`) instead of the bespoke
+      per-channel array code in their `PadMode` 'reflect'/'replicate' branches.
 
 - [~] Bidirectional + multi-layer stacking for `TNNetLSTMCell` / `TNNetGRUCell`
       (and a real `nn.LSTM`/`nn.GRU` num_layers>1 / bidirectional=True checkpoint
