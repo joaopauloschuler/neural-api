@@ -898,7 +898,7 @@ rather than acted on.
       existing parity tests (TestHiFiGANSynthesisParity / TestVitsSynthesisParity /
       EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
       before/after.
-- [ ] OpenCL forward offload for `TNNetKANConv` via the shared `cai_dot_product`
+- [X] OpenCL forward offload for `TNNetKANConv` via the shared `cai_dot_product`
       GEMV kernel. The AVX sweep already reduced each edge's basis-coefficient
       accumulation (`W * FBVal` / `W * FT` over the contiguous `FCoeffsPerEdge`
       span) to a single `TNNetVolume.DotProduct` — structurally the SAME

@@ -11226,7 +11226,20 @@ type
     FKnots: array of TNeuralFloat;     // B-spline knot vector (clamped uniform)
     FBVal: array of TNeuralFloat;      // scratch B_j(u) buffer (length G+K)
     FBDeriv: array of TNeuralFloat;    // scratch B_j'(u) buffer (length G+K)
+    {$IFDEF OpenCL}
+    // Scratch operands for the tap-diagonal coefficient-GEMV offload
+    // (ComputeOpenCL): the per-edge FCoeffsPerEdge basis-coefficient reduction
+    // batched onto the shared cai_dot_product kernel. Basis evaluation itself
+    // (Chebyshev / B-spline) stays on the CPU; only the coefficient dot products
+    // move to the device. Added for the OpenCL forward offload.
+    FGemmWKan: TNNetVolume;     // A: (OutDepth*Taps) coefficient vectors, length C
+    FGemmBasisKan: TNNetVolume; // B: (NumPos*Taps) basis vectors, length C
+    FGemmResKan: TNNetVolume;   // result NumAs*NumBs
+    {$ENDIF}
     procedure ComputeCPU();
+    {$IFDEF OpenCL}
+    procedure ComputeOpenCL();
+    {$ENDIF}
     procedure BackpropagateCPU();
     procedure ComputePreviousLayerErrorCPU();
     procedure SetupBSplineBasis();
@@ -11241,6 +11254,9 @@ type
     procedure Compute(); override;
     procedure Backpropagate(); override;
     procedure InitDefault(); override;
+    {$IFDEF OpenCL}
+    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    {$ENDIF}
     property Degree: integer read FDegree;
     property Basis: integer read FBasis;
   end;
@@ -71918,6 +71934,11 @@ end;
 destructor TNNetKANConv.Destroy();
 begin
   SetLength(FTderivBuf, 0);
+  {$IFDEF OpenCL}
+  if Assigned(FGemmWKan)     then FGemmWKan.Free;
+  if Assigned(FGemmBasisKan) then FGemmBasisKan.Free;
+  if Assigned(FGemmResKan)   then FGemmResKan.Free;
+  {$ENDIF}
   inherited Destroy();
 end;
 
@@ -72133,7 +72154,24 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  {$IFDEF OpenCL}
+  // Offload the per-edge coefficient reduction (the FCoeffsPerEdge dot product)
+  // to the device when OpenCL is armed and the work is large enough to amortise
+  // upload/dispatch. The Chebyshev / B-spline basis evaluation stays on the CPU;
+  // ComputeCPU is the byte-comparable fallback otherwise. The work estimate is
+  // the full MAC count OutDepth*NumPos*TapsPerFilter*CoeffsPerEdge.
+  if FHasOpenCL and FShouldOpenCL and Assigned(FDotCL) and
+     (Int64(FOutput.Size) * FTapsPerFilter * FCoeffsPerEdge >= NeuralConvOpenCLMinWork) then
+  begin
+    ComputeOpenCL();
+  end
+  else
+  begin
+    ComputeCPU();
+  end;
+  {$ELSE}
   ComputeCPU();
+  {$ENDIF}
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -72204,6 +72242,158 @@ begin
     end;
   end;
 end;
+
+{$IFDEF OpenCL}
+procedure TNNetKANConv.EnableOpenCL(DotProductKernel: TDotProductKernel);
+begin
+  // As with TNNetDepthwiseConv / TNNetGroupConvP4, bypass the standard conv
+  // concated-weight arming: the KAN per-filter coefficient layout is NOT the
+  // per-output-feature interleaved-weight layout that path expects. Arm only the
+  // bare TNNetLayer (FHasOpenCL + the shared dot-product kernel) plus our own
+  // scratch operands; the offload runs through ComputeOpenCL as a tap-diagonal
+  // coefficient GEMV.
+  FHasOpenCL := true;
+  FDotProductKernel := DotProductKernel;
+  if not Assigned(FDotCL) then
+  begin
+    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL.HideMessages();
+  end;
+  if not Assigned(FGemmWKan)     then FGemmWKan     := TNNetVolume.Create();
+  if not Assigned(FGemmBasisKan) then FGemmBasisKan := TNNetVolume.Create();
+  if not Assigned(FGemmResKan)   then FGemmResKan   := TNNetVolume.Create();
+  FShouldOpenCL := true;
+end;
+
+// Device forward, mapped onto the shared cai_dot_product GEMV. The forward is
+//   y_oo(ox,oy) = sum_tap < W_oo[tap*C .. tap*C+C-1], Basis_p[tap] >
+// where the length-C (=FCoeffsPerEdge) per-edge coefficient row is reduced
+// against the basis vector at that tap. The basis vector depends ONLY on the
+// input value at the tap (tanh-squashed, then Chebyshev T_k OR B-spline B_j) and
+// is therefore SHARED across all output channels oo. tap = (fy*Fx+fx)*InDepth+ic
+// sweeps the FTapsPerFilter receptive-field edges; padding-clipped taps contribute
+// a ZERO basis vector (so the dot product vanishes, matching ComputeCPU's skip).
+//
+// This is the tap-diagonal analogue of the depthwise depth-diagonal GEMV (tap
+// plays the role of the matched free index):
+//   A = (OutDepth*Taps) coefficient vectors, A[(oo*Taps + tap)*... ] length C
+//   B = (NumPos *Taps) basis        vectors, B[(p *Taps + tap)*C + k]
+// cai_dot_product returns Res[bIdx*NumAs + aIdx] = <A_aIdx, B_bIdx>; we read the
+// TAP-DIAGONAL entries (aIdx and bIdx sharing tap) and sum them over tap into
+// FOutput. Cross-tap products are computed and discarded - correct, at a
+// Taps-fold overspend that the work-threshold gate keeps in check. KAN edges
+// carry their own constant term, so there is NO bias add (matching ComputeCPU).
+procedure TNNetKANConv.ComputeOpenCL();
+var
+  OutDepth, Taps, NumPos, C, NumAs, NumBs: integer;
+  ox, oy, oo, fx, fy, ic, kk, tap, p, base, aIdx, bIdx: integer;
+  prevX, prevY, prevSizeX, prevSizeY: integer;
+  outSizeYMax, outSizeXMax, outDepthMax, featYMax, featXMax, inDepthMax, coeffsMax: integer;
+  tapsMax: integer;
+  u, xv, acc: TNeuralFloat;
+  W, PrevOut: TNNetVolume;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  prevSizeX := PrevOut.SizeX;
+  prevSizeY := PrevOut.SizeY;
+  OutDepth := FNeurons.Count;
+  Taps := FTapsPerFilter;
+  C := FCoeffsPerEdge;
+  NumPos := FOutputSizeX * FOutputSizeY;
+  NumAs := OutDepth * Taps;
+  NumBs := NumPos * Taps;
+  outSizeYMax := FOutputSizeY - 1;
+  outSizeXMax := FOutputSizeX - 1;
+  outDepthMax := OutDepth - 1;
+  featYMax := FFeatureSizeY - 1;
+  featXMax := FFeatureSizeX - 1;
+  inDepthMax := FInDepth - 1;
+  coeffsMax := C - 1;
+  tapsMax := Taps - 1;
+
+  // A: coefficient vectors in the kernel's COLUMN-INTERLEAVED layout
+  // (element k of vector aIdx at [aIdx + k*NumAs]), matching cai_dot_product's
+  // FInputBufferAs[a_id + i*FNumAs] access. aIdx = oo*Taps + tap.
+  FGemmWKan.ReSize(NumAs * C, 1, 1);
+  for oo := 0 to outDepthMax do
+  begin
+    W := FArrNeurons[oo].FWeights;
+    for tap := 0 to tapsMax do
+    begin
+      aIdx := oo * Taps + tap;
+      base := tap * C;
+      for kk := 0 to coeffsMax do
+        FGemmWKan.FData[aIdx + kk * NumAs] := W.FData[base + kk];
+    end;
+  end;
+
+  // B: basis vectors per (output position p, tap), [(p*Taps + tap)*C + k].
+  // The basis is evaluated ONCE per (position, tap) on the CPU and shared across
+  // all output channels. Padding-clipped taps stay zero (Fill 0 + skip).
+  FGemmBasisKan.ReSize(NumBs * C, 1, 1);
+  FGemmBasisKan.Fill(0);
+  for oy := 0 to outSizeYMax do
+  for ox := 0 to outSizeXMax do
+  begin
+    p := oy * FOutputSizeX + ox;
+    for fy := 0 to featYMax do
+    begin
+      prevY := oy * FStride + fy - FPadding;
+      if (prevY < 0) or (prevY >= prevSizeY) then continue;
+      for fx := 0 to featXMax do
+      begin
+        prevX := ox * FStride + fx - FPadding;
+        if (prevX < 0) or (prevX >= prevSizeX) then continue;
+        for ic := 0 to inDepthMax do
+        begin
+          xv := PrevOut.Get(prevX, prevY, ic);
+          u := pcr_tanhf(xv);
+          tap := (fy * FFeatureSizeX + fx) * FInDepth + ic;
+          base := (p * Taps + tap) * C;
+          if FBasis = csKANBasisBSpline then
+          begin
+            EvalBSpline(u, false);
+            for kk := 0 to coeffsMax do
+              FGemmBasisKan.FData[base + kk] := FBVal[kk];
+          end
+          else
+          begin
+            FT[0] := 1;
+            if FDegree >= 1 then FT[1] := u;
+            for kk := 2 to FDegree do FT[kk] := 2 * u * FT[kk - 1] - FT[kk - 2];
+            for kk := 0 to coeffsMax do
+              FGemmBasisKan.FData[base + kk] := FT[kk];
+          end;
+        end;
+      end;
+    end;
+  end;
+
+  // Device GEMV: Res[bIdx*NumAs + aIdx] = <A_aIdx, B_bIdx>.
+  FGemmResKan.ReSize(NumAs * NumBs, 1, 1);
+  FDotCL.PrepareForCompute(FGemmWKan, FGemmBasisKan, C);
+  FDotCL.Compute(FGemmWKan, FGemmBasisKan, {ActFN}0, {NewVAs}true, {NewVBs}true);
+  FDotCL.FinishAndLoadResult(FGemmResKan, 0);
+
+  // Read back: sum the TAP-DIAGONAL entries over tap into each output channel.
+  for oy := 0 to outSizeYMax do
+  for ox := 0 to outSizeXMax do
+  begin
+    p := oy * FOutputSizeX + ox;
+    for oo := 0 to outDepthMax do
+    begin
+      acc := 0;
+      for tap := 0 to tapsMax do
+      begin
+        aIdx := oo * Taps + tap;
+        bIdx := p * Taps + tap;
+        acc := acc + FGemmResKan.FData[bIdx * NumAs + aIdx];
+      end;
+      FOutput.FData[FOutput.GetRawPos(ox, oy, oo)] := acc;
+    end;
+  end;
+end;
+{$ENDIF}
 
 procedure TNNetKANConv.Backpropagate();
 var

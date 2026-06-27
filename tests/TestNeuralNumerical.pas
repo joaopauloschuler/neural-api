@@ -283,6 +283,9 @@ type
     // OpenCL forward offload parity (vs CPU) for the depthwise convolutions.
     procedure TestDepthwiseConvOpenCLParity;
     procedure TestDepthwiseConv1DOpenCLParity;
+    // OpenCL tap-diagonal coefficient-GEMV forward offload parity (vs CPU) for
+    // TNNetKANConv (Chebyshev and B-spline basis).
+    procedure TestKANConvOpenCLParity;
     // OpenCL backward-GEMM offload parity (vs CPU) for the general convolution.
     procedure TestConvolutionBackwardOpenCLParity;
     // OpenCL two-GEMM forward offload parity (vs CPU) for the non-causal global
@@ -58487,6 +58490,82 @@ begin
     Input.Free;
     NN.Free;
   end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetKANConv device tap-diagonal coefficient-GEMV parity (vs CPU). Builds a
+// padded, multi-channel KANConv (both the Chebyshev and the B-spline basis),
+// computes on the CPU, then forces the device path (SetNeuralConvOpenCLMinWork(0))
+// and asserts the outputs match within 1e-5. Only the per-edge FCoeffsPerEdge
+// coefficient reduction moves to the device; the basis evaluation stays on the
+// CPU, so the device and CPU paths are arithmetically identical up to FP32
+// reduction-order noise. Skips gracefully when no OpenCL device is present.
+// Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestKANConvOpenCLParity;
+{$IFDEF OpenCL}
+  procedure RunOne(pBasis: integer; const aName: string);
+  var
+    NN: TNNet;
+    Input, OutCPU: TNNetVolume;
+    KAN: TNNetKANConv;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    i, InSize: integer;
+    Diff, MaxDiff: TNeuralFloat;
+  begin
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 6, 3);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(6, 6, 3, 1));
+      // 4 features, 3x3 feature, pad1, stride1, degree 3 -> 36 output positions,
+      // 27 taps/filter, C coeffs/edge. Padding exercises the zero-basis taps.
+      KAN := TNNetKANConv.Create(4, 3, 1, 1, 3, 1, pBasis);
+      NN.AddLayer(KAN);
+      InSize := Input.Size;
+      for i := 0 to InSize - 1 do
+        Input.Raw[i] := 0.05 * i - 0.4;
+
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      SetNeuralConvOpenCLMinWork(0);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        MaxDiff := 0;
+        AssertEquals(aName + ' output size match', OutCPU.Size,
+          NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        SetNeuralConvOpenCLMinWork(1 shl 20);
+      end;
+      WriteLn('  KANConv ', aName, ' OpenCL parity: max|diff|=', MaxDiff:0:9);
+      AssertTrue('KANConv ' + aName + ' OpenCL vs CPU parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+begin
+  RunOne(csKANBasisChebyshev, 'Chebyshev');
+  RunOne(csKANBasisBSpline, 'BSpline');
 end;
 {$ELSE}
 begin
