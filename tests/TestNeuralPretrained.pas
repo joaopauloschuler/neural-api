@@ -486,6 +486,7 @@ type
     procedure TestDetrConfigFromJSONFile;
     procedure TestDetrObjectDetectionParity;
     procedure TestDetrDetectionDecode;
+    procedure TestMask2FormerParity;
     procedure TestYoloConfigFromJSONFile;
     procedure TestYoloObjectDetectionParity;
     procedure TestYoloDetectionDecode;
@@ -18827,6 +18828,131 @@ begin
     Img.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// Mask2Former universal-segmentation parity (mask-classification set prediction:
+// a fixed set of learned object queries, each predicting one binary mask + a
+// class, with MASKED ATTENTION restricting each decoder layer's cross-attention
+// to the foreground of the previous layer's predicted mask). tiny_mask2former.*
+// is a pico Mask2FormerForUniversalSegmentation (decoder + heads) with re-
+// randomized O(1) weights chosen so the masks genuinely split foreground vs
+// background (the -1e9 masking fires). v1 feeds the PIXEL-DECODER outputs
+// (mask_features + the 3 multi-scale memory levels) as precomputed inputs. The
+// reference per-query mask AND class logits come from the REAL transformers
+// float64 transformer module. Asserts max |diff| < 1e-4 over both the
+// (NumQueries, NumLabels+1) class logits and the (NumQueries, MaskH*MaskW) mask
+// logits -- exercising the masked cross-attention, the cross->self->FFN post-
+// norm order, the dot-product query x mask_features mask einsum, and the round-
+// robin multi-scale level attention.
+procedure TTestNeuralPretrained.TestMask2FormerParity;
+var
+  NN: TNNet;
+  Config: TMask2FormerConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Obj: TJSONObject;
+  MaskFeatArr, ClsArr, MaskArr, LvArr, SrcArr2: TJSONArray;
+  SrcArr, PosArr: array of TNNetVolume;
+  MaskFeatures, ClassLogits, MaskLogits: TNNetVolume;
+  i, q, c, p, s, NumPix, NumKeys, Hidden, NQ, NL: integer;
+  RefVal, GotVal, Diff, MaxClsDiff, MaxMaskDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildMask2FormerFromSafeTensors(
+    FixturePath('tiny_mask2former.safetensors'),
+    Config, {pTrainable=}true, FixturePath('tiny_mask2former_config.json'));
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  MaskFeatures := TNNetVolume.Create;
+  ClassLogits := TNNetVolume.Create;
+  MaskLogits := TNNetVolume.Create;
+  MaxClsDiff := 0;
+  MaxMaskDiff := 0;
+  Hidden := Config.Hidden;
+  NumPix := Config.MaskWidth * Config.MaskHeight;
+  NQ := Config.NumQueries;
+  NL := Config.NumLabels;
+  SetLength(SrcArr, Length(Config.Levels));
+  SetLength(PosArr, Length(Config.Levels));
+  for i := 0 to Length(Config.Levels) - 1 do
+  begin
+    SrcArr[i] := TNNetVolume.Create;
+    PosArr[i] := TNNetVolume.Create;
+  end;
+  try
+    AssertTrue('net built', NN <> nil);
+    RefJson.LoadFromFile(FixturePath('tiny_mask2former_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Obj := TJSONObject(RefRoot);
+    // mask_features: io is channel-major [HIDDEN, MaskH, MaskW]; Pascal volume
+    // (MaskW, MaskH, HIDDEN) is pixel-major FData[p*HIDDEN + c]. Transpose.
+    MaskFeatArr := TJSONArray(Obj.Find('mask_features'));
+    MaskFeatures.ReSize(Config.MaskWidth, Config.MaskHeight, Hidden);
+    for c := 0 to Hidden - 1 do
+      for p := 0 to NumPix - 1 do
+        MaskFeatures.FData[p * Hidden + c] :=
+          MaskFeatArr.Items[c * NumPix + p].AsFloat;
+    // per-level value sources + key positions: io is row-major [S, HIDDEN], and
+    // the Pascal (S, 1, HIDDEN) volume is FData[s*HIDDEN + c] -- direct copy.
+    LvArr := TJSONArray(Obj.Find('level_sources'));
+    for i := 0 to Length(Config.Levels) - 1 do
+    begin
+      NumKeys := Config.Levels[i].Width * Config.Levels[i].Height;
+      SrcArr[i].ReSize(NumKeys, 1, Hidden);
+      SrcArr2 := TJSONArray(LvArr.Items[i]);
+      for s := 0 to NumKeys - 1 do
+        for c := 0 to Hidden - 1 do
+          SrcArr[i].FData[s * Hidden + c] := SrcArr2.Items[s * Hidden + c].AsFloat;
+    end;
+    // keys = value memory + sine positional (HF: k = src + pos). The importer's
+    // KeyPos input is the SUM; build it here from level_sources + level_pos.
+    LvArr := TJSONArray(Obj.Find('level_pos'));
+    for i := 0 to Length(Config.Levels) - 1 do
+    begin
+      NumKeys := Config.Levels[i].Width * Config.Levels[i].Height;
+      PosArr[i].ReSize(NumKeys, 1, Hidden);
+      SrcArr2 := TJSONArray(LvArr.Items[i]);
+      for s := 0 to NumKeys - 1 do
+        for c := 0 to Hidden - 1 do
+          PosArr[i].FData[s * Hidden + c] :=
+            SrcArr[i].FData[s * Hidden + c] +
+            SrcArr2.Items[s * Hidden + c].AsFloat;
+    end;
+    RunMask2FormerSemantic(NN, Config, MaskFeatures, SrcArr, PosArr,
+      ClassLogits, MaskLogits);
+    // compare class logits (Q, L+1).
+    ClsArr := TJSONArray(Obj.Find('class_logits'));
+    for q := 0 to NQ - 1 do
+      for c := 0 to NL do
+      begin
+        RefVal := ClsArr.Items[q * (NL + 1) + c].AsFloat;
+        GotVal := ClassLogits[q, 0, c];
+        Diff := Abs(GotVal - RefVal);
+        if Diff > MaxClsDiff then MaxClsDiff := Diff;
+      end;
+    // compare mask logits (Q, MaskH*MaskW).
+    MaskArr := TJSONArray(Obj.Find('mask_logits'));
+    for q := 0 to NQ - 1 do
+      for p := 0 to NumPix - 1 do
+      begin
+        RefVal := MaskArr.Items[q * NumPix + p].AsFloat;
+        GotVal := MaskLogits[q, 0, p];
+        Diff := Abs(GotVal - RefVal);
+        if Diff > MaxMaskDiff then MaxMaskDiff := Diff;
+      end;
+    AssertTrue('Mask2Former class logits: max |diff| = ' +
+      FloatToStr(MaxClsDiff) + ' must be < 1e-4', MaxClsDiff < 1e-4);
+    AssertTrue('Mask2Former mask logits: max |diff| = ' +
+      FloatToStr(MaxMaskDiff) + ' must be < 1e-4', MaxMaskDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+    MaskFeatures.Free;
+    ClassLogits.Free;
+    MaskLogits.Free;
+    for i := 0 to Length(SrcArr) - 1 do begin SrcArr[i].Free; PosArr[i].Free; end;
+    FreeMask2Former(NN);
   end;
 end;
 

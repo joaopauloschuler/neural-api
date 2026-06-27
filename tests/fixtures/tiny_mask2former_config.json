@@ -1,0 +1,26 @@
+{
+  "model_type": "mask2former",
+  "num_labels": 4,
+  "num_queries": 5,
+  "hidden_dim": 32,
+  "num_attention_heads": 1,
+  "dim_feedforward": 48,
+  "decoder_layers": 3,
+  "num_dec_layers": 2,
+  "mask_h": 8,
+  "mask_w": 8,
+  "levels": [
+    [
+      2,
+      2
+    ],
+    [
+      3,
+      3
+    ],
+    [
+      4,
+      4
+    ]
+  ]
+}

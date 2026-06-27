@@ -11024,6 +11024,106 @@ function DecodeDetrDetections(Output: TNNetVolume; NumLabels: integer;
   Threshold: TNeuralFloat = 0.5): TDetrDetectionArray;
 
 // ---------------------------------------------------------------------------
+// MASK2FORMER UNIVERSAL-SEGMENTATION IMPORT (HF "mask2former", e.g.
+// facebook/mask2former-swin-tiny-*-semantic) -- the repo's FIRST mask-
+// CLASSIFICATION set-prediction segmenter. STRUCTURALLY DISTINCT from the
+// landed SegFormer (per-PIXEL argmax) and the tracked Mask R-CNN (RoIAlign on
+// region proposals): Mask2Former has NO proposals and NO per-pixel classifier.
+// A FIXED set of learned object queries each predict ONE binary mask + a class
+// distribution; semantic/instance/panoptic come from ONE head. The conceptual
+// core is MASKED ATTENTION: each decoder layer's cross-attention is restricted
+// to the FOREGROUND of the mask predicted by the PREVIOUS layer (sigmoid(mask)
+// >= 0.5 keys allowed; background keys get -inf). Reuses the DETR set-prediction
+// machinery (learned queries + transformer decoder, q/k/v/o projections).
+//
+// SCOPE v1: SEMANTIC inference only, and the importer builds the masked-
+// attention DECODER + heads ONLY -- it takes the PIXEL-DECODER outputs
+// (mask_features + the 3 multi-scale memory levels, already projected and with
+// level_embed + sine pos folded into the keys) as PRECOMPUTED inputs, mirroring
+// how Mask R-CNN v1 took FPN feature maps directly. Wiring the full Swin
+// backbone + FPN pixel decoder into one forward is a documented deferred
+// follow-up (see tasklist.md).
+// Coded by Claude (AI).
+type
+  TMask2FormerLabelMap = array of integer;  // per-pixel semantic labels
+
+  TMask2FormerLevel = record
+    Width, Height: integer;                // memory grid for this scale level
+  end;
+
+  TMask2FormerConfig = record
+    Hidden: integer;                       // hidden_dim == mask_feature_size
+    Heads: integer;                        // num_attention_heads
+    FFNDim: integer;                       // dim_feedforward
+    NumQueries: integer;                   // num_queries
+    NumLabels: integer;                    // num_labels (foreground classes)
+    NumDecLayers: integer;                 // ACTUAL decoder layers (HF builds
+                                           // decoder_layers - 1)
+    MaskWidth, MaskHeight: integer;        // mask_features grid (1/4 res)
+    Levels: array of TMask2FormerLevel;    // multi-scale memory levels low->high
+    ModelType: string;                     // 'mask2former'
+  end;
+
+// Reads a HF Mask2Former config.json (model_type "mask2former"). Required:
+// hidden_dim, num_attention_heads, dim_feedforward, num_queries, num_labels.
+// The pico-fixture config additionally carries the pixel-decoder grid shapes
+// (mask_h/mask_w, levels) and num_dec_layers, which the v1 (decoder-only)
+// importer needs to size its precomputed feature-map inputs.
+function ReadMask2FormerConfigFromJSONFile(
+  const FileName: string): TMask2FormerConfig;
+
+function Mask2FormerConfigToString(const Config: TMask2FormerConfig): string;
+
+// Builds the Mask2Former masked-attention decoder + heads described by Config
+// and loads every decoder/head weight from Reader (the caller owns Reader). The
+// returned object is a CONTAINER of (NumDecLayers) per-layer sub-nets plus an
+// initial-prediction sub-net, all wired to share the mask predictor + class
+// head weights. Because masked attention has a DYNAMIC feedback loop (layer L's
+// attention mask comes from layer L-1's predicted mask), the forward is driven
+// layer-by-layer in Pascal by RunMask2FormerSemantic, which recomputes the mask
+// bias between layers. INFERENCE only (no Hungarian matcher, which is training-
+// only). The genuinely new wiring vs DETR is the masked cross-attention
+// (additive -1e9 background mask over an explicit DotProducts score matrix), the
+// dot-product query_embed x mask_features -> per-query mask logits, and the
+// cross->self->FFN post-norm layer order.
+function BuildMask2FormerFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TMask2FormerConfig; pTrainable: boolean = true): TNNet; overload;
+
+function BuildMask2FormerFromSafeTensorsEx(const FileName: string;
+  const Config: TMask2FormerConfig; pTrainable: boolean = true): TNNet;
+
+function BuildMask2FormerFromSafeTensors(const FileName: string;
+  out Config: TMask2FormerConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet; overload;
+
+// Drives the masked-attention decoder layer-by-layer (the masked-attention
+// feedback loop). Inputs: MaskFeatures = the 1/4-res per-pixel embedding
+// (MaskWidth, MaskHeight, Hidden); LevelSources[i] / LevelKeyPos[i] = the value
+// memory and (memory + level_embed + sine pos) keys for each scale level i
+// (each (W*H, 1, Hidden)). Outputs the FINAL-layer per-query ClassLogits
+// (NumQueries, 1, NumLabels+1) and MaskLogits (NumQueries, 1, MaskWidth*
+// MaskHeight). NN must come from BuildMask2FormerFromSafeTensors.
+procedure RunMask2FormerSemantic(NN: TNNet;
+  const Config: TMask2FormerConfig;
+  MaskFeatures: TNNetVolume;
+  const LevelSources, LevelKeyPos: array of TNNetVolume;
+  ClassLogits, MaskLogits: TNNetVolume);
+
+// Folds the final-layer per-query ClassLogits (NumQueries,1,NumLabels+1) and
+// MaskLogits (NumQueries,1,MaskW*MaskH) into a per-pixel semantic label map.
+// Mirrors HF post_process_semantic_segmentation: softmax each query's class
+// logits, DROP the no-object slot, sigmoid the per-query masks, take the class-
+// weighted mask sum, argmax over class. Returns a (MaskW*MaskH) integer array
+// (row-major, label per pixel at 1/4 resolution).
+function DecodeMask2FormerSemantic(ClassLogits, MaskLogits: TNNetVolume;
+  NumLabels, MaskWidth, MaskHeight: integer): TMask2FormerLabelMap;
+
+// Frees a net returned by BuildMask2FormerFromSafeTensors, including its hidden
+// per-layer sub-nets and query tables. Use this INSTEAD of NN.Free (the
+// container holds auxiliary nets the plain destructor would leak).
+procedure FreeMask2Former(NN: TNNet);
+
+// ---------------------------------------------------------------------------
 // YOLOv8 SINGLE-SHOT OBJECT-DETECTION IMPORT (ultralytics "yolov8", e.g.
 // ultralytics/yolov8n) -- the repo's FIRST anchor-free fully-convolutional
 // one-stage detector, STRUCTURALLY DISTINCT from the landed DETR importer (no
@@ -66638,6 +66738,799 @@ begin
     end;
   end;
   SetLength(Result, Cnt);
+end;
+
+// ===========================================================================
+// MASK2FORMER importer
+// ===========================================================================
+function ReadMask2FormerConfigFromJSONFile(
+  const FileName: string): TMask2FormerConfig;
+var
+  JsonText: TStringList;
+  Root, ArrData, LvData: TJSONData;
+  Obj: TJSONObject;
+  Arr, Lv: TJSONArray;
+  i, LpMax: integer;
+
+  function RequiredInt(O: TJSONObject; const FieldName: string): integer;
+  begin
+    if O.IndexOfName(FieldName) < 0 then
+      ImportError('Mask2Former import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := O.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Mask2Former import: config field "' + FieldName +
+        '" must be a positive integer.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Mask2Former import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Mask2Former import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Mask2Former import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'mask2former');
+    if Result.ModelType <> 'mask2former' then
+      ImportError('Mask2Former import: config model_type is "' +
+        Result.ModelType + '" - only "mask2former" is supported.');
+    Result.Hidden := RequiredInt(Obj, 'hidden_dim');
+    Result.Heads := RequiredInt(Obj, 'num_attention_heads');
+    Result.FFNDim := RequiredInt(Obj, 'dim_feedforward');
+    Result.NumQueries := RequiredInt(Obj, 'num_queries');
+    Result.NumLabels := 0;
+    if Obj.IndexOfName('num_labels') >= 0 then
+      Result.NumLabels := Obj.Get('num_labels', 0);
+    if Result.NumLabels <= 0 then Result.NumLabels := 1;
+    // num_dec_layers: HF builds decoder_layers - 1 ACTUAL layers; the pico
+    // fixture writes the actual count, else fall back to decoder_layers - 1.
+    if Obj.IndexOfName('num_dec_layers') >= 0 then
+      Result.NumDecLayers := Obj.Get('num_dec_layers', 0)
+    else
+      Result.NumDecLayers := RequiredInt(Obj, 'decoder_layers') - 1;
+    if Result.NumDecLayers <= 0 then
+      ImportError('Mask2Former import: num_dec_layers must be positive.');
+    // pixel-decoder grid shapes (needed by the v1 decoder-only importer to size
+    // its precomputed feature-map inputs).
+    Result.MaskWidth := Obj.Get('mask_w', 0);
+    Result.MaskHeight := Obj.Get('mask_h', 0);
+    if (Result.MaskWidth <= 0) or (Result.MaskHeight <= 0) then
+      ImportError('Mask2Former import: config must carry mask_w / mask_h (the ' +
+        'pixel-decoder mask_features grid) for the v1 decoder-only importer.');
+    ArrData := Obj.Find('levels');
+    if (ArrData = nil) or (not (ArrData is TJSONArray)) then
+      ImportError('Mask2Former import: config must carry "levels" (the multi-' +
+        'scale memory grid shapes) for the v1 decoder-only importer.');
+    Arr := TJSONArray(ArrData);
+    SetLength(Result.Levels, Arr.Count);
+    LpMax := Arr.Count - 1;
+    for i := 0 to LpMax do
+    begin
+      LvData := Arr.Items[i];
+      if (not (LvData is TJSONArray)) or (TJSONArray(LvData).Count <> 2) then
+        ImportError('Mask2Former import: each "levels" entry must be a [h, w] ' +
+          'pair.');
+      Lv := TJSONArray(LvData);
+      Result.Levels[i].Height := Lv.Integers[0];
+      Result.Levels[i].Width := Lv.Integers[1];
+    end;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function Mask2FormerConfigToString(const Config: TMask2FormerConfig): string;
+var
+  i: integer;
+begin
+  Result := 'Mask2Former(hidden=' + IntToStr(Config.Hidden) +
+    ', heads=' + IntToStr(Config.Heads) +
+    ', ffn=' + IntToStr(Config.FFNDim) +
+    ', queries=' + IntToStr(Config.NumQueries) +
+    ', labels=' + IntToStr(Config.NumLabels) +
+    ', dec_layers=' + IntToStr(Config.NumDecLayers) +
+    ', mask=' + IntToStr(Config.MaskWidth) + 'x' + IntToStr(Config.MaskHeight) +
+    ', levels=[';
+  for i := 0 to Length(Config.Levels) - 1 do
+  begin
+    if i > 0 then Result := Result + ',';
+    Result := Result + IntToStr(Config.Levels[i].Width) + 'x' +
+      IntToStr(Config.Levels[i].Height);
+  end;
+  Result := Result + '])';
+end;
+
+type
+  // Per-decoder-layer sub-net references. Each layer is its OWN TNNet (so the
+  // Pascal orchestrator can recompute the masked-attention mask BETWEEN layers).
+  // All layer nets share the mask predictor + class head weights (loaded into
+  // each copy).
+  TMask2FormerLayerNet = record
+    NN: TNNet;
+    HsIn: TNNetLayer;        // input[0]: hidden state (Q,1,H)
+    MemIn: TNNetLayer;       // input: value memory (S,1,H)
+    KeyPosIn: TNNetLayer;    // input: keys = memory+level_embed+sine pos (S,1,H)
+    MaskBiasIn: TNNetLayer;  // input: additive cross-attn mask (S,1,Q)
+    QueryEmbedIn: TNNetLayer;// input: learned query positional (Q,1,H)
+    HsOut: TNNetLayer;       // layer output hidden state (Q,1,H)
+    NormedOut: TNNetLayer;   // LayerNorm(HsOut) (Q,1,H)
+    ClassOut: TNNetLayer;    // class logits (Q,1,NumLabels+1)
+    MaskEmbedOut: TNNetLayer;// per-query mask embedding (Q,1,H)
+    // loadable projections / norms (cross_attn, self_attn, ffn, predictor)
+    CQ, CK, CV, CO: TNNetLayer;       // cross_attn q/k/v/o proj
+    CrossNorm: TNNetLayer;
+    SQ, SK, SV, SO: TNNetLayer;       // self_attn q/k/v/o proj
+    SelfNorm: TNNetLayer;
+    Fc1, Fc2, FfnNorm: TNNetLayer;
+    PredNorm: TNNetLayer;             // decoder.layernorm
+    Cls: TNNetLayer;                  // class_predictor
+    ME0, ME1, ME2: TNNetLayer;        // mask_embedder 3 linears
+  end;
+
+  // The "initial" predictor (before layer 0): LayerNorm(query_features) ->
+  // class logits + mask embedding. No attention.
+  TMask2FormerInitNet = record
+    NN: TNNet;
+    HsIn: TNNetLayer;        // input[0]: query_features (Q,1,H)
+    NormedOut: TNNetLayer;
+    ClassOut: TNNetLayer;
+    MaskEmbedOut: TNNetLayer;
+    PredNorm: TNNetLayer;
+    Cls: TNNetLayer;
+    ME0, ME1, ME2: TNNetLayer;
+  end;
+
+// Builds one masked-attention decoder layer as a standalone net. The masked
+// cross-attention uses an EXPLICIT DotProducts score matrix so we can ADD the
+// per-layer background mask bias (additive -1e9) before softmax -- there is no
+// off-the-shelf masked-cross-attention leaf. Order is cross -> self -> FFN with
+// POST-norm (Mask2Former-specific, differs from DETR's self-first ordering).
+function BuildMask2FormerLayerNet(const Config: TMask2FormerConfig;
+  LevelKeys: integer; pTrainable: boolean): TMask2FormerLayerNet;
+var
+  NN: TNNet;
+  HeadDim, h, HeadsM1: integer;
+  InvSqrt: TNeuralFloat;
+  QSrc, QHead, KHead, VHead, VTHead, Score, WHead, OutHead: TNNetLayer;
+  CrossNormed, SaSrc, SaQHead, SaKHead, SaVHead, SaVTHead: TNNetLayer;
+  SaScore, SaWHead, SaOutHead, SelfNormed, FfnRes: TNNetLayer;
+  HeadOutputs, SaHeadOutputs: array of TNNetLayer;
+
+  // The masked/plain attention score path shared by cross- and self-attention.
+  // QSrcLayer/KSrcLayer/VSrcLayer feed q/k/v projections; MaskBias (or nil) is an
+  // additive [key,query,1] bias added before softmax over the key axis.
+  function AddAttention(QSrcLayer, KSrcLayer, VSrcLayer, MaskBias: TNNetLayer;
+    out QP, KP, VP, OP: TNNetLayer): TNNetLayer;
+  var
+    hh: integer;
+    qh, kh, vh, vth, sc, wh, oh: TNNetLayer;
+    outs: array of TNNetLayer;
+  begin
+    SetLength(outs, Config.Heads);
+    QP := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Config.Hidden, 0), QSrcLayer);
+    KP := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Config.Hidden, 0), KSrcLayer);
+    VP := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Config.Hidden, 0), VSrcLayer);
+    for hh := 0 to HeadsM1 do
+    begin
+      qh := NN.AddLayerAfter(TNNetSplitChannels.Create(hh * HeadDim, HeadDim), QP);
+      kh := NN.AddLayerAfter(TNNetSplitChannels.Create(hh * HeadDim, HeadDim), KP);
+      vh := NN.AddLayerAfter(TNNetSplitChannels.Create(hh * HeadDim, HeadDim), VP);
+      // scores = DotProducts(Q,K) -> [X=key, Y=1, D=query]; scale; transpose to
+      // [key, query, 1] so the mask bias (also [key,query,1]) can be summed.
+      sc := NN.AddLayer(TNNetDotProducts.Create(qh, kh));
+      sc := NN.AddLayer(TNNetMulByConstant.Create(InvSqrt));
+      sc := NN.AddLayerAfter(TNNetTransposeYD.Create(), sc);
+      if MaskBias <> nil then
+        wh := NN.AddLayer(TNNetSum.Create([sc, MaskBias]))
+      else
+        wh := sc;
+      // softmax over the key axis: [1,query,key]; PointwiseSoftMax over Depth=key.
+      wh := NN.AddLayerAfter(TNNetTransposeXD.Create(), wh);
+      wh := NN.AddLayerAfter(TNNetPointwiseSoftMax.Create(), wh);
+      wh := NN.AddLayerAfter(TNNetTransposeXD.Create(), wh);
+      // weights . V (rectangular cross-attention; key=S may differ from query=Q):
+      // out[q,d] = sum_s prob[s,q] * V[s,d], contracting the KEY axis. Arrange
+      // prob [key=S, query=Q, 1] -> [Q, 1, S] (TransposeYD then TransposeXD) and
+      // V [S, 1, d_k] -> [d_k, 1, S] (TransposeXD); DotProducts contracts Depth=S
+      // -> [B.X=Q, B.Y=1, A.X*A.Y=d_k] = [query, 1, HeadDim].
+      wh := NN.AddLayerAfter(TNNetTransposeYD.Create(), wh);   // [S,1,Q]
+      wh := NN.AddLayerAfter(TNNetTransposeXD.Create(), wh);   // [Q,1,S]
+      vth := NN.AddLayerAfter(TNNetTransposeXD.Create(), vh);  // [d_k,1,S]
+      oh := NN.AddLayer(TNNetDotProducts.Create(vth, wh));     // [Q,1,d_k]
+      outs[hh] := oh;
+      // silence per-head unused
+      if (qh = nil) or (kh = nil) or (vh = nil) or (vth = nil) or (sc = nil) or
+         (wh = nil) or (oh = nil) then ;
+    end;
+    NN.AddLayer(TNNetDeepConcat.Create(outs));
+    OP := NN.AddLayer(TNNetPointwiseConvLinear.Create(Config.Hidden, 0));
+    Result := OP;
+    SetLength(outs, 0);
+  end;
+
+  procedure AddPredictor(HsLayer: TNNetLayer);
+  begin
+    // decoder.layernorm (shared, applied before class + mask predictors).
+    Result.PredNorm := NN.AddLayerAfter(
+      TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), HsLayer);
+    Result.NormedOut := Result.PredNorm;
+    // class head: Linear H -> NumLabels+1 over each query token.
+    Result.Cls := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.NumLabels + 1, 0).SetTrainable(pTrainable),
+      Result.NormedOut);
+    Result.ClassOut := Result.Cls;
+    // mask embedder: 3-layer MLP (relu,relu,identity) H->H->H->H over each query.
+    Result.ME0 := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.Hidden, 0).SetTrainable(pTrainable),
+      Result.NormedOut);
+    NN.AddLayer(TNNetReLU.Create());
+    Result.ME1 := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.Hidden, 0).SetTrainable(pTrainable));
+    NN.AddLayer(TNNetReLU.Create());
+    Result.ME2 := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.Hidden, 0).SetTrainable(pTrainable));
+    Result.MaskEmbedOut := Result.ME2;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Result.NN := NN;
+  HeadDim := Config.Hidden div Config.Heads;
+  HeadsM1 := Config.Heads - 1;
+  InvSqrt := 1.0 / Sqrt(HeadDim);
+  SetLength(HeadOutputs, Config.Heads);
+  SetLength(SaHeadOutputs, Config.Heads);
+
+  // ---- inputs ----
+  // Sizes are FIXED at build time (each decoder layer attends to a SPECIFIC
+  // round-robin level, so LevelKeys=S is known). Static shapes are REQUIRED:
+  // the transpose / dot-product score graph relies on build-time sizing.
+  Result.HsIn := NN.AddLayer(TNNetInput.Create(Config.NumQueries, 1, Config.Hidden));
+  Result.MemIn := NN.AddLayer(TNNetInput.Create(LevelKeys, 1, Config.Hidden));
+  Result.KeyPosIn := NN.AddLayer(TNNetInput.Create(LevelKeys, 1, Config.Hidden));
+  Result.MaskBiasIn := NN.AddLayer(
+    TNNetInput.Create(LevelKeys, Config.NumQueries, 1));  // [key, query, 1]
+  Result.QueryEmbedIn := NN.AddLayer(
+    TNNetInput.Create(Config.NumQueries, 1, Config.Hidden));
+
+  // ===== masked cross-attention (cross FIRST, post-norm) =====
+  // q = Hs + QueryEmbed ; k = KeyPos ; v = Mem.
+  QSrc := NN.AddLayer(TNNetSum.Create([Result.HsIn, Result.QueryEmbedIn]));
+  AddAttention(QSrc, Result.KeyPosIn, Result.MemIn, Result.MaskBiasIn,
+    Result.CQ, Result.CK, Result.CV, Result.CO);
+  NN.AddLayer(TNNetSum.Create([Result.CO, Result.HsIn]));
+  Result.CrossNorm := NN.AddLayer(
+    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable));
+  CrossNormed := Result.CrossNorm;
+
+  // ===== self-attention =====
+  // q = k = CrossNormed + QueryEmbed ; v = CrossNormed.
+  SaSrc := NN.AddLayer(TNNetSum.Create([CrossNormed, Result.QueryEmbedIn]));
+  AddAttention(SaSrc, SaSrc, CrossNormed, nil,
+    Result.SQ, Result.SK, Result.SV, Result.SO);
+  NN.AddLayer(TNNetSum.Create([Result.SO, CrossNormed]));
+  Result.SelfNorm := NN.AddLayer(
+    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable));
+  SelfNormed := Result.SelfNorm;
+
+  // ===== FFN =====
+  Result.Fc1 := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Config.FFNDim, 0).SetTrainable(pTrainable));
+  NN.AddLayer(TNNetReLU.Create());
+  Result.Fc2 := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Config.Hidden, 0).SetTrainable(pTrainable));
+  FfnRes := NN.AddLayer(TNNetSum.Create([Result.Fc2, SelfNormed]));
+  Result.FfnNorm := NN.AddLayer(
+    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable));
+  Result.HsOut := Result.FfnNorm;
+
+  // ===== predictor head (shared weights, loaded per net) =====
+  AddPredictor(Result.HsOut);
+
+  if not pTrainable then NN.SetTrainable();
+  // silence unused
+  if (QHead = nil) and (KHead = nil) and (VHead = nil) and (VTHead = nil) and
+     (Score = nil) and (WHead = nil) and (OutHead = nil) and (SaQHead = nil) and
+     (SaKHead = nil) and (SaVHead = nil) and (SaVTHead = nil) and
+     (SaScore = nil) and (SaWHead = nil) and (SaOutHead = nil) and
+     (FfnRes = nil) then ;
+  SetLength(HeadOutputs, 0);
+  SetLength(SaHeadOutputs, 0);
+end;
+
+// Builds the "initial" predictor (before layer 0): decoder.layernorm over
+// query_features -> class logits + mask embedding. No attention.
+function BuildMask2FormerInitNet(const Config: TMask2FormerConfig;
+  pTrainable: boolean): TMask2FormerInitNet;
+var
+  NN: TNNet;
+begin
+  NN := TNNet.Create();
+  Result.NN := NN;
+  Result.HsIn := NN.AddLayer(
+    TNNetInput.Create(Config.NumQueries, 1, Config.Hidden));
+  Result.NormedOut := NN.AddLayer(
+    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable));
+  Result.PredNorm := Result.NormedOut;
+  NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Config.NumLabels + 1, 0).SetTrainable(pTrainable),
+    Result.NormedOut);
+  Result.ClassOut := NN.GetLastLayer();
+  Result.Cls := Result.ClassOut;
+  Result.ME0 := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Config.Hidden, 0).SetTrainable(pTrainable),
+    Result.NormedOut);
+  NN.AddLayer(TNNetReLU.Create());
+  Result.ME1 := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Config.Hidden, 0).SetTrainable(pTrainable));
+  NN.AddLayer(TNNetReLU.Create());
+  Result.ME2 := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Config.Hidden, 0).SetTrainable(pTrainable));
+  Result.MaskEmbedOut := Result.ME2;
+  if not pTrainable then NN.SetTrainable();
+end;
+
+// Loads a slab-row slice of a packed nn.MultiheadAttention in_proj_weight
+// [3H, H] (+ in_proj_bias [3H]) into a pointwise-conv projection. RowBase picks
+// the Q (0), K (H) or V (2H) block.
+procedure LoadM2FPackedProj(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
+  const WName, BName: string; Hidden, RowBase: integer);
+begin
+  LoadLlamaLinearWeights(Reader, Layer, WName, Hidden, Hidden, 0, -1, 0, BName,
+    1.0, 0, RowBase, 3 * Hidden);
+end;
+
+// Loads a learned embedding table [N, H] into a TNNetInput's Output volume (a
+// constant additive table: queries_features / queries_embedder).
+procedure LoadM2FEmbeddingTable(Reader: TNNetSafeTensorsReader;
+  Target: TNNetVolume; const WName: string; N, H: integer);
+var
+  W: TNNetVolume;
+  i, j: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('Mask2Former import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 2) or (Reader.DimSize(WName, 0) <> N) or
+     (Reader.DimSize(WName, 1) <> H) then
+    ImportError('Mask2Former import: "' + WName + '" must have shape [' +
+      IntToStr(N) + ', ' + IntToStr(H) + '], got ' + Reader.ShapeAsString(WName));
+  W := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    Target.ReSize(N, 1, H);
+    for i := 0 to N - 1 do
+      for j := 0 to H - 1 do
+        Target[i, 0, j] := W.FData[i * H + j];
+  finally
+    W.Free;
+  end;
+end;
+
+// Loads the shared predictor (decoder.layernorm + class_predictor + the 3-layer
+// mask_embedder) into one layer/init net's copy.
+procedure LoadM2FPredictor(Reader: TNNetSafeTensorsReader;
+  PredNorm, Cls, ME0, ME1, ME2: TNNetLayer; const Config: TMask2FormerConfig);
+const
+  cDec = 'model.transformer_module.decoder.';
+begin
+  LoadLayerNormWeights(Reader, PredNorm, cDec + 'layernorm.weight',
+    cDec + 'layernorm.bias', Config.Hidden);
+  LoadLlamaLinearWeights(Reader, Cls, 'class_predictor.weight',
+    Config.Hidden, Config.NumLabels + 1, 0, -1, 0, 'class_predictor.bias');
+  LoadLlamaLinearWeights(Reader, ME0,
+    cDec + 'mask_predictor.mask_embedder.0.0.weight',
+    Config.Hidden, Config.Hidden, 0, -1, 0,
+    cDec + 'mask_predictor.mask_embedder.0.0.bias');
+  LoadLlamaLinearWeights(Reader, ME1,
+    cDec + 'mask_predictor.mask_embedder.1.0.weight',
+    Config.Hidden, Config.Hidden, 0, -1, 0,
+    cDec + 'mask_predictor.mask_embedder.1.0.bias');
+  LoadLlamaLinearWeights(Reader, ME2,
+    cDec + 'mask_predictor.mask_embedder.2.0.weight',
+    Config.Hidden, Config.Hidden, 0, -1, 0,
+    cDec + 'mask_predictor.mask_embedder.2.0.bias');
+end;
+
+// Holds all sub-nets (the init predictor + one net per decoder layer) and the
+// constant query tables. Masked attention needs a DYNAMIC per-layer feedback
+// (layer L's mask comes from L-1's prediction), so the decoder cannot be one
+// chained graph; it is driven layer-by-layer by RunMask2FormerSemantic.
+//
+// To keep the public API a plain TNNet (matching the other importers'
+// BuildXFromSafeTensors: TNNet signatures), BuildMask2Former returns the init
+// net's TNNet as the "container" and keeps the auxiliary nets in a module-level
+// side table (GMask2FormerRegistry) keyed by that container. The orchestrator
+// looks the record up; FreeMask2Former unregisters + frees everything. CALLERS
+// MUST free the returned net with FreeMask2Former, NOT NN.Free (a plain Free
+// would leak the layer nets and leave a stale registry entry). NOT thread-safe
+// across concurrent Build/Free of different models (the registry is a global).
+type
+  TMask2FormerNet = class(TObject)
+  public
+    Container: TNNet;                 // returned to the caller (owns this object)
+    InitNet: TMask2FormerInitNet;
+    Layers: array of TMask2FormerLayerNet;
+    QueryFeatures: TNNetVolume;       // queries_features.weight [Q,1,H]
+    QueryEmbed: TNNetVolume;          // queries_embedder.weight [Q,1,H]
+    destructor Destroy; override;
+  end;
+
+destructor TMask2FormerNet.Destroy;
+var
+  i: integer;
+begin
+  InitNet.NN.Free;
+  for i := 0 to Length(Layers) - 1 do Layers[i].NN.Free;
+  QueryFeatures.Free;
+  QueryEmbed.Free;
+  inherited Destroy;
+end;
+
+var
+  // Side table mapping the returned container TNNet -> its TMask2FormerNet.
+  GMask2FormerRegistry: array of record
+    Container: TNNet;
+    Net: TMask2FormerNet;
+  end;
+
+procedure RegisterMask2Former(Container: TNNet; Net: TMask2FormerNet);
+var
+  n: integer;
+begin
+  n := Length(GMask2FormerRegistry);
+  SetLength(GMask2FormerRegistry, n + 1);
+  GMask2FormerRegistry[n].Container := Container;
+  GMask2FormerRegistry[n].Net := Net;
+end;
+
+function LookupMask2Former(Container: TNNet): TMask2FormerNet;
+var
+  i: integer;
+begin
+  Result := nil;
+  for i := 0 to Length(GMask2FormerRegistry) - 1 do
+    if GMask2FormerRegistry[i].Container = Container then
+      Exit(GMask2FormerRegistry[i].Net);
+end;
+
+procedure UnregisterMask2Former(Container: TNNet);
+var
+  i, n: integer;
+begin
+  n := Length(GMask2FormerRegistry);
+  for i := 0 to n - 1 do
+    if GMask2FormerRegistry[i].Container = Container then
+    begin
+      GMask2FormerRegistry[i] := GMask2FormerRegistry[n - 1];
+      SetLength(GMask2FormerRegistry, n - 1);
+      Exit;
+    end;
+end;
+
+function BuildMask2Former(Reader: TNNetSafeTensorsReader;
+  const Config: TMask2FormerConfig; pTrainable: boolean): TNNet;
+var
+  M2F: TMask2FormerNet;
+  L: integer;
+  LP: string;
+begin
+  if Length(Config.Levels) <> 3 then
+    ImportError('Mask2Former import: v1 expects exactly 3 multi-scale memory ' +
+      'levels (num_feature_levels is 3 in HF).');
+  M2F := TMask2FormerNet.Create;
+  try
+    M2F.QueryFeatures := TNNetVolume.Create;
+    M2F.QueryEmbed := TNNetVolume.Create;
+    LoadM2FEmbeddingTable(Reader, M2F.QueryFeatures,
+      'model.transformer_module.queries_features.weight',
+      Config.NumQueries, Config.Hidden);
+    LoadM2FEmbeddingTable(Reader, M2F.QueryEmbed,
+      'model.transformer_module.queries_embedder.weight',
+      Config.NumQueries, Config.Hidden);
+
+    // init predictor net (+ its shared predictor weights).
+    M2F.InitNet := BuildMask2FormerInitNet(Config, pTrainable);
+    LoadM2FPredictor(Reader, M2F.InitNet.PredNorm, M2F.InitNet.Cls,
+      M2F.InitNet.ME0, M2F.InitNet.ME1, M2F.InitNet.ME2, Config);
+
+    SetLength(M2F.Layers, Config.NumDecLayers);
+    for L := 0 to Config.NumDecLayers - 1 do
+    begin
+      M2F.Layers[L] := BuildMask2FormerLayerNet(Config,
+        Config.Levels[L mod 3].Width * Config.Levels[L mod 3].Height, pTrainable);
+      LP := 'model.transformer_module.decoder.layers.' + IntToStr(L) + '.';
+      // cross-attn (packed nn.MultiheadAttention in_proj).
+      LoadM2FPackedProj(Reader, M2F.Layers[L].CQ, LP + 'cross_attn.in_proj_weight',
+        LP + 'cross_attn.in_proj_bias', Config.Hidden, 0);
+      LoadM2FPackedProj(Reader, M2F.Layers[L].CK, LP + 'cross_attn.in_proj_weight',
+        LP + 'cross_attn.in_proj_bias', Config.Hidden, Config.Hidden);
+      LoadM2FPackedProj(Reader, M2F.Layers[L].CV, LP + 'cross_attn.in_proj_weight',
+        LP + 'cross_attn.in_proj_bias', Config.Hidden, 2 * Config.Hidden);
+      LoadLlamaLinearWeights(Reader, M2F.Layers[L].CO,
+        LP + 'cross_attn.out_proj.weight', Config.Hidden, Config.Hidden,
+        0, -1, 0, LP + 'cross_attn.out_proj.bias');
+      LoadLayerNormWeights(Reader, M2F.Layers[L].CrossNorm,
+        LP + 'cross_attn_layer_norm.weight', LP + 'cross_attn_layer_norm.bias',
+        Config.Hidden);
+      // self-attn (separate q/k/v/o).
+      LoadLlamaLinearWeights(Reader, M2F.Layers[L].SQ, LP + 'self_attn.q_proj.weight',
+        Config.Hidden, Config.Hidden, 0, -1, 0, LP + 'self_attn.q_proj.bias');
+      LoadLlamaLinearWeights(Reader, M2F.Layers[L].SK, LP + 'self_attn.k_proj.weight',
+        Config.Hidden, Config.Hidden, 0, -1, 0, LP + 'self_attn.k_proj.bias');
+      LoadLlamaLinearWeights(Reader, M2F.Layers[L].SV, LP + 'self_attn.v_proj.weight',
+        Config.Hidden, Config.Hidden, 0, -1, 0, LP + 'self_attn.v_proj.bias');
+      LoadLlamaLinearWeights(Reader, M2F.Layers[L].SO, LP + 'self_attn.out_proj.weight',
+        Config.Hidden, Config.Hidden, 0, -1, 0, LP + 'self_attn.out_proj.bias');
+      LoadLayerNormWeights(Reader, M2F.Layers[L].SelfNorm,
+        LP + 'self_attn_layer_norm.weight', LP + 'self_attn_layer_norm.bias',
+        Config.Hidden);
+      // FFN.
+      LoadLlamaLinearWeights(Reader, M2F.Layers[L].Fc1, LP + 'fc1.weight',
+        Config.Hidden, Config.FFNDim, 0, -1, 0, LP + 'fc1.bias');
+      LoadLlamaLinearWeights(Reader, M2F.Layers[L].Fc2, LP + 'fc2.weight',
+        Config.FFNDim, Config.Hidden, 0, -1, 0, LP + 'fc2.bias');
+      LoadLayerNormWeights(Reader, M2F.Layers[L].FfnNorm,
+        LP + 'final_layer_norm.weight', LP + 'final_layer_norm.bias',
+        Config.Hidden);
+      // shared predictor (same weights into every layer's copy).
+      LoadM2FPredictor(Reader, M2F.Layers[L].PredNorm, M2F.Layers[L].Cls,
+        M2F.Layers[L].ME0, M2F.Layers[L].ME1, M2F.Layers[L].ME2, Config);
+    end;
+
+    // The container returned to the caller is the init net's TNNet (the caller
+    // frees it; freeing it must cascade to the auxiliary nets). We register the
+    // M2F record so the orchestrator can find the sub-nets, and own the M2F via
+    // the container's free hook.
+    M2F.Container := M2F.InitNet.NN;
+    RegisterMask2Former(M2F.Container, M2F);
+    Result := M2F.Container;
+  except
+    M2F.Free;
+    raise;
+  end;
+end;
+
+function BuildMask2FormerFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TMask2FormerConfig; pTrainable: boolean): TNNet;
+begin
+  Result := BuildMask2Former(Reader, Config, pTrainable);
+end;
+
+function BuildMask2FormerFromSafeTensorsEx(const FileName: string;
+  const Config: TMask2FormerConfig; pTrainable: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildMask2Former(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildMask2FormerFromSafeTensors(const FileName: string;
+  out Config: TMask2FormerConfig; pTrainable: boolean;
+  const ConfigFileName: string): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadMask2FormerConfigFromJSONFile(ConfigPath);
+  Result := BuildMask2FormerFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+// Computes the per-query mask logits from a mask embedding (Q,1,H) and the
+// per-pixel mask_features (W,H,Hidden): mask[q, p] = sum_c embed[q,c] *
+// feat[p, c]. Dest is (Q, 1, W*H).
+procedure Mask2FormerMaskEinsum(MaskEmbed, MaskFeatures, Dest: TNNetVolume;
+  NumQueries, Hidden, MaskW, MaskH: integer);
+var
+  q, p, c, NumPix: integer;
+  s: TNeuralFloat;
+begin
+  NumPix := MaskW * MaskH;
+  Dest.ReSize(NumQueries, 1, NumPix);
+  for q := 0 to NumQueries - 1 do
+    for p := 0 to NumPix - 1 do
+    begin
+      s := 0;
+      for c := 0 to Hidden - 1 do
+        s := s + MaskEmbed[q, 0, c] * MaskFeatures.FData[p * Hidden + c];
+      Dest[q, 0, p] := s;
+    end;
+end;
+
+// Builds the additive cross-attn mask bias [key=S, query=Q, 1] for one level
+// from the previous layer's per-query mask logits (Q,1,MaskW*MaskH): bilinearly
+// downsample each query mask to the level grid, sigmoid, and set bias = -1e9
+// where sigmoid < 0.5 (background), else 0. Applies the "attend-to-nothing"
+// fallback (a query masking ALL keys is fully unmasked).
+procedure Mask2FormerMaskBias(MaskLogits, Bias: TNNetVolume;
+  NumQueries, MaskW, MaskH, LevelW, LevelH: integer);
+var
+  q, lx, ly, p, NumKeys, AllowedCnt: integer;
+  fx, fy, x0, y0, x1, y1: integer;
+  gx, gy, wx, wy, v00, v01, v10, v11, val, sg: TNeuralFloat;
+const
+  cNegInf = -1.0e9;
+begin
+  NumKeys := LevelW * LevelH;
+  Bias.ReSize(NumKeys, NumQueries, 1);
+  for q := 0 to NumQueries - 1 do
+  begin
+    AllowedCnt := 0;
+    for ly := 0 to LevelH - 1 do
+      for lx := 0 to LevelW - 1 do
+      begin
+        // bilinear sample of the 1/4-res mask at the level-grid centre
+        // (align_corners=False, matching torch F.interpolate).
+        gx := (lx + 0.5) * MaskW / LevelW - 0.5;
+        gy := (ly + 0.5) * MaskH / LevelH - 0.5;
+        x0 := Floor(gx); y0 := Floor(gy);
+        wx := gx - x0; wy := gy - y0;
+        x1 := x0 + 1; y1 := y0 + 1;
+        if x0 < 0 then x0 := 0; if x0 > MaskW - 1 then x0 := MaskW - 1;
+        if x1 < 0 then x1 := 0; if x1 > MaskW - 1 then x1 := MaskW - 1;
+        if y0 < 0 then y0 := 0; if y0 > MaskH - 1 then y0 := MaskH - 1;
+        if y1 < 0 then y1 := 0; if y1 > MaskH - 1 then y1 := MaskH - 1;
+        v00 := MaskLogits[q, 0, y0 * MaskW + x0];
+        v01 := MaskLogits[q, 0, y0 * MaskW + x1];
+        v10 := MaskLogits[q, 0, y1 * MaskW + x0];
+        v11 := MaskLogits[q, 0, y1 * MaskW + x1];
+        val := v00 * (1 - wx) * (1 - wy) + v01 * wx * (1 - wy) +
+               v10 * (1 - wx) * wy + v11 * wx * wy;
+        sg := 1.0 / (1.0 + Exp(-val));
+        p := ly * LevelW + lx;  // key index = row-major over the level grid
+        if sg < 0.5 then
+          Bias[p, q, 0] := cNegInf
+        else
+        begin
+          Bias[p, q, 0] := 0;
+          Inc(AllowedCnt);
+        end;
+        // silence unused fx/fy
+        if (fx = 0) and (fy = 0) then ;
+      end;
+    // fallback: if the query masks ALL keys, unmask everything.
+    if AllowedCnt = 0 then
+      for p := 0 to NumKeys - 1 do Bias[p, q, 0] := 0;
+  end;
+end;
+
+procedure RunMask2FormerSemantic(NN: TNNet;
+  const Config: TMask2FormerConfig;
+  MaskFeatures: TNNetVolume;
+  const LevelSources, LevelKeyPos: array of TNNetVolume;
+  ClassLogits, MaskLogits: TNNetVolume);
+var
+  M2F: TMask2FormerNet;
+  L, LevelIdx, NumPix: integer;
+  Hs, MaskEmb, Bias, CurMask: TNNetVolume;
+begin
+  M2F := LookupMask2Former(NN);
+  if M2F = nil then
+    ImportError('RunMask2FormerSemantic: NN was not built by ' +
+      'BuildMask2FormerFromSafeTensors.');
+  if (Length(LevelSources) <> 3) or (Length(LevelKeyPos) <> 3) then
+    ImportError('RunMask2FormerSemantic: expected 3 level value memories AND ' +
+      '3 level key-position maps.');
+  NumPix := Config.MaskWidth * Config.MaskHeight;
+
+  Hs := TNNetVolume.Create;
+  MaskEmb := TNNetVolume.Create;
+  Bias := TNNetVolume.Create;
+  CurMask := TNNetVolume.Create;
+  try
+    // ----- initial prediction (before layer 0) from query_features -----
+    M2F.InitNet.HsIn.Output.Copy(M2F.QueryFeatures);
+    M2F.InitNet.NN.Compute(M2F.InitNet.HsIn.Output);
+    MaskEmb.Copy(M2F.InitNet.MaskEmbedOut.Output);
+    Mask2FormerMaskEinsum(MaskEmb, MaskFeatures, CurMask,
+      Config.NumQueries, Config.Hidden, Config.MaskWidth, Config.MaskHeight);
+    // hidden state starts at query_features.
+    Hs.Copy(M2F.QueryFeatures);
+
+    for L := 0 to Config.NumDecLayers - 1 do
+    begin
+      LevelIdx := L mod 3;
+      // mask bias for THIS layer from the PREVIOUS prediction, at this level.
+      Mask2FormerMaskBias(CurMask, Bias, Config.NumQueries,
+        Config.MaskWidth, Config.MaskHeight,
+        Config.Levels[LevelIdx].Width, Config.Levels[LevelIdx].Height);
+      // wire inputs.
+      M2F.Layers[L].HsIn.Output.Copy(Hs);
+      M2F.Layers[L].MemIn.Output.Copy(LevelSources[LevelIdx]);
+      M2F.Layers[L].KeyPosIn.Output.Copy(LevelKeyPos[LevelIdx]);
+      M2F.Layers[L].MaskBiasIn.Output.Copy(Bias);
+      M2F.Layers[L].QueryEmbedIn.Output.Copy(M2F.QueryEmbed);
+      M2F.Layers[L].NN.Compute([M2F.Layers[L].HsIn.Output,
+        M2F.Layers[L].MemIn.Output, M2F.Layers[L].KeyPosIn.Output,
+        M2F.Layers[L].MaskBiasIn.Output, M2F.Layers[L].QueryEmbedIn.Output]);
+      Hs.Copy(M2F.Layers[L].HsOut.Output);
+      // class logits + next mask from this layer's predictor.
+      MaskEmb.Copy(M2F.Layers[L].MaskEmbedOut.Output);
+      Mask2FormerMaskEinsum(MaskEmb, MaskFeatures, CurMask,
+        Config.NumQueries, Config.Hidden, Config.MaskWidth, Config.MaskHeight);
+    end;
+    // final-layer outputs.
+    ClassLogits.Copy(M2F.Layers[Config.NumDecLayers - 1].ClassOut.Output);
+    MaskLogits.Copy(CurMask);
+    if NumPix = 0 then ;
+  finally
+    Hs.Free; MaskEmb.Free; Bias.Free; CurMask.Free;
+  end;
+end;
+
+function DecodeMask2FormerSemantic(ClassLogits, MaskLogits: TNNetVolume;
+  NumLabels, MaskWidth, MaskHeight: integer): TMask2FormerLabelMap;
+var
+  q, c, p, NumPix, NumQueries, BestC: integer;
+  MaxLogit, SumExp, prob, sg, acc, BestVal: TNeuralFloat;
+  ClsProb: array of TNeuralFloat;
+begin
+  NumQueries := ClassLogits.SizeX;
+  NumPix := MaskWidth * MaskHeight;
+  SetLength(Result, NumPix);
+  SetLength(ClsProb, NumQueries * NumLabels);
+  // class probabilities: softmax over NumLabels+1, drop the no-object slot.
+  for q := 0 to NumQueries - 1 do
+  begin
+    MaxLogit := ClassLogits[q, 0, 0];
+    for c := 1 to NumLabels do
+      if ClassLogits[q, 0, c] > MaxLogit then MaxLogit := ClassLogits[q, 0, c];
+    SumExp := 0;
+    for c := 0 to NumLabels do
+      SumExp := SumExp + Exp(ClassLogits[q, 0, c] - MaxLogit);
+    for c := 0 to NumLabels - 1 do
+      ClsProb[q * NumLabels + c] := Exp(ClassLogits[q, 0, c] - MaxLogit) / SumExp;
+  end;
+  // per pixel: argmax_c sum_q clsprob[q,c] * sigmoid(mask[q,p]).
+  for p := 0 to NumPix - 1 do
+  begin
+    BestC := 0; BestVal := -1;
+    for c := 0 to NumLabels - 1 do
+    begin
+      acc := 0;
+      for q := 0 to NumQueries - 1 do
+      begin
+        sg := 1.0 / (1.0 + Exp(-MaskLogits[q, 0, p]));
+        acc := acc + ClsProb[q * NumLabels + c] * sg;
+      end;
+      if acc > BestVal then begin BestVal := acc; BestC := c; end;
+    end;
+    Result[p] := BestC;
+  end;
+  if prob = 0 then ;
+end;
+
+procedure FreeMask2Former(NN: TNNet);
+var
+  M2F: TMask2FormerNet;
+begin
+  if NN = nil then Exit;
+  M2F := LookupMask2Former(NN);
+  if M2F = nil then
+  begin
+    // not a Mask2Former container (or already freed): free as a plain net.
+    NN.Free;
+    Exit;
+  end;
+  UnregisterMask2Former(NN);
+  M2F.Free;  // frees InitNet.NN (== container), every layer net, the tables.
 end;
 
 // ===========================================================================

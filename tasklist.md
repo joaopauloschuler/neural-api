@@ -307,23 +307,34 @@ rather than acted on.
     - [ ] add_embedding / class/time-aug conditioning (SDXL micro-conditioning),
           and the end-to-end LatentTextToImage capstone (CLIP text -> this UNet
           -> scheduler loop -> VAE decoder).
-- [ ] Mask2Former universal-segmentation importer
-      (BuildMask2FormerFromSafeTensors, e.g. facebook/mask2former-swin-tiny-*-semantic)
-      — a third, architecturally DISTINCT segmentation vertical: mask-classification
-      set-prediction (a fixed set of learned queries each predicting one binary mask +
-      a class), unifying semantic/instance/panoptic in one head. Different from the
-      landed SegFormer (per-PIXEL argmax) and the tracked Mask R-CNN (RoIAlign on
-      region proposals) — there are NO proposals and NO per-pixel classifier. Reuses
-      the landed DETR set-prediction machinery (learned object queries + a transformer
-      decoder, already imported for detection) and a Swin/ResNet backbone (Swin is a
-      landed classifier importer); the new pieces are the lightweight pixel decoder
-      (a small FPN-style multi-scale conv pixel embedding, reusing the Mask R-CNN FPN
-      blocks) and the masked-attention decoder layer (cross-attention restricted to the
-      current mask foreground) plus the dot-product query-embedding x pixel-embedding
-      -> per-query mask logits. Scope v1 to semantic inference (argmax over query
-      class x mask). Pico parity vs HF float64 on the mask logits for a fixed image +
-      an examples/UniversalSegmentation that writes one segmentation overlay on a tiny
-      CPU image.
+- [X] Mask2Former universal-segmentation importer
+      (BuildMask2FormerFromSafeTensors[Ex], model_type "mask2former", e.g.
+      facebook/mask2former-swin-tiny-*-semantic) LANDED in neuralpretrained.pas.
+      Mask-classification set-prediction: a fixed set of learned object queries each
+      predicting one binary mask + a class, in ONE head. The conceptual core MASKED
+      ATTENTION is correct + parity-verified: each decoder layer's cross-attention is
+      restricted to the previous layer's predicted-mask FOREGROUND (sigmoid>=0.5 keys
+      allowed, background -1e9, HF "attend-to-nothing -> unmask-all" fallback),
+      realised over an explicit TNNetDotProducts score matrix + additive-bias TNNetSum
+      (NO new leaf layer needed) in the Mask2Former cross->self->FFN post-norm order;
+      packed nn.MultiheadAttention in_proj row-sliced into q/k/v; dot-product
+      mask_embedder(query) x mask_features -> per-query mask logits (Mask2FormerMaskEinsum);
+      DecodeMask2FormerSemantic mirrors HF post_process_semantic_segmentation. The
+      dynamic mask feedback (layer L's mask from L-1) is driven layer-by-layer in Pascal
+      by RunMask2FormerSemantic (one sub-net per layer; FreeMask2Former frees the
+      container). TestMask2FormerParity asserts max|diff| < 1e-4 (actual ~1.2e-7) on the
+      per-query mask AND class logits vs the REAL transformers float64 forward
+      (tools/make_pico_mask2former_fixture.py). examples/UniversalSegmentation writes a
+      segmentation overlay PPM. Deferred follow-ups:
+      (a) wire the full Swin backbone + FPN pixel decoder (mask_features + 3 multi-scale
+          memory levels with level_embed + sine pos) into ONE forward — v1 takes the
+          pixel-decoder outputs as PRECOMPUTED TNNetInput feature maps (mirroring Mask
+          R-CNN v1's FPN-input stance); the masked-attention decoder + heads are complete;
+      (b) instance + panoptic post-processing (v1 is SEMANTIC argmax only);
+      (c) multi-head cross-attention beyond the pico 1-head fixture is wired generically
+          (Heads loop) but only parity-verified at Heads=1;
+      (d) a real-checkpoint smoke once a swin-tiny-semantic checkpoint is obtainable
+          offline (the importer is config-driven and ready).
 - [ ] Real-ESRGAN / ESRGAN importer follow-ups (BuildRRDBNet[FromSafeTensors][Ex]
       + TRRDBNetConfig LANDED in neuralpretrained.pas; RRDBNet x4 with
       NEAREST-interpolate conv upsampling via TNNetDeMaxPool(2), parametrized
