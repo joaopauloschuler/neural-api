@@ -1117,10 +1117,16 @@ rather than acted on.
         names + the actual conv-stack depths/strides) instead of the pico fixture's
         re-keyed names, verified against a real `pyannote.audio` float64 oracle once the
         package is available.
-  - [ ] Swap the `TNNetMinLSTM` trunk (gates depend on x_t only) for a VANILLA LSTM with a
+  - [X] Swap the `TNNetMinLSTM` trunk (gates depend on x_t only) for a VANILLA LSTM with a
         true cell state + recurrent gate feed (pyannote uses `nn.LSTM`), so real weights
         load without re-training, using the landed `TNNetLSTMCell` and the landed
         `AddBidirectionalLSTM`/`AddBidirectionalGRU` stacking builders.
+        Done 2026-06-27: trunk now two `TNNetLSTMCell` directions (exact layout
+        `AddBidirectionalLSTM(ConvChannels,1,True)` builds, no projection since
+        Depth==Hidden); `LoadPyannoteLSTM` maps fused `weight_ih`/`weight_hh`/
+        `bias_ih`/`bias_hh` (torch gate order i,f,g,o) onto Neurons[0..3]/[4..7]/
+        folded-sum [8..11]; oracle in `make_pico_pyannote_fixture.py` rewritten to a
+        true LSTM and fixtures regenerated. `TestPyannoteParity` max|diff|=1.9e-7.
   - [ ] Sliding-window inference + overlap stitching for clips longer than the model's
         receptive field, and turning the per-frame activity matrix into final diarized
         speaker turns (clustering across windows).
