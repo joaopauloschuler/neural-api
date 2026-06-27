@@ -722,8 +722,19 @@ type
   // Coded by Claude (AI).
   TNNetGramMatrix = class(TNNetLayer)
     private
+      // Channel-major (HW, C, 1) scratch: row i holds the C-th channel's HW
+      // spatial activations laid out contiguously so each Gram entry collapses
+      // to a depth-contiguous DotProduct over the spatial axis. Allocated in
+      // SetPrevLayer, freed in Destroy (per the per-pass scratch convention).
+      FGramScratch: TNNetVolume;
+      // Second channel-major (HW, C, 1) scratch used in the backward pass to
+      // accumulate dA before the strided scatter into the depth-contiguous
+      // prev-layer error. Same lifecycle as FGramScratch.
+      FGramScratchErr: TNNetVolume;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
+      constructor Create(); override;
+      destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
   end;
@@ -18890,14 +18901,34 @@ end;
 
 { TNNetGramMatrix }
 
+constructor TNNetGramMatrix.Create();
+begin
+  inherited Create();
+  FGramScratch := TNNetVolume.Create();
+  FGramScratchErr := TNNetVolume.Create();
+end;
+
+destructor TNNetGramMatrix.Destroy();
+begin
+  FGramScratchErr.Free;
+  FGramScratch.Free;
+  inherited Destroy();
+end;
+
 procedure TNNetGramMatrix.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  C: integer;
+  C, HW: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
   C := pPrevLayer.Output.Depth;
+  HW := pPrevLayer.Output.SizeX * pPrevLayer.Output.SizeY;
   // Output is the (C, C, 1) Gram matrix.
   FOutput.ReSize(C, C, 1);
+  // Channel-major scratch: C rows of HW contiguous spatial floats. Row i lives
+  // at GetRawPtr(0, i, 0). Allocated here (per-pass scratch convention) and
+  // reused each forward/backward; freed in Destroy.
+  FGramScratch.ReSize(HW, C, 1);
+  FGramScratchErr.ReSize(HW, C, 1);
   // Size from FOutput, not pPrevLayer's error buffer (collapsed when the prev
   // layer is inference-only).
   SetOutputErrorSize(FOutput);
@@ -18909,6 +18940,7 @@ var
   A: TNNetVolume;
   C, HW, x, y, i, j, base: integer;
   norm, acc: TNeuralFloat;
+  rowI, rowJ: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   A := FPrevLayer.FOutput;
@@ -18921,23 +18953,31 @@ begin
     exit;
   end;
   norm := 1.0 / (C * HW);
-  // Memory layout is depth-contiguous, so A[x,y,i] for fixed (x,y) lives at
-  // base+i with base = (y*SizeX + x)*C. The Gram sum for a channel pair (i,j)
-  // walks the spatial positions, which are strided by C.
+  // The prev-layer activation A is depth-contiguous: A[x,y,i] lives at base+i
+  // with base = (y*SizeX + x)*C, so a channel's spatial samples are strided by
+  // C and NOT directly vectorizable. Transpose once into the channel-major
+  // scratch (row i = channel i's HW spatial floats laid out contiguously), then
+  // each Gram entry G[i,j] is a depth-contiguous DotProduct over the spatial
+  // axis. The strided gather is the only scalar remainder.
+  FGramScratch.ReSize(HW, C, 1);
+  for y := 0 to A.SizeY - 1 do
+    for x := 0 to A.SizeX - 1 do
+    begin
+      base := (y * A.SizeX + x) * C;
+      for i := 0 to C - 1 do
+        FGramScratch.FData[i * HW + (y * A.SizeX + x)] := A.FData[base + i];
+    end;
   for i := 0 to C - 1 do
+  begin
+    rowI := FGramScratch.GetRawPtr(0, i, 0);
     for j := i to C - 1 do
     begin
-      acc := 0;
-      for y := 0 to A.SizeY - 1 do
-        for x := 0 to A.SizeX - 1 do
-        begin
-          base := (y * A.SizeX + x) * C;
-          acc := acc + A.FData[base + i] * A.FData[base + j];
-        end;
-      acc := acc * norm;
+      rowJ := FGramScratch.GetRawPtr(0, j, 0);
+      acc := TNNetVolume.DotProduct(rowI, rowJ, HW) * norm;
       FOutput.FData[i * C + j] := acc;
       FOutput.FData[j * C + i] := acc; // symmetric
     end;
+  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -18946,7 +18986,8 @@ var
   StartTime: double;
   A, PrevErr: TNNetVolume;
   C, HW, x, y, i, j, base: integer;
-  norm, gv, sym: TNeuralFloat;
+  norm, sym: TNeuralFloat;
+  rowI, rowJ: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -18964,21 +19005,45 @@ begin
     begin
       norm := 1.0 / (C * HW);
       // G[i,j] = norm * sum_{x,y} A[x,y,i]*A[x,y,j]  (symmetric).
-      // dA[x,y,k] = norm * sum_j (dG[k,j] + dG[j,k]) * A[x,y,j].
+      // dA[x,y,i] = norm * sum_j (dG[i,j] + dG[j,i]) * A[x,y,j].
+      // Build dA channel-major in the scratch (row i = channel i over HW),
+      // accumulating each contribution with the depth-contiguous MulAdd
+      // primitive: rowI += (norm*sym) * channelJ. The channel-major A samples
+      // are taken from a transpose of A; the final strided scatter back into the
+      // depth-contiguous PrevErr is the only scalar remainder.
+      FGramScratch.ReSize(HW, C, 1);
+      // FGramScratch first holds A transposed (reused as the source channels).
       for y := 0 to A.SizeY - 1 do
         for x := 0 to A.SizeX - 1 do
         begin
           base := (y * A.SizeX + x) * C;
           for i := 0 to C - 1 do
+            FGramScratch.FData[i * HW + (y * A.SizeX + x)] := A.FData[base + i];
+        end;
+      // Accumulate dA channel-major into the backward scratch.
+      FGramScratchErr.ReSize(HW, C, 1);
+      FGramScratchErr.Fill(0);
+      for i := 0 to C - 1 do
+      begin
+        rowI := FGramScratchErr.GetRawPtr(0, i, 0);
+        for j := 0 to C - 1 do
+        begin
+          sym := FOutputError.FData[i * C + j] + FOutputError.FData[j * C + i];
+          if sym <> 0 then
           begin
-            gv := 0;
-            for j := 0 to C - 1 do
-            begin
-              sym := FOutputError.FData[i * C + j] + FOutputError.FData[j * C + i];
-              gv := gv + sym * A.FData[base + j];
-            end;
-            PrevErr.FData[base + i] := PrevErr.FData[base + i] + norm * gv;
+            rowJ := FGramScratch.GetRawPtr(0, j, 0);
+            TNNetVolume.MulAdd(rowI, rowJ, norm * sym, HW);
           end;
+        end;
+      end;
+      // Scatter channel-major dA back into the depth-contiguous PrevErr.
+      for y := 0 to A.SizeY - 1 do
+        for x := 0 to A.SizeX - 1 do
+        begin
+          base := (y * A.SizeX + x) * C;
+          for i := 0 to C - 1 do
+            PrevErr.FData[base + i] := PrevErr.FData[base + i] +
+              FGramScratchErr.FData[i * HW + (y * A.SizeX + x)];
         end;
     end;
   end;

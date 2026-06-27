@@ -1769,7 +1769,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
         `acc += WR[tap+zi]·SPtr[zi]` over the contiguous channel dimension (ZC
         floats) is a 1:1 `DotProduct(WR@tap, SPtr, ZC)` replacement, accumulated
         across taps.
-  - [ ] `TNNetGramMatrix.Compute` (~18927-18940) — distinct from the others: the
+  - [X] `TNNetGramMatrix.Compute` (~18927-18940) — distinct from the others: the
         channel-pair accumulation walks spatial positions STRIDED by C, so it is
         NOT a direct DotProduct. Buffer the prev-layer activations into a
         channel-major (C rows × H*W contiguous) scratch ONCE per forward, then
