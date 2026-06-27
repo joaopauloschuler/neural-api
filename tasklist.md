@@ -968,32 +968,29 @@ rather than acted on.
       existing parity tests (TestHiFiGANSynthesisParity / TestVitsSynthesisParity /
       EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
       before/after.
-- [ ] AVX vectorization of `TNNetCorrelationVolume.Compute` (RAFT all-pairs
-      correlation). The hot path is the innermost in-channel accumulation
-      `acc := acc + f1.Get(ix,iy,dd) * f2.Get(jx,jy,dd)` (neuralnetwork.pas
-      ~line 29104) inside the (iy,ix,jy,jx) nest. The two operands are already
-      depth-axis-contiguous columns, so this is the exact case
-      `TNNetVolume.DotProduct(pA, pB, C)` vectorizes — replace the scalar `dd`
-      loop with one DotProduct over the (ix,iy) and (jx,jy) channel columns
-      (≈8x on the dominant inner work). Gate on the optical-flow / RAFT parity
-      test staying within tolerance; mirror the same rewrite in Backpropagate.
+- [X] AVX vectorization of `TNNetCorrelationVolume.Compute` (RAFT all-pairs
+      correlation). DONE (commit 346c1b4): the inner `dd` accumulation is now
+      `TNNetVolume.DotProduct(f1.GetRawPtr(ix,iy,0), f2.GetRawPtr(jx,jy,0), C)`
+      over the depth-contiguous f1/f2 channel columns. Backpropagate left scalar
+      because TNNetCorrelationVolume is inference-only (no gradient scatter into
+      f1/f2). RAFT optical-flow parity (TestRaftOpticalFlowParity) passes on both
+      scalar (max|diff| 5.5e-6) and -dAVX2 (3.7e-6) builds, gate < 1e-4.
 
-- [ ] AVX vectorization of `TNNetSimpleGate.Compute` (NAFNet/SimpleGate GLU,
-      neuralnetwork.pas ~line 37660). The per-position multiply
-      `FOutput[x,y,c] := In[x,y,c] * In[x,y,HalfDepth+c]` over the (IX,IY,IC)
-      nest is a depth-contiguous element-wise product — replace the scalar IC
-      loop with `TNNetVolume.Mul` over the first-half and second-half channel
-      columns. Backward is the symmetric cross-multiply; vectorize it the same
-      way. Gate on `TestNAFNetParity` (< 1e-4 vs the numpy float64 oracle).
+- [X] AVX vectorization of `TNNetSimpleGate.Compute` (NAFNet/SimpleGate GLU).
+      DONE (commit a1e077fb): forward does per-(x,y) `Move` of the first half into
+      the output column then `TNNetVolume.Mul(OutPtr, SecondPtr, HalfDepth)`
+      (AVXMul); backward cross-multiply is two `TNNetVolume.MulAdd` calls per
+      (x,y) (AVXMulAdd). TestSimpleGateForward / GradientCheck / Serialization
+      pass on both scalar and -dAVX2 builds.
 
-- [ ] AVX bulk-copy for `TNNetSpaceToDepth` (pixel-unshuffle) and its inverse
-      `TNNetDepthToSpace` (neuralnetwork.pas ~lines 36982 / 37072). Both inner
-      loops scatter/gather one float at a time over the contiguous in-channel
-      (IC) run; replace the scalar IC loop with a single `Move` of `C` floats
-      (the IC stride is contiguous in both source and destination), keeping the
-      outer (OX,OY,SX,SY) ordering. Used in SigLIP/InternVL pixel-unshuffle
-      connectors and RIFE/VAE upsample paths. Gate on the existing SpaceToDepth
-      round-trip / importer parity tests.
+- [X] AVX bulk-copy for `TNNetSpaceToDepth` (pixel-unshuffle) and its inverse
+      `TNNetDepthToSpace`. DONE (commit 4fa37e81): forward Compute is a single
+      `system.Move` of `C` floats per (OX,OY,SX,SY) position (contiguous IC run);
+      both Backpropagate paths use AVX `TNNetVolume.Add(dstPtr, srcPtr, C)` since
+      the routing is a bijection (each prev-error element written once, so the
+      contiguous depth `+=` preserves exact gradient-accumulation). All 1235
+      numerical tests (incl. SpaceToDepthForward / DepthToSpaceOfSpaceToDepth /
+      SpaceToDepthGradientCheck) pass on both scalar and -dAVX2 builds.
 
 - [ ] OpenCL offload of `TNNetCorrelationLookup.Compute` (RAFT local lookup of
       the all-pairs correlation, neuralnetwork.pas ~line 29120). The per-pixel
