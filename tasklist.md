@@ -1539,8 +1539,27 @@ rather than acted on.
       check (all in TestNeuralNumerical, passing; full suite green 2376/0/0). This
       UNBLOCKS the pyannote `segmentation-3.0` bidirectional-LSTM trunk drop-in
       (lines ~977-995) — the trunk can now swap from MinLSTM to true nn.LSTM cells.
-      STILL OPEN: the actual safetensors importer that loads real nn.LSTM/nn.GRU
-      `weight_ih_l{k}`/`weight_hh_l{k}`(`_reverse`) slabs into the stacked cells.
+  [X] DONE: the generic safetensors importer that loads real torch nn.LSTM/nn.GRU
+      `weight_ih_l{k}`/`weight_hh_l{k}`/`bias_ih_l{k}`/`bias_hh_l{k}`(`_reverse`)
+      slabs into the stacked cells — `LoadTorchLSTMInto`/`LoadTorchGRUInto`
+      (into an existing builder sub-stack under a key prefix) + standalone
+      `BuildLSTMFromSafeTensors`/`BuildGRUFromSafeTensors` (neuralpretrained.pas).
+      Splits the torch fused gate slab into the cell's per-gate tensors in torch
+      order (LSTM i,f,g,o; GRU r,z,n); LSTM bias = bias_ih+bias_hh summed; GRU
+      sums r,z biases but keeps b_in (bias_ih) and b_hn (bias_hh) SEPARATE to
+      match the cell's `n=tanh(W_in x+b_in+r*(W_hn h+b_hn))`. Pico torch oracle
+      fixtures (`tools/torch_rnn_tiny_fixture.py`,
+      `tests/fixtures/tiny_torch_{lstm,gru}_{uni_l1,uni_l2,bi_l1}.*`) +
+      `TestTorch{LSTM,GRU}ImportParity` assert full output-sequence parity < 1e-4
+      (LSTM/GRU × 1-layer uni, 2-layer uni, 1-layer bidir). DEFERRED: the builder
+      inserts a learned `TNNetPointwiseConvLinear` projection whenever an incoming
+      Depth≠Hidden (layer-0 with input_size≠Hidden, or ANY layer above a
+      bidirectional one); that projection has no torch counterpart, so torch
+      weights are NOT faithfully importable through it. Supported (faithful):
+      unidirectional stacks and single bidirectional layers with
+      input_size==Hidden; the importer REJECTS the projection case loudly
+      (`TestTorchRNNImportRejectsProjection`). Also out of scope, rejected:
+      batch_first, proj_size (`weight_hr_l*`), peephole.
 
 - [ ] OpenCL forward offload for `TNNetCausalLinearAttention` (the non-causal global
       `TNNetLinearAttention` is now DONE — `ComputeOpenCL` two-GEMM offload behind

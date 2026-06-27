@@ -49,6 +49,11 @@ type
     // "_ref.json". Callers: TestEnCodec{RoundTrip,NonCausalRoundTrip,
     // LegacyWeightNorm}Parity.
     procedure CheckEnCodecParity(const BaseName: string);
+    // Shared torch nn.LSTM/nn.GRU import-parity body (PRIVATE: parameterized by
+    // fixture tag, must not be auto-run). Builds the matching builder net,
+    // loads the fixture weights through the generic importer and asserts the
+    // full output sequence matches the torch float64 oracle to < 1e-4.
+    procedure RunTorchRNNParity(const Tag: string; UseGRU: boolean);
     // Shared parity loop: feeds every "sequences" row of the reference
     // logits fixture (JSON {"sequences": [[ids..]..], "logits": [[[..]]]})
     // through NN and asserts max |logit diff| < 1e-4 (hard ceiling 1e-3 -
@@ -608,6 +613,9 @@ type
     procedure TestRaftConfigFromJSONFile;
     procedure TestRaftOpticalFlowParity;
     procedure TestGenerationDefaultsFromJSONFile;
+    procedure TestTorchLSTMImportParity;
+    procedure TestTorchGRUImportParity;
+    procedure TestTorchRNNImportRejectsProjection;
   end;
 
 implementation
@@ -25061,6 +25069,123 @@ begin
   AssertFalse('missing -> no top_k', G.HasTopK);
   AssertFalse('missing -> no temperature', G.HasTemperature);
   AssertFalse('missing -> no do_sample', G.HasDoSample);
+end;
+
+// Builds the matching AddBidirectional{LSTM,GRU} net, loads the fixture's torch
+// weights through the generic importer, runs the pinned input and asserts the
+// full output SEQUENCE matches the torch float64 oracle to < 1e-4. Shared by
+// the LSTM/GRU parity tests. UseGRU picks the importer + cell class.
+procedure TTestNeuralPretrained.RunTorchRNNParity(
+  const Tag: string; UseGRU: boolean);
+var
+  NN: TNNet;
+  Input, Output: TNNetVolume;
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  RootObj: TJSONObject;
+  InArr, OutArr, RowArr: TJSONArray;
+  SeqLen, InputSize, Hidden, NumLayers, OutDepth, t, j: integer;
+  Bidirectional: boolean;
+  Diff, MaxDiff: double;
+begin
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  RefRoot := nil;
+  NN := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_torch_' + Tag + '_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RootObj := TJSONObject(RefRoot);
+    SeqLen := RootObj.Integers['seq_len'];
+    InputSize := RootObj.Integers['input_size'];
+    Hidden := RootObj.Integers['hidden'];
+    NumLayers := RootObj.Integers['num_layers'];
+    Bidirectional := RootObj.Booleans['bidirectional'];
+    if Bidirectional then OutDepth := 2 * Hidden else OutDepth := Hidden;
+
+    if UseGRU then
+      NN := BuildGRUFromSafeTensors(
+        FixturePath('tiny_torch_' + Tag + '.safetensors'), '',
+        InputSize, Hidden, NumLayers, SeqLen, Bidirectional)
+    else
+      NN := BuildLSTMFromSafeTensors(
+        FixturePath('tiny_torch_' + Tag + '.safetensors'), '',
+        InputSize, Hidden, NumLayers, SeqLen, Bidirectional);
+
+    // Pinned input: (SeqLen, 1, InputSize), depth-contiguous per time step.
+    InArr := TJSONArray(RootObj.Find('input'));
+    Input.ReSize(SeqLen, 1, InputSize);
+    for t := 0 to SeqLen - 1 do
+    begin
+      RowArr := TJSONArray(InArr.Items[t]);
+      for j := 0 to InputSize - 1 do
+        Input.FData[t * InputSize + j] := RowArr.Items[j].AsFloat;
+    end;
+
+    NN.Compute(Input);
+    NN.GetOutput(Output);
+    AssertEquals(Tag + ' output SizeX', SeqLen, NN.GetLastLayer.Output.SizeX);
+    AssertEquals(Tag + ' output Depth', OutDepth, NN.GetLastLayer.Output.Depth);
+
+    OutArr := TJSONArray(RootObj.Find('output'));
+    MaxDiff := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      RowArr := TJSONArray(OutArr.Items[t]);
+      for j := 0 to OutDepth - 1 do
+      begin
+        Diff := Abs(Output.FData[t * OutDepth + j] - RowArr.Items[j].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('torch RNN parity ' + Tag + ': max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Output.Free;
+    Input.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestTorchLSTMImportParity;
+begin
+  // 1-layer unidirectional, 2-layer unidirectional, 1-layer bidirectional -
+  // every config the projection-free builder can host faithfully.
+  RunTorchRNNParity('lstm_uni_l1', {UseGRU=}False);
+  RunTorchRNNParity('lstm_uni_l2', {UseGRU=}False);
+  RunTorchRNNParity('lstm_bi_l1', {UseGRU=}False);
+end;
+
+procedure TTestNeuralPretrained.TestTorchGRUImportParity;
+begin
+  RunTorchRNNParity('gru_uni_l1', {UseGRU=}True);
+  RunTorchRNNParity('gru_uni_l2', {UseGRU=}True);
+  RunTorchRNNParity('gru_bi_l1', {UseGRU=}True);
+end;
+
+// A config that forces the builder to insert a learned projection (2-layer
+// BIDIRECTIONAL: layer 1's incoming Depth is 2*Hidden != Hidden) is NOT
+// faithfully importable and the importer must reject it loudly rather than
+// silently mis-load. We reuse the bidirectional 1-layer weights file (the
+// importer raises before any tensor name is needed, on the projection check).
+procedure TTestNeuralPretrained.TestTorchRNNImportRejectsProjection;
+var
+  Raised: boolean;
+begin
+  Raised := False;
+  try
+    // input_size==Hidden but NumLayers=2 bidirectional -> projection at layer 1.
+    BuildLSTMFromSafeTensors(
+      FixturePath('tiny_torch_lstm_bi_l1.safetensors'), '',
+      {InputSize=}4, {Hidden=}4, {NumLayers=}2, {SeqLen=}5,
+      {Bidirectional=}True).Free;
+  except
+    on E: EPretrainedImportError do Raised := True;
+  end;
+  AssertTrue('stacked-bidirectional projection must be rejected', Raised);
 end;
 
 initialization

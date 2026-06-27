@@ -11826,6 +11826,55 @@ function BuildVideoMAEFromSafeTensors(const FileName: string;
 // copies the (1,1,num_labels) action logits into Logits. Forward only.
 procedure RunVideoMAELogits(Net: TNNet; ClipInput, Logits: TNNetVolume);
 
+// ---------------------------------------------------------------------------
+// GENERIC torch nn.LSTM / nn.GRU importer
+// ---------------------------------------------------------------------------
+// Loads the real torch
+//   weight_ih_l{k} / weight_hh_l{k} / bias_ih_l{k} / bias_hh_l{k}  (+ _reverse)
+// slabs of an nn.LSTM / nn.GRU into a stack ALREADY built with
+// TNNet.AddBidirectionalLSTM / AddBidirectionalGRU. Sub-stack and tensors must
+// agree on Hidden, num_layers and the bidirectional flag (verified at load).
+//
+// torch fused gate layout: weight_ih_l{k} is [G*Hidden, in] row-blocked by
+// gate, weight_hh_l{k} is [G*Hidden, Hidden]; G=4 (i,f,g,o) for LSTM, 3
+// (r,z,n) for GRU. The repo cells store each gate's W as a SEPARATE [out,0,in]
+// neuron in EXACTLY that gate order, so a gate block maps row-for-row. torch
+// ships TWO bias vectors (bias_ih + bias_hh): for LSTM they are summed into the
+// cell's single per-gate bias; for GRU bias_ih's r/z halves are summed with
+// bias_hh's r/z (gates applied before the W_hn split) while the candidate keeps
+// b_in (from bias_ih) and b_hn (from bias_hh) SEPARATE, matching the cell math
+// n = tanh(W_in x + b_in + r*(W_hn h + b_hn)).
+//
+// batch_first / proj_size / peephole are out of scope and rejected loudly.
+// Bidirectional torch concat is [forward;backward] along the feature axis,
+// matching the builder's TNNetDeepConcat order.
+//
+// LoadTorch{LSTM,GRU}Into take an already-open reader + a key prefix (''
+// for a bare nn.LSTM whose keys are 'weight_ih_l0'..., or e.g. 'rnn' for a
+// submodule whose keys are 'rnn.weight_ih_l0'...) and the builder's returned
+// last layer (the DeepConcat for bidirectional, or the top forward cell for
+// unidirectional). The Build*FromSafeTensors helpers create the matching net,
+// load it and return it (caller-owned). Coded by Claude (AI).
+procedure LoadTorchLSTMInto(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; Net: TNNet; LastLayer: TNNetLayer;
+  Hidden, NumLayers: integer; Bidirectional: boolean);
+
+procedure LoadTorchGRUInto(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; Net: TNNet; LastLayer: TNNetLayer;
+  Hidden, NumLayers: integer; Bidirectional: boolean);
+
+// Builds an INPUT -> AddBidirectional{LSTM,GRU} net matching the checkpoint at
+// FileName (under key Prefix), loads its weights and returns it. SeqLen is the
+// pinned sequence length the net is shaped for; InputSize is layer-0's
+// input_size (the feature Depth of the input tokens). Caller owns the net.
+function BuildLSTMFromSafeTensors(const FileName, Prefix: string;
+  InputSize, Hidden, NumLayers, SeqLen: integer;
+  Bidirectional: boolean): TNNet;
+
+function BuildGRUFromSafeTensors(const FileName, Prefix: string;
+  InputSize, Hidden, NumLayers, SeqLen: integer;
+  Bidirectional: boolean): TNNet;
+
 implementation
 
 procedure ImportError(const Msg: string);
@@ -76671,6 +76720,337 @@ begin
   finally
     Reader.Free;
   end;
+end;
+
+// ---------------------------------------------------------------------------
+// GENERIC torch nn.LSTM / nn.GRU importer (implementation)
+// ---------------------------------------------------------------------------
+
+// Collects, in net order, the recurrent cells of class CellClass between the
+// builder's first inserted layer and LastLayer (inclusive). For a stack built
+// by AddBidirectional{LSTM,GRU} these come out as
+//   [forward_l0, reverse_l0, forward_l1, reverse_l1, ...]  (bidirectional)
+//   [forward_l0, forward_l1, ...]                          (unidirectional)
+// because each layer emits its forward cell first, then (if bidirectional) its
+// reverse cell. Coded by Claude (AI).
+procedure CollectRNNCells(Net: TNNet; LastLayer: TNNetLayer;
+  CellClass: TClass; out Cells: array of TNNetLayer; Expected: integer);
+var
+  i, n, lastIdx: integer;
+begin
+  lastIdx := -1;
+  for i := 0 to Net.Layers.Count - 1 do
+    if Net.Layers[i] = LastLayer then lastIdx := i;
+  if lastIdx < 0 then
+    raise EPretrainedImportError.Create(
+      'LoadTorchRNN: LastLayer is not part of Net');
+  n := 0;
+  for i := 0 to lastIdx do
+    if Net.Layers[i].InheritsFrom(CellClass) then
+    begin
+      if n >= Expected then
+        raise EPretrainedImportError.Create(
+          'LoadTorchRNN: found more cells than expected (' +
+          IntToStr(Expected) + '); does NumLayers/Bidirectional match?');
+      Cells[n] := Net.Layers[i];
+      Inc(n);
+    end;
+  if n <> Expected then
+    raise EPretrainedImportError.Create(
+      'LoadTorchRNN: expected ' + IntToStr(Expected) + ' cells, found ' +
+      IntToStr(n) + '; does NumLayers/Bidirectional match the checkpoint?');
+end;
+
+// Validates that tensor Name exists with shape [Rows, Cols] (Cols<0 => any /
+// 1-D check skipped). Returns a flat row-major copy in T (caller-owned T,
+// reused). Coded by Claude (AI).
+procedure LoadTorchRNNTensor(Reader: TNNetSafeTensorsReader;
+  const Name: string; Rows, Cols: integer; T: TNNetVolume);
+begin
+  if not Reader.HasTensor(Name) then
+    raise EPretrainedImportError.Create(
+      'LoadTorchRNN: missing tensor "' + Name + '"');
+  if Cols >= 0 then
+  begin
+    if (Reader.DimCount(Name) <> 2) or
+       (Reader.DimSize(Name, 0) <> Rows) or
+       (Reader.DimSize(Name, 1) <> Cols) then
+      raise EPretrainedImportError.Create(
+        'LoadTorchRNN: "' + Name + '" shape ' + Reader.ShapeAsString(Name) +
+        ' != expected [' + IntToStr(Rows) + ',' + IntToStr(Cols) + ']');
+  end
+  else
+  begin
+    if Reader.ElementCount(Name) <> Rows then
+      raise EPretrainedImportError.Create(
+        'LoadTorchRNN: "' + Name + '" has ' +
+        IntToStr(Reader.ElementCount(Name)) + ' elements, expected ' +
+        IntToStr(Rows));
+  end;
+  Reader.LoadTensorFlat(Name, T);
+end;
+
+// Copies torch gate block g (rows [g*Hidden .. g*Hidden+Hidden) of a flat
+// [G*Hidden, In] tensor stored in T) into the cell's gate-W neuron, which is
+// shaped [Hidden, 1, In] row-major - i.e. an exact row-for-row block copy.
+procedure CopyGateWeightBlock(T: TNNetVolume; G, GateIdx, Hidden, InW: integer;
+  Dest: TNNetVolume);
+var d, j: integer;
+begin
+  for d := 0 to Hidden - 1 do
+    for j := 0 to InW - 1 do
+      Dest.FData[d * InW + j] := T.FData[(GateIdx * Hidden + d) * InW + j];
+end;
+
+// Sums torch bias_ih + bias_hh gate block g into the cell's per-gate bias.
+procedure SumGateBias(Bih, Bhh: TNNetVolume; GateIdx, Hidden: integer;
+  Dest: TNNetVolume);
+var d: integer;
+begin
+  for d := 0 to Hidden - 1 do
+    Dest.FData[d] := Bih.FData[GateIdx * Hidden + d] +
+                     Bhh.FData[GateIdx * Hidden + d];
+end;
+
+// Loads one direction of one LSTM layer from the torch slabs under
+// Prefix+'.weight_ih_l{k}'(+Suffix) etc. into the given cell. InSize is the
+// layer's torch input_size. Cell neuron layout (see TNNetLSTMCell):
+//   [0..3]=W_ii/W_if/W_ig/W_io  [4..7]=W_hi/W_hf/W_hg/W_ho
+//   [8..11]=b_i/b_f/b_g/b_o    (torch gate order i,f,g,o == cell order).
+procedure LoadLSTMDirection(Reader: TNNetSafeTensorsReader;
+  const Base, Suffix: string; Cell: TNNetLayer; InSize, Hidden: integer);
+var
+  Wih, Whh, Bih, Bhh: TNNetVolume;
+  g: integer;
+begin
+  Wih := TNNetVolume.Create; Whh := TNNetVolume.Create;
+  Bih := TNNetVolume.Create; Bhh := TNNetVolume.Create;
+  try
+    LoadTorchRNNTensor(Reader, Base + 'weight_ih_l' + Suffix,
+      4 * Hidden, InSize, Wih);
+    LoadTorchRNNTensor(Reader, Base + 'weight_hh_l' + Suffix,
+      4 * Hidden, Hidden, Whh);
+    LoadTorchRNNTensor(Reader, Base + 'bias_ih_l' + Suffix,
+      4 * Hidden, -1, Bih);
+    LoadTorchRNNTensor(Reader, Base + 'bias_hh_l' + Suffix,
+      4 * Hidden, -1, Bhh);
+    for g := 0 to 3 do
+    begin
+      CopyGateWeightBlock(Wih, 4, g, Hidden, InSize,
+        Cell.Neurons[g].Weights);
+      CopyGateWeightBlock(Whh, 4, g, Hidden, Hidden,
+        Cell.Neurons[4 + g].Weights);
+      SumGateBias(Bih, Bhh, g, Hidden, Cell.Neurons[8 + g].Weights);
+    end;
+    Cell.FlushWeightCache();
+  finally
+    Wih.Free; Whh.Free; Bih.Free; Bhh.Free;
+  end;
+end;
+
+// GRU sibling of LoadLSTMDirection. Cell neuron layout (see TNNetGRUCell):
+//   [0..2]=W_ir/W_iz/W_in  [3..5]=W_hr/W_hz/W_hn
+//   [6]=b_r [7]=b_z [8]=b_in [9]=b_hn  (torch gate order r,z,n).
+// torch GRU computes n = tanh(W_in x + b_in + r*(W_hn h + b_hn)); the cell
+// keeps b_in (from bias_ih) and b_hn (from bias_hh) SEPARATE for exactly this
+// reason, while r/z biases are the bias_ih+bias_hh sum.
+procedure LoadGRUDirection(Reader: TNNetSafeTensorsReader;
+  const Base, Suffix: string; Cell: TNNetLayer; InSize, Hidden: integer);
+var
+  Wih, Whh, Bih, Bhh: TNNetVolume;
+  g: integer;
+begin
+  Wih := TNNetVolume.Create; Whh := TNNetVolume.Create;
+  Bih := TNNetVolume.Create; Bhh := TNNetVolume.Create;
+  try
+    LoadTorchRNNTensor(Reader, Base + 'weight_ih_l' + Suffix,
+      3 * Hidden, InSize, Wih);
+    LoadTorchRNNTensor(Reader, Base + 'weight_hh_l' + Suffix,
+      3 * Hidden, Hidden, Whh);
+    LoadTorchRNNTensor(Reader, Base + 'bias_ih_l' + Suffix,
+      3 * Hidden, -1, Bih);
+    LoadTorchRNNTensor(Reader, Base + 'bias_hh_l' + Suffix,
+      3 * Hidden, -1, Bhh);
+    for g := 0 to 2 do
+    begin
+      CopyGateWeightBlock(Wih, 3, g, Hidden, InSize,
+        Cell.Neurons[g].Weights);
+      CopyGateWeightBlock(Whh, 3, g, Hidden, Hidden,
+        Cell.Neurons[3 + g].Weights);
+    end;
+    // r,z biases: bias_ih + bias_hh (gate applied before any split).
+    SumGateBias(Bih, Bhh, 0, Hidden, Cell.Neurons[6].Weights);   // b_r
+    SumGateBias(Bih, Bhh, 1, Hidden, Cell.Neurons[7].Weights);   // b_z
+    // candidate split: b_in from bias_ih[2], b_hn from bias_hh[2].
+    for g := 0 to Hidden - 1 do
+    begin
+      Cell.Neurons[8].Weights.FData[g] := Bih.FData[2 * Hidden + g]; // b_in
+      Cell.Neurons[9].Weights.FData[g] := Bhh.FData[2 * Hidden + g]; // b_hn
+    end;
+    Cell.FlushWeightCache();
+  finally
+    Wih.Free; Whh.Free; Bih.Free; Bhh.Free;
+  end;
+end;
+
+// Validates a single key exists / is absent and raises for the out-of-scope
+// torch options that ship extra tensors (proj_size adds weight_hr_l{k}).
+procedure RejectUnsupportedTorchRNN(Reader: TNNetSafeTensorsReader;
+  const Base: string);
+begin
+  if Reader.HasTensor(Base + 'weight_hr_l0') then
+    raise EPretrainedImportError.Create(
+      'LoadTorchRNN: proj_size (weight_hr_l*) is out of scope');
+end;
+
+// True if the builder inserted a learned per-direction projection
+// (TNNetPointwiseConvLinear) anywhere up to and including LastCell - i.e. some
+// cell boundary had incoming Depth != Hidden. Such a projection has no torch
+// counterpart, so torch weights cannot be loaded faithfully through it.
+function NetHasProjectionBeforeCells(Net: TNNet;
+  const Cells: array of TNNetLayer; NumCells: integer): boolean;
+var
+  i, lastIdx: integer;
+begin
+  Result := False;
+  lastIdx := -1;
+  for i := 0 to Net.Layers.Count - 1 do
+    if Net.Layers[i] = Cells[NumCells - 1] then lastIdx := i;
+  for i := 0 to lastIdx do
+    if Net.Layers[i] is TNNetPointwiseConvLinear then
+    begin
+      Result := True;
+      exit;
+    end;
+end;
+
+procedure LoadTorchRNNStack(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; Net: TNNet; LastLayer: TNNetLayer;
+  Hidden, NumLayers: integer; Bidirectional, UseGRU: boolean);
+var
+  Base, Suffix: string;
+  Cells: array of TNNetLayer;
+  NumDir, NumCells, k, InSize: integer;
+  CellClass: TClass;
+begin
+  if Hidden < 1 then
+    raise EPretrainedImportError.Create('LoadTorchRNN: Hidden >= 1 required');
+  if NumLayers < 1 then
+    raise EPretrainedImportError.Create('LoadTorchRNN: NumLayers >= 1 required');
+  // Normalize the prefix so callers may pass '', 'rnn' or 'rnn.'
+  // interchangeably: a non-empty prefix gets exactly one trailing '.' (the
+  // separator before 'weight_ih_l'); an empty prefix stays '' (bare nn.LSTM
+  // keys are 'weight_ih_l0'...).
+  Base := Prefix;
+  while (Length(Base) > 0) and (Base[Length(Base)] = '.') do
+    Delete(Base, Length(Base), 1);
+  if Length(Base) > 0 then Base := Base + '.';
+  RejectUnsupportedTorchRNN(Reader, Base);
+
+  if Bidirectional then NumDir := 2 else NumDir := 1;
+  NumCells := NumLayers * NumDir;
+  SetLength(Cells, NumCells);
+  if UseGRU then CellClass := TNNetGRUCell else CellClass := TNNetLSTMCell;
+  CollectRNNCells(Net, LastLayer, CellClass, Cells, NumCells);
+
+  // A learned per-direction projection (TNNetPointwiseConvLinear, inserted by
+  // the builder when an incoming Depth != Hidden) has NO torch counterpart, so
+  // torch weights cannot be loaded faithfully through it. This fires for
+  // layer 0 when input_size != Hidden and for any layer above a bidirectional
+  // one (incoming 2*Hidden). Faithfully importable: unidirectional stacks with
+  // input_size == Hidden (any depth) and a SINGLE bidirectional layer with
+  // input_size == Hidden. Reject loudly rather than silently mis-load.
+  if NetHasProjectionBeforeCells(Net, Cells, NumCells) then
+    raise EPretrainedImportError.Create(
+      'LoadTorchRNN: builder inserted a learned projection (input_size != ' +
+      'Hidden, or a stacked bidirectional layer). torch weights are not ' +
+      'faithfully importable through it. Supported: unidirectional stacks ' +
+      'and single bidirectional layers with input_size == Hidden.');
+
+  for k := 0 to NumLayers - 1 do
+  begin
+    Suffix := IntToStr(k);
+    // Each cell's input width is its W_i neuron Depth; with no projection
+    // present this equals the torch layer-k input_size (Hidden everywhere for
+    // the supported configs).
+    InSize := Cells[k * NumDir].Neurons[0].Weights.Depth;
+    if UseGRU then
+      LoadGRUDirection(Reader, Base, Suffix, Cells[k * NumDir], InSize, Hidden)
+    else
+      LoadLSTMDirection(Reader, Base, Suffix, Cells[k * NumDir], InSize, Hidden);
+    if Bidirectional then
+    begin
+      InSize := Cells[k * NumDir + 1].Neurons[0].Weights.Depth;
+      if UseGRU then
+        LoadGRUDirection(Reader, Base, Suffix + '_reverse',
+          Cells[k * NumDir + 1], InSize, Hidden)
+      else
+        LoadLSTMDirection(Reader, Base, Suffix + '_reverse',
+          Cells[k * NumDir + 1], InSize, Hidden);
+    end;
+  end;
+end;
+
+procedure LoadTorchLSTMInto(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; Net: TNNet; LastLayer: TNNetLayer;
+  Hidden, NumLayers: integer; Bidirectional: boolean);
+begin
+  LoadTorchRNNStack(Reader, Prefix, Net, LastLayer, Hidden, NumLayers,
+    Bidirectional, {UseGRU=}False);
+end;
+
+procedure LoadTorchGRUInto(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; Net: TNNet; LastLayer: TNNetLayer;
+  Hidden, NumLayers: integer; Bidirectional: boolean);
+begin
+  LoadTorchRNNStack(Reader, Prefix, Net, LastLayer, Hidden, NumLayers,
+    Bidirectional, {UseGRU=}True);
+end;
+
+function BuildTorchRNNFromSafeTensors(const FileName, Prefix: string;
+  InputSize, Hidden, NumLayers, SeqLen: integer;
+  Bidirectional, UseGRU: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  Last: TNNetLayer;
+begin
+  if (SeqLen < 1) or (InputSize < 1) then
+    raise EPretrainedImportError.Create(
+      'BuildTorchRNN: SeqLen and InputSize must be >= 1');
+  Result := TNNet.Create();
+  try
+    Result.AddLayer(TNNetInput.Create(SeqLen, 1, InputSize));
+    if UseGRU then
+      Last := Result.AddBidirectionalGRU(Hidden, NumLayers, Bidirectional)
+    else
+      Last := Result.AddBidirectionalLSTM(Hidden, NumLayers, Bidirectional);
+    Reader := CreatePretrainedTensorReader(FileName);
+    try
+      LoadTorchRNNStack(Reader, Prefix, Result, Last, Hidden, NumLayers,
+        Bidirectional, UseGRU);
+    finally
+      Reader.Free;
+    end;
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+function BuildLSTMFromSafeTensors(const FileName, Prefix: string;
+  InputSize, Hidden, NumLayers, SeqLen: integer;
+  Bidirectional: boolean): TNNet;
+begin
+  Result := BuildTorchRNNFromSafeTensors(FileName, Prefix, InputSize, Hidden,
+    NumLayers, SeqLen, Bidirectional, {UseGRU=}False);
+end;
+
+function BuildGRUFromSafeTensors(const FileName, Prefix: string;
+  InputSize, Hidden, NumLayers, SeqLen: integer;
+  Bidirectional: boolean): TNNet;
+begin
+  Result := BuildTorchRNNFromSafeTensors(FileName, Prefix, InputSize, Hidden,
+    NumLayers, SeqLen, Bidirectional, {UseGRU=}True);
 end;
 
 {$IFDEF OpenCL}
