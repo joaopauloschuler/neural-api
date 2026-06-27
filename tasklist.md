@@ -224,6 +224,38 @@ rather than acted on.
 
 ### Computer vision & generative models
 
+- [ ] FastSAM real-time segment-anything importer (`BuildFastSAMFromSafeTensors[Ex]`,
+      ultralytics FastSAM-s / FastSAM-x). Architecturally distinct from the landed
+      ViT-encoder SAM path: FastSAM reframes "segment everything" as a YOLOv8
+      instance-segmentation backbone (CSP/C2f conv stages + a prototype-mask head)
+      followed by a CLIP-text or point/box prompt-selection step over the emitted
+      masks — no heavy image encoder, so it runs interactively on CPU. v1 scope:
+      the YOLOv8-seg backbone + proto-mask head producing the full mask set on a
+      fixed input, reusing the landed conv/SPPF building blocks; the CLIP-prompt
+      mask ranking as a follow-up. Pico-fixture parity < 1e-4 on the proto-mask
+      logits vs a float64 reference.
+
+- [ ] LLaVA-NeXT (llava-v1.6, model_type `llava_next`) dynamic-resolution VLM
+      importer follow-up to the landed `BuildLlavaFromSafeTensors`. The v1.6
+      difference is the "anyres" image processing: the input is split into a grid
+      of native-aspect tiles plus a global thumbnail, each tile is CLIP-encoded
+      separately, and the per-tile patch grids are spatially unpadded and
+      concatenated into one visual-token stream (a large accuracy gain on dense
+      OCR/chart images over the v1.5 single-square crop). v1 scope: the anyres
+      tile-split + per-tile encode + token-merge connector reusing the landed
+      CLIP vision tower and Llama/Vicuna decoder; `examples/LlavaNextDescribe`
+      caption. Pico-fixture parity < 1e-4 on the merged visual-token features.
+
+- [ ] OpenCLIP / timm vision-tower importer (`BuildOpenClipVisionTower`,
+      laion/CLIP-ViT-* and timm `vit_*.openclip` checkpoints). The landed
+      `BuildClipFromSafeTensors` covers the OpenAI key layout; OpenCLIP/timm
+      checkpoints use a different parameter naming and ship the high-quality
+      ViT-L/14 and ViT-g/14 LAION-trained towers used as the de-facto image
+      encoder for many open generative and retrieval stacks. v1 scope: load the
+      OpenCLIP key layout into the existing `BuildClipVisionTower` graph (reusing
+      the CLIP path), with a real-checkpoint embedding round-trip vs the HF
+      `open_clip` reference < 1e-3 cosine.
+
 - [ ] Janus-Pro unified multimodal importer (`BuildJanusProFromSafeTensors[Ex]`,
       deepseek-ai/Janus-Pro-1B and Janus-Pro-7B). Architecturally distinct from
       every landed VLM (LLaVA / BLIP-2 / Qwen2-VL / PaliGemma / Florence-2) and
@@ -936,6 +968,42 @@ rather than acted on.
       existing parity tests (TestHiFiGANSynthesisParity / TestVitsSynthesisParity /
       EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
       before/after.
+- [ ] AVX vectorization of `TNNetCorrelationVolume.Compute` (RAFT all-pairs
+      correlation). The hot path is the innermost in-channel accumulation
+      `acc := acc + f1.Get(ix,iy,dd) * f2.Get(jx,jy,dd)` (neuralnetwork.pas
+      ~line 29104) inside the (iy,ix,jy,jx) nest. The two operands are already
+      depth-axis-contiguous columns, so this is the exact case
+      `TNNetVolume.DotProduct(pA, pB, C)` vectorizes — replace the scalar `dd`
+      loop with one DotProduct over the (ix,iy) and (jx,jy) channel columns
+      (≈8x on the dominant inner work). Gate on the optical-flow / RAFT parity
+      test staying within tolerance; mirror the same rewrite in Backpropagate.
+
+- [ ] AVX vectorization of `TNNetSimpleGate.Compute` (NAFNet/SimpleGate GLU,
+      neuralnetwork.pas ~line 37660). The per-position multiply
+      `FOutput[x,y,c] := In[x,y,c] * In[x,y,HalfDepth+c]` over the (IX,IY,IC)
+      nest is a depth-contiguous element-wise product — replace the scalar IC
+      loop with `TNNetVolume.Mul` over the first-half and second-half channel
+      columns. Backward is the symmetric cross-multiply; vectorize it the same
+      way. Gate on `TestNAFNetParity` (< 1e-4 vs the numpy float64 oracle).
+
+- [ ] AVX bulk-copy for `TNNetSpaceToDepth` (pixel-unshuffle) and its inverse
+      `TNNetDepthToSpace` (neuralnetwork.pas ~lines 36982 / 37072). Both inner
+      loops scatter/gather one float at a time over the contiguous in-channel
+      (IC) run; replace the scalar IC loop with a single `Move` of `C` floats
+      (the IC stride is contiguous in both source and destination), keeping the
+      outer (OX,OY,SX,SY) ordering. Used in SigLIP/InternVL pixel-unshuffle
+      connectors and RIFE/VAE upsample paths. Gate on the existing SpaceToDepth
+      round-trip / importer parity tests.
+
+- [ ] OpenCL offload of `TNNetCorrelationLookup.Compute` (RAFT local lookup of
+      the all-pairs correlation, neuralnetwork.pas ~line 29120). The per-pixel
+      bilinear grid-sample over a (2R+1)x(2R+1) window is a simple, embarrassingly
+      parallel kernel called once per RAFT refinement iteration — a natural
+      `ComputeOpenCL` candidate (one work-item per output position). Reuse the
+      bilinear-sampler OpenCL scaffolding already shared by the gather layers;
+      gate on the RAFT optical-flow parity test and keep the scalar path as the
+      no-OpenCL fallback.
+
 - [ ] Single-sample `TNNetFullConnect` forward threading follow-ups (opt-in
       `EnableFullConnectThreading` multi-core `ComputeCPU` v1 LANDED for
       FullConnect/FullConnectLinear/FullConnectReLU — off by default, bit-identical
