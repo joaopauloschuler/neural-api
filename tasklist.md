@@ -1520,10 +1520,16 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       (the forward + cleanly-mappable backward paths are done; these are the
       strided-on-one-operand remainders that a single DotProduct/MulAdd cannot cover
       without an extra gather):
-  - [ ] TNNetMonarchLinear `dzP`/`dx` backward loops (both operands stride the inner
+  - [X] TNNetMonarchLinear `dzP`/`dx` backward loops (both operands stride the inner
         index) and TNNetKroneckerLinear `dA`/`G`/`dX` backward loops — gather the
         strided run into a temp buffer first, then DotProduct/MulAdd, as was done for
-        the Monarch forward L-block column gather (FColBuf).
+        the Monarch forward L-block column gather (FColBuf). DONE: reformulated each
+        as a sum of contiguous MulAdds over the non-strided operand's rows (Monarch
+        WL/WR rows; Kronecker BX/A/G rows), accumulating into a contiguous column
+        buffer — no actual gather needed since one operand was already row-contiguous.
+        Monarch dx/dxR use new FColBuf2 scratch; Kronecker G uses FGBuf, dA/dX write
+        deltas/prev-error directly. Bit-identical on scalar, parity tests pass on
+        scalar + -dAVX2.
   - [ ] TNNetSpectralConv1D weight-gradient: kept scalar in Double over the original
         strided interleaved `[m][ci][co][Re,Im]` storage so the saved-weight gradient
         stays byte-identical; vectorize via a contiguous Re/Im gradient-plane scatter

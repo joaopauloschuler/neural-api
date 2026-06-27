@@ -12183,6 +12183,7 @@ type
     FdyTBuf: array of TNeuralFloat; // backward scratch, length n
     FdxRBuf: array of TNeuralFloat; // backward scratch, length n
     FColBuf: array of TNeuralFloat; // contiguous gather of a strided zP column, length m
+    FColBuf2: array of TNeuralFloat; // contiguous backward dxR/dx column accumulator, length m
     procedure ComputeCPU();
     procedure BackpropagateCPU();
     procedure FreeBackpropScratch();
@@ -67341,6 +67342,7 @@ procedure TNNetMonarchLinear.FreeBackpropScratch();
 begin
   SetLength(FdyTBuf, 0);
   SetLength(FdxRBuf, 0);
+  SetLength(FColBuf2, 0);
 end;
 
 function TNNetMonarchLinear.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
@@ -67393,6 +67395,7 @@ begin
   begin
     SetLength(FdyTBuf, N);
     SetLength(FdxRBuf, N);
+    SetLength(FColBuf2, FBlockSize);
   end;
 
   // neuron 0 = R, neuron 1 = L (each b blocks of m*m), neuron 2 = bias (n).
@@ -67536,7 +67539,7 @@ var
   b, m, r, c, k, t, blkBase: integer;
   MaxBlk, MaxM, MaxDim: integer;
   PrevOut, WR, WL, WRDelta, WLDelta, BiasDelta, LocalPrevError: TNNetVolume;
-  acc, e: TNeuralFloat;
+  e: TNeuralFloat;
   HasPrevError: boolean;
 begin
   b := FBlocks;
@@ -67578,15 +67581,16 @@ begin
       TNNetVolume.MulAdd(@WLDelta.FData[blkBase + k * m], @FColBuf[0],
         -FLearningRate * e, m);
     end;
-    // dzP[t,c] = sum_k L_c[k,t]*dyT[k,c]; then dxR[c,t] = dzP[t,c] (P^T). Inner k
-    // strides both WL (stride m) and dyT (stride b), so this stays scalar.
+    // dzP[t,c] = sum_k L_c[k,t]*dyT[k,c]; then dxR[c,t] = dzP[t,c] (P^T). The
+    // inner-k sum strides both WL (stride m) and dyT (stride b); reorder it into
+    // a sum of contiguous MulAdds over WL's rows (WL row k = blkBase+k*m..+m is
+    // contiguous) into FColBuf2[t] = dxR[c,t], reading the scalar dyT[k,c].
+    FillDWord(FColBuf2[0], m, 0);
+    for k := 0 to MaxM do
+      TNNetVolume.MulAdd(@FColBuf2[0], @WL.FData[blkBase + k * m],
+        FdyTBuf[k * b + c], m);
     for t := 0 to MaxM do
-    begin
-      acc := 0;
-      for k := 0 to MaxM do
-        acc := acc + WL.FData[blkBase + k * m + t] * FdyTBuf[k * b + c];
-      FdxRBuf[c * m + t] := acc; // P^T: (m,b)[t,c]->(b,m)[c,t]
-    end;
+      FdxRBuf[c * m + t] := FColBuf2[t]; // P^T: (m,b)[t,c]->(b,m)[c,t]
   end;
 
   // R weight grad + back through R -> dx.
@@ -67598,14 +67602,19 @@ begin
     for k := 0 to MaxM do
       TNNetVolume.MulAdd(@WRDelta.FData[blkBase + k * m], @PrevOut.FData[r * m],
         -FLearningRate * FdxRBuf[r * m + k], m);
+    // dx[r,t] = sum_k R_r[k,t]*dxR[r,k]: inner k strides WR (stride m) while
+    // dxR[r,k] is the contiguous scalar weight. Reorder into contiguous MulAdds
+    // over WR's rows (WR row k = blkBase+k*m..+m), accumulating into FColBuf2
+    // then adding the block into LocalPrevError.
     if HasPrevError then
+    begin
+      FillDWord(FColBuf2[0], m, 0);
+      for k := 0 to MaxM do
+        TNNetVolume.MulAdd(@FColBuf2[0], @WR.FData[blkBase + k * m],
+          FdxRBuf[r * m + k], m);
       for t := 0 to MaxM do
-      begin
-        acc := 0;
-        for k := 0 to MaxM do
-          acc := acc + WR.FData[blkBase + k * m + t] * FdxRBuf[r * m + k];
-        LocalPrevError.FData[r * m + t] := LocalPrevError.FData[r * m + t] + acc;
-      end;
+        LocalPrevError.FData[r * m + t] := LocalPrevError.FData[r * m + t] + FColBuf2[t];
+    end;
   end;
 
   if not FBatchUpdate then
@@ -67820,10 +67829,9 @@ end;
 // All accumulations are small GEMMs. Deltas carry -LR*grad.
 procedure TNNetKroneckerLinear.BackpropagateCPU();
 var
-  p, q, i, j, k, l, w: integer;
+  p, q, i, j, k: integer;
   MaxP, MaxQ, MaxDim: integer;
   PrevOut, WA, WB, WADelta, WBDelta, BiasDelta, LocalPrevError: TNNetVolume;
-  acc, dyij, glil: TNeuralFloat;
   HasPrevError: boolean;
 begin
   p := FP;
@@ -67845,28 +67853,26 @@ begin
     for i := 0 to MaxDim do
       BiasDelta.FData[i] := BiasDelta.FData[i] - FLearningRate * FOutputError.FData[i];
 
-  // dA[j,l] += sum_i dY[i,j]*BX[i,l].
-  for j := 0 to MaxP do
-    for l := 0 to MaxP do
-    begin
-      acc := 0;
-      for i := 0 to MaxQ do
-        acc := acc + FOutputError.FData[i * p + j] * FCacheBX.FData[i * p + l];
-      WADelta.FData[j * p + l] := WADelta.FData[j * p + l] - FLearningRate * acc;
-    end;
-
-  // G[i,l] = sum_j dY[i,j]*A[j,l]  (= dY*A).
+  // dA[j,l] += sum_i dY[i,j]*BX[i,l]. The inner-i sum strides both dY (stride p)
+  // and BX (stride p); reorder into a sum of contiguous MulAdds over BX's rows
+  // (BX row i = i*p..+p is contiguous, length p), reading the scalar dY[i,j],
+  // accumulating into WADelta's j-th row with the -LR scale folded in.
   for i := 0 to MaxQ do
-    for l := 0 to MaxP do
-    begin
-      acc := 0;
-      for j := 0 to MaxP do
-      begin
-        dyij := FOutputError.FData[i * p + j];
-        acc := acc + dyij * WA.FData[j * p + l];
-      end;
-      FGBuf[i * p + l] := acc;
-    end;
+    for j := 0 to MaxP do
+      TNNetVolume.MulAdd(@WADelta.FData[j * p], @FCacheBX.FData[i * p],
+        -FLearningRate * FOutputError.FData[i * p + j], p);
+
+  // G[i,l] = sum_j dY[i,j]*A[j,l]  (= dY*A). The inner-j sum strides A (stride p)
+  // while dY[i,j] is the contiguous scalar; reorder into a sum of contiguous
+  // MulAdds over A's rows (A row j = j*p..+p is contiguous, length p) into G's
+  // i-th row.
+  for i := 0 to MaxQ do
+  begin
+    FillDWord(FGBuf[i * p], p, 0);
+    for j := 0 to MaxP do
+      TNNetVolume.MulAdd(@FGBuf[i * p], @WA.FData[j * p],
+        FOutputError.FData[i * p + j], p);
+  end;
 
   // dB[i,k] += sum_l G[i,l]*X[k,l]   (X[k,l] = x[k*p+l]). Inner l is contiguous
   // on both G (i-th row) and X (= PrevOut's k-th p-segment): a dot product.
@@ -67875,19 +67881,15 @@ begin
       WBDelta.FData[i * q + k] := WBDelta.FData[i * q + k]
         - FLearningRate * TNNetVolume.DotProduct(@FGBuf[i * p], @PrevOut.FData[k * p], p);
 
-  // dX[k,l] = sum_i B[i,k]*G[i,l]; dx[k*p+l] = dX[k,l].
+  // dX[k,l] = sum_i B[i,k]*G[i,l]; dx[k*p+l] = dX[k,l]. The inner-i sum strides
+  // both B (stride q) and G (stride p); reorder into a sum of contiguous MulAdds
+  // over G's rows (G row i = i*p..+p is contiguous, length p), reading the scalar
+  // B[i,k], accumulating directly into LocalPrevError's k-th p-segment.
   if HasPrevError then
     for k := 0 to MaxQ do
-      for l := 0 to MaxP do
-      begin
-        acc := 0;
-        for i := 0 to MaxQ do
-        begin
-          glil := FGBuf[i * p + l];
-          acc := acc + WB.FData[i * q + k] * glil;
-        end;
-        LocalPrevError.FData[k * p + l] := LocalPrevError.FData[k * p + l] + acc;
-      end;
+      for i := 0 to MaxQ do
+        TNNetVolume.MulAdd(@LocalPrevError.FData[k * p], @FGBuf[i * p],
+          WB.FData[i * q + k], p);
 
   if not FBatchUpdate then
   begin
