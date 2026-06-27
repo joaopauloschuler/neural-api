@@ -312,6 +312,9 @@ type
     // OpenCL two-GEMM forward offload parity (vs CPU) for the non-causal global
     // TNNetLinearAttention.
     procedure LinearAttentionOpenCLParity;
+    // OpenCL two-GEMM forward offload parity (vs CPU/AVX) for the RECTANGULAR
+    // TNNetCrossAttention (Q from one source, packed K|V from a second source).
+    procedure CrossAttentionOpenCLParity;
     // OpenCL all-pairs correlation GEMM forward offload parity (vs CPU/AVX) for
     // TNNetCorrelationVolume (RAFT).
     procedure CorrelationVolumeOpenCLParity;
@@ -59577,6 +59580,87 @@ begin
   finally
     OutCPU.Free;
     Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetCrossAttention is the SAME pair of dense GEMMs as TNNetScaledDotProduct-
+// Attention, just RECTANGULAR (QLen <> KVLen) with Q from the previous layer and
+// packed K|V from an explicit second source. ComputeOpenCL maps both GEMMs onto
+// the single cai_dot_product kernel (scores Q.K^T then P.V) and runs the causal
+// mask + softmax on the CPU in between, mirroring the CPU/AVX Compute() exactly.
+// PoCL CPU-backed -> typically ~1e-6; tight 1e-4 gate.
+procedure TTestNeuralNumerical.CrossAttentionOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Dk = 12;
+  QSeqLen = 40;  // >= csCrossAttnOpenCLMinSeqLen (32) so the device path fires
+  KVSeqLen = 28; // deliberately != QSeqLen to exercise the rectangular shape
+var
+  NN: TNNet;
+  QData, KVData, OutCPU: TNNetVolume;
+  QueryInput, KVInput: TNNetLayer;
+  Attn: TNNetCrossAttention;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  QData := TNNetVolume.Create(QSeqLen, 1, Dk);
+  KVData := TNNetVolume.Create(KVSeqLen, 1, 2 * Dk);
+  OutCPU := TNNetVolume.Create();
+  try
+    QueryInput := NN.AddLayer(TNNetInput.Create(QSeqLen, 1, Dk, 1));
+    KVInput := NN.AddLayerAfter(TNNetInput.Create(KVSeqLen, 1, 2 * Dk, 1), 0);
+    Attn := TNNetCrossAttention.Create(Dk, {CausalMask}false, KVInput);
+    NN.AddLayerAfter(Attn, QueryInput);
+
+    // Bounded Q|K|V so the scores and value sums stay O(1) and the 1e-4
+    // absolute gate is meaningful.
+    for i := 0 to QData.Size - 1 do
+      QData.Raw[i] := 0.5 * Sin(i * 0.3) + 0.2 * Cos(i * 0.11);
+    for i := 0 to KVData.Size - 1 do
+      KVData.Raw[i] := 0.4 * Cos(i * 0.37) - 0.2 * Sin(i * 0.13);
+
+    // CPU forward (OpenCL OFF). Drive BOTH input branches.
+    QueryInput.Output.Copy(QData);
+    KVInput.Output.Copy(KVData);
+    NN.Compute(QueryInput.Output);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    // Device forward (offload ARMED for both GEMMs).
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    QueryInput.Output.Copy(QData);
+    KVInput.Output.Copy(KVData);
+    NN.Compute(QueryInput.Output);
+
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    AssertTrue('output on query grid', NN.GetLastLayer.Output.SizeX = QSeqLen);
+    MaxDiff := 0;
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  CrossAttention OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('CrossAttention OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    KVData.Free;
+    QData.Free;
     NN.Free;
   end;
 end;

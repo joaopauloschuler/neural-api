@@ -3325,6 +3325,24 @@ type
     // fixed after SetPrevLayer; no incremental-decode path here so pinned there).
     FdAttnBuf: array of TNeuralFloat;
     FdScoreBuf: array of TNeuralFloat;
+    {$IFDEF OpenCL}
+    // OpenCL offload of BOTH cross-attention matmuls (forward-only); masking and
+    // softmax stay on the CPU. Both reuse the single cai_dot_product kernel (the
+    // inherited FDotCL); the only difference from TNNetScaledDotProductAttention
+    // is the RECTANGULAR shape (QLen <> KVLen) and the packed-K|V source wiring
+    // (Q from PrevLayer, K|V from the explicit second source FKVLayer):
+    //  - scores Q.K^T: FKInterBuf = K interleaved (kernel A: As[j + d*KVLen]),
+    //    FQRowBuf = Q row-major (kernel B: Bs[i*d_k + d]); the result lands in
+    //    FAttn's [query*KVLen+key] layout.
+    //  - value sum P.V: FVColBuf = V packed token-contiguous (kernel A:
+    //    As[d + key*d_k]), FAttn (now the softmax weights) is the kernel B
+    //    DIRECTLY; the result lands in FOutput's [query*d_k+d] layout.
+    // Coded by Claude (AI).
+    FQRowBuf: TNNetVolume;
+    FKInterBuf: TNNetVolume;
+    FVColBuf: TNNetVolume;
+    procedure ComputeOpenCL();
+    {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure FreeBackpropScratch();
   public
@@ -3335,6 +3353,12 @@ type
     function SaveStructureToString(): string; override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
+    {$IFDEF OpenCL}
+    // Allocates the shared dot-product kernel handle (inherited FDotCL) and the
+    // Q/K/V packing buffers, then flags this layer to offload the forward matmuls.
+    // Coded by Claude (AI).
+    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    {$ENDIF}
     property AttentionWeights: TNNetVolume read FAttn;
     property Dk: integer read FDk;
     property CausalMask: boolean read FCausal;
@@ -28149,6 +28173,12 @@ destructor TNNetCrossAttention.Destroy();
 begin
   FAttn.Free;
   FreeBackpropScratch();
+  {$IFDEF OpenCL}
+  // FDotCL is freed by the inherited TNNetLayer.Destroy; free only our buffers.
+  if Assigned(FQRowBuf) then FQRowBuf.Free;
+  if Assigned(FKInterBuf) then FKInterBuf.Free;
+  if Assigned(FVColBuf) then FVColBuf.Free;
+  {$ENDIF}
   inherited Destroy();
 end;
 
@@ -28195,7 +28225,119 @@ begin
   end;
 end;
 
+{$IFDEF OpenCL}
+procedure TNNetCrossAttention.EnableOpenCL(
+  DotProductKernel: TDotProductKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL, FDotProductKernel
+  if not Assigned(FDotCL) then
+  begin
+    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL.HideMessages();
+  end;
+  if not Assigned(FQRowBuf) then FQRowBuf := TNNetVolume.Create();
+  if not Assigned(FKInterBuf) then FKInterBuf := TNNetVolume.Create();
+  if not Assigned(FVColBuf) then FVColBuf := TNNetVolume.Create();
+  FShouldOpenCL := true;
+end;
+
+// Forward: BOTH matmuls (Q.K^T and P.V) on the device, the causal mask + softmax
+// on the CPU in between. Mirrors the CPU/AVX Compute() math exactly (same
+// DotProduct contraction, same invSqrtDk scale, same causal mask and softmax).
+// Coded by Claude (AI).
+procedure TNNetCrossAttention.ComputeOpenCL();
+var
+  StartTime: double;
+  QLen, KVLen, i, j, d: integer;
+  QLenM1, KVLenM1, DkM1: integer;
+  Score, MaxScore, SumExp: TNeuralFloat;
+  Q, KV: TNNetVolume;
+  QBase, KBase, VBase: integer;
+begin
+  StartTime := Now();
+  Q := FPrevLayer.FOutput;
+  KV := FKVLayer.FOutput;
+  QLen := Q.SizeX;
+  KVLen := KV.SizeX;
+  QLenM1 := QLen - 1;
+  KVLenM1 := KVLen - 1;
+  DkM1 := FDk - 1;
+
+  // 1) Unpack into the kernel's operand layouts. Q is row-major (scores' B:
+  //    Bs[i*d_k + d]); K is interleaved (scores' A: As[j + d*KVLen]); V is
+  //    token-contiguous (value sum's A: As[d + key*d_k]). K sits at depth
+  //    [0..d_k-1] of the packed K|V source, V at depth [d_k..2*d_k-1].
+  FQRowBuf.ReSize(QLen * FDk, 1, 1);
+  FKInterBuf.ReSize(KVLen * FDk, 1, 1);
+  FVColBuf.ReSize(KVLen * FDk, 1, 1);
+  for i := 0 to QLenM1 do
+  begin
+    QBase := i * FDk;
+    for d := 0 to DkM1 do
+      FQRowBuf.FData[i * FDk + d] := Q.FData[QBase + d];
+  end;
+  for j := 0 to KVLenM1 do
+  begin
+    KBase := j * (2 * FDk);        // K_j packed at depth [0, FDk)
+    VBase := KBase + FDk;          // V_j packed at depth [FDk, 2*FDk)
+    for d := 0 to DkM1 do
+    begin
+      FKInterBuf.FData[j + d * KVLen] := KV.FData[KBase + d];
+      FVColBuf.FData[d + j * FDk] := KV.FData[VBase + d];
+    end;
+  end;
+
+  // 2) Scores Q_i . K_j on the device. The kernel writes Result[query*KVLen +
+  //    key] = Q_query . K_key, which is exactly FAttn's raw [j,i] layout, so the
+  //    readback lands the RAW (unscaled, unmasked) scores straight into FAttn.
+  FDotCL.PrepareForCompute(FKInterBuf, FQRowBuf, FDk);
+  FDotCL.Compute(FKInterBuf, FQRowBuf, {ActFN}0, {NewVAs}true, {NewVBs}true);
+  FDotCL.FinishAndLoadResult(FAttn, 0);
+
+  // 3) Per query row: scale the unmasked scores (mask the strict future when
+  //    causal), then numerically-stable softmax. FAttn now holds the softmax
+  //    weights P[query, key]. (No value sum here - that is the device matmul
+  //    below.)
+  for i := 0 to QLenM1 do
+  begin
+    MaxScore := -1e30;
+    for j := 0 to KVLenM1 do
+    begin
+      if FCausal and (j > i) then
+        FAttn[j, i, 0] := -1e9
+      else
+        FAttn[j, i, 0] := FAttn[j, i, 0] * FInvSqrtDk;
+      if FAttn[j, i, 0] > MaxScore then MaxScore := FAttn[j, i, 0];
+    end;
+    SumExp := 0;
+    for j := 0 to KVLenM1 do
+    begin
+      Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
+      FAttn[j, i, 0] := Score;
+      SumExp := SumExp + Score;
+    end;
+    if SumExp > 0 then
+      for j := 0 to KVLenM1 do
+        FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
+  end;
+
+  // 4) Value sum O[i,d] = sum_key P[i,key] * V[key,d] on the device. Mapping
+  //    A = V (a = depth d, FNumAs = d_k), B = FAttn (b = query, FNumBs = QLen),
+  //    contraction = KVLen: Result[b*FNumAs + a] = O[query, d] = FOutput's
+  //    native [query*d_k + d] layout, and FAttn is passed as B unchanged.
+  FDotCL.PrepareForCompute(FVColBuf, FAttn, KVLen);
+  FDotCL.Compute(FVColBuf, FAttn, {ActFN}0, {NewVAs}true, {NewVBs}true);
+  FDotCL.FinishAndLoadResult(FOutput, 0);
+
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+{$ENDIF}
+
 procedure TNNetCrossAttention.Compute();
+const
+  // Minimum query SeqLen to offload to OpenCL; below this the kernel launch +
+  // upload cost outweighs the matmul (mirrors the SDPA threshold).
+  csCrossAttnOpenCLMinSeqLen = 32;
 var
   StartTime: double;
   QLen, KVLen, i, j, d: integer;
@@ -28204,6 +28346,16 @@ var
   Q, KV: TNNetVolume;
   OutPtr: TNeuralFloatArrPtr;
 begin
+  {$IFDEF OpenCL}
+  // Offload to the device when OpenCL is enabled and the query sequence is long
+  // enough to amortize the per-forward upload/dispatch.
+  if FHasOpenCL and FShouldOpenCL and
+     (FPrevLayer.FOutput.SizeX >= csCrossAttnOpenCLMinSeqLen) then
+  begin
+    ComputeOpenCL();
+    exit;
+  end;
+  {$ENDIF}
   StartTime := Now();
   Q := FPrevLayer.FOutput;
   KV := FKVLayer.FOutput;
