@@ -1558,6 +1558,35 @@ rather than acted on.
       grounded-captioning / phrase-localization importer, a different capability
       from the landed open-vocabulary DETECTION and free-form caption paths.
       Pico-fixture parity < 1e-4 vs a float64 HF Kosmos2ForConditionalGeneration.
+- [ ] SmolVLM2 image-AND-video VLM importer (`BuildSmolVLM2FromSafeTensors[Ex]`,
+      model_type "smolvlm"/Idefics3-family, e.g. HuggingFaceTB/SmolVLM2-2.2B-Instruct
+      and the 256M/500M tiers). Pairs a SigLIP vision tower (landed
+      `BuildClipVisionTower`/SigLIP path) with a **pixel-shuffle space-to-depth
+      connector** (reuse the landed `TNNetSpaceToDepth`/`TNNetPixelShuffle` to fold a
+      `scale_factor²` spatial block into the channel axis, shrinking the per-tile
+      token count) feeding a SmolLM2 (Llama-path) text decoder. New code is the
+      image-splitting / tiling preprocessor and the **multi-frame VIDEO token
+      packing** (sample N frames, encode each through the shared vision tower, and
+      interleave the per-frame token grids with frame/`<row>_<col>` separators) —
+      the rest is wiring landed layers. Pico fixture + `TestSmolVLM2LogitParity`
+      < 1e-4 vs a float64 HF `SmolVLMForConditionalGeneration`, plus an
+      examples/SmolVLM2Describe demo (one image, then a short clip). Real value:
+      the landed caption VLMs (LLaVA/Blip2/Florence-2/PaliGemma) are image-only;
+      this is the efficient pixel-shuffle-connector + native short-VIDEO path.
+- [ ] RegNet image-classification backbone importer (`BuildRegNetFromSafeTensors[Ex]`,
+      timm/torchvision `regnet_y_*`/`regnet_x_*`, e.g. facebook/regnet-y-040). The
+      AnyNet/RegNet design-space CNN (Radosavovic et al. 2020, *Designing Network
+      Design Spaces*): a simple stem + 4 stages of bottleneck blocks, each block a
+      1x1 → **grouped 3x3** → 1x1 residual unit (the `regnet_y` variant adds a
+      Squeeze-and-Excitation gate). Reuses landed layers end-to-end — grouped conv
+      (`AddGroupedConvolution`), pointwise convs, the SE block and the ResNet-style
+      identity residual — so the importer is mostly config-driven block-width/depth
+      wiring (`widths`/`depths`/`group_width` per stage) plus the BN-fold the landed
+      ResNet importer already does. Pico fixture + `TestRegNetLogitParity` < 1e-4 vs
+      a float64 HF `RegNetForImageClassification`. Real value: a classic, widely
+      used CV backbone family distinct from the landed ResNet and EfficientNet
+      importers (RegNet's grouped-bottleneck design space sits between them), giving
+      another drop-in ImageNet feature extractor for the landed eval harness.
 
 ## Layer follow-ups that fix real limitations
 
@@ -1609,6 +1638,21 @@ rather than acted on.
         the shape — `tools/torch_rnn_tiny_fixture.py`). Unblocks the pyannote
         `segmentation-3.0` real bidirectional-LSTM trunk drop-in.
 
+- [ ] OpenCL forward offload for the Winograd F(2x2,3x3) fast-conv `M`-stage in
+      `TNNetConvolution` (`EnableWinograd` path). The opt-in Winograd forward
+      (`ComputeWinogradCPU`) is CPU-only today; its dominant cost is the per-tile
+      batched GEMM `M[p,tile,o] = Σ_c U[p,o,c]·V[p,tile,c]` — 16 independent
+      `(NumNeurons × NumTiles)`-over-`InputDepth` matmuls (one per 4x4 tile
+      position `p`), which is exactly the shape the existing `cai_dot_product`
+      kernel already offloads for the direct im2col conv. Wire a `ComputeOpenCL`
+      that uploads the cached transformed kernels `FWinogradKernels` (rebuilt only
+      on `AfterWeightUpdate`, so it stays resident) and per-pass transformed inputs
+      `FWinogradInput`, runs the 16 GEMMs on device, and keeps the cheap input/
+      output 4x4 transforms (`BᵀdB`, `AᵀmA`) on CPU. Gate behind `FShouldOpenCL`
+      with a `WinogradOpenCLParity` exact-vs-CPU test (reuse the `SDPAOpenCLParity`
+      harness style). Real value: Winograd already cuts the 3x3 stride-1 conv MACs
+      ~2.25x on CPU; offloading the GEMM stage stacks that with GPU throughput for
+      the dominant conv in every CV backbone/diffusion UNet, with no new kernel.
 - [ ] OpenCL forward offload for `TNNetCausalLinearAttention` (the non-causal global
       `TNNetLinearAttention` is now DONE — `ComputeOpenCL` two-GEMM offload behind
       `FShouldOpenCL` + `LinearAttentionOpenCLParity` exact-vs-CPU test, PoCL-verified
