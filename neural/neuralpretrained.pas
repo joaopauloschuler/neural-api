@@ -9573,7 +9573,14 @@ type
     UpHasAttn: array[0..7] of boolean;        // CrossAttnUpBlock2D? per up
     LayersPerBlock: integer;                  // resnets per down block
     CrossAttentionDim: integer;               // text encoder width (768)
-    NumHeads: integer;                        // attention heads (per layer)
+    NumHeads: integer;                        // attention heads (block-0 value;
+                                              // kept for back-compat + ToString)
+    HeadsPerBlock: array[0..7] of integer;    // attention heads PER resolution
+                                              // block. SD1.5 = constant (all
+                                              // NumHeads); SDXL etc. supply a
+                                              // per-block attention_head_dim list
+                                              // so heads vary: heads[b] =
+                                              // BlockOutChannels[b] / dim[b].
     NormNumGroups: integer;                   // GroupNorm groups (32)
     LatentGrid: integer;                      // latent H=W for the Input
     TextSeqLen: integer;                      // encoder_hidden_states length
@@ -61409,24 +61416,68 @@ begin
     Result.NormNumGroups := Obj.Get('norm_num_groups', 32);
     Result.TimeEmbedDim := 4 * Result.BlockOutChannels[0];
     Result.TextSeqLen := Obj.Get('text_seq_len', Obj.Get('max_position_embeddings', 77));
-    // attention_head_dim: SD interprets this so heads is FIXED per block;
-    // diffusers num_heads = channels div attention_head_dim is NOT how SD1.5
-    // behaves (it uses 8 heads everywhere). We treat the field as the per-head
-    // DIM only when it divides every block width and yields a consistent head
-    // count; the pico fixture pins a clean value. heads[block] = C[block]/dim.
-    AttnHeadDim := Obj.Get('attention_head_dim', 8);
-    if AttnHeadDim < 1 then
-      ImportError('SD UNet import: attention_head_dim must be >= 1.');
-    // Derive a single NumHeads from the FIRST attended block (the importer
-    // builds each Transformer2D with C/AttnHeadDim heads via NumHeads recompute
-    // below; for the common SD configs NumHeads is constant). Store the per-head
-    // dim in NumHeads-as-divisor form: we keep NumHeads = BlockOut[0]/dim.
-    if (Result.BlockOutChannels[0] mod AttnHeadDim) <> 0 then
-      ImportError('SD UNet import: block_out_channels[0]=' +
-        IntToStr(Result.BlockOutChannels[0]) + ' not divisible by ' +
-        'attention_head_dim=' + IntToStr(AttnHeadDim) + '.');
-    Result.NumHeads := Result.BlockOutChannels[0] div AttnHeadDim;
-    if Result.NumHeads < 1 then Result.NumHeads := 1;
+    // attention_head_dim: HF/diffusers semantics -- this is the per-head channel
+    // DIM, and a block's num_heads = (that block's channel width) / its head dim.
+    // It is EITHER a scalar (one head dim for every resolution; SD1.5 uses 8,
+    // which over block_out_channels [320,640,1280,1280] yields a CONSTANT 8 heads
+    // everywhere -- the historical "8 heads" SD case) OR a LIST (one head dim per
+    // block; SDXL-style, e.g. [5,10,20] over [320,640,1280] -> 64 channels/head
+    // and 5/10/20 heads). We parse both into the per-block HeadsPerBlock array.
+    //   heads[block] = BlockOutChannels[block] div dim[block].
+    // NOTE: newer diffusers configs sometimes also carry a confusingly-named
+    // "num_attention_heads" field (the ACTUAL head COUNT, not a dim). This
+    // importer keys on attention_head_dim ONLY (consistent with the original
+    // C/dim derivation and every committed SD fixture); num_attention_heads is
+    // intentionally NOT read here. If a checkpoint relies on it the import will
+    // surface a head-count mismatch rather than silently misbehave.
+    ArrData := Obj.Find('attention_head_dim');
+    if (ArrData <> nil) and (ArrData is TJSONArray) then
+    begin
+      // per-block head-dim list (SDXL etc.): one entry per resolution block.
+      Arr := TJSONArray(ArrData);
+      if Arr.Count <> Result.NumBlockOut then
+        ImportError('SD UNet import: "attention_head_dim" list must have ' +
+          IntToStr(Result.NumBlockOut) + ' entries (one per block), got ' +
+          IntToStr(Arr.Count) + '.');
+      for i := 0 to LpMax do
+      begin
+        AttnHeadDim := Arr.Integers[i];
+        if AttnHeadDim < 1 then
+          ImportError('SD UNet import: attention_head_dim[' + IntToStr(i) +
+            '] must be >= 1.');
+        if (Result.BlockOutChannels[i] mod AttnHeadDim) <> 0 then
+          ImportError('SD UNet import: block_out_channels[' + IntToStr(i) + ']=' +
+            IntToStr(Result.BlockOutChannels[i]) + ' not divisible by ' +
+            'attention_head_dim[' + IntToStr(i) + ']=' + IntToStr(AttnHeadDim) + '.');
+        Result.HeadsPerBlock[i] := Result.BlockOutChannels[i] div AttnHeadDim;
+        if Result.HeadsPerBlock[i] < 1 then Result.HeadsPerBlock[i] := 1;
+      end;
+    end
+    else
+    begin
+      // scalar head dim: SD1.5/2.x interpret this as a CONSTANT head count across
+      // every block (the historical "8 heads everywhere" case). This is NOT the
+      // HF C[i]/dim-per-block rule -- a scalar attention_head_dim in these configs
+      // is the BLOCK-0 head dim only, and SD reuses that head COUNT verbatim for
+      // all resolutions (head DIM then grows with channel width). We preserve that
+      // exactly: heads = BlockOut[0] div dim for every block (BIT-IDENTICAL to the
+      // pre-per-block importer). Only the LIST form (above) yields varying heads.
+      AttnHeadDim := Obj.Get('attention_head_dim', 8);
+      if AttnHeadDim < 1 then
+        ImportError('SD UNet import: attention_head_dim must be >= 1.');
+      if (Result.BlockOutChannels[0] mod AttnHeadDim) <> 0 then
+        ImportError('SD UNet import: block_out_channels[0]=' +
+          IntToStr(Result.BlockOutChannels[0]) + ' not divisible by ' +
+          'attention_head_dim=' + IntToStr(AttnHeadDim) + '.');
+      for i := 0 to LpMax do
+      begin
+        Result.HeadsPerBlock[i] := Result.BlockOutChannels[0] div AttnHeadDim;
+        if Result.HeadsPerBlock[i] < 1 then Result.HeadsPerBlock[i] := 1;
+      end;
+    end;
+    // NumHeads kept as the block-0 value for back-compat (ToString, the >=1
+    // build-time guard). Per-block builders now read HeadsPerBlock directly.
+    Result.NumHeads := Result.HeadsPerBlock[0];
     // Latent grid: pico fixture pins it via "latent_size"; a real config gives
     // "sample_size" (the latent spatial size for the UNet, already in latent
     // space, so latent_grid = sample_size directly).
@@ -61524,7 +61575,16 @@ begin
     ', in/out=' + IntToStr(Config.InChannels) + '/' +
     IntToStr(Config.OutChannels) +
     ', cross_dim=' + IntToStr(Config.CrossAttentionDim) +
-    ', heads=' + IntToStr(Config.NumHeads) +
+    ', heads=' + IntToStr(Config.NumHeads);
+  // per-block heads (SDXL etc. vary; SD1.5 is constant). Show the array so a
+  // varying head count is visible in diagnostics.
+  Result := Result + ', heads_per_block=[';
+  for i := 0 to NumBlockOutM1 do
+  begin
+    if i > 0 then Result := Result + ',';
+    Result := Result + IntToStr(Config.HeadsPerBlock[i]);
+  end;
+  Result := Result + ']' +
     ', groups=' + IntToStr(Config.NormNumGroups) +
     ', latent_grid=' + IntToStr(Config.LatentGrid) +
     ', text_seq=' + IntToStr(Config.TextSeqLen);
@@ -61650,19 +61710,19 @@ end;
 // [O,I,1,1]), which is purely a loader concern (see LoadSDTransformer2D).
 // Coded by Claude (AI).
 procedure AddSDTransformer2D(NN: TNNet; const Config: TSDUNetConfig;
-  TextStates, Input: TNNetLayer; Channels, Depth: integer; pTrainable: boolean;
-  out Refs: TSDAttnLayers);
+  TextStates, Input: TNNetLayer; Channels, Depth, Heads: integer;
+  pTrainable: boolean; out Refs: TSDAttnLayers);
 var
   ResidualIn, Tokens, X1, X2, X3, CrossOut: TNNetLayer;
   KSlice, VSlice, QSlice, KVPack, KProjFull, VProjFull, QProjFull: TNNetLayer;
   HeadOutputs: array of TNNetLayer;
   QChannels: array of integer;
-  H, W, HeadDim, Heads, hh, dd, Inner, HeadsM1, HeadDimM1, blk: integer;
+  H, W, HeadDim, hh, dd, Inner, HeadsM1, HeadDimM1, blk: integer;
 begin
   ResidualIn := Input;
   H := ResidualIn.Output.SizeY;
   W := ResidualIn.Output.SizeX;
-  Heads := Config.NumHeads;
+  if Heads < 1 then Heads := 1;
   HeadDim := Channels div Heads;
   HeadsM1 := Heads - 1;
   HeadDimM1 := HeadDim - 1;
@@ -61965,7 +62025,8 @@ begin
         if Config.DownHasAttn[i] then
         begin
           AddSDTransformer2D(NN, Config, TextInput, HLayer, OutCh,
-            Config.TransformerLayersPerBlock[i], pTrainable, DownAttn[i][j]);
+            Config.TransformerLayersPerBlock[i], Config.HeadsPerBlock[i],
+            pTrainable, DownAttn[i][j]);
           HLayer := NN.GetLastLayer();
         end;
         Skips[SkipTop] := SDUNetSpliceControlSkip(NN, HLayer, CurGrid, OutCh,
@@ -61999,7 +62060,8 @@ begin
       MidRes1);
     HLayer := NN.GetLastLayer();
     AddSDTransformer2D(NN, Config, TextInput, HLayer, MidCh,
-      Config.TransformerLayersPerBlock[nM1], pTrainable, MidAttn);
+      Config.TransformerLayersPerBlock[nM1], Config.HeadsPerBlock[nM1],
+      pTrainable, MidAttn);
     HLayer := NN.GetLastLayer();
     AddSDResnetBlock(NN, Config, TimeCond, HLayer, MidCh, MidCh, pTrainable,
       MidRes2);
@@ -62036,7 +62098,8 @@ begin
         if Config.UpHasAttn[i] then
         begin
           AddSDTransformer2D(NN, Config, TextInput, HLayer, OutCh,
-            Config.TransformerLayersPerBlock[RevIdx], pTrainable, UpAttn[i][j]);
+            Config.TransformerLayersPerBlock[RevIdx], Config.HeadsPerBlock[RevIdx],
+            pTrainable, UpAttn[i][j]);
           HLayer := NN.GetLastLayer();
         end;
       end;
@@ -62722,7 +62785,8 @@ begin
         if Cfg.DownHasAttn[i] then
         begin
           AddSDTransformer2D(NN, Cfg, TextInput, HLayer, OutCh,
-            Cfg.TransformerLayersPerBlock[i], pTrainable, DownAttn[i][j]);
+            Cfg.TransformerLayersPerBlock[i], Cfg.HeadsPerBlock[i],
+            pTrainable, DownAttn[i][j]);
           HLayer := NN.GetLastLayer();
         end;
         Skips[SkipTop] := HLayer; SkipCh[SkipTop] := OutCh; Inc(SkipTop);
@@ -62745,7 +62809,8 @@ begin
     AddSDResnetBlock(NN, Cfg, TimeCond, HLayer, MidCh, MidCh, pTrainable, MidRes1);
     HLayer := NN.GetLastLayer();
     AddSDTransformer2D(NN, Cfg, TextInput, HLayer, MidCh,
-      Cfg.TransformerLayersPerBlock[nM1], pTrainable, MidAttn);
+      Cfg.TransformerLayersPerBlock[nM1], Cfg.HeadsPerBlock[nM1],
+      pTrainable, MidAttn);
     HLayer := NN.GetLastLayer();
     AddSDResnetBlock(NN, Cfg, TimeCond, HLayer, MidCh, MidCh, pTrainable, MidRes2);
     HLayer := NN.GetLastLayer();

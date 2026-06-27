@@ -398,13 +398,19 @@ rather than acted on.
         installable; SDXL VAE uses different group counts / multi-head attention.
   - [ ] SD UNet importer LANDED (BuildSDUNetFromSafeTensors[Ex] + SDUNetDenoise,
         UNet2DConditionModel v1; TestSDUNetParity 2.75e-6 < 1e-4). Open follow-ups:
-    - [ ] real-checkpoint parity (runwayml/stable-diffusion-v1-5 unet) once
-          diffusers is installable; verify the SD attention_head_dim->num_heads
-          interpretation on the real config (the importer derives NumHeads =
-          block_out_channels[0]/attention_head_dim and assumes a constant head
-          count across blocks — SD1.5's 8-heads-everywhere case holds, but SDXL /
-          configs with a per-block attention_head_dim list need a per-block heads
-          array wired through TSDUNetConfig).
+    - [X] per-block heads array wired through TSDUNetConfig: attention_head_dim
+          may now be a LIST (one per-head DIM per block; SDXL-style) -> heads[b]
+          = block_out_channels[b]/dim[b], threaded into each down/mid/up
+          Transformer2D via Config.HeadsPerBlock (AddSDTransformer2D takes a Heads
+          arg). Scalar attention_head_dim keeps the historical CONSTANT-heads
+          (BlockOut[0]/dim everywhere) semantics BIT-IDENTICALLY. New pico fixture
+          tools/sd_unet_perblock_heads_tiny_fixture.py (heads=[4,2], both blocks
+          attended) + TestSDUNetPerBlockHeadsParity matches the numpy float64
+          oracle < 1e-4. NOTE: num_attention_heads (the confusingly-named explicit
+          head COUNT in newer configs) is intentionally NOT read; importer keys on
+          attention_head_dim only. STILL DEFERRED: real-checkpoint parity
+          (runwayml/stable-diffusion-v1-5 / SDXL unet) once diffusers is
+          installable.
     - [ ] the end-to-end LatentTextToImage capstone (CLIP text -> this UNet ->
           scheduler loop -> VAE decoder), incl. the SDXL dual-text-encoder pooled
           embedding + real-checkpoint parity.

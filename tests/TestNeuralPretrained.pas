@@ -538,6 +538,7 @@ type
     procedure TestSDUNetParity;
     procedure TestSDUNetLinearProjParity;
     procedure TestSDUNetSDXLParity;
+    procedure TestSDUNetPerBlockHeadsParity;
     procedure TestDiffusionInpaintSmoke;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
@@ -21582,6 +21583,109 @@ begin
     LatentInput.Free;
     EncStates.Free;
     PooledText.Free;
+    Noise.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Per-block attention-head parity: the diffusers config "attention_head_dim" is
+// a LIST (one per-head DIM per resolution block; SDXL-style) so the head COUNT
+// varies per block. The pico fixture (tools/sd_unet_perblock_heads_tiny_fixture)
+// has block_out_channels=[8,16] with attention_head_dim=[2,8] -> heads=[4,2], and
+// attends BOTH down blocks AND both up blocks so the differing per-block head
+// count is exercised on the down/mid/up paths. Verifies the list parses into
+// HeadsPerBlock (differing values), the net builds, and SDUNetDenoise's predicted
+// noise matches the numpy float64 oracle end-to-end (< 1e-4).
+procedure TTestNeuralPretrained.TestSDUNetPerBlockHeadsParity;
+var
+  NN: TNNet;
+  Config: TSDUNetConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Latent, ChanArr, RowArr, NoiseArr, EncArr, EncRow: TJSONArray;
+  LatentInput, EncStates, Noise: TNNetVolume;
+  t: double;
+  Grid, ChanCnt, YCnt, XCnt, SCnt, DCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildSDUNetFromSafeTensors(
+    FixturePath('tiny_sd_unet_pbheads.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_sd_unet_pbheads_config.json'));
+  RefJson := TStringList.Create;
+  LatentInput := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    // attention_head_dim parsed as a LIST -> differing per-block head counts.
+    AssertEquals('heads_per_block[0]', 4, Config.HeadsPerBlock[0]);
+    AssertEquals('heads_per_block[1]', 2, Config.HeadsPerBlock[1]);
+    AssertTrue('per-block head counts must DIFFER',
+      Config.HeadsPerBlock[0] <> Config.HeadsPerBlock[1]);
+    // NumHeads stays the block-0 value for back-compat.
+    AssertEquals('NumHeads back-compat = block 0', 4, Config.NumHeads);
+    Grid := Config.LatentGrid;
+    AssertEquals('latent grid', Grid, NN.Layers[0].Output.SizeX);
+    RefJson.LoadFromFile(FixturePath('tiny_sd_unet_pbheads_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Latent := TJSONArray(TJSONObject(RefRoot).Find('latent'));
+    NoiseArr := TJSONArray(TJSONObject(RefRoot).Find('noise'));
+    EncArr := TJSONArray(TJSONObject(RefRoot).Find('encoder_hidden_states'));
+    t := TJSONObject(RefRoot).Get('timestep', 0.0);
+    AssertTrue('latent present', Latent <> nil);
+    AssertEquals('output grid', Grid, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output channels', Config.OutChannels,
+      NN.GetLastLayer().Output.Depth);
+
+    LatentInput.ReSize(Grid, Grid, Config.InChannels);
+    for ChanCnt := 0 to Config.InChannels - 1 do
+    begin
+      RowArr := TJSONArray(Latent.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+          LatentInput.FData[(YCnt * Grid + XCnt) * Config.InChannels + ChanCnt]
+            := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    EncStates.ReSize(Config.TextSeqLen, 1, Config.CrossAttentionDim);
+    for SCnt := 0 to Config.TextSeqLen - 1 do
+    begin
+      EncRow := TJSONArray(EncArr.Items[SCnt]);
+      for DCnt := 0 to Config.CrossAttentionDim - 1 do
+        EncStates.FData[SCnt * Config.CrossAttentionDim + DCnt] :=
+          EncRow.Items[DCnt].AsFloat;
+    end;
+
+    SDUNetDenoise(NN, Config, LatentInput, EncStates, t, Noise);
+
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.OutChannels - 1 do
+    begin
+      RowArr := TJSONArray(NoiseArr.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+        begin
+          RefVal := ChanArr.Items[XCnt].AsFloat;
+          GotVal := Noise.FData[(YCnt * Grid + XCnt) * Config.OutChannels +
+            ChanCnt];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('predicted noise: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    LatentInput.Free;
+    EncStates.Free;
     Noise.Free;
     RefJson.Free;
     NN.Free;
