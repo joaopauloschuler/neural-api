@@ -1793,7 +1793,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       so the before/after fit is comparable. Removes a duplicated
       implementation of math the library already owns and exercises the real
       layer end-to-end in an example.
-- [ ] Refactor `examples/HopfieldRetrieval` to use the real modern-Hopfield
+- [X] Refactor `examples/HopfieldRetrieval` to use the real modern-Hopfield
       retrieval path (`AddModernHopfieldRetrieval` / `TNNetModernHopfield`, or
       `TNNetScaledDotProductAttention` for the single-step `softmax(beta·X·q)·X`
       update) instead of the hand-coded `HopfieldStep` procedure. The example
