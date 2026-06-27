@@ -3640,6 +3640,21 @@ type
   private
     FFlowLayer: TNNetLayer; // dense (dx, dy) flow source
     FRadius, FW, FH: integer;
+    {$IFDEF OpenCL}
+    // OpenCL forward offload of the per-output-element bilinear window sampling
+    // onto the shared cai_bilinear_gather kernel (one work-item per output
+    // element (i, k)). The exact floor / zero-pad / blend-weight geometry is
+    // computed bit-identically on the CPU; the kernel only does the masked
+    // 4-tap blend. Each output element samples a SCALAR from the correlation
+    // volume Vol, so the gather runs with Depth=1 and the 4 "corners" are the
+    // full flat indices into Vol.FData of the 4 bilinear neighbours (or -1 for
+    // an out-of-range / zero-pad tap, which the kernel skips). The work-item
+    // order IS the native output raster, so the device result Moves straight
+    // into FOutput.
+    FGatherCL: TNNetBilinearGatherCL;
+    FCornerBuf, FWeightBuf, FDstFlat: TNNetVolume;
+    procedure ComputeOpenCL();
+    {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(pRadius: integer; FlowSource: TNNetLayer); overload;
@@ -3647,6 +3662,11 @@ type
     function SaveStructureToString(): string; override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
+    {$IFDEF OpenCL}
+    // Allocates the shared bilinear-gather kernel plus the corner/weight/result
+    // staging buffers, then flags this layer to offload its forward sampling.
+    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    {$ENDIF}
     property Radius: integer read FRadius;
     property FlowSource: TNNetLayer read FFlowLayer;
   end;
@@ -29351,6 +29371,12 @@ end;
 
 destructor TNNetCorrelationLookup.Destroy();
 begin
+  {$IFDEF OpenCL}
+  if Assigned(FGatherCL)  then FreeAndNil(FGatherCL);
+  if Assigned(FCornerBuf) then FreeAndNil(FCornerBuf);
+  if Assigned(FWeightBuf) then FreeAndNil(FWeightBuf);
+  if Assigned(FDstFlat)   then FreeAndNil(FDstFlat);
+  {$ENDIF}
   inherited Destroy();
 end;
 
@@ -29398,6 +29424,18 @@ var
 
 begin
   StartTime := Now();
+  {$IFDEF OpenCL}
+  // The whole (W*H*(2r+1)^2) window sampling is embarrassingly parallel: one
+  // bilinear scalar lookup per output element. Offload to the shared gather
+  // kernel once the output is large enough to amortise the launch + upload.
+  if FHasOpenCL and FShouldOpenCL and Assigned(FGatherCL) and
+     (Int64(FW) * FH * FOutput.Depth >= NeuralConvOpenCLMinWork) then
+  begin
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  {$ENDIF}
   Vol := FPrevLayer.FOutput;
   Flow := FFlowLayer.FOutput;
   FHM1 := FH - 1; FWM1 := FW - 1;
@@ -29433,6 +29471,92 @@ begin
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
+
+{$IFDEF OpenCL}
+procedure TNNetCorrelationLookup.EnableOpenCL(
+  DotProductKernel: TDotProductKernel);
+begin
+  FHasOpenCL := true;
+  FDotProductKernel := DotProductKernel;
+  if not Assigned(FGatherCL) then
+    FGatherCL := TNNetBilinearGatherCL.Create(DotProductKernel);
+  if not Assigned(FCornerBuf) then FCornerBuf := TNNetVolume.Create();
+  if not Assigned(FWeightBuf) then FWeightBuf := TNNetVolume.Create();
+  if not Assigned(FDstFlat)   then FDstFlat   := TNNetVolume.Create();
+  FShouldOpenCL := true;
+end;
+
+// Device per-output-element bilinear window sampling. The exact grid_sample
+// geometry (align_corners identity round-trip, floor, zero-pad mask) is
+// computed on the CPU bit-identically to Compute(); the kernel only does the
+// masked 4-tap blend. Because each output element reads a SCALAR from the
+// correlation volume, the gather runs with Depth=1 and each "corner" is the
+// FULL flat index into Vol.FData = ((iy*W+ix)*VolDepth + tgty*W+tgtx) of the
+// neighbour (or -1 for an out-of-range / zero-pad tap). The work-item index IS
+// the native output raster index ((iy*W+ix)*OutDepth + k), so FDstFlat Moves
+// straight into FOutput. Coded by Claude (AI).
+procedure TNNetCorrelationLookup.ComputeOpenCL();
+var
+  Vol, Flow: TNNetVolume;
+  ix, iy, dxoff, dyoff, k, cb, outidx: integer;
+  FHM1, FWM1, OutDepth, NumOut, VolDepth, RowBase: integer;
+  TwoRp1: integer;
+  x0, y0, x1, y1: integer;
+  gx, gy, nx, ny, sgx, sgy, fx, fy: TNeuralFloat;
+  inX0, inX1, inY0, inY1: boolean;
+begin
+  Vol := FPrevLayer.FOutput;
+  Flow := FFlowLayer.FOutput;
+  FHM1 := FH - 1; FWM1 := FW - 1;
+  OutDepth := FOutput.Depth;
+  TwoRp1 := 2 * FRadius + 1;
+  VolDepth := Vol.Depth; // = FW * FH
+  NumOut := FW * FH * OutDepth;
+  FCornerBuf.ReSize(NumOut * 4, 1, 1);
+  FWeightBuf.ReSize(NumOut * 4, 1, 1);
+  FDstFlat.ReSize(NumOut, 1, 1);
+  for iy := 0 to FHM1 do
+  for ix := 0 to FWM1 do
+  begin
+    // Source pixel i contributes one Vol "row" of VolDepth correlations.
+    RowBase := (iy * FW + ix) * VolDepth;
+    for dyoff := -FRadius to FRadius do
+    for dxoff := -FRadius to FRadius do
+    begin
+      k := (dyoff + FRadius) * TwoRp1 + (dxoff + FRadius);
+      // Identical grid geometry to the scalar Compute().
+      gx := ix + Flow.Get(ix, iy, 0) + dxoff;
+      gy := iy + Flow.Get(ix, iy, 1) + dyoff;
+      if FW > 1 then nx := 2.0 * gx / (FW - 1) - 1.0 else nx := 0;
+      if FH > 1 then ny := 2.0 * gy / (FH - 1) - 1.0 else ny := 0;
+      if FW > 1 then sgx := (nx + 1.0) * (FW - 1) / 2.0 else sgx := 0;
+      if FH > 1 then sgy := (ny + 1.0) * (FH - 1) / 2.0 else sgy := 0;
+      x0 := Floor(sgx); y0 := Floor(sgy);
+      x1 := x0 + 1;     y1 := y0 + 1;
+      fx := sgx - x0;   fy := sgy - y0;
+      outidx := (iy * FW + ix) * OutDepth + k;
+      cb := outidx * 4;
+      FWeightBuf.FData[cb + 0] := (1 - fx) * (1 - fy);
+      FWeightBuf.FData[cb + 1] := fx * (1 - fy);
+      FWeightBuf.FData[cb + 2] := (1 - fx) * fy;
+      FWeightBuf.FData[cb + 3] := fx * fy;
+      inX0 := (x0 >= 0) and (x0 < FW);
+      inX1 := (x1 >= 0) and (x1 < FW);
+      inY0 := (y0 >= 0) and (y0 < FH);
+      inY1 := (y1 >= 0) and (y1 < FH);
+      // Each in-bounds tap reads Vol(ix,iy, tgty*W+tgtx); the flat scalar index
+      // is RowBase + tgty*W + tgtx. Masked taps -> -1 (kernel emits 0).
+      if inX0 and inY0 then FCornerBuf.FData[cb + 0] := RowBase + y0 * FW + x0 else FCornerBuf.FData[cb + 0] := -1;
+      if inX1 and inY0 then FCornerBuf.FData[cb + 1] := RowBase + y0 * FW + x1 else FCornerBuf.FData[cb + 1] := -1;
+      if inX0 and inY1 then FCornerBuf.FData[cb + 2] := RowBase + y1 * FW + x0 else FCornerBuf.FData[cb + 2] := -1;
+      if inX1 and inY1 then FCornerBuf.FData[cb + 3] := RowBase + y1 * FW + x1 else FCornerBuf.FData[cb + 3] := -1;
+    end;
+  end;
+  // Depth=1 scalar gather: FSrc = Vol raster flat, FDst[outidx] = blended scalar.
+  FGatherCL.Gather(Vol, FCornerBuf, FWeightBuf, FDstFlat, NumOut, 1);
+  Move(FDstFlat.FData[0], FOutput.FData[0], NumOut * SizeOf(TNeuralFloat));
+end;
+{$ENDIF}
 
 procedure TNNetCorrelationLookup.Backpropagate();
 begin

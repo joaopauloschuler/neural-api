@@ -315,6 +315,9 @@ type
     // OpenCL all-pairs correlation GEMM forward offload parity (vs CPU/AVX) for
     // TNNetCorrelationVolume (RAFT).
     procedure CorrelationVolumeOpenCLParity;
+    // OpenCL per-output-element bilinear window-sampling forward offload parity
+    // (vs CPU) for TNNetCorrelationLookup (RAFT local lookup).
+    procedure CorrelationLookupOpenCLParity;
     // OpenCL Winograd F(2x2,3x3) M-stage forward offload parity (vs CPU Winograd).
     procedure WinogradOpenCLParity;
     procedure TestRoIAlignForward;
@@ -59563,6 +59566,98 @@ begin
     OutCPU.Free;
     F2Data.Free;
     F1Data.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetCorrelationLookup (RAFT local lookup) samples, for every source pixel i,
+// the (2r+1)^2 bilinear window of the all-pairs correlation volume around i's
+// current flow estimate -- one bilinear SCALAR lookup per output element.
+// ComputeOpenCL maps the whole (W*H*(2r+1)^2) sampling onto the shared
+// cai_bilinear_gather kernel (Depth=1, the 4 "corners" are full flat indices
+// into the correlation volume, masked taps -> -1) with the exact floor / zero-
+// pad / blend-weight geometry computed bit-identically on the CPU. This pins
+// the device forward bit-close to the CPU forward on a fixed bounded fixture;
+// the only divergence is FP32 blend order, so a tight 1e-4 gate (PoCL CPU-
+// backed -> typically ~1e-6). SetNeuralConvOpenCLMinWork(0) forces the device
+// path on the small fixture (and asserts ShouldOpenCL) so it is provably
+// exercised, not a silent CPU fallback.
+procedure TTestNeuralNumerical.CorrelationLookupOpenCLParity;
+{$IFDEF OpenCL}
+const
+  W = 5; H = 4; R = 2; // out depth = (2R+1)^2 = 25; vol depth = W*H = 20
+var
+  NN: TNNet;
+  VolData, FlowData, OutCPU: TNNetVolume;
+  VolIn, FlowIn: TNNetLayer;
+  Lookup: TNNetCorrelationLookup;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+  SavedMinWork: int64;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  VolData := TNNetVolume.Create(W, H, W * H); // correlation volume (W,H,H*W)
+  FlowData := TNNetVolume.Create(W, H, 2);    // dense (dx, dy) flow field
+  OutCPU := TNNetVolume.Create();
+  SavedMinWork := NeuralConvOpenCLMinWorkValue();
+  try
+    VolIn := NN.AddLayer(TNNetInput.Create(W, H, W * H, 1)); // volume (PrevLayer)
+    FlowIn := NN.AddLayerAfter(TNNetInput.Create(W, H, 2, 1), 0); // flow (2nd src)
+    Lookup := TNNetCorrelationLookup.Create(R, FlowIn);
+    NN.AddLayerAfter(Lookup, VolIn); // re-point Lookup's prev to the volume
+
+    // Bounded correlation volume so the blended values stay O(1).
+    for i := 0 to VolData.Size - 1 do
+      VolData.Raw[i] := 0.5 * Sin(i * 0.3) + 0.2 * Cos(i * 0.11);
+    // Sub-pixel flow that lands some windows partly off-grid, exercising the
+    // bilinear blend AND the zero-pad mask (-1 corners) in both paths.
+    for i := 0 to FlowData.Size - 1 do
+      FlowData.Raw[i] := 0.7 * Sin(i * 0.9) - 0.4;
+
+    // Force the device path on this small fixture (default threshold is 1M MACs).
+    SetNeuralConvOpenCLMinWork(0);
+
+    // CPU forward (OpenCL OFF).
+    VolIn.Output.Copy(VolData);
+    FlowIn.Output.Copy(FlowData);
+    NN.Compute(VolIn.Output);
+    OutCPU.Copy(Lookup.Output);
+
+    // Device forward (window sampling offloaded to cai_bilinear_gather).
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    AssertTrue('CorrelationLookup OpenCL armed', Lookup.ShouldOpenCL);
+    VolIn.Output.Copy(VolData);
+    FlowIn.Output.Copy(FlowData);
+    NN.Compute(VolIn.Output);
+
+    AssertEquals('output size match', OutCPU.Size, Lookup.Output.Size);
+    MaxDiff := 0;
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - Lookup.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  CorrelationLookup OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('CorrelationLookup OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    SetNeuralConvOpenCLMinWork(SavedMinWork);
+    OutCPU.Free;
+    FlowData.Free;
+    VolData.Free;
     NN.Free;
   end;
 end;
