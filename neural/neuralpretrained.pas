@@ -41406,12 +41406,30 @@ begin
   Result := Length(FCodebooks);
 end;
 
+// Single source of truth for the Snake scalar formula used by the codec
+// holders. Snake(x) = x + (1/(alpha+eps)) * sin(alpha*x)^2 with the HF DAC
+// per-channel epsilon guard (alpha can be ~0 for a learnable per-channel
+// parameter). This is the same math as the in-tree TNNetSnake layer
+// (neuralnetwork.pas) modulo: (1) per-channel rather than scalar alpha,
+// (2) the +eps guard (the layer rejects alpha=0 instead), and (3) double
+// precision (the codec round-trip is pinned at <1e-4, so we keep the
+// reference double math rather than routing through the single-precision
+// layer). InvAlpha is precomputed once per channel by the caller.
+function SnakeScalar(const x, Alpha, InvAlpha: double): double; {$IFDEF FPC} inline; {$ENDIF}
+var
+  sx: double;
+begin
+  sx := Sin(Alpha * x);
+  Result := x + InvAlpha * sx * sx;
+end;
+
 // Snake(x) = x + (1/(alpha+1e-9)) * sin(alpha*x)^2, per-channel alpha.
 procedure TNNetDAC.RunSnake(const Alpha: TNeuralFloatDynArr;
   var Sig: TMimiDblArr2D);
 var
   c, t, ChM1, TM1: integer;
-  a, inv, sx, x: double;
+  a, inv: double;
+  Row: TMimiDblArr;
 begin
   ChM1 := Length(Sig) - 1;
   if ChM1 < 0 then Exit;
@@ -41420,12 +41438,9 @@ begin
   begin
     a := Alpha[c];
     inv := 1.0 / (a + 1e-9);
+    Row := Sig[c];
     for t := 0 to TM1 do
-    begin
-      x := Sig[c][t];
-      sx := Sin(a * x);
-      Sig[c][t] := x + inv * sx * sx;
-    end;
+      Row[t] := SnakeScalar(Row[t], a, inv);
   end;
 end;
 
@@ -44734,6 +44749,16 @@ end;
 
 // AdaIN1d: gamma * InstanceNorm_ch(x) + beta, [gamma; beta] = fc(s).
 // InstanceNorm normalizes EACH channel across time (population variance).
+// StyleTTS2 / Kokoro AdaIN1d. NOTE: this is a DIFFERENT operator from the
+// in-tree TNNetAdaIN layer (neuralnetwork.pas), which implements the Huang &
+// Belongie style-transfer AdaIN where the affine (gamma,beta) are the per-
+// channel mean/std STATISTICS of a second style feature map. Here gamma,beta
+// are produced by a learned FC layer applied to the style vector S
+// (gamma=FcB[c]+FcW[c].S, beta=FcB[H+c]+FcW[H+c].S). Only the instance-
+// normalization core (per-channel mean/std over time, then affine) is shared;
+// the conditioning is incompatible, so this path cannot route through
+// TNNetAdaIN without changing results. Kept as a holder method to preserve
+// codec/TTS parity (<1e-4).
 procedure TNNetKokoro.RunAdaIN(const AdaIN: TKokoroAdaIN;
   const S: TNeuralFloatDynArr; var Sig: TNNetFloatDynArr2D);
 var
