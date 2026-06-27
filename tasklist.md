@@ -224,6 +224,24 @@ rather than acted on.
 
 ### Computer vision & generative models
 
+- [ ] mixup + CutMix batch-level augmentation (Zhang et al. 2018 / Yun et al.
+      2019, the timm/torchvision training staple). The landed augmentation stack
+      (NeuralRandAugment / TrivialAugment, TNeuralAugPolicy in neuraldatasets.pas)
+      is SINGLE-IMAGE only — it never mixes two examples or touches the label.
+      mixup/CutMix are pairwise and label-mixing: mixup draws lambda~Beta(a,a) and
+      blends two images `lam*x_i + (1-lam)*x_j` with the SAME convex blend of their
+      one-hot targets; CutMix instead pastes a rectangular patch of x_j into x_i and
+      sets lam to the un-pasted area fraction, blending labels by that area. Both
+      need a soft (non-one-hot) target, so they cannot ride the existing per-image
+      hook — wire a batch-level opt-in in TNeuralImageFit that, after the per-image
+      policy runs, optionally pairs samples within the mini-batch and rewrites both
+      the image volume and the (now soft) target volume before the forward pass.
+      Reuse TVolume.FlipX-style raw-pointer blends for the convex mix and a single
+      rectangular Move loop for the patch paste. Validate: a CIFAR-10 SimpleImage
+      run with mixup converges and the soft targets sum to 1 per row; assert lam=1
+      reduces exactly to the unaugmented batch. Plays with the existing
+      LabelSmoothing target rewrite (they compose, both produce soft targets).
+
 - [ ] Llama 3.2 Vision (mllama) cross-attention VLM importer
       (BuildMllamaFromSafeTensors[Ex], model_type "mllama", e.g.
       meta-llama/Llama-3.2-11B-Vision-Instruct). DISTINCT from the landed
@@ -497,6 +515,28 @@ rather than acted on.
       so removing the redundant copies should lift tokens/sec materially. Guard
       everything behind the existing `FShouldOpenCL`, keep the host round-trip as the
       fallback, and pin parity with the SDPAOpenCLParity-style exact-vs-CPU test.
+- [ ] OpenCL offload of `TNNetConvolution.Backpropagate` (the general
+      FeatureSize>1 convolution backward). The forward conv already routes through
+      the OpenCL GEMM (`Compute` -> `FDotCL`) and the 1x1 case has a backward
+      offload (`BackpropagatePointwiseOpenCL`), but the general conv backward
+      ALWAYS runs `BackpropagateFastTiledCPU` — there is no `FShouldOpenCL` branch
+      in `TNNetConvolution.Backpropagate` at all. That makes training any conv net
+      on the GPU lopsided: the forward pass offloads, the (more expensive)
+      input-gradient + weight-gradient pass stays pinned to the CPU, so the device
+      sits idle for half of every step. This is the gating cost for GPU-side
+      training of every CNN classifier and conv generative decoder (VisualGAN /
+      StyleGAN2 / CycleGAN / SuperResolution / the SD VAE decoder fine-tune path).
+      Scope: reformulate both backward halves as im2col-style GEMMs the existing
+      `myGEMM`/`cai_dot_product` kernel can run — the input-gradient is a
+      transposed-weight GEMM scattered back through the same col indexing the
+      forward im2col uses, and the weight-gradient is `outputErrorDeriv^T * cols`
+      (reuse the DeformableConv / GroupConvP4 spatial-im2col offload pattern,
+      commit c6a6f91, and the device-resident weight buffers the FP16 note
+      references). Guard behind `FShouldOpenCL`, keep `BackpropagateFastTiledCPU`
+      as the exact fallback, and pin an SDPAOpenCLParity-style exact-vs-CPU
+      gradient test (input-grad AND weight-grad) on a fixed multi-channel conv
+      fixture. Pairs with the landed `TNNetDeconvolution.Compute` offload below
+      (the upsampling twin) to make a full conv encoder/decoder trainable on device.
 - [X] OpenCL offload of `TNNetDeconvolution.Compute` (transposed convolution).
       Unlike `TNNetConvolution`, the deconv forward overrides Compute with its own
       overlap-add scatter and does NOT route through the conv OpenCL GEMM — the
@@ -1551,6 +1591,17 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
   - [ ] TNNetTestTimeTraining / TNNetTitansMemory backward "undo" loops (interleaved
         scalar etaGrad/dEta/dTheta accumulation) — the per-token forward rank-1 writes
         are vectorized; this is the lower-value remainder.
+  - [ ] TNNetBilinearUpsample.Backpropagate gradient scatter. The forward landed
+        AVX'd (commit 61eb37b: four-corner Move+Mul(w00)+3x MulAdd over the
+        depth-contiguous source columns; parity test TestBilinearUpsampleForwardParity),
+        but the backward path still scatters each output pixel's depth vector into the
+        four source corners with a scalar per-channel loop. Same depth-axis-contiguous
+        shape as the forward, so it maps drop-in to four `MulAdd(dstPtr, gradPtr, wXY,
+        Depth)` accumulations (the transpose of the forward's four weighted reads).
+        Bilinear upsampling is on the training backward path of the SR / diffusion
+        decoder stacks, so the gradient scatter is a real hot loop, not a leaf-test
+        layer. Pin an exact-vs-scalar backward parity test (bit-identical on the scalar
+        build, <1e-6 on -dAVX2) and add it to the AVX-vectorization-sweep coverage note.
 
 ## Tests / numerical-gradient audit
 
