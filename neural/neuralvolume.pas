@@ -173,6 +173,9 @@ type
     procedure Mul(Original: TVolume); overload; {$IFDEF Release} inline; {$ENDIF}
     class procedure Mul(PtrA: TNeuralFloatArrPtr; MulOp: TNeuralFloat; pSize: integer); overload;
     class procedure Mul(PtrA, PtrB: TNeuralFloatArrPtr; pSize: integer); overload;
+    // Element-wise depth-contiguous maximum: PtrA[i] := max(PtrA[i], PtrB[i]).
+    // Scalar base; overridden by TNNetVolume with an AVX implementation.
+    class procedure MaxElements(PtrA, PtrB: TNeuralFloatArrPtr; pSize: integer); overload;
     procedure Mul(Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure MulAtDepth(pDepth: integer; Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
     procedure Pow(Value: T); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -504,6 +507,7 @@ type
       procedure Mul(Value: Single); overload; {$IFDEF Release} inline; {$ENDIF}
       class procedure Mul(PtrA: TNeuralFloatArrPtr; MulOp: TNeuralFloat; pSize: integer); overload;
       class procedure Mul(PtrA, PtrB: TNeuralFloatArrPtr; pSize: integer); overload; {$IFDEF Release} inline; {$ENDIF}
+      class procedure MaxElements(PtrA, PtrB: TNeuralFloatArrPtr; pSize: integer); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure MulAdd(Value: TNeuralFloat; Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure MulAdd(Original1, Original2: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure MulMulAdd(Value1, Value2: TNeuralFloat; Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -4745,6 +4749,16 @@ begin
     {$ELSE}
     PtrA^[I] := PtrA^[I] + PtrB^[I];
     {$ENDIF}
+end;
+
+class procedure TVolume.MaxElements(PtrA, PtrB: TNeuralFloatArrPtr; pSize: integer);
+var
+  I: integer;
+  vHigh: integer;
+begin
+  vHigh := pSize - 1;
+  for I := 0 to vHigh do
+    if PtrB^[I] > PtrA^[I] then PtrA^[I] := PtrB^[I];
 end;
 
 procedure TVolume.AddAtDepth(pDepth: integer; Value: T);
@@ -10353,6 +10367,87 @@ begin
   end;
 end;
 
+procedure AVXMax(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer);
+var
+  localNumElements, MissedElements: integer;
+begin
+  MissedElements := NumElements and 3;
+  localNumElements := NumElements xor MissedElements;
+  if localNumElements > 0 then
+  begin
+  asm
+  mov ecx, localNumElements
+  mov eax, PtrA
+  mov edx, PtrB
+
+  push ecx
+  shr ecx,5  // number of large iterations = number of elements / 32
+  jz @SkipLargeMaxLoop
+@LargeMaxLoop:
+
+  vmovups ymm2, [eax]
+  vmovups ymm3, [eax+32]
+  vmovups ymm4, [eax+64]
+  vmovups ymm5, [eax+96]
+
+  vmaxps  ymm2, ymm2, [edx]
+  vmaxps  ymm3, ymm3, [edx+32]
+  vmaxps  ymm4, ymm4, [edx+64]
+  vmaxps  ymm5, ymm5, [edx+96]
+
+  vmovups [eax],    ymm2
+  vmovups [eax+32], ymm3
+  vmovups [eax+64], ymm4
+  vmovups [eax+96], ymm5
+
+  add eax, 128
+  add edx, 128
+  dec ecx
+  jnz @LargeMaxLoop
+
+  vzeroupper
+
+@SkipLargeMaxLoop:
+  pop ecx
+  and ecx,$0000001F
+  jz @EndMax
+  shr ecx, 2 // number of small iterations = (number of elements modulo 16) / 4
+@SmallMaxLoop:
+  vzeroupper
+
+  movups xmm2, [eax]
+  movups xmm3, [edx]
+  maxps  xmm2, xmm3
+  movups [eax], xmm2
+
+  add eax, 16
+  add edx, 16
+  dec ecx
+  jnz @SmallMaxLoop
+
+@EndMax:
+  end
+  [
+    'EAX', 'ECX', 'EDX',
+    'ymm2', 'ymm3', 'ymm4', 'ymm5'
+  ];
+  end;
+
+  if MissedElements>0 then
+  begin
+    if PtrB^[localNumElements] > PtrA^[localNumElements] then
+      PtrA^[localNumElements] := PtrB^[localNumElements];
+    if MissedElements>1 then
+    begin
+      if PtrB^[localNumElements+1] > PtrA^[localNumElements+1] then
+        PtrA^[localNumElements+1] := PtrB^[localNumElements+1];
+      if MissedElements>2 then
+        if PtrB^[localNumElements+2] > PtrA^[localNumElements+2] then
+          PtrA^[localNumElements+2] := PtrB^[localNumElements+2];
+    end;
+  end;
+end;
+
 function AVXSumDiff(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
 var
   vRes: array[0..3] of Single;
@@ -11647,6 +11742,99 @@ begin
   end;
 end;
 
+procedure AVXMax(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer);
+var
+  localNumElements, MissedElements: integer;
+begin
+  MissedElements := NumElements and 3;
+  localNumElements := NumElements xor MissedElements;
+  if localNumElements > 0 then
+  begin
+  asm
+  mov ecx, localNumElements
+  mov rax, PtrA
+  mov rdx, PtrB
+
+  push rcx
+  shr ecx,5  // number of large iterations = number of elements / 32
+  jz @SkipLargeMaxLoop
+@LargeMaxLoop:
+
+  {$IFDEF AVX512}
+  vmovups zmm2, [rax]
+  vmovups zmm3, [rax+64]
+
+  vmaxps  zmm2, zmm2, [rdx]
+  vmaxps  zmm3, zmm3, [rdx+64]
+
+  vmovups [rax],    zmm2
+  vmovups [rax+64], zmm3
+  {$ELSE}
+  vmovups ymm2, [rax]
+  vmovups ymm3, [rax+32]
+  vmovups ymm4, [rax+64]
+  vmovups ymm5, [rax+96]
+
+  vmaxps  ymm2, ymm2, [rdx]
+  vmaxps  ymm3, ymm3, [rdx+32]
+  vmaxps  ymm4, ymm4, [rdx+64]
+  vmaxps  ymm5, ymm5, [rdx+96]
+
+  vmovups [rax],    ymm2
+  vmovups [rax+32], ymm3
+  vmovups [rax+64], ymm4
+  vmovups [rax+96], ymm5
+  {$ENDIF}
+
+  add rax, 128
+  add rdx, 128
+  dec ecx
+  jnz @LargeMaxLoop
+
+  vzeroupper
+
+@SkipLargeMaxLoop:
+  pop rcx
+  and ecx,$0000001F
+  jz @EndMax
+  shr ecx, 2 // number of small iterations = (number of elements modulo 16) / 4
+@SmallMaxLoop:
+  vzeroupper
+
+  movups xmm2, [rax]
+  movups xmm3, [rdx]
+  maxps  xmm2, xmm3
+  movups [rax], xmm2
+
+  add rax, 16
+  add rdx, 16
+  dec ecx
+  jnz @SmallMaxLoop
+
+@EndMax:
+  end
+  [
+    'RAX', 'RCX', 'RDX',
+    'ymm2', 'ymm3', 'ymm4', 'ymm5'
+    {$IFDEF AVX512},'zmm2', 'zmm3'{$ENDIF}
+  ];
+  end;
+
+  if MissedElements>0 then
+  begin
+    if PtrB^[localNumElements] > PtrA^[localNumElements] then
+      PtrA^[localNumElements] := PtrB^[localNumElements];
+    if MissedElements>1 then
+    begin
+      if PtrB^[localNumElements+1] > PtrA^[localNumElements+1] then
+        PtrA^[localNumElements+1] := PtrB^[localNumElements+1];
+      if MissedElements>2 then
+        if PtrB^[localNumElements+2] > PtrA^[localNumElements+2] then
+          PtrA^[localNumElements+2] := PtrB^[localNumElements+2];
+    end;
+  end;
+end;
+
 function AVXSumDiff(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
 var
   vRes: array[0..3] of Single;
@@ -12493,6 +12681,11 @@ end;
 class procedure TNNetVolume.Mul(PtrA, PtrB: TNeuralFloatArrPtr; pSize: integer);
 begin
   AVXMul(PtrA, PtrB, pSize);
+end;
+
+class procedure TNNetVolume.MaxElements(PtrA, PtrB: TNeuralFloatArrPtr; pSize: integer);
+begin
+  AVXMax(PtrA, PtrB, pSize);
 end;
 
 procedure TNNetVolume.MulAdd(Value: TNeuralFloat; Original: TNNetVolume);

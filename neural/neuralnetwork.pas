@@ -80310,12 +80310,14 @@ var
   CntX, CntY, CntD: integer;
   MaxX, MaxY, MaxD: integer;
   OutX, OutY: integer;
-  OutputRawPos: integer;
-  InputRawPtr: TNeuralFloatPtr;
+  OutputRawPos, IdxRawPos: integer;
+  InputRawPtr, OutputRawPtr: TNeuralFloatArrPtr;
+  Depth: integer;
 begin
   MaxX := FInputCopy.SizeX - 1;
   MaxY := FInputCopy.SizeY - 1;
   MaxD := FInputCopy.Depth - 1;
+  Depth := FInputCopy.Depth;
 
   for CntY := 0 to MaxY do
   begin
@@ -80325,17 +80327,24 @@ begin
       OutX := FInputDivPool[CntX]; //CntX div FPoolSize;
       OutputRawPos := FOutput.GetRawPos(OutX, OutY);
       InputRawPtr := FInputCopy.GetRawPtr(CntX, CntY);
+      OutputRawPtr := FOutput.GetRawPtr(OutX, OutY);
+      // Argmax bookkeeping is intrinsically scalar (each depth channel records
+      // its own winning X,Y). Tracked here against the running max -- strict '>'
+      // so the FIRST input position reaching the maximum keeps the slot, exactly
+      // matching the original scalar loop -- BEFORE the vectorized value update.
+      IdxRawPos := OutputRawPos;
       for CntD := 0 to MaxD do
       begin
-        if InputRawPtr^ > FOutput.FData[OutputRawPos] then
+        if InputRawPtr^[CntD] > FOutput.FData[IdxRawPos] then
         begin
-          FOutput.FData[OutputRawPos] := InputRawPtr^;
-          FMaxPosX[OutputRawPos] := CntX;
-          FMaxPosY[OutputRawPos] := CntY;
+          FMaxPosX[IdxRawPos] := CntX;
+          FMaxPosY[IdxRawPos] := CntY;
         end;
-        Inc(OutputRawPos);
-        Inc(InputRawPtr);
+        Inc(IdxRawPos);
       end;
+      // Depth-contiguous vectorized value reduction:
+      // FOutput[d] := max(FOutput[d], InputRawPtr[d]).
+      FOutput.MaxElements(OutputRawPtr, InputRawPtr, Depth);
     end;
   end; // of for CntD
 end;
@@ -80346,13 +80355,15 @@ var
   OutputMaxX, OutputMaxY, MaxD: integer;
   InX, InY, InXMax, InYMax: integer;
   CntInputPX, CntInputPY: integer;
-  OutputRawPos: integer;
-  CurrValue: TNeuralFloat;
+  OutputRawPos, IdxRawPos: integer;
+  OutputRawPtr, InputRawPtr: TNeuralFloatArrPtr;
   LocalPoolSizeM1, InputSizeXM1, InputSizeYM1: integer;
+  Depth: integer;
 begin
   OutputMaxX := Output.SizeX - 1;
   OutputMaxY := Output.SizeY - 1;
   MaxD := FPrevLayer.Output.Depth - 1;
+  Depth := FPrevLayer.Output.Depth;
   LocalPoolSizeM1 := FPoolSize - 1;
   InputSizeXM1 := FInputCopy.SizeX - 1;
   InputSizeYM1 := FInputCopy.SizeY - 1;
@@ -80366,23 +80377,31 @@ begin
       InX := CntOutputX * FStride;
       InXMax := Min(InX + LocalPoolSizeM1, InputSizeXM1);
       OutputRawPos := Output.GetRawPos(CntOutputX, CntOutputY);
-      for CntD := 0 to MaxD do
+      OutputRawPtr := FOutput.GetRawPtr(CntOutputX, CntOutputY);
+      // Each (CntInputPX, CntInputPY) cell of the pooling window is one
+      // depth-contiguous strip. The value reduction over the depth axis is
+      // vectorized via FOutput.Max; the per-channel argmax (winning input X,Y)
+      // is tracked with a scalar loop against the running max BEFORE the strip
+      // is folded in. Window cells are visited in the same PX-then-PY order the
+      // original scalar loop used, so the strict-'>' first-winner tie-break
+      // (and hence FMaxPosX/FMaxPosY) is bit-for-bit preserved.
+      for CntInputPX := InX to InXMax do
       begin
-        for CntInputPX := InX to InXMax do
+        for CntInputPY := InY to InYMax do
         begin
-          for CntInputPY := InY to InYMax do
+          InputRawPtr := FInputCopy.GetRawPtr(CntInputPX, CntInputPY);
+          IdxRawPos := OutputRawPos;
+          for CntD := 0 to MaxD do
           begin
-            CurrValue := FInputCopy[CntInputPX, CntInputPY, CntD];
-            if CurrValue > FOutput.FData[OutputRawPos] then
+            if InputRawPtr^[CntD] > FOutput.FData[IdxRawPos] then
             begin
-              //WriteLn(CntInputPX, ' ', CntInputPY,' - ',CntOutputX, ' ', CntOutputY,' ', CurrValue);
-              FOutput.FData[OutputRawPos] := CurrValue;
-              FMaxPosX[OutputRawPos] := CntInputPX;
-              FMaxPosY[OutputRawPos] := CntInputPY;
+              FMaxPosX[IdxRawPos] := CntInputPX;
+              FMaxPosY[IdxRawPos] := CntInputPY;
             end;
+            Inc(IdxRawPos);
           end;
+          FOutput.MaxElements(OutputRawPtr, InputRawPtr, Depth);
         end;
-        Inc(OutputRawPos);
       end;
     end;
   end; // of for CntD

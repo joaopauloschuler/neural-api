@@ -1681,7 +1681,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       (-dAVX2) output vs the current scalar path on a fixed (SeqLen, 1, Depth)
       fixture.
 
-- [ ] AVX-vectorize `TNNetMaxPool` forward (and the backward argmax scatter) over
+- [X] AVX-vectorize `TNNetMaxPool` forward (and the backward argmax scatter) over
       the depth axis. The forward is currently a pure SCALAR triple loop comparing
       `InputRawPtr^ > FOutput.FData[OutputRawPos]` one channel at a time in both the
       default-stride and custom-stride paths; the depth (`CntD`) axis it iterates is

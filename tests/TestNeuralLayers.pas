@@ -20,6 +20,7 @@ type
     procedure TestConvolutionForward;
     procedure TestWinogradConvolutionParity;
     procedure TestMaxPoolForward;
+    procedure TestMaxPoolVectorizedExactParity;
     procedure TestNetworkSaveLoad;
     procedure TestSimpleXORLearning;
     // New comprehensive layer tests
@@ -371,6 +372,112 @@ begin
     NN.Free;
     Input.Free;
   end;
+end;
+
+procedure TTestNeuralLayers.TestMaxPoolVectorizedExactParity;
+// The MaxPool forward folds each pooling-window strip in over the (contiguous)
+// depth axis through the vectorized TNNetVolume.MaxElements primitive. The max
+// reduction is exact (no floating-point reassociation), so the vectorized
+// output must be BIT-IDENTICAL to a straightforward scalar reference. This test
+// builds a multi-channel input with non-trivial depth (37 -> exercises the AVX
+// large/small/tail paths) and checks both stride configurations:
+//   * default stride (stride == pool size, no padding) and
+//   * custom stride with padding.
+  procedure CheckParity(const Title: string; PoolSize, Stride, Padding,
+    SizeX, SizeY, Depth: integer);
+  var
+    NN: TNNet;
+    Input: TNNetVolume;
+    Padded: TNNetVolume;
+    Reference: TNNetVolume;
+    Pool: TNNetMaxPool;
+    OutX, OutY, OutD, OutSizeX, OutSizeY: integer;
+    InX, InY, BaseX, BaseY, px, py: integer;
+    PadSizeX, PadSizeY, InXMax, InYMax: integer;
+    v, best: TNeuralFloat;
+    seen: boolean;
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(SizeX, SizeY, Depth);
+    Padded := TNNetVolume.Create();
+    Reference := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(SizeX, SizeY, Depth));
+      Pool := TNNetMaxPool(NN.AddLayer(TNNetMaxPool.Create(PoolSize, Stride, Padding)));
+
+      // Deterministic, well-separated values (no exact ties across the whole
+      // tensor, so the argmax is unambiguous and reference == layer exactly).
+      for InX := 0 to SizeX - 1 do
+        for InY := 0 to SizeY - 1 do
+          for OutD := 0 to Depth - 1 do
+            Input[InX, InY, OutD] :=
+              Sin(0.37 * InX + 0.91 * InY + 0.13 * OutD) * 100.0
+              + 0.001 * (InX * SizeY * Depth + InY * Depth + OutD);
+
+      NN.Compute(Input);
+
+      OutSizeX := Pool.Output.SizeX;
+      OutSizeY := Pool.Output.SizeY;
+
+      // Build the padded input exactly like the layer (CopyPadding: zero border).
+      if Padding > 0
+        then Padded.CopyPadding(Input, Padding)
+        else Padded.Copy(Input);
+      PadSizeX := Padded.SizeX;
+      PadSizeY := Padded.SizeY;
+
+      // Independent scalar reference. The window is taken over the PADDED volume
+      // with the same clamping the layer applies (Min(base+pool-1, size-1)); a
+      // window cell beyond the padded boundary is simply not part of the pool
+      // (the window shrinks) -- it is NOT a zero. Padding zeros only ever appear
+      // as genuine cells of the padded volume.
+      Reference.ReSize(OutSizeX, OutSizeY, Depth);
+      for OutX := 0 to OutSizeX - 1 do
+        for OutY := 0 to OutSizeY - 1 do
+          for OutD := 0 to Depth - 1 do
+          begin
+            BaseX := OutX * Stride;
+            BaseY := OutY * Stride;
+            InXMax := Min(BaseX + PoolSize - 1, PadSizeX - 1);
+            InYMax := Min(BaseY + PoolSize - 1, PadSizeY - 1);
+            best := 0; // unused until seen
+            seen := false;
+            for px := BaseX to InXMax do
+              for py := BaseY to InYMax do
+              begin
+                v := Padded[px, py, OutD];
+                if (not seen) or (v > best) then
+                begin
+                  best := v;
+                  seen := true;
+                end;
+              end;
+            Reference[OutX, OutY, OutD] := best;
+          end;
+
+      // Demand EXACT equality (delta 0) -- max introduces no rounding.
+      for OutX := 0 to OutSizeX - 1 do
+        for OutY := 0 to OutSizeY - 1 do
+          for OutD := 0 to Depth - 1 do
+            AssertTrue(
+              Format('%s: MaxPool[%d,%d,%d] vectorized=%g scalar-ref=%g must be bit-identical',
+                [Title, OutX, OutY, OutD,
+                 Pool.Output[OutX, OutY, OutD], Reference[OutX, OutY, OutD]]),
+              Pool.Output[OutX, OutY, OutD] = Reference[OutX, OutY, OutD]);
+    finally
+      NN.Free;
+      Input.Free;
+      Padded.Free;
+      Reference.Free;
+    end;
+  end;
+begin
+  // Default stride path (stride == pool size, no padding).
+  CheckParity('default-stride', 2, 2, 0, 8, 6, 37);
+  CheckParity('default-stride-3', 3, 3, 0, 9, 9, 11);
+  // Custom stride + padding path.
+  CheckParity('stride-padding', 3, 2, 1, 7, 5, 37);
+  CheckParity('overlap-stride', 3, 1, 0, 6, 6, 13);
 end;
 
 procedure TTestNeuralLayers.TestNetworkSaveLoad;
