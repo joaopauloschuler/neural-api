@@ -1786,12 +1786,12 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
         GroupedQueryAttention, GumbelSoftmaxDemo, MixtureOfExperts, PonderNet,
         DiagonalSSM, LegendreMemoryUnit, LinearRecurrentUnit, MinimalRNN, RWKV,
         TitansMemory, DebertaReranker (all 14 READMEs LANDED)
-  - [ ] Audio/speech: F5TTS, KokoroTTS, ParlerTTS, Qwen2AudioChat, Wav2Vec2Transcribe,
+  - [X] Audio/speech: F5TTS, KokoroTTS, ParlerTTS, Qwen2AudioChat, Wav2Vec2Transcribe,
         MusicGenProbe, MusicTagging, OCRTranscribe, SpeakerDiarization,
-        SpeakerVerification, DACRoundTrip
-  - [ ] Misc/training: CaiOptimizedDenseNet, MagnitudePruneFineTune, OnlyTwoLayers,
+        SpeakerVerification, DACRoundTrip (all 11 READMEs LANDED)
+  - [X] Misc/training: CaiOptimizedDenseNet, MagnitudePruneFineTune, OnlyTwoLayers,
         SelfTest, SDPAOpenCLParity, OctonionConv, QuaternionConv, QuaternionLinear,
-        HopfieldAssociativeMemory
+        HopfieldAssociativeMemory (all 9 READMEs LANDED)
 
 ## Tests / numerical-gradient audit
 
