@@ -1336,7 +1336,7 @@ rather than acted on.
       RMSNorm/LayerNorm sit on the hot path of every transformer and ConvNeXt-style
       vision block, and the backward pass is currently the only scalar half left.
 
- — the standard fully-connected
+- [X] Port torch `nn.LSTMCell` / `nn.GRUCell` — the standard fully-connected
       recurrent cells with TRUE recurrent gating (each gate sees the previous
       hidden state h_{t-1}, and the LSTM carries a separate cell state c_t), i.e.
       a direct port of torch `nn.LSTMCell`/`nn.GRUCell`. This is a genuine gap, NOT
@@ -1355,6 +1355,23 @@ rather than acted on.
       importer whose recurrent core is a stock LSTM/GRU. Bidirectional + multi-layer
       stacking reuse the existing forward+time-reversed-concat builder idiom used for
       the MinLSTM trunk (no new wiring needed).
+      DONE: `TNNetLSTMCell` (torch i,f,g,o gate order, 12 tensors: `W_i*`/`W_h*`
+      Depth×Depth + folded ih+hh biases, `b_f` init +1, separate cell state `c_t`)
+      and `TNNetGRUCell` (torch r,z,n order, 11 tensors: `W_i*`/`W_h*` + folded
+      `b_r`/`b_z`, SEPARATE `b_in`/`b_hn` because `b_hn` rides inside the reset-gated
+      candidate term, 1 spare bias) in `neural/neuralnetwork.pas`. Both: full forward
+      with frozen-`h_{t-1}` snapshot + exact BPTT (`dL/dc_t`+`dL/dh_t` for LSTM,
+      `dL/dh_t` incl. `z_t⊙h_{t-1}` leakage and `r_t`/`whn` coupling for GRU);
+      registered in both `CreateLayer` dispatch tables; input + weight
+      numerical-gradient tests + serialization round-trip in `TestNeuralNumerical`
+      (max abs grad err ~1.7e-3, well under 1e-2). README rows added.
+      - [ ] FOLLOW-UP (still open): bidirectional + multi-layer stacking for
+            `TNNetLSTMCell`/`TNNetGRUCell` (and a real `nn.LSTM`/`nn.GRU`
+            num_layers>1 / bidirectional=True checkpoint importer). Reuse the
+            existing forward + time-reversed-concat builder idiom from the MinLSTM
+            trunk; no new layer math is needed, just a stacking/reverse builder and
+            the per-direction/per-layer weight-slab wiring. Unblocks the pyannote
+            `segmentation-3.0` bidirectional-LSTM trunk drop-in (lines ~977-995).
 
 (The sub-quadratic / chunked-forward family below is one coherent systems effort:
 every recurrence currently trains as a strict per-token left-to-right scan.)

@@ -7108,6 +7108,108 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// TNNetLSTMCell: the CLASSIC fully-connected LSTM cell with TRUE recurrent
+  // gating (Hochreiter & Schmidhuber 1997 / Gers et al. 2000), a direct port of
+  // torch nn.LSTMCell / a single nn.LSTM layer. Unlike TNNetMinLSTM (gates feed
+  // x_t ONLY, parallel-scan) and unlike the xLSTM TNNetSLSTMCell/TNNetMLSTMCell
+  // (exponential / matrix-memory variants), here EVERY gate sees the previous
+  // hidden state h_{t-1} through a real recurrent weight matrix, and a SEPARATE
+  // cell state c_t is carried. Operates over a (SeqLen,1,Depth) sequence
+  // (SizeY must be 1), recurrence along SizeX = SeqLen, head dim = Depth;
+  // output shape == input shape (shape-preserving).
+  //
+  // Per timestep t, with the standard sigmoid/tanh gates (g = cell candidate):
+  //   i_t = sigmoid(W_ii x_t + W_hi h_{t-1} + b_i)        (input gate)
+  //   f_t = sigmoid(W_if x_t + W_hf h_{t-1} + b_f)        (forget gate)
+  //   g_t = tanh   (W_ig x_t + W_hg h_{t-1} + b_g)        (cell candidate)
+  //   o_t = sigmoid(W_io x_t + W_ho h_{t-1} + b_o)        (output gate)
+  //   c_t = f_t * c_{t-1} + i_t * g_t                     (cell state, c_{-1}=0)
+  //   h_t = o_t * tanh(c_t)                               (hidden, h_{-1}=0)
+  // Gate order is torch's i,f,g,o (matching the fused weight_ih / weight_hh row
+  // packing 4*hidden), so real nn.LSTM/nn.LSTMCell checkpoints load without
+  // re-training: weight_ih rows [0..h)=W_ii [h..2h)=W_if [2h..3h)=W_ig
+  // [3h..4h)=W_io map to Neurons[0..3]; weight_hh likewise to Neurons[4..7];
+  // torch keeps bias_ih+bias_hh separate but they ADD, so fold their sum into
+  // Neurons[8..11]. All W_i*/W_h* are DepthxDepth (stored [out,0,in]); biases
+  // are Depth-long. Storage in Neurons[] (12 tensors):
+  //   [0]=W_ii [1]=W_if [2]=W_ig [3]=W_io   (input projections, DepthxDepth)
+  //   [4]=W_hi [5]=W_hf [6]=W_hg [7]=W_ho   (recurrent projections, DepthxDepth)
+  //   [8]=b_i  [9]=b_f  [10]=b_g [11]=b_o   (biases, Depth-long, = ih+hh sum)
+  // Init: projections small random, biases 0 except forget-bias b_f=+1 (a common
+  // default that starts the cell as a near-pass-through accumulator). Forward is
+  // the explicit per-timestep recurrence (O(SeqLen*Depth^2)); backward is
+  // backprop-through-time, a right-to-left sweep carrying dL/dc_t and dL/dh_t.
+  // The FROZEN-h_{t-1} forward gotcha (read the whole h_{t-1} snapshot, not a
+  // partially-updated h_t) is handled via FHprev, as in TNNetSLSTMCell.
+  // Coded by Claude (AI).
+  TNNetLSTMCell = class(TNNetLayer)
+    private
+      FIg, FFg, FGg, FOg: TNNetVolume; // cached i_t,f_t,g_t,o_t, (SeqLen,1,Depth)
+      FC: TNNetVolume;                 // cached c_t, (SeqLen,1,Depth)
+      FTanhC: TNNetVolume;             // cached tanh(c_t), (SeqLen,1,Depth)
+      FHt: TNNetVolume;                // cached h_t, (SeqLen,1,Depth)
+      FH, FHprev: TNNetVolume;         // running / frozen-prev hidden, Depth scratch
+      FGc, FGh: TNNetVolume;           // backward dL/dc_t, dL/dh_t carry (Depth)
+      FGhNext: TNNetVolume;            // dL/dh_{t-1} accumulator built during step t
+      FGradW: array[0..7] of TNNetVolume;  // DepthxDepth grad accumulators
+      FGradB: array[0..3] of TNNetVolume;  // Depth-long grad accumulators
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
+  /// TNNetGRUCell: the CLASSIC fully-connected GRU cell with TRUE recurrent
+  // gating (Cho et al. 2014, "Learning Phrase Representations ...",
+  // arXiv:1406.1078), a direct port of torch nn.GRUCell / a single nn.GRU layer.
+  // Unlike TNNetMinGRU (gates feed x_t ONLY, parallel-scan), here every gate
+  // sees h_{t-1} through a real recurrent weight matrix. Operates over a
+  // (SeqLen,1,Depth) sequence (SizeY must be 1), recurrence along SizeX = SeqLen,
+  // head dim = Depth; output shape == input shape (shape-preserving).
+  //
+  // Per timestep t, EXACTLY torch's GRU equations (note the recurrent-bias-inside
+  // term for the candidate, gated by r_t):
+  //   r_t = sigmoid(W_ir x_t + b_ir + W_hr h_{t-1} + b_hr)   (reset gate)
+  //   z_t = sigmoid(W_iz x_t + b_iz + W_hz h_{t-1} + b_hz)   (update gate)
+  //   n_t = tanh(W_in x_t + b_in + r_t * (W_hn h_{t-1} + b_hn))  (candidate)
+  //   h_t = (1 - z_t) * n_t + z_t * h_{t-1}                  (hidden, h_{-1}=0)
+  // Gate order is torch's r,z,n (matching the fused weight_ih/weight_hh row
+  // packing 3*hidden) so real nn.GRU/nn.GRUCell checkpoints load without
+  // re-training. For r and z the ih/hh biases ADD (folded), but for n the
+  // recurrent bias b_hn sits INSIDE the r_t product and must stay separate from
+  // b_in. All W_i*/W_h* are DepthxDepth (stored [out,0,in]); biases Depth-long.
+  // Storage in Neurons[] (11 tensors):
+  //   [0]=W_ir [1]=W_iz [2]=W_in   (input projections, DepthxDepth)
+  //   [3]=W_hr [4]=W_hz [5]=W_hn   (recurrent projections, DepthxDepth)
+  //   [6]=b_r  [7]=b_z              (folded ih+hh biases for r,z; Depth-long)
+  //   [8]=b_in [9]=b_hn             (SEPARATE candidate biases; Depth-long)
+  //   [10]=spare zero bias (unused, keeps a uniform 1-bias-per-2-proj layout)
+  // Init: projections small random, all biases 0. Forward is the explicit
+  // per-timestep recurrence (O(SeqLen*Depth^2)); backward is BPTT carrying
+  // dL/dh_t. The FROZEN-h_{t-1} forward gotcha is handled via FHprev.
+  // Coded by Claude (AI).
+  TNNetGRUCell = class(TNNetLayer)
+    private
+      FR, FZ, FN: TNNetVolume;     // cached r_t,z_t,n_t, (SeqLen,1,Depth)
+      FWhn: TNNetVolume;           // cached (W_hn h_{t-1}+b_hn), (SeqLen,1,Depth)
+      FHt: TNNetVolume;            // cached h_t, (SeqLen,1,Depth)
+      FH, FHprev: TNNetVolume;     // running / frozen-prev hidden, Depth scratch
+      FGh: TNNetVolume;            // backward dL/dh_t carry, Depth scratch
+      FGhNext: TNNetVolume;        // dL/dh_{t-1} accumulator built during step t
+      FGradW: array[0..5] of TNNetVolume;  // DepthxDepth grad accumulators
+      FGradB: array[0..3] of TNNetVolume;  // Depth-long grad accumulators (b_r,b_z,b_in,b_hn)
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// TNNetConvLSTMCell: a CONVOLUTIONAL LSTM cell (Shi, Chen, Wang, Yeung, Wong &
   // Woo 2015, "Convolutional LSTM Network", arXiv:1506.04214). The spatial,
   // image-state analogue of the dense recurrent cells (TNNetMinLSTM /
@@ -48495,6 +48597,500 @@ begin
   FNeurons[3].FWeights.Fill(1.0);  // b_f (forget-bias -> near pass-through)
   FNeurons[4].FWeights.Fill(0);    // b_i
   FNeurons[5].FWeights.Fill(0);    // b_h
+  RandSeed := oldSeed;
+  AfterWeightUpdate();
+end;
+
+{ TNNetLSTMCell }
+constructor TNNetLSTMCell.Create();
+var ii: integer;
+begin
+  inherited Create();
+  FIg := TNNetVolume.Create(); FFg := TNNetVolume.Create();
+  FGg := TNNetVolume.Create(); FOg := TNNetVolume.Create();
+  FC := TNNetVolume.Create();  FTanhC := TNNetVolume.Create();
+  FHt := TNNetVolume.Create(); FH := TNNetVolume.Create();
+  FHprev := TNNetVolume.Create();
+  FGc := TNNetVolume.Create(); FGh := TNNetVolume.Create();
+  FGhNext := TNNetVolume.Create();
+  for ii := 0 to 7 do FGradW[ii] := TNNetVolume.Create();
+  for ii := 0 to 3 do FGradB[ii] := TNNetVolume.Create();
+  AddMissingNeurons(12);
+end;
+
+destructor TNNetLSTMCell.Destroy();
+var ii: integer;
+begin
+  for ii := 0 to 3 do FGradB[ii].Free;
+  for ii := 0 to 7 do FGradW[ii].Free;
+  FGhNext.Free; FGh.Free; FGc.Free;
+  FHprev.Free; FH.Free; FHt.Free; FTanhC.Free; FC.Free;
+  FOg.Free; FGg.Free; FFg.Free; FIg.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetLSTMCell.SetPrevLayer(pPrevLayer: TNNetLayer);
+var Depth, ii: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetLSTMCell requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  Depth := pPrevLayer.FOutput.Depth;
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, Depth);
+  SetOutputErrorSize(FOutput);
+  if FNeurons.Count < 12 then AddMissingNeurons(12);
+  // [0..3]=W_ii/W_if/W_ig/W_io and [4..7]=W_hi/W_hf/W_hg/W_ho are DepthxDepth
+  // (stored [out,0,in]); [8..11]=b_i/b_f/b_g/b_o are Depth-long.
+  for ii := 0 to 7 do FNeurons[ii].FWeights.ReSize(Depth, 1, Depth);
+  for ii := 8 to 11 do FNeurons[ii].FWeights.ReSize(Depth, 1, 1);
+  if FIsTrainable then
+    for ii := 0 to 11 do
+    begin
+      FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
+      FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
+    end;
+  FIg.ReSize(FOutput.SizeX, 1, Depth); FFg.ReSize(FOutput.SizeX, 1, Depth);
+  FGg.ReSize(FOutput.SizeX, 1, Depth); FOg.ReSize(FOutput.SizeX, 1, Depth);
+  FC.ReSize(FOutput.SizeX, 1, Depth);  FTanhC.ReSize(FOutput.SizeX, 1, Depth);
+  FHt.ReSize(FOutput.SizeX, 1, Depth);
+  FH.ReSize(1, 1, Depth); FHprev.ReSize(1, 1, Depth);
+  FGc.ReSize(1, 1, Depth); FGh.ReSize(1, 1, Depth); FGhNext.ReSize(1, 1, Depth);
+  for ii := 0 to 7 do FGradW[ii].ReSize(Depth, 1, Depth);
+  for ii := 0 to 3 do FGradB[ii].ReSize(1, 1, Depth);
+  InitDefault();
+end;
+
+procedure TNNetLSTMCell.Compute();
+var
+  StartTime: double;
+  Wii, Wif, Wig, Wio, Whi, Whf, Whg, Who, Bi, Bf, Bg, Bo, Prev: TNNetVolume;
+  SeqLen, Depth, t, d, j, baseT: integer;
+  SeqLenM1, DepthM1: integer;
+  accI, accF, accG, accO, xj, hj, iv, fv, gv, ovv, cPrev, cv, tc: TNeuralFloat;
+  XtPtr, OutPtr: TNeuralFloatArrPtr;
+  WiiR, WifR, WigR, WioR, WhiR, WhfR, WhgR, WhoR: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  Wii := FNeurons[0].FWeights; Wif := FNeurons[1].FWeights;
+  Wig := FNeurons[2].FWeights; Wio := FNeurons[3].FWeights;
+  Whi := FNeurons[4].FWeights; Whf := FNeurons[5].FWeights;
+  Whg := FNeurons[6].FWeights; Who := FNeurons[7].FWeights;
+  Bi := FNeurons[8].FWeights;  Bf := FNeurons[9].FWeights;
+  Bg := FNeurons[10].FWeights; Bo := FNeurons[11].FWeights;
+  SeqLen := FOutput.SizeX; Depth := FOutput.Depth;
+  SeqLenM1 := SeqLen - 1; DepthM1 := Depth - 1;
+  // FHprev holds the FROZEN h_{t-1} read by every gate of step t (reading FH
+  // mid-loop would leak a freshly-updated channel into a later channel's gate).
+  FHprev.Fill(0);
+  for t := 0 to SeqLenM1 do
+  begin
+    XtPtr := Prev.GetRawPtr(t, 0, 0);
+    OutPtr := FOutput.GetRawPtr(t, 0, 0);
+    baseT := t * Depth;
+    for d := 0 to DepthM1 do
+    begin
+      WiiR := Wii.GetRawPtr(d, 0, 0); WifR := Wif.GetRawPtr(d, 0, 0);
+      WigR := Wig.GetRawPtr(d, 0, 0); WioR := Wio.GetRawPtr(d, 0, 0);
+      WhiR := Whi.GetRawPtr(d, 0, 0); WhfR := Whf.GetRawPtr(d, 0, 0);
+      WhgR := Whg.GetRawPtr(d, 0, 0); WhoR := Who.GetRawPtr(d, 0, 0);
+      accI := Bi.FData[d]; accF := Bf.FData[d];
+      accG := Bg.FData[d]; accO := Bo.FData[d];
+      for j := 0 to DepthM1 do
+      begin
+        xj := XtPtr^[j]; hj := FHprev.FData[j];
+        accI := accI + WiiR^[j] * xj + WhiR^[j] * hj;
+        accF := accF + WifR^[j] * xj + WhfR^[j] * hj;
+        accG := accG + WigR^[j] * xj + WhgR^[j] * hj;
+        accO := accO + WioR^[j] * xj + WhoR^[j] * hj;
+      end;
+      iv := Sigmoid(accI); fv := Sigmoid(accF);
+      gv := pcr_tanhf(accG); ovv := Sigmoid(accO);
+      if t > 0 then cPrev := FC.FData[baseT - Depth + d] else cPrev := 0;
+      cv := fv * cPrev + iv * gv;
+      tc := pcr_tanhf(cv);
+      FIg.FData[baseT + d] := iv; FFg.FData[baseT + d] := fv;
+      FGg.FData[baseT + d] := gv; FOg.FData[baseT + d] := ovv;
+      FC.FData[baseT + d] := cv;  FTanhC.FData[baseT + d] := tc;
+      FH.FData[d] := ovv * tc;
+      FHt.FData[baseT + d] := FH.FData[d];
+      OutPtr^[d] := FH.FData[d];
+    end;
+    FHprev.Copy(FH);  // freeze h_t as h_{t-1} for the next step
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetLSTMCell.Backpropagate();
+var
+  StartTime: double;
+  Wii, Wif, Wig, Wio, Whi, Whf, Whg, Who, Prev, PrevErr: TNNetVolume;
+  SeqLen, Depth, t, d, j, baseT: integer;
+  DepthM1: integer;
+  hasInputGrad: boolean;
+  GyPtr, XtPtr, PrevErrPtr, hPrevPtr, GhNextPtr: TNeuralFloatArrPtr;
+  WiiR, WifR, WigR, WioR, WhiR, WhfR, WhgR, WhoR: TNeuralFloatArrPtr;
+  GWiiR, GWifR, GWigR, GWioR, GWhiR, GWhfR, GWhgR, GWhoR: TNeuralFloatArrPtr;
+  ght, gc, iv, fv, gv, ovv, cv, tc, cPrev: TNeuralFloat;
+  gtc, govv, gcell, gi, gf, gg, gpreI, gpreF, gpreG, gpreO: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Wii := FNeurons[0].FWeights; Wif := FNeurons[1].FWeights;
+  Wig := FNeurons[2].FWeights; Wio := FNeurons[3].FWeights;
+  Whi := FNeurons[4].FWeights; Whf := FNeurons[5].FWeights;
+  Whg := FNeurons[6].FWeights; Who := FNeurons[7].FWeights;
+  Prev := FPrevLayer.FOutput;
+  SeqLen := FOutput.SizeX; Depth := FOutput.Depth; DepthM1 := Depth - 1;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  FGc.Fill(0); FGh.Fill(0);
+  for j := 0 to 7 do FGradW[j].Fill(0);
+  for j := 0 to 3 do FGradB[j].Fill(0);
+  // Right-to-left BPTT. FGh carries dL/dh_t arriving through the recurrent W_h*
+  // rows of step t+1; FGc carries dL/dc_t arriving through f_{t+1}.
+  for t := SeqLen - 1 downto 0 do
+  begin
+    GyPtr := FOutputError.GetRawPtr(t, 0, 0);
+    XtPtr := Prev.GetRawPtr(t, 0, 0);
+    baseT := t * Depth;
+    if t > 0 then hPrevPtr := FHt.GetRawPtr(t - 1, 0, 0) else hPrevPtr := nil;
+    if hasInputGrad then PrevErrPtr := PrevErr.GetRawPtr(t, 0, 0)
+      else PrevErrPtr := nil;
+    FGhNext.Fill(0);
+    GhNextPtr := FGhNext.GetRawPtr(0, 0, 0);
+    for d := 0 to DepthM1 do
+    begin
+      iv := FIg.FData[baseT + d]; fv := FFg.FData[baseT + d];
+      gv := FGg.FData[baseT + d]; ovv := FOg.FData[baseT + d];
+      cv := FC.FData[baseT + d];  tc := FTanhC.FData[baseT + d];
+      if t > 0 then cPrev := FC.FData[baseT - Depth + d] else cPrev := 0;
+      ght := GyPtr^[d] + FGh.FData[d];        // dL/dh_t
+      // h_t = o_t * tanh(c_t)
+      govv := ght * tc;                        // dL/do_t
+      gtc := ght * ovv;                        // dL/d tanh(c_t)
+      gcell := gtc * (1 - tc * tc) + FGc.FData[d];  // dL/dc_t (+ downstream)
+      // c_t = f_t*cPrev + i_t*g_t
+      gf := gcell * cPrev;                     // dL/df_t
+      gi := gcell * gv;                        // dL/di_t
+      gg := gcell * iv;                        // dL/dg_t
+      // gate activations: sigmoid for i,f,o ; tanh for g
+      gpreI := gi * iv * (1 - iv);
+      gpreF := gf * fv * (1 - fv);
+      gpreG := gg * (1 - gv * gv);
+      gpreO := govv * ovv * (1 - ovv);
+      FGradB[0].FData[d] := FGradB[0].FData[d] + gpreI;
+      FGradB[1].FData[d] := FGradB[1].FData[d] + gpreF;
+      FGradB[2].FData[d] := FGradB[2].FData[d] + gpreG;
+      FGradB[3].FData[d] := FGradB[3].FData[d] + gpreO;
+      WiiR := Wii.GetRawPtr(d, 0, 0); WifR := Wif.GetRawPtr(d, 0, 0);
+      WigR := Wig.GetRawPtr(d, 0, 0); WioR := Wio.GetRawPtr(d, 0, 0);
+      WhiR := Whi.GetRawPtr(d, 0, 0); WhfR := Whf.GetRawPtr(d, 0, 0);
+      WhgR := Whg.GetRawPtr(d, 0, 0); WhoR := Who.GetRawPtr(d, 0, 0);
+      GWiiR := FGradW[0].GetRawPtr(d, 0, 0); GWifR := FGradW[1].GetRawPtr(d, 0, 0);
+      GWigR := FGradW[2].GetRawPtr(d, 0, 0); GWioR := FGradW[3].GetRawPtr(d, 0, 0);
+      GWhiR := FGradW[4].GetRawPtr(d, 0, 0); GWhfR := FGradW[5].GetRawPtr(d, 0, 0);
+      GWhgR := FGradW[6].GetRawPtr(d, 0, 0); GWhoR := FGradW[7].GetRawPtr(d, 0, 0);
+      for j := 0 to DepthM1 do
+      begin
+        GWiiR^[j] := GWiiR^[j] + gpreI * XtPtr^[j];
+        GWifR^[j] := GWifR^[j] + gpreF * XtPtr^[j];
+        GWigR^[j] := GWigR^[j] + gpreG * XtPtr^[j];
+        GWioR^[j] := GWioR^[j] + gpreO * XtPtr^[j];
+      end;
+      if t > 0 then
+        for j := 0 to DepthM1 do
+        begin
+          GWhiR^[j] := GWhiR^[j] + gpreI * hPrevPtr^[j];
+          GWhfR^[j] := GWhfR^[j] + gpreF * hPrevPtr^[j];
+          GWhgR^[j] := GWhgR^[j] + gpreG * hPrevPtr^[j];
+          GWhoR^[j] := GWhoR^[j] + gpreO * hPrevPtr^[j];
+          GhNextPtr^[j] := GhNextPtr^[j] +
+            gpreI * WhiR^[j] + gpreF * WhfR^[j] +
+            gpreG * WhgR^[j] + gpreO * WhoR^[j];
+        end;
+      if hasInputGrad then
+        for j := 0 to DepthM1 do
+          PrevErrPtr^[j] := PrevErrPtr^[j] +
+            gpreI * WiiR^[j] + gpreF * WifR^[j] +
+            gpreG * WigR^[j] + gpreO * WioR^[j];
+      // carry dL/dc_{t-1} += f_t * gcell
+      FGc.FData[d] := fv * gcell;
+    end;
+    FGh.Copy(FGhNext);
+  end;
+  for j := 0 to 7 do
+    TNNetVolume.MulAdd(FNeurons[j].FDelta.GetRawPtr(), FGradW[j].GetRawPtr(),
+      -FLearningRate, FNeurons[j].FWeights.Size);
+  for j := 0 to 3 do
+    TNNetVolume.MulAdd(FNeurons[8 + j].FDelta.GetRawPtr(), FGradB[j].GetRawPtr(),
+      -FLearningRate, Depth);
+  if (not FBatchUpdate) then
+  begin
+    for j := 0 to 11 do FNeurons[j].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetLSTMCell.InitDefault();
+var Depth, d, j, ii, oldSeed, DepthM1: integer;
+begin
+  if FNeurons.Count < 12 then AddMissingNeurons(12);
+  Depth := FNeurons[8].FWeights.Size;
+  DepthM1 := Depth - 1;
+  oldSeed := RandSeed;
+  RandSeed := 161803;
+  for d := 0 to DepthM1 do
+    for j := 0 to DepthM1 do
+      for ii := 0 to 7 do
+        FNeurons[ii].FWeights[d, 0, j] :=
+          FNeurons[ii].FWeights.RandomGaussianValue() * 0.05;
+  FNeurons[8].FWeights.Fill(0);    // b_i
+  FNeurons[9].FWeights.Fill(1.0);  // b_f (forget-bias)
+  FNeurons[10].FWeights.Fill(0);   // b_g
+  FNeurons[11].FWeights.Fill(0);   // b_o
+  RandSeed := oldSeed;
+  AfterWeightUpdate();
+end;
+
+{ TNNetGRUCell }
+constructor TNNetGRUCell.Create();
+var ii: integer;
+begin
+  inherited Create();
+  FR := TNNetVolume.Create(); FZ := TNNetVolume.Create();
+  FN := TNNetVolume.Create(); FWhn := TNNetVolume.Create();
+  FHt := TNNetVolume.Create(); FH := TNNetVolume.Create();
+  FHprev := TNNetVolume.Create();
+  FGh := TNNetVolume.Create(); FGhNext := TNNetVolume.Create();
+  for ii := 0 to 5 do FGradW[ii] := TNNetVolume.Create();
+  for ii := 0 to 3 do FGradB[ii] := TNNetVolume.Create();
+  AddMissingNeurons(11);
+end;
+
+destructor TNNetGRUCell.Destroy();
+var ii: integer;
+begin
+  for ii := 0 to 3 do FGradB[ii].Free;
+  for ii := 0 to 5 do FGradW[ii].Free;
+  FGhNext.Free; FGh.Free;
+  FHprev.Free; FH.Free; FHt.Free; FWhn.Free;
+  FN.Free; FZ.Free; FR.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetGRUCell.SetPrevLayer(pPrevLayer: TNNetLayer);
+var Depth, ii: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetGRUCell requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  Depth := pPrevLayer.FOutput.Depth;
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, Depth);
+  SetOutputErrorSize(FOutput);
+  if FNeurons.Count < 11 then AddMissingNeurons(11);
+  // [0..2]=W_ir/W_iz/W_in and [3..5]=W_hr/W_hz/W_hn are DepthxDepth
+  // (stored [out,0,in]); [6]=b_r [7]=b_z [8]=b_in [9]=b_hn [10]=spare are Depth-long.
+  for ii := 0 to 5 do FNeurons[ii].FWeights.ReSize(Depth, 1, Depth);
+  for ii := 6 to 10 do FNeurons[ii].FWeights.ReSize(Depth, 1, 1);
+  if FIsTrainable then
+    for ii := 0 to 10 do
+    begin
+      FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
+      FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
+    end;
+  FR.ReSize(FOutput.SizeX, 1, Depth); FZ.ReSize(FOutput.SizeX, 1, Depth);
+  FN.ReSize(FOutput.SizeX, 1, Depth); FWhn.ReSize(FOutput.SizeX, 1, Depth);
+  FHt.ReSize(FOutput.SizeX, 1, Depth);
+  FH.ReSize(1, 1, Depth); FHprev.ReSize(1, 1, Depth);
+  FGh.ReSize(1, 1, Depth); FGhNext.ReSize(1, 1, Depth);
+  for ii := 0 to 5 do FGradW[ii].ReSize(Depth, 1, Depth);
+  for ii := 0 to 3 do FGradB[ii].ReSize(1, 1, Depth);
+  InitDefault();
+end;
+
+procedure TNNetGRUCell.Compute();
+var
+  StartTime: double;
+  Wir, Wiz, Win, Whr, Whz, Whn, Br, Bz, Bin, Bhn, Prev: TNNetVolume;
+  SeqLen, Depth, t, d, j, baseT: integer;
+  SeqLenM1, DepthM1: integer;
+  accR, accZ, accIn, accHn, xj, hj, rv, zv, nv, whnv, hPrev: TNeuralFloat;
+  XtPtr, OutPtr: TNeuralFloatArrPtr;
+  WirR, WizR, WinR, WhrR, WhzR, WhnR: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  Wir := FNeurons[0].FWeights; Wiz := FNeurons[1].FWeights;
+  Win := FNeurons[2].FWeights; Whr := FNeurons[3].FWeights;
+  Whz := FNeurons[4].FWeights; Whn := FNeurons[5].FWeights;
+  Br := FNeurons[6].FWeights;  Bz := FNeurons[7].FWeights;
+  Bin := FNeurons[8].FWeights; Bhn := FNeurons[9].FWeights;
+  SeqLen := FOutput.SizeX; Depth := FOutput.Depth;
+  SeqLenM1 := SeqLen - 1; DepthM1 := Depth - 1;
+  FHprev.Fill(0);  // frozen h_{t-1} read by every gate of step t
+  for t := 0 to SeqLenM1 do
+  begin
+    XtPtr := Prev.GetRawPtr(t, 0, 0);
+    OutPtr := FOutput.GetRawPtr(t, 0, 0);
+    baseT := t * Depth;
+    for d := 0 to DepthM1 do
+    begin
+      WirR := Wir.GetRawPtr(d, 0, 0); WizR := Wiz.GetRawPtr(d, 0, 0);
+      WinR := Win.GetRawPtr(d, 0, 0); WhrR := Whr.GetRawPtr(d, 0, 0);
+      WhzR := Whz.GetRawPtr(d, 0, 0); WhnR := Whn.GetRawPtr(d, 0, 0);
+      accR := Br.FData[d]; accZ := Bz.FData[d];
+      accIn := Bin.FData[d]; accHn := Bhn.FData[d];
+      for j := 0 to DepthM1 do
+      begin
+        xj := XtPtr^[j]; hj := FHprev.FData[j];
+        accR := accR + WirR^[j] * xj + WhrR^[j] * hj;
+        accZ := accZ + WizR^[j] * xj + WhzR^[j] * hj;
+        accIn := accIn + WinR^[j] * xj;
+        accHn := accHn + WhnR^[j] * hj;
+      end;
+      rv := Sigmoid(accR); zv := Sigmoid(accZ);
+      whnv := accHn;                    // W_hn h_{t-1} + b_hn
+      nv := pcr_tanhf(accIn + rv * whnv);
+      hPrev := FHprev.FData[d];
+      FR.FData[baseT + d] := rv; FZ.FData[baseT + d] := zv;
+      FN.FData[baseT + d] := nv; FWhn.FData[baseT + d] := whnv;
+      FH.FData[d] := (1 - zv) * nv + zv * hPrev;
+      FHt.FData[baseT + d] := FH.FData[d];
+      OutPtr^[d] := FH.FData[d];
+    end;
+    FHprev.Copy(FH);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGRUCell.Backpropagate();
+var
+  StartTime: double;
+  Wir, Wiz, Win, Whr, Whz, Whn, Prev, PrevErr: TNNetVolume;
+  SeqLen, Depth, t, d, j, baseT: integer;
+  DepthM1: integer;
+  hasInputGrad: boolean;
+  GyPtr, XtPtr, PrevErrPtr, hPrevPtr, GhNextPtr: TNeuralFloatArrPtr;
+  WirR, WizR, WinR, WhrR, WhzR, WhnR: TNeuralFloatArrPtr;
+  GWirR, GWizR, GWinR, GWhrR, GWhzR, GWhnR: TNeuralFloatArrPtr;
+  ght, rv, zv, nv, whnv, hPrev: TNeuralFloat;
+  gn, gz, gr, gpreN, gpreR, gpreZ, gwhn: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Wir := FNeurons[0].FWeights; Wiz := FNeurons[1].FWeights;
+  Win := FNeurons[2].FWeights; Whr := FNeurons[3].FWeights;
+  Whz := FNeurons[4].FWeights; Whn := FNeurons[5].FWeights;
+  Prev := FPrevLayer.FOutput;
+  SeqLen := FOutput.SizeX; Depth := FOutput.Depth; DepthM1 := Depth - 1;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  FGh.Fill(0);
+  for j := 0 to 5 do FGradW[j].Fill(0);
+  for j := 0 to 3 do FGradB[j].Fill(0);
+  // Right-to-left BPTT. FGh carries dL/dh_t arriving through step t+1's recurrent
+  // rows AND through the (z_t * h_{t-1}) leakage term.
+  for t := SeqLen - 1 downto 0 do
+  begin
+    GyPtr := FOutputError.GetRawPtr(t, 0, 0);
+    XtPtr := Prev.GetRawPtr(t, 0, 0);
+    baseT := t * Depth;
+    if t > 0 then hPrevPtr := FHt.GetRawPtr(t - 1, 0, 0) else hPrevPtr := nil;
+    if hasInputGrad then PrevErrPtr := PrevErr.GetRawPtr(t, 0, 0)
+      else PrevErrPtr := nil;
+    FGhNext.Fill(0);
+    GhNextPtr := FGhNext.GetRawPtr(0, 0, 0);
+    for d := 0 to DepthM1 do
+    begin
+      rv := FR.FData[baseT + d]; zv := FZ.FData[baseT + d];
+      nv := FN.FData[baseT + d]; whnv := FWhn.FData[baseT + d];
+      if t > 0 then hPrev := hPrevPtr^[d] else hPrev := 0;
+      ght := GyPtr^[d] + FGh.FData[d];           // dL/dh_t
+      // h_t = (1 - z_t)*n_t + z_t*h_{t-1}
+      gn := ght * (1 - zv);                       // dL/dn_t
+      gz := ght * (hPrev - nv);                   // dL/dz_t
+      // h_{t-1} also receives z_t directly (leakage)
+      GhNextPtr^[d] := GhNextPtr^[d] + ght * zv;
+      // n_t = tanh(accIn + r_t * whn) ; whn = W_hn h_{t-1} + b_hn
+      gpreN := gn * (1 - nv * nv);                // dL/d pre-tanh of n
+      gr := gpreN * whnv;                         // dL/dr_t
+      gwhn := gpreN * rv;                         // dL/dwhn (into W_hn, b_hn, h_{t-1})
+      gpreR := gr * rv * (1 - rv);
+      gpreZ := gz * zv * (1 - zv);
+      FGradB[0].FData[d] := FGradB[0].FData[d] + gpreR;   // b_r
+      FGradB[1].FData[d] := FGradB[1].FData[d] + gpreZ;   // b_z
+      FGradB[2].FData[d] := FGradB[2].FData[d] + gpreN;   // b_in
+      FGradB[3].FData[d] := FGradB[3].FData[d] + gwhn;    // b_hn
+      WirR := Wir.GetRawPtr(d, 0, 0); WizR := Wiz.GetRawPtr(d, 0, 0);
+      WinR := Win.GetRawPtr(d, 0, 0); WhrR := Whr.GetRawPtr(d, 0, 0);
+      WhzR := Whz.GetRawPtr(d, 0, 0); WhnR := Whn.GetRawPtr(d, 0, 0);
+      GWirR := FGradW[0].GetRawPtr(d, 0, 0); GWizR := FGradW[1].GetRawPtr(d, 0, 0);
+      GWinR := FGradW[2].GetRawPtr(d, 0, 0); GWhrR := FGradW[3].GetRawPtr(d, 0, 0);
+      GWhzR := FGradW[4].GetRawPtr(d, 0, 0); GWhnR := FGradW[5].GetRawPtr(d, 0, 0);
+      for j := 0 to DepthM1 do
+      begin
+        GWirR^[j] := GWirR^[j] + gpreR * XtPtr^[j];
+        GWizR^[j] := GWizR^[j] + gpreZ * XtPtr^[j];
+        GWinR^[j] := GWinR^[j] + gpreN * XtPtr^[j];
+      end;
+      if t > 0 then
+        for j := 0 to DepthM1 do
+        begin
+          GWhrR^[j] := GWhrR^[j] + gpreR * hPrevPtr^[j];
+          GWhzR^[j] := GWhzR^[j] + gpreZ * hPrevPtr^[j];
+          GWhnR^[j] := GWhnR^[j] + gwhn  * hPrevPtr^[j];
+          GhNextPtr^[j] := GhNextPtr^[j] +
+            gpreR * WhrR^[j] + gpreZ * WhzR^[j] + gwhn * WhnR^[j];
+        end;
+      if hasInputGrad then
+        for j := 0 to DepthM1 do
+          PrevErrPtr^[j] := PrevErrPtr^[j] +
+            gpreR * WirR^[j] + gpreZ * WizR^[j] + gpreN * WinR^[j];
+    end;
+    FGh.Copy(FGhNext);
+  end;
+  for j := 0 to 5 do
+    TNNetVolume.MulAdd(FNeurons[j].FDelta.GetRawPtr(), FGradW[j].GetRawPtr(),
+      -FLearningRate, FNeurons[j].FWeights.Size);
+  for j := 0 to 3 do
+    TNNetVolume.MulAdd(FNeurons[6 + j].FDelta.GetRawPtr(), FGradB[j].GetRawPtr(),
+      -FLearningRate, Depth);
+  if (not FBatchUpdate) then
+  begin
+    for j := 0 to 10 do FNeurons[j].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetGRUCell.InitDefault();
+var Depth, d, j, ii, oldSeed, DepthM1: integer;
+begin
+  if FNeurons.Count < 11 then AddMissingNeurons(11);
+  Depth := FNeurons[6].FWeights.Size;
+  DepthM1 := Depth - 1;
+  oldSeed := RandSeed;
+  RandSeed := 314159;
+  for d := 0 to DepthM1 do
+    for j := 0 to DepthM1 do
+      for ii := 0 to 5 do
+        FNeurons[ii].FWeights[d, 0, j] :=
+          FNeurons[ii].FWeights.RandomGaussianValue() * 0.05;
+  for ii := 6 to 10 do FNeurons[ii].FWeights.Fill(0);
   RandSeed := oldSeed;
   AfterWeightUpdate();
 end;
@@ -97310,6 +97906,8 @@ begin
       'TNNetClosedFormContinuous':  Result := TNNetClosedFormContinuous.Create();
       'TNNetSLSTMCell':             Result := TNNetSLSTMCell.Create();
       'TNNetMLSTMCell':             Result := TNNetMLSTMCell.Create();
+      'TNNetLSTMCell':              Result := TNNetLSTMCell.Create();
+      'TNNetGRUCell':               Result := TNNetGRUCell.Create();
       'TNNetMinGRU':                Result := TNNetMinGRU.Create();
       'TNNetMinLSTM':               Result := TNNetMinLSTM.Create();
       'TNNetSincConv1D':            Result := TNNetSincConv1D.Create(St[0], St[1], St[2], Ft[0]);
@@ -97731,6 +98329,8 @@ begin
       if S[0] = 'TNNetClosedFormContinuous' then Result := TNNetClosedFormContinuous.Create() else
       if S[0] = 'TNNetSLSTMCell' then Result := TNNetSLSTMCell.Create() else
       if S[0] = 'TNNetMLSTMCell' then Result := TNNetMLSTMCell.Create() else
+      if S[0] = 'TNNetLSTMCell' then Result := TNNetLSTMCell.Create() else
+      if S[0] = 'TNNetGRUCell' then Result := TNNetGRUCell.Create() else
       if S[0] = 'TNNetMinGRU' then Result := TNNetMinGRU.Create() else
       if S[0] = 'TNNetMinLSTM' then Result := TNNetMinLSTM.Create() else
       if S[0] = 'TNNetSincConv1D' then Result := TNNetSincConv1D.Create(St[0], St[1], St[2], Ft[0]) else

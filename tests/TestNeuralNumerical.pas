@@ -452,6 +452,12 @@ type
     procedure TestMinLSTMInputGradientCheck;
     procedure TestMinLSTMWeightGradientCheck;
     procedure TestMinLSTMSerializationRoundTrip;
+    procedure TestLSTMCellInputGradientCheck;
+    procedure TestLSTMCellWeightGradientCheck;
+    procedure TestLSTMCellSerializationRoundTrip;
+    procedure TestGRUCellInputGradientCheck;
+    procedure TestGRUCellWeightGradientCheck;
+    procedure TestGRUCellSerializationRoundTrip;
     procedure TestSincConv1DInputGradientCheck;
     procedure TestSincConv1DWeightGradientCheck;
     procedure TestSincConv1DSerializationRoundTrip;
@@ -34541,6 +34547,349 @@ begin
   RandSeed := 424242;
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetMinLSTM.Create(), 'MinLSTM', 4, 1, 3, 1e-5);
+end;
+
+// --- TNNetLSTMCell / TNNetGRUCell (classic recurrent-gated cells) ------------
+
+// Deterministic, non-trivial weights for the classic LSTM cell: every gate's
+// input AND recurrent projection, plus the four biases (forget-bias started
+// off +1), so the full BPTT carry of dL/dc and dL/dh is exercised.
+procedure SeedLSTMCell(L: TNNetLSTMCell; Depth: integer);
+var d, j: integer;
+begin
+  for d := 0 to Depth - 1 do
+  begin
+    for j := 0 to Depth - 1 do
+    begin
+      L.Neurons[0].Weights[d, 0, j] := Sin(d * 1.1 + j * 0.6) * 0.25; // W_ii
+      L.Neurons[1].Weights[d, 0, j] := Cos(d * 0.7 - j * 0.9) * 0.20; // W_if
+      L.Neurons[2].Weights[d, 0, j] := Sin(d * 0.5 + j * 0.3) * 0.20; // W_ig
+      L.Neurons[3].Weights[d, 0, j] := Cos(d * 0.9 - j * 0.4) * 0.25; // W_io
+      L.Neurons[4].Weights[d, 0, j] := Sin(d * 0.3 - j * 0.8) * 0.15; // W_hi
+      L.Neurons[5].Weights[d, 0, j] := Cos(d * 0.6 + j * 0.2) * 0.12; // W_hf
+      L.Neurons[6].Weights[d, 0, j] := Sin(d * 0.8 - j * 0.5) * 0.12; // W_hg
+      L.Neurons[7].Weights[d, 0, j] := Cos(d * 0.4 + j * 0.7) * 0.15; // W_ho
+    end;
+    L.Neurons[8].Weights.Raw[d]  := Cos(d * 0.5) * 0.3;       // b_i
+    L.Neurons[9].Weights.Raw[d]  := Sin(d * 0.4) * 0.2 + 0.5; // b_f
+    L.Neurons[10].Weights.Raw[d] := Cos(d * 0.6) * 0.2;       // b_g
+    L.Neurons[11].Weights.Raw[d] := Sin(d * 0.7) * 0.3;       // b_o
+  end;
+end;
+
+// Deterministic weights for the classic GRU cell: r/z/n input and recurrent
+// projections plus the four biases (b_r, b_z, b_in, b_hn). The candidate gate's
+// r_t*(W_hn h + b_hn) coupling is a classic spot for a silent BPTT bug.
+procedure SeedGRUCell(L: TNNetGRUCell; Depth: integer);
+var d, j: integer;
+begin
+  for d := 0 to Depth - 1 do
+  begin
+    for j := 0 to Depth - 1 do
+    begin
+      L.Neurons[0].Weights[d, 0, j] := Sin(d * 1.0 + j * 0.5) * 0.25; // W_ir
+      L.Neurons[1].Weights[d, 0, j] := Cos(d * 0.8 - j * 0.7) * 0.20; // W_iz
+      L.Neurons[2].Weights[d, 0, j] := Sin(d * 0.6 + j * 0.4) * 0.20; // W_in
+      L.Neurons[3].Weights[d, 0, j] := Sin(d * 0.4 - j * 0.7) * 0.15; // W_hr
+      L.Neurons[4].Weights[d, 0, j] := Cos(d * 0.5 + j * 0.3) * 0.12; // W_hz
+      L.Neurons[5].Weights[d, 0, j] := Sin(d * 0.9 - j * 0.6) * 0.12; // W_hn
+    end;
+    L.Neurons[6].Weights.Raw[d] := Cos(d * 0.5) * 0.3; // b_r
+    L.Neurons[7].Weights.Raw[d] := Sin(d * 0.4) * 0.2; // b_z
+    L.Neurons[8].Weights.Raw[d] := Cos(d * 0.6) * 0.2; // b_in
+    L.Neurons[9].Weights.Raw[d] := Sin(d * 0.7) * 0.3; // b_hn
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLSTMCellInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  L: TNNetLSTMCell;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 3);
+  InputPlus := TNNetVolume.Create(3, 1, 3);
+  Desired := TNNetVolume.Create(3, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 3, 1));
+    L := TNNetLSTMCell.Create();
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.9;
+    SeedLSTMCell(L, 3);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('LSTMCell input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('LSTMCell input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLSTMCellWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  L: TNNetLSTMCell;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 3);
+  Desired := TNNetVolume.Create(3, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 3, 1));
+    L := TNNetLSTMCell.Create();
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 1.3 + 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.8;
+    SeedLSTMCell(L, 3);
+
+    // Cover all twelve weight tensors (eight DepthxDepth projections + four
+    // Depth-long biases). The recurrent W_h* paths are the classic BPTT trap.
+    for n := 0 to 11 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('LSTMCell weight gradient check neuron ' + IntToStr(n) +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('LSTMCell weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLSTMCellSerializationRoundTrip;
+begin
+  // LSTMCell stores twelve learnable tensors (eight DepthxDepth projections plus
+  // four Depth-long biases); the perturbed-weights helper pushes them off defaults.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetLSTMCell.Create(), 'LSTMCell', 4, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestGRUCellInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  L: TNNetGRUCell;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 3);
+  InputPlus := TNNetVolume.Create(3, 1, 3);
+  Desired := TNNetVolume.Create(3, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 3, 1));
+    L := TNNetGRUCell.Create();
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.9;
+    SeedGRUCell(L, 3);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('GRUCell input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('GRUCell input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGRUCellWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  L: TNNetGRUCell;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 3);
+  Desired := TNNetVolume.Create(3, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 3, 1));
+    L := TNNetGRUCell.Create();
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 1.3 + 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.8;
+    SeedGRUCell(L, 3);
+
+    // Cover the ten learnable tensors that carry gradient (six DepthxDepth
+    // projections + four Depth-long biases; the spare bias [10] stays zero). The
+    // candidate's r_t*(W_hn h + b_hn) coupling is exercised here.
+    for n := 0 to 9 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('GRUCell weight gradient check neuron ' + IntToStr(n) +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('GRUCell weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGRUCellSerializationRoundTrip;
+begin
+  // GRUCell stores eleven tensors (six DepthxDepth projections + five Depth-long
+  // biases, one spare); the perturbed-weights helper pushes them off defaults.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetGRUCell.Create(), 'GRUCell', 4, 1, 3, 1e-5);
 end;
 
 // --- TNNetSincConv1D (parametrized SincNet band-pass front-end) --------------
