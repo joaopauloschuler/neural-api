@@ -378,13 +378,22 @@ rather than acted on.
       into a Qwen2 / InternLM2 decoder (both importers already landed). The reusable
       new piece is the pixel-unshuffle token reducer + dynamic-tiling image
       preprocessor; verify on the 1B checkpoint against a transformers reference.
-- [ ] DINOv3 self-supervised ViT backbone importer
-      (`BuildDINOv3FromSafeTensors[Ex]`, facebook/dinov3-*). Successor to the
-      landed DINOv2 tower: same ViT body but with Gram-anchoring-trained weights,
-      RoPE-based position embedding (reuse the landed RoPE) and register tokens.
-      Reuse the DINOv2/ViT tower; the new bits are the position-embedding swap and
-      register-token handling. Pairs with the open "register-token DINOv2 backbones
-      rejected by BuildDPT" follow-up and unblocks DINOv3-backed dense-prediction.
+- [X] DINOv3 self-supervised ViT backbone importer LANDED
+      (`BuildDINOv3FromSafeTensors[Ex/WithConfig]`, HF model_type "dinov3_vit",
+      facebook/dinov3-*). Successor to the landed DINOv2 tower: same pre-LN ViT
+      body + LayerScale, but with 2-D AXIAL RoPE on the patch tokens (new
+      TNNetVisionRoPE2D leaf + AddMultiHeadVisionRoPE2DAttention builder; base
+      rope_theta, CLS+register prefix tokens unrotated, same cos/sin across
+      layers), register tokens prepended after CLS (learned per-row table into
+      zero-padded prefix slots), BERT-unfused q/k/v/o_proj with UNbiased key,
+      and Gram-anchoring weights. Parity tested < 1e-4 vs a float64 HF
+      DINOv3ViTModel oracle (tools/dinov3_tiny_fixture.py; transformers 5.11
+      ships dinov3_vit so the oracle is real, no hand-roll). Scalar + AVX2 green.
+      Deferred follow-ups: use_gated_mlp (SwiGLU giant) variant rejected (only
+      plain up_proj/down_proj+gelu wired); non-square / non-native image_size
+      (dynamic RoPE grid) not yet plumbed - TNNetVisionRoPE2D is fixed to the
+      build-time grid. Still unblocks DINOv3-backed dense-prediction once the
+      "register-token DINOv2 backbones rejected by BuildDPT" follow-up lands.
 
 - [ ] Kandinsky 2.2 unCLIP text-to-image importer
       (`BuildKandinskyPriorFromSafeTensors[Ex]` + `BuildKandinskyDecoderFromSafeTensors[Ex]`,
