@@ -37649,29 +37649,37 @@ end;
 
 procedure TNNetSimpleGate.Compute();
 var
-  IX, IY, IC: integer;
-  MaxIX, MaxIY, HalfDepth, MaxC: integer;
+  IX, IY: integer;
+  MaxIX, MaxIY, HalfDepth: integer;
+  OutPtr, FirstPtr, SecondPtr: TNeuralFloatArrPtr;
   StartTime: double;
 begin
   StartTime := Now();
   HalfDepth := FOutput.Depth;
   MaxIX := FPrevLayer.Output.SizeX - 1;
   MaxIY := FPrevLayer.Output.SizeY - 1;
-  MaxC := HalfDepth - 1;
+  // Depth is the contiguous innermost axis, so for each (x,y) the first-half
+  // channel column [0..HalfDepth-1] and the second-half column
+  // [HalfDepth..2*HalfDepth-1] are each a contiguous run of HalfDepth floats.
+  // Copy the first half into the output column, then multiply it in place by
+  // the second half with the AVX-vectorized element-wise product.
   for IX := 0 to MaxIX do
     for IY := 0 to MaxIY do
-      for IC := 0 to MaxC do
-        FOutput[IX, IY, IC] :=
-          FPrevLayer.FOutput[IX, IY, IC] *
-          FPrevLayer.FOutput[IX, IY, HalfDepth + IC];
+    begin
+      OutPtr := FOutput.GetRawPtr(IX, IY, 0);
+      FirstPtr := FPrevLayer.FOutput.GetRawPtr(IX, IY, 0);
+      SecondPtr := FPrevLayer.FOutput.GetRawPtr(IX, IY, HalfDepth);
+      system.Move(FirstPtr^, OutPtr^, HalfDepth * SizeOf(TNeuralFloat));
+      TNNetVolume.Mul(OutPtr, SecondPtr, HalfDepth);
+    end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetSimpleGate.Backpropagate();
 var
-  IX, IY, IC: integer;
-  MaxIX, MaxIY, HalfDepth, MaxC: integer;
-  Err: TNeuralFloat;
+  IX, IY: integer;
+  MaxIX, MaxIY, HalfDepth: integer;
+  ErrPtr, FirstPtr, SecondPtr, DErrFirstPtr, DErrSecondPtr: TNeuralFloatArrPtr;
   StartTime, LocalNow: double;
 begin
   StartTime := Now();
@@ -37684,18 +37692,21 @@ begin
     HalfDepth := FOutput.Depth;
     MaxIX := FPrevLayer.Output.SizeX - 1;
     MaxIY := FPrevLayer.Output.SizeY - 1;
-    MaxC := HalfDepth - 1;
+    // Product rule, vectorized per contiguous (x,y) depth column:
+    //   dIn[c]            += Err[c] * In[HalfDepth+c]
+    //   dIn[HalfDepth+c]  += Err[c] * In[c]
+    // MulAdd(A, B, C, n) computes A[i] += B[i]*C[i] with AVX.
     for IX := 0 to MaxIX do
       for IY := 0 to MaxIY do
-        for IC := 0 to MaxC do
-        begin
-          Err := FOutputError[IX, IY, IC];
-          // Product rule: d/d(a) = err*b ; d/d(b) = err*a.
-          FPrevLayer.OutputError.Add(IX, IY, IC,
-            Err * FPrevLayer.FOutput[IX, IY, HalfDepth + IC]);
-          FPrevLayer.OutputError.Add(IX, IY, HalfDepth + IC,
-            Err * FPrevLayer.FOutput[IX, IY, IC]);
-        end;
+      begin
+        ErrPtr := FOutputError.GetRawPtr(IX, IY, 0);
+        FirstPtr := FPrevLayer.FOutput.GetRawPtr(IX, IY, 0);
+        SecondPtr := FPrevLayer.FOutput.GetRawPtr(IX, IY, HalfDepth);
+        DErrFirstPtr := FPrevLayer.OutputError.GetRawPtr(IX, IY, 0);
+        DErrSecondPtr := FPrevLayer.OutputError.GetRawPtr(IX, IY, HalfDepth);
+        TNNetVolume.MulAdd(DErrFirstPtr, ErrPtr, SecondPtr, HalfDepth);
+        TNNetVolume.MulAdd(DErrSecondPtr, ErrPtr, FirstPtr, HalfDepth);
+      end;
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
