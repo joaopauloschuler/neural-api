@@ -224,17 +224,6 @@ rather than acted on.
 
 ### Computer vision & generative models
 
-- [X] `TNNetGramMatrix` reusable layer — channel-wise Gram matrix LANDED
-      (commit 19ec9be0; `G[i,j] = (1/(C·H·W)) · Σ_{x,y} A[x,y,i]·A[x,y,j]`,
-      output Depth×Depth×1, symmetrized analytic backward correct for
-      non-symmetric incoming dG; registered in both CreateLayer dispatch paths;
-      `// Coded by Claude (AI).`; README layer row; `TestGramMatrixGradientCheck`
-      + `TestGramMatrixLoadFromString`). SCOPE CORRECTION: only
-      `examples/StyleTransfer` actually had a hand-made `ComputeGram` (ported onto
-      the layer, style loss 9.82→0.68 unchanged); `AdaINStyleTransfer` uses
-      `TNNetAdaIN` (no Gram) and `CycleGAN` has no Gram statistic — neither
-      needed changes.
-
 - [ ] FastSAM real-time segment-anything importer (`BuildFastSAMFromSafeTensors[Ex]`,
       ultralytics FastSAM-s / FastSAM-x). Architecturally distinct from the landed
       ViT-encoder SAM path: FastSAM reframes "segment everything" as a YOLOv8
@@ -989,37 +978,6 @@ rather than acted on.
       existing parity tests (TestHiFiGANSynthesisParity / TestVitsSynthesisParity /
       EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
       before/after.
-
-- [X] AVX-vectorize `TNNetPixelNorm` LANDED (commit 52a99b2e): forward
-      sum-of-squares via `DotProduct(OutPtr,OutPtr,Depth)` + rescale via
-      `Mul(OutPtr,InvRMS,Depth)`; backward via `DotProduct(gy,y,Depth)/Depth`
-      projection + two `MulAdd` over the contiguous depth column (mirrors
-      `TNNetL2Normalize.BackpropagatePerDepth`); InvRMS/epsilon kept byte-identical
-      to the scalar path. `TestPixelNorm{Forward,GradientCheck,SerializationRoundTrip}`
-      green on scalar AND clean `-dAVX2 -B` builds (the only AVX failure is the
-      pre-existing `TestSetTrainableKeepsOutputs` FP-ordering flake in the Bugs
-      section, confirmed unrelated via git stash).
-
-- [X] OpenCL offload of `TNNetCorrelationVolume.Compute` LANDED (commit 71b22484):
-      the whole W²·H² correlation maps onto one `cai_dot_product` GEMM via the
-      inherited shared `FDotCL: TDotProductSharedKernel` (A = f1 transposed
-      column-major, B = f2 passed directly in its native depth-contiguous layout,
-      result transposed + 1/sqrt(C) scaled into FOutput). `EnableOpenCL` override
-      + `FShouldOpenCL` gate (dispatches only when W*H>=16), AVX/scalar path is
-      the unchanged fallback. `CorrelationVolumeOpenCLParity` asserts ShouldOpenCL
-      and matches CPU max|diff|=1.19e-7 on PoCL CPU; full suite green on default
-      and `-dOpenCL` builds.
-
-- [X] OpenCL offload of `TNNetCorrelationLookup.Compute` LANDED (commit 92780ac7):
-      reuses the existing shared `cai_bilinear_gather` kernel (via
-      `TNNetBilinearGatherCL`) — each output element samples a scalar from the
-      correlation volume, so the gather runs Depth=1 with the 4 corners as full
-      flat indices into the volume's FData and masked taps→-1 (kernel emits 0);
-      device raster order matches the output so the result Moves straight into
-      FOutput. No new kernel/host machinery. `EnableOpenCL` + `FShouldOpenCL` gate
-      on `>= NeuralConvOpenCLMinWork`, scalar path is the fallback.
-      `CorrelationLookupOpenCLParity` asserts ShouldOpenCL and matches CPU
-      max|diff|=6.0e-8 on PoCL CPU; full suite green on default and `-dOpenCL`.
 
 - [ ] AVX-vectorize `TNNetCosineSimilarity` (Compute + Backpropagate). Both are
       still raw scalar `for D` reductions over a depth-contiguous column (the two
