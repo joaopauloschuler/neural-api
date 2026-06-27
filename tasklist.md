@@ -381,21 +381,10 @@ rather than acted on.
       reader/ToString, resnet18 parity 1.0e-6 vs a numpy float64 oracle —
       torchvision not installed; ConvNeXt LayerScale+GRN+depthwise-7x7 is the
       modern-CNN stretch goal on the same path):
-  - [X] real torchvision .pth (pickle) load path: CreatePretrainedTensorReader
-        now dispatches .pth/.pt (and existing .bin) to TNNetTorchBinReader, so
-        BuildResNetFromSafeTensors[Ex] loads a torchvision state_dict .pth
-        directly (same conv-BN fold + config reader on the torch-bin source).
-        Stem maxpool reconciled (option a): TResNetConfig.PyTorchMaxPool (default
-        TRUE; opt back to legacy CAI ceil maxpool with "cai_maxpool":true) selects
-        TNNetMaxPoolPortable for the stem, which on the post-ReLU non-negative stem
-        input reproduces PyTorch floor-sized/(-inf)-pad maxpool BIT-FOR-BIT (no new
-        class needed; verified vs numpy floor+(-inf) ref + against the .safetensors
-        path < 1e-4). Tests: TestResNetTorchBinPthParity (.pth==.safetensors logits),
-        TestResNetPyTorchStemMaxPool (floor/(-inf) exact), pico_resnet18.{pth,
-        safetensors,_config.json} fixtures. Pico CAI-oracle fixtures18/34/50 pinned
-        to "cai_maxpool":true so their numpy oracles still match.
-        REMAINS: real downloaded torchvision resnet18/50 top-1 over ImageNet val
-        (torchvision still not installed); ConvNeXt modern-CNN stretch goal.
+  - [ ] real downloaded torchvision resnet18/50 top-1 over ImageNet val
+        (torchvision not installed here); ConvNeXt modern-CNN stretch goal. (The
+        torchvision .pth load path + PyTorch stem maxpool reconciliation have
+        landed.)
 - [ ] Stable Diffusion VAE decoder importer follow-ups (BuildVaeDecoderFromSafeTensors[Ex]
       LANDED, commit a7870a1: diffusers AutoencoderKL decoder — post_quant_conv ->
       mid block single self-attention over HxW -> up blocks of ResNet groups +
@@ -407,19 +396,10 @@ rather than acted on.
         installable; SDXL VAE uses different group counts / multi-head attention.
   - [ ] SD UNet importer LANDED (BuildSDUNetFromSafeTensors[Ex] + SDUNetDenoise,
         UNet2DConditionModel v1; TestSDUNetParity 2.75e-6 < 1e-4). Open follow-ups:
-    - [X] per-block heads array wired through TSDUNetConfig: attention_head_dim
-          may now be a LIST (one per-head DIM per block; SDXL-style) -> heads[b]
-          = block_out_channels[b]/dim[b], threaded into each down/mid/up
-          Transformer2D via Config.HeadsPerBlock (AddSDTransformer2D takes a Heads
-          arg). Scalar attention_head_dim keeps the historical CONSTANT-heads
-          (BlockOut[0]/dim everywhere) semantics BIT-IDENTICALLY. New pico fixture
-          tools/sd_unet_perblock_heads_tiny_fixture.py (heads=[4,2], both blocks
-          attended) + TestSDUNetPerBlockHeadsParity matches the numpy float64
-          oracle < 1e-4. NOTE: num_attention_heads (the confusingly-named explicit
-          head COUNT in newer configs) is intentionally NOT read; importer keys on
-          attention_head_dim only. STILL DEFERRED: real-checkpoint parity
-          (runwayml/stable-diffusion-v1-5 / SDXL unet) once diffusers is
-          installable.
+    - [ ] real-checkpoint parity (runwayml/stable-diffusion-v1-5 / SDXL unet)
+          once diffusers is installable. (Per-block attention-head arrays —
+          SDXL-style attention_head_dim list via Config.HeadsPerBlock — have
+          landed, parity < 1e-4.)
     - [ ] the end-to-end LatentTextToImage capstone (CLIP text -> this UNet ->
           scheduler loop -> VAE decoder), incl. the SDXL dual-text-encoder pooled
           embedding + real-checkpoint parity.
@@ -437,24 +417,6 @@ rather than acted on.
           (Heads loop) but only parity-verified at Heads=1;
       (d) a real-checkpoint smoke once a swin-tiny-semantic checkpoint is obtainable
           offline (the importer is config-driven and ready).
-- [X] Real-ESRGAN / ESRGAN importer follow-ups (BuildRRDBNet[FromSafeTensors][Ex]
-      + TRRDBNetConfig LANDED in neuralpretrained.pas; RRDBNet x4 with
-      NEAREST-interpolate conv upsampling via TNNetDeMaxPool(2), parametrized
-      TNNetLeakyReLU.Create(pAlpha) 0.2 slope; pico parity TestRRDBNetParity
-      max|diff| < 1e-4 vs a numpy float64 oracle):
-  - [X] (a) realesrgan .pth pickle load (TNNetTorchBinReader path): the .pth
-        dispatch in CreatePretrainedTensorReader reaches RRDBNet; added a
-        params_ema/params/state_dict/model wrapper-dict UNWRAP to
-        TNNetTorchBinReader.Unpickle (Real-ESRGAN nests its state_dict under
-        'params_ema'). TestRRDBNetParityPth loads tiny_rrdbnet.pth (params_ema-
-        wrapped) and matches the safetensors oracle < 1e-4.
-  - [X] (b) end-to-end tiny PNG upscale example examples/RealESRGANUpscale:
-        builds the committed pico RRDBNet, writes/reads a 6x6 PNG via
-        neuraldatasets Save/LoadImageFromVolumeIntoFile, x4 (6x6->24x24) and x2
-        (6x6->12x12) upscale, writes output PNGs. Listed in examples/README.md.
-  - [X] (c) scale=2 support: TRRDBNetConfig.Scale threaded so scale=2 builds one
-        upsample stage (conv_up1 only) and scale=4 builds two (bit-identical to
-        before). TestRRDBNetParityScale2 vs a numpy float64 oracle < 1e-4.
 - [ ] NAFNet image-restoration importer follow-ups (BuildNAFNetFromSafeTensors[Ex]
       + TNAFNetConfig LANDED — TNNetSimpleGate gate layer + Simplified Channel
       Attention + U-Net of NAFBlocks with LayerNorm2d / depthwise 3x3 / PixelShuffle;
@@ -1695,12 +1657,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       (the forward + cleanly-mappable backward paths are done; these are the
       strided-on-one-operand remainders that a single DotProduct/MulAdd cannot cover
       without an extra gather):
-  - [X] TNNetDeformableConv / DCNv2 backward — per-(ox,oy,tap) gather of the raw-
-        sample + dS/dpx + dS/dpy ci-columns ONCE (reused across co), main-/offset-
-        weight grads via ci-contiguous deltas (FMWDeltaCI/FOWDeltaCI, transposed
-        back), input-grad MulAdd of FWeightCI/FOWeightCI rows into the contiguous
-        PrevErr corner columns, offset/dMod grads via DotProduct. Main-weight grad
-        bit-identical scalar; input/offset ~1e-6. Suite green scalar + -dAVX2.
   - [ ] TNNetTestTimeTraining / TNNetTitansMemory backward "undo" loops (interleaved
         scalar etaGrad/dEta/dTheta accumulation) — the per-token forward rank-1 writes
         are vectorized; this is the lower-value remainder.
