@@ -1568,21 +1568,6 @@ rather than acted on.
         the shape — `tools/torch_rnn_tiny_fixture.py`). Unblocks the pyannote
         `segmentation-3.0` real bidirectional-LSTM trunk drop-in.
 
-- [ ] OpenCL forward offload for the Winograd F(2x2,3x3) fast-conv `M`-stage in
-      `TNNetConvolution` (`EnableWinograd` path). The opt-in Winograd forward
-      (`ComputeWinogradCPU`) is CPU-only today; its dominant cost is the per-tile
-      batched GEMM `M[p,tile,o] = Σ_c U[p,o,c]·V[p,tile,c]` — 16 independent
-      `(NumNeurons × NumTiles)`-over-`InputDepth` matmuls (one per 4x4 tile
-      position `p`), which is exactly the shape the existing `cai_dot_product`
-      kernel already offloads for the direct im2col conv. Wire a `ComputeOpenCL`
-      that uploads the cached transformed kernels `FWinogradKernels` (rebuilt only
-      on `AfterWeightUpdate`, so it stays resident) and per-pass transformed inputs
-      `FWinogradInput`, runs the 16 GEMMs on device, and keeps the cheap input/
-      output 4x4 transforms (`BᵀdB`, `AᵀmA`) on CPU. Gate behind `FShouldOpenCL`
-      with a `WinogradOpenCLParity` exact-vs-CPU test (reuse the `SDPAOpenCLParity`
-      harness style). Real value: Winograd already cuts the 3x3 stride-1 conv MACs
-      ~2.25x on CPU; offloading the GEMM stage stacks that with GPU throughput for
-      the dominant conv in every CV backbone/diffusion UNet, with no new kernel.
 - [ ] OpenCL forward offload for `TNNetCausalLinearAttention` (the non-causal global
       `TNNetLinearAttention` is now DONE — `ComputeOpenCL` two-GEMM offload behind
       `FShouldOpenCL` + `LinearAttentionOpenCLParity` exact-vs-CPU test, PoCL-verified

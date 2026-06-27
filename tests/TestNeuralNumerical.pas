@@ -297,6 +297,8 @@ type
     // OpenCL two-GEMM forward offload parity (vs CPU) for the non-causal global
     // TNNetLinearAttention.
     procedure LinearAttentionOpenCLParity;
+    // OpenCL Winograd F(2x2,3x3) M-stage forward offload parity (vs CPU Winograd).
+    procedure WinogradOpenCLParity;
     procedure TestRoIAlignForward;
     procedure TestRoIAlignInputGradientCheck;
     procedure TestRoIAlignShapeInference;
@@ -59009,6 +59011,75 @@ begin
     end;
     WriteLn('  LinearAttention OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('LinearAttention OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Winograd F(2x2,3x3) fast conv splits the forward into cheap 4x4 input/output
+// transforms (CPU in both paths) plus the dominant M-stage: 16 independent
+// (NumNeurons x NumTiles)-over-InputDepth GEMMs. ComputeWinogradOpenCL offloads
+// only those 16 GEMMs to the shared cai_dot_product kernel (one dispatch per
+// tile-position). This pins the device Winograd forward bit-close to the CPU
+// Winograd forward on a fixed bounded fixture; the only divergence is FP32 GEMM
+// accumulation order, so a tight 1e-4 gate (PoCL CPU-backed -> typically ~1e-6).
+procedure TTestNeuralNumerical.WinogradOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Conv: TNNetConvolution;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  // 9x7x5 input -> odd output size exercises the ragged-edge tile handling.
+  Input := TNNetVolume.Create(9, 7, 5);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(9, 7, 5, 1));
+    // 6 features, 3x3, pad1, stride1 -> the exact shape Winograd handles.
+    Conv := TNNetConvolution.Create(6, 3, 1, 1, 0);
+    NN.AddLayer(Conv);
+    Conv.EnableWinograd(true);
+
+    // Bounded input so outputs stay O(1) and the 1e-4 absolute gate is meaningful.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.5 * Sin(i * 0.3) + 0.2 * Cos(i * 0.11);
+
+    // CPU Winograd forward (OpenCL OFF).
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    // Device Winograd forward (M-stage GEMMs offloaded).
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    MaxDiff := 0;
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  Winograd OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('Winograd OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free;

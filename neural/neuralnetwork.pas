@@ -11020,6 +11020,17 @@ type
       FWinogradM: TNNetVolume;         // (16, NumTiles, NumNeurons): per-tile transformed products M[p,tile,o]
       FWinogradKernelsValid: boolean;  // cache flag invalidated by AfterWeightUpdate
       {$IFDEF OpenCL}
+      // Resident transposed Winograd kernel pack for the device M-stage GEMMs:
+      // per tile-pos p, the (NumNeurons x InputDepth) block is stored column-major
+      // as [c*NumNeurons + o] (the cai_dot_product A operand layout). Rebuilt only
+      // when FWinogradKernelsValid flips false (AfterWeightUpdate), so it stays
+      // resident across forwards. FWgUp/FWgVp/FWgMp are the single tile-position
+      // operand/result slices fed to the shared dot-product kernel each GEMM.
+      FWinogradKernelsT: TNNetVolume; // (16, InputDepth, NumNeurons): U^T[p,c,o]
+      FWinogradKernelsTValid: boolean;
+      FWgUp: TNNetVolume;             // A slice: [c*NumNeurons + o]  (length N*C)
+      FWgVp: TNNetVolume;             // B slice: [tile*InputDepth + c] (length T*C)
+      FWgMp: TNNetVolume;             // result slice: [tile*NumNeurons + o] (T*N)
       // Scratch operands for the device im2col-GEMM backward of the general
       // (FeatureSize>1) conv. The activation-derivative pass and the input-grad
       // scatter stay on the CPU; only the two dense contractions
@@ -11034,6 +11045,10 @@ type
       function WinogradEligible(): boolean; {$IFDEF Release} inline; {$ENDIF}
       procedure BuildWinogradKernels();
       procedure ComputeWinogradCPU();
+      {$IFDEF OpenCL}
+      procedure BuildWinogradKernelsT();
+      procedure ComputeWinogradOpenCL();
+      {$ENDIF}
       procedure ComputeCPU();
       procedure ComputeTiledCPU();
       procedure ComputeInterleaved();
@@ -80580,6 +80595,14 @@ procedure TNNetConvolution.ComputeOpenCL();
 var
   InputAVolume: TNNetVolume;
 begin
+  // Winograd F(2x2,3x3) device forward: when the layer is Winograd-eligible the
+  // 16 per-tile-position channel-reduction GEMMs are offloaded to the shared
+  // cai_dot_product kernel (the cheap 4x4 input/output transforms stay on CPU).
+  if WinogradEligible() then
+  begin
+    ComputeWinogradOpenCL();
+    Exit;
+  end;
   if FShouldInterleaveWeights then
   begin
     if FConcatedWInter.Size < FNeurons[0].Weights.Size * FNeurons.Count then
@@ -80710,6 +80733,11 @@ begin
   FWinogradInput.Free;
   FWinogradM.Free;
   {$IFDEF OpenCL}
+  // Winograd device M-stage scratch (lazily allocated in ComputeWinogradOpenCL).
+  FWinogradKernelsT.Free;
+  FWgUp.Free;
+  FWgVp.Free;
+  FWgMp.Free;
   // Backward-GEMM scratch is lazily allocated in BackpropagateOpenCL; nil-Free
   // is safe when the device backward path was never taken.
   FBpOEDByDepth.Free;
@@ -80727,6 +80755,9 @@ begin
     then FStruct[7] := 1
     else FStruct[7] := 0;
   FWinogradKernelsValid := false;
+  {$IFDEF OpenCL}
+  FWinogradKernelsTValid := false;
+  {$ENDIF}
 end;
 
 function TNNetConvolution.WinogradEnabled(): boolean;
@@ -80962,6 +80993,204 @@ begin
   if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
   ApplyActivationFunctionToOutput();
 end;
+
+{$IFDEF OpenCL}
+procedure TNNetConvolution.BuildWinogradKernelsT();
+// Repack the cached Winograd kernel transform FWinogradKernels (16, NumNeurons,
+// InputDepth) into the column-major operand the shared cai_dot_product kernel
+// expects: per tile-pos p the (NumNeurons x InputDepth) block is laid out as
+// U^T[p, c, o] = FWinogradKernelsT[p][c][o] = [c*NumNeurons + o]. Resident:
+// rebuilt only when the kernel transform is invalidated (AfterWeightUpdate).
+var
+  NeuronCnt, InDepth, o, c, p, blockFloats: integer;
+begin
+  if (not FWinogradKernelsValid) then BuildWinogradKernels();
+  NeuronCnt := FNeurons.Count;
+  if NeuronCnt = 0 then Exit;
+  InDepth := FWinogradKernels.Depth;
+
+  // Flat resident pack: 16 contiguous per-p blocks, each laid out column-major
+  // as [c*NumNeurons + o]. (FWinogradKernels stores p on the fast X axis, so its
+  // per-p data is strided, not contiguous - gather it explicitly here.)
+  blockFloats := InDepth * NeuronCnt;
+  if (FWinogradKernelsT = nil) then FWinogradKernelsT := TNNetVolume.Create;
+  FWinogradKernelsT.ReSize(16 * blockFloats, 1, 1);
+
+  for p := 0 to 15 do
+    for o := 0 to NeuronCnt - 1 do
+      for c := 0 to InDepth - 1 do
+        FWinogradKernelsT.FData[p * blockFloats + c * NeuronCnt + o] :=
+          FWinogradKernels.FData[FWinogradKernels.GetRawPos(p, o, c)];
+  FWinogradKernelsTValid := true;
+end;
+
+procedure TNNetConvolution.ComputeWinogradOpenCL();
+// Device Winograd F(2x2,3x3) forward. The cheap 4x4 input transform (V=B^T d B)
+// and output transform (Y=A^T M A) stay on the CPU - identical to
+// ComputeWinogradCPU. Only the dominant M-stage, the 16 independent
+// (NumNeurons x NumTiles)-over-InputDepth GEMMs M[p,tile,o]=sum_c U[p,o,c]V[p,tile,c],
+// is offloaded: one cai_dot_product dispatch per tile-pos p (a = o, b = tile,
+// contraction i = c). Result layout per p is Res[tile*NumNeurons + o].
+var
+  InDepth, NeuronCnt, NeuronMax: integer;
+  TilesX, TilesY, NumTiles, MaxC: integer;
+  tx, ty, tile, baseX, baseY: integer;
+  sx, sy, ix, iy: integer;
+  c, p, o: integer;
+  d: array[0..3, 0..3] of TNeuralFloat;
+  Bd: array[0..3, 0..3] of TNeuralFloat;
+  V: array[0..3, 0..3] of TNeuralFloat;
+  mPtr, srcPtr: TNeuralFloatArrPtr;
+  M: array[0..3, 0..3] of TNeuralFloat;
+  AM: array[0..1, 0..3] of TNeuralFloat;
+  Y: array[0..1, 0..1] of TNeuralFloat;
+  i, j: integer;
+  outX, outY: integer;
+  pSliceFloats: integer;
+begin
+  // Resident kernel pack: rebuild/transpose only when invalidated.
+  if (not FWinogradKernelsTValid) then BuildWinogradKernelsT();
+
+  InDepth := FInputCopy.Depth;
+  NeuronCnt := FNeurons.Count;
+  NeuronMax := NeuronCnt - 1;
+  MaxC := InDepth - 1;
+
+  TilesX := (FOutputSizeX + 1) div 2;
+  TilesY := (FOutputSizeY + 1) div 2;
+  NumTiles := TilesX * TilesY;
+
+  if (FWinogradInput = nil) then FWinogradInput := TNNetVolume.Create;
+  if (FWinogradM = nil) then FWinogradM := TNNetVolume.Create;
+  if (FWgUp = nil) then FWgUp := TNNetVolume.Create;
+  if (FWgVp = nil) then FWgVp := TNNetVolume.Create;
+  if (FWgMp = nil) then FWgMp := TNNetVolume.Create;
+  FWinogradInput.ReSize(16, NumTiles, InDepth);
+  FWinogradM.ReSize(16, NumTiles, NeuronCnt);
+
+  // --- Input transform: build V[p, tile, :] (depth-contiguous over channels). ---
+  // Identical to the CPU path; FWinogradInput per-p slice is already row-major
+  // [tile*InDepth + c] = the cai_dot_product B operand layout.
+  for ty := 0 to TilesY - 1 do
+  begin
+    baseY := ty * 2;
+    for tx := 0 to TilesX - 1 do
+    begin
+      baseX := tx * 2;
+      tile := ty * TilesX + tx;
+      for c := 0 to MaxC do
+      begin
+        for sy := 0 to 3 do
+        begin
+          iy := baseY + sy;
+          for sx := 0 to 3 do
+          begin
+            ix := baseX + sx;
+            if (ix >= 0) and (ix < FInputCopy.SizeX) and
+               (iy >= 0) and (iy < FInputCopy.SizeY)
+              then d[sy][sx] := FInputCopy.Get(ix, iy, c)
+              else d[sy][sx] := 0;
+          end;
+        end;
+        for j := 0 to 3 do
+        begin
+          Bd[0][j] := d[0][j] - d[2][j];
+          Bd[1][j] := d[1][j] + d[2][j];
+          Bd[2][j] := -d[1][j] + d[2][j];
+          Bd[3][j] := d[1][j] - d[3][j];
+        end;
+        for i := 0 to 3 do
+        begin
+          V[i][0] := Bd[i][0] - Bd[i][2];
+          V[i][1] := Bd[i][1] + Bd[i][2];
+          V[i][2] := -Bd[i][1] + Bd[i][2];
+          V[i][3] := Bd[i][1] - Bd[i][3];
+        end;
+        for i := 0 to 3 do
+          for j := 0 to 3 do
+          begin
+            p := i * 4 + j;
+            FWinogradInput.FData[FWinogradInput.GetRawPos(p, tile, c)] := V[i][j];
+          end;
+      end;
+    end;
+  end;
+
+  // --- M-stage: 16 device GEMMs, one per tile-pos p. ---
+  // For each p: A = U^T[p] (N rows x C, col-major [c*N+o]); B = V[p] (T rows x C,
+  // row-major [tile*C+c]); cai_dot_product writes Res[b*FNumAs + a] = [tile*N+o].
+  FWgUp.ReSize(NeuronCnt * InDepth, 1, 1);
+  FWgVp.ReSize(NumTiles * InDepth, 1, 1);
+  FWgMp.ReSize(NumTiles * NeuronCnt, 1, 1);
+  pSliceFloats := NeuronCnt * InDepth;
+  for p := 0 to 15 do
+  begin
+    // Copy the contiguous p block of the resident transposed kernel pack ([c*N+o]).
+    srcPtr := FWinogradKernelsT.GetRawPtr(0, 0, 0);
+    for i := 0 to pSliceFloats - 1 do
+      FWgUp.FData[i] := srcPtr^[p * pSliceFloats + i];
+    // Gather the p slice of the transformed input into row-major [tile*InDepth+c].
+    // (FWinogradInput stores p on the fast X axis, so the slice is strided.)
+    for tile := 0 to NumTiles - 1 do
+      for c := 0 to MaxC do
+        FWgVp.FData[tile * InDepth + c] :=
+          FWinogradInput.FData[FWinogradInput.GetRawPos(p, tile, c)];
+
+    FDotCL.PrepareForCompute(FWgUp, FWgVp, InDepth);
+    FDotCL.Compute(FWgUp, FWgVp, {ActFN}0, {NewVAs}true, {NewVBs}true);
+    FDotCL.FinishAndLoadResult(FWgMp, 0);
+
+    // Scatter Res[tile*NeuronCnt + o] into FWinogradM[p, tile, o].
+    srcPtr := FWgMp.GetRawPtr(0, 0, 0);
+    for tile := 0 to NumTiles - 1 do
+      for o := 0 to NeuronMax do
+        FWinogradM.FData[FWinogradM.GetRawPos(p, tile, o)] :=
+          srcPtr^[tile * NeuronCnt + o];
+  end;
+
+  // --- Output transform Y = A^T M A and scatter into FOutputRaw (CPU). ---
+  for ty := 0 to TilesY - 1 do
+  begin
+    baseY := ty * 2;
+    for tx := 0 to TilesX - 1 do
+    begin
+      baseX := tx * 2;
+      tile := ty * TilesX + tx;
+      for o := 0 to NeuronMax do
+      begin
+        mPtr := FWinogradM.GetRawPtr(0, tile, o);
+        for i := 0 to 3 do
+          for j := 0 to 3 do
+            M[i][j] := mPtr^[(i * 4 + j) * NeuronCnt];
+        for j := 0 to 3 do
+        begin
+          AM[0][j] := M[0][j] + M[1][j] + M[2][j];
+          AM[1][j] := M[1][j] - M[2][j] - M[3][j];
+        end;
+        for i := 0 to 1 do
+        begin
+          Y[i][0] := AM[i][0] + AM[i][1] + AM[i][2];
+          Y[i][1] := AM[i][1] - AM[i][2] - AM[i][3];
+        end;
+        for i := 0 to 1 do
+        begin
+          outY := baseY + i;
+          if outY >= FOutputSizeY then Continue;
+          for j := 0 to 1 do
+          begin
+            outX := baseX + j;
+            if outX >= FOutputSizeX then Continue;
+            FOutputRaw.FData[FOutputRaw.GetRawPos(outX, outY, o)] := Y[i][j];
+          end;
+        end;
+      end;
+    end;
+  end;
+
+  if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
+  ApplyActivationFunctionToOutput();
+end;
+{$ENDIF}
 
 procedure TNNetConvolution.Compute();
   procedure ComputeOnCPU;
@@ -107988,6 +108217,9 @@ begin
   // rebuilt lazily on the next eligible forward. (Every weight mutation - train
   // step, InitWeights, importer load, FlushWeightCache - funnels through here.)
   FWinogradKernelsValid := false;
+  {$IFDEF OpenCL}
+  FWinogradKernelsTValid := false;
+  {$ENDIF}
   if ActiveLowMemory() then
   begin
     // Release the persistent weight caches the per-neuron forward does not need.
