@@ -467,6 +467,7 @@ type
     procedure TestClapFreqRatio4Parity;
     procedure TestClipScore;
     procedure TestClipVisionFeatures;
+    procedure TestOpenClipVisionTowerParity;
     procedure TestClipImagePreprocess;
     procedure TestSigLIPConfigFromJSONFile;
     procedure TestSigLIPParity;
@@ -17159,6 +17160,107 @@ begin
     ImageInput.Free;
     VisionNet.Free;
     Reader.Free;
+  end;
+end;
+
+// BuildOpenClipVisionTower parity on a pico open_clip-scheme ViT visual tower.
+// The fixture (tools/make_pico_openclip_fixture.py) is a RANDOM-init tower in
+// the flat "visual.*" open_clip key layout (fused attn.in_proj qkv, bias-free
+// visual.proj [width, output_dim], ln_pre/ln_post, gelu MLP); the oracle is a
+// self-contained numpy float64 pre-LN ViT forward (no open_clip lib needed,
+// since we own the weights) mirroring exactly what BuildClipVisionTower
+// computes - per-token ln_post then bias-free projection. We assert the imported
+// tower's full (num_tokens, output_dim) output matches < 1e-4. This exercises
+// the new key translation: fused qkv split, proj transpose, visual.* -> HF
+// vision_model.* renaming, and the gelu activation path.
+procedure TTestNeuralPretrained.TestOpenClipVisionTowerParity;
+var
+  VisionNet: TNNet;
+  CfgRoot, RefRoot: TJSONData;
+  CfgJson, RefJson: TStringList;
+  Tower: TClipTowerConfig;
+  ImageSize, PatchSize, NumChannels, ProjDim, NumTokens: integer;
+  Pixels, RowArr, ChanArr, RefOut, RefTok: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt, TokCnt, ColCnt: integer;
+  Diff, MaxDiff: double;
+  ActStr: string;
+begin
+  RandSeed := 424242;
+  CfgJson := TStringList.Create;
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  VisionNet := nil;
+  CfgRoot := nil;
+  RefRoot := nil;
+  try
+    CfgJson.LoadFromFile(FixturePath('tiny_openclip_config.json'));
+    CfgRoot := GetJSON(CfgJson.Text);
+    ImageSize := TJSONObject(CfgRoot).Get('image_size', 0);
+    PatchSize := TJSONObject(CfgRoot).Get('patch_size', 0);
+    NumChannels := TJSONObject(CfgRoot).Get('num_channels', 3);
+    ProjDim := TJSONObject(CfgRoot).Get('output_dim', 0);
+    Tower.HiddenSize := TJSONObject(CfgRoot).Get('width', 0);
+    Tower.IntermediateSize := TJSONObject(CfgRoot).Get('intermediate_size', 0);
+    Tower.NumLayers := TJSONObject(CfgRoot).Get('num_hidden_layers', 0);
+    Tower.NumHeads := TJSONObject(CfgRoot).Get('num_attention_heads', 0);
+    Tower.LayerNormEps := TJSONObject(CfgRoot).Get('layer_norm_eps', 1e-5);
+    ActStr := TJSONObject(CfgRoot).Get('hidden_act', 'gelu');
+    Tower.HiddenAct := ClipHiddenActFromString(ActStr);
+    NumTokens := Sqr(ImageSize div PatchSize) + 1;
+
+    VisionNet := BuildOpenClipVisionTower(
+      FixturePath('tiny_openclip.safetensors'), Tower,
+      ImageSize, PatchSize, NumChannels, ProjDim);
+
+    AssertEquals('output rows = num tokens', NumTokens,
+      VisionNet.GetLastLayer().Output.SizeX);
+    AssertEquals('output depth = output_dim', ProjDim,
+      VisionNet.GetLastLayer().Output.Depth);
+
+    RefJson.LoadFromFile(FixturePath('tiny_openclip_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));   // [C][H][W]
+    RefOut := TJSONArray(TJSONObject(RefRoot).Find('vision_output'));
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertTrue('vision_output present', RefOut <> nil);
+    AssertEquals('oracle has num_tokens rows', NumTokens, RefOut.Count);
+
+    ImageInput.ReSize(ImageSize, ImageSize, NumChannels);
+    for ChanCnt := 0 to NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to ImageSize - 1 do
+          ImageInput.FData[(YCnt * ImageSize + XCnt) * NumChannels + ChanCnt] :=
+            ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    VisionNet.Compute(ImageInput);
+
+    MaxDiff := 0;
+    for TokCnt := 0 to NumTokens - 1 do
+    begin
+      RefTok := TJSONArray(RefOut.Items[TokCnt]);
+      AssertEquals('output width', ProjDim, RefTok.Count);
+      for ColCnt := 0 to ProjDim - 1 do
+      begin
+        Diff := Abs(VisionNet.GetLastLayer().Output.FData[
+          TokCnt * ProjDim + ColCnt] - RefTok.Items[ColCnt].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('open_clip tower: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    CfgRoot.Free;
+    RefJson.Free;
+    CfgJson.Free;
+    ImageInput.Free;
+    VisionNet.Free;
   end;
 end;
 

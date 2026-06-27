@@ -7215,6 +7215,12 @@ function ReadClipConfigFromJSONFile(const FileName: string): TClipConfig;
 
 function ClipConfigToString(const Config: TClipConfig): string;
 
+// Maps a HF hidden_act string to the CLIP activation enum (quick_gelu / gelu /
+// gelu_new / gelu_pytorch_tanh); raises on anything else. Public so callers
+// building a tower by hand (e.g. BuildOpenClipVisionTower) can select the MLP
+// activation from a config string.
+function ClipHiddenActFromString(const ActStr: string): TClipHiddenAct;
+
 // Builds the CLIP TEXT and VISION nets described by Config and loads every
 // weight from the checkpoint at FileName (.safetensors / sharded index /
 // pytorch_model.bin via CreatePretrainedTensorReader; see the CLIP IMPORT
@@ -7251,6 +7257,28 @@ function BuildClipVisionTower(Reader: TNNetSafeTensorsReader;
   ProjectionDim: integer; const Prefix: string;
   const ProjectionTensorName: string = '';
   pTrainable: boolean = true;
+  pVisionFeatures: boolean = false): TNNet;
+
+// Imports an open_clip / timm ViT VISION tower (laion/CLIP-ViT-* safetensors
+// and timm vit_*.openclip checkpoints) by REUSING BuildClipVisionTower: the
+// only genuinely new code is the flat "visual.*" -> HF "vision_model.*" key
+// translation. The fused attention "in_proj_{weight,bias}" [3*width, width] is
+// split into the q/k/v slabs BuildClipVisionTower's loader reads, the bias-free
+// "visual.proj" [width, output_dim] is transposed into an nn.Linear
+// "visual_projection.weight" [output_dim, width], and class_embedding /
+// positional_embedding are served under the HF names (the builder folds the
+// class token into position row 0). HiddenAct selects the MLP activation:
+// chaQuickGelu for OpenAI-style open_clip (x*sigmoid(1.702x)), chaGeluExact for
+// the LAION ViT-B/g plain-gelu towers. Returns the vision tower as a single
+// TNNet whose output is (num_patches+1, 1, output_dim) per-token projected
+// states (pVisionFeatures=true gives the penultimate patch tokens, as in
+// BuildClipVisionTower). The caller supplies the tower shape; there is no
+// config.json schema fixed for open_clip checkpoints (timm stores it under a
+// different key layout), so Tower/ImageSize/PatchSize/NumChannels/ProjectionDim
+// are passed explicitly.
+function BuildOpenClipVisionTower(const FileName: string;
+  const Tower: TClipTowerConfig; ImageSize, PatchSize, NumChannels,
+  ProjectionDim: integer; pTrainable: boolean = true;
   pVisionFeatures: boolean = false): TNNet;
 
 // The text-pooling position of modeling_clip: EosTokenId = 2 (the legacy
@@ -52149,6 +52177,226 @@ begin
   except
     NN.Free;
     raise;
+  end;
+end;
+
+type
+  // Translates an open_clip / timm ViT "visual.*" checkpoint into the HF
+  // "vision_model.*" tensor names BuildClipVisionTower reads. Every served
+  // tensor is a SYNTHETIC entry that delegates to one inner "visual.*" source;
+  // most are straight pass-throughs (Kind ocrPass), the fused attention slab is
+  // split per layer into q/k/v weight+bias (ocrQ/K/V over weight or bias) and
+  // the bias-free image projection visual.proj [width, output_dim] is
+  // transposed into nn.Linear order [output_dim, width] (ocrProjT). Mirrors
+  // TNNetInternLM2Reader's synthetic-table approach. Coded by Claude (AI).
+  TOpenClipReaderKind = (ocrPass, ocrQ, ocrK, ocrV, ocrProjT);
+  TNNetOpenClipReader = class(TNNetSafeTensorsReader)
+  private
+    FInner: TNNetSafeTensorsReader;     // the real checkpoint (owned)
+    FWidth: integer;
+    FSrcNames: array of string;
+    FKinds: array of TOpenClipReaderKind;
+    procedure AddSynthetic(const HFName, SrcName: string;
+      Kind: TOpenClipReaderKind; const Shape: array of Int64);
+  public
+    constructor Create(Inner: TNNetSafeTensorsReader; NumLayers, Width,
+      IntermediateSize, OutputDim, NumChannels, PatchSize, NumPatches: integer);
+    destructor Destroy; override;
+    procedure LoadTensorFlat(const pName: string;
+      Dest: TNNetVolume); override;
+  end;
+
+procedure TNNetOpenClipReader.AddSynthetic(const HFName, SrcName: string;
+  Kind: TOpenClipReaderKind; const Shape: array of Int64);
+var
+  Idx, i, ShapeHi: integer;
+begin
+  if not FInner.HasTensor(SrcName) then
+    ImportError('OpenCLIP import: missing tensor "' + SrcName + '" in ' +
+      FInner.FileName + '.');
+  Idx := Length(FTensors);
+  SetLength(FTensors, Idx + 1);
+  SetLength(FSrcNames, Idx + 1);
+  SetLength(FKinds, Idx + 1);
+  FTensors[Idx].Name := HFName;
+  FTensors[Idx].DType := 'F32';
+  FTensors[Idx].Shard := 0;
+  FTensors[Idx].DataBegin := 0;
+  FTensors[Idx].DataEnd := 0;
+  SetLength(FTensors[Idx].Shape, Length(Shape));
+  ShapeHi := High(Shape);
+  for i := 0 to ShapeHi do FTensors[Idx].Shape[i] := Shape[i];
+  FSrcNames[Idx] := SrcName;
+  FKinds[Idx] := Kind;
+end;
+
+constructor TNNetOpenClipReader.Create(Inner: TNNetSafeTensorsReader;
+  NumLayers, Width, IntermediateSize, OutputDim, NumChannels, PatchSize,
+  NumPatches: integer);
+var
+  b, NumLayersM1: integer;
+  P, HP, Src: string;
+begin
+  inherited CreateBare;
+  FInner := Inner;
+  FFileName := Inner.FileName;
+  FWidth := Width;
+  // Embeddings: bias-free patch conv, class token, learned position table.
+  AddSynthetic('vision_model.embeddings.patch_embedding.weight',
+    'visual.conv1.weight', ocrPass,
+    [Width, NumChannels, PatchSize, PatchSize]);
+  AddSynthetic('vision_model.embeddings.class_embedding',
+    'visual.class_embedding', ocrPass, [Width]);
+  AddSynthetic('vision_model.embeddings.position_embedding.weight',
+    'visual.positional_embedding', ocrPass, [NumPatches + 1, Width]);
+  // pre / post LayerNorm.
+  AddSynthetic('vision_model.pre_layrnorm.weight', 'visual.ln_pre.weight',
+    ocrPass, [Width]);
+  AddSynthetic('vision_model.pre_layrnorm.bias', 'visual.ln_pre.bias',
+    ocrPass, [Width]);
+  AddSynthetic('vision_model.post_layernorm.weight', 'visual.ln_post.weight',
+    ocrPass, [Width]);
+  AddSynthetic('vision_model.post_layernorm.bias', 'visual.ln_post.bias',
+    ocrPass, [Width]);
+  // Image projection: visual.proj is [width, output_dim] (x @ proj); nn.Linear
+  // visual_projection.weight is its transpose [output_dim, width].
+  AddSynthetic('visual_projection.weight', 'visual.proj', ocrProjT,
+    [OutputDim, Width]);
+  NumLayersM1 := NumLayers - 1;
+  for b := 0 to NumLayersM1 do
+  begin
+    HP := 'vision_model.encoder.layers.' + IntToStr(b) + '.';
+    P := 'visual.transformer.resblocks.' + IntToStr(b) + '.';
+    // Fused attention slab -> q/k/v (in_proj_weight [3*width, width], stacked
+    // query|key|value; in_proj_bias [3*width]).
+    Src := P + 'attn.in_proj_weight';
+    if not FInner.HasTensor(Src) then
+      ImportError('OpenCLIP import: missing tensor "' + Src + '".');
+    if (FInner.DimCount(Src) <> 2) or
+       (FInner.DimSize(Src, 0) <> 3 * Width) or
+       (FInner.DimSize(Src, 1) <> Width) then
+      ImportError('OpenCLIP import: "' + Src + '" must have shape [' +
+        IntToStr(3 * Width) + ', ' + IntToStr(Width) + '], got ' +
+        FInner.ShapeAsString(Src));
+    AddSynthetic(HP + 'self_attn.q_proj.weight', Src, ocrQ, [Width, Width]);
+    AddSynthetic(HP + 'self_attn.k_proj.weight', Src, ocrK, [Width, Width]);
+    AddSynthetic(HP + 'self_attn.v_proj.weight', Src, ocrV, [Width, Width]);
+    Src := P + 'attn.in_proj_bias';
+    AddSynthetic(HP + 'self_attn.q_proj.bias', Src, ocrQ, [Width]);
+    AddSynthetic(HP + 'self_attn.k_proj.bias', Src, ocrK, [Width]);
+    AddSynthetic(HP + 'self_attn.v_proj.bias', Src, ocrV, [Width]);
+    AddSynthetic(HP + 'self_attn.out_proj.weight', P + 'attn.out_proj.weight',
+      ocrPass, [Width, Width]);
+    AddSynthetic(HP + 'self_attn.out_proj.bias', P + 'attn.out_proj.bias',
+      ocrPass, [Width]);
+    AddSynthetic(HP + 'layer_norm1.weight', P + 'ln_1.weight', ocrPass, [Width]);
+    AddSynthetic(HP + 'layer_norm1.bias', P + 'ln_1.bias', ocrPass, [Width]);
+    AddSynthetic(HP + 'layer_norm2.weight', P + 'ln_2.weight', ocrPass, [Width]);
+    AddSynthetic(HP + 'layer_norm2.bias', P + 'ln_2.bias', ocrPass, [Width]);
+    AddSynthetic(HP + 'mlp.fc1.weight', P + 'mlp.c_fc.weight', ocrPass,
+      [IntermediateSize, Width]);
+    AddSynthetic(HP + 'mlp.fc1.bias', P + 'mlp.c_fc.bias', ocrPass,
+      [IntermediateSize]);
+    AddSynthetic(HP + 'mlp.fc2.weight', P + 'mlp.c_proj.weight', ocrPass,
+      [Width, IntermediateSize]);
+    AddSynthetic(HP + 'mlp.fc2.bias', P + 'mlp.c_proj.bias', ocrPass, [Width]);
+  end;
+end;
+
+destructor TNNetOpenClipReader.Destroy;
+begin
+  FInner.Free;
+  inherited Destroy;
+end;
+
+procedure TNNetOpenClipReader.LoadTensorFlat(const pName: string;
+  Dest: TNNetVolume);
+var
+  Idx: integer;
+  Kind: TOpenClipReaderKind;
+  Src: TNNetVolume;
+  RowBase, Rows, Cols, r, c: integer;
+begin
+  Idx := FindTensor(pName);
+  if Idx < 0 then
+    ImportError('OpenCLIP import: tensor "' + pName + '" not found in ' +
+      FFileName + '.');
+  Kind := FKinds[Idx];
+  if Kind = ocrPass then
+  begin
+    FInner.LoadTensorFlat(FSrcNames[Idx], Dest);
+    exit;
+  end;
+  Src := TNNetVolume.Create;
+  try
+    FInner.LoadTensorFlat(FSrcNames[Idx], Src);
+    if Kind = ocrProjT then
+    begin
+      // visual.proj [Width, OutputDim] row-major -> transpose [OutputDim, Width]
+      Cols := FInner.DimSize(FSrcNames[Idx], 1);   // OutputDim
+      Rows := FInner.DimSize(FSrcNames[Idx], 0);   // Width
+      Dest.ReSize(Cols * Rows, 1, 1);
+      for r := 0 to Cols - 1 do          // r over OutputDim (dest rows)
+        for c := 0 to Rows - 1 do        // c over Width      (dest cols)
+          Dest.FData[r * Rows + c] := Src.FData[c * Cols + r];
+      exit;
+    end;
+    // Q/K/V slice of the fused in_proj slab (query rows 0..W-1, key W..2W-1,
+    // value 2W..3W-1). A weight source has Width columns; a bias has 1.
+    case Kind of
+      ocrQ: RowBase := 0;
+      ocrK: RowBase := FWidth;
+      else  RowBase := 2 * FWidth;       // ocrV
+    end;
+    if Src.Size = 3 * FWidth then
+    begin
+      // bias [3*Width] -> [Width]
+      Dest.ReSize(FWidth, 1, 1);
+      for r := 0 to FWidth - 1 do
+        Dest.FData[r] := Src.FData[RowBase + r];
+    end
+    else
+    begin
+      // weight [3*Width, Width] -> [Width, Width]
+      Dest.ReSize(FWidth * FWidth, 1, 1);
+      for r := 0 to FWidth - 1 do
+        for c := 0 to FWidth - 1 do
+          Dest.FData[r * FWidth + c] :=
+            Src.FData[(RowBase + r) * FWidth + c];
+    end;
+  finally
+    Src.Free;
+  end;
+end;
+
+function BuildOpenClipVisionTower(const FileName: string;
+  const Tower: TClipTowerConfig; ImageSize, PatchSize, NumChannels,
+  ProjectionDim: integer; pTrainable: boolean = true;
+  pVisionFeatures: boolean = false): TNNet;
+var
+  Inner: TNNetSafeTensorsReader;
+  Reader: TNNetOpenClipReader;
+  Grid, NumPatches: integer;
+begin
+  if (PatchSize < 1) or ((ImageSize mod PatchSize) <> 0) then
+    ImportError('OpenCLIP import: image_size=' + IntToStr(ImageSize) +
+      ' is not a multiple of patch_size=' + IntToStr(PatchSize) + '.');
+  Grid := ImageSize div PatchSize;
+  NumPatches := Grid * Grid;
+  Inner := CreatePretrainedTensorReader(FileName);
+  Reader := nil;
+  try
+    Reader := TNNetOpenClipReader.Create(Inner, Tower.NumLayers,
+      Tower.HiddenSize, Tower.IntermediateSize, ProjectionDim, NumChannels,
+      PatchSize, NumPatches);
+    Inner := nil;  // owned by Reader now
+    Result := BuildClipVisionTower(Reader, Tower, ImageSize, PatchSize,
+      NumChannels, ProjectionDim, 'vision_model.',
+      {ProjectionTensorName=}'visual_projection.weight',
+      pTrainable, pVisionFeatures);
+  finally
+    Reader.Free;
+    Inner.Free;
   end;
 end;
 
