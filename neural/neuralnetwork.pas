@@ -5283,6 +5283,41 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// 2-D axial Rotary Position Embedding for vision transformers (DINOv3).
+  // Unlike TNNetRotaryEmbedding (1-D rotary keyed to the scalar token index,
+  // interleaved (2k,2k+1) pairs), this layer rotates a per-head Q or K slice
+  // (SeqLen, 1, head_dim) by the DINOv3 2-D axial RoPE:
+  //   - the first FNumPrefix tokens (CLS + register tokens) pass through
+  //     UNROTATED; only the trailing FGridH*FGridW PATCH tokens are rotated;
+  //   - patch token n = i*FGridW + k (row-major) gets the normalized center
+  //     coordinate (cy,cx) = (2*(i+0.5)/FGridH - 1, 2*(k+0.5)/FGridW - 1);
+  //   - inv_freq[j] = base**(-(4*j)/head_dim), j in [0, head_dim/4); the angle
+  //     for channel c in [0, head_dim/2) is 2*pi*cy*inv_freq[c] for the first
+  //     quarter (c < head_dim/4) and 2*pi*cx*inv_freq[c - head_dim/4] for the
+  //     second quarter, and the rotation pairs channel c with c+head_dim/2
+  //     (rotate_half: out[c]=x[c]*cos - x[c+h]*sin, out[c+h]=x[c+h]*cos +
+  //     x[c]*sin, h = head_dim/2). Matches HF apply_rotary_pos_emb exactly.
+  // The cos/sin tables depend ONLY on the geometry (grid, prefix count, base),
+  // so they are recomputed in SetPrevLayer and NOT serialized: the geometry
+  // (FStruct[0..2]) and base (FFloatSt[0]) round-trip through the base class.
+  // Coded by Claude (AI).
+  TNNetVisionRoPE2D = class(TNNetIdentity)
+  protected
+    // Per-patch-token rotation table, indexed [patchIdx*HalfD + c],
+    // c in [0, head_dim/2). HalfD := head_dim div 2.
+    FCos, FSin: array of TNeuralFloat;
+    procedure BuildRopeCache(pHeadDim: integer);
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    // pGridH/pGridW: the patch grid (num_patches = pGridH*pGridW).
+    // pNumPrefix: CLS + register tokens prepended (1 + num_register_tokens).
+    // pBase: rope_theta (DINOv3 default 100).
+    constructor Create(pGridH, pGridW, pNumPrefix: integer;
+      pBase: TNeuralFloat); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   // Calculates Power(LocalPrevOutput.FData[OutputCnt], iPower).
   TNNetPower = class(TNNetReLUBase)
     private
@@ -14284,6 +14319,16 @@ type
         RelPosMaxDistance: integer = 128;
         QKRMSNorm: boolean = false;
         SegmentSource: TNNetLayer = nil): TNNetLayer;
+      // Multi-head self-attention over a (SeqLen,1,3*d_model) Q|K|V slab with
+      // DINOv3-style 2-D AXIAL RoPE applied per head to Q and K (TNNetVisionRoPE2D)
+      // and standard SDPA per head. The leading NumPrefix tokens (CLS + register)
+      // pass through unrotated; the trailing GridH*GridW patch tokens are rotated
+      // by the 2-D axial frequencies (base = RopeBase). Built like
+      // AddMultiHeadSelfAttention (per-head split, concat, PointwiseConvLinear
+      // out-projection). d_model is inferred from the slab depth div 3.
+      // Coded by Claude (AI).
+      function AddMultiHeadVisionRoPE2DAttention(Heads, GridH, GridW,
+        NumPrefix: integer; RopeBase: TNeuralFloat): TNNetLayer;
       // Multi-head LINFORMER self-attention (Wang et al. 2020, arXiv:2006.04768)
       // over a (SeqLen,1,3*d_model) Q|K|V slab. Linformer keeps the softmax but
       // projects K and V DOWN the sequence axis to a fixed rank k (k << SeqLen)
@@ -34652,6 +34697,190 @@ begin
         gy1 := FOutputError[pos, 0, 2 * k + 1];
         PrevErr.Add(pos, 0, 2 * k,      FOutScale * (c * gy0 + s * gy1));
         PrevErr.Add(pos, 0, 2 * k + 1,  FOutScale * (-s * gy0 + c * gy1));
+      end;
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetVisionRoPE2D }
+
+constructor TNNetVisionRoPE2D.Create(pGridH, pGridW, pNumPrefix: integer;
+  pBase: TNeuralFloat);
+begin
+  inherited Create();
+  if (pGridH < 1) or (pGridW < 1) then
+    FErrorProc('TNNetVisionRoPE2D requires a positive patch grid. Got ' +
+      IntToStr(pGridH) + 'x' + IntToStr(pGridW));
+  if pNumPrefix < 0 then
+    FErrorProc('TNNetVisionRoPE2D requires pNumPrefix >= 0. Got ' +
+      IntToStr(pNumPrefix));
+  if pBase <= 0 then pBase := 100.0;
+  FStruct[0] := pGridH;
+  FStruct[1] := pGridW;
+  FStruct[2] := pNumPrefix;
+  FFloatSt[0] := pBase;
+end;
+
+// Precomputes the per-patch-token (cos,sin) tables. pHeadDim must be a
+// multiple of 4 (the head_dim is split into quarters: [Y_freqs | X_freqs]
+// then duplicated by the rotate_half pairing c <-> c+HalfD). HalfD entries
+// per patch token: c in [0, HalfD), the first QuarterD encode the Y axis and
+// the next QuarterD the X axis.
+procedure TNNetVisionRoPE2D.BuildRopeCache(pHeadDim: integer);
+var
+  GridH, GridW, NumPatches, HalfD, QuarterD: integer;
+  NumPatchesM1, QuarterDM1: integer;
+  Base, InvFreq, Coord, Angle, c, s: TNeuralFloat;
+  n, i, k, q: integer;
+begin
+  GridH := FStruct[0];
+  GridW := FStruct[1];
+  NumPatches := GridH * GridW;
+  HalfD := pHeadDim div 2;
+  QuarterD := pHeadDim div 4;
+  Base := FFloatSt[0];
+  if Base <= 0 then Base := 100.0;
+  SetLength(FCos, NumPatches * HalfD);
+  SetLength(FSin, NumPatches * HalfD);
+  NumPatchesM1 := NumPatches - 1;
+  QuarterDM1 := QuarterD - 1;
+  for n := 0 to NumPatchesM1 do
+  begin
+    i := n div GridW;   // patch grid row
+    k := n mod GridW;   // patch grid col
+    for q := 0 to QuarterDM1 do
+    begin
+      // inv_freq[q] = base ** (-(4*q)/head_dim).
+      InvFreq := pcr_expf(-(4.0 * q / pHeadDim) * pcr_logf(Base));
+      // Y axis occupies channels [0, QuarterD); X axis [QuarterD, HalfD).
+      // Normalized patch-center coordinate in [-1, 1].
+      Coord := 2.0 * (i + 0.5) / GridH - 1.0;
+      Angle := 2.0 * Pi * Coord * InvFreq;
+      pcr_sincosf(Angle, s, c);
+      FCos[n * HalfD + q] := c;
+      FSin[n * HalfD + q] := s;
+      Coord := 2.0 * (k + 0.5) / GridW - 1.0;
+      Angle := 2.0 * Pi * Coord * InvFreq;
+      pcr_sincosf(Angle, s, c);
+      FCos[n * HalfD + QuarterD + q] := c;
+      FSin[n * HalfD + QuarterD + q] := s;
+    end;
+  end;
+end;
+
+procedure TNNetVisionRoPE2D.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  NumPatches, NumPrefix: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (pPrevLayer.FOutput.Depth mod 4) <> 0 then
+    FErrorProc('TNNetVisionRoPE2D requires head_dim divisible by 4, got ' +
+      IntToStr(pPrevLayer.FOutput.Depth));
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetVisionRoPE2D requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  NumPatches := FStruct[0] * FStruct[1];
+  NumPrefix := FStruct[2];
+  if pPrevLayer.FOutput.SizeX <> (NumPrefix + NumPatches) then
+    FErrorProc('TNNetVisionRoPE2D: SeqLen=' + IntToStr(pPrevLayer.FOutput.SizeX)
+      + ' must equal num_prefix(' + IntToStr(NumPrefix) + ') + grid(' +
+      IntToStr(NumPatches) + ').');
+  BuildRopeCache(pPrevLayer.FOutput.Depth);
+end;
+
+procedure TNNetVisionRoPE2D.Compute();
+var
+  StartTime: double;
+  SeqLen, Depth, HalfD, NumPrefix: integer;
+  SeqLenM1, HalfDM1: integer;
+  pos, n, c, base: integer;
+  cs, sn, x0, x1: TNeuralFloat;
+  Prev: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  Depth := Prev.Depth;
+  HalfD := Depth div 2;
+  NumPrefix := FStruct[2];
+  SeqLenM1 := SeqLen - 1;
+  HalfDM1 := HalfD - 1;
+  if Length(FCos) <> (FStruct[0] * FStruct[1]) * HalfD then BuildRopeCache(Depth);
+  for pos := 0 to SeqLenM1 do
+  begin
+    if pos < NumPrefix then
+    begin
+      // Prefix tokens (CLS + register): pass through unrotated.
+      for c := 0 to Depth - 1 do
+        FOutput[pos, 0, c] := Prev[pos, 0, c];
+    end
+    else
+    begin
+      n := pos - NumPrefix;       // patch index
+      base := n * HalfD;
+      // rotate_half pairing: channel c (c<HalfD) with c+HalfD.
+      for c := 0 to HalfDM1 do
+      begin
+        cs := FCos[base + c];
+        sn := FSin[base + c];
+        x0 := Prev[pos, 0, c];
+        x1 := Prev[pos, 0, c + HalfD];
+        FOutput[pos, 0, c]         := cs * x0 - sn * x1;
+        FOutput[pos, 0, c + HalfD] := cs * x1 + sn * x0;
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetVisionRoPE2D.Backpropagate();
+var
+  StartTime: double;
+  SeqLen, Depth, HalfD, NumPrefix: integer;
+  SeqLenM1, HalfDM1: integer;
+  pos, n, c, base: integer;
+  cs, sn, gy0, gy1: TNeuralFloat;
+  PrevErr: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if Assigned(FPrevLayer) and
+     (FPrevLayer.OutputError.Size > 0) and
+     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    StartTime := Now();
+    PrevErr := FPrevLayer.FOutputError;
+    SeqLen := FOutput.SizeX;
+    Depth := FOutput.Depth;
+    HalfD := Depth div 2;
+    NumPrefix := FStruct[2];
+    SeqLenM1 := SeqLen - 1;
+    HalfDM1 := HalfD - 1;
+    if Length(FCos) <> (FStruct[0] * FStruct[1]) * HalfD then BuildRopeCache(Depth);
+    for pos := 0 to SeqLenM1 do
+    begin
+      if pos < NumPrefix then
+      begin
+        for c := 0 to Depth - 1 do
+          PrevErr.Add(pos, 0, c, FOutputError[pos, 0, c]);
+      end
+      else
+      begin
+        n := pos - NumPrefix;
+        base := n * HalfD;
+        // Transpose of the forward rotation.
+        for c := 0 to HalfDM1 do
+        begin
+          cs := FCos[base + c];
+          sn := FSin[base + c];
+          gy0 := FOutputError[pos, 0, c];
+          gy1 := FOutputError[pos, 0, c + HalfD];
+          PrevErr.Add(pos, 0, c,         cs * gy0 + sn * gy1);
+          PrevErr.Add(pos, 0, c + HalfD, cs * gy1 - sn * gy0);
+        end;
       end;
     end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -60863,6 +61092,67 @@ begin
   // Token-wise linear out-projection (see header note: FullConnectLinear would
   // flatten the sequence axis; PointwiseConvLinear projects each token).
   Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+end;
+
+function TNNet.AddMultiHeadVisionRoPE2DAttention(Heads, GridH, GridW,
+  NumPrefix: integer; RopeBase: TNeuralFloat): TNNetLayer;
+var
+  SourceLayer: TNNetLayer;
+  d_model, d_k, HeadCnt, d, HeadsM1, d_kM1: integer;
+  SliceLayers, HeadOutputs: array of TNNetLayer;
+  QSlice, KSlice, VSlice, AttnInput: TNNetLayer;
+  QChannels, KChannels, VChannels: array of integer;
+begin
+  SourceLayer := GetLastLayer();
+  if (SourceLayer.Output.Depth mod 3) <> 0 then
+    FErrorProc('AddMultiHeadVisionRoPE2DAttention requires a 3*d_model Q|K|V ' +
+      'slab. Got depth=' + IntToStr(SourceLayer.Output.Depth));
+  d_model := SourceLayer.Output.Depth div 3;
+  if (Heads < 1) or ((d_model mod Heads) <> 0) then
+    FErrorProc('AddMultiHeadVisionRoPE2DAttention requires d_model divisible ' +
+      'by Heads. d_model=' + IntToStr(d_model) + ', Heads=' + IntToStr(Heads));
+  d_k := d_model div Heads;
+  if (d_k mod 4) <> 0 then
+    FErrorProc('AddMultiHeadVisionRoPE2DAttention requires head_dim (= d_model ' +
+      'div Heads) divisible by 4 for 2-D axial RoPE. head_dim=' +
+      IntToStr(d_k));
+  // Per-head split of [Q_all|K_all|V_all] into H [Q_h|K_h|V_h] packs.
+  SetLength(SliceLayers, Heads);
+  AddSplitQKVHeads(d_model, Heads, SliceLayers, SourceLayer);
+  SetLength(HeadOutputs, Heads);
+  HeadsM1 := Heads - 1;
+  d_kM1 := d_k - 1;
+  SetLength(QChannels, d_k);
+  SetLength(KChannels, d_k);
+  SetLength(VChannels, d_k);
+  for d := 0 to d_kM1 do
+  begin
+    QChannels[d] := d;            // Q_h occupies [0 .. d_k-1]
+    KChannels[d] := d_k + d;      // K_h occupies [d_k .. 2*d_k-1]
+    VChannels[d] := 2 * d_k + d;  // V_h occupies [2*d_k .. 3*d_k-1]
+  end;
+  for HeadCnt := 0 to HeadsM1 do
+  begin
+    // Split Q_h / K_h, apply 2-D axial RoPE to each, leave V_h, re-pack, SDPA.
+    QSlice := AddLayerAfter(TNNetSplitChannels.Create(QChannels), SliceLayers[HeadCnt]);
+    QSlice := AddLayerAfter(
+      TNNetVisionRoPE2D.Create(GridH, GridW, NumPrefix, RopeBase), QSlice);
+    KSlice := AddLayerAfter(TNNetSplitChannels.Create(KChannels), SliceLayers[HeadCnt]);
+    KSlice := AddLayerAfter(
+      TNNetVisionRoPE2D.Create(GridH, GridW, NumPrefix, RopeBase), KSlice);
+    VSlice := AddLayerAfter(TNNetSplitChannels.Create(VChannels), SliceLayers[HeadCnt]);
+    AttnInput := AddLayer(TNNetDeepConcat.Create([QSlice, KSlice, VSlice]));
+    HeadOutputs[HeadCnt] := AddLayerAfter(
+      TNNetScaledDotProductAttention.Create(d_k, {CausalMask=}false), AttnInput);
+  end;
+  AddLayer(TNNetDeepConcat.Create(HeadOutputs));
+  // Token-wise linear out-projection (PointwiseConvLinear, not FullConnect).
+  Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+  SetLength(SliceLayers, 0);
+  SetLength(HeadOutputs, 0);
+  SetLength(QChannels, 0);
+  SetLength(KChannels, 0);
+  SetLength(VChannels, 0);
 end;
 
 function TNNet.AddMultiHeadLinformerAttention(Heads, k: integer): TNNetLayer;
@@ -101769,6 +102059,7 @@ begin
       'TNNetLinformerAttention' :   Result := TNNetLinformerAttention.Create(St[0], St[1]);
       'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0);
       'TNNetMRotaryEmbedding' :     Result := TNNetMRotaryEmbedding.Create(Ft[0], St[3], St[4], St[5], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0);
+      'TNNetVisionRoPE2D' :         Result := TNNetVisionRoPE2D.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
       'TNNetReLU6' :                Result := TNNetReLU6.Create(St[2]);

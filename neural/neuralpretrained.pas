@@ -11288,6 +11288,68 @@ function BuildDINOv2FromSafeTensorsWithConfig(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 type
+  // DINOv3 config (facebook/dinov3-*, HF model_type "dinov3_vit", class
+  // DINOv3ViTModel). The successor to DINOv2: the SAME pre-LN ViT trunk with
+  // LayerScale on each residual branch, but with three deltas the importer
+  // reproduces:
+  //   1. 2-D AXIAL RoPE on the patch positions (TNNetVisionRoPE2D) instead of
+  //      a learned absolute position table - applied per head to Q and K,
+  //      same frequencies across every layer, base = RopeTheta (default 100);
+  //   2. NumRegisterTokens learnable register tokens prepended right after the
+  //      CLS token (order [CLS][reg..][patches]);
+  //   3. Gram-anchoring-trained weights (no architectural change).
+  // Attention is BERT-UNFUSED (separate q/k/v/o_proj); query/value/proj are
+  // biased but the KEY projection is UNbiased (key_bias=false). MLP is the
+  // plain up_proj/down_proj + gelu (use_gated_mlp / SwiGLU rejected). Output:
+  // the (1+NumRegisterTokens+num_patches, 1, HiddenSize) post-final-LN hidden
+  // states over ALL tokens (CLS row 0, then registers, then patches).
+  TDINOv3Config = record
+    HiddenSize: integer;        // hidden_size
+    IntermediateSize: integer;  // intermediate_size
+    NumLayers: integer;         // num_hidden_layers
+    NumHeads: integer;          // num_attention_heads
+    LayerNormEps: TNeuralFloat; // layer_norm_eps (1e-5 default)
+    HiddenAct: TClipHiddenAct;  // hidden_act (gelu = exact erf by default)
+    ImageSize: integer;         // image_size
+    PatchSize: integer;         // patch_size
+    NumChannels: integer;       // num_channels (3)
+    NumRegisterTokens: integer; // num_register_tokens (4 in the published models)
+    RopeTheta: TNeuralFloat;    // rope_theta (RoPE base, 100 default)
+    UseGatedMLP: boolean;       // use_gated_mlp (SwiGLU giant; rejected if true)
+    ModelType: string;          // 'dinov3_vit'
+  end;
+
+// Reads a HF DINOv3 config.json (model_type "dinov3_vit"). Required:
+// hidden_size, num_hidden_layers, num_attention_heads, image_size, patch_size.
+// Defaults follow DINOv3ViTConfig: hidden_act "gelu" (exact erf),
+// layer_norm_eps 1e-5, num_channels 3, intermediate_size 4*hidden_size,
+// num_register_tokens 4, rope_theta 100, use_gated_mlp false. use_gated_mlp
+// true is accepted by the reader but rejected by the builder.
+function ReadDINOv3ConfigFromJSONFile(
+  const FileName: string): TDINOv3Config;
+
+function DINOv3ConfigToString(const Config: TDINOv3Config): string;
+
+// Builds the DINOv3 visual-embedding net described by Config and loads every
+// weight from Reader (the caller owns Reader). The net takes an
+// (ImageSize, ImageSize, NumChannels) normalized RGB volume and outputs the
+// (1+NumRegisterTokens+num_patches, 1, HiddenSize) post-final-LayerNorm hidden
+// states: row 0 is the CLS global feature, the next NumRegisterTokens rows are
+// the register tokens, and the rest are the per-patch dense features. There is
+// NO classifier head. pTrainable=False frees training volumes during build.
+function BuildDINOv3FromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TDINOv3Config; pTrainable: boolean = true): TNNet;
+
+// Builds + loads the DINOv3 net from the checkpoint at FileName (.safetensors
+// / sharded index / pytorch_model.bin via CreatePretrainedTensorReader).
+function BuildDINOv3FromSafeTensorsEx(const FileName: string;
+  const Config: TDINOv3Config; pTrainable: boolean = true): TNNet;
+
+function BuildDINOv3FromSafeTensorsWithConfig(const FileName: string;
+  out Config: TDINOv3Config; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+
+type
   // BEiT / data2vec-vision config (microsoft/beit-*, facebook/data2vec-vision-*).
   // A DISTINCT ViT backbone family from the plain ViT/DINOv2 and Swin:
   //   - FULL global attention (no windowing/shift) with a per-LAYER learned
@@ -67686,6 +67748,352 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadDINOv2ConfigFromJSONFile(ConfigPath);
   Result := BuildDINOv2FromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+// ===========================================================================
+// DINOv3 SELF-SUPERVISED ViT BACKBONE IMPORT (facebook/dinov3-*, HF model_type
+// "dinov3_vit", class DINOv3ViTModel). The successor to DINOv2: same pre-LN ViT
+// trunk + LayerScale, but with 2-D axial RoPE (TNNetVisionRoPE2D) instead of a
+// learned absolute position table, register tokens prepended after the CLS
+// token, and BERT-unfused attention with an UNbiased key projection.
+// ===========================================================================
+
+function ReadDINOv3ConfigFromJSONFile(
+  const FileName: string): TDINOv3Config;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('DINOv3 import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('DINOv3 import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('DINOv3 import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('DINOv3 import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('DINOv3 import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'dinov3_vit');
+    if (ModelType <> 'dinov3_vit') and (ModelType <> 'dinov3') then
+      ImportError('DINOv3 import: config model_type is "' + ModelType +
+        '" - only "dinov3_vit" / "dinov3" is supported here.');
+    Result.ModelType := ModelType;
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.ImageSize := RequiredInt('image_size');
+    Result.PatchSize := RequiredInt('patch_size');
+    Result.NumChannels := Obj.Get('num_channels', 3);
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 0.00001);
+    Result.HiddenAct := ClipHiddenActFromString(Obj.Get('hidden_act', 'gelu'));
+    // DINOv3 has an explicit intermediate_size (default 4*hidden_size).
+    Result.IntermediateSize := Obj.Get('intermediate_size',
+      4 * Result.HiddenSize);
+    if Result.IntermediateSize <= 0 then
+      ImportError('DINOv3 import: intermediate_size must be positive, got ' +
+        IntToStr(Result.IntermediateSize) + '.');
+    Result.NumRegisterTokens := Obj.Get('num_register_tokens', 4);
+    Result.RopeTheta := Obj.Get('rope_theta', 100.0);
+    Result.UseGatedMLP := Obj.Get('use_gated_mlp', false);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function DINOv3ConfigToString(const Config: TDINOv3Config): string;
+begin
+  if Config.ModelType = '' then Result := 'dinov3_vit'
+  else Result := Config.ModelType;
+  Result := Result + ' config: d=' + IntToStr(Config.HiddenSize) +
+    ', layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', ffn=' + IntToStr(Config.IntermediateSize) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', patch=' + IntToStr(Config.PatchSize) +
+    ', channels=' + IntToStr(Config.NumChannels) +
+    ', act=' + ClipHiddenActToString(Config.HiddenAct) +
+    ', register_tokens=' + IntToStr(Config.NumRegisterTokens) +
+    ', rope_theta=' + FloatToStr(Config.RopeTheta);
+  if Config.UseGatedMLP then Result := Result + ', gated_mlp=true';
+end;
+
+type
+  // Per-block layers of one DINOv3 encoder block. Same trunk as DINOv2 (two
+  // LayerNorms, fused QKV slab, out-projection, two LayerScales, MLP fc1/fc2)
+  // but the attention sublayer applies 2-D axial RoPE (so AttnDense here is the
+  // RoPE-attention out-projection).
+  TDINOv3BlockLayers = record
+    LN1, QKV, AttnDense, LS1: TNNetLayer;
+    LN2, Inter, OutDense, LS2: TNNetLayer;
+  end;
+  TDINOv3BlockLayersArray = array of TDINOv3BlockLayers;
+
+// Appends one DINOv3 pre-LN encoder block with 2-D axial RoPE attention and
+// LayerScale on each residual branch:
+//   x1 = x + LS1 * RoPEAttn(LN1(x))
+//   y  = x1 + LS2 * MLP(LN2(x1))
+procedure AddDINOv3EncoderBlock(NN: TNNet; const Config: TDINOv3Config;
+  Grid, NumPrefix: integer; var Block: TDINOv3BlockLayers; pTrainable: boolean);
+var
+  BranchInput: TNNetLayer;
+begin
+  BranchInput := NN.GetLastLayer();
+  Block.LN1 := NN.AddLayer(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+  // Fused Q|K|V slab (DINOv3's separate q/k/v projections are packed here; the
+  // unbiased key projection is loaded with an empty bias name below).
+  Block.QKV := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable) );
+  Block.AttnDense := NN.AddMultiHeadVisionRoPE2DAttention(Config.NumHeads,
+    Grid, Grid, NumPrefix, Config.RopeTheta);
+  Block.LS1 := NN.AddLayer( TNNetChannelMul.Create() );
+  NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+  BranchInput := NN.GetLastLayer();
+  Block.LN2 := NN.AddLayer(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+  Block.Inter := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Config.IntermediateSize).SetTrainable(pTrainable) );
+  AddClipHiddenAct(NN, Config.HiddenAct);
+  Block.OutDense := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
+  Block.LS2 := NN.AddLayer( TNNetChannelMul.Create() );
+  NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+  if not pTrainable then NN.SetTrainable();
+end;
+
+// Loads one DINOv3 encoder block. Separate q/k/v/o_proj (key UNbiased), the
+// two biased LayerNorms (norm1 = pre-attn, norm2 = pre-MLP), the two
+// LayerScales, and the plain up_proj/down_proj MLP. BlockPrefix is the prefix
+// THROUGH the per-layer index ('model.layer.N.').
+procedure LoadDINOv3EncoderBlockWeights(Reader: TNNetSafeTensorsReader;
+  const Block: TDINOv3BlockLayers; const BlockPrefix: string;
+  const Config: TDINOv3Config);
+var
+  d: integer;
+  QName, KName, VName, ONm: string;
+begin
+  d := Config.HiddenSize;
+  QName := BlockPrefix + 'attention.q_proj';
+  KName := BlockPrefix + 'attention.k_proj';
+  VName := BlockPrefix + 'attention.v_proj';
+  ONm := BlockPrefix + 'attention.o_proj';
+  LoadLayerNormWeights(Reader, Block.LN1,
+    BlockPrefix + 'norm1.weight', BlockPrefix + 'norm1.bias', d);
+  // q_proj/v_proj are biased; k_proj is UNbiased (empty BiasName -> zeroed).
+  LoadLlamaLinearWeights(Reader, Block.QKV,
+    QName + '.weight', d, d, 0, 3 * d, 0, QName + '.bias');
+  LoadLlamaLinearWeights(Reader, Block.QKV,
+    KName + '.weight', d, d, d, 3 * d, 0, '');
+  LoadLlamaLinearWeights(Reader, Block.QKV,
+    VName + '.weight', d, d, 2 * d, 3 * d, 0, VName + '.bias');
+  LoadLlamaLinearWeights(Reader, Block.AttnDense,
+    ONm + '.weight', d, d, 0, -1, 0, ONm + '.bias');
+  LoadDINOv2LayerScale(Reader, Block.LS1,
+    BlockPrefix + 'layer_scale1.lambda1', d);
+  LoadLayerNormWeights(Reader, Block.LN2,
+    BlockPrefix + 'norm2.weight', BlockPrefix + 'norm2.bias', d);
+  LoadLlamaLinearWeights(Reader, Block.Inter,
+    BlockPrefix + 'mlp.up_proj.weight', d, Config.IntermediateSize, 0, -1, 0,
+    BlockPrefix + 'mlp.up_proj.bias');
+  LoadLlamaLinearWeights(Reader, Block.OutDense,
+    BlockPrefix + 'mlp.down_proj.weight', Config.IntermediateSize, d, 0, -1, 0,
+    BlockPrefix + 'mlp.down_proj.bias');
+  LoadDINOv2LayerScale(Reader, Block.LS2,
+    BlockPrefix + 'layer_scale2.lambda1', d);
+end;
+
+function BuildDINOv3FromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TDINOv3Config; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  PatchConv, PrefixEmb, FinalLN: TNNetLayer;
+  Blocks: TDINOv3BlockLayersArray;
+  Tmp: TNNetVolume;
+  Grid, NumPatches, NumPrefix, NumTokens, BlockCnt, ci, r, d: integer;
+  DM1, LayersM1: integer;
+  PatchBiasName, Pfx, RegName: string;
+begin
+  d := Config.HiddenSize;
+  DM1 := d - 1;
+  LayersM1 := Config.NumLayers - 1;
+  if (Config.NumHeads < 1) or ((d mod Config.NumHeads) <> 0) then
+    ImportError('DINOv3 import: hidden_size=' + IntToStr(d) +
+      ' is not divisible by num_attention_heads=' +
+      IntToStr(Config.NumHeads) + '.');
+  if ((d div Config.NumHeads) mod 4) <> 0 then
+    ImportError('DINOv3 import: head_dim=' + IntToStr(d div Config.NumHeads) +
+      ' (hidden_size div num_attention_heads) must be divisible by 4 for ' +
+      '2-D axial RoPE.');
+  if (Config.PatchSize < 1) or ((Config.ImageSize mod Config.PatchSize) <> 0)
+  then
+    ImportError('DINOv3 import: image_size=' + IntToStr(Config.ImageSize) +
+      ' is not a multiple of patch_size=' + IntToStr(Config.PatchSize) + '.');
+  if Config.UseGatedMLP then
+    ImportError('DINOv3 import: use_gated_mlp=true (the SwiGLU giant model) ' +
+      'is NOT supported - only the plain up_proj/down_proj+gelu MLP is wired.');
+  if Config.NumRegisterTokens < 0 then
+    ImportError('DINOv3 import: num_register_tokens must be >= 0, got ' +
+      IntToStr(Config.NumRegisterTokens) + '.');
+  Grid := Config.ImageSize div Config.PatchSize;
+  NumPatches := Grid * Grid;
+  NumPrefix := 1 + Config.NumRegisterTokens;        // CLS + register tokens
+  NumTokens := NumPrefix + NumPatches;
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels) );
+    // BIASED patch embedding: kernel = stride = patch_size, no padding ->
+    // a (Grid, Grid, hidden) patch grid, flattened row-major over (y,x).
+    PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      d, Config.PatchSize, {pInputPadding=}0, {pStride=}Config.PatchSize,
+      {pSuppressBias=}0).SetTrainable(pTrainable) );
+    NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
+    // Prepend NumPrefix ZERO rows (CLS + register slots). PadXY pads both
+    // ends; Crop drops the right pad, keeping NumTokens rows.
+    NN.AddLayer( TNNetPadXY.Create(NumPrefix, 0) );
+    NN.AddLayer( TNNetCrop.Create(0, 0, NumTokens, 1) );
+    // CLS + register tokens injected into the (zero) prefix slots via a learned
+    // per-row table: rows [0..NumPrefix-1] hold cls/register, patch rows = 0.
+    PrefixEmb := NN.AddLayer(
+      TNNetLearnedPositionalEmbedding.Create(NumTokens).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
+    SetLength(Blocks, Config.NumLayers);
+    for BlockCnt := 0 to LayersM1 do
+      AddDINOv3EncoderBlock(NN, Config, Grid, NumPrefix, Blocks[BlockCnt],
+        pTrainable);
+    // Final layernorm over every token; output = CLS + register + patch hidden
+    // states (NO classifier head).
+    FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
+
+    // ---------------- Weights ----------------
+    // The bare DINOv3ViTModel checkpoint has NO 'backbone.'/'dinov3.' prefix;
+    // a wrapped model nests it. Probe the cls_token to pick.
+    if Reader.HasTensor('backbone.embeddings.cls_token') then
+      Pfx := 'backbone.'
+    else if Reader.HasTensor('dinov3.embeddings.cls_token') then
+      Pfx := 'dinov3.'
+    else
+      Pfx := '';
+    LoadClipPatchConv(Reader, PatchConv,
+      Pfx + 'embeddings.patch_embeddings.weight',
+      Config.NumChannels, Config.PatchSize, d);
+    PatchBiasName := Pfx + 'embeddings.patch_embeddings.bias';
+    if not Reader.HasTensor(PatchBiasName) then
+      ImportError('DINOv3 import: missing tensor "' + PatchBiasName + '".');
+    if (Reader.DimCount(PatchBiasName) <> 1) or
+       (Reader.DimSize(PatchBiasName, 0) <> d) then
+      ImportError('DINOv3 import: "' + PatchBiasName + '" must have shape [' +
+        IntToStr(d) + '], got ' + Reader.ShapeAsString(PatchBiasName));
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(PatchBiasName, Tmp);
+      for ci := 0 to DM1 do
+        PatchConv.FArrNeurons[ci].BiasWeight := Tmp.FData[ci];
+      PatchConv.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    // cls_token [1,1,hidden] -> prefix table row 0.
+    if not Reader.HasTensor(Pfx + 'embeddings.cls_token') then
+      ImportError('DINOv3 import: missing tensor "' + Pfx +
+        'embeddings.cls_token".');
+    PrefixEmb.FArrNeurons[0].Weights.Fill(0);
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(Pfx + 'embeddings.cls_token', Tmp);
+      if Tmp.Size <> d then
+        ImportError('DINOv3 import: "' + Pfx + 'embeddings.cls_token" must ' +
+          'have ' + IntToStr(d) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
+      for ci := 0 to DM1 do
+        PrefixEmb.FArrNeurons[0].Weights.FData[ci] := Tmp.FData[ci];
+    finally
+      Tmp.Free;
+    end;
+    // register_tokens [1,R,hidden] -> prefix table rows 1..R.
+    if Config.NumRegisterTokens > 0 then
+    begin
+      RegName := Pfx + 'embeddings.register_tokens';
+      if not Reader.HasTensor(RegName) then
+        ImportError('DINOv3 import: missing tensor "' + RegName +
+          '" (num_register_tokens=' + IntToStr(Config.NumRegisterTokens) +
+          ').');
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(RegName, Tmp);
+        if Tmp.Size <> Config.NumRegisterTokens * d then
+          ImportError('DINOv3 import: "' + RegName + '" must have ' +
+            IntToStr(Config.NumRegisterTokens * d) + ' elements, got ' +
+            IntToStr(Tmp.Size) + '.');
+        for r := 0 to Config.NumRegisterTokens - 1 do
+          for ci := 0 to DM1 do
+            PrefixEmb.FArrNeurons[0].Weights.FData[(r + 1) * d + ci] :=
+              Tmp.FData[r * d + ci];
+      finally
+        Tmp.Free;
+      end;
+    end;
+    PrefixEmb.FlushWeightCache();
+    for BlockCnt := 0 to LayersM1 do
+      LoadDINOv3EncoderBlockWeights(Reader, Blocks[BlockCnt],
+        Pfx + 'model.layer.' + IntToStr(BlockCnt) + '.', Config);
+    LoadLayerNormWeights(Reader, FinalLN,
+      Pfx + 'norm.weight', Pfx + 'norm.bias', d);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildDINOv3FromSafeTensorsEx(const FileName: string;
+  const Config: TDINOv3Config; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildDINOv3FromSafeTensors(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildDINOv3FromSafeTensorsWithConfig(const FileName: string;
+  out Config: TDINOv3Config; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadDINOv3ConfigFromJSONFile(ConfigPath);
+  Result := BuildDINOv3FromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
