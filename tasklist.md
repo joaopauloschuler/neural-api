@@ -1781,7 +1781,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       Pin exact parity vs the current scalar output on each layer's numerical
       test. Distinct from the existing chunked/parallel-forward items for these
       layers (those change the ALGORITHM; this vectorizes the sequential readout).
-- [ ] Refactor `examples/MixtureDensityNetwork` to use the real
+- [X] Refactor `examples/MixtureDensityNetwork` to use the real
       `TNNetMixtureDensity` layer + its log-sum-exp NLL instead of the
       hand-coded mixture math. The example currently re-implements the whole
       head in local procedures (`DecodeMix` softmax over mixture weights,
