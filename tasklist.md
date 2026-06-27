@@ -1754,7 +1754,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       `TNNetVolume.DotProduct` / `TNNetVolume.MulAdd` over the contiguous axis.
       Pin exact parity vs the current scalar output on each layer's numerical
       test, on BOTH scalar-fallback and `-dAVX2` builds.
-  - [ ] `TNNetSAMVisionAttention.Compute` (neuralnetwork.pas ~33149-33180): the
+  - [X] `TNNetSAMVisionAttention.Compute` (neuralnetwork.pas ~33149-33180): the
         per-query Q·K score (`Score += QPtr[d]·KPtr[d]` over FHeadDim), the two
         decomposed relative-position dot products (`Q·rel_pos_h`, `Q·rel_pos_w`),
         and the weighted-value accumulation (`FCtx[..d] += Score·VPtr[d]`) are all

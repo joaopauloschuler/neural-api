@@ -33145,19 +33145,15 @@ begin
          begin
           j := ki * gx + kj;
           KPtr := @FK.FData[j * FChannels + hOfs];
-          Score := 0;
-          for d := 0 to FHeadDimM1 do
-            Score := Score + QPtr^[d] * KPtr^[d];
+          Score := TNNetVolume.DotProduct(QPtr, KPtr, FHeadDim);
           Score := Score * FInvSqrtHd;
           // decomposed rel-pos bias: Q . rel_pos_h[dh] + Q . rel_pos_w[dw]
           dh := qi - ki + (gy - 1);
           dw := qj - kj + (gx - 1);
-          biasH := 0; biasW := 0;
-          for d := 0 to FHeadDimM1 do
-          begin
-            biasH := biasH + QPtr^[d] * RelP.FData[dh * FHeadDim + d];
-            biasW := biasW + QPtr^[d] * RelP.FData[(Lh + dw) * FHeadDim + d];
-          end;
+          biasH := TNNetVolume.DotProduct(QPtr,
+            @RelP.FData[dh * FHeadDim], FHeadDim);
+          biasW := TNNetVolume.DotProduct(QPtr,
+            @RelP.FData[(Lh + dw) * FHeadDim], FHeadDim);
           Score := Score + biasH + biasW;
           FAttn.FData[j] := Score;
           if Score > MaxScore then MaxScore := Score;
@@ -33169,15 +33165,14 @@ begin
           FAttn.FData[j] := Score;
           SumExp := SumExp + Score;
         end;
+        OutP := @FCtx.FData[i * FChannels + hOfs];
         for d := 0 to FHeadDimM1 do
-          FCtx.FData[i * FChannels + hOfs + d] := 0;
+          OutP^[d] := 0;
         for j := 0 to winTokM1 do
         begin
           Score := FAttn.FData[j] / SumExp;
           KPtr := @FV.FData[j * FChannels + hOfs];
-          for d := 0 to FHeadDimM1 do
-            FCtx.FData[i * FChannels + hOfs + d] :=
-              FCtx.FData[i * FChannels + hOfs + d] + Score * KPtr^[d];
+          TNNetVolume.MulAdd(OutP, KPtr, Score, FHeadDim);
         end;
        end;
     end;
