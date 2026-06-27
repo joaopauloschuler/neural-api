@@ -280,6 +280,8 @@ type
     procedure TestDeformableConvOpenCLParity;
     procedure TestGroupConvP4OpenCLParity;
     procedure TestDeconvolutionOpenCLParity;
+    // OpenCL backward-GEMM offload parity (vs CPU) for the general convolution.
+    procedure TestConvolutionBackwardOpenCLParity;
     procedure TestRoIAlignForward;
     procedure TestRoIAlignInputGradientCheck;
     procedure TestRoIAlignShapeInference;
@@ -58039,6 +58041,123 @@ begin
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// General-convolution BACKWARD device offload parity (vs CPU). Builds a small
+// multi-channel 3x3 conv, runs one CPU backward (BackpropagateFastTiledCPU) and
+// snapshots BOTH gradients (the weight-grad in each neuron Delta and the
+// input-grad in the input layer OutputError), then clears the accumulators and
+// runs the SAME backward forced onto the device GEMM path (MinWork 0,
+// BackpropagateOpenCL) and asserts both gradients match within the importer
+// gate. SetBatchUpdate(true) keeps weights fixed across the two passes so the
+// comparison is apples-to-apples. SKIPs cleanly without a device.
+// Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestConvolutionBackwardOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Conv: TNNetConvolution;
+  InLayer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, od, InSize, NeuronCnt, WSize: integer;
+  Diff, MaxWDiff, MaxIDiff: TNeuralFloat;
+  WGradCPU: array of TNNetVolume;
+  IGradCPU: TNNetVolume;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  // (x,y,d,1) input so the input layer keeps an OutputError buffer (input-grad).
+  Input := TNNetVolume.Create(8, 8, 5);
+  IGradCPU := TNNetVolume.Create();
+  WGradCPU := nil;
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 5, 1));
+    // 6 features, 3x3, pad1, stride1 -> contraction 3*3*5=45, 64 positions.
+    Conv := TNNetConvolution.Create(6, 3, 1, 1, 0);
+    NN.AddLayer(Conv);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true); // accumulate deltas, do not mutate weights
+    InLayer := NN.Layers[0];
+
+    // Bounded inputs/targets so the outputs (and hence the gradients) stay O(1):
+    // the 1e-4 absolute parity gate is then meaningful (the device and CPU GEMMs
+    // differ only by FP32 accumulation order). A linear i-ramp would blow the
+    // outputs up to ~20 and the weight-grads to ~hundreds, where 1e-4 absolute is
+    // tighter than FP32 can deliver.
+    InSize := Input.Size;
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := 0.5 * Sin(i * 0.3) + 0.2 * Cos(i * 0.11);
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+      NN.GetLastLayer.Output.SizeY, NN.GetLastLayer.Output.Depth);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.4 * Sin(i * 0.21 + 0.5);
+
+    NeuronCnt := Conv.Neurons.Count;
+    WSize := Conv.Neurons[0].Weights.Size;
+
+    // --- CPU backward + snapshot. ---
+    NN.Compute(Input);
+    Conv.ClearDeltas;
+    InLayer.OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    SetLength(WGradCPU, NeuronCnt);
+    for od := 0 to NeuronCnt - 1 do
+    begin
+      WGradCPU[od] := TNNetVolume.Create();
+      WGradCPU[od].Copy(Conv.Neurons[od].Delta);
+    end;
+    IGradCPU.Copy(InLayer.OutputError);
+
+    // --- Device backward (force the GEMM path) + compare. ---
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      Conv.ClearDeltas;
+      InLayer.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+
+      MaxWDiff := 0;
+      for od := 0 to NeuronCnt - 1 do
+        for i := 0 to WSize - 1 do
+        begin
+          Diff := Abs(WGradCPU[od].Raw[i] - Conv.Neurons[od].Delta.Raw[i]);
+          if Diff > MaxWDiff then MaxWDiff := Diff;
+        end;
+      MaxIDiff := 0;
+      for i := 0 to IGradCPU.Size - 1 do
+      begin
+        Diff := Abs(IGradCPU.Raw[i] - InLayer.OutputError.Raw[i]);
+        if Diff > MaxIDiff then MaxIDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    WriteLn('  Conv backward OpenCL parity: max|weight-grad diff|=', MaxWDiff:0:9,
+      ' max|input-grad diff|=', MaxIDiff:0:9);
+    AssertTrue('Conv weight-grad OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxWDiff) + ' must be < 1e-4', MaxWDiff < 1e-4);
+    AssertTrue('Conv input-grad OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxIDiff) + ' must be < 1e-4', MaxIDiff < 1e-4);
+  finally
+    for od := 0 to Length(WGradCPU) - 1 do WGradCPU[od].Free;
+    IGradCPU.Free;
+    Desired.Free;
     Input.Free;
     NN.Free;
   end;

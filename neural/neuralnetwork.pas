@@ -10864,6 +10864,18 @@ type
       FWinogradInput: TNNetVolume;     // (16, NumTiles, InputDepth): V[p,tile,:] = (B^T d B) packed depth-contiguous
       FWinogradM: TNNetVolume;         // (16, NumTiles, NumNeurons): per-tile transformed products M[p,tile,o]
       FWinogradKernelsValid: boolean;  // cache flag invalidated by AfterWeightUpdate
+      {$IFDEF OpenCL}
+      // Scratch operands for the device im2col-GEMM backward of the general
+      // (FeatureSize>1) conv. The activation-derivative pass and the input-grad
+      // scatter stay on the CPU; only the two dense contractions
+      // (weight-grad = outErrDeriv * patch^T, input-grad = outErrDeriv * W) run
+      // on the device. Allocated lazily in BackpropagateOpenCL.
+      FBpOEDByDepth: TNNetVolume;   // outErrDeriv, N rows x T (depth-major)
+      FBpPatchByK: TNNetVolume;     // im2col patch^T, FVectorSize rows x T
+      FBpWByK: TNNetVolume;         // weights^T, FVectorSize rows x N
+      FBpWGradRes: TNNetVolume;     // weight-grad GEMM result [od*FVectorSize+k]
+      FBpPrevErrCol: TNNetVolume;   // input-grad GEMM result [pos*FVectorSize+k]
+      {$ENDIF}
       function WinogradEligible(): boolean; {$IFDEF Release} inline; {$ENDIF}
       procedure BuildWinogradKernels();
       procedure ComputeWinogradCPU();
@@ -10875,6 +10887,9 @@ type
       procedure BackpropagateFastTiledCPU();
       procedure BackpropagateFastCPUDev(); // Backprop CPU development version (do not use it)
       procedure BackpropagatePointwiseOpenCL();
+      {$IFDEF OpenCL}
+      procedure BackpropagateOpenCL();
+      {$ENDIF}
       procedure ComputeLowMemoryCPU(); {$IFDEF Release} inline; {$ENDIF}
       procedure AfterWeightUpdate(); override;
       function SupportsLowMemory(): boolean; override;
@@ -79079,6 +79094,15 @@ begin
   FWinogradKernels.Free;
   FWinogradInput.Free;
   FWinogradM.Free;
+  {$IFDEF OpenCL}
+  // Backward-GEMM scratch is lazily allocated in BackpropagateOpenCL; nil-Free
+  // is safe when the device backward path was never taken.
+  FBpOEDByDepth.Free;
+  FBpPatchByK.Free;
+  FBpWByK.Free;
+  FBpWGradRes.Free;
+  FBpPrevErrCol.Free;
+  {$ENDIF}
   inherited Destroy();
 end;
 
@@ -79435,7 +79459,27 @@ begin
       // ClearDeltas() is not required as it's done in BackpropagateNTL
       //BackpropagateFastCPUDev();
       //BackpropagateFastCPU();
+      {$IFDEF OpenCL}
+      // Offload the two dense backward contractions (weight-grad and input-grad)
+      // to the device when OpenCL is armed for this conv, it is the general
+      // (non-pointwise; the pointwise case has its own offload) direct path, and
+      // the work is large enough to amortise the upload/dispatch. The activation
+      // derivative and the input-grad scatter stay on the CPU. Below the work
+      // threshold (or OpenCL off) the exact CPU path runs - byte-identical.
+      if FHasOpenCL and FShouldOpenCL and Assigned(FDotCL) and
+         (not FPointwise) and (not WinogradEligible()) and
+         (Int64(FNeurons.Count) * (FOutputSizeX * FOutputSizeY) * FVectorSize
+          >= NeuralConvOpenCLMinWork) then
+      begin
+        BackpropagateOpenCL();
+      end
+      else
+      begin
+        BackpropagateFastTiledCPU(); // This is our default backprop
+      end;
+      {$ELSE}
       BackpropagateFastTiledCPU(); // This is our default backprop
+      {$ENDIF}
       //BackpropagateCPU();
 
       {$IFDEF CheckRange}ForceRangeWeights(1000);{$ENDIF}
@@ -80269,6 +80313,228 @@ begin
     AfterWeightUpdate();
   end;
 end;
+
+{$IFDEF OpenCL}
+// Device im2col-GEMM backward for the general (FeatureSize>1) convolution.
+//
+// The exact CPU reference is BackpropagateFastTiledCPU; this routine is a
+// numerically identical reformulation whose two dense contractions run on the
+// device while the activation-derivative pass and the input-grad scatter stay
+// on the CPU. Below the work threshold (or with OpenCL off) the CPU reference
+// runs instead, so the two paths agree to FP32 GEMM tolerance.
+//
+// Let  T = OutputSizeX*OutputSizeY (positions), N = FNeurons.Count (out chans),
+//      V = FVectorSize = FeatureSizeX*FeatureSizeY*InDepth (im2col vector),
+//      Patch[pos][k] = FInputPrepared (forward im2col), W[od][k] = neuron k-th
+//      weight, OED[od][pos] = activation-derivative-weighted output error.
+//
+// 1. OED + bias delta (CPU): OED[od][pos] computed exactly as the CPU path
+//    (ReLU / Identity / general activation branch) and written to
+//    FOutputErrorDeriv; bias delta accumulates (-LR)*OED summed over positions.
+// 2. Weight-grad GEMM (device): Res_w[od*V + k] = sum_pos OED[od][pos]*Patch[pos][k]
+//    with VAs = OED laid out N rows x T, VBs = Patch^T laid out V rows x T.
+//    Delta[od][k] += (-LR) * Res_w[od][k].
+// 3. Input-grad GEMM (device): Res_p[pos*V + k] = sum_od OED[od][pos]*W[od][k]
+//    with VAs = FOutputErrorDeriv (already pos rows x N), VBs = W^T (V rows x N).
+//    Scattered on the CPU into LocalPrevError exactly as the CPU path (scaled by
+//    1/FLearnSmoothener, only for in-bounds positions).
+procedure TNNetConvolution.BackpropagateOpenCL();
+var
+  OutputX, OutputY, OutputD: integer;
+  MaxX, MaxY, MaxD: integer;
+  PrevX, PrevY: integer;
+  OutputRawPos: integer;
+  CanBackpropOnPos: boolean;
+  LocalLearningErrorDeriv, LocalOutputErrorDeriv: TNeuralFloat;
+  LocalPrevError: TNNetVolume;
+  LocalWeight: TNNetVolume;
+  MaxPrevX, MaxPrevY: integer;
+  NumPos, VSize, NCnt: integer;
+  pos, kk, od, fy: integer;
+  DepthFSize, ColBase: integer;
+  PrevPtrA, PrevPtrB: TNeuralFloatArrPtr;
+begin
+  MaxX := OutputError.SizeX - 1;
+  MaxY := OutputError.SizeY - 1;
+  MaxD := OutputError.Depth - 1;
+  NumPos := FOutputSizeX * FOutputSizeY;
+  VSize := FVectorSize;
+  NCnt := FNeurons.Count;
+
+  if FPadding > 0 then
+  begin
+    FPrevLayerErrorPadded.Fill(0);
+    LocalPrevError := FPrevLayerErrorPadded;
+  end
+  else
+  begin
+    LocalPrevError := FPrevLayer.OutputError;
+  end;
+  MaxPrevX := 1 + LocalPrevError.SizeX - FFeatureSizeX;
+  MaxPrevY := 1 + LocalPrevError.SizeY - FFeatureSizeY;
+
+  if not Assigned(FBpOEDByDepth) then FBpOEDByDepth := TNNetVolume.Create();
+  if not Assigned(FBpPatchByK)   then FBpPatchByK   := TNNetVolume.Create();
+  if not Assigned(FBpWByK)       then FBpWByK       := TNNetVolume.Create();
+  if not Assigned(FBpWGradRes)   then FBpWGradRes   := TNNetVolume.Create();
+  if not Assigned(FBpPrevErrCol) then FBpPrevErrCol := TNNetVolume.Create();
+
+  // --- Step 1: activation derivative + bias delta (CPU, exact CPU branch). ---
+  // OED is stored into FOutputErrorDeriv (native pos-major, depth-contiguous),
+  // which doubles as the VAs operand of the input-grad GEMM (pos rows x N).
+  for OutputY := 0 to MaxY do
+  for OutputX := 0 to MaxX do
+  begin
+    OutputRawPos := FOutputErrorDeriv.GetRawPos(OutputX, OutputY, 0);
+    for OutputD := 0 to MaxD do
+    begin
+      {$IFDEF FPC}
+      if FActivationFn = @RectifiedLinearUnit then
+      begin
+        if FOutputRaw.FData[OutputRawPos] >= 0
+          then LocalOutputErrorDeriv := FOutputError.FData[OutputRawPos]
+          else LocalOutputErrorDeriv := 0;
+      end
+      else if FActivationFn = @Identity then
+      begin
+        LocalOutputErrorDeriv := FOutputError.FData[OutputRawPos];
+      end
+      else
+      {$ENDIF}
+      begin
+        LocalOutputErrorDeriv :=
+          FOutputError.FData[OutputRawPos] *
+          FActivationFnDerivative(FOutputRaw.FData[OutputRawPos]);
+      end;
+      FOutputErrorDeriv.FData[OutputRawPos] := LocalOutputErrorDeriv;
+      LocalLearningErrorDeriv := (-FLearningRate) * LocalOutputErrorDeriv;
+      if (LocalLearningErrorDeriv <> 0.0) then
+      begin
+        {$IFDEF FPC}
+        FArrNeurons[OutputD].FBiasDelta += LocalLearningErrorDeriv;
+        {$ELSE}
+        FArrNeurons[OutputD].FBiasDelta :=
+          FArrNeurons[OutputD].FBiasDelta + LocalLearningErrorDeriv;
+        {$ENDIF}
+      end;
+      Inc(OutputRawPos);
+    end;
+  end;
+
+  // --- Step 2: weight-grad GEMM (device). ----------------------------------
+  // The kernel reads operand A column-major (A[i*FNumAs + a], a = row, i =
+  // contraction) and operand B row-major (B[b*Size + i]); it writes the result
+  // b-major as Res[b*FNumAs + a].
+  // Contraction is over positions: a = od (N rows), b = k (V rows), i = pos.
+  //   VAs = OED with layout [pos*NCnt + od] -- exactly FOutputErrorDeriv's
+  //         native pos-major depth-contiguous layout, so it is used verbatim.
+  //   VBs = im2col patch transposed to [k*NumPos + pos] (FBpPatchByK).
+  // Res_w[od*VSize + k] = sum_pos OED[od][pos]*Patch[pos][k].
+  FBpPatchByK.ReSize(VSize * NumPos, 1, 1);
+  for OutputY := 0 to MaxY do
+  for OutputX := 0 to MaxX do
+  begin
+    pos := OutputY * FOutputSizeX + OutputX;
+    ColBase := FInputPrepared.GetRawPos(OutputX, OutputY, 0);
+    for kk := 0 to VSize - 1 do
+      FBpPatchByK.FData[kk * NumPos + pos] :=
+        FInputPrepared.FData[ColBase + kk];
+  end;
+
+  FBpWGradRes.ReSize(NCnt * VSize, 1, 1);
+  FDotCL.PrepareForCompute(FOutputErrorDeriv, FBpPatchByK, NumPos);
+  FDotCL.Compute(FOutputErrorDeriv, FBpPatchByK, {ActFN}0, {NewVAs}true, {NewVBs}true);
+  FDotCL.FinishAndLoadResult(FBpWGradRes, 0);
+  // The kernel writes Res[b*FNumAs + a] (b-major), so with a = od (FNumAs=NCnt)
+  // and b = k (FNumBs=VSize) the layout is Res_w[k*NCnt + od]. Accumulate into
+  // the neuron deltas with (-LR).
+  for od := 0 to MaxD do
+  begin
+    LocalWeight := FArrNeurons[od].Delta; // weight-gradient accumulator
+    for kk := 0 to VSize - 1 do
+      LocalWeight.FData[kk] := LocalWeight.FData[kk] +
+        (-FLearningRate) * FBpWGradRes.FData[kk * NCnt + od];
+  end;
+
+  // --- Step 3: input-grad GEMM (device) + CPU scatter. ---------------------
+  if FCalculatePrevLayerError then
+  begin
+    // Contraction is over output channels: a = pos (T rows), b = k (V rows),
+    // i = od. Kernel A is column-major [i*FNumAs + a] = [od*NumPos + pos]
+    // (interleaved OED, FBpOEDByDepth); kernel B is row-major [b*Size + i] =
+    // [k*NCnt + od] (transposed weights, FBpWByK).
+    // Res_p[pos*VSize + k] = sum_od OED[od][pos]*W[od][k].
+    FBpOEDByDepth.ReSize(NCnt * NumPos, 1, 1);
+    for OutputY := 0 to MaxY do
+    for OutputX := 0 to MaxX do
+    begin
+      pos := OutputY * FOutputSizeX + OutputX;
+      OutputRawPos := FOutputErrorDeriv.GetRawPos(OutputX, OutputY, 0);
+      for od := 0 to MaxD do
+        FBpOEDByDepth.FData[od * NumPos + pos] :=
+          FOutputErrorDeriv.FData[OutputRawPos + od];
+    end;
+    FBpWByK.ReSize(VSize * NCnt, 1, 1);
+    for od := 0 to MaxD do
+    begin
+      LocalWeight := FArrNeurons[od].Weights;
+      for kk := 0 to VSize - 1 do
+        FBpWByK.FData[kk * NCnt + od] := LocalWeight.FData[kk];
+    end;
+    FBpPrevErrCol.ReSize(NumPos * VSize, 1, 1);
+    FDotCL.PrepareForCompute(FBpOEDByDepth, FBpWByK, NCnt);
+    FDotCL.Compute(FBpOEDByDepth, FBpWByK, {ActFN}0, {NewVAs}true, {NewVBs}true);
+    FDotCL.FinishAndLoadResult(FBpPrevErrCol, 0);
+
+    // The kernel writes Res[b*FNumAs + a] (b-major), so with a = pos
+    // (FNumAs=NumPos) and b = k (FNumBs=VSize) the layout is Res_p[k*NumPos+pos].
+    // Repack it into the native im2col [pos*VSize + k] layout so each output
+    // position holds a contiguous FSizeXDepth feature row, then scatter exactly
+    // as BackpropagateFastTiledCPU (per feature row fy a MulAdd of the weighted
+    // sum scaled by 1/FLearnSmoothener into LocalPrevError(PrevX, PrevY+fy)).
+    // Only in-bounds positions contribute (matches CanBackpropOnPos).
+    DepthFSize := FSizeXDepth; // = FFeatureSizeX * InDepth (one im2col feature row)
+    for pos := 0 to NumPos - 1 do
+    begin
+      ColBase := pos * VSize;
+      for kk := 0 to VSize - 1 do
+        FBpPatchByK.FData[ColBase + kk] := FBpPrevErrCol.FData[kk * NumPos + pos];
+    end;
+    for OutputY := 0 to MaxY do
+    begin
+      PrevY := OutputY * FStride;
+      for OutputX := 0 to MaxX do
+      begin
+        PrevX := OutputX * FStride;
+        CanBackpropOnPos := (PrevX < MaxPrevX) and (PrevY < MaxPrevY);
+        if not CanBackpropOnPos then continue;
+        pos := OutputY * FOutputSizeX + OutputX;
+        ColBase := pos * VSize;
+        for fy := 0 to FFeatureSizeYMinus1 do
+        begin
+          PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY + fy);
+          PrevPtrB := FBpPatchByK.GetRawPtr(ColBase + fy * DepthFSize);
+          TNNetVolume.MulAdd(PrevPtrA, PrevPtrB,
+            1.0 / FLearnSmoothener, DepthFSize);
+        end;
+      end;
+    end;
+  end;
+
+  if FPadding > 0 then
+  begin
+    FPrevLayer.OutputError.AddArea(0, 0, FPadding, FPadding,
+      FPrevLayer.OutputError.SizeX, FPrevLayer.OutputError.SizeY,
+      FPrevLayerErrorPadded);
+  end;
+
+  if (not FBatchUpdate) then
+  begin
+    for OutputD := 0 to MaxD do FArrNeurons[OutputD].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+end;
+{$ENDIF}
 
 constructor TNNetConvolutionAbstract.Create(pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0);
 begin

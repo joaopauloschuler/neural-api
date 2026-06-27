@@ -515,8 +515,25 @@ rather than acted on.
       so removing the redundant copies should lift tokens/sec materially. Guard
       everything behind the existing `FShouldOpenCL`, keep the host round-trip as the
       fallback, and pin parity with the SDPAOpenCLParity-style exact-vs-CPU test.
-- [ ] OpenCL offload of `TNNetConvolution.Backpropagate` (the general
-      FeatureSize>1 convolution backward). The forward conv already routes through
+- [X] OpenCL offload of `TNNetConvolution.Backpropagate` (the general
+      FeatureSize>1 convolution backward). DONE: `TNNetConvolution.BackpropagateOpenCL`
+      reformulates BOTH backward halves as im2col GEMMs on the shared `FDotCL`
+      kernel — weight-grad = OED * patch^T (VAs = native FOutputErrorDeriv
+      [pos*N+od], VBs = im2col patch^T [k*T+pos]) and input-grad = OED * W
+      (VAs = interleaved OED [od*T+pos], VBs = W^T [k*N+od]), both read back from
+      the kernel's b-major Res[b*FNumAs+a] layout, input-grad repacked to
+      pos-major then scattered through the SAME col indexing the forward im2col
+      uses. The activation-derivative pass, bias delta, and input-grad scatter
+      stay on the CPU. Gated in `Backpropagate` behind FHasOpenCL/FShouldOpenCL +
+      not-pointwise/not-Winograd + `NeuralConvOpenCLMinWork`; `BackpropagateFastTiledCPU`
+      is the EXACT fallback (byte-identical below threshold / OpenCL off). Parity
+      test `TestConvolutionBackwardOpenCLParity` (8x8x5 -> 6ch 3x3 pad1) forces the
+      device path (MinWork 0) and asserts BOTH grads vs the CPU path: measured
+      max|weight-grad diff| 9.5e-7, max|input-grad diff| 3.0e-7 (< 1e-4) on PoCL;
+      SKIPs cleanly without a device. Pointwise (1x1) keeps its own
+      `BackpropagatePointwiseOpenCL`.
+      (was: OpenCL offload of `TNNetConvolution.Backpropagate` — the forward conv
+      already routes through
       the OpenCL GEMM (`Compute` -> `FDotCL`) and the 1x1 case has a backward
       offload (`BackpropagatePointwiseOpenCL`), but the general conv backward
       ALWAYS runs `BackpropagateFastTiledCPU` — there is no `FShouldOpenCL` branch
@@ -536,7 +553,7 @@ rather than acted on.
       as the exact fallback, and pin an SDPAOpenCLParity-style exact-vs-CPU
       gradient test (input-grad AND weight-grad) on a fixed multi-channel conv
       fixture. Pairs with the landed `TNNetDeconvolution.Compute` offload
-      (the upsampling twin) to make a full conv encoder/decoder trainable on device.
+      (the upsampling twin) to make a full conv encoder/decoder trainable on device.)
 - [ ] Tokenizer follow-ups for neuralhftokenizer.pas:
       (b) DONE — raw SentencePiece .model protobuf path landed
       (LoadSentencePieceModel; hand-decoded ModelProto wire format, no
