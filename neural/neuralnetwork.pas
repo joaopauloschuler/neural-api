@@ -2995,6 +2995,30 @@ type
     // layer (RoPE/ALiBi/absolute/learned). See EnableEviction for the full note.
     FEvictSinks: integer;        // 0 = eviction off; >0 = number of sink slots
     FEvictWindow: integer;       // rolling window of most-recent tokens kept
+    // --- FlashAttention-style tiled online-softmax forward (opt-in, FORWARD-
+    // ONLY). OFF by default (FTiledForward = false) => the existing naive full-
+    // score forward runs and is bit-identical to before. When EnableTiledForward
+    // is called the prefill Compute() processes keys/values in tiles of FTileBc
+    // along the key axis, keeping only a running max/denominator/output
+    // accumulator per query, so the L x L score matrix is NEVER materialized:
+    // attention-score MEMORY drops from O(L^2) to O(L*d + Bc). The output is
+    // numerically equivalent (< 1e-5) to the naive path because online softmax
+    // (m_new=max(m,m_tile); l=l*exp(m-m_new)+l_tile; o=o*exp(m-m_new)+o_tile) is
+    // an exact re-association of the same softmax. v1 SCOPE: standard scaled-dot-
+    // product softmax only (plain scale + causal/sliding/bidirectional-window
+    // mask). It falls back to the naive path for the soft-cap, segment/document,
+    // prefix-LM and block-causal features, for the KV-cache decode path, and for
+    // every attention subclass (differential / sink / ALiBi / cosine-sim / T5 /
+    // disentangled / conformer all override Compute and never reach this layer's
+    // tiled code). FORWARD-ONLY: the tiled path does not materialize FAttn, which
+    // Backpropagate needs, so a backward pass after a tiled forward is rejected
+    // (FLastForwardTiled guards it). Use for inference / long-context generation;
+    // keep the flag off for training. Not serialized (transient runtime knob).
+    // Coded by Claude (AI).
+    FTiledForward: boolean;
+    FTileBc: integer;            // key-tile width (online-softmax block size)
+    FLastForwardTiled: boolean;  // guards Backpropagate against a tiled forward
+    FTileAcc: array of TNeuralFloat; // per-query output accumulator scratch [d_k]
     // Per-instance Backpropagate scratch, sized to SeqLen. Exact-size guarded
     // in Backpropagate (not pinned in SetPrevLayer) because the incremental-
     // decode path can change the effective sequence length on the same instance.
@@ -3030,6 +3054,10 @@ type
     procedure DequantizeCacheRow(const Codes: array of ShortInt;
       const Scale: array of TNeuralFloat; Slot: integer; Dst: TNeuralFloatArrPtr);
     procedure ComputeIncremental();
+    // FlashAttention-1 tiled online-softmax forward (opt-in, forward-only).
+    // Returns true if it handled the forward; false to fall back to the naive
+    // path (any feature outside the standard-softmax v1 scope). Coded by Claude (AI).
+    function ComputeTiled(): boolean;
     procedure SetBlockCausalSeg(pValue: boolean);
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
@@ -3184,6 +3212,22 @@ type
       out Len, Sinks, Window: integer);
     procedure RestoreCacheState(SrcK, SrcV: TNNetVolume;
       Len, Sinks, Window: integer);
+    // FlashAttention-style tiled online-softmax forward (opt-in, FORWARD-ONLY).
+    // OFF by default: the naive full-score forward runs and is bit-identical to
+    // before. EnableTiledForward(TileBc) switches the prefill Compute() to the
+    // FlashAttention-1 tiling (keys/values streamed in tiles of TileBc, running
+    // max/denominator/output per query, L x L scores never materialized) so the
+    // attention-score memory drops from O(L^2) to O(L*d). The output stays
+    // numerically equivalent (< 1e-5) to the naive path. v1 handles the standard
+    // scaled-dot-product softmax (plain scale + causal / sliding / bidirectional
+    // window) and FALLS BACK to the naive path for the soft-cap, segment,
+    // prefix-LM, block-causal and KV-cache features. FORWARD-ONLY: it does not
+    // build FAttn, so a backward pass after a tiled forward is rejected; keep the
+    // flag off for training. TileBc <= 0 picks a default of 64. Coded by Claude (AI).
+    procedure EnableTiledForward(TileBc: integer = 0);
+    procedure DisableTiledForward();
+    property TiledForward: boolean read FTiledForward;
+    property TileBc: integer read FTileBc;
     // Read-only access to the post-softmax attention map populated by
     // Compute(). Layout: X=key index j, Y=query index i, attn[j,i,0]; rows
     // (fixed i) sum to 1. Used by TNNet.AttentionEntropyReport.
@@ -25571,6 +25615,11 @@ begin
     exit;
   end;
   {$ENDIF}
+  // FlashAttention-style tiled online-softmax forward (opt-in, forward-only).
+  // Handles the standard-softmax v1 scope; returns false (falls through to the
+  // naive path below) for any feature it does not support.
+  if FTiledForward and ComputeTiled() then exit;
+  FLastForwardTiled := false;
   Inc(FForwardCPUCnt);
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -25661,6 +25710,115 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
+procedure TNNetScaledDotProductAttention.EnableTiledForward(TileBc: integer);
+begin
+  if TileBc <= 0 then TileBc := 64;
+  FTiledForward := true;
+  FTileBc := TileBc;
+end;
+
+procedure TNNetScaledDotProductAttention.DisableTiledForward();
+begin
+  FTiledForward := false;
+end;
+
+// FlashAttention-1 tiled online-softmax forward (opt-in, FORWARD-ONLY).
+// Streams the keys/values in tiles of FTileBc along the key axis and keeps,
+// per query, a running max m, running denominator l and running (unnormalized)
+// output accumulator o, rescaling on every new tile by the classic online-
+// softmax recurrence
+//   m_new = max(m, m_tile)
+//   l     = l * exp(m - m_new) + sum_j(exp(s_j - m_new))
+//   o     = o * exp(m - m_new) + sum_j(exp(s_j - m_new) * V_j)
+// then normalizing o by l at the end. The L x L score matrix is never
+// materialized (only one tile of <= FTileBc raw scores lives at a time), so the
+// attention-score memory is O(L*d + FTileBc) instead of O(L^2). The result is
+// numerically equivalent (< 1e-5) to the naive softmax because this is an exact
+// re-association of the same exp/sum. The masking semantics are shared with the
+// naive path via ScoreIsMasked (plain scale + causal / sliding / bidirectional
+// window). Returns false WITHOUT touching the output for any feature outside
+// the v1 scope, so the caller falls back to the naive path. Coded by Claude (AI).
+function TNNetScaledDotProductAttention.ComputeTiled(): boolean;
+const
+  cMaskFloor = -1e8; // row max <= this => every key masked (matches Compute())
+var
+  StartTime: double;
+  SeqLen, i, j, d, j0, jEnd: integer;
+  SeqLenM1, DkM1: integer;
+  Score, MRun, MNew, LRun, Alpha, Eg: TNeuralFloat;
+  Prev: TNNetVolume;
+  OutPtr, VPtr: TNeuralFloatArrPtr;
+begin
+  // v1 scope guard: only the plain scaled-dot-product softmax with the static
+  // causal / window masks. Anything else (soft-cap, segment/document, prefix-LM,
+  // block-causal, KV-cache decode) falls back to the naive path.
+  if (FScoreSoftCap > 0) or Assigned(FSegLayer) or (FPrefixLen > 0) or
+     FBlockCausalSeg or FCacheEnabled then
+  begin
+    Result := false;
+    exit;
+  end;
+  Result := true;
+  FLastForwardTiled := true;
+  Inc(FForwardCPUCnt);
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  SeqLenM1 := SeqLen - 1;
+  DkM1 := FDk - 1;
+  if Length(FTileAcc) < FDk then SetLength(FTileAcc, FDk);
+
+  for i := 0 to SeqLenM1 do
+  begin
+    // Running online-softmax state for query i.
+    MRun := -1e30;            // running max of seen (scaled) scores
+    LRun := 0;               // running denominator sum(exp(s - MRun))
+    OutPtr := FOutput.GetRawPtr(i, 0, 0);
+    for d := 0 to DkM1 do FTileAcc[d] := 0; // running unnormalized output
+
+    // Stream the key axis in tiles of FTileBc.
+    j0 := 0;
+    while j0 <= SeqLenM1 do
+    begin
+      jEnd := j0 + FTileBc - 1;
+      if jEnd > SeqLenM1 then jEnd := SeqLenM1;
+      for j := j0 to jEnd do
+      begin
+        if ScoreIsMasked(i, j, false, nil, 0) then continue;
+        Score := TNNetVolume.DotProduct(
+          Prev.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, FDk), FDk) * FInvSqrtDk;
+        // Online-softmax update with this single key's score.
+        if Score > MRun then MNew := Score else MNew := MRun;
+        if MRun = -1e30 then
+          Alpha := 0            // first unmasked key: nothing to rescale yet
+        else
+          Alpha := pcr_expf(MRun - MNew);
+        Eg := pcr_expf(Score - MNew);
+        LRun := LRun * Alpha + Eg;
+        VPtr := Prev.GetRawPtr(j, 0, 2 * FDk);
+        for d := 0 to DkM1 do
+          FTileAcc[d] := FTileAcc[d] * Alpha + Eg * VPtr^[d];
+        MRun := MNew;
+      end;
+      Inc(j0, FTileBc);
+    end;
+
+    // Finalize: normalize the accumulator by the denominator. A fully-masked
+    // query never updated MRun (still -1e30 <= cMaskFloor): emit a zero row,
+    // matching the naive all-masked policy.
+    if (MRun <= cMaskFloor) or (LRun <= 0) then
+    begin
+      for d := 0 to DkM1 do OutPtr^[d] := 0;
+    end
+    else
+    begin
+      Alpha := 1 / LRun;
+      for d := 0 to DkM1 do OutPtr^[d] := FTileAcc[d] * Alpha;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
 procedure TNNetScaledDotProductAttention.Backpropagate();
 var
   StartTime: double;
@@ -25671,6 +25829,14 @@ begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
+  // The tiled online-softmax forward is FORWARD-ONLY: it does not materialize
+  // FAttn, which the backward below needs, so a backward after a tiled forward
+  // would silently use a stale/empty FAttn. Reject it loudly (keep the flag off
+  // for training; use it for inference / long-context generation).
+  if FLastForwardTiled then
+    FErrorProc('TNNetScaledDotProductAttention: the tiled online-softmax '
+      + 'forward (EnableTiledForward) is forward/inference-only and cannot be '
+      + 'backpropagated. Disable it (DisableTiledForward) for training.');
   if (FPrevLayer.Output.Size > 0) and
      (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
   begin

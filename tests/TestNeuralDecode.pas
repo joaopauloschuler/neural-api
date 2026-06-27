@@ -165,6 +165,8 @@ type
     procedure TestKVCacheTruncateThenReappendMatchesFresh;
     procedure TestKVCacheDisabledPathUnchanged;
     procedure TestKVCacheInt8DriftWithinTolerance;
+    // FlashAttention-style tiled online-softmax forward parity.
+    procedure TestSDPATiledOnlineSoftmaxParity;
     // O(1)-per-step incremental decode on TNNetDiagonalSSM (persisted state).
     procedure TestSSMIncrementalMatchesFullForward;
     procedure TestSSMPrefillThenStepMatchesFullForward;
@@ -1396,6 +1398,76 @@ end;
 // time through the cached incremental-decode path, and assert EVERY position's
 // output matches to < 1e-5. With a cache, attending over the cached keys
 // [0..t] IS the causal behavior, so all positions (not just the last) agree.
+// FlashAttention-1 tiled online-softmax forward must be numerically equivalent
+// (< 1e-5) to the naive full-score forward. Same fixed input fed through a
+// naive SDPA and a tiled SDPA across a few SeqLen / Dk / mask / tile configs,
+// including a causal case and a tile width that does not divide SeqLen.
+procedure TTestNeuralDecode.TestSDPATiledOnlineSoftmaxParity;
+
+  procedure RunOne(SeqLen, Dk, Window: integer; Causal: boolean; TileBc: integer);
+  var
+    NNNaive, NNTiled: TNNet;
+    SDPATiled: TNNetScaledDotProductAttention;
+    InV, NaiveOut, TiledOut: TNNetVolume;
+    T, D: integer;
+    Diff, MaxDiff: TNeuralFloat;
+    Tag: string;
+  begin
+    RandSeed := 424242;
+    NNNaive := TNNet.Create();
+    NNTiled := TNNet.Create();
+    InV := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+    NaiveOut := TNNetVolume.Create();
+    TiledOut := TNNetVolume.Create();
+    try
+      Tag := Format('L=%d Dk=%d W=%d C=%d Bc=%d',
+        [SeqLen, Dk, Window, Ord(Causal), TileBc]);
+      NNNaive.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+      NNNaive.AddLayer(TNNetScaledDotProductAttention.Create(Dk, Causal, Window));
+      NNTiled.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+      SDPATiled := TNNetScaledDotProductAttention.Create(Dk, Causal, Window);
+      NNTiled.AddLayer(SDPATiled);
+      SDPATiled.EnableTiledForward(TileBc);
+      AssertTrue('tiled flag on ' + Tag, SDPATiled.TiledForward);
+
+      InV.Randomize();
+      InV.Sub(0.5);
+      NNNaive.Compute(InV);
+      NNNaive.GetOutput(NaiveOut);
+      NNTiled.Compute(InV);
+      NNTiled.GetOutput(TiledOut);
+
+      MaxDiff := 0;
+      for T := 0 to SeqLen - 1 do
+        for D := 0 to Dk - 1 do
+        begin
+          Diff := Abs(NaiveOut[T, 0, D] - TiledOut[T, 0, D]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      AssertTrue('tiled parity max|diff| < 1e-5 (' + Tag + ') got '
+        + FloatToStr(MaxDiff), MaxDiff < 1e-5);
+    finally
+      TiledOut.Free;
+      NaiveOut.Free;
+      InV.Free;
+      NNTiled.Free;
+      NNNaive.Free;
+    end;
+  end;
+
+begin
+  // Plain bidirectional, tile divides and does not divide SeqLen, single-tile.
+  RunOne({SeqLen=}16, {Dk=}8,  {Window=}0, {Causal=}false, {TileBc=}4);
+  RunOne({SeqLen=}13, {Dk=}5,  {Window=}0, {Causal=}false, {TileBc=}4);
+  RunOne({SeqLen=}10, {Dk=}7,  {Window=}0, {Causal=}false, {TileBc=}64);
+  // Causal mask.
+  RunOne({SeqLen=}16, {Dk=}8,  {Window=}0, {Causal=}true,  {TileBc=}4);
+  RunOne({SeqLen=}31, {Dk=}6,  {Window=}0, {Causal=}true,  {TileBc=}8);
+  // Sliding-window causal and a larger depth.
+  RunOne({SeqLen=}20, {Dk=}12, {Window=}5, {Causal=}true,  {TileBc=}3);
+  RunOne({SeqLen=}64, {Dk=}16, {Window=}0, {Causal=}true,  {TileBc=}16);
+end;
+
 procedure TTestNeuralDecode.TestKVCacheIncrementalMatchesFullForward;
 const
   SeqLen = 7;

@@ -725,10 +725,22 @@ rather than acted on.
       but NN.Compute has no SIMD batch axis on the char path, so each step still
       pays one forward per running row. The vectorized batch is the actual
       prerequisite for an efficient speculative-decoding verify step.
-- [ ] FlashAttention-style tiled online-softmax SDPA forward: opt-in fast
+- [X] FlashAttention-style tiled online-softmax SDPA forward: opt-in fast
       mode — not for GPU speed but for O(L*d) vs O(L^2) attention-score
       MEMORY on long sequences; gate behind an exact-vs-naive equivalence
       assert, same pattern as the chunked-forward recurrence family.
+      DONE (v1): TNNetScaledDotProductAttention.EnableTiledForward(TileBc) gates
+      the FlashAttention-1 tiling (ComputeTiled: running max/denominator/output
+      per query, keys streamed in tiles, L x L scores never materialized; off by
+      default -> bit-identical naive path). v1 scope = STANDARD softmax variant
+      only (plain scale + causal/sliding/bidirectional-window); falls back to the
+      naive path for soft-cap / segment / prefix-LM / block-causal / KV-cache,
+      and the exotic subclasses (differential/sink/ALiBi/cosine-sim/T5/...) keep
+      their own Compute and never reach it. FORWARD-ONLY: does not build FAttn,
+      so Backpropagate after a tiled forward is rejected. Parity test
+      TestSDPATiledOnlineSoftmaxParity asserts max|diff| < 1e-5 vs naive across
+      SeqLen/Dk/window/causal/tile configs (observed ~1e-7). FOLLOW-UPS: exotic
+      variants + tiled backward (recompute-scores) still open.
 - [ ] longrope short-factor / dynamic switching follow-up (static long-context
       import landed): the import statically picks the long_factor table + long
       attention scaling. HF switches to short_factor when seq_len <=
