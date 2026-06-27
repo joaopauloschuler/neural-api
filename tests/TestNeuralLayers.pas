@@ -5,7 +5,8 @@ unit TestNeuralLayers;
 interface
 
 uses
-  Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume;
+  Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume,
+  pascoremath32;
 
 const
   // Maximum number of elements to check for NaN/Inf in large tensors.
@@ -21,6 +22,9 @@ type
     procedure TestWinogradConvolutionParity;
     procedure TestMaxPoolForward;
     procedure TestMaxPoolVectorizedExactParity;
+    procedure TestVectorExpScalarParity;
+    procedure TestVectorSigmoidScalarParity;
+    procedure TestPointwiseSoftMaxVectorizedParity;
     procedure TestNetworkSaveLoad;
     procedure TestSimpleXORLearning;
     // New comprehensive layer tests
@@ -478,6 +482,125 @@ begin
   // Custom stride + padding path.
   CheckParity('stride-padding', 3, 2, 1, 7, 5, 37);
   CheckParity('overlap-stride', 3, 1, 0, 6, 6, 13);
+end;
+
+procedure TTestNeuralLayers.TestVectorExpScalarParity;
+// TNNetVolume.VectorExp must match the scalar pcr_expf loop (the parity
+// reference) within a tight relative tolerance on every build. On AVX2 builds
+// VectorExp uses an 8-wide polynomial; on scalar builds it IS the pcr_expf loop.
+// N=131 deliberately straddles the 8-wide body and the (N mod 8) scalar tail.
+const
+  N = 131;
+  RelTol = 1e-4;
+var
+  Src, Dst, Ref: TNNetVolume;
+  I: integer;
+  x, e, denom, maxRel: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  Ref := TNNetVolume.Create(N, 1, 1);
+  try
+    // Spread inputs across [-30, 30] plus a couple of saturating extremes.
+    for I := 0 to N - 1 do
+    begin
+      x := -30.0 + 60.0 * I / (N - 1);
+      Src.FData[I] := x;
+      Ref.FData[I] := pcr_expf(x);
+    end;
+    TNNetVolume.VectorExp(Dst.DataPtr, Src.DataPtr, N);
+    maxRel := 0;
+    for I := 0 to N - 1 do
+    begin
+      denom := Abs(Ref.FData[I]);
+      if denom < 1e-20 then denom := 1e-20;
+      e := Abs(Dst.FData[I] - Ref.FData[I]) / denom;
+      if e > maxRel then maxRel := e;
+    end;
+    AssertTrue('VectorExp vs pcr_expf max rel err ' + FloatToStr(maxRel) +
+      ' must be < ' + FloatToStr(RelTol), maxRel < RelTol);
+  finally
+    Src.Free; Dst.Free; Ref.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestVectorSigmoidScalarParity;
+// VectorSigmoid must match the scalar reference Sigmoid() within tolerance.
+const
+  N = 131;
+  AbsTol = 1e-4;
+var
+  Src, Dst: TNNetVolume;
+  I: integer;
+  x, e, maxErr: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  try
+    for I := 0 to N - 1 do
+      Src.FData[I] := -25.0 + 50.0 * I / (N - 1);
+    TNNetVolume.VectorSigmoid(Dst.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      x := Src.FData[I];
+      e := Abs(Dst.FData[I] - Sigmoid(x));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorSigmoid vs Sigmoid max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+  finally
+    Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestPointwiseSoftMaxVectorizedParity;
+// PointwiseSoftMax (depth-axis softmax per (x,y) point) must agree with an
+// independent scalar reference within tolerance. Depth = 37 straddles the AVX
+// 8-wide body and the scalar tail; multiple spatial points exercise the loop.
+const
+  SX = 5; SY = 3; D = 37;
+  AbsTol = 1e-4;
+var
+  V, Ref: TNNetVolume;
+  cx, cy, cd, base: integer;
+  mx, sum: TNeuralFloat;
+begin
+  V := TNNetVolume.Create(SX, SY, D);
+  Ref := TNNetVolume.Create(SX, SY, D);
+  try
+    for cx := 0 to SX - 1 do
+      for cy := 0 to SY - 1 do
+        for cd := 0 to D - 1 do
+        begin
+          V[cx, cy, cd] := Sin(0.31 * cx + 0.7 * cy + 0.17 * cd) * 6.0;
+          Ref[cx, cy, cd] := V[cx, cy, cd];
+        end;
+    // Scalar reference softmax over the depth axis at each (x,y).
+    for cx := 0 to SX - 1 do
+      for cy := 0 to SY - 1 do
+      begin
+        base := Ref.GetRawPos(cx, cy);
+        mx := Ref.FData[base];
+        for cd := 1 to D - 1 do
+          if Ref.FData[base + cd] > mx then mx := Ref.FData[base + cd];
+        sum := 0;
+        for cd := 0 to D - 1 do
+        begin
+          Ref.FData[base + cd] := Exp(Ref.FData[base + cd] - mx);
+          sum := sum + Ref.FData[base + cd];
+        end;
+        for cd := 0 to D - 1 do
+          Ref.FData[base + cd] := Ref.FData[base + cd] / sum;
+      end;
+    V.PointwiseSoftMax();
+    for cd := 0 to V.Size - 1 do
+      AssertTrue('PointwiseSoftMax parity at ' + IntToStr(cd) +
+        ' err ' + FloatToStr(Abs(V.FData[cd] - Ref.FData[cd])),
+        Abs(V.FData[cd] - Ref.FData[cd]) < AbsTol);
+  finally
+    V.Free; Ref.Free;
+  end;
 end;
 
 procedure TTestNeuralLayers.TestNetworkSaveLoad;

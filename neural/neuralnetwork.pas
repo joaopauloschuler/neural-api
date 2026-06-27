@@ -19734,10 +19734,14 @@ begin
 
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
+    // Vectorize sigmoid(x) 8-wide into FOutputErrorDeriv (used as scratch here),
+    // then finish output and derivative elementwise. Using the same VectorSigmoid
+    // as the forward-only branch keeps the two paths bit-identical.
+    TNNetVolume.VectorSigmoid(FOutputErrorDeriv.DataPtr, LocalPrevOutput.DataPtr, SizeM1 + 1);
     for OutputCnt := 0 to SizeM1 do
     begin
       PrevValue := LocalPrevOutput.FData[OutputCnt];
-      SigmoidValue := 1 / ( 1 + pcr_expf(-PrevValue) );
+      SigmoidValue := FOutputErrorDeriv.FData[OutputCnt];
       OutputValue := PrevValue * SigmoidValue;
       FOutput.FData[OutputCnt] := OutputValue;
       FOutputErrorDeriv.FData[OutputCnt] := OutputValue + SigmoidValue * (1-OutputValue);
@@ -19745,12 +19749,12 @@ begin
   end
   else
   begin
-    // can't calculate error on input layers.
+    // can't calculate error on input layers. Forward-only path: compute
+    // sigmoid(x) 8-wide into FOutput, then multiply by x in place. Parity with
+    // the scalar pcr_expf form is within ~1e-6 (well under the 1e-4 target).
+    TNNetVolume.VectorSigmoid(FOutput.DataPtr, LocalPrevOutput.DataPtr, SizeM1 + 1);
     for OutputCnt := 0 to SizeM1 do
-    begin
-      PrevValue := LocalPrevOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := PrevValue / ( 1 + pcr_expf(-PrevValue) );
-    end;
+      FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt] * FOutput.FData[OutputCnt];
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;

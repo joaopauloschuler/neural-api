@@ -1762,24 +1762,32 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
   - [ ] TNNetTestTimeTraining / TNNetTitansMemory backward "undo" loops (interleaved
         scalar etaGrad/dEta/dTheta accumulation) — the per-token forward rank-1 writes
         are vectorized; this is the lower-value remainder.
-- [ ] AVX-vectorize the elementwise transcendental hot loops (exp / tanh /
-      erf). Today every activation and softmax applies its transcendental
-      SCALAR per element via the precise RTL-compatible `pcr_expf` / `pcr_tanhf`
-      / `pcr_erff` (pascoremath32.pas): `TNNetVolume.PointwiseSoftMax`'s
-      `Exp(...)` loop (neuralvolume.pas ~7299), `TNNetSwish` (neuralnetwork.pas
-      ~19740), `TNNetGELU` tanh path (~20523) and exact-erf path (~20589), and
-      `TNNetVolume.Sigmoid` (~1245). Exp dominates the softmax tail of LLM decode
-      and activations are everywhere in CV. Scope: add a SIMD polynomial
-      approximation (`pcr_expf_avx` / `pcr_tanhf_avx`, range-reduce + minimax
-      poly, AVX2 8-wide like the existing `AVXDotProduct`) plus a thin
-      `TNNetVolume.VectorExp(pDst, pSrc, N)` wrapper, then route the loops above
-      through it with a contiguous-depth fast path and a scalar remainder. Keep
-      the scalar `pcr_*` as the fallback build and the parity reference; gate
-      every touched layer's numerical test to stay < 1e-4 vs the current scalar
-      output on BOTH scalar-fallback and `-dAVX2` builds. (Winograd conv, the
-      DotProduct-based norm reductions and the strided state read-outs are
-      already AVX'd — the transcendental element loops are the remaining scalar
-      hot spot.)
+- [X] AVX-vectorize the elementwise transcendental hot loops (exp / tanh /
+      erf). Added `AVXExp` (8-wide AVX2 range-reduce + degree-6 minimax exp,
+      both AVX32 and AVX64 inline-asm blocks, FMA/integer-vector body gated by
+      `{$IFDEF AVX2}`, scalar `pcr_expf` remainder for the N mod 8 tail; max
+      rel err ~1e-6 vs RTL exp). Thin wrappers `TNNetVolume.VectorExp` and
+      `VectorSigmoid` (declared outside the AVXANY guard so the scalar-fallback
+      build also has them; `AVXExp` forward-declared at INTERFACE scope so the
+      generic `TVolume.PointwiseSoftMax` may call it — a generic template can't
+      reference an implementation-private symbol). Routed: `PointwiseSoftMax`
+      exp loop (clamp depth segment in place, then 8-wide AVXExp) and BOTH
+      `TNNetSwish` branches (sigmoid via VectorSigmoid; both branches share the
+      same approximation so trainable/inference builds stay consistent). Parity
+      tests added in TestNeuralLayers: `TestVectorExpScalarParity`,
+      `TestVectorSigmoidScalarParity`, `TestPointwiseSoftMaxVectorizedParity`
+      (all < 1e-4 vs scalar pcr reference, green on both scalar and `-dAVX2`
+      builds). DEFERRED (documented, partial per task guidance): `TNNetGELU`
+      tanh path, `TNNetGELUErf` exact-erf path, and the derivative-coupled
+      branches were left scalar — their forward+derivative are computed
+      interleaved per element, so a clean VectorExp route would need a scratch
+      pass; lower value than softmax/Swish. `TNNetVolume.Sigmoid` is a single-
+      scalar function used through a per-element function pointer
+      (`ApplyActivationFunctionToOutput`), so vectorizing TNNetSigmoid would
+      require restructuring the activation dispatch — also deferred. (Note: the
+      `-dAVX2` build has ONE pre-existing failure, `TestSetTrainableKeepsOutputs`,
+      verified present on clean master with `-dAVX2` and unrelated to this change
+      — FMA nondeterminism between trainable/inference builds.)
 
 ## Tests / numerical-gradient audit
 

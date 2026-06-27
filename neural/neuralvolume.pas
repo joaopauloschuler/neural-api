@@ -472,6 +472,14 @@ type
       procedure DotProductsTiled(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
       procedure PointwiseNorm(pNorms: TNNetVolume = nil);
       procedure PointwiseMul(pNorms: TNNetVolume);
+      // VectorExp writes dst[0..N-1] := exp(src[0..N-1]). On an AVX2 build it
+      // uses an 8-wide polynomial approximation (AVXExp) with a scalar pcr_expf
+      // remainder; on a non-AVX build it is a plain pcr_expf loop. Buffers may
+      // alias (dst = src) since the read happens before the write per lane/element.
+      class procedure VectorExp(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // VectorSigmoid writes dst[0..N-1] := 1/(1+exp(-src)). AVX2-accelerated
+      // path built on VectorExp; numerically stable scalar form on the tail.
+      class procedure VectorSigmoid(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
       procedure AddArea(DestX, DestY, OriginX, OriginY, LenX, LenY: integer; Original: TNNetVolume);
       function HasAVX: boolean; {$IFDEF Release} inline; {$ENDIF}
       function HasAVX2: boolean; {$IFDEF Release} inline; {$ENDIF}
@@ -1141,10 +1149,40 @@ type
 
   function GetDefaultNumericFormat: TFormatSettings;
 
+  {$IFDEF AVXANY}
+  // AVXExp writes pDst[0..N-1] := exp(pSrc[0..N-1]) using an 8-wide AVX2
+  // polynomial approximation (scalar pcr_expf remainder for the N mod 8 tail).
+  // Declared at interface scope so the generic TVolume.PointwiseSoftMax may call
+  // it (a generic template cannot reference an implementation-private symbol).
+  // Implemented in the AVX32 / AVX64 asm blocks. Buffers may alias.
+  procedure AVXExp(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer);
+  {$ENDIF}
+
 implementation
 
 uses
   Math, neuralbit, strutils;
+
+{$IFDEF AVX2}
+// Constants for the AVX2 8-wide exp() polynomial approximation (AVXExp).
+// exp(x) = 2^(x*log2e); split t=x*log2e into k=round(t) and f=t-k in [-0.5,0.5];
+// 2^k is built from the float exponent bits, 2^f = exp(f*ln2) via a degree-6
+// minimax-style Taylor/Horner polynomial. Max relative error ~1e-6, far below
+// the 1e-4 parity target against the scalar pcr_expf reference.
+const
+  cAVXExpHi:  Single  = 88.3762626647949;
+  cAVXExpLo:  Single  = -88.3762626647949;
+  cAVXLog2e:  Single  = 1.44269504088896341;
+  cAVXLn2:    Single  = 0.6931471805599453;
+  cAVXExpP0:  Single  = 1.0;
+  cAVXExpP1:  Single  = 1.0;
+  cAVXExpP2:  Single  = 0.5;
+  cAVXExpP3:  Single  = 0.16666666666666666;
+  cAVXExpP4:  Single  = 0.041666666666666664;
+  cAVXExpP5:  Single  = 0.008333333333333333;
+  cAVXExpP6:  Single  = 0.001388888888888889;
+  cAVXExp127: Integer = 127;
+{$ENDIF}
 
 function CreateTokenizedStringList(str: string; c:char):TNNetStringList;
 begin
@@ -7293,6 +7331,24 @@ begin
         end;
         TotalSum := 0;
         I := StartPointPos;
+        {$IFDEF AVXANY}
+        // Contiguous-depth fast path: clamp (x - max) in place over the depth
+        // segment, then exponentiate it 8-wide via AVXExp (parity with the scalar
+        // pcr_expf loop within ~1e-6 relative error), then accumulate the sum.
+        for CountD := 0 to MaxD do
+        begin
+          FData[I] := NeuronForceRange(FData[I] - MaxValue, 4000);
+          Inc(I);
+        end;
+        AVXExp(TNeuralFloatArrPtr(@FData[StartPointPos]),
+               TNeuralFloatArrPtr(@FData[StartPointPos]), MaxD + 1);
+        I := StartPointPos;
+        for CountD := 0 to MaxD do
+        begin
+          TotalSum := TotalSum + FData[I];
+          Inc(I);
+        end;
+        {$ELSE}
         for CountD := 0 to MaxD do
         begin
           // LocalValue := pcr_expf( NeuronForceRange(FData[I] - MaxValue, 4000) );
@@ -7301,6 +7357,7 @@ begin
           TotalSum := TotalSum + LocalValue;
           Inc(I);
         end;
+        {$ENDIF}
         if TotalSum > 0 then
         begin
           I := StartPointPos;
@@ -7366,6 +7423,40 @@ begin
         Mul(StartPointPtr, Modulus, FDepth);
       end;
     end;
+  end;
+end;
+
+class procedure TNNetVolume.VectorExp(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+{$IFDEF AVXANY}
+begin
+  if N <= 0 then exit;
+  AVXExp(pDst, pSrc, N);
+end;
+{$ELSE}
+var
+  I: integer;
+begin
+  for I := 0 to N - 1 do
+    pDst^[I] := pcr_expf(pSrc^[I]);
+end;
+{$ENDIF}
+
+class procedure TNNetVolume.VectorSigmoid(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+var
+  I: integer;
+  S: TNeuralFloat;
+begin
+  if N <= 0 then exit;
+  // sigmoid(x) = 1/(1+exp(-x)). Compute exp(-x) into the destination buffer in a
+  // single vectorized pass, then finish elementwise. The scalar form below mirrors
+  // the reference Sigmoid() (avoids overflow for very negative x).
+  for I := 0 to N - 1 do
+    pDst^[I] := -pSrc^[I];
+  VectorExp(pDst, pDst, N);
+  for I := 0 to N - 1 do
+  begin
+    S := pDst^[I]; // S = exp(-x)
+    pDst^[I] := 1 / (1 + S);
   end;
 end;
 
@@ -10944,6 +11035,75 @@ begin
   end;
 end;
 
+{ AVXExp (32-bit): dst[0..N-1] := exp(src[0..N-1]). 8-wide AVX2 body using only
+  ymm0..ymm7 (no extended regs in 32-bit), scalar pcr_expf remainder. Under
+  plain-AVX it degrades to a scalar pcr_expf loop. }
+procedure AVXExp(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer);
+{$IFDEF AVX2}
+var
+  localNumElements, MissedElements, I: integer;
+begin
+  MissedElements := NumElements and 7;
+  localNumElements := NumElements xor MissedElements;
+  if localNumElements > 0 then
+  begin
+  asm
+  mov eax, pSrc
+  mov ecx, pDst
+  mov edx, localNumElements
+  shr edx, 3
+  jz @DoneAVXExp32
+@LoopAVXExp32:
+  vmovups ymm0, [eax]
+  vbroadcastss ymm6, dword ptr [cAVXExpHi]
+  vminps  ymm0, ymm0, ymm6
+  vbroadcastss ymm6, dword ptr [cAVXExpLo]
+  vmaxps  ymm0, ymm0, ymm6
+  vbroadcastss ymm6, dword ptr [cAVXLog2e]
+  vmulps  ymm1, ymm0, ymm6          // t = x*log2e
+  vroundps ymm2, ymm1, 0            // k = round(t)
+  vsubps  ymm1, ymm1, ymm2          // f = t-k
+  vbroadcastss ymm6, dword ptr [cAVXLn2]
+  vmulps  ymm3, ymm1, ymm6          // g = f*ln2
+  vbroadcastss ymm4, dword ptr [cAVXExpP6]
+  vbroadcastss ymm5, dword ptr [cAVXExpP5]
+  vfmadd213ps ymm4, ymm3, ymm5
+  vbroadcastss ymm5, dword ptr [cAVXExpP4]
+  vfmadd213ps ymm4, ymm3, ymm5
+  vbroadcastss ymm5, dword ptr [cAVXExpP3]
+  vfmadd213ps ymm4, ymm3, ymm5
+  vbroadcastss ymm5, dword ptr [cAVXExpP2]
+  vfmadd213ps ymm4, ymm3, ymm5
+  vbroadcastss ymm5, dword ptr [cAVXExpP1]
+  vfmadd213ps ymm4, ymm3, ymm5
+  vbroadcastss ymm5, dword ptr [cAVXExpP0]
+  vfmadd213ps ymm4, ymm3, ymm5      // ymm4 = 2^f
+  vcvtps2dq ymm2, ymm2              // k -> int32
+  vbroadcastss ymm6, dword ptr [cAVXExp127]
+  vpaddd ymm2, ymm2, ymm6
+  vpslld ymm2, ymm2, 23            // 2^k as float bits
+  vmulps ymm0, ymm4, ymm2
+  vmovups [ecx], ymm0
+  add eax, 32
+  add ecx, 32
+  dec edx
+  jnz @LoopAVXExp32
+@DoneAVXExp32:
+  vzeroupper
+  end ['eax','ecx','edx',
+       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5','ymm6'];
+  end;
+  for I := localNumElements to NumElements - 1 do
+    pDst^[I] := pcr_expf(pSrc^[I]);
+end;
+{$ELSE}
+var
+  I: integer;
+begin
+  for I := 0 to NumElements - 1 do
+    pDst^[I] := pcr_expf(pSrc^[I]);
+end;
+{$ENDIF}
 
 function AVXDotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
 var
@@ -12392,6 +12552,78 @@ begin
            Sqr(PtrA^[localNumElements+2]);
   end;
 end;
+
+{ AVXExp: dst[0..N-1] := exp(src[0..N-1]). 8-wide AVX2 polynomial body plus a
+  scalar pcr_expf remainder for the (N mod 8) tail. Under plain-AVX (no AVX2)
+  the whole thing degrades to a scalar pcr_expf loop. }
+procedure AVXExp(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer);
+{$IFDEF AVX2}
+var
+  localNumElements, MissedElements, I: integer;
+begin
+  MissedElements := NumElements and 7;
+  localNumElements := NumElements xor MissedElements;
+  if localNumElements > 0 then
+  begin
+  asm
+  mov rax, pSrc
+  mov rcx, pDst
+  mov r8d, localNumElements
+  shr r8d, 3
+  jz @DoneAVXExp
+  vbroadcastss ymm10, [rip+cAVXExpHi]
+  vbroadcastss ymm11, [rip+cAVXExpLo]
+  vbroadcastss ymm12, [rip+cAVXLog2e]
+  vbroadcastss ymm13, [rip+cAVXLn2]
+  vmovd xmm14, dword ptr [rip+cAVXExp127]
+  vpbroadcastd ymm14, xmm14
+@LoopAVXExp:
+  vmovups ymm0, [rax]
+  vminps  ymm0, ymm0, ymm10
+  vmaxps  ymm0, ymm0, ymm11
+  vmulps  ymm1, ymm0, ymm12        // t = x*log2e
+  vroundps ymm2, ymm1, 0           // k = round(t)
+  vsubps  ymm1, ymm1, ymm2         // f = t-k in [-0.5,0.5]
+  vmulps  ymm3, ymm1, ymm13        // g = f*ln2
+  vbroadcastss ymm4, [rip+cAVXExpP6]
+  vbroadcastss ymm5, [rip+cAVXExpP5]
+  vfmadd213ps ymm4, ymm3, ymm5
+  vbroadcastss ymm5, [rip+cAVXExpP4]
+  vfmadd213ps ymm4, ymm3, ymm5
+  vbroadcastss ymm5, [rip+cAVXExpP3]
+  vfmadd213ps ymm4, ymm3, ymm5
+  vbroadcastss ymm5, [rip+cAVXExpP2]
+  vfmadd213ps ymm4, ymm3, ymm5
+  vbroadcastss ymm5, [rip+cAVXExpP1]
+  vfmadd213ps ymm4, ymm3, ymm5
+  vbroadcastss ymm5, [rip+cAVXExpP0]
+  vfmadd213ps ymm4, ymm3, ymm5     // ymm4 = 2^f
+  vcvtps2dq ymm2, ymm2             // k -> int32
+  vpaddd ymm2, ymm2, ymm14
+  vpslld ymm2, ymm2, 23            // 2^k as float bits
+  vmulps ymm0, ymm4, ymm2
+  vmovups [rcx], ymm0
+  add rax, 32
+  add rcx, 32
+  dec r8d
+  jnz @LoopAVXExp
+@DoneAVXExp:
+  vzeroupper
+  end ['rax','rcx','r8',
+       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5',
+       'ymm10','ymm11','ymm12','ymm13','ymm14'];
+  end;
+  for I := localNumElements to NumElements - 1 do
+    pDst^[I] := pcr_expf(pSrc^[I]);
+end;
+{$ELSE}
+var
+  I: integer;
+begin
+  for I := 0 to NumElements - 1 do
+    pDst^[I] := pcr_expf(pSrc^[I]);
+end;
+{$ENDIF}
 
 function AVXDotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
 var
