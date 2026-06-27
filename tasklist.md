@@ -381,12 +381,21 @@ rather than acted on.
       reader/ToString, resnet18 parity 1.0e-6 vs a numpy float64 oracle —
       torchvision not installed; ConvNeXt LayerScale+GRN+depthwise-7x7 is the
       modern-CNN stretch goal on the same path):
-  - [ ] real torchvision .pth (pickle) load path: today the importer reads
-        safetensors only; the pico fixture is a numpy float64 oracle (no
-        torchvision). Also: CAI maxpool (ceil sizing + edge-clamped windows + zero
-        pad) diverges from PyTorch maxpool (floor + -inf pad) — the parity test
-        mirrors CAI semantics; a real-checkpoint top-1 check needs reconciling the
-        stem maxpool or documenting the gap.
+  - [X] real torchvision .pth (pickle) load path: CreatePretrainedTensorReader
+        now dispatches .pth/.pt (and existing .bin) to TNNetTorchBinReader, so
+        BuildResNetFromSafeTensors[Ex] loads a torchvision state_dict .pth
+        directly (same conv-BN fold + config reader on the torch-bin source).
+        Stem maxpool reconciled (option a): TResNetConfig.PyTorchMaxPool (default
+        TRUE; opt back to legacy CAI ceil maxpool with "cai_maxpool":true) selects
+        TNNetMaxPoolPortable for the stem, which on the post-ReLU non-negative stem
+        input reproduces PyTorch floor-sized/(-inf)-pad maxpool BIT-FOR-BIT (no new
+        class needed; verified vs numpy floor+(-inf) ref + against the .safetensors
+        path < 1e-4). Tests: TestResNetTorchBinPthParity (.pth==.safetensors logits),
+        TestResNetPyTorchStemMaxPool (floor/(-inf) exact), pico_resnet18.{pth,
+        safetensors,_config.json} fixtures. Pico CAI-oracle fixtures18/34/50 pinned
+        to "cai_maxpool":true so their numpy oracles still match.
+        REMAINS: real downloaded torchvision resnet18/50 top-1 over ImageNet val
+        (torchvision still not installed); ConvNeXt modern-CNN stretch goal.
 - [ ] Stable Diffusion VAE decoder importer follow-ups (BuildVaeDecoderFromSafeTensors[Ex]
       LANDED, commit a7870a1: diffusers AutoencoderKL decoder — post_quant_conv ->
       mid block single self-attention over HxW -> up blocks of ResNet groups +

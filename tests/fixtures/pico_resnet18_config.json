@@ -1,0 +1,20 @@
+{
+ "model_type": "resnet",
+ "depth": 18,
+ "image_size": 80,
+ "num_channels": 3,
+ "num_labels": 4,
+ "widths": [
+  2,
+  3,
+  4,
+  5
+ ],
+ "blocks_per_stage": [
+  1,
+  1,
+  1,
+  1
+ ],
+ "bn_eps": 1e-05
+}

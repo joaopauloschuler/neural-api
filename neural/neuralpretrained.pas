@@ -8472,6 +8472,13 @@ type
     NumLabels: integer;              // fc out width (1000 ImageNet-1k)
     BnEps: TNeuralFloat;             // BatchNorm2d eps (1e-5 in torchvision)
     ModelType: string;               // 'resnet'
+    PyTorchMaxPool: boolean;         // stem maxpool semantics: true = PyTorch
+                                     // (floor sizing, matches torchvision via
+                                     // TNNetMaxPoolPortable); false = legacy
+                                     // CAI (ceil sizing, edge-clamped). See
+                                     // BuildResNet stem comment. Default false
+                                     // for the pico CAI-oracle parity fixtures;
+                                     // real-checkpoint loaders set it true.
   end;
 
 // Reads a torchvision-style ResNet config. The only REQUIRED field is "depth"
@@ -11926,10 +11933,14 @@ function CreatePretrainedTensorReader(
 const
   BinIndexSuffix = '.bin.index.json';
 var
-  LowerName: string;
+  LowerName, Ext: string;
 begin
   LowerName := LowerCase(FileName);
-  if (ExtractFileExt(LowerName) = '.bin') or
+  Ext := ExtractFileExt(LowerName);
+  // .bin / .pth are both plain torch.save zip archives (same restricted
+  // unpickler + ZIP storage); torchvision checkpoints are conventionally
+  // saved as .pth. *.bin.index.json is a sharded-checkpoint weight map.
+  if (Ext = '.bin') or (Ext = '.pth') or (Ext = '.pt') or
      (Copy(LowerName, Length(LowerName) - Length(BinIndexSuffix) + 1,
        Length(BinIndexSuffix)) = BinIndexSuffix) then
     Result := TNNetTorchBinReader.Create(FileName)
@@ -54886,6 +54897,10 @@ begin
         '" is not a JSON object.');
     Obj := TJSONObject(Root);
     Result.ModelType := Obj.Get('model_type', 'resnet');
+    // Stem maxpool semantics. Default true: a real torchvision checkpoint must
+    // use PyTorch (floor) maxpool sizing to match top-1. The pico CAI-oracle
+    // fixtures opt back to legacy CAI ceil sizing via "cai_maxpool": true.
+    Result.PyTorchMaxPool := not Obj.Get('cai_maxpool', false);
     if Obj.IndexOfName('depth') < 0 then
       ImportError('ResNet import: config "' + FileName +
         '" is missing the required field "depth" (18 / 34 / 50).');
@@ -54984,6 +54999,8 @@ begin
     ', image=' + IntToStr(Config.ImageSize) +
     ', channels=' + IntToStr(Config.NumChannels) +
     ', num_labels=' + IntToStr(Config.NumLabels);
+  if Config.PyTorchMaxPool then Result := Result + ', maxpool=pytorch'
+  else Result := Result + ', maxpool=cai';
 end;
 
 // Loads a torchvision Conv2d (weight [O,I,kh,kw], bias=False) into a CAI conv
@@ -55245,7 +55262,18 @@ begin
     StemConv := NN.AddLayer( TNNetConvolutionLinear.Create(
       Config.StemWidth, 7, {pad=}3, {stride=}2, {suppressBias=}0).SetTrainable(pTrainable) );
     NN.AddLayer( TNNetReLU.Create() );
-    NN.AddLayer( TNNetMaxPool.Create({pool=}3, {stride=}2, {pad=}1) );
+    // Stem maxpool 3x3 stride2 pad1. torchvision uses PyTorch maxpool: floor
+    // output sizing + (-inf) padding. For this post-ReLU (non-negative) stem
+    // input that is EXACTLY reproduced by TNNetMaxPoolPortable (floor sizing,
+    // zero pad == -inf pad here since no full window is padding, edge-clamped
+    // windows that coincide with PyTorch's floor-sized output) - verified
+    // bit-for-bit against a numpy floor+(-inf) reference. The legacy CAI
+    // TNNetMaxPool (ceil sizing, edge-clamped) is kept for the pico CAI-oracle
+    // parity fixtures and selected when Config.PyTorchMaxPool is false.
+    if Config.PyTorchMaxPool then
+      NN.AddLayer( TNNetMaxPoolPortable.Create({pool=}3, {stride=}2, {pad=}1) )
+    else
+      NN.AddLayer( TNNetMaxPool.Create({pool=}3, {stride=}2, {pad=}1) );
     RefCount := 0;
     InWidth := Config.StemWidth;
     for Stage := 0 to 3 do

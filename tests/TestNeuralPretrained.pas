@@ -480,6 +480,8 @@ type
     procedure TestResNet18ImageClassificationParity;
     procedure TestResNet34ImageClassificationParity;
     procedure TestResNet50ImageClassificationParity;
+    procedure TestResNetTorchBinPthParity;
+    procedure TestResNetPyTorchStemMaxPool;
     procedure TestRepVGGConfigFromJSONFile;
     procedure TestRepVGGParity;
     procedure TestMaskRCNNConfigFromJSONFile;
@@ -17934,6 +17936,9 @@ begin
   AssertEquals('stage3 width', 12, Config.StageWidths[3]);
   AssertEquals('stage0 blocks', 2, Config.BlocksPerStage[0]);
   AssertEquals('stage3 blocks', 2, Config.BlocksPerStage[3]);
+  // This pico fixture opts into legacy CAI maxpool (its oracle uses CAI
+  // semantics); the importer default (no cai_maxpool key) is PyTorch maxpool.
+  AssertFalse('cai_maxpool:true -> PyTorchMaxPool false', Config.PyTorchMaxPool);
 end;
 
 // torchvision ResNet18 image-classification parity test (the FIRST conv-net /
@@ -18043,6 +18048,123 @@ end;
 procedure TTestNeuralPretrained.TestResNet50ImageClassificationParity;
 begin
   RunResNetParity('tiny_resnet50');
+end;
+
+// torchvision .pth (PyTorch pickle / ZIP) load path parity. The SAME pico
+// ResNet18 weights are committed twice: pico_resnet18.safetensors and
+// pico_resnet18.pth (torch.save zip, read by TNNetTorchBinReader, which the
+// importer reaches transparently via CreatePretrainedTensorReader dispatching
+// on the .pth extension). Both nets are built with the SAME config (PyTorch
+// stem maxpool, the importer default) and fed the same input; their logits
+// must agree bit-for-bit (the conv-BN fold + forward are identical, only the
+// tensor SOURCE differs). Proves the torch-bin source feeds the conv-BN fold +
+// config reader identically to safetensors. Note: the importer dispatch keys
+// off file extension, so the same physical .pth bytes are also loadable by any
+// other torch-bin importer (Llama/BERT/etc.) sharing the loader.
+procedure TTestNeuralPretrained.TestResNetTorchBinPthParity;
+var
+  NNSafe, NNPth: TNNet;
+  Config: TResNetConfig;
+  ImageInput: TNNetVolume;
+  i: integer;
+  MaxDiff, Diff: double;
+begin
+  RandSeed := 424242;
+  Config := ReadResNetConfigFromJSONFile(
+    FixturePath('pico_resnet18_config.json'));
+  // Default config => PyTorch stem maxpool (the real-checkpoint setting).
+  AssertTrue('default config selects PyTorch stem maxpool',
+    Config.PyTorchMaxPool);
+  NNSafe := nil; NNPth := nil; ImageInput := TNNetVolume.Create;
+  try
+    NNSafe := BuildResNetFromSafeTensorsEx(
+      FixturePath('pico_resnet18.safetensors'), Config, {pTrainable=}true);
+    NNPth := BuildResNetFromSafeTensorsEx(
+      FixturePath('pico_resnet18.pth'), Config, {pTrainable=}true);
+    AssertTrue('both nets built', (NNSafe <> nil) and (NNPth <> nil));
+    AssertEquals('same layer count', NNSafe.CountLayers, NNPth.CountLayers);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for i := 0 to ImageInput.Size - 1 do
+      ImageInput.FData[i] := (((i * 5) mod 17) - 8) / 8.0;
+
+    NNSafe.Compute(ImageInput);
+    NNPth.Compute(ImageInput);
+    AssertEquals('logit width', Config.NumLabels,
+      NNPth.GetLastLayer().Output.Size);
+    MaxDiff := 0;
+    for i := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NNSafe.GetLastLayer().Output.FData[i] -
+        NNPth.GetLastLayer().Output.FData[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('.pth vs .safetensors logits: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    NNSafe.Free; NNPth.Free; ImageInput.Free;
+  end;
+end;
+
+// PyTorch-semantics stem maxpool (TNNetMaxPoolPortable, the importer default)
+// must reproduce PyTorch's floor-sized, (-inf)-padded 3x3 stride2 pad1 maxpool
+// on a non-negative (post-ReLU) input. Hand example: a 4x4 single-channel map
+// 0..15 (all >= 0). PyTorch out size = floor((4+2*1-3)/2)+1 = 2; the floor+(-inf)
+// reference is computed inline and asserted EXACT. The legacy CAI TNNetMaxPool
+// would instead produce a 3x3 (ceil) map, so this also documents the divergence.
+procedure TTestNeuralPretrained.TestResNetPyTorchStemMaxPool;
+var
+  NN: TNNet;
+  Inp, Ref: TNNetVolume;
+  Pool: TNNetMaxPoolPortable;
+  H, W, oy, ox, iy, ix, ky, kx, py, px: integer;
+  m, v: TNeuralFloat;
+const
+  K = 3; ST = 2; PAD = 1;
+begin
+  H := 4; W := 4;
+  Inp := TNNetVolume.Create(W, H, 1);
+  Ref := nil; NN := nil;
+  try
+    for oy := 0 to H - 1 do
+      for ox := 0 to W - 1 do
+        Inp[ox, oy, 0] := oy * W + ox; // 0..15, all >= 0
+
+    NN := TNNet.Create();
+    NN.AddLayer(TNNetInput.Create(W, H, 1));
+    Pool := TNNetMaxPoolPortable(
+      NN.AddLayer(TNNetMaxPoolPortable.Create(K, ST, PAD)));
+    NN.Compute(Inp);
+
+    // PyTorch floor sizing.
+    AssertEquals('PyTorch maxpool out X (floor)', 2, Pool.Output.SizeX);
+    AssertEquals('PyTorch maxpool out Y (floor)', 2, Pool.Output.SizeY);
+
+    // Inline floor + (-inf)-pad reference.
+    Ref := TNNetVolume.Create(Pool.Output.SizeX, Pool.Output.SizeY, 1);
+    for oy := 0 to Pool.Output.SizeY - 1 do
+      for ox := 0 to Pool.Output.SizeX - 1 do
+      begin
+        m := -1e30;
+        for ky := 0 to K - 1 do
+          for kx := 0 to K - 1 do
+          begin
+            iy := oy * ST - PAD + ky;
+            ix := ox * ST - PAD + kx;
+            if (iy >= 0) and (iy < H) and (ix >= 0) and (ix < W) then
+            begin
+              v := Inp[ix, iy, 0];           // padding contributes -inf
+              if v > m then m := v;
+            end;
+          end;
+        Ref[ox, oy, 0] := m;
+        py := oy; px := ox;
+        AssertEquals('PyTorch stem maxpool cell (' + IntToStr(px) + ',' +
+          IntToStr(py) + ')', m, Pool.Output[ox, oy, 0]);
+      end;
+  finally
+    NN.Free; Inp.Free; Ref.Free;
+  end;
 end;
 
 // Shared driver for the RepVGG fusion-parity check. Loads the pico fixture

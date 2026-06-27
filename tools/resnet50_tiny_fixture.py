@@ -151,6 +151,9 @@ def emit(name, depth, widths, blocks, expansion, kind, stem, seed):
         'widths': widths,
         'blocks_per_stage': blocks,
         'bn_eps': EPS,
+        # This oracle replicates CAI (ceil-sized, edge-clamped) maxpool; opt
+        # the importer back to it (the default is PyTorch floor-sized maxpool).
+        'cai_maxpool': True,
     }
     with open(f'tests/fixtures/{name}_config.json', 'w') as f:
         json.dump(config, f, indent=1)

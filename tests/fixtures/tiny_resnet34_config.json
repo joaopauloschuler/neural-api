@@ -19,5 +19,6 @@
   2,
   2
  ],
- "bn_eps": 1e-05
+ "bn_eps": 1e-05,
+ "cai_maxpool": true
 }
