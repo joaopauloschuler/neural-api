@@ -12007,6 +12007,13 @@ type
     FOffOut: integer;      // offset-head output channels: 2*KK, or 3*KK if modulated
     FModulated: integer;   // 0 = plain deformable conv (v1), 1 = DCNv2 modulated
     FOffMap: TNNetVolume;  // cached offset maps (FOutputSizeX,Y, FOffOut)
+    // AVX scratch for the main-conv ci-reduction. FSampledCol holds the
+    // bilinearly-sampled (and modulated) input column over ci for one (ox,oy,tap)
+    // -- gathered SCALAR once, independent of co. FWeightCI is mW transposed to
+    // ci-contiguous [(tap*FOutDepth+co)*FInDepth+ci] so the per-co dot over ci is
+    // a contiguous AVX DotProduct. Both rebuilt each forward.
+    FSampledCol: TNNetVolume;
+    FWeightCI: TNNetVolume;
     {$IFDEF OpenCL}
     // Scratch operands for the device im2col GEMM (interleaved weights, gathered
     // per-position bilinear patches, result). The bilinear GATHER stays on the
@@ -66237,12 +66244,16 @@ begin
   if pModulated <> 0 then FModulated := 1 else FModulated := 0;
   FStruct[5] := FModulated;     // DCNv2 modulation flag (round-trips)
   FOffMap := TNNetVolume.Create();
+  FSampledCol := TNNetVolume.Create();
+  FWeightCI := TNNetVolume.Create();
   // Neurons are sized in SetPrevLayer once InDepth is known.
 end;
 
 destructor TNNetDeformableConv.Destroy();
 begin
   FOffMap.Free;
+  FSampledCol.Free;
+  FWeightCI.Free;
   {$IFDEF OpenCL}
   FGemmWInter.Free;
   FGemmPatch.Free;
@@ -66331,6 +66342,8 @@ begin
   BuildArrNeurons();
 
   FOffMap.ReSize(FOutputSizeX, FOutputSizeY, FOffOut);
+  FSampledCol.ReSize(1, 1, FInDepth);
+  FWeightCI.ReSize(1, 1, FMainSize);  // ci-contiguous transpose of mW
 
   InitDefault();
   RefreshCalculatePrevLayerError();
@@ -66461,34 +66474,52 @@ begin
       FOffMap.FData[FOffMap.GetRawPos(ox, oy, oc)] := offv;
     end;
 
+  // Transpose the main weights to ci-contiguous layout so the per-co reduction
+  // over ci is a contiguous AVX DotProduct. mW is stored co-fastest
+  // [(tap*FInDepth+ci)*FOutDepth+co]; FWeightCI lays it out ci-fastest
+  // [(tap*FOutDepth+co)*FInDepth+ci]. Rebuilt each forward (cheap vs the conv,
+  // tracks training weight updates).
+  for tap := 0 to FNumTaps - 1 do
+    for co := 0 to MaxCO do
+      for ci := 0 to MaxCI do
+        FWeightCI.FData[(tap * FOutDepth + co) * FInDepth + ci] :=
+          mW.FData[(tap * FInDepth + ci) * FOutDepth + co];
+
   // 2. Deformable main conv: sample each tap by bilinear interpolation at the
-  //    offset position, then the usual weighted sum.
+  //    offset position, then the usual weighted sum. The bilinear GATHER stays
+  //    scalar; the sampled (+modulated) input column over ci is gathered ONCE
+  //    per (ox,oy,tap) into FSampledCol (independent of co), then reduced over
+  //    ci against each co's weight row with the AVX DotProduct primitive.
   for oy := 0 to MaxOY do
   for ox := 0 to MaxOX do
+  begin
     for co := 0 to MaxCO do
+      FOutput.FData[FOutput.GetRawPos(ox, oy, co)] := mB.FData[co];  // bias seed
+    for fy := 0 to MaxFY do
+    for fx := 0 to MaxFX do
     begin
-      acc := mB.FData[co];  // 0 when bias suppressed
-      for fy := 0 to MaxFY do
-      for fx := 0 to MaxFX do
-      begin
-        tap := fy * FFeatureSizeX + fx;
-        dx := FOffMap.Get(ox, oy, 2 * tap);
-        dy := FOffMap.Get(ox, oy, 2 * tap + 1);
-        px := ox * FStride + fx - FPadding + dx;
-        py := oy * FStride + fy - FPadding + dy;
-        // DCNv2: per-tap modulation m = sigmoid(logit) scales the sampled value.
-        if FModulated <> 0 then
-          modM := 1.0 / (1.0 + Exp(-FOffMap.Get(ox, oy, 2 * FNumTaps + tap)))
-        else
-          modM := 1.0;
-        for ci := 0 to MaxCI do
-        begin
-          sampled := SampleBilinear(PrevOut, px, py, ci) * modM;
-          acc := acc + mW.FData[(tap * FInDepth + ci) * FOutDepth + co] * sampled;
-        end;
-      end;
-      FOutput.FData[FOutput.GetRawPos(ox, oy, co)] := acc;
+      tap := fy * FFeatureSizeX + fx;
+      dx := FOffMap.Get(ox, oy, 2 * tap);
+      dy := FOffMap.Get(ox, oy, 2 * tap + 1);
+      px := ox * FStride + fx - FPadding + dx;
+      py := oy * FStride + fy - FPadding + dy;
+      // DCNv2: per-tap modulation m = sigmoid(logit) scales the sampled value.
+      if FModulated <> 0 then
+        modM := 1.0 / (1.0 + Exp(-FOffMap.Get(ox, oy, 2 * FNumTaps + tap)))
+      else
+        modM := 1.0;
+      // Scalar bilinear gather of the whole ci column for this tap.
+      for ci := 0 to MaxCI do
+        FSampledCol.FData[ci] := SampleBilinear(PrevOut, px, py, ci) * modM;
+      // AVX ci-reduction: acc[co] += <weightRow(tap,co), FSampledCol>.
+      for co := 0 to MaxCO do
+        FOutput.FData[FOutput.GetRawPos(ox, oy, co)] :=
+          FOutput.FData[FOutput.GetRawPos(ox, oy, co)] +
+          TNNetVolume.DotProduct(
+            @FWeightCI.FData[(tap * FOutDepth + co) * FInDepth],
+            @FSampledCol.FData[0], FInDepth);
     end;
+  end;
 end;
 
 {$IFDEF OpenCL}
