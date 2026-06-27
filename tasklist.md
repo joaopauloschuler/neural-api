@@ -518,6 +518,13 @@ rather than acted on.
       k-quant Q4_K/Q6_K/Q5_K/Q2_K dequant-at-load READ path has landed in
       neural/neuralgguf.pas).
 - [ ] FP16 (half-precision) OpenCL compute path for the dot-product/matmul
+      offload. ENV NOTE (2026-06-27): the only OpenCL device available here is
+      PoCL on the host CPU, which does NOT advertise `cl_khr_fp16` (clinfo shows
+      "Half-precision Floating-point support (n/a)"). The detection + opt-in
+      buffer/kernel path can be written and the FP32-fallback verified, but the
+      actual half-precision kernel CANNOT be exercised/parity-tested here — defer
+      until a `cl_khr_fp16` device is available, or scope a host-side
+      half<->float conversion test only and mark the GPU kernel unverified.
       offload. Every GEMM kernel in `neural/neural.cl` (cai_dot_product,
       simpleGEMMT, myGEMM5/6) is FP32 today, and the landed FP16/BF16 weight
       storage is RAM-only — compute still runs the FP32 kernels (tasklist
