@@ -1804,6 +1804,22 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       demonstrates the shipped API; keep the stored-pattern recall demo and its
       reported recall metric so the refactor is verifiable.
 
+- [ ] Add missing `README.md` to example folders that ship a `.lpr` but no
+      README (the CV/generative six — VQGAN, TinyNeRF, VideoFrameInterpolation,
+      VideoPrediction, VideoAction, VideoActionTiny — LANDED commit 0cf2ea59).
+      Remaining folders still lacking a README (write each strictly from the
+      `.lpr`, matching existing example-README style; no source edits):
+  - [ ] NLP/decoding: BeamSearchDecode, SpanCorruptionPretrain, sentimentAnalysis,
+        GroupedQueryAttention, GumbelSoftmaxDemo, MixtureOfExperts, PonderNet,
+        DiagonalSSM, LegendreMemoryUnit, LinearRecurrentUnit, MinimalRNN, RWKV,
+        TitansMemory, DebertaReranker
+  - [ ] Audio/speech: F5TTS, KokoroTTS, ParlerTTS, Qwen2AudioChat, Wav2Vec2Transcribe,
+        MusicGenProbe, MusicTagging, OCRTranscribe, SpeakerDiarization,
+        SpeakerVerification, DACRoundTrip
+  - [ ] Misc/training: CaiOptimizedDenseNet, MagnitudePruneFineTune, OnlyTwoLayers,
+        SelfTest, SDPAOpenCLParity, OctonionConv, QuaternionConv, QuaternionLinear,
+        HopfieldAssociativeMemory
+
 ## Tests / numerical-gradient audit
 
 - [ ] Shared `LayerInputAndWeightGradientCheck(layer, inputShape)` helper
