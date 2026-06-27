@@ -282,6 +282,9 @@ type
     procedure TestDeconvolutionOpenCLParity;
     // OpenCL backward-GEMM offload parity (vs CPU) for the general convolution.
     procedure TestConvolutionBackwardOpenCLParity;
+    // OpenCL two-GEMM forward offload parity (vs CPU) for the non-causal global
+    // TNNetLinearAttention.
+    procedure LinearAttentionOpenCLParity;
     procedure TestRoIAlignForward;
     procedure TestRoIAlignInputGradientCheck;
     procedure TestRoIAlignShapeInference;
@@ -58158,6 +58161,74 @@ begin
     for od := 0 to Length(WGradCPU) - 1 do WGradCPU[od].Free;
     IGradCPU.Free;
     Desired.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Non-causal global TNNetLinearAttention is two GEMMs (S = phi(K)^T V, then
+// phi(Q) S); both are offloaded to the cai_dot_product kernel behind
+// FShouldOpenCL. This pins the device forward bit-close to the CPU forward on a
+// fixed fixture (SeqLen >= the offload threshold so the GEMM path fires). The
+// phi maps, Z and the per-query denominator stay on the CPU in both paths, so
+// the only divergence is FP32 GEMM accumulation order -> a tight 1e-4 gate.
+procedure TTestNeuralNumerical.LinearAttentionOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Dk = 12;
+  SeqLen = 24; // >= csLinAttnOpenCLMinSeqLen (16) so the device path fires
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Attn: TNNetLinearAttention;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetLinearAttention.Create(Dk);
+    NN.AddLayer(Attn);
+    // Bounded Q|K|V so phi(x)=elu(x)+1 and the value sums stay O(1) and the
+    // 1e-4 absolute gate is meaningful.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.5 * Sin(i * 0.3) + 0.2 * Cos(i * 0.11);
+
+    // CPU forward (OpenCL OFF).
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    // Device forward (offload ARMED for both GEMMs).
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    MaxDiff := 0;
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  LinearAttention OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('LinearAttention OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
     Input.Free;
     NN.Free;
   end;

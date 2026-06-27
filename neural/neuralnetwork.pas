@@ -4778,12 +4778,37 @@ type
     FS: TNNetVolume;    // S = sum_s phi(K_s) (x) V_s,    [d_k,1,d_k] (X=k,Depth=v)
     FZ: TNNetVolume;    // Z = sum_s phi(K_s),            [d_k,1,1]
     FDen: TNNetVolume;  // per-query denominator phi(Q_t).Z, [SeqLen,1,1]
+    {$IFDEF OpenCL}
+    // OpenCL forward offload of the two GEMMs (non-causal global form only;
+    // masking/cumulative-sum-free). Both reuse the inherited cai_dot_product
+    // kernel (FDotCL). phi(Q)/phi(K) and Z/Den stay on the CPU.
+    //  - GEMM1 S[a,b] = sum_i phi(K)[i,a]*V[i,b]: A = FPhiK passed DIRECTLY
+    //    (its native [i*d_k+a] layout already matches the kernel's interleaved
+    //    A read As[a + i*d_k]); B = FVColBuf = V transposed to [b*SeqLen+i].
+    //    Result lands in FSclBuf as [b*d_k+a] = S[a,b].
+    //  - GEMM2 N[i,b] = sum_a phi(Q)[i,a]*S[a,b]: A = FPhiQColBuf = phi(Q)
+    //    transposed to [a*SeqLen+i]; B = FSclBuf DIRECTLY (its [b*d_k+a] layout
+    //    is exactly the kernel's contiguous B read Bs[b*d_k+a]). Result lands
+    //    in FNumBuf as [b*SeqLen+i] = N[i,b], then transposed+divided into
+    //    FOutput. Coded by Claude (AI).
+    FVColBuf: TNNetVolume;
+    FPhiQColBuf: TNNetVolume;
+    FSclBuf: TNNetVolume;
+    FNumBuf: TNNetVolume;
+    procedure ComputeOpenCL();
+    {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(d_k: integer); overload;
     destructor Destroy(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
+    {$IFDEF OpenCL}
+    // Allocates the shared dot-product kernel (inherited FDotCL) plus the
+    // transpose buffers, then flags this layer to offload its two forward
+    // GEMMs. Coded by Claude (AI).
+    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    {$ENDIF}
     property Dk: integer read FDk;
   end;
 
@@ -28602,8 +28627,117 @@ begin
   FS.Free;
   FZ.Free;
   FDen.Free;
+  {$IFDEF OpenCL}
+  // FDotCL is freed by the inherited TNNetLayer.Destroy; free only our buffers.
+  if Assigned(FVColBuf) then FVColBuf.Free;
+  if Assigned(FPhiQColBuf) then FPhiQColBuf.Free;
+  if Assigned(FSclBuf) then FSclBuf.Free;
+  if Assigned(FNumBuf) then FNumBuf.Free;
+  {$ENDIF}
   inherited Destroy();
 end;
+
+{$IFDEF OpenCL}
+procedure TNNetLinearAttention.EnableOpenCL(DotProductKernel: TDotProductKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL, FDotProductKernel
+  if not Assigned(FDotCL) then
+  begin
+    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL.HideMessages();
+  end;
+  if not Assigned(FVColBuf) then FVColBuf := TNNetVolume.Create();
+  if not Assigned(FPhiQColBuf) then FPhiQColBuf := TNNetVolume.Create();
+  if not Assigned(FSclBuf) then FSclBuf := TNNetVolume.Create();
+  if not Assigned(FNumBuf) then FNumBuf := TNNetVolume.Create();
+  FShouldOpenCL := true;
+end;
+
+// Forward: BOTH GEMMs on the device, phi maps + Z/Den on the CPU. Mirrors the
+// CPU Compute() math exactly (same elu+1 phi, same Den clamp, same divide).
+// Coded by Claude (AI).
+procedure TNNetLinearAttention.ComputeOpenCL();
+var
+  StartTime: double;
+  SeqLen, i, a, b: integer;
+  SeqLenM1, DkM1: integer;
+  Prev: TNNetVolume;
+  Q, K, Den, InvDen: TNeuralFloat;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  SeqLenM1 := SeqLen - 1;
+  DkM1 := FDk - 1;
+
+  // 1) Feature maps phi(Q), phi(K) with phi(x) = elu(x)+1 (CPU). FPhiK native
+  //    layout [i*d_k+a] is ALSO the kernel's interleaved A read for GEMM1, so
+  //    FPhiK is passed straight in as A. Also pack V column-major for GEMM1 B
+  //    (FVColBuf[b*SeqLen+i] = V[i,b]).
+  FVColBuf.ReSize(FDk * SeqLen, 1, 1);
+  for i := 0 to SeqLenM1 do
+    for a := 0 to DkM1 do
+    begin
+      Q := Prev[i, 0, a];
+      if Q >= 0 then FPhiQ[i, 0, a] := Q + 1 else FPhiQ[i, 0, a] := pcr_expf(Q);
+      K := Prev[i, 0, FDk + a];
+      if K >= 0 then FPhiK[i, 0, a] := K + 1 else FPhiK[i, 0, a] := pcr_expf(K);
+      FVColBuf.FData[a * SeqLen + i] := Prev.FData[i * (3 * FDk) + 2 * FDk + a];
+    end;
+
+  // 2) Z = sum_s phi(K_s) (CPU; cheap O(SeqLen*d_k)).
+  FZ.Fill(0);
+  for i := 0 to SeqLenM1 do
+    for a := 0 to DkM1 do
+      FZ.FData[a] := FZ.FData[a] + FPhiK[i, 0, a];
+
+  // 3) GEMM1 on device: S[a,b] = sum_i phi(K)[i,a] * V[i,b]. A = FPhiK (a count
+  //    = FNumAs = d_k, interleaved As[a + i*d_k]); B = FVColBuf (b count =
+  //    FNumBs = d_k, contiguous Bs[b*SeqLen + i]); contraction FSize = SeqLen.
+  //    Result[b*d_k + a] = S[a,b] lands raw in FSclBuf.
+  FDotCL.PrepareForCompute(FPhiK, FVColBuf, SeqLen);
+  FDotCL.Compute(FPhiK, FVColBuf, {ActFN}0, {NewVAs}true, {NewVBs}true);
+  FDotCL.FinishAndLoadResult(FSclBuf, 0);
+
+  // 4a) Transpose FSclBuf [b*d_k+a] into FS native [a*d_k+b] so the (CPU)
+  //     Backpropagate after an OpenCL forward sees the exact same S it would
+  //     have on the CPU path. Cheap (d_k x d_k).
+  for a := 0 to DkM1 do
+    for b := 0 to DkM1 do
+      FS.FData[a * FDk + b] := FSclBuf.FData[b * FDk + a];
+
+  // 4) Pack phi(Q) column-major for GEMM2 A (FPhiQColBuf[a*SeqLen+i] = phi(Q)[i,a]).
+  FPhiQColBuf.ReSize(FDk * SeqLen, 1, 1);
+  for i := 0 to SeqLenM1 do
+    for a := 0 to DkM1 do
+      FPhiQColBuf.FData[a * SeqLen + i] := FPhiQ[i, 0, a];
+
+  // 5) GEMM2 on device: N[i,b] = sum_a phi(Q)[i,a] * S[a,b]. A = FPhiQColBuf
+  //    (i count = FNumAs = SeqLen, interleaved As[i + a*SeqLen]); B = FSclBuf
+  //    (b count = FNumBs = d_k, contiguous Bs[b*d_k + a] = S[a,b]); contraction
+  //    FSize = d_k. Result[b*SeqLen + i] = N[i,b] lands raw in FNumBuf.
+  FDotCL.PrepareForCompute(FPhiQColBuf, FSclBuf, FDk);
+  FDotCL.Compute(FPhiQColBuf, FSclBuf, {ActFN}0, {NewVAs}true, {NewVBs}true);
+  FDotCL.FinishAndLoadResult(FNumBuf, 0);
+
+  // 6) Den = phi(Q_i).Z (CPU, AVX dot), clamp exactly as Compute(), then write
+  //    FOutput[i,0,b] = N[i,b] / Den (transposing FNumBuf's [b*SeqLen+i] into
+  //    FOutput's native [i*d_k+b]).
+  for i := 0 to SeqLenM1 do
+  begin
+    Den := TNNetVolume.DotProduct(
+      FPhiQ.GetRawPtr(i, 0, 0), FZ.GetRawPtr(0, 0, 0), FDk);
+    if (Den >= 0) and (Den < 1e-12) then Den := 1e-12;
+    if (Den < 0) and (Den > -1e-12) then Den := -1e-12;
+    FDen[i, 0, 0] := Den;
+    InvDen := 1 / Den;
+    for b := 0 to DkM1 do
+      FOutput.FData[i * FDk + b] := FNumBuf.FData[b * SeqLen + i] * InvDen;
+  end;
+
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+{$ENDIF}
 
 procedure TNNetLinearAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
@@ -28631,7 +28765,19 @@ var
   SeqLenM1, DkM1: integer;
   Prev: TNNetVolume;
   Q, K, PhiVal, Den: TNeuralFloat;
+const
+  // Minimum sequence length to offload both GEMMs to OpenCL; below this the
+  // kernel launch + upload cost outweighs the two small matmuls.
+  csLinAttnOpenCLMinSeqLen = 16;
 begin
+  {$IFDEF OpenCL}
+  if FHasOpenCL and FShouldOpenCL and
+     (FPrevLayer.FOutput.SizeX >= csLinAttnOpenCLMinSeqLen) then
+  begin
+    ComputeOpenCL();
+    exit;
+  end;
+  {$ENDIF}
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;

@@ -1447,13 +1447,15 @@ rather than acted on.
       gate matmul is the same shape as the LSTM/GRU task above). Mirror the matrix
       gradients in the backward with `MulAdd`; gate behind the existing cell
       numerical-gradient tests (scalar build must stay bit-identical).
-- [ ] OpenCL forward offload for `TNNetLinearAttention` / `TNNetCausalLinearAttention`
-      (both are AVX'd but CPU-only — `TNNetScaledDotProductAttention` already has a
-      `ComputeOpenCL` + `SDPAOpenCLParity` exact-vs-CPU test, these siblings do not).
-      The non-causal global form is two GEMMs (`S = ϕ(K)ᵀ V`, then `ϕ(Q) S`) that
-      map cleanly onto the existing `FDotCL` matmul offload behind `FShouldOpenCL`,
-      keeping the host round-trip as the fallback. Pin parity with an exact-vs-CPU
-      test mirroring `SDPAOpenCLParity`.
+- [ ] OpenCL forward offload for `TNNetCausalLinearAttention` (the non-causal global
+      `TNNetLinearAttention` is now DONE — `ComputeOpenCL` two-GEMM offload behind
+      `FShouldOpenCL` + `LinearAttentionOpenCLParity` exact-vs-CPU test, PoCL-verified
+      max|diff| ≈ 1.5e-8). The causal sibling was deliberately LEFT CPU-only: its
+      forward is a left-to-right prefix-sum scan (`S_t = S_{t-1} + ϕ(K_t)⊗V_t`,
+      per-query `Out_t = ϕ(Q_t)·S_t / ϕ(Q_t)·Z_t`), NOT a pair of dense GEMMs, so it
+      does not map onto the `FDotCL` matmul kernel without a chunked-scan rewrite.
+      Tackle it with the chunked-forward family below (intra-chunk dense GEMM +
+      inter-chunk running state), then add a causal parity test alongside.
 
 (The sub-quadratic / chunked-forward family below is one coherent systems effort:
 every recurrence currently trains as a strict per-token left-to-right scan.)
