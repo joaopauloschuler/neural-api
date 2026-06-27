@@ -610,6 +610,21 @@ rather than acted on.
       int8 weight-only storage instead of dequantize-then-requantize (the
       k-quant Q4_K/Q6_K/Q5_K/Q2_K dequant-at-load READ path has landed in
       neural/neuralgguf.pas).
+- [ ] Quantization-aware training (QAT) — port torch.ao.quantization's
+      fake-quantize-during-training so accuracy lost to post-training int8 can be
+      recovered (the landed int8 path is post-training, inference-only). Add a
+      `TNNetFakeQuantize` layer that, in the FORWARD pass, simulates int8
+      round-to-nearest + clamp at the current (running min/max or learned) scale
+      so the network sees quantization error while training, and in the BACKWARD
+      pass passes the gradient straight through inside the representable range
+      (reuse the landed `TNNetStraightThroughEstimator` STE clamp; zero gradient
+      outside the clamp). Reuse the existing int8 scale/storage machinery so a
+      QAT-trained net exports cleanly into the landed int8 weight-only format.
+      Scope v1: per-tensor symmetric fake-quant on weights + activations,
+      observer-driven scale; an `examples/QATFineTune` that PTQ-quantizes a small
+      CIFAR net, measures the accuracy drop, then QAT-fine-tunes it back. Pin a
+      numerical test that the STE gradient matches finite differences inside the
+      clamp band and that the fake-quant forward equals dequant(quant(x)).
 - [ ] FP16 (half-precision) OpenCL compute path for the dot-product/matmul
       offload. ENV NOTE (2026-06-27): the only OpenCL device available here is
       PoCL on the host CPU, which does NOT advertise `cl_khr_fp16` (clinfo shows
@@ -1777,6 +1792,24 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
         contiguous spatial axis (and the symmetric backward mirrors it). Speeds up
         the style-transfer / AdaIN Gram path; document the scratch alloc in
         SetPrevLayer per the preallocated-scratch convention.
+- [ ] AVX-vectorize the elementwise transcendental hot loops (exp / tanh /
+      erf). Today every activation and softmax applies its transcendental
+      SCALAR per element via the precise RTL-compatible `pcr_expf` / `pcr_tanhf`
+      / `pcr_erff` (pascoremath32.pas): `TNNetVolume.PointwiseSoftMax`'s
+      `Exp(...)` loop (neuralvolume.pas ~7299), `TNNetSwish` (neuralnetwork.pas
+      ~19740), `TNNetGELU` tanh path (~20523) and exact-erf path (~20589), and
+      `TNNetVolume.Sigmoid` (~1245). Exp dominates the softmax tail of LLM decode
+      and activations are everywhere in CV. Scope: add a SIMD polynomial
+      approximation (`pcr_expf_avx` / `pcr_tanhf_avx`, range-reduce + minimax
+      poly, AVX2 8-wide like the existing `AVXDotProduct`) plus a thin
+      `TNNetVolume.VectorExp(pDst, pSrc, N)` wrapper, then route the loops above
+      through it with a contiguous-depth fast path and a scalar remainder. Keep
+      the scalar `pcr_*` as the fallback build and the parity reference; gate
+      every touched layer's numerical test to stay < 1e-4 vs the current scalar
+      output on BOTH scalar-fallback and `-dAVX2` builds. (Winograd conv, the
+      DotProduct-based norm reductions and the strided state read-outs are
+      already AVX'd — the transcendental element loops are the remaining scalar
+      hot spot.)
 - [X] Add missing `README.md` to example folders that ship a `.lpr` but no
       README (the CV/generative six — VQGAN, TinyNeRF, VideoFrameInterpolation,
       VideoPrediction, VideoAction, VideoActionTiny — LANDED commit 0cf2ea59).
