@@ -240,34 +240,14 @@ rather than acted on.
       `examples/BackgroundRemoval` cutting a subject out of a tiny CPU image
       (sigmoid mask -> RGBA composite).
 
-- [X] SDXL conditioning support for the landed SD UNet importer
-      (`BuildSDUNetFromSafeTensors`). The `add_embedding` micro-conditioning path
-      (addition_embed_type=="text_time") is now wired behind a config flag,
-      default OFF so SD-1.x/2.x stays BIT-IDENTICAL (TestSDUNetParity /
-      TestSDUNetLinearProjParity unchanged). TSDUNetConfig gains UseAddEmbedding,
-      AdditionTimeEmbedDim, AdditionEmbedTextDim, AddEmbedsInputDim (parsed from
-      addition_embed_type / addition_time_embed_dim /
-      projection_class_embeddings_input_dim; reported in SDUNetConfigToString). On:
-      the importer adds a 4th TNNetInput carrying add_embeds and an in-net
-      add_embedding MLP (PointwiseConvLinear -> SiLU -> PointwiseConvLinear ->
-      TimeEmbedDim) whose output is TNNetSum'd into the timestep embedding before
-      the down/mid/up ResNet blocks. New driver SDUNetDenoiseSDXL(Latent, EncStates,
-      PooledText, t, TimeIds[6], Noise) expands the 6-vector time_ids on the host
-      with the SAME sinusoidal projection as the diffusion timestep
-      (SDUNetFillAddEmbeds, diffusers [cos|sin] order), concatenates
-      [pooled_text | time_ids_emb] into the add_embeds input. Control/adapter skip
-      inputs shift via SDUNetSkipInputBase (3 -> 4 when add_embedding on). New pico
-      fixture tools/sd_unet_sdxl_tiny_fixture.py (time_embed_dim 32,
-      addition_time_embed_dim 8, pooled 12) + TestSDUNetSDXLParity match the numpy
-      float64 oracle < 1e-4. Full suite 2393 tests, 0 failures.
-    - [ ] SDXL residual: real stabilityai/stable-diffusion-xl-base-1.0 checkpoint
-          parity still deferred (only the pico oracle is verified). The 2048 cross
-          width is already just CrossAttentionDim, and the highest-res "no attn"
-          block layout is handled by down_block_types=DownBlock2D (DownHasAttn=false
-          skips the Transformer2DModel) — transformer_layers_per_block list (e.g.
-          [1,2,10]) already supported; no depth=0 special case needed. The dual
-          text-encoder concatenation lives in the (still-deferred) SDXL pipeline
-          driver, not the UNet importer.
+- [ ] SDXL residual: real stabilityai/stable-diffusion-xl-base-1.0 checkpoint
+      parity still deferred (only the pico oracle is verified). The 2048 cross
+      width is already just CrossAttentionDim, and the highest-res "no attn"
+      block layout is handled by down_block_types=DownBlock2D (DownHasAttn=false
+      skips the Transformer2DModel) — transformer_layers_per_block list (e.g.
+      [1,2,10]) already supported; no depth=0 special case needed. The dual
+      text-encoder concatenation lives in the (still-deferred) SDXL pipeline
+      driver, not the UNet importer.
 - [ ] Hunyuan-DiT bilingual text-to-image importer
       (`BuildHunyuanDiTFromSafeTensors[Ex]`, Tencent `Hunyuan-DiT`). A distinct
       DiT from the landed PixArt/MMDiT/Sana stacks: a cross-attention DiT
@@ -425,26 +405,6 @@ rather than acted on.
           count across blocks — SD1.5's 8-heads-everywhere case holds, but SDXL /
           configs with a per-block attention_head_dim list need a per-block heads
           array wired through TSDUNetConfig).
-    - [X] use_linear_projection=True variant (SD2.x / SDXL use Linear proj_in/out
-          instead of 1x1 conv) + transformer_layers_per_block > 1 (SDXL stacks
-          several BasicTransformerBlocks per Transformer2DModel) — the v1 importer
-          hardcoded a 1x1-conv proj and exactly one transformer block. DONE:
-          TSDUNetConfig now carries UseLinearProjection (config use_linear_projection)
-          + TransformerLayersPerBlock[0..7] (scalar OR per-resolution list, mid uses
-          the deepest resolution, up reverses). AddSDTransformer2D loops the
-          self/cross/FFN BasicTransformerBlock Depth times (refs split into
-          TSDBasicBlockLayers array); proj_in/out stay 1x1 TNNetConvolutionLinear
-          (same per-token map) and LoadSDTransformer2D picks the linear loader
-          ([out,in] nn.Linear) vs conv loader ([out,in,1,1]) by the flag — math is
-          identical, only the stored tensor shape differs. v1 defaults
-          (UseLinearProjection=false, depth=1 everywhere) are BIT-IDENTICAL:
-          TestSDUNetParity unchanged. New fixture tools/sd_unet_linproj_tiny_fixture.py
-          + TestSDUNetLinearProjParity (use_linear_projection=true,
-          transformer_layers_per_block=2) match the numpy oracle < 1e-4.
-    - [X] add_embedding / class/time-aug conditioning (SDXL micro-conditioning):
-          UseAddEmbedding flag + SDUNetDenoiseSDXL + add_embedding MLP summed into
-          the timestep embedding; TestSDUNetSDXLParity < 1e-4 (see the SDXL entry
-          above for full detail).
     - [ ] the end-to-end LatentTextToImage capstone (CLIP text -> this UNet ->
           scheduler loop -> VAE decoder), incl. the SDXL dual-text-encoder pooled
           embedding + real-checkpoint parity.
@@ -588,26 +548,6 @@ rather than acted on.
       int8 weight-only storage instead of dequantize-then-requantize (the
       k-quant Q4_K/Q6_K/Q5_K/Q2_K dequant-at-load READ path has landed in
       neural/neuralgguf.pas).
-- [X] OpenCL forward offload for the bilinear-resample layer family:
-      `TNNetBilinearUpsample`, `TNNetAffineGridSample`, `TNNetFlowWarp` and
-      `TNNetBackwardWarp`. ALL FOUR DONE (commit below). New custom kernel
-      `cai_bilinear_gather` in `neural/neural.cl` (one work-item per
-      (output-pixel, depth) channel — the embarrassingly-parallel depth-blend of
-      the four source corner columns) driven by the shared helper class
-      `TNNetBilinearGatherCL`. Each layer's `ComputeOpenCL` computes the four
-      corner pixel offsets + bilinear weights ON THE CPU (exact floor /
-      border-clamp / zero-pad logic, byte-identical to its scalar+AVX forward)
-      and hands them to the device for the blend; the zero-pad (out-of-bounds)
-      corners of `TNNetAffineGridSample` are encoded as corner offset -1 which the
-      kernel skips, matching the in-bounds-only CPU MulAdd exactly. Gated behind
-      the same `EnableOpenCL`/`FShouldOpenCL` plumbing as `TNNetDeformableConv`
-      (default off / falls back to the CPU forward, work-threshold
-      `NeuralConvOpenCLMinWork`). Per-layer parity tests added
-      (`Test{FlowWarp,BackwardWarp,AffineGridSample,BilinearUpsample}OpenCLParity`
-      in TestNeuralNumerical) all pass vs the CPU forward at < 1e-5 on the PoCL
-      FP32 device; full suite 2391/2391 green under both the default and
-      `-dOpenCL` builds. AVX inner loop was DONE in a prior commit (the depth-axis
-      tap blend uses the contiguous `Mul`/`MulAdd` idiom in every sampler).
 - [ ] FP16 (half-precision) OpenCL compute path for the dot-product/matmul
       offload. ENV NOTE (2026-06-27): the only OpenCL device available here is
       PoCL on the host CPU, which does NOT advertise `cl_khr_fp16` (clinfo shows
@@ -1156,16 +1096,6 @@ rather than acted on.
         names + the actual conv-stack depths/strides) instead of the pico fixture's
         re-keyed names, verified against a real `pyannote.audio` float64 oracle once the
         package is available.
-  - [X] Swap the `TNNetMinLSTM` trunk (gates depend on x_t only) for a VANILLA LSTM with a
-        true cell state + recurrent gate feed (pyannote uses `nn.LSTM`), so real weights
-        load without re-training, using the landed `TNNetLSTMCell` and the landed
-        `AddBidirectionalLSTM`/`AddBidirectionalGRU` stacking builders.
-        Done 2026-06-27: trunk now two `TNNetLSTMCell` directions (exact layout
-        `AddBidirectionalLSTM(ConvChannels,1,True)` builds, no projection since
-        Depth==Hidden); `LoadPyannoteLSTM` maps fused `weight_ih`/`weight_hh`/
-        `bias_ih`/`bias_hh` (torch gate order i,f,g,o) onto Neurons[0..3]/[4..7]/
-        folded-sum [8..11]; oracle in `make_pico_pyannote_fixture.py` rewritten to a
-        true LSTM and fixtures regenerated. `TestPyannoteParity` max|diff|=1.9e-7.
   - [ ] Sliding-window inference + overlap stitching for clips longer than the model's
         receptive field, and turning the per-frame activity matrix into final diarized
         speaker turns (clustering across windows).
