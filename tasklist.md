@@ -99,7 +99,11 @@ rather than acted on.
 
 ## Infrastructure / dev experience
 
-- [ ] AVX-vectorize TNNetGroupNorm + TNNetInstanceNorm per-group statistics.
+- [X] AVX-vectorize TNNetGroupNorm + TNNetInstanceNorm per-group statistics.
+      DONE (commit 3f0917b): per-group mean/var/normalize + backward bulk now run
+      via DotProduct/MulAdd/Mul over contiguous depth slices (FOnes scratch);
+      TNNetInstanceNorm inherits the rewrite. Green on scalar + -dAVX2 (lone AVX2
+      failure is the pre-existing TestSetTrainableKeepsOutputs flake).
       Unlike the already-AVX'd whole-volume TNNetLayerNorm / TNNetRMSNorm, these
       two still reduce mean/variance with scalar CntX/CntY/CntD triple loops
       (neuralnetwork.pas ~54897). Within one group the depth sub-range
