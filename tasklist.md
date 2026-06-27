@@ -1599,28 +1599,17 @@ rather than acted on.
       examples/SmolVLM2Describe demo (one image, then a short clip). Real value:
       the landed caption VLMs (LLaVA/Blip2/Florence-2/PaliGemma) are image-only;
       this is the efficient pixel-shuffle-connector + native short-VIDEO path.
-- [X] RegNet image-classification backbone importer (`BuildRegNetFromSafeTensors[Ex]`,
-      transformers model_type `regnet`, e.g. facebook/regnet-y-040 / regnet-x-040).
-      LANDED: `TRegNetConfig` + `ReadRegNetConfigFromJSONFile`/`RegNetConfigToString`
-      + `BuildRegNet`/`BuildRegNetFromSafeTensors[Ex]` in neuralpretrained.pas, plus
-      `regnet` wired into `BuildFromPretrained`. HF key scheme:
-      `regnet.embedder.embedder.{convolution,normalization}` stem;
-      `regnet.encoder.stages.{s}.layers.{l}.layer.{0}` 1x1, `.layer.1` grouped 3x3,
-      regnet_y `.layer.2.attention.{0,2}` SE (reduce/expand convs WITH bias,
-      reduced = round(in/4)), last conv `.layer.{2|3}`, `.shortcut.{convolution,
-      normalization}`; `classifier.1.{weight,bias}`. Every conv+BN folded at load
-      (LoadResNetConvFoldBN); grouped 3x3 built inline (per-group SplitChannels +
-      conv + DeepConcat, ChannelInterleaving=false) with a per-group BN-fold slice
-      loader (`LoadRegNetGroupedConvFoldBN`); SE reuses the EfficientNet pool ->
-      reduce -> ReLU -> expand -> sigmoid -> ChannelMulByLayer gate. NO new leaf
-      layers. Pico fixtures tests/fixtures/tiny_regnet_{x,y}.* built by
-      tools/make_pico_regnet_fixture.py from a REAL float64 HF
-      RegNetForImageClassification (pixels regenerated in-test to keep fixtures
-      tiny). `TestRegNet{Config,XImageClassification,YImageClassification}Parity`
-      green, max|diff| < 1e-4 for both x (no SE) and y (SE). Open follow-ups:
-      real-checkpoint top-1 sweep (facebook/regnet-y-040 / regnet-x-040 needs the
-      HF image-processor preprocessing path); timm naming variant; downsample-in-
-      first-stage=true real configs (code handles it, untested on a real ckpt).
+- [ ] RegNet importer follow-ups (`BuildRegNetFromSafeTensors[Ex]` LANDED,
+      transformers model_type `regnet`, e.g. facebook/regnet-y-040 / regnet-x-040;
+      conv+BN fold at load, grouped 3x3 via per-group SplitChannels/DeepConcat,
+      regnet_y SE gate, NO new leaf layers; pico parity
+      `TestRegNet{Config,XImageClassification,YImageClassification}Parity` < 1e-4
+      vs a REAL float64 HF RegNetForImageClassification):
+  - [ ] real-checkpoint top-1 sweep (facebook/regnet-y-040 / regnet-x-040 needs
+        the HF image-processor preprocessing path).
+  - [ ] timm naming variant.
+  - [ ] downsample-in-first-stage=true real configs (code handles it, untested
+        on a real ckpt).
 - [ ] Qwen-Image text-to-image MMDiT importer (`BuildQwenImageFromSafeTensors[Ex]`,
       Qwen/Qwen-Image, model_type `qwen_image`). The 2025 flagship open text-to-image
       model: a Qwen2.5-VL text encoder (LANDED — `BuildQwen2VL`-family) feeds an
@@ -1652,24 +1641,6 @@ rather than acted on.
       feature extractor for the landed ImageNet eval harness.
 
 ## Layer follow-ups that fix real limitations
-
-- [X] Investigated rewriting the codec reflect/replicate padding in
-      `neural/neuralpretrained.pas` onto the `TNNetPadXY`/`TNNetPad` padding-mode
-      layer. NOT DONE (no code change) — no real dedup exists and the layer does
-      not fit. Findings: (1) the bespoke pad appears in only TWO places, in two
-      SEPARATE routines — `pmReflect` both-side mirror once in `RunEnCodecConv`
-      (single precision, plain channel-major arrays) and `pmReplicate` edge-clamp
-      once in `RunMimiConv` (DOUBLE precision, `TMimiDblArr`). Reflect != replicate
-      and single != double, so there is nothing duplicated to extract into a shared
-      helper. (2) DAC (`RunDACConv`) and HiFi-GAN (`RunHiFiGANConv`) use only
-      zero/implicit-zero padding — they have NO reflect/replicate branch, so the
-      task's "all four holders share this" premise is inaccurate. (3) These holders
-      do conv1d directly on plain channel-major arrays, while `TNNetPad` operates on
-      `TNNetVolume`; wrapping the layer would force per-conv Volume marshalling
-      (alloc churn) with zero dedup benefit. Each pad site is also a few lines
-      tightly interleaved with the conv's `PadLeft`/`Extra` setup and the im2col
-      gather that reads the padded buffer in place. Conclusion: leave as-is; a
-      refactor would add risk and overhead with no duplication removed.
 
 - [~] Bidirectional + multi-layer stacking for `TNNetLSTMCell` / `TNNetGRUCell`
       (and a real `nn.LSTM`/`nn.GRU` num_layers>1 / bidirectional=True checkpoint
