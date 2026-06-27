@@ -57716,8 +57716,9 @@ var
   LpBnd69: integer;
   LpBnd70: integer;
   StartTime: double;
-  x, y, c, BaseIdx, PixelIdx, Depth, DepthM1: integer;
+  x, y, PixelIdx, Depth: integer;
   SumSqr, InvRMS: TNeuralFloat;
+  OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   inherited Compute;
@@ -57729,22 +57730,23 @@ begin
     FForwardTime := FForwardTime + (Now() - StartTime);
     Exit;
   end;
+  // The depth/channel axis is the fastest-varying (contiguous) axis in
+  // TNNetVolume, so the per-pixel column FData[base..base+Depth-1] is a
+  // contiguous run. This lets us drop the scalar inner loops onto the
+  // depth-contiguous TNNetVolume primitives (mirrors TNNetL2Normalize):
+  //   sum-of-squares via DotProduct(ptr, ptr, Depth), rescale via Mul.
   PixelIdx := 0;
-  DepthM1 := Depth - 1;
   LpBnd69 := FOutput.SizeY - 1;
   for y := 0 to LpBnd69 do
   begin
     LpBnd70 := FOutput.SizeX - 1;
     for x := 0 to LpBnd70 do
     begin
-      BaseIdx := FOutput.GetRawPos(x, y, 0);
-      SumSqr := 0;
-      for c := 0 to DepthM1 do
-        SumSqr := SumSqr + FOutput.FData[BaseIdx + c] * FOutput.FData[BaseIdx + c];
+      OutPtr := FOutput.GetRawPtr(x, y, 0);
+      SumSqr := TNNetVolume.DotProduct(OutPtr, OutPtr, Depth);
       InvRMS := pcr_rsqrtf(SumSqr / Depth + FPixelNormEpsilon);
       FInvRMS[PixelIdx] := InvRMS;
-      for c := 0 to DepthM1 do
-        FOutput.FData[BaseIdx + c] := FOutput.FData[BaseIdx + c] * InvRMS;
+      TNNetVolume.Mul(OutPtr, InvRMS, Depth);
       Inc(PixelIdx);
     end;
   end;
@@ -57758,8 +57760,9 @@ var
   LpBnd71: integer;
   LpBnd72: integer;
   StartTime: double;
-  x, y, c, BaseIdx, PixelIdx, Depth, DepthM1: integer;
+  x, y, PixelIdx, Depth: integer;
   SumDyY, InvRMS, DepthF: TNeuralFloat;
+  YPtr, GyPtr, PrevErrPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -57772,27 +57775,26 @@ begin
   begin
     // For unit-RMS normalization over depth at fixed (x,y):
     //   dL/dx_i = invRMS * ( dL/dy_i - (1/Depth) * y_i * sum_j( y_j * dL/dy_j ) )
+    // The depth axis is contiguous, so each per-pixel column is a contiguous
+    // run we can feed to the depth-contiguous TNNetVolume primitives
+    // (DotProduct for the SumDyY projection; two MulAdd for the update),
+    // mirroring TNNetL2Normalize.BackpropagatePerDepth.
     DepthF := Depth;
     PixelIdx := 0;
-    DepthM1 := Depth - 1;
     LpBnd71 := FOutput.SizeY - 1;
     for y := 0 to LpBnd71 do
     begin
       LpBnd72 := FOutput.SizeX - 1;
       for x := 0 to LpBnd72 do
       begin
-        BaseIdx := FOutput.GetRawPos(x, y, 0);
+        YPtr := FNormalized.GetRawPtr(x, y, 0);
+        GyPtr := FOutputError.GetRawPtr(x, y, 0);
+        PrevErrPtr := FPrevLayer.FOutputError.GetRawPtr(x, y, 0);
         InvRMS := FInvRMS[PixelIdx];
-        SumDyY := 0;
-        for c := 0 to DepthM1 do
-          SumDyY := SumDyY +
-            FOutputError.FData[BaseIdx + c] * FNormalized.FData[BaseIdx + c];
-        SumDyY := SumDyY / DepthF;
-        for c := 0 to DepthM1 do
-          FPrevLayer.FOutputError.FData[BaseIdx + c] :=
-            FPrevLayer.FOutputError.FData[BaseIdx + c] +
-            InvRMS * ( FOutputError.FData[BaseIdx + c] -
-              FNormalized.FData[BaseIdx + c] * SumDyY );
+        SumDyY := TNNetVolume.DotProduct(GyPtr, YPtr, Depth) / DepthF;
+        // prevErr += InvRMS*gy - (InvRMS*SumDyY)*y
+        TNNetVolume.MulAdd(PrevErrPtr, GyPtr, InvRMS, Depth);
+        TNNetVolume.MulAdd(PrevErrPtr, YPtr, -(InvRMS * SumDyY), Depth);
         Inc(PixelIdx);
       end;
     end;
