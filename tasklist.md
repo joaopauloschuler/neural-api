@@ -224,6 +224,59 @@ rather than acted on.
 
 ### Computer vision & generative models
 
+- [ ] SDXL conditioning support for the landed SD UNet importer
+      (`BuildSDUNetFromSafeTensors`). The current importer scopes to SD-1.x/2.x
+      UNets; the SDXL UNet additionally feeds a pooled CLIP text-embedding plus a
+      Fourier-encoded `time_ids` vector (original size / crop coords / target
+      size) through an `add_embedding` MLP that is SUMMED into the timestep
+      embedding, uses the dual text-encoder cross-attention width (2048), and the
+      SDXL block layout (no self/cross-attn at the highest resolution, 2/10
+      transformer-depth at the lower ones). Add the addition-embedding path + the
+      wider cross-attn + the SDXL down/up block schedule behind a config flag so
+      a `stabilityai/stable-diffusion-xl-base-1.0` UNet loads on the same code
+      path; scope a pico parity fixture like the SD-1.x one. (Noted as a
+      deferred follow-up next to the landed IP-Adapter wiring.)
+- [ ] Hunyuan-DiT bilingual text-to-image importer
+      (`BuildHunyuanDiTFromSafeTensors[Ex]`, Tencent `Hunyuan-DiT`). A distinct
+      DiT from the landed PixArt/MMDiT/Sana stacks: a cross-attention DiT
+      conditioned on BOTH a bilingual CLIP and an mT5 text encoder (two separate
+      cross-attn streams concatenated), 2-D rotary position embedding on the
+      image tokens, and a "skip-connection" (U-Net-style long skips between the
+      first and second half of the transformer blocks, fused by a Linear). The
+      reusable new pieces are the dual-encoder cross-attention wiring and the
+      DiT-level long-skip Linear merge; reuse the landed VAE decoder + scheduler
+      and scope a small parity fixture.
+- [ ] LTX-Video text-to-video DiT importer (`BuildLTXVideoFromSafeTensors[Ex]`,
+      Lightricks `LTX-Video`). Distinct from the landed CogVideoX / Wan / SVD
+      video importers: a single-stream MMDiT-style video DiT operating on tokens
+      from a high-compression causal video VAE (patchified space-time latents with
+      3-D rotary position embedding), conditioned on a T5 text encoder (landed),
+      with rectified-flow sampling. High-value because it reuses the landed
+      T5 tower + rectified-flow path and only the causal video-VAE patch
+      tokenizer + 3-D RoPE wiring are new; scope a pico latent-space parity
+      fixture (the full VAE decode can be a follow-up like the other video
+      importers).
+- [ ] Pixtral vision-language importer (`BuildPixtralFromSafeTensors[Ex]`,
+      mistralai `Pixtral-12B`, model_type "pixtral"). Distinct from the landed
+      LLaVA / Qwen2-VL / PaliGemma VLMs: a native-resolution ViT vision encoder
+      with 2-D RoPE and a block-diagonal attention mask over a variable number of
+      image patches, a GELU MLP connector, and a Mistral decoder (importer already
+      landed) where each image is spliced in as a flat run of patch tokens framed
+      by `[IMG]` / `[IMG_BREAK]` / `[IMG_END]` markers. The reusable new piece is
+      the 2-D-RoPE variable-resolution vision tower + the patch-token splicing
+      position builder; verify the tower against a transformers reference and the
+      decoder against the landed Mistral parity fixture.
+- [ ] RepVGG classification-backbone importer with load-time structural
+      re-parameterization (`BuildRepVGGFromSafeTensors[Ex]`, the timm / official
+      `RepVGG-A0..B3` family). The training graph is a multi-branch block
+      (3x3 conv-BN + 1x1 conv-BN + an identity BN), but inference FUSES all three
+      branches into a SINGLE plain 3x3 `TNNetConvolution` per block. Implement the
+      fusion at LOAD time — fold each branch's BN into its conv kernel/bias, zero-pad
+      the 1x1 kernel to 3x3, add the identity branch as a centered 3x3 — so the
+      imported net is a pure VGG-style stack of `TNNetConvolutionReLU` with no
+      runtime branch overhead. The reusable new piece is the BN-fold + branch-add
+      reparameterization helper (also applicable to MobileOne / other rep-style
+      nets); verify the fused forward against the unfused torch reference < 1e-4.
 - [ ] Sana text-to-image importer (`BuildSanaFromSafeTensors[Ex]`, NVIDIA /
       Efficient-Large-Model `Sana_*`). A genuinely different image-generation
       stack from the landed PixArt/MMDiT path: a LINEAR-attention DiT denoiser
@@ -1483,6 +1536,39 @@ rather than acted on.
       gate matmul is the same shape as the LSTM/GRU task above). Mirror the matrix
       gradients in the backward with `MulAdd`; gate behind the existing cell
       numerical-gradient tests (scalar build must stay bit-identical).
+- [ ] AVX-vectorize `TNNetDeformableConv` / DCNv2 forward. `ComputeCPU` is a pure
+      scalar loop: the main-conv accumulation `acc := acc + mW.FData[(tap*FInDepth+ci)*FOutDepth+co] * sampled`
+      runs one MUL/ADD per input channel. The accumulation over `ci` is a dot
+      product of a weight row against the bilinearly-sampled input column, so it
+      maps onto the same AVX `DotProduct`/`MulAdd` volume primitives the dense
+      convolutions already use (the offsets/sampling positions are precomputed,
+      so the inner depth loop is contiguous). Keep the bilinear gather scalar,
+      vectorize only the channel reduction; gate on the existing DeformableConv
+      numerical-gradient tests staying bit-identical on the scalar build.
+- [ ] AVX-vectorize `TNNetGroupConvP4` / `TNNetGroupPoolP4` forward. `ComputeCPU`
+      accumulates `acc := acc + W.FData[FRotMap[rBase+dstTap]] * PrevOut.Get(prevX,prevY,ci)`
+      one scalar MUL/ADD at a time over the input-channel axis. Pre-gather the
+      rotation-permuted weights for a given (tap, rotation) into a contiguous
+      scratch row once, then reduce over `ci` with the AVX `DotProduct` primitive
+      — the rotation-equivariant lifting conv currently gets none of the AVX win
+      the plain conv path enjoys. Gate on the EquivarianceReport / group-conv
+      tests staying numerically identical on the scalar build.
+- [ ] AVX-vectorize `TNNetKANConv` forward. The Chebyshev/B-spline edge-function
+      evaluation in `ComputeCPU` reduces to `acc := acc + W.FData[base+kk] * FBVal[kk]`
+      over the per-edge basis-coefficient axis — a dot product of a contiguous
+      weight row against the precomputed basis vector `FBVal`/`FT`. Vectorize that
+      inner reduction with `DotProduct`; the basis evaluation itself stays scalar.
+      Gate on the KANConv B-spline + Chebyshev numerical-gradient tests staying
+      bit-identical on the scalar build.
+- [ ] OpenCL forward offload for `TNNetDepthwiseConv` / `TNNetDepthwiseConv1D`.
+      The depthwise (per-channel) convolutions used by the MobileNetV3 / MobileViT
+      importers (2-D) and the Mamba/EnCodec/audio codec stacks (1-D causal
+      `TNNetDepthwiseConv1D.Compute`) currently run their `sum := sum + W.FData[kk]*Prev[...]`
+      kernel loop entirely on the CPU — `TNNetConvolution` already offloads but
+      these siblings do not. Add an `EnableConvOpenCL`-gated `ComputeOpenCL` that
+      maps the per-channel kernel sweep onto the existing dot-product kernel
+      (one channel per work-item / a strided GEMV), keep the host round-trip as the
+      fallback, and pin an exact-vs-CPU parity test in the SDPAOpenCLParity style.
 - [ ] OpenCL forward offload for `TNNetCausalLinearAttention` (the non-causal global
       `TNNetLinearAttention` is now DONE — `ComputeOpenCL` two-GEMM offload behind
       `FShouldOpenCL` + `LinearAttentionOpenCLParity` exact-vs-CPU test, PoCL-verified
