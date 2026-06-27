@@ -9461,13 +9461,24 @@ function SDUNetConfigToString(const Config: TSDUNetConfig): string;
 // zero-filled, so a plain SDUNetDenoise on a control-enabled net is bit-
 // identical to the base UNet. SDUNetDenoiseWithControl fills them. The skip-add
 // TNNetSum layers carry no weights, so weight loading is unaffected.
+//
+// pWithAdapter (T2I-Adapter, the lighter ControlNet successor) splices a
+// TNNetSum onto the MAIN hidden-state path at the END of each down block (after
+// the last resnet/attn, BEFORE the downsampler) so a T2I-Adapter's per-stage
+// feature maps can be ADDED into `sample` exactly as diffusers'
+// StableDiffusionAdapterPipeline (down_intrablock_additional_residuals) does --
+// distinct from pWithControl, which adds into the decoder SKIPS. There is one
+// adapter input per down block (NumBlockOut total); they sit AFTER the
+// latent/timestep/text/control inputs and start zero-filled, so a plain
+// SDUNetDenoise on an adapter-enabled net is bit-identical to the base UNet.
+// SDUNetDenoiseWithAdapter fills them.
 function BuildSDUNet(Reader: TNNetSafeTensorsReader;
   const Config: TSDUNetConfig; pTrainable: boolean = true;
-  pWithControl: boolean = false): TNNet;
+  pWithControl: boolean = false; pWithAdapter: boolean = false): TNNet;
 
 function BuildSDUNetFromSafeTensorsEx(const FileName: string;
   const Config: TSDUNetConfig; pTrainable: boolean = true;
-  pWithControl: boolean = false): TNNet;
+  pWithControl: boolean = false; pWithAdapter: boolean = false): TNNet;
 
 function BuildSDUNetFromSafeTensors(const FileName: string;
   out Config: TSDUNetConfig; pTrainable: boolean = true;
@@ -9504,6 +9515,20 @@ procedure SDUNetDenoiseWithControl(Net: TNNet; const Config: TSDUNetConfig;
 // this config has (conv_in + layers_per_block per down block + one per interior
 // downsampler) -- the required Length(DownResiduals) for SDUNetDenoiseWithControl.
 function SDUNetControlDownCount(const Config: TSDUNetConfig): integer;
+
+// End-to-end base-UNet-plus-T2I-Adapter single-step denoise. Net MUST be a UNet
+// built with BuildSDUNet(..., pWithAdapter=true). AdapterFeatures (one volume
+// per down block, the (Ch,Grid,Grid) per-stage feature maps from a T2I-Adapter,
+// typically obtained via T2IAdapterFeatures) are ADDED into the main hidden
+// state at the end of each down block, mirroring diffusers'
+// StableDiffusionAdapterPipeline (down_intrablock_additional_residuals).
+procedure SDUNetDenoiseWithAdapter(Net: TNNet; const Config: TSDUNetConfig;
+  Latent, EncStates: TNNetVolume; t: TNeuralFloat;
+  AdapterFeatures: array of TNNetVolume; Noise: TNNetVolume);
+
+// Number of adapter feature maps an adapter-enabled SD UNet of this config
+// expects (one per down block) -- the required Length(AdapterFeatures).
+function SDUNetAdapterFeatureCount(const Config: TSDUNetConfig): integer;
 
 // ---------------------------------------------------------------------------
 // CONTROLNET SPATIAL-CONDITIONING IMPORT (diffusers ControlNetModel, e.g.
@@ -9569,6 +9594,70 @@ function ControlNetCondInput(Net: TNNet): TNNetLayer;
 procedure ControlNetResiduals(Net: TNNet; const Config: TControlNetConfig;
   Latent, EncStates, Cond: TNNetVolume; t: TNeuralFloat;
   DownResiduals: array of TNNetVolume; MidResidual: TNNetVolume);
+
+// ---------------------------------------------------------------------------
+// T2I-ADAPTER FEATURE-INJECTION IMPORT (diffusers T2IAdapter "full_adapter",
+// e.g. TencentARC/t2iadapter_canny_sd15v2 / t2iadapter_sketch_sd14v1). The
+// lighter sibling of ControlNet: a small conv encoder over a spatial hint
+// (canny/sketch/depth) producing a PYRAMID of per-resolution feature maps that
+// are ADDED into the SD UNet's down-block hidden state -- no transformer, no
+// per-block zero-conv, just a lightweight ResNet-ish ladder.
+//
+// diffusers FullAdapter forward: PixelUnshuffle(downscale_factor) reshapes the
+// (CondCh,CondGrid,CondGrid) hint into (CondCh*f*f, CondGrid/f, CondGrid/f) on
+// the latent grid (here a TNNetSpaceToDepth; the conv_in input channels are
+// PERMUTED at load from torch PixelUnshuffle ordering to space-to-depth order).
+// conv_in (3x3 pad1) -> channels[0]. Then len(channels) AdapterBlocks; block 0
+// keeps the grid, blocks 1.. AvgPool2d(2) first (the ladder downsamples). Each
+// block: optional 1x1 in_conv on a channel change, then num_res_blocks adapter
+// ResnetBlocks (block1 3x3 pad1 -> ReLU -> block2 1x1 -> + identity). The output
+// of each block is one feature map. The N features map 1:1 to the SD UNet's N
+// down blocks and are added into `sample` BEFORE that block's downsampler.
+//
+// TWO TNNetInputs: input0 = the (CondGrid,CondGrid,CondChannels) hint image;
+// (no timestep / no text -- the adapter is conditioning-only). The genuinely-new
+// code is only the wiring (TNNetSpaceToDepth + TNNetConvolutionLinear +
+// TNNetReLU + TNNetAvgPool, all existing layers); no new layer class. v1 scope:
+// inference-only, parity on the feature-pyramid tensors; the end-to-end
+// base-UNet-plus-adapter decode loop is wired via BuildSDUNet(pWithAdapter=true)
+// + SDUNetDenoiseWithAdapter.
+type
+  TT2IAdapterConfig = record
+    CondChannels: integer;                    // hint image channels (RGB=3)
+    NumChannels: integer;                     // length of Channels (down stages)
+    Channels: array[0..7] of integer;         // per-stage feature dims
+    NumResBlocks: integer;                    // adapter ResnetBlocks per stage
+    DownscaleFactor: integer;                 // PixelUnshuffle factor
+    CondGrid: integer;                        // hint image H=W (= latent*factor)
+    LatentGrid: integer;                      // conv_in output grid (= CondGrid/f)
+  end;
+
+function ReadT2IAdapterConfigFromJSONFile(const FileName: string): TT2IAdapterConfig;
+
+function T2IAdapterConfigToString(const Config: TT2IAdapterConfig): string;
+
+// Builds the T2IAdapter (full_adapter) described by Config and loads every
+// weight from Reader (caller owns Reader). ONE TNNetInput (the hint image). See
+// T2IAdapterFeatures for the driver.
+function BuildT2IAdapter(Reader: TNNetSafeTensorsReader;
+  const Config: TT2IAdapterConfig; pTrainable: boolean = true): TNNet;
+
+function BuildT2IAdapterFromSafeTensorsEx(const FileName: string;
+  const Config: TT2IAdapterConfig; pTrainable: boolean = true): TNNet;
+
+function BuildT2IAdapterFromSafeTensors(const FileName: string;
+  out Config: TT2IAdapterConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+
+// Returns the hint-image (input0) TNNetInput of an adapter built above.
+function T2IAdapterCondInput(Net: TNNet): TNNetLayer;
+
+// Fills the hint input, runs one forward, and copies the per-stage feature maps:
+// Features[0..NumChannels-1] each receive a (Ch,H,W) adapter feature volume.
+// The caller owns / pre-creates the volumes (resized here). Cond is a
+// (CondCh,CondGrid,CondGrid) hint volume.
+procedure T2IAdapterFeatures(Net: TNNet; const Config: TT2IAdapterConfig;
+  Cond: TNNetVolume; Features: array of TNNetVolume);
 
 // ---------------------------------------------------------------------------
 // IP-ADAPTER IMAGE-PROMPT IMPORT (h94/IP-Adapter ip-adapter_sd15, the plain
@@ -60160,11 +60249,29 @@ begin
   Result := NN.AddLayerAfter( [TNNetSum.Create([HLayer, Ctrl])], HLayer );
 end;
 
+// T2I-Adapter main-path splice: when pWithAdapter, appends a zero-filled adapter
+// feature TNNetInput and returns Sum(HLayer, AdapterInput) -- the new hidden
+// state that flows DOWNSTREAM (unlike SDUNetSpliceControlSkip which only feeds
+// the decoder skip). No-op (returns HLayer) when pWithAdapter is false.
+function SDUNetSpliceAdapterMain(NN: TNNet; HLayer: TNNetLayer;
+  Grid, Ch: integer; pWithAdapter: boolean;
+  var AdapterInputs: array of TNNetLayer; var AdapterTop: integer): TNNetLayer;
+var
+  Adp: TNNetLayer;
+begin
+  if not pWithAdapter then begin Result := HLayer; Exit; end;
+  Adp := NN.AddLayer( TNNetInput.Create(Grid, Grid, Ch) );
+  AdapterInputs[AdapterTop] := Adp; Inc(AdapterTop);
+  Result := NN.AddLayerAfter( [TNNetSum.Create([HLayer, Adp])], HLayer );
+end;
+
 function BuildSDUNet(Reader: TNNetSafeTensorsReader;
   const Config: TSDUNetConfig; pTrainable: boolean = true;
-  pWithControl: boolean = false): TNNet;
+  pWithControl: boolean = false; pWithAdapter: boolean = false): TNNet;
 var
   NN: TNNet;
+  AdapterInputs: array of TNNetLayer;
+  AdapterTop: integer;
   LatentInput, TInput, TextInput, ConvIn, TSin, TFc0, TSilu, TFc2: TNNetLayer;
   TimeCond, NormOut, ConvOut, HLayer: TNNetLayer;
   WVol: TNNetVolume;
@@ -60210,6 +60317,8 @@ begin
     SkipTop := 0;
     SetLength(CtrlInputs, 64);
     CtrlTop := 0;
+    SetLength(AdapterInputs, 64);
+    AdapterTop := 0;
     CurGrid := Config.LatentGrid;
 
     // ---------------- Architecture ----------------
@@ -60265,6 +60374,10 @@ begin
           pWithControl, CtrlInputs, CtrlTop);
         SkipCh[SkipTop] := OutCh; Inc(SkipTop);
       end;
+      // T2I-Adapter: add the per-stage feature into the MAIN path at the end of
+      // this down block, BEFORE the downsampler (diffusers intrablock residual).
+      HLayer := SDUNetSpliceAdapterMain(NN, HLayer, CurGrid, OutCh,
+        pWithAdapter, AdapterInputs, AdapterTop);
       InCh := OutCh;
       if i < nM1 then
       begin
@@ -60439,13 +60552,13 @@ end;
 
 function BuildSDUNetFromSafeTensorsEx(const FileName: string;
   const Config: TSDUNetConfig; pTrainable: boolean = true;
-  pWithControl: boolean = false): TNNet;
+  pWithControl: boolean = false; pWithAdapter: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildSDUNet(Reader, Config, pTrainable, pWithControl);
+    Result := BuildSDUNet(Reader, Config, pTrainable, pWithControl, pWithAdapter);
   finally
     Reader.Free;
   end;
@@ -60556,6 +60669,46 @@ begin
       IntToStr(MidResidual.Size) + ' <> mid control input size ' +
       IntToStr(CtrlLayer.Output.Size) + '.');
   CtrlLayer.Output.Copy(MidResidual);
+  Net.Compute(Latent);
+  Net.GetOutput(Noise);
+end;
+
+function SDUNetAdapterFeatureCount(const Config: TSDUNetConfig): integer;
+begin
+  Result := Config.NumBlockOut; // one adapter feature per down block.
+end;
+
+procedure SDUNetDenoiseWithAdapter(Net: TNNet; const Config: TSDUNetConfig;
+  Latent, EncStates: TNNetVolume; t: TNeuralFloat;
+  AdapterFeatures: array of TNNetVolume; Noise: TNNetVolume);
+var
+  TextIn, AdpLayer: TNNetLayer;
+  Cnt, i, InputIdx: integer;
+begin
+  Cnt := SDUNetAdapterFeatureCount(Config);
+  if Length(AdapterFeatures) < Cnt then
+    ImportError('SDUNetDenoiseWithAdapter: AdapterFeatures has ' +
+      IntToStr(Length(AdapterFeatures)) + ' slots, the adapter-enabled UNet ' +
+      'needs ' + IntToStr(Cnt) +
+      ' (build it with BuildSDUNet(..., pWithAdapter=true)?).');
+  SDUNetTimestepInput(Net).Output.FData[0] := t;
+  TextIn := SDUNetTextStatesInput(Net);
+  if EncStates.Size <> TextIn.Output.Size then
+    ImportError('SDUNetDenoiseWithAdapter: encoder_hidden_states size ' +
+      IntToStr(EncStates.Size) + ' <> the net text input size ' +
+      IntToStr(TextIn.Output.Size) + '.');
+  TextIn.Output.Copy(EncStates);
+  // Adapter inputs are TNNetInputs #3.. : one per down block, in build order.
+  for i := 0 to Cnt - 1 do
+  begin
+    InputIdx := 3 + i;
+    AdpLayer := SDUNetNthInput(Net, InputIdx);
+    if AdapterFeatures[i].Size <> AdpLayer.Output.Size then
+      ImportError('SDUNetDenoiseWithAdapter: adapter feature ' + IntToStr(i) +
+        ' size ' + IntToStr(AdapterFeatures[i].Size) + ' <> adapter input #' +
+        IntToStr(InputIdx) + ' size ' + IntToStr(AdpLayer.Output.Size) + '.');
+    AdpLayer.Output.Copy(AdapterFeatures[i]);
+  end;
   Net.Compute(Latent);
   Net.GetOutput(Noise);
 end;
@@ -61054,6 +61207,355 @@ begin
   for i := 0 to Config.NumDownResiduals - 1 do
     DownResiduals[i].Copy(Taps[i].Output);
   MidResidual.Copy(Taps[Config.NumDownResiduals].Output);
+end;
+
+// ===========================================================================
+// T2I-ADAPTER FEATURE-INJECTION IMPORT (diffusers T2IAdapter full_adapter)
+// ===========================================================================
+
+function ReadT2IAdapterConfigFromJSONFile(
+  const FileName: string): TT2IAdapterConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ArrData: TJSONData;
+  Arr: TJSONArray;
+  ClassName: string;
+  i: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('T2I-Adapter import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('T2I-Adapter import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('T2I-Adapter import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ClassName := Obj.Get('_class_name', Obj.Get('model_type', 'T2IAdapter'));
+    if (ClassName <> 'T2IAdapter') and (ClassName <> 'Adapter') then
+      ImportError('T2I-Adapter import: _class_name is "' + ClassName +
+        '" - only T2IAdapter (full_adapter) is supported here.');
+    Result.CondChannels := Obj.Get('in_channels', 3);
+    if Result.CondChannels < 1 then
+      ImportError('T2I-Adapter import: in_channels must be >= 1.');
+    ArrData := Obj.Find('channels');
+    if (ArrData = nil) or not (ArrData is TJSONArray) or
+       (TJSONArray(ArrData).Count < 1) then
+      ImportError('T2I-Adapter import: missing required array "channels".');
+    Arr := TJSONArray(ArrData);
+    if Arr.Count > 8 then
+      ImportError('T2I-Adapter import: channels must have 1..8 entries.');
+    Result.NumChannels := Arr.Count;
+    for i := 0 to Arr.Count - 1 do Result.Channels[i] := Arr.Integers[i];
+    Result.NumResBlocks := Obj.Get('num_res_blocks', 2);
+    if Result.NumResBlocks < 1 then
+      ImportError('T2I-Adapter import: num_res_blocks must be >= 1.');
+    Result.DownscaleFactor := Obj.Get('downscale_factor', 8);
+    if Result.DownscaleFactor < 1 then
+      ImportError('T2I-Adapter import: downscale_factor must be >= 1.');
+    // The hint grid must be supplied (pico "cond_size") or derived from the
+    // latent grid; conv_in maps cond_grid / downscale_factor -> latent grid.
+    if Obj.IndexOfName('cond_size') >= 0 then
+    begin
+      Result.CondGrid := Obj.Get('cond_size', 0);
+      if (Result.CondGrid mod Result.DownscaleFactor) <> 0 then
+        ImportError('T2I-Adapter import: cond_size ' + IntToStr(Result.CondGrid) +
+          ' not divisible by downscale_factor ' +
+          IntToStr(Result.DownscaleFactor) + '.');
+      Result.LatentGrid := Result.CondGrid div Result.DownscaleFactor;
+    end
+    else if Obj.IndexOfName('latent_size') >= 0 then
+    begin
+      Result.LatentGrid := Obj.Get('latent_size', 0);
+      Result.CondGrid := Result.LatentGrid * Result.DownscaleFactor;
+    end
+    else
+      ImportError('T2I-Adapter import: config needs "cond_size" or ' +
+        '"latent_size" (the hint / latent grid).');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function T2IAdapterConfigToString(const Config: TT2IAdapterConfig): string;
+var
+  i: integer;
+begin
+  Result := 'T2IAdapter(full_adapter): in_channels=' +
+    IntToStr(Config.CondChannels) + ', channels=[';
+  for i := 0 to Config.NumChannels - 1 do
+  begin
+    if i > 0 then Result := Result + ',';
+    Result := Result + IntToStr(Config.Channels[i]);
+  end;
+  Result := Result + '], num_res_blocks=' + IntToStr(Config.NumResBlocks) +
+    ', downscale_factor=' + IntToStr(Config.DownscaleFactor) +
+    ', cond_grid=' + IntToStr(Config.CondGrid) +
+    ', latent_grid=' + IntToStr(Config.LatentGrid);
+end;
+
+// Loads the adapter conv_in (3x3) whose torch input channels are in PixelUnshuffle
+// order (oc = ic*r*r + dy*r + dx, dy=row, dx=col offset) but whose CAI input is a
+// TNNetSpaceToDepth output (cai_depth = (dx*r + dy)*C + ic). Remaps the input
+// channel columns so the SpaceToDepth feed matches the torch unshuffle feed.
+procedure LoadT2IAdapterConvIn(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
+  const WName, BName: string; OutCh, CondCh, R, K: integer);
+var
+  W, B: TNNetVolume;
+  InCh, o, c, ky, kx, ic, dy, dx, torchOc, caiC: integer;
+begin
+  InCh := CondCh * R * R;
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('T2I-Adapter import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 4) or
+     (Reader.DimSize(WName, 0) <> OutCh) or
+     (Reader.DimSize(WName, 1) <> InCh) or
+     (Reader.DimSize(WName, 2) <> K) or
+     (Reader.DimSize(WName, 3) <> K) then
+    ImportError('T2I-Adapter import: "' + WName + '" must have shape [' +
+      IntToStr(OutCh) + ', ' + IntToStr(InCh) + ', ' + IntToStr(K) + ', ' +
+      IntToStr(K) + '], got ' + Reader.ShapeAsString(WName));
+  if (Layer.Neurons.Count <> OutCh) or
+     (Layer.FArrNeurons[0].Weights.Size <> K * K * InCh) then
+    ImportError('T2I-Adapter import: conv_in target shape mismatch.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    if not Reader.HasTensor(BName) then
+      ImportError('T2I-Adapter import: missing bias "' + BName + '".');
+    Reader.LoadTensorFlat(BName, B);
+    for o := 0 to OutCh - 1 do
+    begin
+      // Walk CAI input channels caiC = (dx*R + dy)*CondCh + ic and copy from the
+      // torch column torchOc = ic*R*R + dy*R + dx for each kernel position.
+      for ic := 0 to CondCh - 1 do
+        for dx := 0 to R - 1 do
+          for dy := 0 to R - 1 do
+          begin
+            caiC := (dx * R + dy) * CondCh + ic;
+            torchOc := (ic * R + dy) * R + dx;
+            for ky := 0 to K - 1 do
+              for kx := 0 to K - 1 do
+                Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + caiC] :=
+                  W.FData[((o * InCh + torchOc) * K + ky) * K + kx];
+          end;
+      Layer.FArrNeurons[o].BiasWeight := B.FData[o];
+    end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free; B.Free;
+  end;
+  c := 0; if c <> 0 then ; // silence unused
+end;
+
+// Adds one adapter ResnetBlock (block1 3x3 pad1 -> ReLU -> block2 1x1 -> +x) and
+// returns the block1 / block2 conv refs.
+procedure AddT2IAdapterResnet(NN: TNNet; HLayer: TNNetLayer; Ch: integer;
+  pTrainable: boolean; out Block1, Block2: TNNetLayer);
+var
+  H: TNNetLayer;
+begin
+  Block1 := NN.AddLayerAfter(
+    [TNNetConvolutionLinear.Create(Ch, 3, 1, 1, 0).SetTrainable(pTrainable)], HLayer);
+  NN.AddLayer( TNNetReLU.Create() );
+  Block2 := NN.AddLayer(
+    TNNetConvolutionLinear.Create(Ch, 1, 0, 1, 0).SetTrainable(pTrainable) );
+  H := NN.GetLastLayer();
+  NN.AddLayerAfter( [TNNetSum.Create([H, HLayer])], H );
+end;
+
+function BuildT2IAdapter(Reader: TNNetSafeTensorsReader;
+  const Config: TT2IAdapterConfig; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  CondInput, HLayer, ConvIn: TNNetLayer;
+  d0, n, i, j, InCh, OutCh: integer;
+  Prefix: string;
+  // refs (architecture order): conv_in; per block: in_conv(or nil) + per resnet
+  // block1/block2; feature output layers.
+  ConvInRef: TNNetLayer;
+  InConvRef: array of TNNetLayer;             // [block], nil if no channel change
+  Block1Ref, Block2Ref: array of array of TNNetLayer; // [block][resnet]
+  FeatureRef: array of TNNetLayer;
+begin
+  n := Config.NumChannels;
+  d0 := Config.Channels[0];
+  NN := TNNet.Create();
+  try
+    SetLength(InConvRef, n);
+    SetLength(Block1Ref, n);
+    SetLength(Block2Ref, n);
+    SetLength(FeatureRef, n);
+
+    // ---------------- Architecture ----------------
+    // input0: hint image (CondGrid,CondGrid,CondChannels).
+    CondInput := NN.AddLayer( TNNetInput.Create(Config.CondGrid,
+      Config.CondGrid, Config.CondChannels) );
+    // PixelUnshuffle(downscale_factor) -> (latent grid, CondCh*f*f channels).
+    NN.AddLayer( TNNetSpaceToDepth.Create(Config.DownscaleFactor) );
+    // conv_in: 3x3 pad1 -> channels[0].
+    ConvIn := NN.AddLayer(
+      TNNetConvolutionLinear.Create(d0, 3, 1, 1, 0).SetTrainable(pTrainable) );
+    ConvInRef := ConvIn;
+    HLayer := ConvIn;
+
+    if not pTrainable then NN.SetTrainable();
+
+    InCh := d0;
+    for i := 0 to n - 1 do
+    begin
+      OutCh := Config.Channels[i];
+      SetLength(Block1Ref[i], Config.NumResBlocks);
+      SetLength(Block2Ref[i], Config.NumResBlocks);
+      // blocks 1.. downsample first (AvgPool2d(2)); block 0 keeps the grid.
+      if i > 0 then
+      begin
+        NN.AddLayer( TNNetAvgPool.Create(2) );
+        HLayer := NN.GetLastLayer();
+      end;
+      // 1x1 in_conv on a channel change (always present for i>0 in full_adapter).
+      if InCh <> OutCh then
+      begin
+        InConvRef[i] := NN.AddLayer(
+          TNNetConvolutionLinear.Create(OutCh, 1, 0, 1, 0).SetTrainable(pTrainable) );
+        HLayer := NN.GetLastLayer();
+      end
+      else
+        InConvRef[i] := nil;
+      // num_res_blocks adapter ResnetBlocks.
+      for j := 0 to Config.NumResBlocks - 1 do
+      begin
+        AddT2IAdapterResnet(NN, HLayer, OutCh, pTrainable,
+          Block1Ref[i][j], Block2Ref[i][j]);
+        HLayer := NN.GetLastLayer();
+      end;
+      FeatureRef[i] := HLayer; // this block's output feature map.
+      InCh := OutCh;
+    end;
+
+    if not pTrainable then NN.SetTrainable();
+
+    // No sink layer: TNNet.Compute runs every layer; T2IAdapterFeatures reads
+    // the FeatureRef outputs directly.
+
+    // ---------------- Weights ----------------
+    LoadT2IAdapterConvIn(Reader, ConvInRef, 'adapter.conv_in.weight',
+      'adapter.conv_in.bias', d0, Config.CondChannels, Config.DownscaleFactor, 3);
+    InCh := d0;
+    for i := 0 to n - 1 do
+    begin
+      OutCh := Config.Channels[i];
+      if InConvRef[i] <> nil then
+        LoadVaeConv(Reader, InConvRef[i],
+          'adapter.body.' + IntToStr(i) + '.in_conv.weight',
+          'adapter.body.' + IntToStr(i) + '.in_conv.bias', OutCh, InCh, 1);
+      for j := 0 to Config.NumResBlocks - 1 do
+      begin
+        Prefix := 'adapter.body.' + IntToStr(i) + '.resnets.' + IntToStr(j) + '.';
+        LoadVaeConv(Reader, Block1Ref[i][j], Prefix + 'block1.weight',
+          Prefix + 'block1.bias', OutCh, OutCh, 3);
+        LoadVaeConv(Reader, Block2Ref[i][j], Prefix + 'block2.weight',
+          Prefix + 'block2.bias', OutCh, OutCh, 1);
+      end;
+      InCh := OutCh;
+    end;
+
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildT2IAdapterFromSafeTensorsEx(const FileName: string;
+  const Config: TT2IAdapterConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildT2IAdapter(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildT2IAdapterFromSafeTensors(const FileName: string;
+  out Config: TT2IAdapterConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadT2IAdapterConfigFromJSONFile(ConfigPath);
+  Result := BuildT2IAdapterFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+function T2IAdapterCondInput(Net: TNNet): TNNetLayer;
+begin
+  Result := SDUNetNthInput(Net, 0);
+end;
+
+procedure T2IAdapterFeatures(Net: TNNet; const Config: TT2IAdapterConfig;
+  Cond: TNNetVolume; Features: array of TNNetVolume);
+var
+  CondIn: TNNetLayer;
+  i, LayerIdx, Found: integer;
+  FeatLayers: array of TNNetLayer;
+begin
+  if Length(Features) < Config.NumChannels then
+    ImportError('T2IAdapterFeatures: Features has ' +
+      IntToStr(Length(Features)) + ' slots, need ' +
+      IntToStr(Config.NumChannels) + '.');
+  CondIn := T2IAdapterCondInput(Net);
+  if Cond.Size <> CondIn.Output.Size then
+    ImportError('T2IAdapterFeatures: hint image size ' + IntToStr(Cond.Size) +
+      ' <> net cond input size ' + IntToStr(CondIn.Output.Size) + '.');
+  CondIn.Output.Copy(Cond);
+  Net.Compute(Cond);
+  // The feature outputs are the LAST TNNetSum of each block. Each block ends with
+  // the residual-add of its final adapter ResnetBlock; collect the per-block
+  // feature layers by replaying the build channel sequence is complex, so instead
+  // identify them as the NumChannels TNNetSum layers immediately followed by a
+  // (pool/in_conv/feature-boundary) -- simplest: BuildT2IAdapter places the
+  // block feature as the residual-add right before the next block's pool. We
+  // recorded them implicitly: they are the residual Sum after each block's last
+  // resnet. Walk the net and pick the TNNetSum layers that are block boundaries.
+  // Robust approach: the i-th feature is the output that feeds either the next
+  // block's TNNetAvgPool or (for the last block) is the final layer.
+  SetLength(FeatLayers, Config.NumChannels);
+  Found := 0;
+  for LayerIdx := 0 to Net.CountLayers() - 1 do
+  begin
+    if (Net.Layers[LayerIdx] is TNNetAvgPool) and (LayerIdx > 0) then
+    begin
+      // the layer feeding this pool is the previous block's feature.
+      FeatLayers[Found] := Net.Layers[LayerIdx - 1];
+      Inc(Found);
+    end;
+  end;
+  // the last block's feature is the final layer of the net.
+  FeatLayers[Found] := Net.Layers[Net.CountLayers() - 1];
+  Inc(Found);
+  if Found <> Config.NumChannels then
+    ImportError('T2IAdapterFeatures: located ' + IntToStr(Found) +
+      ' feature layers, expected ' + IntToStr(Config.NumChannels) + '.');
+  for i := 0 to Config.NumChannels - 1 do
+    Features[i].Copy(FeatLayers[i].Output);
 end;
 
 // ===========================================================================

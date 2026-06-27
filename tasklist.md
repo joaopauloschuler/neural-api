@@ -412,8 +412,19 @@ rather than acted on.
       fixtures) + examples/ControlNetCanny smoke. (b) real-checkpoint slicer (slice sd-controlnet-canny like
       slice_llama.py) for parity vs real weights on top of the synthetic fixture;
       (c) the diffusers per-residual conditioning_scale multiplier (constant 1.0
-      here); (d) T2I-Adapter (lighter feature-injection sibling) as its natural
-      successor.
+      here); (d) T2I-Adapter (lighter feature-injection sibling) LANDED —
+      BuildT2IAdapterFromSafeTensors[Ex] imports the diffusers T2IAdapter
+      full_adapter (PixelUnshuffle hint stem via TNNetSpaceToDepth with a conv_in
+      input-channel permutation, an AvgPool ResNet-ish ladder of block1 3x3 ->
+      ReLU -> block2 1x1 -> +identity ResnetBlocks, 1x1 in_conv channel changes);
+      the T2IAdapterFeatures driver produces the per-stage feature pyramid and
+      BuildSDUNet(..., pWithAdapter=true) + SDUNetDenoiseWithAdapter ADD those
+      features into the SD UNet down-block hidden state (diffusers
+      down_intrablock_additional_residuals); reuses existing layers (no new
+      class). Feature parity < 1e-4 in TestT2IAdapterParity vs a numpy float64
+      oracle (tools/t2i_adapter_tiny_fixture.py, diffusers not installed).
+      Follow-ups: real-checkpoint slicer (TencentARC/t2iadapter_*_sd15v2),
+      light_adapter variant, multi-adapter blending.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
       for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
       parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful

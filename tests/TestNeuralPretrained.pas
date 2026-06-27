@@ -527,6 +527,7 @@ type
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
+    procedure TestT2IAdapterParity;
     procedure TestIPAdapterConfigFromJSONFile;
     procedure TestIPAdapterParity;
     procedure TestVaeRoundTrip;
@@ -21487,6 +21488,99 @@ begin
     RefJson.Free;
     CNet.Free;
     UNet.Free;
+  end;
+end;
+
+// T2I-Adapter feature-injection parity test (diffusers T2IAdapter full_adapter,
+// the lighter ControlNet successor). tests/fixtures/tiny_t2i_adapter.* is a pico
+// randomly-initialized adapter (PixelUnshuffle hint stem + a 2-stage ResNet-ish
+// ladder). tools/t2i_adapter_tiny_fixture.py builds a self-contained numpy
+// float64 oracle (diffusers is not installed) of the exact adapter forward and
+// pins the per-stage feature pyramid for a fixed hint image. This exercises the
+// TNNetSpaceToDepth PixelUnshuffle (with the conv_in input-channel permutation),
+// conv_in, the AvgPool downsampling ladder, the 1x1 in_conv channel changes and
+// the adapter ResnetBlocks (block1 3x3 -> ReLU -> block2 1x1 -> + identity), end
+// to end < 1e-4 vs the oracle on the feature maps that get added into the SD
+// UNet down-block hidden state.
+procedure TTestNeuralPretrained.TestT2IAdapterParity;
+var
+  NN: TNNet;
+  Config: TT2IAdapterConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CondArr, RowArr, ChanArr, FeatArr, FeatEntry: TJSONArray;
+  Cond: TNNetVolume;
+  Features: array of TNNetVolume;
+  CondGrid, ChanCnt, YCnt, XCnt, fi, Ch, Hh, Ww: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildT2IAdapterFromSafeTensors(
+    FixturePath('tiny_t2i_adapter.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_t2i_adapter_config.json'));
+  RefJson := TStringList.Create;
+  Cond := TNNetVolume.Create;
+  RefRoot := nil;
+  SetLength(Features, Config.NumChannels);
+  for fi := 0 to Config.NumChannels - 1 do
+    Features[fi] := TNNetVolume.Create;
+  try
+    AssertTrue('net built', NN <> nil);
+    CondGrid := Config.CondGrid;
+    RefJson.LoadFromFile(FixturePath('tiny_t2i_adapter_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CondArr := TJSONArray(TJSONObject(RefRoot).Find('cond'));
+    FeatArr := TJSONArray(TJSONObject(RefRoot).Find('features'));
+    AssertTrue('cond present', CondArr <> nil);
+    AssertEquals('feature count', Config.NumChannels, FeatArr.Count);
+
+    // hint (C,H,W) -> CAI (x,y,depth) volume.
+    Cond.ReSize(CondGrid, CondGrid, Config.CondChannels);
+    for ChanCnt := 0 to Config.CondChannels - 1 do
+    begin
+      RowArr := TJSONArray(CondArr.Items[ChanCnt]);
+      for YCnt := 0 to CondGrid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to CondGrid - 1 do
+          Cond.FData[(YCnt * CondGrid + XCnt) * Config.CondChannels + ChanCnt]
+            := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+
+    T2IAdapterFeatures(NN, Config, Cond, Features);
+
+    MaxDiff := 0;
+    for fi := 0 to Config.NumChannels - 1 do
+    begin
+      FeatEntry := TJSONArray(FeatArr.Items[fi]);
+      Ch := FeatEntry.Count;
+      for ChanCnt := 0 to Ch - 1 do
+      begin
+        RowArr := TJSONArray(FeatEntry.Items[ChanCnt]);
+        Hh := RowArr.Count;
+        for YCnt := 0 to Hh - 1 do
+        begin
+          ChanArr := TJSONArray(RowArr.Items[YCnt]);
+          Ww := ChanArr.Count;
+          for XCnt := 0 to Ww - 1 do
+          begin
+            RefVal := ChanArr.Items[XCnt].AsFloat;
+            GotVal := Features[fi].FData[(YCnt * Ww + XCnt) * Ch + ChanCnt];
+            Diff := Abs(GotVal - RefVal);
+            if Diff > MaxDiff then MaxDiff := Diff;
+          end;
+        end;
+      end;
+    end;
+    AssertTrue('T2I-Adapter feature parity < 1e-4 (max|diff|=' +
+      FloatToStr(MaxDiff) + ')', MaxDiff < 1e-4);
+  finally
+    for fi := 0 to Config.NumChannels - 1 do Features[fi].Free;
+    NN.Free;
+    Cond.Free;
+    RefJson.Free;
+    if RefRoot <> nil then RefRoot.Free;
   end;
 end;
 
