@@ -1764,7 +1764,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
   - [ ] TNNetTestTimeTraining / TNNetTitansMemory backward "undo" loops (interleaved
         scalar etaGrad/dEta/dTheta accumulation) — the per-token forward rank-1 writes
         are vectorized; this is the lower-value remainder.
-- [ ] AVX-vectorize the strided STATE-READOUT forward loops in the
+- [X] AVX-vectorize the strided STATE-READOUT forward loops in the
       linear-attention / state-space family. Several layers compute the output
       `y_t[e] = sum_d q_t[d]·S_t[d,e]` (or the SSM analogue
       `y += C[s]·h_new[s]`) with a SCALAR inner loop where one operand is

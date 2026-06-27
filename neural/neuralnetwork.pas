@@ -52279,7 +52279,7 @@ var
   Wq, Wk, Wv, Wb: TNNetVolume;
   SeqLen, Depth, t, d, e, j, baseT, baseS: integer;
   SeqLenM1, DepthM1: integer;
-  accQ, accK, accV, accBeta, xj, betav, knrm, ss, predE: TNeuralFloat;
+  accQ, accK, accV, accBeta, xj, betav, knrm: TNeuralFloat;
   XtPtr, OutPtr: TNeuralFloatArrPtr;
   WqR, WkR, WvR, PrevRow: TNeuralFloatArrPtr;
 begin
@@ -52317,14 +52317,13 @@ begin
     FBeta.FData[t] := betav;
     // Read prediction pred_t = S_{t-1}^T k_t, error err_t = v_t - pred_t,
     // then the corrective write S_t = S_{t-1} + beta_t k_t (x) err_t.
-    for e := 0 to DepthM1 do
-    begin
-      predE := 0;
-      if t > 0 then
-        for d := 0 to DepthM1 do
-          predE := predE + FS.FData[baseS - Depth * Depth + d * Depth + e] * FKey.FData[baseT + d];
-      FErr.FData[baseT + e] := FV.FData[baseT + e] - predE;
-    end;
+    // err[e] = v[e] - sum_d S_{t-1}[d,e]*k[d]: seed with v then subtract per row
+    // d (S_{t-1} row + FErr contiguous over e) via MulAdd, mirroring the backward.
+    for e := 0 to DepthM1 do FErr.FData[baseT + e] := FV.FData[baseT + e];
+    if t > 0 then
+      for d := 0 to DepthM1 do
+        TNNetVolume.MulAdd(@FErr.FData[baseT], @FS.FData[baseS - Depth * Depth + d * Depth],
+          -FKey.FData[baseT + d], Depth);
     // Rank-1 corrective write, vectorized per output row d (contiguous over e).
     for d := 0 to DepthM1 do
     begin
@@ -52333,14 +52332,12 @@ begin
       TNNetVolume.RankOneUpdateRow(@FS.FData[baseS + d * Depth], PrevRow,
         @FErr.FData[baseT], 1.0, betav * FKey.FData[baseT + d], Depth);
     end;
-    // Read-out y_t[e] = sum_d S_t[d,e] q_t[d].
-    for e := 0 to DepthM1 do
-    begin
-      ss := 0;
-      for d := 0 to DepthM1 do
-        ss := ss + FS.FData[baseS + d * Depth + e] * FQ.FData[baseT + d];
-      OutPtr^[e] := ss;
-    end;
+    // Read-out y_t[e] = sum_d S_t[d,e] q_t[d]. Accumulate per row d (FS row +
+    // OutPtr contiguous over e) via MulAdd, mirroring the backward scatter.
+    for e := 0 to DepthM1 do OutPtr^[e] := 0;
+    for d := 0 to DepthM1 do
+      TNNetVolume.MulAdd(@OutPtr^[0], @FS.FData[baseS + d * Depth],
+        FQ.FData[baseT + d], Depth);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -52840,7 +52837,7 @@ var
   Wq, Wk, Wv, Wa, Ba: TNNetVolume;
   SeqLen, Depth, t, d, e, j, baseT, baseS: integer;
   SeqLenM1, DepthM1: integer;
-  accQ, accK, accV, accA, xj, knrm, ss: TNeuralFloat;
+  accQ, accK, accV, accA, xj, knrm: TNeuralFloat;
   XtPtr, OutPtr: TNeuralFloatArrPtr;
   WqR, WkR, WvR, WaR, PrevRow: TNeuralFloatArrPtr;
 begin
@@ -52884,14 +52881,12 @@ begin
       TNNetVolume.RankOneUpdateRow(@FS.FData[baseS + d * Depth], PrevRow,
         @FV.FData[baseT], FAlpha.FData[baseT + d], FKey.FData[baseT + d], Depth);
     end;
-    // Read-out y_t[e] = sum_d q_t[d] * S_t[d,e].
-    for e := 0 to DepthM1 do
-    begin
-      ss := 0;
-      for d := 0 to DepthM1 do
-        ss := ss + FQ.FData[baseT + d] * FS.FData[baseS + d * Depth + e];
-      OutPtr^[e] := ss;
-    end;
+    // Read-out y_t[e] = sum_d q_t[d] * S_t[d,e]. Accumulate per row d (FS row +
+    // OutPtr contiguous over e) via MulAdd, mirroring the backward scatter.
+    for e := 0 to DepthM1 do OutPtr^[e] := 0;
+    for d := 0 to DepthM1 do
+      TNNetVolume.MulAdd(@OutPtr^[0], @FS.FData[baseS + d * Depth],
+        FQ.FData[baseT + d], Depth);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -54874,7 +54869,6 @@ begin
       xd := XtPtr^[d];
       hbase := ((t * Depth) + d) * NS;
       ebase := d * NS;
-      accY := 0;
       for s := 0 to NSM1 do
       begin
         ad := Exp(-sp * FExpA.FData[ebase + s]);
@@ -54882,8 +54876,10 @@ begin
         hnew := ad * FH.FData[ebase + s] + sp * FBt.FData[(t * NS) + s] * xd;
         FH.FData[ebase + s] := hnew;
         FState.FData[hbase + s] := hnew;
-        accY := accY + FCt.FData[(t * NS) + s] * hnew;
       end;
+      // Read-out accY = sum_s c_t[s]*h_new[s]: FCt row + FState row both
+      // contiguous over the state axis -> AVX dot product.
+      accY := TNNetVolume.DotProduct(@FCt.FData[t * NS], @FState.FData[hbase], NS);
       OutPtr^[d] := accY + Ee.FData[d] * xd;
     end;
   end;
@@ -54994,7 +54990,6 @@ begin
       xd := XtPtr^[d];
       hbase := ((t * Depth) + d) * NS;
       ebase := d * NS;
-      accY := 0;
       for s := 0 to NSM1 do
       begin
         ad := Exp(-sp * FExpA.FData[ebase + s]);
@@ -55002,8 +54997,10 @@ begin
         hnew := ad * FH.FData[ebase + s] + sp * FBt.FData[(t * NS) + s] * xd;
         FH.FData[ebase + s] := hnew;
         FState.FData[hbase + s] := hnew;
-        accY := accY + FCt.FData[(t * NS) + s] * hnew;
       end;
+      // Read-out accY = sum_s c_t[s]*h_new[s]: FCt row + FState row both
+      // contiguous over the state axis -> AVX dot product.
+      accY := TNNetVolume.DotProduct(@FCt.FData[t * NS], @FState.FData[hbase], NS);
       OutPtr^[d] := accY + Ee.FData[d] * xd;
     end;
   end;
@@ -55566,15 +55563,16 @@ begin
         xv := XtPtr^[xbase];
         ebase := xbase * N;
         hbase := ((t * dInner) + xbase) * N;
-        accY := 0;
         for s := 0 to NM1 do
         begin
           hnew := ah * FH.FData[ebase + s] +
             dth * XtPtr^[bOff + hpg + s] * xv;
           FH.FData[ebase + s] := hnew;
           FState.FData[hbase + s] := hnew;
-          accY := accY + XtPtr^[cOff + hpg + s] * hnew;
         end;
+        // Read-out accY = sum_s C_t[s]*h_new[s]: the C slice of x_t and the
+        // FState row are both contiguous over the state axis -> AVX dot product.
+        accY := TNNetVolume.DotProduct(@XtPtr^[cOff + hpg], @FState.FData[hbase], N);
         FY.FData[(t * dInner) + xbase] := accY + Dd.FData[h] * xv;
       end;
     end;
