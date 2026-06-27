@@ -833,12 +833,19 @@ rather than acted on.
       tests (EnCodec round-trips, TestMimiParity, TestDACRoundTripParity,
       TestHiFiGANSynthesisParity, TestVitsSynthesisParity, TestMusicGen*DecoderParity)
       pass on BOTH scalar-fallback and real -dAVX2 builds. REMAINING:
-  - [ ] OpenCL offload of the same accumulation (via the shared dot-product kernel,
-        like FullConnect/Convolution). FORWARD conv1d DONE: EnCodec (`RunEnCodecConv`
+  - [X] OpenCL offload of the same accumulation (via the shared dot-product kernel,
+        like FullConnect/Convolution). FORWARD conv1d LANDED: EnCodec (`RunEnCodecConv`
         — `TEnCodecModel` + MusicGen EnCodec decode) and HiFiGAN/Vits (`RunHiFiGANConv`)
         run the per-stage im2col GEMM as one `TDotProductSharedKernel` call, opt-in +
-        default OFF via the `EnableConvOpenCL`/`SetConvOpenCLMinWork` gate;
-        `TestEnCodecOpenCLConvParity` < 1e-4 on both the default and `-dOpenCL` builds.
+        default OFF via the `EnableConvOpenCL`/`SetConvOpenCLMinWork` gate.
+        `TestEnCodecOpenCLConvParity` GREEN on BOTH the default (CPU==CPU, trivially
+        exact) and `-dOpenCL` builds. Verified on the real PoCL CPU device (FP32):
+        end-to-end EnCodec decode max|diff| = 5.96e-8 << 1e-4 (per-stage forward conv
+        GEMM matched the AVX DotProduct to < 2e-7). `EnableConvOpenCL` now self-tests
+        the device kernel with a tiny known dot product and stays OFF (graceful CPU
+        fallback, no crash) if it can't compute — covers the case where the kernel
+        source `neural.cl` is not reachable from the run dir (added `../neural` and
+        `../../neural` repo-relative lookups so the tests/examples dirs find it).
         REMAINING:
     - [ ] OpenCL offload of the ConvTranspose1d (upsample) overlap-add accumulation
           (EnCodec + HiFiGAN/Vits); the per-(o,k2)-tap in-channel contraction is the

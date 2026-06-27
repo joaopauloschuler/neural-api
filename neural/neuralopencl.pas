@@ -583,6 +583,18 @@ begin
   begin
     CompileProgramFromFile('neural-api/neural/neural.cl');
   end
+  // Repo-relative fallback: the test suite (and other tools) run from the
+  // sibling tests/ or examples/<x>/ directory, where the kernel source sits one
+  // or two levels up under neural/. Without this the kernel silently fails to
+  // build and the offload returns garbage.
+  else if FileExists('../neural/neural.cl') then
+  begin
+    CompileProgramFromFile('../neural/neural.cl');
+  end
+  else if FileExists('../../neural/neural.cl') then
+  begin
+    CompileProgramFromFile('../../neural/neural.cl');
+  end
   else
   begin
     MessageProc('File neural.cl could not be found.');

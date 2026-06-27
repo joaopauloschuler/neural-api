@@ -38685,6 +38685,52 @@ begin
   FConvOpenCLMinWork := MinMACs;
 end;
 
+// Runs a tiny known dot-product through the freshly-created device kernel and
+// checks it against the CPU answer. Guards against a silently-non-functional
+// kernel - most importantly the case where the kernel SOURCE (neural.cl) is not
+// found at runtime, so clBuildProgram/clCreateKernel never produced a working
+// kernel and the GEMM would return garbage (off by ~0.05, not the < 1e-4 the
+// parity gate demands). Returns true only if the device actually computes the
+// dot product correctly. Coded by Claude (AI).
+function ConvOpenCLSelfTest(): boolean;
+var
+  A, B, R: TNNetVolume;
+  o, i: integer;
+  Expected: TNeuralFloat;
+const
+  csSelfTestN  = 2;  // two "A" rows (output channels)
+  csSelfTestSz = 4;  // contraction length
+begin
+  Result := false;
+  A := TNNetVolume.Create();
+  B := TNNetVolume.Create();
+  R := TNNetVolume.Create();
+  try
+    // A interleaved [i*N + o], B contiguous [0*Sz + i]; one B column.
+    A.ReSize(csSelfTestN * csSelfTestSz, 1, 1);
+    for o := 0 to csSelfTestN - 1 do
+      for i := 0 to csSelfTestSz - 1 do
+        A.FData[i * csSelfTestN + o] := (o + 1) * 0.5 + i * 0.25;
+    B.ReSize(csSelfTestSz, 1, 1);
+    for i := 0 to csSelfTestSz - 1 do B.FData[i] := 1.0 + i * 0.1;
+    R.ReSize(csSelfTestN, 1, 1);
+    try
+      FConvDotCL.PrepareForCompute(A, B, csSelfTestSz);
+      FConvDotCL.Compute(A, B, 0, true, true);
+      FConvDotCL.FinishAndLoadResult(R, 0);
+    except
+      Exit; // any OpenCL exception => unusable, fall back to CPU
+    end;
+    // Verify output channel 0 (result laid out [b*N + o], b=0).
+    Expected := 0;
+    for i := 0 to csSelfTestSz - 1 do
+      Expected := Expected + A.FData[i * csSelfTestN + 0] * B.FData[i];
+    Result := Abs(R.FData[0] - Expected) < 1e-4;
+  finally
+    R.Free; B.Free; A.Free;
+  end;
+end;
+
 procedure EnableConvOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
 begin
   if not Assigned(FConvDotKernel) then
@@ -38697,7 +38743,15 @@ begin
   if not Assigned(FConvWInter)   then FConvWInter   := TNNetVolume.Create();
   if not Assigned(FConvPatchMat) then FConvPatchMat := TNNetVolume.Create();
   if not Assigned(FConvResMat)   then FConvResMat   := TNNetVolume.Create();
-  FConvOpenCLEnabled := true;
+  // Probe the device kernel before arming. If it can't reproduce a trivial
+  // dot product (e.g. neural.cl was not found so the kernel never compiled),
+  // tear the offload down and stay on the CPU path - the conv runners then see
+  // ConvOpenCLEnabled()=false and use AVX/scalar DotProduct (graceful fallback,
+  // no crash, byte-identical to the gate-OFF behavior). Coded by Claude (AI).
+  if ConvOpenCLSelfTest() then
+    FConvOpenCLEnabled := true
+  else
+    DisableConvOpenCL();
 end;
 
 procedure DisableConvOpenCL();
