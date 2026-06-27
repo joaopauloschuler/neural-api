@@ -302,28 +302,6 @@ rather than acted on.
       register-token handling. Pairs with the open "register-token DINOv2 backbones
       rejected by BuildDPT" follow-up and unblocks DINOv3-backed dense-prediction.
 
-- [X] Replace the hand-rolled Snake activation and AdaIN in `neuralpretrained.pas`
-      with the landed `TNNetSnake` / `TNNetAdaIN` layers. INVESTIGATED + safe
-      consolidation DONE (commit a7d6f2c). FINDING: the holders' math genuinely
-      DIFFERS from the layers and a literal port would NOT be faithful, so a full
-      replacement was deliberately NOT done:
-  - Snake: there is only ONE hand-rolled Snake (`TNNetDAC.RunSnake`; Mimi has none).
-    The DAC version uses per-channel LEARNABLE alpha (the `TNNetSnake` layer = one
-    scalar), a `1/(alpha+1e-9)` epsilon guard (the layer rejects alpha=0, no eps),
-    and DOUBLE precision over channel-major arrays (the layer = single-precision over
-    a `TNNetVolume`, and is itself a scalar loop with no AVX block to inherit).
-    Routing through the layer would change results and lose precision. Instead the
-    duplicated `sin·sin` arithmetic was extracted into ONE `SnakeScalar` helper
-    (single source of truth, bit-identical output) with a comment documenting the
-    relationship to the layer.
-  - AdaIN: Kokoro's `RunAdaIN` is StyleTTS2 AdaIN1d (affine gamma/beta produced by a
-    LEARNED FC over the style vector S), a DIFFERENT operator from `TNNetAdaIN`
-    (Huang-Belongie style-transfer AdaIN whose affine = per-channel STATISTICS of a
-    second style map). Only the instance-norm core is shared; conditioning is
-    incompatible. Left as a holder method with a reconciliation comment.
-  DAC/Mimi/Kokoro/EnCodec parity tests stay green (370/370). The original premise
-  (the layers and holders compute the same math) was incorrect; closing as done.
-
 - [ ] Llama 3.2 Vision (mllama) cross-attention VLM importer
       (BuildMllamaFromSafeTensors[Ex], model_type "mllama", e.g.
       meta-llama/Llama-3.2-11B-Vision-Instruct). DISTINCT from the landed
@@ -1089,8 +1067,8 @@ rather than acted on.
         package is available.
   - [ ] Swap the `TNNetMinLSTM` trunk (gates depend on x_t only) for a VANILLA LSTM with a
         true cell state + recurrent gate feed (pyannote uses `nn.LSTM`), so real weights
-        load without re-training, using the landed `TNNetLSTMCell` (the bidirectional
-        multi-layer stacking builder is the remaining piece).
+        load without re-training, using the landed `TNNetLSTMCell` and the landed
+        `AddBidirectionalLSTM`/`AddBidirectionalGRU` stacking builders.
   - [ ] Sliding-window inference + overlap stitching for clips longer than the model's
         receptive field, and turning the per-frame activity matrix into final diarized
         speaker turns (clustering across windows).
@@ -1499,43 +1477,6 @@ rather than acted on.
       STILL OPEN: the actual safetensors importer that loads real nn.LSTM/nn.GRU
       `weight_ih_l{k}`/`weight_hh_l{k}`(`_reverse`) slabs into the stacked cells.
 
-- [X] AVX-vectorize `TNNetLSTMCell` + `TNNetGRUCell` gate matmuls. DONE (commit
-      6e7300e): forward gate pre-activations now two `DotProduct`s per gate over
-      `x_t` and the frozen `h_{t-1}`; backward weight-grads use `MulAdd`. GRU keeps
-      `r_t·(W_hn·h+b_hn)` separate so torch GRU semantics hold. The `dL/dh_{t-1}`
-      multi-row GEMV and the `PrevErr` input-grad loops are deliberately left scalar
-      (a small per-row-scaled GEMV, not one MulAdd). Cell gradient tests
-      bit-identical on scalar and `-dAVX2`. ORIGINAL NOTE: Both forwards were
-      fully scalar (verified: zero `DotProduct`/`MulAdd` calls in
-      `TNNetLSTMCell.Compute`): the per-timestep, per-channel inner `for j` loop
-      accumulates `acc += W_x[j]*x_t[j] + W_h[j]*h_{t-1}[j]` over the CONTIGUOUS
-      depth axis, which is exactly two `TNNetVolume.DotProduct(W_row, vec, Depth)`
-      calls — the gate weight rows are depth-contiguous via `GetRawPtr(d,0,0)` and
-      both `x_t` and the frozen `FHprev` are contiguous. Replace the four (LSTM:
-      i/f/g/o) / three (GRU: r/z/n) scalar inner accumulations with `DotProduct`
-      over `x_t` and `h_{t-1}`, and mirror it in the backward weight-gradient
-      accumulation with `MulAdd(GW_row, vec, grad, Depth)`. Single-cell forward is
-      the un-threaded 1-core suspect on imported recurrent models (pyannote LSTM
-      trunk, classic seq models); the EnCodec LSTM was already AVX'd separately
-      (~12.9x) by hand-rolled `DotProduct`, so the speedup is proven for this exact
-      shape. Pin parity with the existing numerical-gradient cell tests.
-- [X] AVX-vectorize `TNNetMLSTMCell` / `TNNetSLSTMCell` matrix-memory updates.
-      DONE (commit cd83b6a): mLSTM q/k/v/o projections, scalar gate args, the
-      covariance write (per-row `MulAdd(C_row,C_prev,f')` + `MulAdd(C_row,k_t,i'·v[d])`,
-      rows `FillChar`-zeroed first to avoid a `NaN*0` trap), normalizer, and readout
-      are vectorized; mLSTM `m_t` stop-gradient semantics untouched. sLSTM gates use
-      two `DotProduct`s; weight-grads use `MulAdd`. Left scalar: sLSTM `dL/dh_{t-1}`
-      (4-row mix) and mLSTM `dL/dx` qkv scatter (3-row mix). 8/8 cell tests + full
-      numerical suite green on scalar and `-dAVX2`. ORIGINAL NOTE:
-      `TNNetMLSTMCell.Compute` was fully scalar (verified: zero `DotProduct`/`MulAdd`,
-      ten scalar `for` loops): the covariance write `C_t += i_t * (v_t k_tᵀ)` is a
-      depth-contiguous outer-product scatter mappable to per-row
-      `MulAdd(C_row, k_t, i_t*v_t[row], Depth)`, and the readout
-      `h_t = (C_t q_t) / max(|n_tᵀ q_t|, 1)` is a per-row `DotProduct(C_row, q_t,
-      Depth)`. `TNNetSLSTMCell` shares the exp-gated structure (its frozen-h_{t-1}
-      gate matmul is the same shape as the LSTM/GRU task above). Mirror the matrix
-      gradients in the backward with `MulAdd`; gate behind the existing cell
-      numerical-gradient tests (scalar build must stay bit-identical).
 - [ ] AVX-vectorize `TNNetDeformableConv` / DCNv2 forward. `ComputeCPU` is a pure
       scalar loop: the main-conv accumulation `acc := acc + mW.FData[(tap*FInDepth+ci)*FOutDepth+co] * sampled`
       runs one MUL/ADD per input channel. The accumulation over `ci` is a dot
