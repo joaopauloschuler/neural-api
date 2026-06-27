@@ -893,6 +893,58 @@ type
       property Delta: TNeuralFloat read FDelta write FDelta;
   end;
 
+  { TNNetSequenceBiasProcessor }
+  // SEQUENCE BIAS / bad-words blocking - the port of transformers'
+  // SequenceBiasLogitsProcessor (and its NoBadWordsLogitsProcessor special
+  // case). Holds a list of (token-sequence, bias) entries. The bias is an
+  // additive LOGIT shift applied to the FINAL token of a sequence, but ONLY
+  // when the sequence's PRECEDING tokens exactly match the most-recent
+  // generated history (its (k-1)-token prefix is a suffix of the running
+  // context). A single-token sequence has an empty prefix that trivially
+  // matches every step, so it degrades to an UNCONDITIONAL bias on that token
+  // (transformers' documented behavior). A multi-token entry only fires once
+  // its lead-in has been emitted, biasing the token that would COMPLETE it.
+  //
+  // HARD BANS. AddBadWord adds an entry with bias = csSequenceBiasBanBias, a
+  // large finite negative used as -infinity; in the probability domain that
+  // drives the final token's probability to ~0 (renormalized away), so a
+  // banned multi-token word can never be completed under greedy/argmax.
+  //
+  // DOMAIN. The chain feeds POST-SOFTMAX PROBABILITIES. The exact image of
+  // "logit += bias" is "prob *= exp(bias)" followed by renormalization (the
+  // same realization TNNetWatermarkLogitsProcessor uses for its green bias);
+  // exp(csSequenceBiasBanBias) underflows to 0, the hard-ban image. A step
+  // that would zero ALL surviving mass leaves the row UNTOUCHED (the
+  // MaskAllowed zero-mass fallback shared by the other processors).
+  //
+  // STATE = the full generated id sequence (prompt + emitted), built in Reset
+  // and advanced in Commit, exactly like TNNetNoRepeatNGramProcessor; prefix
+  // matching is run against its tail each step.
+  // Coded by Claude (AI).
+  TNNetSequenceBiasProcessor = class(TNNetLogitsProcessor)
+    private
+      FSequences: TNNetTokenSequences;
+      FBiases: TNeuralFloatDynArr;
+      FCount: integer;
+      FHistory: TNeuralIntegerArray;
+      FLen: integer;
+      procedure AppendToken(TokenId: integer);
+    public
+      constructor Create();
+      // Adds a (sequence, bias) entry. Sequence must be non-empty. A
+      // single-token sequence biases that token unconditionally; a multi-token
+      // sequence biases its last token only when the leading tokens match the
+      // generated tail. Re-adding the same sequence overwrites its bias.
+      procedure AddSequenceBias(const Sequence: array of integer;
+        Bias: TNeuralFloat);
+      // Convenience: hard-ban a (multi-token) word via the -infinity bias.
+      procedure AddBadWord(const Sequence: array of integer);
+      procedure Reset(const PromptTokens: array of integer); override;
+      procedure ProcessRow(Row: TNNetVolume); override;
+      procedure Commit(TokenId: integer); override;
+      property Count: integer read FCount;
+  end;
+
   { TGenerationConfig }
   // One-record bundle of generation knobs - the GenerationConfig counterpart
   // of the parameter piles on the GenerateTokensStreamed overloads, consumed
@@ -1159,6 +1211,9 @@ const
   // (DecodeSeq2SeqSampled and TNNetTemperatureProcessor): Temperature -> 0
   // degenerates to greedy argmax instead of dividing by zero.
   csDecodeMinTemperature = 1e-6;
+  // The -infinity bias used by TNNetSequenceBiasProcessor hard bans: a large
+  // finite negative logit shift whose exp() underflows to 0 (prob -> 0).
+  csSequenceBiasBanBias = -1e30;
 
 // Wu et al. 2016 length-penalty denominator ((5+L)/6)^alpha. With alpha=0 this
 // is exactly 1.0 (no penalty -> raw sum-log-prob ranking, short-biased).
@@ -4451,6 +4506,143 @@ begin
 end;
 
 procedure TNNetNoRepeatNGramProcessor.Commit(TokenId: integer);
+begin
+  AppendToken(TokenId);
+end;
+
+{ TNNetSequenceBiasProcessor }
+
+constructor TNNetSequenceBiasProcessor.Create();
+begin
+  inherited Create();
+  SetLength(FSequences, 0);
+  SetLength(FBiases, 0);
+  FCount := 0;
+  SetLength(FHistory, 0);
+  FLen := 0;
+end;
+
+procedure TNNetSequenceBiasProcessor.AddSequenceBias(
+  const Sequence: array of integer; Bias: TNeuralFloat);
+var
+  I, J, Len: integer;
+  Same: boolean;
+begin
+  Len := Length(Sequence);
+  if Len = 0 then
+    raise EArgumentException.Create(
+      'TNNetSequenceBiasProcessor.AddSequenceBias: empty sequence.');
+  // Re-adding the same sequence OVERWRITES its bias (HF dict semantics).
+  for I := 0 to FCount - 1 do
+    if Length(FSequences[I]) = Len then
+    begin
+      Same := true;
+      for J := 0 to Len - 1 do
+        if FSequences[I][J] <> Sequence[J] then
+        begin
+          Same := false;
+          break;
+        end;
+      if Same then
+      begin
+        FBiases[I] := Bias;
+        exit;
+      end;
+    end;
+  if FCount >= Length(FSequences) then
+  begin
+    SetLength(FSequences, (FCount + 1) * 2);
+    SetLength(FBiases, (FCount + 1) * 2);
+  end;
+  SetLength(FSequences[FCount], Len);
+  for J := 0 to Len - 1 do FSequences[FCount][J] := Sequence[J];
+  FBiases[FCount] := Bias;
+  Inc(FCount);
+end;
+
+procedure TNNetSequenceBiasProcessor.AddBadWord(
+  const Sequence: array of integer);
+begin
+  AddSequenceBias(Sequence, csSequenceBiasBanBias);
+end;
+
+procedure TNNetSequenceBiasProcessor.AppendToken(TokenId: integer);
+begin
+  if FLen >= Length(FHistory) then
+    SetLength(FHistory, (FLen + 1) * 2);
+  FHistory[FLen] := TokenId;
+  Inc(FLen);
+end;
+
+procedure TNNetSequenceBiasProcessor.Reset(
+  const PromptTokens: array of integer);
+var
+  I, Hi: integer;
+begin
+  // Fresh sequence: the history is the WHOLE context (prompt tokens), so a
+  // multi-token bias whose lead-in sits in the prompt fires on step one.
+  FLen := 0;
+  Hi := High(PromptTokens);
+  for I := 0 to Hi do AppendToken(PromptTokens[I]);
+end;
+
+procedure TNNetSequenceBiasProcessor.ProcessRow(Row: TNNetVolume);
+var
+  I, K, Len, PrefLen, HistStart, Final, Size: integer;
+  Match: boolean;
+  Factor, KeptMass: TNeuralFloat;
+  Scale: TNeuralFloatDynArr;
+begin
+  if FCount = 0 then exit;
+  Size := Row.Size;
+  // Per-token multiplicative factor (exp of the accumulated additive logit
+  // bias), 1.0 = untouched. Biases on the SAME final token ADD in logit space
+  // = multiply in probability space, matching HF (which sums into the logit).
+  SetLength(Scale, Size);
+  for I := 0 to Size - 1 do Scale[I] := 1.0;
+  for I := 0 to FCount - 1 do
+  begin
+    Len := Length(FSequences[I]);
+    Final := FSequences[I][Len - 1];
+    if (Final < 0) or (Final >= Size) then continue;
+    // The (Len-1)-token prefix must be a SUFFIX of the generated history. A
+    // single-token sequence has an empty prefix -> always matches (an
+    // unconditional bias).
+    PrefLen := Len - 1;
+    if PrefLen > FLen then continue; // not enough history for the lead-in
+    Match := true;
+    HistStart := FLen - PrefLen;
+    for K := 0 to PrefLen - 1 do
+      if FHistory[HistStart + K] <> FSequences[I][K] then
+      begin
+        Match := false;
+        break;
+      end;
+    if not Match then continue;
+    // exp(csSequenceBiasBanBias) underflows to exactly 0 (the hard-ban image);
+    // a finite bias scales the probability by exp(bias).
+    if FBiases[I] <= csSequenceBiasBanBias then
+      Scale[Final] := 0
+    else
+      Scale[Final] := Scale[Final] * Exp(FBiases[I]);
+  end;
+  // Probability-domain realization of "logit += bias": p *= exp(bias), then
+  // renormalize. Compute the scaled mass FIRST (without mutating Row) so the
+  // zero-mass fallback can leave the row UNTOUCHED (the MaskAllowed
+  // convention) instead of emitting a degenerate all-zero distribution.
+  KeptMass := 0;
+  for I := 0 to Size - 1 do
+    KeptMass := KeptMass + Row.Raw[I] * Scale[I];
+  if KeptMass <= 0 then exit;
+  for I := 0 to Size - 1 do
+  begin
+    Factor := Scale[I];
+    if Factor <> 1.0 then Row.Raw[I] := Row.Raw[I] * Factor;
+    Row.Raw[I] := Row.Raw[I] / KeptMass;
+  end;
+end;
+
+procedure TNNetSequenceBiasProcessor.Commit(TokenId: integer);
 begin
   AppendToken(TokenId);
 end;

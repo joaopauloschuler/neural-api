@@ -218,6 +218,10 @@ type
     procedure TestWatermarkGreenListReproducibleFromKeyAndPrefix;
     procedure TestWatermarkDetectsWatermarkedAndRejectsRandom;
     procedure TestWatermarkProcessorBoostsGreenInProbabilityDomain;
+    // Sequence-bias / bad-words processor (HF SequenceBiasLogitsProcessor).
+    procedure TestSequenceBiasSingleTokenIsUnconditionalBias;
+    procedure TestSequenceBiasMultiTokenFiresOnlyOnPrefixMatch;
+    procedure TestSequenceBiasBannedWordNeverAppearsInGreedyOutput;
     // Constrained (structured) decoding: TNNetTokenConstraint and friends.
     procedure TestAllowedTokensConstraintMasksAndRenormalizes;
     procedure TestConstraintMaskFallbackLeavesRowUntouched;
@@ -4435,6 +4439,155 @@ begin
     Proc.Free;
     Base.Free;
     Row.Free;
+  end;
+end;
+
+// A single-token bias has an empty prefix, so it fires UNCONDITIONALLY every
+// step (transformers' documented degradation). The probability-domain image is
+// p *= exp(bias), renormalized.
+procedure TTestNeuralDecode.TestSequenceBiasSingleTokenIsUnconditionalBias;
+const
+  Vocab = 5;
+  Bias = 1.5;
+var
+  Proc: TNNetSequenceBiasProcessor;
+  Row: TNNetVolume;
+  I: integer;
+  ExpBias, Sum, Expected: TNeuralFloat;
+begin
+  Proc := TNNetSequenceBiasProcessor.Create();
+  Row := TNNetVolume.Create(Vocab, 1, 1);
+  try
+    AssertTrue('declares the probability domain', Proc.ExpectsProbabilities());
+    Proc.AddSequenceBias([2], Bias); // single-token: unconditional bias on 2
+    AssertEquals('one entry registered', 1, Proc.Count);
+    Proc.Reset([0, 1]); // arbitrary history; the empty prefix matches anyway
+    for I := 0 to Vocab - 1 do Row.Raw[I] := 0.2;
+    Proc.ProcessRow(Row);
+    ExpBias := Exp(Bias);
+    Sum := (Vocab - 1) * 0.2 + 0.2 * ExpBias;
+    for I := 0 to Vocab - 1 do
+    begin
+      if I = 2 then Expected := 0.2 * ExpBias / Sum
+      else Expected := 0.2 / Sum;
+      AssertEquals('single-token bias prob at ' + IntToStr(I), Expected,
+        Row.Raw[I], 1e-6);
+    end;
+    Sum := 0;
+    for I := 0 to Vocab - 1 do Sum := Sum + Row.Raw[I];
+    AssertEquals('row sums to 1', 1.0, Sum, 1e-6);
+  finally
+    Row.Free;
+    Proc.Free;
+  end;
+end;
+
+// A multi-token entry biases its FINAL token only when the leading tokens are
+// the tail of the generated history (prefix match). It must NOT fire when the
+// lead-in does not match.
+procedure TTestNeuralDecode.TestSequenceBiasMultiTokenFiresOnlyOnPrefixMatch;
+const
+  Vocab = 5;
+var
+  Proc: TNNetSequenceBiasProcessor;
+  Row: TNNetVolume;
+  I: integer;
+begin
+  Proc := TNNetSequenceBiasProcessor.Create();
+  Row := TNNetVolume.Create(Vocab, 1, 1);
+  try
+    // Bias token 4 only after the bigram (1,3) has been generated.
+    Proc.AddSequenceBias([1, 3, 4], 2.0);
+
+    // -- NO match: history tail is (0,2); the (1,3) prefix is absent.
+    Proc.Reset([0, 2]);
+    for I := 0 to Vocab - 1 do Row.Raw[I] := 0.2;
+    Proc.ProcessRow(Row);
+    for I := 0 to Vocab - 1 do
+      AssertEquals('no prefix match leaves token ' + IntToStr(I) + ' untouched',
+        0.2, Row.Raw[I], 1e-6);
+
+    // -- MATCH: history tail is exactly (1,3) -> token 4 gets boosted.
+    Proc.Reset([9, 1, 3]); // suffix (1,3) matches the entry's prefix
+    for I := 0 to Vocab - 1 do Row.Raw[I] := 0.2;
+    Proc.ProcessRow(Row);
+    AssertTrue('matched prefix boosts the final token 4 above baseline',
+      Row.Raw[4] > 0.2 + 1e-9);
+    for I := 0 to 3 do
+      AssertTrue('non-final tokens are NOT boosted ' + IntToStr(I),
+        Row.Raw[I] < 0.2 + 1e-9);
+
+    // -- MATCH BY COMMIT: prefix completed via emitted tokens, not the prompt.
+    Proc.Reset([7]);
+    Proc.Commit(1);
+    Proc.Commit(3); // history now (7,1,3); suffix (1,3) matches
+    for I := 0 to Vocab - 1 do Row.Raw[I] := 0.2;
+    Proc.ProcessRow(Row);
+    AssertTrue('prefix completed by Commit boosts token 4',
+      Row.Raw[4] > 0.2 + 1e-9);
+  finally
+    Row.Free;
+    Proc.Free;
+  end;
+end;
+
+// End-to-end greedy check: a hard-banned multi-token word never completes under
+// argmax decoding. We simulate the streamed greedy loop directly on a model
+// distribution that WOULD otherwise emit the banned word, and assert the banned
+// final token never wins once its lead-in has been generated.
+procedure TTestNeuralDecode.TestSequenceBiasBannedWordNeverAppearsInGreedyOutput;
+const
+  Vocab = 4;
+  Steps = 12;
+var
+  Proc: TNNetSequenceBiasProcessor;
+  Row: TNNetVolume;
+  History: array[0..Steps - 1] of integer;
+  I, S, Argmax, Prev: integer;
+  Best: TNeuralFloat;
+begin
+  Proc := TNNetSequenceBiasProcessor.Create();
+  Row := TNNetVolume.Create(Vocab, 1, 1);
+  try
+    // Hard-ban the two-token word (1,2): once a 1 is emitted, a 2 must never
+    // follow it under greedy decoding.
+    Proc.AddBadWord([1, 2]);
+    Proc.Reset([0]); // BOS-like prompt
+    Prev := -1;
+    for S := 0 to Steps - 1 do
+    begin
+      // A degenerate model that ALWAYS most-favours emitting 1 then 2 (so that
+      // without the ban, greedy WOULD produce ...1,2,1,2...). After a 1, token 2
+      // has the largest base probability.
+      if Prev = 1 then
+      begin
+        Row.Raw[0] := 0.1; Row.Raw[1] := 0.1; Row.Raw[2] := 0.7; Row.Raw[3] := 0.1;
+      end
+      else
+      begin
+        Row.Raw[0] := 0.1; Row.Raw[1] := 0.7; Row.Raw[2] := 0.1; Row.Raw[3] := 0.1;
+      end;
+      Proc.ProcessRow(Row);
+      // Greedy argmax.
+      Argmax := 0; Best := Row.Raw[0];
+      for I := 1 to Vocab - 1 do
+        if Row.Raw[I] > Best then begin Best := Row.Raw[I]; Argmax := I; end;
+      History[S] := Argmax;
+      Proc.Commit(Argmax);
+      Prev := Argmax;
+    end;
+    // Assert the banned bigram (1,2) never appears in the greedy output.
+    for S := 0 to Steps - 2 do
+      AssertTrue('banned word (1,2) must not appear at position ' + IntToStr(S),
+        not ((History[S] = 1) and (History[S + 1] = 2)));
+    // Sanity: token 1 WAS emitted at least once (so the ban genuinely fired on
+    // its completion rather than the word never being attempted).
+    Argmax := 0;
+    for S := 0 to Steps - 1 do if History[S] = 1 then Inc(Argmax);
+    AssertTrue('the banned word lead-in (1) was actually generated', Argmax > 0);
+  finally
+    Row.Free;
+    Proc.Free;
   end;
 end;
 

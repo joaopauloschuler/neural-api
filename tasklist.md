@@ -116,15 +116,12 @@ rather than acted on.
       `-FLearningRate` convention and pass the existing numerical-gradient tests
       on both scalar-fallback and `-dAVX2` builds.
 
-- [ ] `bad_words` / sequence-bias logits processor for neuraldecode.pas
-      (`TNNetSequenceBiasProcessor`). The chain already has Penalty / NoRepeatNGram
-      / Constraint / CFG / Watermark, but there is no way to additively bias (or
-      hard-ban via -inf) specific multi-token sequences — the transformers
-      `SequenceBiasLogitsProcessor` / `NoBadWordsLogitsProcessor` behaviour. It
-      should suppress a multi-token sequence's final token only when the preceding
-      tokens already match the generated suffix (prefix-match against history),
-      so single-token bans degrade to a plain logit bias. Add it to the chain
-      builder + a unit test that a banned word never appears in greedy output.
+- [X] `bad_words` / sequence-bias logits processor for neuraldecode.pas
+      (`TNNetSequenceBiasProcessor`). DONE: prob-domain processor (p*=exp(bias),
+      renormalize; AddBadWord => -inf hard ban). Biases a sequence's final token
+      only when its (k-1)-prefix is a suffix of the generated history (single-token
+      = unconditional bias). Used via the Processors chain slot like Watermark/CFG;
+      3 unit tests incl. "banned multi-token word never appears in greedy output".
 
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] GGUF import beyond Llama — open follow-ups (core `BuildFromGGUF`/`BuildFromGGUFEx`
