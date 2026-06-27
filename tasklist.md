@@ -345,21 +345,8 @@ rather than acted on.
       diffusers eps 1e-6); TestVaeDecoderParity <1e-4 vs a numpy float64 oracle):
   - [ ] real-checkpoint (stabilityai/sd-vae-ft-mse) parity once diffusers is
         installable; SDXL VAE uses different group counts / multi-head attention.
-  - [X] the SD UNet itself (the remaining piece for end-to-end latent text-to-image).
-        DONE: BuildSDUNetFromSafeTensors[Ex] + ReadSDUNetConfigFromJSONFile +
-        SDUNetConfigToString + SDUNetDenoise in neuralpretrained.pas (full
-        UNet2DConditionModel v1: conv_in -> down blocks [ResnetBlock2D + optional
-        Transformer2DModel self+text-cross attn + downsample] -> mid
-        [resnet/cross-attn/resnet] -> up blocks [skip-concat + nearest upsample]
-        -> conv_norm_out/SiLU/conv_out; sinusoidal+MLP timestep embed with the
-        [sin|cos]->[cos|sin] swap; additive time injection via a FiLM
-        [ones|time_emb_proj] modulation; GroupNorm eps 1e-5 (resnet) vs 1e-6
-        (transformer); bias-free attn q/k/v; erf-GEGLU FFN; three TNNetInputs
-        latent/timestep/text-states). New helper procs AddSDResnetBlock /
-        AddSDTransformer2D (Coded by Claude). pico fixture
-        tools/sd_unet_tiny_fixture.py (numpy float64 oracle; diffusers not
-        installed) + TestSDUNetParity (max|diff| 2.75e-6 < 1e-4) + the config
-        reader test. DEFERRED follow-ups:
+  - [ ] SD UNet importer LANDED (BuildSDUNetFromSafeTensors[Ex] + SDUNetDenoise,
+        UNet2DConditionModel v1; TestSDUNetParity 2.75e-6 < 1e-4). Open follow-ups:
     - [ ] real-checkpoint parity (runwayml/stable-diffusion-v1-5 unet) once
           diffusers is installable; verify the SD attention_head_dim->num_heads
           interpretation on the real config (the importer derives NumHeads =
@@ -374,25 +361,11 @@ rather than acted on.
     - [ ] add_embedding / class/time-aug conditioning (SDXL micro-conditioning),
           and the end-to-end LatentTextToImage capstone (CLIP text -> this UNet
           -> scheduler loop -> VAE decoder).
-- [X] Mask2Former universal-segmentation importer
-      (BuildMask2FormerFromSafeTensors[Ex], model_type "mask2former", e.g.
-      facebook/mask2former-swin-tiny-*-semantic) LANDED in neuralpretrained.pas.
-      Mask-classification set-prediction: a fixed set of learned object queries each
-      predicting one binary mask + a class, in ONE head. The conceptual core MASKED
-      ATTENTION is correct + parity-verified: each decoder layer's cross-attention is
-      restricted to the previous layer's predicted-mask FOREGROUND (sigmoid>=0.5 keys
-      allowed, background -1e9, HF "attend-to-nothing -> unmask-all" fallback),
-      realised over an explicit TNNetDotProducts score matrix + additive-bias TNNetSum
-      (NO new leaf layer needed) in the Mask2Former cross->self->FFN post-norm order;
-      packed nn.MultiheadAttention in_proj row-sliced into q/k/v; dot-product
-      mask_embedder(query) x mask_features -> per-query mask logits (Mask2FormerMaskEinsum);
-      DecodeMask2FormerSemantic mirrors HF post_process_semantic_segmentation. The
-      dynamic mask feedback (layer L's mask from L-1) is driven layer-by-layer in Pascal
-      by RunMask2FormerSemantic (one sub-net per layer; FreeMask2Former frees the
-      container). TestMask2FormerParity asserts max|diff| < 1e-4 (actual ~1.2e-7) on the
-      per-query mask AND class logits vs the REAL transformers float64 forward
-      (tools/make_pico_mask2former_fixture.py). examples/UniversalSegmentation writes a
-      segmentation overlay PPM. Deferred follow-ups:
+- [ ] Mask2Former universal-segmentation importer LANDED
+      (BuildMask2FormerFromSafeTensors[Ex], model_type "mask2former";
+      masked-attention decoder + per-query mask/class heads, RunMask2FormerSemantic +
+      DecodeMask2FormerSemantic, TestMask2FormerParity ~1.2e-7 < 1e-4,
+      examples/UniversalSegmentation). Deferred follow-ups:
       (a) wire the full Swin backbone + FPN pixel decoder (mask_features + 3 multi-scale
           memory levels with level_embed + sine pos) into ONE forward — v1 takes the
           pixel-decoder outputs as PRECOMPUTED TNNetInput feature maps (mirroring Mask
@@ -473,20 +446,10 @@ rather than acted on.
       offline here); (b) expose LPIPS as a backprop TRAINING LOSS head so the SR
       examples can opt into perceptual fine-tuning (the VGG build already enables
       input/error collection, so the gradient path exists).
-- [X] ControlNet spatial-conditioning importer (BuildControlNetFromSafeTensors[Ex],
-      lllyasviel/sd-controlnet-canny key scheme) — LANDED. TControlNetConfig wraps
-      the SD UNet TSDUNetConfig (encoder + mid block REUSE AddSDResnetBlock /
-      AddSDTransformer2D verbatim; ControlNet has NO up blocks) plus cond fields.
-      Genuinely-new code: the controlnet_cond_embedding hint stem
-      (AddControlNetHintStem: conv_in + (conv, stride-2 conv) pairs w/ SiLU +
-      conv_out, ADDED to conv_in before the down blocks) and the per-resolution
-      zero-conv residual taps (1x1 PointwiseConvLinear off conv_in(+hint), each down
-      resnet(+attn), each downsampler, and the mid output). ControlNetResiduals
-      driver (4 TNNetInputs: latent/timestep/text/control-image) returns the
-      down_block_res_samples + mid_block_res_sample. Pico float64 oracle
-      (tools/controlnet_tiny_fixture.py, diffusers absent) -> TestControlNetParity
-      max|diff| = 2.89e-6 (< 1e-4) on all 4 down residuals + the mid residual; also
-      TestControlNetConfigFromJSONFile. First conditioning-by-feature-injection model.
+- [ ] ControlNet spatial-conditioning importer LANDED
+      (BuildControlNetFromSafeTensors[Ex], lllyasviel/sd-controlnet-canny;
+      hint stem + per-resolution zero-conv residual taps + ControlNetResiduals driver,
+      TestControlNetParity 2.89e-6 < 1e-4). First conditioning-by-feature-injection model.
       DEFERRED follow-ups: (a) end-to-end base-UNet-plus-ControlNet generation
       (inject the residuals into a frozen BuildSDUNet decoder — needs a residual-add
       hook on the SD UNet up-block skip Sums) + an examples/ControlNetCanny smoke
@@ -1073,24 +1036,10 @@ rather than acted on.
       examples/TreeSpeculativeDecoding demo reporting the accepted-tokens/forward
       speedup vs the linear self-speculative baseline.
 
-- [X] ImageNet top-1 / top-5 parity eval harness for the imported vision backbones
-      (EvaluateImageNet + ImageNetReport + TopKIndices + TNNetImageNetSample/Stats in
-      neuralimagemetrics.pas, plus examples/ImageNetEval). LANDED: the harness takes
-      already-preprocessed network-ready volumes + gold labels (decoupled like
-      EvaluateMMLU), runs NN.Compute, forms top-1/top-K via TopKIndices (first-max
-      tie-break), tallies top-1 (argmax==gold) and top-K (gold in top-K) accuracy,
-      and retains up to MaxConfusion top-1 misses (each flagged top-K hit/miss) for a
-      confusion sample; ImageNetReport formats it. The example's default SMOKE trains
-      a small CNN on a deterministic synthetic 6-class set rendered LARGE and pushed
-      through the REAL neuraldatasets.PreprocessImageForVisionModel transform
-      (shorter-side resize -> center-crop -> csImageNetMean/csImageNetStd), exercising
-      the real transform + harness end to end (reports 1.0000/1.0000 on the separable
-      synthetic classes). A --full <dir> hook prints the documented real-ImageNet-val
-      recipe (labels.txt + JPEGs; LoadImageForVisionModel with the importer's
-      ImageSize + ImageNet mean/std; EvaluateImageNet(NN, Samples, 1000, 5)). Tests
-      TestTopKIndices / TestEvaluateImageNetCounting / TestEvaluateImageNetSkipAndConfusion
-      / TestImageNetReportFormat / TestPreprocessTransformMath pin the harness logic +
-      transform math (TestNeuralImageMetrics, full suite 2339 green).
+- [ ] ImageNet top-1 / top-5 parity eval harness LANDED (EvaluateImageNet +
+      ImageNetReport + TopKIndices + TNNetImageNetSample/Stats in
+      neuralimagemetrics.pas, examples/ImageNetEval; synthetic smoke + --full <dir>
+      real-val hook, TestNeuralImageMetrics green). Open follow-up:
   - [ ] Run against REAL ImageNet-val: wire one landed classifier importer
         (BuildResNetFromSafeTensors etc.) over a real checkpoint + the 50k-image
         ImageNet-val set and compare top-1/top-5 to the published torchvision numbers
@@ -1178,12 +1127,12 @@ rather than acted on.
       (reuse the landed SDPA over a (NumFrames,1,C) reshape per spatial cell, exactly
       the VideoMAE space<->time transpose trick) + the zero-initialised residual
       injection into the frozen UNet (same wiring as the tracked ControlNet zero-conv).
-      DEPENDS ON the open SD UNet importer (the VAE-decoder follow-up's deferred piece);
-      track as its natural successor alongside ControlNet. Pico parity vs a diffusers
+      Builds on the landed SD UNet importer (BuildSDUNetFromSafeTensors); track as its
+      natural successor alongside ControlNet. Pico parity vs a diffusers
       float64 oracle on one motion-module output for a fixed multi-frame latent; an
-      examples/TextToVideo that writes a short animated GIF/PPM sequence on CPU once the
-      base UNet lands. Note: the cheaper no-UNet route to video is bolting the same
-      temporal block onto the landed PixArt DiT — worth scoping if SD UNet stays blocked.
+      examples/TextToVideo that writes a short animated GIF/PPM sequence on CPU. Note:
+      a cheaper no-UNet route to video is bolting the same temporal block onto the
+      landed PixArt DiT.
 - [ ] CogVideoX text-to-VIDEO DiT real-checkpoint follow-up
       (BuildCogVideoXFromSafeTensors[Ex] + TCogVideoXConfig + DecodeCogVideoXVae +
       examples/TextToVideo LANDED, reusing TNNetMRotaryEmbedding 3D RoPE +
