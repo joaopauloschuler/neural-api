@@ -49238,8 +49238,8 @@ var
   Wii, Wif, Wig, Wio, Whi, Whf, Whg, Who, Bi, Bf, Bg, Bo, Prev: TNNetVolume;
   SeqLen, Depth, t, d, j, baseT: integer;
   SeqLenM1, DepthM1: integer;
-  accI, accF, accG, accO, xj, hj, iv, fv, gv, ovv, cPrev, cv, tc: TNeuralFloat;
-  XtPtr, OutPtr: TNeuralFloatArrPtr;
+  accI, accF, accG, accO, iv, fv, gv, ovv, cPrev, cv, tc: TNeuralFloat;
+  XtPtr, OutPtr, HprevPtr: TNeuralFloatArrPtr;
   WiiR, WifR, WigR, WioR, WhiR, WhfR, WhgR, WhoR: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
@@ -49255,6 +49255,7 @@ begin
   // FHprev holds the FROZEN h_{t-1} read by every gate of step t (reading FH
   // mid-loop would leak a freshly-updated channel into a later channel's gate).
   FHprev.Fill(0);
+  HprevPtr := FHprev.GetRawPtr(0, 0, 0);
   for t := 0 to SeqLenM1 do
   begin
     XtPtr := Prev.GetRawPtr(t, 0, 0);
@@ -49266,16 +49267,21 @@ begin
       WigR := Wig.GetRawPtr(d, 0, 0); WioR := Wio.GetRawPtr(d, 0, 0);
       WhiR := Whi.GetRawPtr(d, 0, 0); WhfR := Whf.GetRawPtr(d, 0, 0);
       WhgR := Whg.GetRawPtr(d, 0, 0); WhoR := Who.GetRawPtr(d, 0, 0);
-      accI := Bi.FData[d]; accF := Bf.FData[d];
-      accG := Bg.FData[d]; accO := Bo.FData[d];
-      for j := 0 to DepthM1 do
-      begin
-        xj := XtPtr^[j]; hj := FHprev.FData[j];
-        accI := accI + WiiR^[j] * xj + WhiR^[j] * hj;
-        accF := accF + WifR^[j] * xj + WhfR^[j] * hj;
-        accG := accG + WigR^[j] * xj + WhgR^[j] * hj;
-        accO := accO + WioR^[j] * xj + WhoR^[j] * hj;
-      end;
+      // gate pre-activations: bias + W_i*x_t + W_h*h_{t-1}; each W row is
+      // depth-contiguous (GetRawPtr(d,0,0)) and x_t/FHprev are contiguous, so
+      // the inner accumulation is exactly two AVX dot products per gate.
+      accI := Bi.FData[d]
+            + TNNetVolume.DotProduct(WiiR, XtPtr, Depth)
+            + TNNetVolume.DotProduct(WhiR, HprevPtr, Depth);
+      accF := Bf.FData[d]
+            + TNNetVolume.DotProduct(WifR, XtPtr, Depth)
+            + TNNetVolume.DotProduct(WhfR, HprevPtr, Depth);
+      accG := Bg.FData[d]
+            + TNNetVolume.DotProduct(WigR, XtPtr, Depth)
+            + TNNetVolume.DotProduct(WhgR, HprevPtr, Depth);
+      accO := Bo.FData[d]
+            + TNNetVolume.DotProduct(WioR, XtPtr, Depth)
+            + TNNetVolume.DotProduct(WhoR, HprevPtr, Depth);
       iv := Sigmoid(accI); fv := Sigmoid(accF);
       gv := pcr_tanhf(accG); ovv := Sigmoid(accO);
       if t > 0 then cPrev := FC.FData[baseT - Depth + d] else cPrev := 0;
@@ -49367,24 +49373,25 @@ begin
       GWigR := FGradW[2].GetRawPtr(d, 0, 0); GWioR := FGradW[3].GetRawPtr(d, 0, 0);
       GWhiR := FGradW[4].GetRawPtr(d, 0, 0); GWhfR := FGradW[5].GetRawPtr(d, 0, 0);
       GWhgR := FGradW[6].GetRawPtr(d, 0, 0); GWhoR := FGradW[7].GetRawPtr(d, 0, 0);
-      for j := 0 to DepthM1 do
-      begin
-        GWiiR^[j] := GWiiR^[j] + gpreI * XtPtr^[j];
-        GWifR^[j] := GWifR^[j] + gpreF * XtPtr^[j];
-        GWigR^[j] := GWigR^[j] + gpreG * XtPtr^[j];
-        GWioR^[j] := GWioR^[j] + gpreO * XtPtr^[j];
-      end;
+      // input-weight gradient: GW_i[d][:] += gpre * x_t (depth-contiguous MulAdd)
+      TNNetVolume.MulAdd(GWiiR, XtPtr, gpreI, Depth);
+      TNNetVolume.MulAdd(GWifR, XtPtr, gpreF, Depth);
+      TNNetVolume.MulAdd(GWigR, XtPtr, gpreG, Depth);
+      TNNetVolume.MulAdd(GWioR, XtPtr, gpreO, Depth);
       if t > 0 then
+      begin
+        // recurrent-weight gradient: GW_h[d][:] += gpre * h_{t-1}
+        TNNetVolume.MulAdd(GWhiR, hPrevPtr, gpreI, Depth);
+        TNNetVolume.MulAdd(GWhfR, hPrevPtr, gpreF, Depth);
+        TNNetVolume.MulAdd(GWhgR, hPrevPtr, gpreG, Depth);
+        TNNetVolume.MulAdd(GWhoR, hPrevPtr, gpreO, Depth);
+        // dL/dh_{t-1} mixes four scaled W_h rows into one accumulator: not a
+        // single MulAdd, kept scalar.
         for j := 0 to DepthM1 do
-        begin
-          GWhiR^[j] := GWhiR^[j] + gpreI * hPrevPtr^[j];
-          GWhfR^[j] := GWhfR^[j] + gpreF * hPrevPtr^[j];
-          GWhgR^[j] := GWhgR^[j] + gpreG * hPrevPtr^[j];
-          GWhoR^[j] := GWhoR^[j] + gpreO * hPrevPtr^[j];
           GhNextPtr^[j] := GhNextPtr^[j] +
             gpreI * WhiR^[j] + gpreF * WhfR^[j] +
             gpreG * WhgR^[j] + gpreO * WhoR^[j];
-        end;
+      end;
       if hasInputGrad then
         for j := 0 to DepthM1 do
           PrevErrPtr^[j] := PrevErrPtr^[j] +
@@ -49494,8 +49501,8 @@ var
   Wir, Wiz, Win, Whr, Whz, Whn, Br, Bz, Bin, Bhn, Prev: TNNetVolume;
   SeqLen, Depth, t, d, j, baseT: integer;
   SeqLenM1, DepthM1: integer;
-  accR, accZ, accIn, accHn, xj, hj, rv, zv, nv, whnv, hPrev: TNeuralFloat;
-  XtPtr, OutPtr: TNeuralFloatArrPtr;
+  accR, accZ, accIn, accHn, rv, zv, nv, whnv, hPrev: TNeuralFloat;
+  XtPtr, OutPtr, HprevPtr: TNeuralFloatArrPtr;
   WirR, WizR, WinR, WhrR, WhzR, WhnR: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
@@ -49508,6 +49515,7 @@ begin
   SeqLen := FOutput.SizeX; Depth := FOutput.Depth;
   SeqLenM1 := SeqLen - 1; DepthM1 := Depth - 1;
   FHprev.Fill(0);  // frozen h_{t-1} read by every gate of step t
+  HprevPtr := FHprev.GetRawPtr(0, 0, 0);
   for t := 0 to SeqLenM1 do
   begin
     XtPtr := Prev.GetRawPtr(t, 0, 0);
@@ -49518,16 +49526,17 @@ begin
       WirR := Wir.GetRawPtr(d, 0, 0); WizR := Wiz.GetRawPtr(d, 0, 0);
       WinR := Win.GetRawPtr(d, 0, 0); WhrR := Whr.GetRawPtr(d, 0, 0);
       WhzR := Whz.GetRawPtr(d, 0, 0); WhnR := Whn.GetRawPtr(d, 0, 0);
-      accR := Br.FData[d]; accZ := Bz.FData[d];
-      accIn := Bin.FData[d]; accHn := Bhn.FData[d];
-      for j := 0 to DepthM1 do
-      begin
-        xj := XtPtr^[j]; hj := FHprev.FData[j];
-        accR := accR + WirR^[j] * xj + WhrR^[j] * hj;
-        accZ := accZ + WizR^[j] * xj + WhzR^[j] * hj;
-        accIn := accIn + WinR^[j] * xj;
-        accHn := accHn + WhnR^[j] * hj;
-      end;
+      // gate pre-activations are depth-contiguous bias + W_i*x_t (+ W_h*h_{t-1}).
+      // r,z each take two dots; the candidate's input (W_in*x) and recurrent
+      // (W_hn*h, kept SEPARATE so r_t can gate it) parts are one dot apiece.
+      accR := Br.FData[d]
+            + TNNetVolume.DotProduct(WirR, XtPtr, Depth)
+            + TNNetVolume.DotProduct(WhrR, HprevPtr, Depth);
+      accZ := Bz.FData[d]
+            + TNNetVolume.DotProduct(WizR, XtPtr, Depth)
+            + TNNetVolume.DotProduct(WhzR, HprevPtr, Depth);
+      accIn := Bin.FData[d] + TNNetVolume.DotProduct(WinR, XtPtr, Depth);
+      accHn := Bhn.FData[d] + TNNetVolume.DotProduct(WhnR, HprevPtr, Depth);
       rv := Sigmoid(accR); zv := Sigmoid(accZ);
       whnv := accHn;                    // W_hn h_{t-1} + b_hn
       nv := pcr_tanhf(accIn + rv * whnv);
@@ -49611,21 +49620,22 @@ begin
       GWirR := FGradW[0].GetRawPtr(d, 0, 0); GWizR := FGradW[1].GetRawPtr(d, 0, 0);
       GWinR := FGradW[2].GetRawPtr(d, 0, 0); GWhrR := FGradW[3].GetRawPtr(d, 0, 0);
       GWhzR := FGradW[4].GetRawPtr(d, 0, 0); GWhnR := FGradW[5].GetRawPtr(d, 0, 0);
-      for j := 0 to DepthM1 do
-      begin
-        GWirR^[j] := GWirR^[j] + gpreR * XtPtr^[j];
-        GWizR^[j] := GWizR^[j] + gpreZ * XtPtr^[j];
-        GWinR^[j] := GWinR^[j] + gpreN * XtPtr^[j];
-      end;
+      // input-weight gradient: GW_i[d][:] += gpre * x_t (depth-contiguous MulAdd)
+      TNNetVolume.MulAdd(GWirR, XtPtr, gpreR, Depth);
+      TNNetVolume.MulAdd(GWizR, XtPtr, gpreZ, Depth);
+      TNNetVolume.MulAdd(GWinR, XtPtr, gpreN, Depth);
       if t > 0 then
+      begin
+        // recurrent-weight gradient: GW_h[d][:] += gpre * h_{t-1}
+        TNNetVolume.MulAdd(GWhrR, hPrevPtr, gpreR, Depth);
+        TNNetVolume.MulAdd(GWhzR, hPrevPtr, gpreZ, Depth);
+        TNNetVolume.MulAdd(GWhnR, hPrevPtr, gwhn, Depth);
+        // dL/dh_{t-1} mixes three scaled W_h rows into one accumulator: not a
+        // single MulAdd, kept scalar.
         for j := 0 to DepthM1 do
-        begin
-          GWhrR^[j] := GWhrR^[j] + gpreR * hPrevPtr^[j];
-          GWhzR^[j] := GWhzR^[j] + gpreZ * hPrevPtr^[j];
-          GWhnR^[j] := GWhnR^[j] + gwhn  * hPrevPtr^[j];
           GhNextPtr^[j] := GhNextPtr^[j] +
             gpreR * WhrR^[j] + gpreZ * WhzR^[j] + gwhn * WhnR^[j];
-        end;
+      end;
       if hasInputGrad then
         for j := 0 to DepthM1 do
           PrevErrPtr^[j] := PrevErrPtr^[j] +
