@@ -1698,6 +1698,19 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       MaxPool input-gradient test staying green and the pooled output staying
       bit-identical to the scalar path (max is exact — no reassociation), on both
       scalar-fallback and real -dAVX2 builds.
+      DONE (commit fa3b33e9): new `TNNetVolume.MaxElements(PtrA, PtrB, pSize)`
+      depth-contiguous element-wise max primitive (named `MaxElements`, NOT `Max`,
+      to avoid shadowing the global `Math.Max` used ~34× in neuralvolume.pas;
+      AVXMax via `vmaxps`/`maxps` in both AVX32 + AVX64/AVX512 blocks, scalar
+      fallback), `TNNetMaxPool` forward (both stride paths) folds each window strip
+      over depth via it; bit-EXACT parity (delta 0) in `TestMaxPoolVectorizedExactParity`.
+      DELIBERATE SKIP: the backward argmax SCATTER stays scalar — each depth channel
+      records its own winning (X,Y) and the gradient gathers from independent
+      positions, which can't be SIMD'd without a gather; the value reduction is
+      vectorized, the index tracking is a scalar pre-pass preserving the original
+      strict-`>` first-winner tie-break exactly. Not worth a gather rewrite.
+      REUSE NOTE: `TNNetVolume.MaxElements` is now available for any other
+      depth-contiguous max reduction (e.g. a future `TNNetMaxChannel` forward AVX pass).
 
 ## Tests / numerical-gradient audit
 
