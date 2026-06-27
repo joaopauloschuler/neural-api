@@ -3445,6 +3445,26 @@ type
     procedure Gather(Src: TNNetVolume; Corners, Weights: TNNetVolume;
       Dst: TNNetVolume; NumOut, Depth: integer);
   end;
+
+  /// OpenCL forward helper for the per-token depth-axis normalization layers
+  // TNNetTokenRMSNorm (UseMean=false) and TNNetTokenLayerNorm (UseMean=true).
+  // Binds the cai_token_norm entry point on the shared dot-product program's
+  // device, uploads the token tensor + gain (+ bias) weights, runs one
+  // work-item per token and reads the normalized result back.
+  // Coded by Claude (AI).
+  TNNetTokenNormCL = class(TMObject)
+  private
+    FKernel: TNeuralKernel;
+    FXBuf, FYBuf: TNNetVolume; // host staging for the input/output token tensor
+  public
+    constructor Create(DotProductKernel: TDotProductKernel);
+    destructor Destroy(); override;
+    // X holds NumTokens*Depth values [t*Depth + c]; Gain/Bias are Depth long
+    // (Bias may be nil when UseMean is false). Y receives the normalized output
+    // in the same layout. Eps matches the layer's serialized epsilon.
+    procedure Normalize(X: TNNetVolume; Gain, Bias: TNNetVolume; Y: TNNetVolume;
+      NumTokens, Depth: integer; UseMean: boolean; Eps: TNeuralFloat);
+  end;
   {$ENDIF}
 
   /// Affine Grid Sampler -- the differentiable bilinear grid-sampling core of a
@@ -5958,6 +5978,10 @@ type
       FCentered: TNNetVolume;     // per-token (x - mean) scratch, Depth-length
       FGammaGradScratch: TNNetVolume; // Depth-length backward gamma-grad accumulator
       FBetaGradScratch: TNNetVolume;  // Depth-length backward beta-grad accumulator
+      {$IFDEF OpenCL}
+      FTokenNormCL: TNNetTokenNormCL;
+      procedure ComputeOpenCL();
+      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); overload; override;
@@ -5966,6 +5990,9 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+      {$IFDEF OpenCL}
+      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      {$ENDIF}
   end;
 
   /// This layer does per-sample root-mean-square layer normalization. Each
@@ -6009,6 +6036,10 @@ type
       FNormalized: TNNetVolume;   // x_hat = x * invRMS, same shape as input
       FInvRMS: TNNetVolume;       // per-token 1/sqrt(mean(x^2)+eps), X x Y x 1
       FGainGradScratch: TNNetVolume; // Depth-length backward gain-grad accumulator
+      {$IFDEF OpenCL}
+      FTokenNormCL: TNNetTokenNormCL;
+      procedure ComputeOpenCL();
+      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); overload; override;
@@ -6017,6 +6048,9 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+      {$IFDEF OpenCL}
+      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      {$ENDIF}
   end;
 
   /// Llama-4 NoPE attention temperature tuning (arXiv:2501.19399, "Scaling
@@ -28735,6 +28769,67 @@ begin
   clReleaseMemObject(bufCorner);
   clReleaseMemObject(bufWeight);
   clReleaseMemObject(bufDst);
+end;
+
+{ TNNetTokenNormCL }
+
+constructor TNNetTokenNormCL.Create(DotProductKernel: TDotProductKernel);
+begin
+  inherited Create();
+  // Reuse the shared dot-product kernel's already-compiled neural.cl program /
+  // device / platform, just bind our own kernel entry point.
+  FKernel := TNeuralKernel.Create(
+    DotProductKernel.CurrentPlatform, DotProductKernel.CurrentDevice,
+    'cai_token_norm');
+  FKernel.HideMessages();
+  FXBuf := TNNetVolume.Create();
+  FYBuf := TNNetVolume.Create();
+end;
+
+destructor TNNetTokenNormCL.Destroy();
+begin
+  FXBuf.Free;
+  FYBuf.Free;
+  FKernel.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetTokenNormCL.Normalize(X: TNNetVolume; Gain, Bias: TNNetVolume;
+  Y: TNNetVolume; NumTokens, Depth: integer; UseMean: boolean; Eps: TNeuralFloat);
+var
+  bufX, bufY, bufGain, bufBias: cl_mem;
+  k: cl_kernel;
+  iUseMean: longint;
+  fEps: single;
+  BiasSrc: TNNetVolume;
+begin
+  k := FKernel.Kernel;
+  if UseMean then iUseMean := 1 else iUseMean := 0;
+  fEps := Eps;
+  // Upload the token tensor + the per-channel gain/bias weights; allocate the
+  // device result. The bias buffer is always created (the kernel ignores it when
+  // UseMean is false) so the argument is never an invalid handle.
+  bufX    := FKernel.CreateAndWriteBuffer(X);
+  bufGain := FKernel.CreateAndWriteBuffer(Gain);
+  if Assigned(Bias) then BiasSrc := Bias else BiasSrc := Gain;
+  bufBias := FKernel.CreateAndWriteBuffer(BiasSrc);
+  bufY    := FKernel.CreateOutputBuffer(Y);
+  clSetKernelArg(k, 0, SizeOf(longint), @NumTokens);
+  clSetKernelArg(k, 1, SizeOf(longint), @Depth);
+  clSetKernelArg(k, 2, SizeOf(longint), @iUseMean);
+  clSetKernelArg(k, 3, SizeOf(single), @fEps);
+  clSetKernelArg(k, 4, SizeOf(cl_mem), @bufGain);
+  clSetKernelArg(k, 5, SizeOf(cl_mem), @bufBias);
+  clSetKernelArg(k, 6, SizeOf(cl_mem), @bufX);
+  clSetKernelArg(k, 7, SizeOf(cl_mem), @bufY);
+  // One work-item per token.
+  FKernel.RunKernel(k, NumTokens);
+  FKernel.Finish();
+  FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  clReleaseMemObject(bufX);
+  clReleaseMemObject(bufGain);
+  clReleaseMemObject(bufBias);
+  clReleaseMemObject(bufY);
 end;
 {$ENDIF}
 
@@ -57732,6 +57827,9 @@ end;
 
 destructor TNNetTokenLayerNorm.Destroy();
 begin
+  {$IFDEF OpenCL}
+  if Assigned(FTokenNormCL) then FreeAndNil(FTokenNormCL);
+  {$ENDIF}
   FBetaGradScratch.Free;
   FGammaGradScratch.Free;
   FCentered.Free;
@@ -57771,6 +57869,17 @@ begin
   StartTime := Now();
   inherited Compute;
   Depth := FOutput.Depth;
+  {$IFDEF OpenCL}
+  // Device forward keeps the per-token activation resident on the GPU between
+  // attention/FFN blocks (forward-only; training stays on the CPU path below).
+  if FHasOpenCL and FShouldOpenCL and Assigned(FTokenNormCL) and
+     (Int64(FOutput.Size) >= NeuralConvOpenCLMinWork) then
+  begin
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  {$ENDIF}
   // Token index runs over the flattened (X, Y) positions; the Depth axis is
   // contiguous in memory, so token t occupies FData[t*Depth .. t*Depth+Depth-1].
   // Each per-token segment is depth-contiguous, so the mean / variance
@@ -57807,6 +57916,29 @@ begin
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
+
+{$IFDEF OpenCL}
+procedure TNNetTokenLayerNorm.EnableOpenCL(DotProductKernel: TDotProductKernel);
+begin
+  FHasOpenCL := true;
+  FDotProductKernel := DotProductKernel;
+  if not Assigned(FTokenNormCL) then
+    FTokenNormCL := TNNetTokenNormCL.Create(DotProductKernel);
+  FShouldOpenCL := true;
+end;
+
+// Device per-token LayerNorm forward (mean+variance reduction over the Depth
+// axis, then gamma .* x_hat + beta), bit-faithful to the scalar Compute() above.
+procedure TNNetTokenLayerNorm.ComputeOpenCL();
+var
+  Depth, NumTokens: integer;
+begin
+  Depth := FOutput.Depth;
+  NumTokens := FOutput.Size div Depth;
+  FTokenNormCL.Normalize(FOutput, FNeurons[0].FWeights, FNeurons[1].FWeights,
+    FOutput, NumTokens, Depth, {UseMean=}true, FTokenLNEpsilon);
+end;
+{$ENDIF}
 
 procedure TNNetTokenLayerNorm.Backpropagate();
 var
@@ -58017,6 +58149,9 @@ end;
 
 destructor TNNetTokenRMSNorm.Destroy();
 begin
+  {$IFDEF OpenCL}
+  if Assigned(FTokenNormCL) then FreeAndNil(FTokenNormCL);
+  {$ENDIF}
   FGainGradScratch.Free;
   FInvRMS.Free;
   FNormalized.Free;
@@ -58047,6 +58182,17 @@ begin
   StartTime := Now();
   inherited Compute;
   Depth := FOutput.Depth;
+  {$IFDEF OpenCL}
+  // Device forward keeps the per-token activation resident on the GPU between
+  // attention/FFN blocks (forward-only; training stays on the CPU path below).
+  if FHasOpenCL and FShouldOpenCL and Assigned(FTokenNormCL) and
+     (Int64(FOutput.Size) >= NeuralConvOpenCLMinWork) then
+  begin
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  {$ENDIF}
   // Token index runs over the flattened (X, Y) positions; the Depth axis is
   // contiguous in memory, so token t occupies FData[t*Depth .. t*Depth+Depth-1].
   // Each per-token segment is depth-contiguous, so the sum-of-squares reduction
@@ -58074,6 +58220,29 @@ begin
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
+
+{$IFDEF OpenCL}
+procedure TNNetTokenRMSNorm.EnableOpenCL(DotProductKernel: TDotProductKernel);
+begin
+  FHasOpenCL := true;
+  FDotProductKernel := DotProductKernel;
+  if not Assigned(FTokenNormCL) then
+    FTokenNormCL := TNNetTokenNormCL.Create(DotProductKernel);
+  FShouldOpenCL := true;
+end;
+
+// Device per-token RMSNorm forward (sum-of-squares reduction over the Depth axis,
+// no mean subtraction, then gain .* x_hat), bit-faithful to the scalar Compute().
+procedure TNNetTokenRMSNorm.ComputeOpenCL();
+var
+  Depth, NumTokens: integer;
+begin
+  Depth := FOutput.Depth;
+  NumTokens := FOutput.Size div Depth;
+  FTokenNormCL.Normalize(FOutput, FNeurons[0].FWeights, nil,
+    FOutput, NumTokens, Depth, {UseMean=}false, FTokenRMSEpsilon);
+end;
+{$ENDIF}
 
 procedure TNNetTokenRMSNorm.Backpropagate();
 var

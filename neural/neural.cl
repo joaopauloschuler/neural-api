@@ -572,3 +572,67 @@ __kernel void cai_bilinear_gather
   }
   FDst[g_id] = acc;
 }
+
+// CAI Per-Token Norm (RMSNorm / LayerNorm forward)
+// Coded by Claude (AI).
+// Device forward for the per-TOKEN depth-axis normalization layers
+// TNNetTokenRMSNorm and TNNetTokenLayerNorm. The input is a sequence of tokens
+// laid out with the feature vector CONTIGUOUS on the Depth axis: token t occupies
+// FX[t*FDepth .. t*FDepth + FDepth-1]. Each token is normalized INDEPENDENTLY
+// over its FDepth elements, then a per-channel gain (and, for LayerNorm, a bias)
+// is applied. This reproduces the exact scalar arithmetic of the CPU Compute():
+//   FUseMean == 0 (RMSNorm, no mean subtraction):
+//     ms      = mean(x^2)
+//     invStd  = 1/sqrt(ms + FEps)
+//     y[c]    = FGain[c] * (x[c] * invStd)
+//   FUseMean == 1 (LayerNorm):
+//     mean    = mean(x)
+//     var     = mean((x-mean)^2)
+//     invStd  = 1/sqrt(var + FEps)
+//     y[c]    = FGain[c] * ((x[c]-mean) * invStd) + FBias[c]
+//   FGain : per-channel gain weights, FDepth long.
+//   FBias : per-channel bias weights, FDepth long (ignored when FUseMean == 0).
+//   FX    : input tokens, raw [t*FDepth + c].
+//   FY    : output tokens, raw [t*FDepth + c].
+// One work-item per TOKEN: global size = FNumTokens (dim 0). Keeping the whole
+// per-token reduction inside a single work-item keeps the depth-axis sum order
+// close to the scalar path (parity well under 1e-4).
+__kernel void cai_token_norm
+(
+  const int FNumTokens,
+  const int FDepth,
+  const int FUseMean,
+  const float FEps,
+  __global const float* FGain,
+  __global const float* FBias,
+  __global const float* FX,
+  __global float* FY
+)
+{
+  const int t = get_global_id(0);
+  if (t >= FNumTokens) return;
+  const int base = t * FDepth;
+  float mean = 0.0f;
+  if (FUseMean != 0)
+  {
+    float s = 0.0f;
+    for (int c = 0; c < FDepth; c++) s += FX[base + c];
+    mean = s / (float)FDepth;
+  }
+  // reduction: sum of squares (RMS) or sum of centered squares (LayerNorm var)
+  float ss = 0.0f;
+  for (int c = 0; c < FDepth; c++)
+  {
+    const float v = FX[base + c] - mean;
+    ss = mad(v, v, ss);
+  }
+  const float invStd = 1.0f / sqrt(ss / (float)FDepth + FEps);
+  for (int c = 0; c < FDepth; c++)
+  {
+    const float xhat = (FX[base + c] - mean) * invStd;
+    if (FUseMean != 0)
+      FY[base + c] = mad(FGain[c], xhat, FBias[c]);
+    else
+      FY[base + c] = FGain[c] * xhat;
+  }
+}
