@@ -38800,6 +38800,46 @@ begin
     for o := 0 to OutCh - 1 do
       OutSig[o][OutBase + t] := Bias[o] + FConvResMat.FData[t * OutCh + o];
 end;
+
+// Runs the ConvTranspose1d (upsample) in-channel contraction on the OpenCL
+// device, returning the result matrix Res[t*(OutCh*K) + (o*K+k2)] in FConvResMat.
+// This is the SAME shared dot-product GEMM the forward path uses, only the
+// operands are the transposed-im2col buffers the AVX path already builds:
+//   InT  packs InSig as [t*InCh + i]            (each t-column InCh-contiguous)
+//   WT   packs W    as [(o*K+k2)*InCh + i]      (each (o,k2) tap InCh-contiguous)
+// so the per-(o,t,k2) in-channel contraction sum_i WT*InT is one GEMM with
+//   As (interleaved) = WT repacked [i*(OutCh*K) + (o*K+k2)]
+//   Bs (contiguous)  = InT                       (already the kernel's B layout)
+//   Size = InCh, rows N = OutCh*K, columns = InLen.
+// The CALLER then scatters Res into its overlap-add buffer at stride positions
+// (the only twist over the forward path). Caller has screened the work size.
+// Coded by Claude (AI).
+procedure RunConvTransposeGemmOpenCL(const WT, InT: TNeuralFloatDynArr;
+  OutCh, K, InCh, InLen: integer);
+var
+  o, i, k2, t, rows, row: integer;
+begin
+  rows := OutCh * K;
+  // Interleave WT[(o*K+k2)*InCh + i] -> As[i*rows + (o*K+k2)].
+  FConvWInter.ReSize(rows * InCh, 1, 1);
+  for o := 0 to OutCh - 1 do
+    for k2 := 0 to K - 1 do
+    begin
+      row := o * K + k2;
+      for i := 0 to InCh - 1 do
+        FConvWInter.FData[i * rows + row] := WT[row * InCh + i];
+    end;
+  // B = InT directly: [t*InCh + i], one column per input timestep.
+  FConvPatchMat.ReSize(InLen * InCh, 1, 1);
+  for t := 0 to InLen - 1 do
+    for i := 0 to InCh - 1 do
+      FConvPatchMat.FData[t * InCh + i] := InT[t * InCh + i];
+  FConvResMat.ReSize(InLen * rows, 1, 1);
+  FConvDotCL.PrepareForCompute(FConvWInter, FConvPatchMat, InCh);
+  FConvDotCL.Compute(FConvWInter, FConvPatchMat, {ActFN}0, true, true);
+  FConvDotCL.FinishAndLoadResult(FConvResMat, 0);
+  // FConvResMat now holds Res[t*rows + (o*K+k2)] = sum_i WT*InT; caller scatters.
+end;
 {$ENDIF}
 
 type
@@ -39074,6 +39114,27 @@ begin
       for k2 := 0 to KM1 do
         for i := 0 to InChM1 do
           WT[(o * K + k2) * InCh + i] := Conv.W[i * OutCh * K + o * K + k2];
+    {$IFDEF OpenCL}
+    // Opt-in OpenCL fast path: the per-(o,t,k2) in-channel contraction is one
+    // device GEMM (same shared dot-product kernel as the forward path), then the
+    // result scatters into the overlap-add buffer Full at stride positions. Same
+    // arithmetic as the AVX DotProduct transpose (parity < 1e-4). Coded by
+    // Claude (AI).
+    if ConvOpenCLEnabled() and (InLen > 0) and
+       (Int64(OutCh) * K * InLen * InCh >= FConvOpenCLMinWork) then
+    begin
+      RunConvTransposeGemmOpenCL(WT, InT, OutCh, K, InCh, InLen);
+      for o := 0 to OutChM1 do
+        for t := 0 to InLenM1 do
+          for k2 := 0 to KM1 do
+          begin
+            idx := t * Stride + k2;
+            Full[o][idx] := Full[o][idx] +
+              FConvResMat.FData[t * (OutCh * K) + (o * K + k2)];
+          end;
+    end
+    else
+    {$ENDIF}
     // Parallelized over output channels: each thread owns a disjoint set of
     // Full[o] arrays (race-free). Tiny convs run inline.
     if (Pool <> nil) and (Pool.Count > 1) and (OutCh >= 4) and (InLen >= 512) then
@@ -41974,6 +42035,28 @@ begin
       for k2 := 0 to KM1 do
         for i := 0 to InChM1 do
           WT[(o * K + k2) * InCh + i] := Conv.W[i * OutCh * K + o * K + k2];
+    {$IFDEF OpenCL}
+    // Opt-in OpenCL fast path: the per-(o,t,k2) in-channel contraction is one
+    // device GEMM (shared dot-product kernel), then the result scatters into the
+    // bias-preset OutSig at stride positions (Pad-trimmed). Same arithmetic as
+    // the AVX DotProduct transpose (parity < 1e-4). Coded by Claude (AI).
+    if ConvOpenCLEnabled() and (InLen > 0) and
+       (Int64(OutCh) * K * InLen * InCh >= FConvOpenCLMinWork) then
+    begin
+      RunConvTransposeGemmOpenCL(WT, InT, OutCh, K, InCh, InLen);
+      for o := 0 to OutChM1 do
+        for t := 0 to InLenM1 do
+          for k2 := 0 to KM1 do
+          begin
+            idx := t * Stride + k2;     // index into the FullLen buffer
+            val := idx - Pad;           // index into the trimmed output
+            if (val >= 0) and (val < OutLen) then
+              OutSig[o][val] := OutSig[o][val] +
+                FConvResMat.FData[t * (OutCh * K) + (o * K + k2)];
+          end;
+      Exit;
+    end;
+    {$ENDIF}
     for o := 0 to OutChM1 do
       for t := 0 to InLenM1 do
         for k2 := 0 to KM1 do

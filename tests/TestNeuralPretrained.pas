@@ -341,6 +341,12 @@ type
     // when built without -dOpenCL or when no OpenCL device is present. Gates the
     // opt-in EnableConvOpenCL path wired into RunEnCodecConv / RunHiFiGANConv.
     procedure TestEnCodecOpenCLConvParity;
+    // OpenCL parity: synthesizes the HiFi-GAN fixture with the conv1d/
+    // ConvTranspose1d OpenCL offload ARMED (the upsamplers are ConvTranspose1d),
+    // and asserts the waveform matches the CPU decode within 1e-4. SKIPs cleanly
+    // without -dOpenCL or without an OpenCL device. Gates the transpose offload
+    // wired into RunHiFiGANConv.
+    procedure TestHiFiGANOpenCLConvParity;
     // Mimi: round-trips three pinned waveforms through the imported Mimi codec
     // (waveform -> conv encoder -> RoPE transformer -> downsample -> split
     // semantic/acoustic RVQ -> codes -> ... -> waveform) and asserts the codes
@@ -13772,6 +13778,119 @@ begin
     // The OpenCL GEMM is the same im2col arithmetic as the AVX DotProduct path;
     // parity must hold to the same 1e-4 importer gate. NEVER loosen.
     AssertTrue('EnCodec OpenCL-conv vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    DisableConvOpenCL();
+    Model.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+{$ELSE}
+begin
+  // Built without -dOpenCL: nothing to verify, the CPU path is the only path.
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralPretrained.TestHiFiGANOpenCLConvParity;
+{$IFDEF OpenCL}
+var
+  Model: TNNetHiFiGAN;
+  Config: THiFiGANConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Clips, Clip, MelArr, MelRow: TJSONArray;
+  Mel: array of TNeuralFloatDynArr;
+  WaveCPU, WaveCL: TNeuralFloatDynArr;
+  Frames, Bands, ci, b, t, i: integer;
+  Diff, MaxDiff: double;
+  EasyCL: TEasyOpenCL;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+begin
+  // Acquire the first OpenCL device; SKIP (pass) cleanly if none.
+  EasyCL := TEasyOpenCL.Create();
+  try
+    if EasyCL.GetPlatformCount() = 0 then
+    begin
+      AssertTrue('no OpenCL platform: SKIP', true);
+      Exit;
+    end;
+    EasyCL.SetCurrentPlatform(EasyCL.PlatformIds[0]);
+    if EasyCL.GetDeviceCount() = 0 then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    EasyCL.SetCurrentDevice(EasyCL.Devices[0]);
+    PlatformId := EasyCL.PlatformIds[0];
+    DeviceId := EasyCL.Devices[0];
+  finally
+    EasyCL.Free;
+  end;
+
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  DisableConvOpenCL(); // start from a known OFF state
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_hifigan_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Clips := TJSONArray(TJSONObject(RefRoot).Find('clips'));
+    AssertTrue('clips present', Clips <> nil);
+
+    Model := BuildHiFiGANFromSafeTensors(
+      FixturePath('tiny_hifigan.safetensors'), Config,
+      FixturePath('tiny_hifigan_config.json'));
+    AssertTrue('vocoder built', Model <> nil);
+
+    MaxDiff := 0;
+    for ci := 0 to Clips.Count - 1 do
+    begin
+      Clip := TJSONArray(Clips.Items[ci]);
+      MelArr := TJSONArray(TJSONObject(Clip).Find('mel'));
+      Frames := MelArr.Count;
+      Bands := TJSONArray(MelArr.Items[0]).Count;
+      SetLength(Mel, Bands);
+      for b := 0 to Bands - 1 do SetLength(Mel[b], Frames);
+      for t := 0 to Frames - 1 do
+      begin
+        MelRow := TJSONArray(MelArr.Items[t]);
+        for b := 0 to Bands - 1 do Mel[b][t] := MelRow.Items[b].AsFloat;
+      end;
+
+      // CPU synthesis (OpenCL OFF).
+      AssertFalse('OpenCL must start OFF', ConvOpenCLEnabled());
+      Model.Synthesize(Mel, WaveCPU);
+
+      // OpenCL synthesis (offload ARMED for the conv runners, incl. the
+      // ConvTranspose1d upsamplers). MinWork 0 forces every conv onto the device
+      // so the transpose GEMM is genuinely exercised on the tiny fixture.
+      // EnableConvOpenCL self-tests the device kernel and stays OFF (graceful CPU
+      // fallback) if it can't compute (e.g. neural.cl not reachable); in that case
+      // WaveCL is a second CPU decode and the parity below is trivially exact.
+      EnableConvOpenCL(PlatformId, DeviceId);
+      SetConvOpenCLMinWork(0);
+      try
+        Model.Synthesize(Mel, WaveCL);
+      finally
+        DisableConvOpenCL();
+        SetConvOpenCLMinWork(1 shl 20); // restore the default threshold
+      end;
+
+      AssertEquals('CPU/OpenCL waveform length match',
+        Length(WaveCPU), Length(WaveCL));
+      for i := 0 to Length(WaveCPU) - 1 do
+      begin
+        Diff := Abs(WaveCPU[i] - WaveCL[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    // The OpenCL transpose GEMM is the same overlap-add arithmetic as the AVX
+    // DotProduct path; parity must hold to the 1e-4 importer gate. NEVER loosen.
+    AssertTrue('HiFi-GAN OpenCL-conv vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     DisableConvOpenCL();

@@ -799,9 +799,20 @@ rather than acted on.
         source `neural.cl` is not reachable from the run dir (added `../neural` and
         `../../neural` repo-relative lookups so the tests/examples dirs find it).
         REMAINING:
-    - [ ] OpenCL offload of the ConvTranspose1d (upsample) overlap-add accumulation
+    - [X] OpenCL offload of the ConvTranspose1d (upsample) overlap-add accumulation
           (EnCodec + HiFiGAN/Vits); the per-(o,k2)-tap in-channel contraction is the
           same shared-kernel-shaped GEMM but scatters into an overlap-add buffer.
+          DONE: RunConvTransposeGemmOpenCL runs the transposed-im2col GEMM as ONE
+          TDotProductSharedKernel call (As = WT repacked [i*(OutCh*K)+(o*K+k2)],
+          Bs = InT [t*InCh+i], Size=InCh, rows=OutCh*K, cols=InLen); the result
+          Res[t*(OutCh*K)+(o*K+k2)] then scatters overlap-add into Full (EnCodec)
+          / bias-preset Pad-trimmed OutSig (HiFiGAN) at stride positions. Same
+          opt-in EnableConvOpenCL / SetConvOpenCLMinWork gate + ConvOpenCLSelfTest
+          graceful-fallback as the forward path; AVX/CPU stays the fallback.
+          TestEnCodecOpenCLConvParity (decoder upsamplers) + new
+          TestHiFiGANOpenCLConvParity exercise the genuine PoCL FP32 device path
+          (ConvOpenCLEnabled=TRUE): EnCodec end-to-end max|diff| 5.96e-8, HiFiGAN
+          1.79e-7, both << 1e-4. Full suite green on default AND -dOpenCL builds.
     - [ ] OpenCL offload of the Mimi (`RunMimiConv`) / DAC (`RunDACConv`) holders —
           blocked on a Double-precision shared dot-product kernel (their oracle gate
           is `< 1e-4` against a float64 reference; a Float kernel would not hold it).
