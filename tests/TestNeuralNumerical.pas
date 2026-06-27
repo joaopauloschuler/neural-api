@@ -7217,6 +7217,139 @@ begin
   end;
 end;
 
+// Shared input + weight central-difference gradient check. Builds a 1-layer net
+// (Input -> ALayer), then:
+//   1. checks every INPUT cell's analytic gradient (TNNetInput.OutputError)
+//      against the central finite difference, and
+//   2. checks every WEIGHT of every neuron's analytic gradient (-Delta, valid
+//      because LearningRate=1 and batch update is on) against the central
+//      finite difference.
+// The input half matches the seeding/epsilon of LayerInputGradientCheck exactly
+// so converting an existing input-only test to this helper is a true drop-in.
+// Weightless layers simply skip the weight loop. ALayer is owned by the net.
+//
+// AUseDoubleAccumulator opts the loss sum-of-squares into Double precision (eps
+// and Tolerance stay TNeuralFloat). This is the accumulator promoted out of the
+// former DeMaxPoolFamilyGradientCheck: float32 layers where a single output cell
+// carries the whole window error (e.g. max-pool argmax routing) lose ~3 digits
+// in the (lossPlus-lossMinus) subtraction of two near-equal Single sums; summing
+// in Double removes that subtractive-cancellation noise.
+procedure LayerInputAndWeightGradientCheck(ATestCase: TTestCase;
+  ALayer: TNNetLayer; const AName: string;
+  ASizeX, ASizeY, ASizeD: integer;
+  ATolerance: TNeuralFloat = 1e-2;
+  AUseDoubleAccumulator: boolean = false);
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon: TNeuralFloat;
+  lossPlus, lossMinus, numericalGrad: Double;
+  analyticalGrad: TNeuralFloat;
+  i, n, w, neuronCnt, weightCnt: integer;
+  saved: TNeuralFloat;
+
+  function ComputeLoss(AInput: TNNetVolume): Double;
+  var
+    k: integer;
+    diff: Double;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    if AUseDoubleAccumulator then
+    begin
+      // Accumulate in Double so the perturbation-induced delta survives the
+      // sum-of-squares of near-equal terms (float32 subtractive cancellation).
+      for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+      begin
+        diff := Double(NN.GetLastLayer.Output.Raw[k]) - Double(Desired.Raw[k]);
+        Result := Result + 0.5 * diff * diff;
+      end;
+    end
+    else
+    begin
+      // Match LayerInputGradientCheck's TNeuralFloat accumulation exactly.
+      for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+      begin
+        diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+        Result := Result + Double(TNeuralFloat(0.5 * diff * diff));
+      end;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(ASizeX, ASizeY, ASizeD);
+  InputPlus := TNNetVolume.Create(ASizeX, ASizeY, ASizeD);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(ASizeX, ASizeY, ASizeD, 1));
+    NN.AddLayer(ALayer);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    // --- Input-gradient check ---
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      ATestCase.AssertTrue(AName + ' input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < ATolerance);
+    end;
+
+    // --- Weight-gradient check (skipped for weightless layers) ---
+    neuronCnt := ALayer.Neurons.Count;
+    for n := 0 to neuronCnt - 1 do
+    begin
+      weightCnt := ALayer.Neurons[n].Weights.Size;
+      for w := 0 to weightCnt - 1 do
+      begin
+        saved := ALayer.Neurons[n].Weights.Raw[w];
+        ALayer.Neurons[n].Weights.Raw[w] := saved + epsilon;
+        lossPlus := ComputeLoss(Input);
+        ALayer.Neurons[n].Weights.Raw[w] := saved - epsilon;
+        lossMinus := ComputeLoss(Input);
+        ALayer.Neurons[n].Weights.Raw[w] := saved;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        ALayer.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        // LearningRate=1 + batch update => analytic gradient = -Delta.
+        analyticalGrad := -ALayer.Neurons[n].Delta.Raw[w];
+
+        ATestCase.AssertTrue(AName + ' weight gradient check at neuron ' +
+          IntToStr(n) + ' weight ' + IntToStr(w) + ' (num=' +
+          FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+          Abs(numericalGrad - analyticalGrad) < ATolerance);
+      end;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestMinChannelGradientCheck;
 begin
   // TNNetMinChannel reduces (X,Y) per channel to a single min value;
@@ -8108,7 +8241,9 @@ begin
   // shared input cells; with single-precision arithmetic the central-
   // difference vs analytic agreement is ~2e-3 there, so use 5e-3 (still well
   // tighter than the 1e-2 the other pooling gradient checks use).
-  LayerInputGradientCheck(Self, TNNetAdaptiveAvgPool.Create(2),
+  // Converted to the shared LayerInputAndWeightGradientCheck (weightless layer,
+  // input-gradient half only) at the same 0.01 tolerance.
+  LayerInputAndWeightGradientCheck(Self, TNNetAdaptiveAvgPool.Create(2),
     'AdaptiveAvgPool(5->2)', 5, 5, 2, 5e-3);
 end;
 
@@ -8285,8 +8420,14 @@ begin
   // raised to 2e-2 to absorb that subtractive-cancellation noise; the
   // AdaptiveAvgPool check passes at 1e-2 only because its gradient is spread
   // (and smaller) across the window so the cancellation is milder.
-  LayerInputGradientCheck(Self, TNNetAdaptiveMaxPool.Create(2),
-    'AdaptiveMaxPool', 4, 4, 2, 0.02);
+  //
+  // Converted to the shared LayerInputAndWeightGradientCheck with the
+  // Double-precision accumulator opted in: summing the sum-of-squares loss in
+  // Double removes the float32 cancellation noise, so this passes well inside
+  // the historical 0.02 tolerance (kept unchanged). AdaptiveMaxPool is
+  // weightless, so only the input-gradient half runs.
+  LayerInputAndWeightGradientCheck(Self, TNNetAdaptiveMaxPool.Create(2),
+    'AdaptiveMaxPool', 4, 4, 2, 0.02, {AUseDoubleAccumulator=}true);
 end;
 
 procedure TTestNeuralNumerical.TestAdaptiveMaxPoolLoadFromString;
@@ -8510,7 +8651,9 @@ begin
   // Data flow through TNNetExpandDims is pure identity (forward copy, backward
   // copies the OutputError straight back), so the input gradient must equal the
   // finite-difference gradient exactly within numerical noise.
-  LayerInputGradientCheck(Self, TNNetExpandDims.Create(1),
+  // Converted to the shared LayerInputAndWeightGradientCheck (weightless layer,
+  // so only the input-gradient half runs) at the same 0.01 tolerance.
+  LayerInputAndWeightGradientCheck(Self, TNNetExpandDims.Create(1),
     'ExpandDims(axis=1)', 2, 3, 2, 0.01);
 end;
 
@@ -8606,7 +8749,9 @@ begin
   // quadratic in the input, so the FP32 central difference is well-conditioned
   // and the 0.01 default tolerance holds. The 1/(C*H*W) normalization keeps the
   // Gram entries (and hence the gradient magnitude) O(1) for this 3x3x4 shape.
-  LayerInputGradientCheck(Self, TNNetGramMatrix.Create(),
+  // Converted to the shared LayerInputAndWeightGradientCheck (weightless layer,
+  // so only the input-gradient half runs) at the same 0.01 tolerance.
+  LayerInputAndWeightGradientCheck(Self, TNNetGramMatrix.Create(),
     'GramMatrix', 3, 3, 4, 0.01);
 end;
 
@@ -27846,69 +27991,15 @@ begin
 end;
 
 procedure TTestNeuralNumerical.TestReZeroWeightGradientCheck;
-var
-  NN: TNNet;
-  Input, Desired: TNNetVolume;
-  LReZero: TNNetReZero;
-  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
-  i: integer;
-
-  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
-  var
-    k: integer;
-    diff: TNeuralFloat;
-  begin
-    NN.Compute(AInput);
-    Result := 0;
-    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
-    begin
-      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
-      Result := Result + 0.5 * diff * diff;
-    end;
-  end;
-
 begin
-  NN := TNNet.Create();
-  Input := TNNetVolume.Create(3, 2, 2);
-  Desired := TNNetVolume.Create(3, 2, 2);
-  epsilon := 0.0001;
-  try
-    NN.AddLayer(TNNetInput.Create(3, 2, 2, 1));
-    // Non-zero initial alpha so the numerical perturbation samples a
-    // meaningful slope (the gradient itself does not depend on alpha,
-    // but starting at 0 would still work; pick a non-trivial value).
-    LReZero := TNNetReZero.Create(0.4);
-    NN.AddLayer(LReZero);
-    NN.SetLearningRate(1.0, 0.0);
-    NN.SetBatchUpdate(true);
-
-    for i := 0 to Input.Size - 1 do
-      Input.Raw[i] := Sin(i * 0.4) * 1.5 + 0.2;
-    for i := 0 to Desired.Size - 1 do
-      Desired.Raw[i] := Cos(i * 0.3);
-
-    // Numerical gradient w.r.t. the single scalar weight.
-    LReZero.Neurons[0].Weights.Raw[0] := LReZero.Neurons[0].Weights.Raw[0] + epsilon;
-    lossPlus := ComputeLoss(Input);
-    LReZero.Neurons[0].Weights.Raw[0] := LReZero.Neurons[0].Weights.Raw[0] - 2 * epsilon;
-    lossMinus := ComputeLoss(Input);
-    LReZero.Neurons[0].Weights.Raw[0] := LReZero.Neurons[0].Weights.Raw[0] + epsilon;
-    numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
-
-    NN.Compute(Input);
-    LReZero.Neurons[0].ClearDelta;
-    NN.Backpropagate(Desired);
-    // With LearningRate = 1 and batch update on, analytical = -Delta.
-    analyticalGrad := -LReZero.Neurons[0].Delta.Raw[0];
-
-    AssertTrue('ReZero weight gradient check num=' + FloatToStr(numericalGrad) +
-      ' ana=' + FloatToStr(analyticalGrad),
-      Abs(numericalGrad - analyticalGrad) < 0.01);
-  finally
-    NN.Free;
-    Input.Free;
-    Desired.Free;
-  end;
+  // TNNetReZero scales the input by a single learnable scalar alpha. Converted
+  // to the shared LayerInputAndWeightGradientCheck, which exercises BOTH the
+  // input gradient AND the scalar weight gradient (constructed alpha=0.4; the
+  // helper checks the gradient at that value without perturbing the init). The
+  // weight half drives the -Delta path that this test originally covered. Same
+  // 0.01 tolerance as before; the gradient is smooth and well-conditioned.
+  LayerInputAndWeightGradientCheck(Self, TNNetReZero.Create(0.4),
+    'ReZero', 3, 2, 2, 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestReZeroSerializationRoundTrip;

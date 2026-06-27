@@ -1821,7 +1821,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
 
 ## Tests / numerical-gradient audit
 
-- [ ] Shared `LayerInputAndWeightGradientCheck(layer, inputShape)` helper
+- [X] Shared `LayerInputAndWeightGradientCheck(layer, inputShape)` helper
       in tests/TestNeuralNumerical.pas. Three-line tests instead of
       copy-pasted blocks. Should handle both input and weight central-
       difference checks with a `Tolerance` parameter (default 1e-2), and
