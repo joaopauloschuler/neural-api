@@ -1520,59 +1520,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       builder-level analogue of TestSegmentMaskMatchesUnpackedBaseline). KV-cache
       incremental decode stays intentionally unmasked (single-stream = one doc).
 
-- [X] AVX-vectorize the rank-1 outer-product state update in TNNetDeltaNet and
-      TNNetGatedLinearAttention. DONE: added the shared `TVolume.RankOneUpdateRow`
-      primitive (neuralvolume.pas) used by all four layers; DeltaNet/GLA forward
-      state writes + backward dS/dk/dv now route through RankOneUpdateRow /
-      MulAdd / DotProduct / Mul over the depth-contiguous `e` axis. These
-      O(SeqLen*D^2) state writes dominated the layer cost — the largest scalar hot
-      loop in the linear-attention family. `-FLearningRate` convention preserved;
-      numerical-gradient tests pin correctness.
-
-- [X] AVX-vectorize the test-time inner-optimizer weight-matrix updates in
-      TNNetTestTimeTraining and TNNetTitansMemory. DONE: TTT W_lin/W1/W2 inner GD
-      steps and Titans S1/S2 momentum + (1-forget) weight writes now use the same
-      shared `TVolume.RankOneUpdateRow(Dst, Prev, B, AlphaScale, BScale, n)` helper
-      over the contiguous inner axis (one helper, four layers; not four copies).
-      These layers run an optimizer step per token, so the inner matmul was the
-      dominant cost. Numerical-gradient tests stay the correctness oracle.
-
-- [X] AVX-vectorize the block / factor GEMMs of TNNetMonarchLinear and
-      TNNetKroneckerLinear. Both never materialize the full weight, so their forward
-      and backward are small dense matrix-vector products inside nested scalar
-      `for row, col: acc += W[row,col]*x[col]` loops (Monarch's two per-block m x m
-      butterflies, Kronecker's B-then-A two-phase contraction). Each inner
-      accumulation is a contiguous dot product once the block/factor rows are walked
-      row-contiguous, so they map onto `DotProduct` (forward) and `MulAdd` (backward
-      weight/input gradient scatter) directly; where the natural axis is strided
-      (Monarch's P / P^T permutes), reorder to the contiguous run first as was done
-      for the attention output-accumulation loops. These structured-dense layers are
-      pitched as a cheaper FullConnect, but the scalar inner loop currently gives up
-      most of that win on AVX builds.
-
-- [X] AVX-vectorize the complex spectral matmul of TNNetSpectralConv1D. The FFT
-      forward/inverse are already vectorized, but the channel-mixing contraction in
-      the frequency domain is a scalar nested `for co, m, ci` complex multiply-add
-      (`yr += Wr*xr - Wi*xi; yi += Wr*xi + Wi*xr`) in both ComputeCPU and
-      BackpropagateCPU. With the real and imaginary mode weights stored as separate
-      contiguous planes the per-output-channel reduction over input channels becomes
-      four real `DotProduct`s (the standard 4-multiply complex GEMM), turning the
-      O(Modes*InDepth*OutDepth) inner loop into AVX dot products. This is the FNO
-      hot path; keep the Modes low-pass truncation and the learnable-complex-weight
-      gradient exactly as-is, pinned by the existing numerical-gradient test.
-
-- [X] OpenCL offload for the spatial im2col GEMM of TNNetDeformableConv and
-      TNNetGroupConvP4. Both spend their forward in a scalar
-      `for oy, ox, co, fy, fx, ci` convolution accumulation (DeformableConv with a
-      bilinear-sampled patch per tap, GroupConvP4 with the 4 rotation-tied weight
-      copies). Once the (possibly sampled) input patch is gathered into an im2col
-      buffer the accumulation is an ordinary patch x weight GEMM, so it can reuse the
-      same `EnableConvOpenCL` / `SetConvOpenCLMinWork` gated kernel path already
-      landed for the EnCodec/HiFiGAN conv1d and ConvTranspose1d offload (host
-      round-trip as the fallback). Keep the bilinear-sample gather and the rotation
-      weight-folding on the CPU; only the dense contraction goes to the device.
-      Pin parity with a SDPAOpenCLParity-style exact-vs-CPU test on the PoCL device.
-
 - [ ] Residual scalar backward loops left by the AVX/OpenCL vectorization batch
       (the forward + cleanly-mappable backward paths are done; these are the
       strided-on-one-operand remainders that a single DotProduct/MulAdd cannot cover
