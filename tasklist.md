@@ -1319,7 +1319,7 @@ rather than acted on.
 
 ## Layer follow-ups that fix real limitations
 
-- [ ] AVX-vectorize the scalar backward Jacobian of TNNetRMSNorm and
+- [X] AVX-vectorize the scalar backward Jacobian of TNNetRMSNorm and
       TNNetLayerNorm. Their `Compute` already uses the AVX `GetSumSqr`/`Mul`
       primitives, but `Backpropagate` still walks `FData[Cnt]` element-by-element
       to form `dxhat = OutputError .* gamma`, the running reductions

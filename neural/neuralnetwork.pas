@@ -53772,15 +53772,15 @@ var
   StartTime: double;
   FloatSize: TNeuralFloat;
   SumDxHat, SumDxHatXHat: TNeuralFloat;
-  Cnt, SizeM1: integer;
-  DxHat: TNeuralFloat;
+  Size: integer;
+  GammaPtr, OEPtr, NormPtr, DxHatPtr, PrevErrPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
   StartTime := Now();
   FloatSize := FOutput.Size;
-  SizeM1 := FOutput.Size - 1;
+  Size := FOutput.Size;
   // Gradients with respect to gamma and beta (accumulated into deltas).
   // d(gamma) = sum over batch of ( OutputError * normalized )
   // d(beta)  = sum over batch of ( OutputError )
@@ -53797,26 +53797,28 @@ begin
   if Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FOutputError.Size) then
   begin
-    // dxhat = OutputError * gamma
-    // dx = invStdDev * ( dxhat - mean(dxhat) - xhat * mean(dxhat*xhat) )
-    SumDxHat := 0;
-    SumDxHatXHat := 0;
-    for Cnt := 0 to SizeM1 do
-    begin
-      DxHat := FOutputError.FData[Cnt] * FNeurons[0].FWeights.FData[Cnt];
-      FOutputErrorDeriv.FData[Cnt] := DxHat;
-      SumDxHat := SumDxHat + DxHat;
-      SumDxHatXHat := SumDxHatXHat + DxHat * FNormalized.FData[Cnt];
-    end;
-    SumDxHat := SumDxHat / FloatSize;
-    SumDxHatXHat := SumDxHatXHat / FloatSize;
-    for Cnt := 0 to SizeM1 do
-    begin
-      FPrevLayer.FOutputError.FData[Cnt] :=
-        FPrevLayer.FOutputError.FData[Cnt] +
-        FInvStdDev * ( FOutputErrorDeriv.FData[Cnt] - SumDxHat -
-          FNormalized.FData[Cnt] * SumDxHatXHat );
-    end;
+    // Whole-volume LayerNorm Jacobian (the depth axis is the full contiguous
+    // segment), so each reduction / accumulate runs through the AVX-vectorized
+    // TNNetVolume primitives (mirrors TNNetTokenRMSNorm.Backpropagate, plus the
+    // LayerNorm mean-subtraction term):
+    //   dxhat = OutputError * gamma
+    //   dx = invStdDev * ( dxhat - mean(dxhat) - xhat * mean(dxhat*xhat) )
+    GammaPtr := FNeurons[0].FWeights.GetRawPtr();
+    OEPtr := FOutputError.GetRawPtr();
+    NormPtr := FNormalized.GetRawPtr();
+    DxHatPtr := FOutputErrorDeriv.GetRawPtr();
+    PrevErrPtr := FPrevLayer.FOutputError.GetRawPtr();
+    // dxhat = OutputError .* gamma  (elementwise over the whole volume).
+    system.Move(OEPtr^, DxHatPtr^, Size * SizeOf(TNeuralFloat));
+    TNNetVolume.Mul(DxHatPtr, GammaPtr, Size);
+    // mean( dxhat ) and mean( dxhat * xhat ) via vectorized reductions.
+    SumDxHat := FOutputErrorDeriv.GetSum() / FloatSize;
+    SumDxHatXHat := TNNetVolume.DotProduct(DxHatPtr, NormPtr, Size) / FloatSize;
+    // prevErr += invStdDev*dxhat - invStdDev*mean(dxhat)
+    //                            - (invStdDev*mean(dxhat*xhat))*xhat
+    TNNetVolume.MulAdd(PrevErrPtr, DxHatPtr, FInvStdDev, Size);
+    FPrevLayer.FOutputError.Add(-(FInvStdDev * SumDxHat));
+    TNNetVolume.MulAdd(PrevErrPtr, NormPtr, -(FInvStdDev * SumDxHatXHat), Size);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
@@ -54042,15 +54044,15 @@ var
   StartTime: double;
   FloatSize: TNeuralFloat;
   SumDxHatXHat: TNeuralFloat;
-  Cnt, SizeM1: integer;
-  DxHat: TNeuralFloat;
+  Size: integer;
+  GammaPtr, OEPtr, NormPtr, DxHatPtr, PrevErrPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
   StartTime := Now();
   FloatSize := FOutput.Size;
-  SizeM1 := FOutput.Size - 1;
+  Size := FOutput.Size;
   // Gradient with respect to gamma (accumulated into deltas).
   // d(gamma) = sum over batch of ( OutputError * normalized )
   FOutputErrorDeriv.Copy(FOutputError);
@@ -54064,23 +54066,24 @@ begin
   if Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FOutputError.Size) then
   begin
-    // dxhat = OutputError * gamma
-    // dx = invRMS * ( dxhat - xhat * mean(dxhat*xhat) )
-    SumDxHatXHat := 0;
-    for Cnt := 0 to SizeM1 do
-    begin
-      DxHat := FOutputError.FData[Cnt] * FNeurons[0].FWeights.FData[Cnt];
-      FOutputErrorDeriv.FData[Cnt] := DxHat;
-      SumDxHatXHat := SumDxHatXHat + DxHat * FNormalized.FData[Cnt];
-    end;
-    SumDxHatXHat := SumDxHatXHat / FloatSize;
-    for Cnt := 0 to SizeM1 do
-    begin
-      FPrevLayer.FOutputError.FData[Cnt] :=
-        FPrevLayer.FOutputError.FData[Cnt] +
-        FInvRMS * ( FOutputErrorDeriv.FData[Cnt] -
-          FNormalized.FData[Cnt] * SumDxHatXHat );
-    end;
+    // Whole-volume RMSNorm Jacobian (the depth axis is the full contiguous
+    // segment), so each reduction / accumulate runs through the AVX-vectorized
+    // TNNetVolume primitives (mirrors TNNetTokenRMSNorm.Backpropagate):
+    //   dxhat = OutputError * gamma
+    //   dx = invRMS * ( dxhat - xhat * mean(dxhat*xhat) )
+    GammaPtr := FNeurons[0].FWeights.GetRawPtr();
+    OEPtr := FOutputError.GetRawPtr();
+    NormPtr := FNormalized.GetRawPtr();
+    DxHatPtr := FOutputErrorDeriv.GetRawPtr();
+    PrevErrPtr := FPrevLayer.FOutputError.GetRawPtr();
+    // dxhat = OutputError .* gamma  (elementwise over the whole volume).
+    system.Move(OEPtr^, DxHatPtr^, Size * SizeOf(TNeuralFloat));
+    TNNetVolume.Mul(DxHatPtr, GammaPtr, Size);
+    // mean( dxhat * xhat ) via the vectorized dot product.
+    SumDxHatXHat := TNNetVolume.DotProduct(DxHatPtr, NormPtr, Size) / FloatSize;
+    // prevErr += invRMS*dxhat - (invRMS*mean)*xhat
+    TNNetVolume.MulAdd(PrevErrPtr, DxHatPtr, FInvRMS, Size);
+    TNNetVolume.MulAdd(PrevErrPtr, NormPtr, -(FInvRMS * SumDxHatXHat), Size);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
