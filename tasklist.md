@@ -403,9 +403,11 @@ rather than acted on.
       torchvision) — FULL torchvision inception_v3 now imports (config full_arch
       = true -> BuildInceptionV3Full). The pico InceptionA-only path remains for
       the legacy parity test. REMAINING: FID rewire (below).
-  - [ ] Rewire neuralimagemetrics FID onto this backbone (today FID uses
-        placeholder features). Now unblocked: BuildInceptionV3Full
-        exposes the 2048-d pooled feature via PoolFeatureIdx.
+  - [X] Rewire neuralimagemetrics FID onto this backbone. DONE: added
+        ExtractInceptionFeature / AccumulateInceptionFeatures /
+        ComputeInceptionFID in neuralimagemetrics.pas (tap PoolFeatureIdx pooled
+        feature, ImageNet-normalised volumes); pico-fixture test asserts
+        FID(X,X)=0 + monotone growth with perturbation.
 - [ ] LPIPS follow-ups — the metric LANDED (ComputeLPIPSDistance /
       LPIPSStageDistance / LPIPSUnitNormalize in neuralpretrained.pas, reusing the
       VGG importer's 5 relu taps; unit-normalize -> squared-diff -> per-stage lin

@@ -58,7 +58,7 @@ Coded by Claude (AI).
 interface
 
 uses
-  Classes, SysUtils, Math, neuralvolume;
+  Classes, SysUtils, Math, neuralvolume, neuralnetwork;
 
 type
   // Double-precision helpers (FID needs more than single precision).
@@ -121,6 +121,43 @@ function ComputeFIDFromAccumulators(AccR, AccG: TFIDFeatureAccumulator): Double;
 
 // Convenience: FID from two raw feature matrices (Features[sample][dim]).
 function ComputeFIDFromFeatures(const FeaturesR, FeaturesG: TIMDoubleMatrix): Double;
+
+// --- FID over the real Inception backbone ---
+//
+// The functions above are backbone-AGNOSTIC: the caller supplies feature
+// vectors. These wire FID onto the actual Inception-v3 pooled feature, which
+// is the canonical FID definition. The InceptionNet is built by
+// neuralpretrained.BuildInceptionV3Full (full_arch=true), which returns the
+// global-avg-pool layer index via its out PoolFeatureIdx parameter; that layer
+// emits the 2048-d "pool3" activation FID is defined over (the width is smaller
+// for a width_div-shrunk or pico net, but the API is identical).
+//
+// Each image must already be a network-ready volume: (ImageSize, ImageSize,
+// NumChannels), ImageNet-normalised the same way the backbone was trained
+// ((pixel/255 - csImageNetMean[c]) / csImageNetStd[c]) and resized/center-
+// cropped to the backbone's ImageSize. neuraldatasets.LoadImageForVisionModel
+// produces exactly such a volume.
+
+// Runs one image volume through InceptionNet and returns the pooled feature at
+// PoolFeatureIdx as a float64 vector (length = that layer's Output.Size).
+function ExtractInceptionFeature(InceptionNet: TNNet;
+  PoolFeatureIdx: integer; ImageVolume: TNNetVolume): TIMDoubleArray;
+
+// Runs every image in Images through InceptionNet, accumulating the pooled
+// PoolFeatureIdx feature of each into Acc (which must already be sized to the
+// pooled width). Lets a caller stream large image sets without materialising
+// the whole feature matrix. Images is a list of network-ready TNNetVolume.
+procedure AccumulateInceptionFeatures(InceptionNet: TNNet;
+  PoolFeatureIdx: integer; Images: TNNetVolumeList;
+  Acc: TFIDFeatureAccumulator);
+
+// The real-backbone FID: extracts the 2048-d Inception pooled feature for every
+// real and generated image, then returns the Frechet distance between the two
+// resulting Gaussians (reusing the mean/cov/matrix-sqrt math above). Both image
+// lists must hold network-ready volumes (see preprocessing note); both must
+// have >= 2 images so the per-set covariance is defined. FID(X, X) == 0.
+function ComputeInceptionFID(InceptionNet: TNNet; PoolFeatureIdx: integer;
+  RealImages, GenImages: TNNetVolumeList): Double;
 
 // --- Inception Score ---
 
@@ -549,6 +586,73 @@ begin
     MaxG := Length(FeaturesG) - 1;
     for i := 0 to MaxR do accR.Add(FeaturesR[i]);
     for i := 0 to MaxG do accG.Add(FeaturesG[i]);
+    Result := ComputeFIDFromAccumulators(accR, accG);
+  finally
+    accR.Free;
+    accG.Free;
+  end;
+end;
+
+{ FID over the real Inception backbone }
+
+function ExtractInceptionFeature(InceptionNet: TNNet;
+  PoolFeatureIdx: integer; ImageVolume: TNNetVolume): TIMDoubleArray;
+var
+  PoolOut: TNNetVolume;
+  i, dim: integer;
+begin
+  if InceptionNet = nil then
+    raise Exception.Create('ExtractInceptionFeature: nil net');
+  if (PoolFeatureIdx < 0) or (PoolFeatureIdx >= InceptionNet.CountLayers) then
+    raise Exception.CreateFmt(
+      'ExtractInceptionFeature: PoolFeatureIdx %d out of range', [PoolFeatureIdx]);
+  InceptionNet.Compute(ImageVolume);
+  PoolOut := InceptionNet.Layers[PoolFeatureIdx].Output;
+  dim := PoolOut.Size;
+  SetLength(Result, dim);
+  for i := 0 to dim - 1 do
+    Result[i] := PoolOut.FData[i];
+end;
+
+procedure AccumulateInceptionFeatures(InceptionNet: TNNet;
+  PoolFeatureIdx: integer; Images: TNNetVolumeList;
+  Acc: TFIDFeatureAccumulator);
+var
+  i, iMax: integer;
+  feat: TIMDoubleArray;
+begin
+  if Images = nil then
+    raise Exception.Create('AccumulateInceptionFeatures: nil image list');
+  iMax := Images.Count - 1;
+  for i := 0 to iMax do
+  begin
+    feat := ExtractInceptionFeature(InceptionNet, PoolFeatureIdx, Images[i]);
+    Acc.Add(feat);
+  end;
+end;
+
+function ComputeInceptionFID(InceptionNet: TNNet; PoolFeatureIdx: integer;
+  RealImages, GenImages: TNNetVolumeList): Double;
+var
+  accR, accG: TFIDFeatureAccumulator;
+  dim: integer;
+begin
+  if (RealImages = nil) or (GenImages = nil) then
+    raise Exception.Create('ComputeInceptionFID: nil image list');
+  if (RealImages.Count < 2) or (GenImages.Count < 2) then
+    raise Exception.Create(
+      'ComputeInceptionFID: each image set needs at least 2 images');
+  if (PoolFeatureIdx < 0) or (PoolFeatureIdx >= InceptionNet.CountLayers) then
+    raise Exception.CreateFmt(
+      'ComputeInceptionFID: PoolFeatureIdx %d out of range', [PoolFeatureIdx]);
+  // One forward pass primes the net so the pooled width is known.
+  InceptionNet.Compute(RealImages[0]);
+  dim := InceptionNet.Layers[PoolFeatureIdx].Output.Size;
+  accR := TFIDFeatureAccumulator.Create(dim);
+  accG := TFIDFeatureAccumulator.Create(dim);
+  try
+    AccumulateInceptionFeatures(InceptionNet, PoolFeatureIdx, RealImages, accR);
+    AccumulateInceptionFeatures(InceptionNet, PoolFeatureIdx, GenImages, accG);
     Result := ComputeFIDFromAccumulators(accR, accG);
   finally
     accR.Free;

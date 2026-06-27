@@ -26,7 +26,7 @@ interface
 
 uses
   Classes, SysUtils, Math, fpcunit, testregistry, fpjson, jsonparser,
-  neuralvolume, neuralimagemetrics;
+  neuralvolume, neuralnetwork, neuralimagemetrics, neuralpretrained;
 
 type
   TTestNeuralImageMetrics = class(TTestCase)
@@ -68,6 +68,10 @@ type
     procedure TestKIDOrdering;
     // KID subset-bootstrap mean is close to the full-set estimate.
     procedure TestKIDSubsetBootstrap;
+    // FID wired onto the real Inception backbone (pico fixture): FID of a set
+    // against ITSELF is ~0, and FID grows monotonically as the generated set is
+    // perturbed further from the real set.
+    procedure TestInceptionFIDSelfZeroAndMonotone;
   end;
 
 implementation
@@ -529,6 +533,95 @@ begin
     AssertTrue('KID bootstrap std >= 0', sd >= 0);
   finally
     Root.Free;
+  end;
+end;
+
+// Real-backbone FID self-consistency on the pico Inception fixture. Builds the
+// committed tiny Inception-v3 (image_size 8, pooled width 13), makes a "real"
+// set of random ImageNet-scale image volumes, then three "generated" sets that
+// are the real set plus zero / small / large per-pixel perturbations. The
+// pooled Inception feature drives FID; FID(real, real) must be ~0 and FID must
+// grow monotonically with the perturbation. (Self-consistency rather than a
+// torch oracle: torchvision is not installed and the pico backbone is faithful
+// to exactly what CAI computes, so an external float64 reference would only
+// re-derive these same pooled features. The FID MATH itself is already pinned
+// to a numpy float64 oracle by TestFIDvsOracle.)
+procedure TTestNeuralImageMetrics.TestInceptionFIDSelfZeroAndMonotone;
+const
+  cInceptionFixture = 'tiny_inceptionv3.safetensors';
+  cInceptionConfig  = 'tiny_inceptionv3_config.json';
+  cNumImages = 8;
+
+  function MakeImageSet(Seed: integer; PerturbScale: Single;
+    Base: TNNetVolumeList; Cfg: TInceptionV3Config): TNNetVolumeList;
+  var
+    n, i: integer;
+    V: TNNetVolume;
+  begin
+    Result := TNNetVolumeList.Create(true);
+    RandSeed := Seed;
+    for n := 0 to cNumImages - 1 do
+    begin
+      V := TNNetVolume.Create(Cfg.ImageSize, Cfg.ImageSize, Cfg.NumChannels);
+      for i := 0 to V.Size - 1 do
+        if Base = nil then
+          // ImageNet-normalised pixels live roughly in [-2.6, 2.6].
+          V.FData[i] := (Random * 4.0) - 2.0
+        else
+          V.FData[i] := Base[n].FData[i] + PerturbScale * ((Random * 2.0) - 1.0);
+      Result.Add(V);
+    end;
+  end;
+
+var
+  NN: TNNet;
+  Cfg: TInceptionV3Config;
+  PoolIdx: integer;
+  fixDir, fixSafe, fixCfg: string;
+  realSet, genSame, genNear, genFar: TNNetVolumeList;
+  fidSelf, fidNear, fidFar: Double;
+begin
+  fixDir := ExtractFilePath(ParamStr(0)) + 'fixtures' + PathDelim;
+  fixSafe := fixDir + cInceptionFixture;
+  fixCfg  := fixDir + cInceptionConfig;
+  if (not FileExists(fixSafe)) or (not FileExists(fixCfg)) then
+  begin
+    Ignore('inception fixture absent');
+    Exit;
+  end;
+
+  NN := BuildInceptionV3FromSafeTensors(fixSafe, Cfg, PoolIdx,
+    {pTrainable=}false, fixCfg);
+  realSet := nil; genSame := nil; genNear := nil; genFar := nil;
+  try
+    // Real images, then generated sets at growing distance from them.
+    realSet := MakeImageSet(101, 0.0, nil, Cfg);
+    genSame := MakeImageSet(0, 0.0, realSet, Cfg);   // exact copies of realSet
+    genNear := MakeImageSet(202, 0.10, realSet, Cfg);
+    genFar  := MakeImageSet(303, 0.80, realSet, Cfg);
+
+    // (a) FID of the real set against itself is ~0.
+    fidSelf := ComputeInceptionFID(NN, PoolIdx, realSet, realSet);
+    AssertEquals('FID(real, real) ~ 0', 0.0, fidSelf, 1e-6);
+
+    // FID against an exact copy is also ~0.
+    AssertEquals('FID(real, copy) ~ 0', 0.0,
+      ComputeInceptionFID(NN, PoolIdx, realSet, genSame), 1e-6);
+
+    // (b) FID grows monotonically as the generated set diverges.
+    fidNear := ComputeInceptionFID(NN, PoolIdx, realSet, genNear);
+    fidFar  := ComputeInceptionFID(NN, PoolIdx, realSet, genFar);
+    AssertTrue('FID near > 0 (' + FloatToStr(fidNear) + ')', fidNear > 1e-9);
+    AssertTrue('FID far > FID near (' + FloatToStr(fidFar) + ' > ' +
+      FloatToStr(fidNear) + ')', fidFar > fidNear);
+
+    // Single-feature extraction returns the pooled width (13 for the pico).
+    AssertEquals('pooled feature width',
+      NN.Layers[PoolIdx].Output.Size,
+      Length(ExtractInceptionFeature(NN, PoolIdx, realSet[0])));
+  finally
+    realSet.Free; genSame.Free; genNear.Free; genFar.Free;
+    NN.Free;
   end;
 end;
 
