@@ -520,6 +520,7 @@ type
     procedure TestSDUNetParity;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
+    procedure TestControlNetCombinedParity;
     procedure TestVaeRoundTrip;
     procedure TestVqModelEncodeParity;
     procedure TestVqModelDecodeParity;
@@ -21113,6 +21114,139 @@ begin
     for ri := 0 to Config.NumDownResiduals - 1 do DownResiduals[ri].Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// End-to-end base-UNet-plus-ControlNet single denoise step. Builds a CONTROL-
+// ENABLED SD UNet (BuildSDUNet pWithControl=true) from the tiny_sd_unet fixture
+// and a ControlNet from the tiny_controlnet fixture (config-compatible: shared
+// block_out_channels [16,32], latent grid 8, text seq 5, cross dim 12), runs
+// ControlNetResiduals then SDUNetDenoiseWithControl and asserts the predicted
+// noise matches the numpy float64 combined oracle (tools/controlnet_combined_
+// fixture.py: down_block_res_samples + mid added into the decoder skips, as
+// diffusers StableDiffusionControlNetPipeline). max|diff| < 1e-4.
+procedure TTestNeuralPretrained.TestControlNetCombinedParity;
+var
+  UNet, CNet: TNNet;
+  UCfg: TSDUNetConfig;
+  CCfg: TControlNetConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  LatentArr, EncArr, EncRow, CondJArr, NoiseArr, RowArr, ChanArr: TJSONArray;
+  LatentInput, EncStates, Cond, Noise, MidResidual: TNNetVolume;
+  DownResiduals: array of TNNetVolume;
+  t: double;
+  Grid, CondGrid, DownCnt, ChanCnt, YCnt, XCnt, SCnt, DCnt, ri: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  // base UNet built WITH control injection (extra zero-default skip inputs).
+  UNet := BuildSDUNetFromSafeTensorsEx(FixturePath('tiny_sd_unet.safetensors'),
+    ReadSDUNetConfigFromJSONFile(FixturePath('tiny_sd_unet_config.json')),
+    {pTrainable=}true, {pWithControl=}true);
+  UCfg := ReadSDUNetConfigFromJSONFile(FixturePath('tiny_sd_unet_config.json'));
+  CNet := BuildControlNetFromSafeTensors(
+    FixturePath('tiny_controlnet.safetensors'), CCfg,
+    {pTrainable=}true, FixturePath('tiny_controlnet_config.json'));
+  RefJson := TStringList.Create;
+  LatentInput := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create;
+  Cond := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  MidResidual := TNNetVolume.Create;
+  RefRoot := nil;
+  DownCnt := CCfg.NumDownResiduals;
+  SetLength(DownResiduals, DownCnt);
+  for ri := 0 to DownCnt - 1 do DownResiduals[ri] := TNNetVolume.Create;
+  try
+    AssertTrue('base UNet built', UNet <> nil);
+    AssertTrue('controlnet built', CNet <> nil);
+    // base UNet skip-input count must match the controlnet down residual count.
+    AssertEquals('skip control input count', DownCnt,
+      SDUNetControlDownCount(UCfg));
+    Grid := UCfg.LatentGrid;
+    CondGrid := CCfg.CondGrid;
+    RefJson.LoadFromFile(FixturePath('tiny_controlnet_combined_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    LatentArr := TJSONArray(TJSONObject(RefRoot).Find('latent'));
+    EncArr := TJSONArray(TJSONObject(RefRoot).Find('encoder_hidden_states'));
+    CondJArr := TJSONArray(TJSONObject(RefRoot).Find('controlnet_cond'));
+    NoiseArr := TJSONArray(TJSONObject(RefRoot).Find('noise'));
+    t := TJSONObject(RefRoot).Get('timestep', 0.0);
+    AssertEquals('combined down residual count', DownCnt,
+      TJSONObject(RefRoot).Get('num_down_residuals', 0));
+
+    // latent (C,H,W) -> CAI (x,y,depth) volume.
+    LatentInput.ReSize(Grid, Grid, UCfg.InChannels);
+    for ChanCnt := 0 to UCfg.InChannels - 1 do
+    begin
+      RowArr := TJSONArray(LatentArr.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+          LatentInput.FData[(YCnt * Grid + XCnt) * UCfg.InChannels + ChanCnt]
+            := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    // controlnet_cond (C,H,W) -> (x,y,depth) volume.
+    Cond.ReSize(CondGrid, CondGrid, CCfg.CondChannels);
+    for ChanCnt := 0 to CCfg.CondChannels - 1 do
+    begin
+      RowArr := TJSONArray(CondJArr.Items[ChanCnt]);
+      for YCnt := 0 to CondGrid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to CondGrid - 1 do
+          Cond.FData[(YCnt * CondGrid + XCnt) * CCfg.CondChannels + ChanCnt]
+            := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    EncStates.ReSize(UCfg.TextSeqLen, 1, UCfg.CrossAttentionDim);
+    for SCnt := 0 to UCfg.TextSeqLen - 1 do
+    begin
+      EncRow := TJSONArray(EncArr.Items[SCnt]);
+      for DCnt := 0 to UCfg.CrossAttentionDim - 1 do
+        EncStates.FData[SCnt * UCfg.CrossAttentionDim + DCnt] :=
+          EncRow.Items[DCnt].AsFloat;
+    end;
+
+    // 1) run the ControlNet to get the residuals.
+    ControlNetResiduals(CNet, CCfg, LatentInput, EncStates, Cond, t,
+      DownResiduals, MidResidual);
+    // 2) run the base UNet with those residuals injected into the skips.
+    SDUNetDenoiseWithControl(UNet, UCfg, LatentInput, EncStates, t,
+      DownResiduals, MidResidual, Noise);
+
+    MaxDiff := 0;
+    for ChanCnt := 0 to UCfg.OutChannels - 1 do
+    begin
+      RowArr := TJSONArray(NoiseArr.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+        begin
+          RefVal := ChanArr.Items[XCnt].AsFloat;
+          GotVal := Noise.FData[(YCnt * Grid + XCnt) * UCfg.OutChannels + ChanCnt];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('combined noise: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    LatentInput.Free;
+    EncStates.Free;
+    Cond.Free;
+    Noise.Free;
+    MidResidual.Free;
+    for ri := 0 to DownCnt - 1 do DownResiduals[ri].Free;
+    RefJson.Free;
+    CNet.Free;
+    UNet.Free;
   end;
 end;
 

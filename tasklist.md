@@ -463,9 +463,14 @@ rather than acted on.
       hint stem + per-resolution zero-conv residual taps + ControlNetResiduals driver,
       TestControlNetParity 2.89e-6 < 1e-4). First conditioning-by-feature-injection model.
       DEFERRED follow-ups: (a) end-to-end base-UNet-plus-ControlNet generation
-      (inject the residuals into a frozen BuildSDUNet decoder — needs a residual-add
-      hook on the SD UNet up-block skip Sums) + an examples/ControlNetCanny smoke
-      once that lands; (b) real-checkpoint slicer (slice sd-controlnet-canny like
+      LANDED — BuildSDUNet(..., pWithControl=true) splices a zero-default
+      TNNetInput+TNNetSum onto every down-path skip + the mid output (encoder
+      forward unperturbed, plain SDUNetDenoise stays bit-identical), and the new
+      SDUNetDenoiseWithControl driver ADDS the ControlNetResiduals into those
+      skips exactly as diffusers (down += controlnet_down, mid += controlnet_mid);
+      combined forward parity-checked < 1e-4 in TestControlNetCombinedParity
+      (tools/controlnet_combined_fixture.py reuses the two config-compatible pico
+      fixtures) + examples/ControlNetCanny smoke. (b) real-checkpoint slicer (slice sd-controlnet-canny like
       slice_llama.py) for parity vs real weights on top of the synthetic fixture;
       (c) the diffusers per-residual conditioning_scale multiplier (constant 1.0
       here); (d) T2I-Adapter (lighter feature-injection sibling) as its natural

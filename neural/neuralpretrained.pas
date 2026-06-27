@@ -9451,11 +9451,23 @@ function SDUNetConfigToString(const Config: TSDUNetConfig): string;
 // Builds the UNet2DConditionModel described by Config and loads every weight
 // from Reader (caller owns Reader). Three TNNetInputs (latent, timestep, text
 // states). See SDUNetDenoise for the driver.
+//
+// When pWithControl=true the net is built with EXTRA zero-default TNNetInputs +
+// TNNetSum nodes spliced onto every down-path skip (and the mid output) so a
+// ControlNet's down_block_res_samples / mid_block_res_sample can be ADDED into
+// the decoder skip connections exactly as diffusers' StableDiffusionControlNet-
+// Pipeline does. The control inputs sit AFTER the latent/timestep/text inputs
+// (so the SDUNetTimestep/TextStatesInput #1/#2 indices are unchanged) and start
+// zero-filled, so a plain SDUNetDenoise on a control-enabled net is bit-
+// identical to the base UNet. SDUNetDenoiseWithControl fills them. The skip-add
+// TNNetSum layers carry no weights, so weight loading is unaffected.
 function BuildSDUNet(Reader: TNNetSafeTensorsReader;
-  const Config: TSDUNetConfig; pTrainable: boolean = true): TNNet;
+  const Config: TSDUNetConfig; pTrainable: boolean = true;
+  pWithControl: boolean = false): TNNet;
 
 function BuildSDUNetFromSafeTensorsEx(const FileName: string;
-  const Config: TSDUNetConfig; pTrainable: boolean = true): TNNet;
+  const Config: TSDUNetConfig; pTrainable: boolean = true;
+  pWithControl: boolean = false): TNNet;
 
 function BuildSDUNetFromSafeTensors(const FileName: string;
   out Config: TSDUNetConfig; pTrainable: boolean = true;
@@ -9470,6 +9482,28 @@ function SDUNetTextStatesInput(Net: TNNet): TNNetLayer;
 // (InChannels,Grid,Grid)/(TextSeqLen,1,CrossDim) volumes.
 procedure SDUNetDenoise(Net: TNNet; const Config: TSDUNetConfig;
   Latent, EncStates: TNNetVolume; t: TNeuralFloat; Noise: TNNetVolume);
+
+// End-to-end base-UNet-plus-ControlNet single-step denoise. Net MUST be a UNet
+// built with BuildSDUNet(..., pWithControl=true). DownResiduals (the ControlNet
+// down_block_res_samples, in build order: conv_in, then each down resnet, then
+// each downsampler) are ADDED into the matching decoder-skip TNNetSum control
+// inputs; MidResidual (mid_block_res_sample) is added into the mid output. This
+// mirrors diffusers' StableDiffusionControlNetPipeline:
+//   down_block_res_samples = [d + c for d,c in zip(down, controlnet_down)]
+//   mid_block_res_sample  += controlnet_mid
+// Typically the caller obtains DownResiduals/MidResidual from ControlNetResiduals
+// on a sibling ControlNet net. Pass the SAME count of down residuals the UNet
+// has skip inputs for (= conv_in + per-down-resnet + per-downsampler), which is
+// exactly Config-derived NumDownResiduals of a matching ControlNet.
+procedure SDUNetDenoiseWithControl(Net: TNNet; const Config: TSDUNetConfig;
+  Latent, EncStates: TNNetVolume; t: TNeuralFloat;
+  DownResiduals: array of TNNetVolume; MidResidual: TNNetVolume;
+  Noise: TNNetVolume);
+
+// Returns how many down-path skip control inputs a control-enabled SD UNet of
+// this config has (conv_in + layers_per_block per down block + one per interior
+// downsampler) -- the required Length(DownResiduals) for SDUNetDenoiseWithControl.
+function SDUNetControlDownCount(const Config: TSDUNetConfig): integer;
 
 // ---------------------------------------------------------------------------
 // CONTROLNET SPATIAL-CONDITIONING IMPORT (diffusers ControlNetModel, e.g.
@@ -59893,8 +59927,28 @@ begin
     Inner, d, 0, -1, 0, TB + 'ff.net.2.bias');
 end;
 
+// Returns the SKIP layer for HLayer (a down-path skip source). When pWithControl
+// is true it splices a zero-default control input + TNNetSum(HLayer, ctrl) and
+// returns that Sum, so a ControlNet residual is ADDED into the skip copy that
+// the decoder up blocks consume -- WITHOUT perturbing the encoder forward path
+// (the caller keeps feeding the ORIGINAL HLayer downstream, exactly as diffusers
+// only adds controlnet residuals into down_block_res_samples). The control input
+// is appended to CtrlInputs. No-op (returns HLayer) when pWithControl is false.
+function SDUNetSpliceControlSkip(NN: TNNet; HLayer: TNNetLayer;
+  Grid, Ch: integer; pWithControl: boolean;
+  var CtrlInputs: array of TNNetLayer; var CtrlTop: integer): TNNetLayer;
+var
+  Ctrl: TNNetLayer;
+begin
+  if not pWithControl then begin Result := HLayer; Exit; end;
+  Ctrl := NN.AddLayer( TNNetInput.Create(Grid, Grid, Ch) );
+  CtrlInputs[CtrlTop] := Ctrl; Inc(CtrlTop);
+  Result := NN.AddLayerAfter( [TNNetSum.Create([HLayer, Ctrl])], HLayer );
+end;
+
 function BuildSDUNet(Reader: TNNetSafeTensorsReader;
-  const Config: TSDUNetConfig; pTrainable: boolean = true): TNNet;
+  const Config: TSDUNetConfig; pTrainable: boolean = true;
+  pWithControl: boolean = false): TNNet;
 var
   NN: TNNet;
   LatentInput, TInput, TextInput, ConvIn, TSin, TFc0, TSilu, TFc2: TNNetLayer;
@@ -59903,11 +59957,16 @@ var
   SwapTmp: TNeuralFloat;
   d0, half, halfM1, n, nM1, NumResnet, i, j, ci, b: integer;
   InCh, OutCh, MidCh, RevIdx, PrevOut, InputCh, ResSkip, ResnetIn: integer;
+  CurGrid: integer;
   Prefix: string;
   // skip stack (down-path res samples) + per-block layer refs.
   Skips: array of TNNetLayer;
   SkipCh: array of integer;
   SkipTop: integer;
+  // control-injection inputs (one per skip + one mid), built when pWithControl.
+  CtrlInputs: array of TNNetLayer;
+  CtrlTop: integer;
+  MidCtrlInput: TNNetLayer;
   DownRes: array of array of TSDResnetLayers;
   DownAttn: array of array of TSDAttnLayers;
   DownSamp: array of TNNetLayer;
@@ -59935,6 +59994,9 @@ begin
     SetLength(Skips, 64);
     SetLength(SkipCh, 64);
     SkipTop := 0;
+    SetLength(CtrlInputs, 64);
+    CtrlTop := 0;
+    CurGrid := Config.LatentGrid;
 
     // ---------------- Architecture ----------------
     // input0: noisy latent.
@@ -59943,7 +60005,6 @@ begin
     ConvIn := NN.AddLayer(
       TNNetConvolutionLinear.Create(d0, 3, 1, 1, 0).SetTrainable(pTrainable) );
     HLayer := ConvIn;
-    Skips[SkipTop] := HLayer; SkipCh[SkipTop] := d0; Inc(SkipTop);
 
     // input1: scalar timestep -> sinusoidal -> 2-layer MLP -> TimeCond.
     TInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
@@ -59960,6 +60021,12 @@ begin
       Config.CrossAttentionDim) );
 
     if not pTrainable then NN.SetTrainable();
+
+    // conv_in skip (deferred until after the latent/timestep/text inputs so the
+    // skip control inputs all sit at TNNetInput index >= 3).
+    Skips[SkipTop] := SDUNetSpliceControlSkip(NN, ConvIn, CurGrid, d0,
+      pWithControl, CtrlInputs, CtrlTop);
+    SkipCh[SkipTop] := d0; Inc(SkipTop);
 
     // ---- DOWN blocks ----
     InCh := d0;
@@ -59980,7 +60047,9 @@ begin
             DownAttn[i][j]);
           HLayer := NN.GetLastLayer();
         end;
-        Skips[SkipTop] := HLayer; SkipCh[SkipTop] := OutCh; Inc(SkipTop);
+        Skips[SkipTop] := SDUNetSpliceControlSkip(NN, HLayer, CurGrid, OutCh,
+          pWithControl, CtrlInputs, CtrlTop);
+        SkipCh[SkipTop] := OutCh; Inc(SkipTop);
       end;
       InCh := OutCh;
       if i < nM1 then
@@ -59990,7 +60059,10 @@ begin
           [TNNetConvolutionLinear.Create(OutCh, 3, 1, 2, 0).SetTrainable(pTrainable)],
           HLayer);
         HLayer := NN.GetLastLayer();
-        Skips[SkipTop] := HLayer; SkipCh[SkipTop] := OutCh; Inc(SkipTop);
+        CurGrid := CurGrid div 2;
+        Skips[SkipTop] := SDUNetSpliceControlSkip(NN, HLayer, CurGrid, OutCh,
+          pWithControl, CtrlInputs, CtrlTop);
+        SkipCh[SkipTop] := OutCh; Inc(SkipTop);
       end
       else
         DownSamp[i] := nil;
@@ -60006,6 +60078,13 @@ begin
     AddSDResnetBlock(NN, Config, TimeCond, HLayer, MidCh, MidCh, pTrainable,
       MidRes2);
     HLayer := NN.GetLastLayer();
+    // mid residual is ADDED into the value flowing into the up blocks.
+    if pWithControl then
+    begin
+      MidCtrlInput := NN.AddLayer( TNNetInput.Create(CurGrid, CurGrid, MidCh) );
+      HLayer := NN.AddLayerAfter( [TNNetSum.Create([HLayer, MidCtrlInput])],
+        HLayer );
+    end;
 
     // ---- UP blocks ----
     PrevOut := Config.BlockOutChannels[nM1];
@@ -60145,13 +60224,14 @@ begin
 end;
 
 function BuildSDUNetFromSafeTensorsEx(const FileName: string;
-  const Config: TSDUNetConfig; pTrainable: boolean = true): TNNet;
+  const Config: TSDUNetConfig; pTrainable: boolean = true;
+  pWithControl: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
-    Result := BuildSDUNet(Reader, Config, pTrainable);
+    Result := BuildSDUNet(Reader, Config, pTrainable, pWithControl);
   finally
     Reader.Free;
   end;
@@ -60207,6 +60287,61 @@ begin
       IntToStr(EncStates.Size) + ' <> the net text input size ' +
       IntToStr(TextIn.Output.Size) + ' (TextSeqLen/CrossDim mismatch?).');
   TextIn.Output.Copy(EncStates);
+  Net.Compute(Latent);
+  Net.GetOutput(Noise);
+end;
+
+function SDUNetControlDownCount(const Config: TSDUNetConfig): integer;
+var
+  i, Cnt: integer;
+begin
+  Cnt := 1; // conv_in skip
+  for i := 0 to Config.NumBlockOut - 1 do
+  begin
+    Cnt := Cnt + Config.LayersPerBlock; // one skip per down resnet(+attn)
+    if i < Config.NumBlockOut - 1 then Inc(Cnt); // downsampler skip
+  end;
+  Result := Cnt;
+end;
+
+procedure SDUNetDenoiseWithControl(Net: TNNet; const Config: TSDUNetConfig;
+  Latent, EncStates: TNNetVolume; t: TNeuralFloat;
+  DownResiduals: array of TNNetVolume; MidResidual: TNNetVolume;
+  Noise: TNNetVolume);
+var
+  TextIn, CtrlLayer: TNNetLayer;
+  DownCnt, i, InputIdx: integer;
+begin
+  DownCnt := SDUNetControlDownCount(Config);
+  if Length(DownResiduals) < DownCnt then
+    ImportError('SDUNetDenoiseWithControl: DownResiduals has ' +
+      IntToStr(Length(DownResiduals)) + ' slots, the control-enabled UNet needs ' +
+      IntToStr(DownCnt) + ' (build it with BuildSDUNet(..., pWithControl=true)?).');
+  SDUNetTimestepInput(Net).Output.FData[0] := t;
+  TextIn := SDUNetTextStatesInput(Net);
+  if EncStates.Size <> TextIn.Output.Size then
+    ImportError('SDUNetDenoiseWithControl: encoder_hidden_states size ' +
+      IntToStr(EncStates.Size) + ' <> the net text input size ' +
+      IntToStr(TextIn.Output.Size) + '.');
+  TextIn.Output.Copy(EncStates);
+  // Control inputs are TNNetInputs #3.. : the DownCnt skip inputs (build order:
+  // conv_in, per down resnet, per downsampler) then the mid input LAST.
+  for i := 0 to DownCnt - 1 do
+  begin
+    InputIdx := 3 + i;
+    CtrlLayer := SDUNetNthInput(Net, InputIdx);
+    if DownResiduals[i].Size <> CtrlLayer.Output.Size then
+      ImportError('SDUNetDenoiseWithControl: down residual ' + IntToStr(i) +
+        ' size ' + IntToStr(DownResiduals[i].Size) + ' <> skip control input #' +
+        IntToStr(InputIdx) + ' size ' + IntToStr(CtrlLayer.Output.Size) + '.');
+    CtrlLayer.Output.Copy(DownResiduals[i]);
+  end;
+  CtrlLayer := SDUNetNthInput(Net, 3 + DownCnt); // mid control input (last)
+  if MidResidual.Size <> CtrlLayer.Output.Size then
+    ImportError('SDUNetDenoiseWithControl: mid residual size ' +
+      IntToStr(MidResidual.Size) + ' <> mid control input size ' +
+      IntToStr(CtrlLayer.Output.Size) + '.');
+  CtrlLayer.Output.Copy(MidResidual);
   Net.Compute(Latent);
   Net.GetOutput(Noise);
 end;
