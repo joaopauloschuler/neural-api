@@ -409,10 +409,22 @@ rather than acted on.
           count across blocks — SD1.5's 8-heads-everywhere case holds, but SDXL /
           configs with a per-block attention_head_dim list need a per-block heads
           array wired through TSDUNetConfig).
-    - [ ] use_linear_projection=True variant (SD2.x / SDXL use Linear proj_in/out
+    - [X] use_linear_projection=True variant (SD2.x / SDXL use Linear proj_in/out
           instead of 1x1 conv) + transformer_layers_per_block > 1 (SDXL stacks
           several BasicTransformerBlocks per Transformer2DModel) — the v1 importer
-          hardcodes a 1x1-conv proj and exactly one transformer block.
+          hardcoded a 1x1-conv proj and exactly one transformer block. DONE:
+          TSDUNetConfig now carries UseLinearProjection (config use_linear_projection)
+          + TransformerLayersPerBlock[0..7] (scalar OR per-resolution list, mid uses
+          the deepest resolution, up reverses). AddSDTransformer2D loops the
+          self/cross/FFN BasicTransformerBlock Depth times (refs split into
+          TSDBasicBlockLayers array); proj_in/out stay 1x1 TNNetConvolutionLinear
+          (same per-token map) and LoadSDTransformer2D picks the linear loader
+          ([out,in] nn.Linear) vs conv loader ([out,in,1,1]) by the flag — math is
+          identical, only the stored tensor shape differs. v1 defaults
+          (UseLinearProjection=false, depth=1 everywhere) are BIT-IDENTICAL:
+          TestSDUNetParity unchanged. New fixture tools/sd_unet_linproj_tiny_fixture.py
+          + TestSDUNetLinearProjParity (use_linear_projection=true,
+          transformer_layers_per_block=2) match the numpy oracle < 1e-4.
     - [ ] add_embedding / class/time-aug conditioning (SDXL micro-conditioning),
           and the end-to-end LatentTextToImage capstone (CLIP text -> this UNet
           -> scheduler loop -> VAE decoder).

@@ -9579,6 +9579,12 @@ type
     TextSeqLen: integer;                      // encoder_hidden_states length
     TimeEmbedDim: integer;                    // 4*BlockOutChannels[0]
     ModelType: string;                        // 'UNet2DConditionModel'
+    // SD2.x / SDXL variant knobs (defaults reproduce the SD1.x v1 path
+    // BIT-IDENTICALLY: UseLinearProjection=false, TransformerLayersPerBlock all 1).
+    UseLinearProjection: boolean;             // proj_in/out is nn.Linear ([O,I])
+                                              // not a 1x1 conv ([O,I,1,1])
+    TransformerLayersPerBlock: array[0..7] of integer; // BasicTransformerBlocks
+                                              // per Transformer2DModel, per resolution
   end;
 
 function ReadSDUNetConfigFromJSONFile(const FileName: string): TSDUNetConfig;
@@ -61412,6 +61418,38 @@ begin
     if Result.LatentGrid < 1 then
       ImportError('SD UNet import: resolved latent grid is ' +
         IntToStr(Result.LatentGrid) + ' (must be >= 1).');
+    // SD2.x / SDXL: use_linear_projection (default false -> 1x1-conv proj).
+    Result.UseLinearProjection := Obj.Get('use_linear_projection', false);
+    // transformer_layers_per_block: a scalar (applies to every resolution) or a
+    // list (one per block, SDXL-style e.g. [1,2,10]). Default 1 everywhere.
+    for i := 0 to 7 do Result.TransformerLayersPerBlock[i] := 1;
+    ArrData := Obj.Find('transformer_layers_per_block');
+    if ArrData <> nil then
+    begin
+      if ArrData is TJSONArray then
+      begin
+        Arr := TJSONArray(ArrData);
+        if Arr.Count <> Result.NumBlockOut then
+          ImportError('SD UNet import: "transformer_layers_per_block" list must ' +
+            'have ' + IntToStr(Result.NumBlockOut) + ' entries (one per block), ' +
+            'got ' + IntToStr(Arr.Count) + '.');
+        for i := 0 to LpMax do
+        begin
+          Result.TransformerLayersPerBlock[i] := Arr.Integers[i];
+          if Result.TransformerLayersPerBlock[i] < 1 then
+            ImportError('SD UNet import: "transformer_layers_per_block[' +
+              IntToStr(i) + ']" must be >= 1.');
+        end;
+      end
+      else
+      begin
+        AttnHeadDim := Obj.Get('transformer_layers_per_block', 1);
+        if AttnHeadDim < 1 then
+          ImportError('SD UNet import: "transformer_layers_per_block" must be >= 1.');
+        for i := 0 to 7 do
+          Result.TransformerLayersPerBlock[i] := AttnHeadDim;
+      end;
+    end;
   finally
     Root.Free;
     JsonText.Free;
@@ -61437,18 +61475,32 @@ begin
     ', groups=' + IntToStr(Config.NormNumGroups) +
     ', latent_grid=' + IntToStr(Config.LatentGrid) +
     ', text_seq=' + IntToStr(Config.TextSeqLen);
+  if Config.UseLinearProjection then Result := Result + ', linear_proj';
+  Result := Result + ', tlpb=[';
+  for i := 0 to NumBlockOutM1 do
+  begin
+    if i > 0 then Result := Result + ',';
+    Result := Result + IntToStr(Config.TransformerLayersPerBlock[i]);
+  end;
+  Result := Result + ']';
 end;
 
 type
   TSDResnetLayers = record
     GN1, Conv1, TimeProj, GN2, Conv2, Shortcut: TNNetLayer;
   end;
-  TSDAttnLayers = record
-    GN, ProjIn, ProjOut: TNNetLayer;
+  // One BasicTransformerBlock's layer refs (self-attn / cross-attn / GEGLU FF).
+  TSDBasicBlockLayers = record
     LN1, LN2, LN3: TNNetLayer;
     Self_QKV, Self_Out: TNNetLayer;
     Cross_Q, Cross_K, Cross_V, Cross_Out: TNNetLayer;
     FfProj, FfOut: TNNetLayer;
+  end;
+  // One Transformer2DModel: GN + proj_in/out + a STACK of BasicTransformerBlocks
+  // (transformer_layers_per_block, SDXL stacks >1; SD1.x uses exactly 1).
+  TSDAttnLayers = record
+    GN, ProjIn, ProjOut: TNNetLayer;
+    Blocks: array of TSDBasicBlockLayers;
   end;
 
 // One diffusers ResnetBlock2D with ADDITIVE timestep injection. Same pre-norm
@@ -61526,23 +61578,28 @@ begin
       Prefix + 'conv_shortcut.bias', OutCh, InCh, 1);
 end;
 
-// One diffusers Transformer2DModel: GroupNorm(eps 1e-6) -> proj_in(1x1) ->
-// flatten (H,W,C)->(H*W,1,C) -> a single pre-norm BasicTransformerBlock
-// (self-attn, text cross-attn over TextStates, GEGLU FFN) -> reshape ->
-// proj_out(1x1) -> + residual(input). Self-attn is built per-head exactly like
-// the VAE mid-attention but with token LayerNorm; cross-attn uses per-head
-// TNNetCrossAttention over the projected text states (the landed two-source
-// recipe).
+// One diffusers Transformer2DModel: GroupNorm(eps 1e-6) -> proj_in ->
+// flatten (H,W,C)->(H*W,1,C) -> transformer_layers_per_block pre-norm
+// BasicTransformerBlocks (each: self-attn, text cross-attn over TextStates,
+// GEGLU FFN) -> reshape -> proj_out -> + residual(input). Self-attn is built
+// per-head exactly like the VAE mid-attention but with token LayerNorm;
+// cross-attn uses per-head TNNetCrossAttention over the projected text states
+// (the landed two-source recipe).
+//
+// proj_in/proj_out are built as 1x1 TNNetConvolutionLinear regardless of
+// Config.UseLinearProjection: an nn.Linear over the channel axis and a 1x1 conv
+// are the SAME per-token map -- only the stored tensor shape differs ([O,I] vs
+// [O,I,1,1]), which is purely a loader concern (see LoadSDTransformer2D).
 // Coded by Claude (AI).
 procedure AddSDTransformer2D(NN: TNNet; const Config: TSDUNetConfig;
-  TextStates, Input: TNNetLayer; Channels: integer; pTrainable: boolean;
+  TextStates, Input: TNNetLayer; Channels, Depth: integer; pTrainable: boolean;
   out Refs: TSDAttnLayers);
 var
-  ResidualIn, Tokens, X1, X2, X3, AttnOut, CrossOut, FfHidden: TNNetLayer;
+  ResidualIn, Tokens, X1, X2, X3, CrossOut: TNNetLayer;
   KSlice, VSlice, QSlice, KVPack, KProjFull, VProjFull, QProjFull: TNNetLayer;
   HeadOutputs: array of TNNetLayer;
   QChannels: array of integer;
-  H, W, HeadDim, Heads, hh, dd, Inner, HeadsM1, HeadDimM1: integer;
+  H, W, HeadDim, Heads, hh, dd, Inner, HeadsM1, HeadDimM1, blk: integer;
 begin
   ResidualIn := Input;
   H := ResidualIn.Output.SizeY;
@@ -61560,57 +61617,63 @@ begin
   Tokens := NN.GetLastLayer();
   SetLength(HeadOutputs, Heads);
   SetLength(QChannels, HeadDim);
+  if Depth < 1 then Depth := 1;
+  SetLength(Refs.Blocks, Depth);
 
-  // ---- self-attention (pre-norm) ----
-  Refs.LN1 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), Tokens);
-  Refs.Self_QKV := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(3 * Channels, {SuppressBias=}1).SetTrainable(pTrainable) );
-  AttnOut := NN.AddMultiHeadSelfAttention(Heads, {CausalMask=}false);
-  Refs.Self_Out := NN.GetLastLayer();
-  X1 := NN.AddLayer( TNNetSum.Create([Refs.Self_Out, Tokens]) );
-
-  // ---- cross-attention (pre-norm; K|V from text states) ----
-  Refs.LN2 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), X1);
-  QProjFull := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(Channels, {SuppressBias=}1).SetTrainable(pTrainable), Refs.LN2);
-  Refs.Cross_Q := QProjFull;
-  KProjFull := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(Channels, {SuppressBias=}1).SetTrainable(pTrainable), TextStates);
-  Refs.Cross_K := KProjFull;
-  VProjFull := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(Channels, {SuppressBias=}1).SetTrainable(pTrainable), TextStates);
-  Refs.Cross_V := VProjFull;
-  for hh := 0 to HeadsM1 do
+  for blk := 0 to Depth - 1 do
   begin
-    for dd := 0 to HeadDimM1 do QChannels[dd] := hh * HeadDim + dd;
-    QSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), QProjFull);
-    KSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), KProjFull);
-    VSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), VProjFull);
-    KVPack := NN.AddLayer(TNNetDeepConcat.Create([KSlice, VSlice]));
-    HeadOutputs[hh] := NN.AddLayerAfter(
-      TNNetCrossAttention.Create(HeadDim, {CausalMask=}false, KVPack), QSlice);
-  end;
-  NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
-  Refs.Cross_Out := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(Channels).SetTrainable(pTrainable) );
-  CrossOut := NN.GetLastLayer();
-  X2 := NN.AddLayer( TNNetSum.Create([CrossOut, X1]) );
+    // ---- self-attention (pre-norm) ----
+    Refs.Blocks[blk].LN1 := NN.AddLayerAfter(
+      TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), Tokens);
+    Refs.Blocks[blk].Self_QKV := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(3 * Channels, {SuppressBias=}1).SetTrainable(pTrainable) );
+    NN.AddMultiHeadSelfAttention(Heads, {CausalMask=}false);
+    Refs.Blocks[blk].Self_Out := NN.GetLastLayer();
+    X1 := NN.AddLayer( TNNetSum.Create([Refs.Blocks[blk].Self_Out, Tokens]) );
 
-  // ---- GEGLU feed-forward (pre-norm) ----
-  Refs.LN3 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), X2);
-  Refs.FfProj := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(2 * Inner).SetTrainable(pTrainable) );
-  NN.AddLayer( TNNetGEGLUErf.Create() );
-  FfHidden := NN.GetLastLayer();
-  Refs.FfOut := NN.AddLayer(
-    TNNetPointwiseConvLinear.Create(Channels).SetTrainable(pTrainable) );
-  X3 := NN.AddLayer( TNNetSum.Create([Refs.FfOut, X2]) );
+    // ---- cross-attention (pre-norm; K|V from text states) ----
+    Refs.Blocks[blk].LN2 := NN.AddLayerAfter(
+      TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), X1);
+    QProjFull := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Channels, {SuppressBias=}1).SetTrainable(pTrainable), Refs.Blocks[blk].LN2);
+    Refs.Blocks[blk].Cross_Q := QProjFull;
+    KProjFull := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Channels, {SuppressBias=}1).SetTrainable(pTrainable), TextStates);
+    Refs.Blocks[blk].Cross_K := KProjFull;
+    VProjFull := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Channels, {SuppressBias=}1).SetTrainable(pTrainable), TextStates);
+    Refs.Blocks[blk].Cross_V := VProjFull;
+    for hh := 0 to HeadsM1 do
+    begin
+      for dd := 0 to HeadDimM1 do QChannels[dd] := hh * HeadDim + dd;
+      QSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), QProjFull);
+      KSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), KProjFull);
+      VSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), VProjFull);
+      KVPack := NN.AddLayer(TNNetDeepConcat.Create([KSlice, VSlice]));
+      HeadOutputs[hh] := NN.AddLayerAfter(
+        TNNetCrossAttention.Create(HeadDim, {CausalMask=}false, KVPack), QSlice);
+    end;
+    NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+    Refs.Blocks[blk].Cross_Out := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Channels).SetTrainable(pTrainable) );
+    CrossOut := NN.GetLastLayer();
+    X2 := NN.AddLayer( TNNetSum.Create([CrossOut, X1]) );
+
+    // ---- GEGLU feed-forward (pre-norm) ----
+    Refs.Blocks[blk].LN3 := NN.AddLayerAfter(
+      TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), X2);
+    Refs.Blocks[blk].FfProj := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(2 * Inner).SetTrainable(pTrainable) );
+    NN.AddLayer( TNNetGEGLUErf.Create() );
+    Refs.Blocks[blk].FfOut := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Channels).SetTrainable(pTrainable) );
+    X3 := NN.AddLayer( TNNetSum.Create([Refs.Blocks[blk].FfOut, X2]) );
+    // the next block (if any) consumes this block's token output.
+    Tokens := X3;
+  end;
 
   // ---- fold tokens back to (W,H,C), proj_out, + residual ----
-  NN.AddLayerAfter( TNNetReshape.Create(W, H, Channels), X3 );
+  NN.AddLayerAfter( TNNetReshape.Create(W, H, Channels), Tokens );
   Refs.ProjOut := NN.AddLayer(
     TNNetConvolutionLinear.Create(Channels, 1, 0, 1, 0).SetTrainable(pTrainable) );
   NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), ResidualIn]) );
@@ -61622,47 +61685,66 @@ procedure LoadSDTransformer2D(Reader: TNNetSafeTensorsReader;
   const Refs: TSDAttnLayers; const Prefix: string;
   Channels: integer; const Config: TSDUNetConfig);
 var
-  d, Inner: integer;
+  d, Inner, blk: integer;
   P, TB: string;
 begin
   d := Channels;
   Inner := 4 * Channels;
   P := Prefix;
-  TB := Prefix + 'transformer_blocks.0.';
   LoadVaeGroupNorm(Reader, Refs.GN, P + 'norm', d, SDUNET_TR_EPS);
-  LoadVaeConv(Reader, Refs.ProjIn, P + 'proj_in.weight', P + 'proj_in.bias',
-    d, d, 1);
-  LoadVaeConv(Reader, Refs.ProjOut, P + 'proj_out.weight', P + 'proj_out.bias',
-    d, d, 1);
-  // norms (token LayerNorm gain/bias).
-  LoadLayerNormWeights(Reader, Refs.LN1, TB + 'norm1.weight', TB + 'norm1.bias', d);
-  LoadLayerNormWeights(Reader, Refs.LN2, TB + 'norm2.weight', TB + 'norm2.bias', d);
-  LoadLayerNormWeights(Reader, Refs.LN3, TB + 'norm3.weight', TB + 'norm3.bias', d);
-  // self-attention: q/k/v bias-free -> fused Q|K|V slab; to_out.0 biased.
-  LoadLlamaLinearWeights(Reader, Refs.Self_QKV, TB + 'attn1.to_q.weight',
-    d, d, 0, 3 * d, 0, '');
-  LoadLlamaLinearWeights(Reader, Refs.Self_QKV, TB + 'attn1.to_k.weight',
-    d, d, d, 3 * d, 0, '');
-  LoadLlamaLinearWeights(Reader, Refs.Self_QKV, TB + 'attn1.to_v.weight',
-    d, d, 2 * d, 3 * d, 0, '');
-  LoadLlamaLinearWeights(Reader, Refs.Self_Out, TB + 'attn1.to_out.0.weight',
-    d, d, 0, -1, 0, TB + 'attn1.to_out.0.bias');
-  // cross-attention: to_q over image (d->d), to_k/to_v over text (cross->d),
-  // all bias-free; to_out.0 biased.
-  LoadLlamaLinearWeights(Reader, Refs.Cross_Q, TB + 'attn2.to_q.weight',
-    d, d, 0, -1, 0, '');
-  LoadLlamaLinearWeights(Reader, Refs.Cross_K, TB + 'attn2.to_k.weight',
-    Config.CrossAttentionDim, d, 0, -1, 0, '');
-  LoadLlamaLinearWeights(Reader, Refs.Cross_V, TB + 'attn2.to_v.weight',
-    Config.CrossAttentionDim, d, 0, -1, 0, '');
-  LoadLlamaLinearWeights(Reader, Refs.Cross_Out, TB + 'attn2.to_out.0.weight',
-    d, d, 0, -1, 0, TB + 'attn2.to_out.0.bias');
-  // GEGLU ff: net.0.proj (d -> 2*inner) biased; net.2 (inner -> d) biased.
-  // TNNetGEGLUErf consumes [hidden|gate] in the same chunk(2) order.
-  LoadLlamaLinearWeights(Reader, Refs.FfProj, TB + 'ff.net.0.proj.weight',
-    d, 2 * Inner, 0, -1, 0, TB + 'ff.net.0.proj.bias');
-  LoadLlamaLinearWeights(Reader, Refs.FfOut, TB + 'ff.net.2.weight',
-    Inner, d, 0, -1, 0, TB + 'ff.net.2.bias');
+  // proj_in / proj_out. With use_linear_projection (SD2.x / SDXL) the tensors are
+  // nn.Linear weights stored as [out, in]; without it they are 1x1 conv kernels
+  // stored as [out, in, 1, 1]. The MATH is identical (per-token channel mix), so
+  // the same 1x1 TNNetConvolutionLinear target loads either layout -- a 1x1 conv
+  // neuron's weight vector IS the linear row. Pick the loader by tensor shape.
+  if Config.UseLinearProjection then
+  begin
+    LoadLlamaLinearWeights(Reader, Refs.ProjIn, P + 'proj_in.weight',
+      d, d, 0, -1, 0, P + 'proj_in.bias');
+    LoadLlamaLinearWeights(Reader, Refs.ProjOut, P + 'proj_out.weight',
+      d, d, 0, -1, 0, P + 'proj_out.bias');
+  end
+  else
+  begin
+    LoadVaeConv(Reader, Refs.ProjIn, P + 'proj_in.weight', P + 'proj_in.bias',
+      d, d, 1);
+    LoadVaeConv(Reader, Refs.ProjOut, P + 'proj_out.weight', P + 'proj_out.bias',
+      d, d, 1);
+  end;
+  // each stacked BasicTransformerBlock loads its own weight set.
+  for blk := 0 to Length(Refs.Blocks) - 1 do
+  begin
+    TB := P + 'transformer_blocks.' + IntToStr(blk) + '.';
+    // norms (token LayerNorm gain/bias).
+    LoadLayerNormWeights(Reader, Refs.Blocks[blk].LN1, TB + 'norm1.weight', TB + 'norm1.bias', d);
+    LoadLayerNormWeights(Reader, Refs.Blocks[blk].LN2, TB + 'norm2.weight', TB + 'norm2.bias', d);
+    LoadLayerNormWeights(Reader, Refs.Blocks[blk].LN3, TB + 'norm3.weight', TB + 'norm3.bias', d);
+    // self-attention: q/k/v bias-free -> fused Q|K|V slab; to_out.0 biased.
+    LoadLlamaLinearWeights(Reader, Refs.Blocks[blk].Self_QKV, TB + 'attn1.to_q.weight',
+      d, d, 0, 3 * d, 0, '');
+    LoadLlamaLinearWeights(Reader, Refs.Blocks[blk].Self_QKV, TB + 'attn1.to_k.weight',
+      d, d, d, 3 * d, 0, '');
+    LoadLlamaLinearWeights(Reader, Refs.Blocks[blk].Self_QKV, TB + 'attn1.to_v.weight',
+      d, d, 2 * d, 3 * d, 0, '');
+    LoadLlamaLinearWeights(Reader, Refs.Blocks[blk].Self_Out, TB + 'attn1.to_out.0.weight',
+      d, d, 0, -1, 0, TB + 'attn1.to_out.0.bias');
+    // cross-attention: to_q over image (d->d), to_k/to_v over text (cross->d),
+    // all bias-free; to_out.0 biased.
+    LoadLlamaLinearWeights(Reader, Refs.Blocks[blk].Cross_Q, TB + 'attn2.to_q.weight',
+      d, d, 0, -1, 0, '');
+    LoadLlamaLinearWeights(Reader, Refs.Blocks[blk].Cross_K, TB + 'attn2.to_k.weight',
+      Config.CrossAttentionDim, d, 0, -1, 0, '');
+    LoadLlamaLinearWeights(Reader, Refs.Blocks[blk].Cross_V, TB + 'attn2.to_v.weight',
+      Config.CrossAttentionDim, d, 0, -1, 0, '');
+    LoadLlamaLinearWeights(Reader, Refs.Blocks[blk].Cross_Out, TB + 'attn2.to_out.0.weight',
+      d, d, 0, -1, 0, TB + 'attn2.to_out.0.bias');
+    // GEGLU ff: net.0.proj (d -> 2*inner) biased; net.2 (inner -> d) biased.
+    // TNNetGEGLUErf consumes [hidden|gate] in the same chunk(2) order.
+    LoadLlamaLinearWeights(Reader, Refs.Blocks[blk].FfProj, TB + 'ff.net.0.proj.weight',
+      d, 2 * Inner, 0, -1, 0, TB + 'ff.net.0.proj.bias');
+    LoadLlamaLinearWeights(Reader, Refs.Blocks[blk].FfOut, TB + 'ff.net.2.weight',
+      Inner, d, 0, -1, 0, TB + 'ff.net.2.bias');
+  end;
 end;
 
 // Returns the SKIP layer for HLayer (a down-path skip source). When pWithControl
@@ -61801,8 +61883,8 @@ begin
         HLayer := NN.GetLastLayer();
         if Config.DownHasAttn[i] then
         begin
-          AddSDTransformer2D(NN, Config, TextInput, HLayer, OutCh, pTrainable,
-            DownAttn[i][j]);
+          AddSDTransformer2D(NN, Config, TextInput, HLayer, OutCh,
+            Config.TransformerLayersPerBlock[i], pTrainable, DownAttn[i][j]);
           HLayer := NN.GetLastLayer();
         end;
         Skips[SkipTop] := SDUNetSpliceControlSkip(NN, HLayer, CurGrid, OutCh,
@@ -61835,7 +61917,8 @@ begin
     AddSDResnetBlock(NN, Config, TimeCond, HLayer, MidCh, MidCh, pTrainable,
       MidRes1);
     HLayer := NN.GetLastLayer();
-    AddSDTransformer2D(NN, Config, TextInput, HLayer, MidCh, pTrainable, MidAttn);
+    AddSDTransformer2D(NN, Config, TextInput, HLayer, MidCh,
+      Config.TransformerLayersPerBlock[nM1], pTrainable, MidAttn);
     HLayer := NN.GetLastLayer();
     AddSDResnetBlock(NN, Config, TimeCond, HLayer, MidCh, MidCh, pTrainable,
       MidRes2);
@@ -61871,8 +61954,8 @@ begin
         HLayer := NN.GetLastLayer();
         if Config.UpHasAttn[i] then
         begin
-          AddSDTransformer2D(NN, Config, TextInput, HLayer, OutCh, pTrainable,
-            UpAttn[i][j]);
+          AddSDTransformer2D(NN, Config, TextInput, HLayer, OutCh,
+            Config.TransformerLayersPerBlock[RevIdx], pTrainable, UpAttn[i][j]);
           HLayer := NN.GetLastLayer();
         end;
       end;
@@ -62463,8 +62546,8 @@ begin
         HLayer := NN.GetLastLayer();
         if Cfg.DownHasAttn[i] then
         begin
-          AddSDTransformer2D(NN, Cfg, TextInput, HLayer, OutCh, pTrainable,
-            DownAttn[i][j]);
+          AddSDTransformer2D(NN, Cfg, TextInput, HLayer, OutCh,
+            Cfg.TransformerLayersPerBlock[i], pTrainable, DownAttn[i][j]);
           HLayer := NN.GetLastLayer();
         end;
         Skips[SkipTop] := HLayer; SkipCh[SkipTop] := OutCh; Inc(SkipTop);
@@ -62486,7 +62569,8 @@ begin
     MidCh := Cfg.BlockOutChannels[nM1];
     AddSDResnetBlock(NN, Cfg, TimeCond, HLayer, MidCh, MidCh, pTrainable, MidRes1);
     HLayer := NN.GetLastLayer();
-    AddSDTransformer2D(NN, Cfg, TextInput, HLayer, MidCh, pTrainable, MidAttn);
+    AddSDTransformer2D(NN, Cfg, TextInput, HLayer, MidCh,
+      Cfg.TransformerLayersPerBlock[nM1], pTrainable, MidAttn);
     HLayer := NN.GetLastLayer();
     AddSDResnetBlock(NN, Cfg, TimeCond, HLayer, MidCh, MidCh, pTrainable, MidRes2);
     HLayer := NN.GetLastLayer();

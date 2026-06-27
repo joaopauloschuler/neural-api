@@ -536,6 +536,7 @@ type
     procedure TestVaeEncoderParity;
     procedure TestSDUNetConfigFromJSONFile;
     procedure TestSDUNetParity;
+    procedure TestSDUNetLinearProjParity;
     procedure TestDiffusionInpaintSmoke;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
@@ -21337,6 +21338,105 @@ begin
       end;
     end;
     // encoder_hidden_states (TextSeqLen, CrossDim) -> (SeqLen,1,CrossDim) volume.
+    EncStates.ReSize(Config.TextSeqLen, 1, Config.CrossAttentionDim);
+    for SCnt := 0 to Config.TextSeqLen - 1 do
+    begin
+      EncRow := TJSONArray(EncArr.Items[SCnt]);
+      for DCnt := 0 to Config.CrossAttentionDim - 1 do
+        EncStates.FData[SCnt * Config.CrossAttentionDim + DCnt] :=
+          EncRow.Items[DCnt].AsFloat;
+    end;
+
+    SDUNetDenoise(NN, Config, LatentInput, EncStates, t, Noise);
+
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.OutChannels - 1 do
+    begin
+      RowArr := TJSONArray(NoiseArr.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+        begin
+          RefVal := ChanArr.Items[XCnt].AsFloat;
+          GotVal := Noise.FData[(YCnt * Grid + XCnt) * Config.OutChannels +
+            ChanCnt];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('predicted noise: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    LatentInput.Free;
+    EncStates.Free;
+    Noise.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// SD2.x / SDXL variant parity: use_linear_projection=True (proj_in/out are
+// nn.Linear [out,in] not 1x1 convs) AND transformer_layers_per_block=2 (each
+// Transformer2DModel stacks 2 BasicTransformerBlocks). The oracle in
+// tools/sd_unet_linproj_tiny_fixture.py mirrors both. Verifies the config flags
+// parse, the net builds with the stacked/linear path, and the predicted noise
+// matches the numpy float64 oracle end-to-end (< 1e-4).
+procedure TTestNeuralPretrained.TestSDUNetLinearProjParity;
+var
+  NN: TNNet;
+  Config: TSDUNetConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Latent, ChanArr, RowArr, NoiseArr, EncArr, EncRow: TJSONArray;
+  LatentInput, EncStates, Noise: TNNetVolume;
+  t: double;
+  Grid, ChanCnt, YCnt, XCnt, SCnt, DCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildSDUNetFromSafeTensors(
+    FixturePath('tiny_sd_unet_linproj.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_sd_unet_linproj_config.json'));
+  RefJson := TStringList.Create;
+  LatentInput := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertTrue('use_linear_projection parsed', Config.UseLinearProjection);
+    AssertEquals('transformer_layers_per_block[0]', 2,
+      Config.TransformerLayersPerBlock[0]);
+    AssertEquals('transformer_layers_per_block[1]', 2,
+      Config.TransformerLayersPerBlock[1]);
+    Grid := Config.LatentGrid;
+    AssertEquals('latent grid', Grid, NN.Layers[0].Output.SizeX);
+    RefJson.LoadFromFile(FixturePath('tiny_sd_unet_linproj_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Latent := TJSONArray(TJSONObject(RefRoot).Find('latent'));
+    NoiseArr := TJSONArray(TJSONObject(RefRoot).Find('noise'));
+    EncArr := TJSONArray(TJSONObject(RefRoot).Find('encoder_hidden_states'));
+    t := TJSONObject(RefRoot).Get('timestep', 0.0);
+    AssertTrue('latent present', Latent <> nil);
+    AssertEquals('output grid', Grid, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output channels', Config.OutChannels,
+      NN.GetLastLayer().Output.Depth);
+
+    LatentInput.ReSize(Grid, Grid, Config.InChannels);
+    for ChanCnt := 0 to Config.InChannels - 1 do
+    begin
+      RowArr := TJSONArray(Latent.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+          LatentInput.FData[(YCnt * Grid + XCnt) * Config.InChannels + ChanCnt]
+            := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
     EncStates.ReSize(Config.TextSeqLen, 1, Config.CrossAttentionDim);
     for SCnt := 0 to Config.TextSeqLen - 1 do
     begin
