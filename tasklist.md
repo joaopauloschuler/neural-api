@@ -759,32 +759,13 @@ rather than acted on.
       tests (EnCodec round-trips, TestMimiParity, TestDACRoundTripParity,
       TestHiFiGANSynthesisParity, TestVitsSynthesisParity, TestMusicGen*DecoderParity)
       pass on BOTH scalar-fallback and real -dAVX2 builds. REMAINING:
-  - [X] OpenCL offload of the same accumulation (via the shared dot-product
-        kernel, like FullConnect/Convolution). DONE for the FORWARD conv1d of the
-        EnCodec (`RunEnCodecConv` — covers `TEnCodecModel` + the MusicGen EnCodec
-        decode path) and HiFiGAN/Vits (`RunHiFiGANConv` — covers `TNNetHiFiGAN` +
-        the nested Vits decoder) holders. OPT-IN + default OFF via a process-wide
-        gate (`EnableConvOpenCL(platform,device)` / `DisableConvOpenCL` /
-        `ConvOpenCLEnabled`; the runners are free functions, not methods). When
-        armed AND the stage's GEMM exceeds `FConvOpenCLMinWork` MACs (settable via
-        `SetConvOpenCLMinWork`; small convs stay on CPU as kernel-launch overhead
-        dominates), the per-stage im2col matmul runs as ONE `TDotProductSharedKernel`
-        call: weights transpose into the kernel's interleaved As layout
-        (`WInter[i*OutCh+o]`), patches pack contiguous as Bs (`Patch[t*Size+i]`),
-        result lands `Res[t*OutCh+o]` = the exact same arithmetic as the per-position
-        CPU `DotProduct`. New `TestEnCodecOpenCLConvParity` arms OpenCL (MinWork 0 to
-        force every conv onto the device) and asserts the decode matches the CPU
-        decode `< 1e-4`; all audio parity tests stay `< 1e-4` on BOTH the default
-        (no-`-dOpenCL`, path inert) and `-dOpenCL` builds (PoCL CPU device here;
-        full default suite 2319 tests / 0 failures). Verified on PoCL; the real perf
-        win is large-checkpoint decode on a real GPU (not profilable here — on a CPU
-        device or for small convs the launch overhead can make it slower, hence the
-        opt-in gate + size threshold). DEFERRED (open sub-bullets below): the
-        ConvTranspose1d (upsample) overlap-add path of all holders, and the
-        double-precision Mimi (`RunMimiConv`) / DAC (`RunDACConv`) holders, which use
-        `MimiDotProductD` (Double) — the shared kernel is single-precision, so a
-        Float OpenCL path there would not meet the `< 1e-4` Double-oracle gate
-        without a Double kernel; left on CPU AVX.
+  - [ ] OpenCL offload of the same accumulation (via the shared dot-product kernel,
+        like FullConnect/Convolution). FORWARD conv1d DONE: EnCodec (`RunEnCodecConv`
+        — `TEnCodecModel` + MusicGen EnCodec decode) and HiFiGAN/Vits (`RunHiFiGANConv`)
+        run the per-stage im2col GEMM as one `TDotProductSharedKernel` call, opt-in +
+        default OFF via the `EnableConvOpenCL`/`SetConvOpenCLMinWork` gate;
+        `TestEnCodecOpenCLConvParity` < 1e-4 on both the default and `-dOpenCL` builds.
+        REMAINING:
     - [ ] OpenCL offload of the ConvTranspose1d (upsample) overlap-add accumulation
           (EnCodec + HiFiGAN/Vits); the per-(o,k2)-tap in-channel contraction is the
           same shared-kernel-shaped GEMM but scatters into an overlap-add buffer.
@@ -800,27 +781,14 @@ rather than acted on.
       existing parity tests (TestHiFiGANSynthesisParity / TestVitsSynthesisParity /
       EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
       before/after.
-- [X] Parler-TTS importer (`BuildParlerTTSFromSafeTensors[Ex]` + `TParlerConfig` +
-      `ReadParlerConfigFromJSONFile`/`ParlerConfigToString`, model_type `parler_tts`,
-      e.g. parler-tts/parler-tts-mini-v1) — description-conditioned TTS. LANDED: a
-      (By)T5 text encoder (reuse `BuildT5FromSafeTensors`) encodes a free-text STYLE
-      description for CROSS-ATTENTION; a codec-LM decoder (reuses the shared
-      `BuildMusicGenDecoderNet` — architecturally the Marian/MusicGen PRE-norm
-      cross-attention stack) autoregressively predicts the DELAY-PATTERNED
-      multi-codebook DAC codes; the landed DAC decoder renders the waveform. The
-      genuinely new wiring is the DUAL PROMPT — the transcript prompt token ids are
-      embedded by a separate learned table (`embed_prompts`) and PREPENDED on the
-      sequence axis before the codec frames; the delay-pattern interleave reuses
-      `MusicGenDelayInterleave`/`Deinterleave`. `TParlerTTSModel` holder
-      (`ProjectEncoderStates`/`ComputeLogits`/`Generate`) with the SDPA KV-cache
-      width-1-twin AR decode (bit-identical to the full re-encode, gated). Pico parity
-      `< 1e-4` vs a self-contained numpy float64 oracle (`tools/parler_tiny_fixture.py`,
-      `TestParlerTTSParity` — next-codebook logits AND KV-cache==full-decode),
-      `examples/ParlerTTS` smoke.
-  - [ ] follow-ups: pair the decoder with the real (By)T5 encoder + DAC decoder to a
-        WAVEFORM end-to-end (all three importable in-tree); the real
-        parler-tts-mini-v1 checkpoint key mapping + tokenizers; classifier-free
-        guidance; sampling controls.
+- [ ] Parler-TTS importer end-to-end follow-up (`BuildParlerTTSFromSafeTensors[Ex]`
+      + `TParlerConfig` + `TParlerTTSModel` holder + `examples/ParlerTTS` LANDED,
+      model_type `parler_tts`; (By)T5 description encoder cross-attention + shared
+      `BuildMusicGenDecoderNet` codec-LM decoder over delay-patterned DAC codes +
+      SDPA KV-cache width-1-twin AR decode; pico parity TestParlerTTSParity < 1e-4):
+      pair the decoder with the real (By)T5 encoder + DAC decoder to a WAVEFORM
+      end-to-end (all three importable in-tree); the real parler-tts-mini-v1
+      checkpoint key mapping + tokenizers; classifier-free guidance; sampling controls.
 - [ ] VITS / MMS-TTS end-to-end text-to-speech importer (`BuildVitsFromSafeTensors[Ex]`
       LANDED + `ReadVitsConfigFromJSONFile`/`VitsConfigToString` + the `TVitsConfig`
       record + the `TNNetVits` channel-major holder (Analyze / ExpandPrior /
@@ -869,37 +837,17 @@ rather than acted on.
   - [ ] Mimi STREAMING chunk-at-a-time encode/decode (HF `MimiConv1dPaddingCache`
         per-conv padding cache + KV-cache transformer decode via the landed SDPA
         Begin/EndIncrementalDecode) for O(1) per-frame Moshi-style inference.
-- [X] F5-TTS flow-matching text-to-speech importer (`BuildF5TTSFromSafeTensors[Ex]` +
-      `TF5Config`/`ReadF5ConfigFromJSONFile`, model `SWivid/F5-TTS`) — the
-      leading open NON-autoregressive, NON-GAN voice cloner, genuinely distinct
-      from the landed VITS (GAN), Kokoro/StyleTTS2 (adversarial), Bark (codec-LM)
-      and Parler (codec-LM) paths: it regresses a mel-spectrogram by integrating a
-      conditional-flow-matching ODE (the landed `examples/FlowMatching` +
-      `neuraldiffusion.pas` sampler machinery is the velocity-field driver) through a
-      DiT trunk that is conditioned, in-context, on a masked reference mel + the
-      ConvNeXt-V2-embedded character sequence (no phonemizer — raw chars/pinyin), so
-      the model "infills" the target speech in the reference speaker's voice. Reuses
-      the landed DiT/adaLN-zero blocks, RoPE SDPA and ConvNeXt blocks; the only
-      genuinely new wiring is the text+audio concat conditioning and the sway-sampled
-      timestep schedule. Pair the mel output with the already-landed vocoder path
-      (Vocos/HiFi-GAN) to reach waveform. Pico parity `< 1e-4` vs a float64 HF
-      reference on the DiT velocity field (generator `tools/f5_tiny_fixture.py`,
-      committed `tests/fixtures/tiny_f5.*`) + an `examples/F5TTS` voice-clone smoke.
-      LANDED: `TF5Config`/`ReadF5ConfigFromJSONFile`/`F5ConfigToString` +
-      `BuildF5TTSFromSafeTensors[Ex]` (four-input DiT velocity field: ConvNeXt-V2
-      1-D text embed, in-context `DeepConcat([x_t,cond,text])` input embedding,
-      sinusoidal+MLP time cond, adaLN-zero RoPE-SDPA DiT trunk via the landed
-      `DiTModCond`/`TNNetFiLM` + qkv `rotate_half`->interleaved permute, adaLN
-      norm-out, NO new leaf layer); pico oracle `tools/f5_tiny_fixture.py` (numpy
-      float64 reimpl of the official `dit.py` forward, F5 not in transformers) +
-      `tiny_f5.*` (~29KB) + `TestF5TTSParity` max |diff| ~1.4e-5 < 1e-4;
-      `examples/F5TTS` Euler-ODE voice-clone smoke (outputs MEL; non-AR so no
-      KV-cache) + examples/README.md entry. Open follow-ups: real
-      `SWivid/F5-TTS` checkpoint key-mapping parity (offline/RAM-gated); the
-      mel->waveform Vocos/HiFi-GAN vocoder pairing (v1 emits mel); non-default
-      `rope_theta` (the SDPA RoPE base is fixed at 10000, rejected loudly);
-      the E2-TTS flat-UNet variant (same flow-matching objective, simpler trunk);
-      classifier-free-guidance strength sweep on the cond/uncond DiT pass.
+- [ ] F5-TTS flow-matching TTS follow-ups (`BuildF5TTSFromSafeTensors[Ex]` + `TF5Config`
+      + `ReadF5ConfigFromJSONFile` + `examples/F5TTS` LANDED, model `SWivid/F5-TTS`;
+      NON-autoregressive, NON-GAN voice cloner regressing a mel via a conditional-flow-
+      matching ODE through an adaLN-zero RoPE-SDPA DiT trunk conditioned in-context on a
+      masked reference mel + a ConvNeXt-V2 char embed, reusing the landed DiT/FiLM/RoPE-
+      SDPA blocks, no new leaf; pico parity TestF5TTSParity ~1.4e-5 < 1e-4 on the DiT
+      velocity field): real `SWivid/F5-TTS` checkpoint key-mapping parity (offline/RAM-
+      gated); the mel->waveform Vocos/HiFi-GAN vocoder pairing (v1 emits mel); non-default
+      `rope_theta` (the SDPA RoPE base is fixed at 10000, rejected loudly); the E2-TTS
+      flat-UNet variant (same flow-matching objective, simpler trunk); classifier-free-
+      guidance strength sweep on the cond/uncond DiT pass.
 - [ ] CLAP audio-text contrastive importer (`BuildClapFromSafeTensors[Ex]` +
       `BuildClapFromSafeTensorsWithConfig`, `TClapConfig`/`ReadClapConfigFromJSONFile`)
       + examples/ZeroShotAudioTag — LANDED. Audio-domain analogue of the CLIP
@@ -1080,28 +1028,13 @@ rather than acted on.
         sensible image, and consider a Karras-spaced / Euler-ancestral variant.
       Edit examples/README.md. Mind the 5-min/ulimit budget — default to a smoke run.
 
-- [X] Mask R-CNN instance-segmentation importer + a RoIAlign primitive
-      (RoIAlign DEPENDENCY WAS ALREADY SATISFIED — TNNetRoIAlign had landed in
-      neuralnetwork.pas with full input numerical-gradient + forward + serialization
-      coverage in TestNeuralNumerical.pas; this task wired the importer/FPN/heads).
-      LANDED: BuildMaskRCNNFromSafeTensors[Ex] + BuildMaskRCNN + ReadMaskRCNNConfig
-      FromJSONFile/MaskRCNNConfigToString (TMaskRCNNConfig record) + RunMaskRCNN, the
-      FIRST instance-segmentation vertical (per-OBJECT binary masks, distinct from
-      DETR's boxes-only, SegFormer's single dense class map, SAM's prompt-driven mask).
-      Builds the FPN top-down pyramid (lateral 1x1 inner_blocks + nearest-2x upsample
-      via TNNetDeMaxPool + 3x3 layer_blocks smoothing), RoIAlign of one externally
-      supplied proposal box from the chosen P-level at box-pool 7 + mask-pool 14, the
-      box head (fc6->ReLU->fc7->ReLU -> parallel cls_score + bbox_pred; fc6 input
-      columns PERMUTED PyTorch channel-major -> CAI depth-major in LoadMaskRCNNBoxFC6),
-      and the mask head (4x 3x3 conv+ReLU -> ConvTranspose2d(2,stride2)+ReLU via
-      LoadMaskRCNNDeconv [I,O] axis swap -> 1x1 conv to per-class HxH mask logits).
-      TestMaskRCNNParity: mask-head logits max|diff| = 1.8e-6 (+ cls/bbox) < 1e-4 vs a
-      self-contained numpy float64 oracle (torchvision NOT in the venv — same stance
-      as the ResNet fixture); fixture tools/make_pico_maskrcnn_fixture.py ->
-      tests/fixtures/tiny_maskrcnn.{safetensors(14KB),config.json,ref.json}.
-      examples/InstanceSegmentation overlays the best class's mask on a tiny CPU image
-      and writes a PPM. RoIAlign also unblocks any future two-stage detector (Faster
-      R-CNN box head). Deferred follow-ups (v1 scope was bounded to the tested core):
+- [ ] Mask R-CNN instance-segmentation importer follow-ups (`BuildMaskRCNNFromSafeTensors[Ex]`
+      + `BuildMaskRCNN` + `RunMaskRCNN` + `TMaskRCNNConfig` + `examples/InstanceSegmentation`
+      LANDED, the FIRST instance-segmentation vertical — per-OBJECT binary masks; FPN
+      top-down pyramid + `TNNetRoIAlign` of an externally supplied proposal + box head
+      (fc6/fc7 -> cls_score + bbox_pred) + mask head (4x conv -> ConvTranspose2d -> 1x1
+      per-class mask logits); pico parity TestMaskRCNNParity 1.8e-6 < 1e-4 vs a numpy
+      float64 oracle). Deferred follow-ups (v1 scope was bounded to the tested core):
   - [ ] RPN / anchor generation + proposal NMS (v1 takes EXTERNALLY supplied proposal
         boxes; the RPN head + anchor grid + objectness/box-delta decode + top-k/NMS
         proposal selection are the missing front end for an end-to-end detector).
