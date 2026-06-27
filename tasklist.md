@@ -1814,10 +1814,15 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       Backpropagate, opt cross-entropy training paths into the cheap
       (y - target) shortcut explicitly, and add a regression test that
       checks the shortcut and the full-Jacobian path agree to 1e-5.
-- [ ] TNNetSoftmaxTemperature refactor attempt: extract a shared softmax-
+- [X] TNNetSoftmaxTemperature refactor attempt: extract a shared softmax-
       Jacobian helper so SoftMax / PointwiseSoftMax / SoftmaxTemperature
       reduce to one Backpropagate body parameterised by axis +
       inv-temperature. Pure refactor, gradient tests pin behavior.
+      DONE: protected TNNetPointwiseSoftMax.BackpropagateSoftMaxJacobian(
+      GroupLen, InvScale) iterates contiguous groups (Depth for pointwise,
+      Size for whole-volume) applying y*(g - y.g)*InvScale. All three
+      Backpropagate bodies now call it. Suite green (AVX2 modulo the known
+      TestSetTrainableKeepsOutputs flake).
 - [ ] Cross-entropy regression-style check: confirm classification
       examples (SimpleImage CIFAR) converge to the same loss curve they
       did before the TNNetSoftMax.Backpropagate exact-Jacobian change.

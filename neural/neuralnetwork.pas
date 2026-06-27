@@ -10601,6 +10601,14 @@ type
     FNoForward: boolean;
     procedure PrepareNoForwardMask();
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    // Shared exact softmax-Jacobian backward, accumulated into the previous
+    // layer's OutputError. The softmax is normalized over contiguous groups of
+    // GroupLen elements that tile FOutput (GroupLen = Depth for the per-token
+    // pointwise softmax, GroupLen = FOutput.Size for the whole-volume softmax).
+    // For y = softmax(x/T) within a group, with g = dL/dy:
+    //   dL/dx_i = InvScale * y_i * (g_i - sum_j y_j * g_j)
+    // InvScale carries the inverse temperature (1 for the plain softmax).
+    procedure BackpropagateSoftMaxJacobian(GroupLen: integer; InvScale: TNeuralFloat);
   public
     // Although skipping the derivative calculation is a non standard usage,
     // skipping the derivative can give higher classification accuracy at
@@ -18376,11 +18384,43 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
+procedure TNNetPointwiseSoftMax.BackpropagateSoftMaxJacobian(
+  GroupLen: integer; InvScale: TNeuralFloat);
+var
+  GroupStart, CntInGroup, TotalSize: integer;
+  Dot, Yi: TNeuralFloat;
+begin
+  // Full softmax Jacobian per normalization group. Each group is a run of
+  // GroupLen contiguous elements (the depth axis is depth-contiguous in this
+  // library, so per-(X,Y) pointwise groups and the whole-volume group are
+  // both contiguous). For y_i = softmax(x_i) within a group, g = dL/dy:
+  //   dL/dx_i = InvScale * y_i * (g_i - sum_j y_j * g_j)
+  // This is the O(N) form of the (diag(y) - y*y^T) Jacobian product. A
+  // diagonal-only y*(1-y) form would only be exact when paired with the
+  // cross-entropy loss (off-diagonal terms cancel against the loss
+  // derivative); it is incorrect for any other downstream usage.
+  TotalSize := FOutput.Size;
+  GroupStart := 0;
+  while GroupStart < TotalSize do
+  begin
+    Dot := 0;
+    for CntInGroup := 0 to GroupLen - 1 do
+      Dot := Dot + FOutput.FData[GroupStart + CntInGroup] *
+        FOutputError.FData[GroupStart + CntInGroup];
+    for CntInGroup := 0 to GroupLen - 1 do
+    begin
+      Yi := FOutput.FData[GroupStart + CntInGroup];
+      FPrevLayer.OutputError.FData[GroupStart + CntInGroup] :=
+        FPrevLayer.OutputError.FData[GroupStart + CntInGroup] +
+        InvScale * Yi * (FOutputError.FData[GroupStart + CntInGroup] - Dot);
+    end;
+    GroupStart := GroupStart + GroupLen;
+  end;
+end;
+
 procedure TNNetPointwiseSoftMax.Backpropagate;
 var
   StartTime: double;
-  CntX, CntY, CntD, MaxX, MaxY, MaxD, StartPos: integer;
-  Dot, Yi: TNeuralFloat;
 begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
@@ -18400,36 +18440,9 @@ begin
     end
     else
     begin
-      // Full softmax Jacobian, applied per spatial position (X,Y) over the
-      // depth axis (which is the axis PointwiseSoftMax normalizes over in
-      // the forward pass). For y_i = softmax(x_i) within a group:
-      //   dL/dx_i = y_i * (dL/dy_i - sum_j y_j * dL/dy_j)
-      // This is the O(N) form of the (diag(y) - y*y^T) Jacobian product.
-      // The previous implementation used the diagonal-only y*(1-y)
-      // approximation, which is only exact when paired with cross-entropy
-      // loss (the off-diagonal terms cancel against the loss derivative);
-      // it is incorrect for any other downstream usage.
-      MaxX := FOutput.SizeX - 1;
-      MaxY := FOutput.SizeY - 1;
-      MaxD := FOutput.Depth - 1;
-      for CntX := 0 to MaxX do
-      begin
-        for CntY := 0 to MaxY do
-        begin
-          StartPos := FOutput.GetRawPos(CntX, CntY, 0);
-          Dot := 0;
-          for CntD := 0 to MaxD do
-            Dot := Dot + FOutput.FData[StartPos + CntD] *
-              FOutputError.FData[StartPos + CntD];
-          for CntD := 0 to MaxD do
-          begin
-            Yi := FOutput.FData[StartPos + CntD];
-            FPrevLayer.OutputError.FData[StartPos + CntD] :=
-              FPrevLayer.OutputError.FData[StartPos + CntD] +
-              Yi * (FOutputError.FData[StartPos + CntD] - Dot);
-          end;
-        end;
-      end;
+      // Pointwise softmax normalizes per spatial position (X,Y) over the
+      // depth axis: one group per (X,Y), each of length Depth.
+      BackpropagateSoftMaxJacobian(FOutput.Depth, 1.0);
     end;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -79201,8 +79214,6 @@ end;
 procedure TNNetSoftMax.Backpropagate;
 var
   StartTime: double;
-  Dot, Yi: TNeuralFloat;
-  i, SizeM1: integer;
 begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
@@ -79222,20 +79233,9 @@ begin
     end
     else if FOutput.Size = FOutputError.Size then
     begin
-      // Full softmax Jacobian for the global softmax (TNNetSoftMax normalizes
-      // over the whole volume, not per spatial position):
-      //   dL/dx_i = y_i * (dL/dy_i - sum_j y_j * dL/dy_j)
-      // Single O(N) dot product over the entire output.
-      SizeM1 := FOutput.Size - 1;
-      Dot := 0;
-      for i := 0 to SizeM1 do
-        Dot := Dot + FOutput.FData[i] * FOutputError.FData[i];
-      for i := 0 to SizeM1 do
-      begin
-        Yi := FOutput.FData[i];
-        FPrevLayer.OutputError.FData[i] := FPrevLayer.OutputError.FData[i] +
-          Yi * (FOutputError.FData[i] - Dot);
-      end;
+      // Global softmax: normalizes over the whole volume (not per spatial
+      // position), so the entire output is a single group.
+      BackpropagateSoftMaxJacobian(FOutput.Size, 1.0);
     end;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -79429,8 +79429,7 @@ end;
 procedure TNNetSoftmaxTemperature.Backpropagate;
 var
   StartTime: double;
-  T, InvT, Dot, Yi: TNeuralFloat;
-  i, SizeM1: integer;
+  T: TNeuralFloat;
 begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
@@ -79438,24 +79437,14 @@ begin
   TestBackPropCallCurrCnt();
   T := FFloatSt[0];
   if T = 0 then T := 1.0;
-  InvT := 1.0 / T;
   if Assigned(FPrevLayer) and
     (FPrevLayer.OutputError.Size > 0) and
     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) and
     (FOutput.Size = FOutputError.Size) then
   begin
-    // Full softmax Jacobian with temperature:
-    //   y = softmax(x/T) -> dL/dx_i = (1/T) * y_i * (dL/dy_i - sum_j dL/dy_j y_j)
-    SizeM1 := FOutput.Size - 1;
-    Dot := 0;
-    for i := 0 to SizeM1 do
-      Dot := Dot + FOutputError.FData[i] * FOutput.FData[i];
-    for i := 0 to SizeM1 do
-    begin
-      Yi := FOutput.FData[i];
-      FPrevLayer.OutputError.FData[i] := FPrevLayer.OutputError.FData[i] +
-        InvT * Yi * (FOutputError.FData[i] - Dot);
-    end;
+    // Whole-volume softmax with temperature: y = softmax(x/T), one group over
+    // the whole output, the inverse temperature 1/T scales the Jacobian.
+    BackpropagateSoftMaxJacobian(FOutput.Size, 1.0 / T);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   FPrevLayer.Backpropagate();
