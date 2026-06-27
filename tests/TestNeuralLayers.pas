@@ -24,6 +24,8 @@ type
     procedure TestMaxPoolVectorizedExactParity;
     procedure TestVectorExpScalarParity;
     procedure TestVectorSigmoidScalarParity;
+    procedure TestVectorTanhScalarParity;
+    procedure TestVectorErfScalarParity;
     procedure TestPointwiseSoftMaxVectorizedParity;
     procedure TestNetworkSaveLoad;
     procedure TestSimpleXORLearning;
@@ -548,6 +550,70 @@ begin
       if e > maxErr then maxErr := e;
     end;
     AssertTrue('VectorSigmoid vs Sigmoid max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+  finally
+    Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestVectorTanhScalarParity;
+// VectorTanh must match the scalar pcr_tanhf reference within a tight tolerance
+// on every build (AVX2 8-wide exp path and scalar fallback). N=131 straddles
+// the 8-wide body and the (N mod 8) tail; range covers saturating extremes.
+const
+  N = 131;
+  AbsTol = 1e-4;
+var
+  Src, Dst: TNNetVolume;
+  I: integer;
+  x, e, maxErr: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  try
+    for I := 0 to N - 1 do
+      Src.FData[I] := -12.0 + 24.0 * I / (N - 1);
+    TNNetVolume.VectorTanh(Dst.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      x := Src.FData[I];
+      e := Abs(Dst.FData[I] - pcr_tanhf(x));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorTanh vs pcr_tanhf max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+  finally
+    Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestVectorErfScalarParity;
+// VectorErf (Abramowitz & Stegun 7.1.26) must match the near-exact scalar
+// pcr_erff within tolerance on every build. N=131 straddles the 8-wide exp body
+// and the scalar tail; range covers both the linear region and the saturated tails.
+const
+  N = 131;
+  AbsTol = 1e-4;
+var
+  Src, Dst: TNNetVolume;
+  I: integer;
+  x, e, maxErr: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  try
+    for I := 0 to N - 1 do
+      Src.FData[I] := -4.0 + 8.0 * I / (N - 1);
+    TNNetVolume.VectorErf(Dst.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      x := Src.FData[I];
+      e := Abs(Dst.FData[I] - pcr_erff(x));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorErf vs pcr_erff max abs err ' + FloatToStr(maxErr) +
       ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
   finally
     Src.Free; Dst.Free;

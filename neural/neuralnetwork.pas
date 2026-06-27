@@ -1064,6 +1064,8 @@ type
   // as opposed to "gelu_new"/"gelu_pytorch_tanh" which is the tanh approximation
   // implemented by TNNetGELU. erf is evaluated via pcr_erff. Derivative:
   //   GELU_erf'(x) = Phi(x) + x * phi(x), phi(x) = exp(-x^2/2)/sqrt(2*pi)
+  // erf is evaluated via the vectorized TNNetVolume.VectorErf (A&S 7.1.26,
+  // |err| < 1.5e-7, AVX2-accelerated) in a two-pass forward.
   // Coded by Claude (AI).
   TNNetGELUErf = class(TNNetReLUBase)
   public
@@ -20272,18 +20274,21 @@ begin
   // Let s = sigmoid(x), L = ln(1 + s), t = tanh(L)
   //   dL/dx = s*(1-s) / (1+s)
   //   dy/dx = t + x * (1 - t^2) * dL/dx
+  // Two-pass: VectorSigmoid -> s, then VectorTanh(log1p(s)) -> t, then a scalar
+  // finishing pass combines them (and the derivative).
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
+    // s = sigmoid(x) into FOutputErrorDeriv (reused as scratch, overwritten below).
+    TNNetVolume.VectorSigmoid(@FOutputErrorDeriv.FData[0], @LocalPrevOutput.FData[0],
+      LocalPrevOutput.Size);
+    for OutputCnt := 0 to SizeM1 do
+      FOutput.FData[OutputCnt] := pcr_log1pf(FOutputErrorDeriv.FData[OutputCnt]);
+    TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      // Numerically stable sigmoid.
-      if x >= 0 then
-        s := 1 / (1 + Exp(-x))
-      else
-        s := Exp(x) / (1 + Exp(x));
-      L := pcr_logf(1 + s);
-      t := pcr_tanhf(L);
+      s := FOutputErrorDeriv.FData[OutputCnt];   // sigmoid(x)
+      t := FOutput.FData[OutputCnt];             // tanh(log1p(s))
       FOutput.FData[OutputCnt] := x * t;
       dL := s * (1 - s) / (1 + s);
       FOutputErrorDeriv.FData[OutputCnt] := t + x * (1 - t * t) * dL;
@@ -20291,16 +20296,14 @@ begin
   end
   else
   begin
-    // can't calculate error on input layers.
+    // can't calculate error on input layers: s in FOutput, then log1p, then tanh.
+    TNNetVolume.VectorSigmoid(@FOutput.FData[0], @LocalPrevOutput.FData[0],
+      LocalPrevOutput.Size);
     for OutputCnt := 0 to SizeM1 do
-    begin
-      x := LocalPrevOutput.FData[OutputCnt];
-      if x >= 0 then
-        s := 1 / (1 + Exp(-x))
-      else
-        s := Exp(x) / (1 + Exp(x));
-      FOutput.FData[OutputCnt] := x * pcr_tanhf(pcr_logf(1 + s));
-    end;
+      FOutput.FData[OutputCnt] := pcr_log1pf(FOutput.FData[OutputCnt]);
+    TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+    for OutputCnt := 0 to SizeM1 do
+      FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt] * FOutput.FData[OutputCnt];
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -20517,14 +20520,21 @@ begin
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
+  // Two-pass: fill FOutput with the tanh argument, vectorize tanh in place
+  // (VectorTanh), then a scalar finishing pass reads tanhVal back from FOutput.
+  for OutputCnt := 0 to SizeM1 do
+  begin
+    x := LocalPrevOutput.FData[OutputCnt];
+    x3 := x * x * x;
+    FOutput.FData[OutputCnt] := SQRT_2_OVER_PI * (x + GELU_CONST * x3);
+  end;
+  TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      x3 := x * x * x;
-      tanhArg := SQRT_2_OVER_PI * (x + GELU_CONST * x3);
-      tanhVal := pcr_tanhf(tanhArg);
+      tanhVal := FOutput.FData[OutputCnt];   // tanh(arg) from the vectorized pass
       cdf := 0.5 * (1 + tanhVal);
       outputVal := x * cdf;
       FOutput.FData[OutputCnt] := outputVal;
@@ -20540,9 +20550,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      x3 := x * x * x;
-      tanhArg := SQRT_2_OVER_PI * (x + GELU_CONST * x3);
-      FOutput.FData[OutputCnt] := 0.5 * x * (1 + pcr_tanhf(tanhArg));
+      FOutput.FData[OutputCnt] := 0.5 * x * (1 + FOutput.FData[OutputCnt]);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -20582,12 +20590,17 @@ begin
   StartTime := Now();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
+  // Two-pass: fill FOutput with x/sqrt(2), vectorize erf in place (VectorErf),
+  // then a scalar finishing pass reads erf(x/sqrt(2)) back from FOutput.
+  for OutputCnt := 0 to SizeM1 do
+    FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt] * INV_SQRT_2;
+  TNNetVolume.VectorErf(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      cdf := 0.5 * (1 + pcr_erff(x * INV_SQRT_2));
+      cdf := 0.5 * (1 + FOutput.FData[OutputCnt]);   // FOutput = erf(x/sqrt(2))
       FOutput.FData[OutputCnt] := x * cdf;
       // GELU_erf'(x) = Phi(x) + x * phi(x)
       pdf := INV_SQRT_2PI * pcr_expf(-0.5 * x * x);
@@ -20599,7 +20612,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := x * 0.5 * (1 + pcr_erff(x * INV_SQRT_2));
+      FOutput.FData[OutputCnt] := x * 0.5 * (1 + FOutput.FData[OutputCnt]);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -34982,40 +34995,42 @@ begin
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
+  // Two-pass: fill FOutput with softplus(x), vectorize tanh in place
+  // (VectorTanh), then a scalar finishing pass reads tanh(softplus(x)) back.
+  for OutputCnt := 0 to SizeM1 do
+  begin
+    x := LocalPrevOutput.FData[OutputCnt];
+    // Numerically-stable softplus; tanh saturates correctly at both extremes.
+    if x > 20 then
+      FOutput.FData[OutputCnt] := x
+    else if x < -20 then
+      FOutput.FData[OutputCnt] := pcr_expf(x)
+    else
+      FOutput.FData[OutputCnt] := pcr_log1pf(pcr_expf(x));
+  end;
+  TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      // Numerical stability: for large positive x, exp(x) overflows
-      // softplus(x) = ln(1 + exp(x)) ≈ x for large x
+      tanhSP := FOutput.FData[OutputCnt];   // tanh(softplus(x)) from vectorized pass
       if x > 20 then
       begin
-        // For large x: softplus(x) ≈ x, tanh(x) ≈ 1, sigmoid(x) ≈ 1
-        // Mish(x) ≈ x * 1 = x
-        // Mish'(x) ≈ 1 + x * sech^2(x) * 1 ≈ 1 (since sech^2(x) → 0 for large x)
         FOutput.FData[OutputCnt] := x;
         FOutputErrorDeriv.FData[OutputCnt] := 1.0;
       end
       else if x < -20 then
       begin
-        // For very negative x: softplus(x) ≈ exp(x) ≈ 0, tanh(0) = 0
-        // Mish(x) ≈ 0
-        // Mish'(x) ≈ 0
         FOutput.FData[OutputCnt] := 0;
         FOutputErrorDeriv.FData[OutputCnt] := 0;
       end
       else
       begin
-        expVal := pcr_expf(x);
-        softplus := pcr_logf(1 + expVal);
-        tanhSP := pcr_tanhf(softplus);
         outputVal := x * tanhSP;
         FOutput.FData[OutputCnt] := outputVal;
-        // Derivative: Mish'(x) = tanh(softplus(x)) + x * sigmoid(x) * (1 - tanh^2(softplus(x)))
-        // = tanh(sp) + x * sech^2(sp) * sigmoid(x)
-        // Using omega = exp(x) and delta = 1 + exp(x)
-        // sigmoid(x) = omega / delta
+        // Mish'(x) = tanh(sp) + x * sech^2(sp) * sigmoid(x); sigmoid(x)=omega/delta.
+        expVal := pcr_expf(x);
         omega := expVal;
         delta := 1 + expVal;
         FOutputErrorDeriv.FData[OutputCnt] := tanhSP + x * (1 - tanhSP * tanhSP) * omega / delta;
@@ -35026,17 +35041,7 @@ begin
   begin
     // can't calculate error on input layers.
     for OutputCnt := 0 to SizeM1 do
-    begin
-      x := LocalPrevOutput.FData[OutputCnt];
-      // Numerical stability
-      if x > 20 then
-        softplus := x
-      else if x < -20 then
-        softplus := pcr_expf(x)
-      else
-        softplus := pcr_log1pf(pcr_expf(x));
-      FOutput.FData[OutputCnt] := x * pcr_tanhf(softplus);
-    end;
+      FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt] * FOutput.FData[OutputCnt];
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -35076,21 +35081,36 @@ begin
   SizeM1 := LocalPrevOutput.Size - 1;
 
   // Phish(x) = x * tanh(gelu(x)), where gelu uses the tanh approximation.
+  // Two nested tanh layers, each vectorized: VectorTanh on the GELU argument,
+  // then VectorTanh on g = gelu(x). Scratch passes are scalar.
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
+    // Inner tanh: FOutput := tanh(gelu_arg(x)).
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
       x3 := x * x * x;
-      tanhArg := SQRT_2_OVER_PI * (x + GELU_CONST * x3);
-      tanhVal := pcr_tanhf(tanhArg);
+      FOutput.FData[OutputCnt] := SQRT_2_OVER_PI * (x + GELU_CONST * x3);
+    end;
+    TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+    // FOutput := g = gelu(x); FOutputErrorDeriv := dg/dx (uses inner tanhVal).
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      tanhVal := FOutput.FData[OutputCnt];
       cdf := 0.5 * (1 + tanhVal);
-      g := x * cdf;
-      t := pcr_tanhf(g);
-      FOutput.FData[OutputCnt] := x * t;
-      // dg/dx (same as TNNetGELU derivative).
-      dg := cdf + 0.5 * x * (1 - tanhVal * tanhVal) *
+      FOutput.FData[OutputCnt] := x * cdf;
+      FOutputErrorDeriv.FData[OutputCnt] := cdf + 0.5 * x * (1 - tanhVal * tanhVal) *
         SQRT_2_OVER_PI * (1 + 3 * GELU_CONST * x * x);
+    end;
+    // Outer tanh: FOutput := t = tanh(g).
+    TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      t := FOutput.FData[OutputCnt];
+      dg := FOutputErrorDeriv.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := x * t;
       FOutputErrorDeriv.FData[OutputCnt] := t + x * (1 - t * t) * dg;
     end;
   end
@@ -35101,10 +35121,15 @@ begin
     begin
       x := LocalPrevOutput.FData[OutputCnt];
       x3 := x * x * x;
-      tanhArg := SQRT_2_OVER_PI * (x + GELU_CONST * x3);
-      g := 0.5 * x * (1 + pcr_tanhf(tanhArg));
-      FOutput.FData[OutputCnt] := x * pcr_tanhf(g);
+      FOutput.FData[OutputCnt] := SQRT_2_OVER_PI * (x + GELU_CONST * x3);
     end;
+    TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+    for OutputCnt := 0 to SizeM1 do
+      FOutput.FData[OutputCnt] := 0.5 * LocalPrevOutput.FData[OutputCnt] *
+        (1 + FOutput.FData[OutputCnt]);
+    TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+    for OutputCnt := 0 to SizeM1 do
+      FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt] * FOutput.FData[OutputCnt];
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -35149,22 +35174,32 @@ begin
   SizeM1 := LocalPrevOutput.Size - 1;
   twoOverSqrtPi := 2.0 / Sqrt(Pi);
 
+  // Two-pass: fill FOutput with softplus(x), vectorize erf in place (VectorErf),
+  // then a scalar finishing pass reads erf(softplus(x)) back from FOutput.
+  for OutputCnt := 0 to SizeM1 do
+  begin
+    x := LocalPrevOutput.FData[OutputCnt];
+    if x > 30 then
+      FOutput.FData[OutputCnt] := x
+    else if x < -30 then
+      FOutput.FData[OutputCnt] := pcr_expf(x)
+    else
+      FOutput.FData[OutputCnt] := pcr_log1pf(pcr_expf(x));
+  end;
+  TNNetVolume.VectorErf(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      // Numerically-stable softplus and sigmoid, matching TNNetSoftPlus.
+      erfSp := FOutput.FData[OutputCnt];   // erf(softplus(x)) from vectorized pass
       if x > 30 then
       begin
-        // softplus(x) ~= x grows linearly; erf(sp) saturates to 1; the
-        // exp(-sp^2) factor in the derivative is ~0, so dy/dx ~= 1.
         FOutput.FData[OutputCnt] := x;
         FOutputErrorDeriv.FData[OutputCnt] := 1.0;
       end
       else if x < -30 then
       begin
-        // softplus(x) ~= 0; erf(0) = 0; output and derivative collapse to 0.
         FOutput.FData[OutputCnt] := 0;
         FOutputErrorDeriv.FData[OutputCnt] := 0;
       end
@@ -35172,7 +35207,6 @@ begin
       begin
         sp := pcr_log1pf(pcr_expf(x));
         sig := 1.0 / (1.0 + pcr_expf(-x));
-        erfSp := SerfErf(sp);
         FOutput.FData[OutputCnt] := x * erfSp;
         // dy/dx = erf(sp) + x * (2/sqrt(pi)) * exp(-sp^2) * sigmoid(x)
         FOutputErrorDeriv.FData[OutputCnt] :=
@@ -35184,16 +35218,7 @@ begin
   begin
     // can't calculate error on input layers.
     for OutputCnt := 0 to SizeM1 do
-    begin
-      x := LocalPrevOutput.FData[OutputCnt];
-      if x > 30 then
-        sp := x
-      else if x < -30 then
-        sp := pcr_expf(x)
-      else
-        sp := pcr_log1pf(pcr_expf(x));
-      FOutput.FData[OutputCnt] := x * SerfErf(sp);
-    end;
+      FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt] * FOutput.FData[OutputCnt];
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -36318,26 +36343,29 @@ begin
   // Numerically stable: log(cosh(x)) = |x| + ln(1 + exp(-2*|x|)) - ln(2).
   // For |x| > 15, the exp term underflows to 0 and the result is |x| - ln(2),
   // which avoids EOverflow when cosh(x) itself would explode.
-  // Derivative is tanh(x); for |x| > 15 we saturate to +/-1.
+  // Derivative is tanh(x); for |x| > 15 we saturate to +/-1 (VectorTanh already
+  // saturates there). Two-pass forward: VectorExp produces exp(-2|x|) into FOutput
+  // and VectorTanh produces the derivative; scalar passes finish elementwise.
+  for OutputCnt := 0 to SizeM1 do
+  begin
+    absX := Abs(LocalPrevOutput.FData[OutputCnt]);
+    if absX > 15 then absX := 15;   // exp(-2|x|) has underflowed; clamp arg
+    FOutput.FData[OutputCnt] := -2.0 * absX;
+  end;
+  TNNetVolume.VectorExp(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
+    TNNetVolume.VectorTanh(@FOutputErrorDeriv.FData[0], @LocalPrevOutput.FData[0],
+      LocalPrevOutput.Size);
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
       absX := Abs(x);
       if absX > 15 then
-      begin
-        logCoshVal := absX - cLn2;
-        if x >= 0 then
-          FOutputErrorDeriv.FData[OutputCnt] := 1.0
-        else
-          FOutputErrorDeriv.FData[OutputCnt] := -1.0;
-      end
+        logCoshVal := absX - cLn2
       else
-      begin
-        logCoshVal := absX + pcr_logf(1.0 + pcr_expf(-2.0 * absX)) - cLn2;
-        FOutputErrorDeriv.FData[OutputCnt] := pcr_tanhf(x);
-      end;
+        // FOutput = exp(-2|x|) from the vectorized pass.
+        logCoshVal := absX + pcr_log1pf(FOutput.FData[OutputCnt]) - cLn2;
       FOutput.FData[OutputCnt] := logCoshVal;
     end;
   end
@@ -36346,12 +36374,11 @@ begin
     // can't calculate error on input layers.
     for OutputCnt := 0 to SizeM1 do
     begin
-      x := LocalPrevOutput.FData[OutputCnt];
-      absX := Abs(x);
+      absX := Abs(LocalPrevOutput.FData[OutputCnt]);
       if absX > 15 then
         FOutput.FData[OutputCnt] := absX - cLn2
       else
-        FOutput.FData[OutputCnt] := absX + pcr_logf(1.0 + pcr_expf(-2.0 * absX)) - cLn2;
+        FOutput.FData[OutputCnt] := absX + pcr_log1pf(FOutput.FData[OutputCnt]) - cLn2;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -36716,13 +36743,16 @@ begin
   SizeM1 := LocalPrevOutput.Size - 1;
 
   // LiSHT(x) = x * tanh(x). Derivative is tanh(x) + x * (1 - tanh(x)^2).
-  // tanh(x) is computed once per element and reused for both.
+  // tanh(x) is computed once (vectorized) into FOutput, then reused for both
+  // the activation and its derivative in a scalar finishing pass.
+  TNNetVolume.VectorTanh(@FOutput.FData[0], @LocalPrevOutput.FData[0],
+    LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      t := pcr_tanhf(x);
+      t := FOutput.FData[OutputCnt];     // t = tanh(x) from the vectorized pass
       FOutput.FData[OutputCnt] := x * t;
       FOutputErrorDeriv.FData[OutputCnt] := t + x * (1.0 - t * t);
     end;
@@ -36733,7 +36763,7 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := x * pcr_tanhf(x);
+      FOutput.FData[OutputCnt] := x * FOutput.FData[OutputCnt];
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);

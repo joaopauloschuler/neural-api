@@ -1683,20 +1683,17 @@ rather than acted on.
       `TNNetScaledDotProductAttention` already offload. Offload the projections
       behind an `FShouldOpenCL` gate (the elementwise gate nonlinearities and
       the cell-state recurrence stay on CPU), with an exact-vs-CPU parity test.
-- [ ] AVX-vectorize the remaining scalar transcendental activation FORWARD
-      loops, completing the documented deferral from the landed `AVXExp` /
-      `VectorExp` / `VectorSigmoid` batch (which routed only `PointwiseSoftMax`
-      and `TNNetSwish`). Still strictly per-element scalar: `TNNetGELU`
-      (tanh path), `TNNetGELUErf` (exact-erf path), `TNNetMish`, `TNNetPhish`,
-      `TNNetSerf`, `TNNetSmish`, `TNNetLogCoshActivation`, `TNNetLisht`, plus
-      `TNNetSin` / `TNNetCos` / `TNNetSinhAct` / `TNNetArcSinh`. The original
-      deferral was because forward and derivative are computed interleaved per
-      element; resolve it with the documented two-pass scratch approach (fill
-      the activation with one vectorized forward pass via `VectorExp` /
-      `VectorSigmoid` and new `VectorTanh` / `VectorErf` 8-wide primitives
-      declared alongside them, then a second pass for `FOutputErrorDeriv`).
-      Add per-activation `< 1e-4` parity tests that stay green on BOTH the
-      scalar-fallback and `-dAVX2` builds (mirror `TestVectorExpScalarParity`).
+- [ ] AVX-vectorize the trig/inverse-hyperbolic activation FORWARD loops left
+      scalar by the transcendental-activation batch: `TNNetSin` / `TNNetCos` /
+      `TNNetSinhAct` / `TNNetArcSinh`. These need new `VectorSin` / `VectorCos` /
+      `VectorSinh` / `VectorArcSinh` 8-wide primitives (no existing `VectorExp`-
+      derived identity covers them cleanly), unlike the tanh/erf-based ones which
+      are now two-pass vectorized via `VectorTanh` / `VectorErf`. Done so far:
+      `TNNetGELU`, `TNNetGELUErf`, `TNNetMish`, `TNNetSerf`, `TNNetSmish`,
+      `TNNetPhish`, `TNNetLogCoshActivation`, `TNNetLisht` are vectorized with
+      `VectorTanh`/`VectorErf` (built on `VectorExp`); parity tests
+      `TestVectorTanhScalarParity` / `TestVectorErfScalarParity` (< 1e-4) green on
+      both builds.
 
 (The sub-quadratic / chunked-forward family below is one coherent systems effort:
 every recurrence currently trains as a strict per-token left-to-right scan.)

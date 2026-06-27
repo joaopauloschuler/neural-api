@@ -480,6 +480,14 @@ type
       // VectorSigmoid writes dst[0..N-1] := 1/(1+exp(-src)). AVX2-accelerated
       // path built on VectorExp; numerically stable scalar form on the tail.
       class procedure VectorSigmoid(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // VectorTanh writes dst[0..N-1] := tanh(src[0..N-1]). Built on VectorExp
+      // via tanh(x) = 1 - 2/(exp(2x)+1) so it inherits VectorExp's AVX2 path.
+      // Matches pcr_tanhf to ~1e-6. Buffers may alias (dst = src).
+      class procedure VectorTanh(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // VectorErf writes dst[0..N-1] := erf(src[0..N-1]) using the Abramowitz &
+      // Stegun 7.1.26 approximation (|err| < 1.5e-7, i.e. matches pcr_erff to
+      // ~1e-6). Built on VectorExp so it inherits the AVX2 path. dst may alias src.
+      class procedure VectorErf(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
       procedure AddArea(DestX, DestY, OriginX, OriginY, LenX, LenY: integer; Original: TNNetVolume);
       function HasAVX: boolean; {$IFDEF Release} inline; {$ENDIF}
       function HasAVX2: boolean; {$IFDEF Release} inline; {$ENDIF}
@@ -7457,6 +7465,72 @@ begin
   begin
     S := pDst^[I]; // S = exp(-x)
     pDst^[I] := 1 / (1 + S);
+  end;
+end;
+
+class procedure TNNetVolume.VectorTanh(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+var
+  I: integer;
+  X, E: TNeuralFloat;
+begin
+  if N <= 0 then exit;
+  // tanh(x) = (1 - exp(-2x)) / (1 + exp(-2x)). Compute E = exp(-2x) in a single
+  // vectorized pass, clamping -2x into [-88, 88] so exp neither overflows nor
+  // underflows (tanh saturates to +/-1 there, matching the scalar pcr_tanhf).
+  // No sign read in the finishing pass, so buffers may alias (dst = src).
+  for I := 0 to N - 1 do
+  begin
+    X := -2 * pSrc^[I];
+    if X > 88 then X := 88
+    else if X < -88 then X := -88;
+    pDst^[I] := X;
+  end;
+  VectorExp(pDst, pDst, N);
+  for I := 0 to N - 1 do
+  begin
+    E := pDst^[I]; // E = exp(-2x) in [exp(-88), exp(88)]
+    pDst^[I] := (1 - E) / (1 + E);
+  end;
+end;
+
+class procedure TNNetVolume.VectorErf(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+const
+  // Abramowitz & Stegun 7.1.26 coefficients (|err| < 1.5e-7).
+  cErfA1: TNeuralFloat =  0.254829592;
+  cErfA2: TNeuralFloat = -0.284496736;
+  cErfA3: TNeuralFloat =  1.421413741;
+  cErfA4: TNeuralFloat = -1.453152027;
+  cErfA5: TNeuralFloat =  1.061405429;
+  cErfP:  TNeuralFloat =  0.3275911;
+var
+  I: integer;
+  X, AX, T, Poly, E: TNeuralFloat;
+  ExpBuf: array of TNeuralFloat;
+begin
+  if N <= 0 then exit;
+  // erf(x) = sign(x) * (1 - poly(t)*exp(-x^2)), t = 1/(1+p*|x|).
+  // exp(-x^2) is produced by a single vectorized VectorExp pass into a scratch
+  // buffer (NOT pDst) so that pSrc -- which still holds x for the |x| and sign
+  // terms in the finishing pass -- is never clobbered. Hence dst may alias src.
+  SetLength(ExpBuf, N);
+  for I := 0 to N - 1 do
+  begin
+    X := pSrc^[I];
+    ExpBuf[I] := -X * X;
+  end;
+  VectorExp(TNeuralFloatArrPtr(@ExpBuf[0]), TNeuralFloatArrPtr(@ExpBuf[0]), N);
+  for I := 0 to N - 1 do
+  begin
+    X := pSrc^[I];
+    if X < 0 then AX := -X else AX := X;
+    T := 1 / (1 + cErfP * AX);
+    // Horner: (((a5*t + a4)*t + a3)*t + a2)*t + a1) * t
+    Poly := ((((cErfA5 * T + cErfA4) * T + cErfA3) * T + cErfA2) * T + cErfA1) * T;
+    E := ExpBuf[I];
+    if X < 0 then
+      pDst^[I] := -(1 - Poly * E)
+    else
+      pDst^[I] := 1 - Poly * E;
   end;
 end;
 
