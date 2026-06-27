@@ -11174,16 +11174,27 @@ type
     FSreBuf, FSimBuf: array of Double;      // ComputeCPU per-output spectrum (FSeqLen)
     FGreBuf, FGimBuf: array of Double;      // BackpropagateCPU FFT scratch (FSeqLen)
     FdXreBuf, FdXimBuf: array of array of Double; // BackpropagateCPU input-spectrum grad [FInDepth][FModes]
+    // AVX-contiguous mirrors of the spectral weights, rebuilt in AfterWeightUpdate
+    // from the interleaved W.FData. Layout: index (co*FModes + m)*FInDepth + ci so
+    // that, for a fixed (co,m), the InDepth reduction over ci is a contiguous
+    // DotProduct (the 4-multiply complex GEMM). Single precision for AVX.
+    FWrPlane, FWiPlane: array of TNeuralFloat;
+    // Per-mode contiguous input spectra, index m*FInDepth + ci (Single, AVX).
+    FxrPlane, FximPlane: array of TNeuralFloat;
+    // BackpropagateCPU contiguous input-spectrum gradient, index m*FInDepth + ci.
+    FdXrePlane, FdXimPlane: array of TNeuralFloat;
     procedure ComputeCPU();
     procedure BackpropagateCPU();
     function WBase(m, ci, co: integer): integer;
     procedure FreeBackpropScratch();
+    procedure RebuildWeightPlanes();
   public
     constructor Create(pOutDepth, pModes: integer); overload;
     destructor Destroy(); override;
     function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure InitDefault(); override;
+    procedure AfterWeightUpdate(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     property Modes: integer read FModes;
@@ -62240,6 +62251,8 @@ begin
   SetLength(FGimBuf, 0);
   SetLength(FdXreBuf, 0);
   SetLength(FdXimBuf, 0);
+  SetLength(FdXrePlane, 0);
+  SetLength(FdXimPlane, 0);
 end;
 
 function TNNetSpectralConv1D.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
@@ -62254,6 +62267,10 @@ begin
   SetLength(FXim, 0);
   SetLength(FSreBuf, 0);
   SetLength(FSimBuf, 0);
+  SetLength(FWrPlane, 0);
+  SetLength(FWiPlane, 0);
+  SetLength(FxrPlane, 0);
+  SetLength(FximPlane, 0);
   FreeBackpropScratch();
   inherited Destroy();
 end;
@@ -62299,12 +62316,19 @@ begin
   // FSreBuf/FSimBuf are forward Compute scratch; the rest is backprop-only.
   SetLength(FSreBuf, FSeqLen);
   SetLength(FSimBuf, FSeqLen);
+  // AVX-contiguous weight + input-spectrum planes (forward path).
+  SetLength(FWrPlane, FOutDepth * FModes * FInDepth);
+  SetLength(FWiPlane, FOutDepth * FModes * FInDepth);
+  SetLength(FxrPlane, FModes * FInDepth);
+  SetLength(FximPlane, FModes * FInDepth);
   if FIsTrainable then
   begin
     SetLength(FGreBuf, FSeqLen);
     SetLength(FGimBuf, FSeqLen);
     SetLength(FdXreBuf, FInDepth, FModes);
     SetLength(FdXimBuf, FInDepth, FModes);
+    SetLength(FdXrePlane, FModes * FInDepth);
+    SetLength(FdXimPlane, FModes * FInDepth);
   end;
 
   InitDefault();
@@ -62329,6 +62353,40 @@ begin
     W.FData[i] := scale * (Random - 0.5) * 2;
 end;
 
+// Scatter the interleaved [m][ci][co][Re,Im] persistent weights into the
+// AVX-contiguous Re/Im planes laid out (co,m)-major, ci-minor so the per-output
+// InDepth contraction is a contiguous DotProduct. The persistent storage and its
+// save/load layout are untouched; these planes are a pure read-only mirror.
+procedure TNNetSpectralConv1D.RebuildWeightPlanes();
+var
+  ci, co, m, b, dst: integer;
+  InDepthM1, OutDepthM1, ModesM1: integer;
+  W: TNNetVolume;
+begin
+  if (FInDepth <= 0) or (Length(FWrPlane) = 0) then exit;
+  W := FArrNeurons[0].FWeights;
+  InDepthM1 := FInDepth - 1;
+  OutDepthM1 := FOutDepth - 1;
+  ModesM1 := FModes - 1;
+  for co := 0 to OutDepthM1 do
+    for m := 0 to ModesM1 do
+    begin
+      dst := (co * FModes + m) * FInDepth;
+      for ci := 0 to InDepthM1 do
+      begin
+        b := WBase(m, ci, co);
+        FWrPlane[dst + ci] := W.FData[b];
+        FWiPlane[dst + ci] := W.FData[b + 1];
+      end;
+    end;
+end;
+
+procedure TNNetSpectralConv1D.AfterWeightUpdate();
+begin
+  inherited AfterWeightUpdate();
+  RebuildWeightPlanes();
+end;
+
 procedure TNNetSpectralConv1D.Compute();
 var
   StartTime: double;
@@ -62340,17 +62398,21 @@ end;
 
 procedure TNNetSpectralConv1D.ComputeCPU();
 var
-  ci, co, m, n, b: integer;
+  ci, co, m, n: integer;
   InDepthM1, OutDepthM1, SeqLenM1, ModesM1: integer;
-  PrevOut, W: TNNetVolume;
-  a, bb, xr, xi, yr, yi: Double;
+  wBaseIdx, xBaseIdx: integer;
+  PrevOut: TNNetVolume;
 begin
   PrevOut := FPrevLayer.FOutput;
-  W := FArrNeurons[0].FWeights;
   InDepthM1 := FInDepth - 1;
   OutDepthM1 := FOutDepth - 1;
   SeqLenM1 := FSeqLen - 1;
   ModesM1 := FModes - 1;
+  // Refresh the contiguous weight mirror so a directly hand-edited weight (a
+  // finite-difference perturbation, a freshly LoadFromString'd net, etc.) is
+  // honoured even without an intervening AfterWeightUpdate. Cost is a single
+  // weight-sized copy -- cheap next to the FFTs and the vectorized contraction.
+  RebuildWeightPlanes();
   // 1. Real FFT of every input channel along SeqLen.
   for ci := 0 to InDepthM1 do
   begin
@@ -62361,7 +62423,21 @@ begin
     end;
     FourierMixFFT(FXre[ci], FXim[ci], FSeqLen, false);
   end;
+  // Pack the kept-mode input spectra into contiguous (m,ci) Single planes so the
+  // InDepth contraction below is a vectorizable DotProduct.
+  for m := 0 to ModesM1 do
+  begin
+    xBaseIdx := m * FInDepth;
+    for ci := 0 to InDepthM1 do
+    begin
+      FxrPlane[xBaseIdx + ci] := FXre[ci][m];
+      FximPlane[xBaseIdx + ci] := FXim[ci][m];
+    end;
+  end;
   // 2./3./4. Per output channel: spectral matmul over kept modes, then IFFT.
+  // The InDepth complex contraction is the 4-multiply complex GEMM, each real
+  // reduction an AVX DotProduct over the contiguous ci axis:
+  //   Yre = Wr.xr - Wi.xi ;  Yim = Wr.xi + Wi.xr.
   for co := 0 to OutDepthM1 do
   begin
     for m := 0 to SeqLenM1 do
@@ -62371,21 +62447,14 @@ begin
     end;
     for m := 0 to ModesM1 do
     begin
-      yr := 0;
-      yi := 0;
-      for ci := 0 to InDepthM1 do
-      begin
-        b := WBase(m, ci, co);
-        a := W.FData[b];        // Re R
-        bb := W.FData[b + 1];   // Im R
-        xr := FXre[ci][m];
-        xi := FXim[ci][m];
-        // (a + bb i)(xr + xi i)
-        yr := yr + (a * xr - bb * xi);
-        yi := yi + (a * xi + bb * xr);
-      end;
-      FSreBuf[m] := yr;
-      FSimBuf[m] := yi;
+      wBaseIdx := (co * FModes + m) * FInDepth;
+      xBaseIdx := m * FInDepth;
+      FSreBuf[m] :=
+        TNNetVolume.DotProduct(@FWrPlane[wBaseIdx], @FxrPlane[xBaseIdx], FInDepth) -
+        TNNetVolume.DotProduct(@FWiPlane[wBaseIdx], @FximPlane[xBaseIdx], FInDepth);
+      FSimBuf[m] :=
+        TNNetVolume.DotProduct(@FWrPlane[wBaseIdx], @FximPlane[xBaseIdx], FInDepth) +
+        TNNetVolume.DotProduct(@FWiPlane[wBaseIdx], @FxrPlane[xBaseIdx], FInDepth);
     end;
     FourierMixFFT(FSreBuf, FSimBuf, FSeqLen, true);  // inverse FFT (includes 1/L)
     for n := 0 to SeqLenM1 do
@@ -62414,8 +62483,9 @@ procedure TNNetSpectralConv1D.BackpropagateCPU();
 var
   ci, co, m, n, b: integer;
   W, WDelta, LocalPrevError: TNNetVolume;
-  invL, a, bb, xr, xi, gyr, gyi, contrib: Double;
+  invL, xr, xi, gyr, gyi, contrib: Double;
   InDepthM1, OutDepthM1, SeqLenM1, ModesM1: integer;
+  wBaseIdx, xBaseIdx, planeSize: integer;
 begin
   W := FArrNeurons[0].FWeights;
   WDelta := FArrNeurons[0].FDelta;
@@ -62424,13 +62494,13 @@ begin
   OutDepthM1 := FOutDepth - 1;
   SeqLenM1 := FSeqLen - 1;
   ModesM1 := FModes - 1;
-
-  for ci := 0 to InDepthM1 do
-    for m := 0 to ModesM1 do
-    begin
-      FdXreBuf[ci][m] := 0;
-      FdXimBuf[ci][m] := 0;
-    end;
+  // Contiguous (m,ci) input-spectrum gradient planes -- vectorizable AXPY target.
+  planeSize := FModes * FInDepth;
+  for n := 0 to planeSize - 1 do
+  begin
+    FdXrePlane[n] := 0;
+    FdXimPlane[n] := 0;
+  end;
 
   for co := 0 to OutDepthM1 do
   begin
@@ -62445,25 +62515,40 @@ begin
     begin
       gyr := invL * FGreBuf[m];
       gyi := invL * FGimBuf[m];
+      // Weight gradient: strided writes into the interleaved persistent storage,
+      // kept scalar (and in Double, reading the Double FFT spectra) so the saved
+      // weights and their gradient are byte-for-byte the original layout.
       for ci := 0 to InDepthM1 do
       begin
         b := WBase(m, ci, co);
-        a := W.FData[b];        // Re R
-        bb := W.FData[b + 1];   // Im R
         xr := FXre[ci][m];
         xi := FXim[ci][m];
-        // Weight gradient (accumulate, scaled by -LearningRate so the ordinary
-        // update applies). Yre=a*xr-bb*xi, Yim=a*xi+bb*xr.
+        // Yre=a*xr-bb*xi, Yim=a*xi+bb*xr.
         WDelta.FData[b]     := WDelta.FData[b]     +
           (-FLearningRate) * (gyr * xr + gyi * xi);
         WDelta.FData[b + 1] := WDelta.FData[b + 1] +
           (-FLearningRate) * (-gyr * xi + gyi * xr);
-        // Input-spectrum gradient (sum over co).
-        FdXreBuf[ci][m] := FdXreBuf[ci][m] + (gyr * a + gyi * bb);
-        FdXimBuf[ci][m] := FdXimBuf[ci][m] + (-gyr * bb + gyi * a);
       end;
+      // Input-spectrum gradient (sum over co): contiguous AXPY over the ci axis.
+      //   dXre[ci] += gyr*Wr[ci] + gyi*Wi[ci]
+      //   dXim[ci] += -gyr*Wi[ci] + gyi*Wr[ci]
+      wBaseIdx := (co * FModes + m) * FInDepth;
+      xBaseIdx := m * FInDepth;
+      TNNetVolume.MulAdd(@FdXrePlane[xBaseIdx], @FWrPlane[wBaseIdx], gyr, FInDepth);
+      TNNetVolume.MulAdd(@FdXrePlane[xBaseIdx], @FWiPlane[wBaseIdx], gyi, FInDepth);
+      TNNetVolume.MulAdd(@FdXimPlane[xBaseIdx], @FWiPlane[wBaseIdx], -gyr, FInDepth);
+      TNNetVolume.MulAdd(@FdXimPlane[xBaseIdx], @FWrPlane[wBaseIdx], gyi, FInDepth);
     end;
   end;
+
+  // Scatter the contiguous (m,ci) input-spectrum gradient back to the [ci][m]
+  // scratch the per-channel IFFT below consumes.
+  for ci := 0 to InDepthM1 do
+    for m := 0 to ModesM1 do
+    begin
+      FdXreBuf[ci][m] := FdXrePlane[m * FInDepth + ci];
+      FdXimBuf[ci][m] := FdXimPlane[m * FInDepth + ci];
+    end;
 
   // Propagate the input-spectrum gradient back through the input FFT:
   //   dL/dx[ci][n] = L * Re( IFFT(dXhat[ci]) )[n].

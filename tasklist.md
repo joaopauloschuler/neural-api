@@ -1476,7 +1476,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       pitched as a cheaper FullConnect, but the scalar inner loop currently gives up
       most of that win on AVX builds.
 
-- [ ] AVX-vectorize the complex spectral matmul of TNNetSpectralConv1D. The FFT
+- [X] AVX-vectorize the complex spectral matmul of TNNetSpectralConv1D. The FFT
       forward/inverse are already vectorized, but the channel-mixing contraction in
       the frequency domain is a scalar nested `for co, m, ci` complex multiply-add
       (`yr += Wr*xr - Wi*xi; yi += Wr*xi + Wi*xr`) in both ComputeCPU and
