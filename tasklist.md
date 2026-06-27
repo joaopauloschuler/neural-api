@@ -911,21 +911,29 @@ rather than acted on.
       the existing KANConv numerical-gradient/forward tests staying bit-close on the
       scalar fallback and `< 1e-5` on the device path. Closes a remaining gap in the
       "dot-product-amenable conv layers are OpenCL-armed" set.
-- [ ] Multi-core threading of the single-sample `TNNetFullConnect` forward (and the
-      per-token projection it dominates) for imported-model CPU inference. Today
-      `TNNet` single-sample forward is inherently 1-core — parallelism lives only at
-      BATCH level inside `neuralfit` — so an imported LLM / TTS decoder generating one
-      token at a time pins a single core through its largest matmuls (profiled as a
-      top single-core suspect in the MusicGen / EnCodec decode work, alongside the
-      already-AVX'd inner dot products). Split the output-neuron range of
-      `TNNetFullConnect.Compute` across a `TNeuralThreadList` sized via
-      `NeuralDefaultThreadCount()` (NOT `TThread.ProcessorCount`, which returns 1 in
-      the POCL container — see the EnCodec threading gotcha), gated by a minimum
-      work threshold (Neurons * InputSize) so small layers stay serial, off by default
-      behind a setter the inference holders opt into. Bit-identical vs serial
-      (forced-thread A/B checksum like the EnCodec conv threading), re-profile
-      one-token decode wall-clock before/after on a real imported decoder. Generic win
-      across ChatTerminal / MusicGenText / every `BuildFromSafeTensors` model run on CPU.
+- [X] Multi-core threading of the single-sample `TNNetFullConnect` forward (and the
+      per-token projection it dominates) for imported-model CPU inference. LANDED:
+      `ComputeCPU` of `TNNetFullConnect` (FActivationFn), `TNNetFullConnectLinear`
+      (activation-free q/k/v/o + gate/up/down) and `TNNetFullConnectReLU` (inlined
+      ReLU FFN) now split their independent OUTPUT-NEURON range across a shared
+      `TNeuralThreadList` sized via `NeuralDefaultThreadCount()` (NOT
+      `TThread.ProcessorCount` — the POCL-returns-1 EnCodec gotcha). Each thread owns
+      a disjoint neuron slice and writes only its own `FOutputRaw`/`FOutput` slots, so
+      it is BIT-IDENTICAL to the serial path (per-neuron reduction order unchanged;
+      verified by `TestFullConnectThreadingParity` with `=` equality on both the
+      Linear and ReLU variants, plain + `-dAVX2` builds, forced-thread via
+      `SetFullConnectThreadingMinWork(0)`). OFF by default behind
+      `EnableFullConnectThreading`; gated by a work threshold (Neurons*InputSize MACs,
+      default 256K) via `SetFullConnectThreadingMinWork` so small projections stay
+      serial; the batched neuralfit path is untouched (only the batch-1 CPU
+      `ComputeCPU` is threaded). Pool created lazily, freed in unit finalization.
+      FOLLOW-UPS: (a) the per-token projection HOLDERS (ChatTerminal /
+      MusicGenText / `RunLlama`-style decoders) still need to call
+      `EnableFullConnectThreading(true)` to opt in — wire it into the imported-model
+      run paths; (b) re-profile one-token decode wall-clock before/after on a real
+      imported decoder to tune the default threshold; (c) the int8-quantized
+      `ComputeQuantizedInt8CPU` and `TNNetFullConnectSigmoid`/other activation
+      siblings are still serial.
 - [ ] Parler-TTS importer end-to-end follow-up (`BuildParlerTTSFromSafeTensors[Ex]`
       + `TParlerConfig` + `TParlerTTSModel` holder + `examples/ParlerTTS` LANDED,
       model_type `parler_tts`; (By)T5 description encoder cross-attention + shared

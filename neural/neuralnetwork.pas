@@ -49,7 +49,7 @@ uses
   fgl,
   {$ENDIF}
   Classes, SysUtils, math, syncobjs, neuralvolume, neuralgeneric,
-  neuralbyteprediction, neuralcache, neuralab,
+  neuralbyteprediction, neuralcache, neuralab, neuralthread,
   pascoremath32, pascoremathhelperfuncs;
 
 const
@@ -17729,6 +17729,21 @@ type
   function NeuralConvOpenCLMinWorkValue(): int64;
   {$ENDIF}
 
+  // Opt-in multi-core threading of the SINGLE-SAMPLE TNNetFullConnect forward
+  // (batch size 1), for imported-model CPU decode where TNNet runs one token at
+  // a time and parallelism cannot come from the batch axis. Splits the
+  // independent OUTPUT-NEURON range across NeuralDefaultThreadCount worker
+  // threads; bit-identical to the serial ComputeCPU (per-neuron reduction order
+  // is unchanged - only independent neurons are partitioned). OFF by default;
+  // the batched neuralfit path already parallelizes at batch level and is left
+  // untouched. The threshold (Neurons*InputSize MACs) keeps small projections
+  // serial. EnableFullConnectThreading(false) disables; 0 threshold forces every
+  // layer threaded (parity tests). Coded by Claude (AI).
+  procedure EnableFullConnectThreading(Enabled: boolean = true);
+  function FullConnectThreadingEnabled(): boolean;
+  procedure SetFullConnectThreadingMinWork(MinMACs: int64);
+  function FullConnectThreadingMinWorkValue(): int64;
+
   procedure RebuildPatternOnPreviousPatterns
   (
     Calculated: TNNetVolume;
@@ -17768,6 +17783,43 @@ begin
   Result := NeuralConvOpenCLMinWork;
 end;
 {$ENDIF}
+
+// Single-sample TNNetFullConnect forward threading state (see interface). The
+// shared worker pool is sized from NeuralDefaultThreadCount (NOT
+// TThread.ProcessorCount, which returns 1 in the POCL container - the EnCodec
+// threading gotcha) and created lazily on first threaded forward.
+// Coded by Claude (AI).
+var
+  vFullConnectThreading: boolean = false;
+  vFullConnectThreadingMinWork: int64 = 1 shl 18; // 256K MACs (e.g. 512x512)
+  vFullConnectThreadPool: TNeuralThreadList = nil;
+
+procedure EnableFullConnectThreading(Enabled: boolean = true);
+begin
+  vFullConnectThreading := Enabled;
+end;
+
+function FullConnectThreadingEnabled(): boolean;
+begin
+  Result := vFullConnectThreading;
+end;
+
+procedure SetFullConnectThreadingMinWork(MinMACs: int64);
+begin
+  vFullConnectThreadingMinWork := MinMACs;
+end;
+
+function FullConnectThreadingMinWorkValue(): int64;
+begin
+  Result := vFullConnectThreadingMinWork;
+end;
+
+function FullConnectThreadPool(): TNeuralThreadList;
+begin
+  if vFullConnectThreadPool = nil then
+    vFullConnectThreadPool := TNeuralThreadList.Create(NeuralDefaultThreadCount());
+  Result := vFullConnectThreadPool;
+end;
 
 function BoolToString(B: Boolean; const TrueS, FalseS: string): String; inline;
 begin
@@ -61575,11 +61627,63 @@ begin
   end;
 end;
 
+// Linear (activation-free) single-sample forward worker - this is the variant
+// that dominates imported-LLM per-token projections (q/k/v/o, gate/up/down).
+// Writes only FOutput (no activation, no FOutputRaw). Disjoint neuron slices =>
+// race-free + bit-identical to the serial loop below. Coded by Claude (AI).
+type
+  TNNetFullConnectLinearComputeWorker = class
+  public
+    Layer: TNNetFullConnect;
+    procedure Run(index, threadnum: integer);
+  end;
+
+procedure TNNetFullConnectLinearComputeWorker.Run(index, threadnum: integer);
+var
+  Cnt, StartN, FinN: integer;
+  PrevOutput: TNNetVolume;
+begin
+  TNeuralThreadList.CalculateWorkingRange(index, threadnum,
+    Layer.FNeurons.Count, StartN, FinN);
+  PrevOutput := Layer.FPrevLayer.Output;
+  if Layer.FSuppressBias = 0 then
+  begin
+    for Cnt := StartN to FinN do
+      Layer.FOutput.FData[Cnt] :=
+        Layer.FArrNeurons[Cnt].Weights.DotProduct(PrevOutput) +
+        Layer.FArrNeurons[Cnt].FBiasWeight;
+  end
+  else
+  begin
+    for Cnt := StartN to FinN do
+      Layer.FOutput.FData[Cnt] :=
+        Layer.FArrNeurons[Cnt].Weights.DotProduct(PrevOutput);
+  end;
+end;
+
 procedure TNNetFullConnectLinear.ComputeCPU();
 var
   Cnt, MaxCnt: integer;
+  Pool: TNeuralThreadList;
+  Worker: TNNetFullConnectLinearComputeWorker;
 begin
   MaxCnt := FNeurons.Count - 1;
+  if vFullConnectThreading and
+    (int64(FNeurons.Count) * FVectorSize >= vFullConnectThreadingMinWork) then
+  begin
+    Pool := FullConnectThreadPool();
+    if Pool.Count > 1 then
+    begin
+      Worker := TNNetFullConnectLinearComputeWorker.Create;
+      try
+        Worker.Layer := Self;
+        Pool.StartProc({$IFDEF FPC}@Worker.Run{$ELSE}Worker.Run{$ENDIF});
+      finally
+        Worker.Free;
+      end;
+      exit;
+    end;
+  end;
   if FSuppressBias = 0 then
   begin
     for Cnt := 0 to MaxCnt do
@@ -78203,12 +78307,72 @@ begin
   end;
 end;
 
+// Single-sample ReLU FullConnect forward worker (inlined ReLU, writes both
+// FOutputRaw and FOutput). Disjoint neuron slices => race-free + bit-identical
+// to the serial loop below. Coded by Claude (AI).
+type
+  TNNetFullConnectReLUComputeWorker = class
+  public
+    Layer: TNNetFullConnect;
+    procedure Run(index, threadnum: integer);
+  end;
+
+procedure TNNetFullConnectReLUComputeWorker.Run(index, threadnum: integer);
+var
+  Cnt, StartN, FinN: integer;
+  Sum: TNeuralFloat;
+  PrevOutput: TNNetVolume;
+begin
+  TNeuralThreadList.CalculateWorkingRange(index, threadnum,
+    Layer.FNeurons.Count, StartN, FinN);
+  PrevOutput := Layer.FPrevLayer.Output;
+  if Layer.FSuppressBias = 0 then
+  begin
+    for Cnt := StartN to FinN do
+    begin
+      Sum := Layer.FArrNeurons[Cnt].Weights.DotProduct(PrevOutput) +
+        Layer.FArrNeurons[Cnt].FBiasWeight;
+      Layer.FOutputRaw.FData[Cnt] := Sum;
+      if Sum > 0 then Layer.FOutput.FData[Cnt] := Sum
+        else Layer.FOutput.FData[Cnt] := 0;
+    end;
+  end
+  else
+  begin
+    for Cnt := StartN to FinN do
+    begin
+      Sum := Layer.FArrNeurons[Cnt].Weights.DotProduct(PrevOutput);
+      Layer.FOutputRaw.FData[Cnt] := Sum;
+      if Sum > 0 then Layer.FOutput.FData[Cnt] := Sum
+        else Layer.FOutput.FData[Cnt] := 0;
+    end;
+  end;
+end;
+
 procedure TNNetFullConnectReLU.ComputeCPU();
 var
   Cnt, MaxCnt: integer;
   Sum: TNeuralFloat;
+  Pool: TNeuralThreadList;
+  Worker: TNNetFullConnectReLUComputeWorker;
 begin
   MaxCnt := FNeurons.Count - 1;
+  if vFullConnectThreading and
+    (int64(FNeurons.Count) * FVectorSize >= vFullConnectThreadingMinWork) then
+  begin
+    Pool := FullConnectThreadPool();
+    if Pool.Count > 1 then
+    begin
+      Worker := TNNetFullConnectReLUComputeWorker.Create;
+      try
+        Worker.Layer := Self;
+        Pool.StartProc({$IFDEF FPC}@Worker.Run{$ELSE}Worker.Run{$ENDIF});
+      finally
+        Worker.Free;
+      end;
+      exit;
+    end;
+  end;
   if FSuppressBias = 0 then
   begin
     for Cnt := 0 to MaxCnt do
@@ -81594,12 +81758,78 @@ begin
   end;
 end;
 
+// Single-sample TNNetFullConnect forward worker: each thread owns a disjoint
+// slice of the OUTPUT-NEURON range. Every output neuron's dot product +
+// activation is fully independent (reads the shared, read-only FPrevLayer.Output
+// and per-neuron weights; writes only its own FOutputRaw/FOutput slots), so the
+// split is race-free and BIT-IDENTICAL to the serial ComputeCPU - the per-neuron
+// reduction order inside DotProduct is untouched, only independent neurons are
+// partitioned. Coded by Claude (AI).
+type
+  TNNetFullConnectComputeWorker = class
+  public
+    Layer: TNNetFullConnect;
+    procedure Run(index, threadnum: integer);
+  end;
+
+procedure TNNetFullConnectComputeWorker.Run(index, threadnum: integer);
+var
+  Cnt, StartN, FinN: integer;
+  Sum: TNeuralFloat;
+  PrevOutput: TNNetVolume;
+begin
+  TNeuralThreadList.CalculateWorkingRange(index, threadnum,
+    Layer.FNeurons.Count, StartN, FinN);
+  PrevOutput := Layer.FPrevLayer.Output;
+  if Layer.FSuppressBias = 0 then
+  begin
+    for Cnt := StartN to FinN do
+    begin
+      Sum := Layer.FArrNeurons[Cnt].Weights.DotProduct(PrevOutput) +
+        Layer.FArrNeurons[Cnt].FBiasWeight;
+      Layer.FOutputRaw.FData[Cnt] := Sum;
+      Layer.FOutput.FData[Cnt] := Layer.FActivationFn(Sum);
+    end;
+  end
+  else
+  begin
+    for Cnt := StartN to FinN do
+    begin
+      Sum := Layer.FArrNeurons[Cnt].Weights.DotProduct(PrevOutput);
+      Layer.FOutputRaw.FData[Cnt] := Sum;
+      Layer.FOutput.FData[Cnt] := Layer.FActivationFn(Sum);
+    end;
+  end;
+end;
+
 procedure TNNetFullConnect.ComputeCPU();
 var
   Cnt, MaxCnt: integer;
   Sum: TNeuralFloat;
+  Pool: TNeuralThreadList;
+  Worker: TNNetFullConnectComputeWorker;
 begin
   MaxCnt := FNeurons.Count - 1;
+  // Opt-in single-sample multi-core path: only above the work threshold (small
+  // projections stay serial - kernel dispatch would dominate). The pool is
+  // sized from NeuralDefaultThreadCount. Bit-identical to the serial loops
+  // below. Coded by Claude (AI).
+  if vFullConnectThreading and
+    (int64(FNeurons.Count) * FVectorSize >= vFullConnectThreadingMinWork) then
+  begin
+    Pool := FullConnectThreadPool();
+    if Pool.Count > 1 then
+    begin
+      Worker := TNNetFullConnectComputeWorker.Create;
+      try
+        Worker.Layer := Self;
+        Pool.StartProc({$IFDEF FPC}@Worker.Run{$ELSE}Worker.Run{$ENDIF});
+      finally
+        Worker.Free;
+      end;
+      exit;
+    end;
+  end;
   if FSuppressBias = 0 then
   begin
     for Cnt := 0 to MaxCnt do
@@ -107732,6 +107962,16 @@ initialization
 
 Randomize();
 {$ENDIF}
+
+finalization
+
+// Free the lazily-created single-sample FullConnect worker pool, if armed.
+// Coded by Claude (AI).
+if vFullConnectThreadPool <> nil then
+begin
+  vFullConnectThreadPool.Free;
+  vFullConnectThreadPool := nil;
+end;
 
 end.
 

@@ -16,6 +16,7 @@ type
   TTestNeuralLayers = class(TTestCase)
   published
     procedure TestFullyConnectedForward;
+    procedure TestFullConnectThreadingParity;
     procedure TestConvolutionForward;
     procedure TestWinogradConvolutionParity;
     procedure TestMaxPoolForward;
@@ -134,6 +135,98 @@ begin
     NN.Free;
     Input.Free;
     Output.Free;
+  end;
+end;
+
+// Bit-identical serial-vs-threaded A/B for the opt-in single-sample
+// TNNetFullConnect forward (the EnCodec-conv-style forced-thread checksum, but
+// here it must be EXACTLY equal: only independent output neurons are
+// partitioned, the per-neuron reduction order is unchanged). Forces the
+// threaded path with SetFullConnectThreadingMinWork(0) on a layer well above
+// any sane work threshold, for both the activation (TNNetFullConnect/ReLU) and
+// the activation-free (TNNetFullConnectLinear) variants.
+procedure TTestNeuralLayers.TestFullConnectThreadingParity;
+var
+  Input: TNNetVolume;
+  i: integer;
+
+  // Build a fresh single-FC net, set deterministic weights, compute, copy out.
+  procedure RunCase(IsLinear: boolean; Threaded: boolean; Dst: TNNetVolume);
+  var
+    NN: TNNet;
+    Layer: TNNetFullConnect;
+    neuron, w: integer;
+  begin
+    NN := TNNet.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(256));
+      if IsLinear then
+        Layer := TNNetFullConnectLinear.Create(384)
+      else
+        Layer := TNNetFullConnectReLU.Create(384);
+      NN.AddLayer(Layer);
+      // Deterministic, reproducible weights (independent of the threading flag).
+      for neuron := 0 to Layer.Neurons.Count - 1 do
+      begin
+        for w := 0 to Layer.Neurons[neuron].Weights.Size - 1 do
+          Layer.Neurons[neuron].Weights.Raw[w] :=
+            Sin(neuron * 0.013 + w * 0.0007) * 0.1;
+        Layer.Neurons[neuron].BiasWeight := Cos(neuron * 0.021) * 0.05;
+      end;
+      if Threaded then
+      begin
+        EnableFullConnectThreading(true);
+        SetFullConnectThreadingMinWork(0); // force the threaded path
+      end
+      else
+        EnableFullConnectThreading(false);
+      NN.Compute(Input);
+      Dst.Copy(Layer.Output);
+    finally
+      NN.Free;
+    end;
+  end;
+
+var
+  SerialLin, ThreadLin, SerialAct, ThreadAct: TNNetVolume;
+begin
+  Input := TNNetVolume.Create(256, 1, 1);
+  SerialLin := TNNetVolume.Create();
+  ThreadLin := TNNetVolume.Create();
+  SerialAct := TNNetVolume.Create();
+  ThreadAct := TNNetVolume.Create();
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.05) - 0.3;
+
+    RunCase({IsLinear=}true,  {Threaded=}false, SerialLin);
+    RunCase({IsLinear=}true,  {Threaded=}true,  ThreadLin);
+    RunCase({IsLinear=}false, {Threaded=}false, SerialAct);
+    RunCase({IsLinear=}false, {Threaded=}true,  ThreadAct);
+
+    // Restore the off-by-default state for the rest of the suite.
+    EnableFullConnectThreading(false);
+
+    AssertEquals('Linear output sizes match', SerialLin.Size, ThreadLin.Size);
+    for i := 0 to SerialLin.Size - 1 do
+      AssertTrue('Linear FC threaded must be BIT-IDENTICAL to serial at ' +
+        IntToStr(i), SerialLin.Raw[i] = ThreadLin.Raw[i]);
+
+    AssertEquals('Activation output sizes match', SerialAct.Size, ThreadAct.Size);
+    for i := 0 to SerialAct.Size - 1 do
+      AssertTrue('ReLU FC threaded must be BIT-IDENTICAL to serial at ' +
+        IntToStr(i), SerialAct.Raw[i] = ThreadAct.Raw[i]);
+
+    // Sanity: the layer actually produced varied, finite output (not all zero).
+    AssertFalse('Linear output[0] not NaN', IsNaN(SerialLin.Raw[0]));
+    AssertTrue('Linear output is non-trivial',
+      SerialLin.GetSumAbs() > 0.0);
+  finally
+    Input.Free;
+    SerialLin.Free;
+    ThreadLin.Free;
+    SerialAct.Free;
+    ThreadAct.Free;
   end;
 end;
 
