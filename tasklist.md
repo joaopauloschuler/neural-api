@@ -1585,10 +1585,23 @@ rather than acted on.
 
 ## Layer follow-ups that fix real limitations
 
-- [ ] Rewrite the EnCodec/Mimi/DAC/HiFi-GAN codec reflect/replicate left-padding
-      in `neural/neuralpretrained.pas` to use the landed `TNNetPadXY`/`TNNetPad`
-      padding-mode layer (`pmReflect`/`pmReplicate`) instead of the bespoke
-      per-channel array code in their `PadMode` 'reflect'/'replicate' branches.
+- [X] Investigated rewriting the codec reflect/replicate padding in
+      `neural/neuralpretrained.pas` onto the `TNNetPadXY`/`TNNetPad` padding-mode
+      layer. NOT DONE (no code change) — no real dedup exists and the layer does
+      not fit. Findings: (1) the bespoke pad appears in only TWO places, in two
+      SEPARATE routines — `pmReflect` both-side mirror once in `RunEnCodecConv`
+      (single precision, plain channel-major arrays) and `pmReplicate` edge-clamp
+      once in `RunMimiConv` (DOUBLE precision, `TMimiDblArr`). Reflect != replicate
+      and single != double, so there is nothing duplicated to extract into a shared
+      helper. (2) DAC (`RunDACConv`) and HiFi-GAN (`RunHiFiGANConv`) use only
+      zero/implicit-zero padding — they have NO reflect/replicate branch, so the
+      task's "all four holders share this" premise is inaccurate. (3) These holders
+      do conv1d directly on plain channel-major arrays, while `TNNetPad` operates on
+      `TNNetVolume`; wrapping the layer would force per-conv Volume marshalling
+      (alloc churn) with zero dedup benefit. Each pad site is also a few lines
+      tightly interleaved with the conv's `PadLeft`/`Extra` setup and the im2col
+      gather that reads the padded buffer in place. Conclusion: leave as-is; a
+      refactor would add risk and overhead with no duplication removed.
 
 - [~] Bidirectional + multi-layer stacking for `TNNetLSTMCell` / `TNNetGRUCell`
       (and a real `nn.LSTM`/`nn.GRU` num_layers>1 / bidirectional=True checkpoint
