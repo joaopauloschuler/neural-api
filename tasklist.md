@@ -1280,6 +1280,26 @@ rather than acted on.
       TestMaxChannelRectangular / TestMinChannelRectangular (W<>H forward+gradient)
       + TestMaxChannelSquareRegression in TestNeuralLayers.
 
+- [ ] Vanilla `TNNetLSTMCell` + `TNNetGRUCell` — the standard fully-connected
+      recurrent cells with TRUE recurrent gating (each gate sees the previous
+      hidden state h_{t-1}, and the LSTM carries a separate cell state c_t), i.e.
+      a direct port of torch `nn.LSTMCell`/`nn.GRUCell`. This is a genuine gap, NOT
+      a near-duplicate of anything in tree: `TNNetMinLSTM`/`TNNetMinGRU` deliberately
+      make the gates depend on x_t ONLY (so they parallel-scan), `TNNetSLSTMCell`/
+      `TNNetMLSTMCell` are the xLSTM exp-gated / matrix-memory variants, and
+      `TNNetConvLSTMCell`/`TNNetConvGRUCell` are convolutional. None implement the
+      classic Hochreiter/Cho gates `i,f,o,c̃ = σ/tanh(W_x·x_t + W_h·h_{t-1} + b)`
+      with a real recurrent W_h. Full forward + BPTT (the frozen-h_{t-1} forward
+      gotcha noted for sLSTM applies), input & weight numerical-gradient tests, and
+      a weight layout that maps the torch fused `weight_ih`/`weight_hh` (4·hidden /
+      3·hidden row-packed i,f,g,o gate order) so real `nn.LSTM`/`nn.GRU` checkpoints
+      load without re-training. Immediate payoff: UNBLOCKS the pyannote
+      real-checkpoint follow-up (lines 977-979, which needs exactly this to drop in
+      `pyannote/segmentation-3.0`'s `nn.LSTM` trunk) and any future speech / seq2seq
+      importer whose recurrent core is a stock LSTM/GRU. Bidirectional + multi-layer
+      stacking reuse the existing forward+time-reversed-concat builder idiom used for
+      the MinLSTM trunk (no new wiring needed).
+
 (The sub-quadratic / chunked-forward family below is one coherent systems effort:
 every recurrence currently trains as a strict per-token left-to-right scan.)
 
