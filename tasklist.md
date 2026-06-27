@@ -224,6 +224,22 @@ rather than acted on.
 
 ### Computer vision & generative models
 
+- [ ] BiRefNet / RMBG-2.0 background-removal (dichotomous high-resolution image
+      segmentation) importer (`BuildBiRefNetFromSafeTensors[Ex]`,
+      ZhengPeng7/BiRefNet and briaai/RMBG-2.0, which ships the same BiRefNet
+      architecture). Distinct from the landed semantic/instance/panoptic
+      segmentation paths (SegFormer / Mask2Former / Mask-R-CNN): BiRefNet predicts
+      a SINGLE high-resolution foreground alpha matte via a bilateral-reference
+      decoder — a Swin-L backbone (reuse `BuildSwinFromSafeTensors`) feeding a
+      localization module + a reconstruction decoder whose blocks each take a
+      gradient/inward-reference and an outward-reference feature, upsampled to a
+      full-resolution sigmoid mask. The reusable new pieces are the
+      bilateral-reference decoder block and the multi-scale supervision head;
+      reuse the landed bilinear upsample (`TNNetBilinearUpsample`) and Swin tower.
+      Pico-fixture parity < 1e-4 vs a float64 transformers oracle, plus an
+      `examples/BackgroundRemoval` cutting a subject out of a tiny CPU image
+      (sigmoid mask -> RGBA composite).
+
 - [ ] SDXL conditioning support for the landed SD UNet importer
       (`BuildSDUNetFromSafeTensors`). The current importer scopes to SD-1.x/2.x
       UNets; the SDXL UNet additionally feeds a pooled CLIP text-embedding plus a
@@ -540,6 +556,19 @@ rather than acted on.
       int8 weight-only storage instead of dequantize-then-requantize (the
       k-quant Q4_K/Q6_K/Q5_K/Q2_K dequant-at-load READ path has landed in
       neural/neuralgguf.pas).
+- [ ] OpenCL forward offload (and an AVX inner loop) for the bilinear-resample
+      layer family: `TNNetBilinearUpsample`, `TNNetAffineGridSample`,
+      `TNNetFlowWarp` and `TNNetBackwardWarp`. Today only `TNNetDeformableConv`
+      has an OpenCL path (`TNNetDeformableConv.ComputeOpenCL`); these per-output-
+      pixel bilinear-gather layers — exercised by the OpticalFlow,
+      VideoFrameInterpolation, FrameInterpolation, SpatialTransformer and
+      super-resolution examples — run a scalar (x,y)-over-output loop. The gather
+      (4 source taps × clamped coords × bilinear weights) is embarrassingly
+      parallel per output position and depth-contiguous, so it maps cleanly onto
+      a workgroup-per-output-pixel kernel mirroring the DeformableConv offload,
+      and the CPU fallback can vectorize the depth-axis tap blend with the
+      existing AVX `MulAdd` primitive. Gate behind the existing
+      `EnableOpenCL`/`WillOpenCL` plumbing and parity-check vs the scalar forward.
 - [ ] FP16 (half-precision) OpenCL compute path for the dot-product/matmul
       offload. ENV NOTE (2026-06-27): the only OpenCL device available here is
       PoCL on the host CPU, which does NOT advertise `cl_khr_fp16` (clinfo shows
@@ -1521,6 +1550,21 @@ rather than acted on.
       Pico-fixture parity < 1e-4 vs a float64 HF Kosmos2ForConditionalGeneration.
 
 ## Layer follow-ups that fix real limitations
+
+- [ ] Non-zero padding modes for `TNNetPadXY` (and `TNNetPad`): add a
+      `TNNetPadMode` argument — `pmZero` (current behaviour, default), `pmReflect`,
+      `pmReplicate` (edge-clamp) and `pmCircular` — porting `torch.nn.ReflectionPad2d`
+      / `ReplicationPad2d` / circular `F.pad`. Forward copies the mirrored / clamped
+      / wrapped border columns instead of zeros; backward SCATTERS each padded
+      output cell's gradient back onto the real source column it was copied from
+      (reflect/replicate accumulate onto interior/edge columns, circular wraps),
+      so it stays a parameter-free differentiable layer. High value because reflect
+      and replicate padding are the standard CV-generator padding (style-transfer
+      / SR generators) AND it lets the hand-rolled reflect/replicate left-padding
+      inside the EnCodec / Mimi / DAC / HiFi-GAN codec convs in
+      `neural/neuralpretrained.pas` (their `PadMode` 'reflect'/'replicate' branches)
+      be expressed with a real layer rather than bespoke array code. Numerical-
+      gradient test per mode; serialization round-trip for the new enum arg.
 
 - [~] Bidirectional + multi-layer stacking for `TNNetLSTMCell` / `TNNetGRUCell`
       (and a real `nn.LSTM`/`nn.GRU` num_layers>1 / bidirectional=True checkpoint
