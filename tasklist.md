@@ -1463,7 +1463,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       copies. These layers run an optimizer step per token, so the inner matmul is
       the dominant cost. Numerical-gradient tests stay the correctness oracle.
 
-- [ ] AVX-vectorize the block / factor GEMMs of TNNetMonarchLinear and
+- [X] AVX-vectorize the block / factor GEMMs of TNNetMonarchLinear and
       TNNetKroneckerLinear. Both never materialize the full weight, so their forward
       and backward are small dense matrix-vector products inside nested scalar
       `for row, col: acc += W[row,col]*x[col]` loops (Monarch's two per-block m x m

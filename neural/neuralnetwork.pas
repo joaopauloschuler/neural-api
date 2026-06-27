@@ -12063,6 +12063,7 @@ type
     FCacheZP: TNNetVolume; // P*(R*x) (length n, (m,b) layout)
     FdyTBuf: array of TNeuralFloat; // backward scratch, length n
     FdxRBuf: array of TNeuralFloat; // backward scratch, length n
+    FColBuf: array of TNeuralFloat; // contiguous gather of a strided zP column, length m
     procedure ComputeCPU();
     procedure BackpropagateCPU();
     procedure FreeBackpropScratch();
@@ -66432,6 +66433,7 @@ destructor TNNetMonarchLinear.Destroy();
 begin
   FCacheXR.Free;
   FCacheZP.Free;
+  SetLength(FColBuf, 0);
   FreeBackpropScratch();
   inherited Destroy();
 end;
@@ -66463,6 +66465,9 @@ begin
   SetOutputErrorSize(N, 1, 1);
   FCacheXR.ReSize(N, 1, 1);
   FCacheZP.ReSize(N, 1, 1);
+  // Contiguous gather buffer for a strided zP column (used by the forward L pass
+  // and the backward L-grad). Length m; needed even in inference.
+  SetLength(FColBuf, FBlockSize);
   // Backprop-only scratch: skip on inference-only layers.
   if FIsTrainable then
   begin
@@ -66539,7 +66544,6 @@ var
   b, m, r, c, k, t, blkBase: integer;
   MaxBlk, MaxM: integer;
   PrevOut, WR, WL, Bias: TNNetVolume;
-  acc: TNeuralFloat;
 begin
   b := FBlocks;
   m := FBlockSize;
@@ -66550,17 +66554,14 @@ begin
   WL := FArrNeurons[1].FWeights;
   Bias := FArrNeurons[2].FWeights;
 
-  // Pass 1: R (per row/block r) -> xR in (b,m) layout.
+  // Pass 1: R (per row/block r) -> xR in (b,m) layout. The inner-t accumulation
+  // is a contiguous dot product of WR's k-th row and x's r-th block.
   for r := 0 to MaxBlk do
   begin
     blkBase := r * m * m;
     for k := 0 to MaxM do
-    begin
-      acc := 0;
-      for t := 0 to MaxM do
-        acc := acc + WR.FData[blkBase + k * m + t] * PrevOut.FData[r * m + t];
-      FCacheXR.FData[r * m + k] := acc;
-    end;
+      FCacheXR.FData[r * m + k] :=
+        TNNetVolume.DotProduct(@WR.FData[blkBase + k * m], @PrevOut.FData[r * m], m);
   end;
 
   // Pass 2: P -> zP[k,c] = xR[c,k]  (in (m,b) layout, index k*b+c).
@@ -66568,18 +66569,18 @@ begin
     for k := 0 to MaxM do
       FCacheZP.FData[k * b + c] := FCacheXR.FData[c * m + k];
 
-  // Pass 3 + 4: L (per column/block c) then P^T into FOutput (b,m layout).
+  // Pass 3 + 4: L (per column/block c) then P^T into FOutput (b,m layout). zP's
+  // c-column is strided (stride b); gather it once into FColBuf so the inner-t
+  // accumulation becomes a contiguous dot product against WL's k-th row.
   for c := 0 to MaxBlk do
   begin
     blkBase := c * m * m;
+    for t := 0 to MaxM do
+      FColBuf[t] := FCacheZP.FData[t * b + c];
     for k := 0 to MaxM do
-    begin
-      acc := 0;
-      for t := 0 to MaxM do
-        acc := acc + WL.FData[blkBase + k * m + t] * FCacheZP.FData[t * b + c];
       // P^T: output (m,b)[k,c] goes to (b,m)[c,k] -> index c*m+k.
-      FOutput.FData[c * m + k] := acc;
-    end;
+      FOutput.FData[c * m + k] :=
+        TNNetVolume.DotProduct(@WL.FData[blkBase + k * m], @FColBuf[0], m);
   end;
 
   if FSuppressBias = 0 then
@@ -66647,16 +66648,18 @@ begin
   for c := 0 to MaxBlk do
   begin
     blkBase := c * m * m;
-    // dL_c[k,t] += dyT[k,c] * zP[t,c].
+    // zP's c-column is strided (stride b); gather it once into FColBuf so the
+    // dL_c[k,t] += -LR*dyT[k,c]*zP[t,c] update is a contiguous MulAdd over t.
+    for t := 0 to MaxM do
+      FColBuf[t] := FCacheZP.FData[t * b + c];
     for k := 0 to MaxM do
     begin
       e := FdyTBuf[k * b + c];
-      for t := 0 to MaxM do
-        WLDelta.FData[blkBase + k * m + t] :=
-          WLDelta.FData[blkBase + k * m + t]
-          - FLearningRate * e * FCacheZP.FData[t * b + c];
+      TNNetVolume.MulAdd(@WLDelta.FData[blkBase + k * m], @FColBuf[0],
+        -FLearningRate * e, m);
     end;
-    // dzP[t,c] = sum_k L_c[k,t]*dyT[k,c]; then dxR[c,t] = dzP[t,c] (P^T).
+    // dzP[t,c] = sum_k L_c[k,t]*dyT[k,c]; then dxR[c,t] = dzP[t,c] (P^T). Inner k
+    // strides both WL (stride m) and dyT (stride b), so this stays scalar.
     for t := 0 to MaxM do
     begin
       acc := 0;
@@ -66670,14 +66673,11 @@ begin
   for r := 0 to MaxBlk do
   begin
     blkBase := r * m * m;
+    // dR_r[k,t] += -LR*dxR[r,k]*x[r,t]: contiguous MulAdd over t (WRDelta k-th
+    // row, x's r-th block).
     for k := 0 to MaxM do
-    begin
-      e := FdxRBuf[r * m + k];
-      for t := 0 to MaxM do
-        WRDelta.FData[blkBase + k * m + t] :=
-          WRDelta.FData[blkBase + k * m + t]
-          - FLearningRate * e * PrevOut.FData[r * m + t];
-    end;
+      TNNetVolume.MulAdd(@WRDelta.FData[blkBase + k * m], @PrevOut.FData[r * m],
+        -FLearningRate * FdxRBuf[r * m + k], m);
     if HasPrevError then
       for t := 0 to MaxM do
       begin
@@ -66852,25 +66852,23 @@ begin
   WB := FArrNeurons[1].FWeights;
   Bias := FArrNeurons[2].FWeights;
 
-  // BX[i,l] = sum_k B[i,k]*X[k,l]  (X[k,l] = x[k*p+l]).
+  // BX[i,l] = sum_k B[i,k]*X[k,l]  (X[k,l] = x[k*p+l]). X[w,:] (= PrevOut's w-th
+  // p-segment) is contiguous in l, so accumulate BX[i,:] as a sum of contiguous
+  // MulAdds B[i,w]*X[w,:] instead of dotting B's strided w-column.
   for i := 0 to MaxQ do
-    for l := 0 to MaxP do
-    begin
-      acc := 0;
-      for w := 0 to MaxQ do
-        acc := acc + WB.FData[i * q + w] * PrevOut.FData[w * p + l];
-      FCacheBX.FData[i * p + l] := acc;
-    end;
+  begin
+    FillDWord(FCacheBX.FData[i * p], p, 0);
+    for w := 0 to MaxQ do
+      TNNetVolume.MulAdd(@FCacheBX.FData[i * p], @PrevOut.FData[w * p],
+        WB.FData[i * q + w], p);
+  end;
 
-  // Y[i,j] = sum_l BX[i,l]*A[j,l]; y[i*p+j] = Y[i,j].
+  // Y[i,j] = sum_l BX[i,l]*A[j,l]; y[i*p+j] = Y[i,j]. Inner l is contiguous on
+  // both BX (i-th row) and WA (j-th row): a dot product.
   for i := 0 to MaxQ do
     for j := 0 to MaxP do
-    begin
-      acc := 0;
-      for l := 0 to MaxP do
-        acc := acc + FCacheBX.FData[i * p + l] * WA.FData[j * p + l];
-      FOutput.FData[i * p + j] := acc;
-    end;
+      FOutput.FData[i * p + j] :=
+        TNNetVolume.DotProduct(@FCacheBX.FData[i * p], @WA.FData[j * p], p);
 
   if FSuppressBias = 0 then
     FOutput.Add(Bias);
@@ -66950,15 +66948,12 @@ begin
       FGBuf[i * p + l] := acc;
     end;
 
-  // dB[i,k] += sum_l G[i,l]*X[k,l]   (X[k,l] = x[k*p+l]).
+  // dB[i,k] += sum_l G[i,l]*X[k,l]   (X[k,l] = x[k*p+l]). Inner l is contiguous
+  // on both G (i-th row) and X (= PrevOut's k-th p-segment): a dot product.
   for i := 0 to MaxQ do
     for k := 0 to MaxQ do
-    begin
-      acc := 0;
-      for l := 0 to MaxP do
-        acc := acc + FGBuf[i * p + l] * PrevOut.FData[k * p + l];
-      WBDelta.FData[i * q + k] := WBDelta.FData[i * q + k] - FLearningRate * acc;
-    end;
+      WBDelta.FData[i * q + k] := WBDelta.FData[i * q + k]
+        - FLearningRate * TNNetVolume.DotProduct(@FGBuf[i * p], @PrevOut.FData[k * p], p);
 
   // dX[k,l] = sum_i B[i,k]*G[i,l]; dx[k*p+l] = dX[k,l].
   if HasPrevError then
