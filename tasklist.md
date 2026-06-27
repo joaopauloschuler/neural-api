@@ -1356,7 +1356,23 @@ rather than acted on.
       transcription) importer; reuses Swin + mBART that already ship. Pico-fixture
       cross-entropy parity < 1e-4 vs a float64 HF VisionEncoderDecoderModel.
 
-- [ ] Stable Diffusion img2img + inpainting pipelines. The landed SD path
+- [~] Stable Diffusion img2img + inpainting pipelines. DONE (commit 2191b80): the
+      VAE ENCODER gap is closed — BuildVaeEncoderFromSafeTensors[Ex] +
+      ReadVaeEncoderConfigFromJSONFile land the diffusers AutoencoderKL encoder
+      (conv_in -> down blocks with stride-2 downsample convs reproducing the
+      asymmetric (0,1,0,1) pad -> mid self-attn -> conv_norm_out/conv_out ->
+      quant_conv), reusing every decoder helper (TVaeDecoderConfig,
+      AddVaeResnetBlock, AddVaeAttention, LoadVaeConv). The net's final layer crops
+      to mean and applies the 0.18215 scaling_factor = the deterministic img2img
+      init-latent setup. Pico fixture (tools/vae_encoder_tiny_fixture.py ->
+      tests/fixtures/tiny_vae_encoder*) + TestVaeEncoderParity (numpy float64
+      oracle, max|diff| < 1e-4) + TestVaeRoundTrip (encode->decode end to end).
+      STILL OPEN: (1) full sampler-loop img2img — start the existing sampler at
+      timestep int(strength*num_steps) with scheduler.add_noise on the init latents
+      (alphas_cumprod schedule already exists); (2) the non-deterministic
+      reparameterize head (mean+exp(0.5*logvar)*noise); (3) inpainting blend +
+      9-channel inpaint conv_in widening.
+      ORIGINAL NOTE — The landed SD path
       (BuildVaeDecoderFromSafeTensors + BuildSDUNetFromSafeTensors + SDUNetDenoise +
       the neuraldiffusion sampler zoo) does text-to-image only — it starts denoising
       from pure Gaussian latents. The two highest-value missing modes reuse ALL of
