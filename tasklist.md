@@ -1777,9 +1777,12 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
         contiguous spatial axis (and the symmetric backward mirrors it). Speeds up
         the style-transfer / AdaIN Gram path; document the scratch alloc in
         SetPrevLayer per the preallocated-scratch convention.
-- [ ] Add missing `README.md` to example folders that ship a `.lpr` but no
+- [X] Add missing `README.md` to example folders that ship a `.lpr` but no
       README (the CV/generative six — VQGAN, TinyNeRF, VideoFrameInterpolation,
       VideoPrediction, VideoAction, VideoActionTiny — LANDED commit 0cf2ea59).
+      DONE: every example folder shipping a `.lpr` now has a README. The final
+      three were WeightDriftReport, YoloDetect and ZeroShotAudioTag (written
+      strictly from their `.lpr`, matching existing example-README style).
       Remaining folders still lacking a README (write each strictly from the
       `.lpr`, matching existing example-README style; no source edits):
   - [X] NLP/decoding: BeamSearchDecode, SpanCorruptionPretrain, sentimentAnalysis,
