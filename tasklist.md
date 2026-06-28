@@ -1986,7 +1986,7 @@ Open follow-up surfaced while landing them:)
 tasklist and confirmed ABSENT before listing. Categories follow the lucky-day
 priority list: AVX vectorization of an existing layer, then importer dedup.)
 
-- [ ] AVX-vectorize the FlashAttention `TNNetScaledDotProductAttention.ComputeTiled`
+- [X] AVX-vectorize the FlashAttention `TNNetScaledDotProductAttention.ComputeTiled`
       forward online-softmax accumulation (neuralnetwork.pas ~line 28761). The hot
       per-(query, key)-inner loop is currently scalar over the contiguous head-dim
       axis:
