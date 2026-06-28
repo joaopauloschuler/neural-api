@@ -1140,6 +1140,29 @@ type
   function NeuralLinearSolve(var A: array of TNeuralFloat;
     var B: array of TNeuralFloat; n, m: integer): boolean;
 
+  { NeuralBoxIoU returns the Intersection-over-Union of two axis-aligned boxes
+    given in corner (x1,y1,x2,y2) format (x2>=x1, y2>=y1; pixel or any
+    consistent unit). Degenerate boxes are clamped to zero area, and a zero
+    union yields 0. This is the single shared box-IoU used by the object-
+    detection NMS / matching code across the importers and examples. }
+  function NeuralBoxIoU(AX1, AY1, AX2, AY2,
+    BX1, BY1, BX2, BY2: TNeuralFloat): TNeuralFloat;
+
+  { NeuralGreedyNMS runs greedy, score-sorted, class-aware Non-Max-Suppression
+    over Count boxes. Boxes are passed as four parallel flat arrays in corner
+    (x1,y1,x2,y2) format; Scores[i] is box i's confidence; Classes[i] is its
+    integer class id. The routine does NOT mutate any input array. It returns
+    the kept box indices, ORDERED by descending score (ties keep the original
+    relative order, because the internal sort is a stable selection sort over
+    the index permutation). A box j is suppressed by an earlier (higher-score)
+    kept box i ONLY when Classes[j] = Classes[i] AND IoU(i,j) > IoUThreshold
+    (strictly greater, matching the YOLO post-process). Pass a class array of
+    all-equal ids for class-agnostic NMS. }
+  function NeuralGreedyNMS(
+    const BX1, BY1, BX2, BY2, Scores: array of TNeuralFloat;
+    const Classes: array of integer; Count: integer;
+    IoUThreshold: TNeuralFloat): TNeuralIntegerArray;
+
   { RandomBetaValue draws a sample from a Beta(Alpha, Alpha) distribution
     using the repo's global Random RNG. Implemented via two Gamma(Alpha,1)
     draws: Beta = Ga/(Ga+Gb). For Alpha=1 this reduces to Uniform(0,1), the
@@ -2008,6 +2031,74 @@ begin
         B[row * m + k] := B[row * m + k] - factor * B[col * m + k];
     end;
   end;
+end;
+
+function NeuralBoxIoU(AX1, AY1, AX2, AY2,
+  BX1, BY1, BX2, BY2: TNeuralFloat): TNeuralFloat;
+var
+  IX1, IY1, IX2, IY2, IW, IH, Inter, Area1, Area2, UnionA: TNeuralFloat;
+begin
+  Area1 := Max(0, AX2 - AX1) * Max(0, AY2 - AY1);
+  Area2 := Max(0, BX2 - BX1) * Max(0, BY2 - BY1);
+  IX1 := Max(AX1, BX1);
+  IY1 := Max(AY1, BY1);
+  IX2 := Min(AX2, BX2);
+  IY2 := Min(AY2, BY2);
+  IW := Max(0, IX2 - IX1);
+  IH := Max(0, IY2 - IY1);
+  Inter := IW * IH;
+  UnionA := Area1 + Area2 - Inter;
+  if UnionA > 0 then Result := Inter / UnionA else Result := 0;
+end;
+
+function NeuralGreedyNMS(
+  const BX1, BY1, BX2, BY2, Scores: array of TNeuralFloat;
+  const Classes: array of integer; Count: integer;
+  IoUThreshold: TNeuralFloat): TNeuralIntegerArray;
+var
+  Order: TNeuralIntegerArray;
+  Keep: array of boolean;
+  i, jj, oi, oj, tmp, HiCand, KeptCnt: integer;
+  IoU: TNeuralFloat;
+begin
+  SetLength(Result, 0);
+  if Count <= 0 then Exit;
+  HiCand := Count - 1;
+  // Index permutation sorted by descending score (stable selection sort over
+  // the indices - candidate counts in detection are small).
+  SetLength(Order, Count);
+  for i := 0 to HiCand do Order[i] := i;
+  for i := 0 to HiCand do
+    for jj := i + 1 to HiCand do
+      if Scores[Order[jj]] > Scores[Order[i]] then
+      begin tmp := Order[i]; Order[i] := Order[jj]; Order[jj] := tmp; end;
+  // Greedy NMS over the sorted order: a later box is suppressed only by an
+  // earlier (higher-score) kept box of the SAME class with IoU > threshold.
+  SetLength(Keep, Count);
+  for i := 0 to HiCand do Keep[i] := True;
+  for i := 0 to HiCand do
+  begin
+    if not Keep[i] then Continue;
+    oi := Order[i];
+    for jj := i + 1 to HiCand do
+    begin
+      oj := Order[jj];
+      if (not Keep[jj]) or (Classes[oj] <> Classes[oi]) then Continue;
+      IoU := NeuralBoxIoU(BX1[oi], BY1[oi], BX2[oi], BY2[oi],
+        BX1[oj], BY1[oj], BX2[oj], BY2[oj]);
+      if IoU > IoUThreshold then Keep[jj] := False;
+    end;
+  end;
+  // Emit kept original indices in descending-score order.
+  SetLength(Result, Count);
+  KeptCnt := 0;
+  for i := 0 to HiCand do
+    if Keep[i] then
+    begin
+      Result[KeptCnt] := Order[i];
+      Inc(KeptCnt);
+    end;
+  SetLength(Result, KeptCnt);
 end;
 
 procedure WriteLnPassIfZero(x: TNeuralFloat; Tolerance: TNeuralFloat=0.0001);

@@ -73187,15 +73187,14 @@ end;
 function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
   ScoreThreshold: TNeuralFloat; IoUThreshold: TNeuralFloat): TYoloDetectionArray;
 var
-  s, gx, gy, gw, side, b, k, cls, BestCls, Cnt, Cell, i2, jj: integer;
+  s, gx, gy, gw, side, b, k, cls, BestCls, Cnt, Cell, i2: integer;
   rm, nc, OutDim, Stride: integer;
   gwM1, ncM1, rmM1, HiCand: integer;
   MaxLogit, SumExp, P, BestScore, Dist, Cx, Cy, L, Tp, R, Bp: TNeuralFloat;
   Dists: array[0..3] of TNeuralFloat;
   Cand: TYoloDetectionArray;
-  Keep: array of boolean;
-  Tmp: TYoloDetection;
-  Area1, Area2, IX1, IY1, IX2, IY2, IW, IH, Inter, UnionA, IoU: TNeuralFloat;
+  NX1, NY1, NX2, NY2, NScore: TNeuralFloatDynArr;
+  NCls, KeptIdx: TNeuralIntegerArray;
 begin
   rm := Config.RegMax; nc := Config.NumClasses; OutDim := 4 * rm + nc;
   rmM1 := rm - 1; ncM1 := nc - 1;
@@ -73248,42 +73247,25 @@ begin
         Inc(Cell);
       end;
   end;
-  // sort by descending score (selection sort - candidate counts are small).
+  // Score-sorted, class-aware greedy NMS via the shared neuralvolume helper.
+  // Build the parallel box / score / class arrays it expects (corner xyxy).
   HiCand := High(Cand);
-  for i2 := 0 to HiCand do
-    for jj := i2 + 1 to HiCand do
-      if Cand[jj].Score > Cand[i2].Score then
-      begin Tmp := Cand[i2]; Cand[i2] := Cand[jj]; Cand[jj] := Tmp; end;
-  // greedy NMS (class-agnostic by IoU; suppress only same-class overlaps).
-  SetLength(Keep, Length(Cand));
-  for i2 := 0 to HiCand do Keep[i2] := True;
+  SetLength(NX1, Length(Cand)); SetLength(NY1, Length(Cand));
+  SetLength(NX2, Length(Cand)); SetLength(NY2, Length(Cand));
+  SetLength(NScore, Length(Cand)); SetLength(NCls, Length(Cand));
   for i2 := 0 to HiCand do
   begin
-    if not Keep[i2] then Continue;
-    Area1 := Max(0, Cand[i2].X2 - Cand[i2].X1) * Max(0, Cand[i2].Y2 - Cand[i2].Y1);
-    for jj := i2 + 1 to HiCand do
-    begin
-      if (not Keep[jj]) or (Cand[jj].ClassId <> Cand[i2].ClassId) then Continue;
-      IX1 := Max(Cand[i2].X1, Cand[jj].X1);
-      IY1 := Max(Cand[i2].Y1, Cand[jj].Y1);
-      IX2 := Min(Cand[i2].X2, Cand[jj].X2);
-      IY2 := Min(Cand[i2].Y2, Cand[jj].Y2);
-      IW := Max(0, IX2 - IX1); IH := Max(0, IY2 - IY1);
-      Inter := IW * IH;
-      Area2 := Max(0, Cand[jj].X2 - Cand[jj].X1) * Max(0, Cand[jj].Y2 - Cand[jj].Y1);
-      UnionA := Area1 + Area2 - Inter;
-      if UnionA > 0 then IoU := Inter / UnionA else IoU := 0;
-      if IoU > IoUThreshold then Keep[jj] := False;
-    end;
+    NX1[i2] := Cand[i2].X1; NY1[i2] := Cand[i2].Y1;
+    NX2[i2] := Cand[i2].X2; NY2[i2] := Cand[i2].Y2;
+    NScore[i2] := Cand[i2].Score; NCls[i2] := Cand[i2].ClassId;
   end;
-  SetLength(Result, 0);
-  for i2 := 0 to HiCand do
-    if Keep[i2] then
-    begin
-      k := Length(Result);
-      SetLength(Result, k + 1);
-      Result[k] := Cand[i2];
-    end;
+  KeptIdx := NeuralGreedyNMS(NX1, NY1, NX2, NY2, NScore, NCls,
+    Length(Cand), IoUThreshold);
+  // KeptIdx is already in descending-score order (matches the prior in-place
+  // sort + suppression), so emit the kept candidates directly.
+  SetLength(Result, Length(KeptIdx));
+  for k := 0 to High(KeptIdx) do
+    Result[k] := Cand[KeptIdx[k]];
 end;
 
 function BuildDPTFromSafeTensorsEx(const FileName: string;

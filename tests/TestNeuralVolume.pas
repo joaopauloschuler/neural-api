@@ -51,6 +51,8 @@ type
     procedure TestAssertFiniteDetectsNaN;
     procedure TestAssertFiniteDetectsInf;
     procedure TestAssertFiniteNilVolume;
+    procedure TestNeuralBoxIoU;
+    procedure TestNeuralGreedyNMS;
   end;
 
 implementation
@@ -1020,6 +1022,56 @@ begin
       Raised := True;
   end;
   AssertTrue('Exception should have been raised for nil volume', Raised);
+end;
+
+procedure TTestNeuralVolume.TestNeuralBoxIoU;
+var
+  IoU: TNeuralFloat;
+begin
+  // Identical boxes -> IoU 1.
+  AssertEquals('Identical boxes IoU', 1.0,
+    NeuralBoxIoU(0, 0, 10, 10, 0, 0, 10, 10), 1e-5);
+  // Disjoint boxes -> IoU 0.
+  AssertEquals('Disjoint boxes IoU', 0.0,
+    NeuralBoxIoU(0, 0, 10, 10, 100, 100, 110, 110), 1e-5);
+  // Half overlap: A=(0,0,10,10), B=(5,0,15,10). inter=5*10=50,
+  // union=100+100-50=150 -> IoU = 1/3.
+  IoU := NeuralBoxIoU(0, 0, 10, 10, 5, 0, 15, 10);
+  AssertEquals('Half-overlap IoU', 1.0 / 3.0, IoU, 1e-5);
+  // Degenerate (zero-area) box -> 0.
+  AssertEquals('Degenerate box IoU', 0.0,
+    NeuralBoxIoU(5, 5, 5, 5, 0, 0, 10, 10), 1e-5);
+end;
+
+procedure TTestNeuralVolume.TestNeuralGreedyNMS;
+var
+  BX1, BY1, BX2, BY2, Scores: array of TNeuralFloat;
+  Classes: TNeuralIntegerArray;
+  Kept: TNeuralIntegerArray;
+begin
+  // Four candidate boxes:
+  //   0: (0,0,10,10)       class 0  score 0.90  -> KEPT (highest)
+  //   1: (1,1,11,11)       class 0  score 0.80  -> SUPPRESSED by 0 (IoU>0.45)
+  //   2: (1,1,11,11)       class 1  score 0.85  -> KEPT (different class)
+  //   3: (100,100,110,110) class 0  score 0.70  -> KEPT (no overlap)
+  SetLength(BX1, 4); SetLength(BY1, 4); SetLength(BX2, 4); SetLength(BY2, 4);
+  SetLength(Scores, 4); SetLength(Classes, 4);
+  BX1[0] := 0;   BY1[0] := 0;   BX2[0] := 10;  BY2[0] := 10;  Scores[0] := 0.90; Classes[0] := 0;
+  BX1[1] := 1;   BY1[1] := 1;   BX2[1] := 11;  BY2[1] := 11;  Scores[1] := 0.80; Classes[1] := 0;
+  BX1[2] := 1;   BY1[2] := 1;   BX2[2] := 11;  BY2[2] := 11;  Scores[2] := 0.85; Classes[2] := 1;
+  BX1[3] := 100; BY1[3] := 100; BX2[3] := 110; BY2[3] := 110; Scores[3] := 0.70; Classes[3] := 0;
+
+  Kept := NeuralGreedyNMS(BX1, BY1, BX2, BY2, Scores, Classes, 4, 0.45);
+
+  // Expected kept indices in descending-score order: [0, 2, 3].
+  AssertEquals('Kept count', 3, Length(Kept));
+  AssertEquals('Kept[0] (score 0.90)', 0, Kept[0]);
+  AssertEquals('Kept[1] (score 0.85, class 1)', 2, Kept[1]);
+  AssertEquals('Kept[2] (score 0.70, disjoint)', 3, Kept[2]);
+
+  // Empty input -> empty result, no crash.
+  Kept := NeuralGreedyNMS(BX1, BY1, BX2, BY2, Scores, Classes, 0, 0.45);
+  AssertEquals('Empty NMS count', 0, Length(Kept));
 end;
 
 initialization

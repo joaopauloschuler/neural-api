@@ -1986,17 +1986,6 @@ the existing tasklist before listing — none are already coded or pending.)
       NMS dedup task below. Unlocks DETR/RT-DETR/Grounding-DINO fine-tuning instead
       of frozen inference. Numerical-gradient test on a tiny N=4,M=2 fixture.
 
-- [ ] Consolidate the duplicated greedy-NMS + box-IoU code into ONE reusable
-      routine. Greedy class-aware NMS is hand-rolled at least twice — inside the
-      detection importers (`neuralpretrained.pas:73257`, plus the YOLO post-process
-      around `neuralpretrained.pas:11952`) and again in `examples/YoloDetect`
-      (`examples/YoloDetect/YoloDetect.lpr`). Promote a single
-      `NeuralBoxIoU`/`NeuralGreedyNMS` (box-IoU + score-sorted suppression at an
-      IoU threshold) into a shared spot and have the importers AND the YoloDetect
-      example call it. Pure refactor — pin byte-identical detection output on the
-      existing YoloDetect / ObjectDetection runs before and after. Also feeds the
-      DETR loss task above (shared IoU).
-
 - [ ] OpenCL forward offload + AVX mean/var for `TNNetInstanceNorm`. The per-channel
       instance norm (`neuralnetwork.pas:61778`) is hot in the generative / style
       paths (AdaIN, CycleGAN, Pix2Pix, StyleTransfer) yet runs entirely on the host
