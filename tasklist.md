@@ -2015,3 +2015,25 @@ diffusers/torch ports.)
   and SEAMLESS (the MID global self-attention makes tiling an approximation, as
   in diffusers, so the seam jump — not an exact interior bound — is asserted);
   opt-in `--vae-tiling` flag wired into examples/LatentTextToImage.)
+
+## Lucky-day batch 2026-06-28f (follow-ups surfaced by 28e landings)
+
+(All three 28e items LANDED: Heun sampler [891e7537], Min-SNR-gamma loss
+weighting [f8e1823c], tiled VAE decode [2e28a44b]. Genuinely-novel follow-ups
+surfaced while landing them:)
+
+- [ ] Fully-convolutional VAE-decoder Compute path so `TiledVaeDecode`
+      (neuralpretrained.pas) can reuse ONE decoder net across tiles instead of
+      rebuilding a tile-sized decoder per tile-grid. Today `TNNet.Compute` errors
+      on a latent whose size differs from the fixed `TNNetInput`, so the tiled
+      path rebuilds the decoder at the tile latent size. A size-agnostic forward
+      (re-derive layer shapes from the actual input volume on each Compute, or a
+      Resize-input hook) would let a single resident net decode arbitrary tile
+      sizes — also unblocks variable-resolution inference generally. Scope first:
+      audit which layers in the VAE decoder graph hard-bind to TNNetInput size.
+- [ ] Tiled VAE decode is an APPROXIMATION because the decoder MID block has
+      GLOBAL self-attention (same caveat as diffusers): per-tile attention can't
+      see across seams. Follow-up: a windowed/overlapped-attention tiled mode, or
+      document+measure the approximation error vs whole-image decode on a real
+      (trained) checkpoint so users know the quality trade-off. Pure host /
+      analysis; no new layer.
