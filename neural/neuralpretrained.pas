@@ -12339,35 +12339,70 @@ type
   end;
 
 // Loads a HF LayerNorm weight/bias pair into a TNNetTokenLayerNorm.
-procedure LoadLayerNormWeights(Reader: TNNetSafeTensorsReader;
-  Layer: TNNetLayer; const WName, BName: string; d_model: integer);
+// Shared core for every per-importer affine norm-weight loader. Loads a 1-D
+// [d_model] gamma tensor into FArrNeurons[0].Weights (each element offset by
+// GainOffset - the +1 fold some RMSNorm variants need), and OPTIONALLY a beta
+// vector into FArrNeurons[1] (loaded from the BName tensor when BetaFromTensor
+// is true, otherwise zeroed - the bias-free case). All callers index the
+// public FArrNeurons mirror, never Neurons[].
+//   ImporterName    - error-message prefix ('GPT-2', 'Llama', 'Cohere', ...).
+//   HasBeta         - whether FArrNeurons[1] (beta) exists and is written.
+//   BetaFromTensor  - beta read from BName (true) vs zeroed (false); ignored
+//                     when HasBeta is false.
+//   ValidateBeta    - when loading beta from a tensor, also require its shape
+//                     to be exactly [d_model] (the GPT-2 path checks this; the
+//                     Bark path only checks presence).
+procedure LoadAffineNormWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string; d_model: integer;
+  GainOffset: TNeuralFloat; HasBeta, BetaFromTensor, ValidateBeta: boolean;
+  const ImporterName: string);
 var
   Tmp: TNNetVolume;
   i, d_modelM1: integer;
 begin
   if not Reader.HasTensor(WName) then
-    ImportError('GPT-2 import: missing tensor "' + WName + '".');
-  if not Reader.HasTensor(BName) then
-    ImportError('GPT-2 import: missing tensor "' + BName + '".');
+    ImportError(ImporterName + ' import: missing tensor "' + WName + '".');
   if (Reader.DimCount(WName) <> 1) or (Reader.DimSize(WName, 0) <> d_model) then
-    ImportError('GPT-2 import: "' + WName + '" must have shape [' +
+    ImportError(ImporterName + ' import: "' + WName + '" must have shape [' +
       IntToStr(d_model) + '], got ' + Reader.ShapeAsString(WName));
-  if (Reader.DimCount(BName) <> 1) or (Reader.DimSize(BName, 0) <> d_model) then
-    ImportError('GPT-2 import: "' + BName + '" must have shape [' +
-      IntToStr(d_model) + '], got ' + Reader.ShapeAsString(BName));
+  if HasBeta and BetaFromTensor then
+  begin
+    if not Reader.HasTensor(BName) then
+      ImportError(ImporterName + ' import: missing tensor "' + BName + '".');
+    if ValidateBeta and
+       ((Reader.DimCount(BName) <> 1) or (Reader.DimSize(BName, 0) <> d_model)) then
+      ImportError(ImporterName + ' import: "' + BName + '" must have shape [' +
+        IntToStr(d_model) + '], got ' + Reader.ShapeAsString(BName));
+  end;
   Tmp := TNNetVolume.Create;
   try
     d_modelM1 := d_model - 1;
     Reader.LoadTensorFlat(WName, Tmp);
     for i := 0 to d_modelM1 do
-      Layer.FArrNeurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
-    Reader.LoadTensorFlat(BName, Tmp);
-    for i := 0 to d_modelM1 do
-      Layer.FArrNeurons[1].Weights.FData[i] := Tmp.FData[i]; // beta
+      Layer.FArrNeurons[0].Weights.FData[i] := GainOffset + Tmp.FData[i]; // gamma/gain
+    if HasBeta then
+    begin
+      if BetaFromTensor then
+      begin
+        Reader.LoadTensorFlat(BName, Tmp);
+        for i := 0 to d_modelM1 do
+          Layer.FArrNeurons[1].Weights.FData[i] := Tmp.FData[i]; // beta
+      end
+      else
+        for i := 0 to d_modelM1 do
+          Layer.FArrNeurons[1].Weights.FData[i] := 0;             // beta (bias-free)
+    end;
   finally
     Tmp.Free;
   end;
   Layer.FlushWeightCache();
+end;
+
+procedure LoadLayerNormWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string; d_model: integer);
+begin
+  LoadAffineNormWeights(Reader, Layer, WName, BName, d_model, 0,
+    {HasBeta=}True, {BetaFromTensor=}True, {ValidateBeta=}True, 'GPT-2');
 end;
 
 // Loads a HF Conv1D weight [in, out] (+ bias [out]) pair into a
@@ -14025,25 +14060,9 @@ end;
 procedure LoadLlamaRMSNormWeights(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName: string; d_model: integer;
   GainOffset: TNeuralFloat = 0);
-var
-  Tmp: TNNetVolume;
-  i, d_modelM1: integer;
 begin
-  if not Reader.HasTensor(WName) then
-    ImportError('Llama import: missing tensor "' + WName + '".');
-  if (Reader.DimCount(WName) <> 1) or (Reader.DimSize(WName, 0) <> d_model) then
-    ImportError('Llama import: "' + WName + '" must have shape [' +
-      IntToStr(d_model) + '], got ' + Reader.ShapeAsString(WName));
-  Tmp := TNNetVolume.Create;
-  try
-    Reader.LoadTensorFlat(WName, Tmp);
-    d_modelM1 := d_model - 1;
-    for i := 0 to d_modelM1 do
-      Layer.FArrNeurons[0].Weights.FData[i] := GainOffset + Tmp.FData[i]; // gain
-  finally
-    Tmp.Free;
-  end;
-  Layer.FlushWeightCache();
+  LoadAffineNormWeights(Reader, Layer, WName, '', d_model, GainOffset,
+    {HasBeta=}False, {BetaFromTensor=}False, {ValidateBeta=}False, 'Llama');
 end;
 
 // Loads a HF nn.Linear weight [out, in] (bias-free, the Llama convention)
@@ -21182,28 +21201,9 @@ end;
 // Coded by Claude (AI).
 procedure LoadCohereLayerNormWeights(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName: string; d_model: integer);
-var
-  Tmp: TNNetVolume;
-  i, DModelM1: integer;
 begin
-  if not Reader.HasTensor(WName) then
-    ImportError('Cohere import: missing tensor "' + WName + '".');
-  if (Reader.DimCount(WName) <> 1) or (Reader.DimSize(WName, 0) <> d_model) then
-    ImportError('Cohere import: "' + WName + '" must have shape [' +
-      IntToStr(d_model) + '], got ' + Reader.ShapeAsString(WName));
-  Tmp := TNNetVolume.Create;
-  try
-    Reader.LoadTensorFlat(WName, Tmp);
-    DModelM1 := d_model - 1;
-    for i := 0 to DModelM1 do
-    begin
-      Layer.FArrNeurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
-      Layer.FArrNeurons[1].Weights.FData[i] := 0;            // beta (bias-free)
-    end;
-  finally
-    Tmp.Free;
-  end;
-  Layer.FlushWeightCache();
+  LoadAffineNormWeights(Reader, Layer, WName, '', d_model, 0,
+    {HasBeta=}True, {BetaFromTensor=}False, {ValidateBeta=}False, 'Cohere');
 end;
 
 // Loads the per-head CohereLayerNorm q_norm/k_norm gains (weight shape
@@ -32861,36 +32861,11 @@ end;
 // Claude (AI).
 procedure LoadBarkLayerNorm(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
   const WName, BName: string; d_model: integer; HasBias: boolean);
-var
-  Tmp: TNNetVolume;
-  i, d_modelM1: integer;
 begin
-  if not Reader.HasTensor(WName) then
-    ImportError('Bark import: missing tensor "' + WName + '".');
-  if (Reader.DimCount(WName) <> 1) or (Reader.DimSize(WName, 0) <> d_model) then
-    ImportError('Bark import: "' + WName + '" must have shape [' +
-      IntToStr(d_model) + '], got ' + Reader.ShapeAsString(WName));
-  Tmp := TNNetVolume.Create;
-  try
-    d_modelM1 := d_model - 1;
-    Reader.LoadTensorFlat(WName, Tmp);
-    for i := 0 to d_modelM1 do
-      Layer.FArrNeurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
-    if HasBias then
-    begin
-      if not Reader.HasTensor(BName) then
-        ImportError('Bark import: missing tensor "' + BName + '".');
-      Reader.LoadTensorFlat(BName, Tmp);
-      for i := 0 to d_modelM1 do
-        Layer.FArrNeurons[1].Weights.FData[i] := Tmp.FData[i]; // beta
-    end
-    else
-      for i := 0 to d_modelM1 do
-        Layer.FArrNeurons[1].Weights.FData[i] := 0;
-  finally
-    Tmp.Free;
-  end;
-  Layer.FlushWeightCache();
+  // Bark always has a beta neuron: loaded from BName when HasBias, else zeroed.
+  // Unlike the GPT-2 path it only checks beta presence, not its [d_model] shape.
+  LoadAffineNormWeights(Reader, Layer, WName, BName, d_model, 0,
+    {HasBeta=}True, {BetaFromTensor=}HasBias, {ValidateBeta=}False, 'Bark');
 end;
 
 // Builds one Bark GPT trunk TNNet: an embedding-vector input (seq,1,hidden) ->

@@ -2017,7 +2017,7 @@ priority list: AVX vectorization of an existing layer, then importer dedup.)
       fourth copy. Pure refactor: the three existing importer parity fixtures
       (pythia/bloom/falcon pico) must stay bit-identical — no behavior change.
 
-- [ ] Dedup the per-importer norm-weight loaders. `LoadLlamaRMSNormWeights`
+- [X] Dedup the per-importer norm-weight loaders. `LoadLlamaRMSNormWeights`
       (neuralpretrained.pas ~14025, optional gain offset), `LoadCohereLayerNormWeights`
       (~21103, additionally zeros a beta neuron) and the GPT-2/Bark-style
       gamma+beta `LoadLayerNormWeights`/`LoadBarkLayerNorm` loaders all do the same
