@@ -2033,3 +2033,54 @@ the landed work exposed. All verified absent in source before listing.)
       3-D section-position `Compute` on the host. Either generalize `cai_rope` to
       take a per-token position triple or add a `cai_mrope` kernel; keep the
       host-built angle table so device math stays pure rotation.
+
+## Accelerator & dedup batch 2026-06-27f
+
+(All verified absent in source before listing. Checked the actual `Compute`
+bodies, not just the tasklist. `TNNetAvgPool` was a candidate but is ALREADY
+OpenCL-offloaded via the shared `cai_pool2d`/`TNNetPool2DCL` path
+(neuralnetwork.pas ~80441) — do NOT relist it. The Vits/HiFi-GAN/EnCodec hand-
+rolled host math is DELIBERATELY self-contained channel-major code, not a layer-
+replacement candidate — see the audio-holder AVX/OpenCL entries above; do NOT
+file "replace Vits hand-made with TNNet layers".)
+
+- [ ] OpenCL forward offload for the softmax head — `TNNetPointwiseSoftMax`
+      (neuralnetwork.pas ~18959, forward is `FOutput.PointwiseSoftMax`) and the
+      whole-volume `TNNetSoftMax` (~82534). Today both run the normalization on the
+      HOST even when the producer (e.g. the SDPA score matrix, or the final
+      classifier logits) is device-resident, forcing an activation round-trip on
+      EVERY attention block and EVERY classification/decoder step. Add a
+      `cai_softmax` kernel to `neural/neural.cl` (one work-group per normalization
+      group of `GroupLen` contiguous elements — `GroupLen = Depth` for the pointwise
+      per-token case, `GroupLen = FOutput.Size` for the whole-volume case — doing
+      the standard max-subtract → exp → sum → divide in two passes / a local
+      reduction) and wire it through the shared host-helper pattern (mirror
+      `TNNetGroupNormCL`/`TNNetPool2DCL`, arming `FShouldOpenCL`). Forward-only, keep
+      the scalar/AVX host path as fallback, gate on `FOutput.Size >=
+      NeuralConvOpenCLMinWork`, and pin `<1e-4` CPU-vs-OpenCL parity with a test
+      that skips cleanly when no device is present.
+
+- [ ] AVX-vectorize the `TNNetReLU` forward pass. `TNNetReLU.Compute`
+      (neuralnetwork.pas ~61176) is a scalar per-element `if x >= 0` loop, even
+      though `TNNetVolume.CopyRelu` / `AVXCopyRelu` (neuralvolume.pas ~13251 /
+      ~10396) already do exactly the `max(x,0)` clamp under `{$IFDEF AVXANY}`. ReLU
+      is one of the most frequently instantiated layers in the library. For the
+      inference branch (no `FOutputError`/deriv buffer) dispatch the contiguous
+      buffer straight through `FOutput.CopyRelu(LocalPrevOutput)`; for the training
+      branch (where the `>=0` mask is also written into `FOutputErrorDeriv` as 1/0)
+      either compute the output via `CopyRelu` then derive the mask vectorized, or
+      add a small fused AVX kernel that emits both — keeping the scalar loop as the
+      `{$IFNDEF AVXANY}` fallback. Pin parity with the existing ReLU
+      numerical-gradient / dead-ReLU tests.
+
+- [ ] AVX-vectorize the remaining `exp`-based activation forwards via the existing
+      `AVXExp` vector exponential (the same kernel the GLU-family / `PointwiseSoftMax`
+      / just-landed `TNNetELU`/`TNNetSELU` passes use). Confirmed still scalar
+      (`pcr_expf` per element): `TNNetSoftPlus` (~36797, `ln(1+exp(x))` with the
+      stable large-`x` branch + its `sigmoid` derivative), `TNNetGaussianActivation`
+      (~37247, `exp(-x*x)`), and `TNNetSoftExponential` (~37170, the `alpha<>0`
+      `exp`/`log` branches). All are depth-contiguous elementwise passes. Vectorize
+      the exponential over 8-lane blocks (masking the numerically-stable branches
+      per block where needed), keep the scalar branch as the `{$IFNDEF AVXANY}`
+      fallback, and pin parity with the existing per-activation saturation /
+      numerical-gradient tests.
