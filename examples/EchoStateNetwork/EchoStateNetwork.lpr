@@ -272,66 +272,10 @@ end;
 //     (S^T S + lambda I) Wout = S^T Y          ->   A Wout = B
 //
 // We form A (size (N+1)x(N+1)) and B ((N+1)x1) and solve the small dense system
-// directly. neuralvolume.pas exposes no matrix solve/inverse helper (checked:
-// no Solve/Inverse/Cholesky/Gauss), so we hand-roll Gauss-Jordan elimination
-// with partial pivoting below - simple, deterministic and exact for this size.
-// No learning rate, no epochs, no shuffling: it is a single linear solve.
+// directly via neuralvolume's shared NeuralLinearSolve (Gauss-Jordan with
+// partial pivoting) - simple, deterministic and exact for this size. No
+// learning rate, no epochs, no shuffling: it is a single linear solve.
 // ----------------------------------------------------------------------------
-
-// Solve the dense linear system A*X = B in place by Gauss-Jordan elimination
-// with partial pivoting. A is n x n, B is n x m; on return B holds the solution
-// X (A is destroyed). Returns False if A is singular.
-function GaussJordanSolve(var A: array of TNeuralFloat;
-  var B: array of TNeuralFloat; n, m: integer): boolean;
-var
-  col, row, piv, k: integer;
-  maxAbs, v, factor, diag: TNeuralFloat;
-  tmp: TNeuralFloat;
-begin
-  Result := True;
-  for col := 0 to n - 1 do
-  begin
-    // Partial pivot: pick the row (>= col) with the largest |A[row,col]|.
-    piv := col;
-    maxAbs := Abs(A[col * n + col]);
-    for row := col + 1 to n - 1 do
-    begin
-      v := Abs(A[row * n + col]);
-      if v > maxAbs then begin maxAbs := v; piv := row; end;
-    end;
-    if maxAbs < 1e-30 then begin Result := False; Exit; end;
-
-    // Swap the pivot row into place (in both A and B).
-    if piv <> col then
-    begin
-      for k := 0 to n - 1 do
-      begin
-        tmp := A[col * n + k]; A[col * n + k] := A[piv * n + k]; A[piv * n + k] := tmp;
-      end;
-      for k := 0 to m - 1 do
-      begin
-        tmp := B[col * m + k]; B[col * m + k] := B[piv * m + k]; B[piv * m + k] := tmp;
-      end;
-    end;
-
-    // Normalise the pivot row so A[col,col] = 1.
-    diag := A[col * n + col];
-    for k := 0 to n - 1 do A[col * n + k] := A[col * n + k] / diag;
-    for k := 0 to m - 1 do B[col * m + k] := B[col * m + k] / diag;
-
-    // Eliminate the pivot column from every other row.
-    for row := 0 to n - 1 do
-    begin
-      if row = col then Continue;
-      factor := A[row * n + col];
-      if factor = 0 then Continue;
-      for k := 0 to n - 1 do
-        A[row * n + k] := A[row * n + k] - factor * A[col * n + k];
-      for k := 0 to m - 1 do
-        B[row * m + k] := B[row * m + k] - factor * B[col * m + k];
-    end;
-  end;
-end;
 
 // Build the trained readout via the closed-form ridge solve, reusing the SAME
 // reservoir/washout/training window as TrainReadout so the comparison is
@@ -387,7 +331,7 @@ begin
   end;
 
   // Solve A * Wout = B in place; Bmat now holds Wout (length d).
-  if not GaussJordanSolve(A, Bmat, d, 1) then
+  if not NeuralLinearSolve(A, Bmat, d, 1) then
     WriteLn('    WARNING: ridge normal-equations matrix was singular.');
 
   // Pack Wout into the SAME readout-net shape as the SGD arm.

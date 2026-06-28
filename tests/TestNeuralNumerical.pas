@@ -1331,6 +1331,8 @@ type
     procedure TestGEGLUSerializationRoundTrip;
     procedure TestAddGEGLUFeedForwardBuilder;
     // (TestTanhGLUSerializationRoundTrip published alongside TestTanhGLU* above)
+    // Shared dense linear solver
+    procedure TestNeuralLinearSolveRoundTrip;
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
     procedure TestSumNumericalValues;
@@ -66458,6 +66460,63 @@ begin
     InputPlus.Free;
     Desired.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestNeuralLinearSolveRoundTrip;
+var
+  A, B, Acopy, x: array of TNeuralFloat;
+  n, m, i, j: integer;
+  acc, residual, maxResidual: TNeuralFloat;
+  ok: boolean;
+begin
+  // Solve a known well-conditioned 3x3 system A*x = b with a single RHS, then
+  // verify the round-trip residual |A*x - b| is tiny.
+  n := 3;
+  m := 1;
+  SetLength(A, n * n);
+  SetLength(B, n * m);
+  SetLength(Acopy, n * n);
+  // A (row-major):
+  //   2  1  1
+  //   1  3  2
+  //   1  0  0
+  A[0] := 2; A[1] := 1; A[2] := 1;
+  A[3] := 1; A[4] := 3; A[5] := 2;
+  A[6] := 1; A[7] := 0; A[8] := 0;
+  // b = [4, 5, 6]^T ; the exact solution is x = [6, 15, -23]^T.
+  B[0] := 4; B[1] := 5; B[2] := 6;
+  for i := 0 to n * n - 1 do Acopy[i] := A[i];
+
+  ok := NeuralLinearSolve(A, B, n, m);
+  AssertTrue('NeuralLinearSolve reports non-singular', ok);
+
+  // B now holds the solution x.
+  SetLength(x, n);
+  for i := 0 to n - 1 do x[i] := B[i];
+  AssertTrue('x[0] ~ 6', Abs(x[0] - 6.0) < 1e-4);
+  AssertTrue('x[1] ~ 15', Abs(x[1] - 15.0) < 1e-4);
+  AssertTrue('x[2] ~ -23', Abs(x[2] - (-23.0)) < 1e-4);
+
+  // Round-trip residual A*x = b using the ORIGINAL A (Acopy).
+  maxResidual := 0;
+  for i := 0 to n - 1 do
+  begin
+    acc := 0;
+    for j := 0 to n - 1 do acc := acc + Acopy[i * n + j] * x[j];
+    residual := Abs(acc - (4 + i)); // b = [4,5,6]
+    if residual > maxResidual then maxResidual := residual;
+  end;
+  WriteLn('  NeuralLinearSolve round-trip max residual: ', maxResidual:0:8);
+  AssertTrue('round-trip residual < 1e-4', maxResidual < 1e-4);
+
+  // Singular matrix (row 2 = 2 * row 0) must be reported as singular.
+  SetLength(A, 4);
+  SetLength(B, 2);
+  A[0] := 1; A[1] := 2;
+  A[2] := 2; A[3] := 4;
+  B[0] := 3; B[1] := 6;
+  ok := NeuralLinearSolve(A, B, 2, 1);
+  AssertFalse('singular system reported as singular', ok);
 end;
 
 initialization

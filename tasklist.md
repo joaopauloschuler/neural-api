@@ -1998,7 +1998,7 @@ with incompatible signatures.)
       Keep the scalar branch as the `{$IFNDEF AVXANY}` fallback and pin parity
       with the existing saturation-safety / numerical-gradient tests.
 
-- [ ] Remove the duplicated dense Gauss-Jordan linear solver. `TNNet` carries a
+- [X] Remove the duplicated dense Gauss-Jordan linear solver. `TNNet` carries a
       private `GaussJordanSolve(var A, B: TDoubleMatrix; ...)` (used by its
       least-squares head, neuralnetwork.pas ~89355) while
       `examples/EchoStateNetwork/EchoStateNetwork.lpr` hand-rolls a SECOND,

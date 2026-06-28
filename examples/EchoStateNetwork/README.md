@@ -68,11 +68,11 @@ matrix `Y` (one column, `x_{t+1}`). The ridge readout minimises
 ```
 
 The example forms `A` (size `(N+1)×(N+1)`) and `B` (`(N+1)×1`) and solves the
-small dense system directly. `neuralvolume.pas` exposes **no** matrix
-solve/inverse/Cholesky helper (verified by grepping for `Solve`/`Inverse`/
-`Cholesky`/`Gauss`), so the example **hand-rolls** a `GaussJordanSolve` routine
-— Gauss-Jordan elimination with partial pivoting — clearly commented and exact
-for this reservoir size. The solved `Wout` is then packed back into the **same**
+small dense system directly via the shared library routine
+`NeuralLinearSolve` in `neuralvolume.pas` — Gauss-Jordan elimination with
+partial pivoting — the single reusable dense solver also used by the library's
+closed-form least-squares head, exact for this reservoir size. The solved
+`Wout` is then packed back into the **same**
 `Input(N)→FullConnectLinear(1)` net shape as the SGD arm (reservoir weights into
 the neuron's `Weights`, the intercept into its `BiasWeight`), so both arms are
 evaluated by identical code. No learning rate, no epochs, no shuffling — it is a

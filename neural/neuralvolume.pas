@@ -1111,6 +1111,17 @@ type
     numerical instability in forward/backward passes. }
   procedure AssertFinite(V: TNNetVolume; const Where: string);
 
+  { NeuralLinearSolve solves the dense linear system A*X = B in place by
+    Gauss-Jordan elimination with partial pivoting (single precision). A is a
+    row-major n x n matrix, B is a row-major n x m matrix; on return B holds the
+    solution X and A is destroyed. Both arrays are flat TNeuralFloat arrays
+    (A indexed A[row*n+col], B indexed B[row*m+col]). Returns False when A is
+    singular (a near-zero pivot is encountered), True otherwise. This is the
+    single shared dense solver used by the closed-form least-squares /
+    ridge-regression callers across the library and examples. }
+  function NeuralLinearSolve(var A: array of TNeuralFloat;
+    var B: array of TNeuralFloat; n, m: integer): boolean;
+
   { RandomBetaValue draws a sample from a Beta(Alpha, Alpha) distribution
     using the repo's global Random RNG. Implemented via two Gamma(Alpha,1)
     draws: Beta = Ga/(Ga+Gb). For Alpha=1 this reduces to Uniform(0,1), the
@@ -1862,6 +1873,57 @@ begin
       raise Exception.Create('AssertFinite(' + Where +
         '): non-finite value at index ' + IntToStr(I) +
         ': Inf (' + FloatToStr(Val) + ')');
+  end;
+end;
+
+function NeuralLinearSolve(var A: array of TNeuralFloat;
+  var B: array of TNeuralFloat; n, m: integer): boolean;
+var
+  col, row, piv, k: integer;
+  maxAbs, v, factor, diag, tmp: TNeuralFloat;
+begin
+  Result := True;
+  for col := 0 to n - 1 do
+  begin
+    // Partial pivot: pick the row (>= col) with the largest |A[row,col]|.
+    piv := col;
+    maxAbs := Abs(A[col * n + col]);
+    for row := col + 1 to n - 1 do
+    begin
+      v := Abs(A[row * n + col]);
+      if v > maxAbs then begin maxAbs := v; piv := row; end;
+    end;
+    if maxAbs < 1e-30 then begin Result := False; Exit; end;
+
+    // Swap the pivot row into place (in both A and B).
+    if piv <> col then
+    begin
+      for k := 0 to n - 1 do
+      begin
+        tmp := A[col * n + k]; A[col * n + k] := A[piv * n + k]; A[piv * n + k] := tmp;
+      end;
+      for k := 0 to m - 1 do
+      begin
+        tmp := B[col * m + k]; B[col * m + k] := B[piv * m + k]; B[piv * m + k] := tmp;
+      end;
+    end;
+
+    // Normalise the pivot row so A[col,col] = 1.
+    diag := A[col * n + col];
+    for k := 0 to n - 1 do A[col * n + k] := A[col * n + k] / diag;
+    for k := 0 to m - 1 do B[col * m + k] := B[col * m + k] / diag;
+
+    // Eliminate the pivot column from every other row.
+    for row := 0 to n - 1 do
+    begin
+      if row = col then Continue;
+      factor := A[row * n + col];
+      if factor = 0 then Continue;
+      for k := 0 to n - 1 do
+        A[row * n + k] := A[row * n + k] - factor * A[col * n + k];
+      for k := 0 to m - 1 do
+        B[row * m + k] := B[row * m + k] - factor * B[col * m + k];
+    end;
   end;
 end;
 
