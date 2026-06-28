@@ -82,8 +82,18 @@ type
   //     thresholding=False, lower_order_final=True). Shares the same
   //     lambda/sigma/alpha schedule plumbing and prev-output history that
   //     DPM-Solver++(2M) keeps, plus the previous sample for the corrector.
+  //   smHeun : Heun 2nd-order deterministic sampler (k-diffusion sample_heun /
+  //     Karras et al. 2022 EDM "Algorithm 2"). A genuine intra-step
+  //     predictor-corrector in sigma-space costing TWO denoiser evals per step:
+  //     an Euler predict from sigma_t to sigma_{t-1}, a SECOND denoiser eval at
+  //     the predicted point, then the trapezoidal average of the two drifts.
+  //     Unlike the MULTISTEP DPM-Solver++(2M)/UniPC (which reuse the PREVIOUS
+  //     step's stored output, 1 eval/step), Heun re-runs the model inside the
+  //     step, so the Sample() driver calls Denoise TWICE per step and SKIPS the
+  //     corrector on the final step (sigma_{t-1} = 0), matching k-diffusion's
+  //     `if sigmas[i+1] == 0` branch. Pairs naturally with tsKarras spacing.
   TNNetSamplerMethod = (smDDPM, smDDIM, smDPMSolverPP2M, smEulerAncestral,
-    smUniPC);
+    smUniPC, smHeun);
 
   // Timestep SPACING for the Sample() driver.
   //   tsUniform : evenly strided timesteps in 1..T (the original behaviour).
@@ -144,6 +154,11 @@ type
     // image) using the requested spacing. Caller-owned dynamic array.
     function BuildTimestepSchedule(NumSteps: integer;
       Spacing: TNNetTimestepSpacing): TNeuralIntegerArray;
+    // Heun 2nd-order trajectory (smHeun). Separated from Sample() because it is
+    // the only method that calls Denoise TWICE per step (a genuine intra-step
+    // second derivative), so it cannot share the single-eval Step() dispatch.
+    procedure SampleHeun(X: TNNetVolume; Denoise: TNNetDenoiseCallback;
+      NumSteps: integer; Spacing: TNNetTimestepSpacing);
   protected
     // Convert a raw model prediction (eps or v) at timestep Tt into eps.
     procedure ToEps(Xt, RawPred, EpsOut: TNNetVolume; Tt: integer);
@@ -869,6 +884,80 @@ begin
   end;
 end;
 
+procedure TNNetDiffusionScheduler.SampleHeun(X: TNNetVolume;
+  Denoise: TNNetDenoiseCallback; NumSteps: integer; Spacing: TNNetTimestepSpacing);
+var
+  k, Tt, TtPrev, i, SizeM1: integer;
+  NumStepsM1: integer;
+  Pred, X0, Y, Ye, X0b, XPred: TNNetVolume;
+  Schedule: TNeuralIntegerArray;
+  sigma, sigmaNext, sqrtAbT, sqrtAbPrev, d, d2: TNeuralFloat;
+begin
+  // Deterministic Heun 2nd-order sampler in the VE sigma parameterisation:
+  //   y     = x_t / sqrt(ab_t)                    (VE sample),
+  //   x0    = PredictX0(x_t, t)                   (denoiser output, 1st eval),
+  //   d     = (y - x0)/sigma_t,                   (drift),
+  //   y_e   = y + d*(sigma_{t-1} - sigma_t)       (Euler predictor).
+  // On the final step (sigma_{t-1} = 0) emit y_e directly (skip corrector, as
+  // k-diffusion does when sigmas[i+1] == 0). Otherwise the SECOND denoiser eval
+  // at the predicted VP point x_e = sqrt(ab_prev)*y_e gives x0_2, and:
+  //   d2    = (y_e - x0_2)/sigma_{t-1},
+  //   y_new = y + (sigma_{t-1} - sigma_t)*0.5*(d + d2)  (trapezoidal average).
+  // Re-noise back to VP scale: x_{t-1} = sqrt(ab_prev)*y_new.
+  if NumSteps < 1 then NumSteps := 1;
+  NumStepsM1 := NumSteps - 1;
+  Schedule := BuildTimestepSchedule(NumSteps, Spacing);
+  SizeM1 := X.Size - 1;
+  Pred  := TNNetVolume.Create(X);
+  X0    := TNNetVolume.Create(X);
+  Y     := TNNetVolume.Create(X);
+  Ye    := TNNetVolume.Create(X);
+  X0b   := TNNetVolume.Create(X);
+  XPred := TNNetVolume.Create(X);
+  try
+    for k := 0 to NumStepsM1 do
+    begin
+      Tt := Schedule[k];
+      TtPrev := Schedule[k + 1];
+      sigma := SigmaOf(Tt);
+      sigmaNext := SigmaOf(TtPrev);          // 0 when TtPrev = 0
+      sqrtAbT := FSqrtAlphaBar[Tt];
+      // First denoiser eval at (x_t, t) -> x0.
+      Denoise(X, Pred, Tt);
+      PredictX0(X, Pred, X0, Tt);
+      // VE sample and Euler predictor y_e.
+      for i := 0 to SizeM1 do
+      begin
+        Y.FData[i] := X.FData[i] / sqrtAbT;
+        d := (Y.FData[i] - X0.FData[i]) / sigma;
+        Ye.FData[i] := Y.FData[i] + d * (sigmaNext - sigma);
+      end;
+      if TtPrev = 0 then
+      begin
+        // Final step: sqrt(ab_prev) = 1, y_e is already the clean image.
+        for i := 0 to SizeM1 do X.FData[i] := Ye.FData[i];
+      end
+      else
+      begin
+        sqrtAbPrev := FSqrtAlphaBar[TtPrev];
+        // Build the predicted VP sample for the 2nd eval, then re-evaluate.
+        for i := 0 to SizeM1 do XPred.FData[i] := sqrtAbPrev * Ye.FData[i];
+        Denoise(XPred, Pred, TtPrev);
+        PredictX0(XPred, Pred, X0b, TtPrev);
+        for i := 0 to SizeM1 do
+        begin
+          d  := (Y.FData[i]  - X0.FData[i])  / sigma;
+          d2 := (Ye.FData[i] - X0b.FData[i]) / sigmaNext;
+          X.FData[i] := sqrtAbPrev *
+            (Y.FData[i] + (sigmaNext - sigma) * 0.5 * (d + d2));
+        end;
+      end;
+    end;
+  finally
+    Pred.Free; X0.Free; Y.Free; Ye.Free; X0b.Free; XPred.Free;
+  end;
+end;
+
 procedure TNNetDiffusionScheduler.Sample(X: TNNetVolume;
   Denoise: TNNetDenoiseCallback; NumSteps: integer;
   Method: TNNetSamplerMethod; Eta: TNeuralFloat; Spacing: TNNetTimestepSpacing);
@@ -878,6 +967,12 @@ var
   Pred: TNNetVolume;
   Schedule: TNeuralIntegerArray;
 begin
+  if Method = smHeun then
+  begin
+    // Heun needs two denoiser evals per step; handled by its own driver.
+    SampleHeun(X, Denoise, NumSteps, Spacing);
+    Exit;
+  end;
   if NumSteps < 1 then NumSteps := 1;
   NumStepsM1 := NumSteps - 1;
   ResetMultistep;

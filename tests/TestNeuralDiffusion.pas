@@ -57,6 +57,7 @@ type
     procedure TestDDIMTrajectoryVsOracle;
     procedure TestDPMSolverVsOracle;
     procedure TestUniPCVsOracle;
+    procedure TestHeunVsOracle;
     procedure TestDDPMRunsNoNaN;
     procedure TestEulerAncestralZeroEtaMatchesDDIM;
     procedure TestKarrasSpacingSigmaMonotone;
@@ -97,6 +98,13 @@ const
     (-1.0913574282060237, -0.8185180711545179, -0.5456787141030118,
      -0.2728393570515059, 0.0, 0.2728393570515059,
       0.5456787141030118, 0.8185180711545179);
+  // Heun 2nd-order (smHeun) with tsKarras spacing, from the float64 numpy oracle
+  // tools/heun_scheduler_oracle.py (same toy model & start). Two denoiser evals
+  // per step; corrector skipped on the final hop (sigma=0).
+  cOracleHeun: array[0..7] of double =
+    (-0.9874468254279581, -0.7405851190709684, -0.49372341271397907,
+     -0.24686170635698954, 0.0, 0.24686170635698954,
+      0.49372341271397907, 0.7405851190709684);
 
 procedure TTestNeuralDiffusion.ToyModel(Xt, Output: TNNetVolume; Tt: integer);
 var i: integer; s: TNeuralFloat;
@@ -386,6 +394,35 @@ begin
         IsNan(X.FData[i]) or IsInfinite(X.FData[i]));
       AssertEquals('unipc vs oracle @ ' + IntToStr(i),
         cOracleUniPC[i], X.FData[i], 1e-4);
+    end;
+  finally
+    Sched.Free; X.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestHeunVsOracle;
+var
+  Sched: TNNetDiffusionScheduler;
+  X: TNNetVolume;
+  i: integer;
+begin
+  // Heun 2nd-order deterministic sampler (k-diffusion sample_heun) with the
+  // Karras rho=7 spacing must reproduce the float64 numpy oracle to <1e-4. This
+  // is a genuine intra-step predictor-corrector: the Sample() driver calls the
+  // denoiser TWICE per step (Euler predict + 2nd-derivative correction) and
+  // skips the corrector on the final hop (sigma=0). It is a DISTINCT trajectory
+  // from the single-eval DDIM/DPM++/UniPC finals on the SAME toy model & start.
+  Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  X := TNNetVolume.Create(cN, 1, 1);
+  try
+    for i := 0 to cN - 1 do X.FData[i] := (i - cN / 2) * 0.3;
+    Sched.Sample(X, @ToyModel, cSteps, smHeun, 0.0, tsKarras);
+    for i := 0 to cN - 1 do
+    begin
+      AssertFalse('heun no NaN @ ' + IntToStr(i),
+        IsNan(X.FData[i]) or IsInfinite(X.FData[i]));
+      AssertEquals('heun vs oracle @ ' + IntToStr(i),
+        cOracleHeun[i], X.FData[i], 1e-4);
     end;
   finally
     Sched.Free; X.Free;
