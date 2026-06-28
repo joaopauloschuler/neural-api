@@ -1907,42 +1907,9 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
 
 ## Vision / generative & accelerator batch 2026-06-27b
 
-(All verified absent in source before listing. The GLU/GroupNorm layers carry
-no `FShouldOpenCL`/`ComputeOpenCL` path and their forward is a plain scalar
-triple loop with no AVX fast path; `BuildRAFTFromSafeTensors` and an NF4
-dequant path do not exist (only int8 + MXFP4-dequant do); there is a VQVAE
-example but no continuous-latent VAE example and no Gaussian reparameterization
-sampling layer — the "reparameterization" mentions in source are weight-norm,
-not z = mu + sigma·eps sampling.)
+(All verified absent in source before listing. `BuildRAFTFromSafeTensors` and an
+NF4 dequant path do not exist (only int8 + MXFP4-dequant do).)
 
-- [X] OpenCL forward offload for the GLU-family feed-forward activations
-      (`TNNetSwiGLU`, `TNNetGLU`, `TNNetGEGLU`, `TNNetGEGLUErf`,
-      `TNNetGptOssGatedSwiGLU`). These run in EVERY transformer FFN block (so in
-      every ChatTerminal / imported-LLM forward pass) and are currently a scalar
-      per-element loop over the full volume calling `pcr_expf`/`pcr_tanhf` once
-      per element. A single shared elementwise gating kernel in `neural/neural.cl`
-      (split the depth axis into the two halves A|B, compute `A * act(B)` with the
-      activation selected by a flag — sigmoid/swish/gelu-tanh/gelu-erf) keeps
-      activations device-resident between attention and the down-projection.
-      Mirror the existing `TNNetTokenRMSNorm` OpenCL pattern: arm `FShouldOpenCL`
-      in `EnableOpenCL`, gate dispatch on `FOutput.Size >= NeuralConvOpenCLMinWork`,
-      forward-only (training stays on CPU), with a `<1e-4` parity test per variant.
-- [X] AVX vectorization of the same GLU-family forward (`TNNetSwiGLU` / `TNNetGLU`
-      / `TNNetGEGLU` / `TNNetGEGLUErf`). The two gated halves A and B are each
-      depth-axis-contiguous (the AVX-friendly layout per the depth-contiguous
-      rule), so the `A * sigmoid(B)` / `A * swish(B)` elementwise pass can reuse
-      the existing `AVXExp` vector exponential already used by
-      `TVolume.PointwiseSoftMax` instead of a scalar `pcr_expf` per element.
-      Keep the scalar path as the `{$IFNDEF AVXANY}` fallback and pin parity with
-      the existing numerical-gradient/forward tests.
-- [X] OpenCL forward offload for `TNNetGroupNorm` / `TNNetInstanceNorm`. These are
-      the normalization used in diffusion UNet / GAN / StyleGAN image-generation
-      stacks (which already run their convs on the GPU), so the per-group
-      mean/variance reduction + affine scale/shift is a round-trip-forcing CPU
-      island today. Add a reduction kernel (one work-item group per (sample,group)
-      computing mean + variance then applying gain/bias), reusing the
-      `cai_token_norm`-style reduction shape from the landed token-norm offload;
-      forward-only, `FShouldOpenCL` armed in `EnableOpenCL`, `<1e-4` parity test.
 - [ ] RAFT optical-flow importer `BuildRAFTFromSafeTensors[Ex]`
       (`princeton-vl/raft`-style checkpoints; model the small + large feature/
       context encoders, the all-pairs correlation, and the convGRU update block).
@@ -1972,22 +1939,6 @@ not z = mu + sigma·eps sampling.)
         must expand or raise rather than feed quantized absmax in (no silent
         garbage path). A real `bnb-4bit` Llama/Qwen slicer fixture is RAM/network
         -gated; today's parity is the random pico numpy oracle only.
-- [X] Continuous-latent variational autoencoder example `examples/VAE` (KL +
-      Gaussian reparameterization), distinct from the existing discrete `VQVAE`
-      example. The `TNNetKLDivergence` loss layer already exists, but there is no
-      reparameterization sampling layer, so first add a shape-preserving
-      `TNNetGaussianReparameterize` layer that splits its input depth into
-      (mu | log-var), emits `z = mu + exp(0.5·log-var)·eps` in the forward (eps
-      frozen for the matching backward, like the Gumbel/weight-norm fixed-noise
-      pattern), and routes the standard-normal-prior KL gradient back through mu
-      and log-var. Then the example trains an encoder→reparameterize→decoder on
-      MNIST/CIFAR with reconstruction + KL, replacing any hand-rolled sampling.
-      LANDED (commit 55870274): `TNNetGaussianReparameterize` (reparam gradient
-      only, frozen `FEps`) + a companion `TNNetVAEKLDivergence` head (standard-
-      normal-prior KL kept as a SEPARATE loss for clean two-headed composition,
-      `dKL/dmu = mu`, `dKL/dlog_var = 0.5*(exp(log_var)-1)`, beta-scaled);
-      gradient checks `TestGaussianReparameterizeGradientCheck` /
-      `TestVAEKLDivergenceGradientCheck`; `examples/VAE` smoke MSE 0.21→0.02.
 
 ## Accelerator & dedup batch 2026-06-27c
 
