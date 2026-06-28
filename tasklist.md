@@ -1974,3 +1974,54 @@ cai_mrope M-RoPE OpenCL offload [b06c5d0d]. Open follow-ups:)
 - diffusers `guidance_rescale` ported into `TNNetDiffusionScheduler.ApplyCFG`
   (new 5-arg overload, phi=0 back-compatible) + test + LatentTextToImage wiring,
   commit 3b823163.)
+
+## Lucky-day batch 2026-06-28e (verified-novel diffusion / torch ports)
+
+(Each verified absent in the source before listing. `neural/neuraldiffusion.pas`
+already ships DDPM/DDIM/DPM-Solver++(2M)/Euler-Ancestral/UniPC samplers, Karras
+spacing, eps/v prediction, CFG + guidance-rescale, and the LCM/consistency
+subclass; SDEdit img2img + blended inpainting + ControlNet/IP-Adapter/LoRA + the
+VAE encoder/decoder importers all exist. The three items below are the gaps left
+in that otherwise-complete diffusion stack — all CV/generative and/or direct
+diffusers/torch ports.)
+
+- [ ] Heun 2nd-order (Karras EDM "Algorithm 2" / k-diffusion `sample_heun`)
+      sampler in `TNNetDiffusionScheduler`. Add an `smHeun` member to
+      `TNNetSamplerMethod` and a deterministic Heun update inside `Step`: it is a
+      single-step **predictor-corrector in sigma-space** that costs TWO denoiser
+      evals per step — Euler-predict from sigma_t to sigma_{t-1} to get x_pred,
+      re-evaluate the denoiser at (x_pred, t-1) for the second derivative, then
+      average the two drifts (trapezoidal correction). Unlike the existing
+      MULTISTEP DPM-Solver++(2M)/UniPC (which reuse the PREVIOUS step's stored
+      output as the 2nd order term, 1 eval/step) this is a genuine intra-step 2nd
+      eval, so it needs the `Sample` driver to call the `Denoise` callback twice
+      per step (and skip the corrector on the final step where sigma_{t-1}=0,
+      matching k-diffusion's `if sigmas[i+1]==0` branch). Reuses the existing
+      `SigmaOf`/`SigmaToTimestep`/`PredictX0` plumbing. Add a numpy/k-diffusion
+      float64 oracle parity test (`tools/make_*_fixture.py` -> `tests/fixtures`)
+      to `<1e-4`; pairs naturally with `tsKarras` spacing.
+
+- [ ] Tiled VAE decode (diffusers `enable_vae_tiling` port) for
+      `BuildVaeDecoderFromSafeTensors`. Decode a large latent in OVERLAPPING
+      spatial tiles and feather-blend the seams so peak working-set memory is
+      bounded by tile size, not by the full latent — the standard way to decode
+      megapixel SD/SDXL latents on a memory-constrained box. Mirror diffusers'
+      params: `tile_latent_min_size`, `tile_overlap_factor`; the blend is the
+      linear ramp over the overlap region (`blend_h`/`blend_v`). Pure host
+      orchestration around the existing decoder forward (no new layer, no new
+      weights). Parity test: a tiled decode of a small latent must match the
+      whole-image decode to `<1e-3` on the interior (seams allowed looser);
+      wire an opt-in `--vae-tiling` flag into examples/LatentTextToImage.
+
+- [ ] Min-SNR-gamma diffusion training-loss weighting (Hang et al. 2023, "Efficient
+      Diffusion Training via Min-SNR Weighting Strategy"; diffusers' `snr_gamma`
+      path). Add `function TNNetDiffusionScheduler.SNRWeight(Tt: integer;
+      Gamma: TNeuralFloat): TNeuralFloat` returning the per-timestep loss weight:
+      with `SNR(t) = exp(2*Lambda(Tt))` (the scheduler already exposes the
+      half-log-SNR `Lambda`), eps-prediction weight = `min(SNR, Gamma)/SNR` and
+      v-prediction weight = `min(SNR, Gamma)/(SNR+1)` (the `PredictionType`
+      already on the scheduler selects which). This is the missing training-side
+      counterpart to the rich SAMPLING side; a diffusion trainer (examples/
+      DiffusionMNIST) multiplies its per-sample MSE by this weight. Add a unit
+      test pinning the weights against a numpy oracle for both prediction types
+      (`Gamma=5.0` is the paper default; `Gamma=+inf` must reproduce unweighted).
