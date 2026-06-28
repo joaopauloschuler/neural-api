@@ -1915,7 +1915,7 @@ example but no continuous-latent VAE example and no Gaussian reparameterization
 sampling layer — the "reparameterization" mentions in source are weight-norm,
 not z = mu + sigma·eps sampling.)
 
-- [ ] OpenCL forward offload for the GLU-family feed-forward activations
+- [X] OpenCL forward offload for the GLU-family feed-forward activations
       (`TNNetSwiGLU`, `TNNetGLU`, `TNNetGEGLU`, `TNNetGEGLUErf`,
       `TNNetGptOssGatedSwiGLU`). These run in EVERY transformer FFN block (so in
       every ChatTerminal / imported-LLM forward pass) and are currently a scalar

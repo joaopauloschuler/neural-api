@@ -636,3 +636,50 @@ __kernel void cai_token_norm
       FY[base + c] = FGain[c] * xhat;
   }
 }
+
+// Shared GLU-family gated feed-forward activation. The input tensor is laid out
+// as FNumTokens rows of (2*FHalfDepth) contiguous channels; each row splits into
+// two contiguous depth-halves A = [0 .. FHalfDepth) and B = [FHalfDepth ..
+// 2*FHalfDepth). The output is A * act(B) where act is selected by FActFlag:
+//   0 = sigmoid     -> GLU       (A * sigmoid(B))
+//   1 = swish       -> SwiGLU    (A * B * sigmoid(B))
+//   2 = gelu-tanh   -> GEGLU     (A * B * 0.5*(1+tanh(sqrt(2/pi)*(B+0.044715*B^3))))
+//   3 = gelu-erf    -> GEGLUErf  (A * B * 0.5*(1+erf(B/sqrt(2))))
+// One work-item per (token, output-channel). Forward-only; the formulas are the
+// exact analytic forms used by the scalar CPU Compute() so parity is < 1e-4.
+__kernel void cai_glu_gate
+(
+  const int FNumTokens,
+  const int FHalfDepth,
+  const int FActFlag,
+  __global const float* FX,
+  __global float* FY
+)
+{
+  const int gid = get_global_id(0);
+  const int total = FNumTokens * FHalfDepth;
+  if (gid >= total) return;
+  const int t = gid / FHalfDepth;
+  const int d = gid - t * FHalfDepth;
+  const int inBase = t * (2 * FHalfDepth);
+  const float a = FX[inBase + d];
+  const float b = FX[inBase + FHalfDepth + d];
+  float gated;
+  if (FActFlag == 0)            // GLU: sigmoid(B)
+    gated = 1.0f / (1.0f + exp(-b));
+  else if (FActFlag == 1)       // SwiGLU: swish(B) = B*sigmoid(B)
+    gated = b * (1.0f / (1.0f + exp(-b)));
+  else if (FActFlag == 2)       // GEGLU: gelu_tanh(B)
+  {
+    const float SQRT_2_OVER_PI = 0.7978845608f;
+    const float GELU_CONST = 0.044715f;
+    const float arg = SQRT_2_OVER_PI * (b + GELU_CONST * b * b * b);
+    gated = b * 0.5f * (1.0f + tanh(arg));
+  }
+  else                          // GEGLUErf: gelu_erf(B)
+  {
+    const float INV_SQRT_2 = 0.7071067811865476f;
+    gated = b * 0.5f * (1.0f + erf(b * INV_SQRT_2));
+  }
+  FY[gid] = a * gated;
+}

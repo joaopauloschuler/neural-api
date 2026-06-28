@@ -332,6 +332,9 @@ type
     // transformer norm layers TNNetTokenRMSNorm and TNNetTokenLayerNorm.
     procedure TokenRMSNormOpenCLParity;
     procedure LayerNormOpenCLParity;
+    // OpenCL gated FFN forward offload parity (vs CPU) for the GLU-family
+    // activations TNNetGLU / TNNetSwiGLU / TNNetGEGLU / TNNetGEGLUErf.
+    procedure GLUFamilyOpenCLParity;
     procedure TestRoIAlignForward;
     procedure TestRoIAlignInputGradientCheck;
     procedure TestRoIAlignShapeInference;
@@ -60299,6 +60302,81 @@ begin
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Device forward parity (vs CPU) for the GLU-family gated FFN activations.
+// Each variant splits its input depth into two contiguous halves A|B and emits
+// A * act(B); the shared cai_glu_gate kernel is run for all four and pinned
+// against the CPU forward (< 1e-4). gpt-oss clamped SwiGLU stays CPU-only
+// (interleaved split + clamp does not fit the contiguous-half shared kernel),
+// so it is not exercised here. Coded by Claude (AI).
+procedure TTestNeuralNumerical.GLUFamilyOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Names: array[0..3] of string = ('GLU', 'SwiGLU', 'GEGLU', 'GEGLUErf');
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Gate: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, v: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for v := 0 to 3 do
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(5, 1, 24); // 5 tokens, input depth 24 -> out 12
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(5, 1, 24, 1));
+      case v of
+        0: Gate := TNNetGLU.Create();
+        1: Gate := TNNetSwiGLU.Create();
+        2: Gate := TNNetGEGLU.Create();
+      else Gate := TNNetGEGLUErf.Create();
+      end;
+      NN.AddLayer(Gate);
+      // Spread B over a wide range so the transcendental gate is well exercised.
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 2.4 * Sin(i * 0.37) - 0.3;
+
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      SetNeuralConvOpenCLMinWork(0);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        AssertEquals(Names[v] + ' output size match',
+          OutCPU.Size, NN.GetLastLayer.Output.Size);
+        MaxDiff := 0;
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        SetNeuralConvOpenCLMinWork(1 shl 20);
+      end;
+      WriteLn('  ', Names[v], ' OpenCL parity: max|diff|=', MaxDiff:0:9);
+      AssertTrue(Names[v] + ' OpenCL vs CPU parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      OutCPU.Free; Input.Free; NN.Free;
+    end;
   end;
 end;
 {$ELSE}
