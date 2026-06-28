@@ -179,7 +179,15 @@ type
     //   Dst := EpsUncond + W*(EpsCond - EpsUncond).
     // Dst may alias EpsCond or EpsUncond.
     class procedure ApplyCFG(EpsCond, EpsUncond, Dst: TNNetVolume;
-      W: TNeuralFloat);
+      W: TNeuralFloat); overload;
+    // Same CFG mix, then the guidance-rescale of Lin et al. 2023 ("Common
+    // Diffusion Noise Schedules and Sample Steps Are Flawed"), i.e. diffusers'
+    // rescale_noise_cfg. Let cfg := EpsUncond + W*(EpsCond - EpsUncond); rescale
+    // it by std(EpsCond)/std(cfg) and blend back: Dst := GuidanceRescale*rescaled
+    // + (1-GuidanceRescale)*cfg. GuidanceRescale=0 reproduces the plain CFG mix
+    // exactly. std is the population std over the whole volume.
+    class procedure ApplyCFG(EpsCond, EpsUncond, Dst: TNNetVolume;
+      W, GuidanceRescale: TNeuralFloat); overload;
 
     // Reset the DPM-Solver++ multistep history. Call before each new trajectory.
     procedure ResetMultistep;
@@ -508,6 +516,28 @@ begin
   for i := 0 to DstSizeM1 do
     Dst.FData[i] := EpsUncond.FData[i] +
       W * (EpsCond.FData[i] - EpsUncond.FData[i]);
+end;
+
+class procedure TNNetDiffusionScheduler.ApplyCFG(EpsCond, EpsUncond,
+  Dst: TNNetVolume; W, GuidanceRescale: TNeuralFloat);
+var
+  i, DstSizeM1: integer;
+  stdCond, stdCfg, factor: TNeuralFloat;
+begin
+  // Plain CFG mix first (also fills Dst when GuidanceRescale = 0).
+  ApplyCFG(EpsCond, EpsUncond, Dst, W);
+  if GuidanceRescale = 0 then exit;
+
+  // Rescale the over-saturated CFG result toward the conditional's std, then
+  // blend back by GuidanceRescale (diffusers rescale_noise_cfg, Lin et al. 2023).
+  stdCond := EpsCond.GetStdDeviation();
+  stdCfg  := Dst.GetStdDeviation();
+  if stdCfg = 0 then exit;
+  factor := stdCond / stdCfg;
+  DstSizeM1 := Dst.Size - 1;
+  for i := 0 to DstSizeM1 do
+    Dst.FData[i] := GuidanceRescale * (Dst.FData[i] * factor) +
+      (1 - GuidanceRescale) * Dst.FData[i];
 end;
 
 procedure TNNetDiffusionScheduler.ResetMultistep;

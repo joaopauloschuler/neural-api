@@ -309,7 +309,10 @@ begin
         // CFG: cond = prompt T5 states; uncond = null/empty caption (zeros).
         PixArtDenoise(PixArtNet, PixCfg, Latent, T, TextStates, EpsCond);
         PixArtDenoise(PixArtNet, PixCfg, Latent, T, NullStates, EpsUncond);
-        TNNetDiffusionScheduler.ApplyCFG(EpsCond, EpsUncond, EpsGuided, Guidance);
+        // Guidance-rescale (Lin et al. 2023): counteract the over-exposure of
+        // high CFG by pulling the result's std back toward the conditional's.
+        TNNetDiffusionScheduler.ApplyCFG(EpsCond, EpsUncond, EpsGuided,
+          Guidance, 0.7);
         Scheduler.Step(Latent, EpsGuided, T, TPrev, Method, 0.0);
         WriteLn('  step ', StepCnt + 1, '/', NumSteps, '  t=', T,
           '  |latent|=', Latent.GetMagnitude():0:4);

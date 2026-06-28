@@ -45,6 +45,8 @@ type
     // what a perfectly-distilled LCM satisfies, so the multistep loop is a fixed
     // point and must return the clean image.
     procedure LCMOracleModel(Xt, Output: TNNetVolume; Tt: integer);
+    // CFG guidance-rescale assertions; driven by TestApplyCFG (not a test itself).
+    procedure TestApplyCFGRescale(Cond, Uncond: TNNetVolume; w: TNeuralFloat);
   published
     procedure TestLinearScheduleVsOracle;
     procedure TestScaledLinearInvariants;
@@ -240,8 +242,41 @@ begin
       expect := Uncond.FData[i] + w * (Cond.FData[i] - Uncond.FData[i]);
       AssertEquals('cfg @ ' + IntToStr(i), expect, Dst.FData[i], 1e-6);
     end;
+    TestApplyCFGRescale(Cond, Uncond, w);
   finally
     Cond.Free; Uncond.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestApplyCFGRescale(
+  Cond, Uncond: TNNetVolume; w: TNeuralFloat);
+var
+  Plain, Rescaled: TNNetVolume;
+  i: integer;
+  stdCond, stdPlain, stdRescaled, phi: TNeuralFloat;
+begin
+  Plain    := TNNetVolume.Create(cN, 1, 1);
+  Rescaled := TNNetVolume.Create(cN, 1, 1);
+  try
+    // (a) GuidanceRescale = 0 reproduces the plain CFG mix exactly.
+    TNNetDiffusionScheduler.ApplyCFG(Cond, Uncond, Plain, w);
+    TNNetDiffusionScheduler.ApplyCFG(Cond, Uncond, Rescaled, w, 0.0);
+    for i := 0 to cN - 1 do
+      AssertEquals('rescale phi=0 @ ' + IntToStr(i),
+        Plain.FData[i], Rescaled.FData[i], 1e-6);
+
+    // (b) phi>0 pulls std(result) toward std(Cond) (w>1 overshoots it).
+    phi := 0.7;
+    TNNetDiffusionScheduler.ApplyCFG(Cond, Uncond, Rescaled, w, phi);
+    stdCond     := Cond.GetStdDeviation();
+    stdPlain    := Plain.GetStdDeviation();
+    stdRescaled := Rescaled.GetStdDeviation();
+    AssertTrue('plain CFG std overshoots cond std for w>1',
+      stdPlain > stdCond);
+    AssertTrue('rescaled std is closer to cond std than plain CFG std',
+      Abs(stdRescaled - stdCond) < Abs(stdPlain - stdCond));
+  finally
+    Plain.Free; Rescaled.Free;
   end;
 end;
 
