@@ -1950,18 +1950,24 @@ remaining transcendental activations are scalar `pcr_expf`/`pcr_tanhf`
 per-element loops; the dense Gauss-Jordan solver is hand-rolled in TWO places
 with incompatible signatures.)
 
-- [ ] OpenCL forward offload for `TNNetMaxPool` / `TNNetAvgPool` (and the
-      matching `TNNetDeMaxPool` / `TNNetDeAvgPool` unpool). These pooling layers
-      sit between convolution stages in the diffusion-UNet / GAN / StyleGAN /
-      classification-backbone image stacks that already run their convs AND their
-      GroupNorm on the GPU (GroupNorm OpenCL landed commit 09f9a13b), so each pool
-      is a CPU island that forces a device→host→device round-trip mid-forward.
-      Add a windowed-reduction kernel to `neural/neural.cl` (one work-item per
-      output (x,y,depth) cell reducing its `Size×Size` stride window by max / sum),
-      mirroring the landed `cai_group_norm` reduction-offload pattern: arm
-      `FShouldOpenCL` in `EnableOpenCL`, gate dispatch on
-      `FOutput.Size >= NeuralConvOpenCLMinWork`, forward-only (backward stays on
-      CPU), with a `<1e-4` parity test per layer against the scalar path.
+- [X] OpenCL forward offload for `TNNetMaxPool` / `TNNetAvgPool`. Added the
+      `cai_pool2d` windowed-reduction kernel to `neural/neural.cl` (one work-item
+      per output (x,y,depth) cell reducing its clipped `PoolSize×PoolSize` stride
+      window by max or sum/divisor), wired through the shared `TNNetPool2DCL` host
+      helper (binds on the dot-product program's device, mirrors `TNNetGroupNormCL`
+      from commit 09f9a13b). `EnableOpenCL` arms `FShouldOpenCL` on `TNNetMaxPool`
+      (inherited by `TNNetAvgPool`); dispatch gated on `FOutput.Size >=
+      NeuralConvOpenCLMinWork` and restricted to the exact `TNNetMaxPool` /
+      `TNNetAvgPool` ClassType (argmax-tracking / channel / position subclasses
+      keep the scalar path). MaxPool offloads the post-CopyPadding `FInputCopy` so
+      zero-padded border cells stay real window members; AvgPool divides by the
+      FULL `PoolSize*PoolSize` like the scalar `Output.Divi` even on edge windows.
+      Forward-only (backward stays on CPU). PoCL parity: MaxPool max|diff|=0.0,
+      AvgPool max|diff|=3.0e-8 (< 1e-4) via MaxPoolOpenCLParity/AvgPoolOpenCLParity
+      (skip cleanly when no OpenCL device is present).
+      FOLLOW-UP (still open): the matching `TNNetDeMaxPool` / `TNNetDeAvgPool`
+      unpool forward offload — its scatter/replicate semantics differ from the
+      windowed reduction and were left out of scope here.
 
 - [ ] OpenCL forward offload for `TNNetEmbedding` token-gather. The embedding
       lookup is the FIRST layer of every imported-LLM / ChatTerminal forward pass;

@@ -758,3 +758,76 @@ __kernel void cai_group_norm
       }
     }
 }
+
+// Windowed 2-D pooling forward (TNNetMaxPool / TNNetAvgPool). The input volume is
+// laid out depth-axis contiguous in the TVolume convention: element (x,y,d) lives
+// at FX[((FInW * y) + x) * FDepth + d], with row stride FInW*FDepth and x stride
+// FDepth. One work-item per OUTPUT (x,y,d) cell: it reduces its pooling window
+//   ix in [ox*FStride .. min(ox*FStride + FPoolSize - 1, FInW - 1)]
+//   iy in [oy*FStride .. min(oy*FStride + FPoolSize - 1, FInH - 1)]
+// (window edges are clipped to the input, exactly like the scalar loops). FReduce
+// selects the reduction:
+//   0 = MAX  : maximum over the actual (clipped) window cells. For TNNetMaxPool
+//              the host passes the post-CopyPadding input when padding>0 / strided
+//              so the zero-padded border cells are real window members, matching
+//              the scalar FInputCopy path. FStride is the layer stride.
+//   1 = AVG  : sum over the window divided by FDivisor (TNNetAvgPool divides by
+//              the FULL FPoolSize*FPoolSize, NOT the clipped cell count; the host
+//              passes FStride = FPoolSize and FDivisor = FPoolSize*FPoolSize).
+// Global size = FOutW * FOutH * FDepth (dim 0). Forward-only; training stays on CPU.
+__kernel void cai_pool2d
+(
+  const int FInW,
+  const int FInH,
+  const int FDepth,
+  const int FOutW,
+  const int FOutH,
+  const int FPoolSize,
+  const int FStride,
+  const int FReduce,
+  const float FDivisor,
+  __global const float* FX,
+  __global float* FY
+)
+{
+  const int gid = get_global_id(0);
+  const int total = FOutW * FOutH * FDepth;
+  if (gid >= total) return;
+  // Decode the output (ox, oy, d) from the flat work-item id (depth-contiguous).
+  const int d  = gid % FDepth;
+  const int t  = gid / FDepth;
+  const int ox = t % FOutW;
+  const int oy = t / FOutW;
+
+  const int ix0 = ox * FStride;
+  const int iy0 = oy * FStride;
+  int ixMax = ix0 + FPoolSize - 1; if (ixMax > FInW - 1) ixMax = FInW - 1;
+  int iyMax = iy0 + FPoolSize - 1; if (iyMax > FInH - 1) iyMax = FInH - 1;
+
+  const int rowStride = FInW * FDepth;
+  if (FReduce == 0)
+  {
+    float m = -1e30f;
+    for (int iy = iy0; iy <= iyMax; iy++)
+    {
+      const int rowBase = iy * rowStride + d;
+      for (int ix = ix0; ix <= ixMax; ix++)
+      {
+        const float v = FX[rowBase + ix * FDepth];
+        if (v > m) m = v;
+      }
+    }
+    FY[gid] = m;
+  }
+  else
+  {
+    float s = 0.0f;
+    for (int iy = iy0; iy <= iyMax; iy++)
+    {
+      const int rowBase = iy * rowStride + d;
+      for (int ix = ix0; ix <= ixMax; ix++)
+        s += FX[rowBase + ix * FDepth];
+    }
+    FY[gid] = s / FDivisor;
+  }
+}
