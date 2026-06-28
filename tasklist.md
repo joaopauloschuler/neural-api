@@ -1914,16 +1914,32 @@ then — only int8 + MXFP4-dequant did.)
       `bitsandbytes` is NOT importable under `venv x` — CPU torch, no CUDA bnb
       build) via `TestNF4DequantFixtureParity` + `TestNF4DequantHandBlock`.
       OPEN FOLLOW-UPS:
-  - [ ] Wire detection into `BuildLlamaFromSafeTensors` family — detect a
-        `weight` + `weight.absmax` bnb-4bit pair, expand to F32 at load (mirrors
-        how MXFP4 dequant is consumed; both are currently helper-level, the
-        gpt-oss MXFP4 build-path consumption is itself documented-but-deferred).
+  - [X] Wire detection into `BuildLlamaFromSafeTensors` family — LANDED. The
+        central Llama-family linear loader `LoadLlamaLinearWeights` now detects a
+        bnb-4bit pair via `IsNF4QuantizedTensor` (a `<name>.weight` U8 packed
+        tensor + a `<name>.weight.absmax` FP32 sibling) and, when present, skips
+        the dense `[out,in]` shape check and expands the packed nibbles to a flat
+        F32 `[out,in]` buffer via `LoadNF4QuantizedTensorFlat` (calls
+        `neuralnf4.DequantizeNF4`, BlockSize=64) before the dtype-agnostic
+        permutation/copy — every Build* wrapper that routes its q/k/v/o/MLP/lm_head
+        weights through `LoadLlamaLinearWeights` (Llama/Mistral/Qwen2/3/Gemma/
+        Phi-3/OLMo2/GLM4/...) inherits the path. Both helpers are exported in the
+        interface. Parity: `tools/make_pico_nf4_fixture.py` now also emits a tiny
+        bnb-4bit `.safetensors` (`tests/fixtures/pico_nf4_linear.safetensors`,
+        packed U8 weight + FP32 absmax) + the numpy reference dequant
+        (`pico_nf4_linear.json`); `TestNF4ImporterLinearParity` drives the
+        importer NF4 branch through `TNNetSafeTensorsReader` and asserts <1e-5.
   - [ ] Double-quantized absmax: handle `*.nested_absmax` / `*.nested_quant_map`
         / `*.quant_state.*` (the secondary int8 quant + nested absmax + offset).
-        The unit consumes already-FP32 absmax and documents that the importer
-        must expand or raise rather than feed quantized absmax in (no silent
-        garbage path). A real `bnb-4bit` Llama/Qwen slicer fixture is RAM/network
-        -gated; today's parity is the random pico numpy oracle only.
+        DEFERRED. `LoadNF4QuantizedTensorFlat` now RAISES a clear
+        `EPretrainedImportError` on these nested/double-quant markers (and on a
+        non-FP32 absmax sibling) rather than feeding quantized absmax into
+        DequantizeNF4 — no silent garbage path. `TestNF4ImporterRejectsDoubleQuant`
+        covers the rejection (fixture `pico_nf4_doublequant.safetensors`). To
+        finish: expand the int8-quantized absmax (nested absmax + offset +
+        quant_map) to FP32 upstream, then drop the guard. A real `bnb-4bit`
+        Llama/Qwen slicer fixture is RAM/network-gated; today's parity is the
+        random pico numpy oracle only.
 
 ## Accelerator & dedup batch 2026-06-27f
 

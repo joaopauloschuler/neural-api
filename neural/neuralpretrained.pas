@@ -528,8 +528,8 @@ uses
   {$ENDIF}
   Classes, SysUtils, Math, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralthread, neuralsafetensors, neuraltorchbin,
-  neuralgguf, neuralhftokenizer, neuralmxfp4, neuralaudio, neuraldiffusion,
-  pascoremath32;
+  neuralgguf, neuralhftokenizer, neuralmxfp4, neuralnf4, neuralaudio,
+  neuraldiffusion, pascoremath32;
 
 type
   EPretrainedImportError = class(Exception);
@@ -554,6 +554,13 @@ function ReadGPT2Config(Reader: TNNetSafeTensorsReader;
   pNumHeads: integer = 0): TGPT2Config;
 
 function GPT2ConfigToString(const Config: TGPT2Config): string;
+
+// bitsandbytes 4-bit (NF4) detection + dequant-at-load helpers (exposed for the
+// importer NF4 wiring and its parity test; see implementation comments).
+function IsNF4QuantizedTensor(Reader: TNNetSafeTensorsReader;
+  const WName: string): boolean;
+procedure LoadNF4QuantizedTensorFlat(Reader: TNNetSafeTensorsReader;
+  const WName: string; NumRows, InDim: integer; Dest: TNNetVolume);
 
 // Opens the checkpoint at FileName with the reader matching its format:
 // a ".bin" extension - or a ".bin.index.json" sharded-checkpoint index
@@ -14065,6 +14072,86 @@ begin
     {HasBeta=}False, {BetaFromTensor=}False, {ValidateBeta=}False, 'Llama');
 end;
 
+// Returns True iff WName is stored as a bitsandbytes 4-bit (NF4) quantized
+// tensor, i.e. the packed-nibble weight `WName` (uint8) plus its per-block
+// FP32 scale sibling `WName + '.absmax'` are both present. HF Linear4bit
+// checkpoints store the weight this way (the dense `WName` is the packed U8
+// buffer, the unpacked [out, in] shape lives in the quant-state metadata, not
+// in the safetensors shape - the U8 tensor is typically [ceil(numel/2), 1]).
+function IsNF4QuantizedTensor(Reader: TNNetSafeTensorsReader;
+  const WName: string): boolean;
+begin
+  Result := Reader.HasTensor(WName) and
+            Reader.HasTensor(WName + '.absmax') and
+            (Reader.GetDType(WName) = 'U8');
+end;
+
+// Dequantizes a bitsandbytes 4-bit (NF4) weight `WName` into Dest as a flat
+// F32 [NumRows * InDim] buffer in HF nn.Linear [out, in] row-major order (the
+// same layout Reader.LoadTensorFlat produces for a dense weight), so callers
+// can treat the result identically to an F32 weight. `WName` is the packed
+// uint8 nibble stream (ceil(NumRows*InDim/2) bytes, HIGH nibble first) and
+// `WName + '.absmax'` the per-block FP32 scales (NF4_DEFAULT_BLOCKSIZE = 64
+// elements/block). The element count NumRows*InDim is taken from the caller's
+// expected shape, not the (collapsed) U8 tensor shape.
+//
+// DOUBLE-QUANT IS DEFERRED: bitsandbytes can itself int8-quantize the absmax
+// (a nested absmax + offset + quant_map). neuralnf4.DequantizeNF4 consumes
+// already-FP32 absmax only, so if any nested/double-quant marker is present
+// (`*.nested_absmax`, `*.nested_quant_map`, `*.quant_state.*`) or the absmax
+// sibling is not FP32, we RAISE rather than feed quantized absmax in and
+// silently produce garbage. Single-quant (FP32 absmax) is the only supported
+// path here.
+procedure LoadNF4QuantizedTensorFlat(Reader: TNNetSafeTensorsReader;
+  const WName: string; NumRows, InDim: integer; Dest: TNNetVolume);
+var
+  AbsmaxName: string;
+  PackedBytes: TBytes;
+  Absmax: TNNetVolume;
+  NumElements, ExpectedBytes, ExpectedBlocks: Int64;
+begin
+  AbsmaxName := WName + '.absmax';
+  // Reject double-quantized absmax up front: the helper consumes FP32 absmax.
+  if Reader.HasTensor(WName + '.nested_absmax') or
+     Reader.HasTensor(WName + '.nested_quant_map') or
+     Reader.HasTensor(WName + '.quant_state.bitsandbytes__nf4') or
+     Reader.HasTensor(WName + '.quant_state.bitsandbytes__fp4') then
+    ImportError('NF4 import: "' + WName + '" is DOUBLE-quantized ' +
+      '(nested/quant_state absmax present). DequantizeNF4 consumes FP32 ' +
+      'absmax only; double-quant dequant is not yet supported.');
+  if Reader.GetDType(AbsmaxName) <> 'F32' then
+    ImportError('NF4 import: "' + AbsmaxName + '" must be FP32 (single-quant ' +
+      'absmax), got dtype "' + Reader.GetDType(AbsmaxName) + '". ' +
+      'Double-quantized absmax is not yet supported.');
+  if Reader.GetDType(WName) <> 'U8' then
+    ImportError('NF4 import: "' + WName + '" must be a packed uint8 (U8) ' +
+      'tensor, got dtype "' + Reader.GetDType(WName) + '".');
+  NumElements := Int64(NumRows) * InDim;
+  ExpectedBytes := (NumElements + 1) div 2;       // 2 nibbles/byte
+  ExpectedBlocks := (NumElements + NF4_DEFAULT_BLOCKSIZE - 1)
+    div NF4_DEFAULT_BLOCKSIZE;
+  Reader.LoadTensorRawBytes(WName, PackedBytes);
+  if Length(PackedBytes) <> ExpectedBytes then
+    ImportError('NF4 import: "' + WName + '" has ' + IntToStr(Length(PackedBytes)) +
+      ' packed bytes, expected ' + IntToStr(ExpectedBytes) + ' for a [' +
+      IntToStr(NumRows) + ', ' + IntToStr(InDim) + '] (' +
+      IntToStr(NumElements) + '-element) NF4 weight.');
+  Absmax := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(AbsmaxName, Absmax);
+    if Absmax.Size <> ExpectedBlocks then
+      ImportError('NF4 import: "' + AbsmaxName + '" has ' +
+        IntToStr(Absmax.Size) + ' block scales, expected ' +
+        IntToStr(ExpectedBlocks) + ' (' + IntToStr(NF4_DEFAULT_BLOCKSIZE) +
+        ' elements/block for ' + IntToStr(NumElements) + ' elements).');
+    Dest.ReSize(integer(NumElements), 1, 1);
+    DequantizeNF4(@PackedBytes[0], @Absmax.FData[0], NumElements, @Dest.FData[0],
+      NF4_DEFAULT_BLOCKSIZE);
+  finally
+    Absmax.Free;
+  end;
+end;
+
 // Loads a HF nn.Linear weight [out, in] (bias-free, the Llama convention)
 // into a TNNetPointwiseConvLinear: HF computes y = x . W^T, so output
 // channel j IS row j: Neuron[NeuronBase + j].Weights[i] = W[j*in + i].
@@ -14120,9 +14207,15 @@ begin
       ImportError('Llama import: "' + BiasName + '" must have shape [' +
         IntToStr(SrcRows) + '], got ' + Reader.ShapeAsString(BiasName));
   end;
-  if (Reader.DimCount(WName) <> 2) or
-     (Reader.DimSize(WName, 0) <> SrcRows) or
-     (Reader.DimSize(WName, 1) <> InDim) then
+  // bitsandbytes 4-bit (NF4) weights ship as a packed U8 buffer whose
+  // safetensors shape is the COLLAPSED packed shape (not [out, in]); the logical
+  // [out, in] shape is what the caller passes. Skip the dense shape check for
+  // those and dequantize-at-load below (LoadNF4QuantizedTensorFlat validates the
+  // packed byte / absmax-block counts against [SrcRows, InDim]).
+  if (not IsNF4QuantizedTensor(Reader, WName)) and
+     ((Reader.DimCount(WName) <> 2) or
+      (Reader.DimSize(WName, 0) <> SrcRows) or
+      (Reader.DimSize(WName, 1) <> InDim)) then
     ImportError('Llama import: "' + WName + '" must have shape [' +
       IntToStr(SrcRows) + ', ' + IntToStr(InDim) + '] (nn.Linear stores ' +
       '[out, in]), got ' + Reader.ShapeAsString(WName));
@@ -14143,7 +14236,12 @@ begin
   W := TNNetVolume.Create;
   B := nil;
   try
-    Reader.LoadTensorFlat(WName, W);
+    if IsNF4QuantizedTensor(Reader, WName) then
+      // bnb-4bit: expand the packed nibbles + FP32 absmax into a flat F32
+      // [SrcRows, InDim] buffer; the rest of the loader is dtype-agnostic.
+      LoadNF4QuantizedTensorFlat(Reader, WName, SrcRows, InDim, W)
+    else
+      Reader.LoadTensorFlat(WName, W);
     if BiasName <> '' then
     begin
       B := TNNetVolume.Create;

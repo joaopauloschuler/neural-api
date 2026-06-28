@@ -25,6 +25,14 @@ import json
 import numpy as np
 
 OUT_JSON = "tests/fixtures/pico_nf4.json"
+# Importer-level fixture: a tiny bnb-4bit nn.Linear weight (packed U8 + FP32
+# absmax) in a real .safetensors, plus the expected dequant matrix as JSON, so
+# the Pascal importer (LoadLlamaLinearWeights NF4 branch) can be parity-checked
+# end-to-end through TNNetSafeTensorsReader.
+OUT_ST = "tests/fixtures/pico_nf4_linear.safetensors"
+OUT_LINEAR_JSON = "tests/fixtures/pico_nf4_linear.json"
+OUT_ST_DQ = "tests/fixtures/pico_nf4_doublequant.safetensors"
+WEIGHT_NAME = "model.layers.0.self_attn.q_proj.weight"
 
 # bitsandbytes NF4 codebook (functional.py, quant_type="nf4"). 16 levels,
 # index 0..15, ascending. Index 7 is exactly 0.0.
@@ -119,6 +127,61 @@ def main():
         json.dump(fixture, f)
     print("wrote", OUT_JSON, "n=", n, "nblocks=", nblocks,
           "packed_bytes=", packed.size, "max|deq|=", float(np.max(np.abs(deq))))
+
+    write_linear_fixture(rng, blocksize)
+
+
+def write_linear_fixture(rng, blocksize):
+    # A tiny nn.Linear weight [out_dim, in_dim] quantized as one flat NF4 stream
+    # (bitsandbytes flattens the matrix row-major before blockwise quant). Dims
+    # chosen so out_dim*in_dim spans several 64-element blocks with a ragged tail.
+    from safetensors.numpy import save_file
+    import os
+    out_dim, in_dim = 6, 20            # 120 elements -> 2 blocks (64, 56)
+    w = rng.standard_normal((out_dim, in_dim)).astype(np.float32)
+    flat = w.reshape(-1)
+    idx, absmax, nblocks = quantize_nf4(flat, blocksize)
+    packed = pack_high_first(idx)
+    deq = dequantize_nf4(packed, absmax, flat.size, blocksize)
+    deq_mat = deq.reshape(out_dim, in_dim)
+
+    tensors = {
+        # bnb-4bit storage: packed U8 buffer (collapsed [ceil(numel/2), 1] shape)
+        # plus the per-block FP32 absmax sibling. No nested/quant_state markers
+        # -> single-quant (the only path the importer expands).
+        WEIGHT_NAME: packed.reshape(-1, 1),                  # uint8
+        WEIGHT_NAME + ".absmax": absmax.astype(np.float32),  # fp32
+    }
+    os.makedirs(os.path.dirname(OUT_ST), exist_ok=True)
+    save_file(tensors, OUT_ST)
+
+    linear = {
+        "weight_name": WEIGHT_NAME,
+        "out_dim": out_dim,
+        "in_dim": in_dim,
+        "blocksize": blocksize,
+        "nblocks": int(nblocks),
+        "dequant": deq_mat.tolist(),   # fp64 reference [out_dim][in_dim]
+        "reference": "numpy-reconstructed bitsandbytes NF4 (bnb not importable)",
+    }
+    with open(OUT_LINEAR_JSON, "w") as f:
+        json.dump(linear, f)
+    print("wrote", OUT_ST, "and", OUT_LINEAR_JSON,
+          "out_dim=", out_dim, "in_dim=", in_dim, "nblocks=", nblocks,
+          "packed_bytes=", packed.size)
+
+    # Double-quantized variant: the absmax is itself int8-quantized (U8) with a
+    # nested_absmax marker. The importer must REJECT this (DequantizeNF4 consumes
+    # FP32 absmax only) rather than feed quantized absmax in.
+    dq_tensors = {
+        WEIGHT_NAME: packed.reshape(-1, 1),                       # uint8
+        WEIGHT_NAME + ".absmax": (absmax * 0).astype(np.uint8),   # U8 (quantized)
+        WEIGHT_NAME + ".nested_absmax": np.array(
+            [float(absmax.max())], dtype=np.float32),
+        WEIGHT_NAME + ".quant_map": NF4_CODE.astype(np.float32),
+    }
+    save_file(dq_tensors, OUT_ST_DQ)
+    print("wrote", OUT_ST_DQ, "(double-quant rejection fixture)")
 
 
 if __name__ == "__main__":

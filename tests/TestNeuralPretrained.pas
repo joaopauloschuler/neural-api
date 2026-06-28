@@ -194,6 +194,8 @@ type
     procedure TestMXFP4DequantNaNScale;
     procedure TestNF4DequantHandBlock;
     procedure TestNF4DequantFixtureParity;
+    procedure TestNF4ImporterLinearParity;
+    procedure TestNF4ImporterRejectsDoubleQuant;
     procedure TestShardedReaderMatchesSingleFile;
     procedure TestShardedLlamaLogitsBitIdentical;
     procedure TestDistilGPT2LogitParity;
@@ -26629,6 +26631,109 @@ begin
     end;
   finally
     RefJson.Free;
+  end;
+end;
+
+// Importer-level NF4 parity: drives the BuildLlamaFromSafeTensors NF4 wiring
+// (IsNF4QuantizedTensor detection + LoadNF4QuantizedTensorFlat dequant-at-load)
+// through a real TNNetSafeTensorsReader on the committed pico bnb-4bit fixture
+// (tests/fixtures/pico_nf4_linear.safetensors: a [6,20] q_proj weight stored as
+// a packed U8 nibble buffer + FP32 .absmax sibling, no double-quant markers).
+// Asserts the importer detects it as NF4 and expands it to the numpy-reference
+// dequant matrix (tests/fixtures/pico_nf4_linear.json) to < 1e-5.
+procedure TTestNeuralPretrained.TestNF4ImporterLinearParity;
+var
+  Reader: TNNetSafeTensorsReader;
+  RefJson: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  DeqArr, RowArr: TJSONArray;
+  WName: string;
+  OutDim, InDim, i, j: integer;
+  W: TNNetVolume;
+  Diff, MaxDiff, Ref: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  W := TNNetVolume.Create;
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('pico_nf4_linear.safetensors'));
+  try
+    RefJson.LoadFromFile(FixturePath('pico_nf4_linear.json'));
+    Root := GetJSON(RefJson.Text);
+    try
+      Obj := Root as TJSONObject;
+      WName := Obj.Strings['weight_name'];
+      OutDim := Obj.Integers['out_dim'];
+      InDim := Obj.Integers['in_dim'];
+      DeqArr := Obj.Arrays['dequant'];
+
+      // The importer must recognise the packed U8 + .absmax pair as NF4.
+      AssertTrue('detected as NF4 quantized', IsNF4QuantizedTensor(Reader, WName));
+      AssertEquals('packed weight dtype is U8', 'U8', Reader.GetDType(WName));
+      AssertEquals('absmax dtype is F32', 'F32',
+        Reader.GetDType(WName + '.absmax'));
+
+      // Expand to a flat F32 [OutDim, InDim] buffer (same layout a dense load
+      // would produce) and compare to the numpy reference matrix.
+      LoadNF4QuantizedTensorFlat(Reader, WName, OutDim, InDim, W);
+      AssertEquals('dequant element count', OutDim * InDim, W.Size);
+      MaxDiff := 0;
+      for j := 0 to OutDim - 1 do
+      begin
+        RowArr := DeqArr.Arrays[j];
+        AssertEquals('dequant row width', InDim, RowArr.Count);
+        for i := 0 to InDim - 1 do
+        begin
+          Ref := RowArr.Floats[i];
+          Diff := Abs(W.FData[j * InDim + i] - Ref);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+      AssertTrue('NF4 importer linear parity max|diff|=' + FloatToStr(MaxDiff) +
+        ' < 1e-5', MaxDiff < 1e-5);
+    finally
+      Root.Free;
+    end;
+  finally
+    Reader.Free;
+    W.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Double-quant guard: bitsandbytes can int8-quantize the absmax itself (a
+// nested_absmax + quant_map). DequantizeNF4 consumes FP32 absmax only, so the
+// importer must RAISE (not silently dequant garbage) when it sees the nested /
+// double-quant markers. The fixture stores a U8 .absmax + .nested_absmax.
+procedure TTestNeuralPretrained.TestNF4ImporterRejectsDoubleQuant;
+var
+  Reader: TNNetSafeTensorsReader;
+  W: TNNetVolume;
+  WName: string;
+  Raised: boolean;
+begin
+  RandSeed := 424242;
+  WName := 'model.layers.0.self_attn.q_proj.weight';
+  W := TNNetVolume.Create;
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('pico_nf4_doublequant.safetensors'));
+  try
+    // Still detected as a 4-bit pair (U8 weight + .absmax sibling present)...
+    AssertTrue('double-quant still detected as NF4',
+      IsNF4QuantizedTensor(Reader, WName));
+    // ...but expanding it must RAISE rather than feed quantized absmax in.
+    Raised := False;
+    try
+      LoadNF4QuantizedTensorFlat(Reader, WName, 6, 20, W);
+    except
+      on E: EPretrainedImportError do
+        Raised := True;
+    end;
+    AssertTrue('double-quant NF4 raises EPretrainedImportError', Raised);
+  finally
+    Reader.Free;
+    W.Free;
   end;
 end;
 
