@@ -323,6 +323,11 @@ type
     // OpenCL two-GEMM forward offload parity (vs CPU/AVX) for the RECTANGULAR
     // TNNetCrossAttention (Q from one source, packed K|V from a second source).
     procedure CrossAttentionOpenCLParity;
+    // OpenCL forward offload parity (vs CPU) for TNNetALiBiAttention: the two
+    // SDPA device matmuls plus the ALiBi linear position bias injected in the
+    // CPU mask/softmax gap. Also asserts the SAFETY fallback: the sibling
+    // variants that DON'T ship a correct offload must NOT arm the device path.
+    procedure ALiBiAttentionOpenCLParity;
     // OpenCL input-projection GEMM forward offload parity (vs CPU/AVX) for the
     // dense recurrent cells TNNetLSTMCell / TNNetGRUCell.
     procedure LSTMCellOpenCLParity;
@@ -60596,6 +60601,96 @@ begin
     OutCPU.Free;
     KVData.Free;
     QData.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetALiBiAttention reuses the parent's two device matmuls (Q.K^T and P.V) and
+// injects the fixed linear bias Slope*(j-i) in the CPU mask/softmax gap, so the
+// device forward must match the CPU Compute() within FP32 GEMM-reorder noise.
+// SeqLen >= 32 so the device path fires; causal+sliding-window are exercised so
+// the masking branch is covered. The test also pins the SAFETY guard: a sibling
+// variant (TNNetCosineSimilarityAttention) that ships NO correct offload must
+// have ShouldOpenCL = false after EnableOpenCL, i.e. it falls back to its CPU
+// Compute() rather than the wrong inherited plain-SDPA device path.
+procedure TTestNeuralNumerical.ALiBiAttentionOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Dk = 12;
+  SeqLen = 40; // >= 32 so the device path fires
+  Slope = 0.125;
+  Window = 8;
+var
+  NN: TNNet;
+  XData, OutCPU: TNNetVolume;
+  InputLayer: TNNetLayer;
+  Attn: TNNetALiBiAttention;
+  Cosine: TNNetCosineSimilarityAttention;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  OutCPU := TNNetVolume.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetALiBiAttention.Create(Dk, {CausalMask}true, Slope, Window);
+    NN.AddLayerAfter(Attn, InputLayer);
+
+    // Bounded Q|K|V so scores/value sums stay O(1) and the 1e-4 gate is tight.
+    for i := 0 to XData.Size - 1 do
+      XData.Raw[i] := 0.5 * Sin(i * 0.3) + 0.2 * Cos(i * 0.11);
+
+    // CPU forward (OpenCL OFF) -> reference.
+    NN.Compute(XData);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    // Device forward (ALiBi offload ARMED via its own EnableOpenCL override).
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    AssertTrue('ALiBi device path armed', Attn.ShouldOpenCL);
+    NN.Compute(XData);
+
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    MaxDiff := 0;
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  ALiBiAttention OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('ALiBiAttention OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    XData.Free;
+    NN.Free;
+  end;
+
+  // SAFETY guard: a variant WITHOUT a correct offload must NOT arm the device
+  // path (else it would silently run the wrong inherited plain-SDPA kernel).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Cosine := TNNetCosineSimilarityAttention.Create(Dk, {CausalMask}true);
+    NN.AddLayerAfter(Cosine, InputLayer);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    AssertTrue('CosineSimilarity variant must fall back to CPU (ShouldOpenCL=false)',
+      not Cosine.ShouldOpenCL);
+  finally
     NN.Free;
   end;
 end;
