@@ -2007,3 +2007,55 @@ the existing tasklist before listing — none are already coded or pending.)
       `tools/make_pico_xlmroberta_fixture.py` → tiny_xlmroberta.safetensors (9.8KB,
       O(1)-rescaled). Tests `TestXLMRoberta{Config,HiddenState,Pooler}Parity` < 2e-5
       vs HF `XLMRobertaModel`; suite 2474/0.
+
+## Lucky-day batch 2026-06-28d (verified-novel AVX / OpenCL / diffusion)
+
+(Each checked against neuralnetwork.pas / neuraldiffusion.pas and the existing
+tasklist before listing — none are already coded or pending. Lucky number 39.)
+
+- [ ] AVX-vectorize the `TNNetGlobalSumPool.Compute` forward. Today it is a pure
+      scalar channel-outer triple loop (`for D ... for Y for X` accumulating one
+      scalar `Sum` per channel) — the worst memory pattern because each channel's
+      elements are strided by `Depth`. Restructure to a pixel-outer accumulation:
+      zero a `Depth`-long accumulator, then for each (X,Y) AVX-add that pixel's
+      depth-CONTIGUOUS span into the accumulator (`TNNetVolume.Add`, which already
+      dispatches to AVX), giving the per-channel sums in one contiguous-vector
+      reduction. This is the same depth-axis-contiguous rule the AvgChannel/pool
+      reductions follow. Forward-only; backward (broadcast scatter) already exists
+      and is untouched. Parity `<1e-5` vs the current scalar path on a non-trivial
+      (SizeX,SizeY,Depth) volume.
+
+- [ ] OpenCL forward offload for `TNNetGramMatrix.Compute`. The layer computes a
+      `C x C` Gram matrix as `C*(C+1)/2` depth-contiguous `TNNetVolume.DotProduct`
+      calls over the `HW` spatial rows (already AVX on host) — a dense symmetric
+      GEMM that is the per-style-image hotspot of neural style transfer
+      (examples/StyleTransfer, examples/AdaINStyleTransfer). No `ComputeOpenCL`
+      exists for it today. Wire `EnableOpenCL`/`ComputeOpenCL` onto the existing
+      `cai_dot_product` kernel (one row-pair dot product per work item; fill the
+      upper triangle then mirror), applying the same `1/HW` (or `1/(C*HW)`) scale
+      the host path uses. Forward-only, parity-tested `<1e-4`, self-skip clean when
+      no device — mirrors the established offload-with-host-fallback pattern.
+
+- [ ] AVX-vectorize the forward of `TNNetAdaptiveAvgPool` and `TNNetAdaptiveMaxPool`.
+      Both are scalar nested loops (`OutX,OutY,D,InY,InX`) that, for each output
+      cell, re-scan a variable input window element-by-element with strided depth
+      access. Restructure each output window to iterate input pixels OUTER and
+      reduce the depth-CONTIGUOUS span per input pixel: AvgPool accumulates spans
+      with `TNNetVolume.Add` then scales by `1/windowCount`; MaxPool uses an
+      element-wise AVX max over the spans (`TNNetVolume.MaxAbs`-style / pmax). This
+      is the adaptive-window analogue of the fixed-window pool AVX path. Forward
+      only; AdaptiveMaxPool's argmax-tracking backward stays scalar/exact. Parity
+      `<1e-5` vs the current scalar forward across several output grid sizes.
+
+- [ ] Port diffusers' `guidance_rescale` (Lin et al. 2023, "Common Diffusion Noise
+      Schedules and Sample Steps Are Flawed") into `TNNetDiffusionScheduler`. Today
+      `ApplyCFG(EpsCond, EpsUncond, Dst, W)` is the plain linear extrapolation
+      `uncond + W*(cond-uncond)`; at high guidance scales this overexposes/saturates
+      samples. Add an optional rescale step: compute `std(EpsCond)` and `std(cfg)`,
+      form `cfg_rescaled = cfg * (std_cond / std_cfg)`, then blend
+      `phi*cfg_rescaled + (1-phi)*cfg` with a `GuidanceRescale` (phi) parameter
+      (0 = current behaviour, exactly back-compatible). Expose as an overload /
+      extra arg on `ApplyCFG` so existing callers are unchanged. Unit-test the
+      phi=0 identity and that phi>0 reduces the output standard deviation toward the
+      conditional's; wire into examples/LatentTextToImage's CFG call as the
+      demonstration.
