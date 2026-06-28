@@ -1666,13 +1666,6 @@ rather than acted on.
       Tackle it with the chunked-forward family below (intra-chunk dense GEMM +
       inter-chunk running state), then add a causal parity test alongside.
 
-- [ ] OpenCL forward offload for the gate projections of `TNNetLSTMCell` /
-      `TNNetGRUCell`. Each cell's per-step work is dominated by dense
-      input-projection + recurrent-projection matmuls (4 gates for LSTM, 3 for
-      GRU) — exactly the `FDotCL` GEMM shape that `TNNetFullConnect` /
-      `TNNetScaledDotProductAttention` already offload. Offload the projections
-      behind an `FShouldOpenCL` gate (the elementwise gate nonlinearities and
-      the cell-state recurrence stay on CPU), with an exact-vs-CPU parity test.
 - [ ] AVX-vectorize the remaining trig/inverse-hyperbolic activation FORWARD
       loops left scalar: `TNNetSin` / `TNNetCos` / `TNNetArcSinh`.
       `TNNetSinhAct` is now DONE — `sinh(x) = (exp(x) - exp(-x))/2` reduces to two
@@ -1907,18 +1900,9 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
 
 ## Vision / generative & accelerator batch 2026-06-27b
 
-(All verified absent in source before listing. `BuildRAFTFromSafeTensors` and an
-NF4 dequant path do not exist (only int8 + MXFP4-dequant do).)
+(Verified absent in source before listing. An NF4 dequant path did not exist
+then — only int8 + MXFP4-dequant did.)
 
-- [ ] RAFT optical-flow importer `BuildRAFTFromSafeTensors[Ex]`
-      (`princeton-vl/raft`-style checkpoints; model the small + large feature/
-      context encoders, the all-pairs correlation, and the convGRU update block).
-      The signature primitives ALREADY EXIST as layers — `TNNetCorrelationVolume`,
-      `TNNetCorrelationLookup`, and the convGRU hidden-state update — so this is a
-      weight-loading + graph-wiring job, not new math. Adds a real trained flow
-      model to the existing video stack (FlowWarp / VideoFrameInterpolation /
-      TextToVideo). Use the pico-fixture parity pattern (slice a tiny real
-      checkpoint into a committed fixture + a `<1e-4` logit/flow parity test).
 - [ ] NF4 (bitsandbytes 4-bit) dequantizing import path. PARTIALLY LANDED
       (commit 90b6c931): the `neural/neuralnf4.pas` dequant unit ships — the exact
       16-level NF4 codebook (`NF4Code`) + `DequantizeNF4(Codes, Absmax, N, Dest,
@@ -1984,22 +1968,6 @@ remainder tail has NO internal clamp so extreme inputs must be pre-clamped to
 
 (Vision/generative, OpenCL, AVX and dedup ideas verified against the source as
 NOT already implemented. Each reuses landed infrastructure where possible.)
-
-- [ ] ConvNeXt / ConvNeXt-V2 image-classification importer
-      (`BuildConvNextFromSafeTensors[Ex]`, model_type `convnext` / `convnextv2`,
-      e.g. `facebook/convnext-tiny-224`, `facebook/convnextv2-tiny-22k-224`). All
-      the building blocks already exist as reusable layers — depthwise 7x7 conv,
-      `TNNetLayerNorm` (channels-last per-token), the inverted 4x pointwise MLP,
-      `TNNetChannelMul` LayerScale (gamma), `TNNetStochasticDepth`, and for V2 the
-      `TNNetGRN` Global Response Normalization — so this is a reuse-only wiring +
-      tensor-name mapping job, no new layer. Stem = patchify conv4/stride4 +
-      LayerNorm; 4 stages with `[3,3,9,3]`-style block counts and downsample
-      (LayerNorm + conv2/stride2) between stages; head = global avg pool ->
-      LayerNorm -> Linear. Reuse the `make_pico_*_fixture.py` slicer for a tiny
-      committed parity fixture (HF std-0.02 init is vacuous — re-randomize to
-      O(1) scale like the ModernBERT fixtures). Closes the last mainstream
-      modern-CNN backbone gap (ViT / Swin / SwinV2 / MobileNetV3 / RegNet / ResNet
-      / EfficientNet are all already imported).
 
 - [ ] OpenCL forward offload for `TNNetPixelShuffle` and `TNNetBicubicUpsample`
       — the sibling `TNNetBilinearUpsample` already offloads via `ComputeOpenCL`
