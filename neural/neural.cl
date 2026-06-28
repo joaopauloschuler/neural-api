@@ -961,6 +961,41 @@ __kernel void cai_rope
   FY[base + 1] = FOutScale * (s * x0 + c * x1);
 }
 
+// Multimodal rotary forward (M-RoPE, TNNetMRotaryEmbedding). Same interleaved
+// (2k, 2k+1) pair rotation as cai_rope, but the per-(token, pair) ANGLE is
+// resolved on the HOST (which 3-D section position each pair uses, plus the
+// FTheta frequency and any RoPE scaling) and uploaded verbatim as the
+// FAngle[token*FHalfDepth + k] table. The device only applies the pure
+// rotation; FOutScale is the YaRN/LongRoPE output multiplier (1.0 default).
+// One work-item per (token, channel-pair). Bit-faithful to the scalar
+// TNNetMRotaryEmbedding.Compute() so parity is < 1e-4.
+// Coded by Claude (AI).
+__kernel void cai_mrope
+(
+  const int FSeqLen,
+  const int FDepth,
+  const int FHalfDepth,
+  const float FOutScale,
+  __global const float* FAngle,
+  __global const float* FX,
+  __global float* FY
+)
+{
+  const int gid = get_global_id(0);
+  const int total = FSeqLen * FHalfDepth;
+  if (gid >= total) return;
+  const int k = gid % FHalfDepth;
+  const int pos = gid / FHalfDepth;
+  const float angle = FAngle[gid];
+  const float s = sin(angle);
+  const float c = cos(angle);
+  const int base = pos * FDepth + 2 * k;
+  const float x0 = FX[base];
+  const float x1 = FX[base + 1];
+  FY[base]     = FOutScale * (c * x0 - s * x1);
+  FY[base + 1] = FOutScale * (s * x0 + c * x1);
+}
+
 // Numerically-stable softmax forward for the softmax head layers
 // (TNNetPointwiseSoftMax, TNNetSoftMax). The volume is tiled into contiguous
 // normalization groups of FGroupLen elements; group g owns FX[g*FGroupLen ..

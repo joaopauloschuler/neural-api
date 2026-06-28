@@ -1934,7 +1934,7 @@ kernel, and the rest are already wired in their dedicated layer `Compute` method
 OpenCL `TNNetGroupNorm`/`TNNetInstanceNorm` offload AUDIT (BOTH already offload via
 `TNNetGroupNormCL`+`cai_group_norm`, parity tests already published). Remaining open:)
 
-- [ ] OpenCL offload for `TNNetMRotaryEmbedding` (M-RoPE) — the base
+- [X] OpenCL offload for `TNNetMRotaryEmbedding` (M-RoPE) — the base
       `TNNetRotaryEmbedding` now offloads via `cai_rope`, but M-RoPE keeps its own
       3-D section-position `Compute` on the host. Either generalize `cai_rope` to
       take a per-token position triple or add a `cai_mrope` kernel; keep the
@@ -1956,7 +1956,7 @@ remainder tail has NO internal clamp so extreme inputs must be pre-clamped to
       Tie into the existing "keep activations resident across consecutive offloaded
       layers" follow-up in the vision/generative section so attention blocks chain
       device-side. Forward-only, parity-tested, skip-clean when no device.
-- [ ] AVX-vectorize the softmax-head HOST fallback to match the new device path.
+- [X] AVX-vectorize the softmax-head HOST fallback to match the new device path.
       `TVolume.PointwiseSoftMax` / whole-volume `TVolume.SoftMax` still do scalar
       max -> `pcr_expf` per element -> sum -> divide; the `cai_softmax` kernel now
       does the stable two-pass form on device, but the CPU fallback (no GPU here)
@@ -1969,7 +1969,7 @@ remainder tail has NO internal clamp so extreme inputs must be pre-clamped to
 (Vision/generative, OpenCL, AVX and dedup ideas verified against the source as
 NOT already implemented. Each reuses landed infrastructure where possible.)
 
-- [ ] OpenCL forward offload for `TNNetPixelShuffle` and `TNNetBicubicUpsample`
+- [X] OpenCL forward offload for `TNNetPixelShuffle` and `TNNetBicubicUpsample`
       — the sibling `TNNetBilinearUpsample` already offloads via `ComputeOpenCL`
       (commit path at `TNNetBilinearUpsample.ComputeOpenCL`/`EnableOpenCL`), but
       these two stay on the host. Both are hot in super-resolution and generative
@@ -1980,7 +1980,7 @@ NOT already implemented. Each reuses landed infrastructure where possible.)
       gather analogous to `cai_bilinear_gather`. Forward-only, parity-tested
       (`<1e-4` vs host), skip-clean when no device.
 
-- [ ] AVX-vectorize `TNNetAvgPool` backward spatial accumulation. The forward is
+- [X] AVX-vectorize `TNNetAvgPool` backward spatial accumulation. The forward is
       fine, but `TNNetAvgPool.Backpropagate` distributes the upstream gradient with
       two scalar nested `for CntX/CntY` loops around a per-cell `TNNetVolume.Add`
       (the `Add` itself is AVX, but the outer scatter is scalar and re-dispatches
@@ -1990,7 +1990,7 @@ NOT already implemented. Each reuses landed infrastructure where possible.)
       AVX pass. Pin `<1e-6` parity with the existing pooling numerical-gradient
       tests; keep the general overlapped-window path as the scalar fallback.
 
-- [ ] Replace the hand-coded reservoir loop in `examples/EchoStateNetwork` with a
+- [X] Replace the hand-coded reservoir loop in `examples/EchoStateNetwork` with a
       reusable `TNNetEchoStateReservoir` layer (leaky-integrator Echo State Network
       / Reservoir Computing core, Jaeger 2001). The example currently hand-rolls
       `h_t = (1-a)*h_{t-1} + a*tanh(W_in*x_t + W*h_{t-1})` with nested loops over a

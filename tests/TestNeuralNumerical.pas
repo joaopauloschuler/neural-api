@@ -336,6 +336,8 @@ type
     procedure LayerNormOpenCLParity;
     // OpenCL interleaved-pair rotary (RoPE) forward offload parity (vs CPU).
     procedure RoPEOpenCLParity;
+    // OpenCL multimodal rotary (M-RoPE) forward offload parity (vs CPU).
+    procedure MRoPEOpenCLParity;
     // OpenCL whole-volume mean/variance (LayerNorm) and mean-square (RMSNorm)
     // forward offload parity (vs CPU) for TNNetLayerNorm / TNNetRMSNorm, which
     // collapse the whole SizeX*SizeY*Depth sample into one cai_token_norm token.
@@ -60749,6 +60751,80 @@ begin
     end;
     WriteLn('  RoPE OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('RoPE OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Multimodal rotary (M-RoPE) device-forward parity: the cai_mrope kernel rotates
+// each (2k, 2k+1) channel-pair by the host-resolved per-(token,pair) angle (each
+// pair picks its 3-D section position via SectionOfPair), vs the scalar
+// Compute(). Distinct temporal/height/width positions per token plus a non-zero
+// PositionOffset exercise the section selection and the angle-table indexing.
+// Coded by Claude (AI).
+procedure TTestNeuralNumerical.MRoPEOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Rope: TNNetMRotaryEmbedding;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, t: integer;
+  PosT, PosH, PosW: array of integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(7, 1, 32); // 7 tokens, head_dim = 32 -> HalfD = 16
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(7, 1, 32, 1));
+    // mrope_section (6,5,5) sums to HalfD = 16; mixes all three sections.
+    Rope := TNNetMRotaryEmbedding.Create(10000.0, 6, 5, 5);
+    NN.AddLayer(Rope);
+    Rope.PositionOffset := 3; // exercise the angle-table offset
+    // Distinct per-token T/H/W positions so each section rotates differently.
+    SetLength(PosT, 7); SetLength(PosH, 7); SetLength(PosW, 7);
+    for t := 0 to 6 do
+    begin
+      PosT[t] := t;
+      PosH[t] := (t * 2) mod 5;
+      PosW[t] := (t * 3 + 1) mod 6;
+    end;
+    Rope.SetPositions(PosT, PosH, PosW);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.5 * Sin(i * 0.37) - 0.2;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      MaxDiff := 0;
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    WriteLn('  M-RoPE OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('M-RoPE OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
