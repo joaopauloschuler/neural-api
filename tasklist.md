@@ -1969,7 +1969,7 @@ with incompatible signatures.)
       unpool forward offload — its scatter/replicate semantics differ from the
       windowed reduction and were left out of scope here.
 
-- [ ] OpenCL forward offload for `TNNetEmbedding` token-gather. The embedding
+- [X] OpenCL forward offload for `TNNetEmbedding` token-gather. The embedding
       lookup is the FIRST layer of every imported-LLM / ChatTerminal forward pass;
       its output feeds the (already device-resident) transformer stack, so doing
       the gather on the host re-uploads the activation every step. Add a simple

@@ -344,6 +344,8 @@ type
     // layers TNNetMaxPool / TNNetAvgPool.
     procedure MaxPoolOpenCLParity;
     procedure AvgPoolOpenCLParity;
+    // OpenCL token-gather forward offload parity (vs CPU) for TNNetEmbedding.
+    procedure EmbeddingOpenCLParity;
     procedure TestRoIAlignForward;
     procedure TestRoIAlignInputGradientCheck;
     procedure TestRoIAlignShapeInference;
@@ -60783,6 +60785,71 @@ begin
     end;
     WriteLn('  AvgPool OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('AvgPool OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Device forward parity (vs CPU) for TNNetEmbedding token-gather. Uses a small
+// vocab/embedding with a sequence that includes token 0 (EncodeZero=0, so its
+// output row must stay zero -- the kernel's row=-1 padding case) alongside
+// non-zero tokens, verifying the gathered rows match the scalar MulAdd copy.
+// Skips cleanly when no OpenCL device is present.
+// Coded by Claude (AI).
+procedure TTestNeuralNumerical.EmbeddingOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 6;
+  VocabSize = 11;
+  EmbSize = 16;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Tokens: array[0..SeqLen-1] of integer = (3, 0, 7, 1, 0, 10);
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 1, 1));
+    NN.AddLayer(TNNetEmbedding.Create(VocabSize, EmbSize, {EncodeZero=}0, 0.5));
+    for i := 0 to SeqLen - 1 do Input.FData[i] := Tokens[i];
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      MaxDiff := 0;
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    WriteLn('  Embedding OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('Embedding OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;

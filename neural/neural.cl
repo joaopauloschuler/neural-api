@@ -831,3 +831,33 @@ __kernel void cai_pool2d
     FY[gid] = s / FDivisor;
   }
 }
+
+// Token-gather embedding forward (TNNetEmbedding). The weight table FW is laid out
+// row-per-token, depth-contiguous (row t, embedding index e at FW[t*FEmbeddingSize + e]),
+// exactly FNeurons[0].Weights in the TVolume convention. FTokenRows holds one resolved
+// source row per output token: FTokenRows[c] = the vocab row to copy into output token c,
+// or -1 to leave that output token zero (the scalar path's zero-padding case -- token 0
+// when EncodeZero is false). One work-item per (output token, depth) pair copies a single
+// scalar:
+//   FY[c*FEmbeddingSize + e] = (FTokenRows[c] < 0) ? 0 : FW[FTokenRows[c]*FEmbeddingSize + e]
+// Global size = FNumTokens * FEmbeddingSize (dim 0). Forward-only; training stays on CPU.
+__kernel void cai_embedding_gather
+(
+  const int FNumTokens,
+  const int FEmbeddingSize,
+  __global const int* FTokenRows,
+  __global const float* FW,
+  __global float* FY
+)
+{
+  const int gid = get_global_id(0);
+  const int total = FNumTokens * FEmbeddingSize;
+  if (gid >= total) return;
+  const int e = gid % FEmbeddingSize;
+  const int c = gid / FEmbeddingSize;
+  const int row = FTokenRows[c];
+  if (row < 0)
+    FY[gid] = 0.0f;
+  else
+    FY[gid] = FW[row * FEmbeddingSize + e];
+}
