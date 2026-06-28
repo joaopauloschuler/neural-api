@@ -2078,3 +2078,45 @@ state confirmed via the layer `Compute`/`ComputeOpenCL` methods on 2026-06-28.)
         Add an OpenCL forward (reuse `TNNetBilinearGatherCL`/`TNNetBicubicGatherCL`
         exactly as `TNNetBilinearResize`/`TNNetBicubicUpsample` do) if profiling
         shows it on a hot path.
+
+## Lucky-day batch 2026-06-28k (verified-novel AVX / dedup / OpenCL — generative vision)
+
+(Checked against `neural/*.pas` before listing on 2026-06-28. `TNNetAdaIN`
+exists with a full CPU `Compute`/`Backpropagate` but has NO `ComputeOpenCL`/
+`EnableOpenCL` — `grep -c 'TNNetAdaIN.ComputeOpenCL' neuralnetwork.pas` = 0 — and
+its forward uses strided per-channel scalar access, unlike the AVX'd GroupNorm/
+L2Normalize/PixelNorm reductions that already landed.)
+
+- [ ] AVX + dedup the `TNNetAdaIN.Compute` per-channel spatial statistics, and
+      add a forward-only OpenCL offload. AdaIN (Adaptive Instance Normalization,
+      Huang & Belongie 2017) is the core layer of `examples/AdaINStyleTransfer`
+      and the StyleGAN-style generators. Today its forward computes the content
+      mean/variance and the style mean/variance with FOUR nested
+      `for CntX/CntY` loops that index `ContentOut[CntX, CntY, C]` /
+      `StyleOut[CntX, CntY, C]` ONE element at a time — the stride-`Depth`
+      column-gather pattern the depth-axis-contiguous rule warns against
+      (`neuralnetwork.pas` ~line 44034). Every other per-channel/per-position
+      reduction in the library was already converted to a depth-contiguous AVX
+      accumulation: GroupNorm reduces each `(x,y)` column with `DotProduct`
+      against a ones vector (~line 64560), and the per-CHANNEL L2Normalize path
+      accumulates `ss[d] += x[d]*x[d]` over whole depth columns via the 3-pointer
+      `TVolume.MulAdd` form (commit b01eab21). Do the same here: walk the spatial
+      positions ONCE, accumulating per-channel `sum[d] += col[d]` (via `Add`) and
+      `sumsq[d] += col[d]*col[d]` (via `MulAdd`) into two `Depth`-length scratch
+      vectors, then finish mean/inv-std element-wise — no transpose, no
+      stride-`Depth` scalar gather. The content half of this is exactly the
+      InstanceNorm reduction (`TNNetInstanceNorm` = `TNNetGroupNorm` with
+      `Groups=Depth`, where GroupNorm's column `DotProduct` degenerates to a
+      single-element call per `(x,y)`), so factor the per-channel mean/inv-std
+      accumulation into a shared `NeuralPerChannelMeanInvStd` helper that AdaIN
+      and InstanceNorm both call (dedup, not a fork). Then add
+      `TNNetAdaIN.EnableOpenCL`/`ComputeOpenCL`: the content instance-normalize
+      reuses the existing per-position reduction kernel family (`cai_group_norm`
+      with `Groups=Depth`, or the `cai_l2norm_perdepth` mean/rsqrt shape) and the
+      `style_std*(x-mean)*inv_std + style_mean` affine is a per-channel
+      scale+shift on the device — keeping a device-resident generator stack from
+      bouncing the activation to the host between convs. Forward-only (backward,
+      and the `FNormContent`/`FContentMean`/`FContentInvStd` caches it needs, stay
+      on CPU); parity-test scalar-vs-AVX (wide `Depth`, `SizeX<>SizeY`) and
+      device-vs-CPU, skip-clean when no device. Hot path of `AdaINStyleTransfer`
+      and `StyleGAN2Generate`.
