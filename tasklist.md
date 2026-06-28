@@ -1666,11 +1666,6 @@ rather than acted on.
       Tackle it with the chunked-forward family below (intra-chunk dense GEMM +
       inter-chunk running state), then add a causal parity test alongside.
 
-- [X] OpenCL forward offload for `TNNetCrossAttention` — DONE (already landed):
-      `TNNetCrossAttention.ComputeOpenCL` exists (the same rectangular two-GEMM
-      offload on `FDotCL`, behind `FShouldOpenCL`) and is covered by the passing
-      `CrossAttentionOpenCLParity` test (PoCL-verified max|diff| ~2.2e-8). This
-      entry was stale.
 - [ ] OpenCL forward offload for the gate projections of `TNNetLSTMCell` /
       `TNNetGRUCell`. Each cell's per-step work is dominated by dense
       input-projection + recurrent-projection matmuls (4 gates for LSTM, 3 for
@@ -1909,67 +1904,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       with loss-difference direction >90% of the time across a small grid.
 - [ ] Coverage matrix at the top of TestNeuralNumerical.pas: per-class
       `[grad] [serialize]` block, written by a small script.
-
-## Vision / generative & accelerator batch 2026-06-27
-
-(All four verified absent in source before listing: the OpenCL targets carry
-no `FShouldOpenCL` path in their `Compute`, and the loss heads exist only as
-eval-time metric helpers, not as trainable `TNNet*Loss` layers.)
-
-- [X] OpenCL forward offload for `TNNetTokenRMSNorm` and `TNNetTokenLayerNorm`
-      DONE (commit 1c30c9fd): the per-token transformer norms (the depth-axis,
-      gain+bias variants used in LLM runs — NOT the legacy whole-volume
-      `TNNetLayerNorm`) now have a `ComputeOpenCL()` so activations stay
-      device-resident between attention/FFN blocks. New minimal reduction kernel
-      `cai_token_norm` in `neural/neural.cl` (one work-item per token, `FUseMean`
-      flag selects RMS sum-of-squares vs LayerNorm mean+variance, applies
-      per-channel gain + LayerNorm bias, same epsilon as the scalar path), bound
-      by helper `TNNetTokenNormCL` on the shared dot-product program's device.
-      `EnableOpenCL` arms `FShouldOpenCL`; dispatch gated on
-      `FOutput.Size >= NeuralConvOpenCLMinWork`; forward-only (training stays on
-      CPU). Parity tests `TokenRMSNormOpenCLParity` (4.77e-7) /
-      `LayerNormOpenCLParity` (3.58e-7) < 1e-4 vs CPU on the PoCL device.
-- [X] OpenCL forward offload for `TNNetBilinearResize` DONE (commit 69d9f9a1):
-      mirrors `TNNetBilinearUpsample` — `ComputeOpenCL()` REUSES the existing
-      `TNNetBilinearGatherCL` gather kernel as-is (no new `.cl` kernel), with the
-      per-output-pixel four taps + bilinear weights precomputed on the CPU via
-      the existing `BilinearResizeMap` so the align-corners/clamping math is
-      bit-identical to the scalar path. `EnableOpenCL` arms `FShouldOpenCL`,
-      dispatch gated on `OutX*OutY*D >= NeuralConvOpenCLMinWork`. Parity test
-      `TestBilinearResizeOpenCLParity` (non-integer 8×8→11×7 ratio) max|diff|
-      1.19e-7 < 1e-4 on the PoCL device.
-- [X] Differentiable SSIM loss head `TNNetSSIMLoss` DONE (commit 3db2f82f):
-      `TNNetIdentity`-descendant loss head whose `Backpropagate` recovers the
-      target from the seeded `(output-target)` residual, calls the existing
-      `ComputeSSIMLossAndGradient` (NO duplicated SSIM math) and writes the
-      `d(1-SSIM)/d(output)` gradient into `FOutputError`. DataRange in
-      `FFloatSt[0]`. Circular dependency (`neuralimagemetrics` already
-      `uses neuralnetwork`) broken via dependency inversion: a
-      `NeuralSSIMLossGradientHook` function pointer in neuralnetwork.pas is
-      assigned from neuralimagemetrics.pas's `initialization` — so the layer
-      lives in neuralnetwork.pas WITH full CreateLayer/LoadFromString dispatch
-      registration (round-trips), raising a clear "uses neuralimagemetrics"
-      error if the hook is unset. Tests: forward passthrough, numerical-gradient
-      (11×11×3, FD < 1e-3), LoadFromString round-trip; README loss-head row.
-      Follow-up: MS-SSIM variant + wiring into an SR training example.
-- [X] Perceptual / deep-feature-matching loss for image generation DONE
-      (commit 406f77a0): shipped as the HELPER `ComputePerceptualLossAndGradient`
-      in neuralpretrained.pas (paralleling the existing `ComputeLPIPSDistance` /
-      `ComputeSSIMLossAndGradient` helpers — NOT a TNNet layer, since these
-      perceptual metrics are caller-driven helpers and the loss needs to run a
-      whole frozen sub-net). Reuses the frozen `BuildVGG` feature extractor (NO
-      duplicated feature math): loss = sum over the set relu stages of the
-      per-stage feature L2 (Johnson et al. 2016; plain — calibrated LPIPS
-      unit-normalize is a noted follow-up), and `GradImage` = d(Loss)/d(pixels)
-      obtained by seeding each tap's feature-diff gradient and driving a
-      multi-tap backward through the frozen VGG to the input layer (one backward
-      per stage, accumulated). Added public `TNNetLayer.GetDepartingBranchesCnt`
-      so the out-of-unit helper can guard the idempotent intermediate-tap
-      `IncDepartingBranchesCnt`. Tests `TestPerceptualLossGradientCheck`
-      (FD max rel err 7.1e-3) + `TestPerceptualLossSelfZero` (loss/grad ≈ 0 for
-      identical inputs). OPEN follow-ups: the optional learned 1x1 lin-head LPIPS
-      variant, and wiring it into an SR/GAN/diffusion training example as an
-      opt-in perceptual objective.
 
 ## Vision / generative & accelerator batch 2026-06-27b
 
