@@ -63,6 +63,13 @@ type
     procedure TestPSNRIdenticalIsInf;
     // 1-SSIM loss gradient matches a central difference.
     procedure TestSSIMLossGradient;
+    // TNNetSSIMLoss head: forward is an identity passthrough.
+    procedure TestSSIMLossLayerForwardPassthrough;
+    // TNNetSSIMLoss head: the +gradient it writes to FOutputError matches a
+    // central difference of the 1-SSIM loss.
+    procedure TestSSIMLossLayerGradient;
+    // TNNetSSIMLoss head: SaveToString / LoadFromString round-trips DataRange.
+    procedure TestSSIMLossLayerRoundTrip;
     // KID unbiased MMD^2 vs the numpy float64 oracle on Gaussian sets.
     procedure TestKIDMMD2vsOracle;
     // KID ordering: self ~ small < same-distribution < shifted-distribution.
@@ -476,6 +483,128 @@ begin
   end;
   AssertTrue('SSIM loss grad vs central diff (maxErr=' +
     FloatToStr(maxErr) + ')', maxErr < 1e-4);
+end;
+
+procedure TTestNeuralImageMetrics.TestSSIMLossLayerForwardPassthrough;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetSSIMLoss forward must be an identity passthrough (W=11, H=11, C=1).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(11, 11, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(11, 11, 1, 1));
+    NN.AddLayer(TNNetSSIMLoss.Create(1.0));
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Abs(Sin(i * 0.31)) * 0.9 + 0.05;  // in (0,1)
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('SSIMLoss forward is passthrough at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.00001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralImageMetrics.TestSSIMLossLayerGradient;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  ia, ib, ia2, grad, dummy: TIMDoubleArray;
+  H, W, C, n, i, p: integer;
+  eps, lp, lm, numg, maxErr: Double;
+begin
+  // 11x11x3 image (both sides >= the 11x11 SSIM window). The head must write
+  // +d(1-SSIM)/dprediction into FOutputError (which an upstream Identity layer
+  // receives); check it against a central difference of the same 1-SSIM loss
+  // the helper computes.
+  W := 11; H := 11; C := 3;
+  n := H * W * C;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(W, H, C);
+  Target := TNNetVolume.Create(W, H, C);
+  SetLength(ia, n); SetLength(ib, n);
+  try
+    NN.AddLayer(TNNetInput.Create(W, H, C, 1));
+    LMid := TNNetIdentity.Create();
+    NN.AddLayer(LMid);
+    NN.AddLayer(TNNetSSIMLoss.Create(1.0));
+
+    RandSeed := 991133; Random;  // defensive reseed (FPC mtwist), see memory note
+    RandSeed := 424242;
+    for i := 0 to n - 1 do
+    begin
+      ia[i] := Random * 0.8 + 0.1;   // prediction
+      ib[i] := Random * 0.8 + 0.1;   // target
+    end;
+    // The volume raw layout is bit-identical to the helper's channel-last
+    // layout, so a straight copy is correct.
+    for i := 0 to n - 1 do
+    begin
+      Input.Raw[i]  := ia[i];
+      Target.Raw[i] := ib[i];
+    end;
+
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    eps := 1e-6;
+    maxErr := 0;
+    // probe a deterministic spread of pixels across all channels
+    for i := 0 to 11 do
+    begin
+      p := (i * 19 + 5) mod n;
+      SetLength(ia2, n);
+      Move(ia[0], ia2[0], n * SizeOf(Double));
+      ia2[p] := ia2[p] + eps;
+      lp := ComputeSSIMLossAndGradient(ia2, ib, H, W, C, dummy, 1.0);
+      ia2[p] := ia2[p] - 2 * eps;
+      lm := ComputeSSIMLossAndGradient(ia2, ib, H, W, C, dummy, 1.0);
+      numg := (lp - lm) / (2 * eps);
+      if Abs(numg - LMid.OutputError.Raw[p]) > maxErr then
+        maxErr := Abs(numg - LMid.OutputError.Raw[p]);
+    end;
+    // float32 OutputError vs float64 central diff: ~1e-3 tolerance.
+    AssertTrue('SSIMLoss layer grad vs central diff (maxErr=' +
+      FloatToStr(maxErr) + ')', maxErr < 1e-3);
+    // sanity: analytic helper grad agrees too
+    ComputeSSIMLossAndGradient(ia, ib, H, W, C, grad, 1.0);
+    AssertTrue('helper grad finite', not IsNan(grad[0]));
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralImageMetrics.TestSSIMLossLayerRoundTrip;
+var
+  NN, NN2: TNNet;
+  Saved: string;
+begin
+  // SaveToString / LoadFromString must round-trip the layer type and DataRange.
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(11, 11, 1, 1));
+    NN.AddLayer(TNNetSSIMLoss.Create(255.0));
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+    AssertTrue('Loaded last layer is TNNetSSIMLoss',
+      NN2.GetLastLayer is TNNetSSIMLoss);
+    // The structure string encodes the FFloatSt params, so matching strings
+    // proves DataRange (255.0) survived the round-trip.
+    AssertEquals('SSIMLoss structure round-trip',
+      NN.GetLastLayer.SaveStructureToString(),
+      NN2.GetLastLayer.SaveStructureToString());
+  finally
+    NN.Free;
+    NN2.Free;
+  end;
 end;
 
 procedure TTestNeuralImageMetrics.TestKIDMMD2vsOracle;

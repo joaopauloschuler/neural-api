@@ -1506,4 +1506,34 @@ begin
   end;
 end;
 
+// Adapter wiring ComputeSSIMLossAndGradient (which takes TIMDoubleArray) into
+// the open-array NeuralSSIMLossGradientHook that neuralnetwork.TNNetSSIMLoss
+// calls. The open-array params are copied into local TIMDoubleArray buffers and
+// the computed gradient copied back out. Assigned at unit init below so any
+// program that 'uses neuralimagemetrics' enables the SSIM loss head.
+// Coded by Claude (AI).
+function SSIMLossGradientHookAdapter(const ImgA, ImgB: array of Double;
+  H, W, Channels: integer; out GradA: array of Double; DataRange: Double): Double;
+var
+  A, B, G: TIMDoubleArray;
+  i, n, nM1: integer;
+begin
+  n := Length(ImgA);
+  SetLength(A, n);
+  SetLength(B, n);
+  nM1 := n - 1;
+  for i := 0 to nM1 do
+  begin
+    A[i] := ImgA[i];
+    B[i] := ImgB[i];
+  end;
+  Result := ComputeSSIMLossAndGradient(A, B, H, W, Channels, G, DataRange);
+  nM1 := Length(G) - 1;
+  for i := 0 to nM1 do
+    GradA[i] := G[i];
+end;
+
+initialization
+  NeuralSSIMLossGradientHook := @SSIMLossGradientHookAdapter;
+
 end.
