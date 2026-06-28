@@ -1959,10 +1959,22 @@ exposed. All verified absent in source before listing.)
       existing `Vector*` kernels (Exp/Sigmoid/Tanh/Erf/Sinh) are all already wired in
       their dedicated layer `Compute` methods (GELU/SiLU/SoftPlus/Sinh/…), a separate
       code path. Nothing further to wire in this shared dispatch.
-- [ ] OpenCL forward offload for `TNNetGroupNorm`/`TNNetInstanceNorm` whole-sample
+- [X] OpenCL forward offload for `TNNetGroupNorm`/`TNNetInstanceNorm` whole-sample
       path is the obvious sibling of the just-landed whole-volume `TNNetLayerNorm`/
       `TNNetRMSNorm` offload — confirm which already offload and add the gap via the
       same `cai_token_norm`/`cai_group_norm` reuse + skip-clean parity test.
+      AUDIT FINDING (no code change needed): BOTH already offload. `TNNetGroupNorm.Compute`
+      arms `FHasOpenCL && FShouldOpenCL && Assigned(FGroupNormCL)` gated on
+      `FOutput.Size >= NeuralConvOpenCLMinWork` and dispatches `ComputeOpenCL` ->
+      `TNNetGroupNormCL.Normalize` (one work-item per group) on the `cai_group_norm`
+      kernel; the CPU/AVX path stays as fallback and still caches FNormalized/FInvStdDev
+      for backward. `TNNetInstanceNorm` is a subclass that only overrides SetPrevLayer
+      (Groups=Depth) and inherits Compute/EnableOpenCL/ComputeOpenCL verbatim, so it
+      offloads through the same path. Skip-clean `<1e-4` parity tests already exist and
+      are published: `TTestNeuralNumerical.GroupNormOpenCLParity` (4 groups, per-channel
+      affine) and `InstanceNormOpenCLParity` (Groups=Depth), both with the standard
+      `AcquireFirstOpenCLDevice` SKIP idiom and an `{$ELSE}` "OpenCL not compiled in:
+      SKIP" branch. Full suite green (2459 tests, 0 fail) with no device present.
 - [ ] OpenCL offload for `TNNetMRotaryEmbedding` (M-RoPE) — the base
       `TNNetRotaryEmbedding` now offloads via `cai_rope`, but M-RoPE keeps its own
       3-D section-position `Compute` on the host. Either generalize `cai_rope` to
