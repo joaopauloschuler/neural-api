@@ -9475,7 +9475,13 @@ end;
 
 procedure TTestNeuralNumerical.TestAvgPoolGradientCheck;
 begin
+  // Exact-multiple geometry (4x4, pool 2): exercises the AVX backward fast path
+  // with full pool rows.
   LayerInputGradientCheck(Self, TNNetAvgPool.Create(2), 'AvgPool', 4, 4, 2, 0.01);
+  // Non-multiple geometry (5x5, pool 2): exercises the edge-clamped partial
+  // window in the AVX backward fast path (last output row/col covers a single
+  // input row/col). Depth 3 keeps the contiguous span > 1 element.
+  LayerInputGradientCheck(Self, TNNetAvgPool.Create(2), 'AvgPoolEdge', 5, 5, 3, 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestUpsampleGradientCheck;
