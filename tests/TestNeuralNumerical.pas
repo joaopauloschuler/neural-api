@@ -302,6 +302,8 @@ type
     procedure TestBilinearUpsampleOpenCLParity;
     procedure TestPixelShuffleOpenCLParity;
     procedure TestBicubicUpsampleOpenCLParity;
+    procedure TestPixelShuffleBackwardOpenCLParity;
+    procedure TestBicubicUpsampleBackwardOpenCLParity;
     procedure TestBilinearResizeOpenCLParity;
     procedure TestDeconvolutionOpenCLParity;
     // OpenCL forward offload parity (vs CPU) for the depthwise convolutions.
@@ -59740,6 +59742,134 @@ begin
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestPixelShuffleBackwardOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, Desired, PrevErrCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  W, H, D, i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  W := 5; H := 4; D := 12; // r=2 -> 3 output channels, 10x8 grid
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(W, H, D);
+  Desired := TNNetVolume.Create();
+  PrevErrCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    NN.AddLayer(TNNetPixelShuffle.Create(2));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.27) * 0.9 - 0.05;
+
+    // CPU backward: gradient flows back to the PixelShuffle's PREV layer (the
+    // input layer), which holds it in Layers[0].OutputError.
+    NN.Compute(Input);
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.41) * 0.7;
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    PrevErrCPU.Copy(NN.Layers[0].OutputError);
+
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      MaxDiff := 0;
+      AssertEquals('prev-error size match', PrevErrCPU.Size, NN.Layers[0].OutputError.Size);
+      for i := 0 to PrevErrCPU.Size - 1 do
+      begin
+        Diff := Abs(PrevErrCPU.Raw[i] - NN.Layers[0].OutputError.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    AssertTrue('PixelShuffle backward OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-6', MaxDiff < 1e-6);
+  finally
+    PrevErrCPU.Free; Desired.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestBicubicUpsampleBackwardOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, Desired, PrevErrCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  W, H, D, i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  W := 7; H := 6; D := 5;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(W, H, D);
+  Desired := TNNetVolume.Create();
+  PrevErrCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    NN.AddLayer(TNNetBicubicUpsample.Create(3, 0)); // 3x -> 21x18 grid
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.39) * 0.85 - 0.1;
+
+    NN.Compute(Input);
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.23) * 0.6;
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    PrevErrCPU.Copy(NN.Layers[0].OutputError);
+
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      MaxDiff := 0;
+      AssertEquals('prev-error size match', PrevErrCPU.Size, NN.Layers[0].OutputError.Size);
+      for i := 0 to PrevErrCPU.Size - 1 do
+      begin
+        Diff := Abs(PrevErrCPU.Raw[i] - NN.Layers[0].OutputError.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    AssertTrue('BicubicUpsample backward OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-6', MaxDiff < 1e-6);
+  finally
+    PrevErrCPU.Free; Desired.Free; Input.Free; NN.Free;
   end;
 end;
 {$ELSE}

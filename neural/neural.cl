@@ -636,6 +636,77 @@ __kernel void cai_bicubic_gather
   FDst[g_id] = acc;
 }
 
+// CAI Pixel Shuffle Scatter (depth-to-space backward)
+// Coded by Claude (AI).
+// Device backward for TNNetPixelShuffle. The forward shuffle is a bijection
+// (a pure permutation: each output element copies exactly one source element),
+// so the backward gradient scatter is collision-free: every source element
+// receives exactly one output gradient. We REUSE the SAME index buffer the
+// forward built (output element -> source linear offset) and write in the OTHER
+// direction. One work-item per OUTPUT element, no atomics needed.
+//   FSrcIdx : source linear element offset per output element, [g_id] (same
+//             buffer as the forward cai_pixel_shuffle).
+//   FSrc    : output gradient, raw, [g_id].
+//   FDst    : scattered source gradient, raw (zero-init by the host; this
+//             permutation fully covers it with one write per element).
+// One work-item per OUTPUT element: global size = FNumOut (dim 0).
+__kernel void cai_pixel_shuffle_scatter
+(
+  const int FNumOut,
+  __global const float* FSrcIdx,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FNumOut) return;
+  FDst[(int)FSrcIdx[g_id]] = FSrc[g_id];
+}
+
+// CAI Bicubic Scatter (separable 4x4 weighted backward)
+// Coded by Claude (AI).
+// Device backward for TNNetBicubicUpsample, the transpose of cai_bicubic_gather.
+// The forward reads a 4x4 clamped source neighbourhood per output pixel; the
+// backward scatters each output pixel's gradient into those same 16 corners
+// with the same wy[r]*wx[c] weights. Because border clamping makes several
+// output pixels write the SAME source pixel, a naive per-output scatter would
+// race; to match the codebase's atomic-free gather style we instead run ONE
+// work-item per (SOURCE pixel, depth) and gather every output contribution that
+// lands on it from a CPU-built CSR contribution table (offsets + flat
+// (outpix,weight) entries, byte-identical weights to the scalar backward).
+//   FRowOff  : CSR row offsets per source pixel, [srcpix] and [srcpix+1],
+//              stored as float (exact). Length FNumSrc+1.
+//   FOutIdx  : flat output-pixel index per CSR entry, [entry] (stored float).
+//   FWeights : flat blend weight per CSR entry, [entry].
+//   FSrc     : output gradient, raw [outpix*FDepth + d].
+//   FDst     : scattered source gradient, raw [srcpix*FDepth + d].
+// One work-item per (srcpix, d): global size = FNumSrc * FDepth (dim 0).
+__kernel void cai_bicubic_scatter
+(
+  const int FNumSrc,
+  const int FDepth,
+  __global const float* FRowOff,
+  __global const float* FOutIdx,
+  __global const float* FWeights,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FNumSrc * FDepth) return;
+  const int srcpix = g_id / FDepth;
+  const int d      = g_id - srcpix * FDepth;
+  const int e0     = (int)FRowOff[srcpix];
+  const int e1     = (int)FRowOff[srcpix + 1];
+  float acc = 0.0f;
+  for (int e = e0; e < e1; e++)
+  {
+    const int outpix = (int)FOutIdx[e];
+    acc = mad(FWeights[e], FSrc[outpix * FDepth + d], acc);
+  }
+  FDst[g_id] = acc;
+}
+
 // CAI Per-Token Norm (RMSNorm / LayerNorm forward)
 // Coded by Claude (AI).
 // Device forward for the per-TOKEN depth-axis normalization layers
