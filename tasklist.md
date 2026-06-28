@@ -1989,7 +1989,7 @@ with incompatible signatures.)
       linear-DiT importer. Keep the scalar path as the `{$IFNDEF AVXANY}` fallback
       and pin parity with the existing numerical-gradient/forward tests.
 
-- [ ] AVX vectorization of the remaining transcendental activation forwards
+- [X] AVX vectorization of the remaining transcendental activation forwards
       (`TNNetTanhExp`, `TNNetPenalizedTanh`, `TNNetSoftPlusBeta`). Each is a pure
       depth-contiguous elementwise pass currently looping a scalar `pcr_expf` /
       `pcr_tanhf` / `pcr_log1pf` per element; they can reuse the same `AVXExp`
