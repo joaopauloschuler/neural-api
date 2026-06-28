@@ -2001,3 +2001,29 @@ NOT already implemented. Each reuses landed infrastructure where possible.)
       composable inside larger nets (only a trainable linear read-out downstream)
       and removes the per-example hand-math. Numerical-gradient test only needs the
       read-out path (reservoir weights are frozen).
+
+## Lucky-day batch 2026-06-28b (follow-ups surfaced by 28's accelerator landings)
+
+(All five 28 tasks LANDED: PixelShuffle/Bicubic OpenCL forward offload [556e9c9b],
+AvgPool-backward AVX scatter [32a2ebad], TNNetEchoStateReservoir layer + example
+rewrite [4fc761f1], whole-volume SoftMax AVX host fallback + AVXGetSum [d64994e4],
+cai_mrope M-RoPE OpenCL offload [b06c5d0d]. Open follow-ups:)
+
+- [ ] BACKWARD OpenCL offload for `TNNetPixelShuffle` / `TNNetBicubicUpsample` —
+      the 28 landing is FORWARD-only (backward stays on host). PixelShuffle backward
+      is the inverse space->depth scatter (reuse the same index buffer, gather the
+      other direction); Bicubic backward scatters each output gradient across its
+      4x4 corner weights (an atomic-add or transposed-gather kernel). Parity-test
+      `<1e-6` vs host backward; skip-clean when no device.
+- [ ] `TNNetMRotaryEmbedding.ComputeOpenCL` rebuilds the full per-(token,pair)
+      `FAngleTable` on the HOST every forward then uploads it. For incremental
+      decode (one new token per step) this re-uploads the whole table each call —
+      cache the table and only append/upload the new token's angle row, mirroring
+      the KV-cache incremental-decode path the base RoPE already supports
+      (PositionOffset). Forward-only, parity-tested.
+- [ ] AVX-vectorize the per-(x,y) outer loop of `TVolume.PointwiseSoftMax` — the
+      28 landing vectorized the inner depth-span exp+sum, but the outer scan over
+      spatial positions still re-dispatches `AVXExp`/`AVXGetSum` per (x,y). For the
+      common contiguous-depth case the whole volume could be processed with a single
+      two-pass sweep that resets the running max/sum at each depth boundary. Minor;
+      pin `<1e-4` with the existing softmax parity tests.
