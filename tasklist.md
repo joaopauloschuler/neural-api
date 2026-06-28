@@ -1964,54 +1964,21 @@ surfaced while landing them:)
       (trained) checkpoint so users know the quality trade-off. Pure host /
       analysis; no new layer.
 
-## Lucky-day batch 2026-06-28g (verified-novel AVX / OpenCL / image-tokenizer)
+## Lucky-day batch 2026-06-28g (follow-ups surfaced by 28g landings)
 
-(Each item below was grepped against neuralnetwork.pas + the full tasklist and
-confirmed ABSENT before listing. Categories follow the lucky-day priority list:
-OpenCL correctness/offload, AVX vectorization, and torch/diffusers CV ports.)
+(All five 28g items LANDED and removed: SDPA attention-variant OpenCL safety
+guard for all four variants + correct ALiBi device offload [9957892f]; AVX
+`TNNetSoftPool` [6e373ae4]; AVX `TNNetCumSum` depth-axis [ff593de0];
+`TNNetFiniteScalarQuant`/FSQ [dfaa9c41]; `TNNetLookupFreeQuant`/LFQ [8cfaea3b].
+Open follow-up surfaced while landing them:)
 
-- [X] OpenCL correctness + offload for the SDPA attention VARIANTS — Part 1
-      (safety guard) LANDED for all four variants: `EnableOpenCL` now arms
-      `FShouldOpenCL` only for the exact base `TNNetScaledDotProductAttention`
-      class, so `TNNetCosineSimilarityAttention` / `TNNetDisentangledAttention` /
-      `TNNetConformerRelPosAttention` / `TNNetALiBiAttention` fall back to their
-      correct CPU `Compute()` instead of the base wrong-score device path. Part 2
-      (correct offload) LANDED for `TNNetALiBiAttention` (`ComputeOpenCL` reuses
-      the two base device matmuls + injects the `Slope*(j-i)` bias in the CPU
-      mask/softmax gap; dispatches on prefill SeqLen >= 32, decode width-1 stays
-      CPU). New `ALiBiAttentionOpenCLParity` test, PoCL max|diff| 3.0e-8, skip-clean
-      with no device. Commit 9957892f.
-  - [ ] FOLLOW-UP: correct device offload for the remaining three variants
-        (cosine-sim Q/K row renorm before the score matmul; disentangled
-        content/position relative-bias; conformer relative-position bias added to
-        logits). These currently fall back to their correct CPU `Compute()` — a
-        PERFORMANCE follow-up, not a correctness gap. Same recipe as ALiBi.
-- [X] AVX-vectorize `TNNetSoftPool.Compute` — LANDED (commit 6e373ae4). Forward
-      passes 2/3 and BOTH backward exp passes batch the per-window
-      `exp(beta*x - winMax)` 8-wide via `AVXExp` over the contiguous depth axis,
-      arg pre-clamped to [-88,88]; scalar triple-nested loops kept as the
-      `{$ELSE}` fallback. `TestSoftPoolReferenceParity` + existing numerical-grad
-      checks green on scalar and -dAVX2.
-- [X] AVX-vectorize `TNNetCumSum` (depth axis) — LANDED (commit ff593de0).
-      caDepth forward/backward use vectorized column `Move` + BW=64 block-prefix
-      with a vectorized whole-block carry broadcast-add and contiguous-span `Add`;
-      X/Y axes unchanged (scalar). Honest assessment: constant-factor win
-      (sequential critical path Depth -> Depth/64), not asymptotic — prefix-sum is
-      inherently sequential. Bit-identical scalar-vs-AVX; new parity + large-depth
-      numerical-grad tests.
-- [X] `TNNetFiniteScalarQuant` (FSQ) — LANDED (commit dfaa9c41). Codebook-free
-      per-channel `tanh`-bounded round quantizer with STE backward, mixed-radix
-      `CodeIndex`, `CodebookSize`; registered in both CreateLayer tables, FStruct
-      serialization round-trips the variable-length Levels. STE-gradient +
-      round-trip tests; `examples/FSQVAE` MNIST reaches 100% per-channel level
-      utilization. Layer row in README.md, example in examples/README.md.
-- [X] `TNNetLookupFreeQuant` (LFQ) — LANDED (commit 8cfaea3b). Binary sign
-      quantizer, bit-packed `CodeIndex`, STE backward clipped to |z|<=1; entropy
-      aux loss exposed as public `PerSampleEntropy`/`CodebookEntropy`/
-      `EntropyAuxLoss` (factorized binary form, layer injects no entropy gradient
-      — read & add like `TNNetLoadBalanceLoss`). STE-grad + round-trip + entropy
-      sanity tests; `examples/LFQVAE`. Layer row in README.md, example in
-      examples/README.md.
+- [ ] Correct device OpenCL offload for the remaining three SDPA attention
+      variants (cosine-sim Q/K row renorm before the score matmul; disentangled
+      content/position relative-bias; conformer relative-position bias added to
+      logits). These currently fall back to their correct CPU `Compute()` — a
+      PERFORMANCE follow-up, not a correctness gap. Same recipe as the landed
+      ALiBi offload (reuse the two base device matmuls + inject the bias in the
+      CPU mask/softmax gap).
 
 ## Lucky-day batch 2026-06-28h (verified-novel AVX / dedup)
 
