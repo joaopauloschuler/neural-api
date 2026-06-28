@@ -1946,13 +1946,19 @@ NF4 dequant path do not exist (only int8 + MXFP4-dequant do).)
 been removed from this list. These are natural next steps that the landed work
 exposed. All verified absent in source before listing.)
 
-- [ ] Extend the AVX activation-forward dispatch (now live for Sigmoid/Tanh via
+- [X] Extend the AVX activation-forward dispatch (now live for Sigmoid/Tanh via
       `VectorSigmoid`/`VectorTanh` in `ApplyActivationFunctionToOutput`) to any
       other `FActivationFn` that already has a `TNNetVolume.Vector*` batched kernel
-      but is still scalar-dispatched — audit the pointer-dispatch chain at
-      neuralnetwork.pas ~108846 against the `Vector*` class procedures in
-      neuralvolume.pas (~480) and wire each remaining match. Pin parity with the
-      existing per-activation numerical-gradient/saturation tests.
+      but is still scalar-dispatched. AUDIT FINDING (no code change needed): the
+      only `FActivationFn` pointers ever assigned anywhere are Identity, ReLU,
+      Sigmoid, HiperbolicTangent, HardSwish, Swish and DiffAct. The dispatch chain
+      already routes Identity/ReLU/Sigmoid/Tanh/HardSwish; the two remaining scalar
+      ones have NO directly-matching `Vector*` kernel — DiffAct = 1-Abs(clamp(x,±1))
+      (no exp/erf/sinh), and Swish = x/(1+exp(-x)) has no `VectorSwish` (composing it
+      from VectorSigmoid would also diverge from the scalar form for large -x). The
+      existing `Vector*` kernels (Exp/Sigmoid/Tanh/Erf/Sinh) are all already wired in
+      their dedicated layer `Compute` methods (GELU/SiLU/SoftPlus/Sinh/…), a separate
+      code path. Nothing further to wire in this shared dispatch.
 - [ ] OpenCL forward offload for `TNNetGroupNorm`/`TNNetInstanceNorm` whole-sample
       path is the obvious sibling of the just-landed whole-volume `TNNetLayerNorm`/
       `TNNetRMSNorm` offload — confirm which already offload and add the gap via the
