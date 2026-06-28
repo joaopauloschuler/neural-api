@@ -1970,71 +1970,18 @@ surfaced while landing them:)
 guard for all four variants + correct ALiBi device offload [9957892f]; AVX
 `TNNetSoftPool` [6e373ae4]; AVX `TNNetCumSum` depth-axis [ff593de0];
 `TNNetFiniteScalarQuant`/FSQ [dfaa9c41]; `TNNetLookupFreeQuant`/LFQ [8cfaea3b].
-Open follow-up surfaced while landing them:)
+The open OpenCL follow-up LANDED and removed: device offload for the remaining
+three SDPA variants (cosine-sim / disentangled / conformer) via per-variant
+EnableOpenCL + ComputeOpenCL, gathered position dots stay on the CPU gap, new
+CosineSimilarity/Disentangled/ConformerRelPosAttentionOpenCLParity tests RAN on
+PoCL at max|diff| ~1e-7, suite 2493/2493 on both builds [914cbdc9].)
 
-- [X] Correct device OpenCL offload for the remaining three SDPA attention
-      variants (cosine-sim Q/K row renorm before the score matmul; disentangled
-      content/position relative-bias; conformer relative-position bias added to
-      logits). These currently fall back to their correct CPU `Compute()` — a
-      PERFORMANCE follow-up, not a correctness gap. Same recipe as the landed
-      ALiBi offload (reuse the two base device matmuls + inject the bias in the
-      CPU mask/softmax gap).
-      DONE: each variant overrides EnableOpenCL (re-arms FShouldOpenCL) +
-      ComputeOpenCL (two device GEMMs, variant term in the CPU gap). Cosine
-      L2-renormalises Q/K rows on the host BEFORE the score GEMM and scales by
-      the live cosine scale; its TNNetQKNormAttention subclass inherits the
-      offload. Disentangled/conformer keep the GATHERED position dots on the CPU
-      (the table row depends on (i,j) so they can't fold into a dense GEMM) and
-      add them to the c2c GEMM logits. New parity tests CosineSimilarity/
-      Disentangled/ConformerRelPosAttentionOpenCLParity all RAN on PoCL,
-      max|diff| ~1e-7 (< 1e-4 gate); the stale ALiBi-test safety assertion was
-      retargeted from cosine (now armed) to TNNetT5RelPosBiasAttention (still
-      CPU-only). Full suite 2493/2493 green on both OpenCL and non-OpenCL builds.
+## Lucky-day batch 2026-06-28h (verified-novel AVX / dedup) — ALL LANDED
 
-## Lucky-day batch 2026-06-28h (verified-novel AVX / dedup)
-
-(Each item grepped against neuralnetwork.pas / neuralpretrained.pas / the full
-tasklist and confirmed ABSENT before listing. Categories follow the lucky-day
-priority list: AVX vectorization of an existing layer, then importer dedup.)
-
-- [X] AVX-vectorize the FlashAttention `TNNetScaledDotProductAttention.ComputeTiled`
-      forward online-softmax accumulation (neuralnetwork.pas ~line 28761). The hot
-      per-(query, key)-inner loop is currently scalar over the contiguous head-dim
-      axis:
-      `for d := 0 to DkM1 do FTileAcc[d] := FTileAcc[d]*Alpha + Eg*VPtr^[d];`
-      `FTileAcc` and `VPtr` are both depth-contiguous (`FDk` floats), so the rescale
-      + value-accumulate splits into two depth-contiguous AVX ops —
-      `TNNetVolume.Mul(@FTileAcc[0], Alpha, FDk)` then
-      `TNNetVolume.MulAdd(@FTileAcc[0], VPtr, Eg, FDk)` — and the finalize loop
-      (`OutPtr^[d] := FTileAcc[d]*Alpha`, ~line 28778) becomes one `Mul`-into-`Move`.
-      This is the inner loop run per (query x key) over long contexts, so a
-      constant-factor depth-axis win compounds. Distinct from the open
-      `EnableTiledForward/ComputeTiled` follow-up (line ~830), which extends
-      masking/ALiBi COVERAGE of the tiled path, not the existing forward's SIMD.
-      Keep the scalar triple as the `{$ELSE}` fallback; parity-test bit-identical
-      scalar vs the factored two-op form and <1e-6 on `-dAVX2` (reuse the existing
-      tiled-vs-naive SDPA equality test). The exp/max transcendental stays scalar
-      (no SIMD exp on the online-softmax critical path).
-
-- [X] Dedup the three fused-QKV safetensors unpackers into one shared helper.
-      `LoadGPTNeoXQKVWeights` (neuralpretrained.pas ~18680), `LoadBloomQKVWeights`
-      (~49712) and `LoadFalconQKVWeights` (~50206) each slice a single fused
-      `query_key_value` slab into the separate Q/K/V neuron ranges with the same
-      outer loop and only different per-variant stride/offset arithmetic
-      (GPTNeoX per-head interleaved, Bloom `[num_heads,3,head_dim]`, Falcon MQA
-      grouped). Audit how much is genuinely common, then factor a parameterized
-      `LoadFusedQKVWeights(Reader, Layer, TensorName, OutDim, InDim, Layout)` (or a
-      small `TQKVPackLayout` enum) so a new fused-QKV arch reuses it instead of a
-      fourth copy. Pure refactor: the three existing importer parity fixtures
-      (pythia/bloom/falcon pico) must stay bit-identical — no behavior change.
-
-- [X] Dedup the per-importer norm-weight loaders. `LoadLlamaRMSNormWeights`
-      (neuralpretrained.pas ~14025, optional gain offset), `LoadCohereLayerNormWeights`
-      (~21103, additionally zeros a beta neuron) and the GPT-2/Bark-style
-      gamma+beta `LoadLayerNormWeights`/`LoadBarkLayerNorm` loaders all do the same
-      "load a [d_model] 1-D tensor into `FArrNeurons[0].Weights`, optionally a beta
-      into `FArrNeurons[1]`" copy. Audit for true equivalence, then collapse into
-      one `LoadAffineNormWeights(Reader, Layer, GammaName, BetaName, d_model,
-      GainOffset, HasBeta, ImporterName)` helper (keep the existing names as thin
-      wrappers so call sites and the per-norm gain-offset folds are unchanged).
-      Pure refactor; all importer parity fixtures must stay bit-identical.
+(All three 28h items LANDED and removed: AVX-vectorized SDPA `ComputeTiled`
+online-softmax accumulation via `TNNetVolume.Mul`/`MulAdd` depth-contiguous ops,
+tiled-vs-naive parity green on scalar + -dAVX2 [02d11b09]; fused-QKV unpackers
+unified into `LoadFusedQKVWeights` + `TQKVPackLayout` enum, three importer
+wrappers preserved, pico fixtures bit-identical [6083a4d0]; GPT-2/Llama/Cohere/
+Bark affine norm-weight loaders unified into `LoadAffineNormWeights`, four thin
+wrappers preserved, all parity fixtures bit-identical [dd5373fc].)
