@@ -273,6 +273,9 @@ type
     procedure TestRobertaConfigFromJSONFile;
     procedure TestRobertaHiddenStateParity;
     procedure TestRobertaPoolerParity;
+    procedure TestXLMRobertaConfigFromJSONFile;
+    procedure TestXLMRobertaHiddenStateParity;
+    procedure TestXLMRobertaPoolerParity;
     procedure TestT5ConfigFromJSONFile;
     procedure TestFlanT5Parity;
     procedure TestT5V10Parity;
@@ -9999,6 +10002,106 @@ begin
     FixturePath('tiny_roberta_config.json'));
   try
     AssertBertParityWithFixture(NN, FixturePath('tiny_roberta_hidden.json'),
+      Config.MaxPositions - 2, Config.HiddenSize, {PoolerRow0Only=}true);
+  finally
+    NN.Free;
+  end;
+end;
+
+// XLM-RoBERTa (model_type "xlm-roberta") is the multilingual RoBERTa: the
+// SAME encoder network, the ONLY difference is the SentencePiece tokenizer
+// (outside the builder). The config reader must map "xlm-roberta" to the
+// bfRoberta family with the +2 position offset and type_vocab_size = 1.
+procedure TTestNeuralPretrained.TestXLMRobertaConfigFromJSONFile;
+var
+  Config: TBertConfig;
+begin
+  Config := ReadBertConfigFromJSONFile(
+    FixturePath('tiny_xlmroberta_config.json'));
+  AssertTrue('family is roberta (xlm-roberta rides bfRoberta)',
+    Config.Family = bfRoberta);
+  AssertEquals('hidden_size', 8, Config.HiddenSize);
+  AssertEquals('intermediate_size', 16, Config.IntermediateSize);
+  AssertEquals('num_hidden_layers', 2, Config.NumLayers);
+  AssertEquals('num_attention_heads', 2, Config.NumHeads);
+  AssertEquals('vocab_size', 11, Config.VocabSize);
+  AssertEquals('max_position_embeddings', 16, Config.MaxPositions);
+  AssertEquals('type_vocab_size degenerates to 1', 1, Config.TypeVocabSize);
+  AssertEquals('position offset = pad_token_id + 1', 2,
+    Config.PositionOffset);
+  AssertEquals('layer_norm_eps', 1e-5, Config.LayerNormEps, 1e-12);
+  AssertFalse('hidden_act gelu = exact erf form', Config.HiddenActTanh);
+end;
+
+// THE two XLM-R deltas this test exercises (if either were wrong the logits
+// would drift far past the 1e-4 gate, the fixture generator asserts it):
+//   - position-id +2 offset: the importer reads checkpoint position rows
+//     2..SeqLen+1 (rows 0/1 are scrubbed to huge values, so reading them
+//     blows the gate by 5 orders of magnitude) and caps the usable context
+//     at max_position_embeddings - 2 = 14;
+//   - NO real segment embedding: type_vocab_size = 1, the token-type branch
+//     is a single constant row.
+// The dedicated BuildXLMRobertaFromSafeTensorsEx entry point must produce
+// the same net as the BERT-family path and match HF XLMRobertaModel's float64
+// last_hidden_state.
+procedure TTestNeuralPretrained.TestXLMRobertaHiddenStateParity;
+var
+  NN: TNNet;
+  Config: TBertConfig;
+  Rejected: boolean;
+begin
+  RandSeed := 424242;
+  NN := BuildXLMRobertaFromSafeTensorsEx(
+    FixturePath('tiny_xlmroberta.safetensors'),
+    Config, {SeqLen=}0, {pTrainable=}true, {pIncludePooler=}false,
+    FixturePath('tiny_xlmroberta_config.json'));
+  try
+    AssertTrue('family', Config.Family = bfRoberta);
+    AssertEquals('position offset', 2, Config.PositionOffset);
+    AssertEquals('prefix (XLMRobertaModel exports unprefixed)', '',
+      Config.Prefix);
+    // SeqLen=0 must default to the USABLE context, not the table size.
+    AssertEquals('input defaults to max_pos - 2',
+      Config.MaxPositions - 2, NN.Layers[0].Output.SizeX);
+    AssertBertParityWithFixture(NN,
+      FixturePath('tiny_xlmroberta_hidden.json'),
+      Config.MaxPositions - 2, Config.HiddenSize, {PoolerRow0Only=}false);
+  finally
+    NN.Free;
+  end;
+  // Requesting more than max_position_embeddings - 2 positions must fail.
+  Rejected := false;
+  NN := nil;
+  try
+    try
+      NN := BuildXLMRobertaFromSafeTensorsEx(
+        FixturePath('tiny_xlmroberta.safetensors'), Config,
+        {SeqLen=}15, false, false,
+        FixturePath('tiny_xlmroberta_config.json'));
+    except
+      on E: EPretrainedImportError do Rejected := true;
+    end;
+  finally
+    NN.Free;
+  end;
+  AssertTrue('SeqLen > max_pos - 2 rejected for xlm-roberta', Rejected);
+end;
+
+// XLMRobertaModel carries a BERT-style pooler: with pIncludePooler=true the
+// output row 0 must equal HF's pooler_output.
+procedure TTestNeuralPretrained.TestXLMRobertaPoolerParity;
+var
+  NN: TNNet;
+  Config: TBertConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildXLMRobertaFromSafeTensorsEx(
+    FixturePath('tiny_xlmroberta.safetensors'),
+    Config, {SeqLen=}0, {pTrainable=}true, {pIncludePooler=}true,
+    FixturePath('tiny_xlmroberta_config.json'));
+  try
+    AssertBertParityWithFixture(NN,
+      FixturePath('tiny_xlmroberta_hidden.json'),
       Config.MaxPositions - 2, Config.HiddenSize, {PoolerRow0Only=}true);
   finally
     NN.Free;

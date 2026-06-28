@@ -2216,6 +2216,31 @@ function BuildBertFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pTrainable: boolean = true;
   pIncludePooler: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
+// XLM-RoBERTa (model_type "xlm-roberta", e.g. FacebookAI/xlm-roberta-base and
+// the multilingual sentence-transformers / reranker / ColBERT backbones built
+// on it). The NETWORK is bit-identical to RoBERTa (the bfRoberta family): same
+// post-LN bidirectional encoder, same tensor names (XLMRobertaModel exports
+// unprefixed, the *For* heads carry "roberta."), the SAME +2 position offset
+// (create_position_ids_from_input_ids starts real positions at pad_token_id+1
+// = 2, rows 0/1 of the position table are never read) and type_vocab_size = 1
+// (the token-type branch is a single constant row). The ONLY thing that makes
+// XLM-R "multilingual" is the SentencePiece tokenizer (the 250k-piece
+// sentencepiece.bpe.model), which is loaded separately via
+// neuralhftokenizer.LoadSentencePieceModel - it is NOT part of this builder.
+// These thin wrappers ASSERT the config's model_type is "xlm-roberta" (or
+// "roberta") and then ride the BERT-family encoder path, so the encoder is
+// reused exactly. I/O contract is identical to BuildBertFromSafeTensors:
+// (SeqLen,1,2) token|token-type ids in, (SeqLen,1,hidden) final hidden states
+// out (pIncludePooler appends the pooler; row 0 = HF pooler_output).
+function BuildXLMRobertaFromSafeTensorsEx(const FileName: string;
+  out Config: TBertConfig; pSeqLen: integer = 0;
+  pTrainable: boolean = true; pIncludePooler: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildXLMRobertaFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
+  pIncludePooler: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
 // Re-emits a wired BERT-family encoder (built by BuildBertFromSafeTensors) as
 // a HF-named .safetensors checkpoint - the exact inverse of the importer's
 // name map and transforms. Config must be the one the importer returned (it
@@ -22069,12 +22094,16 @@ begin
       Result.Family := bfBert
     else if ModelType = 'distilbert' then
       Result.Family := bfDistilBert
-    else if ModelType = 'roberta' then
+    else if (ModelType = 'roberta') or (ModelType = 'xlm-roberta') then
+      // XLM-RoBERTa is structurally IDENTICAL to RoBERTa (same encoder math,
+      // same tensor names, same +2 position offset, type_vocab_size=1): the
+      // ONLY difference is the tokenizer (SentencePiece vs BPE), which lives
+      // outside this network builder. So it rides the bfRoberta family.
       Result.Family := bfRoberta
     else
       ImportError('BERT import: config model_type is "' + ModelType +
-        '" - expected "bert", "distilbert" or "roberta" (see ' +
-        'BuildFromPretrained for the full dispatch).');
+        '" - expected "bert", "distilbert", "roberta" or "xlm-roberta" ' +
+        '(see BuildFromPretrained for the full dispatch).');
     if Result.Family = bfDistilBert then
     begin
       // DistilBertConfig spells everything differently and hardcodes the
@@ -22657,6 +22686,69 @@ var
   IgnoredConfig: TBertConfig;
 begin
   Result := BuildBertFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pTrainable, pIncludePooler, '', pQuantizeInt8);
+end;
+
+// Reads the config.json model_type WITHOUT building anything (a light helper
+// for the XLM-R wrappers below, which want to fail loudly on the wrong family
+// before touching the checkpoint).
+function ReadModelTypeFromConfigFile(const FileName: string): string;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+begin
+  Result := '';
+  if not FileExists(FileName) then
+    ImportError('XLM-RoBERTa import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('XLM-RoBERTa import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if Root is TJSONObject then
+      Result := TJSONObject(Root).Get('model_type', '');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function BuildXLMRobertaFromSafeTensorsEx(const FileName: string;
+  out Config: TBertConfig; pSeqLen: integer = 0;
+  pTrainable: boolean = true; pIncludePooler: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath, ModelType: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  // Fail loudly on the wrong family: XLM-R is the bfRoberta encoder, so we
+  // accept "xlm-roberta" (and "roberta", which is the same network) only.
+  ModelType := ReadModelTypeFromConfigFile(ConfigPath);
+  if (ModelType <> 'xlm-roberta') and (ModelType <> 'roberta') then
+    ImportError('XLM-RoBERTa import: config model_type is "' + ModelType +
+      '" - BuildXLMRobertaFromSafeTensors expects "xlm-roberta" (or the ' +
+      'structurally identical "roberta").');
+  // XLM-R rides the RoBERTa encoder path verbatim: ReadBertConfigFromJSONFile
+  // maps model_type "xlm-roberta" to the bfRoberta family (the +2 position
+  // offset and type_vocab_size=1 are read from the config there).
+  Result := BuildBertFromSafeTensorsEx(FileName, Config, pSeqLen,
+    pTrainable, pIncludePooler, ConfigPath, pQuantizeInt8);
+end;
+
+function BuildXLMRobertaFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
+  pIncludePooler: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TBertConfig;
+begin
+  Result := BuildXLMRobertaFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pTrainable, pIncludePooler, '', pQuantizeInt8);
 end;
 
@@ -75491,7 +75583,8 @@ begin
     Result := BuildGPT2FromSafeTensors(WeightsPath, pSeqLen, NumHeads,
       pTrainable, GPT2ExactGelu, pQuantizeInt8)
   else if ((ModelType = 'bert') or (ModelType = 'distilbert') or
-           (ModelType = 'roberta')) and BertSeqCls then
+           (ModelType = 'roberta') or (ModelType = 'xlm-roberta')) and
+          BertSeqCls then
   begin
     IgnoredId2Label := nil;
     Result := BuildBertForSequenceClassificationFromSafeTensorsEx(
@@ -75613,9 +75706,11 @@ begin
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
       pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if (ModelType = 'bert') or (ModelType = 'distilbert') or
-          (ModelType = 'roberta') then
+          (ModelType = 'roberta') or (ModelType = 'xlm-roberta') then
     // ENCODER route: input (SeqLen,1,2) token|token-type ids (channel 1
-    // ignored for distilbert, zeros for roberta), output (SeqLen,1,hidden)
+    // ignored for distilbert, zeros for roberta/xlm-roberta - the latter is
+    // RoBERTa with a SentencePiece tokenizer, same encoder, +2 position
+    // offset), output (SeqLen,1,hidden)
     // final hidden states - NOT causal-LM logits (see the interface
     // comment). Pooler excluded; call BuildBertFromSafeTensors directly to
     // include it (bert/roberta - distilbert has none).
