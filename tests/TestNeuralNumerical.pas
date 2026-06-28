@@ -41,6 +41,9 @@ type
     procedure TestLpPoolLoadFromString;
     procedure TestFiniteScalarQuantSTEGradientCheck;
     procedure TestFiniteScalarQuantCodeIndexRoundTrip;
+    procedure TestLookupFreeQuantSTEGradientCheck;
+    procedure TestLookupFreeQuantCodeIndexRoundTrip;
+    procedure TestLookupFreeQuantEntropy;
     procedure TestSoftPoolGradientCheck;
     procedure TestSoftPoolGradientCheckBetaSweep;
     procedure TestSoftPoolBetaLimits;
@@ -7845,6 +7848,172 @@ begin
     finally
       NN2.Free;
     end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLookupFreeQuantSTEGradientCheck;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LFQ: TNNetLookupFreeQuant;
+  UpErr: TNNetVolume;
+  D, I, X, Y, Ch: integer;
+  Z, Expected, Got: TNeuralFloat;
+const
+  cSX = 2; cSY = 2; cTol = 1e-6;
+begin
+  // TNNetLookupFreeQuant straight-through estimator: the sign() in the forward
+  // is identity in the backward INSIDE the |z| <= 1 band and zeroed outside
+  // (the lucidrains LFQ clip). We seed inputs both inside and outside the band,
+  // set a known upstream output error, run the layer's Backpropagate, and
+  // compare the propagated input error to the expected clipped identity.
+  RandSeed := 424242;
+  D := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cSX, cSY, D);
+  UpErr := TNNetVolume.Create(cSX, cSY, D);
+  try
+    NN.AddLayer(TNNetInput.Create(cSX, cSY, D, 1));
+    LFQ := TNNetLookupFreeQuant.Create(D, 1.0, 1.0);
+    NN.AddLayer(LFQ);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Mix of inside-band (|z|<=1) and outside-band (|z|>1) inputs, none on the
+    // exact +/-1 boundary (where the clip is measure-zero ambiguous).
+    for I := 0 to Input.Size - 1 do
+      Input.Raw[I] := 0.37 * (I + 1) - 1.55;
+    NN.Compute(Input);
+
+    for I := 0 to LFQ.Output.Size - 1 do
+    begin
+      UpErr.Raw[I] := 0.5 + 0.25 * I;
+      LFQ.OutputError.Raw[I] := UpErr.Raw[I];
+    end;
+
+    NN.Layers[0].OutputError.Fill(0);
+    LFQ.IncDepartingBranchesCnt();
+    LFQ.Backpropagate();
+
+    for X := 0 to cSX - 1 do
+      for Y := 0 to cSY - 1 do
+        for Ch := 0 to D - 1 do
+        begin
+          Z := Input[X, Y, Ch];
+          if Abs(Z) <= 1.0 then Expected := UpErr[X, Y, Ch]
+          else Expected := 0;
+          Got := NN.Layers[0].OutputError[X, Y, Ch];
+          AssertTrue('LFQ STE grad (X=' + IntToStr(X) + ' Y=' + IntToStr(Y) +
+            ' Ch=' + IntToStr(Ch) + ' z=' + FloatToStr(Z) +
+            ' exp=' + FloatToStr(Expected) + ' got=' + FloatToStr(Got) + ')',
+            Abs(Expected - Got) < cTol);
+        end;
+  finally
+    NN.Free;
+    Input.Free;
+    UpErr.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLookupFreeQuantCodeIndexRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  LFQ, LFQ2: TNNetLookupFreeQuant;
+  S: string;
+  Idx: integer;
+begin
+  // The forward maps each channel to +/-1 by sign and CodeIndex bit-packs the
+  // sign pattern (channel 0 most significant). Verify a hand computation AND
+  // that the layer (incl. its inverse-temp + diversity floats) round-trips
+  // through SaveStructureToString/CreateLayer.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3, 1));
+    LFQ := TNNetLookupFreeQuant.Create(3, 2.0, 0.5);
+    NN.AddLayer(LFQ);
+
+    AssertEquals('LFQ codebook size 2^3', 8, LFQ.CodebookSize());
+    AssertEquals('LFQ num channels', 3, LFQ.NumChannels());
+
+    // signs: + - +  -> bits 1 0 1 -> 5
+    Input[0, 0, 0] := 0.7;
+    Input[0, 0, 1] := -0.3;
+    Input[0, 0, 2] := 1.9;
+    NN.Compute(Input);
+    Idx := LFQ.CodeIndex(0, 0);
+    AssertEquals('LFQ code index bit-pack', 5, Idx);
+    AssertEquals('LFQ ch0 +1', 1.0, LFQ.Output[0, 0, 0]);
+    AssertEquals('LFQ ch1 -1', -1.0, LFQ.Output[0, 0, 1]);
+
+    S := LFQ.SaveStructureToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.AddLayer(TNNetInput.Create(1, 1, 3, 1));
+      LFQ2 := NN2.CreateLayer(S) as TNNetLookupFreeQuant;
+      NN2.AddLayer(LFQ2);
+      AssertEquals('LFQ reload channels', 3, LFQ2.NumChannels());
+      AssertEquals('LFQ reload codebook', 8, LFQ2.CodebookSize());
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLookupFreeQuantEntropy;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LFQ: TNNetLookupFreeQuant;
+  I: integer;
+  DiverseCBE, CollapsedCBE: TNeuralFloat;
+begin
+  // Sanity: the codebook (batch) entropy is HIGH when codes are used uniformly
+  // (half +1, half -1 per channel) and LOW when collapsed (all same sign). The
+  // per-sample entropy is the confident-assignment term; aux loss subtracts the
+  // diversity-weighted codebook entropy.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 2); // 4 spatial positions, 2 channels
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 2, 1));
+    LFQ := TNNetLookupFreeQuant.Create(2, 8.0, 1.0); // sharp inv-temp
+    NN.AddLayer(LFQ);
+
+    // Diverse: each channel balanced +/- across the 4 positions.
+    for I := 0 to 1 do
+    begin
+      Input[0, 0, I] :=  2.0; Input[1, 0, I] := -2.0;
+      Input[2, 0, I] :=  2.0; Input[3, 0, I] := -2.0;
+    end;
+    NN.Compute(Input);
+    DiverseCBE := LFQ.CodebookEntropy();
+
+    // Collapsed: every position the SAME sign on both channels.
+    for I := 0 to 1 do
+    begin
+      Input[0, 0, I] := 2.0; Input[1, 0, I] := 2.0;
+      Input[2, 0, I] := 2.0; Input[3, 0, I] := 2.0;
+    end;
+    NN.Compute(Input);
+    CollapsedCBE := LFQ.CodebookEntropy();
+
+    AssertTrue('LFQ diverse codebook entropy (' + FloatToStr(DiverseCBE) +
+      ') > collapsed (' + FloatToStr(CollapsedCBE) + ')',
+      DiverseCBE > CollapsedCBE + 0.1);
+    AssertTrue('LFQ collapsed codebook entropy near zero',
+      CollapsedCBE < 0.05);
+    // Confident sharp assignment -> per-sample entropy near zero.
+    AssertTrue('LFQ per-sample entropy small under sharp inv-temp',
+      LFQ.PerSampleEntropy() < 0.05);
   finally
     NN.Free;
     Input.Free;
