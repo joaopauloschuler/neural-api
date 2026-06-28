@@ -1972,13 +1972,24 @@ guard for all four variants + correct ALiBi device offload [9957892f]; AVX
 `TNNetFiniteScalarQuant`/FSQ [dfaa9c41]; `TNNetLookupFreeQuant`/LFQ [8cfaea3b].
 Open follow-up surfaced while landing them:)
 
-- [ ] Correct device OpenCL offload for the remaining three SDPA attention
+- [X] Correct device OpenCL offload for the remaining three SDPA attention
       variants (cosine-sim Q/K row renorm before the score matmul; disentangled
       content/position relative-bias; conformer relative-position bias added to
       logits). These currently fall back to their correct CPU `Compute()` — a
       PERFORMANCE follow-up, not a correctness gap. Same recipe as the landed
       ALiBi offload (reuse the two base device matmuls + inject the bias in the
       CPU mask/softmax gap).
+      DONE: each variant overrides EnableOpenCL (re-arms FShouldOpenCL) +
+      ComputeOpenCL (two device GEMMs, variant term in the CPU gap). Cosine
+      L2-renormalises Q/K rows on the host BEFORE the score GEMM and scales by
+      the live cosine scale; its TNNetQKNormAttention subclass inherits the
+      offload. Disentangled/conformer keep the GATHERED position dots on the CPU
+      (the table row depends on (i,j) so they can't fold into a dense GEMM) and
+      add them to the c2c GEMM logits. New parity tests CosineSimilarity/
+      Disentangled/ConformerRelPosAttentionOpenCLParity all RAN on PoCL,
+      max|diff| ~1e-7 (< 1e-4 gate); the stale ALiBi-test safety assertion was
+      retargeted from cosine (now armed) to TNNetT5RelPosBiasAttention (still
+      CPU-only). Full suite 2493/2493 green on both OpenCL and non-OpenCL builds.
 
 ## Lucky-day batch 2026-06-28h (verified-novel AVX / dedup)
 

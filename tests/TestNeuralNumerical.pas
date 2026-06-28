@@ -334,6 +334,14 @@ type
     // CPU mask/softmax gap. Also asserts the SAFETY fallback: the sibling
     // variants that DON'T ship a correct offload must NOT arm the device path.
     procedure ALiBiAttentionOpenCLParity;
+    // OpenCL forward offload parity (vs CPU) for the three remaining score-math
+    // SDPA variants: cosine-similarity (Q/K L2-renorm on the host before the
+    // score GEMM), DeBERTa disentangled (c2p+p2c position bias in the CPU gap),
+    // conformer relative-position (Q.P bias in the CPU gap). Each reuses the two
+    // dense device matmuls and injects its variant term between them.
+    procedure CosineSimilarityAttentionOpenCLParity;
+    procedure DisentangledAttentionOpenCLParity;
+    procedure ConformerRelPosAttentionOpenCLParity;
     // OpenCL input-projection GEMM forward offload parity (vs CPU/AVX) for the
     // dense recurrent cells TNNetLSTMCell / TNNetGRUCell.
     procedure LSTMCellOpenCLParity;
@@ -61107,9 +61115,11 @@ end;
 // device forward must match the CPU Compute() within FP32 GEMM-reorder noise.
 // SeqLen >= 32 so the device path fires; causal+sliding-window are exercised so
 // the masking branch is covered. The test also pins the SAFETY guard: a sibling
-// variant (TNNetCosineSimilarityAttention) that ships NO correct offload must
-// have ShouldOpenCL = false after EnableOpenCL, i.e. it falls back to its CPU
-// Compute() rather than the wrong inherited plain-SDPA device path.
+// variant (TNNetT5RelPosBiasAttention) that ships NO correct offload must have
+// ShouldOpenCL = false after EnableOpenCL, i.e. it falls back to its CPU
+// Compute() rather than the wrong inherited plain-SDPA device path. (Cosine /
+// disentangled / conformer now DO ship correct offloads, so they are armed and
+// covered by their own parity tests.)
 procedure TTestNeuralNumerical.ALiBiAttentionOpenCLParity;
 {$IFDEF OpenCL}
 const
@@ -61122,7 +61132,7 @@ var
   XData, OutCPU: TNNetVolume;
   InputLayer: TNNetLayer;
   Attn: TNNetALiBiAttention;
-  Cosine: TNNetCosineSimilarityAttention;
+  NoOffload: TNNetT5RelPosBiasAttention;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
   i: integer;
@@ -61177,12 +61187,206 @@ begin
   NN := TNNet.Create();
   try
     InputLayer := NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
-    Cosine := TNNetCosineSimilarityAttention.Create(Dk, {CausalMask}true);
-    NN.AddLayerAfter(Cosine, InputLayer);
+    NoOffload := TNNetT5RelPosBiasAttention.Create(Dk, {CausalMask}true);
+    NN.AddLayerAfter(NoOffload, InputLayer);
     NN.EnableOpenCL(PlatformId, DeviceId);
-    AssertTrue('CosineSimilarity variant must fall back to CPU (ShouldOpenCL=false)',
-      not Cosine.ShouldOpenCL);
+    AssertTrue('T5RelPosBias variant must fall back to CPU (ShouldOpenCL=false)',
+      not NoOffload.ShouldOpenCL);
   finally
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetCosineSimilarityAttention L2-renormalises the Q and K rows on the host,
+// runs the cosine score GEMM (Qn.Kn^T) and the value GEMM (P.V) on the device,
+// and applies the live scale + causal mask + softmax in the CPU gap. The device
+// forward must match the CPU Compute() within FP32 GEMM-reorder noise. SeqLen >=
+// 32 so the device path fires; causal masking is exercised.
+procedure TTestNeuralNumerical.CosineSimilarityAttentionOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Dk = 12;
+  SeqLen = 40;
+  Scale = 8.0;
+var
+  NN: TNNet;
+  XData, OutCPU: TNNetVolume;
+  InputLayer: TNNetLayer;
+  Attn: TNNetCosineSimilarityAttention;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  OutCPU := TNNetVolume.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetCosineSimilarityAttention.Create(Dk, {CausalMask}true, Scale);
+    NN.AddLayerAfter(Attn, InputLayer);
+    for i := 0 to XData.Size - 1 do
+      XData.Raw[i] := 0.5 * Sin(i * 0.3) + 0.2 * Cos(i * 0.11);
+    NN.Compute(XData);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    AssertTrue('CosineSimilarity device path armed', Attn.ShouldOpenCL);
+    NN.Compute(XData);
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    MaxDiff := 0;
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  CosineSimilarityAttention OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('CosineSimilarityAttention OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    XData.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetDisentangledAttention runs the content-to-content score GEMM and the P.V
+// value GEMM on the device and adds the gathered DeBERTa c2p + p2c position bias
+// (then the shared sqrt(d_k*3) scale + causal mask + softmax) in the CPU gap.
+// The position tables are nonzero (InitDefault Gaussian) so the bias is exercised.
+procedure TTestNeuralNumerical.DisentangledAttentionOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Dk = 12;
+  SeqLen = 40;
+  AttSpan = 16;
+  PosBuckets = 0; // raw (no log bucketing) keeps the test self-contained
+  MaxRelPos = 64;
+var
+  NN: TNNet;
+  XData, OutCPU: TNNetVolume;
+  InputLayer: TNNetLayer;
+  Attn: TNNetDisentangledAttention;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  OutCPU := TNNetVolume.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetDisentangledAttention.Create(Dk, {CausalMask}true, AttSpan,
+      PosBuckets, MaxRelPos);
+    NN.AddLayerAfter(Attn, InputLayer);
+    for i := 0 to XData.Size - 1 do
+      XData.Raw[i] := 0.5 * Sin(i * 0.3) + 0.2 * Cos(i * 0.11);
+    NN.Compute(XData);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    AssertTrue('Disentangled device path armed', Attn.ShouldOpenCL);
+    NN.Compute(XData);
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    MaxDiff := 0;
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  DisentangledAttention OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('DisentangledAttention OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    XData.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetConformerRelPosAttention runs the content-to-content score GEMM and the
+// P.V value GEMM on the device and adds the gathered Q.P relative-position bias
+// (then the shared 1/sqrt(d_k) scale + causal/window mask + softmax) in the CPU
+// gap. Bidirectional encoder layer with a sliding window so the mask branch is
+// covered; the distance table is nonzero (InitDefault Gaussian).
+procedure TTestNeuralNumerical.ConformerRelPosAttentionOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Dk = 12;
+  SeqLen = 40;
+  LeftMax = 16;
+  RightMax = 16;
+  Window = 12;
+var
+  NN: TNNet;
+  XData, OutCPU: TNNetVolume;
+  InputLayer: TNNetLayer;
+  Attn: TNNetConformerRelPosAttention;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  OutCPU := TNNetVolume.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetConformerRelPosAttention.Create(Dk, {CausalMask}false, LeftMax,
+      RightMax, Window);
+    NN.AddLayerAfter(Attn, InputLayer);
+    for i := 0 to XData.Size - 1 do
+      XData.Raw[i] := 0.5 * Sin(i * 0.3) + 0.2 * Cos(i * 0.11);
+    NN.Compute(XData);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    AssertTrue('Conformer device path armed', Attn.ShouldOpenCL);
+    NN.Compute(XData);
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    MaxDiff := 0;
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  ConformerRelPosAttention OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('ConformerRelPosAttention OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    XData.Free;
     NN.Free;
   end;
 end;
