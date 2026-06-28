@@ -1947,14 +1947,17 @@ remainder tail has NO internal clamp so extreme inputs must be pre-clamped to
 (All five 28 tasks LANDED: PixelShuffle/Bicubic OpenCL forward offload [556e9c9b],
 AvgPool-backward AVX scatter [32a2ebad], TNNetEchoStateReservoir layer + example
 rewrite [4fc761f1], whole-volume SoftMax AVX host fallback + AVXGetSum [d64994e4],
-cai_mrope M-RoPE OpenCL offload [b06c5d0d]. Open follow-ups:)
+cai_mrope M-RoPE OpenCL offload [b06c5d0d]. Follow-ups landed:
+- BACKWARD OpenCL offload for `TNNetPixelShuffle` / `TNNetBicubicUpsample`
+  [4c70fc5c]: cai_pixel_shuffle_scatter (collision-free inverse permutation,
+  reuses the forward index buffer in the other direction) +
+  cai_bicubic_scatter (transposed gather over a per-source-pixel CSR
+  contribution table, atomic-free to match the gather kernels). New
+  TNNetPixelShuffleScatterCL / TNNetBicubicScatterCL helpers + BackpropagateOpenCL.
+  Parity `<1e-6` vs host backward on the PoCL CPU device,
+  TestPixelShuffle/BicubicUpsampleBackwardOpenCLParity, skip-clean with no device.
+Open follow-ups:)
 
-- [ ] BACKWARD OpenCL offload for `TNNetPixelShuffle` / `TNNetBicubicUpsample` —
-      the 28 landing is FORWARD-only (backward stays on host). PixelShuffle backward
-      is the inverse space->depth scatter (reuse the same index buffer, gather the
-      other direction); Bicubic backward scatters each output gradient across its
-      4x4 corner weights (an atomic-add or transposed-gather kernel). Parity-test
-      `<1e-6` vs host backward; skip-clean when no device.
 - [ ] `TNNetMRotaryEmbedding.ComputeOpenCL` rebuilds the full per-(token,pair)
       `FAngleTable` on the HOST every forward then uploads it. For incremental
       decode (one new token per step) this re-uploads the whole table each call —
