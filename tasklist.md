@@ -1985,3 +1985,40 @@ unified into `LoadFusedQKVWeights` + `TQKVPackLayout` enum, three importer
 wrappers preserved, pico fixtures bit-identical [6083a4d0]; GPT-2/Llama/Cohere/
 Bark affine norm-weight loaders unified into `LoadAffineNormWeights`, four thin
 wrappers preserved, all parity fixtures bit-identical [dd5373fc].)
+
+## Lucky-day batch 2026-06-28i (verified-novel vision dedup / AVX / torch port)
+
+- [ ] Add a reusable `TNNetGridSample` layer (port of torch `F.grid_sample`):
+      two-source layer that warps a feature map by an explicit per-pixel sampling
+      grid (second input supplies normalized (x, y) flow in [-1, 1] over the
+      output positions), with `bilinear` and `nearest` interpolation modes,
+      `zeros`/`border` padding modes and an `align_corners` flag. The bilinear
+      forward already exists TWICE in scalar/partly-AVX form — in
+      `TNNetAffineGridSample.Compute` (depth-contiguous `MulAdd` blend, AVX) and
+      in `TNNetDeformableConv.SampleBilinear` (scalar per-channel) — so factor a
+      single shared depth-column bilinear-gather helper and have all three sites
+      use it. `TNNetAffineGridSample` then becomes the affine special case that
+      generates its grid from a 2x3 theta and delegates to the shared gather.
+      Numerical-gradient test the grid (flow) input path; OpenCL is optional
+      (the existing `TNNetAffineGridSample` gather kernel is the template).
+
+- [ ] AVX-vectorize the `TNNetDeformableConv` bilinear gather. The offsets are
+      per-tap (shared across all Depth channels of a given sampled position), so
+      the four corner taps can be blended as Depth-long contiguous `MulAdd`
+      accumulations exactly like `TNNetAffineGridSample.Compute` already does,
+      instead of the current scalar per-channel `PrevOut.Get(x, y, ci)` loop in
+      `SampleBilinear`. Route through the shared depth-column gather helper from
+      the `TNNetGridSample` item above (or stand alone if that lands later).
+      Forward-and-backward parity-test against the current scalar path on a small
+      net; the GEMM stage already offloads, this removes the remaining CPU-scalar
+      gather bottleneck. Pairs with the existing DCNv2 modulated mask path.
+
+- [ ] Add a reusable `TNNet.AddPatchEmbedding` builder method (patchify +
+      linear projection to tokens, optional learnable class token and learnable
+      positional embedding) for ViT-style stacks. Today every patch-tokenizing
+      example (e.g. `MaskedAutoencoder`, `Perceiver`, MLP-Mixer / ViT demos)
+      hand-rolls the conv-stride-`PatchSize` → flatten-to-(SeqLen,1,EmbedDim)
+      sequence reshape inline. One builder removes that duplication and makes
+      from-scratch ViT examples a few lines. Mirror the existing
+      `Add*Block`/`Add*Encoder` builder conventions; convert at least one
+      example to use it as the regression check.
