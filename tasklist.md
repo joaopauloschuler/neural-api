@@ -1998,7 +1998,7 @@ gather), forward bit-identical / backward parity-tested [ab92389f]; reusable
 `TNNet.AddPatchEmbedding` ViT patchify builder (conv-stride-patch -> reshape ->
 optional CLS + positional embedding) + `examples/TinyViT` regression [91024a9e].)
 
-## Lucky-day batch 2026-06-28j (verified-novel accelerator / generative / torch port)
+## Lucky-day batch 2026-06-28j (verified-novel accelerator / generative / torch port) — ALL THREE LANDED (open follow-ups inline)
 
 (Each item below was checked against `neural/*.pas` and `examples/` before
 listing — none is a near-duplicate of existing source. Forward-path AVX/OpenCL
