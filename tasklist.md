@@ -1924,22 +1924,6 @@ then — only int8 + MXFP4-dequant did.)
         garbage path). A real `bnb-4bit` Llama/Qwen slicer fixture is RAM/network
         -gated; today's parity is the random pico numpy oracle only.
 
-## Accelerator & dedup batch 2026-06-27e (follow-ups surfaced by 27d)
-
-(The 2026-06-27d/e accelerator/dedup batches are LANDED — completed tasks removed.
-LANDED in 27e: AVX activation-forward dispatch extension AUDIT (no code change —
-only Identity/ReLU/Sigmoid/Tanh/HardSwish/Swish/DiffAct are ever assigned to
-`FActivationFn`; the remaining scalar ones DiffAct/Swish have no matching `Vector*`
-kernel, and the rest are already wired in their dedicated layer `Compute` methods);
-OpenCL `TNNetGroupNorm`/`TNNetInstanceNorm` offload AUDIT (BOTH already offload via
-`TNNetGroupNormCL`+`cai_group_norm`, parity tests already published). Remaining open:)
-
-- [X] OpenCL offload for `TNNetMRotaryEmbedding` (M-RoPE) — the base
-      `TNNetRotaryEmbedding` now offloads via `cai_rope`, but M-RoPE keeps its own
-      3-D section-position `Compute` on the host. Either generalize `cai_rope` to
-      take a per-token position triple or add a `cai_mrope` kernel; keep the
-      host-built angle table so device math stays pure rotation.
-
 ## Accelerator & dedup batch 2026-06-27f
 
 (All LANDED and removed: OpenCL softmax-head offload — new `cai_softmax` kernel +
@@ -1956,51 +1940,6 @@ remainder tail has NO internal clamp so extreme inputs must be pre-clamped to
       Tie into the existing "keep activations resident across consecutive offloaded
       layers" follow-up in the vision/generative section so attention blocks chain
       device-side. Forward-only, parity-tested, skip-clean when no device.
-- [X] AVX-vectorize the softmax-head HOST fallback to match the new device path.
-      `TVolume.PointwiseSoftMax` / whole-volume `TVolume.SoftMax` still do scalar
-      max -> `pcr_expf` per element -> sum -> divide; the `cai_softmax` kernel now
-      does the stable two-pass form on device, but the CPU fallback (no GPU here)
-      could reuse `AVXExp` over the exp pass (pre-clamp args per the 27f finding
-      above) + a vector max/sum reduction. Pin `<1e-4` parity with the existing
-      softmax numerical tests.
-
-## Lucky-day batch 2026-06-28
-
-(Vision/generative, OpenCL, AVX and dedup ideas verified against the source as
-NOT already implemented. Each reuses landed infrastructure where possible.)
-
-- [X] OpenCL forward offload for `TNNetPixelShuffle` and `TNNetBicubicUpsample`
-      — the sibling `TNNetBilinearUpsample` already offloads via `ComputeOpenCL`
-      (commit path at `TNNetBilinearUpsample.ComputeOpenCL`/`EnableOpenCL`), but
-      these two stay on the host. Both are hot in super-resolution and generative
-      decoders (SwinIR / NAFNet / Real-ESRGAN / SD VAE upsample). PixelShuffle is a
-      pure depth->space gather (a `cai_pixel_shuffle` index kernel, no arithmetic);
-      Bicubic reuses the precomputed corner-index + weight tables the host path
-      already builds (`BicubicResizeMap`) so the kernel is a fixed 4x4 weighted
-      gather analogous to `cai_bilinear_gather`. Forward-only, parity-tested
-      (`<1e-4` vs host), skip-clean when no device.
-
-- [X] AVX-vectorize `TNNetAvgPool` backward spatial accumulation. The forward is
-      fine, but `TNNetAvgPool.Backpropagate` distributes the upstream gradient with
-      two scalar nested `for CntX/CntY` loops around a per-cell `TNNetVolume.Add`
-      (the `Add` itself is AVX, but the outer scatter is scalar and re-dispatches
-      per cell). For the common non-overlapping stride=size case each output cell
-      maps to a disjoint contiguous depth-block, so the whole backward is a single
-      broadcast-scaled vector accumulate over contiguous spans — restructure to one
-      AVX pass. Pin `<1e-6` parity with the existing pooling numerical-gradient
-      tests; keep the general overlapped-window path as the scalar fallback.
-
-- [X] Replace the hand-coded reservoir loop in `examples/EchoStateNetwork` with a
-      reusable `TNNetEchoStateReservoir` layer (leaky-integrator Echo State Network
-      / Reservoir Computing core, Jaeger 2001). The example currently hand-rolls
-      `h_t = (1-a)*h_{t-1} + a*tanh(W_in*x_t + W*h_{t-1})` with nested loops over a
-      frozen random `W`/`W_in`; promote that to a recurrent layer that owns the two
-      non-trainable matrices (random-init, never gradient-updated), the leak rate
-      `a`, and a one-shot spectral-radius rescale at build time via the landed
-      power-iteration helper `TNNet.EstimateSpectralRadius`. This makes reservoirs
-      composable inside larger nets (only a trainable linear read-out downstream)
-      and removes the per-example hand-math. Numerical-gradient test only needs the
-      read-out path (reservoir weights are frozen).
 
 ## Lucky-day batch 2026-06-28b (follow-ups surfaced by 28's accelerator landings)
 
