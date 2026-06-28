@@ -1988,3 +1988,67 @@ not z = mu + sigma·eps sampling.)
       `dKL/dmu = mu`, `dKL/dlog_var = 0.5*(exp(log_var)-1)`, beta-scaled);
       gradient checks `TestGaussianReparameterizeGradientCheck` /
       `TestVAEKLDivergenceGradientCheck`; `examples/VAE` smoke MSE 0.21→0.02.
+
+## Accelerator & dedup batch 2026-06-27c
+
+(All verified absent in source before listing. `TNNetMaxPool` / `TNNetAvgPool`
+forward methods are plain scalar nested-window loops with no `FShouldOpenCL` /
+`ComputeOpenCL` path; `TNNetEmbedding.Compute` is a scalar token-gather loop;
+`TNNetLinearAttention` has an OpenCL score path but its CPU feature-map and the
+remaining transcendental activations are scalar `pcr_expf`/`pcr_tanhf`
+per-element loops; the dense Gauss-Jordan solver is hand-rolled in TWO places
+with incompatible signatures.)
+
+- [ ] OpenCL forward offload for `TNNetMaxPool` / `TNNetAvgPool` (and the
+      matching `TNNetDeMaxPool` / `TNNetDeAvgPool` unpool). These pooling layers
+      sit between convolution stages in the diffusion-UNet / GAN / StyleGAN /
+      classification-backbone image stacks that already run their convs AND their
+      GroupNorm on the GPU (GroupNorm OpenCL landed commit 09f9a13b), so each pool
+      is a CPU island that forces a device→host→device round-trip mid-forward.
+      Add a windowed-reduction kernel to `neural/neural.cl` (one work-item per
+      output (x,y,depth) cell reducing its `Size×Size` stride window by max / sum),
+      mirroring the landed `cai_group_norm` reduction-offload pattern: arm
+      `FShouldOpenCL` in `EnableOpenCL`, gate dispatch on
+      `FOutput.Size >= NeuralConvOpenCLMinWork`, forward-only (backward stays on
+      CPU), with a `<1e-4` parity test per layer against the scalar path.
+
+- [ ] OpenCL forward offload for `TNNetEmbedding` token-gather. The embedding
+      lookup is the FIRST layer of every imported-LLM / ChatTerminal forward pass;
+      its output feeds the (already device-resident) transformer stack, so doing
+      the gather on the host re-uploads the activation every step. Add a simple
+      gather kernel (one work-item per (token, depth) copying `FArrNeurons[token]`
+      into the output) so the embedding output stays device-resident going into
+      the first attention block. Mirror the existing `FShouldOpenCL` arming +
+      `NeuralConvOpenCLMinWork` gate pattern; forward-only, `<1e-4` parity test.
+
+- [ ] AVX vectorization of the `TNNetLinearAttention` CPU feature map. The layer
+      already has an OpenCL score path, but its CPU forward computes the kernel
+      feature map `phi(x) = elu(x)+1` (and its backward derivative) with a scalar
+      `pcr_expf` branch per (sequence, feature) element. The feature axis is
+      depth-contiguous (the AVX-friendly layout per the depth-contiguous rule), so
+      the `phi` pass can reuse the existing `AVXExp` vector exponential already used
+      by `TVolume.PointwiseSoftMax` instead of a per-element scalar exp. This is in
+      the hot path of the `LinearAttention` / `Performer` examples and the Sana
+      linear-DiT importer. Keep the scalar path as the `{$IFNDEF AVXANY}` fallback
+      and pin parity with the existing numerical-gradient/forward tests.
+
+- [ ] AVX vectorization of the remaining transcendental activation forwards
+      (`TNNetTanhExp`, `TNNetPenalizedTanh`, `TNNetSoftPlusBeta`). Each is a pure
+      depth-contiguous elementwise pass currently looping a scalar `pcr_expf` /
+      `pcr_tanhf` / `pcr_log1pf` per element; they can reuse the same `AVXExp`
+      vector-exponential helper the GLU-family AVX pass (commit 64c7d45d) and
+      `PointwiseSoftMax` already use, batching the transcendental over 8 lanes.
+      Keep the scalar branch as the `{$IFNDEF AVXANY}` fallback and pin parity
+      with the existing saturation-safety / numerical-gradient tests.
+
+- [ ] Remove the duplicated dense Gauss-Jordan linear solver. `TNNet` carries a
+      private `GaussJordanSolve(var A, B: TDoubleMatrix; ...)` (used by its
+      least-squares head, neuralnetwork.pas ~89355) while
+      `examples/EchoStateNetwork/EchoStateNetwork.lpr` hand-rolls a SECOND,
+      signature-incompatible `GaussJordanSolve(var A: array of TNeuralFloat; ...)`
+      for its ridge-regression readout. Extract one reusable public dense
+      linear-solve routine (`TNNetVolume`-or-`neuralvolume`-level, single-precision
+      `TNeuralFloat`-array signature with partial pivoting) and have BOTH the
+      least-squares head and the EchoStateNetwork example call it, deleting the
+      hand-rolled copy. Cover the shared routine with a small solve-a-known-system
+      unit test (round-trip `A·x = b` to `<1e-4`).
