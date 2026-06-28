@@ -2012,12 +2012,18 @@ round-trip (commit e37d07bb). Open follow-ups surfaced by the Resize2D landing:)
       of v1 (it changes the kernel support to scale-dependent, breaking the fixed
       2-tap / 4-tap separable gather; torch's antialias widens the kernel and
       renormalises). Add it as an opt-in 5th flag (FStruct[4]) when needed.
-- [ ] DID NOT dedup the integer-factor up-samplers onto `TNNetResize2D` — the
+- [X] DID NOT dedup the integer-factor up-samplers onto `TNNetResize2D` — the
       risk note said not to force it. `TNNetBilinearUpsample`/`Upsample` keep
-      their OpenCL gather/scatter paths; `TNNetResize2D` is CPU-only for now.
-      Add an OpenCL forward (reuse `TNNetBilinearGatherCL`/`TNNetBicubicGatherCL`
-      exactly as `TNNetBilinearResize`/`TNNetBicubicUpsample` do) if profiling
-      shows it on a hot path.
+      their OpenCL gather/scatter paths. The OpenCL forward IS NOW DONE (the dedup
+      was deliberately left out): `TNNetResize2D.EnableOpenCL`/`ComputeOpenCL`
+      reuse `TNNetBilinearGatherCL` (4 corners, bilinear mode) and
+      `TNNetBicubicGatherCL` (16 corners, bicubic mode) exactly as
+      `TNNetBilinearResize`/`TNNetBicubicUpsample` do; the SIZE-based source maps
+      (`BilinearResizeMap`/`BicubicResizeMap`) drive the gather, nearest stays a
+      pure host Move, backward stays on the CPU, host round-trip is the
+      `FShouldOpenCL` fallback. `TestResize2DOpenCLParity` covers bilinear
+      upscale/downscale/rectangular + bicubic upscale/rectangular vs CPU < 1e-4
+      (ran on the PoCL CPU device); skips cleanly with no device.
 
 ## Lucky-day batch 2026-06-28k (verified-novel AVX / dedup / OpenCL — generative vision)
 
@@ -2027,8 +2033,11 @@ exists with a full CPU `Compute`/`Backpropagate` but has NO `ComputeOpenCL`/
 its forward uses strided per-channel scalar access, unlike the AVX'd GroupNorm/
 L2Normalize/PixelNorm reductions that already landed.)
 
-- [ ] AVX + dedup the `TNNetAdaIN.Compute` per-channel spatial statistics, and
-      add a forward-only OpenCL offload. AdaIN (Adaptive Instance Normalization,
+- [X] AVX + dedup the `TNNetAdaIN.Compute` per-channel spatial statistics, and
+      add a forward-only OpenCL offload. (DONE commit 1d86f6b3: depth-contiguous
+      Add/MulAdd reduction, shared `NeuralPerChannelMeanInvStd` helper reused by
+      GroupNorm ChannelsPerGroup=1 fast path, `cai_group_norm` Groups=Depth OpenCL
+      offload; `TestAdaINForwardAVXParity` 3.58e-7 + `AdaINOpenCLParity`.) AdaIN (Adaptive Instance Normalization,
       Huang & Belongie 2017) is the core layer of `examples/AdaINStyleTransfer`
       and the StyleGAN-style generators. Today its forward computes the content
       mean/variance and the style mean/variance with FOUR nested

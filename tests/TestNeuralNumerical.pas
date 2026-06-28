@@ -315,6 +315,7 @@ type
     procedure TestPixelShuffleBackwardOpenCLParity;
     procedure TestBicubicUpsampleBackwardOpenCLParity;
     procedure TestBilinearResizeOpenCLParity;
+    procedure TestResize2DOpenCLParity;
     procedure TestResize2DNearestInputGradientCheck;
     procedure TestResize2DBilinearInputGradientCheck;
     procedure TestResize2DBicubicInputGradientCheck;
@@ -61470,6 +61471,80 @@ begin
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetResize2D forward device offload parity (vs CPU). Reuses the same
+// per-output-pixel gather kernels as TNNetBilinearResize / TNNetBicubicUpsample:
+// the bilinear path drives TNNetBilinearGatherCL (4 corners) and the bicubic
+// path drives TNNetBicubicGatherCL (16 corners). Covers an UPSCALE, a DOWNSCALE
+// and a RECTANGULAR SizeX<>SizeY case across bilinear and bicubic modes. Skips
+// cleanly when no OpenCL device is present.
+procedure TTestNeuralNumerical.TestResize2DOpenCLParity;
+{$IFDEF OpenCL}
+type
+  TCase = record W, H, D, OutW, OutH, Mode: integer; Name: string; end;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Cases: array[0..4] of TCase;
+  ci, i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  // Bilinear upscale, bilinear downscale, bilinear rectangular, bicubic upscale,
+  // bicubic rectangular downscale. All non-integer ratios -> fractional weights.
+  Cases[0].W :=  8; Cases[0].H :=  8; Cases[0].D := 5; Cases[0].OutW := 13; Cases[0].OutH := 11; Cases[0].Mode := 1; Cases[0].Name := 'bilinear-upscale';
+  Cases[1].W := 12; Cases[1].H := 12; Cases[1].D := 3; Cases[1].OutW :=  7; Cases[1].OutH :=  5; Cases[1].Mode := 1; Cases[1].Name := 'bilinear-downscale';
+  Cases[2].W := 10; Cases[2].H :=  6; Cases[2].D := 4; Cases[2].OutW :=  5; Cases[2].OutH := 14; Cases[2].Mode := 1; Cases[2].Name := 'bilinear-rect';
+  Cases[3].W :=  8; Cases[3].H :=  8; Cases[3].D := 5; Cases[3].OutW := 13; Cases[3].OutH := 11; Cases[3].Mode := 2; Cases[3].Name := 'bicubic-upscale';
+  Cases[4].W := 11; Cases[4].H :=  9; Cases[4].D := 3; Cases[4].OutW :=  6; Cases[4].OutH := 15; Cases[4].Mode := 2; Cases[4].Name := 'bicubic-rect';
+  for ci := 0 to High(Cases) do
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(Cases[ci].W, Cases[ci].H, Cases[ci].D);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(Cases[ci].W, Cases[ci].H, Cases[ci].D, 1));
+      NN.AddLayer(TNNetResize2D.Create(Cases[ci].OutW, Cases[ci].OutH, Cases[ci].Mode, 0));
+      for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.39) * 0.85 - 0.1;
+
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      SetNeuralConvOpenCLMinWork(0);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        MaxDiff := 0;
+        AssertEquals('output size match (' + Cases[ci].Name + ')',
+          OutCPU.Size, NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        SetNeuralConvOpenCLMinWork(1 shl 20);
+      end;
+      AssertTrue('Resize2D OpenCL vs CPU parity (' + Cases[ci].Name +
+        '): max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+        MaxDiff < 1e-4);
+    finally
+      OutCPU.Free; Input.Free; NN.Free;
+    end;
   end;
 end;
 {$ELSE}
