@@ -1970,60 +1970,45 @@ surfaced while landing them:)
 confirmed ABSENT before listing. Categories follow the lucky-day priority list:
 OpenCL correctness/offload, AVX vectorization, and torch/diffusers CV ports.)
 
-- [ ] OpenCL correctness + offload for the SDPA attention VARIANTS
-      (`TNNetCosineSimilarityAttention`, `TNNetDisentangledAttention`,
-      `TNNetConformerRelPosAttention`, `TNNetALiBiAttention`). All four subclass
-      `TNNetScaledDotProductAttention` and override `Compute()` with their own
-      score math, but NONE override `EnableOpenCL`/`ComputeOpenCL` — so if OpenCL
-      is enabled on one, it inherits the base `ComputeOpenCL` (line ~27906) which
-      computes PLAIN dot-product attention and silently returns WRONG results
-      (wrong scores: cosine renorm / relative-position bias / linear ALiBi bias
-      all dropped). Two-part task: (1) immediate safety — guard the base
-      `EnableOpenCL`/`FShouldOpenCL` by exact `ClassType` so a variant falls back
-      to its correct CPU `Compute()` instead of the wrong device path; (2) then
-      add a CORRECT offload, easiest first for `TNNetALiBiAttention` since ALiBi
-      only ADDS a per-(i,j) linear position bias to the scores — reuse the base
-      two device matmuls (Q·Kᵀ and P·V) and inject the bias in the CPU
-      masking/softmax gap that already sits between them. Parity-tested vs CPU
-      `Compute()` on the PoCL device, skip-clean with no device. Same recipe then
-      extends to the cosine/disentangled/conformer variants.
-- [ ] AVX-vectorize `TNNetSoftPool.Compute` (line ~82767). The window-softmax
-      pool runs three passes of triple-nested scalar loops with a `pcr_expf` per
-      element (`exp(beta*x_i - winMax)`), then a weighted-sum normalize. The depth
-      axis is contiguous, so the existing `AVXExp` primitive (already used by the
-      SoftPlus/Gaussian forwards) can vectorize the per-window exp + accumulate —
-      note `AVXExp`'s scalar tail has no internal clamp, so pre-clamp the
-      `beta*x - winMax` argument to [-88,88] before the call (the winMax subtract
-      already bounds it above by 0, but guard the low tail). Forward-first; the
-      backward (line ~82862) shares the same exp pattern and can follow.
-      Numerical-gradient + scalar-vs-AVX parity tested.
-- [ ] AVX-vectorize `TNNetCumSum.Compute`/`Backpropagate` (line ~41416/~41468)
-      for the DEPTH-axis (`caDepth`) case only — there the scanned axis is
-      contiguous in memory, so a running-accumulator pass can use a vectorized
-      add of the prefix into spans (or at minimum `AVXCopy` the input span then a
-      vectorized in-place prefix). The X/Y-axis cases stay scalar (strided, no
-      contiguous span). Backward is the reverse-cumulative-sum mirror with the
-      same depth-contiguous structure. Guard by axis; numerical-gradient + parity
-      tested, no behaviour change on X/Y.
-- [ ] `TNNetFiniteScalarQuant` (FSQ — Mentzer et al. 2023, "Finite Scalar
-      Quantization: VQ-VAE Made Simple"; lucidrains `vector-quantize-pytorch`
-      port). Codebook-FREE quantizer: bound each of d channels with
-      `f(z)=⌊L/2⌋·tanh(z)`, round to the nearest of L_i integer levels with a
-      straight-through estimator, implicit codebook size = ∏ L_i. A distinct,
-      non-duplicate alternative to the existing `TNNetVectorQuantizer` (no learned
-      codebook, no EMA, no commitment loss, structurally collapse-free) — directly
-      addresses the failure mode the `examples/VQCodebookCollapse` example
-      demonstrates. Per-channel `Levels: array of integer` arg; forward = bounded
-      round, backward = STE passthrough; expose the integer code indices for a
-      downstream embedding/transformer. Numerical-gradient test on the STE region
-      + an example (FSQ-VAE on MNIST showing 100% codebook utilization).
-- [ ] `TNNetLookupFreeQuant` (LFQ — Yu et al. 2023, MagViT-v2 "Language Model
-      Beats Diffusion: Tokenizer is Key to Visual Generation"). Binary
-      sign-quantizer: code = sign(z) per channel (implicit codebook = {-1,+1}^d,
-      index = bit-packed sign pattern), STE backward, plus the LFQ entropy
-      objective (per-batch entropy maximization − code-usage entropy
-      minimization) exposed as a public penalty so a `TNNetLoss`-style head can
-      add it. Genuinely different math from FSQ (binary vs multi-level levels) and
-      from `TNNetVectorQuantizer` (no codebook lookup at all). Numerical-gradient
-      test + a usage example; pairs with the FSQ task as the two modern
-      tokenizer-quantizer options the repo currently lacks.
+- [X] OpenCL correctness + offload for the SDPA attention VARIANTS — Part 1
+      (safety guard) LANDED for all four variants: `EnableOpenCL` now arms
+      `FShouldOpenCL` only for the exact base `TNNetScaledDotProductAttention`
+      class, so `TNNetCosineSimilarityAttention` / `TNNetDisentangledAttention` /
+      `TNNetConformerRelPosAttention` / `TNNetALiBiAttention` fall back to their
+      correct CPU `Compute()` instead of the base wrong-score device path. Part 2
+      (correct offload) LANDED for `TNNetALiBiAttention` (`ComputeOpenCL` reuses
+      the two base device matmuls + injects the `Slope*(j-i)` bias in the CPU
+      mask/softmax gap; dispatches on prefill SeqLen >= 32, decode width-1 stays
+      CPU). New `ALiBiAttentionOpenCLParity` test, PoCL max|diff| 3.0e-8, skip-clean
+      with no device. Commit 9957892f.
+  - [ ] FOLLOW-UP: correct device offload for the remaining three variants
+        (cosine-sim Q/K row renorm before the score matmul; disentangled
+        content/position relative-bias; conformer relative-position bias added to
+        logits). These currently fall back to their correct CPU `Compute()` — a
+        PERFORMANCE follow-up, not a correctness gap. Same recipe as ALiBi.
+- [X] AVX-vectorize `TNNetSoftPool.Compute` — LANDED (commit 6e373ae4). Forward
+      passes 2/3 and BOTH backward exp passes batch the per-window
+      `exp(beta*x - winMax)` 8-wide via `AVXExp` over the contiguous depth axis,
+      arg pre-clamped to [-88,88]; scalar triple-nested loops kept as the
+      `{$ELSE}` fallback. `TestSoftPoolReferenceParity` + existing numerical-grad
+      checks green on scalar and -dAVX2.
+- [X] AVX-vectorize `TNNetCumSum` (depth axis) — LANDED (commit ff593de0).
+      caDepth forward/backward use vectorized column `Move` + BW=64 block-prefix
+      with a vectorized whole-block carry broadcast-add and contiguous-span `Add`;
+      X/Y axes unchanged (scalar). Honest assessment: constant-factor win
+      (sequential critical path Depth -> Depth/64), not asymptotic — prefix-sum is
+      inherently sequential. Bit-identical scalar-vs-AVX; new parity + large-depth
+      numerical-grad tests.
+- [X] `TNNetFiniteScalarQuant` (FSQ) — LANDED (commit dfaa9c41). Codebook-free
+      per-channel `tanh`-bounded round quantizer with STE backward, mixed-radix
+      `CodeIndex`, `CodebookSize`; registered in both CreateLayer tables, FStruct
+      serialization round-trips the variable-length Levels. STE-gradient +
+      round-trip tests; `examples/FSQVAE` MNIST reaches 100% per-channel level
+      utilization. Layer row in README.md, example in examples/README.md.
+- [X] `TNNetLookupFreeQuant` (LFQ) — LANDED (commit 8cfaea3b). Binary sign
+      quantizer, bit-packed `CodeIndex`, STE backward clipped to |z|<=1; entropy
+      aux loss exposed as public `PerSampleEntropy`/`CodebookEntropy`/
+      `EntropyAuxLoss` (factorized binary form, layer injects no entropy gradient
+      — read & add like `TNNetLoadBalanceLoss`). STE-grad + round-trip + entropy
+      sanity tests; `examples/LFQVAE`. Layer row in README.md, example in
+      examples/README.md.
