@@ -1469,6 +1469,11 @@ type
     procedure TestBilinearUpsampleBackwardParity;
     procedure TestBicubicUpsampleForwardParity;
     procedure TestBicubicUpsampleInputGradientCheck;
+    // TNNetFakeQuantize (QAT fake-quant; added at the END to avoid disturbing
+    // the shared-RNG ordering of the existing gradient tests).
+    procedure TestFakeQuantizeForwardDequantQuant;
+    procedure TestFakeQuantizeSTEGradientCheck;
+    procedure TestFakeQuantizeObserverAndRoundTrip;
   end;
 
 implementation
@@ -69773,6 +69778,191 @@ begin
     end;
   finally
     Row.Free; A.Free; B.Free; Mat.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFakeQuantizeForwardDequantQuant;
+var
+  NN: TNNet;
+  FQ: TNNetFakeQuantize;
+  Input, Output: TNNetVolume;
+  Scale, V, Code, Expected: TNeuralFloat;
+  QMax, I: integer;
+begin
+  // FORWARD must equal dequant(quant(x)) for a fixed input and a fixed scale.
+  // Build a FROZEN observer with a known running max-abs so the scale is
+  // deterministic: scale = runningMaxAbs / qmax = 4.0 / 127.
+  QMax := 127;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 1, 1);
+  Output := TNNetVolume.Create(8, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(8, 1, 1));
+    // Create(qmax, momentum, runningMaxAbs, frozen=1)
+    FQ := TNNetFakeQuantize.Create(QMax, 0.99, 4.0, 1);
+    NN.AddLayer(FQ);
+
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := 0.013;     // ~ half a code -> rounds to 0
+    Input.Raw[2] := 0.05;      // rounds to 2 codes
+    Input.Raw[3] := 1.234;
+    Input.Raw[4] := -2.5;
+    Input.Raw[5] := 4.0;       // exactly the max -> code = qmax
+    Input.Raw[6] := 9.9;       // beyond range -> clamps to +qmax*scale
+    Input.Raw[7] := -100.0;    // beyond range -> clamps to -qmax*scale
+
+    Scale := 4.0 / QMax;
+    AssertEquals('FakeQuantize scale property', Scale, FQ.Scale, 1e-7);
+
+    NN.Compute(Input);
+    NN.GetOutput(Output);
+
+    for I := 0 to Input.Size - 1 do
+    begin
+      V := Input.Raw[I];
+      Code := Round(V / Scale);
+      if Code > QMax then Code := QMax;
+      if Code < -QMax then Code := -QMax;
+      Expected := Code * Scale;
+      AssertEquals('FakeQuantize forward = dequant(quant(x)) at ' + IntToStr(I),
+        Expected, Output.Raw[I], 1e-6);
+    end;
+
+    // Frozen observer must NOT have changed the running max-abs.
+    AssertEquals('FakeQuantize frozen running max-abs unchanged',
+      4.0, FQ.RunningMaxAbs, 1e-7);
+  finally
+    NN.Free;
+    Input.Free;
+    Output.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFakeQuantizeSTEGradientCheck;
+var
+  NN: TNNet;
+  FQ: TNNetFakeQuantize;
+  Input, Desired: TNNetVolume;
+  ClampHi, V, AnaGrad, UpstreamErr: TNeuralFloat;
+  I: integer;
+begin
+  // Straight-through estimator backward: the input gradient must equal the
+  // upstream (output) error UNCHANGED inside the representable band
+  // [-qmax*scale, qmax*scale] and be ZERO outside it. With a frozen observer at
+  // runningMaxAbs = 4.0 and qmax = 127, the band edge is exactly +/-4.0.
+  //
+  // This mirrors the canonical STE definition: dequant(quant(x)) is treated as
+  // the identity inside the band, so d(out)/d(in) = 1 there and 0 outside. We
+  // compare the analytical input gradient against that piecewise-identity (the
+  // "finite difference" of the surrogate identity is 1 inside / 0 outside).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(7, 1, 1);
+  Desired := TNNetVolume.Create(7, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(7, 1, 1, 1)); // pError=1 sizes error volumes
+    FQ := TNNetFakeQuantize.Create(127, 0.99, 4.0, 1); // frozen, runningMaxAbs=4
+    NN.AddLayer(FQ);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    ClampHi := 4.0; // qmax*scale = 127 * (4/127)
+
+    Input.Raw[0] := 0.0;     // inside
+    Input.Raw[1] := 1.5;     // inside
+    Input.Raw[2] := -2.7;    // inside
+    Input.Raw[3] := 3.9;     // inside (just under edge)
+    Input.Raw[4] := 5.0;     // OUTSIDE (above edge) -> zero grad
+    Input.Raw[5] := -8.0;    // OUTSIDE (below edge) -> zero grad
+    Input.Raw[6] := 2.0;     // inside
+
+    // Use desired such that the last-layer output error is non-trivial and
+    // distinct per element (TNNetIdentity-style head: error = output - desired).
+    for I := 0 to Desired.Size - 1 do
+      Desired.Raw[I] := -1.0 - 0.3 * I;
+
+    NN.Compute(Input);
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+
+    for I := 0 to Input.Size - 1 do
+    begin
+      V := Input.Raw[I];
+      // Upstream error reaching this layer = FQ output error (output - desired).
+      UpstreamErr := NN.GetLastLayer.Output.Raw[I] - Desired.Raw[I];
+      AnaGrad := NN.Layers[0].OutputError.Raw[I];
+      if (V >= -ClampHi) and (V <= ClampHi) then
+        AssertEquals('STE input grad passes through inside band at ' + IntToStr(I),
+          UpstreamErr, AnaGrad, 1e-5)
+      else
+        AssertEquals('STE input grad zeroed outside band at ' + IntToStr(I),
+          0.0, AnaGrad, 1e-7);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFakeQuantizeObserverAndRoundTrip;
+var
+  NN, NN2: TNNet;
+  FQ, FQ2: TNNetFakeQuantize;
+  Input: TNNetVolume;
+  StructStr: string;
+  R1: TNeuralFloat;
+begin
+  // Observer: a training forward pass on a COLD layer must seed the running
+  // max-abs directly to the input's max-abs; a frozen layer must not update.
+  // Then verify the structure (including observer state) round-trips.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1)); // error volumes => training mode
+    FQ := TNNetFakeQuantize.Create(0.9);        // momentum 0.9, cold, active
+    NN.AddLayer(FQ);
+    NN.SetBatchUpdate(true);
+
+    Input.Raw[0] := 1.0;
+    Input.Raw[1] := -3.0;  // max-abs = 3.0
+    Input.Raw[2] := 2.0;
+    Input.Raw[3] := 0.5;
+
+    AssertEquals('cold observer starts at 0', 0.0, FQ.RunningMaxAbs, 1e-7);
+    NN.Compute(Input);
+    // cold-start seeds directly to max|x| = 3.0
+    AssertEquals('observer cold-start seed', 3.0, FQ.RunningMaxAbs, 1e-6);
+
+    // A second forward with a smaller max-abs EMA-blends toward it:
+    // r = 0.9*3.0 + 0.1*1.0 = 2.8
+    Input.Raw[1] := -1.0; // now max-abs = 2.0... set so max-abs = 1.0:
+    Input.Raw[0] := 1.0; Input.Raw[1] := -1.0; Input.Raw[2] := 0.5; Input.Raw[3] := 0.25;
+    NN.Compute(Input);
+    AssertEquals('observer EMA update', 2.8, FQ.RunningMaxAbs, 1e-5);
+    R1 := FQ.RunningMaxAbs;
+
+    // Freeze: further forwards must not change the statistic.
+    FQ.Freeze();
+    NN.Compute(Input);
+    AssertEquals('frozen observer does not update', R1, FQ.RunningMaxAbs, 1e-7);
+
+    // Structure round-trip (qmax, frozen flag, momentum, running max-abs).
+    StructStr := NN.SaveStructureToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadStructureFromString(StructStr);
+      AssertEquals('round-trip structure string', StructStr,
+        NN2.SaveStructureToString());
+      FQ2 := NN2.Layers[NN2.GetLastLayerIdx()] as TNNetFakeQuantize;
+      AssertEquals('round-trip running max-abs', R1, FQ2.RunningMaxAbs, 1e-5);
+      AssertEquals('round-trip scale', FQ.Scale, FQ2.Scale, 1e-7);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 

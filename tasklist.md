@@ -626,21 +626,28 @@ rather than acted on.
       int8 weight-only storage instead of dequantize-then-requantize (the
       k-quant Q4_K/Q6_K/Q5_K/Q2_K dequant-at-load READ path has landed in
       neural/neuralgguf.pas).
-- [ ] Quantization-aware training (QAT) — port torch.ao.quantization's
+- [X] Quantization-aware training (QAT) — port torch.ao.quantization's
       fake-quantize-during-training so accuracy lost to post-training int8 can be
-      recovered (the landed int8 path is post-training, inference-only). Add a
-      `TNNetFakeQuantize` layer that, in the FORWARD pass, simulates int8
-      round-to-nearest + clamp at the current (running min/max or learned) scale
-      so the network sees quantization error while training, and in the BACKWARD
-      pass passes the gradient straight through inside the representable range
-      (reuse the landed `TNNetStraightThroughEstimator` STE clamp; zero gradient
-      outside the clamp). Reuse the existing int8 scale/storage machinery so a
-      QAT-trained net exports cleanly into the landed int8 weight-only format.
-      Scope v1: per-tensor symmetric fake-quant on weights + activations,
-      observer-driven scale; an `examples/QATFineTune` that PTQ-quantizes a small
-      CIFAR net, measures the accuracy drop, then QAT-fine-tunes it back. Pin a
-      numerical test that the STE gradient matches finite differences inside the
-      clamp band and that the fake-quant forward equals dequant(quant(x)).
+      recovered (the landed int8 path is post-training, inference-only). LANDED:
+      `TNNetFakeQuantize` (neural/neuralnetwork.pas) per-tensor SYMMETRIC int8
+      fake-quant of the layer INPUT — FORWARD `x_q = round(clip(x/scale,-127,127))
+      *scale = dequant(quant(x))` with `scale = max|x|/127` (exactly the landed
+      `QuantizeWeightsInt8` weight-path convention, so QAT activation scales line
+      up with the int8 weight-only export format); observer-driven scale via a
+      MovingAverageMinMaxObserver-style running max-abs EMA (first obs seeds
+      directly, frozen at inference / via `Freeze`); BACKWARD straight-through,
+      reusing the `TNNetSoftCapping`/`TNNetStraightThroughEstimator` deriv-mask
+      clamp machinery (grad passes through inside `[-qmax*scale,qmax*scale]`, zero
+      outside). Registered in both CreateLayer dispatch tables; round-trips via
+      Save/Load (FStruct[0]=qmax, FStruct[1]=frozen, FFloatSt[0]=momentum,
+      FFloatSt[1]=running max-abs). Tests (all pass, full suite 2521/0/0):
+      TestFakeQuantizeForwardDequantQuant (forward = dequant(quant(x))),
+      TestFakeQuantizeSTEGradientCheck (STE grad = upstream inside band, 0
+      outside), TestFakeQuantizeObserverAndRoundTrip (EMA + freeze + round-trip),
+      plus registry round-trip builder #376. README layer table updated.
+      FOLLOW-UPS (v1 scope = activations only): weight fake-quant, learned scale,
+      per-channel/asymmetric variants, full int8 export wiring, and an
+      `examples/QATFineTune` PTQ-drop-then-QAT-recover smoke run were deferred.
 - [ ] FP16 (half-precision) OpenCL compute path for the dot-product/matmul
       offload. ENV NOTE (2026-06-27): the only OpenCL device available here is
       PoCL on the host CPU, which does NOT advertise `cl_khr_fp16` (clinfo shows

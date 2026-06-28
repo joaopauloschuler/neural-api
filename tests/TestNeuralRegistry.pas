@@ -527,6 +527,9 @@ begin
     // the 8-channel image input; WindowSize 4 divides the 8x8 map.
     374: begin AddImgInput(ANet); Exit(L('TNNetSAMVisionAttention', TNNetSAMVisionAttention.Create(2, 4, 4, 8))); end;
     375: begin AddImgInput(ANet); Exit(L('TNNetGridAvgPool', TNNetGridAvgPool.Create(3, 1, 1))); end;
+    // QAT fake-quant: non-default qmax/momentum/running-stat/frozen so all four
+    // packed FStruct/FFloatSt slots are exercised by the structure round-trip.
+    376: begin AddImgInput(ANet); Exit(L('TNNetFakeQuantize', TNNetFakeQuantize.Create(63, 0.95, 1.25, 1))); end;
     else
       Result := False;
   end;
