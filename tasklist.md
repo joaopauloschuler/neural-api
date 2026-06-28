@@ -2049,7 +2049,7 @@ wrappers preserved, all parity fixtures bit-identical [dd5373fc].)
       `TNNetDeformableConv.SampleBilinear` method is now unused by the forward but
       kept as documentation (RoIAlign has its own copy).
 
-- [ ] Add a reusable `TNNet.AddPatchEmbedding` builder method (patchify +
+- [X] Add a reusable `TNNet.AddPatchEmbedding` builder method (patchify +
       linear projection to tokens, optional learnable class token and learnable
       positional embedding) for ViT-style stacks. Today every patch-tokenizing
       example (e.g. `MaskedAutoencoder`, `Perceiver`, MLP-Mixer / ViT demos)
@@ -2058,3 +2058,17 @@ wrappers preserved, all parity fixtures bit-identical [dd5373fc].)
       from-scratch ViT examples a few lines. Mirror the existing
       `Add*Block`/`Add*Encoder` builder conventions; convert at least one
       example to use it as the regression check.
+      DONE: `TNNet.AddPatchEmbedding(PatchSize, EmbedDim, AddClassToken=false,
+      AddPositionalEmbedding=true): TNNetLayer` composes
+      `TNNetConvolutionLinear` (kernel=stride=PatchSize) → `TNNetReshape`
+      ((GridX*GridY,1,EmbedDim)) → optional `TNNetSoftPrompt(1,EmbedDim)` [CLS]
+      prepend → optional `TNNetLearnedPositionalEmbedding`. New example
+      `examples/TinyViT` (which-quadrant image classification, [CLS]-token head,
+      converges to 100% in <1 min CPU) is the regression check. Tests:
+      `TestPatchEmbeddingShape`, `TestPatchEmbeddingSerializationRoundTrip` in
+      tests/TestNeuralNumerical.pas. Full suite green (scalar 2502/0/0; AVX2
+      only the known `TestSetTrainableKeepsOutputs` flake).
+      Follow-ups: (a) `MaskedAutoencoder` was NOT converted — it patchifies on
+      the CPU (needs explicit per-patch masking), so the builder doesn't fit its
+      pipeline; convert it only if a non-masked variant is added. (b) Could add
+      a `Channels`/`InputPadding` knob or a sinusoidal-pos-embed option later.

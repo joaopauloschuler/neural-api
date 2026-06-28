@@ -732,6 +732,8 @@ type
     procedure TestPerceiverEncoderShape;
     procedure TestPerceiverEncoderInputGradientCheck;
     procedure TestPerceiverEncoderSerializationRoundTrip;
+    procedure TestPatchEmbeddingShape;
+    procedure TestPatchEmbeddingSerializationRoundTrip;
     procedure TestProductKeyMemoryInputGradientCheck;
     procedure TestProductKeyMemoryWeightGradientCheck;
     procedure TestProductKeyMemoryTopK1GradientCheck;
@@ -41976,6 +41978,127 @@ begin
         if tmp > maxErr then maxErr := tmp;
       end;
       AssertTrue('Perceiver reloaded forward output identical (maxErr=' +
+        FloatToStr(maxErr) + ')', maxErr < 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free; Out1.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPatchEmbeddingShape;
+// AddPatchEmbedding(PatchSize, EmbedDim, AddClassToken, AddPositionalEmbedding)
+// turns a 2D image into a (SeqLen[+1],1,EmbedDim) token sequence:
+//   - a (PatchGrid x PatchGrid) conv (kernel=stride=PatchSize) -> EmbedDim,
+//   - flattened to SeqLen = (W/PatchSize)*(H/PatchSize) tokens,
+//   - the class-token flag prepends ONE extra token (SeqLen+1),
+//   - everything is depth = EmbedDim with SizeY = 1.
+var
+  NN, NNCls: TNNet;
+  Input: TNNetVolume;
+  i, convCnt: integer;
+begin
+  RandSeed := 424242;
+  // 8x8 single-channel image, 2x2 patches -> 4x4 = 16 tokens, EmbedDim=12.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 1));
+    NN.AddPatchEmbedding(2, 12, {AddClassToken=}false,
+      {AddPositionalEmbedding=}true);
+    AssertEquals('PatchEmbedding token count = (W/P)*(H/P)',
+      16, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('PatchEmbedding SizeY = 1', 1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('PatchEmbedding Depth = EmbedDim',
+      12, NN.GetLastLayer.Output.Depth);
+
+    // The patchify conv must be a single kernel=stride=PatchSize convolution.
+    convCnt := 0;
+    for i := 0 to NN.CountLayers - 1 do
+      if NN.Layers[i] is TNNetConvolutionLinear then Inc(convCnt);
+    AssertEquals('PatchEmbedding has exactly one patchify conv', 1, convCnt);
+    // The pos-embed flag must add a learnable positional embedding layer.
+    convCnt := 0;
+    for i := 0 to NN.CountLayers - 1 do
+      if NN.Layers[i] is TNNetLearnedPositionalEmbedding then Inc(convCnt);
+    AssertEquals('PatchEmbedding has a learned positional embedding', 1, convCnt);
+
+    // A forward pass must run and keep the claimed shape.
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.21) * 1.3;
+    NN.Compute(Input);
+    AssertEquals('PatchEmbedding forward keeps token count',
+      16, NN.GetLastLayer.Output.SizeX);
+
+    // With AddClassToken the sequence gains exactly one prepended token.
+    NNCls := TNNet.Create();
+    try
+      RandSeed := 424242;
+      NNCls.AddLayer(TNNetInput.Create(8, 8, 1));
+      NNCls.AddPatchEmbedding(2, 12, {AddClassToken=}true,
+        {AddPositionalEmbedding=}true);
+      AssertEquals('PatchEmbedding class token adds one sequence position',
+        17, NNCls.GetLastLayer.Output.SizeX);
+      AssertEquals('PatchEmbedding class-token Depth still EmbedDim',
+        12, NNCls.GetLastLayer.Output.Depth);
+      // The class token is a learnable prepended virtual token (SoftPrompt).
+      convCnt := 0;
+      for i := 0 to NNCls.CountLayers - 1 do
+        if NNCls.Layers[i] is TNNetSoftPrompt then Inc(convCnt);
+      AssertEquals('PatchEmbedding class token is one SoftPrompt layer',
+        1, convCnt);
+    finally
+      NNCls.Free;
+    end;
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPatchEmbeddingSerializationRoundTrip;
+// A net containing AddPatchEmbedding (with class token + positional embedding)
+// must SaveToString/LoadFromString bit-for-bit and the reloaded net must
+// reproduce the EXACT same forward output on a random image input.
+var
+  NN, NN2: TNNet;
+  Input, Out1: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+  maxErr, tmp: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 1);
+  Out1 := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 1));
+    NN.AddPatchEmbedding(2, 12, {AddClassToken=}true,
+      {AddPositionalEmbedding=}true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.91) * 0.9 - 0.2;
+    NN.Compute(Input);
+    Out1.Copy(NN.GetLastLayer.Output);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertEquals('PatchEmbedding round-trip layer count',
+        NN.CountLayers(), NN2.CountLayers());
+      AssertEquals('PatchEmbedding round-trip output SizeX',
+        NN.GetLastLayer.Output.SizeX, NN2.GetLastLayer.Output.SizeX);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('PatchEmbedding SaveToString round-trip equality',
+        Saved, Saved2);
+
+      NN2.Compute(Input);
+      maxErr := 0;
+      for i := 0 to Out1.Size - 1 do
+      begin
+        tmp := Abs(Out1.Raw[i] - NN2.GetLastLayer.Output.Raw[i]);
+        if tmp > maxErr then maxErr := tmp;
+      end;
+      AssertTrue('PatchEmbedding reloaded forward output identical (maxErr=' +
         FloatToStr(maxErr) + ')', maxErr < 1e-6);
     finally
       NN2.Free;
