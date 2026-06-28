@@ -2022,7 +2022,7 @@ state confirmed via the layer `Compute`/`ComputeOpenCL` methods on 2026-06-28.)
       is forward-only, so a GPU forward leaves `FInvNorms` unpopulated -- a fused
       device backward for the per-depth Jacobian could remove that CPU fallback.
 
-- [ ] OpenCL device offload for `TNNetPixelNorm`. `TNNetPixelNorm` is the
+- [X] OpenCL device offload for `TNNetPixelNorm`. `TNNetPixelNorm` is the
       ProGAN/StyleGAN per-pixel feature-vector normalization (each (x,y) position
       divided by the RMS over its depth channels). Its forward is already AVX
       (per-pixel `DotProduct` + `Mul`) but there is NO `ComputeOpenCL`, so in a
@@ -2034,6 +2034,14 @@ state confirmed via the layer `Compute`/`ComputeOpenCL` methods on 2026-06-28.)
       parity-test vs the AVX CPU path and skip-clean when no device. Ties into the
       existing "keep activations resident across consecutive offloaded layers"
       generator follow-up.
+      DONE: reused the `cai_l2norm_perdepth` kernel + `TNNetL2NormCL` host
+      wrapper landed by the L2Normalize task (commit b01eab21) with InvScale =
+      1/Depth (RMS variant) and Eps = FPixelNormEpsilon, so invN = rsqrt(mean(x^2)
+      + eps) matches the CPU `Compute` bit-for-bit; no new kernel. Wired
+      `TNNetPixelNorm.EnableOpenCL`/`ComputeOpenCL` (forward-only; backward and its
+      FInvRMS/FNormalized cache stay on CPU). Added `PixelNormOpenCLParity`
+      (device-vs-AVX, skip-clean) -- passes on PoCL at max|diff| 2.4e-7. Full
+      suite green (2511 tests, 0 fail).
 
 - [X] Arbitrary-output-SIZE resize layer (`TNNetResize2D`, port of torch
       `F.interpolate(size=(H,W), mode=...)`). The existing `TNNetBilinearUpsample`

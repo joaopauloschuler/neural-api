@@ -389,6 +389,9 @@ type
     // OpenCL per-depth-column L2 reduce + rsqrt scale forward offload parity
     // (vs CPU) for TNNetL2Normalize axis-0 (per-position) mode.
     procedure L2NormalizeOpenCLParity;
+    // OpenCL per-pixel RMS-over-depth forward offload parity (vs CPU) for
+    // TNNetPixelNorm (shares cai_l2norm_perdepth with InvScale = 1/Depth).
+    procedure PixelNormOpenCLParity;
     // OpenCL windowed-reduction forward offload parity (vs CPU) for the pooling
     // layers TNNetMaxPool / TNNetAvgPool.
     procedure MaxPoolOpenCLParity;
@@ -63405,6 +63408,64 @@ begin
     end;
     WriteLn('  L2Normalize OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('L2Normalize OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Device forward parity (vs CPU) for TNNetPixelNorm (ProGAN/StyleGAN per-pixel
+// feature-vector normalization): the shared cai_l2norm_perdepth kernel reduces
+// each (x,y) depth column and scales by rsqrt(mean(x^2) + eps), driven with
+// InvScale = 1/Depth (the RMS variant). Same harness as the L2Normalize test.
+procedure TTestNeuralNumerical.PixelNormOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 5, 13); // 20 positions, depth 13 (wide column)
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 5, 13, 1));
+    NN.AddLayer(TNNetPixelNorm.Create());
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.6 * Sin(i * 0.31) - 0.15;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      MaxDiff := 0;
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    WriteLn('  PixelNorm OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('PixelNorm OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
