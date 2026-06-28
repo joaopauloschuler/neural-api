@@ -7608,6 +7608,65 @@ begin
 
   if MaxD > 0 then
   begin
+    {$IFDEF AVXANY}
+    if not NoForward then
+    begin
+      // Whole-volume fast path (NoForward=false): every (x,y) position owns a
+      // full, contiguous FDepth-length span, so the entire FData buffer is a
+      // back-to-back sequence of equal-length depth spans. Because exp() is a
+      // pure element-wise map, the numerically-stabilized exponentiation can be
+      // dispatched to AVXExp ONCE over the whole volume instead of re-dispatching
+      // per position. Only the max-find / clamp (pass 1) and the sum+normalize
+      // (pass 2) reductions reset at each Depth boundary, preserving the exact
+      // per-position max-subtraction stabilization. This avoids FSizeX*FSizeY
+      // AVXExp/AVXGetSum dispatches per call.
+      // Pass 1: per-span max, then in-place clamp of (x - max) over the span.
+      for CountX := 0 to MaxX do
+      begin
+        for CountY := 0 to MaxY do
+        begin
+          StartPointPos := GetRawPos(CountX, CountY);
+          I := StartPointPos;
+          MaxValue := FData[I];
+          for CountD := 1 to MaxD do
+          begin
+            Inc(I);
+            if FData[I] > MaxValue then MaxValue := FData[I];
+          end;
+          I := StartPointPos;
+          for CountD := 0 to MaxD do
+          begin
+            FData[I] := NeuronForceRange(FData[I] - MaxValue, 4000);
+            Inc(I);
+          end;
+        end;
+      end;
+      // Single whole-volume exponentiation (parity with the scalar pcr_expf loop
+      // within ~1e-6 relative error). Spatial spans are contiguous so the entire
+      // FSizeX*FSizeY*FDepth range is one AVXExp call.
+      AVXExp(TNeuralFloatArrPtr(@FData[0]),
+             TNeuralFloatArrPtr(@FData[0]), FSizeX * FSizeY * FDepth);
+      // Pass 2: per-span sum + normalize.
+      for CountX := 0 to MaxX do
+      begin
+        for CountY := 0 to MaxY do
+        begin
+          StartPointPos := GetRawPos(CountX, CountY);
+          TotalSum := AVXGetSum(TNeuralFloatArrPtr(@FData[StartPointPos]), MaxD + 1);
+          if TotalSum > 0 then
+          begin
+            I := StartPointPos;
+            for CountD := 0 to MaxD do
+            begin
+              FData[I] := FData[I] / TotalSum;
+              Inc(I);
+            end;
+          end;
+        end;
+      end;
+      Exit;
+    end;
+    {$ENDIF}
     for CountX := 0 to MaxX do
     begin
       if NoForward then MaxD := Min(FDepth - 1, CountX);
