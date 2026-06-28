@@ -2088,3 +2088,80 @@ wrappers preserved, all parity fixtures bit-identical [dd5373fc].)
       the CPU (needs explicit per-patch masking), so the builder doesn't fit its
       pipeline; convert it only if a non-masked variant is added. (b) Could add
       a `Channels`/`InputPadding` knob or a sinusoidal-pos-embed option later.
+
+## Lucky-day batch 2026-06-28j (verified-novel accelerator / generative / torch port)
+
+(Each item below was checked against `neural/*.pas` and `examples/` before
+listing — none is a near-duplicate of existing source. Forward-path AVX/OpenCL
+state confirmed via the layer `Compute`/`ComputeOpenCL` methods on 2026-06-28.)
+
+- [ ] OpenCL device offload for `TNNetL2Normalize`. The layer currently has NO
+      `ComputeOpenCL` path (CPU only), and its per-CHANNEL mode forward is a
+      scalar element loop (the per-DEPTH and full-volume modes already use the
+      AVX `DotProduct`/`Mul` depth-contiguous ops). Two concrete wins: (a) AVX-
+      vectorize the per-channel mode (gather each channel's stride-`Depth` column
+      is awkward, so transpose-free: accumulate the per-channel sum-of-squares
+      with a strided AVX reduction, then scale) and (b) add a `ComputeOpenCL`
+      that does the per-depth-column L2 reduce + reciprocal-sqrt scale on the
+      device (template: the `TNNetGroupNorm.ComputeOpenCL` / `cai_token_norm`
+      per-token reduction kernel). This layer sits on the hot path of every
+      embedding / ArcFace / contrastive head (`ArcFaceEmbedding`,
+      `TripletEmbedding`, `InfoNCEContrastive`, `EuclideanNormHead`), so keeping
+      it device-resident removes a per-call round-trip. Forward-and-backward
+      parity-test vs the scalar path; skip-clean when no device.
+
+- [ ] OpenCL device offload for `TNNetPixelNorm`. `TNNetPixelNorm` is the
+      ProGAN/StyleGAN per-pixel feature-vector normalization (each (x,y) position
+      divided by the RMS over its depth channels). Its forward is already AVX
+      (per-pixel `DotProduct` + `Mul`) but there is NO `ComputeOpenCL`, so in a
+      GPU-resident generator stack it forces a download/normalize/upload bounce
+      between two device-resident convs. Add a `ComputeOpenCL` that reduces each
+      depth column's sum-of-squares and scales in place on the device (same
+      per-position reduction shape as the `cai_token_norm` kernel, just without
+      the mean-subtraction). Forward-only is enough for inference (generation);
+      parity-test vs the AVX CPU path and skip-clean when no device. Ties into the
+      existing "keep activations resident across consecutive offloaded layers"
+      generator follow-up.
+
+- [ ] Top-level SD3 / FLUX (MMDiT) text-to-image importer + runnable example.
+      `BuildMMDiTBlockFromSafeTensors` already imports ONE MMDiT joint
+      attention block, but there is no `BuildSD3FromSafeTensors` /
+      `BuildFluxFromSafeTensors` that (a) reads the diffusers `transformer/`
+      config, (b) builds the patch-embed + timestep/pooled-text conditioning
+      (AdaLN-Zero modulation) + the stack of N joint blocks + final
+      AdaLN/unpatchify head, and (c) wires the dual text encoders (CLIP-L +
+      T5/​CLIP-G — CLIP and T5 importers already exist) and the VAE decoder
+      (`BuildVaeDecoderFromSafeTensors` exists). Then add an `examples/SD3Generate`
+      (or `FluxGenerate`) that runs a few flow-matching / Euler steps end-to-end
+      to a PNG, mirroring `examples/LatentTextToImage` (PixArt) structure. This is
+      the missing "full modern diffusion pipeline" — every sub-piece exists; the
+      task is the importer wiring + one example. Scope first: diff the SD3-medium
+      vs FLUX.1 transformer key layouts (FLUX adds the single-stream blocks) and
+      decide whether one importer with a flag covers both or they need siblings.
+
+- [ ] Pixtral vision-language importer (`BuildPixtralFromSafeTensors`). Llava /
+      PaliGemma / Qwen2-VL importers exist, but Pixtral's vision tower is
+      genuinely different from the fixed-grid CLIP/SigLIP towers those reuse: it
+      applies **2-D RoPE** to the patch tokens and supports **arbitrary input
+      resolution** (variable patch-grid per image, no learned positional table).
+      Port that vision encoder (2-D rotary position embedding over the (row, col)
+      patch grid; the existing 1-D `TNNetRoPE` and the 2-D-RoPE math from the
+      Qwen2-VL path are the templates), reuse the existing Mistral text importer
+      for the decoder, and wire the `[IMG]`/`[IMG_BREAK]`/`[IMG_END]` multimodal
+      projector connector. Add a pico fixture (slice a real Pixtral checkpoint
+      per the `make_pico_*_fixture.py` recipe) for parity. Verified absent.
+
+- [ ] Arbitrary-output-SIZE resize layer (`TNNetResize2D`, port of torch
+      `F.interpolate(size=(H,W), mode=...)`). The existing `TNNetBilinearUpsample`
+      / `TNNetBicubicUpsample` only support an INTEGER scale factor; there is no
+      layer that resamples a feature map to an arbitrary target `(SizeX, SizeY)`
+      (including DOWN-sampling and non-integer ratios). Add one reusable layer
+      that takes target `(OutX, OutY)` + `mode` (nearest / bilinear / bicubic) +
+      `align_corners` (and an optional `antialias` box-prefilter for downscale,
+      matching torch's `antialias=True`), reusing the separable cubic/linear
+      kernels and the shared depth-column gather helper
+      (`NeuralBilinearGatherColumn`) the up-samplers already use — so the
+      integer-factor up-samplers can be re-expressed as the special case (dedup),
+      not a fork. Numerical-gradient test the input path for each mode. This is
+      needed wherever a model expects a fixed input resolution (ViT/SigLIP/DINOv2
+      towers, super-res pre/post resize) and for general vision preprocessing.
