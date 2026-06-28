@@ -1927,7 +1927,7 @@ not z = mu + sigma·eps sampling.)
       Mirror the existing `TNNetTokenRMSNorm` OpenCL pattern: arm `FShouldOpenCL`
       in `EnableOpenCL`, gate dispatch on `FOutput.Size >= NeuralConvOpenCLMinWork`,
       forward-only (training stays on CPU), with a `<1e-4` parity test per variant.
-- [ ] AVX vectorization of the same GLU-family forward (`TNNetSwiGLU` / `TNNetGLU`
+- [X] AVX vectorization of the same GLU-family forward (`TNNetSwiGLU` / `TNNetGLU`
       / `TNNetGEGLU` / `TNNetGEGLUErf`). The two gated halves A and B are each
       depth-axis-contiguous (the AVX-friendly layout per the depth-contiguous
       rule), so the `A * sigmoid(B)` / `A * swish(B)` elementwise pass can reuse

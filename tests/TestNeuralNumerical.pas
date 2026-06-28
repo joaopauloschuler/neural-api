@@ -839,6 +839,7 @@ type
     procedure TestGptOssGatedSwiGLULoadFromString;
     procedure TestGLUForward;
     procedure TestGLUGradientCheck;
+    procedure TestGLUFamilyForwardParity;
     procedure TestTanhGLUForward;
     procedure TestTanhGLUGradientCheck;
     procedure TestTanhGLUSerializationRoundTrip;
@@ -9954,6 +9955,80 @@ end;
 procedure TTestNeuralNumerical.TestGLUGradientCheck;
 begin
   LayerInputGradientCheck(Self, TNNetGLU.Create(), 'GLU', 2, 2, 4, 0.01);
+end;
+
+// Pins the AVX-vectorized GLU-family forward (GLU/SwiGLU/GEGLU/GEGLUErf) against
+// the scalar analytic formula over a multi-row (SizeX=2,SizeY=2), HalfDepth=4
+// input -- so the depth-contiguous vector primitives (VectorSigmoid/VectorTanh/
+// VectorErf + AVX Mul) are exercised across several (X,Y) rows and a full SIMD
+// width. The expected values use the reference scalar form; the 1e-4 tolerance
+// holds on both scalar and -dAVX2 builds.
+procedure TTestNeuralNumerical.TestGLUFamilyForwardParity;
+const
+  INV_SQRT_2 = 0.70710678118654752;
+  SQRT_2_OVER_PI = 0.7978845608;
+  GELU_CONST = 0.044715;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, D, HalfDepth, SizeX, SizeY, FullDepth: integer;
+  a, b, sig, arg, expGLU, expSwiGLU, expGEGLU, expGEGLUErf: TNeuralFloat;
+  glu, swiglu, geglu, geglurf: TNNetLayer;
+
+  function Erf(x: TNeuralFloat): TNeuralFloat;
+  const
+    a1 =  0.254829592; a2 = -0.284496736; a3 =  1.421413741;
+    a4 = -1.453152027; a5 =  1.061405429; p  =  0.3275911;
+  var ax, t, poly: TNeuralFloat;
+  begin
+    if x < 0 then ax := -x else ax := x;
+    t := 1 / (1 + p * ax);
+    poly := ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t;
+    Result := 1 - poly * Exp(-ax * ax);
+    if x < 0 then Result := -Result;
+  end;
+
+begin
+  SizeX := 2; SizeY := 2; HalfDepth := 4; FullDepth := HalfDepth * 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, FullDepth);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, FullDepth, 1));
+    glu     := NN.AddLayerAfter(TNNetGLU.Create(),      0);
+    swiglu  := NN.AddLayerAfter(TNNetSwiGLU.Create(),   0);
+    geglu   := NN.AddLayerAfter(TNNetGEGLU.Create(),    0);
+    geglurf := NN.AddLayerAfter(TNNetGEGLUErf.Create(), 0);
+
+    // Deterministic spread of A and B values across rows and depths.
+    for X := 0 to SizeX - 1 do
+      for Y := 0 to SizeY - 1 do
+        for D := 0 to FullDepth - 1 do
+          Input[X, Y, D] := Sin(0.7 * (X * 13 + Y * 5 + D)) * 2.5;
+
+    NN.Compute(Input);
+
+    for X := 0 to SizeX - 1 do
+      for Y := 0 to SizeY - 1 do
+        for D := 0 to HalfDepth - 1 do
+        begin
+          a := Input[X, Y, D];
+          b := Input[X, Y, D + HalfDepth];
+          sig := 1 / (1 + Exp(-b));
+          expGLU := a * sig;
+          expSwiGLU := a * (b * sig);
+          arg := SQRT_2_OVER_PI * (b + GELU_CONST * b * b * b);
+          expGEGLU := a * (b * (0.5 * (1 + Tanh(arg))));
+          expGEGLUErf := a * (b * (0.5 * (1 + Erf(b * INV_SQRT_2))));
+
+          AssertEquals('GLU parity', expGLU, glu.Output[X, Y, D], 0.0001);
+          AssertEquals('SwiGLU parity', expSwiGLU, swiglu.Output[X, Y, D], 0.0001);
+          AssertEquals('GEGLU parity', expGEGLU, geglu.Output[X, Y, D], 0.0001);
+          AssertEquals('GEGLUErf parity', expGEGLUErf, geglurf.Output[X, Y, D], 0.0001);
+        end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestTanhGLUForward;
