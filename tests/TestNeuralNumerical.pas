@@ -315,6 +315,9 @@ type
     // OpenCL two-GEMM forward offload parity (vs CPU) for the non-causal global
     // TNNetLinearAttention.
     procedure LinearAttentionOpenCLParity;
+    // OpenCL dense symmetric Gram-GEMM forward offload parity (vs CPU/AVX) for
+    // TNNetGramMatrix (the neural style transfer per-style-image hotspot).
+    procedure GramMatrixOpenCLParity;
     // OpenCL two-GEMM forward offload parity (vs CPU/AVX) for the RECTANGULAR
     // TNNetCrossAttention (Q from one source, packed K|V from a second source).
     procedure CrossAttentionOpenCLParity;
@@ -60306,6 +60309,75 @@ begin
     end;
     WriteLn('  LinearAttention OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('LinearAttention OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetGramMatrix computes the C x C symmetric Gram matrix G[i,j] =
+// (sum_k row_i[k]*row_j[k]) / (C*HW) over the HW spatial samples. ComputeOpenCL
+// maps the dense GEMM onto the single cai_dot_product kernel (one row-pair dot
+// product per work item) and runs the 1/(C*HW) scale + symmetric mirror on the
+// CPU, mirroring the CPU/AVX Compute() exactly. PoCL CPU-backed -> typically
+// ~1e-6; tight 1e-4 gate.
+procedure TTestNeuralNumerical.GramMatrixOpenCLParity;
+{$IFDEF OpenCL}
+const
+  C  = 24; // channels; >= csGramOpenCLMinC (16) so the device path fires
+  SX = 7;  // spatial width
+  SY = 5;  // spatial height (HW = 35)
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Gram: TNNetGramMatrix;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SX, SY, C);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SX, SY, C, 1));
+    Gram := TNNetGramMatrix.Create();
+    NN.AddLayer(Gram);
+    // Bounded activations so the Gram entries stay O(1) and the 1e-4 absolute
+    // gate is meaningful.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.5 * Sin(i * 0.3) + 0.2 * Cos(i * 0.11);
+
+    // CPU forward (OpenCL OFF).
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    // Device forward (offload ARMED).
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    MaxDiff := 0;
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  GramMatrix OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('GramMatrix OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free;
