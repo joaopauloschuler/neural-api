@@ -26,6 +26,8 @@ type
     procedure TestVolumeFlip;
     procedure TestVolumeClassification;
     procedure TestVolumeSoftMax;
+    procedure TestVolumeSoftMaxParity;
+    procedure TestVolumePointwiseSoftMaxParity;
     procedure TestVolumePadding;
     procedure TestVolumeTranspose;
     // Additional volume tests
@@ -370,6 +372,102 @@ begin
     AssertTrue('V[3] should be greater than V[0]', V.Raw[3] > V.Raw[0]);
     AssertTrue('V[3] should be greater than V[1]', V.Raw[3] > V.Raw[1]);
     AssertTrue('V[3] should be greater than V[2]', V.Raw[3] > V.Raw[2]);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeSoftMaxParity;
+// Verifies the (possibly AVX) TVolume.SoftMax against an independent scalar
+// stable-softmax reference, element by element, within 1e-4.
+var
+  V: TNNetVolume;
+  Ref: array of TNeuralFloat;
+  N, I: integer;
+  MaxV, MinV, S: TNeuralFloat;
+begin
+  N := 37; // not a multiple of 8 to exercise the AVXExp remainder tail
+  V := TNNetVolume.Create(N, 1, 1);
+  SetLength(Ref, N);
+  try
+    RandSeed := 424242;
+    for I := 0 to N - 1 do
+    begin
+      V.Raw[I] := (Random - 0.5) * 20.0;
+      Ref[I] := V.Raw[I];
+    end;
+
+    // Independent scalar reference mirroring TVolume.SoftMax semantics.
+    MaxV := Ref[0];
+    for I := 1 to N - 1 do if Ref[I] > MaxV then MaxV := Ref[I];
+    if MaxV <> 0 then for I := 0 to N - 1 do Ref[I] := Ref[I] - MaxV;
+    MinV := Ref[0];
+    for I := 1 to N - 1 do if Ref[I] < MinV then MinV := Ref[I];
+    if MinV <> 0 then
+    begin
+      if MinV < -1000 then
+        for I := 0 to N - 1 do Ref[I] := Ref[I] * (-1000 / MinV);
+      S := 0;
+      for I := 0 to N - 1 do
+      begin
+        Ref[I] := Exp(NeuronForceRange(Ref[I], 4000));
+        S := S + Ref[I];
+      end;
+      if S > 0 then for I := 0 to N - 1 do Ref[I] := Ref[I] / S;
+    end;
+
+    V.SoftMax();
+
+    for I := 0 to N - 1 do
+      AssertEquals('SoftMax parity at ' + IntToStr(I), Ref[I], V.Raw[I], 1e-4);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumePointwiseSoftMaxParity;
+// Verifies TVolume.PointwiseSoftMax (per-(x,y) over the depth axis) against an
+// independent scalar stable-softmax reference, within 1e-4.
+var
+  V: TNNetVolume;
+  SX, SY, D, X, Y, K, Base: integer;
+  Ref: array of TNeuralFloat;
+  MaxV, S: TNeuralFloat;
+begin
+  SX := 3; SY := 2; D := 13; // depth not a multiple of 8 -> AVXExp tail
+  V := TNNetVolume.Create(SX, SY, D);
+  SetLength(Ref, SX * SY * D);
+  try
+    RandSeed := 99;
+    for K := 0 to SX * SY * D - 1 do
+    begin
+      V.Raw[K] := (Random - 0.5) * 16.0;
+      Ref[K] := V.Raw[K];
+    end;
+
+    // Independent per-(x,y) scalar reference over the contiguous depth span.
+    for X := 0 to SX - 1 do
+      for Y := 0 to SY - 1 do
+      begin
+        Base := V.GetRawPos(X, Y, 0);
+        MaxV := Ref[Base];
+        for K := 1 to D - 1 do
+          if Ref[Base + K] > MaxV then MaxV := Ref[Base + K];
+        S := 0;
+        for K := 0 to D - 1 do
+        begin
+          Ref[Base + K] := Exp(NeuronForceRange(Ref[Base + K] - MaxV, 4000));
+          S := S + Ref[Base + K];
+        end;
+        if S > 0 then
+          for K := 0 to D - 1 do Ref[Base + K] := Ref[Base + K] / S;
+      end;
+
+    V.PointwiseSoftMax();
+
+    for K := 0 to SX * SY * D - 1 do
+      AssertEquals('PointwiseSoftMax parity at ' + IntToStr(K),
+        Ref[K], V.Raw[K], 1e-4);
   finally
     V.Free;
   end;

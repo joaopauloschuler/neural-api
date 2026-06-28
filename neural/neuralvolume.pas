@@ -1200,6 +1200,10 @@ type
   // it (a generic template cannot reference an implementation-private symbol).
   // Implemented in the AVX32 / AVX64 asm blocks. Buffers may alias.
   procedure AVXExp(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer);
+  // AVXGetSum returns the sum of pSrc[0..N-1] via an 8-wide AVX2 reduction
+  // (scalar tail for the N mod 4 remainder). Declared at interface scope so the
+  // generic TVolume.SoftMax / PointwiseSoftMax may reduce the exp pass with it.
+  function AVXGetSum(PtrA: TNeuralFloatArrPtr; NumElements: integer): Single;
   {$ENDIF}
 
 implementation
@@ -7425,6 +7429,18 @@ begin
     if MinValue < -1000 then Mul( -1000/MinValue );
     vHigh := High(FData);
 
+    {$IFDEF AVXANY}
+    // FData has already been shifted by Sub(MaxValue), so every element is <= 0
+    // (and floored to [-1000,0] above), well inside AVXExp's safe range. Clamp
+    // in place for bit-parity with the scalar NeuronForceRange path, then
+    // exponentiate the whole flat buffer 8-wide and sum it with the AVX
+    // reduction (parity with the scalar Exp/accumulate loop within ~1e-6).
+    for I := 0 to vHigh do
+      FData[I] := NeuronForceRange(FData[I], 4000);
+    AVXExp(TNeuralFloatArrPtr(@FData[0]),
+           TNeuralFloatArrPtr(@FData[0]), vHigh + 1);
+    TotalSum := AVXGetSum(TNeuralFloatArrPtr(@FData[0]), vHigh + 1);
+    {$ELSE}
     for I := 0 to vHigh do
     begin
       // FData has already been shifted by Sub(MaxValue) above, so do not
@@ -7434,6 +7450,7 @@ begin
       FData[I] := LocalValue;
       TotalSum := TotalSum + FData[I];
     end;
+    {$ENDIF}
 
     if TotalSum > 0 then
     begin
@@ -7498,12 +7515,7 @@ begin
         end;
         AVXExp(TNeuralFloatArrPtr(@FData[StartPointPos]),
                TNeuralFloatArrPtr(@FData[StartPointPos]), MaxD + 1);
-        I := StartPointPos;
-        for CountD := 0 to MaxD do
-        begin
-          TotalSum := TotalSum + FData[I];
-          Inc(I);
-        end;
+        TotalSum := AVXGetSum(TNeuralFloatArrPtr(@FData[StartPointPos]), MaxD + 1);
         {$ELSE}
         for CountD := 0 to MaxD do
         begin
