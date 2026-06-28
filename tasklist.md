@@ -2002,7 +2002,7 @@ file "replace Vits hand-made with TNNet layers".)
       `{$IFNDEF AVXANY}` fallback. Pin parity with the existing ReLU
       numerical-gradient / dead-ReLU tests.
 
-- [ ] AVX-vectorize the remaining `exp`-based activation forwards via the existing
+- [X] AVX-vectorize the remaining `exp`-based activation forwards via the existing
       `AVXExp` vector exponential (the same kernel the GLU-family / `PointwiseSoftMax`
       / just-landed `TNNetELU`/`TNNetSELU` passes use). Confirmed still scalar
       (`pcr_expf` per element): `TNNetSoftPlus` (~36797, `ln(1+exp(x))` with the
