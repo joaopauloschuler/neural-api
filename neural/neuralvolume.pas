@@ -1148,6 +1148,16 @@ type
   function NeuralBoxIoU(AX1, AY1, AX2, AY2,
     BX1, BY1, BX2, BY2: TNeuralFloat): TNeuralFloat;
 
+  { NeuralBoxGIoU returns the Generalized Intersection-over-Union (Rezatofighi
+    et al. 2019) of two axis-aligned boxes in corner (x1,y1,x2,y2) format.
+    GIoU = IoU - (area(C) - union) / area(C), where C is the smallest enclosing
+    box of A and B. It lies in (-1,1], equals IoU when the boxes overlap, and
+    stays a useful signal (negative) even when the boxes are disjoint, which is
+    why DETR-style set-prediction matching/loss uses it instead of plain IoU.
+    Degenerate boxes are clamped to zero area; a zero enclosing area yields 0. }
+  function NeuralBoxGIoU(AX1, AY1, AX2, AY2,
+    BX1, BY1, BX2, BY2: TNeuralFloat): TNeuralFloat;
+
   { NeuralGreedyNMS runs greedy, score-sorted, class-aware Non-Max-Suppression
     over Count boxes. Boxes are passed as four parallel flat arrays in corner
     (x1,y1,x2,y2) format; Scores[i] is box i's confidence; Classes[i] is its
@@ -2049,6 +2059,35 @@ begin
   Inter := IW * IH;
   UnionA := Area1 + Area2 - Inter;
   if UnionA > 0 then Result := Inter / UnionA else Result := 0;
+end;
+
+function NeuralBoxGIoU(AX1, AY1, AX2, AY2,
+  BX1, BY1, BX2, BY2: TNeuralFloat): TNeuralFloat;
+var
+  IX1, IY1, IX2, IY2, IW, IH, Inter, Area1, Area2, UnionA: TNeuralFloat;
+  CX1, CY1, CX2, CY2, AreaC, IoU: TNeuralFloat;
+begin
+  Area1 := Max(0, AX2 - AX1) * Max(0, AY2 - AY1);
+  Area2 := Max(0, BX2 - BX1) * Max(0, BY2 - BY1);
+  IX1 := Max(AX1, BX1);
+  IY1 := Max(AY1, BY1);
+  IX2 := Min(AX2, BX2);
+  IY2 := Min(AY2, BY2);
+  IW := Max(0, IX2 - IX1);
+  IH := Max(0, IY2 - IY1);
+  Inter := IW * IH;
+  UnionA := Area1 + Area2 - Inter;
+  if UnionA > 0 then IoU := Inter / UnionA else IoU := 0;
+  // Smallest axis-aligned box C enclosing both A and B.
+  CX1 := Min(AX1, BX1);
+  CY1 := Min(AY1, BY1);
+  CX2 := Max(AX2, BX2);
+  CY2 := Max(AY2, BY2);
+  AreaC := Max(0, CX2 - CX1) * Max(0, CY2 - CY1);
+  if AreaC > 0 then
+    Result := IoU - (AreaC - UnionA) / AreaC
+  else
+    Result := 0;
 end;
 
 function NeuralGreedyNMS(

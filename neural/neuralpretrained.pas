@@ -11734,8 +11734,10 @@ function DetrConfigToString(const Config: TDetrConfig): string;
 // FIXED set of NumQueries object queries, a (NumQueries, 1, NumLabels + 1 + 4)
 // volume: channels 0..NumLabels = the per-query class logits (the last is the
 // "no object" slot), channels NumLabels+1 .. NumLabels+4 = the sigmoid-
-// normalized cxcywh bounding box. INFERENCE only (no Hungarian matcher, which is
-// training-only): softmax each query's class logits, drop the no-object slot,
+// normalized cxcywh bounding box. For TRAINING / fine-tuning, attach a
+// TNNetDETRSetPredictionLoss(NumLabels) head (bipartite matcher + SetCriterion;
+// see neuralnetwork.pas). For INFERENCE read-out: softmax each query's class
+// logits, drop the no-object slot,
 // threshold, and read off the box with DecodeDetrDetections. Reuses the ResNet
 // backbone (conv + folded FrozenBatchNorm) and the transformer enc-dec
 // primitives; the genuinely new wiring is the learned object queries, the 2-D

@@ -805,6 +805,8 @@ type
     procedure TestMixtureDensitySampleAndLoadFromString;
     procedure TestEvidentialRegressionGradient;
     procedure TestEvidentialRegressionLoadFromString;
+    procedure TestDETRSetPredictionLossGradient;
+    procedure TestDETRSetPredictionLossLoadFromString;
     procedure TestEvidentialClassificationGradient;
     procedure TestEvidentialClassificationLoadFromString;
     procedure TestLabelSmoothingLossForwardPassthrough;
@@ -46540,6 +46542,136 @@ begin
     NN.Free;
     NN2.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDETRSetPredictionLossGradient;
+const
+  cNumLabels = 3;
+  cN = 4;                      // object queries
+  cDepth = cNumLabels + 1 + 4; // 8 = class logits (incl no-object) + cxcywh
+var
+  NN: TNNet;
+  Input, InputPlus, Target: TNNetVolume;
+  LMid: TNNetIdentity;
+  DETR: TNNetDETRSetPredictionLoss;
+  AnaGrad, NumGrad, OldP, LossP, LossM, Eps: TNeuralFloat;
+  i, BoxBase: integer;
+
+  // Scalar set-prediction loss as a function of the RAW input (the previous
+  // layer is identity, so the layer input == NN input). Delegates to the
+  // layer's own public loss so the FD probe and the analytic backward share the
+  // exact same matching + loss definition.
+  function DetrLoss(ARaw: TNNetVolume): TNeuralFloat;
+  begin
+    NN.Compute(ARaw);
+    Result := DETR.DETRSetPredictionLoss(NN.GetLastLayer.Output, Target);
+  end;
+
+begin
+  // Shared RNG is ordering-sensitive across this file: reseed deterministically.
+  RandSeed := 424242;
+  BoxBase := cNumLabels + 1;
+  Eps := 1e-4;
+
+  NN := TNNet.Create();
+  // pError=1 resizes the error volumes so the input-gradient probe is valid.
+  Input := TNNetVolume.Create(cN, 1, cDepth);
+  InputPlus := TNNetVolume.Create(cN, 1, cDepth);
+  Target := TNNetVolume.Create(cN, 1, cDepth);
+  try
+    NN.AddLayer(TNNetInput.Create(cN, 1, cDepth, 1));
+    LMid := TNNetIdentity.Create();
+    NN.AddLayer(LMid);
+    DETR := TNNetDETRSetPredictionLoss.Create(cNumLabels); // 1/5/2/0.1 defaults
+    NN.AddLayer(DETR);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Distinct, moderate class logits per query and well-separated boxes that
+    // do NOT sit exactly on a ground-truth coordinate (keeps the L1 sign and
+    // the greedy assignment stable across the +/- Eps finite-difference probe).
+    // Query 0
+    Input[0,0,0]:= 0.9; Input[0,0,1]:=-0.3; Input[0,0,2]:= 0.2; Input[0,0,3]:=-0.8;
+    Input[0,0,BoxBase+0]:=0.30; Input[0,0,BoxBase+1]:=0.32; Input[0,0,BoxBase+2]:=0.22; Input[0,0,BoxBase+3]:=0.18;
+    // Query 1
+    Input[1,0,0]:=-0.4; Input[1,0,1]:= 1.1; Input[1,0,2]:= 0.0; Input[1,0,3]:=-0.5;
+    Input[1,0,BoxBase+0]:=0.70; Input[1,0,BoxBase+1]:=0.66; Input[1,0,BoxBase+2]:=0.24; Input[1,0,BoxBase+3]:=0.20;
+    // Query 2
+    Input[2,0,0]:= 0.1; Input[2,0,1]:= 0.3; Input[2,0,2]:= 0.7; Input[2,0,3]:= 0.4;
+    Input[2,0,BoxBase+0]:=0.50; Input[2,0,BoxBase+1]:=0.48; Input[2,0,BoxBase+2]:=0.16; Input[2,0,BoxBase+3]:=0.14;
+    // Query 3
+    Input[3,0,0]:=-0.2; Input[3,0,1]:=-0.6; Input[3,0,2]:= 0.5; Input[3,0,3]:= 0.9;
+    Input[3,0,BoxBase+0]:=0.20; Input[3,0,BoxBase+1]:=0.78; Input[3,0,BoxBase+2]:=0.12; Input[3,0,BoxBase+3]:=0.10;
+
+    // Ground truth: M=2 objects packed into rows 0..1; rows 2..3 are padding
+    // (class id -1). Channel 0 = class id; box channels = cxcywh.
+    Target.Fill(0);
+    Target[0,0,0]:=0; // class 0
+    Target[0,0,BoxBase+0]:=0.33; Target[0,0,BoxBase+1]:=0.35; Target[0,0,BoxBase+2]:=0.25; Target[0,0,BoxBase+3]:=0.21;
+    Target[1,0,0]:=2; // class 2
+    Target[1,0,BoxBase+0]:=0.72; Target[1,0,BoxBase+1]:=0.64; Target[1,0,BoxBase+2]:=0.26; Target[1,0,BoxBase+3]:=0.22;
+    Target[2,0,0]:=-1; // padding
+    Target[3,0,0]:=-1; // padding
+
+    // Analytic input gradient via one backward pass.
+    NN.Compute(Input);
+    LMid.OutputError.Fill(0);
+    NN.Backpropagate(Target);
+
+    // Central finite-difference check at every input position. The box channels
+    // exercise the L1 + GIoU box gradient; the class channels exercise the
+    // softmax-CE gradient (matched -> gt class, unmatched -> no-object).
+    for i := 0 to Input.Size - 1 do
+    begin
+      AnaGrad := LMid.OutputError.Raw[i];
+      InputPlus.Copy(Input);
+      OldP := Input.Raw[i];
+      InputPlus.Raw[i] := OldP + Eps;
+      LossP := DetrLoss(InputPlus);
+      InputPlus.Raw[i] := OldP - Eps;
+      LossM := DetrLoss(InputPlus);
+      NumGrad := (LossP - LossM) / (2 * Eps);
+      AssertTrue('DETR set-prediction input grad at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(NumGrad) + ' ana=' + FloatToStr(AnaGrad) + ')',
+        Abs(NumGrad - AnaGrad) < 1e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDETRSetPredictionLossLoadFromString;
+var
+  NN, NN2: TNNet;
+  DETR: TNNetDETRSetPredictionLoss;
+  Saved: string;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 8, 1));
+    NN.AddLayer(TNNetIdentity.Create());
+    // Non-default cost weights to prove all four FFloatSt slots round-trip.
+    NN.AddLayer(TNNetDETRSetPredictionLoss.Create(3, 1.5, 4.0, 3.0, 0.2));
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetDETRSetPredictionLoss',
+      NN2.GetLastLayer is TNNetDETRSetPredictionLoss);
+    DETR := NN2.GetLastLayer as TNNetDETRSetPredictionLoss;
+    AssertEquals('Loaded NumLabels', 3, DETR.NumLabels());
+    AssertEquals('Loaded class_cost', 1.5, DETR.ClassCost(), 1e-6);
+    AssertEquals('Loaded bbox_cost', 4.0, DETR.BBoxCost(), 1e-6);
+    AssertEquals('Loaded giou_cost', 3.0, DETR.GIoUCost(), 1e-6);
+    AssertEquals('Loaded eos_coef', 0.2, DETR.EosCoef(), 1e-6);
+  finally
+    NN.Free;
+    NN2.Free;
   end;
 end;
 
