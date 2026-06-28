@@ -573,6 +573,69 @@ __kernel void cai_bilinear_gather
   FDst[g_id] = acc;
 }
 
+// CAI Pixel Shuffle (depth-to-space gather forward)
+// Coded by Claude (AI).
+// Device forward for TNNetPixelShuffle: a pure depth->space gather with NO
+// arithmetic (each output element is a verbatim copy of one source element).
+// The caller precomputes, per output element, the source LINEAR offset into the
+// raw source feature map [(y*W + x)*Depth + d] (stored as float, exact for any
+// realistic element count) and uploads it; this kernel only performs the copy.
+//   FSrcIdx : source linear element offset per output element, [g_id].
+//   FSrc    : source feature map, raw.
+//   FDst    : output feature map, raw, [g_id].
+// One work-item per OUTPUT element: global size = FNumOut (dim 0).
+__kernel void cai_pixel_shuffle
+(
+  const int FNumOut,
+  __global const float* FSrcIdx,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FNumOut) return;
+  FDst[g_id] = FSrc[(int)FSrcIdx[g_id]];
+}
+
+// CAI Bicubic Gather (separable 4x4 weighted gather forward)
+// Coded by Claude (AI).
+// Device forward for TNNetBicubicUpsample, the 16-corner sibling of
+// cai_bilinear_gather. The caller precomputes, per output pixel, the 16 source
+// linear pixel offsets (the 4x4 clamped neighbourhood) and the 16 separable
+// cubic weights (wy[r]*wx[c]) ON THE CPU (byte-identical to the scalar forward)
+// and uploads them; this kernel only does the memory-bound blend of the 16
+// Depth-long source columns into the output column.
+//   FCorners : 16 source linear pixel offsets per output pixel (stored as float,
+//              exact), [outpix*16 + corner], each = (y*W + x) (all in-bounds:
+//              bicubic clamps replicate the edge, so there is no masking).
+//   FWeights : 16 blend weights per output pixel, [outpix*16 + corner].
+//   FSrc     : source feature map, raw [(y*W + x)*Depth + d].
+//   FDst     : output feature map, raw [outpix*Depth + d].
+// One work-item per (outpix, d): global size = FNumOut * FDepth (dim 0).
+__kernel void cai_bicubic_gather
+(
+  const int FNumOut,
+  const int FDepth,
+  __global const float* FCorners,
+  __global const float* FWeights,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FNumOut * FDepth) return;
+  const int outpix = g_id / FDepth;
+  const int d      = g_id - outpix * FDepth;
+  const int cbase  = outpix * 16;
+  float acc = 0.0f;
+  for (int c = 0; c < 16; c++)
+  {
+    const int corner = (int)FCorners[cbase + c];
+    acc = mad(FWeights[cbase + c], FSrc[corner * FDepth + d], acc);
+  }
+  FDst[g_id] = acc;
+}
+
 // CAI Per-Token Norm (RMSNorm / LayerNorm forward)
 // Coded by Claude (AI).
 // Device forward for the per-TOKEN depth-axis normalization layers
