@@ -861,3 +861,39 @@ __kernel void cai_embedding_gather
   else
     FY[gid] = FW[row * FEmbeddingSize + e];
 }
+
+// Rotary positional embedding (RoPE) forward. The input is FSeqLen tokens of
+// FDepth depth-contiguous channels [t*FDepth + c]; FDepth is even and the
+// rotation operates on the interleaved channel-pairs (2k, 2k+1). FTheta holds
+// the FHalfDepth (= FDepth/2) precomputed per-pair effective frequencies (with
+// any NTK/YaRN/Llama3/PI/LongRoPE scaling ALREADY folded in on the host, so the
+// device only does the plain rotation). The rotation angle for pair k of token t
+// is (t + FPositionOffset) * FTheta[k]; FOutScale is the YaRN/LongRoPE output
+// multiplier (1.0 on the default path). One work-item per (token, channel-pair).
+// Bit-faithful to the scalar CPU Compute() so parity is < 1e-4.
+__kernel void cai_rope
+(
+  const int FSeqLen,
+  const int FDepth,
+  const int FHalfDepth,
+  const int FPositionOffset,
+  const float FOutScale,
+  __global const float* FTheta,
+  __global const float* FX,
+  __global float* FY
+)
+{
+  const int gid = get_global_id(0);
+  const int total = FSeqLen * FHalfDepth;
+  if (gid >= total) return;
+  const int k = gid % FHalfDepth;
+  const int pos = gid / FHalfDepth;
+  const float angle = (float)(pos + FPositionOffset) * FTheta[k];
+  const float s = sin(angle);
+  const float c = cos(angle);
+  const int base = pos * FDepth + 2 * k;
+  const float x0 = FX[base];
+  const float x1 = FX[base + 1];
+  FY[base]     = FOutScale * (c * x0 - s * x1);
+  FY[base + 1] = FOutScale * (s * x0 + c * x1);
+}
