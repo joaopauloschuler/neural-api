@@ -220,6 +220,18 @@ type
     // Per-timestep noise level sigma_t = sqrt((1-ab_t)/ab_t) (Karras VE form).
     property SigmaAt[Tt: integer]: TNeuralFloat read SigmaOf;
 
+    // Min-SNR-gamma per-timestep LOSS weight (Hang et al. 2023, "Efficient
+    // Diffusion Training via Min-SNR Weighting Strategy"; diffusers snr_gamma).
+    // SNR(t) = exp(2*Lambda(t)) = ab_t/(1-ab_t). The clamp min(SNR, Gamma)
+    // down-weights the easy low-noise (high-SNR) timesteps. The denominator
+    // depends on the scheduler's PredictionType (the model's target):
+    //   eps-prediction : weight = min(SNR, Gamma) / SNR,
+    //   v-prediction   : weight = min(SNR, Gamma) / (SNR + 1).
+    // Gamma = 5.0 is the paper default; Gamma = +Inf reproduces the unweighted
+    // objective (weight = 1 for eps, SNR/(SNR+1) for v -- the standard v-loss
+    // reweighting, which is exactly diffusers' base case).
+    function SNRWeight(Tt: integer; Gamma: TNeuralFloat = 5.0): TNeuralFloat;
+
     // High-level driver: run a complete reverse trajectory in place on X
     // (which should start as N(0,I) noise) over NumSteps evenly-strided
     // timesteps using the supplied Denoise callback. Leaves the sampled x0 in X.
@@ -395,6 +407,25 @@ begin
   ab := FAlphaBar[Tt];
   if ab >= 1.0 then Result := 0
   else Result := Sqrt((1.0 - ab) / ab);
+end;
+
+function TNNetDiffusionScheduler.SNRWeight(Tt: integer;
+  Gamma: TNeuralFloat): TNeuralFloat;
+var
+  snr, clamped: double;
+begin
+  // SNR(t) = exp(2*Lambda(t)) (Lambda is the half-log-SNR the DPM-Solver uses).
+  snr := Exp(2.0 * Lambda(Tt));
+  // min(SNR, Gamma); Gamma = +Inf leaves the clamp inactive (clamped = snr).
+  if snr < Gamma then clamped := snr else clamped := Gamma;
+  case FPrediction of
+    dpV:
+      // v-prediction: divide by (SNR + 1). Gamma = +Inf -> SNR/(SNR+1).
+      Result := clamped / (snr + 1.0);
+    else // dpEps
+      // eps-prediction: divide by SNR. Gamma = +Inf -> 1.
+      Result := clamped / snr;
+  end;
 end;
 
 function TNNetDiffusionScheduler.SigmaToTimestep(TargetSigma: TNeuralFloat): integer;

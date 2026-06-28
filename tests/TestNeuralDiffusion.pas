@@ -58,6 +58,7 @@ type
     procedure TestDPMSolverVsOracle;
     procedure TestUniPCVsOracle;
     procedure TestHeunVsOracle;
+    procedure TestMinSNRWeight;
     procedure TestDDPMRunsNoNaN;
     procedure TestEulerAncestralZeroEtaMatchesDDIM;
     procedure TestKarrasSpacingSigmaMonotone;
@@ -105,6 +106,17 @@ const
     (-0.9874468254279581, -0.7405851190709684, -0.49372341271397907,
      -0.24686170635698954, 0.0, 0.24686170635698954,
       0.49372341271397907, 0.7405851190709684);
+  // Min-SNR-gamma loss-weight probes (tools/min_snr_oracle.py). SNR(t)=ab/(1-ab).
+  cSNRProbeT: array[0..5] of integer = (1, 25, 50, 100, 150, 200);
+  cSNREpsGamma5: array[0..5] of double =
+    (0.000500050005000445, 0.16531233763786016, 0.6811466136251436,
+     1.0, 1.0, 1.0);
+  cSNRVGamma5: array[0..5] of double =
+    (0.0004999999999999449, 0.16002162776613316, 0.5994798761147474,
+     0.6024803053077055, 0.32038735949336433, 0.13218275425061793);
+  cSNRVGammaInf: array[0..5] of double =
+    (0.9999, 0.9679956744467734, 0.8801040247770505,
+     0.6024803053077055, 0.32038735949336433, 0.13218275425061793);
 
 procedure TTestNeuralDiffusion.ToyModel(Xt, Output: TNNetVolume; Tt: integer);
 var i: integer; s: TNeuralFloat;
@@ -426,6 +438,39 @@ begin
     end;
   finally
     Sched.Free; X.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestMinSNRWeight;
+var
+  SchedE, SchedV: TNNetDiffusionScheduler;
+  i, t: integer;
+const
+  cBigGamma = 1.0e30;   // stands in for +Inf (clamp never binds).
+begin
+  // Min-SNR-gamma loss weighting (Hang et al. 2023). eps-prediction weight is
+  // min(SNR,gamma)/SNR; v-prediction is min(SNR,gamma)/(SNR+1). Pin BOTH
+  // prediction types against the float64 numpy oracle for gamma=5.0, and verify
+  // the gamma=+inf limits: eps -> 1 (unweighted), v -> SNR/(SNR+1).
+  SchedE := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  SchedV := TNNetDiffusionScheduler.Create(cT, dsLinear, dpV, cBeta1, cBetaT);
+  try
+    for i := 0 to High(cSNRProbeT) do
+    begin
+      t := cSNRProbeT[i];
+      AssertEquals('eps gamma=5 @ ' + IntToStr(t),
+        cSNREpsGamma5[i], SchedE.SNRWeight(t, 5.0), 1e-5);
+      AssertEquals('v gamma=5 @ ' + IntToStr(t),
+        cSNRVGamma5[i], SchedV.SNRWeight(t, 5.0), 1e-5);
+      // gamma = +inf: eps weight collapses to the unweighted objective (1.0).
+      AssertEquals('eps gamma=inf -> 1 @ ' + IntToStr(t),
+        1.0, SchedE.SNRWeight(t, cBigGamma), 1e-5);
+      // gamma = +inf: v weight collapses to SNR/(SNR+1) = ab_t.
+      AssertEquals('v gamma=inf -> SNR/(SNR+1) @ ' + IntToStr(t),
+        cSNRVGammaInf[i], SchedV.SNRWeight(t, cBigGamma), 1e-5);
+    end;
+  finally
+    SchedE.Free; SchedV.Free;
   end;
 end;
 
