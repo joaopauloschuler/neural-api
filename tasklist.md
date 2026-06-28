@@ -1979,3 +1979,57 @@ remainder tail has NO internal clamp so extreme inputs must be pre-clamped to
       could reuse `AVXExp` over the exp pass (pre-clamp args per the 27f finding
       above) + a vector max/sum reduction. Pin `<1e-4` parity with the existing
       softmax numerical tests.
+
+## Lucky-day batch 2026-06-28
+
+(Vision/generative, OpenCL, AVX and dedup ideas verified against the source as
+NOT already implemented. Each reuses landed infrastructure where possible.)
+
+- [ ] ConvNeXt / ConvNeXt-V2 image-classification importer
+      (`BuildConvNextFromSafeTensors[Ex]`, model_type `convnext` / `convnextv2`,
+      e.g. `facebook/convnext-tiny-224`, `facebook/convnextv2-tiny-22k-224`). All
+      the building blocks already exist as reusable layers — depthwise 7x7 conv,
+      `TNNetLayerNorm` (channels-last per-token), the inverted 4x pointwise MLP,
+      `TNNetChannelMul` LayerScale (gamma), `TNNetStochasticDepth`, and for V2 the
+      `TNNetGRN` Global Response Normalization — so this is a reuse-only wiring +
+      tensor-name mapping job, no new layer. Stem = patchify conv4/stride4 +
+      LayerNorm; 4 stages with `[3,3,9,3]`-style block counts and downsample
+      (LayerNorm + conv2/stride2) between stages; head = global avg pool ->
+      LayerNorm -> Linear. Reuse the `make_pico_*_fixture.py` slicer for a tiny
+      committed parity fixture (HF std-0.02 init is vacuous — re-randomize to
+      O(1) scale like the ModernBERT fixtures). Closes the last mainstream
+      modern-CNN backbone gap (ViT / Swin / SwinV2 / MobileNetV3 / RegNet / ResNet
+      / EfficientNet are all already imported).
+
+- [ ] OpenCL forward offload for `TNNetPixelShuffle` and `TNNetBicubicUpsample`
+      — the sibling `TNNetBilinearUpsample` already offloads via `ComputeOpenCL`
+      (commit path at `TNNetBilinearUpsample.ComputeOpenCL`/`EnableOpenCL`), but
+      these two stay on the host. Both are hot in super-resolution and generative
+      decoders (SwinIR / NAFNet / Real-ESRGAN / SD VAE upsample). PixelShuffle is a
+      pure depth->space gather (a `cai_pixel_shuffle` index kernel, no arithmetic);
+      Bicubic reuses the precomputed corner-index + weight tables the host path
+      already builds (`BicubicResizeMap`) so the kernel is a fixed 4x4 weighted
+      gather analogous to `cai_bilinear_gather`. Forward-only, parity-tested
+      (`<1e-4` vs host), skip-clean when no device.
+
+- [ ] AVX-vectorize `TNNetAvgPool` backward spatial accumulation. The forward is
+      fine, but `TNNetAvgPool.Backpropagate` distributes the upstream gradient with
+      two scalar nested `for CntX/CntY` loops around a per-cell `TNNetVolume.Add`
+      (the `Add` itself is AVX, but the outer scatter is scalar and re-dispatches
+      per cell). For the common non-overlapping stride=size case each output cell
+      maps to a disjoint contiguous depth-block, so the whole backward is a single
+      broadcast-scaled vector accumulate over contiguous spans — restructure to one
+      AVX pass. Pin `<1e-6` parity with the existing pooling numerical-gradient
+      tests; keep the general overlapped-window path as the scalar fallback.
+
+- [ ] Replace the hand-coded reservoir loop in `examples/EchoStateNetwork` with a
+      reusable `TNNetEchoStateReservoir` layer (leaky-integrator Echo State Network
+      / Reservoir Computing core, Jaeger 2001). The example currently hand-rolls
+      `h_t = (1-a)*h_{t-1} + a*tanh(W_in*x_t + W*h_{t-1})` with nested loops over a
+      frozen random `W`/`W_in`; promote that to a recurrent layer that owns the two
+      non-trainable matrices (random-init, never gradient-updated), the leak rate
+      `a`, and a one-shot spectral-radius rescale at build time via the landed
+      power-iteration helper `TNNet.EstimateSpectralRadius`. This makes reservoirs
+      composable inside larger nets (only a trainable linear read-out downstream)
+      and removes the per-example hand-math. Numerical-gradient test only needs the
+      read-out path (reservoir weights are frozen).
