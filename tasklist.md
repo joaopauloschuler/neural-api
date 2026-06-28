@@ -1998,86 +1998,26 @@ gather), forward bit-identical / backward parity-tested [ab92389f]; reusable
 `TNNet.AddPatchEmbedding` ViT patchify builder (conv-stride-patch -> reshape ->
 optional CLS + positional embedding) + `examples/TinyViT` regression [91024a9e].)
 
-## Lucky-day batch 2026-06-28j (verified-novel accelerator / generative / torch port) — ALL THREE LANDED (open follow-ups inline)
+## Lucky-day batch 2026-06-28j (verified-novel accelerator / generative / torch port) — ALL THREE LANDED
 
-(Each item below was checked against `neural/*.pas` and `examples/` before
-listing — none is a near-duplicate of existing source. Forward-path AVX/OpenCL
-state confirmed via the layer `Compute`/`ComputeOpenCL` methods on 2026-06-28.)
+(All three 28j items LANDED and removed: AVX per-channel + OpenCL per-depth
+forward for `TNNetL2Normalize` (`cai_l2norm_perdepth` kernel + `TNNetL2NormCL`,
+commit b01eab21); OpenCL per-pixel RMS forward for `TNNetPixelNorm` reusing that
+kernel with InvScale=1/Depth + Eps (commit d50725e5); `TNNetResize2D` unified
+arbitrary-size resize — nearest/bilinear/bicubic + align_corners, size-based
+source maps for down/non-integer ratios, exact-transpose backward, FStruct[0..3]
+round-trip (commit e37d07bb). Open follow-ups surfaced by the Resize2D landing:)
 
-- [X] OpenCL device offload for `TNNetL2Normalize`. (a) The per-CHANNEL mode
-      forward is now AVX: transpose-free strided sum-of-squares via the
-      depth-contiguous `TVolume.MulAdd` 3-pointer form (`ss[d] += x[d]*x[d]`)
-      then an element-wise `Mul` by the cached reciprocal norm -- no stride-Depth
-      column gather. (b) Added `cai_l2norm_perdepth` (one work-item per (x,y)
-      position, L2-reduce + rsqrt scale, no mean/gain), the `TNNetL2NormCL`
-      wrapper, and `TNNetL2Normalize.EnableOpenCL`/`ComputeOpenCL` for the axis-0
-      per-position mode (forward-only; backward/per-channel/full-volume stay CPU).
-      Parity tests `TestL2NormalizePerChannelAVXParity` (scalar-vs-AVX, wide
-      Depth=19) and `L2NormalizeOpenCLParity` (device-vs-CPU, skip-clean) both
-      pass on PoCL (max|diff| 0 and 6e-8). The `InvScale` kernel arg leaves the
-      same kernel ready to drive the PixelNorm offload below (RMS InvScale=1/D).
-      Hot path of every embedding / ArcFace / contrastive head
-      (`ArcFaceEmbedding`, `TripletEmbedding`, `InfoNCEContrastive`,
-      `EuclideanNormHead`). Follow-up (deliberately deferred): the device path
-      is forward-only, so a GPU forward leaves `FInvNorms` unpopulated -- a fused
-      device backward for the per-depth Jacobian could remove that CPU fallback.
-
-- [X] OpenCL device offload for `TNNetPixelNorm`. `TNNetPixelNorm` is the
-      ProGAN/StyleGAN per-pixel feature-vector normalization (each (x,y) position
-      divided by the RMS over its depth channels). Its forward is already AVX
-      (per-pixel `DotProduct` + `Mul`) but there is NO `ComputeOpenCL`, so in a
-      GPU-resident generator stack it forces a download/normalize/upload bounce
-      between two device-resident convs. Add a `ComputeOpenCL` that reduces each
-      depth column's sum-of-squares and scales in place on the device (same
-      per-position reduction shape as the `cai_token_norm` kernel, just without
-      the mean-subtraction). Forward-only is enough for inference (generation);
-      parity-test vs the AVX CPU path and skip-clean when no device. Ties into the
-      existing "keep activations resident across consecutive offloaded layers"
-      generator follow-up.
-      DONE: reused the `cai_l2norm_perdepth` kernel + `TNNetL2NormCL` host
-      wrapper landed by the L2Normalize task (commit b01eab21) with InvScale =
-      1/Depth (RMS variant) and Eps = FPixelNormEpsilon, so invN = rsqrt(mean(x^2)
-      + eps) matches the CPU `Compute` bit-for-bit; no new kernel. Wired
-      `TNNetPixelNorm.EnableOpenCL`/`ComputeOpenCL` (forward-only; backward and its
-      FInvRMS/FNormalized cache stay on CPU). Added `PixelNormOpenCLParity`
-      (device-vs-AVX, skip-clean) -- passes on PoCL at max|diff| 2.4e-7. Full
-      suite green (2511 tests, 0 fail).
-
-- [X] Arbitrary-output-SIZE resize layer (`TNNetResize2D`, port of torch
-      `F.interpolate(size=(H,W), mode=...)`). The existing `TNNetBilinearUpsample`
-      / `TNNetBicubicUpsample` only support an INTEGER scale factor; there is no
-      layer that resamples a feature map to an arbitrary target `(SizeX, SizeY)`
-      (including DOWN-sampling and non-integer ratios). Add one reusable layer
-      that takes target `(OutX, OutY)` + `mode` (nearest / bilinear / bicubic) +
-      `align_corners` (and an optional `antialias` box-prefilter for downscale,
-      matching torch's `antialias=True`), reusing the separable cubic/linear
-      kernels and the shared depth-column gather helper
-      (`NeuralBilinearGatherColumn`) the up-samplers already use — so the
-      integer-factor up-samplers can be re-expressed as the special case (dedup),
-      not a fork. Numerical-gradient test the input path for each mode. This is
-      needed wherever a model expects a fixed input resolution (ViT/SigLIP/DINOv2
-      towers, super-res pre/post resize) and for general vision preprocessing.
-      DONE: `TNNetResize2D` (neuralnetwork.pas) with 3 modes (0=nearest,
-      1=bilinear, 2=bicubic) + align_corners; size-based source maps so down-
-      sampling/non-integer ratios work; forward reuses the Move/MulAdd Depth-
-      column idiom and the shared `CubicWeights`/`BilinearResizeMap` kernels;
-      backward is the exact transpose scatter for every mode. Registered in both
-      LoadDataFromString branches; FStruct[0..3] round-trip (serialization test).
-      Numerical input-gradient tests for all 3 modes (up + down, both
-      align_corners). Tolerance is 1e-2 to match the sibling Bilinear/Bicubic
-      gradient tests (float32 FD on order-0.5 values cannot reach 1e-4 even though
-      the layer is exactly linear; analytic vs FD agree to ~2e-4).
-      Follow-ups discovered:
-  - [ ] `antialias=True` box-prefilter for downscale was SCOPED OUT of v1 (it
-        changes the kernel support to scale-dependent, breaking the fixed 2-tap /
-        4-tap separable gather; torch's antialias widens the kernel and
-        renormalises). Add it as an opt-in 5th flag (FStruct[4]) when needed.
-  - [ ] DID NOT dedup the integer-factor up-samplers onto `TNNetResize2D` — the
-        risk note said not to force it. `TNNetBilinearUpsample`/`Upsample` keep
-        their OpenCL gather/scatter paths; `TNNetResize2D` is CPU-only for now.
-        Add an OpenCL forward (reuse `TNNetBilinearGatherCL`/`TNNetBicubicGatherCL`
-        exactly as `TNNetBilinearResize`/`TNNetBicubicUpsample` do) if profiling
-        shows it on a hot path.
+- [ ] `TNNetResize2D` `antialias=True` box-prefilter for downscale was SCOPED OUT
+      of v1 (it changes the kernel support to scale-dependent, breaking the fixed
+      2-tap / 4-tap separable gather; torch's antialias widens the kernel and
+      renormalises). Add it as an opt-in 5th flag (FStruct[4]) when needed.
+- [ ] DID NOT dedup the integer-factor up-samplers onto `TNNetResize2D` — the
+      risk note said not to force it. `TNNetBilinearUpsample`/`Upsample` keep
+      their OpenCL gather/scatter paths; `TNNetResize2D` is CPU-only for now.
+      Add an OpenCL forward (reuse `TNNetBilinearGatherCL`/`TNNetBicubicGatherCL`
+      exactly as `TNNetBilinearResize`/`TNNetBicubicUpsample` do) if profiling
+      shows it on a hot path.
 
 ## Lucky-day batch 2026-06-28k (verified-novel AVX / dedup / OpenCL — generative vision)
 
