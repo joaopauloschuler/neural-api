@@ -43,6 +43,7 @@ type
     procedure TestSoftPoolGradientCheckBetaSweep;
     procedure TestSoftPoolBetaLimits;
     procedure TestSoftPoolAvgLimit;
+    procedure TestSoftPoolReferenceParity;
     procedure TestSoftPoolLoadFromString;
     procedure TestSoftPoolLoadFromStringBeta;
     procedure TestStochasticPoolInferenceExpectation;
@@ -7808,6 +7809,81 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftPoolReferenceParity;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Ref: TNNetVolume;
+  CntX, CntY, CntD, OutX, OutY: integer;
+  PoolSize, OutSX, OutSY, Depth: integer;
+  Beta, WinMax, ExpSum, BetaX, ExpVal, XVal, Acc: TNeuralFloat;
+const
+  cBeta = 1.7;
+begin
+  // Scalar-vs-AVX parity: the SoftPool forward is exp-vectorized via AVXExp under
+  // -dAVX2 but stays scalar otherwise. Both builds must reproduce the same
+  // independently-computed reference output (the softmax-weighted window average
+  // with the max-subtraction stability trick). The clamp the AVX path applies to
+  // the exp argument lives in (-inf,0] here (winMax = max beta*x), so it never
+  // bites and the two paths agree to float tolerance.
+  // Shared RNG ordering: reseed so this test is order-independent.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 3);
+  Ref := TNNetVolume.Create(2, 2, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 3));
+    NN.AddLayer(TNNetSoftPool.Create(2, 0, 0, cBeta));
+    for CntX := 0 to Input.Size - 1 do
+      Input.Raw[CntX] := Sin(CntX * 0.37) * 3.0 - Cos(CntX * 0.11) * 1.5;
+    NN.Compute(Input);
+
+    // Independent scalar reference (2x2 non-overlapping windows).
+    PoolSize := 2;
+    OutSX := 2; OutSY := 2; Depth := 3;
+    Beta := cBeta;
+    for OutX := 0 to OutSX - 1 do
+      for OutY := 0 to OutSY - 1 do
+        for CntD := 0 to Depth - 1 do
+        begin
+          WinMax := -3.4e38;
+          for CntX := 0 to PoolSize - 1 do
+            for CntY := 0 to PoolSize - 1 do
+            begin
+              BetaX := Beta * Input[OutX * PoolSize + CntX, OutY * PoolSize + CntY, CntD];
+              if BetaX > WinMax then WinMax := BetaX;
+            end;
+          ExpSum := 0;
+          for CntX := 0 to PoolSize - 1 do
+            for CntY := 0 to PoolSize - 1 do
+              ExpSum := ExpSum +
+                Exp(Beta * Input[OutX * PoolSize + CntX, OutY * PoolSize + CntY, CntD] - WinMax);
+          Acc := 0;
+          if ExpSum > 0 then
+            for CntX := 0 to PoolSize - 1 do
+              for CntY := 0 to PoolSize - 1 do
+              begin
+                XVal := Input[OutX * PoolSize + CntX, OutY * PoolSize + CntY, CntD];
+                ExpVal := Exp(Beta * XVal - WinMax) / ExpSum;
+                Acc := Acc + ExpVal * XVal;
+              end;
+          Ref[OutX, OutY, CntD] := Acc;
+        end;
+
+    for OutX := 0 to OutSX - 1 do
+      for OutY := 0 to OutSY - 1 do
+        for CntD := 0 to Depth - 1 do
+          AssertEquals('SoftPool reference parity at ' +
+            IntToStr(OutX) + ',' + IntToStr(OutY) + ',' + IntToStr(CntD),
+            Ref[OutX, OutY, CntD],
+            NN.GetLastLayer.Output[OutX, OutY, CntD], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+    Ref.Free;
   end;
 end;
 
