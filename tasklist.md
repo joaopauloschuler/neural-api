@@ -1914,21 +1914,6 @@ then — only int8 + MXFP4-dequant did.)
       `bitsandbytes` is NOT importable under `venv x` — CPU torch, no CUDA bnb
       build) via `TestNF4DequantFixtureParity` + `TestNF4DequantHandBlock`.
       OPEN FOLLOW-UPS:
-  - [X] Wire detection into `BuildLlamaFromSafeTensors` family — LANDED. The
-        central Llama-family linear loader `LoadLlamaLinearWeights` now detects a
-        bnb-4bit pair via `IsNF4QuantizedTensor` (a `<name>.weight` U8 packed
-        tensor + a `<name>.weight.absmax` FP32 sibling) and, when present, skips
-        the dense `[out,in]` shape check and expands the packed nibbles to a flat
-        F32 `[out,in]` buffer via `LoadNF4QuantizedTensorFlat` (calls
-        `neuralnf4.DequantizeNF4`, BlockSize=64) before the dtype-agnostic
-        permutation/copy — every Build* wrapper that routes its q/k/v/o/MLP/lm_head
-        weights through `LoadLlamaLinearWeights` (Llama/Mistral/Qwen2/3/Gemma/
-        Phi-3/OLMo2/GLM4/...) inherits the path. Both helpers are exported in the
-        interface. Parity: `tools/make_pico_nf4_fixture.py` now also emits a tiny
-        bnb-4bit `.safetensors` (`tests/fixtures/pico_nf4_linear.safetensors`,
-        packed U8 weight + FP32 absmax) + the numpy reference dequant
-        (`pico_nf4_linear.json`); `TestNF4ImporterLinearParity` drives the
-        importer NF4 branch through `TNNetSafeTensorsReader` and asserts <1e-5.
   - [ ] Double-quantized absmax: handle `*.nested_absmax` / `*.nested_quant_map`
         / `*.quant_state.*` (the secondary int8 quant + nested absmax + offset).
         DEFERRED. `LoadNF4QuantizedTensorFlat` now RAISES a clear
@@ -2002,92 +1987,16 @@ wrappers preserved, pico fixtures bit-identical [6083a4d0]; GPT-2/Llama/Cohere/
 Bark affine norm-weight loaders unified into `LoadAffineNormWeights`, four thin
 wrappers preserved, all parity fixtures bit-identical [dd5373fc].)
 
-## Lucky-day batch 2026-06-28i (verified-novel vision dedup / AVX / torch port)
+## Lucky-day batch 2026-06-28i (verified-novel vision dedup / AVX / torch port) — ALL LANDED
 
-- [X] Add a reusable `TNNetGridSample` layer (port of torch `F.grid_sample`):
-      two-source layer that warps a feature map by an explicit per-pixel sampling
-      grid (second input supplies normalized (x, y) flow in [-1, 1] over the
-      output positions), with `bilinear` and `nearest` interpolation modes,
-      `zeros`/`border` padding modes and an `align_corners` flag. The bilinear
-      forward already exists TWICE in scalar/partly-AVX form — in
-      `TNNetAffineGridSample.Compute` (depth-contiguous `MulAdd` blend, AVX) and
-      in `TNNetDeformableConv.SampleBilinear` (scalar per-channel) — so factor a
-      single shared depth-column bilinear-gather helper and have all three sites
-      use it. `TNNetAffineGridSample` then becomes the affine special case that
-      generates its grid from a 2x3 theta and delegates to the shared gather.
-      Numerical-gradient test the grid (flow) input path; OpenCL is optional
-      (the existing `TNNetAffineGridSample` gather kernel is the template).
-      DONE 2026-06-28: `TNNetGridSample` lands (neuralnetwork.pas), matching torch
-      bilinear/nearest x zeros/border x align_corners True/False (nearest uses
-      round-half-to-even; align_corners unnormalize/grad exact). Shared helper
-      `NeuralBilinearGatherColumn(Src, OutPtr, sx, sy, W, H, D, BorderPad)`
-      (zeros vs border padding) factored out; `TNNetAffineGridSample.Compute`
-      now delegates to it. Registered in all 3 dispatch sites
-      (FStruct[0..2] = interp/pad/align + injected grid layer idx, round-trips).
-      Optional bilinear OpenCL gather added (reuses TNNetBilinearGatherCL). Tests
-      in tests/TestNeuralNumerical.pas: TestGridSampleFeatureGradientCheck,
-      TestGridSampleGridGradientCheck, TestGridSampleBorderGridGradientCheck,
-      TestGridSampleNearestForward, TestGridSampleLoadFromString (all green;
-      max grad err ~1e-3). Suite 2498 scalar / 2498 AVX2 (the one AVX2 failure,
-      TestSetTrainableKeepsOutputs, is a pre-existing fp flake on clean tree).
-      FOLLOW-UP: only `TNNetAffineGridSample` was migrated to the shared helper;
-      `TNNetDeformableConv.SampleBilinear` is per-channel (per-tap offsets) and is
-      handled by the SEPARATE "AVX-vectorize the DeformableConv bilinear gather"
-      item below (which can now route through `NeuralBilinearGatherColumn`).
-
-- [X] AVX-vectorize the `TNNetDeformableConv` bilinear gather. The offsets are
-      per-tap (shared across all Depth channels of a given sampled position), so
-      the four corner taps can be blended as Depth-long contiguous `MulAdd`
-      accumulations exactly like `TNNetAffineGridSample.Compute` already does,
-      instead of the current scalar per-channel `PrevOut.Get(x, y, ci)` loop in
-      `SampleBilinear`. Route through the shared depth-column gather helper from
-      the `TNNetGridSample` item above (or stand alone if that lands later).
-      Forward-and-backward parity-test against the current scalar path on a small
-      net; the GEMM stage already offloads, this removes the remaining CPU-scalar
-      gather bottleneck. Pairs with the existing DCNv2 modulated mask path.
-      DONE 2026-06-28: both forward CPU paths now route the per-tap column gather
-      through the shared `NeuralBilinearGatherColumn` helper (zero-padding) and
-      apply the DCNv2 sigmoid modulation AFTER the gather via the AVX scalar
-      `TNNetVolume.Mul`. The CPU `ComputeCPU` blends into `FSampledCol`; the
-      OpenCL `ComputeOpenCL` blends straight into the contiguous im2col patch
-      slot `FGemmPatch[t*Sz + tap*FInDepth ..)`. The corner add order matches the
-      old scalar `SampleBilinear` exactly, so the forward is bit-identical (scalar
-      build) / <1e-6 (AVX2). The helper's existing signature already fit the
-      DeformableConv access pattern, so NO helper change was needed (GridSample /
-      AffineGridSample callers untouched). The backward gather was already AVX
-      (prior 2026-06-27 batch); left unchanged. New parity tests in
-      tests/TestNeuralNumerical.pas: TestDeformableConvGatherParity and
-      TestModulatedDeformableConvGatherParity (forward AND full backward
-      input-gradient — incl. offset-head and DCNv2 modulation-logit scatter —
-      vs an independent scalar reference, max |diff| < 1e-5 both paths). Suite
-      2500 scalar / 2500 AVX2 green (the one AVX2 failure, TestSetTrainableKeeps-
-      Outputs, is the documented pre-existing fp flake). The dead
-      `TNNetDeformableConv.SampleBilinear` method is now unused by the forward but
-      kept as documentation (RoIAlign has its own copy).
-
-- [X] Add a reusable `TNNet.AddPatchEmbedding` builder method (patchify +
-      linear projection to tokens, optional learnable class token and learnable
-      positional embedding) for ViT-style stacks. Today every patch-tokenizing
-      example (e.g. `MaskedAutoencoder`, `Perceiver`, MLP-Mixer / ViT demos)
-      hand-rolls the conv-stride-`PatchSize` → flatten-to-(SeqLen,1,EmbedDim)
-      sequence reshape inline. One builder removes that duplication and makes
-      from-scratch ViT examples a few lines. Mirror the existing
-      `Add*Block`/`Add*Encoder` builder conventions; convert at least one
-      example to use it as the regression check.
-      DONE: `TNNet.AddPatchEmbedding(PatchSize, EmbedDim, AddClassToken=false,
-      AddPositionalEmbedding=true): TNNetLayer` composes
-      `TNNetConvolutionLinear` (kernel=stride=PatchSize) → `TNNetReshape`
-      ((GridX*GridY,1,EmbedDim)) → optional `TNNetSoftPrompt(1,EmbedDim)` [CLS]
-      prepend → optional `TNNetLearnedPositionalEmbedding`. New example
-      `examples/TinyViT` (which-quadrant image classification, [CLS]-token head,
-      converges to 100% in <1 min CPU) is the regression check. Tests:
-      `TestPatchEmbeddingShape`, `TestPatchEmbeddingSerializationRoundTrip` in
-      tests/TestNeuralNumerical.pas. Full suite green (scalar 2502/0/0; AVX2
-      only the known `TestSetTrainableKeepsOutputs` flake).
-      Follow-ups: (a) `MaskedAutoencoder` was NOT converted — it patchifies on
-      the CPU (needs explicit per-patch masking), so the builder doesn't fit its
-      pipeline; convert it only if a non-masked variant is added. (b) Could add
-      a `Channels`/`InputPadding` knob or a sinusoidal-pos-embed option later.
+(All three 28i items LANDED and removed: reusable `TNNetGridSample` layer — torch
+`F.grid_sample` bilinear/nearest x zeros/border x align_corners, with a shared
+`NeuralBilinearGatherColumn` depth-column gather helper that `TNNetAffineGridSample`
+now delegates to [d9f91ab4]; AVX-vectorized `TNNetDeformableConv` bilinear gather
+routed through that same shared helper (+ DCNv2 sigmoid modulation applied after the
+gather), forward bit-identical / backward parity-tested [ab92389f]; reusable
+`TNNet.AddPatchEmbedding` ViT patchify builder (conv-stride-patch -> reshape ->
+optional CLS + positional embedding) + `examples/TinyViT` regression [91024a9e].)
 
 ## Lucky-day batch 2026-06-28j (verified-novel accelerator / generative / torch port)
 
@@ -2122,34 +2031,6 @@ state confirmed via the layer `Compute`/`ComputeOpenCL` methods on 2026-06-28.)
       parity-test vs the AVX CPU path and skip-clean when no device. Ties into the
       existing "keep activations resident across consecutive offloaded layers"
       generator follow-up.
-
-- [ ] Top-level SD3 / FLUX (MMDiT) text-to-image importer + runnable example.
-      `BuildMMDiTBlockFromSafeTensors` already imports ONE MMDiT joint
-      attention block, but there is no `BuildSD3FromSafeTensors` /
-      `BuildFluxFromSafeTensors` that (a) reads the diffusers `transformer/`
-      config, (b) builds the patch-embed + timestep/pooled-text conditioning
-      (AdaLN-Zero modulation) + the stack of N joint blocks + final
-      AdaLN/unpatchify head, and (c) wires the dual text encoders (CLIP-L +
-      T5/​CLIP-G — CLIP and T5 importers already exist) and the VAE decoder
-      (`BuildVaeDecoderFromSafeTensors` exists). Then add an `examples/SD3Generate`
-      (or `FluxGenerate`) that runs a few flow-matching / Euler steps end-to-end
-      to a PNG, mirroring `examples/LatentTextToImage` (PixArt) structure. This is
-      the missing "full modern diffusion pipeline" — every sub-piece exists; the
-      task is the importer wiring + one example. Scope first: diff the SD3-medium
-      vs FLUX.1 transformer key layouts (FLUX adds the single-stream blocks) and
-      decide whether one importer with a flag covers both or they need siblings.
-
-- [ ] Pixtral vision-language importer (`BuildPixtralFromSafeTensors`). Llava /
-      PaliGemma / Qwen2-VL importers exist, but Pixtral's vision tower is
-      genuinely different from the fixed-grid CLIP/SigLIP towers those reuse: it
-      applies **2-D RoPE** to the patch tokens and supports **arbitrary input
-      resolution** (variable patch-grid per image, no learned positional table).
-      Port that vision encoder (2-D rotary position embedding over the (row, col)
-      patch grid; the existing 1-D `TNNetRoPE` and the 2-D-RoPE math from the
-      Qwen2-VL path are the templates), reuse the existing Mistral text importer
-      for the decoder, and wire the `[IMG]`/`[IMG_BREAK]`/`[IMG_END]` multimodal
-      projector connector. Add a pico fixture (slice a real Pixtral checkpoint
-      per the `make_pico_*_fixture.py` recipe) for parity. Verified absent.
 
 - [ ] Arbitrary-output-SIZE resize layer (`TNNetResize2D`, port of torch
       `F.interpolate(size=(H,W), mode=...)`). The existing `TNNetBilinearUpsample`
