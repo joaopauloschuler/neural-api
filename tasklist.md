@@ -1942,39 +1942,14 @@ NF4 dequant path do not exist (only int8 + MXFP4-dequant do).)
 
 ## Accelerator & dedup batch 2026-06-27e (follow-ups surfaced by 27d)
 
-(The 2026-06-27d accelerator/dedup batch is LANDED — its completed tasks have
-been removed from this list. These are natural next steps that the landed work
-exposed. All verified absent in source before listing.)
+(The 2026-06-27d/e accelerator/dedup batches are LANDED — completed tasks removed.
+LANDED in 27e: AVX activation-forward dispatch extension AUDIT (no code change —
+only Identity/ReLU/Sigmoid/Tanh/HardSwish/Swish/DiffAct are ever assigned to
+`FActivationFn`; the remaining scalar ones DiffAct/Swish have no matching `Vector*`
+kernel, and the rest are already wired in their dedicated layer `Compute` methods);
+OpenCL `TNNetGroupNorm`/`TNNetInstanceNorm` offload AUDIT (BOTH already offload via
+`TNNetGroupNormCL`+`cai_group_norm`, parity tests already published). Remaining open:)
 
-- [X] Extend the AVX activation-forward dispatch (now live for Sigmoid/Tanh via
-      `VectorSigmoid`/`VectorTanh` in `ApplyActivationFunctionToOutput`) to any
-      other `FActivationFn` that already has a `TNNetVolume.Vector*` batched kernel
-      but is still scalar-dispatched. AUDIT FINDING (no code change needed): the
-      only `FActivationFn` pointers ever assigned anywhere are Identity, ReLU,
-      Sigmoid, HiperbolicTangent, HardSwish, Swish and DiffAct. The dispatch chain
-      already routes Identity/ReLU/Sigmoid/Tanh/HardSwish; the two remaining scalar
-      ones have NO directly-matching `Vector*` kernel — DiffAct = 1-Abs(clamp(x,±1))
-      (no exp/erf/sinh), and Swish = x/(1+exp(-x)) has no `VectorSwish` (composing it
-      from VectorSigmoid would also diverge from the scalar form for large -x). The
-      existing `Vector*` kernels (Exp/Sigmoid/Tanh/Erf/Sinh) are all already wired in
-      their dedicated layer `Compute` methods (GELU/SiLU/SoftPlus/Sinh/…), a separate
-      code path. Nothing further to wire in this shared dispatch.
-- [X] OpenCL forward offload for `TNNetGroupNorm`/`TNNetInstanceNorm` whole-sample
-      path is the obvious sibling of the just-landed whole-volume `TNNetLayerNorm`/
-      `TNNetRMSNorm` offload — confirm which already offload and add the gap via the
-      same `cai_token_norm`/`cai_group_norm` reuse + skip-clean parity test.
-      AUDIT FINDING (no code change needed): BOTH already offload. `TNNetGroupNorm.Compute`
-      arms `FHasOpenCL && FShouldOpenCL && Assigned(FGroupNormCL)` gated on
-      `FOutput.Size >= NeuralConvOpenCLMinWork` and dispatches `ComputeOpenCL` ->
-      `TNNetGroupNormCL.Normalize` (one work-item per group) on the `cai_group_norm`
-      kernel; the CPU/AVX path stays as fallback and still caches FNormalized/FInvStdDev
-      for backward. `TNNetInstanceNorm` is a subclass that only overrides SetPrevLayer
-      (Groups=Depth) and inherits Compute/EnableOpenCL/ComputeOpenCL verbatim, so it
-      offloads through the same path. Skip-clean `<1e-4` parity tests already exist and
-      are published: `TTestNeuralNumerical.GroupNormOpenCLParity` (4 groups, per-channel
-      affine) and `InstanceNormOpenCLParity` (Groups=Depth), both with the standard
-      `AcquireFirstOpenCLDevice` SKIP idiom and an `{$ELSE}` "OpenCL not compiled in:
-      SKIP" branch. Full suite green (2459 tests, 0 fail) with no device present.
 - [ ] OpenCL offload for `TNNetMRotaryEmbedding` (M-RoPE) — the base
       `TNNetRotaryEmbedding` now offloads via `cai_rope`, but M-RoPE keeps its own
       3-D section-position `Compute` on the host. Either generalize `cai_rope` to
@@ -1983,51 +1958,24 @@ exposed. All verified absent in source before listing.)
 
 ## Accelerator & dedup batch 2026-06-27f
 
-(All verified absent in source before listing. Checked the actual `Compute`
-bodies, not just the tasklist. `TNNetAvgPool` was a candidate but is ALREADY
-OpenCL-offloaded via the shared `cai_pool2d`/`TNNetPool2DCL` path
-(neuralnetwork.pas ~80441) — do NOT relist it. The Vits/HiFi-GAN/EnCodec hand-
-rolled host math is DELIBERATELY self-contained channel-major code, not a layer-
-replacement candidate — see the audio-holder AVX/OpenCL entries above; do NOT
-file "replace Vits hand-made with TNNet layers".)
+(All LANDED and removed: OpenCL softmax-head offload — new `cai_softmax` kernel +
+`TNNetSoftMaxCL` host helper for `TNNetPointwiseSoftMax`/`TNNetSoftMax`, commit
+e8042aa0; AVX `TNNetReLU` forward via `AVXCopyRelu`, commit 10433bfd; AVX
+SoftPlus/Gaussian/SoftExponential forwards via `AVXExp` — note `AVXExp`'s scalar
+remainder tail has NO internal clamp so extreme inputs must be pre-clamped to
+[-88,88] before the call, commit 3e5e649d. Open follow-ups surfaced by this batch:)
 
-- [X] OpenCL forward offload for the softmax head — `TNNetPointwiseSoftMax`
-      (neuralnetwork.pas ~18959, forward is `FOutput.PointwiseSoftMax`) and the
-      whole-volume `TNNetSoftMax` (~82534). Today both run the normalization on the
-      HOST even when the producer (e.g. the SDPA score matrix, or the final
-      classifier logits) is device-resident, forcing an activation round-trip on
-      EVERY attention block and EVERY classification/decoder step. Add a
-      `cai_softmax` kernel to `neural/neural.cl` (one work-group per normalization
-      group of `GroupLen` contiguous elements — `GroupLen = Depth` for the pointwise
-      per-token case, `GroupLen = FOutput.Size` for the whole-volume case — doing
-      the standard max-subtract → exp → sum → divide in two passes / a local
-      reduction) and wire it through the shared host-helper pattern (mirror
-      `TNNetGroupNormCL`/`TNNetPool2DCL`, arming `FShouldOpenCL`). Forward-only, keep
-      the scalar/AVX host path as fallback, gate on `FOutput.Size >=
-      NeuralConvOpenCLMinWork`, and pin `<1e-4` CPU-vs-OpenCL parity with a test
-      that skips cleanly when no device is present.
-
-- [X] AVX-vectorize the `TNNetReLU` forward pass. `TNNetReLU.Compute`
-      (neuralnetwork.pas ~61176) is a scalar per-element `if x >= 0` loop, even
-      though `TNNetVolume.CopyRelu` / `AVXCopyRelu` (neuralvolume.pas ~13251 /
-      ~10396) already do exactly the `max(x,0)` clamp under `{$IFDEF AVXANY}`. ReLU
-      is one of the most frequently instantiated layers in the library. For the
-      inference branch (no `FOutputError`/deriv buffer) dispatch the contiguous
-      buffer straight through `FOutput.CopyRelu(LocalPrevOutput)`; for the training
-      branch (where the `>=0` mask is also written into `FOutputErrorDeriv` as 1/0)
-      either compute the output via `CopyRelu` then derive the mask vectorized, or
-      add a small fused AVX kernel that emits both — keeping the scalar loop as the
-      `{$IFNDEF AVXANY}` fallback. Pin parity with the existing ReLU
-      numerical-gradient / dead-ReLU tests.
-
-- [X] AVX-vectorize the remaining `exp`-based activation forwards via the existing
-      `AVXExp` vector exponential (the same kernel the GLU-family / `PointwiseSoftMax`
-      / just-landed `TNNetELU`/`TNNetSELU` passes use). Confirmed still scalar
-      (`pcr_expf` per element): `TNNetSoftPlus` (~36797, `ln(1+exp(x))` with the
-      stable large-`x` branch + its `sigmoid` derivative), `TNNetGaussianActivation`
-      (~37247, `exp(-x*x)`), and `TNNetSoftExponential` (~37170, the `alpha<>0`
-      `exp`/`log` branches). All are depth-contiguous elementwise passes. Vectorize
-      the exponential over 8-lane blocks (masking the numerically-stable branches
-      per block where needed), keep the scalar branch as the `{$IFNDEF AVXANY}`
-      fallback, and pin parity with the existing per-activation saturation /
-      numerical-gradient tests.
+- [ ] Keep the softmax-head activation resident on the OpenCL device across the
+      SDPA score-matrix producer -> `cai_softmax` -> consumer chain. The new
+      `cai_softmax` offload (e8042aa0) still uploads/downloads the volume per call;
+      when the producer is already device-resident this is a wasted round-trip.
+      Tie into the existing "keep activations resident across consecutive offloaded
+      layers" follow-up in the vision/generative section so attention blocks chain
+      device-side. Forward-only, parity-tested, skip-clean when no device.
+- [ ] AVX-vectorize the softmax-head HOST fallback to match the new device path.
+      `TVolume.PointwiseSoftMax` / whole-volume `TVolume.SoftMax` still do scalar
+      max -> `pcr_expf` per element -> sum -> divide; the `cai_softmax` kernel now
+      does the stable two-pass form on device, but the CPU fallback (no GPU here)
+      could reuse `AVXExp` over the exp pass (pre-clamp args per the 27f finding
+      above) + a vector max/sum reduction. Pin `<1e-4` parity with the existing
+      softmax numerical tests.
