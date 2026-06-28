@@ -2027,3 +2027,57 @@ cai_mrope M-RoPE OpenCL offload [b06c5d0d]. Open follow-ups:)
       common contiguous-depth case the whole volume could be processed with a single
       two-pass sweep that resets the running max/sum at each depth boundary. Minor;
       pin `<1e-4` with the existing softmax parity tests.
+
+## Lucky-day batch 2026-06-28c (verified-novel CV / accelerator / multilingual)
+
+(All four checked against neuralnetwork.pas / neuralpretrained.pas / examples/ and
+the existing tasklist before listing — none are already coded or pending.)
+
+- [ ] DETR / RT-DETR set-prediction TRAINING loss head (bipartite matching). The
+      `BuildDetrFromSafeTensors` importer (`neuralpretrained.pas:11753`) is
+      explicitly INFERENCE-only — `neuralnetwork.pas:17390` and the DETR comment
+      note the missing Hungarian matcher, so the imported detector cannot be
+      fine-tuned. Add a reusable set-prediction loss that (a) computes the NxM cost
+      matrix between N queries and M ground-truth boxes from class-CE + L1 box +
+      generalized-IoU terms, (b) solves the assignment (greedy/auction is acceptable
+      v1 — leave an exact-Hungarian flag open, mirroring the
+      `neuralnetwork.pas:17390` greedy-vs-auction note), and (c) backprops the
+      combined matched loss. Follow the [[loss-layer-pattern]] (Identity passthrough
+      + backward rewrite, two dispatch tables) and reuse the box-IoU helper from the
+      NMS dedup task below. Unlocks DETR/RT-DETR/Grounding-DINO fine-tuning instead
+      of frozen inference. Numerical-gradient test on a tiny N=4,M=2 fixture.
+
+- [ ] Consolidate the duplicated greedy-NMS + box-IoU code into ONE reusable
+      routine. Greedy class-aware NMS is hand-rolled at least twice — inside the
+      detection importers (`neuralpretrained.pas:73257`, plus the YOLO post-process
+      around `neuralpretrained.pas:11952`) and again in `examples/YoloDetect`
+      (`examples/YoloDetect/YoloDetect.lpr`). Promote a single
+      `NeuralBoxIoU`/`NeuralGreedyNMS` (box-IoU + score-sorted suppression at an
+      IoU threshold) into a shared spot and have the importers AND the YoloDetect
+      example call it. Pure refactor — pin byte-identical detection output on the
+      existing YoloDetect / ObjectDetection runs before and after. Also feeds the
+      DETR loss task above (shared IoU).
+
+- [ ] OpenCL forward offload + AVX mean/var for `TNNetInstanceNorm`. The per-channel
+      instance norm (`neuralnetwork.pas:61778`) is hot in the generative / style
+      paths (AdaIN, CycleGAN, Pix2Pix, StyleTransfer) yet runs entirely on the host
+      with a scalar mean/variance pass, while its near-twin `TNNetGroupNorm` ALREADY
+      has both `ComputeOpenCL`/`EnableOpenCL` and the depth-contiguous statistics.
+      (a) Mirror `TNNetGroupNorm.ComputeOpenCL` with NumGroups = channel count so
+      each channel is its own group; (b) on the host fallback, replace the scalar
+      sums with the contiguous-depth `GetSum`/`GetSumSqr` AVX primitives (the
+      depth-contiguous rule in [[avx-vectorization-sweep]]). Forward-only, parity
+      `<1e-5` vs the current host path, skip-clean when no device.
+
+- [ ] XLM-RoBERTa multilingual encoder importer
+      (`BuildXLMRobertaFromSafeTensors[Ex]`, model_type `xlm-roberta`). The BERT
+      encoder importer (`BuildBertFromSafeTensors`, `neuralpretrained.pas:2210`)
+      already covers monolingual RoBERTa-style encoders, but XLM-R — the workhorse
+      multilingual embedding / cross-lingual reranker backbone — is not reachable.
+      It is the BERT path with three deltas: a SentencePiece (not WordPiece)
+      vocabulary, RoBERTa absolute position ids offset by `padding_idx`+1 (positions
+      start at 2, not 0), and no token-type/segment embedding. Reuse the existing
+      encoder builder + safetensors loader; commit a pico fixture per
+      [[pico-import-fixtures]] and verify pooled-embedding parity against
+      `transformers` in venv x. Feeds the existing SemanticSearch / Rerank / ColBERT
+      examples with a multilingual backbone.
