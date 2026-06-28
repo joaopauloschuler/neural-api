@@ -1970,3 +1970,70 @@ eval-time metric helpers, not as trainable `TNNet*Loss` layers.)
       identical inputs). OPEN follow-ups: the optional learned 1x1 lin-head LPIPS
       variant, and wiring it into an SR/GAN/diffusion training example as an
       opt-in perceptual objective.
+
+## Vision / generative & accelerator batch 2026-06-27b
+
+(All verified absent in source before listing. The GLU/GroupNorm layers carry
+no `FShouldOpenCL`/`ComputeOpenCL` path and their forward is a plain scalar
+triple loop with no AVX fast path; `BuildRAFTFromSafeTensors` and an NF4
+dequant path do not exist (only int8 + MXFP4-dequant do); there is a VQVAE
+example but no continuous-latent VAE example and no Gaussian reparameterization
+sampling layer — the "reparameterization" mentions in source are weight-norm,
+not z = mu + sigma·eps sampling.)
+
+- [ ] OpenCL forward offload for the GLU-family feed-forward activations
+      (`TNNetSwiGLU`, `TNNetGLU`, `TNNetGEGLU`, `TNNetGEGLUErf`,
+      `TNNetGptOssGatedSwiGLU`). These run in EVERY transformer FFN block (so in
+      every ChatTerminal / imported-LLM forward pass) and are currently a scalar
+      per-element loop over the full volume calling `pcr_expf`/`pcr_tanhf` once
+      per element. A single shared elementwise gating kernel in `neural/neural.cl`
+      (split the depth axis into the two halves A|B, compute `A * act(B)` with the
+      activation selected by a flag — sigmoid/swish/gelu-tanh/gelu-erf) keeps
+      activations device-resident between attention and the down-projection.
+      Mirror the existing `TNNetTokenRMSNorm` OpenCL pattern: arm `FShouldOpenCL`
+      in `EnableOpenCL`, gate dispatch on `FOutput.Size >= NeuralConvOpenCLMinWork`,
+      forward-only (training stays on CPU), with a `<1e-4` parity test per variant.
+- [ ] AVX vectorization of the same GLU-family forward (`TNNetSwiGLU` / `TNNetGLU`
+      / `TNNetGEGLU` / `TNNetGEGLUErf`). The two gated halves A and B are each
+      depth-axis-contiguous (the AVX-friendly layout per the depth-contiguous
+      rule), so the `A * sigmoid(B)` / `A * swish(B)` elementwise pass can reuse
+      the existing `AVXExp` vector exponential already used by
+      `TVolume.PointwiseSoftMax` instead of a scalar `pcr_expf` per element.
+      Keep the scalar path as the `{$IFNDEF AVXANY}` fallback and pin parity with
+      the existing numerical-gradient/forward tests.
+- [ ] OpenCL forward offload for `TNNetGroupNorm` / `TNNetInstanceNorm`. These are
+      the normalization used in diffusion UNet / GAN / StyleGAN image-generation
+      stacks (which already run their convs on the GPU), so the per-group
+      mean/variance reduction + affine scale/shift is a round-trip-forcing CPU
+      island today. Add a reduction kernel (one work-item group per (sample,group)
+      computing mean + variance then applying gain/bias), reusing the
+      `cai_token_norm`-style reduction shape from the landed token-norm offload;
+      forward-only, `FShouldOpenCL` armed in `EnableOpenCL`, `<1e-4` parity test.
+- [ ] RAFT optical-flow importer `BuildRAFTFromSafeTensors[Ex]`
+      (`princeton-vl/raft`-style checkpoints; model the small + large feature/
+      context encoders, the all-pairs correlation, and the convGRU update block).
+      The signature primitives ALREADY EXIST as layers — `TNNetCorrelationVolume`,
+      `TNNetCorrelationLookup`, and the convGRU hidden-state update — so this is a
+      weight-loading + graph-wiring job, not new math. Adds a real trained flow
+      model to the existing video stack (FlowWarp / VideoFrameInterpolation /
+      TextToVideo). Use the pico-fixture parity pattern (slice a tiny real
+      checkpoint into a committed fixture + a `<1e-4` logit/flow parity test).
+- [ ] NF4 (bitsandbytes 4-bit) dequantizing import path, paralleling the existing
+      int8 (`pQuantizeInt8`) and MXFP4 (`neuralmxfp4.DequantizeMXFP4`) support.
+      Add an `nf4` block dequantizer (the 16-level NF4 codebook + per-block FP
+      absmax scales, optionally double-quantized scales) in a `neuralnf4.pas`
+      sibling of `neuralmxfp4.pas`, dequantizing to F32 at load time on the
+      shared safetensors importer path so any `bnb-4bit` HF checkpoint (e.g. a
+      4-bit Llama/Qwen) loads through the existing `BuildLlamaFromSafeTensors`
+      family. Cross-check against a `bitsandbytes` reference tensor under the
+      `venv x` python.
+- [ ] Continuous-latent variational autoencoder example `examples/VAE` (KL +
+      Gaussian reparameterization), distinct from the existing discrete `VQVAE`
+      example. The `TNNetKLDivergence` loss layer already exists, but there is no
+      reparameterization sampling layer, so first add a shape-preserving
+      `TNNetGaussianReparameterize` layer that splits its input depth into
+      (mu | log-var), emits `z = mu + exp(0.5·log-var)·eps` in the forward (eps
+      frozen for the matching backward, like the Gumbel/weight-norm fixed-noise
+      pattern), and routes the standard-normal-prior KL gradient back through mu
+      and log-var. Then the example trains an encoder→reparameterize→decoder on
+      MNIST/CIFAR with reconstruction + KL, replacing any hand-rolled sampling.
