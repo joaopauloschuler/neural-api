@@ -2004,20 +2004,23 @@ optional CLS + positional embedding) + `examples/TinyViT` regression [91024a9e].
 listing — none is a near-duplicate of existing source. Forward-path AVX/OpenCL
 state confirmed via the layer `Compute`/`ComputeOpenCL` methods on 2026-06-28.)
 
-- [ ] OpenCL device offload for `TNNetL2Normalize`. The layer currently has NO
-      `ComputeOpenCL` path (CPU only), and its per-CHANNEL mode forward is a
-      scalar element loop (the per-DEPTH and full-volume modes already use the
-      AVX `DotProduct`/`Mul` depth-contiguous ops). Two concrete wins: (a) AVX-
-      vectorize the per-channel mode (gather each channel's stride-`Depth` column
-      is awkward, so transpose-free: accumulate the per-channel sum-of-squares
-      with a strided AVX reduction, then scale) and (b) add a `ComputeOpenCL`
-      that does the per-depth-column L2 reduce + reciprocal-sqrt scale on the
-      device (template: the `TNNetGroupNorm.ComputeOpenCL` / `cai_token_norm`
-      per-token reduction kernel). This layer sits on the hot path of every
-      embedding / ArcFace / contrastive head (`ArcFaceEmbedding`,
-      `TripletEmbedding`, `InfoNCEContrastive`, `EuclideanNormHead`), so keeping
-      it device-resident removes a per-call round-trip. Forward-and-backward
-      parity-test vs the scalar path; skip-clean when no device.
+- [X] OpenCL device offload for `TNNetL2Normalize`. (a) The per-CHANNEL mode
+      forward is now AVX: transpose-free strided sum-of-squares via the
+      depth-contiguous `TVolume.MulAdd` 3-pointer form (`ss[d] += x[d]*x[d]`)
+      then an element-wise `Mul` by the cached reciprocal norm -- no stride-Depth
+      column gather. (b) Added `cai_l2norm_perdepth` (one work-item per (x,y)
+      position, L2-reduce + rsqrt scale, no mean/gain), the `TNNetL2NormCL`
+      wrapper, and `TNNetL2Normalize.EnableOpenCL`/`ComputeOpenCL` for the axis-0
+      per-position mode (forward-only; backward/per-channel/full-volume stay CPU).
+      Parity tests `TestL2NormalizePerChannelAVXParity` (scalar-vs-AVX, wide
+      Depth=19) and `L2NormalizeOpenCLParity` (device-vs-CPU, skip-clean) both
+      pass on PoCL (max|diff| 0 and 6e-8). The `InvScale` kernel arg leaves the
+      same kernel ready to drive the PixelNorm offload below (RMS InvScale=1/D).
+      Hot path of every embedding / ArcFace / contrastive head
+      (`ArcFaceEmbedding`, `TripletEmbedding`, `InfoNCEContrastive`,
+      `EuclideanNormHead`). Follow-up (deliberately deferred): the device path
+      is forward-only, so a GPU forward leaves `FInvNorms` unpopulated -- a fused
+      device backward for the per-depth Jacobian could remove that CPU fallback.
 
 - [ ] OpenCL device offload for `TNNetPixelNorm`. `TNNetPixelNorm` is the
       ProGAN/StyleGAN per-pixel feature-vector normalization (each (x,y) position

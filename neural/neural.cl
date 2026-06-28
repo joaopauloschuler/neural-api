@@ -771,6 +771,44 @@ __kernel void cai_token_norm
   }
 }
 
+// Per-depth-column L2 normalization forward (TNNetL2Normalize axis-0 / PixelNorm
+// per-position mode, and TNNetPixelNorm). For each position p of FNumPositions
+// (= SizeX*SizeY), the FDepth contiguous channels at base = p*FDepth are scaled
+// to unit (or 1/sqrt(mean)) L2 norm over the depth axis -- NO mean subtraction,
+// NO gain/bias:
+//   ss     = sum_c x[c]^2
+//   invN   = 1 / sqrt(ss * FInvScale + FEps)
+//   y[c]   = x[c] * invN
+// FInvScale selects the variant: 1.0 = plain L2 (TNNetL2Normalize, invN =
+// rsqrt(sum + eps)); 1/FDepth = RMS-style (TNNetPixelNorm, invN =
+// rsqrt(mean(x^2) + eps)). One work-item per POSITION: global size =
+// FNumPositions (dim 0). Keeping the whole per-position reduction in one
+// work-item matches the scalar/AVX depth-sum order (parity well under 1e-4).
+// Forward-only; training stays on the CPU.
+__kernel void cai_l2norm_perdepth
+(
+  const int FNumPositions,
+  const int FDepth,
+  const float FInvScale,
+  const float FEps,
+  __global const float* FX,
+  __global float* FY
+)
+{
+  const int p = get_global_id(0);
+  if (p >= FNumPositions) return;
+  const int base = p * FDepth;
+  float ss = 0.0f;
+  for (int c = 0; c < FDepth; c++)
+  {
+    const float v = FX[base + c];
+    ss = mad(v, v, ss);
+  }
+  const float invN = 1.0f / sqrt(ss * FInvScale + FEps);
+  for (int c = 0; c < FDepth; c++)
+    FY[base + c] = FX[base + c] * invN;
+}
+
 // Shared GLU-family gated feed-forward activation. The input tensor is laid out
 // as FNumTokens rows of (2*FHalfDepth) contiguous channels; each row splits into
 // two contiguous depth-halves A = [0 .. FHalfDepth) and B = [FHalfDepth ..

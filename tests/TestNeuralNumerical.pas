@@ -386,6 +386,9 @@ type
     // TNNetInstanceNorm.
     procedure GroupNormOpenCLParity;
     procedure InstanceNormOpenCLParity;
+    // OpenCL per-depth-column L2 reduce + rsqrt scale forward offload parity
+    // (vs CPU) for TNNetL2Normalize axis-0 (per-position) mode.
+    procedure L2NormalizeOpenCLParity;
     // OpenCL windowed-reduction forward offload parity (vs CPU) for the pooling
     // layers TNNetMaxPool / TNNetAvgPool.
     procedure MaxPoolOpenCLParity;
@@ -1360,6 +1363,9 @@ type
     procedure TestL2NormalizePerChannelUnitNorm;
     procedure TestL2NormalizePerChannelGradientCheck;
     procedure TestL2NormalizePerChannelSerializationRoundTrip;
+    // AVX-vs-scalar parity for the per-CHANNEL forward over a wide depth run
+    // (exercises the MulAdd 8/4/1 unrolled reduction + Mul scale path).
+    procedure TestL2NormalizePerChannelAVXParity;
     procedure TestUnitNormForward;
     procedure TestUnitNormGradientCheck;
     procedure TestUnitNormSerializationRoundTrip;
@@ -28275,6 +28281,60 @@ begin
     end;
   finally
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestL2NormalizePerChannelAVXParity;
+const
+  SizeX = 3;
+  SizeY = 5;
+  Depth = 19; // wide, non-multiple-of-8 -> exercises MulAdd 8/4/1 remainders
+  Eps = 1e-8;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  CntX, CntY, CntD, i: integer;
+  SumSq, Ref, Got, Diff, MaxDiff: TNeuralFloat;
+  ChanInvN: array[0..Depth - 1] of TNeuralFloat;
+begin
+  // The numerical suite is built once scalar and once with -dAVX2; this test
+  // compares the per-channel layer output against an independent scalar
+  // reference, so it pins the AVX (strided MulAdd reduction + Mul scale) path
+  // to the textbook formula on the vectorized build and the plain path on the
+  // scalar build. Tolerance < 1e-4 per the AVX-parity convention.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, Depth, 1));
+    NN.AddLayer(TNNetL2Normalize.Create(2)); // axis 2 = per-channel
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.7 * Sin(i * 0.37) - 0.2 * Cos(i * 0.11) + 0.05;
+    // Independent scalar reference: each channel's reciprocal spatial L2 norm.
+    for CntD := 0 to Depth - 1 do
+    begin
+      SumSq := 0;
+      for CntX := 0 to SizeX - 1 do
+        for CntY := 0 to SizeY - 1 do
+          SumSq := SumSq + Input[CntX, CntY, CntD] * Input[CntX, CntY, CntD];
+      ChanInvN[CntD] := 1.0 / Sqrt(SumSq + Eps);
+    end;
+    NN.Compute(Input);
+    MaxDiff := 0;
+    for CntX := 0 to SizeX - 1 do
+      for CntY := 0 to SizeY - 1 do
+        for CntD := 0 to Depth - 1 do
+        begin
+          Ref := Input[CntX, CntY, CntD] * ChanInvN[CntD];
+          Got := NN.GetLastLayer.Output[CntX, CntY, CntD];
+          Diff := Abs(Ref - Got);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+    WriteLn('  L2Normalize per-channel AVX parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('L2Normalize per-channel AVX vs scalar parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 
@@ -63288,6 +63348,63 @@ begin
     end;
     WriteLn('  GroupNorm OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('GroupNorm OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Device forward parity (vs CPU) for TNNetL2Normalize axis-0 (per-(x,y)-position
+// over depth) mode: the cai_l2norm_perdepth kernel reduces each depth column and
+// scales by rsqrt(sum + eps). Same harness as the GroupNorm test.
+procedure TTestNeuralNumerical.L2NormalizeOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 5, 13); // 20 positions, depth 13 (wide column)
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 5, 13, 1));
+    NN.AddLayer(TNNetL2Normalize.Create()); // axis 0 = per-(x,y) over depth
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.6 * Sin(i * 0.31) - 0.15;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      MaxDiff := 0;
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    WriteLn('  L2Normalize OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('L2Normalize OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
