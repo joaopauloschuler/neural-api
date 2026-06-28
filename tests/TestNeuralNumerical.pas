@@ -343,6 +343,9 @@ type
     procedure RoPEOpenCLParity;
     // OpenCL multimodal rotary (M-RoPE) forward offload parity (vs CPU).
     procedure MRoPEOpenCLParity;
+    // OpenCL M-RoPE incremental-decode angle-table cache parity: the cached
+    // extending-sequence path must equal a per-step full recompute.
+    procedure MRoPEOpenCLIncrementalCacheParity;
     // OpenCL whole-volume mean/variance (LayerNorm) and mean-square (RMSNorm)
     // forward offload parity (vs CPU) for TNNetLayerNorm / TNNetRMSNorm, which
     // collapse the whole SizeX*SizeY*Depth sample into one cai_token_norm token.
@@ -61162,6 +61165,104 @@ begin
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// M-RoPE incremental-decode angle-table cache parity. A growing sequence is fed
+// to the device path step by step (token 1, then 1..2, ... 1..N) so that each
+// forward only EXTENDS the previous positions - exercising the angle-table
+// prefix reuse in ComputeOpenCL. The cached output must match, bit-for-bit, a
+// reference that forces a full table rebuild each step via ResetCache (and, as a
+// second anchor, the scalar CPU forward). Coded by Claude (AI).
+procedure TTestNeuralNumerical.MRoPEOpenCLIncrementalCacheParity;
+{$IFDEF OpenCL}
+const
+  MaxLen = 6;
+  HeadDim = 32;       // HalfD = 16
+var
+  NN: TNNet;
+  Input, OutRef, OutCached: TNNetVolume;
+  Rope: TNNetMRotaryEmbedding;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, t, step: integer;
+  PosT, PosH, PosW: array of integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  // The input is sized to the FULL sequence; each step only forwards a length-S
+  // prefix of it (TNNetInput.SetInput resizes the active volume to S tokens).
+  Input := TNNetVolume.Create(MaxLen, 1, HeadDim, 1);
+  OutRef := TNNetVolume.Create();
+  OutCached := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(MaxLen, 1, HeadDim, 1));
+    Rope := TNNetMRotaryEmbedding.Create(10000.0, 6, 5, 5); // sums to HalfD = 16
+    NN.AddLayer(Rope);
+    Rope.PositionOffset := 2;
+    SetLength(PosT, MaxLen); SetLength(PosH, MaxLen); SetLength(PosW, MaxLen);
+    for t := 0 to MaxLen - 1 do
+    begin
+      PosT[t] := t;
+      PosH[t] := (t * 2) mod 5;
+      PosW[t] := (t * 3 + 1) mod 6;
+    end;
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.5 * Sin(i * 0.41) - 0.2;
+
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      MaxDiff := 0;
+      // Walk the sequence length up from 1 to MaxLen. The SAME layer instance is
+      // reused so its cache persists and grows step by step.
+      for step := 1 to MaxLen do
+      begin
+        // Truncate the active input to a length-`step` prefix.
+        NN.GetFirstLayer.Output.ReSize(step, 1, HeadDim);
+        for i := 0 to step * HeadDim - 1 do
+          NN.GetFirstLayer.Output.Raw[i] := Input.Raw[i];
+        Rope.SetPositions(Copy(PosT, 0, step), Copy(PosH, 0, step),
+          Copy(PosW, 0, step));
+
+        // Cached path: do NOT reset, let the prefix accumulate.
+        NN.Compute(NN.GetFirstLayer.Output);
+        OutCached.Copy(NN.GetLastLayer.Output);
+
+        // Reference path: force a full rebuild for the identical request.
+        Rope.ResetCache();
+        NN.Compute(NN.GetFirstLayer.Output);
+        OutRef.Copy(NN.GetLastLayer.Output);
+
+        AssertEquals('step ' + IntToStr(step) + ' size match',
+          OutRef.Size, OutCached.Size);
+        for i := 0 to OutRef.Size - 1 do
+        begin
+          Diff := Abs(OutRef.Raw[i] - OutCached.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+        // The reference Compute just left the cache armed at length `step` with
+        // the current positions, so the NEXT step's cached Compute is a pure
+        // extension - exactly the path under test.
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    WriteLn('  M-RoPE OpenCL incremental-cache parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('M-RoPE incremental cache vs full-rebuild: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-6', MaxDiff < 1e-6);
+  finally
+    OutCached.Free; OutRef.Free; Input.Free; NN.Free;
   end;
 end;
 {$ELSE}
