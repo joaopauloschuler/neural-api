@@ -495,6 +495,23 @@ type
       // src. The clamped arg keeps exp finite; sinh stays accurate to ~1e-6 vs
       // pcr_sinhf over the activation parity range.
       class procedure VectorSinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // VectorLn writes dst[0..N-1] := ln(src[0..N-1]). On an AVX2 build it uses an
+      // 8-wide Cephes logf polynomial (AVXLn) with a scalar pcr_logf remainder; on a
+      // non-AVX build it is a plain pcr_logf loop. Matches pcr_logf to ~1e-6 over the
+      // positive normal range. Buffers may alias (read-before-write per lane/element).
+      class procedure VectorLn(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // VectorSin / VectorCos write dst[0..N-1] := sin/cos(src[0..N-1]). On an AVX2
+      // build they use an 8-wide Cephes sinf/cosf polynomial (AVXSinCos) with a
+      // 3-part Cody-Waite range reduction (accurate to large magnitudes) and a scalar
+      // pcr_sinf/pcr_cosf remainder; non-AVX builds are plain RTL loops. ~1e-6 vs RTL.
+      // Buffers may alias (dst = src).
+      class procedure VectorSin(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      class procedure VectorCos(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // VectorArcSinh writes dst[0..N-1] := arcsinh(src) = ln(x + sqrt(x^2 + 1)).
+      // Built on VectorLn (and a vectorized sqrt in the prep pass) so it inherits the
+      // AVX2 path. The sqrt argument is always >= 1 so ln stays in its accurate range
+      // and dst may alias src (the prep pass reads src into a scratch before VectorLn).
+      class procedure VectorArcSinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
       procedure AddArea(DestX, DestY, OriginX, OriginY, LenX, LenY: integer; Original: TNNetVolume);
       function HasAVX: boolean; {$IFDEF Release} inline; {$ENDIF}
       function HasAVX2: boolean; {$IFDEF Release} inline; {$ENDIF}
@@ -1233,6 +1250,13 @@ type
   // it (a generic template cannot reference an implementation-private symbol).
   // Implemented in the AVX32 / AVX64 asm blocks. Buffers may alias.
   procedure AVXExp(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer);
+  // AVXLn writes pDst[0..N-1] := ln(pSrc[0..N-1]) via an 8-wide Cephes logf
+  // polynomial (scalar pcr_logf remainder). Buffers may alias.
+  procedure AVXLn(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer);
+  // AVXSinCos writes pDst[0..N-1] := sin or cos of pSrc[0..N-1] via an 8-wide Cephes
+  // sinf/cosf polynomial with 3-part Cody-Waite range reduction (scalar RTL
+  // remainder). DoCos selects cos (true) vs sin (false). Buffers may alias.
+  procedure AVXSinCos(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer; DoCos: boolean);
   // AVXGetSum returns the sum of pSrc[0..N-1] via an 8-wide AVX2 reduction
   // (scalar tail for the N mod 4 remainder). Declared at interface scope so the
   // generic TVolume.SoftMax / PointwiseSoftMax may reduce the exp pass with it.
@@ -1263,6 +1287,49 @@ const
   cAVXExpP5:  Single  = 0.008333333333333333;
   cAVXExpP6:  Single  = 0.001388888888888889;
   cAVXExp127: Integer = 127;
+
+// Constants for the AVX2 8-wide ln() approximation (AVXLn), Cephes single-precision
+// logf. Decompose x = m * 2^e with m in [sqrt(0.5), sqrt(2)); ln(x) = ln(m) + e*ln2,
+// where ln(m) is a degree-8 minimax polynomial in (m-1). Max relative error ~2e-7
+// over the normal positive range, far below the 1e-4 parity target vs pcr_logf.
+  cAVXLnP0:   Single  =  7.0376836292E-2;
+  cAVXLnP1:   Single  = -1.1514610310E-1;
+  cAVXLnP2:   Single  =  1.1676998740E-1;
+  cAVXLnP3:   Single  = -1.2420140846E-1;
+  cAVXLnP4:   Single  =  1.4249322787E-1;
+  cAVXLnP5:   Single  = -1.6668057665E-1;
+  cAVXLnP6:   Single  =  2.0000714765E-1;
+  cAVXLnP7:   Single  = -2.4999993993E-1;
+  cAVXLnP8:   Single  =  3.3333331174E-1;
+  cAVXLnQ1:   Single  = -2.12194440E-4;     // ln2 correction tail
+  cAVXLnQ2:   Single  =  0.693359375;       // ln2 lead
+  cAVXLnSqrtHf: Single = 0.707106781186547524; // sqrt(0.5)
+  cAVXLnHalf:  Single = 0.5;
+  cAVXLnOne:   Single = 1.0;
+  cAVXLnMinNorm: Integer = $00800000;       // smallest positive normal float bits
+  cAVXLnInvMant: Integer = $807fffff;       // sign + mantissa mask (clears exponent)
+
+// Constants for the AVX2 8-wide sin()/cos() approximation (AVXSinCos), Cephes
+// single-precision sinf/cosf. Range-reduce x by q = round(x * 4/pi); the low 3 bits
+// of q select the octant and the sin/cos polynomial + sign. Max abs error ~1e-7 over
+// a wide range; we extend the reduction with a 3-part Cody-Waite pi/4 subtraction so
+// it stays accurate out to large magnitudes (|x| up to ~1e5).
+  cAVXSC_FOPI:  Single =  1.27323954473516;   // 4/pi
+  cAVXSC_DP1:   Single = -0.78515625;
+  cAVXSC_DP2:   Single = -2.4187564849853515625E-4;
+  cAVXSC_DP3:   Single = -3.77489497744594108E-8;
+  cAVXSC_SinP0: Single = -1.9515295891E-4;
+  cAVXSC_SinP1: Single =  8.3321608736E-3;
+  cAVXSC_SinP2: Single = -1.6666654611E-1;
+  cAVXSC_CosP0: Single =  2.443315711809948E-5;
+  cAVXSC_CosP1: Single = -1.388731625493765E-3;
+  cAVXSC_CosP2: Single =  4.166664568298827E-2;
+  cAVXSC_Half:  Single =  0.5;
+  cAVXSC_One:   Single =  1.0;
+  cAVXSC_1i:    Integer = 1;
+  cAVXSC_2i:    Integer = 2;
+  cAVXSC_4i:    Integer = 4;
+  cAVXSC_NOT1i: Integer = -2;                 // not(1) = $FFFFFFFE
 {$ENDIF}
 
 function CreateTokenizedStringList(str: string; c:char):TNNetStringList;
@@ -7915,6 +7982,72 @@ begin
   end;
 end;
 
+class procedure TNNetVolume.VectorLn(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+{$IFDEF AVXANY}
+begin
+  if N <= 0 then exit;
+  AVXLn(pDst, pSrc, N);
+end;
+{$ELSE}
+var
+  I: integer;
+begin
+  for I := 0 to N - 1 do
+    pDst^[I] := pcr_logf(pSrc^[I]);
+end;
+{$ENDIF}
+
+class procedure TNNetVolume.VectorSin(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+{$IFDEF AVXANY}
+begin
+  if N <= 0 then exit;
+  AVXSinCos(pDst, pSrc, N, False);
+end;
+{$ELSE}
+var
+  I: integer;
+begin
+  for I := 0 to N - 1 do
+    pDst^[I] := pcr_sinf(pSrc^[I]);
+end;
+{$ENDIF}
+
+class procedure TNNetVolume.VectorCos(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+{$IFDEF AVXANY}
+begin
+  if N <= 0 then exit;
+  AVXSinCos(pDst, pSrc, N, True);
+end;
+{$ELSE}
+var
+  I: integer;
+begin
+  for I := 0 to N - 1 do
+    pDst^[I] := pcr_cosf(pSrc^[I]);
+end;
+{$ENDIF}
+
+class procedure TNNetVolume.VectorArcSinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+var
+  I: integer;
+  X: TNeuralFloat;
+  ArgBuf: array of TNeuralFloat;
+begin
+  if N <= 0 then exit;
+  // arcsinh(x) = ln(x + sqrt(x^2 + 1)). The argument x + sqrt(x^2+1) is always >= 1
+  // and is built into a scratch buffer (NOT pDst) so pSrc is never clobbered before
+  // it is read -- hence dst may alias src. VectorLn then supplies the AVX2 ln pass.
+  SetLength(ArgBuf, N);
+  for I := 0 to N - 1 do
+  begin
+    X := pSrc^[I];
+    ArgBuf[I] := X + Sqrt(X * X + 1.0);
+  end;
+  VectorLn(TNeuralFloatArrPtr(@ArgBuf[0]), TNeuralFloatArrPtr(@ArgBuf[0]), N);
+  for I := 0 to N - 1 do
+    pDst^[I] := ArgBuf[I];
+end;
+
 procedure TVolume.GroupedPointwiseSoftMax(Groups: integer);
 var
   I, StartPointPos: integer;
@@ -11560,6 +11693,30 @@ begin
 end;
 {$ENDIF}
 
+{ AVXLn (32-bit): scalar pcr_logf loop. The Cephes log bit-tricks need many ymm
+  registers (only ymm0..7 are usable in 32-bit asm), so the 32-bit build falls back
+  to the RTL while the 64-bit build provides the 8-wide vectorized AVXLn. }
+procedure AVXLn(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer);
+var
+  I: integer;
+begin
+  for I := 0 to NumElements - 1 do
+    pDst^[I] := pcr_logf(pSrc^[I]);
+end;
+
+{ AVXSinCos (32-bit): scalar RTL loop (see AVXLn note on the register pressure). }
+procedure AVXSinCos(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer; DoCos: boolean);
+var
+  I: integer;
+begin
+  if DoCos then
+    for I := 0 to NumElements - 1 do
+      pDst^[I] := pcr_cosf(pSrc^[I])
+  else
+    for I := 0 to NumElements - 1 do
+      pDst^[I] := pcr_sinf(pSrc^[I]);
+end;
+
 function AVXDotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
 var
   vRes: array[0..3] of Single;
@@ -13077,6 +13234,288 @@ var
 begin
   for I := 0 to NumElements - 1 do
     pDst^[I] := pcr_expf(pSrc^[I]);
+end;
+{$ENDIF}
+
+{ AVXLn: dst[0..N-1] := ln(src[0..N-1]). 8-wide AVX2 Cephes logf body plus a scalar
+  pcr_logf remainder for the (N mod 8) tail. Decomposes x = m*2^e with m in
+  [sqrt(0.5),sqrt(2)) and evaluates ln(m) as a degree-8 polynomial in (m-1). }
+procedure AVXLn(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer);
+{$IFDEF AVX2}
+var
+  localNumElements, MissedElements, I: integer;
+begin
+  MissedElements := NumElements and 7;
+  localNumElements := NumElements xor MissedElements;
+  if localNumElements > 0 then
+  begin
+  asm
+  mov rax, pSrc
+  mov rcx, pDst
+  mov r8d, localNumElements
+  shr r8d, 3
+  jz @DoneAVXLn
+@LoopAVXLn:
+  vmovups ymm0, [rax]
+  // clamp to smallest positive normal so denormals/zero do not poison the bit tricks
+  vbroadcastss ymm15, [rip+cAVXLnMinNorm]
+  vmaxps  ymm0, ymm0, ymm15
+  // e = (float)(((bits >> 23) & 0xff) - 0x7f) + 1   (mantissa rescaled to [0.5,1))
+  vpsrld  ymm2, ymm0, 23
+  vmovd   xmm15, dword ptr [rip+cAVXExp127]
+  vpbroadcastd ymm15, xmm15            // 0x7f = 127
+  vpsubd  ymm2, ymm2, ymm15            // unbiased exponent
+  vcvtdq2ps ymm2, ymm2
+  vbroadcastss ymm15, [rip+cAVXLnOne]
+  vaddps  ymm2, ymm2, ymm15            // e = exp + 1 (0.5*2^e convention)
+  // mantissa in [0.5,1): bits = (bits & invMant) | 0.5bits
+  vbroadcastss ymm15, [rip+cAVXLnInvMant]
+  vandps  ymm0, ymm0, ymm15
+  vbroadcastss ymm15, [rip+cAVXLnHalf]
+  vorps   ymm0, ymm0, ymm15            // x = mantissa in [0.5,1)
+  // mask: m < sqrt(0.5) ?
+  vbroadcastss ymm15, [rip+cAVXLnSqrtHf]
+  vcmpltps ymm3, ymm0, ymm15           // mask = (x < SQRTHF)
+  vandps  ymm4, ymm0, ymm3             // tmp = (x<sqrthf)? x : 0
+  vbroadcastss ymm15, [rip+cAVXLnOne]
+  vsubps  ymm0, ymm0, ymm15            // x = x - 1
+  vaddps  ymm0, ymm0, ymm4             // if x<sqrthf: x = 2x - 1
+  vandps  ymm5, ymm15, ymm3            // (x<sqrthf)? 1.0 : 0.0
+  vsubps  ymm2, ymm2, ymm5             // e -= 1 where x<sqrthf
+  // z = x*x
+  vmulps  ymm1, ymm0, ymm0             // z
+  // Horner polynomial in x: P0..P8
+  vbroadcastss ymm4, [rip+cAVXLnP0]
+  vbroadcastss ymm5, [rip+cAVXLnP1]
+  vfmadd213ps ymm4, ymm0, ymm5
+  vbroadcastss ymm5, [rip+cAVXLnP2]
+  vfmadd213ps ymm4, ymm0, ymm5
+  vbroadcastss ymm5, [rip+cAVXLnP3]
+  vfmadd213ps ymm4, ymm0, ymm5
+  vbroadcastss ymm5, [rip+cAVXLnP4]
+  vfmadd213ps ymm4, ymm0, ymm5
+  vbroadcastss ymm5, [rip+cAVXLnP5]
+  vfmadd213ps ymm4, ymm0, ymm5
+  vbroadcastss ymm5, [rip+cAVXLnP6]
+  vfmadd213ps ymm4, ymm0, ymm5
+  vbroadcastss ymm5, [rip+cAVXLnP7]
+  vfmadd213ps ymm4, ymm0, ymm5
+  vbroadcastss ymm5, [rip+cAVXLnP8]
+  vfmadd213ps ymm4, ymm0, ymm5         // ymm4 = poly
+  vmulps  ymm4, ymm4, ymm0             // poly *= x
+  vmulps  ymm4, ymm4, ymm1             // poly *= z   (= y)
+  // y += e*Q1
+  vbroadcastss ymm5, [rip+cAVXLnQ1]
+  vfmadd231ps ymm4, ymm2, ymm5
+  // y -= 0.5*z
+  vbroadcastss ymm5, [rip+cAVXLnHalf]
+  vmulps  ymm6, ymm1, ymm5
+  vsubps  ymm4, ymm4, ymm6
+  // x = x + y
+  vaddps  ymm0, ymm0, ymm4
+  // x += e*Q2
+  vbroadcastss ymm5, [rip+cAVXLnQ2]
+  vfmadd231ps ymm0, ymm2, ymm5
+  vmovups [rcx], ymm0
+  add rax, 32
+  add rcx, 32
+  dec r8d
+  jnz @LoopAVXLn
+@DoneAVXLn:
+  vzeroupper
+  end ['rax','rcx','r8',
+       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5','ymm6','ymm15'];
+  end;
+  for I := localNumElements to NumElements - 1 do
+    pDst^[I] := pcr_logf(pSrc^[I]);
+end;
+{$ELSE}
+var
+  I: integer;
+begin
+  for I := 0 to NumElements - 1 do
+    pDst^[I] := pcr_logf(pSrc^[I]);
+end;
+{$ENDIF}
+
+{ AVXSinCos: dst[0..N-1] := sin or cos of src[0..N-1]. 8-wide AVX2 Cephes sinf/cosf
+  body (3-part Cody-Waite pi/4 range reduction) plus a scalar RTL remainder. }
+procedure AVXSinCos(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer; DoCos: boolean);
+{$IFDEF AVX2}
+var
+  localNumElements, MissedElements, I: integer;
+begin
+  MissedElements := NumElements and 7;
+  localNumElements := NumElements xor MissedElements;
+  if localNumElements > 0 then
+  begin
+  if DoCos then
+  begin
+  asm
+  mov rax, pSrc
+  mov rcx, pDst
+  mov r8d, localNumElements
+  shr r8d, 3
+  jz @DoneAVXCos
+@LoopAVXCos:
+  vmovups ymm0, [rax]               // x
+  vpcmpeqd ymm14, ymm14, ymm14
+  vpsrld  ymm14, ymm14, 1           // 0x7fffffff
+  vandps  ymm1, ymm0, ymm14         // |x|
+  vbroadcastss ymm15, [rip+cAVXSC_FOPI]
+  vmulps  ymm2, ymm1, ymm15
+  vcvttps2dq ymm3, ymm2             // j = trunc(|x|*4/pi)
+  vmovd   xmm15, dword ptr [rip+cAVXSC_1i]
+  vpbroadcastd ymm15, xmm15
+  vpaddd  ymm3, ymm3, ymm15         // j+1
+  vmovd   xmm15, dword ptr [rip+cAVXSC_NOT1i]
+  vpbroadcastd ymm15, xmm15
+  vpand   ymm3, ymm3, ymm15         // j &= ~1
+  vcvtdq2ps ymm2, ymm3              // y = (float)j
+  vbroadcastss ymm15, [rip+cAVXSC_DP1]
+  vfmadd231ps ymm1, ymm2, ymm15
+  vbroadcastss ymm15, [rip+cAVXSC_DP2]
+  vfmadd231ps ymm1, ymm2, ymm15
+  vbroadcastss ymm15, [rip+cAVXSC_DP3]
+  vfmadd231ps ymm1, ymm2, ymm15     // reduced x
+  vmovd   xmm15, dword ptr [rip+cAVXSC_2i]
+  vpbroadcastd ymm15, xmm15
+  vpsubd  ymm4, ymm3, ymm15         // m = j-2
+  vmovd   xmm15, dword ptr [rip+cAVXSC_4i]
+  vpbroadcastd ymm15, xmm15
+  vpandn  ymm5, ymm4, ymm15         // (~m)&4   (Cephes cos sign convention)
+  vpslld  ymm5, ymm5, 29            // sign = ((~m)&4)<<29
+  vmovd   xmm15, dword ptr [rip+cAVXSC_2i]
+  vpbroadcastd ymm15, xmm15
+  vpand   ymm6, ymm4, ymm15
+  vpxor   ymm15, ymm15, ymm15
+  vpcmpeqd ymm6, ymm6, ymm15        // polymask: (m&2)==0 -> sin poly (Cephes cos)
+  vmulps  ymm7, ymm1, ymm1          // z
+  vbroadcastss ymm8,  [rip+cAVXSC_CosP0]
+  vbroadcastss ymm9,  [rip+cAVXSC_CosP1]
+  vfmadd213ps ymm8, ymm7, ymm9
+  vbroadcastss ymm9,  [rip+cAVXSC_CosP2]
+  vfmadd213ps ymm8, ymm7, ymm9
+  vmulps  ymm8, ymm8, ymm7
+  vmulps  ymm8, ymm8, ymm7
+  vbroadcastss ymm9,  [rip+cAVXSC_Half]
+  vmulps  ymm10, ymm7, ymm9
+  vsubps  ymm8, ymm8, ymm10
+  vbroadcastss ymm9,  [rip+cAVXSC_One]
+  vaddps  ymm8, ymm8, ymm9          // cos candidate
+  vbroadcastss ymm11, [rip+cAVXSC_SinP0]
+  vbroadcastss ymm12, [rip+cAVXSC_SinP1]
+  vfmadd213ps ymm11, ymm7, ymm12
+  vbroadcastss ymm12, [rip+cAVXSC_SinP2]
+  vfmadd213ps ymm11, ymm7, ymm12
+  vmulps  ymm11, ymm11, ymm7
+  vmulps  ymm11, ymm11, ymm1
+  vaddps  ymm11, ymm11, ymm1        // sin candidate
+  vblendvps ymm0, ymm8, ymm11, ymm6 // (m&2)? sin : cos
+  vxorps  ymm0, ymm0, ymm5          // sign
+  vmovups [rcx], ymm0
+  add rax, 32
+  add rcx, 32
+  dec r8d
+  jnz @LoopAVXCos
+@DoneAVXCos:
+  vzeroupper
+  end ['rax','rcx','r8',
+       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5','ymm6','ymm7','ymm8',
+       'ymm9','ymm10','ymm11','ymm12','ymm14','ymm15'];
+  end
+  else
+  begin
+  asm
+  mov rax, pSrc
+  mov rcx, pDst
+  mov r8d, localNumElements
+  shr r8d, 3
+  jz @DoneAVXSin
+@LoopAVXSin:
+  vmovups ymm0, [rax]               // x
+  vpcmpeqd ymm14, ymm14, ymm14
+  vpslld  ymm13, ymm14, 31          // 0x80000000
+  vandps  ymm5, ymm0, ymm13         // sign_x
+  vpsrld  ymm14, ymm14, 1           // 0x7fffffff
+  vandps  ymm1, ymm0, ymm14         // |x|
+  vbroadcastss ymm15, [rip+cAVXSC_FOPI]
+  vmulps  ymm2, ymm1, ymm15
+  vcvttps2dq ymm3, ymm2             // j
+  vmovd   xmm15, dword ptr [rip+cAVXSC_1i]
+  vpbroadcastd ymm15, xmm15
+  vpaddd  ymm3, ymm3, ymm15
+  vmovd   xmm15, dword ptr [rip+cAVXSC_NOT1i]
+  vpbroadcastd ymm15, xmm15
+  vpand   ymm3, ymm3, ymm15         // j = (j+1)&~1
+  vcvtdq2ps ymm2, ymm3              // y
+  vbroadcastss ymm15, [rip+cAVXSC_DP1]
+  vfmadd231ps ymm1, ymm2, ymm15
+  vbroadcastss ymm15, [rip+cAVXSC_DP2]
+  vfmadd231ps ymm1, ymm2, ymm15
+  vbroadcastss ymm15, [rip+cAVXSC_DP3]
+  vfmadd231ps ymm1, ymm2, ymm15     // reduced x
+  vmovd   xmm15, dword ptr [rip+cAVXSC_4i]
+  vpbroadcastd ymm15, xmm15
+  vpand   ymm4, ymm3, ymm15
+  vpslld  ymm4, ymm4, 29            // (j&4)<<29
+  vxorps  ymm5, ymm5, ymm4          // combined sign
+  vmovd   xmm15, dword ptr [rip+cAVXSC_2i]
+  vpbroadcastd ymm15, xmm15
+  vpand   ymm6, ymm3, ymm15
+  vpcmpeqd ymm6, ymm6, ymm15        // polymask: (j&2)==2 -> cos poly
+  vmulps  ymm7, ymm1, ymm1          // z
+  vbroadcastss ymm8,  [rip+cAVXSC_CosP0]
+  vbroadcastss ymm9,  [rip+cAVXSC_CosP1]
+  vfmadd213ps ymm8, ymm7, ymm9
+  vbroadcastss ymm9,  [rip+cAVXSC_CosP2]
+  vfmadd213ps ymm8, ymm7, ymm9
+  vmulps  ymm8, ymm8, ymm7
+  vmulps  ymm8, ymm8, ymm7
+  vbroadcastss ymm9,  [rip+cAVXSC_Half]
+  vmulps  ymm10, ymm7, ymm9
+  vsubps  ymm8, ymm8, ymm10
+  vbroadcastss ymm9,  [rip+cAVXSC_One]
+  vaddps  ymm8, ymm8, ymm9          // cos candidate
+  vbroadcastss ymm11, [rip+cAVXSC_SinP0]
+  vbroadcastss ymm12, [rip+cAVXSC_SinP1]
+  vfmadd213ps ymm11, ymm7, ymm12
+  vbroadcastss ymm12, [rip+cAVXSC_SinP2]
+  vfmadd213ps ymm11, ymm7, ymm12
+  vmulps  ymm11, ymm11, ymm7
+  vmulps  ymm11, ymm11, ymm1
+  vaddps  ymm11, ymm11, ymm1        // sin candidate
+  vblendvps ymm0, ymm11, ymm8, ymm6 // (j&2)? cos : sin
+  vxorps  ymm0, ymm0, ymm5          // sign
+  vmovups [rcx], ymm0
+  add rax, 32
+  add rcx, 32
+  dec r8d
+  jnz @LoopAVXSin
+@DoneAVXSin:
+  vzeroupper
+  end ['rax','rcx','r8',
+       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5','ymm6','ymm7','ymm8',
+       'ymm9','ymm10','ymm11','ymm12','ymm13','ymm14','ymm15'];
+  end;
+  end;
+  if DoCos then
+    for I := localNumElements to NumElements - 1 do
+      pDst^[I] := pcr_cosf(pSrc^[I])
+  else
+    for I := localNumElements to NumElements - 1 do
+      pDst^[I] := pcr_sinf(pSrc^[I]);
+end;
+{$ELSE}
+var
+  I: integer;
+begin
+  if DoCos then
+    for I := 0 to NumElements - 1 do
+      pDst^[I] := pcr_cosf(pSrc^[I])
+  else
+    for I := 0 to NumElements - 1 do
+      pDst^[I] := pcr_sinf(pSrc^[I]);
 end;
 {$ENDIF}
 

@@ -27,6 +27,10 @@ type
     procedure TestVectorTanhScalarParity;
     procedure TestVectorErfScalarParity;
     procedure TestVectorSinhScalarParity;
+    procedure TestVectorLnScalarParity;
+    procedure TestVectorSinScalarParity;
+    procedure TestVectorCosScalarParity;
+    procedure TestVectorArcSinhScalarParity;
     procedure TestPointwiseSoftMaxVectorizedParity;
     procedure TestNetworkSaveLoad;
     procedure TestSimpleXORLearning;
@@ -667,6 +671,186 @@ begin
     end;
     AssertTrue('VectorSinh (aliased) vs pcr_sinhf max rel err ' + FloatToStr(maxRel) +
       ' must be < ' + FloatToStr(RelTol), maxRel < RelTol);
+  finally
+    Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestVectorLnScalarParity;
+// VectorLn (Cephes logf on the AVX2 build, pcr_logf fallback otherwise) must match
+// the scalar pcr_logf reference within tolerance on every build. N=131 straddles the
+// 8-wide body and the (N mod 8) scalar tail; range covers small and large positive
+// inputs. A second pass with dst aliasing src guards against buffer aliasing bugs.
+const
+  N = 131;
+  AbsTol = 1e-4;
+var
+  Src, Dst: TNNetVolume;
+  I: integer;
+  x, e, maxErr: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  try
+    for I := 0 to N - 1 do
+      Src.FData[I] := 1e-3 + 50.0 * I / (N - 1);
+    TNNetVolume.VectorLn(Dst.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      e := Abs(Dst.FData[I] - pcr_logf(Src.FData[I]));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorLn vs pcr_logf max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+    // dst aliasing src.
+    TNNetVolume.VectorLn(Src.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      x := 1e-3 + 50.0 * I / (N - 1);
+      e := Abs(Src.FData[I] - pcr_logf(x));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorLn (aliased) vs pcr_logf max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+  finally
+    Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestVectorSinScalarParity;
+// VectorSin (Cephes sinf with 3-part Cody-Waite reduction on the AVX2 build) must
+// match the scalar pcr_sinf reference within tolerance on every build. N=131
+// straddles the 8-wide body and the scalar tail; range [-50,50] plus a few large
+// magnitudes exercise the range reduction. dst aliasing src is also checked.
+const
+  N = 131;
+  AbsTol = 1e-4;
+var
+  Src, Dst: TNNetVolume;
+  I: integer;
+  x, e, maxErr: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  try
+    for I := 0 to N - 1 do
+      Src.FData[I] := -50.0 + 100.0 * I / (N - 1);
+    // Sprinkle in a few large magnitudes.
+    Src.FData[0] := 1000.0; Src.FData[1] := -1234.5; Src.FData[2] := 9999.9;
+    TNNetVolume.VectorSin(Dst.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      e := Abs(Dst.FData[I] - pcr_sinf(Src.FData[I]));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorSin vs pcr_sinf max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+    // dst aliasing src.
+    TNNetVolume.VectorSin(Src.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      if I = 0 then x := 1000.0
+      else if I = 1 then x := -1234.5
+      else if I = 2 then x := 9999.9
+      else x := -50.0 + 100.0 * I / (N - 1);
+      e := Abs(Src.FData[I] - pcr_sinf(x));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorSin (aliased) vs pcr_sinf max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+  finally
+    Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestVectorCosScalarParity;
+// VectorCos (Cephes cosf with 3-part Cody-Waite reduction on the AVX2 build) must
+// match the scalar pcr_cosf reference within tolerance on every build. Same coverage
+// rationale as TestVectorSinScalarParity.
+const
+  N = 131;
+  AbsTol = 1e-4;
+var
+  Src, Dst: TNNetVolume;
+  I: integer;
+  x, e, maxErr: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  try
+    for I := 0 to N - 1 do
+      Src.FData[I] := -50.0 + 100.0 * I / (N - 1);
+    Src.FData[0] := 1000.0; Src.FData[1] := -1234.5; Src.FData[2] := 9999.9;
+    TNNetVolume.VectorCos(Dst.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      e := Abs(Dst.FData[I] - pcr_cosf(Src.FData[I]));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorCos vs pcr_cosf max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+    // dst aliasing src.
+    TNNetVolume.VectorCos(Src.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      if I = 0 then x := 1000.0
+      else if I = 1 then x := -1234.5
+      else if I = 2 then x := 9999.9
+      else x := -50.0 + 100.0 * I / (N - 1);
+      e := Abs(Src.FData[I] - pcr_cosf(x));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorCos (aliased) vs pcr_cosf max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+  finally
+    Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestVectorArcSinhScalarParity;
+// VectorArcSinh = ln(x + sqrt(x^2+1)), built on the AVX2 VectorLn, must match the
+// scalar reference within tolerance on every build. N=131 straddles body+tail; range
+// covers both signs and large magnitudes. dst aliasing src is also checked.
+const
+  N = 131;
+  AbsTol = 1e-4;
+var
+  Src, Dst: TNNetVolume;
+  I: integer;
+  x, e, maxErr: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  try
+    for I := 0 to N - 1 do
+      Src.FData[I] := -30.0 + 60.0 * I / (N - 1);
+    TNNetVolume.VectorArcSinh(Dst.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      x := Src.FData[I];
+      e := Abs(Dst.FData[I] - pcr_logf(x + Sqrt(x * x + 1.0)));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorArcSinh vs ln(x+sqrt(x^2+1)) max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+    // dst aliasing src.
+    TNNetVolume.VectorArcSinh(Src.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      x := -30.0 + 60.0 * I / (N - 1);
+      e := Abs(Src.FData[I] - pcr_logf(x + Sqrt(x * x + 1.0)));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorArcSinh (aliased) max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
   finally
     Src.Free; Dst.Free;
   end;

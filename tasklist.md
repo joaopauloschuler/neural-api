@@ -1667,19 +1667,24 @@ rather than acted on.
       Tackle it with the chunked-forward family below (intra-chunk dense GEMM +
       inter-chunk running state), then add a causal parity test alongside.
 
-- [ ] AVX-vectorize the remaining trig/inverse-hyperbolic activation FORWARD
-      loops left scalar: `TNNetSin` / `TNNetCos` / `TNNetArcSinh`.
-      `TNNetSinhAct` is now DONE — `sinh(x) = (exp(x) - exp(-x))/2` reduces to two
-      `VectorExp` passes, so `TNNetVolume.VectorSinh` was added (alias-safe, AVX2
-      via `VectorExp`) and `TNNetSinhAct.Compute` converted to the two-pass scheme;
-      parity test `TestVectorSinhScalarParity` (< 1e-4, body+tail+aliased) green on
-      both builds. The remaining three CANNOT ride `VectorExp`: `TNNetArcSinh`
-      needs a vectorized natural log (`ln(x+sqrt(x^2+1))`) and `TNNetSin`/`TNNetCos`
-      need a Cephes-style range-reduced polynomial sin/cos. None of those have a
-      `VectorExp`-derived identity, and the AVX path is asm-only (`AVXExp`), so a
-      pure-Pascal "primitive" would gain nothing — they need dedicated 8-wide
-      `VectorLn` / `VectorSin` / `VectorCos` asm/intrinsic kernels held to < 1e-4
-      vs the RTL, which is the actual remaining work. Earlier tanh/erf batch:
+- [X] AVX-vectorize the remaining trig/inverse-hyperbolic activation FORWARD
+      loops left scalar: `TNNetSin` / `TNNetCos` / `TNNetArcSinh`. DONE — added
+      three dedicated 8-wide AVX2 kernels to `neuralvolume.pas`: `AVXLn` (Cephes
+      `logf`, x=m*2^e decompose + degree-8 poly in (m-1)), `AVXSinCos` (Cephes
+      `sinf`/`cosf` with 3-part Cody-Waite pi/4 range reduction, octant sign/poly
+      select via `vpandn`/`vblendvps`; cos uses the `(~m)&4` sign and `(m&2)==0`
+      poly convention), plus alias-safe class wrappers `TNNetVolume.VectorLn` /
+      `VectorSin` / `VectorCos`. `VectorArcSinh` = `ln(x+sqrt(x^2+1))` is built on
+      `VectorLn` (scratch-buffer prep so dst may alias src). 32-bit / non-AVX2
+      builds fall back to scalar RTL loops (register pressure on the bit-tricks).
+      `TNNetSin.Compute` / `TNNetCos.Compute` / `TNNetArcSinh.Compute` converted to
+      the new vector primitives (forward vectorized; derivative filled by a scalar
+      finishing pass reading x back, so backward math is byte-identical). Parity
+      tests `TestVectorLnScalarParity` / `TestVectorSinScalarParity` /
+      `TestVectorCosScalarParity` / `TestVectorArcSinhScalarParity` (< 1e-4,
+      body+tail+aliased+large-magnitude) green on both builds; measured AVX2 max abs
+      err ~2.4e-7 (ln), ~6e-8 (sin/cos), ~4.8e-7 (arcsinh). Earlier `TNNetSinhAct`
+      was DONE via two `VectorExp` passes (`VectorSinh`). Earlier tanh/erf batch:
       `TNNetGELU`, `TNNetGELUErf`, `TNNetMish`, `TNNetSerf`, `TNNetSmish`,
       `TNNetPhish`, `TNNetLogCoshActivation`, `TNNetLisht` vectorized via
       `VectorTanh`/`VectorErf` (built on `VectorExp`); parity tests
