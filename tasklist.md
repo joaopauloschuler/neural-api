@@ -1960,52 +1960,50 @@ cai_mrope M-RoPE OpenCL offload [b06c5d0d]. Open follow-ups:)
       cache the table and only append/upload the new token's angle row, mirroring
       the KV-cache incremental-decode path the base RoPE already supports
       (PositionOffset). Forward-only, parity-tested.
-- [ ] AVX-vectorize the per-(x,y) outer loop of `TVolume.PointwiseSoftMax` — the
-      28 landing vectorized the inner depth-span exp+sum, but the outer scan over
-      spatial positions still re-dispatches `AVXExp`/`AVXGetSum` per (x,y). For the
-      common contiguous-depth case the whole volume could be processed with a single
-      two-pass sweep that resets the running max/sum at each depth boundary. Minor;
-      pin `<1e-4` with the existing softmax parity tests.
+- [X] AVX-vectorize the per-(x,y) outer loop of `TVolume.PointwiseSoftMax`
+      (commit a14ce393). For the `NoForward=false` contiguous-depth case the whole
+      dense buffer is now a single two-pass sweep: per-span max+clamp, ONE
+      whole-volume `AVXExp` (exp dispatch cut from SizeX*SizeY to 1), then per-span
+      `AVXGetSum`+normalize resetting at each depth boundary (per-position
+      stabilization preserved exactly). NoForward=true causal-mask path + scalar
+      fallback untouched. Parity `<1e-4`; suite clean apart from the pre-existing
+      AVX2 TestSetTrainableKeepsOutputs flake.
 
 ## Lucky-day batch 2026-06-28c (verified-novel CV / accelerator / multilingual)
 
 (All four checked against neuralnetwork.pas / neuralpretrained.pas / examples/ and
 the existing tasklist before listing — none are already coded or pending.)
 
-- [ ] DETR / RT-DETR set-prediction TRAINING loss head (bipartite matching). The
-      `BuildDetrFromSafeTensors` importer (`neuralpretrained.pas:11753`) is
-      explicitly INFERENCE-only — `neuralnetwork.pas:17390` and the DETR comment
-      note the missing Hungarian matcher, so the imported detector cannot be
-      fine-tuned. Add a reusable set-prediction loss that (a) computes the NxM cost
-      matrix between N queries and M ground-truth boxes from class-CE + L1 box +
-      generalized-IoU terms, (b) solves the assignment (greedy/auction is acceptable
-      v1 — leave an exact-Hungarian flag open, mirroring the
-      `neuralnetwork.pas:17390` greedy-vs-auction note), and (c) backprops the
-      combined matched loss. Follow the [[loss-layer-pattern]] (Identity passthrough
-      + backward rewrite, two dispatch tables) and reuse the box-IoU helper from the
-      NMS dedup task below. Unlocks DETR/RT-DETR/Grounding-DINO fine-tuning instead
-      of frozen inference. Numerical-gradient test on a tiny N=4,M=2 fixture.
+- [X] DETR / RT-DETR set-prediction TRAINING loss head (bipartite matching)
+      (commit 87a9862d). Added `TNNetDETRSetPredictionLoss` (Identity passthrough +
+      backward rewrite, two dispatch tables) on the `(NumQueries,1,NumLabels+1+4)`
+      DETR head layout: NxM cost = class(-softmax_prob, w=1) + L1 box (w=5) + GIoU
+      (w=2), GREEDY bipartite assignment, eos_coef=0.1 no-object weight — weights
+      verified against transformers' DetrHungarianMatcher/DetrLoss. Added
+      `NeuralBoxGIoU` next to `NeuralBoxIoU` in neuralvolume.pas. Numerical-grad
+      test `TestDETRSetPredictionLossGradient` (N=4,M=2) passes at 1e-2 +
+      load-from-string round-trip; suite 2471/0. OPEN: exact Hungarian/auction
+      assignment (v1 greedy); GIoU box gradient uses an internal finite difference.
 
-- [ ] OpenCL forward offload + AVX mean/var for `TNNetInstanceNorm`. The per-channel
-      instance norm (`neuralnetwork.pas:61778`) is hot in the generative / style
-      paths (AdaIN, CycleGAN, Pix2Pix, StyleTransfer) yet runs entirely on the host
-      with a scalar mean/variance pass, while its near-twin `TNNetGroupNorm` ALREADY
-      has both `ComputeOpenCL`/`EnableOpenCL` and the depth-contiguous statistics.
-      (a) Mirror `TNNetGroupNorm.ComputeOpenCL` with NumGroups = channel count so
-      each channel is its own group; (b) on the host fallback, replace the scalar
-      sums with the contiguous-depth `GetSum`/`GetSumSqr` AVX primitives (the
-      depth-contiguous rule in [[avx-vectorization-sweep]]). Forward-only, parity
-      `<1e-5` vs the current host path, skip-clean when no device.
+- [X] OpenCL forward offload + AVX mean/var for `TNNetInstanceNorm` — ALREADY
+      LANDED in commit 09f9a13b (the tasklist entry was stale). `TNNetInstanceNorm`
+      is `class(TNNetGroupNorm)` and INHERITS `EnableOpenCL`/`Compute`/`ComputeOpenCL`
+      (cai_group_norm) with `FGroups := Depth` (one channel per group). The parent
+      host `Compute()` already uses AVX `DotProduct` over each contiguous per-pixel
+      depth column for mean/var; a separate per-channel AVX reduction is INVALID for
+      instance norm (GroupDepth=1 ⇒ a channel's elements are strided by Depth, not
+      contiguous) — correctly not added. Parity tests `GroupNormOpenCLParity` /
+      `InstanceNormOpenCLParity` self-skip without a device; PoCL measured 3.58e-7.
 
-- [ ] XLM-RoBERTa multilingual encoder importer
-      (`BuildXLMRobertaFromSafeTensors[Ex]`, model_type `xlm-roberta`). The BERT
-      encoder importer (`BuildBertFromSafeTensors`, `neuralpretrained.pas:2210`)
-      already covers monolingual RoBERTa-style encoders, but XLM-R — the workhorse
-      multilingual embedding / cross-lingual reranker backbone — is not reachable.
-      It is the BERT path with three deltas: a SentencePiece (not WordPiece)
-      vocabulary, RoBERTa absolute position ids offset by `padding_idx`+1 (positions
-      start at 2, not 0), and no token-type/segment embedding. Reuse the existing
-      encoder builder + safetensors loader; commit a pico fixture per
-      [[pico-import-fixtures]] and verify pooled-embedding parity against
-      `transformers` in venv x. Feeds the existing SemanticSearch / Rerank / ColBERT
-      examples with a multilingual backbone.
+- [X] XLM-RoBERTa multilingual encoder importer
+      (`BuildXLMRobertaFromSafeTensors[Ex]`, model_type `xlm-roberta`)
+      (commit 8ed8c818). XLM-R's network is bit-identical to RoBERTa, so this is
+      REUSE of the existing `bfRoberta` family (thin wrappers + config-reader alias +
+      `BuildFromPretrained` dispatch), no new encoder fork. The three deltas:
+      (1) SentencePiece tokenizer attaches via the existing `LoadSentencePieceModel`
+      at inference (caller's responsibility, like Marian/mBART); (2) position-id +2
+      offset already handled by `bfRoberta`'s `PositionOffset=pad_token_id+1`;
+      (3) `type_vocab_size=1` single constant segment row. Pico fixture
+      `tools/make_pico_xlmroberta_fixture.py` → tiny_xlmroberta.safetensors (9.8KB,
+      O(1)-rescaled). Tests `TestXLMRoberta{Config,HiddenState,Pooler}Parity` < 2e-5
+      vs HF `XLMRobertaModel`; suite 2474/0.
