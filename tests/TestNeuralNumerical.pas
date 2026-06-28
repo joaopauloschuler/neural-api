@@ -39,6 +39,8 @@ type
     procedure TestLpPoolGradientCheckP2;
     procedure TestLpPoolGradientCheckP3;
     procedure TestLpPoolLoadFromString;
+    procedure TestFiniteScalarQuantSTEGradientCheck;
+    procedure TestFiniteScalarQuantCodeIndexRoundTrip;
     procedure TestSoftPoolGradientCheck;
     procedure TestSoftPoolGradientCheckBetaSweep;
     procedure TestSoftPoolBetaLimits;
@@ -7700,6 +7702,146 @@ begin
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('LpPool round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFiniteScalarQuantSTEGradientCheck;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  FSQ: TNNetFiniteScalarQuant;
+  Levels: array[0..2] of integer;
+  UpErr: TNNetVolume;
+  D, I, X, Y, Ch: integer;
+  Z, HalfL, Offset, Shift, R, T, Expected, Got: TNeuralFloat;
+const
+  cSX = 2; cSY = 2; cTol = 1e-5;
+begin
+  // TNNetFiniteScalarQuant straight-through estimator: the round() in the
+  // forward is identity in the backward, so the gradient flowing into channel i
+  // is the upstream gradient times the analytic tanh-bound derivative
+  //   df/dz = half_l_i * (1 - tanh(z + shift_i)^2).
+  // We seed inputs WELL AWAY from the exact half-integer round boundaries (the
+  // only place the STE differs from a finite difference), set a KNOWN upstream
+  // output error, run the layer's Backpropagate, and compare the propagated
+  // input error against the closed-form bound derivative. Reseed the shared RNG.
+  RandSeed := 424242;
+  Levels[0] := 5; // odd  -> offset 0, shift 0
+  Levels[1] := 4; // even -> offset 0.5, shift = atanh(0.5/half_l)
+  Levels[2] := 8; // even
+  D := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cSX, cSY, D);
+  UpErr := TNNetVolume.Create(cSX, cSY, D);
+  try
+    NN.AddLayer(TNNetInput.Create(cSX, cSY, D, 1));
+    FSQ := TNNetFiniteScalarQuant.Create(Levels);
+    NN.AddLayer(FSQ);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Inputs chosen so tanh(z) is mid-scale (gradient well clear of 0) and the
+    // bounded value is far from a half-integer.
+    for I := 0 to Input.Size - 1 do
+      Input.Raw[I] := 0.13 * (I + 1) - 0.21; // small, smooth, no boundary hits
+    NN.Compute(Input);
+
+    // Known upstream gradient on the FSQ output (kept in UpErr too, because the
+    // layer rescales FOutputError in place during the STE backward).
+    for I := 0 to FSQ.Output.Size - 1 do
+    begin
+      UpErr.Raw[I] := 0.5 + 0.25 * I;
+      FSQ.OutputError.Raw[I] := UpErr.Raw[I];
+    end;
+
+    // Direct single-layer backprop: announce the (sole) departing branch so the
+    // backprop-call-count guard is satisfied, then propagate.
+    NN.Layers[0].OutputError.Fill(0);
+    FSQ.IncDepartingBranchesCnt();
+    FSQ.Backpropagate();
+
+    for X := 0 to cSX - 1 do
+      for Y := 0 to cSY - 1 do
+        for Ch := 0 to D - 1 do
+        begin
+          Z := Input[X, Y, Ch];
+          HalfL := (Levels[Ch] - 1) / 2;
+          if (Levels[Ch] mod 2) = 0 then Offset := 0.5 else Offset := 0.0;
+          if Offset = 0.0 then Shift := 0.0
+          else
+          begin
+            R := Offset / HalfL;
+            Shift := 0.5 * Ln((1 + R) / (1 - R));
+          end;
+          T := Tanh(Z + Shift);
+          Expected := UpErr[X, Y, Ch] * HalfL * (1 - T * T);
+          Got := NN.Layers[0].OutputError[X, Y, Ch];
+          AssertTrue('FSQ STE grad (X=' + IntToStr(X) + ' Y=' + IntToStr(Y) +
+            ' Ch=' + IntToStr(Ch) + ' exp=' + FloatToStr(Expected) +
+            ' got=' + FloatToStr(Got) + ')', Abs(Expected - Got) < cTol);
+        end;
+  finally
+    NN.Free;
+    Input.Free;
+    UpErr.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFiniteScalarQuantCodeIndexRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  FSQ, FSQ2: TNNetFiniteScalarQuant;
+  Levels: array[0..1] of integer;
+  S: string;
+  Idx, ExpIdx, Z0, Z1: integer;
+begin
+  // The forward quantizes each channel to a symmetric integer level and
+  // CodeIndex mixed-radix-combines them into 0..CodebookSize-1. Verify the
+  // implicit index matches a hand computation AND that the layer (incl. its
+  // variable-length Levels) round-trips through SaveStructureToString/CreateLayer.
+  RandSeed := 424242;
+  Levels[0] := 3; // levels -1,0,+1 -> per-ch index 0..2
+  Levels[1] := 4; // even: levels -2,-1,0,+1 -> per-ch index 0..3
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 2, 1));
+    FSQ := TNNetFiniteScalarQuant.Create(Levels);
+    NN.AddLayer(FSQ);
+
+    AssertEquals('FSQ codebook size 3*4', 12, FSQ.CodebookSize());
+    AssertEquals('FSQ num channels', 2, FSQ.NumChannels());
+
+    // Large +/- inputs saturate tanh: ch0 -> +1 level (index 2), ch1 (even,
+    // offset 0.5) at large +z saturates to bound = half_l - 0.5 = +1 level.
+    Input[0, 0, 0] := 5.0;
+    Input[0, 0, 1] := 5.0;
+    NN.Compute(Input);
+    Z0 := Round(FSQ.Output[0, 0, 0]);
+    Z1 := Round(FSQ.Output[0, 0, 1]);
+    ExpIdx := (Z0 + (Levels[0] div 2)) * Levels[1] + (Z1 + (Levels[1] div 2));
+    Idx := FSQ.CodeIndex(0, 0);
+    AssertEquals('FSQ code index combine', ExpIdx, Idx);
+    AssertTrue('FSQ code index in range', (Idx >= 0) and (Idx < 12));
+
+    // Save/Load round-trip of the variable-length Levels.
+    S := FSQ.SaveStructureToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.AddLayer(TNNetInput.Create(1, 1, 2, 1));
+      FSQ2 := NN2.CreateLayer(S) as TNNetFiniteScalarQuant;
+      NN2.AddLayer(FSQ2);
+      AssertEquals('FSQ reload channels', 2, FSQ2.NumChannels());
+      AssertEquals('FSQ reload L0', 3, FSQ2.LevelCount(0));
+      AssertEquals('FSQ reload L1', 4, FSQ2.LevelCount(1));
+      AssertEquals('FSQ reload codebook', 12, FSQ2.CodebookSize());
     finally
       NN2.Free;
     end;
