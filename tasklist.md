@@ -1989,7 +1989,7 @@ file "replace Vits hand-made with TNNet layers".)
       NeuralConvOpenCLMinWork`, and pin `<1e-4` CPU-vs-OpenCL parity with a test
       that skips cleanly when no device is present.
 
-- [ ] AVX-vectorize the `TNNetReLU` forward pass. `TNNetReLU.Compute`
+- [X] AVX-vectorize the `TNNetReLU` forward pass. `TNNetReLU.Compute`
       (neuralnetwork.pas ~61176) is a scalar per-element `if x >= 0` loop, even
       though `TNNetVolume.CopyRelu` / `AVXCopyRelu` (neuralvolume.pas ~13251 /
       ~10396) already do exactly the `max(x,0)` clamp under `{$IFDEF AVXANY}`. ReLU
