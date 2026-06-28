@@ -18,21 +18,23 @@ reservoir asymptotically forgets its initial state, so the same input drives
 it to the same state regardless of where it started - which is what makes the
 fixed random recurrence usable as a feature generator.
 
+The reservoir core is the reusable TNNetEchoStateReservoir layer (see
+neural/neuralnetwork.pas). It OWNS the two frozen matrices W_in and W, owns the
+leak rate a, and does the one-shot spectral-radius rescale of W at build time
+via the library power-iteration helper TNNet.EstimateSpectralRadius (it measures
+the TRUE largest eigenvalue MAGNITUDE rho = |lambda|_max directly with a W*v
+iteration - no transpose step - so rescaling W := W * (rho_target / rho) targets
+the exact spectral radius that governs the echo-state property). The layer is a
+shape-(SeqLen,1,1) -> (SeqLen,1,N) sequence map: feed it a whole driving
+sequence and it returns the whole sequence of reservoir states in one Compute.
+The matrices are NEVER touched by a gradient.
+
 Pipeline:
-  1. Build W_in and a sparse W with hand-rolled arrays.
-  2. RESCALE W to the target spectral radius. We reuse the library's
-     power-iteration helper TNNet.EstimateSpectralRadius to MEASURE the current
-     largest eigenvalue MAGNITUDE rho = |lambda|_max directly (W*v iteration,
-     no transpose step) instead of running a full eigensolve. The echo-state
-     property is governed by rho, so rescaling W := W * (rho_target / rho)
-     targets the TRUE spectral radius exactly: with rho_target < 1 the reservoir
-     forgets its initial state (rich, well-tuned memory) without the conservative
-     under-scaling that EstimateSpectralNorm's singular-value upper bound (rho <=
-     sigma_1) would give. For comparison we also print the spectral NORM sigma_1
-     via EstimateSpectralNorm to show rho <= sigma_1 on this non-symmetric W.
-  3. Run the reservoir FORWARD (no gradient) over a training sequence, collect
-     each state h_t into a TNNetVolumePair (input = h_t, target = x_{t+1}).
-  4. Train ONLY a TNNetFullConnectLinear(1) readout on those collected pairs
+  1. Build an Input(1) -> TNNetEchoStateReservoir(N) net (the layer builds and
+     spectral-rescales W_in and W itself).
+  2. Run the reservoir FORWARD (no gradient) over a driving sequence; each
+     output column h_t is a reservoir state. Pair (h_t -> x_{t+1}).
+  3. Train ONLY a TNNetFullConnectLinear(1) readout on those collected pairs
      with a tiny SGD loop (an L2-regularised linear / ridge-style fit).
 
 Headline task: one-step-ahead prediction of a deterministic sum-of-sines
@@ -81,13 +83,14 @@ const
   cN         = 100;    // reservoir size (units). Tiny: 50-150 is plenty.
   cLeak      = 0.3;    // leak rate `a` in the state update.
   cSparsity  = 0.1;    // fraction of W entries that are non-zero.
-  // NOTE on the two rho settings: EstimateSpectralRadius returns the TRUE
-  // spectral RADIUS rho = |lambda|_max, so we can target it directly. The
-  // echo-state property holds iff rho < 1, so the working case sets rho just
-  // below 1 (rich memory, still contractive) and the ablation drives rho > 1.
+  // NOTE on the two rho settings: the layer's spectral rescale targets the TRUE
+  // spectral RADIUS rho = |lambda|_max directly. The echo-state property holds
+  // iff rho < 1, so the working case sets rho just below 1 (rich memory, still
+  // contractive) and the ablation drives rho > 1.
   cRhoGood   = 0.9;    // echo-state working case (true radius < 1, ESP holds).
   cRhoBad    = 1.8;    // ablation case (true radius > 1, ESP broken).
   cInScale   = 1.0;    // input weight scale.
+  cSeed      = 20260628; // deterministic seed for the frozen reservoir matrices.
   cWarmup    = 100;    // washout steps (reservoir forgets its zero init).
   cTrainLen  = 600;    // teacher-forced training steps after washout.
   cTestLen   = 200;    // teacher-forced one-step test steps.
@@ -95,18 +98,11 @@ const
   cReadoutEpochs = 600;
   cReadoutLR     = 0.02;
   cReadoutL2     = 1e-5; // ridge-style regularisation on the readout.
-  cPowerIters    = 200;  // power-iteration steps for the spectral helpers.
-
-type
-  // The fixed random reservoir. W_in and W are plain arrays - the recurrence
-  // is hand-rolled, never touched by backprop.
-  TReservoir = record
-    Win: array of TNeuralFloat;            // [N]   input weights
-    W:   array of array of TNeuralFloat;   // [N,N] sparse recurrent matrix
-    H:   array of TNeuralFloat;            // [N]   current state h_t
-    Rho:   TNeuralFloat;                  // measured spectral RADIUS of raw W
-    Sigma: TNeuralFloat;                  // measured spectral NORM of raw W
-  end;
+  // Longest driving sequence we ever feed (washout + train + test, and the
+  // free-run prefix + appended predictions). The reservoir net's Input layer is
+  // sized to this; shorter runs zero-pad the tail (harmless: the recurrence is
+  // causal so states at index < Len never see the padding).
+  cMaxLen    = cWarmup + cTrainLen + cTestLen + cFreeRun + 8;
 
 // The deterministic target series x_t = sin(0.2 t) + 0.3 sin(0.31 t).
 function Series(t: integer): TNeuralFloat;
@@ -114,122 +110,86 @@ begin
   Result := Sin(0.2 * t) + 0.3 * Sin(0.31 * t);
 end;
 
-// Build W_in (uniform in [-cInScale, cInScale]) and a sparse W (uniform in
-// [-1,1] on a cSparsity fraction of entries), then rescale W to TargetRho
-// using the library power-iteration spectral-RADIUS helper (see file header).
-procedure BuildReservoir(var R: TReservoir; TargetRho: TNeuralFloat);
+// ----------------------------------------------------------------------------
+// The reservoir is the reusable TNNetEchoStateReservoir layer wrapped in a
+// one-layer Input(1) -> Reservoir(N) net. Because the layer re-inits its state
+// to zero at the start of every Compute and runs a whole sequence at once, we
+// drive it by REPLAYING a full driving sequence (washout + window) and reading
+// the output column at the desired step. The echo-state property (rho < 1)
+// guarantees the state after a few-dozen-step washout is independent of the
+// zero initialisation, so this is exactly equivalent to a persistent step loop.
+// ----------------------------------------------------------------------------
+
 var
-  i, j: integer;
-  ProbeNN: TNNet;
-  ProbeLayer: TNNetLayer;
-  Scale: TNeuralFloat;
+  gReservoir: TNNet;        // Input(1) -> TNNetEchoStateReservoir(cN)
+  gResLayer: TNNetEchoStateReservoir;
+  gDrive: TNNetVolume;      // reused (Len,1,1) driving-sequence buffer
+
+// Build the reservoir net at the given target spectral radius. The layer builds
+// and spectral-rescales its own W_in / W from cSeed.
+procedure BuildReservoir(TargetRho: TNeuralFloat);
 begin
-  SetLength(R.Win, cN);
-  SetLength(R.W, cN, cN);
-  SetLength(R.H, cN);
-
-  for i := 0 to cN - 1 do
-  begin
-    R.Win[i] := (Random * 2.0 - 1.0) * cInScale;
-    R.H[i] := 0;
-    for j := 0 to cN - 1 do
-    begin
-      if Random < cSparsity then
-        R.W[i][j] := Random * 2.0 - 1.0
-      else
-        R.W[i][j] := 0;
-    end;
-  end;
-
-  // Measure the current spectral RADIUS of W by stuffing its rows into a
-  // throwaway Input(N)->FullConnectLinear(N) network (building the net sizes
-  // each neuron's Weights to fan-in N, so Neurons[i].Weights = row i of W) and
-  // calling the reusable power-iteration helper. No training, no gradients -
-  // we read both rho (the echo-state-relevant radius) and, for comparison,
-  // sigma_1 (the conservative spectral-norm upper bound) back out.
-  ProbeNN := TNNet.Create();
-  try
-    ProbeNN.AddLayer([
-      TNNetInput.Create(cN),
-      TNNetFullConnectLinear.Create(cN)
-    ]);
-    ProbeLayer := ProbeNN.GetLastLayer();
-    for i := 0 to cN - 1 do
-      for j := 0 to cN - 1 do
-        ProbeLayer.Neurons[i].Weights.FData[j] := R.W[i][j];
-    R.Rho   := TNNet.EstimateSpectralRadius(ProbeLayer, cPowerIters);
-    R.Sigma := TNNet.EstimateSpectralNorm(ProbeLayer, cPowerIters);
-  finally
-    ProbeNN.Free;
-  end;
-
-  // Rescale to the TRUE target spectral radius (rho_target). Because rho is the
-  // exact echo-state quantity, TargetRho < 1 directly guarantees ESP.
-  if R.Rho > 1e-12 then
-  begin
-    Scale := TargetRho / R.Rho;
-    for i := 0 to cN - 1 do
-      for j := 0 to cN - 1 do
-        R.W[i][j] := R.W[i][j] * Scale;
-  end;
+  if Assigned(gReservoir) then gReservoir.Free;
+  gReservoir := TNNet.Create();
+  gReservoir.AddLayer([
+    // 1-D driving signal laid out along SizeX (sized to the longest sequence;
+    // shorter runs zero-pad the causal tail).
+    TNNetInput.Create(cMaxLen, 1, 1),
+    TNNetEchoStateReservoir.Create(cN, cLeak, TargetRho, cSparsity, cInScale, cSeed)
+  ]);
+  gResLayer := gReservoir.GetLastLayer() as TNNetEchoStateReservoir;
 end;
 
-// Reset the reservoir state to zero (used between independent runs).
-procedure ResetState(var R: TReservoir);
+// Run the reservoir over the driving values drive[0..Len-1] and return the
+// reservoir-state OUTPUT volume (shape (Len,1,cN)). The returned volume is owned
+// by the reservoir layer - do not free it; copy what you need.
+function RunReservoir(const drive: array of TNeuralFloat; Len: integer): TNNetVolume;
+var
+  i: integer;
+begin
+  // Always a cMaxLen-long buffer (the Input layer's fixed shape); zero-pad the
+  // tail beyond Len. The causal recurrence makes states at index < Len
+  // independent of the padding, so reading those indices is exact.
+  gDrive.Fill(0);
+  for i := 0 to Len - 1 do
+    gDrive.FData[gDrive.GetRawPos(i, 0, 0)] := drive[i];
+  gReservoir.Compute(gDrive);
+  Result := gResLayer.Output;
+end;
+
+// Copy reservoir state h at step `idx` (0-based into the last RunReservoir call)
+// into volume V (shape (cN,1,1)) - the readout input layout.
+procedure StateToVolume(States: TNNetVolume; idx: integer; V: TNNetVolume);
 var i: integer;
 begin
-  for i := 0 to cN - 1 do R.H[i] := 0;
-end;
-
-// One leaky-integrator update step: h := (1-a) h + a tanh(Win*x + W*h).
-procedure StepReservoir(var R: TReservoir; x: TNeuralFloat);
-var
-  i, j: integer;
-  PreAct: TNeuralFloat;
-  NewH: array of TNeuralFloat;
-begin
-  SetLength(NewH, cN);
   for i := 0 to cN - 1 do
-  begin
-    PreAct := R.Win[i] * x;
-    for j := 0 to cN - 1 do
-      PreAct := PreAct + R.W[i][j] * R.H[j];
-    NewH[i] := (1 - cLeak) * R.H[i] + cLeak * Tanh(PreAct);
-  end;
-  for i := 0 to cN - 1 do R.H[i] := NewH[i];
+    V.FData[i] := States.FData[States.GetRawPos(idx, 0, i)];
 end;
 
-// Copy the current reservoir state h_t into a TNNetVolume (the readout input).
-procedure StateToVolume(const R: TReservoir; V: TNNetVolume);
-var i: integer;
-begin
-  for i := 0 to cN - 1 do V.FData[i] := R.H[i];
-end;
-
-// Build the trained readout: a single linear unit over the N reservoir
-// states. Drives the reservoir over [WarmupStart .. WarmupStart+cWarmup) as
-// washout (collect nothing), then over the training window collects
+// Build the trained readout: a single linear unit over the N reservoir states.
+// Drives the reservoir over the washout + training window, collects
 // (h_t -> x_{t+1}) pairs and fits the readout with a small L2-regularised SGD
 // loop (deterministic; avoids TNeuralFit's shuffle/best-model reload).
-function TrainReadout(var R: TReservoir): TNNet;
+function TrainReadout(): TNNet;
 var
   NN: TNNet;
   Pairs: TNNetVolumePairList;
-  t, Epoch, k: integer;
+  States: TNNetVolume;
+  drive: array of TNeuralFloat;
+  t, Epoch, k, Len: integer;
   InV, TgtV: TNNetVolume;
 begin
-  ResetState(R);
-  // Washout: drive with the real series, discard states.
-  for t := 0 to cWarmup - 1 do
-    StepReservoir(R, Series(t));
+  Len := cWarmup + cTrainLen;
+  SetLength(drive, Len);
+  for t := 0 to Len - 1 do drive[t] := Series(t);
+  States := RunReservoir(drive, Len);
 
-  // Collect (state -> next value) pairs over the training window.
+  // Collect (state -> next value) pairs over the training window (post-washout).
   Pairs := TNNetVolumePairList.Create();
   for t := cWarmup to cWarmup + cTrainLen - 1 do
   begin
-    StepReservoir(R, Series(t));
     InV := TNNetVolume.Create(cN, 1, 1);
-    StateToVolume(R, InV);
+    StateToVolume(States, t, InV);
     TgtV := TNNetVolume.Create([Series(t + 1)]);
     Pairs.Add(TNNetVolumePair.Create(InV, TgtV));
   end;
@@ -242,8 +202,6 @@ begin
   NN.SetLearningRate(cReadoutLR, {Momentum=}0.9);
   NN.SetL2Decay(cReadoutL2);
 
-  // Full-batch-ish SGD: one update per sample, several epochs. The mapping is
-  // linear in the states, so this converges to the ridge least-squares fit.
   for Epoch := 1 to cReadoutEpochs do
   begin
     NN.ClearDeltas();
@@ -262,30 +220,23 @@ end;
 // ----------------------------------------------------------------------------
 // Closed-form RIDGE (Tikhonov) readout - the CLASSIC ESN training.
 //
-// The readout is linear in the reservoir state, so the optimal weights are not
-// something we have to chase with SGD: they are the one-shot ridge-regression
-// solution. Collect the state matrix S (rows = timesteps, cols = N reservoir
-// units PLUS a bias/intercept column) and the target matrix Y (here a single
-// column x_{t+1}). The ridge readout minimises ||S*Wout - Y||^2 + lambda||Wout||^2,
-// whose normal equations are
+// The readout is linear in the reservoir state, so the optimal weights are the
+// one-shot ridge-regression solution. Collect the state matrix S (rows =
+// timesteps, cols = N reservoir units PLUS a bias/intercept column) and the
+// target matrix Y (a single column x_{t+1}). The ridge readout minimises
+// ||S*Wout - Y||^2 + lambda||Wout||^2, whose normal equations are
 //
 //     (S^T S + lambda I) Wout = S^T Y          ->   A Wout = B
 //
-// We form A (size (N+1)x(N+1)) and B ((N+1)x1) and solve the small dense system
-// directly via neuralvolume's shared NeuralLinearSolve (Gauss-Jordan with
-// partial pivoting) - simple, deterministic and exact for this size. No
-// learning rate, no epochs, no shuffling: it is a single linear solve.
+// We form A ((N+1)x(N+1)) and B ((N+1)x1) and solve the small dense system via
+// neuralvolume's shared NeuralLinearSolve (Gauss-Jordan with partial pivoting).
 // ----------------------------------------------------------------------------
-
-// Build the trained readout via the closed-form ridge solve, reusing the SAME
-// reservoir/washout/training window as TrainReadout so the comparison is
-// apples-to-apples. The returned TNNet is the SAME Input(N)->FullConnectLinear(1)
-// shape as the SGD arm, with Wout[0..N-1] written into the neuron weights and
-// the intercept (bias column) into the neuron bias.
-function RidgeReadout(var R: TReservoir; Lambda: TNeuralFloat): TNNet;
+function RidgeReadout(Lambda: TNeuralFloat): TNNet;
 var
   NN: TNNet;
-  t, i, j, d, rows: integer;
+  States: TNNetVolume;
+  drive: array of TNeuralFloat;
+  t, i, j, d, rows, Len: integer;
   S: array of TNeuralFloat;   // rows x d   (d = N+1, last col = bias 1.0)
   Y: array of TNeuralFloat;   // rows x 1
   A: array of TNeuralFloat;   // d x d  normal-equations matrix
@@ -294,23 +245,24 @@ var
 begin
   d := cN + 1;                 // reservoir units + 1 bias/intercept column
   rows := cTrainLen;
+  Len := cWarmup + cTrainLen;
 
-  ResetState(R);
-  for t := 0 to cWarmup - 1 do
-    StepReservoir(R, Series(t));   // washout (same as SGD arm)
+  SetLength(drive, Len);
+  for t := 0 to Len - 1 do drive[t] := Series(t);
+  States := RunReservoir(drive, Len);
 
   SetLength(S, rows * d);
   SetLength(Y, rows * 1);
   for i := 0 to rows - 1 do
   begin
     t := cWarmup + i;
-    StepReservoir(R, Series(t));
-    for j := 0 to cN - 1 do S[i * d + j] := R.H[j];
+    for j := 0 to cN - 1 do
+      S[i * d + j] := States.FData[States.GetRawPos(t, 0, j)];
     S[i * d + cN] := 1.0;             // bias/intercept column
     Y[i] := Series(t + 1);
   end;
 
-  // A = S^T S + lambda*I   (symmetric positive-definite for lambda>0).
+  // A = S^T S + lambda*I.
   SetLength(A, d * d);
   for i := 0 to d - 1 do
     for j := 0 to d - 1 do
@@ -330,11 +282,9 @@ begin
     Bmat[i] := acc;
   end;
 
-  // Solve A * Wout = B in place; Bmat now holds Wout (length d).
   if not NeuralLinearSolve(A, Bmat, d, 1) then
     WriteLn('    WARNING: ridge normal-equations matrix was singular.');
 
-  // Pack Wout into the SAME readout-net shape as the SGD arm.
   NN := TNNet.Create();
   NN.AddLayer([
     TNNetInput.Create(cN),
@@ -377,19 +327,21 @@ begin
 end;
 
 // Teacher-forced one-step test NRMSE plus the persistence baseline
-// (predict x_{t+1} = x_t) over the same window. The reservoir is warmed up
-// again on the test window's lead-in so its state is valid.
-procedure TeacherForcedTest(var R: TReservoir; NN: TNNet;
+// (predict x_{t+1} = x_t) over the test window.
+procedure TeacherForcedTest(NN: TNNet;
   out ModelNRMSE, BaselineNRMSE: TNeuralFloat);
 var
-  t, idx, StartT: integer;
+  t, idx, StartT, Len: integer;
+  drive: array of TNeuralFloat;
+  States: TNNetVolume;
   InV, OutV: TNNetVolume;
   Pred, Truth, Persist: array of TNeuralFloat;
 begin
   StartT := cWarmup + cTrainLen; // continue past the training window
-  ResetState(R);
-  for t := 0 to StartT - 1 do
-    StepReservoir(R, Series(t));   // washout + replay so state is consistent
+  Len := StartT + cTestLen;
+  SetLength(drive, Len);
+  for t := 0 to Len - 1 do drive[t] := Series(t);
+  States := RunReservoir(drive, Len);
 
   SetLength(Pred, cTestLen);
   SetLength(Truth, cTestLen);
@@ -400,8 +352,7 @@ begin
     for idx := 0 to cTestLen - 1 do
     begin
       t := StartT + idx;
-      StepReservoir(R, Series(t));      // teacher forcing: real input
-      StateToVolume(R, InV);
+      StateToVolume(States, t, InV);   // teacher forcing: real input drove it
       NN.Compute(InV);
       NN.GetOutput(OutV);
       Pred[idx]    := OutV.Raw[0];
@@ -417,33 +368,39 @@ begin
 end;
 
 // Free-run: prime the reservoir on the real series, then feed the readout's
-// own output back as the next input for cFreeRun steps. Fills Pred/Truth and
-// returns the free-run NRMSE.
-function FreeRun(var R: TReservoir; NN: TNNet;
-  out Pred, Truth: array of TNeuralFloat): TNeuralFloat;
+// own output back as the next input for cFreeRun steps. Because the layer runs
+// a whole sequence per Compute (state re-derived from the prefix each call,
+// exact under the echo-state property), each free-run step EXTENDS the driving
+// sequence with our own prediction and re-runs, reading the final state.
+function FreeRun(NN: TNNet; out Pred, Truth: array of TNeuralFloat): TNeuralFloat;
 var
-  t, idx, StartT: integer;
+  t, idx, StartT, Len: integer;
+  drive: array of TNeuralFloat;
+  States: TNNetVolume;
   InV, OutV: TNNetVolume;
   x: TNeuralFloat;
 begin
   StartT := cWarmup + cTrainLen;
-  ResetState(R);
-  for t := 0 to StartT - 1 do
-    StepReservoir(R, Series(t));
+  // Driving sequence: real series up to StartT (inclusive), then our own
+  // predictions appended one at a time.
+  SetLength(drive, StartT + 1 + cFreeRun);
+  for t := 0 to StartT do drive[t] := Series(t);
+  Len := StartT + 1;  // current driving length (last real input at StartT)
 
   InV  := TNNetVolume.Create(cN, 1, 1);
   OutV := TNNetVolume.Create(1, 1, 1);
   try
-    x := Series(StartT);  // last real input that primes the loop
     for idx := 0 to cFreeRun - 1 do
     begin
-      StepReservoir(R, x);              // drive with our OWN previous output
-      StateToVolume(R, InV);
+      States := RunReservoir(drive, Len);     // drive with seq incl. own outputs
+      StateToVolume(States, Len - 1, InV);    // state after the latest input
       NN.Compute(InV);
       NN.GetOutput(OutV);
-      x := OutV.Raw[0];                 // feedback: prediction becomes input
+      x := OutV.Raw[0];                        // feedback: prediction = next input
       Pred[idx]  := x;
       Truth[idx] := Series(StartT + 1 + idx);
+      drive[Len] := x;                         // append for the next step
+      Inc(Len);
     end;
   finally
     InV.Free;
@@ -503,7 +460,6 @@ const
   cLambdaSweep: array[0..3] of TNeuralFloat = (0.0, 1e-6, 1e-4, 1e-2);
 
 var
-  R: TReservoir;
   NN, RidgeNN: TNNet;
   TfModel, TfBaseline, FrGood, FrBad: TNeuralFloat;
   RidgeTf, RidgeFr, BestRidgeTf, BestRidgeFr: TNeuralFloat;
@@ -518,40 +474,40 @@ begin
                     exOverflow, exUnderflow, exPrecision]);
   RandSeed := 2026;
   AllOK := True;
+  gReservoir := nil;
+  gDrive := TNNetVolume.Create(cMaxLen, 1, 1);
 
   WriteLn('Echo State Network (Reservoir Computing, Jaeger 2001)');
   WriteLn('Reservoir N=', cN, '  leak=', cLeak:0:2, '  sparsity=',
     cSparsity:0:2, '  target rho=', cRhoGood:0:2);
+  WriteLn('Recurrent core: reusable TNNetEchoStateReservoir layer.');
   WriteLn('Task: one-step prediction of sin(0.2 t) + 0.3 sin(0.31 t).');
   WriteLn(StringOfChar('=', 64));
 
   // ---- Working case: rho < 1 (echo-state property holds) -----------------
   WriteLn;
   WriteLn('[1] Building reservoir at rho=', cRhoGood:0:2, ' ...');
-  BuildReservoir(R, cRhoGood);
-  WriteLn('    measured raw W: spectral RADIUS rho = ', R.Rho:0:4,
-    '   spectral NORM sigma_1 = ', R.Sigma:0:4, '  (rho <= sigma_1)');
-  WriteLn('    -> W rescaled so its true spectral radius = ', cRhoGood:0:2);
+  BuildReservoir(cRhoGood);
+  WriteLn('    measured raw W: spectral RADIUS rho = ', gResLayer.MeasuredRho:0:4);
+  WriteLn('    -> W rescaled by the layer so its true spectral radius = ',
+    cRhoGood:0:2);
 
   WriteLn('    training the linear readout (', cReadoutEpochs, ' epochs)...');
-  NN := TrainReadout(R);
+  NN := TrainReadout();
 
-  TeacherForcedTest(R, NN, TfModel, TfBaseline);
+  TeacherForcedTest(NN, TfModel, TfBaseline);
   WriteLn(Format('    teacher-forced one-step NRMSE = %.4f', [TfModel]));
   WriteLn(Format('    persistence baseline   NRMSE = %.4f', [TfBaseline]));
 
   SetLength(PredG, cFreeRun);
   SetLength(TruthG, cFreeRun);
-  FrGood := FreeRun(R, NN, PredG, TruthG);
+  FrGood := FreeRun(NN, PredG, TruthG);
   WriteLn(Format('    free-run (autonomous)  NRMSE = %.4f', [FrGood]));
   WriteLn;
   AsciiPlot(PredG, TruthG);
   NN.Free;
 
   // ---- Closed-form RIDGE readout (one-shot) + lambda sweep ----------------
-  // SAME reservoir, SAME washout/training window, SAME error metric as the SGD
-  // arm above - the ONLY difference is how Wout is obtained: a single Tikhonov
-  // normal-equations solve instead of an SGD loop. No learning rate to tune.
   WriteLn;
   WriteLn(StringOfChar('-', 64));
   WriteLn('[1b] Closed-form RIDGE readout  Wout = (S^T S + lambda I)^-1 S^T Y');
@@ -564,16 +520,11 @@ begin
   BestLambda  := cLambdaSweep[0];
   for li := 0 to High(cLambdaSweep) do
   begin
-    RidgeNN := RidgeReadout(R, cLambdaSweep[li]);
-    TeacherForcedTest(R, RidgeNN, RidgeTf, RidgeTfDummy);
-    RidgeFr := FreeRun(R, RidgeNN, PredR, TruthR);
+    RidgeNN := RidgeReadout(cLambdaSweep[li]);
+    TeacherForcedTest(RidgeNN, RidgeTf, RidgeTfDummy);
+    RidgeFr := FreeRun(RidgeNN, PredR, TruthR);
     WriteLn(Format('       %-9.0e  %12.4f   %12.4f',
       [cLambdaSweep[li], RidgeTf, RidgeFr]));
-    // Track the best lambda by FREE-RUN NRMSE: that is the metric that matters
-    // for autonomous generation, and it is exactly where ridge regularisation
-    // pays off - the lambda=0 fit nails the teacher-forced step but a tiny
-    // unregularised readout amplifies error catastrophically in the feedback
-    // loop, so the sweep is what reveals the right amount of damping.
     if RidgeFr < BestRidgeFr then
     begin
       BestRidgeTf := RidgeTf;
@@ -594,13 +545,12 @@ begin
   WriteLn(StringOfChar('=', 64));
   WriteLn('[2] ABLATION - rebuilding reservoir at rho=', cRhoBad:0:2,
     ' (> 1, echo-state property BROKEN)');
-  BuildReservoir(R, cRhoBad);
-  WriteLn('    measured raw W: spectral RADIUS rho = ', R.Rho:0:4,
-    '   spectral NORM sigma_1 = ', R.Sigma:0:4);
-  NN := TrainReadout(R);
+  BuildReservoir(cRhoBad);
+  WriteLn('    measured raw W: spectral RADIUS rho = ', gResLayer.MeasuredRho:0:4);
+  NN := TrainReadout();
   SetLength(PredB, cFreeRun);
   SetLength(TruthB, cFreeRun);
-  FrBad := FreeRun(R, NN, PredB, TruthB);
+  FrBad := FreeRun(NN, PredB, TruthB);
   WriteLn(Format('    free-run (autonomous)  NRMSE = %.4g  (expected to explode)',
     [FrBad]));
   NN.Free;
@@ -630,9 +580,7 @@ begin
     AllOK := False;
   end;
 
-  // 3) ablation: rho>1 free-run must diverge far worse than rho<1. A broken
-  //    reservoir can overflow tanh feedback to NaN/Inf - that is the most
-  //    extreme divergence, so treat any non-finite NRMSE as a pass too.
+  // 3) ablation: rho>1 free-run must diverge far worse than rho<1.
   if IsNan(FrBad) or IsInfinite(FrBad) or (FrBad > 5.0 * FrGood + 1.0) then
     WriteLn(Format('  PASS  rho>1 free-run NRMSE %.4g explodes vs rho<1 %.4f',
       [FrBad, FrGood]))
@@ -642,6 +590,9 @@ begin
       [FrBad, FrGood]));
     AllOK := False;
   end;
+
+  gReservoir.Free;
+  gDrive.Free;
 
   WriteLn(StringOfChar('=', 64));
   if AllOK then

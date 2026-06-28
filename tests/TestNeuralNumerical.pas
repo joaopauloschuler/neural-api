@@ -598,6 +598,9 @@ type
     procedure TestWKVIncrementalDecodeEquivalence;
     procedure TestTokenShiftIncrementalDecodeEquivalence;
     procedure TestRWKVBlockIncrementalDecodeEquivalence;
+    procedure TestEchoStateReservoirShapeInference;
+    procedure TestEchoStateReservoirReadoutGradientCheck;
+    procedure TestEchoStateReservoirSerializationRoundTrip;
     procedure TestLRUShapeInference;
     procedure TestLRUInputGradientCheck;
     procedure TestLRUWeightGradientCheck;
@@ -31002,6 +31005,162 @@ begin
   finally
     NNInc.Free;
     NNFull.Free;
+  end;
+end;
+
+// --- TNNetEchoStateReservoir (Echo State Network reservoir, Jaeger 2001) -----
+
+procedure TTestNeuralNumerical.TestEchoStateReservoirShapeInference;
+var
+  NN: TNNet;
+  L: TNNetEchoStateReservoir;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    // (SeqLen=6,1,InputDim=2) driving signal -> (SeqLen=6,1,N=8) reservoir states.
+    NN.AddLayer(TNNetInput.Create(6, 1, 2, 1));
+    L := TNNetEchoStateReservoir.Create(8, 0.3, 0.9, 0.5, 1.0, 777);
+    NN.AddLayer(L);
+    AssertEquals('ESN output SizeX = SeqLen', 6, L.Output.SizeX);
+    AssertEquals('ESN output SizeY', 1, L.Output.SizeY);
+    AssertEquals('ESN output Depth = N', 8, L.Output.Depth);
+    AssertEquals('ESN has NO trainable neurons (frozen reservoir)',
+      0, L.Neurons.Count);
+    // The one-shot spectral rescale ran: raw radius was measured (> 0).
+    AssertTrue('ESN measured spectral radius of raw W > 0', L.MeasuredRho > 0);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestEchoStateReservoirReadoutGradientCheck;
+// End-to-end input-gradient check on Input -> EchoStateReservoir ->
+// FullConnectLinear(1) read-out. The reservoir is frozen (no weight gradients);
+// this exercises the trainable read-out path AND the reservoir's exact BPTT
+// adjoint that carries the gradient back to the input, which is what makes the
+// layer composable with a downstream trainable read-out.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;  // shared-RNG ordering requirement
+  NN := TNNet.Create();
+  // SeqLen=4, InputDim=1 driving signal; reservoir N=6; read-out -> 1 value/step.
+  Input := TNNetVolume.Create(4, 1, 1);
+  InputPlus := TNNetVolume.Create(4, 1, 1);
+  Desired := TNNetVolume.Create(4, 1, 1);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));  // pError=1 for input-grad read
+    NN.AddLayer(TNNetEchoStateReservoir.Create(6, 0.4, 0.9, 0.6, 1.0, 13579));
+    // Per-token (per-timestep) trainable linear read-out: PointwiseConvLinear
+    // projects each timestep's N-dim state -> 1 value, preserving SeqLen along
+    // SizeX (a whole-volume FullConnect would mix the sequence into one scalar).
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(1));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Bounded inputs/targets (FD-truncation control); tanh keeps it well-behaved.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.5;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('ESN read-out input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('EchoStateReservoir read-out input gradient max abs error: ',
+      maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestEchoStateReservoirSerializationRoundTrip;
+// The frozen matrices are NOT stored: they regenerate deterministically from the
+// seed (FStruct[2]) on reload, including the spectral rescale. So a save/load
+// round-trip must reproduce the forward output bit-for-bit.
+var
+  NN, NN2: TNNet;
+  Input, Out1, Out2: TNNetVolume;
+  S: string;
+  i: integer;
+  maxErr: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 2);
+  Out1 := TNNetVolume.Create();
+  Out2 := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 2, 1));
+    NN.AddLayer(TNNetEchoStateReservoir.Create(7, 0.35, 0.85, 0.4, 1.5, 24680));
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.5) * 0.5;
+    NN.Compute(Input);
+    Out1.Copy(NN.GetLastLayer.Output);
+
+    S := NN.SaveStructureToString();
+    NN2.LoadStructureFromString(S);
+    NN2.Compute(Input);
+    Out2.Copy(NN2.GetLastLayer.Output);
+
+    AssertEquals('ESN reload output size', Out1.Size, Out2.Size);
+    maxErr := 0;
+    for i := 0 to Out1.Size - 1 do
+      if Abs(Out1.Raw[i] - Out2.Raw[i]) > maxErr then
+        maxErr := Abs(Out1.Raw[i] - Out2.Raw[i]);
+    WriteLn('EchoStateReservoir serialization round-trip max abs error: ',
+      maxErr:0:10);
+    AssertTrue('ESN deterministic reservoir reproduces forward output (< 1e-6)',
+      maxErr < 1e-6);
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+    Out1.Free;
+    Out2.Free;
   end;
 end;
 
