@@ -1961,7 +1961,7 @@ not z = mu + sigma·eps sampling.)
       4-bit Llama/Qwen) loads through the existing `BuildLlamaFromSafeTensors`
       family. Cross-check against a `bitsandbytes` reference tensor under the
       `venv x` python.
-- [ ] Continuous-latent variational autoencoder example `examples/VAE` (KL +
+- [X] Continuous-latent variational autoencoder example `examples/VAE` (KL +
       Gaussian reparameterization), distinct from the existing discrete `VQVAE`
       example. The `TNNetKLDivergence` loss layer already exists, but there is no
       reparameterization sampling layer, so first add a shape-preserving

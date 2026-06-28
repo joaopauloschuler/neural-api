@@ -1113,6 +1113,8 @@ type
     procedure TestGumbelSoftmaxSoftForwardIsProbability;
     procedure TestGumbelSoftmaxHardForwardIsOneHot;
     procedure TestGumbelSoftmaxGradientCheck;
+    procedure TestGaussianReparameterizeGradientCheck;
+    procedure TestVAEKLDivergenceGradientCheck;
     procedure TestGumbelSoftmaxSerializationRoundTrip;
     procedure TestGumbelSoftmaxSetTemperature;
     procedure TestPointwiseSoftMaxExactJacobianGradientCheck;
@@ -25252,6 +25254,156 @@ begin
     Input.Free;
     InputPlus.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGaussianReparameterizeGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    // Reseed so the FROZEN eps draw is identical across every forward; this is
+    // the fixed-noise discipline that keeps the finite difference honest.
+    RandSeed := 424242;
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Central-difference gradient check for TNNetGaussianReparameterize. Input
+  // depth 4 = (mu_0, mu_1 | log_var_0, log_var_1); output depth 2 = z. The
+  // layer is left Enabled (sampling on) and RandSeed is reset before every
+  // forward so eps is the SAME frozen draw the analytic backward reuses. This
+  // exercises BOTH gradient branches: dz/dmu = 1 and dz/dlog_var = 0.5*sigma*eps.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  // TNNetInput.Create(x,y,d,1) avoids the OOB stale-heap flake on input-grad tests.
+  Input := TNNetVolume.Create(1, 1, 4);
+  InputPlus := TNNetVolume.Create(1, 1, 4);
+  epsilon := 1e-3;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetGaussianReparameterize.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.6 + 0.2; // keep log_var modest
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.1 * (i + 1);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      RandSeed := 424242;
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('GaussianReparameterize gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 1e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestVAEKLDivergenceGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, HalfD: integer;
+  beta: TNeuralFloat;
+
+  // KL(N(mu,sigma^2) || N(0,1)) summed over latents; this is the scalar the
+  // head's gradient descends. The head ignores the seeded residual, so the
+  // reference loss is the analytic KL itself.
+  function ComputeKL(AInput: TNNetVolume): TNeuralFloat;
+  var
+    mu, lv: TNeuralFloat;
+    k: integer;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to HalfD - 1 do
+    begin
+      mu := AInput.Raw[k];
+      lv := AInput.Raw[k + HalfD];
+      Result := Result + beta * (-0.5) * (1 + lv - mu * mu - Exp(lv));
+    end;
+  end;
+
+begin
+  // Central-difference check for TNNetVAEKLDivergence: input (mu | log_var),
+  // depth 4 -> 2 latents. The head overwrites FOutputError with the analytic
+  // KL gradient (dKL/dmu = mu, dKL/dlog_var = 0.5*(exp(lv)-1)), scaled by beta.
+  RandSeed := 424242;
+  beta := 0.7;
+  HalfD := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  InputPlus := TNNetVolume.Create(1, 1, 4);
+  epsilon := 1e-3;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetVAEKLDivergence.Create(beta));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 0.5 + 0.1;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeKL(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeKL(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      // Backpropagate with a zero target; the head ignores it and writes the KL grad.
+      NN.Backpropagate(Input);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('VAEKLDivergence gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 1e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
   end;
 end;
 
