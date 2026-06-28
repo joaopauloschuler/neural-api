@@ -1940,82 +1940,11 @@ NF4 dequant path do not exist (only int8 + MXFP4-dequant do).)
         garbage path). A real `bnb-4bit` Llama/Qwen slicer fixture is RAM/network
         -gated; today's parity is the random pico numpy oracle only.
 
-## Accelerator & dedup batch 2026-06-27d
-
-(All verified absent in source before listing. Checked: `TNNetRotaryEmbedding`,
-whole-volume `TNNetLayerNorm`/`TNNetRMSNorm`, the generic activation-function
-forward path, and `TNNetELU`/`TNNetSELU` — none carry an `FShouldOpenCL`/
-`ComputeOpenCL` path nor an AVX branch where noted. Only the per-token
-`TNNetTokenLayerNorm`/`TNNetTokenRMSNorm` and `TNNetGroupNorm` currently offload
-to OpenCL via `cai_token_norm`/`cai_group_norm`; the generic activation loop at
-neuralnetwork.pas ~108869 still calls `FActivationFn` scalar per element.)
-
-- [X] OpenCL forward offload for `TNNetRotaryEmbedding` RoPE. RoPE runs on the
-      Q and K projections of EVERY attention block on EVERY decode step of every
-      imported LLM (Llama/Qwen/Mistral/...), and its `Compute` (neuralnetwork.pas
-      ~35905) is a scalar nested loop (per token, per channel-pair: a `pcr_cosf`/
-      `pcr_sinf` rotation of the `(2k, 2k+1)` interleaved pair). The data is
-      depth-contiguous and the rotation is embarrassingly parallel. Add a
-      `cai_rope` kernel to `neural/neural.cl` (one work-item per `(token,
-      channel-pair)`, taking the precomputed `theta[]` / `PositionOffset` so the
-      angle table is not recomputed on the device) and wire it through the shared
-      host-helper pattern (mirror `TNNetGroupNormCL`/`TNNetPool2DCL`). Forward-only,
-      keep the scalar path as fallback, gate on `FOutput.Size >=
-      NeuralConvOpenCLMinWork`, and pin `<1e-4` parity with a CPU-vs-OpenCL test
-      that skips cleanly when no device is present.
-
-- [X] OpenCL forward offload for whole-volume `TNNetLayerNorm` / `TNNetRMSNorm`.
-      The per-token `TNNetTokenLayerNorm`/`TNNetTokenRMSNorm` already offload via
-      `cai_token_norm`, but the whole-volume `TNNetLayerNorm` (normalize over the
-      entire `SizeX*SizeY*Depth` then per-element affine, ~58916) and `TNNetRMSNorm`
-      (~59252) are still scalar `GetAvg`/`GetSumSqr` + `Mul`/`Add` passes that run
-      on the host between device-resident layers in vision/classification stacks,
-      forcing an activation round-trip. Reuse the `cai_token_norm` kernel treating
-      the whole sample as a single "token" (or `cai_group_norm` with one group),
-      arming `FShouldOpenCL` exactly like the Token* siblings. Forward-only,
-      `<1e-4` CPU-vs-OpenCL parity test, scalar fallback retained.
-
-- [X] AVX-vectorize the generic activation-function forward path for the
-      sigmoid/tanh-family layers (`TNNetSigmoid`, `TNNetHyperbolicTangent`). The
-      shared `ApplyActivationFunctionToOutput` loop (neuralnetwork.pas ~108869)
-      calls the scalar `FActivationFn` pointer once per element even though
-      `TVolume` already exposes the batched `VectorSigmoid` / `VectorTanh` class
-      procedures (neuralvolume.pas ~482, already used by `TNNetSwish`/`TNNetGELU`).
-      Dispatch the contiguous output buffer through `VectorSigmoid`/`VectorTanh`
-      when the layer's activation is sigmoid/tanh (depth-contiguous, full buffer),
-      keeping the scalar `FActivationFn` loop as the `{$IFNDEF AVXANY}` fallback and
-      for activations without a vector kernel. Pin parity with the existing
-      activation saturation-safety / numerical-gradient tests.
-
-- [X] AVX-vectorize the `TNNetELU` / `TNNetSELU` exponential negative branch.
-      Both forwards (neuralnetwork.pas ~43273 and ~43210) loop a scalar `pcr_expf`
-      over the negative-input branch (`alpha*(exp(x)-1)` for ELU, the scaled SELU
-      variant) while the positive branch is plain arithmetic — a depth-contiguous
-      elementwise pass that can reuse the same `AVXExp` vector exponential the
-      GLU-family / `PointwiseSoftMax` AVX passes already use, masking the
-      positive/negative branches per 8-lane block. Keep the scalar branch as the
-      `{$IFNDEF AVXANY}` fallback and pin parity with the existing saturation /
-      numerical-gradient tests.
-
-- [X] Remove the duplicated host-side `SoftmaxRow` / `CosineSimilarity` /
-      per-row-L2-normalize helper routines. The same numerically-stable softmax
-      over a logits/score row is hand-rolled in `examples/RAG/RAG.lpr` (~407) and
-      `examples/ChatTerminal/ChatTerminal.lpr` (~430); cosine-similarity dot+norm
-      is re-coded in `RAG.lpr` (~344), `examples/HopfieldRetrieval/HopfieldRetrieval.lpr`
-      (~122) and `neural/neuralpretrained.pas` (`CosineSimilarity`/`CosineDot`,
-      ~23346); per-row L2 normalization is duplicated in `neuralpretrained.pas`
-      (`ColBERTNormalizeRows` ~23715 and `BertPoolSentenceEmbedding`'s tail ~23216).
-      These are post-network host math (operate on raw `TNNetVolume` rows outside
-      the layer graph, so they are NOT layer replacements), but they are verbatim
-      copies. Extract one reusable set of `TNNetVolume`/`neuralvolume`-level
-      routines (`RowSoftMax`, `RowCosineSimilarity`, `NormalizeRowsL2`) and have all
-      call sites use them. Cover with a small unit test (softmax sums to 1, cosine
-      of a vector with itself = 1, normalized rows have unit L2).
-
 ## Accelerator & dedup batch 2026-06-27e (follow-ups surfaced by 27d)
 
-(The whole 2026-06-27d batch above is LANDED. These are natural next steps that
-the landed work exposed. All verified absent in source before listing.)
+(The 2026-06-27d accelerator/dedup batch is LANDED — its completed tasks have
+been removed from this list. These are natural next steps that the landed work
+exposed. All verified absent in source before listing.)
 
 - [ ] Extend the AVX activation-forward dispatch (now live for Sigmoid/Tanh via
       `VectorSigmoid`/`VectorTanh` in `ApplyActivationFunctionToOutput`) to any
