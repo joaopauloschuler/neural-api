@@ -315,6 +315,10 @@ type
     procedure TestPixelShuffleBackwardOpenCLParity;
     procedure TestBicubicUpsampleBackwardOpenCLParity;
     procedure TestBilinearResizeOpenCLParity;
+    procedure TestResize2DNearestInputGradientCheck;
+    procedure TestResize2DBilinearInputGradientCheck;
+    procedure TestResize2DBicubicInputGradientCheck;
+    procedure TestResize2DSerializationRoundTrip;
     procedure TestDeconvolutionOpenCLParity;
     // OpenCL forward offload parity (vs CPU) for the depthwise convolutions.
     procedure TestDepthwiseConvOpenCLParity;
@@ -58292,6 +58296,136 @@ begin
     Input.Free;
     InputPlus.Free;
     Desired.Free;
+  end;
+end;
+
+// Shared finite-difference INPUT-gradient driver for TNNetResize2D. Resizes an
+// (InX,InY,Depth) feature map to (OutX,OutY) in the given mode and checks the
+// analytic input gradient against a central difference. Covers up- AND down-
+// sampling (non-integer ratio) and both align_corners conventions.
+procedure Resize2DInputGradHelper(ATest: TTestNeuralNumerical;
+  AMode, AAlignCorners, InX, InY, OutX, OutY, Depth: integer;
+  const AName: string; ATol: TNeuralFloat);
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, InSize, OutSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  InSize := InX * InY * Depth;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(InX, InY, Depth);
+  InputPlus := TNNetVolume.Create(InX, InY, Depth);
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(InX, InY, Depth, 1)); // 1 = collect input error
+    NN.AddLayer(TNNetResize2D.Create(OutX, OutY, AMode, AAlignCorners));
+    OutSize := NN.GetLastLayer.Output.Size;
+    Desired := TNNetVolume.Create(OutSize, 1, 1);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.4 + 0.05;
+    for i := 0 to OutSize - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.4;
+
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+
+      ATest.AssertTrue(AName + ' input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < ATol);
+    end;
+    WriteLn('  ', AName, ' input gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestResize2DNearestInputGradientCheck;
+begin
+  // Nearest: each output picks exactly one source pixel; the input gradient is a
+  // pure (transposed) selection, so the central difference matches to FP noise.
+  // 5x4 -> 7x3 (non-integer up/down ratio).
+  Resize2DInputGradHelper(Self, 0, 0, 5, 4, 7, 3, 2, 'Resize2D-Nearest', 1e-2);
+end;
+
+procedure TTestNeuralNumerical.TestResize2DBilinearInputGradientCheck;
+begin
+  // Bilinear, align_corners=False, 4x4 -> 6x5 (non-integer upscale). Linear map,
+  // so the FD is exact within float rounding.
+  Resize2DInputGradHelper(Self, 1, 0, 4, 4, 6, 5, 2, 'Resize2D-Bilinear-ac0', 1e-2);
+  // align_corners=True, downscale 6x6 -> 4x3 (exercises the OutSize-1 map +
+  // down-sampling transpose).
+  Resize2DInputGradHelper(Self, 1, 1, 6, 6, 4, 3, 2, 'Resize2D-Bilinear-ac1', 1e-2);
+end;
+
+procedure TTestNeuralNumerical.TestResize2DBicubicInputGradientCheck;
+begin
+  // Bicubic, align_corners=False, 5x5 -> 7x6 (non-integer upscale). Separable
+  // Keys cubic is linear in the input, so the FD is exact.
+  Resize2DInputGradHelper(Self, 2, 0, 5, 5, 7, 6, 2, 'Resize2D-Bicubic-ac0', 1e-2);
+  // align_corners=True, 6x6 -> 4x4 (downscale).
+  Resize2DInputGradHelper(Self, 2, 1, 6, 6, 4, 4, 2, 'Resize2D-Bicubic-ac1', 1e-2);
+end;
+
+procedure TTestNeuralNumerical.TestResize2DSerializationRoundTrip;
+var
+  L: TNNetResize2D;
+  NN, NN2: TNNet;
+  S: string;
+begin
+  // FStruct[0..3] (OutX,OutY,mode,align_corners) must survive Save/Load.
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(8, 6, 3));
+    NN.AddLayer(TNNetResize2D.Create(11, 5, 2, 1));
+    S := NN.SaveStructureToString();
+    NN2.LoadStructureFromString(S);
+    AssertTrue('round-trips to TNNetResize2D',
+      NN2.GetLastLayer is TNNetResize2D);
+    L := NN2.GetLastLayer as TNNetResize2D;
+    AssertEquals('OutX', 11, L.Output.SizeX);
+    AssertEquals('OutY', 5, L.Output.SizeY);
+    AssertEquals('Depth preserved', 3, L.Output.Depth);
+  finally
+    NN.Free;
+    NN2.Free;
   end;
 end;
 

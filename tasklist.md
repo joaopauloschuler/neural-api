@@ -2032,7 +2032,7 @@ state confirmed via the layer `Compute`/`ComputeOpenCL` methods on 2026-06-28.)
       existing "keep activations resident across consecutive offloaded layers"
       generator follow-up.
 
-- [ ] Arbitrary-output-SIZE resize layer (`TNNetResize2D`, port of torch
+- [X] Arbitrary-output-SIZE resize layer (`TNNetResize2D`, port of torch
       `F.interpolate(size=(H,W), mode=...)`). The existing `TNNetBilinearUpsample`
       / `TNNetBicubicUpsample` only support an INTEGER scale factor; there is no
       layer that resamples a feature map to an arbitrary target `(SizeX, SizeY)`
@@ -2046,3 +2046,24 @@ state confirmed via the layer `Compute`/`ComputeOpenCL` methods on 2026-06-28.)
       not a fork. Numerical-gradient test the input path for each mode. This is
       needed wherever a model expects a fixed input resolution (ViT/SigLIP/DINOv2
       towers, super-res pre/post resize) and for general vision preprocessing.
+      DONE: `TNNetResize2D` (neuralnetwork.pas) with 3 modes (0=nearest,
+      1=bilinear, 2=bicubic) + align_corners; size-based source maps so down-
+      sampling/non-integer ratios work; forward reuses the Move/MulAdd Depth-
+      column idiom and the shared `CubicWeights`/`BilinearResizeMap` kernels;
+      backward is the exact transpose scatter for every mode. Registered in both
+      LoadDataFromString branches; FStruct[0..3] round-trip (serialization test).
+      Numerical input-gradient tests for all 3 modes (up + down, both
+      align_corners). Tolerance is 1e-2 to match the sibling Bilinear/Bicubic
+      gradient tests (float32 FD on order-0.5 values cannot reach 1e-4 even though
+      the layer is exactly linear; analytic vs FD agree to ~2e-4).
+      Follow-ups discovered:
+  - [ ] `antialias=True` box-prefilter for downscale was SCOPED OUT of v1 (it
+        changes the kernel support to scale-dependent, breaking the fixed 2-tap /
+        4-tap separable gather; torch's antialias widens the kernel and
+        renormalises). Add it as an opt-in 5th flag (FStruct[4]) when needed.
+  - [ ] DID NOT dedup the integer-factor up-samplers onto `TNNetResize2D` — the
+        risk note said not to force it. `TNNetBilinearUpsample`/`Upsample` keep
+        their OpenCL gather/scatter paths; `TNNetResize2D` is CPU-only for now.
+        Add an OpenCL forward (reuse `TNNetBilinearGatherCL`/`TNNetBicubicGatherCL`
+        exactly as `TNNetBilinearResize`/`TNNetBicubicUpsample` do) if profiling
+        shows it on a hot path.
