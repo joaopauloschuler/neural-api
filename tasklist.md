@@ -1979,7 +1979,7 @@ rolled host math is DELIBERATELY self-contained channel-major code, not a layer-
 replacement candidate — see the audio-holder AVX/OpenCL entries above; do NOT
 file "replace Vits hand-made with TNNet layers".)
 
-- [ ] OpenCL forward offload for the softmax head — `TNNetPointwiseSoftMax`
+- [X] OpenCL forward offload for the softmax head — `TNNetPointwiseSoftMax`
       (neuralnetwork.pas ~18959, forward is `FOutput.PointwiseSoftMax`) and the
       whole-volume `TNNetSoftMax` (~82534). Today both run the normalization on the
       HOST even when the producer (e.g. the SDPA score matrix, or the final

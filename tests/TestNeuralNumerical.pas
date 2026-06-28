@@ -353,6 +353,11 @@ type
     procedure AvgPoolOpenCLParity;
     // OpenCL token-gather forward offload parity (vs CPU) for TNNetEmbedding.
     procedure EmbeddingOpenCLParity;
+    // OpenCL contiguous-group softmax forward offload parity (vs CPU) for the
+    // softmax head layers TNNetPointwiseSoftMax (per-token, GroupLen=Depth) and
+    // TNNetSoftMax (whole-volume, GroupLen=Size).
+    procedure PointwiseSoftMaxOpenCLParity;
+    procedure WholeVolumeSoftMaxOpenCLParity;
     procedure TestRoIAlignForward;
     procedure TestRoIAlignInputGradientCheck;
     procedure TestRoIAlignShapeInference;
@@ -61057,6 +61062,128 @@ begin
     end;
     WriteLn('  Embedding OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('Embedding OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Device per-token softmax forward parity. TNNetPointwiseSoftMax normalizes each
+// (X,Y) position over its contiguous Depth elements (FOutput.PointwiseSoftMax);
+// the cai_softmax offload tiles the volume into Size/Depth groups of GroupLen =
+// Depth (ApplyMinScale = false). Pinned < 1e-4 against the CPU/AVX forward.
+// Coded by Claude (AI).
+procedure TTestNeuralNumerical.PointwiseSoftMaxOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InputMax, OutMax: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 4, 12); // 20 tokens of Depth=12
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(5, 4, 12, 1));
+    NN.AddLayer(TNNetPointwiseSoftMax.Create());
+    InputMax := Input.Size - 1;
+    for i := 0 to InputMax do Input.Raw[i] := 0.9 * Sin(i * 0.37) - 0.2;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      MaxDiff := 0;
+      OutMax := OutCPU.Size - 1;
+      for i := 0 to OutMax do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    WriteLn('  PointwiseSoftMax OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('PointwiseSoftMax OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Device whole-volume softmax forward parity. TNNetSoftMax normalizes the ENTIRE
+// SizeX*SizeY*Depth sample as one group (TVolume.SoftMax: max-subtract + low-end
+// rescale); the cai_softmax offload runs a single group of GroupLen = Size with
+// ApplyMinScale = true. Pinned < 1e-4 against the CPU forward.
+// Coded by Claude (AI).
+procedure TTestNeuralNumerical.WholeVolumeSoftMaxOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InputMax, OutMax: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 3, 16); // whole-volume sample = 192
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 3, 16, 1));
+    NN.AddLayer(TNNetSoftMax.Create());
+    InputMax := Input.Size - 1;
+    for i := 0 to InputMax do Input.Raw[i] := 0.9 * Sin(i * 0.31) - 0.2;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      MaxDiff := 0;
+      OutMax := OutCPU.Size - 1;
+      for i := 0 to OutMax do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    WriteLn('  WholeVolume SoftMax OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('WholeVolume SoftMax OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;

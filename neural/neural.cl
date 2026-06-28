@@ -897,3 +897,73 @@ __kernel void cai_rope
   FY[base]     = FOutScale * (c * x0 - s * x1);
   FY[base + 1] = FOutScale * (s * x0 + c * x1);
 }
+
+// Numerically-stable softmax forward for the softmax head layers
+// (TNNetPointwiseSoftMax, TNNetSoftMax). The volume is tiled into contiguous
+// normalization groups of FGroupLen elements; group g owns FX[g*FGroupLen ..
+// +FGroupLen). One work-item per group does the standard max-subtract -> exp ->
+// sum -> divide:
+//   m = max(x);  e_i = exp(clamp(x_i - m, 4000));  y_i = e_i / sum(e)
+// FApplyMinScale selects the variant:
+//   0 = TNNetPointwiseSoftMax (FOutput.PointwiseSoftMax, GroupLen = Depth): no
+//       low-end rescaling.
+//   1 = TNNetSoftMax (TVolume.SoftMax, GroupLen = FOutput.Size): mirrors the
+//       scalar path which, after the max-subtract, multiplies the whole group by
+//       (-1000 / minValue) when minValue < -1000 (and leaves the group UNCHANGED
+//       -- TotalSum := 0 -- in the degenerate minValue == 0 all-equal case).
+// The per-group reduction stays inside one work-item to match the scalar
+// accumulation order (parity < 1e-4). Forward-only; training stays on the CPU.
+__kernel void cai_softmax
+(
+  const int FNumGroups,
+  const int FGroupLen,
+  const int FApplyMinScale,
+  __global const float* FX,
+  __global float* FY
+)
+{
+  const int g = get_global_id(0);
+  if (g >= FNumGroups) return;
+  const int base = g * FGroupLen;
+  // Per-group max (for the stable shift) and min (for the whole-volume rescale).
+  float maxv = FX[base];
+  float minv = FX[base];
+  for (int c = 1; c < FGroupLen; c++)
+  {
+    const float v = FX[base + c];
+    if (v > maxv) maxv = v;
+    if (v < minv) minv = v;
+  }
+  // Shift by the max (skipped when max == 0, matching the scalar Sub guard).
+  const float shift = (maxv != 0.0f) ? maxv : 0.0f;
+  // Whole-volume variant: after the shift, minValue := min - shift. When that
+  // shifted minimum is < -1000 the scalar path rescales the whole group by
+  // (-1000 / shiftedMin); when it is exactly 0 (all elements equal) the scalar
+  // path returns without normalizing.
+  float scale = 1.0f;
+  if (FApplyMinScale != 0)
+  {
+    const float shiftedMin = minv - shift;
+    if (shiftedMin == 0.0f)
+    {
+      // Degenerate all-equal group: scalar SoftMax leaves data unchanged.
+      for (int c = 0; c < FGroupLen; c++) FY[base + c] = FX[base + c];
+      return;
+    }
+    if (shiftedMin < -1000.0f) scale = -1000.0f / shiftedMin;
+  }
+  float total = 0.0f;
+  for (int c = 0; c < FGroupLen; c++)
+  {
+    float a = (FX[base + c] - shift) * scale;
+    if (a > 4000.0f) a = 4000.0f; else if (a < -4000.0f) a = -4000.0f;
+    const float e = exp(a);
+    FY[base + c] = e;
+    total += e;
+  }
+  if (total > 0.0f)
+  {
+    const float inv = 1.0f / total;
+    for (int c = 0; c < FGroupLen; c++) FY[base + c] *= inv;
+  }
+}
