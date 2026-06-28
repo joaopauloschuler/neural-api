@@ -1988,7 +1988,7 @@ wrappers preserved, all parity fixtures bit-identical [dd5373fc].)
 
 ## Lucky-day batch 2026-06-28i (verified-novel vision dedup / AVX / torch port)
 
-- [ ] Add a reusable `TNNetGridSample` layer (port of torch `F.grid_sample`):
+- [X] Add a reusable `TNNetGridSample` layer (port of torch `F.grid_sample`):
       two-source layer that warps a feature map by an explicit per-pixel sampling
       grid (second input supplies normalized (x, y) flow in [-1, 1] over the
       output positions), with `bilinear` and `nearest` interpolation modes,
@@ -2001,6 +2001,23 @@ wrappers preserved, all parity fixtures bit-identical [dd5373fc].)
       generates its grid from a 2x3 theta and delegates to the shared gather.
       Numerical-gradient test the grid (flow) input path; OpenCL is optional
       (the existing `TNNetAffineGridSample` gather kernel is the template).
+      DONE 2026-06-28: `TNNetGridSample` lands (neuralnetwork.pas), matching torch
+      bilinear/nearest x zeros/border x align_corners True/False (nearest uses
+      round-half-to-even; align_corners unnormalize/grad exact). Shared helper
+      `NeuralBilinearGatherColumn(Src, OutPtr, sx, sy, W, H, D, BorderPad)`
+      (zeros vs border padding) factored out; `TNNetAffineGridSample.Compute`
+      now delegates to it. Registered in all 3 dispatch sites
+      (FStruct[0..2] = interp/pad/align + injected grid layer idx, round-trips).
+      Optional bilinear OpenCL gather added (reuses TNNetBilinearGatherCL). Tests
+      in tests/TestNeuralNumerical.pas: TestGridSampleFeatureGradientCheck,
+      TestGridSampleGridGradientCheck, TestGridSampleBorderGridGradientCheck,
+      TestGridSampleNearestForward, TestGridSampleLoadFromString (all green;
+      max grad err ~1e-3). Suite 2498 scalar / 2498 AVX2 (the one AVX2 failure,
+      TestSetTrainableKeepsOutputs, is a pre-existing fp flake on clean tree).
+      FOLLOW-UP: only `TNNetAffineGridSample` was migrated to the shared helper;
+      `TNNetDeformableConv.SampleBilinear` is per-channel (per-tap offsets) and is
+      handled by the SEPARATE "AVX-vectorize the DeformableConv bilinear gather"
+      item below (which can now route through `NeuralBilinearGatherColumn`).
 
 - [ ] AVX-vectorize the `TNNetDeformableConv` bilinear gather. The offsets are
       per-tap (shared across all Depth channels of a given sampled position), so

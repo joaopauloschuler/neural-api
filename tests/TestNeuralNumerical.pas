@@ -1091,6 +1091,12 @@ type
     procedure TestAffineGridSampleSourceGradientCheck;
     procedure TestAffineGridSampleThetaGradientCheck;
     procedure TestAffineGridSampleLoadFromString;
+    // TNNetGridSample torch F.grid_sample port (normalized [-1,1] grid)
+    procedure TestGridSampleFeatureGradientCheck;
+    procedure TestGridSampleGridGradientCheck;
+    procedure TestGridSampleBorderGridGradientCheck;
+    procedure TestGridSampleNearestForward;
+    procedure TestGridSampleLoadFromString;
     // TNNetFlowWarp dense per-pixel (dx,dy) backward-warp sampler
     procedure TestFlowWarpFeatureGradientCheck;
     procedure TestFlowWarpFlowGradientCheck;
@@ -19061,6 +19067,371 @@ begin
     end;
   finally
     NN.Free; Img.Free; Theta.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGridSampleFeatureGradientCheck;
+// Finite-difference check of d(loss)/d(features) through TNNetGridSample
+// (bilinear, zeros padding, align_corners=False). The normalized grid is built
+// so every sample lands strictly INTERIOR and OFF the integer grid (all 4
+// bilinear weights nonzero, far from the kink / border).
+var
+  NN: TNNet;
+  ImgInput, GridInput: TNNetLayer;
+  ImgData, ImgPlus, Grid, Desired: TNNetVolume;
+  W, H, D, i, x, y: integer;
+  sxTarget, syTarget: TNeuralFloat;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AImg: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    ImgInput.Output.Copy(AImg);
+    GridInput.Output.Copy(Grid);
+    NN.Compute(ImgInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  W := 5; H := 4; D := 2;
+  NN := TNNet.Create();
+  ImgData := TNNetVolume.Create(W, H, D);
+  ImgPlus := TNNetVolume.Create(W, H, D);
+  Grid := TNNetVolume.Create(W, H, 2);
+  Desired := TNNetVolume.Create(W, H, D);
+  epsilon := 0.001; maxErr := 0;
+  try
+    ImgInput  := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    GridInput := NN.AddLayerAfter(TNNetInput.Create(W, H, 2, 1), 0);
+    NN.AddLayerAfter(TNNetGridSample.Create(GridInput, gsiBilinear, gspZeros, false), ImgInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to ImgData.Size - 1 do ImgData.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31);
+    // align_corners=False: px = ((x_n+1)*W - 1)/2  =>  x_n = (2*sxTarget+1)/W - 1.
+    // Target an interior fractional sample for every output pixel.
+    for y := 0 to H - 1 do
+    for x := 0 to W - 1 do
+    begin
+      sxTarget := 1.3 + 0.30 * Sin(0.7 * x + 1.1 * y);
+      syTarget := 1.2 + 0.25 * Cos(0.5 * x - 0.9 * y);
+      Grid.Store(x, y, 0, (2.0 * sxTarget + 1.0) / W - 1.0);
+      Grid.Store(x, y, 1, (2.0 * syTarget + 1.0) / H - 1.0);
+    end;
+
+    for i := 0 to ImgData.Size - 1 do
+    begin
+      ImgPlus.Copy(ImgData);
+      ImgPlus.Raw[i] := ImgData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(ImgPlus);
+      ImgPlus.Raw[i] := ImgData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(ImgPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ImgInput.Output.Copy(ImgData);
+      GridInput.Output.Copy(Grid);
+      NN.Compute(ImgInput.Output);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := ImgInput.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('GridSample feature gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestGridSampleFeatureGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; ImgData.Free; ImgPlus.Free; Grid.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGridSampleGridGradientCheck;
+// The headline gradient: finite-difference check of d(loss)/d(grid), the
+// normalized (x_n, y_n) sample field (bilinear, zeros, align_corners=False).
+// The grid comes from a second input branch so its OutputError holds the
+// accumulated d(loss)/d(grid). Samples kept interior & off-grid.
+var
+  NN: TNNet;
+  ImgInput, GridInput: TNNetLayer;
+  Img, GridData, GridPlus, Desired: TNNetVolume;
+  W, H, D, i, x, y: integer;
+  sxTarget, syTarget: TNeuralFloat;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AGrid: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    ImgInput.Output.Copy(Img);
+    GridInput.Output.Copy(AGrid);
+    NN.Compute(ImgInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  W := 5; H := 4; D := 2;
+  NN := TNNet.Create();
+  Img := TNNetVolume.Create(W, H, D);
+  GridData := TNNetVolume.Create(W, H, 2);
+  GridPlus := TNNetVolume.Create(W, H, 2);
+  Desired := TNNetVolume.Create(W, H, D);
+  epsilon := 0.0005; maxErr := 0;
+  try
+    ImgInput  := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    GridInput := NN.AddLayerAfter(TNNetInput.Create(W, H, 2, 1), 0);
+    NN.AddLayerAfter(TNNetGridSample.Create(GridInput, gsiBilinear, gspZeros, false), ImgInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Img.Size - 1 do Img.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31);
+    for y := 0 to H - 1 do
+    for x := 0 to W - 1 do
+    begin
+      sxTarget := 1.4 + 0.25 * Sin(0.6 * x + 0.8 * y);
+      syTarget := 1.3 + 0.20 * Cos(0.4 * x - 0.7 * y);
+      GridData.Store(x, y, 0, (2.0 * sxTarget + 1.0) / W - 1.0);
+      GridData.Store(x, y, 1, (2.0 * syTarget + 1.0) / H - 1.0);
+    end;
+
+    for i := 0 to GridData.Size - 1 do
+    begin
+      GridPlus.Copy(GridData);
+      GridPlus.Raw[i] := GridData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(GridPlus);
+      GridPlus.Raw[i] := GridData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(GridPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ImgInput.Output.Copy(Img);
+      GridInput.Output.Copy(GridData);
+      NN.Compute(ImgInput.Output);
+      GridInput.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := GridInput.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('GridSample grid gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestGridSampleGridGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; Img.Free; GridData.Free; GridPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGridSampleBorderGridGradientCheck;
+// Grid-path gradient with padding_mode='border' and align_corners=True. Samples
+// kept interior & off-grid (so the clamp is not saturated and we test the full
+// interior bilinear grid derivative under the True normalization).
+var
+  NN: TNNet;
+  ImgInput, GridInput: TNNetLayer;
+  Img, GridData, GridPlus, Desired: TNNetVolume;
+  W, H, D, i, x, y: integer;
+  sxTarget, syTarget: TNeuralFloat;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AGrid: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    ImgInput.Output.Copy(Img);
+    GridInput.Output.Copy(AGrid);
+    NN.Compute(ImgInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  W := 5; H := 4; D := 2;
+  NN := TNNet.Create();
+  Img := TNNetVolume.Create(W, H, D);
+  GridData := TNNetVolume.Create(W, H, 2);
+  GridPlus := TNNetVolume.Create(W, H, 2);
+  Desired := TNNetVolume.Create(W, H, D);
+  epsilon := 0.0005; maxErr := 0;
+  try
+    ImgInput  := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    GridInput := NN.AddLayerAfter(TNNetInput.Create(W, H, 2, 1), 0);
+    NN.AddLayerAfter(TNNetGridSample.Create(GridInput, gsiBilinear, gspBorder, true), ImgInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Img.Size - 1 do Img.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31);
+    // align_corners=True: px = (x_n+1)*(W-1)/2  =>  x_n = 2*sxTarget/(W-1) - 1.
+    for y := 0 to H - 1 do
+    for x := 0 to W - 1 do
+    begin
+      sxTarget := 1.4 + 0.25 * Sin(0.6 * x + 0.8 * y);
+      syTarget := 1.3 + 0.20 * Cos(0.4 * x - 0.7 * y);
+      GridData.Store(x, y, 0, 2.0 * sxTarget / (W - 1) - 1.0);
+      GridData.Store(x, y, 1, 2.0 * syTarget / (H - 1) - 1.0);
+    end;
+
+    for i := 0 to GridData.Size - 1 do
+    begin
+      GridPlus.Copy(GridData);
+      GridPlus.Raw[i] := GridData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(GridPlus);
+      GridPlus.Raw[i] := GridData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(GridPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ImgInput.Output.Copy(Img);
+      GridInput.Output.Copy(GridData);
+      NN.Compute(ImgInput.Output);
+      GridInput.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := GridInput.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('GridSample border grid gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestGridSampleBorderGridGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; Img.Free; GridData.Free; GridPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGridSampleNearestForward;
+// Nearest mode (align_corners=True, zeros padding) must copy the rounded-to-
+// nearest source pixel exactly. We sample one fixed interior pixel and an
+// out-of-range position (which must read zeros).
+var
+  NN: TNNet;
+  ImgInput, GridInput: TNNetLayer;
+  Img, Grid: TNNetVolume;
+  W, H, D, x, y, dd, sx, sy: integer;
+  xnFar: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  W := 5; H := 4; D := 2;
+  NN := TNNet.Create();
+  Img := TNNetVolume.Create(W, H, D);
+  Grid := TNNetVolume.Create(W, H, 2);
+  try
+    ImgInput  := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    GridInput := NN.AddLayerAfter(TNNetInput.Create(W, H, 2, 1), 0);
+    NN.AddLayerAfter(TNNetGridSample.Create(GridInput, gsiNearest, gspZeros, true), ImgInput);
+
+    for y := 0 to H - 1 do
+    for x := 0 to W - 1 do
+    for dd := 0 to D - 1 do
+      Img.Store(x, y, dd, x * 10 + y + dd * 0.5);
+    // Every output pixel samples source pixel (sx=2, sy=1) (slightly perturbed
+    // so rounding still lands there), EXCEPT the top-left pixel which samples
+    // far out of range (x_n=3) and must read zeros.
+    sx := 2; sy := 1;
+    xnFar := 3.0;
+    for y := 0 to H - 1 do
+    for x := 0 to W - 1 do
+    begin
+      // align_corners=True: x_n = 2*sx/(W-1) - 1, plus a tiny sub-half jitter.
+      Grid.Store(x, y, 0, 2.0 * (sx + 0.2) / (W - 1) - 1.0);
+      Grid.Store(x, y, 1, 2.0 * (sy - 0.2) / (H - 1) - 1.0);
+    end;
+    Grid.Store(0, 0, 0, xnFar);
+    Grid.Store(0, 0, 1, xnFar);
+
+    ImgInput.Output.Copy(Img);
+    GridInput.Output.Copy(Grid);
+    NN.Compute(ImgInput.Output);
+
+    for dd := 0 to D - 1 do
+    begin
+      AssertEquals('GridSample nearest copies (2,1) at d=' + IntToStr(dd),
+        Img.Get(sx, sy, dd), NN.GetLastLayer.Output.Get(1, 1, dd), 1e-6);
+      AssertEquals('GridSample nearest zeros-pad out-of-range at d=' + IntToStr(dd),
+        0.0, NN.GetLastLayer.Output.Get(0, 0, dd), 1e-6);
+    end;
+  finally
+    NN.Free; Img.Free; Grid.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGridSampleLoadFromString;
+// Serialization round-trip: the grid source layer index AND the interp/pad/
+// align_corners FStruct must survive SaveToString -> LoadFromString and the
+// reloaded net must reproduce the forward pass bit-for-bit.
+var
+  NN, NN2: TNNet;
+  ImgInput, GridInput: TNNetLayer;
+  Img, Grid: TNNetVolume;
+  W, H, D, i, x, y: integer;
+  Saved, Saved2: string;
+  Found: boolean;
+begin
+  RandSeed := 424242;
+  W := 5; H := 4; D := 2;
+  NN := TNNet.Create();
+  Img := TNNetVolume.Create(W, H, D);
+  Grid := TNNetVolume.Create(W, H, 2);
+  try
+    ImgInput  := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    GridInput := NN.AddLayerAfter(TNNetInput.Create(W, H, 2, 1), 0);
+    NN.AddLayerAfter(TNNetGridSample.Create(GridInput, gsiNearest, gspBorder, true), ImgInput);
+
+    for i := 0 to Img.Size - 1 do Img.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for y := 0 to H - 1 do
+    for x := 0 to W - 1 do
+    begin
+      Grid.Store(x, y, 0, 0.3 * Sin(0.7 * x + 1.1 * y));
+      Grid.Store(x, y, 1, 0.3 * Cos(0.5 * x - 0.9 * y));
+    end;
+    ImgInput.Output.Copy(Img);
+    GridInput.Output.Copy(Grid);
+    NN.Compute(ImgInput.Output);
+
+    Found := false;
+    for i := 0 to NN.GetLastLayerIdx do
+      if NN.Layers[i] is TNNetGridSample then Found := true;
+    AssertTrue('GridSample layer present', Found);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('GridSample SaveToString round-trip equality', Saved, Saved2);
+      NN2.Layers[0].Output.Copy(Img);
+      NN2.Layers[1].Output.Copy(Grid);
+      NN2.Compute(NN2.Layers[0].Output);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('GridSample round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Img.Free; Grid.Free;
   end;
 end;
 
