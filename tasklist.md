@@ -2012,3 +2012,51 @@ OpenCL correctness/offload, AVX vectorization, and torch/diffusers CV ports.)
       — read & add like `TNNetLoadBalanceLoss`). STE-grad + round-trip + entropy
       sanity tests; `examples/LFQVAE`. Layer row in README.md, example in
       examples/README.md.
+
+## Lucky-day batch 2026-06-28h (verified-novel AVX / dedup)
+
+(Each item grepped against neuralnetwork.pas / neuralpretrained.pas / the full
+tasklist and confirmed ABSENT before listing. Categories follow the lucky-day
+priority list: AVX vectorization of an existing layer, then importer dedup.)
+
+- [ ] AVX-vectorize the FlashAttention `TNNetScaledDotProductAttention.ComputeTiled`
+      forward online-softmax accumulation (neuralnetwork.pas ~line 28761). The hot
+      per-(query, key)-inner loop is currently scalar over the contiguous head-dim
+      axis:
+      `for d := 0 to DkM1 do FTileAcc[d] := FTileAcc[d]*Alpha + Eg*VPtr^[d];`
+      `FTileAcc` and `VPtr` are both depth-contiguous (`FDk` floats), so the rescale
+      + value-accumulate splits into two depth-contiguous AVX ops —
+      `TNNetVolume.Mul(@FTileAcc[0], Alpha, FDk)` then
+      `TNNetVolume.MulAdd(@FTileAcc[0], VPtr, Eg, FDk)` — and the finalize loop
+      (`OutPtr^[d] := FTileAcc[d]*Alpha`, ~line 28778) becomes one `Mul`-into-`Move`.
+      This is the inner loop run per (query x key) over long contexts, so a
+      constant-factor depth-axis win compounds. Distinct from the open
+      `EnableTiledForward/ComputeTiled` follow-up (line ~830), which extends
+      masking/ALiBi COVERAGE of the tiled path, not the existing forward's SIMD.
+      Keep the scalar triple as the `{$ELSE}` fallback; parity-test bit-identical
+      scalar vs the factored two-op form and <1e-6 on `-dAVX2` (reuse the existing
+      tiled-vs-naive SDPA equality test). The exp/max transcendental stays scalar
+      (no SIMD exp on the online-softmax critical path).
+
+- [ ] Dedup the three fused-QKV safetensors unpackers into one shared helper.
+      `LoadGPTNeoXQKVWeights` (neuralpretrained.pas ~18680), `LoadBloomQKVWeights`
+      (~49712) and `LoadFalconQKVWeights` (~50206) each slice a single fused
+      `query_key_value` slab into the separate Q/K/V neuron ranges with the same
+      outer loop and only different per-variant stride/offset arithmetic
+      (GPTNeoX per-head interleaved, Bloom `[num_heads,3,head_dim]`, Falcon MQA
+      grouped). Audit how much is genuinely common, then factor a parameterized
+      `LoadFusedQKVWeights(Reader, Layer, TensorName, OutDim, InDim, Layout)` (or a
+      small `TQKVPackLayout` enum) so a new fused-QKV arch reuses it instead of a
+      fourth copy. Pure refactor: the three existing importer parity fixtures
+      (pythia/bloom/falcon pico) must stay bit-identical — no behavior change.
+
+- [ ] Dedup the per-importer norm-weight loaders. `LoadLlamaRMSNormWeights`
+      (neuralpretrained.pas ~14025, optional gain offset), `LoadCohereLayerNormWeights`
+      (~21103, additionally zeros a beta neuron) and the GPT-2/Bark-style
+      gamma+beta `LoadLayerNormWeights`/`LoadBarkLayerNorm` loaders all do the same
+      "load a [d_model] 1-D tensor into `FArrNeurons[0].Weights`, optionally a beta
+      into `FArrNeurons[1]`" copy. Audit for true equivalence, then collapse into
+      one `LoadAffineNormWeights(Reader, Layer, GammaName, BetaName, d_model,
+      GainOffset, HasBeta, ImporterName)` helper (keep the existing names as thin
+      wrappers so call sites and the per-norm gain-offset folds are unchanged).
+      Pure refactor; all importer parity fixtures must stay bit-identical.
