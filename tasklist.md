@@ -710,9 +710,10 @@ rather than acted on.
       sentencepiece encoder over ASCII *and* non-ASCII (café/CJK/emoji/control-
       byte) inputs, and that encoder is itself id-identical to a tokenizers BPE
       model built from these same reconstructed merges. WORD/CHAR model_types
-      still raise EHFTokenizerError. This now partially UNBLOCKS the mBART/NLLB
-      BART-family follow-up (a, above) and the DeBERTa-v3 import. No residual
-      non-ASCII parity gap. BYTE
+      still raise EHFTokenizerError. This UNBLOCKED the mBART/NLLB BART-family
+      import (BuildMBartFromSafeTensors / BuildM2M100FromSafeTensors, LANDED)
+      and the DeBERTa-v3 import (BuildDebertaV2FromSafeTensors, LANDED). No
+      residual non-ASCII parity gap. BYTE
       (type=6) byte-fallback is now DONE: LoadSentencePieceModel sets
       FByteFallback when any type-6 piece is present, so (1) encode routes
       unknown chars through the <0xNN> BYTE pieces — the Unigram Viterbi
@@ -724,9 +725,9 @@ rather than acted on.
       TestSentencePieceByteFallbackRoundTrip + tiny_spm_bytefallback.model
       fixture (tools/make_pico_spm_fixture.py byte_fallback variant; cases
       read via TJSONParser(s,[]) to keep their UTF-8 bytes intact). This
-      partially UNBLOCKS the mBART/NLLB BART-family follow-up (b) and the
-      DeBERTa-v3 import (both ship raw sentencepiece .model and are
-      Unigram). (c) exact full-Unicode \p{L}/\p{N} tables (current
+      UNBLOCKED the mBART/NLLB BART-family import and the DeBERTa-v3 import
+      (both ship raw sentencepiece .model and are Unigram; all LANDED).
+      (c) exact full-Unicode \p{L}/\p{N} tables (current
       classifier covers Latin/Greek/Cyrillic/Armenian/Hebrew/Arabic/
       Devanagari/Kana/CJK/Hangul; exotic scripts fall into the
       punctuation class of the GPT-2 regex); (d) DONE — build a tokenizer from
