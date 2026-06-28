@@ -2005,7 +2005,7 @@ priority list: AVX vectorization of an existing layer, then importer dedup.)
       tiled-vs-naive SDPA equality test). The exp/max transcendental stays scalar
       (no SIMD exp on the online-softmax critical path).
 
-- [ ] Dedup the three fused-QKV safetensors unpackers into one shared helper.
+- [X] Dedup the three fused-QKV safetensors unpackers into one shared helper.
       `LoadGPTNeoXQKVWeights` (neuralpretrained.pas ~18680), `LoadBloomQKVWeights`
       (~49712) and `LoadFalconQKVWeights` (~50206) each slice a single fused
       `query_key_value` slab into the separate Q/K/V neuron ranges with the same

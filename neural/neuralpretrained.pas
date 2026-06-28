@@ -18666,6 +18666,143 @@ begin
     Result := Result + ', prefix="' + Config.Prefix + '"';
 end;
 
+// Source-row packing layout for a fused query_key_value slab. The three
+// importers that share LoadFusedQKVWeights below differ ONLY in how a source
+// row r decodes into (Third in {0=q,1=k,2=v}, HeadIdx, RowInHead) and in the
+// rotate_half->interleaved permutation applied to q/k rows:
+//   qkvPerHeadThirds  - HF view(heads, 3, head_dim): per-head q|k|v blocks.
+//                       Used by GPT-NeoX (partial rotary, RotaryDims rows) and
+//                       Falcon's new-decoder-architecture multi_query=false.
+//   qkvFalconMQA      - Falcon view(kv_heads, group_size+2, head_dim): a K and
+//                       a V head shared across each group_size query heads.
+// Bloom reuses qkvPerHeadThirds with RotaryDims=0 (ALiBi, no rotation).
+type
+  TQKVPackLayout = (qkvPerHeadThirds, qkvFalconMQA);
+
+// Shared unpacker for a fused query_key_value nn.Linear into a Q|K|V neuron
+// slab. WName is the [QkvOut, Hidden] weight; BName the [QkvOut] bias, or ''
+// when the checkpoint has no qkv bias (Falcon) - then BiasWeight is set to 0.
+// Heads/KVHeads/HeadDim describe the attention shape (KVHeads=Heads for MHA),
+// RotaryDims the per-head rotary slice (0 disables the rotate_half permute).
+// The q|k|v slab destination offsets are Q at 0, K at Heads*HeadDim, V at
+// Heads*HeadDim + KVHeads*HeadDim. ErrPrefix labels diagnostics per importer.
+procedure LoadFusedQKVWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string;
+  Hidden, Heads, KVHeads, HeadDim, RotaryDims: integer;
+  Layout: TQKVPackLayout; const ErrPrefix: string);
+var
+  W, B: TNNetVolume;
+  r, i, HeadIdx, Third, RowInHead, RotHalf, TargetRow, TargetIdx: integer;
+  QWidth, KVWidth, QkvOut, QkvOutM1, HiddenM1, GroupSize, GroupStride: integer;
+  Group, SubInGroup: integer;
+  HasBias: boolean;
+begin
+  EnsureWritableImportWeights(Layer);
+  HasBias := BName <> '';
+  QWidth := Heads * HeadDim;
+  KVWidth := KVHeads * HeadDim;
+  QkvOut := QWidth + 2 * KVWidth;
+  GroupSize := Heads div KVHeads;
+  GroupStride := (GroupSize + 2) * HeadDim;
+  if not Reader.HasTensor(WName) then
+    ImportError(ErrPrefix + ': missing tensor "' + WName + '".');
+  if HasBias and (not Reader.HasTensor(BName)) then
+    ImportError(ErrPrefix + ': missing tensor "' + BName + '".');
+  if (Reader.DimCount(WName) <> 2) or
+     (Reader.DimSize(WName, 0) <> QkvOut) or
+     (Reader.DimSize(WName, 1) <> Hidden) then
+    ImportError(ErrPrefix + ': "' + WName + '" must have shape [' +
+      IntToStr(QkvOut) + ', ' + IntToStr(Hidden) + '] (nn.Linear ' +
+      'stores [out, in]), got ' + Reader.ShapeAsString(WName));
+  if HasBias and ((Reader.DimCount(BName) <> 1) or
+     (Reader.DimSize(BName, 0) <> QkvOut)) then
+    ImportError(ErrPrefix + ': "' + BName + '" must have shape [' +
+      IntToStr(QkvOut) + '], got ' + Reader.ShapeAsString(BName));
+  if Layer.Neurons.Count <> QkvOut then
+    ImportError(ErrPrefix + ': internal error - layer for "' + WName +
+      '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(QkvOut) + '.');
+  RotHalf := RotaryDims div 2;
+  QkvOutM1 := QkvOut - 1;
+  HiddenM1 := Hidden - 1;
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    if HasBias then Reader.LoadTensorFlat(BName, B);
+    for r := 0 to QkvOutM1 do
+    begin
+      // Decode source row r -> (Third in {0=q,1=k,2=v}, HeadIdx, RowInHead).
+      if Layout = qkvFalconMQA then
+      begin
+        // view(num_kv_heads, GroupSize + 2, head_dim): group g, sub s, dim d
+        // at ((g*(GroupSize+2) + s)*head_dim + d). s in 0..GroupSize-1 are
+        // query heads (global head g*GroupSize + s), s=GroupSize is the K
+        // head, s=GroupSize+1 the V head (both shared across the group).
+        Group := r div GroupStride;
+        SubInGroup := (r mod GroupStride) div HeadDim;
+        RowInHead := r mod HeadDim;
+        if SubInGroup < GroupSize then
+        begin
+          Third := 0;
+          HeadIdx := Group * GroupSize + SubInGroup;
+        end
+        else if SubInGroup = GroupSize then
+        begin
+          Third := 1;
+          HeadIdx := Group;
+        end
+        else
+        begin
+          Third := 2;
+          HeadIdx := Group;
+        end;
+      end
+      else
+      begin
+        // view(heads, 3, head_dim): head h, third t, dim d at
+        // ((h*3 + t)*head_dim + d).
+        HeadIdx := r div (3 * HeadDim);
+        Third := (r mod (3 * HeadDim)) div HeadDim;
+        RowInHead := r mod HeadDim;
+      end;
+      // rotate_half -> interleaved permutation, RESTRICTED to the first
+      // RotaryDims rows of q and k heads (the partial-rotary slice; the full
+      // head when RotaryDims = HeadDim, disabled entirely when RotaryDims = 0).
+      TargetRow := RowInHead;
+      if (Third < 2) and (RowInHead < RotaryDims) then
+      begin
+        if RowInHead < RotHalf then
+          TargetRow := 2 * RowInHead
+        else
+          TargetRow := 2 * (RowInHead - RotHalf) + 1;
+      end;
+      // Destination index in the q|k|v slab.
+      case Third of
+        0: TargetIdx := HeadIdx * HeadDim + TargetRow;
+        1: TargetIdx := QWidth + HeadIdx * HeadDim + TargetRow;
+      else
+        TargetIdx := QWidth + KVWidth + HeadIdx * HeadDim + TargetRow;
+      end;
+      if Layer.FArrNeurons[TargetIdx].Weights.Size <> Hidden then
+        ImportError(ErrPrefix + ': internal error - neuron ' +
+          IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
+          IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
+          ' weights, expected ' + IntToStr(Hidden) + '.');
+      for i := 0 to HiddenM1 do
+        Layer.FArrNeurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
+      if HasBias then
+        Layer.FArrNeurons[TargetIdx].BiasWeight := B.FData[r]
+      else
+        Layer.FArrNeurons[TargetIdx].BiasWeight := 0;
+    end;
+  finally
+    B.Free;
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
 // Loads the fused GPT-NeoX query_key_value nn.Linear ([3*hidden, hidden]
 // weight + [3*hidden] bias) into a TNNetPointwiseConvLinear Q|K|V slab
 // (q -> neurons 0..hidden-1, k -> hidden..2*hidden-1, v -> 2*hidden..).
@@ -18680,68 +18817,11 @@ end;
 procedure LoadGPTNeoXQKVWeights(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BName: string;
   Hidden, Heads, HeadDim, RotaryDims: integer);
-var
-  W, B: TNNetVolume;
-  r, i, HeadIdx, Third, RowInHead, RotHalf, TargetRow, TargetIdx: integer;
-  ThreeHiddenM1, HiddenM1: integer;
 begin
-  EnsureWritableImportWeights(Layer);
-  if not Reader.HasTensor(WName) then
-    ImportError('GPT-NeoX import: missing tensor "' + WName + '".');
-  if not Reader.HasTensor(BName) then
-    ImportError('GPT-NeoX import: missing tensor "' + BName + '".');
-  if (Reader.DimCount(WName) <> 2) or
-     (Reader.DimSize(WName, 0) <> 3 * Hidden) or
-     (Reader.DimSize(WName, 1) <> Hidden) then
-    ImportError('GPT-NeoX import: "' + WName + '" must have shape [' +
-      IntToStr(3 * Hidden) + ', ' + IntToStr(Hidden) + '] (nn.Linear ' +
-      'stores [out, in]), got ' + Reader.ShapeAsString(WName));
-  if (Reader.DimCount(BName) <> 1) or
-     (Reader.DimSize(BName, 0) <> 3 * Hidden) then
-    ImportError('GPT-NeoX import: "' + BName + '" must have shape [' +
-      IntToStr(3 * Hidden) + '], got ' + Reader.ShapeAsString(BName));
-  if Layer.Neurons.Count <> 3 * Hidden then
-    ImportError('GPT-NeoX import: internal error - layer for "' + WName +
-      '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
-      IntToStr(3 * Hidden) + '.');
-  RotHalf := RotaryDims div 2;
-  ThreeHiddenM1 := 3 * Hidden - 1;
-  HiddenM1 := Hidden - 1;
-  W := TNNetVolume.Create;
-  B := TNNetVolume.Create;
-  try
-    Reader.LoadTensorFlat(WName, W);
-    Reader.LoadTensorFlat(BName, B);
-    for r := 0 to ThreeHiddenM1 do
-    begin
-      HeadIdx := r div (3 * HeadDim);
-      Third := (r mod (3 * HeadDim)) div HeadDim; // 0=q, 1=k, 2=v
-      RowInHead := r mod HeadDim;
-      // rotate_half -> interleaved permutation, RESTRICTED to the first
-      // RotaryDims rows of q and k heads (the partial-rotary slice).
-      TargetRow := RowInHead;
-      if (Third < 2) and (RowInHead < RotaryDims) then
-      begin
-        if RowInHead < RotHalf then
-          TargetRow := 2 * RowInHead
-        else
-          TargetRow := 2 * (RowInHead - RotHalf) + 1;
-      end;
-      TargetIdx := Third * Hidden + HeadIdx * HeadDim + TargetRow;
-      if Layer.FArrNeurons[TargetIdx].Weights.Size <> Hidden then
-        ImportError('GPT-NeoX import: internal error - neuron ' +
-          IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
-          IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
-          ' weights, expected ' + IntToStr(Hidden) + '.');
-      for i := 0 to HiddenM1 do
-        Layer.FArrNeurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
-      Layer.FArrNeurons[TargetIdx].BiasWeight := B.FData[r];
-    end;
-  finally
-    B.Free;
-    W.Free;
-  end;
-  Layer.FlushWeightCache();
+  // MHA (KVHeads = Heads), per-head q|k|v thirds, partial rotary slice.
+  LoadFusedQKVWeights(Reader, Layer, WName, BName,
+    Hidden, Heads, {KVHeads=}Heads, HeadDim, RotaryDims,
+    qkvPerHeadThirds, 'GPT-NeoX import');
 end;
 
 type
@@ -49712,57 +49792,12 @@ end;
 procedure LoadBloomQKVWeights(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BName: string;
   Hidden, HeadDim: integer);
-var
-  W, B: TNNetVolume;
-  r, i, HeadIdx, Third, RowInHead, TargetIdx: integer;
-  ThreeHiddenM1, HiddenM1: integer;
 begin
-  EnsureWritableImportWeights(Layer);
-  if not Reader.HasTensor(WName) then
-    ImportError('BLOOM import: missing tensor "' + WName + '".');
-  if not Reader.HasTensor(BName) then
-    ImportError('BLOOM import: missing tensor "' + BName + '".');
-  if (Reader.DimCount(WName) <> 2) or
-     (Reader.DimSize(WName, 0) <> 3 * Hidden) or
-     (Reader.DimSize(WName, 1) <> Hidden) then
-    ImportError('BLOOM import: "' + WName + '" must have shape [' +
-      IntToStr(3 * Hidden) + ', ' + IntToStr(Hidden) + '] (nn.Linear ' +
-      'stores [out, in]), got ' + Reader.ShapeAsString(WName));
-  if (Reader.DimCount(BName) <> 1) or
-     (Reader.DimSize(BName, 0) <> 3 * Hidden) then
-    ImportError('BLOOM import: "' + BName + '" must have shape [' +
-      IntToStr(3 * Hidden) + '], got ' + Reader.ShapeAsString(BName));
-  if Layer.Neurons.Count <> 3 * Hidden then
-    ImportError('BLOOM import: internal error - layer for "' + WName +
-      '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
-      IntToStr(3 * Hidden) + '.');
-  W := TNNetVolume.Create;
-  B := TNNetVolume.Create;
-  try
-    Reader.LoadTensorFlat(WName, W);
-    Reader.LoadTensorFlat(BName, B);
-    ThreeHiddenM1 := 3 * Hidden - 1;
-    HiddenM1 := Hidden - 1;
-    for r := 0 to ThreeHiddenM1 do
-    begin
-      HeadIdx := r div (3 * HeadDim);
-      Third := (r mod (3 * HeadDim)) div HeadDim; // 0=q, 1=k, 2=v
-      RowInHead := r mod HeadDim;
-      TargetIdx := Third * Hidden + HeadIdx * HeadDim + RowInHead;
-      if Layer.FArrNeurons[TargetIdx].Weights.Size <> Hidden then
-        ImportError('BLOOM import: internal error - neuron ' +
-          IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
-          IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
-          ' weights, expected ' + IntToStr(Hidden) + '.');
-      for i := 0 to HiddenM1 do
-        Layer.FArrNeurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
-      Layer.FArrNeurons[TargetIdx].BiasWeight := B.FData[r];
-    end;
-  finally
-    B.Free;
-    W.Free;
-  end;
-  Layer.FlushWeightCache();
+  // MHA (KVHeads = Heads), per-head q|k|v thirds, NO rotation (RotaryDims=0;
+  // BLOOM is ALiBi). Heads = Hidden div HeadDim.
+  LoadFusedQKVWeights(Reader, Layer, WName, BName,
+    Hidden, {Heads=}Hidden div HeadDim, {KVHeads=}Hidden div HeadDim,
+    HeadDim, {RotaryDims=}0, qkvPerHeadThirds, 'BLOOM import');
 end;
 
 type
@@ -50207,100 +50242,16 @@ procedure LoadFalconQKVWeights(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName: string;
   Hidden, Heads, KVHeads, HeadDim: integer; PerHeadThirds: boolean);
 var
-  W: TNNetVolume;
-  GroupSize, QkvOut, QWidth, KVWidth, r, i: integer;
-  HeadIdx, Third, RowInHead, RotHalf, TargetRow, TargetIdx: integer;
-  Group, SubInGroup, GroupStride, QkvOutM1, HiddenM1: integer;
+  Layout: TQKVPackLayout;
 begin
-  EnsureWritableImportWeights(Layer);
-  GroupSize := Heads div KVHeads;
-  QWidth := Heads * HeadDim;
-  KVWidth := KVHeads * HeadDim;
-  QkvOut := QWidth + 2 * KVWidth;
-  if not Reader.HasTensor(WName) then
-    ImportError('Falcon import: missing tensor "' + WName + '".');
-  if (Reader.DimCount(WName) <> 2) or
-     (Reader.DimSize(WName, 0) <> QkvOut) or
-     (Reader.DimSize(WName, 1) <> Hidden) then
-    ImportError('Falcon import: "' + WName + '" must have shape [' +
-      IntToStr(QkvOut) + ', ' + IntToStr(Hidden) + '] (nn.Linear stores ' +
-      '[out, in]), got ' + Reader.ShapeAsString(WName));
-  if Layer.Neurons.Count <> QkvOut then
-    ImportError('Falcon import: internal error - layer for "' + WName +
-      '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
-      IntToStr(QkvOut) + '.');
-  RotHalf := HeadDim div 2;
-  GroupStride := (GroupSize + 2) * HeadDim;
-  QkvOutM1 := QkvOut - 1;
-  HiddenM1 := Hidden - 1;
-  W := TNNetVolume.Create;
-  try
-    Reader.LoadTensorFlat(WName, W);
-    for r := 0 to QkvOutM1 do
-    begin
-      // Decode source row r -> (Third in {0=q,1=k,2=v}, HeadIdx, RowInHead).
-      if PerHeadThirds then
-      begin
-        // view(num_heads, 3, head_dim): head h, third t, dim d at
-        // ((h*3 + t)*head_dim + d).
-        HeadIdx := r div (3 * HeadDim);
-        Third := (r mod (3 * HeadDim)) div HeadDim;
-        RowInHead := r mod HeadDim;
-      end
-      else
-      begin
-        // view(num_kv_heads, GroupSize + 2, head_dim): group g, sub s, dim d
-        // at ((g*(GroupSize+2) + s)*head_dim + d). s in 0..GroupSize-1 are
-        // query heads (global head g*GroupSize + s), s=GroupSize is the K
-        // head, s=GroupSize+1 the V head (both shared across the group).
-        Group := r div GroupStride;
-        SubInGroup := (r mod GroupStride) div HeadDim;
-        RowInHead := r mod HeadDim;
-        if SubInGroup < GroupSize then
-        begin
-          Third := 0;
-          HeadIdx := Group * GroupSize + SubInGroup;
-        end
-        else if SubInGroup = GroupSize then
-        begin
-          Third := 1;
-          HeadIdx := Group;
-        end
-        else
-        begin
-          Third := 2;
-          HeadIdx := Group;
-        end;
-      end;
-      // rotate_half -> interleaved permutation on q and k rows (full head).
-      TargetRow := RowInHead;
-      if Third < 2 then
-      begin
-        if RowInHead < RotHalf then
-          TargetRow := 2 * RowInHead
-        else
-          TargetRow := 2 * (RowInHead - RotHalf) + 1;
-      end;
-      // Destination index in the q|k|v slab.
-      case Third of
-        0: TargetIdx := HeadIdx * HeadDim + TargetRow;
-        1: TargetIdx := QWidth + HeadIdx * HeadDim + TargetRow;
-      else
-        TargetIdx := QWidth + KVWidth + HeadIdx * HeadDim + TargetRow;
-      end;
-      if Layer.FArrNeurons[TargetIdx].Weights.Size <> Hidden then
-        ImportError('Falcon import: internal error - neuron ' +
-          IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
-          IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
-          ' weights, expected ' + IntToStr(Hidden) + '.');
-      for i := 0 to HiddenM1 do
-        Layer.FArrNeurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
-      Layer.FArrNeurons[TargetIdx].BiasWeight := 0;
-    end;
-  finally
-    W.Free;
-  end;
-  Layer.FlushWeightCache();
+  // No qkv bias (BName=''). Full-head rotate_half permute (RotaryDims=HeadDim).
+  // PerHeadThirds picks the plain-MHA per-head q|k|v layout vs the GQA-grouped
+  // (multi_query / new-decoder-arch) layout.
+  if PerHeadThirds then Layout := qkvPerHeadThirds
+  else Layout := qkvFalconMQA;
+  LoadFusedQKVWeights(Reader, Layer, WName, {BName=}'',
+    Hidden, Heads, KVHeads, HeadDim, {RotaryDims=}HeadDim,
+    Layout, 'Falcon import');
 end;
 
 type
