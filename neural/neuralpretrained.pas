@@ -9598,6 +9598,45 @@ function LPIPSStageDistance(A, B: TNNetVolume;
 function ComputeLPIPSDistance(NN: TNNet; const TapLayerIdx: array of integer;
   ImgA, ImgB: TNNetVolume; const LinWeights: TLPIPSLinWeights = nil): TNeuralFloat;
 
+// Coded by Claude (AI).
+// DEEP-FEATURE (perceptual / LPIPS-style) TRAINING LOSS *with gradient*.
+// Computes the Johnson et al. (2016) perceptual loss between a generated image
+// Gen and a Target image over the frozen VGG feature extractor NN, AND the
+// gradient d(Loss)/d(Gen pixels), so image-generation examples (super-res /
+// GAN / diffusion) can train against a perceptual objective instead of pixel
+// L1/L2.
+//
+// Loss = sum over the selected stages S of the per-stage feature L2 between the
+// VGG relu-tap features of Gen and Target. Each stage term is the SAME scalar
+// that LPIPSStageDistance returns on the RAW (non-unit-normalized) tap maps:
+//   stage_S = (1/HW) * sum_loc sum_c W_c * (Feat_Gen - Feat_Target)^2
+// with W_c = 1/Depth when StageWeights is nil (the unweighted channel-mean
+// baseline) or W_c = StageWeights[S] (a single scalar applied to every channel)
+// otherwise. This deliberately uses a PLAIN feature L2 and does NOT apply the
+// LPIPS channel unit-normalization (LPIPSUnitNormalize): that calibrated
+// variant adds a per-location Jacobian and is a documented follow-up.
+//
+// GradImage = d(Loss)/d(Gen image), SAME shape as Gen. It is computed by, for
+// each stage S: seeding ONLY tap S's analytic feature gradient
+//   dLoss/dFeat_S = (2*W_c/HW) * (Feat_Gen - Feat_Target)
+// and backpropagating through the (frozen) VGG to the input layer, then
+// accumulating the input-layer gradient into GradImage. (The tap relu's own
+// backward applies the relu derivative, completing the chain rule.) Stages are
+// <= 5 so the few extra backward passes are cheap. No VGG weight is updated.
+//
+// GradImage is CREATED by this function if passed nil, or RESIZED to Gen's
+// shape if already created; either way the CALLER owns and frees it.
+//
+// NN MUST be built with BuildVGG(..., pTrainable=true) so the input layer has
+// error collection on (the gradient path to the pixels exists). The tap indices
+// are validated like ComputeLPIPSDistance; an unset tap raises a clear error.
+// StageWeights, when supplied, is one scalar per stage (length up to 5).
+// ComputePerceptualLossAndGradient(NN, taps, X, X, g) -> loss = 0, g = 0.
+function ComputePerceptualLossAndGradient(NN: TNNet;
+  const TapLayerIdx: array of integer; Gen, Target: TNNetVolume;
+  out GradImage: TNNetVolume;
+  const StageWeights: TNeuralFloatArray = nil): TNeuralFloat;
+
 // ---------------------------------------------------------------------------
 // STABLE DIFFUSION VAE DECODER IMPORT (diffusers AutoencoderKL DECODER only,
 // model_type / _class_name "AutoencoderKL", e.g. stabilityai/sd-vae-ft-mse).
@@ -62186,6 +62225,113 @@ begin
       TapA[Stage].Free;
       TapB[Stage].Free;
     end;
+  end;
+end;
+
+// Coded by Claude (AI).
+function ComputePerceptualLossAndGradient(NN: TNNet;
+  const TapLayerIdx: array of integer; Gen, Target: TNNetVolume;
+  out GradImage: TNNetVolume;
+  const StageWeights: TNeuralFloatArray = nil): TNeuralFloat;
+var
+  Stage, NumStages, Loc, c, D, NumLoc, Base, NumLocM1, DM1, Gi, GradM1: integer;
+  TapFeat: TNNetVolume;            // snapshot of tap-S features for Target
+  TargetFeat: array[0..4] of TNNetVolume;
+  TapLayer, InLayer: TNNetLayer;
+  W, Diff, Scale: TNeuralFloat;
+  UseScalarW: boolean;
+begin
+  Result := 0;
+  if (NN = nil) then ImportError('Perceptual loss: NN is nil.');
+  if (Gen = nil) or (Target = nil) then
+    ImportError('Perceptual loss: Gen/Target volume is nil.');
+  if (Gen.Size <> Target.Size) or (Gen.Depth <> Target.Depth) then
+    ImportError('Perceptual loss: Gen and Target must have the same shape.');
+  // Validate taps: at least stage 0 must be set; iterate the contiguous set
+  // taps (matching the BuildVGG convention where TapLayerIdx[0..LastStage] are
+  // filled and the rest are -1).
+  NumStages := 0;
+  for Stage := 0 to 4 do
+  begin
+    if (Stage <= High(TapLayerIdx)) and (TapLayerIdx[Stage] >= 0) then
+      Inc(NumStages)
+    else
+      break;
+  end;
+  if NumStages < 1 then
+    ImportError('Perceptual loss: no VGG relu tap is set - pass a BuildVGG ' +
+      'net whose TapLayerIdx[0..] are populated.');
+  InLayer := NN.Layers[0];
+  if (InLayer.OutputError = nil) or
+     (InLayer.OutputError.Size <> InLayer.Output.Size) then
+    ImportError('Perceptual loss: the VGG input layer has no error-collection ' +
+      'buffer - build it with BuildVGG(..., pTrainable=true) so the gradient ' +
+      'can reach the pixels.');
+
+  // GradImage: create if nil, resize to Gen otherwise; caller owns it.
+  if GradImage = nil then GradImage := TNNetVolume.Create;
+  GradImage.ReSize(Gen);
+  GradImage.Fill(0);
+
+  for Stage := 0 to 4 do TargetFeat[Stage] := nil;
+  try
+    // Snapshot Target's tap features once (forward pass on Target).
+    NN.Compute(Target);
+    for Stage := 0 to NumStages - 1 do
+    begin
+      TargetFeat[Stage] := TNNetVolume.Create;
+      TargetFeat[Stage].Copy(NN.Layers[TapLayerIdx[Stage]].Output);
+    end;
+
+    GradM1 := GradImage.Size - 1;
+    for Stage := 0 to NumStages - 1 do
+    begin
+      // Fresh forward on Gen for this stage (each backward consumes the
+      // transient error buffers; recomputing is robust and cheap for <=5 taps).
+      NN.Compute(Gen);
+      TapLayer := NN.Layers[TapLayerIdx[Stage]];
+      TapFeat := TapLayer.Output;          // live Gen features at the tap.
+      if (TapFeat.Size <> TargetFeat[Stage].Size) or
+         (TapFeat.Depth <> TargetFeat[Stage].Depth) then
+        ImportError('Perceptual loss: tap feature maps differ in shape between ' +
+          'Gen and Target (stage ' + IntToStr(Stage) + ').');
+      D := TapFeat.Depth;
+      NumLoc := TapFeat.SizeX * TapFeat.SizeY;
+      if (D < 1) or (NumLoc < 1) then continue;
+      NumLocM1 := NumLoc - 1;
+      DM1 := D - 1;
+      UseScalarW := (Stage <= High(StageWeights));
+      // Reset all layer errors + backprop counters (zeros every OutputError).
+      NN.ResetBackpropCallCurrCnt();
+      if TapLayer.GetDepartingBranchesCnt() = 0 then
+        TapLayer.IncDepartingBranchesCnt();
+      // Seed the tap output error with the analytic feature gradient and
+      // accumulate the scalar stage loss with EXACTLY matching arithmetic.
+      Scale := 1.0 / NumLoc;
+      for Loc := 0 to NumLocM1 do
+      begin
+        Base := Loc * D;
+        for c := 0 to DM1 do
+        begin
+          if UseScalarW then W := StageWeights[Stage] else W := 1.0 / D;
+          Diff := TapFeat.FData[Base + c] - TargetFeat[Stage].FData[Base + c];
+          Result := Result + Scale * W * Diff * Diff;
+          // dLoss/dFeat = (1/HW) * 2 * W * (Feat_Gen - Feat_Target).
+          TapLayer.OutputError.FData[Base + c] := Scale * 2.0 * W * Diff;
+        end;
+      end;
+      // Backpropagate from the tap relu to the input (relu backward applies its
+      // own derivative; intermediate convs/pools scatter the gradient down).
+      TapLayer.Backpropagate();
+      // Accumulate the pixel gradient that landed on the input layer.
+      if (InLayer.OutputError <> nil) and
+         (InLayer.OutputError.Size = GradImage.Size) then
+        for Gi := 0 to GradM1 do
+          GradImage.FData[Gi] := GradImage.FData[Gi] + InLayer.OutputError.FData[Gi];
+    end;
+  finally
+    for Stage := 0 to 4 do
+      if TargetFeat[Stage] <> nil then TargetFeat[Stage].Free;
   end;
 end;
 

@@ -564,9 +564,13 @@ rather than acted on.
       baseline (what the oracle pins). OPEN: (a) ship/import the OFFICIAL
       richzhang/PerceptualSimilarity lin{0..4}.model 1x1-conv weights + parity vs
       the reference calibrated LPIPS (needs the `lpips` weights, unobtainable
-      offline here); (b) expose LPIPS as a backprop TRAINING LOSS head so the SR
-      examples can opt into perceptual fine-tuning (the VGG build already enables
-      input/error collection, so the gradient path exists).
+      offline here). (b) DONE: ComputePerceptualLossAndGradient (neuralpretrained.pas)
+      exposes the Johnson-2016 deep-feature perceptual loss WITH the d(Loss)/d(pixels)
+      gradient (per-stage feature L2, plain — calibrated unit-normalize is a follow-up),
+      driving a multi-tap backward through the frozen VGG to the input layer; tests
+      TestPerceptualLossGradientCheck (FD max rel err 7.1e-3) + TestPerceptualLossSelfZero.
+      Added public TNNetLayer.GetDepartingBranchesCnt for the idempotent intermediate-tap
+      IncDepartingBranchesCnt guard. OPEN: wire it into an SR example as an opt-in objective.
 - [ ] ControlNet spatial-conditioning importer LANDED
       (BuildControlNetFromSafeTensors[Ex], lllyasviel/sd-controlnet-canny;
       hint stem + per-resolution zero-conv residual taps + ControlNetResiduals driver,

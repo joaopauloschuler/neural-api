@@ -544,6 +544,8 @@ type
     procedure TestVGGLogitParity;
     procedure TestVGGFeatureTaps;
     procedure TestLPIPSDistanceParity;
+    procedure TestPerceptualLossGradientCheck;
+    procedure TestPerceptualLossSelfZero;
     procedure TestVaeDecoderConfigFromJSONFile;
     procedure TestVaeDecoderParity;
     procedure TestVaeEncoderParity;
@@ -21751,6 +21753,170 @@ begin
     RefJson.Free;
     LpipsJson.Free;
     NN.Free;
+  end;
+end;
+
+// Builds a SMALL trainable VGG-style feature extractor (2 conv+relu stages with
+// a maxpool between them, input error collection on) by hand and verifies that
+// ComputePerceptualLossAndGradient's GradImage matches central differences of
+// the scalar perceptual loss w.r.t. the Gen pixels at a handful of probes.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestPerceptualLossGradientCheck;
+var
+  NN: TNNet;
+  Gen, GenPert, Target, Grad: TNNetVolume;
+  Tap: array[0..4] of integer;
+  C1, C2: TNNetLayer;
+  W, H, Ch, i, p, ProbeCnt, Sz: integer;
+  epsilon, lossPlus, lossMinus, numGrad, anaGrad, maxRelErr, denom, relErr: TNeuralFloat;
+  Probes: array[0..6] of integer;
+
+  function PerceptualLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    g: TNNetVolume;
+  begin
+    g := nil;
+    Result := ComputePerceptualLossAndGradient(NN, Tap, AInput, Target, g, nil);
+    g.Free;
+  end;
+
+begin
+  RandSeed := 424242;
+  W := 8; H := 8; Ch := 3;
+  for i := 0 to 4 do Tap[i] := -1;
+  NN := TNNet.Create();
+  Gen := TNNetVolume.Create(W, H, Ch);
+  GenPert := TNNetVolume.Create(W, H, Ch);
+  Target := TNNetVolume.Create(W, H, Ch);
+  Grad := nil;
+  epsilon := 0.001;
+  try
+    // 4-arg input ctor (pError=1) so Layers[0].OutputError is full-size: the
+    // pixel gradient is read from it (input-gradient-test-needs-perror).
+    NN.AddLayer(TNNetInput.Create(W, H, Ch, 1));
+    TNNetInput(NN.GetLastLayer()).EnableErrorCollection();
+    // Stage 0: conv 3x3 pad1 -> relu (tap 0), then maxpool 2.
+    C1 := NN.AddLayer(TNNetConvolutionLinear.Create(6, 3, 1, 1, 0));
+    NN.AddLayer(TNNetReLU.Create());
+    Tap[0] := NN.GetLastLayer().LayerIdx;
+    NN.AddLayer(TNNetMaxPool.Create(2, 2, 0));
+    // Stage 1: conv 3x3 pad1 -> relu (tap 1).
+    C2 := NN.AddLayer(TNNetConvolutionLinear.Create(5, 3, 1, 1, 0));
+    NN.AddLayer(TNNetReLU.Create());
+    Tap[1] := NN.GetLastLayer().LayerIdx;
+    NN.SetLearningRate(0.0, 0.0);   // FROZEN feature extractor.
+    NN.SetBatchUpdate(true);
+
+    // Bounded random weights so FD truncation never dominates.
+    for i := 0 to C1.Neurons.Count - 1 do
+    begin
+      for p := 0 to C1.Neurons[i].Weights.Size - 1 do
+        C1.Neurons[i].Weights.Raw[p] := 0.3 * Sin(i * 1.7 + p * 0.6 + 0.2);
+      C1.Neurons[i].BiasWeight := 0.05 * (i - 3);
+    end;
+    for i := 0 to C2.Neurons.Count - 1 do
+    begin
+      for p := 0 to C2.Neurons[i].Weights.Size - 1 do
+        C2.Neurons[i].Weights.Raw[p] := 0.25 * Cos(i * 1.1 + p * 0.4 - 0.1);
+      C2.Neurons[i].BiasWeight := 0.04 * (i - 2);
+    end;
+    C1.FlushWeightCache();
+    C2.FlushWeightCache();
+
+    Sz := Gen.Size;
+    for i := 0 to Sz - 1 do
+    begin
+      Gen.Raw[i]    := Sin(i * 0.37) * 0.6 + 0.1;
+      Target.Raw[i] := Cos(i * 0.29) * 0.5 - 0.05;
+    end;
+
+    // Analytic gradient (loss return ignored here; Grad is the out param).
+    ComputePerceptualLossAndGradient(NN, Tap, Gen, Target, Grad, nil);
+    AssertTrue('Grad shape', (Grad.Size = Gen.Size));
+
+    // Probe a spread of pixels across channels/locations.
+    Probes[0] := 0; Probes[1] := 7; Probes[2] := 31;
+    Probes[3] := 64; Probes[4] := 100; Probes[5] := 150; Probes[6] := Sz - 1;
+    ProbeCnt := 7;
+    maxRelErr := 0;
+    for p := 0 to ProbeCnt - 1 do
+    begin
+      i := Probes[p];
+      GenPert.Copy(Gen);
+      GenPert.Raw[i] := Gen.Raw[i] + epsilon;
+      lossPlus := PerceptualLoss(GenPert);
+      GenPert.Raw[i] := Gen.Raw[i] - epsilon;
+      lossMinus := PerceptualLoss(GenPert);
+      numGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      anaGrad := Grad.Raw[i];
+      denom := Max(1.0, Max(Abs(numGrad), Abs(anaGrad)));
+      relErr := Abs(numGrad - anaGrad) / denom;
+      if relErr > maxRelErr then maxRelErr := relErr;
+      AssertTrue('Perceptual input grad at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numGrad) + ' ana=' + FloatToStr(anaGrad),
+        Abs(numGrad - anaGrad) < 0.01);
+    end;
+    // maxRelErr is surfaced via WriteLn for the report; not an assertion gate.
+    WriteLn('  [PerceptualLoss] max relative gradient error: ',
+      maxRelErr:0:6);
+  finally
+    NN.Free;
+    Gen.Free;
+    GenPert.Free;
+    Target.Free;
+    Grad.Free;
+  end;
+end;
+
+// Sanity: ComputePerceptualLossAndGradient(NN, taps, X, X) -> loss = 0, grad = 0
+// (mirrors the ComputeLPIPSDistance(x,x) == 0 invariant).
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestPerceptualLossSelfZero;
+var
+  NN: TNNet;
+  X, Grad: TNNetVolume;
+  Tap: array[0..4] of integer;
+  C1: TNNetLayer;
+  i, p, W, H, Ch: integer;
+  Loss, maxG: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  W := 8; H := 8; Ch := 3;
+  for i := 0 to 4 do Tap[i] := -1;
+  NN := TNNet.Create();
+  X := TNNetVolume.Create(W, H, Ch);
+  Grad := nil;
+  try
+    NN.AddLayer(TNNetInput.Create(W, H, Ch, 1));
+    TNNetInput(NN.GetLastLayer()).EnableErrorCollection();
+    C1 := NN.AddLayer(TNNetConvolutionLinear.Create(6, 3, 1, 1, 0));
+    NN.AddLayer(TNNetReLU.Create());
+    Tap[0] := NN.GetLastLayer().LayerIdx;
+    NN.AddLayer(TNNetMaxPool.Create(2, 2, 0));
+    NN.AddLayer(TNNetConvolutionLinear.Create(5, 3, 1, 1, 0));
+    NN.AddLayer(TNNetReLU.Create());
+    Tap[1] := NN.GetLastLayer().LayerIdx;
+    NN.SetLearningRate(0.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to C1.Neurons.Count - 1 do
+      for p := 0 to C1.Neurons[i].Weights.Size - 1 do
+        C1.Neurons[i].Weights.Raw[p] := 0.3 * Sin(i + p * 0.5);
+    C1.FlushWeightCache();
+    for i := 0 to X.Size - 1 do
+      X.Raw[i] := Sin(i * 0.41) * 0.5 + 0.1;
+
+    Loss := ComputePerceptualLossAndGradient(NN, Tap, X, X, Grad, nil);
+    AssertTrue('Perceptual loss(X,X) = ' + FloatToStr(Loss) + ' must be 0',
+      Abs(Loss) < 1e-9);
+    maxG := 0;
+    for i := 0 to Grad.Size - 1 do
+      if Abs(Grad.Raw[i]) > maxG then maxG := Abs(Grad.Raw[i]);
+    AssertTrue('Perceptual grad(X,X) max = ' + FloatToStr(maxG) + ' must be 0',
+      maxG < 1e-9);
+  finally
+    NN.Free;
+    X.Free;
+    Grad.Free;
   end;
 end;
 
