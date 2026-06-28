@@ -31,8 +31,14 @@ lazbuild LatentTextToImage.lpi --build-mode=Release
 Optional trailing flags: `--steps N` (reverse steps, default 4), `--cfg W`
 (guidance scale, default 4.0), `--dpm` (DPM-Solver++(2M) instead of DDIM),
 `--unipc` (UniPC order-2 predictor-corrector), `--lcm` (Latent Consistency Model
-few-step sampler — single model pass per step, guidance baked in), `--smoke`
-(assert finiteness, print `SMOKE OK`/`SMOKE FAIL`, exit without a PPM).
+few-step sampler — single model pass per step, guidance baked in),
+`--vae-tiling` (diffusers `enable_vae_tiling`: decode the latent in OVERLAPPING
+spatial tiles through a tile-sized decoder and feather-blend the seams with a
+linear ramp, bounding peak VAE memory to one tile instead of the full latent —
+the standard way to decode megapixel SD/SDXL latents on a memory-constrained
+box; tile latent 32, overlap 0.25, clamped to the latent so it is a 1-tile
+no-op on the tiny fixture), `--smoke` (assert finiteness, print `SMOKE OK`/
+`SMOKE FAIL`, exit without a PPM).
 
 ## Input
 

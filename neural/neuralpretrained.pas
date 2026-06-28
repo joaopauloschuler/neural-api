@@ -9737,6 +9737,29 @@ function BuildVaeDecoderFromSafeTensors(const FileName: string;
   out Config: TVaeDecoderConfig; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
+// Tiled VAE decode (port of diffusers' AutoencoderKL.enable_vae_tiling +
+// tiled_decode). Decodes a LARGE latent volume in OVERLAPPING spatial tiles
+// and feather-blends the seams so peak working-set memory is bounded by the
+// TILE size, not by the full latent. Pure host orchestration around the
+// existing fixed-size decoder forward -- no new layer / weights.
+//   Decoder           : a VAE decoder built at LatentGrid = TileLatentMinSize
+//                       (its fixed-size TNNetInput defines the tile shape; the
+//                       latent->image scale is read from in/out layer sizes).
+//   Latent            : the (W, H, LatentChannels) latent to decode (any size
+//                       >= the tile size).
+//   TileLatentMinSize : latent-space tile edge (must equal the decoder's
+//                       LatentGrid). diffusers default 512/8 = 64.
+//   TileOverlapFactor : fraction of the tile that overlaps its neighbour
+//                       (diffusers default 0.25); overlap = round(tile*factor).
+// Tiles step by (tile - overlap); the seam rows/cols are blended with a linear
+// weight ramp (diffusers' blend_h / blend_v): the top edge of each tile is
+// blended with the bottom of the tile above and the left edge with the right
+// of the tile to its left. Edge tiles are clamped so every tile is exactly
+// TileLatentMinSize (the fixed-size net cannot accept a smaller tile). Returns
+// a freshly-allocated (W*scale, H*scale, OutChannels) image; caller owns it.
+function TiledVaeDecode(Decoder: TNNet; Latent: TNNetVolume;
+  TileLatentMinSize: integer; TileOverlapFactor: TNeuralFloat): TNNetVolume;
+
 // ---------------------------------------------------------------------------
 // STABLE DIFFUSION UNet IMPORT (diffusers UNet2DConditionModel - the text-
 // conditioned latent DENOISER behind Stable Diffusion v1.x / v2.x). This is
@@ -62814,6 +62837,121 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadVaeDecoderConfigFromJSONFile(ConfigPath);
   Result := BuildVaeDecoderFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+// Decode one latent tile (already cropped to the decoder's input size) and
+// return a reference to the decoder's output volume (NOT owned by caller).
+function VaeDecodeTile(Decoder: TNNet; LatentTile: TNNetVolume): TNNetVolume;
+begin
+  Decoder.Compute(LatentTile);
+  Result := Decoder.GetLastLayer().Output;
+end;
+
+function TiledVaeDecode(Decoder: TNNet; Latent: TNNetVolume;
+  TileLatentMinSize: integer; TileOverlapFactor: TNeuralFloat): TNNetVolume;
+var
+  LatTileW, ImgTileW, Scale, Overlap, Stride: integer;
+  OutChannels, OutW, OutH: integer;
+  StartsX, StartsY: array of integer;
+  nx, nj: integer;
+  s, sLast: integer;
+  LatTile, DecOut: TNNetVolume;
+  ImgOverlap: integer;
+  tx, ty, d: integer;
+  gx, gy: integer;          // global image coords
+  wx, wy, w: TNeuralFloat;  // feather weights
+begin
+  // The decoder's fixed-size TNNetInput defines the tile; the latent->image
+  // scale is read from the first/last layer spatial sizes.
+  LatTileW := Decoder.GetFirstLayer().Output.SizeX;
+  ImgTileW := Decoder.GetLastLayer().Output.SizeX;
+  if LatTileW <> TileLatentMinSize then
+    ImportError('TiledVaeDecode: decoder LatentGrid (' + IntToStr(LatTileW) +
+      ') must equal TileLatentMinSize (' + IntToStr(TileLatentMinSize) + ').');
+  if (LatTileW <= 0) or (ImgTileW mod LatTileW <> 0) then
+    ImportError('TiledVaeDecode: cannot derive integer latent->image scale.');
+  Scale := ImgTileW div LatTileW;
+  OutChannels := Decoder.GetLastLayer().Output.Depth;
+
+  Overlap := Round(TileLatentMinSize * TileOverlapFactor);
+  if Overlap < 0 then Overlap := 0;
+  if Overlap > TileLatentMinSize - 1 then Overlap := TileLatentMinSize - 1;
+  Stride := TileLatentMinSize - Overlap;
+  if Stride < 1 then Stride := 1;
+  ImgOverlap := Overlap * Scale;
+
+  if (Latent.SizeX < TileLatentMinSize) or (Latent.SizeY < TileLatentMinSize) then
+    ImportError('TiledVaeDecode: latent smaller than one tile; use plain decode.');
+
+  // Tile START positions in latent space. Edge tiles are CLAMPED so every tile
+  // is exactly TileLatentMinSize (the fixed-size net cannot accept a smaller
+  // tile); the last tile may overlap its predecessor by more than Overlap.
+  SetLength(StartsX, 0);
+  s := 0; sLast := Latent.SizeX - TileLatentMinSize;
+  while s < sLast do
+  begin
+    SetLength(StartsX, Length(StartsX) + 1); StartsX[High(StartsX)] := s;
+    Inc(s, Stride);
+  end;
+  SetLength(StartsX, Length(StartsX) + 1); StartsX[High(StartsX)] := sLast;
+  SetLength(StartsY, 0);
+  s := 0; sLast := Latent.SizeY - TileLatentMinSize;
+  while s < sLast do
+  begin
+    SetLength(StartsY, Length(StartsY) + 1); StartsY[High(StartsY)] := s;
+    Inc(s, Stride);
+  end;
+  SetLength(StartsY, Length(StartsY) + 1); StartsY[High(StartsY)] := sLast;
+
+  OutW := Latent.SizeX * Scale;
+  OutH := Latent.SizeY * Scale;
+  Result := TNNetVolume.Create;
+  Result.ReSize(OutW, OutH, OutChannels);
+  Result.Fill(0);
+
+  LatTile := TNNetVolume.Create;
+  try
+    LatTile.ReSize(TileLatentMinSize, TileLatentMinSize, Latent.Depth);
+    for nj := 0 to High(StartsY) do
+    for nx := 0 to High(StartsX) do
+    begin
+      // Crop the latent tile.
+      for ty := 0 to TileLatentMinSize - 1 do
+        for tx := 0 to TileLatentMinSize - 1 do
+          for d := 0 to Latent.Depth - 1 do
+            LatTile[tx, ty, d] :=
+              Latent[StartsX[nx] + tx, StartsY[nj] + ty, d];
+
+      DecOut := VaeDecodeTile(Decoder, LatTile);
+
+      // Place the decoded tile, feather-blending the top edge into the tile
+      // above (StartsY[nj]>0) and the left edge into the tile to the left
+      // (StartsX[nx]>0). diffusers blend_v / blend_h: a linear ramp across the
+      // overlap rows/cols; the rest is overwrite.
+      for ty := 0 to ImgTileW - 1 do
+      begin
+        gy := StartsY[nj] * Scale + ty;
+        if (nj > 0) and (ty < ImgOverlap) then
+          wy := (ty + 1) / (ImgOverlap + 1)
+        else
+          wy := 1.0;
+        for tx := 0 to ImgTileW - 1 do
+        begin
+          gx := StartsX[nx] * Scale + tx;
+          if (nx > 0) and (tx < ImgOverlap) then
+            wx := (tx + 1) / (ImgOverlap + 1)
+          else
+            wx := 1.0;
+          w := wx * wy;
+          for d := 0 to OutChannels - 1 do
+            Result[gx, gy, d] :=
+              Result[gx, gy, d] * (1.0 - w) + DecOut[tx, ty, d] * w;
+        end;
+      end;
+    end;
+  finally
+    LatTile.Free;
+  end;
 end;
 
 // ===========================================================================

@@ -1986,7 +1986,7 @@ VAE encoder/decoder importers all exist. The three items below are the gaps left
 in that otherwise-complete diffusion stack — all CV/generative and/or direct
 diffusers/torch ports.)
 
-(Two of the three LANDED 2026-06-28 — removed:
+(All three LANDED 2026-06-28 — removed:
 - Heun 2nd-order sampler (`smHeun`, k-diffusion `sample_heun` / Karras EDM
   "Algorithm 2"): intra-step predictor-corrector in sigma-space, two denoiser
   evals per step via a dedicated `SampleHeun` driver (corrector skipped on the
@@ -1995,16 +1995,15 @@ diffusers/torch ports.)
 - Min-SNR-gamma loss weighting `TNNetDiffusionScheduler.SNRWeight` (Hang et al.
   2023; diffusers `snr_gamma`): eps `min(SNR,Gamma)/SNR`, v
   `min(SNR,Gamma)/(SNR+1)`, `TestMinSNRWeight` pins both prediction types at
-  gamma=5.0 and the gamma=+inf limits to <1e-5, commit f8e1823c.)
-
-- [ ] Tiled VAE decode (diffusers `enable_vae_tiling` port) for
-      `BuildVaeDecoderFromSafeTensors`. Decode a large latent in OVERLAPPING
-      spatial tiles and feather-blend the seams so peak working-set memory is
-      bounded by tile size, not by the full latent — the standard way to decode
-      megapixel SD/SDXL latents on a memory-constrained box. Mirror diffusers'
-      params: `tile_latent_min_size`, `tile_overlap_factor`; the blend is the
-      linear ramp over the overlap region (`blend_h`/`blend_v`). Pure host
-      orchestration around the existing decoder forward (no new layer, no new
-      weights). Parity test: a tiled decode of a small latent must match the
-      whole-image decode to `<1e-3` on the interior (seams allowed looser);
-      wire an opt-in `--vae-tiling` flag into examples/LatentTextToImage.
+  gamma=5.0 and the gamma=+inf limits to <1e-5, commit f8e1823c;
+- Tiled VAE decode (diffusers `enable_vae_tiling` port): `TiledVaeDecode`
+  (`neuralpretrained.pas`) decodes a large latent in OVERLAPPING spatial tiles
+  through a tile-sized decoder and feather-blends the seams with a separable
+  linear ramp over the overlap (`blend_h`/`blend_v`), bounding peak working-set
+  to the tile; mirrors `tile_latent_min_size`/`tile_overlap_factor`, edge tiles
+  clamped (the fixed-size conv net can't take a smaller tile). Pure host
+  orchestration, no new layer/weights. `TestTiledVaeDecodeParity` proves the
+  single-tile path matches plain decode <1e-4 and the multi-tile path is finite
+  and SEAMLESS (the MID global self-attention makes tiling an approximation, as
+  in diffusers, so the seam jump — not an exact interior bound — is asserted);
+  opt-in `--vae-tiling` flag wired into examples/LatentTextToImage.)

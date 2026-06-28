@@ -187,7 +187,8 @@ var
   Method: TNNetSamplerMethod;
   NumSteps, StepCnt, T, TPrev, i: integer;
   Guidance: TNeuralFloat;
-  SmokeMode, UseLCM, LatentOk, ImageOk: boolean;
+  SmokeMode, UseLCM, LatentOk, ImageOk, UseTiling: boolean;
+  TileLatent: integer;
   Arg: string;
 begin
   // ---- argument parsing ----
@@ -198,6 +199,7 @@ begin
   Method := smDDIM;
   SmokeMode := false;
   UseLCM := false;
+  UseTiling := false;
   // Positional checkpoint args (the first two non-flag args).
   i := 1;
   if (ParamCount >= 1) and (Copy(ParamStr(1), 1, 2) <> '--') then
@@ -224,6 +226,7 @@ begin
     else if Arg = '--dpm' then Method := smDPMSolverPP2M
     else if Arg = '--unipc' then Method := smUniPC
     else if Arg = '--lcm' then UseLCM := true
+    else if Arg = '--vae-tiling' then UseTiling := true
     else if Arg = '--smoke' then SmokeMode := true
     else WriteLn('Ignoring unknown argument: ', Arg);
     Inc(i);
@@ -324,8 +327,30 @@ begin
       Latent.Depth, '  finite=', BoolToStr(LatentOk, true));
 
     // Step 2: decode the latent to RGB (the /0.18215 scaling is inside the net).
-    VaeNet.Compute(Latent);
-    Image.Copy(VaeNet.GetLastLayer().Output);
+    if UseTiling then
+    begin
+      // diffusers enable_vae_tiling: decode the latent in OVERLAPPING tiles and
+      // feather-blend the seams, bounding peak memory to a single tile. The
+      // tile-sized decoder shares the full decoder's weights (conv weights are
+      // grid-independent); we build one at the chosen tile latent grid. Clamp
+      // the tile to the latent so the fixture (tiny latent) is a 1-tile no-op.
+      TileLatent := 32;
+      if TileLatent > VaeCfg.LatentGrid then TileLatent := VaeCfg.LatentGrid;
+      // Rebuild the decoder at the TILE latent grid (same weights; conv weights
+      // are grid-independent so only the fixed-size Input/Output layers shrink).
+      VaeNet.Free; VaeNet := nil;
+      VaeCfg.LatentGrid := TileLatent;
+      VaeNet := BuildVaeDecoderFromSafeTensorsEx(VaeST, VaeCfg, {pTrainable=}false);
+      WriteLn('VAE tiling ON: tile latent ', TileLatent, ' overlap 0.25 -> image ',
+        'tile ', VaeNet.GetLastLayer().Output.SizeX);
+      Image.Free;
+      Image := TiledVaeDecode(VaeNet, Latent, TileLatent, 0.25);
+    end
+    else
+    begin
+      VaeNet.Compute(Latent);
+      Image.Copy(VaeNet.GetLastLayer().Output);
+    end;
     ImageOk := AllFinite(Image);
     WriteLn('Decoded image ', Image.SizeX, 'x', Image.SizeY, 'x', Image.Depth,
       '  finite=', BoolToStr(ImageOk, true));
