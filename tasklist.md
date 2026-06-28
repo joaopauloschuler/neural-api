@@ -1935,7 +1935,7 @@ not z = mu + sigma·eps sampling.)
       `TVolume.PointwiseSoftMax` instead of a scalar `pcr_expf` per element.
       Keep the scalar path as the `{$IFNDEF AVXANY}` fallback and pin parity with
       the existing numerical-gradient/forward tests.
-- [ ] OpenCL forward offload for `TNNetGroupNorm` / `TNNetInstanceNorm`. These are
+- [X] OpenCL forward offload for `TNNetGroupNorm` / `TNNetInstanceNorm`. These are
       the normalization used in diffusion UNet / GAN / StyleGAN image-generation
       stacks (which already run their convs on the GPU), so the per-group
       mean/variance reduction + affine scale/shift is a round-trip-forcing CPU
@@ -1952,15 +1952,26 @@ not z = mu + sigma·eps sampling.)
       model to the existing video stack (FlowWarp / VideoFrameInterpolation /
       TextToVideo). Use the pico-fixture parity pattern (slice a tiny real
       checkpoint into a committed fixture + a `<1e-4` logit/flow parity test).
-- [ ] NF4 (bitsandbytes 4-bit) dequantizing import path, paralleling the existing
-      int8 (`pQuantizeInt8`) and MXFP4 (`neuralmxfp4.DequantizeMXFP4`) support.
-      Add an `nf4` block dequantizer (the 16-level NF4 codebook + per-block FP
-      absmax scales, optionally double-quantized scales) in a `neuralnf4.pas`
-      sibling of `neuralmxfp4.pas`, dequantizing to F32 at load time on the
-      shared safetensors importer path so any `bnb-4bit` HF checkpoint (e.g. a
-      4-bit Llama/Qwen) loads through the existing `BuildLlamaFromSafeTensors`
-      family. Cross-check against a `bitsandbytes` reference tensor under the
-      `venv x` python.
+- [ ] NF4 (bitsandbytes 4-bit) dequantizing import path. PARTIALLY LANDED
+      (commit 90b6c931): the `neural/neuralnf4.pas` dequant unit ships — the exact
+      16-level NF4 codebook (`NF4Code`) + `DequantizeNF4(Codes, Absmax, N, Dest,
+      BlockSize=64)` with HIGH-nibble-first packing and per-block FP32 absmax
+      (`dequant[i] = NF4_CODE[nibble] * absmax[i div BlockSize]`); single-quant
+      only. Cross-checked to <1e-5 against a pure-numpy reference
+      (`tools/make_pico_nf4_fixture.py` → `tests/fixtures/pico_nf4.json`;
+      `bitsandbytes` is NOT importable under `venv x` — CPU torch, no CUDA bnb
+      build) via `TestNF4DequantFixtureParity` + `TestNF4DequantHandBlock`.
+      OPEN FOLLOW-UPS:
+  - [ ] Wire detection into `BuildLlamaFromSafeTensors` family — detect a
+        `weight` + `weight.absmax` bnb-4bit pair, expand to F32 at load (mirrors
+        how MXFP4 dequant is consumed; both are currently helper-level, the
+        gpt-oss MXFP4 build-path consumption is itself documented-but-deferred).
+  - [ ] Double-quantized absmax: handle `*.nested_absmax` / `*.nested_quant_map`
+        / `*.quant_state.*` (the secondary int8 quant + nested absmax + offset).
+        The unit consumes already-FP32 absmax and documents that the importer
+        must expand or raise rather than feed quantized absmax in (no silent
+        garbage path). A real `bnb-4bit` Llama/Qwen slicer fixture is RAM/network
+        -gated; today's parity is the random pico numpy oracle only.
 - [X] Continuous-latent variational autoencoder example `examples/VAE` (KL +
       Gaussian reparameterization), distinct from the existing discrete `VQVAE`
       example. The `TNNetKLDivergence` loss layer already exists, but there is no
@@ -1971,3 +1982,9 @@ not z = mu + sigma·eps sampling.)
       pattern), and routes the standard-normal-prior KL gradient back through mu
       and log-var. Then the example trains an encoder→reparameterize→decoder on
       MNIST/CIFAR with reconstruction + KL, replacing any hand-rolled sampling.
+      LANDED (commit 55870274): `TNNetGaussianReparameterize` (reparam gradient
+      only, frozen `FEps`) + a companion `TNNetVAEKLDivergence` head (standard-
+      normal-prior KL kept as a SEPARATE loss for clean two-headed composition,
+      `dKL/dmu = mu`, `dKL/dlog_var = 0.5*(exp(log_var)-1)`, beta-scaled);
+      gradient checks `TestGaussianReparameterizeGradientCheck` /
+      `TestVAEKLDivergenceGradientCheck`; `examples/VAE` smoke MSE 0.21→0.02.
