@@ -2019,7 +2019,7 @@ wrappers preserved, all parity fixtures bit-identical [dd5373fc].)
       handled by the SEPARATE "AVX-vectorize the DeformableConv bilinear gather"
       item below (which can now route through `NeuralBilinearGatherColumn`).
 
-- [ ] AVX-vectorize the `TNNetDeformableConv` bilinear gather. The offsets are
+- [X] AVX-vectorize the `TNNetDeformableConv` bilinear gather. The offsets are
       per-tap (shared across all Depth channels of a given sampled position), so
       the four corner taps can be blended as Depth-long contiguous `MulAdd`
       accumulations exactly like `TNNetAffineGridSample.Compute` already does,
@@ -2029,6 +2029,25 @@ wrappers preserved, all parity fixtures bit-identical [dd5373fc].)
       Forward-and-backward parity-test against the current scalar path on a small
       net; the GEMM stage already offloads, this removes the remaining CPU-scalar
       gather bottleneck. Pairs with the existing DCNv2 modulated mask path.
+      DONE 2026-06-28: both forward CPU paths now route the per-tap column gather
+      through the shared `NeuralBilinearGatherColumn` helper (zero-padding) and
+      apply the DCNv2 sigmoid modulation AFTER the gather via the AVX scalar
+      `TNNetVolume.Mul`. The CPU `ComputeCPU` blends into `FSampledCol`; the
+      OpenCL `ComputeOpenCL` blends straight into the contiguous im2col patch
+      slot `FGemmPatch[t*Sz + tap*FInDepth ..)`. The corner add order matches the
+      old scalar `SampleBilinear` exactly, so the forward is bit-identical (scalar
+      build) / <1e-6 (AVX2). The helper's existing signature already fit the
+      DeformableConv access pattern, so NO helper change was needed (GridSample /
+      AffineGridSample callers untouched). The backward gather was already AVX
+      (prior 2026-06-27 batch); left unchanged. New parity tests in
+      tests/TestNeuralNumerical.pas: TestDeformableConvGatherParity and
+      TestModulatedDeformableConvGatherParity (forward AND full backward
+      input-gradient — incl. offset-head and DCNv2 modulation-logit scatter —
+      vs an independent scalar reference, max |diff| < 1e-5 both paths). Suite
+      2500 scalar / 2500 AVX2 green (the one AVX2 failure, TestSetTrainableKeeps-
+      Outputs, is the documented pre-existing fp flake). The dead
+      `TNNetDeformableConv.SampleBilinear` method is now unused by the forward but
+      kept as documentation (RoIAlign has its own copy).
 
 - [ ] Add a reusable `TNNet.AddPatchEmbedding` builder method (patchify +
       linear projection to tokens, optional learnable class token and learnable

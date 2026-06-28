@@ -297,6 +297,10 @@ type
     procedure TestModulatedDeformableConvInputGradientCheck;
     procedure TestModulatedDeformableConvWeightGradientCheck;
     procedure TestModulatedDeformableConvSerializationRoundTrip;
+    // AVX bilinear-gather (NeuralBilinearGatherColumn) parity vs an independent
+    // scalar reference, forward AND backward, regular and DCNv2 modulated.
+    procedure TestDeformableConvGatherParity;
+    procedure TestModulatedDeformableConvGatherParity;
     // OpenCL im2col-GEMM offload parity (vs CPU) for DeformableConv / GroupConvP4
     procedure TestDeformableConvOpenCLParity;
     procedure TestGroupConvP4OpenCLParity;
@@ -60194,6 +60198,270 @@ begin
   end;
 end;
 {$ENDIF}
+
+// Independent scalar reference for the TNNetDeformableConv bilinear gather. The
+// production forward now blends the four corner columns through the shared AVX
+// helper NeuralBilinearGatherColumn; this confirms forward output AND the
+// back-propagated input gradient still match a from-scratch per-channel scalar
+// computation, for both the plain (v1) and DCNv2 modulated paths. The reference
+// mirrors the layer's offset head, bias seed, sample order and gradient scatter.
+procedure DeformableConvGatherParityRef(NN: TNNet; DC: TNNetDeformableConv;
+  Input, OutRef, InGradRef: TNNetVolume; Modulated: boolean);
+var
+  PrevOut, mW, mB, oW, oB, OffMap, dOffGrad: TNNetVolume;
+  ox, oy, co, fx, fy, ci, tap, oc, prevX0, prevY0: integer;
+  W, H, D, OutDepth, OffOut, NumTaps, K, Pad, Stride, OutW, OutH: integer;
+  x0, y0, x1, y1: integer;
+  offv, dx, dyo, px, py, modM, fxr, fyr, w00, w01, w10, w11, sval: TNeuralFloat;
+  acc, coef, dpx, dpy, rawS, dOffX, dOffY, dModL: TNeuralFloat;
+
+  function Samp(cc: integer): TNeuralFloat;
+  var v: TNeuralFloat;
+  begin
+    v := 0;
+    if (x0 >= 0) and (x0 < W) and (y0 >= 0) and (y0 < H) then v := v + w00 * PrevOut.Get(x0, y0, cc);
+    if (x1 >= 0) and (x1 < W) and (y0 >= 0) and (y0 < H) then v := v + w01 * PrevOut.Get(x1, y0, cc);
+    if (x0 >= 0) and (x0 < W) and (y1 >= 0) and (y1 < H) then v := v + w10 * PrevOut.Get(x0, y1, cc);
+    if (x1 >= 0) and (x1 < W) and (y1 >= 0) and (y1 < H) then v := v + w11 * PrevOut.Get(x1, y1, cc);
+    Result := v;
+  end;
+
+begin
+  PrevOut := DC.PrevLayer.Output;
+  mW := DC.Neurons[0].Weights;
+  mB := DC.Neurons[1].Weights;
+  oW := DC.Neurons[2].Weights;
+  oB := DC.Neurons[3].Weights;
+  W := PrevOut.SizeX; H := PrevOut.SizeY; D := PrevOut.Depth;
+  OutDepth := DC.OutDepth;
+  K := 3; Pad := 1; Stride := 1;
+  NumTaps := K * K;
+  if Modulated then OffOut := 3 * NumTaps else OffOut := 2 * NumTaps;
+  OutW := DC.Output.SizeX; OutH := DC.Output.SizeY;
+  OutRef.ReSize(DC.Output);
+  OutRef.Fill(0);
+  InGradRef.ReSize(PrevOut);
+  InGradRef.Fill(0);
+
+  // Offset head (ordinary conv) -> offset/modulation maps.
+  OffMap := TNNetVolume.Create(OutW, OutH, OffOut);
+  dOffGrad := TNNetVolume.Create(OutW, OutH, OffOut);
+  dOffGrad.Fill(0);
+  dOffX := 0; dOffY := 0; dModL := 0;
+  try
+    for oy := 0 to OutH - 1 do
+    for ox := 0 to OutW - 1 do
+      for oc := 0 to OffOut - 1 do
+      begin
+        offv := oB.FData[oc];
+        for fy := 0 to K - 1 do
+        begin
+          prevY0 := oy * Stride + fy - Pad;
+          if (prevY0 < 0) or (prevY0 >= H) then continue;
+          for fx := 0 to K - 1 do
+          begin
+            prevX0 := ox * Stride + fx - Pad;
+            if (prevX0 < 0) or (prevX0 >= W) then continue;
+            for ci := 0 to D - 1 do
+              offv := offv + oW.FData[((fy * K + fx) * D + ci) * OffOut + oc] *
+                PrevOut.Get(prevX0, prevY0, ci);
+          end;
+        end;
+        OffMap.Store(ox, oy, oc, offv);
+      end;
+
+    // Main deformable conv: scalar per-channel forward + input-gradient scatter
+    // (unit upstream error dy_out = 1 for every output element).
+    for oy := 0 to OutH - 1 do
+    for ox := 0 to OutW - 1 do
+    begin
+      for co := 0 to OutDepth - 1 do
+        OutRef.Store(ox, oy, co, mB.FData[co]);
+      for fy := 0 to K - 1 do
+      for fx := 0 to K - 1 do
+      begin
+        tap := fy * K + fx;
+        dx := OffMap.Get(ox, oy, 2 * tap);
+        dyo := OffMap.Get(ox, oy, 2 * tap + 1);
+        px := ox * Stride + fx - Pad + dx;
+        py := oy * Stride + fy - Pad + dyo;
+        if Modulated then
+          modM := 1.0 / (1.0 + Exp(-OffMap.Get(ox, oy, 2 * NumTaps + tap)))
+        else
+          modM := 1.0;
+        x0 := Floor(px); y0 := Floor(py);
+        x1 := x0 + 1;    y1 := y0 + 1;
+        fxr := px - x0;  fyr := py - y0;
+        w00 := (1 - fxr) * (1 - fyr);
+        w01 := fxr * (1 - fyr);
+        w10 := (1 - fxr) * fyr;
+        w11 := fxr * fyr;
+        for co := 0 to OutDepth - 1 do
+        begin
+          acc := 0;
+          for ci := 0 to D - 1 do
+            acc := acc + mW.FData[((tap * D + ci) * OutDepth) + co] * Samp(ci) * modM;
+          OutRef.Store(ox, oy, co, OutRef.Get(ox, oy, co) + acc);
+        end;
+        // Main-conv input gradient (unit output error): dInput_corner +=
+        // sum_co w*modM*cornerWeight. This is the contribution the forward
+        // bilinear gather feeds; the offset-head path is added below.
+        for ci := 0 to D - 1 do
+        begin
+          coef := 0;
+          for co := 0 to OutDepth - 1 do
+            coef := coef + mW.FData[((tap * D + ci) * OutDepth) + co];
+          coef := coef * modM;
+          if (x0 >= 0) and (x0 < W) and (y0 >= 0) and (y0 < H) then
+            InGradRef.Add(x0, y0, ci, coef * w00);
+          if (x1 >= 0) and (x1 < W) and (y0 >= 0) and (y0 < H) then
+            InGradRef.Add(x1, y0, ci, coef * w01);
+          if (x0 >= 0) and (x0 < W) and (y1 >= 0) and (y1 < H) then
+            InGradRef.Add(x0, y1, ci, coef * w10);
+          if (x1 >= 0) and (x1 < W) and (y1 >= 0) and (y1 < H) then
+            InGradRef.Add(x1, y1, ci, coef * w11);
+        end;
+        // Offset-map gradient (and DCNv2 modulation-logit gradient): dOff =
+        // sum_ci sum_co dy_out*modM*w*(dS/dp). With unit output error dy_out=1.
+        for ci := 0 to D - 1 do
+        begin
+          coef := 0;  // sum_co w[tap,co,ci]
+          for co := 0 to OutDepth - 1 do
+            coef := coef + mW.FData[((tap * D + ci) * OutDepth) + co];
+          // dS/dpx and dS/dpy at corner ci (in-bounds corners only).
+          dpx := 0; dpy := 0; rawS := 0;
+          if (x0 >= 0) and (x0 < W) and (y0 >= 0) and (y0 < H) then
+          begin sval := PrevOut.Get(x0, y0, ci);
+            dpx := dpx - (1 - fyr) * sval; dpy := dpy - (1 - fxr) * sval; rawS := rawS + w00 * sval; end;
+          if (x1 >= 0) and (x1 < W) and (y0 >= 0) and (y0 < H) then
+          begin sval := PrevOut.Get(x1, y0, ci);
+            dpx := dpx + (1 - fyr) * sval; dpy := dpy - fxr * sval; rawS := rawS + w01 * sval; end;
+          if (x0 >= 0) and (x0 < W) and (y1 >= 0) and (y1 < H) then
+          begin sval := PrevOut.Get(x0, y1, ci);
+            dpx := dpx - fyr * sval; dpy := dpy + (1 - fxr) * sval; rawS := rawS + w10 * sval; end;
+          if (x1 >= 0) and (x1 < W) and (y1 >= 0) and (y1 < H) then
+          begin sval := PrevOut.Get(x1, y1, ci);
+            dpx := dpx + fyr * sval; dpy := dpy + fxr * sval; rawS := rawS + w11 * sval; end;
+          dOffX := dOffX + coef * modM * dpx;
+          dOffY := dOffY + coef * modM * dpy;
+          dModL := dModL + coef * rawS;  // dL/dm before *m*(1-m)
+        end;
+        dOffGrad.Add(ox, oy, 2 * tap, dOffX);
+        dOffGrad.Add(ox, oy, 2 * tap + 1, dOffY);
+        if Modulated then
+          dOffGrad.Add(ox, oy, 2 * NumTaps + tap, dModL * modM * (1 - modM));
+        dOffX := 0; dOffY := 0; dModL := 0;
+      end;
+    end;
+
+    // Offset-head backward (ordinary conv): scatter dOffGrad into the input via
+    // the offset-head weights, exactly mirroring the layer's offset-conv backward.
+    for oy := 0 to OutH - 1 do
+    for ox := 0 to OutW - 1 do
+      for oc := 0 to OffOut - 1 do
+      begin
+        offv := dOffGrad.Get(ox, oy, oc);
+        if offv = 0 then continue;
+        for fy := 0 to K - 1 do
+        begin
+          prevY0 := oy * Stride + fy - Pad;
+          if (prevY0 < 0) or (prevY0 >= H) then continue;
+          for fx := 0 to K - 1 do
+          begin
+            prevX0 := ox * Stride + fx - Pad;
+            if (prevX0 < 0) or (prevX0 >= W) then continue;
+            for ci := 0 to D - 1 do
+              InGradRef.Add(prevX0, prevY0, ci,
+                offv * oW.FData[((fy * K + fx) * D + ci) * OffOut + oc]);
+          end;
+        end;
+      end;
+  finally
+    OffMap.Free;
+    dOffGrad.Free;
+  end;
+end;
+
+procedure RunDeformableConvGatherParity(Self: TTestNeuralNumerical; Modulated: boolean);
+var
+  NN: TNNet;
+  Input, OutRef, InGradRef: TNNetVolume;
+  DC: TNNetDeformableConv;
+  PrevErr, ConvOutErr: TNNetVolume;
+  i, mFlag: integer;
+  Diff, MaxFwd, MaxBwd: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 4);
+  OutRef := TNNetVolume.Create();
+  InGradRef := TNNetVolume.Create();
+  try
+    if Modulated then mFlag := 1 else mFlag := 0;
+    NN.AddLayer(TNNetInput.Create(8, 8, 4, 1));
+    DC := TNNetDeformableConv.Create(6, 3, 1, 1, 0, mFlag);
+    NN.AddLayer(DC);
+    // Content-driven fractional offsets (and modulation logits) so the bilinear
+    // sampler is exercised across all four corners and out-of-bounds taps.
+    for i := 0 to DC.Neurons[3].Weights.Size - 1 do
+      DC.Neurons[3].Weights.Raw[i] := 0.3 - 0.013 * i;
+    for i := 0 to DC.Neurons[2].Weights.Size - 1 do
+      DC.Neurons[2].Weights.Raw[i] := 0.015 * Sin(i * 0.7);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.07 * i - 0.4;
+
+    // Reference forward + input gradient.
+    NN.Compute(Input);  // populate offsets/shapes; ref recomputes independently
+    DeformableConvGatherParityRef(NN, DC, Input, OutRef, InGradRef, Modulated);
+
+    // Production forward parity.
+    NN.Compute(Input);
+    MaxFwd := 0;
+    Self.AssertEquals('forward size match', OutRef.Size, DC.Output.Size);
+    for i := 0 to OutRef.Size - 1 do
+    begin
+      Diff := Abs(OutRef.Raw[i] - DC.Output.Raw[i]);
+      if Diff > MaxFwd then MaxFwd := Diff;
+    end;
+
+    // Production backward parity (unit upstream error). Backpropagate scatters
+    // into PrevLayer.OutputError; compare against the scalar reference scatter.
+    NN.GetLastLayer.OutputError.Fill(1);
+    DC.PrevLayer.OutputError.Fill(0);
+    DC.IncDepartingBranchesCnt();
+    DC.Backpropagate();
+    PrevErr := DC.PrevLayer.OutputError;
+    MaxBwd := 0;
+    Self.AssertEquals('backward size match', InGradRef.Size, PrevErr.Size);
+    for i := 0 to InGradRef.Size - 1 do
+    begin
+      Diff := Abs(InGradRef.Raw[i] - PrevErr.Raw[i]);
+      if Diff > MaxBwd then MaxBwd := Diff;
+    end;
+
+    Self.AssertTrue('DeformableConv gather forward parity (modulated=' +
+      IntToStr(mFlag) + '): max |diff| = ' + FloatToStr(MaxFwd) + ' < 1e-5',
+      MaxFwd < 1e-5);
+    Self.AssertTrue('DeformableConv gather backward parity (modulated=' +
+      IntToStr(mFlag) + '): max |diff| = ' + FloatToStr(MaxBwd) + ' < 1e-5',
+      MaxBwd < 1e-5);
+  finally
+    InGradRef.Free;
+    OutRef.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDeformableConvGatherParity;
+begin
+  RunDeformableConvGatherParity(Self, false);
+end;
+
+procedure TTestNeuralNumerical.TestModulatedDeformableConvGatherParity;
+begin
+  RunDeformableConvGatherParity(Self, true);
+end;
 
 procedure TTestNeuralNumerical.TestDeformableConvOpenCLParity;
 {$IFDEF OpenCL}
