@@ -332,6 +332,11 @@ type
     // transformer norm layers TNNetTokenRMSNorm and TNNetTokenLayerNorm.
     procedure TokenRMSNormOpenCLParity;
     procedure LayerNormOpenCLParity;
+    // OpenCL whole-volume mean/variance (LayerNorm) and mean-square (RMSNorm)
+    // forward offload parity (vs CPU) for TNNetLayerNorm / TNNetRMSNorm, which
+    // collapse the whole SizeX*SizeY*Depth sample into one cai_token_norm token.
+    procedure WholeVolumeLayerNormOpenCLParity;
+    procedure WholeVolumeRMSNormOpenCLParity;
     // OpenCL gated FFN forward offload parity (vs CPU) for the GLU-family
     // activations TNNetGLU / TNNetSwiGLU / TNNetGEGLU / TNNetGEGLUErf.
     procedure GLUFamilyOpenCLParity;
@@ -60466,6 +60471,141 @@ begin
     end;
     WriteLn('  LayerNorm OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('LayerNorm OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Whole-volume LayerNorm device-forward parity. TNNetLayerNorm normalizes over
+// the ENTIRE SizeX*SizeY*Depth sample (one mean/variance) and applies a
+// per-ELEMENT gamma/beta; the offload feeds cai_token_norm a single token of
+// width Depth=Size. Randomized per-element gamma AND beta. Coded by Claude (AI).
+procedure TTestNeuralNumerical.WholeVolumeLayerNormOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Norm: TNNetLayerNorm;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, WeightMax, InputMax, OutMax: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 3, 16); // whole-volume sample = 4*3*16 = 192
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 3, 16, 1));
+    Norm := TNNetLayerNorm.Create();
+    NN.AddLayer(Norm);
+    // Non-trivial per-element gamma (Neurons[0]) and beta (Neurons[1]).
+    WeightMax := Norm.Neurons[0].Weights.Size - 1;
+    for i := 0 to WeightMax do
+    begin
+      Norm.Neurons[0].Weights.Raw[i] := 1.0 + 0.4 * Sin(i * 0.7);
+      Norm.Neurons[1].Weights.Raw[i] := 0.2 * Cos(i * 0.5);
+    end;
+    InputMax := Input.Size - 1;
+    for i := 0 to InputMax do Input.Raw[i] := 0.6 * Sin(i * 0.31) - 0.15;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      MaxDiff := 0;
+      OutMax := OutCPU.Size - 1;
+      for i := 0 to OutMax do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    WriteLn('  WholeVolume LayerNorm OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('WholeVolume LayerNorm OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Whole-volume RMSNorm device-forward parity. TNNetRMSNorm divides the ENTIRE
+// SizeX*SizeY*Depth sample by sqrt(mean(x^2)+eps) (no mean subtraction) and
+// applies a per-ELEMENT gamma (no bias); the offload feeds cai_token_norm a
+// single token of width Depth=Size with UseMean=false. Coded by Claude (AI).
+procedure TTestNeuralNumerical.WholeVolumeRMSNormOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Norm: TNNetRMSNorm;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, WeightMax, InputMax, OutMax: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 3, 16); // whole-volume sample = 4*3*16 = 192
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 3, 16, 1));
+    Norm := TNNetRMSNorm.Create();
+    NN.AddLayer(Norm);
+    // Non-trivial per-element gain (Neurons[0]); no bias.
+    WeightMax := Norm.Neurons[0].Weights.Size - 1;
+    for i := 0 to WeightMax do
+      Norm.Neurons[0].Weights.Raw[i] := 1.0 + 0.4 * Sin(i * 0.7);
+    InputMax := Input.Size - 1;
+    for i := 0 to InputMax do Input.Raw[i] := 0.6 * Sin(i * 0.31) - 0.15;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      MaxDiff := 0;
+      OutMax := OutCPU.Size - 1;
+      for i := 0 to OutMax do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    WriteLn('  WholeVolume RMSNorm OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('WholeVolume RMSNorm OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
