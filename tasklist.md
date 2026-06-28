@@ -1978,7 +1978,7 @@ with incompatible signatures.)
       the first attention block. Mirror the existing `FShouldOpenCL` arming +
       `NeuralConvOpenCLMinWork` gate pattern; forward-only, `<1e-4` parity test.
 
-- [ ] AVX vectorization of the `TNNetLinearAttention` CPU feature map. The layer
+- [X] AVX vectorization of the `TNNetLinearAttention` CPU feature map. The layer
       already has an OpenCL score path, but its CPU forward computes the kernel
       feature map `phi(x) = elu(x)+1` (and its backward derivative) with a scalar
       `pcr_expf` branch per (sequence, feature) element. The feature axis is
