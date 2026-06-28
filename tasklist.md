@@ -2037,3 +2037,67 @@ surfaced while landing them:)
       document+measure the approximation error vs whole-image decode on a real
       (trained) checkpoint so users know the quality trade-off. Pure host /
       analysis; no new layer.
+
+## Lucky-day batch 2026-06-28g (verified-novel AVX / OpenCL / image-tokenizer)
+
+(Each item below was grepped against neuralnetwork.pas + the full tasklist and
+confirmed ABSENT before listing. Categories follow the lucky-day priority list:
+OpenCL correctness/offload, AVX vectorization, and torch/diffusers CV ports.)
+
+- [ ] OpenCL correctness + offload for the SDPA attention VARIANTS
+      (`TNNetCosineSimilarityAttention`, `TNNetDisentangledAttention`,
+      `TNNetConformerRelPosAttention`, `TNNetALiBiAttention`). All four subclass
+      `TNNetScaledDotProductAttention` and override `Compute()` with their own
+      score math, but NONE override `EnableOpenCL`/`ComputeOpenCL` — so if OpenCL
+      is enabled on one, it inherits the base `ComputeOpenCL` (line ~27906) which
+      computes PLAIN dot-product attention and silently returns WRONG results
+      (wrong scores: cosine renorm / relative-position bias / linear ALiBi bias
+      all dropped). Two-part task: (1) immediate safety — guard the base
+      `EnableOpenCL`/`FShouldOpenCL` by exact `ClassType` so a variant falls back
+      to its correct CPU `Compute()` instead of the wrong device path; (2) then
+      add a CORRECT offload, easiest first for `TNNetALiBiAttention` since ALiBi
+      only ADDS a per-(i,j) linear position bias to the scores — reuse the base
+      two device matmuls (Q·Kᵀ and P·V) and inject the bias in the CPU
+      masking/softmax gap that already sits between them. Parity-tested vs CPU
+      `Compute()` on the PoCL device, skip-clean with no device. Same recipe then
+      extends to the cosine/disentangled/conformer variants.
+- [ ] AVX-vectorize `TNNetSoftPool.Compute` (line ~82767). The window-softmax
+      pool runs three passes of triple-nested scalar loops with a `pcr_expf` per
+      element (`exp(beta*x_i - winMax)`), then a weighted-sum normalize. The depth
+      axis is contiguous, so the existing `AVXExp` primitive (already used by the
+      SoftPlus/Gaussian forwards) can vectorize the per-window exp + accumulate —
+      note `AVXExp`'s scalar tail has no internal clamp, so pre-clamp the
+      `beta*x - winMax` argument to [-88,88] before the call (the winMax subtract
+      already bounds it above by 0, but guard the low tail). Forward-first; the
+      backward (line ~82862) shares the same exp pattern and can follow.
+      Numerical-gradient + scalar-vs-AVX parity tested.
+- [ ] AVX-vectorize `TNNetCumSum.Compute`/`Backpropagate` (line ~41416/~41468)
+      for the DEPTH-axis (`caDepth`) case only — there the scanned axis is
+      contiguous in memory, so a running-accumulator pass can use a vectorized
+      add of the prefix into spans (or at minimum `AVXCopy` the input span then a
+      vectorized in-place prefix). The X/Y-axis cases stay scalar (strided, no
+      contiguous span). Backward is the reverse-cumulative-sum mirror with the
+      same depth-contiguous structure. Guard by axis; numerical-gradient + parity
+      tested, no behaviour change on X/Y.
+- [ ] `TNNetFiniteScalarQuant` (FSQ — Mentzer et al. 2023, "Finite Scalar
+      Quantization: VQ-VAE Made Simple"; lucidrains `vector-quantize-pytorch`
+      port). Codebook-FREE quantizer: bound each of d channels with
+      `f(z)=⌊L/2⌋·tanh(z)`, round to the nearest of L_i integer levels with a
+      straight-through estimator, implicit codebook size = ∏ L_i. A distinct,
+      non-duplicate alternative to the existing `TNNetVectorQuantizer` (no learned
+      codebook, no EMA, no commitment loss, structurally collapse-free) — directly
+      addresses the failure mode the `examples/VQCodebookCollapse` example
+      demonstrates. Per-channel `Levels: array of integer` arg; forward = bounded
+      round, backward = STE passthrough; expose the integer code indices for a
+      downstream embedding/transformer. Numerical-gradient test on the STE region
+      + an example (FSQ-VAE on MNIST showing 100% codebook utilization).
+- [ ] `TNNetLookupFreeQuant` (LFQ — Yu et al. 2023, MagViT-v2 "Language Model
+      Beats Diffusion: Tokenizer is Key to Visual Generation"). Binary
+      sign-quantizer: code = sign(z) per channel (implicit codebook = {-1,+1}^d,
+      index = bit-packed sign pattern), STE backward, plus the LFQ entropy
+      objective (per-batch entropy maximization − code-usage entropy
+      minimization) exposed as a public penalty so a `TNNetLoss`-style head can
+      add it. Genuinely different math from FSQ (binary vs multi-level levels) and
+      from `TNNetVectorQuantizer` (no codebook lookup at all). Numerical-gradient
+      test + a usage example; pairs with the FSQ task as the two modern
+      tokenizer-quantizer options the repo currently lacks.
