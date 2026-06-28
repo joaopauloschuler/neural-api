@@ -683,3 +683,78 @@ __kernel void cai_glu_gate
   }
   FY[gid] = a * gated;
 }
+
+// Group / Instance normalization forward (TNNetGroupNorm, and its Groups=Depth
+// limit TNNetInstanceNorm). A single sample's volume is laid out depth-axis
+// contiguous: element (x,y,c) lives at FX[(x*FSizeY + y)*FDepth + c]. The Depth
+// channels are partitioned into FGroups contiguous groups of FChannelsPerGroup =
+// FDepth/FGroups channels; group g owns channels [g*FChannelsPerGroup ..
+// +FChannelsPerGroup). Each group is normalized to zero mean / unit variance
+// over its (FSizeX * FSizeY * FChannelsPerGroup) elements, then an affine
+// gamma/beta is applied. FAffineMode selects the gamma/beta layout:
+//   0 = per-channel : FGain/FBias are FDepth long, indexed by absolute channel c
+//   1 = per-element : FGain/FBias are FSizeX*FSizeY*FDepth long, indexed by the
+//                     full element offset (legacy affine)
+// One work-item per GROUP: global size = FGroups (dim 0). Keeping the whole
+// per-group reduction in a single work-item matches the scalar accumulation
+// order closely (parity well under 1e-4). Forward-only; training stays on CPU.
+__kernel void cai_group_norm
+(
+  const int FSizeX,
+  const int FSizeY,
+  const int FDepth,
+  const int FGroups,
+  const int FChannelsPerGroup,
+  const int FAffineMode,
+  const float FEps,
+  __global const float* FGain,
+  __global const float* FBias,
+  __global const float* FX,
+  __global float* FY
+)
+{
+  const int g = get_global_id(0);
+  if (g >= FGroups) return;
+  const int dStart = g * FChannelsPerGroup;
+  const int groupSize = FSizeX * FSizeY * FChannelsPerGroup;
+  const int rowStride = FSizeY * FDepth; // stride between successive x
+  // Mean over the group.
+  float s = 0.0f;
+  for (int x = 0; x < FSizeX; x++)
+    for (int y = 0; y < FSizeY; y++)
+    {
+      const int base = x * rowStride + y * FDepth + dStart;
+      for (int c = 0; c < FChannelsPerGroup; c++)
+        s += FX[base + c];
+    }
+  const float mean = s / (float)groupSize;
+  // Variance = mean( (x-mean)^2 ) over the group.
+  float ss = 0.0f;
+  for (int x = 0; x < FSizeX; x++)
+    for (int y = 0; y < FSizeY; y++)
+    {
+      const int base = x * rowStride + y * FDepth + dStart;
+      for (int c = 0; c < FChannelsPerGroup; c++)
+      {
+        const float v = FX[base + c] - mean;
+        ss = mad(v, v, ss);
+      }
+    }
+  const float variance = ss / (float)groupSize;
+  const float invStd = 1.0f / sqrt(variance + FEps);
+  // Normalize then apply the learnable scale (gamma) and bias (beta).
+  for (int x = 0; x < FSizeX; x++)
+    for (int y = 0; y < FSizeY; y++)
+    {
+      const int base = x * rowStride + y * FDepth + dStart;
+      for (int c = 0; c < FChannelsPerGroup; c++)
+      {
+        const int idx = base + c;
+        const float xhat = (FX[idx] - mean) * invStd;
+        int wIdx;
+        if (FAffineMode == 0) wIdx = dStart + c; // per-channel
+        else                  wIdx = idx;        // per-element
+        FY[idx] = mad(FGain[wIdx], xhat, FBias[wIdx]);
+      }
+    }
+}
