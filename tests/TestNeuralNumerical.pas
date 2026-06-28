@@ -386,6 +386,9 @@ type
     // TNNetInstanceNorm.
     procedure GroupNormOpenCLParity;
     procedure InstanceNormOpenCLParity;
+    // OpenCL forward offload parity (vs CPU) for TNNetAdaIN (content instance-
+    // normalize + per-channel style affine via cai_group_norm, Groups=Depth).
+    procedure AdaINOpenCLParity;
     // OpenCL per-depth-column L2 reduce + rsqrt scale forward offload parity
     // (vs CPU) for TNNetL2Normalize axis-0 (per-position) mode.
     procedure L2NormalizeOpenCLParity;
@@ -1122,6 +1125,7 @@ type
     procedure TestBackwardWarpFlowGradientCheck;
     procedure TestBackwardWarpLoadFromString;
     procedure TestAdaINForwardStatistics;
+    procedure TestAdaINForwardAVXParity;
     procedure TestAdaINContentGradientCheck;
     procedure TestAdaINStyleGradientCheck;
     procedure TestAdaINLoadFromString;
@@ -19961,6 +19965,80 @@ begin
     end;
   finally
     NN.Free; Content.Free; Style.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAdaINForwardAVXParity;
+// Verifies the depth-contiguous AVX vector reduction of TNNetAdaIN.Compute against
+// an independent element-wise SCALAR reference, with a WIDE depth and a RECTANGULAR
+// (SizeX <> SizeY) spatial layout that differs between content and style, to
+// exercise the M<>N per-channel path. max|diff| must be < 1e-4.
+var
+  NN: TNNet;
+  ContentInput, StyleInput: TNNetLayer;
+  Content, Style, Ref: TNNetVolume;
+  CW, CH, SW, SH, D, c, x, y, n: integer;
+  cMean, cVar, cInvStd, sMean, sVar, sStd, xhat, eps: TNeuralFloat;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  eps := 1e-5;          // matches TNNetAdaIN.FAdaEpsilon
+  CW := 7; CH := 3;     // rectangular content
+  SW := 2; SH := 9;     // rectangular style, different size from content
+  D := 37;              // wide depth (non-multiple of 8 stresses AVX tail)
+  NN := TNNet.Create();
+  Content := TNNetVolume.Create(CW, CH, D);
+  Style := TNNetVolume.Create(SW, SH, D);
+  Ref := TNNetVolume.Create(CW, CH, D);
+  try
+    ContentInput := NN.AddLayer(TNNetInput.Create(CW, CH, D, 1));
+    StyleInput   := NN.AddLayerAfter(TNNetInput.Create(SW, SH, D, 1), 0);
+    NN.AddLayerAfter(TNNetAdaIN.Create(ContentInput, StyleInput), ContentInput);
+
+    for n := 0 to Content.Size - 1 do Content.Raw[n] := Sin(n * 0.53) * 0.9 + 0.1;
+    for n := 0 to Style.Size - 1 do Style.Raw[n] := Cos(n * 0.37) * 1.7 - 0.4;
+    ContentInput.Output.Copy(Content);
+    StyleInput.Output.Copy(Style);
+    NN.Compute(ContentInput.Output);
+
+    // Independent scalar reference: per channel, content instance-normalize then
+    // re-scale/shift by the style channel statistics.
+    for c := 0 to D - 1 do
+    begin
+      cMean := 0;
+      for x := 0 to CW - 1 do for y := 0 to CH - 1 do cMean := cMean + Content[x, y, c];
+      cMean := cMean / (CW * CH);
+      cVar := 0;
+      for x := 0 to CW - 1 do for y := 0 to CH - 1 do
+        cVar := cVar + Sqr(Content[x, y, c] - cMean);
+      cVar := cVar / (CW * CH);
+      cInvStd := 1 / Sqrt(cVar + eps);
+      sMean := 0;
+      for x := 0 to SW - 1 do for y := 0 to SH - 1 do sMean := sMean + Style[x, y, c];
+      sMean := sMean / (SW * SH);
+      sVar := 0;
+      for x := 0 to SW - 1 do for y := 0 to SH - 1 do
+        sVar := sVar + Sqr(Style[x, y, c] - sMean);
+      sVar := sVar / (SW * SH);
+      sStd := Sqrt(sVar + eps);
+      for x := 0 to CW - 1 do for y := 0 to CH - 1 do
+      begin
+        xhat := (Content[x, y, c] - cMean) * cInvStd;
+        Ref[x, y, c] := sStd * xhat + sMean;
+      end;
+    end;
+
+    MaxDiff := 0;
+    for n := 0 to Ref.Size - 1 do
+    begin
+      Diff := Abs(Ref.Raw[n] - NN.GetLastLayer.Output.Raw[n]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  AdaIN forward AVX-vs-scalar parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('AdaIN AVX-vs-scalar forward parity: max|diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    NN.Free; Content.Free; Style.Free; Ref.Free;
   end;
 end;
 
@@ -63533,6 +63611,76 @@ begin
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Device forward offload parity (vs CPU) for TNNetAdaIN: content instance-
+// normalize + per-channel style affine (gain=style_std, bias=style_mean) via the
+// shared cai_group_norm kernel with Groups=Depth. Content and style use DIFFERENT
+// rectangular spatial sizes to exercise the M<>N path. Skips cleanly when no
+// OpenCL device is present. Coded by Claude (AI).
+procedure TTestNeuralNumerical.AdaINOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  ContentInput, StyleInput: TNNetLayer;
+  OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CW, CH, SW, SH, D, i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  CW := 6; CH := 4; SW := 3; SH := 7; D := 8;
+  NN := TNNet.Create();
+  OutCPU := TNNetVolume.Create();
+  try
+    ContentInput := NN.AddLayer(TNNetInput.Create(CW, CH, D, 1));
+    StyleInput   := NN.AddLayerAfter(TNNetInput.Create(SW, SH, D, 1), 0);
+    NN.AddLayerAfter(TNNetAdaIN.Create(ContentInput, StyleInput), ContentInput);
+
+    for i := 0 to ContentInput.Output.Size - 1 do
+      ContentInput.Output.Raw[i] := 0.6 * Sin(i * 0.31) - 0.15;
+    for i := 0 to StyleInput.Output.Size - 1 do
+      StyleInput.Output.Raw[i] := 1.7 * Cos(i * 0.37) - 0.4;
+
+    NN.Compute(ContentInput.Output);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    SetNeuralConvOpenCLMinWork(0);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      // EnableOpenCL may have reset the input volumes; re-seed them.
+      for i := 0 to ContentInput.Output.Size - 1 do
+        ContentInput.Output.Raw[i] := 0.6 * Sin(i * 0.31) - 0.15;
+      for i := 0 to StyleInput.Output.Size - 1 do
+        StyleInput.Output.Raw[i] := 1.7 * Cos(i * 0.37) - 0.4;
+      NN.Compute(ContentInput.Output);
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      MaxDiff := 0;
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      SetNeuralConvOpenCLMinWork(1 shl 20);
+    end;
+    WriteLn('  AdaIN OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('AdaIN OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; NN.Free;
   end;
 end;
 {$ELSE}
