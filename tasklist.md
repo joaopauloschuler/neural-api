@@ -1956,14 +1956,19 @@ cai_mrope M-RoPE OpenCL offload [b06c5d0d]. Follow-ups landed:
   TNNetPixelShuffleScatterCL / TNNetBicubicScatterCL helpers + BackpropagateOpenCL.
   Parity `<1e-6` vs host backward on the PoCL CPU device,
   TestPixelShuffle/BicubicUpsampleBackwardOpenCLParity, skip-clean with no device.
+- M-RoPE angle-table incremental-decode cache for
+  `TNNetMRotaryEmbedding.ComputeOpenCL` [bc0794e4]: the host-built
+  per-(token,pair) `FAngleTable` now keeps its resolved leading rows across an
+  EXTENDING sequence (same HalfD / PositionOffset / leading positions) and only
+  recomputes the appended tail, instead of rebuilding the whole table every
+  forward. Invalidates on geometry/offset/position-prefix change and on the new
+  `ResetCache()` (called from EnableOpenCL); the full table still uploads each
+  call, matching the base RoPE transient-buffer ownership. Forward-only, bit-
+  exact (max|diff|=0) vs a per-step full rebuild on the PoCL CPU device,
+  MRoPEOpenCLIncrementalCacheParity, skip-clean with no device.
 Open follow-ups:)
 
-- [ ] `TNNetMRotaryEmbedding.ComputeOpenCL` rebuilds the full per-(token,pair)
-      `FAngleTable` on the HOST every forward then uploads it. For incremental
-      decode (one new token per step) this re-uploads the whole table each call —
-      cache the table and only append/upload the new token's angle row, mirroring
-      the KV-cache incremental-decode path the base RoPE already supports
-      (PositionOffset). Forward-only, parity-tested.
+(none open — all follow-ups landed)
 
 ## Lucky-day batch 2026-06-28d (verified-novel AVX / OpenCL / diffusion)
 
