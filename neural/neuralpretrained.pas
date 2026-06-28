@@ -23189,7 +23189,7 @@ procedure BertPoolSentenceEmbedding(HiddenStates: TNNetVolume;
   RealTokens: integer; Embedding: TNNetVolume);
 var
   SeqLen, Depth, PosCnt, ChanCnt, DepthM1, RealMax: integer;
-  Sum, Norm: TNeuralFloat;
+  Sum: TNeuralFloat;
 begin
   SeqLen := HiddenStates.SizeX;
   Depth := HiddenStates.Depth;
@@ -23212,13 +23212,8 @@ begin
       Sum := Sum + HiddenStates.FData[PosCnt * Depth + ChanCnt];
     Embedding.FData[ChanCnt] := Sum / RealTokens;
   end;
-  Norm := 0;
-  for ChanCnt := 0 to DepthM1 do
-    Norm := Norm + Embedding.FData[ChanCnt] * Embedding.FData[ChanCnt];
-  Norm := Sqrt(Norm);
-  if Norm > 0 then
-    for ChanCnt := 0 to DepthM1 do
-      Embedding.FData[ChanCnt] := Embedding.FData[ChanCnt] / Norm;
+  // L2-normalize the single (1,1,Depth) embedding vector
+  NormalizeRowsL2(Embedding);
 end;
 
 procedure BertEncodeSentence(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
@@ -23344,26 +23339,13 @@ begin
 end;
 
 function CosineSimilarity(A, B: TNNetVolume): TNeuralFloat;
-var
-  LpMax: integer;
-  Dot, NormA, NormB: TNeuralFloat;
-  Cnt: integer;
 begin
+  // The size-mismatch guard is specific to the importer call sites; the math
+  // itself is the shared neuralvolume.RowCosineSimilarity routine.
   if A.Size <> B.Size then
     ImportError('CosineSimilarity: vector size mismatch ' +
       IntToStr(A.Size) + ' vs ' + IntToStr(B.Size) + '.');
-  Dot := 0; NormA := 0; NormB := 0;
-  LpMax := A.Size - 1;
-  for Cnt := 0 to LpMax do
-  begin
-    Dot   := Dot   + A.FData[Cnt] * B.FData[Cnt];
-    NormA := NormA + A.FData[Cnt] * A.FData[Cnt];
-    NormB := NormB + B.FData[Cnt] * B.FData[Cnt];
-  end;
-  if (NormA <= 0) or (NormB <= 0) then
-    Result := 0
-  else
-    Result := Dot / (Sqrt(NormA) * Sqrt(NormB));
+  Result := RowCosineSimilarity(A, B);
 end;
 
 function PearsonCorrelation(const X, Y: array of TNeuralFloat): TNeuralFloat;
@@ -23714,27 +23696,15 @@ end;
 
 procedure ColBERTNormalizeRows(Mat: TNNetVolume);
 var
-  Rows, Dim, R, C: integer;
-  RowsM1, DimM1: integer;
-  Norm: TNeuralFloat;
+  Rows, Dim: integer;
 begin
   Rows := Mat.SizeX;
   Dim := Mat.Depth;
   if (Mat.SizeY <> 1) or (Rows < 1) or (Dim < 1) then
     ImportError('ColBERTNormalizeRows: expected a (Rows,1,Dim) volume, got ' +
       IntToStr(Rows) + 'x' + IntToStr(Mat.SizeY) + 'x' + IntToStr(Dim) + '.');
-  RowsM1 := Rows - 1;
-  DimM1 := Dim - 1;
-  for R := 0 to RowsM1 do
-  begin
-    Norm := 0;
-    for C := 0 to DimM1 do
-      Norm := Norm + Mat.FData[R * Dim + C] * Mat.FData[R * Dim + C];
-    Norm := Sqrt(Norm);
-    if Norm > 0 then
-      for C := 0 to DimM1 do
-        Mat.FData[R * Dim + C] := Mat.FData[R * Dim + C] / Norm;
-  end;
+  // per-row L2 normalization is the shared neuralvolume.NormalizeRowsL2
+  NormalizeRowsL2(Mat);
 end;
 
 procedure ColBERTEmbedTokens(Net: TNNet; Tokenizer: TNeuralHFTokenizer;

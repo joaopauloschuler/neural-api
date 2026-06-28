@@ -404,22 +404,7 @@ end;
 // Generation: one grounded answer streamed to stdout (the ChatTerminal
 // full-recompute decode, greedy argmax).
 // ---------------------------------------------------------------------------
-procedure SoftmaxRow(Row: TNNetVolume);
-var
-  Cnt: integer;
-  MaxV, Sum: TNeuralFloat;
-begin
-  MaxV := Row.FData[0];
-  for Cnt := 1 to Row.Size - 1 do
-    if Row.FData[Cnt] > MaxV then MaxV := Row.FData[Cnt];
-  Sum := 0;
-  for Cnt := 0 to Row.Size - 1 do
-  begin
-    Row.FData[Cnt] := Exp(Row.FData[Cnt] - MaxV);
-    Sum := Sum + Row.FData[Cnt];
-  end;
-  if Sum > 0 then Row.Mul(1 / Sum);
-end;
+// Stable in-place softmax of a logits row is now neuralvolume.RowSoftMax.
 
 function ArgMaxRow(Row: TNNetVolume): integer;
 var
@@ -464,7 +449,7 @@ begin
       NN.GetOutput(Output);
       for Cnt := 0 to VocabSize - 1 do
         Row.FData[Cnt] := Output.FData[(Len - 1) * VocabSize + Cnt];
-      SoftmaxRow(Row);
+      RowSoftMax(Row);
       NewToken := ArgMaxRow(Row);
       Tokens[Len] := NewToken;
       Inc(Len);

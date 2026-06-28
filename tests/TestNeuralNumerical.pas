@@ -1333,6 +1333,8 @@ type
     // (TestTanhGLUSerializationRoundTrip published alongside TestTanhGLU* above)
     // Shared dense linear solver
     procedure TestNeuralLinearSolveRoundTrip;
+    // Shared host-side row math (softmax / cosine / L2 row-normalize)
+    procedure TestRowMathHelpers;
     // Concat and sum numerical tests
     procedure TestConcatNumericalValues;
     procedure TestSumNumericalValues;
@@ -66517,6 +66519,57 @@ begin
   B[0] := 3; B[1] := 6;
   ok := NeuralLinearSolve(A, B, 2, 1);
   AssertFalse('singular system reported as singular', ok);
+end;
+
+procedure TTestNeuralNumerical.TestRowMathHelpers;
+var
+  Row, A, B, Mat: TNNetVolume;
+  Cnt: integer;
+  Sum, RowNorm: TNeuralFloat;
+begin
+  // RowSoftMax: a softmaxed row sums to 1 and is shift-invariant.
+  Row := TNNetVolume.Create(4, 1, 1);
+  A := TNNetVolume.Create(5, 1, 1);
+  B := TNNetVolume.Create(5, 1, 1);
+  Mat := TNNetVolume.Create(3, 1, 4);
+  try
+    Row.FData[0] := 1.0; Row.FData[1] := 2.0;
+    Row.FData[2] := 3.0; Row.FData[3] := 4.0;
+    RowSoftMax(Row);
+    Sum := 0;
+    for Cnt := 0 to Row.Size - 1 do Sum := Sum + Row.FData[Cnt];
+    AssertTrue('RowSoftMax sums to 1', Abs(Sum - 1.0) < 1e-5);
+    AssertTrue('RowSoftMax is monotone (last >= first)',
+      Row.FData[3] > Row.FData[0]);
+
+    // RowCosineSimilarity: cosine of a vector with itself = 1; with its
+    // negation = -1; orthogonal vectors = 0.
+    A.FData[0] := 0.5; A.FData[1] := -1.0; A.FData[2] := 2.0;
+    A.FData[3] := 0.25; A.FData[4] := -0.75;
+    AssertTrue('cosine(A,A) = 1', Abs(RowCosineSimilarity(A, A) - 1.0) < 1e-5);
+    for Cnt := 0 to A.Size - 1 do B.FData[Cnt] := -A.FData[Cnt];
+    AssertTrue('cosine(A,-A) = -1',
+      Abs(RowCosineSimilarity(A, B) + 1.0) < 1e-5);
+    B.Fill(0); B.FData[0] := 1.0; // orthogonal to e1 only if A has no e0...
+    A.Fill(0); A.FData[1] := 3.0; // A = 3*e1, B = e0 -> orthogonal
+    AssertTrue('cosine(orthogonal) = 0',
+      Abs(RowCosineSimilarity(A, B)) < 1e-5);
+
+    // NormalizeRowsL2: every row of a (Rows,1,Dim) volume becomes unit L2.
+    for Cnt := 0 to Mat.Size - 1 do Mat.FData[Cnt] := Cnt + 1; // 1..12, all > 0
+    NormalizeRowsL2(Mat);
+    for Cnt := 0 to Mat.SizeX - 1 do
+    begin
+      RowNorm := Sqrt(Sqr(Mat.FData[Cnt * Mat.Depth + 0]) +
+                      Sqr(Mat.FData[Cnt * Mat.Depth + 1]) +
+                      Sqr(Mat.FData[Cnt * Mat.Depth + 2]) +
+                      Sqr(Mat.FData[Cnt * Mat.Depth + 3]));
+      AssertTrue('NormalizeRowsL2 row has unit norm',
+        Abs(RowNorm - 1.0) < 1e-5);
+    end;
+  finally
+    Row.Free; A.Free; B.Free; Mat.Free;
+  end;
 end;
 
 initialization

@@ -1111,6 +1111,24 @@ type
     numerical instability in forward/backward passes. }
   procedure AssertFinite(V: TNNetVolume; const Where: string);
 
+  { RowSoftMax replaces Row in place with the numerically-stable softmax over
+    all Row.Size elements (subtract the row max, exponentiate, divide by the
+    sum). This is post-network host math over a flat logits/score row; it is
+    NOT a TNNetSoftMax layer. A zero sum is left untouched. }
+  procedure RowSoftMax(Row: TNNetVolume);
+
+  { RowCosineSimilarity returns the cosine similarity between two equally-sized
+    volumes (dot(A,B) / (||A||*||B||)), treating each as a flat vector of
+    A.Size elements. Returns 0 when either vector has zero norm or the sizes
+    differ. }
+  function RowCosineSimilarity(A, B: TNNetVolume): TNeuralFloat;
+
+  { NormalizeRowsL2 L2-normalizes each row of a (Rows,1,Dim) volume in place:
+    every row vector of length Dim is divided by its own L2 norm (rows with
+    zero norm are left untouched). For a single (1,1,Dim) embedding this
+    normalizes that one vector. }
+  procedure NormalizeRowsL2(Mat: TNNetVolume);
+
   { NeuralLinearSolve solves the dense linear system A*X = B in place by
     Gauss-Jordan elimination with partial pivoting (single precision). A is a
     row-major n x n matrix, B is a row-major n x m matrix; on return B holds the
@@ -1873,6 +1891,67 @@ begin
       raise Exception.Create('AssertFinite(' + Where +
         '): non-finite value at index ' + IntToStr(I) +
         ': Inf (' + FloatToStr(Val) + ')');
+  end;
+end;
+
+procedure RowSoftMax(Row: TNNetVolume);
+var
+  Cnt, SizeM1: integer;
+  MaxV, Sum: TNeuralFloat;
+begin
+  SizeM1 := Row.Size - 1;
+  if SizeM1 < 0 then exit;
+  MaxV := Row.FData[0];
+  for Cnt := 1 to SizeM1 do
+    if Row.FData[Cnt] > MaxV then MaxV := Row.FData[Cnt];
+  Sum := 0;
+  for Cnt := 0 to SizeM1 do
+  begin
+    Row.FData[Cnt] := Exp(Row.FData[Cnt] - MaxV);
+    Sum := Sum + Row.FData[Cnt];
+  end;
+  if Sum > 0 then Row.Mul(1 / Sum);
+end;
+
+function RowCosineSimilarity(A, B: TNNetVolume): TNeuralFloat;
+var
+  Cnt, SizeM1: integer;
+  Dot, NormA, NormB: TNeuralFloat;
+begin
+  if A.Size <> B.Size then exit(0);
+  Dot := 0; NormA := 0; NormB := 0;
+  SizeM1 := A.Size - 1;
+  for Cnt := 0 to SizeM1 do
+  begin
+    Dot   := Dot   + A.FData[Cnt] * B.FData[Cnt];
+    NormA := NormA + A.FData[Cnt] * A.FData[Cnt];
+    NormB := NormB + B.FData[Cnt] * B.FData[Cnt];
+  end;
+  if (NormA <= 0) or (NormB <= 0) then
+    Result := 0
+  else
+    Result := Dot / (Sqrt(NormA) * Sqrt(NormB));
+end;
+
+procedure NormalizeRowsL2(Mat: TNNetVolume);
+var
+  Rows, Dim, R, C: integer;
+  RowsM1, DimM1: integer;
+  Norm: TNeuralFloat;
+begin
+  Rows := Mat.SizeX;
+  Dim := Mat.Depth;
+  RowsM1 := Rows - 1;
+  DimM1 := Dim - 1;
+  for R := 0 to RowsM1 do
+  begin
+    Norm := 0;
+    for C := 0 to DimM1 do
+      Norm := Norm + Mat.FData[R * Dim + C] * Mat.FData[R * Dim + C];
+    Norm := Sqrt(Norm);
+    if Norm > 0 then
+      for C := 0 to DimM1 do
+        Mat.FData[R * Dim + C] := Mat.FData[R * Dim + C] / Norm;
   end;
 end;
 
