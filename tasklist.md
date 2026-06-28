@@ -1986,21 +1986,16 @@ VAE encoder/decoder importers all exist. The three items below are the gaps left
 in that otherwise-complete diffusion stack — all CV/generative and/or direct
 diffusers/torch ports.)
 
-- [ ] Heun 2nd-order (Karras EDM "Algorithm 2" / k-diffusion `sample_heun`)
-      sampler in `TNNetDiffusionScheduler`. Add an `smHeun` member to
-      `TNNetSamplerMethod` and a deterministic Heun update inside `Step`: it is a
-      single-step **predictor-corrector in sigma-space** that costs TWO denoiser
-      evals per step — Euler-predict from sigma_t to sigma_{t-1} to get x_pred,
-      re-evaluate the denoiser at (x_pred, t-1) for the second derivative, then
-      average the two drifts (trapezoidal correction). Unlike the existing
-      MULTISTEP DPM-Solver++(2M)/UniPC (which reuse the PREVIOUS step's stored
-      output as the 2nd order term, 1 eval/step) this is a genuine intra-step 2nd
-      eval, so it needs the `Sample` driver to call the `Denoise` callback twice
-      per step (and skip the corrector on the final step where sigma_{t-1}=0,
-      matching k-diffusion's `if sigmas[i+1]==0` branch). Reuses the existing
-      `SigmaOf`/`SigmaToTimestep`/`PredictX0` plumbing. Add a numpy/k-diffusion
-      float64 oracle parity test (`tools/make_*_fixture.py` -> `tests/fixtures`)
-      to `<1e-4`; pairs naturally with `tsKarras` spacing.
+(Two of the three LANDED 2026-06-28 — removed:
+- Heun 2nd-order sampler (`smHeun`, k-diffusion `sample_heun` / Karras EDM
+  "Algorithm 2"): intra-step predictor-corrector in sigma-space, two denoiser
+  evals per step via a dedicated `SampleHeun` driver (corrector skipped on the
+  final sigma=0 hop), `TestHeunVsOracle` matches the float64 numpy oracle to
+  <1e-4, commit 891e7537;
+- Min-SNR-gamma loss weighting `TNNetDiffusionScheduler.SNRWeight` (Hang et al.
+  2023; diffusers `snr_gamma`): eps `min(SNR,Gamma)/SNR`, v
+  `min(SNR,Gamma)/(SNR+1)`, `TestMinSNRWeight` pins both prediction types at
+  gamma=5.0 and the gamma=+inf limits to <1e-5, commit f8e1823c.)
 
 - [ ] Tiled VAE decode (diffusers `enable_vae_tiling` port) for
       `BuildVaeDecoderFromSafeTensors`. Decode a large latent in OVERLAPPING
@@ -2013,16 +2008,3 @@ diffusers/torch ports.)
       weights). Parity test: a tiled decode of a small latent must match the
       whole-image decode to `<1e-3` on the interior (seams allowed looser);
       wire an opt-in `--vae-tiling` flag into examples/LatentTextToImage.
-
-- [ ] Min-SNR-gamma diffusion training-loss weighting (Hang et al. 2023, "Efficient
-      Diffusion Training via Min-SNR Weighting Strategy"; diffusers' `snr_gamma`
-      path). Add `function TNNetDiffusionScheduler.SNRWeight(Tt: integer;
-      Gamma: TNeuralFloat): TNeuralFloat` returning the per-timestep loss weight:
-      with `SNR(t) = exp(2*Lambda(Tt))` (the scheduler already exposes the
-      half-log-SNR `Lambda`), eps-prediction weight = `min(SNR, Gamma)/SNR` and
-      v-prediction weight = `min(SNR, Gamma)/(SNR+1)` (the `PredictionType`
-      already on the scheduler selects which). This is the missing training-side
-      counterpart to the rich SAMPLING side; a diffusion trainer (examples/
-      DiffusionMNIST) multiplies its per-sample MSE by this weight. Add a unit
-      test pinning the weights against a numpy oracle for both prediction types
-      (`Gamma=5.0` is the paper default; `Gamma=+inf` must reproduce unweighted).
