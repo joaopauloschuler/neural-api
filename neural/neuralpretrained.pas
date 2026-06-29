@@ -13180,8 +13180,12 @@ end;
 // Constructs a TNNetRotaryEmbedding from a base and a parsed rope_scaling
 // (Mode=rsmNone passes only the base - bit-identical to the unscaled
 // constructor). Coded by Claude (AI).
+// pRotaryHeadDim > 0 builds a head-tiled layer (one full-width RoPE equivalent
+// to NumHeads per-head layers); 0 = the ordinary per-slice layer. LongRoPE
+// (partial rotary, Phi-3) is never hoisted, so it ignores the head dim.
 function CreateRoPEFromScaling(Base: TNeuralFloat;
-  const S: TRoPEScalingConfig): TNNetRotaryEmbedding;
+  const S: TRoPEScalingConfig;
+  pRotaryHeadDim: integer = 0): TNNetRotaryEmbedding;
 begin
   if S.Mode = rsmLongRoPE then
     Result := TNNetRotaryEmbedding.CreateLongRoPE(Base, S.LongFactors,
@@ -13192,7 +13196,7 @@ begin
     // for every other YaRN config keeps the layer's 0.1*ln(s)+1 default.
     Result := TNNetRotaryEmbedding.Create(Base, S.Mode, S.Factor,
       S.OriginalContextLen, S.YarnAlpha, S.YarnBeta, S.YarnAttnFactor,
-      S.YarnTruncate);
+      S.YarnTruncate, pRotaryHeadDim);
 end;
 
 // Returns the per-head Q/K rotary layer for the decoder block: an ordinary
@@ -13200,8 +13204,11 @@ end;
 // TNNetMRotaryEmbedding carrying the mrope_section split. The frequency
 // schedule / scaling is identical either way; only the per-token rotary index
 // differs. Coded by Claude (AI).
+// pRotaryHeadDim > 0 requests the head-tiled full-width layer (only the plain
+// non-M-RoPE path supports it; M-RoPE is never hoisted, so it ignores it).
 function CreateRoPELayerForConfig(const Config: TLlamaConfig;
-  Base: TNeuralFloat; const S: TRoPEScalingConfig): TNNetRotaryEmbedding;
+  Base: TNeuralFloat; const S: TRoPEScalingConfig;
+  pRotaryHeadDim: integer = 0): TNNetRotaryEmbedding;
 begin
   if Config.MRoPEEnabled then
   begin
@@ -13214,7 +13221,7 @@ begin
       S.YarnTruncate);
   end
   else
-    Result := CreateRoPEFromScaling(Base, S);
+    Result := CreateRoPEFromScaling(Base, S, pRotaryHeadDim);
 end;
 
 // ============================ LLAMA IMPORT =================================
@@ -14939,6 +14946,7 @@ var
   NumLayersM1, NumKVHeadsM1, NumHeadsM1, HeadDimM1, RotaryDimsM1: integer;
   HeadDimMRotaryM1, VocabSizeM1, HiddenSizeM1, NumLocalExpertsM1: integer;
   LayerIsLocal, LayerUseRoPE: boolean;
+  DoHoistRoPE: boolean;
   NormGainOffset, QScale, QProjScale, LayerTheta: TNeuralFloat;
   LogitScaleFold: TNeuralFloat;
   LayerRoPEScaling: TRoPEScalingConfig;
@@ -15203,6 +15211,29 @@ begin
           SetLength(Blocks[BlockCnt].QNorms, Config.NumHeads);
           SetLength(Blocks[BlockCnt].KNorms, Config.NumKVHeads);
         end;
+        // OPTIMIZATION (Coded by Claude (AI)): hoist RoPE ahead of the per-head
+        // split. RoPE rotates each head's (2k,2k+1) pairs by the SAME per-head
+        // schedule, so ONE full-width TNNetRotaryEmbedding with a head-tiled
+        // theta (pRotaryHeadDim = HeadDim) over the whole q/k projection is
+        // bit-identical to NumHeads/NumKVHeads per-head layers - but it is a
+        // single layer/dispatch instead of one per head. Only valid when
+        // nothing per-head sits between the split and RoPE and the rotary is
+        // full-width: NO per-head QKNorm (Qwen3/Gemma-3), NO Llama-4 per-head
+        // QK-L2-norm (applied AFTER RoPE), and RotaryDims = HeadDim (not the
+        // Phi-3 partial-rotary slice). QKNormFullWidth (OLMo-2) is fine - that
+        // norm is already whole-width and precedes RoPE. M-RoPE keeps per-head
+        // (CreateRoPELayerForConfig ignores the head dim for it).
+        DoHoistRoPE := LayerUseRoPE and (not Config.QKNorm) and
+          (not Config.Llama4QKL2Norm) and (RotaryDims >= HeadDim);
+        if DoHoistRoPE then
+        begin
+          QSource := NN.AddLayerAfter(
+            CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling, HeadDim),
+            QSource);
+          KSource := NN.AddLayerAfter(
+            CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling, HeadDim),
+            KSource);
+        end;
         // K is rotated ONCE per KV head; V is never rotated.
         for KVHeadCnt := 0 to NumKVHeadsM1 do
         begin
@@ -15245,7 +15276,10 @@ begin
             // positional encoding); RotaryEmbedding's native (2k,2k+1) layout
             // matches Llama-4's view_as_complex pairing (Config.InterleavedRotary
             // loads q/k straight - no rotate_half permutation).
-            if LayerUseRoPE then
+            // Skipped when DoHoistRoPE applied RoPE to the whole K projection
+            // above (the head-tiled full-width layer); the per-head slice is
+            // already rotated.
+            if LayerUseRoPE and (not DoHoistRoPE) then
               KSlice := NN.AddLayerAfter(
                 CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling), KSlice);
             // Config.Llama4QKL2Norm (use_qk_norm): UNWEIGHTED L2 RMS-norm over
@@ -15291,7 +15325,8 @@ begin
               QSlice := Blocks[BlockCnt].QNorms[HeadCnt];
             end;
             // Llama-4 iRoPE: RoPE only on the RoPE layers (see the K path).
-            if LayerUseRoPE then
+            // Skipped when DoHoistRoPE rotated the whole Q projection above.
+            if LayerUseRoPE and (not DoHoistRoPE) then
               QSlice := NN.AddLayerAfter(
                 CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling), QSlice);
             if Config.Llama4QKL2Norm and LayerUseRoPE then
