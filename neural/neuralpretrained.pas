@@ -15221,10 +15221,13 @@ begin
         // full-width: NO per-head QKNorm (Qwen3/Gemma-3), NO Llama-4 per-head
         // QK-L2-norm (applied AFTER RoPE), and RotaryDims = HeadDim (not the
         // Phi-3 partial-rotary slice). QKNormFullWidth (OLMo-2) is fine - that
-        // norm is already whole-width and precedes RoPE. M-RoPE keeps per-head
-        // (CreateRoPELayerForConfig ignores the head dim for it).
+        // norm is already whole-width and precedes RoPE. M-RoPE MUST keep
+        // per-head: CreateRoPELayerForConfig ignores the head dim for it, so a
+        // hoisted layer would spread the per-head frequency schedule across the
+        // whole projection width (wrong frequencies) - excluded explicitly.
         DoHoistRoPE := LayerUseRoPE and (not Config.QKNorm) and
-          (not Config.Llama4QKL2Norm) and (RotaryDims >= HeadDim);
+          (not Config.Llama4QKL2Norm) and (RotaryDims >= HeadDim) and
+          (not Config.MRoPEEnabled);
         if DoHoistRoPE then
         begin
           QSource := NN.AddLayerAfter(

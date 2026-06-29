@@ -4329,7 +4329,9 @@ begin
     NN.Free;
   end;
   // ...and a config WITH rope_scaling must reach every rotary layer the
-  // builder creates (2 blocks x (1 KV head + 2 Q heads) = 6 layers).
+  // builder creates. With the hoisted-RoPE optimization the builder emits ONE
+  // full-width head-tiled rotary per Q and per K projection instead of one per
+  // head: 2 blocks x (1 Q + 1 K) = 4 layers.
   Config := ReadLlamaConfigFromJSONFile(FixturePath('tiny_llama_config.json'));
   Config.RopeScaling.Mode := rsmYaRN;
   Config.RopeScaling.Factor := 4.0;
@@ -4353,7 +4355,7 @@ begin
         AssertEquals('rotary layer alpha', 1.0, Rope.GetYarnAlpha(), 1e-6);
         AssertEquals('rotary layer beta', 32.0, Rope.GetYarnBeta(), 1e-6);
       end;
-    AssertEquals('rotary layer count', 6, RopeCnt);
+    AssertEquals('rotary layer count', 4, RopeCnt);
   finally
     NN.Free;
   end;
