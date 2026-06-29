@@ -21,7 +21,7 @@ CAI NEURAL API is a Pascal deep-learning library optimized for the AVX, AVX2 and
 You'll need [Lazarus](https://www.lazarus-ide.org/) development environment. If you have an OpenCL capable device, you'll need its OpenCL drivers. Many examples use the [CIFAR-10](https://www.cs.toronto.edu/~kriz/cifar.html) dataset. You'll also find examples for the [CIFAR-100](https://www.cs.toronto.edu/~kriz/cifar.html), [MNIST](http://yann.lecun.com/exdb/mnist/), [Fashion MNIST](https://www.kaggle.com/zalando-research/fashionmnist) and the [Places365-Standard Small images 256x256](http://places2.csail.mit.edu/download.html) dataset.
 
 ## Will It Work with Delphi?
-This project is [Lazarus](https://www.lazarus-ide.org/) / [Free Pascal](https://www.freepascal.org/) based. That said, in release [v2.0.0](https://github.com/joaopauloschuler/neural-api/releases/tag/v2.0.0), a number of units do compile with Delphi and you can create and run neural networks with Delphi. You'll be able to compile these units with Delphi: neuralvolume, neuralnetwork, neuralab, neuralabfun, neuralbit, neuralbyteprediction, neuralcache, neuraldatasets, neuralgeneric, neuralplanbuilder, Neural OpenCL, Neural Threading and neuralfit. 
+This project is [Lazarus](https://www.lazarus-ide.org/) / [Free Pascal](https://www.freepascal.org/) based. The master branch does not work with Delphi. For Delphi, use [v2.0.0](https://github.com/joaopauloschuler/neural-api/releases/tag/v2.0.0) instead.
 
 ## Installation
 Clone this project, add the [**neural**](https://github.com/joaopauloschuler/neural-api/tree/master/neural) folder to your [Lazarus](https://www.lazarus-ide.org/) unit search path and you'll be ready to go!
