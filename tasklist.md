@@ -87,6 +87,41 @@ rather than acted on.
       parsed/applied. A tokenizer.json that declares a standard NFKC/NFKD
       normalizer already works in full (`UnicodeNormalize` + `AddNormalizer`,
       landed); only the embedded charsmap is unhandled.
+- [ ] `TNNetKANConv` OpenCL forward allocates a `Taps²`-blown-up result buffer
+      and OOMs/segfaults for any realistic conv shape. In the device forward
+      (`neuralnetwork.pas` ~81139-81143, the `{$IFDEF OpenCL}` GEMM path gated
+      above `NeuralConvOpenCLMinWork` at ~80929) the result buffer is sized
+      `FGemmResKan.ReSize(NumAs * NumBs, 1, 1)` where `NumAs = OutDepth*Taps`
+      and `NumBs = NumPos*Taps` (`NumPos = OutW*OutH`, `Taps = FeatSizeX*
+      FeatSizeY*InDepth`, `C = FCoeffsPerEdge`). That materializes the FULL
+      all-pairs `cai_dot_product` cross product `NumAs x NumBs =
+      OutDepth*NumPos*Taps^2` contracting only over `C`, then the read-back
+      (~81145-81161) keeps ONLY the tap-diagonal entries
+      (`Res[(p*Taps+tap)*NumAs + (oo*Taps+tap)]` summed over `tap`). So
+      ~`(1 - 1/Taps)` of the computed result is discarded, the buffer is `Taps^2`
+      larger than the `OutDepth*NumPos` actually needed, and the device does
+      `Taps`x the necessary FLOPs. Concrete repro shape from
+      `examples/OpenCLForwardBenchmark` (Input 32x32x64 ->
+      `TNNetKANConv.Create(64,3,1,1)`, degree 3): `OutDepth=64, NumPos=1024,
+      Taps=576, C=4` -> `NumAs=36864, NumBs=589824`, result =
+      `21,743,271,936` floats = `86,973,087,744` bytes (~81 GB) ->
+      `clCreateBuffer :-61` (CL_INVALID_BUFFER_SIZE) then an uncatchable
+      `EAccessViolation` INSIDE the driver (a Pascal `try/except` cannot stop
+      it; it aborts the whole process). Verified on POCL CPU device; KANConv on
+      CPU is fine, so the bug is isolated to the OpenCL forward. FIX: the wanted
+      output is `out[p,oo] = sum_tap sum_k A[oo,tap,k]*B[p,tap,k]`, i.e. a single
+      dot product over a COMBINED `Taps*C` axis. Lay A out as
+      `[OutDepth x (Taps*C)]` and B as `[NumPos x (Taps*C)]`, call
+      `PrepareForCompute(..., Taps*C)` with `NumAs=OutDepth`, `NumBs=NumPos`,
+      and replace the diagonal-extraction read-back with a direct copy
+      `Res[p*OutDepth + oo]` (or `oo*NumPos + p`, matching the kernel's
+      interleave). Result buffer drops from `OutDepth*NumPos*Taps^2` to
+      `OutDepth*NumPos` (~331,000x smaller at this shape: 81 GB -> ~256 KB) with
+      no wasted off-diagonal compute; the per-`(.,tap)` block data is already in
+      the needed interleaved layout, so it is mostly a regrouping + contraction-
+      length change. Add a device-vs-CPU parity test (and keep KANConv excluded
+      from `OpenCLForwardBenchmark` until fixed; it is listed there under
+      "Known device-path faults"). Backward and the CPU forward are unaffected.
 
 ## Infrastructure / dev experience
 
