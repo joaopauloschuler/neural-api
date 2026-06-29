@@ -2,9 +2,24 @@
 
 A self-contained demo of the **Muon** optimizer (Newton-Schulz orthogonalized
 momentum, Jordan et al. 2024, <https://kellerjordan.github.io/posts/muon/>) on a
-tiny synthetic regression toy, with a hand-rolled per-step weight-surgery loop
-(no `TNeuralFit`), in the same idiom as
-[`SharpnessAwareMinimization`](../SharpnessAwareMinimization).
+tiny synthetic regression toy. The Muon arm drives the **library optimizer**
+(`TNeuralOptimizerMuon`, via `TNNet.CalcMuonDelta` → `UpdateWeightsAdam`) from a
+hand-rolled per-step training loop (no `TNeuralFit`), in the same idiom as
+[`SharpnessAwareMinimization`](../SharpnessAwareMinimization). The standalone
+`NewtonSchulz5` in the source is kept only for the headline orthogonality probe;
+the weight update itself is the real facility.
+
+## The library optimizer
+
+The orthogonalized-momentum step lives in `neuralfit.pas` as
+**`TNeuralOptimizerMuon`** (a `TNeuralOptimizer` subclass, sibling of
+`TNeuralOptimizerLion` / `TNeuralOptimizerAdafactor`). With `TNeuralFit` you just
+set it as the optimizer; it keeps a **single** momentum buffer (like Lion),
+applies the Newton-Schulz orthogonalized step to genuine 2-D weight matrices
+(`FullConnect` / linear layers) and falls back to **SGD-momentum** on non-matrix
+params (biases, conv kernels) — mirroring real Muon, which routes vector params
+to a scalar optimizer. Like the other custom optimizers it requires
+`SetBatchUpdate(True)` (`TNeuralFit` already sets it).
 
 ## What it is
 
@@ -39,12 +54,11 @@ directions near-isotropic.
   `lr` folds into the step scale).
 - For a `TNNetFullConnectLinear` layer, **neuron `n` owns row `n`** of the
   weight matrix (`Weights` = `FanIn` values) — exactly the `(FanOut x FanIn)`
-  layout that `TNNet.EstimateSpectralNorm` assumes. We pack the rows
-  contiguously into a `TNNetVolume` and drive every matmul through
-  `TNNetVolume.DotProducts` (no hand-rolled triple loops). Note its layout:
-  `DotProducts(NumAs, NumBs, V, A, B)` stores `out[b*NumAs + a] = dot(A row a,
-  B row b)`, i.e. a `(NumBs x NumAs)` matrix; the example's `MatMul` wrapper
-  feeds `A = Q^T, B = P` to recover an ordinary product `P*Q`.
+  layout `TNNet.CalcMuonDelta` packs, orthogonalizes (Newton-Schulz through
+  `TNNetVolume.DotProducts`), and writes back into every neuron's `Delta` as
+  `-lr*sqrt(max(rows,cols))*O`. The momentum buffer is each neuron's
+  `FBackInertia` (zeroed by `NN.ClearInertia()` at setup) — a single buffer,
+  like Lion.
 - **Biases are suppressed model-wide** (`pSuppressBias = 1` on every dense
   layer). The library's only public bias accessor is read-only, and Muon's paper
   routes vector params to a scalar optimizer anyway; dropping biases keeps the
@@ -103,11 +117,11 @@ Headline check: Newton-Schulz drives the singular values into ~[0.7,1.3].
 
 Bake-off (final train MSE, lower is better):
   epoch    SGD-momentum         Adam            Muon
-      1       0.352790       0.115187       0.388614
-     10       0.004544       0.002078       0.005501
-     40       0.001877       0.001156       0.001975
+      1       0.352790       0.115187       0.283280
+     10       0.004544       0.002078       0.003270
+     40       0.001877       0.001156       0.001796
 
-Final train MSE:  SGD-momentum=0.001877   Adam=0.001156   Muon=0.001975
+Final train MSE:  SGD-momentum=0.001877   Adam=0.001156   Muon=0.001796
 ```
 
 On this small noise-free regression all three optimizers converge to comparable

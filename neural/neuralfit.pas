@@ -37,6 +37,144 @@ uses
 
 type
   TNeuralFitBase = class;
+  TNeuralFitCallback = class;
+
+  // Abstract base class for training-loop callbacks (a port of the
+  // HuggingFace transformers TrainerCallback concept). A callback is an
+  // object whose virtual hook methods are invoked by the fit loop at well
+  // defined points. All hooks are no-ops by default, so a subclass overrides
+  // only the events it cares about. Callbacks are registered on a
+  // TNeuralFitBase via AddCallback; the fit object does NOT own them by
+  // default (the caller is responsible for freeing them) - see
+  // TNeuralFitBase.OwnsCallbacks. Sender is the originating TNeuralFitBase so
+  // a callback can read live training state (CurrentEpoch, ValidationLoss,
+  // TrainingAccuracy, etc.) and, if needed, request an early stop by setting
+  // Sender.ShouldQuit := true.
+  // Coded by Claude (AI).
+  TNeuralFitCallback = class(TObject)
+    public
+      // Fired at the start of every epoch, BEFORE any training batch of that
+      // epoch runs. Epoch is the 0-based epoch index about to be trained.
+      procedure OnEpochBegin(Sender: TNeuralFitBase; Epoch: integer); virtual;
+      // Fired at the end of every epoch, AFTER validation/test for that epoch.
+      // Epoch is the 1-based count of epochs completed (matches CurrentEpoch).
+      procedure OnEpochEnd(Sender: TNeuralFitBase; Epoch: integer); virtual;
+      // Fired after every completed training step (optimizer cadence batch).
+      // GlobalStep is the running step count (matches CurrentStep).
+      procedure OnStepEnd(Sender: TNeuralFitBase; GlobalStep: integer); virtual;
+      // Fired once per epoch right after validation metrics are computed.
+      // ValLoss/ValAcc are the just-measured validation loss and accuracy
+      // (accuracy as a 0..1 rate, same convention as ValidationAccuracy).
+      procedure OnEvaluate(Sender: TNeuralFitBase; Epoch: integer;
+        ValLoss, ValAcc: TNeuralFloat); virtual;
+  end;
+
+  // Early-stopping callback (transformers EarlyStoppingCallback port). Monitors
+  // the validation loss reported at OnEvaluate; if it fails to improve by at
+  // least MinDelta for Patience consecutive evaluations, it requests an early
+  // abort by setting Sender.ShouldQuit := true. With Patience = 0 it never
+  // stops. Default MinDelta = 0 (any non-improvement counts). Lower-is-better
+  // (validation loss) semantics.
+  // Coded by Claude (AI).
+  TNeuralFitEarlyStopping = class(TNeuralFitCallback)
+    private
+      FPatience: integer;
+      FMinDelta: TNeuralFloat;
+      FBestLoss: TNeuralFloat;
+      FWaitCount: integer;
+      FHasBest: boolean;
+      FStopped: boolean;
+    public
+      constructor Create(pPatience: integer = 1; pMinDelta: TNeuralFloat = 0.0);
+      // Resets the internal best/wait state so the callback can be reused for a
+      // fresh fit. Called automatically nowhere - call it before re-fitting.
+      procedure Reset();
+      procedure OnEvaluate(Sender: TNeuralFitBase; Epoch: integer;
+        ValLoss, ValAcc: TNeuralFloat); override;
+      property Patience: integer read FPatience write FPatience;
+      property MinDelta: TNeuralFloat read FMinDelta write FMinDelta;
+      // True once the callback has fired a stop request.
+      property Stopped: boolean read FStopped;
+      // Best (lowest) validation loss seen so far.
+      property BestLoss: TNeuralFloat read FBestLoss;
+    end;
+
+  // Stochastic Weight Averaging callback (a port of torch.optim.swa_utils).
+  // Maintains an EQUAL-WEIGHT running mean of the live network weights,
+  // snapshotting at the end of every epoch in the averaging window (epochs
+  // >= StartEpoch, every SnapshotEveryEpochs-th epoch). Unlike the EMA wiring
+  // (TNeuralFitBase.EnableEMA, a decayed running average), SWA is a plain mean
+  // of K snapshots over the schedule tail. The averaging math is delegated to
+  // TNNetSWAWrapper (neuralnetwork.pas) - it is NOT reimplemented here.
+  //
+  // Implemented as a CALLBACK (rather than as TNeuralFitBase fields like EMA)
+  // because the new callback API already exposes exactly the hook SWA needs -
+  // OnEpochEnd - so no growth of TNeuralFitBase is required; the wrapper, the
+  // live-weight stash and the swap state all live on the callback. The
+  // store/load/restore swap mirrors the EMA Apply/Restore plumbing
+  // (TNeuralFitBase.ApplyEMAWeights / RestoreLiveWeights): ApplySWAWeights
+  // stashes the live weights then copies the averaged shadow into the net so
+  // the caller can eval/save; RestoreLiveWeights puts the live weights back so
+  // training continues bit-identically.
+  //
+  // SWA constant/cyclic LR phase: the torch SWALR schedule (holding a constant
+  // SWA learning rate, or cycling it, during the averaging tail) is a learning
+  // -rate concern, not an averaging concern. It is supplied independently via
+  // the existing LR machinery (e.g. Fit.CyclicalLearningRateLen for a cyclic
+  // tail, or a custom/constant InitialLearningRate), so this callback does NOT
+  // touch the learning rate - it only accumulates and swaps weights.
+  //
+  // BatchNorm running-stats recompute (torch's update_bn): SKIPPED here. This
+  // library's normalization layers (TNNetLayerNorm / TNNetRMSNorm / TNNetGroupNorm)
+  // compute their statistics per-forward-pass from the current activations and
+  // carry NO persistent running mean/var that an averaged-weight forward pass
+  // would invalidate, so no BN-recompute pass is needed. If a running-stats BN
+  // layer is added later, a post-SWA recompute pass over the training data
+  // would have to be layered on.
+  // Coded by Claude (AI).
+  TNeuralFitSWA = class(TNeuralFitCallback)
+    private
+      FStartEpoch: integer;          // first (1-based) epoch to snapshot
+      FSnapshotEveryEpochs: integer; // snapshot cadence within the window
+      FSWA: TNNetSWAWrapper;         // averaging machinery (owned, lazy)
+      FSaved: TNNet;                 // live weights stashed during a swap (owned)
+      FSwapped: boolean;             // true while averaged weights are swapped in
+      FLastNN: TNNet;                // net the wrapper was created against
+    public
+      // pStartEpoch         = first 1-based epoch whose end-of-epoch weights are
+      //                       folded into the average (epochs before it are
+      //                       ignored). Defaults to 1 (average the whole run).
+      // pSnapshotEveryEpochs= snapshot cadence within the window (>=1). 1 means
+      //                       every epoch; 2 means every other epoch, etc.
+      constructor Create(pStartEpoch: integer = 1;
+        pSnapshotEveryEpochs: integer = 1);
+      destructor Destroy(); override;
+      // Resets the running mean (and any active swap) so the callback can be
+      // reused for a fresh fit.
+      procedure Reset();
+      // Folds the current live weights of Sender.NN into the running mean when
+      // the epoch is in the averaging window. Called automatically by the fit
+      // loop at the end of each epoch.
+      procedure OnEpochEnd(Sender: TNeuralFitBase; Epoch: integer); override;
+      // Swaps the averaged (SWA) weights INTO the live net for eval/save,
+      // stashing the live training weights so they can be restored. No-op
+      // (returns false) when no snapshot has been accumulated yet, or when a
+      // swap is already active. Pairs with RestoreLiveWeights.
+      function ApplySWAWeights(pNN: TNNet): boolean;
+      // Restores the live training weights stashed by ApplySWAWeights, leaving
+      // them bit-identical to before the swap. No-op if no swap is active.
+      procedure RestoreLiveWeights(pNN: TNNet);
+      // The shadow network holding the averaged weights (nil until the first
+      // snapshot; owned by the wrapper). Read-only convenience accessor.
+      function SWAShadowNet(): TNNet;
+      // Number of snapshots folded into the current average.
+      function SnapshotCount(): integer;
+      // True while the averaged weights are swapped into the live net.
+      property Swapped: boolean read FSwapped;
+      property StartEpoch: integer read FStartEpoch write FStartEpoch;
+      property SnapshotEveryEpochs: integer read FSnapshotEveryEpochs
+        write FSnapshotEveryEpochs;
+    end;
 
   // This is a base class for all optimizers
   TNeuralOptimizer = class(TMObject)
@@ -101,6 +239,113 @@ type
     procedure Optimize(); override;
 
     property WeightDecay: TNeuralFloat read FWeightDecay write FWeightDecay;
+  end;
+
+  // Lion optimization method (Chen et al., "Symbolic Discovery of Optimization
+  // Algorithms", 2023). The update direction is the SIGN of an interpolated
+  // momentum:
+  //   c_t = beta1 * m_{t-1} + (1 - beta1) * g
+  //   W  -= lr * sign(c_t)        ( + decoupled AdamW-style weight decay )
+  //   m_t = beta2 * m_{t-1} + (1 - beta2) * g
+  // Lion keeps a SINGLE momentum buffer m (half of Adam's optimizer state,
+  // which needs both a first and a second moment). Because the step is a pure
+  // sign, the effective per-coordinate update is +-lr; Lion therefore usually
+  // wants a smaller learning rate and a larger weight decay than Adam.
+  // Weight decay is decoupled (applied directly to the weights via
+  // TNNet.ApplyDecoupledWeightDecay, so biases and normalization layers are
+  // skipped). With WeightDecay = 0 it is plain Lion.
+  // Coded by Claude (AI).
+  TNeuralOptimizerLion = class(TNeuralOptimizer)
+  protected
+    FBeta1: TNeuralFloat;
+    FBeta2: TNeuralFloat;
+    FWeightDecay: TNeuralFloat;
+    FInitialized: boolean;
+  public
+    constructor Create(
+      Beta1: TNeuralFloat = 0.9;
+      Beta2: TNeuralFloat = 0.99;
+      WeightDecay: TNeuralFloat = 0.0); overload;
+
+    procedure Optimize(); override;
+    procedure ReSet(); override;
+
+    property WeightDecay: TNeuralFloat read FWeightDecay write FWeightDecay;
+  end;
+
+  // Adafactor optimization method (Shazeer & Stern, "Adafactor: Adaptive
+  // Learning Rates with Sublinear Memory Cost", 2018). Instead of Adam's full
+  // per-element second-moment matrix V (shape R x C), Adafactor stores only a
+  // row-moment vector (length R) and a column-moment vector (length C) and
+  // reconstructs V on the fly as a rank-1 outer product:
+  //   R_t = beta2*R + (1-beta2)*rowmean(g^2 + eps1)
+  //   C_t = beta2*C + (1-beta2)*colmean(g^2 + eps1)
+  //   Vhat[i,j] = R_t[i]*C_t[j] / mean(R_t)
+  //   W -= lr * g / sqrt(Vhat)
+  // This is the major memory win: R+C scalars instead of R*C. Non-factorable
+  // params (1-D weights, biases) fall back to a full per-element second moment.
+  // PRAGMATIC v1 - the following optional Adafactor knobs are DELIBERATELY
+  // OMITTED and documented here: (1) the optional first-moment beta1 EMA
+  // (this implementation has no momentum on the update direction), and (2) the
+  // update RMS clipping (clip-by-RMS of the step). The relative-step learning
+  // rate is taken from the host fit's schedule rather than Adafactor's internal
+  // rule. The result is a correct, well-documented optimizer that trains.
+  // Coded by Claude (AI).
+  TNeuralOptimizerAdafactor = class(TNeuralOptimizer)
+  protected
+    FBeta2: TNeuralFloat;
+    FEpsilon: TNeuralFloat;
+    FEps1: TNeuralFloat;
+    FInitialized: boolean;
+  public
+    constructor Create(
+      Beta2: TNeuralFloat = 0.999;
+      Epsilon: TNeuralFloat = 1e-8;
+      Eps1: TNeuralFloat = 1e-8); overload;
+
+    procedure Optimize(); override;
+    procedure ReSet(); override;
+  end;
+
+  // Muon optimization method (Jordan et al. 2024, "Muon: MomentUm Orthogonalized
+  // by Newton-schulz", https://kellerjordan.github.io/posts/muon/). For each 2-D
+  // weight matrix W (FanOut x FanIn) of a dense layer, per step:
+  //   (1) momentum buffer  M <- mu*M + G            (G = accumulated gradient);
+  //   (2) ORTHOGONALIZE the update O <- NewtonSchulz5(M) - replace M by the
+  //       (approximately) nearest orthogonal matrix using NSIters quintic
+  //       Newton-Schulz iterations on the Frobenius-normalized X = M/||M||_F:
+  //           X <- a*X + b*(X X^T)X + c*(X X^T)^2 X   (a,b,c)=(3.4445,-4.7750,2.0315)
+  //   (3) apply  W <- W - lr*sqrt(max(rows,cols))*O. The sqrt(max(rows,cols))
+  //       factor makes the per-element update RMS roughly match Adam's, so the
+  //       same learning rate transfers.
+  // The 5-step quintic is a DELIBERATELY approximate orthogonalizer (stable
+  // fixed points sigma ~ 0.868 and ~1.264, f(1)=0.701): it produces a
+  // SEMI-orthogonal update with every singular value squeezed into ~[0.7,1.3],
+  // which is all Muon needs to make the update directions near-isotropic.
+  // Muon keeps a SINGLE momentum buffer (FBackInertia, like Lion). It applies
+  // the orthogonalized step ONLY to genuine 2-D weight matrices (FullConnect /
+  // linear layers, where neuron n owns a flat FanIn row); NON-matrix params
+  // (biases, and conv kernels whose per-neuron weights are not a flat row) fall
+  // back to plain SGD-momentum - mirroring real Muon, which routes vector
+  // params to a scalar optimizer (AdamW/SGD). Like the other optimizers here it
+  // REQUIRES SetBatchUpdate(True) so Backpropagate accumulates the gradient into
+  // Neurons[].Delta (TNeuralFit already sets it).
+  // Coded by Claude (AI).
+  TNeuralOptimizerMuon = class(TNeuralOptimizer)
+  protected
+    FMomentum: TNeuralFloat;
+    FNSIters: integer;
+    FInitialized: boolean;
+  public
+    constructor Create(
+      Momentum: TNeuralFloat = 0.95;
+      NSIters: integer = 5); overload;
+
+    procedure Optimize(); override;
+    procedure ReSet(); override;
+
+    property Momentum: TNeuralFloat read FMomentum write FMomentum;
+    property NSIters: integer read FNSIters write FNSIters;
   end;
 
   TCustomLearningRateScheduleFn = function(Epoch: integer): single;
@@ -180,6 +425,12 @@ type
       FEMA: TNNetEMAWrapper;            // lazily created on the first update
       FEMASwapped: boolean;             // true while EMA weights are swapped in
       FEMASaved: TNNet;                 // live weights stashed during a swap
+      // Trainer callbacks (transformers TrainerCallback port). nil/empty by
+      // default so all hook dispatch is a cheap no-op and behaviour is
+      // unchanged. The fit object does not own the callbacks unless
+      // FOwnsCallbacks is set.
+      FCallbacks: TList;
+      FOwnsCallbacks: boolean;
       // Parameter-group (PyTorch param_groups) support. Off by default.
       FExcludeBiasAndNormFromWeightDecay: boolean;
       FNormAndBiasLearningRateMul: TNeuralFloat;
@@ -193,6 +444,13 @@ type
       procedure SetOptimizer(pOptimizer: TNeuralOptimizer);
       procedure SetClipDelta(Value: TNeuralFloat);
       procedure SetClipNorm(Value: TNeuralFloat);
+      // Trainer-callback dispatch helpers: invoke the matching hook on every
+      // registered callback. Each short-circuits immediately when no callback
+      // is present, so the empty-list path is a cheap no-op.
+      procedure DispatchEpochBegin(Epoch: integer);
+      procedure DispatchEpochEnd(Epoch: integer);
+      procedure DispatchStepEnd(GlobalStep: integer);
+      procedure DispatchEvaluate(Epoch: integer; ValLoss, ValAcc: TNeuralFloat);
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -328,6 +586,18 @@ type
       // them bit-identical to before the swap so training can continue. No-op if
       // no swap is currently active.
       procedure RestoreLiveWeights();
+      // Registers a trainer callback (transformers TrainerCallback port). The
+      // callback's hooks are invoked by the fit loop at epoch/step/evaluate
+      // boundaries. By default the caller retains ownership (the fit object
+      // will NOT free it); set OwnsCallbacks := true to have Destroy free all
+      // registered callbacks. Adding the same callback twice is allowed but
+      // it will then fire twice per hook.
+      procedure AddCallback(pCallback: TNeuralFitCallback);
+      // Number of currently registered callbacks.
+      function CallbackCount(): integer;
+      // When true, Destroy frees every registered callback. Default false:
+      // the caller owns the callbacks.
+      property OwnsCallbacks: boolean read FOwnsCallbacks write FOwnsCallbacks;
       property StaircaseEpochs: integer read FStaircaseEpochs write FStaircaseEpochs;
       property TargetAccuracy: single read FTargetAccuracy write FTargetAccuracy;
       property TestBestAtEnd: boolean read FTestBestAtEnd write FTestBestAtEnd;
@@ -348,6 +618,12 @@ type
   // neuraldatasets, layered on top of the built-in flip+crop pipeline.
   TNNetImageAugmentationFn = procedure(pInput: TNNetVolume; ThreadId: integer) of object;
 
+  // Batch-level (sample-pairing) augmentation mode for the image fit loop.
+  //   bamNone   - disabled (default); targets stay hard one-hot.
+  //   bamMixup  - blend lam*x_i+(1-lam)*x_j with the same convex label blend.
+  //   bamCutMix - paste a partner rectangle into x_i; label blend by area.
+  TNeuralBatchAugMode = (bamNone, bamMixup, bamCutMix);
+
   { TNeuralFitWithImageBase }
 
   TNeuralFitWithImageBase = class(TNeuralFitBase)
@@ -361,6 +637,9 @@ type
       FColorEncoding: integer;
       FChannelShiftRate: TNeuralFloat;
       FImageAugmentationFn: TNNetImageAugmentationFn;
+      FBatchAugMode: TNeuralBatchAugMode;
+      FBatchAugAlpha: TNeuralFloat;
+      FBatchAugProb: TNeuralFloat;
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -380,6 +659,18 @@ type
       // Optional opt-in single-image augmentation policy applied AFTER the
       // built-in flip/crop pipeline (nil = disabled, the default).
       property ImageAugmentationFn: TNNetImageAugmentationFn read FImageAugmentationFn write FImageAugmentationFn;
+      // Batch-level mixup / CutMix augmentation. bamNone (default) keeps hard
+      // one-hot targets. When enabled, after the per-image policy runs, each
+      // sample is (with probability BatchAugProb) paired with another randomly
+      // drawn training sample and both the input volume and the (now soft)
+      // target are rewritten as a convex blend before the forward pass.
+      property BatchAugMode: TNeuralBatchAugMode read FBatchAugMode write FBatchAugMode;
+      // Beta(Alpha, Alpha) parameter for the mixing coefficient lambda. The
+      // common practical default 1.0 yields Uniform(0,1).
+      property BatchAugAlpha: TNeuralFloat read FBatchAugAlpha write FBatchAugAlpha;
+      // Per-sample probability of applying the batch-level mix (0..1). 1.0 mixes
+      // every sample; the default 1.0 is only active once BatchAugMode <> bamNone.
+      property BatchAugProb: TNeuralFloat read FBatchAugProb write FBatchAugProb;
   end;
 
   TNNetDataAugmentationFn = procedure(pInput: TNNetVolume; ThreadId: integer) of object;
@@ -517,6 +808,14 @@ type
         pNumClasses, pBatchSize, Epochs: integer);
       procedure RunNNThread(index, threadnum: integer);
       procedure TestNNThread(index, threadnum: integer);
+      // Builds the batch-level mixup/CutMix SOFT target into TargetVolume:
+      //   target := Lambda*onehot(TagA) + (1-Lambda)*onehot(TagB)
+      // (then remapped to the +0.9/-0.1 convention when not softmax). With
+      // Lambda = 1 this is exactly the unaugmented one-hot target for TagA. The
+      // softmax-convention row sums to 1. This is the exact rewrite used inside
+      // RunNNThread; exposed so the property can be unit-tested directly.
+      procedure BuildMixedSoftTarget(TargetVolume: TNNetVolume;
+        TagA, TagB: integer; Lambda: TNeuralFloat);
   end;
 
   function MonopolarCompare(A, B: TNNetVolume; ThreadId: integer): boolean;
@@ -924,6 +1223,9 @@ begin
   FMultipleSamplesAtValidation := false;
   FChannelShiftRate := 0;
   FImageAugmentationFn := nil;
+  FBatchAugMode := bamNone;
+  FBatchAugAlpha := 1.0;
+  FBatchAugProb := 1.0;
 end;
 
 destructor TNeuralFitWithImageBase.Destroy();
@@ -1181,6 +1483,7 @@ begin
   globalStartTime := Now();
   while ( (FMaxEpochs > FCurrentEpoch) and Not(FShouldQuit) ) do
   begin
+    DispatchEpochBegin(FCurrentEpoch);
     FGlobalErrorSum := 0;
     startTime := Now();
     CheckLearningRate(FCurrentEpoch);
@@ -1234,6 +1537,7 @@ begin
       end;
       if Assigned(FOnAfterStep) then FOnAfterStep(Self);
       Inc(FCurrentStep);
+      DispatchStepEnd(FCurrentStep);
     end;
 
     Inc(FCurrentEpoch);
@@ -1268,6 +1572,7 @@ begin
           FValidationError := FGlobalErrorSum / FGlobalTotal;
           FValidationAccuracy := ValidationRate;
         end;
+        DispatchEvaluate(FCurrentEpoch, FValidationLoss, FValidationAccuracy);
 
         if (FSaveBest = SaveBestAccuracy) then
         begin
@@ -1383,6 +1688,7 @@ begin
       '. Working time: '+FloatToStrF(Round((Now() - globalStartTime)*2400)/100,ffFixed,4,2)+' hours.');
 
     if Assigned(FOnAfterEpoch) then FOnAfterEpoch(Self);
+    DispatchEpochEnd(FCurrentEpoch);
   end;
 
   if TestBestAtEnd and
@@ -2225,6 +2531,108 @@ begin
   end;
 end;
 
+{ TNeuralOptimizerLion }
+
+constructor TNeuralOptimizerLion.Create(Beta1: TNeuralFloat;
+  Beta2: TNeuralFloat; WeightDecay: TNeuralFloat);
+begin
+  inherited Create();
+  FBeta1 := Beta1;
+  FBeta2 := Beta2;
+  FWeightDecay := WeightDecay;
+  FInitialized := false;
+end;
+
+procedure TNeuralOptimizerLion.ReSet();
+begin
+  inherited ReSet;
+  // Lion keeps a SINGLE momentum buffer (FBackInertia). ClearInertia zeros it;
+  // the Adam second-moment buffer is left at its tiny (1,1,1) size, so Lion
+  // really does use half of Adam's optimizer state.
+  FNN.ClearInertia();
+end;
+
+procedure TNeuralOptimizerLion.Optimize();
+begin
+  if not(FInitialized) then
+  begin
+    ReSet();
+    FInitialized := true;
+  end;
+  // Compute the sign-based Lion increment into every neuron's delta...
+  FNN.CalcLionDelta(FFit.CurrentLearningRate, FBeta1, FBeta2);
+  ForceDeltaLimists();
+  // ...and apply it (UpdateWeightsAdam simply adds the precomputed delta).
+  FNN.UpdateWeightsAdam();
+  // Decoupled (AdamW-style) weight decay: skips biases/norm layers.
+  if FWeightDecay > 0 then
+    FNN.ApplyDecoupledWeightDecay(FFit.CurrentLearningRate * FWeightDecay);
+end;
+
+{ TNeuralOptimizerAdafactor }
+
+constructor TNeuralOptimizerAdafactor.Create(Beta2: TNeuralFloat;
+  Epsilon: TNeuralFloat; Eps1: TNeuralFloat);
+begin
+  inherited Create();
+  FBeta2 := Beta2;
+  FEpsilon := Epsilon;
+  FEps1 := Eps1;
+  FInitialized := false;
+end;
+
+procedure TNeuralOptimizerAdafactor.ReSet();
+begin
+  inherited ReSet;
+  // Allocate the FACTORED second-moment state (row + column vectors) instead
+  // of Adam's full per-element second moment.
+  FNN.InitAdafactor();
+end;
+
+procedure TNeuralOptimizerAdafactor.Optimize();
+begin
+  if not(FInitialized) then
+  begin
+    ReSet();
+    FInitialized := true;
+  end;
+  FNN.CalcAdafactorDelta(FBeta2, FEpsilon, FEps1);
+  ForceDeltaLimists();
+  FNN.UpdateWeightsAdam();
+end;
+
+{ TNeuralOptimizerMuon }
+
+constructor TNeuralOptimizerMuon.Create(Momentum: TNeuralFloat; NSIters: integer);
+begin
+  inherited Create();
+  FMomentum := Momentum;
+  FNSIters := NSIters;
+  FInitialized := false;
+end;
+
+procedure TNeuralOptimizerMuon.ReSet();
+begin
+  inherited ReSet;
+  // Muon keeps a SINGLE momentum buffer (FBackInertia, like Lion). ClearInertia
+  // zeros it; the Adam second-moment buffer is left at its tiny default size.
+  FNN.ClearInertia();
+end;
+
+procedure TNeuralOptimizerMuon.Optimize();
+begin
+  if not(FInitialized) then
+  begin
+    ReSet();
+    FInitialized := true;
+  end;
+  // Compute the orthogonalized-momentum increment into every neuron's delta...
+  FNN.CalcMuonDelta(FMomentum, FNSIters);
+  ForceDeltaLimists();
+  // ...and apply it (UpdateWeightsAdam simply adds the precomputed delta).
+  FNN.UpdateWeightsAdam();
+end;
+
 { TNeuralFitBase }
 constructor TNeuralFitBase.Create();
 begin
@@ -2294,6 +2702,59 @@ begin
   FEMASaved := nil;
   FExcludeBiasAndNormFromWeightDecay := false;
   FNormAndBiasLearningRateMul := 1.0;
+  FCallbacks := nil;
+  FOwnsCallbacks := false;
+end;
+
+procedure TNeuralFitBase.AddCallback(pCallback: TNeuralFitCallback);
+begin
+  if not Assigned(pCallback) then exit;
+  if not Assigned(FCallbacks) then FCallbacks := TList.Create();
+  FCallbacks.Add(pCallback);
+end;
+
+function TNeuralFitBase.CallbackCount(): integer;
+begin
+  if Assigned(FCallbacks)
+  then Result := FCallbacks.Count
+  else Result := 0;
+end;
+
+procedure TNeuralFitBase.DispatchEpochBegin(Epoch: integer);
+var
+  I: integer;
+begin
+  if not Assigned(FCallbacks) then exit;
+  for I := 0 to FCallbacks.Count - 1 do
+    TNeuralFitCallback(FCallbacks[I]).OnEpochBegin(Self, Epoch);
+end;
+
+procedure TNeuralFitBase.DispatchEpochEnd(Epoch: integer);
+var
+  I: integer;
+begin
+  if not Assigned(FCallbacks) then exit;
+  for I := 0 to FCallbacks.Count - 1 do
+    TNeuralFitCallback(FCallbacks[I]).OnEpochEnd(Self, Epoch);
+end;
+
+procedure TNeuralFitBase.DispatchStepEnd(GlobalStep: integer);
+var
+  I: integer;
+begin
+  if not Assigned(FCallbacks) then exit;
+  for I := 0 to FCallbacks.Count - 1 do
+    TNeuralFitCallback(FCallbacks[I]).OnStepEnd(Self, GlobalStep);
+end;
+
+procedure TNeuralFitBase.DispatchEvaluate(Epoch: integer;
+  ValLoss, ValAcc: TNeuralFloat);
+var
+  I: integer;
+begin
+  if not Assigned(FCallbacks) then exit;
+  for I := 0 to FCallbacks.Count - 1 do
+    TNeuralFitCallback(FCallbacks[I]).OnEvaluate(Self, Epoch, ValLoss, ValAcc);
 end;
 
 procedure TNeuralFitBase.SetAccumulationSteps(Value: integer);
@@ -2309,11 +2770,178 @@ begin
   if FEMASwapped then RestoreLiveWeights();
   if Assigned(FEMA) then FreeAndNil(FEMA);
   if Assigned(FEMASaved) then FreeAndNil(FEMASaved);
+  if Assigned(FCallbacks) then
+  begin
+    if FOwnsCallbacks then
+      while FCallbacks.Count > 0 do
+      begin
+        TNeuralFitCallback(FCallbacks[FCallbacks.Count - 1]).Free;
+        FCallbacks.Delete(FCallbacks.Count - 1);
+      end;
+    FreeAndNil(FCallbacks);
+  end;
   {$IFDEF HASTHREADS}
   NeuralDoneCriticalSection(FCritSec);
   {$ENDIF}
   FFinishedThread.Free;
   inherited Destroy();
+end;
+
+{ TNeuralFitCallback }
+
+procedure TNeuralFitCallback.OnEpochBegin(Sender: TNeuralFitBase; Epoch: integer);
+begin
+  // no-op
+end;
+
+procedure TNeuralFitCallback.OnEpochEnd(Sender: TNeuralFitBase; Epoch: integer);
+begin
+  // no-op
+end;
+
+procedure TNeuralFitCallback.OnStepEnd(Sender: TNeuralFitBase; GlobalStep: integer);
+begin
+  // no-op
+end;
+
+procedure TNeuralFitCallback.OnEvaluate(Sender: TNeuralFitBase; Epoch: integer;
+  ValLoss, ValAcc: TNeuralFloat);
+begin
+  // no-op
+end;
+
+{ TNeuralFitEarlyStopping }
+
+constructor TNeuralFitEarlyStopping.Create(pPatience: integer;
+  pMinDelta: TNeuralFloat);
+begin
+  inherited Create();
+  FPatience := pPatience;
+  FMinDelta := pMinDelta;
+  Reset();
+end;
+
+procedure TNeuralFitEarlyStopping.Reset();
+begin
+  FBestLoss := 0;
+  FWaitCount := 0;
+  FHasBest := false;
+  FStopped := false;
+end;
+
+procedure TNeuralFitEarlyStopping.OnEvaluate(Sender: TNeuralFitBase;
+  Epoch: integer; ValLoss, ValAcc: TNeuralFloat);
+begin
+  if FStopped then exit;
+  if (not FHasBest) or (ValLoss < FBestLoss - FMinDelta) then
+  begin
+    // Improvement (or first measurement): reset the patience counter.
+    FBestLoss := ValLoss;
+    FHasBest := true;
+    FWaitCount := 0;
+  end
+  else
+  begin
+    Inc(FWaitCount);
+    if (FPatience > 0) and (FWaitCount >= FPatience) then
+    begin
+      FStopped := true;
+      if Assigned(Sender) then
+      begin
+        if Sender.Verbose then
+          Sender.MessageProc('Early stopping: validation loss did not improve for '
+            + IntToStr(FWaitCount) + ' evaluations.');
+        Sender.ShouldQuit := true;
+      end;
+    end;
+  end;
+end;
+
+{ TNeuralFitSWA }
+
+constructor TNeuralFitSWA.Create(pStartEpoch: integer;
+  pSnapshotEveryEpochs: integer);
+begin
+  inherited Create();
+  FStartEpoch := pStartEpoch;
+  if pSnapshotEveryEpochs < 1 then pSnapshotEveryEpochs := 1;
+  FSnapshotEveryEpochs := pSnapshotEveryEpochs;
+  FSWA := nil;
+  FSaved := nil;
+  FSwapped := false;
+  FLastNN := nil;
+end;
+
+destructor TNeuralFitSWA.Destroy();
+begin
+  if Assigned(FSWA) then FreeAndNil(FSWA);
+  if Assigned(FSaved) then FreeAndNil(FSaved);
+  inherited Destroy();
+end;
+
+procedure TNeuralFitSWA.Reset();
+begin
+  // Drop any active swap and the accumulated mean.
+  FSwapped := false;
+  if Assigned(FSWA) then FSWA.Reset();
+end;
+
+procedure TNeuralFitSWA.OnEpochEnd(Sender: TNeuralFitBase; Epoch: integer);
+begin
+  if not Assigned(Sender) then exit;
+  if not Assigned(Sender.NN) then exit;
+  // Only snapshot inside the averaging window: from StartEpoch onward, every
+  // SnapshotEveryEpochs-th epoch (counting from StartEpoch). Epoch is 1-based.
+  if Epoch < FStartEpoch then exit;
+  if ((Epoch - FStartEpoch) mod FSnapshotEveryEpochs) <> 0 then exit;
+  // Lazily create the wrapper against the live net. The wrapper clones the
+  // net (constructing layers whose initializers draw from the global RNG, then
+  // overwriting them via CopyWeights) - exactly the bounded RNG perturbation
+  // already documented for the EMA wiring; the optimization MATH is untouched
+  // because SWA never writes the live weights or deltas during training.
+  if (not Assigned(FSWA)) or (FLastNN <> Sender.NN) then
+  begin
+    if Assigned(FSWA) then FreeAndNil(FSWA);
+    FSWA := TNNetSWAWrapper.Create(Sender.NN);
+    FLastNN := Sender.NN;
+  end;
+  // Fold the current live weights into the equal-weight running mean.
+  FSWA.Accumulate();
+end;
+
+function TNeuralFitSWA.ApplySWAWeights(pNN: TNNet): boolean;
+begin
+  Result := false;
+  if (not Assigned(FSWA)) or (FSWA.Count = 0) or (not Assigned(pNN)) then exit;
+  if FSwapped then exit; // already swapped; ignore nested calls
+  // Stash the live training weights, then copy the SWA shadow into the net.
+  if not Assigned(FSaved)
+    then FSaved := pNN.Clone()
+    else FSaved.CopyWeights(pNN);
+  FSWA.CopyShadowTo(pNN);
+  FSwapped := true;
+  Result := true;
+end;
+
+procedure TNeuralFitSWA.RestoreLiveWeights(pNN: TNNet);
+begin
+  if not FSwapped then exit;
+  if Assigned(FSaved) and Assigned(pNN) then pNN.CopyWeights(FSaved);
+  FSwapped := false;
+end;
+
+function TNeuralFitSWA.SWAShadowNet(): TNNet;
+begin
+  if Assigned(FSWA)
+    then Result := FSWA.ShadowNet()
+    else Result := nil;
+end;
+
+function TNeuralFitSWA.SnapshotCount(): integer;
+begin
+  if Assigned(FSWA)
+    then Result := FSWA.Count
+    else Result := 0;
 end;
 
 procedure TNeuralFitBase.WaitUntilFinished;
@@ -2639,6 +3267,7 @@ begin
   globalStartTime := Now();
   while ( (FMaxEpochs > FCurrentEpoch) and Not(FShouldQuit) ) do
   begin
+    DispatchEpochBegin(FCurrentEpoch);
     FGlobalErrorSum := 0;
     startTime := Now();
     CheckLearningRate(FCurrentEpoch);
@@ -2705,6 +3334,7 @@ begin
       end;
       if Assigned(FOnAfterStep) then FOnAfterStep(Self);
       Inc(FCurrentStep);
+      DispatchStepEnd(FCurrentStep);
     end; // of epoch
     {$IFDEF Debug}
     FMessageProc(
@@ -2756,6 +3386,7 @@ begin
           FValidationError := FGlobalErrorSum / FGlobalTotal;
           FValidationAccuracy := ValidationRate;
         end;
+        DispatchEvaluate(FCurrentEpoch, FValidationLoss, FValidationAccuracy);
 
         if (FSaveBest = SaveBestAccuracy) then
         begin
@@ -2920,21 +3551,43 @@ begin
   FRunning := false;
 end;
 
+procedure TNeuralImageFit.BuildMixedSoftTarget(TargetVolume: TNNetVolume;
+  TagA, TagB: integer; Lambda: TNeuralFloat);
+begin
+  // Soft target := Lambda*onehot(TagA) + (1-Lambda)*onehot(TagB). Adding the
+  // two scaled one-hot rows yields a (softmax-convention) row that sums to 1
+  // by construction, regardless of whether TagA = TagB. Lambda = 1 reduces to
+  // a pure one-hot(TagA), i.e. the unaugmented target.
+  TargetVolume.Fill(0);
+  TargetVolume.FData[TagA] := TargetVolume.FData[TagA] + Lambda;
+  TargetVolume.FData[TagB] := TargetVolume.FData[TagB] + (1.0 - Lambda);
+  if not FIsSoftmax then
+  begin
+    // Match the hard-target convention (positive +0.9 / negative -0.1) used by
+    // SetClass(Tag, +0.9, -0.1): remap [0,1] -> [-0.1, 0.9] via value - 0.1.
+    TargetVolume.Add(-0.1);
+  end;
+end;
+
 procedure TNeuralImageFit.RunNNThread(index, threadnum: integer);
 var
   BlockSize, BlockSizeRest, CropSizeX, CropSizeY: integer;
   LocalNN: TNNet;
-  ImgInput, ImgInputCp: TNNetVolume;
+  ImgInput, ImgInputCp, PartnerInput: TNNetVolume;
   pOutput, vOutput: TNNetVolume;
-  I, ImgIdx: integer;
+  I, ImgIdx, PartnerIdx, PartnerTag: integer;
   OutputValue, CurrentLoss: TNeuralFloat;
   LocalHit, LocalMiss: integer;
   LocalTotalLoss, LocalErrorSum, CurrentError: TNeuralFloat;
   DepthCnt, DepthM1: integer;
   LocalChannelShiftRate: TNeuralFloat;
+  MixLambda: TNeuralFloat;
+  DidBatchMix: boolean;
+  CutX0, CutY0, CutBoxW, CutBoxH, CutX, CutY, CutD, CutXMax, CutYMax: integer;
 begin
   ImgInput := TNNetVolume.Create();
   ImgInputCp := TNNetVolume.Create();
+  PartnerInput := TNNetVolume.Create();
   pOutput := TNNetVolume.Create(FNumClasses,1,1);
   vOutput := TNNetVolume.Create(FNumClasses,1,1);
 
@@ -3029,10 +3682,62 @@ begin
       Continue;
     end;
 
+    // Batch-level mixup / CutMix (opt-in). After the per-image policy ran, pair
+    // this sample with another randomly drawn training sample and rewrite both
+    // the input volume and the (now soft) target as a convex blend. lambda=1
+    // (or a no-op CutMix box) reduces EXACTLY to the unaugmented batch.
+    DidBatchMix := false;
+    MixLambda := 1.0;
+    PartnerTag := ImgInput.Tag;
+    if FDataAugmentation and (FBatchAugMode <> bamNone) and (FNumClasses > 1)
+       and (FImgVolumes.Count > 1)
+       and ( (FBatchAugProb >= 1.0) or (Random() < FBatchAugProb) ) then
+    begin
+      PartnerIdx := Random(FImgVolumes.Count);
+      PartnerInput.Copy(FImgVolumes[PartnerIdx]);
+      PartnerTag := FImgVolumes[PartnerIdx].Tag;
+      if (PartnerTag < FNumClasses)
+         and (PartnerInput.SizeX = ImgInput.SizeX)
+         and (PartnerInput.SizeY = ImgInput.SizeY)
+         and (PartnerInput.Depth = ImgInput.Depth) then
+      begin
+        MixLambda := RandomBetaValue(FBatchAugAlpha);
+        if FBatchAugMode = bamMixup then
+        begin
+          // ImgInput := lambda*ImgInput + (1-lambda)*Partner
+          MixVolumes(ImgInput, ImgInput, PartnerInput, MixLambda);
+          DidBatchMix := true;
+        end
+        else // bamCutMix
+        begin
+          ComputeCutMixBox(ImgInput.SizeX, ImgInput.SizeY, MixLambda,
+            Random(), Random(), CutX0, CutY0, CutBoxW, CutBoxH);
+          if (CutBoxW > 0) and (CutBoxH > 0) then
+          begin
+            CutXMax := CutX0 + CutBoxW - 1;
+            CutYMax := CutY0 + CutBoxH - 1;
+            DepthM1 := ImgInput.Depth - 1;
+            for CutX := CutX0 to CutXMax do
+              for CutY := CutY0 to CutYMax do
+                for CutD := 0 to DepthM1 do
+                  ImgInput[CutX, CutY, CutD] := PartnerInput[CutX, CutY, CutD];
+          end;
+          // True pasted-area fraction (clamped box may shrink at borders).
+          MixLambda := 1.0 -
+            (CutBoxW * CutBoxH) / (ImgInput.SizeX * ImgInput.SizeY);
+          DidBatchMix := true;
+        end;
+      end;
+    end;
+
     LocalNN.Compute( ImgInput );
     LocalNN.GetOutput( pOutput );
 
-    if FIsSoftmax
+    if DidBatchMix and (MixLambda < 1.0) then
+    begin
+      BuildMixedSoftTarget(vOutput, ImgInput.Tag, PartnerTag, MixLambda);
+    end
+    else if FIsSoftmax
       then vOutput.SetClassForSoftMax( ImgInput.Tag )
       else vOutput.SetClass( ImgInput.Tag, +0.9, -0.1);
     // Optional label smoothing on the TRAINING target only (no-op when
@@ -3145,6 +3850,7 @@ begin
   {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSec);{$ENDIF}
   ImgInputCp.Free;
   ImgInput.Free;
+  PartnerInput.Free;
   vOutput.Free;
   pOutput.Free;
 end;

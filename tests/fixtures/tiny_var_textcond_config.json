@@ -1,0 +1,16 @@
+{
+  "_class_name": "VAR",
+  "hidden_size": 16,
+  "depth": 2,
+  "num_heads": 2,
+  "mlp_ratio": 4,
+  "vocab_size": 12,
+  "patch_nums": [
+    1,
+    2
+  ],
+  "layer_norm_eps": 1e-06,
+  "text_cond": true,
+  "text_dim": 10,
+  "text_seq_len": 3
+}

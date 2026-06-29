@@ -426,23 +426,8 @@ begin
 end;
 
 // Stable in-place softmax of a probability row (the imported nets output raw
-// logits; the processor chain and the samplers expect POST-SOFTMAX rows).
-procedure SoftmaxRow(Row: TNNetVolume);
-var
-  Cnt: integer;
-  MaxV, Sum: TNeuralFloat;
-begin
-  MaxV := Row.FData[0];
-  for Cnt := 1 to Row.Size - 1 do
-    if Row.FData[Cnt] > MaxV then MaxV := Row.FData[Cnt];
-  Sum := 0;
-  for Cnt := 0 to Row.Size - 1 do
-  begin
-    Row.FData[Cnt] := Exp(Row.FData[Cnt] - MaxV);
-    Sum := Sum + Row.FData[Cnt];
-  end;
-  if Sum > 0 then Row.Mul(1/Sum);
-end;
+// logits; the processor chain and the samplers expect POST-SOFTMAX rows) is
+// now neuralvolume.RowSoftMax.
 
 function ArgMaxRow(Row: TNNetVolume): integer;
 var
@@ -637,7 +622,7 @@ begin
       Session.StepForward(InV, Len - 1);
       Output := Session.Output(); // (1,1,vocab) -- the single logits row
       for Cnt := 0 to VocabSize - 1 do Row.FData[Cnt] := Output.FData[Cnt];
-      SoftmaxRow(Row);
+      RowSoftMax(Row);
       Chain.ProcessRow(Row);
       if Assigned(Sampler) then NewToken := Sampler.GetToken(Row)
       else NewToken := ArgMaxRow(Row);

@@ -1,0 +1,32 @@
+{
+  "model_type": "florence2",
+  "image_token_id": 59,
+  "vision_feature_channels": 16,
+  "vision_feature_height": 4,
+  "vision_feature_width": 4,
+  "projection_dim": 16,
+  "max_temporal_embeddings": 8,
+  "vision_max_position_embeddings": 16,
+  "text_config": {
+    "model_type": "bart",
+    "d_model": 16,
+    "encoder_layers": 2,
+    "decoder_layers": 2,
+    "encoder_attention_heads": 2,
+    "decoder_attention_heads": 2,
+    "encoder_ffn_dim": 32,
+    "decoder_ffn_dim": 32,
+    "vocab_size": 60,
+    "max_position_embeddings": 40,
+    "activation_function": "gelu",
+    "bos_token_id": 0,
+    "eos_token_id": 2,
+    "pad_token_id": 1,
+    "decoder_start_token_id": 2,
+    "scale_embedding": true
+  },
+  "location_token": {
+    "num_bins": 1000,
+    "loc_base": 100
+  }
+}

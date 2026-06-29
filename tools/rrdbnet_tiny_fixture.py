@@ -43,14 +43,13 @@ import json
 import numpy as np
 from safetensors.numpy import save_file
 
-# Pico config: tiny widths, 1 RRDB block, scale x4.
+# Pico config: tiny widths, 1 RRDB block.
 NF = 8            # num_feat
 GC = 4            # num_grow_ch
 NUM_BLOCK = 1     # number of RRDB blocks in body
-SCALE = 4
 IN_CH = 3
 OUT_CH = 3
-INPUT = 6         # input image grid (-> 24x24 output)
+INPUT = 6         # input image grid (scale x4 -> 24x24, scale x2 -> 12x12)
 LRELU_SLOPE = 0.2
 
 rng = np.random.default_rng(20260614)
@@ -80,7 +79,7 @@ def add_rdb(sd, prefix):
     add_conv(sd, prefix + 'conv5', NF, NF + 4 * GC)
 
 
-def build_state_dict():
+def build_state_dict(scale):
     sd = {}
     add_conv(sd, 'conv_first', NF, IN_CH)
     for i in range(NUM_BLOCK):
@@ -88,7 +87,8 @@ def build_state_dict():
             add_rdb(sd, f'body.{i}.rdb{r}.')
     add_conv(sd, 'conv_body', NF, NF)
     add_conv(sd, 'conv_up1', NF, NF)
-    add_conv(sd, 'conv_up2', NF, NF)
+    if scale == 4:
+        add_conv(sd, 'conv_up2', NF, NF)
     add_conv(sd, 'conv_hr', NF, NF)
     add_conv(sd, 'conv_last', OUT_CH, NF)
     return sd
@@ -144,42 +144,46 @@ def rrdb(x, sd, prefix):
     return x + 0.2 * out
 
 
-def forward(x, sd):
+def forward(x, sd, scale):
     feat = conv2d(x, sd['conv_first.weight'], sd['conv_first.bias'], 1)
     body = feat
     for i in range(NUM_BLOCK):
         body = rrdb(body, sd, f'body.{i}.')
     body = conv2d(body, sd['conv_body.weight'], sd['conv_body.bias'], 1)
     feat = feat + body
-    # Upsample x4 (two nearest-2x + conv + lrelu stages).
+    # Upsample (nearest-2x + conv + lrelu): two stages for x4, one for x2.
     feat = lrelu(conv2d(upsample_nearest(feat),
                         sd['conv_up1.weight'], sd['conv_up1.bias'], 1))
-    feat = lrelu(conv2d(upsample_nearest(feat),
-                        sd['conv_up2.weight'], sd['conv_up2.bias'], 1))
+    if scale == 4:
+        feat = lrelu(conv2d(upsample_nearest(feat),
+                            sd['conv_up2.weight'], sd['conv_up2.bias'], 1))
     feat = lrelu(conv2d(feat, sd['conv_hr.weight'], sd['conv_hr.bias'], 1))
     out = conv2d(feat, sd['conv_last.weight'], sd['conv_last.bias'], 1)
     return out
 
 
-def main():
-    sd = build_state_dict()
-    # Round-trip every weight through float32 (CAI loads float32).
-    sd_f32 = {k: v.astype(np.float32) for k, v in sd.items()}
-    sd = {k: v.astype(np.float64) for k, v in sd_f32.items()}
-
+def pinned_input():
     # Pinned input image: deterministic dyadic values (exact in f32 + JSON).
     x = np.zeros((IN_CH, INPUT, INPUT), dtype=np.float64)
     for c in range(IN_CH):
         for y in range(INPUT):
             for px in range(INPUT):
                 x[c, y, px] = (((c * 36 + y * 6 + px) * 5) % 13 - 6) / 8.0
+    return x
 
-    img = forward(x, sd)
-    print(f'input {x.shape} -> image {img.shape}')
-    print(f'image stats: min {img.min():.4f} max {img.max():.4f} '
-          f'mean {img.mean():.4f}')
 
-    save_file(sd_f32, 'tests/fixtures/tiny_rrdbnet.safetensors')
+def emit(scale, stem):
+    sd = build_state_dict(scale)
+    # Round-trip every weight through float32 (CAI loads float32).
+    sd_f32 = {k: v.astype(np.float32) for k, v in sd.items()}
+    sd = {k: v.astype(np.float64) for k, v in sd_f32.items()}
+
+    x = pinned_input()
+    img = forward(x, sd, scale)
+    print(f'[scale x{scale}] input {x.shape} -> image {img.shape}; '
+          f'min {img.min():.4f} max {img.max():.4f} mean {img.mean():.4f}')
+
+    save_file(sd_f32, f'tests/fixtures/{stem}.safetensors')
     config = {
         'model_type': 'rrdbnet',
         'num_in_ch': IN_CH,
@@ -187,38 +191,58 @@ def main():
         'num_feat': NF,
         'num_block': NUM_BLOCK,
         'num_grow_ch': GC,
-        'scale': SCALE,
+        'scale': scale,
         'input_size': INPUT,
     }
-    with open('tests/fixtures/tiny_rrdbnet_config.json', 'w') as f:
+    with open(f'tests/fixtures/{stem}_config.json', 'w') as f:
         json.dump(config, f, indent=1)
-    with open('tests/fixtures/tiny_rrdbnet_io.json', 'w') as f:
+    with open(f'tests/fixtures/{stem}_io.json', 'w') as f:
         json.dump({
             'input': x.tolist(),                  # [3][INPUT][INPUT]
             'image': img.tolist(),                # [3][IMG][IMG]
             'image_size': img.shape[1],
         }, f)
-    print(f'wrote tiny_rrdbnet.safetensors ({len(sd_f32)} tensors) + '
-          f'config + io oracle')
+    print(f'  wrote {stem}.safetensors ({len(sd_f32)} tensors) + config + io')
+    return sd, sd_f32, x, img
 
-    # ---- fixture self-checks: each major piece must MATTER. ----
-    base = img.copy()
 
-    alt = dict(sd)
-    alt['body.0.rdb2.conv3.weight'] = np.zeros_like(sd['body.0.rdb2.conv3.weight'])
-    d = np.abs(forward(x, alt) - base).max()
+def write_pth_params_ema(sd_f32, path):
+    # Save the SAME float32 weights as a Real-ESRGAN-style .pth: the actual
+    # state_dict is nested under a 'params_ema' top-level key. torch.save uses
+    # a STORED (uncompressed) zip, which TNNetTorchBinReader requires.
+    import torch
+    params = {k: torch.from_numpy(np.ascontiguousarray(v))
+              for k, v in sd_f32.items()}
+    torch.save({'params_ema': params}, path)
+    print(f'  wrote {path} (params_ema-wrapped .pth)')
+
+
+def main():
+    # ---- scale x4 (canonical: two upsample stages) ----
+    sd4, sd4_f32, x, img4 = emit(4, 'tiny_rrdbnet')
+    write_pth_params_ema(sd4_f32, 'tests/fixtures/tiny_rrdbnet.pth')
+
+    # ---- scale x2 (one upsample stage; conv_up2 absent) ----
+    emit(2, 'tiny_rrdbnet_x2')
+
+    # ---- fixture self-checks (scale x4): each major piece must MATTER. ----
+    base = img4.copy()
+
+    alt = dict(sd4)
+    alt['body.0.rdb2.conv3.weight'] = np.zeros_like(sd4['body.0.rdb2.conv3.weight'])
+    d = np.abs(forward(x, alt, 4) - base).max()
     assert d > 1e-4, f'dense conv3 had no effect ({d})'
     print(f'dense skip conv3 effect: max|diff| = {d:.4f}')
 
-    alt = dict(sd)
-    alt['conv_body.bias'] = np.zeros_like(sd['conv_body.bias'])
-    d = np.abs(forward(x, alt) - base).max()
+    alt = dict(sd4)
+    alt['conv_body.bias'] = np.zeros_like(sd4['conv_body.bias'])
+    d = np.abs(forward(x, alt, 4) - base).max()
     assert d > 1e-4, f'conv_body bias had no effect ({d})'
     print(f'conv_body bias effect: max|diff| = {d:.4f}')
 
-    alt = dict(sd)
-    alt['conv_up2.weight'] = np.zeros_like(sd['conv_up2.weight'])
-    d = np.abs(forward(x, alt) - base).max()
+    alt = dict(sd4)
+    alt['conv_up2.weight'] = np.zeros_like(sd4['conv_up2.weight'])
+    d = np.abs(forward(x, alt, 4) - base).max()
     assert d > 1e-4, f'conv_up2 had no effect ({d})'
     print(f'conv_up2 effect: max|diff| = {d:.4f}')
 

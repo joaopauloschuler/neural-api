@@ -1,0 +1,16 @@
+{
+  "image_size": 8,
+  "num_channels": 3,
+  "stem_ch": 4,
+  "expand_ch": 8,
+  "se_ch": 2,
+  "project_ch": 6,
+  "dim": 6,
+  "num_heads": 2,
+  "window": 4,
+  "grid": 4,
+  "mlp_ratio": 2,
+  "num_labels": 5,
+  "ln_eps": 1e-05,
+  "bn_eps": 1e-05
+}

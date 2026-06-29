@@ -1,0 +1,35 @@
+{
+ "model_type": "clipseg",
+ "projection_dim": 6,
+ "reduce_dim": 6,
+ "extract_layers": [
+  0,
+  1
+ ],
+ "conditional_layer": 0,
+ "decoder_num_attention_heads": 2,
+ "decoder_intermediate_size": 12,
+ "use_complex_transposed_convolution": true,
+ "text_config": {
+  "hidden_size": 8,
+  "intermediate_size": 16,
+  "num_hidden_layers": 2,
+  "num_attention_heads": 2,
+  "vocab_size": 30,
+  "max_position_embeddings": 12,
+  "layer_norm_eps": 1e-05,
+  "hidden_act": "quick_gelu",
+  "eos_token_id": 2
+ },
+ "vision_config": {
+  "hidden_size": 8,
+  "intermediate_size": 16,
+  "num_hidden_layers": 3,
+  "num_attention_heads": 2,
+  "num_channels": 3,
+  "image_size": 24,
+  "patch_size": 8,
+  "layer_norm_eps": 1e-05,
+  "hidden_act": "quick_gelu"
+ }
+}

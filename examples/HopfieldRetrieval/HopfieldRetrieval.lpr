@@ -18,6 +18,15 @@ scaling in a transformer. The softmax produces a distribution over the
 K stored patterns; the retrieved vector is the corresponding convex
 combination of those patterns.
 
+This is EXACTLY the forward of the shipped library layer
+TNNetModernHopfield (built via TNNet.AddModernHopfieldRetrieval): the
+stored patterns are the layer's bank (Neurons[0].Weights, a
+(NumPatterns,1,d) volume), the query is the (SeqLen,1,d) input, beta is
+the layer's inverse temperature and KSteps is the number of iterated
+update steps. This demo drives that REAL layer (KSteps=1, a single
+softmax-attention step) rather than re-deriving the math inline -- the
+retrieved vector is read straight from the layer output.
+
 The qualitative behaviour is governed entirely by beta:
 
   - LOW beta  -> the softmax is near-uniform, so the retrieved vector is
@@ -32,21 +41,21 @@ The qualitative behaviour is governed entirely by beta:
 With well-separated patterns and a large enough beta, retrieval is a
 single forward step: no training, no iteration, no backprop.
 
-This demo (route B in the brief: explicit TNNetVolume math, so beta is
-literally a number in the score and the whole thing is self-evidently
-correct) does the following, all in-code with a fixed RandSeed:
+This demo, with a fixed RandSeed, does the following:
 
-  1. Builds K random BIPOLAR (+/-1) patterns of dimension d.
+  1. Builds K random BIPOLAR (+/-1) patterns of dimension d and loads
+     them into the TNNetModernHopfield layer's bank.
   2. For each pattern, corrupts it by flipping a fraction of its signs,
-     then runs ONE Hopfield step softmax(beta * X q) X.
+     then runs ONE Hopfield step (TNNetModernHopfield, KSteps=1) over
+     the corrupted query.
   3. Reports, per pattern: cosine similarity between the retrieved
-     vector and the TRUE stored pattern, and whether the argmax of the
-     attention weights points at the correct stored pattern.
+     vector and the TRUE stored pattern, and whether the retrieved
+     vector is nearest (in cosine) to the correct stored pattern.
   4. Sweeps beta (showing the blurry-average -> clean-snap transition)
      and sweeps corruption level.
   5. Prints NaN/Inf-guarded PASS/FAIL sanity checks: at high beta and
      low corruption every pattern must recover with cosine > 0.95 AND
-     every query's argmax-attention must select the correct pattern.
+     every query's retrieval must land nearest the correct pattern.
 
 Pure CPU, no external dataset, forward-only, finishes in ~1 second.
 
@@ -69,7 +78,7 @@ Coded by Claude (AI).
 
 uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes, SysUtils, Math,
-  neuralvolume;
+  neuralvolume, neuralnetwork;
 
 const
   cK         = 6;        // number of stored patterns
@@ -85,6 +94,13 @@ type
 
 var
   GBank: TPatternBank;   // the stored patterns X (bipolar +/-1)
+  // One reusable net per beta is overkill (beta is fixed per layer); instead we
+  // keep a single net and a query/output volume, rebuilding the net whenever the
+  // requested beta changes. The bank lives in the layer's Neurons[0].Weights.
+  GNet: TNNet = nil;
+  GHopfield: TNNetModernHopfield = nil;
+  GQuery: TNNetVolume = nil;
+  GNetBeta: TNeuralFloat = -1.0;
 
 // ---------------------------------------------------------------------
 // Pattern bank
@@ -137,51 +153,57 @@ begin
 end;
 
 // ---------------------------------------------------------------------
-// THE Hopfield step: retrieved = X^T softmax(beta * X q).
-// Returns the retrieved vector in Retrieved and the argmax stored-pattern
-// index in BestK (the pattern the attention weights point at).
+// Build (or rebuild) the one-position-sequence net whose single layer is
+// the REAL modern-Hopfield retrieval layer (KSteps=1, a single softmax-
+// attention step). The stored patterns are loaded straight into the
+// layer's bank: pattern k is row k, its d values depth-contiguous at
+// Neurons[0].Weights[k,0,*].
+// ---------------------------------------------------------------------
+procedure EnsureNet(Beta: TNeuralFloat);
+var
+  K, C: integer;
+begin
+  if (GNet <> nil) and (GNetBeta = Beta) then Exit;
+  GNet.Free;          // Free(nil) is safe
+  GNet := TNNet.Create();
+  GNet.AddLayer(TNNetInput.Create(1, 1, cD));   // SeqLen=1 query (1,1,d)
+  GHopfield := GNet.AddModernHopfieldRetrieval(cK, 1, Beta)
+    as TNNetModernHopfield;
+  for K := 0 to cK - 1 do
+    for C := 0 to cD - 1 do
+      GHopfield.Neurons[0].Weights[K, 0, C] := GBank[K, C];
+  GNetBeta := Beta;
+end;
+
+// ---------------------------------------------------------------------
+// THE Hopfield step, via the shipped TNNetModernHopfield layer:
+//   retrieved = X^T softmax(beta * X q).
+// Runs one forward pass and reads the retrieved vector from the layer
+// output. BestK is the stored pattern the retrieval landed NEAREST to
+// (argmax cosine over the bank) and BestW its cosine -- a recovery check
+// computable directly from the layer's output.
 // ---------------------------------------------------------------------
 procedure HopfieldStep(const Q: array of TNeuralFloat; Beta: TNeuralFloat;
   out Retrieved: array of TNeuralFloat; out BestK: integer;
   out BestW: TNeuralFloat);
 var
   K, C: integer;
-  Score: array[0..cK - 1] of Double;
-  W: array[0..cK - 1] of Double;
-  MaxScore, SumExp, Dot: Double;
+  Out0: TNNetVolume;
+  Cos: TNeuralFloat;
 begin
-  // scores[k] = beta * <X[k], q>
-  MaxScore := -1e30;
+  EnsureNet(Beta);
+  for C := 0 to cD - 1 do GQuery.FData[C] := Q[C];
+  GNet.Compute(GQuery);
+  Out0 := GNet.GetLastLayer.Output;
+  for C := 0 to cD - 1 do Retrieved[C] := Out0.FData[C];
+
+  // Nearest stored pattern to the retrieved vector (cosine).
+  BestK := 0; BestW := -1e30;
   for K := 0 to cK - 1 do
   begin
-    Dot := 0;
-    for C := 0 to cD - 1 do
-      Dot := Dot + GBank[K, C] * Q[C];
-    Score[K] := Beta * Dot;
-    if Score[K] > MaxScore then MaxScore := Score[K];
+    Cos := CosineSim(Retrieved, GBank[K]);
+    if Cos > BestW then begin BestW := Cos; BestK := K; end;
   end;
-
-  // softmax over k (max-subtracted for numerical stability)
-  SumExp := 0;
-  for K := 0 to cK - 1 do
-  begin
-    W[K] := Exp(Score[K] - MaxScore);
-    SumExp := SumExp + W[K];
-  end;
-  for K := 0 to cK - 1 do
-    W[K] := W[K] / SumExp;
-
-  // retrieved = sum_k w[k] * X[k]
-  for C := 0 to cD - 1 do
-    Retrieved[C] := 0;
-  for K := 0 to cK - 1 do
-    for C := 0 to cD - 1 do
-      Retrieved[C] := Retrieved[C] + W[K] * GBank[K, C];
-
-  // argmax weight = the pattern the attention selected
-  BestK := 0; BestW := W[0];
-  for K := 1 to cK - 1 do
-    if W[K] > BestW then begin BestW := W[K]; BestK := K; end;
 end;
 
 function SafeF(V: TNeuralFloat; Dec: integer): string;
@@ -194,7 +216,8 @@ end;
 
 // ---------------------------------------------------------------------
 // Per-pattern retrieval table at a fixed beta / corruption level.
-// Returns whether ALL patterns recovered (cos > thresh AND argmax right).
+// Returns whether ALL patterns recovered (cos > thresh AND retrieval
+// landed nearest the correct stored pattern).
 // ---------------------------------------------------------------------
 function RetrievalTable(Beta, FlipFrac: TNeuralFloat; Verbose: boolean):
   boolean;
@@ -212,7 +235,7 @@ begin
   begin
     WriteLn(Format('  beta=%s  flip=%s', [SafeF(Beta, 2), SafeF(FlipFrac, 2)]));
     WriteLn(Format('    %-8s %10s %10s %8s %8s %6s',
-      ['pattern', 'cos(in)', 'cos(out)', 'argmax', 'weight', 'ok']));
+      ['pattern', 'cos(in)', 'cos(out)', 'nearest', 'cos_n', 'ok']));
   end;
   for K := 0 to cK - 1 do
   begin
@@ -266,6 +289,8 @@ begin
   WriteLn('Modern Hopfield network as ONE softmax-attention step.');
   WriteLn('Ramsauer et al. 2020, "Hopfield Networks is All You Need"');
   WriteLn('https://arxiv.org/abs/2008.02217');
+  WriteLn('Retrieval runs through the shipped TNNetModernHopfield layer');
+  WriteLn('(TNNet.AddModernHopfieldRetrieval, KSteps=1).');
   WriteLn;
   WriteLn(Format('Stored bank: K=%d bipolar (+/-1) patterns of dim d=%d  RandSeed=%d',
     [cK, cD, cSeed]));
@@ -335,10 +360,10 @@ begin
   // --- Sanity checks ---
   WriteLn('=== Sanity checks ===');
 
-  // (1) high beta + low corruption: every pattern recovers, argmax correct
+  // (1) high beta + low corruption: every pattern recovers, nearest correct
   if PassHigh then
     WriteLn(Format('[PASS] beta=%s flip=%s: all %d patterns recovered ' +
-      '(cos>%s) and argmax-attention picked the correct stored pattern.',
+      '(cos>%s) and the retrieval landed nearest the correct stored pattern.',
       [SafeF(cPassBeta, 1), SafeF(cPassFlip, 2), cK, SafeF(cPassCos, 2)]))
   else
     WriteLn('[FAIL] high-beta low-corruption retrieval did not recover all patterns.');
@@ -362,13 +387,20 @@ begin
       '(low=%s high=%s).', [SafeF(LowCos, 3), SafeF(HighCos, 3)]));
 
   WriteLn;
-  WriteLn('Modern-Hopfield retrieval is a single softmax-attention step: with a');
-  WriteLn('well-separated bank and large beta, one step completes a corrupted');
-  WriteLn('query to the nearest stored pattern.');
+  WriteLn('Modern-Hopfield retrieval is a single softmax-attention step (the');
+  WriteLn('TNNetModernHopfield layer): with a well-separated bank and large');
+  WriteLn('beta, one step completes a corrupted query to the nearest stored');
+  WriteLn('pattern.');
 end;
 
 begin
   RandSeed := cSeed;
   BuildBank;
-  Run;
+  GQuery := TNNetVolume.Create(1, 1, cD);
+  try
+    Run;
+  finally
+    GQuery.Free;
+    GNet.Free;
+  end;
 end.

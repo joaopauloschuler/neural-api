@@ -26,6 +26,9 @@ examples/MusicGenSmoke/MusicGenSmoke
 examples/MusicGenText/MusicGenText
 examples/MusicGenText/musicgen_text_demo.wav
 examples/LotteryTicketIMP/LotteryTicketIMP
+examples/LatentTextToImage/LatentTextToImage
+examples/KokoroTTS/KokoroTTS
+examples/KokoroTTS/kokoro_pico.wav
 examples/VQCodebookUsage/VQCodebookUsage
 examples/FourierMix/FourierMix
 examples/SpanCorruptionPretrain/SpanCorruptionPretrain
@@ -94,6 +97,12 @@ examples/TinyNeRF/*.ppm
 examples/TinyNeRF/*.o
 examples/TinyNeRF/*.ppu
 examples/TinyNeRF/tinynerf_run.txt
+
+# Mask R-CNN instance-segmentation example: compiled binary + generated PPM
+examples/InstanceSegmentation/InstanceSegmentation
+examples/InstanceSegmentation/*.ppm
+examples/InstanceSegmentation/*.o
+examples/InstanceSegmentation/*.ppu
 
 # Python bytecode caches (fixture generators in tools/)
 __pycache__/

@@ -108,6 +108,7 @@ var
   T5Cfg: TT5Config;
   Model: TMusicGenModel;
   Config: TMusicGenConfig;
+  GenDefaults: TGenerationDefaults;
   Codec: TEnCodecModel;
   CodecCfg: TEnCodecConfig;
   Tok: TNeuralHFTokenizer;
@@ -259,6 +260,26 @@ begin
     // into a repetitive drone. Default to MusicGen's top_k=250 unless overridden
     // (pass --topk 0 to force the greedy path explicitly).
     if not HasFlag('--topk') then TopK := DefaultRealTopK;
+    // If the checkpoint ships a generation_config.json beside its weights, let
+    // it seed the sampling defaults -- this is how facebook/musicgen-small pins
+    // top_k=250 / temperature=1.0 / guidance_scale=3.0 / do_sample=true, and a
+    // non-standard MusicGen variant with different decode defaults gets honored
+    // automatically. Explicit CLI --flags STILL win (the HasFlag guards below).
+    GenDefaults := ReadGenerationDefaultsFromDir(MgDir);
+    if GenDefaults.Found then
+    begin
+      WriteLn('Found generation_config.json: seeding sampling defaults from it.');
+      // do_sample=false means greedy: collapse to top_k=0 unless a do_sample
+      // model also pins a top_k (handled by the HasTopK branch below).
+      if GenDefaults.HasDoSample and (not GenDefaults.DoSample) and
+         (not HasFlag('--topk')) then TopK := 0;
+      if GenDefaults.HasTopK and (not HasFlag('--topk')) then
+        TopK := GenDefaults.TopK;
+      if GenDefaults.HasTemperature and (not HasFlag('--temperature')) then
+        Temperature := GenDefaults.Temperature;
+      if GenDefaults.HasGuidanceScale and (not HasFlag('--guidance')) then
+        GuidanceScale := GenDefaults.GuidanceScale;
+    end;
     WriteLn('Prompt: "', ParseStrArg('--prompt', DefaultPrompt), '"');
     WriteLn;
   end

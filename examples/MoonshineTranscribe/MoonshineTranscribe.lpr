@@ -35,9 +35,10 @@ Coded by Claude (AI).
 //
 // The decoder (RoPE + SwiGLU, cross-attending these states) is the autoregressive
 // transformer that turns the encoder hidden states into text. It is built by
-// BuildMoonshineEncoderDecoderFromSafeTensors and driven by the landed seq2seq
-// decode machinery (DecodeSeq2SeqGreedy via the T5EncoderStatesInput two-net
-// convention).
+// BuildMoonshineEncoderDecoderFromSafeTensors and driven by
+// DecodeMoonshineGreedyCached: a KV-CACHE incremental decode (self-attn K/V
+// cached across steps, constant cross-attn states re-read each step) that runs
+// the whole transcript in O(L) instead of the O(L^2) re-encode-the-prefix loop.
 //
 // Usage:
 //   MoonshineTranscribe [<checkpoint-dir>]
@@ -110,21 +111,20 @@ var
   Enc, Dec: TNNet;
   Config: TMoonshineConfig;
   Tok: TNeuralHFTokenizer;
-  Wave, DecIn, Logits: TNNetVolume;
-  EncStates: TNNetLayer;
-  Gen: array of integer;
-  i, DecSeqLen, CurLen, StartId, EOSId, Next: integer;
+  Wave: TNNetVolume;
+  Gen: TNeuralIntegerArray;
+  i, MaxNewTokens, StartId, EOSId: integer;
 begin
   // A small decode budget keeps the smoke fast; raise for longer clips.
-  DecSeqLen := 64;
+  MaxNewTokens := 63;
   StartId := 1;  // decoder_start_token_id (Moonshine default)
   EOSId := 2;    // eos_token_id (Moonshine default)
+  // KV-cache incremental decode feeds ONE token per step, so the decoder's
+  // token input is built at width 1 (the growing context lives in the cache).
   BuildMoonshineEncoderDecoderFromSafeTensors(WeightsPath, Enc, Dec, Config,
-    NumSamples, DecSeqLen, {pTrainable=}false, ConfigPath);
+    NumSamples, {DecSeqLen=}1, {pTrainable=}false, ConfigPath);
   Tok := TNeuralHFTokenizer.Create();
   Wave := TNNetVolume.Create;
-  DecIn := TNNetVolume.Create;
-  Logits := TNNetVolume.Create;
   SetLength(Gen, 0);
   try
     Tok.LoadFromFile(TokPath);
@@ -132,33 +132,21 @@ begin
     for i := 0 to NumSamples - 1 do
       Wave.FData[i] := 0.5 * Sin(2.0 * Pi * 220.0 * i / 16000.0);
     // The audio encoder's input is the RAW WAVEFORM (not token ids), so we
-    // drive a manual greedy loop instead of DecodeSeq2SeqGreedy (which assumes
-    // a token-id encoder): encode once, cache the states in the decoder's 2nd
-    // input, then autoregress reading row CurLen-1 each step.
-    Enc.Compute(Wave);
-    EncStates := T5EncoderStatesInput(Dec);
-    EncStates.Output.Copy(Enc.GetLastLayer().Output);
-    DecIn.ReSize(DecSeqLen, 1, 1);
-    CurLen := 1;
-    DecIn.FData[0] := StartId;
-    while CurLen < DecSeqLen do
-    begin
-      for i := CurLen to DecSeqLen - 1 do DecIn.FData[i] := StartId;
-      Dec.Compute(DecIn);
-      Dec.GetOutput(Logits);
-      Next := Logits.GetClassOnPixel(CurLen - 1, 0);
-      if Next = EOSId then break;
-      SetLength(Gen, Length(Gen) + 1);
-      Gen[High(Gen)] := Next;
-      DecIn.FData[CurLen] := Next;
-      Inc(CurLen);
-    end;
+    // cannot use DecodeSeq2SeqGreedy (which assumes a token-id encoder).
+    // DecodeMoonshineGreedyCached encodes once, caches the states in the
+    // decoder's 2nd input, then drives a KV-CACHE incremental decode: each
+    // generated token is fed one at a time, appending only its self-attn K/V
+    // and re-reading the constant cross-attn states - O(L) total instead of
+    // the O(L^2) re-run-the-whole-prefix loop this example used to drive.
+    Gen := DecodeMoonshineGreedyCached(Enc, Dec, Wave, StartId, EOSId,
+      MaxNewTokens);
+    // EOS is appended by the decoder; trim it before detokenizing.
+    if (Length(Gen) > 0) and (Gen[High(Gen)] = EOSId) then
+      SetLength(Gen, Length(Gen) - 1);
     Write('  transcription: "');
     Write(Tok.Decode(Gen, {SkipSpecialTokens=}true));
     WriteLn('"');
   finally
-    Logits.Free;
-    DecIn.Free;
     Wave.Free;
     Tok.Free;
     Dec.Free;

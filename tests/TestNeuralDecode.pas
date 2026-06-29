@@ -92,6 +92,21 @@ type
     function CausalReEncodeBeamAll(Full: TNNet; const PromptToks: array of integer;
       MaxLen, BeamWidth: integer; LengthPenalty: TNeuralFloat
       ): TNNetDecodeResultArray;
+    // Synthetic CROSS-ATTENTION encoder-decoder pair for the forced-prefix
+    // cached-decode tests. The encoder is token-ids -> embedding -> a causal
+    // transformer block -> (EncSeqLen,1,Dim) hidden states. The decoder is built
+    // TWICE off the SAME weights: Enc and the wide DecFull share an encoder-
+    // states input filled by the caller; DecCached is the width-1 incremental
+    // twin (DecSeqLen=1) used by DecodeSeq2SeqForcedPrefixCached. CopyWeights
+    // keeps the two decoders bit-identical so the cached vs full paths agree.
+    procedure BuildCrossAttnSeq2SeqPair(out Enc, DecFull, DecCached: TNNet;
+      EncSeqLen, DecFullSeqLen, Vocab: integer);
+    // Naive O(L^2) reference: re-run the FULL decoder over the whole growing
+    // (ForcedPrefix ++ generated) prefix every step, reading the last-real-row
+    // argmax. EncStates is pre-computed and copied into DecFull's second input.
+    function ForcedPrefixFullReDecode(DecFull: TNNet; EncStates: TNNetVolume;
+      const ForcedPrefix: array of integer;
+      EOSTokenId, MaxNewTokens: integer): TNeuralIntegerArray;
   published
     // Pure helper functions (no network needed).
     procedure TestLengthPenaltyAlphaZeroIsOne;
@@ -150,6 +165,8 @@ type
     procedure TestKVCacheTruncateThenReappendMatchesFresh;
     procedure TestKVCacheDisabledPathUnchanged;
     procedure TestKVCacheInt8DriftWithinTolerance;
+    // FlashAttention-style tiled online-softmax forward parity.
+    procedure TestSDPATiledOnlineSoftmaxParity;
     // O(1)-per-step incremental decode on TNNetDiagonalSSM (persisted state).
     procedure TestSSMIncrementalMatchesFullForward;
     procedure TestSSMPrefillThenStepMatchesFullForward;
@@ -187,6 +204,7 @@ type
     // Logits-processor chain + temperature + generation config.
     procedure TestTemperatureProcessorProbabilityDomainMath;
     procedure TestProcessorChainOrderMatters;
+    procedure TestNoRepeatNGramBansSeenBigramAndTrigram;
     procedure TestNoOpChainAndConfigBitIdenticalToPlainPath;
     procedure TestGenerateWithConfigMatchesHandAssembled;
     procedure TestTemperatureNearZeroWithSamplerMatchesGreedy;
@@ -202,6 +220,10 @@ type
     procedure TestWatermarkGreenListReproducibleFromKeyAndPrefix;
     procedure TestWatermarkDetectsWatermarkedAndRejectsRandom;
     procedure TestWatermarkProcessorBoostsGreenInProbabilityDomain;
+    // Sequence-bias / bad-words processor (HF SequenceBiasLogitsProcessor).
+    procedure TestSequenceBiasSingleTokenIsUnconditionalBias;
+    procedure TestSequenceBiasMultiTokenFiresOnlyOnPrefixMatch;
+    procedure TestSequenceBiasBannedWordNeverAppearsInGreedyOutput;
     // Constrained (structured) decoding: TNNetTokenConstraint and friends.
     procedure TestAllowedTokensConstraintMasksAndRenormalizes;
     procedure TestConstraintMaskFallbackLeavesRowUntouched;
@@ -247,6 +269,13 @@ type
     procedure TestSeq2SeqBeamBeatsGreedyFirstTokenTrap;
     procedure TestSeq2SeqBeamFinishedPoolLengthPenaltyFlipsRanking;
     procedure TestSeq2SeqBeamDeterministicCapsAndValidation;
+    // Forced-prefix KV-cached seq2seq decode (DecodeSeq2SeqForcedPrefixCached):
+    // a synthetic cross-attention encoder-decoder pair; the cached path must be
+    // bit-identical to the naive full-re-decode loop, and a multi-token forced
+    // prologue must be honored verbatim and steer the greedy continuation.
+    procedure TestForcedPrefixCachedMatchesFullReDecode;
+    procedure TestForcedPrefixSteersGreedyContinuation;
+    procedure TestForcedPrefixCachedRejectsInvalidArguments;
     // Needle-in-a-haystack long-context eval harness (no model: deterministic
     // string stand-ins exercise insertion/grid/accuracy mechanics).
     procedure TestNeedleHaystackGridShapeMatchesAxes;
@@ -1369,6 +1398,76 @@ end;
 // time through the cached incremental-decode path, and assert EVERY position's
 // output matches to < 1e-5. With a cache, attending over the cached keys
 // [0..t] IS the causal behavior, so all positions (not just the last) agree.
+// FlashAttention-1 tiled online-softmax forward must be numerically equivalent
+// (< 1e-5) to the naive full-score forward. Same fixed input fed through a
+// naive SDPA and a tiled SDPA across a few SeqLen / Dk / mask / tile configs,
+// including a causal case and a tile width that does not divide SeqLen.
+procedure TTestNeuralDecode.TestSDPATiledOnlineSoftmaxParity;
+
+  procedure RunOne(SeqLen, Dk, Window: integer; Causal: boolean; TileBc: integer);
+  var
+    NNNaive, NNTiled: TNNet;
+    SDPATiled: TNNetScaledDotProductAttention;
+    InV, NaiveOut, TiledOut: TNNetVolume;
+    T, D: integer;
+    Diff, MaxDiff: TNeuralFloat;
+    Tag: string;
+  begin
+    RandSeed := 424242;
+    NNNaive := TNNet.Create();
+    NNTiled := TNNet.Create();
+    InV := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+    NaiveOut := TNNetVolume.Create();
+    TiledOut := TNNetVolume.Create();
+    try
+      Tag := Format('L=%d Dk=%d W=%d C=%d Bc=%d',
+        [SeqLen, Dk, Window, Ord(Causal), TileBc]);
+      NNNaive.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+      NNNaive.AddLayer(TNNetScaledDotProductAttention.Create(Dk, Causal, Window));
+      NNTiled.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+      SDPATiled := TNNetScaledDotProductAttention.Create(Dk, Causal, Window);
+      NNTiled.AddLayer(SDPATiled);
+      SDPATiled.EnableTiledForward(TileBc);
+      AssertTrue('tiled flag on ' + Tag, SDPATiled.TiledForward);
+
+      InV.Randomize();
+      InV.Sub(0.5);
+      NNNaive.Compute(InV);
+      NNNaive.GetOutput(NaiveOut);
+      NNTiled.Compute(InV);
+      NNTiled.GetOutput(TiledOut);
+
+      MaxDiff := 0;
+      for T := 0 to SeqLen - 1 do
+        for D := 0 to Dk - 1 do
+        begin
+          Diff := Abs(NaiveOut[T, 0, D] - TiledOut[T, 0, D]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      AssertTrue('tiled parity max|diff| < 1e-5 (' + Tag + ') got '
+        + FloatToStr(MaxDiff), MaxDiff < 1e-5);
+    finally
+      TiledOut.Free;
+      NaiveOut.Free;
+      InV.Free;
+      NNTiled.Free;
+      NNNaive.Free;
+    end;
+  end;
+
+begin
+  // Plain bidirectional, tile divides and does not divide SeqLen, single-tile.
+  RunOne({SeqLen=}16, {Dk=}8,  {Window=}0, {Causal=}false, {TileBc=}4);
+  RunOne({SeqLen=}13, {Dk=}5,  {Window=}0, {Causal=}false, {TileBc=}4);
+  RunOne({SeqLen=}10, {Dk=}7,  {Window=}0, {Causal=}false, {TileBc=}64);
+  // Causal mask.
+  RunOne({SeqLen=}16, {Dk=}8,  {Window=}0, {Causal=}true,  {TileBc=}4);
+  RunOne({SeqLen=}31, {Dk=}6,  {Window=}0, {Causal=}true,  {TileBc=}8);
+  // Sliding-window causal and a larger depth.
+  RunOne({SeqLen=}20, {Dk=}12, {Window=}5, {Causal=}true,  {TileBc=}3);
+  RunOne({SeqLen=}64, {Dk=}16, {Window=}0, {Causal=}true,  {TileBc=}16);
+end;
+
 procedure TTestNeuralDecode.TestKVCacheIncrementalMatchesFullForward;
 const
   SeqLen = 7;
@@ -3526,6 +3625,92 @@ begin
   end;
 end;
 
+// TNNetNoRepeatNGramProcessor: EXACT n-gram blocking (HF no_repeat_ngram_size).
+// With size=2, after a context ending in token "B" whose only prior
+// occurrence was followed by "C", the bigram (B,C) cannot be re-formed: prob
+// of C is zeroed and surviving mass renormalized. With size=3 only the FULL
+// 2-token suffix keys the ban (a token sharing just the 1-token suffix is NOT
+// blocked). Banning is in the probability domain (the post-softmax image of
+// logit -> -inf); a uniform row over the survivors integrates to 1.
+procedure TTestNeuralDecode.TestNoRepeatNGramBansSeenBigramAndTrigram;
+var
+  Proc: TNNetNoRepeatNGramProcessor;
+  Row: TNNetVolume;
+  I: integer;
+  Total: TNeuralFloat;
+begin
+  // ---- size=2: bigram blocking. Context: A B C B  (vocab 0..4: A=0..C=2).
+  // Seen bigram (B,C) = (3->4 indices): the only B at index 1 was followed by
+  // C. Current suffix is the trailing "B" (index 3); its prior occurrence was
+  // followed by C, so C (=2) must be banned for the next token.
+  Proc := TNNetNoRepeatNGramProcessor.Create(2);
+  Row := TNNetVolume.Create(5, 1, 1);
+  try
+    AssertTrue('declares the probability domain', Proc.ExpectsProbabilities());
+    Proc.Reset([0, 1, 2, 1]); // A B C B  (B=1, C=2)
+    for I := 0 to 4 do Row.Raw[I] := 0.2; // uniform
+    Proc.ProcessRow(Row);
+    AssertEquals('size=2 bans C (re-forms seen bigram B,C)', 0.0, Row.Raw[2],
+      0.0);
+    Total := 0;
+    for I := 0 to 4 do Total := Total + Row.Raw[I];
+    AssertEquals('survivors renormalize to 1', 1.0, Total, 1e-6);
+    AssertEquals('an unrelated token keeps non-zero mass (>0)', 0.25,
+      Row.Raw[0], 1e-6); // 0.2 / (4*0.2) = 0.25
+  finally
+    Row.Free;
+    Proc.Free;
+  end;
+
+  // ---- size=3: trigram blocking keys on the 2-token suffix. Context:
+  // A B C  A B  -> suffix "A B". The prior "A B" (indices 0,1) was followed by
+  // C, so C must be banned. A token that only shares the 1-token suffix "B"
+  // (e.g. via a (X,B,*) elsewhere) is NOT blocked - only the full (A,B,*).
+  Proc := TNNetNoRepeatNGramProcessor.Create(3);
+  Row := TNNetVolume.Create(5, 1, 1);
+  try
+    Proc.Reset([0, 1, 2, 0, 1]); // A B C A B
+    for I := 0 to 4 do Row.Raw[I] := 0.2;
+    Proc.ProcessRow(Row);
+    AssertEquals('size=3 bans C (re-forms seen trigram A,B,C)', 0.0,
+      Row.Raw[2], 0.0);
+    Total := 0;
+    for I := 0 to 4 do Total := Total + Row.Raw[I];
+    AssertEquals('trigram survivors renormalize to 1', 1.0, Total, 1e-6);
+
+    // Negative: with the SAME suffix "B" but a DIFFERENT preceding token, the
+    // (A,B,C) ban does not fire. Context: D B (suffix "B" only, no full 2-gram
+    // suffix repeated) -> with size=3 and FLen<3 nothing is banned.
+    Proc.Reset([3, 1]); // D B  (len 2 < 3)
+    for I := 0 to 4 do Row.Raw[I] := 0.2;
+    Proc.ProcessRow(Row);
+    for I := 0 to 4 do
+      AssertEquals('size=3 with short context bans nothing at ' + IntToStr(I),
+        0.2, Row.Raw[I], 1e-6);
+  finally
+    Row.Free;
+    Proc.Free;
+  end;
+
+  // ---- Commit advances state: after emitting a token the new suffix governs
+  // the next ban. Start "A B", emit C -> context "A B C"; with size=2 the
+  // suffix is now "C" (no prior C), so nothing banned; then the prior B,C is
+  // recorded so a later B would ban C.
+  Proc := TNNetNoRepeatNGramProcessor.Create(2);
+  Row := TNNetVolume.Create(5, 1, 1);
+  try
+    Proc.Reset([0, 1]); // A B
+    Proc.Commit(2);     // emit C -> A B C
+    Proc.Commit(1);     // emit B -> A B C B ; suffix B, prior B followed by C
+    for I := 0 to 4 do Row.Raw[I] := 0.2;
+    Proc.ProcessRow(Row);
+    AssertEquals('after Commit, suffix B bans C', 0.0, Row.Raw[2], 0.0);
+  finally
+    Row.Free;
+    Proc.Free;
+  end;
+end;
+
 // Order matters: penalty-then-temperature sharpens the PENALIZED distribution
 // while temperature-then-penalty penalizes the SHARPENED one - the frequency
 // factor enters once as exp(-a)^(1/T) vs exp(-a). Both expected rows are
@@ -4326,6 +4511,155 @@ begin
     Proc.Free;
     Base.Free;
     Row.Free;
+  end;
+end;
+
+// A single-token bias has an empty prefix, so it fires UNCONDITIONALLY every
+// step (transformers' documented degradation). The probability-domain image is
+// p *= exp(bias), renormalized.
+procedure TTestNeuralDecode.TestSequenceBiasSingleTokenIsUnconditionalBias;
+const
+  Vocab = 5;
+  Bias = 1.5;
+var
+  Proc: TNNetSequenceBiasProcessor;
+  Row: TNNetVolume;
+  I: integer;
+  ExpBias, Sum, Expected: TNeuralFloat;
+begin
+  Proc := TNNetSequenceBiasProcessor.Create();
+  Row := TNNetVolume.Create(Vocab, 1, 1);
+  try
+    AssertTrue('declares the probability domain', Proc.ExpectsProbabilities());
+    Proc.AddSequenceBias([2], Bias); // single-token: unconditional bias on 2
+    AssertEquals('one entry registered', 1, Proc.Count);
+    Proc.Reset([0, 1]); // arbitrary history; the empty prefix matches anyway
+    for I := 0 to Vocab - 1 do Row.Raw[I] := 0.2;
+    Proc.ProcessRow(Row);
+    ExpBias := Exp(Bias);
+    Sum := (Vocab - 1) * 0.2 + 0.2 * ExpBias;
+    for I := 0 to Vocab - 1 do
+    begin
+      if I = 2 then Expected := 0.2 * ExpBias / Sum
+      else Expected := 0.2 / Sum;
+      AssertEquals('single-token bias prob at ' + IntToStr(I), Expected,
+        Row.Raw[I], 1e-6);
+    end;
+    Sum := 0;
+    for I := 0 to Vocab - 1 do Sum := Sum + Row.Raw[I];
+    AssertEquals('row sums to 1', 1.0, Sum, 1e-6);
+  finally
+    Row.Free;
+    Proc.Free;
+  end;
+end;
+
+// A multi-token entry biases its FINAL token only when the leading tokens are
+// the tail of the generated history (prefix match). It must NOT fire when the
+// lead-in does not match.
+procedure TTestNeuralDecode.TestSequenceBiasMultiTokenFiresOnlyOnPrefixMatch;
+const
+  Vocab = 5;
+var
+  Proc: TNNetSequenceBiasProcessor;
+  Row: TNNetVolume;
+  I: integer;
+begin
+  Proc := TNNetSequenceBiasProcessor.Create();
+  Row := TNNetVolume.Create(Vocab, 1, 1);
+  try
+    // Bias token 4 only after the bigram (1,3) has been generated.
+    Proc.AddSequenceBias([1, 3, 4], 2.0);
+
+    // -- NO match: history tail is (0,2); the (1,3) prefix is absent.
+    Proc.Reset([0, 2]);
+    for I := 0 to Vocab - 1 do Row.Raw[I] := 0.2;
+    Proc.ProcessRow(Row);
+    for I := 0 to Vocab - 1 do
+      AssertEquals('no prefix match leaves token ' + IntToStr(I) + ' untouched',
+        0.2, Row.Raw[I], 1e-6);
+
+    // -- MATCH: history tail is exactly (1,3) -> token 4 gets boosted.
+    Proc.Reset([9, 1, 3]); // suffix (1,3) matches the entry's prefix
+    for I := 0 to Vocab - 1 do Row.Raw[I] := 0.2;
+    Proc.ProcessRow(Row);
+    AssertTrue('matched prefix boosts the final token 4 above baseline',
+      Row.Raw[4] > 0.2 + 1e-9);
+    for I := 0 to 3 do
+      AssertTrue('non-final tokens are NOT boosted ' + IntToStr(I),
+        Row.Raw[I] < 0.2 + 1e-9);
+
+    // -- MATCH BY COMMIT: prefix completed via emitted tokens, not the prompt.
+    Proc.Reset([7]);
+    Proc.Commit(1);
+    Proc.Commit(3); // history now (7,1,3); suffix (1,3) matches
+    for I := 0 to Vocab - 1 do Row.Raw[I] := 0.2;
+    Proc.ProcessRow(Row);
+    AssertTrue('prefix completed by Commit boosts token 4',
+      Row.Raw[4] > 0.2 + 1e-9);
+  finally
+    Row.Free;
+    Proc.Free;
+  end;
+end;
+
+// End-to-end greedy check: a hard-banned multi-token word never completes under
+// argmax decoding. We simulate the streamed greedy loop directly on a model
+// distribution that WOULD otherwise emit the banned word, and assert the banned
+// final token never wins once its lead-in has been generated.
+procedure TTestNeuralDecode.TestSequenceBiasBannedWordNeverAppearsInGreedyOutput;
+const
+  Vocab = 4;
+  Steps = 12;
+var
+  Proc: TNNetSequenceBiasProcessor;
+  Row: TNNetVolume;
+  History: array[0..Steps - 1] of integer;
+  I, S, Argmax, Prev: integer;
+  Best: TNeuralFloat;
+begin
+  Proc := TNNetSequenceBiasProcessor.Create();
+  Row := TNNetVolume.Create(Vocab, 1, 1);
+  try
+    // Hard-ban the two-token word (1,2): once a 1 is emitted, a 2 must never
+    // follow it under greedy decoding.
+    Proc.AddBadWord([1, 2]);
+    Proc.Reset([0]); // BOS-like prompt
+    Prev := -1;
+    for S := 0 to Steps - 1 do
+    begin
+      // A degenerate model that ALWAYS most-favours emitting 1 then 2 (so that
+      // without the ban, greedy WOULD produce ...1,2,1,2...). After a 1, token 2
+      // has the largest base probability.
+      if Prev = 1 then
+      begin
+        Row.Raw[0] := 0.1; Row.Raw[1] := 0.1; Row.Raw[2] := 0.7; Row.Raw[3] := 0.1;
+      end
+      else
+      begin
+        Row.Raw[0] := 0.1; Row.Raw[1] := 0.7; Row.Raw[2] := 0.1; Row.Raw[3] := 0.1;
+      end;
+      Proc.ProcessRow(Row);
+      // Greedy argmax.
+      Argmax := 0; Best := Row.Raw[0];
+      for I := 1 to Vocab - 1 do
+        if Row.Raw[I] > Best then begin Best := Row.Raw[I]; Argmax := I; end;
+      History[S] := Argmax;
+      Proc.Commit(Argmax);
+      Prev := Argmax;
+    end;
+    // Assert the banned bigram (1,2) never appears in the greedy output.
+    for S := 0 to Steps - 2 do
+      AssertTrue('banned word (1,2) must not appear at position ' + IntToStr(S),
+        not ((History[S] = 1) and (History[S + 1] = 2)));
+    // Sanity: token 1 WAS emitted at least once (so the ban genuinely fired on
+    // its completion rather than the word never being attempted).
+    Argmax := 0;
+    for S := 0 to Steps - 1 do if History[S] = 1 then Inc(Argmax);
+    AssertTrue('the banned word lead-in (1) was actually generated', Argmax > 0);
+  finally
+    Row.Free;
+    Proc.Free;
   end;
 end;
 
@@ -6579,6 +6913,234 @@ begin
   finally
     Session.Free;
     Wide.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// Forced-prefix KV-cached seq2seq decode tests.
+// ---------------------------------------------------------------------------
+
+procedure TTestNeuralDecode.BuildCrossAttnSeq2SeqPair(
+  out Enc, DecFull, DecCached: TNNet;
+  EncSeqLen, DecFullSeqLen, Vocab: integer);
+const Dim = 8;
+
+  // Builds one cross-attention decoder at the given query width. The token
+  // input is FIRST (GetFirstLayer), the encoder-states input SECOND (the
+  // two-net convention); the embedding stream branches off the token input,
+  // then a full decoder block cross-attends to the encoder-states input.
+  function BuildDec(DecSeqLen: integer): TNNet;
+  var TokIn, EncStatesIn: TNNetLayer;
+  begin
+    Result := TNNet.Create();
+    TokIn := Result.AddLayer(TNNetInput.Create(DecSeqLen, 1, 1));
+    EncStatesIn := Result.AddLayer(TNNetInput.Create(EncSeqLen, 1, Dim));
+    Result.AddLayerAfter(
+      TNNetEmbedding.Create(Vocab, Dim, {EncodeZero=}0, 0.02), TokIn);
+    Result.AddTransformerDecoderBlock({Heads=}2, {d_ff=}8, EncStatesIn,
+      {PreNorm=}true, {UseRoPE=}true, {NormClass=}TNNetDyT);
+    Result.AddLayer(TNNetPointwiseConvLinear.Create(Vocab));
+  end;
+
+begin
+  // Encoder: token ids -> embedding -> causal transformer block -> hidden
+  // states (EncSeqLen,1,Dim), matching the decoder's encoder-states input.
+  RandSeed := 424242;
+  Enc := TNNet.Create();
+  Enc.AddLayer(TNNetInput.Create(EncSeqLen, 1, 1));
+  Enc.AddLayer(TNNetEmbedding.Create(Vocab, Dim, 0, 0.02));
+  Enc.AddTransformerEncoderBlock({Heads=}2, {d_ff=}8,
+    {PreNorm=}true, {CausalMask=}false, {UseRoPE=}true, {NormClass=}TNNetDyT);
+  Enc.InitWeights();
+
+  // Two decoders off the SAME random init, then CopyWeights makes the width-1
+  // cached twin bit-identical to the wide full-re-decode reference.
+  RandSeed := 987654;
+  DecFull := BuildDec(DecFullSeqLen);
+  DecFull.InitWeights();
+  DecCached := BuildDec(1);
+  DecCached.CopyWeights(DecFull);
+end;
+
+function TTestNeuralDecode.ForcedPrefixFullReDecode(DecFull: TNNet;
+  EncStates: TNNetVolume; const ForcedPrefix: array of integer;
+  EOSTokenId, MaxNewTokens: integer): TNeuralIntegerArray;
+var
+  EncStatesIn: TNNetLayer;
+  DecToks, Logits: TNNetVolume;
+  Prefix: TNeuralIntegerArray;
+  DecSeqLen, CurLen, Pos, Next, PfxLen, i: integer;
+begin
+  SetLength(Result, 0);
+  if MaxNewTokens < 1 then exit;
+  // Second TNNetInput holds the (constant) encoder states.
+  EncStatesIn := Seq2SeqEncoderStatesInput(DecFull);
+  EncStatesIn.Output.Copy(EncStates);
+  DecSeqLen := DecFull.GetFirstLayer().Output.Size;
+  Logits := DecFull.GetLastLayer().Output;
+  PfxLen := Length(ForcedPrefix);
+  // Working prefix = forced prologue ++ generated, padded to DecSeqLen with the
+  // last token (causal masking makes the pad invisible to earlier rows).
+  SetLength(Prefix, PfxLen);
+  for i := 0 to PfxLen - 1 do Prefix[i] := ForcedPrefix[i];
+  CurLen := PfxLen;
+  DecToks := TNNetVolume.Create(DecSeqLen, 1, 1);
+  try
+    while True do
+    begin
+      for Pos := 0 to DecSeqLen - 1 do
+        if Pos < CurLen
+        then DecToks.FData[Pos] := Prefix[Pos]
+        else DecToks.FData[Pos] := Prefix[CurLen - 1];
+      DecFull.Compute(DecToks);
+      Next := Logits.GetClassOnPixel(CurLen - 1, 0);
+      SetLength(Result, Length(Result) + 1);
+      Result[High(Result)] := Next;
+      if Next = EOSTokenId then break;
+      if Length(Result) >= MaxNewTokens then break;
+      if CurLen >= DecSeqLen then break;
+      SetLength(Prefix, CurLen + 1);
+      Prefix[CurLen] := Next;
+      Inc(CurLen);
+    end;
+  finally
+    DecToks.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestForcedPrefixCachedMatchesFullReDecode;
+const
+  EncSeqLen = 5; Vocab = 12; MaxNew = 14; DecFullSeqLen = 20;
+var
+  Enc, DecFull, DecCached: TNNet;
+  EncToks, EncStates: TNNetVolume;
+  Prefix, Cached, Full: TNeuralIntegerArray;
+  i: integer;
+begin
+  BuildCrossAttnSeq2SeqPair(Enc, DecFull, DecCached, EncSeqLen, DecFullSeqLen,
+    Vocab);
+  EncToks := TNNetVolume.Create(EncSeqLen, 1, 1);
+  EncStates := TNNetVolume.Create();
+  try
+    // Run the encoder ONCE; both decode paths consume these fixed states.
+    for i := 0 to EncSeqLen - 1 do EncToks.FData[i] := (i * 3 + 2) mod Vocab;
+    Enc.Compute(EncToks);
+    EncStates.Copy(Enc.GetLastLayer().Output);
+
+    // A multi-token forced prologue (Whisper-style), EOS = 11.
+    SetLength(Prefix, 4);
+    Prefix[0] := 1; Prefix[1] := 6; Prefix[2] := 3; Prefix[3] := 9;
+
+    Cached := DecodeSeq2SeqForcedPrefixCached(DecCached, EncStates, Prefix,
+      {EOS=}11, MaxNew);
+    Full := ForcedPrefixFullReDecode(DecFull, EncStates, Prefix, {EOS=}11,
+      MaxNew);
+
+    AssertEquals('cached and full lengths match', Length(Full), Length(Cached));
+    for i := 0 to High(Full) do
+      AssertEquals('token ' + IntToStr(i) + ' bit-identical',
+        Full[i], Cached[i]);
+    AssertTrue('at least one token generated', Length(Cached) > 0);
+  finally
+    EncStates.Free; EncToks.Free;
+    DecCached.Free; DecFull.Free; Enc.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestForcedPrefixSteersGreedyContinuation;
+const
+  EncSeqLen = 5; Vocab = 12; MaxNew = 10; DecFullSeqLen = 20;
+var
+  Enc, DecFull, DecCached, Dec2, DecFull2: TNNet;
+  EncToks, EncStates: TNNetVolume;
+  PrefixA, PrefixB, OutA, OutB: TNeuralIntegerArray;
+  i: integer;
+  Differ: boolean;
+begin
+  BuildCrossAttnSeq2SeqPair(Enc, DecFull, DecCached, EncSeqLen, DecFullSeqLen,
+    Vocab);
+  // A second cached twin off the same weights for the B run (a session resets
+  // its own cache, so one twin would suffice, but two keeps the runs isolated).
+  BuildCrossAttnSeq2SeqPair(Enc, DecFull2, Dec2, EncSeqLen, DecFullSeqLen,
+    Vocab);
+  EncToks := TNNetVolume.Create(EncSeqLen, 1, 1);
+  EncStates := TNNetVolume.Create();
+  try
+    for i := 0 to EncSeqLen - 1 do EncToks.FData[i] := (i * 3 + 2) mod Vocab;
+    Enc.Compute(EncToks);
+    EncStates.Copy(Enc.GetLastLayer().Output);
+
+    // Two DIFFERENT forced prologues from the SAME encoder states. EOS unset
+    // (use an id never produced) so the full MaxNew window is generated.
+    SetLength(PrefixA, 3); PrefixA[0] := 2; PrefixA[1] := 4; PrefixA[2] := 7;
+    SetLength(PrefixB, 3); PrefixB[0] := 8; PrefixB[1] := 5; PrefixB[2] := 1;
+
+    OutA := DecodeSeq2SeqForcedPrefixCached(DecCached, EncStates, PrefixA,
+      {EOS=}-1, MaxNew);
+    OutB := DecodeSeq2SeqForcedPrefixCached(Dec2, EncStates, PrefixB,
+      {EOS=}-1, MaxNew);
+
+    // The forced tokens are NOT in the result (excluded by convention), yet the
+    // distinct prologues must steer the greedy continuation to differ.
+    AssertEquals('A full window', MaxNew, Length(OutA));
+    AssertEquals('B full window', MaxNew, Length(OutB));
+    Differ := False;
+    for i := 0 to MaxNew - 1 do
+      if OutA[i] <> OutB[i] then Differ := True;
+    AssertTrue('distinct forced prologues steer different continuations',
+      Differ);
+  finally
+    EncStates.Free; EncToks.Free;
+    Dec2.Free; DecFull2.Free;
+    DecCached.Free; DecFull.Free; Enc.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestForcedPrefixCachedRejectsInvalidArguments;
+const
+  EncSeqLen = 5; Vocab = 12; DecFullSeqLen = 20;
+var
+  Enc, DecFull, DecCached: TNNet;
+  EncStates, BadStates: TNNetVolume;
+  EmptyPrefix, Prefix: TNeuralIntegerArray;
+  Raised: boolean;
+begin
+  BuildCrossAttnSeq2SeqPair(Enc, DecFull, DecCached, EncSeqLen, DecFullSeqLen,
+    Vocab);
+  EncStates := TNNetVolume.Create(EncSeqLen, 1, 8);
+  BadStates := TNNetVolume.Create(EncSeqLen + 1, 1, 8);
+  try
+    SetLength(EmptyPrefix, 0);
+    SetLength(Prefix, 1); Prefix[0] := 1;
+
+    // Empty prefix is rejected.
+    Raised := False;
+    try
+      DecodeSeq2SeqForcedPrefixCached(DecCached, EncStates, EmptyPrefix, 11, 4);
+    except on EArgumentException do Raised := True; end;
+    AssertTrue('empty prefix rejected', Raised);
+
+    // Encoder-states size mismatch is rejected.
+    Raised := False;
+    try
+      DecodeSeq2SeqForcedPrefixCached(DecCached, BadStates, Prefix, 11, 4);
+    except on EArgumentException do Raised := True; end;
+    AssertTrue('encoder-states size mismatch rejected', Raised);
+
+    // A wide (DecSeqLen > 1) decoder cannot drive incremental decode.
+    Raised := False;
+    try
+      DecodeSeq2SeqForcedPrefixCached(DecFull, EncStates, Prefix, 11, 4);
+    except on EArgumentException do Raised := True; end;
+    AssertTrue('wide decoder rejected', Raised);
+
+    // MaxNewTokens < 1 returns empty (no raise).
+    AssertEquals('MaxNewTokens<1 empty', 0,
+      Length(DecodeSeq2SeqForcedPrefixCached(DecCached, EncStates, Prefix,
+        11, 0)));
+  finally
+    BadStates.Free; EncStates.Free;
+    DecCached.Free; DecFull.Free; Enc.Free;
   end;
 end;
 

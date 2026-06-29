@@ -58,7 +58,7 @@ Coded by Claude (AI).
 interface
 
 uses
-  Classes, SysUtils, Math, neuralvolume;
+  Classes, SysUtils, Math, neuralvolume, neuralnetwork;
 
 type
   // Double-precision helpers (FID needs more than single precision).
@@ -121,6 +121,43 @@ function ComputeFIDFromAccumulators(AccR, AccG: TFIDFeatureAccumulator): Double;
 
 // Convenience: FID from two raw feature matrices (Features[sample][dim]).
 function ComputeFIDFromFeatures(const FeaturesR, FeaturesG: TIMDoubleMatrix): Double;
+
+// --- FID over the real Inception backbone ---
+//
+// The functions above are backbone-AGNOSTIC: the caller supplies feature
+// vectors. These wire FID onto the actual Inception-v3 pooled feature, which
+// is the canonical FID definition. The InceptionNet is built by
+// neuralpretrained.BuildInceptionV3Full (full_arch=true), which returns the
+// global-avg-pool layer index via its out PoolFeatureIdx parameter; that layer
+// emits the 2048-d "pool3" activation FID is defined over (the width is smaller
+// for a width_div-shrunk or pico net, but the API is identical).
+//
+// Each image must already be a network-ready volume: (ImageSize, ImageSize,
+// NumChannels), ImageNet-normalised the same way the backbone was trained
+// ((pixel/255 - csImageNetMean[c]) / csImageNetStd[c]) and resized/center-
+// cropped to the backbone's ImageSize. neuraldatasets.LoadImageForVisionModel
+// produces exactly such a volume.
+
+// Runs one image volume through InceptionNet and returns the pooled feature at
+// PoolFeatureIdx as a float64 vector (length = that layer's Output.Size).
+function ExtractInceptionFeature(InceptionNet: TNNet;
+  PoolFeatureIdx: integer; ImageVolume: TNNetVolume): TIMDoubleArray;
+
+// Runs every image in Images through InceptionNet, accumulating the pooled
+// PoolFeatureIdx feature of each into Acc (which must already be sized to the
+// pooled width). Lets a caller stream large image sets without materialising
+// the whole feature matrix. Images is a list of network-ready TNNetVolume.
+procedure AccumulateInceptionFeatures(InceptionNet: TNNet;
+  PoolFeatureIdx: integer; Images: TNNetVolumeList;
+  Acc: TFIDFeatureAccumulator);
+
+// The real-backbone FID: extracts the 2048-d Inception pooled feature for every
+// real and generated image, then returns the Frechet distance between the two
+// resulting Gaussians (reusing the mean/cov/matrix-sqrt math above). Both image
+// lists must hold network-ready volumes (see preprocessing note); both must
+// have >= 2 images so the per-set covariance is defined. FID(X, X) == 0.
+function ComputeInceptionFID(InceptionNet: TNNet; PoolFeatureIdx: integer;
+  RealImages, GenImages: TNNetVolumeList): Double;
 
 // --- Inception Score ---
 
@@ -209,6 +246,96 @@ function ComputeKIDMMD2(const FeaturesR, FeaturesG: TIMDoubleMatrix): Double;
 // of SubsetSize samples drawn (without replacement) from each set.
 procedure ComputeKID(const FeaturesR, FeaturesG: TIMDoubleMatrix;
   SubsetSize, NumSubsets: integer; out Score: Double; out StdDev: Double);
+
+// ---------------------------------------------------------------------------
+// ImageNet top-1 / top-5 accuracy harness (classifier IMPORT verification)
+// ---------------------------------------------------------------------------
+//
+// EvaluateImageNet / ImageNetReport are to the imported vision backbones what
+// EvaluateMMLU / MMLUReport (neuralnlpmetrics) are to the imported LLMs: an
+// end-to-end ACCURACY backstop. Each classifier importer's parity test only
+// compares raw logits on one or two tensors, which catches a transposed weight
+// but NOT a wrong preprocessing pipeline (resize / center-crop / normalize) or
+// a label permutation. Running a folder of labelled ImageNet-val images through
+// the real preprocessing transform and the real net, then checking top-1 /
+// top-5 against the published numbers, is the missing import-VERIFICATION.
+//
+// DESIGN. This core takes images that are ALREADY network-ready volumes (the
+// (ImageSize, ImageSize, 3) ImageNet-normalised tensor that
+// neuraldatasets.LoadImageForVisionModel / PreprocessImageForVisionModel
+// produce). The harness therefore depends only on neuralvolume / neuralnetwork
+// (NOT on the image codecs in neuraldatasets), exactly as EvaluateMMLU depends
+// only on the net and pre-tokenized prompts: the resize/crop/normalize transform
+// lives in the caller (the example wires neuraldatasets), and the test can inject
+// deterministic synthetic volumes through a stub net so the accuracy numbers are
+// pinned. The net's final layer must emit a class-score volume of length
+// NumClasses (logits or post-softmax probabilities - argmax / top-k is identical
+// either way). Label indices are the standard ImageNet class indices (0..999 for
+// the full set); GoldLabel outside 0..NumClasses-1 marks the sample skipped.
+//
+type
+  // One labelled, already-preprocessed evaluation image. Image is a
+  // network-ready normalised volume (see DESIGN above); GoldLabel is the true
+  // ImageNet class index. SourceName is an optional tag (e.g. the file name)
+  // carried through into the confusion sample for human-readable reports.
+  TNNetImageNetSample = record
+    Image: TNNetVolume;
+    GoldLabel: integer;
+    SourceName: string;
+  end;
+  TNNetImageNetSampleArray = array of TNNetImageNetSample;
+
+  // One misclassified item retained for the confusion sample in the report:
+  // the true label, the predicted top-1 label, and whether the gold label was
+  // anywhere in the top-K (a top-1 miss that is still a top-5 hit is the
+  // common, benign case and is flagged so the report can separate the two).
+  TNNetImageNetConfusion = record
+    SourceName: string;
+    GoldLabel: integer;
+    PredLabel: integer;   // top-1 prediction
+    InTopK: boolean;      // gold label within the top-K predictions
+  end;
+  TNNetImageNetConfusionArray = array of TNNetImageNetConfusion;
+
+  // Aggregate ImageNet accuracy result. Top1/Top5 are the headline fractions
+  // (Top1Correct/ItemCount, TopKCorrect/ItemCount); K is the K actually used
+  // for the top-K column (the requested K clipped to NumClasses).
+  TNNetImageNetStats = record
+    ItemCount: integer;
+    Top1Correct: integer;
+    TopKCorrect: integer;
+    Top1Accuracy: TNeuralFloat;
+    TopKAccuracy: TNeuralFloat;
+    K: integer;
+    NumClasses: integer;
+    Confusion: TNNetImageNetConfusionArray; // first MaxConfusion misses
+  end;
+
+// Returns, in Pred[0..K-1], the indices of the K largest values of Scores
+// (Scores[0..Count-1]), most-confident first, with a deterministic first-max
+// tie-break (a lower index wins an exact tie). K is clipped to Count. Public so
+// the test can pin the top-K selection independently of any net.
+procedure TopKIndices(const Scores: array of TNeuralFloat; Count, K: integer;
+  out Pred: array of integer);
+
+// The ImageNet accuracy harness. For every sample whose GoldLabel is a valid
+// class index, the net is Compute()d on the (already-preprocessed) image, the
+// final layer's NumClasses-length output is read, and the top-1 / top-K
+// predictions are formed (TopKIndices). Tallies top-1 (argmax == gold) and
+// top-K (gold anywhere in the top-K) accuracy. Up to MaxConfusion top-1 MISSES
+// are retained in Stats.Confusion for a human-readable confusion sample. K is
+// the top-K to score (5 is the ImageNet convention; clipped to NumClasses).
+function EvaluateImageNet(NN: TNNet;
+  const Samples: array of TNNetImageNetSample;
+  NumClasses: integer; K: integer = 5;
+  MaxConfusion: integer = 16): TNNetImageNetStats;
+
+// Formats a TNNetImageNetStats into a small multi-line report (the *Report
+// idiom). ClassNames, when supplied (length = NumClasses, or empty), labels the
+// confusion-sample rows; otherwise classes are printed as bare indices. Title
+// is the header line (e.g. "ResNet-50 ImageNet-val").
+function ImageNetReport(const Stats: TNNetImageNetStats;
+  const ClassNames: array of string; const Title: string = 'ImageNet'): string;
 
 implementation
 
@@ -549,6 +676,73 @@ begin
     MaxG := Length(FeaturesG) - 1;
     for i := 0 to MaxR do accR.Add(FeaturesR[i]);
     for i := 0 to MaxG do accG.Add(FeaturesG[i]);
+    Result := ComputeFIDFromAccumulators(accR, accG);
+  finally
+    accR.Free;
+    accG.Free;
+  end;
+end;
+
+{ FID over the real Inception backbone }
+
+function ExtractInceptionFeature(InceptionNet: TNNet;
+  PoolFeatureIdx: integer; ImageVolume: TNNetVolume): TIMDoubleArray;
+var
+  PoolOut: TNNetVolume;
+  i, dim: integer;
+begin
+  if InceptionNet = nil then
+    raise Exception.Create('ExtractInceptionFeature: nil net');
+  if (PoolFeatureIdx < 0) or (PoolFeatureIdx >= InceptionNet.CountLayers) then
+    raise Exception.CreateFmt(
+      'ExtractInceptionFeature: PoolFeatureIdx %d out of range', [PoolFeatureIdx]);
+  InceptionNet.Compute(ImageVolume);
+  PoolOut := InceptionNet.Layers[PoolFeatureIdx].Output;
+  dim := PoolOut.Size;
+  SetLength(Result, dim);
+  for i := 0 to dim - 1 do
+    Result[i] := PoolOut.FData[i];
+end;
+
+procedure AccumulateInceptionFeatures(InceptionNet: TNNet;
+  PoolFeatureIdx: integer; Images: TNNetVolumeList;
+  Acc: TFIDFeatureAccumulator);
+var
+  i, iMax: integer;
+  feat: TIMDoubleArray;
+begin
+  if Images = nil then
+    raise Exception.Create('AccumulateInceptionFeatures: nil image list');
+  iMax := Images.Count - 1;
+  for i := 0 to iMax do
+  begin
+    feat := ExtractInceptionFeature(InceptionNet, PoolFeatureIdx, Images[i]);
+    Acc.Add(feat);
+  end;
+end;
+
+function ComputeInceptionFID(InceptionNet: TNNet; PoolFeatureIdx: integer;
+  RealImages, GenImages: TNNetVolumeList): Double;
+var
+  accR, accG: TFIDFeatureAccumulator;
+  dim: integer;
+begin
+  if (RealImages = nil) or (GenImages = nil) then
+    raise Exception.Create('ComputeInceptionFID: nil image list');
+  if (RealImages.Count < 2) or (GenImages.Count < 2) then
+    raise Exception.Create(
+      'ComputeInceptionFID: each image set needs at least 2 images');
+  if (PoolFeatureIdx < 0) or (PoolFeatureIdx >= InceptionNet.CountLayers) then
+    raise Exception.CreateFmt(
+      'ComputeInceptionFID: PoolFeatureIdx %d out of range', [PoolFeatureIdx]);
+  // One forward pass primes the net so the pooled width is known.
+  InceptionNet.Compute(RealImages[0]);
+  dim := InceptionNet.Layers[PoolFeatureIdx].Output.Size;
+  accR := TFIDFeatureAccumulator.Create(dim);
+  accG := TFIDFeatureAccumulator.Create(dim);
+  try
+    AccumulateInceptionFeatures(InceptionNet, PoolFeatureIdx, RealImages, accR);
+    AccumulateInceptionFeatures(InceptionNet, PoolFeatureIdx, GenImages, accG);
     Result := ComputeFIDFromAccumulators(accR, accG);
   finally
     accR.Free;
@@ -1155,5 +1349,191 @@ begin
   else
     StdDev := 0;
 end;
+
+{ ImageNet top-1 / top-5 accuracy harness }
+
+procedure TopKIndices(const Scores: array of TNeuralFloat; Count, K: integer;
+  out Pred: array of integer);
+var
+  used: array of boolean;
+  rank, i, best, CountM1, KM1: integer;
+  bestVal: TNeuralFloat;
+begin
+  if Count > Length(Scores) then Count := Length(Scores);
+  if K > Count then K := Count;
+  if K < 0 then K := 0;
+  if K = 0 then Exit;
+  SetLength(used, Count);
+  CountM1 := Count - 1;
+  for i := 0 to CountM1 do used[i] := False;
+  KM1 := K - 1;
+  for rank := 0 to KM1 do
+  begin
+    best := -1;
+    bestVal := 0;
+    // First-max tie-break: scan ascending, take a STRICTLY greater value, so
+    // the lowest index wins an exact tie (matches argmax / GetClass).
+    for i := 0 to CountM1 do
+      if not used[i] then
+        if (best < 0) or (Scores[i] > bestVal) then
+        begin
+          bestVal := Scores[i];
+          best := i;
+        end;
+    used[best] := True;
+    Pred[rank] := best;
+  end;
+end;
+
+function EvaluateImageNet(NN: TNNet;
+  const Samples: array of TNNetImageNetSample;
+  NumClasses: integer; K: integer;
+  MaxConfusion: integer): TNNetImageNetStats;
+var
+  SamplesHi, SIdx, rank, KM1, ConfCnt: integer;
+  Gold, Top1: integer;
+  OutVol: TNNetVolume;
+  Pred: array of integer;
+  Scores: array of TNeuralFloat;
+  HitTopK: boolean;
+begin
+  Result.ItemCount := 0;
+  Result.Top1Correct := 0;
+  Result.TopKCorrect := 0;
+  Result.Top1Accuracy := 0;
+  Result.TopKAccuracy := 0;
+  Result.NumClasses := NumClasses;
+  SetLength(Result.Confusion, 0);
+  if NumClasses <= 0 then
+    raise Exception.Create('EvaluateImageNet: NumClasses must be > 0');
+  if K < 1 then K := 1;
+  if K > NumClasses then K := NumClasses;
+  Result.K := K;
+  if MaxConfusion < 0 then MaxConfusion := 0;
+  if NN = nil then Exit;
+
+  KM1 := K - 1;
+  SetLength(Pred, K);
+  SetLength(Scores, NumClasses);
+  ConfCnt := 0;
+  SamplesHi := High(Samples);
+  for SIdx := 0 to SamplesHi do
+  begin
+    Gold := Samples[SIdx].GoldLabel;
+    if (Gold < 0) or (Gold >= NumClasses) then continue;
+    if Samples[SIdx].Image = nil then continue;
+    NN.Compute(Samples[SIdx].Image);
+    OutVol := NN.GetLastLayer().Output;
+    if OutVol.Size < NumClasses then
+      raise Exception.CreateFmt(
+        'EvaluateImageNet: net output size %d < NumClasses %d',
+        [OutVol.Size, NumClasses]);
+    // Copy the first NumClasses scores (logits or probs - argmax is identical).
+    for rank := 0 to NumClasses - 1 do
+      Scores[rank] := OutVol.FData[rank];
+    TopKIndices(Scores, NumClasses, K, Pred);
+
+    Top1 := Pred[0];
+    HitTopK := False;
+    for rank := 0 to KM1 do
+      if Pred[rank] = Gold then
+      begin
+        HitTopK := True;
+        Break;
+      end;
+
+    Inc(Result.ItemCount);
+    if Top1 = Gold then Inc(Result.Top1Correct);
+    if HitTopK then Inc(Result.TopKCorrect);
+
+    // Retain top-1 misses for the confusion sample.
+    if (Top1 <> Gold) and (ConfCnt < MaxConfusion) then
+    begin
+      SetLength(Result.Confusion, ConfCnt + 1);
+      Result.Confusion[ConfCnt].SourceName := Samples[SIdx].SourceName;
+      Result.Confusion[ConfCnt].GoldLabel := Gold;
+      Result.Confusion[ConfCnt].PredLabel := Top1;
+      Result.Confusion[ConfCnt].InTopK := HitTopK;
+      Inc(ConfCnt);
+    end;
+  end;
+
+  if Result.ItemCount > 0 then
+  begin
+    Result.Top1Accuracy := Result.Top1Correct / Result.ItemCount;
+    Result.TopKAccuracy := Result.TopKCorrect / Result.ItemCount;
+  end;
+end;
+
+function ImageNetReport(const Stats: TNNetImageNetStats;
+  const ClassNames: array of string; const Title: string): string;
+var
+  SL: TStringList;
+  i, ConfHi: integer;
+
+  function LabelName(Idx: integer): string;
+  begin
+    if (Idx >= 0) and (Idx <= High(ClassNames)) then
+      Result := Format('%d (%s)', [Idx, ClassNames[Idx]])
+    else
+      Result := IntToStr(Idx);
+  end;
+
+begin
+  SL := TStringList.Create();
+  try
+    SL.Add(Format('%s top-1 / top-%d accuracy', [Title, Stats.K]));
+    SL.Add(Format('  images scored : %d', [Stats.ItemCount]));
+    SL.Add(Format('  classes       : %d', [Stats.NumClasses]));
+    SL.Add(Format('  top-1         : %.4f  (%d / %d)',
+      [Stats.Top1Accuracy, Stats.Top1Correct, Stats.ItemCount]));
+    SL.Add(Format('  top-%-9d : %.4f  (%d / %d)',
+      [Stats.K, Stats.TopKAccuracy, Stats.TopKCorrect, Stats.ItemCount]));
+    ConfHi := High(Stats.Confusion);
+    if ConfHi >= 0 then
+    begin
+      SL.Add(Format('  confusion sample (%d top-1 miss(es)):', [ConfHi + 1]));
+      for i := 0 to ConfHi do
+        SL.Add(Format('    %-24s gold %-20s pred %-20s %s',
+          [Stats.Confusion[i].SourceName,
+           LabelName(Stats.Confusion[i].GoldLabel),
+           LabelName(Stats.Confusion[i].PredLabel),
+           BoolToStr(Stats.Confusion[i].InTopK, 'top-K hit', 'top-K miss')]));
+    end;
+    Result := SL.Text;
+  finally
+    SL.Free;
+  end;
+end;
+
+// Adapter wiring ComputeSSIMLossAndGradient (which takes TIMDoubleArray) into
+// the open-array NeuralSSIMLossGradientHook that neuralnetwork.TNNetSSIMLoss
+// calls. The open-array params are copied into local TIMDoubleArray buffers and
+// the computed gradient copied back out. Assigned at unit init below so any
+// program that 'uses neuralimagemetrics' enables the SSIM loss head.
+// Coded by Claude (AI).
+function SSIMLossGradientHookAdapter(const ImgA, ImgB: array of Double;
+  H, W, Channels: integer; out GradA: array of Double; DataRange: Double): Double;
+var
+  A, B, G: TIMDoubleArray;
+  i, n, nM1: integer;
+begin
+  n := Length(ImgA);
+  SetLength(A, n);
+  SetLength(B, n);
+  nM1 := n - 1;
+  for i := 0 to nM1 do
+  begin
+    A[i] := ImgA[i];
+    B[i] := ImgB[i];
+  end;
+  Result := ComputeSSIMLossAndGradient(A, B, H, W, Channels, G, DataRange);
+  nM1 := Length(G) - 1;
+  for i := 0 to nM1 do
+    GradA[i] := G[i];
+end;
+
+initialization
+  NeuralSSIMLossGradientHook := @SSIMLossGradientHookAdapter;
 
 end.

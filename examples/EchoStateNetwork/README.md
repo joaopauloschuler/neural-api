@@ -16,16 +16,30 @@ h_t = (1 - a) * h_{t-1} + a * tanh(W_in * x_t + W * h_{t-1})
 ```
 
 - `a` is the leak rate.
-- `W_in` is a random input vector.
+- `W_in` is a random input matrix.
 - `W` is a sparse random `N x N` matrix **rescaled to a chosen spectral radius
   `rho < 1`**. That `rho < 1` condition is the **echo-state property**: the
   reservoir asymptotically forgets its initial state, so the same input drives
   it to the same state regardless of where it started. That is what makes a
   *fixed random* recurrence usable as a feature generator.
 
+### The reusable reservoir layer
+
+The recurrent core is the reusable
+[`TNNetEchoStateReservoir`](../../neural/neuralnetwork.pas) layer — a
+shape-`(SeqLen,1,1)` → `(SeqLen,1,N)` sequence map. The layer **owns** the two
+frozen matrices `W_in` and `W`, owns the leak rate `a`, runs the leaky-integrator
+recurrence above over the whole driving sequence in one `Compute`, and does the
+one-shot spectral-radius rescale of `W` at build time. The matrices are
+**non-trainable** (regenerated deterministically from a seed, so they round-trip
+through serialization for free) and are never touched by a gradient; only a
+linear read-out **downstream** is ever trained. The example wraps the layer in a
+one-layer `Input(1) → TNNetEchoStateReservoir(N)` net and reads each output
+column `h_t` as a reservoir state.
+
 ### Spectral-radius rescaling
 
-We reuse the library's power-iteration helper
+At build time the layer reuses the library's power-iteration helper
 [`TNNet.EstimateSpectralRadius`](../../neural/neuralnetwork.pas) to **measure**
 the scale of `W` instead of running a full eigensolver. Unlike its sibling
 `TNNet.EstimateSpectralNorm` — which estimates the spectral **norm** (largest
@@ -33,22 +47,19 @@ singular value `sigma_1`) by alternating `W*v` and `W^T*u` steps —
 `EstimateSpectralRadius` iterates **only** `v := W*v / ‖W*v‖` (no transpose
 step) and returns the Rayleigh-flavoured ratio `rho ≈ ‖W*v‖` at convergence,
 i.e. the true spectral **radius** `|lambda|_max` that actually governs the
-echo-state property. Because `rho <= sigma_1` for a non-symmetric `W`, scaling
-`W := W * (rho_target / rho)` targets the radius **directly and exactly** — so
-`rho_target < 1` can be set straight (here `0.9`), with none of the
-under-scaling the conservative `sigma_1` upper bound would impose. The example
-also prints `sigma_1` alongside `rho` to show `rho <= sigma_1` on the raw `W`.
-See the comments in `EchoStateNetwork.lpr`.
+echo-state property. The layer then scales `W := W * (rho_target / rho)`, which
+targets the radius **directly and exactly** — so `rho_target < 1` can be set
+straight (here `0.9`). The example prints the measured raw radius via the layer's
+`MeasuredRho` property.
 
 ### Pipeline
 
-1. Build `W_in` and a sparse `W` as plain Pascal arrays (hand-rolled
-   recurrence — never touched by a gradient).
-2. Rescale `W` to the target spectral radius using `EstimateSpectralRadius`.
-3. Run the reservoir **forward** (no gradient) over a training sequence and
-   collect each state `h_t` into a `TNNetVolumePair` (input = `h_t`,
+1. Build an `Input(1) → TNNetEchoStateReservoir(N)` net; the layer builds and
+   spectral-rescales its own `W_in` and `W` (never touched by a gradient).
+2. Run the reservoir **forward** (no gradient) over a training sequence and
+   collect each output state `h_t` into a `TNNetVolumePair` (input = `h_t`,
    target = `x_{t+1}`).
-4. Train **only** a `TNNetFullConnectLinear(1)` readout on those collected
+3. Train **only** a `TNNetFullConnectLinear(1)` readout on those collected
    pairs. Two arms are trained and compared on the **same** reservoir, **same**
    collected states and **same** error metric:
    - an iterative, LR-sensitive **SGD** loop (a tiny L2-regularised linear fit);
@@ -68,11 +79,11 @@ matrix `Y` (one column, `x_{t+1}`). The ridge readout minimises
 ```
 
 The example forms `A` (size `(N+1)×(N+1)`) and `B` (`(N+1)×1`) and solves the
-small dense system directly. `neuralvolume.pas` exposes **no** matrix
-solve/inverse/Cholesky helper (verified by grepping for `Solve`/`Inverse`/
-`Cholesky`/`Gauss`), so the example **hand-rolls** a `GaussJordanSolve` routine
-— Gauss-Jordan elimination with partial pivoting — clearly commented and exact
-for this reservoir size. The solved `Wout` is then packed back into the **same**
+small dense system directly via the shared library routine
+`NeuralLinearSolve` in `neuralvolume.pas` — Gauss-Jordan elimination with
+partial pivoting — the single reusable dense solver also used by the library's
+closed-form least-squares head, exact for this reservoir size. The solved
+`Wout` is then packed back into the **same**
 `Input(N)→FullConnectLinear(1)` net shape as the SGD arm (reservoir weights into
 the neuron's `Weights`, the intercept into its `BiasWeight`), so both arms are
 evaluated by identical code. No learning rate, no epochs, no shuffling — it is a
@@ -142,47 +153,46 @@ are covered by `examples/.gitignore` and the root `.gitignore`.
 ```
 Echo State Network (Reservoir Computing, Jaeger 2001)
 Reservoir N=100  leak=0.30  sparsity=0.10  target rho=0.90
+Recurrent core: reusable TNNetEchoStateReservoir layer.
 Task: one-step prediction of sin(0.2 t) + 0.3 sin(0.31 t).
 ================================================================
 
 [1] Building reservoir at rho=0.90 ...
-    measured raw W: spectral RADIUS rho = 1.7471   spectral NORM sigma_1 = 3.6757  (rho <= sigma_1)
-    -> W rescaled so its true spectral radius = 0.90
+    measured raw W: spectral RADIUS rho = 2.0081
+    -> W rescaled by the layer so its true spectral radius = 0.90
     training the linear readout (600 epochs)...
-    teacher-forced one-step NRMSE = 0.0214
+    teacher-forced one-step NRMSE = 0.0189
     persistence baseline   NRMSE = 0.2136
-    free-run (autonomous)  NRMSE = 0.0793
+    free-run (autonomous)  NRMSE = 0.0948
 
 Free-run waveform   ( . = true   o = predicted   * = overlap ):
   step |---------------------------------------------------|
      0 |                                        *          |
-     3 |                             o.                    |
-     6 |                   o .                             |
     ...
 
 ----------------------------------------------------------------
 [1b] Closed-form RIDGE readout  Wout = (S^T S + lambda I)^-1 S^T Y
      one-shot solve (no LR, no epochs); lambda regularisation sweep:
        lambda     teacher-NRMSE   free-run-NRMSE
-       0.0E+000         0.0037         9.0620
-       1.0E-006         0.0038         5.7713
-       1.0E-004         0.0368         5.4790
-       1.0E-002         0.0064         0.0583
+       0.0E+000         0.0020         6.4692
+       1.0E-006         0.0015         0.4024
+       1.0E-004         0.0336        12.2650
+       1.0E-002         0.0071         0.0492
 
      SGD-vs-ridge headline (same reservoir, same task):
-       SGD readout   (600 epochs, LR=0.02): teacher 0.0214  free-run 0.0793
-       ridge readout (one-shot, lambda=1.0E-002):  teacher 0.0064  free-run 0.0583
+       SGD readout   (600 epochs, LR=0.02): teacher 0.0189  free-run 0.0948
+       ridge readout (one-shot, lambda=1.0E-002):  teacher 0.0071  free-run 0.0492
 
 ================================================================
 [2] ABLATION - rebuilding reservoir at rho=1.80 (> 1, echo-state property BROKEN)
-    measured raw W: spectral RADIUS rho = 1.9087   spectral NORM sigma_1 = 3.9124
+    measured raw W: spectral RADIUS rho = 2.0081
     free-run (autonomous)  NRMSE = Nan  (expected to explode)
 
 ================================================================
 Correctness checks:
-  PASS  teacher-forced NRMSE 0.0214 < 0.5 x persistence 0.2136
-  PASS  rho<1 free-run NRMSE 0.0793 < 0.5
-  PASS  rho>1 free-run NRMSE Nan explodes vs rho<1 0.0793
+  PASS  teacher-forced NRMSE 0.0189 < 0.5 x persistence 0.2136
+  PASS  rho<1 free-run NRMSE 0.0948 < 0.5
+  PASS  rho>1 free-run NRMSE Nan explodes vs rho<1 0.0948
 ================================================================
 ALL CHECKS PASSED
 ```

@@ -1,0 +1,28 @@
+{
+ "_class_name": "UNet2DConditionModel",
+ "in_channels": 4,
+ "out_channels": 4,
+ "block_out_channels": [
+  8,
+  16
+ ],
+ "down_block_types": [
+  "CrossAttnDownBlock2D",
+  "DownBlock2D"
+ ],
+ "up_block_types": [
+  "UpBlock2D",
+  "CrossAttnUpBlock2D"
+ ],
+ "layers_per_block": 1,
+ "cross_attention_dim": 12,
+ "attention_head_dim": 4,
+ "norm_num_groups": 4,
+ "flip_sin_to_cos": true,
+ "freq_shift": 0,
+ "latent_size": 8,
+ "text_seq_len": 5,
+ "addition_embed_type": "text_time",
+ "addition_time_embed_dim": 8,
+ "projection_class_embeddings_input_dim": 60
+}

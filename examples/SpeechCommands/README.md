@@ -37,13 +37,26 @@ Model (`BuildModel`):
 ## Default: synthetic smoke (no network, reproducible)
 
 Run with no arguments and it generates a deterministic synthetic keyword set
-(fixed `RandSeed = 1234`) of six distinct acoustic "words" -- low/mid/high
-pure tones, an up-chirp, a down-chirp, and band-limited noise -- each with a
-touch of seeded jitter and additive noise so the classes are non-trivial but
-clearly separable. **Every clip passes through the real `ComputeWhisperLogMel`**,
-so the smoke exercises the exact frontend+training path end to end on CPU in
-well under a minute, and reports a final test accuracy far above the 1/6
-(~16.7%) chance line.
+(fixed `RandSeed = 1234`) of **ten genuinely confusable acoustic "words"**
+chosen so the task is *not* trivially separable:
+
+| class | content |
+| --- | --- |
+| `tone_430` / `tone_470` / `tone_510` | closely-spaced pure tones (~9% apart) |
+| `chord_lo` / `chord_hi` | two-tone chords that **overlap** one pure tone (430 / 510 Hz) |
+| `am_tone` | 7-9 Hz amplitude-modulated (tremolo) tone at 470 Hz |
+| `chirp_up` / `chirp_down` | fast 350↔2600 Hz linear sweeps |
+| `noise_bright` / `noise_dark` | colored noise differing only in spectral tilt |
+
+Each clip carries seeded pitch jitter and a comparatively **low SNR**
+(`noiseAmp ≈ 0.18`), so the classes overlap in mel space.
+**Every clip passes through the real `ComputeWhisperLogMel`.** Because the
+task is hard, validation now climbs gradually rather than saturating at
+epoch 2 -- roughly 0.30 (epoch 1) → 0.65 (6) → 0.91 (10) → 0.99 (16),
+hitting the 100% `TargetAccuracy` early-stop at **epoch 17** -- and the smoke finishes at
+**≈99% held-out test accuracy** (observed 98.93%, `RandSeed = 1234`), far
+above the 1/10 = 10% chance line. The whole run is well under a minute on
+CPU within the 3 GB / 280 s budget.
 
 ```bash
 cd examples/SpeechCommands
@@ -61,10 +74,11 @@ fpc -B -Fu../../neural -Fu"$LAZUTILS_PATH" -Mobjfpc -Sh -O2 SpeechCommands.lpr
 
 `<dir>` must contain one subfolder per label, each holding 16 kHz mono 16-bit
 PCM `.wav` clips (`<dir>/yes/*.wav`, `<dir>/no/*.wav`, ...). Clips are loaded
-with `LoadWav16ToVolume` and featurized through the same frontend; the example
-does a seeded 80/10/10 split and trains for 30 epochs. There is no resampler
-in this v1, so non-16 kHz files raise an exception -- convert first
-(`ffmpeg -ar 16000 -ac 1`).
+with `LoadWavResampledToVolume` (which resamples any sample rate to 16 kHz via
+the windowed-sinc resampler in `neural/neuralaudio.pas`; a 16 kHz file passes
+through bit-identically) and featurized through the same frontend; the example
+does a seeded 80/10/10 split and trains for 30 epochs. WAVs at other rates are
+accepted directly -- no `ffmpeg` pre-conversion needed.
 
 A tiny downloader that fetches a few keyword folders and re-encodes them is
 provided (NOT run by the smoke -- the full archive is ~2.3 GB):

@@ -73,7 +73,27 @@ type
   // Reverse-process update family.
   //   smEulerAncestral : deterministic Euler drift in sigma-space + per-step
   //     ancestral Gaussian noise injection (Karras et al. 2022 "Euler a").
-  TNNetSamplerMethod = (smDDPM, smDDIM, smDPMSolverPP2M, smEulerAncestral);
+  //   smUniPC : UniPC (UniPCMultistepScheduler, Zhao et al. 2023,
+  //     arXiv:2302.04867). A unified PREDICTOR-CORRECTOR ODE solver of order
+  //     B(h). Unlike the DPM-Solver++(2M) predictor it REUSES the previous
+  //     step's model output a SECOND time as a free corrector before the
+  //     predictor, giving noticeably better quality at very low step counts
+  //     (5-10). This implements the order-2 bh2 variant (predict_x0=True,
+  //     thresholding=False, lower_order_final=True). Shares the same
+  //     lambda/sigma/alpha schedule plumbing and prev-output history that
+  //     DPM-Solver++(2M) keeps, plus the previous sample for the corrector.
+  //   smHeun : Heun 2nd-order deterministic sampler (k-diffusion sample_heun /
+  //     Karras et al. 2022 EDM "Algorithm 2"). A genuine intra-step
+  //     predictor-corrector in sigma-space costing TWO denoiser evals per step:
+  //     an Euler predict from sigma_t to sigma_{t-1}, a SECOND denoiser eval at
+  //     the predicted point, then the trapezoidal average of the two drifts.
+  //     Unlike the MULTISTEP DPM-Solver++(2M)/UniPC (which reuse the PREVIOUS
+  //     step's stored output, 1 eval/step), Heun re-runs the model inside the
+  //     step, so the Sample() driver calls Denoise TWICE per step and SKIPS the
+  //     corrector on the final step (sigma_{t-1} = 0), matching k-diffusion's
+  //     `if sigmas[i+1] == 0` branch. Pairs naturally with tsKarras spacing.
+  TNNetSamplerMethod = (smDDPM, smDDIM, smDPMSolverPP2M, smEulerAncestral,
+    smUniPC, smHeun);
 
   // Timestep SPACING for the Sample() driver.
   //   tsUniform : evenly strided timesteps in 1..T (the original behaviour).
@@ -104,6 +124,20 @@ type
     FHasPrev: boolean;
     FPrevX0: TNNetVolume;
     FPrevLambda: TNeuralFloat;
+    // UniPC predictor-corrector extra state. FUniPrevT is the integer timestep
+    // of the previous step (s0 of the corrector), FUniPrevSample is that step's
+    // (corrected) output sample x_{s0}, FUniLowerOrderNums counts how many
+    // model outputs have accumulated (caps the per-step order during warm-up),
+    // and FUniThisOrder is the order the PREVIOUS predictor used (= the order
+    // the current corrector must use, matching diffusers' self.this_order).
+    FUniThisOrder: integer;
+    FUniLowerOrderNums: integer;
+    FUniPrevSample: TNNetVolume;
+    // Two-deep UniPC model-output history (x0 predictions + their timesteps),
+    // newest at index 1. FUniHistLen counts valid entries (0..2).
+    FUniHistX0: array[0..1] of TNNetVolume;
+    FUniHistT: array[0..1] of integer;
+    FUniHistLen: integer;
     procedure BuildTables(Beta1, BetaT, CosineS: TNeuralFloat);
     function GetBeta(Tt: integer): TNeuralFloat;
     function GetAlpha(Tt: integer): TNeuralFloat;
@@ -120,6 +154,11 @@ type
     // image) using the requested spacing. Caller-owned dynamic array.
     function BuildTimestepSchedule(NumSteps: integer;
       Spacing: TNNetTimestepSpacing): TNeuralIntegerArray;
+    // Heun 2nd-order trajectory (smHeun). Separated from Sample() because it is
+    // the only method that calls Denoise TWICE per step (a genuine intra-step
+    // second derivative), so it cannot share the single-eval Step() dispatch.
+    procedure SampleHeun(X: TNNetVolume; Denoise: TNNetDenoiseCallback;
+      NumSteps: integer; Spacing: TNNetTimestepSpacing);
   protected
     // Convert a raw model prediction (eps or v) at timestep Tt into eps.
     procedure ToEps(Xt, RawPred, EpsOut: TNNetVolume; Tt: integer);
@@ -155,7 +194,15 @@ type
     //   Dst := EpsUncond + W*(EpsCond - EpsUncond).
     // Dst may alias EpsCond or EpsUncond.
     class procedure ApplyCFG(EpsCond, EpsUncond, Dst: TNNetVolume;
-      W: TNeuralFloat);
+      W: TNeuralFloat); overload;
+    // Same CFG mix, then the guidance-rescale of Lin et al. 2023 ("Common
+    // Diffusion Noise Schedules and Sample Steps Are Flawed"), i.e. diffusers'
+    // rescale_noise_cfg. Let cfg := EpsUncond + W*(EpsCond - EpsUncond); rescale
+    // it by std(EpsCond)/std(cfg) and blend back: Dst := GuidanceRescale*rescaled
+    // + (1-GuidanceRescale)*cfg. GuidanceRescale=0 reproduces the plain CFG mix
+    // exactly. std is the population std over the whole volume.
+    class procedure ApplyCFG(EpsCond, EpsUncond, Dst: TNNetVolume;
+      W, GuidanceRescale: TNeuralFloat); overload;
 
     // Reset the DPM-Solver++ multistep history. Call before each new trajectory.
     procedure ResetMultistep;
@@ -172,6 +219,18 @@ type
 
     // Per-timestep noise level sigma_t = sqrt((1-ab_t)/ab_t) (Karras VE form).
     property SigmaAt[Tt: integer]: TNeuralFloat read SigmaOf;
+
+    // Min-SNR-gamma per-timestep LOSS weight (Hang et al. 2023, "Efficient
+    // Diffusion Training via Min-SNR Weighting Strategy"; diffusers snr_gamma).
+    // SNR(t) = exp(2*Lambda(t)) = ab_t/(1-ab_t). The clamp min(SNR, Gamma)
+    // down-weights the easy low-noise (high-SNR) timesteps. The denominator
+    // depends on the scheduler's PredictionType (the model's target):
+    //   eps-prediction : weight = min(SNR, Gamma) / SNR,
+    //   v-prediction   : weight = min(SNR, Gamma) / (SNR + 1).
+    // Gamma = 5.0 is the paper default; Gamma = +Inf reproduces the unweighted
+    // objective (weight = 1 for eps, SNR/(SNR+1) for v -- the standard v-loss
+    // reweighting, which is exactly diffusers' base case).
+    function SNRWeight(Tt: integer; Gamma: TNeuralFloat = 5.0): TNeuralFloat;
 
     // High-level driver: run a complete reverse trajectory in place on X
     // (which should start as N(0,I) noise) over NumSteps evenly-strided
@@ -238,12 +297,21 @@ begin
   SetLength(FSqrtOneMinusAlphaBar, FT + 1);
   BuildTables(Beta1, BetaT, CosineS);
   FPrevX0 := nil;
+  FUniPrevSample := nil;
+  FUniHistX0[0] := nil;
+  FUniHistX0[1] := nil;
   FHasPrev := false;
+  FUniThisOrder := 1;
+  FUniLowerOrderNums := 0;
+  FUniHistLen := 0;
 end;
 
 destructor TNNetDiffusionScheduler.Destroy;
 begin
   if Assigned(FPrevX0) then FPrevX0.Free;
+  if Assigned(FUniPrevSample) then FUniPrevSample.Free;
+  if Assigned(FUniHistX0[0]) then FUniHistX0[0].Free;
+  if Assigned(FUniHistX0[1]) then FUniHistX0[1].Free;
   inherited Destroy;
 end;
 
@@ -339,6 +407,25 @@ begin
   ab := FAlphaBar[Tt];
   if ab >= 1.0 then Result := 0
   else Result := Sqrt((1.0 - ab) / ab);
+end;
+
+function TNNetDiffusionScheduler.SNRWeight(Tt: integer;
+  Gamma: TNeuralFloat): TNeuralFloat;
+var
+  snr, clamped: double;
+begin
+  // SNR(t) = exp(2*Lambda(t)) (Lambda is the half-log-SNR the DPM-Solver uses).
+  snr := Exp(2.0 * Lambda(Tt));
+  // min(SNR, Gamma); Gamma = +Inf leaves the clamp inactive (clamped = snr).
+  if snr < Gamma then clamped := snr else clamped := Gamma;
+  case FPrediction of
+    dpV:
+      // v-prediction: divide by (SNR + 1). Gamma = +Inf -> SNR/(SNR+1).
+      Result := clamped / (snr + 1.0);
+    else // dpEps
+      // eps-prediction: divide by SNR. Gamma = +Inf -> 1.
+      Result := clamped / snr;
+  end;
 end;
 
 function TNNetDiffusionScheduler.SigmaToTimestep(TargetSigma: TNeuralFloat): integer;
@@ -477,9 +564,34 @@ begin
       W * (EpsCond.FData[i] - EpsUncond.FData[i]);
 end;
 
+class procedure TNNetDiffusionScheduler.ApplyCFG(EpsCond, EpsUncond,
+  Dst: TNNetVolume; W, GuidanceRescale: TNeuralFloat);
+var
+  i, DstSizeM1: integer;
+  stdCond, stdCfg, factor: TNeuralFloat;
+begin
+  // Plain CFG mix first (also fills Dst when GuidanceRescale = 0).
+  ApplyCFG(EpsCond, EpsUncond, Dst, W);
+  if GuidanceRescale = 0 then exit;
+
+  // Rescale the over-saturated CFG result toward the conditional's std, then
+  // blend back by GuidanceRescale (diffusers rescale_noise_cfg, Lin et al. 2023).
+  stdCond := EpsCond.GetStdDeviation();
+  stdCfg  := Dst.GetStdDeviation();
+  if stdCfg = 0 then exit;
+  factor := stdCond / stdCfg;
+  DstSizeM1 := Dst.Size - 1;
+  for i := 0 to DstSizeM1 do
+    Dst.FData[i] := GuidanceRescale * (Dst.FData[i] * factor) +
+      (1 - GuidanceRescale) * Dst.FData[i];
+end;
+
 procedure TNNetDiffusionScheduler.ResetMultistep;
 begin
   FHasPrev := false;
+  FUniThisOrder := 1;
+  FUniLowerOrderNums := 0;
+  FUniHistLen := 0;
 end;
 
 procedure TNNetDiffusionScheduler.Step(Xt, RawPred: TNNetVolume;
@@ -493,6 +605,10 @@ var
   // DPM-Solver++ locals.
   lamT, lamPrev, h, hLast, r0: TNeuralFloat;
   curX0, dCoef: TNeuralFloat;
+  // UniPC locals (order-2 bh2, predict_x0).
+  alphaT, sigmaTuni, sigmaS0, hh, hphi1, Bh, rk, rhoC0, rhoC1: TNeuralFloat;
+  detR, sigRatio, m0v, mtv, D1: TNeuralFloat;
+  cOrder, pOrder: integer;
 begin
   Eps := TNNetVolume.Create(Xt);
   try
@@ -646,9 +762,230 @@ begin
           FPrevLambda := lamT;
           FHasPrev := true;
         end;
+      smUniPC:
+        begin
+          // UniPC order-2 bh2 predictor-corrector (Zhao et al. 2023), data
+          // (x0) prediction form, mirroring diffusers UniPCMultistepScheduler
+          // (multistep_uni_c_bh_update then multistep_uni_p_bh_update).
+          //   alpha_t = sqrt(ab_t), sigma_t = sqrt(1-ab_t),
+          //   lambda_t = log(alpha_t/sigma_t) (= Lambda()), increases as Tt falls.
+          //   h  = lambda_target - lambda_current,  hh = -h (predict_x0),
+          //   h_phi_1 = expm1(hh),  B_h = expm1(hh) (bh2).
+          // 1. Convert current eps -> current x0 prediction m_t (reuse Eps).
+          abT := FAlphaBar[Tt];
+          for i := 0 to XtSizeM1 do
+            Eps.FData[i] := (Xt.FData[i] - FSqrtOneMinusAlphaBar[Tt] * Eps.FData[i]) / Sqrt(abT);
+          lamT := Lambda(Tt);
+
+          // 2. CORRECTOR: uses the PREVIOUS step's stored output (m0 = the
+          //    newest history entry FUniHistX0[FUniHistLen-1] at FUniHistT),
+          //    the previous (corrected) sample FUniPrevSample = x_{s0}, and
+          //    m_t (this step's x0). Order = FUniThisOrder (the order the
+          //    previous predictor used). Runs from step 1 onward. The model is
+          //    NOT re-run; m_t (Eps) is left unchanged for the history push.
+          if FHasPrev then
+          begin
+            sigmaTuni := FSqrtOneMinusAlphaBar[Tt];        // sigma at this Tt
+            alphaT := Sqrt(abT);                           // alpha at this Tt
+            lamPrev := Lambda(FUniHistT[FUniHistLen - 1]); // lambda at s0
+            sigmaS0 := FSqrtOneMinusAlphaBar[FUniHistT[FUniHistLen - 1]];
+            h := lamT - lamPrev;
+            hh := -h;
+            hphi1 := Exp(hh) - 1.0;
+            Bh := hphi1;                                   // bh2
+            sigRatio := sigmaTuni / sigmaS0;
+            cOrder := FUniThisOrder;
+            if cOrder >= 2 then
+            begin
+              // rk for the second history point (FUniHistX0[FUniHistLen-2] at
+              // FUniHistT[FUniHistLen-2]); D1 = (m1 - m0)/rk.
+              rk := (Lambda(FUniHistT[FUniHistLen - 2]) - lamPrev) / h;
+              // Solve the 2x2 system R*rhos = b for the corrector weights.
+              //   R = [[1, 1],[rk, 1]], b = [hphi1/hh - 1, ...]/Bh-scaled terms.
+              //   b1 = (hphi1/hh - 1)/Bh,
+              //   b2 = ((hphi1/hh - 1)/hh - 1/2)*2/Bh.
+              rhoC0 := (hphi1 / hh - 1.0) / Bh;                       // b1
+              rhoC1 := ((hphi1 / hh - 1.0) / hh - 0.5) * 2.0 / Bh;    // b2
+              detR := 1.0 - rk;   // det([[1,1],[rk,1]]) = 1 - rk
+              // rhos = R^{-1} b ; R^{-1} = 1/detR * [[1,-1],[-rk,1]].
+              curX0 := (rhoC0 - rhoC1) / detR;        // rhos_c[0]
+              dCoef := (-rk * rhoC0 + rhoC1) / detR;  // rhos_c[1] (multiplies D1_t)
+              for i := 0 to XtSizeM1 do
+              begin
+                m0v := FUniHistX0[FUniHistLen - 1].FData[i];
+                mtv := Eps.FData[i];
+                D1 := (FUniHistX0[FUniHistLen - 2].FData[i] - m0v) / rk;
+                Xt.FData[i] := sigRatio * FUniPrevSample.FData[i]
+                  - alphaT * hphi1 * m0v
+                  - alphaT * Bh * (curX0 * D1 + dCoef * (mtv - m0v));
+              end;
+            end
+            else
+            begin
+              // First-order corrector: rhos_c = [0.5].
+              for i := 0 to XtSizeM1 do
+              begin
+                m0v := FUniHistX0[FUniHistLen - 1].FData[i];
+                mtv := Eps.FData[i];
+                Xt.FData[i] := sigRatio * FUniPrevSample.FData[i]
+                  - alphaT * hphi1 * m0v
+                  - alphaT * Bh * 0.5 * (mtv - m0v);
+              end;
+            end;
+          end;
+
+          // 3. Push m_t (pre-correction x0) + Tt into the 2-deep history.
+          if FUniHistLen = 2 then
+          begin
+            // Drop oldest: shift [1] -> [0], free/reuse [1] for the new entry.
+            FUniHistX0[0].Copy(FUniHistX0[1]);
+            FUniHistT[0] := FUniHistT[1];
+            FUniHistX0[1].Copy(Eps);
+            FUniHistT[1] := Tt;
+          end
+          else
+          begin
+            if not Assigned(FUniHistX0[FUniHistLen]) then
+              FUniHistX0[FUniHistLen] := TNNetVolume.Create(Xt);
+            FUniHistX0[FUniHistLen].Copy(Eps);
+            FUniHistT[FUniHistLen] := Tt;
+            Inc(FUniHistLen);
+          end;
+
+          // 4. Determine this step's predictor order (lower_order_final clamps
+          //    the FINAL step -- TtPrev=0 -- to first order), then store it as
+          //    FUniThisOrder for the next step's corrector. Save the current
+          //    sample as last_sample for that corrector BEFORE the predictor
+          //    overwrites Xt.
+          if TtPrev = 0 then pOrder := 1
+          else pOrder := 2;
+          if pOrder > FUniLowerOrderNums + 1 then pOrder := FUniLowerOrderNums + 1;
+          FUniThisOrder := pOrder;
+          if not Assigned(FUniPrevSample) then FUniPrevSample := TNNetVolume.Create(Xt);
+          FUniPrevSample.Copy(Xt);
+
+          // 5. PREDICTOR: produce x_{TtPrev}. m0 = m_t (Eps, the newest output).
+          if TtPrev = 0 then
+          begin
+            // Final hop to the clean image. With sigma_target=0, alpha_target=1,
+            // h -> +inf, h_phi_1 -> -1, so x = m0 (the x0 prediction).
+            Xt.Copy(Eps);
+          end
+          else
+          begin
+            abPrev := FAlphaBar[TtPrev];
+            alphaT := Sqrt(abPrev);                  // alpha at target
+            sigmaTuni := FSqrtOneMinusAlphaBar[TtPrev];
+            sigmaS0 := FSqrtOneMinusAlphaBar[Tt];
+            lamPrev := Lambda(TtPrev);
+            h := lamPrev - lamT;
+            hh := -h;
+            hphi1 := Exp(hh) - 1.0;
+            Bh := hphi1;                             // bh2
+            sigRatio := sigmaTuni / sigmaS0;
+            if (pOrder >= 2) and (FUniHistLen >= 2) then
+            begin
+              // Predictor D1 from the previous history entry (rhos_p = [0.5]).
+              //   rk = (lambda_{prev hist} - lambda_t)/h.
+              rk := (Lambda(FUniHistT[FUniHistLen - 2]) - lamT) / h;
+              for i := 0 to XtSizeM1 do
+              begin
+                m0v := Eps.FData[i];
+                D1 := (FUniHistX0[FUniHistLen - 2].FData[i] - m0v) / rk;
+                Xt.FData[i] := sigRatio * FUniPrevSample.FData[i]
+                  - alphaT * hphi1 * m0v
+                  - alphaT * Bh * 0.5 * D1;
+              end;
+            end
+            else
+            begin
+              // First-order predictor (no correction term).
+              for i := 0 to XtSizeM1 do
+                Xt.FData[i] := sigRatio * FUniPrevSample.FData[i]
+                  - alphaT * hphi1 * Eps.FData[i];
+            end;
+          end;
+
+          if FUniLowerOrderNums < 2 then Inc(FUniLowerOrderNums);
+          FHasPrev := true;
+        end;
     end;
   finally
     Eps.Free;
+  end;
+end;
+
+procedure TNNetDiffusionScheduler.SampleHeun(X: TNNetVolume;
+  Denoise: TNNetDenoiseCallback; NumSteps: integer; Spacing: TNNetTimestepSpacing);
+var
+  k, Tt, TtPrev, i, SizeM1: integer;
+  NumStepsM1: integer;
+  Pred, X0, Y, Ye, X0b, XPred: TNNetVolume;
+  Schedule: TNeuralIntegerArray;
+  sigma, sigmaNext, sqrtAbT, sqrtAbPrev, d, d2: TNeuralFloat;
+begin
+  // Deterministic Heun 2nd-order sampler in the VE sigma parameterisation:
+  //   y     = x_t / sqrt(ab_t)                    (VE sample),
+  //   x0    = PredictX0(x_t, t)                   (denoiser output, 1st eval),
+  //   d     = (y - x0)/sigma_t,                   (drift),
+  //   y_e   = y + d*(sigma_{t-1} - sigma_t)       (Euler predictor).
+  // On the final step (sigma_{t-1} = 0) emit y_e directly (skip corrector, as
+  // k-diffusion does when sigmas[i+1] == 0). Otherwise the SECOND denoiser eval
+  // at the predicted VP point x_e = sqrt(ab_prev)*y_e gives x0_2, and:
+  //   d2    = (y_e - x0_2)/sigma_{t-1},
+  //   y_new = y + (sigma_{t-1} - sigma_t)*0.5*(d + d2)  (trapezoidal average).
+  // Re-noise back to VP scale: x_{t-1} = sqrt(ab_prev)*y_new.
+  if NumSteps < 1 then NumSteps := 1;
+  NumStepsM1 := NumSteps - 1;
+  Schedule := BuildTimestepSchedule(NumSteps, Spacing);
+  SizeM1 := X.Size - 1;
+  Pred  := TNNetVolume.Create(X);
+  X0    := TNNetVolume.Create(X);
+  Y     := TNNetVolume.Create(X);
+  Ye    := TNNetVolume.Create(X);
+  X0b   := TNNetVolume.Create(X);
+  XPred := TNNetVolume.Create(X);
+  try
+    for k := 0 to NumStepsM1 do
+    begin
+      Tt := Schedule[k];
+      TtPrev := Schedule[k + 1];
+      sigma := SigmaOf(Tt);
+      sigmaNext := SigmaOf(TtPrev);          // 0 when TtPrev = 0
+      sqrtAbT := FSqrtAlphaBar[Tt];
+      // First denoiser eval at (x_t, t) -> x0.
+      Denoise(X, Pred, Tt);
+      PredictX0(X, Pred, X0, Tt);
+      // VE sample and Euler predictor y_e.
+      for i := 0 to SizeM1 do
+      begin
+        Y.FData[i] := X.FData[i] / sqrtAbT;
+        d := (Y.FData[i] - X0.FData[i]) / sigma;
+        Ye.FData[i] := Y.FData[i] + d * (sigmaNext - sigma);
+      end;
+      if TtPrev = 0 then
+      begin
+        // Final step: sqrt(ab_prev) = 1, y_e is already the clean image.
+        for i := 0 to SizeM1 do X.FData[i] := Ye.FData[i];
+      end
+      else
+      begin
+        sqrtAbPrev := FSqrtAlphaBar[TtPrev];
+        // Build the predicted VP sample for the 2nd eval, then re-evaluate.
+        for i := 0 to SizeM1 do XPred.FData[i] := sqrtAbPrev * Ye.FData[i];
+        Denoise(XPred, Pred, TtPrev);
+        PredictX0(XPred, Pred, X0b, TtPrev);
+        for i := 0 to SizeM1 do
+        begin
+          d  := (Y.FData[i]  - X0.FData[i])  / sigma;
+          d2 := (Ye.FData[i] - X0b.FData[i]) / sigmaNext;
+          X.FData[i] := sqrtAbPrev *
+            (Y.FData[i] + (sigmaNext - sigma) * 0.5 * (d + d2));
+        end;
+      end;
+    end;
+  finally
+    Pred.Free; X0.Free; Y.Free; Ye.Free; X0b.Free; XPred.Free;
   end;
 end;
 
@@ -661,6 +998,12 @@ var
   Pred: TNNetVolume;
   Schedule: TNeuralIntegerArray;
 begin
+  if Method = smHeun then
+  begin
+    // Heun needs two denoiser evals per step; handled by its own driver.
+    SampleHeun(X, Denoise, NumSteps, Spacing);
+    Exit;
+  end;
   if NumSteps < 1 then NumSteps := 1;
   NumStepsM1 := NumSteps - 1;
   ResetMultistep;

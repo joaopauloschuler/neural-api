@@ -1,0 +1,23 @@
+{
+  "_class_name": "CogVideoXTransformer3DModel",
+  "hidden_size": 16,
+  "num_attention_heads": 2,
+  "attention_head_dim": 8,
+  "num_layers": 1,
+  "mlp_hidden": 64,
+  "num_frames": 2,
+  "grid_height": 2,
+  "grid_width": 2,
+  "in_channels": 4,
+  "out_channels": 4,
+  "text_dim": 6,
+  "text_seq_len": 3,
+  "rope_base": 10000.0,
+  "rope_section_t": 2,
+  "rope_section_h": 1,
+  "rope_section_w": 1,
+  "layer_norm_eps": 1e-05,
+  "vae_latent_channels": 4,
+  "vae_out_channels": 3,
+  "vae_temporal_kernel": 3
+}

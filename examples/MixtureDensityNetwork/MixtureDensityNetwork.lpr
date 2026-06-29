@@ -17,31 +17,31 @@ THE FIX (Bishop 1994)
   Model the conditional as a Gaussian MIXTURE whose parameters are functions of
   x emitted by the net:
       p(y|x) = sum_k pi_k(x) * Normal(y ; mu_k(x), sigma_k(x)^2)
-  The net emits 3*K RAW outputs, reshaped into K triples (a_k, m_k, s_k):
-      pi_k    = softmax(a)_k          (mixing coefficients, sum to 1)
+  The net emits K*(1+2*D) RAW outputs along the DEPTH axis, which the LIBRARY
+  layer TNNetMixtureDensity(K, D) turns into the mixture parameters in place:
+      pi_k    = softmax(logit)_k      (mixing coefficients, sum to 1)
       mu_k    = m_k                   (component means, linear)
-      sigma_k = softplus(s_k) + eps   (positive component widths)
+      sigma_k = softplus(s_k)         (positive component widths)
   trained on the mixture NEGATIVE LOG-LIKELIHOOD
       NLL = -log( sum_k pi_k * Normal(y ; mu_k, sigma_k) ).
 
-MANUAL GRADIENT SURGERY (no library changes; pseudo-target trick)
-  Both arms emit RAW linear outputs from a TNNetFullConnectLinear head. The
-  framework's stock Backpropagate seeds the output layer's error as
-  (output - target) and, for a Linear head (Identity activation, derivative 1),
-  delivers exactly that as the gradient w.r.t. the raw outputs. So to inject an
-  arbitrary analytic gradient g_i w.r.t. raw output i we feed a PSEUDO-TARGET
-      pseudo_i = output_i - g_i      ->  (output - pseudo)_i == g_i .
-  The closed-form mixture-NLL gradients (responsibilities gamma_k):
-      gamma_k    = pi_k*N_k / sum_j pi_j*N_j
-      dNLL/da_k  = pi_k - gamma_k                          (softmax / logits)
-      dNLL/dm_k  = gamma_k * (mu_k - y) / sigma_k^2        (mu, linear)
-      dNLL/ds_k  = gamma_k * (1/sigma_k - (y-mu_k)^2/sigma_k^3) * sigmoid(s_k)
-                   (sigma, chained through softplus' = sigmoid).
-  The MSE arm uses the same trick with g_i = (out_i - y) (single linear output).
-  We hand-roll the mini-batch loop in BATCH-UPDATE mode (NN.SetBatchUpdate(True)
-  -> Backpropagate ACCUMULATES into Neurons[].Delta; UpdateWeights applies once),
-  scaling each per-sample gradient by 1/batch so the applied step is the MEAN.
-  We never call TNeuralFit.Fit, so layer references never go stale.
+LIBRARY HEAD (TNNetMixtureDensity) + ITS OWN log-sum-exp NLL BACKWARD
+  The MDN head is the real library layer, NOT a hand-coded reimplementation.
+  TNNetMixtureDensity packs the K*(1+2*D) channels over the DEPTH axis as
+      [ K mixing logits | K*D means | K*D raw scales ]
+  (for D=1: [a_0..a_{K-1}, m_0..m_{K-1}, s_0..s_{K-1}]), applies softmax to the
+  logits and softplus to the scales in Compute(), and owns the EXACT
+  responsibility-weighted dNLL/dparam in Backpropagate() (stable log-sum-exp).
+
+  We drive that backward the way the layer expects: the framework seeds the
+  head's error as (output - target), so we build a target volume whose FIRST D
+  channels carry the true y (the head recovers y from output - error there) and
+  whose remaining channels equal the output (zero residual). We run the
+  mini-batch loop in BATCH-UPDATE mode (NN.SetBatchUpdate(True) -> Backpropagate
+  ACCUMULATES into Neurons[].Delta; UpdateWeights applies once), scaling the
+  accumulated deltas by 1/batch so the applied step is the MEAN gradient. We
+  never call TNeuralFit.Fit, so layer references never go stale. The MSE arm uses
+  the stock (out - y) gradient on its single linear output.
 
 BUILT-IN CORRECTNESS INVARIANTS (HALT(1) on violation)
   (1) K=1 REDUCTION: a K=1 MDN's NLL is a homoscedastic Gaussian NLL whose only
@@ -50,8 +50,6 @@ BUILT-IN CORRECTNESS INVARIANTS (HALT(1) on violation)
       the K=1 mu and the MSE prediction over a probe grid is small.
   (2) SIMPLEX: the mixture weights pi_k(x) must sum to 1 (within 1e-5) at every
       probe x (softmax sanity).
-  Also a finite-difference GRADIENT CHECK of the analytic NLL gradient at startup
-  (HALT(1) if the closed form disagrees with central differences).
 
 DISTINCT FROM other in-tree uncertainty work -- see README:
   - examples/MCDropoutUncertainty/ models EPISTEMIC uncertainty by sampling
@@ -85,6 +83,11 @@ uses {$IFDEF UNIX} cthreads, {$ENDIF}
   neuralnetwork,
   neuralvolume;
 
+// D = target dimensionality (scalar y). The library head packs K*(1+2*D)
+// channels over the depth axis; with D=1 that is the familiar 3*K.
+const
+  cD = 1;
+
 const
   cSeed       = 424242;
   cNumPts     = 600;          // training points (tiny)
@@ -94,7 +97,6 @@ const
   cBatchSize  = 60;
   cEpochs     = 600;
   cLearnRate  = 0.02;
-  cSigmaEps   = 1e-3;         // sigma floor (softplus + eps)
   cPi2        = 6.2831853071795864769;  // 2*pi
   cNLLEps     = 1e-12;
 
@@ -130,47 +132,23 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
-// Numerically-stable softplus and its derivative (= logistic sigmoid).
+// Decode the TNNetMixtureDensity head OUTPUT (the layer already applied softmax
+// to the logits and softplus to the scales in Compute()) into (pi, mu, sigma).
+// Depth-axis packing the layer uses: [ pi_0..pi_{K-1} | mu_0.. | sigma_0.. ],
+// i.e. for D=1: [pi_0..pi_{K-1}, mu_0..mu_{K-1}, sigma_0..sigma_{K-1}].
 // ---------------------------------------------------------------------------
-function SoftPlus(z: TNeuralFloat): TNeuralFloat;
-begin
-  if z > 30 then Result := z
-  else if z < -30 then Result := Exp(z)
-  else Result := Ln(1 + Exp(z));
-end;
-
-function Sigmoid(z: TNeuralFloat): TNeuralFloat;
-begin
-  if z >= 0 then Result := 1.0 / (1.0 + Exp(-z))
-  else begin Result := Exp(z); Result := Result / (1.0 + Result); end;
-end;
-
-// ---------------------------------------------------------------------------
-// Decode the 3*K raw network outputs of an MDN with K components into
-// (pi, mu, sigma). Layout: [a_0..a_{K-1}, m_0..m_{K-1}, s_0..s_{K-1}].
-// ---------------------------------------------------------------------------
-procedure DecodeMix(const Raw: TNNetVolume; K: integer; out P: TMixParams);
+procedure DecodeMix(const Outp: TNNetVolume; K: integer; out P: TMixParams);
 var
-  k1: integer;
-  MaxA, SumExp: TNeuralFloat;
-  Ex: array of TNeuralFloat;
+  k1, BaseMu, BaseS: integer;
 begin
   SetLength(P.Pi, K); SetLength(P.Mu, K); SetLength(P.Sigma, K);
-  SetLength(Ex, K);
-  // softmax over the pi logits (subtract max for stability)
-  MaxA := Raw.FData[0];
-  for k1 := 1 to K - 1 do if Raw.FData[k1] > MaxA then MaxA := Raw.FData[k1];
-  SumExp := 0;
+  BaseMu := K;                 // K + k*D with D=1
+  BaseS  := K + K * cD;        // start of the K*D scale block
   for k1 := 0 to K - 1 do
   begin
-    Ex[k1] := Exp(Raw.FData[k1] - MaxA);
-    SumExp := SumExp + Ex[k1];
-  end;
-  for k1 := 0 to K - 1 do
-  begin
-    P.Pi[k1]    := Ex[k1] / SumExp;
-    P.Mu[k1]    := Raw.FData[K + k1];
-    P.Sigma[k1] := SoftPlus(Raw.FData[2 * K + k1]) + cSigmaEps;
+    P.Pi[k1]    := Outp.FData[k1];
+    P.Mu[k1]    := Outp.FData[BaseMu + k1 * cD];
+    P.Sigma[k1] := Outp.FData[BaseS + k1 * cD];
   end;
 end;
 
@@ -197,61 +175,65 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
-// Analytic gradient of the mixture NLL w.r.t. the 3*K RAW outputs, written into
-// Grad (same layout as the raw outputs). RawSigma holds the pre-softplus sigma
-// logits (needed for the softplus' = sigmoid chain). Returns the NLL value.
-// ---------------------------------------------------------------------------
-function MixtureNLLGrad(const Raw: TNNetVolume; const P: TMixParams; K: integer;
-  y: TNeuralFloat; Grad: TNNetVolume): TNeuralFloat;
-var
-  k1: integer;
-  Nk, Denom, gamma, dmu, dsigma, sig: TNeuralFloat;
-  Resp: array of TNeuralFloat;
-begin
-  SetLength(Resp, K);
-  Denom := 0;
-  for k1 := 0 to K - 1 do
-  begin
-    Nk := GaussPdf(y, P.Mu[k1], P.Sigma[k1]);
-    Resp[k1] := P.Pi[k1] * Nk;       // pi_k * N_k (un-normalised responsibility)
-    Denom := Denom + Resp[k1];
-  end;
-  if Denom < cNLLEps then Denom := cNLLEps;
-
-  for k1 := 0 to K - 1 do
-  begin
-    gamma := Resp[k1] / Denom;       // posterior responsibility gamma_k
-    // d/d a_k (pi logits): pi_k - gamma_k
-    Grad.FData[k1] := P.Pi[k1] - gamma;
-    // d/d mu_k: gamma_k * (mu_k - y)/sigma_k^2 ; mu = m_k so chain is 1
-    dmu := gamma * (P.Mu[k1] - y) / (P.Sigma[k1] * P.Sigma[k1]);
-    Grad.FData[K + k1] := dmu;
-    // d/d sigma_k: gamma_k * (1/sigma - (y-mu)^2/sigma^3) ; chain softplus'=sigmoid
-    dsigma := gamma * (1.0 / P.Sigma[k1]
-              - Sqr(y - P.Mu[k1]) / (P.Sigma[k1] * P.Sigma[k1] * P.Sigma[k1]));
-    sig := Sigmoid(Raw.FData[2 * K + k1]);
-    Grad.FData[2 * K + k1] := dsigma * sig;
-  end;
-  Result := MixtureNLL(P, K, y);
-end;
-
-// ---------------------------------------------------------------------------
-// MLP with a RAW linear head of OutDim outputs.
-//   Input(1) -> Tanh(H) -> Tanh(H) -> Linear(OutDim)
+// MLP trunk + head.
+//   MSE arm (K=0): Input(1) -> Tanh(H) -> Tanh(H) -> Linear(1)
+//   MDN arm (K>0): trunk -> Linear(K*(1+2*D)) -> TNNetMixtureDensity(K, D)
+// The Linear layer emits the K*(1+2*D) RAW parameters along the DEPTH axis (the
+// axis the mixture head packs over); the library head transforms them in place.
 // Tanh hidden layers keep forward/backward RNG-free and give smooth fits.
 // ---------------------------------------------------------------------------
-procedure BuildNet(out NN: TNNet; OutDim: integer);
+procedure BuildNet(out NN: TNNet; K: integer);
 begin
   NN := TNNet.Create();
   NN.AddLayer(TNNetInput.Create(1, 1, 1));
   NN.AddLayer(TNNetFullConnect.Create(cHiddenW));        // Tanh
   NN.AddLayer(TNNetFullConnect.Create(cHiddenW));        // Tanh
-  NN.AddLayer(TNNetFullConnectLinear.Create(OutDim));    // RAW linear head
+  if K > 0 then
+  begin
+    // Raw mixture parameters on the depth axis: shape (1,1,K*(1+2*D)).
+    NN.AddLayer(TNNetFullConnectLinear.Create(1, 1, K * (1 + 2 * cD)));
+    NN.AddLayer(TNNetMixtureDensity.Create(K, cD));      // library head + NLL
+  end
+  else
+    NN.AddLayer(TNNetFullConnectLinear.Create(1));       // MSE: single output
   NN.SetLearningRate(cLearnRate, {Momentum=}0.0);
   NN.SetL2Decay(0.0);
   // Batch-update: Backpropagate accumulates into Neurons[].Delta; UpdateWeights
-  // applies once per mini-batch. REQUIRED for manual gradient surgery.
+  // applies once per mini-batch. We scale the accumulated deltas to the MEAN.
   NN.SetBatchUpdate(True);
+end;
+
+// ---------------------------------------------------------------------------
+// Break the symmetry of the MDN head. The K mean components must START spread
+// across the target range [0,1] or training collapses every component onto the
+// conditional mean (the very failure mode an MDN exists to avoid). We set the
+// mean-neuron biases to evenly spaced values and the raw-scale biases so the
+// initial sigma = softplus(bias) ~ 0.15 (narrow enough to separate branches).
+// The Linear head neuron layout matches the layer's K*(1+2*D) depth packing:
+// [0..K-1] mixing logits, [K..K+K*D-1] means, [K+K*D..end] raw scales.
+// ---------------------------------------------------------------------------
+procedure InitMDNHead(NN: TNNet; K: integer);
+var
+  Head: TNNetLayer;
+  kk, dd, idx, BaseMu, BaseS: integer;
+  spread: TNeuralFloat;
+begin
+  Head := NN.Layers[NN.GetLastLayerIdx - 1];  // the FullConnectLinear head
+  BaseMu := K;
+  BaseS := K + K * cD;
+  for kk := 0 to K - 1 do
+  begin
+    // Mixing logits start at 0 (uniform pi).
+    Head.Neurons[kk].BiasWeight := 0;
+    if K > 1 then spread := 0.1 + 0.8 * kk / (K - 1) else spread := 0.5;
+    for dd := 0 to cD - 1 do
+    begin
+      idx := BaseMu + kk * cD + dd;
+      Head.Neurons[idx].BiasWeight := spread;          // means spread over [0.1,0.9]
+      // softplus(s) = 0.15  =>  s = ln(exp(0.15)-1) ~ -1.84.
+      Head.Neurons[BaseS + kk * cD + dd].BiasWeight := -1.84;
+    end;
+  end;
 end;
 
 // ---------------------------------------------------------------------------
@@ -296,18 +278,24 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
-// Train an MDN with K components on the mixture NLL via the analytic gradient.
+// Train an MDN with K components on the mixture NLL using the LIBRARY layer's
+// own log-sum-exp NLL backward (TNNetMixtureDensity.Backpropagate).
+//
+// The framework seeds the head error as (output - target). The library head
+// recovers the regression target y from the FIRST D channels as
+// output - (output - target). So we build a target volume that copies the head
+// output (every channel zero residual) and overwrites the first D channels with
+// the true y. The head then emits the exact responsibility-weighted dNLL/dparam.
 // ---------------------------------------------------------------------------
 procedure TrainMDN(NN: TNNet; K: integer);
 var
   Order: array of integer;
-  Epoch, Lo, Hi, I, J, R, Tmp: integer;
-  Inp, Pseudo, Grad, Outp: TNNetVolume;
-  P: TMixParams;
+  Epoch, Lo, Hi, I, J, Tmp, HeadDepth: integer;
+  Inp, Tgt, Outp: TNNetVolume;
 begin
+  HeadDepth := K * (1 + 2 * cD);
   Inp := TNNetVolume.Create(1, 1, 1);
-  Pseudo := TNNetVolume.Create(3 * K, 1, 1);
-  Grad := TNNetVolume.Create(3 * K, 1, 1);
+  Tgt := TNNetVolume.Create(1, 1, HeadDepth);
   SetLength(Order, cNumPts);
   for I := 0 to cNumPts - 1 do Order[I] := I;
   for Epoch := 1 to cEpochs do
@@ -326,18 +314,20 @@ begin
         Inp.FData[0] := DataX[Order[I]];
         NN.Compute(Inp);
         Outp := NN.GetLastLayer().Output;
-        DecodeMix(Outp, K, P);
-        MixtureNLLGrad(Outp, P, K, DataY[Order[I]], Grad);
-        // pseudo = out - g/batch  -> stock error == g/batch == MEAN gradient
-        for R := 0 to 3 * K - 1 do
-          Pseudo.FData[R] := Outp.FData[R] - Grad.FData[R] / (Hi - Lo);
-        NN.Backpropagate(Pseudo);
+        // Copy the (transformed) output so every channel has zero residual,
+        // then overwrite the first D channels with the true y; the head reads
+        // y from there and produces the exact NLL gradient (batch mode).
+        Tgt.Copy(Outp);
+        Tgt.FData[0] := DataY[Order[I]];
+        NN.Backpropagate(Tgt);
       end;
+      // Scale accumulated deltas to the MEAN gradient over the mini-batch.
+      NN.MulDeltas(1.0 / (Hi - Lo));
       NN.UpdateWeights();
       Lo := Hi;
     end;
   end;
-  Grad.Free; Pseudo.Free; Inp.Free;
+  Tgt.Free; Inp.Free;
 end;
 
 // Forward a single x through an MDN, returning decoded params.
@@ -448,120 +438,6 @@ begin
   else Result := Format('%*.*f', [W, D, V]);
 end;
 
-// ---------------------------------------------------------------------------
-// Finite-difference check of the analytic mixture-NLL gradient w.r.t. the raw
-// outputs, at a random raw vector / random target. HALT(1) on disagreement.
-// ---------------------------------------------------------------------------
-// This check operates entirely in DOUBLE precision (not the single-precision
-// TNNetVolume) so it validates the analytic FORMULAS, not float-rounding: a
-// single-precision round-trip would inject ~1e-2 noise into the central diff.
-procedure GradientCheck;
-const
-  K = 3; H = 1e-5;
-var
-  raw, grad: array[0 .. 3 * K - 1] of Double;
-  y, fdg, ana, maxrel, rel, save, lp, lm: Double;
-  R: integer;
-
-  // Double-precision softplus / sigmoid (the unit-level ones take single args,
-  // which would truncate the Double probe and pollute the central difference).
-  function SoftPlusD(z: Double): Double;
-  begin
-    if z > 30 then Result := z
-    else if z < -30 then Result := Exp(z)
-    else Result := Ln(1 + Exp(z));
-  end;
-
-  function SigmoidD(z: Double): Double;
-  begin
-    if z >= 0 then Result := 1.0 / (1.0 + Exp(-z))
-    else begin Result := Exp(z); Result := Result / (1.0 + Result); end;
-  end;
-
-  // Self-contained Double-precision mixture NLL of the raw vector at target ty.
-  function NLLat(const rr: array of Double; ty: Double): Double;
-  var
-    k1: integer;
-    maxa, sumexp, pk, muk, sgk, d, s: Double;
-    pp: array[0 .. K - 1] of Double;
-  begin
-    maxa := rr[0];
-    for k1 := 1 to K - 1 do if rr[k1] > maxa then maxa := rr[k1];
-    sumexp := 0;
-    for k1 := 0 to K - 1 do begin pp[k1] := Exp(rr[k1] - maxa); sumexp := sumexp + pp[k1]; end;
-    s := 0;
-    for k1 := 0 to K - 1 do
-    begin
-      pk  := pp[k1] / sumexp;
-      muk := rr[K + k1];
-      sgk := SoftPlusD(rr[2 * K + k1]) + cSigmaEps;
-      d := ty - muk;
-      s := s + pk * Exp(-(d * d) / (2 * sgk * sgk)) / (sgk * Sqrt(cPi2));
-    end;
-    if s < cNLLEps then s := cNLLEps;
-    Result := -Ln(s);
-  end;
-
-  // Double-precision analytic gradient (mirrors MixtureNLLGrad exactly).
-  procedure AnaGrad(const rr: array of Double; ty: Double; var g: array of Double);
-  var
-    k1: integer;
-    maxa, sumexp, denom, gamma, muk, sgk, nk: Double;
-    pp, mu, sg, resp: array[0 .. K - 1] of Double;
-  begin
-    maxa := rr[0];
-    for k1 := 1 to K - 1 do if rr[k1] > maxa then maxa := rr[k1];
-    sumexp := 0;
-    for k1 := 0 to K - 1 do begin pp[k1] := Exp(rr[k1] - maxa); sumexp := sumexp + pp[k1]; end;
-    denom := 0;
-    for k1 := 0 to K - 1 do
-    begin
-      pp[k1] := pp[k1] / sumexp;
-      mu[k1] := rr[K + k1];
-      sg[k1] := SoftPlusD(rr[2 * K + k1]) + cSigmaEps;
-      nk := Exp(-Sqr(ty - mu[k1]) / (2 * sg[k1] * sg[k1])) / (sg[k1] * Sqrt(cPi2));
-      resp[k1] := pp[k1] * nk;
-      denom := denom + resp[k1];
-    end;
-    if denom < cNLLEps then denom := cNLLEps;
-    for k1 := 0 to K - 1 do
-    begin
-      gamma := resp[k1] / denom;
-      muk := mu[k1]; sgk := sg[k1];
-      g[k1]         := pp[k1] - gamma;
-      g[K + k1]     := gamma * (muk - ty) / (sgk * sgk);
-      g[2 * K + k1] := gamma * (1.0 / sgk - Sqr(ty - muk) / (sgk * sgk * sgk))
-                       * SigmoidD(rr[2 * K + k1]);
-    end;
-  end;
-
-begin
-  for R := 0 to 3 * K - 1 do raw[R] := RandG(0, 1);
-  y := 0.4;
-  AnaGrad(raw, y, grad);
-  maxrel := 0;
-  for R := 0 to 3 * K - 1 do
-  begin
-    save := raw[R];
-    raw[R] := save + H; lp := NLLat(raw, y);
-    raw[R] := save - H; lm := NLLat(raw, y);
-    raw[R] := save;
-    fdg := (lp - lm) / (2 * H);
-    ana := grad[R];
-    rel := Abs(fdg - ana) / (Abs(fdg) + Abs(ana) + 1e-8);
-    if rel > maxrel then maxrel := rel;
-  end;
-  WriteLn(Format('Startup gradient check (analytic vs central-diff): max rel err = %.3e',
-    [maxrel]));
-  if maxrel > 1e-3 then
-  begin
-    WriteLn('  GRADIENT CHECK FAILED -- analytic NLL gradient is wrong. HALT.');
-    Halt(1);
-  end
-  else
-    WriteLn('  gradient check PASS (< 1e-3).');
-end;
-
 // ASCII scatter: x on the horizontal axis, y on the vertical. Plots the TRUE
 // data as '.', the MSE prediction as 'M', and MDN samples as 'o'. Shows the MDN
 // recovering all three branches where the MSE arm cannot.
@@ -647,15 +523,10 @@ begin
   WriteLn('========================================================================');
   WriteLn(Format('Forward map: x = y + 0.3*sin(2*pi*y) + N(0,%.2f^2), y~U[0,1]; learn y|x.',
     [cNoise]));
-  WriteLn(Format('Net: 1 -> %d(Tanh) -> %d(Tanh) -> Linear head (raw). seed=%d.',
+  WriteLn(Format('Net: 1 -> %d(Tanh) -> %d(Tanh) -> Linear(K*(1+2D)) -> TNNetMixtureDensity. seed=%d.',
     [cHiddenW, cHiddenW, cSeed]));
-  WriteLn(Format('MDN head: K=%d components (3K=%d raw outputs); train=%d, batch=%d, epochs=%d, lr=%.3f.',
-    [cK, 3 * cK, cNumPts, cBatchSize, cEpochs, cLearnRate]));
-  WriteLn;
-
-  // Startup analytic-gradient finite-difference check.
-  RandSeed := cSeed;
-  GradientCheck;
+  WriteLn(Format('MDN head: K=%d components, D=%d (%d raw params); train=%d, batch=%d, epochs=%d, lr=%.3f.',
+    [cK, cD, cK * (1 + 2 * cD), cNumPts, cBatchSize, cEpochs, cLearnRate]));
   WriteLn;
 
   // Build the shared dataset once (after seeding) so all arms see identical x,y.
@@ -664,7 +535,7 @@ begin
 
   // ----------------------- Arm A: plain MSE regressor ---------------------
   RandSeed := cSeed;       // identical seed/arch before each arm
-  BuildNet(NNmse, 1);
+  BuildNet(NNmse, 0);      // K=0 -> single linear output (MSE arm)
   TrainMSE(NNmse);
   mseMSE := MSEMeanMSE(NNmse);
   mseSigma := Sqrt(mseMSE);
@@ -672,14 +543,16 @@ begin
 
   // ----------------------- Arm B: K=3 MDN ---------------------------------
   RandSeed := cSeed;
-  BuildNet(NNmdn, 3 * cK);
+  BuildNet(NNmdn, cK);
+  InitMDNHead(NNmdn, cK);
   TrainMDN(NNmdn, cK);
   NLLmdn := MDNMeanNLL(NNmdn, cK);
   MSEmdn := MDNMeanMSE(NNmdn, cK);
 
   // ----------------------- Arm C: K=1 MDN (for invariant 1) ---------------
   RandSeed := cSeed;
-  BuildNet(NNmdn1, 3 * 1);
+  BuildNet(NNmdn1, 1);
+  InitMDNHead(NNmdn1, 1);
   TrainMDN(NNmdn1, 1);
   NLLmdn1 := MDNMeanNLL(NNmdn1, 1);
 

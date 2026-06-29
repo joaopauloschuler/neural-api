@@ -1,0 +1,12 @@
+{
+ "_class_name": "IPAdapterModel",
+ "clip_embeddings_dim": 10,
+ "cross_attention_dim": 6,
+ "clip_extra_context_tokens": 4,
+ "channels": 8,
+ "num_heads": 2,
+ "hidden_tokens": 9,
+ "text_seq_len": 5,
+ "conditioning_scale": 0.7,
+ "attn_index": 1
+}

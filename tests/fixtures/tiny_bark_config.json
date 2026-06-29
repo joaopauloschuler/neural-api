@@ -1,0 +1,35 @@
+{
+ "model_type": "bark",
+ "semantic_config": {
+  "model_type": "semantic",
+  "block_size": 32,
+  "input_vocab_size": 33,
+  "output_vocab_size": 33,
+  "num_layers": 2,
+  "num_heads": 2,
+  "hidden_size": 16,
+  "bias": true
+ },
+ "coarse_acoustics_config": {
+  "model_type": "coarse_acoustics",
+  "block_size": 32,
+  "input_vocab_size": 20,
+  "output_vocab_size": 20,
+  "num_layers": 2,
+  "num_heads": 2,
+  "hidden_size": 16,
+  "bias": true
+ },
+ "fine_acoustics_config": {
+  "model_type": "fine_acoustics",
+  "block_size": 32,
+  "input_vocab_size": 16,
+  "output_vocab_size": 16,
+  "num_layers": 2,
+  "num_heads": 2,
+  "hidden_size": 16,
+  "bias": true,
+  "n_codes_total": 6,
+  "n_codes_given": 1
+ }
+}

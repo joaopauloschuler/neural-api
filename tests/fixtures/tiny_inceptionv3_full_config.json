@@ -1,0 +1,12 @@
+{
+ "model_type": "inception",
+ "architectures": [
+  "InceptionV3"
+ ],
+ "full_arch": true,
+ "width_div": 8,
+ "image_size": 160,
+ "num_channels": 3,
+ "num_labels": 4,
+ "bn_eps": 0.001
+}

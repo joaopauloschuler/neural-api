@@ -13,7 +13,7 @@
 #     -> ReLU
 #     -> MaxPool2 (size=stride=Pool2)          (clean block-max; L2 % Pool2 == 0)
 #     -> TokenLayerNorm
-#     -> BiLSTM (TNNetMinLSTM forward + time-reversed, concat over channels)
+#     -> BiLSTM (vanilla nn.LSTM forward + reverse, concat over channels)
 #     -> Linear head -> NumPowersetClasses logits per frame
 #
 # It then writes a tiny RE-RANDOMIZED O(1)-scale safetensors fixture, a matching
@@ -43,7 +43,7 @@ POOL1 = 2
 CONV_CH = 5
 CONV_KERNEL = 3
 POOL2 = 2
-# TNNetMinLSTM is a same-shape recurrence: hidden size == input depth (CONV_CH).
+# TNNetLSTMCell is a same-shape recurrence: hidden size == input depth (CONV_CH).
 LSTM_HIDDEN = CONV_CH
 MAX_SPEAKERS = 3
 POWERSET = 7            # 1 + 3 + C(3,2)
@@ -118,20 +118,31 @@ def block_maxpool(x, p):
     return out
 
 
-def minlstm(x, Wf, Wi, Wh, bf, bi, bh):
-    # x: (T, In). Gates depend on x only; normalized f/(f+i) carry. -> (T, Hidden)
+def vanilla_lstm(x, Wih, Whh, bih, bhh):
+    # Exact torch nn.LSTM single-layer forward. x: (T, In) -> (T, Hidden).
+    #   weight_ih: (4H, In), weight_hh: (4H, H), bias_ih/bias_hh: (4H,)
+    # torch gate order along the 4H axis is i, f, g, o:
+    #   i_t = sigmoid(W_ii x + W_hi h + b_i)
+    #   f_t = sigmoid(W_if x + W_hf h + b_f)
+    #   g_t = tanh   (W_ig x + W_hg h + b_g)
+    #   o_t = sigmoid(W_io x + W_ho h + b_o)
+    #   c_t = f_t * c_{t-1} + i_t * g_t      (c_{-1}=0)
+    #   h_t = o_t * tanh(c_t)                (h_{-1}=0)
+    # bias_ih and bias_hh simply ADD, so fold their sum.
     T = x.shape[0]
-    H = Wf.shape[0]
+    H = Whh.shape[1]
+    b = bih + bhh                     # (4H,)
     h = np.zeros(H)
+    c = np.zeros(H)
     out = np.zeros((T, H))
     for t in range(T):
-        f = sigmoid(bf + Wf @ x[t])
-        i = sigmoid(bi + Wi @ x[t])
-        hc = bh + Wh @ x[t]
-        denom = f + i
-        fp = f / denom
-        ip = i / denom
-        h = fp * h + ip * hc
+        z = Wih @ x[t] + Whh @ h + b  # (4H,)
+        i = sigmoid(z[0:H])
+        f = sigmoid(z[H:2 * H])
+        g = np.tanh(z[2 * H:3 * H])
+        o = sigmoid(z[3 * H:4 * H])
+        c = f * c + i * g
+        h = o * np.tanh(c)
         out[t] = h
     return out
 
@@ -165,11 +176,11 @@ def forward(P):
     conv = block_maxpool(conv, POOL2)
     conv = token_layernorm(conv, P["ln2_w"], P["ln2_b"])
     # BiLSTM: forward over conv, reverse over time-flipped conv (then flip back).
-    fwd = minlstm(conv, P["fwd_W_f"], P["fwd_W_i"], P["fwd_W_h"],
-                  P["fwd_b_f"], P["fwd_b_i"], P["fwd_b_h"])
+    fwd = vanilla_lstm(conv, P["fwd_weight_ih"], P["fwd_weight_hh"],
+                       P["fwd_bias_ih"], P["fwd_bias_hh"])
     rev_in = conv[::-1]
-    rev = minlstm(rev_in, P["rev_W_f"], P["rev_W_i"], P["rev_W_h"],
-                  P["rev_b_f"], P["rev_b_i"], P["rev_b_h"])[::-1]
+    rev = vanilla_lstm(rev_in, P["rev_weight_ih"], P["rev_weight_hh"],
+                       P["rev_bias_ih"], P["rev_bias_hh"])[::-1]
     h = np.concatenate([fwd, rev], axis=1)  # (frames, 2*Hidden)
     # Linear head.
     logits = h @ P["head_w"].T + P["head_b"][None, :]  # (frames, POWERSET)
@@ -194,12 +205,14 @@ P["conv_b"] = randn(CONV_CH, scale=0.2)
 P["ln2_w"] = randn(CONV_CH, scale=0.3) + 1.0
 P["ln2_b"] = randn(CONV_CH, scale=0.2)
 for d in ("fwd", "rev"):
-    P[f"{d}_W_f"] = randn(LSTM_HIDDEN, CONV_CH, scale=0.3)
-    P[f"{d}_W_i"] = randn(LSTM_HIDDEN, CONV_CH, scale=0.3)
-    P[f"{d}_W_h"] = randn(LSTM_HIDDEN, CONV_CH, scale=0.3)
-    P[f"{d}_b_f"] = randn(LSTM_HIDDEN, scale=0.2) + 0.5
-    P[f"{d}_b_i"] = randn(LSTM_HIDDEN, scale=0.2)
-    P[f"{d}_b_h"] = randn(LSTM_HIDDEN, scale=0.2)
+    # nn.LSTM tensors: weight_ih (4H, In), weight_hh (4H, H), bias_ih/hh (4H,).
+    # Gate rows are ordered i, f, g, o along the 4H axis.
+    P[f"{d}_weight_ih"] = randn(4 * LSTM_HIDDEN, CONV_CH, scale=0.3)
+    P[f"{d}_weight_hh"] = randn(4 * LSTM_HIDDEN, LSTM_HIDDEN, scale=0.3)
+    P[f"{d}_bias_ih"] = randn(4 * LSTM_HIDDEN, scale=0.2)
+    P[f"{d}_bias_hh"] = randn(4 * LSTM_HIDDEN, scale=0.2)
+    # A common default: positive forget-gate bias (rows H..2H) eases pass-through.
+    P[f"{d}_bias_ih"][LSTM_HIDDEN:2 * LSTM_HIDDEN] += 0.5
 P["head_w"] = randn(POWERSET, 2 * LSTM_HIDDEN, scale=0.4)
 P["head_b"] = randn(POWERSET, scale=0.2)
 
@@ -246,7 +259,7 @@ tensors = {
     "head.bias": P["head_b"],
 }
 for d in ("fwd", "rev"):
-    for g in ("W_f", "W_i", "W_h", "b_f", "b_i", "b_h"):
+    for g in ("weight_ih", "weight_hh", "bias_ih", "bias_hh"):
         tensors[f"lstm.{d}.{g}"] = P[f"{d}_{g}"]
 
 save_safetensors(os.path.join(OUTDIR, "tiny_pyannote.safetensors"), tensors)

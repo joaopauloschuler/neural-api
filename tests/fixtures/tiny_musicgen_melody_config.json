@@ -1,0 +1,18 @@
+{
+ "model_type": "musicgen_melody",
+ "text_d_model": 12,
+ "num_chroma": 12,
+ "chroma_length": 6,
+ "decoder": {
+  "vocab_size": 16,
+  "hidden_size": 8,
+  "num_hidden_layers": 2,
+  "num_attention_heads": 2,
+  "ffn_dim": 16,
+  "num_codebooks": 4,
+  "max_position_embeddings": 128,
+  "activation_function": "gelu",
+  "scale_embedding": false,
+  "audio_channels": 1
+ }
+}

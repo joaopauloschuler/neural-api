@@ -135,6 +135,14 @@ type
     procedure TestL2DecayExcludeBiasKeepsBias;
     procedure TestL2DecayDefaultDecaysBias;
     procedure TestNormLayerLearningRateMultiplier;
+
+    // Batch-level mixup / CutMix augmentation
+    procedure TestBatchAugDefaultsOff;
+    procedure TestMixedSoftTargetSumsToOne;
+    procedure TestMixedSoftTargetLambdaOneIsOneHot;
+    procedure TestMixedSoftTargetSameTag;
+    procedure TestMixupImageFitConverges;
+    procedure TestCutMixImageFitConverges;
   end;
 
 implementation
@@ -1622,6 +1630,249 @@ begin
   finally
     NN.Free;
   end;
+end;
+
+procedure TTestNeuralFit.TestBatchAugDefaultsOff;
+var
+  Fit: TNeuralImageFit;
+begin
+  Fit := TNeuralImageFit.Create;
+  try
+    // The batch-level mix must be OPT-IN so the default training path is
+    // unchanged. Defaults: disabled, Beta(1,1) (=Uniform), every sample.
+    AssertTrue('BatchAugMode must default to bamNone',
+      Fit.BatchAugMode = bamNone);
+    AssertEquals('BatchAugAlpha must default to 1.0', 1.0,
+      Fit.BatchAugAlpha, 0);
+    AssertEquals('BatchAugProb must default to 1.0', 1.0,
+      Fit.BatchAugProb, 0);
+    Fit.BatchAugMode := bamMixup;
+    AssertTrue('BatchAugMode must round-trip', Fit.BatchAugMode = bamMixup);
+    Fit.BatchAugMode := bamCutMix;
+    AssertTrue('BatchAugMode must round-trip', Fit.BatchAugMode = bamCutMix);
+    Fit.BatchAugAlpha := 0.2;
+    AssertEquals('BatchAugAlpha must round-trip', 0.2, Fit.BatchAugAlpha, 1e-7);
+  finally
+    Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestMixedSoftTargetSumsToOne;
+var
+  Fit: TNeuralImageFit;
+  Target: TNNetVolume;
+  I, K: integer;
+  Sum, Lambda: TNeuralFloat;
+const
+  cNumClasses = 10;
+begin
+  // The mixup/CutMix SOFT target is a convex blend of two one-hot rows; under
+  // the softmax convention (the default) every produced row must sum to 1, for
+  // any lambda in [0,1] and any pair of (distinct) class ids.
+  Fit := TNeuralImageFit.Create;
+  Target := TNNetVolume.Create(cNumClasses, 1, 1);
+  try
+    for K := 0 to 6 do
+    begin
+      Lambda := K / 6.0; // sweep 0, 1/6, ..., 1
+      Fit.BuildMixedSoftTarget(Target, 3, 7, Lambda);
+      Sum := 0;
+      for I := 0 to cNumClasses - 1 do Sum := Sum + Target.FData[I];
+      AssertEquals('Soft target row must sum to 1 (lambda=' +
+        FloatToStr(Lambda) + ')', 1.0, Sum, 1e-6);
+      // The two mixed classes carry exactly lambda / (1-lambda); all others 0.
+      AssertEquals('TagA weight must equal lambda', Lambda, Target.FData[3], 1e-6);
+      AssertEquals('TagB weight must equal 1-lambda', 1.0 - Lambda,
+        Target.FData[7], 1e-6);
+      AssertEquals('Unmixed class must be 0', 0.0, Target.FData[0], 0);
+    end;
+  finally
+    Target.Free;
+    Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestMixedSoftTargetLambdaOneIsOneHot;
+var
+  Fit: TNeuralImageFit;
+  Mixed, Reference: TNNetVolume;
+  I: integer;
+const
+  cNumClasses = 10;
+  cTagA = 4;
+  cTagB = 9;
+begin
+  // lambda = 1 must reduce EXACTLY to the unaugmented one-hot target for TagA,
+  // bit-for-bit identical to SetClassForSoftMax(TagA). This is the "lam=1
+  // reduces exactly to the unaugmented batch" guarantee for the softmax path.
+  Fit := TNeuralImageFit.Create;
+  Mixed := TNNetVolume.Create(cNumClasses, 1, 1);
+  Reference := TNNetVolume.Create(cNumClasses, 1, 1);
+  try
+    Reference.SetClassForSoftMax(cTagA);
+    Fit.BuildMixedSoftTarget(Mixed, cTagA, cTagB, 1.0);
+    for I := 0 to cNumClasses - 1 do
+      AssertEquals('lambda=1 soft target must be bit-identical to one-hot(TagA)',
+        Reference.FData[I], Mixed.FData[I], 0);
+  finally
+    Reference.Free;
+    Mixed.Free;
+    Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestMixedSoftTargetSameTag;
+var
+  Fit: TNeuralImageFit;
+  Mixed, Reference: TNNetVolume;
+  I: integer;
+  Sum, Lambda: TNeuralFloat;
+const
+  cNumClasses = 5;
+  cTag = 2;
+begin
+  // CutMix can pair a sample with a partner of the SAME class. The blend
+  // lambda*onehot(t)+(1-lambda)*onehot(t) must collapse back to a clean one-hot
+  // (the two weights add up on the same index) and still sum to 1.
+  Fit := TNeuralImageFit.Create;
+  Mixed := TNNetVolume.Create(cNumClasses, 1, 1);
+  Reference := TNNetVolume.Create(cNumClasses, 1, 1);
+  try
+    Reference.SetClassForSoftMax(cTag);
+    Lambda := 0.37;
+    Fit.BuildMixedSoftTarget(Mixed, cTag, cTag, Lambda);
+    Sum := 0;
+    for I := 0 to cNumClasses - 1 do Sum := Sum + Mixed.FData[I];
+    AssertEquals('Same-tag soft target must still sum to 1', 1.0, Sum, 1e-6);
+    for I := 0 to cNumClasses - 1 do
+      AssertEquals('Same-tag soft target must collapse to one-hot',
+        Reference.FData[I], Mixed.FData[I], 1e-6);
+  finally
+    Reference.Free;
+    Mixed.Free;
+    Fit.Free;
+  end;
+end;
+
+// Builds a tiny, easily separable 2-class image dataset: class 0 images are
+// (mostly) dark, class 1 images are (mostly) bright. SizeImgX/Y small so the
+// run is fast and fits well under the test memory/time budget.
+function BuildTinyImageSet(pCount: integer): TNNetVolumeList;
+var
+  I, X, Y, D, Cls: integer;
+  V: TNNetVolume;
+  Base: TNeuralFloat;
+const
+  // Must exceed TNeuralImageFit's default MaxCropSize (8) so the built-in
+  // random crop/resize leaves a non-degenerate region.
+  cSize = 16;
+begin
+  Result := TNNetVolumeList.Create();
+  for I := 0 to pCount - 1 do
+  begin
+    Cls := I mod 2;
+    V := TNNetVolume.Create(cSize, cSize, 3);
+    if Cls = 0 then Base := -0.6 else Base := 0.6;
+    for X := 0 to cSize - 1 do
+      for Y := 0 to cSize - 1 do
+        for D := 0 to 2 do
+          // small deterministic per-pixel jitter keeps classes separable but
+          // not perfectly constant.
+          V[X, Y, D] := Base + 0.05 * Sin(0.3 * X + 0.7 * Y + 1.1 * D + I);
+    V.Tag := Cls;
+    Result.Add(V);
+  end;
+end;
+
+// Accuracy of an image net over a volume list (argmax == Tag).
+function ImageSetAccuracy(NN: TNNet; pList: TNNetVolumeList): TNeuralFloat;
+var
+  I, Hit: integer;
+  Output: TNNetVolume;
+begin
+  Hit := 0;
+  Output := TNNetVolume.Create();
+  try
+    for I := 0 to pList.Count - 1 do
+    begin
+      NN.Compute(pList[I]);
+      NN.GetOutput(Output);
+      if Output.GetClass() = pList[I].Tag then Inc(Hit);
+    end;
+    Result := Hit / pList.Count;
+  finally
+    Output.Free;
+  end;
+end;
+
+// Shared body for the end-to-end convergence tests: a tiny TNeuralImageFit run
+// with the given batch-level augmentation mode ENABLED must train without
+// crashing and reach high accuracy on a trivially separable set. This exercises
+// the in-loop batch-level wiring (partner sampling, the mixup MixVolumes blend
+// or the CutMix patch paste + area-fraction lambda, and the soft-target
+// rewrite) on the real training path.
+function RunImageFitConverges(Mode: TNeuralBatchAugMode): TNeuralFloat;
+var
+  NN: TNNet;
+  Training: TNNetVolumeList;
+  Fit: TNeuralImageFit;
+  OldMask: TFPUExceptionMask;
+begin
+  // Mask FP exceptions like a real training loop (softmax/log can transiently
+  // touch exInvalidOp); restored in the finally block.
+  OldMask := GetExceptionMask;
+  SetExceptionMask(OldMask + [exInvalidOp, exOverflow, exZeroDivide,
+    exDenormalized, exUnderflow, exPrecision]);
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN.AddLayer([
+    TNNetInput.Create(16, 16, 3),
+    TNNetConvolutionReLU.Create(8, 3, 1, 1, 0),
+    TNNetMaxPool.Create(2),
+    TNNetFullConnectReLU.Create(16),
+    TNNetFullConnectLinear.Create(2),
+    TNNetSoftMax.Create()
+  ]);
+
+  Training := BuildTinyImageSet(40);
+  Fit := TNeuralImageFit.Create;
+  try
+    Fit.HideMessages;
+    Fit.Verbose := False;
+    Fit.MaxThreadNum := 1;
+    Fit.InitialLearningRate := 0.01;
+    Fit.LearningRateDecay := 0;
+    Fit.StaircaseEpochs := 1;
+    Fit.LoadBestAtEnd := False;
+    // Turn ON the batch-level augmentation under test.
+    Fit.BatchAugMode := Mode;
+    Fit.BatchAugAlpha := 0.2; // typical mixup/CutMix alpha
+    RandSeed := 100;
+    Fit.Fit(NN, Training, nil, nil, 2, 16, 30);
+
+    Result := ImageSetAccuracy(NN, Training);
+  finally
+    SetExceptionMask(OldMask);
+    Fit.Free;
+    Training.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestMixupImageFitConverges;
+var Acc: TNeuralFloat;
+begin
+  Acc := RunImageFitConverges(bamMixup);
+  AssertTrue('Mixup image-fit must reach high accuracy (' + FloatToStr(Acc) + ')',
+    Acc >= 0.9);
+end;
+
+procedure TTestNeuralFit.TestCutMixImageFitConverges;
+var Acc: TNeuralFloat;
+begin
+  Acc := RunImageFitConverges(bamCutMix);
+  AssertTrue('CutMix image-fit must reach high accuracy (' + FloatToStr(Acc) + ')',
+    Acc >= 0.9);
 end;
 
 initialization
