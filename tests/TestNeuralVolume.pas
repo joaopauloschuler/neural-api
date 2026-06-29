@@ -26,6 +26,8 @@ type
     procedure TestVolumeFlip;
     procedure TestVolumeClassification;
     procedure TestVolumeSoftMax;
+    procedure TestVolumeSoftMaxParity;
+    procedure TestVolumePointwiseSoftMaxParity;
     procedure TestVolumePadding;
     procedure TestVolumeTranspose;
     // Additional volume tests
@@ -49,6 +51,8 @@ type
     procedure TestAssertFiniteDetectsNaN;
     procedure TestAssertFiniteDetectsInf;
     procedure TestAssertFiniteNilVolume;
+    procedure TestNeuralBoxIoU;
+    procedure TestNeuralGreedyNMS;
   end;
 
 implementation
@@ -370,6 +374,102 @@ begin
     AssertTrue('V[3] should be greater than V[0]', V.Raw[3] > V.Raw[0]);
     AssertTrue('V[3] should be greater than V[1]', V.Raw[3] > V.Raw[1]);
     AssertTrue('V[3] should be greater than V[2]', V.Raw[3] > V.Raw[2]);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeSoftMaxParity;
+// Verifies the (possibly AVX) TVolume.SoftMax against an independent scalar
+// stable-softmax reference, element by element, within 1e-4.
+var
+  V: TNNetVolume;
+  Ref: array of TNeuralFloat;
+  N, I: integer;
+  MaxV, MinV, S: TNeuralFloat;
+begin
+  N := 37; // not a multiple of 8 to exercise the AVXExp remainder tail
+  V := TNNetVolume.Create(N, 1, 1);
+  SetLength(Ref, N);
+  try
+    RandSeed := 424242;
+    for I := 0 to N - 1 do
+    begin
+      V.Raw[I] := (Random - 0.5) * 20.0;
+      Ref[I] := V.Raw[I];
+    end;
+
+    // Independent scalar reference mirroring TVolume.SoftMax semantics.
+    MaxV := Ref[0];
+    for I := 1 to N - 1 do if Ref[I] > MaxV then MaxV := Ref[I];
+    if MaxV <> 0 then for I := 0 to N - 1 do Ref[I] := Ref[I] - MaxV;
+    MinV := Ref[0];
+    for I := 1 to N - 1 do if Ref[I] < MinV then MinV := Ref[I];
+    if MinV <> 0 then
+    begin
+      if MinV < -1000 then
+        for I := 0 to N - 1 do Ref[I] := Ref[I] * (-1000 / MinV);
+      S := 0;
+      for I := 0 to N - 1 do
+      begin
+        Ref[I] := Exp(NeuronForceRange(Ref[I], 4000));
+        S := S + Ref[I];
+      end;
+      if S > 0 then for I := 0 to N - 1 do Ref[I] := Ref[I] / S;
+    end;
+
+    V.SoftMax();
+
+    for I := 0 to N - 1 do
+      AssertEquals('SoftMax parity at ' + IntToStr(I), Ref[I], V.Raw[I], 1e-4);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumePointwiseSoftMaxParity;
+// Verifies TVolume.PointwiseSoftMax (per-(x,y) over the depth axis) against an
+// independent scalar stable-softmax reference, within 1e-4.
+var
+  V: TNNetVolume;
+  SX, SY, D, X, Y, K, Base: integer;
+  Ref: array of TNeuralFloat;
+  MaxV, S: TNeuralFloat;
+begin
+  SX := 3; SY := 2; D := 13; // depth not a multiple of 8 -> AVXExp tail
+  V := TNNetVolume.Create(SX, SY, D);
+  SetLength(Ref, SX * SY * D);
+  try
+    RandSeed := 99;
+    for K := 0 to SX * SY * D - 1 do
+    begin
+      V.Raw[K] := (Random - 0.5) * 16.0;
+      Ref[K] := V.Raw[K];
+    end;
+
+    // Independent per-(x,y) scalar reference over the contiguous depth span.
+    for X := 0 to SX - 1 do
+      for Y := 0 to SY - 1 do
+      begin
+        Base := V.GetRawPos(X, Y, 0);
+        MaxV := Ref[Base];
+        for K := 1 to D - 1 do
+          if Ref[Base + K] > MaxV then MaxV := Ref[Base + K];
+        S := 0;
+        for K := 0 to D - 1 do
+        begin
+          Ref[Base + K] := Exp(NeuronForceRange(Ref[Base + K] - MaxV, 4000));
+          S := S + Ref[Base + K];
+        end;
+        if S > 0 then
+          for K := 0 to D - 1 do Ref[Base + K] := Ref[Base + K] / S;
+      end;
+
+    V.PointwiseSoftMax();
+
+    for K := 0 to SX * SY * D - 1 do
+      AssertEquals('PointwiseSoftMax parity at ' + IntToStr(K),
+        Ref[K], V.Raw[K], 1e-4);
   finally
     V.Free;
   end;
@@ -922,6 +1022,56 @@ begin
       Raised := True;
   end;
   AssertTrue('Exception should have been raised for nil volume', Raised);
+end;
+
+procedure TTestNeuralVolume.TestNeuralBoxIoU;
+var
+  IoU: TNeuralFloat;
+begin
+  // Identical boxes -> IoU 1.
+  AssertEquals('Identical boxes IoU', 1.0,
+    NeuralBoxIoU(0, 0, 10, 10, 0, 0, 10, 10), 1e-5);
+  // Disjoint boxes -> IoU 0.
+  AssertEquals('Disjoint boxes IoU', 0.0,
+    NeuralBoxIoU(0, 0, 10, 10, 100, 100, 110, 110), 1e-5);
+  // Half overlap: A=(0,0,10,10), B=(5,0,15,10). inter=5*10=50,
+  // union=100+100-50=150 -> IoU = 1/3.
+  IoU := NeuralBoxIoU(0, 0, 10, 10, 5, 0, 15, 10);
+  AssertEquals('Half-overlap IoU', 1.0 / 3.0, IoU, 1e-5);
+  // Degenerate (zero-area) box -> 0.
+  AssertEquals('Degenerate box IoU', 0.0,
+    NeuralBoxIoU(5, 5, 5, 5, 0, 0, 10, 10), 1e-5);
+end;
+
+procedure TTestNeuralVolume.TestNeuralGreedyNMS;
+var
+  BX1, BY1, BX2, BY2, Scores: array of TNeuralFloat;
+  Classes: TNeuralIntegerArray;
+  Kept: TNeuralIntegerArray;
+begin
+  // Four candidate boxes:
+  //   0: (0,0,10,10)       class 0  score 0.90  -> KEPT (highest)
+  //   1: (1,1,11,11)       class 0  score 0.80  -> SUPPRESSED by 0 (IoU>0.45)
+  //   2: (1,1,11,11)       class 1  score 0.85  -> KEPT (different class)
+  //   3: (100,100,110,110) class 0  score 0.70  -> KEPT (no overlap)
+  SetLength(BX1, 4); SetLength(BY1, 4); SetLength(BX2, 4); SetLength(BY2, 4);
+  SetLength(Scores, 4); SetLength(Classes, 4);
+  BX1[0] := 0;   BY1[0] := 0;   BX2[0] := 10;  BY2[0] := 10;  Scores[0] := 0.90; Classes[0] := 0;
+  BX1[1] := 1;   BY1[1] := 1;   BX2[1] := 11;  BY2[1] := 11;  Scores[1] := 0.80; Classes[1] := 0;
+  BX1[2] := 1;   BY1[2] := 1;   BX2[2] := 11;  BY2[2] := 11;  Scores[2] := 0.85; Classes[2] := 1;
+  BX1[3] := 100; BY1[3] := 100; BX2[3] := 110; BY2[3] := 110; Scores[3] := 0.70; Classes[3] := 0;
+
+  Kept := NeuralGreedyNMS(BX1, BY1, BX2, BY2, Scores, Classes, 4, 0.45);
+
+  // Expected kept indices in descending-score order: [0, 2, 3].
+  AssertEquals('Kept count', 3, Length(Kept));
+  AssertEquals('Kept[0] (score 0.90)', 0, Kept[0]);
+  AssertEquals('Kept[1] (score 0.85, class 1)', 2, Kept[1]);
+  AssertEquals('Kept[2] (score 0.70, disjoint)', 3, Kept[2]);
+
+  // Empty input -> empty result, no crash.
+  Kept := NeuralGreedyNMS(BX1, BY1, BX2, BY2, Scores, Classes, 0, 0.45);
+  AssertEquals('Empty NMS count', 0, Length(Kept));
 end;
 
 initialization

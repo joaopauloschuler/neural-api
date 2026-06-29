@@ -78,6 +78,12 @@ type
     FContext: cl_context;        // OpenCL compute context
     FCommands: cl_command_queue; // OpenCL compute command queue
     FProg: cl_program;           // OpenCL compute program
+    // When true the context/command-queue/program above are BORROWED from
+    // another TEasyOpenCL (the shared dot-product kernel) and must NOT be
+    // released by this instance. Set by TNeuralKernel.CreateFromProgram so a
+    // helper kernel can bind the already-compiled neural.cl program instead of
+    // recompiling it per layer. (Coded by Claude (AI).)
+    FBorrowedContext: boolean;
     {$IFDEF FPC}
     FCompilerOptions: string[255];
     {$ELSE}
@@ -166,6 +172,14 @@ type
       procedure UnprepareKernel();
     public
       constructor Create(pCurrentPlatform: cl_platform_id; pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product');
+      // Binds a kernel entry point against the ALREADY-COMPILED program of a
+      // shared kernel (e.g. the net-wide dot-product kernel) instead of
+      // recompiling neural.cl. The context, command queue and program are
+      // borrowed from SharedKernel and are not released by this instance; only
+      // the kernel handle and the per-instance buffers are owned here. This is
+      // the shared-program form of the auxiliary helper kernels (RoPE, softmax,
+      // norms, gathers, ...). (Coded by Claude (AI).)
+      constructor CreateFromProgram(SharedKernel: TEasyOpenCL; kernelname: string; pHideMessages: boolean = true);
       destructor Destroy(); override;
 
       property Kernel: cl_kernel read FKernel;
@@ -224,6 +238,11 @@ type
       function PrepareForCompute(VAs, VBs: TNNetVolume; pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0): integer;
       procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint; NewVAs:boolean = true; NewVBs:boolean = true);
       procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
+
+      /// The underlying device kernel shared by this instance. Exposed so a layer
+      /// can spin up a second TDotProductSharedKernel (e.g. a dedicated backward
+      /// instance) bound to the same kernel without re-deriving it.
+      property DotProductKernel: TDotProductKernel read FDotProductKernel;
   end;
 
   /// Class that does dot products via OpenCL
@@ -583,10 +602,43 @@ begin
   begin
     CompileProgramFromFile('neural-api/neural/neural.cl');
   end
+  // Repo-relative fallback: the test suite (and other tools) run from the
+  // sibling tests/ or examples/<x>/ directory, where the kernel source sits one
+  // or two levels up under neural/. Without this the kernel silently fails to
+  // build and the offload returns garbage.
+  else if FileExists('../neural/neural.cl') then
+  begin
+    CompileProgramFromFile('../neural/neural.cl');
+  end
+  else if FileExists('../../neural/neural.cl') then
+  begin
+    CompileProgramFromFile('../../neural/neural.cl');
+  end
   else
   begin
     MessageProc('File neural.cl could not be found.');
   end;
+  PrepareKernel(kernelname);
+end;
+
+constructor TNeuralKernel.CreateFromProgram(SharedKernel: TEasyOpenCL;
+  kernelname: string; pHideMessages: boolean = true);
+begin
+  inherited Create();
+  // Suppress the per-layer "clCreateKernel ... OK!" chatter by default: a model
+  // with many transformer blocks binds the same helper kernel dozens of times.
+  if pHideMessages then HideMessages();
+  // Borrow the shared kernel's context/queue/program. FBorrowedContext keeps the
+  // destructor from releasing them (they outlive this helper). No
+  // CompileProgramFromFile call here: neural.cl was already built once when the
+  // shared dot-product kernel was created.
+  FBorrowedContext := true;
+  FCurrentPlatform := SharedKernel.CurrentPlatform;
+  FCurrentDevice   := SharedKernel.CurrentDevice;
+  FContext  := SharedKernel.Context;
+  FCommands := SharedKernel.Commands;
+  FProg     := SharedKernel.Prog;
+  // Bind our own kernel handle into the shared (already-built) program.
   PrepareKernel(kernelname);
 end;
 
@@ -920,6 +972,16 @@ end;
 
 procedure TEasyOpenCL.FreeContext();
 begin
+  // Borrowed context/queue/program belong to the shared kernel that compiled
+  // them; releasing them here would tear them out from under every other
+  // borrower. Just drop our references. (Coded by Claude (AI).)
+  if FBorrowedContext then
+  begin
+    FProg := nil;
+    FCommands := nil;
+    FContext := nil;
+    exit;
+  end;
   if Assigned(FProg) then clReleaseProgram(FProg);
   if Assigned(FCommands) then clReleaseCommandQueue(FCommands);
   if Assigned(FContext) then clReleaseContext(FContext);
@@ -1393,6 +1455,7 @@ begin
   FContext := nil;        // compute context
   FCommands := nil;       // compute command queue
   FProg := nil;           // compute program
+  FBorrowedContext := false;
 end;
 
 destructor TEasyOpenCL.Destroy();

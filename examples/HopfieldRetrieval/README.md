@@ -31,12 +31,14 @@ The whole behaviour is governed by `beta`:
 
 No training, no iteration, no backprop: retrieval is one forward step.
 
-This demo takes **route B** from the design brief — the math is done
-directly on plain vectors (`scores[k] = beta * dot(q, X[k])`, softmax
-over `k`, then `retrieved = sum_k w[k] * X[k]`) so that `beta` is
-literally a number in the score and the equivalence is self-evidently
-correct. (Route A would wire the same computation through
-`TNNetScaledDotProductAttention`.)
+This demo drives the **shipped library layer** for exactly this rule:
+`TNNetModernHopfield`, built with `TNNet.AddModernHopfieldRetrieval`. The
+stored patterns are loaded straight into the layer's bank
+(`Neurons[0].Weights`, a `(K,1,d)` volume), the corrupted query is the
+`(1,1,d)` input, `beta` is the layer's inverse temperature and `KSteps`
+is the number of iterated update steps. Here `KSteps = 1` — a single
+softmax-attention step — and the retrieved vector is read straight from
+the layer output. No retrieval math is re-implemented in the example.
 
 ## The retrieval task
 
@@ -50,8 +52,8 @@ Everything is generated in-code (no dataset download), with a fixed
 2. For each stored pattern, **corrupt** it by flipping the sign of a
    fraction of its dimensions, then run one Hopfield step.
 3. Report, per pattern: the input cosine to the true pattern, the
-   retrieved cosine, the `argmax` of the attention weights (which stored
-   pattern was selected) and its weight.
+   retrieved cosine, which stored pattern the retrieved vector is
+   **nearest** to (argmax cosine over the bank) and that cosine.
 
 ## The beta sweep
 
@@ -77,8 +79,8 @@ non-interactive (no trailing `ReadLn`).
 
 - A per-pattern retrieval table at the sanity-check operating point
   (`beta = 8`, flip fraction `0.15`): every corrupted query is completed
-  back to its true stored pattern (`cos(out) = 1.000`) and the
-  `argmax`-attention weight points at the correct pattern.
+  back to its true stored pattern (`cos(out) = 1.000`) and the retrieved
+  vector is nearest the correct stored pattern.
 - The **same** queries replayed at low `beta = 0.1`: now the retrieved
   vectors are blurry averages (lower `cos(out)`, attention mass spread
   across several patterns) — a vivid contrast against the high-`beta`
@@ -86,8 +88,8 @@ non-interactive (no trailing `ReadLn`).
 - A `beta` sweep and a corruption sweep of mean retrieval cosine.
 - Two NaN/Inf-guarded sanity checks printed as `PASS`/`FAIL`:
   1. at high `beta` and low corruption, all `K` patterns recover with
-     cosine `> 0.95` **and** every query's `argmax`-attention selects
-     the correct stored pattern, and
+     cosine `> 0.95` **and** every query's retrieval lands nearest the
+     correct stored pattern, and
   2. the blurry-average -> clean-snap transition is real: low `beta`
      produces a measurably blurry average while high `beta` snaps
      essentially perfectly.
@@ -102,19 +104,19 @@ Worst-case |cosine| between distinct stored patterns: 0.313
 
 === Per-pattern retrieval (single Hopfield step) ===
   beta=8.00  flip=0.15
-    pattern     cos(in)   cos(out)   argmax   weight     ok
+    pattern     cos(in)   cos(out)  nearest    cos_n     ok
     p0            0.375      1.000        0    1.000    yes
-    p1            0.750      1.000        1    1.000    yes
-    p2            0.813      1.000        2    1.000    yes
-    p3            0.875      1.000        3    1.000    yes
-    p4            0.750      1.000        4    1.000    yes
-    p5            0.750      1.000        5    1.000    yes
+    p1            0.625      1.000        1    1.000    yes
+    p2            0.750      1.000        2    1.000    yes
+    p3            0.750      1.000        3    1.000    yes
+    p4            0.813      1.000        4    1.000    yes
+    p5            0.688      1.000        5    1.000    yes
 
 === Same queries, LOW beta (blurry average, NOT a memory) ===
   beta=0.10  flip=0.15
-    pattern     cos(in)   cos(out)   argmax   weight     ok
-    p0            0.375      0.793        0    0.321     no
-    p1            0.750      0.938        1    0.582     no
+    pattern     cos(in)   cos(out)  nearest    cos_n     ok
+    p0            0.875      0.980        0    0.980    yes
+    p1            0.375      0.853        1    0.853     no
     ...
 
 === Beta sweep (mean retrieval cosine, flip=0.15) ===
@@ -124,11 +126,11 @@ Worst-case |cosine| between distinct stored patterns: 0.313
 
 === Corruption sweep (mean retrieval cosine, beta=8.0) ===
     flip_frac        0.00     0.10     0.20     0.30     0.40
-    mean_cos        1.000    1.000    1.000    0.758    0.260
+    mean_cos        1.000    1.000    1.000    0.826    0.556
 
 === Sanity checks ===
-[PASS] beta=8.0 flip=0.15: all 6 patterns recovered (cos>0.95) and argmax-attention picked the correct stored pattern.
-[PASS] blurry->snap: low beta=0.1 is a blurry average (mean_cos=0.947) while high beta=8.0 snaps cleanly (mean_cos=1.000).
+[PASS] beta=8.0 flip=0.15: all 6 patterns recovered (cos>0.95) and the retrieval landed nearest the correct stored pattern.
+[PASS] blurry->snap: low beta=0.1 is a blurry average (mean_cos=0.952) while high beta=8.0 snaps cleanly (mean_cos=1.000).
 ```
 
 The corruption sweep also shows the capacity edge: past a critical flip

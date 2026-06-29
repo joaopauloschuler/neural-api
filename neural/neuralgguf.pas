@@ -28,15 +28,21 @@ unit neuralgguf;
 //        each block an f16 scale d + 32 int8 quants, x = d * q. Decoded
 //        (dequantized) to FP32 on load - the int8-direct path into
 //        TNNet.QuantizeWeightsInt8 storage is a possible follow-up.
-//   Q2_K (10) / Q4_K (12) / Q5_K (13) / Q6_K (14) - the k-quant members of
-//        the dominant community mixes. ggml k-quant 256-element super-blocks:
-//        Q4_K/Q5_K/Q6_K use 8 sub-blocks of 32 with a block-level f16 d
-//        (plus f16 d_min for Q4_K/Q5_K), 6-bit packed sub-scales/sub-mins
-//        and 4/5/6-bit packed quants; Q2_K uses 16 sub-blocks of 16 with
-//        4-bit packed sub-scales/sub-mins and 2-bit quants. Dequantized to
-//        FP32 on load, mirroring ggml's reference dequant_row_q2_K /
-//        dequant_row_q4_K / dequant_row_q5_K / dequant_row_q6_K unpacking.
-// Anything else (Q3_K, Q4_0, ...) raises EGGUFError with the type name.
+//   Q2_K (10) / Q3_K (11) / Q4_K (12) / Q5_K (13) / Q6_K (14) - the k-quant
+//        members of the dominant community mixes. ggml k-quant 256-element
+//        super-blocks: Q4_K/Q5_K/Q6_K use 8 sub-blocks of 32 with a
+//        block-level f16 d (plus f16 d_min for Q4_K/Q5_K), 6-bit packed
+//        sub-scales/sub-mins and 4/5/6-bit packed quants; Q2_K and Q3_K use
+//        16 sub-blocks of 16. Q3_K carries a 32-byte hmask (3rd bit-plane),
+//        64 bytes of 2-bit low quants, 12 bytes of 6-bit packed sub-scales
+//        and an f16 d. Dequantized to FP32 on load, mirroring ggml's
+//        reference dequant_row_q2_K / q3_K / q4_K / q5_K / q6_K unpacking.
+//   Q4_0 (2) / Q4_1 (3) / Q5_0 (6) / Q5_1 (7) - legacy round-to-nearest
+//        quants in 32-element blocks: f16 d (+ f16 m for the _1 variants,
+//        + a 4-byte 5th-bit plane for the _5 variants) and 16 bytes of 32
+//        4-bit nibbles. x = d*(nibble[-bias]) [+ m]. Dequantized to FP32 on
+//        load, mirroring ggml's dequantize_row_q4_0/q4_1/q5_0/q5_1.
+// Anything else raises EGGUFError with the type name.
 //
 // Importer hooks (used by BuildLlamaFromGGUF in neuralpretrained.pas):
 //   RenameTensor          - GGUF names tensors per the ggml convention
@@ -80,8 +86,13 @@ const
   // ggml tensor dtype ids (the ones this reader decodes).
   GGML_TYPE_F32  = 0;
   GGML_TYPE_F16  = 1;
+  GGML_TYPE_Q4_0 = 2;
+  GGML_TYPE_Q4_1 = 3;
+  GGML_TYPE_Q5_0 = 6;
+  GGML_TYPE_Q5_1 = 7;
   GGML_TYPE_Q8_0 = 8;
   GGML_TYPE_Q2_K = 10;
+  GGML_TYPE_Q3_K = 11;
   GGML_TYPE_Q4_K = 12;
   GGML_TYPE_Q5_K = 13;
   GGML_TYPE_Q6_K = 14;
@@ -108,6 +119,23 @@ const
   // block_q6_K = 210 bytes: 128 bytes ql (4-bit low), 64 bytes qh (2-bit
   // high), 16 int8 group scales, then f16 d.
   GGUF_Q6_K_BLOCK_BYTES = 210;
+  // block_q3_K = 110 bytes: 32 bytes hmask (the 3rd bit-plane), 64 bytes qs
+  // (2-bit low quants), 12 bytes of 6-bit packed sub-scales, then f16 d.
+  // QK_K=256 elements as 16 sub-blocks of 16.
+  GGUF_Q3_K_BLOCK_BYTES = 110;
+
+  // Legacy round-to-nearest block geometries. Each block holds QK=32
+  // elements along the contiguous axis (the same block size as Q8_0).
+  GGUF_QK_LEGACY        = 32;
+  // block_q4_0 = 18 bytes: f16 d, then 16 bytes (32 4-bit nibbles).
+  GGUF_Q4_0_BLOCK_BYTES = 18;
+  // block_q4_1 = 20 bytes: f16 d, f16 m, then 16 bytes (32 nibbles).
+  GGUF_Q4_1_BLOCK_BYTES = 20;
+  // block_q5_0 = 22 bytes: f16 d, 4 bytes qh (the 5th-bit plane), then 16
+  // bytes (32 nibbles).
+  GGUF_Q5_0_BLOCK_BYTES = 22;
+  // block_q5_1 = 24 bytes: f16 d, f16 m, 4 bytes qh, then 16 bytes nibbles.
+  GGUF_Q5_1_BLOCK_BYTES = 24;
 
 type
   EGGUFError = class(ESafeTensorsError);
@@ -337,6 +365,16 @@ begin
       Result := (NumElements div GGUF_QK_K) * GGUF_Q5_K_BLOCK_BYTES;
     GGML_TYPE_Q6_K:
       Result := (NumElements div GGUF_QK_K) * GGUF_Q6_K_BLOCK_BYTES;
+    GGML_TYPE_Q3_K:
+      Result := (NumElements div GGUF_QK_K) * GGUF_Q3_K_BLOCK_BYTES;
+    GGML_TYPE_Q4_0:
+      Result := (NumElements div GGUF_QK_LEGACY) * GGUF_Q4_0_BLOCK_BYTES;
+    GGML_TYPE_Q4_1:
+      Result := (NumElements div GGUF_QK_LEGACY) * GGUF_Q4_1_BLOCK_BYTES;
+    GGML_TYPE_Q5_0:
+      Result := (NumElements div GGUF_QK_LEGACY) * GGUF_Q5_0_BLOCK_BYTES;
+    GGML_TYPE_Q5_1:
+      Result := (NumElements div GGUF_QK_LEGACY) * GGUF_Q5_1_BLOCK_BYTES;
     else Result := 0;
   end;
 end;
@@ -581,6 +619,195 @@ begin
   end;
 end;
 
+// Dequantizes a Q3_K tensor (NumBlocks super-blocks of 256) from Raw into
+// Dest in flat row-major order. Block layout (110 bytes): 32 bytes hmask
+// (the 3rd bit-plane), 64 bytes qs (2-bit low quants), 12 bytes of 6-bit
+// packed sub-scales, then f16 d. There are 16 sub-blocks of 16 elements.
+//
+// Scale unpacking mirrors ggml/gguf's q3_K 6-bit packing: the first 8 bytes
+// (lscales) carry the low 4 bits of each of the 16 scales (byte b holds
+// scale b in the low nibble and scale b+8 in the high nibble); the last 4
+// bytes (hscales) carry the high 2 bits (byte b, shift 2*g, holds scales
+// b, b+4, b+8, b+12). scale = ((lscale & 0x0F) | ((hscale & 0x03) << 4))
+// read as int8 minus 32. Reconstruction per sub-block sb: dl = d*scale[sb];
+// q = ql - (qh << 2) where ql is the 2-bit low quant and qh is the hmask bit
+// XORed with 1 (so a CLEAR high bit contributes -4, a SET bit contributes 0).
+//
+// qs layout: element e splits as h0 = e div 128, p = e mod 32,
+// s = (e mod 128) div 32; the 2-bit field is at shift 2*s of byte
+// (h0*32 + p) (ggml's qs.reshape(-1,2,1,32) >> [0,2,4,6]).
+// hmask layout: hmask bit (e div 32) of byte (e mod 32)
+// (ggml's hmask.reshape(-1,1,1,32) >> [0..7]).
+procedure DequantizeQ3K(const Raw: PByte; NumBlocks: Int64;
+  Dest: PSingle);
+var
+  b, e, h0, p, s, sb: Int64;
+  Base, HmPtr, QsPtr, ScPtr: PByte;
+  d: single;
+  Scales: array[0..15] of shortint;
+  lsc, hsc: byte;
+  ql, qh: integer;
+  qv: integer;
+  Outp: PSingle;
+  NumBlocksM1, QKM1: Int64;
+  j: integer;
+begin
+  NumBlocksM1 := NumBlocks - 1;
+  QKM1 := GGUF_QK_K - 1;
+  for b := 0 to NumBlocksM1 do
+  begin
+    Base  := Raw + b * GGUF_Q3_K_BLOCK_BYTES;
+    HmPtr := Base;             // 32 bytes hmask (3rd bit-plane)
+    QsPtr := Base + 32;        // 64 bytes 2-bit low quants
+    ScPtr := Base + 96;        // 12 bytes 6-bit packed scales
+    d := DecodeF16(PWord(Base + 108)^);
+    // Unpack the 16 6-bit signed scales (lscales bytes 0..7, hscales 8..11).
+    for j := 0 to 15 do
+    begin
+      // low 4 bits: byte (j mod 8), low nibble for j<8 else high nibble.
+      lsc := (ScPtr + (j and $07))^;
+      if j < 8 then lsc := lsc and $0F
+      else lsc := (lsc shr 4) and $0F;
+      // high 2 bits: byte 8 + (j mod 4), shift 2*(j div 4).
+      hsc := (ScPtr + 8 + (j and $03))^;
+      hsc := (hsc shr (2 * (j shr 2))) and $03;
+      Scales[j] := shortint(byte(lsc or (hsc shl 4)) - 32);
+    end;
+    Outp := Dest + b * GGUF_QK_K;
+    for e := 0 to QKM1 do
+    begin
+      h0 := e div 128;
+      p  := e mod 32;
+      s  := (e mod 128) div 32;
+      ql := ((QsPtr + (h0 * 32 + p))^ shr (2 * s)) and $03;
+      qh := ((HmPtr + p)^ shr (e div 32)) and $01;
+      qh := qh xor $01;        // CLEAR high bit -> contributes -4
+      qv := ql - (qh shl 2);
+      sb := e div 16;
+      Outp[e] := d * Scales[sb] * qv;
+    end;
+  end;
+end;
+
+// Splits a legacy QK=32 nibble block: element e in 0..31 lives in the low
+// nibble of byte e for e<16, and in the high nibble of byte (e-16) for
+// e>=16 (ggml's qs.reshape(-1,2,16) >> [0,4]). Returns the 4-bit value.
+function LegacyNibble(const Quants: PByte; e: integer): byte; inline;
+begin
+  if e < 16 then
+    Result := (Quants + e)^ and $0F
+  else
+    Result := ((Quants + (e - 16))^ shr 4) and $0F;
+end;
+
+// Dequantizes a legacy Q4_0 tensor (NumBlocks blocks of 32) from Raw into
+// Dest. Block layout (18 bytes): f16 d, then 16 bytes of 32 nibbles.
+// x = d * (nibble - 8).
+procedure DequantizeQ4_0(const Raw: PByte; NumBlocks: Int64; Dest: PSingle);
+var
+  b: Int64;
+  Base: PByte;
+  d: single;
+  e: integer;
+  Outp: PSingle;
+  NumBlocksM1: Int64;
+begin
+  NumBlocksM1 := NumBlocks - 1;
+  for b := 0 to NumBlocksM1 do
+  begin
+    Base := Raw + b * GGUF_Q4_0_BLOCK_BYTES;
+    d := DecodeF16(PWord(Base)^);
+    Outp := Dest + b * GGUF_QK_LEGACY;
+    for e := 0 to GGUF_QK_LEGACY - 1 do
+      Outp[e] := d * (integer(LegacyNibble(Base + 2, e)) - 8);
+  end;
+end;
+
+// Dequantizes a legacy Q4_1 tensor (NumBlocks blocks of 32) from Raw into
+// Dest. Block layout (20 bytes): f16 d, f16 m, then 16 bytes nibbles.
+// x = d * nibble + m.
+procedure DequantizeQ4_1(const Raw: PByte; NumBlocks: Int64; Dest: PSingle);
+var
+  b: Int64;
+  Base: PByte;
+  d, m: single;
+  e: integer;
+  Outp: PSingle;
+  NumBlocksM1: Int64;
+begin
+  NumBlocksM1 := NumBlocks - 1;
+  for b := 0 to NumBlocksM1 do
+  begin
+    Base := Raw + b * GGUF_Q4_1_BLOCK_BYTES;
+    d := DecodeF16(PWord(Base)^);
+    m := DecodeF16(PWord(Base + 2)^);
+    Outp := Dest + b * GGUF_QK_LEGACY;
+    for e := 0 to GGUF_QK_LEGACY - 1 do
+      Outp[e] := d * integer(LegacyNibble(Base + 4, e)) + m;
+  end;
+end;
+
+// Dequantizes a legacy Q5_0 tensor (NumBlocks blocks of 32) from Raw into
+// Dest. Block layout (22 bytes): f16 d, 4 bytes qh (a 32-bit LE 5th-bit
+// plane), then 16 bytes nibbles. x = d * ((nibble | (qh_bit << 4)) - 16).
+procedure DequantizeQ5_0(const Raw: PByte; NumBlocks: Int64; Dest: PSingle);
+var
+  b: Int64;
+  Base: PByte;
+  d: single;
+  qh: cardinal;
+  e: integer;
+  q5: integer;
+  Outp: PSingle;
+  NumBlocksM1: Int64;
+begin
+  NumBlocksM1 := NumBlocks - 1;
+  for b := 0 to NumBlocksM1 do
+  begin
+    Base := Raw + b * GGUF_Q5_0_BLOCK_BYTES;
+    d := DecodeF16(PWord(Base)^);
+    qh := PCardinal(Base + 2)^;
+    Outp := Dest + b * GGUF_QK_LEGACY;
+    for e := 0 to GGUF_QK_LEGACY - 1 do
+    begin
+      q5 := integer(LegacyNibble(Base + 6, e)) or
+        (integer((qh shr e) and $01) shl 4);
+      Outp[e] := d * (q5 - 16);
+    end;
+  end;
+end;
+
+// Dequantizes a legacy Q5_1 tensor (NumBlocks blocks of 32) from Raw into
+// Dest. Block layout (24 bytes): f16 d, f16 m, 4 bytes qh, then 16 bytes
+// nibbles. x = d * (nibble | (qh_bit << 4)) + m.
+procedure DequantizeQ5_1(const Raw: PByte; NumBlocks: Int64; Dest: PSingle);
+var
+  b: Int64;
+  Base: PByte;
+  d, m: single;
+  qh: cardinal;
+  e: integer;
+  q5: integer;
+  Outp: PSingle;
+  NumBlocksM1: Int64;
+begin
+  NumBlocksM1 := NumBlocks - 1;
+  for b := 0 to NumBlocksM1 do
+  begin
+    Base := Raw + b * GGUF_Q5_1_BLOCK_BYTES;
+    d := DecodeF16(PWord(Base)^);
+    m := DecodeF16(PWord(Base + 2)^);
+    qh := PCardinal(Base + 4)^;
+    Outp := Dest + b * GGUF_QK_LEGACY;
+    for e := 0 to GGUF_QK_LEGACY - 1 do
+    begin
+      q5 := integer(LegacyNibble(Base + 8, e)) or
+        (integer((qh shr e) and $01) shl 4);
+      Outp[e] := d * q5 + m;
+    end;
+  end;
+end;
+
 { TNNetGGUFReader }
 
 constructor TNNetGGUFReader.Create(const pFileName: string);
@@ -797,13 +1024,20 @@ begin
       FTensors[i].Shape[j] := Dims[NDims - 1 - j];
     Stream.ReadBuffer(U32, 4);
     FGGMLTypes[i] := integer(U32);
-    if (FGGMLTypes[i] = GGML_TYPE_Q8_0) and
+    // Q8_0 and the legacy round-to-nearest quants all use 32-element blocks.
+    if ((FGGMLTypes[i] = GGML_TYPE_Q8_0) or
+        (FGGMLTypes[i] = GGML_TYPE_Q4_0) or
+        (FGGMLTypes[i] = GGML_TYPE_Q4_1) or
+        (FGGMLTypes[i] = GGML_TYPE_Q5_0) or
+        (FGGMLTypes[i] = GGML_TYPE_Q5_1)) and
        ((Dims[0] mod GGUF_Q8_0_BLOCK_ELEMS) <> 0) then
       raise EGGUFError.CreateFmt(
-        'gguf: tensor "%s" is Q8_0 but its contiguous dimension %d is not ' +
+        'gguf: tensor "%s" is %s but its contiguous dimension %d is not ' +
         'a multiple of the block size %d: %s',
-        [FTensors[i].Name, Dims[0], GGUF_Q8_0_BLOCK_ELEMS, FFileName]);
+        [FTensors[i].Name, GGMLTypeName(FGGMLTypes[i]), Dims[0],
+         GGUF_Q8_0_BLOCK_ELEMS, FFileName]);
     if ((FGGMLTypes[i] = GGML_TYPE_Q2_K) or
+        (FGGMLTypes[i] = GGML_TYPE_Q3_K) or
         (FGGMLTypes[i] = GGML_TYPE_Q4_K) or
         (FGGMLTypes[i] = GGML_TYPE_Q5_K) or
         (FGGMLTypes[i] = GGML_TYPE_Q6_K)) and
@@ -1086,11 +1320,14 @@ begin
   GGMLType := FGGMLTypes[Idx];
   if (GGMLType <> GGML_TYPE_F32) and (GGMLType <> GGML_TYPE_F16) and
      (GGMLType <> GGML_TYPE_Q8_0) and (GGMLType <> GGML_TYPE_Q2_K) and
+     (GGMLType <> GGML_TYPE_Q3_K) and
      (GGMLType <> GGML_TYPE_Q4_K) and (GGMLType <> GGML_TYPE_Q5_K) and
-     (GGMLType <> GGML_TYPE_Q6_K) then
+     (GGMLType <> GGML_TYPE_Q6_K) and (GGMLType <> GGML_TYPE_Q4_0) and
+     (GGMLType <> GGML_TYPE_Q4_1) and (GGMLType <> GGML_TYPE_Q5_0) and
+     (GGMLType <> GGML_TYPE_Q5_1) then
     raise EGGUFError.CreateFmt(
       'gguf: tensor "%s" has unsupported ggml dtype %s (supported: F32, ' +
-      'F16, Q8_0, Q2_K, Q4_K, Q5_K, Q6_K): %s',
+      'F16, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q4_0, Q4_1, Q5_0, Q5_1): %s',
       [pName, GGMLTypeName(GGMLType), FFileName]);
   NumElements := ElementCount(pName);
   if NumElements > High(integer) then
@@ -1170,6 +1407,34 @@ begin
     begin
       NumBlocks := NumElements div GGUF_QK_K;
       DequantizeQ6K(PByte(@RawBytes[0]), NumBlocks, PSingle(@Dest.FData[0]));
+    end;
+    GGML_TYPE_Q3_K:
+    begin
+      // 2-bit low quants + a 3rd bit-plane (hmask) and 6-bit packed scales:
+      // 110-byte super-blocks of 256, 16 sub-blocks of 16.
+      NumBlocks := NumElements div GGUF_QK_K;
+      DequantizeQ3K(PByte(@RawBytes[0]), NumBlocks, PSingle(@Dest.FData[0]));
+    end;
+    GGML_TYPE_Q4_0:
+    begin
+      // Legacy round-to-nearest 32-element blocks: f16 d + 32 nibbles.
+      NumBlocks := NumElements div GGUF_QK_LEGACY;
+      DequantizeQ4_0(PByte(@RawBytes[0]), NumBlocks, PSingle(@Dest.FData[0]));
+    end;
+    GGML_TYPE_Q4_1:
+    begin
+      NumBlocks := NumElements div GGUF_QK_LEGACY;
+      DequantizeQ4_1(PByte(@RawBytes[0]), NumBlocks, PSingle(@Dest.FData[0]));
+    end;
+    GGML_TYPE_Q5_0:
+    begin
+      NumBlocks := NumElements div GGUF_QK_LEGACY;
+      DequantizeQ5_0(PByte(@RawBytes[0]), NumBlocks, PSingle(@Dest.FData[0]));
+    end;
+    GGML_TYPE_Q5_1:
+    begin
+      NumBlocks := NumElements div GGUF_QK_LEGACY;
+      DequantizeQ5_1(PByte(@RawBytes[0]), NumBlocks, PSingle(@Dest.FData[0]));
     end;
   end;
   // Registered q/k projections: undo llama.cpp's per-head interleaved-

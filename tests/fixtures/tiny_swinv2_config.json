@@ -1,0 +1,25 @@
+{
+ "model_type": "swinv2",
+ "image_size": 8,
+ "patch_size": 2,
+ "num_channels": 3,
+ "embed_dim": 4,
+ "depths": [
+  2,
+  2
+ ],
+ "num_heads": [
+  2,
+  4
+ ],
+ "window_size": 2,
+ "mlp_ratio": 2.0,
+ "qkv_bias": true,
+ "hidden_act": "gelu",
+ "layer_norm_eps": 1e-05,
+ "num_labels": 5,
+ "pretrained_window_sizes": [
+  0,
+  0
+ ]
+}

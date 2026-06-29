@@ -1,0 +1,11 @@
+{
+  "model_type": "ecapa_tdnn",
+  "num_mel": 6,
+  "channels": 8,
+  "kernel": 3,
+  "scale": 4,
+  "se_reduction": 4,
+  "mfa_channels": 10,
+  "att_channels": 5,
+  "emb_dim": 7
+}

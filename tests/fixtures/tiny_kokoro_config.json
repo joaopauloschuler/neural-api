@@ -1,0 +1,15 @@
+{
+  "model_type": "kokoro",
+  "hidden_size": 8,
+  "style_dim": 16,
+  "vocab_size": 24,
+  "enc_kernel": 5,
+  "dur_kernel": 3,
+  "f0_kernel": 3,
+  "dec_kernel": 3,
+  "n_fft": 16,
+  "hop_length": 4,
+  "speed": 1.0,
+  "layer_norm_eps": 1e-05,
+  "sampling_rate": 24000
+}

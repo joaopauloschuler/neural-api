@@ -733,6 +733,36 @@ type
       property Constraint: TNNetTokenConstraint read FConstraint;
   end;
 
+  { TNNetNoRepeatNGramProcessor }
+  // EXACT n-gram blocking - the port of transformers'
+  // NoRepeatNGramLogitsProcessor. DISTINCT from the repetition PENALTY (which
+  // SCALES single-token logits): this BANS any next token that would complete
+  // an n-gram (length NGramSize) already seen in the running context. State =
+  // the full generated id sequence (prompt + emitted), built in Reset and
+  // advanced in Commit. Each step it takes the current (NGramSize-1)-token
+  // suffix and, for every position in the history where that same suffix
+  // occurred, bans the token that FOLLOWED it (so the seen n-gram cannot be
+  // re-formed). NGramSize <= 1 is OFF (no n-gram is shorter than its own
+  // continuation); with a context shorter than NGramSize-1 nothing is banned.
+  // DOMAIN: probability-domain like its siblings - banning sets the prob to 0
+  // and renormalizes the surviving mass (HF's logit -> -inf before softmax has
+  // exactly this post-softmax image). If banning would zero ALL mass the row
+  // is left UNTOUCHED (the MaskAllowed zero-mass fallback).
+  // Coded by Claude (AI).
+  TNNetNoRepeatNGramProcessor = class(TNNetLogitsProcessor)
+    private
+      FNGramSize: integer;
+      FHistory: TNeuralIntegerArray;
+      FLen: integer;
+      procedure AppendToken(TokenId: integer);
+    public
+      constructor Create(pNGramSize: integer);
+      procedure Reset(const PromptTokens: array of integer); override;
+      procedure ProcessRow(Row: TNNetVolume); override;
+      procedure Commit(TokenId: integer); override;
+      property NGramSize: integer read FNGramSize;
+  end;
+
   { TNNetLogitsProcessorChain }
   // Ordered chain of processors; Reset/ProcessRow/Commit forward to every
   // item IN INSERTION ORDER (order matters: e.g. penalty-then-temperature
@@ -863,6 +893,58 @@ type
       property Delta: TNeuralFloat read FDelta write FDelta;
   end;
 
+  { TNNetSequenceBiasProcessor }
+  // SEQUENCE BIAS / bad-words blocking - the port of transformers'
+  // SequenceBiasLogitsProcessor (and its NoBadWordsLogitsProcessor special
+  // case). Holds a list of (token-sequence, bias) entries. The bias is an
+  // additive LOGIT shift applied to the FINAL token of a sequence, but ONLY
+  // when the sequence's PRECEDING tokens exactly match the most-recent
+  // generated history (its (k-1)-token prefix is a suffix of the running
+  // context). A single-token sequence has an empty prefix that trivially
+  // matches every step, so it degrades to an UNCONDITIONAL bias on that token
+  // (transformers' documented behavior). A multi-token entry only fires once
+  // its lead-in has been emitted, biasing the token that would COMPLETE it.
+  //
+  // HARD BANS. AddBadWord adds an entry with bias = csSequenceBiasBanBias, a
+  // large finite negative used as -infinity; in the probability domain that
+  // drives the final token's probability to ~0 (renormalized away), so a
+  // banned multi-token word can never be completed under greedy/argmax.
+  //
+  // DOMAIN. The chain feeds POST-SOFTMAX PROBABILITIES. The exact image of
+  // "logit += bias" is "prob *= exp(bias)" followed by renormalization (the
+  // same realization TNNetWatermarkLogitsProcessor uses for its green bias);
+  // exp(csSequenceBiasBanBias) underflows to 0, the hard-ban image. A step
+  // that would zero ALL surviving mass leaves the row UNTOUCHED (the
+  // MaskAllowed zero-mass fallback shared by the other processors).
+  //
+  // STATE = the full generated id sequence (prompt + emitted), built in Reset
+  // and advanced in Commit, exactly like TNNetNoRepeatNGramProcessor; prefix
+  // matching is run against its tail each step.
+  // Coded by Claude (AI).
+  TNNetSequenceBiasProcessor = class(TNNetLogitsProcessor)
+    private
+      FSequences: TNNetTokenSequences;
+      FBiases: TNeuralFloatDynArr;
+      FCount: integer;
+      FHistory: TNeuralIntegerArray;
+      FLen: integer;
+      procedure AppendToken(TokenId: integer);
+    public
+      constructor Create();
+      // Adds a (sequence, bias) entry. Sequence must be non-empty. A
+      // single-token sequence biases that token unconditionally; a multi-token
+      // sequence biases its last token only when the leading tokens match the
+      // generated tail. Re-adding the same sequence overwrites its bias.
+      procedure AddSequenceBias(const Sequence: array of integer;
+        Bias: TNeuralFloat);
+      // Convenience: hard-ban a (multi-token) word via the -infinity bias.
+      procedure AddBadWord(const Sequence: array of integer);
+      procedure Reset(const PromptTokens: array of integer); override;
+      procedure ProcessRow(Row: TNNetVolume); override;
+      procedure Commit(TokenId: integer); override;
+      property Count: integer read FCount;
+  end;
+
   { TGenerationConfig }
   // One-record bundle of generation knobs - the GenerationConfig counterpart
   // of the parameter piles on the GenerateTokensStreamed overloads, consumed
@@ -889,6 +971,12 @@ type
     Temperature: TNeuralFloat;
     Penalty: TNNetTokenHistoryPenalty;     // nil = off (not owned)
     Processors: TNNetLogitsProcessorChain; // nil = none (not owned)
+    // EXACT n-gram blocking (HF no_repeat_ngram_size). 0 (or <=1) = off; >1
+    // wires a TNNetNoRepeatNGramProcessor banning any token that would re-form
+    // an already-seen NoRepeatNGramSize-gram. Distinct from Penalty (which
+    // only scales single-token logits). It runs in the Processors slot order,
+    // BEFORE the Constraint (structural guarantees still run last).
+    NoRepeatNGramSize: integer;            // 0 = off
     Constraint: TNNetTokenConstraint;      // nil = off (not owned)
     // Sampler reading the processed probability row; nil = greedy argmax.
     Sampler: TNNetSamplerBase;             // not owned
@@ -1123,6 +1211,9 @@ const
   // (DecodeSeq2SeqSampled and TNNetTemperatureProcessor): Temperature -> 0
   // degenerates to greedy argmax instead of dividing by zero.
   csDecodeMinTemperature = 1e-6;
+  // The -infinity bias used by TNNetSequenceBiasProcessor hard bans: a large
+  // finite negative logit shift whose exp() underflows to 0 (prob -> 0).
+  csSequenceBiasBanBias = -1e30;
 
 // Wu et al. 2016 length-penalty denominator ((5+L)/6)^alpha. With alpha=0 this
 // is exactly 1.0 (no penalty -> raw sum-log-prob ranking, short-biased).
@@ -1884,6 +1975,66 @@ function Seq2SeqEncoderStatesInput(DecoderNet: TNNet): TNNetLayer;
 function DecodeSeq2SeqGreedy(EncoderNet, DecoderNet: TNNet;
   const SourceTokens: array of integer;
   StartTokenId, EOSTokenId, MaxNewTokens: integer): TNeuralIntegerArray;
+
+// KV-CACHE (O(1)-per-step) greedy decode for an AUDIO encoder-decoder whose
+// encoder takes a RAW WAVEFORM volume (Moonshine), not token ids - so it
+// cannot use DecodeSeq2SeqGreedy (which assumes a token-id encoder). The
+// encoder runs ONCE; its hidden states are cached in the decoder's second
+// TNNetInput (constant across every decode step, so the per-layer CROSS-
+// attention re-reads them unchanged each step - there is nothing to grow). A
+// TNNetStreamingDecoder session arms every SELF-attention SDPA's incremental
+// KV cache and the partial-RoPE PositionOffset: the start token is prefilled
+// at absolute position 0, then each generated token is fed ONE AT A TIME at
+// its absolute position, appending only its K/V to the self-attn cache and
+// reading the single next-token logit row. This turns the per-step cost from
+// O(L) (re-run the whole StartTokenId-padded prefix) into O(1), so a length-L
+// transcript is O(L) total instead of O(L^2).
+//
+// EXACTNESS: per the TNNetStreamingDecoder contract the streamed argmax is
+// BIT-IDENTICAL to the full re-encode-the-prefix loop (DecodeSeq2SeqGreedy on
+// a token-id encoder, or the manual loop the Moonshine example used to drive).
+// Decode stops on EOSTokenId (appended and counted), at MaxNewTokens, or at
+// the session's MaxCacheLen capacity. The encoder/decoder state-size match is
+// validated (EArgumentException on mismatch). MaxNewTokens < 1 returns empty.
+// Coded by Claude (AI).
+function DecodeMoonshineGreedyCached(EncoderNet, DecoderNet: TNNet;
+  Waveform: TNNetVolume;
+  StartTokenId, EOSTokenId, MaxNewTokens: integer): TNeuralIntegerArray;
+
+// KV-CACHE (O(1)-per-step) greedy decode driven by a PRE-COMPUTED encoder
+// states volume and an ARBITRARY FORCED TOKEN PROLOGUE - the Whisper-style
+// generalisation of DecodeMoonshineGreedyCached. The caller runs the encoder
+// itself (e.g. a mel-spectrogram encoder over a raw audio volume) ONCE and
+// passes the resulting hidden states in as EncoderStates; they are copied into
+// the decoder's second TNNetInput, constant across every step (the per-layer
+// CROSS-attention re-reads them unchanged - nothing to grow). Unlike
+// DecodeSeq2SeqGreedy / DecodeMoonshineGreedyCached, which start from a single
+// BOS, the decode is seeded by ForcedPrefix: an array of token ids fed verbatim
+// (e.g. Whisper's <|startoftranscript|><|en|><|transcribe|><|notimestamps|>).
+//
+// The forced tokens are PREFILLED one at a time into the self-attention KV cache
+// (advancing the absolute position and the partial-RoPE PositionOffset), then
+// the model autoregresses greedily from the logits row produced by the LAST
+// forced token. ForcedPrefix tokens are NOT included in the result (mirroring
+// the StartTokenId-excluded convention of DecodeSeq2SeqGreedy); only the
+// GENERATED ids are returned, with EOSTokenId appended and counted when emitted.
+//
+// EXACTNESS: per the TNNetStreamingDecoder contract the streamed argmax is
+// BIT-IDENTICAL to the naive loop that re-runs the FULL decoder over the whole
+// growing (ForcedPrefix ++ generated) prefix every step (no cache). The self-
+// attention SDPA caches grow one token per step (O(1)), so a length-L transcript
+// is O(L) total instead of O(L^2).
+//
+// DECODER SHAPE: the decoder's first TNNetInput (token ids) must be width 1
+// (built with DecSeqLen=1) - the cache, not the input width, carries context.
+// ForcedPrefix must be non-empty (it seeds the first logits row). The encoder
+// states / decoder-second-input size match is validated; mismatches and an empty
+// prefix raise EArgumentException. MaxNewTokens < 1 returns empty.
+// Coded by Claude (AI).
+function DecodeSeq2SeqForcedPrefixCached(DecoderNet: TNNet;
+  EncoderStates: TNNetVolume;
+  const ForcedPrefix: array of integer;
+  EOSTokenId, MaxNewTokens: integer): TNeuralIntegerArray;
 
 // Stochastic seq2seq decode: the step's logits row is divided by Temperature
 // (clamped to >= 1e-6; Temperature -> 0 degenerates to greedy argmax) and
@@ -4262,6 +4413,240 @@ begin
   FConstraint.Commit(TokenId);
 end;
 
+{ TNNetNoRepeatNGramProcessor }
+
+constructor TNNetNoRepeatNGramProcessor.Create(pNGramSize: integer);
+begin
+  inherited Create();
+  FNGramSize := pNGramSize;
+  SetLength(FHistory, 0);
+  FLen := 0;
+end;
+
+procedure TNNetNoRepeatNGramProcessor.AppendToken(TokenId: integer);
+begin
+  // Amortized growth: the history grows by emitted tokens only.
+  if FLen >= Length(FHistory) then
+    SetLength(FHistory, (FLen + 1) * 2);
+  FHistory[FLen] := TokenId;
+  Inc(FLen);
+end;
+
+procedure TNNetNoRepeatNGramProcessor.Reset(
+  const PromptTokens: array of integer);
+var
+  I, Hi: integer;
+begin
+  // Fresh sequence: the history is the WHOLE context (prompt tokens), so the
+  // first generated step already sees prompt n-grams (HF semantics).
+  FLen := 0;
+  Hi := High(PromptTokens);
+  for I := 0 to Hi do AppendToken(PromptTokens[I]);
+end;
+
+procedure TNNetNoRepeatNGramProcessor.ProcessRow(Row: TNNetVolume);
+var
+  I, J, K, Size, SuffixStart, Last, NM1, Banned: integer;
+  Match: boolean;
+  KeptMass: TNeuralFloat;
+  Ban: array of boolean;
+begin
+  // OFF: an n-gram of size <= 1 has no (n-1)-suffix to key on.
+  if FNGramSize <= 1 then exit;
+  NM1 := FNGramSize - 1;
+  // Need at least NM1 history tokens to form the suffix AND one preceding
+  // n-gram (a position p with the same suffix and a follower): the earliest
+  // such follower sits at index FNGramSize-1, so we need FLen >= FNGramSize.
+  if FLen < FNGramSize then exit;
+  Size := Row.Size;
+  SetLength(Ban, Size);
+  for I := 0 to Size - 1 do Ban[I] := false;
+  // Current (n-1)-token suffix is the LAST NM1 tokens of the history.
+  SuffixStart := FLen - NM1;
+  Banned := 0;
+  // Scan every position whose n-gram ENDS at or before the suffix start, i.e.
+  // its (n-1)-prefix could match the current suffix and its follower (the
+  // token at J+NM1) is the banned continuation. J ranges so that J+NM1 is a
+  // valid index BEFORE the current suffix (J+NM1 <= SuffixStart-1 would be too
+  // strict; the standard scan allows the follower up to FLen-1 of the prefix
+  // window, which is index FLen-NM1-1 + ... ). Concretely: for each start J
+  // with J in [0, SuffixStart-1], if history[J..J+NM1-1] = suffix then ban
+  // history[J+NM1].
+  for J := 0 to SuffixStart - 1 do
+  begin
+    Match := true;
+    for K := 0 to NM1 - 1 do
+      if FHistory[J + K] <> FHistory[SuffixStart + K] then
+      begin
+        Match := false;
+        break;
+      end;
+    if Match then
+    begin
+      Last := FHistory[J + NM1];
+      if (Last >= 0) and (Last < Size) and (not Ban[Last]) then
+      begin
+        Ban[Last] := true;
+        Inc(Banned);
+      end;
+    end;
+  end;
+  if Banned = 0 then exit;
+  // Probability-domain ban: zero the banned tokens and renormalize the
+  // surviving mass (image of logit -> -inf before softmax). Zero-mass
+  // fallback (every surviving token has zero prob, or all were banned): leave
+  // the row UNTOUCHED, mirroring MaskAllowed.
+  KeptMass := 0;
+  for I := 0 to Size - 1 do
+    if not Ban[I] then KeptMass := KeptMass + Row.Raw[I];
+  if KeptMass <= 0 then exit;
+  for I := 0 to Size - 1 do
+    if Ban[I] then Row.Raw[I] := 0
+    else Row.Raw[I] := Row.Raw[I] / KeptMass;
+end;
+
+procedure TNNetNoRepeatNGramProcessor.Commit(TokenId: integer);
+begin
+  AppendToken(TokenId);
+end;
+
+{ TNNetSequenceBiasProcessor }
+
+constructor TNNetSequenceBiasProcessor.Create();
+begin
+  inherited Create();
+  SetLength(FSequences, 0);
+  SetLength(FBiases, 0);
+  FCount := 0;
+  SetLength(FHistory, 0);
+  FLen := 0;
+end;
+
+procedure TNNetSequenceBiasProcessor.AddSequenceBias(
+  const Sequence: array of integer; Bias: TNeuralFloat);
+var
+  I, J, Len: integer;
+  Same: boolean;
+begin
+  Len := Length(Sequence);
+  if Len = 0 then
+    raise EArgumentException.Create(
+      'TNNetSequenceBiasProcessor.AddSequenceBias: empty sequence.');
+  // Re-adding the same sequence OVERWRITES its bias (HF dict semantics).
+  for I := 0 to FCount - 1 do
+    if Length(FSequences[I]) = Len then
+    begin
+      Same := true;
+      for J := 0 to Len - 1 do
+        if FSequences[I][J] <> Sequence[J] then
+        begin
+          Same := false;
+          break;
+        end;
+      if Same then
+      begin
+        FBiases[I] := Bias;
+        exit;
+      end;
+    end;
+  if FCount >= Length(FSequences) then
+  begin
+    SetLength(FSequences, (FCount + 1) * 2);
+    SetLength(FBiases, (FCount + 1) * 2);
+  end;
+  SetLength(FSequences[FCount], Len);
+  for J := 0 to Len - 1 do FSequences[FCount][J] := Sequence[J];
+  FBiases[FCount] := Bias;
+  Inc(FCount);
+end;
+
+procedure TNNetSequenceBiasProcessor.AddBadWord(
+  const Sequence: array of integer);
+begin
+  AddSequenceBias(Sequence, csSequenceBiasBanBias);
+end;
+
+procedure TNNetSequenceBiasProcessor.AppendToken(TokenId: integer);
+begin
+  if FLen >= Length(FHistory) then
+    SetLength(FHistory, (FLen + 1) * 2);
+  FHistory[FLen] := TokenId;
+  Inc(FLen);
+end;
+
+procedure TNNetSequenceBiasProcessor.Reset(
+  const PromptTokens: array of integer);
+var
+  I, Hi: integer;
+begin
+  // Fresh sequence: the history is the WHOLE context (prompt tokens), so a
+  // multi-token bias whose lead-in sits in the prompt fires on step one.
+  FLen := 0;
+  Hi := High(PromptTokens);
+  for I := 0 to Hi do AppendToken(PromptTokens[I]);
+end;
+
+procedure TNNetSequenceBiasProcessor.ProcessRow(Row: TNNetVolume);
+var
+  I, K, Len, PrefLen, HistStart, Final, Size: integer;
+  Match: boolean;
+  Factor, KeptMass: TNeuralFloat;
+  Scale: TNeuralFloatDynArr;
+begin
+  if FCount = 0 then exit;
+  Size := Row.Size;
+  // Per-token multiplicative factor (exp of the accumulated additive logit
+  // bias), 1.0 = untouched. Biases on the SAME final token ADD in logit space
+  // = multiply in probability space, matching HF (which sums into the logit).
+  SetLength(Scale, Size);
+  for I := 0 to Size - 1 do Scale[I] := 1.0;
+  for I := 0 to FCount - 1 do
+  begin
+    Len := Length(FSequences[I]);
+    Final := FSequences[I][Len - 1];
+    if (Final < 0) or (Final >= Size) then continue;
+    // The (Len-1)-token prefix must be a SUFFIX of the generated history. A
+    // single-token sequence has an empty prefix -> always matches (an
+    // unconditional bias).
+    PrefLen := Len - 1;
+    if PrefLen > FLen then continue; // not enough history for the lead-in
+    Match := true;
+    HistStart := FLen - PrefLen;
+    for K := 0 to PrefLen - 1 do
+      if FHistory[HistStart + K] <> FSequences[I][K] then
+      begin
+        Match := false;
+        break;
+      end;
+    if not Match then continue;
+    // exp(csSequenceBiasBanBias) underflows to exactly 0 (the hard-ban image);
+    // a finite bias scales the probability by exp(bias).
+    if FBiases[I] <= csSequenceBiasBanBias then
+      Scale[Final] := 0
+    else
+      Scale[Final] := Scale[Final] * Exp(FBiases[I]);
+  end;
+  // Probability-domain realization of "logit += bias": p *= exp(bias), then
+  // renormalize. Compute the scaled mass FIRST (without mutating Row) so the
+  // zero-mass fallback can leave the row UNTOUCHED (the MaskAllowed
+  // convention) instead of emitting a degenerate all-zero distribution.
+  KeptMass := 0;
+  for I := 0 to Size - 1 do
+    KeptMass := KeptMass + Row.Raw[I] * Scale[I];
+  if KeptMass <= 0 then exit;
+  for I := 0 to Size - 1 do
+  begin
+    Factor := Scale[I];
+    if Factor <> 1.0 then Row.Raw[I] := Row.Raw[I] * Factor;
+    Row.Raw[I] := Row.Raw[I] / KeptMass;
+  end;
+end;
+
+procedure TNNetSequenceBiasProcessor.Commit(TokenId: integer);
+begin
+  AppendToken(TokenId);
+end;
+
 { TNNetWatermarkLogitsProcessor }
 
 // One round of the splitmix64 finalizer - a fast, well-mixing 64-bit hash.
@@ -4852,10 +5237,12 @@ end;
 // is off, so the caller can take the zero-overhead plain path.
 function BuildProcessorPipeline(Penalty: TNNetTokenHistoryPenalty;
   Temperature: TNeuralFloat; UserProcessors: TNNetLogitsProcessorChain;
-  Constraint: TNNetTokenConstraint): TNNetLogitsProcessorChain;
+  Constraint: TNNetTokenConstraint;
+  NoRepeatNGramSize: integer = 0): TNNetLogitsProcessorChain;
 begin
   if (Penalty = nil) and (Temperature = 1.0) and
     ((UserProcessors = nil) or (UserProcessors.Count = 0)) and
+    (NoRepeatNGramSize <= 1) and
     (Constraint = nil) then exit(nil);
   Result := TNNetLogitsProcessorChain.Create();
   if Assigned(Penalty) then
@@ -4864,6 +5251,9 @@ begin
     Result.Add(TNNetTemperatureProcessor.Create(Temperature), true);
   if Assigned(UserProcessors) and (UserProcessors.Count > 0) then
     Result.Add(UserProcessors, false);
+  // EXACT n-gram blocking runs in the Processors slot, BEFORE the Constraint.
+  if NoRepeatNGramSize > 1 then
+    Result.Add(TNNetNoRepeatNGramProcessor.Create(NoRepeatNGramSize), true);
   if Assigned(Constraint) then
     Result.Add(TNNetConstraintProcessor.Create(Constraint), true);
 end;
@@ -5296,6 +5686,7 @@ begin
   Result.Temperature := 1.0;
   Result.Penalty := nil;
   Result.Processors := nil;
+  Result.NoRepeatNGramSize := 0; // no-repeat n-gram blocking off
   Result.Constraint := nil;
   Result.Sampler := nil;
   Result.GuidanceScale := 1.0; // CFG off
@@ -5318,7 +5709,7 @@ var
   StdChain: TNNetLogitsProcessorChain;
 begin
   StdChain := BuildProcessorPipeline(Config.Penalty, Config.Temperature,
-    Config.Processors, Config.Constraint);
+    Config.Processors, Config.Constraint, Config.NoRepeatNGramSize);
   if Config.GuidanceScale = 1.0 then exit(StdChain); // CFG off: as before
   if not Assigned(Config.CFGUncond) then
     raise EArgumentException.Create(
@@ -7515,6 +7906,150 @@ begin
   // the Temperature argument is irrelevant there).
   Result := DecodeSeq2SeqSampled(EncoderNet, DecoderNet, SourceTokens,
     StartTokenId, EOSTokenId, MaxNewTokens, nil);
+end;
+
+function DecodeMoonshineGreedyCached(EncoderNet, DecoderNet: TNNet;
+  Waveform: TNNetVolume;
+  StartTokenId, EOSTokenId, MaxNewTokens: integer): TNeuralIntegerArray;
+var
+  EncStates: TNNetLayer;
+  Session: TNNetStreamingDecoder;
+  StepIn, Logits: TNNetVolume;
+  DecSeqLen, AbsPos, Next, MaxCache: integer;
+begin
+  SetLength(Result, 0);
+  if MaxNewTokens < 1 then exit;
+  // (1) Encode the waveform ONCE and cache the hidden states in the decoder's
+  // second TNNetInput - they are constant across every decode step, so the
+  // per-layer cross-attention re-reads them unchanged (nothing to grow).
+  EncStates := Seq2SeqEncoderStatesInput(DecoderNet);
+  EncoderNet.Compute(Waveform);
+  if EncoderNet.GetLastLayer().Output.Size <> EncStates.Output.Size then
+    raise EArgumentException.Create('DecodeMoonshineGreedyCached: encoder ' +
+      'output size ' + IntToStr(EncoderNet.GetLastLayer().Output.Size) +
+      ' does not match the decoder''s encoder-states input size ' +
+      IntToStr(EncStates.Output.Size) + ' (frames/d_model mismatch?).');
+  EncStates.Output.Copy(EncoderNet.GetLastLayer().Output);
+  // The incremental path feeds the decoder ONE token per step, so its first
+  // TNNetInput (the token ids) must be built at width 1 - a wider decoder
+  // would have TNNet.Compute reject the width-1 step volume outright. Build
+  // the cached decoder with DecSeqLen = 1 (the cache, not the input width,
+  // carries the growing context).
+  DecSeqLen := DecoderNet.GetFirstLayer().Output.Size;
+  if DecSeqLen <> 1 then
+    raise EArgumentException.Create('DecodeMoonshineGreedyCached: the ' +
+      'decoder''s token input must be width 1 for incremental decode (built ' +
+      'at DecSeqLen=' + IntToStr(DecSeqLen) + '); build it with DecSeqLen=1.');
+  // The session's KV cache is the real context capacity.
+  MaxCache := MaxNewTokens + 1;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  // (2) Arm the self-attn SDPA KV caches + RoPE PositionOffset. The session
+  // feeds ONE token per StepForward at its absolute position, appending only
+  // that token's K/V - O(1) per step instead of re-running the whole prefix.
+  Session := TNNetStreamingDecoder.Create(DecoderNet, MaxCache);
+  try
+    Session.Reset();
+    AbsPos := 0;
+    StepIn.FData[0] := StartTokenId;
+    while True do
+    begin
+      Session.StepForward(StepIn, AbsPos);
+      Logits := Session.Output();
+      // Width-1 step: the next-token distribution is the single output row 0
+      // (argmax ties to the lowest id, like GetClassOnPixel everywhere else).
+      Next := Logits.GetClassOnPixel(0, 0);
+      SetLength(Result, Length(Result) + 1);
+      Result[High(Result)] := Next;
+      if Next = EOSTokenId then break;
+      if Length(Result) >= MaxNewTokens then break;
+      // Cache capacity reached: the token just generated cannot be fed back.
+      Inc(AbsPos);
+      if AbsPos >= MaxCache then break;
+      StepIn.FData[0] := Next;
+    end;
+  finally
+    Session.Free;
+    StepIn.Free;
+  end;
+end;
+
+function DecodeSeq2SeqForcedPrefixCached(DecoderNet: TNNet;
+  EncoderStates: TNNetVolume;
+  const ForcedPrefix: array of integer;
+  EOSTokenId, MaxNewTokens: integer): TNeuralIntegerArray;
+var
+  EncStates: TNNetLayer;
+  Session: TNNetStreamingDecoder;
+  StepIn, Logits: TNNetVolume;
+  DecSeqLen, AbsPos, Next, MaxCache, PrefixHi, i: integer;
+begin
+  SetLength(Result, 0);
+  if MaxNewTokens < 1 then exit;
+  PrefixHi := High(ForcedPrefix);
+  if PrefixHi < 0 then
+    raise EArgumentException.Create('DecodeSeq2SeqForcedPrefixCached: ' +
+      'ForcedPrefix is empty - at least one forced token is required to seed ' +
+      'the first logits row.');
+  // (1) Cache the PRE-COMPUTED encoder states in the decoder's second
+  // TNNetInput - the caller already ran the encoder once. They are constant
+  // across every decode step, so the per-layer cross-attention re-reads them
+  // unchanged (nothing to grow).
+  EncStates := Seq2SeqEncoderStatesInput(DecoderNet);
+  if EncoderStates.Size <> EncStates.Output.Size then
+    raise EArgumentException.Create('DecodeSeq2SeqForcedPrefixCached: ' +
+      'encoder states size ' + IntToStr(EncoderStates.Size) +
+      ' does not match the decoder''s encoder-states input size ' +
+      IntToStr(EncStates.Output.Size) + ' (EncSeqLen/d_model mismatch?).');
+  EncStates.Output.Copy(EncoderStates);
+  // The incremental path feeds the decoder ONE token per step, so its first
+  // TNNetInput (the token ids) must be width 1; the cache carries context.
+  DecSeqLen := DecoderNet.GetFirstLayer().Output.Size;
+  if DecSeqLen <> 1 then
+    raise EArgumentException.Create('DecodeSeq2SeqForcedPrefixCached: the ' +
+      'decoder''s token input must be width 1 for incremental decode (built ' +
+      'at DecSeqLen=' + IntToStr(DecSeqLen) + '); build it with DecSeqLen=1.');
+  // Cache capacity: the whole forced prologue plus every generated token.
+  MaxCache := Length(ForcedPrefix) + MaxNewTokens;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  // (2) Arm the self-attn SDPA KV caches + RoPE PositionOffset (cross-attention
+  // is NOT a TNNetScaledDotProductAttention, so the scan skips it - its encoder
+  // K/V stay fixed). Prefill the forced prologue one token per StepForward, then
+  // autoregress from the LAST forced token's logits row.
+  Session := TNNetStreamingDecoder.Create(DecoderNet, MaxCache);
+  try
+    Session.Reset();
+    AbsPos := 0;
+    // Prefill all forced tokens. Each appends only its K/V to the cache; only
+    // the LAST one's output row seeds generation (earlier rows are discarded,
+    // exactly as a full forward over the prefix would discard non-final rows).
+    for i := 0 to PrefixHi do
+    begin
+      StepIn.FData[0] := ForcedPrefix[i];
+      Session.StepForward(StepIn, AbsPos);
+      if i < PrefixHi then Inc(AbsPos);
+    end;
+    // AbsPos now indexes the LAST forced token; its logits predict the first
+    // generated token.
+    while True do
+    begin
+      Logits := Session.Output();
+      // Width-1 step: the next-token distribution is the single output row 0
+      // (argmax ties to the lowest id, like GetClassOnPixel everywhere else).
+      Next := Logits.GetClassOnPixel(0, 0);
+      SetLength(Result, Length(Result) + 1);
+      Result[High(Result)] := Next;
+      if Next = EOSTokenId then break;
+      if Length(Result) >= MaxNewTokens then break;
+      // Cache capacity reached: the token just generated cannot be fed back.
+      Inc(AbsPos);
+      if AbsPos >= MaxCache then break;
+      StepIn.FData[0] := Next;
+      Session.StepForward(StepIn, AbsPos);
+    end;
+  finally
+    Session.Free;
+    StepIn.Free;
+  end;
 end;
 
 function DecodeSeq2SeqSampled(EncoderNet, DecoderNet: TNNet;

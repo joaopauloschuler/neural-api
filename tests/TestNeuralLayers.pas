@@ -5,7 +5,8 @@ unit TestNeuralLayers;
 interface
 
 uses
-  Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume;
+  Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume,
+  pascoremath32;
 
 const
   // Maximum number of elements to check for NaN/Inf in large tensors.
@@ -16,8 +17,21 @@ type
   TTestNeuralLayers = class(TTestCase)
   published
     procedure TestFullyConnectedForward;
+    procedure TestFullConnectThreadingParity;
     procedure TestConvolutionForward;
+    procedure TestWinogradConvolutionParity;
     procedure TestMaxPoolForward;
+    procedure TestMaxPoolVectorizedExactParity;
+    procedure TestVectorExpScalarParity;
+    procedure TestVectorSigmoidScalarParity;
+    procedure TestVectorTanhScalarParity;
+    procedure TestVectorErfScalarParity;
+    procedure TestVectorSinhScalarParity;
+    procedure TestVectorLnScalarParity;
+    procedure TestVectorSinScalarParity;
+    procedure TestVectorCosScalarParity;
+    procedure TestVectorArcSinhScalarParity;
+    procedure TestPointwiseSoftMaxVectorizedParity;
     procedure TestNetworkSaveLoad;
     procedure TestSimpleXORLearning;
     // New comprehensive layer tests
@@ -75,6 +89,12 @@ type
     // Embedding layers
     procedure TestEmbeddingLayer;
     procedure TestTokenAndPositionalEmbedding;
+    // Rectangular (W <> H) channel reductions + flip/padded-conv regressions
+    procedure TestMaxChannelRectangular;
+    procedure TestMinChannelRectangular;
+    procedure TestMaxChannelSquareRegression;
+    procedure TestFlipXPaddedConvBackprop;
+    procedure TestFlipYPaddedConvBackprop;
   end;
 
 implementation
@@ -130,6 +150,98 @@ begin
   end;
 end;
 
+// Bit-identical serial-vs-threaded A/B for the opt-in single-sample
+// TNNetFullConnect forward (the EnCodec-conv-style forced-thread checksum, but
+// here it must be EXACTLY equal: only independent output neurons are
+// partitioned, the per-neuron reduction order is unchanged). Forces the
+// threaded path with SetFullConnectThreadingMinWork(0) on a layer well above
+// any sane work threshold, for both the activation (TNNetFullConnect/ReLU) and
+// the activation-free (TNNetFullConnectLinear) variants.
+procedure TTestNeuralLayers.TestFullConnectThreadingParity;
+var
+  Input: TNNetVolume;
+  i: integer;
+
+  // Build a fresh single-FC net, set deterministic weights, compute, copy out.
+  procedure RunCase(IsLinear: boolean; Threaded: boolean; Dst: TNNetVolume);
+  var
+    NN: TNNet;
+    Layer: TNNetFullConnect;
+    neuron, w: integer;
+  begin
+    NN := TNNet.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(256));
+      if IsLinear then
+        Layer := TNNetFullConnectLinear.Create(384)
+      else
+        Layer := TNNetFullConnectReLU.Create(384);
+      NN.AddLayer(Layer);
+      // Deterministic, reproducible weights (independent of the threading flag).
+      for neuron := 0 to Layer.Neurons.Count - 1 do
+      begin
+        for w := 0 to Layer.Neurons[neuron].Weights.Size - 1 do
+          Layer.Neurons[neuron].Weights.Raw[w] :=
+            Sin(neuron * 0.013 + w * 0.0007) * 0.1;
+        Layer.Neurons[neuron].BiasWeight := Cos(neuron * 0.021) * 0.05;
+      end;
+      if Threaded then
+      begin
+        EnableFullConnectThreading(true);
+        SetFullConnectThreadingMinWork(0); // force the threaded path
+      end
+      else
+        EnableFullConnectThreading(false);
+      NN.Compute(Input);
+      Dst.Copy(Layer.Output);
+    finally
+      NN.Free;
+    end;
+  end;
+
+var
+  SerialLin, ThreadLin, SerialAct, ThreadAct: TNNetVolume;
+begin
+  Input := TNNetVolume.Create(256, 1, 1);
+  SerialLin := TNNetVolume.Create();
+  ThreadLin := TNNetVolume.Create();
+  SerialAct := TNNetVolume.Create();
+  ThreadAct := TNNetVolume.Create();
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.05) - 0.3;
+
+    RunCase({IsLinear=}true,  {Threaded=}false, SerialLin);
+    RunCase({IsLinear=}true,  {Threaded=}true,  ThreadLin);
+    RunCase({IsLinear=}false, {Threaded=}false, SerialAct);
+    RunCase({IsLinear=}false, {Threaded=}true,  ThreadAct);
+
+    // Restore the off-by-default state for the rest of the suite.
+    EnableFullConnectThreading(false);
+
+    AssertEquals('Linear output sizes match', SerialLin.Size, ThreadLin.Size);
+    for i := 0 to SerialLin.Size - 1 do
+      AssertTrue('Linear FC threaded must be BIT-IDENTICAL to serial at ' +
+        IntToStr(i), SerialLin.Raw[i] = ThreadLin.Raw[i]);
+
+    AssertEquals('Activation output sizes match', SerialAct.Size, ThreadAct.Size);
+    for i := 0 to SerialAct.Size - 1 do
+      AssertTrue('ReLU FC threaded must be BIT-IDENTICAL to serial at ' +
+        IntToStr(i), SerialAct.Raw[i] = ThreadAct.Raw[i]);
+
+    // Sanity: the layer actually produced varied, finite output (not all zero).
+    AssertFalse('Linear output[0] not NaN', IsNaN(SerialLin.Raw[0]));
+    AssertTrue('Linear output is non-trivial',
+      SerialLin.GetSumAbs() > 0.0);
+  finally
+    Input.Free;
+    SerialLin.Free;
+    ThreadLin.Free;
+    SerialAct.Free;
+    ThreadAct.Free;
+  end;
+end;
+
 procedure TTestNeuralLayers.TestConvolutionForward;
 var
   NN: TNNet;
@@ -172,6 +284,71 @@ begin
   end;
 end;
 
+procedure TTestNeuralLayers.TestWinogradConvolutionParity;
+
+  // Builds a 3x3 stride-1 conv (linear activation), random weights+input, then
+  // compares the exact direct forward against the opt-in Winograd path. Winograd
+  // reassociates the channel sum so float32 differs slightly; tolerance 1e-4.
+  function MaxDiffFor(InW, InH, InD, OutD, Pad: integer): TNeuralFloat;
+  var
+    NN: TNNet;
+    Input, DirectOut: TNNetVolume;
+    Conv: TNNetConvolutionLinear;
+    I: integer;
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(InW, InH, InD);
+    DirectOut := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(InW, InH, InD));
+      Conv := TNNetConvolutionLinear.Create(OutD, 3, Pad, 1);
+      NN.AddLayer(Conv);
+      NN.InitWeights();
+      // Random input in a reasonable range.
+      for I := 0 to Input.Size - 1 do
+        Input.Raw[I] := (Random - 0.5) * 4;
+
+      // Exact direct path (Winograd default OFF).
+      NN.Compute(Input);
+      DirectOut.Copy(NN.GetLastLayer.Output);
+
+      // Same weights, Winograd path ON.
+      Conv.EnableWinograd(true);
+      AssertTrue('Winograd should report enabled', Conv.WinogradEnabled());
+      NN.Compute(Input);
+
+      Result := 0;
+      for I := 0 to DirectOut.Size - 1 do
+        Result := Max(Result, Abs(DirectOut.Raw[I] - NN.GetLastLayer.Output.Raw[I]));
+    finally
+      NN.Free;
+      Input.Free;
+      DirectOut.Free;
+    end;
+  end;
+
+var
+  D: TNeuralFloat;
+begin
+  // Padded same-size output (pad=1): even output size 8x8.
+  D := MaxDiffFor(8, 8, 4, 6, 1);
+  AssertTrue('Winograd parity (padded 8x8) max|diff|<1e-4, got ' + FloatToStr(D), D < 1e-4);
+
+  // Unpadded (pad=0): output 6x6 (even), boundary tiles read zeros outside.
+  D := MaxDiffFor(8, 8, 4, 6, 0);
+  AssertTrue('Winograd parity (unpadded 6x6) max|diff|<1e-4, got ' + FloatToStr(D), D < 1e-4);
+
+  // Odd output size to exercise the ragged right/bottom edge: 7x7 input, pad=1
+  // -> output 7x7 (odd), so the last 2x2 block straddles the edge.
+  D := MaxDiffFor(7, 7, 3, 5, 1);
+  AssertTrue('Winograd parity (odd 7x7) max|diff|<1e-4, got ' + FloatToStr(D), D < 1e-4);
+
+  // Unpadded odd output: 8x8 input pad=0 already even; use 9x9 -> output 7x7 odd.
+  D := MaxDiffFor(9, 9, 5, 4, 0);
+  AssertTrue('Winograd parity (unpadded odd 7x7) max|diff|<1e-4, got ' + FloatToStr(D), D < 1e-4);
+end;
+
 procedure TTestNeuralLayers.TestMaxPoolForward;
 var
   NN: TNNet;
@@ -205,6 +382,526 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestMaxPoolVectorizedExactParity;
+// The MaxPool forward folds each pooling-window strip in over the (contiguous)
+// depth axis through the vectorized TNNetVolume.MaxElements primitive. The max
+// reduction is exact (no floating-point reassociation), so the vectorized
+// output must be BIT-IDENTICAL to a straightforward scalar reference. This test
+// builds a multi-channel input with non-trivial depth (37 -> exercises the AVX
+// large/small/tail paths) and checks both stride configurations:
+//   * default stride (stride == pool size, no padding) and
+//   * custom stride with padding.
+  procedure CheckParity(const Title: string; PoolSize, Stride, Padding,
+    SizeX, SizeY, Depth: integer);
+  var
+    NN: TNNet;
+    Input: TNNetVolume;
+    Padded: TNNetVolume;
+    Reference: TNNetVolume;
+    Pool: TNNetMaxPool;
+    OutX, OutY, OutD, OutSizeX, OutSizeY: integer;
+    InX, InY, BaseX, BaseY, px, py: integer;
+    PadSizeX, PadSizeY, InXMax, InYMax: integer;
+    v, best: TNeuralFloat;
+    seen: boolean;
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(SizeX, SizeY, Depth);
+    Padded := TNNetVolume.Create();
+    Reference := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(SizeX, SizeY, Depth));
+      Pool := TNNetMaxPool(NN.AddLayer(TNNetMaxPool.Create(PoolSize, Stride, Padding)));
+
+      // Deterministic, well-separated values (no exact ties across the whole
+      // tensor, so the argmax is unambiguous and reference == layer exactly).
+      for InX := 0 to SizeX - 1 do
+        for InY := 0 to SizeY - 1 do
+          for OutD := 0 to Depth - 1 do
+            Input[InX, InY, OutD] :=
+              Sin(0.37 * InX + 0.91 * InY + 0.13 * OutD) * 100.0
+              + 0.001 * (InX * SizeY * Depth + InY * Depth + OutD);
+
+      NN.Compute(Input);
+
+      OutSizeX := Pool.Output.SizeX;
+      OutSizeY := Pool.Output.SizeY;
+
+      // Build the padded input exactly like the layer (CopyPadding: zero border).
+      if Padding > 0
+        then Padded.CopyPadding(Input, Padding)
+        else Padded.Copy(Input);
+      PadSizeX := Padded.SizeX;
+      PadSizeY := Padded.SizeY;
+
+      // Independent scalar reference. The window is taken over the PADDED volume
+      // with the same clamping the layer applies (Min(base+pool-1, size-1)); a
+      // window cell beyond the padded boundary is simply not part of the pool
+      // (the window shrinks) -- it is NOT a zero. Padding zeros only ever appear
+      // as genuine cells of the padded volume.
+      Reference.ReSize(OutSizeX, OutSizeY, Depth);
+      for OutX := 0 to OutSizeX - 1 do
+        for OutY := 0 to OutSizeY - 1 do
+          for OutD := 0 to Depth - 1 do
+          begin
+            BaseX := OutX * Stride;
+            BaseY := OutY * Stride;
+            InXMax := Min(BaseX + PoolSize - 1, PadSizeX - 1);
+            InYMax := Min(BaseY + PoolSize - 1, PadSizeY - 1);
+            best := 0; // unused until seen
+            seen := false;
+            for px := BaseX to InXMax do
+              for py := BaseY to InYMax do
+              begin
+                v := Padded[px, py, OutD];
+                if (not seen) or (v > best) then
+                begin
+                  best := v;
+                  seen := true;
+                end;
+              end;
+            Reference[OutX, OutY, OutD] := best;
+          end;
+
+      // Demand EXACT equality (delta 0) -- max introduces no rounding.
+      for OutX := 0 to OutSizeX - 1 do
+        for OutY := 0 to OutSizeY - 1 do
+          for OutD := 0 to Depth - 1 do
+            AssertTrue(
+              Format('%s: MaxPool[%d,%d,%d] vectorized=%g scalar-ref=%g must be bit-identical',
+                [Title, OutX, OutY, OutD,
+                 Pool.Output[OutX, OutY, OutD], Reference[OutX, OutY, OutD]]),
+              Pool.Output[OutX, OutY, OutD] = Reference[OutX, OutY, OutD]);
+    finally
+      NN.Free;
+      Input.Free;
+      Padded.Free;
+      Reference.Free;
+    end;
+  end;
+begin
+  // Default stride path (stride == pool size, no padding).
+  CheckParity('default-stride', 2, 2, 0, 8, 6, 37);
+  CheckParity('default-stride-3', 3, 3, 0, 9, 9, 11);
+  // Custom stride + padding path.
+  CheckParity('stride-padding', 3, 2, 1, 7, 5, 37);
+  CheckParity('overlap-stride', 3, 1, 0, 6, 6, 13);
+end;
+
+procedure TTestNeuralLayers.TestVectorExpScalarParity;
+// TNNetVolume.VectorExp must match the scalar pcr_expf loop (the parity
+// reference) within a tight relative tolerance on every build. On AVX2 builds
+// VectorExp uses an 8-wide polynomial; on scalar builds it IS the pcr_expf loop.
+// N=131 deliberately straddles the 8-wide body and the (N mod 8) scalar tail.
+const
+  N = 131;
+  RelTol = 1e-4;
+var
+  Src, Dst, Ref: TNNetVolume;
+  I: integer;
+  x, e, denom, maxRel: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  Ref := TNNetVolume.Create(N, 1, 1);
+  try
+    // Spread inputs across [-30, 30] plus a couple of saturating extremes.
+    for I := 0 to N - 1 do
+    begin
+      x := -30.0 + 60.0 * I / (N - 1);
+      Src.FData[I] := x;
+      Ref.FData[I] := pcr_expf(x);
+    end;
+    TNNetVolume.VectorExp(Dst.DataPtr, Src.DataPtr, N);
+    maxRel := 0;
+    for I := 0 to N - 1 do
+    begin
+      denom := Abs(Ref.FData[I]);
+      if denom < 1e-20 then denom := 1e-20;
+      e := Abs(Dst.FData[I] - Ref.FData[I]) / denom;
+      if e > maxRel then maxRel := e;
+    end;
+    AssertTrue('VectorExp vs pcr_expf max rel err ' + FloatToStr(maxRel) +
+      ' must be < ' + FloatToStr(RelTol), maxRel < RelTol);
+  finally
+    Src.Free; Dst.Free; Ref.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestVectorSigmoidScalarParity;
+// VectorSigmoid must match the scalar reference Sigmoid() within tolerance.
+const
+  N = 131;
+  AbsTol = 1e-4;
+var
+  Src, Dst: TNNetVolume;
+  I: integer;
+  x, e, maxErr: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  try
+    for I := 0 to N - 1 do
+      Src.FData[I] := -25.0 + 50.0 * I / (N - 1);
+    TNNetVolume.VectorSigmoid(Dst.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      x := Src.FData[I];
+      e := Abs(Dst.FData[I] - Sigmoid(x));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorSigmoid vs Sigmoid max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+  finally
+    Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestVectorTanhScalarParity;
+// VectorTanh must match the scalar pcr_tanhf reference within a tight tolerance
+// on every build (AVX2 8-wide exp path and scalar fallback). N=131 straddles
+// the 8-wide body and the (N mod 8) tail; range covers saturating extremes.
+const
+  N = 131;
+  AbsTol = 1e-4;
+var
+  Src, Dst: TNNetVolume;
+  I: integer;
+  x, e, maxErr: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  try
+    for I := 0 to N - 1 do
+      Src.FData[I] := -12.0 + 24.0 * I / (N - 1);
+    TNNetVolume.VectorTanh(Dst.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      x := Src.FData[I];
+      e := Abs(Dst.FData[I] - pcr_tanhf(x));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorTanh vs pcr_tanhf max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+  finally
+    Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestVectorErfScalarParity;
+// VectorErf (Abramowitz & Stegun 7.1.26) must match the near-exact scalar
+// pcr_erff within tolerance on every build. N=131 straddles the 8-wide exp body
+// and the scalar tail; range covers both the linear region and the saturated tails.
+const
+  N = 131;
+  AbsTol = 1e-4;
+var
+  Src, Dst: TNNetVolume;
+  I: integer;
+  x, e, maxErr: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  try
+    for I := 0 to N - 1 do
+      Src.FData[I] := -4.0 + 8.0 * I / (N - 1);
+    TNNetVolume.VectorErf(Dst.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      x := Src.FData[I];
+      e := Abs(Dst.FData[I] - pcr_erff(x));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorErf vs pcr_erff max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+  finally
+    Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestVectorSinhScalarParity;
+// VectorSinh (sinh built on the AVX2 VectorExp) must match the scalar pcr_sinhf
+// reference within tolerance on every build. N=131 straddles the 8-wide exp body
+// and the (N mod 8) scalar tail; range [-12,12] matches the SinhAct parity band.
+// A second pass with dst aliasing src guards against the buffer-aliasing bug that
+// was fixed in VectorTanh/VectorErf.
+const
+  N = 131;
+  RelTol = 1e-4;
+var
+  Src, Dst: TNNetVolume;
+  I: integer;
+  x, e, denom, maxRel: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  try
+    for I := 0 to N - 1 do
+      Src.FData[I] := -12.0 + 24.0 * I / (N - 1);
+    // Distinct dst.
+    TNNetVolume.VectorSinh(Dst.DataPtr, Src.DataPtr, N);
+    maxRel := 0;
+    for I := 0 to N - 1 do
+    begin
+      x := Src.FData[I];
+      denom := Abs(pcr_sinhf(x));
+      if denom < 1e-20 then denom := 1e-20;
+      e := Abs(Dst.FData[I] - pcr_sinhf(x)) / denom;
+      if e > maxRel then maxRel := e;
+    end;
+    AssertTrue('VectorSinh vs pcr_sinhf max rel err ' + FloatToStr(maxRel) +
+      ' must be < ' + FloatToStr(RelTol), maxRel < RelTol);
+    // dst aliasing src.
+    TNNetVolume.VectorSinh(Src.DataPtr, Src.DataPtr, N);
+    maxRel := 0;
+    for I := 0 to N - 1 do
+    begin
+      // Recompute the original x from the index (Src has been overwritten).
+      x := -12.0 + 24.0 * I / (N - 1);
+      denom := Abs(pcr_sinhf(x));
+      if denom < 1e-20 then denom := 1e-20;
+      e := Abs(Src.FData[I] - pcr_sinhf(x)) / denom;
+      if e > maxRel then maxRel := e;
+    end;
+    AssertTrue('VectorSinh (aliased) vs pcr_sinhf max rel err ' + FloatToStr(maxRel) +
+      ' must be < ' + FloatToStr(RelTol), maxRel < RelTol);
+  finally
+    Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestVectorLnScalarParity;
+// VectorLn (Cephes logf on the AVX2 build, pcr_logf fallback otherwise) must match
+// the scalar pcr_logf reference within tolerance on every build. N=131 straddles the
+// 8-wide body and the (N mod 8) scalar tail; range covers small and large positive
+// inputs. A second pass with dst aliasing src guards against buffer aliasing bugs.
+const
+  N = 131;
+  AbsTol = 1e-4;
+var
+  Src, Dst: TNNetVolume;
+  I: integer;
+  x, e, maxErr: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  try
+    for I := 0 to N - 1 do
+      Src.FData[I] := 1e-3 + 50.0 * I / (N - 1);
+    TNNetVolume.VectorLn(Dst.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      e := Abs(Dst.FData[I] - pcr_logf(Src.FData[I]));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorLn vs pcr_logf max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+    // dst aliasing src.
+    TNNetVolume.VectorLn(Src.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      x := 1e-3 + 50.0 * I / (N - 1);
+      e := Abs(Src.FData[I] - pcr_logf(x));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorLn (aliased) vs pcr_logf max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+  finally
+    Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestVectorSinScalarParity;
+// VectorSin (Cephes sinf with 3-part Cody-Waite reduction on the AVX2 build) must
+// match the scalar pcr_sinf reference within tolerance on every build. N=131
+// straddles the 8-wide body and the scalar tail; range [-50,50] plus a few large
+// magnitudes exercise the range reduction. dst aliasing src is also checked.
+const
+  N = 131;
+  AbsTol = 1e-4;
+var
+  Src, Dst: TNNetVolume;
+  I: integer;
+  x, e, maxErr: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  try
+    for I := 0 to N - 1 do
+      Src.FData[I] := -50.0 + 100.0 * I / (N - 1);
+    // Sprinkle in a few large magnitudes.
+    Src.FData[0] := 1000.0; Src.FData[1] := -1234.5; Src.FData[2] := 9999.9;
+    TNNetVolume.VectorSin(Dst.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      e := Abs(Dst.FData[I] - pcr_sinf(Src.FData[I]));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorSin vs pcr_sinf max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+    // dst aliasing src.
+    TNNetVolume.VectorSin(Src.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      if I = 0 then x := 1000.0
+      else if I = 1 then x := -1234.5
+      else if I = 2 then x := 9999.9
+      else x := -50.0 + 100.0 * I / (N - 1);
+      e := Abs(Src.FData[I] - pcr_sinf(x));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorSin (aliased) vs pcr_sinf max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+  finally
+    Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestVectorCosScalarParity;
+// VectorCos (Cephes cosf with 3-part Cody-Waite reduction on the AVX2 build) must
+// match the scalar pcr_cosf reference within tolerance on every build. Same coverage
+// rationale as TestVectorSinScalarParity.
+const
+  N = 131;
+  AbsTol = 1e-4;
+var
+  Src, Dst: TNNetVolume;
+  I: integer;
+  x, e, maxErr: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  try
+    for I := 0 to N - 1 do
+      Src.FData[I] := -50.0 + 100.0 * I / (N - 1);
+    Src.FData[0] := 1000.0; Src.FData[1] := -1234.5; Src.FData[2] := 9999.9;
+    TNNetVolume.VectorCos(Dst.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      e := Abs(Dst.FData[I] - pcr_cosf(Src.FData[I]));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorCos vs pcr_cosf max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+    // dst aliasing src.
+    TNNetVolume.VectorCos(Src.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      if I = 0 then x := 1000.0
+      else if I = 1 then x := -1234.5
+      else if I = 2 then x := 9999.9
+      else x := -50.0 + 100.0 * I / (N - 1);
+      e := Abs(Src.FData[I] - pcr_cosf(x));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorCos (aliased) vs pcr_cosf max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+  finally
+    Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestVectorArcSinhScalarParity;
+// VectorArcSinh = ln(x + sqrt(x^2+1)), built on the AVX2 VectorLn, must match the
+// scalar reference within tolerance on every build. N=131 straddles body+tail; range
+// covers both signs and large magnitudes. dst aliasing src is also checked.
+const
+  N = 131;
+  AbsTol = 1e-4;
+var
+  Src, Dst: TNNetVolume;
+  I: integer;
+  x, e, maxErr: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  try
+    for I := 0 to N - 1 do
+      Src.FData[I] := -30.0 + 60.0 * I / (N - 1);
+    TNNetVolume.VectorArcSinh(Dst.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      x := Src.FData[I];
+      e := Abs(Dst.FData[I] - pcr_logf(x + Sqrt(x * x + 1.0)));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorArcSinh vs ln(x+sqrt(x^2+1)) max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+    // dst aliasing src.
+    TNNetVolume.VectorArcSinh(Src.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    for I := 0 to N - 1 do
+    begin
+      x := -30.0 + 60.0 * I / (N - 1);
+      e := Abs(Src.FData[I] - pcr_logf(x + Sqrt(x * x + 1.0)));
+      if e > maxErr then maxErr := e;
+    end;
+    AssertTrue('VectorArcSinh (aliased) max abs err ' + FloatToStr(maxErr) +
+      ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
+  finally
+    Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestPointwiseSoftMaxVectorizedParity;
+// PointwiseSoftMax (depth-axis softmax per (x,y) point) must agree with an
+// independent scalar reference within tolerance. Depth = 37 straddles the AVX
+// 8-wide body and the scalar tail; multiple spatial points exercise the loop.
+const
+  SX = 5; SY = 3; D = 37;
+  AbsTol = 1e-4;
+var
+  V, Ref: TNNetVolume;
+  cx, cy, cd, base: integer;
+  mx, sum: TNeuralFloat;
+begin
+  V := TNNetVolume.Create(SX, SY, D);
+  Ref := TNNetVolume.Create(SX, SY, D);
+  try
+    for cx := 0 to SX - 1 do
+      for cy := 0 to SY - 1 do
+        for cd := 0 to D - 1 do
+        begin
+          V[cx, cy, cd] := Sin(0.31 * cx + 0.7 * cy + 0.17 * cd) * 6.0;
+          Ref[cx, cy, cd] := V[cx, cy, cd];
+        end;
+    // Scalar reference softmax over the depth axis at each (x,y).
+    for cx := 0 to SX - 1 do
+      for cy := 0 to SY - 1 do
+      begin
+        base := Ref.GetRawPos(cx, cy);
+        mx := Ref.FData[base];
+        for cd := 1 to D - 1 do
+          if Ref.FData[base + cd] > mx then mx := Ref.FData[base + cd];
+        sum := 0;
+        for cd := 0 to D - 1 do
+        begin
+          Ref.FData[base + cd] := Exp(Ref.FData[base + cd] - mx);
+          sum := sum + Ref.FData[base + cd];
+        end;
+        for cd := 0 to D - 1 do
+          Ref.FData[base + cd] := Ref.FData[base + cd] / sum;
+      end;
+    V.PointwiseSoftMax();
+    for cd := 0 to V.Size - 1 do
+      AssertTrue('PointwiseSoftMax parity at ' + IntToStr(cd) +
+        ' err ' + FloatToStr(Abs(V.FData[cd] - Ref.FData[cd])),
+        Abs(V.FData[cd] - Ref.FData[cd]) < AbsTol);
+  finally
+    V.Free; Ref.Free;
   end;
 end;
 
@@ -1727,6 +2424,210 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+// Regression: TNNetMaxChannel global max over a RECTANGULAR (SizeX <> SizeY)
+// feature map. The old square-only pooling path mis-indexed the output rows
+// when SizeY <> SizeX; the reduction must collapse the WHOLE grid to (1,1,D)
+// and route the gradient to the true winning (x,y) position per channel.
+procedure TTestNeuralLayers.TestMaxChannelRectangular;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ChannelLayer: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 5, 2); // W=3, H=5 (rectangular)
+  try
+    NN.AddLayer(TNNetInput.Create(3, 5, 2, 1));
+    ChannelLayer := NN.AddLayer(TNNetMaxChannel.Create());
+
+    // Baseline values per channel, then plant a single distinct maximum.
+    Input.FillAtDepth(0, 1.0);
+    Input.FillAtDepth(1, -4.0);
+    // Channel 0 max at (x=2,y=4); channel 1 max at (x=0,y=3).
+    Input[2, 4, 0] := 9.0;
+    Input[0, 3, 1] := 7.0;
+
+    NN.Compute(Input);
+
+    AssertEquals('Output collapses to (1,1,Depth)=2 elements',
+      2, ChannelLayer.Output.Size);
+    AssertEquals('Output SizeX must be 1', 1, ChannelLayer.Output.SizeX);
+    AssertEquals('Output SizeY must be 1', 1, ChannelLayer.Output.SizeY);
+    AssertEquals('Global max of channel 0', 9.0, ChannelLayer.Output.Raw[0], 0.0001);
+    AssertEquals('Global max of channel 1', 7.0, ChannelLayer.Output.Raw[1], 0.0001);
+
+    // Backward: gradient routes to the winning position only.
+    ChannelLayer.OutputError.Fill(0);
+    ChannelLayer.OutputError.Raw[0] := 1.0;
+    ChannelLayer.OutputError.Raw[1] := 2.0;
+    NN.GetFirstLayer.OutputError.Fill(0);
+    ChannelLayer.IncDepartingBranchesCnt();
+    ChannelLayer.Backpropagate();
+
+    AssertEquals('Grad lands on channel-0 winner (2,4,0)',
+      1.0, NN.GetFirstLayer.OutputError[2, 4, 0], 0.0001);
+    AssertEquals('Grad lands on channel-1 winner (0,3,1)',
+      2.0, NN.GetFirstLayer.OutputError[0, 3, 1], 0.0001);
+    // A non-winning cell receives nothing.
+    AssertEquals('No grad at a non-winning cell',
+      0.0, NN.GetFirstLayer.OutputError[0, 0, 0], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Regression: TNNetMinChannel global min over a RECTANGULAR feature map.
+procedure TTestNeuralLayers.TestMinChannelRectangular;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ChannelLayer: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 2, 2); // W=6, H=2 (wide rectangular)
+  try
+    NN.AddLayer(TNNetInput.Create(6, 2, 2, 1));
+    ChannelLayer := NN.AddLayer(TNNetMinChannel.Create());
+
+    Input.FillAtDepth(0, 3.0);
+    Input.FillAtDepth(1, 8.0);
+    Input[5, 1, 0] := -2.0; // channel 0 min
+    Input[1, 0, 1] := 0.5;  // channel 1 min
+
+    NN.Compute(Input);
+
+    AssertEquals('Output collapses to 2 elements', 2, ChannelLayer.Output.Size);
+    AssertEquals('Global min of channel 0', -2.0, ChannelLayer.Output.Raw[0], 0.0001);
+    AssertEquals('Global min of channel 1', 0.5, ChannelLayer.Output.Raw[1], 0.0001);
+
+    ChannelLayer.OutputError.Fill(0);
+    ChannelLayer.OutputError.Raw[0] := 5.0;
+    ChannelLayer.OutputError.Raw[1] := -1.0;
+    NN.GetFirstLayer.OutputError.Fill(0);
+    ChannelLayer.IncDepartingBranchesCnt();
+    ChannelLayer.Backpropagate();
+
+    AssertEquals('Grad lands on channel-0 min winner (5,1,0)',
+      5.0, NN.GetFirstLayer.OutputError[5, 1, 0], 0.0001);
+    AssertEquals('Grad lands on channel-1 min winner (1,0,1)',
+      -1.0, NN.GetFirstLayer.OutputError[1, 0, 1], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// The SQUARE case must be unchanged by the rectangular fix.
+procedure TTestNeuralLayers.TestMaxChannelSquareRegression;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ChannelLayer: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 3, 1)); // pError=1 sizes error volumes
+    ChannelLayer := NN.AddLayer(TNNetMaxChannel.Create());
+
+    Input.FillAtDepth(0, 1.0);
+    Input.FillAtDepth(1, 2.0);
+    Input.FillAtDepth(2, 3.0);
+    Input[1, 2, 2] := 11.0; // a plain maximum in channel 2
+
+    NN.Compute(Input);
+
+    AssertEquals('Square output still 3 elements', 3, ChannelLayer.Output.Size);
+    AssertEquals('Square max channel 0', 1.0, ChannelLayer.Output.Raw[0], 0.0001);
+    AssertEquals('Square max channel 1', 2.0, ChannelLayer.Output.Raw[1], 0.0001);
+    AssertEquals('Square max channel 2', 11.0, ChannelLayer.Output.Raw[2], 0.0001);
+
+    ChannelLayer.OutputError.Fill(0);
+    ChannelLayer.OutputError.Raw[2] := 1.0;
+    NN.GetFirstLayer.OutputError.Fill(0);
+    ChannelLayer.IncDepartingBranchesCnt();
+    ChannelLayer.Backpropagate();
+    AssertEquals('Square grad routes to winner (1,2,2)',
+      1.0, NN.GetFirstLayer.OutputError[1, 2, 2], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Regression for FlipX -> padded convolution: a padded conv writes its error
+// back into the flip layer's output-sized error buffer; the flip backward must
+// stay within bounds and produce finite gradients (no range-check overflow).
+procedure TTestNeuralLayers.TestFlipXPaddedConvBackprop;
+var
+  NN: TNNet;
+  Input, Expected: TNNetVolume;
+  I: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 7, 2); // rectangular to exercise both axes
+  Expected := TNNetVolume.Create(3);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 7, 2, 1));
+    NN.AddLayer(TNNetFlipX.Create());
+    // Padded (FeatureSize 3, Padding 1) conv keeps spatial size; its backward
+    // routes a padded error region into the flip layer.
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    Input.Randomize();
+    Expected.Raw[0] := 0.5; Expected.Raw[1] := -0.3; Expected.Raw[2] := 0.1;
+
+    NN.Compute(Input);
+    NN.Backpropagate(Expected);
+
+    // Assert input gradients are finite (no overflow / NaN).
+    for I := 0 to NN.GetFirstLayer.OutputError.Size - 1 do
+      AssertTrue('Input grad must be finite',
+        not (IsNan(NN.GetFirstLayer.OutputError.Raw[I]) or
+             IsInfinite(NN.GetFirstLayer.OutputError.Raw[I])));
+    AssertEquals('Head output size is 3', 3, NN.GetLastLayer.Output.Size);
+  finally
+    NN.Free;
+    Input.Free;
+    Expected.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestFlipYPaddedConvBackprop;
+var
+  NN: TNNet;
+  Input, Expected: TNNetVolume;
+  I: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(7, 5, 2);
+  Expected := TNNetVolume.Create(3);
+  try
+    NN.AddLayer(TNNetInput.Create(7, 5, 2, 1));
+    NN.AddLayer(TNNetFlipY.Create());
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    Input.Randomize();
+    Expected.Raw[0] := -0.2; Expected.Raw[1] := 0.4; Expected.Raw[2] := 0.0;
+
+    NN.Compute(Input);
+    NN.Backpropagate(Expected);
+
+    for I := 0 to NN.GetFirstLayer.OutputError.Size - 1 do
+      AssertTrue('Input grad must be finite',
+        not (IsNan(NN.GetFirstLayer.OutputError.Raw[I]) or
+             IsInfinite(NN.GetFirstLayer.OutputError.Raw[I])));
+    AssertEquals('Head output size is 3', 3, NN.GetLastLayer.Output.Size);
+  finally
+    NN.Free;
+    Input.Free;
+    Expected.Free;
   end;
 end;
 

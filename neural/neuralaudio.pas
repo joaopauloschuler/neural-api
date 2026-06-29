@@ -61,7 +61,7 @@ unit neuralaudio;
 interface
 
 uses
-  Classes, SysUtils, neuralvolume;
+  Classes, SysUtils, Math, neuralvolume;
 
 // Reads a 16-bit PCM RIFF/WAVE file into Samples as mono floats in [-1, 1)
 // (multi-channel input is averaged). Samples is resized to (N, 1, 1).
@@ -78,17 +78,83 @@ function LoadWav16ToVolume(const FileName: string;
 procedure SaveVolumeToWav16(Samples: TNNetVolume; const FileName: string;
   SampleRate: integer = 16000);
 
+// Sample-rate conversion of a mono waveform (floats in [-1, 1], laid out
+// along FData as LoadWav16ToVolume reads them) from SourceRate to TargetRate.
+// Returns a NEWLY created TNNetVolume of shape (round(N * TargetRate /
+// SourceRate), 1, 1) - the CALLER OWNS and must Free it.
+//
+// Quality: a windowed-sinc (Lanczos, default A = csResampleLanczosA lobes)
+// polyphase-style kernel evaluated per output sample. For DOWNSAMPLING the
+// sinc cutoff is lowered to the output Nyquist (cutoff = TargetRate /
+// SourceRate in input-sample units), so the low-pass anti-alias filter is
+// folded into the interpolation kernel - no separate pre-filter needed. For
+// UPSAMPLING the cutoff stays at the input Nyquist (band-limited interp).
+// This is materially better than naive linear interpolation for downsampling
+// (linear leaves audible aliasing); the cost is O(N_out * 2*A/ratio) which is
+// negligible next to the STFT/mel that follows.
+//
+// FAST PATH: when SourceRate = TargetRate the input is copied bit-identically
+// (no kernel evaluated), so a 16 kHz -> 16 kHz call is a pure passthrough.
+function ResampleVolume(Wave: TNNetVolume; SourceRate, TargetRate: integer): TNNetVolume;
+
+// Convenience: ResampleVolume(Wave, SourceRate, 16000). Caller owns Result.
+function ResampleVolumeTo16k(Wave: TNNetVolume; SourceRate: integer): TNNetVolume;
+
+// Like LoadWav16ToVolume but the loaded waveform is resampled to TargetRate
+// (default 16000 Hz) mono. When the file is already at TargetRate this is
+// bit-identical to LoadWav16ToVolume. Returns TargetRate (always); Samples is
+// the resampled mono waveform (N, 1, 1).
+function LoadWavResampledToVolume(const FileName: string; Samples: TNNetVolume;
+  TargetRate: integer = 16000): integer;
+
 // HF WhisperFeatureExtractor log-mel spectrogram (see the unit header).
 // Samples: mono waveform at 16 kHz, any length (padded/truncated to
 // NumFrames*160 samples). Mel is resized to (NumFrames, 1, NumMelBins).
 procedure ComputeWhisperLogMel(Samples: TNNetVolume; Mel: TNNetVolume;
   NumMelBins: integer = 80; NumFrames: integer = 3000);
 
-// Convenience wrapper: LoadWav16ToVolume + ComputeWhisperLogMel. The WAV
-// must already be sampled at 16000 Hz (no resampler in this v1 - raises
-// Exception otherwise; convert first, e.g. ffmpeg -ar 16000 -ac 1).
+// Convenience wrapper: load a WAV + ComputeWhisperLogMel. By default
+// (Resample = True) a WAV at any sample rate is accepted and resampled to
+// 16000 Hz mono via ResampleVolume (a 16 kHz file passes through untouched).
+// Pass Resample = False to keep the strict v1 behaviour (raise Exception if
+// the file is not already 16000 Hz).
 procedure WhisperLogMelFromWavFile(const FileName: string; Mel: TNNetVolume;
-  NumMelBins: integer = 80; NumFrames: integer = 3000);
+  NumMelBins: integer = 80; NumFrames: integer = 3000;
+  Resample: boolean = True);
+
+// MusicGen Melody chroma front-end (HF transformers
+// MusicgenMelodyFeatureExtractor): a 12-bin CHROMAGRAM of a reference waveform
+// that conditions music generation in BuildMusicGenMelodyFromSafeTensors. The
+// pipeline matches the feature extractor bit-for-bit:
+//   - a POWER spectrogram (torchaudio.transforms.Spectrogram with
+//     n_fft=NFFT, win_length=NFFT, hop_length=Hop, a PERIODIC Hann window,
+//     center=True / reflect pad, NORMALIZED by the window L2 energy
+//     sqrt(sum(window^2)), power=2);
+//   - a chroma_filter_bank (librosa-style, see BuildChromaFilterBank) mapping
+//     the NFFT div 2 + 1 one-sided FFT bins onto NumChroma pitch classes;
+//   - per-frame inf-norm normalization (divide each chroma row by its max,
+//     eps 1e-6);
+//   - per-frame ARGMAX one-hot: the dominant pitch class is set to 1, the rest
+//     to 0.
+// Samples is a mono waveform at SampleRate (32000 for the real model; any
+// length - padded to NFFT if shorter, matching the extractor). Chroma is
+// resized to (NumFrames, 1, NumChroma): time along SizeX, pitch classes along
+// Depth (the same (SeqLen,1,Channels) layout ComputeWhisperLogMel emits), where
+// NumFrames = 1 + Samples.Size div Hop (the center-padded STFT frame count).
+// Coded by Claude (AI).
+procedure ComputeMusicgenMelodyChroma(Samples: TNNetVolume; Chroma: TNNetVolume;
+  SampleRate: integer = 32000; NFFT: integer = 16384; Hop: integer = 4096;
+  NumChroma: integer = 12);
+
+// Builds the MusicGen Melody chroma filter bank (librosa/transformers
+// chroma_filter_bank with tuning=0, power=2, weighting_parameters=(5,2),
+// start_at_c_chroma=True): a (NumChroma x (NFFT div 2 + 1)) matrix projecting
+// one-sided power-spectrum bins onto pitch classes. Filt is resized to
+// (NumChroma, 1, NFFT div 2 + 1): Filt[c][b] is the weight of FFT bin b in
+// chroma c. Depends only on (SampleRate, NFFT, NumChroma) - a fixed constant
+// matrix for a given model. Coded by Claude (AI).
+procedure BuildChromaFilterBank(Filt: TNNetVolume;
+  SampleRate, NFFT, NumChroma: integer);
 
 // Inverse STFT overlap-add (OLA) synthesis - the exact inverse of the forward
 // real STFT used by ComputeWhisperLogMel (periodic Hann analysis window, same
@@ -135,6 +201,7 @@ const
   csWhisperHop = 160;       // hop (10 ms at 16 kHz)
   csWhisperSampleRate = 16000;
   csWhisperMaxFreq = 8000.0;
+  csResampleLanczosA = 4;   // sinc lobes per side for the resampler kernel
   csWhisperMelFloor = 1e-10;
 
 function LoadWav16ToVolume(const FileName: string;
@@ -237,6 +304,115 @@ begin
   finally
     FS.Free;
   end;
+end;
+
+function ResampleVolume(Wave: TNNetVolume; SourceRate, TargetRate: integer): TNNetVolume;
+var
+  NIn, NOut, OutCnt, J, JLo, JHi: integer;
+  Ratio, Cutoff, SrcPos, Center, X, Acc, WSum, W, PiX, PiXA: double;
+
+  // Lanczos-windowed sinc at offset T (in input-sample units), low-passed at
+  // Cutoff (cycles per input sample, <= 0.5). Returns the kernel weight.
+  function LanczosKernel(T: double): double;
+  begin
+    if Abs(T) < 1e-12 then
+    begin
+      Result := 2.0 * Cutoff;
+      exit;
+    end;
+    if Abs(T) >= csResampleLanczosA then
+    begin
+      Result := 0.0;
+      exit;
+    end;
+    // sinc(2*Cutoff*T) low-pass, windowed by the Lanczos lobe sinc(T/A).
+    PiX := Pi * 2.0 * Cutoff * T;
+    PiXA := Pi * T / csResampleLanczosA;
+    Result := 2.0 * Cutoff * (Sin(PiX) / PiX) * (Sin(PiXA) / PiXA);
+  end;
+
+begin
+  if (SourceRate <= 0) or (TargetRate <= 0) then
+    raise Exception.Create('ResampleVolume: sample rates must be positive.');
+  Result := TNNetVolume.Create;
+  NIn := Wave.Size;
+  // FAST PATH: identical rates -> bit-identical copy, no kernel evaluated.
+  if SourceRate = TargetRate then
+  begin
+    Result.ReSize(NIn, 1, 1);
+    if NIn > 0 then
+      Move(Wave.FData[0], Result.FData[0], NIn * SizeOf(Wave.FData[0]));
+    exit;
+  end;
+  NOut := Round(NIn * (TargetRate / SourceRate));
+  Result.ReSize(NOut, 1, 1);
+  if (NIn = 0) or (NOut = 0) then exit;
+
+  Ratio := TargetRate / SourceRate;
+  // Anti-alias cutoff: input Nyquist when upsampling (Ratio>=1, Cutoff=0.5),
+  // lowered to the OUTPUT Nyquist when downsampling (Cutoff=0.5*Ratio). The
+  // kernel half-width grows by 1/min(1,Ratio) so it still spans A output lobes.
+  if Ratio >= 1.0 then
+    Cutoff := 0.5
+  else
+    Cutoff := 0.5 * Ratio;
+
+  for OutCnt := 0 to NOut - 1 do
+  begin
+    // Position of this output sample expressed in INPUT-sample coordinates.
+    SrcPos := OutCnt / Ratio;
+    Center := SrcPos;
+    // Kernel support in input samples: A lobes scaled by the cutoff stretch.
+    if Ratio >= 1.0 then
+    begin
+      JLo := Floor(Center) - csResampleLanczosA + 1;
+      JHi := Floor(Center) + csResampleLanczosA;
+    end
+    else
+    begin
+      JLo := Floor(Center - csResampleLanczosA / Ratio);
+      JHi := Ceil(Center + csResampleLanczosA / Ratio);
+    end;
+    Acc := 0.0;
+    WSum := 0.0;
+    for J := JLo to JHi do
+    begin
+      if (J < 0) or (J > NIn - 1) then continue;
+      X := Center - J;
+      W := LanczosKernel(X);
+      if W = 0.0 then continue;
+      Acc := Acc + W * Wave.FData[J];
+      WSum := WSum + W;
+    end;
+    if WSum <> 0.0 then
+      Result.FData[OutCnt] := Acc / WSum
+    else
+      Result.FData[OutCnt] := 0.0;
+  end;
+end;
+
+function ResampleVolumeTo16k(Wave: TNNetVolume; SourceRate: integer): TNNetVolume;
+begin
+  Result := ResampleVolume(Wave, SourceRate, csWhisperSampleRate);
+end;
+
+function LoadWavResampledToVolume(const FileName: string; Samples: TNNetVolume;
+  TargetRate: integer = 16000): integer;
+var
+  SrcRate: integer;
+  Resampled: TNNetVolume;
+begin
+  SrcRate := LoadWav16ToVolume(FileName, Samples);
+  if SrcRate <> TargetRate then
+  begin
+    Resampled := ResampleVolume(Samples, SrcRate, TargetRate);
+    try
+      Samples.Copy(Resampled);
+    finally
+      Resampled.Free;
+    end;
+  end;
+  Result := TargetRate;
 end;
 
 procedure SaveVolumeToWav16(Samples: TNNetVolume; const FileName: string;
@@ -499,22 +675,312 @@ begin
 end;
 
 procedure WhisperLogMelFromWavFile(const FileName: string; Mel: TNNetVolume;
-  NumMelBins: integer = 80; NumFrames: integer = 3000);
+  NumMelBins: integer = 80; NumFrames: integer = 3000;
+  Resample: boolean = True);
 var
   Samples: TNNetVolume;
   SampleRate: integer;
 begin
   Samples := TNNetVolume.Create;
   try
-    SampleRate := LoadWav16ToVolume(FileName, Samples);
+    if Resample then
+      SampleRate := LoadWavResampledToVolume(FileName, Samples,
+        csWhisperSampleRate)
+    else
+      SampleRate := LoadWav16ToVolume(FileName, Samples);
     if SampleRate <> csWhisperSampleRate then
       raise Exception.Create('WhisperLogMelFromWavFile: ' + FileName +
         ' is sampled at ' + IntToStr(SampleRate) + ' Hz - Whisper needs ' +
-        '16000 Hz mono (convert first, e.g. ffmpeg -i in.wav -ar 16000 ' +
-        '-ac 1 out.wav).');
+        '16000 Hz mono (pass Resample=True, or convert first, e.g. ' +
+        'ffmpeg -i in.wav -ar 16000 -ac 1 out.wav).');
     ComputeWhisperLogMel(Samples, Mel, NumMelBins, NumFrames);
   finally
     Samples.Free;
+  end;
+end;
+
+procedure BuildChromaFilterBank(Filt: TNNetVolume;
+  SampleRate, NFFT, NumChroma: integer);
+var
+  NumBins, NumKept, c, b, NumChromaM1, NumBinsM1, NumKeptM1: integer;
+  Freq, Octave, StuttgartOver16, NumChroma2, Center, HalfWidth, FreqBin0: double;
+  FreqBins: array of double;     // NFFT (the 0-Hz bin + NFFT-1 real bins)
+  BinsWidth: array of double;    // NFFT
+  Raw: array of double;          // (NumChroma x NFFT) before normalization
+  ColNorm, Diff, Val, W, Tmp: double;
+  Rolled: array of double;       // (NumChroma x NumKept) after roll + slice
+  RollBy: integer;
+begin
+  // chroma_filter_bank(tuning=0, power=2, weighting=(5,2), start_at_c=True),
+  // transformers.audio_utils. The filter bank has one column per FREQ BIN of
+  // the full NFFT spectrum (NFFT entries: a synthetic 0-Hz bin prepended to the
+  // NFFT-1 bins of linspace(0,sr,NFFT,endpoint=False)[1:]); the final result is
+  // sliced to the first NFFT div 2 + 1 one-sided bins.
+  NumBins := NFFT;                 // freq_bins length after the 0-Hz prepend
+  NumKept := NFFT div 2 + 1;       // one-sided bins kept
+  NumChromaM1 := NumChroma - 1;
+  NumBinsM1 := NumBins - 1;
+  NumKeptM1 := NumKept - 1;
+  StuttgartOver16 := 440.0 / 16.0; // stuttgart_pitch (tuning 0) / 16
+
+  // HF freq_bins = concatenate([fb0], NumChroma*octave(linspace[1:])): slot 0 is
+  // the synthetic 0-Hz bin = fb(at freq index 1) - 1.5*NumChroma; slot i (>=1)
+  // = NumChroma*octave(freq index i), freq index i = sr*i/NFFT.
+  SetLength(FreqBins, NumBins);
+  for b := 1 to NumBinsM1 do
+  begin
+    Freq := SampleRate * (b / NFFT);  // linspace(0,sr,NFFT,endpoint=False)[b]
+    Octave := Ln(Freq / StuttgartOver16) / Ln(2.0);
+    FreqBins[b] := NumChroma * Octave;
+  end;
+  FreqBin0 := FreqBins[1] - 1.5 * NumChroma;
+  FreqBins[0] := FreqBin0;
+
+  // bins_width = concatenate([max(diff(freq_bins),1.0), [1]])
+  SetLength(BinsWidth, NumBins);
+  for b := 0 to NumBinsM1 - 1 do
+  begin
+    Diff := FreqBins[b + 1] - FreqBins[b];
+    if Diff < 1.0 then Diff := 1.0;
+    BinsWidth[b] := Diff;
+  end;
+  BinsWidth[NumBinsM1] := 1.0;
+
+  NumChroma2 := Round(NumChroma / 2.0);
+
+  // chroma_filters[c][b] = exp(-0.5 * (2*D/binwidth[b])^2) where
+  //   D = ((freq_bins[b] - c + NumChroma2 + 10*NumChroma) mod NumChroma)
+  //       - NumChroma2
+  SetLength(Raw, NumChroma * NumBins);
+  for c := 0 to NumChromaM1 do
+    for b := 0 to NumBinsM1 do
+    begin
+      Val := FreqBins[b] - c;
+      Val := Val + NumChroma2 + 10 * NumChroma;
+      // python float remainder (result has sign of divisor; here divisor > 0)
+      Val := Val - NumChroma * Floor(Val / NumChroma);
+      Val := Val - NumChroma2;
+      W := 2.0 * Val / BinsWidth[b];
+      Raw[c * NumBins + b] := Exp(-0.5 * W * W);
+    end;
+
+  // normalize each COLUMN by its L2 norm (power=2)
+  for b := 0 to NumBinsM1 do
+  begin
+    ColNorm := 0.0;
+    for c := 0 to NumChromaM1 do
+      ColNorm := ColNorm + Raw[c * NumBins + b] * Raw[c * NumBins + b];
+    ColNorm := Sqrt(ColNorm);
+    if ColNorm > 0.0 then
+      for c := 0 to NumChromaM1 do
+        Raw[c * NumBins + b] := Raw[c * NumBins + b] / ColNorm;
+  end;
+
+  // Gaussian frequency weighting: *= exp(-0.5*((freq_bins/NumChroma - 5)/2)^2)
+  Center := 5.0;
+  HalfWidth := 2.0;
+  for b := 0 to NumBinsM1 do
+  begin
+    Tmp := (FreqBins[b] / NumChroma - Center) / HalfWidth;
+    W := Exp(-0.5 * Tmp * Tmp);
+    for c := 0 to NumChromaM1 do
+      Raw[c * NumBins + b] := Raw[c * NumBins + b] * W;
+  end;
+
+  // start_at_c_chroma: roll rows by -3*(NumChroma div 12) along the chroma axis
+  RollBy := 3 * (NumChroma div 12);   // shift UP by RollBy (np.roll(-RollBy))
+  SetLength(Rolled, NumChroma * NumKept);
+  for c := 0 to NumChromaM1 do
+    for b := 0 to NumKeptM1 do
+      Rolled[c * NumKept + b] :=
+        Raw[(((c + RollBy) mod NumChroma)) * NumBins + b];
+
+  Filt.ReSize(NumChroma, 1, NumKept);
+  for c := 0 to NumChromaM1 do
+    for b := 0 to NumKeptM1 do
+      Filt.FData[c * NumKept + b] := Rolled[c * NumKept + b];
+end;
+
+procedure ComputeMusicgenMelodyChroma(Samples: TNNetVolume; Chroma: TNNetVolume;
+  SampleRate: integer = 32000; NFFT: integer = 16384; Hop: integer = 4096;
+  NumChroma: integer = 12);
+var
+  NumSamplesIn, NumSamples, PadLeft, NumFrames, NumBins: integer;
+  NumSamplesM1, NFFTM1, NumBinsM1, NumChromaM1, NumFramesM1: integer;
+  Window: array of double;        // periodic hann
+  WinNorm: double;                // sqrt(sum(window^2))
+  Filt: TNNetVolume;
+  Re, Im: array of double;        // FFT scratch (NFFT)
+  Power: array of double;         // one frame's power spectrum (NumBins)
+  RawChroma: array of double;     // (NumFrames x NumChroma)
+  FrameStart, FrameCnt, TapCnt, BinCnt, ChCnt, SrcIdx, ArgMax: integer;
+  Acc, MaxVal, V: double;
+
+  // reflect pad indexing (np pad mode 'reflect' = torch center pad): mirror
+  // WITHOUT repeating the edge sample. Single bounce suffices (PadLeft < len).
+  function WaveAt(Idx: integer): double;
+  begin
+    if Idx < 0 then Idx := -Idx;
+    if Idx >= NumSamplesIn then Idx := 2 * NumSamplesIn - 2 - Idx;
+    if Idx < 0 then Idx := 0;
+    if Idx >= NumSamplesIn then Idx := NumSamplesIn - 1;
+    Result := Samples.FData[Idx];
+  end;
+
+  // In-place radix-2 FFT (forward: X[k] = sum x[n] exp(-2*pi*i*k*n/N)). NFFT
+  // is a power of two for the melody front-end (16384).
+  procedure FFTRadix2;
+  var
+    i2, j2, lenF, halfF, k2, a2, b2: integer;
+    ang, wRe, wIm, wpRe, wpIm, tmpF: double;
+    uRe, uIm, vRe, vIm: double;
+  begin
+    j2 := 0;
+    for i2 := 1 to NFFTM1 do
+    begin
+      k2 := NFFT shr 1;
+      while (j2 and k2) <> 0 do
+      begin
+        j2 := j2 and (not k2);
+        k2 := k2 shr 1;
+      end;
+      j2 := j2 or k2;
+      if i2 < j2 then
+      begin
+        tmpF := Re[i2]; Re[i2] := Re[j2]; Re[j2] := tmpF;
+        tmpF := Im[i2]; Im[i2] := Im[j2]; Im[j2] := tmpF;
+      end;
+    end;
+    lenF := 2;
+    while lenF <= NFFT do
+    begin
+      halfF := lenF shr 1;
+      ang := -2.0 * Pi / lenF;
+      wpRe := Cos(ang);
+      wpIm := Sin(ang);
+      i2 := 0;
+      while i2 < NFFT do
+      begin
+        wRe := 1.0; wIm := 0.0;
+        for k2 := 0 to halfF - 1 do
+        begin
+          a2 := i2 + k2;
+          b2 := a2 + halfF;
+          uRe := Re[a2]; uIm := Im[a2];
+          vRe := Re[b2] * wRe - Im[b2] * wIm;
+          vIm := Re[b2] * wIm + Im[b2] * wRe;
+          Re[a2] := uRe + vRe; Im[a2] := uIm + vIm;
+          Re[b2] := uRe - vRe; Im[b2] := uIm - vIm;
+          tmpF := wRe * wpRe - wIm * wpIm;
+          wIm := wRe * wpIm + wIm * wpRe;
+          wRe := tmpF;
+        end;
+        i2 := i2 + lenF;
+      end;
+      lenF := lenF shl 1;
+    end;
+  end;
+
+begin
+  if NFFT < 2 then
+    raise Exception.Create('ComputeMusicgenMelodyChroma: NFFT must be >= 2.');
+  if (NFFT and (NFFT - 1)) <> 0 then
+    raise Exception.Create('ComputeMusicgenMelodyChroma: NFFT must be a power of two.');
+  NumSamplesIn := Samples.Size;
+  // The feature extractor pads a too-short waveform to NFFT with zeros first
+  // (centered). Mirror that by treating Samples as already >= NFFT here: in
+  // practice the reference melody is longer than NFFT. If shorter, the reflect
+  // pad below still produces a valid (if degenerate) spectrogram.
+  if NumSamplesIn < 1 then
+    raise Exception.Create('ComputeMusicgenMelodyChroma: empty waveform.');
+  NFFTM1 := NFFT - 1;
+  NumBins := NFFT div 2 + 1;
+  NumBinsM1 := NumBins - 1;
+  NumChromaM1 := NumChroma - 1;
+  // center=True: torch reflect-pads NFFT div 2 on each side, then frames hop by
+  // Hop. Frame count = 1 + NumSamplesIn div Hop.
+  PadLeft := NFFT div 2;
+  NumFrames := 1 + NumSamplesIn div Hop;
+  NumFramesM1 := NumFrames - 1;
+  NumSamples := NumSamplesIn;
+  NumSamplesM1 := NumSamples - 1;
+
+  // periodic hann window + its L2 energy (the torchaudio normalized=True norm)
+  SetLength(Window, NFFT);
+  WinNorm := 0.0;
+  for TapCnt := 0 to NFFTM1 do
+  begin
+    Window[TapCnt] := 0.5 - 0.5 * Cos(2.0 * Pi * TapCnt / NFFT);
+    WinNorm := WinNorm + Window[TapCnt] * Window[TapCnt];
+  end;
+  WinNorm := Sqrt(WinNorm);
+  if WinNorm <= 0.0 then WinNorm := 1.0;
+
+  Filt := TNNetVolume.Create;
+  SetLength(Re, NFFT);
+  SetLength(Im, NFFT);
+  SetLength(Power, NumBins);
+  SetLength(RawChroma, NumFrames * NumChroma);
+  try
+    BuildChromaFilterBank(Filt, SampleRate, NFFT, NumChroma);
+
+    for FrameCnt := 0 to NumFramesM1 do
+    begin
+      // frame center at FrameCnt*Hop in the centered (padded) signal -> start at
+      // FrameCnt*Hop - PadLeft in the ORIGINAL signal.
+      FrameStart := FrameCnt * Hop - PadLeft;
+      for TapCnt := 0 to NFFTM1 do
+      begin
+        SrcIdx := FrameStart + TapCnt;
+        if (SrcIdx >= 0) and (SrcIdx <= NumSamplesM1) then
+          V := Samples.FData[SrcIdx]
+        else
+          V := WaveAt(SrcIdx);
+        Re[TapCnt] := V * Window[TapCnt];
+        Im[TapCnt] := 0.0;
+      end;
+      FFTRadix2;
+      // one-sided power spectrum, normalized by the window L2 energy
+      for BinCnt := 0 to NumBinsM1 do
+      begin
+        V := (Re[BinCnt] / WinNorm);
+        Acc := (Im[BinCnt] / WinNorm);
+        Power[BinCnt] := V * V + Acc * Acc;
+      end;
+      // raw_chroma[c] = sum_b Filt[c][b] * Power[b]
+      MaxVal := -1e30;
+      for ChCnt := 0 to NumChromaM1 do
+      begin
+        Acc := 0.0;
+        for BinCnt := 0 to NumBinsM1 do
+          Acc := Acc + Filt.FData[ChCnt * NumBins + BinCnt] * Power[BinCnt];
+        RawChroma[FrameCnt * NumChroma + ChCnt] := Acc;
+        if Acc > MaxVal then MaxVal := Acc;
+      end;
+      // inf-norm normalize is monotonic, so the ARGMAX is unchanged by it; the
+      // one-hot only needs the dominant chroma index.
+      ArgMax := 0;
+      MaxVal := RawChroma[FrameCnt * NumChroma];
+      for ChCnt := 1 to NumChromaM1 do
+        if RawChroma[FrameCnt * NumChroma + ChCnt] > MaxVal then
+        begin
+          MaxVal := RawChroma[FrameCnt * NumChroma + ChCnt];
+          ArgMax := ChCnt;
+        end;
+      for ChCnt := 0 to NumChromaM1 do
+        RawChroma[FrameCnt * NumChroma + ChCnt] := 0.0;
+      RawChroma[FrameCnt * NumChroma + ArgMax] := 1.0;
+    end;
+
+    Chroma.ReSize(NumFrames, 1, NumChroma);
+    for FrameCnt := 0 to NumFramesM1 do
+      for ChCnt := 0 to NumChromaM1 do
+        Chroma.FData[FrameCnt * NumChroma + ChCnt] :=
+          RawChroma[FrameCnt * NumChroma + ChCnt];
+  finally
+    Filt.Free;
+    SetLength(Re, 0); SetLength(Im, 0); SetLength(Power, 0);
+    SetLength(RawChroma, 0); SetLength(Window, 0);
   end;
 end;
 

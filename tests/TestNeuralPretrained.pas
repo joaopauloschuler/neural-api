@@ -16,9 +16,12 @@ unit TestNeuralPretrained;
 interface
 
 uses
+  {$IFDEF OpenCL}
+  cl, neuralopencl, // platform/device for the audio-holder conv OpenCL parity test
+  {$ENDIF}
   Classes, SysUtils, Math, fpcunit, testregistry, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
-  neuralgguf, neuralmxfp4, neuralpretrained, neuralhftokenizer, neuralaudio,
+  neuralgguf, neuralmxfp4, neuralnf4, neuralpretrained, neuralhftokenizer, neuralaudio,
   neuraldecode, neuraldiffusion;
 
 type
@@ -27,6 +30,8 @@ type
     function FixturePath(const FileName: string): string;
     procedure RunConvNeXtParity(const Base: string);
     procedure RunResNetParity(const Base: string);
+    procedure RunRegNetParity(const Base: string);
+    procedure RunRepVGGParity(const Base: string);
     // Composes a minimal safetensors byte stream into a temp file and
     // returns its path. HeaderJson is written verbatim (preceded by its
     // 8-byte little-endian length); Payload is the raw data section.
@@ -45,6 +50,11 @@ type
     // "_ref.json". Callers: TestEnCodec{RoundTrip,NonCausalRoundTrip,
     // LegacyWeightNorm}Parity.
     procedure CheckEnCodecParity(const BaseName: string);
+    // Shared torch nn.LSTM/nn.GRU import-parity body (PRIVATE: parameterized by
+    // fixture tag, must not be auto-run). Builds the matching builder net,
+    // loads the fixture weights through the generic importer and asserts the
+    // full output sequence matches the torch float64 oracle to < 1e-4.
+    procedure RunTorchRNNParity(const Tag: string; UseGRU: boolean);
     // Shared parity loop: feeds every "sequences" row of the reference
     // logits fixture (JSON {"sequences": [[ids..]..], "logits": [[[..]]]})
     // through NN and asserts max |logit diff| < 1e-4 (hard ceiling 1e-3 -
@@ -101,6 +111,10 @@ type
     procedure AssertInt8DriftSeq2Seq(const FamilyName: string;
       EncF, DecF, EncQ, DecQ: TNNet; EncSeqLen, DecSeqLen, VocabRange,
       MinQuantLayers: integer; MaxRelDrift: double);
+    // Shared RRDBNet parity body: compares NN.Compute(io.input) against the
+    // io.json oracle image (< 1e-4). PRIVATE (parameterized; not auto-run).
+    procedure RunRRDBNetParity(NN: TNNet; const Config: TRRDBNetConfig;
+      const IoFixture: string);
   published
     procedure TestTokenLayerNormForwardAndSaveLoad;
     procedure TestLearnedPositionalEmbeddingForwardAndSaveLoad;
@@ -165,6 +179,7 @@ type
     procedure TestGGUFReaderMetadataAndTensors;
     procedure TestGGUFTensorDecodeParity;
     procedure TestGGUFKQuantDecodeParity;
+    procedure TestGGUFQ3KAndLegacyDecodeParity;
     procedure TestGGUFLlamaLogitParity;
     procedure TestGGUFLlamaQ8AndF16ImportDrift;
     procedure TestGGUFWriterRoundTrip;
@@ -177,6 +192,10 @@ type
     procedure TestGGUFWriterQ8FromInt8;
     procedure TestMXFP4DequantHandBlock;
     procedure TestMXFP4DequantNaNScale;
+    procedure TestNF4DequantHandBlock;
+    procedure TestNF4DequantFixtureParity;
+    procedure TestNF4ImporterLinearParity;
+    procedure TestNF4ImporterRejectsDoubleQuant;
     procedure TestShardedReaderMatchesSingleFile;
     procedure TestShardedLlamaLogitsBitIdentical;
     procedure TestDistilGPT2LogitParity;
@@ -220,6 +239,7 @@ type
     procedure TestGPTNeoXSequentialLogitParity;
     procedure TestOPTConfigFromJSONFile;
     procedure TestOPTNextTokenLogitsParity;
+    procedure TestOPT350ProjPostLNLogitParity;
     procedure TestFalconConfigFromJSONFile;
     procedure TestFalconMultiQueryLogitParity;
     procedure TestFalconNewArchLogitParity;
@@ -255,6 +275,9 @@ type
     procedure TestRobertaConfigFromJSONFile;
     procedure TestRobertaHiddenStateParity;
     procedure TestRobertaPoolerParity;
+    procedure TestXLMRobertaConfigFromJSONFile;
+    procedure TestXLMRobertaHiddenStateParity;
+    procedure TestXLMRobertaPoolerParity;
     procedure TestT5ConfigFromJSONFile;
     procedure TestFlanT5Parity;
     procedure TestT5V10Parity;
@@ -270,17 +293,32 @@ type
     procedure TestM2M100Parity;
     procedure TestSeamlessM4Tv2ConfigFromJSONFile;
     procedure TestSeamlessM4Tv2S2TTParity;
+    procedure TestSeamlessM4Tv2RelKeyConfigFromJSONFile;
+    procedure TestSeamlessM4Tv2RelKeyS2TTParity;
     procedure TestWhisperConfigFromJSONFile;
     procedure TestWhisperParity;
     procedure TestWhisperWordTimestamps;
     procedure TestWav2Vec2ConfigFromJSONFile;
     procedure TestWav2Vec2CTCParity;
     procedure TestHubertCTCParity;
+    procedure TestMERTConfigFromJSONFile;
+    procedure TestMERTParity;
     // Pyannote speaker-diarization parity: raw waveform -> SincNet band-pass
     // front-end -> conv/pool/LayerNorm -> BiLSTM -> per-frame powerset logits,
     // vs a numpy float64 oracle on the committed pico fixture. Also exercises
     // the powerset->per-speaker decode.
     procedure TestPyannoteParity;
+    // F5-TTS flow-matching DiT velocity-field parity: noised mel + reference
+    // cond mel + character ids + scalar time -> ConvNeXt-V2 text embed,
+    // in-context concat input embedding, RoPE adaLN-zero DiT trunk, adaLN
+    // norm-out -> mel-width velocity field, vs a numpy float64 oracle on the
+    // committed pico fixture.
+    procedure TestF5TTSParity;
+    // ECAPA-TDNN speaker-embedding parity: log-mel frames -> conv_pre ->
+    // 3x SE-Res2Block -> MFA -> attentive statistics pooling -> 192-d-style
+    // embedding, vs a numpy float64 oracle on a re-randomized pico fixture;
+    // also checks the cosine speaker-verification score (same vs different clip).
+    procedure TestEcapaParity;
     // Moonshine streaming-ASR ENCODER parity: raw waveform -> conv stem ->
     // partial-RoPE bidirectional transformer -> encoder hidden states, vs an
     // HF float64 oracle (a SECOND speech-to-text architecture, distinct from
@@ -291,6 +329,19 @@ type
     // the next-token logit row against the HF float64
     // MoonshineForConditionalGeneration oracle (< 1e-4).
     procedure TestMoonshineDecoderLogitParity;
+    // Moonshine GROUPED-QUERY-ATTENTION parity: a pico fixture with
+    // num_key_value_heads (2) < num_attention_heads (4) on BOTH towers, so
+    // the importer's K/V-head replication slice path (KVGroup := HeadCnt div
+    // GroupSize, GroupSize=2) is exercised against an HF float64 oracle in
+    // the encoder, decoder self-attn AND cross-attn (the base pico leaves
+    // GroupSize=1, never verifying the broadcast).
+    procedure TestMoonshineGQAEncoderParity;
+    procedure TestMoonshineGQADecoderLogitParity;
+    // Moonshine KV-CACHE incremental decode (DecodeMoonshineGreedyCached): the
+    // O(1)-per-step streamed greedy decode must be BIT-IDENTICAL (token-for-
+    // token) to the O(L)-per-step re-encode-the-whole-prefix manual loop the
+    // example used to drive. Same pico fixture, same start/eos.
+    procedure TestMoonshineKVCacheDecodeParity;
     // EnCodec: round-trips three pinned waveforms through the imported codec
     // (waveform -> RVQ codes -> waveform) and asserts the codes match the HF
     // oracle EXACTLY and the reconstructed waveform matches < 1e-4.
@@ -303,12 +354,29 @@ type
     // ships) instead of the new .parametrizations.weight.original0/1; pins the
     // importer's legacy-naming branch (same w = g*v/||v||, identical oracle).
     procedure TestEnCodecLegacyWeightNormParity;
+    // OpenCL parity: decodes the same EnCodec fixture with the channel-major
+    // conv1d/ConvTranspose1d OpenCL offload ARMED, and asserts the waveform
+    // matches the CPU (AVX/scalar DotProduct) decode within 1e-4. SKIPs cleanly
+    // when built without -dOpenCL or when no OpenCL device is present. Gates the
+    // opt-in EnableConvOpenCL path wired into RunEnCodecConv / RunHiFiGANConv.
+    procedure TestEnCodecOpenCLConvParity;
+    // OpenCL parity: synthesizes the HiFi-GAN fixture with the conv1d/
+    // ConvTranspose1d OpenCL offload ARMED (the upsamplers are ConvTranspose1d),
+    // and asserts the waveform matches the CPU decode within 1e-4. SKIPs cleanly
+    // without -dOpenCL or without an OpenCL device. Gates the transpose offload
+    // wired into RunHiFiGANConv.
+    procedure TestHiFiGANOpenCLConvParity;
     // Mimi: round-trips three pinned waveforms through the imported Mimi codec
     // (waveform -> conv encoder -> RoPE transformer -> downsample -> split
     // semantic/acoustic RVQ -> codes -> ... -> waveform) and asserts the codes
     // match the HF MimiModel float64 oracle EXACTLY and the reconstructed
     // waveform matches < 1e-4.
     procedure TestMimiParity;
+    // DAC (Descript Audio Codec): encodes three pinned synthesized clips to RVQ
+    // codes and decodes them back, asserting the factorized L2-normalized RVQ
+    // code stack matches the HF DacModel float64 oracle EXACTLY and the
+    // reconstructed waveform matches < 1e-4.
+    procedure TestDACRoundTripParity;
     // HiFi-GAN: synthesizes three pinned log-mel clips through the imported
     // vocoder (mel -> waveform) and asserts the waveform matches the HF
     // SpeechT5HifiGan float64 oracle < 1e-4.
@@ -330,6 +398,12 @@ type
     // committed char-vocab fixture; the expected ids come from the real HF
     // VitsTokenizer (cross-checked offline).
     procedure TestVitsTokenizerParity;
+    // Kokoro / StyleTTS2: per-stage parity (text-encoder hidden, style-
+    // conditioned log-durations + integer durations, length-regulator
+    // expansion, F0/energy prosody curves, iSTFTNet magnitude+phase, end-to-
+    // end waveform) vs a self-contained numpy float64 oracle on a pico fixture,
+    // with the reference style vector fed explicitly < 1e-4.
+    procedure TestKokoroSynthesisParity;
     // Demucs: separates two pinned mixed waveforms through the imported
     // time-domain U-Net (strided conv + GLU + bi-LSTM + transpose conv with
     // U-Net skips) and asserts the four stems match the self-contained numpy
@@ -340,7 +414,28 @@ type
     // 1e-4, and the pure delay-pattern (de)interleave helpers round-trip and
     // match HF build_delay_pattern_mask exactly.
     procedure TestMusicGenDecoderParity;
+    // Parler-TTS importer (model_type "parler_tts"): the description-conditioned
+    // codec-LM DECODER forward logits vs a self-contained float64 oracle on a
+    // committed pico fixture. Pins the genuinely new Parler wiring - the
+    // transcript prompt PREFIX (embed_prompts) prepended on the sequence axis
+    // before the codec frames, with the K LM heads read at the codec positions
+    // while the blocks cross-attend the description states - to < 1e-4. Also
+    // checks the KV-cache greedy decode is bit-identical to the full re-encode.
+    procedure TestParlerTTSParity;
+    // Bark TTS importer (model_type "bark"): the THREE GPT-style sub-models'
+    // forward logits (semantic, coarse, fine) vs a float64 HF oracle on a
+    // committed re-randomized pico fixture. The fine model's NON-causal forward
+    // (codebook-conditioned merged input embedding sum over codebooks 0..idx,
+    // bidirectional over time) is pinned per (sequence, codebook_idx) case.
+    procedure TestBarkParity;
     procedure TestMusicGenDelayPattern;
+    // STEREO (audio_channels=2) MusicGen: the decoder doubles to 2*K
+    // interleaved-codebook rows (row 2c=left codebook c, 2c+1=right) sharing
+    // delay offset c. Asserts the imported stereo DECODER forward matches the
+    // HF float64 oracle < 1e-4, and the stereo (Channels=2) delay-pattern
+    // (de)interleave round-trips and matches HF build_delay_pattern_mask.
+    procedure TestMusicGenStereoDecoderParity;
+    procedure TestMusicGenStereoDelayPattern;
     // End-to-end TEXT-CONDITIONED wiring (examples/MusicGenText): a fixed
     // prompt id sequence runs through the REAL T5 text encoder, conditions the
     // MusicGen decoder's delay-pattern generation, and the resulting code stack
@@ -364,6 +459,12 @@ type
     // path is BIT-IDENTICAL to the un-cached GenerateCFG re-encode loop, for
     // both a distinct and a zeroed (null) unconditional condition.
     procedure TestMusicGenGuidedCache;
+    // MusicGen MELODY (model_type "musicgen_melody"): asserts (1) the chroma
+    // front-end (neuralaudio.ComputeMusicgenMelodyChroma) matches the HF
+    // MusicgenMelodyFeatureExtractor oracle exactly, and (2) ONE decoder step
+    // of the melody decoder (chroma+text conditioning PREPENDED to the causal
+    // self-attention sequence) matches the HF logits < 1e-4.
+    procedure TestMusicGenMelodyParity;
     procedure TestBlip2QFormerConfigFromJSONFile;
     procedure TestBlip2QFormerParity;
     procedure TestBlip2FullBridgeParity;
@@ -373,6 +474,7 @@ type
     procedure TestClapFreqRatio4Parity;
     procedure TestClipScore;
     procedure TestClipVisionFeatures;
+    procedure TestOpenClipVisionTowerParity;
     procedure TestClipImagePreprocess;
     procedure TestSigLIPConfigFromJSONFile;
     procedure TestSigLIPParity;
@@ -392,6 +494,12 @@ type
     procedure TestResNet18ImageClassificationParity;
     procedure TestResNet34ImageClassificationParity;
     procedure TestResNet50ImageClassificationParity;
+    procedure TestResNetTorchBinPthParity;
+    procedure TestResNetPyTorchStemMaxPool;
+    procedure TestRepVGGConfigFromJSONFile;
+    procedure TestRepVGGParity;
+    procedure TestMaskRCNNConfigFromJSONFile;
+    procedure TestMaskRCNNParity;
     procedure TestConvNeXtConfigFromJSONFile;
     procedure TestConvNeXtV1ImageClassificationParity;
     procedure TestConvNeXtV2ImageClassificationParity;
@@ -399,6 +507,7 @@ type
     procedure TestSegformerSemanticSegmentationParity;
     procedure TestDPTConfigFromJSONFile;
     procedure TestDPTDepthEstimationParity;
+    procedure TestDepthAnythingV2Parity;
     procedure TestVideoMAEConfigFromJSONFile;
     procedure TestVideoMAEClassificationParity;
     procedure TestViTPoseConfigFromJSONFile;
@@ -407,6 +516,7 @@ type
     procedure TestDetrConfigFromJSONFile;
     procedure TestDetrObjectDetectionParity;
     procedure TestDetrDetectionDecode;
+    procedure TestMask2FormerParity;
     procedure TestYoloConfigFromJSONFile;
     procedure TestYoloObjectDetectionParity;
     procedure TestYoloDetectionDecode;
@@ -418,21 +528,47 @@ type
     procedure TestBlipCaptionGreedy;
     procedure TestTrOCRConfigFromJSONFile;
     procedure TestTrOCRParity;
+    procedure TestFlorence2LocationTokens;
+    procedure TestFlorence2Parity;
     procedure TestInceptionV3ConfigFromJSONFile;
     procedure TestInceptionV3ImageClassificationParity;
+    procedure TestInceptionV3FullParity;
     procedure TestMobileNetV3ConfigFromJSONFile;
     procedure TestMobileNetV3ImageClassificationParity;
     procedure TestEfficientNetConfigFromJSONFile;
     procedure TestEfficientNetImageClassificationParity;
+    procedure TestRegNetConfigFromJSONFile;
+    procedure TestRegNetXImageClassificationParity;
+    procedure TestRegNetYImageClassificationParity;
+    procedure TestMobileViTConfigFromJSONFile;
+    procedure TestMobileViTImageClassificationParity;
     procedure TestSwinConfigFromJSONFile;
     procedure TestSwinImageClassificationParity;
+    procedure TestMaxViTLogitParity;
+    procedure TestSwinV2ConfigFromJSONFile;
+    procedure TestSwinV2ImageClassificationParity;
     procedure TestVGGConfigParity;
     procedure TestVGGLogitParity;
     procedure TestVGGFeatureTaps;
     procedure TestLPIPSDistanceParity;
+    procedure TestPerceptualLossGradientCheck;
+    procedure TestPerceptualLossSelfZero;
     procedure TestVaeDecoderConfigFromJSONFile;
     procedure TestVaeDecoderParity;
+    procedure TestTiledVaeDecodeParity;
     procedure TestVaeEncoderParity;
+    procedure TestSDUNetConfigFromJSONFile;
+    procedure TestSDUNetParity;
+    procedure TestSDUNetLinearProjParity;
+    procedure TestSDUNetSDXLParity;
+    procedure TestSDUNetPerBlockHeadsParity;
+    procedure TestDiffusionInpaintSmoke;
+    procedure TestControlNetConfigFromJSONFile;
+    procedure TestControlNetParity;
+    procedure TestControlNetCombinedParity;
+    procedure TestT2IAdapterParity;
+    procedure TestIPAdapterConfigFromJSONFile;
+    procedure TestIPAdapterParity;
     procedure TestVaeRoundTrip;
     procedure TestVqModelEncodeParity;
     procedure TestVqModelDecodeParity;
@@ -442,12 +578,17 @@ type
     procedure TestDiTSchedulerSmoke;
     procedure TestVARConfigFromJSONFile;
     procedure TestVARParity;
+    procedure TestVARTextCondParity;
+    procedure TestVARGenerateSmoke;
     procedure TestPixArtConfigFromJSONFile;
     procedure TestPixArtParity;
     procedure TestMMDiTConfigFromJSONFile;
     procedure TestMMDiTJointBlockParity;
+    procedure TestCogVideoXParity;
     procedure TestLatentTextToImageSmoke;
     procedure TestRRDBNetParity;
+    procedure TestRRDBNetParityPth;
+    procedure TestRRDBNetParityScale2;
     procedure TestNAFNetConfigFromJSONFile;
     procedure TestNAFNetParity;
     procedure TestRIFEConfigFromJSONFile;
@@ -456,12 +597,16 @@ type
     procedure TestSwinIRParity;
     procedure TestCLIPSegConfigFromJSONFile;
     procedure TestCLIPSegParity;
+    procedure TestCLIPSegComplexUpsampleParity;
     procedure TestStyleGAN2ConfigFromJSONFile;
     procedure TestStyleGAN2GeneratorParity;
     procedure TestDINOv2ConfigFromJSONFile;
     procedure TestDINOv2Parity;
+    procedure TestDINOv3ConfigFromJSONFile;
+    procedure TestDINOv3Parity;
     procedure TestBeitConfigFromJSONFile;
     procedure TestBeitParity;
+    procedure TestBeitImageClassificationParity;
     procedure TestSAMEncoderParity;
     procedure TestSAMMaskDecoderParity;
     procedure TestSAMMaskDecoderV2Parity;
@@ -498,9 +643,30 @@ type
     procedure TestPEFTLoRAAdapterLoadAndMerge;
     procedure TestRaftConfigFromJSONFile;
     procedure TestRaftOpticalFlowParity;
+    procedure TestGenerationDefaultsFromJSONFile;
+    procedure TestTorchLSTMImportParity;
+    procedure TestTorchGRUImportParity;
+    procedure TestTorchRNNImportRejectsProjection;
   end;
 
 implementation
+
+type
+  // Single-pass PixArt denoiser wrapper for the LCM smoke (TNNetLCMScheduler.
+  // LCMSample wants a method-of-object callback). The LCM path uses ONLY the
+  // conditional pass -- no classifier-free guidance double pass.
+  TLCMPixArtDenoiser = class
+  public
+    Net: TNNet;
+    Cfg: TPixArtConfig;
+    Prompt: TNNetVolume;
+    procedure Denoise(Xt, Output: TNNetVolume; Tt: integer);
+  end;
+
+procedure TLCMPixArtDenoiser.Denoise(Xt, Output: TNNetVolume; Tt: integer);
+begin
+  PixArtDenoise(Net, Cfg, Xt, Tt, Prompt, Output);
+end;
 
 // Writes a small JSON sidecar describing the GGUF the writer round-trip
 // test emitted, for tools/verify_gguf_writer.py to cross-check against the
@@ -4163,7 +4329,9 @@ begin
     NN.Free;
   end;
   // ...and a config WITH rope_scaling must reach every rotary layer the
-  // builder creates (2 blocks x (1 KV head + 2 Q heads) = 6 layers).
+  // builder creates. With the hoisted-RoPE optimization the builder emits ONE
+  // full-width head-tiled rotary per Q and per K projection instead of one per
+  // head: 2 blocks x (1 Q + 1 K) = 4 layers.
   Config := ReadLlamaConfigFromJSONFile(FixturePath('tiny_llama_config.json'));
   Config.RopeScaling.Mode := rsmYaRN;
   Config.RopeScaling.Factor := 4.0;
@@ -4187,7 +4355,7 @@ begin
         AssertEquals('rotary layer alpha', 1.0, Rope.GetYarnAlpha(), 1e-6);
         AssertEquals('rotary layer beta', 32.0, Rope.GetYarnBeta(), 1e-6);
       end;
-    AssertEquals('rotary layer count', 6, RopeCnt);
+    AssertEquals('rotary layer count', 4, RopeCnt);
   finally
     NN.Free;
   end;
@@ -4605,6 +4773,288 @@ begin
   finally
     RefRoot.Free;
     RefJson.Free;
+    V.Free;
+  end;
+end;
+
+// GGUF Q3_K + legacy Q4_0/Q4_1/Q5_0/Q5_1 dequant-at-load value test. The
+// reader's quant paths are gated against tiny_kquant.gguf for the k-quants;
+// this test covers the NEWLY added types with self-contained byte buffers
+// built here in Pascal (no committed binary fixture). For each type it
+// hand-rolls one block/super-block in the EXACT ggml byte layout from
+// chosen quant codes + scales, writes a minimal GGUF file, reads it back
+// and asserts the dequantized FP32 values equal the closed-form expected
+// value (computed here directly from the chosen codes, independent of the
+// reader's unpacking) to f32 rounding.
+procedure TTestNeuralPretrained.TestGGUFQ3KAndLegacyDecodeParity;
+var
+  Path: string;
+
+  // Writes a single-tensor GGUF v3 file (alignment 32, no metadata) with the
+  // given raw payload as ggml dtype TypeId, contiguous dim = NumElems (so the
+  // served row-major shape is [1, NumElems]).
+  procedure WriteOneTensorGGUF(TypeId: integer; NumElems: integer;
+    const Payload: array of byte);
+  var
+    FS: TFileStream;
+    U32: cardinal;
+    U64: QWord;
+    NameLen: QWord;
+    NameB: TBytes;
+    HeaderEnd, DataStart, PadLen: Int64;
+    Zero: byte;
+    i: integer;
+    Name: ansistring;
+  begin
+    FS := TFileStream.Create(Path, fmCreate);
+    try
+      U32 := $46554747; FS.WriteBuffer(U32, 4);     // 'GGUF'
+      U32 := 3; FS.WriteBuffer(U32, 4);             // version 3
+      U64 := 1; FS.WriteBuffer(U64, 8);             // tensor count
+      U64 := 0; FS.WriteBuffer(U64, 8);             // kv count
+      // tensor info: name, n_dims=1, dim[0]=NumElems, type, offset=0
+      Name := 'w';
+      NameLen := Length(Name);
+      FS.WriteBuffer(NameLen, 8);
+      SetLength(NameB, Length(Name));
+      for i := 1 to Length(Name) do NameB[i - 1] := byte(Name[i]);
+      FS.WriteBuffer(NameB[0], Length(NameB));
+      U32 := 1; FS.WriteBuffer(U32, 4);             // n_dims
+      U64 := QWord(NumElems); FS.WriteBuffer(U64, 8);
+      U32 := cardinal(TypeId); FS.WriteBuffer(U32, 4);
+      U64 := 0; FS.WriteBuffer(U64, 8);             // data offset
+      // align to 32 before the data section
+      HeaderEnd := FS.Position;
+      DataStart := ((HeaderEnd + 31) div 32) * 32;
+      PadLen := DataStart - HeaderEnd;
+      Zero := 0;
+      while PadLen > 0 do begin FS.WriteBuffer(Zero, 1); Dec(PadLen); end;
+      if Length(Payload) > 0 then
+        FS.WriteBuffer(Payload[0], Length(Payload));
+    finally
+      FS.Free;
+    end;
+  end;
+
+  // Stores V as f16 little-endian AND returns the f16-rounded value, so the
+  // closed-form expected uses the SAME d/m the reader decodes (f16 isn't
+  // exact, e.g. 0.3 -> 0.30005).
+  function PutF16(var Buf: array of byte; Ofs: integer; V: single): single;
+  var
+    W: word;
+  begin
+    W := EncodeF16(V);
+    Buf[Ofs] := byte(W and $FF);
+    Buf[Ofs + 1] := byte((W shr 8) and $FF);
+    Result := DecodeF16(W);
+  end;
+
+var
+  GGUF: TNNetGGUFReader;
+  V: TNNetVolume;
+  Q40, Q41, Q50, Q51: array[0..23] of byte;  // max legacy block = 24 bytes
+  Q3K: array[0..GGUF_Q3_K_BLOCK_BYTES - 1] of byte;
+  e, sb, j: integer;
+  d, m: single;
+  code: integer;
+  expv: single;
+  scales: array[0..15] of integer;
+  qcode: array[0..255] of integer;  // 2-bit low code per element
+  hbit: array[0..255] of integer;   // 3rd-bit-plane bit per element
+  h0, p, s: integer;
+  by: integer;
+  lo4, hi2: integer;
+begin
+  V := TNNetVolume.Create;
+  Path := GetTempDir(false) + 'cai_gguf_legacy_' + IntToStr(Random(1000000)) +
+    '.gguf';
+  try
+    // ---- Q4_0 (type 2): f16 d + 16 nibbles; x = d*(nibble-8). One block. ----
+    FillChar(Q40, SizeOf(Q40), 0);
+    d := 0.5;
+    d := PutF16(Q40, 0, d);
+    // element e gets nibble code (e mod 16); low nibble = e<16, high = e>=16.
+    for e := 0 to 31 do
+    begin
+      code := e mod 16;
+      if e < 16 then
+        Q40[2 + e] := Q40[2 + e] or byte(code)
+      else
+        Q40[2 + (e - 16)] := Q40[2 + (e - 16)] or byte(code shl 4);
+    end;
+    WriteOneTensorGGUF(GGML_TYPE_Q4_0, 32, Q40);
+    GGUF := TNNetGGUFReader.Create(Path);
+    try
+      AssertEquals('Q4_0 dtype', 'Q4_0', GGUF.GetDType('w'));
+      GGUF.LoadTensorFlat('w', V);
+      AssertEquals('Q4_0 count', 32, V.Size);
+      for e := 0 to 31 do
+      begin
+        expv := d * ((e mod 16) - 8);
+        AssertTrue('Q4_0 elem ' + IntToStr(e) + ' = ' + FloatToStr(V.FData[e]) +
+          ' exp ' + FloatToStr(expv), Abs(V.FData[e] - expv) < 1e-4);
+      end;
+    finally
+      GGUF.Free;
+    end;
+
+    // ---- Q4_1 (type 3): f16 d, f16 m + nibbles; x = d*nibble + m. ----
+    FillChar(Q41, SizeOf(Q41), 0);
+    d := 0.25; m := -1.5;
+    d := PutF16(Q41, 0, d);
+    m := PutF16(Q41, 2, m);
+    for e := 0 to 31 do
+    begin
+      code := e mod 16;
+      if e < 16 then
+        Q41[4 + e] := Q41[4 + e] or byte(code)
+      else
+        Q41[4 + (e - 16)] := Q41[4 + (e - 16)] or byte(code shl 4);
+    end;
+    WriteOneTensorGGUF(GGML_TYPE_Q4_1, 32, Q41);
+    GGUF := TNNetGGUFReader.Create(Path);
+    try
+      AssertEquals('Q4_1 dtype', 'Q4_1', GGUF.GetDType('w'));
+      GGUF.LoadTensorFlat('w', V);
+      for e := 0 to 31 do
+      begin
+        expv := d * (e mod 16) + m;
+        AssertTrue('Q4_1 elem ' + IntToStr(e) + ' = ' + FloatToStr(V.FData[e]) +
+          ' exp ' + FloatToStr(expv), Abs(V.FData[e] - expv) < 1e-4);
+      end;
+    finally
+      GGUF.Free;
+    end;
+
+    // ---- Q5_0 (type 6): f16 d, 4-byte qh + nibbles; ----
+    //   x = d*((nibble | (qh_bit<<4)) - 16). 5-bit code = e (0..31), low 4
+    //   bits in the nibble, bit 5 in qh bit e.
+    FillChar(Q50, SizeOf(Q50), 0);
+    d := 0.3;
+    d := PutF16(Q50, 0, d);
+    for e := 0 to 31 do
+    begin
+      code := e;                       // 5-bit code 0..31
+      lo4 := code and $0F;
+      if (code shr 4) and $01 = 1 then
+        // set qh bit e (4-byte LE plane starting at offset 2)
+        Q50[2 + (e div 8)] := Q50[2 + (e div 8)] or byte(1 shl (e mod 8));
+      if e < 16 then
+        Q50[6 + e] := Q50[6 + e] or byte(lo4)
+      else
+        Q50[6 + (e - 16)] := Q50[6 + (e - 16)] or byte(lo4 shl 4);
+    end;
+    WriteOneTensorGGUF(GGML_TYPE_Q5_0, 32, Q50);
+    GGUF := TNNetGGUFReader.Create(Path);
+    try
+      AssertEquals('Q5_0 dtype', 'Q5_0', GGUF.GetDType('w'));
+      GGUF.LoadTensorFlat('w', V);
+      for e := 0 to 31 do
+      begin
+        expv := d * (e - 16);
+        AssertTrue('Q5_0 elem ' + IntToStr(e) + ' = ' + FloatToStr(V.FData[e]) +
+          ' exp ' + FloatToStr(expv), Abs(V.FData[e] - expv) < 1e-4);
+      end;
+    finally
+      GGUF.Free;
+    end;
+
+    // ---- Q5_1 (type 7): f16 d, f16 m, 4-byte qh + nibbles; ----
+    //   x = d*(nibble | (qh_bit<<4)) + m.
+    FillChar(Q51, SizeOf(Q51), 0);
+    d := 0.2; m := 2.0;
+    d := PutF16(Q51, 0, d);
+    m := PutF16(Q51, 2, m);
+    for e := 0 to 31 do
+    begin
+      code := e;                       // 5-bit code 0..31
+      lo4 := code and $0F;
+      if (code shr 4) and $01 = 1 then
+        Q51[4 + (e div 8)] := Q51[4 + (e div 8)] or byte(1 shl (e mod 8));
+      if e < 16 then
+        Q51[8 + e] := Q51[8 + e] or byte(lo4)
+      else
+        Q51[8 + (e - 16)] := Q51[8 + (e - 16)] or byte(lo4 shl 4);
+    end;
+    WriteOneTensorGGUF(GGML_TYPE_Q5_1, 32, Q51);
+    GGUF := TNNetGGUFReader.Create(Path);
+    try
+      AssertEquals('Q5_1 dtype', 'Q5_1', GGUF.GetDType('w'));
+      GGUF.LoadTensorFlat('w', V);
+      for e := 0 to 31 do
+      begin
+        expv := d * e + m;
+        AssertTrue('Q5_1 elem ' + IntToStr(e) + ' = ' + FloatToStr(V.FData[e]) +
+          ' exp ' + FloatToStr(expv), Abs(V.FData[e] - expv) < 1e-4);
+      end;
+    finally
+      GGUF.Free;
+    end;
+
+    // ---- Q3_K (type 11): one super-block of 256. ----
+    //   Layout: 32 bytes hmask, 64 bytes qs (2-bit), 12 bytes 6-bit packed
+    //   scales, f16 d. 16 sub-blocks of 16. dl[sb]=d*(scale[sb]-32);
+    //   q = qcode - ((1 xor hbit)<<2); x = dl*q.
+    //   Chosen codes: scale[sb] (the value BEFORE -32 offset) = sb+24 so the
+    //   signed scale spans -8..+7; qcode[e] = (e mod 4); hbit alternates.
+    FillChar(Q3K, SizeOf(Q3K), 0);
+    d := 0.1;
+    d := PutF16(Q3K, 108, d);
+    for sb := 0 to 15 do scales[sb] := sb + 24;   // the 6-bit packed value
+    for e := 0 to 255 do
+    begin
+      qcode[e] := e mod 4;
+      hbit[e] := (e mod 3) and $01;               // some 0s and 1s
+    end;
+    // pack qs: byte (h0*32 + p) holds the 2-bit field at shift 2*s.
+    for e := 0 to 255 do
+    begin
+      h0 := e div 128;
+      p := e mod 32;
+      s := (e mod 128) div 32;
+      by := 32 + (h0 * 32 + p);                    // qs starts at offset 32
+      Q3K[by] := Q3K[by] or byte(qcode[e] shl (2 * s));
+    end;
+    // pack hmask: bit (e div 32) of byte (e mod 32), hmask starts at offset 0.
+    for e := 0 to 255 do
+      if hbit[e] = 1 then
+        Q3K[e mod 32] := Q3K[e mod 32] or byte(1 shl (e div 32));
+    // pack scales (6-bit each) into 12 bytes at offset 96: low nibble of
+    // byte (j mod 8) carries scale low4 for j<8 / high nibble for j>=8; high
+    // 2 bits in byte 8+(j mod 4) at shift 2*(j div 4).
+    for j := 0 to 15 do
+    begin
+      lo4 := scales[j] and $0F;
+      hi2 := (scales[j] shr 4) and $03;
+      if j < 8 then
+        Q3K[96 + j] := Q3K[96 + j] or byte(lo4)
+      else
+        Q3K[96 + (j - 8)] := Q3K[96 + (j - 8)] or byte(lo4 shl 4);
+      Q3K[96 + 8 + (j mod 4)] :=
+        Q3K[96 + 8 + (j mod 4)] or byte(hi2 shl (2 * (j div 4)));
+    end;
+    WriteOneTensorGGUF(GGML_TYPE_Q3_K, 256, Q3K);
+    GGUF := TNNetGGUFReader.Create(Path);
+    try
+      AssertEquals('Q3_K dtype', 'Q3_K', GGUF.GetDType('w'));
+      AssertTrue('Q3_K ggml type',
+        GGUF.TensorGGMLType('w') = GGML_TYPE_Q3_K);
+      GGUF.LoadTensorFlat('w', V);
+      AssertEquals('Q3_K count', 256, V.Size);
+      for e := 0 to 255 do
+      begin
+        sb := e div 16;
+        // closed form, independent of the reader's unpacking
+        code := qcode[e] - ((1 xor hbit[e]) shl 2);
+        expv := d * (scales[sb] - 32) * code;
+        AssertTrue('Q3_K elem ' + IntToStr(e) + ' = ' + FloatToStr(V.FData[e]) +
+          ' exp ' + FloatToStr(expv), Abs(V.FData[e] - expv) < 1e-4);
+      end;
+    finally
+      GGUF.Free;
+    end;
+  finally
+    if FileExists(Path) then DeleteFile(Path);
     V.Free;
   end;
 end;
@@ -8153,6 +8603,48 @@ begin
   end;
 end;
 
+// Verifies the OPT import on the opt-350m-SHAPED pico fixture:
+// tests/fixtures/tiny_opt350.* is a randomly-initialized HF OPTForCausalLM
+// with word_embed_proj_dim (12) != hidden_size (16) and
+// do_layer_norm_before=False - the opt-350m architecture at pico dims. This
+// single fixture exercises the two importer paths the 125m-shaped tiny_opt
+// fixture leaves untested: (a) the bias-free project_in (embed -> hidden) and
+// project_out (hidden -> embed) projections, and (b) the POST-LN block wiring
+// (x := N(x + sublayer(x))). With do_layer_norm_before=False the decoder-level
+// final_layer_norm is absent (HasFinalLayerNorm=false), also distinct from the
+// 125m fixture. The generator boosts q/k and both projections so the new paths
+// genuinely matter and asserts project_in and post-LN-vs-pre-LN both move the
+// logits. Whole-sequence logits must match the float64 oracle to < 1e-4.
+procedure TTestNeuralPretrained.TestOPT350ProjPostLNLogitParity;
+var
+  NN: TNNet;
+  Config: TOPTConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildOPTFromSafeTensorsEx(
+    FixturePath('tiny_opt350.safetensors'),
+    Config, {SeqLen=}0, {pTrainable=}true,
+    FixturePath('tiny_opt350_config.json'));
+  try
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('vocab', 11, Config.VocabSize);
+    AssertEquals('hidden_size', 16, Config.HiddenSize);
+    // word_embed_proj_dim != hidden_size -> project_in/project_out present.
+    AssertEquals('word_embed_proj_dim', 12, Config.WordEmbedProjDim);
+    // opt-350m architecture: POST-LN.
+    AssertFalse('do_layer_norm_before', Config.DoLayerNormBefore);
+    // post-LN -> no decoder-level final_layer_norm.
+    AssertFalse('has final_layer_norm', Config.HasFinalLayerNorm);
+    AssertEquals('prefix', 'model.decoder.', Config.Prefix);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_opt350_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestFalconConfigFromJSONFile;
 var
   Config: TFalconConfig;
@@ -9515,6 +10007,106 @@ begin
     FixturePath('tiny_roberta_config.json'));
   try
     AssertBertParityWithFixture(NN, FixturePath('tiny_roberta_hidden.json'),
+      Config.MaxPositions - 2, Config.HiddenSize, {PoolerRow0Only=}true);
+  finally
+    NN.Free;
+  end;
+end;
+
+// XLM-RoBERTa (model_type "xlm-roberta") is the multilingual RoBERTa: the
+// SAME encoder network, the ONLY difference is the SentencePiece tokenizer
+// (outside the builder). The config reader must map "xlm-roberta" to the
+// bfRoberta family with the +2 position offset and type_vocab_size = 1.
+procedure TTestNeuralPretrained.TestXLMRobertaConfigFromJSONFile;
+var
+  Config: TBertConfig;
+begin
+  Config := ReadBertConfigFromJSONFile(
+    FixturePath('tiny_xlmroberta_config.json'));
+  AssertTrue('family is roberta (xlm-roberta rides bfRoberta)',
+    Config.Family = bfRoberta);
+  AssertEquals('hidden_size', 8, Config.HiddenSize);
+  AssertEquals('intermediate_size', 16, Config.IntermediateSize);
+  AssertEquals('num_hidden_layers', 2, Config.NumLayers);
+  AssertEquals('num_attention_heads', 2, Config.NumHeads);
+  AssertEquals('vocab_size', 11, Config.VocabSize);
+  AssertEquals('max_position_embeddings', 16, Config.MaxPositions);
+  AssertEquals('type_vocab_size degenerates to 1', 1, Config.TypeVocabSize);
+  AssertEquals('position offset = pad_token_id + 1', 2,
+    Config.PositionOffset);
+  AssertEquals('layer_norm_eps', 1e-5, Config.LayerNormEps, 1e-12);
+  AssertFalse('hidden_act gelu = exact erf form', Config.HiddenActTanh);
+end;
+
+// THE two XLM-R deltas this test exercises (if either were wrong the logits
+// would drift far past the 1e-4 gate, the fixture generator asserts it):
+//   - position-id +2 offset: the importer reads checkpoint position rows
+//     2..SeqLen+1 (rows 0/1 are scrubbed to huge values, so reading them
+//     blows the gate by 5 orders of magnitude) and caps the usable context
+//     at max_position_embeddings - 2 = 14;
+//   - NO real segment embedding: type_vocab_size = 1, the token-type branch
+//     is a single constant row.
+// The dedicated BuildXLMRobertaFromSafeTensorsEx entry point must produce
+// the same net as the BERT-family path and match HF XLMRobertaModel's float64
+// last_hidden_state.
+procedure TTestNeuralPretrained.TestXLMRobertaHiddenStateParity;
+var
+  NN: TNNet;
+  Config: TBertConfig;
+  Rejected: boolean;
+begin
+  RandSeed := 424242;
+  NN := BuildXLMRobertaFromSafeTensorsEx(
+    FixturePath('tiny_xlmroberta.safetensors'),
+    Config, {SeqLen=}0, {pTrainable=}true, {pIncludePooler=}false,
+    FixturePath('tiny_xlmroberta_config.json'));
+  try
+    AssertTrue('family', Config.Family = bfRoberta);
+    AssertEquals('position offset', 2, Config.PositionOffset);
+    AssertEquals('prefix (XLMRobertaModel exports unprefixed)', '',
+      Config.Prefix);
+    // SeqLen=0 must default to the USABLE context, not the table size.
+    AssertEquals('input defaults to max_pos - 2',
+      Config.MaxPositions - 2, NN.Layers[0].Output.SizeX);
+    AssertBertParityWithFixture(NN,
+      FixturePath('tiny_xlmroberta_hidden.json'),
+      Config.MaxPositions - 2, Config.HiddenSize, {PoolerRow0Only=}false);
+  finally
+    NN.Free;
+  end;
+  // Requesting more than max_position_embeddings - 2 positions must fail.
+  Rejected := false;
+  NN := nil;
+  try
+    try
+      NN := BuildXLMRobertaFromSafeTensorsEx(
+        FixturePath('tiny_xlmroberta.safetensors'), Config,
+        {SeqLen=}15, false, false,
+        FixturePath('tiny_xlmroberta_config.json'));
+    except
+      on E: EPretrainedImportError do Rejected := true;
+    end;
+  finally
+    NN.Free;
+  end;
+  AssertTrue('SeqLen > max_pos - 2 rejected for xlm-roberta', Rejected);
+end;
+
+// XLMRobertaModel carries a BERT-style pooler: with pIncludePooler=true the
+// output row 0 must equal HF's pooler_output.
+procedure TTestNeuralPretrained.TestXLMRobertaPoolerParity;
+var
+  NN: TNNet;
+  Config: TBertConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildXLMRobertaFromSafeTensorsEx(
+    FixturePath('tiny_xlmroberta.safetensors'),
+    Config, {SeqLen=}0, {pTrainable=}true, {pIncludePooler=}true,
+    FixturePath('tiny_xlmroberta_config.json'));
+  try
+    AssertBertParityWithFixture(NN,
+      FixturePath('tiny_xlmroberta_hidden.json'),
       Config.MaxPositions - 2, Config.HiddenSize, {PoolerRow0Only=}true);
   finally
     NN.Free;
@@ -11856,6 +12448,143 @@ begin
   end;
 end;
 
+// Verifies ReadSeamlessM4Tv2ConfigFromJSONFile ACCEPTS
+// position_embeddings_type="relative_key" and reads the left/right max
+// position-embedding clamps (the v2 conformer distance-embedding bias).
+procedure TTestNeuralPretrained.TestSeamlessM4Tv2RelKeyConfigFromJSONFile;
+var
+  Config: TSeamlessM4Tv2Config;
+begin
+  Config := ReadSeamlessM4Tv2ConfigFromJSONFile(
+    FixturePath('tiny_seamless_m4t_v2_relkey_config.json'));
+  AssertEquals('model_type', 'seamless_m4t_v2', Config.ModelType);
+  AssertEquals('hidden_size', 16, Config.HiddenSize);
+  AssertEquals('position_embeddings_type', 'relative_key',
+    Config.PositionEmbeddingsType);
+  AssertEquals('left_max_position_embeddings', 4,
+    Config.LeftMaxPositionEmbeddings);
+  AssertEquals('right_max_position_embeddings', 2,
+    Config.RightMaxPositionEmbeddings);
+  AssertEquals('adapted length for 6 frames',
+    SeamlessM4Tv2AdaptedLength(Config, 6), 3);
+end;
+
+// SeamlessM4T-v2 S2TT parity with position_embeddings_type="relative_key": the
+// conformer ENCODER self-attention uses TNNetConformerRelPosAttention (the
+// learned distance-embedding score bias added before softmax, clamped to
+// [-left_max, right_max]); the strided ADAPTER self-attn stays vanilla SDPA
+// (HF use_position_embeddings=False). Checked vs a float64 HF
+// SeamlessM4Tv2ForSpeechToText oracle on the committed relkey pico fixture.
+// Encoder-only hidden-state parity AND full encoder-decoder logit parity, both
+// < 1e-4 (NEVER loosen past 1e-3).
+procedure TTestNeuralPretrained.TestSeamlessM4Tv2RelKeyS2TTParity;
+var
+  Enc, Dec: TNNet;
+  Config: TSeamlessM4Tv2Config;
+  RefRoot: TJSONData;
+  FeatArr, RowArr, SeqArr, HiddenArr, LogitsArr: TJSONArray;
+  EncInput, DecInput, Logits: TNNetVolume;
+  RefJson: TStringList;
+  FrameCnt, ChCnt, PosCnt, AdaptedLen: integer;
+  Diff, MaxHiddenDiff, MaxLogitDiff: double;
+  FoundRelPos: boolean;
+  LayerCnt: integer;
+const
+  SpeechFrames = 6;
+  DecLen = 5;
+begin
+  RandSeed := 424242;
+  BuildSeamlessM4TFromSafeTensors(
+    FixturePath('tiny_seamless_m4t_v2_relkey.safetensors'), Enc, Dec, Config,
+    SpeechFrames, DecLen, {pTrainable=}true,
+    FixturePath('tiny_seamless_m4t_v2_relkey_config.json'));
+  RefJson := TStringList.Create;
+  EncInput := TNNetVolume.Create;
+  DecInput := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('encoder built', Enc <> nil);
+    AssertTrue('decoder built', Dec <> nil);
+    AssertEquals('config carries relative_key', 'relative_key',
+      Config.PositionEmbeddingsType);
+    // The encoder must actually contain at least one relpos attention layer
+    // (otherwise the bias would silently be a no-op).
+    FoundRelPos := false;
+    for LayerCnt := 0 to Enc.Layers.Count - 1 do
+      if Enc.Layers[LayerCnt] is TNNetConformerRelPosAttention then
+        FoundRelPos := true;
+    AssertTrue('encoder uses TNNetConformerRelPosAttention', FoundRelPos);
+
+    AdaptedLen := SeamlessM4Tv2AdaptedLength(Config, SpeechFrames);
+
+    RefJson.LoadFromFile(
+      FixturePath('tiny_seamless_m4t_v2_relkey_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    FeatArr := TJSONArray(TJSONObject(RefRoot).Find('input_features'));
+    SeqArr := TJSONArray(TJSONObject(RefRoot).Find('dec_sequences'));
+    HiddenArr := TJSONArray(TJSONObject(RefRoot).Find('enc_hidden'));
+    LogitsArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    AssertTrue('input_features present', FeatArr <> nil);
+    AssertTrue('enc_hidden present', HiddenArr <> nil);
+    AssertTrue('logits present', LogitsArr <> nil);
+    AssertEquals('adapted_len rows', AdaptedLen, HiddenArr.Count);
+
+    EncInput.ReSize(SpeechFrames, 1, Config.FeatureProjInputDim);
+    for FrameCnt := 0 to SpeechFrames - 1 do
+    begin
+      RowArr := TJSONArray(FeatArr.Items[FrameCnt]);
+      for ChCnt := 0 to Config.FeatureProjInputDim - 1 do
+        EncInput.FData[FrameCnt * Config.FeatureProjInputDim + ChCnt] :=
+          RowArr.Items[ChCnt].AsFloat;
+    end;
+    DecInput.ReSize(DecLen, 1, 1);
+    for PosCnt := 0 to DecLen - 1 do
+      DecInput.FData[PosCnt] := SeqArr.Items[PosCnt].AsInteger;
+
+    // Encoder-only parity: adapted hidden states vs the HF float64 oracle.
+    Enc.Compute(EncInput);
+    MaxHiddenDiff := 0;
+    for PosCnt := 0 to AdaptedLen - 1 do
+    begin
+      RowArr := TJSONArray(HiddenArr.Items[PosCnt]);
+      for ChCnt := 0 to Config.HiddenSize - 1 do
+      begin
+        Diff := Abs(Enc.GetLastLayer().Output.FData[
+          PosCnt * Config.HiddenSize + ChCnt] - RowArr.Items[ChCnt].AsFloat);
+        if Diff > MaxHiddenDiff then MaxHiddenDiff := Diff;
+      end;
+    end;
+
+    // Full S2TT parity through RunT5.
+    RunT5(Enc, Dec, EncInput, DecInput, Logits);
+    AssertEquals('logits size', DecLen * Config.VocabSize, Logits.Size);
+    MaxLogitDiff := 0;
+    for PosCnt := 0 to DecLen - 1 do
+    begin
+      RowArr := TJSONArray(LogitsArr.Items[PosCnt]);
+      for ChCnt := 0 to Config.VocabSize - 1 do
+      begin
+        Diff := Abs(Logits.FData[PosCnt * Config.VocabSize + ChCnt] -
+          RowArr.Items[ChCnt].AsFloat);
+        if Diff > MaxLogitDiff then MaxLogitDiff := Diff;
+      end;
+    end;
+    AssertTrue('SeamlessM4T relkey encoder hidden-state parity: max |diff| = ' +
+      FloatToStr(MaxHiddenDiff) + ' must be < 1e-4', MaxHiddenDiff < 1e-4);
+    AssertTrue('SeamlessM4T relkey logit parity: max |diff| = ' +
+      FloatToStr(MaxLogitDiff) + ' must be < 1e-4', MaxLogitDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Logits.Free;
+    DecInput.Free;
+    EncInput.Free;
+    RefJson.Free;
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
 // Verifies ReadWhisperConfigFromJSONFile on the committed Whisper pico
 // config plus the BuildFromPretrained "whisper" rejection (an
 // encoder-decoder cannot be returned by the single-net dispatch; the error
@@ -12064,10 +12793,15 @@ var
   MelArr: TJSONArray;
   RefJson, LogJson: TStringList;
   EncInput, DecInput, Logits, Score: TNNetVolume;
+  ScorePlain, ScoreK1, ScoreK7: TNNetVolume;
   Heads: TWhisperAlignmentHeads;
   PathTok, PathFrame: array of integer;
   SeqCnt, i, j, MelCnt, FrameCnt, PosCnt, PathLen, NTok, NSrc: integer;
-  Diff, MaxScoreDiff: double;
+  Diff, MaxScoreDiff, MaxK1Diff, RowSum: double;
+  Tokenizer: TNeuralHFTokenizer;
+  WTokens: array of integer;
+  WordTs: TWhisperWordTimestamps;
+  PrevEnd: TNeuralFloat;
 const
   DecLen = 6;
 begin
@@ -12203,11 +12937,102 @@ begin
     AssertTrue('Whisper alignment score parity: max |diff| = ' +
       FloatToStr(MaxScoreDiff) + ' must be < 1e-4', MaxScoreDiff < 1e-4);
 
+    // ---- (a) median-filter smoothing regression -------------------------
+    // The decoder is still Computed on the LAST sequence's prefix, so its
+    // cross-attention leaves are live. NTok/NSrc carry over from that
+    // sequence. Kernel 0 and 1 must be BIT-identical to no smoothing;
+    // kernel 7 must still yield a valid per-row distribution and monotonic
+    // word boundaries downstream.
+    ScorePlain := WhisperCollectCrossAttention(Dec, Config, Heads, NTok, 0);
+    ScoreK1 := WhisperCollectCrossAttention(Dec, Config, Heads, NTok, 1);
+    ScoreK7 := WhisperCollectCrossAttention(Dec, Config, Heads, NTok, 7);
+    try
+      MaxK1Diff := 0;
+      for i := 0 to NTok - 1 do
+        for j := 0 to NSrc - 1 do
+        begin
+          Diff := Abs(ScorePlain[j, i, 0] - ScoreK1[j, i, 0]);
+          if Diff > MaxK1Diff then MaxK1Diff := Diff;
+        end;
+      AssertTrue('median kernel 1 identical to no smoothing (max |diff| = ' +
+        FloatToStr(MaxK1Diff) + ')', MaxK1Diff = 0);
+      // kernel 7 stays a per-row probability distribution (softmaxed)
+      for i := 0 to NTok - 1 do
+      begin
+        RowSum := 0;
+        for j := 0 to NSrc - 1 do
+        begin
+          AssertTrue('median-7 row >= 0', ScoreK7[j, i, 0] >= 0);
+          RowSum := RowSum + ScoreK7[j, i, 0];
+        end;
+        AssertTrue('median-7 row sums to 1 (got ' + FloatToStr(RowSum) + ')',
+          Abs(RowSum - 1.0) < 1e-4);
+      end;
+    finally
+      ScoreK7.Free;
+      ScoreK1.Free;
+      ScorePlain.Free;
+    end;
+
+    // ---- (a)+(e) end-to-end word timestamps + confidence ----------------
+    // Drive WhisperWordTimestamps with a byte-level BPE tokenizer fixture
+    // (the GPT-2-style leading-space word rule Whisper uses). The exact
+    // surface text is irrelevant here; we assert STRUCTURE: monotonic
+    // non-decreasing boundaries and a present, sane confidence per word,
+    // for both no-smoothing and the kernel-7 default.
+    Tokenizer := TNeuralHFTokenizer.Create;
+    try
+      Tokenizer.LoadFromFile(
+        FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
+      // The last decode prefix's ids; treat position 0 as the (single)
+      // prologue token, the rest as "text". Map ids into the tokenizer's
+      // valid range so DecodeToken never returns empty.
+      SetLength(WTokens, DecLen);
+      RowArr := TJSONArray(DecSeqs.Items[AlignArr.Count - 1]);
+      for i := 0 to DecLen - 1 do
+        WTokens[i] := RowArr.Items[i].AsInteger mod Tokenizer.GetVocabSize();
+
+      // kernel 0 (v1) and kernel 7 (default) must both produce structurally
+      // valid output.
+      for PathLen := 0 to 1 do
+      begin
+        if PathLen = 0 then
+          WordTs := WhisperWordTimestamps(Dec, Config, Tokenizer,
+            WTokens, {TextStart=}1, Heads, {MedianKernel=}0)
+        else
+          WordTs := WhisperWordTimestamps(Dec, Config, Tokenizer,
+            WTokens, {TextStart=}1, Heads, {MedianKernel=}7);
+        PrevEnd := -1;
+        for i := 0 to High(WordTs) do
+        begin
+          AssertTrue('word start <= end', WordTs[i].StartS <= WordTs[i].EndS);
+          AssertTrue('word boundaries non-decreasing',
+            WordTs[i].StartS >= PrevEnd - 1e-6);
+          PrevEnd := WordTs[i].StartS;
+          // Confidence is the mean path attention -> a probability-ish value
+          // present for every word, in a sane [0,1.0001] range.
+          AssertTrue('confidence present and >= 0', WordTs[i].Confidence >= 0);
+          AssertTrue('confidence <= ~1 (got ' +
+            FloatToStr(WordTs[i].Confidence) + ')',
+            WordTs[i].Confidence <= 1.0001);
+        end;
+      end;
+    finally
+      Tokenizer.Free;
+    end;
+
     // The size-keyed default-head table: the released whisper-tiny shape
     // (4 layers, 6 heads) returns the baked-in openai-whisper subset; the
     // pico shape returns empty (callers fall back to all heads).
     Heads := WhisperDefaultAlignmentHeads(4, 6);
     AssertTrue('whisper-tiny default alignment heads non-empty',
+      Length(Heads) > 0);
+    // medium (24L,16H) and large (32L,20H) now have baked-in head lists too.
+    Heads := WhisperDefaultAlignmentHeads(24, 16);
+    AssertTrue('whisper-medium default alignment heads non-empty',
+      Length(Heads) > 0);
+    Heads := WhisperDefaultAlignmentHeads(32, 20);
+    AssertTrue('whisper-large default alignment heads non-empty',
       Length(Heads) > 0);
     Heads := WhisperDefaultAlignmentHeads(
       Config.DecoderLayers, Config.DecoderHeads);
@@ -12379,6 +13204,168 @@ begin
   AssertWav2Vec2CTCParity({IsHubert=}true);
 end;
 
+procedure TTestNeuralPretrained.TestMERTConfigFromJSONFile;
+var
+  Config: TMERTConfig;
+begin
+  Config := ReadMERTConfigFromJSONFile(FixturePath('tiny_mert_config.json'));
+  AssertEquals('model_type', 'mert_model', Config.ModelType);
+  AssertEquals('hidden', 16, Config.HiddenSize);
+  AssertEquals('layers', 3, Config.NumLayers);
+  AssertEquals('heads', 2, Config.NumHeads);
+  AssertEquals('inter', 32, Config.IntermediateSize);
+  AssertEquals('num conv layers', 3, Config.NumConvLayers);
+  AssertEquals('conv_dim[0]', 8, Config.ConvDim[0]);
+  AssertEquals('conv_stride[0]', 5, Config.ConvStride[0]);
+  AssertEquals('conv_kernel[0]', 10, Config.ConvKernel[0]);
+  AssertEquals('conv_bias', false, Config.ConvBias);
+  AssertEquals('pos conv kernel', 8, Config.NumPosConvEmbeddings);
+  AssertEquals('pos conv groups', 4, Config.NumPosConvGroups);
+  AssertEquals('sample rate', 24000, Config.SampleRate);
+  // N+1 = 4 weighted-layer-sum weights (planted, non-uniform).
+  AssertEquals('layer weights count', 4, Length(Config.LayerWeights));
+end;
+
+// MERT music-encoder parity: builds the importer net for the fixture clip
+// length, feeds every raw "clips" row of the reference JSON and asserts (1)
+// the encoder last_hidden_state, (2) EACH of the N+1 raw transformer hidden
+// states (catches a trunk transpose / a wrong hidden-state collection point),
+// and (3) the weighted-layer-sum MUSIC EMBEDDING (MERTWeightedLayerSum, the
+// MERT-specific readout) all match the HF float64 oracle to < 1e-4.
+procedure TTestNeuralPretrained.TestMERTParity;
+var
+  NN: TNNet;
+  Config: TMERTConfig;
+  HiddenLayers: TMERTHiddenStateArray;
+  RefRoot: TJSONData;
+  Clips, LastH, AllH, EmbArr, ClipArr, PosArr, RowArr, StateArr: TJSONArray;
+  Input, Output, Emb: TNNetVolume;
+  RefJson: TStringList;
+  ClipCnt, PosCnt, ChCnt, StateCnt, NumSamples, EncLen, expLen: integer;
+  NumStates: integer;
+  Diff, MaxLastDiff, MaxStateDiff, MaxEmbDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  Emb := TNNetVolume.Create;
+  RefRoot := nil;
+  NN := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_mert_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Clips := TJSONArray(TJSONObject(RefRoot).Find('clips'));
+    LastH := TJSONArray(TJSONObject(RefRoot).Find('last_hidden'));
+    AllH := TJSONArray(TJSONObject(RefRoot).Find('all_hidden'));
+    EmbArr := TJSONArray(TJSONObject(RefRoot).Find('embedding'));
+    expLen := TJSONObject(RefRoot).Get('enc_len', 0);
+    NumStates := TJSONObject(RefRoot).Get('num_hidden', 0);
+    AssertTrue('clips present', Clips <> nil);
+    AssertTrue('last_hidden present', LastH <> nil);
+    AssertTrue('all_hidden present', AllH <> nil);
+    AssertTrue('embedding present', EmbArr <> nil);
+    AssertTrue('at least 3 clips', Clips.Count >= 3);
+    NumSamples := TJSONArray(Clips.Items[0]).Count;
+
+    NN := BuildMERTFromSafeTensorsEx(
+      FixturePath('tiny_mert.safetensors'), Config, NumSamples, HiddenLayers,
+      {pTrainable=}true, FixturePath('tiny_mert_config.json'));
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('model_type from config', 'mert_model', Config.ModelType);
+
+    EncLen := MERTEncoderLength(Config, NumSamples);
+    AssertEquals('encoder length matches the oracle', expLen, EncLen);
+    AssertEquals('hidden state count', NumStates, Length(HiddenLayers));
+    AssertEquals('num_hidden_layers+1', Config.NumLayers + 1, NumStates);
+    AssertEquals('raw input length', NumSamples, NN.Layers[0].Output.SizeX);
+    AssertEquals('last_hidden_state shape', EncLen * Config.HiddenSize,
+      NN.GetLastLayer().Output.Size);
+
+    MaxLastDiff := 0;
+    MaxStateDiff := 0;
+    MaxEmbDiff := 0;
+    Input.ReSize(NumSamples, 1, 1);
+    for ClipCnt := 0 to Clips.Count - 1 do
+    begin
+      ClipArr := TJSONArray(Clips.Items[ClipCnt]);
+      AssertEquals('clip length', NumSamples, ClipArr.Count);
+      for PosCnt := 0 to NumSamples - 1 do
+        Input.FData[PosCnt] := ClipArr.Items[PosCnt].AsFloat;
+      NN.Compute(Input);
+      NN.GetOutput(Output);
+
+      // (1) last_hidden_state parity.
+      PosArr := TJSONArray(LastH.Items[ClipCnt]);
+      AssertEquals('last hidden frames', EncLen, PosArr.Count);
+      for PosCnt := 0 to EncLen - 1 do
+      begin
+        RowArr := TJSONArray(PosArr.Items[PosCnt]);
+        for ChCnt := 0 to Config.HiddenSize - 1 do
+        begin
+          Diff := Abs(Output.FData[PosCnt * Config.HiddenSize + ChCnt] -
+            RowArr.Items[ChCnt].AsFloat);
+          if Diff > MaxLastDiff then MaxLastDiff := Diff;
+        end;
+      end;
+
+      // (2) EACH raw transformer hidden state (the trunk transpose pin).
+      StateArr := TJSONArray(AllH.Items[ClipCnt]);
+      AssertEquals('hidden state rows', NumStates, StateArr.Count);
+      for StateCnt := 0 to NumStates - 1 do
+      begin
+        PosArr := TJSONArray(StateArr.Items[StateCnt]);
+        AssertEquals('hidden state frames', EncLen, PosArr.Count);
+        for PosCnt := 0 to EncLen - 1 do
+        begin
+          RowArr := TJSONArray(PosArr.Items[PosCnt]);
+          for ChCnt := 0 to Config.HiddenSize - 1 do
+          begin
+            Diff := Abs(HiddenLayers[StateCnt].Output.FData[
+              PosCnt * Config.HiddenSize + ChCnt] - RowArr.Items[ChCnt].AsFloat);
+            if Diff > MaxStateDiff then MaxStateDiff := Diff;
+          end;
+        end;
+      end;
+
+      // (3) the weighted-layer-sum MUSIC EMBEDDING (MERT-specific readout).
+      MERTWeightedLayerSum(Config, HiddenLayers, Emb, {MeanPool=}false);
+      AssertEquals('embedding seq length', EncLen, Emb.SizeX);
+      AssertEquals('embedding depth', Config.HiddenSize, Emb.Depth);
+      PosArr := TJSONArray(EmbArr.Items[ClipCnt]);
+      AssertEquals('embedding frames', EncLen, PosArr.Count);
+      for PosCnt := 0 to EncLen - 1 do
+      begin
+        RowArr := TJSONArray(PosArr.Items[PosCnt]);
+        for ChCnt := 0 to Config.HiddenSize - 1 do
+        begin
+          Diff := Abs(Emb.FData[PosCnt * Config.HiddenSize + ChCnt] -
+            RowArr.Items[ChCnt].AsFloat);
+          if Diff > MaxEmbDiff then MaxEmbDiff := Diff;
+        end;
+      end;
+
+      // The mean-pooled embedding must be (1,1,hidden).
+      MERTWeightedLayerSum(Config, HiddenLayers, Emb, {MeanPool=}true);
+      AssertEquals('pooled embedding size', Config.HiddenSize, Emb.Size);
+    end;
+
+    AssertTrue('MERT last_hidden parity: max |diff| = ' +
+      FloatToStr(MaxLastDiff) + ' must be < 1e-4', MaxLastDiff < 1e-4);
+    AssertTrue('MERT per-layer hidden parity: max |diff| = ' +
+      FloatToStr(MaxStateDiff) + ' must be < 1e-4', MaxStateDiff < 1e-4);
+    AssertTrue('MERT weighted-layer-sum parity: max |diff| = ' +
+      FloatToStr(MaxEmbDiff) + ' must be < 1e-4', MaxEmbDiff < 1e-4);
+  finally
+    NN.Free;
+    RefRoot.Free;
+    Emb.Free;
+    Output.Free;
+    Input.Free;
+    RefJson.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestPyannoteParity;
 var
   NN: TNNet;
@@ -12479,6 +13466,197 @@ begin
     NN.Free;
     Output.Free; Input.Free;
     RowToks.Free; WaveToks.Free; Header.Free; Lines.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestF5TTSParity;
+var
+  NN: TNNet;
+  Config: TF5Config;
+  Lines, Header, IdToks, XToks, CToks, RowToks: TStringList;
+  Xt, Cond, Text, Time, Output: TNNetVolume;
+  S, NMel, Vocab, r, c, i: integer;
+  TVal: double;
+  Diff, MaxDiff, Expected: double;
+  FS: TFormatSettings;
+begin
+  RandSeed := 424242;
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  Lines := TStringList.Create;
+  Header := TStringList.Create;
+  IdToks := TStringList.Create;
+  XToks := TStringList.Create;
+  CToks := TStringList.Create;
+  RowToks := TStringList.Create;
+  Xt := TNNetVolume.Create;
+  Cond := TNNetVolume.Create;
+  Text := TNNetVolume.Create;
+  Time := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  NN := nil;
+  try
+    Lines.LoadFromFile(FixturePath('tiny_f5_expected.txt'));
+    AssertTrue('expected file has header + ids + 2 inputs + frames',
+      Lines.Count >= 4);
+    // Line 0: "S n_mel vocab t".
+    Header.Delimiter := ' '; Header.StrictDelimiter := True;
+    Header.DelimitedText := Lines[0];
+    S := StrToInt(Header[0]);
+    NMel := StrToInt(Header[1]);
+    Vocab := StrToInt(Header[2]);
+    TVal := StrToFloat(Header[3], FS);
+
+    NN := BuildF5TTSFromSafeTensors(
+      FixturePath('tiny_f5.safetensors'), S, Config,
+      FixturePath('tiny_f5_config.json'));
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('model_type', 'f5tts', Config.ModelType);
+    AssertEquals('n_mel', NMel, Config.NMelChannels);
+    AssertEquals('vocab', Vocab, Config.TextNumEmbeds);
+    AssertEquals('velocity shape', S * NMel, NN.GetLastLayer().Output.Size);
+
+    // Line 1: character ids.
+    IdToks.Delimiter := ' '; IdToks.StrictDelimiter := True;
+    IdToks.DelimitedText := Lines[1];
+    AssertEquals('id count', S, IdToks.Count);
+    Text.ReSize(S, 1, 1);
+    for i := 0 to S - 1 do Text.FData[i] := StrToInt(IdToks[i]);
+    // Line 2: noised mel x_t (S*NMel). Line 3: reference cond mel (S*NMel).
+    XToks.Delimiter := ' '; XToks.StrictDelimiter := True;
+    XToks.DelimitedText := Lines[2];
+    CToks.Delimiter := ' '; CToks.StrictDelimiter := True;
+    CToks.DelimitedText := Lines[3];
+    AssertEquals('x_t length', S * NMel, XToks.Count);
+    AssertEquals('cond length', S * NMel, CToks.Count);
+    Xt.ReSize(S, 1, NMel);
+    Cond.ReSize(S, 1, NMel);
+    for i := 0 to S * NMel - 1 do
+    begin
+      Xt.FData[i] := StrToFloat(XToks[i], FS);
+      Cond.FData[i] := StrToFloat(CToks[i], FS);
+    end;
+    // F5/FlowMatching convention: the scalar time input is the continuous
+    // t in [0,1] PRE-SCALED by 1000 to land in the sinusoidal table's integer
+    // range (TNNetSinusoidalTimeEmbedding consumes the input verbatim).
+    Time.ReSize(1, 1, 1);
+    Time.FData[0] := TVal * 1000.0;
+
+    NN.Compute([Xt, Cond, Text, Time]);
+    NN.GetOutput(Output);
+
+    // Lines 4..: per-frame expected velocity (S rows x NMel).
+    MaxDiff := 0;
+    for r := 0 to S - 1 do
+    begin
+      RowToks.Delimiter := ' '; RowToks.StrictDelimiter := True;
+      RowToks.DelimitedText := Lines[4 + r];
+      AssertEquals('velocity row width', NMel, RowToks.Count);
+      for c := 0 to NMel - 1 do
+      begin
+        Expected := StrToFloat(RowToks[c], FS);
+        Diff := Abs(Output.FData[r * NMel + c] - Expected);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    // 1e-4 importer-parity gate (the committed-fixture convention). NEVER
+    // loosen - fix the model instead.
+    AssertTrue('F5-TTS velocity-field parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    WriteLn('F5-TTS velocity max abs diff: ', MaxDiff:0:10);
+  finally
+    NN.Free;
+    Output.Free; Time.Free; Text.Free; Cond.Free; Xt.Free;
+    RowToks.Free; CToks.Free; XToks.Free; IdToks.Free; Header.Free; Lines.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestEcapaParity;
+var
+  NN: TNNet;
+  Config: TEcapaTdnnConfig;
+  Lines, Header, XToks, EToks, CosToks: TStringList;
+  Input, Output, EmbA, EmbB: TNNetVolume;
+  NumFrames, NumMel, EmbDim, clip, i, c: integer;
+  Diff, MaxDiff, Expected: double;
+  CosAA, CosAB, ExpCosAA, ExpCosAB: double;
+  FS: TFormatSettings;
+begin
+  RandSeed := 424242;
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  Lines := TStringList.Create;
+  Header := TStringList.Create;
+  XToks := TStringList.Create;
+  EToks := TStringList.Create;
+  CosToks := TStringList.Create;
+  Input := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  EmbA := TNNetVolume.Create;
+  EmbB := TNNetVolume.Create;
+  NN := nil;
+  try
+    Lines.LoadFromFile(FixturePath('tiny_ecapa_expected.txt'));
+    AssertTrue('expected file has header + 2 clips + cos line', Lines.Count >= 6);
+    Header.Delimiter := ' '; Header.StrictDelimiter := True;
+    Header.DelimitedText := Lines[0];
+    NumFrames := StrToInt(Header[0]);
+    NumMel := StrToInt(Header[1]);
+    EmbDim := StrToInt(Header[2]);
+
+    NN := BuildEcapaTdnnFromSafeTensorsEx(
+      FixturePath('tiny_ecapa.safetensors'), Config, NumFrames,
+      {pTrainable=}true, FixturePath('tiny_ecapa_config.json'));
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('num_mel', NumMel, Config.NumMel);
+    AssertEquals('emb_dim', EmbDim, Config.EmbDim);
+    AssertEquals('embedding shape', EmbDim, NN.GetLastLayer().Output.Size);
+
+    MaxDiff := 0;
+    for clip := 0 to 1 do
+    begin
+      // Input row (T*NumMel, row-major t-major) then embedding row.
+      XToks.Delimiter := ' '; XToks.StrictDelimiter := True;
+      XToks.DelimitedText := Lines[1 + clip * 2];
+      AssertEquals('input length', NumFrames * NumMel, XToks.Count);
+      Input.ReSize(NumFrames, 1, NumMel);
+      for i := 0 to NumFrames * NumMel - 1 do
+        Input.FData[i] := StrToFloat(XToks[i], FS);
+      NN.Compute(Input);
+      NN.GetOutput(Output);
+      if clip = 0 then EmbA.Copy(Output) else EmbB.Copy(Output);
+
+      EToks.Delimiter := ' '; EToks.StrictDelimiter := True;
+      EToks.DelimitedText := Lines[2 + clip * 2];
+      AssertEquals('embedding length', EmbDim, EToks.Count);
+      for c := 0 to EmbDim - 1 do
+      begin
+        Expected := StrToFloat(EToks[c], FS);
+        Diff := Abs(Output.FData[c] - Expected);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    // 1e-4 importer-parity gate (committed-fixture convention). NEVER loosen.
+    AssertTrue('ECAPA embedding parity: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // Speaker-verification cosine score: same clip ~1, different clip < same.
+    CosToks.Delimiter := ' '; CosToks.StrictDelimiter := True;
+    CosToks.DelimitedText := Lines[5];
+    ExpCosAA := StrToFloat(CosToks[0], FS);
+    ExpCosAB := StrToFloat(CosToks[1], FS);
+    CosAA := EcapaCosineScore(EmbA, EmbA);
+    CosAB := EcapaCosineScore(EmbA, EmbB);
+    AssertTrue('cos(A,A) parity', Abs(CosAA - ExpCosAA) < 1e-4);
+    AssertTrue('cos(A,B) parity', Abs(CosAB - ExpCosAB) < 1e-4);
+    AssertTrue('same-speaker score >= different-speaker score',
+      CosAA >= CosAB - 1e-6);
+    WriteLn('ECAPA embedding max abs diff: ', MaxDiff:0:10);
+    WriteLn('ECAPA cos(A,A)=', CosAA:0:6, ' cos(A,B)=', CosAB:0:6);
+  finally
+    NN.Free;
+    EmbB.Free; EmbA.Free; Output.Free; Input.Free;
+    CosToks.Free; EToks.Free; XToks.Free; Header.Free; Lines.Free;
   end;
 end;
 
@@ -12644,6 +13822,277 @@ begin
   end;
 end;
 
+procedure TTestNeuralPretrained.TestMoonshineGQAEncoderParity;
+var
+  NN: TNNet;
+  Config: TMoonshineConfig;
+  RefRoot: TJSONData;
+  WaveArr, Hidden, RowArr: TJSONArray;
+  Input, Output: TNNetVolume;
+  RefJson: TStringList;
+  PosCnt, ChCnt, NumSamples, EncLen, expLen: integer;
+  Diff, MaxHiddenDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  RefRoot := nil;
+  NN := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_moonshine_gqa_encoder.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    WaveArr := TJSONArray(TJSONObject(RefRoot).Find('waveform'));
+    Hidden := TJSONArray(TJSONObject(RefRoot).Find('enc_hidden'));
+    expLen := TJSONObject(RefRoot).Get('enc_len', 0);
+    AssertTrue('waveform present', WaveArr <> nil);
+    AssertTrue('enc_hidden present', Hidden <> nil);
+    NumSamples := WaveArr.Count;
+
+    NN := BuildMoonshineFromSafeTensorsEx(
+      FixturePath('tiny_moonshine_gqa.safetensors'), Config, NumSamples,
+      {pTrainable=}true, FixturePath('tiny_moonshine_gqa_config.json'));
+    AssertTrue('net built', NN <> nil);
+
+    // The whole point of this fixture: GQA (kv heads < query heads), so the
+    // K/V-head replication slice path actually fires (GroupSize > 1).
+    AssertTrue('encoder is GQA (kv heads < query heads)',
+      Config.NumEncoderKVHeads < Config.NumEncoderHeads);
+    AssertEquals('encoder query heads', 4, Config.NumEncoderHeads);
+    AssertEquals('encoder kv heads', 2, Config.NumEncoderKVHeads);
+
+    EncLen := MoonshineEncoderLength(NumSamples);
+    AssertEquals('encoder length matches the oracle', expLen, EncLen);
+    AssertEquals('raw input length', NumSamples, NN.Layers[0].Output.SizeX);
+    AssertEquals('encoder hidden shape', EncLen * Config.HiddenSize,
+      NN.GetLastLayer().Output.Size);
+
+    Input.ReSize(NumSamples, 1, 1);
+    for PosCnt := 0 to NumSamples - 1 do
+      Input.FData[PosCnt] := WaveArr.Items[PosCnt].AsFloat;
+    NN.Compute(Input);
+    NN.GetOutput(Output);
+
+    MaxHiddenDiff := 0;
+    AssertEquals('hidden frames', EncLen, Hidden.Count);
+    for PosCnt := 0 to EncLen - 1 do
+    begin
+      RowArr := TJSONArray(Hidden.Items[PosCnt]);
+      AssertEquals('hidden width', Config.HiddenSize, RowArr.Count);
+      for ChCnt := 0 to Config.HiddenSize - 1 do
+      begin
+        Diff := Abs(Output.FData[PosCnt * Config.HiddenSize + ChCnt] -
+          RowArr.Items[ChCnt].AsFloat);
+        if Diff > MaxHiddenDiff then MaxHiddenDiff := Diff;
+      end;
+    end;
+    // 1e-4 importer-parity gate. NEVER loosen - fix the model instead.
+    AssertTrue('Moonshine GQA encoder hidden parity: max |diff| = ' +
+      FloatToStr(MaxHiddenDiff) + ' must be < 1e-4', MaxHiddenDiff < 1e-4);
+  finally
+    NN.Free;
+    RefRoot.Free;
+    Output.Free;
+    Input.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMoonshineGQADecoderLogitParity;
+var
+  Enc, Dec: TNNet;
+  Config: TMoonshineConfig;
+  RefRoot: TJSONData;
+  WaveArr, PrefixArr, LogitsArr: TJSONArray;
+  EncIn, EncOut, DecIn, Logits: TNNetVolume;
+  EncStates: TNNetLayer;
+  RefJson: TStringList;
+  i, NumSamples, PrefixLen, DecSeqLen, Row: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  EncIn := TNNetVolume.Create;
+  EncOut := TNNetVolume.Create;
+  DecIn := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  Enc := nil;
+  Dec := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_moonshine_gqa_decoder.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    WaveArr := TJSONArray(TJSONObject(RefRoot).Find('waveform'));
+    PrefixArr := TJSONArray(TJSONObject(RefRoot).Find('dec_prefix'));
+    LogitsArr := TJSONArray(TJSONObject(RefRoot).Find('dec_logits'));
+    AssertTrue('waveform present', WaveArr <> nil);
+    AssertTrue('dec_prefix present', PrefixArr <> nil);
+    AssertTrue('dec_logits present', LogitsArr <> nil);
+    NumSamples := WaveArr.Count;
+    PrefixLen := PrefixArr.Count;
+    DecSeqLen := PrefixLen + 2;
+
+    BuildMoonshineEncoderDecoderFromSafeTensors(
+      FixturePath('tiny_moonshine_gqa.safetensors'), Enc, Dec, Config,
+      NumSamples, DecSeqLen, {pTrainable=}true,
+      FixturePath('tiny_moonshine_gqa_config.json'));
+    AssertTrue('encoder built', Enc <> nil);
+    AssertTrue('decoder built', Dec <> nil);
+    AssertEquals('vocab matches the logit oracle', LogitsArr.Count,
+      Config.VocabSize);
+
+    // Decoder GQA must be active: self-attn AND cross-attn replicate kv heads.
+    AssertTrue('decoder is GQA (kv heads < query heads)',
+      Config.NumDecoderKVHeads < Config.NumDecoderHeads);
+    AssertEquals('decoder query heads', 4, Config.NumDecoderHeads);
+    AssertEquals('decoder kv heads', 2, Config.NumDecoderKVHeads);
+
+    // 1) Encode the waveform.
+    EncIn.ReSize(NumSamples, 1, 1);
+    for i := 0 to NumSamples - 1 do EncIn.FData[i] := WaveArr.Items[i].AsFloat;
+    Enc.Compute(EncIn);
+    Enc.GetOutput(EncOut);
+
+    // 2) Copy the encoder states into the decoder's second TNNetInput.
+    EncStates := T5EncoderStatesInput(Dec);
+    AssertEquals('encoder states size matches decoder input',
+      EncStates.Output.Size, EncOut.Size);
+    EncStates.Output.Copy(EncOut);
+
+    // 3) Decoder tokens: prefix then padding with the start token.
+    DecIn.ReSize(DecSeqLen, 1, 1);
+    for i := 0 to DecSeqLen - 1 do
+      if i < PrefixLen then DecIn.FData[i] := PrefixArr.Items[i].AsFloat
+      else DecIn.FData[i] := PrefixArr.Items[0].AsFloat;
+    Dec.Compute(DecIn);
+    Dec.GetOutput(Logits);
+
+    // 4) Compare the next-token logit row (after the full prefix).
+    Row := PrefixLen - 1;
+    MaxDiff := 0;
+    for i := 0 to Config.VocabSize - 1 do
+    begin
+      Diff := Abs(Logits.FData[Row * Config.VocabSize + i] -
+        LogitsArr.Items[i].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    // 1e-4 importer-parity gate. NEVER loosen - fix the model instead.
+    AssertTrue('Moonshine GQA decoder logit parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Dec.Free;
+    Enc.Free;
+    RefRoot.Free;
+    Logits.Free;
+    DecIn.Free;
+    EncOut.Free;
+    EncIn.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMoonshineKVCacheDecodeParity;
+var
+  Enc, Dec, EncC, DecC: TNNet;
+  Config, ConfigC: TMoonshineConfig;
+  RefRoot: TJSONData;
+  WaveArr: TJSONArray;
+  EncIn, DecIn, Logits, Wave: TNNetVolume;
+  EncStates: TNNetLayer;
+  RefJson: TStringList;
+  RefTokens, CachedTokens: TNeuralIntegerArray;
+  i, NumSamples, DecSeqLen, StartId, EOSId, MaxNew, CurLen, Next: integer;
+begin
+  RandSeed := 424242;
+  StartId := 1;  // decoder_start_token_id (Moonshine default)
+  EOSId := 2;    // eos_token_id (Moonshine default)
+  DecSeqLen := 24;
+  MaxNew := DecSeqLen - 1;
+  RefJson := TStringList.Create;
+  EncIn := TNNetVolume.Create;
+  DecIn := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  Wave := TNNetVolume.Create;
+  RefRoot := nil;
+  Enc := nil;
+  Dec := nil;
+  EncC := nil;
+  DecC := nil;
+  try
+    // Reuse the committed decoder fixture's pinned waveform (token oracle not
+    // needed here - this test compares two DECODE PATHS, not against HF).
+    RefJson.LoadFromFile(FixturePath('tiny_moonshine_decoder.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    WaveArr := TJSONArray(TJSONObject(RefRoot).Find('waveform'));
+    AssertTrue('waveform present', WaveArr <> nil);
+    NumSamples := WaveArr.Count;
+
+    BuildMoonshineEncoderDecoderFromSafeTensors(
+      FixturePath('tiny_moonshine.safetensors'), Enc, Dec, Config,
+      NumSamples, DecSeqLen, {pTrainable=}true,
+      FixturePath('tiny_moonshine_config.json'));
+    AssertTrue('encoder built', Enc <> nil);
+    AssertTrue('decoder built', Dec <> nil);
+
+    Wave.ReSize(NumSamples, 1, 1);
+    for i := 0 to NumSamples - 1 do Wave.FData[i] := WaveArr.Items[i].AsFloat;
+
+    // ---- (A) REFERENCE: the manual re-encode-the-whole-prefix greedy loop
+    //      the example used to drive (O(L) per step). ----
+    EncIn.ReSize(NumSamples, 1, 1);
+    for i := 0 to NumSamples - 1 do EncIn.FData[i] := Wave.FData[i];
+    Enc.Compute(EncIn);
+    EncStates := T5EncoderStatesInput(Dec);
+    EncStates.Output.Copy(Enc.GetLastLayer().Output);
+    DecIn.ReSize(DecSeqLen, 1, 1);
+    SetLength(RefTokens, 0);
+    CurLen := 1;
+    DecIn.FData[0] := StartId;
+    while CurLen < DecSeqLen do
+    begin
+      for i := CurLen to DecSeqLen - 1 do DecIn.FData[i] := StartId;
+      Dec.Compute(DecIn);
+      Dec.GetOutput(Logits);
+      Next := Logits.GetClassOnPixel(CurLen - 1, 0);
+      SetLength(RefTokens, Length(RefTokens) + 1);
+      RefTokens[High(RefTokens)] := Next;
+      if Next = EOSId then break;
+      if Length(RefTokens) >= MaxNew then break;
+      DecIn.FData[CurLen] := Next;
+      Inc(CurLen);
+    end;
+
+    // ---- (B) KV-CACHE incremental decode (O(1) per step). The cached path
+    //      feeds ONE token at a time, so its decoder's token input must be
+    //      built at width 1 (same fixture weights, DecSeqLen=1). ----
+    BuildMoonshineEncoderDecoderFromSafeTensors(
+      FixturePath('tiny_moonshine.safetensors'), EncC, DecC, ConfigC,
+      NumSamples, {DecSeqLen=}1, {pTrainable=}true,
+      FixturePath('tiny_moonshine_config.json'));
+    CachedTokens := DecodeMoonshineGreedyCached(EncC, DecC, Wave,
+      StartId, EOSId, MaxNew);
+
+    // ---- BIT-IDENTITY: token-for-token equality, NEVER loosen. ----
+    AssertTrue('cached decode generated >= 1 token', Length(CachedTokens) >= 1);
+    AssertEquals('KV-cache decode length matches the full-prefix loop',
+      Length(RefTokens), Length(CachedTokens));
+    for i := 0 to Length(RefTokens) - 1 do
+      AssertEquals('KV-cache token[' + IntToStr(i) + '] bit-identical',
+        RefTokens[i], CachedTokens[i]);
+  finally
+    DecC.Free;
+    EncC.Free;
+    Dec.Free;
+    Enc.Free;
+    RefRoot.Free;
+    Wave.Free;
+    Logits.Free;
+    DecIn.Free;
+    EncIn.Free;
+    RefJson.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestEnCodecRoundTripParity;
 begin
   CheckEnCodecParity('tiny_encodec');           // causal 24 kHz topology
@@ -12658,6 +14107,236 @@ procedure TTestNeuralPretrained.TestEnCodecLegacyWeightNormParity;
 begin
   CheckEnCodecParity('tiny_encodec_legacynorm'); // legacy weight_g/weight_v
 end;
+
+procedure TTestNeuralPretrained.TestEnCodecOpenCLConvParity;
+{$IFDEF OpenCL}
+var
+  Model: TEnCodecModel;
+  Config: TEnCodecConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Clips, Clip, InArr, CodeStack, CodeRow: TJSONArray;
+  Wave, ReconCPU, ReconCL: TNeuralFloatDynArr;
+  Codes: array of TNeuralIntegerArray;
+  Frames, ci, i, q, t: integer;
+  Diff, MaxDiff: double;
+  EasyCL: TEasyOpenCL;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+begin
+  // Acquire the first OpenCL device; SKIP (pass) cleanly if none.
+  EasyCL := TEasyOpenCL.Create();
+  try
+    if EasyCL.GetPlatformCount() = 0 then
+    begin
+      AssertTrue('no OpenCL platform: SKIP', true);
+      Exit;
+    end;
+    EasyCL.SetCurrentPlatform(EasyCL.PlatformIds[0]);
+    if EasyCL.GetDeviceCount() = 0 then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    EasyCL.SetCurrentDevice(EasyCL.Devices[0]);
+    PlatformId := EasyCL.PlatformIds[0];
+    DeviceId := EasyCL.Devices[0];
+  finally
+    EasyCL.Free;
+  end;
+
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  DisableConvOpenCL(); // start from a known OFF state
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_encodec_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Clips := TJSONArray(TJSONObject(RefRoot).Find('clips'));
+    AssertTrue('clips present', Clips <> nil);
+
+    Model := BuildEnCodecFromSafeTensors(
+      FixturePath('tiny_encodec.safetensors'), Config,
+      FixturePath('tiny_encodec_config.json'));
+    AssertTrue('codec built', Model <> nil);
+
+    MaxDiff := 0;
+    for ci := 0 to Clips.Count - 1 do
+    begin
+      Clip := TJSONArray(Clips.Items[ci]);
+      InArr := TJSONArray(TJSONObject(Clip).Find('input'));
+      CodeStack := TJSONArray(TJSONObject(Clip).Find('codes'));
+      // Build the RVQ code stack straight from the oracle fixture so both
+      // decodes start from identical codes (the encode path is unchanged).
+      SetLength(Codes, CodeStack.Count);
+      for q := 0 to CodeStack.Count - 1 do
+      begin
+        CodeRow := TJSONArray(CodeStack.Items[q]);
+        SetLength(Codes[q], CodeRow.Count);
+        for t := 0 to CodeRow.Count - 1 do
+          Codes[q][t] := CodeRow.Items[t].AsInteger;
+      end;
+
+      // CPU decode (OpenCL OFF).
+      AssertFalse('OpenCL must start OFF', ConvOpenCLEnabled());
+      Model.DecodeCodesToAudio(Codes, ReconCPU, 0);
+
+      // OpenCL decode (offload ARMED for the conv runners). Force the device
+      // path for EVERY conv (MinWork 0) so the kernel is genuinely exercised
+      // even on the tiny parity fixture. EnableConvOpenCL self-tests the device
+      // kernel and stays OFF (graceful CPU fallback) if it can't compute - e.g.
+      // when the kernel source neural.cl is not reachable from the run dir. In
+      // that case ReconCL is just a second CPU decode and the parity below is
+      // trivially exact, so the test is green whether or not the device path is
+      // actually available. When it IS available the real device GEMM runs.
+      EnableConvOpenCL(PlatformId, DeviceId);
+      SetConvOpenCLMinWork(0);
+      try
+        Model.DecodeCodesToAudio(Codes, ReconCL, 0);
+      finally
+        DisableConvOpenCL();
+        SetConvOpenCLMinWork(1 shl 20); // restore the default threshold
+      end;
+
+      AssertEquals('CPU/OpenCL decode length match',
+        Length(ReconCPU), Length(ReconCL));
+      for i := 0 to Length(ReconCPU) - 1 do
+      begin
+        Diff := Abs(ReconCPU[i] - ReconCL[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    // The OpenCL GEMM is the same im2col arithmetic as the AVX DotProduct path;
+    // parity must hold to the same 1e-4 importer gate. NEVER loosen.
+    AssertTrue('EnCodec OpenCL-conv vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    DisableConvOpenCL();
+    Model.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+{$ELSE}
+begin
+  // Built without -dOpenCL: nothing to verify, the CPU path is the only path.
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralPretrained.TestHiFiGANOpenCLConvParity;
+{$IFDEF OpenCL}
+var
+  Model: TNNetHiFiGAN;
+  Config: THiFiGANConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Clips, Clip, MelArr, MelRow: TJSONArray;
+  Mel: array of TNeuralFloatDynArr;
+  WaveCPU, WaveCL: TNeuralFloatDynArr;
+  Frames, Bands, ci, b, t, i: integer;
+  Diff, MaxDiff: double;
+  EasyCL: TEasyOpenCL;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+begin
+  // Acquire the first OpenCL device; SKIP (pass) cleanly if none.
+  EasyCL := TEasyOpenCL.Create();
+  try
+    if EasyCL.GetPlatformCount() = 0 then
+    begin
+      AssertTrue('no OpenCL platform: SKIP', true);
+      Exit;
+    end;
+    EasyCL.SetCurrentPlatform(EasyCL.PlatformIds[0]);
+    if EasyCL.GetDeviceCount() = 0 then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    EasyCL.SetCurrentDevice(EasyCL.Devices[0]);
+    PlatformId := EasyCL.PlatformIds[0];
+    DeviceId := EasyCL.Devices[0];
+  finally
+    EasyCL.Free;
+  end;
+
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  DisableConvOpenCL(); // start from a known OFF state
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_hifigan_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Clips := TJSONArray(TJSONObject(RefRoot).Find('clips'));
+    AssertTrue('clips present', Clips <> nil);
+
+    Model := BuildHiFiGANFromSafeTensors(
+      FixturePath('tiny_hifigan.safetensors'), Config,
+      FixturePath('tiny_hifigan_config.json'));
+    AssertTrue('vocoder built', Model <> nil);
+
+    MaxDiff := 0;
+    for ci := 0 to Clips.Count - 1 do
+    begin
+      Clip := TJSONArray(Clips.Items[ci]);
+      MelArr := TJSONArray(TJSONObject(Clip).Find('mel'));
+      Frames := MelArr.Count;
+      Bands := TJSONArray(MelArr.Items[0]).Count;
+      SetLength(Mel, Bands);
+      for b := 0 to Bands - 1 do SetLength(Mel[b], Frames);
+      for t := 0 to Frames - 1 do
+      begin
+        MelRow := TJSONArray(MelArr.Items[t]);
+        for b := 0 to Bands - 1 do Mel[b][t] := MelRow.Items[b].AsFloat;
+      end;
+
+      // CPU synthesis (OpenCL OFF).
+      AssertFalse('OpenCL must start OFF', ConvOpenCLEnabled());
+      Model.Synthesize(Mel, WaveCPU);
+
+      // OpenCL synthesis (offload ARMED for the conv runners, incl. the
+      // ConvTranspose1d upsamplers). MinWork 0 forces every conv onto the device
+      // so the transpose GEMM is genuinely exercised on the tiny fixture.
+      // EnableConvOpenCL self-tests the device kernel and stays OFF (graceful CPU
+      // fallback) if it can't compute (e.g. neural.cl not reachable); in that case
+      // WaveCL is a second CPU decode and the parity below is trivially exact.
+      EnableConvOpenCL(PlatformId, DeviceId);
+      SetConvOpenCLMinWork(0);
+      try
+        Model.Synthesize(Mel, WaveCL);
+      finally
+        DisableConvOpenCL();
+        SetConvOpenCLMinWork(1 shl 20); // restore the default threshold
+      end;
+
+      AssertEquals('CPU/OpenCL waveform length match',
+        Length(WaveCPU), Length(WaveCL));
+      for i := 0 to Length(WaveCPU) - 1 do
+      begin
+        Diff := Abs(WaveCPU[i] - WaveCL[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    // The OpenCL transpose GEMM is the same overlap-add arithmetic as the AVX
+    // DotProduct path; parity must hold to the 1e-4 importer gate. NEVER loosen.
+    AssertTrue('HiFi-GAN OpenCL-conv vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    DisableConvOpenCL();
+    Model.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+{$ELSE}
+begin
+  // Built without -dOpenCL: nothing to verify, the CPU path is the only path.
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 procedure TTestNeuralPretrained.CheckEnCodecParity(const BaseName: string);
 var
@@ -12814,6 +14493,85 @@ begin
       0, MaxCodeDiff);
     // 1e-4 importer-parity gate. NEVER loosen - fix the model instead.
     AssertTrue('Mimi round-trip waveform parity: max |diff| = ' +
+      FloatToStr(MaxReconDiff) + ' must be < 1e-4', MaxReconDiff < 1e-4);
+  finally
+    Model.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestDACRoundTripParity;
+var
+  Model: TNNetDAC;
+  Config: TDACConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Clips, Clip, InArr, ReconArr, CodeStack, CodeRow: TJSONArray;
+  Wave, Recon: TNeuralFloatDynArr;
+  Codes: TNNetIntArr2D;
+  Frames, ci, i, q, t, MaxCodeDiff: integer;
+  Diff, MaxReconDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_dac_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Clips := TJSONArray(TJSONObject(RefRoot).Find('clips'));
+    AssertTrue('clips present', Clips <> nil);
+    AssertTrue('at least 3 clips', Clips.Count >= 3);
+
+    Model := BuildDACFromSafeTensors(
+      FixturePath('tiny_dac.safetensors'), Config,
+      FixturePath('tiny_dac_config.json'));
+    AssertTrue('codec built', Model <> nil);
+    AssertEquals('num codebooks from config',
+      TJSONObject(RefRoot).Get('num_codebooks', 0), Model.NumCodebooks);
+    AssertTrue('RVQ cascade exercised', Model.NumCodebooks >= 2);
+    AssertEquals('hidden size from config',
+      TJSONObject(RefRoot).Get('hidden_size', 0), Config.HiddenSize);
+
+    MaxCodeDiff := 0;
+    MaxReconDiff := 0;
+    for ci := 0 to Clips.Count - 1 do
+    begin
+      Clip := TJSONArray(Clips.Items[ci]);
+      InArr := TJSONArray(TJSONObject(Clip).Find('input'));
+      ReconArr := TJSONArray(TJSONObject(Clip).Find('recon'));
+      CodeStack := TJSONArray(TJSONObject(Clip).Find('codes'));
+      SetLength(Wave, InArr.Count);
+      for i := 0 to InArr.Count - 1 do Wave[i] := InArr.Items[i].AsFloat;
+
+      // Encode: the factorized L2-normalized RVQ code stack must match exactly.
+      Model.Encode(Wave, Codes, Frames);
+      AssertEquals('RVQ stages', CodeStack.Count, Length(Codes));
+      AssertEquals('latent frame count',
+        TJSONArray(CodeStack.Items[0]).Count, Frames);
+      for q := 0 to CodeStack.Count - 1 do
+      begin
+        CodeRow := TJSONArray(CodeStack.Items[q]);
+        for t := 0 to CodeRow.Count - 1 do
+        begin
+          Diff := Abs(Codes[q][t] - CodeRow.Items[t].AsInteger);
+          if Diff > MaxCodeDiff then MaxCodeDiff := Round(Diff);
+        end;
+      end;
+
+      // Decode from the codes and compare to the float64 oracle.
+      Model.Decode(Codes, Recon, 0);
+      AssertEquals('reconstructed length', ReconArr.Count, Length(Recon));
+      for i := 0 to ReconArr.Count - 1 do
+      begin
+        Diff := Abs(Recon[i] - ReconArr.Items[i].AsFloat);
+        if Diff > MaxReconDiff then MaxReconDiff := Diff;
+      end;
+    end;
+    AssertEquals('DAC RVQ codes must match the oracle exactly', 0, MaxCodeDiff);
+    // 1e-4 importer-parity gate. NEVER loosen - fix the model instead.
+    AssertTrue('DAC round-trip waveform parity: max |diff| = ' +
       FloatToStr(MaxReconDiff) + ' must be < 1e-4', MaxReconDiff < 1e-4);
   finally
     Model.Free;
@@ -13251,6 +15009,137 @@ begin
   end;
 end;
 
+procedure TTestNeuralPretrained.TestKokoroSynthesisParity;
+var
+  Model: TNNetKokoro;
+  Config: TKokoroConfig;
+  RefRoot: TJSONData;
+  RefObj: TJSONObject;
+  RefJson: TStringList;
+  IdArr, StyleArr, LdArr, DurArr, F0Arr, EnArr, MagArr, PhArr, WavArr,
+    RowArr: TJSONArray;
+  Ids: array of integer;
+  Style, LogDur, F0, Energy, Wave, SPred: TNeuralFloatDynArr;
+  Durations: TNeuralIntegerArray;
+  Hidden, Expanded, Magnitude, Phase: TNNetFloatDynArr2D;
+  DurI: array of integer;
+  H, T, OutLen, NBins, i, c, t2: integer;
+  Diff, MaxDiff, RefV: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_kokoro_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefObj := TJSONObject(RefRoot);
+    H := RefObj.Get('hidden_size', 0);
+    OutLen := RefObj.Get('out_len', 0);
+    NBins := RefObj.Get('n_bins', 0);
+
+    Model := BuildKokoroFromSafeTensors(FixturePath('tiny_kokoro.safetensors'),
+      Config, FixturePath('tiny_kokoro_config.json'));
+    AssertTrue('kokoro built', Model <> nil);
+    AssertEquals('hidden_size from config', H, Config.HiddenSize);
+
+    // ---- inputs: phoneme ids + style vector.
+    IdArr := TJSONArray(RefObj.Find('input_ids'));
+    T := IdArr.Count;
+    SetLength(Ids, T);
+    for i := 0 to T - 1 do Ids[i] := IdArr.Items[i].AsInteger;
+    StyleArr := TJSONArray(RefObj.Find('style'));
+    SetLength(Style, StyleArr.Count);
+    for i := 0 to StyleArr.Count - 1 do Style[i] := StyleArr.Items[i].AsFloat;
+    SetLength(SPred, H);
+    for i := 0 to H - 1 do SPred[i] := Style[i];
+
+    // ---- Stage: text encoder + duration predictor.
+    Model.RunTextEncoder(Ids, Hidden);
+    Model.RunDuration(Hidden, SPred, LogDur, Durations);
+
+    LdArr := TJSONArray(RefObj.Find('log_duration'));
+    MaxDiff := 0;
+    for i := 0 to T - 1 do
+    begin
+      Diff := Abs(LogDur[i] - LdArr.Items[i].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('Kokoro log-duration parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    DurArr := TJSONArray(RefObj.Find('durations'));
+    SetLength(DurI, T);
+    for i := 0 to T - 1 do
+    begin
+      DurI[i] := Round(DurArr.Items[i].AsFloat);
+      AssertEquals('Kokoro duration token ' + IntToStr(i),
+        DurI[i], Durations[i]);
+    end;
+
+    // ---- Stage: length-regulator expansion + prosody curves.
+    Model.ExpandHidden(Hidden, Durations, Expanded);
+    AssertEquals('Kokoro expanded length', OutLen, Length(Expanded[0]));
+    Model.RunProsody(Expanded, SPred, F0, Energy);
+
+    F0Arr := TJSONArray(RefObj.Find('f0'));
+    EnArr := TJSONArray(RefObj.Find('energy'));
+    MaxDiff := 0;
+    for i := 0 to OutLen - 1 do
+    begin
+      Diff := Abs(F0[i] - F0Arr.Items[i].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+      Diff := Abs(Energy[i] - EnArr.Items[i].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('Kokoro F0/energy parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // ---- Stage: iSTFTNet decoder magnitude + phase.
+    Model.RunDecoder(Expanded, F0, Energy,
+      Copy(Style, H, Config.StyleDim - H), Magnitude, Phase, Wave);
+    MagArr := TJSONArray(RefObj.Find('magnitude'));   // [NBINS][L]
+    PhArr := TJSONArray(RefObj.Find('phase'));
+    MaxDiff := 0;
+    for c := 0 to NBins - 1 do
+    begin
+      RowArr := TJSONArray(MagArr.Items[c]);
+      for t2 := 0 to OutLen - 1 do
+      begin
+        Diff := Abs(Magnitude[c][t2] - RowArr.Items[t2].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      RowArr := TJSONArray(PhArr.Items[c]);
+      for t2 := 0 to OutLen - 1 do
+      begin
+        Diff := Abs(Phase[c][t2] - RowArr.Items[t2].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('Kokoro magnitude/phase parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // ---- End-to-end: ids + style -> waveform.
+    Model.Synthesize(Ids, Style, Wave);
+    WavArr := TJSONArray(RefObj.Find('waveform'));
+    AssertEquals('Kokoro waveform length', WavArr.Count, Length(Wave));
+    MaxDiff := 0;
+    for i := 0 to WavArr.Count - 1 do
+    begin
+      RefV := WavArr.Items[i].AsFloat;
+      Diff := Abs(Wave[i] - RefV);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    // 1e-4 importer-parity gate. NEVER loosen - fix the model instead.
+    AssertTrue('Kokoro end-to-end waveform parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Model.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestDemucsSeparationParity;
 var
   Model: TNNetDemucs;
@@ -13422,6 +15311,258 @@ begin
   end;
 end;
 
+procedure TTestNeuralPretrained.TestParlerTTSParity;
+var
+  Model: TParlerTTSModel;
+  Config: TParlerConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  RefObj: TJSONObject;
+  EncStatesArr, RowArr, CodesArr, PromptArr, LogitsArr, KArr, TArr: TJSONArray;
+  EncStates, EncHidden, Logits: TNNetVolume;
+  Codes, GenCacheless, GenCached: TNNetIntArr2D;
+  PromptIds: array of integer;
+  EncSeq, PromptLen, CodecSeq, K, Vocab, TextD, t, k_i, v, i: integer;
+  MaxDiff, Diff: double;
+  Mismatch: boolean;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  EncStates := TNNetVolume.Create;
+  EncHidden := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_parler_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefObj := TJSONObject(RefRoot);
+    EncSeq := RefObj.Get('enc_seq_len', 0);
+    PromptLen := RefObj.Get('prompt_len', 0);
+    CodecSeq := RefObj.Get('codec_seq_len', 0);
+    K := RefObj.Get('num_codebooks', 0);
+    Vocab := RefObj.Get('vocab_size', 0);
+    TextD := RefObj.Get('text_d_model', 0);
+
+    Model := BuildParlerTTSFromSafeTensors(
+      FixturePath('tiny_parler.safetensors'), Config, EncSeq, PromptLen,
+      CodecSeq, {pTrainable=}true, FixturePath('tiny_parler_config.json'));
+    AssertTrue('parler decoder built', Model <> nil);
+    AssertEquals('model_type', 'parler_tts', Config.ModelType);
+    AssertEquals('num codebooks', K, Config.NumCodebooks);
+    AssertEquals('vocab size', Vocab, Config.VocabSize);
+    AssertEquals('text d_model', TextD, Config.TextDModel);
+
+    // Fixed description encoder hidden states (EncSeq x TextD).
+    EncStatesArr := TJSONArray(RefObj.Find('enc_states'));
+    EncStates.ReSize(EncSeq, 1, TextD);
+    for t := 0 to EncSeq - 1 do
+    begin
+      RowArr := TJSONArray(EncStatesArr.Items[t]);
+      for i := 0 to TextD - 1 do
+        EncStates.FData[t * TextD + i] := RowArr.Items[i].AsFloat;
+    end;
+
+    // Fixed transcript prompt ids.
+    PromptArr := TJSONArray(RefObj.Find('prompt_ids'));
+    SetLength(PromptIds, PromptLen);
+    for i := 0 to PromptLen - 1 do PromptIds[i] := PromptArr.Items[i].AsInteger;
+
+    // Fixed codec code stack (K x CodecSeq).
+    CodesArr := TJSONArray(RefObj.Find('codec_codes'));
+    SetLength(Codes, K);
+    for k_i := 0 to K - 1 do
+    begin
+      RowArr := TJSONArray(CodesArr.Items[k_i]);
+      SetLength(Codes[k_i], CodecSeq);
+      for t := 0 to CodecSeq - 1 do Codes[k_i][t] := RowArr.Items[t].AsInteger;
+    end;
+
+    Model.ProjectEncoderStates(EncStates, EncHidden);
+    Model.ComputeLogits(PromptIds, Codes, EncHidden, Logits);
+    AssertEquals('logits depth = K*vocab', K * Vocab, Logits.Depth);
+    AssertEquals('logits length = CodecSeq', CodecSeq, Logits.SizeX);
+
+    // Oracle logits [K][CodecSeq][Vocab]; Pascal layout is depth k*Vocab + v.
+    LogitsArr := TJSONArray(RefObj.Find('logits'));
+    MaxDiff := 0;
+    for k_i := 0 to K - 1 do
+    begin
+      KArr := TJSONArray(LogitsArr.Items[k_i]);
+      for t := 0 to CodecSeq - 1 do
+      begin
+        TArr := TJSONArray(KArr.Items[t]);
+        for v := 0 to Vocab - 1 do
+        begin
+          Diff := Abs(Logits.FData[t * (K * Vocab) + k_i * Vocab + v] -
+            TArr.Items[v].AsFloat);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('Parler-TTS decoder logit parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // KV-cache greedy decode must be bit-identical to the full re-encode path.
+    // Generate a handful of frames (CodecSeq - K + 1 fit in the built CodecLen).
+    Model.Generate(EncStates, PromptIds, CodecSeq - K, {UseCache=}false,
+      GenCacheless);
+    Model.Generate(EncStates, PromptIds, CodecSeq - K, {UseCache=}true,
+      GenCached);
+    Mismatch := false;
+    for k_i := 0 to K - 1 do
+      for t := 0 to Length(GenCacheless[k_i]) - 1 do
+        if GenCacheless[k_i][t] <> GenCached[k_i][t] then Mismatch := true;
+    AssertTrue('Parler KV-cache decode == full re-encode decode',
+      not Mismatch);
+  finally
+    Model.Free;
+    EncStates.Free;
+    EncHidden.Free;
+    Logits.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestBarkParity;
+var
+  Model: TBarkModel;
+  Config: TBarkConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  RefObj, SubObj, CaseObj: TJSONObject;
+  SeqArr, LogitsArr, RowArr, CodeRowArr, CasesArr: TJSONArray;
+  Logits: TNNetVolume;
+  TokenIds: array of integer;
+  Codes: TNNetIntArr2D;
+  SemSeq, CoarseSeq, FineSeq, Vocab, NCases, NCodesTotal: integer;
+  s, p, v, c, CbIdx: integer;
+  MaxDiff, Diff: double;
+
+  function ReadSeqLen(const Key: string): integer;
+  var SO: TJSONObject; SA: TJSONArray;
+  begin
+    SO := TJSONObject(RefObj.Find(Key));
+    SA := TJSONArray(SO.Find('sequences'));
+    Result := TJSONArray(SA.Items[0]).Count;
+  end;
+
+  // Compares Logits (SeqLen*Vocab) row-major against oracle row s of SubObj.
+  procedure AccumDiff(const OracleLogits: TJSONArray; SeqLen: integer);
+  var
+    pp, vv: integer;
+    LocalRow: TJSONArray;
+    LocalDiff: double;
+  begin
+    for pp := 0 to SeqLen - 1 do
+    begin
+      LocalRow := TJSONArray(OracleLogits.Items[pp]);
+      for vv := 0 to Vocab - 1 do
+      begin
+        LocalDiff := Abs(Logits.FData[pp * Vocab + vv] -
+          LocalRow.Items[vv].AsFloat);
+        if LocalDiff > MaxDiff then MaxDiff := LocalDiff;
+      end;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  Logits := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_bark_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefObj := TJSONObject(RefRoot);
+    SemSeq := ReadSeqLen('semantic');
+    CoarseSeq := ReadSeqLen('coarse');
+    SubObj := TJSONObject(RefObj.Find('fine'));
+    CasesArr := TJSONArray(SubObj.Find('cases'));
+    FineSeq := TJSONArray(TJSONObject(CasesArr.Items[0]).Find('codes')).Count;
+
+    Model := BuildBarkFromSafeTensors(
+      FixturePath('tiny_bark_semantic.safetensors'),
+      FixturePath('tiny_bark_coarse.safetensors'),
+      FixturePath('tiny_bark_fine.safetensors'),
+      Config, SemSeq, CoarseSeq, FineSeq, {pTrainable=}true,
+      FixturePath('tiny_bark_config.json'));
+    AssertTrue('bark model built', Model <> nil);
+    AssertEquals('bark model_type', 'bark', Config.ModelType);
+    AssertEquals('fine n_codes_total', 6, Config.Fine.NCodesTotal);
+    AssertEquals('fine n_codes_given', 1, Config.Fine.NCodesGiven);
+
+    MaxDiff := 0;
+
+    // ---- SEMANTIC sub-model ----
+    SubObj := TJSONObject(RefObj.Find('semantic'));
+    Vocab := SubObj.Get('vocab', 0);
+    SeqArr := TJSONArray(SubObj.Find('sequences'));
+    LogitsArr := TJSONArray(SubObj.Find('logits'));
+    SetLength(TokenIds, SemSeq);
+    for s := 0 to SeqArr.Count - 1 do
+    begin
+      RowArr := TJSONArray(SeqArr.Items[s]);
+      for p := 0 to SemSeq - 1 do TokenIds[p] := RowArr.Items[p].AsInteger;
+      Model.Semantic.ComputeLogits(TokenIds, Logits);
+      AccumDiff(TJSONArray(LogitsArr.Items[s]), SemSeq);
+    end;
+    AssertTrue('Bark SEMANTIC logit parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // ---- COARSE sub-model ----
+    MaxDiff := 0;
+    SubObj := TJSONObject(RefObj.Find('coarse'));
+    Vocab := SubObj.Get('vocab', 0);
+    SeqArr := TJSONArray(SubObj.Find('sequences'));
+    LogitsArr := TJSONArray(SubObj.Find('logits'));
+    SetLength(TokenIds, CoarseSeq);
+    for s := 0 to SeqArr.Count - 1 do
+    begin
+      RowArr := TJSONArray(SeqArr.Items[s]);
+      for p := 0 to CoarseSeq - 1 do TokenIds[p] := RowArr.Items[p].AsInteger;
+      Model.Coarse.ComputeLogits(TokenIds, Logits);
+      AccumDiff(TJSONArray(LogitsArr.Items[s]), CoarseSeq);
+    end;
+    AssertTrue('Bark COARSE logit parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // ---- FINE sub-model (non-causal over codebooks) ----
+    MaxDiff := 0;
+    SubObj := TJSONObject(RefObj.Find('fine'));
+    Vocab := SubObj.Get('vocab', 0);
+    NCodesTotal := SubObj.Get('n_codes_total', 0);
+    CasesArr := TJSONArray(SubObj.Find('cases'));
+    LogitsArr := TJSONArray(SubObj.Find('logits'));
+    NCases := CasesArr.Count;
+    SetLength(Codes, FineSeq);
+    for s := 0 to NCases - 1 do
+    begin
+      CaseObj := TJSONObject(CasesArr.Items[s]);
+      CbIdx := CaseObj.Get('codebook_idx', 0);
+      CodeRowArr := TJSONArray(CaseObj.Find('codes')); // [seq][n_codes_total]
+      for p := 0 to FineSeq - 1 do
+      begin
+        RowArr := TJSONArray(CodeRowArr.Items[p]);
+        SetLength(Codes[p], NCodesTotal);
+        for c := 0 to NCodesTotal - 1 do
+          Codes[p][c] := RowArr.Items[c].AsInteger;
+      end;
+      Model.Fine.ComputeFineLogits(Codes, CbIdx, Logits);
+      AccumDiff(TJSONArray(LogitsArr.Items[s]), FineSeq);
+    end;
+    AssertTrue('Bark FINE logit parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Model.Free;
+    Logits.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestMusicGenDelayPattern;
 var
   RefRoot: TJSONData;
@@ -13471,6 +15612,164 @@ begin
         if Abs(Back[k_i][t] - Raw[k_i][t]) > MaxDiff then
           MaxDiff := Abs(Back[k_i][t] - Raw[k_i][t]);
     AssertEquals('delay-pattern round-trip recovers raw codes (t>=1)',
+      0, MaxDiff);
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMusicGenStereoDecoderParity;
+var
+  Model: TMusicGenModel;
+  Config: TMusicGenConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  RefObj: TJSONObject;
+  EncStatesArr, RowArr, CodesArr, LogitsArr, KArr, TArr: TJSONArray;
+  EncStates, EncHidden, Logits: TNNetVolume;
+  Codes: TNNetIntArr2D;
+  EncSeq, DecSeq, K, Vocab, TextD, Chan, t, k_i, v, i: integer;
+  MaxDiff, Diff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  EncStates := TNNetVolume.Create;
+  EncHidden := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_musicgen_stereo_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefObj := TJSONObject(RefRoot);
+    EncSeq := RefObj.Get('enc_seq_len', 0);
+    DecSeq := RefObj.Get('dec_seq_len', 0);
+    K := RefObj.Get('num_codebooks', 0);        // 2*K_channel (stereo rows)
+    Vocab := RefObj.Get('vocab_size', 0);
+    TextD := RefObj.Get('text_d_model', 0);
+    Chan := RefObj.Get('audio_channels', 0);
+
+    Model := BuildMusicGenFromSafeTensors(
+      FixturePath('tiny_musicgen_stereo.safetensors'), Config, EncSeq, DecSeq,
+      {pTrainable=}true, FixturePath('tiny_musicgen_stereo_config.json'));
+    AssertTrue('stereo musicgen decoder built', Model <> nil);
+    AssertEquals('stereo audio_channels accepted', 2, Config.AudioChannels);
+    AssertEquals('stereo audio_channels matches oracle', Chan,
+      Config.AudioChannels);
+    AssertEquals('stereo num codebooks (2*K)', K, Config.NumCodebooks);
+    AssertEquals('stereo codebooks are even', 0, Config.NumCodebooks mod 2);
+    AssertEquals('stereo vocab size', Vocab, Config.VocabSize);
+
+    EncStatesArr := TJSONArray(RefObj.Find('enc_states'));
+    EncStates.ReSize(EncSeq, 1, TextD);
+    for t := 0 to EncSeq - 1 do
+    begin
+      RowArr := TJSONArray(EncStatesArr.Items[t]);
+      for i := 0 to TextD - 1 do
+        EncStates.FData[t * TextD + i] := RowArr.Items[i].AsFloat;
+    end;
+
+    CodesArr := TJSONArray(RefObj.Find('dec_codes'));
+    SetLength(Codes, K);
+    for k_i := 0 to K - 1 do
+    begin
+      RowArr := TJSONArray(CodesArr.Items[k_i]);
+      SetLength(Codes[k_i], DecSeq);
+      for t := 0 to DecSeq - 1 do
+        Codes[k_i][t] := RowArr.Items[t].AsInteger;
+    end;
+
+    Model.ProjectEncoderStates(EncStates, EncHidden);
+    Model.ComputeLogits(Codes, EncHidden, Logits);
+    AssertEquals('stereo logits depth = 2K*vocab', K * Vocab, Logits.Depth);
+    AssertEquals('stereo logits length = DecSeq', DecSeq, Logits.SizeX);
+
+    LogitsArr := TJSONArray(RefObj.Find('logits'));
+    MaxDiff := 0;
+    for k_i := 0 to K - 1 do
+    begin
+      KArr := TJSONArray(LogitsArr.Items[k_i]);
+      for t := 0 to DecSeq - 1 do
+      begin
+        TArr := TJSONArray(KArr.Items[t]);
+        for v := 0 to Vocab - 1 do
+        begin
+          Diff := Abs(Logits.FData[t * (K * Vocab) + k_i * Vocab + v] -
+            TArr.Items[v].AsFloat);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    // 1e-4 importer-parity gate (committed-fixture convention). NEVER loosen.
+    AssertTrue('Stereo MusicGen decoder logit parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Model.Free;
+    EncStates.Free;
+    EncHidden.Free;
+    Logits.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMusicGenStereoDelayPattern;
+var
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  DelayObj: TJSONObject;
+  RawArr, DelayedArr, RowArr: TJSONArray;
+  Raw, Delayed, Back: TNNetIntArr2D;
+  K, Len, PadId, Chan, Off, k_i, t, MaxDiff: integer;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_musicgen_stereo_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    DelayObj := TJSONObject(TJSONObject(RefRoot).Find('delay'));
+    PadId := DelayObj.Get('pad_id', 0);
+    Chan := DelayObj.Get('channels', 2);
+    AssertEquals('stereo delay channels = 2', 2, Chan);
+    RawArr := TJSONArray(DelayObj.Find('raw'));
+    DelayedArr := TJSONArray(DelayObj.Find('delayed'));
+    K := RawArr.Count;
+    Len := TJSONArray(RawArr.Items[0]).Count;
+    SetLength(Raw, K);
+    for k_i := 0 to K - 1 do
+    begin
+      RowArr := TJSONArray(RawArr.Items[k_i]);
+      SetLength(Raw[k_i], Len);
+      for t := 0 to Len - 1 do Raw[k_i][t] := RowArr.Items[t].AsInteger;
+    end;
+
+    // Stereo interleave (Channels=2): rows 2c,2c+1 share offset c. Must match
+    // HF build_delay_pattern_mask's delayed ids (audio_channels==2) exactly.
+    MusicGenDelayInterleave(Raw, PadId, Delayed, Chan);
+    MaxDiff := 0;
+    for k_i := 0 to K - 1 do
+    begin
+      RowArr := TJSONArray(DelayedArr.Items[k_i]);
+      for t := 0 to Len - 1 do
+        if Abs(Delayed[k_i][t] - RowArr.Items[t].AsInteger) > MaxDiff then
+          MaxDiff := Abs(Delayed[k_i][t] - RowArr.Items[t].AsInteger);
+    end;
+    AssertEquals('stereo delay-pattern interleave matches HF oracle', 0,
+      MaxDiff);
+
+    // Deinterleave with Channels=2 recovers raw[k][t] for t >= 1 over the
+    // recoverable region (out length = Len - max_offset, max_offset = K/2 - 1).
+    MusicGenDelayDeinterleave(Delayed, Len - (K div Chan - 1), Back, Chan);
+    MaxDiff := 0;
+    for k_i := 0 to K - 1 do
+    begin
+      Off := k_i div Chan;
+      for t := 1 to (Len - (K div Chan - 1)) - 1 do
+        if (t + Off < Len) and (Abs(Back[k_i][t] - Raw[k_i][t]) > MaxDiff) then
+          MaxDiff := Abs(Back[k_i][t] - Raw[k_i][t]);
+    end;
+    AssertEquals('stereo delay-pattern round-trip recovers raw codes (t>=1)',
       0, MaxDiff);
   finally
     RefRoot.Free;
@@ -13875,6 +16174,165 @@ begin
     Uncond.Free;
     Zero.Free;
     Model.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMusicGenMelodyParity;
+var
+  Model: TMusicGenMelodyModel;
+  Config: TMusicGenMelodyConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  RefObj: TJSONObject;
+  WaveFreqs, WaveAmps, EncStatesArr, RowArr, CondArr, CodesArr, LogitsArr,
+    KArr, TArr, ChromaArr: TJSONArray;
+  Samples, Chroma, EncStates, ChromaCond, Prefix, Logits: TNNetVolume;
+  Codes: TNNetIntArr2D;
+  EncSeq, DecSeq, K, Vocab, TextD, NumChroma, ChromaLen, NSamp, SR: integer;
+  NumFrames, t, k_i, v, i, c, expArg, gotArg: integer;
+  MaxDiff, Diff, ww, tt, maxv: double;
+  ChromaMism: integer;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  Samples := TNNetVolume.Create;
+  Chroma := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create;
+  ChromaCond := TNNetVolume.Create;
+  Prefix := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_musicgen_melody_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefObj := TJSONObject(RefRoot);
+    EncSeq := RefObj.Get('enc_seq_len', 0);
+    DecSeq := RefObj.Get('dec_seq_len', 0);
+    K := RefObj.Get('num_codebooks', 0);
+    Vocab := RefObj.Get('vocab_size', 0);
+    TextD := RefObj.Get('text_d_model', 0);
+    NumChroma := RefObj.Get('num_chroma', 12);
+    ChromaLen := RefObj.Get('chroma_length', 0);
+    NSamp := RefObj.Get('wave_n_samples', 0);
+    SR := RefObj.Get('sampling_rate', 32000);
+    NumFrames := RefObj.Get('num_frames', 0);
+
+    // ---- (1) chroma front-end parity ----
+    // Re-synthesize the reference waveform from the recipe (the committed
+    // fixture stores freqs/amps, not the raw samples).
+    WaveFreqs := TJSONArray(RefObj.Find('wave_freqs'));
+    WaveAmps := TJSONArray(RefObj.Find('wave_amps'));
+    Samples.ReSize(NSamp, 1, 1);
+    for i := 0 to NSamp - 1 do
+    begin
+      tt := i / SR; ww := 0;
+      for c := 0 to WaveFreqs.Count - 1 do
+        ww := ww + WaveAmps.Items[c].AsFloat *
+          Sin(2 * Pi * WaveFreqs.Items[c].AsFloat * tt);
+      Samples.FData[i] := ww;
+    end;
+    ComputeMusicgenMelodyChroma(Samples, Chroma, SR,
+      RefObj.Get('n_fft', 16384), RefObj.Get('hop_length', 4096), NumChroma);
+    AssertEquals('chroma frame count', NumFrames, Chroma.SizeX);
+    AssertEquals('chroma depth = num_chroma', NumChroma, Chroma.Depth);
+    ChromaArr := TJSONArray(RefObj.Find('chroma'));
+    MaxDiff := 0;
+    ChromaMism := 0;
+    for t := 0 to NumFrames - 1 do
+    begin
+      RowArr := TJSONArray(ChromaArr.Items[t]);
+      // exact one-hot match (every entry, not just the argmax)
+      for c := 0 to NumChroma - 1 do
+      begin
+        Diff := Abs(Chroma.FData[t * NumChroma + c] - RowArr.Items[c].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      // belt-and-braces: argmax agreement
+      expArg := 0; maxv := RowArr.Items[0].AsFloat;
+      for c := 1 to NumChroma - 1 do
+        if RowArr.Items[c].AsFloat > maxv then
+        begin maxv := RowArr.Items[c].AsFloat; expArg := c; end;
+      gotArg := 0; maxv := Chroma.FData[t * NumChroma];
+      for c := 1 to NumChroma - 1 do
+        if Chroma.FData[t * NumChroma + c] > maxv then
+        begin maxv := Chroma.FData[t * NumChroma + c]; gotArg := c; end;
+      if expArg <> gotArg then Inc(ChromaMism);
+    end;
+    AssertEquals('chroma argmax matches HF oracle every frame', 0, ChromaMism);
+    AssertTrue('MusicGen Melody chroma parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // ---- (2) one decoder step parity ----
+    Model := BuildMusicGenMelodyFromSafeTensors(
+      FixturePath('tiny_musicgen_melody.safetensors'), Config, EncSeq, DecSeq,
+      {pTrainable=}true, FixturePath('tiny_musicgen_melody_config.json'));
+    AssertTrue('musicgen melody decoder built', Model <> nil);
+    AssertEquals('num codebooks', K, Config.NumCodebooks);
+    AssertEquals('vocab size', Vocab, Config.VocabSize);
+    AssertEquals('num_chroma', NumChroma, Config.NumChroma);
+    AssertEquals('chroma_length', ChromaLen, Config.ChromaLength);
+
+    EncStatesArr := TJSONArray(RefObj.Find('enc_states'));
+    EncStates.ReSize(EncSeq, 1, TextD);
+    for t := 0 to EncSeq - 1 do
+    begin
+      RowArr := TJSONArray(EncStatesArr.Items[t]);
+      for i := 0 to TextD - 1 do
+        EncStates.FData[t * TextD + i] := RowArr.Items[i].AsFloat;
+    end;
+
+    CondArr := TJSONArray(RefObj.Find('chroma_cond'));
+    ChromaCond.ReSize(CondArr.Count, 1, NumChroma);
+    for t := 0 to CondArr.Count - 1 do
+    begin
+      RowArr := TJSONArray(CondArr.Items[t]);
+      for c := 0 to NumChroma - 1 do
+        ChromaCond.FData[t * NumChroma + c] := RowArr.Items[c].AsFloat;
+    end;
+
+    CodesArr := TJSONArray(RefObj.Find('dec_codes'));
+    SetLength(Codes, K);
+    for k_i := 0 to K - 1 do
+    begin
+      RowArr := TJSONArray(CodesArr.Items[k_i]);
+      SetLength(Codes[k_i], DecSeq);
+      for t := 0 to DecSeq - 1 do Codes[k_i][t] := RowArr.Items[t].AsInteger;
+    end;
+
+    Model.BuildConditioningPrefix(ChromaCond, EncStates, Prefix);
+    Model.ComputeLogits(Codes, Prefix, Logits);
+    AssertEquals('logits depth = K*vocab', K * Vocab, Logits.Depth);
+    AssertEquals('logits length = DecSeq', DecSeq, Logits.SizeX);
+
+    LogitsArr := TJSONArray(RefObj.Find('logits'));
+    MaxDiff := 0;
+    for k_i := 0 to K - 1 do
+    begin
+      KArr := TJSONArray(LogitsArr.Items[k_i]);
+      for t := 0 to DecSeq - 1 do
+      begin
+        TArr := TJSONArray(KArr.Items[t]);
+        for v := 0 to Vocab - 1 do
+        begin
+          Diff := Abs(Logits.FData[t * (K * Vocab) + k_i * Vocab + v] -
+            TArr.Items[v].AsFloat);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('MusicGen Melody decoder logit parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Model.Free;
+    Samples.Free;
+    Chroma.Free;
+    EncStates.Free;
+    ChromaCond.Free;
+    Prefix.Free;
+    Logits.Free;
+    RefRoot.Free;
+    RefJson.Free;
   end;
 end;
 
@@ -14818,6 +17276,107 @@ begin
     ImageInput.Free;
     VisionNet.Free;
     Reader.Free;
+  end;
+end;
+
+// BuildOpenClipVisionTower parity on a pico open_clip-scheme ViT visual tower.
+// The fixture (tools/make_pico_openclip_fixture.py) is a RANDOM-init tower in
+// the flat "visual.*" open_clip key layout (fused attn.in_proj qkv, bias-free
+// visual.proj [width, output_dim], ln_pre/ln_post, gelu MLP); the oracle is a
+// self-contained numpy float64 pre-LN ViT forward (no open_clip lib needed,
+// since we own the weights) mirroring exactly what BuildClipVisionTower
+// computes - per-token ln_post then bias-free projection. We assert the imported
+// tower's full (num_tokens, output_dim) output matches < 1e-4. This exercises
+// the new key translation: fused qkv split, proj transpose, visual.* -> HF
+// vision_model.* renaming, and the gelu activation path.
+procedure TTestNeuralPretrained.TestOpenClipVisionTowerParity;
+var
+  VisionNet: TNNet;
+  CfgRoot, RefRoot: TJSONData;
+  CfgJson, RefJson: TStringList;
+  Tower: TClipTowerConfig;
+  ImageSize, PatchSize, NumChannels, ProjDim, NumTokens: integer;
+  Pixels, RowArr, ChanArr, RefOut, RefTok: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt, TokCnt, ColCnt: integer;
+  Diff, MaxDiff: double;
+  ActStr: string;
+begin
+  RandSeed := 424242;
+  CfgJson := TStringList.Create;
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  VisionNet := nil;
+  CfgRoot := nil;
+  RefRoot := nil;
+  try
+    CfgJson.LoadFromFile(FixturePath('tiny_openclip_config.json'));
+    CfgRoot := GetJSON(CfgJson.Text);
+    ImageSize := TJSONObject(CfgRoot).Get('image_size', 0);
+    PatchSize := TJSONObject(CfgRoot).Get('patch_size', 0);
+    NumChannels := TJSONObject(CfgRoot).Get('num_channels', 3);
+    ProjDim := TJSONObject(CfgRoot).Get('output_dim', 0);
+    Tower.HiddenSize := TJSONObject(CfgRoot).Get('width', 0);
+    Tower.IntermediateSize := TJSONObject(CfgRoot).Get('intermediate_size', 0);
+    Tower.NumLayers := TJSONObject(CfgRoot).Get('num_hidden_layers', 0);
+    Tower.NumHeads := TJSONObject(CfgRoot).Get('num_attention_heads', 0);
+    Tower.LayerNormEps := TJSONObject(CfgRoot).Get('layer_norm_eps', 1e-5);
+    ActStr := TJSONObject(CfgRoot).Get('hidden_act', 'gelu');
+    Tower.HiddenAct := ClipHiddenActFromString(ActStr);
+    NumTokens := Sqr(ImageSize div PatchSize) + 1;
+
+    VisionNet := BuildOpenClipVisionTower(
+      FixturePath('tiny_openclip.safetensors'), Tower,
+      ImageSize, PatchSize, NumChannels, ProjDim);
+
+    AssertEquals('output rows = num tokens', NumTokens,
+      VisionNet.GetLastLayer().Output.SizeX);
+    AssertEquals('output depth = output_dim', ProjDim,
+      VisionNet.GetLastLayer().Output.Depth);
+
+    RefJson.LoadFromFile(FixturePath('tiny_openclip_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));   // [C][H][W]
+    RefOut := TJSONArray(TJSONObject(RefRoot).Find('vision_output'));
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertTrue('vision_output present', RefOut <> nil);
+    AssertEquals('oracle has num_tokens rows', NumTokens, RefOut.Count);
+
+    ImageInput.ReSize(ImageSize, ImageSize, NumChannels);
+    for ChanCnt := 0 to NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to ImageSize - 1 do
+          ImageInput.FData[(YCnt * ImageSize + XCnt) * NumChannels + ChanCnt] :=
+            ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    VisionNet.Compute(ImageInput);
+
+    MaxDiff := 0;
+    for TokCnt := 0 to NumTokens - 1 do
+    begin
+      RefTok := TJSONArray(RefOut.Items[TokCnt]);
+      AssertEquals('output width', ProjDim, RefTok.Count);
+      for ColCnt := 0 to ProjDim - 1 do
+      begin
+        Diff := Abs(VisionNet.GetLastLayer().Output.FData[
+          TokCnt * ProjDim + ColCnt] - RefTok.Items[ColCnt].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('open_clip tower: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    CfgRoot.Free;
+    RefJson.Free;
+    CfgJson.Free;
+    ImageInput.Free;
+    VisionNet.Free;
   end;
 end;
 
@@ -15888,6 +18447,9 @@ begin
   AssertEquals('stage3 width', 12, Config.StageWidths[3]);
   AssertEquals('stage0 blocks', 2, Config.BlocksPerStage[0]);
   AssertEquals('stage3 blocks', 2, Config.BlocksPerStage[3]);
+  // This pico fixture opts into legacy CAI maxpool (its oracle uses CAI
+  // semantics); the importer default (no cai_maxpool key) is PyTorch maxpool.
+  AssertFalse('cai_maxpool:true -> PyTorchMaxPool false', Config.PyTorchMaxPool);
 end;
 
 // torchvision ResNet18 image-classification parity test (the FIRST conv-net /
@@ -15997,6 +18559,460 @@ end;
 procedure TTestNeuralPretrained.TestResNet50ImageClassificationParity;
 begin
   RunResNetParity('tiny_resnet50');
+end;
+
+// transformers RegNet image-classification parity (BuildRegNet). The fixture
+// tiny_regnet_{x,y}.* is a pico RANDOM-init transformers
+// RegNetForImageClassification whose safetensors carry the exact
+// "regnet."-prefixed HF key scheme and whose reference logits come from a REAL
+// float64 HF forward (tools/make_pico_regnet_fixture.py). The pinned input is
+// the deterministic dyadic formula regenerated bit-for-bit here (NOT stored, to
+// keep the committed fixture tiny). regnet_x has NO SE; regnet_y adds the SE
+// gate. Both keep every spatial map square (image 64,
+// downsample_in_first_stage=false) so TNNetAvgChannel is an exact global mean,
+// and group_width 4 divides every hidden size so the grouped 3x3 conv has
+// groups > 1 (exercising the per-group weight-slice loader).
+procedure TTestNeuralPretrained.RunRegNetParity(const Base: string);
+var
+  NN: TNNet;
+  Config: TRegNetConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  LogitsArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt, ImgSz, NumCh: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildRegNetFromSafeTensors(FixturePath(Base + '.safetensors'),
+    Config, {pTrainable=}true, FixturePath(Base + '_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output size = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Size);
+
+    RefJson.LoadFromFile(FixturePath(Base + '_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    LogitsArr := TJSONArray(TJSONArray(
+      TJSONObject(RefRoot).Find('logits')).Items[0]);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+
+    // Regenerate the pinned pixels: (((c*4096 + y*W + x)*5) mod 17 - 8)/8.
+    // CAI input volume packs depth-contiguous: FData[(y*W + x)*C + c].
+    ImgSz := Config.ImageSize;
+    NumCh := Config.NumChannels;
+    ImageInput.ReSize(ImgSz, ImgSz, NumCh);
+    for ChanCnt := 0 to NumCh - 1 do
+      for YCnt := 0 to ImgSz - 1 do
+        for XCnt := 0 to ImgSz - 1 do
+          ImageInput.FData[(YCnt * ImgSz + XCnt) * NumCh + ChanCnt] :=
+            (((ChanCnt * 4096 + YCnt * ImgSz + XCnt) * 5) mod 17 - 8) / 8.0;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ChanCnt] -
+        LogitsArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestRegNetConfigFromJSONFile;
+var
+  Config: TRegNetConfig;
+begin
+  Config := ReadRegNetConfigFromJSONFile(FixturePath('tiny_regnet_y_config.json'));
+  AssertEquals('model_type', 'regnet', Config.ModelType);
+  AssertEquals('embedding_size', 8, Config.EmbeddingSize);
+  AssertEquals('groups_width', 4, Config.GroupsWidth);
+  AssertEquals('hidden_sizes[3]', 24, Config.HiddenSizes[3]);
+  AssertEquals('depths[1]', 2, Config.Depths[1]);
+  AssertTrue('layer_type y => HasSE', Config.HasSE);
+  AssertTrue('downsample_in_first_stage false',
+    not Config.DownsampleInFirstStage);
+  AssertEquals('num_labels', 5, Config.NumLabels);
+end;
+
+// regnet_x: bottleneck blocks with grouped 3x3 and NO squeeze-excite.
+procedure TTestNeuralPretrained.TestRegNetXImageClassificationParity;
+begin
+  RunRegNetParity('tiny_regnet_x');
+end;
+
+// regnet_y: regnet_x plus the squeeze-and-excite gate on each block.
+procedure TTestNeuralPretrained.TestRegNetYImageClassificationParity;
+begin
+  RunRegNetParity('tiny_regnet_y');
+end;
+
+// torchvision .pth (PyTorch pickle / ZIP) load path parity. The SAME pico
+// ResNet18 weights are committed twice: pico_resnet18.safetensors and
+// pico_resnet18.pth (torch.save zip, read by TNNetTorchBinReader, which the
+// importer reaches transparently via CreatePretrainedTensorReader dispatching
+// on the .pth extension). Both nets are built with the SAME config (PyTorch
+// stem maxpool, the importer default) and fed the same input; their logits
+// must agree bit-for-bit (the conv-BN fold + forward are identical, only the
+// tensor SOURCE differs). Proves the torch-bin source feeds the conv-BN fold +
+// config reader identically to safetensors. Note: the importer dispatch keys
+// off file extension, so the same physical .pth bytes are also loadable by any
+// other torch-bin importer (Llama/BERT/etc.) sharing the loader.
+procedure TTestNeuralPretrained.TestResNetTorchBinPthParity;
+var
+  NNSafe, NNPth: TNNet;
+  Config: TResNetConfig;
+  ImageInput: TNNetVolume;
+  i: integer;
+  MaxDiff, Diff: double;
+begin
+  RandSeed := 424242;
+  Config := ReadResNetConfigFromJSONFile(
+    FixturePath('pico_resnet18_config.json'));
+  // Default config => PyTorch stem maxpool (the real-checkpoint setting).
+  AssertTrue('default config selects PyTorch stem maxpool',
+    Config.PyTorchMaxPool);
+  NNSafe := nil; NNPth := nil; ImageInput := TNNetVolume.Create;
+  try
+    NNSafe := BuildResNetFromSafeTensorsEx(
+      FixturePath('pico_resnet18.safetensors'), Config, {pTrainable=}true);
+    NNPth := BuildResNetFromSafeTensorsEx(
+      FixturePath('pico_resnet18.pth'), Config, {pTrainable=}true);
+    AssertTrue('both nets built', (NNSafe <> nil) and (NNPth <> nil));
+    AssertEquals('same layer count', NNSafe.CountLayers, NNPth.CountLayers);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for i := 0 to ImageInput.Size - 1 do
+      ImageInput.FData[i] := (((i * 5) mod 17) - 8) / 8.0;
+
+    NNSafe.Compute(ImageInput);
+    NNPth.Compute(ImageInput);
+    AssertEquals('logit width', Config.NumLabels,
+      NNPth.GetLastLayer().Output.Size);
+    MaxDiff := 0;
+    for i := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NNSafe.GetLastLayer().Output.FData[i] -
+        NNPth.GetLastLayer().Output.FData[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('.pth vs .safetensors logits: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    NNSafe.Free; NNPth.Free; ImageInput.Free;
+  end;
+end;
+
+// PyTorch-semantics stem maxpool (TNNetMaxPoolPortable, the importer default)
+// must reproduce PyTorch's floor-sized, (-inf)-padded 3x3 stride2 pad1 maxpool
+// on a non-negative (post-ReLU) input. Hand example: a 4x4 single-channel map
+// 0..15 (all >= 0). PyTorch out size = floor((4+2*1-3)/2)+1 = 2; the floor+(-inf)
+// reference is computed inline and asserted EXACT. The legacy CAI TNNetMaxPool
+// would instead produce a 3x3 (ceil) map, so this also documents the divergence.
+procedure TTestNeuralPretrained.TestResNetPyTorchStemMaxPool;
+var
+  NN: TNNet;
+  Inp, Ref: TNNetVolume;
+  Pool: TNNetMaxPoolPortable;
+  H, W, oy, ox, iy, ix, ky, kx, py, px: integer;
+  m, v: TNeuralFloat;
+const
+  K = 3; ST = 2; PAD = 1;
+begin
+  H := 4; W := 4;
+  Inp := TNNetVolume.Create(W, H, 1);
+  Ref := nil; NN := nil;
+  try
+    for oy := 0 to H - 1 do
+      for ox := 0 to W - 1 do
+        Inp[ox, oy, 0] := oy * W + ox; // 0..15, all >= 0
+
+    NN := TNNet.Create();
+    NN.AddLayer(TNNetInput.Create(W, H, 1));
+    Pool := TNNetMaxPoolPortable(
+      NN.AddLayer(TNNetMaxPoolPortable.Create(K, ST, PAD)));
+    NN.Compute(Inp);
+
+    // PyTorch floor sizing.
+    AssertEquals('PyTorch maxpool out X (floor)', 2, Pool.Output.SizeX);
+    AssertEquals('PyTorch maxpool out Y (floor)', 2, Pool.Output.SizeY);
+
+    // Inline floor + (-inf)-pad reference.
+    Ref := TNNetVolume.Create(Pool.Output.SizeX, Pool.Output.SizeY, 1);
+    for oy := 0 to Pool.Output.SizeY - 1 do
+      for ox := 0 to Pool.Output.SizeX - 1 do
+      begin
+        m := -1e30;
+        for ky := 0 to K - 1 do
+          for kx := 0 to K - 1 do
+          begin
+            iy := oy * ST - PAD + ky;
+            ix := ox * ST - PAD + kx;
+            if (iy >= 0) and (iy < H) and (ix >= 0) and (ix < W) then
+            begin
+              v := Inp[ix, iy, 0];           // padding contributes -inf
+              if v > m then m := v;
+            end;
+          end;
+        Ref[ox, oy, 0] := m;
+        py := oy; px := ox;
+        AssertEquals('PyTorch stem maxpool cell (' + IntToStr(px) + ',' +
+          IntToStr(py) + ')', m, Pool.Output[ox, oy, 0]);
+      end;
+  finally
+    NN.Free; Inp.Free; Ref.Free;
+  end;
+end;
+
+// Shared driver for the RepVGG fusion-parity check. Loads the pico fixture
+// (importer FUSES each multi-branch training block into one 3x3 conv at load
+// time), runs the CAI forward, and asserts it matches the numpy float64 oracle
+// -- which computes the MULTI-BRANCH TRAINING forward (3x3 conv-BN + 1x1
+// conv-BN + identity-BN, summed, then ReLU). max|diff| < 1e-4 is the proof
+// that load-time re-parameterization is numerically exact.
+procedure TTestNeuralPretrained.RunRepVGGParity(const Base: string);
+var
+  NN: TNNet;
+  Config: TRepVGGConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, LogitsArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildRepVGGFromSafeTensors(FixturePath(Base + '.safetensors'),
+    Config, {pTrainable=}true, FixturePath(Base + '_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output size = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Size);
+
+    RefJson.LoadFromFile(FixturePath(Base + '_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    LogitsArr := TJSONArray(TJSONArray(
+      TJSONObject(RefRoot).Find('logits')).Items[0]);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ChanCnt] -
+        LogitsArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadRepVGGConfigFromJSONFile on the committed pico config.
+procedure TTestNeuralPretrained.TestRepVGGConfigFromJSONFile;
+var
+  Config: TRepVGGConfig;
+begin
+  Config := ReadRepVGGConfigFromJSONFile(FixturePath('tiny_repvgg_config.json'));
+  AssertEquals('model_type', 'repvgg', Config.ModelType);
+  AssertEquals('stage1 width', 8, Config.StageWidths[0]);
+  AssertEquals('stage4 width', 24, Config.StageWidths[3]);
+  AssertEquals('stage1 blocks', 2, Config.NumBlocksPerStage[0]);
+  AssertEquals('stage4 blocks', 1, Config.NumBlocksPerStage[3]);
+  AssertEquals('stem width', 6, Config.StemWidth);
+  AssertEquals('num_labels', 5, Config.NumLabels);
+  AssertTrue('ToString non-empty', Length(RepVGGConfigToString(Config)) > 0);
+end;
+
+// RepVGG load-time structural re-parameterization parity: the FUSED single-3x3
+// inference net must match the multi-branch training oracle to < 1e-4. Pico
+// fixture tiny_repvgg.* exercises the stem (no identity), stride-2 width-change
+// blocks (no identity, 1x1 zero-pad), and stride-1 same-width blocks (all three
+// branches incl. the identity centred-kernel term).
+procedure TTestNeuralPretrained.TestRepVGGParity;
+begin
+  RunRepVGGParity('tiny_repvgg');
+end;
+
+// Verifies ReadMaskRCNNConfigFromJSONFile on the committed pico config.
+procedure TTestNeuralPretrained.TestMaskRCNNConfigFromJSONFile;
+var
+  Config: TMaskRCNNConfig;
+begin
+  Config := ReadMaskRCNNConfigFromJSONFile(
+    FixturePath('tiny_maskrcnn_config.json'));
+  AssertEquals('fpn out channels', 4, Config.FpnOutChannels);
+  AssertEquals('num classes', 3, Config.NumClasses);
+  AssertEquals('box pool', 7, Config.BoxPoolSize);
+  AssertEquals('mask pool', 14, Config.MaskPoolSize);
+  AssertEquals('box rep', 8, Config.BoxRepSize);
+  AssertEquals('sampling ratio', 2, Config.SamplingRatio);
+  AssertEquals('num levels', 2, Config.NumLevels);
+  AssertEquals('box level', 0, Config.BoxLevel);
+  AssertEquals('level0 in_ch', 6, Config.Levels[0].InChannels);
+  AssertEquals('level0 H', 8, Config.Levels[0].Height);
+  AssertEquals('level1 H', 4, Config.Levels[1].Height);
+  WriteLn('  ', MaskRCNNConfigToString(Config));
+end;
+
+// torchvision maskrcnn_resnet50_fpn FPN + RoIAlign + box/mask heads parity.
+// The RPN is skipped (v1 scope): two backbone FPN-input levels + a single fixed
+// proposal box are supplied directly; the oracle is a self-contained numpy
+// float64 forward (tools/make_pico_maskrcnn_fixture.py). The gate is on the
+// MASK-HEAD logits (the instance-segmentation deliverable) plus the box-head
+// class logits and box deltas, all < 1e-4.
+procedure TTestNeuralPretrained.TestMaskRCNNParity;
+var
+  NN: TNNet;
+  Config: TMaskRCNNConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  FeatsArr, LvArr, ChArr, RowArr, MaskArr, MClsArr, MRowArr: TJSONArray;
+  ClsArr, BboxArr, BoxArr: TJSONArray;
+  LevelFeats: array of TNNetVolume;
+  Box: array[0..3] of TNeuralFloat;
+  ClsOut, BboxOut, MaskOut: TNNetVolume;
+  lv, c, y, x, idx, Wm, Hm: integer;
+  Diff, MaxMask, MaxCls, MaxBbox, Ref: double;
+begin
+  RandSeed := 424242;
+  NN := BuildMaskRCNNFromSafeTensors(FixturePath('tiny_maskrcnn.safetensors'),
+    Config, {pTrainable=}true, FixturePath('tiny_maskrcnn_config.json'));
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  ClsOut := TNNetVolume.Create;
+  BboxOut := TNNetVolume.Create;
+  MaskOut := TNNetVolume.Create;
+  SetLength(LevelFeats, Config.NumLevels);
+  for lv := 0 to Config.NumLevels - 1 do
+    LevelFeats[lv] := TNNetVolume.Create;
+  try
+    AssertTrue('net built', NN <> nil);
+
+    RefJson.LoadFromFile(FixturePath('tiny_maskrcnn_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+
+    // --- load level feature maps (ref "feats" is [level][C][H][W]) ----------
+    FeatsArr := TJSONArray(TJSONObject(RefRoot).Find('feats'));
+    AssertEquals('feats levels', Config.NumLevels, FeatsArr.Count);
+    for lv := 0 to Config.NumLevels - 1 do
+    begin
+      LvArr := TJSONArray(FeatsArr.Items[lv]);
+      LevelFeats[lv].ReSize(Config.Levels[lv].Width,
+        Config.Levels[lv].Height, Config.Levels[lv].InChannels);
+      for c := 0 to Config.Levels[lv].InChannels - 1 do
+      begin
+        ChArr := TJSONArray(LvArr.Items[c]);
+        for y := 0 to Config.Levels[lv].Height - 1 do
+        begin
+          RowArr := TJSONArray(ChArr.Items[y]);
+          for x := 0 to Config.Levels[lv].Width - 1 do
+            LevelFeats[lv].FData[(y * Config.Levels[lv].Width + x) *
+              Config.Levels[lv].InChannels + c] := RowArr.Items[x].AsFloat;
+        end;
+      end;
+    end;
+
+    BoxArr := TJSONArray(TJSONObject(RefRoot).Find('box'));
+    for x := 0 to 3 do Box[x] := BoxArr.Items[x].AsFloat;
+
+    RunMaskRCNN(NN, Config, LevelFeats, Box, ClsOut, BboxOut, MaskOut);
+
+    // --- mask logits (PRIMARY gate). ref "mask_logits" = [cls][Hm][Wm]; CAI
+    //     MaskOut is depth-major (x,y,cls): (y*Wm+x)*NumClasses + cls. --------
+    MaskArr := TJSONArray(TJSONObject(RefRoot).Find('mask_logits'));
+    AssertEquals('mask classes', Config.NumClasses, MaskArr.Count);
+    MClsArr := TJSONArray(MaskArr.Items[0]);
+    Hm := MClsArr.Count;
+    Wm := TJSONArray(MClsArr.Items[0]).Count;
+    AssertEquals('mask out SizeX', Wm, MaskOut.SizeX);
+    AssertEquals('mask out SizeY', Hm, MaskOut.SizeY);
+    AssertEquals('mask out Depth', Config.NumClasses, MaskOut.Depth);
+    MaxMask := 0;
+    for c := 0 to Config.NumClasses - 1 do
+    begin
+      MClsArr := TJSONArray(MaskArr.Items[c]);
+      for y := 0 to Hm - 1 do
+      begin
+        MRowArr := TJSONArray(MClsArr.Items[y]);
+        for x := 0 to Wm - 1 do
+        begin
+          Ref := MRowArr.Items[x].AsFloat;
+          Diff := Abs(MaskOut.FData[(y * Wm + x) * Config.NumClasses + c] - Ref);
+          if Diff > MaxMask then MaxMask := Diff;
+        end;
+      end;
+    end;
+
+    // --- box-head class logits + box deltas ---------------------------------
+    ClsArr := TJSONArray(TJSONObject(RefRoot).Find('cls_logits'));
+    AssertEquals('cls width', Config.NumClasses, ClsArr.Count);
+    AssertEquals('cls out size', Config.NumClasses, ClsOut.Size);
+    MaxCls := 0;
+    for idx := 0 to Config.NumClasses - 1 do
+    begin
+      Diff := Abs(ClsOut.FData[idx] - ClsArr.Items[idx].AsFloat);
+      if Diff > MaxCls then MaxCls := Diff;
+    end;
+    BboxArr := TJSONArray(TJSONObject(RefRoot).Find('bbox_deltas'));
+    AssertEquals('bbox width', Config.NumClasses * 4, BboxArr.Count);
+    AssertEquals('bbox out size', Config.NumClasses * 4, BboxOut.Size);
+    MaxBbox := 0;
+    for idx := 0 to Config.NumClasses * 4 - 1 do
+    begin
+      Diff := Abs(BboxOut.FData[idx] - BboxArr.Items[idx].AsFloat);
+      if Diff > MaxBbox then MaxBbox := Diff;
+    end;
+
+    WriteLn('  Mask R-CNN parity: mask |diff|=', MaxMask:0:8,
+      ' cls |diff|=', MaxCls:0:8, ' bbox |diff|=', MaxBbox:0:8);
+    AssertTrue('mask logits: max |diff| = ' + FloatToStr(MaxMask) +
+      ' must be < 1e-4', MaxMask < 1e-4);
+    AssertTrue('cls logits: max |diff| = ' + FloatToStr(MaxCls) +
+      ' must be < 1e-4', MaxCls < 1e-4);
+    AssertTrue('bbox deltas: max |diff| = ' + FloatToStr(MaxBbox) +
+      ' must be < 1e-4', MaxBbox < 1e-4);
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+    ClsOut.Free; BboxOut.Free; MaskOut.Free;
+    for lv := 0 to Config.NumLevels - 1 do LevelFeats[lv].Free;
+    NN.Free;
+  end;
 end;
 
 // Verifies ReadConvNeXtConfigFromJSONFile on the committed v1 pico config.
@@ -16315,6 +19331,91 @@ begin
         end;
     end;
     AssertTrue('DPT depth: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Img.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Depth Anything V2 monocular relative-depth importer parity. tiny_depth_anything
+// _v2.* is a pico DepthAnythingForDepthEstimation built via the named
+// BuildDepthAnythingV2FromSafeTensors entry point. Distinct from the DPT fixture:
+// the DINOv2 backbone has 6 layers and hooks NON-contiguous, NON-last-4 stages
+// out_indices=[2,3,5,6] (0-based blocks 1,2,4,5), exercising the importer's
+// out_indices wiring (tap the SELECTED encoder blocks + shared final LayerNorm)
+// rather than a hardcoded last-4 tap. The reference per-pixel depth map comes
+// from the REAL transformers float64 forward; asserts max |diff| < 1e-4 over the
+// whole (H, W) map.
+procedure TTestNeuralPretrained.TestDepthAnythingV2Parity;
+var
+  NN: TNNet;
+  Config: TDPTConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, OutArr, InArr: TJSONArray;
+  CaseObj: TJSONObject;
+  Img: TNNetVolume;
+  Output: TNNetVolume;
+  RefVal, GotVal, Diff, MaxDiff: double;
+  CaseCnt, x, yy, c, FlatIdx, GW, GH, W, H, NumCh: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildDepthAnythingV2FromSafeTensors(
+    FixturePath('tiny_depth_anything_v2.safetensors'),
+    Config, {pTrainable=}true,
+    FixturePath('tiny_depth_anything_v2_config.json'));
+  RefJson := TStringList.Create;
+  Img := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  W := Config.Backbone.ImageSize; H := Config.Backbone.ImageSize;
+  NumCh := Config.Backbone.NumChannels;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('model_type', 'depth_anything', Config.ModelType);
+    // the non-default stage hooks must have been read from the config.
+    AssertEquals('out_indices[0]', 2, Config.OutIndices[0]);
+    AssertEquals('out_indices[1]', 3, Config.OutIndices[1]);
+    AssertEquals('out_indices[2]', 5, Config.OutIndices[2]);
+    AssertEquals('out_indices[3]', 6, Config.OutIndices[3]);
+    RefJson.LoadFromFile(FixturePath('tiny_depth_anything_v2_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertTrue('cases present', CasesArr <> nil);
+    for CaseCnt := 0 to CasesArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(CasesArr.Items[CaseCnt]);
+      InArr := TJSONArray(CaseObj.Find('input'));
+      OutArr := TJSONArray(CaseObj.Find('output'));
+      GW := CaseObj.Get('out_grid_w', 0);
+      GH := CaseObj.Get('out_grid_h', 0);
+      Img.ReSize(W, H, NumCh);
+      for yy := 0 to H - 1 do
+        for x := 0 to W - 1 do
+          for c := 0 to NumCh - 1 do
+          begin
+            FlatIdx := (yy * W + x) * NumCh + c;
+            Img.FData[(yy * W + x) * NumCh + c] := InArr.Items[FlatIdx].AsFloat;
+          end;
+      NN.Compute(Img);
+      Output := NN.GetLastLayer().Output;
+      AssertEquals('depth grid w', GW, Output.SizeX);
+      AssertEquals('depth grid h', GH, Output.SizeY);
+      AssertEquals('depth channels', 1, Output.Depth);
+      for yy := 0 to GH - 1 do
+        for x := 0 to GW - 1 do
+        begin
+          FlatIdx := yy * GW + x;
+          RefVal := OutArr.Items[FlatIdx].AsFloat;
+          GotVal := Output.FData[(yy * GW + x)];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+    end;
+    AssertTrue('Depth Anything V2: max |diff| = ' + FloatToStr(MaxDiff) +
       ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     RefRoot.Free;
@@ -16698,6 +19799,131 @@ begin
     Img.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// Mask2Former universal-segmentation parity (mask-classification set prediction:
+// a fixed set of learned object queries, each predicting one binary mask + a
+// class, with MASKED ATTENTION restricting each decoder layer's cross-attention
+// to the foreground of the previous layer's predicted mask). tiny_mask2former.*
+// is a pico Mask2FormerForUniversalSegmentation (decoder + heads) with re-
+// randomized O(1) weights chosen so the masks genuinely split foreground vs
+// background (the -1e9 masking fires). v1 feeds the PIXEL-DECODER outputs
+// (mask_features + the 3 multi-scale memory levels) as precomputed inputs. The
+// reference per-query mask AND class logits come from the REAL transformers
+// float64 transformer module. Asserts max |diff| < 1e-4 over both the
+// (NumQueries, NumLabels+1) class logits and the (NumQueries, MaskH*MaskW) mask
+// logits -- exercising the masked cross-attention, the cross->self->FFN post-
+// norm order, the dot-product query x mask_features mask einsum, and the round-
+// robin multi-scale level attention.
+procedure TTestNeuralPretrained.TestMask2FormerParity;
+var
+  NN: TNNet;
+  Config: TMask2FormerConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Obj: TJSONObject;
+  MaskFeatArr, ClsArr, MaskArr, LvArr, SrcArr2: TJSONArray;
+  SrcArr, PosArr: array of TNNetVolume;
+  MaskFeatures, ClassLogits, MaskLogits: TNNetVolume;
+  i, q, c, p, s, NumPix, NumKeys, Hidden, NQ, NL: integer;
+  RefVal, GotVal, Diff, MaxClsDiff, MaxMaskDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildMask2FormerFromSafeTensors(
+    FixturePath('tiny_mask2former.safetensors'),
+    Config, {pTrainable=}true, FixturePath('tiny_mask2former_config.json'));
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  MaskFeatures := TNNetVolume.Create;
+  ClassLogits := TNNetVolume.Create;
+  MaskLogits := TNNetVolume.Create;
+  MaxClsDiff := 0;
+  MaxMaskDiff := 0;
+  Hidden := Config.Hidden;
+  NumPix := Config.MaskWidth * Config.MaskHeight;
+  NQ := Config.NumQueries;
+  NL := Config.NumLabels;
+  SetLength(SrcArr, Length(Config.Levels));
+  SetLength(PosArr, Length(Config.Levels));
+  for i := 0 to Length(Config.Levels) - 1 do
+  begin
+    SrcArr[i] := TNNetVolume.Create;
+    PosArr[i] := TNNetVolume.Create;
+  end;
+  try
+    AssertTrue('net built', NN <> nil);
+    RefJson.LoadFromFile(FixturePath('tiny_mask2former_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Obj := TJSONObject(RefRoot);
+    // mask_features: io is channel-major [HIDDEN, MaskH, MaskW]; Pascal volume
+    // (MaskW, MaskH, HIDDEN) is pixel-major FData[p*HIDDEN + c]. Transpose.
+    MaskFeatArr := TJSONArray(Obj.Find('mask_features'));
+    MaskFeatures.ReSize(Config.MaskWidth, Config.MaskHeight, Hidden);
+    for c := 0 to Hidden - 1 do
+      for p := 0 to NumPix - 1 do
+        MaskFeatures.FData[p * Hidden + c] :=
+          MaskFeatArr.Items[c * NumPix + p].AsFloat;
+    // per-level value sources + key positions: io is row-major [S, HIDDEN], and
+    // the Pascal (S, 1, HIDDEN) volume is FData[s*HIDDEN + c] -- direct copy.
+    LvArr := TJSONArray(Obj.Find('level_sources'));
+    for i := 0 to Length(Config.Levels) - 1 do
+    begin
+      NumKeys := Config.Levels[i].Width * Config.Levels[i].Height;
+      SrcArr[i].ReSize(NumKeys, 1, Hidden);
+      SrcArr2 := TJSONArray(LvArr.Items[i]);
+      for s := 0 to NumKeys - 1 do
+        for c := 0 to Hidden - 1 do
+          SrcArr[i].FData[s * Hidden + c] := SrcArr2.Items[s * Hidden + c].AsFloat;
+    end;
+    // keys = value memory + sine positional (HF: k = src + pos). The importer's
+    // KeyPos input is the SUM; build it here from level_sources + level_pos.
+    LvArr := TJSONArray(Obj.Find('level_pos'));
+    for i := 0 to Length(Config.Levels) - 1 do
+    begin
+      NumKeys := Config.Levels[i].Width * Config.Levels[i].Height;
+      PosArr[i].ReSize(NumKeys, 1, Hidden);
+      SrcArr2 := TJSONArray(LvArr.Items[i]);
+      for s := 0 to NumKeys - 1 do
+        for c := 0 to Hidden - 1 do
+          PosArr[i].FData[s * Hidden + c] :=
+            SrcArr[i].FData[s * Hidden + c] +
+            SrcArr2.Items[s * Hidden + c].AsFloat;
+    end;
+    RunMask2FormerSemantic(NN, Config, MaskFeatures, SrcArr, PosArr,
+      ClassLogits, MaskLogits);
+    // compare class logits (Q, L+1).
+    ClsArr := TJSONArray(Obj.Find('class_logits'));
+    for q := 0 to NQ - 1 do
+      for c := 0 to NL do
+      begin
+        RefVal := ClsArr.Items[q * (NL + 1) + c].AsFloat;
+        GotVal := ClassLogits[q, 0, c];
+        Diff := Abs(GotVal - RefVal);
+        if Diff > MaxClsDiff then MaxClsDiff := Diff;
+      end;
+    // compare mask logits (Q, MaskH*MaskW).
+    MaskArr := TJSONArray(Obj.Find('mask_logits'));
+    for q := 0 to NQ - 1 do
+      for p := 0 to NumPix - 1 do
+      begin
+        RefVal := MaskArr.Items[q * NumPix + p].AsFloat;
+        GotVal := MaskLogits[q, 0, p];
+        Diff := Abs(GotVal - RefVal);
+        if Diff > MaxMaskDiff then MaxMaskDiff := Diff;
+      end;
+    AssertTrue('Mask2Former class logits: max |diff| = ' +
+      FloatToStr(MaxClsDiff) + ' must be < 1e-4', MaxClsDiff < 1e-4);
+    AssertTrue('Mask2Former mask logits: max |diff| = ' +
+      FloatToStr(MaxMaskDiff) + ' must be < 1e-4', MaxMaskDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+    MaskFeatures.Free;
+    ClassLogits.Free;
+    MaskLogits.Free;
+    for i := 0 to Length(SrcArr) - 1 do begin SrcArr[i].Free; PosArr[i].Free; end;
+    FreeMask2Former(NN);
   end;
 end;
 
@@ -17201,6 +20427,150 @@ begin
   end;
 end;
 
+// Florence-2 location-token (de)quantization: a normalized coordinate <->
+// a <loc_> token id round-trip (the "spatial outputs as text" idea), checked
+// against the reference bins the fixture generator emits.
+procedure TTestNeuralPretrained.TestFlorence2LocationTokens;
+var
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  LocArr, BoxArr, BinArr: TJSONArray;
+  Item: TJSONObject;
+  NumBins, LocBase, i, GotId, RefBin, GotBin: integer;
+  Coord, GotCoord: double;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_florence2_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    NumBins := TJSONObject(RefRoot).Get('num_bins', 1000);
+    LocBase := TJSONObject(RefRoot).Get('loc_base', 0);
+    LocArr := TJSONArray(TJSONObject(RefRoot).Find('loc_examples'));
+    for i := 0 to LocArr.Count - 1 do
+    begin
+      Item := TJSONObject(LocArr.Items[i]);
+      Coord := Item.Get('coord', 0.0);
+      RefBin := Item.Get('bin', 0);
+      GotId := Florence2QuantizeCoord(Coord, NumBins, LocBase);
+      AssertEquals('loc bin for coord ' + FloatToStr(Coord),
+        LocBase + RefBin, GotId);
+      // Dequantize round-trips to within one bin width.
+      GotCoord := Florence2DequantizeCoord(GotId, NumBins, LocBase);
+      AssertTrue('loc dequant round-trip',
+        Abs(GotCoord - Coord) <= 1.0 / (NumBins - 1) + 1e-9);
+    end;
+    // A reference box maps to its 4 reference bins.
+    BoxArr := TJSONArray(TJSONObject(RefRoot).Find('ref_box'));
+    BinArr := TJSONArray(TJSONObject(RefRoot).Find('ref_box_bins'));
+    for i := 0 to BoxArr.Count - 1 do
+    begin
+      RefBin := BinArr.Items[i].AsInteger;
+      GotId := Florence2QuantizeCoord(BoxArr.Items[i].AsFloat,
+        NumBins, LocBase);
+      GotBin := GotId - LocBase;
+      AssertEquals('ref box bin ' + IntToStr(i), RefBin, GotBin);
+    end;
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Florence-2 unified-vision parity: the multimodal projector + the visual-
+// prefix BART encoder + the BART decoder pinned to the REAL HF Florence2
+// float64 oracle on the decoder logits for a fixed image-feature map + task
+// prompt + decoder prefix. The DaViT vision tower is the deferred gap: the
+// fixture supplies its last_hidden_state feature map as the precomputed input.
+// See tools/make_pico_florence2_fixture.py.
+procedure TTestNeuralPretrained.TestFlorence2Parity;
+var
+  EncoderNet, DecoderNet: TNNet;
+  Projector: TFlorence2Projector;
+  Config: TFlorence2Config;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  FmapArr, TaskArr, DecArr, LogArr, RowArr: TJSONArray;
+  Fmap, TaskToks, DecToks, Logits: TNNetVolume;
+  RefVal, GotVal, Diff, MaxDiff: double;
+  C, H, W, NumVisual, EncSeqLen, DecLen, ch, yy, xx, Vocab, Pos, v: integer;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  Fmap := TNNetVolume.Create;
+  TaskToks := TNNetVolume.Create;
+  DecToks := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  EncoderNet := nil;
+  DecoderNet := nil;
+  FillChar(Projector, SizeOf(Projector), 0);
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_florence2_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    C := TJSONObject(RefRoot).Get('feature_c', 0);
+    H := TJSONObject(RefRoot).Get('feature_h', 0);
+    W := TJSONObject(RefRoot).Get('feature_w', 0);
+    NumVisual := TJSONObject(RefRoot).Get('num_visual_tokens', 0);
+    FmapArr := TJSONArray(TJSONObject(RefRoot).Find('feature_map_chw'));
+    TaskArr := TJSONArray(TJSONObject(RefRoot).Find('task_ids'));
+    DecArr := TJSONArray(TJSONObject(RefRoot).Find('dec_ids'));
+    LogArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    DecLen := DecArr.Count;
+    EncSeqLen := NumVisual + TaskArr.Count;
+
+    BuildFlorence2FromSafeTensors(FixturePath('tiny_florence2.safetensors'),
+      EncoderNet, DecoderNet, Projector, Config, EncSeqLen, DecLen,
+      {pTrainable=}true, FixturePath('tiny_florence2_config.json'));
+    AssertTrue('encoder net built', EncoderNet <> nil);
+    AssertTrue('decoder net built', DecoderNet <> nil);
+    AssertEquals('feature channels', Config.FeatureChannels, C);
+
+    // feature map stored (C,H,W); CAI volume is (x=W, y=H, depth=C).
+    Fmap.ReSize(W, H, C);
+    for ch := 0 to C - 1 do
+      for yy := 0 to H - 1 do
+        for xx := 0 to W - 1 do
+          Fmap[xx, yy, ch] :=
+            TJSONArray(TJSONArray(FmapArr.Items[ch]).Items[yy]).Items[xx].AsFloat;
+    TaskToks.ReSize(TaskArr.Count, 1, 1);
+    for Pos := 0 to TaskArr.Count - 1 do
+      TaskToks.FData[Pos] := TaskArr.Items[Pos].AsInteger;
+    DecToks.ReSize(DecLen, 1, 1);
+    for Pos := 0 to DecLen - 1 do
+      DecToks.FData[Pos] := DecArr.Items[Pos].AsInteger;
+
+    RunFlorence2Logits(EncoderNet, DecoderNet, Config, Projector,
+      Fmap, TaskToks, DecToks, Logits);
+    Vocab := Config.Bart.VocabSize;
+    AssertEquals('logits vocab', Vocab, Logits.Depth);
+    for Pos := 0 to DecLen - 1 do
+    begin
+      RowArr := TJSONArray(LogArr.Items[Pos]);
+      for v := 0 to Vocab - 1 do
+      begin
+        RefVal := RowArr.Items[v].AsFloat;
+        GotVal := Logits[Pos, 0, v];
+        Diff := Abs(GotVal - RefVal);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('Florence-2 logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Logits.Free;
+    DecToks.Free;
+    TaskToks.Free;
+    Fmap.Free;
+    RefJson.Free;
+    FreeFlorence2Projector(Projector);
+    EncoderNet.Free;
+    DecoderNet.Free;
+  end;
+end;
+
 // Verifies ReadOwlViTConfigFromJSONFile on the committed OWL-ViT pico config
 // (the FIRST open-vocabulary / zero-shot object-detection importer).
 procedure TTestNeuralPretrained.TestOwlViTConfigFromJSONFile;
@@ -17561,6 +20931,99 @@ begin
   end;
 end;
 
+// FULL torchvision inception_v3 parity test: builds the COMPLETE module
+// sequence (stem Conv2d_1a..4a + maxpools, InceptionA x3, the strided
+// grid-reductions InceptionB/D, the 7x7-factorized InceptionC x4, and the wide
+// InceptionE x2) at the REAL torchvision channel widths and the real key scheme
+// (tiny_inceptionv3_full.*, full_arch=true). Exercises: TNNetGridAvgPool (the
+// real count_include_pad=False avg-pool branch), TNNetConvolutionRectangular +
+// TNNetPadXY (the asymmetric 1x7/7x1 convs), TNNetMaxPoolPortable stride-2
+// reductions, channel concat, and conv-BN fold. The 2048-d pooled feature is
+// the FID backbone tap. Logits + pooled feature must match the numpy float64
+// oracle (tools/inceptionv3_full_fixture.py) < 1e-4.
+procedure TTestNeuralPretrained.TestInceptionV3FullParity;
+var
+  NN: TNNet;
+  Config: TInceptionV3Config;
+  PoolIdx: integer;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, LogitsArr, PooledArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt, PoolDim: integer;
+  Diff, MaxDiff, MaxPoolDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildInceptionV3FromSafeTensors(
+    FixturePath('tiny_inceptionv3_full.safetensors'), Config, PoolIdx,
+    {pTrainable=}true, FixturePath('tiny_inceptionv3_full_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertTrue('full_arch flag', Config.FullArch);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output size = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Size);
+
+    RefJson.LoadFromFile(FixturePath('tiny_inceptionv3_full_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    LogitsArr := TJSONArray(TJSONArray(
+      TJSONObject(RefRoot).Find('logits')).Items[0]);
+    PooledArr := TJSONArray(TJSONObject(RefRoot).Find('pooled'));
+    PoolDim := TJSONObject(RefRoot).Get('pooled_dim', 0);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+    // The pooled-feature tap is the global-avg-pool (FID backbone): with
+    // width_div=8 the 2048-d torchvision feature scales to 256.
+    AssertTrue('pooled_dim from oracle > 0', PoolDim > 0);
+    AssertEquals('pool feature dim = oracle pooled_dim', PoolDim,
+      NN.Layers[PoolIdx].Output.Size);
+    AssertEquals('pooled width = oracle pooled_dim', PoolDim, PooledArr.Count);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ChanCnt] -
+        LogitsArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+    // Pooled-feature (FID backbone) parity.
+    MaxPoolDiff := 0;
+    for ChanCnt := 0 to PoolDim - 1 do
+    begin
+      Diff := Abs(NN.Layers[PoolIdx].Output.FData[ChanCnt] -
+        PooledArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxPoolDiff then MaxPoolDiff := Diff;
+    end;
+    AssertTrue('pooled feature: max |diff| = ' + FloatToStr(MaxPoolDiff) +
+      ' must be < 1e-4', MaxPoolDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
 // Verifies ReadMobileNetV3ConfigFromJSONFile on the committed pico config.
 procedure TTestNeuralPretrained.TestMobileNetV3ConfigFromJSONFile;
 var
@@ -17775,6 +21238,109 @@ begin
   end;
 end;
 
+// Verifies ReadMobileViTConfigFromJSONFile on the committed pico config.
+procedure TTestNeuralPretrained.TestMobileViTConfigFromJSONFile;
+var
+  Config: TMobileViTConfig;
+begin
+  Config := ReadMobileViTConfigFromJSONFile(
+    FixturePath('tiny_mobilevit_config.json'));
+  AssertEquals('model_type', 'mobilevit', Config.ModelType);
+  AssertEquals('image_size', 128, Config.ImageSize);
+  AssertEquals('num_channels', 3, Config.NumChannels);
+  AssertEquals('patch_size', 2, Config.PatchSize);
+  AssertEquals('num_labels', 5, Config.NumLabels);
+  AssertEquals('num_heads', 2, Config.NumHeads);
+  AssertEquals('conv_kernel', 3, Config.ConvKernel);
+  AssertTrue('qkv_bias', Config.QkvBias);
+  AssertTrue('mlp_ratio = 2', Abs(Config.MlpRatio - 2.0) < 1e-9);
+  AssertTrue('expand_ratio = 2', Abs(Config.ExpandRatio - 2.0) < 1e-9);
+  AssertEquals('hidden0', 8, Config.HiddenSizes[0]);
+  AssertEquals('hidden2', 12, Config.HiddenSizes[2]);
+  AssertEquals('neck0', 4, Config.NeckHiddenSizes[0]);
+  AssertEquals('neck6', 16, Config.NeckHiddenSizes[6]);
+  AssertEquals('tx layers0', 1, Config.TransformerLayers[0]);
+end;
+
+// MobileViT image-classification parity test. tests/fixtures/tiny_mobilevit.* is
+// a pico random-init MobileViT (image 64, patch 2, neck [4,6,8,10,12,14,16],
+// hidden [8,10,12], 1 transformer layer per MobileViT block, 5 labels) whose
+// state_dict mirrors transformers' exact mobilevit key scheme. It exercises
+// every importer branch: conv stem, the two MobileNet inverted-residual stages
+// (expand / depthwise+BN-shift / project / residual), the three MobileViT
+// blocks (downsample inv-res -> local conv_kxk -> conv_1x1 with NO BN/act ->
+// TNNetMobileViTUnfold 2x2 patches -> per-sub-position BLOCK-DIAGONAL attention
+// via TNNetMobileViTPatchSegments + the SDPA segment side channel -> post
+// LayerNorm -> TNNetMobileViTFold -> conv_projection -> fusion concat+conv),
+// conv_1x1_exp, global avg pool and the classifier Linear. Each BatchNorm
+// (eps 1e-5) is FOLDED into its conv at load (depthwise shift rides a
+// TNNetChannelBias). tools/make_pico_mobilevit_fixture.py computes the
+// reference logits with a self-contained numpy float64 first-principles oracle
+// (transformers is not installed). Asserts the (1,1,num_labels) logits match
+// the oracle < 1e-4 -- in particular validating the unfold/fold reshape.
+procedure TTestNeuralPretrained.TestMobileViTImageClassificationParity;
+var
+  NN: TNNet;
+  Config: TMobileViTConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, LogitsArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildMobileViTFromSafeTensors(
+    FixturePath('tiny_mobilevit.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_mobilevit_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output size = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Size);
+
+    RefJson.LoadFromFile(FixturePath('tiny_mobilevit_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    LogitsArr := TJSONArray(TJSONArray(
+      TJSONObject(RefRoot).Find('logits')).Items[0]);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ChanCnt] -
+        LogitsArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
 // Verifies ReadSwinConfigFromJSONFile on the committed pico Swin config.
 procedure TTestNeuralPretrained.TestSwinConfigFromJSONFile;
 var
@@ -17832,6 +21398,173 @@ begin
       NN.GetLastLayer().Output.Size);
 
     RefJson.LoadFromFile(FixturePath('tiny_swin_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    LogitsArr := TJSONArray(TJSONArray(
+      TJSONObject(RefRoot).Find('logits')).Items[0]);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ChanCnt] -
+        LogitsArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// MaxViT image-classification parity test. tests/fixtures/tiny_maxvit.* is a
+// pico random-init MaxViT (image 8, stem 3x3 -> 8x8x4, MBConv expand 8 + SE 2
+// -> project 6, block attention window 4, grid attention grid 4, 2 heads, 5
+// labels). The fixture (tools/maxvit_tiny_fixture.py) is a SELF-CONTAINED
+// float64 numpy oracle (timm/coatnet are not installed offline; MaxViT is not
+// in transformers). Exercises the conv-BN-fold stem + MBConv + SE, BLOCK
+// attention (window-local partition), GRID attention (the strided/dilated grid
+// partition - the genuinely-new TNNetGatherTokens permutation), the
+// relative-position bias, and the head. Asserts the (1,1,num_labels) logits
+// match the oracle < 1e-4.
+procedure TTestNeuralPretrained.TestMaxViTLogitParity;
+var
+  NN: TNNet;
+  Config: TMaxViTConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, LogitsArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildMaxViTFromSafeTensors(
+    FixturePath('tiny_maxvit.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_maxvit_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output size = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Size);
+
+    RefJson.LoadFromFile(FixturePath('tiny_maxvit_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    LogitsArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ChanCnt] -
+        LogitsArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadSwinV2ConfigFromJSONFile on the committed pico SwinV2 config.
+procedure TTestNeuralPretrained.TestSwinV2ConfigFromJSONFile;
+var
+  Config: TSwinConfig;
+begin
+  Config := ReadSwinV2ConfigFromJSONFile(FixturePath('tiny_swinv2_config.json'));
+  AssertEquals('model_type', 'swinv2', Config.ModelType);
+  AssertEquals('image_size', 8, Config.ImageSize);
+  AssertEquals('patch_size', 2, Config.PatchSize);
+  AssertEquals('num_channels', 3, Config.NumChannels);
+  AssertEquals('embed_dim', 4, Config.EmbedDim);
+  AssertEquals('window_size', 2, Config.WindowSize);
+  AssertEquals('num_labels', 5, Config.NumLabels);
+  AssertEquals('num stages', 2, Length(Config.Depths));
+  AssertEquals('depth0', 2, Config.Depths[0]);
+  AssertEquals('depth1', 2, Config.Depths[1]);
+  AssertEquals('heads0', 2, Config.NumHeads[0]);
+  AssertEquals('heads1', 4, Config.NumHeads[1]);
+  AssertTrue('qkv_bias', Config.QkvBias);
+end;
+
+// Swin Transformer V2 image-classification parity test. tests/fixtures/
+// tiny_swinv2.* is a pico random-init Swinv2ForImageClassification (image 8,
+// patch 2 -> 4x4 grid, embed_dim 4, depths [2,2], num_heads [2,4], window 2, 5
+// labels). The fixture (tools/swinv2_tiny_fixture.py) uses the REAL HF Swinv2
+// model cast to float64 as the oracle. The config exercises the full SwinV2
+// path: cosine attention with a per-head clamped exp(logit_scale), the
+// continuous-position-bias MLP (cpb_mlp) evaluated at LOAD time, post-norm
+// residual ordering, reduction-then-norm patch merging, and the shifted-window
+// cyclic-shift mask (stage 0 even block W-MSA + odd block SW-MSA). Asserts the
+// (1,1,num_labels) logits match the HF reference < 1e-4 - exercising
+// TNNetSwinV2WindowAttention + SwinV2SetContinuousPositionBias.
+procedure TTestNeuralPretrained.TestSwinV2ImageClassificationParity;
+var
+  NN: TNNet;
+  Config: TSwinConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, LogitsArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildSwinV2FromSafeTensors(
+    FixturePath('tiny_swinv2.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_swinv2_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output size = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Size);
+
+    RefJson.LoadFromFile(FixturePath('tiny_swinv2_logits.json'));
     RefRoot := GetJSON(RefJson.Text);
     Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
     LogitsArr := TJSONArray(TJSONArray(
@@ -18133,6 +21866,170 @@ begin
   end;
 end;
 
+// Builds a SMALL trainable VGG-style feature extractor (2 conv+relu stages with
+// a maxpool between them, input error collection on) by hand and verifies that
+// ComputePerceptualLossAndGradient's GradImage matches central differences of
+// the scalar perceptual loss w.r.t. the Gen pixels at a handful of probes.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestPerceptualLossGradientCheck;
+var
+  NN: TNNet;
+  Gen, GenPert, Target, Grad: TNNetVolume;
+  Tap: array[0..4] of integer;
+  C1, C2: TNNetLayer;
+  W, H, Ch, i, p, ProbeCnt, Sz: integer;
+  epsilon, lossPlus, lossMinus, numGrad, anaGrad, maxRelErr, denom, relErr: TNeuralFloat;
+  Probes: array[0..6] of integer;
+
+  function PerceptualLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    g: TNNetVolume;
+  begin
+    g := nil;
+    Result := ComputePerceptualLossAndGradient(NN, Tap, AInput, Target, g, nil);
+    g.Free;
+  end;
+
+begin
+  RandSeed := 424242;
+  W := 8; H := 8; Ch := 3;
+  for i := 0 to 4 do Tap[i] := -1;
+  NN := TNNet.Create();
+  Gen := TNNetVolume.Create(W, H, Ch);
+  GenPert := TNNetVolume.Create(W, H, Ch);
+  Target := TNNetVolume.Create(W, H, Ch);
+  Grad := nil;
+  epsilon := 0.001;
+  try
+    // 4-arg input ctor (pError=1) so Layers[0].OutputError is full-size: the
+    // pixel gradient is read from it (input-gradient-test-needs-perror).
+    NN.AddLayer(TNNetInput.Create(W, H, Ch, 1));
+    TNNetInput(NN.GetLastLayer()).EnableErrorCollection();
+    // Stage 0: conv 3x3 pad1 -> relu (tap 0), then maxpool 2.
+    C1 := NN.AddLayer(TNNetConvolutionLinear.Create(6, 3, 1, 1, 0));
+    NN.AddLayer(TNNetReLU.Create());
+    Tap[0] := NN.GetLastLayer().LayerIdx;
+    NN.AddLayer(TNNetMaxPool.Create(2, 2, 0));
+    // Stage 1: conv 3x3 pad1 -> relu (tap 1).
+    C2 := NN.AddLayer(TNNetConvolutionLinear.Create(5, 3, 1, 1, 0));
+    NN.AddLayer(TNNetReLU.Create());
+    Tap[1] := NN.GetLastLayer().LayerIdx;
+    NN.SetLearningRate(0.0, 0.0);   // FROZEN feature extractor.
+    NN.SetBatchUpdate(true);
+
+    // Bounded random weights so FD truncation never dominates.
+    for i := 0 to C1.Neurons.Count - 1 do
+    begin
+      for p := 0 to C1.Neurons[i].Weights.Size - 1 do
+        C1.Neurons[i].Weights.Raw[p] := 0.3 * Sin(i * 1.7 + p * 0.6 + 0.2);
+      C1.Neurons[i].BiasWeight := 0.05 * (i - 3);
+    end;
+    for i := 0 to C2.Neurons.Count - 1 do
+    begin
+      for p := 0 to C2.Neurons[i].Weights.Size - 1 do
+        C2.Neurons[i].Weights.Raw[p] := 0.25 * Cos(i * 1.1 + p * 0.4 - 0.1);
+      C2.Neurons[i].BiasWeight := 0.04 * (i - 2);
+    end;
+    C1.FlushWeightCache();
+    C2.FlushWeightCache();
+
+    Sz := Gen.Size;
+    for i := 0 to Sz - 1 do
+    begin
+      Gen.Raw[i]    := Sin(i * 0.37) * 0.6 + 0.1;
+      Target.Raw[i] := Cos(i * 0.29) * 0.5 - 0.05;
+    end;
+
+    // Analytic gradient (loss return ignored here; Grad is the out param).
+    ComputePerceptualLossAndGradient(NN, Tap, Gen, Target, Grad, nil);
+    AssertTrue('Grad shape', (Grad.Size = Gen.Size));
+
+    // Probe a spread of pixels across channels/locations.
+    Probes[0] := 0; Probes[1] := 7; Probes[2] := 31;
+    Probes[3] := 64; Probes[4] := 100; Probes[5] := 150; Probes[6] := Sz - 1;
+    ProbeCnt := 7;
+    maxRelErr := 0;
+    for p := 0 to ProbeCnt - 1 do
+    begin
+      i := Probes[p];
+      GenPert.Copy(Gen);
+      GenPert.Raw[i] := Gen.Raw[i] + epsilon;
+      lossPlus := PerceptualLoss(GenPert);
+      GenPert.Raw[i] := Gen.Raw[i] - epsilon;
+      lossMinus := PerceptualLoss(GenPert);
+      numGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      anaGrad := Grad.Raw[i];
+      denom := Max(1.0, Max(Abs(numGrad), Abs(anaGrad)));
+      relErr := Abs(numGrad - anaGrad) / denom;
+      if relErr > maxRelErr then maxRelErr := relErr;
+      AssertTrue('Perceptual input grad at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numGrad) + ' ana=' + FloatToStr(anaGrad),
+        Abs(numGrad - anaGrad) < 0.01);
+    end;
+    // maxRelErr is surfaced via WriteLn for the report; not an assertion gate.
+    WriteLn('  [PerceptualLoss] max relative gradient error: ',
+      maxRelErr:0:6);
+  finally
+    NN.Free;
+    Gen.Free;
+    GenPert.Free;
+    Target.Free;
+    Grad.Free;
+  end;
+end;
+
+// Sanity: ComputePerceptualLossAndGradient(NN, taps, X, X) -> loss = 0, grad = 0
+// (mirrors the ComputeLPIPSDistance(x,x) == 0 invariant).
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestPerceptualLossSelfZero;
+var
+  NN: TNNet;
+  X, Grad: TNNetVolume;
+  Tap: array[0..4] of integer;
+  C1: TNNetLayer;
+  i, p, W, H, Ch: integer;
+  Loss, maxG: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  W := 8; H := 8; Ch := 3;
+  for i := 0 to 4 do Tap[i] := -1;
+  NN := TNNet.Create();
+  X := TNNetVolume.Create(W, H, Ch);
+  Grad := nil;
+  try
+    NN.AddLayer(TNNetInput.Create(W, H, Ch, 1));
+    TNNetInput(NN.GetLastLayer()).EnableErrorCollection();
+    C1 := NN.AddLayer(TNNetConvolutionLinear.Create(6, 3, 1, 1, 0));
+    NN.AddLayer(TNNetReLU.Create());
+    Tap[0] := NN.GetLastLayer().LayerIdx;
+    NN.AddLayer(TNNetMaxPool.Create(2, 2, 0));
+    NN.AddLayer(TNNetConvolutionLinear.Create(5, 3, 1, 1, 0));
+    NN.AddLayer(TNNetReLU.Create());
+    Tap[1] := NN.GetLastLayer().LayerIdx;
+    NN.SetLearningRate(0.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to C1.Neurons.Count - 1 do
+      for p := 0 to C1.Neurons[i].Weights.Size - 1 do
+        C1.Neurons[i].Weights.Raw[p] := 0.3 * Sin(i + p * 0.5);
+    C1.FlushWeightCache();
+    for i := 0 to X.Size - 1 do
+      X.Raw[i] := Sin(i * 0.41) * 0.5 + 0.1;
+
+    Loss := ComputePerceptualLossAndGradient(NN, Tap, X, X, Grad, nil);
+    AssertTrue('Perceptual loss(X,X) = ' + FloatToStr(Loss) + ' must be 0',
+      Abs(Loss) < 1e-9);
+    maxG := 0;
+    for i := 0 to Grad.Size - 1 do
+      if Abs(Grad.Raw[i]) > maxG then maxG := Abs(Grad.Raw[i]);
+    AssertTrue('Perceptual grad(X,X) max = ' + FloatToStr(maxG) + ' must be 0',
+      maxG < 1e-9);
+  finally
+    NN.Free;
+    X.Free;
+    Grad.Free;
+  end;
+end;
+
 // Verifies ReadVaeDecoderConfigFromJSONFile on the committed pico VAE config.
 procedure TTestNeuralPretrained.TestVaeDecoderConfigFromJSONFile;
 var
@@ -18239,6 +22136,120 @@ begin
   end;
 end;
 
+// Tiled VAE decode parity (diffusers enable_vae_tiling port). Two checks on the
+// committed pico decoder, built fully-convolutionally at TWO latent grids from
+// the SAME weights:
+//  (1) SINGLE-TILE identity: a latent exactly one tile wide decoded by
+//      TiledVaeDecode (one tile, no seams) must EXACTLY match the plain
+//      whole-image decode through a tile-sized net (<1e-4) -- this proves the
+//      crop/scale/place orchestration is correct.
+//  (2) MULTI-TILE interior: a larger latent decoded tiled vs decoded whole.
+//      The pico decoder's MID self-attention is GLOBAL (not translation-
+//      equivariant), so tiling is an APPROXIMATION (exactly as in diffusers);
+//      the interior match is therefore asserted at a loose-but-tight bound and
+//      the result must be finite. Seam feathering is exercised by the >1 tile.
+procedure TTestNeuralPretrained.TestTiledVaeDecodeParity;
+const
+  cTile = 8;        // tile latent edge == pico decoder LatentGrid
+  cWhole = 12;      // multi-tile latent edge
+  cOverlap = 0.25;
+var
+  CfgTile, CfgWhole: TVaeDecoderConfig;
+  TileNet, WholeNet: TNNet;
+  LatTile, LatWhole, Tiled, Whole: TNNetVolume;
+  Scale, i, x, y, d, lo: integer;
+  Diff, MaxDiff, IntDiff, MaxInt: TNeuralFloat;
+  AllOk: boolean;
+begin
+  RandSeed := 424242;
+  // Tile-sized net (LatentGrid = cTile) -- this is the decoder TiledVaeDecode
+  // runs each tile through.
+  CfgTile := ReadVaeDecoderConfigFromJSONFile(
+    FixturePath('tiny_vae_decoder_config.json'));
+  CfgTile.LatentGrid := cTile;
+  TileNet := BuildVaeDecoderFromSafeTensorsEx(
+    FixturePath('tiny_vae_decoder.safetensors'), CfgTile, {pTrainable=}false);
+  // Whole-image net at the larger grid, SAME weights (conv weights are grid-
+  // independent; only the Input/Output layer sizes differ).
+  CfgWhole := CfgTile; CfgWhole.LatentGrid := cWhole;
+  WholeNet := BuildVaeDecoderFromSafeTensorsEx(
+    FixturePath('tiny_vae_decoder.safetensors'), CfgWhole, {pTrainable=}false);
+
+  Scale := TileNet.GetLastLayer().Output.SizeX div cTile;
+  LatTile := TNNetVolume.Create;
+  LatWhole := TNNetVolume.Create;
+  Tiled := nil; Whole := TNNetVolume.Create;
+  try
+    AssertTrue('tile net built', TileNet <> nil);
+    AssertTrue('whole net built', WholeNet <> nil);
+
+    // ---- (1) single-tile identity ----
+    LatTile.ReSize(cTile, cTile, CfgTile.LatentChannels);
+    for i := 0 to LatTile.Size - 1 do LatTile.FData[i] := Sin(i * 0.37) * 0.6;
+    TileNet.Compute(LatTile);
+    Whole.Copy(TileNet.GetLastLayer().Output);   // plain decode reference
+    Tiled := TiledVaeDecode(TileNet, LatTile, cTile, cOverlap);
+    AssertEquals('single-tile out W', Whole.SizeX, Tiled.SizeX);
+    AssertEquals('single-tile out H', Whole.SizeY, Tiled.SizeY);
+    MaxDiff := 0;
+    for i := 0 to Whole.Size - 1 do
+    begin
+      Diff := Abs(Tiled.FData[i] - Whole.FData[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('single-tile identity max|diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+    Tiled.Free; Tiled := nil;
+
+    // ---- (2) multi-tile decode: finite + SEAMLESS ----
+    // The pico decoder's MID self-attention is GLOBAL, so a tiled decode is an
+    // APPROXIMATION of the whole decode (same caveat as diffusers); with an
+    // UNTRAINED random attention the whole-vs-tiled values diverge by O(signal)
+    // and an exact interior bound is not meaningful. What feathering MUST
+    // guarantee is that the seams are not visible as hard discontinuities: the
+    // largest adjacent-pixel jump that straddles a tile seam must be no worse
+    // than the largest adjacent-pixel jump anywhere in the image.
+    LatWhole.ReSize(cWhole, cWhole, CfgWhole.LatentChannels);
+    for i := 0 to LatWhole.Size - 1 do LatWhole.FData[i] := Sin(i * 0.21) * 0.6;
+    Tiled := TiledVaeDecode(TileNet, LatWhole, cTile, cOverlap);
+    AssertEquals('multi-tile out W', cWhole * Scale, Tiled.SizeX);
+    AssertEquals('multi-tile out H', cWhole * Scale, Tiled.SizeY);
+
+    AllOk := true;
+    for i := 0 to Tiled.Size - 1 do
+      if not ((Tiled.FData[i] < 1e30) and (Tiled.FData[i] > -1e30)) then
+        AllOk := false;
+    AssertTrue('multi-tile decode finite', AllOk);
+
+    // The interior seam in image space sits at column/row = stride*scale, where
+    // stride = tile - round(tile*overlap) = 8 - 2 = 6 latent -> 12 px. Compare
+    // the horizontal jump across that seam column to the global max horiz jump.
+    lo := (cTile - Round(cTile * cOverlap)) * Scale;  // first seam, image space
+    MaxInt := 0;  // max horizontal jump straddling the seam column
+    MaxDiff := 0; // max horizontal jump anywhere
+    for d := 0 to Tiled.Depth - 1 do
+      for y := 0 to Tiled.SizeY - 1 do
+        for x := 1 to Tiled.SizeX - 1 do
+        begin
+          IntDiff := Abs(Tiled[x, y, d] - Tiled[x - 1, y, d]);
+          if IntDiff > MaxDiff then MaxDiff := IntDiff;
+          if x = lo then
+            if IntDiff > MaxInt then MaxInt := IntDiff;
+        end;
+    // Seamlessness: the seam jump must not be the dominant discontinuity.
+    AssertTrue('seam horiz jump = ' + FloatToStr(MaxInt) +
+      ' must be <= global max horiz jump = ' + FloatToStr(MaxDiff),
+      MaxInt <= MaxDiff + 1e-4);
+  finally
+    Tiled.Free;
+    Whole.Free;
+    LatWhole.Free;
+    LatTile.Free;
+    WholeNet.Free;
+    TileNet.Free;
+  end;
+end;
+
 // Stable Diffusion VAE ENCODER parity test (diffusers AutoencoderKL encoder),
 // the mirror of TestVaeDecoderParity. tests/fixtures/tiny_vae_encoder.* is a
 // pico randomly-initialized encoder (block_out_channels [8,16],
@@ -18320,6 +22331,1052 @@ begin
     ImgInput.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestSDUNetConfigFromJSONFile;
+var
+  Config: TSDUNetConfig;
+begin
+  Config := ReadSDUNetConfigFromJSONFile(FixturePath('tiny_sd_unet_config.json'));
+  AssertEquals('model type', 'UNet2DConditionModel', Config.ModelType);
+  AssertEquals('num block out', 2, Config.NumBlockOut);
+  AssertEquals('block out 0', 16, Config.BlockOutChannels[0]);
+  AssertEquals('block out 1', 32, Config.BlockOutChannels[1]);
+  AssertEquals('layers per block', 1, Config.LayersPerBlock);
+  AssertEquals('cross dim', 12, Config.CrossAttentionDim);
+  AssertEquals('num heads', 2, Config.NumHeads);
+  AssertEquals('norm groups', 4, Config.NormNumGroups);
+  AssertEquals('latent grid', 8, Config.LatentGrid);
+  AssertEquals('time embed dim', 64, Config.TimeEmbedDim);
+  AssertTrue('down0 has attn', Config.DownHasAttn[0]);
+  AssertTrue('down1 no attn', not Config.DownHasAttn[1]);
+  AssertTrue('up0 no attn', not Config.UpHasAttn[0]);
+  AssertTrue('up1 has attn', Config.UpHasAttn[1]);
+end;
+
+// Stable Diffusion UNet parity test (diffusers UNet2DConditionModel).
+// tests/fixtures/tiny_sd_unet.* is a pico randomly-initialized UNet
+// (block_out_channels [16,32], down [CrossAttnDownBlock2D, DownBlock2D],
+// up [UpBlock2D, CrossAttnUpBlock2D], layers_per_block 1, cross_dim 12,
+// 2 heads, norm_num_groups 4, 8x8 latent, 4 in/out channels, text seq 5).
+// The generator tools/sd_unet_tiny_fixture.py builds a self-contained numpy
+// float64 oracle (diffusers is not installed) of the exact UNet forward. This
+// exercises conv_in, the sinusoidal+MLP timestep embedding with the [sin|cos]
+// -> [cos|sin] swap, the additive time injection inside each ResnetBlock2D,
+// the Transformer2DModel (proj_in/out + self-attn + text CROSS-attn over the
+// second TNNetInput + GEGLU FFN), down-path skip collection, the mid
+// resnet/cross-attn/resnet, the up-path skip concat + nearest upsample, and
+// conv_norm_out -> SiLU -> conv_out, end to end < 1e-4 vs the oracle on the
+// predicted noise for a fixed (latent, timestep, text-states) triple.
+procedure TTestNeuralPretrained.TestSDUNetParity;
+var
+  NN: TNNet;
+  Config: TSDUNetConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Latent, ChanArr, RowArr, NoiseArr, EncArr, EncRow: TJSONArray;
+  LatentInput, EncStates, Noise: TNNetVolume;
+  t: double;
+  Grid, ChanCnt, YCnt, XCnt, SCnt, DCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildSDUNetFromSafeTensors(
+    FixturePath('tiny_sd_unet.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_sd_unet_config.json'));
+  RefJson := TStringList.Create;
+  LatentInput := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    Grid := Config.LatentGrid;
+    AssertEquals('latent grid', Grid, NN.Layers[0].Output.SizeX);
+    RefJson.LoadFromFile(FixturePath('tiny_sd_unet_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Latent := TJSONArray(TJSONObject(RefRoot).Find('latent'));
+    NoiseArr := TJSONArray(TJSONObject(RefRoot).Find('noise'));
+    EncArr := TJSONArray(TJSONObject(RefRoot).Find('encoder_hidden_states'));
+    t := TJSONObject(RefRoot).Get('timestep', 0.0);
+    AssertTrue('latent present', Latent <> nil);
+    AssertEquals('output grid', Grid, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output channels', Config.OutChannels,
+      NN.GetLastLayer().Output.Depth);
+
+    // latent (C,H,W) -> CAI (x,y,depth) volume.
+    LatentInput.ReSize(Grid, Grid, Config.InChannels);
+    for ChanCnt := 0 to Config.InChannels - 1 do
+    begin
+      RowArr := TJSONArray(Latent.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+          LatentInput.FData[(YCnt * Grid + XCnt) * Config.InChannels + ChanCnt]
+            := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    // encoder_hidden_states (TextSeqLen, CrossDim) -> (SeqLen,1,CrossDim) volume.
+    EncStates.ReSize(Config.TextSeqLen, 1, Config.CrossAttentionDim);
+    for SCnt := 0 to Config.TextSeqLen - 1 do
+    begin
+      EncRow := TJSONArray(EncArr.Items[SCnt]);
+      for DCnt := 0 to Config.CrossAttentionDim - 1 do
+        EncStates.FData[SCnt * Config.CrossAttentionDim + DCnt] :=
+          EncRow.Items[DCnt].AsFloat;
+    end;
+
+    SDUNetDenoise(NN, Config, LatentInput, EncStates, t, Noise);
+
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.OutChannels - 1 do
+    begin
+      RowArr := TJSONArray(NoiseArr.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+        begin
+          RefVal := ChanArr.Items[XCnt].AsFloat;
+          GotVal := Noise.FData[(YCnt * Grid + XCnt) * Config.OutChannels +
+            ChanCnt];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('predicted noise: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    LatentInput.Free;
+    EncStates.Free;
+    Noise.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// SD2.x / SDXL variant parity: use_linear_projection=True (proj_in/out are
+// nn.Linear [out,in] not 1x1 convs) AND transformer_layers_per_block=2 (each
+// Transformer2DModel stacks 2 BasicTransformerBlocks). The oracle in
+// tools/sd_unet_linproj_tiny_fixture.py mirrors both. Verifies the config flags
+// parse, the net builds with the stacked/linear path, and the predicted noise
+// matches the numpy float64 oracle end-to-end (< 1e-4).
+procedure TTestNeuralPretrained.TestSDUNetLinearProjParity;
+var
+  NN: TNNet;
+  Config: TSDUNetConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Latent, ChanArr, RowArr, NoiseArr, EncArr, EncRow: TJSONArray;
+  LatentInput, EncStates, Noise: TNNetVolume;
+  t: double;
+  Grid, ChanCnt, YCnt, XCnt, SCnt, DCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildSDUNetFromSafeTensors(
+    FixturePath('tiny_sd_unet_linproj.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_sd_unet_linproj_config.json'));
+  RefJson := TStringList.Create;
+  LatentInput := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertTrue('use_linear_projection parsed', Config.UseLinearProjection);
+    AssertEquals('transformer_layers_per_block[0]', 2,
+      Config.TransformerLayersPerBlock[0]);
+    AssertEquals('transformer_layers_per_block[1]', 2,
+      Config.TransformerLayersPerBlock[1]);
+    Grid := Config.LatentGrid;
+    AssertEquals('latent grid', Grid, NN.Layers[0].Output.SizeX);
+    RefJson.LoadFromFile(FixturePath('tiny_sd_unet_linproj_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Latent := TJSONArray(TJSONObject(RefRoot).Find('latent'));
+    NoiseArr := TJSONArray(TJSONObject(RefRoot).Find('noise'));
+    EncArr := TJSONArray(TJSONObject(RefRoot).Find('encoder_hidden_states'));
+    t := TJSONObject(RefRoot).Get('timestep', 0.0);
+    AssertTrue('latent present', Latent <> nil);
+    AssertEquals('output grid', Grid, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output channels', Config.OutChannels,
+      NN.GetLastLayer().Output.Depth);
+
+    LatentInput.ReSize(Grid, Grid, Config.InChannels);
+    for ChanCnt := 0 to Config.InChannels - 1 do
+    begin
+      RowArr := TJSONArray(Latent.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+          LatentInput.FData[(YCnt * Grid + XCnt) * Config.InChannels + ChanCnt]
+            := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    EncStates.ReSize(Config.TextSeqLen, 1, Config.CrossAttentionDim);
+    for SCnt := 0 to Config.TextSeqLen - 1 do
+    begin
+      EncRow := TJSONArray(EncArr.Items[SCnt]);
+      for DCnt := 0 to Config.CrossAttentionDim - 1 do
+        EncStates.FData[SCnt * Config.CrossAttentionDim + DCnt] :=
+          EncRow.Items[DCnt].AsFloat;
+    end;
+
+    SDUNetDenoise(NN, Config, LatentInput, EncStates, t, Noise);
+
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.OutChannels - 1 do
+    begin
+      RowArr := TJSONArray(NoiseArr.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+        begin
+          RefVal := ChanArr.Items[XCnt].AsFloat;
+          GotVal := Noise.FData[(YCnt * Grid + XCnt) * Config.OutChannels +
+            ChanCnt];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('predicted noise: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    LatentInput.Free;
+    EncStates.Free;
+    Noise.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// SDXL micro-conditioning parity: addition_embed_type=="text_time" turns on the
+// add_embedding path -- time_ids (6-vector) are sinusoidally projected, concat'd
+// with the pooled CLIP text embedding into add_embeds, mapped by a 2-layer MLP
+// (Linear->SiLU->Linear) and ADDED into the timestep embedding before the ResNet
+// blocks. The oracle in tools/sd_unet_sdxl_tiny_fixture.py mirrors that path.
+// Verifies the config knobs parse (UseAddEmbedding / AdditionTimeEmbedDim /
+// AdditionEmbedTextDim / AddEmbedsInputDim), the extra add_embeds input exists,
+// and SDUNetDenoiseSDXL's predicted noise matches the numpy float64 oracle (<1e-4).
+procedure TTestNeuralPretrained.TestSDUNetSDXLParity;
+var
+  NN: TNNet;
+  Config: TSDUNetConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Latent, ChanArr, RowArr, NoiseArr, EncArr, EncRow, TidArr, PoolArr: TJSONArray;
+  LatentInput, EncStates, PooledText, Noise: TNNetVolume;
+  t: double;
+  TimeIds: array[0..5] of TNeuralFloat;
+  Grid, ChanCnt, YCnt, XCnt, SCnt, DCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildSDUNetFromSafeTensors(
+    FixturePath('tiny_sd_unet_sdxl.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_sd_unet_sdxl_config.json'));
+  RefJson := TStringList.Create;
+  LatentInput := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create;
+  PooledText := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertTrue('addition_embed_type parsed', Config.UseAddEmbedding);
+    AssertEquals('addition_time_embed_dim', 8, Config.AdditionTimeEmbedDim);
+    AssertEquals('pooled text dim', 12, Config.AdditionEmbedTextDim);
+    AssertEquals('add_embeds input dim', 60, Config.AddEmbedsInputDim);
+    Grid := Config.LatentGrid;
+    AssertEquals('latent grid', Grid, NN.Layers[0].Output.SizeX);
+    RefJson.LoadFromFile(FixturePath('tiny_sd_unet_sdxl_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Latent := TJSONArray(TJSONObject(RefRoot).Find('latent'));
+    NoiseArr := TJSONArray(TJSONObject(RefRoot).Find('noise'));
+    EncArr := TJSONArray(TJSONObject(RefRoot).Find('encoder_hidden_states'));
+    TidArr := TJSONArray(TJSONObject(RefRoot).Find('time_ids'));
+    PoolArr := TJSONArray(TJSONObject(RefRoot).Find('pooled_text'));
+    t := TJSONObject(RefRoot).Get('timestep', 0.0);
+    AssertTrue('latent present', Latent <> nil);
+    AssertEquals('output grid', Grid, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output channels', Config.OutChannels,
+      NN.GetLastLayer().Output.Depth);
+
+    LatentInput.ReSize(Grid, Grid, Config.InChannels);
+    for ChanCnt := 0 to Config.InChannels - 1 do
+    begin
+      RowArr := TJSONArray(Latent.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+          LatentInput.FData[(YCnt * Grid + XCnt) * Config.InChannels + ChanCnt]
+            := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    EncStates.ReSize(Config.TextSeqLen, 1, Config.CrossAttentionDim);
+    for SCnt := 0 to Config.TextSeqLen - 1 do
+    begin
+      EncRow := TJSONArray(EncArr.Items[SCnt]);
+      for DCnt := 0 to Config.CrossAttentionDim - 1 do
+        EncStates.FData[SCnt * Config.CrossAttentionDim + DCnt] :=
+          EncRow.Items[DCnt].AsFloat;
+    end;
+    PooledText.ReSize(1, 1, Config.AdditionEmbedTextDim);
+    for DCnt := 0 to Config.AdditionEmbedTextDim - 1 do
+      PooledText.FData[DCnt] := PoolArr.Items[DCnt].AsFloat;
+    for DCnt := 0 to 5 do TimeIds[DCnt] := TidArr.Items[DCnt].AsFloat;
+
+    SDUNetDenoiseSDXL(NN, Config, LatentInput, EncStates, PooledText, t,
+      TimeIds, Noise);
+
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.OutChannels - 1 do
+    begin
+      RowArr := TJSONArray(NoiseArr.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+        begin
+          RefVal := ChanArr.Items[XCnt].AsFloat;
+          GotVal := Noise.FData[(YCnt * Grid + XCnt) * Config.OutChannels +
+            ChanCnt];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('predicted noise: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    LatentInput.Free;
+    EncStates.Free;
+    PooledText.Free;
+    Noise.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Per-block attention-head parity: the diffusers config "attention_head_dim" is
+// a LIST (one per-head DIM per resolution block; SDXL-style) so the head COUNT
+// varies per block. The pico fixture (tools/sd_unet_perblock_heads_tiny_fixture)
+// has block_out_channels=[8,16] with attention_head_dim=[2,8] -> heads=[4,2], and
+// attends BOTH down blocks AND both up blocks so the differing per-block head
+// count is exercised on the down/mid/up paths. Verifies the list parses into
+// HeadsPerBlock (differing values), the net builds, and SDUNetDenoise's predicted
+// noise matches the numpy float64 oracle end-to-end (< 1e-4).
+procedure TTestNeuralPretrained.TestSDUNetPerBlockHeadsParity;
+var
+  NN: TNNet;
+  Config: TSDUNetConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Latent, ChanArr, RowArr, NoiseArr, EncArr, EncRow: TJSONArray;
+  LatentInput, EncStates, Noise: TNNetVolume;
+  t: double;
+  Grid, ChanCnt, YCnt, XCnt, SCnt, DCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildSDUNetFromSafeTensors(
+    FixturePath('tiny_sd_unet_pbheads.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_sd_unet_pbheads_config.json'));
+  RefJson := TStringList.Create;
+  LatentInput := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    // attention_head_dim parsed as a LIST -> differing per-block head counts.
+    AssertEquals('heads_per_block[0]', 4, Config.HeadsPerBlock[0]);
+    AssertEquals('heads_per_block[1]', 2, Config.HeadsPerBlock[1]);
+    AssertTrue('per-block head counts must DIFFER',
+      Config.HeadsPerBlock[0] <> Config.HeadsPerBlock[1]);
+    // NumHeads stays the block-0 value for back-compat.
+    AssertEquals('NumHeads back-compat = block 0', 4, Config.NumHeads);
+    Grid := Config.LatentGrid;
+    AssertEquals('latent grid', Grid, NN.Layers[0].Output.SizeX);
+    RefJson.LoadFromFile(FixturePath('tiny_sd_unet_pbheads_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Latent := TJSONArray(TJSONObject(RefRoot).Find('latent'));
+    NoiseArr := TJSONArray(TJSONObject(RefRoot).Find('noise'));
+    EncArr := TJSONArray(TJSONObject(RefRoot).Find('encoder_hidden_states'));
+    t := TJSONObject(RefRoot).Get('timestep', 0.0);
+    AssertTrue('latent present', Latent <> nil);
+    AssertEquals('output grid', Grid, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output channels', Config.OutChannels,
+      NN.GetLastLayer().Output.Depth);
+
+    LatentInput.ReSize(Grid, Grid, Config.InChannels);
+    for ChanCnt := 0 to Config.InChannels - 1 do
+    begin
+      RowArr := TJSONArray(Latent.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+          LatentInput.FData[(YCnt * Grid + XCnt) * Config.InChannels + ChanCnt]
+            := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    EncStates.ReSize(Config.TextSeqLen, 1, Config.CrossAttentionDim);
+    for SCnt := 0 to Config.TextSeqLen - 1 do
+    begin
+      EncRow := TJSONArray(EncArr.Items[SCnt]);
+      for DCnt := 0 to Config.CrossAttentionDim - 1 do
+        EncStates.FData[SCnt * Config.CrossAttentionDim + DCnt] :=
+          EncRow.Items[DCnt].AsFloat;
+    end;
+
+    SDUNetDenoise(NN, Config, LatentInput, EncStates, t, Noise);
+
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.OutChannels - 1 do
+    begin
+      RowArr := TJSONArray(NoiseArr.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+        begin
+          RefVal := ChanArr.Items[XCnt].AsFloat;
+          GotVal := Noise.FData[(YCnt * Grid + XCnt) * Config.OutChannels +
+            ChanCnt];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('predicted noise: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    LatentInput.Free;
+    EncStates.Free;
+    Noise.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Blended-diffusion inpainting smoke (SDUNetDenoiseInpaint): VAE-encode a
+// synthetic source to z0, downsample a right-half-hole mask to the latent grid,
+// run the blended reverse loop on the pico SD UNet, then assert the KEPT region
+// of the final latent equals z0 exactly (pixel-faithful by the final composite)
+// and the masked HOLE region was changed by the denoiser. Mirrors the
+// TestSDUNetParity / TestVaeRoundTrip pico-fixture pattern; the nets are random
+// so this validates the driver path, not photorealism.
+procedure TTestNeuralPretrained.TestDiffusionInpaintSmoke;
+const
+  cT = 50;
+  cSteps = 4;
+var
+  Enc: TNNet;
+  UNet: TNNet;
+  EncCfg: TVaeDecoderConfig;
+  UCfg: TSDUNetConfig;
+  Sched: TNNetDiffusionScheduler;
+  ImgIn, Z0, Mask, EncStates, Latents, Scratch, KnownNoised: TNNetVolume;
+  Schedule: array of integer;
+  ImgGrid, i, x, y, c, sIdx: integer;
+  m, d, maxKeepErr, maskedDiff: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  Enc := BuildVaeEncoderFromSafeTensors(
+    FixturePath('tiny_vae_encoder.safetensors'), EncCfg,
+    {pTrainable=}true, FixturePath('tiny_vae_encoder_config.json'));
+  UNet := BuildSDUNetFromSafeTensors(
+    FixturePath('tiny_sd_unet.safetensors'), UCfg,
+    {pTrainable=}true, FixturePath('tiny_sd_unet_config.json'));
+  Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps);
+  ImgGrid := EncCfg.LatentGrid shl (EncCfg.NumBlockOut - 1);
+  ImgIn := TNNetVolume.Create(ImgGrid, ImgGrid, EncCfg.OutChannels);
+  Z0 := TNNetVolume.Create;
+  Mask := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create(UCfg.TextSeqLen, 1, UCfg.CrossAttentionDim);
+  Latents := TNNetVolume.Create;
+  Scratch := TNNetVolume.Create;
+  KnownNoised := TNNetVolume.Create;
+  Schedule := nil;
+  try
+    AssertEquals('VAE latent grid matches UNet grid',
+      UCfg.LatentGrid, EncCfg.LatentGrid);
+    // synthetic source ramp.
+    for y := 0 to ImgGrid - 1 do
+      for x := 0 to ImgGrid - 1 do
+      begin
+        ImgIn[x, y, 0] := (x / Max(1, ImgGrid - 1)) * 2.0 - 1.0;
+        ImgIn[x, y, 1] := (y / Max(1, ImgGrid - 1)) * 2.0 - 1.0;
+        ImgIn[x, y, 2] := Sin((x + y) * 0.6) * 0.8;
+      end;
+    Enc.Compute(ImgIn);
+    Z0.Copy(Enc.GetLastLayer().Output);
+    AssertEquals('z0 grid', UCfg.LatentGrid, Z0.SizeX);
+    // mask: right half = hole (1), left half = keep (0).
+    Mask.ReSize(Z0);
+    for y := 0 to Z0.SizeY - 1 do
+      for x := 0 to Z0.SizeX - 1 do
+        for c := 0 to Z0.Depth - 1 do
+          if x >= (Z0.SizeX div 2) then Mask[x, y, c] := 1.0
+          else Mask[x, y, c] := 0.0;
+    for i := 0 to EncStates.Size - 1 do
+      EncStates.FData[i] := RandG(0, 1) * 0.5;
+    SetLength(Schedule, cSteps + 1);
+    for sIdx := 0 to cSteps do
+      Schedule[sIdx] := Round(cT * (1.0 - sIdx / cSteps));
+
+    SDUNetDenoiseInpaint(UNet, UCfg, Z0, Mask, EncStates, Sched,
+      Schedule, smDDIM, 0.0, Latents, Scratch, KnownNoised);
+
+    maxKeepErr := 0;
+    maskedDiff := 0;
+    for i := 0 to Latents.Size - 1 do
+    begin
+      m := Mask.FData[i];
+      d := Abs(Latents.FData[i] - Z0.FData[i]);
+      if m < 0.5 then begin if d > maxKeepErr then maxKeepErr := d; end
+      else maskedDiff := maskedDiff + d;
+    end;
+    AssertTrue('kept region pixel-faithful: max|diff| = ' +
+      FloatToStr(maxKeepErr) + ' must be < 1e-4', maxKeepErr < 1e-4);
+    AssertTrue('masked hole regenerated: total change = ' +
+      FloatToStr(maskedDiff) + ' must be > 1e-6', maskedDiff > 1e-6);
+    // no NaN/Inf in the result.
+    for i := 0 to Latents.Size - 1 do
+      AssertTrue('finite latent',
+        not (IsNan(Latents.FData[i]) or IsInfinite(Latents.FData[i])));
+  finally
+    SetLength(Schedule, 0);
+    ImgIn.Free; Z0.Free; Mask.Free; EncStates.Free;
+    Latents.Free; Scratch.Free; KnownNoised.Free;
+    Sched.Free; Enc.Free; UNet.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestControlNetConfigFromJSONFile;
+var
+  Config: TControlNetConfig;
+begin
+  Config := ReadControlNetConfigFromJSONFile(
+    FixturePath('tiny_controlnet_config.json'));
+  AssertEquals('base model type', 'UNet2DConditionModel', Config.Base.ModelType);
+  AssertEquals('num block out', 2, Config.Base.NumBlockOut);
+  AssertEquals('block out 0', 16, Config.Base.BlockOutChannels[0]);
+  AssertEquals('block out 1', 32, Config.Base.BlockOutChannels[1]);
+  AssertEquals('layers per block', 1, Config.Base.LayersPerBlock);
+  AssertEquals('cross dim', 12, Config.Base.CrossAttentionDim);
+  AssertEquals('num heads', 2, Config.Base.NumHeads);
+  AssertEquals('latent grid', 8, Config.Base.LatentGrid);
+  AssertTrue('down0 has attn', Config.Base.DownHasAttn[0]);
+  AssertTrue('down1 no attn', not Config.Base.DownHasAttn[1]);
+  AssertEquals('cond channels', 3, Config.CondChannels);
+  AssertEquals('num cond embed out', 2, Config.NumCondEmbedOut);
+  AssertEquals('cond embed out 0', 8, Config.CondEmbedOut[0]);
+  AssertEquals('cond embed out 1', 16, Config.CondEmbedOut[1]);
+  AssertEquals('cond grid', 16, Config.CondGrid);
+  // taps: conv_in + 1 down resnet(attn) + 1 downsampler + 1 down resnet = 4.
+  AssertEquals('num down residuals', 4, Config.NumDownResiduals);
+end;
+
+// ControlNet spatial-conditioning parity test (diffusers ControlNetModel).
+// tests/fixtures/tiny_controlnet.* is a pico randomly-initialized ControlNet
+// (the SD UNet encoder + mid block copy, a controlnet_cond_embedding hint stem,
+// and zero-conv residual taps filled with small random weights). The generator
+// tools/controlnet_tiny_fixture.py builds a self-contained numpy float64 oracle
+// (diffusers is not installed) of the exact ControlNet forward and pins the
+// down_block_res_samples + mid_block_res_sample for a fixed (latent, timestep,
+// text-states, control-image) tuple. This exercises conv_in + the hint stem
+// (added to conv_in), the encoder down/mid blocks (REUSE of the SD UNet block
+// builders), and the per-resolution zero-conv taps, end to end < 1e-4 vs the
+// oracle on the residual tensors that get injected into the frozen base UNet.
+procedure TTestNeuralPretrained.TestControlNetParity;
+var
+  NN: TNNet;
+  Config: TControlNetConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Latent, ChanArr, RowArr, EncArr, EncRow, CondArr, DownArr, ResEntry: TJSONArray;
+  MidArr: TJSONArray;
+  LatentInput, EncStates, Cond, MidResidual: TNNetVolume;
+  DownResiduals: array of TNNetVolume;
+  t: double;
+  Grid, CondGrid, ChanCnt, YCnt, XCnt, SCnt, DCnt, ri, Ch, Hh, Ww: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildControlNetFromSafeTensors(
+    FixturePath('tiny_controlnet.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_controlnet_config.json'));
+  RefJson := TStringList.Create;
+  LatentInput := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create;
+  Cond := TNNetVolume.Create;
+  MidResidual := TNNetVolume.Create;
+  RefRoot := nil;
+  SetLength(DownResiduals, Config.NumDownResiduals);
+  for ri := 0 to Config.NumDownResiduals - 1 do
+    DownResiduals[ri] := TNNetVolume.Create;
+  try
+    AssertTrue('net built', NN <> nil);
+    Grid := Config.Base.LatentGrid;
+    CondGrid := Config.CondGrid;
+    RefJson.LoadFromFile(FixturePath('tiny_controlnet_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Latent := TJSONArray(TJSONObject(RefRoot).Find('latent'));
+    EncArr := TJSONArray(TJSONObject(RefRoot).Find('encoder_hidden_states'));
+    CondArr := TJSONArray(TJSONObject(RefRoot).Find('controlnet_cond'));
+    DownArr := TJSONArray(TJSONObject(RefRoot).Find('down_block_res_samples'));
+    MidArr := TJSONArray(TJSONObject(RefRoot).Find('mid_block_res_sample'));
+    t := TJSONObject(RefRoot).Get('timestep', 0.0);
+    AssertTrue('latent present', Latent <> nil);
+    AssertEquals('down residual count', Config.NumDownResiduals, DownArr.Count);
+
+    // latent (C,H,W) -> CAI (x,y,depth) volume.
+    LatentInput.ReSize(Grid, Grid, Config.Base.InChannels);
+    for ChanCnt := 0 to Config.Base.InChannels - 1 do
+    begin
+      RowArr := TJSONArray(Latent.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+          LatentInput.FData[(YCnt * Grid + XCnt) * Config.Base.InChannels + ChanCnt]
+            := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    // encoder_hidden_states (TextSeqLen, CrossDim) -> (SeqLen,1,CrossDim).
+    EncStates.ReSize(Config.Base.TextSeqLen, 1, Config.Base.CrossAttentionDim);
+    for SCnt := 0 to Config.Base.TextSeqLen - 1 do
+    begin
+      EncRow := TJSONArray(EncArr.Items[SCnt]);
+      for DCnt := 0 to Config.Base.CrossAttentionDim - 1 do
+        EncStates.FData[SCnt * Config.Base.CrossAttentionDim + DCnt] :=
+          EncRow.Items[DCnt].AsFloat;
+    end;
+    // controlnet_cond (C,H,W) -> (x,y,depth) volume.
+    Cond.ReSize(CondGrid, CondGrid, Config.CondChannels);
+    for ChanCnt := 0 to Config.CondChannels - 1 do
+    begin
+      RowArr := TJSONArray(CondArr.Items[ChanCnt]);
+      for YCnt := 0 to CondGrid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to CondGrid - 1 do
+          Cond.FData[(YCnt * CondGrid + XCnt) * Config.CondChannels + ChanCnt]
+            := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+
+    ControlNetResiduals(NN, Config, LatentInput, EncStates, Cond, t,
+      DownResiduals, MidResidual);
+
+    MaxDiff := 0;
+    // down_block_res_samples: each (Ch,H,W).
+    for ri := 0 to Config.NumDownResiduals - 1 do
+    begin
+      ResEntry := TJSONArray(DownArr.Items[ri]);
+      Ch := ResEntry.Count;
+      for ChanCnt := 0 to Ch - 1 do
+      begin
+        RowArr := TJSONArray(ResEntry.Items[ChanCnt]);
+        Hh := RowArr.Count;
+        for YCnt := 0 to Hh - 1 do
+        begin
+          ChanArr := TJSONArray(RowArr.Items[YCnt]);
+          Ww := ChanArr.Count;
+          for XCnt := 0 to Ww - 1 do
+          begin
+            RefVal := ChanArr.Items[XCnt].AsFloat;
+            GotVal := DownResiduals[ri].FData[(YCnt * Ww + XCnt) * Ch + ChanCnt];
+            Diff := Abs(GotVal - RefVal);
+            if Diff > MaxDiff then MaxDiff := Diff;
+          end;
+        end;
+      end;
+    end;
+    // mid_block_res_sample (Ch,H,W).
+    Ch := MidArr.Count;
+    for ChanCnt := 0 to Ch - 1 do
+    begin
+      RowArr := TJSONArray(MidArr.Items[ChanCnt]);
+      Hh := RowArr.Count;
+      for YCnt := 0 to Hh - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        Ww := ChanArr.Count;
+        for XCnt := 0 to Ww - 1 do
+        begin
+          RefVal := ChanArr.Items[XCnt].AsFloat;
+          GotVal := MidResidual.FData[(YCnt * Ww + XCnt) * Ch + ChanCnt];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('controlnet residuals: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    LatentInput.Free;
+    EncStates.Free;
+    Cond.Free;
+    MidResidual.Free;
+    for ri := 0 to Config.NumDownResiduals - 1 do DownResiduals[ri].Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestIPAdapterConfigFromJSONFile;
+var
+  Config: TIPAdapterConfig;
+begin
+  Config := ReadIPAdapterConfigFromJSONFile(
+    FixturePath('tiny_ip_adapter_config.json'));
+  AssertEquals('model type', 'IPAdapterModel', Config.ModelType);
+  AssertEquals('clip dim', 10, Config.ClipEmbeddingsDim);
+  AssertEquals('cross dim', 6, Config.CrossAttentionDim);
+  AssertEquals('num image tokens', 4, Config.NumImageTokens);
+  AssertEquals('channels', 8, Config.Channels);
+  AssertEquals('num heads', 2, Config.NumHeads);
+  AssertEquals('hidden tokens', 9, Config.HiddenTokens);
+  AssertEquals('text seq len', 5, Config.TextSeqLen);
+  AssertEquals('attn index', 1, Config.AttnIndex);
+  AssertTrue('conditioning scale ~0.7',
+    Abs(Config.ConditioningScale - 0.7) < 1e-6);
+end;
+
+// IP-Adapter decoupled-cross-attention parity test (h94/IP-Adapter
+// ip-adapter_sd15, the plain non-Plus variant). tests/fixtures/tiny_ip_adapter.*
+// is a pico randomly-initialized IP-Adapter: the diffusers ImageProjModel
+// (image_proj.proj Linear + norm LayerNorm) plus ONE isolated decoupled
+// cross-attention block (the shared base-UNet Q/text-K/V/out + the EXTRA
+// to_k_ip / to_v_ip image K/V). The generator tools/ip_adapter_tiny_fixture.py
+// builds a self-contained numpy float64 oracle (diffusers is not installed) of
+//   out = Attn(Q,K_txt,V_txt) + scale*Attn(Q,K_img,V_img)
+// for a fixed (image_embed, unet hidden state, text states) tuple and pins the
+// image tokens + the combined cross-attn output. This exercises the two
+// genuinely-new pieces -- the image_proj loader and the decoupled second-K/V
+// cross-attention path (TNNetCrossAttention reused for the image stream) -- end
+// to end < 1e-4 vs the oracle. v1 scope: isolated block; full per-block UNet
+// tapping is a follow-up.
+procedure TTestNeuralPretrained.TestIPAdapterParity;
+var
+  NN: TNNet;
+  Config: TIPAdapterConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  HidArr, HidRow, TxtArr, TxtRow, ImgArr, OutArr, OutRow: TJSONArray;
+  Hidden, Text, ImageEmbed, Output: TNNetVolume;
+  SCnt, DCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildIPAdapterFromSafeTensors(
+    FixturePath('tiny_ip_adapter.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_ip_adapter_config.json'));
+  RefJson := TStringList.Create;
+  Hidden := TNNetVolume.Create;
+  Text := TNNetVolume.Create;
+  ImageEmbed := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    RefJson.LoadFromFile(FixturePath('tiny_ip_adapter_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    HidArr := TJSONArray(TJSONObject(RefRoot).Find('hidden_state'));
+    TxtArr := TJSONArray(TJSONObject(RefRoot).Find('text_states'));
+    ImgArr := TJSONArray(TJSONObject(RefRoot).Find('image_embeds'));
+    OutArr := TJSONArray(TJSONObject(RefRoot).Find('cross_attn_output'));
+    AssertTrue('hidden present', HidArr <> nil);
+
+    // hidden_state (HiddenTokens, Channels) -> (HiddenTokens,1,Channels).
+    Hidden.ReSize(Config.HiddenTokens, 1, Config.Channels);
+    for SCnt := 0 to Config.HiddenTokens - 1 do
+    begin
+      HidRow := TJSONArray(HidArr.Items[SCnt]);
+      for DCnt := 0 to Config.Channels - 1 do
+        Hidden.FData[SCnt * Config.Channels + DCnt] :=
+          HidRow.Items[DCnt].AsFloat;
+    end;
+    // text_states (TextSeqLen, CrossDim) -> (TextSeqLen,1,CrossDim).
+    Text.ReSize(Config.TextSeqLen, 1, Config.CrossAttentionDim);
+    for SCnt := 0 to Config.TextSeqLen - 1 do
+    begin
+      TxtRow := TJSONArray(TxtArr.Items[SCnt]);
+      for DCnt := 0 to Config.CrossAttentionDim - 1 do
+        Text.FData[SCnt * Config.CrossAttentionDim + DCnt] :=
+          TxtRow.Items[DCnt].AsFloat;
+    end;
+    // image_embeds (ClipDim,) -> (ClipDim,1,1).
+    ImageEmbed.ReSize(Config.ClipEmbeddingsDim, 1, 1);
+    for DCnt := 0 to Config.ClipEmbeddingsDim - 1 do
+      ImageEmbed.FData[DCnt] := ImgArr.Items[DCnt].AsFloat;
+
+    IPAdapterCrossAttention(NN, Config, Hidden, Text, ImageEmbed, Output);
+
+    // combined cross-attn output (HiddenTokens, Channels).
+    MaxDiff := 0;
+    for SCnt := 0 to Config.HiddenTokens - 1 do
+    begin
+      OutRow := TJSONArray(OutArr.Items[SCnt]);
+      for DCnt := 0 to Config.Channels - 1 do
+      begin
+        RefVal := OutRow.Items[DCnt].AsFloat;
+        GotVal := Output.FData[SCnt * Config.Channels + DCnt];
+        Diff := Abs(GotVal - RefVal);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('ip-adapter cross-attn: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Hidden.Free;
+    Text.Free;
+    ImageEmbed.Free;
+    Output.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// End-to-end base-UNet-plus-ControlNet single denoise step. Builds a CONTROL-
+// ENABLED SD UNet (BuildSDUNet pWithControl=true) from the tiny_sd_unet fixture
+// and a ControlNet from the tiny_controlnet fixture (config-compatible: shared
+// block_out_channels [16,32], latent grid 8, text seq 5, cross dim 12), runs
+// ControlNetResiduals then SDUNetDenoiseWithControl and asserts the predicted
+// noise matches the numpy float64 combined oracle (tools/controlnet_combined_
+// fixture.py: down_block_res_samples + mid added into the decoder skips, as
+// diffusers StableDiffusionControlNetPipeline). max|diff| < 1e-4.
+procedure TTestNeuralPretrained.TestControlNetCombinedParity;
+var
+  UNet, CNet: TNNet;
+  UCfg: TSDUNetConfig;
+  CCfg: TControlNetConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  LatentArr, EncArr, EncRow, CondJArr, NoiseArr, RowArr, ChanArr: TJSONArray;
+  LatentInput, EncStates, Cond, Noise, MidResidual: TNNetVolume;
+  DownResiduals: array of TNNetVolume;
+  t: double;
+  Grid, CondGrid, DownCnt, ChanCnt, YCnt, XCnt, SCnt, DCnt, ri: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  // base UNet built WITH control injection (extra zero-default skip inputs).
+  UNet := BuildSDUNetFromSafeTensorsEx(FixturePath('tiny_sd_unet.safetensors'),
+    ReadSDUNetConfigFromJSONFile(FixturePath('tiny_sd_unet_config.json')),
+    {pTrainable=}true, {pWithControl=}true);
+  UCfg := ReadSDUNetConfigFromJSONFile(FixturePath('tiny_sd_unet_config.json'));
+  CNet := BuildControlNetFromSafeTensors(
+    FixturePath('tiny_controlnet.safetensors'), CCfg,
+    {pTrainable=}true, FixturePath('tiny_controlnet_config.json'));
+  RefJson := TStringList.Create;
+  LatentInput := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create;
+  Cond := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  MidResidual := TNNetVolume.Create;
+  RefRoot := nil;
+  DownCnt := CCfg.NumDownResiduals;
+  SetLength(DownResiduals, DownCnt);
+  for ri := 0 to DownCnt - 1 do DownResiduals[ri] := TNNetVolume.Create;
+  try
+    AssertTrue('base UNet built', UNet <> nil);
+    AssertTrue('controlnet built', CNet <> nil);
+    // base UNet skip-input count must match the controlnet down residual count.
+    AssertEquals('skip control input count', DownCnt,
+      SDUNetControlDownCount(UCfg));
+    Grid := UCfg.LatentGrid;
+    CondGrid := CCfg.CondGrid;
+    RefJson.LoadFromFile(FixturePath('tiny_controlnet_combined_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    LatentArr := TJSONArray(TJSONObject(RefRoot).Find('latent'));
+    EncArr := TJSONArray(TJSONObject(RefRoot).Find('encoder_hidden_states'));
+    CondJArr := TJSONArray(TJSONObject(RefRoot).Find('controlnet_cond'));
+    NoiseArr := TJSONArray(TJSONObject(RefRoot).Find('noise'));
+    t := TJSONObject(RefRoot).Get('timestep', 0.0);
+    AssertEquals('combined down residual count', DownCnt,
+      TJSONObject(RefRoot).Get('num_down_residuals', 0));
+
+    // latent (C,H,W) -> CAI (x,y,depth) volume.
+    LatentInput.ReSize(Grid, Grid, UCfg.InChannels);
+    for ChanCnt := 0 to UCfg.InChannels - 1 do
+    begin
+      RowArr := TJSONArray(LatentArr.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+          LatentInput.FData[(YCnt * Grid + XCnt) * UCfg.InChannels + ChanCnt]
+            := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    // controlnet_cond (C,H,W) -> (x,y,depth) volume.
+    Cond.ReSize(CondGrid, CondGrid, CCfg.CondChannels);
+    for ChanCnt := 0 to CCfg.CondChannels - 1 do
+    begin
+      RowArr := TJSONArray(CondJArr.Items[ChanCnt]);
+      for YCnt := 0 to CondGrid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to CondGrid - 1 do
+          Cond.FData[(YCnt * CondGrid + XCnt) * CCfg.CondChannels + ChanCnt]
+            := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    EncStates.ReSize(UCfg.TextSeqLen, 1, UCfg.CrossAttentionDim);
+    for SCnt := 0 to UCfg.TextSeqLen - 1 do
+    begin
+      EncRow := TJSONArray(EncArr.Items[SCnt]);
+      for DCnt := 0 to UCfg.CrossAttentionDim - 1 do
+        EncStates.FData[SCnt * UCfg.CrossAttentionDim + DCnt] :=
+          EncRow.Items[DCnt].AsFloat;
+    end;
+
+    // 1) run the ControlNet to get the residuals.
+    ControlNetResiduals(CNet, CCfg, LatentInput, EncStates, Cond, t,
+      DownResiduals, MidResidual);
+    // 2) run the base UNet with those residuals injected into the skips.
+    SDUNetDenoiseWithControl(UNet, UCfg, LatentInput, EncStates, t,
+      DownResiduals, MidResidual, Noise);
+
+    MaxDiff := 0;
+    for ChanCnt := 0 to UCfg.OutChannels - 1 do
+    begin
+      RowArr := TJSONArray(NoiseArr.Items[ChanCnt]);
+      for YCnt := 0 to Grid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Grid - 1 do
+        begin
+          RefVal := ChanArr.Items[XCnt].AsFloat;
+          GotVal := Noise.FData[(YCnt * Grid + XCnt) * UCfg.OutChannels + ChanCnt];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('combined noise: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    LatentInput.Free;
+    EncStates.Free;
+    Cond.Free;
+    Noise.Free;
+    MidResidual.Free;
+    for ri := 0 to DownCnt - 1 do DownResiduals[ri].Free;
+    RefJson.Free;
+    CNet.Free;
+    UNet.Free;
+  end;
+end;
+
+// T2I-Adapter feature-injection parity test (diffusers T2IAdapter full_adapter,
+// the lighter ControlNet successor). tests/fixtures/tiny_t2i_adapter.* is a pico
+// randomly-initialized adapter (PixelUnshuffle hint stem + a 2-stage ResNet-ish
+// ladder). tools/t2i_adapter_tiny_fixture.py builds a self-contained numpy
+// float64 oracle (diffusers is not installed) of the exact adapter forward and
+// pins the per-stage feature pyramid for a fixed hint image. This exercises the
+// TNNetSpaceToDepth PixelUnshuffle (with the conv_in input-channel permutation),
+// conv_in, the AvgPool downsampling ladder, the 1x1 in_conv channel changes and
+// the adapter ResnetBlocks (block1 3x3 -> ReLU -> block2 1x1 -> + identity), end
+// to end < 1e-4 vs the oracle on the feature maps that get added into the SD
+// UNet down-block hidden state.
+procedure TTestNeuralPretrained.TestT2IAdapterParity;
+var
+  NN: TNNet;
+  Config: TT2IAdapterConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CondArr, RowArr, ChanArr, FeatArr, FeatEntry: TJSONArray;
+  Cond: TNNetVolume;
+  Features: array of TNNetVolume;
+  CondGrid, ChanCnt, YCnt, XCnt, fi, Ch, Hh, Ww: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildT2IAdapterFromSafeTensors(
+    FixturePath('tiny_t2i_adapter.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_t2i_adapter_config.json'));
+  RefJson := TStringList.Create;
+  Cond := TNNetVolume.Create;
+  RefRoot := nil;
+  SetLength(Features, Config.NumChannels);
+  for fi := 0 to Config.NumChannels - 1 do
+    Features[fi] := TNNetVolume.Create;
+  try
+    AssertTrue('net built', NN <> nil);
+    CondGrid := Config.CondGrid;
+    RefJson.LoadFromFile(FixturePath('tiny_t2i_adapter_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CondArr := TJSONArray(TJSONObject(RefRoot).Find('cond'));
+    FeatArr := TJSONArray(TJSONObject(RefRoot).Find('features'));
+    AssertTrue('cond present', CondArr <> nil);
+    AssertEquals('feature count', Config.NumChannels, FeatArr.Count);
+
+    // hint (C,H,W) -> CAI (x,y,depth) volume.
+    Cond.ReSize(CondGrid, CondGrid, Config.CondChannels);
+    for ChanCnt := 0 to Config.CondChannels - 1 do
+    begin
+      RowArr := TJSONArray(CondArr.Items[ChanCnt]);
+      for YCnt := 0 to CondGrid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to CondGrid - 1 do
+          Cond.FData[(YCnt * CondGrid + XCnt) * Config.CondChannels + ChanCnt]
+            := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+
+    T2IAdapterFeatures(NN, Config, Cond, Features);
+
+    MaxDiff := 0;
+    for fi := 0 to Config.NumChannels - 1 do
+    begin
+      FeatEntry := TJSONArray(FeatArr.Items[fi]);
+      Ch := FeatEntry.Count;
+      for ChanCnt := 0 to Ch - 1 do
+      begin
+        RowArr := TJSONArray(FeatEntry.Items[ChanCnt]);
+        Hh := RowArr.Count;
+        for YCnt := 0 to Hh - 1 do
+        begin
+          ChanArr := TJSONArray(RowArr.Items[YCnt]);
+          Ww := ChanArr.Count;
+          for XCnt := 0 to Ww - 1 do
+          begin
+            RefVal := ChanArr.Items[XCnt].AsFloat;
+            GotVal := Features[fi].FData[(YCnt * Ww + XCnt) * Ch + ChanCnt];
+            Diff := Abs(GotVal - RefVal);
+            if Diff > MaxDiff then MaxDiff := Diff;
+          end;
+        end;
+      end;
+    end;
+    AssertTrue('T2I-Adapter feature parity < 1e-4 (max|diff|=' +
+      FloatToStr(MaxDiff) + ')', MaxDiff < 1e-4);
+  finally
+    for fi := 0 to Config.NumChannels - 1 do Features[fi].Free;
+    NN.Free;
+    Cond.Free;
+    RefJson.Free;
+    if RefRoot <> nil then RefRoot.Free;
   end;
 end;
 
@@ -18883,6 +23940,166 @@ begin
   end;
 end;
 
+// Parity test for the TEXT-conditioned (Infinity-style) VAR importer
+// (BuildVARFromSafeTensors with text_cond=true) against the committed tiny
+// float64 numpy oracle (tools/make_pico_var_textcond_fixture.py: hidden 16,
+// depth 2, heads 2, vocab 12, pyramid [1,2] -> 5 tokens, text_dim 10, 3 text
+// tokens). The PixArt-style text-cond analogue of the class-conditional path:
+// the single class token is replaced by caller-supplied TEXT-ENCODER states fed
+// to the net's THIRD TNNetInput; conditioning enters via (a) per-block
+// CROSS-ATTENTION (image tokens attend to caption-projected text) and (b) a
+// POOLED-TEXT adaLN vector. The next-scale block-causal SELF-attention is
+// unchanged. Asserts < 1e-4 on EVERY scale's logits. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestVARTextCondParity;
+var
+  NN: TNNet;
+  Config: TVARConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, IdxArr, TextArr, LogitsArr: TJSONArray;
+  CaseObj: TJSONObject;
+  TokInput, TextStates, Output: TNNetVolume;
+  RefVal, GotVal, Diff, MaxDiff: double;
+  CaseCnt, pos, v, t, ch, FlatIdx: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildVARFromSafeTensors(
+    FixturePath('tiny_var_textcond.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_var_textcond_config.json'));
+  RefJson := TStringList.Create;
+  TokInput := TNNetVolume.Create;
+  TextStates := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertTrue('config is text-cond', Config.TextCond);
+    VARFillScaleIds(NN, Config);
+    RefJson.LoadFromFile(FixturePath('tiny_var_textcond_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertTrue('cases present', CasesArr <> nil);
+    for CaseCnt := 0 to CasesArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(CasesArr.Items[CaseCnt]);
+      IdxArr := TJSONArray(CaseObj.Find('idx'));
+      TextArr := TJSONArray(CaseObj.Find('text'));      // flat (TextSeqLen, TextDim)
+      LogitsArr := TJSONArray(CaseObj.Find('logits'));  // flat (SeqLen, vocab)
+      // input0: token index sequence (SeqLen,1,1).
+      TokInput.ReSize(Config.SeqLen, 1, 1);
+      for pos := 0 to Config.SeqLen - 1 do
+        TokInput.FData[pos] := IdxArr.Items[pos].AsInteger;
+      // input2: the text-encoder states (TextSeqLen,1,TextDim).
+      TextStates.ReSize(Config.TextSeqLen, 1, Config.TextDim);
+      for t := 0 to Config.TextSeqLen - 1 do
+        for ch := 0 to Config.TextDim - 1 do
+          TextStates.FData[t * Config.TextDim + ch] :=
+            TextArr.Items[t * Config.TextDim + ch].AsFloat;
+      VARTextInput(NN).Output.Copy(TextStates);
+      VARFillScaleIds(NN, Config);
+      NN.Compute(TokInput);
+      Output := NN.GetLastLayer().Output;
+      AssertEquals('logits seq', Config.SeqLen, Output.SizeX);
+      AssertEquals('logits vocab', Config.VocabSize, Output.Depth);
+      for pos := 0 to Config.SeqLen - 1 do
+        for v := 0 to Config.VocabSize - 1 do
+        begin
+          FlatIdx := pos * Config.VocabSize + v;
+          RefVal := LogitsArr.Items[FlatIdx].AsFloat;
+          GotVal := Output.FData[pos * Config.VocabSize + v];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+    end;
+    AssertTrue('VAR text-cond logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    TokInput.Free;
+    TextStates.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// End-to-end smoke for the VAR coarse-to-fine next-scale SAMPLING loop
+// (VARGenerate) + the residual/discrete VQ decode to pixels
+// (DecodeVARTokensToImage), the same chain examples/VARGenerate runs. Uses the
+// pico VAR fixture (random weights) and the MATCHED pico VQModel
+// (tiny_var_vqmodel.*, latent grid 3 = VAR final patch_num, codebook 12 = VAR
+// vocab). With a fixed seed the loop must:
+//   - return a full SeqLen (14) token sequence with every token a legal vocab
+//     id and every legal VQ id;
+//   - decode that final 3x3 grid to a finite 6x6x3 RGB image;
+//   - be DETERMINISTIC across two runs at the same seed (greedy argmax).
+// This is a wiring/regression smoke (random weights -> not a real image), the
+// online-budget counterpart of TestLatentTextToImageSmoke. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestVARGenerateSmoke;
+var
+  VarNet: TNNet;
+  VarCfg: TVARConfig;
+  VqModel: TNNetVqModel;
+  VqCfg: TVqModelConfig;
+  Tokens, Tokens2: TNeuralIntegerArray;
+  Image: TNNetVolume;
+  i, FinalP, FinalStart: integer;
+  AllFinite, Deterministic: boolean;
+begin
+  VarNet := BuildVARFromSafeTensors(FixturePath('tiny_var.safetensors'), VarCfg,
+    {pTrainable=}false, FixturePath('tiny_var_config.json'));
+  VqModel := BuildVqModelFromSafeTensors(
+    FixturePath('tiny_var_vqmodel.safetensors'), VqCfg, {pTrainable=}false,
+    FixturePath('tiny_var_vqmodel_config.json'));
+  Image := TNNetVolume.Create;
+  try
+    AssertTrue('VAR net built', VarNet <> nil);
+    AssertTrue('VQ model built', VqModel <> nil);
+    FinalP := VarCfg.PatchNums[VarCfg.NumScales - 1];
+    AssertEquals('VQ grid = VAR final patch_num', FinalP, VqCfg.LatentGrid);
+    AssertTrue('VQ codebook >= VAR vocab',
+      VqCfg.NumVqEmbeddings >= VarCfg.VocabSize);
+
+    // ---- the coarse-to-fine next-scale sampling loop (greedy, deterministic) ----
+    RandSeed := 424242;
+    VARGenerate(VarNet, VarCfg, {ClassId=}0, Tokens, {Temperature=}0.0);
+    AssertEquals('token sequence length = SeqLen', VarCfg.SeqLen, Length(Tokens));
+    for i := 0 to High(Tokens) do
+    begin
+      AssertTrue('token ' + IntToStr(i) + ' >= 0', Tokens[i] >= 0);
+      AssertTrue('token ' + IntToStr(i) + ' < vocab', Tokens[i] < VarCfg.VocabSize);
+    end;
+
+    // ---- residual/discrete VQ decode of the final 3x3 token grid -> RGB ----
+    DecodeVARTokensToImage(VqModel, VarCfg, Tokens, Image);
+    AssertEquals('decoded image grid X', FinalP * 2, Image.SizeX);
+    AssertEquals('decoded image grid Y', FinalP * 2, Image.SizeY);
+    AssertEquals('decoded image channels', 3, Image.Depth);
+    AllFinite := true;
+    for i := 0 to Image.Size - 1 do
+      if (Image.FData[i] <> Image.FData[i]) or (Abs(Image.FData[i]) > 1e30) then
+        AllFinite := false;
+    AssertTrue('decoded image finite', AllFinite);
+
+    // ---- determinism: greedy argmax must repeat bit-for-bit at the same seed ----
+    RandSeed := 424242;
+    VARGenerate(VarNet, VarCfg, {ClassId=}0, Tokens2, {Temperature=}0.0);
+    AssertEquals('second run same length', Length(Tokens), Length(Tokens2));
+    Deterministic := true;
+    for i := 0 to High(Tokens) do
+      if Tokens[i] <> Tokens2[i] then Deterministic := false;
+    AssertTrue('greedy VARGenerate is deterministic', Deterministic);
+
+    // The final-scale tokens (the decoded VQ grid) are the last FinalP^2 entries.
+    FinalStart := VARScaleStart(VarCfg, VarCfg.NumScales - 1);
+    AssertEquals('final scale start offset', VarCfg.SeqLen - FinalP * FinalP,
+      FinalStart);
+  finally
+    Image.Free;
+    VqModel.Free;
+    VarNet.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestPixArtConfigFromJSONFile;
 var
   Config: TPixArtConfig;
@@ -19126,6 +24343,117 @@ begin
   end;
 end;
 
+procedure TTestNeuralPretrained.TestCogVideoXParity;
+var
+  NN, VaeNN: TNNet;
+  Config: TCogVideoXConfig;
+  Latent, TextStates, Decoded, VaeLatent: TNNetVolume;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  DenArr, VaeArr: TJSONArray;
+  CaseObj: TJSONObject;
+  LatArr, TextArr, EpsArr, VLatArr, DecArr: TJSONArray;
+  LV, T, GH, GW, CaseCnt, idx, i, ft, hh, ww, c: integer;
+  tval, RefVal, GotVal, Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  Config := ReadCogVideoXConfigFromJSONFile(
+    FixturePath('tiny_cogvideox_config.json'));
+  T := Config.NumFrames; GH := Config.GridHeight; GW := Config.GridWidth;
+  LV := T * GH * GW;
+  NN := BuildCogVideoXFromSafeTensorsEx(
+    FixturePath('tiny_cogvideox.safetensors'), Config, {pTrainable=}true);
+  VaeNN := BuildCogVideoXVaeDecoderFromSafeTensorsEx(
+    FixturePath('tiny_cogvideox.safetensors'), Config, {pTrainable=}true);
+  RefJson := TStringList.Create;
+  Latent := TNNetVolume.Create;
+  TextStates := TNNetVolume.Create;
+  Decoded := TNNetVolume.Create;
+  VaeLatent := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  try
+    AssertTrue('cogvideox denoiser built', NN <> nil);
+    AssertTrue('cogvideox vae built', VaeNN <> nil);
+    RefJson.LoadFromFile(FixturePath('tiny_cogvideox_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    // ---- (A) denoiser parity ----
+    DenArr := TJSONArray(TJSONObject(RefRoot).Find('denoiser'));
+    AssertTrue('denoiser cases present', DenArr <> nil);
+    for CaseCnt := 0 to DenArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(DenArr.Items[CaseCnt]);
+      LatArr := TJSONArray(CaseObj.Find('latent'));  // flat (T,GH,GW,Cin)
+      tval := CaseObj.Find('t').AsFloat;
+      TextArr := TJSONArray(CaseObj.Find('text'));   // flat (Lt,TextDim)
+      EpsArr := TJSONArray(CaseObj.Find('eps'));      // flat (T,GH,GW,Cout)
+      // latent -> (LV,1,Cin): flat (T,GH,GW,Cin) IS token-major already.
+      Latent.ReSize(LV, 1, Config.InChannels);
+      for i := 0 to LV * Config.InChannels - 1 do
+        Latent.FData[i] := LatArr.Items[i].AsFloat;
+      TextStates.ReSize(Config.TextSeqLen, 1, Config.TextDim);
+      for i := 0 to Config.TextSeqLen * Config.TextDim - 1 do
+        TextStates.FData[i] := TextArr.Items[i].AsFloat;
+      CogVideoXConditioning(NN, Config, tval, TextStates);
+      NN.Compute(Latent);
+      // output is (LV,1,Cout) token-major == flat (T,GH,GW,Cout).
+      for i := 0 to LV * Config.OutChannels - 1 do
+      begin
+        RefVal := EpsArr.Items[i].AsFloat;
+        GotVal := NN.GetLastLayer().Output.FData[i];
+        Diff := Abs(GotVal - RefVal);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('CogVideoX denoiser: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+    // ---- (B) VAE-decode parity ----
+    VaeArr := TJSONArray(TJSONObject(RefRoot).Find('vae'));
+    AssertTrue('vae cases present', VaeArr <> nil);
+    for CaseCnt := 0 to VaeArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(VaeArr.Items[CaseCnt]);
+      VLatArr := TJSONArray(CaseObj.Find('latent'));   // flat (T,GH,GW,Clat)
+      DecArr := TJSONArray(CaseObj.Find('decoded'));   // flat (T,GH,GW,Vout)
+      // pack into the (T, HW, Clat) channel-major layout DecodeCogVideoXVae wants.
+      VaeLatent.ReSize(T, GH * GW, Config.VaeLatentChannels);
+      idx := 0;
+      for ft := 0 to T - 1 do
+        for hh := 0 to GH - 1 do
+          for ww := 0 to GW - 1 do
+            for c := 0 to Config.VaeLatentChannels - 1 do
+            begin
+              VaeLatent[ft, hh * GW + ww, c] := VLatArr.Items[idx].AsFloat;
+              Inc(idx);
+            end;
+      DecodeCogVideoXVae(VaeNN, Config, VaeLatent, Decoded);
+      idx := 0;
+      for ft := 0 to T - 1 do
+        for hh := 0 to GH - 1 do
+          for ww := 0 to GW - 1 do
+            for c := 0 to Config.VaeOutChannels - 1 do
+            begin
+              RefVal := DecArr.Items[idx].AsFloat;
+              GotVal := Decoded[ft, hh * GW + ww, c];
+              Diff := Abs(GotVal - RefVal);
+              if Diff > MaxDiff then MaxDiff := Diff;
+              Inc(idx);
+            end;
+    end;
+    AssertTrue('CogVideoX denoiser+VAE: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Latent.Free;
+    TextStates.Free;
+    Decoded.Free;
+    VaeLatent.Free;
+    RefJson.Free;
+    NN.Free;
+    VaeNN.Free;
+  end;
+end;
+
 // End-to-end latent text-to-image SMOKE test (examples/LatentTextToImage Steps
 // 1 & 2): the imported PixArt transformer drives the existing
 // TNNetDiffusionScheduler over a few DDIM steps from latent noise with
@@ -19147,6 +24475,9 @@ var
   PixCfg: TPixArtConfig;
   VaeCfg: TVaeDecoderConfig;
   Scheduler: TNNetDiffusionScheduler;
+  LCMScheduler: TNNetLCMScheduler;
+  LCMDenoiser: TLCMPixArtDenoiser;
+  LCMLatent, LCMImage: TNNetVolume;
   Latent, TextStates, NullStates, EpsCond, EpsUncond, EpsGuided, Image: TNNetVolume;
   StepCnt, T, TPrev, x, yy, c, HW: integer;
   AllFinite: boolean;
@@ -19159,6 +24490,10 @@ begin
     FixturePath('tiny_vae_decoder_ltt.safetensors'), VaeCfg,
     {pTrainable=}true, FixturePath('tiny_vae_decoder_ltt_config.json'));
   Scheduler := TNNetDiffusionScheduler.Create(100, dsLinear, dpEps);
+  LCMScheduler := TNNetLCMScheduler.Create(100, dsLinear, dpEps);
+  LCMDenoiser := TLCMPixArtDenoiser.Create;
+  LCMLatent := TNNetVolume.Create;
+  LCMImage := TNNetVolume.Create;
   Latent := TNNetVolume.Create;
   TextStates := TNNetVolume.Create;
   NullStates := TNNetVolume.Create;
@@ -19225,6 +24560,39 @@ begin
         for x := 0 to Image.SizeX - 1 do
           if not (Image[x, yy, c] = Image[x, yy, c]) then AllFinite := false;
     AssertTrue('decoded image is finite', AllFinite);
+
+    // ---- LCM few-step sampler path (opt-in --lcm in the example) ----
+    // TNNetLCMScheduler.LCMSample drives the consistency function with a SINGLE
+    // conditional model pass per step (guidance baked in -- NO cond/uncond CFG
+    // double pass), in ~4 steps over the SAME pico fixtures. The pico weights
+    // are not LCM-distilled, so this asserts the few-step loop RUNS and produces
+    // a finite, correctly-shaped latent/image (a wiring smoke), not teacher parity.
+    RandSeed := 424242;
+    LCMDenoiser.Net := PixArtNet;
+    LCMDenoiser.Cfg := PixCfg;
+    LCMDenoiser.Prompt := TextStates;
+    LCMLatent.ReSize(HW, HW, PixCfg.InChannels);
+    LCMLatent.RandomizeGaussian(1.0);
+    LCMScheduler.LCMSample(LCMLatent, @LCMDenoiser.Denoise, {NumSteps=}4, tsUniform);
+    AssertEquals('LCM latent grid', HW, LCMLatent.SizeX);
+    AssertEquals('LCM latent channels', PixCfg.InChannels, LCMLatent.Depth);
+    AllFinite := true;
+    for c := 0 to PixCfg.InChannels - 1 do
+      for yy := 0 to HW - 1 do
+        for x := 0 to HW - 1 do
+          if not (LCMLatent[x, yy, c] = LCMLatent[x, yy, c]) then AllFinite := false;
+    AssertTrue('LCM latent is finite', AllFinite);
+    // Decode the LCM latent through the same VAE -> finite RGB image.
+    VaeNet.Compute(LCMLatent);
+    LCMImage.Copy(VaeNet.GetLastLayer().Output);
+    AssertEquals('LCM image channels', VaeCfg.OutChannels, LCMImage.Depth);
+    AssertEquals('LCM image grid', HW * 2, LCMImage.SizeX);
+    AllFinite := true;
+    for c := 0 to LCMImage.Depth - 1 do
+      for yy := 0 to LCMImage.SizeY - 1 do
+        for x := 0 to LCMImage.SizeX - 1 do
+          if not (LCMImage[x, yy, c] = LCMImage[x, yy, c]) then AllFinite := false;
+    AssertTrue('LCM decoded image is finite', AllFinite);
   finally
     Image.Free;
     EpsGuided.Free;
@@ -19233,6 +24601,10 @@ begin
     NullStates.Free;
     TextStates.Free;
     Latent.Free;
+    LCMImage.Free;
+    LCMLatent.Free;
+    LCMDenoiser.Free;
+    LCMScheduler.Free;
     Scheduler.Free;
     VaeNet.Free;
     PixArtNet.Free;
@@ -19241,10 +24613,11 @@ end;
 
 // Parity test for the Real-ESRGAN / ESRGAN RRDBNet (scale x4) importer against
 // the committed tiny float64 numpy oracle (tools/rrdbnet_tiny_fixture.py).
-procedure TTestNeuralPretrained.TestRRDBNetParity;
+// Shared body: compares NN.Compute(io.input) against the io oracle image.
+// Caller owns NN (freed here). IoFixture is the io.json fixture stem.
+procedure TTestNeuralPretrained.RunRRDBNetParity(NN: TNNet;
+  const Config: TRRDBNetConfig; const IoFixture: string);
 var
-  NN: TNNet;
-  Config: TRRDBNetConfig;
   RefRoot: TJSONData;
   RefJson: TStringList;
   InputArr, ChanArr, RowArr, ImgArr: TJSONArray;
@@ -19253,17 +24626,13 @@ var
   ChanCnt, YCnt, XCnt: integer;
   Diff, MaxDiff, RefVal, GotVal: double;
 begin
-  RandSeed := 424242;
-  NN := BuildRRDBNetFromSafeTensors(
-    FixturePath('tiny_rrdbnet.safetensors'), Config,
-    {pTrainable=}true, FixturePath('tiny_rrdbnet_config.json'));
   RefJson := TStringList.Create;
   ImgInput := TNNetVolume.Create;
   RefRoot := nil;
   try
     AssertTrue('net built', NN <> nil);
     AssertEquals('input grid', Config.InputSize, NN.Layers[0].Output.SizeX);
-    RefJson.LoadFromFile(FixturePath('tiny_rrdbnet_io.json'));
+    RefJson.LoadFromFile(FixturePath(IoFixture));
     RefRoot := GetJSON(RefJson.Text);
     InputArr := TJSONArray(TJSONObject(RefRoot).Find('input'));
     ImgArr := TJSONArray(TJSONObject(RefRoot).Find('image'));
@@ -19317,6 +24686,44 @@ begin
     RefJson.Free;
     NN.Free;
   end;
+end;
+
+procedure TTestNeuralPretrained.TestRRDBNetParity;
+var
+  Config: TRRDBNetConfig;
+begin
+  RandSeed := 424242;
+  RunRRDBNetParity(BuildRRDBNetFromSafeTensors(
+    FixturePath('tiny_rrdbnet.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_rrdbnet_config.json')),
+    Config, 'tiny_rrdbnet_io.json');
+end;
+
+// Same scale x4 net, but loaded from a Real-ESRGAN-style .pth whose state_dict
+// is nested under a 'params_ema' top-level key (TNNetTorchBinReader unwrap).
+// Must match the SAME oracle as the safetensors path (< 1e-4).
+procedure TTestNeuralPretrained.TestRRDBNetParityPth;
+var
+  Config: TRRDBNetConfig;
+begin
+  RandSeed := 424242;
+  RunRRDBNetParity(BuildRRDBNetFromSafeTensors(
+    FixturePath('tiny_rrdbnet.pth'), Config,
+    {pTrainable=}true, FixturePath('tiny_rrdbnet_config.json')),
+    Config, 'tiny_rrdbnet_io.json');
+end;
+
+// scale x2 RRDBNet (one upsample stage; conv_up2 absent) vs its float64 oracle.
+procedure TTestNeuralPretrained.TestRRDBNetParityScale2;
+var
+  Config: TRRDBNetConfig;
+begin
+  RandSeed := 424242;
+  RunRRDBNetParity(BuildRRDBNetFromSafeTensors(
+    FixturePath('tiny_rrdbnet_x2.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_rrdbnet_x2_config.json')),
+    Config, 'tiny_rrdbnet_x2_io.json');
+  AssertEquals('scale is 2', 2, Config.Scale);
 end;
 
 // Verifies ReadNAFNetConfigFromJSONFile on the committed pico config.
@@ -19784,6 +25191,119 @@ begin
   end;
 end;
 
+// Parity test for the COMPLEX transposed-conv upsample head
+// (use_complex_transposed_convolution=true): the rd64-refined decoder head is a
+// 3x3 Conv2d + ReLU + two non-overlapping ConvTranspose2d (each a DepthToSpace
+// upsample by k = patch_size // 4) ending at one channel, instead of the single
+// ConvTranspose2d v1 ships. Fixture tools/clipseg_complex_tiny_fixture.py
+// (patch_size 8 -> k 2, grid 2x2 -> 8x8 mask, reduce_dim 6). Asserts the mask
+// logits match the HF float64 oracle < 1e-4.
+procedure TTestNeuralPretrained.TestCLIPSegComplexUpsampleParity;
+var
+  VisionNet, TextNet, DecoderNet: TNNet;
+  Config: TCLIPSegConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  PixelArr, ChanArr, RowArr, LogitArr, IdArr, CondArr: TJSONArray;
+  ImgInput, TokenIds, Logits: TNNetVolume;
+  LogitSize, SeqLen: integer;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  BuildCLIPSegFromSafeTensors(
+    FixturePath('tiny_clipseg_complex.safetensors'),
+    VisionNet, TextNet, DecoderNet, Config,
+    {TextSeqLen=}5, {pTrainable=}true,
+    FixturePath('tiny_clipseg_complex_config.json'));
+  RefJson := TStringList.Create;
+  ImgInput := TNNetVolume.Create;
+  TokenIds := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('vision net built', VisionNet <> nil);
+    AssertTrue('text net built', TextNet <> nil);
+    AssertTrue('decoder net built', DecoderNet <> nil);
+    AssertTrue('complex head flag parsed', Config.UseComplexTransposedConv);
+    AssertEquals('tap count', 2, Length(Config.TapLayerIdx));
+
+    RefJson.LoadFromFile(FixturePath('tiny_clipseg_complex_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    PixelArr := TJSONArray(TJSONObject(RefRoot).Find('pixel'));
+    IdArr := TJSONArray(TJSONObject(RefRoot).Find('input_ids'));
+    LogitArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    CondArr := TJSONArray(TJSONObject(RefRoot).Find('cond'));
+    LogitSize := TJSONObject(RefRoot).Get('logit_size', 0);
+    // The complex head output is grid * k * k = (image/patch) * (patch//4)^2,
+    // NOT image_size; here 2 * 2 * 2 = 8.
+    AssertTrue('oracle logit size positive', LogitSize > 0);
+
+    ImgInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(PixelArr.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImgInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels + ChanCnt] :=
+            ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    SeqLen := IdArr.Count;
+    TokenIds.ReSize(SeqLen, 1, 1);
+    for XCnt := 0 to SeqLen - 1 do
+      TokenIds.FData[XCnt] := IdArr.Items[XCnt].AsInteger;
+
+    // Conditional embedding first.
+    TextNet.Compute(TokenIds);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.ProjectionDim - 1 do
+    begin
+      RefVal := CondArr.Items[ChanCnt].AsFloat;
+      GotVal := TextNet.GetLastLayer().Output[
+        ClipTextEosPosition(TokenIds, Config.EosTokenId), 0, ChanCnt];
+      Diff := Abs(GotVal - RefVal);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('conditional embed: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // Full pipeline through the complex head.
+    RunCLIPSeg(VisionNet, TextNet, DecoderNet, Config,
+      ImgInput, TokenIds, Logits);
+    AssertEquals('mask grid X', LogitSize, Logits.SizeX);
+    AssertEquals('mask grid Y', LogitSize, Logits.SizeY);
+    AssertEquals('mask depth', 1, Logits.Depth);
+
+    MaxDiff := 0;
+    for YCnt := 0 to LogitSize - 1 do
+    begin
+      RowArr := TJSONArray(LogitArr.Items[YCnt]);
+      for XCnt := 0 to LogitSize - 1 do
+      begin
+        RefVal := RowArr.Items[XCnt].AsFloat;
+        GotVal := Logits[XCnt, YCnt, 0];
+        Diff := Abs(GotVal - RefVal);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('complex mask logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImgInput.Free;
+    TokenIds.Free;
+    Logits.Free;
+    RefJson.Free;
+    VisionNet.Free;
+    TextNet.Free;
+    DecoderNet.Free;
+  end;
+end;
+
 // Verifies ReadStyleGAN2ConfigFromJSONFile on the committed pico config.
 procedure TTestNeuralPretrained.TestStyleGAN2ConfigFromJSONFile;
 var
@@ -19975,6 +25495,107 @@ begin
   end;
 end;
 
+// Verifies ReadDINOv3ConfigFromJSONFile on the committed DINOv3 pico config.
+procedure TTestNeuralPretrained.TestDINOv3ConfigFromJSONFile;
+var
+  Config: TDINOv3Config;
+begin
+  Config := ReadDINOv3ConfigFromJSONFile(FixturePath('tiny_dinov3_config.json'));
+  AssertEquals('model_type', 'dinov3_vit', Config.ModelType);
+  AssertEquals('hidden_size', 16, Config.HiddenSize);
+  AssertEquals('intermediate_size', 64, Config.IntermediateSize);
+  AssertEquals('num_hidden_layers', 2, Config.NumLayers);
+  AssertEquals('num_attention_heads', 4, Config.NumHeads);
+  AssertEquals('image_size', 12, Config.ImageSize);
+  AssertEquals('patch_size', 4, Config.PatchSize);
+  AssertEquals('num_channels', 3, Config.NumChannels);
+  AssertEquals('num_register_tokens', 2, Config.NumRegisterTokens);
+  AssertTrue('rope_theta ~ 100', Abs(Config.RopeTheta - 100.0) < 1e-3);
+  AssertTrue('hidden_act gelu (exact erf)', Config.HiddenAct = chaGeluExact);
+  AssertTrue('use_gated_mlp false', not Config.UseGatedMLP);
+end;
+
+// DINOv3 parity test: tests/fixtures/tiny_dinov3.* is a pico randomly-
+// initialized HF DINOv3ViTModel (image 12, patch 4 -> 9 patches; +1 CLS +2
+// register = 12 tokens, 2 layers, 4 heads, d 16, ffn 64; BIASED patch conv,
+// 2-D axial RoPE on the patch tokens (base 100, CLS+register unrotated),
+// learnable cls_token + register_tokens prepended, LayerScale on every
+// residual branch, exact-erf gelu, separate q/k/v/o_proj with UNbiased key,
+// layer_norm_eps 1e-6, final layernorm "norm" and NO classifier head). The
+// generator tools/dinov3_tiny_fixture.py asserts every DINOv3 quirk (RoPE,
+// register tokens, LayerScale, cls_token, patch bias, exact-erf gelu) is
+// visible in the float64 oracle. Compares the (num_tokens, 1, hidden)
+// post-final-LN hidden states < 1e-4 vs HF.
+procedure TTestNeuralPretrained.TestDINOv3Parity;
+var
+  NN: TNNet;
+  Config: TDINOv3Config;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, HiddenArr, TokRow: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt, TokCnt, ColCnt, NumTokens: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildDINOv3FromSafeTensorsWithConfig(
+    FixturePath('tiny_dinov3.safetensors'),
+    Config, {pTrainable=}true, FixturePath('tiny_dinov3_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output depth = hidden_size', Config.HiddenSize,
+      NN.GetLastLayer().Output.Depth);
+
+    RefJson.LoadFromFile(FixturePath('tiny_dinov3_hidden.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    HiddenArr := TJSONArray(TJSONObject(RefRoot).Find('hidden'));
+    NumTokens := TJSONObject(RefRoot).Get('num_tokens', 0);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('oracle token rows', NumTokens, HiddenArr.Count);
+    AssertEquals('output rows = num tokens (CLS + register + patches)',
+      NumTokens, NN.GetLastLayer().Output.SizeX);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for TokCnt := 0 to NumTokens - 1 do
+    begin
+      TokRow := TJSONArray(HiddenArr.Items[TokCnt]);
+      for ColCnt := 0 to Config.HiddenSize - 1 do
+      begin
+        Diff := Abs(NN.GetLastLayer().Output.FData[
+          TokCnt * Config.HiddenSize + ColCnt] -
+          TokRow.Items[ColCnt].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('CLS+register+patch hidden states: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestBeitConfigFromJSONFile;
 var
   Config: TBeitConfig;
@@ -20075,6 +25696,90 @@ begin
     ImageInput.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// BEiT IMAGE-CLASSIFICATION parity test: tests/fixtures/tiny_beit_cls_{mean,cls}
+// is a pico randomly-initialized HF BeitForImageClassification (image 12, patch
+// 4 -> 9 patches + 1 cls = 10 tokens, 2 layers, 4 heads, d 16, ffn 64, 5 labels)
+// re-keyed to the CLASSIC published key scheme, plus a pooler + classifier head.
+// It exercises BuildBeitFromSafeTensorsForImageClassification (the encoder + the
+// HF BeitPooler + classifier nn.Linear) for BOTH pooling modes:
+//   _mean: use_mean_pooling=true  -> layernorm(hidden[:,1:].mean(1)) (PATCH-token
+//          mean, cls excluded, then pooler.layernorm; encoder final LN = Identity)
+//   _cls : use_mean_pooling=false -> hidden[:,0] (cls row, encoder final LN);
+//          no pooler LayerNorm.
+// tools/beit_cls_tiny_fixture.py asserts the head + pooler matter in the float64
+// oracle. Compares the (1,1,num_labels) class logits < 1e-4 vs HF.
+procedure TTestNeuralPretrained.TestBeitImageClassificationParity;
+const
+  Modes: array[0..1] of string = ('mean', 'cls');
+var
+  NN: TNNet;
+  Config: TBeitConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, LogitsArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt, LblCnt, NumLabels, ModeCnt: integer;
+  Diff, MaxDiff: double;
+  Stem: string;
+begin
+  for ModeCnt := 0 to High(Modes) do
+  begin
+    RandSeed := 424242;
+    Stem := 'tiny_beit_cls_' + Modes[ModeCnt];
+    NN := BuildBeitForImageClassificationWithConfig(
+      FixturePath(Stem + '.safetensors'),
+      Config, {pTrainable=}true, FixturePath(Stem + '_config.json'));
+    RefJson := TStringList.Create;
+    ImageInput := TNNetVolume.Create;
+    RefRoot := nil;
+    try
+      AssertTrue(Stem + ': net built', NN <> nil);
+      AssertEquals(Stem + ': num_labels = 5', 5, Config.NumLabels);
+      AssertEquals(Stem + ': output depth = num_labels', Config.NumLabels,
+        NN.GetLastLayer().Output.Depth);
+      AssertEquals(Stem + ': output is a single row', 1,
+        NN.GetLastLayer().Output.SizeX);
+
+      RefJson.LoadFromFile(FixturePath(Stem + '_logits.json'));
+      RefRoot := GetJSON(RefJson.Text);
+      Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+      LogitsArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+      NumLabels := TJSONObject(RefRoot).Get('num_labels', 0);
+      AssertTrue(Stem + ': pixels present', Pixels <> nil);
+      AssertEquals(Stem + ': oracle label count', NumLabels, LogitsArr.Count);
+
+      ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+      for ChanCnt := 0 to Config.NumChannels - 1 do
+      begin
+        RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+        for YCnt := 0 to Config.ImageSize - 1 do
+        begin
+          ChanArr := TJSONArray(RowArr.Items[YCnt]);
+          for XCnt := 0 to Config.ImageSize - 1 do
+            ImageInput.FData[
+              (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+              ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+        end;
+      end;
+      NN.Compute(ImageInput);
+      MaxDiff := 0;
+      for LblCnt := 0 to NumLabels - 1 do
+      begin
+        Diff := Abs(NN.GetLastLayer().Output.FData[LblCnt] -
+          LogitsArr.Items[LblCnt].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      AssertTrue(Stem + ': class logits max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      RefRoot.Free;
+      ImageInput.Free;
+      RefJson.Free;
+      NN.Free;
+    end;
   end;
 end;
 
@@ -20838,6 +26543,202 @@ begin
       IsNan(Dest[i]));
 end;
 
+// Hand-block NF4 dequant: one absmax block, the 16 nibble codes swept in order
+// so each codebook level appears exactly once, plus the HIGH-nibble-first
+// packing order (element 2*i = byte shr 4, element 2*i+1 = byte and $0F).
+procedure TTestNeuralPretrained.TestNF4DequantHandBlock;
+const
+  // bitsandbytes NF4 codebook (must match neuralnf4.cNF4Code).
+  Code: array[0..15] of single = (
+    -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+    -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+    0.07958029955625534, 0.16093020141124725, 0.24611230194568634,
+    0.33791524171829224, 0.44070982933044434, 0.5626170039176941,
+    0.7229568362236023, 1.0);
+var
+  PkBytes: array[0..7] of byte;   // 8 bytes -> 16 nibbles
+  Absmax: array[0..0] of single;
+  Dest: array[0..15] of single;
+  i: integer;
+begin
+  RandSeed := 424242;
+  // Pack nibble i into element i: HIGH nibble = even, LOW nibble = odd.
+  // bytes: (0<<4|1),(2<<4|3),... -> elements 0,1,2,...,15 = codes 0..15.
+  for i := 0 to 7 do
+    PkBytes[i] := (((2 * i) and $0F) shl 4) or (((2 * i + 1) and $0F));
+  Absmax[0] := 2.0;
+  DequantizeNF4(@PkBytes[0], @Absmax[0], 16, @Dest[0], 64);
+  for i := 0 to 15 do
+    AssertEquals('NF4 elem ' + IntToStr(i), Code[i] * 2.0, Dest[i], 1e-6);
+  // NF4Code accessor exposes the same table.
+  AssertEquals('NF4Code(0)', -1.0, NF4Code(0), 0);
+  AssertEquals('NF4Code(7)', 0.0, NF4Code(7), 0);
+  AssertEquals('NF4Code(15)', 1.0, NF4Code(15), 0);
+end;
+
+// NF4 dequant parity against the committed pico fixture (tests/fixtures/
+// pico_nf4.json, generated by tools/make_pico_nf4_fixture.py). bitsandbytes is
+// not importable in the CPU venv, so the reference is a numpy reconstruction of
+// the published NF4 codebook + per-block FP32 absmax formula. The fixture is a
+// 200-element standard-normal tensor quantized in 64-element blocks (4 blocks,
+// ragged last block of 8) with single-quant absmax. Asserts Pascal
+// DequantizeNF4 reproduces the reference dequant to < 1e-5 (max|diff|).
+procedure TTestNeuralPretrained.TestNF4DequantFixtureParity;
+var
+  RefJson: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  PackedArr, AbsmaxArr, DeqArr: TJSONArray;
+  PkBytes: array of byte;
+  Absmax: array of single;
+  Dest: array of single;
+  n, blocksize, i: integer;
+  Diff, MaxDiff, Ref: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('pico_nf4.json'));
+    Root := GetJSON(RefJson.Text);
+    try
+      Obj := Root as TJSONObject;
+      n := Obj.Integers['n'];
+      blocksize := Obj.Integers['blocksize'];
+      PackedArr := Obj.Arrays['packed_bytes'];
+      AbsmaxArr := Obj.Arrays['absmax'];
+      DeqArr := Obj.Arrays['dequant'];
+      AssertEquals('dequant length', n, DeqArr.Count);
+
+      SetLength(PkBytes, PackedArr.Count);
+      for i := 0 to PackedArr.Count - 1 do
+        PkBytes[i] := byte(PackedArr.Integers[i]);
+      SetLength(Absmax, AbsmaxArr.Count);
+      for i := 0 to AbsmaxArr.Count - 1 do
+        Absmax[i] := AbsmaxArr.Floats[i];
+      SetLength(Dest, n);
+
+      DequantizeNF4(@PkBytes[0], @Absmax[0], n, @Dest[0], blocksize);
+
+      MaxDiff := 0;
+      for i := 0 to n - 1 do
+      begin
+        Ref := DeqArr.Floats[i];
+        Diff := Abs(Dest[i] - Ref);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      AssertTrue('NF4 fixture parity max|diff|=' + FloatToStr(MaxDiff) +
+        ' < 1e-5', MaxDiff < 1e-5);
+    finally
+      Root.Free;
+    end;
+  finally
+    RefJson.Free;
+  end;
+end;
+
+// Importer-level NF4 parity: drives the BuildLlamaFromSafeTensors NF4 wiring
+// (IsNF4QuantizedTensor detection + LoadNF4QuantizedTensorFlat dequant-at-load)
+// through a real TNNetSafeTensorsReader on the committed pico bnb-4bit fixture
+// (tests/fixtures/pico_nf4_linear.safetensors: a [6,20] q_proj weight stored as
+// a packed U8 nibble buffer + FP32 .absmax sibling, no double-quant markers).
+// Asserts the importer detects it as NF4 and expands it to the numpy-reference
+// dequant matrix (tests/fixtures/pico_nf4_linear.json) to < 1e-5.
+procedure TTestNeuralPretrained.TestNF4ImporterLinearParity;
+var
+  Reader: TNNetSafeTensorsReader;
+  RefJson: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  DeqArr, RowArr: TJSONArray;
+  WName: string;
+  OutDim, InDim, i, j: integer;
+  W: TNNetVolume;
+  Diff, MaxDiff, Ref: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  W := TNNetVolume.Create;
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('pico_nf4_linear.safetensors'));
+  try
+    RefJson.LoadFromFile(FixturePath('pico_nf4_linear.json'));
+    Root := GetJSON(RefJson.Text);
+    try
+      Obj := Root as TJSONObject;
+      WName := Obj.Strings['weight_name'];
+      OutDim := Obj.Integers['out_dim'];
+      InDim := Obj.Integers['in_dim'];
+      DeqArr := Obj.Arrays['dequant'];
+
+      // The importer must recognise the packed U8 + .absmax pair as NF4.
+      AssertTrue('detected as NF4 quantized', IsNF4QuantizedTensor(Reader, WName));
+      AssertEquals('packed weight dtype is U8', 'U8', Reader.GetDType(WName));
+      AssertEquals('absmax dtype is F32', 'F32',
+        Reader.GetDType(WName + '.absmax'));
+
+      // Expand to a flat F32 [OutDim, InDim] buffer (same layout a dense load
+      // would produce) and compare to the numpy reference matrix.
+      LoadNF4QuantizedTensorFlat(Reader, WName, OutDim, InDim, W);
+      AssertEquals('dequant element count', OutDim * InDim, W.Size);
+      MaxDiff := 0;
+      for j := 0 to OutDim - 1 do
+      begin
+        RowArr := DeqArr.Arrays[j];
+        AssertEquals('dequant row width', InDim, RowArr.Count);
+        for i := 0 to InDim - 1 do
+        begin
+          Ref := RowArr.Floats[i];
+          Diff := Abs(W.FData[j * InDim + i] - Ref);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+      AssertTrue('NF4 importer linear parity max|diff|=' + FloatToStr(MaxDiff) +
+        ' < 1e-5', MaxDiff < 1e-5);
+    finally
+      Root.Free;
+    end;
+  finally
+    Reader.Free;
+    W.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Double-quant guard: bitsandbytes can int8-quantize the absmax itself (a
+// nested_absmax + quant_map). DequantizeNF4 consumes FP32 absmax only, so the
+// importer must RAISE (not silently dequant garbage) when it sees the nested /
+// double-quant markers. The fixture stores a U8 .absmax + .nested_absmax.
+procedure TTestNeuralPretrained.TestNF4ImporterRejectsDoubleQuant;
+var
+  Reader: TNNetSafeTensorsReader;
+  W: TNNetVolume;
+  WName: string;
+  Raised: boolean;
+begin
+  RandSeed := 424242;
+  WName := 'model.layers.0.self_attn.q_proj.weight';
+  W := TNNetVolume.Create;
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('pico_nf4_doublequant.safetensors'));
+  try
+    // Still detected as a 4-bit pair (U8 weight + .absmax sibling present)...
+    AssertTrue('double-quant still detected as NF4',
+      IsNF4QuantizedTensor(Reader, WName));
+    // ...but expanding it must RAISE rather than feed quantized absmax in.
+    Raised := False;
+    try
+      LoadNF4QuantizedTensorFlat(Reader, WName, 6, 20, W);
+    except
+      on E: EPretrainedImportError do
+        Raised := True;
+    end;
+    AssertTrue('double-quant NF4 raises EPretrainedImportError', Raised);
+  finally
+    Reader.Free;
+    W.Free;
+  end;
+end;
+
 // Verifies ReadRaftConfigFromJSONFile on the committed pico RAFT config.
 procedure TTestNeuralPretrained.TestRaftConfigFromJSONFile;
 var
@@ -20944,6 +26845,157 @@ begin
     RefJson.Free;
     NN.Free;
   end;
+end;
+
+// generation_config.json decode-default reader. The fixture mirrors
+// facebook/musicgen-small's recipe (do_sample=true, top_k=250, temperature=1.0,
+// guidance_scale=3.0, max_length=1500, top_p=0.0). Also exercises the
+// missing-file graceful path: a non-existent file must return Found=False with
+// no exception.
+procedure TTestNeuralPretrained.TestGenerationDefaultsFromJSONFile;
+var
+  G: TGenerationDefaults;
+begin
+  G := ReadGenerationDefaultsFromJSONFile(
+    FixturePath('tiny_generation_config.json'));
+  AssertTrue('file found+parsed', G.Found);
+  AssertTrue('has top_k', G.HasTopK);
+  AssertEquals('top_k', 250, G.TopK);
+  AssertTrue('has top_p', G.HasTopP);
+  AssertEquals('top_p', 0.0, G.TopP, 1e-6);
+  AssertTrue('has temperature', G.HasTemperature);
+  AssertEquals('temperature', 1.0, G.Temperature, 1e-6);
+  AssertTrue('has do_sample', G.HasDoSample);
+  AssertTrue('do_sample', G.DoSample);
+  AssertTrue('has guidance_scale', G.HasGuidanceScale);
+  AssertEquals('guidance_scale', 3.0, G.GuidanceScale, 1e-6);
+  AssertTrue('has max_length', G.HasMaxLength);
+  AssertEquals('max_length', 1500, G.MaxLength);
+
+  // Missing file: graceful, no exception, Found=False, every Has* False.
+  G := ReadGenerationDefaultsFromJSONFile(
+    FixturePath('tiny_generation_config.json') + '.does-not-exist');
+  AssertFalse('missing file -> not Found', G.Found);
+  AssertFalse('missing -> no top_k', G.HasTopK);
+  AssertFalse('missing -> no temperature', G.HasTemperature);
+  AssertFalse('missing -> no do_sample', G.HasDoSample);
+end;
+
+// Builds the matching AddBidirectional{LSTM,GRU} net, loads the fixture's torch
+// weights through the generic importer, runs the pinned input and asserts the
+// full output SEQUENCE matches the torch float64 oracle to < 1e-4. Shared by
+// the LSTM/GRU parity tests. UseGRU picks the importer + cell class.
+procedure TTestNeuralPretrained.RunTorchRNNParity(
+  const Tag: string; UseGRU: boolean);
+var
+  NN: TNNet;
+  Input, Output: TNNetVolume;
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  RootObj: TJSONObject;
+  InArr, OutArr, RowArr: TJSONArray;
+  SeqLen, InputSize, Hidden, NumLayers, OutDepth, t, j: integer;
+  Bidirectional: boolean;
+  Diff, MaxDiff: double;
+begin
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  RefRoot := nil;
+  NN := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_torch_' + Tag + '_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RootObj := TJSONObject(RefRoot);
+    SeqLen := RootObj.Integers['seq_len'];
+    InputSize := RootObj.Integers['input_size'];
+    Hidden := RootObj.Integers['hidden'];
+    NumLayers := RootObj.Integers['num_layers'];
+    Bidirectional := RootObj.Booleans['bidirectional'];
+    if Bidirectional then OutDepth := 2 * Hidden else OutDepth := Hidden;
+
+    if UseGRU then
+      NN := BuildGRUFromSafeTensors(
+        FixturePath('tiny_torch_' + Tag + '.safetensors'), '',
+        InputSize, Hidden, NumLayers, SeqLen, Bidirectional)
+    else
+      NN := BuildLSTMFromSafeTensors(
+        FixturePath('tiny_torch_' + Tag + '.safetensors'), '',
+        InputSize, Hidden, NumLayers, SeqLen, Bidirectional);
+
+    // Pinned input: (SeqLen, 1, InputSize), depth-contiguous per time step.
+    InArr := TJSONArray(RootObj.Find('input'));
+    Input.ReSize(SeqLen, 1, InputSize);
+    for t := 0 to SeqLen - 1 do
+    begin
+      RowArr := TJSONArray(InArr.Items[t]);
+      for j := 0 to InputSize - 1 do
+        Input.FData[t * InputSize + j] := RowArr.Items[j].AsFloat;
+    end;
+
+    NN.Compute(Input);
+    NN.GetOutput(Output);
+    AssertEquals(Tag + ' output SizeX', SeqLen, NN.GetLastLayer.Output.SizeX);
+    AssertEquals(Tag + ' output Depth', OutDepth, NN.GetLastLayer.Output.Depth);
+
+    OutArr := TJSONArray(RootObj.Find('output'));
+    MaxDiff := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      RowArr := TJSONArray(OutArr.Items[t]);
+      for j := 0 to OutDepth - 1 do
+      begin
+        Diff := Abs(Output.FData[t * OutDepth + j] - RowArr.Items[j].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('torch RNN parity ' + Tag + ': max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Output.Free;
+    Input.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestTorchLSTMImportParity;
+begin
+  // 1-layer unidirectional, 2-layer unidirectional, 1-layer bidirectional -
+  // every config the projection-free builder can host faithfully.
+  RunTorchRNNParity('lstm_uni_l1', {UseGRU=}False);
+  RunTorchRNNParity('lstm_uni_l2', {UseGRU=}False);
+  RunTorchRNNParity('lstm_bi_l1', {UseGRU=}False);
+end;
+
+procedure TTestNeuralPretrained.TestTorchGRUImportParity;
+begin
+  RunTorchRNNParity('gru_uni_l1', {UseGRU=}True);
+  RunTorchRNNParity('gru_uni_l2', {UseGRU=}True);
+  RunTorchRNNParity('gru_bi_l1', {UseGRU=}True);
+end;
+
+// A config that forces the builder to insert a learned projection (2-layer
+// BIDIRECTIONAL: layer 1's incoming Depth is 2*Hidden != Hidden) is NOT
+// faithfully importable and the importer must reject it loudly rather than
+// silently mis-load. We reuse the bidirectional 1-layer weights file (the
+// importer raises before any tensor name is needed, on the projection check).
+procedure TTestNeuralPretrained.TestTorchRNNImportRejectsProjection;
+var
+  Raised: boolean;
+begin
+  Raised := False;
+  try
+    // input_size==Hidden but NumLayers=2 bidirectional -> projection at layer 1.
+    BuildLSTMFromSafeTensors(
+      FixturePath('tiny_torch_lstm_bi_l1.safetensors'), '',
+      {InputSize=}4, {Hidden=}4, {NumLayers=}2, {SeqLen=}5,
+      {Bidirectional=}True).Free;
+  except
+    on E: EPretrainedImportError do Raised := True;
+  end;
+  AssertTrue('stacked-bidirectional projection must be rejected', Raised);
 end;
 
 initialization

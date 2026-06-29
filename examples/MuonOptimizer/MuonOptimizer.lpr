@@ -1,9 +1,14 @@
 program MuonOptimizer;
 (*
 MuonOptimizer: a self-contained demo of the Muon optimizer (Jordan et al. 2024,
-https://kellerjordan.github.io/posts/muon/) on a tiny synthetic regression toy,
-with a hand-rolled per-step weight-surgery loop (no TNeuralFit) in the same
-idiom as examples/SharpnessAwareMinimization/.
+https://kellerjordan.github.io/posts/muon/) on a tiny synthetic regression toy.
+The Muon arm drives the LIBRARY optimizer path (TNNet.CalcMuonDelta ->
+UpdateWeightsAdam, the same sequence TNeuralOptimizerMuon.Optimize runs inside
+TNeuralFit) from a hand-rolled per-step training loop (no TNeuralFit), in the
+same idiom as examples/SharpnessAwareMinimization/. The standalone NewtonSchulz5
+below is retained ONLY for the headline orthogonality probe (a self-contained
+demonstration of the orthogonalizer); the weight update itself is the real
+facility, not hand-rolled surgery.
 
 Muon, in one step, for EACH 2D weight matrix W of a dense layer:
   (1) momentum buffer  M <- mu*M + G        (G = accumulated gradient of W);
@@ -324,54 +329,18 @@ begin
     end;
 end;
 
-// Apply one Muon step: each layer's 2D weight matrix gets the orthogonalized
-// momentum update. (Biases are suppressed model-wide, so weights are the only
-// trainable tensors -- Muon owns every parameter here.)
-procedure MuonStep(NN: TNNet; var States: array of TLayerState; Cnt: integer);
-var
-  T, NIdx, W, Rows, Cols: integer;
-  Neuron: TNNetNeuron;
-  Mmat, Omat: TNNetVolume;
-  Scale: TNeuralFloat;
+// Apply one Muon step using the LIBRARY optimizer path
+// (TNNet.CalcMuonDelta -> UpdateWeightsAdam), exactly what
+// TNeuralOptimizerMuon.Optimize drives inside TNeuralFit. CalcMuonDelta builds
+// each layer's momentum buffer (the neurons' FBackInertia, zeroed by
+// ClearInertia at setup), Newton-Schulz-orthogonalizes the FanOut x FanIn
+// matrix, and rewrites every neuron's Delta to -lr*sqrt(max(rows,cols))*O; the
+// layer learning rate (set to cMuonLR for this arm) supplies lr. This replaces
+// the former hand-rolled per-neuron weight surgery with the real facility.
+procedure MuonStep(NN: TNNet);
 begin
-  Mmat := TNNetVolume.Create();
-  Omat := TNNetVolume.Create();
-  try
-    for T := 0 to Cnt - 1 do
-    begin
-      Rows := Length(States[T].M);                          // FanOut (neurons)
-      Cols := States[T].M[0].Size;                          // FanIn
-      Scale := Sqrt(Max(Rows, Cols));
-
-      // Pack the momentum-updated gradient matrix M (Rows x Cols), row n = neuron n.
-      Mmat.ReSize(Rows * Cols, 1, 1);
-      for NIdx := 0 to Rows - 1 do
-      begin
-        Neuron := NN.Layers[States[T].LayerIdx].Neurons[NIdx];
-        // M <- mu*M + G  (G = -Delta/lr; the constant lr folds into the step
-        // scale below, so we accumulate Gloc = -Delta and scale once at the end).
-        for W := 0 to Cols - 1 do
-          States[T].M[NIdx].FData[W] :=
-            cMomentum * States[T].M[NIdx].FData[W] - Neuron.Delta.FData[W];
-        for W := 0 to Cols - 1 do
-          Mmat.FData[NIdx * Cols + W] := States[T].M[NIdx].FData[W];
-      end;
-
-      // O = NewtonSchulz5(M): orthogonalized update direction.
-      NewtonSchulz5(Omat, Mmat, Rows, Cols);
-
-      // W <- W - lr * sqrt(max(rows,cols)) * O.
-      for NIdx := 0 to Rows - 1 do
-      begin
-        Neuron := NN.Layers[States[T].LayerIdx].Neurons[NIdx];
-        for W := 0 to Cols - 1 do
-          Neuron.Weights.FData[W] := Neuron.Weights.FData[W]
-            - cMuonLR * Scale * Omat.FData[NIdx * Cols + W];
-      end;
-    end;
-  finally
-    Mmat.Free; Omat.Free;
-  end;
+  NN.CalcMuonDelta(cMomentum, cNSIters);
+  NN.UpdateWeightsAdam();
 end;
 
 // Mean-squared-error over the dataset.
@@ -420,6 +389,14 @@ begin
   SetLength(States, Cnt);
   InitStates(NN, Idx, Cnt, States);
 
+  if Opt = okMuon then
+  begin
+    // Muon reads its learning rate from the layers and its momentum buffer from
+    // each neuron's FBackInertia; set the (smaller) Muon lr and zero the buffer.
+    NN.SetLearningRate(cMuonLR, cMomentum);
+    NN.ClearInertia();
+  end;
+
   SetLength(Order, Train.Count);
   for I := 0 to High(Order) do Order[I] := I;
 
@@ -446,7 +423,7 @@ begin
       case Opt of
         okSGDm: NN.UpdateWeights();          // library SGD+momentum step
         okAdam: AdamStep(NN, States, Cnt, StepNo);
-        okMuon: MuonStep(NN, States, Cnt);
+        okMuon: MuonStep(NN);
       end;
 
       Lo := Hi;

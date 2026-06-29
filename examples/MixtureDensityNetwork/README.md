@@ -6,8 +6,9 @@ on the classic **inverse-problem toy**. It contrasts a plain MSE regressor
 (which provably collapses to the conditional mean) against an MDN head that
 recovers the full **multimodal** conditional `p(y|x)`.
 
-No new layer is needed; the demo uses only existing layers (`TNNetFullConnect`,
-`TNNetFullConnectLinear`) plus hand-rolled gradient surgery.
+The MDN head is the **library layer `TNNetMixtureDensity`** (with its own
+log-sum-exp negative-log-likelihood backward) on top of a small
+`TNNetFullConnect` MLP trunk — no hand-coded mixture math.
 
 ## The phenomenon
 
@@ -36,13 +37,16 @@ of `x` emitted by the net:
 p(y|x) = sum_k  pi_k(x) * Normal(y ; mu_k(x), sigma_k(x)^2)
 ```
 
-The net emits `3*K` **raw** outputs, reshaped into `K` triples `(a_k, m_k, s_k)`:
+The trunk emits `K*(1+2*D)` **raw** outputs along the **depth axis**, which the
+library head `TNNetMixtureDensity(K, D)` turns into the mixture parameters in
+place. For `D = 1` the depth packing is
+`[ a_0..a_{K-1} | m_0..m_{K-1} | s_0..s_{K-1} ]`:
 
 | parameter | from raw output | activation               | constraint        |
 |-----------|-----------------|--------------------------|-------------------|
 | `pi_k`    | `a_k`           | softmax over the `a`     | `sum_k pi_k = 1`  |
 | `mu_k`    | `m_k`           | identity (linear)        | —                 |
-| `sigma_k` | `s_k`           | `softplus(s_k) + eps`    | `sigma_k > 0`     |
+| `sigma_k` | `s_k`           | `softplus(s_k)`          | `sigma_k > 0`     |
 
 trained on the mixture **negative log-likelihood**
 
@@ -50,34 +54,34 @@ trained on the mixture **negative log-likelihood**
 NLL = -log( sum_k pi_k * Normal(y ; mu_k, sigma_k) ).
 ```
 
-## How it trains (manual gradient surgery, no library changes)
+## How it trains (the library head owns the loss)
 
-Both arms emit raw linear outputs from a `TNNetFullConnectLinear` head. The
-framework's stock `Backpropagate` seeds the output layer's error as
-`(output - target)` and — for a **Linear** head (Identity activation, derivative
-1) — delivers exactly that as the gradient w.r.t. the raw outputs. So to inject
-an arbitrary analytic gradient `g_i`, we feed a **pseudo-target**
+The MDN arm is `Input(1) -> Tanh -> Tanh -> Linear(K*(1+2*D)) ->
+TNNetMixtureDensity(K, D)`. The library head applies the softmax/softplus
+transforms in `Compute()` and emits the **exact** responsibility-weighted
+`dNLL/dparam` (stable log-sum-exp) in its own `Backpropagate()` — there is no
+hand-coded mixture gradient in this example.
+
+We drive that backward the way the layer expects. The framework seeds the head
+error as `(output - target)`, and the head recovers the regression target `y`
+from its **first `D` channels** as `output - (output - target)`. So we build a
+target volume that copies the head output (every channel has zero residual) and
+overwrites the first `D` channels with the true `y`:
 
 ```
-pseudo_i = output_i - g_i      =>   (output - pseudo)_i == g_i .
+Tgt.Copy(head.Output);  Tgt.FData[0] := y;  NN.Backpropagate(Tgt);
 ```
 
-The closed-form mixture-NLL gradients (with responsibilities `gamma_k`):
+The loop runs in **batch-update mode** (`NN.SetBatchUpdate(True)` makes
+`Backpropagate` *accumulate* into `Neurons[].Delta`); after each mini-batch we
+`MulDeltas(1/batch)` so the applied step is the **mean** gradient and
+`UpdateWeights` applies it once. We never call `TNeuralFit.Fit`, so layer
+references never go stale. The MSE arm uses the stock `(out - y)` gradient on its
+single linear output.
 
-```
-gamma_k   = pi_k*N_k / sum_j pi_j*N_j
-dNLL/da_k = pi_k - gamma_k                                  (pi logits / softmax)
-dNLL/dm_k = gamma_k * (mu_k - y) / sigma_k^2                (mu, linear)
-dNLL/ds_k = gamma_k * (1/sigma_k - (y-mu_k)^2/sigma_k^3) * sigmoid(s_k)
-            (sigma, chained through softplus' = sigmoid)
-```
-
-The training loop is hand-rolled in **batch-update mode**
-(`NN.SetBatchUpdate(True)` makes `Backpropagate` *accumulate* into
-`Neurons[].Delta`; `UpdateWeights` applies it once per mini-batch). Each
-per-sample gradient is scaled by `1/batch` so the applied step is the mean.
-We never call `TNeuralFit.Fit`, so layer references never go stale. The MSE arm
-uses the same pseudo-target trick with `g = (out - y)`.
+The `K` mean biases are spread across `[0.1, 0.9]` at init (and the scale biases
+set so `sigma ~ 0.15`) to break the symmetry that would otherwise collapse every
+component onto the conditional mean.
 
 ## What it reports
 
@@ -93,14 +97,11 @@ uses the same pseudo-target trick with `g = (out - y)`.
 
 ## Built-in correctness invariants (the program `HALT(1)`s if any fail)
 
-1. **Startup gradient check** — the analytic NLL gradient is compared (in pure
-   double precision) against central finite differences; max relative error must
-   be `< 1e-3` (observed `~3e-10`).
-2. **K=1 reduction** — a `K=1` MDN's NLL is a homoscedastic Gaussian NLL whose
+1. **K=1 reduction** — a `K=1` MDN's NLL is a homoscedastic Gaussian NLL whose
    only mean is `mu_0`; that `mu` must match the independently-trained MSE arm's
    prediction over a probe grid (both recover `E[y|x]`).
-3. **Simplex** — the mixture weights must sum to 1 (within `1e-5`) at every
-   probe `x`.
+2. **Simplex** — the mixture weights (read from the head output) must sum to 1
+   (within `1e-5`) at every probe `x`.
 
 ## Run
 

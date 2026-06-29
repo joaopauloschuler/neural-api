@@ -37,6 +37,13 @@ Coded by Claude (AI).
 //
 // Usage:
 //   WhisperTranscribe <checkpoint-dir> <audio.wav> [MaxNewTokens]
+//                     [--word-timestamps]
+//
+//   --word-timestamps - after the greedy decode, run the cross-attention
+//                       DTW alignment (neuralpretrained.WhisperWordTimestamps,
+//                       median-filter smoothing on) and print each decoded
+//                       word with its [start - end] audio span in seconds and
+//                       an alignment confidence in [0,1].
 //
 //   checkpoint-dir - directory holding model.safetensors (or
 //                    pytorch_model.bin), config.json and tokenizer.json,
@@ -81,6 +88,11 @@ var
   StepCnt, PosCnt, TokCnt, BestId, CurLen: integer;
   BestLogit: TNeuralFloat;
   StartTicks: QWord;
+  WantWordTimestamps: boolean;
+  AlignTokens: array of integer;
+  AlignHeads: TWhisperAlignmentHeads;
+  WordTs: TWhisperWordTimestamps;
+  ArgCnt, TextStart, WordCnt: integer;
 
 // Appends the id of Token to Prologue when the tokenizer knows it (the
 // *.en checkpoints have no language/task specials).
@@ -111,7 +123,16 @@ begin
   CheckpointDir := IncludeTrailingPathDelimiter(ParamStr(1));
   WavPath := ParamStr(2);
   MaxNewTokens := 32;
-  if ParamCount >= 3 then MaxNewTokens := StrToIntDef(ParamStr(3), 32);
+  WantWordTimestamps := false;
+  // Scan the remaining args: the first numeric one is MaxNewTokens; the
+  // --word-timestamps switch may appear anywhere.
+  for ArgCnt := 3 to ParamCount do
+  begin
+    if ParamStr(ArgCnt) = '--word-timestamps' then
+      WantWordTimestamps := true
+    else
+      MaxNewTokens := StrToIntDef(ParamStr(ArgCnt), MaxNewTokens);
+  end;
 
   WeightsPath := CheckpointDir + 'model.safetensors';
   if not FileExists(WeightsPath) then
@@ -215,6 +236,42 @@ begin
       (GetTickCount64 - StartTicks) div 1000, ' s');
     WriteLn;
     WriteLn('Transcription:', Tokenizer.Decode(Generated));
+
+    // ---- optional word-level timestamps (cross-attention DTW) ----
+    if WantWordTimestamps then
+    begin
+      // The decoder was last Computed on the full (prologue + generated)
+      // prefix, so its cross-attention leaves are live. Re-run that exact
+      // prefix to be safe (decode may have broken on EOS mid-buffer), then
+      // align. Tokens = prologue ++ generated; text starts after prologue.
+      SetLength(AlignTokens, Length(Prologue) + Length(Generated));
+      for PosCnt := 0 to High(Prologue) do
+        AlignTokens[PosCnt] := Prologue[PosCnt];
+      for PosCnt := 0 to High(Generated) do
+        AlignTokens[Length(Prologue) + PosCnt] := Generated[PosCnt];
+      TextStart := Length(Prologue);
+      // Re-pack the decode buffer with the final prefix and recompute so the
+      // attention maps match AlignTokens exactly.
+      for PosCnt := 0 to DecSeqLen - 1 do
+        if PosCnt <= High(AlignTokens) then
+          DecToks.FData[PosCnt] := AlignTokens[PosCnt]
+        else
+          DecToks.FData[PosCnt] := Config.DecoderStartTokenId;
+      Dec.Compute(DecToks);
+
+      // Curated alignment heads for the released shapes; empty -> all heads.
+      AlignHeads := WhisperDefaultAlignmentHeads(Config.DecoderLayers,
+        Config.DecoderHeads);
+      // MedianKernel 7 = openai-whisper default smoothing.
+      WordTs := WhisperWordTimestamps(Dec, Config, Tokenizer,
+        AlignTokens, TextStart, AlignHeads, {MedianKernel=}7);
+      WriteLn;
+      WriteLn('Word timestamps (start - end  [confidence]  word):');
+      for WordCnt := 0 to High(WordTs) do
+        WriteLn(Format('  %7.2f - %7.2f  [%.2f]  %s',
+          [WordTs[WordCnt].StartS, WordTs[WordCnt].EndS,
+           WordTs[WordCnt].Confidence, WordTs[WordCnt].Word]));
+    end;
   finally
     Logits.Free;
     DecToks.Free;

@@ -76,7 +76,7 @@ ENC_SEQ = 5
 DEC_SEQ = 7
 
 
-def build_config():
+def build_config(audio_channels=1, num_codebooks=NUM_CODEBOOKS):
     t5 = T5Config(vocab_size=40, d_model=TEXT_DMODEL, d_ff=16, num_layers=2,
                   num_heads=2, d_kv=6, relative_attention_num_buckets=8,
                   relative_attention_max_distance=16)
@@ -91,11 +91,15 @@ def build_config():
                         dilation_growth_rate=2, compress=2, num_lstm_layers=1,
                         codebook_size=VOCAB, codebook_dim=8,
                         target_bandwidths=[48.0])
+    # NOTE: stereo MusicGen keeps the EnCodec audio_encoder MONO
+    # (audio_channels=1) - HF decodes each channel's codebooks through the same
+    # mono codec and concatenates. Only the DECODER carries audio_channels=2 and
+    # the doubled (2*K) interleaved-codebook layout.
     dec = MusicgenDecoderConfig(
         vocab_size=VOCAB, max_position_embeddings=64,
         num_hidden_layers=DEC_LAYERS, ffn_dim=FFN,
         num_attention_heads=DEC_HEADS, hidden_size=DEC_HIDDEN,
-        num_codebooks=NUM_CODEBOOKS, audio_channels=1,
+        num_codebooks=num_codebooks, audio_channels=audio_channels,
         scale_embedding=False, activation_function="gelu")
     return MusicgenConfig(text_encoder=t5.to_dict(),
                           audio_encoder=enc.to_dict(), decoder=dec.to_dict())
@@ -313,5 +317,121 @@ def main():
           "delayed shape", list(delayed_ids.shape))
 
 
+def make_stereo():
+    """Stereo (audio_channels=2) MusicGen parity fixture.
+
+    Stereo MusicGen doubles the decoder to 2*K codebook rows: the two channels'
+    per-channel codebooks are INTERLEAVED (row 2c = left codebook c, row 2c+1 =
+    right codebook c) and each pair shares delay offset c. The transformer trunk
+    is otherwise channel-agnostic (2*K embedding tables summed in, 2*K LM heads),
+    so this pins (a) the decoder forward at 2*K rows and (b) the stereo
+    delay-pattern round trip (HF build_delay_pattern_mask, audio_channels==2).
+    Writes tiny_musicgen_stereo{.safetensors,_config.json,_ref.json}.
+    """
+    stereo_channels = 2
+    channel_cb = NUM_CODEBOOKS          # per-channel codebooks (K)
+    total_cb = stereo_channels * channel_cb  # decoder rows (2*K)
+
+    torch.manual_seed(SEED + 1)
+    np.random.seed(SEED + 1)
+    cfg = build_config(audio_channels=stereo_channels, num_codebooks=total_cb)
+    model = MusicgenForConditionalGeneration(cfg).eval()
+    with torch.no_grad():
+        model.enc_to_dec_proj.weight.mul_(12.0)
+        for layer in model.decoder.model.decoder.layers:
+            ca = layer.encoder_attn
+            for proj in (ca.q_proj, ca.k_proj, ca.v_proj, ca.out_proj):
+                proj.weight.mul_(4.0)
+
+    model_f64 = MusicgenForConditionalGeneration(cfg).double().eval()
+    model_f64.load_state_dict(model.state_dict())
+
+    rng = np.random.RandomState(SEED + 1)
+    enc_states = (rng.randn(ENC_SEQ, TEXT_DMODEL) * 0.5)
+    enc_states = np.round(enc_states * 64.0) / 64.0
+    # 2*K interleaved code rows.
+    dec_codes = rng.randint(0, VOCAB, size=(total_cb, DEC_SEQ))
+
+    with torch.no_grad():
+        proj = model_f64.enc_to_dec_proj
+        enc_t = torch.tensor(enc_states, dtype=torch.float64).unsqueeze(0)
+        enc_hidden = proj(enc_t)
+        decoder: MusicgenForCausalLM = model_f64.decoder
+        ids = torch.tensor(dec_codes, dtype=torch.long).reshape(
+            total_cb, DEC_SEQ)
+        out = decoder(input_ids=ids, encoder_hidden_states=enc_hidden,
+                      use_cache=False)
+        logits = out.logits.reshape(total_cb, DEC_SEQ, VOCAB)
+
+    # ---- stereo delay-pattern round-trip oracle ----
+    raw = rng.randint(0, VOCAB, size=(total_cb, DEC_SEQ))
+    pad_id = VOCAB
+    with torch.no_grad():
+        gen_decoder = model.decoder
+        raw_ids = torch.tensor(raw, dtype=torch.long).reshape(total_cb, DEC_SEQ)
+        # stereo max delay offset is channel_cb-1, so max_length needs the same
+        # +channel_cb headroom the importer's Steps uses.
+        max_len = DEC_SEQ + channel_cb
+        delayed_ids, mask = gen_decoder.build_delay_pattern_mask(
+            raw_ids, pad_token_id=pad_id, max_length=max_len)
+        delayed_ids = delayed_ids.reshape(total_cb, -1)
+        mask = mask.reshape(total_cb, -1)
+
+    os.makedirs(FIX, exist_ok=True)
+    sd = {}
+    for k, v in model.state_dict().items():
+        if k.startswith("audio_encoder") or k.startswith("text_encoder"):
+            continue
+        sd[k] = v.to(torch.float32).contiguous()
+    save_file(sd, os.path.join(FIX, "tiny_musicgen_stereo.safetensors"))
+
+    out_cfg = {
+        "model_type": "musicgen",
+        "text_d_model": TEXT_DMODEL,
+        "decoder": {
+            "vocab_size": VOCAB,
+            "hidden_size": DEC_HIDDEN,
+            "num_hidden_layers": DEC_LAYERS,
+            "num_attention_heads": DEC_HEADS,
+            "ffn_dim": FFN,
+            "num_codebooks": total_cb,
+            "max_position_embeddings": 64,
+            "activation_function": "gelu",
+            "scale_embedding": False,
+            "audio_channels": 2,
+        },
+    }
+    with open(os.path.join(FIX, "tiny_musicgen_stereo_config.json"), "w") as f:
+        json.dump(out_cfg, f, indent=1)
+
+    ref = {
+        "text_d_model": TEXT_DMODEL,
+        "dec_hidden": DEC_HIDDEN,
+        "vocab_size": VOCAB,
+        "num_codebooks": total_cb,
+        "audio_channels": 2,
+        "enc_seq_len": ENC_SEQ,
+        "dec_seq_len": DEC_SEQ,
+        "enc_states": enc_states.tolist(),
+        "dec_codes": dec_codes.astype(np.int64).tolist(),
+        "logits": logits.to(torch.float64).tolist(),
+        "delay": {
+            "channels": stereo_channels,
+            "pad_id": pad_id,
+            "max_length": int(max_len),
+            "raw": raw.astype(np.int64).tolist(),
+            "delayed": delayed_ids.to(torch.int64).tolist(),
+            "mask": mask.to(torch.int64).tolist(),
+        },
+    }
+    with open(os.path.join(FIX, "tiny_musicgen_stereo_ref.json"), "w") as f:
+        json.dump(ref, f)
+    st = os.path.getsize(os.path.join(FIX, "tiny_musicgen_stereo.safetensors"))
+    print("wrote tiny_musicgen_stereo.safetensors %d bytes" % st)
+    print("stereo logits shape", list(logits.shape),
+          "delayed shape", list(delayed_ids.shape))
+
+
 if __name__ == "__main__":
     main()
+    make_stereo()

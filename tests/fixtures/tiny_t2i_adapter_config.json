@@ -1,0 +1,11 @@
+{
+ "_class_name": "T2IAdapter",
+ "in_channels": 3,
+ "channels": [
+  16,
+  32
+ ],
+ "num_res_blocks": 2,
+ "downscale_factor": 2,
+ "cond_size": 16
+}

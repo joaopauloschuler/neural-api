@@ -1,0 +1,30 @@
+{
+ "architectures": [
+  "MoonshineModel"
+ ],
+ "model_type": "moonshine",
+ "hidden_size": 32,
+ "intermediate_size": 32,
+ "encoder_num_hidden_layers": 2,
+ "decoder_num_hidden_layers": 2,
+ "encoder_num_attention_heads": 4,
+ "decoder_num_attention_heads": 4,
+ "encoder_num_key_value_heads": 2,
+ "decoder_num_key_value_heads": 2,
+ "encoder_hidden_act": "gelu",
+ "decoder_hidden_act": "silu",
+ "vocab_size": 40,
+ "max_position_embeddings": 64,
+ "partial_rotary_factor": 0.75,
+ "rope_parameters": {
+  "rope_theta": 10000.0,
+  "partial_rotary_factor": 0.75,
+  "rope_type": "default"
+ },
+ "attention_bias": false,
+ "attention_dropout": 0.0,
+ "bos_token_id": 1,
+ "eos_token_id": 2,
+ "decoder_start_token_id": 1,
+ "tie_word_embeddings": true
+}

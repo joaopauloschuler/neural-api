@@ -37,6 +37,16 @@ type
     // Forward STFT -> ISTFTOverlapAdd round-trips the interior near-exactly
     // under a perfect-reconstruction Hann window with 75% overlap.
     procedure TestISTFTRoundTrip;
+    // Resampling 16 kHz -> 16 kHz is a bit-identical passthrough.
+    procedure TestResampleIdentity;
+    // Output length matches the round(N * target/source) ratio (up and down).
+    procedure TestResampleLength;
+    // A pure low-frequency sine survives 44.1k -> 16k and 8k -> 16k with its
+    // fundamental (zero-crossing rate) preserved within tolerance.
+    procedure TestResampleSinePreservesFrequency;
+    // LoadWavResampledToVolume on an 8 kHz WAV returns a 16 kHz volume of the
+    // right length, round-tripped through a temp WAV on disk.
+    procedure TestLoadWavResampledRoundTrip;
   end;
 
 implementation
@@ -236,6 +246,142 @@ begin
     Mag.Free;
     Phase.Free;
     Rec.Free;
+  end;
+end;
+
+// Counts sign changes (zero crossings) of a mono waveform - twice the
+// frequency in cycles per the buffer's duration, robust to amplitude.
+function CountZeroCrossings(V: TNNetVolume): integer;
+var
+  i: integer;
+  Prev, Cur: double;
+begin
+  Result := 0;
+  if V.Size < 2 then exit;
+  Prev := V.FData[0];
+  for i := 1 to V.Size - 1 do
+  begin
+    Cur := V.FData[i];
+    if ((Prev < 0) and (Cur >= 0)) or ((Prev >= 0) and (Cur < 0)) then
+      Inc(Result);
+    Prev := Cur;
+  end;
+end;
+
+procedure TTestNeuralAudio.TestResampleIdentity;
+var
+  Src, Dst: TNNetVolume;
+  N, i: integer;
+begin
+  N := 2000;
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := nil;
+  try
+    RandSeed := 314159;
+    for i := 0 to N - 1 do
+      Src.FData[i] := 0.7 * Sin(2.0 * Pi * 300.0 * i / 16000.0)
+        + 0.1 * (Random - 0.5);
+    Dst := ResampleVolume(Src, 16000, 16000);
+    AssertEquals('identity resample length', N, Dst.Size);
+    for i := 0 to N - 1 do
+      AssertTrue('identity resample is bit-identical at ' + IntToStr(i),
+        Src.FData[i] = Dst.FData[i]);
+  finally
+    Src.Free;
+    Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralAudio.TestResampleLength;
+var
+  Src, Dst: TNNetVolume;
+  N: integer;
+begin
+  N := 4410;
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := nil;
+  try
+    // Downsample 44100 -> 16000 : expect round(4410 * 16000/44100) = 1600.
+    Dst := ResampleVolume(Src, 44100, 16000);
+    AssertEquals('downsample length', Round(N * 16000.0 / 44100.0), Dst.Size);
+    AssertEquals('downsample length value', 1600, Dst.Size);
+    Dst.Free; Dst := nil;
+    // Upsample 8000 -> 16000 : expect exactly 2*N.
+    Dst := ResampleVolume(Src, 8000, 16000);
+    AssertEquals('upsample length', 2 * N, Dst.Size);
+  finally
+    Src.Free;
+    Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralAudio.TestResampleSinePreservesFrequency;
+var
+  Src, Dst: TNNetVolume;
+  N, i, ZcSrc, ZcDst: integer;
+  ExpectedZc, Tol: double;
+
+  procedure CheckRate(SrcRate, DstRate: integer; Freq: double);
+  var DurSec: double; k: integer;
+  begin
+    DurSec := 0.25; // 250 ms of signal
+    N := Round(SrcRate * DurSec);
+    Src.ReSize(N, 1, 1);
+    for k := 0 to N - 1 do
+      Src.FData[k] := Sin(2.0 * Pi * Freq * k / SrcRate);
+    ZcSrc := CountZeroCrossings(Src);
+    Dst := ResampleVolume(Src, SrcRate, DstRate);
+    try
+      ZcDst := CountZeroCrossings(Dst);
+      // Both should be ~ 2 * Freq * DurSec crossings; allow a couple of edge
+      // crossings of slack (the resampled buffer covers the same duration).
+      ExpectedZc := 2.0 * Freq * DurSec;
+      Tol := 4;
+      AssertTrue('src zero-crossings near expected (' + IntToStr(ZcSrc) +
+        ' vs ' + FloatToStr(ExpectedZc) + ')', Abs(ZcSrc - ExpectedZc) <= Tol);
+      AssertTrue('resampled zero-crossings preserved (' + IntToStr(ZcDst) +
+        ' vs src ' + IntToStr(ZcSrc) + ')', Abs(ZcDst - ZcSrc) <= Tol);
+    finally
+      Dst.Free; Dst := nil;
+    end;
+  end;
+
+begin
+  Src := TNNetVolume.Create(1, 1, 1);
+  Dst := nil;
+  try
+    CheckRate(44100, 16000, 440.0);  // downsample, A4
+    CheckRate(8000, 16000, 440.0);   // upsample, A4
+  finally
+    Src.Free;
+    Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralAudio.TestLoadWavResampledRoundTrip;
+var
+  Src, Loaded: TNNetVolume;
+  N, i, Sr: integer;
+begin
+  FTmpWav := GetTempDir(false) + 'cai_audio_resample_' +
+    IntToStr(Random(1000000)) + '.wav';
+  N := 2000; // 0.25 s at 8 kHz
+  Src := TNNetVolume.Create(N, 1, 1);
+  Loaded := TNNetVolume.Create(1, 1, 1);
+  try
+    for i := 0 to N - 1 do
+      Src.FData[i] := 0.6 * Sin(2.0 * Pi * 300.0 * i / 8000.0);
+    SaveVolumeToWav16(Src, FTmpWav, 8000);
+    Sr := LoadWavResampledToVolume(FTmpWav, Loaded, 16000);
+    AssertEquals('returns target rate', 16000, Sr);
+    AssertEquals('resampled length', Round(N * 16000.0 / 8000.0), Loaded.Size);
+    AssertEquals('resampled length value', 4000, Loaded.Size);
+    // 300 Hz over 0.25 s => ~150 zero crossings, preserved through disk+resample.
+    AssertTrue('fundamental preserved through load+resample',
+      Abs(CountZeroCrossings(Loaded) - 150) <= 4);
+  finally
+    Src.Free;
+    Loaded.Free;
   end;
 end;
 

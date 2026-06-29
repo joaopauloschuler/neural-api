@@ -45,6 +45,8 @@ type
     // what a perfectly-distilled LCM satisfies, so the multistep loop is a fixed
     // point and must return the clean image.
     procedure LCMOracleModel(Xt, Output: TNNetVolume; Tt: integer);
+    // CFG guidance-rescale assertions; driven by TestApplyCFG (not a test itself).
+    procedure TestApplyCFGRescale(Cond, Uncond: TNNetVolume; w: TNeuralFloat);
   published
     procedure TestLinearScheduleVsOracle;
     procedure TestScaledLinearInvariants;
@@ -54,6 +56,9 @@ type
     procedure TestVPredictionToEps;
     procedure TestDDIMTrajectoryVsOracle;
     procedure TestDPMSolverVsOracle;
+    procedure TestUniPCVsOracle;
+    procedure TestHeunVsOracle;
+    procedure TestMinSNRWeight;
     procedure TestDDPMRunsNoNaN;
     procedure TestEulerAncestralZeroEtaMatchesDDIM;
     procedure TestKarrasSpacingSigmaMonotone;
@@ -88,6 +93,30 @@ const
     (-5.69458245535186, -4.270936841513894, -2.84729122767593,
      -1.423645613837965, 0.0, 1.423645613837965,
       2.84729122767593, 4.270936841513894);
+  // UniPC (order-2 bh2, predict_x0) final from the float64 numpy oracle
+  // tools/unipc_scheduler_oracle.py (same toy model, start & uniform schedule).
+  cOracleUniPC: array[0..7] of double =
+    (-1.0913574282060237, -0.8185180711545179, -0.5456787141030118,
+     -0.2728393570515059, 0.0, 0.2728393570515059,
+      0.5456787141030118, 0.8185180711545179);
+  // Heun 2nd-order (smHeun) with tsKarras spacing, from the float64 numpy oracle
+  // tools/heun_scheduler_oracle.py (same toy model & start). Two denoiser evals
+  // per step; corrector skipped on the final hop (sigma=0).
+  cOracleHeun: array[0..7] of double =
+    (-0.9874468254279581, -0.7405851190709684, -0.49372341271397907,
+     -0.24686170635698954, 0.0, 0.24686170635698954,
+      0.49372341271397907, 0.7405851190709684);
+  // Min-SNR-gamma loss-weight probes (tools/min_snr_oracle.py). SNR(t)=ab/(1-ab).
+  cSNRProbeT: array[0..5] of integer = (1, 25, 50, 100, 150, 200);
+  cSNREpsGamma5: array[0..5] of double =
+    (0.000500050005000445, 0.16531233763786016, 0.6811466136251436,
+     1.0, 1.0, 1.0);
+  cSNRVGamma5: array[0..5] of double =
+    (0.0004999999999999449, 0.16002162776613316, 0.5994798761147474,
+     0.6024803053077055, 0.32038735949336433, 0.13218275425061793);
+  cSNRVGammaInf: array[0..5] of double =
+    (0.9999, 0.9679956744467734, 0.8801040247770505,
+     0.6024803053077055, 0.32038735949336433, 0.13218275425061793);
 
 procedure TTestNeuralDiffusion.ToyModel(Xt, Output: TNNetVolume; Tt: integer);
 var i: integer; s: TNeuralFloat;
@@ -233,8 +262,41 @@ begin
       expect := Uncond.FData[i] + w * (Cond.FData[i] - Uncond.FData[i]);
       AssertEquals('cfg @ ' + IntToStr(i), expect, Dst.FData[i], 1e-6);
     end;
+    TestApplyCFGRescale(Cond, Uncond, w);
   finally
     Cond.Free; Uncond.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestApplyCFGRescale(
+  Cond, Uncond: TNNetVolume; w: TNeuralFloat);
+var
+  Plain, Rescaled: TNNetVolume;
+  i: integer;
+  stdCond, stdPlain, stdRescaled, phi: TNeuralFloat;
+begin
+  Plain    := TNNetVolume.Create(cN, 1, 1);
+  Rescaled := TNNetVolume.Create(cN, 1, 1);
+  try
+    // (a) GuidanceRescale = 0 reproduces the plain CFG mix exactly.
+    TNNetDiffusionScheduler.ApplyCFG(Cond, Uncond, Plain, w);
+    TNNetDiffusionScheduler.ApplyCFG(Cond, Uncond, Rescaled, w, 0.0);
+    for i := 0 to cN - 1 do
+      AssertEquals('rescale phi=0 @ ' + IntToStr(i),
+        Plain.FData[i], Rescaled.FData[i], 1e-6);
+
+    // (b) phi>0 pulls std(result) toward std(Cond) (w>1 overshoots it).
+    phi := 0.7;
+    TNNetDiffusionScheduler.ApplyCFG(Cond, Uncond, Rescaled, w, phi);
+    stdCond     := Cond.GetStdDeviation();
+    stdPlain    := Plain.GetStdDeviation();
+    stdRescaled := Rescaled.GetStdDeviation();
+    AssertTrue('plain CFG std overshoots cond std for w>1',
+      stdPlain > stdCond);
+    AssertTrue('rescaled std is closer to cond std than plain CFG std',
+      Abs(stdRescaled - stdCond) < Abs(stdPlain - stdCond));
+  finally
+    Plain.Free; Rescaled.Free;
   end;
 end;
 
@@ -321,6 +383,94 @@ begin
     end;
   finally
     Sched.Free; X.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestUniPCVsOracle;
+var
+  Sched: TNNetDiffusionScheduler;
+  X: TNNetVolume;
+  i: integer;
+begin
+  Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  X := TNNetVolume.Create(cN, 1, 1);
+  try
+    for i := 0 to cN - 1 do X.FData[i] := (i - cN / 2) * 0.3;
+    Sched.Sample(X, @ToyModel, cSteps, smUniPC, 0.0);
+    // Match the numpy UniPC (order-2 bh2) float64 oracle to <1e-4. UniPC is a
+    // genuinely distinct predictor-corrector trajectory: it differs from both
+    // the DDIM and DPM-Solver++(2M) finals on the SAME toy model & start.
+    for i := 0 to cN - 1 do
+    begin
+      AssertFalse('unipc no NaN @ ' + IntToStr(i),
+        IsNan(X.FData[i]) or IsInfinite(X.FData[i]));
+      AssertEquals('unipc vs oracle @ ' + IntToStr(i),
+        cOracleUniPC[i], X.FData[i], 1e-4);
+    end;
+  finally
+    Sched.Free; X.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestHeunVsOracle;
+var
+  Sched: TNNetDiffusionScheduler;
+  X: TNNetVolume;
+  i: integer;
+begin
+  // Heun 2nd-order deterministic sampler (k-diffusion sample_heun) with the
+  // Karras rho=7 spacing must reproduce the float64 numpy oracle to <1e-4. This
+  // is a genuine intra-step predictor-corrector: the Sample() driver calls the
+  // denoiser TWICE per step (Euler predict + 2nd-derivative correction) and
+  // skips the corrector on the final hop (sigma=0). It is a DISTINCT trajectory
+  // from the single-eval DDIM/DPM++/UniPC finals on the SAME toy model & start.
+  Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  X := TNNetVolume.Create(cN, 1, 1);
+  try
+    for i := 0 to cN - 1 do X.FData[i] := (i - cN / 2) * 0.3;
+    Sched.Sample(X, @ToyModel, cSteps, smHeun, 0.0, tsKarras);
+    for i := 0 to cN - 1 do
+    begin
+      AssertFalse('heun no NaN @ ' + IntToStr(i),
+        IsNan(X.FData[i]) or IsInfinite(X.FData[i]));
+      AssertEquals('heun vs oracle @ ' + IntToStr(i),
+        cOracleHeun[i], X.FData[i], 1e-4);
+    end;
+  finally
+    Sched.Free; X.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestMinSNRWeight;
+var
+  SchedE, SchedV: TNNetDiffusionScheduler;
+  i, t: integer;
+const
+  cBigGamma = 1.0e30;   // stands in for +Inf (clamp never binds).
+begin
+  // Min-SNR-gamma loss weighting (Hang et al. 2023). eps-prediction weight is
+  // min(SNR,gamma)/SNR; v-prediction is min(SNR,gamma)/(SNR+1). Pin BOTH
+  // prediction types against the float64 numpy oracle for gamma=5.0, and verify
+  // the gamma=+inf limits: eps -> 1 (unweighted), v -> SNR/(SNR+1).
+  SchedE := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  SchedV := TNNetDiffusionScheduler.Create(cT, dsLinear, dpV, cBeta1, cBetaT);
+  try
+    for i := 0 to High(cSNRProbeT) do
+    begin
+      t := cSNRProbeT[i];
+      AssertEquals('eps gamma=5 @ ' + IntToStr(t),
+        cSNREpsGamma5[i], SchedE.SNRWeight(t, 5.0), 1e-5);
+      AssertEquals('v gamma=5 @ ' + IntToStr(t),
+        cSNRVGamma5[i], SchedV.SNRWeight(t, 5.0), 1e-5);
+      // gamma = +inf: eps weight collapses to the unweighted objective (1.0).
+      AssertEquals('eps gamma=inf -> 1 @ ' + IntToStr(t),
+        1.0, SchedE.SNRWeight(t, cBigGamma), 1e-5);
+      // gamma = +inf: v weight collapses to SNR/(SNR+1) = ab_t.
+      AssertEquals('v gamma=inf -> SNR/(SNR+1) @ ' + IntToStr(t),
+        cSNRVGammaInf[i], SchedV.SNRWeight(t, cBigGamma), 1e-5);
+    end;
+  finally
+    SchedE.Free; SchedV.Free;
   end;
 end;
 

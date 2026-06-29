@@ -981,6 +981,36 @@ begin
         'torch.bin: the pickled object is not a dict/state_dict: %s',
         [ShardPath]);
 
+    // ---- unwrap a nested checkpoint dict --------------------------------
+    // Many checkpoints (e.g. Real-ESRGAN .pth) wrap the actual state_dict in
+    // a single top-level key: {'params_ema': {<tensors>}} (or 'params',
+    // 'state_dict', 'model'). If no top-level value is a tensor but one of
+    // those keys holds a dict, descend into it. EMA weights are preferred.
+    if Length(Root.Keys) > 0 then
+    begin
+      RootKeysHi := High(Root.Keys);
+      ValNode := nil;
+      for i := 0 to RootKeysHi do
+        if Root.Vals[i].Kind = pkTensor then begin ValNode := Root.Vals[i]; break; end;
+      if ValNode = nil then
+      begin
+        // No tensor at top level - look for a known wrapper key.
+        Node := nil;
+        for i := 0 to RootKeysHi do
+          if (Root.Keys[i].Kind = pkStr) and (Root.Vals[i].Kind = pkDict) and
+             (Root.Keys[i].StrVal = 'params_ema') then
+          begin Node := Root.Vals[i]; break; end;
+        if Node = nil then
+          for i := 0 to RootKeysHi do
+            if (Root.Keys[i].Kind = pkStr) and (Root.Vals[i].Kind = pkDict) and
+               ((Root.Keys[i].StrVal = 'params') or
+                (Root.Keys[i].StrVal = 'state_dict') or
+                (Root.Keys[i].StrVal = 'model')) then
+            begin Node := Root.Vals[i]; break; end;
+        if Node <> nil then Root := Node;
+      end;
+    end;
+
     // ---- materialize the tensor table from the unpickled state_dict ----
     // Appends to FTensors: with a sharded checkpoint each shard's
     // state_dict contributes its own tensors (duplicate names across

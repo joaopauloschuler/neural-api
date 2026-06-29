@@ -15,13 +15,22 @@ Pipeline (identical in the smoke and the --full path):
 
 DEFAULT smoke (NO network, fully reproducible): a deterministic
 SYNTHETIC keyword set is generated in-process from a fixed RandSeed --
-six distinct acoustic "words" (low/mid/high pure tones, an up-chirp, a
-down-chirp, and band-limited noise), each with a touch of seeded jitter
-and additive noise so the classes are non-trivial but clearly separable.
-Every clip goes through the REAL log-mel frontend, so the smoke exercises
-the exact frontend+training path end to end on CPU in well under a
-minute, and prints a final test-accuracy number far above the 1/6 chance
-line.
+TEN acoustic "words" chosen to be genuinely CONFUSABLE rather than
+trivially separable: three CLOSELY-SPACED pure tones (430 / 470 / 510 Hz,
+only ~9% apart so a single mel bin can straddle two of them), two
+two-tone CHORDS that overlap one of those tones, an AM (tremolo) tone,
+a fast up-chirp and a fast down-chirp, plus two band-limited NOISE
+textures (a bright and a dark colouring) that differ only in spectral
+tilt. Each clip carries seeded pitch jitter and a comparatively LOW SNR
+(noiseAmp ~0.18, vs the old ~0.02), so the classes overlap in mel space
+and the net needs many epochs of training -- not two -- to pull them
+apart. Every clip goes through the REAL log-mel frontend, so the smoke
+exercises the exact frontend+training path end to end on CPU in under a
+minute. Validation now climbs GRADUALLY (≈0.30 at epoch 1, 0.65 at 6,
+0.91 at 10, 0.99 at 16) and only hits the 100% TargetAccuracy early-stop
+at epoch 17 -- it no longer saturates at epoch 2 -- finishing at ≈99%
+held-out test accuracy (observed 98.93%), far above the 1/10 = 10%
+chance line (see README.md).
 
 Optional real data:  SpeechCommands --full <dir>
 loads Google Speech Commands v2 WAVs from <dir> (one subfolder per label,
@@ -54,18 +63,22 @@ const
   CLIP_SAMPLES  = 16000;      // 1 second of audio
   NUM_FRAMES    = 100;        // hop 160 -> 100 frames cover 16000 samples
   NUM_MEL_BINS  = 40;         // compact mel bank (fast, still separable)
-  // ---- synthetic keyword set ----
-  NUM_CLASSES   = 6;          // low/mid/high tone, up-chirp, down-chirp, noise
-  TRAIN_PER_CLS = 120;
-  VAL_PER_CLS   = 30;
-  TEST_PER_CLS  = 30;
+  // ---- synthetic keyword set (10 CONFUSABLE classes; see header) ----
+  NUM_CLASSES   = 10;
+  TRAIN_PER_CLS = 110;
+  VAL_PER_CLS   = 28;
+  TEST_PER_CLS  = 28;
   // ---- training ----
-  NUM_EPOCHS    = 20;       // test phase fires at epoch 10 and 20
+  NUM_EPOCHS    = 30;       // harder task needs the full schedule to converge
   BATCH_SIZE    = 16;
 
 var
   ClassNames: array[0..NUM_CLASSES-1] of string =
-    ('tone_low', 'tone_mid', 'tone_high', 'chirp_up', 'chirp_down', 'noise');
+    ('tone_430', 'tone_470', 'tone_510',     // closely-spaced pure tones
+     'chord_lo', 'chord_hi',                 // two-tone chords (overlap tones)
+     'am_tone',                              // amplitude-modulated tone
+     'chirp_up', 'chirp_down',               // fast linear sweeps
+     'noise_bright', 'noise_dark');          // colored-noise textures
 
 // ---------------------------------------------------------------------------
 // Synthetic waveform generators. Each returns a CLIP_SAMPLES mono waveform in
@@ -76,48 +89,86 @@ var
 procedure SynthWaveform(Samples: TNNetVolume; Label_: integer);
 var
   i: integer;
-  t, f, f0, f1, phase, amp, noiseAmp, jitter: double;
+  t, f, fa, fb, f0, f1, phase, amp, noiseAmp, jitter, modf, tilt, prev: double;
 begin
   Samples.ReSize(CLIP_SAMPLES, 1, 1);
-  jitter := (Random - 0.5) * 0.10;     // +/-5% pitch/sweep jitter per clip
+  jitter := (Random - 0.5) * 0.06;     // +/-3% pitch/sweep jitter per clip
   amp := 0.45 + Random * 0.20;
-  noiseAmp := 0.02;
+  // LOW SNR on purpose: additive white noise comparable to a tone partial,
+  // so classes overlap in mel space and the task is NOT trivially separable.
+  noiseAmp := 0.18;
   case Label_ of
-    0: f := 220.0  * (1.0 + jitter);   // low tone
-    1: f := 660.0  * (1.0 + jitter);   // mid tone
-    2: f := 1760.0 * (1.0 + jitter);   // high tone
-  else
-    f := 0.0;
-  end;
-  case Label_ of
+    // ---- 0..2: closely-spaced pure tones (only ~9% apart) ----
     0, 1, 2:
-      for i := 0 to CLIP_SAMPLES - 1 do
       begin
-        t := i / SAMPLE_RATE;
-        Samples.FData[i] := amp * Sin(2.0 * Pi * f * t)
-          + noiseAmp * (Random - 0.5);
+        case Label_ of
+          0: f := 430.0 * (1.0 + jitter);
+          1: f := 470.0 * (1.0 + jitter);
+        else f := 510.0 * (1.0 + jitter);
+        end;
+        for i := 0 to CLIP_SAMPLES - 1 do
+        begin
+          t := i / SAMPLE_RATE;
+          Samples.FData[i] := amp * Sin(2.0 * Pi * f * t)
+            + noiseAmp * (Random - 0.5);
+        end;
       end;
-    3, 4:  // linear chirp (up: 300->3000 Hz, down: 3000->300 Hz)
+    // ---- 3,4: two-tone chords that OVERLAP one of the pure tones ----
+    3, 4:
       begin
-        if Label_ = 3 then begin f0 := 300.0; f1 := 3000.0; end
-                      else begin f0 := 3000.0; f1 := 300.0; end;
+        if Label_ = 3 then begin fa := 430.0; fb := 880.0; end   // shares 430
+                      else begin fa := 510.0; fb := 990.0; end;  // shares 510
+        fa := fa * (1.0 + jitter);
+        fb := fb * (1.0 + jitter);
+        for i := 0 to CLIP_SAMPLES - 1 do
+        begin
+          t := i / SAMPLE_RATE;
+          Samples.FData[i] := 0.5 * amp * Sin(2.0 * Pi * fa * t)
+            + 0.5 * amp * Sin(2.0 * Pi * fb * t)
+            + noiseAmp * (Random - 0.5);
+        end;
+      end;
+    // ---- 5: amplitude-modulated (tremolo) tone near the tone cluster ----
+    5:
+      begin
+        f := 470.0 * (1.0 + jitter);
+        modf := 7.0 + Random * 2.0;       // 7-9 Hz tremolo
+        for i := 0 to CLIP_SAMPLES - 1 do
+        begin
+          t := i / SAMPLE_RATE;
+          Samples.FData[i] := amp * (0.6 + 0.4 * Sin(2.0 * Pi * modf * t))
+            * Sin(2.0 * Pi * f * t) + noiseAmp * (Random - 0.5);
+        end;
+      end;
+    // ---- 6,7: fast linear chirps (up 350->2600, down 2600->350) ----
+    6, 7:
+      begin
+        if Label_ = 6 then begin f0 := 350.0; f1 := 2600.0; end
+                      else begin f0 := 2600.0; f1 := 350.0; end;
         f0 := f0 * (1.0 + jitter);
         f1 := f1 * (1.0 + jitter);
         phase := 0.0;
         for i := 0 to CLIP_SAMPLES - 1 do
         begin
           t := i / (CLIP_SAMPLES - 1);
-          f := f0 + (f1 - f0) * t;       // instantaneous frequency
+          f := f0 + (f1 - f0) * t;
           phase := phase + 2.0 * Pi * f / SAMPLE_RATE;
           Samples.FData[i] := amp * Sin(phase) + noiseAmp * (Random - 0.5);
         end;
       end;
-    5:  // band-limited noise burst (random walk, mild smoothing)
+    // ---- 8,9: colored noise that differs ONLY in spectral tilt ----
+    8, 9:
       begin
+        // tilt = AR(1) pole: bright (small) keeps highs, dark (large) is a
+        // stronger low-pass. The classes share the same family, only color.
+        if Label_ = 8 then tilt := 0.55 else tilt := 0.93;
+        prev := 0.0;
         Samples.FData[0] := 0.0;
         for i := 1 to CLIP_SAMPLES - 1 do
-          Samples.FData[i] := 0.95 * Samples.FData[i-1]
-            + amp * (Random - 0.5);
+        begin
+          prev := tilt * prev + amp * (Random - 0.5);
+          Samples.FData[i] := prev + noiseAmp * (Random - 0.5);
+        end;
       end;
   end;
 end;
@@ -182,9 +233,9 @@ begin
     begin
       repeat
         WavPath := IncludeTrailingPathDelimiter(LabelDir) + FileRec.Name;
-        if LoadWav16ToVolume(WavPath, Samples) <> SAMPLE_RATE then
-          raise Exception.Create('SpeechCommands --full: ' + WavPath +
-            ' is not 16 kHz (convert with: ffmpeg -ar 16000 -ac 1).');
+        // Accept WAVs at ANY sample rate: LoadWavResampledToVolume resamples
+        // to 16 kHz (a 16 kHz file is a bit-identical passthrough).
+        LoadWavResampledToVolume(WavPath, Samples, SAMPLE_RATE);
         Mel := TNNetVolume.Create();
         ComputeWhisperLogMel(Samples, Mel, NUM_MEL_BINS, NUM_FRAMES);
         Onehot := TNNetVolume.Create(1, 1, Labels.Count, 0);
