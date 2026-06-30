@@ -60907,7 +60907,7 @@ begin
     OutCPU.Copy(NN.GetLastLayer.Output);
 
     // Device forward (force every position onto the GEMM kernel).
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -60919,7 +60919,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20); // restore default
+      NN.ForceOpenCL(False); // restore per-layer verdict
     end;
     AssertTrue('DeformableConv OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
@@ -60979,7 +60979,7 @@ begin
     NN.Compute(ImgInput.Output);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       ImgInput.Output.Copy(Img);
@@ -60993,7 +60993,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     AssertTrue('FlowWarp OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
@@ -61046,7 +61046,7 @@ begin
     NN.Compute(ImgInput.Output);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       ImgInput.Output.Copy(Img);
@@ -61060,7 +61060,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     AssertTrue('BackwardWarp OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
@@ -61111,7 +61111,7 @@ begin
     NN.Compute(ImgInput.Output);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       ImgInput.Output.Copy(Img);
@@ -61125,7 +61125,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     AssertTrue('AffineGridSample OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
@@ -61167,7 +61167,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -61179,7 +61179,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     AssertTrue('BilinearUpsample OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
@@ -61221,7 +61221,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -61233,7 +61233,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     AssertTrue('PixelShuffle OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
@@ -61275,7 +61275,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -61287,7 +61287,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     AssertTrue('BicubicUpsample OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
@@ -61338,7 +61338,7 @@ begin
     NN.Backpropagate(Desired);
     PrevErrCPU.Copy(NN.Layers[0].OutputError);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -61352,7 +61352,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     AssertTrue('PixelShuffle backward OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-6', MaxDiff < 1e-6);
@@ -61401,7 +61401,7 @@ begin
     NN.Backpropagate(Desired);
     PrevErrCPU.Copy(NN.Layers[0].OutputError);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -61415,7 +61415,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     AssertTrue('BicubicUpsample backward OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-6', MaxDiff < 1e-6);
@@ -61458,7 +61458,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -61470,7 +61470,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     AssertTrue('BilinearResize OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
@@ -61529,7 +61529,7 @@ begin
       NN.Compute(Input);
       OutCPU.Copy(NN.GetLastLayer.Output);
 
-      SetNeuralConvOpenCLMinWork(0);
+      NN.ForceOpenCL(True);
       NN.EnableOpenCL(PlatformId, DeviceId);
       try
         NN.Compute(Input);
@@ -61542,7 +61542,7 @@ begin
           if Diff > MaxDiff then MaxDiff := Diff;
         end;
       finally
-        SetNeuralConvOpenCLMinWork(1 shl 20);
+        NN.ForceOpenCL(False);
       end;
       AssertTrue('Resize2D OpenCL vs CPU parity (' + Cases[ci].Name +
         '): max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
@@ -61590,7 +61590,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -61602,7 +61602,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     AssertTrue('GroupConvP4 OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
@@ -61655,7 +61655,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -61667,7 +61667,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  DepthwiseConv OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('DepthwiseConv OpenCL vs CPU parity: max |diff| = ' +
@@ -61721,7 +61721,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -61733,7 +61733,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  DepthwiseConv1D OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('DepthwiseConv1D OpenCL vs CPU parity: max |diff| = ' +
@@ -61788,7 +61788,7 @@ begin
     OutCPU.Copy(NN.GetLastLayer.Output);
 
     // Device forward (force the scatter-GEMM path).
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -61800,7 +61800,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     AssertTrue('Deconvolution OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
@@ -61858,7 +61858,7 @@ procedure TTestNeuralNumerical.TestKANConvOpenCLParity;
       NN.Compute(Input);
       OutCPU.Copy(NN.GetLastLayer.Output);
 
-      SetNeuralConvOpenCLMinWork(0);
+      NN.ForceOpenCL(True);
       NN.EnableOpenCL(PlatformId, DeviceId);
       try
         NN.Compute(Input);
@@ -61871,7 +61871,7 @@ procedure TTestNeuralNumerical.TestKANConvOpenCLParity;
           if Diff > MaxDiff then MaxDiff := Diff;
         end;
       finally
-        SetNeuralConvOpenCLMinWork(1 shl 20);
+        NN.ForceOpenCL(False);
       end;
       WriteLn('  KANConv ', aName, ' OpenCL parity: max|diff|=', MaxDiff:0:9);
       AssertTrue('KANConv ' + aName + ' OpenCL vs CPU parity: max |diff| = ' +
@@ -61965,7 +61965,7 @@ begin
     IGradCPU.Copy(InLayer.OutputError);
 
     // --- Device backward (force the GEMM path) + compare. ---
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -61987,7 +61987,7 @@ begin
         if Diff > MaxIDiff then MaxIDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  Conv backward OpenCL parity: max|weight-grad diff|=', MaxWDiff:0:9,
       ' max|input-grad diff|=', MaxIDiff:0:9);
@@ -62746,7 +62746,6 @@ var
   DeviceId: cl_device_id;
   i: integer;
   Diff, MaxDiff: TNeuralFloat;
-  SavedMinWork: int64;
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
@@ -62758,7 +62757,6 @@ begin
   VolData := TNNetVolume.Create(W, H, W * H); // correlation volume (W,H,H*W)
   FlowData := TNNetVolume.Create(W, H, 2);    // dense (dx, dy) flow field
   OutCPU := TNNetVolume.Create();
-  SavedMinWork := NeuralConvOpenCLMinWorkValue();
   try
     VolIn := NN.AddLayer(TNNetInput.Create(W, H, W * H, 1)); // volume (PrevLayer)
     FlowIn := NN.AddLayerAfter(TNNetInput.Create(W, H, 2, 1), 0); // flow (2nd src)
@@ -62774,7 +62772,7 @@ begin
       FlowData.Raw[i] := 0.7 * Sin(i * 0.9) - 0.4;
 
     // Force the device path on this small fixture (default threshold is 1M MACs).
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
 
     // CPU forward (OpenCL OFF).
     VolIn.Output.Copy(VolData);
@@ -62784,7 +62782,7 @@ begin
 
     // Device forward (window sampling offloaded to cai_bilinear_gather).
     NN.EnableOpenCL(PlatformId, DeviceId);
-    AssertTrue('CorrelationLookup OpenCL armed', Lookup.ShouldOpenCL);
+    AssertTrue('CorrelationLookup OpenCL armed', Lookup.HasOpenCL);
     VolIn.Output.Copy(VolData);
     FlowIn.Output.Copy(FlowData);
     NN.Compute(VolIn.Output);
@@ -62800,7 +62798,7 @@ begin
     AssertTrue('CorrelationLookup OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
-    SetNeuralConvOpenCLMinWork(SavedMinWork);
+    NN.ForceOpenCL(False);
     OutCPU.Free;
     FlowData.Free;
     VolData.Free;
@@ -62919,7 +62917,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -62931,7 +62929,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  TokenRMSNorm OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('TokenRMSNorm OpenCL vs CPU parity: max |diff| = ' +
@@ -62980,7 +62978,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -62992,7 +62990,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  RoPE OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('RoPE OpenCL vs CPU parity: max |diff| = ' +
@@ -63054,7 +63052,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -63066,7 +63064,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  M-RoPE OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('M-RoPE OpenCL vs CPU parity: max |diff| = ' +
@@ -63128,7 +63126,7 @@ begin
     end;
     for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.5 * Sin(i * 0.41) - 0.2;
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       MaxDiff := 0;
@@ -63164,7 +63162,7 @@ begin
         // extension - exactly the path under test.
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  M-RoPE OpenCL incremental-cache parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('M-RoPE incremental cache vs full-rebuild: max |diff| = ' +
@@ -63217,7 +63215,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -63229,7 +63227,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  LayerNorm OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('LayerNorm OpenCL vs CPU parity: max |diff| = ' +
@@ -63285,7 +63283,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -63298,7 +63296,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  WholeVolume LayerNorm OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('WholeVolume LayerNorm OpenCL vs CPU parity: max |diff| = ' +
@@ -63351,7 +63349,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -63364,7 +63362,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  WholeVolume RMSNorm OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('WholeVolume RMSNorm OpenCL vs CPU parity: max |diff| = ' +
@@ -63425,7 +63423,7 @@ begin
       NN.Compute(Input);
       OutCPU.Copy(NN.GetLastLayer.Output);
 
-      SetNeuralConvOpenCLMinWork(0);
+      NN.ForceOpenCL(True);
       NN.EnableOpenCL(PlatformId, DeviceId);
       try
         NN.Compute(Input);
@@ -63438,7 +63436,7 @@ begin
           if Diff > MaxDiff then MaxDiff := Diff;
         end;
       finally
-        SetNeuralConvOpenCLMinWork(1 shl 20);
+        NN.ForceOpenCL(False);
       end;
       WriteLn('  ', Names[v], ' OpenCL parity: max|diff|=', MaxDiff:0:9);
       AssertTrue(Names[v] + ' OpenCL vs CPU parity: max |diff| = ' +
@@ -63493,7 +63491,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -63505,7 +63503,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  GroupNorm OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('GroupNorm OpenCL vs CPU parity: max |diff| = ' +
@@ -63550,7 +63548,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -63562,7 +63560,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  L2Normalize OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('L2Normalize OpenCL vs CPU parity: max |diff| = ' +
@@ -63608,7 +63606,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -63620,7 +63618,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  PixelNorm OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('PixelNorm OpenCL vs CPU parity: max |diff| = ' +
@@ -63672,7 +63670,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -63684,7 +63682,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  InstanceNorm OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('InstanceNorm OpenCL vs CPU parity: max |diff| = ' +
@@ -63737,7 +63735,7 @@ begin
     NN.Compute(ContentInput.Output);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       // EnableOpenCL may have reset the input volumes; re-seed them.
@@ -63754,7 +63752,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  AdaIN OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('AdaIN OpenCL vs CPU parity: max |diff| = ' +
@@ -63801,7 +63799,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -63813,7 +63811,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  MaxPool OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('MaxPool OpenCL vs CPU parity: max |diff| = ' +
@@ -63860,7 +63858,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -63872,7 +63870,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  AvgPool OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('AvgPool OpenCL vs CPU parity: max |diff| = ' +
@@ -63925,7 +63923,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -63937,7 +63935,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  Embedding OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('Embedding OpenCL vs CPU parity: max |diff| = ' +
@@ -63985,7 +63983,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -63998,7 +63996,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  PointwiseSoftMax OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('PointwiseSoftMax OpenCL vs CPU parity: max |diff| = ' +
@@ -64046,7 +64044,7 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    SetNeuralConvOpenCLMinWork(0);
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
@@ -64059,7 +64057,7 @@ begin
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
     finally
-      SetNeuralConvOpenCLMinWork(1 shl 20);
+      NN.ForceOpenCL(False);
     end;
     WriteLn('  WholeVolume SoftMax OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('WholeVolume SoftMax OpenCL vs CPU parity: max |diff| = ' +

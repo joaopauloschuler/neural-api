@@ -53,14 +53,6 @@ const
   cMaxIters   = 8192;  // ... but never exceed this many forwards per measurement
   cWarmups    = 3;     // discarded forwards before each timed measurement
 
-  // Device dispatch threshold (output-element MACs) below which the conv/
-  // elementwise layer family stays on the CPU. The library default is 2^16; we
-  // set it explicitly here so the benchmark is self-describing and exercises the
-  // device path for mid-sized tensors regardless of the build's default. Set to
-  // 0 to force EVERY capable layer onto the device (will show <1x rows where the
-  // host wins - that is the point: it charts the per-layer crossover).
-  cMinWorkMACs = 1 shl 16;
-
   cVocab   = 32000;  // embedding vocabulary (table size, not a per-forward size)
 
 // Input profiles. The values below are the moderate BASE sizes; the optional
@@ -159,8 +151,12 @@ begin
       for Cnt := 1 to cWarmups do NN.Compute(Inp);
       CpuUs := TimeForward(NN, Inp, ItersC);
 
-      // OpenCL path (warmup absorbs kernel compile + first upload).
+      // OpenCL path (warmup absorbs kernel compile + first upload). ForceOpenCL
+      // overrides each layer's per-layer size verdict so every OpenCL-capable
+      // layer dispatches to the device regardless of tensor size - that is what
+      // charts the per-layer crossover (the <1x rows are the point).
       NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.ForceOpenCL(True);
       for Cnt := 1 to cWarmups do NN.Compute(Inp);
       NN.ClearTime(); // zero the dispatch counters so GpuCnt covers only the measure
       GpuUs := TimeForward(NN, Inp, ItersG);
@@ -222,7 +218,6 @@ begin
     RandSeed := 424242; // deterministic inputs across runs
     AnyFallback := False;
     AnyError := False;
-    SetNeuralConvOpenCLMinWork(cMinWorkMACs); // lower the device dispatch gate
 
     // Optional input scale factor (argv[1], default 1). Integer multiply keeps
     // every divisibility invariant the layers need (see the profile comment), so
@@ -239,8 +234,7 @@ begin
     WriteLn(Format('Input scale factor: %d (argv[1]; default 1)', [cScale]));
     WriteLn(Format('Profiles: SEQ=(%d,1,D)  VIS=(%d,%d,C)  d_k=%d  d_model=%d',
       [cSeqLen, cVisX, cVisY, cDk, cDModel]));
-    WriteLn(Format('Device dispatch gate: NeuralConvOpenCLMinWork = %d output elements',
-      [cMinWorkMACs]));
+    WriteLn('Dispatch: per-layer FShouldOpenCL verdict, overridden by NN.ForceOpenCL(True)');
     WriteLn(Format('Auto-scaled timing: >= %.2fs/measurement, cap %d forwards, %d warmups',
       [cMinSeconds, cMaxIters, cWarmups]));
     WriteLn;

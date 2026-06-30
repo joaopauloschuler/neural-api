@@ -25,6 +25,7 @@ examples/EnCodecRoundTrip/EnCodecRoundTrip
 examples/MusicGenSmoke/MusicGenSmoke
 examples/MusicGenText/MusicGenText
 examples/MusicGenText/musicgen_text_demo.wav
+examples/OpenCLForwardBenchmark/OpenCLForwardBenchmark
 examples/LotteryTicketIMP/LotteryTicketIMP
 examples/LatentTextToImage/LatentTextToImage
 examples/KokoroTTS/KokoroTTS

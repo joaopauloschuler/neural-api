@@ -79,6 +79,47 @@ rather than acted on.
       Likely an AVX-vs-scalar reassociation crossing the test's exact-equality
       tolerance; either loosen that one assertion to a small epsilon or pin the
       reassociation. Whole suite is otherwise 0/0 on both builds.
+- [ ] BUG: `MRoPEOpenCLIncrementalCacheParity` (TestNeuralNumerical.pas, proc at
+      ~line 63088) fails NONDETERMINISTICALLY — `max|diff|` swings between
+      `0.000000000` (pass) and garbage like `1.86e34` (fail, asserted `< 1e-6`).
+      It passed 1306/1307 inside the full suite on one run but fails ~5/5 when run
+      in ISOLATION (`./RunTests --suite=MRoPEOpenCLIncrementalCacheParity`); the
+      outcome depends on surrounding allocations, i.e. an UNINITIALIZED-MEMORY /
+      heap over-read, not a logic error. Surfaced during the per-layer
+      `WillOpenCL`/`FShouldOpenCL` dispatch refactor (drop of the global
+      `NeuralConvOpenCLMinWork` gate): adding the `FForceOpenCL: boolean` field to
+      every `TNNetLayer` shifted heap layout and EXPOSED a pre-existing latent bug
+      — it is NOT caused by the dispatch change. Evidence it is pre-existing/
+      memory, not dispatch logic: (1) the M-RoPE dispatch predicate is
+      functionally identical before/after (old guard `FHasOpenCL and FShouldOpenCL
+      and Assigned(FMRoPECL) and (FOutput.Size >= NeuralConvOpenCLMinWork)` forced
+      via the test's old `SetNeuralConvOpenCLMinWork(0)`; new
+      `Assigned(FMRoPECL) and FHasOpenCL and (FShouldOpenCL or FForceOpenCL)`
+      forced via the test's new `NN.ForceOpenCL(True)` — both dispatch the GPU
+      path on every step); (2) on the PRISTINE tree the test passes 8/8 in
+      isolation (rebuilt `-dOpenCL`, PoCL CPU device); (3) the NON-incremental
+      `M-RoPE OpenCL parity` test passes (~6e-8), so only the incremental-cache
+      REUSE path is affected; (4) the value is a garbage float, and context-
+      dependence = uninitialized read. Ruled out so far: `TVolume.ReSize`
+      (neuralvolume.pas ~6080) uses `SetLength(FData,...)` which PRESERVES the
+      cached prefix on grow, so `FAngleTable`'s reused rows `[0,FAngleCacheRows)`
+      survive; `BuildThetaCache`/`FTheta` and the SetPositions length check run
+      BEFORE the `WillOpenCL` dispatch so `FTheta[k]` is valid; `HalfD` is held
+      constant by the `FCachedHalfD = HalfD` reuse guard. Suspected remaining
+      cause: a heap over-read in `TNNetMRotaryEmbedding.ComputeOpenCL`
+      (neuralnetwork.pas ~39622) and/or the `FMRoPECL.Rotate(FPrevLayer.FOutput,
+      FAngleTable, FOutput, SeqLen, Depth, HalfD, FOutScale)` device-buffer
+      handling — note `FOutput` is NOT resized per incremental step (stays at the
+      SetPrevLayer full `(MaxLen,1,Depth)`) while `FPrevLayer.FOutput` IS resized
+      to the length-`step` prefix by the test, so the kernel runs with mismatched
+      input/output `SizeX` (input SizeX=step, output SizeX=MaxLen) though both
+      stride by `Depth`; verify the OpenCL input/output buffer sizes and the cache
+      snapshot arrays (`FCachedPosT/H/W`, sized via `SetLength(...,SeqLen)`) for an
+      out-of-range index when `SeqLen < FOutput.SizeX`. Repro: build RunTests with
+      `-dOpenCL` (PoCL device present), `./RunTests --suite=MRoPEOpenCLIncrementalCacheParity`
+      a few times. Next step: run under valgrind/heaptrc to pinpoint the exact
+      uninitialized read, then fix the M-RoPE GPU incremental cache (this is GPU
+      kernel/cache code, separate from the dispatch refactor).
 - [ ] FFT-path FPU denormal/invalid-op traps in TNNetSpectralConv2D needed an
       example-side SetExceptionMask workaround — consider masking/guarding the
       denormals inside the layer's FFT so callers don't have to.
