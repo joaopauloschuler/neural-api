@@ -87,59 +87,41 @@ rather than acted on.
       parsed/applied. A tokenizer.json that declares a standard NFKC/NFKD
       normalizer already works in full (`UnicodeNormalize` + `AddNormalizer`,
       landed); only the embedded charsmap is unhandled.
-- [ ] `TNNetKANConv` OpenCL forward allocates a `Taps²`-blown-up result buffer
-      and OOMs/segfaults for any realistic conv shape. In the device forward
-      (`neuralnetwork.pas` ~81139-81143, the `{$IFDEF OpenCL}` GEMM path gated
-      above `NeuralConvOpenCLMinWork` at ~80929) the result buffer is sized
-      `FGemmResKan.ReSize(NumAs * NumBs, 1, 1)` where `NumAs = OutDepth*Taps`
-      and `NumBs = NumPos*Taps` (`NumPos = OutW*OutH`, `Taps = FeatSizeX*
-      FeatSizeY*InDepth`, `C = FCoeffsPerEdge`). That materializes the FULL
-      all-pairs `cai_dot_product` cross product `NumAs x NumBs =
-      OutDepth*NumPos*Taps^2` contracting only over `C`, then the read-back
-      (~81145-81161) keeps ONLY the tap-diagonal entries
-      (`Res[(p*Taps+tap)*NumAs + (oo*Taps+tap)]` summed over `tap`). So
-      ~`(1 - 1/Taps)` of the computed result is discarded, the buffer is `Taps^2`
-      larger than the `OutDepth*NumPos` actually needed, and the device does
-      `Taps`x the necessary FLOPs. Concrete repro shape from
-      `examples/OpenCLForwardBenchmark` (Input 32x32x64 ->
-      `TNNetKANConv.Create(64,3,1,1)`, degree 3): `OutDepth=64, NumPos=1024,
-      Taps=576, C=4` -> `NumAs=36864, NumBs=589824`, result =
-      `21,743,271,936` floats = `86,973,087,744` bytes (~81 GB) ->
-      `clCreateBuffer :-61` (CL_INVALID_BUFFER_SIZE) then an uncatchable
-      `EAccessViolation` INSIDE the driver (a Pascal `try/except` cannot stop
-      it; it aborts the whole process). Verified on POCL CPU device; KANConv on
-      CPU is fine, so the bug is isolated to the OpenCL forward. FIX: the wanted
-      output is `out[p,oo] = sum_tap sum_k A[oo,tap,k]*B[p,tap,k]`, i.e. a single
-      dot product over a COMBINED `Taps*C` axis. Lay A out as
-      `[OutDepth x (Taps*C)]` and B as `[NumPos x (Taps*C)]`, call
-      `PrepareForCompute(..., Taps*C)` with `NumAs=OutDepth`, `NumBs=NumPos`,
-      and replace the diagonal-extraction read-back with a direct copy
-      `Res[p*OutDepth + oo]` (or `oo*NumPos + p`, matching the kernel's
-      interleave). Result buffer drops from `OutDepth*NumPos*Taps^2` to
-      `OutDepth*NumPos` (~331,000x smaller at this shape: 81 GB -> ~256 KB) with
-      no wasted off-diagonal compute; the per-`(.,tap)` block data is already in
-      the needed interleaved layout, so it is mostly a regrouping + contraction-
-      length change. Add a device-vs-CPU parity test (and keep KANConv excluded
-      from `OpenCLForwardBenchmark` until fixed; it is listed there under
-      "Known device-path faults"). Backward and the CPU forward are unaffected.
-      SHARED PATTERN — this all-pairs-`cai_dot_product`-then-extract-diagonal
-      offload is used by FOUR layers, each with a squared dimension in the result
-      buffer: `TNNetDepthwiseConv.ComputeOpenCL` (~48751
-      `FGemmResDw.ReSize(NumAs*NumBs,..)`, depth-diagonal), `TNNetDepthwiseConv1D`
-      (~51931 `FGemmRes.ReSize(Channels*(Channels*SeqLen),..)` = `Channels^2*
-      SeqLen`, channel-diagonal), `TNNetKANConv` (~81146, `Taps^2`, tap-diagonal),
-      and `TNNetDeconvolution.ComputeOpenCL` (~86547 `FGemmRes.ReSize(NumBs*NumAs,
-      ..)`). KANConv and DepthwiseConv1D are the worst because the squared term
-      (`Taps^2` / `Channels^2`) dominates: with the dispatch gate now at `2^16`,
-      DepthwiseConv1D at `(SeqLen=512, Depth=1024)` asks for `1024^2*512` floats =
-      2 GB and faults on a small device (observed: `clCreateBuffer :-61` then a
-      cascade of uncatchable `EAccessViolation`). DepthwiseConv(2D) and
-      Deconvolution stayed under the overflow at the benchmark's moderate shapes
-      (they run, just wastefully). The COMBINED-axis fix above applies to all
-      four (contract over the diagonal axis instead of materializing the full
-      cross product); fixing them as a family + one shared parity test is the
-      right scope. Until then `OpenCLForwardBenchmark` keeps tensors moderate so
-      only KANConv (which overflows at any shape, `Taps=576`) needs excluding.
+- [X] `TNNetKANConv` OpenCL forward allocated a `Taps²`-blown-up result buffer
+      and OOMed/segfaulted for any realistic conv shape (the `{$IFDEF OpenCL}`
+      GEMM path materialized the FULL all-pairs `cai_dot_product` cross product
+      `NumAs x NumBs = OutDepth*NumPos*Taps^2`, then kept only the tap-diagonal).
+      Concrete repro (Input 32x32x64 -> `TNNetKANConv.Create(64,3,1,1)`, degree 3):
+      result = 21,743,271,936 floats (~81 GB) -> `clCreateBuffer :-61` then an
+      uncatchable `EAccessViolation` inside the driver. FIXED (commit on `a3`):
+      the wanted output `out[p,oo] = sum_tap sum_k A[oo,tap,k]*B[p,tap,k]` is one
+      dot product over the COMBINED `Taps*C` axis, so KANConv now lays A out as
+      `[OutDepth x (Taps*C)]` (B was already in that layout), calls
+      `PrepareForCompute(..., Taps*C)` with `NumAs=OutDepth, NumBs=NumPos`, and
+      reads `Res[p*OutDepth + oo]` directly. Buffer drops `OutDepth*NumPos*Taps^2`
+      -> `OutDepth*NumPos` (~331,000x at that shape: 81 GB -> ~256 KB) with NO
+      wasted off-diagonal compute - on POCL it went from OOM to a 6.43x speedup.
+      SHARED PATTERN (RESOLVED) — the same all-pairs-then-extract-diagonal offload
+      was used by three more layers; status after this batch:
+      * `TNNetDepthwiseConv1D` (~51931, was `Channels^2*SeqLen`, channel-diagonal)
+        and `TNNetDepthwiseConv` (~48751, was `NumAs*NumBs`, depth-diagonal) are
+        GENUINELY block-diagonal (each group feeds a different output, so the
+        group axis canNOT be folded into the contraction the way KAN's tap axis
+        can). They now TILE the B axis so the transient result never exceeds
+        `csOpenCLMaxGemmResElems` (2^24 floats = 64 MB) - numerics identical to the
+        un-tiled GEMM (DepthwiseConv1D is bit-exact), no OOM at any shape. The
+        per-group cross-product waste remains (a perf, not correctness, issue);
+        a true batched/grouped dot-product kernel would remove it - left as a
+        follow-up.
+      * `TNNetDeconvolution.ComputeOpenCL` (~86547 `FGemmRes.ReSize(NumBs*NumAs)`)
+        was MISCLASSIFIED here: its scatter step consumes the FULL `NumBs x NumAs`
+        result (every input cell x tap x out-channel), so it is a legitimate dense
+        GEMM, not a diagonal-extraction waste. No change; buffer is proportional to
+        real deconv FLOPs.
+      Verified on the POCL CPU device via a device-vs-CPU parity harness: all
+      four layers fire on the device with max abs diff at f32 rounding (~1e-6),
+      and the two previously-OOMing shapes (KAN 81 GB, DepthwiseConv1D 2 GB) now
+      run. `OpenCLForwardBenchmark` re-includes `TNNetKANConv`.
 
 ## Infrastructure / dev experience
 

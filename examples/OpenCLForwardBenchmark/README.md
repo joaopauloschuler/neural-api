@@ -37,9 +37,10 @@ Input profiles: `SEQ = (256, 1, D)` for sequence/transformer layers,
 named constants at the top of the `.lpr` (`cSeqLen`, `cVisX/Y/C`, `cDk`, ...).
 They are kept moderate on purpose: the benchmark lowers the device dispatch gate
 `NeuralConvOpenCLMinWork` to `2^16` (`cMinWorkMACs`), so these sizes already push
-the conv/norm/gate/softmax family onto the device without needing giant tensors -
-which also avoids OOMing the OpenCL paths whose result buffer carries a squared
-dimension (see "Known device-path faults"). Raise them to sweep, but with care.
+the conv/norm/gate/softmax family onto the device without needing giant tensors.
+(The depthwise/KAN paths whose result buffer once grew with the square of the
+group count - and could reach tens of GB - have been fixed; see the GEMV-diagonal
+note in `tasklist.md`.) Raise them to sweep.
 
 This is a microbenchmark of isolated single layers, not a model — the numbers
 show where the device beats the host for each operator in isolation. Wall-clock
@@ -64,12 +65,13 @@ Multi-input layers need a second source branch and are not benchmarked here:
 `TNNetBackwardWarp`, `TNNetFlowWarp`, `TNNetAdaIN`, `TNNetCorrelationVolume`,
 `TNNetCorrelationLookup`.
 
-Two further single-input layers are excluded by name:
-- `TNNetKANConv` - its OpenCL forward requests a ~81 GB buffer at the benchmark
-  shape and segfaults inside the driver (an uncatchable native fault). Worth a
-  separate investigation.
+One further single-input layer is excluded by name:
 - `TNNetMRotaryEmbedding` - requires `SetPositions` (a multimodal T/H/W position
   grid) before any forward, which this generic harness does not supply.
+
+(`TNNetKANConv` used to be excluded too - its OpenCL forward requested a ~81 GB
+buffer and segfaulted inside the driver. That has been fixed: it now contracts
+the combined tap axis into a single dense GEMM, so it is back in the sweep.)
 
 ## Build & run
 

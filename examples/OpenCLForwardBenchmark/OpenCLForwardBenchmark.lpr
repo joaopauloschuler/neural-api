@@ -57,10 +57,11 @@ const
 
   // Input profiles. Kept moderate on purpose: with the dispatch gate lowered to
   // 2^16 (below), these sizes already push the conv/norm/gate/softmax family onto
-  // the device, so there is no need for giant tensors. Larger tensors also OOM
-  // some OpenCL paths whose result buffer carries a squared dimension (see the
-  // "Known device-path faults" note) - e.g. DepthwiseConv1D at (512,1,1024) tries
-  // a 2 GB buffer. Tune these to sweep, but raise with care.
+  // the device, so there is no need for giant tensors. (The depthwise/KAN device
+  // paths whose result buffer once carried a squared dimension - and could reach
+  // tens of GB - have since been fixed: KANConv contracts the combined tap axis
+  // and the depthwise layers tile the B axis. See the GEMV-diagonal note in
+  // tasklist.md.) Tune these to sweep.
   cVisX    = 32;     // VIS spatial width
   cVisY    = 32;     // VIS spatial height
   cVisC    = 64;     // VIS input channels
@@ -234,11 +235,8 @@ begin
     Bench('TNNetDepthwiseConv1D', NN, Inp);
     NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetGroupConvP4.Create(cVisFeat div 4, 3, 1, 1));
     Bench('TNNetGroupConvP4', NN, Inp);
-    // TNNetKANConv is intentionally excluded: its OpenCL forward path requests a
-    // pathological buffer (~81 GB) and faults inside the device driver, which is
-    // an unrecoverable native segfault (a try/except cannot catch it, so it would
-    // abort the whole sweep). Flagged as a library issue worth a separate look;
-    // see the "Known device-path faults" note at the end.
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetKANConv.Create(cVisFeat, 3, 1, 1));
+    Bench('TNNetKANConv', NN, Inp);
     NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetDeformableConv.Create(cVisFeat, 3, 1, 1));
     Bench('TNNetDeformableConv', NN, Inp);
 
@@ -332,11 +330,9 @@ begin
       + 'TNNetCrossAttention, TNNetGridSample, TNNetAffineGridSample, '
       + 'TNNetBackwardWarp, TNNetFlowWarp, TNNetAdaIN, TNNetCorrelationVolume, '
       + 'TNNetCorrelationLookup.');
-    WriteLn('Known device-path faults (excluded): TNNetKANConv - its OpenCL '
-      + 'forward requests a ~81 GB buffer at the benchmark shape and segfaults '
-      + 'inside the driver (uncatchable). Worth a separate investigation. '
-      + 'TNNetMRotaryEmbedding needs SetPositions before a forward and is also '
-      + 'excluded from this generic harness.');
+    WriteLn('Excluded: TNNetMRotaryEmbedding needs SetPositions (a multimodal '
+      + 'T/H/W position grid) before a forward and is not supported by this '
+      + 'generic single-input harness.');
   finally
     EasyCL.Free;
   end;
