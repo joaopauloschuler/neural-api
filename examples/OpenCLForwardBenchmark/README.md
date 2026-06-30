@@ -34,13 +34,28 @@ pays kernel compilation and buffer upload, which the warmup absorbs.
 
 Input profiles: `SEQ = (256, 1, D)` for sequence/transformer layers,
 `VIS = (32, 32, C)` for spatial layers; `d_k = 64`, `d_model = 512`. These are
-named constants at the top of the `.lpr` (`cSeqLen`, `cVisX/Y/C`, `cDk`, ...).
-They are kept moderate on purpose: the benchmark lowers the device dispatch gate
-`NeuralConvOpenCLMinWork` to `2^16` (`cMinWorkMACs`), so these sizes already push
-the conv/norm/gate/softmax family onto the device without needing giant tensors.
-(The depthwise/KAN paths whose result buffer once grew with the square of the
-group count - and could reach tens of GB - have been fixed; see the GEMV-diagonal
-note in `tasklist.md`.) Raise them to sweep.
+the base sizes at the top of the `.lpr` (`cSeqLen`, `cVisX/Y/C`, `cDk`, ...).
+
+To sweep larger without recompiling, pass an **integer scale factor** as the
+first argument; it multiplies every profiled dimension:
+
+```
+OpenCLForwardBenchmark        # base sizes (default == scale 1)
+OpenCLForwardBenchmark 4      # every dimension x4
+```
+
+An integer factor is used deliberately: the base sizes satisfy each layer's
+divisibility invariants (channels `/8` for GroupNorm and `/4` for GroupConvP4,
+even gate/RoPE depths, `3*d_k` packing) and integer multiplication preserves
+them, so no factor can produce an illegal shape. A non-numeric or `<1` argument
+falls back to 1. The resolved sizes (and the factor) are echoed in the banner.
+
+The base sizes are kept moderate on purpose: the benchmark lowers the device
+dispatch gate `NeuralConvOpenCLMinWork` to `2^16` (`cMinWorkMACs`), so they
+already push the conv/norm/gate/softmax family onto the device without needing
+giant tensors. (The depthwise/KAN paths whose result buffer once grew with the
+square of the group count - and could reach tens of GB - have been fixed; see
+the GEMV-diagonal note in `tasklist.md`, so large factors are now safe.)
 
 This is a microbenchmark of isolated single layers, not a model — the numbers
 show where the device beats the host for each operator in isolation. Wall-clock

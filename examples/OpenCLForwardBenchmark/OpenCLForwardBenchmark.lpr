@@ -30,6 +30,12 @@ concept here - the program always exits 0 (it is a benchmark, not a test). With
 no OpenCL platform available it prints SKIP and exits 0 (harmless in CPU-only
 CI).
 
+An optional integer input scale factor (argv[1], default 1) multiplies every
+profiled dimension, so the same binary can sweep from the moderate default up to
+GPU-saturating tensors without a rebuild:
+  OpenCLForwardBenchmark        # base sizes (default, == scale 1)
+  OpenCLForwardBenchmark 4      # every dimension x4
+
 Build (from this directory):
   fpc -Mobjfpc -Sh -O3 -dAVX2 -dRelease -dOpenCL -Fu../../neural OpenCLForwardBenchmark.lpr
 
@@ -55,25 +61,33 @@ const
   // host wins - that is the point: it charts the per-layer crossover).
   cMinWorkMACs = 1 shl 16;
 
-  // Input profiles. Kept moderate on purpose: with the dispatch gate lowered to
-  // 2^16 (below), these sizes already push the conv/norm/gate/softmax family onto
-  // the device, so there is no need for giant tensors. (The depthwise/KAN device
-  // paths whose result buffer once carried a squared dimension - and could reach
-  // tens of GB - have since been fixed: KANConv contracts the combined tap axis
-  // and the depthwise layers tile the B axis. See the GEMV-diagonal note in
-  // tasklist.md.) Tune these to sweep.
-  cVisX    = 32;     // VIS spatial width
-  cVisY    = 32;     // VIS spatial height
-  cVisC    = 64;     // VIS input channels
-  cVisFeat = 128;    // VIS conv output features
-  cSeqLen  = 256;    // SEQ sequence length
-  cDModel  = 512;    // SEQ model width (norms, softmax, pointwise gates)
-  cDk      = 64;     // attention head dim; QKV-packed input depth = 3*cDk
-  cGateIn  = 1024;   // gated-activation input depth (even; output halves)
-  cFCIn    = 2048;   // FullConnect flattened input/output width
-  cVocab   = 32000;  // embedding vocabulary size
-  cRoPEDim = 128;    // rotary embedding depth (even)
-  cRnnDim  = 256;    // LSTM/GRU cell width
+  cVocab   = 32000;  // embedding vocabulary (table size, not a per-forward size)
+
+// Input profiles. The values below are the moderate BASE sizes; the optional
+// command-line scale factor (argv[1], default 1) multiplies every
+// compute-relevant dimension at startup. An INTEGER factor is used on purpose:
+// it preserves every divisibility invariant the layers need - channels stay /8
+// (GroupNorm) and /4 (GroupConvP4), gated-activation and RoPE depths stay even,
+// attention stays 3*d_k - because integer multiplication keeps divisibility, so
+// no per-dimension rounding is needed and no factor can produce an illegal
+// shape. The resolved sizes are echoed in the banner. With the dispatch gate at
+// 2^16 the base sizes already exercise the device; raise the factor to push a
+// real GPU (the depthwise/KAN result-buffer OOMs are fixed, so large factors are
+// safe - see the GEMV-diagonal note in tasklist.md). These are var, not const,
+// only so the factor can scale them.
+var
+  cVisX:    integer = 32;    // VIS spatial width
+  cVisY:    integer = 32;    // VIS spatial height
+  cVisC:    integer = 64;    // VIS input channels
+  cVisFeat: integer = 128;   // VIS conv output features
+  cSeqLen:  integer = 256;   // SEQ sequence length
+  cDModel:  integer = 512;   // SEQ model width (norms, softmax, pointwise gates)
+  cDk:      integer = 64;    // attention head dim; QKV-packed input depth = 3*cDk
+  cGateIn:  integer = 1024;  // gated-activation input depth (even; output halves)
+  cFCIn:    integer = 2048;  // FullConnect flattened input/output width
+  cRoPEDim: integer = 128;   // rotary embedding depth (even)
+  cRnnDim:  integer = 256;   // LSTM/GRU cell width
+  cScale:   integer = 1;     // argv[1]: multiplies the dimensions above
 
 var
   EasyCL: TEasyOpenCL;
@@ -210,7 +224,19 @@ begin
     AnyError := False;
     SetNeuralConvOpenCLMinWork(cMinWorkMACs); // lower the device dispatch gate
 
+    // Optional input scale factor (argv[1], default 1). Integer multiply keeps
+    // every divisibility invariant the layers need (see the profile comment), so
+    // any positive factor yields a legal shape. A non-numeric/<1 arg falls back
+    // to 1, leaving the run identical to the no-argument default.
+    if ParamCount >= 1 then cScale := StrToIntDef(ParamStr(1), 1);
+    if cScale < 1 then cScale := 1;
+    cVisX := cVisX * cScale;  cVisY := cVisY * cScale;  cVisC := cVisC * cScale;
+    cVisFeat := cVisFeat * cScale;  cSeqLen := cSeqLen * cScale;
+    cDModel := cDModel * cScale;  cDk := cDk * cScale;  cGateIn := cGateIn * cScale;
+    cFCIn := cFCIn * cScale;  cRoPEDim := cRoPEDim * cScale;  cRnnDim := cRnnDim * cScale;
+
     WriteLn('OpenCL: ', EasyCL.PlatformNames[0], ' / ', EasyCL.DeviceNames[0]);
+    WriteLn(Format('Input scale factor: %d (argv[1]; default 1)', [cScale]));
     WriteLn(Format('Profiles: SEQ=(%d,1,D)  VIS=(%d,%d,C)  d_k=%d  d_model=%d',
       [cSeqLen, cVisX, cVisY, cDk, cDModel]));
     WriteLn(Format('Device dispatch gate: NeuralConvOpenCLMinWork = %d output elements',
