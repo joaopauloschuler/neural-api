@@ -79,8 +79,25 @@ rather than acted on.
       Likely an AVX-vs-scalar reassociation crossing the test's exact-equality
       tolerance; either loosen that one assertion to a small epsilon or pin the
       reassociation. Whole suite is otherwise 0/0 on both builds.
-- [ ] BUG: `MRoPEOpenCLIncrementalCacheParity` (TestNeuralNumerical.pas, proc at
+- [X] BUG (FIXED): `MRoPEOpenCLIncrementalCacheParity` (TestNeuralNumerical.pas, proc at
       ~line 63088) fails NONDETERMINISTICALLY — `max|diff|` swings between
+      `0.000000000` (pass) and garbage like `1.86e34` (fail, asserted `< 1e-6`).
+      ROOT CAUSE confirmed = the suspected `FOutput` SizeX mismatch below. SetPrevLayer
+      (TNNetIdentity) sizes `FOutput` to the FULL `(MaxLen,1,Depth)` and RoPE's
+      Compute/ComputeOpenCL never resized it per step, so on an incremental forward
+      (`SeqLen < MaxLen`) `FMRoPECL.Rotate` allocated a `MaxLen*Depth` device output
+      buffer (`CreateOutputBuffer(FOutput)`), the kernel wrote only the `SeqLen*Depth`
+      prefix, and `ReadBuffer` copied the WHOLE buffer back — so the tail
+      `[SeqLen*Depth..MaxLen*Depth)` was uninitialized device memory (nondeterministic
+      garbage). Both cached and reference paths copy the full `FOutput`; identical
+      prefix, differing garbage tail → exploding `max|diff|`. FIX: resize `FOutput` to
+      `(SeqLen,1,Depth)` before the `Rotate` round-trip in BOTH
+      `TNNetMRotaryEmbedding.ComputeOpenCL` (~39664) and `TNNetRotaryEmbedding.
+      ComputeOpenCL` (~39129) — no-op when SeqLen is the full length. Verified: test
+      now `max|diff|=0.0` deterministically over 5 isolated runs; all RoPE/MRoPE
+      forward+parity+grad tests pass; full numerical suite 1307/1307; clean
+      non-OpenCL `-B` build. Original diagnosis kept below for the record.
+- [x] (original report) `max|diff|` swings between
       `0.000000000` (pass) and garbage like `1.86e34` (fail, asserted `< 1e-6`).
       It passed 1306/1307 inside the full suite on one run but fails ~5/5 when run
       in ISOLATION (`./RunTests --suite=MRoPEOpenCLIncrementalCacheParity`); the
