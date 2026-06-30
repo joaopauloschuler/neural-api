@@ -62120,7 +62120,11 @@ begin
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
 
-    // Device forward (offload ARMED).
+    // Device forward (offload ARMED). GramMatrix's production verdict is pinned
+    // to CPU (FShouldOpenCL := false, bandwidth-bound), so force the device path
+    // here to keep this parity check meaningful (mirrors the other *OpenCLParity
+    // tests, which all ForceOpenCL(True) before the device Compute).
+    NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     NN.Compute(Input);
 
