@@ -39666,7 +39666,7 @@ end;
 procedure EnableConvOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
 begin
   if not Assigned(FConvDotKernel) then
-    FConvDotKernel := TDotProductCL.Create(platform_id, device_id);
+    FConvDotKernel := TDotProductCL.Create(platform_id, device_id, 'cai_dot_product', {pHideMessages}true);
   if not Assigned(FConvDotCL) then
   begin
     FConvDotCL := TDotProductSharedKernel.Create(FConvDotKernel);

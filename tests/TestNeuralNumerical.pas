@@ -61618,7 +61618,7 @@ begin
 end;
 {$ENDIF}
 
-// Depthwise 2-D conv (TNNetDepthwiseConv) device depth-diagonal-GEMV parity.
+// Depthwise 2-D conv (TNNetDepthwiseConv) true-depthwise device-kernel parity.
 // Build the depthwise conv (multiplier>1, pad, stride), compute on the CPU,
 // then force the device path (SetNeuralConvOpenCLMinWork(0)) and assert the
 // outputs match within 1e-4. Skips gracefully when no OpenCL device is present.
@@ -61684,7 +61684,7 @@ begin
 end;
 {$ENDIF}
 
-// Depthwise 1-D causal conv (TNNetDepthwiseConv1D) device diagonal-GEMV parity.
+// Depthwise 1-D causal conv (TNNetDepthwiseConv1D) true-depthwise device-kernel parity.
 procedure TTestNeuralNumerical.TestDepthwiseConv1DOpenCLParity;
 {$IFDEF OpenCL}
 var

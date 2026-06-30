@@ -171,7 +171,7 @@ type
       function PrepareKernel(kernelname: string = 'cai_dot_product'): integer;
       procedure UnprepareKernel();
     public
-      constructor Create(pCurrentPlatform: cl_platform_id; pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product');
+      constructor Create(pCurrentPlatform: cl_platform_id; pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product'; pHideMessages: boolean = false);
       // Binds a kernel entry point against the ALREADY-COMPILED program of a
       // shared kernel (e.g. the net-wide dot-product kernel) instead of
       // recompiling neural.cl. The context, command queue and program are
@@ -268,7 +268,7 @@ type
       /// OpenCL Group Sizes;
       FGroupSizeA, FGroupSizeB: longint;
     public
-      constructor Create(pCurrentPlatform: cl_platform_id; pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product');
+      constructor Create(pCurrentPlatform: cl_platform_id; pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product'; pHideMessages: boolean = false);
       destructor Destroy(); override;
 
       procedure UnprepareForCompute();
@@ -583,9 +583,19 @@ begin
 end;
 
 constructor TNeuralKernel.Create(pCurrentPlatform: cl_platform_id;
-  pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product');
+  pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product';
+  pHideMessages: boolean = false);
 begin
   inherited Create();
+  // Optionally suppress the routine "clCreateContext/clBuildProgram/
+  // clCreateKernel ... OK!" progress chatter emitted while compiling neural.cl:
+  // a net enabling OpenCL builds this kernel once, but a process that spins up
+  // many nets (or the per-layer benchmark) repeats the whole banner each time.
+  // Default false keeps the historical verbose behaviour for existing callers;
+  // pass pHideMessages=true to opt in. HideMessages only gags FMessageProc;
+  // FErrorProc (build failures, missing neural.cl below) is untouched, so real
+  // problems still surface. (Coded by Claude (AI).)
+  if pHideMessages then HideMessages();
   SetCurrentPlatform(pCurrentPlatform);
   SetCurrentDevice(pCurrentDevice);
 
@@ -616,7 +626,10 @@ begin
   end
   else
   begin
-    MessageProc('File neural.cl could not be found.');
+    // Report through ErrorProc, not MessageProc: a missing kernel means the
+    // offload silently builds nothing and returns garbage, so this must stay
+    // visible even when the routine progress messages are hidden.
+    FErrorProc('File neural.cl could not be found.');
   end;
   PrepareKernel(kernelname);
 end;
@@ -649,9 +662,9 @@ begin
 end;
 
 { TDotProductCL }
-constructor TDotProductCL.Create(pCurrentPlatform: cl_platform_id; pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product');
+constructor TDotProductCL.Create(pCurrentPlatform: cl_platform_id; pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product'; pHideMessages: boolean = false);
 begin
-  inherited Create(pCurrentPlatform, pCurrentDevice, kernelname);
+  inherited Create(pCurrentPlatform, pCurrentDevice, kernelname, pHideMessages);
   FInputBufferAs := nil;
   FInputBufferBs := nil;
   FResultBuffer  := nil;

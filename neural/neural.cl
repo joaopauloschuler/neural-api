@@ -1174,3 +1174,105 @@ __kernel void cai_softmax
     for (int c = 0; c < FGroupLen; c++) FY[base + c] *= inv;
   }
 }
+
+// CAI Depthwise Convolution 2-D forward (TNNetDepthwiseConv).
+// Coded by Claude (AI).
+// A TRUE per-channel convolution: output channel (n*FInDepth + d) reduces ONLY
+// over input channel d's FFx*FFy spatial taps (depthwise -- NO cross-channel
+// mixing). This replaces the earlier dense-GEMV mapping that computed the full
+// (Mult*InDepth) x (NumPos*InDepth) product and read back only the depth-diagonal
+// -- an InDepth-fold compute overspend that made the device path far slower than
+// the CPU. Here each work-item does exactly its own FFx*FFy MACs, zero waste.
+//   Raw[ox,oy, n*InDepth + d] =
+//       sum_{cy,cx} FW[n][cy,cx,d] * FX[ox*S+cx, oy*S+cy, d]
+// FX is the host-padded input copy (SizeX = FInW, depth = FInDepth), so no bounds
+// checks are needed (output extents were sized to fit). FW is the Mult neurons'
+// weight volumes concatenated, each in its native depth-contiguous raw layout
+// (tap (cx,cy), depth d at [(FFx*cy + cx)*FInDepth + d]); neuron n starts at
+// n*FFx*FFy*FInDepth. The result is written PRE-activation into FY (the raw
+// output); the host applies the activation function afterwards (the depthwise
+// conv adds no bias), exactly matching the scalar path. One work-item per output
+// element: global size = FOutW * FOutH * (FMult * FInDepth) (dim 0).
+__kernel void cai_depthwise_conv2d
+(
+  const int FOutW,
+  const int FOutH,
+  const int FInW,
+  const int FInDepth,
+  const int FMult,
+  const int FFx,
+  const int FFy,
+  const int FStride,
+  __global const float* FW,
+  __global const float* FX,
+  __global float* FY
+)
+{
+  const int gid = get_global_id(0);
+  const int FOutDepth = FMult * FInDepth;
+  const int total = FOutW * FOutH * FOutDepth;
+  if (gid >= total) return;
+  const int outd = gid % FOutDepth;
+  const int t    = gid / FOutDepth;
+  const int ox   = t % FOutW;
+  const int oy   = t / FOutW;
+  const int n = outd / FInDepth;
+  const int d = outd - n * FInDepth;
+  const int ix0 = ox * FStride;
+  const int iy0 = oy * FStride;
+  const int wBase = n * (FFx * FFy) * FInDepth + d; // + tap*FInDepth below
+  float acc = 0.0f;
+  for (int cy = 0; cy < FFy; cy++)
+  {
+    const int iy = iy0 + cy;
+    const int xRow = ((FInW * iy) + ix0) * FInDepth + d;
+    const int wRow = wBase + (FFx * cy) * FInDepth;
+    for (int cx = 0; cx < FFx; cx++)
+      acc = mad(FW[wRow + cx * FInDepth], FX[xRow + cx * FInDepth], acc);
+  }
+  FY[gid] = acc;
+}
+
+// CAI Depthwise Convolution 1-D forward (TNNetDepthwiseConv1D).
+// Coded by Claude (AI).
+// The 1-D sibling of cai_depthwise_conv2d: a per-channel causal/SAME temporal
+// convolution along the sequence (SizeX = time, depth = channel; SizeY = 1).
+// Output (t, c) reduces ONLY over channel c's own length-FKsize kernel -- again
+// replacing the dense-GEMV-and-discard mapping with one work-item doing exactly
+// its FKsize MACs.
+//   out[t,c] = (FSuppressBias ? 0 : FBias[c])
+//              + sum_kk FW[c*FKsize + kk] * x[t - FOff + kk, c]   (OOB tap -> 0)
+// FOff = FKsize-1 for causal, FKsize/2 for centred SAME (resolved on the host).
+// FX is the previous layer's output, raw [t*FChannels + c]; OOB taps are skipped
+// here (zero-pad) so -- unlike the 2-D path -- NO host pre-padding is needed.
+// FW is the C neurons' length-K kernels concatenated [c*FKsize + kk]; FBias holds
+// the C per-channel biases. Linear, no activation, matching the scalar path. One
+// work-item per output element: global size = FSeqLen * FChannels (dim 0).
+__kernel void cai_depthwise_conv1d
+(
+  const int FSeqLen,
+  const int FChannels,
+  const int FKsize,
+  const int FOff,
+  const int FSuppressBias,
+  __global const float* FW,
+  __global const float* FBias,
+  __global const float* FX,
+  __global float* FY
+)
+{
+  const int gid = get_global_id(0);
+  const int total = FSeqLen * FChannels;
+  if (gid >= total) return;
+  const int c = gid % FChannels;
+  const int t = gid / FChannels;
+  float acc = (FSuppressBias == 0) ? FBias[c] : 0.0f;
+  const int wBase = c * FKsize;
+  for (int kk = 0; kk < FKsize; kk++)
+  {
+    const int srcT = t - FOff + kk;
+    if (srcT < 0 || srcT >= FSeqLen) continue; // zero pad
+    acc = mad(FW[wBase + kk], FX[srcT * FChannels + c], acc);
+  }
+  FY[gid] = acc;
+}
