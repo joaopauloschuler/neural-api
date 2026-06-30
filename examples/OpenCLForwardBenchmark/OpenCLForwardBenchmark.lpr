@@ -47,6 +47,33 @@ const
   cMaxIters   = 8192;  // ... but never exceed this many forwards per measurement
   cWarmups    = 3;     // discarded forwards before each timed measurement
 
+  // Device dispatch threshold (output-element MACs) below which the conv/
+  // elementwise layer family stays on the CPU. The library default is 2^16; we
+  // set it explicitly here so the benchmark is self-describing and exercises the
+  // device path for mid-sized tensors regardless of the build's default. Set to
+  // 0 to force EVERY capable layer onto the device (will show <1x rows where the
+  // host wins - that is the point: it charts the per-layer crossover).
+  cMinWorkMACs = 1 shl 16;
+
+  // Input profiles. Kept moderate on purpose: with the dispatch gate lowered to
+  // 2^16 (below), these sizes already push the conv/norm/gate/softmax family onto
+  // the device, so there is no need for giant tensors. Larger tensors also OOM
+  // some OpenCL paths whose result buffer carries a squared dimension (see the
+  // "Known device-path faults" note) - e.g. DepthwiseConv1D at (512,1,1024) tries
+  // a 2 GB buffer. Tune these to sweep, but raise with care.
+  cVisX    = 32;     // VIS spatial width
+  cVisY    = 32;     // VIS spatial height
+  cVisC    = 64;     // VIS input channels
+  cVisFeat = 128;    // VIS conv output features
+  cSeqLen  = 256;    // SEQ sequence length
+  cDModel  = 512;    // SEQ model width (norms, softmax, pointwise gates)
+  cDk      = 64;     // attention head dim; QKV-packed input depth = 3*cDk
+  cGateIn  = 1024;   // gated-activation input depth (even; output halves)
+  cFCIn    = 2048;   // FullConnect flattened input/output width
+  cVocab   = 32000;  // embedding vocabulary size
+  cRoPEDim = 128;    // rotary embedding depth (even)
+  cRnnDim  = 256;    // LSTM/GRU cell width
+
 var
   EasyCL: TEasyOpenCL;
   PlatformId: cl_platform_id;
@@ -180,9 +207,13 @@ begin
     RandSeed := 424242; // deterministic inputs across runs
     AnyFallback := False;
     AnyError := False;
+    SetNeuralConvOpenCLMinWork(cMinWorkMACs); // lower the device dispatch gate
 
     WriteLn('OpenCL: ', EasyCL.PlatformNames[0], ' / ', EasyCL.DeviceNames[0]);
-    WriteLn('Profiles: SEQ=(256,1,D)  VIS=(32,32,C)  d_k=64  d_model=512');
+    WriteLn(Format('Profiles: SEQ=(%d,1,D)  VIS=(%d,%d,C)  d_k=%d  d_model=%d',
+      [cSeqLen, cVisX, cVisY, cDk, cDModel]));
+    WriteLn(Format('Device dispatch gate: NeuralConvOpenCLMinWork = %d output elements',
+      [cMinWorkMACs]));
     WriteLn(Format('Auto-scaled timing: >= %.2fs/measurement, cap %d forwards, %d warmups',
       [cMinSeconds, cMaxIters, cWarmups]));
     WriteLn;
@@ -190,103 +221,103 @@ begin
       ['layer', 'out shape', 'cpu us/fwd', 'gpu us/fwd', 'speedup', 'gpu?']));
     WriteLn(StringOfChar('-', 96));
 
-    // --- Convolution family (VIS 32x32x64) ---
-    NN := MakeNet(32, 32, 64, Inp); NN.AddLayer(TNNetConvolution.Create(128, 3, 1, 1));
+    // --- Convolution family (VIS) ---
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetConvolution.Create(cVisFeat, 3, 1, 1));
     Bench('TNNetConvolution', NN, Inp);
-    NN := MakeNet(32, 32, 64, Inp); NN.AddLayer(TNNetConvolutionLinear.Create(128, 3, 1, 1));
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetConvolutionLinear.Create(cVisFeat, 3, 1, 1));
     Bench('TNNetConvolutionLinear', NN, Inp);
-    NN := MakeNet(32, 32, 64, Inp); NN.AddLayer(TNNetDeconvolution.Create(64, 3, 2, 1, 1));
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetDeconvolution.Create(cVisC, 3, 2, 1, 1));
     Bench('TNNetDeconvolution', NN, Inp);
-    NN := MakeNet(32, 32, 64, Inp); NN.AddLayer(TNNetDepthwiseConv.Create(2, 3, 1, 1));
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetDepthwiseConv.Create(2, 3, 1, 1));
     Bench('TNNetDepthwiseConv', NN, Inp);
-    NN := MakeNet(256, 1, 512, Inp); NN.AddLayer(TNNetDepthwiseConv1D.Create(3, True));
+    NN := MakeNet(cSeqLen, 1, cDModel, Inp); NN.AddLayer(TNNetDepthwiseConv1D.Create(3, True));
     Bench('TNNetDepthwiseConv1D', NN, Inp);
-    NN := MakeNet(32, 32, 64, Inp); NN.AddLayer(TNNetGroupConvP4.Create(32, 3, 1, 1));
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetGroupConvP4.Create(cVisFeat div 4, 3, 1, 1));
     Bench('TNNetGroupConvP4', NN, Inp);
     // TNNetKANConv is intentionally excluded: its OpenCL forward path requests a
-    // pathological buffer (~81 GB at this shape) and faults inside the device
-    // driver, which is an unrecoverable native segfault (a try/except cannot
-    // catch it, so it would abort the whole sweep). Flagged as a library issue
-    // worth a separate look; see the "Known device-path faults" note at the end.
-    NN := MakeNet(32, 32, 64, Inp); NN.AddLayer(TNNetDeformableConv.Create(64, 3, 1, 1));
+    // pathological buffer (~81 GB) and faults inside the device driver, which is
+    // an unrecoverable native segfault (a try/except cannot catch it, so it would
+    // abort the whole sweep). Flagged as a library issue worth a separate look;
+    // see the "Known device-path faults" note at the end.
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetDeformableConv.Create(cVisFeat, 3, 1, 1));
     Bench('TNNetDeformableConv', NN, Inp);
 
     // --- Dense / embedding ---
-    NN := MakeNet(1, 1, 2048, Inp); NN.AddLayer(TNNetFullConnect.Create(2048));
+    NN := MakeNet(1, 1, cFCIn, Inp); NN.AddLayer(TNNetFullConnect.Create(cFCIn));
     Bench('TNNetFullConnect', NN, Inp);
-    NN := MakeNet(256, 1, 1, Inp); FillTokens(Inp, 32000);
-    NN.AddLayer(TNNetEmbedding.Create(32000, 512));
+    NN := MakeNet(cSeqLen, 1, 1, Inp); FillTokens(Inp, cVocab);
+    NN.AddLayer(TNNetEmbedding.Create(cVocab, cDModel));
     Bench('TNNetEmbedding', NN, Inp);
 
-    // --- Attention (SEQ 256x1x192, QKV-packed, d_k=64) ---
-    NN := MakeNet(256, 1, 192, Inp); NN.AddLayer(TNNetScaledDotProductAttention.Create(64, True, 0, 0));
+    // --- Attention (SEQ, QKV-packed, depth = 3*d_k) ---
+    NN := MakeNet(cSeqLen, 1, 3 * cDk, Inp); NN.AddLayer(TNNetScaledDotProductAttention.Create(cDk, True, 0, 0));
     Bench('TNNetScaledDotProductAttention', NN, Inp);
-    NN := MakeNet(256, 1, 192, Inp); NN.AddLayer(TNNetLinearAttention.Create(64));
+    NN := MakeNet(cSeqLen, 1, 3 * cDk, Inp); NN.AddLayer(TNNetLinearAttention.Create(cDk));
     Bench('TNNetLinearAttention', NN, Inp);
-    NN := MakeNet(256, 1, 192, Inp); NN.AddLayer(TNNetCosineSimilarityAttention.Create(64, True));
+    NN := MakeNet(cSeqLen, 1, 3 * cDk, Inp); NN.AddLayer(TNNetCosineSimilarityAttention.Create(cDk, True));
     Bench('TNNetCosineSimilarityAttention', NN, Inp);
-    NN := MakeNet(256, 1, 192, Inp); NN.AddLayer(TNNetDisentangledAttention.Create(64, True));
+    NN := MakeNet(cSeqLen, 1, 3 * cDk, Inp); NN.AddLayer(TNNetDisentangledAttention.Create(cDk, True));
     Bench('TNNetDisentangledAttention', NN, Inp);
-    NN := MakeNet(256, 1, 192, Inp); NN.AddLayer(TNNetConformerRelPosAttention.Create(64, True));
+    NN := MakeNet(cSeqLen, 1, 3 * cDk, Inp); NN.AddLayer(TNNetConformerRelPosAttention.Create(cDk, True));
     Bench('TNNetConformerRelPosAttention', NN, Inp);
-    NN := MakeNet(256, 1, 192, Inp); NN.AddLayer(TNNetALiBiAttention.Create(64, True));
+    NN := MakeNet(cSeqLen, 1, 3 * cDk, Inp); NN.AddLayer(TNNetALiBiAttention.Create(cDk, True));
     Bench('TNNetALiBiAttention', NN, Inp);
 
     // --- Rotary position embeddings ---
-    NN := MakeNet(256, 1, 128, Inp); NN.AddLayer(TNNetRotaryEmbedding.Create());
+    NN := MakeNet(cSeqLen, 1, cRoPEDim, Inp); NN.AddLayer(TNNetRotaryEmbedding.Create());
     Bench('TNNetRotaryEmbedding', NN, Inp);
     // TNNetMRotaryEmbedding is excluded: it requires SetPositions (a per-token
     // T/H/W multimodal position grid) before any forward pass, which the generic
     // single-layer harness does not supply; without it the forward faults.
 
     // --- Normalization ---
-    NN := MakeNet(256, 1, 512, Inp); NN.AddLayer(TNNetRMSNorm.Create());
+    NN := MakeNet(cSeqLen, 1, cDModel, Inp); NN.AddLayer(TNNetRMSNorm.Create());
     Bench('TNNetRMSNorm', NN, Inp);
-    NN := MakeNet(256, 1, 512, Inp); NN.AddLayer(TNNetTokenRMSNorm.Create());
+    NN := MakeNet(cSeqLen, 1, cDModel, Inp); NN.AddLayer(TNNetTokenRMSNorm.Create());
     Bench('TNNetTokenRMSNorm', NN, Inp);
-    NN := MakeNet(32, 32, 64, Inp); NN.AddLayer(TNNetGroupNorm.Create(8));
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetGroupNorm.Create(8));
     Bench('TNNetGroupNorm', NN, Inp);
-    NN := MakeNet(256, 1, 512, Inp); NN.AddLayer(TNNetLayerNorm.Create());
+    NN := MakeNet(cSeqLen, 1, cDModel, Inp); NN.AddLayer(TNNetLayerNorm.Create());
     Bench('TNNetLayerNorm', NN, Inp);
-    NN := MakeNet(256, 1, 512, Inp); NN.AddLayer(TNNetTokenLayerNorm.Create());
+    NN := MakeNet(cSeqLen, 1, cDModel, Inp); NN.AddLayer(TNNetTokenLayerNorm.Create());
     Bench('TNNetTokenLayerNorm', NN, Inp);
-    NN := MakeNet(32, 32, 64, Inp); NN.AddLayer(TNNetPixelNorm.Create());
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetPixelNorm.Create());
     Bench('TNNetPixelNorm', NN, Inp);
-    NN := MakeNet(256, 1, 512, Inp); NN.AddLayer(TNNetL2Normalize.Create());
+    NN := MakeNet(cSeqLen, 1, cDModel, Inp); NN.AddLayer(TNNetL2Normalize.Create());
     Bench('TNNetL2Normalize', NN, Inp);
 
     // --- Gated activations (even depth -> output halves) ---
-    NN := MakeNet(256, 1, 1024, Inp); NN.AddLayer(TNNetSwiGLU.Create());
+    NN := MakeNet(cSeqLen, 1, cGateIn, Inp); NN.AddLayer(TNNetSwiGLU.Create());
     Bench('TNNetSwiGLU', NN, Inp);
-    NN := MakeNet(256, 1, 1024, Inp); NN.AddLayer(TNNetGLU.Create());
+    NN := MakeNet(cSeqLen, 1, cGateIn, Inp); NN.AddLayer(TNNetGLU.Create());
     Bench('TNNetGLU', NN, Inp);
-    NN := MakeNet(256, 1, 1024, Inp); NN.AddLayer(TNNetGEGLU.Create());
+    NN := MakeNet(cSeqLen, 1, cGateIn, Inp); NN.AddLayer(TNNetGEGLU.Create());
     Bench('TNNetGEGLU', NN, Inp);
-    NN := MakeNet(256, 1, 1024, Inp); NN.AddLayer(TNNetGEGLUErf.Create());
+    NN := MakeNet(cSeqLen, 1, cGateIn, Inp); NN.AddLayer(TNNetGEGLUErf.Create());
     Bench('TNNetGEGLUErf', NN, Inp);
-    NN := MakeNet(256, 1, 512, Inp); NN.AddLayer(TNNetPointwiseSoftMax.Create());
+    NN := MakeNet(cSeqLen, 1, cDModel, Inp); NN.AddLayer(TNNetPointwiseSoftMax.Create());
     Bench('TNNetPointwiseSoftMax', NN, Inp);
 
-    // --- Pooling / spatial resize ---
-    NN := MakeNet(32, 32, 64, Inp); NN.AddLayer(TNNetMaxPool.Create(2, 2));
+    // --- Pooling / spatial resize (VIS) ---
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetMaxPool.Create(2, 2));
     Bench('TNNetMaxPool', NN, Inp);
-    NN := MakeNet(32, 32, 64, Inp); NN.AddLayer(TNNetBilinearResize.Create(64, 64, 0));
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetBilinearResize.Create(cVisX * 2, cVisY * 2, 0));
     Bench('TNNetBilinearResize', NN, Inp);
-    NN := MakeNet(32, 32, 64, Inp); NN.AddLayer(TNNetBicubicUpsample.Create(2, 0));
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetBicubicUpsample.Create(2, 0));
     Bench('TNNetBicubicUpsample', NN, Inp);
-    NN := MakeNet(32, 32, 64, Inp); NN.AddLayer(TNNetBilinearUpsample.Create(2));
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetBilinearUpsample.Create(2));
     Bench('TNNetBilinearUpsample', NN, Inp);
-    NN := MakeNet(32, 32, 64, Inp); NN.AddLayer(TNNetPixelShuffle.Create(2));
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetPixelShuffle.Create(2));
     Bench('TNNetPixelShuffle', NN, Inp);
-    NN := MakeNet(32, 32, 64, Inp); NN.AddLayer(TNNetResize2D.Create(64, 64, 1, 0));
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetResize2D.Create(cVisX * 2, cVisY * 2, 1, 0));
     Bench('TNNetResize2D', NN, Inp);
-    NN := MakeNet(32, 32, 64, Inp); NN.AddLayer(TNNetGramMatrix.Create());
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetGramMatrix.Create());
     Bench('TNNetGramMatrix', NN, Inp);
 
     // --- Recurrent cells (shape-preserving, read depth from prev layer) ---
-    NN := MakeNet(256, 1, 256, Inp); NN.AddLayer(TNNetLSTMCell.Create());
+    NN := MakeNet(cSeqLen, 1, cRnnDim, Inp); NN.AddLayer(TNNetLSTMCell.Create());
     Bench('TNNetLSTMCell', NN, Inp);
-    NN := MakeNet(256, 1, 256, Inp); NN.AddLayer(TNNetGRUCell.Create());
+    NN := MakeNet(cSeqLen, 1, cRnnDim, Inp); NN.AddLayer(TNNetGRUCell.Create());
     Bench('TNNetGRUCell', NN, Inp);
 
     WriteLn(StringOfChar('-', 96));

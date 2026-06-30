@@ -122,6 +122,24 @@ rather than acted on.
       length change. Add a device-vs-CPU parity test (and keep KANConv excluded
       from `OpenCLForwardBenchmark` until fixed; it is listed there under
       "Known device-path faults"). Backward and the CPU forward are unaffected.
+      SHARED PATTERN — this all-pairs-`cai_dot_product`-then-extract-diagonal
+      offload is used by FOUR layers, each with a squared dimension in the result
+      buffer: `TNNetDepthwiseConv.ComputeOpenCL` (~48751
+      `FGemmResDw.ReSize(NumAs*NumBs,..)`, depth-diagonal), `TNNetDepthwiseConv1D`
+      (~51931 `FGemmRes.ReSize(Channels*(Channels*SeqLen),..)` = `Channels^2*
+      SeqLen`, channel-diagonal), `TNNetKANConv` (~81146, `Taps^2`, tap-diagonal),
+      and `TNNetDeconvolution.ComputeOpenCL` (~86547 `FGemmRes.ReSize(NumBs*NumAs,
+      ..)`). KANConv and DepthwiseConv1D are the worst because the squared term
+      (`Taps^2` / `Channels^2`) dominates: with the dispatch gate now at `2^16`,
+      DepthwiseConv1D at `(SeqLen=512, Depth=1024)` asks for `1024^2*512` floats =
+      2 GB and faults on a small device (observed: `clCreateBuffer :-61` then a
+      cascade of uncatchable `EAccessViolation`). DepthwiseConv(2D) and
+      Deconvolution stayed under the overflow at the benchmark's moderate shapes
+      (they run, just wastefully). The COMBINED-axis fix above applies to all
+      four (contract over the diagonal axis instead of materializing the full
+      cross product); fixing them as a family + one shared parity test is the
+      right scope. Until then `OpenCLForwardBenchmark` keeps tensors moderate so
+      only KANConv (which overflows at any shape, `Taps=576`) needs excluding.
 
 ## Infrastructure / dev experience
 

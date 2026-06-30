@@ -33,7 +33,13 @@ is run and discarded before each measurement; the first device call additionally
 pays kernel compilation and buffer upload, which the warmup absorbs.
 
 Input profiles: `SEQ = (256, 1, D)` for sequence/transformer layers,
-`VIS = (32, 32, C)` for spatial layers; `d_k = 64`, `d_model = 512`.
+`VIS = (32, 32, C)` for spatial layers; `d_k = 64`, `d_model = 512`. These are
+named constants at the top of the `.lpr` (`cSeqLen`, `cVisX/Y/C`, `cDk`, ...).
+They are kept moderate on purpose: the benchmark lowers the device dispatch gate
+`NeuralConvOpenCLMinWork` to `2^16` (`cMinWorkMACs`), so these sizes already push
+the conv/norm/gate/softmax family onto the device without needing giant tensors -
+which also avoids OOMing the OpenCL paths whose result buffer carries a squared
+dimension (see "Known device-path faults"). Raise them to sweep, but with care.
 
 This is a microbenchmark of isolated single layers, not a model — the numbers
 show where the device beats the host for each operator in isolation. Wall-clock
