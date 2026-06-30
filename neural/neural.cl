@@ -771,6 +771,80 @@ __kernel void cai_token_norm
   }
 }
 
+// Whole-volume normalization (TNNetRMSNorm with FUseMean=0 / TNNetLayerNorm with
+// FUseMean=1). The WHOLE sample is a single reduction over FSize elements, so the
+// per-token kernel above -- invoked with one token of width FSize -- would put
+// the entire FSize-element reduction AND all FSize output writes on ONE
+// work-item (a pathological serialization: ~100x slower than the parallel token
+// path on a large volume). Instead this kernel runs ONE work-group of get_local_
+// size(0) work-items that cooperatively reduce mean/variance through local
+// memory, then apply the per-ELEMENT gain/bias in parallel via a grid-stride
+// loop. Gain/Bias are FSize long (per element, NOT per channel), matching the
+// scalar TNNetRMSNorm/TNNetLayerNorm which scale the flattened sample. Launch
+// with global size == local size (a single work-group) and a power-of-two local
+// size; pass FScratch as get_local_size(0) floats of __local memory. The CPU
+// reference reduces with an 8-wide AVX accumulator, so this tree reduction --
+// also order-independent in spirit -- stays within the <1e-4 parity bound.
+__kernel void cai_volume_norm
+(
+  const int FSize,
+  const int FUseMean,
+  const float FEps,
+  __global const float* FGain,
+  __global const float* FBias,
+  __global const float* FX,
+  __global float* FY,
+  __local float* FScratch
+)
+{
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  int s;
+
+  // ---- mean (LayerNorm only); RMSNorm leaves mean = 0 ----
+  float mean = 0.0f;
+  if (FUseMean != 0)
+  {
+    float partial = 0.0f;
+    for (int i = lid; i < FSize; i += lsize) partial += FX[i];
+    FScratch[lid] = partial;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (s = lsize >> 1; s > 0; s >>= 1)
+    {
+      if (lid < s) FScratch[lid] += FScratch[lid + s];
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    mean = FScratch[0] / (float)FSize;
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+
+  // ---- sum of (centered) squares ----
+  float ss = 0.0f;
+  for (int i = lid; i < FSize; i += lsize)
+  {
+    const float v = FX[i] - mean;
+    ss = mad(v, v, ss);
+  }
+  FScratch[lid] = ss;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] += FScratch[lid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float invStd = 1.0f / sqrt(FScratch[0] / (float)FSize + FEps);
+
+  // ---- apply per-element gain/bias in parallel ----
+  for (int i = lid; i < FSize; i += lsize)
+  {
+    const float xhat = (FX[i] - mean) * invStd;
+    if (FUseMean != 0)
+      FY[i] = mad(FGain[i], xhat, FBias[i]);
+    else
+      FY[i] = FGain[i] * xhat;
+  }
+}
+
 // Per-depth-column L2 normalization forward (TNNetL2Normalize axis-0 / PixelNorm
 // per-position mode, and TNNetPixelNorm). For each position p of FNumPositions
 // (= SizeX*SizeY), the FDepth contiguous channels at base = p*FDepth are scaled
