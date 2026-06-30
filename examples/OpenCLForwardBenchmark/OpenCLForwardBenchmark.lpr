@@ -30,11 +30,23 @@ concept here - the program always exits 0 (it is a benchmark, not a test). With
 no OpenCL platform available it prints SKIP and exits 0 (harmless in CPU-only
 CI).
 
-An optional integer input scale factor (argv[1], default 1) multiplies every
-profiled dimension, so the same binary can sweep from the moderate default up to
-GPU-saturating tensors without a rebuild:
+An optional integer input scale factor (argv[1], default 1) multiplies, FOR EACH
+layer, only the ONE dimension that drives that layer's CPU-vs-GPU crossover - the
+sequence length for the per-token SEQ ops (norms, gated activations, softmax,
+RoPE, embedding) and attention, the spatial width for the VIS spatial ops
+(pooling, resize/upsample, shuffle, pixel/group norm, Gram), the output-feature
+count for the convolutions, and the cell width for the recurrent cells. Holding
+every other dimension at its base keeps the sweep near-linear (instead of the
+k^3..k^4 blow-up of scaling all dimensions at once), so the same binary walks
+each operator across its threshold without a rebuild:
   OpenCLForwardBenchmark        # base sizes (default, == scale 1)
-  OpenCLForwardBenchmark 4      # every dimension x4
+  OpenCLForwardBenchmark 8      # each layer's primary dimension x8
+
+Every row is measured with NN.ForceOpenCL(True) so the GPU path always fires and
+both timings are charted; the 'verdict' column separately reports each layer's
+own FShouldOpenCL size decision (what production dispatch would choose at this
+size), so the gap between where 'verdict' flips to yes and where 'speedup'
+crosses 1x shows whether the per-layer threshold is set well.
 
 Build (from this directory):
   fpc -Mobjfpc -Sh -O3 -dAVX2 -dRelease -dOpenCL -Fu../../neural OpenCLForwardBenchmark.lpr
@@ -55,18 +67,19 @@ const
 
   cVocab   = 32000;  // embedding vocabulary (table size, not a per-forward size)
 
-// Input profiles. The values below are the moderate BASE sizes; the optional
-// command-line scale factor (argv[1], default 1) multiplies every
-// compute-relevant dimension at startup. An INTEGER factor is used on purpose:
-// it preserves every divisibility invariant the layers need - channels stay /8
-// (GroupNorm) and /4 (GroupConvP4), gated-activation and RoPE depths stay even,
-// attention stays 3*d_k - because integer multiplication keeps divisibility, so
-// no per-dimension rounding is needed and no factor can produce an illegal
-// shape. The resolved sizes are echoed in the banner. With the dispatch gate at
-// 2^16 the base sizes already exercise the device; raise the factor to push a
-// real GPU (the depthwise/KAN result-buffer OOMs are fixed, so large factors are
-// safe - see the GEMV-diagonal note in tasklist.md). These are var, not const,
-// only so the factor can scale them.
+// Input profiles. The values below are the moderate BASE sizes. The optional
+// command-line scale factor (argv[1], default 1) is NOT applied here; instead
+// each Bench call site multiplies it into the ONE dimension that drives that
+// layer's crossover (see the program header), leaving every other dimension at
+// base. An INTEGER factor is used on purpose: it preserves every divisibility
+// invariant the layers need - the scaled dimension keeps its own property
+// (even depths stay even, channels stay /4 and /8, 3*d_k stays a multiple of 3,
+// pool/shuffle spatial stays even) because integer multiplication keeps
+// divisibility, so no per-dimension rounding is needed and no factor can produce
+// an illegal shape. The resolved factor is echoed in the banner. With the
+// dispatch gate at 2^16 the base sizes already exercise the device; raise the
+// factor to push a real GPU (the depthwise/KAN result-buffer OOMs are fixed, so
+// large factors are safe - see the GEMV-diagonal note in tasklist.md).
 var
   cVisX:    integer = 32;    // VIS spatial width
   cVisY:    integer = 32;    // VIS spatial height
@@ -137,7 +150,7 @@ var
   CpuUs, GpuUs, Speed: double;
   GpuCnt: integer;
   Last: TNNetLayer;
-  Shape, Fired: string;
+  Shape, Fired, Verdict: string;
 begin
   try
     Last := NN.GetLastLayer();
@@ -156,6 +169,10 @@ begin
       // layer dispatches to the device regardless of tensor size - that is what
       // charts the per-layer crossover (the <1x rows are the point).
       NN.EnableOpenCL(PlatformId, DeviceId);
+      // The natural per-layer size verdict (frozen in SetPrevLayer), captured
+      // BEFORE the force override so the column reports what production dispatch
+      // would actually choose at this size.
+      if NN.GetLastLayer().ShouldOpenCL then Verdict := 'yes' else Verdict := 'no';
       NN.ForceOpenCL(True);
       for Cnt := 1 to cWarmups do NN.Compute(Inp);
       NN.ClearTime(); // zero the dispatch counters so GpuCnt covers only the measure
@@ -175,11 +192,11 @@ begin
         Speed := 0;
 
       if Speed > 0 then
-        WriteLn(Format('%-32s %-14s %12.1f %12.1f %9.2fx  %s',
-          [Name, Shape, CpuUs, GpuUs, Speed, Fired]))
+        WriteLn(Format('%-32s %-14s %12.1f %12.1f %9.2fx  %-6s %s',
+          [Name, Shape, CpuUs, GpuUs, Speed, Fired, Verdict]))
       else
-        WriteLn(Format('%-32s %-14s %12.1f %12.1f %10s  %s',
-          [Name, Shape, CpuUs, GpuUs, '-', Fired]));
+        WriteLn(Format('%-32s %-14s %12.1f %12.1f %10s  %-6s %s',
+          [Name, Shape, CpuUs, GpuUs, '-', Fired, Verdict]));
     except
       on E: Exception do
       begin
@@ -219,126 +236,136 @@ begin
     AnyFallback := False;
     AnyError := False;
 
-    // Optional input scale factor (argv[1], default 1). Integer multiply keeps
-    // every divisibility invariant the layers need (see the profile comment), so
-    // any positive factor yields a legal shape. A non-numeric/<1 arg falls back
-    // to 1, leaving the run identical to the no-argument default.
+    // Optional scale factor (argv[1], default 1). It is NOT applied to the global
+    // profiles here; each Bench call site below multiplies it into the single
+    // crossover-relevant dimension for that layer (see the program header). A
+    // non-numeric/<1 arg falls back to 1, leaving the run identical to the
+    // no-argument default.
     if ParamCount >= 1 then cScale := StrToIntDef(ParamStr(1), 1);
     if cScale < 1 then cScale := 1;
-    cVisX := cVisX * cScale;  cVisY := cVisY * cScale;  cVisC := cVisC * cScale;
-    cVisFeat := cVisFeat * cScale;  cSeqLen := cSeqLen * cScale;
-    cDModel := cDModel * cScale;  cDk := cDk * cScale;  cGateIn := cGateIn * cScale;
-    cFCIn := cFCIn * cScale;  cRoPEDim := cRoPEDim * cScale;  cRnnDim := cRnnDim * cScale;
 
     WriteLn('OpenCL: ', EasyCL.PlatformNames[0], ' / ', EasyCL.DeviceNames[0]);
-    WriteLn(Format('Input scale factor: %d (argv[1]; default 1)', [cScale]));
-    WriteLn(Format('Profiles: SEQ=(%d,1,D)  VIS=(%d,%d,C)  d_k=%d  d_model=%d',
-      [cSeqLen, cVisX, cVisY, cDk, cDModel]));
-    WriteLn('Dispatch: per-layer FShouldOpenCL verdict, overridden by NN.ForceOpenCL(True)');
+    WriteLn(Format('Scale factor: %d (argv[1]; default 1) - applied per layer to '
+      + 'its primary dimension', [cScale]));
+    WriteLn(Format('Base profiles: SEQ=(%d,1,%d)  VIS=(%d,%d,%d)  d_k=%d',
+      [cSeqLen, cDModel, cVisX, cVisY, cVisC, cDk]));
+    WriteLn('Dispatch: all layers FORCED via NN.ForceOpenCL(True); the verdict '
+      + 'column shows each layer''s own FShouldOpenCL size decision');
     WriteLn(Format('Auto-scaled timing: >= %.2fs/measurement, cap %d forwards, %d warmups',
       [cMinSeconds, cMaxIters, cWarmups]));
     WriteLn;
-    WriteLn(Format('%-32s %-14s %12s %12s %10s  %s',
-      ['layer', 'out shape', 'cpu us/fwd', 'gpu us/fwd', 'speedup', 'gpu?']));
-    WriteLn(StringOfChar('-', 96));
+    WriteLn(Format('%-32s %-14s %12s %12s %10s  %-6s %s',
+      ['layer', 'out shape', 'cpu us/fwd', 'gpu us/fwd', 'speedup', 'gpu?', 'verdict']));
+    WriteLn(StringOfChar('-', 104));
 
-    // --- Convolution family (VIS) ---
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetConvolution.Create(cVisFeat, 3, 1, 1));
+    // --- Convolution family (VIS) --- primary dim = output FEATURE count
+    // (cVisFeat * cScale), the GEMM width that moves both the dispatch metric
+    // (X*Y*Feat) and the arithmetic. Depthwise has no separate feature count, so
+    // it scales input CHANNELS; DepthwiseConv1D is a SEQ op, so it scales SeqLen.
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetConvolution.Create(cVisFeat * cScale, 3, 1, 1));
     Bench('TNNetConvolution', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetConvolutionLinear.Create(cVisFeat, 3, 1, 1));
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetConvolutionLinear.Create(cVisFeat * cScale, 3, 1, 1));
     Bench('TNNetConvolutionLinear', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetDeconvolution.Create(cVisC, 3, 2, 1, 1));
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetDeconvolution.Create(cVisC * cScale, 3, 2, 1, 1));
     Bench('TNNetDeconvolution', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetDepthwiseConv.Create(2, 3, 1, 1));
+    NN := MakeNet(cVisX, cVisY, cVisC * cScale, Inp); NN.AddLayer(TNNetDepthwiseConv.Create(2, 3, 1, 1));
     Bench('TNNetDepthwiseConv', NN, Inp);
-    NN := MakeNet(cSeqLen, 1, cDModel, Inp); NN.AddLayer(TNNetDepthwiseConv1D.Create(3, True));
+    NN := MakeNet(cSeqLen * cScale, 1, cDModel, Inp); NN.AddLayer(TNNetDepthwiseConv1D.Create(3, True));
     Bench('TNNetDepthwiseConv1D', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetGroupConvP4.Create(cVisFeat div 4, 3, 1, 1));
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetGroupConvP4.Create((cVisFeat * cScale) div 4, 3, 1, 1));
     Bench('TNNetGroupConvP4', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetKANConv.Create(cVisFeat, 3, 1, 1));
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetKANConv.Create(cVisFeat * cScale, 3, 1, 1));
     Bench('TNNetKANConv', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetDeformableConv.Create(cVisFeat, 3, 1, 1));
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetDeformableConv.Create(cVisFeat * cScale, 3, 1, 1));
     Bench('TNNetDeformableConv', NN, Inp);
 
-    // --- Dense / embedding ---
-    NN := MakeNet(1, 1, cFCIn, Inp); NN.AddLayer(TNNetFullConnect.Create(cFCIn));
+    // --- Dense / embedding --- FullConnect scales its OUTPUT width (the dispatch
+    // metric; input width held at base keeps work linear); Embedding scales the
+    // SEQ length (number of row lookups).
+    NN := MakeNet(1, 1, cFCIn, Inp); NN.AddLayer(TNNetFullConnect.Create(cFCIn * cScale));
     Bench('TNNetFullConnect', NN, Inp);
-    NN := MakeNet(cSeqLen, 1, 1, Inp); FillTokens(Inp, cVocab);
+    NN := MakeNet(cSeqLen * cScale, 1, 1, Inp); FillTokens(Inp, cVocab);
     NN.AddLayer(TNNetEmbedding.Create(cVocab, cDModel));
     Bench('TNNetEmbedding', NN, Inp);
 
-    // --- Attention (SEQ, QKV-packed, depth = 3*d_k) ---
-    NN := MakeNet(cSeqLen, 1, 3 * cDk, Inp); NN.AddLayer(TNNetScaledDotProductAttention.Create(cDk, True, 0, 0));
+    // --- Attention (SEQ, QKV-packed, depth = 3*d_k) --- primary dim = SeqLen,
+    // the O(SeqLen^2) term that decides the offload (d_k held at base).
+    NN := MakeNet(cSeqLen * cScale, 1, 3 * cDk, Inp); NN.AddLayer(TNNetScaledDotProductAttention.Create(cDk, True, 0, 0));
     Bench('TNNetScaledDotProductAttention', NN, Inp);
-    NN := MakeNet(cSeqLen, 1, 3 * cDk, Inp); NN.AddLayer(TNNetLinearAttention.Create(cDk));
+    NN := MakeNet(cSeqLen * cScale, 1, 3 * cDk, Inp); NN.AddLayer(TNNetLinearAttention.Create(cDk));
     Bench('TNNetLinearAttention', NN, Inp);
-    NN := MakeNet(cSeqLen, 1, 3 * cDk, Inp); NN.AddLayer(TNNetCosineSimilarityAttention.Create(cDk, True));
+    NN := MakeNet(cSeqLen * cScale, 1, 3 * cDk, Inp); NN.AddLayer(TNNetCosineSimilarityAttention.Create(cDk, True));
     Bench('TNNetCosineSimilarityAttention', NN, Inp);
-    NN := MakeNet(cSeqLen, 1, 3 * cDk, Inp); NN.AddLayer(TNNetDisentangledAttention.Create(cDk, True));
+    NN := MakeNet(cSeqLen * cScale, 1, 3 * cDk, Inp); NN.AddLayer(TNNetDisentangledAttention.Create(cDk, True));
     Bench('TNNetDisentangledAttention', NN, Inp);
-    NN := MakeNet(cSeqLen, 1, 3 * cDk, Inp); NN.AddLayer(TNNetConformerRelPosAttention.Create(cDk, True));
+    NN := MakeNet(cSeqLen * cScale, 1, 3 * cDk, Inp); NN.AddLayer(TNNetConformerRelPosAttention.Create(cDk, True));
     Bench('TNNetConformerRelPosAttention', NN, Inp);
-    NN := MakeNet(cSeqLen, 1, 3 * cDk, Inp); NN.AddLayer(TNNetALiBiAttention.Create(cDk, True));
+    NN := MakeNet(cSeqLen * cScale, 1, 3 * cDk, Inp); NN.AddLayer(TNNetALiBiAttention.Create(cDk, True));
     Bench('TNNetALiBiAttention', NN, Inp);
 
-    // --- Rotary position embeddings ---
-    NN := MakeNet(cSeqLen, 1, cRoPEDim, Inp); NN.AddLayer(TNNetRotaryEmbedding.Create());
+    // --- Rotary position embeddings --- primary dim = SeqLen (RoPE depth base).
+    NN := MakeNet(cSeqLen * cScale, 1, cRoPEDim, Inp); NN.AddLayer(TNNetRotaryEmbedding.Create());
     Bench('TNNetRotaryEmbedding', NN, Inp);
     // TNNetMRotaryEmbedding is excluded: it requires SetPositions (a per-token
     // T/H/W multimodal position grid) before any forward pass, which the generic
     // single-layer harness does not supply; without it the forward faults.
 
-    // --- Normalization ---
-    NN := MakeNet(cSeqLen, 1, cDModel, Inp); NN.AddLayer(TNNetRMSNorm.Create());
+    // --- Normalization --- per-token SEQ norms scale SeqLen; the VIS per-pixel /
+    // grouped norms scale spatial width (cVisX * cScale).
+    NN := MakeNet(cSeqLen * cScale, 1, cDModel, Inp); NN.AddLayer(TNNetRMSNorm.Create());
     Bench('TNNetRMSNorm', NN, Inp);
-    NN := MakeNet(cSeqLen, 1, cDModel, Inp); NN.AddLayer(TNNetTokenRMSNorm.Create());
+    NN := MakeNet(cSeqLen * cScale, 1, cDModel, Inp); NN.AddLayer(TNNetTokenRMSNorm.Create());
     Bench('TNNetTokenRMSNorm', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetGroupNorm.Create(8));
+    NN := MakeNet(cVisX * cScale, cVisY, cVisC, Inp); NN.AddLayer(TNNetGroupNorm.Create(8));
     Bench('TNNetGroupNorm', NN, Inp);
-    NN := MakeNet(cSeqLen, 1, cDModel, Inp); NN.AddLayer(TNNetLayerNorm.Create());
+    NN := MakeNet(cSeqLen * cScale, 1, cDModel, Inp); NN.AddLayer(TNNetLayerNorm.Create());
     Bench('TNNetLayerNorm', NN, Inp);
-    NN := MakeNet(cSeqLen, 1, cDModel, Inp); NN.AddLayer(TNNetTokenLayerNorm.Create());
+    NN := MakeNet(cSeqLen * cScale, 1, cDModel, Inp); NN.AddLayer(TNNetTokenLayerNorm.Create());
     Bench('TNNetTokenLayerNorm', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetPixelNorm.Create());
+    NN := MakeNet(cVisX * cScale, cVisY, cVisC, Inp); NN.AddLayer(TNNetPixelNorm.Create());
     Bench('TNNetPixelNorm', NN, Inp);
-    NN := MakeNet(cSeqLen, 1, cDModel, Inp); NN.AddLayer(TNNetL2Normalize.Create());
+    NN := MakeNet(cSeqLen * cScale, 1, cDModel, Inp); NN.AddLayer(TNNetL2Normalize.Create());
     Bench('TNNetL2Normalize', NN, Inp);
 
-    // --- Gated activations (even depth -> output halves) ---
-    NN := MakeNet(cSeqLen, 1, cGateIn, Inp); NN.AddLayer(TNNetSwiGLU.Create());
+    // --- Gated activations (even depth -> output halves) --- primary dim = SeqLen
+    // (gate width held at base, stays even).
+    NN := MakeNet(cSeqLen * cScale, 1, cGateIn, Inp); NN.AddLayer(TNNetSwiGLU.Create());
     Bench('TNNetSwiGLU', NN, Inp);
-    NN := MakeNet(cSeqLen, 1, cGateIn, Inp); NN.AddLayer(TNNetGLU.Create());
+    NN := MakeNet(cSeqLen * cScale, 1, cGateIn, Inp); NN.AddLayer(TNNetGLU.Create());
     Bench('TNNetGLU', NN, Inp);
-    NN := MakeNet(cSeqLen, 1, cGateIn, Inp); NN.AddLayer(TNNetGEGLU.Create());
+    NN := MakeNet(cSeqLen * cScale, 1, cGateIn, Inp); NN.AddLayer(TNNetGEGLU.Create());
     Bench('TNNetGEGLU', NN, Inp);
-    NN := MakeNet(cSeqLen, 1, cGateIn, Inp); NN.AddLayer(TNNetGEGLUErf.Create());
+    NN := MakeNet(cSeqLen * cScale, 1, cGateIn, Inp); NN.AddLayer(TNNetGEGLUErf.Create());
     Bench('TNNetGEGLUErf', NN, Inp);
-    NN := MakeNet(cSeqLen, 1, cDModel, Inp); NN.AddLayer(TNNetPointwiseSoftMax.Create());
+    NN := MakeNet(cSeqLen * cScale, 1, cDModel, Inp); NN.AddLayer(TNNetPointwiseSoftMax.Create());
     Bench('TNNetPointwiseSoftMax', NN, Inp);
 
-    // --- Pooling / spatial resize (VIS) ---
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetMaxPool.Create(2, 2));
+    // --- Pooling / spatial resize (VIS) --- primary dim = spatial WIDTH
+    // (cVisX * cScale); height held at base so work grows linearly. Resize/upsample
+    // targets track the scaled input width.
+    NN := MakeNet(cVisX * cScale, cVisY, cVisC, Inp); NN.AddLayer(TNNetMaxPool.Create(2, 2));
     Bench('TNNetMaxPool', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetBilinearResize.Create(cVisX * 2, cVisY * 2, 0));
+    NN := MakeNet(cVisX * cScale, cVisY, cVisC, Inp); NN.AddLayer(TNNetBilinearResize.Create(cVisX * cScale * 2, cVisY * 2, 0));
     Bench('TNNetBilinearResize', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetBicubicUpsample.Create(2, 0));
+    NN := MakeNet(cVisX * cScale, cVisY, cVisC, Inp); NN.AddLayer(TNNetBicubicUpsample.Create(2, 0));
     Bench('TNNetBicubicUpsample', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetBilinearUpsample.Create(2));
+    NN := MakeNet(cVisX * cScale, cVisY, cVisC, Inp); NN.AddLayer(TNNetBilinearUpsample.Create(2));
     Bench('TNNetBilinearUpsample', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetPixelShuffle.Create(2));
+    NN := MakeNet(cVisX * cScale, cVisY, cVisC, Inp); NN.AddLayer(TNNetPixelShuffle.Create(2));
     Bench('TNNetPixelShuffle', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetResize2D.Create(cVisX * 2, cVisY * 2, 1, 0));
+    NN := MakeNet(cVisX * cScale, cVisY, cVisC, Inp); NN.AddLayer(TNNetResize2D.Create(cVisX * cScale * 2, cVisY * 2, 1, 0));
     Bench('TNNetResize2D', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetGramMatrix.Create());
+    NN := MakeNet(cVisX * cScale, cVisY, cVisC, Inp); NN.AddLayer(TNNetGramMatrix.Create());
     Bench('TNNetGramMatrix', NN, Inp);
 
     // --- Recurrent cells (shape-preserving, read depth from prev layer) ---
-    NN := MakeNet(cSeqLen, 1, cRnnDim, Inp); NN.AddLayer(TNNetLSTMCell.Create());
+    // primary dim = cell WIDTH (cRnnDim * cScale), the per-step gate matmul size.
+    NN := MakeNet(cSeqLen, 1, cRnnDim * cScale, Inp); NN.AddLayer(TNNetLSTMCell.Create());
     Bench('TNNetLSTMCell', NN, Inp);
-    NN := MakeNet(cSeqLen, 1, cRnnDim, Inp); NN.AddLayer(TNNetGRUCell.Create());
+    NN := MakeNet(cSeqLen, 1, cRnnDim * cScale, Inp); NN.AddLayer(TNNetGRUCell.Create());
     Bench('TNNetGRUCell', NN, Inp);
 
-    WriteLn(StringOfChar('-', 96));
+    WriteLn(StringOfChar('-', 104));
     if AnyFallback then
       WriteLn('Note: rows marked NO-cpu never dispatched to the device (below a '
         + 'size threshold or no GPU path for that input) - their speedup is omitted.');
