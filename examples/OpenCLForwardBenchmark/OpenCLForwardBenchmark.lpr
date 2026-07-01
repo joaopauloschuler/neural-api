@@ -162,6 +162,15 @@ begin
     Last := NN.GetLastLayer();
     Shape := Format('%dx%dx%d',
       [Last.Output.SizeX, Last.Output.SizeY, Last.Output.Depth]);
+    // Every benchmark net is flipped inference-only BEFORE any forward. This
+    // frees the per-neuron training buffers and, more importantly here, arms the
+    // device-side activation-fusion path: an inference-only, bias-suppressed conv
+    // applies its activation inside the cai_dot_product GEMM kernel instead of a
+    // separate host sweep, so the row times the fused forward a deployed model
+    // would actually run. pLowMemory stays False so the concatenated weight cache
+    // the OpenCL GEMM uploads from is still built (True would drop it and force
+    // the per-neuron CPU path, breaking the device dispatch).
+    NN.SetTrainable(False, False);
     // A single layer whose OpenCL path faults (bad buffer size, kernel arg
     // failure, etc.) must not abort the whole sweep: catch it, print an ERROR
     // row, and move on to the next layer.
@@ -303,6 +312,19 @@ begin
     Bench('TNNetPointwiseConvLinear', NN, Inp);
     NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetPointwiseConvReLU.Create(cVisFeat * cScale));
     Bench('TNNetPointwiseConvReLU', NN, Inp);
+
+    // Bias-suppressed (pSuppressBias=1) twins of two fused-activation convs. Only
+    // TNNetConvolution.ComputeOpenCL fuses the activation into the cai_dot_product
+    // GEMM, and only when the layer is inference-only (SetTrainable(False), armed
+    // in Bench) AND bias is suppressed - so these two rows are the only ones that
+    // actually exercise the device-side fusion: TNNetConvolution activates Tanh
+    // (its default) in-kernel, TNNetPointwiseConvReLU activates ReLU in-kernel,
+    // each skipping the host bias-add + activation sweep their with-bias rows
+    // above still pay. 5x5 keeps the spatial conv off the Winograd early-exit.
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetConvolution.Create(cVisFeat * cScale, 5, 2, 1, 1));
+    Bench('TNNetConvolution 5x5 nobias', NN, Inp);
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetPointwiseConvReLU.Create(cVisFeat * cScale, 1));
+    Bench('TNNetPointwiseConvReLU nobias', NN, Inp);
 
     // --- Dense / embedding --- FullConnect scales its OUTPUT width (the dispatch
     // metric; input width held at base keeps work linear); Embedding scales the
