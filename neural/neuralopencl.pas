@@ -243,6 +243,10 @@ type
       FPreviousComputeTime: TDateTime;
       /// Indicates if buffers should be stored on host.
       FHostInput: boolean;
+      /// Byte capacities of the three device buffers above. Used by
+      /// ReallocateBuffersIfRequired for grow-only reuse; kept in sync with the
+      /// actual allocations (reset to 0 whenever a buffer is released).
+      FCapAs, FCapBs, FCapResult: csize_t;
 
       FDotProductKernel: TDotProductKernel;
 
@@ -253,6 +257,14 @@ type
 
       procedure UnprepareForCompute();
       function PrepareForCompute(VAs, VBs: TNNetVolume; pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0): integer;
+      /// Grow-only sibling of PrepareForCompute: sets the same scalar shape state
+      /// but only releases+recreates a device buffer when the needed byte size
+      /// exceeds its current capacity, otherwise reuses it in place. Safe because
+      /// Compute() re-uploads both operands every call, so stale buffer contents
+      /// never leak. Use this from per-forward attention/gram ComputeOpenCL paths
+      /// to avoid churning three clCreateBuffer/clReleaseMemObject pairs per GEMM.
+      /// Coded by Claude (AI).
+      procedure ReallocateBuffersIfRequired(VAs, VBs: TNNetVolume; pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0);
       procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint; NewVAs:boolean = true; NewVBs:boolean = true);
       procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
 
@@ -405,6 +417,70 @@ begin
   FInputBufferAs := nil;
   FInputBufferBs := nil;
   FResultBuffer  := nil;
+
+  FCapAs := 0;
+  FCapBs := 0;
+  FCapResult := 0;
+end;
+
+// Grow-only buffer management for the per-forward attention/gram callers. Unlike
+// PrepareForCompute (which unconditionally frees + recreates all three buffers),
+// this keeps a buffer whenever it is already big enough. The scalar shape state
+// (FNumAs/FNumBs/FSize/FThreadCount/FGroupSize*) is still set on every call, so
+// the two different-shaped GEMMs of a single attention forward remain correct.
+// CreateHostInputBuffer binds a buffer to a specific host pointer, so it cannot
+// be reused across volumes; the FHostInput path therefore still allocates fresh.
+// Coded by Claude (AI).
+procedure TDotProductSharedKernel.ReallocateBuffersIfRequired(VAs, VBs: TNNetVolume;
+  pSize: longint; GroupSizeA: integer; GroupSizeB: integer);
+var
+  NeededAs, NeededBs, NeededResult: csize_t;
+begin
+  FNumAs := VAs.Size div pSize;
+  FNumBs := VBs.Size div pSize;
+  FThreadCount := FNumAs * FNumBs;
+  FSize := pSize;
+  FGroupSizeA := GroupSizeA;
+  FGroupSizeB := GroupSizeB;
+
+  NeededResult := FNumAs * FNumBs * SizeOf(TNeuralFloat);
+
+  if (FHostInput) then
+  begin
+    // Host-pointer buffers cannot be reused across volumes: free + recreate.
+    if Assigned(FInputBufferAs) then clReleaseMemObject(FInputBufferAs);
+    if Assigned(FInputBufferBs) then clReleaseMemObject(FInputBufferBs);
+    FInputBufferAs := FDotProductKernel.CreateHostInputBuffer(VAs);
+    FInputBufferBs := FDotProductKernel.CreateHostInputBuffer(VBs);
+    FCapAs := VAs.GetMemSize();
+    FCapBs := VBs.GetMemSize();
+  end
+  else
+  begin
+    NeededAs := VAs.GetMemSize();
+    NeededBs := VBs.GetMemSize();
+    if (FInputBufferAs = nil) or (NeededAs > FCapAs) then
+    begin
+      if Assigned(FInputBufferAs) then clReleaseMemObject(FInputBufferAs);
+      FInputBufferAs := FDotProductKernel.CreateInputBuffer(NeededAs);
+      FCapAs := NeededAs;
+    end;
+    if (FInputBufferBs = nil) or (NeededBs > FCapBs) then
+    begin
+      if Assigned(FInputBufferBs) then clReleaseMemObject(FInputBufferBs);
+      FInputBufferBs := FDotProductKernel.CreateInputBuffer(NeededBs);
+      FCapBs := NeededBs;
+    end;
+  end;
+
+  if (FResultBuffer = nil) or (NeededResult > FCapResult) then
+  begin
+    if Assigned(FResultBuffer) then clReleaseMemObject(FResultBuffer);
+    FResultBuffer := FDotProductKernel.CreateOutputBuffer(NeededResult);
+    FCapResult := NeededResult;
+  end;
+
+  FPreviousComputeTime := 0;
 end;
 
 function TDotProductSharedKernel.PrepareForCompute(VAs, VBs: TNNetVolume;

@@ -329,6 +329,11 @@ type
     procedure TestKANConvOpenCLParity;
     // OpenCL backward-GEMM offload parity (vs CPU) for the general convolution.
     procedure TestConvolutionBackwardOpenCLParity;
+    // OpenCL two-GEMM forward offload parity (vs CPU) for the BASE
+    // TNNetScaledDotProductAttention: score GEMM (contract d_k) then value GEMM
+    // (contract SeqLen) share one FDotCL, so this also exercises the grow-only
+    // ReallocateBuffersIfRequired buffer reuse across the two differing shapes.
+    procedure ScaledDotProductAttentionOpenCLParity;
     // OpenCL two-GEMM forward offload parity (vs CPU) for the non-causal global
     // TNNetLinearAttention.
     procedure LinearAttentionOpenCLParity;
@@ -62015,6 +62020,72 @@ end;
 // fixed fixture (SeqLen >= the offload threshold so the GEMM path fires). The
 // phi maps, Z and the per-query denominator stay on the CPU in both paths, so
 // the only divergence is FP32 GEMM accumulation order -> a tight 1e-4 gate.
+// Base TNNetScaledDotProductAttention device path: BOTH matmuls (Q.K^T and P.V)
+// run on the device, masking + softmax on the CPU in between. The two GEMMs have
+// different contraction sizes (d_k then SeqLen) yet share one FDotCL, so this is
+// the direct check that the grow-only ReallocateBuffersIfRequired reuse produces
+// bit-for-bit the CPU result across a within-forward shape change. Coded by Claude (AI).
+procedure TTestNeuralNumerical.ScaledDotProductAttentionOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Dk = 16;
+  SeqLen = 40; // >= csSDPAOpenCLMinSeqLen (32) so the device path fires
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Attn: TNNetScaledDotProductAttention;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetScaledDotProductAttention.Create(Dk); // non-causal base class
+    NN.AddLayer(Attn);
+    // Bounded Q|K|V so scores/softmax/value sums stay O(1) and 1e-4 is meaningful.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.5 * Sin(i * 0.3) + 0.2 * Cos(i * 0.11);
+
+    // CPU forward (OpenCL OFF).
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    // Device forward (both GEMMs offloaded; base class arms FShouldOpenCL).
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    MaxDiff := 0;
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  ScaledDotProductAttention OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('ScaledDotProductAttention OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
 procedure TTestNeuralNumerical.LinearAttentionOpenCLParity;
 {$IFDEF OpenCL}
 const
