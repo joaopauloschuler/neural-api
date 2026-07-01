@@ -7,6 +7,38 @@
 // B vectors (B1, B2, B3, ...) via dot product. There is a resulting vector
 // R with all dot products A1.B1 .. A1.B2 .. A2.B1 .. AN.BN .
 // A vectors are sometimes interleaved.
+
+// Shared bias+activation epilogue for the dot-product kernel: applies the
+// optional fused activation to an already-reduced (bias-added) value. Opcodes
+// match the csAct* constants (1=ReLU, 2=Sigmoid, 3=HyperbolicTangent; 0/other=
+// pass-through) and mirror cai_activation exactly so device and host agree to
+// ~1e-6. Coded by Claude (AI).
+inline float cai_dp_finish(float v, const int ActFN)
+{
+  if (ActFN == 1)
+  {
+    if (v < 0.0f) { v = 0.0f; }
+  }
+  else if (ActFN == 2) // Sigmoid: numerically-stable two-branch 1/(1+exp(-x))
+  {
+    if (v > 0.0f)
+      v = 1.0f / (1.0f + exp(-v));
+    else
+    {
+      const float s = exp(v);
+      v = s / (1.0f + s);
+    }
+  }
+  else if (ActFN == 3) // HyperbolicTangent: clamp [-10,10], (1-e)/(1+e), e=exp(-2x)
+  {
+    float xc = v;
+    if (xc > 10.0f) xc = 10.0f; else if (xc < -10.0f) xc = -10.0f;
+    const float e = exp(-2.0f * xc);
+    v = (1.0f - e) / (1.0f + e);
+  }
+  return v;
+}
+
 __kernel void cai_dot_product
 (
   const int FThreadCount,
@@ -28,122 +60,64 @@ __kernel void cai_dot_product
   __global const float* FBiasOutput
 )
 {
-  const int a_id = get_global_id(0);
-  const int b_id = get_global_id(1);
+  // Register micro-tiling along the a-axis: each work-item computes MA (=4)
+  // consecutive a_id for one b_id, holding 4 accumulators in registers. Every
+  // loaded B element is reused across the 4 accumulators, cutting B global
+  // traffic ~4-fold and giving 4 independent mad chains (ILP that hides the
+  // mad latency better than the old single-chain 32-wide unroll). This is the
+  // GPU analog of the CPU DotProductsTiled loop blocking.
+  //
+  // FNumAs/FNumBs are arbitrary (no multiple-of assumption): the a-axis is
+  // launched as ceil(FNumAs/4) work-items and each of the 4 lanes is guarded by
+  // a_id < FNumAs; the b-axis is untouched (one work-item per b_id). The A
+  // buffer is interleaved (stride FNumAs across the reduction), so the 4 lanes
+  // read 4 contiguous floats per step (coalesced across the work-group).
+  // Coded by Claude (AI).
+  const int a_base = get_global_id(0) * 4;
+  const int b_id   = get_global_id(1);
 
-  if ( (a_id < FNumAs) && (b_id < FNumBs) )
+  if ( (a_base < FNumAs) && (b_id < FNumBs) )
   {
     const int VectBPos = b_id * FSize;
 
-    float DotProductResult = 0;
-    int i = 0;
+    // Valid lanes in this MA-block (tail: FNumAs not a multiple of 4). Read
+    // offsets for absent lanes are clamped to lane 0 so the A loads stay in
+    // bounds; those duplicate products are computed but never written.
+    const int lanes = min(4, FNumAs - a_base);
+    const int o1 = (lanes > 1) ? 1 : 0;
+    const int o2 = (lanes > 2) ? 2 : 0;
+    const int o3 = (lanes > 3) ? 3 : 0;
 
-    const int FSizeMinus8  = FSize -  8;
-    const int FSizeMinus32 = FSize - 32;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
 
-    while (i < FSizeMinus32)
+    for (int i = 0; i < FSize; i++)
     {
-      const int startBPos = i + VectBPos;
-
-      DotProductResult =
-        mad(FInputBufferAs[a_id + (i+ 0)*FNumAs], FInputBufferBs[startBPos +  0],
-        mad(FInputBufferAs[a_id + (i+ 1)*FNumAs], FInputBufferBs[startBPos +  1],
-        mad(FInputBufferAs[a_id + (i+ 2)*FNumAs], FInputBufferBs[startBPos +  2],
-        mad(FInputBufferAs[a_id + (i+ 3)*FNumAs], FInputBufferBs[startBPos +  3],
-        mad(FInputBufferAs[a_id + (i+ 4)*FNumAs], FInputBufferBs[startBPos +  4],
-        mad(FInputBufferAs[a_id + (i+ 5)*FNumAs], FInputBufferBs[startBPos +  5],
-        mad(FInputBufferAs[a_id + (i+ 6)*FNumAs], FInputBufferBs[startBPos +  6],
-        mad(FInputBufferAs[a_id + (i+ 7)*FNumAs], FInputBufferBs[startBPos +  7],
-        mad(FInputBufferAs[a_id + (i+ 8)*FNumAs], FInputBufferBs[startBPos +  8],
-        mad(FInputBufferAs[a_id + (i+ 9)*FNumAs], FInputBufferBs[startBPos +  9],
-        mad(FInputBufferAs[a_id + (i+10)*FNumAs], FInputBufferBs[startBPos + 10],
-        mad(FInputBufferAs[a_id + (i+11)*FNumAs], FInputBufferBs[startBPos + 11],
-        mad(FInputBufferAs[a_id + (i+12)*FNumAs], FInputBufferBs[startBPos + 12],
-        mad(FInputBufferAs[a_id + (i+13)*FNumAs], FInputBufferBs[startBPos + 13],
-        mad(FInputBufferAs[a_id + (i+14)*FNumAs], FInputBufferBs[startBPos + 14],
-        mad(FInputBufferAs[a_id + (i+15)*FNumAs], FInputBufferBs[startBPos + 15],
-        mad(FInputBufferAs[a_id + (i+16)*FNumAs], FInputBufferBs[startBPos + 16],
-        mad(FInputBufferAs[a_id + (i+17)*FNumAs], FInputBufferBs[startBPos + 17],
-        mad(FInputBufferAs[a_id + (i+18)*FNumAs], FInputBufferBs[startBPos + 18],
-        mad(FInputBufferAs[a_id + (i+19)*FNumAs], FInputBufferBs[startBPos + 19],
-        mad(FInputBufferAs[a_id + (i+20)*FNumAs], FInputBufferBs[startBPos + 20],
-        mad(FInputBufferAs[a_id + (i+21)*FNumAs], FInputBufferBs[startBPos + 21],
-        mad(FInputBufferAs[a_id + (i+22)*FNumAs], FInputBufferBs[startBPos + 22],
-        mad(FInputBufferAs[a_id + (i+23)*FNumAs], FInputBufferBs[startBPos + 23],
-        mad(FInputBufferAs[a_id + (i+24)*FNumAs], FInputBufferBs[startBPos + 24],
-        mad(FInputBufferAs[a_id + (i+25)*FNumAs], FInputBufferBs[startBPos + 25],
-        mad(FInputBufferAs[a_id + (i+26)*FNumAs], FInputBufferBs[startBPos + 26],
-        mad(FInputBufferAs[a_id + (i+27)*FNumAs], FInputBufferBs[startBPos + 27],
-        mad(FInputBufferAs[a_id + (i+28)*FNumAs], FInputBufferBs[startBPos + 28],
-        mad(FInputBufferAs[a_id + (i+29)*FNumAs], FInputBufferBs[startBPos + 29],
-        mad(FInputBufferAs[a_id + (i+30)*FNumAs], FInputBufferBs[startBPos + 30],
-        mad(FInputBufferAs[a_id + (i+31)*FNumAs], FInputBufferBs[startBPos + 31],
-        DotProductResult
-        ))))))))
-        ))))))))
-        ))))))))
-        ))))))));
-
-      i += 32;
-    }
-
-    while (i < FSizeMinus8)
-    {
-      const int startBPos = i + VectBPos;
-
-      DotProductResult =
-        mad(FInputBufferAs[a_id + (i+0)*FNumAs], FInputBufferBs[startBPos + 0],
-        mad(FInputBufferAs[a_id + (i+1)*FNumAs], FInputBufferBs[startBPos + 1],
-        mad(FInputBufferAs[a_id + (i+2)*FNumAs], FInputBufferBs[startBPos + 2],
-        mad(FInputBufferAs[a_id + (i+3)*FNumAs], FInputBufferBs[startBPos + 3],
-        mad(FInputBufferAs[a_id + (i+4)*FNumAs], FInputBufferBs[startBPos + 4],
-        mad(FInputBufferAs[a_id + (i+5)*FNumAs], FInputBufferBs[startBPos + 5],
-        mad(FInputBufferAs[a_id + (i+6)*FNumAs], FInputBufferBs[startBPos + 6],
-        mad(FInputBufferAs[a_id + (i+7)*FNumAs], FInputBufferBs[startBPos + 7],
-        DotProductResult))))))));
-      i += 8;
-    }
-
-    while (i < FSize)
-    {
-      DotProductResult =
-        mad(FInputBufferAs[a_id + i*FNumAs], FInputBufferBs[i + VectBPos], DotProductResult);
-        i += 1;
+      const float bv  = FInputBufferBs[VectBPos + i];
+      const int  aPos = a_base + i * FNumAs;
+      acc0 = mad(FInputBufferAs[aPos     ], bv, acc0);
+      acc1 = mad(FInputBufferAs[aPos + o1], bv, acc1);
+      acc2 = mad(FInputBufferAs[aPos + o2], bv, acc2);
+      acc3 = mad(FInputBufferAs[aPos + o3], bv, acc3);
     }
 
     // Fused bias-add (see the FBiasOutput arg comment): act must see W.x + b.
-    if (UseBias != 0) DotProductResult += FBiasOutput[b_id * FNumAs + a_id];
-
-    // Optional fused activation, applied in-register to the reduced dot product
-    // before it is written back. Opcodes match the csAct* constants (and the
-    // cai_activation switch): 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent;
-    // 0/other = pass-through. This lets an inference forward skip the host-side
-    // bias-add + activation sweep over the whole output volume. The sigmoid/tanh
-    // math mirrors cai_activation exactly so device and host agree to ~1e-6.
-    // Coded by Claude (AI).
-    if (ActFN == 1)
+    const int rBase = b_id * FNumAs + a_base;
+    if (UseBias != 0)
     {
-      if (DotProductResult < 0.0f) { DotProductResult = 0.0f; }
-    }
-    else if (ActFN == 2) // Sigmoid: numerically-stable two-branch 1/(1+exp(-x))
-    {
-      if (DotProductResult > 0.0f)
-        DotProductResult = 1.0f / (1.0f + exp(-DotProductResult));
-      else
-      {
-        const float s = exp(DotProductResult);
-        DotProductResult = s / (1.0f + s);
-      }
-    }
-    else if (ActFN == 3) // HyperbolicTangent: clamp [-10,10], (1-e)/(1+e), e=exp(-2x)
-    {
-      float xc = DotProductResult;
-      if (xc > 10.0f) xc = 10.0f; else if (xc < -10.0f) xc = -10.0f;
-      const float e = exp(-2.0f * xc);
-      DotProductResult = (1.0f - e) / (1.0f + e);
+      acc0 += FBiasOutput[rBase];
+      if (lanes > 1) acc1 += FBiasOutput[rBase + 1];
+      if (lanes > 2) acc2 += FBiasOutput[rBase + 2];
+      if (lanes > 3) acc3 += FBiasOutput[rBase + 3];
     }
 
-    FResultBuffer[b_id * FNumAs + a_id] = DotProductResult;
+    // Optional fused activation (cai_dp_finish), then write only valid lanes.
+    FResultBuffer[rBase] = cai_dp_finish(acc0, ActFN);
+    if (lanes > 1) FResultBuffer[rBase + 1] = cai_dp_finish(acc1, ActFN);
+    if (lanes > 2) FResultBuffer[rBase + 2] = cai_dp_finish(acc2, ActFN);
+    if (lanes > 3) FResultBuffer[rBase + 3] = cai_dp_finish(acc3, ActFN);
   }
 } // end of kernel
 

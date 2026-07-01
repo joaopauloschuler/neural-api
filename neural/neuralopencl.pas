@@ -678,13 +678,20 @@ begin
       if err = CL_SUCCESS then
       begin
 
+        // cai_dot_product register micro-tiles the a-axis by MA=4 (each
+        // work-item computes up to 4 consecutive a_id), so dim0 is launched as
+        // ceil(FNumAs/4). FNumAs is arbitrary - the kernel guards each lane by
+        // a_id < FNumAs. No caller sets a work-group size (FGroupSizeA/B are
+        // always 0), so the coarsened global size needs no divisibility; if one
+        // is ever set it must divide the coarsened dim0, not FNumAs. MA must
+        // stay in sync with the 4 in cai_dot_product. Coded by Claude (AI).
         if (FGroupSizeA > 0) and (FGroupSizeB > 0)  then
         begin
-          FDotProductKernel.RunKernel2D(Kernel, FNumAs, FNumBs, FGroupSizeA, FGroupSizeB);
+          FDotProductKernel.RunKernel2D(Kernel, (FNumAs + 3) div 4, FNumBs, FGroupSizeA, FGroupSizeB);
         end
         else
         begin
-          FDotProductKernel.RunKernel2D(Kernel, FNumAs, FNumBs);
+          FDotProductKernel.RunKernel2D(Kernel, (FNumAs + 3) div 4, FNumBs);
         end;
 
       end
@@ -994,13 +1001,16 @@ begin
       if err = CL_SUCCESS then
       begin
 
+        // a-axis register micro-tiled MA=4 in cai_dot_product: dim0 =
+        // ceil(FNumAs/4) (see the matching note in TDotProductSharedKernel.
+        // Compute). Coded by Claude (AI).
         if (FGroupSizeA > 0) and (FGroupSizeB > 0)  then
         begin
-          RunKernel2D(FKernel, FNumAs, FNumBs, FGroupSizeA, FGroupSizeB);
+          RunKernel2D(FKernel, (FNumAs + 3) div 4, FNumBs, FGroupSizeA, FGroupSizeB);
         end
         else
         begin
-          RunKernel2D(FKernel, FNumAs, FNumBs);
+          RunKernel2D(FKernel, (FNumAs + 3) div 4, FNumBs);
         end;
 
       end
