@@ -1144,6 +1144,42 @@ __kernel void cai_embedding_gather
     FY[gid] = FW[row * FEmbeddingSize + e];
 }
 
+// Device-side im2col: builds the convolution's FInputPrepared column matrix
+// straight into device memory, so only the small (padded) input crosses the bus
+// instead of the ~FeatureSizeX*FeatureSizeY-times-larger column matrix, and the
+// host im2col gather (PrepareInputForConvolutionFast) is skipped entirely. Pure
+// gather - every output element FCols[gid] is a copy of one FInput element, index
+// computed from the closed-form conv geometry. It is bit-faithful to the CPU
+// PrepareInputForConvolutionFast (same TVolume layout ((SizeX*y)+x)*Depth+d), so
+// the GEMM that follows reads an identical B operand. FInput is the ALREADY
+// (zero-)padded input (FInputCopy), hence no bounds checks. Only used on the
+// inference-only, non-pointwise, non-Winograd forward path. One work-item per
+// column-matrix element. Coded by Claude (AI).
+__kernel void cai_im2col
+(
+  const int N,          // total elements = OutSizeX*OutSizeY*ColDepth
+  const int OutSizeX,   // FOutput.SizeX
+  const int ColDepth,   // FInputPrepared depth = InDepth*FeatX*FeatY
+  const int RowSpan,    // one feature-row width = InDepth*FeatX
+  const int InSizeX,    // FInputCopy.SizeX (padded)
+  const int InDepth,    // FInputCopy.Depth
+  const int Stride,
+  __global const float* FInput,
+  __global float* FCols
+)
+{
+  const int gid = get_global_id(0);
+  if (gid >= N) return;
+  const int col_elem = gid % ColDepth;
+  const int pos      = gid / ColDepth;
+  const int ox       = pos % OutSizeX;
+  const int oy       = pos / OutSizeX;
+  const int yCount   = col_elem / RowSpan;
+  const int rem      = col_elem % RowSpan;
+  const int src = ((InSizeX * (oy * Stride + yCount)) + ox * Stride) * InDepth + rem;
+  FCols[gid] = FInput[src];
+}
+
 // Rotary positional embedding (RoPE) forward. The input is FSeqLen tokens of
 // FDepth depth-contiguous channels [t*FDepth + c]; FDepth is even and the
 // rotation operates on the interleaved channel-pairs (2k, 2k+1). FTheta holds

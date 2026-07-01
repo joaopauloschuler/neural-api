@@ -257,6 +257,13 @@ type
       /// nil (and UseBias=0) for every bias-less caller. Coded by Claude (AI).
       FBiasBuffer: cl_mem;
       FCapBias: csize_t;
+      /// Optional resident source buffer for device-side im2col: holds the small
+      /// (padded) convolution input that BuildInputColsOnDevice gathers into
+      /// FInputBufferBs. Grow-only and re-uploaded only when the source changed;
+      /// nil until the first inference-only non-pointwise conv forward that opts in.
+      /// Coded by Claude (AI).
+      FIm2ColSrcBuffer: cl_mem;
+      FCapIm2ColSrc: csize_t;
 
       FDotProductKernel: TDotProductKernel;
 
@@ -275,6 +282,15 @@ type
       /// to avoid churning three clCreateBuffer/clReleaseMemObject pairs per GEMM.
       /// Coded by Claude (AI).
       procedure ReallocateBuffersIfRequired(VAs, VBs: TNNetVolume; pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0);
+      /// Device-side im2col: gathers SrcVol (the padded conv input) into the
+      /// resident B-operand buffer (FInputBufferBs) using the shared cai_im2col
+      /// kernel, so the host never builds nor uploads the inflated column matrix.
+      /// Must be called AFTER the B buffer is sized (PrepareForCompute in
+      /// EnableOpenCL) and BEFORE the matching Compute(..., NewVBs=false), on the
+      /// same in-order command queue so the gather is ordered before the GEMM.
+      /// Coded by Claude (AI).
+      procedure BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel; SrcVol: TNNetVolume;
+        OutSizeX, ColDepth, RowSpan, InSizeX, InDepth, Stride: longint; NewSrc: boolean = true);
       procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint; NewVAs:boolean = true; NewVBs:boolean = true; VBias: TNNetVolume = nil; NewVBias: boolean = true);
       procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
 
@@ -424,16 +440,19 @@ begin
   if Assigned(FInputBufferBs) then clReleaseMemObject(FInputBufferBs);
   if Assigned(FResultBuffer)  then clReleaseMemObject(FResultBuffer);
   if Assigned(FBiasBuffer)    then clReleaseMemObject(FBiasBuffer);
+  if Assigned(FIm2ColSrcBuffer) then clReleaseMemObject(FIm2ColSrcBuffer);
 
   FInputBufferAs := nil;
   FInputBufferBs := nil;
   FResultBuffer  := nil;
   FBiasBuffer    := nil;
+  FIm2ColSrcBuffer := nil;
 
   FCapAs := 0;
   FCapBs := 0;
   FCapResult := 0;
   FCapBias := 0;
+  FCapIm2ColSrc := 0;
 end;
 
 // Grow-only buffer management for the per-forward attention/gram callers. Unlike
@@ -522,6 +541,49 @@ begin
   FPreviousComputeTime := 0;
 
   PrepareForCompute := CL_SUCCESS;
+end;
+
+procedure TDotProductSharedKernel.BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel;
+  SrcVol: TNNetVolume; OutSizeX, ColDepth, RowSpan, InSizeX, InDepth, Stride: longint;
+  NewSrc: boolean = true);
+var
+  k: cl_kernel;
+  N: longint;
+  err: integer;
+  NeededSrc: csize_t;
+begin
+  k := Im2ColKernel.Kernel;
+  // Total column-matrix elements = FInputBufferBs capacity (already sized to
+  // FInputPrepared by PrepareForCompute). FNumBs*FSize == FInputPrepared.Size.
+  N := FNumBs * FSize;
+
+  // Resident, grow-only source buffer (same model as the operand/bias buffers).
+  NeededSrc := SrcVol.GetMemSize();
+  if (FIm2ColSrcBuffer = nil) or (NeededSrc > FCapIm2ColSrc) then
+  begin
+    if Assigned(FIm2ColSrcBuffer) then clReleaseMemObject(FIm2ColSrcBuffer);
+    FIm2ColSrcBuffer := FDotProductKernel.CreateInputBuffer(NeededSrc);
+    FCapIm2ColSrc := NeededSrc;
+    NewSrc := true; // fresh/grown buffer: force upload regardless of caller
+  end;
+  if NewSrc then err := FDotProductKernel.WriteBuffer(FIm2ColSrcBuffer, SrcVol)
+  else err := CL_SUCCESS;
+
+  err := err or clSetKernelArg(k, 0, SizeOf(longint), @N);
+  err := err or clSetKernelArg(k, 1, SizeOf(longint), @OutSizeX);
+  err := err or clSetKernelArg(k, 2, SizeOf(longint), @ColDepth);
+  err := err or clSetKernelArg(k, 3, SizeOf(longint), @RowSpan);
+  err := err or clSetKernelArg(k, 4, SizeOf(longint), @InSizeX);
+  err := err or clSetKernelArg(k, 5, SizeOf(longint), @InDepth);
+  err := err or clSetKernelArg(k, 6, SizeOf(longint), @Stride);
+  err := err or clSetKernelArg(k, 7, SizeOf(cl_mem), @FIm2ColSrcBuffer);
+  err := err or clSetKernelArg(k, 8, SizeOf(cl_mem), @FInputBufferBs);
+  if (err <> CL_SUCCESS) then
+    ErrorProc('Error: BuildInputColsOnDevice - failed setting parameters: ' + IntToStr(err));
+
+  // Enqueue on the shared in-order command queue; the following Compute GEMM
+  // (same queue) is ordered after this gather, so no explicit Finish is needed.
+  Im2ColKernel.RunKernel(k, N);
 end;
 
 procedure TDotProductSharedKernel.Compute

@@ -337,6 +337,12 @@ type
     // (shares the cai_dot_product FDotCL). Sweeps the four opcodes x bias/nobias
     // on an inference-only dense layer. Coded by Claude (AI).
     procedure TestFullConnectActivationFusionOpenCLParity;
+    // Device-side im2col (cai_im2col) forward parity for the general convolution:
+    // an inference-only conv gathers FInputPrepared on the device instead of the
+    // host. Sweeps feature-size x padding x stride so the gather index math
+    // (padded-vs-aliased input, stride>1) is exercised against the CPU reference.
+    // Coded by Claude (AI).
+    procedure TestConvDeviceIm2ColOpenCLParity;
     // OpenCL backward-GEMM offload parity (vs CPU) for the general convolution.
     procedure TestConvolutionBackwardOpenCLParity;
     // OpenCL two-GEMM forward offload parity (vs CPU) for the BASE
@@ -62126,6 +62132,105 @@ begin
   RunOne('ReLU bias', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0);
   RunOne('Sigmoid bias', @Sigmoid, @SigmoidDerivative, 0);
   RunOne('Tanh bias', @HiperbolicTangent, @HiperbolicTangentDerivative, 0);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Device-side im2col (cai_im2col) forward parity for the general convolution. On
+// the inference-only device path ComputeOpenCL gathers FInputPrepared straight
+// into the GEMM B buffer on the device (the host PrepareInputForConvolutionFast
+// is skipped and the inflated column matrix is never uploaded). We sweep
+// feature-size x padding x stride so the gather index math is stressed: padding=0
+// aliases FInputCopy to the prev output, padding>0 exercises the padded copy, and
+// stride>1 exercises the strided receptive-field walk. Each case is compared
+// against the plain trainable CPU forward. Depth 3, 3x3/5x5 keeps FVectorSize
+// (<=75) under csMaxInterleavedSize so the conv's SetPrevLayer verdict arms
+// FShouldOpenCL; default (non-opt-in) Winograd stays off, so ShouldDeviceIm2Col
+// is taken. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestConvDeviceIm2ColOpenCLParity;
+{$IFDEF OpenCL}
+  procedure RunOne(const aName: string; pFeatureSize, pPadding, pStride: integer;
+    ActFn, ActDeriv: TNeuralActivationFunction; pSuppressBias: integer);
+  var
+    NN: TNNet;
+    Input, OutCPU: TNNetVolume;
+    Conv: TNNetConvolution;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    i: integer;
+    Diff, MaxDiff: TNeuralFloat;
+  begin
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(9, 9, 3);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(9, 9, 3, 1));
+      Conv := TNNetConvolution.Create(4, pFeatureSize, pPadding, pStride, pSuppressBias);
+      Conv.ActivationFn := ActFn;
+      Conv.ActivationFnDerivative := ActDeriv;
+      NN.AddLayer(Conv);
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.03 * i - 1.1;
+
+      // Distinct non-zero biases so the bias-present sweep is not vacuous.
+      for i := 0 to Conv.Neurons.Count - 1 do
+        Conv.Neurons[i].BiasWeight := 0.2 + 0.1 * i;
+      NN.UpdateWeights();
+
+      // CPU reference (host im2col + host activation), captured while trainable.
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      // Inference-only (keep weight cache): arms both the device im2col gather AND
+      // the fused activation/bias load into FOutput.
+      Conv.SetTrainable(False, False);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        NN.Compute(Input); // second pass: resident weights + re-uploaded input
+        MaxDiff := 0;
+        AssertEquals(aName + ' output size match', OutCPU.Size,
+          NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  ConvDeviceIm2Col ', aName, ' OpenCL parity: max|diff|=', MaxDiff:0:9);
+      AssertTrue('ConvDeviceIm2Col ' + aName + ' OpenCL vs CPU parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+begin
+  // Geometry sweep (featureSize, padding, stride). Tanh keeps the fused-activation
+  // path active; bias present so FBiasOutput also rides the gathered columns.
+  RunOne('3x3 pad0 s1', 3, 0, 1, @HiperbolicTangent, @HiperbolicTangentDerivative, 0);
+  RunOne('3x3 pad1 s1', 3, 1, 1, @HiperbolicTangent, @HiperbolicTangentDerivative, 0);
+  RunOne('3x3 pad1 s2', 3, 1, 2, @HiperbolicTangent, @HiperbolicTangentDerivative, 0);
+  RunOne('3x3 pad0 s2', 3, 0, 2, @HiperbolicTangent, @HiperbolicTangentDerivative, 0);
+  RunOne('5x5 pad2 s1', 5, 2, 1, @HiperbolicTangent, @HiperbolicTangentDerivative, 0);
+  RunOne('5x5 pad0 s2', 5, 0, 2, @HiperbolicTangent, @HiperbolicTangentDerivative, 0);
+  // A bias-suppressed + ReLU case to vary the fused opcode/bias combination.
+  RunOne('3x3 pad1 s1 relu nobias', 3, 1, 1, @RectifiedLinearUnit,
+    @RectifiedLinearUnitDerivative, 1);
 end;
 {$ELSE}
 begin
