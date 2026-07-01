@@ -162,6 +162,23 @@ type
       function CreateAndWriteBuffer(V: TNNetVolume): cl_mem; overload; {$IFDEF Release} inline; {$ENDIF}
       function CreateWriteSetArgument(V: TNNetVolume; kernel:cl_kernel; arg_index: cl_uint): cl_mem; {$IFDEF Release} inline; {$ENDIF}
       function CreateOutputSetArgument(V: TNNetVolume; kernel:cl_kernel; arg_index: cl_uint): cl_mem; {$IFDEF Release} inline; {$ENDIF}
+
+      // Grow-only persistent device buffer, the convolution buffer-reuse model
+      // applied to the auxiliary helper kernels: pass the SAME (buf, capBytes)
+      // pair every forward and the buffer is (re)allocated only when the needed
+      // size exceeds the current capacity, otherwise reused in place. This
+      // replaces the per-forward CreateBuffer/clReleaseMemObject churn that made
+      // deep transformer models allocate dozens of tiny device buffers per pass.
+      // The owning helper must release the buffer once in its destructor and
+      // zero-init (buf=nil, capBytes=0). (Coded by Claude (AI).)
+      function EnsureBuffer(var buf: cl_mem; var capBytes: csize_t;
+        flags: cl_mem_flags; neededBytes: csize_t): cl_mem;
+      // Ensure a persistent buffer big enough for V, then upload V into it.
+      function EnsureWriteBuffer(var buf: cl_mem; var capBytes: csize_t;
+        V: TNNetVolume): cl_mem;
+      // Ensure a persistent output buffer big enough for V (no upload).
+      function EnsureOutputBuffer(var buf: cl_mem; var capBytes: csize_t;
+        V: TNNetVolume): cl_mem;
   end;
 
   TNeuralKernel = class(TEasyOpenCLV)
@@ -930,6 +947,36 @@ function TEasyOpenCLV.CreateOutputSetArgument(V: TNNetVolume;
 begin
   Result := CreateOutputBuffer(V);
   clSetKernelArg(kernel, arg_index, sizeof(cl_mem), @Result);
+end;
+
+function TEasyOpenCLV.EnsureBuffer(var buf: cl_mem; var capBytes: PtrUInt;
+  flags: cl_mem_flags; neededBytes: PtrUInt): cl_mem;
+begin
+  // Grow only: reuse the existing allocation whenever it is large enough (a
+  // buffer bigger than needed is harmless - WriteBuffer/ReadBuffer move exactly
+  // V.GetMemSize() bytes and the kernels are bounded by explicit size args).
+  if (buf = nil) or (neededBytes > capBytes) then
+  begin
+    if Assigned(buf) then clReleaseMemObject(buf);
+    buf := CreateBuffer(flags, neededBytes);
+    capBytes := neededBytes;
+  end;
+  Result := buf;
+end;
+
+function TEasyOpenCLV.EnsureWriteBuffer(var buf: cl_mem; var capBytes: csize_t;
+  V: TNNetVolume): cl_mem;
+begin
+  // READ_WRITE (not READ_ONLY) so one persistent buffer can back either an
+  // input or output role across shapes without flag mismatches.
+  Result := EnsureBuffer(buf, capBytes, CL_MEM_READ_WRITE, V.GetMemSize());
+  WriteBuffer(Result, V, CL_FALSE);
+end;
+
+function TEasyOpenCLV.EnsureOutputBuffer(var buf: cl_mem; var capBytes: csize_t;
+  V: TNNetVolume): cl_mem;
+begin
+  Result := EnsureBuffer(buf, capBytes, CL_MEM_READ_WRITE, V.GetMemSize());
 end;
 
 { TEasyOpenCL }
