@@ -251,6 +251,12 @@ type
       /// ReallocateBuffersIfRequired for grow-only reuse; kept in sync with the
       /// actual allocations (reset to 0 whenever a buffer is released).
       FCapAs, FCapBs, FCapResult: csize_t;
+      /// Optional resident fused-bias buffer (arg 9 of cai_dot_product). Only
+      /// allocated when a Compute call passes a bias volume; grow-only like the
+      /// operands, uploaded only when NewVBias (or on first/grown allocation).
+      /// nil (and UseBias=0) for every bias-less caller. Coded by Claude (AI).
+      FBiasBuffer: cl_mem;
+      FCapBias: csize_t;
 
       FDotProductKernel: TDotProductKernel;
 
@@ -269,7 +275,7 @@ type
       /// to avoid churning three clCreateBuffer/clReleaseMemObject pairs per GEMM.
       /// Coded by Claude (AI).
       procedure ReallocateBuffersIfRequired(VAs, VBs: TNNetVolume; pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0);
-      procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint; NewVAs:boolean = true; NewVBs:boolean = true);
+      procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint; NewVAs:boolean = true; NewVBs:boolean = true; VBias: TNNetVolume = nil; NewVBias: boolean = true);
       procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
 
       /// The underlying device kernel shared by this instance. Exposed so a layer
@@ -417,14 +423,17 @@ begin
   if Assigned(FInputBufferAs) then clReleaseMemObject(FInputBufferAs);
   if Assigned(FInputBufferBs) then clReleaseMemObject(FInputBufferBs);
   if Assigned(FResultBuffer)  then clReleaseMemObject(FResultBuffer);
+  if Assigned(FBiasBuffer)    then clReleaseMemObject(FBiasBuffer);
 
   FInputBufferAs := nil;
   FInputBufferBs := nil;
   FResultBuffer  := nil;
+  FBiasBuffer    := nil;
 
   FCapAs := 0;
   FCapBs := 0;
   FCapResult := 0;
+  FCapBias := 0;
 end;
 
 // Grow-only buffer management for the per-forward attention/gram callers. Unlike
@@ -519,10 +528,13 @@ procedure TDotProductSharedKernel.Compute
 (
   VAs, VBs: TNNetVolume;
   pActFN: longint;
-  NewVAs:boolean = true; NewVBs:boolean = true
+  NewVAs:boolean = true; NewVBs:boolean = true;
+  VBias: TNNetVolume = nil; NewVBias: boolean = true
 );
 var
   err: integer;
+  UseBias: longint;
+  NeededBias: csize_t;
 begin
   FActFun := pActFN;
 
@@ -553,6 +565,34 @@ begin
 
       err := err or clSetKernelArg(Kernel, 7, SizeOf(cl_mem),  @FResultBuffer);
       if (err <> CL_SUCCESS) then ErrorProc('7 Error: Failed to set kernel arguments:' + IntToStr(err));
+
+      // Fused bias (arg 8 UseBias, arg 9 FBiasBuffer). Both args MUST be set every
+      // call: cai_dot_product now has 10 args and the enqueue rejects any unset
+      // one. A bias-less caller (VBias=nil) passes UseBias=0 and a NULL buffer
+      // (legal - the kernel never reads it). With a bias volume, keep it resident
+      // grow-only and re-upload only when NewVBias or the buffer was just
+      // (re)allocated. Coded by Claude (AI).
+      if VBias <> nil then
+      begin
+        NeededBias := VBias.GetMemSize();
+        if (FBiasBuffer = nil) or (NeededBias > FCapBias) then
+        begin
+          if Assigned(FBiasBuffer) then clReleaseMemObject(FBiasBuffer);
+          FBiasBuffer := FDotProductKernel.CreateInputBuffer(NeededBias);
+          FCapBias := NeededBias;
+          NewVBias := true; // fresh/grown buffer: force upload regardless of caller
+        end;
+        if NewVBias then err := err or FDotProductKernel.WriteBuffer(FBiasBuffer, VBias);
+        UseBias := 1;
+      end
+      else
+        UseBias := 0;
+
+      err := err or clSetKernelArg(Kernel, 8, SizeOf(longint), @UseBias);
+      if (err <> CL_SUCCESS) then ErrorProc('8 Error: Failed to set kernel arguments:' + IntToStr(err));
+
+      err := err or clSetKernelArg(Kernel, 9, SizeOf(cl_mem), @FBiasBuffer);
+      if (err <> CL_SUCCESS) then ErrorProc('9 Error: Failed to set kernel arguments:' + IntToStr(err));
 
       if (FHostInput) then
       begin
@@ -795,6 +835,8 @@ function TDotProductCL.PrepareForCompute(VAs, VBs: TNNetVolume; pSize: longint;
   kernelname: string; GroupSizeA: integer; GroupSizeB: integer): integer;
 var
   err: integer; // error code returned from api calls
+  UseBiasZero: longint; // this class never fuses bias
+  NilBias: cl_mem;
 begin
   UnprepareForCompute();
 
@@ -843,6 +885,17 @@ begin
 
   err := err or clSetKernelArg(FKernel, 7, SizeOf(cl_mem),  @FResultBuffer);
   if (err <> CL_SUCCESS) then ErrorProc('7 Error: Failed to set kernel arguments:' + IntToStr(err));
+
+  // cai_dot_product gained two fused-bias args (8 UseBias, 9 FBiasOutput). This
+  // class never fuses bias, but every arg must be set once before enqueue, so pin
+  // UseBias=0 and a NULL bias buffer here (clSetKernelArg copies the value
+  // immediately, so the locals are safe). Coded by Claude (AI).
+  UseBiasZero := 0;
+  NilBias := nil;
+  err := err or clSetKernelArg(FKernel, 8, SizeOf(longint), @UseBiasZero);
+  if (err <> CL_SUCCESS) then ErrorProc('8 Error: Failed to set kernel arguments:' + IntToStr(err));
+  err := err or clSetKernelArg(FKernel, 9, SizeOf(cl_mem), @NilBias);
+  if (err <> CL_SUCCESS) then ErrorProc('9 Error: Failed to set kernel arguments:' + IntToStr(err));
 
   PrepareForCompute := err;
 end;

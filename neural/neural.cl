@@ -16,7 +16,16 @@ __kernel void cai_dot_product
   int ActFN,
   __global float* FInputBufferAs,
   __global float* FInputBufferBs,
-  __global float* FResultBuffer
+  __global float* FResultBuffer,
+  // Optional fused bias: when UseBias != 0, FBiasOutput[b_id*FNumAs + a_id] is
+  // added to the reduced dot product BEFORE the activation, so an inference
+  // forward computes act(W.x + b) entirely on the device (no host bias-add +
+  // activation sweep). FBiasOutput carries the host FBiasOutput volume verbatim
+  // (bias replicated per output position, same [pos][feature] layout as the
+  // result), so the index matches the result write exactly. When UseBias == 0
+  // the pointer is unread and may be NULL. Coded by Claude (AI).
+  const int UseBias,
+  __global const float* FBiasOutput
 )
 {
   const int a_id = get_global_id(0);
@@ -102,13 +111,16 @@ __kernel void cai_dot_product
         i += 1;
     }
 
+    // Fused bias-add (see the FBiasOutput arg comment): act must see W.x + b.
+    if (UseBias != 0) DotProductResult += FBiasOutput[b_id * FNumAs + a_id];
+
     // Optional fused activation, applied in-register to the reduced dot product
     // before it is written back. Opcodes match the csAct* constants (and the
     // cai_activation switch): 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent;
-    // 0/other = pass-through. This lets an inference forward (bias suppressed)
-    // skip the host-side activation sweep over the whole output volume. The
-    // sigmoid/tanh math mirrors cai_activation exactly so device and host agree
-    // to ~1e-6. Coded by Claude (AI).
+    // 0/other = pass-through. This lets an inference forward skip the host-side
+    // bias-add + activation sweep over the whole output volume. The sigmoid/tanh
+    // math mirrors cai_activation exactly so device and host agree to ~1e-6.
+    // Coded by Claude (AI).
     if (ActFN == 1)
     {
       if (DotProductResult < 0.0f) { DotProductResult = 0.0f; }

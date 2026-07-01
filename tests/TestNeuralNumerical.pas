@@ -61932,7 +61932,8 @@ end;
 // exercised. Coded by Claude (AI).
 procedure TTestNeuralNumerical.TestConvActivationFusionOpenCLParity;
 {$IFDEF OpenCL}
-  procedure RunOne(const aName: string; ActFn, ActDeriv: TNeuralActivationFunction);
+  procedure RunOne(const aName: string; ActFn, ActDeriv: TNeuralActivationFunction;
+    pSuppressBias: integer);
   var
     NN: TNNet;
     Input, OutCPU: TNNetVolume;
@@ -61957,15 +61958,24 @@ procedure TTestNeuralNumerical.TestConvActivationFusionOpenCLParity;
     OutCPU := TNNetVolume.Create();
     try
       NN.AddLayer(TNNetInput.Create(8, 8, 3, 1));
-      // 6 features, 5x5 kernel, pad2, stride1, pSuppressBias=1 (bias-free is the
-      // precondition for the fusion: the kernel activates W.x with no host bias-add
-      // in between).
-      Conv := TNNetConvolution.Create(6, 5, 2, 1, 1);
+      // 6 features, 5x5 kernel, pad2, stride1. pSuppressBias is swept: =1 exercises
+      // the bias-free fused path (UseBias=0), =0 exercises the fused bias-add path
+      // (FBiasOutput rides along as kernel arg 9 -> act(W.x + b) on the device).
+      Conv := TNNetConvolution.Create(6, 5, 2, 1, pSuppressBias);
       Conv.ActivationFn := ActFn;
       Conv.ActivationFnDerivative := ActDeriv;
       NN.AddLayer(Conv);
       for i := 0 to Input.Size - 1 do
         Input.Raw[i] := 0.05 * i - 0.9;
+
+      // Give every neuron a distinct non-zero bias so the pSuppressBias=0 sweep
+      // genuinely exercises the fused device bias-add: default init leaves bias 0,
+      // which would make act(W.x + b) == act(W.x) and the bias rows vacuous.
+      // UpdateWeights cascades AfterWeightUpdate -> BuildBiasOutput so the host
+      // FBiasOutput (and the CPU reference below) reflect these values.
+      for i := 0 to Conv.Neurons.Count - 1 do
+        Conv.Neurons[i].BiasWeight := 0.4 + 0.15 * i;
+      NN.UpdateWeights();
 
       // CPU reference (host activation path), captured while still trainable.
       NN.Compute(Input);
@@ -62003,10 +62013,16 @@ procedure TTestNeuralNumerical.TestConvActivationFusionOpenCLParity;
     end;
   end;
 begin
-  RunOne('Identity', @Identity, @IdentityDerivative);
-  RunOne('ReLU', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative);
-  RunOne('Sigmoid', @Sigmoid, @SigmoidDerivative);
-  RunOne('Tanh', @HiperbolicTangent, @HiperbolicTangentDerivative);
+  // Each activation swept twice: bias-suppressed (UseBias=0) and bias-present
+  // (fused device bias-add). Both must match the host reference.
+  RunOne('Identity nobias', @Identity, @IdentityDerivative, 1);
+  RunOne('ReLU nobias', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 1);
+  RunOne('Sigmoid nobias', @Sigmoid, @SigmoidDerivative, 1);
+  RunOne('Tanh nobias', @HiperbolicTangent, @HiperbolicTangentDerivative, 1);
+  RunOne('Identity bias', @Identity, @IdentityDerivative, 0);
+  RunOne('ReLU bias', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0);
+  RunOne('Sigmoid bias', @Sigmoid, @SigmoidDerivative, 0);
+  RunOne('Tanh bias', @HiperbolicTangent, @HiperbolicTangentDerivative, 0);
 end;
 {$ELSE}
 begin
