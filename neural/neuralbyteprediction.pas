@@ -258,10 +258,13 @@ type
     // This function returns the probability to win of a given neuron from position pos.
     function ProbToWin(neuronPos: longint): extended;
 
+  // <TEMP> Temporarily place unused functions in the protected section to avoid hints.
+  protected
     // This function returns all relation indexes with a minimun number of victories (selections)
     // and a minimum probability MinF.
     procedure SelectBestIndexes(MinimumNumberOfVictories: longint; MinF: extended);
     procedure ResumeSlowPrediction;
+  // </TEMP>
 
   end;
 
@@ -866,24 +869,24 @@ procedure TStatePredictionClass.AddNeuronsFromStringFromPos(var str: string; pos
 var
   S: TStringList;
   neuronPos: longint;
-  version: integer;
-  evaluation: integer;
-  pActionLen: integer;
-  pStatelen: integer;
+  //version: integer;
+  //evaluation: integer;
+  //pActionLen: integer;
+  //pStatelen: integer;
   inputNeuronCnt: integer;
   MaxInputNeuron: integer;
 begin
-  version := 1;
+  //version := 1;
   S := TStringList.Create;
   S.Sorted := false;
   S.Delimiter := chr(10);
   S.StrictDelimiter := true;
   S.DelimitedText := str;
 
-  version := StrToInt(S[0]);
-  evaluation := StrToInt(S[1]);
-  pActionLen := StrToInt(S[2]);
-  pStatelen := StrToInt(S[3]);
+  //version := StrToInt(S[0]);
+  //evaluation := StrToInt(S[1]);
+  //pActionLen := StrToInt(S[2]);
+  //pStatelen := StrToInt(S[3]);
 
   //TODO: treat above info here.
 
