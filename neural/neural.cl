@@ -1249,6 +1249,56 @@ __kernel void cai_softmax
   }
 }
 
+// CAI shared elementwise activation forward. One work-item per element applies
+// the function selected by FOpcode (kept in sync with the csAct* constants in
+// neuralnetwork.pas): 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent. This single
+// kernel backs every opting-in TNNetIdentity activation descendant via
+// TNNetActivationCL, so new elementwise activations only add a case here plus an
+// opcode. Forward-only: the host keeps the backward pass (and, for ReLU, the
+// derivative gate mask). The sigmoid/tanh math mirrors the scalar CPU forms -
+// the two-branch stable sigmoid and the [-10,10]-clamped tanh - so the device
+// result tracks the host to ~1e-6 (exp here is more accurate than the CPU
+// polynomial pcr_expf, not less). Coded by Claude (AI).
+__kernel void cai_activation
+(
+  const int FSize,
+  const int FOpcode,
+  __global const float* FX,
+  __global float* FY
+)
+{
+  const int i = get_global_id(0);
+  if (i >= FSize) return;
+  const float x = FX[i];
+  float y;
+  switch (FOpcode)
+  {
+    case 1: // ReLU: max(x, 0)
+      y = (x > 0.0f) ? x : 0.0f;
+      break;
+    case 2: // Sigmoid: numerically-stable two-branch 1/(1+exp(-x))
+      if (x > 0.0f)
+        y = 1.0f / (1.0f + exp(-x));
+      else
+      {
+        const float s = exp(x);
+        y = s / (1.0f + s);
+      }
+      break;
+    case 3: // HyperbolicTangent: clamp to [-10,10], (1-exp(-2x))/(1+exp(-2x))
+    {
+      float xc = x;
+      if (xc > 10.0f) xc = 10.0f; else if (xc < -10.0f) xc = -10.0f;
+      const float e = exp(-2.0f * xc);
+      y = (1.0f - e) / (1.0f + e);
+      break;
+    }
+    default: // csActNone / unknown: pass through
+      y = x;
+  }
+  FY[i] = y;
+}
+
 // CAI Depthwise Convolution 2-D forward (TNNetDepthwiseConv).
 // Coded by Claude (AI).
 // A TRUE per-channel convolution: output channel (n*FInDepth + d) reduces ONLY

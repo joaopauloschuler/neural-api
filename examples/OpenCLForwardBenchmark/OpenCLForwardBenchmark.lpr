@@ -352,6 +352,19 @@ begin
     NN := MakeNet(cSeqLen * cScale, 1, cDModel, Inp); NN.AddLayer(TNNetPointwiseSoftMax.Create());
     Bench('TNNetPointwiseSoftMax', NN, Inp);
 
+    // --- Elementwise activations (shared cai_activation kernel) --- pure
+    // pointwise maps, so the primary dim is total element count; scaled via
+    // SeqLen at the SEQ profile. These are ~1..10 flops/word (memory-bandwidth
+    // bound): their production verdict is deliberately 'no' (see
+    // csActivationOpenCLMinSize) and the device path is charted only because the
+    // harness forces it - expect speedup < 1 on a real GPU too.
+    NN := MakeNet(cSeqLen * cScale, 1, cDModel, Inp); NN.AddLayer(TNNetReLU.Create());
+    Bench('TNNetReLU', NN, Inp);
+    NN := MakeNet(cSeqLen * cScale, 1, cDModel, Inp); NN.AddLayer(TNNetSigmoid.Create());
+    Bench('TNNetSigmoid', NN, Inp);
+    NN := MakeNet(cSeqLen * cScale, 1, cDModel, Inp); NN.AddLayer(TNNetHyperbolicTangent.Create());
+    Bench('TNNetHyperbolicTangent', NN, Inp);
+
     // --- Pooling / spatial resize (VIS) --- primary dim = spatial WIDTH
     // (cVisX * cScale); height held at base so work grows linearly. Resize/upsample
     // targets track the scaled input width.
