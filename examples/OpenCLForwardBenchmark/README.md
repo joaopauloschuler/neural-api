@@ -8,12 +8,18 @@ times the forward pass on the CPU, then calls `EnableOpenCL` and times the same
 forward on the device, and prints one table row:
 
 ```
-layer                            out shape        cpu us/fwd   gpu us/fwd   speedup   gpu?
-------------------------------------------------------------------------------------------------
-TNNetConvolution                 32x32x128            1234.5        210.3      5.87x   yes
-TNNetRMSNorm                     256x1x512              42.1         98.7          -   NO-cpu
+layer                            out shape        cpu us/fwd   gpu us/fwd    speedup  gpu?   verdict
+--------------------------------------------------------------------------------------------------------
+TNNetConvolution                 32x32x1280          85125.0      20281.3      4.20x  yes    yes
+TNNetRMSNorm                     256x1x512              42.1         98.7           -  NO-cpu no
 ...
 ```
+
+The `verdict` column is separate from `gpu?`: every row is forced onto the device
+(`NN.ForceOpenCL(True)`) so both timings are always charted, while `verdict`
+reports each layer's own `FShouldOpenCL` size decision — what production dispatch
+would choose at that shape. The gap between where `verdict` flips to `yes` and
+where `speedup` crosses `1x` shows whether a layer's threshold is tuned well.
 
 ## The `gpu?` column matters
 
@@ -37,18 +43,25 @@ Input profiles: `SEQ = (256, 1, D)` for sequence/transformer layers,
 the base sizes at the top of the `.lpr` (`cSeqLen`, `cVisX/Y/C`, `cDk`, ...).
 
 To sweep larger without recompiling, pass an **integer scale factor** as the
-first argument; it multiplies every profiled dimension:
+first argument. It does **not** multiply every dimension at once; instead, for
+each layer, it multiplies only the ONE dimension that drives that layer's
+CPU-vs-GPU crossover — the sequence length for the per-token SEQ ops and
+attention, the spatial width for the VIS spatial ops, the output-feature count
+for the convolutions (spatial and pointwise), the output width for the dense
+layers, and the cell width for the recurrent cells. Every other dimension stays
+at base, so the sweep grows near-linearly instead of the `k^3..k^4` blow-up of
+scaling all dimensions together:
 
 ```
 OpenCLForwardBenchmark        # base sizes (default == scale 1)
-OpenCLForwardBenchmark 4      # every dimension x4
+OpenCLForwardBenchmark 8      # each layer's primary dimension x8
 ```
 
 An integer factor is used deliberately: the base sizes satisfy each layer's
 divisibility invariants (channels `/8` for GroupNorm and `/4` for GroupConvP4,
 even gate/RoPE depths, `3*d_k` packing) and integer multiplication preserves
 them, so no factor can produce an illegal shape. A non-numeric or `<1` argument
-falls back to 1. The resolved sizes (and the factor) are echoed in the banner.
+falls back to 1. The resolved base sizes (and the factor) are echoed in the banner.
 
 The base sizes are kept moderate on purpose: the benchmark lowers the device
 dispatch gate `NeuralConvOpenCLMinWork` to `2^16` (`cMinWorkMACs`), so they

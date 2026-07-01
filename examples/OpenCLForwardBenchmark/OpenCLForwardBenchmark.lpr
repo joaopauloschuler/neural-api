@@ -278,12 +278,24 @@ begin
     Bench('TNNetKANConv', NN, Inp);
     NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetDeformableConv.Create(cVisFeat * cScale, 3, 1, 1));
     Bench('TNNetDeformableConv', NN, Inp);
+    // Pointwise (1x1) convolutions are the per-position GEMM inside every
+    // transformer FFN/projection; like the spatial convs they scale the output
+    // FEATURE count. Linear and ReLU share the conv path, differing only in the
+    // fused activation.
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetPointwiseConvLinear.Create(cVisFeat * cScale));
+    Bench('TNNetPointwiseConvLinear', NN, Inp);
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetPointwiseConvReLU.Create(cVisFeat * cScale));
+    Bench('TNNetPointwiseConvReLU', NN, Inp);
 
     // --- Dense / embedding --- FullConnect scales its OUTPUT width (the dispatch
     // metric; input width held at base keeps work linear); Embedding scales the
     // SEQ length (number of row lookups).
     NN := MakeNet(1, 1, cFCIn, Inp); NN.AddLayer(TNNetFullConnect.Create(cFCIn * cScale));
     Bench('TNNetFullConnect', NN, Inp);
+    NN := MakeNet(1, 1, cFCIn, Inp); NN.AddLayer(TNNetFullConnectLinear.Create(cFCIn * cScale));
+    Bench('TNNetFullConnectLinear', NN, Inp);
+    NN := MakeNet(1, 1, cFCIn, Inp); NN.AddLayer(TNNetFullConnectReLU.Create(cFCIn * cScale));
+    Bench('TNNetFullConnectReLU', NN, Inp);
     NN := MakeNet(cSeqLen * cScale, 1, 1, Inp); FillTokens(Inp, cVocab);
     NN.AddLayer(TNNetEmbedding.Create(cVocab, cDModel));
     Bench('TNNetEmbedding', NN, Inp);
