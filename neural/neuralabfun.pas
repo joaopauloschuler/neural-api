@@ -511,7 +511,7 @@ begin
 
   if OpCode in BinaryOperationSet then
   begin
-    result := '(' + sOp1 + ' ' + csStrOp[OpCode] + ' ' + sOp2 + ')';
+    result := '(' + sOp1 + ' ' + String(csStrOp[OpCode]) + ' ' + sOp2 + ')';
     exit;
   end;
 
@@ -529,11 +529,11 @@ begin
 
   if OpCode in NoArgSet then
   begin
-    result := csStrOp[OpCode] + ' S[B]';
+    result := String(csStrOp[OpCode]) + ' S[B]';
     exit;
   end;
 
-  result := '(' + csStrOp[OpCode] + ',' + sOp1 + ',' + sOp2 + ')';
+  result := '(' + String(csStrOp[OpCode]) + ',' + sOp1 + ',' + sOp2 + ')';
 end;
 
 function TTestsClass.ToHumanString: string;

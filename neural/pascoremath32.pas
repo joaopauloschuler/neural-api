@@ -1,4 +1,4 @@
-// pas-core-math - Pascal port of CORE-MATH
+﻿// pas-core-math - Pascal port of CORE-MATH
 // https://github.com/joaopauloschuler/pas-core-math
 //                                                                                                                                                                                                      
 // Copyright (c) 2024-2026 Joao Paulo Schwarz Schuler and contributors.
@@ -1953,13 +1953,13 @@ begin
   end;
   if ax >= $8562E430 then // |x| > 88.72
   begin
-    if ax > ($FF shl 24) then begin Result := x + x; Exit; end; // nan
+    if ax > UInt32($FF shl 24) then begin Result := x + x; Exit; end; // nan
     if (ux shr 31) <> 0 then // x < 0
     begin
-      if ax = ($FF shl 24) then begin Result := -1.0; Exit; end; // -inf
+      if ax = UInt32($FF shl 24) then begin Result := -1.0; Exit; end; // -inf
       Result := -1.0 + Single(1.4901161193847656e-08); Exit;
     end;
-    if ax = ($FF shl 24) then begin Result := x * x; Exit; end; // +inf
+    if ax = UInt32($FF shl 24) then begin Result := x * x; Exit; end; // +inf
     t.u := $7F7FFFFF;  // 0x1.fffffep127
     Result := t.f * Single(zd); Exit;
   end;
@@ -2832,8 +2832,8 @@ begin
     if ux_exp < $6F93813E then begin  // |x| < 0x1.93813ep-16
       Result := Single(k11_exp + z_exp*(k11_exp + z_exp*k10_exp)); Exit;
     end;
-    if ux_exp >= ($FF shl 24) then begin
-      if ux_exp > ($FF shl 24) then begin Result := x + x; Exit; end;  // nan
+    if ux_exp >= UInt32($FF shl 24) then begin
+      if ux_exp > UInt32($FF shl 24) then begin Result := x + x; Exit; end;  // nan
       if (te.u shr 31) <> 0 then Result := k13_exp else Result := x; Exit;  // +-inf
     end;
     if te.u > $C2CE8EC0 then begin  // x < -0x1.9d1d8p+6
@@ -4234,7 +4234,7 @@ begin
     if th_a2 + th_a2*Double(8.673617379884035e-19) = th_a2 - th_a2*Double(8.673617379884035e-19) then begin
       { 0x1p-60 = 8.673617379884035e-19 }
       tth_a2.u := tth_a2.u and $7FF0000000000000;
-      tth_a2.u := tth_a2.u - $0180000000000000;  { subtract 24<<52 }
+      tth_a2.u := tth_a2.u - UInt64($0180000000000000);  { subtract 24<<52 }
       if pcr_fabs(tm_a2) > tth_a2.f then
         tm_a2 := tm_a2 * 1.25
       else

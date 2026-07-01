@@ -804,6 +804,7 @@ type
   end;
 
   /// Class with string message events
+  {$IFNDEF FPC} {$M+} {$ENDIF}
   TMObject = class(TObject)
     protected
       FMessageProc: TGetStrProc;
@@ -822,6 +823,7 @@ type
       property MessageProc: TGetStrProc read FMessageProc write FMessageProc;
       property ErrorProc: TGetStrProc read FErrorProc write FErrorProc;
   end;
+  {$IFNDEF FPC} {$M-} {$ENDIF}
 
   /// TNNetVolume list
   {$IFDEF FPC}
@@ -884,7 +886,7 @@ type
       FLastStepTime: double;
       FLastDistance: TNeuralFloat;
     public
-      constructor Create(pVolNum, pSizeX, pSizeY, pDepth: integer; pManhattan: boolean = true);
+      constructor Create(pVolNum, pSizeX, pSizeY, pDepth: integer; pManhattan: boolean = true); reintroduce;
       destructor Destroy(); override;
 
       procedure RunStep(RepositionClusters: boolean = true);
@@ -4323,13 +4325,13 @@ var
   Word: string;
   WordCount: string;
   FileHandler: TextFile;
-  LineCnt: integer;
+  //LineCnt: integer;
 begin
   Clear;
   Sep := CreateTokenizedStringList(Separator);
   AssignFile(FileHandler, Filename);
   Reset(FileHandler);
-  LineCnt := 0;
+  //LineCnt := 0;
   while not Eof(FileHandler) do
   begin
     ReadLn(FileHandler, CurrentLine);
@@ -4343,7 +4345,7 @@ begin
       {$ELSE}
       Self.AddInteger(Sep[0],StrToInt(Sep[1]));
       {$ENDIF}
-      LineCnt := LineCnt + 1;
+      //LineCnt := LineCnt + 1;
     end
     else
     begin
@@ -4569,7 +4571,6 @@ end;
 procedure TNNetVolumeList.AddValue(Value: TNeuralFloat);
 var
   I, MaxIdx: integer;
-  AuxVolume: TNNetVolume;
 begin
   if (Count>0) then
   begin
@@ -4584,7 +4585,6 @@ end;
 procedure TNNetVolumeList.Mul(Value: TNeuralFloat);
 var
   I, MaxIdx: integer;
-  AuxVolume: TNNetVolume;
 begin
   if (Count>0) then
   begin
@@ -4599,7 +4599,6 @@ end;
 procedure TNNetVolumeList.Divi(Value: TNeuralFloat);
 var
   I, MaxIdx: integer;
-  AuxVolume: TNNetVolume;
 begin
   if (Count>0) then
   begin
@@ -5759,7 +5758,9 @@ var
   I: integer;
   vHigh: integer;
   BasePos: integer;
+  {$IFDEF FPC}
   AddrA, AddrB: TNeuralFloatPtr;
+  {$ENDIF}
 begin
   BasePos := 0;
   vHigh := pSize - 1;
@@ -5812,7 +5813,9 @@ var
   I: integer;
   vHigh: integer;
   BasePos: integer;
+  {$IFDEF FPC}
   AddrA, AddrB: TNeuralFloatPtr;
+  {$ENDIF}
 begin
   BasePos := 0;
   vHigh := pSize - 1;
@@ -5880,12 +5883,16 @@ var
   I: integer;
   vHigh: integer;
   BasePos: integer;
+  {$IFDEF FPC}
   AddrA, AddrB, AddrC: TNeuralFloatPtr;
+  {$ENDIF}
 begin
   BasePos := 0;
+  {$IFDEF FPC}
   AddrA := pointer(PtrA);
   AddrB := pointer(PtrB);
   AddrC := pointer(PtrC);
+  {$ENDIF}
   vHigh := pSize - 1;
   {$IFDEF FPC}
   while BasePos <= vHigh - 7 do
@@ -8071,7 +8078,7 @@ begin
     begin
       for CountY := 0 to MaxY do
       begin
-        StartPointPos := GetRawPos(CountX, CountY);
+        //StartPointPos := GetRawPos(CountX, CountY);
         for GroupCnt := 0 to GroupsM1 do
         begin
           StartD := ChannelsPerGroup * GroupCnt;
@@ -8254,7 +8261,8 @@ end;
 
 function TVolume.ReverseGroupedOneHotEncodingOnPixel(Groups, X, Y: integer): integer;
 var
-  CntToken, MaxToken, Token: integer;
+  Token: integer;
+  //MaxToken: integer;
   GroupSize, MaxGroupSize, GroupCnt, MaxGroup, TokenMod: integer;
   GroupSizePower: integer;
   InitTokenPos: integer;
@@ -8263,7 +8271,7 @@ var
   MaxTokenMod: integer;
 begin
   // Calculate maximum token index
-  MaxToken := FSizeX - 1;
+  //MaxToken := FSizeX - 1;
   // Calculate size of each group
   GroupSize := FDepth div Groups;
   MaxGroupSize := GroupSize - 1;
@@ -8918,15 +8926,15 @@ end;
 procedure TVolume.LoadFromString(strData: string);
 var
   S: TStringList;
-  version: integer;
+  //version: integer;
   pSizeX, pSizeY, pDepth: integer;
   I, SCountMax: integer;
   AuxFloat: Single;
 begin
-  version := 1;
+  //version := 1;
   S := CreateTokenizedStringList(strData,';');
 
-  version := StrToInt(S[0]);
+  //version := StrToInt(S[0]);
   pSizeX  := StrToInt(S[1]);
   pSizeY  := StrToInt(S[2]);
   pDepth  := StrToInt(S[3]);
@@ -9215,11 +9223,13 @@ procedure TNNetVolume.DotProducts(NumAs, NumBs, VectorSize: integer;
   VAs, VBs: TNNetVolume;
   NoForward:boolean = false);
 var
-  CntA, CntB, CntAPos, CntBPos, MaxA, LocalMaxA, MaxB: integer;
-  DestPointer: pointer;
-  CntBVectorSizePlusCntBPos: integer;
+  CntA, CntB, MaxA, LocalMaxA, MaxB: integer;
+  //DestPointer: pointer;
+  //CntBVectorSizePlusCntBPos: integer;
+  {$IFDEF AVXANY}
   vRes: array[0..3] of Single;
   localNumElements, MissedElements: integer;
+  {$ENDIF}
   PtrA, PtrB: TNeuralFloatArrPtr;
   Result: TNeuralFloat;
   //PointwiseMinValue: TNeuralFloat;
@@ -9229,8 +9239,11 @@ begin
 
   //localNumElements := (VectorSize div 4) * 4;
   //MissedElements := VectorSize - localNumElements;
+
+  {$IFDEF AVXANY}
   MissedElements := VectorSize and 3;
   localNumElements := VectorSize xor MissedElements;
+  {$ENDIF}
 
   if NoForward then Fill(0);
 
@@ -9501,11 +9514,13 @@ end;
 
 procedure TNNetVolume.DotProductsTiled(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
 var
-  CntA, CntB, CntAPos, CntBPos, MaxA, MaxB: integer;
-  DestPointer: pointer;
-  CntBVectorSizePlusCntBPos: integer;
+  CntA, CntB: Integer;
+  //DestPointer: pointer;
+  //CntBVectorSizePlusCntBPos: integer;
+  {$IFDEF AVXANY}
   vRes: array[0..3] of Single;
   localNumElements, MissedElements: integer;
+  {$ENDIF}
   PtrA, PtrB: TNeuralFloatArrPtr;
   Result: TNeuralFloat;
   // Tiling
@@ -9513,13 +9528,12 @@ var
   StartTileA, EndTileA, StartTileB, EndTileB: integer;
   MaxTileA, MaxTileB: integer;
 begin
-  MaxA := NumAs - 1;
-  MaxB := NumBs - 1;
-
   //localNumElements := (VectorSize div 4) * 4;
   //MissedElements := VectorSize - localNumElements;
+  {$IFDEF AVXANY}
   MissedElements := VectorSize and 3;
   localNumElements := VectorSize xor MissedElements;
+  {$ENDIF}
   MaxTileA := (NumAs div TileSizeA) - 1;
   MaxTileB := (NumBs div TileSizeB) - 1;
   for TileBCnt := 0 to MaxTileB do
@@ -14023,7 +14037,9 @@ class function TVolume.DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: i
 var
   I: integer;
   BasePos, vHigh: integer;
+  {$IFDEF FPC}
   AddrA, AddrB: TNeuralFloatPtr;
+  {$ENDIF}
 begin
   Result := 0;
   BasePos := 0;
