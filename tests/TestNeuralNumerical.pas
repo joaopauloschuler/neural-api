@@ -333,6 +333,10 @@ type
     // the host activation sweep is skipped. Verifies all four opcode branches
     // (Identity pass-through + the three real activations). Coded by Claude (AI).
     procedure TestConvActivationFusionOpenCLParity;
+    // Same device-side fused bias+activation forward parity, for TNNetFullConnect
+    // (shares the cai_dot_product FDotCL). Sweeps the four opcodes x bias/nobias
+    // on an inference-only dense layer. Coded by Claude (AI).
+    procedure TestFullConnectActivationFusionOpenCLParity;
     // OpenCL backward-GEMM offload parity (vs CPU) for the general convolution.
     procedure TestConvolutionBackwardOpenCLParity;
     // OpenCL two-GEMM forward offload parity (vs CPU) for the BASE
@@ -62015,6 +62019,105 @@ procedure TTestNeuralNumerical.TestConvActivationFusionOpenCLParity;
 begin
   // Each activation swept twice: bias-suppressed (UseBias=0) and bias-present
   // (fused device bias-add). Both must match the host reference.
+  RunOne('Identity nobias', @Identity, @IdentityDerivative, 1);
+  RunOne('ReLU nobias', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 1);
+  RunOne('Sigmoid nobias', @Sigmoid, @SigmoidDerivative, 1);
+  RunOne('Tanh nobias', @HiperbolicTangent, @HiperbolicTangentDerivative, 1);
+  RunOne('Identity bias', @Identity, @IdentityDerivative, 0);
+  RunOne('ReLU bias', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0);
+  RunOne('Sigmoid bias', @Sigmoid, @SigmoidDerivative, 0);
+  RunOne('Tanh bias', @HiperbolicTangent, @HiperbolicTangentDerivative, 0);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Device-side fused bias+activation forward parity for TNNetFullConnect (shares
+// the cai_dot_product FDotCL with the convolution). An inference-only
+// (SetTrainable(False)) dense layer adds the per-neuron bias AND applies the
+// activation in-kernel, loading the finished result straight into FOutput. We
+// sweep the four opcode branches x bias/nobias against the plain CPU forward.
+// The layer is sized to arm FullConnect's own device verdict
+// (FNeurons.Count>=512 and prev.Output.Size>=128) so the base EnableOpenCL
+// actually allocates FDotCL. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestFullConnectActivationFusionOpenCLParity;
+{$IFDEF OpenCL}
+  procedure RunOne(const aName: string; ActFn, ActDeriv: TNeuralActivationFunction;
+    pSuppressBias: integer);
+  var
+    NN: TNNet;
+    Input, OutCPU: TNNetVolume;
+    FC: TNNetFullConnect;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    i: integer;
+    Diff, MaxDiff: TNeuralFloat;
+  begin
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    // prev.Output.Size = 128 (>=128) and 512 neurons (>=512): both halves of the
+    // FullConnect FShouldOpenCL verdict, so the base allocates FDotCL.
+    Input := TNNetVolume.Create(1, 1, 128);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(1, 1, 128, 1));
+      FC := TNNetFullConnect.Create(512, pSuppressBias);
+      FC.ActivationFn := ActFn;
+      FC.ActivationFnDerivative := ActDeriv;
+      NN.AddLayer(FC);
+      // Bounded inputs so the pre-activations stay O(1) and the 1e-5 absolute gate
+      // is meaningful (tanh/sigmoid outside +/-10 saturates identically anyway).
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.02 * i - 1.28;
+
+      // Distinct non-zero bias per neuron so the pSuppressBias=0 sweep genuinely
+      // exercises the fused device bias-add (default init leaves bias 0).
+      for i := 0 to FC.Neurons.Count - 1 do
+        FC.Neurons[i].BiasWeight := 0.3 * Sin(i * 0.2);
+      NN.UpdateWeights(); // cascades AfterWeightUpdate -> BuildBiasOutput
+
+      // CPU reference (host activation path), captured while still trainable.
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      // Inference-only WITHOUT low-memory: keeps the concatenated weight cache the
+      // device path uploads from, and arms the fused branch.
+      FC.SetTrainable(False, False);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Second forward, unchanged weights: resident weight+bias reuse path.
+        NN.Compute(Input);
+        MaxDiff := 0;
+        AssertEquals(aName + ' output size match', OutCPU.Size,
+          NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  FCActFusion ', aName, ' OpenCL parity: max|diff|=', MaxDiff:0:9);
+      AssertTrue('FCActFusion ' + aName + ' OpenCL vs CPU parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+begin
   RunOne('Identity nobias', @Identity, @IdentityDerivative, 1);
   RunOne('ReLU nobias', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 1);
   RunOne('Sigmoid nobias', @Sigmoid, @SigmoidDerivative, 1);
