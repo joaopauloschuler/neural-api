@@ -327,6 +327,12 @@ type
     // OpenCL tap-diagonal coefficient-GEMV forward offload parity (vs CPU) for
     // TNNetKANConv (Chebyshev and B-spline basis).
     procedure TestKANConvOpenCLParity;
+    // OpenCL device-side FUSED-ACTIVATION forward parity (vs CPU) for the general
+    // convolution: an inference-only (SetTrainable(False)), bias-suppressed conv
+    // lets cai_dot_product apply ReLU/Sigmoid/Tanh in-register (ActFN opcode) so
+    // the host activation sweep is skipped. Verifies all four opcode branches
+    // (Identity pass-through + the three real activations). Coded by Claude (AI).
+    procedure TestConvActivationFusionOpenCLParity;
     // OpenCL backward-GEMM offload parity (vs CPU) for the general convolution.
     procedure TestConvolutionBackwardOpenCLParity;
     // OpenCL two-GEMM forward offload parity (vs CPU) for the BASE
@@ -61908,6 +61914,99 @@ procedure TTestNeuralNumerical.TestKANConvOpenCLParity;
 begin
   RunOne(csKANBasisChebyshev, 'Chebyshev');
   RunOne(csKANBasisBSpline, 'BSpline');
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Device-side fused-activation forward parity for the general convolution.
+// A bias-suppressed, inference-only (SetTrainable(False)) 5x5 conv routes
+// through cai_dot_product with a non-zero ActFN opcode, so the activation is
+// applied on the device while the GEMM result is still in-register and the host
+// ApplyActivationFunctionToOutput sweep is skipped. We sweep the four opcode
+// branches - Identity (pass-through), ReLU, Sigmoid, HyperbolicTangent - and
+// compare each against the plain CPU forward (which applies the same activation
+// on the host). 5x5 dodges the Winograd early-exit so the fused GEMM path is
+// exercised. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestConvActivationFusionOpenCLParity;
+{$IFDEF OpenCL}
+  procedure RunOne(const aName: string; ActFn, ActDeriv: TNeuralActivationFunction);
+  var
+    NN: TNNet;
+    Input, OutCPU: TNNetVolume;
+    Conv: TNNetConvolution;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    i: integer;
+    Diff, MaxDiff: TNeuralFloat;
+  begin
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    // Depth 3 keeps FVectorSize (5*5*3=75) <= csMaxInterleavedSize (95) so the
+    // conv's own SetPrevLayer verdict arms FShouldOpenCL and the base allocates
+    // FDotCL - a deeper input would need a much larger spatial extent to clear
+    // the alternate size gate. 5x5 still dodges the 3x3 Winograd early-exit.
+    Input := TNNetVolume.Create(8, 8, 3);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(8, 8, 3, 1));
+      // 6 features, 5x5 kernel, pad2, stride1, pSuppressBias=1 (bias-free is the
+      // precondition for the fusion: the kernel activates W.x with no host bias-add
+      // in between).
+      Conv := TNNetConvolution.Create(6, 5, 2, 1, 1);
+      Conv.ActivationFn := ActFn;
+      Conv.ActivationFnDerivative := ActDeriv;
+      NN.AddLayer(Conv);
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.05 * i - 0.9;
+
+      // CPU reference (host activation path), captured while still trainable.
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      // Flip the conv to inference-only WITHOUT low-memory (keeps the concatenated
+      // weight cache the device path uploads from). This arms the fused branch.
+      Conv.SetTrainable(False, False);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Second forward with UNCHANGED weights: exercises resident-weight reuse
+        // alongside the fused-activation load-into-FOutput path.
+        NN.Compute(Input);
+        MaxDiff := 0;
+        AssertEquals(aName + ' output size match', OutCPU.Size,
+          NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  ConvActFusion ', aName, ' OpenCL parity: max|diff|=', MaxDiff:0:9);
+      AssertTrue('ConvActFusion ' + aName + ' OpenCL vs CPU parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+begin
+  RunOne('Identity', @Identity, @IdentityDerivative);
+  RunOne('ReLU', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative);
+  RunOne('Sigmoid', @Sigmoid, @SigmoidDerivative);
+  RunOne('Tanh', @HiperbolicTangent, @HiperbolicTangentDerivative);
 end;
 {$ELSE}
 begin

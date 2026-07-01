@@ -102,9 +102,33 @@ __kernel void cai_dot_product
         i += 1;
     }
 
+    // Optional fused activation, applied in-register to the reduced dot product
+    // before it is written back. Opcodes match the csAct* constants (and the
+    // cai_activation switch): 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent;
+    // 0/other = pass-through. This lets an inference forward (bias suppressed)
+    // skip the host-side activation sweep over the whole output volume. The
+    // sigmoid/tanh math mirrors cai_activation exactly so device and host agree
+    // to ~1e-6. Coded by Claude (AI).
     if (ActFN == 1)
     {
       if (DotProductResult < 0.0f) { DotProductResult = 0.0f; }
+    }
+    else if (ActFN == 2) // Sigmoid: numerically-stable two-branch 1/(1+exp(-x))
+    {
+      if (DotProductResult > 0.0f)
+        DotProductResult = 1.0f / (1.0f + exp(-DotProductResult));
+      else
+      {
+        const float s = exp(DotProductResult);
+        DotProductResult = s / (1.0f + s);
+      }
+    }
+    else if (ActFN == 3) // HyperbolicTangent: clamp [-10,10], (1-e)/(1+e), e=exp(-2x)
+    {
+      float xc = DotProductResult;
+      if (xc > 10.0f) xc = 10.0f; else if (xc < -10.0f) xc = -10.0f;
+      const float e = exp(-2.0f * xc);
+      DotProductResult = (1.0f - e) / (1.0f + e);
     }
 
     FResultBuffer[b_id * FNumAs + a_id] = DotProductResult;
