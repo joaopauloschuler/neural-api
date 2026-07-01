@@ -27,7 +27,7 @@ unit neuraldatasets;
 interface
 
 uses
-  {$IFNDEF FPC}System.Classes, Windows, Vcl.Graphics, System.JSON, {$ENDIF}
+  {$IFNDEF FPC}System.Classes, Windows, Vcl.Graphics, System.JSON, System.Generics.Collections, {$ENDIF}
   neuralvolume, neuralnetwork, pascoremath32
   {$IFDEF FPC},
   FPimage, FPReadBMP, FPReadPCX, FPReadJPEG, FPReadPNG,
@@ -762,9 +762,14 @@ type
       FSpecialCount: integer;
       FRngState: cardinal;
       function NextRandom(): TNeuralFloat;
-      function NextRandomInt(N: integer): integer;
       function IsSpecial(TokenId: integer): boolean;
       function SampleSpanLength(): integer;
+
+    // <TEMP> Temporarily place unused functions in the protected section to avoid hints.
+    protected
+      function NextRandomInt(N: integer): integer;
+    // </TEMP>
+
     public
       // pSentinelBaseId: id of <extra_id_0> (sentinels count DOWN from here).
       // pVocabSize: number of token ids (sentinels are assumed to live at the
@@ -932,7 +937,7 @@ procedure FindAllDirectories(AList: TStrings; const SearchPath: String;
   SearchSubDirs: Boolean = true; PathSeparator: char = ';');
 var
   dirs: TStringDynArray;
-  dir, Path, SearchPattern: ShortString;
+  dir, Path, SearchPattern: {$IFDEF FPC} ShortString; {$ELSE} String; {$ENDIF}
   SearchOption: TSearchOption;
 begin
   if SearchSubDirs
@@ -952,7 +957,7 @@ procedure FindAllFiles(AList: TStrings; const SearchPath: String;
   MaskSeparator: char = ';'; PathSeparator: char = ';');
 var
   fileNames: TStringDynArray;
-  fileName, Path, SearchPattern: ShortString;
+  fileName, Path, SearchPattern: {$IFDEF FPC} ShortString; {$ELSE} String; {$ENDIF}
   SearchOption: TSearchOption;
 begin
   if SearchSubDirs
@@ -1153,14 +1158,14 @@ var
   ExpectedTokenInt: integer;
   AIntegerArray: TNeuralIntegerArray;
   pInput, pOutput: TNNetVolume;
-  CntHit, CntMiss: integer;
+  CntHit{, CntMiss}: integer;
   InputString: string;
   MaxIdx: integer;
 begin
   pInput := TNNetVolume.Create();
   pOutput := TNNetVolume.Create();
   CntHit := 0;
-  CntMiss := 0;
+  //CntMiss := 0;
   // Make sure that expected input and output have the proper sizes.
   if NN.GetFirstLayer().Output.Size <> pInput.Size then pInput.ReSize(NN.GetFirstLayer().Output);
   if NN.GetLastLayer().Output.Size <> pOutput.Size then pOutput.ReSize(NN.GetLastLayer().Output);
@@ -1196,7 +1201,7 @@ begin
     end
     else
     begin
-      Inc(CntMiss);
+      //Inc(CntMiss);
     end;
   end;
   WriteLn('Pos: ',Pos,' Hit:',CntHit);
@@ -2600,7 +2605,7 @@ end;
 
 procedure TClassesAndElements.AddFileNamesTo(FileNames: TFileNameList);
 var
-  SourceVolume: TNNetVolume;
+  //SourceVolume: TNNetVolume;
   ClassId, FileId: integer;
   MaxClassId, MaxFileId: integer;
 begin
