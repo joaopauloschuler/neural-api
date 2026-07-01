@@ -60916,6 +60916,9 @@ begin
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
+      // Second device forward with UNCHANGED weights: exercises the
+      // resident-weight reuse path (no re-upload). Coded by Claude (AI).
+      NN.Compute(Input);
       MaxDiff := 0;
       AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
       for i := 0 to OutCPU.Size - 1 do
@@ -61599,6 +61602,9 @@ begin
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
+      // Second device forward with UNCHANGED weights: exercises the
+      // resident-weight reuse path (no re-upload). Coded by Claude (AI).
+      NN.Compute(Input);
       MaxDiff := 0;
       AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
       for i := 0 to OutCPU.Size - 1 do
@@ -61663,6 +61669,9 @@ begin
     NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
+      NN.Compute(Input);
+      // Second device forward with UNCHANGED weights: exercises the
+      // resident-weight reuse path (no re-upload). Coded by Claude (AI).
       NN.Compute(Input);
       MaxDiff := 0;
       AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
@@ -61730,6 +61739,9 @@ begin
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
+      // Second device forward with UNCHANGED weights: exercises the
+      // resident-weight reuse path (no re-upload). Coded by Claude (AI).
+      NN.Compute(Input);
       MaxDiff := 0;
       AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
       for i := 0 to OutCPU.Size - 1 do
@@ -61796,6 +61808,9 @@ begin
     NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
+      NN.Compute(Input);
+      // Second device forward with UNCHANGED weights: exercises the
+      // resident-weight reuse path (no re-upload). Coded by Claude (AI).
       NN.Compute(Input);
       MaxDiff := 0;
       AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
@@ -61866,6 +61881,9 @@ procedure TTestNeuralNumerical.TestKANConvOpenCLParity;
       NN.ForceOpenCL(True);
       NN.EnableOpenCL(PlatformId, DeviceId);
       try
+        NN.Compute(Input);
+        // Second device forward with UNCHANGED weights: exercises the
+        // resident-weight reuse path (no re-upload). Coded by Claude (AI).
         NN.Compute(Input);
         MaxDiff := 0;
         AssertEquals(aName + ' output size match', OutCPU.Size,
@@ -62632,6 +62650,9 @@ begin
     // Device forward (input-projection offload ARMED).
     NN.EnableOpenCL(PlatformId, DeviceId);
     NN.Compute(XData);
+    // Second device forward with UNCHANGED weights: exercises the
+    // resident-weight reuse path (no re-upload). Coded by Claude (AI).
+    NN.Compute(XData);
 
     AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
     MaxDiff := 0;
@@ -62692,6 +62713,9 @@ begin
     OutCPU.Copy(NN.GetLastLayer.Output);
 
     NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(XData);
+    // Second device forward with UNCHANGED weights: exercises the
+    // resident-weight reuse path (no re-upload). Coded by Claude (AI).
     NN.Compute(XData);
 
     AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
