@@ -67,6 +67,12 @@ const
 
   cVocab   = 32000;  // embedding vocabulary (table size, not a per-forward size)
 
+  // Spatial (non-pointwise) convolutions are swept at TWO kernel shapes so the
+  // table shows how each layer's CPU-vs-GPU crossover moves with kernel area
+  // (K*K*C per output position). Padding is K div 2 per shape, keeping the
+  // output spatial size fixed so the 3x3 and 5x5 rows differ only in the kernel.
+  cConvKernels: array[0..1] of integer = (3, 5);
+
 // Input profiles. The values below are the moderate BASE sizes. The optional
 // command-line scale factor (argv[1], default 1) is NOT applied here; instead
 // each Bench call site multiplies it into the ONE dimension that drives that
@@ -156,6 +162,15 @@ begin
     Last := NN.GetLastLayer();
     Shape := Format('%dx%dx%d',
       [Last.Output.SizeX, Last.Output.SizeY, Last.Output.Depth]);
+    // Every benchmark net is flipped inference-only BEFORE any forward. This
+    // frees the per-neuron training buffers and, more importantly here, arms the
+    // device-side activation-fusion path: an inference-only, bias-suppressed conv
+    // applies its activation inside the cai_dot_product GEMM kernel instead of a
+    // separate host sweep, so the row times the fused forward a deployed model
+    // would actually run. pLowMemory stays False so the concatenated weight cache
+    // the OpenCL GEMM uploads from is still built (True would drop it and force
+    // the per-neuron CPU path, breaking the device dispatch).
+    NN.SetTrainable(False, False);
     // A single layer whose OpenCL path faults (bad buffer size, kernel arg
     // failure, etc.) must not abort the whole sweep: catch it, print an ERROR
     // row, and move on to the next layer.
@@ -213,6 +228,8 @@ end;
 var
   NN: TNNet;
   Inp: TNNetVolume;
+  KIdx, KSize, KPad: integer;   // conv kernel sweep (3x3 then 5x5)
+  KTag: string;
 
 begin
   EasyCL := TEasyOpenCL.Create();
@@ -262,28 +279,62 @@ begin
     // (cVisFeat * cScale), the GEMM width that moves both the dispatch metric
     // (X*Y*Feat) and the arithmetic. Depthwise has no separate feature count, so
     // it scales input CHANNELS; DepthwiseConv1D is a SEQ op, so it scales SeqLen.
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetConvolution.Create(cVisFeat * cScale, 3, 1, 1));
-    Bench('TNNetConvolution', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetConvolutionLinear.Create(cVisFeat * cScale, 3, 1, 1));
-    Bench('TNNetConvolutionLinear', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetDeconvolution.Create(cVisC * cScale, 3, 2, 1, 1));
-    Bench('TNNetDeconvolution', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC * cScale, Inp); NN.AddLayer(TNNetDepthwiseConv.Create(2, 3, 1, 1));
-    Bench('TNNetDepthwiseConv', NN, Inp);
-    NN := MakeNet(cSeqLen * cScale, 1, cDModel, Inp); NN.AddLayer(TNNetDepthwiseConv1D.Create(3, True));
-    Bench('TNNetDepthwiseConv1D', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetGroupConvP4.Create((cVisFeat * cScale) div 4, 3, 1, 1));
-    Bench('TNNetGroupConvP4', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetKANConv.Create(cVisFeat * cScale, 3, 1, 1));
-    Bench('TNNetKANConv', NN, Inp);
-    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetDeformableConv.Create(cVisFeat * cScale, 3, 1, 1));
-    Bench('TNNetDeformableConv', NN, Inp);
+    // Each spatial (non-pointwise) conv is benched at both 3x3 and 5x5 kernels
+    // (cConvKernels), padding = K div 2, so the pair of rows isolates the kernel
+    // area's effect on the crossover. DepthwiseConv1D has a 1-D kernel, tagged kN.
+    for KIdx := 0 to High(cConvKernels) do
+    begin
+      KSize := cConvKernels[KIdx];
+      KPad  := KSize div 2;
+      KTag  := Format(' %dx%d', [KSize, KSize]);
+      NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetConvolution.Create(cVisFeat * cScale, KSize, KPad, 1));
+      Bench('TNNetConvolution' + KTag, NN, Inp);
+      NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetConvolutionLinear.Create(cVisFeat * cScale, KSize, KPad, 1));
+      Bench('TNNetConvolutionLinear' + KTag, NN, Inp);
+      NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetDeconvolution.Create(cVisC * cScale, KSize, 2, KPad, 1));
+      Bench('TNNetDeconvolution' + KTag, NN, Inp);
+      NN := MakeNet(cVisX, cVisY, cVisC * cScale, Inp); NN.AddLayer(TNNetDepthwiseConv.Create(2, KSize, KPad, 1));
+      Bench('TNNetDepthwiseConv' + KTag, NN, Inp);
+      NN := MakeNet(cSeqLen * cScale, 1, cDModel, Inp); NN.AddLayer(TNNetDepthwiseConv1D.Create(KSize, True));
+      Bench(Format('TNNetDepthwiseConv1D k%d', [KSize]), NN, Inp);
+      NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetGroupConvP4.Create((cVisFeat * cScale) div 4, KSize, KPad, 1));
+      Bench('TNNetGroupConvP4' + KTag, NN, Inp);
+      NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetKANConv.Create(cVisFeat * cScale, KSize, KPad, 1));
+      Bench('TNNetKANConv' + KTag, NN, Inp);
+      NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetDeformableConv.Create(cVisFeat * cScale, KSize, KPad, 1));
+      Bench('TNNetDeformableConv' + KTag, NN, Inp);
+    end;
+    // Pointwise (1x1) convolutions are the per-position GEMM inside every
+    // transformer FFN/projection; like the spatial convs they scale the output
+    // FEATURE count. Linear and ReLU share the conv path, differing only in the
+    // fused activation.
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetPointwiseConvLinear.Create(cVisFeat * cScale));
+    Bench('TNNetPointwiseConvLinear', NN, Inp);
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetPointwiseConvReLU.Create(cVisFeat * cScale));
+    Bench('TNNetPointwiseConvReLU', NN, Inp);
+
+    // Bias-suppressed (pSuppressBias=1) twins of two fused-activation convs. Only
+    // TNNetConvolution.ComputeOpenCL fuses the activation into the cai_dot_product
+    // GEMM, and only when the layer is inference-only (SetTrainable(False), armed
+    // in Bench) AND bias is suppressed - so these two rows are the only ones that
+    // actually exercise the device-side fusion: TNNetConvolution activates Tanh
+    // (its default) in-kernel, TNNetPointwiseConvReLU activates ReLU in-kernel,
+    // each skipping the host bias-add + activation sweep their with-bias rows
+    // above still pay. 5x5 keeps the spatial conv off the Winograd early-exit.
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetConvolution.Create(cVisFeat * cScale, 5, 2, 1, 1));
+    Bench('TNNetConvolution 5x5 nobias', NN, Inp);
+    NN := MakeNet(cVisX, cVisY, cVisC, Inp); NN.AddLayer(TNNetPointwiseConvReLU.Create(cVisFeat * cScale, 1));
+    Bench('TNNetPointwiseConvReLU nobias', NN, Inp);
 
     // --- Dense / embedding --- FullConnect scales its OUTPUT width (the dispatch
     // metric; input width held at base keeps work linear); Embedding scales the
     // SEQ length (number of row lookups).
     NN := MakeNet(1, 1, cFCIn, Inp); NN.AddLayer(TNNetFullConnect.Create(cFCIn * cScale));
     Bench('TNNetFullConnect', NN, Inp);
+    NN := MakeNet(1, 1, cFCIn, Inp); NN.AddLayer(TNNetFullConnectLinear.Create(cFCIn * cScale));
+    Bench('TNNetFullConnectLinear', NN, Inp);
+    NN := MakeNet(1, 1, cFCIn, Inp); NN.AddLayer(TNNetFullConnectReLU.Create(cFCIn * cScale));
+    Bench('TNNetFullConnectReLU', NN, Inp);
     NN := MakeNet(cSeqLen * cScale, 1, 1, Inp); FillTokens(Inp, cVocab);
     NN.AddLayer(TNNetEmbedding.Create(cVocab, cDModel));
     Bench('TNNetEmbedding', NN, Inp);
@@ -339,6 +390,19 @@ begin
     Bench('TNNetGEGLUErf', NN, Inp);
     NN := MakeNet(cSeqLen * cScale, 1, cDModel, Inp); NN.AddLayer(TNNetPointwiseSoftMax.Create());
     Bench('TNNetPointwiseSoftMax', NN, Inp);
+
+    // --- Elementwise activations (shared cai_activation kernel) --- pure
+    // pointwise maps, so the primary dim is total element count; scaled via
+    // SeqLen at the SEQ profile. These are ~1..10 flops/word (memory-bandwidth
+    // bound): their production verdict is deliberately 'no' (see
+    // csActivationOpenCLMinSize) and the device path is charted only because the
+    // harness forces it - expect speedup < 1 on a real GPU too.
+    NN := MakeNet(cSeqLen * cScale, 1, cDModel, Inp); NN.AddLayer(TNNetReLU.Create());
+    Bench('TNNetReLU', NN, Inp);
+    NN := MakeNet(cSeqLen * cScale, 1, cDModel, Inp); NN.AddLayer(TNNetSigmoid.Create());
+    Bench('TNNetSigmoid', NN, Inp);
+    NN := MakeNet(cSeqLen * cScale, 1, cDModel, Inp); NN.AddLayer(TNNetHyperbolicTangent.Create());
+    Bench('TNNetHyperbolicTangent', NN, Inp);
 
     // --- Pooling / spatial resize (VIS) --- primary dim = spatial WIDTH
     // (cVisX * cScale); height held at base so work grows linearly. Resize/upsample

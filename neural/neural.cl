@@ -16,7 +16,16 @@ __kernel void cai_dot_product
   int ActFN,
   __global float* FInputBufferAs,
   __global float* FInputBufferBs,
-  __global float* FResultBuffer
+  __global float* FResultBuffer,
+  // Optional fused bias: when UseBias != 0, FBiasOutput[b_id*FNumAs + a_id] is
+  // added to the reduced dot product BEFORE the activation, so an inference
+  // forward computes act(W.x + b) entirely on the device (no host bias-add +
+  // activation sweep). FBiasOutput carries the host FBiasOutput volume verbatim
+  // (bias replicated per output position, same [pos][feature] layout as the
+  // result), so the index matches the result write exactly. When UseBias == 0
+  // the pointer is unread and may be NULL. Coded by Claude (AI).
+  const int UseBias,
+  __global const float* FBiasOutput
 )
 {
   const int a_id = get_global_id(0);
@@ -102,9 +111,36 @@ __kernel void cai_dot_product
         i += 1;
     }
 
+    // Fused bias-add (see the FBiasOutput arg comment): act must see W.x + b.
+    if (UseBias != 0) DotProductResult += FBiasOutput[b_id * FNumAs + a_id];
+
+    // Optional fused activation, applied in-register to the reduced dot product
+    // before it is written back. Opcodes match the csAct* constants (and the
+    // cai_activation switch): 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent;
+    // 0/other = pass-through. This lets an inference forward skip the host-side
+    // bias-add + activation sweep over the whole output volume. The sigmoid/tanh
+    // math mirrors cai_activation exactly so device and host agree to ~1e-6.
+    // Coded by Claude (AI).
     if (ActFN == 1)
     {
       if (DotProductResult < 0.0f) { DotProductResult = 0.0f; }
+    }
+    else if (ActFN == 2) // Sigmoid: numerically-stable two-branch 1/(1+exp(-x))
+    {
+      if (DotProductResult > 0.0f)
+        DotProductResult = 1.0f / (1.0f + exp(-DotProductResult));
+      else
+      {
+        const float s = exp(DotProductResult);
+        DotProductResult = s / (1.0f + s);
+      }
+    }
+    else if (ActFN == 3) // HyperbolicTangent: clamp [-10,10], (1-e)/(1+e), e=exp(-2x)
+    {
+      float xc = DotProductResult;
+      if (xc > 10.0f) xc = 10.0f; else if (xc < -10.0f) xc = -10.0f;
+      const float e = exp(-2.0f * xc);
+      DotProductResult = (1.0f - e) / (1.0f + e);
     }
 
     FResultBuffer[b_id * FNumAs + a_id] = DotProductResult;
@@ -1247,6 +1283,56 @@ __kernel void cai_softmax
     const float inv = 1.0f / total;
     for (int c = 0; c < FGroupLen; c++) FY[base + c] *= inv;
   }
+}
+
+// CAI shared elementwise activation forward. One work-item per element applies
+// the function selected by FOpcode (kept in sync with the csAct* constants in
+// neuralnetwork.pas): 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent. This single
+// kernel backs every opting-in TNNetIdentity activation descendant via
+// TNNetActivationCL, so new elementwise activations only add a case here plus an
+// opcode. Forward-only: the host keeps the backward pass (and, for ReLU, the
+// derivative gate mask). The sigmoid/tanh math mirrors the scalar CPU forms -
+// the two-branch stable sigmoid and the [-10,10]-clamped tanh - so the device
+// result tracks the host to ~1e-6 (exp here is more accurate than the CPU
+// polynomial pcr_expf, not less). Coded by Claude (AI).
+__kernel void cai_activation
+(
+  const int FSize,
+  const int FOpcode,
+  __global const float* FX,
+  __global float* FY
+)
+{
+  const int i = get_global_id(0);
+  if (i >= FSize) return;
+  const float x = FX[i];
+  float y;
+  switch (FOpcode)
+  {
+    case 1: // ReLU: max(x, 0)
+      y = (x > 0.0f) ? x : 0.0f;
+      break;
+    case 2: // Sigmoid: numerically-stable two-branch 1/(1+exp(-x))
+      if (x > 0.0f)
+        y = 1.0f / (1.0f + exp(-x));
+      else
+      {
+        const float s = exp(x);
+        y = s / (1.0f + s);
+      }
+      break;
+    case 3: // HyperbolicTangent: clamp to [-10,10], (1-exp(-2x))/(1+exp(-2x))
+    {
+      float xc = x;
+      if (xc > 10.0f) xc = 10.0f; else if (xc < -10.0f) xc = -10.0f;
+      const float e = exp(-2.0f * xc);
+      y = (1.0f - e) / (1.0f + e);
+      break;
+    }
+    default: // csActNone / unknown: pass through
+      y = x;
+  }
+  FY[i] = y;
 }
 
 // CAI Depthwise Convolution 2-D forward (TNNetDepthwiseConv).

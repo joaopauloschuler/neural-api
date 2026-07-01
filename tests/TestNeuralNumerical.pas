@@ -327,8 +327,23 @@ type
     // OpenCL tap-diagonal coefficient-GEMV forward offload parity (vs CPU) for
     // TNNetKANConv (Chebyshev and B-spline basis).
     procedure TestKANConvOpenCLParity;
+    // OpenCL device-side FUSED-ACTIVATION forward parity (vs CPU) for the general
+    // convolution: an inference-only (SetTrainable(False)), bias-suppressed conv
+    // lets cai_dot_product apply ReLU/Sigmoid/Tanh in-register (ActFN opcode) so
+    // the host activation sweep is skipped. Verifies all four opcode branches
+    // (Identity pass-through + the three real activations). Coded by Claude (AI).
+    procedure TestConvActivationFusionOpenCLParity;
+    // Same device-side fused bias+activation forward parity, for TNNetFullConnect
+    // (shares the cai_dot_product FDotCL). Sweeps the four opcodes x bias/nobias
+    // on an inference-only dense layer. Coded by Claude (AI).
+    procedure TestFullConnectActivationFusionOpenCLParity;
     // OpenCL backward-GEMM offload parity (vs CPU) for the general convolution.
     procedure TestConvolutionBackwardOpenCLParity;
+    // OpenCL two-GEMM forward offload parity (vs CPU) for the BASE
+    // TNNetScaledDotProductAttention: score GEMM (contract d_k) then value GEMM
+    // (contract SeqLen) share one FDotCL, so this also exercises the grow-only
+    // ReallocateBuffersIfRequired buffer reuse across the two differing shapes.
+    procedure ScaledDotProductAttentionOpenCLParity;
     // OpenCL two-GEMM forward offload parity (vs CPU) for the non-causal global
     // TNNetLinearAttention.
     procedure LinearAttentionOpenCLParity;
@@ -60911,6 +60926,9 @@ begin
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
+      // Second device forward with UNCHANGED weights: exercises the
+      // resident-weight reuse path (no re-upload). Coded by Claude (AI).
+      NN.Compute(Input);
       MaxDiff := 0;
       AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
       for i := 0 to OutCPU.Size - 1 do
@@ -61594,6 +61612,9 @@ begin
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
+      // Second device forward with UNCHANGED weights: exercises the
+      // resident-weight reuse path (no re-upload). Coded by Claude (AI).
+      NN.Compute(Input);
       MaxDiff := 0;
       AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
       for i := 0 to OutCPU.Size - 1 do
@@ -61658,6 +61679,9 @@ begin
     NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
+      NN.Compute(Input);
+      // Second device forward with UNCHANGED weights: exercises the
+      // resident-weight reuse path (no re-upload). Coded by Claude (AI).
       NN.Compute(Input);
       MaxDiff := 0;
       AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
@@ -61725,6 +61749,9 @@ begin
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
       NN.Compute(Input);
+      // Second device forward with UNCHANGED weights: exercises the
+      // resident-weight reuse path (no re-upload). Coded by Claude (AI).
+      NN.Compute(Input);
       MaxDiff := 0;
       AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
       for i := 0 to OutCPU.Size - 1 do
@@ -61791,6 +61818,9 @@ begin
     NN.ForceOpenCL(True);
     NN.EnableOpenCL(PlatformId, DeviceId);
     try
+      NN.Compute(Input);
+      // Second device forward with UNCHANGED weights: exercises the
+      // resident-weight reuse path (no re-upload). Coded by Claude (AI).
       NN.Compute(Input);
       MaxDiff := 0;
       AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
@@ -61862,6 +61892,9 @@ procedure TTestNeuralNumerical.TestKANConvOpenCLParity;
       NN.EnableOpenCL(PlatformId, DeviceId);
       try
         NN.Compute(Input);
+        // Second device forward with UNCHANGED weights: exercises the
+        // resident-weight reuse path (no re-upload). Coded by Claude (AI).
+        NN.Compute(Input);
         MaxDiff := 0;
         AssertEquals(aName + ' output size match', OutCPU.Size,
           NN.GetLastLayer.Output.Size);
@@ -61885,6 +61918,214 @@ procedure TTestNeuralNumerical.TestKANConvOpenCLParity;
 begin
   RunOne(csKANBasisChebyshev, 'Chebyshev');
   RunOne(csKANBasisBSpline, 'BSpline');
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Device-side fused-activation forward parity for the general convolution.
+// A bias-suppressed, inference-only (SetTrainable(False)) 5x5 conv routes
+// through cai_dot_product with a non-zero ActFN opcode, so the activation is
+// applied on the device while the GEMM result is still in-register and the host
+// ApplyActivationFunctionToOutput sweep is skipped. We sweep the four opcode
+// branches - Identity (pass-through), ReLU, Sigmoid, HyperbolicTangent - and
+// compare each against the plain CPU forward (which applies the same activation
+// on the host). 5x5 dodges the Winograd early-exit so the fused GEMM path is
+// exercised. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestConvActivationFusionOpenCLParity;
+{$IFDEF OpenCL}
+  procedure RunOne(const aName: string; ActFn, ActDeriv: TNeuralActivationFunction;
+    pSuppressBias: integer);
+  var
+    NN: TNNet;
+    Input, OutCPU: TNNetVolume;
+    Conv: TNNetConvolution;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    i: integer;
+    Diff, MaxDiff: TNeuralFloat;
+  begin
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    // Depth 3 keeps FVectorSize (5*5*3=75) <= csMaxInterleavedSize (95) so the
+    // conv's own SetPrevLayer verdict arms FShouldOpenCL and the base allocates
+    // FDotCL - a deeper input would need a much larger spatial extent to clear
+    // the alternate size gate. 5x5 still dodges the 3x3 Winograd early-exit.
+    Input := TNNetVolume.Create(8, 8, 3);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(8, 8, 3, 1));
+      // 6 features, 5x5 kernel, pad2, stride1. pSuppressBias is swept: =1 exercises
+      // the bias-free fused path (UseBias=0), =0 exercises the fused bias-add path
+      // (FBiasOutput rides along as kernel arg 9 -> act(W.x + b) on the device).
+      Conv := TNNetConvolution.Create(6, 5, 2, 1, pSuppressBias);
+      Conv.ActivationFn := ActFn;
+      Conv.ActivationFnDerivative := ActDeriv;
+      NN.AddLayer(Conv);
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.05 * i - 0.9;
+
+      // Give every neuron a distinct non-zero bias so the pSuppressBias=0 sweep
+      // genuinely exercises the fused device bias-add: default init leaves bias 0,
+      // which would make act(W.x + b) == act(W.x) and the bias rows vacuous.
+      // UpdateWeights cascades AfterWeightUpdate -> BuildBiasOutput so the host
+      // FBiasOutput (and the CPU reference below) reflect these values.
+      for i := 0 to Conv.Neurons.Count - 1 do
+        Conv.Neurons[i].BiasWeight := 0.4 + 0.15 * i;
+      NN.UpdateWeights();
+
+      // CPU reference (host activation path), captured while still trainable.
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      // Flip the conv to inference-only WITHOUT low-memory (keeps the concatenated
+      // weight cache the device path uploads from). This arms the fused branch.
+      Conv.SetTrainable(False, False);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Second forward with UNCHANGED weights: exercises resident-weight reuse
+        // alongside the fused-activation load-into-FOutput path.
+        NN.Compute(Input);
+        MaxDiff := 0;
+        AssertEquals(aName + ' output size match', OutCPU.Size,
+          NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  ConvActFusion ', aName, ' OpenCL parity: max|diff|=', MaxDiff:0:9);
+      AssertTrue('ConvActFusion ' + aName + ' OpenCL vs CPU parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+begin
+  // Each activation swept twice: bias-suppressed (UseBias=0) and bias-present
+  // (fused device bias-add). Both must match the host reference.
+  RunOne('Identity nobias', @Identity, @IdentityDerivative, 1);
+  RunOne('ReLU nobias', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 1);
+  RunOne('Sigmoid nobias', @Sigmoid, @SigmoidDerivative, 1);
+  RunOne('Tanh nobias', @HiperbolicTangent, @HiperbolicTangentDerivative, 1);
+  RunOne('Identity bias', @Identity, @IdentityDerivative, 0);
+  RunOne('ReLU bias', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0);
+  RunOne('Sigmoid bias', @Sigmoid, @SigmoidDerivative, 0);
+  RunOne('Tanh bias', @HiperbolicTangent, @HiperbolicTangentDerivative, 0);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Device-side fused bias+activation forward parity for TNNetFullConnect (shares
+// the cai_dot_product FDotCL with the convolution). An inference-only
+// (SetTrainable(False)) dense layer adds the per-neuron bias AND applies the
+// activation in-kernel, loading the finished result straight into FOutput. We
+// sweep the four opcode branches x bias/nobias against the plain CPU forward.
+// The layer is sized to arm FullConnect's own device verdict
+// (FNeurons.Count>=512 and prev.Output.Size>=128) so the base EnableOpenCL
+// actually allocates FDotCL. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestFullConnectActivationFusionOpenCLParity;
+{$IFDEF OpenCL}
+  procedure RunOne(const aName: string; ActFn, ActDeriv: TNeuralActivationFunction;
+    pSuppressBias: integer);
+  var
+    NN: TNNet;
+    Input, OutCPU: TNNetVolume;
+    FC: TNNetFullConnect;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    i: integer;
+    Diff, MaxDiff: TNeuralFloat;
+  begin
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    // prev.Output.Size = 128 (>=128) and 512 neurons (>=512): both halves of the
+    // FullConnect FShouldOpenCL verdict, so the base allocates FDotCL.
+    Input := TNNetVolume.Create(1, 1, 128);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(1, 1, 128, 1));
+      FC := TNNetFullConnect.Create(512, pSuppressBias);
+      FC.ActivationFn := ActFn;
+      FC.ActivationFnDerivative := ActDeriv;
+      NN.AddLayer(FC);
+      // Bounded inputs so the pre-activations stay O(1) and the 1e-5 absolute gate
+      // is meaningful (tanh/sigmoid outside +/-10 saturates identically anyway).
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.02 * i - 1.28;
+
+      // Distinct non-zero bias per neuron so the pSuppressBias=0 sweep genuinely
+      // exercises the fused device bias-add (default init leaves bias 0).
+      for i := 0 to FC.Neurons.Count - 1 do
+        FC.Neurons[i].BiasWeight := 0.3 * Sin(i * 0.2);
+      NN.UpdateWeights(); // cascades AfterWeightUpdate -> BuildBiasOutput
+
+      // CPU reference (host activation path), captured while still trainable.
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      // Inference-only WITHOUT low-memory: keeps the concatenated weight cache the
+      // device path uploads from, and arms the fused branch.
+      FC.SetTrainable(False, False);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Second forward, unchanged weights: resident weight+bias reuse path.
+        NN.Compute(Input);
+        MaxDiff := 0;
+        AssertEquals(aName + ' output size match', OutCPU.Size,
+          NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  FCActFusion ', aName, ' OpenCL parity: max|diff|=', MaxDiff:0:9);
+      AssertTrue('FCActFusion ' + aName + ' OpenCL vs CPU parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+begin
+  RunOne('Identity nobias', @Identity, @IdentityDerivative, 1);
+  RunOne('ReLU nobias', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 1);
+  RunOne('Sigmoid nobias', @Sigmoid, @SigmoidDerivative, 1);
+  RunOne('Tanh nobias', @HiperbolicTangent, @HiperbolicTangentDerivative, 1);
+  RunOne('Identity bias', @Identity, @IdentityDerivative, 0);
+  RunOne('ReLU bias', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0);
+  RunOne('Sigmoid bias', @Sigmoid, @SigmoidDerivative, 0);
+  RunOne('Tanh bias', @HiperbolicTangent, @HiperbolicTangentDerivative, 0);
 end;
 {$ELSE}
 begin
@@ -62015,6 +62256,72 @@ end;
 // fixed fixture (SeqLen >= the offload threshold so the GEMM path fires). The
 // phi maps, Z and the per-query denominator stay on the CPU in both paths, so
 // the only divergence is FP32 GEMM accumulation order -> a tight 1e-4 gate.
+// Base TNNetScaledDotProductAttention device path: BOTH matmuls (Q.K^T and P.V)
+// run on the device, masking + softmax on the CPU in between. The two GEMMs have
+// different contraction sizes (d_k then SeqLen) yet share one FDotCL, so this is
+// the direct check that the grow-only ReallocateBuffersIfRequired reuse produces
+// bit-for-bit the CPU result across a within-forward shape change. Coded by Claude (AI).
+procedure TTestNeuralNumerical.ScaledDotProductAttentionOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Dk = 16;
+  SeqLen = 40; // >= csSDPAOpenCLMinSeqLen (32) so the device path fires
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Attn: TNNetScaledDotProductAttention;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetScaledDotProductAttention.Create(Dk); // non-causal base class
+    NN.AddLayer(Attn);
+    // Bounded Q|K|V so scores/softmax/value sums stay O(1) and 1e-4 is meaningful.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.5 * Sin(i * 0.3) + 0.2 * Cos(i * 0.11);
+
+    // CPU forward (OpenCL OFF).
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    // Device forward (both GEMMs offloaded; base class arms FShouldOpenCL).
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    MaxDiff := 0;
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  ScaledDotProductAttention OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('ScaledDotProductAttention OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
 procedure TTestNeuralNumerical.LinearAttentionOpenCLParity;
 {$IFDEF OpenCL}
 const
@@ -62561,6 +62868,9 @@ begin
     // Device forward (input-projection offload ARMED).
     NN.EnableOpenCL(PlatformId, DeviceId);
     NN.Compute(XData);
+    // Second device forward with UNCHANGED weights: exercises the
+    // resident-weight reuse path (no re-upload). Coded by Claude (AI).
+    NN.Compute(XData);
 
     AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
     MaxDiff := 0;
@@ -62621,6 +62931,9 @@ begin
     OutCPU.Copy(NN.GetLastLayer.Output);
 
     NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(XData);
+    // Second device forward with UNCHANGED weights: exercises the
+    // resident-weight reuse path (no re-upload). Coded by Claude (AI).
     NN.Compute(XData);
 
     AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);

@@ -162,6 +162,27 @@ type
       function CreateAndWriteBuffer(V: TNNetVolume): cl_mem; overload; {$IFDEF Release} inline; {$ENDIF}
       function CreateWriteSetArgument(V: TNNetVolume; kernel:cl_kernel; arg_index: cl_uint): cl_mem; {$IFDEF Release} inline; {$ENDIF}
       function CreateOutputSetArgument(V: TNNetVolume; kernel:cl_kernel; arg_index: cl_uint): cl_mem; {$IFDEF Release} inline; {$ENDIF}
+
+      // Grow-only persistent device buffer, the convolution buffer-reuse model
+      // applied to the auxiliary helper kernels: pass the SAME (buf, capBytes)
+      // pair every forward and the buffer is (re)allocated only when the needed
+      // size exceeds the current capacity, otherwise reused in place. This
+      // replaces the per-forward CreateBuffer/clReleaseMemObject churn that made
+      // deep transformer models allocate dozens of tiny device buffers per pass.
+      // The owning helper must release the buffer once in its destructor and
+      // zero-init (buf=nil, capBytes=0). (Coded by Claude (AI).)
+      function EnsureBuffer(var buf: cl_mem; var capBytes: csize_t;
+        flags: cl_mem_flags; neededBytes: csize_t): cl_mem;
+      // Ensure a persistent buffer big enough for V, then upload V into it.
+      // DoWrite=false skips the upload (reuse the resident contents) - only safe
+      // when V is unchanged since the last write AND no reallocation happened
+      // (any size growth forces a fresh CreateBuffer, so the caller must pass
+      // DoWrite=true whenever V could have grown; see the weight-dirty callers).
+      function EnsureWriteBuffer(var buf: cl_mem; var capBytes: csize_t;
+        V: TNNetVolume; DoWrite: boolean = true): cl_mem;
+      // Ensure a persistent output buffer big enough for V (no upload).
+      function EnsureOutputBuffer(var buf: cl_mem; var capBytes: csize_t;
+        V: TNNetVolume): cl_mem;
   end;
 
   TNeuralKernel = class(TEasyOpenCLV)
@@ -226,6 +247,16 @@ type
       FPreviousComputeTime: TDateTime;
       /// Indicates if buffers should be stored on host.
       FHostInput: boolean;
+      /// Byte capacities of the three device buffers above. Used by
+      /// ReallocateBuffersIfRequired for grow-only reuse; kept in sync with the
+      /// actual allocations (reset to 0 whenever a buffer is released).
+      FCapAs, FCapBs, FCapResult: csize_t;
+      /// Optional resident fused-bias buffer (arg 9 of cai_dot_product). Only
+      /// allocated when a Compute call passes a bias volume; grow-only like the
+      /// operands, uploaded only when NewVBias (or on first/grown allocation).
+      /// nil (and UseBias=0) for every bias-less caller. Coded by Claude (AI).
+      FBiasBuffer: cl_mem;
+      FCapBias: csize_t;
 
       FDotProductKernel: TDotProductKernel;
 
@@ -236,7 +267,15 @@ type
 
       procedure UnprepareForCompute();
       function PrepareForCompute(VAs, VBs: TNNetVolume; pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0): integer;
-      procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint; NewVAs:boolean = true; NewVBs:boolean = true);
+      /// Grow-only sibling of PrepareForCompute: sets the same scalar shape state
+      /// but only releases+recreates a device buffer when the needed byte size
+      /// exceeds its current capacity, otherwise reuses it in place. Safe because
+      /// Compute() re-uploads both operands every call, so stale buffer contents
+      /// never leak. Use this from per-forward attention/gram ComputeOpenCL paths
+      /// to avoid churning three clCreateBuffer/clReleaseMemObject pairs per GEMM.
+      /// Coded by Claude (AI).
+      procedure ReallocateBuffersIfRequired(VAs, VBs: TNNetVolume; pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0);
+      procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint; NewVAs:boolean = true; NewVBs:boolean = true; VBias: TNNetVolume = nil; NewVBias: boolean = true);
       procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
 
       /// The underlying device kernel shared by this instance. Exposed so a layer
@@ -384,10 +423,77 @@ begin
   if Assigned(FInputBufferAs) then clReleaseMemObject(FInputBufferAs);
   if Assigned(FInputBufferBs) then clReleaseMemObject(FInputBufferBs);
   if Assigned(FResultBuffer)  then clReleaseMemObject(FResultBuffer);
+  if Assigned(FBiasBuffer)    then clReleaseMemObject(FBiasBuffer);
 
   FInputBufferAs := nil;
   FInputBufferBs := nil;
   FResultBuffer  := nil;
+  FBiasBuffer    := nil;
+
+  FCapAs := 0;
+  FCapBs := 0;
+  FCapResult := 0;
+  FCapBias := 0;
+end;
+
+// Grow-only buffer management for the per-forward attention/gram callers. Unlike
+// PrepareForCompute (which unconditionally frees + recreates all three buffers),
+// this keeps a buffer whenever it is already big enough. The scalar shape state
+// (FNumAs/FNumBs/FSize/FThreadCount/FGroupSize*) is still set on every call, so
+// the two different-shaped GEMMs of a single attention forward remain correct.
+// CreateHostInputBuffer binds a buffer to a specific host pointer, so it cannot
+// be reused across volumes; the FHostInput path therefore still allocates fresh.
+// Coded by Claude (AI).
+procedure TDotProductSharedKernel.ReallocateBuffersIfRequired(VAs, VBs: TNNetVolume;
+  pSize: longint; GroupSizeA: integer; GroupSizeB: integer);
+var
+  NeededAs, NeededBs, NeededResult: csize_t;
+begin
+  FNumAs := VAs.Size div pSize;
+  FNumBs := VBs.Size div pSize;
+  FThreadCount := FNumAs * FNumBs;
+  FSize := pSize;
+  FGroupSizeA := GroupSizeA;
+  FGroupSizeB := GroupSizeB;
+
+  NeededResult := FNumAs * FNumBs * SizeOf(TNeuralFloat);
+
+  if (FHostInput) then
+  begin
+    // Host-pointer buffers cannot be reused across volumes: free + recreate.
+    if Assigned(FInputBufferAs) then clReleaseMemObject(FInputBufferAs);
+    if Assigned(FInputBufferBs) then clReleaseMemObject(FInputBufferBs);
+    FInputBufferAs := FDotProductKernel.CreateHostInputBuffer(VAs);
+    FInputBufferBs := FDotProductKernel.CreateHostInputBuffer(VBs);
+    FCapAs := VAs.GetMemSize();
+    FCapBs := VBs.GetMemSize();
+  end
+  else
+  begin
+    NeededAs := VAs.GetMemSize();
+    NeededBs := VBs.GetMemSize();
+    if (FInputBufferAs = nil) or (NeededAs > FCapAs) then
+    begin
+      if Assigned(FInputBufferAs) then clReleaseMemObject(FInputBufferAs);
+      FInputBufferAs := FDotProductKernel.CreateInputBuffer(NeededAs);
+      FCapAs := NeededAs;
+    end;
+    if (FInputBufferBs = nil) or (NeededBs > FCapBs) then
+    begin
+      if Assigned(FInputBufferBs) then clReleaseMemObject(FInputBufferBs);
+      FInputBufferBs := FDotProductKernel.CreateInputBuffer(NeededBs);
+      FCapBs := NeededBs;
+    end;
+  end;
+
+  if (FResultBuffer = nil) or (NeededResult > FCapResult) then
+  begin
+    if Assigned(FResultBuffer) then clReleaseMemObject(FResultBuffer);
+    FResultBuffer := FDotProductKernel.CreateOutputBuffer(NeededResult);
+    FCapResult := NeededResult;
+  end;
+
+  FPreviousComputeTime := 0;
 end;
 
 function TDotProductSharedKernel.PrepareForCompute(VAs, VBs: TNNetVolume;
@@ -422,10 +528,13 @@ procedure TDotProductSharedKernel.Compute
 (
   VAs, VBs: TNNetVolume;
   pActFN: longint;
-  NewVAs:boolean = true; NewVBs:boolean = true
+  NewVAs:boolean = true; NewVBs:boolean = true;
+  VBias: TNNetVolume = nil; NewVBias: boolean = true
 );
 var
   err: integer;
+  UseBias: longint;
+  NeededBias: csize_t;
 begin
   FActFun := pActFN;
 
@@ -456,6 +565,34 @@ begin
 
       err := err or clSetKernelArg(Kernel, 7, SizeOf(cl_mem),  @FResultBuffer);
       if (err <> CL_SUCCESS) then ErrorProc('7 Error: Failed to set kernel arguments:' + IntToStr(err));
+
+      // Fused bias (arg 8 UseBias, arg 9 FBiasBuffer). Both args MUST be set every
+      // call: cai_dot_product now has 10 args and the enqueue rejects any unset
+      // one. A bias-less caller (VBias=nil) passes UseBias=0 and a NULL buffer
+      // (legal - the kernel never reads it). With a bias volume, keep it resident
+      // grow-only and re-upload only when NewVBias or the buffer was just
+      // (re)allocated. Coded by Claude (AI).
+      if VBias <> nil then
+      begin
+        NeededBias := VBias.GetMemSize();
+        if (FBiasBuffer = nil) or (NeededBias > FCapBias) then
+        begin
+          if Assigned(FBiasBuffer) then clReleaseMemObject(FBiasBuffer);
+          FBiasBuffer := FDotProductKernel.CreateInputBuffer(NeededBias);
+          FCapBias := NeededBias;
+          NewVBias := true; // fresh/grown buffer: force upload regardless of caller
+        end;
+        if NewVBias then err := err or FDotProductKernel.WriteBuffer(FBiasBuffer, VBias);
+        UseBias := 1;
+      end
+      else
+        UseBias := 0;
+
+      err := err or clSetKernelArg(Kernel, 8, SizeOf(longint), @UseBias);
+      if (err <> CL_SUCCESS) then ErrorProc('8 Error: Failed to set kernel arguments:' + IntToStr(err));
+
+      err := err or clSetKernelArg(Kernel, 9, SizeOf(cl_mem), @FBiasBuffer);
+      if (err <> CL_SUCCESS) then ErrorProc('9 Error: Failed to set kernel arguments:' + IntToStr(err));
 
       if (FHostInput) then
       begin
@@ -698,6 +835,8 @@ function TDotProductCL.PrepareForCompute(VAs, VBs: TNNetVolume; pSize: longint;
   kernelname: string; GroupSizeA: integer; GroupSizeB: integer): integer;
 var
   err: integer; // error code returned from api calls
+  UseBiasZero: longint; // this class never fuses bias
+  NilBias: cl_mem;
 begin
   UnprepareForCompute();
 
@@ -746,6 +885,17 @@ begin
 
   err := err or clSetKernelArg(FKernel, 7, SizeOf(cl_mem),  @FResultBuffer);
   if (err <> CL_SUCCESS) then ErrorProc('7 Error: Failed to set kernel arguments:' + IntToStr(err));
+
+  // cai_dot_product gained two fused-bias args (8 UseBias, 9 FBiasOutput). This
+  // class never fuses bias, but every arg must be set once before enqueue, so pin
+  // UseBias=0 and a NULL bias buffer here (clSetKernelArg copies the value
+  // immediately, so the locals are safe). Coded by Claude (AI).
+  UseBiasZero := 0;
+  NilBias := nil;
+  err := err or clSetKernelArg(FKernel, 8, SizeOf(longint), @UseBiasZero);
+  if (err <> CL_SUCCESS) then ErrorProc('8 Error: Failed to set kernel arguments:' + IntToStr(err));
+  err := err or clSetKernelArg(FKernel, 9, SizeOf(cl_mem), @NilBias);
+  if (err <> CL_SUCCESS) then ErrorProc('9 Error: Failed to set kernel arguments:' + IntToStr(err));
 
   PrepareForCompute := err;
 end;
@@ -930,6 +1080,37 @@ function TEasyOpenCLV.CreateOutputSetArgument(V: TNNetVolume;
 begin
   Result := CreateOutputBuffer(V);
   clSetKernelArg(kernel, arg_index, sizeof(cl_mem), @Result);
+end;
+
+function TEasyOpenCLV.EnsureBuffer(var buf: cl_mem; var capBytes: PtrUInt;
+  flags: cl_mem_flags; neededBytes: PtrUInt): cl_mem;
+begin
+  // Grow only: reuse the existing allocation whenever it is large enough (a
+  // buffer bigger than needed is harmless - WriteBuffer/ReadBuffer move exactly
+  // V.GetMemSize() bytes and the kernels are bounded by explicit size args).
+  if (buf = nil) or (neededBytes > capBytes) then
+  begin
+    if Assigned(buf) then clReleaseMemObject(buf);
+    buf := CreateBuffer(flags, neededBytes);
+    capBytes := neededBytes;
+  end;
+  Result := buf;
+end;
+
+function TEasyOpenCLV.EnsureWriteBuffer(var buf: cl_mem; var capBytes: csize_t;
+  V: TNNetVolume; DoWrite: boolean = true): cl_mem;
+begin
+  // READ_WRITE (not READ_ONLY) so one persistent buffer can back either an
+  // input or output role across shapes without flag mismatches.
+  Result := EnsureBuffer(buf, capBytes, CL_MEM_READ_WRITE, V.GetMemSize());
+  // DoWrite=false leaves the resident device copy in place (weights unchanged).
+  if DoWrite then WriteBuffer(Result, V, CL_FALSE);
+end;
+
+function TEasyOpenCLV.EnsureOutputBuffer(var buf: cl_mem; var capBytes: csize_t;
+  V: TNNetVolume): cl_mem;
+begin
+  Result := EnsureBuffer(buf, capBytes, CL_MEM_READ_WRITE, V.GetMemSize());
 end;
 
 { TEasyOpenCL }
