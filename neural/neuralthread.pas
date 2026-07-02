@@ -123,12 +123,60 @@ type
   function fNTL: TNeuralThreadList; {$IFDEF FPC}{$IFDEF Release} inline; {$ENDIF}{$ENDIF}
   procedure CreateNeuralThreadListIfRequired();
   function NeuralDefaultThreadCount: integer;
+  // Portable interlocked helpers for the layer-graph inference scheduler
+  // (TNNet.ComputeForInference): claim/publish per-layer compute states and
+  // count remaining layers across worker threads. All are full memory
+  // barriers, so a value published with NeuralAtomicExchange is observed -
+  // together with everything written before it - by a NeuralAtomicRead on
+  // another core. Coded by Claude (AI).
+  function NeuralAtomicCmpExchange(var Target: LongInt; NewValue, Comparand: LongInt): LongInt;
+  function NeuralAtomicExchange(var Target: LongInt; NewValue: LongInt): LongInt;
+  function NeuralAtomicDecrement(var Target: LongInt): LongInt;
+  function NeuralAtomicRead(var Target: LongInt): LongInt;
   procedure NeuralInitCriticalSection(var pCritSec: TRTLCriticalSection);
   procedure NeuralDoneCriticalSection(var pCritSec: TRTLCriticalSection);
   function GetProcessId(): {$IFDEF FPC}integer{$ELSE}integer{$ENDIF};
   procedure DebugThreadCount();
 
 implementation
+
+function NeuralAtomicCmpExchange(var Target: LongInt; NewValue, Comparand: LongInt): LongInt;
+begin
+  {$IFDEF FPC}
+  Result := InterlockedCompareExchange(Target, NewValue, Comparand);
+  {$ELSE}
+  Result := AtomicCmpExchange(Target, NewValue, Comparand);
+  {$ENDIF}
+end;
+
+function NeuralAtomicExchange(var Target: LongInt; NewValue: LongInt): LongInt;
+begin
+  {$IFDEF FPC}
+  Result := InterLockedExchange(Target, NewValue);
+  {$ELSE}
+  Result := AtomicExchange(Target, NewValue);
+  {$ENDIF}
+end;
+
+function NeuralAtomicDecrement(var Target: LongInt): LongInt;
+begin
+  {$IFDEF FPC}
+  Result := InterLockedDecrement(Target);
+  {$ELSE}
+  Result := AtomicDecrement(Target);
+  {$ENDIF}
+end;
+
+function NeuralAtomicRead(var Target: LongInt): LongInt;
+begin
+  // Read with a full barrier: an add of zero returns the current value
+  // without changing it.
+  {$IFDEF FPC}
+  Result := InterLockedExchangeAdd(Target, 0);
+  {$ELSE}
+  Result := AtomicCmpExchange(Target, 0, 0);
+  {$ENDIF}
+end;
 
 procedure NeuralInitCriticalSection(var pCritSec: TRTLCriticalSection);
 begin
