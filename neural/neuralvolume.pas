@@ -467,6 +467,7 @@ type
       *)
       procedure InterleavedDotProduct(InterleavedAs, B:TNNetVolume);  overload;
       procedure InterleavedDotProduct(InterleavedAs, Bs:TNNetVolume; VectorSize: integer); overload;
+      procedure InterleavedDotProduct(InterleavedAs, Bs:TNNetVolume; BStart, BFinish, VectorSize: integer); overload;
       procedure DotProducts(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; NoForward:boolean = false); overload;
       // Ranged variant computing only the B rows [BStart..BFinish]. Output cells
       // keep their absolute positions (FData[CntB*NumAs + CntA]), so concurrent
@@ -9182,6 +9183,37 @@ begin
 
   Fill(0);
   for CntB := 0 to NumBM1 do
+  begin
+    DestPointer := Self.GetRawPtr(NumA*CntB);
+    CntBVectorSizePlusCntBPos := CntB*VectorSize;
+    for CntBPos := 0 to MaxBPos do
+    begin
+      //MulAdd(DestPointer, InterleavedAs.GetRawPtr(CntBPos*NumA), Bs.FData[CntB*VectorSize + CntBPos], NumA);
+      MulAdd(DestPointer, InterleavedAs.GetRawPtr(CntBPos*NumA), Bs.FData[CntBVectorSizePlusCntBPos], NumA);
+      Inc(CntBVectorSizePlusCntBPos);
+    end;
+  end;
+end;
+
+procedure TNNetVolume.InterleavedDotProduct(InterleavedAs, Bs: TNNetVolume;
+  BStart, BFinish, VectorSize: integer);
+var
+  CntB, CntBPos, MaxBPos: integer;
+  NumA, NumB: integer;
+  DestPointer: pointer;
+  CntBVectorSizePlusCntBPos: integer;
+begin
+  NumA := InterleavedAs.Size div VectorSize;
+  NumB := Bs.Size div VectorSize;
+
+  MaxBPos := VectorSize - 1;
+
+  if FSize <> NumA * NumB then
+  begin
+    Resize(1, NumB, NumA);
+  end;
+
+  for CntB := BStart to BFinish do
   begin
     DestPointer := Self.GetRawPtr(NumA*CntB);
     CntBVectorSizePlusCntBPos := CntB*VectorSize;
