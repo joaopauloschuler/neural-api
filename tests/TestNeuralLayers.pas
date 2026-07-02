@@ -19,6 +19,7 @@ type
     procedure TestFullyConnectedForward;
     procedure TestFullConnectThreadingParity;
     procedure TestWillThreadParallelPassParity;
+    procedure TestConvolutionWillThreadParity;
     procedure TestConvolutionForward;
     procedure TestWinogradConvolutionParity;
     procedure TestMaxPoolForward;
@@ -303,6 +304,86 @@ begin
 
     // Inference: parallel scheduler passes with worker-0-routed WillThread
     // layers must stay bit-identical, pass after pass.
+    NN.SetTrainable(False);
+    for pass := 1 to 20 do
+    begin
+      NN.Compute(Input);
+      AssertEquals('Output size matches at pass ' + IntToStr(pass),
+        SerialOut.Size, NN.GetLastLayer().Output.Size);
+      for i := 0 to SerialOut.Size - 1 do
+        AssertTrue('Parallel pass ' + IntToStr(pass) +
+          ' must be BIT-IDENTICAL to serial at ' + IntToStr(i),
+          SerialOut.Raw[i] = NN.GetLastLayer().Output.Raw[i]);
+    end;
+  finally
+    Input.Free;
+    SerialOut.Free;
+    NN.Free;
+  end;
+end;
+
+// Conv counterpart of TestWillThreadParallelPassParity: three conv branches
+// chosen to exercise BOTH threaded twins - Branch1 (32 neurons, 3x3 on depth
+// 8: VectorSize 72 <= csMaxInterleavedSize and neurons mod 32 = 0) takes the
+// interleaved kernel; Branch2 (24 neurons, 3x3) and Branch3 (pointwise) take
+// the tiled kernel. The serial trainable pass is the reference; every
+// parallel scheduler pass must be BIT-IDENTICAL (the ranged kernels only
+// partition the outer B loop - per-cell accumulation order is untouched).
+// Coded by Claude (AI).
+procedure TTestNeuralLayers.TestConvolutionWillThreadParity;
+var
+  NN: TNNet;
+  Input, SerialOut: TNNetVolume;
+  InputLayer, Branch1, Branch2, Branch3: TNNetLayer;
+  Layer: TNNetLayer;
+  i, pass, LayerCnt, neuron, w: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 8);
+  SerialOut := TNNetVolume.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(8, 8, 8));
+    Branch1 := NN.AddLayerAfter(
+      TNNetConvolutionReLU.Create(32, 3, 1, 1), InputLayer);
+    Branch2 := NN.AddLayerAfter(
+      TNNetConvolutionLinear.Create(24, 3, 1, 1), InputLayer);
+    Branch3 := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(48), InputLayer);
+    NN.AddLayer(TNNetDeepConcat.Create([Branch1, Branch2, Branch3]));
+    // Deterministic weights; AfterWeightUpdate refreshes the concatenated and
+    // interleaved weight caches the conv forward reads.
+    for LayerCnt := 0 to NN.CountLayers() - 1 do
+    begin
+      Layer := NN.Layers[LayerCnt];
+      if Layer.Neurons.Count > 0 then
+      begin
+        for neuron := 0 to Layer.Neurons.Count - 1 do
+        begin
+          for w := 0 to Layer.Neurons[neuron].Weights.Size - 1 do
+            Layer.Neurons[neuron].Weights.Raw[w] :=
+              Sin(LayerCnt * 1.7 + neuron * 0.013 + w * 0.0007) * 0.1;
+          Layer.Neurons[neuron].BiasWeight := Cos(neuron * 0.021) * 0.05;
+        end;
+        Layer.FlushWeightCache();
+      end;
+    end;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.05) - 0.3;
+
+    NN.EnableIntraLayerThreading(true);
+    NN.SetIntraLayerThreadingMinWork(0); // force WillThread on all branches
+    AssertTrue('Branch1 must report WillThread', Branch1.WillThread());
+    AssertTrue('Branch2 must report WillThread', Branch2.WillThread());
+    AssertTrue('Branch3 must report WillThread', Branch3.WillThread());
+
+    // Reference: trainable -> serial loop with the classic serial kernels.
+    NN.Compute(Input);
+    SerialOut.Copy(NN.GetLastLayer().Output);
+    AssertTrue('Reference output is non-trivial', SerialOut.GetSumAbs() > 0.0);
+
+    // Inference: parallel scheduler passes with worker-0-routed WillThread
+    // layers running the threaded twins must stay bit-identical, pass after
+    // pass.
     NN.SetTrainable(False);
     for pass := 1 to 20 do
     begin
