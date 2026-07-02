@@ -156,7 +156,7 @@ begin
   WriteLn('  --repetition-penalty X  CTRL repetition penalty (default 1.0)');
   WriteLn('  --frequency-penalty X   frequency penalty (default 0)');
   WriteLn('  --presence-penalty X    presence penalty (default 0)');
-  WriteLn('  --max-new-tokens N    reply length cap (default 128)');
+  WriteLn('  --max-new-tokens N    reply length cap (default 8192)');
   WriteLn('  --seed N              RNG seed (default: randomize)');
   WriteLn('  --ctx N               context window (default min(model max,2048); mem ~O(ctx^2))');
   WriteLn('  --format NAME         chatml|llama2|llama3|zephyr|gemma|phi3|mistral');
@@ -189,7 +189,7 @@ begin
   Result.Int8 := false; // full-precision FP32 weights by default (--int8 for less RAM)
   Result.LowMemory := true; // low-memory forward path by default (drops weight cache)
   Result.CtxLen := 0;
-  Result.MaxNewTokens := 128;
+  Result.MaxNewTokens := 8192;
   Result.Temperature := 1.0;
   Result.TopK := 0;
   Result.WeightedTopK := false;

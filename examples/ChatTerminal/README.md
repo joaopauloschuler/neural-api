@@ -58,7 +58,7 @@ guard, flushed per token so piped output streams too).
 | `--repetition-penalty X` | CTRL repetition penalty (`TNNetTokenHistoryPenalty`) | 1.0 (off) |
 | `--frequency-penalty X` | frequency penalty | 0 (off) |
 | `--presence-penalty X` | presence penalty | 0 (off) |
-| `--max-new-tokens N` | reply length cap | 128 |
+| `--max-new-tokens N` | reply length cap | 8192 |
 | `--seed N` | RNG seed (reproducible sampling) | randomize |
 | `--ctx N` | context window to build (`pSeqLen`) | model max |
 | `--format NAME` | `chatml`/`llama2`/`llama3`/`zephyr`/`gemma`/`phi3`/`mistral` override | autodetect |
