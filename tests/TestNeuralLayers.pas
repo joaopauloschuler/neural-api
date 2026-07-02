@@ -18,6 +18,7 @@ type
   published
     procedure TestFullyConnectedForward;
     procedure TestFullConnectThreadingParity;
+    procedure TestWillThreadParallelPassParity;
     procedure TestConvolutionForward;
     procedure TestWinogradConvolutionParity;
     procedure TestMaxPoolForward;
@@ -154,9 +155,11 @@ end;
 // TNNetFullConnect forward (the EnCodec-conv-style forced-thread checksum, but
 // here it must be EXACTLY equal: only independent output neurons are
 // partitioned, the per-neuron reduction order is unchanged). Forces the
-// threaded path with SetFullConnectThreadingMinWork(0) on a layer well above
-// any sane work threshold, for both the activation (TNNetFullConnect/ReLU) and
-// the activation-free (TNNetFullConnectLinear) variants.
+// threaded path with NN.SetIntraLayerThreadingMinWork(0) on a layer well
+// above any sane work threshold, for both the activation
+// (TNNetFullConnect/ReLU) and the activation-free (TNNetFullConnectLinear)
+// variants. Threading state is per-net (TNNetExecutionPlanner), so it dies
+// with each RunCase net - no global restore needed.
 procedure TTestNeuralLayers.TestFullConnectThreadingParity;
 var
   Input: TNNetVolume;
@@ -187,11 +190,11 @@ var
       end;
       if Threaded then
       begin
-        EnableFullConnectThreading(true);
-        SetFullConnectThreadingMinWork(0); // force the threaded path
+        NN.EnableIntraLayerThreading(true);
+        NN.SetIntraLayerThreadingMinWork(0); // force the threaded path
       end
       else
-        EnableFullConnectThreading(false);
+        NN.EnableIntraLayerThreading(false);
       NN.Compute(Input);
       Dst.Copy(Layer.Output);
     finally
@@ -216,9 +219,6 @@ begin
     RunCase({IsLinear=}false, {Threaded=}false, SerialAct);
     RunCase({IsLinear=}false, {Threaded=}true,  ThreadAct);
 
-    // Restore the off-by-default state for the rest of the suite.
-    EnableFullConnectThreading(false);
-
     AssertEquals('Linear output sizes match', SerialLin.Size, ThreadLin.Size);
     for i := 0 to SerialLin.Size - 1 do
       AssertTrue('Linear FC threaded must be BIT-IDENTICAL to serial at ' +
@@ -239,6 +239,85 @@ begin
     ThreadLin.Free;
     SerialAct.Free;
     ThreadAct.Free;
+  end;
+end;
+
+// Exercises WillThread layers INSIDE a parallel inference pass: a branching
+// net (width 2) so ComputeForInference engages the graph scheduler, with
+// intra-layer threading forced on (min-work 0), so both FullConnect branches
+// report WillThread=True and are routed through the single-consumer worker-0
+// queue - the only safeguard serializing StartProc on the net's shared
+// intra-layer pool (there is no suppression flag anymore). Every parallel
+// pass must be bit-identical to the serial trainable compute: the scheduler
+// only reorders independent layers and the threaded range split preserves
+// the per-neuron reduction order.
+procedure TTestNeuralLayers.TestWillThreadParallelPassParity;
+var
+  NN: TNNet;
+  Input, SerialOut: TNNetVolume;
+  InputLayer, Branch1, Branch2: TNNetLayer;
+  Layer: TNNetLayer;
+  i, pass, LayerCnt, neuron, w: integer;
+  FC: TNNetFullConnect;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(256, 1, 1);
+  SerialOut := TNNetVolume.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(256));
+    // (1,1,depth)-shaped outputs: TNNetDeepConcat requires matching X/Y and
+    // concatenates on the depth axis.
+    Branch1 := NN.AddLayerAfter(
+      TNNetFullConnectLinear.Create(1, 1, 384), InputLayer);
+    Branch2 := NN.AddLayerAfter(
+      TNNetFullConnectReLU.Create(1, 1, 96), InputLayer);
+    NN.AddLayer(TNNetDeepConcat.Create([Branch1, Branch2]));
+    // Deterministic weights on both branches.
+    for LayerCnt := 0 to NN.CountLayers() - 1 do
+    begin
+      Layer := NN.Layers[LayerCnt];
+      if Layer is TNNetFullConnect then
+      begin
+        FC := TNNetFullConnect(Layer);
+        for neuron := 0 to FC.Neurons.Count - 1 do
+        begin
+          for w := 0 to FC.Neurons[neuron].Weights.Size - 1 do
+            FC.Neurons[neuron].Weights.Raw[w] :=
+              Sin(LayerCnt * 1.7 + neuron * 0.013 + w * 0.0007) * 0.1;
+          FC.Neurons[neuron].BiasWeight := Cos(neuron * 0.021) * 0.05;
+        end;
+      end;
+    end;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.05) - 0.3;
+
+    NN.EnableIntraLayerThreading(true);
+    NN.SetIntraLayerThreadingMinWork(0); // force WillThread on both branches
+    AssertTrue('Branch1 must report WillThread', Branch1.WillThread());
+    AssertTrue('Branch2 must report WillThread', Branch2.WillThread());
+
+    // Reference: trainable -> serial loop (threaded ranges, no scheduler).
+    NN.Compute(Input);
+    SerialOut.Copy(NN.GetLastLayer().Output);
+    AssertTrue('Reference output is non-trivial', SerialOut.GetSumAbs() > 0.0);
+
+    // Inference: parallel scheduler passes with worker-0-routed WillThread
+    // layers must stay bit-identical, pass after pass.
+    NN.SetTrainable(False);
+    for pass := 1 to 20 do
+    begin
+      NN.Compute(Input);
+      AssertEquals('Output size matches at pass ' + IntToStr(pass),
+        SerialOut.Size, NN.GetLastLayer().Output.Size);
+      for i := 0 to SerialOut.Size - 1 do
+        AssertTrue('Parallel pass ' + IntToStr(pass) +
+          ' must be BIT-IDENTICAL to serial at ' + IntToStr(i),
+          SerialOut.Raw[i] = NN.GetLastLayer().Output.Raw[i]);
+    end;
+  finally
+    Input.Free;
+    SerialOut.Free;
+    NN.Free;
   end;
 end;
 
