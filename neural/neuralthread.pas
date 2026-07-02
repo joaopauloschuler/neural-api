@@ -131,6 +131,7 @@ type
   // another core. Coded by Claude (AI).
   function NeuralAtomicCmpExchange(var Target: LongInt; NewValue, Comparand: LongInt): LongInt;
   function NeuralAtomicExchange(var Target: LongInt; NewValue: LongInt): LongInt;
+  function NeuralAtomicIncrement(var Target: LongInt): LongInt;
   function NeuralAtomicDecrement(var Target: LongInt): LongInt;
   function NeuralAtomicRead(var Target: LongInt): LongInt;
   procedure NeuralInitCriticalSection(var pCritSec: TRTLCriticalSection);
@@ -155,6 +156,15 @@ begin
   Result := InterLockedExchange(Target, NewValue);
   {$ELSE}
   Result := AtomicExchange(Target, NewValue);
+  {$ENDIF}
+end;
+
+function NeuralAtomicIncrement(var Target: LongInt): LongInt;
+begin
+  {$IFDEF FPC}
+  Result := InterLockedIncrement(Target);
+  {$ELSE}
+  Result := AtomicIncrement(Target);
   {$ENDIF}
 end;
 

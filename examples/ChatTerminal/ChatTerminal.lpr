@@ -172,7 +172,9 @@ begin
   WriteLn('  --gpu-device N        OpenCL device index within the platform (default 0)');
   WriteLn('  --stats               per-turn timing to stderr (TTFT, decode tok/s)');
   WriteLn('  --profile             per-layer-class forward timing to stderr after each');
-  WriteLn('                        turn (decode steps only); ranks classes to optimize');
+  WriteLn('                        turn (decode steps only); ranks classes to optimize.');
+  WriteLn('                        Also prints [sched]: layer-graph parallelism (graph');
+  WriteLn('                        width, parallel vs serial passes, peak in-flight)');
   WriteLn('  --no-cache-reuse      re-prefill the whole prompt each turn (default:');
   WriteLn('                        reuse the shared KV-cache prefix from last turn)');
   WriteLn('  --selftest            run the offline unit checks and exit');
@@ -610,10 +612,15 @@ begin
       InV.FData[0] := Tokens[Cnt];
       Session.StepForward(InV, Cnt);
     end;
-    // --profile: discard the one-shot prefill timings so the per-layer-class
-    // report below reflects only the repeated single-token decode steps - the
-    // steady-state workload whose layer costs we want to rank for optimization.
-    if Opt.Profile then NN.ClearTime();
+    // --profile: discard the one-shot prefill timings (and scheduler stats)
+    // so the per-layer-class report below reflects only the repeated
+    // single-token decode steps - the steady-state workload whose layer costs
+    // we want to rank for optimization.
+    if Opt.Profile then
+    begin
+      NN.ClearTime();
+      NN.ResetSchedulerStats();
+    end;
     for StepCnt := 1 to Opt.MaxNewTokens do
     begin
       if Len >= SeqLen then break;
@@ -693,6 +700,11 @@ begin
     begin
       WriteLn(StdErr);
       Write(StdErr, TNNet.LayerClassTimingReport(NN));
+      // Layer-graph scheduler parallelism for this turn's decode steps: how
+      // wide the graph is, how often the parallel path ran vs the serial
+      // fallback, and how much overlap it actually achieved (peak in-flight,
+      // share of layers computed off the primary worker).
+      WriteLn(StdErr, '[sched] ', NN.SchedulerStatsReport());
       Flush(StdErr);
     end;
   finally
