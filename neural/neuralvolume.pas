@@ -468,6 +468,7 @@ type
       procedure InterleavedDotProduct(InterleavedAs, B:TNNetVolume);  overload;
       procedure InterleavedDotProduct(InterleavedAs, Bs:TNNetVolume; VectorSize: integer); overload;
       procedure DotProducts(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; NoForward:boolean = false);
+      procedure DotProducts(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; NoForward:boolean = false);
       procedure DotProductsPointwise(VAs, VBs: TNNetVolume; NoForward:boolean = false);
       procedure DotProductsTiled(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
       procedure PointwiseNorm(pNorms: TNNetVolume = nil);
@@ -9222,6 +9223,13 @@ end;
 procedure TNNetVolume.DotProducts(NumAs, NumBs, VectorSize: integer;
   VAs, VBs: TNNetVolume;
   NoForward:boolean = false);
+begin
+  DotProducts(NumAs, 0, NumBs-1, VectorSize, VAs, VBs, NoForward);
+end;
+
+procedure TNNetVolume.DotProducts(NumAs, BStart, BFinish, VectorSize: integer;
+  VAs, VBs: TNNetVolume;
+  NoForward:boolean = false);
 var
   CntA, CntB, MaxA, LocalMaxA, MaxB: integer;
   //DestPointer: pointer;
@@ -9235,7 +9243,6 @@ var
   //PointwiseMinValue: TNeuralFloat;
 begin
   MaxA := NumAs - 1;
-  MaxB := NumBs - 1;
 
   //localNumElements := (VectorSize div 4) * 4;
   //MissedElements := VectorSize - localNumElements;
@@ -9247,7 +9254,7 @@ begin
 
   if NoForward then Fill(0);
 
-  for CntB := 0 to MaxB do
+  for CntB := BStart to BFinish do
   begin
     PtrB := VBs.GetRawPtr(CntB*VectorSize);
     if NoForward
