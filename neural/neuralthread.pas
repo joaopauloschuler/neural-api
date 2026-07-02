@@ -134,6 +134,13 @@ type
   function NeuralAtomicIncrement(var Target: LongInt): LongInt;
   function NeuralAtomicDecrement(var Target: LongInt): LongInt;
   function NeuralAtomicRead(var Target: LongInt): LongInt;
+  // SMT-polite busy-wait hint for spin loops: PAUSE on x86 (releases the
+  // core's execution resources to the sibling hyperthread and saves power;
+  // ~tens of ns), a no-op elsewhere. Unlike TThread.Yield it is NOT a
+  // syscall - a hot scheduler worker yielding once per loop iteration costs
+  // a kernel round-trip (worse still under virtualization) per idle probe.
+  // Coded by Claude (AI).
+  procedure NeuralPause;
   procedure NeuralInitCriticalSection(var pCritSec: TRTLCriticalSection);
   procedure NeuralDoneCriticalSection(var pCritSec: TRTLCriticalSection);
   function GetProcessId(): {$IFDEF FPC}integer{$ELSE}integer{$ENDIF};
@@ -187,6 +194,17 @@ begin
   Result := AtomicCmpExchange(Target, 0, 0);
   {$ENDIF}
 end;
+
+{$IF DEFINED(CPUX86_64) OR DEFINED(CPUX64) OR DEFINED(CPU386) OR DEFINED(CPUI386)}
+procedure NeuralPause; assembler; {$IFDEF FPC}nostackframe;{$ENDIF}
+asm
+  pause
+end;
+{$ELSE}
+procedure NeuralPause;
+begin
+end;
+{$IFEND}
 
 procedure NeuralInitCriticalSection(var pCritSec: TRTLCriticalSection);
 begin
