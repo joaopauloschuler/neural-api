@@ -467,10 +467,24 @@ type
       *)
       procedure InterleavedDotProduct(InterleavedAs, B:TNNetVolume);  overload;
       procedure InterleavedDotProduct(InterleavedAs, Bs:TNNetVolume; VectorSize: integer); overload;
-      procedure DotProducts(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; NoForward:boolean = false);
-      procedure DotProducts(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; NoForward:boolean = false);
-      procedure DotProductsPointwise(VAs, VBs: TNNetVolume; NoForward:boolean = false);
-      procedure DotProductsTiled(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
+      procedure DotProducts(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; NoForward:boolean = false); overload;
+      // Ranged variant computing only the B rows [BStart..BFinish]. Output cells
+      // keep their absolute positions (FData[CntB*NumAs + CntA]), so concurrent
+      // callers on disjoint B ranges write disjoint slices of the same volume.
+      // Threaded callers must NOT pass NoForward=true (its Fill(0) clears the
+      // WHOLE volume, racing with the other ranges).
+      procedure DotProducts(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; NoForward:boolean = false); overload;
+      procedure DotProductsPointwise(VAs, VBs: TNNetVolume; NoForward:boolean = false); overload;
+      // Ranged variant over the B rows [BStart..BFinish]; same absolute-position
+      // guarantees as the ranged DotProducts. Never resizes Self - the caller
+      // must have presized it (concurrent resize would race).
+      procedure DotProductsPointwise(VAs, VBs: TNNetVolume; BStart, BFinish: integer; NoForward:boolean = false); overload;
+      procedure DotProductsTiled(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer); overload;
+      // Ranged variant over the B rows [BStart..BFinish]; same absolute-position
+      // guarantees as the ranged DotProducts. Tiles are anchored at BStart and the
+      // last B tile may be PARTIAL (clamped to BFinish), so arbitrary thread
+      // ranges are safe even when TileSizeB does not divide the range length.
+      procedure DotProductsTiled(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer); overload;
       procedure PointwiseNorm(pNorms: TNNetVolume = nil);
       procedure PointwiseMul(pNorms: TNNetVolume);
       // VectorExp writes dst[0..N-1] := exp(src[0..N-1]). On an AVX2 build it
@@ -9191,10 +9205,29 @@ begin
   begin
     Resize(VBsCount, 1, VAsCount);
   end;
+  DotProductsPointwise(VAs, VBs, 0, VBsCount-1, NoForward);
+end;
+
+procedure TNNetVolume.DotProductsPointwise(VAs, VBs: TNNetVolume;
+  BStart, BFinish: integer; NoForward: boolean);
+var
+  VAsCount, VBsCount: integer;
+begin
+  VAsCount := VAs.SizeX * VAs.SizeY;
+  VBsCount := VBs.SizeX * VBs.SizeY;
+  if (VAsCount*VBsCount <> FSize) then
+  begin
+    WriteLn(
+      'TNNetVolume.DotProductsPointwise (ranged) - Self is not presized: '+
+      IntToStr(FSize) + ' <> ' +
+      IntToStr(VAsCount*VBsCount) + '.'
+    );
+    exit;
+  end;
 
   if (VAs.Depth = VBs.Depth) then
   begin
-    DotProducts(VAsCount, VBsCount, VAs.Depth, VAs, VBs, NoForward);
+    DotProducts(VAsCount, BStart, BFinish, VAs.Depth, VAs, VBs, NoForward);
   end
   else
   begin
@@ -9231,7 +9264,7 @@ procedure TNNetVolume.DotProducts(NumAs, BStart, BFinish, VectorSize: integer;
   VAs, VBs: TNNetVolume;
   NoForward:boolean = false);
 var
-  CntA, CntB, MaxA, LocalMaxA, MaxB: integer;
+  CntA, CntB, MaxA, LocalMaxA: integer;
   //DestPointer: pointer;
   //CntBVectorSizePlusCntBPos: integer;
   {$IFDEF AVXANY}
@@ -9520,6 +9553,11 @@ begin
 end;
 
 procedure TNNetVolume.DotProductsTiled(NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
+begin
+  DotProductsTiled(NumAs, 0, NumBs-1, VectorSize, VAs, VBs, TileSizeA, TileSizeB);
+end;
+
+procedure TNNetVolume.DotProductsTiled(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
 var
   CntA, CntB: Integer;
   //DestPointer: pointer;
@@ -9542,11 +9580,15 @@ begin
   localNumElements := VectorSize xor MissedElements;
   {$ENDIF}
   MaxTileA := (NumAs div TileSizeA) - 1;
-  MaxTileB := (NumBs div TileSizeB) - 1;
+  // B tiles are anchored at BStart; ceil division so a trailing PARTIAL tile
+  // (clamped to BFinish below) covers ranges TileSizeB does not divide. With
+  // BStart=0 and TileSizeB dividing NumBs (every non-ranged caller - the conv
+  // tile sizes come from GetMaxDivisor), this is the original tiling.
+  MaxTileB := ((BFinish - BStart + 1) + TileSizeB - 1) div TileSizeB - 1;
   for TileBCnt := 0 to MaxTileB do
   begin
-    StartTileB := TileBCnt * TileSizeB;
-    EndTileB := StartTileB + TileSizeB - 1;
+    StartTileB := BStart + TileBCnt * TileSizeB;
+    EndTileB := Min(StartTileB + TileSizeB - 1, BFinish);
     for TileACnt := 0 to MaxTileA do
     begin
       StartTileA := TileACnt * TileSizeA;
