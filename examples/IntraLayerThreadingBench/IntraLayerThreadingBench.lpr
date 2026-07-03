@@ -2,17 +2,6 @@ program IntraLayerThreadingBench;
 (*
 IntraLayerThreadingBench: validates the intra-layer threading decision.
 
-Since the "Simpler Threading Decision" refactor, chunk-eligibility is a fixed
-per-layer rule (no runtime-settable threshold anymore):
-
-    TNNetFullConnect : FOutput.Size * FVectorSize        >= 1024*1024
-    TNNetConvolution : FPrevLayer.Output.Size * FOutput.Size >= 1024*1024
-
-Both reduce to the SAME work proxy - prevOutputSize * outputSize - i.e. one
-unified crossover at 1M for every dense/conv layer. This program checks that
-the 1M crossover is well placed by measuring, per layer shape, the wall-clock
-of the SAME net computed with intra-layer threading OFF vs ON:
-
   * Experiment A sweeps single-layer FC / pointwise / conv shapes across the
     crossover, reports whether each shape is eligible under the 1M rule, the
     OFF-vs-ON speedup, and a bit-parity check (threaded output MUST equal
@@ -158,7 +147,7 @@ begin
 
     // Same net, same weights, threading on: the hardcoded rule decides.
     NN.EnableIntraLayerThreading(true);
-    NN.Compute(MyIn);
+    NN.Compute(MyIn,{parallel=}true);
     maxdiff := 0;
     for i := 0 to OutSerial.Size - 1 do
     begin
