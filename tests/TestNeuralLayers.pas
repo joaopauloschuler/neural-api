@@ -20,6 +20,8 @@ type
     procedure TestFullConnectThreadingParity;
     procedure TestWillThreadParallelPassParity;
     procedure TestConvolutionWillThreadParity;
+    procedure TestConvolutionColdParallelParity;
+    procedure TestConvolutionLowMemoryChunkParity;
     procedure TestConvolutionForward;
     procedure TestWinogradConvolutionParity;
     procedure TestMaxPoolForward;
@@ -408,6 +410,133 @@ begin
   finally
     Input.Free;
     SerialOut.Free;
+    NN.Free;
+  end;
+end;
+
+// Build the 3-branch (2 spatial conv + 1 pointwise) diamond used by the
+// cold-parallel and low-memory chunk parity tests, with deterministic weights.
+procedure BuildConvParityNet(out NN: TNNet;
+  out Branch1, Branch2, Branch3: TNNetLayer);
+var
+  InputLayer, Layer: TNNetLayer;
+  LayerCnt, neuron, w: integer;
+begin
+  NN := TNNet.Create();
+  InputLayer := NN.AddLayer(TNNetInput.Create(16, 16, 8));
+  Branch1 := NN.AddLayerAfter(TNNetConvolutionReLU.Create(32, 3, 1, 1), InputLayer);
+  Branch2 := NN.AddLayerAfter(TNNetConvolutionLinear.Create(24, 3, 1, 1), InputLayer);
+  Branch3 := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(48), InputLayer);
+  NN.AddLayer(TNNetDeepConcat.Create([Branch1, Branch2, Branch3]));
+  for LayerCnt := 0 to NN.CountLayers() - 1 do
+  begin
+    Layer := NN.Layers[LayerCnt];
+    if Layer.Neurons.Count > 0 then
+    begin
+      for neuron := 0 to Layer.Neurons.Count - 1 do
+      begin
+        for w := 0 to Layer.Neurons[neuron].Weights.Size - 1 do
+          Layer.Neurons[neuron].Weights.Raw[w] :=
+            Sin(LayerCnt * 1.7 + neuron * 0.013 + w * 0.0007) * 0.1;
+        Layer.Neurons[neuron].BiasWeight := Cos(neuron * 0.021) * 0.05;
+      end;
+      Layer.FlushWeightCache();
+    end;
+  end;
+end;
+
+// Guards the parallel-path input prologue (PrepareChunkedForward): a chunked
+// SPATIAL conv rebuilds its im2col (FInputPrepared) on the parallel path rather
+// than reusing a stale one from an earlier pass. Two DISTINCT inputs run
+// back-to-back on the parallel scheduler with NO matching serial warm-up; the
+// second must match the serial reference bit-for-bit. Before the prologue fix
+// the parallel result held the PREVIOUS input's im2col and diverged. Coded by
+// Claude (AI).
+procedure TTestNeuralLayers.TestConvolutionColdParallelParity;
+var
+  NN: TNNet;
+  InA, InB, ParOut: TNNetVolume;
+  Branch1, Branch2, Branch3: TNNetLayer;
+  i: integer;
+begin
+  BuildConvParityNet(NN, Branch1, Branch2, Branch3);
+  InA := TNNetVolume.Create(16, 16, 8);
+  InB := TNNetVolume.Create(16, 16, 8);
+  ParOut := TNNetVolume.Create();
+  try
+    for i := 0 to InA.Size - 1 do InA.Raw[i] := Sin(i * 0.05) - 0.3;
+    for i := 0 to InB.Size - 1 do InB.Raw[i] := Cos(i * 0.037) + 0.2;
+
+    NN.EnableIntraLayerThreading(true);
+    NN.SchedulerMinGain := 0; // force the parallel scheduler on every pass
+    NN.SetTrainable(False, {pLowMemory=}False);
+    AssertTrue('Branch1 must be chunk-eligible', Branch1.ChunkEligible());
+    AssertTrue('Branch2 must be chunk-eligible', Branch2.ChunkEligible());
+
+    // Cold parallel: warm the im2col with A, then compute B on the parallel path.
+    NN.Compute(InA, 0, True);
+    NN.Compute(InB, 0, True);
+    ParOut.Copy(NN.GetLastLayer().Output);
+    // Serial reference for B rebuilds the im2col correctly via Compute().
+    NN.Compute(InB, 0, False);
+    AssertEquals('Output size matches', NN.GetLastLayer().Output.Size, ParOut.Size);
+    AssertTrue('Reference output is non-trivial',
+      NN.GetLastLayer().Output.GetSumAbs() > 0.0);
+    for i := 0 to ParOut.Size - 1 do
+      AssertTrue('Cold parallel B must be BIT-IDENTICAL to serial B at ' +
+        IntToStr(i), ParOut.Raw[i] = NN.GetLastLayer().Output.Raw[i]);
+  finally
+    InA.Free;
+    InB.Free;
+    ParOut.Free;
+    NN.Free;
+  end;
+end;
+
+// Low-memory convolutions now chunk: ChunkEligible no longer excludes
+// ActiveLowMemory, and ComputeRange has a per-neuron ranged branch (the
+// concatenated-weight caches are released in low-memory mode). A cold parallel
+// low-memory pass must equal the low-memory SERIAL reference (ComputeLowMemoryCPU)
+// bit-for-bit. Coded by Claude (AI).
+procedure TTestNeuralLayers.TestConvolutionLowMemoryChunkParity;
+var
+  NN: TNNet;
+  InA, InB, ParOut: TNNetVolume;
+  Branch1, Branch2, Branch3: TNNetLayer;
+  i: integer;
+begin
+  BuildConvParityNet(NN, Branch1, Branch2, Branch3);
+  InA := TNNetVolume.Create(16, 16, 8);
+  InB := TNNetVolume.Create(16, 16, 8);
+  ParOut := TNNetVolume.Create();
+  try
+    for i := 0 to InA.Size - 1 do InA.Raw[i] := Sin(i * 0.05) - 0.3;
+    for i := 0 to InB.Size - 1 do InB.Raw[i] := Cos(i * 0.037) + 0.2;
+
+    NN.EnableIntraLayerThreading(true);
+    NN.SchedulerMinGain := 0;
+    NN.SetTrainable(False, {pLowMemory=}True);
+    AssertTrue('Low-memory spatial conv must be chunk-eligible',
+      Branch1.ChunkEligible());
+    AssertTrue('Low-memory pointwise conv must be chunk-eligible',
+      Branch3.ChunkEligible());
+
+    // Cold parallel low-memory: warm with A, then compute B.
+    NN.Compute(InA, 0, True);
+    NN.Compute(InB, 0, True);
+    ParOut.Copy(NN.GetLastLayer().Output);
+    // Low-memory serial reference for B (per-neuron ComputeLowMemoryCPU).
+    NN.Compute(InB, 0, False);
+    AssertEquals('Output size matches', NN.GetLastLayer().Output.Size, ParOut.Size);
+    AssertTrue('Reference output is non-trivial',
+      NN.GetLastLayer().Output.GetSumAbs() > 0.0);
+    for i := 0 to ParOut.Size - 1 do
+      AssertTrue('Low-memory parallel B must be BIT-IDENTICAL to serial B at ' +
+        IntToStr(i), ParOut.Raw[i] = NN.GetLastLayer().Output.Raw[i]);
+  finally
+    InA.Free;
+    InB.Free;
+    ParOut.Free;
     NN.Free;
   end;
 end;
