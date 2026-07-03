@@ -155,12 +155,13 @@ end;
 // Bit-identical serial-vs-threaded A/B for the opt-in single-sample
 // TNNetFullConnect forward (the EnCodec-conv-style forced-thread checksum, but
 // here it must be EXACTLY equal: only independent output neurons are
-// partitioned, the per-neuron reduction order is unchanged). Forces the
-// threaded path with NN.SetIntraLayerThreadingMinWork(0) on a layer well
-// above any sane work threshold, for both the activation
-// (TNNetFullConnect/ReLU) and the activation-free (TNNetFullConnectLinear)
-// variants. Threading state is per-net (TNNetExecutionPlanner), so it dies
-// with each RunCase net - no global restore needed.
+// partitioned, the per-neuron reduction order is unchanged). The layer is
+// sized (1024 input x 1024 neurons = 1M work proxy) to clear the fixed
+// chunk-eligibility crossover so EnableIntraLayerThreading alone engages the
+// threaded path, for both the activation (TNNetFullConnect/ReLU) and the
+// activation-free (TNNetFullConnectLinear) variants. Threading state is
+// per-net (TNNetExecutionPlanner), so it dies with each RunCase net - no
+// global restore needed.
 procedure TTestNeuralLayers.TestFullConnectThreadingParity;
 var
   Input: TNNetVolume;
@@ -175,11 +176,11 @@ var
   begin
     NN := TNNet.Create();
     try
-      NN.AddLayer(TNNetInput.Create(256));
+      NN.AddLayer(TNNetInput.Create(1024));
       if IsLinear then
-        Layer := TNNetFullConnectLinear.Create(384)
+        Layer := TNNetFullConnectLinear.Create(1024)
       else
-        Layer := TNNetFullConnectReLU.Create(384);
+        Layer := TNNetFullConnectReLU.Create(1024);
       NN.AddLayer(Layer);
       // Deterministic, reproducible weights (independent of the threading flag).
       for neuron := 0 to Layer.Neurons.Count - 1 do
@@ -189,13 +190,9 @@ var
             Sin(neuron * 0.013 + w * 0.0007) * 0.1;
         Layer.Neurons[neuron].BiasWeight := Cos(neuron * 0.021) * 0.05;
       end;
-      if Threaded then
-      begin
-        NN.EnableIntraLayerThreading(true);
-        NN.SetIntraLayerThreadingMinWork(0); // force the threaded path
-      end
-      else
-        NN.EnableIntraLayerThreading(false);
+      // The layer clears the fixed 1M crossover, so enabling threading is
+      // enough to engage the chunked path (no runtime threshold override).
+      NN.EnableIntraLayerThreading(Threaded);
       NN.Compute(Input);
       Dst.Copy(Layer.Output);
     finally
@@ -206,7 +203,7 @@ var
 var
   SerialLin, ThreadLin, SerialAct, ThreadAct: TNNetVolume;
 begin
-  Input := TNNetVolume.Create(256, 1, 1);
+  Input := TNNetVolume.Create(1024, 1, 1);
   SerialLin := TNNetVolume.Create();
   ThreadLin := TNNetVolume.Create();
   SerialAct := TNNetVolume.Create();
@@ -262,16 +259,19 @@ var
   FC: TNNetFullConnect;
 begin
   NN := TNNet.Create();
-  Input := TNNetVolume.Create(256, 1, 1);
+  Input := TNNetVolume.Create(2048, 1, 1);
   SerialOut := TNNetVolume.Create();
   try
-    InputLayer := NN.AddLayer(TNNetInput.Create(256));
+    InputLayer := NN.AddLayer(TNNetInput.Create(2048));
     // (1,1,depth)-shaped outputs: TNNetDeepConcat requires matching X/Y and
-    // concatenates on the depth axis.
+    // concatenates on the depth axis. Both branches are sized so their
+    // prevSize*outSize work proxy clears the fixed 1M chunk-eligibility
+    // crossover (2048*1024 and 2048*512), so EnableIntraLayerThreading alone
+    // makes them chunk-eligible.
     Branch1 := NN.AddLayerAfter(
-      TNNetFullConnectLinear.Create(1, 1, 384), InputLayer);
+      TNNetFullConnectLinear.Create(1, 1, 1024), InputLayer);
     Branch2 := NN.AddLayerAfter(
-      TNNetFullConnectReLU.Create(1, 1, 96), InputLayer);
+      TNNetFullConnectReLU.Create(1, 1, 512), InputLayer);
     NN.AddLayer(TNNetDeepConcat.Create([Branch1, Branch2]));
     // Deterministic weights on both branches.
     for LayerCnt := 0 to NN.CountLayers() - 1 do
@@ -293,7 +293,6 @@ begin
       Input.Raw[i] := Sin(i * 0.05) - 0.3;
 
     NN.EnableIntraLayerThreading(true);
-    NN.SetIntraLayerThreadingMinWork(0); // force chunk-eligibility on both branches
     // ChunkEligible is the static verdict; WillThread is parallel-pass-only
     // (False here, outside a pass) - see TNNetLayerThreading.
     AssertTrue('Branch1 must be chunk-eligible', Branch1.ChunkEligible());
@@ -345,10 +344,13 @@ var
   i, pass, LayerCnt, neuron, w: integer;
 begin
   NN := TNNet.Create();
-  Input := TNNetVolume.Create(8, 8, 8);
+  // 16x16x8 input: each branch's prevSize*outSize work proxy (2048 * >=6144)
+  // clears the fixed 1M chunk-eligibility crossover. Depth stays 8 so Branch1
+  // keeps VectorSize 72 <= csMaxInterleavedSize and takes the interleaved kernel.
+  Input := TNNetVolume.Create(16, 16, 8);
   SerialOut := TNNetVolume.Create();
   try
-    InputLayer := NN.AddLayer(TNNetInput.Create(8, 8, 8));
+    InputLayer := NN.AddLayer(TNNetInput.Create(16, 16, 8));
     Branch1 := NN.AddLayerAfter(
       TNNetConvolutionReLU.Create(32, 3, 1, 1), InputLayer);
     Branch2 := NN.AddLayerAfter(
@@ -377,7 +379,6 @@ begin
       Input.Raw[i] := Sin(i * 0.05) - 0.3;
 
     NN.EnableIntraLayerThreading(true);
-    NN.SetIntraLayerThreadingMinWork(0); // force chunk-eligibility on all branches
     // ChunkEligible is the static verdict; WillThread is parallel-pass-only.
     AssertTrue('Branch1 must be chunk-eligible', Branch1.ChunkEligible());
     AssertTrue('Branch2 must be chunk-eligible', Branch2.ChunkEligible());
