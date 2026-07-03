@@ -135,6 +135,8 @@ type
     NoCacheReuse: boolean;       // force full re-prefill every turn (A/B + debug)
     Serial: boolean;             // serial layer loop; default is the parallel
                                  // layer-graph scheduler (ComputeParallel)
+    IntraLayerThreading: boolean; // split big conv/linear layers across the
+                                  // thread pool (off by default)
     Gpu: boolean;                // offload conv/linear matmuls via OpenCL
     GpuPlatform: integer;        // OpenCL platform index (default 0)
     GpuDevice: integer;          // OpenCL device index within the platform (0)
@@ -181,6 +183,8 @@ begin
   WriteLn('                        reuse the shared KV-cache prefix from last turn)');
   WriteLn('  --serial              serial layer loop (default: layer-graph parallel');
   WriteLn('                        forward pass across independent layers)');
+  WriteLn('  --intra-layer-threading  split large conv/linear layers across the');
+  WriteLn('                        thread pool (default: off)');
   WriteLn('  --selftest            run the offline unit checks and exit');
   WriteLn('  --help                this text');
   WriteLn;
@@ -211,6 +215,7 @@ begin
   Result.Profile := false;
   Result.NoCacheReuse := false;
   Result.Serial := false; // parallel layer-graph forward by default (--serial)
+  Result.IntraLayerThreading := false; // opt-in via --intra-layer-threading
   // OpenCL offload defaults ON when the binary is built with -dOpenCL (the
   // default compilation), OFF otherwise; --cpu forces CPU either way.
   Result.Gpu := {$IFDEF OpenCL}true{$ELSE}false{$ENDIF};
@@ -286,6 +291,7 @@ begin
     else if Arg = '--profile' then Opt.Profile := true
     else if Arg = '--no-cache-reuse' then Opt.NoCacheReuse := true
     else if Arg = '--serial' then Opt.Serial := true
+    else if Arg = '--intra-layer-threading' then Opt.IntraLayerThreading := true
     else if Arg = '--gpu' then Opt.Gpu := true
     else if Arg = '--cpu' then Opt.Gpu := false
     else if Arg = '--gpu-platform' then
@@ -845,6 +851,17 @@ begin
     Args.Add('--serial');
     Check(ParseArgs(Args, Opt) and Opt.Serial, '--serial parses');
 
+    // Intra-layer threading is off by default; --intra-layer-threading opts in.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and not Opt.IntraLayerThreading,
+      'intra-layer threading off by default');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--intra-layer-threading');
+    Check(ParseArgs(Args, Opt) and Opt.IntraLayerThreading,
+      '--intra-layer-threading parses');
+
     // KV-cache reuse is on by default; --no-cache-reuse disables it.
     Args.Clear;
     Args.Add('/tmp/model');
@@ -1120,6 +1137,11 @@ begin
   // step (e.g. an MHA block's sibling heads) run across cores. --serial keeps
   // the classic in-order layer loop.
   Session.Parallel := not Opt.Serial;
+  // --intra-layer-threading: additionally split each big conv/linear layer's
+  // own work across the thread pool (WillThread layers above the MinWork
+  // threshold). Works on both the serial and the parallel path (parallel
+  // routes WillThread layers to worker 0, which drives the pool).
+  if Opt.IntraLayerThreading then NN.EnableIntraLayerThreading();
   // KV-cache reuse across turns needs position-truncatable attention K/V and no
   // recurrent (SSM) state to rewind. Pure-attention nets qualify; --no-cache-
   // reuse forces the full re-prefill at the call site.
@@ -1144,6 +1166,9 @@ begin
   else
     WriteLn('[layer-graph parallel forward (default) - pass --serial for the',
       ' serial layer loop]');
+  if Opt.IntraLayerThreading then
+    WriteLn('[intra-layer threading ON (--intra-layer-threading) - large',
+      ' conv/linear layers split across the thread pool]');
 
   // Distribution pipeline (TGenerationConfig order: penalty -> temperature
   // -> sampler).
