@@ -194,6 +194,32 @@ begin
   Result := NN;
 end;
 
+// Per-layer chunk report for a net that has just run a parallel pass. The
+// scheduler splits a chunk-eligible layer into clamp(WorkerCount, 1, WorkCount)
+// slices (see SchedEnqueueReady); a non-eligible layer runs as one whole-layer
+// item. WorkCount is the ComputeRange index space (FullConnect: output neurons;
+// Convolution: output positions), so this exposes the seq=1 pointwise case
+// where positions=1 forces a single chunk and no intra-layer parallelism.
+procedure DumpChunks(NN: TNNet);
+var
+  li, workers, work, chunks: integer;
+  L: TNNetLayer;
+begin
+  workers := NN.SchedulerWorkerCount();
+  WriteLn(Format('      per-layer chunks (workers=%d):', [workers]));
+  for li := 0 to NN.CountLayers - 1 do
+  begin
+    L := NN.Layers[li];
+    work := L.ChunkWorkCount();
+    if L.ChunkEligible() then
+      chunks := Max(1, Min(workers, work))  // matches SchedEnqueueReady
+    else
+      chunks := 0;                          // 0 => whole-layer, not chunked
+    WriteLn(Format('        [%2d] %-26s work=%-7d chunks=%d',
+      [li, L.ClassName, work, chunks]));
+  end;
+end;
+
 procedure SweepNet(const Tag: string; dModel, dHidden, nBlocks, seqLen: integer);
 var
   MyIn: TNNetVolume; NN: TNNet; off, on_: double;
@@ -205,11 +231,16 @@ begin
   NN.Free;
 
   NN := BuildStack(dModel, dHidden, nBlocks, seqLen, true);
+  NN.ResetSchedulerStats();  // clean per-net pass/worker counts
   on_ := BestTimeMs(NN, MyIn, {parallel=}true);
-  NN.Free;
 
   WriteLn(Format('  %-16s dM=%-5d dH=%-5d blk=%d seq=%-3d  off=%8.3f  on=%8.3f  %6.2fx',
     [Tag, dModel, dHidden, nBlocks, seqLen, off, on_, off / on_]));
+  // Proof the parallel path actually ran (passes: P parallel / S serial); if
+  // this shows 0 parallel the ON timing measured the serial fallback.
+  WriteLn('      ', NN.SchedulerStatsReport());
+  DumpChunks(NN);
+  NN.Free;
   MyIn.Free;
 end;
 
