@@ -305,12 +305,15 @@ begin
     SerialOut.Copy(NN.GetLastLayer().Output);
     AssertTrue('Reference output is non-trivial', SerialOut.GetSumAbs() > 0.0);
 
-    // Inference: parallel scheduler passes with worker-0-routed WillThread
-    // layers must stay bit-identical, pass after pass.
+    // Inference: parallel scheduler passes (Parallel=True) split each
+    // chunk-eligible FullConnect branch into wkChunk work items computed via
+    // ComputeRange. FullConnect uses scalar per-neuron activation, so the
+    // chunked result stays BIT-IDENTICAL to the single-threaded serial
+    // reference, pass after pass.
     NN.SetTrainable(False);
     for pass := 1 to 20 do
     begin
-      NN.Compute(Input);
+      NN.Compute(Input, 0, True);
       AssertEquals('Output size matches at pass ' + IntToStr(pass),
         SerialOut.Size, NN.GetLastLayer().Output.Size);
       for i := 0 to SerialOut.Size - 1 do
@@ -385,13 +388,15 @@ begin
     SerialOut.Copy(NN.GetLastLayer().Output);
     AssertTrue('Reference output is non-trivial', SerialOut.GetSumAbs() > 0.0);
 
-    // Inference: parallel scheduler passes with worker-0-routed WillThread
-    // layers running the threaded twins must stay bit-identical, pass after
-    // pass.
+    // Inference: parallel scheduler passes (Parallel=True) split each conv
+    // branch into per-output-position wkChunk items (both the interleaved and
+    // tiled twins). Branches use ReLU/Linear activations, which are
+    // slice-invariant, so the chunked result stays BIT-IDENTICAL to the
+    // single-threaded serial reference, pass after pass.
     NN.SetTrainable(False);
     for pass := 1 to 20 do
     begin
-      NN.Compute(Input);
+      NN.Compute(Input, 0, True);
       AssertEquals('Output size matches at pass ' + IntToStr(pass),
         SerialOut.Size, NN.GetLastLayer().Output.Size);
       for i := 0 to SerialOut.Size - 1 do
