@@ -293,11 +293,14 @@ begin
       Input.Raw[i] := Sin(i * 0.05) - 0.3;
 
     NN.EnableIntraLayerThreading(true);
-    NN.SetIntraLayerThreadingMinWork(0); // force WillThread on both branches
-    AssertTrue('Branch1 must report WillThread', Branch1.WillThread());
-    AssertTrue('Branch2 must report WillThread', Branch2.WillThread());
+    NN.SetIntraLayerThreadingMinWork(0); // force chunk-eligibility on both branches
+    // ChunkEligible is the static verdict; WillThread is parallel-pass-only
+    // (False here, outside a pass) - see TNNetLayerThreading.
+    AssertTrue('Branch1 must be chunk-eligible', Branch1.ChunkEligible());
+    AssertTrue('Branch2 must be chunk-eligible', Branch2.ChunkEligible());
 
-    // Reference: trainable -> serial loop (threaded ranges, no scheduler).
+    // Reference: trainable -> serial loop (single-threaded, no scheduler;
+    // WillThread is False outside a parallel pass).
     NN.Compute(Input);
     SerialOut.Copy(NN.GetLastLayer().Output);
     AssertTrue('Reference output is non-trivial', SerialOut.GetSumAbs() > 0.0);
@@ -371,10 +374,11 @@ begin
       Input.Raw[i] := Sin(i * 0.05) - 0.3;
 
     NN.EnableIntraLayerThreading(true);
-    NN.SetIntraLayerThreadingMinWork(0); // force WillThread on all branches
-    AssertTrue('Branch1 must report WillThread', Branch1.WillThread());
-    AssertTrue('Branch2 must report WillThread', Branch2.WillThread());
-    AssertTrue('Branch3 must report WillThread', Branch3.WillThread());
+    NN.SetIntraLayerThreadingMinWork(0); // force chunk-eligibility on all branches
+    // ChunkEligible is the static verdict; WillThread is parallel-pass-only.
+    AssertTrue('Branch1 must be chunk-eligible', Branch1.ChunkEligible());
+    AssertTrue('Branch2 must be chunk-eligible', Branch2.ChunkEligible());
+    AssertTrue('Branch3 must be chunk-eligible', Branch3.ChunkEligible());
 
     // Reference: trainable -> serial loop with the classic serial kernels.
     NN.Compute(Input);
