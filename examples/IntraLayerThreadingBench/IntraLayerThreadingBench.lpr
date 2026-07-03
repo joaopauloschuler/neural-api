@@ -33,8 +33,11 @@ const
   CROSSOVER = 1024*1024; // the hardcoded 1M work proxy under test
 
 // Warm up, then best-of-5 timing (ms per Compute). Best-of rejects scheduler
-// jitter / turbo wobble far better than an average on a noisy box.
-function BestTimeMs(NN: TNNet; MyIn: TNNetVolume): double;
+// jitter / turbo wobble far better than an average on a noisy box. Parallel
+// MUST be threaded through to Compute: EnableIntraLayerThreading only arms the
+// chunk path - Compute still runs serial unless Parallel=true is passed, so
+// timing the threaded case with the default (serial) overload measures nothing.
+function BestTimeMs(NN: TNNet; MyIn: TNNetVolume; Parallel: boolean): double;
 var
   r, i, iters: integer;
   StartT: TDateTime;
@@ -43,7 +46,7 @@ begin
   iters := 1;
   repeat
     StartT := Now();
-    for i := 1 to iters do NN.Compute(MyIn);
+    for i := 1 to iters do NN.Compute(MyIn, 0, Parallel);
     el := MilliSecondsBetween(Now(), StartT);
     if el >= 150 then break;
     if el < 1 then iters := iters * 8
@@ -54,7 +57,7 @@ begin
   for r := 0 to 4 do
   begin
     StartT := Now();
-    for i := 1 to iters do NN.Compute(MyIn);
+    for i := 1 to iters do NN.Compute(MyIn, 0, Parallel);
     el := MilliSecondsBetween(Now(), StartT) / iters;
     if el < best then best := el;
   end;
@@ -141,20 +144,23 @@ begin
 
     // Serial reference (threading off), then snapshot for the parity check.
     NN.EnableIntraLayerThreading(false);
-    NN.Compute(MyIn);
+    NN.Compute(MyIn, 0, {parallel=}false);
     OutSerial := TNNetVolume.Create(NN.GetLastLayer().Output);
-    Ts := BestTimeMs(NN, MyIn);
+    Ts := BestTimeMs(NN, MyIn, {parallel=}false);
 
-    // Same net, same weights, threading on: the hardcoded rule decides.
+    // Same net, same weights, threading on: arm the chunk path AND route
+    // Compute through the parallel scheduler (SetTrainable(False) is the
+    // inference-only contract the parallel pass expects).
+    NN.SetTrainable(False);
     NN.EnableIntraLayerThreading(true);
-    NN.Compute(MyIn,{parallel=}true);
+    NN.Compute(MyIn, 0, {parallel=}true);
     maxdiff := 0;
     for i := 0 to OutSerial.Size - 1 do
     begin
       d := Abs(OutSerial.FData[i] - NN.GetLastLayer().Output.FData[i]);
       if d > maxdiff then maxdiff := d;
     end;
-    Tt := BestTimeMs(NN, MyIn);
+    Tt := BestTimeMs(NN, MyIn, {parallel=}true);
 
     if Tt > 0 then sp := Ts / Tt else sp := 0;
     if proxy >= CROSSOVER then elig := 'yes' else elig := 'no';
@@ -183,6 +189,7 @@ begin
     NN.AddLayer(TNNetPointwiseConvLinear.Create(dModel));
   end;
   for b := 0 to NN.CountLayers - 1 do NN.Layers[b].InitDefault();
+  NN.SetTrainable(False);
   NN.EnableIntraLayerThreading(Threaded);
   Result := NN;
 end;
@@ -194,11 +201,11 @@ begin
   NN := BuildStack(dModel, dHidden, nBlocks, seqLen, false);
   MyIn := TNNetVolume.Create(NN.Layers[0].Output);
   MyIn.Randomize();
-  off := BestTimeMs(NN, MyIn);
+  off := BestTimeMs(NN, MyIn, {parallel=}false);
   NN.Free;
 
   NN := BuildStack(dModel, dHidden, nBlocks, seqLen, true);
-  on_ := BestTimeMs(NN, MyIn);
+  on_ := BestTimeMs(NN, MyIn, {parallel=}true);
   NN.Free;
 
   WriteLn(Format('  %-16s dM=%-5d dH=%-5d blk=%d seq=%-3d  off=%8.3f  on=%8.3f  %6.2fx',
