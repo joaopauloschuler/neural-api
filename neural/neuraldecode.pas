@@ -1111,6 +1111,7 @@ type
   TNNetStreamingDecoder = class(TObject)
   private
     FNet: TNNet;
+    FParallel: boolean;              // StepForward via TNNet.ComputeParallel
     FSDPAs: array of TNNetScaledDotProductAttention;
     FSSMs: array of TNNetDiagonalSSM;
     FRopes: array of TNNetRotaryEmbedding;
@@ -1200,6 +1201,10 @@ type
     // beam / best-of-N tasks) read instead of running an extra full forward.
     function HiddenState(): TNNetVolume;
     property Net: TNNet read FNet;
+    // When True, StepForward runs the forward through the layer-graph
+    // parallel scheduler (TNNet.ComputeParallel) instead of the serial layer
+    // loop. Default False (serial). Coded by Claude (AI).
+    property Parallel: boolean read FParallel write FParallel;
     property SDPACount: integer read GetSDPACount;
     property SSMCount: integer read GetSSMCount;
     property RopeCount: integer read GetRopeCount;
@@ -4948,6 +4953,7 @@ var
 begin
   inherited Create();
   FNet := pNet;
+  FParallel := false;
   SetLength(FSDPAs, 0);
   SetLength(FSSMs, 0);
   SetLength(FRopes, 0);
@@ -5036,7 +5042,7 @@ begin
   // step at absolute position p reads wpe[p] (and a width-K verify window
   // reads wpe[p..p+K-1]).
   for i := 0 to HiLearned do FLearnedPos[i].PositionOffset := AbsPos;
-  FNet.Compute(InV);
+  FNet.Compute(InV, {FromLayerIdx=}0, FParallel);
 end;
 
 procedure TNNetStreamingDecoder.TruncateTo(CommittedLen: integer);

@@ -133,6 +133,8 @@ type
                                  // each turn (decode steps only); for picking the
                                  // next layer class to optimize (e.g. OpenCL)
     NoCacheReuse: boolean;       // force full re-prefill every turn (A/B + debug)
+    Serial: boolean;             // serial layer loop; default is the parallel
+                                 // layer-graph scheduler (ComputeParallel)
     Gpu: boolean;                // offload conv/linear matmuls via OpenCL
     GpuPlatform: integer;        // OpenCL platform index (default 0)
     GpuDevice: integer;          // OpenCL device index within the platform (0)
@@ -177,6 +179,8 @@ begin
   WriteLn('                        width, parallel vs serial passes, peak in-flight)');
   WriteLn('  --no-cache-reuse      re-prefill the whole prompt each turn (default:');
   WriteLn('                        reuse the shared KV-cache prefix from last turn)');
+  WriteLn('  --serial              serial layer loop (default: layer-graph parallel');
+  WriteLn('                        forward pass across independent layers)');
   WriteLn('  --selftest            run the offline unit checks and exit');
   WriteLn('  --help                this text');
   WriteLn;
@@ -206,6 +210,7 @@ begin
   Result.Stats := false;
   Result.Profile := false;
   Result.NoCacheReuse := false;
+  Result.Serial := false; // parallel layer-graph forward by default (--serial)
   // OpenCL offload defaults ON when the binary is built with -dOpenCL (the
   // default compilation), OFF otherwise; --cpu forces CPU either way.
   Result.Gpu := {$IFDEF OpenCL}true{$ELSE}false{$ENDIF};
@@ -280,6 +285,7 @@ begin
     else if Arg = '--stats' then Opt.Stats := true
     else if Arg = '--profile' then Opt.Profile := true
     else if Arg = '--no-cache-reuse' then Opt.NoCacheReuse := true
+    else if Arg = '--serial' then Opt.Serial := true
     else if Arg = '--gpu' then Opt.Gpu := true
     else if Arg = '--cpu' then Opt.Gpu := false
     else if Arg = '--gpu-platform' then
@@ -829,6 +835,16 @@ begin
     Check(ParseArgs(Args, Opt) and (Opt.GpuPlatform = 1) and (Opt.GpuDevice = 2),
       '--gpu-platform/--gpu-device parse');
 
+    // Parallel layer-graph forward is the default; --serial opts out.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and not Opt.Serial,
+      'parallel forward on by default');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--serial');
+    Check(ParseArgs(Args, Opt) and Opt.Serial, '--serial parses');
+
     // KV-cache reuse is on by default; --no-cache-reuse disables it.
     Args.Clear;
     Args.Add('/tmp/model');
@@ -1100,6 +1116,10 @@ begin
   SeqLen := Opt.CtxLen;
   VocabSize := NN.GetLastLayer().Output.Depth;
   Session := TNNetStreamingDecoder.Create(NN, SeqLen);
+  // Layer-graph parallel forward by default: independent layers of one token
+  // step (e.g. an MHA block's sibling heads) run across cores. --serial keeps
+  // the classic in-order layer loop.
+  Session.Parallel := not Opt.Serial;
   // KV-cache reuse across turns needs position-truncatable attention K/V and no
   // recurrent (SSM) state to rewind. Pure-attention nets qualify; --no-cache-
   // reuse forces the full re-prefill at the call site.
@@ -1119,6 +1139,11 @@ begin
   else
     WriteLn('[KV-cache reuse N/A for this architecture (recurrent/SSM state)',
       ' - full re-prefill each turn]');
+  if Opt.Serial then
+    WriteLn('[serial layer loop (--serial)]')
+  else
+    WriteLn('[layer-graph parallel forward (default) - pass --serial for the',
+      ' serial layer loop]');
 
   // Distribution pipeline (TGenerationConfig order: penalty -> temperature
   // -> sampler).
