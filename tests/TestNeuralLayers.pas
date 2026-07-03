@@ -244,7 +244,7 @@ begin
 end;
 
 // Exercises WillThread layers INSIDE a parallel inference pass: a branching
-// net (width 2) so ComputeForInference engages the graph scheduler, with
+// net (width 2) so ComputeParallel engages the graph scheduler, with
 // intra-layer threading forced on (min-work 0), so both FullConnect branches
 // report WillThread=True and are routed through the single-consumer worker-0
 // queue - the only safeguard serializing StartProc on the net's shared

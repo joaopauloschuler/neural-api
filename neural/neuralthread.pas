@@ -124,7 +124,7 @@ type
   procedure CreateNeuralThreadListIfRequired();
   function NeuralDefaultThreadCount: integer;
   // Portable interlocked helpers for the layer-graph inference scheduler
-  // (TNNet.ComputeForInference): claim/publish per-layer compute states and
+  // (TNNet.ComputeParallel): claim/publish per-layer compute states and
   // count remaining layers across worker threads. All are full memory
   // barriers, so a value published with NeuralAtomicExchange is observed -
   // together with everything written before it - by a NeuralAtomicRead on
