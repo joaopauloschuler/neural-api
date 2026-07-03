@@ -109,10 +109,12 @@ var
   si, i: integer;
   S: TShape;
   NN: TNNet;
+  L: TNNetLayer;
   MyIn, OutSerial: TNNetVolume;
   proxy: int64;
   Ts, Tt, sp, maxdiff, d: double;
   elig: string;
+  workers, chunks: integer;
 begin
   AddA('FC 256x256',        0, 256,  256,  0, 0);
   AddA('FC 512x512',        0, 512,  512,  0, 0);
@@ -131,9 +133,9 @@ begin
 
   WriteLn('=== Experiment A: per-layer  threading OFF vs ON  (1M crossover) ===');
   WriteLn('Cores (NeuralDefaultThreadCount) = ', NeuralDefaultThreadCount());
-  WriteLn(Format('%-20s %13s %8s %9s %9s %8s %9s',
-    ['shape', 'proxy', '>=1M?', 'off ms', 'on ms', 'speedup', 'maxdiff']));
-  WriteLn(StringOfChar('-', 82));
+  WriteLn(Format('%-20s %13s %6s %9s %9s %8s %7s %9s',
+    ['shape', 'proxy', '>=1M?', 'off ms', 'on ms', 'speedup', 'chunks', 'maxdiff']));
+  WriteLn(StringOfChar('-', 90));
   for si := 0 to High(ShA) do
   begin
     S := ShA[si];
@@ -150,8 +152,11 @@ begin
 
     // Same net, same weights, threading on: arm the chunk path AND route
     // Compute through the parallel scheduler (SetTrainable(False) is the
-    // inference-only contract the parallel pass expects).
-    NN.SetTrainable(False);
+    // inference-only contract the parallel pass expects). pLowMemory=False:
+    // the default True sets FLowMemory, which TNNetConvolution.ChunkEligible
+    // excludes via (not ActiveLowMemory()) - so conv/pointwise would never
+    // chunk. Keep low memory off here to actually exercise conv chunking.
+    NN.SetTrainable(False, {pLowMemory=}False);
     NN.EnableIntraLayerThreading(true);
     NN.Compute(MyIn, 0, {parallel=}true);
     maxdiff := 0;
@@ -160,12 +165,26 @@ begin
       d := Abs(OutSerial.FData[i] - NN.GetLastLayer().Output.FData[i]);
       if d > maxdiff then maxdiff := d;
     end;
+    NN.ResetSchedulerStats();  // count only this shape's parallel timing passes
     Tt := BestTimeMs(NN, MyIn, {parallel=}true);
+
+    // Chunks the scheduler emitted for the single compute layer:
+    // clamp(workers, 1, ChunkWorkCount) when eligible, else 0 (whole-layer).
+    // 0 means the layer stayed below the 1M proxy (or is otherwise not
+    // ChunkEligible); eligible layers show min(workers, work).
+    L := NN.GetLastLayer();
+    workers := NN.SchedulerWorkerCount();
+    if L.ChunkEligible() then
+      chunks := Max(1, Min(workers, L.ChunkWorkCount()))
+    else
+      chunks := 0;
 
     if Tt > 0 then sp := Ts / Tt else sp := 0;
     if proxy >= CROSSOVER then elig := 'yes' else elig := 'no';
-    WriteLn(Format('%-20s %13d %8s %9.3f %9.3f %7.2fx %9.2g',
-      [S.Name, proxy, elig, Ts, Tt, sp, maxdiff]));
+    WriteLn(Format('%-20s %13d %6s %9.3f %9.3f %7.2fx %7d %9.2g',
+      [S.Name, proxy, elig, Ts, Tt, sp, chunks, maxdiff]));
+    // Parallel/serial pass counts for this shape's timed run (passes: P/S).
+    WriteLn('      ', NN.SchedulerStatsReport());
 
     OutSerial.Free;
     MyIn.Free;
@@ -189,9 +208,38 @@ begin
     NN.AddLayer(TNNetPointwiseConvLinear.Create(dModel));
   end;
   for b := 0 to NN.CountLayers - 1 do NN.Layers[b].InitDefault();
-  NN.SetTrainable(False);
+  // pLowMemory=False: default True sets FLowMemory, which disqualifies
+  // conv/pointwise from chunking (TNNetConvolution.ChunkEligible excludes
+  // ActiveLowMemory). Off here so intra-layer chunking actually engages.
+  NN.SetTrainable(False, {pLowMemory=}False);
   NN.EnableIntraLayerThreading(Threaded);
   Result := NN;
+end;
+
+// Per-layer chunk report for a net that has just run a parallel pass. The
+// scheduler splits a chunk-eligible layer into clamp(WorkerCount, 1, WorkCount)
+// slices (see SchedEnqueueReady); a non-eligible layer runs as one whole-layer
+// item. WorkCount is the ComputeRange index space (FullConnect: output neurons;
+// Convolution: output positions), so this exposes the seq=1 pointwise case
+// where positions=1 forces a single chunk and no intra-layer parallelism.
+procedure DumpChunks(NN: TNNet);
+var
+  li, workers, work, chunks: integer;
+  L: TNNetLayer;
+begin
+  workers := NN.SchedulerWorkerCount();
+  WriteLn(Format('      per-layer chunks (workers=%d):', [workers]));
+  for li := 0 to NN.CountLayers - 1 do
+  begin
+    L := NN.Layers[li];
+    work := L.ChunkWorkCount();
+    if L.ChunkEligible() then
+      chunks := Max(1, Min(workers, work))  // matches SchedEnqueueReady
+    else
+      chunks := 0;                          // 0 => whole-layer, not chunked
+    WriteLn(Format('        [%2d] %-26s work=%-7d chunks=%d',
+      [li, L.ClassName, work, chunks]));
+  end;
 end;
 
 procedure SweepNet(const Tag: string; dModel, dHidden, nBlocks, seqLen: integer);
@@ -205,11 +253,16 @@ begin
   NN.Free;
 
   NN := BuildStack(dModel, dHidden, nBlocks, seqLen, true);
+  NN.ResetSchedulerStats();  // clean per-net pass/worker counts
   on_ := BestTimeMs(NN, MyIn, {parallel=}true);
-  NN.Free;
 
   WriteLn(Format('  %-16s dM=%-5d dH=%-5d blk=%d seq=%-3d  off=%8.3f  on=%8.3f  %6.2fx',
     [Tag, dModel, dHidden, nBlocks, seqLen, off, on_, off / on_]));
+  // Proof the parallel path actually ran (passes: P parallel / S serial); if
+  // this shows 0 parallel the ON timing measured the serial fallback.
+  WriteLn('      ', NN.SchedulerStatsReport());
+  DumpChunks(NN);
+  NN.Free;
   MyIn.Free;
 end;
 
