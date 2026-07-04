@@ -154,23 +154,26 @@ begin
   end;
 end;
 
-// Bit-identical serial-vs-threaded A/B for the opt-in single-sample
-// TNNetFullConnect forward (the EnCodec-conv-style forced-thread checksum, but
-// here it must be EXACTLY equal: only independent output neurons are
+// Bit-identical serial-vs-threaded A/B for the single-sample TNNetFullConnect
+// forward (here it must be EXACTLY equal: only independent output neurons are
 // partitioned, the per-neuron reduction order is unchanged). The layer is
 // sized (1024 input x 1024 neurons = 1M work proxy) to clear the fixed
-// chunk-eligibility crossover so EnableIntraLayerThreading alone engages the
-// threaded path, for both the activation (TNNetFullConnect/ReLU) and the
-// activation-free (TNNetFullConnectLinear) variants. Threading state is
-// per-net (TNNetExecutionPlanner), so it dies with each RunCase net - no
-// global restore needed.
+// chunk-eligibility crossover. Intra-layer threading is now driven by the
+// compute path, not a standalone flag: the serial reference runs ComputeCPU
+// (ComputeSerial disables threading), and the threaded case runs an
+// inference-only parallel pass (SetTrainable(False) + Compute(...,True)), where
+// ComputeParallel enables intra-layer threading and the scheduler splits the FC
+// into ComputeRange chunks. Covered for both the activation
+// (TNNetFullConnect/ReLU) and activation-free (TNNetFullConnectLinear) variants.
+// Threading state is per-net (TNNetExecutionPlanner), so it dies with each
+// RunCase net - no global restore needed.
 procedure TTestNeuralLayers.TestFullConnectThreadingParity;
 var
   Input: TNNetVolume;
   i: integer;
 
   // Build a fresh single-FC net, set deterministic weights, compute, copy out.
-  procedure RunCase(IsLinear: boolean; Threaded: boolean; Dst: TNNetVolume);
+  procedure RunCase(IsLinear: boolean; Parallel: boolean; Dst: TNNetVolume);
   var
     NN: TNNet;
     Layer: TNNetFullConnect;
@@ -184,7 +187,7 @@ var
       else
         Layer := TNNetFullConnectReLU.Create(1024);
       NN.AddLayer(Layer);
-      // Deterministic, reproducible weights (independent of the threading flag).
+      // Deterministic, reproducible weights (independent of the compute path).
       for neuron := 0 to Layer.Neurons.Count - 1 do
       begin
         for w := 0 to Layer.Neurons[neuron].Weights.Size - 1 do
@@ -192,10 +195,17 @@ var
             Sin(neuron * 0.013 + w * 0.0007) * 0.1;
         Layer.Neurons[neuron].BiasWeight := Cos(neuron * 0.021) * 0.05;
       end;
-      // The layer clears the fixed 1M crossover, so enabling threading is
-      // enough to engage the chunked path (no runtime threshold override).
-      NN.EnableIntraLayerThreading(Threaded);
-      NN.Compute(Input);
+      if Parallel then
+      begin
+        // Inference-only parallel pass: ComputeParallel enables intra-layer
+        // threading and the FC clears the 1M crossover, so the scheduler splits
+        // it into ComputeRange chunks. MinGain 0 forces the parallel branch.
+        NN.SetTrainable(False);
+        NN.SchedulerMinGain := 0;
+        NN.Compute(Input, 0, True);
+      end
+      else
+        NN.Compute(Input); // serial ComputeCPU reference
       Dst.Copy(Layer.Output);
     finally
       NN.Free;
@@ -214,10 +224,10 @@ begin
     for i := 0 to Input.Size - 1 do
       Input.Raw[i] := Sin(i * 0.05) - 0.3;
 
-    RunCase({IsLinear=}true,  {Threaded=}false, SerialLin);
-    RunCase({IsLinear=}true,  {Threaded=}true,  ThreadLin);
-    RunCase({IsLinear=}false, {Threaded=}false, SerialAct);
-    RunCase({IsLinear=}false, {Threaded=}true,  ThreadAct);
+    RunCase({IsLinear=}true,  {Parallel=}false, SerialLin);
+    RunCase({IsLinear=}true,  {Parallel=}true,  ThreadLin);
+    RunCase({IsLinear=}false, {Parallel=}false, SerialAct);
+    RunCase({IsLinear=}false, {Parallel=}true,  ThreadAct);
 
     AssertEquals('Linear output sizes match', SerialLin.Size, ThreadLin.Size);
     for i := 0 to SerialLin.Size - 1 do

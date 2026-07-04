@@ -34,9 +34,10 @@ const
 
 // Warm up, then best-of-5 timing (ms per Compute). Best-of rejects scheduler
 // jitter / turbo wobble far better than an average on a noisy box. Parallel
-// MUST be threaded through to Compute: EnableIntraLayerThreading only arms the
-// chunk path - Compute still runs serial unless Parallel=true is passed, so
-// timing the threaded case with the default (serial) overload measures nothing.
+// MUST be threaded through to Compute: the compute path itself drives the chunk
+// path now (ComputeParallel enables intra-layer threading, ComputeSerial
+// disables it), so timing the threaded case with the default (serial) overload
+// measures the serial path and nothing threaded.
 function BestTimeMs(NN: TNNet; MyIn: TNNetVolume; Parallel: boolean): double;
 var
   r, i, iters: integer;
@@ -144,20 +145,20 @@ begin
     MyIn.Randomize();
     proxy := WorkProxy(NN);
 
-    // Serial reference (threading off), then snapshot for the parity check.
-    NN.EnableIntraLayerThreading(false);
+    // Serial reference: Compute serial disables intra-layer threading on its
+    // own. Snapshot the output for the parity check below.
     NN.Compute(MyIn, 0, {parallel=}false);
     OutSerial := TNNetVolume.Create(NN.GetLastLayer().Output);
     Ts := BestTimeMs(NN, MyIn, {parallel=}false);
 
-    // Same net, same weights, threading on: arm the chunk path AND route
-    // Compute through the parallel scheduler (SetTrainable(False) is the
-    // inference-only contract the parallel pass expects). pLowMemory=False:
-    // the default True sets FLowMemory, which TNNetConvolution.ChunkEligible
-    // excludes via (not ActiveLowMemory()) - so conv/pointwise would never
-    // chunk. Keep low memory off here to actually exercise conv chunking.
+    // Same net, same weights, threading on: routing Compute through the
+    // parallel scheduler enables intra-layer threading on its own
+    // (SetTrainable(False) is the inference-only contract the parallel pass
+    // expects). pLowMemory=False: the default True sets FLowMemory, which
+    // TNNetConvolution.ChunkEligible excludes via (not ActiveLowMemory()) - so
+    // conv/pointwise would never chunk. Keep low memory off here to actually
+    // exercise conv chunking.
     NN.SetTrainable(False, {pLowMemory=}False);
-    NN.EnableIntraLayerThreading(true);
     NN.Compute(MyIn, 0, {parallel=}true);
     maxdiff := 0;
     for i := 0 to OutSerial.Size - 1 do
@@ -196,8 +197,7 @@ end;
 // =============================== Experiment B =================================
 // Transformer-decoder-ish forward: a stack of per-token MLP blocks over a short
 // sequence - the shape where intra-layer threading is meant to pay off.
-function BuildStack(dModel, dHidden, nBlocks, seqLen: integer;
-  Threaded: boolean): TNNet;
+function BuildStack(dModel, dHidden, nBlocks, seqLen: integer): TNNet;
 var NN: TNNet; b: integer;
 begin
   NN := TNNet.Create();
@@ -212,7 +212,6 @@ begin
   // conv/pointwise from chunking (TNNetConvolution.ChunkEligible excludes
   // ActiveLowMemory). Off here so intra-layer chunking actually engages.
   NN.SetTrainable(False, {pLowMemory=}False);
-  NN.EnableIntraLayerThreading(Threaded);
   Result := NN;
 end;
 
@@ -246,13 +245,13 @@ procedure SweepNet(const Tag: string; dModel, dHidden, nBlocks, seqLen: integer)
 var
   MyIn: TNNetVolume; NN: TNNet; off, on_: double;
 begin
-  NN := BuildStack(dModel, dHidden, nBlocks, seqLen, false);
+  NN := BuildStack(dModel, dHidden, nBlocks, seqLen);
   MyIn := TNNetVolume.Create(NN.Layers[0].Output);
   MyIn.Randomize();
   off := BestTimeMs(NN, MyIn, {parallel=}false);
   NN.Free;
 
-  NN := BuildStack(dModel, dHidden, nBlocks, seqLen, true);
+  NN := BuildStack(dModel, dHidden, nBlocks, seqLen);
   NN.ResetSchedulerStats();  // clean per-net pass/worker counts
   on_ := BestTimeMs(NN, MyIn, {parallel=}true);
 

@@ -74,8 +74,7 @@ guard, flushed per token so piped output streams too).
 | `--stats` | per-turn timing to **stderr**: TTFT (prefill + first token), steady-state decode tok/s, and `prompt N (reused K)` from the KV-cache reuse | off |
 | `--profile` | per-layer-class forward timing to **stderr** after each turn (decode steps only — prefill is excluded), plus a `[sched]` line with the layer-graph scheduler stats (graph width, parallel vs serial passes, peak in-flight) | off |
 | `--no-cache-reuse` | re-prefill the whole prompt every turn instead of reusing the shared KV-cache prefix (A/B + debugging) | reuse on |
-| `--serial` | classic in-order serial layer loop instead of the layer-graph parallel forward (see below) | parallel on |
-| `--intra-layer-threading` | split each large conv/linear layer's own forward across the thread pool (see below) | off |
+| `--serial` | classic in-order serial layer loop, fully single-threaded, instead of the layer-graph parallel forward that also threads large conv/linear layers internally (see below) | parallel on |
 | `--selftest` | run the offline unit checks and exit | — |
 
 The model is always built with `pTrainable=false` (the REPL never
@@ -112,26 +111,28 @@ the cache is built so the kernel can run.
   pass `--cpu` to honor low-memory on CPU, or `--max-fast-memory` to keep the
   cache explicitly.
 
-**Parallel execution (CPU).** Two orthogonal, composable axes:
+**Parallel execution (CPU).** One switch, `--serial`, selects between two
+forward paths; each path drives *both* levels of parallelism together:
 
-- **Layer-graph parallelism** (the **default**; `--serial` opts out) runs each
-  token step through `TNNet.ComputeParallel`, the dependency-graph scheduler:
-  independent layers — e.g. the q/k/v projections off one RMSNorm, or an MHA
-  block's sibling attention heads — are computed concurrently by a worker
-  pool, while dependent layers still wait for their inputs. Output is
-  bit-identical to the serial loop (only the order *between independent
-  layers* changes). Straight-line graph regions and graphs whose parallel
-  gain cannot repay the scheduler overhead fall back to the serial loop
-  automatically; `--profile`'s `[sched]` line shows the parallel/serial pass
-  split actually achieved.
-- **Intra-layer threading** (`--intra-layer-threading`, off by default)
-  additionally splits each *large* conv/linear layer's own forward across the
-  thread pool (layers above the ~4M-MAC work threshold; smaller layers are
-  cheaper serial than the pool dispatch). This is the axis that helps on
-  multi-billion-parameter checkpoints whose big projections dominate; on
-  sub-1B models no layer crosses the threshold and the flag is a no-op. It
-  works on both paths: the serial loop dispatches the pool from the calling
-  thread, a parallel pass from worker 0.
+- **Parallel (the default; `--serial` opts out)** runs each token step through
+  `TNNet.ComputeParallel`, the dependency-graph scheduler: independent layers —
+  e.g. the q/k/v projections off one RMSNorm, or an MHA block's sibling
+  attention heads — are computed concurrently by a worker pool, while dependent
+  layers still wait for their inputs. The same path also turns on **intra-layer
+  threading**: each *large* conv/linear layer (above the ~4M-MAC work
+  threshold) additionally splits its own forward across the pool via worker 0;
+  smaller layers stay serial because the pool dispatch costs more than it saves.
+  Output is bit-identical to the serial loop (only the order *between
+  independent layers* changes, and the intra-layer range split preserves the
+  per-neuron reduction order). Straight-line graph regions and graphs whose
+  parallel gain cannot repay the scheduler overhead fall back to the serial
+  loop automatically; `--profile`'s `[sched]` line shows the parallel/serial
+  pass split actually achieved. Intra-layer threading is what helps on
+  multi-billion-parameter checkpoints whose big projections dominate; on sub-1B
+  models no layer crosses the threshold, so it costs nothing.
+- **Serial (`--serial`)** runs the classic in-order layer loop through
+  `TNNet.ComputeSerial`, fully single-threaded — both layer-graph parallelism
+  and intra-layer threading are off.
 
 Temperature and the penalties run through a
 `TNNetLogitsProcessorChain` in the `TGenerationConfig` pipeline order
