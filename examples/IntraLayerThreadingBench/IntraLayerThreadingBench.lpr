@@ -2,16 +2,22 @@ program IntraLayerThreadingBench;
 (*
 IntraLayerThreadingBench: validates the intra-layer threading decision.
 
-  * Experiment A sweeps single-layer FC / pointwise / conv shapes across the
-    crossover, reports whether each shape is eligible under the 1M rule, the
-    OFF-vs-ON speedup, and a bit-parity check (threaded output MUST equal
-    serial output - only independent outputs are partitioned).
+  * Experiment A sweeps single-layer FC / pointwise / conv shapes from tiny to
+    large, reports each shape's neuron count, whether it is eligible to chunk
+    (the real ChunkEligible() verdict), the OFF-vs-ON speedup, and a bit-parity
+    check (threaded output MUST equal serial output - only independent outputs
+    are partitioned). It is run twice, once with the low-memory inference
+    contract off and once on, since conv/pointwise chunk in both modes.
   * Experiment B times a few realistic multi-layer nets OFF vs ON end to end.
 
+ChunkEligible returns true for every size, so a parallel pass always chunks.
+Experiment A measures where that pays: the tiny shapes at the top of each block
+are the ones at risk of regressing (speedup < 1.00x) when the work is too small
+to repay scheduler/pool overhead, while the large shapes should scale toward the
+core count.
+
 A speedup > 1.00x means threading pays off at that size; <= 1.00x means the
-serial path (or a higher crossover) would be faster. Read the eligible column
-against the speedup to judge the 1M line: eligible shapes should show a gain,
-sub-threshold shapes should be ones threading would not have helped.
+serial path would have been faster on that shape.
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -29,15 +35,12 @@ uses {$IFDEF UNIX} cthreads, {$ENDIF}
   neuralvolume,
   neuralthread;
 
-const
-  CROSSOVER = 1024*1024; // the hardcoded 1M work proxy under test
-
 // Warm up, then best-of-5 timing (ms per Compute). Best-of rejects scheduler
 // jitter / turbo wobble far better than an average on a noisy box. Parallel
 // MUST be threaded through to Compute: the compute path itself drives the chunk
-// path now (ComputeParallel enables intra-layer threading, ComputeSerial
-// disables it), so timing the threaded case with the default (serial) overload
-// measures the serial path and nothing threaded.
+// path (ComputeParallel enables intra-layer threading, ComputeSerial disables
+// it), so timing the threaded case with the default (serial) overload measures
+// the serial path and nothing threaded.
 function BestTimeMs(NN: TNNet; MyIn: TNNetVolume; Parallel: boolean): double;
 var
   r, i, iters: integer;
@@ -105,18 +108,18 @@ begin
   Result := int64(NN.Layers[0].Output.Size) * NN.GetLastLayer().Output.Size;
 end;
 
-procedure ExperimentA;
-var
-  si, i: integer;
-  S: TShape;
-  NN: TNNet;
-  L: TNNetLayer;
-  MyIn, OutSerial: TNNetVolume;
-  proxy: int64;
-  Ts, Tt, sp, maxdiff, d: double;
-  elig: string;
-  workers, chunks: integer;
+// The Experiment A shape sweep. Each block goes small -> large across FC, PW
+// and Conv. Every shape chunks, so the small shapes are the probe: they show
+// whether threading regresses (speedup < 1x) on work too small to repay the
+// pool, while the large ones should scale toward core count. "Neurons" per
+// shape is the last layer's neuron count: FC -> output neurons (B), PW/Conv ->
+// features (C).
+procedure BuildShapesA;
 begin
+  SetLength(ShA, 0);
+  // FullConnect: input A -> B neurons.  neurons = B
+  AddA('FC 64x64',          0, 64,   64,   0, 0);
+  AddA('FC 128x128',        0, 128,  128,  0, 0);
   AddA('FC 256x256',        0, 256,  256,  0, 0);
   AddA('FC 512x512',        0, 512,  512,  0, 0);
   AddA('FC 768x768',        0, 768,  768,  0, 0);
@@ -126,17 +129,47 @@ begin
   AddA('FC 3072x3072',      0, 3072, 3072, 0, 0);
   AddA('FC 768x3072 up',    0, 768,  3072, 0, 0);
   AddA('FC 3072x768 dn',    0, 3072, 768,  0, 0);
+  // PointwiseConv: input AxAxB -> C features.  neurons = C
+  AddA('Pw 8x8x64->64',     2, 8,  64,  64,  0);
+  AddA('Pw 8x8x128->128',   2, 8,  128, 128, 0);
   AddA('Pw 32x32x256->256', 2, 32, 256, 256, 0);
   AddA('Pw 16x16x512->512', 2, 16, 512, 512, 0);
+  // Convolution: input AxAxB, C features, DxD kernel.  neurons = C
+  AddA('Conv 8x8x32 k3',    1, 8,  32,  32,  3);
+  AddA('Conv 8x8x64 k3',    1, 8,  64,  64,  3);
   AddA('Conv 16x16x64 k3',  1, 16, 64,  128, 3);
   AddA('Conv 32x32x64 k3',  1, 32, 64,  64,  3);
   AddA('Conv 8x8x256 k3',   1, 8,  256, 256, 3);
+end;
 
-  WriteLn('=== Experiment A: per-layer  threading OFF vs ON  (1M crossover) ===');
-  WriteLn('Cores (NeuralDefaultThreadCount) = ', NeuralDefaultThreadCount());
-  WriteLn(Format('%-20s %13s %6s %9s %9s %8s %7s %9s',
-    ['shape', 'proxy', '>=1M?', 'off ms', 'on ms', 'speedup', 'chunks', 'maxdiff']));
-  WriteLn(StringOfChar('-', 90));
+// One pass of the shape sweep for a given memory mode. LowMem toggles the
+// inference-time low-memory contract (SetTrainable(False, LowMem)).
+// Conv/pointwise chunk under BOTH modes, so running the sweep twice (LowMem
+// False then True) shows whether the mode shifts the eligible set, the chunk
+// counts or the speedup. FC is unaffected by the memory mode (no released
+// weight caches); under low memory conv/pointwise release the concatenated-
+// weight caches and take the per-neuron ranged path, so their timing can differ.
+procedure ExperimentA(LowMem: boolean);
+var
+  si, i: integer;
+  S: TShape;
+  NN: TNNet;
+  L: TNNetLayer;
+  MyIn, OutSerial: TNNetVolume;
+  proxy: int64;
+  Ts, Tt, sp, maxdiff, d: double;
+  elig, memtag: string;
+  workers, chunks, neurons: integer;
+begin
+  BuildShapesA;
+  if LowMem then memtag := 'low-memory ON' else memtag := 'low-memory OFF';
+  WriteLn('=== Experiment A: per-layer threading OFF vs ON  [', memtag, '] ===');
+  WriteLn('Cores (NeuralDefaultThreadCount) = ', NeuralDefaultThreadCount(),
+    '   every size is chunk-eligible');
+  WriteLn(Format('%-20s %8s %13s %6s %9s %9s %8s %7s %9s',
+    ['shape', 'neurons', 'proxy', 'elig?', 'off ms', 'on ms', 'speedup',
+     'chunks', 'maxdiff']));
+  WriteLn(StringOfChar('-', 100));
   for si := 0 to High(ShA) do
   begin
     S := ShA[si];
@@ -144,6 +177,7 @@ begin
     MyIn := TNNetVolume.Create(NN.Layers[0].Output);
     MyIn.Randomize();
     proxy := WorkProxy(NN);
+    neurons := NN.GetLastLayer().CountNeurons();
 
     // Serial reference: Compute serial disables intra-layer threading on its
     // own. Snapshot the output for the parity check below.
@@ -154,11 +188,9 @@ begin
     // Same net, same weights, threading on: routing Compute through the
     // parallel scheduler enables intra-layer threading on its own
     // (SetTrainable(False) is the inference-only contract the parallel pass
-    // expects). pLowMemory=False: the default True sets FLowMemory, which
-    // TNNetConvolution.ChunkEligible excludes via (not ActiveLowMemory()) - so
-    // conv/pointwise would never chunk. Keep low memory off here to actually
-    // exercise conv chunking.
-    NN.SetTrainable(False, {pLowMemory=}False);
+    // expects). LowMem is the mode under test this pass - conv/pointwise chunk
+    // in both modes, so the parity check must hold either way.
+    NN.SetTrainable(False, {pLowMemory=}LowMem);
     NN.Compute(MyIn, 0, {parallel=}true);
     maxdiff := 0;
     for i := 0 to OutSerial.Size - 1 do
@@ -171,19 +203,25 @@ begin
 
     // Chunks the scheduler emitted for the single compute layer:
     // clamp(workers, 1, ChunkWorkCount) when eligible, else 0 (whole-layer).
-    // 0 means the layer stayed below the 1M proxy (or is otherwise not
-    // ChunkEligible); eligible layers show min(workers, work).
+    // The elig column is the real ChunkEligible() verdict; eligible layers show
+    // min(workers, work), non-eligible layers (e.g. OpenCL / int8 / Winograd
+    // paths) show 0.
     L := NN.GetLastLayer();
     workers := NN.SchedulerWorkerCount();
     if L.ChunkEligible() then
-      chunks := Max(1, Min(workers, L.ChunkWorkCount()))
+    begin
+      elig := 'yes';
+      chunks := Max(1, Min(workers, L.ChunkWorkCount()));
+    end
     else
+    begin
+      elig := 'no';
       chunks := 0;
+    end;
 
     if Tt > 0 then sp := Ts / Tt else sp := 0;
-    if proxy >= CROSSOVER then elig := 'yes' else elig := 'no';
-    WriteLn(Format('%-20s %13d %6s %9.3f %9.3f %7.2fx %7d %9.2g',
-      [S.Name, proxy, elig, Ts, Tt, sp, chunks, maxdiff]));
+    WriteLn(Format('%-20s %8d %13d %6s %9.3f %9.3f %7.2fx %7d %9.2g',
+      [S.Name, neurons, proxy, elig, Ts, Tt, sp, chunks, maxdiff]));
     // Parallel/serial pass counts for this shape's timed run (passes: P/S).
     WriteLn('      ', NN.SchedulerStatsReport());
 
@@ -208,9 +246,10 @@ begin
     NN.AddLayer(TNNetPointwiseConvLinear.Create(dModel));
   end;
   for b := 0 to NN.CountLayers - 1 do NN.Layers[b].InitDefault();
-  // pLowMemory=False: default True sets FLowMemory, which disqualifies
-  // conv/pointwise from chunking (TNNetConvolution.ChunkEligible excludes
-  // ActiveLowMemory). Off here so intra-layer chunking actually engages.
+  // Inference contract for the parallel pass. pLowMemory=False keeps the
+  // concatenated-weight caches (the faster pointwise path); low memory also
+  // chunks but takes the slower per-neuron path, so it is left off here to time
+  // the fast case.
   NN.SetTrainable(False, {pLowMemory=}False);
   Result := NN;
 end;
@@ -267,7 +306,12 @@ end;
 
 begin
   Randomize;
-  ExperimentA;
+  // Experiment A is run twice: once with the low-memory inference contract off
+  // (concatenated-weight caches kept) and once with it on (caches released,
+  // per-neuron ranged path). Conv/pointwise chunk in both modes, so the two
+  // passes expose whether the memory mode shifts eligibility or timing.
+  ExperimentA({LowMem=}False);
+  ExperimentA({LowMem=}True);
   WriteLn('=== Experiment B: realistic nets  threading OFF vs ON (end-to-end) ===');
   SweepNet('small GPT MLP', 512,  2048, 6, 8);
   SweepNet('mid GPT MLP',   768,  3072, 6, 16);
