@@ -102,12 +102,6 @@ begin
   Result := NN;
 end;
 
-// The unified work proxy the eligibility rule compares against 1M.
-function WorkProxy(NN: TNNet): int64;
-begin
-  Result := int64(NN.Layers[0].Output.Size) * NN.GetLastLayer().Output.Size;
-end;
-
 // The Experiment A shape sweep. Each block goes small -> large across FC, PW
 // and Conv. Every shape chunks, so the small shapes are the probe: they show
 // whether threading regresses (speedup < 1x) on work too small to repay the
@@ -156,7 +150,6 @@ var
   NN: TNNet;
   L: TNNetLayer;
   MyIn, OutSerial: TNNetVolume;
-  proxy: int64;
   Ts, Tt, sp, maxdiff, d: double;
   elig, memtag: string;
   workers, chunks, neurons: integer;
@@ -166,17 +159,16 @@ begin
   WriteLn('=== Experiment A: per-layer threading OFF vs ON  [', memtag, '] ===');
   WriteLn('Cores (NeuralDefaultThreadCount) = ', NeuralDefaultThreadCount(),
     '   every size is chunk-eligible');
-  WriteLn(Format('%-20s %8s %13s %6s %9s %9s %8s %7s %9s',
-    ['shape', 'neurons', 'proxy', 'elig?', 'off ms', 'on ms', 'speedup',
+  WriteLn(Format('%-20s %8s %6s %9s %9s %8s %7s %9s',
+    ['shape', 'neurons', 'elig?', 'off ms', 'on ms', 'speedup',
      'chunks', 'maxdiff']));
-  WriteLn(StringOfChar('-', 100));
+  WriteLn(StringOfChar('-', 86));
   for si := 0 to High(ShA) do
   begin
     S := ShA[si];
     NN := BuildOne(S);
     MyIn := TNNetVolume.Create(NN.Layers[0].Output);
     MyIn.Randomize();
-    proxy := WorkProxy(NN);
     neurons := NN.GetLastLayer().CountNeurons();
 
     // Serial reference: Compute serial disables intra-layer threading on its
@@ -220,8 +212,8 @@ begin
     end;
 
     if Tt > 0 then sp := Ts / Tt else sp := 0;
-    WriteLn(Format('%-20s %8d %13d %6s %9.3f %9.3f %7.2fx %7d %9.2g',
-      [S.Name, neurons, proxy, elig, Ts, Tt, sp, chunks, maxdiff]));
+    WriteLn(Format('%-20s %8d %6s %9.3f %9.3f %7.2fx %7d %9.2g',
+      [S.Name, neurons, elig, Ts, Tt, sp, chunks, maxdiff]));
     // Parallel/serial pass counts for this shape's timed run (passes: P/S).
     WriteLn('      ', NN.SchedulerStatsReport());
 
