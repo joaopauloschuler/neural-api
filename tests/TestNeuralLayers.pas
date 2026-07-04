@@ -6,7 +6,7 @@ interface
 
 uses
   Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume,
-  pascoremath32;
+  neuralthread, pascoremath32;
 
 const
   // Maximum number of elements to check for NaN/Inf in large tensors.
@@ -22,6 +22,7 @@ type
     procedure TestConvolutionWillThreadParity;
     procedure TestConvolutionColdParallelParity;
     procedure TestConvolutionLowMemoryChunkParity;
+    procedure TestConvolutionDecodeNeuronChunkParity;
     procedure TestConvolutionForward;
     procedure TestWinogradConvolutionParity;
     procedure TestMaxPoolForward;
@@ -542,6 +543,75 @@ begin
       NN.GetLastLayer().Output.GetSumAbs() > 0.0);
     for i := 0 to ParOut.Size - 1 do
       AssertTrue('Low-memory parallel B must be BIT-IDENTICAL to serial B at ' +
+        IntToStr(i), ParOut.Raw[i] = NN.GetLastLayer().Output.Raw[i]);
+  finally
+    InA.Free;
+    InB.Free;
+    ParOut.Free;
+    NN.Free;
+  end;
+end;
+
+// Single-output-position ("decode-shaped") convolution: with only one spatial
+// position, position-chunking would emit a single chunk and thread nothing, so
+// a low-memory layer chunks over its output NEURONS instead (ChunkOverNeurons).
+// That neuron slice uses the same per-neuron DotProduct as the serial
+// ComputeLowMemoryCPU, so a cold parallel pass must equal the serial reference
+// bit-for-bit. This is the transformer single-token decode shape (pointwise
+// projections over a 1-token grid). Coded by Claude (AI).
+procedure TTestNeuralLayers.TestConvolutionDecodeNeuronChunkParity;
+var
+  NN: TNNet;
+  ConvLayer: TNNetLayer;
+  InA, InB, ParOut: TNNetVolume;
+  i, neuron, w: integer;
+begin
+  NN := TNNet.Create();
+  NN.AddLayer(TNNetInput.Create(1, 1, 64));
+  ConvLayer := NN.AddLayer(TNNetPointwiseConvLinear.Create(128));
+  // Deterministic non-trivial weights so parallel and serial share one net.
+  for neuron := 0 to ConvLayer.Neurons.Count - 1 do
+  begin
+    for w := 0 to ConvLayer.Neurons[neuron].Weights.Size - 1 do
+      ConvLayer.Neurons[neuron].Weights.Raw[w] :=
+        Sin(neuron * 0.017 + w * 0.0031) * 0.1;
+    ConvLayer.Neurons[neuron].BiasWeight := Cos(neuron * 0.019) * 0.05;
+  end;
+  ConvLayer.FlushWeightCache();
+
+  InA := TNNetVolume.Create(1, 1, 64);
+  InB := TNNetVolume.Create(1, 1, 64);
+  ParOut := TNNetVolume.Create();
+  try
+    for i := 0 to InA.Size - 1 do InA.Raw[i] := Sin(i * 0.05) - 0.3;
+    for i := 0 to InB.Size - 1 do InB.Raw[i] := Cos(i * 0.037) + 0.2;
+
+    NN.EnableIntraLayerThreading(true);
+    NN.SchedulerMinGain := 0; // force the parallel scheduler on every pass
+    NN.SetTrainable(False, {pLowMemory=}True);
+    // Neuron-axis chunking only engages when the pool has room (more than one
+    // worker); on a single-core box the layer stays serial and parity is
+    // trivial, so gate the "did it engage" asserts on the thread count.
+    if NeuralDefaultThreadCount() > 1 then
+    begin
+      AssertTrue('Decode-shaped low-memory conv chunks over neurons',
+        TNNetConvolution(ConvLayer).ChunkOverNeurons());
+      AssertEquals('Neuron-axis work count = neuron count',
+        ConvLayer.Neurons.Count, ConvLayer.ChunkWorkCount());
+    end;
+    AssertTrue('Must be chunk-eligible', ConvLayer.ChunkEligible());
+
+    // Cold parallel low-memory: warm with A, then compute B on the parallel path.
+    NN.Compute(InA, 0, True);
+    NN.Compute(InB, 0, True);
+    ParOut.Copy(NN.GetLastLayer().Output);
+    // Low-memory serial reference for B (per-neuron ComputeLowMemoryCPU).
+    NN.Compute(InB, 0, False);
+    AssertEquals('Output size matches', NN.GetLastLayer().Output.Size, ParOut.Size);
+    AssertTrue('Reference output is non-trivial',
+      NN.GetLastLayer().Output.GetSumAbs() > 0.0);
+    for i := 0 to ParOut.Size - 1 do
+      AssertTrue('Neuron-chunk parallel B must be BIT-IDENTICAL to serial B at ' +
         IntToStr(i), ParOut.Raw[i] = NN.GetLastLayer().Output.Raw[i]);
   finally
     InA.Free;
