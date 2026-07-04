@@ -58,11 +58,12 @@ guard, flushed per token so piped output streams too).
 | `--repetition-penalty X` | CTRL repetition penalty (`TNNetTokenHistoryPenalty`) | 1.0 (off) |
 | `--frequency-penalty X` | frequency penalty | 0 (off) |
 | `--presence-penalty X` | presence penalty | 0 (off) |
-| `--max-new-tokens N` | reply length cap | 128 |
+| `--max-new-tokens N` | reply length cap | 8192 |
 | `--seed N` | RNG seed (reproducible sampling) | randomize |
 | `--ctx N` | context window to build (`pSeqLen`) | model max |
 | `--format NAME` | `chatml`/`llama2`/`llama3`/`zephyr`/`gemma`/`phi3`/`mistral` override | autodetect |
 | `--system "msg"` | initial system prompt | none |
+| `--fp32` | full-precision fp32 weights — faster, more RAM | **on** |
 | `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — slower, less RAM. **Overridden by `--gpu`** (see below) | fp32 (faster, more RAM) |
 | `--low-memory` | drop each conv/linear layer's concatenated weight cache (`FConcatedWeights`) and compute per-neuron straight from the weights — less RAM, somewhat slower forward (`pLowMemory`). **Overridden by `--gpu`** (see below) | **on** |
 | `--max-fast-memory` | keep the concatenated weight cache for a faster forward at the cost of more RAM — required for GPU offload | off |
@@ -71,7 +72,9 @@ guard, flushed per token so piped output streams too).
 | `--gpu-platform N` | OpenCL platform index | 0 |
 | `--gpu-device N` | OpenCL device index within the platform | 0 |
 | `--stats` | per-turn timing to **stderr**: TTFT (prefill + first token), steady-state decode tok/s, and `prompt N (reused K)` from the KV-cache reuse | off |
+| `--profile` | per-layer-class forward timing to **stderr** after each turn (decode steps only — prefill is excluded), plus a `[sched]` line with the layer-graph scheduler stats (graph width, parallel vs serial passes, peak in-flight) | off |
 | `--no-cache-reuse` | re-prefill the whole prompt every turn instead of reusing the shared KV-cache prefix (A/B + debugging) | reuse on |
+| `--serial` | classic in-order serial layer loop, fully single-threaded, instead of the layer-graph parallel forward that also threads large conv/linear layers internally (see below) | parallel on |
 | `--selftest` | run the offline unit checks and exit | — |
 
 The model is always built with `pTrainable=false` (the REPL never
@@ -107,6 +110,29 @@ the cache is built so the kernel can run.
   `--low-memory` and `--gpu` default to on, the default GPU run keeps the cache;
   pass `--cpu` to honor low-memory on CPU, or `--max-fast-memory` to keep the
   cache explicitly.
+
+**Parallel execution (CPU).** One switch, `--serial`, selects between two
+forward paths; each path drives *both* levels of parallelism together:
+
+- **Parallel (the default; `--serial` opts out)** runs each token step through
+  `TNNet.ComputeParallel`, the dependency-graph scheduler: independent layers —
+  e.g. the q/k/v projections off one RMSNorm, or an MHA block's sibling
+  attention heads — are computed concurrently by a worker pool, while dependent
+  layers still wait for their inputs. The same path also turns on **intra-layer
+  threading**: each *large* conv/linear layer (above the ~4M-MAC work
+  threshold) additionally splits its own forward across the pool via worker 0;
+  smaller layers stay serial because the pool dispatch costs more than it saves.
+  Output is bit-identical to the serial loop (only the order *between
+  independent layers* changes, and the intra-layer range split preserves the
+  per-neuron reduction order). Straight-line graph regions and graphs whose
+  parallel gain cannot repay the scheduler overhead fall back to the serial
+  loop automatically; `--profile`'s `[sched]` line shows the parallel/serial
+  pass split actually achieved. Intra-layer threading is what helps on
+  multi-billion-parameter checkpoints whose big projections dominate; on sub-1B
+  models no layer crosses the threshold, so it costs nothing.
+- **Serial (`--serial`)** runs the classic in-order layer loop through
+  `TNNet.ComputeSerial`, fully single-threaded — both layer-graph parallelism
+  and intra-layer threading are off.
 
 Temperature and the penalties run through a
 `TNNetLogitsProcessorChain` in the `TGenerationConfig` pipeline order
@@ -155,17 +181,18 @@ The capital of France is Paris.
 Bye.
 ```
 
-Decoding is one full fixed-width forward per token (the `GPT2Import`
-convention), so it works unchanged across every imported family — including
-the ones whose normalization layers are not KV-cache streamable. Expect it
-to be CPU-slow on multi-billion-parameter checkpoints; small instruct
-models (0.5B-1B, `--ctx 512`) are the comfortable range.
+Decoding streams through a `TNNetStreamingDecoder` KV cache: the model is
+built at input width 1 and each token costs one width-1 forward over the
+cached past (cache memory grows O(ctx), not the O(ctx²) score buffers of a
+full-recompute decode). Expect it to be CPU-slow on multi-billion-parameter
+checkpoints; small instruct models (0.5B-1B, `--ctx 512`) are the
+comfortable range.
 
 ## Testing
 
-`--selftest` runs 31 offline checks (argument parsing, prompt assembly
+`--selftest` runs 55 offline checks (argument parsing, prompt assembly
 against the byte-exact ChatML render, end-of-turn markers, REPL command
-parsing) without needing any model files. For an end-to-end plumbing check,
+parsing, the KV-cache-reuse prefix diff) without needing any model files. For an end-to-end plumbing check,
 any directory with a pico-sized random checkpoint plus a tokenizer works —
 output is gibberish by construction, but loading, templating, streaming and
 the stop paths are real.

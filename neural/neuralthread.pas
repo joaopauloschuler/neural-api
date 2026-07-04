@@ -123,12 +123,88 @@ type
   function fNTL: TNeuralThreadList; {$IFDEF FPC}{$IFDEF Release} inline; {$ENDIF}{$ENDIF}
   procedure CreateNeuralThreadListIfRequired();
   function NeuralDefaultThreadCount: integer;
+  // Portable interlocked helpers for the layer-graph inference scheduler
+  // (TNNet.ComputeParallel): claim/publish per-layer compute states and
+  // count remaining layers across worker threads. All are full memory
+  // barriers, so a value published with NeuralAtomicExchange is observed -
+  // together with everything written before it - by a NeuralAtomicRead on
+  // another core. Coded by Claude (AI).
+  function NeuralAtomicCmpExchange(var Target: LongInt; NewValue, Comparand: LongInt): LongInt;
+  function NeuralAtomicExchange(var Target: LongInt; NewValue: LongInt): LongInt;
+  function NeuralAtomicIncrement(var Target: LongInt): LongInt;
+  function NeuralAtomicDecrement(var Target: LongInt): LongInt;
+  function NeuralAtomicRead(var Target: LongInt): LongInt;
+  // SMT-polite busy-wait hint for spin loops: PAUSE on x86 (releases the
+  // core's execution resources to the sibling hyperthread and saves power;
+  // ~tens of ns), a no-op elsewhere. Unlike TThread.Yield it is NOT a
+  // syscall - a hot scheduler worker yielding once per loop iteration costs
+  // a kernel round-trip (worse still under virtualization) per idle probe.
+  // Coded by Claude (AI).
+  procedure NeuralPause;
   procedure NeuralInitCriticalSection(var pCritSec: TRTLCriticalSection);
   procedure NeuralDoneCriticalSection(var pCritSec: TRTLCriticalSection);
   function GetProcessId(): {$IFDEF FPC}integer{$ELSE}integer{$ENDIF};
   procedure DebugThreadCount();
 
 implementation
+
+function NeuralAtomicCmpExchange(var Target: LongInt; NewValue, Comparand: LongInt): LongInt;
+begin
+  {$IFDEF FPC}
+  Result := InterlockedCompareExchange(Target, NewValue, Comparand);
+  {$ELSE}
+  Result := AtomicCmpExchange(Target, NewValue, Comparand);
+  {$ENDIF}
+end;
+
+function NeuralAtomicExchange(var Target: LongInt; NewValue: LongInt): LongInt;
+begin
+  {$IFDEF FPC}
+  Result := InterLockedExchange(Target, NewValue);
+  {$ELSE}
+  Result := AtomicExchange(Target, NewValue);
+  {$ENDIF}
+end;
+
+function NeuralAtomicIncrement(var Target: LongInt): LongInt;
+begin
+  {$IFDEF FPC}
+  Result := InterLockedIncrement(Target);
+  {$ELSE}
+  Result := AtomicIncrement(Target);
+  {$ENDIF}
+end;
+
+function NeuralAtomicDecrement(var Target: LongInt): LongInt;
+begin
+  {$IFDEF FPC}
+  Result := InterLockedDecrement(Target);
+  {$ELSE}
+  Result := AtomicDecrement(Target);
+  {$ENDIF}
+end;
+
+function NeuralAtomicRead(var Target: LongInt): LongInt;
+begin
+  // Read with a full barrier: an add of zero returns the current value
+  // without changing it.
+  {$IFDEF FPC}
+  Result := InterLockedExchangeAdd(Target, 0);
+  {$ELSE}
+  Result := AtomicCmpExchange(Target, 0, 0);
+  {$ENDIF}
+end;
+
+{$IF DEFINED(CPUX86_64) OR DEFINED(CPUX64) OR DEFINED(CPU386) OR DEFINED(CPUI386)}
+procedure NeuralPause; assembler; {$IFDEF FPC}nostackframe;{$ENDIF}
+asm
+  pause
+end;
+{$ELSE}
+procedure NeuralPause;
+begin
+end;
+{$IFEND}
 
 procedure NeuralInitCriticalSection(var pCritSec: TRTLCriticalSection);
 begin
