@@ -23,6 +23,8 @@ type
     procedure TestConvolutionColdParallelParity;
     procedure TestConvolutionLowMemoryChunkParity;
     procedure TestConvolutionDecodeNeuronChunkParity;
+    procedure TestConvolutionFastMemoryNeuronChunk;
+    procedure TestConvolutionSpatialNeuronChunk;
     procedure TestConvolutionForward;
     procedure TestWinogradConvolutionParity;
     procedure TestMaxPoolForward;
@@ -613,6 +615,125 @@ begin
     for i := 0 to ParOut.Size - 1 do
       AssertTrue('Neuron-chunk parallel B must be BIT-IDENTICAL to serial B at ' +
         IntToStr(i), ParOut.Raw[i] = NN.GetLastLayer().Output.Raw[i]);
+  finally
+    InA.Free;
+    InB.Free;
+    ParOut.Free;
+    NN.Free;
+  end;
+end;
+
+// Fast-memory (--max-fast-memory) decode-shaped pointwise conv: the concatenated
+// weight cache is resident, so the neuron-axis chunk runs through the general
+// neuron-ranged DotProductsTiled rather than the per-neuron low-memory path.
+// Parallel and serial need only be numerically equivalent (bit-parity is not a
+// requirement), so this checks a tolerance, not bit-equality. Coded by Claude (AI).
+procedure TTestNeuralLayers.TestConvolutionFastMemoryNeuronChunk;
+var
+  NN: TNNet;
+  ConvLayer: TNNetLayer;
+  InA, InB, ParOut: TNNetVolume;
+  i, neuron, w: integer;
+begin
+  NN := TNNet.Create();
+  NN.AddLayer(TNNetInput.Create(1, 1, 64));
+  ConvLayer := NN.AddLayer(TNNetPointwiseConvLinear.Create(128));
+  for neuron := 0 to ConvLayer.Neurons.Count - 1 do
+  begin
+    for w := 0 to ConvLayer.Neurons[neuron].Weights.Size - 1 do
+      ConvLayer.Neurons[neuron].Weights.Raw[w] :=
+        Sin(neuron * 0.017 + w * 0.0031) * 0.1;
+    ConvLayer.Neurons[neuron].BiasWeight := Cos(neuron * 0.019) * 0.05;
+  end;
+  ConvLayer.FlushWeightCache();
+
+  InA := TNNetVolume.Create(1, 1, 64);
+  InB := TNNetVolume.Create(1, 1, 64);
+  ParOut := TNNetVolume.Create();
+  try
+    for i := 0 to InA.Size - 1 do InA.Raw[i] := Sin(i * 0.05) - 0.3;
+    for i := 0 to InB.Size - 1 do InB.Raw[i] := Cos(i * 0.037) + 0.2;
+
+    NN.EnableIntraLayerThreading(true);
+    NN.SchedulerMinGain := 0;
+    NN.SetTrainable(False, {pLowMemory=}False); // keep the weight cache (fast path)
+    if NeuralDefaultThreadCount() > 1 then
+      AssertTrue('Fast-memory decode conv chunks over neurons',
+        TNNetConvolution(ConvLayer).ChunkOverNeurons());
+    AssertTrue('Must be chunk-eligible', ConvLayer.ChunkEligible());
+
+    NN.Compute(InA, 0, True);
+    NN.Compute(InB, 0, True);
+    ParOut.Copy(NN.GetLastLayer().Output);
+    NN.Compute(InB, 0, False);
+    AssertTrue('Reference output is non-trivial',
+      NN.GetLastLayer().Output.GetSumAbs() > 0.0);
+    for i := 0 to ParOut.Size - 1 do
+      AssertTrue('Fast-memory neuron-chunk B must match serial B (tol) at ' +
+        IntToStr(i),
+        Abs(ParOut.Raw[i] - NN.GetLastLayer().Output.Raw[i])
+          <= 1e-4 * (1 + Abs(NN.GetLastLayer().Output.Raw[i])));
+  finally
+    InA.Free;
+    InB.Free;
+    ParOut.Free;
+    NN.Free;
+  end;
+end;
+
+// The neuron-axis chunk is kernel-size agnostic: a SPATIAL 3x3 conv on a
+// single-position grid (3x3 input, pad 0 -> 1x1 output) still chunks over
+// neurons and its fast-memory path runs the same neuron-ranged DotProductsTiled
+// over the im2col matrix (VectorSize = 3*3*inChannels). Proves the path is not
+// pointwise-only. Coded by Claude (AI).
+procedure TTestNeuralLayers.TestConvolutionSpatialNeuronChunk;
+var
+  NN: TNNet;
+  ConvLayer: TNNetLayer;
+  InA, InB, ParOut: TNNetVolume;
+  i, neuron, w: integer;
+begin
+  NN := TNNet.Create();
+  NN.AddLayer(TNNetInput.Create(3, 3, 8));
+  // 3x3 kernel, pad 0, stride 1 on a 3x3 input -> output 1x1x64 (one position).
+  ConvLayer := NN.AddLayer(TNNetConvolutionReLU.Create(64, 3, 0, 1));
+  for neuron := 0 to ConvLayer.Neurons.Count - 1 do
+  begin
+    for w := 0 to ConvLayer.Neurons[neuron].Weights.Size - 1 do
+      ConvLayer.Neurons[neuron].Weights.Raw[w] :=
+        Sin(neuron * 0.013 + w * 0.0027) * 0.1;
+    ConvLayer.Neurons[neuron].BiasWeight := Cos(neuron * 0.023) * 0.05;
+  end;
+  ConvLayer.FlushWeightCache();
+
+  InA := TNNetVolume.Create(3, 3, 8);
+  InB := TNNetVolume.Create(3, 3, 8);
+  ParOut := TNNetVolume.Create();
+  try
+    for i := 0 to InA.Size - 1 do InA.Raw[i] := Sin(i * 0.05) - 0.3;
+    for i := 0 to InB.Size - 1 do InB.Raw[i] := Cos(i * 0.037) + 0.2;
+
+    NN.EnableIntraLayerThreading(true);
+    NN.SchedulerMinGain := 0;
+    NN.SetTrainable(False, {pLowMemory=}False);
+    AssertEquals('Single output position', 1,
+      NN.GetLastLayer().Output.SizeX * NN.GetLastLayer().Output.SizeY);
+    if NeuralDefaultThreadCount() > 1 then
+      AssertTrue('Spatial single-position conv chunks over neurons',
+        TNNetConvolution(ConvLayer).ChunkOverNeurons());
+    AssertTrue('Must be chunk-eligible', ConvLayer.ChunkEligible());
+
+    NN.Compute(InA, 0, True);
+    NN.Compute(InB, 0, True);
+    ParOut.Copy(NN.GetLastLayer().Output);
+    NN.Compute(InB, 0, False);
+    AssertTrue('Reference output is non-trivial',
+      NN.GetLastLayer().Output.GetSumAbs() > 0.0);
+    for i := 0 to ParOut.Size - 1 do
+      AssertTrue('Spatial neuron-chunk B must match serial B (tol) at ' +
+        IntToStr(i),
+        Abs(ParOut.Raw[i] - NN.GetLastLayer().Output.Raw[i])
+          <= 1e-4 * (1 + Abs(NN.GetLastLayer().Output.Raw[i])));
   finally
     InA.Free;
     InB.Free;
