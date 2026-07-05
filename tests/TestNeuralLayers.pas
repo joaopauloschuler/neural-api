@@ -25,6 +25,7 @@ type
     procedure TestConvolutionDecodeNeuronChunkParity;
     procedure TestConvolutionFastMemoryNeuronChunk;
     procedure TestConvolutionSpatialNeuronChunk;
+    procedure TestHotThreadWorkersStartStop;
     procedure TestConvolutionForward;
     procedure TestWinogradConvolutionParity;
     procedure TestMaxPoolForward;
@@ -335,6 +336,107 @@ begin
           ' must be BIT-IDENTICAL to serial at ' + IntToStr(i),
           SerialOut.Raw[i] = NN.GetLastLayer().Output.Raw[i]);
     end;
+  finally
+    Input.Free;
+    SerialOut.Free;
+    NN.Free;
+  end;
+end;
+
+// Exercises the StartThreadWorkers / StopThreadWorkers public API on a small
+// two-branch inference net: StartThreadWorkers configures the hot-worker policy
+// and pre-warms the persistent pool; every parallel pass stays BIT-IDENTICAL to
+// the serial reference; StopThreadWorkers reverts the policy and the pool
+// recreates transparently on the next pass; and StopOnFinish=True tears the pool
+// down after one pass (the hot count reverts to its default). Coded by Claude (AI).
+procedure TTestNeuralLayers.TestHotThreadWorkersStartStop;
+var
+  NN: TNNet;
+  Input, SerialOut: TNNetVolume;
+  InputLayer, Branch1, Branch2: TNNetLayer;
+  Layer: TNNetLayer;
+  i, pass, LayerCnt, neuron, w: integer;
+  FC: TNNetFullConnect;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2048, 1, 1);
+  SerialOut := TNNetVolume.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(2048));
+    Branch1 := NN.AddLayerAfter(
+      TNNetFullConnectLinear.Create(1, 1, 1024), InputLayer);
+    Branch2 := NN.AddLayerAfter(
+      TNNetFullConnectReLU.Create(1, 1, 512), InputLayer);
+    NN.AddLayer(TNNetDeepConcat.Create([Branch1, Branch2]));
+    for LayerCnt := 0 to NN.CountLayers() - 1 do
+    begin
+      Layer := NN.Layers[LayerCnt];
+      if Layer is TNNetFullConnect then
+      begin
+        FC := TNNetFullConnect(Layer);
+        for neuron := 0 to FC.Neurons.Count - 1 do
+        begin
+          for w := 0 to FC.Neurons[neuron].Weights.Size - 1 do
+            FC.Neurons[neuron].Weights.Raw[w] :=
+              Sin(LayerCnt * 1.7 + neuron * 0.013 + w * 0.0007) * 0.1;
+          FC.Neurons[neuron].BiasWeight := Cos(neuron * 0.021) * 0.05;
+        end;
+      end;
+    end;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.05) - 0.3;
+
+    // Serial reference (trainable -> single-threaded serial loop).
+    NN.Compute(Input);
+    SerialOut.Copy(NN.GetLastLayer().Output);
+    AssertTrue('Reference output is non-trivial', SerialOut.GetSumAbs() > 0.0);
+
+    NN.SetTrainable(False);
+    NN.SchedulerMinGain := 0; // force the parallel scheduler on every pass
+
+    // StartThreadWorkers configures the hot policy and pre-warms the pool. The
+    // hot count is clamped to the pool width (= cpu cores), so use Min() to stay
+    // correct on any core count. The timeout is stored verbatim.
+    NN.StartThreadWorkers({StopOnFinish=}False, {pHotThreadNum=}3, {timeout=}5);
+    AssertEquals('StartThreadWorkers sets HotThreadWorkers',
+      Min(3, NeuralDefaultThreadCount()), NN.HotThreadWorkers);
+    AssertEquals('StartThreadWorkers sets HotThreadTimeout', 5, NN.HotThreadTimeout);
+
+    // Every parallel pass stays bit-identical to serial with the pool persisting.
+    for pass := 1 to 10 do
+    begin
+      NN.Compute(Input, 0, True);
+      AssertEquals('Output size at pass ' + IntToStr(pass),
+        SerialOut.Size, NN.GetLastLayer().Output.Size);
+      for i := 0 to SerialOut.Size - 1 do
+        AssertTrue('Hot-workers parallel pass ' + IntToStr(pass) +
+          ' must be BIT-IDENTICAL to serial at ' + IntToStr(i),
+          SerialOut.Raw[i] = NN.GetLastLayer().Output.Raw[i]);
+    end;
+
+    // StopThreadWorkers reverts the hot policy to its default (worker 0 hot).
+    NN.StopThreadWorkers();
+    AssertEquals('StopThreadWorkers resets HotThreadWorkers', 1, NN.HotThreadWorkers);
+
+    // The pool recreates transparently on the next pass, still bit-identical.
+    NN.Compute(Input, 0, True);
+    for i := 0 to SerialOut.Size - 1 do
+      AssertTrue('Post-stop parallel pass must be BIT-IDENTICAL to serial at ' +
+        IntToStr(i), SerialOut.Raw[i] = NN.GetLastLayer().Output.Raw[i]);
+
+    // StopOnFinish=True: the pool is torn down after the next pass, so the hot
+    // count reverts to 1 (on a multi-core host, where the parallel path - and
+    // thus the teardown hook - actually runs; on a single-core host the count is
+    // already clamped to 1, so the post-pass assertion holds trivially).
+    NN.StartThreadWorkers({StopOnFinish=}True, {pHotThreadNum=}2, {timeout=}3);
+    AssertEquals('HotThreadWorkers before the StopOnFinish pass',
+      Min(2, NeuralDefaultThreadCount()), NN.HotThreadWorkers);
+    NN.Compute(Input, 0, True);
+    AssertEquals('StopOnFinish reverts HotThreadWorkers after the pass',
+      1, NN.HotThreadWorkers);
+    for i := 0 to SerialOut.Size - 1 do
+      AssertTrue('StopOnFinish pass must be BIT-IDENTICAL to serial at ' +
+        IntToStr(i), SerialOut.Raw[i] = NN.GetLastLayer().Output.Raw[i]);
   finally
     Input.Free;
     SerialOut.Free;
