@@ -122,6 +122,31 @@ safe when you know the volume's layout. The clean, common cases:
   If you have already precomputed a raw offset (or a row pointer via
   `GetRawPtr`), prefer that.
 
+**Compute the offset with `GetRawPos`, don't hand-roll it.** When the index is
+non-trivial, let the volume compute its own flat offset via the public
+`GetRawPos` (`inline` in Release) instead of re-deriving the arithmetic
+yourself:
+
+```pascal
+base := FA.GetRawPos(t_, 0, c);   // = t_ * FDepth + c, but self-documenting
+a  := FA.FData[base];
+```
+
+This is preferable to writing `t_ * FChannels + c` by hand: it reads the
+volume's *actual* `FDepth` (so it stays correct if the layout assumption
+changes), it documents intent, and — because it is inlined — it costs nothing in
+Release. **Reuse one `base` across volumes that share a shape.** If several
+volumes have identical dimensions, a single `GetRawPos` result indexes all of
+them:
+
+```pascal
+// FA, H and HErr all share (T, 1, FChannels) — one offset addresses all three.
+base := FA.GetRawPos(t_, 0, c);
+a  := FA.FData[base];
+hv := H.FData[base];
+HErr.FData[base] := HErr.FData[base] + ...;
+```
+
 **Caveat.** `FData[]` does no bounds/shape checking and bypasses the accessor
 entirely. Only use it where the shape is known and fixed (asserted at layer
 setup), and keep the index expression obviously correct. For one-off or
