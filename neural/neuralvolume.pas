@@ -6639,6 +6639,7 @@ end;
 procedure TVolume.CopyResizing(Original: TVolume; NewSizeX, NewSizeY: integer);
 var
   RatioX, RatioY: TNeuralFloat;
+  InvRatioX, InvRatioY: TNeuralFloat;
   CntX, CntY: integer;
   MaxX, MaxY: integer;
   OrigMaxX, OrigMaxY: integer;
@@ -6655,6 +6656,8 @@ begin
     ReSize(NewSizeX, NewSizeY, Original.Depth);
     RatioX := NewSizeX / Original.SizeX;
     RatioY := NewSizeY / Original.SizeY;
+    InvRatioX := 1 / RatioX;
+    InvRatioY := 1 / RatioY;
 
     MaxX := SizeX - 1;
     MaxY := SizeY - 1;
@@ -6664,10 +6667,10 @@ begin
 
     for CntX := 0 to MaxX do
     begin
-      OrigPosX := Min(OrigMaxX, Round(CntX / RatioX));
+      OrigPosX := Min(OrigMaxX, Round(CntX * InvRatioX));
       for CntY := 0 to MaxY do
       begin
-        OrigPosY := Min(OrigMaxY, Round(CntY / RatioY));
+        OrigPosY := Min(OrigMaxY, Round(CntY * InvRatioY));
         RawPostDest := GetRawPos(CntX, CntY);
         RawPosSource := Original.GetRawPos(OrigPosX, OrigPosY);
         Move(Original.FData[RawPosSource], FData[RawPostDest], MoveSizeBytes);
@@ -9184,6 +9187,7 @@ procedure TNNetVolume.InterleavedDotProduct(InterleavedAs,
 var
   CntBPos, MaxBPos: integer;
   NumOriginalInterleaved: integer;
+  Ofs: integer;
 begin
   MaxBPos := B.FSize - 1;
   NumOriginalInterleaved := InterleavedAs.Size div B.Size;
@@ -9195,9 +9199,11 @@ begin
 
   Fill(0);
 
+  Ofs := 0;
   for CntBPos := 0 to MaxBPos do
   begin
-    MulAdd(FDataPtr, InterleavedAs.GetRawPtr(CntBPos*NumOriginalInterleaved), B.FData[CntBPos], NumOriginalInterleaved);
+    MulAdd(FDataPtr, InterleavedAs.GetRawPtr(Ofs), B.FData[CntBPos], NumOriginalInterleaved);
+    Inc(Ofs, NumOriginalInterleaved);
   end;
 end;
 
@@ -9208,6 +9214,7 @@ var
   NumA, NumB, NumBM1: integer;
   DestPointer: pointer;
   CntBVectorSizePlusCntBPos: integer;
+  AOfs: integer;
 begin
   NumA := InterleavedAs.Size div VectorSize;
   NumB := Bs.Size div VectorSize;
@@ -9225,11 +9232,13 @@ begin
   begin
     DestPointer := Self.GetRawPtr(NumA*CntB);
     CntBVectorSizePlusCntBPos := CntB*VectorSize;
+    AOfs := 0;
     for CntBPos := 0 to MaxBPos do
     begin
       //MulAdd(DestPointer, InterleavedAs.GetRawPtr(CntBPos*NumA), Bs.FData[CntB*VectorSize + CntBPos], NumA);
-      MulAdd(DestPointer, InterleavedAs.GetRawPtr(CntBPos*NumA), Bs.FData[CntBVectorSizePlusCntBPos], NumA);
+      MulAdd(DestPointer, InterleavedAs.GetRawPtr(AOfs), Bs.FData[CntBVectorSizePlusCntBPos], NumA);
       Inc(CntBVectorSizePlusCntBPos);
+      Inc(AOfs, NumA);
     end;
   end;
 end;
@@ -9241,6 +9250,7 @@ var
   NumA, NumB: integer;
   DestPointer: pointer;
   CntBVectorSizePlusCntBPos: integer;
+  AOfs: integer;
 begin
   NumA := InterleavedAs.Size div VectorSize;
   NumB := Bs.Size div VectorSize;
@@ -9256,11 +9266,13 @@ begin
   begin
     DestPointer := Self.GetRawPtr(NumA*CntB);
     CntBVectorSizePlusCntBPos := CntB*VectorSize;
+    AOfs := 0;
     for CntBPos := 0 to MaxBPos do
     begin
       //MulAdd(DestPointer, InterleavedAs.GetRawPtr(CntBPos*NumA), Bs.FData[CntB*VectorSize + CntBPos], NumA);
-      MulAdd(DestPointer, InterleavedAs.GetRawPtr(CntBPos*NumA), Bs.FData[CntBVectorSizePlusCntBPos], NumA);
+      MulAdd(DestPointer, InterleavedAs.GetRawPtr(AOfs), Bs.FData[CntBVectorSizePlusCntBPos], NumA);
       Inc(CntBVectorSizePlusCntBPos);
+      Inc(AOfs, NumA);
     end;
   end;
 end;
@@ -9336,6 +9348,7 @@ procedure TNNetVolume.DotProducts(NumAs, BStart, BFinish, VectorSize: integer;
   NoForward:boolean = false);
 var
   CntA, CntB, MaxA, LocalMaxA: integer;
+  RowBase, AOfs: integer;
   //DestPointer: pointer;
   //CntBVectorSizePlusCntBPos: integer;
   {$IFDEF AVXANY}
@@ -9366,6 +9379,8 @@ begin
       else LocalMaxA := MaxA;
     if LocalMaxA >= 0 then
     begin
+      RowBase := CntB * NumAs;
+      AOfs := 0;
       for CntA := 0 to LocalMaxA do
       begin
         {$IFDEF DEBUG}
@@ -9374,7 +9389,7 @@ begin
           WriteLn('This should never happen.');
         end;
         {$ENDIF}
-        PtrA := VAs.GetRawPtr(CntA*VectorSize);
+        PtrA := VAs.GetRawPtr(AOfs);
 
         {$IFDEF AVXANY}
         {$IFDEF AVX32}
@@ -9602,7 +9617,8 @@ begin
         {$IFNDEF AVXANY}
         Result := DotProduct(PtrA, PtrB, VectorSize);
         {$ENDIF}
-        FData[CntB * NumAs + CntA] := Result;
+        FData[RowBase + CntA] := Result;
+        Inc(AOfs, VectorSize);
         (*
         if NoForward then
         begin
@@ -9631,6 +9647,7 @@ end;
 procedure TNNetVolume.DotProductsTiled(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1);
 var
   CntA, CntB: Integer;
+  RowBase, AOfs: integer;
   //DestPointer: pointer;
   //CntBVectorSizePlusCntBPos: integer;
   {$IFDEF AVXANY}
@@ -9675,9 +9692,11 @@ begin
       for CntB := StartTileB to EndTileB do
       begin
         PtrB := VBs.GetRawPtr(CntB*VectorSize);
+        RowBase := CntB * NumAs;
+        AOfs := StartTileA * VectorSize;
         for CntA := StartTileA to EndTileA do
         begin
-          PtrA := VAs.GetRawPtr(CntA*VectorSize);
+          PtrA := VAs.GetRawPtr(AOfs);
 
           {$IFDEF AVXANY}
           {$IFDEF AVX32}
@@ -9905,7 +9924,8 @@ begin
           {$IFNDEF AVXANY}
           Result := DotProduct(PtrA, PtrB, VectorSize);
           {$ENDIF}
-          FData[CntB * NumAs + CntA] := Result;
+          FData[RowBase + CntA] := Result;
+          Inc(AOfs, VectorSize);
         end;
       end;
 
