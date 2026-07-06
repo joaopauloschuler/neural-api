@@ -6,43 +6,63 @@ it matters. Recommendations are added incrementally as we discover them.
 
 ## 1. Prefer named size constants over `SizeOf(type)`
 
-Replace repeated `SizeOf(TNeuralFloat)` (and similar element-size expressions)
-with the predefined constant `csNeuralFloatSize`, declared in
-`neural/neuralvolume.pas`:
+Replace repeated `SizeOf(<type>)` expressions with a predefined named size
+constant. These constants live in `neural/neuralvolume.pas` and are visible to
+every unit that `uses neuralvolume`:
 
 ```pascal
 const
-  csNeuralFloatSize = SizeOf(TNeuralFloat);
+  csNeuralFloatSize  = SizeOf(TNeuralFloat);
+  csNeuralFloat4Size = SizeOf(TNeuralFloat4);
+  csLongintSize      = SizeOf(Longint);
+  csIntegerSize      = SizeOf(Integer);
+  csShortIntSize     = SizeOf(ShortInt);
 ```
 
 **Do this:**
 
 ```pascal
 Move(Src^, Dst^, Count * csNeuralFloatSize);
+clSetKernelArg(k, 0, csLongintSize, @N);
+Move(FKCacheCodes[(j + 1) * FDk], FKCacheCodes[j * FDk], FDk * csShortIntSize);
 ```
 
 **Instead of:**
 
 ```pascal
 Move(Src^, Dst^, Count * SizeOf(TNeuralFloat));
+clSetKernelArg(k, 0, SizeOf(Longint), @N);
+Move(FKCacheCodes[(j + 1) * FDk], FKCacheCodes[j * FDk], FDk * SizeOf(ShortInt));
 ```
 
 **Why it matters**
 
-- **Consistency** — one canonical name for the element size across the whole
-  codebase, so `Move`/allocation/stride arithmetic all read the same way.
-- **Single source of truth** — if the float type ever changes, the intent stays
+- **Consistency** — one canonical name per element size across the whole
+  codebase, so `Move`/allocation/stride/`clSetKernelArg` arithmetic all read the
+  same way.
+- **Single source of truth** — if a type's width ever changes, the intent stays
   expressed through one named constant rather than scattered `SizeOf` literals.
 - **Readability** — `csNeuralFloatSize` signals *"one neural-float element"* at
   a glance, which is clearer than a bare `SizeOf` inside a byte-count
   expression.
 
-**Caveat: declaration order in Pascal.** A constant cannot be referenced before
-it is declared. The `csNeuralFloatSize` definition itself, and the
-`TNeuralFloatArr = array[0..Maxint div SizeOf(TNeuralFloat)] of ...` type
-declarations that precede it in `neuralvolume.pas`, must keep the literal
-`SizeOf(TNeuralFloat)`. Everything after the `const` block — and every other
-unit that `uses neuralvolume` — should use `csNeuralFloatSize`.
+**Adding a new size constant.** When you hit a repeated `SizeOf(<sometype>)`,
+add a `cs<Type>Size = SizeOf(<sometype>);` line to the same `const` block in
+`neuralvolume.pas` (keep the literal `SizeOf` in the definition itself), then
+search/replace the literal across the codebase. Match case-insensitively — Pascal
+is case-insensitive, so `SizeOf(integer)` and `SizeOf(Integer)` both occur.
+
+**Caveats.**
+
+- **Declaration order (Pascal).** A constant cannot be referenced before it is
+  declared. The `cs*Size` definitions themselves, and any `type` declarations
+  that precede the `const` block (e.g.
+  `TNeuralFloatArr = array[0..Maxint div SizeOf(TNeuralFloat)] of ...`), must
+  keep the literal `SizeOf`.
+- **Only substitute matching types.** Replace `SizeOf(Longint)` with
+  `csLongintSize`, not with `csIntegerSize` — on some targets `Integer` and
+  `Longint` need not be the same width, so keep the constant tied to the exact
+  type it names.
 
 ## 2. Never place expressions in a `for` bound; hoist them into a variable
 
