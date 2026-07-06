@@ -179,3 +179,67 @@ loop; switching those to `FData[c]` is exact and removes the accessor overhead.
 Verified equivalent by the numerical gradient-check tests
 (`TestAttentiveStatsPoolingFeatureGradientCheck` /
 `...LogitGradientCheck`).
+
+## 4. Hoist repeated subexpressions inside a loop body
+
+If the same subexpression appears more than once in a loop body, compute it
+once into a local and reuse it. Re-writing `j + 1` (or any index arithmetic)
+several times per iteration re-does the work each time and obscures that all
+those uses refer to the *same* value.
+
+**Anti-example — do NOT follow this.** From the KV-cache eviction shift in
+`TNNetScaledDotProductAttention.ComputeIncremental()`, `j + 1` is recomputed up
+to six times per iteration, and `j * FDk` / `(j + 1) * FDk` twice each:
+
+```pascal
+for j := FEvictSinks to CacheLenM2 do
+begin
+  if FKVQuantInt8 then
+  begin
+    Move(FKCacheCodes[(j + 1) * FDk], FKCacheCodes[j * FDk], FDk * csShortIntSize);
+    Move(FVCacheCodes[(j + 1) * FDk], FVCacheCodes[j * FDk], FDk * csShortIntSize);
+    FKCacheScale[j] := FKCacheScale[j + 1];
+    FVCacheScale[j] := FVCacheScale[j + 1];
+  end
+  else
+  begin
+    Move(FKCache.GetRawPtr(j + 1, 0, 0)^, FKCache.GetRawPtr(j, 0, 0)^, FDk * csNeuralFloatSize);
+    Move(FVCache.GetRawPtr(j + 1, 0, 0)^, FVCache.GetRawPtr(j, 0, 0)^, FDk * csNeuralFloatSize);
+  end;
+end;
+```
+
+**Do this instead — compute each repeated value once:**
+
+```pascal
+for j := FEvictSinks to CacheLenM2 do
+begin
+  jP1 := j + 1;
+  if FKVQuantInt8 then
+  begin
+    jDk   := j   * FDk;
+    jP1Dk := jP1 * FDk;
+    Move(FKCacheCodes[jP1Dk], FKCacheCodes[jDk], FDk * csShortIntSize);
+    Move(FVCacheCodes[jP1Dk], FVCacheCodes[jDk], FDk * csShortIntSize);
+    FKCacheScale[j] := FKCacheScale[jP1];
+    FVCacheScale[j] := FVCacheScale[jP1];
+  end
+  else
+  begin
+    Move(FKCache.GetRawPtr(jP1, 0, 0)^, FKCache.GetRawPtr(j, 0, 0)^, FDk * csNeuralFloatSize);
+    Move(FVCache.GetRawPtr(jP1, 0, 0)^, FVCache.GetRawPtr(j, 0, 0)^, FDk * csNeuralFloatSize);
+  end;
+end;
+```
+
+**Why it matters**
+
+- **Less repeated work** — the index arithmetic is done once per iteration
+  instead of once per use.
+- **Readability** — a named `jP1` makes it explicit that every reference is the
+  *same* neighbouring slot, not several independent computations.
+- **Fewer edit hazards** — with one definition there is a single place to change
+  if the offset logic ever moves, so the uses cannot drift out of sync.
+
+(This eviction loop has further, larger problems beyond the repeated
+subexpression — see later recommendations.)
