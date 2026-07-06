@@ -4745,7 +4745,7 @@ begin
     MaxIdx := Count - 1;
     for I := 0 to MaxIdx do
     begin
-      system.Move(Self[I].FData[0], V.FData[CurrPos], Self[I].Size * SizeOf(TNeuralFloat));
+      system.Move(Self[I].FData[0], V.FData[CurrPos], Self[I].Size * csNeuralFloatSize);
       {$IFDEF FPC}
       CurrPos += Self[I].Size;
       {$ELSE}
@@ -4797,7 +4797,7 @@ begin
     MaxIdx := Count - 1;
     for I := 0 to MaxIdx do
     begin
-      system.Move(V.FData[CurrPos], Self[I].FData[0], Self[I].Size * SizeOf(TNeuralFloat));
+      system.Move(V.FData[CurrPos], Self[I].FData[0], Self[I].Size * csNeuralFloatSize);
       {$IFDEF FPC}
       CurrPos += Self[I].Size;
       {$ELSE}
@@ -5581,7 +5581,7 @@ end;
 
 function TVolume.IncYSizeBytes(): integer;
 begin
-  Result := IncYSize() * SizeOf(TNeuralFloat);
+  Result := IncYSize() * csNeuralFloatSize;
 end;
 
 function TVolume.SameSize(Original: TVolume): boolean;
@@ -6561,7 +6561,7 @@ begin
   NewSizeX := Original.SizeX + Padding * 2;
   NewSizeY := Original.SizeY + Padding * 2;
   MaxY := Original.SizeY - 1;
-  RowSize := Original.SizeX * Original.Depth * SizeOf(TNeuralFloat);
+  RowSize := Original.SizeX * Original.Depth * csNeuralFloatSize;
 
   Resize(NewSizeX, NewSizeY, Original.Depth);
   Fill(0);
@@ -6585,7 +6585,7 @@ begin
   NewSizeX := Original.SizeX + PaddingX * 2;
   NewSizeY := Original.SizeY + PaddingY * 2;
   MaxY := Original.SizeY - 1;
-  RowSize := Original.SizeX * Original.Depth * SizeOf(TNeuralFloat);
+  RowSize := Original.SizeX * Original.Depth * csNeuralFloatSize;
 
   Resize(NewSizeX, NewSizeY, Original.Depth);
   Fill(0);
@@ -9001,7 +9001,7 @@ end;
 
 function TNNetVolume.GetMemSize(): integer;
 begin
-  Result := FSize * SizeOf(TNeuralFloat);
+  Result := FSize * csNeuralFloatSize;
 end;
 
 // inspired on: http://caffe.berkeleyvision.org/tutorial/layers/lrn.html

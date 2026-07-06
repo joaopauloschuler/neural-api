@@ -475,7 +475,7 @@ begin
   FGroupSizeA := GroupSizeA;
   FGroupSizeB := GroupSizeB;
 
-  NeededResult := FNumAs * FNumBs * SizeOf(TNeuralFloat);
+  NeededResult := FNumAs * FNumBs * csNeuralFloatSize;
 
   if (FHostInput) then
   begin
@@ -537,7 +537,7 @@ begin
     FInputBufferBs := FDotProductKernel.CreateInputBuffer(VBs);
   end;
 
-  FResultBuffer  := FDotProductKernel.CreateOutputBuffer(FNumAs * FNumBs * SizeOf(TNeuralFloat));
+  FResultBuffer  := FDotProductKernel.CreateOutputBuffer(FNumAs * FNumBs * csNeuralFloatSize);
   FPreviousComputeTime := 0;
 
   PrepareForCompute := CL_SUCCESS;
@@ -919,7 +919,7 @@ begin
     FInputBufferAs := CreateInputBuffer(VAs);
     FInputBufferBs := CreateInputBuffer(VBs);
   end;
-  FResultBuffer  := CreateOutputBuffer(FNumAs * FNumBs * SizeOf(TNeuralFloat));
+  FResultBuffer  := CreateOutputBuffer(FNumAs * FNumBs * csNeuralFloatSize);
   FPreviousComputeTime := 0;
 
   err := PrepareKernel(kernelname);
