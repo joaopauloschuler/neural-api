@@ -59,6 +59,10 @@ type
   cl_kernel        = PCL_kernel;
   {$ENDIF}
 
+const
+  csCLMemSize = SizeOf(cl_mem);
+
+type
   TPlatformNames = array of string;
   TPlatforms = array of cl_platform_id;
   TDeviceNames = array of string;
@@ -576,8 +580,8 @@ begin
   err := err or clSetKernelArg(k, 4, csLongintSize, @InSizeX);
   err := err or clSetKernelArg(k, 5, csLongintSize, @InDepth);
   err := err or clSetKernelArg(k, 6, csLongintSize, @Stride);
-  err := err or clSetKernelArg(k, 7, SizeOf(cl_mem), @FIm2ColSrcBuffer);
-  err := err or clSetKernelArg(k, 8, SizeOf(cl_mem), @FInputBufferBs);
+  err := err or clSetKernelArg(k, 7, csCLMemSize, @FIm2ColSrcBuffer);
+  err := err or clSetKernelArg(k, 8, csCLMemSize, @FInputBufferBs);
   if (err <> CL_SUCCESS) then
     ErrorProc('Error: BuildInputColsOnDevice - failed setting parameters: ' + IntToStr(err));
 
@@ -619,13 +623,13 @@ begin
       err := err or clSetKernelArg(Kernel, 4, csLongintSize, @FActFun);
       if (err <> CL_SUCCESS) then ErrorProc('4 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 5, SizeOf(cl_mem),  @FInputBufferAs);
+      err := err or clSetKernelArg(Kernel, 5, csCLMemSize,  @FInputBufferAs);
       if (err <> CL_SUCCESS) then ErrorProc('5 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 6, SizeOf(cl_mem),  @FInputBufferBs);
+      err := err or clSetKernelArg(Kernel, 6, csCLMemSize,  @FInputBufferBs);
       if (err <> CL_SUCCESS) then ErrorProc('6 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 7, SizeOf(cl_mem),  @FResultBuffer);
+      err := err or clSetKernelArg(Kernel, 7, csCLMemSize,  @FResultBuffer);
       if (err <> CL_SUCCESS) then ErrorProc('7 Error: Failed to set kernel arguments:' + IntToStr(err));
 
       // Fused bias (arg 8 UseBias, arg 9 FBiasBuffer). Both args MUST be set every
@@ -653,7 +657,7 @@ begin
       err := err or clSetKernelArg(Kernel, 8, csLongintSize, @UseBias);
       if (err <> CL_SUCCESS) then ErrorProc('8 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 9, SizeOf(cl_mem), @FBiasBuffer);
+      err := err or clSetKernelArg(Kernel, 9, csCLMemSize, @FBiasBuffer);
       if (err <> CL_SUCCESS) then ErrorProc('9 Error: Failed to set kernel arguments:' + IntToStr(err));
 
       if (FHostInput) then
@@ -939,13 +943,13 @@ begin
   err := err or clSetKernelArg(FKernel, 4, csLongintSize, @FActFun);
   if (err <> CL_SUCCESS) then ErrorProc('4 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-  err := err or clSetKernelArg(FKernel, 5, SizeOf(cl_mem),  @FInputBufferAs);
+  err := err or clSetKernelArg(FKernel, 5, csCLMemSize,  @FInputBufferAs);
   if (err <> CL_SUCCESS) then ErrorProc('5 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-  err := err or clSetKernelArg(FKernel, 6, SizeOf(cl_mem),  @FInputBufferBs);
+  err := err or clSetKernelArg(FKernel, 6, csCLMemSize,  @FInputBufferBs);
   if (err <> CL_SUCCESS) then ErrorProc('6 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-  err := err or clSetKernelArg(FKernel, 7, SizeOf(cl_mem),  @FResultBuffer);
+  err := err or clSetKernelArg(FKernel, 7, csCLMemSize,  @FResultBuffer);
   if (err <> CL_SUCCESS) then ErrorProc('7 Error: Failed to set kernel arguments:' + IntToStr(err));
 
   // cai_dot_product gained two fused-bias args (8 UseBias, 9 FBiasOutput). This
@@ -956,7 +960,7 @@ begin
   NilBias := nil;
   err := err or clSetKernelArg(FKernel, 8, csLongintSize, @UseBiasZero);
   if (err <> CL_SUCCESS) then ErrorProc('8 Error: Failed to set kernel arguments:' + IntToStr(err));
-  err := err or clSetKernelArg(FKernel, 9, SizeOf(cl_mem), @NilBias);
+  err := err or clSetKernelArg(FKernel, 9, csCLMemSize, @NilBias);
   if (err <> CL_SUCCESS) then ErrorProc('9 Error: Failed to set kernel arguments:' + IntToStr(err));
 
   PrepareForCompute := err;
@@ -1134,14 +1138,14 @@ function TEasyOpenCLV.CreateWriteSetArgument(V: TNNetVolume; kernel:cl_kernel; a
 begin
   Result := nil;
   CreateAndWriteBuffer(V, Result);
-  clSetKernelArg(kernel, arg_index, sizeof(cl_mem), @Result);
+  clSetKernelArg(kernel, arg_index, csCLMemSize, @Result);
 end;
 
 function TEasyOpenCLV.CreateOutputSetArgument(V: TNNetVolume;
   kernel: cl_kernel; arg_index: cl_uint): cl_mem;
 begin
   Result := CreateOutputBuffer(V);
-  clSetKernelArg(kernel, arg_index, sizeof(cl_mem), @Result);
+  clSetKernelArg(kernel, arg_index, csCLMemSize, @Result);
 end;
 
 function TEasyOpenCLV.EnsureBuffer(var buf: cl_mem; var capBytes: PtrUInt;
