@@ -1128,7 +1128,7 @@ end;
 function EvaluateMultipleChoice(NN: TNNet;
   const Items: array of TNNetMultipleChoiceItem): TNNetMultipleChoiceStats;
 var
-  ItemIdx, Cand, BestSum, BestNorm, ItemsHi: integer;
+  ItemIdx, Cand, BestSum, BestNorm, ItemsHi, CandHigh: integer;
   Scores: TNNetCompletionScoreArray;
   Score: TNNetCompletionScore;
   BestSumLP, BestNormLP: TNeuralFloat;
@@ -1151,7 +1151,8 @@ begin
     // the shared context is not re-forwarded per candidate (single-head nets).
     Scores := ScoreCompletionsBatch(NN, Items[ItemIdx].ContextTokens,
       Items[ItemIdx].Candidates);
-    for Cand := 0 to High(Items[ItemIdx].Candidates) do
+    CandHigh := High(Items[ItemIdx].Candidates);
+    for Cand := 0 to CandHigh do
     begin
       Score := Scores[Cand];
       // First-max tie-break: a later candidate must be STRICTLY better.

@@ -2723,27 +2723,33 @@ end;
 procedure TNeuralFitBase.DispatchEpochBegin(Epoch: integer);
 var
   I: integer;
+  CallbackCntM1: integer;
 begin
   if not Assigned(FCallbacks) then exit;
-  for I := 0 to FCallbacks.Count - 1 do
+  CallbackCntM1 := FCallbacks.Count - 1;
+  for I := 0 to CallbackCntM1 do
     TNeuralFitCallback(FCallbacks[I]).OnEpochBegin(Self, Epoch);
 end;
 
 procedure TNeuralFitBase.DispatchEpochEnd(Epoch: integer);
 var
   I: integer;
+  CallbackCntM1: integer;
 begin
   if not Assigned(FCallbacks) then exit;
-  for I := 0 to FCallbacks.Count - 1 do
+  CallbackCntM1 := FCallbacks.Count - 1;
+  for I := 0 to CallbackCntM1 do
     TNeuralFitCallback(FCallbacks[I]).OnEpochEnd(Self, Epoch);
 end;
 
 procedure TNeuralFitBase.DispatchStepEnd(GlobalStep: integer);
 var
   I: integer;
+  CallbackCntM1: integer;
 begin
   if not Assigned(FCallbacks) then exit;
-  for I := 0 to FCallbacks.Count - 1 do
+  CallbackCntM1 := FCallbacks.Count - 1;
+  for I := 0 to CallbackCntM1 do
     TNeuralFitCallback(FCallbacks[I]).OnStepEnd(Self, GlobalStep);
 end;
 
@@ -2751,9 +2757,11 @@ procedure TNeuralFitBase.DispatchEvaluate(Epoch: integer;
   ValLoss, ValAcc: TNeuralFloat);
 var
   I: integer;
+  CallbackCntM1: integer;
 begin
   if not Assigned(FCallbacks) then exit;
-  for I := 0 to FCallbacks.Count - 1 do
+  CallbackCntM1 := FCallbacks.Count - 1;
+  for I := 0 to CallbackCntM1 do
     TNeuralFitCallback(FCallbacks[I]).OnEvaluate(Self, Epoch, ValLoss, ValAcc);
 end;
 
