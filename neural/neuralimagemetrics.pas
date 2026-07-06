@@ -690,6 +690,7 @@ function ExtractInceptionFeature(InceptionNet: TNNet;
 var
   PoolOut: TNNetVolume;
   i, dim: integer;
+  dimM1: integer;
 begin
   if InceptionNet = nil then
     raise Exception.Create('ExtractInceptionFeature: nil net');
@@ -700,7 +701,8 @@ begin
   PoolOut := InceptionNet.Layers[PoolFeatureIdx].Output;
   dim := PoolOut.Size;
   SetLength(Result, dim);
-  for i := 0 to dim - 1 do
+  dimM1 := dim - 1;
+  for i := 0 to dimM1 do
     Result[i] := PoolOut.FData[i];
 end;
 
@@ -1391,6 +1393,7 @@ function EvaluateImageNet(NN: TNNet;
   MaxConfusion: integer): TNNetImageNetStats;
 var
   SamplesHi, SIdx, rank, KM1, ConfCnt: integer;
+  NumClassesM1: integer;
   Gold, Top1: integer;
   OutVol: TNNetVolume;
   Pred: array of integer;
@@ -1413,6 +1416,7 @@ begin
   if NN = nil then Exit;
 
   KM1 := K - 1;
+  NumClassesM1 := NumClasses - 1;
   SetLength(Pred, K);
   SetLength(Scores, NumClasses);
   ConfCnt := 0;
@@ -1429,7 +1433,7 @@ begin
         'EvaluateImageNet: net output size %d < NumClasses %d',
         [OutVol.Size, NumClasses]);
     // Copy the first NumClasses scores (logits or probs - argmax is identical).
-    for rank := 0 to NumClasses - 1 do
+    for rank := 0 to NumClassesM1 do
       Scores[rank] := OutVol.FData[rank];
     TopKIndices(Scores, NumClasses, K, Pred);
 

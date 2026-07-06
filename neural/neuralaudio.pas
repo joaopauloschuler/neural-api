@@ -309,6 +309,7 @@ end;
 function ResampleVolume(Wave: TNNetVolume; SourceRate, TargetRate: integer): TNNetVolume;
 var
   NIn, NOut, OutCnt, J, JLo, JHi: integer;
+  NOutM1: integer;
   Ratio, Cutoff, SrcPos, Center, X, Acc, WSum, W, PiX, PiXA: double;
 
   // Lanczos-windowed sinc at offset T (in input-sample units), low-passed at
@@ -357,7 +358,8 @@ begin
   else
     Cutoff := 0.5 * Ratio;
 
-  for OutCnt := 0 to NOut - 1 do
+  NOutM1 := NOut - 1;
+  for OutCnt := 0 to NOutM1 do
   begin
     // Position of this output sample expressed in INPUT-sample coordinates.
     SrcPos := OutCnt / Ratio;
@@ -703,6 +705,7 @@ procedure BuildChromaFilterBank(Filt: TNNetVolume;
   SampleRate, NFFT, NumChroma: integer);
 var
   NumBins, NumKept, c, b, NumChromaM1, NumBinsM1, NumKeptM1: integer;
+  NumBinsM2: integer;
   Freq, Octave, StuttgartOver16, NumChroma2, Center, HalfWidth, FreqBin0: double;
   FreqBins: array of double;     // NFFT (the 0-Hz bin + NFFT-1 real bins)
   BinsWidth: array of double;    // NFFT
@@ -738,7 +741,8 @@ begin
 
   // bins_width = concatenate([max(diff(freq_bins),1.0), [1]])
   SetLength(BinsWidth, NumBins);
-  for b := 0 to NumBinsM1 - 1 do
+  NumBinsM2 := NumBinsM1 - 1;
+  for b := 0 to NumBinsM2 do
   begin
     Diff := FreqBins[b + 1] - FreqBins[b];
     if Diff < 1.0 then Diff := 1.0;
@@ -832,6 +836,7 @@ var
   procedure FFTRadix2;
   var
     i2, j2, lenF, halfF, k2, a2, b2: integer;
+    halfFM1: integer;
     ang, wRe, wIm, wpRe, wpIm, tmpF: double;
     uRe, uIm, vRe, vIm: double;
   begin
@@ -855,6 +860,7 @@ var
     while lenF <= NFFT do
     begin
       halfF := lenF shr 1;
+      halfFM1 := halfF - 1;
       ang := -2.0 * Pi / lenF;
       wpRe := Cos(ang);
       wpIm := Sin(ang);
@@ -862,7 +868,7 @@ var
       while i2 < NFFT do
       begin
         wRe := 1.0; wIm := 0.0;
-        for k2 := 0 to halfF - 1 do
+        for k2 := 0 to halfFM1 do
         begin
           a2 := i2 + k2;
           b2 := a2 + halfF;
