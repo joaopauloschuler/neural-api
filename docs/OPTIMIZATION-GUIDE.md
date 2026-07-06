@@ -204,6 +204,53 @@ Verified equivalent by the numerical gradient-check tests
 (`TestAttentiveStatsPoolingFeatureGradientCheck` /
 `...LogitGradientCheck`).
 
+**Anti-pattern — do NOT follow this: inline `V.FData[V.GetRawPos(x,y,d)]` at a
+single-use site.** The entire point of this rule is to *avoid recomputing the
+flat offset*. Calling `GetRawPos` **inline**, with the same indices the accessor
+would use, at a place where the result is used exactly once, achieves nothing —
+it is the same work the accessor already does, just spelled out and made harder
+to read.
+
+**Do NOT do this:**
+
+```pascal
+FOutput.FData[FOutput.GetRawPos(t, 0, c)] := sum;   // pointless
+err := FOutputError.FData[FOutputError.GetRawPos(X, Y, D)];   // pointless
+```
+
+**Because it is identical in cost to — and less readable than — the accessor:**
+
+```pascal
+FOutput[t, 0, c] := sum;
+err := FOutputError[X, Y, D];
+```
+
+The `[x, y, d]` getter/setter *is* `FData[GetRawPos(x, y, d)]` internally, and
+`GetRawPos` is `inline` in Release, so `V.FData[V.GetRawPos(x, y, d)]` and
+`V[x, y, d]` compile to the same code. Writing the long form buys no speed and
+loses clarity — and it silently bypasses bounds/shape checking for zero benefit.
+
+**The rule only pays off when the offset is *reused*.** Direct `FData` is
+worthwhile only in one of these shapes — otherwise keep the accessor:
+
+- **Reused base:** compute `base := V.GetRawPos(x, y, 0)` *once*, then hit it
+  more than once — `V.FData[base + k]`, `V.FData[base + HalfDepth]`, or across
+  several same-shaped volumes (`A.FData[base]`, `B.FData[base]`).
+- **Read-modify-write of one cell:** the accessor form
+  `V[x, y, d] := V[x, y, d] * s` computes the offset *twice*; `pos := V.GetRawPos(x, y, d); V.FData[pos] := V.FData[pos] * s` computes it once. That is a real save (offset used twice via `pos`).
+- **Running offset (strength reduction, #6):** `Inc(pos, stride)` /
+  `idx := idx + OutDepth` down a loop, seeded once.
+- **`(1,1,N)` / `(N,1,1)` collapse:** `FData[c]` / `FData[a]` directly, no
+  `GetRawPos` at all.
+
+**The test:** does the offset get used *at least twice* (or carried, or
+collapsed)? If not — a lone read or a lone write with the same indices as the
+accessor — leave it as `V[x, y, d]`. If you find yourself typing
+`V.FData[V.GetRawPos(...)]`, either bind the offset to a local you reuse, or
+revert to the accessor. This is exactly the over-application that had to be
+reverted after a rule #3 sweep across the GLU-family Compute writes, Retention,
+`DepthwiseConv1D`, `PixelShuffle`, `GetMinMaxAtDepth`/`FillAtDepth`, and others.
+
 ## 4. Hoist repeated subexpressions inside a loop body
 
 If the same subexpression appears more than once in a loop body, compute it
