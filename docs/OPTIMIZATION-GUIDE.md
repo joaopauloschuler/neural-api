@@ -299,3 +299,74 @@ behaviour, not just cost.
 > Note: a good optimizing compiler may hoist trivial invariants on its own, but
 > do not rely on it — hoisting explicitly guarantees the win, documents intent,
 > and often exposes further simplifications (e.g. a shared row-pointer).
+
+## 6. Replace loop multiplication with a running sum (strength reduction)
+
+When an expression multiplies the loop variable by a constant — `j * FDk`,
+`i * Stride`, `row * Width` — and the loop variable advances by a fixed step,
+the product advances by a *fixed increment* too. So maintain it as a running
+accumulator updated by addition, instead of recomputing the multiply every
+iteration. This is **strength reduction**: trading a per-iteration multiply for
+a per-iteration add (and a variable read), which is cheaper on essentially every
+CPU.
+
+It differs from the earlier recommendations:
+
+- **#4 (CSE)** removes a subexpression repeated *within one iteration*.
+- **#5 (invariant hoisting)** removes a value that does not change *at all*.
+- **#6 (strength reduction)** handles a value that *does* change each iteration,
+  but by a constant step — so it can be carried forward by `+=` instead of
+  recomputed from scratch.
+
+**Anti-example — do NOT follow this.** `j * FDk` and `(j + 1) * FDk` are each a
+multiply recomputed every iteration (and duplicated across the K and V rows),
+from the KV-cache eviction shift:
+
+```pascal
+for j := FEvictSinks to CacheLenM2 do
+begin
+  Move(FKCacheCodes[(j + 1) * FDk], FKCacheCodes[j * FDk], RowBytesI8);
+  Move(FVCacheCodes[(j + 1) * FDk], FVCacheCodes[j * FDk], RowBytesI8);
+  ...
+end;
+```
+
+**Do this — carry the offset by addition:**
+
+```pascal
+jDk := FEvictSinks * FDk;              // seed once: the first j * FDk
+for j := FEvictSinks to CacheLenM2 do
+begin
+  jP1Dk := jDk + FDk;                  // (j + 1) * FDk, by addition
+  Move(FKCacheCodes[jP1Dk], FKCacheCodes[jDk], RowBytesI8);
+  Move(FVCacheCodes[jP1Dk], FVCacheCodes[jDk], RowBytesI8);
+  ...
+  jDk := jP1Dk;                        // advance: next iteration's j * FDk
+end;
+```
+
+The single seed multiply outside the loop replaces one multiply *per iteration*;
+`jDk` and `jP1Dk` are each computed once and reused for both the K and V rows
+(folding in #4's de-duplication).
+
+**Why it matters**
+
+- **Multiply → add** — the inner loop becomes add-only; only one multiply (the
+  seed) remains, outside the loop.
+- **Fewer operations overall** — combined with reusing each offset for the K and
+  V rows, four multiplies per iteration collapse to one add plus one copy-forward.
+
+**Caveats.**
+
+- **The step must be constant.** Strength reduction is valid only because `j`
+  advances by exactly 1 (so the product advances by exactly `FDk`). If the
+  induction variable's step varies, the increment is not constant and this does
+  not apply.
+- **Keep the accumulator in sync with the branch that uses it.** Here `jDk` is
+  advanced inside the `if FKVQuantInt8` branch, which is safe *only because the
+  condition is loop-invariant* (it is the same every iteration, so the branch —
+  and the advance — runs on every pass). If the branch could vary per iteration,
+  advance the accumulator unconditionally in the loop body instead.
+- **Seed correctly.** The initial value must equal the product at the loop's
+  first index (`FEvictSinks * FDk`, not `0`), or every subsequent offset is
+  wrong.
