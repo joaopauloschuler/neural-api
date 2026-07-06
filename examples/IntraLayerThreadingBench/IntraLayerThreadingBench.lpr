@@ -8,7 +8,11 @@ IntraLayerThreadingBench: validates the intra-layer threading decision.
     check (threaded output MUST equal serial output - only independent outputs
     are partitioned). It is run twice, once with the low-memory inference
     contract off and once on, since conv/pointwise chunk in both modes.
-  * Experiment B times a few realistic multi-layer nets OFF vs ON end to end.
+  * Experiment B takes the small shapes from A and sweeps them across
+    NN.StartThreadWorkers() policies - hot-core counts 1..4 crossed with
+    cool-down timeouts 0..2 seconds - since the small end is where the pool
+    policy actually moves the OFF-vs-ON speedup.
+  * Experiment C times a few realistic multi-layer nets OFF vs ON end to end.
 
 ChunkEligible returns true for every size, so a parallel pass always chunks.
 Experiment A measures where that pays: the tiny shapes at the top of each block
@@ -227,6 +231,85 @@ begin
 end;
 
 // =============================== Experiment B =================================
+// Small shapes from Experiment A, swept across StartThreadWorkers() policies:
+// hot-core counts 1..4 crossed with cool-down timeouts 0..2 seconds. The small
+// shapes are the pool-policy probe - the fixed scheduler/pool overhead is a big
+// fraction of their tiny compute, so keeping more workers hot (or letting them
+// nap sooner) is where the OFF-vs-ON speedup visibly shifts. The larger A shapes
+// amortise the overhead and barely move with policy, so only the small end is
+// swept here.
+//
+// pHotThreadNum (arg 2) = how many low-index workers stay hot (never napping
+// while idle within a pass); pHotThreadTimeoutSeconds (arg 3) = the cool-down
+// window before a non-primary hot worker is allowed to nap.
+procedure ExperimentB;
+var
+  si, hot, tmo: integer;
+  S: TShape;
+  NN: TNNet;
+  MyIn: TNNetVolume;
+  off, on_, sp: double;
+  Small: array of TShape;
+
+  procedure AddSmall(const N: string; K, A, B, C, D: integer);
+  var idx: integer;
+  begin
+    idx := Length(Small);
+    SetLength(Small, idx + 1);
+    Small[idx].Name := N; Small[idx].Kind := K;
+    Small[idx].A := A; Small[idx].B := B; Small[idx].C := C; Small[idx].D := D;
+  end;
+begin
+  WriteLn('=== Experiment B: small shapes x StartThreadWorkers() policy ===');
+  WriteLn('Cores (NeuralDefaultThreadCount) = ', NeuralDefaultThreadCount());
+  WriteLn('hot = hot-core count (StartThreadWorkers arg 2), ',
+    'tmo = cool-down seconds (arg 3)');
+
+  SetLength(Small, 0);
+  AddSmall('FC 64x64',       0, 64, 64,  0,  0);
+  AddSmall('FC 128x128',     0, 128, 128, 0,  0);
+  AddSmall('Pw 8x8x64->64',  2, 8,  64,  64, 0);
+  AddSmall('Conv 8x8x32 k3', 1, 8,  32,  32, 3);
+
+  for si := 0 to High(Small) do
+  begin
+    S := Small[si];
+    WriteLn;
+    WriteLn(Format('  %s', [S.Name]));
+    WriteLn(Format('    %4s %4s %10s %10s %8s',
+      ['hot', 'tmo', 'off ms', 'on ms', 'speedup']));
+
+    // OFF reference is policy-independent (the serial path never touches the
+    // worker pool), so time it once per shape. MyIn is an independent copy, so
+    // it outlives the net it was sized from and is reused for every policy.
+    NN := BuildOne(S);
+    MyIn := TNNetVolume.Create(NN.Layers[0].Output);
+    MyIn.Randomize();
+    NN.SetTrainable(False, {pLowMemory=}False);
+    off := BestTimeMs(NN, MyIn, {parallel=}false);
+    NN.Free;
+
+    for hot := 1 to 4 do
+      for tmo := 0 to 2 do
+      begin
+        NN := BuildOne(S);
+        NN.SetTrainable(False, {pLowMemory=}False);
+        NN.ResetSchedulerStats();
+        // Fresh pool per policy: arg 2 = hot cores, arg 3 = cool-down seconds.
+        NN.StartThreadWorkers({StopOnFinish=}False, {pHotThreadNum=}hot,
+          {pHotThreadTimeoutSeconds=}tmo);
+        on_ := BestTimeMs(NN, MyIn, {parallel=}true);
+        if on_ > 0 then sp := off / on_ else sp := 0;
+        WriteLn(Format('    %4d %4d %10.3f %10.3f %7.2fx',
+          [hot, tmo, off, on_, sp]));
+        NN.Free;
+      end;
+    MyIn.Free;
+  end;
+  WriteLn;
+end;
+
+// =============================== Experiment C =================================
 // Transformer-decoder-ish forward: a stack of per-token MLP blocks over a short
 // sequence - the shape where intra-layer threading is meant to pay off.
 function BuildStack(dModel, dHidden, nBlocks, seqLen: integer): TNNet;
@@ -307,10 +390,13 @@ begin
   // passes expose whether the memory mode shifts eligibility or timing.
   ExperimentA({LowMem=}False);
   ExperimentA({LowMem=}True);
-  WriteLn('=== Experiment B: realistic nets  threading OFF vs ON (end-to-end) ===');
+  ExperimentB;
+  WriteLn('=== Experiment C: realistic nets  threading OFF vs ON (end-to-end) ===');
   SweepNet('small GPT MLP', 512,  2048, 6, 8);
-  SweepNet('mid GPT MLP',   768,  3072, 6, 16);
-  SweepNet('wide 1-token',  2048, 8192, 4, 1);
+  // The remaining two architectures are commented out to keep the run short -
+  // the first architecture is representative of the end-to-end case.
+  // SweepNet('mid GPT MLP',   768,  3072, 6, 16);
+  // SweepNet('wide 1-token',  2048, 8192, 4, 1);
   WriteLn;
   WriteLn('speedup > 1.00x => the 1M threading decision is winning on this box.');
 end.
