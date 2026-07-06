@@ -2092,15 +2092,19 @@ function NeuralLinearSolve(var A: array of TNeuralFloat;
   var B: array of TNeuralFloat; n, m: integer): boolean;
 var
   col, row, piv, k: integer;
+  nM1, mM1, rowStart: integer;
   maxAbs, v, factor, diag, tmp: TNeuralFloat;
 begin
   Result := True;
-  for col := 0 to n - 1 do
+  nM1 := n - 1;
+  mM1 := m - 1;
+  for col := 0 to nM1 do
   begin
     // Partial pivot: pick the row (>= col) with the largest |A[row,col]|.
     piv := col;
     maxAbs := Abs(A[col * n + col]);
-    for row := col + 1 to n - 1 do
+    rowStart := col + 1;
+    for row := rowStart to nM1 do
     begin
       v := Abs(A[row * n + col]);
       if v > maxAbs then begin maxAbs := v; piv := row; end;
@@ -2110,11 +2114,11 @@ begin
     // Swap the pivot row into place (in both A and B).
     if piv <> col then
     begin
-      for k := 0 to n - 1 do
+      for k := 0 to nM1 do
       begin
         tmp := A[col * n + k]; A[col * n + k] := A[piv * n + k]; A[piv * n + k] := tmp;
       end;
-      for k := 0 to m - 1 do
+      for k := 0 to mM1 do
       begin
         tmp := B[col * m + k]; B[col * m + k] := B[piv * m + k]; B[piv * m + k] := tmp;
       end;
@@ -2122,18 +2126,18 @@ begin
 
     // Normalise the pivot row so A[col,col] = 1.
     diag := A[col * n + col];
-    for k := 0 to n - 1 do A[col * n + k] := A[col * n + k] / diag;
-    for k := 0 to m - 1 do B[col * m + k] := B[col * m + k] / diag;
+    for k := 0 to nM1 do A[col * n + k] := A[col * n + k] / diag;
+    for k := 0 to mM1 do B[col * m + k] := B[col * m + k] / diag;
 
     // Eliminate the pivot column from every other row.
-    for row := 0 to n - 1 do
+    for row := 0 to nM1 do
     begin
       if row = col then Continue;
       factor := A[row * n + col];
       if factor = 0 then Continue;
-      for k := 0 to n - 1 do
+      for k := 0 to nM1 do
         A[row * n + k] := A[row * n + k] - factor * A[col * n + k];
-      for k := 0 to m - 1 do
+      for k := 0 to mM1 do
         B[row * m + k] := B[row * m + k] - factor * B[col * m + k];
     end;
   end;
@@ -2194,6 +2198,7 @@ var
   Order: TNeuralIntegerArray;
   Keep: array of boolean;
   i, jj, oi, oj, tmp, HiCand, KeptCnt: integer;
+  jjStart: integer;
   IoU: TNeuralFloat;
 begin
   SetLength(Result, 0);
@@ -2204,9 +2209,12 @@ begin
   SetLength(Order, Count);
   for i := 0 to HiCand do Order[i] := i;
   for i := 0 to HiCand do
-    for jj := i + 1 to HiCand do
+  begin
+    jjStart := i + 1;
+    for jj := jjStart to HiCand do
       if Scores[Order[jj]] > Scores[Order[i]] then
       begin tmp := Order[i]; Order[i] := Order[jj]; Order[jj] := tmp; end;
+  end;
   // Greedy NMS over the sorted order: a later box is suppressed only by an
   // earlier (higher-score) kept box of the SAME class with IoU > threshold.
   SetLength(Keep, Count);
@@ -2215,7 +2223,8 @@ begin
   begin
     if not Keep[i] then Continue;
     oi := Order[i];
-    for jj := i + 1 to HiCand do
+    jjStart := i + 1;
+    for jj := jjStart to HiCand do
     begin
       oj := Order[jj];
       if (not Keep[jj]) or (Classes[oj] <> Classes[oi]) then Continue;
@@ -2342,7 +2351,7 @@ begin
   // is paired with another sample from the same list (minibatch mixup).
   SetLength(Perm, Cnt);
   for I := 0 to CntM1 do Perm[I] := I;
-  for I := Cnt - 1 downto 1 do
+  for I := CntM1 downto 1 do
   begin
     J := Random(I + 1);
     Tmp := Perm[I]; Perm[I] := Perm[J]; Perm[J] := Tmp;
@@ -2417,7 +2426,7 @@ begin
   // Random partner permutation (Fisher-Yates) -> minibatch CutMix.
   SetLength(Perm, Cnt);
   for I := 0 to CntM1 do Perm[I] := I;
-  for I := Cnt - 1 downto 1 do
+  for I := CntM1 downto 1 do
   begin
     J := Random(I + 1);
     Tmp := Perm[I]; Perm[I] := Perm[J]; Perm[J] := Tmp;
@@ -2869,14 +2878,15 @@ end;
 function TNNetSamplerTopP.GetToken(Origin: TNNetVolume): integer;
 var
   CumulativeSum: TNeuralFloat;
-  I, Threshold, Hi: Integer;
+  I, Threshold, Hi, Lo: Integer;
 begin
   Origin.GetTokenArray(FTokenArr);
   SortTokenArray();
   CumulativeSum := 0;
   Threshold := 0;
   Hi := High(FTokenArr);
-  for I := Low(FTokenArr) to Hi do
+  Lo := Low(FTokenArr);
+  for I := Lo to Hi do
   begin
     CumulativeSum := CumulativeSum + FTokenArr[i].Score;
     if CumulativeSum > FTopP then
@@ -2897,14 +2907,15 @@ function TNNetSamplerTopP.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 var
   CumulativeSum: TNeuralFloat;
-  I, Threshold, Hi: Integer;
+  I, Threshold, Hi, Lo: Integer;
 begin
   Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
   SortTokenArray();
   CumulativeSum := 0;
   Threshold := 0;
   Hi := High(FTokenArr);
-  for I := Low(FTokenArr) to Hi do
+  Lo := Low(FTokenArr);
+  for I := Lo to Hi do
   begin
     CumulativeSum := CumulativeSum + FTokenArr[i].Score;
     if CumulativeSum > FTopP then
@@ -2932,7 +2943,7 @@ end;
 function TNNetSamplerMinP.SampleFromSorted(): integer;
 var
   Threshold, KeptSum, Roll, Cumulative: TNeuralFloat;
-  I, KeptCount, KeptCountM1, Hi: integer;
+  I, KeptCount, KeptCountM1, Hi, Lo: integer;
 begin
   if Length(FTokenArr) = 0 then
   begin
@@ -2944,7 +2955,8 @@ begin
   KeptCount := 0;
   KeptSum := 0;
   Hi := High(FTokenArr);
-  for I := Low(FTokenArr) to Hi do
+  Lo := Low(FTokenArr);
+  for I := Lo to Hi do
   begin
     if FTokenArr[I].Score >= Threshold then
     begin
@@ -3086,7 +3098,7 @@ var
   Entropy, P, Surprise, KeptSum, Roll, Cumulative: TNeuralFloat;
   Dist: array of TNeuralFloat; // |surprise - entropy| per FTokenArr entry
   Order: array of integer;     // FTokenArr indices sorted by ascending Dist
-  I, J, KeptCount, KeptCountM1, Tmp, N, NM1, NM2: integer;
+  I, J, KeptCount, KeptCountM1, Tmp, N, NM1, NM2, JStart: integer;
 begin
   N := Length(FTokenArr);
   if N = 0 then
@@ -3116,11 +3128,14 @@ begin
   // Selection sort of Order by ascending Dist (vocab-sized but only run once
   // per step; mirrors the simple sort style used elsewhere in this unit).
   for I := 0 to NM2 do
-    for J := I + 1 to NM1 do
+  begin
+    JStart := I + 1;
+    for J := JStart to NM1 do
       if Dist[Order[J]] < Dist[Order[I]] then
       begin
         Tmp := Order[I]; Order[I] := Order[J]; Order[J] := Tmp;
       end;
+  end;
   // Smallest prefix (by ascending distance) whose cumulative mass reaches FMass.
   KeptCount := 0;
   KeptSum := 0;
@@ -7332,10 +7347,11 @@ end;
 
 procedure TVolume.ClearTag();
 var
-  I, Hi: integer;
+  I, Hi, Lo: integer;
 begin
   Hi := High(FTag);
-  for I := Low(FTag) to Hi do FTag[I] := 0;
+  Lo := Low(FTag);
+  for I := Lo to Hi do FTag[I] := 0;
 end;
 
 function TVolume.NeuralToStr(V: TNeuralFloat): string;
@@ -7695,7 +7711,7 @@ end;
 procedure TVolume.PointwiseSoftMax(NoForward: boolean = false);
 var
   I, StartPointPos: integer;
-  MaxX, MaxY, MaxD, FDepthM1: integer;
+  MaxX, MaxY, MaxD, FDepthM1, MaxDP1: integer;
   CountX, CountY, CountD: integer;
   MaxValue: T;
   LocalValue: T;
@@ -7776,8 +7792,9 @@ begin
         StartPointPos := GetRawPos(CountX, CountY);
         if NoForward and (MaxD < FDepth - 1) then
         begin
-          I := StartPointPos + MaxD + 1;
-          for CountD := MaxD + 1 to FDepthM1 do
+          MaxDP1 := MaxD + 1;
+          I := StartPointPos + MaxDP1;
+          for CountD := MaxDP1 to FDepthM1 do
           begin
             FData[I] := 0;
             Inc(I);
@@ -7892,26 +7909,28 @@ begin
 end;
 {$ELSE}
 var
-  I: integer;
+  I, NM1: integer;
 begin
-  for I := 0 to N - 1 do
+  NM1 := N - 1;
+  for I := 0 to NM1 do
     pDst^[I] := pcr_expf(pSrc^[I]);
 end;
 {$ENDIF}
 
 class procedure TNNetVolume.VectorSigmoid(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 var
-  I: integer;
+  I, NM1: integer;
   S: TNeuralFloat;
 begin
   if N <= 0 then exit;
+  NM1 := N - 1;
   // sigmoid(x) = 1/(1+exp(-x)). Compute exp(-x) into the destination buffer in a
   // single vectorized pass, then finish elementwise. The scalar form below mirrors
   // the reference Sigmoid() (avoids overflow for very negative x).
-  for I := 0 to N - 1 do
+  for I := 0 to NM1 do
     pDst^[I] := -pSrc^[I];
   VectorExp(pDst, pDst, N);
-  for I := 0 to N - 1 do
+  for I := 0 to NM1 do
   begin
     S := pDst^[I]; // S = exp(-x)
     pDst^[I] := 1 / (1 + S);
@@ -7920,15 +7939,16 @@ end;
 
 class procedure TNNetVolume.VectorTanh(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 var
-  I: integer;
+  I, NM1: integer;
   X, E: TNeuralFloat;
 begin
   if N <= 0 then exit;
+  NM1 := N - 1;
   // tanh(x) = (1 - exp(-2x)) / (1 + exp(-2x)). Compute E = exp(-2x) in a single
   // vectorized pass, clamping -2x into [-88, 88] so exp neither overflows nor
   // underflows (tanh saturates to +/-1 there, matching the scalar pcr_tanhf).
   // No sign read in the finishing pass, so buffers may alias (dst = src).
-  for I := 0 to N - 1 do
+  for I := 0 to NM1 do
   begin
     X := -2 * pSrc^[I];
     if X > 88 then X := 88
@@ -7936,7 +7956,7 @@ begin
     pDst^[I] := X;
   end;
   VectorExp(pDst, pDst, N);
-  for I := 0 to N - 1 do
+  for I := 0 to NM1 do
   begin
     E := pDst^[I]; // E = exp(-2x) in [exp(-88), exp(88)]
     pDst^[I] := (1 - E) / (1 + E);
@@ -7953,23 +7973,24 @@ const
   cErfA5: TNeuralFloat =  1.061405429;
   cErfP:  TNeuralFloat =  0.3275911;
 var
-  I: integer;
+  I, NM1: integer;
   X, AX, T, Poly, E: TNeuralFloat;
   ExpBuf: array of TNeuralFloat;
 begin
   if N <= 0 then exit;
+  NM1 := N - 1;
   // erf(x) = sign(x) * (1 - poly(t)*exp(-x^2)), t = 1/(1+p*|x|).
   // exp(-x^2) is produced by a single vectorized VectorExp pass into a scratch
   // buffer (NOT pDst) so that pSrc -- which still holds x for the |x| and sign
   // terms in the finishing pass -- is never clobbered. Hence dst may alias src.
   SetLength(ExpBuf, N);
-  for I := 0 to N - 1 do
+  for I := 0 to NM1 do
   begin
     X := pSrc^[I];
     ExpBuf[I] := -X * X;
   end;
   VectorExp(TNeuralFloatArrPtr(@ExpBuf[0]), TNeuralFloatArrPtr(@ExpBuf[0]), N);
-  for I := 0 to N - 1 do
+  for I := 0 to NM1 do
   begin
     X := pSrc^[I];
     if X < 0 then AX := -X else AX := X;
@@ -7986,11 +8007,12 @@ end;
 
 class procedure TNNetVolume.VectorSinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 var
-  I: integer;
+  I, NM1: integer;
   X, EPos, ENeg: TNeuralFloat;
   PosBuf, NegBuf: array of TNeuralFloat;
 begin
   if N <= 0 then exit;
+  NM1 := N - 1;
   // sinh(x) = (exp(x) - exp(-x)) / 2. Both exponentials are produced by single
   // vectorized VectorExp passes into local scratch buffers (NOT pDst), so pSrc --
   // read for nothing past the fill below -- is never clobbered and dst may alias
@@ -7998,7 +8020,7 @@ begin
   // (sinh would overflow to +/-Inf there anyway, matching the scalar pcr_sinhf).
   SetLength(PosBuf, N);
   SetLength(NegBuf, N);
-  for I := 0 to N - 1 do
+  for I := 0 to NM1 do
   begin
     X := pSrc^[I];
     if X > 88 then X := 88
@@ -8008,7 +8030,7 @@ begin
   end;
   VectorExp(TNeuralFloatArrPtr(@PosBuf[0]), TNeuralFloatArrPtr(@PosBuf[0]), N);
   VectorExp(TNeuralFloatArrPtr(@NegBuf[0]), TNeuralFloatArrPtr(@NegBuf[0]), N);
-  for I := 0 to N - 1 do
+  for I := 0 to NM1 do
   begin
     EPos := PosBuf[I]; // exp(x)
     ENeg := NegBuf[I]; // exp(-x)
@@ -8024,9 +8046,10 @@ begin
 end;
 {$ELSE}
 var
-  I: integer;
+  I, NM1: integer;
 begin
-  for I := 0 to N - 1 do
+  NM1 := N - 1;
+  for I := 0 to NM1 do
     pDst^[I] := pcr_logf(pSrc^[I]);
 end;
 {$ENDIF}
@@ -8039,9 +8062,10 @@ begin
 end;
 {$ELSE}
 var
-  I: integer;
+  I, NM1: integer;
 begin
-  for I := 0 to N - 1 do
+  NM1 := N - 1;
+  for I := 0 to NM1 do
     pDst^[I] := pcr_sinf(pSrc^[I]);
 end;
 {$ENDIF}
@@ -8054,31 +8078,33 @@ begin
 end;
 {$ELSE}
 var
-  I: integer;
+  I, NM1: integer;
 begin
-  for I := 0 to N - 1 do
+  NM1 := N - 1;
+  for I := 0 to NM1 do
     pDst^[I] := pcr_cosf(pSrc^[I]);
 end;
 {$ENDIF}
 
 class procedure TNNetVolume.VectorArcSinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 var
-  I: integer;
+  I, NM1: integer;
   X: TNeuralFloat;
   ArgBuf: array of TNeuralFloat;
 begin
   if N <= 0 then exit;
+  NM1 := N - 1;
   // arcsinh(x) = ln(x + sqrt(x^2 + 1)). The argument x + sqrt(x^2+1) is always >= 1
   // and is built into a scratch buffer (NOT pDst) so pSrc is never clobbered before
   // it is read -- hence dst may alias src. VectorLn then supplies the AVX2 ln pass.
   SetLength(ArgBuf, N);
-  for I := 0 to N - 1 do
+  for I := 0 to NM1 do
   begin
     X := pSrc^[I];
     ArgBuf[I] := X + Sqrt(X * X + 1.0);
   end;
   VectorLn(TNeuralFloatArrPtr(@ArgBuf[0]), TNeuralFloatArrPtr(@ArgBuf[0]), N);
-  for I := 0 to N - 1 do
+  for I := 0 to NM1 do
     pDst^[I] := ArgBuf[I];
 end;
 
@@ -8163,7 +8189,7 @@ end;
 
 procedure TVolume.OneHotEncoding(aTokens: array of integer);
 var
-  CntToken, MaxToken, Token, SizeXM1: integer;
+  CntToken, MaxToken, Token, SizeXM1, MaxTokenP1: integer;
 begin
   MaxToken := Length(aTokens) - 1;
   SizeXM1 := SizeX - 1;
@@ -8184,7 +8210,8 @@ begin
     end;
     if MaxToken < SizeX - 1 then
     begin
-      for CntToken := MaxToken + 1 to SizeXM1 do
+      MaxTokenP1 := MaxToken + 1;
+      for CntToken := MaxTokenP1 to SizeXM1 do
       begin
         Self[CntToken, 0, 0] := 1;
       end;
@@ -8926,7 +8953,7 @@ end;
 function TVolume.SaveToString(): string;
 var
   S: TNNetStringList;
-  I, Hi: integer;
+  I, Hi, Lo: integer;
   version: integer;
   AuxFloat: Single;
 begin
@@ -8939,7 +8966,8 @@ begin
   S.Add( IntToStr(FDepth) );
 
   Hi := High(FData);
-  for I := Low(FData) to Hi do
+  Lo := Low(FData);
+  for I := Lo to Hi do
   begin
     AuxFloat := FData[I];
     S.Add( FloatToStr(AuxFloat, FFormatSettings) );
@@ -11743,10 +11771,11 @@ end;
 procedure AVXExp(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer);
 {$IFDEF AVX2}
 var
-  localNumElements, MissedElements, I: integer;
+  localNumElements, MissedElements, I, NumElementsM1: integer;
 begin
   MissedElements := NumElements and 7;
   localNumElements := NumElements xor MissedElements;
+  NumElementsM1 := NumElements - 1;
   if localNumElements > 0 then
   begin
   asm
@@ -11795,14 +11824,15 @@ begin
   end ['eax','ecx','edx',
        'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5','ymm6'];
   end;
-  for I := localNumElements to NumElements - 1 do
+  for I := localNumElements to NumElementsM1 do
     pDst^[I] := pcr_expf(pSrc^[I]);
 end;
 {$ELSE}
 var
-  I: integer;
+  I, NumElementsM1: integer;
 begin
-  for I := 0 to NumElements - 1 do
+  NumElementsM1 := NumElements - 1;
+  for I := 0 to NumElementsM1 do
     pDst^[I] := pcr_expf(pSrc^[I]);
 end;
 {$ENDIF}
@@ -11812,22 +11842,24 @@ end;
   to the RTL while the 64-bit build provides the 8-wide vectorized AVXLn. }
 procedure AVXLn(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer);
 var
-  I: integer;
+  I, NumElementsM1: integer;
 begin
-  for I := 0 to NumElements - 1 do
+  NumElementsM1 := NumElements - 1;
+  for I := 0 to NumElementsM1 do
     pDst^[I] := pcr_logf(pSrc^[I]);
 end;
 
 { AVXSinCos (32-bit): scalar RTL loop (see AVXLn note on the register pressure). }
 procedure AVXSinCos(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer; DoCos: boolean);
 var
-  I: integer;
+  I, NumElementsM1: integer;
 begin
+  NumElementsM1 := NumElements - 1;
   if DoCos then
-    for I := 0 to NumElements - 1 do
+    for I := 0 to NumElementsM1 do
       pDst^[I] := pcr_cosf(pSrc^[I])
   else
-    for I := 0 to NumElements - 1 do
+    for I := 0 to NumElementsM1 do
       pDst^[I] := pcr_sinf(pSrc^[I]);
 end;
 
@@ -13285,10 +13317,11 @@ end;
 procedure AVXExp(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer);
 {$IFDEF AVX2}
 var
-  localNumElements, MissedElements, I: integer;
+  localNumElements, MissedElements, I, NumElementsM1: integer;
 begin
   MissedElements := NumElements and 7;
   localNumElements := NumElements xor MissedElements;
+  NumElementsM1 := NumElements - 1;
   if localNumElements > 0 then
   begin
   asm
@@ -13339,14 +13372,15 @@ begin
        'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5',
        'ymm10','ymm11','ymm12','ymm13','ymm14'];
   end;
-  for I := localNumElements to NumElements - 1 do
+  for I := localNumElements to NumElementsM1 do
     pDst^[I] := pcr_expf(pSrc^[I]);
 end;
 {$ELSE}
 var
-  I: integer;
+  I, NumElementsM1: integer;
 begin
-  for I := 0 to NumElements - 1 do
+  NumElementsM1 := NumElements - 1;
+  for I := 0 to NumElementsM1 do
     pDst^[I] := pcr_expf(pSrc^[I]);
 end;
 {$ENDIF}
@@ -13357,10 +13391,11 @@ end;
 procedure AVXLn(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer);
 {$IFDEF AVX2}
 var
-  localNumElements, MissedElements, I: integer;
+  localNumElements, MissedElements, I, NumElementsM1: integer;
 begin
   MissedElements := NumElements and 7;
   localNumElements := NumElements xor MissedElements;
+  NumElementsM1 := NumElements - 1;
   if localNumElements > 0 then
   begin
   asm
@@ -13440,14 +13475,15 @@ begin
   end ['rax','rcx','r8',
        'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5','ymm6','ymm15'];
   end;
-  for I := localNumElements to NumElements - 1 do
+  for I := localNumElements to NumElementsM1 do
     pDst^[I] := pcr_logf(pSrc^[I]);
 end;
 {$ELSE}
 var
-  I: integer;
+  I, NumElementsM1: integer;
 begin
-  for I := 0 to NumElements - 1 do
+  NumElementsM1 := NumElements - 1;
+  for I := 0 to NumElementsM1 do
     pDst^[I] := pcr_logf(pSrc^[I]);
 end;
 {$ENDIF}
@@ -13457,10 +13493,11 @@ end;
 procedure AVXSinCos(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer; DoCos: boolean);
 {$IFDEF AVX2}
 var
-  localNumElements, MissedElements, I: integer;
+  localNumElements, MissedElements, I, NumElementsM1: integer;
 begin
   MissedElements := NumElements and 7;
   localNumElements := NumElements xor MissedElements;
+  NumElementsM1 := NumElements - 1;
   if localNumElements > 0 then
   begin
   if DoCos then
@@ -13614,21 +13651,22 @@ begin
   end;
   end;
   if DoCos then
-    for I := localNumElements to NumElements - 1 do
+    for I := localNumElements to NumElementsM1 do
       pDst^[I] := pcr_cosf(pSrc^[I])
   else
-    for I := localNumElements to NumElements - 1 do
+    for I := localNumElements to NumElementsM1 do
       pDst^[I] := pcr_sinf(pSrc^[I]);
 end;
 {$ELSE}
 var
-  I: integer;
+  I, NumElementsM1: integer;
 begin
+  NumElementsM1 := NumElements - 1;
   if DoCos then
-    for I := 0 to NumElements - 1 do
+    for I := 0 to NumElementsM1 do
       pDst^[I] := pcr_cosf(pSrc^[I])
   else
-    for I := 0 to NumElements - 1 do
+    for I := 0 to NumElementsM1 do
       pDst^[I] := pcr_sinf(pSrc^[I]);
 end;
 {$ENDIF}
