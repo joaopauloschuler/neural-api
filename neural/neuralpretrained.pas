@@ -65027,14 +65027,16 @@ begin
     LoadT2IAdapterConvIn(Reader, ConvInRef, 'adapter.conv_in.weight',
       'adapter.conv_in.bias', d0, Config.CondChannels, Config.DownscaleFactor, 3);
     InCh := d0;
-    for i := 0 to n - 1 do
+    nM1 := n - 1;
+    NumResBlocksM1 := Config.NumResBlocks - 1;
+    for i := 0 to nM1 do
     begin
       OutCh := Config.Channels[i];
       if InConvRef[i] <> nil then
         LoadVaeConv(Reader, InConvRef[i],
           'adapter.body.' + IntToStr(i) + '.in_conv.weight',
           'adapter.body.' + IntToStr(i) + '.in_conv.bias', OutCh, InCh, 1);
-      for j := 0 to Config.NumResBlocks - 1 do
+      for j := 0 to NumResBlocksM1 do
       begin
         Prefix := 'adapter.body.' + IntToStr(i) + '.resnets.' + IntToStr(j) + '.';
         LoadVaeConv(Reader, Block1Ref[i][j], Prefix + 'block1.weight',
