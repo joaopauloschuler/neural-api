@@ -60308,6 +60308,7 @@ var
   gy, gx, ny, nx, half: integer;
   PatchGrid: integer;
   NumStagesM1, HeadsM1, HeadDimM1, NumWindowsM1, halfM1: integer;
+  DepthsStageM1: integer;
 begin
   NumStages := Length(Config.Depths);
   NumStagesM1 := NumStages - 1;
@@ -60357,7 +60358,8 @@ begin
       end;
       ws2 := EffWindow * EffWindow;
       Prefix := 'encoder.layers.' + IntToStr(StageIdx) + '.';
-      for BlockIdx := 0 to Config.Depths[StageIdx] - 1 do
+      DepthsStageM1 := Config.Depths[StageIdx] - 1;
+      for BlockIdx := 0 to DepthsStageM1 do
       begin
         Shifted := (Odd(BlockIdx)) and (ShiftSize > 0);
         if Shifted then EffShift := ShiftSize else EffShift := 0;
@@ -60592,6 +60594,7 @@ var
   Mat: TNNetVolume;
   qReg, kReg, RegBase: integer;
   side, sideM1: integer;
+  HiddenM1, NumHeadsM1, ws2M1, NumWindowsM1: integer;
 begin
   ws2 := WindowSize * WindowSize;
   side := 2 * WindowSize - 1;
@@ -60612,6 +60615,8 @@ begin
       'attention.self.continuous_position_bias_mlp.2.weight', Mlp2W);
     Reader.LoadTensorFlat(BPrefix + 'attention.self.logit_scale', LogitRaw);
     Hidden := Mlp0B.Size;        // 512 in HF
+    HiddenM1 := Hidden - 1;
+    NumHeadsM1 := NumHeads - 1;
     HiddenAct.ReSize(Hidden, 1, 1);
     BiasTable.ReSize(NumCoords, 1, NumHeads);
 
@@ -60643,7 +60648,7 @@ begin
         else
           Coord[1] := -Ln(Abs(coord1) + 1.0) / Ln(8.0);
         // MLP layer 0: Linear(2 -> Hidden) + bias, then ReLU
-        for hdn := 0 to Hidden - 1 do
+        for hdn := 0 to HiddenM1 do
         begin
           acc := Mlp0B.FData[hdn] +
             Mlp0W.FData[hdn * 2 + 0] * Coord[0] +
@@ -60652,10 +60657,10 @@ begin
           HiddenAct.FData[hdn] := acc;
         end;
         // MLP layer 2: Linear(Hidden -> NumHeads), no bias; then 16*sigmoid.
-        for h := 0 to NumHeads - 1 do
+        for h := 0 to NumHeadsM1 do
         begin
           acc := 0;
-          for hdn := 0 to Hidden - 1 do
+          for hdn := 0 to HiddenM1 do
             acc := acc + Mlp2W.FData[h * Hidden + hdn] * HiddenAct.FData[hdn];
           biasVal := 16.0 / (1.0 + Exp(-acc));
           BiasTable.FData[c * NumHeads + h] := biasVal;
@@ -60665,14 +60670,16 @@ begin
     // ---- per (window, head): gather bias by RelPosIndex, add shift mask ----
     clampMax := Ln(1.0 / 0.01); // HF: clamp(logit_scale, max=log(1/0.01))
     Mat := TNNetVolume.Create(ws2 * ws2, 1, 1);
+    ws2M1 := ws2 - 1;
+    NumWindowsM1 := NumWindows - 1;
     try
-      for wIdx := 0 to NumWindows - 1 do
+      for wIdx := 0 to NumWindowsM1 do
       begin
         RegBase := wIdx * ws2;
-        for h := 0 to NumHeads - 1 do
+        for h := 0 to NumHeadsM1 do
         begin
-          for i := 0 to ws2 - 1 do
-            for j := 0 to ws2 - 1 do
+          for i := 0 to ws2M1 do
+            for j := 0 to ws2M1 do
             begin
               idx := RelPosIndex[i * ws2 + j];
               biasVal := BiasTable.FData[idx * NumHeads + h];
@@ -60723,6 +60730,7 @@ var
   gy, gx, ny, nx, half: integer;
   PatchGrid, LayersBase: integer;
   NumStagesM1, HeadsM1, HeadDimM1, NumWindowsM1, halfM1: integer;
+  DepthsStageM1: integer;
 begin
   NumStages := Length(Config.Depths);
   NumStagesM1 := NumStages - 1;
@@ -60767,7 +60775,8 @@ begin
       end;
       ws2 := EffWindow * EffWindow;
       Prefix := 'encoder.layers.' + IntToStr(StageIdx) + '.';
-      for BlockIdx := 0 to Config.Depths[StageIdx] - 1 do
+      DepthsStageM1 := Config.Depths[StageIdx] - 1;
+      for BlockIdx := 0 to DepthsStageM1 do
       begin
         Shifted := (Odd(BlockIdx)) and (ShiftSize > 0);
         if Shifted then EffShift := ShiftSize else EffShift := 0;
@@ -60992,17 +61001,20 @@ procedure MaxViTBuildPartition(H, P: integer; IsGrid: boolean;
   out Perm, InvPerm: TNeuralIntegerArray; out NumWindows: integer);
 var
   side, p2, outPos, wy, wx, iy, ix, srcY, srcX, i, HHM1: integer;
+  sideM1, PM1: integer;
 begin
   side := H div P;                 // windows per side
   NumWindows := side * side;
   p2 := P * P;
+  sideM1 := side - 1;
+  PM1 := P - 1;
   SetLength(Perm, H * H);
   SetLength(InvPerm, H * H);
   outPos := 0;
-  for wy := 0 to side - 1 do
-    for wx := 0 to side - 1 do
-      for iy := 0 to P - 1 do
-        for ix := 0 to P - 1 do
+  for wy := 0 to sideM1 do
+    for wx := 0 to sideM1 do
+      for iy := 0 to PM1 do
+        for ix := 0 to PM1 do
         begin
           if IsGrid then
           begin
@@ -61030,13 +61042,15 @@ procedure MaxViTBuildRelPosIndex(P: integer;
   out RelPosIndex: TNeuralIntegerArray);
 var
   p2, qy, qx, ky, kx, i, j, dy, dx, idx: integer;
+  PM1: integer;
 begin
   p2 := P * P;
+  PM1 := P - 1;
   SetLength(RelPosIndex, p2 * p2);
-  for qy := 0 to P - 1 do
-    for qx := 0 to P - 1 do
-      for ky := 0 to P - 1 do
-        for kx := 0 to P - 1 do
+  for qy := 0 to PM1 do
+    for qx := 0 to PM1 do
+      for ky := 0 to PM1 do
+        for kx := 0 to PM1 do
         begin
           i := qy * P + qx;
           j := ky * P + kx;
@@ -61094,6 +61108,7 @@ var
   var
     Perm, InvPerm, RelPosIndex, Channels: TNeuralIntegerArray;
     NW, wIdx, h, ci, MlpHidden: integer;
+    NWM1, NumHeadsM1, AHeadDimM1: integer;
     Norm1, Reordered, AttnConcat, OProj, ReorderBack, AttnResidual: TNNetLayer;
     Norm2, Fc1, Fc2, MlpResidual, WinSlice, QProj, KProj, VProj: TNNetLayer;
     QSlice, KSlice, VSlice, QKV, HeadAttn: TNNetLayer;
@@ -61104,6 +61119,9 @@ var
     MaxViTBuildPartition(AH, P, IsGrid, Perm, InvPerm, NW);
     MaxViTBuildRelPosIndex(P, RelPosIndex);
     ws2 := P * P;
+    NWM1 := NW - 1;
+    NumHeadsM1 := Config.NumHeads - 1;
+    AHeadDimM1 := AHeadDim - 1;
     SetLength(WinAttnLayers, 0);
 
     // pre-norm (channel/token LayerNorm over Dim)
@@ -61114,7 +61132,7 @@ var
     Reordered := NN.AddLayer( TNNetGatherTokens.Create(Perm) );
 
     SetLength(WindowOuts, NW);
-    for wIdx := 0 to NW - 1 do
+    for wIdx := 0 to NWM1 do
     begin
       WinSlice := NN.AddLayerAfter(
         TNNetCrop.Create(wIdx * ws2, 0, ws2, 1), Reordered);
@@ -61125,10 +61143,10 @@ var
       VProj := NN.AddLayerAfter(
         TNNetPointwiseConvLinear.Create(ADim).SetTrainable(pTrainable), WinSlice);
       SetLength(HeadOuts, Config.NumHeads);
-      for h := 0 to Config.NumHeads - 1 do
+      for h := 0 to NumHeadsM1 do
       begin
         SetLength(Channels, AHeadDim);
-        for ci := 0 to AHeadDim - 1 do Channels[ci] := h * AHeadDim + ci;
+        for ci := 0 to AHeadDimM1 do Channels[ci] := h * AHeadDim + ci;
         QSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), QProj);
         KSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), KProj);
         VSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), VProj);
@@ -61181,8 +61199,8 @@ var
     BiasTable := TNNetVolume.Create;
     try
       Reader.LoadTensorFlat(Prefix + '.attn.rel_pos_bias_table', BiasTable);
-      for wIdx := 0 to NW - 1 do
-        for h := 0 to Config.NumHeads - 1 do
+      for wIdx := 0 to NWM1 do
+        for h := 0 to NumHeadsM1 do
         begin
           ci := wIdx * Config.NumHeads + h;
           MaxViTSetWindowBias(WinAttnLayers[ci], BiasTable,
@@ -61475,6 +61493,7 @@ var
   BiasTable: TNNetVolume;
   ny, nx, gy, gx, half, FreqRatio, PatchGrid: integer;
   NumStagesM1, HeadsM1, HeadDimM1, NumWindowsM1, halfM1: integer;
+  DepthsStageM1: integer;
 begin
   NumStages := Length(Config.Audio.Depths);
   NumStagesM1 := NumStages - 1;
@@ -61524,7 +61543,8 @@ begin
       else begin EffWindow := ws; ShiftSize := ws div 2; end;
       ws2 := EffWindow * EffWindow;
       Prefix := EncPrefix + 'layers.' + IntToStr(StageIdx) + '.';
-      for BlockIdx := 0 to Config.Audio.Depths[StageIdx] - 1 do
+      DepthsStageM1 := Config.Audio.Depths[StageIdx] - 1;
+      for BlockIdx := 0 to DepthsStageM1 do
       begin
         Shifted := Odd(BlockIdx) and (ShiftSize > 0);
         if Shifted then EffShift := ShiftSize else EffShift := 0;
@@ -62118,6 +62138,7 @@ var
   FeatPos, i: integer;
   Prefix: string;
   LastStage, TapHi: integer;
+  StageConvsM1: integer;
 begin
   if Config.NumChannels < 1 then
     ImportError('VGG import: num_channels must be >= 1.');
@@ -62152,7 +62173,8 @@ begin
     InWidth := Config.NumChannels;
     for Stage := 0 to LastStage do
     begin
-      for ConvIdx := 0 to Config.StageConvs[Stage] - 1 do
+      StageConvsM1 := Config.StageConvs[Stage] - 1;
+      for ConvIdx := 0 to StageConvsM1 do
       begin
         // Conv 3x3 pad1 stride1 with bias (suppressBias=0), then ReLU.
         ConvLayers[RefCount] := NN.AddLayer(
@@ -62204,7 +62226,8 @@ begin
     InWidth := Config.NumChannels;
     for Stage := 0 to LastStage do
     begin
-      for ConvIdx := 0 to Config.StageConvs[Stage] - 1 do
+      StageConvsM1 := Config.StageConvs[Stage] - 1;
+      for ConvIdx := 0 to StageConvsM1 do
       begin
         Prefix := 'features.' + IntToStr(FeatPos);
         LoadResNetConvFoldBN(Reader, ConvLayers[RefCount],
@@ -62384,6 +62407,7 @@ function ComputePerceptualLossAndGradient(NN: TNNet;
   const StageWeights: TNeuralFloatArray = nil): TNeuralFloat;
 var
   Stage, NumStages, Loc, c, D, NumLoc, Base, NumLocM1, DM1, Gi, GradM1: integer;
+  NumStagesM1: integer;
   TapFeat: TNNetVolume;            // snapshot of tap-S features for Target
   TargetFeat: array[0..4] of TNNetVolume;
   TapLayer, InLayer: TNNetLayer;
@@ -62426,14 +62450,15 @@ begin
   try
     // Snapshot Target's tap features once (forward pass on Target).
     NN.Compute(Target);
-    for Stage := 0 to NumStages - 1 do
+    NumStagesM1 := NumStages - 1;
+    for Stage := 0 to NumStagesM1 do
     begin
       TargetFeat[Stage] := TNNetVolume.Create;
       TargetFeat[Stage].Copy(NN.Layers[TapLayerIdx[Stage]].Output);
     end;
 
     GradM1 := GradImage.Size - 1;
-    for Stage := 0 to NumStages - 1 do
+    for Stage := 0 to NumStagesM1 do
     begin
       // Fresh forward on Gen for this stage (each backward consumes the
       // transient error buffers; recomputing is robust and cheap for <=5 taps).
@@ -62922,6 +62947,8 @@ var
   tx, ty, d: integer;
   gx, gy: integer;          // global image coords
   wx, wy, w: TNeuralFloat;  // feather weights
+  StartsYHi, StartsXHi, TileLatentMinSizeM1, LatentDepthM1: integer;
+  ImgTileWM1, OutChannelsM1: integer;
 begin
   // The decoder's fixed-size TNNetInput defines the tile; the latent->image
   // scale is read from the first/last layer spatial sizes.
@@ -62974,13 +63001,19 @@ begin
   LatTile := TNNetVolume.Create;
   try
     LatTile.ReSize(TileLatentMinSize, TileLatentMinSize, Latent.Depth);
-    for nj := 0 to High(StartsY) do
-    for nx := 0 to High(StartsX) do
+    StartsYHi := High(StartsY);
+    StartsXHi := High(StartsX);
+    TileLatentMinSizeM1 := TileLatentMinSize - 1;
+    LatentDepthM1 := Latent.Depth - 1;
+    ImgTileWM1 := ImgTileW - 1;
+    OutChannelsM1 := OutChannels - 1;
+    for nj := 0 to StartsYHi do
+    for nx := 0 to StartsXHi do
     begin
       // Crop the latent tile.
-      for ty := 0 to TileLatentMinSize - 1 do
-        for tx := 0 to TileLatentMinSize - 1 do
-          for d := 0 to Latent.Depth - 1 do
+      for ty := 0 to TileLatentMinSizeM1 do
+        for tx := 0 to TileLatentMinSizeM1 do
+          for d := 0 to LatentDepthM1 do
             LatTile[tx, ty, d] :=
               Latent[StartsX[nx] + tx, StartsY[nj] + ty, d];
 
@@ -62990,14 +63023,14 @@ begin
       // above (StartsY[nj]>0) and the left edge into the tile to the left
       // (StartsX[nx]>0). diffusers blend_v / blend_h: a linear ramp across the
       // overlap rows/cols; the rest is overwrite.
-      for ty := 0 to ImgTileW - 1 do
+      for ty := 0 to ImgTileWM1 do
       begin
         gy := StartsY[nj] * Scale + ty;
         if (nj > 0) and (ty < ImgOverlap) then
           wy := (ty + 1) / (ImgOverlap + 1)
         else
           wy := 1.0;
-        for tx := 0 to ImgTileW - 1 do
+        for tx := 0 to ImgTileWM1 do
         begin
           gx := StartsX[nx] * Scale + tx;
           if (nx > 0) and (tx < ImgOverlap) then
@@ -63005,7 +63038,7 @@ begin
           else
             wx := 1.0;
           w := wx * wy;
-          for d := 0 to OutChannels - 1 do
+          for d := 0 to OutChannelsM1 do
             Result[gx, gy, d] :=
               Result[gx, gy, d] * (1.0 - w) + DecOut[tx, ty, d] * w;
         end;
@@ -63364,6 +63397,7 @@ procedure LoadSDResnetBlock(Reader: TNNetSafeTensorsReader;
   InCh, OutCh: integer; const Config: TSDUNetConfig);
 var
   gi: integer;
+  OutChM1: integer;
 begin
   LoadVaeGroupNorm(Reader, Refs.GN1, Prefix + 'norm1', InCh, SDUNET_RES_EPS);
   LoadVaeConv(Reader, Refs.Conv1, Prefix + 'conv1.weight', Prefix + 'conv1.bias',
@@ -63371,7 +63405,8 @@ begin
   // TimeProj is a 2*OutCh PointwiseConvLinear holding [gamma | beta]: the first
   // OutCh neurons are the CONSTANT ones vector (zero weights, bias 1.0); the
   // next OutCh neurons load time_emb_proj (the additive beta).
-  for gi := 0 to OutCh - 1 do
+  OutChM1 := OutCh - 1;
+  for gi := 0 to OutChM1 do
   begin
     Refs.TimeProj.FArrNeurons[gi].Weights.Fill(0.0);
     Refs.TimeProj.FArrNeurons[gi].BiasWeight := 1.0;
@@ -63410,6 +63445,7 @@ var
   HeadOutputs: array of TNNetLayer;
   QChannels: array of integer;
   H, W, HeadDim, hh, dd, Inner, HeadsM1, HeadDimM1, blk: integer;
+  DepthM1: integer;
 begin
   ResidualIn := Input;
   H := ResidualIn.Output.SizeY;
@@ -63430,7 +63466,8 @@ begin
   if Depth < 1 then Depth := 1;
   SetLength(Refs.Blocks, Depth);
 
-  for blk := 0 to Depth - 1 do
+  DepthM1 := Depth - 1;
+  for blk := 0 to DepthM1 do
   begin
     // ---- self-attention (pre-norm) ----
     Refs.Blocks[blk].LN1 := NN.AddLayerAfter(
@@ -63497,6 +63534,7 @@ procedure LoadSDTransformer2D(Reader: TNNetSafeTensorsReader;
 var
   d, Inner, blk: integer;
   P, TB: string;
+  BlocksM1: integer;
 begin
   d := Channels;
   Inner := 4 * Channels;
@@ -63522,7 +63560,8 @@ begin
       d, d, 1);
   end;
   // each stacked BasicTransformerBlock loads its own weight set.
-  for blk := 0 to Length(Refs.Blocks) - 1 do
+  BlocksM1 := Length(Refs.Blocks) - 1;
+  for blk := 0 to BlocksM1 do
   begin
     TB := P + 'transformer_blocks.' + IntToStr(blk) + '.';
     // norms (token LayerNorm gain/bias).
@@ -63625,11 +63664,13 @@ var
   UpAttn: array of array of TSDAttnLayers;
   UpSamp: array of TNNetLayer;
   PoppedCh: integer;
+  NumResnetM1, TimeEmbedDimM1: integer;
 begin
   n := Config.NumBlockOut;
   nM1 := n - 1;
   d0 := Config.BlockOutChannels[0];
   NumResnet := Config.LayersPerBlock;
+  NumResnetM1 := NumResnet - 1;
   if (Config.NumHeads < 1) then
     ImportError('SD UNet import: num_heads must be >= 1.');
   NN := TNNet.Create();
@@ -63708,7 +63749,7 @@ begin
       OutCh := Config.BlockOutChannels[i];
       SetLength(DownRes[i], NumResnet);
       SetLength(DownAttn[i], NumResnet);
-      for j := 0 to NumResnet - 1 do
+      for j := 0 to NumResnetM1 do
       begin
         if j = 0 then b := InCh else b := OutCh;
         AddSDResnetBlock(NN, Config, TimeCond, HLayer, b, OutCh, pTrainable,
@@ -63823,7 +63864,8 @@ begin
     halfM1 := half - 1;
     LoadLlamaLinearWeights(Reader, TFc0, 'time_embedding.linear_1.weight',
       d0, Config.TimeEmbedDim, 0, -1, 0, 'time_embedding.linear_1.bias');
-    for i := 0 to Config.TimeEmbedDim - 1 do
+    TimeEmbedDimM1 := Config.TimeEmbedDim - 1;
+    for i := 0 to TimeEmbedDimM1 do
     begin
       WVol := TFc0.FArrNeurons[i].Weights;
       for ci := 0 to halfM1 do
@@ -63856,7 +63898,7 @@ begin
     for i := 0 to nM1 do
     begin
       OutCh := Config.BlockOutChannels[i];
-      for j := 0 to NumResnet - 1 do
+      for j := 0 to NumResnetM1 do
       begin
         if j = 0 then b := InCh else b := OutCh;
         Prefix := 'down_blocks.' + IntToStr(i) + '.resnets.' + IntToStr(j) + '.';
@@ -63987,6 +64029,7 @@ var
   Vec: TNNetVolume;
   half, halfM1, i, k, base: integer;
   LogMax, freq, angle: TNeuralFloat;
+  AddTextDimM1: integer;
 begin
   if not Config.UseAddEmbedding then
     ImportError('SDUNetFillAddEmbeds: this UNet was not built with add_embedding.');
@@ -64004,7 +64047,8 @@ begin
       IntToStr(Vec.Size) + ' <> AddEmbedsInputDim ' +
       IntToStr(Config.AddEmbedsInputDim) + '.');
   // [ pooled_text | time_ids_emb ] -- pooled first (diffusers cat order).
-  for i := 0 to Config.AdditionEmbedTextDim - 1 do
+  AddTextDimM1 := Config.AdditionEmbedTextDim - 1;
+  for i := 0 to AddTextDimM1 do
     Vec.FData[i] := PooledText.FData[i];
   half := Config.AdditionTimeEmbedDim div 2;
   halfM1 := half - 1;
@@ -64073,6 +64117,7 @@ procedure SDUNetDenoiseInpaint(Net: TNNet; const Config: TSDUNetConfig;
 var
   sIdx, i: integer;
   m: TNeuralFloat;
+  ScheduleM2, LatentsSizeM1: integer;
 begin
   // Start the working latent from the source re-noised to the FIRST scheduled
   // timestep (Schedule[0]); the hole then drifts toward generation while the
@@ -64081,14 +64126,16 @@ begin
   Sched.AddNoise(Z0, KnownNoised, Schedule[0]);
   Latents.Copy(KnownNoised);
   Sched.ResetMultistep;
-  for sIdx := 0 to Length(Schedule) - 2 do
+  ScheduleM2 := Length(Schedule) - 2;
+  LatentsSizeM1 := Latents.Size - 1;
+  for sIdx := 0 to ScheduleM2 do
   begin
     if Schedule[sIdx] < 1 then Continue;          // skip degenerate t=0 steps
     // BLEND: overwrite the KEPT region with the clean source re-noised to THIS
     // timestep, so the visible region carries the right noise level for t while
     // only the hole (mask=1) is driven by the denoiser.
     Sched.AddNoise(Z0, KnownNoised, Schedule[sIdx]);
-    for i := 0 to Latents.Size - 1 do
+    for i := 0 to LatentsSizeM1 do
     begin
       m := MaskLatent.FData[i];
       Latents.FData[i] := m * Latents.FData[i] + (1.0 - m) * KnownNoised.FData[i];
@@ -64098,7 +64145,7 @@ begin
   end;
   // Final composite at t=0: the kept region is EXACTLY the clean source latent so
   // the unmasked output is pixel-faithful (latent-exact) by construction.
-  for i := 0 to Latents.Size - 1 do
+  for i := 0 to LatentsSizeM1 do
   begin
     m := MaskLatent.FData[i];
     Latents.FData[i] := m * Latents.FData[i] + (1.0 - m) * Z0.FData[i];
@@ -64108,9 +64155,11 @@ end;
 function SDUNetControlDownCount(const Config: TSDUNetConfig): integer;
 var
   i, Cnt: integer;
+  NumBlockOutM1: integer;
 begin
   Cnt := 1; // conv_in skip
-  for i := 0 to Config.NumBlockOut - 1 do
+  NumBlockOutM1 := Config.NumBlockOut - 1;
+  for i := 0 to NumBlockOutM1 do
   begin
     Cnt := Cnt + Config.LayersPerBlock; // one skip per down resnet(+attn)
     if i < Config.NumBlockOut - 1 then Inc(Cnt); // downsampler skip
@@ -64125,6 +64174,7 @@ procedure SDUNetDenoiseWithControl(Net: TNNet; const Config: TSDUNetConfig;
 var
   TextIn, CtrlLayer: TNNetLayer;
   DownCnt, i, InputIdx: integer;
+  DownCntM1: integer;
 begin
   DownCnt := SDUNetControlDownCount(Config);
   if Length(DownResiduals) < DownCnt then
@@ -64140,7 +64190,8 @@ begin
   TextIn.Output.Copy(EncStates);
   // Control inputs are TNNetInputs #3.. : the DownCnt skip inputs (build order:
   // conv_in, per down resnet, per downsampler) then the mid input LAST.
-  for i := 0 to DownCnt - 1 do
+  DownCntM1 := DownCnt - 1;
+  for i := 0 to DownCntM1 do
   begin
     InputIdx := SDUNetSkipInputBase(Config) + i;
     CtrlLayer := SDUNetNthInput(Net, InputIdx);
@@ -64171,6 +64222,7 @@ procedure SDUNetDenoiseWithAdapter(Net: TNNet; const Config: TSDUNetConfig;
 var
   TextIn, AdpLayer: TNNetLayer;
   Cnt, i, InputIdx: integer;
+  CntM1: integer;
 begin
   Cnt := SDUNetAdapterFeatureCount(Config);
   if Length(AdapterFeatures) < Cnt then
@@ -64186,7 +64238,8 @@ begin
       IntToStr(TextIn.Output.Size) + '.');
   TextIn.Output.Copy(EncStates);
   // Adapter inputs are TNNetInputs #3.. : one per down block, in build order.
-  for i := 0 to Cnt - 1 do
+  CntM1 := Cnt - 1;
+  for i := 0 to CntM1 do
   begin
     InputIdx := SDUNetSkipInputBase(Config) + i;
     AdpLayer := SDUNetNthInput(Net, InputIdx);
@@ -64225,6 +64278,7 @@ var
   i, NumStride2, Factor, BaseDownTaps: integer;
   PatchedFile: TStringList;
   TmpPath: string;
+  ArrCountM1, BaseNumBlockOutM1: integer;
 begin
   if not FileExists(FileName) then
     ImportError('ControlNet import: config file not found: ' + FileName);
@@ -64258,7 +64312,8 @@ begin
       ImportError('ControlNet import: missing required array "down_block_types".');
     Arr := TJSONArray(ArrData);
     MirrorJson := '[';
-    for i := 0 to Arr.Count - 1 do
+    ArrCountM1 := Arr.Count - 1;
+    for i := 0 to ArrCountM1 do
     begin
       if i > 0 then MirrorJson := MirrorJson + ',';
       // any valid up type works (never built); use the matching attn flag.
@@ -64296,7 +64351,8 @@ begin
       ImportError('ControlNet import: conditioning_embedding_out_channels ' +
         'must have 1..8 entries.');
     Result.NumCondEmbedOut := Arr.Count;
-    for i := 0 to Arr.Count - 1 do Result.CondEmbedOut[i] := Arr.Integers[i];
+    ArrCountM1 := Arr.Count - 1;
+    for i := 0 to ArrCountM1 do Result.CondEmbedOut[i] := Arr.Integers[i];
     // The cond stem down-samples by 2 once per (interior) embed-out transition;
     // the diffusers ControlNetConditioningEmbedding uses len(dims)-1 stride-2
     // blocks. The control image grid is latent_grid * 2^NumStride2.
@@ -64314,7 +64370,8 @@ begin
     // number of down-block residual taps: conv_in(+hint) + one per down
     // resnet(+attn) + one per downsampler.
     BaseDownTaps := 1; // conv_in(+hint)
-    for i := 0 to Result.Base.NumBlockOut - 1 do
+    BaseNumBlockOutM1 := Result.Base.NumBlockOut - 1;
+    for i := 0 to BaseNumBlockOutM1 do
     begin
       BaseDownTaps := BaseDownTaps + Result.Base.LayersPerBlock;
       if i < Result.Base.NumBlockOut - 1 then Inc(BaseDownTaps);
@@ -64332,11 +64389,13 @@ end;
 function ControlNetConfigToString(const Config: TControlNetConfig): string;
 var
   i: integer;
+  NumCondEmbedOutM1: integer;
 begin
   Result := 'ControlNetModel: ' + SDUNetConfigToString(Config.Base) +
     '; cond_channels=' + IntToStr(Config.CondChannels) +
     ', cond_embed_out=[';
-  for i := 0 to Config.NumCondEmbedOut - 1 do
+  NumCondEmbedOutM1 := Config.NumCondEmbedOut - 1;
+  for i := 0 to NumCondEmbedOutM1 do
   begin
     if i > 0 then Result := Result + ',';
     Result := Result + IntToStr(Config.CondEmbedOut[i]);
@@ -64354,6 +64413,7 @@ procedure AddControlNetHintStem(NN: TNNet; const Config: TControlNetConfig;
 var
   i, ridx: integer;
   ChIn, ChOut: integer;
+  NumCondEmbedOutM2: integer;
 begin
   ridx := 0;
   // conv_in: 3x3 pad1 -> CondEmbedOut[0].
@@ -64363,7 +64423,8 @@ begin
   Inc(ridx);
   NN.AddLayer( TNNetSiLU.Create() );
   // blocks: (conv same-dim 3x3 pad1, conv stride2 3x3 pad1) per transition.
-  for i := 0 to Config.NumCondEmbedOut - 2 do
+  NumCondEmbedOutM2 := Config.NumCondEmbedOut - 2;
+  for i := 0 to NumCondEmbedOutM2 do
   begin
     ChIn := Config.CondEmbedOut[i];
     ChOut := Config.CondEmbedOut[i + 1];
@@ -64408,12 +64469,14 @@ var
   DownTaps: array of TNNetLayer;
   MidTap: TNNetLayer;
   TapTop: integer;
+  NumResnetM1, SkipTopM1, TimeEmbedDimM1, NumCondEmbedOutM2, NumDownResidualsM1: integer;
 begin
   Cfg := Config.Base;
   n := Cfg.NumBlockOut;
   nM1 := n - 1;
   d0 := Cfg.BlockOutChannels[0];
   NumResnet := Cfg.LayersPerBlock;
+  NumResnetM1 := NumResnet - 1;
   if (Cfg.NumHeads < 1) then
     ImportError('ControlNet import: num_heads must be >= 1.');
   NN := TNNet.Create();
@@ -64468,7 +64531,7 @@ begin
       OutCh := Cfg.BlockOutChannels[i];
       SetLength(DownRes[i], NumResnet);
       SetLength(DownAttn[i], NumResnet);
-      for j := 0 to NumResnet - 1 do
+      for j := 0 to NumResnetM1 do
       begin
         if j = 0 then b := InCh else b := OutCh;
         AddSDResnetBlock(NN, Cfg, TimeCond, HLayer, b, OutCh, pTrainable,
@@ -64512,7 +64575,8 @@ begin
         IntToStr(SkipTop) + ' vs ' + IntToStr(Config.NumDownResiduals) + ').');
 
     // ---- ZERO-CONV residual taps (1x1 PointwiseConvLinear off each skip) ----
-    for i := 0 to SkipTop - 1 do
+    SkipTopM1 := SkipTop - 1;
+    for i := 0 to SkipTopM1 do
     begin
       DownTaps[i] := NN.AddLayerAfter(
         [TNNetPointwiseConvLinear.Create(SkipCh[i]).SetTrainable(pTrainable)],
@@ -64538,7 +64602,8 @@ begin
     halfM1 := half - 1;
     LoadLlamaLinearWeights(Reader, TFc0, 'time_embedding.linear_1.weight',
       d0, Cfg.TimeEmbedDim, 0, -1, 0, 'time_embedding.linear_1.bias');
-    for i := 0 to Cfg.TimeEmbedDim - 1 do
+    TimeEmbedDimM1 := Cfg.TimeEmbedDim - 1;
+    for i := 0 to TimeEmbedDimM1 do
     begin
       WVol := TFc0.FArrNeurons[i].Weights;
       for ci := 0 to halfM1 do
@@ -64558,7 +64623,8 @@ begin
       'controlnet_cond_embedding.conv_in.bias', Config.CondEmbedOut[0],
       Config.CondChannels, 3);
     HintBi := 1;
-    for i := 0 to Config.NumCondEmbedOut - 2 do
+    NumCondEmbedOutM2 := Config.NumCondEmbedOut - 2;
+    for i := 0 to NumCondEmbedOutM2 do
     begin
       LoadVaeConv(Reader, HintRefs[HintBi],
         'controlnet_cond_embedding.blocks.' + IntToStr(2 * i) + '.weight',
@@ -64583,7 +64649,7 @@ begin
     for i := 0 to nM1 do
     begin
       OutCh := Cfg.BlockOutChannels[i];
-      for j := 0 to NumResnet - 1 do
+      for j := 0 to NumResnetM1 do
       begin
         if j = 0 then b := InCh else b := OutCh;
         Prefix := 'down_blocks.' + IntToStr(i) + '.resnets.' + IntToStr(j) + '.';
@@ -64607,7 +64673,8 @@ begin
     LoadSDResnetBlock(Reader, MidRes2, 'mid_block.resnets.1.', MidCh, MidCh, Cfg);
 
     // zero-conv taps (1x1 convs, [out,in,1,1]).
-    for i := 0 to Config.NumDownResiduals - 1 do
+    NumDownResidualsM1 := Config.NumDownResiduals - 1;
+    for i := 0 to NumDownResidualsM1 do
       LoadVaeConv(Reader, DownTaps[i],
         'controlnet_down_blocks.' + IntToStr(i) + '.weight',
         'controlnet_down_blocks.' + IntToStr(i) + '.bias',
@@ -64669,6 +64736,7 @@ var
   TextIn, CondIn: TNNetLayer;
   Taps: array of TNNetLayer;
   TapCount, i: integer;
+  TapCountM1, NumDownResidualsM1: integer;
 begin
   if Length(DownResiduals) < Config.NumDownResiduals then
     ImportError('ControlNetResiduals: DownResiduals has ' +
@@ -64692,9 +64760,11 @@ begin
   // CONSECUTIVELY as [down taps..., mid tap] (no sink layer follows them).
   TapCount := Config.NumDownResiduals + 1;
   SetLength(Taps, TapCount);
-  for i := 0 to TapCount - 1 do
+  TapCountM1 := TapCount - 1;
+  for i := 0 to TapCountM1 do
     Taps[i] := Net.Layers[Net.CountLayers() - TapCount + i];
-  for i := 0 to Config.NumDownResiduals - 1 do
+  NumDownResidualsM1 := Config.NumDownResiduals - 1;
+  for i := 0 to NumDownResidualsM1 do
     DownResiduals[i].Copy(Taps[i].Output);
   MidResidual.Copy(Taps[Config.NumDownResiduals].Output);
 end;
@@ -64713,6 +64783,7 @@ var
   Arr: TJSONArray;
   ClassName: string;
   i: integer;
+  ArrCountM1: integer;
 begin
   if not FileExists(FileName) then
     ImportError('T2I-Adapter import: config file not found: ' + FileName);
@@ -64746,7 +64817,8 @@ begin
     if Arr.Count > 8 then
       ImportError('T2I-Adapter import: channels must have 1..8 entries.');
     Result.NumChannels := Arr.Count;
-    for i := 0 to Arr.Count - 1 do Result.Channels[i] := Arr.Integers[i];
+    ArrCountM1 := Arr.Count - 1;
+    for i := 0 to ArrCountM1 do Result.Channels[i] := Arr.Integers[i];
     Result.NumResBlocks := Obj.Get('num_res_blocks', 2);
     if Result.NumResBlocks < 1 then
       ImportError('T2I-Adapter import: num_res_blocks must be >= 1.');
@@ -64781,10 +64853,12 @@ end;
 function T2IAdapterConfigToString(const Config: TT2IAdapterConfig): string;
 var
   i: integer;
+  NumChannelsM1: integer;
 begin
   Result := 'T2IAdapter(full_adapter): in_channels=' +
     IntToStr(Config.CondChannels) + ', channels=[';
-  for i := 0 to Config.NumChannels - 1 do
+  NumChannelsM1 := Config.NumChannels - 1;
+  for i := 0 to NumChannelsM1 do
   begin
     if i > 0 then Result := Result + ',';
     Result := Result + IntToStr(Config.Channels[i]);
@@ -64804,6 +64878,7 @@ procedure LoadT2IAdapterConvIn(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer
 var
   W, B: TNNetVolume;
   InCh, o, c, ky, kx, ic, dy, dx, torchOc, caiC: integer;
+  OutChM1, CondChM1, RM1, KM1: integer;
 begin
   InCh := CondCh * R * R;
   EnsureWritableImportWeights(Layer);
@@ -64827,18 +64902,22 @@ begin
     if not Reader.HasTensor(BName) then
       ImportError('T2I-Adapter import: missing bias "' + BName + '".');
     Reader.LoadTensorFlat(BName, B);
-    for o := 0 to OutCh - 1 do
+    OutChM1 := OutCh - 1;
+    CondChM1 := CondCh - 1;
+    RM1 := R - 1;
+    KM1 := K - 1;
+    for o := 0 to OutChM1 do
     begin
       // Walk CAI input channels caiC = (dx*R + dy)*CondCh + ic and copy from the
       // torch column torchOc = ic*R*R + dy*R + dx for each kernel position.
-      for ic := 0 to CondCh - 1 do
-        for dx := 0 to R - 1 do
-          for dy := 0 to R - 1 do
+      for ic := 0 to CondChM1 do
+        for dx := 0 to RM1 do
+          for dy := 0 to RM1 do
           begin
             caiC := (dx * R + dy) * CondCh + ic;
             torchOc := (ic * R + dy) * R + dx;
-            for ky := 0 to K - 1 do
-              for kx := 0 to K - 1 do
+            for ky := 0 to KM1 do
+              for kx := 0 to KM1 do
                 Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + caiC] :=
                   W.FData[((o * InCh + torchOc) * K + ky) * K + kx];
           end;
@@ -64873,6 +64952,7 @@ var
   NN: TNNet;
   CondInput, HLayer, ConvIn: TNNetLayer;
   d0, n, i, j, InCh, OutCh: integer;
+  nM1, NumResBlocksM1: integer;
   Prefix: string;
   // refs (architecture order): conv_in; per block: in_conv(or nil) + per resnet
   // block1/block2; feature output layers.
@@ -64882,6 +64962,8 @@ var
   FeatureRef: array of TNNetLayer;
 begin
   n := Config.NumChannels;
+  nM1 := n - 1;
+  NumResBlocksM1 := Config.NumResBlocks - 1;
   d0 := Config.Channels[0];
   NN := TNNet.Create();
   try
@@ -64905,7 +64987,7 @@ begin
     if not pTrainable then NN.SetTrainable();
 
     InCh := d0;
-    for i := 0 to n - 1 do
+    for i := 0 to nM1 do
     begin
       OutCh := Config.Channels[i];
       SetLength(Block1Ref[i], Config.NumResBlocks);
@@ -64926,7 +65008,7 @@ begin
       else
         InConvRef[i] := nil;
       // num_res_blocks adapter ResnetBlocks.
-      for j := 0 to Config.NumResBlocks - 1 do
+      for j := 0 to NumResBlocksM1 do
       begin
         AddT2IAdapterResnet(NN, HLayer, OutCh, pTrainable,
           Block1Ref[i][j], Block2Ref[i][j]);
