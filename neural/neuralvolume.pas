@@ -485,7 +485,15 @@ type
       // guarantees as the ranged DotProducts. Tiles are anchored at BStart and the
       // last B tile may be PARTIAL (clamped to BFinish), so arbitrary thread
       // ranges are safe even when TileSizeB does not divide the range length.
-      procedure DotProductsTiled(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer); overload;
+      // Optional AStart..AFinish restricts the OUTPUT rows (A / neurons) this
+      // call writes, keeping NumAs as the destination stride so the written
+      // slice lands at FData[CntB*NumAs + CntA]. Default (AFinish<0) = the full
+      // 0..NumAs-1 range, i.e. unchanged for every existing caller. A disjoint
+      // A slice over all B is the neuron-axis intra-layer chunk; kernel-size
+      // agnostic (VBs is the im2col matrix, so VectorSize folds the kernel), so
+      // it covers spatial convs, not just pointwise. Reuses the same inline
+      // kernel - no per-element call overhead. Coded by Claude (AI).
+      procedure DotProductsTiled(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
       procedure PointwiseNorm(pNorms: TNNetVolume = nil);
       procedure PointwiseMul(pNorms: TNNetVolume);
       // VectorExp writes dst[0..N-1] := exp(src[0..N-1]). On an AVX2 build it
@@ -9589,7 +9597,7 @@ begin
   DotProductsTiled(NumAs, 0, NumBs-1, VectorSize, VAs, VBs, TileSizeA, TileSizeB);
 end;
 
-procedure TNNetVolume.DotProductsTiled(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
+procedure TNNetVolume.DotProductsTiled(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1);
 var
   CntA, CntB: Integer;
   //DestPointer: pointer;
@@ -9611,7 +9619,15 @@ begin
   MissedElements := VectorSize and 3;
   localNumElements := VectorSize xor MissedElements;
   {$ENDIF}
-  MaxTileA := (NumAs div TileSizeA) - 1;
+  // A tiles are anchored at AStart with a trailing PARTIAL tile (ceil division,
+  // clamped to AFinish below), so an arbitrary neuron range - the neuron-axis
+  // intra-layer chunk - is safe even when TileSizeA does not divide it. AFinish
+  // < 0 means "all rows" (AFinish := NumAs-1); with AStart=0 and TileSizeA
+  // dividing NumAs (every non-ranged caller - conv tile sizes come from
+  // GetMaxDivisor) this reduces to the original tiling. NumAs stays the output
+  // row stride, so a sliced call writes exactly its neuron columns.
+  if AFinish < 0 then AFinish := NumAs - 1;
+  MaxTileA := ((AFinish - AStart + 1) + TileSizeA - 1) div TileSizeA - 1;
   // B tiles are anchored at BStart; ceil division so a trailing PARTIAL tile
   // (clamped to BFinish below) covers ranges TileSizeB does not divide. With
   // BStart=0 and TileSizeB dividing NumBs (every non-ranged caller - the conv
@@ -9623,8 +9639,8 @@ begin
     EndTileB := Min(StartTileB + TileSizeB - 1, BFinish);
     for TileACnt := 0 to MaxTileA do
     begin
-      StartTileA := TileACnt * TileSizeA;
-      EndTileA := StartTileA + TileSizeA - 1;
+      StartTileA := AStart + TileACnt * TileSizeA;
+      EndTileA := Min(StartTileA + TileSizeA - 1, AFinish);
       for CntB := StartTileB to EndTileB do
       begin
         PtrB := VBs.GetRawPtr(CntB*VectorSize);

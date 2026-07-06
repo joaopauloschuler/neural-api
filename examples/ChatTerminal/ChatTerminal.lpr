@@ -1128,6 +1128,10 @@ begin
   // conv/linear layers above the MinWork threshold split across the pool via
   // worker 0), ComputeSerial runs fully single-threaded. No separate flag.
   Session.Parallel := not Opt.Serial;
+  // Keep the scheduler's worker pool alive and HOT between decode steps (default
+  // policy: ~50% of the pool hot, worker 0 always) so each token's parallel
+  // forward reaches the workers without re-warming the pool every step.
+  if Session.Parallel then NN.StartThreadWorkers();
   // KV-cache reuse across turns needs position-truncatable attention K/V and no
   // recurrent (SSM) state to rewind. Pure-attention nets qualify; --no-cache-
   // reuse forces the full re-prefill at the call site.

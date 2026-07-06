@@ -250,13 +250,23 @@ begin
   end;
 end;
 
+var vDefaultThreadCountCached: integer;
+
 function NeuralDefaultThreadCount: integer;
 begin
-  {$IFDEF FPC}
-  Result := GetSystemThreadCount;
-  {$ELSE}
-  Result := TThread.ProcessorCount;
-  {$ENDIF}
+  if vDefaultThreadCountCached > 0 then
+  begin
+    Result := vDefaultThreadCountCached;
+  end
+  else
+  begin
+    {$IFDEF FPC}
+    Result := GetSystemThreadCount;
+    {$ELSE}
+    Result := TThread.ProcessorCount;
+    {$ENDIF}
+    vDefaultThreadCountCached := Result;
+  end;
 end;
 
 procedure DebugThreadCount;
@@ -494,6 +504,7 @@ end;
 
 initialization
 vNTL := nil;
+vDefaultThreadCountCached := 0;
 
 finalization
 NeuralThreadListFree();
