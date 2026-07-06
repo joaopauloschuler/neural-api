@@ -6106,7 +6106,7 @@ begin
   begin
     for CntY := 0 to MaxY do
     begin
-      Data[CntX, CntY, pDepth] := Value;
+      FData[GetRawPos(CntX, CntY, pDepth)] := Value;
     end;
   end;
 end;
@@ -7039,7 +7039,7 @@ begin
   begin
     for CntY := 0 to MaxY do
     begin
-      Aux := Self.Data[CntX, CntY, pDepth];
+      Aux := Self.FData[Self.GetRawPos(CntX, CntY, pDepth)];
 
       if Aux < pMin
       then pMin := Aux
@@ -8527,6 +8527,7 @@ var
   I, J: integer;
   MaxX, MaxY: integer;
   h, s, v: TNeuralFloat;
+  base: integer;
 begin
   h := 0;
   s := 0;
@@ -8542,10 +8543,11 @@ begin
     begin
       for J := 0 to MaxY do
       begin
-        rgb2hsv(Self.Data[I,J,0], Self.Data[I,J,1],Self.Data[I,J,2],h,s,v);
-        Self.Data[I,J,0] := h;
-        Self.Data[I,J,1] := s;
-        Self.Data[I,J,2] := v;
+        base := Self.GetRawPos(I, J, 0);
+        rgb2hsv(FData[base], FData[base+1], FData[base+2], h, s, v);
+        FData[base] := h;
+        FData[base+1] := s;
+        FData[base+2] := v;
       end;
     end;
   end;
@@ -8556,6 +8558,7 @@ var
   I, J: integer;
   MaxX, MaxY: integer;
   r, g, b: TNeuralFloat;
+  base: integer;
 begin
   r := 0;
   g := 0;
@@ -8571,10 +8574,11 @@ begin
     begin
       for J := 0 to MaxY do
       begin
-        hsv2rgb(Self.Data[I,J,0], Self.Data[I,J,1],Self.Data[I,J,2],r,g,b);
-        Self.Data[I,J,0] := r;
-        Self.Data[I,J,1] := g;
-        Self.Data[I,J,2] := b;
+        base := Self.GetRawPos(I, J, 0);
+        hsv2rgb(FData[base], FData[base+1], FData[base+2], r, g, b);
+        FData[base] := r;
+        FData[base+1] := g;
+        FData[base+2] := b;
       end;
     end;
   end;
@@ -8585,6 +8589,7 @@ var
   I, J: integer;
   MaxX, MaxY: integer;
   h, s, l: TNeuralFloat;
+  base: integer;
 begin
   h := 0;
   s := 0;
@@ -8600,10 +8605,11 @@ begin
     begin
       for J := 0 to MaxY do
       begin
-        rgb2hsl(Self.Data[I,J,0], Self.Data[I,J,1],Self.Data[I,J,2],h,s,l);
-        Self.Data[I,J,0] := h;
-        Self.Data[I,J,1] := s;
-        Self.Data[I,J,2] := l;
+        base := Self.GetRawPos(I, J, 0);
+        rgb2hsl(FData[base], FData[base+1], FData[base+2], h, s, l);
+        FData[base] := h;
+        FData[base+1] := s;
+        FData[base+2] := l;
       end;
     end;
   end;
@@ -8614,6 +8620,7 @@ var
   I, J: integer;
   MaxX, MaxY: integer;
   r, g, b: TNeuralFloat;
+  base: integer;
 begin
   r := 0;
   g := 0;
@@ -8628,10 +8635,11 @@ begin
     begin
       for J := 0 to MaxY do
       begin
-        hsl2rgb(Self.Data[I,J,0], Self.Data[I,J,1],Self.Data[I,J,2],r,g,b);
-        Self.Data[I,J,0] := r;
-        Self.Data[I,J,1] := g;
-        Self.Data[I,J,2] := b;
+        base := Self.GetRawPos(I, J, 0);
+        hsl2rgb(FData[base], FData[base+1], FData[base+2], r, g, b);
+        FData[base] := r;
+        FData[base+1] := g;
+        FData[base+2] := b;
       end;
     end;
   end;
@@ -8642,6 +8650,7 @@ var
   I, J: integer;
   MaxX, MaxY: integer;
   l, a, b: TNeuralFloat;
+  base: integer;
 begin
   l := 0;
   a := 0;
@@ -8656,10 +8665,11 @@ begin
     begin
       for J := 0 to MaxY do
       begin
-        rgb2lab(Self.Data[I,J,0], Self.Data[I,J,1],Self.Data[I,J,2],l,a,b);
-        Self.Data[I,J,0] := l;
-        Self.Data[I,J,1] := a;
-        Self.Data[I,J,2] := b;
+        base := Self.GetRawPos(I, J, 0);
+        rgb2lab(FData[base], FData[base+1], FData[base+2], l, a, b);
+        FData[base] := l;
+        FData[base+1] := a;
+        FData[base+2] := b;
 
       end;
     end;
@@ -8671,6 +8681,7 @@ var
   I, J: integer;
   MaxX, MaxY: integer;
   r, g, b: TNeuralFloat;
+  base: integer;
 begin
   r := 0;
   g := 0;
@@ -8685,10 +8696,11 @@ begin
     begin
       for J := 0 to MaxY do
       begin
-        lab2rgb(Self.Data[I,J,0], Self.Data[I,J,1],Self.Data[I,J,2],r,g,b);
-        Self.Data[I,J,0] := r;
-        Self.Data[I,J,1] := g;
-        Self.Data[I,J,2] := b;
+        base := Self.GetRawPos(I, J, 0);
+        lab2rgb(FData[base], FData[base+1], FData[base+2], r, g, b);
+        FData[base] := r;
+        FData[base+1] := g;
+        FData[base+2] := b;
       end;
     end;
   end;
@@ -8699,6 +8711,7 @@ var
   I, J: integer;
   MaxX, MaxY: integer;
   aux: TNeuralFloat;
+  base: integer;
 begin
   if Depth >= 3 then
   begin
@@ -8709,10 +8722,11 @@ begin
     begin
       for J := 0 to MaxY do
       begin
-        aux := (Self.Data[I,J,0] + Self.Data[I,J,1] + Self.Data[I,J,2]) / 3;
-        Self.Data[I,J,0] := aux;
-        Self.Data[I,J,1] := aux;
-        Self.Data[I,J,2] := aux;
+        base := Self.GetRawPos(I, J, 0);
+        aux := (FData[base] + FData[base+1] + FData[base+2]) / 3;
+        FData[base] := aux;
+        FData[base+1] := aux;
+        FData[base+2] := aux;
       end;
     end;
   end;
@@ -8722,6 +8736,7 @@ procedure TVolume.GetGrayFromRgb(Rgb: TVolume);
 var
   I, J: integer;
   MaxX, MaxY: integer;
+  rgbBase: integer;
 begin
   ReSize(Rgb.SizeX, Rgb.SizeY, 1);
   if Rgb.Depth >= 3 then
@@ -8733,8 +8748,9 @@ begin
     begin
       for J := 0 to MaxY do
       begin
-        Self.Data[I,J,0] :=
-          (Rgb.Data[I,J,0] + Rgb.Data[I,J,1] + Rgb.Data[I,J,2]) / 3;
+        rgbBase := Rgb.GetRawPos(I, J, 0);
+        Self.FData[Self.GetRawPos(I, J, 0)] :=
+          (Rgb.FData[rgbBase] + Rgb.FData[rgbBase+1] + Rgb.FData[rgbBase+2]) / 3;
       end;
     end;
   end;
@@ -9104,6 +9120,7 @@ var
   MaxX, MaxY, MaxD: integer;
   MinID, MaxID: integer;
   CountX, CountY, CountD: integer;
+  sqrBase: integer;
 begin
   ReSize(Original);
   Fill(1);
@@ -9131,13 +9148,15 @@ begin
 
         //WriteLn('CountX:', CountX,' CountY:', CountY, ' CountD:',CountD, ' MinID:',MinID, ' MaxID:', MaxID);
 
+        sqrBase := SqrElements.GetRawPos(CountX, CountY, MinID);
         for CountID := MinID to MaxID do
         begin
           {$IFDEF FPC}
-          FData[iRawPos] += SqrElements.Data[CountX, CountY, CountID];
+          FData[iRawPos] += SqrElements.FData[sqrBase];
           {$ELSE}
-          FData[iRawPos] := FData[iRawPos] + SqrElements.Data[CountX, CountY, CountID];
+          FData[iRawPos] := FData[iRawPos] + SqrElements.FData[sqrBase];
           {$ENDIF}
+          Inc(sqrBase);
         end;
 
       end;
