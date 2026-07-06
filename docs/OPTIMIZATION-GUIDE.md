@@ -167,6 +167,30 @@ hv := H.FData[base];
 HErr.FData[base] := HErr.FData[base] + ...;
 ```
 
+**The same offset can span different storage formats.** A slot's flat offset
+depends only on the shape, so it addresses *any* array laid out with the same
+per-slot stride — not just other `TNNetVolume.FData`. In the KV-cache eviction
+shift, `FKCache`/`FVCache` (float rows in `.FData`) and
+`FKCacheCodes`/`FVCacheCodes` (int8 code rows) all store `FDk` contiguous
+elements per slot, so `j * FDk` indexes all four:
+
+```pascal
+// FKCache/FVCache are (MaxContext, 1, FDk) => GetRawPos(j,0,0) = j * FDk, which
+// is also the int8 code offset. One carried offset (see #6) serves both formats.
+Move(FKCache.FData[jP1Dk],   FKCache.FData[jDk],   RowBytesFP); // float rows
+Move(FKCacheCodes[jP1Dk],    FKCacheCodes[jDk],    RowBytesI8); // int8 code rows
+```
+
+**`Move` and friends take untyped `var` parameters — pass the element, not a
+pointer.** `Move(const source; var dest; count)` takes the *variables* and the
+compiler passes their addresses; there is no `Addr`/`@` at the call site. So
+`Move(V.FData[pos], ...)` is correct, and replacing `V.GetRawPtr(x,y,d)^` with
+`V.FData[pos]` is a safe swap: `GetRawPtr` returns a pointer and the `^` already
+dereferenced it back to a variable, which is exactly what `V.FData[pos]` is.
+(Writing `Move(Addr(V.FData[pos])^, ...)` is equivalent but redundant; writing
+`Move(Addr(V.FData[pos]), ...)` — no `^` — is a bug that copies the pointer
+bytes.)
+
 **Caveat.** `FData[]` does no bounds/shape checking and bypasses the accessor
 entirely. Only use it where the shape is known and fixed (asserted at layer
 setup), and keep the index expression obviously correct. For one-off or
@@ -331,23 +355,32 @@ begin
 end;
 ```
 
-**Do this — carry the offset by addition:**
+**Do this — carry the offset by addition, and update it once per iteration in
+the loop body (not inside a branch) so every branch can share it:**
 
 ```pascal
 jDk := FEvictSinks * FDk;              // seed once: the first j * FDk
 for j := FEvictSinks to CacheLenM2 do
 begin
   jP1Dk := jDk + FDk;                  // (j + 1) * FDk, by addition
-  Move(FKCacheCodes[jP1Dk], FKCacheCodes[jDk], RowBytesI8);
-  Move(FVCacheCodes[jP1Dk], FVCacheCodes[jDk], RowBytesI8);
-  ...
+  if FKVQuantInt8 then
+  begin
+    Move(FKCacheCodes[jP1Dk], FKCacheCodes[jDk], RowBytesI8);
+    Move(FVCacheCodes[jP1Dk], FVCacheCodes[jDk], RowBytesI8);
+    ...
+  end
+  else
+  begin
+    Move(FKCache.FData[jP1Dk], FKCache.FData[jDk], RowBytesFP);  // same offset (see #3)
+    Move(FVCache.FData[jP1Dk], FVCache.FData[jDk], RowBytesFP);
+  end;
   jDk := jP1Dk;                        // advance: next iteration's j * FDk
 end;
 ```
 
 The single seed multiply outside the loop replaces one multiply *per iteration*;
-`jDk` and `jP1Dk` are each computed once and reused for both the K and V rows
-(folding in #4's de-duplication).
+`jDk` and `jP1Dk` are each computed once and reused for both the K and V rows in
+*both* storage formats (folding in #4's de-duplication and #3's shared offset).
 
 **Why it matters**
 
@@ -362,11 +395,12 @@ The single seed multiply outside the loop replaces one multiply *per iteration*;
   advances by exactly 1 (so the product advances by exactly `FDk`). If the
   induction variable's step varies, the increment is not constant and this does
   not apply.
-- **Keep the accumulator in sync with the branch that uses it.** Here `jDk` is
-  advanced inside the `if FKVQuantInt8` branch, which is safe *only because the
-  condition is loop-invariant* (it is the same every iteration, so the branch —
-  and the advance — runs on every pass). If the branch could vary per iteration,
-  advance the accumulator unconditionally in the loop body instead.
+- **Advance the accumulator unconditionally, in the loop body.** Update `jDk`
+  once per iteration outside any branch, so it stays correct no matter which
+  branch runs and can be shared by all of them (here both the int8 and the FP32
+  paths). Advancing it *inside* a branch is a trap: it is correct only if that
+  branch runs on every iteration — e.g. a loop-invariant `if` — and silently
+  desynchronises the offset the moment that stops being true.
 - **Seed correctly.** The initial value must equal the product at the loop's
   first index (`FEvictSinks * FDk`, not `0`), or every subsequent offset is
   wrong.
