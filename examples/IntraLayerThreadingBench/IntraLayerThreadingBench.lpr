@@ -183,6 +183,8 @@ begin
     // expects). LowMem is the mode under test this pass - conv/pointwise chunk
     // in both modes, so the parity check must hold either way.
     NN.SetTrainable(False, {pLowMemory=}LowMem);
+    // Keep the worker pool alive/hot across the timed passes (default policy).
+    NN.StartThreadWorkers();
     NN.Compute(MyIn, 0, {parallel=}true);
     maxdiff := 0;
     for i := 0 to OutSerial.Size - 1 do
@@ -284,6 +286,7 @@ begin
 
   NN := BuildStack(dModel, dHidden, nBlocks, seqLen);
   NN.ResetSchedulerStats();  // clean per-net pass/worker counts
+  NN.StartThreadWorkers();   // keep the pool alive/hot across the timed passes
   on_ := BestTimeMs(NN, MyIn, {parallel=}true);
 
   WriteLn(Format('  %-16s dM=%-5d dH=%-5d blk=%d seq=%-3d  off=%8.3f  on=%8.3f  %6.2fx',
