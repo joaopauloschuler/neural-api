@@ -6106,7 +6106,7 @@ begin
   begin
     for CntY := 0 to MaxY do
     begin
-      FData[GetRawPos(CntX, CntY, pDepth)] := Value;
+      Data[CntX, CntY, pDepth] := Value;
     end;
   end;
 end;
@@ -7039,7 +7039,7 @@ begin
   begin
     for CntY := 0 to MaxY do
     begin
-      Aux := Self.FData[Self.GetRawPos(CntX, CntY, pDepth)];
+      Aux := Self.Data[CntX, CntY, pDepth];
 
       if Aux < pMin
       then pMin := Aux
@@ -8749,7 +8749,7 @@ begin
       for J := 0 to MaxY do
       begin
         rgbBase := Rgb.GetRawPos(I, J, 0);
-        Self.FData[Self.GetRawPos(I, J, 0)] :=
+        Self.Data[I, J, 0] :=
           (Rgb.FData[rgbBase] + Rgb.FData[rgbBase+1] + Rgb.FData[rgbBase+2]) / 3;
       end;
     end;
