@@ -243,3 +243,59 @@ end;
 
 (This eviction loop has further, larger problems beyond the repeated
 subexpression — see later recommendations.)
+
+## 5. Hoist loop-invariant computations out of the loop entirely
+
+Recommendation #4 removes a subexpression recomputed *within one iteration*.
+This one is stronger: if a value does not depend on the loop variable at all,
+it is **loop-invariant** and should be computed *once before the loop* (or once
+per call), not on every iteration.
+
+The tell is that the expression contains none of the loop's induction
+variables. In the same KV-cache path, the per-row byte size
+`FDk * csNeuralFloatSize` (and `FDk * csShortIntSize`) depends only on `FDk`,
+which is fixed for the whole call — yet it was recomputed at every `Move` in
+both the eviction shift and the cache append.
+
+**Anti-example — do NOT follow this** (recomputed every iteration):
+
+```pascal
+for p := 0 to SeqLenM1 do
+begin
+  ...
+  Move(FKCache.GetRawPtr(j + 1, 0, 0)^, FKCache.GetRawPtr(j, 0, 0)^,
+    FDk * csNeuralFloatSize);   // FDk is invariant — nothing here depends on p or j
+  ...
+end;
+```
+
+**Do this — compute once up front, then reuse:**
+
+```pascal
+RowBytesFP := FDk * csNeuralFloatSize;   // once per call, before the loop
+RowBytesI8 := FDk * csShortIntSize;
+for p := 0 to SeqLenM1 do
+begin
+  ...
+  Move(FKCache.GetRawPtr(j + 1, 0, 0)^, FKCache.GetRawPtr(j, 0, 0)^, RowBytesFP);
+  ...
+end;
+```
+
+**Why it matters**
+
+- **Work is done once, not N times** — the deeper the loop nest, the bigger the
+  saving; an invariant hoisted out of an inner loop is removed from every
+  iteration of every enclosing loop.
+- **Readability** — a named `RowBytesFP` states *what* the quantity is ("bytes
+  in one cache row") at the point it is computed.
+
+**How far to hoist.** Lift the value to the outermost scope in which it is still
+invariant. If it never changes across calls (a per-layer quantity), consider
+caching it in a field computed at setup rather than recomputing it each call.
+Do **not** hoist something whose inputs change inside the loop — that changes
+behaviour, not just cost.
+
+> Note: a good optimizing compiler may hoist trivial invariants on its own, but
+> do not rely on it — hoisting explicitly guarantees the win, documents intent,
+> and often exposes further simplifications (e.g. a shared row-pointer).
