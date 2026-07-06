@@ -186,6 +186,7 @@ type
     // StreamingLLM KV-cache eviction (attention sinks + rolling window).
     procedure TestStreamingEvictionWithinWindowBitIdenticalToUnbounded;
     procedure TestStreamingEvictionCapsCacheLengthPastWindow;
+    procedure TestStreamingEvictionInt8MatchesFP32WithinTolerance;
     // GenerateTokensStreamed / GenerateStringStreamed: streamed generation.
     procedure TestGenerateTokensStreamedTransformerMatchesFullGreedy;
     procedure TestGenerateTokensStreamedSSMMatchesFullGreedy;
@@ -2962,6 +2963,84 @@ begin
   finally
     StepIn.Free;
     Evict.Free;
+    Twin.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestStreamingEvictionInt8MatchesFP32WithinTolerance;
+// Exercises the int8-KV eviction shift specifically (int8 code + scale rows
+// shifted left on every token once the cache is at its cap). FP32 and int8
+// sessions evict the SAME logical positions (eviction is position-based and
+// independent of the storage format), so the only difference between their
+// outputs is int8 quantization drift. A wrong int8 shift offset would copy the
+// wrong code row and diverge far beyond the drift tolerance below.
+const
+  Sinks = 2;
+  Window = 4;
+  Cap = Sinks + Window;   // 6
+  Steps = 20;             // well past the cap: many eviction shifts
+  Budget = 64;
+  Tol = 1e-1;             // int8 KV drift; a bad shift diverges by O(1), not this
+var
+  Twin: TNNet;
+  EvictFP32, EvictInt8: TNNetStreamingDecoder;
+  StepIn: TNNetVolume;
+  T, D, L, Vocab, Tok: integer;
+  MaxDrift, Drift: TNeuralFloat;
+  Evicted: boolean;
+begin
+  RandSeed := 424242;
+  Twin := BuildTinyCausalLM(1);
+  EvictFP32 := nil;
+  EvictInt8 := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    Vocab := Twin.GetLastLayer().Output.Depth;
+
+    EvictFP32 := TNNetStreamingDecoder.Create(Twin, Budget);
+    EvictFP32.EnableEviction(Sinks, Window);
+    EvictFP32.Reset();
+
+    EvictInt8 := TNNetStreamingDecoder.Create(Twin, Budget);
+    EvictInt8.EnableEviction(Sinks, Window);
+    EvictInt8.Reset();
+    EvictInt8.EnableInt8KVCache();
+    AssertTrue('session has attention layers', EvictInt8.SDPACount > 0);
+
+    MaxDrift := 0;
+    Evicted := false;
+    for T := 0 to Steps - 1 do
+    begin
+      Tok := (T * 7 + 3) mod csStreamVocab;
+      StepIn.FData[0] := Tok;
+      EvictFP32.StepForward(StepIn, T);
+      StepIn.FData[0] := Tok;
+      EvictInt8.StepForward(StepIn, T);
+
+      // Both sessions cap the live cache at the same length once past the cap;
+      // record that eviction actually ran (so the int8 shift was exercised).
+      for L := 0 to EvictInt8.SDPACount - 1 do
+      begin
+        AssertEquals('fp32/int8 same cache length layer ' + IntToStr(L) +
+          ' step ' + IntToStr(T),
+          EvictFP32.SDPACacheLength(L), EvictInt8.SDPACacheLength(L));
+        if EvictInt8.SDPACacheLength(L) >= Cap then Evicted := true;
+      end;
+
+      for D := 0 to Vocab - 1 do
+      begin
+        Drift := Abs(EvictInt8.Output()[0, 0, D] - EvictFP32.Output()[0, 0, D]);
+        if Drift > MaxDrift then MaxDrift := Drift;
+      end;
+    end;
+
+    AssertTrue('eviction actually ran (cache reached the cap)', Evicted);
+    AssertTrue('int8-under-eviction logit drift ' + FloatToStr(MaxDrift) +
+      ' within tolerance ' + FloatToStr(Tol), MaxDrift < Tol);
+  finally
+    StepIn.Free;
+    EvictInt8.Free;
+    EvictFP32.Free;
     Twin.Free;
   end;
 end;
