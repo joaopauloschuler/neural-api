@@ -40187,11 +40187,15 @@ procedure ApplyEnCodecELU(var Sig: TNNetFloatDynArr2D);
 var
   c, t: integer;
   SigMax: integer;
+  SigLenM1: integer;
 begin
   SigMax := Length(Sig) - 1;
   for c := 0 to SigMax do
-    for t := 0 to Length(Sig[c]) - 1 do
+  begin
+    SigLenM1 := Length(Sig[c]) - 1;
+    for t := 0 to SigLenM1 do
       Sig[c][t] := EnCodecELU(Sig[c][t]);
+  end;
 end;
 
 procedure TEnCodecModel.RunStage(const Stage: TEnCodecStage;
@@ -40200,6 +40204,7 @@ var
   Tmp, Shr_, Res: TNNetFloatDynArr2D;
   c, t: integer;
   InSigMax, TmpMax: integer;
+  InSigLenM1, TmpLenM1: integer;
 begin
   InSigMax := Length(InSig) - 1;
   case Stage.Kind of
@@ -40210,7 +40215,8 @@ begin
         for c := 0 to InSigMax do
         begin
           SetLength(OutSig[c], Length(InSig[c]));
-          for t := 0 to Length(InSig[c]) - 1 do
+          InSigLenM1 := Length(InSig[c]) - 1;
+          for t := 0 to InSigLenM1 do
             OutSig[c][t] := EnCodecELU(InSig[c][t]);
         end;
       end;
@@ -40221,7 +40227,8 @@ begin
         for c := 0 to InSigMax do
         begin
           SetLength(Tmp[c], Length(InSig[c]));
-          for t := 0 to Length(InSig[c]) - 1 do
+          InSigLenM1 := Length(InSig[c]) - 1;
+          for t := 0 to InSigLenM1 do
             Tmp[c][t] := EnCodecELU(InSig[c][t]);
         end;
         RunEnCodecConv(Stage.Resnet.Conv1, Tmp, Res, FConfig.UseCausalConv, FProcs);
@@ -40239,7 +40246,8 @@ begin
         for c := 0 to TmpMax do
         begin
           SetLength(OutSig[c], Length(Tmp[c]));
-          for t := 0 to Length(Tmp[c]) - 1 do
+          TmpLenM1 := Length(Tmp[c]) - 1;
+          for t := 0 to TmpLenM1 do
             OutSig[c][t] := Shr_[c][t] + Tmp[c][t];
         end;
       end;
@@ -40469,7 +40477,7 @@ begin
     dim := Config.NumFilters;
     // reversed(upsampling_ratios): each adds [Resnet]*num_residual_layers,
     // ELU, downsample Conv.
-    for r := NumRatios - 1 downto 0 do
+    for r := NumRatiosM1 downto 0 do
     begin
       ratio := Config.UpsamplingRatios[r];
       for j := 0 to NumResLayM1 do
@@ -40903,6 +40911,7 @@ var
   Padded, Full: TMimiDblArr2D;
   Patch, WD: TMimiDblArr; // im2col gather + Double-packed weights
   IPGK, lp: integer;
+  WDMax: integer;
 begin
   InCh := Conv.InCh;
   OutCh := Conv.OutCh;
@@ -40958,7 +40967,8 @@ begin
     // Pre-pack the (single) Conv weights into a contiguous Double buffer once so
     // the per-output-position contraction is a contiguous Double DotProduct.
     SetLength(WD, OutCh * IPGK);
-    for lp := 0 to OutCh * IPGK - 1 do WD[lp] := Conv.W[lp];
+    WDMax := OutCh * IPGK - 1;
+    for lp := 0 to WDMax do WD[lp] := Conv.W[lp];
     // im2col over the OUTPUT-TIME axis. For a fixed (group, t) the receptive-field
     // patch (ordered [gi*K + k2], matching the [Out,In/groups,K] weight layout)
     // is shared by all OPG output channels in the group, so it is gathered once
@@ -41146,11 +41156,15 @@ procedure ApplyMimiELU(var Sig: TMimiDblArr2D);
 var
   c, t: integer;
   SigM1: integer;
+  SigLenM1: integer;
 begin
   SigM1 := Length(Sig) - 1;
   for c := 0 to SigM1 do
-    for t := 0 to Length(Sig[c]) - 1 do
+  begin
+    SigLenM1 := Length(Sig[c]) - 1;
+    for t := 0 to SigLenM1 do
       if Sig[c][t] <= 0 then Sig[c][t] := Exp(Sig[c][t]) - 1;
+  end;
 end;
 
 // Pre-norm RoPE causal-attention + GELU MLP transformer over a channel-major
@@ -41381,6 +41395,7 @@ var
   Tmp, Shr_, Res: TMimiDblArr2D;
   c, t: integer;
   InSigM1, TmpM1: integer;
+  InSigLenM1, TmpLenM1: integer;
 begin
   InSigM1 := Length(InSig) - 1;
   case Stage.Kind of
@@ -41391,7 +41406,8 @@ begin
         for c := 0 to InSigM1 do
         begin
           SetLength(OutSig[c], Length(InSig[c]));
-          for t := 0 to Length(InSig[c]) - 1 do
+          InSigLenM1 := Length(InSig[c]) - 1;
+          for t := 0 to InSigLenM1 do
             OutSig[c][t] := MimiELUf(InSig[c][t]);
         end;
       end;
@@ -41401,7 +41417,8 @@ begin
         for c := 0 to InSigM1 do
         begin
           SetLength(Tmp[c], Length(InSig[c]));
-          for t := 0 to Length(InSig[c]) - 1 do
+          InSigLenM1 := Length(InSig[c]) - 1;
+          for t := 0 to InSigLenM1 do
             Tmp[c][t] := MimiELUf(InSig[c][t]);
         end;
         RunMimiConv(Stage.Resnet.Conv1, Tmp, Res);
@@ -41419,7 +41436,8 @@ begin
         for c := 0 to TmpM1 do
         begin
           SetLength(OutSig[c], Length(Tmp[c]));
-          for t := 0 to Length(Tmp[c]) - 1 do
+          TmpLenM1 := Length(Tmp[c]) - 1;
+          for t := 0 to TmpLenM1 do
             OutSig[c][t] := Shr_[c][t] + Tmp[c][t];
         end;
       end;
@@ -41704,7 +41722,7 @@ begin
     PushEnc(MakeConvStage('encoder.layers.0.conv', 1, 1));
     Idx := 1;
     dim := Config.NumFilters;
-    for r := NumRatios - 1 downto 0 do
+    for r := NumRatiosM1 downto 0 do
     begin
       ratio := Config.UpsamplingRatios[r];
       for j := 0 to MaxResid do
@@ -41953,6 +41971,7 @@ var
   Padded, Full: TMimiDblArr2D;
   Patch, WD: TMimiDblArr;
   InCK: integer;
+  PaddedLenM1, WDMax: integer;
 begin
   InCh := Conv.InCh;
   OutCh := Conv.OutCh;
@@ -41968,11 +41987,12 @@ begin
   if not Conv.Transpose then
   begin
     PaddedLen := InLen + 2 * Pad;
+    PaddedLenM1 := PaddedLen - 1;
     SetLength(Padded, InCh);
     for i := 0 to InChM1 do
     begin
       SetLength(Padded[i], PaddedLen);
-      for t := 0 to PaddedLen - 1 do Padded[i][t] := 0;
+      for t := 0 to PaddedLenM1 do Padded[i][t] := 0;
       for t := 0 to InLenM1 do Padded[i][Pad + t] := InSig[i][t];
     end;
     OutLen := (PaddedLen - EffK) div Stride + 1;
@@ -41982,7 +42002,8 @@ begin
     SetLength(OutSig, OutCh);
     for o := 0 to OutChM1 do SetLength(OutSig[o], OutLen);
     SetLength(WD, OutCh * InCK);
-    for lp := 0 to OutCh * InCK - 1 do WD[lp] := Conv.W[lp];
+    WDMax := OutCh * InCK - 1;
+    for lp := 0 to WDMax do WD[lp] := Conv.W[lp];
     SetLength(Patch, InCK);
     for t := 0 to OutLenM1 do
     begin
@@ -42218,15 +42239,17 @@ var
   H, Tmp: TMimiDblArr2D;
   c, t, ChM1, InLen, OutLen, Padding, OutM1: integer;
   Pad1: integer;
+  InLenM1: integer;
 begin
   ChM1 := Length(Sig) - 1;
   InLen := Length(Sig[0]);
+  InLenM1 := InLen - 1;
   // Work on a copy so the residual (Sig) is preserved for the crop+add.
   SetLength(H, ChM1 + 1);
   for c := 0 to ChM1 do
   begin
     SetLength(H[c], InLen);
-    for t := 0 to InLen - 1 do H[c][t] := Sig[c][t];
+    for t := 0 to InLenM1 do H[c][t] := Sig[c][t];
   end;
   RunSnake(RU.Snake1Alpha, H);
   // conv1: k=7 dilated, pad = ((7-1)*dilation)//2.
@@ -42262,19 +42285,23 @@ var
   pn, cn, dot, BestSim: double;
   CodebookNorms: TMimiDblArr2D; // L2-normalized codebook rows per quantizer
   CbSize, d, CdM1: integer;
+  WaveLenM1, NumStagesM1, EncResHigh, NQM1, CbSizeM1, HiddenDimM1: integer;
 begin
   // input -> [1][T]
   SetLength(Sig, 1);
   SetLength(Sig[0], Length(Waveform));
-  for t := 0 to Length(Waveform) - 1 do Sig[0][t] := Waveform[t];
+  WaveLenM1 := Length(Waveform) - 1;
+  for t := 0 to WaveLenM1 do Sig[0][t] := Waveform[t];
 
   // encoder conv1 (k=7, pad=3).
   RunDACConv(FEncConv1, 3, Sig, Tmp); Sig := Tmp;
   NumStages := Length(FEncBlockConv);
-  for b := 0 to NumStages - 1 do
+  NumStagesM1 := NumStages - 1;
+  for b := 0 to NumStagesM1 do
   begin
     // three residual units (dilations 1,3,9).
-    for ru := 0 to High(FEncBlockRes[b]) do
+    EncResHigh := High(FEncBlockRes[b]);
+    for ru := 0 to EncResHigh do
       RunResidualUnit(FEncBlockRes[b][ru], Sig);
     RunSnake(FEncBlockSnakeAlpha[b], Sig);
     // strided downsample conv (k=2*stride, stride, pad=ceil(stride/2)).
@@ -42286,23 +42313,26 @@ begin
   RunDACConv(FEncConv2, 1, Sig, Tmp); Sig := Tmp; // k=3, pad=1
 
   HiddenDim := Length(Sig);
+  HiddenDimM1 := HiddenDim - 1;
   Frames := Length(Sig[0]);
   FrameCount := Frames;
   FramesM1 := Frames - 1;
 
   NQ := Length(FCodebooks);
+  NQM1 := NQ - 1;
   Cd := FConfig.CodebookDim;
   CdM1 := Cd - 1;
   SetLength(Codes, NQ);
-  for q := 0 to NQ - 1 do SetLength(Codes[q], Frames);
+  for q := 0 to NQM1 do SetLength(Codes[q], Frames);
 
   // Pre-normalize each codebook's rows once (L2 over codebook_dim).
   SetLength(CodebookNorms, NQ);
-  for q := 0 to NQ - 1 do
+  for q := 0 to NQM1 do
   begin
     CbSize := FCodebooks[q].Rows;
+    CbSizeM1 := CbSize - 1;
     SetLength(CodebookNorms[q], CbSize * Cd);
-    for cbk := 0 to CbSize - 1 do
+    for cbk := 0 to CbSizeM1 do
     begin
       cn := 0;
       for d := 0 to CdM1 do
@@ -42318,8 +42348,8 @@ begin
   SetLength(NormP, Cd);
   for t := 0 to FramesM1 do
   begin
-    for i := 0 to HiddenDim - 1 do Residual[i] := Sig[i][t];
-    for q := 0 to NQ - 1 do
+    for i := 0 to HiddenDimM1 do Residual[i] := Sig[i][t];
+    for q := 0 to NQM1 do
     begin
       // in_proj: 1x1 conv hidden->codebook_dim. Residual is one frame; do the
       // matmul (out[o] = bias + sum_i W[o,i]*residual[i]).
@@ -42328,7 +42358,7 @@ begin
       for d := 0 to CdM1 do
       begin
         dot := FInProj[q].B[d];
-        for i := 0 to HiddenDim - 1 do
+        for i := 0 to HiddenDimM1 do
           dot := dot + FInProj[q].W[d * HiddenDim + i] * Residual[i];
         NormP[d] := dot;
       end;
@@ -42341,8 +42371,9 @@ begin
       // argmax cosine = argmin L2 of the normalized vectors against the
       // normalized codebook (both unit-norm).
       CbSize := FCodebooks[q].Rows;
+      CbSizeM1 := CbSize - 1;
       best := 0; BestSim := -1e30;
-      for cbk := 0 to CbSize - 1 do
+      for cbk := 0 to CbSizeM1 do
       begin
         dot := 0;
         for d := 0 to CdM1 do
@@ -42351,7 +42382,7 @@ begin
       end;
       Codes[q][t] := best;
       // out_proj(raw codebook row) -> hidden, subtract from residual.
-      for i := 0 to HiddenDim - 1 do
+      for i := 0 to HiddenDimM1 do
       begin
         dot := FOutProj[q].B[i];
         for d := 0 to CdM1 do
@@ -42369,6 +42400,7 @@ var
   i, t, b, NumStages, ru, q, NQ, Cd, HiddenDim, Frames, code, d: integer;
   Stride, Pad, FramesM1, NUse, OutLen, CdM1: integer;
   dot: double;
+  HiddenDimM1, NUseM1, NumStagesM1, DecResHigh, OutLenM1: integer;
 begin
   NQ := Length(FCodebooks);
   if (UseCodebooks > 0) and (UseCodebooks < NQ) then NUse := UseCodebooks
@@ -42376,21 +42408,23 @@ begin
   Cd := FConfig.CodebookDim;
   CdM1 := Cd - 1;
   HiddenDim := FConfig.HiddenSize;
+  HiddenDimM1 := HiddenDim - 1;
+  NUseM1 := NUse - 1;
   Frames := Length(Codes[0]);
   FramesM1 := Frames - 1;
 
   // from_codes: quantized = sum_q out_proj(codebook[codes[q]]).
   SetLength(Sig, HiddenDim);
-  for i := 0 to HiddenDim - 1 do
+  for i := 0 to HiddenDimM1 do
   begin
     SetLength(Sig[i], Frames);
     for t := 0 to FramesM1 do Sig[i][t] := 0;
   end;
-  for q := 0 to NUse - 1 do
+  for q := 0 to NUseM1 do
     for t := 0 to FramesM1 do
     begin
       code := Codes[q][t];
-      for i := 0 to HiddenDim - 1 do
+      for i := 0 to HiddenDimM1 do
       begin
         dot := FOutProj[q].B[i];
         for d := 0 to CdM1 do
@@ -42402,13 +42436,15 @@ begin
   // decoder conv1 (k=7, pad=3).
   RunDACConv(FDecConv1, 3, Sig, Tmp); Sig := Tmp;
   NumStages := Length(FDecBlockConvT);
-  for b := 0 to NumStages - 1 do
+  NumStagesM1 := NumStages - 1;
+  for b := 0 to NumStagesM1 do
   begin
     RunSnake(FDecBlockSnakeAlpha[b], Sig);
     Stride := FDecBlockConvT[b].Stride;
     Pad := (Stride + 1) div 2; // ceil(stride/2)
     RunDACConv(FDecBlockConvT[b], Pad, Sig, Tmp); Sig := Tmp;
-    for ru := 0 to High(FDecBlockRes[b]) do
+    DecResHigh := High(FDecBlockRes[b]);
+    for ru := 0 to DecResHigh do
       RunResidualUnit(FDecBlockRes[b][ru], Sig);
   end;
   RunSnake(FDecSnakeAlpha, Sig);
@@ -42416,8 +42452,9 @@ begin
 
   // tanh.
   OutLen := Length(Sig[0]);
+  OutLenM1 := OutLen - 1;
   SetLength(Waveform, OutLen);
-  for t := 0 to OutLen - 1 do
+  for t := 0 to OutLenM1 do
   begin
     dot := Sig[0][t];
     Waveform[t] := Tanh(dot);
@@ -42441,6 +42478,7 @@ var
   Consumed: TStringList;
   NumStages, b, ru, q, NQ: integer;
   Stride: integer;
+  NumStagesM1, NQM1: integer;
   EncPref, DecPref, RuPref, QPref: string;
   Dilations: array[0..2] of integer = (1, 3, 9);
 
@@ -42461,13 +42499,14 @@ begin
   try
     Model := TNNetDAC.Create(Config);
     NumStages := Length(Config.DownsamplingRatios);
+    NumStagesM1 := NumStages - 1;
 
     // ---------------- ENCODER ----------------
     LoadDACConv(Reader, 'encoder.conv1', Model.FEncConv1, False, 1, 1, Consumed);
     SetLength(Model.FEncBlockRes, NumStages);
     SetLength(Model.FEncBlockSnakeAlpha, NumStages);
     SetLength(Model.FEncBlockConv, NumStages);
-    for b := 0 to NumStages - 1 do
+    for b := 0 to NumStagesM1 do
     begin
       EncPref := 'encoder.block.' + IntToStr(b);
       SetLength(Model.FEncBlockRes[b], 3);
@@ -42489,10 +42528,11 @@ begin
 
     // ---------------- RVQ ----------------
     NQ := Config.NumCodebooks;
+    NQM1 := NQ - 1;
     SetLength(Model.FInProj, NQ);
     SetLength(Model.FOutProj, NQ);
     SetLength(Model.FCodebooks, NQ);
-    for q := 0 to NQ - 1 do
+    for q := 0 to NQM1 do
     begin
       QPref := 'quantizer.quantizers.' + IntToStr(q);
       LoadDACConv(Reader, QPref + '.in_proj', Model.FInProj[q], False, 1, 1,
@@ -42508,7 +42548,7 @@ begin
     SetLength(Model.FDecBlockSnakeAlpha, NumStages);
     SetLength(Model.FDecBlockConvT, NumStages);
     SetLength(Model.FDecBlockRes, NumStages);
-    for b := 0 to NumStages - 1 do
+    for b := 0 to NumStagesM1 do
     begin
       DecPref := 'decoder.block.' + IntToStr(b);
       LoadDACSnakeAlpha(Reader, DecPref + '.snake1.alpha',
@@ -42715,6 +42755,7 @@ function HiFiGANConfigToString(const Config: THiFiGANConfig): string;
 var
   k, j: integer;
   Hi: integer;
+  DilM1: integer;
   Rates, UKernels, RKernels, Dils: string;
 begin
   Rates := ''; UKernels := '';
@@ -42731,7 +42772,8 @@ begin
   begin
     if k > 0 then begin RKernels := RKernels + ','; Dils := Dils + ';'; end;
     RKernels := RKernels + IntToStr(Config.ResblockKernelSizes[k]);
-    for j := 0 to Length(Config.ResblockDilationSizes[k]) - 1 do
+    DilM1 := Length(Config.ResblockDilationSizes[k]) - 1;
+    for j := 0 to DilM1 do
     begin
       if j > 0 then Dils := Dils + ',';
       Dils := Dils + IntToStr(Config.ResblockDilationSizes[k][j]);
@@ -42863,11 +42905,15 @@ procedure ApplyHiFiGANLeakyReLU(var Sig: TNNetFloatDynArr2D; Slope: TNeuralFloat
 var
   c, t: integer;
   MaxC: integer;
+  SigLenM1: integer;
 begin
   MaxC := Length(Sig) - 1;
   for c := 0 to MaxC do
-    for t := 0 to Length(Sig[c]) - 1 do
+  begin
+    SigLenM1 := Length(Sig[c]) - 1;
+    for t := 0 to SigLenM1 do
       Sig[c][t] := HiFiGANLeakyReLU(Sig[c][t], Slope);
+  end;
 end;
 
 // Conv1d ("same"-padded) / ConvTranspose1d on a channel-major signal. For a
@@ -43038,6 +43084,7 @@ var
   NumUp, NumKernels, s, j, d, c, t, dil, rb: integer;
   MaxC, NumUpM1, NumKernelsM1, LenSig, LenResOne, LenResSum: integer;
   LenConvs, LenConvs1, LenSig0: integer;
+  MelTLen, SigTLen, ResOneTLen, ResSumTLen: integer;
   Slope, InvK: TNeuralFloat;
 begin
   NumUp := Length(FConfig.UpsampleRates);
@@ -43051,7 +43098,8 @@ begin
   for c := 0 to MaxC do
   begin
     SetLength(Sig[c], Length(Mel[c]));
-    for t := 0 to Length(Mel[c]) - 1 do
+    MelTLen := Length(Mel[c]) - 1;
+    for t := 0 to MelTLen do
     begin
       if FConfig.NormalizeBefore then
         Sig[c][t] := (Mel[c][t] - FMean[c]) / FScale[c]
@@ -43080,7 +43128,8 @@ begin
       for c := 0 to LenSig do
       begin
         SetLength(ResOne[c], Length(Sig[c]));
-        for t := 0 to Length(Sig[c]) - 1 do ResOne[c][t] := Sig[c][t];
+        SigTLen := Length(Sig[c]) - 1;
+        for t := 0 to SigTLen do ResOne[c][t] := Sig[c][t];
       end;
       LenResOne := Length(ResOne) - 1;
       if FConfig.ResblockType = 2 then
@@ -43094,14 +43143,18 @@ begin
           for c := 0 to LenResOne do
           begin
             SetLength(Tmp1[c], Length(ResOne[c]));
-            for t := 0 to Length(ResOne[c]) - 1 do
+            ResOneTLen := Length(ResOne[c]) - 1;
+            for t := 0 to ResOneTLen do
               Tmp1[c][t] := HiFiGANLeakyReLU(ResOne[c][t], Slope);
           end;
           RunHiFiGANConv(FResBlocks[rb].Convs[d], Tmp1, Tmp2);
           // ResOne := ResOne + Tmp2
           for c := 0 to LenResOne do
-            for t := 0 to Length(ResOne[c]) - 1 do
+          begin
+            ResOneTLen := Length(ResOne[c]) - 1;
+            for t := 0 to ResOneTLen do
               ResOne[c][t] := ResOne[c][t] + Tmp2[c][t];
+          end;
           if dil = 0 then ; // (silence "unused" hint when no dilations)
         end;
       end
@@ -43116,7 +43169,8 @@ begin
         for c := 0 to LenResOne do
         begin
           SetLength(Tmp1[c], Length(ResOne[c]));
-          for t := 0 to Length(ResOne[c]) - 1 do
+          ResOneTLen := Length(ResOne[c]) - 1;
+          for t := 0 to ResOneTLen do
             Tmp1[c][t] := HiFiGANLeakyReLU(ResOne[c][t], Slope);
         end;
         RunHiFiGANConv(FResBlocks[rb].Convs1[d], Tmp1, Tmp2);
@@ -43124,8 +43178,11 @@ begin
         RunHiFiGANConv(FResBlocks[rb].Convs2[d], Tmp2, Tmp1);
         // ResOne := ResOne + Tmp1
         for c := 0 to LenResOne do
-          for t := 0 to Length(ResOne[c]) - 1 do
+        begin
+          ResOneTLen := Length(ResOne[c]) - 1;
+          for t := 0 to ResOneTLen do
             ResOne[c][t] := ResOne[c][t] + Tmp1[c][t];
+        end;
         if dil = 0 then ; // (silence "unused" hint when no dilations)
       end;
       end;
@@ -43136,19 +43193,26 @@ begin
         for c := 0 to LenResOne do
         begin
           SetLength(ResSum[c], Length(ResOne[c]));
-          for t := 0 to Length(ResOne[c]) - 1 do ResSum[c][t] := ResOne[c][t];
+          ResOneTLen := Length(ResOne[c]) - 1;
+          for t := 0 to ResOneTLen do ResSum[c][t] := ResOne[c][t];
         end;
       end
       else
         for c := 0 to LenResOne do
-          for t := 0 to Length(ResOne[c]) - 1 do
+        begin
+          ResOneTLen := Length(ResOne[c]) - 1;
+          for t := 0 to ResOneTLen do
             ResSum[c][t] := ResSum[c][t] + ResOne[c][t];
+        end;
     end;
     InvK := 1.0 / NumKernels;
     LenResSum := Length(ResSum) - 1;
     for c := 0 to LenResSum do
-      for t := 0 to Length(ResSum[c]) - 1 do
+    begin
+      ResSumTLen := Length(ResSum[c]) - 1;
+      for t := 0 to ResSumTLen do
         ResSum[c][t] := ResSum[c][t] * InvK;
+    end;
     Sig := ResSum;
   end;
   // ---- final LeakyReLU uses PyTorch's DEFAULT slope (0.01), not the config.
@@ -43195,6 +43259,7 @@ var
   T: TNNetVolume;
   NumUp, NumKernels, s, j, d, rb, ch, pad, kk, st: integer;
   NumUpM1, NumKernelsM1: integer;
+  DilSizeM1: integer;
   Base: string;
 begin
   Consumed := TStringList.Create;
@@ -43238,13 +43303,14 @@ begin
         rb := s * NumKernels + j;
         kk := Config.ResblockKernelSizes[j];
         Base := 'resblocks.' + IntToStr(rb);
+        DilSizeM1 := Length(Config.ResblockDilationSizes[j]) - 1;
         if Config.ResblockType = 2 then
         begin
           // Type 2: a SINGLE dilated conv per tap (resblocks.{rb}.convs.{d}),
           // no convs2. Forward per tap: x := x + conv(LeakyReLU(x)).
           SetLength(Model.FResBlocks[rb].Convs,
             Length(Config.ResblockDilationSizes[j]));
-          for d := 0 to Length(Config.ResblockDilationSizes[j]) - 1 do
+          for d := 0 to DilSizeM1 do
             // convs[d]: dilation resblock_dilation_sizes[j][d], "same" pad
             // = (k*dil - dil) div 2.
             LoadHiFiGANConv(Reader, Base + '.convs.' + IntToStr(d),
@@ -43259,7 +43325,7 @@ begin
             Length(Config.ResblockDilationSizes[j]));
           SetLength(Model.FResBlocks[rb].Convs2,
             Length(Config.ResblockDilationSizes[j]));
-          for d := 0 to Length(Config.ResblockDilationSizes[j]) - 1 do
+          for d := 0 to DilSizeM1 do
           begin
             // convs1[d]: dilation resblock_dilation_sizes[j][d], "same" pad
             // = (k*dil - dil) div 2.
@@ -43415,6 +43481,7 @@ procedure DemucsGLU(const InSig: array of TNeuralFloatDynArr;
 var
   Half, c, t: integer;
   HalfM1: integer;
+  InSigTLen: integer;
 begin
   Half := Length(InSig) div 2;
   SetLength(OutSig, Half);
@@ -43422,7 +43489,8 @@ begin
   for c := 0 to HalfM1 do
   begin
     SetLength(OutSig[c], Length(InSig[c]));
-    for t := 0 to Length(InSig[c]) - 1 do
+    InSigTLen := Length(InSig[c]) - 1;
+    for t := 0 to InSigTLen do
       OutSig[c][t] := InSig[c][t] *
         (1.0 / (1.0 + Exp(-InSig[Half + c][t])));
   end;
@@ -43432,11 +43500,15 @@ procedure DemucsReLU(var Sig: TNNetFloatDynArr2D);
 var
   c, t: integer;
   MaxC: integer;
+  SigTLen: integer;
 begin
   MaxC := Length(Sig) - 1;
   for c := 0 to MaxC do
-    for t := 0 to Length(Sig[c]) - 1 do
+  begin
+    SigTLen := Length(Sig[c]) - 1;
+    for t := 0 to SigTLen do
       if Sig[c][t] < 0 then Sig[c][t] := 0;
+  end;
 end;
 
 // Symmetric center trim of a channel-major signal to RefLen (Demucs
@@ -43523,6 +43595,7 @@ var
   Acc: TNeuralFloat;
   AudioChM1, InLenM1, LenSig, LSTMLayersM1: integer;
   FLinOutM1, TlenM1, FLinInM1, LM1, SourcesM1: integer;
+  SigTLen, LSTMHiddenM1: integer;
 begin
   InLen := Length(Mix[0]);
   // ---- mixed waveform as channel-major Sig[channel][sample].
@@ -43552,7 +43625,8 @@ begin
     for c := 0 to LenSig do
     begin
       SetLength(Skips[i][c], Length(Sig[c]));
-      for t := 0 to Length(Sig[c]) - 1 do Skips[i][c][t] := Sig[c][t];
+      SigTLen := Length(Sig[c]) - 1;
+      for t := 0 to SigTLen do Skips[i][c][t] := Sig[c][t];
     end;
   end;
 
@@ -43569,8 +43643,9 @@ begin
       FLSTM[i].BhhR, FLSTM[i].InSize, FLSTM[i].Hidden, Tlen, True, Bwd);
     // concat forward then reverse on the feature axis.
     SetLength(Cat, 2 * FLSTM[i].Hidden);
-    for c := 0 to FLSTM[i].Hidden - 1 do Cat[c] := Fwd[c];
-    for c := 0 to FLSTM[i].Hidden - 1 do Cat[FLSTM[i].Hidden + c] := Bwd[c];
+    LSTMHiddenM1 := FLSTM[i].Hidden - 1;
+    for c := 0 to LSTMHiddenM1 do Cat[c] := Fwd[c];
+    for c := 0 to LSTMHiddenM1 do Cat[FLSTM[i].Hidden + c] := Bwd[c];
     Seq := Cat;
   end;
   // Linear(2C -> C): Lin[o][t] = sum_in W[o,in]*Seq[in][t] + B[o].
@@ -44627,6 +44702,7 @@ procedure TNNetVits.RunFlowReverse(var Latent: TNNetFloatDynArr2D);
 var
   fi, half, c, t, Tlen, Flow: integer;
   FlowM1, HalfM1, TlenM1: integer;
+  PriorFlowsM1: integer;
   FirstHalf, Pre, WNOut, Mean, Tmp: TNNetFloatDynArr2D;
 begin
   Flow := FConfig.FlowSize;
@@ -44635,9 +44711,10 @@ begin
   FlowM1 := Flow - 1;
   HalfM1 := half - 1;
   TlenM1 := Tlen - 1;
+  PriorFlowsM1 := FConfig.PriorNumFlows - 1;
   // reversed(flows): for each flow (from last to first): flip channels, then
   // reverse coupling (second_half -= mean(first_half)).
-  for fi := FConfig.PriorNumFlows - 1 downto 0 do
+  for fi := PriorFlowsM1 downto 0 do
   begin
     // flip channels [1]: reverse the channel order.
     SetLength(Tmp, Flow);
@@ -44794,6 +44871,7 @@ procedure TNNetVits.StochasticDurationReverse(const Hidden: TNNetFloatDynArr2D;
 var
   Tlen, H, c, t, fi, NumApplied: integer;
   HM1, TlenM1, NumAppliedM1: integer;
+  DurNumFlowsStart: integer;
   Inp, Cond, Latent, Tmp: TNNetFloatDynArr2D;
   Order: array of integer;
 begin
@@ -44830,7 +44908,8 @@ begin
   // first conv flow (self.flows[1]). self.flows = [affine, CF_0 .. CF_{n-1}].
   SetLength(Order, FConfig.DurNumFlows);   // = (num conv flows - 1) + 1 affine
   NumApplied := 0;
-  for fi := FConfig.DurNumFlows downto 2 do   // conv flows CF_{n-1} .. CF_1
+  DurNumFlowsStart := FConfig.DurNumFlows;
+  for fi := DurNumFlowsStart downto 2 do   // conv flows CF_{n-1} .. CF_1
   begin
     Order[NumApplied] := fi;                   // FSDPFlows index (affine=0)
     Inc(NumApplied);
@@ -44898,6 +44977,7 @@ procedure TNNetVits.ExpandPrior(const PriorMean, PriorLogVar: TNNetFloatDynArr2D
   out ExpMean, ExpLogVar: TNNetFloatDynArr2D);
 var
   T, Flow, OutLen, tok, rep, col, c, TM1, FlowM1: integer;
+  DurM1: integer;
 begin
   T := Length(PriorMean);
   Flow := FConfig.FlowSize;
@@ -44915,7 +44995,9 @@ begin
   end;
   col := 0;
   for tok := 0 to TM1 do
-    for rep := 0 to Durations[tok] - 1 do
+  begin
+    DurM1 := Durations[tok] - 1;
+    for rep := 0 to DurM1 do
     begin
       if col >= OutLen then Break;
       for c := 0 to FlowM1 do
@@ -44925,6 +45007,7 @@ begin
       end;
       Inc(col);
     end;
+  end;
 end;
 
 procedure TNNetVits.FlowReverse(const PriorLatents: TNNetFloatDynArr2D;
