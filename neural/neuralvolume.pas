@@ -81,6 +81,8 @@ type
 const
   csNeuralFloatSize = SizeOf(TNeuralFloat);
   csNeuralFloat4Size = SizeOf(TNeuralFloat4);
+  csLongintSize = SizeOf(Longint);
+  csIntegerSize = SizeOf(Integer);
   csNeuralFloat4Zero : TNeuralFloat4 = (0,0,0,0);
   csNeuralFloat4One : TNeuralFloat4  = (1,1,1,1);
 

@@ -867,7 +867,7 @@ begin
     Dict.Tokenize(Corpus[LineIdx], Toks);
     if Length(Toks) = 0 then continue;
     SetLength(Stream, StreamLen + Length(Toks));
-    Move(Toks[0], Stream[StreamLen], Length(Toks) * SizeOf(integer));
+    Move(Toks[0], Stream[StreamLen], Length(Toks) * csIntegerSize);
     StreamLen := StreamLen + Length(Toks);
   end;
   if StreamLen < 2 then Exit;

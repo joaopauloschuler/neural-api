@@ -3616,7 +3616,7 @@ begin
     begin
       UnpackPos(TopPos, Rule, Idx);
       SetLength(Adv, FStackLen[I]);
-      Move(FStacks[I][0], Adv[0], FStackLen[I] * SizeOf(integer));
+      Move(FStacks[I][0], Adv[0], FStackLen[I] * csIntegerSize);
       Adv[FStackLen[I] - 1] := PackPos(Rule, Idx + 1);
       AddStackExpanded(Adv, FStackLen[I]);
     end;

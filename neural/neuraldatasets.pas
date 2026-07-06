@@ -1184,7 +1184,7 @@ begin
     // This portion of code was coded by https://chatgpt.com/g/g-bqMxEDpIg-neural-api-free-pascal-developer
     SetLength(AIntegerArray, SampleCutPosition);
     if SampleCutPosition > 0 then
-    Move(Dataset[SampleId][0], AIntegerArray[0], SampleCutPosition * SizeOf(Integer));
+    Move(Dataset[SampleId][0], AIntegerArray[0], SampleCutPosition * csIntegerSize);
     {$ENDIF}
     pInput.Fill(0);
     pInput.CopyReversedNoChecksIntArr( AIntegerArray );
