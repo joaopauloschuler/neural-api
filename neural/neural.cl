@@ -147,6 +147,149 @@ __kernel void cai_dot_product
   }
 } // end of kernel
 
+// Int8-weight twin of cai_dot_product: the A operand is per-output-row
+// symmetric int8 codes (dequantized value = code * FScales[a_id]) stored in
+// the SAME interleaved layout ([a_id + i*FNumAs], one byte per element), so
+// adjacent work-items read adjacent bytes - 4 lanes per 32-bit transaction,
+// 1/4 of the FP32 weight traffic. Codes convert to float in-register
+// (convert_float on OpenCL's signed char); the per-row scale is applied ONCE
+// to the reduced raw code sum, before the fused bias-add, mirroring the host
+// fused kernel (TNNetVolume.DotProductInt8 + deferred scale) so device and
+// host agree to normal float tolerance. B, the result layout, and the fused
+// bias/activation tail (args 8/9, opcodes 1=ReLU 2=Sigmoid 3=Tanh) are
+// identical to cai_dot_product; FScales rides as arg 10. Coded by Claude (AI).
+__kernel void cai_dot_product_int8
+(
+  const int FThreadCount,
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  int ActFN,
+  __global const char* FInputBufferAs,
+  __global float* FInputBufferBs,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FBiasOutput,
+  __global const float* FScales
+)
+{
+  const int a_id = get_global_id(0);
+  const int b_id = get_global_id(1);
+
+  if ( (a_id < FNumAs) && (b_id < FNumBs) )
+  {
+    const int VectBPos = b_id * FSize;
+
+    float DotProductResult = 0;
+    int i = 0;
+
+    const int FSizeMinus8  = FSize -  8;
+    const int FSizeMinus32 = FSize - 32;
+
+    while (i < FSizeMinus32)
+    {
+      const int startBPos = i + VectBPos;
+
+      DotProductResult =
+        mad(convert_float(FInputBufferAs[a_id + (i+ 0)*FNumAs]), FInputBufferBs[startBPos +  0],
+        mad(convert_float(FInputBufferAs[a_id + (i+ 1)*FNumAs]), FInputBufferBs[startBPos +  1],
+        mad(convert_float(FInputBufferAs[a_id + (i+ 2)*FNumAs]), FInputBufferBs[startBPos +  2],
+        mad(convert_float(FInputBufferAs[a_id + (i+ 3)*FNumAs]), FInputBufferBs[startBPos +  3],
+        mad(convert_float(FInputBufferAs[a_id + (i+ 4)*FNumAs]), FInputBufferBs[startBPos +  4],
+        mad(convert_float(FInputBufferAs[a_id + (i+ 5)*FNumAs]), FInputBufferBs[startBPos +  5],
+        mad(convert_float(FInputBufferAs[a_id + (i+ 6)*FNumAs]), FInputBufferBs[startBPos +  6],
+        mad(convert_float(FInputBufferAs[a_id + (i+ 7)*FNumAs]), FInputBufferBs[startBPos +  7],
+        mad(convert_float(FInputBufferAs[a_id + (i+ 8)*FNumAs]), FInputBufferBs[startBPos +  8],
+        mad(convert_float(FInputBufferAs[a_id + (i+ 9)*FNumAs]), FInputBufferBs[startBPos +  9],
+        mad(convert_float(FInputBufferAs[a_id + (i+10)*FNumAs]), FInputBufferBs[startBPos + 10],
+        mad(convert_float(FInputBufferAs[a_id + (i+11)*FNumAs]), FInputBufferBs[startBPos + 11],
+        mad(convert_float(FInputBufferAs[a_id + (i+12)*FNumAs]), FInputBufferBs[startBPos + 12],
+        mad(convert_float(FInputBufferAs[a_id + (i+13)*FNumAs]), FInputBufferBs[startBPos + 13],
+        mad(convert_float(FInputBufferAs[a_id + (i+14)*FNumAs]), FInputBufferBs[startBPos + 14],
+        mad(convert_float(FInputBufferAs[a_id + (i+15)*FNumAs]), FInputBufferBs[startBPos + 15],
+        mad(convert_float(FInputBufferAs[a_id + (i+16)*FNumAs]), FInputBufferBs[startBPos + 16],
+        mad(convert_float(FInputBufferAs[a_id + (i+17)*FNumAs]), FInputBufferBs[startBPos + 17],
+        mad(convert_float(FInputBufferAs[a_id + (i+18)*FNumAs]), FInputBufferBs[startBPos + 18],
+        mad(convert_float(FInputBufferAs[a_id + (i+19)*FNumAs]), FInputBufferBs[startBPos + 19],
+        mad(convert_float(FInputBufferAs[a_id + (i+20)*FNumAs]), FInputBufferBs[startBPos + 20],
+        mad(convert_float(FInputBufferAs[a_id + (i+21)*FNumAs]), FInputBufferBs[startBPos + 21],
+        mad(convert_float(FInputBufferAs[a_id + (i+22)*FNumAs]), FInputBufferBs[startBPos + 22],
+        mad(convert_float(FInputBufferAs[a_id + (i+23)*FNumAs]), FInputBufferBs[startBPos + 23],
+        mad(convert_float(FInputBufferAs[a_id + (i+24)*FNumAs]), FInputBufferBs[startBPos + 24],
+        mad(convert_float(FInputBufferAs[a_id + (i+25)*FNumAs]), FInputBufferBs[startBPos + 25],
+        mad(convert_float(FInputBufferAs[a_id + (i+26)*FNumAs]), FInputBufferBs[startBPos + 26],
+        mad(convert_float(FInputBufferAs[a_id + (i+27)*FNumAs]), FInputBufferBs[startBPos + 27],
+        mad(convert_float(FInputBufferAs[a_id + (i+28)*FNumAs]), FInputBufferBs[startBPos + 28],
+        mad(convert_float(FInputBufferAs[a_id + (i+29)*FNumAs]), FInputBufferBs[startBPos + 29],
+        mad(convert_float(FInputBufferAs[a_id + (i+30)*FNumAs]), FInputBufferBs[startBPos + 30],
+        mad(convert_float(FInputBufferAs[a_id + (i+31)*FNumAs]), FInputBufferBs[startBPos + 31],
+        DotProductResult
+        ))))))))
+        ))))))))
+        ))))))))
+        ))))))));
+
+      i += 32;
+    }
+
+    while (i < FSizeMinus8)
+    {
+      const int startBPos = i + VectBPos;
+
+      DotProductResult =
+        mad(convert_float(FInputBufferAs[a_id + (i+0)*FNumAs]), FInputBufferBs[startBPos + 0],
+        mad(convert_float(FInputBufferAs[a_id + (i+1)*FNumAs]), FInputBufferBs[startBPos + 1],
+        mad(convert_float(FInputBufferAs[a_id + (i+2)*FNumAs]), FInputBufferBs[startBPos + 2],
+        mad(convert_float(FInputBufferAs[a_id + (i+3)*FNumAs]), FInputBufferBs[startBPos + 3],
+        mad(convert_float(FInputBufferAs[a_id + (i+4)*FNumAs]), FInputBufferBs[startBPos + 4],
+        mad(convert_float(FInputBufferAs[a_id + (i+5)*FNumAs]), FInputBufferBs[startBPos + 5],
+        mad(convert_float(FInputBufferAs[a_id + (i+6)*FNumAs]), FInputBufferBs[startBPos + 6],
+        mad(convert_float(FInputBufferAs[a_id + (i+7)*FNumAs]), FInputBufferBs[startBPos + 7],
+        DotProductResult))))))));
+      i += 8;
+    }
+
+    while (i < FSize)
+    {
+      DotProductResult =
+        mad(convert_float(FInputBufferAs[a_id + i*FNumAs]), FInputBufferBs[i + VectBPos], DotProductResult);
+        i += 1;
+    }
+
+    // Deferred per-row dequantization scale: applied ONCE to the raw code sum,
+    // BEFORE the (FP32, unscaled) bias - same order as the host fused path.
+    DotProductResult *= FScales[a_id];
+
+    // Fused bias-add (see cai_dot_product): act must see W.x + b.
+    if (UseBias != 0) DotProductResult += FBiasOutput[b_id * FNumAs + a_id];
+
+    // Fused activation, identical opcode set and math as cai_dot_product.
+    if (ActFN == 1)
+    {
+      if (DotProductResult < 0.0f) { DotProductResult = 0.0f; }
+    }
+    else if (ActFN == 2) // Sigmoid: numerically-stable two-branch 1/(1+exp(-x))
+    {
+      if (DotProductResult > 0.0f)
+        DotProductResult = 1.0f / (1.0f + exp(-DotProductResult));
+      else
+      {
+        const float s = exp(DotProductResult);
+        DotProductResult = s / (1.0f + s);
+      }
+    }
+    else if (ActFN == 3) // HyperbolicTangent: clamp [-10,10], (1-e)/(1+e), e=exp(-2x)
+    {
+      float xc = DotProductResult;
+      if (xc > 10.0f) xc = 10.0f; else if (xc < -10.0f) xc = -10.0f;
+      const float e = exp(-2.0f * xc);
+      DotProductResult = (1.0f - e) / (1.0f + e);
+    }
+
+    FResultBuffer[b_id * FNumAs + a_id] = DotProductResult;
+  }
+} // end of kernel
+
 __kernel void cai_dot_product2
 (
   const int FThreadCount,

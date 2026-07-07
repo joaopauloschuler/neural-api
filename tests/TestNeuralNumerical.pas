@@ -343,6 +343,12 @@ type
     // (padded-vs-aliased input, stride>1) is exercised against the CPU reference.
     // Coded by Claude (AI).
     procedure TestConvDeviceIm2ColOpenCLParity;
+    // Int8-quantized device forward parity (cai_dot_product_int8, resident
+    // interleaved codes + per-row scales) vs the fused int8 CPU kernels, for
+    // TNNetFullConnect (activation x bias sweep) and TNNetConvolution
+    // (feature-size x padding x stride sweep, incl. pointwise and device
+    // im2col). Coded by Claude (AI).
+    procedure TestInt8QuantizedOpenCLParity;
     // OpenCL backward-GEMM offload parity (vs CPU) for the general convolution.
     procedure TestConvolutionBackwardOpenCLParity;
     // OpenCL two-GEMM forward offload parity (vs CPU) for the BASE
@@ -62132,6 +62138,159 @@ begin
   RunOne('ReLU bias', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0);
   RunOne('Sigmoid bias', @Sigmoid, @SigmoidDerivative, 0);
   RunOne('Tanh bias', @HiperbolicTangent, @HiperbolicTangentDerivative, 0);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Int8-quantized device forward parity (cai_dot_product_int8) vs the fused
+// int8 CPU kernels. The net is quantized FIRST, the fused int8 CPU forward is
+// captured as the reference, THEN EnableOpenCL arms the resident interleaved
+// code/scale buffers (the ordering the int8 device route requires - enabling
+// before quantization leaves Int8Ready false and the layer stays on the CPU
+// path, by design). Both routes compute the same deferred-scale math, so
+// parity must hold to float reduction-order tolerance (< 1e-4). A second
+// forward exercises the resident reuse path (only the input travels). If no
+// device is present the test SKIPs; if the device path is not actually taken
+// the second pass is another CPU forward and parity is trivially exact -
+// ForwardGPUCnt is printed so a vacuous run is visible. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestInt8QuantizedOpenCLParity;
+{$IFDEF OpenCL}
+  procedure RunFC(const aName: string; ActFn, ActDeriv: TNeuralActivationFunction;
+    pSuppressBias: integer);
+  var
+    NN: TNNet;
+    Input, OutCPU: TNNetVolume;
+    FC: TNNetFullConnect;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    i: integer;
+    Diff, MaxDiff: TNeuralFloat;
+  begin
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    RandSeed := 20260706;
+    NN := TNNet.Create();
+    // 128 inputs / 512 neurons: both halves of the FullConnect FShouldOpenCL
+    // verdict, so the base EnableOpenCL allocates FDotCL.
+    Input := TNNetVolume.Create(1, 1, 128);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(1, 1, 128, 1));
+      FC := TNNetFullConnect.Create(512, pSuppressBias);
+      FC.ActivationFn := ActFn;
+      FC.ActivationFnDerivative := ActDeriv;
+      NN.AddLayer(FC);
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.02 * i - 1.28;
+      for i := 0 to FC.Neurons.Count - 1 do
+        FC.Neurons[i].BiasWeight := 0.3 * Sin(i * 0.2);
+      NN.UpdateWeights();
+      FC.SetTrainable(False, False);
+
+      NN.QuantizeWeightsInt8();
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      NN.Compute(Input); // resident codes/scales/bias reuse path
+      MaxDiff := 0;
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      WriteLn('  Int8FC ', aName, ' OpenCL parity: max|diff|=', MaxDiff:0:9,
+        ' gpu forwards=', FC.ForwardGPUCnt);
+      AssertTrue('Int8FC ' + aName + ' device vs CPU parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+
+  procedure RunConv(const aName: string; pFeatureSize, pPadding, pStride: integer;
+    UseReLU: boolean);
+  var
+    NN: TNNet;
+    Input, OutCPU: TNNetVolume;
+    Conv: TNNetConvolutionBase;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    i: integer;
+    Diff, MaxDiff: TNeuralFloat;
+  begin
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    RandSeed := 20260706;
+    NN := TNNet.Create();
+    // Depth 3 keeps FVectorSize (<= 75) under csMaxInterleavedSize so the conv
+    // SetPrevLayer verdict arms FShouldOpenCL and the base allocates FDotCL.
+    Input := TNNetVolume.Create(8, 8, 3);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(8, 8, 3, 1));
+      if UseReLU
+        then Conv := TNNetConvolutionReLU.Create(16, pFeatureSize, pPadding, pStride)
+        else Conv := TNNetConvolutionLinear.Create(16, pFeatureSize, pPadding, pStride);
+      NN.AddLayer(Conv);
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.011 * i - 1.05;
+      for i := 0 to Conv.Neurons.Count - 1 do
+        Conv.Neurons[i].BiasWeight := 0.25 * Sin(i * 0.3);
+      NN.UpdateWeights();
+      Conv.SetTrainable(False, False);
+
+      NN.QuantizeWeightsInt8();
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        NN.Compute(Input); // resident codes/scales/bias reuse path
+        MaxDiff := 0;
+        AssertEquals('Int8Conv ' + aName + ' output size match', OutCPU.Size,
+          NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  Int8Conv ', aName, ' OpenCL parity: max|diff|=', MaxDiff:0:9,
+        ' gpu forwards=', Conv.ForwardGPUCnt);
+      AssertTrue('Int8Conv ' + aName + ' device vs CPU parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+begin
+  RunFC('Identity nobias', @Identity, @IdentityDerivative, 1);
+  RunFC('ReLU bias', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0);
+  RunFC('Sigmoid bias', @Sigmoid, @SigmoidDerivative, 0);
+  RunFC('Tanh nobias', @HiperbolicTangent, @HiperbolicTangentDerivative, 1);
+  RunConv('3x3 pad1 s1 relu', 3, 1, 1, true);
+  RunConv('3x3 pad0 s1 linear', 3, 0, 1, false);
+  RunConv('5x5 pad2 s2 relu', 5, 2, 2, true);
+  RunConv('1x1 pointwise linear', 1, 0, 1, false);
 end;
 {$ELSE}
 begin

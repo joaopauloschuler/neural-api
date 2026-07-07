@@ -46,9 +46,11 @@ weights: less resident RAM, a somewhat slower forward. --max-fast-memory keeps
 the concatenated cache for a faster forward at the cost of more RAM. (The two
 settings are orthogonal; low memory only touches the forward weight cache,
 trainability only the backprop buffers.) Full-precision FP32 weights
-are the DEFAULT: faster, at the cost of more RAM. Pass --int8 for weight-only
-int8 storage (pQuantizeInt8): less RAM, but slower (each layer is dequantized
-on the fly).
+are the DEFAULT: faster on CPU, at the cost of more RAM. Pass --int8 for
+weight-only int8 storage (pQuantizeInt8): less RAM, slower on CPU (the fused
+kernels dequantize on the fly). Combined with --gpu the quantized codes and
+per-row scales are uploaded ONCE as resident device buffers
+(cai_dot_product_int8), so int8 runs on the GPU too.
 
 REPL commands: /exit, /reset (clear history), /system <msg> (set the system
 prompt; raises on formats without a system role, e.g. gemma/mistral).
@@ -167,7 +169,8 @@ begin
   WriteLn('  --format NAME         chatml|llama2|llama3|zephyr|gemma|phi3|mistral');
   WriteLn('  --system "msg"        initial system prompt');
   WriteLn('  --fp32                full-precision weights (DEFAULT; faster, more RAM)');
-  WriteLn('  --int8                int8 weight-only quantized inference (slower, less RAM)');
+  WriteLn('  --int8                int8 weight-only quantized inference (less RAM,');
+  WriteLn('                        slower on CPU; works with --gpu: resident int8 codes)');
   WriteLn('  --low-memory          drop conv/linear weight cache; per-neuron forward (DEFAULT)');
   WriteLn('  --max-fast-memory     keep the concatenated weight cache (faster forward, more RAM)');
   WriteLn('  --gpu                 OpenCL offload of conv/linear matmuls (DEFAULT when');
@@ -1036,12 +1039,6 @@ begin
 
   {$IFDEF OpenCL}
   GpuCL := nil;
-  if Opt.Gpu and Opt.Int8 then
-  begin
-    WriteLn('[--int8 ignored: incompatible with --gpu]');
-    Opt.Int8 := false;
-  end;
-
   if Opt.Gpu and Opt.LowMemory then
   begin
     WriteLn('[--low-memory ignored: incompatible with --gpu]');
@@ -1053,10 +1050,10 @@ begin
   // Weight precision. FP32 is the default (faster, more RAM); int8 is the
   // opt-in for less RAM at the cost of speed (per-layer dequantization).
   if Opt.Int8 then
-    WriteLn('[--int8: int8 weight-only quantized weights - slower, less RAM;',
-      ' pass --fp32 (or drop --int8) for GPU capable full-precision]')
+    WriteLn('[--int8: int8 weight-only quantized weights - less RAM, slower on',
+      ' CPU; on --gpu the codes stay resident on the device]')
   else
-    WriteLn('[fp32 weights (default) - GPU capable]');
+    WriteLn('[fp32 weights (default)]');
   if Opt.LowMemory then
     WriteLn('[low-memory forward (default) - concatenated weight cache dropped,',
       ' per-neuron compute, not compatible with GPU,',
@@ -1083,8 +1080,9 @@ begin
   // OpenCL offload of the conv/linear matmuls. Enabling it rebuilds each
   // accelerated layer's concatenated weight cache and turns its low-memory
   // forward path off (the GPU kernel needs the cache), so --gpu effectively
-  // overrides --low-memory on those layers. Incompatible with --int8 (the
-  // int8 path never builds the interleaved cache the kernel consumes).
+  // overrides --low-memory on those layers. With --int8 the layers instead
+  // arm the resident int8 device mode (cai_dot_product_int8): the quantized
+  // codes + per-row scales are uploaded once and stay on the device.
   if Opt.Gpu then
   begin
     GpuCL := TEasyOpenCL.Create();

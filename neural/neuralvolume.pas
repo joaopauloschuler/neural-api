@@ -77,6 +77,11 @@ type
 
   TNeuralFloatArrPtr = ^TNeuralFloatArr;
   TNeuralIntegerArray = array of integer;
+  // Unbounded-view type over int8 quantized weight codes (never allocated as
+  // such - only used to pointer-index into TInt8DynArr storage, mirroring how
+  // TNeuralFloatArrPtr views float buffers). Coded by Claude (AI).
+  TNeuralInt8Arr = array[0..Maxint div 2] of ShortInt;
+  TNeuralInt8ArrPtr = ^TNeuralInt8Arr;
 
 const
   csNeuralFloatSize = SizeOf(TNeuralFloat);
@@ -497,6 +502,20 @@ type
       // it covers spatial convs, not just pointwise. Reuses the same inline
       // kernel - no per-element call overhead. Coded by Claude (AI).
       procedure DotProductsTiled(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
+      // Fused int8-weight x float32-input dot product: returns the RAW code
+      // sum (sum of code_i * b_i) with NO scale applied - the caller multiplies
+      // by the per-row quantization scale once, so the kernel never touches a
+      // dequantized FP32 weight copy (weights stream at 1 byte/element).
+      // AVX2/x86-64 builds use an asm kernel (sign-extend + convert + FMA in
+      // registers); every other build runs the pure Pascal loop.
+      // Coded by Claude (AI).
+      class function DotProductInt8(PtrA: TNeuralInt8ArrPtr; PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
+      // Int8-weight twin of DotProductsTiled: A rows are int8 codes laid out
+      // exactly like the concatenated weights (row r at Codes[r*VectorSize]),
+      // Scales[r] is row r's quantization scale (applied once per dot product,
+      // fused into the output store). Same tiling and same output layout
+      // (FData[CntB*NumAs + CntA]) as the FP32 version. Coded by Claude (AI).
+      procedure DotProductsTiledInt8(NumAs, NumBs, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
       procedure PointwiseNorm(pNorms: TNNetVolume = nil);
       procedure PointwiseMul(pNorms: TNNetVolume);
       // VectorExp writes dst[0..N-1] := exp(src[0..N-1]). On an AVX2 build it
@@ -1296,6 +1315,116 @@ implementation
 
 uses
   Math, neuralbit, strutils;
+
+{$IFDEF AVX64}
+{$IFDEF AVX2}
+// Fused int8 x float32 dot product (raw code sum, no scale): sign-extends 8
+// codes at a time to dwords (vpmovsxbd), converts to floats in-register
+// (vcvtdq2ps) and FMAs against the float input - the dequantized weight never
+// exists in memory, so the weight stream costs 1 byte/element. Same loop
+// skeleton, accumulator discipline and 4-wide tail as AVXDotProduct.
+// Coded by Claude (AI).
+function AVXDotProductInt8(PtrA: TNeuralInt8ArrPtr; PtrB: TNeuralFloatArrPtr;
+  NumElements: integer): Single;
+var
+  vRes: array[0..3] of Single;
+  localNumElements, MissedElements: integer;
+begin
+  MissedElements := NumElements and 3;
+  localNumElements := NumElements xor MissedElements;
+  if localNumElements > 0 then
+  begin
+  asm
+  mov ecx, localNumElements
+  mov rax, PtrA
+  mov rdx, PtrB
+  vxorps ymm0, ymm0, ymm0
+
+  push rcx
+  shr ecx,5  // number of large iterations = number of elements / 32
+  jz @SkipLargeAddLoop
+  vxorps ymm1, ymm1, ymm1
+
+@LargeAddLoop:
+  vpmovsxbd ymm2, [rax]
+  vpmovsxbd ymm3, [rax+8]
+  vpmovsxbd ymm4, [rax+16]
+  vpmovsxbd ymm5, [rax+24]
+
+  vcvtdq2ps ymm2, ymm2
+  vcvtdq2ps ymm3, ymm3
+  vcvtdq2ps ymm4, ymm4
+  vcvtdq2ps ymm5, ymm5
+
+  vfmadd231ps ymm0, ymm2, [rdx]
+  vfmadd231ps ymm1, ymm3, [rdx+32]
+  vfmadd231ps ymm0, ymm4, [rdx+64]
+  vfmadd231ps ymm1, ymm5, [rdx+96]
+
+  add rax, 32
+  add rdx, 128
+  dec ecx
+  jnz @LargeAddLoop
+
+  vaddps ymm0, ymm0, ymm1
+  VEXTRACTF128 xmm2, ymm0, 1
+  vzeroupper
+  addps xmm0, xmm2
+
+@SkipLargeAddLoop:
+  pop rcx
+  and ecx,$0000001F
+  jz @EndAdd
+  shr ecx, 2 // number of small iterations = (number of elements modulo 32) / 4
+@SmallAddLoop:
+  vzeroupper
+
+  vpmovsxbd xmm2, [rax]
+  vcvtdq2ps xmm2, xmm2
+  movups xmm3, [rdx]
+  mulps xmm2, xmm3
+  addps xmm0, xmm2
+
+  add rax, 4
+  add rdx, 16
+  dec ecx
+  jnz @SmallAddLoop
+
+@EndAdd:
+  vzeroupper
+  // Sums all elements of xmm0 into the first position
+  HADDPS xmm0,xmm0
+  HADDPS xmm0,xmm0
+
+  movups vRes, xmm0
+  end
+  [
+    'RAX', 'RCX', 'RDX',
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
+  ];
+
+    Result := vRes[0];
+  end else
+  begin
+    Result := 0;
+  end;
+
+  if MissedElements > 0 then
+  begin
+    if MissedElements = 1
+    then Result += PtrA^[localNumElements] * PtrB^[localNumElements]
+    else if MissedElements = 2
+    then Result +=
+           PtrA^[localNumElements] * PtrB^[localNumElements] +
+           PtrA^[localNumElements+1] * PtrB^[localNumElements+1]
+    else Result +=
+           PtrA^[localNumElements] * PtrB^[localNumElements] +
+           PtrA^[localNumElements+1] * PtrB^[localNumElements+1] +
+           PtrA^[localNumElements+2] * PtrB^[localNumElements+2];
+  end;
+end;
+{$ENDIF}
+{$ENDIF}
 
 {$IFDEF AVX2}
 // Constants for the AVX2 8-wide exp() polynomial approximation (AVXExp).
@@ -9948,6 +10077,72 @@ begin
         end;
       end;
 
+    end; // A Tiling.
+  end; // B Tiling.
+end;
+
+class function TNNetVolume.DotProductInt8(PtrA: TNeuralInt8ArrPtr;
+  PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
+var
+  I: integer;
+  vHigh: integer;
+begin
+  {$IFDEF AVX64}
+  {$IFDEF AVX2}
+  if NumElements >= csMinAvxSize then
+  begin
+    Result := AVXDotProductInt8(PtrA, PtrB, NumElements);
+    exit;
+  end;
+  {$ENDIF}
+  {$ENDIF}
+  Result := 0;
+  vHigh := NumElements - 1;
+  for I := 0 to vHigh do
+    Result += PtrA^[I] * PtrB^[I];
+end;
+
+procedure TNNetVolume.DotProductsTiledInt8(NumAs, NumBs, VectorSize: integer;
+  const Codes: array of ShortInt; const Scales: array of TNeuralFloat;
+  VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
+var
+  CntA, CntB: integer;
+  RowBase, AOfs: integer;
+  PtrA: TNeuralInt8ArrPtr;
+  PtrB: TNeuralFloatArrPtr;
+  // Tiling
+  TileACnt, TileBCnt: integer;
+  StartTileA, EndTileA, StartTileB, EndTileB: integer;
+  MaxTileA, MaxTileB: integer;
+begin
+  // Ceil-division tiling with a clamped trailing PARTIAL tile (same contract
+  // as the ranged DotProductsTiled), so tile sizes that do not divide the
+  // range are safe.
+  MaxTileA := (NumAs + TileSizeA - 1) div TileSizeA - 1;
+  MaxTileB := (NumBs + TileSizeB - 1) div TileSizeB - 1;
+  for TileBCnt := 0 to MaxTileB do
+  begin
+    StartTileB := TileBCnt * TileSizeB;
+    EndTileB := Min(StartTileB + TileSizeB - 1, NumBs - 1);
+    for TileACnt := 0 to MaxTileA do
+    begin
+      StartTileA := TileACnt * TileSizeA;
+      EndTileA := Min(StartTileA + TileSizeA - 1, NumAs - 1);
+      for CntB := StartTileB to EndTileB do
+      begin
+        PtrB := VBs.GetRawPtr(CntB*VectorSize);
+        RowBase := CntB * NumAs;
+        AOfs := StartTileA * VectorSize;
+        for CntA := StartTileA to EndTileA do
+        begin
+          PtrA := TNeuralInt8ArrPtr(@Codes[AOfs]);
+          // Deferred per-row scale: fused into the store so the inner kernel
+          // stays a pure raw-code reduction.
+          FData[RowBase + CntA] := DotProductInt8(PtrA, PtrB, VectorSize)
+            * Scales[CntA];
+          Inc(AOfs, VectorSize);
+        end;
+      end;
     end; // A Tiling.
   end; // B Tiling.
 end;
