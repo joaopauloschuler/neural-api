@@ -154,6 +154,12 @@ type
     procedure TestGPT2LogitParityFromShardedTorchBin;
     procedure TestSetTrainableKeepsOutputs;
     procedure TestInt8QuantizeRoundTripAndForward;
+    procedure TestInt8QuantizeAliasClasses;
+    procedure TestInt8QuantizeRectangularConv;
+    procedure TestInt8QuantizeEmbedding;
+    procedure TestInt8QuantizeTokenPositionalEmbedding;
+    procedure TestInt8QuantizeDepthwiseConv;
+    procedure TestInt8QuantizeGroupedConv;
     procedure TestInt8QuantizedGPT2LogitDrift;
     procedure TestInt8QuantizedLlamaLogitDrift;
     procedure TestInt8QuantizedGPTNeoLogitDrift;
@@ -3338,6 +3344,476 @@ begin
   finally
     for n := 0 to High(OrigConvW) do OrigConvW[n].Free;
     for n := 0 to High(OrigFCW) do OrigFCW[n].Free;
+    OutDQ.Free;
+    OutQ.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+// The empty alias subclasses (TNNetDense = class(TNNetFullConnect);
+// TNNetDenseReLU, TNNetLayerFullConnect, TNNetLayerFullConnectReLU) add no
+// code of their own, but TNNet.QuantizeWeightsInt8 gates on EXACT class
+// matches - so a network built with the alias names used to skip quantization
+// silently. This stacks all four aliases, quantizes, and asserts (a) every
+// alias layer really flips to int8 storage with the FP32 weights released,
+// and (b) the quantized forward equals the FP32 forward on the dequantized
+// weights (the same equivalence TestInt8QuantizeRoundTripAndForward gates for
+// the base classes). // Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestInt8QuantizeAliasClasses;
+var
+  NN: TNNet;
+  AliasLayers: array[0..3] of TNNetLayer;
+  Input, OutQ, OutDQ: TNNetVolume;
+  i, n: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN.AddLayer( TNNetInput.Create(30) );
+  AliasLayers[0] := NN.AddLayer( TNNetDense.Create(12) );
+  AliasLayers[1] := NN.AddLayer( TNNetDenseReLU.Create(10) );
+  AliasLayers[2] := NN.AddLayer( TNNetLayerFullConnect.Create(8) );
+  AliasLayers[3] := NN.AddLayer( TNNetLayerFullConnectReLU.Create(6) );
+  Input := TNNetVolume.Create(30, 1, 1);
+  OutQ := TNNetVolume.Create;
+  OutDQ := TNNetVolume.Create;
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.FData[i] := Sin(0.7 * i) * 0.5;
+
+    NN.QuantizeWeightsInt8();
+    for n := 0 to High(AliasLayers) do
+    begin
+      AssertTrue('alias layer ' + AliasLayers[n].ClassName + ' quantized',
+        TNNetLayerConcatedWeights(AliasLayers[n]).WeightsQuantizedInt8);
+      AssertEquals('alias layer ' + AliasLayers[n].ClassName +
+        ' FP32 weights released', 1, AliasLayers[n].Neurons[0].Weights.Size);
+    end;
+
+    NN.Compute(Input);
+    NN.GetOutput(OutQ);
+
+    for n := 0 to High(AliasLayers) do
+      TNNetLayerConcatedWeights(AliasLayers[n]).DequantizeWeightsInt8();
+    NN.Compute(Input);
+    NN.GetOutput(OutDQ);
+    AssertEquals('output size', OutQ.Size, OutDQ.Size);
+    for i := 0 to OutQ.Size - 1 do
+      AssertEquals('alias quantized forward = FP32-on-dequantized-weights ' +
+        IntToStr(i), OutDQ.FData[i], OutQ.FData[i], 1e-6);
+  finally
+    OutDQ.Free;
+    OutQ.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+// Rectangular (asymmetric-kernel) convolutions inherit the square conv's
+// im2col forward unchanged - the int8 codes quantize the same flattened
+// FeatureSizeX*FeatureSizeY*InDepth row - but the exact-class gate in
+// TNNet.QuantizeWeightsInt8 used to exclude them. This stacks a 3x1 and a
+// 1x3 factorized pair (the shapes the class exists for), quantizes, and
+// asserts the layers flip to int8 storage and the quantized forward equals
+// the FP32 forward on the dequantized weights. // Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestInt8QuantizeRectangularConv;
+var
+  NN: TNNet;
+  RectLayers: array[0..1] of TNNetLayer;
+  Input, OutQ, OutDQ: TNNetVolume;
+  i, n: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN.AddLayer( TNNetInput.Create(7, 6, 3) );
+  RectLayers[0] := NN.AddLayer(
+    TNNetConvolutionRectangular.Create({Features=}4, {SizeX=}3, {SizeY=}1,
+      {Padding=}1, {Stride=}1) );
+  RectLayers[1] := NN.AddLayer(
+    TNNetConvolutionRectangularReLU.Create({Features=}3, {SizeX=}1, {SizeY=}3,
+      {Padding=}0, {Stride=}1) );
+  Input := TNNetVolume.Create(7, 6, 3);
+  OutQ := TNNetVolume.Create;
+  OutDQ := TNNetVolume.Create;
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.FData[i] := Sin(0.7 * i) * 0.5;
+
+    NN.QuantizeWeightsInt8();
+    for n := 0 to High(RectLayers) do
+    begin
+      AssertTrue('rect layer ' + RectLayers[n].ClassName + ' quantized',
+        TNNetLayerConcatedWeights(RectLayers[n]).WeightsQuantizedInt8);
+      AssertEquals('rect layer ' + RectLayers[n].ClassName +
+        ' FP32 weights released', 1, RectLayers[n].Neurons[0].Weights.Size);
+    end;
+
+    NN.Compute(Input);
+    NN.GetOutput(OutQ);
+
+    for n := 0 to High(RectLayers) do
+      TNNetLayerConcatedWeights(RectLayers[n]).DequantizeWeightsInt8();
+    NN.Compute(Input);
+    NN.GetOutput(OutDQ);
+    AssertEquals('output size', OutQ.Size, OutDQ.Size);
+    for i := 0 to OutQ.Size - 1 do
+      AssertEquals('rect quantized forward = FP32-on-dequantized-weights ' +
+        IntToStr(i), OutDQ.FData[i], OutQ.FData[i], 1e-6);
+  finally
+    OutDQ.Free;
+    OutQ.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+// Int8 quantization of the TNNetEmbedding vocab table - the largest weight
+// block in LLM inference. The embedding stores its table outside the
+// concated-weights storage, so it carries its own int8 container (same
+// per-row symmetric convention); the forward gather dequantizes the
+// looked-up row straight into the output. Gates: (a) TNNet.QuantizeWeightsInt8
+// reaches the embedding, the FP32 table is released and the container holds
+// codes+scales; (b) the quantized gather equals the FP32 gather on the
+// dequantized table exactly, and the drift vs the ORIGINAL table respects
+// the per-row scale/2 bound; (c) token 0 stays a zero row when EncodeZero
+// is off; (d) Backpropagate raises; (e) ResizeTokenEmbeddings on a
+// quantized embedding dequantizes, resizes and requantizes transparently.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestInt8QuantizeEmbedding;
+const
+  Vocab = 11;
+  EmbSize = 8;
+  SeqLen = 6;
+var
+  NN: TNNet;
+  Emb: TNNetEmbedding;
+  Input, OutF, OutQ, OutDQ: TNNetVolume;
+  OrigW: TNNetVolume;
+  i, t, RowBase: integer;
+  Scale, Diff: double;
+  Raised: boolean;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN.AddLayer( TNNetInput.Create(SeqLen) );
+  Emb := TNNetEmbedding(NN.AddLayer(
+    TNNetEmbedding.Create(Vocab, EmbSize) ));
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutF := TNNetVolume.Create;
+  OutQ := TNNetVolume.Create;
+  OutDQ := TNNetVolume.Create;
+  OrigW := TNNetVolume.Create;
+  try
+    // Token 0 (padding, EncodeZero off), a repeat, and the top of the vocab.
+    Input.FData[0] := 3; Input.FData[1] := 0; Input.FData[2] := 10;
+    Input.FData[3] := 3; Input.FData[4] := 7; Input.FData[5] := 1;
+    OrigW.Copy(Emb.Neurons[0].Weights);
+
+    NN.Compute(Input);
+    NN.GetOutput(OutF);
+
+    NN.QuantizeWeightsInt8();
+    AssertTrue('embedding quantized', Emb.WeightsQuantizedInt8);
+    AssertEquals('embedding FP32 table released', 1,
+      Emb.Neurons[0].Weights.Size);
+    AssertEquals('embedding int8 container bytes',
+      Vocab * EmbSize + Vocab * 4, Emb.Int8QuantizedSizeBytes());
+
+    NN.Compute(Input);
+    NN.GetOutput(OutQ);
+    AssertEquals('output size', OutF.Size, OutQ.Size);
+
+    // (c) padding token 0 must stay a zero row on the quantized gather.
+    for i := 0 to EmbSize - 1 do
+      AssertEquals('padding row stays zero ' + IntToStr(i), 0,
+        OutQ.FData[1 * EmbSize + i], 0);
+
+    // (b1) drift vs the original FP32 gather obeys the per-row scale/2
+    // bound (the row's quantization error is the only difference).
+    for t := 0 to SeqLen - 1 do
+    begin
+      RowBase := Round(Input.FData[t]) * EmbSize;
+      Scale := 0;
+      for i := 0 to EmbSize - 1 do
+        if Abs(OrigW.FData[RowBase + i]) > Scale then
+          Scale := Abs(OrigW.FData[RowBase + i]);
+      Scale := Scale / 127;
+      for i := 0 to EmbSize - 1 do
+      begin
+        Diff := Abs(OutQ.FData[t * EmbSize + i] - OutF.FData[t * EmbSize + i]);
+        AssertTrue('embedding drift bound token ' + IntToStr(t) +
+          ' dim ' + IntToStr(i) + ': ' + FloatToStr(Diff),
+          Diff <= Scale * 0.5 + 1e-9);
+      end;
+    end;
+
+    // (d) inference-only contract.
+    Raised := false;
+    try
+      Emb.Backpropagate();
+    except
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue('Backpropagate must raise on int8-quantized embedding', Raised);
+
+    // (b2) dequantize and recompute: identical gather.
+    Emb.DequantizeWeightsInt8();
+    AssertTrue('embedding un-quantized', not Emb.WeightsQuantizedInt8);
+    NN.Compute(Input);
+    NN.GetOutput(OutDQ);
+    for i := 0 to OutQ.Size - 1 do
+      AssertEquals('quantized gather = FP32-on-dequantized-table ' +
+        IntToStr(i), OutDQ.FData[i], OutQ.FData[i], 1e-6);
+
+    // (e) resize while quantized: dequantize -> resize -> requantize.
+    Emb.QuantizeWeightsInt8();
+    AssertTrue('embedding re-quantized', Emb.WeightsQuantizedInt8);
+    AssertTrue('resize returns the embedding',
+      NN.ResizeTokenEmbeddings(Vocab + 4) = Emb);
+    AssertEquals('vocab resized', Vocab + 4, Emb.VocabSize);
+    AssertTrue('still quantized after resize', Emb.WeightsQuantizedInt8);
+    AssertEquals('resized int8 container bytes',
+      (Vocab + 4) * EmbSize + (Vocab + 4) * 4, Emb.Int8QuantizedSizeBytes());
+    NN.Compute(Input);
+    NN.GetOutput(OutDQ);
+    for i := 0 to OutQ.Size - 1 do
+      AssertEquals('gather unchanged for existing tokens after resize ' +
+        IntToStr(i), OutQ.FData[i], OutDQ.FData[i], 1e-6);
+  finally
+    OrigW.Free;
+    OutDQ.Free;
+    OutQ.Free;
+    OutF.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+// Int8 quantization of TNNetTokenAndPositionalEmbedding: only the inherited
+// token table quantizes (the positional table is COMPUTED sinusoidal data,
+// rebuilt in SetPrevLayer - not weights), and the int8 gather adds the FP32
+// positional row on top of the dequantized token row. Gates: quantized
+// forward equals FP32-on-dequantized forward exactly; the drift vs the
+// original FP32 forward obeys the token row's scale/2 bound (the positional
+// add is common to both paths); a zero-padded token gets NEITHER table.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestInt8QuantizeTokenPositionalEmbedding;
+const
+  Vocab = 9;
+  EmbSize = 8;
+  SeqLen = 5;
+var
+  NN: TNNet;
+  Emb: TNNetTokenAndPositionalEmbedding;
+  Input, OutF, OutQ, OutDQ: TNNetVolume;
+  OrigW: TNNetVolume;
+  i, t, RowBase: integer;
+  Scale, Diff: double;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN.AddLayer( TNNetInput.Create(SeqLen) );
+  Emb := TNNetTokenAndPositionalEmbedding(NN.AddLayer(
+    TNNetTokenAndPositionalEmbedding.Create(Vocab, EmbSize) ));
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutF := TNNetVolume.Create;
+  OutQ := TNNetVolume.Create;
+  OutDQ := TNNetVolume.Create;
+  OrigW := TNNetVolume.Create;
+  try
+    Input.FData[0] := 4; Input.FData[1] := 0; Input.FData[2] := 8;
+    Input.FData[3] := 4; Input.FData[4] := 1;
+    OrigW.Copy(Emb.Neurons[0].Weights);
+
+    NN.Compute(Input);
+    NN.GetOutput(OutF);
+
+    NN.QuantizeWeightsInt8();
+    AssertTrue('token+pos embedding quantized', Emb.WeightsQuantizedInt8);
+    AssertEquals('token table released', 1, Emb.Neurons[0].Weights.Size);
+
+    NN.Compute(Input);
+    NN.GetOutput(OutQ);
+    AssertEquals('output size', OutF.Size, OutQ.Size);
+
+    // Zero-padded token 0 gets neither table (matches the FP32 path).
+    for i := 0 to EmbSize - 1 do
+      AssertEquals('padding row stays zero ' + IntToStr(i), 0,
+        OutQ.FData[1 * EmbSize + i], 0);
+
+    // Drift bound: positional add is identical in both paths, so the
+    // difference is exactly the token row's quantization error.
+    for t := 0 to SeqLen - 1 do
+    begin
+      RowBase := Round(Input.FData[t]) * EmbSize;
+      Scale := 0;
+      for i := 0 to EmbSize - 1 do
+        if Abs(OrigW.FData[RowBase + i]) > Scale then
+          Scale := Abs(OrigW.FData[RowBase + i]);
+      Scale := Scale / 127;
+      for i := 0 to EmbSize - 1 do
+      begin
+        Diff := Abs(OutQ.FData[t * EmbSize + i] - OutF.FData[t * EmbSize + i]);
+        AssertTrue('token+pos drift bound token ' + IntToStr(t) +
+          ' dim ' + IntToStr(i) + ': ' + FloatToStr(Diff),
+          Diff <= Scale * 0.5 + 1e-9);
+      end;
+    end;
+
+    // Exact parity vs the FP32 forward on the dequantized table.
+    Emb.DequantizeWeightsInt8();
+    NN.Compute(Input);
+    NN.GetOutput(OutDQ);
+    for i := 0 to OutQ.Size - 1 do
+      AssertEquals('quantized forward = FP32-on-dequantized-table ' +
+        IntToStr(i), OutDQ.FData[i], OutQ.FData[i], 1e-6);
+  finally
+    OrigW.Free;
+    OutDQ.Free;
+    OutQ.Free;
+    OutF.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+// Int8 quantization of the depthwise convolution family. Depthwise layers
+// inherit the TNNetLayerConcatedWeights int8 storage but have their own
+// forward (per-channel spatial taps, elementwise MulAdd along depth instead
+// of a dot-product reduction), so they get a fused twin: ComputeInt8CPU
+// streams the codes per tap (MulAddInt8, 1 byte/element) and applies the
+// per-neuron scale ONCE per output element after all taps accumulated.
+// Stacks multiplier>1 + padding + stride + Linear/ReLU/Tanh activations and
+// gates quantized forward == FP32-on-dequantized forward, plus the
+// inference-only Backpropagate raise. // Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestInt8QuantizeDepthwiseConv;
+var
+  NN: TNNet;
+  DwLayers: array[0..2] of TNNetLayer;
+  Input, OutQ, OutDQ: TNNetVolume;
+  i, n: integer;
+  Raised: boolean;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN.AddLayer( TNNetInput.Create(7, 6, 3) );
+  DwLayers[0] := NN.AddLayer(
+    TNNetDepthwiseConvLinear.Create({Mult=}2, {Feature=}3, {Pad=}1, {Stride=}1) );
+  DwLayers[1] := NN.AddLayer(
+    TNNetDepthwiseConvReLU.Create({Mult=}1, {Feature=}3, {Pad=}0, {Stride=}2) );
+  DwLayers[2] := NN.AddLayer(
+    TNNetDepthwiseConv.Create({Mult=}1, {Feature=}1, {Pad=}0, {Stride=}1) );
+  Input := TNNetVolume.Create(7, 6, 3);
+  OutQ := TNNetVolume.Create;
+  OutDQ := TNNetVolume.Create;
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.FData[i] := Sin(0.7 * i) * 0.5;
+
+    NN.QuantizeWeightsInt8();
+    for n := 0 to High(DwLayers) do
+    begin
+      AssertTrue('depthwise layer ' + DwLayers[n].ClassName + ' quantized',
+        TNNetLayerConcatedWeights(DwLayers[n]).WeightsQuantizedInt8);
+      AssertEquals('depthwise layer ' + DwLayers[n].ClassName +
+        ' FP32 weights released', 1, DwLayers[n].Neurons[0].Weights.Size);
+    end;
+
+    NN.Compute(Input);
+    NN.GetOutput(OutQ);
+
+    Raised := false;
+    try
+      DwLayers[0].Backpropagate();
+    except
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue('Backpropagate must raise on int8-quantized depthwise', Raised);
+
+    for n := 0 to High(DwLayers) do
+      TNNetLayerConcatedWeights(DwLayers[n]).DequantizeWeightsInt8();
+    NN.Compute(Input);
+    NN.GetOutput(OutDQ);
+    AssertEquals('output size', OutQ.Size, OutDQ.Size);
+    for i := 0 to OutQ.Size - 1 do
+      AssertEquals('depthwise quantized forward = FP32-on-dequantized ' +
+        IntToStr(i), OutDQ.FData[i], OutQ.FData[i], 1e-6);
+  finally
+    OutDQ.Free;
+    OutQ.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+// Int8 quantization of the grouped convolution family. Grouped convs
+// inherit the concated-weights int8 storage; their forward GEMM
+// (GroupedDotProductsTiled over the grouped im2col input) gets the int8
+// twin GroupedDotProductsTiledInt8 - codes streamed at 1 byte/element with
+// the per-row scale applied once per dot product, same grouped B
+// addressing. Stacks spatial + pointwise grouped layers (groups=2) with
+// Linear/ReLU/HardSwish activations, padding and stride, and gates
+// quantized forward == FP32-on-dequantized forward plus the inference-only
+// Backpropagate raise. // Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestInt8QuantizeGroupedConv;
+var
+  NN: TNNet;
+  GLayers: array[0..3] of TNNetLayer;
+  Input, OutQ, OutDQ: TNNetVolume;
+  i, n: integer;
+  Raised: boolean;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN.AddLayer( TNNetInput.Create(6, 6, 4) );
+  GLayers[0] := NN.AddLayer(
+    TNNetGroupedConvolutionLinear.Create({Features=}6, {Feature=}3, {Pad=}1,
+      {Stride=}1, {Groups=}2) );
+  GLayers[1] := NN.AddLayer(
+    TNNetGroupedPointwiseConvReLU.Create({Features=}8, {Groups=}2) );
+  GLayers[2] := NN.AddLayer(
+    TNNetGroupedConvolutionReLU.Create({Features=}4, {Feature=}3, {Pad=}0,
+      {Stride=}2, {Groups=}2) );
+  GLayers[3] := NN.AddLayer(
+    TNNetGroupedPointwiseConvHardSwish.Create({Features=}4, {Groups=}2) );
+  Input := TNNetVolume.Create(6, 6, 4);
+  OutQ := TNNetVolume.Create;
+  OutDQ := TNNetVolume.Create;
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.FData[i] := Sin(0.7 * i) * 0.5;
+    NN.UpdateWeights();
+
+    NN.QuantizeWeightsInt8();
+    for n := 0 to High(GLayers) do
+    begin
+      AssertTrue('grouped layer ' + GLayers[n].ClassName + ' quantized',
+        TNNetLayerConcatedWeights(GLayers[n]).WeightsQuantizedInt8);
+      AssertEquals('grouped layer ' + GLayers[n].ClassName +
+        ' FP32 weights released', 1, GLayers[n].Neurons[0].Weights.Size);
+    end;
+
+    NN.Compute(Input);
+    NN.GetOutput(OutQ);
+
+    Raised := false;
+    try
+      GLayers[0].Backpropagate();
+    except
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue('Backpropagate must raise on int8-quantized grouped conv',
+      Raised);
+
+    for n := 0 to High(GLayers) do
+      TNNetLayerConcatedWeights(GLayers[n]).DequantizeWeightsInt8();
+    NN.Compute(Input);
+    NN.GetOutput(OutDQ);
+    AssertEquals('output size', OutQ.Size, OutDQ.Size);
+    for i := 0 to OutQ.Size - 1 do
+      AssertEquals('grouped quantized forward = FP32-on-dequantized ' +
+        IntToStr(i), OutDQ.FData[i], OutQ.FData[i], 1e-6);
+  finally
     OutDQ.Free;
     OutQ.Free;
     Input.Free;

@@ -510,12 +510,34 @@ type
       // registers); every other build runs the pure Pascal loop.
       // Coded by Claude (AI).
       class function DotProductInt8(PtrA: TNeuralInt8ArrPtr; PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
+      // Fused int8-weight x float32-input elementwise multiply-accumulate:
+      // PtrA[i] += PtrCodes[i] * PtrB[i], with NO scale applied - the caller
+      // multiplies the accumulated result by the per-row quantization scale
+      // once (every tap of a row shares it), so the codes are never
+      // dequantized to memory. Channelwise sibling of DotProductInt8 for the
+      // depthwise convolution (product per element instead of a reduction).
+      // Coded by Claude (AI).
+      class procedure MulAddInt8(PtrA, PtrB: TNeuralFloatArrPtr; PtrCodes: TNeuralInt8ArrPtr; pSize: integer); static;
+      // Fused int8 axpy: PtrA[i] += W * PtrCodes[i], the int8-code twin of
+      // MulAdd(PtrA, PtrB, W, N). The caller folds every per-row scalar
+      // (attention weight, softmax normalizer, the row's quantization scale)
+      // into W, so the codes are never dequantized to memory. Built for the
+      // int8 KV-cache decode value sum. Coded by Claude (AI).
+      class procedure MulAddInt8Scalar(PtrA: TNeuralFloatArrPtr; PtrCodes: TNeuralInt8ArrPtr; W: TNeuralFloat; pSize: integer); static;
       // Int8-weight twin of DotProductsTiled: A rows are int8 codes laid out
       // exactly like the concatenated weights (row r at Codes[r*VectorSize]),
       // Scales[r] is row r's quantization scale (applied once per dot product,
       // fused into the output store). Same tiling and same output layout
       // (FData[CntB*NumAs + CntA]) as the FP32 version. Coded by Claude (AI).
-      procedure DotProductsTiledInt8(NumAs, NumBs, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
+      procedure DotProductsTiledInt8(NumAs, NumBs, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer); overload;
+      // Ranged twin (same contract as the ranged DotProductsTiled): computes
+      // only B columns [BStart..BFinish] and A rows [AStart..AFinish], with
+      // ceil-division tiling anchored at the range start and a clamped trailing
+      // partial tile. NumAs stays the output row stride, so a sliced call
+      // writes exactly its own output elements - this is what the intra-layer
+      // chunk scheduler calls (position-axis chunks range B, neuron-axis
+      // chunks range A). AFinish < 0 means all rows. Coded by Claude (AI).
+      procedure DotProductsTiledInt8(NumAs, BStart, BFinish, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
       procedure PointwiseNorm(pNorms: TNNetVolume = nil);
       procedure PointwiseMul(pNorms: TNNetVolume);
       // VectorExp writes dst[0..N-1] := exp(src[0..N-1]). On an AVX2 build it
@@ -624,6 +646,13 @@ type
     public
       destructor Destroy(); override;
       procedure GroupedDotProductsTiled(Groups, NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
+      // Int8-weight twin of GroupedDotProductsTiled: A rows are int8 codes
+      // laid out exactly like the concatenated weights (row r at
+      // Codes[r*VectorSize]), Scales[r] applied once per dot product. Same
+      // grouped B addressing (input vectors hold VectorSize*Groups, neuron r
+      // reads its group's slice) and same output layout
+      // (FData[CntB*NumAs + CntA]) as the FP32 version. Coded by Claude (AI).
+      procedure GroupedDotProductsTiledInt8(Groups, NumAs, NumBs, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
   end;
 
   { TNNetSamplerBase }
@@ -1422,6 +1451,180 @@ begin
            PtrA^[localNumElements+1] * PtrB^[localNumElements+1] +
            PtrA^[localNumElements+2] * PtrB^[localNumElements+2];
   end;
+end;
+
+// Fused int8 axpy PtrA[i] += W * PtrCodes[i]: AVXDotProductInt8's byte->float
+// front end (vpmovsxbd + vcvtdq2ps, the codes stream at 1 byte/element and the
+// dequantized value never exists in memory) grafted onto the scalar
+// AVXMulAdd's broadcast-FMA + store-back back end. Note the asymmetric
+// strides: 32 elements advance the code pointer 32 BYTES but the float
+// pointer 128. Scalar remainder (N mod 4) in Pascal. Coded by Claude (AI).
+procedure AVXMulAddInt8Scalar(PtrA: TNeuralFloatArrPtr;
+  PtrCodes: TNeuralInt8ArrPtr; W: TNeuralFloat; NumElements: integer);
+var
+  WPtr: pointer;
+  localNumElements, MissedElements: integer;
+  i: integer;
+begin
+  MissedElements := NumElements and 3;
+  localNumElements := NumElements xor MissedElements;
+  if localNumElements > 0 then
+  begin
+    WPtr := Addr(W);
+  asm
+  mov ecx, localNumElements
+  mov rdx, WPtr
+  VBROADCASTSS ymm5, [rdx]
+  mov rax, PtrCodes
+  mov rdx, PtrA
+
+  push rcx
+  shr ecx,5  // number of large iterations = number of elements / 32
+  jz @SkipLargeAddLoop
+
+@LargeAddLoop:
+  vpmovsxbd ymm0, [rax]
+  vpmovsxbd ymm1, [rax+8]
+  vpmovsxbd ymm2, [rax+16]
+  vpmovsxbd ymm3, [rax+24]
+
+  vcvtdq2ps ymm0, ymm0
+  vcvtdq2ps ymm1, ymm1
+  vcvtdq2ps ymm2, ymm2
+  vcvtdq2ps ymm3, ymm3
+
+  vmovups ymm6, [rdx]
+  vmovups ymm7, [rdx+32]
+  vfmadd231ps ymm6, ymm0, ymm5
+  vfmadd231ps ymm7, ymm1, ymm5
+  vmovups [rdx],    ymm6
+  vmovups [rdx+32], ymm7
+
+  vmovups ymm6, [rdx+64]
+  vmovups ymm7, [rdx+96]
+  vfmadd231ps ymm6, ymm2, ymm5
+  vfmadd231ps ymm7, ymm3, ymm5
+  vmovups [rdx+64], ymm6
+  vmovups [rdx+96], ymm7
+
+  add rax, 32
+  add rdx, 128
+  dec ecx
+  jnz @LargeAddLoop
+
+@SkipLargeAddLoop:
+  pop rcx
+  and ecx,$0000001F
+  jz @EndAdd
+  shr ecx, 2 // number of small iterations = (number of elements modulo 32) / 4
+@SmallAddLoop:
+  vpmovsxbd xmm0, [rax]
+  vcvtdq2ps xmm0, xmm0
+  vmovups xmm6, [rdx]
+  vfmadd231ps xmm6, xmm0, xmm5
+  vmovups [rdx], xmm6
+
+  add rax, 4
+  add rdx, 16
+  dec ecx
+  jnz @SmallAddLoop
+
+@EndAdd:
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX',
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm5', 'ymm6', 'ymm7'
+  ];
+  end;
+  for i := localNumElements to NumElements - 1 do
+    PtrA^[i] := PtrA^[i] + W * PtrCodes^[i];
+end;
+
+// Fused int8 elementwise multiply-accumulate PtrA[i] += PtrCodes[i] * PtrB[i]
+// (the depthwise-conv tap kernel): same byte->float front end as above, with
+// the float input as the FMA memory operand (three streams, RBX for the codes
+// like the 3-pointer AVXMulAdd macro). Scalar remainder (N mod 4) in Pascal.
+// Coded by Claude (AI).
+procedure AVXMulAddInt8(PtrA, PtrB: TNeuralFloatArrPtr;
+  PtrCodes: TNeuralInt8ArrPtr; NumElements: integer);
+var
+  localNumElements, MissedElements: integer;
+  i: integer;
+begin
+  MissedElements := NumElements and 3;
+  localNumElements := NumElements xor MissedElements;
+  if localNumElements > 0 then
+  begin
+  asm
+  mov ecx, localNumElements
+  mov rdx, PtrA
+  mov rax, PtrB
+  mov rbx, PtrCodes
+
+  push rcx
+  shr ecx,5  // number of large iterations = number of elements / 32
+  jz @SkipLargeAddLoop
+
+@LargeAddLoop:
+  vpmovsxbd ymm0, [rbx]
+  vpmovsxbd ymm1, [rbx+8]
+  vpmovsxbd ymm2, [rbx+16]
+  vpmovsxbd ymm3, [rbx+24]
+
+  vcvtdq2ps ymm0, ymm0
+  vcvtdq2ps ymm1, ymm1
+  vcvtdq2ps ymm2, ymm2
+  vcvtdq2ps ymm3, ymm3
+
+  vmovups ymm6, [rdx]
+  vmovups ymm7, [rdx+32]
+  vfmadd231ps ymm6, ymm0, [rax]
+  vfmadd231ps ymm7, ymm1, [rax+32]
+  vmovups [rdx],    ymm6
+  vmovups [rdx+32], ymm7
+
+  vmovups ymm6, [rdx+64]
+  vmovups ymm7, [rdx+96]
+  vfmadd231ps ymm6, ymm2, [rax+64]
+  vfmadd231ps ymm7, ymm3, [rax+96]
+  vmovups [rdx+64], ymm6
+  vmovups [rdx+96], ymm7
+
+  add rbx, 32
+  add rax, 128
+  add rdx, 128
+  dec ecx
+  jnz @LargeAddLoop
+
+@SkipLargeAddLoop:
+  pop rcx
+  and ecx,$0000001F
+  jz @EndAdd
+  shr ecx, 2 // number of small iterations = (number of elements modulo 32) / 4
+@SmallAddLoop:
+  vpmovsxbd xmm0, [rbx]
+  vcvtdq2ps xmm0, xmm0
+  vmovups xmm6, [rdx]
+  vfmadd231ps xmm6, xmm0, [rax]
+  vmovups [rdx], xmm6
+
+  add rbx, 4
+  add rax, 16
+  add rdx, 16
+  dec ecx
+  jnz @SmallAddLoop
+
+@EndAdd:
+  vzeroupper
+  end
+  [
+    'RAX', 'RBX', 'RCX', 'RDX',
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm6', 'ymm7'
+  ];
+  end;
+  for i := localNumElements to NumElements - 1 do
+    PtrA^[i] := PtrA^[i] + PtrCodes^[i] * PtrB^[i];
 end;
 {$ENDIF}
 {$ENDIF}
@@ -10102,9 +10305,59 @@ begin
     Result += PtrA^[I] * PtrB^[I];
 end;
 
+class procedure TNNetVolume.MulAddInt8(PtrA, PtrB: TNeuralFloatArrPtr;
+  PtrCodes: TNeuralInt8ArrPtr; pSize: integer);
+var
+  I: integer;
+  vHigh: integer;
+begin
+  {$IFDEF AVX64}
+  {$IFDEF AVX2}
+  if pSize >= csMinAvxSize then
+  begin
+    AVXMulAddInt8(PtrA, PtrB, PtrCodes, pSize);
+    exit;
+  end;
+  {$ENDIF}
+  {$ENDIF}
+  vHigh := pSize - 1;
+  for I := 0 to vHigh do
+    PtrA^[I] := PtrA^[I] + PtrCodes^[I] * PtrB^[I];
+end;
+
+class procedure TNNetVolume.MulAddInt8Scalar(PtrA: TNeuralFloatArrPtr;
+  PtrCodes: TNeuralInt8ArrPtr; W: TNeuralFloat; pSize: integer);
+var
+  I: integer;
+  vHigh: integer;
+begin
+  {$IFDEF AVX64}
+  {$IFDEF AVX2}
+  if pSize >= csMinAvxSize then
+  begin
+    AVXMulAddInt8Scalar(PtrA, PtrCodes, W, pSize);
+    exit;
+  end;
+  {$ENDIF}
+  {$ENDIF}
+  vHigh := pSize - 1;
+  for I := 0 to vHigh do
+    PtrA^[I] := PtrA^[I] + W * PtrCodes^[I];
+end;
+
 procedure TNNetVolume.DotProductsTiledInt8(NumAs, NumBs, VectorSize: integer;
   const Codes: array of ShortInt; const Scales: array of TNeuralFloat;
   VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
+begin
+  DotProductsTiledInt8(NumAs, 0, NumBs - 1, VectorSize, Codes, Scales, VBs,
+    TileSizeA, TileSizeB);
+end;
+
+procedure TNNetVolume.DotProductsTiledInt8(NumAs, BStart, BFinish,
+  VectorSize: integer;
+  const Codes: array of ShortInt; const Scales: array of TNeuralFloat;
+  VBs: TNNetVolume; TileSizeA, TileSizeB: integer;
+  AStart: integer = 0; AFinish: integer = -1);
 var
   CntA, CntB: integer;
   RowBase, AOfs: integer;
@@ -10115,19 +10368,21 @@ var
   StartTileA, EndTileA, StartTileB, EndTileB: integer;
   MaxTileA, MaxTileB: integer;
 begin
-  // Ceil-division tiling with a clamped trailing PARTIAL tile (same contract
-  // as the ranged DotProductsTiled), so tile sizes that do not divide the
-  // range are safe.
-  MaxTileA := (NumAs + TileSizeA - 1) div TileSizeA - 1;
-  MaxTileB := (NumBs + TileSizeB - 1) div TileSizeB - 1;
+  // Ceil-division tiling anchored at the range start with a clamped trailing
+  // PARTIAL tile (same contract as the ranged DotProductsTiled), so tile sizes
+  // that do not divide the range are safe. NumAs stays the output row stride,
+  // so a sliced call writes exactly its own output elements.
+  if AFinish < 0 then AFinish := NumAs - 1;
+  MaxTileA := ((AFinish - AStart + 1) + TileSizeA - 1) div TileSizeA - 1;
+  MaxTileB := ((BFinish - BStart + 1) + TileSizeB - 1) div TileSizeB - 1;
   for TileBCnt := 0 to MaxTileB do
   begin
-    StartTileB := TileBCnt * TileSizeB;
-    EndTileB := Min(StartTileB + TileSizeB - 1, NumBs - 1);
+    StartTileB := BStart + TileBCnt * TileSizeB;
+    EndTileB := Min(StartTileB + TileSizeB - 1, BFinish);
     for TileACnt := 0 to MaxTileA do
     begin
-      StartTileA := TileACnt * TileSizeA;
-      EndTileA := Min(StartTileA + TileSizeA - 1, NumAs - 1);
+      StartTileA := AStart + TileACnt * TileSizeA;
+      EndTileA := Min(StartTileA + TileSizeA - 1, AFinish);
       for CntB := StartTileB to EndTileB do
       begin
         PtrB := VBs.GetRawPtr(CntB*VectorSize);
@@ -10145,6 +10400,52 @@ begin
       end;
     end; // A Tiling.
   end; // B Tiling.
+end;
+
+procedure TNNetGroupedVolume.GroupedDotProductsTiledInt8(Groups, NumAs, NumBs,
+  VectorSize: integer; const Codes: array of ShortInt;
+  const Scales: array of TNeuralFloat; VBs: TNNetVolume;
+  TileSizeA, TileSizeB: integer);
+var
+  CntA, CntB: integer;
+  GroupASize, VectorBSize, GroupIdVectorSize: integer;
+  RowBase: integer;
+  PtrA: TNeuralInt8ArrPtr;
+  PtrB: TNeuralFloatArrPtr;
+  // Tiling
+  TileACnt, TileBCnt: integer;
+  StartTileA, EndTileA, StartTileB, EndTileB: integer;
+  MaxTileA, MaxTileB: integer;
+begin
+  GroupASize := NumAs div Groups;
+  VectorBSize := VectorSize * Groups;
+  // Ceil-division tiling with a clamped trailing PARTIAL tile (same contract
+  // as DotProductsTiledInt8), so tile sizes that do not divide the range are
+  // safe.
+  MaxTileA := (NumAs + TileSizeA - 1) div TileSizeA - 1;
+  MaxTileB := (NumBs + TileSizeB - 1) div TileSizeB - 1;
+  for TileBCnt := 0 to MaxTileB do
+  begin
+    StartTileB := TileBCnt * TileSizeB;
+    EndTileB := Min(StartTileB + TileSizeB - 1, NumBs - 1);
+    for TileACnt := 0 to MaxTileA do
+    begin
+      StartTileA := TileACnt * TileSizeA;
+      EndTileA := Min(StartTileA + TileSizeA - 1, NumAs - 1);
+      for CntB := StartTileB to EndTileB do
+      begin
+        RowBase := CntB * NumAs;
+        for CntA := StartTileA to EndTileA do
+        begin
+          GroupIdVectorSize := (CntA div GroupASize) * VectorSize;
+          PtrA := Addr(Codes[CntA * VectorSize]);
+          PtrB := VBs.GetRawPtr(CntB * VectorBSize + GroupIdVectorSize);
+          FData[RowBase + CntA] := DotProductInt8(PtrA, PtrB, VectorSize)
+            * Scales[CntA];
+        end;
+      end;
+    end;
+  end;
 end;
 
 /// In this function, "As" should be weights, "VectorSize" should be the number
