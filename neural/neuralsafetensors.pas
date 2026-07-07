@@ -1024,6 +1024,7 @@ end;
 function TNNetSafeTensorsWriter.BuildHeaderJson: string;
 var
   i, j, MetaCount, MetaMax, Hi: integer;
+  ShapeHi: integer;
   Offset: Int64;
   Entry: string;
 begin
@@ -1058,7 +1059,8 @@ begin
       else Entry := '"' + JsonEscapeString(FTensors[i].Name) +
         '":{"dtype":"F32","shape":[';
     end;
-    for j := 0 to High(FTensors[i].Shape) do
+    ShapeHi := High(FTensors[i].Shape);
+    for j := 0 to ShapeHi do
     begin
       if j > 0 then Entry := Entry + ',';
       Entry := Entry + IntToStr(FTensors[i].Shape[j]);
@@ -1201,6 +1203,7 @@ var
   Tmp: TNNetVolume;
   L: TNNetLayer;
   LayerIdx, j, i, Cursor, NeuronCount, MaxNeurons, LayerMax: integer;
+  WSizeM1: integer;
   Base, TensorName: string;
 
   procedure LoadExpected(const pName: string; ExpectedElements: integer);
@@ -1238,11 +1241,14 @@ begin
           NeuronCount * L.FArrNeurons[0].Weights.Size);
         Cursor := 0;
         for j := 0 to MaxNeurons do
-          for i := 0 to L.FArrNeurons[j].Weights.Size - 1 do
+        begin
+          WSizeM1 := L.FArrNeurons[j].Weights.Size - 1;
+          for i := 0 to WSizeM1 do
           begin
             L.FArrNeurons[j].Weights.FData[i] := Tmp.FData[Cursor];
             Inc(Cursor);
           end;
+        end;
       end
       else
       begin
@@ -1250,7 +1256,8 @@ begin
         begin
           TensorName := Base + '.neuron_' + IntToStr(j) + '.weights';
           LoadExpected(TensorName, L.FArrNeurons[j].Weights.Size);
-          for i := 0 to L.FArrNeurons[j].Weights.Size - 1 do
+          WSizeM1 := L.FArrNeurons[j].Weights.Size - 1;
+          for i := 0 to WSizeM1 do
             L.FArrNeurons[j].Weights.FData[i] := Tmp.FData[i];
         end;
       end;

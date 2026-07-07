@@ -1184,7 +1184,7 @@ begin
     // This portion of code was coded by https://chatgpt.com/g/g-bqMxEDpIg-neural-api-free-pascal-developer
     SetLength(AIntegerArray, SampleCutPosition);
     if SampleCutPosition > 0 then
-    Move(Dataset[SampleId][0], AIntegerArray[0], SampleCutPosition * SizeOf(Integer));
+    Move(Dataset[SampleId][0], AIntegerArray[0], SampleCutPosition * csIntegerSize);
     {$ENDIF}
     pInput.Fill(0);
     pInput.CopyReversedNoChecksIntArr( AIntegerArray );
@@ -1308,6 +1308,7 @@ var
   StreamLen, DocIdx, I, Pos, WinCount, W: integer;
   Stream: TNeuralIntegerArray;
   DocM1, WinM1, ContextM1: integer;
+  DocLenM1: integer;
 begin
   StreamLen := 0;
   DocM1 := FDocCount - 1;
@@ -1317,7 +1318,8 @@ begin
   Pos := 0;
   for DocIdx := 0 to DocM1 do
   begin
-    for I := 0 to Length(FDocs[DocIdx]) - 1 do
+    DocLenM1 := Length(FDocs[DocIdx]) - 1;
+    for I := 0 to DocLenM1 do
     begin
       Stream[Pos] := FDocs[DocIdx][I];
       Inc(Pos);
@@ -1350,6 +1352,7 @@ procedure TNNetSequencePacker.PackGreedyBins(OneDocPerWindow: boolean);
 var
   DocIdx, DocLen, I, Pos, W: integer;
   DocM1: integer;
+  DocLenM1: integer;
 
   procedure PadAndCloseCurrent();
   var
@@ -1383,7 +1386,8 @@ begin
       if W >= 0 then PadAndCloseCurrent();
       OpenNewWindow();
     end;
-    for I := 0 to DocLen - 1 do
+    DocLenM1 := DocLen - 1;
+    for I := 0 to DocLenM1 do
     begin
       FWindows[W][Pos] := FDocs[DocIdx][I];
       Inc(Pos);
@@ -2273,6 +2277,7 @@ function TNNetLengthGroupedBatcher.TotalPadTokens(): int64;
 var
   B, W, SeqLen: integer;
   BatchM1: integer;
+  BatchSizeM1: integer;
 begin
   RequireBuilt();
   Result := 0;
@@ -2280,7 +2285,8 @@ begin
   for B := 0 to BatchM1 do
   begin
     SeqLen := BatchSeqLen(B);
-    for W := 0 to BatchSize(B) - 1 do
+    BatchSizeM1 := BatchSize(B) - 1;
+    for W := 0 to BatchSizeM1 do
       Result := Result + (SeqLen - SampleLenOf(B, W));
   end;
 end;
@@ -2927,6 +2933,7 @@ procedure CreateCifar10Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
   ValidationSampleSize: integer = 2000);
 var
   I, LastElement: integer;
+  DownLimit: integer;
 begin
   ImgTrainingVolumes := TNNetVolumeList.Create();
   ImgValidationVolumes := TNNetVolumeList.Create();
@@ -2959,7 +2966,8 @@ begin
   begin
     ImgValidationVolumes.FreeObjects := False;
     LastElement := ImgValidationVolumes.Count - 1;
-    for I := LastElement downto (LastElement-(10000-ValidationSampleSize)+1) do
+    DownLimit := LastElement-(10000-ValidationSampleSize)+1;
+    for I := LastElement downto DownLimit do
     begin
       ImgTrainingVolumes.Add(ImgValidationVolumes[I]);
       ImgValidationVolumes.Delete(I);
@@ -2973,6 +2981,7 @@ procedure CreateCifar100Volumes(out ImgTrainingVolumes, ImgValidationVolumes,
   Verbose:boolean = true; ValidationSampleSize: integer = 2000);
 var
   I, LastElement: integer;
+  DownLimit: integer;
 begin
   ImgTrainingVolumes := TNNetVolumeList.Create();
   ImgValidationVolumes := TNNetVolumeList.Create();
@@ -2984,7 +2993,8 @@ begin
   begin
     ImgTrainingVolumes.FreeObjects := false;
     if ValidationSampleSize > 25000 then ValidationSampleSize := 25000;
-    for I := LastElement downto (LastElement-ValidationSampleSize+1) do
+    DownLimit := LastElement-ValidationSampleSize+1;
+    for I := LastElement downto DownLimit do
     begin
       ImgValidationVolumes.Add(ImgTrainingVolumes[I]);
       ImgTrainingVolumes.Delete(I);

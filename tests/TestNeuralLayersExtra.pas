@@ -6511,7 +6511,7 @@ var
   i, RowCnt, BytesPerElem: integer;
   ExpectedFCParamBytes, ExpectedFCActBytes: integer;
 begin
-  BytesPerElem := SizeOf(TNeuralFloat);
+  BytesPerElem := csNeuralFloatSize;
   NN := TNNet.Create;
   NN.AddLayer(TNNetInput.Create(4));
   // FullConnectReLU(5) over 4 inputs: 5*4 weights + 5 biases = 25 params.

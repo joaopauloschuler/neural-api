@@ -599,12 +599,14 @@ end;
 function TActionStateList.RemoveCicles: boolean;
 var
   I, J: integer;
+  IM1: integer;
 begin
   RemoveCicles := False;
   (* Write('Removing'); *)
   for I := NumStates - 1 downto 1 do
   begin
-    for J := 0 to I - 1 do
+    IM1 := I - 1;
+    for J := 0 to IM1 do
     begin
       if ABCmp(ListStates[J], ListStates[I]) then
       begin

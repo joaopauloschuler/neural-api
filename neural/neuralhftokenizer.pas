@@ -3122,6 +3122,7 @@ var
   SegId: array of integer;    // backtracked ids, collected in reverse
   SegStart: array of integer; // backtracked start CHAR index of each segment
   Total, Position, SegCnt, I, J, BestPrev, TokenId: integer;
+  JM1: integer;
   BestScore: array of double; // best score to reach char-boundary J (0..Total)
   BackPtr: array of integer;  // start char index of the piece ending at J
   BackId: array of integer;   // vocab id of that piece, or -1 for unk
@@ -3137,14 +3138,16 @@ var
   function EmitByteFallback(CharStart, CharEnd: integer): boolean;
   var
     K, BId: integer;
+    KEndM1: integer;
   begin
     Result := false;
     if not FByteFallback then Exit;
+    KEndM1 := CPStart[CharEnd] - 1;
     // verify all byte pieces exist before emitting any
-    for K := CPStart[CharStart] to CPStart[CharEnd] - 1 do
+    for K := CPStart[CharStart] to KEndM1 do
       if VocabFind('<0x' + IntToHex(Ord(PieceText[K]), 2) + '>') < 0 then
         Exit;
-    for K := CPStart[CharStart] to CPStart[CharEnd] - 1 do
+    for K := CPStart[CharStart] to KEndM1 do
     begin
       BId := VocabFind('<0x' + IntToHex(Ord(PieceText[K]), 2) + '>');
       Ids.Add(BId);
@@ -3182,7 +3185,9 @@ begin
 
   // Forward DP: BestScore[J] = best total log-prob for chars [0..J).
   for J := 1 to Total do
-    for I := 0 to J - 1 do
+  begin
+    JM1 := J - 1;
+    for I := 0 to JM1 do
     begin
       if BestScore[I] = NegInfinity then continue;
       Sub := Copy(PieceText, CPStart[I], CPStart[J] - CPStart[I]);
@@ -3204,6 +3209,7 @@ begin
         BackId[J] := TokenId;
       end;
     end;
+  end;
 
   // Backtrack (collect ids in reverse), then emit forward, fusing adjacent
   // unk ids into one.

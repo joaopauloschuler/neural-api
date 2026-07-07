@@ -59,6 +59,10 @@ type
   cl_kernel        = PCL_kernel;
   {$ENDIF}
 
+const
+  csCLMemSize = SizeOf(cl_mem);
+
+type
   TPlatformNames = array of string;
   TPlatforms = array of cl_platform_id;
   TDeviceNames = array of string;
@@ -475,7 +479,7 @@ begin
   FGroupSizeA := GroupSizeA;
   FGroupSizeB := GroupSizeB;
 
-  NeededResult := FNumAs * FNumBs * SizeOf(TNeuralFloat);
+  NeededResult := FNumAs * FNumBs * csNeuralFloatSize;
 
   if (FHostInput) then
   begin
@@ -537,7 +541,7 @@ begin
     FInputBufferBs := FDotProductKernel.CreateInputBuffer(VBs);
   end;
 
-  FResultBuffer  := FDotProductKernel.CreateOutputBuffer(FNumAs * FNumBs * SizeOf(TNeuralFloat));
+  FResultBuffer  := FDotProductKernel.CreateOutputBuffer(FNumAs * FNumBs * csNeuralFloatSize);
   FPreviousComputeTime := 0;
 
   PrepareForCompute := CL_SUCCESS;
@@ -569,15 +573,15 @@ begin
   if NewSrc then err := FDotProductKernel.WriteBuffer(FIm2ColSrcBuffer, SrcVol)
   else err := CL_SUCCESS;
 
-  err := err or clSetKernelArg(k, 0, SizeOf(longint), @N);
-  err := err or clSetKernelArg(k, 1, SizeOf(longint), @OutSizeX);
-  err := err or clSetKernelArg(k, 2, SizeOf(longint), @ColDepth);
-  err := err or clSetKernelArg(k, 3, SizeOf(longint), @RowSpan);
-  err := err or clSetKernelArg(k, 4, SizeOf(longint), @InSizeX);
-  err := err or clSetKernelArg(k, 5, SizeOf(longint), @InDepth);
-  err := err or clSetKernelArg(k, 6, SizeOf(longint), @Stride);
-  err := err or clSetKernelArg(k, 7, SizeOf(cl_mem), @FIm2ColSrcBuffer);
-  err := err or clSetKernelArg(k, 8, SizeOf(cl_mem), @FInputBufferBs);
+  err := err or clSetKernelArg(k, 0, csLongintSize, @N);
+  err := err or clSetKernelArg(k, 1, csLongintSize, @OutSizeX);
+  err := err or clSetKernelArg(k, 2, csLongintSize, @ColDepth);
+  err := err or clSetKernelArg(k, 3, csLongintSize, @RowSpan);
+  err := err or clSetKernelArg(k, 4, csLongintSize, @InSizeX);
+  err := err or clSetKernelArg(k, 5, csLongintSize, @InDepth);
+  err := err or clSetKernelArg(k, 6, csLongintSize, @Stride);
+  err := err or clSetKernelArg(k, 7, csCLMemSize, @FIm2ColSrcBuffer);
+  err := err or clSetKernelArg(k, 8, csCLMemSize, @FInputBufferBs);
   if (err <> CL_SUCCESS) then
     ErrorProc('Error: BuildInputColsOnDevice - failed setting parameters: ' + IntToStr(err));
 
@@ -604,28 +608,28 @@ begin
   begin
     if (VBs.Size = FSize * FNumBs) then
     begin
-      err := clSetKernelArg(Kernel, 0, SizeOf(longint), @FThreadCount);
+      err := clSetKernelArg(Kernel, 0, csLongintSize, @FThreadCount);
       if (err <> CL_SUCCESS) then ErrorProc('0 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 1, SizeOf(longint), @FNumAs);
+      err := err or clSetKernelArg(Kernel, 1, csLongintSize, @FNumAs);
       if (err <> CL_SUCCESS) then ErrorProc('1 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 2, SizeOf(longint), @FNumBs);
+      err := err or clSetKernelArg(Kernel, 2, csLongintSize, @FNumBs);
       if (err <> CL_SUCCESS) then ErrorProc('2 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 3, SizeOf(longint), @FSize);
+      err := err or clSetKernelArg(Kernel, 3, csLongintSize, @FSize);
       if (err <> CL_SUCCESS) then ErrorProc('3 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 4, SizeOf(longint), @FActFun);
+      err := err or clSetKernelArg(Kernel, 4, csLongintSize, @FActFun);
       if (err <> CL_SUCCESS) then ErrorProc('4 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 5, SizeOf(cl_mem),  @FInputBufferAs);
+      err := err or clSetKernelArg(Kernel, 5, csCLMemSize,  @FInputBufferAs);
       if (err <> CL_SUCCESS) then ErrorProc('5 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 6, SizeOf(cl_mem),  @FInputBufferBs);
+      err := err or clSetKernelArg(Kernel, 6, csCLMemSize,  @FInputBufferBs);
       if (err <> CL_SUCCESS) then ErrorProc('6 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 7, SizeOf(cl_mem),  @FResultBuffer);
+      err := err or clSetKernelArg(Kernel, 7, csCLMemSize,  @FResultBuffer);
       if (err <> CL_SUCCESS) then ErrorProc('7 Error: Failed to set kernel arguments:' + IntToStr(err));
 
       // Fused bias (arg 8 UseBias, arg 9 FBiasBuffer). Both args MUST be set every
@@ -650,10 +654,10 @@ begin
       else
         UseBias := 0;
 
-      err := err or clSetKernelArg(Kernel, 8, SizeOf(longint), @UseBias);
+      err := err or clSetKernelArg(Kernel, 8, csLongintSize, @UseBias);
       if (err <> CL_SUCCESS) then ErrorProc('8 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 9, SizeOf(cl_mem), @FBiasBuffer);
+      err := err or clSetKernelArg(Kernel, 9, csCLMemSize, @FBiasBuffer);
       if (err <> CL_SUCCESS) then ErrorProc('9 Error: Failed to set kernel arguments:' + IntToStr(err));
 
       if (FHostInput) then
@@ -672,7 +676,7 @@ begin
 
       if (err <> CL_SUCCESS) then ErrorProc('Failed at WriteBuffer(input):' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 4, SizeOf(longint), @FActFun);
+      err := err or clSetKernelArg(Kernel, 4, csLongintSize, @FActFun);
       if (err <> CL_SUCCESS) then ErrorProc('Failed at clSetKernelArg 4:' + IntToStr(err));
 
       if err = CL_SUCCESS then
@@ -919,33 +923,33 @@ begin
     FInputBufferAs := CreateInputBuffer(VAs);
     FInputBufferBs := CreateInputBuffer(VBs);
   end;
-  FResultBuffer  := CreateOutputBuffer(FNumAs * FNumBs * SizeOf(TNeuralFloat));
+  FResultBuffer  := CreateOutputBuffer(FNumAs * FNumBs * csNeuralFloatSize);
   FPreviousComputeTime := 0;
 
   err := PrepareKernel(kernelname);
 
-  err := err or clSetKernelArg(FKernel, 0, SizeOf(longint), @FThreadCount);
+  err := err or clSetKernelArg(FKernel, 0, csLongintSize, @FThreadCount);
   if (err <> CL_SUCCESS) then ErrorProc('0 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-  err := err or clSetKernelArg(FKernel, 1, SizeOf(longint), @FNumAs);
+  err := err or clSetKernelArg(FKernel, 1, csLongintSize, @FNumAs);
   if (err <> CL_SUCCESS) then ErrorProc('1 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-  err := err or clSetKernelArg(FKernel, 2, SizeOf(longint), @FNumBs);
+  err := err or clSetKernelArg(FKernel, 2, csLongintSize, @FNumBs);
   if (err <> CL_SUCCESS) then ErrorProc('2 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-  err := err or clSetKernelArg(FKernel, 3, SizeOf(longint), @FSize);
+  err := err or clSetKernelArg(FKernel, 3, csLongintSize, @FSize);
   if (err <> CL_SUCCESS) then ErrorProc('3 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-  err := err or clSetKernelArg(FKernel, 4, SizeOf(longint), @FActFun);
+  err := err or clSetKernelArg(FKernel, 4, csLongintSize, @FActFun);
   if (err <> CL_SUCCESS) then ErrorProc('4 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-  err := err or clSetKernelArg(FKernel, 5, SizeOf(cl_mem),  @FInputBufferAs);
+  err := err or clSetKernelArg(FKernel, 5, csCLMemSize,  @FInputBufferAs);
   if (err <> CL_SUCCESS) then ErrorProc('5 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-  err := err or clSetKernelArg(FKernel, 6, SizeOf(cl_mem),  @FInputBufferBs);
+  err := err or clSetKernelArg(FKernel, 6, csCLMemSize,  @FInputBufferBs);
   if (err <> CL_SUCCESS) then ErrorProc('6 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-  err := err or clSetKernelArg(FKernel, 7, SizeOf(cl_mem),  @FResultBuffer);
+  err := err or clSetKernelArg(FKernel, 7, csCLMemSize,  @FResultBuffer);
   if (err <> CL_SUCCESS) then ErrorProc('7 Error: Failed to set kernel arguments:' + IntToStr(err));
 
   // cai_dot_product gained two fused-bias args (8 UseBias, 9 FBiasOutput). This
@@ -954,9 +958,9 @@ begin
   // immediately, so the locals are safe). Coded by Claude (AI).
   UseBiasZero := 0;
   NilBias := nil;
-  err := err or clSetKernelArg(FKernel, 8, SizeOf(longint), @UseBiasZero);
+  err := err or clSetKernelArg(FKernel, 8, csLongintSize, @UseBiasZero);
   if (err <> CL_SUCCESS) then ErrorProc('8 Error: Failed to set kernel arguments:' + IntToStr(err));
-  err := err or clSetKernelArg(FKernel, 9, SizeOf(cl_mem), @NilBias);
+  err := err or clSetKernelArg(FKernel, 9, csCLMemSize, @NilBias);
   if (err <> CL_SUCCESS) then ErrorProc('9 Error: Failed to set kernel arguments:' + IntToStr(err));
 
   PrepareForCompute := err;
@@ -989,7 +993,7 @@ begin
 
       FActFun := pActFN;
 
-      err := err or clSetKernelArg(FKernel, 4, SizeOf(longint), @FActFun);
+      err := err or clSetKernelArg(FKernel, 4, csLongintSize, @FActFun);
 
       if err = CL_SUCCESS then
       begin
@@ -1134,14 +1138,14 @@ function TEasyOpenCLV.CreateWriteSetArgument(V: TNNetVolume; kernel:cl_kernel; a
 begin
   Result := nil;
   CreateAndWriteBuffer(V, Result);
-  clSetKernelArg(kernel, arg_index, sizeof(cl_mem), @Result);
+  clSetKernelArg(kernel, arg_index, csCLMemSize, @Result);
 end;
 
 function TEasyOpenCLV.CreateOutputSetArgument(V: TNNetVolume;
   kernel: cl_kernel; arg_index: cl_uint): cl_mem;
 begin
   Result := CreateOutputBuffer(V);
-  clSetKernelArg(kernel, arg_index, sizeof(cl_mem), @Result);
+  clSetKernelArg(kernel, arg_index, csCLMemSize, @Result);
 end;
 
 function TEasyOpenCLV.EnsureBuffer(var buf: cl_mem; var capBytes: PtrUInt;

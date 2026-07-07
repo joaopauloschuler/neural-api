@@ -711,14 +711,16 @@ var
   e: integer;
   Outp: PSingle;
   NumBlocksM1: Int64;
+  QKM1: integer;
 begin
   NumBlocksM1 := NumBlocks - 1;
+  QKM1 := GGUF_QK_LEGACY - 1;
   for b := 0 to NumBlocksM1 do
   begin
     Base := Raw + b * GGUF_Q4_0_BLOCK_BYTES;
     d := DecodeF16(PWord(Base)^);
     Outp := Dest + b * GGUF_QK_LEGACY;
-    for e := 0 to GGUF_QK_LEGACY - 1 do
+    for e := 0 to QKM1 do
       Outp[e] := d * (integer(LegacyNibble(Base + 2, e)) - 8);
   end;
 end;
@@ -734,15 +736,17 @@ var
   e: integer;
   Outp: PSingle;
   NumBlocksM1: Int64;
+  QKM1: integer;
 begin
   NumBlocksM1 := NumBlocks - 1;
+  QKM1 := GGUF_QK_LEGACY - 1;
   for b := 0 to NumBlocksM1 do
   begin
     Base := Raw + b * GGUF_Q4_1_BLOCK_BYTES;
     d := DecodeF16(PWord(Base)^);
     m := DecodeF16(PWord(Base + 2)^);
     Outp := Dest + b * GGUF_QK_LEGACY;
-    for e := 0 to GGUF_QK_LEGACY - 1 do
+    for e := 0 to QKM1 do
       Outp[e] := d * integer(LegacyNibble(Base + 4, e)) + m;
   end;
 end;
@@ -760,15 +764,17 @@ var
   q5: integer;
   Outp: PSingle;
   NumBlocksM1: Int64;
+  QKM1: integer;
 begin
   NumBlocksM1 := NumBlocks - 1;
+  QKM1 := GGUF_QK_LEGACY - 1;
   for b := 0 to NumBlocksM1 do
   begin
     Base := Raw + b * GGUF_Q5_0_BLOCK_BYTES;
     d := DecodeF16(PWord(Base)^);
     qh := PCardinal(Base + 2)^;
     Outp := Dest + b * GGUF_QK_LEGACY;
-    for e := 0 to GGUF_QK_LEGACY - 1 do
+    for e := 0 to QKM1 do
     begin
       q5 := integer(LegacyNibble(Base + 6, e)) or
         (integer((qh shr e) and $01) shl 4);
@@ -790,8 +796,10 @@ var
   q5: integer;
   Outp: PSingle;
   NumBlocksM1: Int64;
+  QKM1: integer;
 begin
   NumBlocksM1 := NumBlocks - 1;
+  QKM1 := GGUF_QK_LEGACY - 1;
   for b := 0 to NumBlocksM1 do
   begin
     Base := Raw + b * GGUF_Q5_1_BLOCK_BYTES;
@@ -799,7 +807,7 @@ begin
     m := DecodeF16(PWord(Base + 2)^);
     qh := PCardinal(Base + 4)^;
     Outp := Dest + b * GGUF_QK_LEGACY;
-    for e := 0 to GGUF_QK_LEGACY - 1 do
+    for e := 0 to QKM1 do
     begin
       q5 := integer(LegacyNibble(Base + 8, e)) or
         (integer((qh shr e) and $01) shl 4);

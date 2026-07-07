@@ -2245,7 +2245,7 @@ type
   end;
 var
   NumT, Vocab, ti, k, i, j, bi, LastSym: integer;
-  NumTM1, VocabM1, BeamsHi, BeamsHiM1, NextHi: integer;
+  NumTM1, VocabM1, BeamsHi, BeamsHiM1, NextHi, IP1: integer;
   Beams, Next: array of TCTCBeam;
   Prob: array of double; // current frame probabilities
   BestIdx: integer;
@@ -2358,7 +2358,8 @@ begin
     begin
       BestIdx := i;
       BestScore := Beams[i].PB + Beams[i].PNB;
-      for j := i + 1 to BeamsHi do
+      IP1 := i + 1;
+      for j := IP1 to BeamsHi do
       begin
         Total := Beams[j].PB + Beams[j].PNB;
         if Total > BestScore then
@@ -3520,7 +3521,7 @@ end;
 
 procedure TNNetGrammarMachine.CommitScratchToActive();
 var
-  I, J, FScratchCountM1: integer;
+  I, J, FScratchCountM1, ScratchLenM1: integer;
 begin
   if Length(FStacks) < FScratchCount then
   begin
@@ -3532,7 +3533,8 @@ begin
   begin
     if Length(FStacks[I]) < FScratchLen[I] then
       SetLength(FStacks[I], FScratchLen[I] + 8);
-    for J := 0 to FScratchLen[I] - 1 do FStacks[I][J] := FScratch[I][J];
+    ScratchLenM1 := FScratchLen[I] - 1;
+    for J := 0 to ScratchLenM1 do FStacks[I][J] := FScratch[I][J];
     FStackLen[I] := FScratchLen[I];
   end;
   FStackCount := FScratchCount;
@@ -3552,7 +3554,7 @@ end;
 
 procedure TNNetGrammarMachine.CopyFrom(Source: TNNetGrammarMachine);
 var
-  I, J, SrcStackCountM1: integer;
+  I, J, SrcStackCountM1, SrcStackLenM1: integer;
 begin
   FGrammar := Source.FGrammar;
   if Length(FStacks) < Source.FStackCount then
@@ -3565,7 +3567,8 @@ begin
   begin
     if Length(FStacks[I]) < Source.FStackLen[I] then
       SetLength(FStacks[I], Source.FStackLen[I] + 8);
-    for J := 0 to Source.FStackLen[I] - 1 do
+    SrcStackLenM1 := Source.FStackLen[I] - 1;
+    for J := 0 to SrcStackLenM1 do
       FStacks[I][J] := Source.FStacks[I][J];
     FStackLen[I] := Source.FStackLen[I];
   end;
@@ -3574,7 +3577,7 @@ end;
 
 function TNNetGrammarMachine.ElemMatches(Pos: integer; C: char): boolean;
 var
-  Rule, Idx, SetIdx, R, RMax: integer;
+  Rule, Idx, SetIdx, R, RMax, SetFirst: integer;
   Body: TNNetGrammarElemArray;
   InSet: boolean;
 begin
@@ -3587,9 +3590,9 @@ begin
       begin
         SetIdx := Body[Idx].Value;
         InSet := false;
-        RMax := FGrammar.FCharSets[SetIdx].First +
-          FGrammar.FCharSets[SetIdx].Count - 1;
-        for R := FGrammar.FCharSets[SetIdx].First to RMax do
+        SetFirst := FGrammar.FCharSets[SetIdx].First;
+        RMax := SetFirst + FGrammar.FCharSets[SetIdx].Count - 1;
+        for R := SetFirst to RMax do
           if (C >= FGrammar.FRanges[R].Lo) and
              (C <= FGrammar.FRanges[R].Hi) then
           begin InSet := true; break; end;
@@ -3616,7 +3619,7 @@ begin
     begin
       UnpackPos(TopPos, Rule, Idx);
       SetLength(Adv, FStackLen[I]);
-      Move(FStacks[I][0], Adv[0], FStackLen[I] * SizeOf(integer));
+      Move(FStacks[I][0], Adv[0], FStackLen[I] * csIntegerSize);
       Adv[FStackLen[I] - 1] := PackPos(Rule, Idx + 1);
       AddStackExpanded(Adv, FStackLen[I]);
     end;
@@ -4031,7 +4034,7 @@ function TJSONSchemaCompiler.CompileArray(Obj: TJSONObject;
   const Hint: string): string;
 var
   ItemRule, Body, WS: string;
-  MinItems, MaxItems, I: integer;
+  MinItems, MaxItems, I, MinItemsP1: integer;
   ItemsNode: TJSONData;
 begin
   WS := WSRule();
@@ -4063,9 +4066,12 @@ begin
         // Then any number more.
         Body := Body + ' ("," ' + WS + ' ' + ItemRule + ' ' + WS + ')*'
       else
+      begin
         // Up to (MaxItems - MinItems) more, each optional.
-        for I := MinItems + 1 to MaxItems do
+        MinItemsP1 := MinItems + 1;
+        for I := MinItemsP1 to MaxItems do
           Body := Body + ' ("," ' + WS + ' ' + ItemRule + ' ' + WS + ')?';
+      end;
     end
     else
     begin
@@ -4452,6 +4458,7 @@ end;
 procedure TNNetNoRepeatNGramProcessor.ProcessRow(Row: TNNetVolume);
 var
   I, J, K, Size, SuffixStart, Last, NM1, Banned: integer;
+  SizeM1, SuffixStartM1, NM1M1: integer;
   Match: boolean;
   KeptMass: TNeuralFloat;
   Ban: array of boolean;
@@ -4459,15 +4466,18 @@ begin
   // OFF: an n-gram of size <= 1 has no (n-1)-suffix to key on.
   if FNGramSize <= 1 then exit;
   NM1 := FNGramSize - 1;
+  NM1M1 := NM1 - 1;
   // Need at least NM1 history tokens to form the suffix AND one preceding
   // n-gram (a position p with the same suffix and a follower): the earliest
   // such follower sits at index FNGramSize-1, so we need FLen >= FNGramSize.
   if FLen < FNGramSize then exit;
   Size := Row.Size;
+  SizeM1 := Size - 1;
   SetLength(Ban, Size);
-  for I := 0 to Size - 1 do Ban[I] := false;
+  for I := 0 to SizeM1 do Ban[I] := false;
   // Current (n-1)-token suffix is the LAST NM1 tokens of the history.
   SuffixStart := FLen - NM1;
+  SuffixStartM1 := SuffixStart - 1;
   Banned := 0;
   // Scan every position whose n-gram ENDS at or before the suffix start, i.e.
   // its (n-1)-prefix could match the current suffix and its follower (the
@@ -4477,10 +4487,10 @@ begin
   // window, which is index FLen-NM1-1 + ... ). Concretely: for each start J
   // with J in [0, SuffixStart-1], if history[J..J+NM1-1] = suffix then ban
   // history[J+NM1].
-  for J := 0 to SuffixStart - 1 do
+  for J := 0 to SuffixStartM1 do
   begin
     Match := true;
-    for K := 0 to NM1 - 1 do
+    for K := 0 to NM1M1 do
       if FHistory[J + K] <> FHistory[SuffixStart + K] then
       begin
         Match := false;
@@ -4502,10 +4512,10 @@ begin
   // fallback (every surviving token has zero prob, or all were banned): leave
   // the row UNTOUCHED, mirroring MaskAllowed.
   KeptMass := 0;
-  for I := 0 to Size - 1 do
+  for I := 0 to SizeM1 do
     if not Ban[I] then KeptMass := KeptMass + Row.Raw[I];
   if KeptMass <= 0 then exit;
-  for I := 0 to Size - 1 do
+  for I := 0 to SizeM1 do
     if Ban[I] then Row.Raw[I] := 0
     else Row.Raw[I] := Row.Raw[I] / KeptMass;
 end;
@@ -4530,19 +4540,21 @@ end;
 procedure TNNetSequenceBiasProcessor.AddSequenceBias(
   const Sequence: array of integer; Bias: TNeuralFloat);
 var
-  I, J, Len: integer;
+  I, J, Len, FCountM1, LenM1: integer;
   Same: boolean;
 begin
   Len := Length(Sequence);
   if Len = 0 then
     raise EArgumentException.Create(
       'TNNetSequenceBiasProcessor.AddSequenceBias: empty sequence.');
+  LenM1 := Len - 1;
+  FCountM1 := FCount - 1;
   // Re-adding the same sequence OVERWRITES its bias (HF dict semantics).
-  for I := 0 to FCount - 1 do
+  for I := 0 to FCountM1 do
     if Length(FSequences[I]) = Len then
     begin
       Same := true;
-      for J := 0 to Len - 1 do
+      for J := 0 to LenM1 do
         if FSequences[I][J] <> Sequence[J] then
         begin
           Same := false;
@@ -4560,7 +4572,7 @@ begin
     SetLength(FBiases, (FCount + 1) * 2);
   end;
   SetLength(FSequences[FCount], Len);
-  for J := 0 to Len - 1 do FSequences[FCount][J] := Sequence[J];
+  for J := 0 to LenM1 do FSequences[FCount][J] := Sequence[J];
   FBiases[FCount] := Bias;
   Inc(FCount);
 end;
@@ -4594,18 +4606,21 @@ end;
 procedure TNNetSequenceBiasProcessor.ProcessRow(Row: TNNetVolume);
 var
   I, K, Len, PrefLen, HistStart, Final, Size: integer;
+  SizeM1, FCountM1, PrefLenM1: integer;
   Match: boolean;
   Factor, KeptMass: TNeuralFloat;
   Scale: TNeuralFloatDynArr;
 begin
   if FCount = 0 then exit;
   Size := Row.Size;
+  SizeM1 := Size - 1;
+  FCountM1 := FCount - 1;
   // Per-token multiplicative factor (exp of the accumulated additive logit
   // bias), 1.0 = untouched. Biases on the SAME final token ADD in logit space
   // = multiply in probability space, matching HF (which sums into the logit).
   SetLength(Scale, Size);
-  for I := 0 to Size - 1 do Scale[I] := 1.0;
-  for I := 0 to FCount - 1 do
+  for I := 0 to SizeM1 do Scale[I] := 1.0;
+  for I := 0 to FCountM1 do
   begin
     Len := Length(FSequences[I]);
     Final := FSequences[I][Len - 1];
@@ -4617,7 +4632,8 @@ begin
     if PrefLen > FLen then continue; // not enough history for the lead-in
     Match := true;
     HistStart := FLen - PrefLen;
-    for K := 0 to PrefLen - 1 do
+    PrefLenM1 := PrefLen - 1;
+    for K := 0 to PrefLenM1 do
       if FHistory[HistStart + K] <> FSequences[I][K] then
       begin
         Match := false;
@@ -4636,10 +4652,10 @@ begin
   // zero-mass fallback can leave the row UNTOUCHED (the MaskAllowed
   // convention) instead of emitting a degenerate all-zero distribution.
   KeptMass := 0;
-  for I := 0 to Size - 1 do
+  for I := 0 to SizeM1 do
     KeptMass := KeptMass + Row.Raw[I] * Scale[I];
   if KeptMass <= 0 then exit;
-  for I := 0 to Size - 1 do
+  for I := 0 to SizeM1 do
   begin
     Factor := Scale[I];
     if Factor <> 1.0 then Row.Raw[I] := Row.Raw[I] * Factor;
@@ -5445,7 +5461,7 @@ var
   LastText, CandText: string;
   Allowed: TNeuralIntegerArray;
   TokenCnt, AllowedCount, VocabCount, LastLen, Roll, RollIdx, Tok: integer;
-  PromptLenM1, VocabCountM1: integer;
+  PromptLenM1, VocabCountM1, RollStart: integer;
   HasStrictExtension: boolean;
 begin
   Result := nil;
@@ -5459,7 +5475,8 @@ begin
   // Rebuild the combined boundary fragment from the last Roll tokens.
   LastText := '';
   PromptLenM1 := PromptLen - 1;
-  for RollIdx := PromptLen - Roll to PromptLenM1 do
+  RollStart := PromptLen - Roll;
+  for RollIdx := RollStart to PromptLenM1 do
   begin
     Tok := Tokens[RollIdx];
     if (Tok < 0) or (Tok >= VocabCount) then exit; // out-of-dict id: skip
@@ -5500,7 +5517,7 @@ var
   Fragment, CandSurface, FragSurface: string;
   Allowed: TNeuralIntegerArray;
   Roll, RollIdx, FragLen, Cnt: integer;
-  PromptLenM1, AllowedHi: integer;
+  PromptLenM1, AllowedHi, RollStart: integer;
   HasStrictExtension: boolean;
 begin
   Result := nil;
@@ -5512,7 +5529,8 @@ begin
   // Rebuild the combined boundary fragment (raw text) from the last Roll ids.
   Fragment := '';
   PromptLenM1 := PromptLen - 1;
-  for RollIdx := PromptLen - Roll to PromptLenM1 do
+  RollStart := PromptLen - Roll;
+  for RollIdx := RollStart to PromptLenM1 do
     Fragment := Fragment + Tokenizer.DecodeToken(Tokens[RollIdx]);
   if Fragment = '' then exit; // special/empty surface: no-op fallback
   // Surface-space prefix scan over the byte-level/metaspace vocabulary.
@@ -6050,7 +6068,7 @@ var
   Past: array of TNNetVolume;      // hidden states of already-processed tokens
   CandHidden: TNNetVolume;         // snapshot of a candidate's hidden state
   VocabSize, Step, I, J, NumCand, Best, StopLen, PastLen: integer;
-  VocabSizeM1, NumCandM1, PastLenM1: integer;
+  VocabSizeM1, NumCandM1, PastLenM1, IP1: integer;
   Total, MaxSim, Sim, ScoreV, BestScore: TNeuralFloat;
   Context, CandStr: string;
   TmpI: integer;
@@ -6097,7 +6115,8 @@ begin
       for I := 0 to NumCandM1 do
       begin
         Best := I;
-        for J := I + 1 to VocabSizeM1 do
+        IP1 := I + 1;
+        for J := IP1 to VocabSizeM1 do
           if Probs[Cand[J]] > Probs[Cand[Best]] then Best := J;
         TmpI := Cand[I]; Cand[I] := Cand[Best]; Cand[Best] := TmpI;
       end;
@@ -6185,7 +6204,7 @@ var
   Past: array of TNNetVolume;
   CandHidden: TNNetVolume;
   VocabSize, Pos, CapLen, I, J, NumCand, Best, PastLen, StopLen: integer;
-  VocabSizeM1, NumCandM1, PastLenM1, PromptLenM2: integer;
+  VocabSizeM1, NumCandM1, PastLenM1, PromptLenM2, IP1: integer;
   Total, MaxSim, Sim, ScoreV, BestScore: TNeuralFloat;
   TmpI: integer;
 begin
@@ -6255,7 +6274,8 @@ begin
       for I := 0 to NumCandM1 do
       begin
         Best := I;
-        for J := I + 1 to VocabSizeM1 do
+        IP1 := I + 1;
+        for J := IP1 to VocabSizeM1 do
           if Probs[Cand[J]] > Probs[Cand[Best]] then Best := J;
         TmpI := Cand[I]; Cand[I] := Cand[Best]; Cand[Best] := TmpI;
       end;
@@ -6878,7 +6898,7 @@ end;
 function PromptLookupDraft(const Context: string;
   MatchLen, NumDraft: integer): string;
 var
-  CtxLen, P, FollowLen: integer;
+  CtxLen, P, FollowLen, PStart: integer;
   Suffix: string;
 begin
   Result := '';
@@ -6889,7 +6909,8 @@ begin
   // a match at start position P occupies Context[P .. P+MatchLen-1]. The most
   // recent earlier occurrence has the largest P with P+MatchLen-1 < CtxLen, i.e.
   // P <= CtxLen - MatchLen, EXCLUDING P = CtxLen - MatchLen + 1 (the suffix).
-  for P := CtxLen - MatchLen downto 1 do
+  PStart := CtxLen - MatchLen;
+  for P := PStart downto 1 do
     if Copy(Context, P, MatchLen) = Suffix then
     begin
       FollowLen := CtxLen - (P + MatchLen) + 1; // chars available after match
@@ -7629,7 +7650,7 @@ end;
 function NeededNextChars(const Text: string;
   const ForceTokens: array of string): string;
 var
-  K, P, MatchLen: integer;
+  K, P, MatchLen, PhraseLenM1: integer;
   ForceTokensHi: integer;
   Phrase, Tail: string;
   C: char;
@@ -7643,7 +7664,8 @@ begin
     // Longest prefix of Phrase that is a suffix of Text (how far an in-progress
     // emission of this phrase has got); 0 means "start the phrase fresh".
     MatchLen := 0;
-    for P := Length(Phrase) - 1 downto 1 do
+    PhraseLenM1 := Length(Phrase) - 1;
+    for P := PhraseLenM1 downto 1 do
       if (Length(Text) >= P) and
          (Copy(Text, Length(Text) - P + 1, P) = Copy(Phrase, 1, P)) then
       begin
@@ -7664,7 +7686,7 @@ end;
 function ForcedProgress(const Text: string;
   const ForceTokens: array of string): integer;
 var
-  K, P: integer;
+  K, P, PhraseLenM1: integer;
   ForceTokensHi: integer;
   Phrase: string;
 begin
@@ -7677,13 +7699,16 @@ begin
     if Pos(Phrase, Text) > 0 then
       Inc(Result, Length(Phrase))
     else
-      for P := Length(Phrase) - 1 downto 1 do
+    begin
+      PhraseLenM1 := Length(Phrase) - 1;
+      for P := PhraseLenM1 downto 1 do
         if (Length(Text) >= P) and
            (Copy(Text, Length(Text) - P + 1, P) = Copy(Phrase, 1, P)) then
         begin
           Inc(Result, P);
           Break;
         end;
+    end;
   end;
 end;
 

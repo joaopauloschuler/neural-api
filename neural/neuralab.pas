@@ -299,10 +299,14 @@ end;
 procedure ABShiftLogicalRight(var X: array of byte);
 var
   I: longint;
+  LowP1: longint;
 begin
   if High(X) > Low(X) then
-    for I := High(X) downto Low(X) + 1 do
+  begin
+    LowP1 := Low(X) + 1;
+    for I := High(X) downto LowP1 do
       X[I] := X[I - 1];
+  end;
   X[Low(X)] := 0;
 end;
 
