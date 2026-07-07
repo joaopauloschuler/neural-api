@@ -154,6 +154,7 @@ type
     procedure TestGPT2LogitParityFromShardedTorchBin;
     procedure TestSetTrainableKeepsOutputs;
     procedure TestInt8QuantizeRoundTripAndForward;
+    procedure TestInt8QuantizeAliasClasses;
     procedure TestInt8QuantizedGPT2LogitDrift;
     procedure TestInt8QuantizedLlamaLogitDrift;
     procedure TestInt8QuantizedGPTNeoLogitDrift;
@@ -3338,6 +3339,64 @@ begin
   finally
     for n := 0 to High(OrigConvW) do OrigConvW[n].Free;
     for n := 0 to High(OrigFCW) do OrigFCW[n].Free;
+    OutDQ.Free;
+    OutQ.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+// The empty alias subclasses (TNNetDense = class(TNNetFullConnect);
+// TNNetDenseReLU, TNNetLayerFullConnect, TNNetLayerFullConnectReLU) add no
+// code of their own, but TNNet.QuantizeWeightsInt8 gates on EXACT class
+// matches - so a network built with the alias names used to skip quantization
+// silently. This stacks all four aliases, quantizes, and asserts (a) every
+// alias layer really flips to int8 storage with the FP32 weights released,
+// and (b) the quantized forward equals the FP32 forward on the dequantized
+// weights (the same equivalence TestInt8QuantizeRoundTripAndForward gates for
+// the base classes). // Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestInt8QuantizeAliasClasses;
+var
+  NN: TNNet;
+  AliasLayers: array[0..3] of TNNetLayer;
+  Input, OutQ, OutDQ: TNNetVolume;
+  i, n: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN.AddLayer( TNNetInput.Create(30) );
+  AliasLayers[0] := NN.AddLayer( TNNetDense.Create(12) );
+  AliasLayers[1] := NN.AddLayer( TNNetDenseReLU.Create(10) );
+  AliasLayers[2] := NN.AddLayer( TNNetLayerFullConnect.Create(8) );
+  AliasLayers[3] := NN.AddLayer( TNNetLayerFullConnectReLU.Create(6) );
+  Input := TNNetVolume.Create(30, 1, 1);
+  OutQ := TNNetVolume.Create;
+  OutDQ := TNNetVolume.Create;
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.FData[i] := Sin(0.7 * i) * 0.5;
+
+    NN.QuantizeWeightsInt8();
+    for n := 0 to High(AliasLayers) do
+    begin
+      AssertTrue('alias layer ' + AliasLayers[n].ClassName + ' quantized',
+        TNNetLayerConcatedWeights(AliasLayers[n]).WeightsQuantizedInt8);
+      AssertEquals('alias layer ' + AliasLayers[n].ClassName +
+        ' FP32 weights released', 1, AliasLayers[n].Neurons[0].Weights.Size);
+    end;
+
+    NN.Compute(Input);
+    NN.GetOutput(OutQ);
+
+    for n := 0 to High(AliasLayers) do
+      TNNetLayerConcatedWeights(AliasLayers[n]).DequantizeWeightsInt8();
+    NN.Compute(Input);
+    NN.GetOutput(OutDQ);
+    AssertEquals('output size', OutQ.Size, OutDQ.Size);
+    for i := 0 to OutQ.Size - 1 do
+      AssertEquals('alias quantized forward = FP32-on-dequantized-weights ' +
+        IntToStr(i), OutDQ.FData[i], OutQ.FData[i], 1e-6);
+  finally
     OutDQ.Free;
     OutQ.Free;
     Input.Free;
