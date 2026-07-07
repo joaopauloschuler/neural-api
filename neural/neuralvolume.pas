@@ -1452,6 +1452,180 @@ begin
            PtrA^[localNumElements+2] * PtrB^[localNumElements+2];
   end;
 end;
+
+// Fused int8 axpy PtrA[i] += W * PtrCodes[i]: AVXDotProductInt8's byte->float
+// front end (vpmovsxbd + vcvtdq2ps, the codes stream at 1 byte/element and the
+// dequantized value never exists in memory) grafted onto the scalar
+// AVXMulAdd's broadcast-FMA + store-back back end. Note the asymmetric
+// strides: 32 elements advance the code pointer 32 BYTES but the float
+// pointer 128. Scalar remainder (N mod 4) in Pascal. Coded by Claude (AI).
+procedure AVXMulAddInt8Scalar(PtrA: TNeuralFloatArrPtr;
+  PtrCodes: TNeuralInt8ArrPtr; W: TNeuralFloat; NumElements: integer);
+var
+  WPtr: pointer;
+  localNumElements, MissedElements: integer;
+  i: integer;
+begin
+  MissedElements := NumElements and 3;
+  localNumElements := NumElements xor MissedElements;
+  if localNumElements > 0 then
+  begin
+    WPtr := Addr(W);
+  asm
+  mov ecx, localNumElements
+  mov rdx, WPtr
+  VBROADCASTSS ymm5, [rdx]
+  mov rax, PtrCodes
+  mov rdx, PtrA
+
+  push rcx
+  shr ecx,5  // number of large iterations = number of elements / 32
+  jz @SkipLargeAddLoop
+
+@LargeAddLoop:
+  vpmovsxbd ymm0, [rax]
+  vpmovsxbd ymm1, [rax+8]
+  vpmovsxbd ymm2, [rax+16]
+  vpmovsxbd ymm3, [rax+24]
+
+  vcvtdq2ps ymm0, ymm0
+  vcvtdq2ps ymm1, ymm1
+  vcvtdq2ps ymm2, ymm2
+  vcvtdq2ps ymm3, ymm3
+
+  vmovups ymm6, [rdx]
+  vmovups ymm7, [rdx+32]
+  vfmadd231ps ymm6, ymm0, ymm5
+  vfmadd231ps ymm7, ymm1, ymm5
+  vmovups [rdx],    ymm6
+  vmovups [rdx+32], ymm7
+
+  vmovups ymm6, [rdx+64]
+  vmovups ymm7, [rdx+96]
+  vfmadd231ps ymm6, ymm2, ymm5
+  vfmadd231ps ymm7, ymm3, ymm5
+  vmovups [rdx+64], ymm6
+  vmovups [rdx+96], ymm7
+
+  add rax, 32
+  add rdx, 128
+  dec ecx
+  jnz @LargeAddLoop
+
+@SkipLargeAddLoop:
+  pop rcx
+  and ecx,$0000001F
+  jz @EndAdd
+  shr ecx, 2 // number of small iterations = (number of elements modulo 32) / 4
+@SmallAddLoop:
+  vpmovsxbd xmm0, [rax]
+  vcvtdq2ps xmm0, xmm0
+  vmovups xmm6, [rdx]
+  vfmadd231ps xmm6, xmm0, xmm5
+  vmovups [rdx], xmm6
+
+  add rax, 4
+  add rdx, 16
+  dec ecx
+  jnz @SmallAddLoop
+
+@EndAdd:
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX',
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm5', 'ymm6', 'ymm7'
+  ];
+  end;
+  for i := localNumElements to NumElements - 1 do
+    PtrA^[i] := PtrA^[i] + W * PtrCodes^[i];
+end;
+
+// Fused int8 elementwise multiply-accumulate PtrA[i] += PtrCodes[i] * PtrB[i]
+// (the depthwise-conv tap kernel): same byte->float front end as above, with
+// the float input as the FMA memory operand (three streams, RBX for the codes
+// like the 3-pointer AVXMulAdd macro). Scalar remainder (N mod 4) in Pascal.
+// Coded by Claude (AI).
+procedure AVXMulAddInt8(PtrA, PtrB: TNeuralFloatArrPtr;
+  PtrCodes: TNeuralInt8ArrPtr; NumElements: integer);
+var
+  localNumElements, MissedElements: integer;
+  i: integer;
+begin
+  MissedElements := NumElements and 3;
+  localNumElements := NumElements xor MissedElements;
+  if localNumElements > 0 then
+  begin
+  asm
+  mov ecx, localNumElements
+  mov rdx, PtrA
+  mov rax, PtrB
+  mov rbx, PtrCodes
+
+  push rcx
+  shr ecx,5  // number of large iterations = number of elements / 32
+  jz @SkipLargeAddLoop
+
+@LargeAddLoop:
+  vpmovsxbd ymm0, [rbx]
+  vpmovsxbd ymm1, [rbx+8]
+  vpmovsxbd ymm2, [rbx+16]
+  vpmovsxbd ymm3, [rbx+24]
+
+  vcvtdq2ps ymm0, ymm0
+  vcvtdq2ps ymm1, ymm1
+  vcvtdq2ps ymm2, ymm2
+  vcvtdq2ps ymm3, ymm3
+
+  vmovups ymm6, [rdx]
+  vmovups ymm7, [rdx+32]
+  vfmadd231ps ymm6, ymm0, [rax]
+  vfmadd231ps ymm7, ymm1, [rax+32]
+  vmovups [rdx],    ymm6
+  vmovups [rdx+32], ymm7
+
+  vmovups ymm6, [rdx+64]
+  vmovups ymm7, [rdx+96]
+  vfmadd231ps ymm6, ymm2, [rax+64]
+  vfmadd231ps ymm7, ymm3, [rax+96]
+  vmovups [rdx+64], ymm6
+  vmovups [rdx+96], ymm7
+
+  add rbx, 32
+  add rax, 128
+  add rdx, 128
+  dec ecx
+  jnz @LargeAddLoop
+
+@SkipLargeAddLoop:
+  pop rcx
+  and ecx,$0000001F
+  jz @EndAdd
+  shr ecx, 2 // number of small iterations = (number of elements modulo 32) / 4
+@SmallAddLoop:
+  vpmovsxbd xmm0, [rbx]
+  vcvtdq2ps xmm0, xmm0
+  vmovups xmm6, [rdx]
+  vfmadd231ps xmm6, xmm0, [rax]
+  vmovups [rdx], xmm6
+
+  add rbx, 4
+  add rax, 16
+  add rdx, 16
+  dec ecx
+  jnz @SmallAddLoop
+
+@EndAdd:
+  vzeroupper
+  end
+  [
+    'RAX', 'RBX', 'RCX', 'RDX',
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm6', 'ymm7'
+  ];
+  end;
+  for i := localNumElements to NumElements - 1 do
+    PtrA^[i] := PtrA^[i] + PtrCodes^[i] * PtrB^[i];
+end;
 {$ENDIF}
 {$ENDIF}
 
@@ -10137,6 +10311,15 @@ var
   I: integer;
   vHigh: integer;
 begin
+  {$IFDEF AVX64}
+  {$IFDEF AVX2}
+  if pSize >= csMinAvxSize then
+  begin
+    AVXMulAddInt8(PtrA, PtrB, PtrCodes, pSize);
+    exit;
+  end;
+  {$ENDIF}
+  {$ENDIF}
   vHigh := pSize - 1;
   for I := 0 to vHigh do
     PtrA^[I] := PtrA^[I] + PtrCodes^[I] * PtrB^[I];
@@ -10148,6 +10331,15 @@ var
   I: integer;
   vHigh: integer;
 begin
+  {$IFDEF AVX64}
+  {$IFDEF AVX2}
+  if pSize >= csMinAvxSize then
+  begin
+    AVXMulAddInt8Scalar(PtrA, PtrCodes, W, pSize);
+    exit;
+  end;
+  {$ENDIF}
+  {$ENDIF}
   vHigh := pSize - 1;
   for I := 0 to vHigh do
     PtrA^[I] := PtrA^[I] + W * PtrCodes^[I];
