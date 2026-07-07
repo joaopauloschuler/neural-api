@@ -10,11 +10,13 @@ IntraLayerThreadingBench: validates the intra-layer threading decision.
     check (threaded output MUST equal serial output - only independent outputs
     are partitioned). It is run twice, once with the low-memory inference
     contract off and once on, since conv/pointwise chunk in both modes.
-  * Experiment B takes the small shapes from A and sweeps them across
-    NN.StartThreadWorkers() policies - hot-core counts 1..4 crossed with
-    cool-down timeouts 0..2 seconds - since the small end is where the pool
-    policy actually moves the OFF-vs-ON speedup.
-  * Experiment C times a few realistic multi-layer nets OFF vs ON end to end.
+  * Experiment B (no longer run - kept in the source for reference) took the
+    small shapes from A and swept them across NN.StartThreadWorkers()
+    policies - hot-core counts 1..4 crossed with cool-down timeouts 0..2
+    seconds - since the small end is where the pool policy actually moves
+    the OFF-vs-ON speedup.
+  * Experiment C (no longer run - kept in the source for reference) timed a
+    few realistic multi-layer nets OFF vs ON end to end.
 
 ChunkEligible returns true for every size, so a parallel pass always chunks.
 Experiment A measures where that pays: the tiny shapes at the top of each block
@@ -449,17 +451,17 @@ begin
   // passes expose whether the memory mode shifts eligibility or timing.
   ExperimentA({LowMem=}False);
   ExperimentA({LowMem=}True);
-  ExperimentB;
-  WriteLn('=== Experiment C: realistic nets  threading OFF vs ON (end-to-end) ===');
-  SweepNet('small GPT MLP', 512,  2048, 6, 8);
+  // Experiments B (pool-policy sweep) and C (end-to-end nets) are no longer
+  // relevant; kept in the source for reference but not run.
+  // ExperimentB;
+  // WriteLn('=== Experiment C: realistic nets  threading OFF vs ON (end-to-end) ===');
+  // SweepNet('small GPT MLP', 512,  2048, 6, 8);
   // SwiGLU-FFN stack (RoPE + per-block RMSNorm -> up-proj -> SwiGLU ->
   // down-proj): the end-to-end probe for the token-layer ComputeRange work.
   // seq=8 is prefill-like; seq=1 is the KV-cache decode shape where the token
   // layers need a finer-than-token chunk axis to thread at all.
-  SweepNet('GPT SwiGLU FFN', 512,  2048, 6, 8, {UseSwiGLU=}true);
-  SweepNet('SwiGLU 1-token', 1024, 4096, 4, 1, {UseSwiGLU=}true);
-  // The remaining two architectures are commented out to keep the run short -
-  // the first architecture is representative of the end-to-end case.
+  // SweepNet('GPT SwiGLU FFN', 512,  2048, 6, 8, {UseSwiGLU=}true);
+  // SweepNet('SwiGLU 1-token', 1024, 4096, 4, 1, {UseSwiGLU=}true);
   // SweepNet('mid GPT MLP',   768,  3072, 6, 16);
   // SweepNet('wide 1-token',  2048, 8192, 4, 1);
   WriteLn;
