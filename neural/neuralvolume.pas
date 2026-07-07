@@ -518,6 +518,12 @@ type
       // depthwise convolution (product per element instead of a reduction).
       // Coded by Claude (AI).
       class procedure MulAddInt8(PtrA, PtrB: TNeuralFloatArrPtr; PtrCodes: TNeuralInt8ArrPtr; pSize: integer); static;
+      // Fused int8 axpy: PtrA[i] += W * PtrCodes[i], the int8-code twin of
+      // MulAdd(PtrA, PtrB, W, N). The caller folds every per-row scalar
+      // (attention weight, softmax normalizer, the row's quantization scale)
+      // into W, so the codes are never dequantized to memory. Built for the
+      // int8 KV-cache decode value sum. Coded by Claude (AI).
+      class procedure MulAddInt8Scalar(PtrA: TNeuralFloatArrPtr; PtrCodes: TNeuralInt8ArrPtr; W: TNeuralFloat; pSize: integer); static;
       // Int8-weight twin of DotProductsTiled: A rows are int8 codes laid out
       // exactly like the concatenated weights (row r at Codes[r*VectorSize]),
       // Scales[r] is row r's quantization scale (applied once per dot product,
@@ -10134,6 +10140,17 @@ begin
   vHigh := pSize - 1;
   for I := 0 to vHigh do
     PtrA^[I] := PtrA^[I] + PtrCodes^[I] * PtrB^[I];
+end;
+
+class procedure TNNetVolume.MulAddInt8Scalar(PtrA: TNeuralFloatArrPtr;
+  PtrCodes: TNeuralInt8ArrPtr; W: TNeuralFloat; pSize: integer);
+var
+  I: integer;
+  vHigh: integer;
+begin
+  vHigh := pSize - 1;
+  for I := 0 to vHigh do
+    PtrA^[I] := PtrA^[I] + W * PtrCodes^[I];
 end;
 
 procedure TNNetVolume.DotProductsTiledInt8(NumAs, NumBs, VectorSize: integer;
