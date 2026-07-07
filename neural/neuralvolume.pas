@@ -632,6 +632,13 @@ type
     public
       destructor Destroy(); override;
       procedure GroupedDotProductsTiled(Groups, NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
+      // Int8-weight twin of GroupedDotProductsTiled: A rows are int8 codes
+      // laid out exactly like the concatenated weights (row r at
+      // Codes[r*VectorSize]), Scales[r] applied once per dot product. Same
+      // grouped B addressing (input vectors hold VectorSize*Groups, neuron r
+      // reads its group's slice) and same output layout
+      // (FData[CntB*NumAs + CntA]) as the FP32 version. Coded by Claude (AI).
+      procedure GroupedDotProductsTiledInt8(Groups, NumAs, NumBs, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
   end;
 
   { TNNetSamplerBase }
@@ -10164,6 +10171,52 @@ begin
       end;
     end; // A Tiling.
   end; // B Tiling.
+end;
+
+procedure TNNetGroupedVolume.GroupedDotProductsTiledInt8(Groups, NumAs, NumBs,
+  VectorSize: integer; const Codes: array of ShortInt;
+  const Scales: array of TNeuralFloat; VBs: TNNetVolume;
+  TileSizeA, TileSizeB: integer);
+var
+  CntA, CntB: integer;
+  GroupASize, VectorBSize, GroupIdVectorSize: integer;
+  RowBase: integer;
+  PtrA: TNeuralInt8ArrPtr;
+  PtrB: TNeuralFloatArrPtr;
+  // Tiling
+  TileACnt, TileBCnt: integer;
+  StartTileA, EndTileA, StartTileB, EndTileB: integer;
+  MaxTileA, MaxTileB: integer;
+begin
+  GroupASize := NumAs div Groups;
+  VectorBSize := VectorSize * Groups;
+  // Ceil-division tiling with a clamped trailing PARTIAL tile (same contract
+  // as DotProductsTiledInt8), so tile sizes that do not divide the range are
+  // safe.
+  MaxTileA := (NumAs + TileSizeA - 1) div TileSizeA - 1;
+  MaxTileB := (NumBs + TileSizeB - 1) div TileSizeB - 1;
+  for TileBCnt := 0 to MaxTileB do
+  begin
+    StartTileB := TileBCnt * TileSizeB;
+    EndTileB := Min(StartTileB + TileSizeB - 1, NumBs - 1);
+    for TileACnt := 0 to MaxTileA do
+    begin
+      StartTileA := TileACnt * TileSizeA;
+      EndTileA := Min(StartTileA + TileSizeA - 1, NumAs - 1);
+      for CntB := StartTileB to EndTileB do
+      begin
+        RowBase := CntB * NumAs;
+        for CntA := StartTileA to EndTileA do
+        begin
+          GroupIdVectorSize := (CntA div GroupASize) * VectorSize;
+          PtrA := Addr(Codes[CntA * VectorSize]);
+          PtrB := VBs.GetRawPtr(CntB * VectorBSize + GroupIdVectorSize);
+          FData[RowBase + CntA] := DotProductInt8(PtrA, PtrB, VectorSize)
+            * Scales[CntA];
+        end;
+      end;
+    end;
+  end;
 end;
 
 /// In this function, "As" should be weights, "VectorSize" should be the number

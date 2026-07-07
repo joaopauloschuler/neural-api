@@ -159,6 +159,7 @@ type
     procedure TestInt8QuantizeEmbedding;
     procedure TestInt8QuantizeTokenPositionalEmbedding;
     procedure TestInt8QuantizeDepthwiseConv;
+    procedure TestInt8QuantizeGroupedConv;
     procedure TestInt8QuantizedGPT2LogitDrift;
     procedure TestInt8QuantizedLlamaLogitDrift;
     procedure TestInt8QuantizedGPTNeoLogitDrift;
@@ -3736,6 +3737,81 @@ begin
     AssertEquals('output size', OutQ.Size, OutDQ.Size);
     for i := 0 to OutQ.Size - 1 do
       AssertEquals('depthwise quantized forward = FP32-on-dequantized ' +
+        IntToStr(i), OutDQ.FData[i], OutQ.FData[i], 1e-6);
+  finally
+    OutDQ.Free;
+    OutQ.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+// Int8 quantization of the grouped convolution family. Grouped convs
+// inherit the concated-weights int8 storage; their forward GEMM
+// (GroupedDotProductsTiled over the grouped im2col input) gets the int8
+// twin GroupedDotProductsTiledInt8 - codes streamed at 1 byte/element with
+// the per-row scale applied once per dot product, same grouped B
+// addressing. Stacks spatial + pointwise grouped layers (groups=2) with
+// Linear/ReLU/HardSwish activations, padding and stride, and gates
+// quantized forward == FP32-on-dequantized forward plus the inference-only
+// Backpropagate raise. // Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestInt8QuantizeGroupedConv;
+var
+  NN: TNNet;
+  GLayers: array[0..3] of TNNetLayer;
+  Input, OutQ, OutDQ: TNNetVolume;
+  i, n: integer;
+  Raised: boolean;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN.AddLayer( TNNetInput.Create(6, 6, 4) );
+  GLayers[0] := NN.AddLayer(
+    TNNetGroupedConvolutionLinear.Create({Features=}6, {Feature=}3, {Pad=}1,
+      {Stride=}1, {Groups=}2) );
+  GLayers[1] := NN.AddLayer(
+    TNNetGroupedPointwiseConvReLU.Create({Features=}8, {Groups=}2) );
+  GLayers[2] := NN.AddLayer(
+    TNNetGroupedConvolutionReLU.Create({Features=}4, {Feature=}3, {Pad=}0,
+      {Stride=}2, {Groups=}2) );
+  GLayers[3] := NN.AddLayer(
+    TNNetGroupedPointwiseConvHardSwish.Create({Features=}4, {Groups=}2) );
+  Input := TNNetVolume.Create(6, 6, 4);
+  OutQ := TNNetVolume.Create;
+  OutDQ := TNNetVolume.Create;
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.FData[i] := Sin(0.7 * i) * 0.5;
+    NN.UpdateWeights();
+
+    NN.QuantizeWeightsInt8();
+    for n := 0 to High(GLayers) do
+    begin
+      AssertTrue('grouped layer ' + GLayers[n].ClassName + ' quantized',
+        TNNetLayerConcatedWeights(GLayers[n]).WeightsQuantizedInt8);
+      AssertEquals('grouped layer ' + GLayers[n].ClassName +
+        ' FP32 weights released', 1, GLayers[n].Neurons[0].Weights.Size);
+    end;
+
+    NN.Compute(Input);
+    NN.GetOutput(OutQ);
+
+    Raised := false;
+    try
+      GLayers[0].Backpropagate();
+    except
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue('Backpropagate must raise on int8-quantized grouped conv',
+      Raised);
+
+    for n := 0 to High(GLayers) do
+      TNNetLayerConcatedWeights(GLayers[n]).DequantizeWeightsInt8();
+    NN.Compute(Input);
+    NN.GetOutput(OutDQ);
+    AssertEquals('output size', OutQ.Size, OutDQ.Size);
+    for i := 0 to OutQ.Size - 1 do
+      AssertEquals('grouped quantized forward = FP32-on-dequantized ' +
         IntToStr(i), OutDQ.FData[i], OutQ.FData[i], 1e-6);
   finally
     OutDQ.Free;
