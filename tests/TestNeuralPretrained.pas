@@ -156,6 +156,7 @@ type
     procedure TestInt8QuantizeRoundTripAndForward;
     procedure TestInt8QuantizeAliasClasses;
     procedure TestInt8QuantizeRectangularConv;
+    procedure TestInt8QuantizeEmbedding;
     procedure TestInt8QuantizedGPT2LogitDrift;
     procedure TestInt8QuantizedLlamaLogitDrift;
     procedure TestInt8QuantizedGPTNeoLogitDrift;
@@ -3458,6 +3459,128 @@ begin
   finally
     OutDQ.Free;
     OutQ.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+// Int8 quantization of the TNNetEmbedding vocab table - the largest weight
+// block in LLM inference. The embedding stores its table outside the
+// concated-weights storage, so it carries its own int8 container (same
+// per-row symmetric convention); the forward gather dequantizes the
+// looked-up row straight into the output. Gates: (a) TNNet.QuantizeWeightsInt8
+// reaches the embedding, the FP32 table is released and the container holds
+// codes+scales; (b) the quantized gather equals the FP32 gather on the
+// dequantized table exactly, and the drift vs the ORIGINAL table respects
+// the per-row scale/2 bound; (c) token 0 stays a zero row when EncodeZero
+// is off; (d) Backpropagate raises; (e) ResizeTokenEmbeddings on a
+// quantized embedding dequantizes, resizes and requantizes transparently.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestInt8QuantizeEmbedding;
+const
+  Vocab = 11;
+  EmbSize = 8;
+  SeqLen = 6;
+var
+  NN: TNNet;
+  Emb: TNNetEmbedding;
+  Input, OutF, OutQ, OutDQ: TNNetVolume;
+  OrigW: TNNetVolume;
+  i, t, RowBase: integer;
+  Scale, Diff: double;
+  Raised: boolean;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN.AddLayer( TNNetInput.Create(SeqLen) );
+  Emb := TNNetEmbedding(NN.AddLayer(
+    TNNetEmbedding.Create(Vocab, EmbSize) ));
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutF := TNNetVolume.Create;
+  OutQ := TNNetVolume.Create;
+  OutDQ := TNNetVolume.Create;
+  OrigW := TNNetVolume.Create;
+  try
+    // Token 0 (padding, EncodeZero off), a repeat, and the top of the vocab.
+    Input.FData[0] := 3; Input.FData[1] := 0; Input.FData[2] := 10;
+    Input.FData[3] := 3; Input.FData[4] := 7; Input.FData[5] := 1;
+    OrigW.Copy(Emb.Neurons[0].Weights);
+
+    NN.Compute(Input);
+    NN.GetOutput(OutF);
+
+    NN.QuantizeWeightsInt8();
+    AssertTrue('embedding quantized', Emb.WeightsQuantizedInt8);
+    AssertEquals('embedding FP32 table released', 1,
+      Emb.Neurons[0].Weights.Size);
+    AssertEquals('embedding int8 container bytes',
+      Vocab * EmbSize + Vocab * 4, Emb.Int8QuantizedSizeBytes());
+
+    NN.Compute(Input);
+    NN.GetOutput(OutQ);
+    AssertEquals('output size', OutF.Size, OutQ.Size);
+
+    // (c) padding token 0 must stay a zero row on the quantized gather.
+    for i := 0 to EmbSize - 1 do
+      AssertEquals('padding row stays zero ' + IntToStr(i), 0,
+        OutQ.FData[1 * EmbSize + i], 0);
+
+    // (b1) drift vs the original FP32 gather obeys the per-row scale/2
+    // bound (the row's quantization error is the only difference).
+    for t := 0 to SeqLen - 1 do
+    begin
+      RowBase := Round(Input.FData[t]) * EmbSize;
+      Scale := 0;
+      for i := 0 to EmbSize - 1 do
+        if Abs(OrigW.FData[RowBase + i]) > Scale then
+          Scale := Abs(OrigW.FData[RowBase + i]);
+      Scale := Scale / 127;
+      for i := 0 to EmbSize - 1 do
+      begin
+        Diff := Abs(OutQ.FData[t * EmbSize + i] - OutF.FData[t * EmbSize + i]);
+        AssertTrue('embedding drift bound token ' + IntToStr(t) +
+          ' dim ' + IntToStr(i) + ': ' + FloatToStr(Diff),
+          Diff <= Scale * 0.5 + 1e-9);
+      end;
+    end;
+
+    // (d) inference-only contract.
+    Raised := false;
+    try
+      Emb.Backpropagate();
+    except
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue('Backpropagate must raise on int8-quantized embedding', Raised);
+
+    // (b2) dequantize and recompute: identical gather.
+    Emb.DequantizeWeightsInt8();
+    AssertTrue('embedding un-quantized', not Emb.WeightsQuantizedInt8);
+    NN.Compute(Input);
+    NN.GetOutput(OutDQ);
+    for i := 0 to OutQ.Size - 1 do
+      AssertEquals('quantized gather = FP32-on-dequantized-table ' +
+        IntToStr(i), OutDQ.FData[i], OutQ.FData[i], 1e-6);
+
+    // (e) resize while quantized: dequantize -> resize -> requantize.
+    Emb.QuantizeWeightsInt8();
+    AssertTrue('embedding re-quantized', Emb.WeightsQuantizedInt8);
+    AssertTrue('resize returns the embedding',
+      NN.ResizeTokenEmbeddings(Vocab + 4) = Emb);
+    AssertEquals('vocab resized', Vocab + 4, Emb.VocabSize);
+    AssertTrue('still quantized after resize', Emb.WeightsQuantizedInt8);
+    AssertEquals('resized int8 container bytes',
+      (Vocab + 4) * EmbSize + (Vocab + 4) * 4, Emb.Int8QuantizedSizeBytes());
+    NN.Compute(Input);
+    NN.GetOutput(OutDQ);
+    for i := 0 to OutQ.Size - 1 do
+      AssertEquals('gather unchanged for existing tokens after resize ' +
+        IntToStr(i), OutQ.FData[i], OutDQ.FData[i], 1e-6);
+  finally
+    OrigW.Free;
+    OutDQ.Free;
+    OutQ.Free;
+    OutF.Free;
     Input.Free;
     NN.Free;
   end;

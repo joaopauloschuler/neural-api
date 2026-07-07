@@ -12427,7 +12427,12 @@ procedure EnsureWritableImportWeights(Layer: TNNetLayer);
 begin
   if (Layer is TNNetLayerConcatedWeights) and
      TNNetLayerConcatedWeights(Layer).WeightsQuantizedInt8 then
-    TNNetLayerConcatedWeights(Layer).DequantizeWeightsInt8();
+    TNNetLayerConcatedWeights(Layer).DequantizeWeightsInt8()
+  // The embedding keeps its vocab table in its own int8 container (outside
+  // the concated-weights storage), so it needs its own writable-restore.
+  else if (Layer is TNNetEmbedding) and
+     TNNetEmbedding(Layer).WeightsQuantizedInt8 then
+    TNNetEmbedding(Layer).DequantizeWeightsInt8();
 end;
 
 procedure LoadConv1DWeights(Reader: TNNetSafeTensorsReader;
@@ -12615,6 +12620,7 @@ begin
         // wte -> embedding table (vocab rows of d floats, row-major both
         // in the checkpoint and in TNNetEmbedding's neuron volume).
         Reader.LoadTensorFlat(Config.Prefix + 'wte.weight', Tmp);
+        EnsureWritableImportWeights(EmbeddingLayer);
         if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('GPT-2 import: wte.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
@@ -15487,6 +15493,7 @@ begin
         // embed_tokens -> embedding table (vocab rows of d floats,
         // row-major both in the checkpoint and in TNNetEmbedding).
         Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+        EnsureWritableImportWeights(EmbeddingLayer);
         if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('Llama import: embed_tokens.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
@@ -18557,6 +18564,7 @@ begin
       try
         // wte -> embedding table (vocab rows of d floats).
         Reader.LoadTensorFlat(Config.Prefix + 'wte.weight', Tmp);
+        EnsureWritableImportWeights(EmbeddingLayer);
         if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('GPT-Neo import: wte.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
@@ -19214,6 +19222,7 @@ begin
       try
         // embed_in -> embedding table (vocab rows of d floats).
         Reader.LoadTensorFlat(Config.Prefix + 'embed_in.weight', Tmp);
+        EnsureWritableImportWeights(EmbeddingLayer);
         if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('GPT-NeoX import: embed_in.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
@@ -19678,6 +19687,7 @@ begin
       try
         // embed_tokens -> embedding table (vocab rows of word_embed_proj_dim).
         Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+        EnsureWritableImportWeights(EmbeddingLayer);
         if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('OPT import: embed_tokens.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
@@ -20161,6 +20171,7 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+        EnsureWritableImportWeights(EmbeddingLayer);
         if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('Starcoder2 import: embed_tokens.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
@@ -20564,6 +20575,7 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat(Config.Prefix + 'wte.weight', Tmp);
+        EnsureWritableImportWeights(EmbeddingLayer);
         if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('GPT-BigCode import: wte.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
@@ -21027,6 +21039,7 @@ begin
       try
         // wte -> embedding table (vocab rows of d floats).
         Reader.LoadTensorFlat(Config.Prefix + 'wte.weight', Tmp);
+        EnsureWritableImportWeights(EmbeddingLayer);
         if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('GPT-J import: wte.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
@@ -21610,6 +21623,7 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+        EnsureWritableImportWeights(EmbeddingLayer);
         if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('Cohere import: embed_tokens.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
@@ -22168,6 +22182,7 @@ begin
       try
         // embed_tokens -> embedding table (vocab rows of d floats).
         Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+        EnsureWritableImportWeights(EmbeddingLayer);
         if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('Phi import: embed_tokens.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
@@ -22486,6 +22501,7 @@ var
     Tmp := TNNetVolume.Create;
     try
       Reader.LoadTensorFlat(TName, Tmp);
+      EnsureWritableImportWeights(Layer);
       UsedSize := (Rows - SrcRowOffset) * Cols;
       UsedMax := UsedSize - 1;
       if Layer.FArrNeurons[0].Weights.Size <> UsedSize then
@@ -25352,6 +25368,7 @@ var
     Tmp := TNNetVolume.Create;
     try
       Reader.LoadTensorFlat(TName, Tmp);
+      EnsureWritableImportWeights(Layer);
       Layer.FArrNeurons[0].Weights.Copy(Tmp);
       Layer.FlushWeightCache();
     finally
@@ -26807,6 +26824,7 @@ begin
     Tmp := TNNetVolume.Create;
     try
       Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+      EnsureWritableImportWeights(EmbeddingLayer);
       if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
         ImportError('gpt-oss import: embed_tokens.weight element count ' +
           IntToStr(Tmp.Size) + ' <> embedding table size ' +
@@ -27633,6 +27651,8 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat('shared.weight', Tmp);
+        EnsureWritableImportWeights(EncEmbed);
+        EnsureWritableImportWeights(DecEmbed);
         if EncEmbed.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('T5 import: shared.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
@@ -28275,6 +28295,8 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat('model.shared.weight', Tmp);
+        EnsureWritableImportWeights(EncEmbed);
+        EnsureWritableImportWeights(DecEmbed);
         if EncEmbed.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('Marian import: model.shared.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
@@ -29561,6 +29583,8 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat('model.shared.weight', Tmp);
+        EnsureWritableImportWeights(EncEmbed);
+        EnsureWritableImportWeights(DecEmbed);
         if EncEmbed.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('BART import: model.shared.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
@@ -30103,6 +30127,7 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat('model.shared.weight', Tmp);
+        EnsureWritableImportWeights(DecEmbed);
         if Config.Bart.ScaleEmbedding then EmbedScale := Sqrt(BC.DModel)
         else EmbedScale := 1.0;
         VocabSizeM1 := BC.VocabSize - 1;
@@ -33671,6 +33696,8 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat('model.shared.weight', Tmp);
+        EnsureWritableImportWeights(EncEmbed);
+        EnsureWritableImportWeights(DecEmbed);
         if EncEmbed.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('Pegasus import: model.shared.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
@@ -34031,6 +34058,8 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat('model.shared.weight', Tmp);
+        EnsureWritableImportWeights(EncEmbed);
+        EnsureWritableImportWeights(DecEmbed);
         if EncEmbed.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('mBART import: model.shared.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
@@ -34407,6 +34436,8 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat('model.shared.weight', Tmp);
+        EnsureWritableImportWeights(EncEmbed);
+        EnsureWritableImportWeights(DecEmbed);
         if EncEmbed.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('M2M100 import: model.shared.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
@@ -35302,6 +35333,7 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat('shared.weight', Tmp);
+        EnsureWritableImportWeights(DecEmbed);
         if Config.ScaleEmbedding then EmbedScale := Sqrt(Hidden)
         else EmbedScale := 1.0;
         LpMax := Tmp.Size - 1;
@@ -35957,6 +35989,7 @@ begin
         // folds sqrt(d_model) into the embedding rows like Marian; every
         // released Whisper has it false.
         Reader.LoadTensorFlat('model.decoder.embed_tokens.weight', Tmp);
+        EnsureWritableImportWeights(DecEmbed);
         if DecEmbed.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('Whisper import: embed_tokens element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
@@ -39163,6 +39196,7 @@ begin
 
       // ---------------- Weights ----------------
       Reader.LoadTensorFlat('decoder.embed_tokens.weight', EmbedTmp);
+      EnsureWritableImportWeights(DecEmbed);
       if DecEmbed.FArrNeurons[0].Weights.Size <> EmbedTmp.Size then
         ImportError('Moonshine import: decoder.embed_tokens.weight element ' +
           'count ' + IntToStr(EmbedTmp.Size) + ' does not match the ' +
@@ -46403,6 +46437,7 @@ begin
 
       // ---------------- Weights ----------------
       Reader.LoadTensorFlat(Config.Prefix + 'embeddings.weight', Tmp);
+      EnsureWritableImportWeights(EmbeddingLayer);
       if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
         ImportError('RWKV import: embeddings.weight element count ' +
           IntToStr(Tmp.Size) + ' does not match the embedding table ' +
@@ -46915,6 +46950,7 @@ begin
 
       // ---------------- Weights ----------------
       Reader.LoadTensorFlat(Config.Prefix + 'embeddings.weight', Tmp);
+      EnsureWritableImportWeights(EmbeddingLayer);
       if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
         ImportError('Mamba import: embeddings.weight element count ' +
           IntToStr(Tmp.Size) + ' does not match the embedding table ' +
@@ -47870,6 +47906,7 @@ begin
 
       // ---------------- Weights ----------------
       Reader.LoadTensorFlat(Config.Prefix + 'embeddings.weight', Tmp);
+      EnsureWritableImportWeights(EmbeddingLayer);
       EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
       EmbeddingLayer.FlushWeightCache();
       MarkConsumed(Config.Prefix + 'embeddings.weight');
@@ -48435,6 +48472,7 @@ begin
         LMHead.FArrNeurons[j].BiasWeight := 0;
       end;
       LMHead.FlushWeightCache();
+      EnsureWritableImportWeights(EmbeddingLayer);
       EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
       EmbeddingLayer.FArrNeurons[0].Weights.Mul(Sqrt(Config.HiddenSize));
       EmbeddingLayer.FlushWeightCache();
@@ -49013,6 +49051,7 @@ begin
 
       // ---------------- Weights ----------------
       Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+      EnsureWritableImportWeights(EmbeddingLayer);
       if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
         ImportError('Jamba import: embed_tokens.weight size mismatch.');
       EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
@@ -49755,6 +49794,7 @@ begin
 
       // ---------------- Weights ----------------
       Reader.LoadTensorFlat(Config.Prefix + 'embeddings.weight', Tmp);
+      EnsureWritableImportWeights(EmbeddingLayer);
       EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
       EmbeddingLayer.FlushWeightCache();
       MarkConsumed(Config.Prefix + 'embeddings.weight');
@@ -50241,6 +50281,7 @@ begin
         // (BloomForCausalLM ships no separate lm_head tensor; logits =
         // h . word_embeddings^T, bias-free).
         Reader.LoadTensorFlat(Config.Prefix + 'word_embeddings.weight', Tmp);
+        EnsureWritableImportWeights(EmbeddingLayer);
         if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('BLOOM import: word_embeddings.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table ' +
@@ -50772,6 +50813,7 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat(Config.Prefix + 'word_embeddings.weight', Tmp);
+        EnsureWritableImportWeights(EmbeddingLayer);
         if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('Falcon import: word_embeddings.weight element count ' +
             IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
@@ -51459,6 +51501,7 @@ begin
       try
         Reader.LoadTensorFlat(
           Config.Prefix + 'embeddings.tok_embeddings.weight', Tmp);
+        EnsureWritableImportWeights(EmbeddingLayer);
         if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('ModernBERT import: tok_embeddings.weight element ' +
             'count ' + IntToStr(Tmp.Size) + ' does not match the ' +
@@ -52106,6 +52149,7 @@ begin
       Tmp := TNNetVolume.Create;
       try
         Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+        EnsureWritableImportWeights(EmbeddingLayer);
         if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
           ImportError('DeepSeek-V2 import: embed_tokens.weight element ' +
             'count ' + IntToStr(Tmp.Size) + ' does not match the ' +
@@ -52488,6 +52532,7 @@ begin
   Tmp := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(TName, Tmp);
+    EnsureWritableImportWeights(Layer);
     if Layer.FArrNeurons[0].Weights.Size <> Rows * Cols then
       ImportError('CLIP import: "' + TName + '" element count ' +
         IntToStr(Rows * Cols) + ' does not match the table size ' +
@@ -53880,6 +53925,7 @@ begin
           'text_decoder.bert.embeddings.word_embeddings.weight', Tmp);
         if Tmp.Size <> Config.VocabSize * d then
           ImportError('BLIP import: word_embeddings size mismatch.');
+        EnsureWritableImportWeights(WordEmb);
         WordEmb.FArrNeurons[0].Weights.Copy(Tmp);
         WordEmb.FlushWeightCache();
         Reader.LoadTensorFlat(
@@ -61930,6 +61976,7 @@ var
     Tmp := TNNetVolume.Create;
     try
       Reader.LoadTensorFlat(TName, Tmp);
+      EnsureWritableImportWeights(Layer);
       UsedSize := (Rows - SrcRowOffset) * Cols;
       UsedSizeM1 := UsedSize - 1;
       if SrcRowOffset = 0 then Layer.FArrNeurons[0].Weights.Copy(Tmp)
