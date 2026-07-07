@@ -268,6 +268,19 @@ type
       /// Coded by Claude (AI).
       FIm2ColSrcBuffer: cl_mem;
       FCapIm2ColSrc: csize_t;
+      /// INT8 WEIGHT MODE (cai_dot_product_int8). The A operand is per-row
+      /// symmetric int8 codes + per-row FP32 scales, both RESIDENT and
+      /// IMMUTABLE (quantized layers are inference-only, so unlike the FP32
+      /// weights they are uploaded exactly once, at PrepareForComputeInt8
+      /// time, and never re-uploaded). FInt8Kernel binds the int8 kernel
+      /// entry point against the same compiled neural.cl program; buffers
+      /// and enqueues ride the shared in-order queue via FDotProductKernel.
+      /// Coded by Claude (AI).
+      FInt8Kernel: TNeuralKernel;
+      FCodesBuffer: cl_mem;
+      FScalesBuffer: cl_mem;
+      FCapCodes, FCapScales: csize_t;
+      FInt8Ready: boolean;
 
       FDotProductKernel: TDotProductKernel;
 
@@ -296,12 +309,31 @@ type
       procedure BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel; SrcVol: TNNetVolume;
         OutSizeX, ColDepth, RowSpan, InSizeX, InDepth, Stride: longint; NewSrc: boolean = true);
       procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint; NewVAs:boolean = true; NewVBs:boolean = true; VBias: TNNetVolume = nil; NewVBias: boolean = true);
+      /// Arms the int8 weight mode: binds cai_dot_product_int8, uploads the
+      /// interleaved codes (pCodes, NumAs*pSize bytes, layout
+      /// codes[a + i*NumAs]) and per-row scales (pScales, NumAs floats) as
+      /// resident immutable buffers, and sizes the B/result buffers for VBs.
+      /// Blocking uploads: the caller's staging arrays may be freed on
+      /// return. Coded by Claude (AI).
+      function PrepareForComputeInt8(pCodes, pScales: Pointer;
+        NumAs, pSize: longint; VBs: TNNetVolume): integer;
+      /// Int8 twin of Compute: same B upload, fused bias and activation
+      /// semantics, but the A operand is the resident code buffer and the
+      /// per-row scales ride as kernel arg 10 (deferred dequantization).
+      /// Coded by Claude (AI).
+      procedure ComputeInt8(VBs: TNNetVolume; pActFN: longint;
+        NewVBs: boolean = true; VBias: TNNetVolume = nil;
+        NewVBias: boolean = true);
       procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
 
       /// The underlying device kernel shared by this instance. Exposed so a layer
       /// can spin up a second TDotProductSharedKernel (e.g. a dedicated backward
       /// instance) bound to the same kernel without re-deriving it.
       property DotProductKernel: TDotProductKernel read FDotProductKernel;
+      /// True after a successful PrepareForComputeInt8 (cleared by
+      /// UnprepareForCompute). Layers gate their int8 device route on this,
+      /// falling back to the fused CPU path when unarmed.
+      property Int8Ready: boolean read FInt8Ready;
   end;
 
   /// Class that does dot products via OpenCL
@@ -435,6 +467,9 @@ end;
 destructor TDotProductSharedKernel.Destroy();
 begin
   UnprepareForCompute();
+  // Owns only the int8 kernel HANDLE; the program/queue behind it are the
+  // shared FDotProductKernel's (see TNeuralKernel.CreateFromProgram).
+  FInt8Kernel.Free;
   inherited Destroy();
 end;
 
@@ -445,18 +480,25 @@ begin
   if Assigned(FResultBuffer)  then clReleaseMemObject(FResultBuffer);
   if Assigned(FBiasBuffer)    then clReleaseMemObject(FBiasBuffer);
   if Assigned(FIm2ColSrcBuffer) then clReleaseMemObject(FIm2ColSrcBuffer);
+  if Assigned(FCodesBuffer)   then clReleaseMemObject(FCodesBuffer);
+  if Assigned(FScalesBuffer)  then clReleaseMemObject(FScalesBuffer);
 
   FInputBufferAs := nil;
   FInputBufferBs := nil;
   FResultBuffer  := nil;
   FBiasBuffer    := nil;
   FIm2ColSrcBuffer := nil;
+  FCodesBuffer   := nil;
+  FScalesBuffer  := nil;
 
   FCapAs := 0;
   FCapBs := 0;
   FCapResult := 0;
   FCapBias := 0;
   FCapIm2ColSrc := 0;
+  FCapCodes := 0;
+  FCapScales := 0;
+  FInt8Ready := false;
 end;
 
 // Grow-only buffer management for the per-forward attention/gram callers. Unlike
@@ -721,6 +763,122 @@ begin
       ' FSize: ' + IntToStr(FSize) +
       ' NumAs:' + IntToStr(FNumAs)
     );
+  end;
+end;
+
+function TDotProductSharedKernel.PrepareForComputeInt8(pCodes, pScales: Pointer;
+  NumAs, pSize: longint; VBs: TNNetVolume): integer;
+var
+  NeededCodes, NeededScales, NeededResult: csize_t;
+  err: integer;
+begin
+  UnprepareForCompute();
+  if not Assigned(FInt8Kernel) then
+    FInt8Kernel := TNeuralKernel.CreateFromProgram(FDotProductKernel,
+      'cai_dot_product_int8');
+  FNumAs := NumAs;
+  FNumBs := VBs.Size div pSize;
+  FThreadCount := FNumAs * FNumBs;
+  FSize := pSize;
+  FGroupSizeA := 0;
+  FGroupSizeB := 0;
+
+  NeededCodes := FNumAs * FSize; // 1 byte per code
+  NeededScales := FNumAs * csNeuralFloatSize;
+  NeededResult := FNumAs * FNumBs * csNeuralFloatSize;
+
+  FCodesBuffer := FDotProductKernel.CreateInputBuffer(NeededCodes);
+  FScalesBuffer := FDotProductKernel.CreateInputBuffer(NeededScales);
+  FInputBufferBs := FDotProductKernel.CreateInputBuffer(VBs);
+  FResultBuffer := FDotProductKernel.CreateOutputBuffer(NeededResult);
+  FCapCodes := NeededCodes;
+  FCapScales := NeededScales;
+  FCapBs := VBs.GetMemSize();
+  FCapResult := NeededResult;
+
+  // One-time blocking uploads: the codes/scales never change afterwards
+  // (quantized layers are inference-only) and the caller's staging arrays
+  // may be freed as soon as this returns.
+  err := FDotProductKernel.WriteBuffer(FCodesBuffer, NeededCodes, pCodes, CL_TRUE);
+  err := err or FDotProductKernel.WriteBuffer(FScalesBuffer, NeededScales,
+    pScales, CL_TRUE);
+  if (err <> CL_SUCCESS) then
+    ErrorProc('Error: PrepareForComputeInt8 - failed uploading codes/scales: '
+      + IntToStr(err));
+
+  FPreviousComputeTime := 0;
+  FInt8Ready := (err = CL_SUCCESS);
+  PrepareForComputeInt8 := err;
+end;
+
+procedure TDotProductSharedKernel.ComputeInt8(VBs: TNNetVolume;
+  pActFN: longint; NewVBs: boolean = true; VBias: TNNetVolume = nil;
+  NewVBias: boolean = true);
+var
+  err: integer;
+  UseBias: longint;
+  NeededBias: csize_t;
+  K: cl_kernel;
+begin
+  if not FInt8Ready then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeInt8 without ' +
+      'PrepareForComputeInt8.');
+    exit;
+  end;
+  if (VBs.Size <> FSize * FNumBs) then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeInt8 - VB size: ' +
+      IntToStr(VBs.Size) + ' FSize: ' + IntToStr(FSize) +
+      ' NumBs:' + IntToStr(FNumBs));
+    exit;
+  end;
+  FActFun := pActFN;
+  K := FInt8Kernel.Kernel;
+
+  err := clSetKernelArg(K, 0, csLongintSize, @FThreadCount);
+  err := err or clSetKernelArg(K, 1, csLongintSize, @FNumAs);
+  err := err or clSetKernelArg(K, 2, csLongintSize, @FNumBs);
+  err := err or clSetKernelArg(K, 3, csLongintSize, @FSize);
+  err := err or clSetKernelArg(K, 4, csLongintSize, @FActFun);
+  err := err or clSetKernelArg(K, 5, csCLMemSize, @FCodesBuffer);
+  err := err or clSetKernelArg(K, 6, csCLMemSize, @FInputBufferBs);
+  err := err or clSetKernelArg(K, 7, csCLMemSize, @FResultBuffer);
+
+  // Fused bias: same contract as Compute (args 8/9 must always be set; a
+  // bias-less caller passes UseBias=0 and a NULL buffer the kernel never
+  // reads). Resident grow-only buffer, re-uploaded only when NewVBias or
+  // just (re)allocated.
+  if VBias <> nil then
+  begin
+    NeededBias := VBias.GetMemSize();
+    if (FBiasBuffer = nil) or (NeededBias > FCapBias) then
+    begin
+      if Assigned(FBiasBuffer) then clReleaseMemObject(FBiasBuffer);
+      FBiasBuffer := FDotProductKernel.CreateInputBuffer(NeededBias);
+      FCapBias := NeededBias;
+      NewVBias := true; // fresh/grown buffer: force upload regardless of caller
+    end;
+    if NewVBias then err := err or FDotProductKernel.WriteBuffer(FBiasBuffer, VBias);
+    UseBias := 1;
+  end
+  else
+    UseBias := 0;
+
+  err := err or clSetKernelArg(K, 8, csLongintSize, @UseBias);
+  err := err or clSetKernelArg(K, 9, csCLMemSize, @FBiasBuffer);
+  err := err or clSetKernelArg(K, 10, csCLMemSize, @FScalesBuffer);
+
+  if NewVBs then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
+
+  if err = CL_SUCCESS then
+  begin
+    FDotProductKernel.RunKernel2D(K, FNumAs, FNumBs);
+  end
+  else
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeInt8 - ' +
+      'failed setting parameters: ' + IntToStr(err));
   end;
 end;
 
