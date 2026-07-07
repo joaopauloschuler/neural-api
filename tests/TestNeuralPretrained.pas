@@ -155,6 +155,7 @@ type
     procedure TestSetTrainableKeepsOutputs;
     procedure TestInt8QuantizeRoundTripAndForward;
     procedure TestInt8QuantizeAliasClasses;
+    procedure TestInt8QuantizeRectangularConv;
     procedure TestInt8QuantizedGPT2LogitDrift;
     procedure TestInt8QuantizedLlamaLogitDrift;
     procedure TestInt8QuantizedGPTNeoLogitDrift;
@@ -3395,6 +3396,64 @@ begin
     AssertEquals('output size', OutQ.Size, OutDQ.Size);
     for i := 0 to OutQ.Size - 1 do
       AssertEquals('alias quantized forward = FP32-on-dequantized-weights ' +
+        IntToStr(i), OutDQ.FData[i], OutQ.FData[i], 1e-6);
+  finally
+    OutDQ.Free;
+    OutQ.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+// Rectangular (asymmetric-kernel) convolutions inherit the square conv's
+// im2col forward unchanged - the int8 codes quantize the same flattened
+// FeatureSizeX*FeatureSizeY*InDepth row - but the exact-class gate in
+// TNNet.QuantizeWeightsInt8 used to exclude them. This stacks a 3x1 and a
+// 1x3 factorized pair (the shapes the class exists for), quantizes, and
+// asserts the layers flip to int8 storage and the quantized forward equals
+// the FP32 forward on the dequantized weights. // Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestInt8QuantizeRectangularConv;
+var
+  NN: TNNet;
+  RectLayers: array[0..1] of TNNetLayer;
+  Input, OutQ, OutDQ: TNNetVolume;
+  i, n: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN.AddLayer( TNNetInput.Create(7, 6, 3) );
+  RectLayers[0] := NN.AddLayer(
+    TNNetConvolutionRectangular.Create({Features=}4, {SizeX=}3, {SizeY=}1,
+      {Padding=}1, {Stride=}1) );
+  RectLayers[1] := NN.AddLayer(
+    TNNetConvolutionRectangularReLU.Create({Features=}3, {SizeX=}1, {SizeY=}3,
+      {Padding=}0, {Stride=}1) );
+  Input := TNNetVolume.Create(7, 6, 3);
+  OutQ := TNNetVolume.Create;
+  OutDQ := TNNetVolume.Create;
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.FData[i] := Sin(0.7 * i) * 0.5;
+
+    NN.QuantizeWeightsInt8();
+    for n := 0 to High(RectLayers) do
+    begin
+      AssertTrue('rect layer ' + RectLayers[n].ClassName + ' quantized',
+        TNNetLayerConcatedWeights(RectLayers[n]).WeightsQuantizedInt8);
+      AssertEquals('rect layer ' + RectLayers[n].ClassName +
+        ' FP32 weights released', 1, RectLayers[n].Neurons[0].Weights.Size);
+    end;
+
+    NN.Compute(Input);
+    NN.GetOutput(OutQ);
+
+    for n := 0 to High(RectLayers) do
+      TNNetLayerConcatedWeights(RectLayers[n]).DequantizeWeightsInt8();
+    NN.Compute(Input);
+    NN.GetOutput(OutDQ);
+    AssertEquals('output size', OutQ.Size, OutDQ.Size);
+    for i := 0 to OutQ.Size - 1 do
+      AssertEquals('rect quantized forward = FP32-on-dequantized-weights ' +
         IntToStr(i), OutDQ.FData[i], OutQ.FData[i], 1e-6);
   finally
     OutDQ.Free;

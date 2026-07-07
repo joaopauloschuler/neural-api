@@ -62217,8 +62217,11 @@ procedure TTestNeuralNumerical.TestInt8QuantizedOpenCLParity;
     end;
   end;
 
-  procedure RunConv(const aName: string; pFeatureSize, pPadding, pStride: integer;
-    UseReLU: boolean);
+  // pFeatureSizeY = 0 builds the square TNNetConvolution(Linear/ReLU); a
+  // nonzero pFeatureSizeY builds the rectangular sibling with independent
+  // X/Y kernel extents (same inherited int8 forward, asymmetric geometry).
+  procedure RunConv(const aName: string; pFeatureSize, pFeatureSizeY,
+    pPadding, pStride: integer; UseReLU: boolean);
   var
     NN: TNNet;
     Input, OutCPU: TNNetVolume;
@@ -62241,7 +62244,15 @@ procedure TTestNeuralNumerical.TestInt8QuantizedOpenCLParity;
     OutCPU := TNNetVolume.Create();
     try
       NN.AddLayer(TNNetInput.Create(8, 8, 3, 1));
-      if UseReLU
+      if pFeatureSizeY > 0 then
+      begin
+        if UseReLU
+          then Conv := TNNetConvolutionRectangularReLU.Create(16, pFeatureSize,
+            pFeatureSizeY, pPadding, pStride)
+          else Conv := TNNetConvolutionRectangular.Create(16, pFeatureSize,
+            pFeatureSizeY, pPadding, pStride);
+      end
+      else if UseReLU
         then Conv := TNNetConvolutionReLU.Create(16, pFeatureSize, pPadding, pStride)
         else Conv := TNNetConvolutionLinear.Create(16, pFeatureSize, pPadding, pStride);
       NN.AddLayer(Conv);
@@ -62287,10 +62298,13 @@ begin
   RunFC('ReLU bias', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0);
   RunFC('Sigmoid bias', @Sigmoid, @SigmoidDerivative, 0);
   RunFC('Tanh nobias', @HiperbolicTangent, @HiperbolicTangentDerivative, 1);
-  RunConv('3x3 pad1 s1 relu', 3, 1, 1, true);
-  RunConv('3x3 pad0 s1 linear', 3, 0, 1, false);
-  RunConv('5x5 pad2 s2 relu', 5, 2, 2, true);
-  RunConv('1x1 pointwise linear', 1, 0, 1, false);
+  RunConv('3x3 pad1 s1 relu', 3, 0, 1, 1, true);
+  RunConv('3x3 pad0 s1 linear', 3, 0, 0, 1, false);
+  RunConv('5x5 pad2 s2 relu', 5, 0, 2, 2, true);
+  RunConv('1x1 pointwise linear', 1, 0, 0, 1, false);
+  RunConv('rect 3x1 pad1 s1 relu', 3, 1, 1, 1, true);
+  RunConv('rect 1x3 pad0 s1 linear', 1, 3, 0, 1, false);
+  RunConv('rect 5x3 pad2 s2 relu', 5, 3, 2, 2, true);
 end;
 {$ELSE}
 begin
