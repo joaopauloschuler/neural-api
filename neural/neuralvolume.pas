@@ -523,7 +523,15 @@ type
       // Scales[r] is row r's quantization scale (applied once per dot product,
       // fused into the output store). Same tiling and same output layout
       // (FData[CntB*NumAs + CntA]) as the FP32 version. Coded by Claude (AI).
-      procedure DotProductsTiledInt8(NumAs, NumBs, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
+      procedure DotProductsTiledInt8(NumAs, NumBs, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer); overload;
+      // Ranged twin (same contract as the ranged DotProductsTiled): computes
+      // only B columns [BStart..BFinish] and A rows [AStart..AFinish], with
+      // ceil-division tiling anchored at the range start and a clamped trailing
+      // partial tile. NumAs stays the output row stride, so a sliced call
+      // writes exactly its own output elements - this is what the intra-layer
+      // chunk scheduler calls (position-axis chunks range B, neuron-axis
+      // chunks range A). AFinish < 0 means all rows. Coded by Claude (AI).
+      procedure DotProductsTiledInt8(NumAs, BStart, BFinish, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
       procedure PointwiseNorm(pNorms: TNNetVolume = nil);
       procedure PointwiseMul(pNorms: TNNetVolume);
       // VectorExp writes dst[0..N-1] := exp(src[0..N-1]). On an AVX2 build it
@@ -10131,6 +10139,16 @@ end;
 procedure TNNetVolume.DotProductsTiledInt8(NumAs, NumBs, VectorSize: integer;
   const Codes: array of ShortInt; const Scales: array of TNeuralFloat;
   VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
+begin
+  DotProductsTiledInt8(NumAs, 0, NumBs - 1, VectorSize, Codes, Scales, VBs,
+    TileSizeA, TileSizeB);
+end;
+
+procedure TNNetVolume.DotProductsTiledInt8(NumAs, BStart, BFinish,
+  VectorSize: integer;
+  const Codes: array of ShortInt; const Scales: array of TNeuralFloat;
+  VBs: TNNetVolume; TileSizeA, TileSizeB: integer;
+  AStart: integer = 0; AFinish: integer = -1);
 var
   CntA, CntB: integer;
   RowBase, AOfs: integer;
@@ -10141,19 +10159,21 @@ var
   StartTileA, EndTileA, StartTileB, EndTileB: integer;
   MaxTileA, MaxTileB: integer;
 begin
-  // Ceil-division tiling with a clamped trailing PARTIAL tile (same contract
-  // as the ranged DotProductsTiled), so tile sizes that do not divide the
-  // range are safe.
-  MaxTileA := (NumAs + TileSizeA - 1) div TileSizeA - 1;
-  MaxTileB := (NumBs + TileSizeB - 1) div TileSizeB - 1;
+  // Ceil-division tiling anchored at the range start with a clamped trailing
+  // PARTIAL tile (same contract as the ranged DotProductsTiled), so tile sizes
+  // that do not divide the range are safe. NumAs stays the output row stride,
+  // so a sliced call writes exactly its own output elements.
+  if AFinish < 0 then AFinish := NumAs - 1;
+  MaxTileA := ((AFinish - AStart + 1) + TileSizeA - 1) div TileSizeA - 1;
+  MaxTileB := ((BFinish - BStart + 1) + TileSizeB - 1) div TileSizeB - 1;
   for TileBCnt := 0 to MaxTileB do
   begin
-    StartTileB := TileBCnt * TileSizeB;
-    EndTileB := Min(StartTileB + TileSizeB - 1, NumBs - 1);
+    StartTileB := BStart + TileBCnt * TileSizeB;
+    EndTileB := Min(StartTileB + TileSizeB - 1, BFinish);
     for TileACnt := 0 to MaxTileA do
     begin
-      StartTileA := TileACnt * TileSizeA;
-      EndTileA := Min(StartTileA + TileSizeA - 1, NumAs - 1);
+      StartTileA := AStart + TileACnt * TileSizeA;
+      EndTileA := Min(StartTileA + TileSizeA - 1, AFinish);
       for CntB := StartTileB to EndTileB do
       begin
         PtrB := VBs.GetRawPtr(CntB*VectorSize);
