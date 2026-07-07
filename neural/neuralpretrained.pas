@@ -15083,6 +15083,13 @@ begin
 
       // ---------------- Architecture ----------------
       NN := TNNet.Create();
+      // Arm BEFORE the first AddLayer so every eligible layer skips the
+      // FP32 weight allocation from the very first block (the per-block
+      // QuantizeWeightsInt8 sweeps below would arm it anyway, but only
+      // after block 0 was built FP32). With the flag armed, attaching a
+      // projection/MLP/LM-head layer allocates the int8 container
+      // directly - the process never touches the FP32 weight footprint.
+      NN.BuildQuantInt8 := pQuantizeInt8;
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real token (<unk> in the Llama vocab),
       // not padding.
