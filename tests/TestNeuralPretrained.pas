@@ -157,6 +157,7 @@ type
     procedure TestInt8QuantizeAliasClasses;
     procedure TestInt8QuantizeRectangularConv;
     procedure TestInt8QuantizeEmbedding;
+    procedure TestInt8QuantizeTokenPositionalEmbedding;
     procedure TestInt8QuantizedGPT2LogitDrift;
     procedure TestInt8QuantizedLlamaLogitDrift;
     procedure TestInt8QuantizedGPTNeoLogitDrift;
@@ -3576,6 +3577,94 @@ begin
     for i := 0 to OutQ.Size - 1 do
       AssertEquals('gather unchanged for existing tokens after resize ' +
         IntToStr(i), OutQ.FData[i], OutDQ.FData[i], 1e-6);
+  finally
+    OrigW.Free;
+    OutDQ.Free;
+    OutQ.Free;
+    OutF.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+// Int8 quantization of TNNetTokenAndPositionalEmbedding: only the inherited
+// token table quantizes (the positional table is COMPUTED sinusoidal data,
+// rebuilt in SetPrevLayer - not weights), and the int8 gather adds the FP32
+// positional row on top of the dequantized token row. Gates: quantized
+// forward equals FP32-on-dequantized forward exactly; the drift vs the
+// original FP32 forward obeys the token row's scale/2 bound (the positional
+// add is common to both paths); a zero-padded token gets NEITHER table.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestInt8QuantizeTokenPositionalEmbedding;
+const
+  Vocab = 9;
+  EmbSize = 8;
+  SeqLen = 5;
+var
+  NN: TNNet;
+  Emb: TNNetTokenAndPositionalEmbedding;
+  Input, OutF, OutQ, OutDQ: TNNetVolume;
+  OrigW: TNNetVolume;
+  i, t, RowBase: integer;
+  Scale, Diff: double;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN.AddLayer( TNNetInput.Create(SeqLen) );
+  Emb := TNNetTokenAndPositionalEmbedding(NN.AddLayer(
+    TNNetTokenAndPositionalEmbedding.Create(Vocab, EmbSize) ));
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutF := TNNetVolume.Create;
+  OutQ := TNNetVolume.Create;
+  OutDQ := TNNetVolume.Create;
+  OrigW := TNNetVolume.Create;
+  try
+    Input.FData[0] := 4; Input.FData[1] := 0; Input.FData[2] := 8;
+    Input.FData[3] := 4; Input.FData[4] := 1;
+    OrigW.Copy(Emb.Neurons[0].Weights);
+
+    NN.Compute(Input);
+    NN.GetOutput(OutF);
+
+    NN.QuantizeWeightsInt8();
+    AssertTrue('token+pos embedding quantized', Emb.WeightsQuantizedInt8);
+    AssertEquals('token table released', 1, Emb.Neurons[0].Weights.Size);
+
+    NN.Compute(Input);
+    NN.GetOutput(OutQ);
+    AssertEquals('output size', OutF.Size, OutQ.Size);
+
+    // Zero-padded token 0 gets neither table (matches the FP32 path).
+    for i := 0 to EmbSize - 1 do
+      AssertEquals('padding row stays zero ' + IntToStr(i), 0,
+        OutQ.FData[1 * EmbSize + i], 0);
+
+    // Drift bound: positional add is identical in both paths, so the
+    // difference is exactly the token row's quantization error.
+    for t := 0 to SeqLen - 1 do
+    begin
+      RowBase := Round(Input.FData[t]) * EmbSize;
+      Scale := 0;
+      for i := 0 to EmbSize - 1 do
+        if Abs(OrigW.FData[RowBase + i]) > Scale then
+          Scale := Abs(OrigW.FData[RowBase + i]);
+      Scale := Scale / 127;
+      for i := 0 to EmbSize - 1 do
+      begin
+        Diff := Abs(OutQ.FData[t * EmbSize + i] - OutF.FData[t * EmbSize + i]);
+        AssertTrue('token+pos drift bound token ' + IntToStr(t) +
+          ' dim ' + IntToStr(i) + ': ' + FloatToStr(Diff),
+          Diff <= Scale * 0.5 + 1e-9);
+      end;
+    end;
+
+    // Exact parity vs the FP32 forward on the dequantized table.
+    Emb.DequantizeWeightsInt8();
+    NN.Compute(Input);
+    NN.GetOutput(OutDQ);
+    for i := 0 to OutQ.Size - 1 do
+      AssertEquals('quantized forward = FP32-on-dequantized-table ' +
+        IntToStr(i), OutDQ.FData[i], OutQ.FData[i], 1e-6);
   finally
     OrigW.Free;
     OutDQ.Free;
