@@ -510,6 +510,14 @@ type
       // registers); every other build runs the pure Pascal loop.
       // Coded by Claude (AI).
       class function DotProductInt8(PtrA: TNeuralInt8ArrPtr; PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
+      // Fused int8-weight x float32-input elementwise multiply-accumulate:
+      // PtrA[i] += PtrCodes[i] * PtrB[i], with NO scale applied - the caller
+      // multiplies the accumulated result by the per-row quantization scale
+      // once (every tap of a row shares it), so the codes are never
+      // dequantized to memory. Channelwise sibling of DotProductInt8 for the
+      // depthwise convolution (product per element instead of a reduction).
+      // Coded by Claude (AI).
+      class procedure MulAddInt8(PtrA, PtrB: TNeuralFloatArrPtr; PtrCodes: TNeuralInt8ArrPtr; pSize: integer); static;
       // Int8-weight twin of DotProductsTiled: A rows are int8 codes laid out
       // exactly like the concatenated weights (row r at Codes[r*VectorSize]),
       // Scales[r] is row r's quantization scale (applied once per dot product,
@@ -10100,6 +10108,17 @@ begin
   vHigh := NumElements - 1;
   for I := 0 to vHigh do
     Result += PtrA^[I] * PtrB^[I];
+end;
+
+class procedure TNNetVolume.MulAddInt8(PtrA, PtrB: TNeuralFloatArrPtr;
+  PtrCodes: TNeuralInt8ArrPtr; pSize: integer);
+var
+  I: integer;
+  vHigh: integer;
+begin
+  vHigh := pSize - 1;
+  for I := 0 to vHigh do
+    PtrA^[I] := PtrA^[I] + PtrCodes^[I] * PtrB^[I];
 end;
 
 procedure TNNetVolume.DotProductsTiledInt8(NumAs, NumBs, VectorSize: integer;

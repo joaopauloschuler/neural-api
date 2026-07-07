@@ -158,6 +158,7 @@ type
     procedure TestInt8QuantizeRectangularConv;
     procedure TestInt8QuantizeEmbedding;
     procedure TestInt8QuantizeTokenPositionalEmbedding;
+    procedure TestInt8QuantizeDepthwiseConv;
     procedure TestInt8QuantizedGPT2LogitDrift;
     procedure TestInt8QuantizedLlamaLogitDrift;
     procedure TestInt8QuantizedGPTNeoLogitDrift;
@@ -3670,6 +3671,75 @@ begin
     OutDQ.Free;
     OutQ.Free;
     OutF.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+// Int8 quantization of the depthwise convolution family. Depthwise layers
+// inherit the TNNetLayerConcatedWeights int8 storage but have their own
+// forward (per-channel spatial taps, elementwise MulAdd along depth instead
+// of a dot-product reduction), so they get a fused twin: ComputeInt8CPU
+// streams the codes per tap (MulAddInt8, 1 byte/element) and applies the
+// per-neuron scale ONCE per output element after all taps accumulated.
+// Stacks multiplier>1 + padding + stride + Linear/ReLU/Tanh activations and
+// gates quantized forward == FP32-on-dequantized forward, plus the
+// inference-only Backpropagate raise. // Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestInt8QuantizeDepthwiseConv;
+var
+  NN: TNNet;
+  DwLayers: array[0..2] of TNNetLayer;
+  Input, OutQ, OutDQ: TNNetVolume;
+  i, n: integer;
+  Raised: boolean;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN.AddLayer( TNNetInput.Create(7, 6, 3) );
+  DwLayers[0] := NN.AddLayer(
+    TNNetDepthwiseConvLinear.Create({Mult=}2, {Feature=}3, {Pad=}1, {Stride=}1) );
+  DwLayers[1] := NN.AddLayer(
+    TNNetDepthwiseConvReLU.Create({Mult=}1, {Feature=}3, {Pad=}0, {Stride=}2) );
+  DwLayers[2] := NN.AddLayer(
+    TNNetDepthwiseConv.Create({Mult=}1, {Feature=}1, {Pad=}0, {Stride=}1) );
+  Input := TNNetVolume.Create(7, 6, 3);
+  OutQ := TNNetVolume.Create;
+  OutDQ := TNNetVolume.Create;
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.FData[i] := Sin(0.7 * i) * 0.5;
+
+    NN.QuantizeWeightsInt8();
+    for n := 0 to High(DwLayers) do
+    begin
+      AssertTrue('depthwise layer ' + DwLayers[n].ClassName + ' quantized',
+        TNNetLayerConcatedWeights(DwLayers[n]).WeightsQuantizedInt8);
+      AssertEquals('depthwise layer ' + DwLayers[n].ClassName +
+        ' FP32 weights released', 1, DwLayers[n].Neurons[0].Weights.Size);
+    end;
+
+    NN.Compute(Input);
+    NN.GetOutput(OutQ);
+
+    Raised := false;
+    try
+      DwLayers[0].Backpropagate();
+    except
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue('Backpropagate must raise on int8-quantized depthwise', Raised);
+
+    for n := 0 to High(DwLayers) do
+      TNNetLayerConcatedWeights(DwLayers[n]).DequantizeWeightsInt8();
+    NN.Compute(Input);
+    NN.GetOutput(OutDQ);
+    AssertEquals('output size', OutQ.Size, OutDQ.Size);
+    for i := 0 to OutQ.Size - 1 do
+      AssertEquals('depthwise quantized forward = FP32-on-dequantized ' +
+        IntToStr(i), OutDQ.FData[i], OutQ.FData[i], 1e-6);
+  finally
+    OutDQ.Free;
+    OutQ.Free;
     Input.Free;
     NN.Free;
   end;
