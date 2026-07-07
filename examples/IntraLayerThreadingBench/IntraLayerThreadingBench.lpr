@@ -465,5 +465,8 @@ begin
   // SweepNet('mid GPT MLP',   768,  3072, 6, 16);
   // SweepNet('wide 1-token',  2048, 8192, 4, 1);
   WriteLn;
-  WriteLn('speedup > 1.00x => the 1M threading decision is winning on this box.');
+  WriteLn('speedup > 1.00x => chunking that shape pays off on this box;');
+  WriteLn('<= 1.00x on a SINGLE-layer shape overstates the in-net cost: the');
+  WriteLn('scheduler pass overhead charged here to one layer is paid once per');
+  WriteLn('forward in a real net - validate borderline shapes on a real model.');
 end.
