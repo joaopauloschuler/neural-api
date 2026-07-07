@@ -45,12 +45,12 @@ weight cache (FConcatedWeights) and computes per-neuron straight from the
 weights: less resident RAM, a somewhat slower forward. --max-fast-memory keeps
 the concatenated cache for a faster forward at the cost of more RAM. (The two
 settings are orthogonal; low memory only touches the forward weight cache,
-trainability only the backprop buffers.) Full-precision FP32 weights
-are the DEFAULT: faster on CPU, at the cost of more RAM. Pass --int8 for
-weight-only int8 storage (pQuantizeInt8): less RAM, slower on CPU (the fused
-kernels dequantize on the fly). Combined with --gpu the quantized codes and
-per-row scales are uploaded ONCE as resident device buffers
-(cai_dot_product_int8), so int8 runs on the GPU too.
+trainability only the backprop buffers.) Weight-only int8 storage
+(pQuantizeInt8) is the DEFAULT: less RAM AND faster than fp32 on both CPU
+(fused int8 kernels, AVX2-accelerated) and GPU. Pass --fp32 for
+full-precision FP32 weights (more RAM, slower). Combined with --gpu the
+quantized codes and per-row scales are uploaded ONCE as resident device
+buffers (cai_dot_product_int8), so int8 runs on the GPU too.
 
 REPL commands: /exit, /reset (clear history), /system <msg> (set the system
 prompt; raises on formats without a system role, e.g. gemma/mistral).
@@ -168,9 +168,9 @@ begin
   WriteLn('  --ctx N               context window (default min(model max,2048); mem ~O(ctx^2))');
   WriteLn('  --format NAME         chatml|llama2|llama3|zephyr|gemma|phi3|mistral');
   WriteLn('  --system "msg"        initial system prompt');
-  WriteLn('  --fp32                full-precision weights (DEFAULT; faster, more RAM)');
-  WriteLn('  --int8                int8 weight-only quantized inference (less RAM,');
-  WriteLn('                        slower on CPU; works with --gpu: resident int8 codes)');
+  WriteLn('  --int8                int8 weight-only quantized inference (DEFAULT; less');
+  WriteLn('                        RAM and faster on CPU and GPU: resident int8 codes)');
+  WriteLn('  --fp32                full-precision weights (more RAM, slower)');
   WriteLn('  --low-memory          drop conv/linear weight cache; per-neuron forward (DEFAULT)');
   WriteLn('  --max-fast-memory     keep the concatenated weight cache (faster forward, more RAM)');
   WriteLn('  --gpu                 OpenCL offload of conv/linear matmuls (DEFAULT when');
@@ -198,7 +198,7 @@ end;
 function DefaultChatOptions(): TChatOptions;
 begin
   Result.ModelDir := '';
-  Result.Int8 := false; // full-precision FP32 weights by default (--int8 for less RAM)
+  Result.Int8 := true; // int8 weights by default: less RAM, faster (--fp32 opts out)
   Result.LowMemory := true; // low-memory forward path by default (drops weight cache)
   Result.CtxLen := 0;
   Result.MaxNewTokens := 8192;
@@ -791,14 +791,18 @@ begin
     Check(Opt.Stats, '--stats');
     Check(Opt.Profile, '--profile');
 
-    // fp32 is the default; --int8 opts into quantized weights.
+    // int8 is the default; --fp32 opts into full-precision weights.
     Args.Clear;
     Args.Add('/tmp/model');
-    Check(ParseArgs(Args, Opt) and not Opt.Int8, 'fp32 is the default weight mode');
+    Check(ParseArgs(Args, Opt) and Opt.Int8, 'int8 is the default weight mode');
     Args.Clear;
     Args.Add('/tmp/model');
-    Args.Add('--int8');
-    Check(ParseArgs(Args, Opt) and Opt.Int8, '--int8 enables int8');
+    Args.Add('--fp32');
+    Check(ParseArgs(Args, Opt) and not Opt.Int8, '--fp32 disables int8');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--fp32'); Args.Add('--int8');
+    Check(ParseArgs(Args, Opt) and Opt.Int8, '--int8 re-enables it');
 
     // --stats is off by default.
     Args.Clear;
@@ -1026,7 +1030,7 @@ begin
   // Using the checkpoint's full max_position_embeddings (32768 for Qwen2.5)
   // would still be large, so when the user gives no --ctx we cap the default at
   // DefaultCtxCap (clamped to the model's own limit). Raise it with --ctx N
-  // (and prefer --int8) if you have the RAM.
+  // if you have the RAM (the default int8 weights help there too).
   if Opt.CtxLen <= 0 then
   begin
     Cnt := ReadConfigInt(IncludeTrailingPathDelimiter(Opt.ModelDir) +
@@ -1046,14 +1050,14 @@ begin
   end;
   {$ENDIF}
 
-  // Model: generic architecture dispatch, inference-only, optional int8.
-  // Weight precision. FP32 is the default (faster, more RAM); int8 is the
-  // opt-in for less RAM at the cost of speed (per-layer dequantization).
+  // Model: generic architecture dispatch, inference-only, int8 by default.
+  // Weight precision. Int8 is the default (less RAM and faster on CPU and
+  // GPU); --fp32 opts into full-precision weights (more RAM, slower).
   if Opt.Int8 then
-    WriteLn('[--int8: int8 weight-only quantized weights - less RAM, slower on',
-      ' CPU; on --gpu the codes stay resident on the device]')
+    WriteLn('[int8 weights (default) - less RAM, faster on CPU and GPU;',
+      ' on --gpu the codes stay resident on the device; --fp32 opts out]')
   else
-    WriteLn('[fp32 weights (default)]');
+    WriteLn('[--fp32: full-precision weights - more RAM, slower than int8]');
   if Opt.LowMemory then
     WriteLn('[low-memory forward (default) - concatenated weight cache dropped,',
       ' per-neuron compute, not compatible with GPU,',

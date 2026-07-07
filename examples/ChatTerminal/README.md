@@ -35,7 +35,8 @@ Le chat est assis sur le rebord de la fenetre.
 Aya / Command-R are tuned for cross-lingual instruction following, so a
 single session can switch languages turn to turn. The chat format is
 fingerprinted from the Cohere `tokenizer_config.json` like every other
-family; `--int8` trades CPU speed for memory (and combines with `--gpu`).
+family; the default int8 weights save memory *and* run faster than fp32
+(and combine with `--gpu`).
 
 The conversation is kept as a multi-turn history rendered through the
 chat-template engine (`neural/neuralchat.pas`): the chat format is
@@ -63,8 +64,8 @@ guard, flushed per token so piped output streams too).
 | `--ctx N` | context window to build (`pSeqLen`) | model max |
 | `--format NAME` | `chatml`/`llama2`/`llama3`/`zephyr`/`gemma`/`phi3`/`mistral` override | autodetect |
 | `--system "msg"` | initial system prompt | none |
-| `--fp32` | full-precision fp32 weights — faster, more RAM | **on** |
-| `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — less RAM, slower on CPU. Works with `--gpu`: the quantized codes stay resident on the device (see below) | fp32 (faster, more RAM) |
+| `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — less RAM **and** faster than fp32 on both CPU (fused AVX2 int8 kernels) and GPU: the quantized codes stay resident on the device (see below) | **on** |
+| `--fp32` | full-precision fp32 weights — more RAM, slower | off |
 | `--low-memory` | drop each conv/linear layer's concatenated weight cache (`FConcatedWeights`) and compute per-neuron straight from the weights — less RAM, somewhat slower forward (`pLowMemory`). **Overridden by `--gpu`** (see below) | **on** |
 | `--max-fast-memory` | keep the concatenated weight cache for a faster forward at the cost of more RAM — required for GPU offload | off |
 | `--gpu` | OpenCL offload of the conv/linear matmuls (only when built with `-dOpenCL`) — overrides `--low-memory` (see below) | **on** when built with `-dOpenCL`, else off |
@@ -84,9 +85,11 @@ while `--low-memory`/`--max-fast-memory` toggles the *forward* weight cache.
 Low memory is the default — each conv/linear layer drops its persistent
 concatenated weight cache and computes per-neuron from the raw weights
 (less resident RAM, a somewhat slower forward); `--max-fast-memory` keeps
-the cache for a faster forward at the cost of more RAM. Orthogonally,
-`--int8` swaps fp32 storage for weight-only int8 (less RAM, dequantized on
-the fly).
+the cache for a faster forward at the cost of more RAM. Orthogonally, the
+weight storage is int8 by default — quantized at construction time (no FP32
+weight copy is ever allocated) and run through fused int8 kernels that are
+both smaller *and* faster than fp32 on CPU and GPU; `--fp32` opts back into
+full-precision storage.
 
 **OpenCL / GPU offload.** When the binary is built with `-dOpenCL` (the
 default compilation), the conv/linear matmuls are offloaded to the GPU by
@@ -102,13 +105,14 @@ is rebuilt and the low-memory forward is turned off on the accelerated layers
 default to on, the default GPU run keeps the cache; pass `--cpu` to honor
 low-memory on CPU, or `--max-fast-memory` to keep the cache explicitly.
 
-**`--int8` + `--gpu`** run together: quantized layers use a dedicated int8
-device forward (`cai_dot_product_int8`) instead of the fp32 cache. The
-interleaved int8 codes and per-row scales are uploaded **once** as resident
-immutable device buffers (quantized layers are inference-only, so there is no
-re-upload) and only each step's input travels to the GPU — 1/4 of the fp32
-weight traffic, with the same fused bias/activation tail. So `--int8` saves
-RAM on both paths: host RAM on CPU, host *and* device memory on GPU.
+**int8 + `--gpu`** (both defaults) run together: quantized layers use a
+dedicated int8 device forward (`cai_dot_product_int8`) instead of the fp32
+cache. The interleaved int8 codes and per-row scales are uploaded **once** as
+resident immutable device buffers (quantized layers are inference-only, so
+there is no re-upload) and only each step's input travels to the GPU — 1/4 of
+the fp32 weight traffic, with the same fused bias/activation tail. So int8
+wins on both paths: less host RAM and a faster forward on CPU, less host
+*and* device memory plus less weight traffic on GPU.
 
 **Parallel execution (CPU).** One switch, `--serial`, selects between two
 forward paths; each path drives *both* levels of parallelism together:
@@ -169,7 +173,7 @@ re-prefill each turn. `--no-cache-reuse` forces the full re-prefill (use
 ```
 $ ChatTerminal /path/to/model --temperature 0.7 --top-p 0.9 --seed 42
 Loading /path/to/model ...
-Model: qwen2, 494032768 params, vocab 151936, context 1024, chat format chatml, fp32 weights.
+Model: qwen2, 494032768 params, vocab 151936, context 1024, chat format chatml, int8 weights.
 Type your message; /exit quits, /reset clears the history,
 /system <msg> sets the system prompt.
 > /system You are a terse assistant.
@@ -189,7 +193,7 @@ comfortable range.
 
 ## Testing
 
-`--selftest` runs 55 offline checks (argument parsing, prompt assembly
+`--selftest` runs 54 offline checks (argument parsing, prompt assembly
 against the byte-exact ChatML render, end-of-turn markers, REPL command
 parsing, the KV-cache-reuse prefix diff) without needing any model files. For an end-to-end plumbing check,
 any directory with a pico-sized random checkpoint plus a tokenizer works —
