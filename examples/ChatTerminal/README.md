@@ -35,7 +35,7 @@ Le chat est assis sur le rebord de la fenetre.
 Aya / Command-R are tuned for cross-lingual instruction following, so a
 single session can switch languages turn to turn. The chat format is
 fingerprinted from the Cohere `tokenizer_config.json` like every other
-family; `--int8` trades speed for memory.
+family; `--int8` trades CPU speed for memory (and combines with `--gpu`).
 
 The conversation is kept as a multi-turn history rendered through the
 chat-template engine (`neural/neuralchat.pas`): the chat format is
@@ -64,10 +64,10 @@ guard, flushed per token so piped output streams too).
 | `--format NAME` | `chatml`/`llama2`/`llama3`/`zephyr`/`gemma`/`phi3`/`mistral` override | autodetect |
 | `--system "msg"` | initial system prompt | none |
 | `--fp32` | full-precision fp32 weights — faster, more RAM | **on** |
-| `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — slower, less RAM. **Overridden by `--gpu`** (see below) | fp32 (faster, more RAM) |
+| `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — less RAM, slower on CPU. Works with `--gpu`: the quantized codes stay resident on the device (see below) | fp32 (faster, more RAM) |
 | `--low-memory` | drop each conv/linear layer's concatenated weight cache (`FConcatedWeights`) and compute per-neuron straight from the weights — less RAM, somewhat slower forward (`pLowMemory`). **Overridden by `--gpu`** (see below) | **on** |
 | `--max-fast-memory` | keep the concatenated weight cache for a faster forward at the cost of more RAM — required for GPU offload | off |
-| `--gpu` | OpenCL offload of the conv/linear matmuls (only when built with `-dOpenCL`) — overrides `--int8` and `--low-memory` (see below) | **on** when built with `-dOpenCL`, else off |
+| `--gpu` | OpenCL offload of the conv/linear matmuls (only when built with `-dOpenCL`) — overrides `--low-memory` (see below) | **on** when built with `-dOpenCL`, else off |
 | `--cpu` | force CPU even when built with `-dOpenCL` | — |
 | `--gpu-platform N` | OpenCL platform index | 0 |
 | `--gpu-device N` | OpenCL device index within the platform | 0 |
@@ -94,22 +94,21 @@ default; `--cpu` forces CPU, and `--gpu-platform N` / `--gpu-device N`
 select the OpenCL device. A binary built without `-dOpenCL` is CPU-only and
 ignores the `--gpu*` flags.
 
-GPU offload needs each accelerated layer's concatenated weight cache, which
-neither `--int8` nor `--low-memory` provides. When you combine either with
-`--gpu`, **`--gpu` wins**: the conflicting flag is ignored (with a notice) and
-the cache is built so the kernel can run.
+GPU offload of an fp32 layer needs its concatenated weight cache, which
+`--low-memory` (the default) drops. Combining it with `--gpu` therefore
+*overrides* it (`[--low-memory ignored: incompatible with --gpu]`): the cache
+is rebuilt and the low-memory forward is turned off on the accelerated layers
+(more RAM, the GPU's cost of entry). Since both `--low-memory` and `--gpu`
+default to on, the default GPU run keeps the cache; pass `--cpu` to honor
+low-memory on CPU, or `--max-fast-memory` to keep the cache explicitly.
 
-- **`--int8`** — the int8 path never builds the interleaved cache the kernel
-  reads, so combining it with `--gpu` drops int8, not the GPU: int8 is disabled
-  and the model runs fp32 on the GPU (`[--int8 ignored: incompatible with
-  --gpu]`). To actually run int8, pass `--cpu` and keep it on CPU.
-- **`--low-memory`** (the default) drops exactly that weight cache. Combining it
-  with `--gpu` therefore *overrides* it (`[--low-memory ignored: incompatible
-  with --gpu]`): the cache is rebuilt and the low-memory forward is turned off
-  on the accelerated layers (more RAM, the GPU's cost of entry). Since both
-  `--low-memory` and `--gpu` default to on, the default GPU run keeps the cache;
-  pass `--cpu` to honor low-memory on CPU, or `--max-fast-memory` to keep the
-  cache explicitly.
+**`--int8` + `--gpu`** run together: quantized layers use a dedicated int8
+device forward (`cai_dot_product_int8`) instead of the fp32 cache. The
+interleaved int8 codes and per-row scales are uploaded **once** as resident
+immutable device buffers (quantized layers are inference-only, so there is no
+re-upload) and only each step's input travels to the GPU — 1/4 of the fp32
+weight traffic, with the same fused bias/activation tail. So `--int8` saves
+RAM on both paths: host RAM on CPU, host *and* device memory on GPU.
 
 **Parallel execution (CPU).** One switch, `--serial`, selects between two
 forward paths; each path drives *both* levels of parallelism together:
