@@ -29,6 +29,17 @@ matching TNNetSampler* (greedy argmax when none is given). NOTE the library
 semantics: TNNetSamplerTopK draws UNIFORMLY among the K most probable
 tokens; TNNetSamplerTopP / TNNetSamplerMinP draw proportionally.
 
+SAMPLING DEFAULTS (ApplySamplingDefaults, per parameter): an explicit flag
+wins; otherwise the model's generation_config.json (the checkpoint author's
+recommended settings - temperature/top_p/top_k/repetition_penalty, with
+do_sample=false honored as greedy) supplies the value; otherwise the
+built-in fallback top-p 0.2 + repetition-penalty 1.05 (near-greedy
+stability, the mild penalty preventing the repetition loops pure greedy
+falls into on small models). A config top_k maps to the WEIGHTED top-k and
+top_p is preferred over top_k (see the library semantics note above).
+--greedy hard-overrides everything - deterministic argmax with no sampler,
+temperature or penalties - the mode for CPU/GPU parity checks and debugging.
+
 Generation stops on the tokenizer's EOS id, on the chat format's
 end-of-turn marker (e.g. <|im_end|> for ChatML - matched as a token-id stop
 sequence in the generated region and trimmed from the reply), or after
@@ -125,6 +136,19 @@ type
     RepetitionPenalty: TNeuralFloat; // 1.0 = off
     FrequencyPenalty: TNeuralFloat;  // 0 = off
     PresencePenalty: TNeuralFloat;   // 0 = off
+    Greedy: boolean;             // --greedy: deterministic argmax - no sampler,
+                                 // no temperature, no penalties. Hard override:
+                                 // beats explicit sampling flags AND the model's
+                                 // generation_config.json (CPU/GPU parity and
+                                 // debugging mode)
+    // "Explicitly set on the command line" trackers. ApplySamplingDefaults
+    // fills a parameter from generation_config.json (or the built-in fallback)
+    // only when its flag was NOT given: CLI > generation_config > fallback.
+    TemperatureSet: boolean;
+    TopKSet: boolean;
+    TopPSet: boolean;
+    MinPSet: boolean;
+    RepPenaltySet: boolean;
     Seed: integer;               // < 0 = Randomize
     FormatName: string;          // '' = autodetect
     SystemPrompt: string;
@@ -146,6 +170,18 @@ type
     ErrorMsg: string;
   end;
 
+  // Sampling-relevant fields of a HuggingFace generation_config.json, each
+  // with a presence flag (an absent field must not override anything).
+  // Filled by ReadGenerationConfig, consumed by ApplySamplingDefaults.
+  TGenConfigDefaults = record
+    Found: boolean;              // file existed and parsed
+    HasDoSample: boolean;        DoSample: boolean;
+    HasTemperature: boolean;     Temperature: TNeuralFloat;
+    HasTopP: boolean;            TopP: TNeuralFloat;
+    HasTopK: boolean;            TopK: integer;
+    HasRepetitionPenalty: boolean; RepetitionPenalty: TNeuralFloat;
+  end;
+
 procedure PrintUsage();
 begin
   WriteLn('Usage: ChatTerminal <model-dir> [options]');
@@ -155,12 +191,17 @@ begin
   WriteLn('autodetection) tokenizer_config.json.');
   WriteLn;
   WriteLn('Options:');
-  WriteLn('  --temperature X       sampling temperature (default 1.0)');
+  WriteLn('  Sampling defaults come from the model''s generation_config.json when');
+  WriteLn('  present; otherwise top-p 0.2 + repetition-penalty 1.05. Explicit');
+  WriteLn('  flags override the config; --greedy overrides everything.');
+  WriteLn('  --greedy              deterministic argmax: no sampler, no temperature,');
+  WriteLn('                        no penalties (CPU/GPU parity + debugging)');
+  WriteLn('  --temperature X       sampling temperature (1.0 = off)');
   WriteLn('  --top-k N             top-k sampling (uniform draw among top K)');
   WriteLn('  --weighted-top-k N    top-k sampling (HF: weighted draw among top K)');
   WriteLn('  --top-p X             nucleus sampling (weighted draw)');
   WriteLn('  --min-p X             min-p sampling (weighted draw)');
-  WriteLn('  --repetition-penalty X  CTRL repetition penalty (default 1.0)');
+  WriteLn('  --repetition-penalty X  CTRL repetition penalty (1.0 = off)');
   WriteLn('  --frequency-penalty X   frequency penalty (default 0)');
   WriteLn('  --presence-penalty X    presence penalty (default 0)');
   WriteLn('  --max-new-tokens N    reply length cap (default 8192)');
@@ -210,6 +251,12 @@ begin
   Result.RepetitionPenalty := 1.0;
   Result.FrequencyPenalty := 0;
   Result.PresencePenalty := 0;
+  Result.Greedy := false;
+  Result.TemperatureSet := false;
+  Result.TopKSet := false;
+  Result.TopPSet := false;
+  Result.MinPSet := false;
+  Result.RepPenaltySet := false;
   Result.Seed := -1;
   Result.FormatName := '';
   Result.SystemPrompt := '';
@@ -308,36 +355,43 @@ begin
     end
     else if Arg = '--selftest' then Opt.SelfTest := true
     else if (Arg = '--help') or (Arg = '-h') then Opt.ShowHelp := true
+    else if Arg = '--greedy' then Opt.Greedy := true
     else if Arg = '--temperature' then
     begin
       if not NextFloat(Arg, FVal) then exit(false);
       Opt.Temperature := FVal;
+      Opt.TemperatureSet := true;
     end
     else if Arg = '--top-k' then
     begin
       if not NextInt(Arg, IVal) then exit(false);
       Opt.TopK := IVal;
+      Opt.TopKSet := true;
     end
     else if Arg = '--weighted-top-k' then
     begin
       if not NextInt(Arg, IVal) then exit(false);
       Opt.TopK := IVal;
       Opt.WeightedTopK := true;
+      Opt.TopKSet := true;
     end
     else if Arg = '--top-p' then
     begin
       if not NextFloat(Arg, FVal) then exit(false);
       Opt.TopP := FVal;
+      Opt.TopPSet := true;
     end
     else if Arg = '--min-p' then
     begin
       if not NextFloat(Arg, FVal) then exit(false);
       Opt.MinP := FVal;
+      Opt.MinPSet := true;
     end
     else if Arg = '--repetition-penalty' then
     begin
       if not NextFloat(Arg, FVal) then exit(false);
       Opt.RepetitionPenalty := FVal;
+      Opt.RepPenaltySet := true;
     end
     else if Arg = '--frequency-penalty' then
     begin
@@ -547,6 +601,142 @@ begin
   SL.Free;
 end;
 
+// Built-in fallback sampling defaults, used only for parameters that neither
+// an explicit flag nor the model's generation_config.json supplies. A tight
+// nucleus + a mild penalty: near-greedy stability, but the penalty prevents
+// the repetition loops pure greedy falls into on small models.
+const
+  csFallbackTopP = 0.2;
+  csFallbackRepetitionPenalty = 1.05;
+
+// Reads the sampling-relevant fields of the model's generation_config.json
+// (the checkpoint author's recommended decode settings). Absent file/fields
+// leave the presence flags false. Same fpjson stance as ReadModelType.
+function ReadGenerationConfig(const FileName: string): TGenConfigDefaults;
+var
+  SL: TStringList;
+  Parser: TJSONParser;
+  Root: TJSONData;
+  Node: TJSONData;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  if not FileExists(FileName) then exit;
+  SL := TStringList.Create();
+  try
+    try
+      SL.LoadFromFile(FileName);
+      Parser := TJSONParser.Create(SL.Text, []);
+      try
+        Root := Parser.Parse();
+        try
+          Result.Found := true;
+          Node := Root.FindPath('do_sample');
+          if Assigned(Node) and (Node.JSONType = jtBoolean) then
+          begin
+            Result.HasDoSample := true;
+            Result.DoSample := Node.AsBoolean;
+          end;
+          Node := Root.FindPath('temperature');
+          if Assigned(Node) and (Node.JSONType = jtNumber) then
+          begin
+            Result.HasTemperature := true;
+            Result.Temperature := Node.AsFloat;
+          end;
+          Node := Root.FindPath('top_p');
+          if Assigned(Node) and (Node.JSONType = jtNumber) then
+          begin
+            Result.HasTopP := true;
+            Result.TopP := Node.AsFloat;
+          end;
+          Node := Root.FindPath('top_k');
+          if Assigned(Node) and (Node.JSONType = jtNumber) then
+          begin
+            Result.HasTopK := true;
+            Result.TopK := Node.AsInteger;
+          end;
+          Node := Root.FindPath('repetition_penalty');
+          if Assigned(Node) and (Node.JSONType = jtNumber) then
+          begin
+            Result.HasRepetitionPenalty := true;
+            Result.RepetitionPenalty := Node.AsFloat;
+          end;
+        finally
+          Root.Free;
+        end;
+      finally
+        Parser.Free;
+      end;
+    except
+      FillChar(Result, SizeOf(Result), 0); // unreadable/bad JSON = no config
+    end;
+  finally
+    SL.Free;
+  end;
+end;
+
+// Resolves the effective sampling settings in Opt. Per parameter the
+// precedence is: explicit CLI flag > generation_config.json > built-in
+// fallback (csFallbackTopP / csFallbackRepetitionPenalty). --greedy is a hard
+// override of everything, including explicit sampling flags - it is the
+// deterministic argmax parity/debug mode. A config with do_sample=false means
+// the model author recommends greedy: it contributes greedy defaults (explicit
+// flags still override individually, matching the per-parameter rule).
+// Sampler choice from a config: top_p is preferred over top_k because this
+// library's plain top-k draws UNIFORMLY among the K most probable tokens; a
+// config top_k maps to the HF-style WEIGHTED top-k when no top_p is given.
+// Kept pure (no file access - the caller passes the parsed config) so
+// --selftest can exercise the precedence table.
+procedure ApplySamplingDefaults(var Opt: TChatOptions;
+  const Cfg: TGenConfigDefaults);
+var
+  CfgGreedy, UserSampler: boolean;
+begin
+  if Opt.Greedy then
+  begin
+    Opt.Temperature := 1.0;
+    Opt.TopK := 0;
+    Opt.WeightedTopK := false;
+    Opt.TopP := 0;
+    Opt.MinP := 0;
+    Opt.RepetitionPenalty := 1.0;
+    Opt.FrequencyPenalty := 0;
+    Opt.PresencePenalty := 0;
+    exit;
+  end;
+  CfgGreedy := Cfg.Found and Cfg.HasDoSample and (not Cfg.DoSample);
+  UserSampler := Opt.TopKSet or Opt.TopPSet or Opt.MinPSet;
+  if not Opt.TemperatureSet then
+  begin
+    // The fallback deliberately leaves temperature at 1.0 (off): with the
+    // tight fallback nucleus it would only reshape 1-3 candidates anyway.
+    if (not CfgGreedy) and Cfg.HasTemperature then
+      Opt.Temperature := Cfg.Temperature;
+  end;
+  if not Opt.RepPenaltySet then
+  begin
+    if CfgGreedy then Opt.RepetitionPenalty := 1.0
+    else if Cfg.HasRepetitionPenalty then
+      Opt.RepetitionPenalty := Cfg.RepetitionPenalty
+    else Opt.RepetitionPenalty := csFallbackRepetitionPenalty;
+  end;
+  if not UserSampler then
+  begin
+    if CfgGreedy then
+    begin
+      Opt.TopK := 0;
+      Opt.TopP := 0;
+      Opt.MinP := 0;
+    end
+    else if Cfg.HasTopP then Opt.TopP := Cfg.TopP
+    else if Cfg.HasTopK then
+    begin
+      Opt.TopK := Cfg.TopK;
+      Opt.WeightedTopK := true;
+    end
+    else Opt.TopP := csFallbackTopP;
+  end;
+end;
+
 // ---------------------------------------------------------------------------
 // Generation: one assistant reply, streamed to stdout as it decodes.
 // ---------------------------------------------------------------------------
@@ -751,6 +941,7 @@ var
   History: TChatMessages;
   Rendered, Cmd, Arg: string;
   PA, PB: TNeuralIntegerArray;  // CommonPrefixLen fixtures
+  GenCfg: TGenConfigDefaults;   // ApplySamplingDefaults fixtures
 begin
   Failures := 0;
   Args := TStringList.Create();
@@ -867,6 +1058,103 @@ begin
     Args.Add('--no-cache-reuse');
     Check(ParseArgs(Args, Opt) and Opt.NoCacheReuse, '--no-cache-reuse parses');
 
+    // --greedy and the explicit-flag trackers.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and not Opt.Greedy, 'greedy off by default');
+    Check(not (Opt.TemperatureSet or Opt.TopKSet or Opt.TopPSet or
+      Opt.MinPSet or Opt.RepPenaltySet), 'no sampling flag marked set by default');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--greedy');
+    Check(ParseArgs(Args, Opt) and Opt.Greedy, '--greedy parses');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--temperature'); Args.Add('0.7');
+    Args.Add('--top-p'); Args.Add('0.9');
+    Args.Add('--repetition-penalty'); Args.Add('1.1');
+    Check(ParseArgs(Args, Opt) and Opt.TemperatureSet and Opt.TopPSet and
+      Opt.RepPenaltySet and not Opt.TopKSet and not Opt.MinPSet,
+      'explicit sampling flags are tracked');
+
+    // ApplySamplingDefaults precedence: flag > generation_config > fallback.
+    // No config, no flags -> the built-in fallback (top-p + mild penalty).
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt), 'defaults fixture parses');
+    FillChar(GenCfg, SizeOf(GenCfg), 0);
+    ApplySamplingDefaults(Opt, GenCfg);
+    Check((Abs(Opt.TopP - csFallbackTopP) < 1e-6) and (Opt.TopK = 0) and
+      (Abs(Opt.RepetitionPenalty - csFallbackRepetitionPenalty) < 1e-6) and
+      (Abs(Opt.Temperature - 1.0) < 1e-6),
+      'no config + no flags -> fallback top-p and repetition penalty');
+    // Full config (the Qwen2.5 shape): top_p preferred over top_k,
+    // temperature and repetition penalty adopted.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt), 'config fixture parses');
+    FillChar(GenCfg, SizeOf(GenCfg), 0);
+    GenCfg.Found := true;
+    GenCfg.HasTemperature := true; GenCfg.Temperature := 0.7;
+    GenCfg.HasTopP := true; GenCfg.TopP := 0.8;
+    GenCfg.HasTopK := true; GenCfg.TopK := 20;
+    GenCfg.HasRepetitionPenalty := true; GenCfg.RepetitionPenalty := 1.05;
+    ApplySamplingDefaults(Opt, GenCfg);
+    Check((Abs(Opt.TopP - 0.8) < 1e-6) and (Opt.TopK = 0) and
+      (Abs(Opt.Temperature - 0.7) < 1e-6) and
+      (Abs(Opt.RepetitionPenalty - 1.05) < 1e-6),
+      'config adopted; top_p preferred over top_k');
+    // Config with top_k only -> HF-style WEIGHTED top-k.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt), 'top_k fixture parses');
+    FillChar(GenCfg, SizeOf(GenCfg), 0);
+    GenCfg.Found := true;
+    GenCfg.HasTopK := true; GenCfg.TopK := 20;
+    ApplySamplingDefaults(Opt, GenCfg);
+    Check((Opt.TopK = 20) and Opt.WeightedTopK and (Opt.TopP = 0),
+      'config top_k maps to weighted top-k');
+    // Explicit flag beats the config.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--top-p'); Args.Add('0.9');
+    Check(ParseArgs(Args, Opt), 'override fixture parses');
+    FillChar(GenCfg, SizeOf(GenCfg), 0);
+    GenCfg.Found := true;
+    GenCfg.HasTopP := true; GenCfg.TopP := 0.8;
+    ApplySamplingDefaults(Opt, GenCfg);
+    Check(Abs(Opt.TopP - 0.9) < 1e-6, 'explicit --top-p beats the config');
+    // do_sample=false -> the author recommends greedy; no fallback sampler.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt), 'do_sample fixture parses');
+    FillChar(GenCfg, SizeOf(GenCfg), 0);
+    GenCfg.Found := true;
+    GenCfg.HasDoSample := true; GenCfg.DoSample := false;
+    GenCfg.HasTemperature := true; GenCfg.Temperature := 0.7;
+    GenCfg.HasTopP := true; GenCfg.TopP := 0.8;
+    ApplySamplingDefaults(Opt, GenCfg);
+    Check((Opt.TopP = 0) and (Opt.TopK = 0) and (Opt.MinP = 0) and
+      (Abs(Opt.Temperature - 1.0) < 1e-6) and
+      (Abs(Opt.RepetitionPenalty - 1.0) < 1e-6),
+      'do_sample=false yields greedy defaults');
+    // --greedy is a hard override of flags AND config.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--greedy');
+    Args.Add('--top-p'); Args.Add('0.9');
+    Args.Add('--temperature'); Args.Add('0.7');
+    Args.Add('--repetition-penalty'); Args.Add('1.1');
+    Check(ParseArgs(Args, Opt), 'greedy override fixture parses');
+    FillChar(GenCfg, SizeOf(GenCfg), 0);
+    GenCfg.Found := true;
+    GenCfg.HasTopP := true; GenCfg.TopP := 0.8;
+    ApplySamplingDefaults(Opt, GenCfg);
+    Check((Opt.TopP = 0) and (Opt.TopK = 0) and (Opt.MinP = 0) and
+      (Abs(Opt.Temperature - 1.0) < 1e-6) and
+      (Abs(Opt.RepetitionPenalty - 1.0) < 1e-6),
+      '--greedy overrides flags and config');
+
     Args.Clear;
     Args.Add('--bogus-flag');
     Check(not ParseArgs(Args, Opt), 'unknown flag rejected');
@@ -955,6 +1243,7 @@ var
   Chain: TNNetLogitsProcessorChain;
   Sampler: TNNetSamplerBase;
   Penalty: TNNetTokenHistoryPenalty;
+  GenCfg: TGenConfigDefaults;   // model's generation_config.json (if any)
   ReuseOK: boolean;             // KV-cache reuse sound for this architecture?
   {$IFDEF OpenCL}
   GpuCL: TEasyOpenCL;           // platform/device handle for OpenCL offload
@@ -1158,6 +1447,33 @@ begin
   else
     WriteLn('[layer-graph parallel forward (default) - independent layers and',
       ' large conv/linear layers threaded; pass --serial for the serial loop]');
+
+  // Sampling defaults: explicit flag > the model's generation_config.json >
+  // built-in fallback (top-p 0.2 + repetition-penalty 1.05); --greedy
+  // overrides everything (deterministic argmax, the CPU/GPU parity mode).
+  GenCfg := ReadGenerationConfig(
+    IncludeTrailingPathDelimiter(Opt.ModelDir) + 'generation_config.json');
+  ApplySamplingDefaults(Opt, GenCfg);
+  if Opt.Greedy then
+    WriteLn('[sampling: greedy argmax (--greedy) - deterministic]')
+  else
+  begin
+    Write('[sampling:');
+    if Opt.TopK > 0 then
+      Write(' top-k ', Opt.TopK,
+        BoolToStr(Opt.WeightedTopK, ' weighted', ' uniform'))
+    else if Opt.TopP > 0 then Write(' top-p ', Opt.TopP:0:2)
+    else if Opt.MinP > 0 then Write(' min-p ', Opt.MinP:0:2)
+    else Write(' greedy argmax');
+    if Opt.Temperature <> 1.0 then
+      Write(', temperature ', Opt.Temperature:0:2);
+    if Opt.RepetitionPenalty <> 1.0 then
+      Write(', repetition-penalty ', Opt.RepetitionPenalty:0:2);
+    if GenCfg.Found then
+      WriteLn(' - flags > generation_config.json > fallback]')
+    else
+      WriteLn(' - flags > built-in fallback (no generation_config.json)]');
+  end;
 
   // Distribution pipeline (TGenerationConfig order: penalty -> temperature
   // -> sampler).
