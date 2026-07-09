@@ -1,14 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <CONFIG>
   <ProjectOptions>
-    <Version Value="11"/>
+    <Version Value="12"/>
     <PathDelim Value="\"/>
     <General>
       <Flags>
         <MainUnitHasCreateFormStatements Value="False"/>
+        <MainUnitHasTitleStatement Value="False"/>
+        <MainUnitHasScaledStatement Value="False"/>
+        <CompatibilityMode Value="True"/>
       </Flags>
       <SessionStorage Value="InProjectDir"/>
-      <MainUnit Value="0"/>
       <Title Value="Intra-Layer Threading Benchmark"/>
       <UseAppBundle Value="False"/>
       <ResourceType Value="res"/>
@@ -127,7 +129,7 @@
     </SearchPaths>
     <CodeGeneration>
       <Optimizations>
-        <OptimizationLevel Value="3"/>
+        <OptimizationLevel Value="4"/>
       </Optimizations>
     </CodeGeneration>
     <Linking>
@@ -138,10 +140,6 @@
     <Other>
       <CustomOptions Value="-dAVX2
 -dRelease"/>
-      <OtherDefines Count="2">
-        <Define0 Value="AVX2"/>
-        <Define1 Value="Release"/>
-      </OtherDefines>
     </Other>
   </CompilerOptions>
   <Debugging>

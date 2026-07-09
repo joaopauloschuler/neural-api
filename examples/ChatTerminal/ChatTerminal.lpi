@@ -1,14 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <CONFIG>
   <ProjectOptions>
-    <Version Value="11"/>
+    <Version Value="12"/>
     <PathDelim Value="\"/>
     <General>
       <Flags>
         <MainUnitHasCreateFormStatements Value="False"/>
+        <MainUnitHasTitleStatement Value="False"/>
+        <MainUnitHasScaledStatement Value="False"/>
+        <CompatibilityMode Value="True"/>
       </Flags>
       <SessionStorage Value="InProjectDir"/>
-      <MainUnit Value="0"/>
       <Title Value="ChatTerminal Example"/>
       <UseAppBundle Value="False"/>
       <ResourceType Value="res"/>
@@ -136,7 +138,7 @@
     </SearchPaths>
     <CodeGeneration>
       <Optimizations>
-        <OptimizationLevel Value="3"/>
+        <OptimizationLevel Value="4"/>
       </Optimizations>
     </CodeGeneration>
     <Linking>
@@ -148,11 +150,6 @@
       <CustomOptions Value="-dAVX2
 -dRelease
 -dOpenCL"/>
-      <OtherDefines Count="3">
-        <Define0 Value="AVX2"/>
-        <Define1 Value="Release"/>
-        <Define2 Value="OpenCL"/>
-      </OtherDefines>
     </Other>
   </CompilerOptions>
   <Debugging>
