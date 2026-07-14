@@ -3,16 +3,20 @@ program IntraLayerThreadingBench;
 IntraLayerThreadingBench: validates the intra-layer threading decision.
 
   * Experiment A sweeps single-layer FC / pointwise / conv shapes from tiny to
-    large, reports each shape's neuron count, whether it is eligible to chunk
+    large - plus the token-wise transformer layers (SwiGLU / TokenRMSNorm /
+    RotaryEmbedding) at decode (seq=1) and prefill-like sequence lengths -
+    reports each shape's neuron count, whether it is eligible to chunk
     (the real ChunkEligible() verdict), the OFF-vs-ON speedup, and a bit-parity
     check (threaded output MUST equal serial output - only independent outputs
     are partitioned). It is run twice, once with the low-memory inference
     contract off and once on, since conv/pointwise chunk in both modes.
-  * Experiment B takes the small shapes from A and sweeps them across
-    NN.StartThreadWorkers() policies - hot-core counts 1..4 crossed with
-    cool-down timeouts 0..2 seconds - since the small end is where the pool
-    policy actually moves the OFF-vs-ON speedup.
-  * Experiment C times a few realistic multi-layer nets OFF vs ON end to end.
+  * Experiment B (no longer run - kept in the source for reference) took the
+    small shapes from A and swept them across NN.StartThreadWorkers()
+    policies - hot-core counts 1..4 crossed with cool-down timeouts 0..2
+    seconds - since the small end is where the pool policy actually moves
+    the OFF-vs-ON speedup.
+  * Experiment C (no longer run - kept in the source for reference) timed a
+    few realistic multi-layer nets OFF vs ON end to end.
 
 ChunkEligible returns true for every size, so a parallel pass always chunks.
 Experiment A measures where that pays: the tiny shapes at the top of each block
@@ -81,6 +85,9 @@ var
 // Kind 0 = FullConnect(input A -> B neurons)
 //      1 = Convolution(input AxAxB, C features, DxD kernel, stride 1, pad 0)
 //      2 = PointwiseConv(input AxAxB -> C features)
+//      3 = SwiGLU(input Ax1x2B -> Ax1xB; A = seqLen, B = half depth)
+//      4 = TokenRMSNorm(input Ax1xB; A = seqLen, B = depth)
+//      5 = RotaryEmbedding(input Ax1xB; A = seqLen, B = depth, B even)
 procedure AddA(const N: string; K, A, B, C, D: integer);
 var idx: integer;
 begin
@@ -101,6 +108,12 @@ begin
              NN.AddLayer(TNNetConvolutionReLU.Create(S.C, S.D, 0, 1)); end;
     2: begin NN.AddLayer(TNNetInput.Create(S.A, S.A, S.B));
              NN.AddLayer(TNNetPointwiseConvReLU.Create(S.C)); end;
+    3: begin NN.AddLayer(TNNetInput.Create(S.A, 1, 2 * S.B));
+             NN.AddLayer(TNNetSwiGLU.Create()); end;
+    4: begin NN.AddLayer(TNNetInput.Create(S.A, 1, S.B));
+             NN.AddLayer(TNNetTokenRMSNorm.Create()); end;
+    5: begin NN.AddLayer(TNNetInput.Create(S.A, 1, S.B));
+             NN.AddLayer(TNNetRotaryEmbedding.Create()); end;
   end;
   NN.GetLastLayer().InitDefault();
   Result := NN;
@@ -138,6 +151,24 @@ begin
   AddA('Conv 16x16x64 k3',  1, 16, 64,  128, 3);
   AddA('Conv 32x32x64 k3',  1, 32, 64,  64,  3);
   AddA('Conv 8x8x256 k3',   1, 8,  256, 256, 3);
+  // Token-wise transformer layers: input A(seq) x 1 x B(depth). These report
+  // their real ChunkEligible() verdict - 'no' with a ~1.00x speedup until each
+  // gains a ComputeRange, then the same rows become the payoff measurement.
+  // seq=1 rows are the KV-cache decode shape (the case that needs a finer-than-
+  // token chunk axis); the larger seq rows are prefill-like.
+  // SwiGLU: input Ax1x2B -> Ax1xB (token-wise gate).
+  AddA('SwiGLU s1 d3072',   3, 1,   3072, 0, 0);
+  AddA('SwiGLU s8 d3072',   3, 8,   3072, 0, 0);
+  AddA('SwiGLU s64 d3072',  3, 64,  3072, 0, 0);
+  AddA('SwiGLU s512 d1536', 3, 512, 1536, 0, 0);
+  // TokenRMSNorm: per-token RMS reduction + gain over depth B.
+  AddA('RMSN s1 d1024',     4, 1,   1024, 0, 0);
+  AddA('RMSN s64 d1024',    4, 64,  1024, 0, 0);
+  AddA('RMSN s512 d1024',   4, 512, 1024, 0, 0);
+  // RotaryEmbedding: interleaved pair rotation, B/2 sincos pairs per token.
+  AddA('RoPE s1 d128',      5, 1,   128,  0, 0);
+  AddA('RoPE s64 d128',     5, 64,  128,  0, 0);
+  AddA('RoPE s512 d1024',   5, 512, 1024, 0, 0);
 end;
 
 // One pass of the shape sweep for a given memory mode. LowMem toggles the
@@ -162,7 +193,8 @@ begin
   if LowMem then memtag := 'low-memory ON' else memtag := 'low-memory OFF';
   WriteLn('=== Experiment A: per-layer threading OFF vs ON  [', memtag, '] ===');
   WriteLn('Cores (NeuralDefaultThreadCount) = ', NeuralDefaultThreadCount(),
-    '   every size is chunk-eligible');
+    '   FC/PW/Conv: every size is chunk-eligible; ',
+    'SwiGLU/RMSN/RoPE show their current verdict');
   WriteLn(Format('%-20s %8s %6s %9s %9s %8s %7s %9s',
     ['shape', 'neurons', 'elig?', 'off ms', 'on ms', 'speedup',
      'chunks', 'maxdiff']));
@@ -331,6 +363,32 @@ begin
   Result := NN;
 end;
 
+// Transformer-decoder-ish forward with the modern token-wise layers: RoPE on
+// the input stream, then per block TokenRMSNorm -> up-projection to 2*dHidden
+// -> SwiGLU gate (halves the depth back to dHidden) -> down-projection to
+// dModel. Unlike BuildStack, tokens run along X and channels along Depth
+// (seqLen x 1 x dModel), the layout the token-wise layers reduce over. This is
+// the end-to-end probe for the SwiGLU/RMSNorm/RoPE ComputeRange work: until
+// they chunk, only the two pointwise projections thread and the token layers
+// are the serial gaps in the pass.
+function BuildStackSwiGLU(dModel, dHidden, nBlocks, seqLen: integer): TNNet;
+var NN: TNNet; b: integer;
+begin
+  NN := TNNet.Create();
+  NN.AddLayer(TNNetInput.Create(seqLen, 1, dModel));
+  NN.AddLayer(TNNetRotaryEmbedding.Create());
+  for b := 0 to nBlocks - 1 do
+  begin
+    NN.AddLayer(TNNetTokenRMSNorm.Create());
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(2 * dHidden));
+    NN.AddLayer(TNNetSwiGLU.Create());
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(dModel));
+  end;
+  for b := 0 to NN.CountLayers - 1 do NN.Layers[b].InitDefault();
+  NN.SetTrainable(False, {pLowMemory=}False);
+  Result := NN;
+end;
+
 // Per-layer chunk report for a net that has just run a parallel pass. The
 // scheduler splits a chunk-eligible layer into clamp(WorkerCount, 1, WorkCount)
 // slices (see SchedEnqueueReady); a non-eligible layer runs as one whole-layer
@@ -357,17 +415,20 @@ begin
   end;
 end;
 
-procedure SweepNet(const Tag: string; dModel, dHidden, nBlocks, seqLen: integer);
+procedure SweepNet(const Tag: string; dModel, dHidden, nBlocks, seqLen: integer;
+  UseSwiGLU: boolean = false);
 var
   MyIn: TNNetVolume; NN: TNNet; off, on_: double;
 begin
-  NN := BuildStack(dModel, dHidden, nBlocks, seqLen);
+  if UseSwiGLU then NN := BuildStackSwiGLU(dModel, dHidden, nBlocks, seqLen)
+  else NN := BuildStack(dModel, dHidden, nBlocks, seqLen);
   MyIn := TNNetVolume.Create(NN.Layers[0].Output);
   MyIn.Randomize();
   off := BestTimeMs(NN, MyIn, {parallel=}false);
   NN.Free;
 
-  NN := BuildStack(dModel, dHidden, nBlocks, seqLen);
+  if UseSwiGLU then NN := BuildStackSwiGLU(dModel, dHidden, nBlocks, seqLen)
+  else NN := BuildStack(dModel, dHidden, nBlocks, seqLen);
   NN.ResetSchedulerStats();  // clean per-net pass/worker counts
   NN.StartThreadWorkers();   // keep the pool alive/hot across the timed passes
   on_ := BestTimeMs(NN, MyIn, {parallel=}true);
@@ -390,13 +451,22 @@ begin
   // passes expose whether the memory mode shifts eligibility or timing.
   ExperimentA({LowMem=}False);
   ExperimentA({LowMem=}True);
-  ExperimentB;
-  WriteLn('=== Experiment C: realistic nets  threading OFF vs ON (end-to-end) ===');
-  SweepNet('small GPT MLP', 512,  2048, 6, 8);
-  // The remaining two architectures are commented out to keep the run short -
-  // the first architecture is representative of the end-to-end case.
+  // Experiments B (pool-policy sweep) and C (end-to-end nets) are no longer
+  // relevant; kept in the source for reference but not run.
+  // ExperimentB;
+  // WriteLn('=== Experiment C: realistic nets  threading OFF vs ON (end-to-end) ===');
+  // SweepNet('small GPT MLP', 512,  2048, 6, 8);
+  // SwiGLU-FFN stack (RoPE + per-block RMSNorm -> up-proj -> SwiGLU ->
+  // down-proj): the end-to-end probe for the token-layer ComputeRange work.
+  // seq=8 is prefill-like; seq=1 is the KV-cache decode shape where the token
+  // layers need a finer-than-token chunk axis to thread at all.
+  // SweepNet('GPT SwiGLU FFN', 512,  2048, 6, 8, {UseSwiGLU=}true);
+  // SweepNet('SwiGLU 1-token', 1024, 4096, 4, 1, {UseSwiGLU=}true);
   // SweepNet('mid GPT MLP',   768,  3072, 6, 16);
   // SweepNet('wide 1-token',  2048, 8192, 4, 1);
   WriteLn;
-  WriteLn('speedup > 1.00x => the 1M threading decision is winning on this box.');
+  WriteLn('speedup > 1.00x => chunking that shape pays off on this box;');
+  WriteLn('<= 1.00x on a SINGLE-layer shape overstates the in-net cost: the');
+  WriteLn('scheduler pass overhead charged here to one layer is paid once per');
+  WriteLn('forward in a real net - validate borderline shapes on a real model.');
 end.

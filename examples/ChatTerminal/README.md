@@ -49,14 +49,23 @@ guard, flushed per token so piped output streams too).
 
 ## Flags
 
+Sampling defaults resolve **per parameter** as: explicit flag >
+the model's `generation_config.json` (the checkpoint author's recommended
+`temperature`/`top_p`/`top_k`/`repetition_penalty`; `do_sample: false` is
+honored as greedy) > the built-in fallback **top-p 0.2 +
+repetition-penalty 1.05**. A config `top_k` maps to the **weighted** top-k
+(and `top_p` is preferred over `top_k`) because this library's plain top-k
+draws uniformly. `--greedy` hard-overrides everything.
+
 | Flag | Meaning | Default |
 | --- | --- | --- |
-| `--temperature X` | sampling temperature (probability-domain `TNNetTemperatureProcessor`) | 1.0 (off) |
+| `--greedy` | deterministic argmax: no sampler, no temperature, no penalties — overrides all sampling flags **and** `generation_config.json` (the CPU/GPU parity + debugging mode) | off |
+| `--temperature X` | sampling temperature (probability-domain `TNNetTemperatureProcessor`) | config, else 1.0 (off) |
 | `--top-k N` | `TNNetSamplerTopK` — NOTE: draws **uniformly** among the top K | off |
-| `--weighted-top-k N` | `TNNetSamplerWeightedTopK` — HF semantics: draws **proportionally** to the renormalized top-K probabilities | off |
-| `--top-p X` | `TNNetSamplerTopP` nucleus sampling (weighted draw) | off |
+| `--weighted-top-k N` | `TNNetSamplerWeightedTopK` — HF semantics: draws **proportionally** to the renormalized top-K probabilities | config `top_k`, else off |
+| `--top-p X` | `TNNetSamplerTopP` nucleus sampling (weighted draw) | config `top_p`, else 0.2 |
 | `--min-p X` | `TNNetSamplerMinP` (weighted draw) | off |
-| `--repetition-penalty X` | CTRL repetition penalty (`TNNetTokenHistoryPenalty`) | 1.0 (off) |
+| `--repetition-penalty X` | CTRL repetition penalty (`TNNetTokenHistoryPenalty`) | config, else 1.05 |
 | `--frequency-penalty X` | frequency penalty | 0 (off) |
 | `--presence-penalty X` | presence penalty | 0 (off) |
 | `--max-new-tokens N` | reply length cap | 8192 |
@@ -139,8 +148,10 @@ forward paths; each path drives *both* levels of parallelism together:
 
 Temperature and the penalties run through a
 `TNNetLogitsProcessorChain` in the `TGenerationConfig` pipeline order
-(penalty -> temperature -> sampler); without a sampler flag decoding is
-greedy argmax. Generation stops on the tokenizer's EOS id, on the chat
+(penalty -> temperature -> sampler); the effective settings come from the
+flag > `generation_config.json` > fallback resolution above (the startup
+banner prints what was resolved), and `--greedy` forces plain argmax.
+Generation stops on the tokenizer's EOS id, on the chat
 format's end-of-turn marker (`<|im_end|>`, `<|eot_id|>`, `<end_of_turn>`,
 `<|end|>`, `</s>` — matched as a token-id stop sequence in the generated
 region and trimmed from the reply), or at `--max-new-tokens`.
