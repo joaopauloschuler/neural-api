@@ -70,11 +70,13 @@ draws uniformly. `--greedy` hard-overrides everything.
 | `--presence-penalty X` | presence penalty | 0 (off) |
 | `--max-new-tokens N` | reply length cap | 8192 |
 | `--seed N` | RNG seed (reproducible sampling) | randomize |
-| `--ctx N` | context window to build (`pSeqLen`) | model max |
+| `--ctx N` | context window to build (`pSeqLen`) — KV-cache memory grows ~O(ctx) | model max, capped at 2048 (the startup banner says so; raise explicitly with `--ctx`) |
 | `--format NAME` | `chatml`/`llama2`/`llama3`/`zephyr`/`gemma`/`phi3`/`mistral` override | autodetect |
 | `--system "msg"` | initial system prompt | none |
 | `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — less RAM **and** faster than fp32 on both CPU (fused AVX2 int8 kernels) and GPU: the quantized codes stay resident on the device (see below) | **on** |
-| `--fp32` | full-precision fp32 weights — more RAM, slower | off |
+| `--fp32` | full-precision fp32 weights — more RAM, slower. Also switches the KV-cache default to fp32 | off |
+| `--kv-int8` | int8-quantized KV cache (per-row scale = max\|row\|/127): ~1/4 the KV RAM at long context, identical on CPU and GPU. Slightly lossy logits (drift on the order of e-2, greedy argmax stable); the FP32 K/V buffers are never allocated | **on** whenever the weights are int8 |
+| `--kv-fp32` | keep the bit-exact FP32 KV cache while the weights stay int8 | off |
 | `--low-memory` | drop each conv/linear layer's concatenated weight cache (`FConcatedWeights`) and compute per-neuron straight from the weights — less RAM, somewhat slower forward (`pLowMemory`). **Overridden by `--gpu`** (see below) | **on** |
 | `--max-fast-memory` | keep the concatenated weight cache for a faster forward at the cost of more RAM — required for GPU offload | off |
 | `--gpu` | OpenCL offload of the conv/linear matmuls (only when built with `-dOpenCL`) — overrides `--low-memory` (see below) | **on** when built with `-dOpenCL`, else off |
@@ -87,18 +89,32 @@ draws uniformly. `--greedy` hard-overrides everything.
 | `--serial` | classic in-order serial layer loop, fully single-threaded, instead of the layer-graph parallel forward that also threads large conv/linear layers internally (see below) | parallel on |
 | `--selftest` | run the offline unit checks and exit | — |
 
-The model is always built with `pTrainable=false` (the REPL never
-trains; ~1/3 the memory). **Memory vs. speed** is controlled by two
-orthogonal axes on top of that: trainability gates the backprop buffers,
-while `--low-memory`/`--max-fast-memory` toggles the *forward* weight cache.
+The model is always built with `pTrainable=false` — the REPL never trains,
+so the per-layer error buffers and each neuron's optimizer-state volumes
+(delta/inertia) are freed outright, not just shrunk (on a multi-billion-
+parameter model the per-neuron object overhead alone is gigabytes).
+**Memory vs. speed** is controlled by two orthogonal axes on top of that:
+trainability gates the backprop buffers, while
+`--low-memory`/`--max-fast-memory` toggles the *forward* weight cache.
 Low memory is the default — each conv/linear layer drops its persistent
 concatenated weight cache and computes per-neuron from the raw weights
 (less resident RAM, a somewhat slower forward); `--max-fast-memory` keeps
 the cache for a faster forward at the cost of more RAM. Orthogonally, the
 weight storage is int8 by default — quantized at construction time (no FP32
-weight copy is ever allocated) and run through fused int8 kernels that are
-both smaller *and* faster than fp32 on CPU and GPU; `--fp32` opts back into
-full-precision storage.
+weight copy is ever allocated; large checkpoints stream row-by-row straight
+into the int8 codes, so loading never spikes to the FP32 size) and run
+through fused int8 kernels that are both smaller *and* faster than fp32 on
+CPU and GPU; `--fp32` opts back into full-precision storage.
+
+The decode-time KV cache follows the weight mode: with int8 weights (the
+default) each attention layer's K/V rows are quantized to int8 with a
+per-row scale as they are appended — ~1/4 the KV RAM, the full-size FP32
+K/V buffers are never allocated, and the fused int8 kernels read the codes
+directly. The drift is small (logits within ~e-2, greedy argmax stable —
+see `TestKVCacheInt8DriftWithinTolerance`) but decode is not bit-exact vs
+the FP32 cache; `--kv-fp32` opts back into the exact cache, and `--fp32`
+weights default to it. The KV cache behaves identically on CPU and GPU
+(the cached decode path is the same code).
 
 **OpenCL / GPU offload.** When the binary is built with `-dOpenCL` (the
 default compilation), the conv/linear matmuls are offloaded to the GPU by
@@ -164,7 +180,8 @@ divergent tail and prefills only the new tokens — so time-to-first-token
 stays roughly flat instead of growing with the transcript. This is correct
 regardless of tokenizer round-tripping (the diff always finds the true
 shared prefix; `/system` and `/reset` simply diverge earlier and re-prefill
-more). It applies to pure-attention models only: a recurrent (SSM/Mamba/RWKV)
+more), and it works the same with the int8 KV cache (truncation only
+rewinds the cache length). It applies to pure-attention models only: a recurrent (SSM/Mamba/RWKV)
 state cannot be truncated by position, so those fall back to a full
 re-prefill each turn. `--no-cache-reuse` forces the full re-prefill (use
 `--stats` to compare: watch `prompt N (reused K)` and TTFT).
@@ -204,7 +221,7 @@ comfortable range.
 
 ## Testing
 
-`--selftest` runs 54 offline checks (argument parsing, prompt assembly
+`--selftest` runs 75 offline checks (argument parsing, prompt assembly
 against the byte-exact ChatML render, end-of-turn markers, REPL command
 parsing, the KV-cache-reuse prefix diff) without needing any model files. For an end-to-end plumbing check,
 any directory with a pico-sized random checkpoint plus a tokenizer works —
