@@ -1,8 +1,8 @@
 # ChatTerminal: interactive chat REPL over any imported instruct checkpoint
 
 A terminal chat program for the checkpoints the generic importer dispatch
-(`BuildFromPretrained` in `neural/neuralpretrained.pas`) supports: qwen2, quen2.5.
-It is planned (coded) to support: quen3, gpt2, llama, mistral, /3, gemma/2/3, phi/phi3, gpt_neo(x), 
+(`BuildFromPretrained` in `neural/neuralpretrained.pas`) supports: qwen2, qwen2.5, qwen3.
+It is planned (coded) to support: gpt2, llama, mistral, /3, gemma/2/3, phi/phi3, gpt_neo(x), 
 gptj, cohere/cohere2, rwkv, mamba, bloom, deepseek_v2. Point it at a
 HuggingFace-style model directory (`config.json` + `model.safetensors` [or
 sharded index / pytorch_model.bin] + `tokenizer.json`
