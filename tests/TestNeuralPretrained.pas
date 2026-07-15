@@ -158,6 +158,7 @@ type
     procedure TestInt8QuantizeRectangularConv;
     procedure TestInt8QuantizeEmbedding;
     procedure TestInt8QuantizeNonFiniteRow;
+    procedure TestInt8QuantizeTinyRow;
     procedure TestInt8QuantizeTokenPositionalEmbedding;
     procedure TestInt8QuantizeDepthwiseConv;
     procedure TestInt8QuantizeGroupedConv;
@@ -3657,6 +3658,66 @@ begin
     AssertEquals('sweep: NaN codes as 0', 0, W.FData[2], 0);
     AssertEquals('sweep: +Inf clamps', 2.0, W.FData[3], 1e-6);
     AssertEquals('sweep: -Inf clamps', -2.0, W.FData[4], 1e-6);
+  finally
+    Src.Free;
+    Emb.Free;
+  end;
+end;
+
+// Rows of tiny-magnitude values (Qwen2.5-7B pads its vocab with rows of
+// +/-1.1754943508e-37): the per-row scale MaxAbs/127 lands in the single
+// denormal range and its single-precision reciprocal overflows (> 3.4e38),
+// which trapped as EInvalidOp under FPC's unmasked SSE exceptions. The
+// quantizer computes the reciprocal in double; a row whose scale underflows
+// single entirely (MaxAbs < ~1.8e-43) takes the zero-row convention.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestInt8QuantizeTinyRow;
+const
+  Vocab = 3;
+  EmbSize = 8;
+  TinyV: single = 1.1754943508222875e-37; // the actual Qwen2.5-7B pad value
+  SubV: single = 1.0e-44; // scale underflows single -> zero row
+var
+  Emb: TNNetEmbedding;
+  Src, W: TNNetVolume;
+  i: integer;
+begin
+  Emb := TNNetEmbedding.Create(Vocab, EmbSize, 0, 0.02,
+    {pTrainable=}false, {pQuantizeInt8=}true);
+  Src := TNNetVolume.Create(Vocab * EmbSize, 1, 1);
+  try
+    // row 0: the real padding pattern, alternating +/-TinyV.
+    for i := 0 to EmbSize - 1 do
+      if (i mod 2) = 0 then Src.FData[i] := TinyV
+      else Src.FData[i] := -TinyV;
+    // row 1: below the quantizable range.
+    for i := EmbSize to 2 * EmbSize - 1 do Src.FData[i] := SubV;
+    // row 2: plain finite row.
+    for i := 2 * EmbSize to 3 * EmbSize - 1 do Src.FData[i] := 0.25;
+    for i := 0 to Vocab - 1 do
+      Emb.ImportInt8QuantRow(i, Src, i * EmbSize, 1.0); // must not trap
+    Emb.DequantizeWeightsInt8();
+    W := Emb.Neurons[0].Weights;
+    // row 0: values survive within the scale/2 bound (scale ~ 9.3e-40).
+    AssertEquals('tiny +row value survives', TinyV, W.FData[0],
+      TinyV / 127);
+    AssertEquals('tiny -row value survives', -TinyV, W.FData[1],
+      TinyV / 127);
+    // row 1: zero-row convention.
+    for i := EmbSize to 2 * EmbSize - 1 do
+      AssertEquals('sub-denormal-scale row is zero ' + IntToStr(i), 0,
+        W.FData[i], 0);
+    // row 2: intact.
+    AssertEquals('finite row survives', 0.25, W.FData[2 * EmbSize],
+      0.25 / 127 / 2 + 1e-9);
+    // FP32-fill -> QuantizeWeightsInt8 sweep over the same table.
+    Emb.QuantizeWeightsInt8();
+    AssertTrue('sweep quantized without trapping',
+      Emb.WeightsQuantizedInt8);
+    Emb.DequantizeWeightsInt8();
+    W := Emb.Neurons[0].Weights;
+    AssertEquals('sweep: tiny value survives', TinyV, W.FData[0],
+      TinyV / 127);
   finally
     Src.Free;
     Emb.Free;
