@@ -3209,10 +3209,12 @@ begin
     for i := 0 to OutTrain.Size - 1 do
       AssertEquals('post-build SetTrainable logit ' + IntToStr(i),
         OutTrain.FData[i], OutInfer.FData[i], 0);
-    AssertEquals('delta volume shrunk', 1,
-      NNTrain.Layers[1].Neurons[0].Delta.Size);
-    AssertEquals('inertia volume shrunk', 1,
-      NNTrain.Layers[1].Neurons[0].BackInertia.Size);
+    // SetTrainable(false) frees the training volumes outright (nil), it
+    // does not just shrink them - see TNNetNeuron.SetTrainable.
+    AssertTrue('delta volume freed',
+      NNTrain.Layers[1].Neurons[0].Delta = nil);
+    AssertTrue('inertia volume freed',
+      NNTrain.Layers[1].Neurons[0].BackInertia = nil);
   finally
     OutInfer.Free;
     OutTrain.Free;
