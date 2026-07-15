@@ -157,6 +157,7 @@ type
     procedure TestInt8QuantizeAliasClasses;
     procedure TestInt8QuantizeRectangularConv;
     procedure TestInt8QuantizeEmbedding;
+    procedure TestInt8QuantizeNonFiniteRow;
     procedure TestInt8QuantizeTokenPositionalEmbedding;
     procedure TestInt8QuantizeDepthwiseConv;
     procedure TestInt8QuantizeGroupedConv;
@@ -3586,6 +3587,79 @@ begin
     OutF.Free;
     Input.Free;
     NN.Free;
+  end;
+end;
+
+// Non-finite checkpoint values must not crash int8 quantization: real
+// checkpoints pad the vocab table with untrained garbage rows that can
+// decode to +/-Inf or NaN (Qwen2.5-7B-Instruct does), and Round() of a
+// non-finite value - or even a SIGNALING compare against a NaN - raises
+// EInvalidOp. Covers BOTH fixed routes: the direct row-streaming import
+// (ImportInt8QuantRow on an int8-armed embedding) and the FP32-fill ->
+// QuantizeWeightsInt8 sweep. Convention: NaN codes as 0, +/-Inf clamps to
+// the finite row max (code +/-127), a row with nothing finite non-zero
+// takes the zero-row convention (zero codes, scale 1).
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestInt8QuantizeNonFiniteRow;
+const
+  Vocab = 3;
+  EmbSize = 8;
+var
+  Emb: TNNetEmbedding;
+  Src, W: TNNetVolume;
+  i: integer;
+  NaNv, InfP, InfN: single;
+begin
+  NaNv := math.NaN;
+  InfP := math.Infinity;
+  InfN := math.NegInfinity;
+  // (a) direct streaming import into an int8-armed embedding.
+  Emb := TNNetEmbedding.Create(Vocab, EmbSize, 0, 0.02,
+    {pTrainable=}false, {pQuantizeInt8=}true);
+  Src := TNNetVolume.Create(Vocab * EmbSize, 1, 1);
+  try
+    AssertTrue('constructor armed int8', Emb.WeightsQuantizedInt8);
+    // row 0: finite values mixed with NaN and +/-Inf; finite max = 2.
+    Src.FData[0] := 1;    Src.FData[1] := -2;   Src.FData[2] := NaNv;
+    Src.FData[3] := InfP; Src.FData[4] := InfN; Src.FData[5] := 0.5;
+    Src.FData[6] := -1;   Src.FData[7] := 2;
+    // row 1: nothing finite non-zero -> zero-row convention.
+    Src.FData[8] := NaNv; Src.FData[9] := InfP; Src.FData[10] := InfN;
+    for i := 11 to 15 do Src.FData[i] := 0;
+    // row 2: plain finite row.
+    for i := 16 to 23 do Src.FData[i] := 0.25;
+    for i := 0 to Vocab - 1 do
+      Emb.ImportInt8QuantRow(i, Src, i * EmbSize, 1.0);
+    Emb.DequantizeWeightsInt8();
+    W := Emb.Neurons[0].Weights;
+    // row 0 dequantized: NaN -> 0, +/-Inf -> +/-finite-max (2), finite
+    // values within the scale/2 quantization bound (scale = 2/127).
+    AssertEquals('NaN codes as 0', 0, W.FData[2], 0);
+    AssertEquals('+Inf clamps to finite row max', 2.0, W.FData[3], 1e-6);
+    AssertEquals('-Inf clamps to -finite row max', -2.0, W.FData[4], 1e-6);
+    AssertEquals('finite max exact', 2.0, W.FData[7], 1e-6);
+    AssertEquals('finite value quantizes', 1.0, W.FData[0], 2.0 / 127 / 2 + 1e-9);
+    // row 1: all zero.
+    for i := 8 to 15 do
+      AssertEquals('nothing-finite row is zero ' + IntToStr(i), 0,
+        W.FData[i], 0);
+    // row 2: intact.
+    for i := 16 to 23 do
+      AssertEquals('finite row survives ' + IntToStr(i), 0.25,
+        W.FData[i], 0.25 / 127 / 2 + 1e-9);
+    // (b) FP32-fill -> QuantizeWeightsInt8 sweep over the same table.
+    W.FData[2] := NaNv; W.FData[3] := InfP; W.FData[4] := InfN;
+    Emb.QuantizeWeightsInt8();
+    AssertTrue('sweep quantized without EInvalidOp',
+      Emb.WeightsQuantizedInt8);
+    Emb.DequantizeWeightsInt8();
+    W := Emb.Neurons[0].Weights;
+    AssertEquals('sweep: NaN codes as 0', 0, W.FData[2], 0);
+    AssertEquals('sweep: +Inf clamps', 2.0, W.FData[3], 1e-6);
+    AssertEquals('sweep: -Inf clamps', -2.0, W.FData[4], 1e-6);
+  finally
+    Src.Free;
+    Emb.Free;
   end;
 end;
 
