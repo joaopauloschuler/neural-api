@@ -159,8 +159,13 @@ type
                                  // each turn (decode steps only); for picking the
                                  // next layer class to optimize (e.g. OpenCL)
     NoCacheReuse: boolean;       // force full re-prefill every turn (A/B + debug)
-    KVInt8: boolean;             // --kv-int8: int8-quantized KV cache (~1/4 the
-                                 // KV RAM at long context; logits not bit-exact)
+    KVInt8: boolean;             // int8-quantized KV cache (~1/4 the KV RAM at
+                                 // long context; logits not bit-exact). Follows
+                                 // the weight mode (on with int8 weights, off
+                                 // with --fp32) unless --kv-int8/--kv-fp32
+                                 // picks explicitly - identical CPU/GPU.
+    KVInt8Set: boolean;          // --kv-int8/--kv-fp32 given: skip the
+                                 // follow-the-weights default
     Serial: boolean;             // serial layer loop; default is the parallel
                                  // layer-graph scheduler (ComputeParallel).
                                  // The parallel path also enables intra-layer
@@ -217,7 +222,10 @@ begin
   WriteLn('  --low-memory          drop conv/linear weight cache; per-neuron forward (DEFAULT)');
   WriteLn('  --max-fast-memory     keep the concatenated weight cache (faster forward, more RAM)');
   WriteLn('  --kv-int8             int8-quantized KV cache: ~1/4 the KV RAM at long context');
-  WriteLn('                        (per-row scales; slightly lossy logits, argmax stable)');
+  WriteLn('                        (per-row scales; slightly lossy logits, argmax stable).');
+  WriteLn('                        DEFAULT whenever the weights are int8; --fp32 weights');
+  WriteLn('                        default to the FP32 cache');
+  WriteLn('  --kv-fp32             keep the bit-exact FP32 KV cache with int8 weights');
   WriteLn('  --gpu                 OpenCL offload of conv/linear matmuls (DEFAULT when');
   WriteLn('                        built with -dOpenCL); --cpu forces CPU');
   WriteLn('  --cpu                 force CPU even when built with -dOpenCL');
@@ -269,7 +277,8 @@ begin
   Result.Stats := false;
   Result.Profile := false;
   Result.NoCacheReuse := false;
-  Result.KVInt8 := false; // FP32 KV cache by default (bit-exact decode)
+  Result.KVInt8 := false;    // resolved after parsing: follows the weight mode
+  Result.KVInt8Set := false; // unless --kv-int8/--kv-fp32 picked explicitly
   Result.Serial := false; // parallel layer-graph forward by default (--serial)
   // OpenCL offload defaults ON when the binary is built with -dOpenCL (the
   // default compilation), OFF otherwise; --cpu forces CPU either way.
@@ -345,7 +354,16 @@ begin
     else if Arg = '--stats' then Opt.Stats := true
     else if Arg = '--profile' then Opt.Profile := true
     else if Arg = '--no-cache-reuse' then Opt.NoCacheReuse := true
-    else if Arg = '--kv-int8' then Opt.KVInt8 := true
+    else if Arg = '--kv-int8' then
+    begin
+      Opt.KVInt8 := true;
+      Opt.KVInt8Set := true;
+    end
+    else if Arg = '--kv-fp32' then
+    begin
+      Opt.KVInt8 := false;
+      Opt.KVInt8Set := true;
+    end
     else if Arg = '--serial' then Opt.Serial := true
     else if Arg = '--gpu' then Opt.Gpu := true
     else if Arg = '--cpu' then Opt.Gpu := false
@@ -447,6 +465,11 @@ begin
     end;
     Inc(ArgPos);
   end;
+  // The KV cache follows the weight mode unless picked explicitly: int8
+  // weights get the int8 KV cache (same accuracy philosophy, ~1/4 the KV
+  // RAM), --fp32 weights keep the bit-exact FP32 cache. Identical on CPU
+  // and GPU (the cached decode path is the same code).
+  if not Opt.KVInt8Set then Opt.KVInt8 := Opt.Int8;
   Result := true;
 end;
 
@@ -1026,14 +1049,32 @@ begin
     Args.Add('--max-fast-memory'); Args.Add('--low-memory');
     Check(ParseArgs(Args, Opt) and Opt.LowMemory, '--low-memory re-enables it');
 
-    // int8 KV cache is opt-in.
+    // int8 KV cache follows the weight mode unless picked explicitly, in
+    // any flag order.
     Args.Clear;
     Args.Add('/tmp/model');
-    Check(ParseArgs(Args, Opt) and not Opt.KVInt8, 'kv-int8 off by default');
+    Check(ParseArgs(Args, Opt) and Opt.KVInt8,
+      'kv-int8 on by default (int8 weights are the default)');
     Args.Clear;
     Args.Add('/tmp/model');
-    Args.Add('--kv-int8');
-    Check(ParseArgs(Args, Opt) and Opt.KVInt8, '--kv-int8 enables it');
+    Args.Add('--fp32');
+    Check(ParseArgs(Args, Opt) and not Opt.KVInt8,
+      '--fp32 weights default to the FP32 KV cache');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--kv-fp32');
+    Check(ParseArgs(Args, Opt) and not Opt.KVInt8,
+      '--kv-fp32 opts out with int8 weights');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--kv-int8'); Args.Add('--fp32');
+    Check(ParseArgs(Args, Opt) and Opt.KVInt8,
+      'explicit --kv-int8 beats the --fp32 default in any order');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--fp32'); Args.Add('--kv-int8');
+    Check(ParseArgs(Args, Opt) and Opt.KVInt8,
+      'explicit --kv-int8 beats the --fp32 default in any order (2)');
 
     // OpenCL offload: --gpu/--cpu toggle, platform/device indices parse.
     // (The default depends on the -dOpenCL build define, so only toggles are
@@ -1432,7 +1473,8 @@ begin
   // (they only rewind the cache length).
   Session := TNNetStreamingDecoder.Create(NN, SeqLen, Opt.KVInt8);
   if Opt.KVInt8 then
-    WriteLn('[--kv-int8: int8 KV cache - ~1/4 the KV RAM, logits not bit-exact]');
+    WriteLn('[int8 KV cache (default with int8 weights) - ~1/4 the KV RAM, ',
+      'logits not bit-exact; --kv-fp32 opts out]');
   // Layer-graph parallel forward by default: independent layers of one token
   // step (e.g. an MHA block's sibling heads) run across cores. --serial keeps
   // the classic in-order layer loop. The compute path also drives intra-layer
