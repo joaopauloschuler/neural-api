@@ -1121,7 +1121,14 @@ type
     function GetSSMCount(): integer;
     function GetRopeCount(): integer;
   public
-    constructor Create(pNet: TNNet; pMaxCacheLen: integer);
+    // pInt8KV = true arms the int8-quantized KV cache at construction: the
+    // attention layers allocate the int8 code/scale storage directly and the
+    // full-size FP32 K/V buffers are never allocated (the post-Create
+    // EnableInt8KVCache route frees them, but a churned allocator arena may
+    // never return the already-zero-filled pages to the OS). Same lossy
+    // semantics as EnableInt8KVCache below.
+    constructor Create(pNet: TNNet; pMaxCacheLen: integer;
+      pInt8KV: boolean = false);
     destructor Destroy(); override;
     // Start a fresh sequence: ResetCache on every attention layer, ResetState
     // on every SSM layer. Call before the first prefill token of a sequence.
@@ -4962,7 +4969,8 @@ end;
 
 { TNNetStreamingDecoder }
 
-constructor TNNetStreamingDecoder.Create(pNet: TNNet; pMaxCacheLen: integer);
+constructor TNNetStreamingDecoder.Create(pNet: TNNet; pMaxCacheLen: integer;
+  pInt8KV: boolean);
 var
   i, n, LayerCnt, LayerCntM1: integer;
   Layer: TNNetLayer;
@@ -4986,7 +4994,7 @@ begin
       n := Length(FSDPAs);
       SetLength(FSDPAs, n + 1);
       FSDPAs[n] := TNNetScaledDotProductAttention(Layer);
-      FSDPAs[n].BeginIncrementalDecode(pMaxCacheLen);
+      FSDPAs[n].BeginIncrementalDecode(pMaxCacheLen, pInt8KV);
     end;
     if Layer is TNNetDiagonalSSM then
     begin

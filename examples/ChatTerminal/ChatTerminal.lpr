@@ -159,6 +159,8 @@ type
                                  // each turn (decode steps only); for picking the
                                  // next layer class to optimize (e.g. OpenCL)
     NoCacheReuse: boolean;       // force full re-prefill every turn (A/B + debug)
+    KVInt8: boolean;             // --kv-int8: int8-quantized KV cache (~1/4 the
+                                 // KV RAM at long context; logits not bit-exact)
     Serial: boolean;             // serial layer loop; default is the parallel
                                  // layer-graph scheduler (ComputeParallel).
                                  // The parallel path also enables intra-layer
@@ -214,6 +216,8 @@ begin
   WriteLn('  --fp32                full-precision weights (more RAM, slower)');
   WriteLn('  --low-memory          drop conv/linear weight cache; per-neuron forward (DEFAULT)');
   WriteLn('  --max-fast-memory     keep the concatenated weight cache (faster forward, more RAM)');
+  WriteLn('  --kv-int8             int8-quantized KV cache: ~1/4 the KV RAM at long context');
+  WriteLn('                        (per-row scales; slightly lossy logits, argmax stable)');
   WriteLn('  --gpu                 OpenCL offload of conv/linear matmuls (DEFAULT when');
   WriteLn('                        built with -dOpenCL); --cpu forces CPU');
   WriteLn('  --cpu                 force CPU even when built with -dOpenCL');
@@ -265,6 +269,7 @@ begin
   Result.Stats := false;
   Result.Profile := false;
   Result.NoCacheReuse := false;
+  Result.KVInt8 := false; // FP32 KV cache by default (bit-exact decode)
   Result.Serial := false; // parallel layer-graph forward by default (--serial)
   // OpenCL offload defaults ON when the binary is built with -dOpenCL (the
   // default compilation), OFF otherwise; --cpu forces CPU either way.
@@ -340,6 +345,7 @@ begin
     else if Arg = '--stats' then Opt.Stats := true
     else if Arg = '--profile' then Opt.Profile := true
     else if Arg = '--no-cache-reuse' then Opt.NoCacheReuse := true
+    else if Arg = '--kv-int8' then Opt.KVInt8 := true
     else if Arg = '--serial' then Opt.Serial := true
     else if Arg = '--gpu' then Opt.Gpu := true
     else if Arg = '--cpu' then Opt.Gpu := false
@@ -1020,6 +1026,15 @@ begin
     Args.Add('--max-fast-memory'); Args.Add('--low-memory');
     Check(ParseArgs(Args, Opt) and Opt.LowMemory, '--low-memory re-enables it');
 
+    // int8 KV cache is opt-in.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and not Opt.KVInt8, 'kv-int8 off by default');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--kv-int8');
+    Check(ParseArgs(Args, Opt) and Opt.KVInt8, '--kv-int8 enables it');
+
     // OpenCL offload: --gpu/--cpu toggle, platform/device indices parse.
     // (The default depends on the -dOpenCL build define, so only toggles are
     // asserted here.)
@@ -1411,7 +1426,13 @@ begin
 
   SeqLen := Opt.CtxLen;
   VocabSize := NN.GetLastLayer().Output.Depth;
-  Session := TNNetStreamingDecoder.Create(NN, SeqLen);
+  // int8 KV cache is armed at construction so the FP32 K/V buffers are never
+  // allocated (a post-Create switch frees them, but the allocator arena may
+  // keep the pages). /reset and cache-reuse truncation keep the int8 mode
+  // (they only rewind the cache length).
+  Session := TNNetStreamingDecoder.Create(NN, SeqLen, Opt.KVInt8);
+  if Opt.KVInt8 then
+    WriteLn('[--kv-int8: int8 KV cache - ~1/4 the KV RAM, logits not bit-exact]');
   // Layer-graph parallel forward by default: independent layers of one token
   // step (e.g. an MHA block's sibling heads) run across cores. --serial keeps
   // the classic in-order layer loop. The compute path also drives intra-layer

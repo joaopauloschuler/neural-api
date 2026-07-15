@@ -1994,10 +1994,10 @@ begin
     end;
     SessFP32.Free; SessFP32 := nil;
 
-    // Pass 2: int8 KV cache enabled on a FRESH session. Compare to pass 1.
-    SessInt8 := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    // Pass 2: int8 KV cache armed at CONSTRUCTION (the FP32 K/V buffers are
+    // never allocated). Compare to pass 1.
+    SessInt8 := TNNetStreamingDecoder.Create(Twin, SeqLen, {pInt8KV=}true);
     SessInt8.Reset();
-    SessInt8.EnableInt8KVCache();
     MaxDrift := 0;
     for T := 0 to SeqLen - 1 do
     begin
@@ -2021,6 +2021,21 @@ begin
     // Documented tolerance: max logit drift across the whole pinned prompt.
     AssertTrue('int8 KV logit drift ' + FloatToStr(MaxDrift) +
       ' within tolerance ' + FloatToStr(Tol), MaxDrift < Tol);
+
+    // Pass 3: DisableInt8KVCache on the (reset) session must restore the FP32
+    // K/V storage EnableInt8KV released - the decode must be BIT-EXACT vs
+    // pass 1 again, proving the buffers came back at full size.
+    SessInt8.Reset();
+    SessInt8.DisableInt8KVCache();
+    for T := 0 to SeqLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      SessInt8.StepForward(StepIn, T);
+      for D := 0 to Vocab - 1 do
+        AssertEquals('FP32 restored, logit exact at pos ' + IntToStr(T) +
+          ' dim ' + IntToStr(D),
+          LogitFP32[T][D], SessInt8.Output()[0, 0, D], 0);
+    end;
   finally
     StepIn.Free;
     SessInt8.Free;
