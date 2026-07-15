@@ -214,6 +214,20 @@ type
 
     procedure LoadTensorFlat(const pName: string;
       Dest: TNNetVolume); override;
+    // Row streaming works for every dtype LoadTensorFlat decodes because
+    // ggml never lets a quant block straddle a row: ne[0] is validated at
+    // parse as a multiple of the block size, so row r starts at the
+    // computable byte offset DataBegin + r*(ne[0]/blockElems)*blockBytes
+    // and the per-block dequantizers row-scope cleanly. De-interleave-
+    // registered 2-D tensors are served in HF order by mapping each
+    // requested row through the per-head permutation while locating it -
+    // no full-tensor copy. The 1-D bias targets permute along ne[0]
+    // itself (their "rows" are single elements), so they are NOT
+    // streamable and stay on LoadTensorFlat, which is where the int8
+    // importers load biases anyway. Coded by Claude (AI).
+    function CanStreamTensorRows(const pName: string): boolean; override;
+    procedure LoadTensorRowsFlat(const pName: string;
+      FirstRow, RowCount, RowSize: integer; Dest: TNNetVolume); override;
 
     property Version: integer read FVersion;
     property Alignment: integer read FAlignment;
@@ -1305,6 +1319,192 @@ begin
     if FDeinterleaveNames[i] = pName then
       exit(FDeinterleaveHeadDim[i]);
   Result := 0;
+end;
+
+// TRUE for the ggml dtypes this reader decodes (the LoadTensorFlat set).
+// All of them row-scope: F32/F16 are raw scalars and every supported
+// quant packs whole blocks along the contiguous axis with ne[0] a
+// validated multiple of the block size, so no block ever straddles a
+// row boundary. Coded by Claude (AI).
+function GGMLRowStreamable(TypeId: integer): boolean;
+begin
+  Result := (TypeId = GGML_TYPE_F32) or (TypeId = GGML_TYPE_F16) or
+    (TypeId = GGML_TYPE_Q8_0) or (TypeId = GGML_TYPE_Q2_K) or
+    (TypeId = GGML_TYPE_Q3_K) or (TypeId = GGML_TYPE_Q4_K) or
+    (TypeId = GGML_TYPE_Q5_K) or (TypeId = GGML_TYPE_Q6_K) or
+    (TypeId = GGML_TYPE_Q4_0) or (TypeId = GGML_TYPE_Q4_1) or
+    (TypeId = GGML_TYPE_Q5_0) or (TypeId = GGML_TYPE_Q5_1);
+end;
+
+// Decodes ElemCnt elements of ggml-encoded bytes at Raw into Outp as FP32.
+// Raw must start on a block boundary and ElemCnt must be a whole number
+// of blocks for quantized TypeIds - guaranteed by the callers, which only
+// pass spans of whole ne[0]-rows for quantized dtypes. Coded by Claude (AI).
+procedure DecodeGGMLSpan(TypeId: integer; Raw: PByte; ElemCnt: Int64;
+  Outp: PSingle);
+var
+  i, BlockCnt, NumBlocksM1, ElemCntM1, Q8ElemsM1: Int64;
+  Scale: single;
+  WordPtr: PWord;
+  QuantPtr: PShortInt;
+begin
+  ElemCntM1 := ElemCnt - 1;
+  case TypeId of
+    GGML_TYPE_F32:
+      Move(Raw^, Outp^, ElemCnt * SizeOf(single));
+    GGML_TYPE_F16:
+    begin
+      WordPtr := PWord(Raw);
+      for i := 0 to ElemCntM1 do
+      begin
+        Outp[i] := DecodeF16(WordPtr^);
+        Inc(WordPtr);
+      end;
+    end;
+    GGML_TYPE_Q8_0:
+    begin
+      // f16 scale d then 32 int8 quants per block; x = d * q.
+      Q8ElemsM1 := GGUF_Q8_0_BLOCK_ELEMS - 1;
+      NumBlocksM1 := (ElemCnt div GGUF_Q8_0_BLOCK_ELEMS) - 1;
+      for BlockCnt := 0 to NumBlocksM1 do
+      begin
+        Scale := DecodeF16(PWord(Raw + BlockCnt * GGUF_Q8_0_BLOCK_BYTES)^);
+        QuantPtr := PShortInt(Raw + BlockCnt * GGUF_Q8_0_BLOCK_BYTES + 2);
+        for i := 0 to Q8ElemsM1 do
+        begin
+          Outp[BlockCnt * GGUF_Q8_0_BLOCK_ELEMS + i] := Scale * QuantPtr^;
+          Inc(QuantPtr);
+        end;
+      end;
+    end;
+    GGML_TYPE_Q4_K:
+      DequantizeQ4K(Raw, ElemCnt div GGUF_QK_K, Outp);
+    GGML_TYPE_Q5_K:
+      DequantizeQ5K(Raw, ElemCnt div GGUF_QK_K, Outp);
+    GGML_TYPE_Q2_K:
+      DequantizeQ2K(Raw, ElemCnt div GGUF_QK_K, Outp);
+    GGML_TYPE_Q6_K:
+      DequantizeQ6K(Raw, ElemCnt div GGUF_QK_K, Outp);
+    GGML_TYPE_Q3_K:
+      DequantizeQ3K(Raw, ElemCnt div GGUF_QK_K, Outp);
+    GGML_TYPE_Q4_0:
+      DequantizeQ4_0(Raw, ElemCnt div GGUF_QK_LEGACY, Outp);
+    GGML_TYPE_Q4_1:
+      DequantizeQ4_1(Raw, ElemCnt div GGUF_QK_LEGACY, Outp);
+    GGML_TYPE_Q5_0:
+      DequantizeQ5_0(Raw, ElemCnt div GGUF_QK_LEGACY, Outp);
+    GGML_TYPE_Q5_1:
+      DequantizeQ5_1(Raw, ElemCnt div GGUF_QK_LEGACY, Outp);
+  end;
+end;
+
+function TNNetGGUFReader.CanStreamTensorRows(const pName: string): boolean;
+var
+  Idx: integer;
+begin
+  Idx := FindTensor(pName);
+  if Idx < 0 then
+    raise EGGUFError.CreateFmt(
+      'gguf: tensor "%s" not found in %s', [pName, FFileName]);
+  Result := GGMLRowStreamable(FGGMLTypes[Idx]);
+  // De-interleave targets: only the 2-D projection form streams (rows map
+  // 1:1 through the per-head permutation). The 1-D bias form permutes
+  // single ELEMENTS along ne[0], which breaks the [*, ne[0]] row view -
+  // it stays on LoadTensorFlat (biases are loaded whole anyway).
+  if Result and (DeinterleaveHeadDimFor(pName) > 0) then
+    Result := Length(FTensors[Idx].Shape) = 2;
+end;
+
+procedure TNNetGGUFReader.LoadTensorRowsFlat(const pName: string;
+  FirstRow, RowCount, RowSize: integer; Dest: TNNetVolume);
+var
+  Idx, GGMLType, HeadDim, HalfDim: integer;
+  NumElements, ElemCount, InnerDim, RowBytes: Int64;
+  dr, r, RowInHead, SrcRow, RowCountM1: Int64;
+  RawBytes: TBytes;
+begin
+  Idx := FindTensor(pName);
+  if Idx < 0 then
+    raise EGGUFError.CreateFmt(
+      'gguf: tensor "%s" not found in %s', [pName, FFileName]);
+  GGMLType := FGGMLTypes[Idx];
+  if not GGMLRowStreamable(GGMLType) then
+    raise EGGUFError.CreateFmt(
+      'gguf: tensor "%s" has unsupported ggml dtype %s (supported: F32, ' +
+      'F16, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q4_0, Q4_1, Q5_0, Q5_1): %s',
+      [pName, GGMLTypeName(GGMLType), FFileName]);
+  NumElements := ElementCount(pName);
+  if (FirstRow < 0) or (RowCount <= 0) or (RowSize <= 0) or
+     ((Int64(FirstRow) + RowCount) * RowSize > NumElements) then
+    raise EGGUFError.CreateFmt(
+      'gguf: rows %d..%d of RowSize=%d exceed the %d elements of "%s": %s',
+      [FirstRow, FirstRow + RowCount - 1, RowSize, NumElements, pName,
+       FFileName]);
+  ElemCount := Int64(RowCount) * RowSize;
+  if ElemCount > High(integer) then
+    raise EGGUFError.CreateFmt(
+      'gguf: row range of "%s" is too large (%d elements): %s',
+      [pName, ElemCount, FFileName]);
+  InnerDim := FTensors[Idx].Shape[High(FTensors[Idx].Shape)]; // ggml ne[0]
+  HeadDim := DeinterleaveHeadDimFor(pName);
+  // Quantized rows are only block-aligned at TRUE ne[0] boundaries, and
+  // the de-interleave permutation is defined on true rows too - both need
+  // RowSize = ne[0]. Plain F32/F16 without de-interleave is a raw
+  // contiguous scalar range, so any RowSize consistent with the flat
+  // element count (validated above) reads correctly and is allowed.
+  if (RowSize <> InnerDim) and
+     (((GGMLType <> GGML_TYPE_F32) and (GGMLType <> GGML_TYPE_F16)) or
+      (HeadDim > 0)) then
+    raise EGGUFError.CreateFmt(
+      'gguf: LoadTensorRowsFlat on "%s" (%s%s) needs RowSize = the ' +
+      'contiguous dimension %d, got %d: %s',
+      [pName, GGMLTypeName(GGMLType), BoolToStr(HeadDim > 0,
+       ', de-interleaved', ''), InnerDim, RowSize, FFileName]);
+  if (HeadDim > 0) and (Length(FTensors[Idx].Shape) <> 2) then
+    raise EGGUFError.CreateFmt(
+      'gguf: LoadTensorRowsFlat cannot serve the de-interleaved 1-D ' +
+      'tensor "%s" (%s) - use LoadTensorFlat: %s',
+      [pName, ShapeAsString(pName), FFileName]);
+  // With RowSize a whole number of blocks (= ne[0] for quantized dtypes;
+  // any RowSize for the scalar F32/F16), row r spans exactly RowBytes
+  // starting at DataBegin + r*RowBytes.
+  RowBytes := GGMLByteSize(GGMLType, RowSize);
+  Dest.ReSize(integer(ElemCount), 1, 1);
+  RowCountM1 := RowCount - 1;
+  if HeadDim = 0 then
+  begin
+    // Contiguous stored rows: one ranged read, one decode sweep.
+    SetLength(RawBytes, Int64(RowCount) * RowBytes);
+    FStreams[0].Position := FDataStarts[0] + FTensors[Idx].DataBegin +
+      Int64(FirstRow) * RowBytes;
+    FStreams[0].ReadBuffer(RawBytes[0], Length(RawBytes));
+    DecodeGGMLSpan(GGMLType, PByte(@RawBytes[0]), ElemCount,
+      PSingle(@Dest.FData[0]));
+  end
+  else
+  begin
+    // De-interleaved q/k projection: serve HF rotate_half order. The HF
+    // row r lives at stored row SrcRow per llama.cpp's per-head permute
+    // (hf_row[p] = stored[2p], hf_row[p + HeadDim/2] = stored[2p+1]) -
+    // the same mapping LoadTensorFlat applies, here used to LOCATE each
+    // row instead of shuffling a full-tensor copy.
+    HalfDim := HeadDim div 2;
+    SetLength(RawBytes, RowBytes);
+    for dr := 0 to RowCountM1 do
+    begin
+      r := Int64(FirstRow) + dr;
+      RowInHead := r mod HeadDim;
+      if RowInHead < HalfDim then
+        SrcRow := (r - RowInHead) + 2 * RowInHead
+      else
+        SrcRow := (r - RowInHead) + 2 * (RowInHead - HalfDim) + 1;
+      FStreams[0].Position := FDataStarts[0] + FTensors[Idx].DataBegin +
+        SrcRow * RowBytes;
+      FStreams[0].ReadBuffer(RawBytes[0], Length(RawBytes));
+      DecodeGGMLSpan(GGMLType, PByte(@RawBytes[0]), RowSize,
+        PSingle(@Dest.FData[dr * RowSize]));
+    end;
+  end;
 end;
 
 procedure TNNetGGUFReader.LoadTensorFlat(const pName: string;

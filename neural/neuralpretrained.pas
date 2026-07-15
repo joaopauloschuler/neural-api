@@ -14199,10 +14199,39 @@ procedure LoadLlamaLinearWeights(Reader: TNNetSafeTensorsReader;
   SrcRowBase: integer = 0; SrcRows: integer = 0);
 var
   W, B: TNNetVolume;
-  i, j, TargetIdx, HeadIdx, RowInHead, TargetRow, HalfDim, SrcRow: integer;
+  i, j, TargetIdx, HalfDim, SrcRow: integer;
   OutDimM1, InDimM1: integer;
+  QLayer: TNNetLayerConcatedWeights;
+  DirectInt8: boolean;
+  ChunkRows, RowsInChunk, RowCnt: integer;
+
+  // Maps checkpoint row pRow (0-based within this OutDim slice) to its
+  // neuron index: the rotate_half -> interleaved rotary reorder (restricted
+  // to the rotary slice; RowInHead >= RotaryDims is the partial-rotary
+  // pass-through tail and keeps its position) plus the NeuronBase offset.
+  function MapTargetNeuron(pRow: integer): integer;
+  var
+    HeadIdx, RowInHead, TargetRow: integer;
+  begin
+    if RotaryHeadDim > 0 then
+    begin
+      HeadIdx := pRow div RotaryHeadDim;
+      RowInHead := pRow mod RotaryHeadDim;
+      TargetRow := RowInHead;
+      if RowInHead < RotaryDims then
+      begin
+        if RowInHead < HalfDim then
+          TargetRow := 2 * RowInHead
+        else
+          TargetRow := 2 * (RowInHead - HalfDim) + 1;
+      end;
+      Result := HeadIdx * RotaryHeadDim + TargetRow + NeuronBase;
+    end
+    else
+      Result := pRow + NeuronBase;
+  end;
+
 begin
-  EnsureWritableImportWeights(Layer);
   if ExpectedNeurons < 0 then ExpectedNeurons := OutDim;
   if SrcRows <= 0 then SrcRows := OutDim;
   if SrcRowBase + OutDim > SrcRows then
@@ -14246,15 +14275,27 @@ begin
       IntToStr(RotaryHeadDim) + ' with an even rotary slice ' +
       IntToStr(RotaryDims) + '.');
   HalfDim := RotaryDims div 2;
+  QLayer := nil;
+  if Layer is TNNetLayerConcatedWeights then
+    QLayer := TNNetLayerConcatedWeights(Layer);
+  // Direct-to-int8 row streaming: when the layer already sits in the armed
+  // int8 container (TNNet.BuildQuantInt8) and the checkpoint tensor is a
+  // plain dense F32/F16/BF16 matrix, every row is read and quantized
+  // straight into the int8 codes. The FP32 restore
+  // (EnsureWritableImportWeights) + full-tensor W + requantize-sweep
+  // round-trip is skipped entirely, so peak memory is one small chunk of
+  // rows instead of ~2x the tensor's FP32 bytes. The codes are the ones
+  // the FP32 round-trip would produce (a uniform Scale cancels out of the
+  // per-row quantization), see TNNetLayerConcatedWeights.ImportInt8QuantRow.
+  DirectInt8 := (QLayer <> nil) and QLayer.WeightsQuantizedInt8 and
+    (QLayer.QuantInt8VectorSize = InDim) and
+    (not IsNF4QuantizedTensor(Reader, WName)) and
+    Reader.CanStreamTensorRows(WName);
+  if not DirectInt8 then
+    EnsureWritableImportWeights(Layer);
   W := TNNetVolume.Create;
   B := nil;
   try
-    if IsNF4QuantizedTensor(Reader, WName) then
-      // bnb-4bit: expand the packed nibbles + FP32 absmax into a flat F32
-      // [SrcRows, InDim] buffer; the rest of the loader is dtype-agnostic.
-      LoadNF4QuantizedTensorFlat(Reader, WName, SrcRows, InDim, W)
-    else
-      Reader.LoadTensorFlat(WName, W);
     if BiasName <> '' then
     begin
       B := TNNetVolume.Create;
@@ -14262,41 +14303,58 @@ begin
     end;
     OutDimM1 := OutDim - 1;
     InDimM1 := InDim - 1;
-    for j := 0 to OutDimM1 do
+    if DirectInt8 then
     begin
-      if RotaryHeadDim > 0 then
+      // ~4 MB of FP32 rows per read keeps the syscall count low while
+      // bounding the scratch far below the full [SrcRows, InDim] tensor.
+      ChunkRows := (4 * 1024 * 1024) div (InDim * 4);
+      if ChunkRows < 1 then ChunkRows := 1;
+      if ChunkRows > OutDim then ChunkRows := OutDim;
+      j := 0;
+      while j < OutDim do
       begin
-        HeadIdx := j div RotaryHeadDim;
-        RowInHead := j mod RotaryHeadDim;
-        // rotate_half -> interleaved, restricted to the rotary slice
-        // (RowInHead >= RotaryDims is the partial-rotary pass-through
-        // tail and keeps its position).
-        TargetRow := RowInHead;
-        if RowInHead < RotaryDims then
+        RowsInChunk := ChunkRows;
+        if j + RowsInChunk > OutDim then RowsInChunk := OutDim - j;
+        Reader.LoadTensorRowsFlat(WName, SrcRowBase + j, RowsInChunk,
+          InDim, W);
+        for RowCnt := 0 to RowsInChunk - 1 do
         begin
-          if RowInHead < HalfDim then
-            TargetRow := 2 * RowInHead
+          TargetIdx := MapTargetNeuron(j + RowCnt);
+          QLayer.ImportInt8QuantRow(TargetIdx, W, RowCnt * InDim, Scale);
+          if B <> nil then
+            Layer.FArrNeurons[TargetIdx].BiasWeight :=
+              Scale * B.FData[SrcRowBase + j + RowCnt]
           else
-            TargetRow := 2 * (RowInHead - HalfDim) + 1;
+            Layer.FArrNeurons[TargetIdx].BiasWeight := 0; // bias-free Linear
         end;
-        TargetIdx := HeadIdx * RotaryHeadDim + TargetRow;
-      end
+        Inc(j, RowsInChunk);
+      end;
+    end
+    else
+    begin
+      if IsNF4QuantizedTensor(Reader, WName) then
+        // bnb-4bit: expand the packed nibbles + FP32 absmax into a flat F32
+        // [SrcRows, InDim] buffer; the rest of the loader is dtype-agnostic.
+        LoadNF4QuantizedTensorFlat(Reader, WName, SrcRows, InDim, W)
       else
-        TargetIdx := j;
-      TargetIdx := TargetIdx + NeuronBase;
-      SrcRow := SrcRowBase + j;
-      if Layer.FArrNeurons[TargetIdx].Weights.Size <> InDim then
-        ImportError('Llama import: internal error - neuron ' +
-          IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
-          IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
-          ' weights, expected ' + IntToStr(InDim) + '.');
-      for i := 0 to InDimM1 do
-        Layer.FArrNeurons[TargetIdx].Weights.FData[i] :=
-          Scale * W.FData[SrcRow * InDim + i];
-      if B <> nil then
-        Layer.FArrNeurons[TargetIdx].BiasWeight := Scale * B.FData[SrcRow]
-      else
-        Layer.FArrNeurons[TargetIdx].BiasWeight := 0; // bias-free Linear
+        Reader.LoadTensorFlat(WName, W);
+      for j := 0 to OutDimM1 do
+      begin
+        TargetIdx := MapTargetNeuron(j);
+        SrcRow := SrcRowBase + j;
+        if Layer.FArrNeurons[TargetIdx].Weights.Size <> InDim then
+          ImportError('Llama import: internal error - neuron ' +
+            IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
+            IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
+            ' weights, expected ' + IntToStr(InDim) + '.');
+        for i := 0 to InDimM1 do
+          Layer.FArrNeurons[TargetIdx].Weights.FData[i] :=
+            Scale * W.FData[SrcRow * InDim + i];
+        if B <> nil then
+          Layer.FArrNeurons[TargetIdx].BiasWeight := Scale * B.FData[SrcRow]
+        else
+          Layer.FArrNeurons[TargetIdx].BiasWeight := 0; // bias-free Linear
+      end;
     end;
   finally
     B.Free;
@@ -14960,6 +15018,11 @@ var
   Tmp: TNNetVolume;
   BlockPrefix, TensorNameStr, LMHeadName, FusedName: string;
   QBiasName, KBiasName, VBiasName: string;
+  EmbName: string;
+  EmbDirect: boolean;
+  EmbFold: TNeuralFloat;
+  QHeadCW: TNNetLayerConcatedWeights;
+  EmbChunkRows, EmbRowsInChunk, EmbRowCnt: integer;
   Consumed: TStringList;
 
   procedure MarkConsumed(const TName: string);
@@ -15093,8 +15156,14 @@ begin
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real token (<unk> in the Llama vocab),
       // not padding.
+      // pTrainable/pQuantizeInt8 forwarded so the constructor sizes only
+      // what this build needs: no Delta/BackInertia when inference-only,
+      // and no FP32 vocab table at all when int8-armed (the vocab table is
+      // the single largest tensor - the old create-3xFP32-then-shrink
+      // sequence set a process-lifetime allocator high-water mark).
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1,
+        {ScaleEmbedding=}0.02, pTrainable, pQuantizeInt8
         ).SetTrainable(pTrainable) );
       // pQuantizeInt8: idempotent block-by-block sweeps (same pattern as
       // SetTrainable) keep peak RAM at quantized-net + one FP32 block
@@ -15497,31 +15566,19 @@ begin
         QProjScale := QScale;
       Tmp := TNNetVolume.Create;
       try
-        // embed_tokens -> embedding table (vocab rows of d floats,
-        // row-major both in the checkpoint and in TNNetEmbedding).
-        Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
-        EnsureWritableImportWeights(EmbeddingLayer);
-        if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
-          ImportError('Llama import: embed_tokens.weight element count ' +
-            IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
-            IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
-        EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
+        EmbName := Config.Prefix + 'embed_tokens.weight';
         // Config.EmbedScale (Gemma: sqrt(hidden_size)) scales the embedding
         // OUTPUT; TNNetEmbedding's ScaleEmbedding is init-only, so the scale
         // is folded into the embedding ROWS instead. ONLY the embedding copy
-        // is scaled - the tied LM head below reads the UNSCALED Tmp rows,
-        // matching HF GemmaForCausalLM (the head ties to the raw matrix).
+        // is scaled - the tied LM head below reads the UNSCALED checkpoint
+        // rows, matching HF GemmaForCausalLM (the head ties to the raw
+        // matrix). Config.EmbeddingMultiplier (Granite) folds the same way.
+        EmbFold := 1.0;
         if (Config.EmbedScale <> 0) and (Config.EmbedScale <> 1.0) then
-          EmbeddingLayer.FArrNeurons[0].Weights.Mul(Config.EmbedScale);
-        // Config.EmbeddingMultiplier (Granite): scale token embeddings AFTER
-        // lookup - folded into the embedding rows like EmbedScale (and, like
-        // EmbedScale, NOT into the tied LM head, which reads the raw Tmp rows
-        // matching HF GraniteForCausalLM tying to the unscaled matrix).
+          EmbFold := EmbFold * Config.EmbedScale;
         if (Config.EmbeddingMultiplier <> 0) and
            (Config.EmbeddingMultiplier <> 1.0) then
-          EmbeddingLayer.FArrNeurons[0].Weights.Mul(Config.EmbeddingMultiplier);
-        EmbeddingLayer.FlushWeightCache();
-        MarkConsumed(Config.Prefix + 'embed_tokens.weight');
+          EmbFold := EmbFold * Config.EmbeddingMultiplier;
         // Config.LogitsScaling (Granite): HF DIVIDES the final logits by
         // logits_scaling before softmax. Fold 1/logits_scaling into the LM
         // head rows (exactly the Cohere logit_scale fold, but dividing).
@@ -15529,29 +15586,121 @@ begin
           LogitScaleFold := 1.0 / Config.LogitsScaling
         else
           LogitScaleFold := 1.0;
-        if Config.TieWordEmbeddings then
+        // Direct-to-int8 vocab-table streaming: the vocab table is the
+        // single largest tensor of the checkpoint, and the FP32 route
+        // below briefly holds up to THREE copies of it (Tmp + dequantized
+        // embedding + dequantized tied head). When the embedding (and,
+        // when tied, the LM head) already sits in the armed int8 container
+        // and the tensor is dense F32/F16/BF16, each row chunk is read
+        // once and quantized straight into BOTH containers - the codes are
+        // identical (a uniform row scale cancels), only the per-row scales
+        // carry the EmbFold / LogitScaleFold difference.
+        EmbDirect := pQuantizeInt8 and (EmbeddingLayer is TNNetEmbedding) and
+          TNNetEmbedding(EmbeddingLayer).WeightsQuantizedInt8 and
+          (TNNetEmbedding(EmbeddingLayer).VocabSize = Config.VocabSize) and
+          (TNNetEmbedding(EmbeddingLayer).EmbeddingSize = Config.HiddenSize)
+          and Reader.CanStreamTensorRows(EmbName);
+        QHeadCW := nil;
+        if LMHead is TNNetLayerConcatedWeights then
+          QHeadCW := TNNetLayerConcatedWeights(LMHead);
+        if EmbDirect and Config.TieWordEmbeddings then
+          EmbDirect := (QHeadCW <> nil) and QHeadCW.WeightsQuantizedInt8 and
+            (QHeadCW.QuantInt8VectorSize = Config.HiddenSize) and
+            (QHeadCW.Neurons.Count = Config.VocabSize);
+        if EmbDirect then
         begin
-          // Tied LM head: logits = (h . embed^T) / logits_scaling (rows
-          // copied with the 1/logits_scaling fold, bias-free).
-          EnsureWritableImportWeights(LMHead);
-          VocabSizeM1 := Config.VocabSize - 1;
-          HiddenSizeM1 := Config.HiddenSize - 1;
-          for j := 0 to VocabSizeM1 do
+          // ~4 MB of FP32 rows per read (same chunking as
+          // LoadLlamaLinearWeights' direct path).
+          EmbChunkRows := (4 * 1024 * 1024) div (Config.HiddenSize * 4);
+          if EmbChunkRows < 1 then EmbChunkRows := 1;
+          if EmbChunkRows > Config.VocabSize then
+            EmbChunkRows := Config.VocabSize;
+          j := 0;
+          while j < Config.VocabSize do
           begin
-            for i := 0 to HiddenSizeM1 do
-              LMHead.FArrNeurons[j].Weights.FData[i] :=
-                LogitScaleFold * Tmp.FData[j * Config.HiddenSize + i];
-            LMHead.FArrNeurons[j].BiasWeight := 0;
+            EmbRowsInChunk := EmbChunkRows;
+            if j + EmbRowsInChunk > Config.VocabSize then
+              EmbRowsInChunk := Config.VocabSize - j;
+            Reader.LoadTensorRowsFlat(EmbName, j, EmbRowsInChunk,
+              Config.HiddenSize, Tmp);
+            for EmbRowCnt := 0 to EmbRowsInChunk - 1 do
+            begin
+              TNNetEmbedding(EmbeddingLayer).ImportInt8QuantRow(
+                j + EmbRowCnt, Tmp, EmbRowCnt * Config.HiddenSize, EmbFold);
+              if Config.TieWordEmbeddings then
+              begin
+                // Tied LM head: logits = (h . embed^T) / logits_scaling
+                // (same codes, LogitScaleFold in the scale, bias-free).
+                QHeadCW.ImportInt8QuantRow(j + EmbRowCnt, Tmp,
+                  EmbRowCnt * Config.HiddenSize, LogitScaleFold);
+                LMHead.FArrNeurons[j + EmbRowCnt].BiasWeight := 0;
+              end;
+            end;
+            Inc(j, EmbRowsInChunk);
           end;
-          LMHead.FlushWeightCache();
-          // A redundant serialized lm_head.weight is ignorable when tied.
-          if Reader.HasTensor(LMHeadName) then MarkConsumed(LMHeadName);
+          EmbeddingLayer.FlushWeightCache();
+          MarkConsumed(EmbName);
+          if Config.TieWordEmbeddings then
+          begin
+            LMHead.FlushWeightCache();
+            // A redundant serialized lm_head.weight is ignorable when tied.
+            if Reader.HasTensor(LMHeadName) then MarkConsumed(LMHeadName);
+          end
+          else
+          begin
+            LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
+              Config.HiddenSize, Config.VocabSize, 0, -1, 0, '',
+              LogitScaleFold);
+            MarkConsumed(LMHeadName);
+          end;
         end
         else
         begin
-          LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
-            Config.HiddenSize, Config.VocabSize, 0, -1, 0, '', LogitScaleFold);
-          MarkConsumed(LMHeadName);
+          // embed_tokens -> embedding table (vocab rows of d floats,
+          // row-major both in the checkpoint and in TNNetEmbedding).
+          Reader.LoadTensorFlat(EmbName, Tmp);
+          EnsureWritableImportWeights(EmbeddingLayer);
+          if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
+            ImportError('Llama import: embed_tokens.weight element count ' +
+              IntToStr(Tmp.Size) + ' does not match the embedding table ' +
+              'size ' +
+              IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+          EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
+          // Two separate Muls (not one EmbFold multiply): keeps this FP32
+          // path bit-identical to its historical rounding.
+          if (Config.EmbedScale <> 0) and (Config.EmbedScale <> 1.0) then
+            EmbeddingLayer.FArrNeurons[0].Weights.Mul(Config.EmbedScale);
+          if (Config.EmbeddingMultiplier <> 0) and
+             (Config.EmbeddingMultiplier <> 1.0) then
+            EmbeddingLayer.FArrNeurons[0].Weights.Mul(
+              Config.EmbeddingMultiplier);
+          EmbeddingLayer.FlushWeightCache();
+          MarkConsumed(EmbName);
+          if Config.TieWordEmbeddings then
+          begin
+            // Tied LM head: logits = (h . embed^T) / logits_scaling (rows
+            // copied with the 1/logits_scaling fold, bias-free).
+            EnsureWritableImportWeights(LMHead);
+            VocabSizeM1 := Config.VocabSize - 1;
+            HiddenSizeM1 := Config.HiddenSize - 1;
+            for j := 0 to VocabSizeM1 do
+            begin
+              for i := 0 to HiddenSizeM1 do
+                LMHead.FArrNeurons[j].Weights.FData[i] :=
+                  LogitScaleFold * Tmp.FData[j * Config.HiddenSize + i];
+              LMHead.FArrNeurons[j].BiasWeight := 0;
+            end;
+            LMHead.FlushWeightCache();
+            // A redundant serialized lm_head.weight is ignorable when tied.
+            if Reader.HasTensor(LMHeadName) then MarkConsumed(LMHeadName);
+          end
+          else
+          begin
+            LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
+              Config.HiddenSize, Config.VocabSize, 0, -1, 0, '',
+              LogitScaleFold);
+            MarkConsumed(LMHeadName);
+          end;
         end;
       finally
         Tmp.Free;
@@ -16845,6 +16994,9 @@ type
       Src: TNNetVolume);
     procedure LoadTensorFlat(const pName: string;
       Dest: TNNetVolume); override;
+    // Tensors live in owned volumes, not raw stream bytes - the base
+    // reader's ranged read does not apply. Coded by Claude (AI).
+    function CanStreamTensorRows(const pName: string): boolean; override;
   end;
 
 constructor TNNetMemTensorReader.Create;
@@ -16892,6 +17044,12 @@ begin
   FTensors[Idx].DataBegin := 0;
   FTensors[Idx].DataEnd := Elems * 4;
   FTensors[Idx].Shard := 0;
+end;
+
+function TNNetMemTensorReader.CanStreamTensorRows(
+  const pName: string): boolean;
+begin
+  Result := false;
 end;
 
 procedure TNNetMemTensorReader.LoadTensorFlat(const pName: string;
@@ -26126,6 +26284,9 @@ type
     destructor Destroy; override;
     procedure LoadTensorFlat(const pName: string;
       Dest: TNNetVolume); override;
+    // Synthetic view over FInner (wqkv slices) - no raw bytes of its own.
+    // Coded by Claude (AI).
+    function CanStreamTensorRows(const pName: string): boolean; override;
   end;
 
 procedure TNNetInternLM2Reader.AddSynthetic(const HFName, SrcName: string;
@@ -26214,6 +26375,12 @@ destructor TNNetInternLM2Reader.Destroy;
 begin
   FInner.Free;
   inherited Destroy;
+end;
+
+function TNNetInternLM2Reader.CanStreamTensorRows(
+  const pName: string): boolean;
+begin
+  Result := false;
 end;
 
 procedure TNNetInternLM2Reader.LoadTensorFlat(const pName: string;
@@ -52764,6 +52931,9 @@ type
     destructor Destroy; override;
     procedure LoadTensorFlat(const pName: string;
       Dest: TNNetVolume); override;
+    // Synthetic view over FInner (fused/reshaped tensors) - no raw bytes
+    // of its own. Coded by Claude (AI).
+    function CanStreamTensorRows(const pName: string): boolean; override;
   end;
 
 procedure TNNetOpenClipReader.AddSynthetic(const HFName, SrcName: string;
@@ -52867,6 +53037,12 @@ destructor TNNetOpenClipReader.Destroy;
 begin
   FInner.Free;
   inherited Destroy;
+end;
+
+function TNNetOpenClipReader.CanStreamTensorRows(
+  const pName: string): boolean;
+begin
+  Result := false;
 end;
 
 procedure TNNetOpenClipReader.LoadTensorFlat(const pName: string;

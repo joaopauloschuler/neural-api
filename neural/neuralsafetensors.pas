@@ -100,6 +100,23 @@ type
     // quantized blocks, neuralgguf.pas) can decode their own dtypes.
     procedure LoadTensorFlat(const pName: string;
       Dest: TNNetVolume); virtual;
+    // TRUE when the named tensor can be served by LoadTensorRowsFlat: its
+    // bytes live raw (undecoded, contiguous row-major) in FStreams at the
+    // recorded offsets in a dtype that routine decodes (F32/F16/BF16). Row
+    // streaming lets the int8 importers quantize per weight row without
+    // ever materializing the whole tensor in FP32. Format siblings whose
+    // LoadTensorFlat override decodes or synthesizes tensor content (GGUF
+    // quantized blocks, in-memory and synthetic-view readers) MUST override
+    // this to false unless they also override LoadTensorRowsFlat.
+    // Coded by Claude (AI).
+    function CanStreamTensorRows(const pName: string): boolean; virtual;
+    // Loads rows FirstRow..FirstRow+RowCount-1 of the named tensor - viewed
+    // flat row-major as [*, RowSize] - into Dest, resized to
+    // (RowCount*RowSize, 1, 1). Element i of Dest receives element
+    // (FirstRow*RowSize)+i of the flat tensor. Only valid when
+    // CanStreamTensorRows returns true. Coded by Claude (AI).
+    procedure LoadTensorRowsFlat(const pName: string;
+      FirstRow, RowCount, RowSize: integer; Dest: TNNetVolume); virtual;
     // Loads the named tensor's RAW on-disk bytes verbatim into Dest (no dtype
     // decoding). Used by the MXFP4 dequant-at-load path (gpt-oss), whose
     // packed-nibble "*_blocks" and E8M0 "*_scales" tensors ship as U8 and must
@@ -842,6 +859,80 @@ begin
     begin
       Dest.FData[i] := Int64Ptr^;
       Inc(Int64Ptr);
+    end;
+  end;
+end;
+
+function TNNetSafeTensorsReader.CanStreamTensorRows(
+  const pName: string): boolean;
+var
+  DType: string;
+begin
+  DType := GetDType(pName);
+  Result := (DType = 'F32') or (DType = 'F16') or (DType = 'BF16');
+end;
+
+procedure TNNetSafeTensorsReader.LoadTensorRowsFlat(const pName: string;
+  FirstRow, RowCount, RowSize: integer; Dest: TNNetVolume);
+var
+  Info: TSafeTensorInfo;
+  NumElements, ElemBegin, ElemCount, i, MaxIdx: Int64;
+  DSize: integer;
+  RawBytes: TBytes;
+  WordPtr: PWord;
+  SinglePtr: PSingle;
+begin
+  Info := GetInfo(pName);
+  if (Info.DType <> 'F32') and (Info.DType <> 'F16') and
+     (Info.DType <> 'BF16') then
+    raise ESafeTensorsError.CreateFmt(
+      'safetensors: LoadTensorRowsFlat on "%s" needs dtype F32, F16 or ' +
+      'BF16, got "%s": %s', [pName, Info.DType, FFileName]);
+  NumElements := ElementCount(pName);
+  if (FirstRow < 0) or (RowCount <= 0) or (RowSize <= 0) or
+     ((Int64(FirstRow) + RowCount) * RowSize > NumElements) then
+    raise ESafeTensorsError.CreateFmt(
+      'safetensors: rows %d..%d of RowSize=%d exceed the %d elements of ' +
+      '"%s": %s', [FirstRow, FirstRow + RowCount - 1, RowSize, NumElements,
+      pName, FFileName]);
+  ElemCount := Int64(RowCount) * RowSize;
+  if ElemCount > High(integer) then
+    raise ESafeTensorsError.CreateFmt(
+      'safetensors: row range of "%s" is too large (%d elements): %s',
+      [pName, ElemCount, FFileName]);
+  ElemBegin := Int64(FirstRow) * RowSize;
+  DSize := DTypeByteSize(Info.DType);
+  Dest.ReSize(integer(ElemCount), 1, 1);
+  MaxIdx := ElemCount - 1;
+  SetLength(RawBytes, ElemCount * DSize);
+  FStreams[Info.Shard].Position := FDataStarts[Info.Shard] +
+    Info.DataBegin + ElemBegin * DSize;
+  FStreams[Info.Shard].ReadBuffer(RawBytes[0], Length(RawBytes));
+  if Info.DType = 'F32' then
+  begin
+    SinglePtr := PSingle(@RawBytes[0]);
+    for i := 0 to MaxIdx do
+    begin
+      Dest.FData[i] := SinglePtr^;
+      Inc(SinglePtr);
+    end;
+  end
+  else if Info.DType = 'F16' then
+  begin
+    WordPtr := PWord(@RawBytes[0]);
+    for i := 0 to MaxIdx do
+    begin
+      Dest.FData[i] := DecodeF16(WordPtr^);
+      Inc(WordPtr);
+    end;
+  end
+  else // BF16
+  begin
+    WordPtr := PWord(@RawBytes[0]);
+    for i := 0 to MaxIdx do
+    begin
+      Dest.FData[i] := DecodeBF16(WordPtr^);
+      Inc(WordPtr);
     end;
   end;
 end;
