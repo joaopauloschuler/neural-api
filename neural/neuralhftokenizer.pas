@@ -376,6 +376,26 @@ type
 function HFDecodeUnicodeEscapes(const S: string): string;
 function HFParseJSONRaw(const S: string): TJSONData;
 
+// fpjson's TJSONObject stores member names in a TFPHashObjectList whose
+// keys are SHORTSTRINGS: every object key is silently truncated to its
+// first 255 bytes. Keys that share a 255-byte prefix then collide and
+// parsing raises EJSON "Duplicate object member" -- the GPT-NeoX tokenizer
+// lineage (mamba/mamba2, pythia, gpt-neox-20b, stablelm-alpha) carries
+// whitespace-run vocab keys up to 1024 bytes, and StarCoder2/GPT-2 have
+// 256..512-byte indentation keys that would silently alias even without
+// the exception.
+//   * HFShieldLongJSONKeys scans the (already escape-decoded) JSON text
+//     and replaces the content of every object KEY longer than 255 bytes
+//     with a short unique ASCII placeholder, recording
+//     '<placeholder>=<original unescaped key>' in ShieldedKeys.
+//   * HFUnshieldJSONKey maps a retrieved key back: the original for a
+//     placeholder, the key unchanged otherwise.
+// String VALUES have no length limit in fpjson, so only keys need this.
+function HFShieldLongJSONKeys(const S: string;
+  ShieldedKeys: TStrings): string;
+function HFUnshieldJSONKey(const Key: string;
+  ShieldedKeys: TStrings): string;
+
 implementation
 
 uses
@@ -1143,6 +1163,128 @@ begin
   Result := ParseJSONRaw(S);
 end;
 
+// Decodes the two-character escapes of a JSON string body to the bytes
+// fpjson would have produced (\uXXXX is already handled upstream by
+// DecodeUnicodeEscapes, so only \" \\ \/ \b \f \n \r \t remain).
+function UnescapeJSONStringBody(const S: string): string;
+var
+  Position, Total, OutPos: integer;
+  C: char;
+begin
+  Total := Length(S);
+  SetLength(Result, Total);
+  OutPos := 0;
+  Position := 1;
+  while Position <= Total do
+  begin
+    C := S[Position];
+    if (C = '\') and (Position < Total) then
+    begin
+      Inc(Position);
+      case S[Position] of
+        'b': C := #8;
+        'f': C := #12;
+        'n': C := #10;
+        'r': C := #13;
+        't': C := #9;
+        else C := S[Position]; // '"', '\', '/': the char itself
+      end;
+    end;
+    Inc(OutPos);
+    Result[OutPos] := C;
+    Inc(Position);
+  end;
+  SetLength(Result, OutPos);
+end;
+
+function HFShieldLongJSONKeys(const S: string;
+  ShieldedKeys: TStrings): string;
+const
+  // TFPHashObjectList (fpjson's member-name store) truncates shortstring
+  // keys to this many bytes.
+  csMaxHashKeyBytes = 255;
+var
+  SpanStart, SpanEnd: array of integer; // key-content byte spans, inclusive
+  SpanCnt: integer;
+  Position, Total, ContentStart, ContentEnd, Look: integer;
+  Cnt, Prev: integer;
+  Marker, Placeholder: string;
+begin
+  Result := S;
+  Total := Length(S);
+  SpanCnt := 0;
+  Position := 1;
+  while Position <= Total do
+  begin
+    if S[Position] = '"' then
+    begin
+      ContentStart := Position + 1;
+      Position := ContentStart;
+      while (Position <= Total) and (S[Position] <> '"') do
+        if S[Position] = '\' then Inc(Position, 2) else Inc(Position);
+      ContentEnd := Position - 1;
+      Inc(Position); // step past the closing quote
+      if ContentEnd - ContentStart + 1 > csMaxHashKeyBytes then
+      begin
+        // a string is an object KEY exactly when the next non-whitespace
+        // byte is ':' (a value is followed by ',', '}' or ']')
+        Look := Position;
+        while (Look <= Total) and (S[Look] in [' ', #9, #10, #13]) do
+          Inc(Look);
+        if (Look <= Total) and (S[Look] = ':') then
+        begin
+          if SpanCnt = Length(SpanStart) then
+          begin
+            SetLength(SpanStart, SpanCnt * 2 + 4);
+            SetLength(SpanEnd, SpanCnt * 2 + 4);
+          end;
+          SpanStart[SpanCnt] := ContentStart;
+          SpanEnd[SpanCnt] := ContentEnd;
+          Inc(SpanCnt);
+        end;
+      end;
+    end
+    else
+      Inc(Position);
+  end;
+  if SpanCnt = 0 then exit;
+  // grow the marker until it appears nowhere in the document, so a
+  // placeholder can never collide with a real key
+  Marker := '~neural.longkey.';
+  while Pos(Marker, S) > 0 do Marker := '~' + Marker;
+  Result := '';
+  Prev := 1;
+  for Cnt := 0 to SpanCnt - 1 do
+  begin
+    Placeholder := Marker + IntToStr(ShieldedKeys.Count) + '~';
+    ShieldedKeys.Add(Placeholder + '=' + UnescapeJSONStringBody(
+      Copy(S, SpanStart[Cnt], SpanEnd[Cnt] - SpanStart[Cnt] + 1)));
+    // spans are rare (a handful of whitespace-run vocab keys), so plain
+    // concatenation stays linear in practice
+    Result := Result + Copy(S, Prev, SpanStart[Cnt] - Prev) + Placeholder;
+    Prev := SpanEnd[Cnt] + 1;
+  end;
+  Result := Result + Copy(S, Prev, Total - Prev + 1);
+end;
+
+function HFUnshieldJSONKey(const Key: string;
+  ShieldedKeys: TStrings): string;
+var
+  Cnt, CntMax, EqPos: integer;
+  Entry: string;
+begin
+  Result := Key;
+  if (ShieldedKeys = nil) or (ShieldedKeys.Count = 0) then exit;
+  CntMax := ShieldedKeys.Count - 1;
+  for Cnt := 0 to CntMax do
+  begin
+    Entry := ShieldedKeys[Cnt];
+    EqPos := Pos('=', Entry);
+    if (EqPos - 1 = Length(Key)) and (Copy(Entry, 1, EqPos - 1) = Key) then
+      Exit(Copy(Entry, EqPos + 1, Length(Entry)));
+  end;
+end;
+
 procedure TNeuralHFTokenizer.DetectKeyMangling();
 var
   Probe: TJSONData;
@@ -1209,9 +1351,10 @@ var
   VocabCnt, VocabObjCnt, MergesCnt, AddedCnt: integer;
   VocabCntM1, VocabObjCntM1, AddedCntM1: integer;
   Score: double;
-  Left, Right, MergeStr, NormType, Content: string;
+  Left, Right, MergeStr, NormType, Content, Restored: string;
   SpacePos: integer;
   Node: TJSONData;
+  ShieldedKeys: TStringList;
 
   procedure AddNormalizer(NormObj: TJSONObject);
   var
@@ -1497,9 +1640,15 @@ begin
     LoadSentencePieceModel(FileName);
     Exit;
   end;
-  // decode \uXXXX up front (see DecodeUnicodeEscapes) and parse raw
-  Root := ParseJSONRaw(DecodeUnicodeEscapes(RawJson));
+  // decode \uXXXX up front (see DecodeUnicodeEscapes), shield object keys
+  // longer than fpjson's 255-byte member-name limit (see
+  // HFShieldLongJSONKeys: GPT-NeoX-lineage vocabs carry whitespace-run
+  // keys up to 1024 bytes) and parse raw
+  ShieldedKeys := TStringList.Create();
+  Root := nil;
   try
+    Root := ParseJSONRaw(HFShieldLongJSONKeys(
+      DecodeUnicodeEscapes(RawJson), ShieldedKeys));
     if not (Root is TJSONObject) then
       raise EHFTokenizerError.Create('tokenizer.json: root is not an object');
     RootObj := TJSONObject(Root);
@@ -1562,7 +1711,14 @@ begin
       for Cnt := 0 to VocabObjCntM1 do
       begin
         TokenId := VocabObj.Items[Cnt].AsInteger;
-        Content := FixJSONKey(VocabObj.Names[Cnt]);
+        Content := VocabObj.Names[Cnt];
+        Restored := HFUnshieldJSONKey(Content, ShieldedKeys);
+        if Restored <> Content then
+          // shielded long key: raw bytes captured before fpjson, so the
+          // widestring-manager mangling FixJSONKey inverts never happened
+          Content := Restored
+        else
+          Content := FixJSONKey(Content);
         FVocab.AddObject(Content, TObject(PtrInt(TokenId)));
         FIdToToken[TokenId] := Content;
       end;
@@ -1644,6 +1800,7 @@ begin
       AddDecoder(TJSONObject(Node));
   finally
     Root.Free;
+    ShieldedKeys.Free;
   end;
 end;
 
