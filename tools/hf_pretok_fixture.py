@@ -292,6 +292,112 @@ def build_bytelevel_noregex():
                             ["x<|endoftext|>y"])
 
 
+# StarCoder2/SantaCoder style: Sequence[Digits(individual_digits=True),
+# ByteLevel(use_regex=True)] -- every numeric codepoint isolated on the RAW
+# text BEFORE the GPT-2 regex split. Numerals are restricted to the ranges
+# the Pascal IsNumberCP table covers (ASCII, ²³¹¼½¾, Arabic-Indic,
+# Devanagari, fullwidth); rarer \p{N} scripts would not be byte-parity
+# (same approximation stance as the cl100k/DeepSeek splitters).
+DIGITS_CASES = [
+    "Hello world",
+    "abc 123456 def",
+    "price: 12,345.67",
+    "a  12",
+    " 999",
+    "1234567",
+    "x²y and 2³=8",
+    "٣٤٥ and १२३",
+    "v1.2.3-rc4",
+    "  leading and  multiple   spaces",
+    "trailing 12   ",
+    "tabs\there\nnewline 42",
+    "Don't stop at 3.14!",
+    "a1b22c333d4444e",
+    "",
+]
+
+
+def build_digits_bytelevel():
+    path = os.path.join(FIXDIR, 'tiny_bpe_digits_bytelevel_tokenizer.json')
+    if not os.path.exists(path):
+        tok = Tokenizer(models.BPE())
+        tok.pre_tokenizer = pre_tokenizers.Sequence([
+            pre_tokenizers.Digits(individual_digits=True),
+            pre_tokenizers.ByteLevel(add_prefix_space=False,
+                                     use_regex=True),
+        ])
+        tok.decoder = decoders.ByteLevel()
+        trainer = trainers.BpeTrainer(
+            vocab_size=400, special_tokens=["<|endoftext|>"],
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet())
+        tok.train_from_iterator(CORPUS, trainer)
+        tok.save(path)
+    tok = Tokenizer.from_file(path)  # verify (re)load
+    return path, dump_cases(tok, DIGITS_CASES, ["x<|endoftext|>y"])
+
+
+# The Falcon-family 4-stage Sequence (falcon-7b/40b/rw and falcon-mamba):
+#   Punctuation(Contiguous) -> ByteLevel(use_regex=True) ->
+#   Digits(individual_digits=False) -> Split("[0-9][0-9][0-9]", Isolated).
+# The digit stages run on the byte-MAPPED text, so self-mapped latin-1
+# bytes that render as numeric superscripts/fractions (B2/B3/B9/BC/BD/BE)
+# split too -- 'м' (D0 BC) -> 'Ð' + '¼' is real HF behavior, pinned below.
+FALCON_PRE_TOKENIZER = {
+    "type": "Sequence",
+    "pretokenizers": [
+        {"type": "Punctuation", "behavior": "Contiguous"},
+        {"type": "ByteLevel", "add_prefix_space": False,
+         "trim_offsets": True, "use_regex": True},
+        {"type": "Digits", "individual_digits": False},
+        {"type": "Split", "pattern": {"Regex": "[0-9][0-9][0-9]"},
+         "behavior": "Isolated", "invert": False},
+    ],
+}
+
+FALCON_CASES = [
+    "Hello world",
+    "hello, world!! ...ok",
+    "abc 123456 def",
+    "price: 12,345.67",
+    "a  12",
+    " 999",
+    "1234567",
+    "12½3456",
+    "½6789",
+    "м and мир 999",
+    "x²y",
+    "٣٤٥",
+    "Don't stop at 3.14159265!",
+    "(555) 123-4567 ext. 89",
+    "  leading and  multiple   spaces",
+    "trailing 12   ",
+    "tabs\there\nnewline 42",
+    "",
+]
+
+
+def build_falcon_seq():
+    path = os.path.join(FIXDIR, 'tiny_bpe_falcon_seq_tokenizer.json')
+    if not os.path.exists(path):
+        # Same raw-json route as the DeepSeek fixture: train with a
+        # placeholder, then install the exact 4-stage Sequence.
+        tok = Tokenizer(models.BPE())
+        tok.pre_tokenizer = pre_tokenizers.Sequence([
+            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
+        ])  # placeholder; overwritten below
+        tok.decoder = decoders.ByteLevel()
+        trainer = trainers.BpeTrainer(
+            vocab_size=400, special_tokens=["<|endoftext|>"],
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet())
+        tok.train_from_iterator(CORPUS, trainer)
+        data = json.loads(tok.to_str())
+        data['pre_tokenizer'] = FALCON_PRE_TOKENIZER
+        with open(path, 'w') as f:
+            json.dump(data, f, ensure_ascii=False)
+    tok = Tokenizer.from_file(path)  # verify (re)load with real pre-tok
+    return path, dump_cases(tok, FALCON_CASES, ["x<|endoftext|>y"])
+
+
 def build_metaspace_pretok():
     path = os.path.join(FIXDIR, 'tiny_bpe_metaspace_pretok_tokenizer.json')
     if not os.path.exists(path):
@@ -333,6 +439,8 @@ def main():
     d_path, d_cases = build_deepseek_split()
     b_path, b_cases = build_bytelevel_noregex()
     m_path, m_cases = build_metaspace_pretok()
+    g_path, g_cases = build_digits_bytelevel()
+    f_path, f_cases = build_falcon_seq()
     cases_path = os.path.join(FIXDIR, 'hf_tokenizer_cases.json')
     with open(cases_path) as f:
         out = json.load(f)
@@ -348,9 +456,14 @@ def main():
                                 "cases": b_cases}
     out["metaspace_pretok"] = {"tokenizer": os.path.basename(m_path),
                                "cases": m_cases}
+    out["digits_bytelevel"] = {"tokenizer": os.path.basename(g_path),
+                               "cases": g_cases}
+    out["falcon_seq"] = {"tokenizer": os.path.basename(f_path),
+                         "cases": f_cases}
     with open(cases_path, 'w') as f:
         json.dump(out, f, ensure_ascii=False, indent=1)
-    for p in (q_path, c_path, o_path, d_path, b_path, m_path, cases_path):
+    for p in (q_path, c_path, o_path, d_path, b_path, m_path, g_path,
+              f_path, cases_path):
         print(p, os.path.getsize(p), 'bytes')
 
 

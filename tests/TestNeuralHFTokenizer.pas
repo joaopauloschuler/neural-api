@@ -43,6 +43,8 @@ type
     procedure TestSplitDeepSeekParityWithHF;
     procedure TestSplitO200kParityWithHF;
     procedure TestByteLevelNoRegexParityWithHF;
+    procedure TestDigitsByteLevelParityWithHF;
+    procedure TestFalconSequenceParityWithHF;
     procedure TestMetaspacePreTokenizerParityWithHF;
     procedure TestRejectsUnknownSplitPattern;
     procedure TestNFCComposesDecomposedInput;
@@ -544,6 +546,25 @@ end;
 procedure TTestNeuralHFTokenizer.TestByteLevelNoRegexParityWithHF;
 begin
   RunParityBattery('bytelevel_noregex');
+end;
+
+// StarCoder2/SantaCoder style Sequence[Digits(individual_digits=true),
+// ByteLevel(use_regex=true)]: every numeric codepoint isolated on the RAW
+// text before the GPT-2 regex split. Cases include ²/٣/१ numerals (the
+// \p{N} ranges IsNumberCP covers).
+procedure TTestNeuralHFTokenizer.TestDigitsByteLevelParityWithHF;
+begin
+  RunParityBattery('digits_bytelevel');
+end;
+
+// Falcon-family 4-stage Sequence (falcon-7b/40b/rw + falcon-mamba):
+// Punctuation(Contiguous) -> ByteLevel(use_regex=true) -> Digits(false) ->
+// Split("[0-9][0-9][0-9]", Isolated). The digit stages act on the
+// byte-MAPPED text -- the pinned cases include 'м' -> 'Ð'+'¼' (mapped byte
+// BC renders as the numeric ¼) and left-to-right 3-digit chunking.
+procedure TTestNeuralHFTokenizer.TestFalconSequenceParityWithHF;
+begin
+  RunParityBattery('falcon_seq');
 end;
 
 // Mistral / legacy=false Llama style Metaspace PRE_TOKENIZER

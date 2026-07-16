@@ -183,6 +183,17 @@ type
       // o200k_base / GPT-4o-family Split pattern (case-aware letter runs --
       // see SplitO200kPieces).
       FO200kPreTok: boolean;
+      // Digits pre-tokenizer BEFORE ByteLevel (StarCoder2/SantaCoder:
+      // Sequence[Digits, ByteLevel]): numeric codepoints are isolated on the
+      // RAW text ahead of the GPT-2 regex split. individual_digits=true ->
+      // every numeric codepoint is its own piece.
+      FDigitsPreTok: boolean;
+      FDigitsIndividual: boolean;
+      // Falcon-family 4-stage Sequence (Punctuation(Contiguous) -> ByteLevel
+      // -> Digits(individual=false) -> Split three-ASCII-digits), detected
+      // as a WHOLE and dispatched to SplitFalconMappedPieces: the digit
+      // stages run on the byte-MAPPED text, unlike the generic Digits path.
+      FFalconPreTok: boolean;
       // Metaspace pre-tokenizer (Llama-2 / Mistral SentencePiece-BPE)
       FMetaspacePreTok: boolean;
       FMSReplacement: string;     // usually U+2581
@@ -232,6 +243,10 @@ type
       procedure SplitDeepSeekPieces(const Segment: string;
         Pieces: TStringList);
       procedure SplitO200kPieces(const Segment: string;
+        Pieces: TStringList);
+      procedure SplitDigitsPieces(const Segment: string;
+        IndividualDigits: boolean; Pieces: TStringList);
+      procedure SplitFalconMappedPieces(const Segment: string;
         Pieces: TStringList);
       function MapPieceToByteLevel(const Piece: string): TStringList;
       function FindAddedToken(const Text: string; Position: integer;
@@ -1091,6 +1106,9 @@ begin
   FSplitDigitsMax := 1;
   FDeepSeekPreTok := false;
   FO200kPreTok := false;
+  FDigitsPreTok := false;
+  FDigitsIndividual := false;
+  FFalconPreTok := false;
   FMetaspacePreTok := false;
   FMSReplacement := csMetaspace;
   FMSPrependScheme := 'always';
@@ -1460,6 +1478,29 @@ var
     Result := HasNL and HasLetters and HasDigits and HasByteLevel;
   end;
 
+  // Detects the Falcon-family pre-tokenizer Sequence as a WHOLE:
+  //   Punctuation(Contiguous) -> ByteLevel(use_regex=true) ->
+  //   Digits(individual_digits=false) -> Split("[0-9][0-9][0-9]", Isolated)
+  // (falcon-7b/40b/rw and falcon-mamba all ship exactly this). Stage ORDER
+  // matters here: the digit isolation and three-digit chunking run on the
+  // byte-MAPPED text, which SplitFalconMappedPieces reproduces in one pass.
+  // Recursing child-by-child would both hit the unsupported standalone
+  // Punctuation kind and mis-order the digit stages.
+  function MatchesFalconSequence(Arr: TJSONArray): boolean;
+  begin
+    Result := (Arr.Count = 4) and
+      (Arr.Objects[0].Get('type', '') = 'Punctuation') and
+      (Arr.Objects[0].Get('behavior', '') = 'Contiguous') and
+      (Arr.Objects[1].Get('type', '') = 'ByteLevel') and
+      Arr.Objects[1].Get('use_regex', true) and
+      (not Arr.Objects[1].Get('add_prefix_space', false)) and
+      (Arr.Objects[2].Get('type', '') = 'Digits') and
+      (not Arr.Objects[2].Get('individual_digits', false)) and
+      (ChildRegex(Arr.Objects[3]) = '[0-9][0-9][0-9]') and
+      (Arr.Objects[3].Get('behavior', '') = 'Isolated') and
+      (not Arr.Objects[3].Get('invert', false));
+  end;
+
   procedure AddPreTokenizer(PreObj: TJSONObject);
   var
     Kind, Pattern: string;
@@ -1485,6 +1526,14 @@ var
         FAddPrefixSpace := false;
         Exit;
       end;
+      if MatchesFalconSequence(InnerArr) then
+      begin
+        FFalconPreTok := true;
+        FByteLevel := true;
+        FByteLevelUseRegex := false;
+        FAddPrefixSpace := false;
+        Exit;
+      end;
       InnerMax := InnerArr.Count - 1;
       for InnerCnt := 0 to InnerMax do
         AddPreTokenizer(InnerArr.Objects[InnerCnt]);
@@ -1502,6 +1551,19 @@ var
     else if Kind = 'BertPreTokenizer' then
       // whitespace split + isolated punctuation; keyed off FWordPiece in
       // EncodeSegment (BertPieces), nothing else to configure
+    else if Kind = 'Digits' then
+    begin
+      // Digits on the RAW text (StarCoder2/SantaCoder: Sequence[Digits,
+      // ByteLevel]). Only the digits-BEFORE-ByteLevel order is supported on
+      // this generic path -- the digits-AFTER order changes piece boundaries
+      // (the digit test then sees the byte-mapped text) and is only handled
+      // by the whole-sequence Falcon match above.
+      if FByteLevel then
+        raise EHFTokenizerError.Create(
+          'Unsupported pre_tokenizer order: Digits after ByteLevel');
+      FDigitsPreTok := true;
+      FDigitsIndividual := PreObj.Get('individual_digits', false);
+    end
     else if Kind = 'Metaspace' then
     begin
       // Llama-2/Mistral SentencePiece-BPE: space -> U+2581 replacement,
@@ -1795,6 +1857,12 @@ begin
     Node := RootObj.Find('pre_tokenizer');
     if (Node <> nil) and (Node is TJSONObject) then
       AddPreTokenizer(TJSONObject(Node));
+    // The generic Digits path is only wired into the ByteLevel branch of
+    // EncodeSegment; accepting it alongside any other pipeline would
+    // silently skip the digit isolation.
+    if FDigitsPreTok and (not FByteLevel) then
+      raise EHFTokenizerError.Create(
+        'Unsupported pre_tokenizer: Digits without ByteLevel');
     Node := RootObj.Find('decoder');
     if (Node <> nil) and (Node is TJSONObject) then
       AddDecoder(TJSONObject(Node));
@@ -2650,6 +2718,160 @@ begin
         Idx := RunEnd + 1;
       end;
     end;
+  end;
+end;
+
+// The Digits pre-tokenizer: isolates \p{N} codepoints from everything else.
+// IndividualDigits=true -> every numeric codepoint is its own piece
+// (StarCoder2); false -> maximal numeric runs are single pieces (Falcon).
+procedure TNeuralHFTokenizer.SplitDigitsPieces(const Segment: string;
+  IndividualDigits: boolean; Pieces: TStringList);
+var
+  Position, RunStart, CPStart, SegLen: integer;
+  InDigits: boolean;
+begin
+  SegLen := Length(Segment);
+  Position := 1;
+  RunStart := 1;
+  InDigits := false;
+  while Position <= SegLen do
+  begin
+    CPStart := Position;
+    if IsNumberCP(NextCodePoint(Segment, Position)) then
+    begin
+      if (CPStart > RunStart) and (not InDigits) then
+      begin
+        Pieces.Add(Copy(Segment, RunStart, CPStart - RunStart));
+        RunStart := CPStart;
+      end;
+      InDigits := true;
+      if IndividualDigits then
+      begin
+        Pieces.Add(Copy(Segment, CPStart, Position - CPStart));
+        RunStart := Position;
+        InDigits := false;
+      end;
+    end
+    else
+    begin
+      if InDigits and (CPStart > RunStart) then
+      begin
+        Pieces.Add(Copy(Segment, RunStart, CPStart - RunStart));
+        RunStart := CPStart;
+      end;
+      InDigits := false;
+    end;
+  end;
+  if RunStart <= SegLen then
+    Pieces.Add(Copy(Segment, RunStart, SegLen - RunStart + 1));
+end;
+
+// Reproduces the Falcon-family pre-tokenizer Sequence in one pass:
+//   1. Punctuation(Contiguous): maximal punctuation runs isolated,
+//   2. ByteLevel(use_regex=true): GPT-2 regex split within each piece,
+//      then the bytes->unicode alphabet mapping,
+//   3. Digits(individual_digits=false): numeric-codepoint runs isolated on
+//      the MAPPED text -- self-mapped latin-1 bytes B2/B3/B9/BC/BD/BE render
+//      as numeric superscripts/fractions and split too, e.g. Cyrillic 'м'
+//      (D0 BC) becomes 'Ð' + '¼' exactly as HF does,
+//   4. Split("[0-9][0-9][0-9]", Isolated): ASCII digit runs chunked into
+//      threes left-to-right, remainder (1-2 digits) trailing.
+// Emits byte-MAPPED pieces: the caller BPEs them per codepoint WITHOUT a
+// MapPieceToByteLevel pass.
+procedure TNeuralHFTokenizer.SplitFalconMappedPieces(const Segment: string;
+  Pieces: TStringList);
+var
+  SubPieces, DigitRuns: TStringList;
+  Position, CPStart, RunStart, SegLen: integer;
+  InPunct, CPPunct: boolean;
+
+  // stage 4: cut every run of >=3 ASCII digits into leading triples; the
+  // gaps and the 1-2 digit remainders coalesce with what follows them.
+  procedure ChunkThreeDigits(const Piece: string);
+  var
+    BytePos, PieceStart, RunLen, PieceLen: integer;
+  begin
+    PieceLen := Length(Piece);
+    BytePos := 1;
+    PieceStart := 1;
+    while BytePos <= PieceLen do
+    begin
+      if Piece[BytePos] in ['0'..'9'] then
+      begin
+        RunLen := 1;
+        while (BytePos + RunLen <= PieceLen) and
+          (Piece[BytePos + RunLen] in ['0'..'9']) do
+          Inc(RunLen);
+        if RunLen >= 3 then
+        begin
+          if BytePos > PieceStart then
+            Pieces.Add(Copy(Piece, PieceStart, BytePos - PieceStart));
+          while RunLen >= 3 do
+          begin
+            Pieces.Add(Copy(Piece, BytePos, 3));
+            Inc(BytePos, 3);
+            Dec(RunLen, 3);
+          end;
+          PieceStart := BytePos;
+          Inc(BytePos, RunLen);
+        end
+        else
+          Inc(BytePos, RunLen);
+      end
+      else
+        Inc(BytePos);
+    end;
+    if PieceStart <= PieceLen then
+      Pieces.Add(Copy(Piece, PieceStart, PieceLen - PieceStart + 1));
+  end;
+
+  // stages 2-4 for one punctuation-stage piece
+  procedure EmitRun(const Run: string);
+  var
+    Cnt, SubCnt, ByteCnt, SubLen: integer;
+    Mapped: string;
+  begin
+    SubPieces.Clear;
+    ByteLevelPieces(Run, SubPieces);
+    for Cnt := 0 to SubPieces.Count - 1 do
+    begin
+      Mapped := '';
+      SubLen := Length(SubPieces[Cnt]);
+      for ByteCnt := 1 to SubLen do
+        Mapped := Mapped +
+          CodePointToUTF8(FByteToCP[Ord(SubPieces[Cnt][ByteCnt])]);
+      DigitRuns.Clear;
+      SplitDigitsPieces(Mapped, false, DigitRuns);
+      for SubCnt := 0 to DigitRuns.Count - 1 do
+        ChunkThreeDigits(DigitRuns[SubCnt]);
+    end;
+  end;
+
+begin
+  SegLen := Length(Segment);
+  SubPieces := TStringList.Create();
+  DigitRuns := TStringList.Create();
+  try
+    // stage 1: Punctuation(Contiguous) over the raw codepoints
+    Position := 1;
+    RunStart := 1;
+    InPunct := false;
+    while Position <= SegLen do
+    begin
+      CPStart := Position;
+      CPPunct := IsBertPunctuationCP(NextCodePoint(Segment, Position));
+      if (CPStart > RunStart) and (CPPunct <> InPunct) then
+      begin
+        EmitRun(Copy(Segment, RunStart, CPStart - RunStart));
+        RunStart := CPStart;
+      end;
+      InPunct := CPPunct;
+    end;
+    if RunStart <= SegLen then
+      EmitRun(Copy(Segment, RunStart, SegLen - RunStart + 1));
+  finally
+    DigitRuns.Free;
+    SubPieces.Free;
   end;
 end;
 
@@ -3540,7 +3762,7 @@ end;
 procedure TNeuralHFTokenizer.EncodeSegment(const Segment: string;
   Ids: TIntegerList; IsFirstSegment: boolean);
 var
-  Pieces, Symbols: TStringList;
+  Pieces, Symbols, DigitPieces: TStringList;
   Cnt, Position, RunStart, PieceStart, PiecesCnt, NormReplaceHi: integer;
   Normalized: string;
   Seg: string;
@@ -3642,6 +3864,35 @@ begin
       Pieces.Free;
     end;
   end
+  else if FFalconPreTok then
+  begin
+    // Falcon 4-stage Sequence: the splitter emits byte-MAPPED pieces (its
+    // digit stages run on the mapped text), so BPE consumes them per
+    // codepoint directly, with NO MapPieceToByteLevel pass.
+    Pieces := TStringList.Create();
+    try
+      SplitFalconMappedPieces(Seg, Pieces);
+      PiecesCnt := Pieces.Count - 1;
+      for Cnt := 0 to PiecesCnt do
+      begin
+        Symbols := TStringList.Create();
+        try
+          Position := 1;
+          while Position <= Length(Pieces[Cnt]) do
+          begin
+            RunStart := Position;
+            NextCodePoint(Pieces[Cnt], Position);
+            Symbols.Add(Copy(Pieces[Cnt], RunStart, Position - RunStart));
+          end;
+          BPEWord(Symbols, Ids);
+        finally
+          Symbols.Free;
+        end;
+      end;
+    finally
+      Pieces.Free;
+    end;
+  end
   else if FSplitPreTok then
   begin
     // Sequence[Split(cl100k-style), ByteLevel(use_regex=false)]:
@@ -3666,18 +3917,43 @@ begin
   end
   else if FByteLevel then
   begin
-    Normalized := Seg;
-    if FAddPrefixSpace and (Length(Normalized) > 0) and
-      (Normalized[1] <> ' ') then
-      Normalized := ' ' + Normalized;
     Pieces := TStringList.Create();
     try
-      if FByteLevelUseRegex then
-        ByteLevelPieces(Normalized, Pieces)
-      else if Length(Normalized) > 0 then
-        // use_regex=false: NO GPT-2 regex split -- the whole segment is a
-        // single chunk fed straight to the byte-level alphabet + BPE.
-        Pieces.Add(Normalized);
+      if FDigitsPreTok then
+      begin
+        // Digits stage FIRST on the raw text (HF order: Digits precedes
+        // ByteLevel, whose prefix space lands on the first digit-stage
+        // piece), then the GPT-2 regex within each piece -- regex matches
+        // never cross piece boundaries.
+        DigitPieces := TStringList.Create();
+        try
+          SplitDigitsPieces(Seg, FDigitsIndividual, DigitPieces);
+          if FAddPrefixSpace and (DigitPieces.Count > 0) and
+            (Copy(DigitPieces[0], 1, 1) <> ' ') then
+            DigitPieces[0] := ' ' + DigitPieces[0];
+          PiecesCnt := DigitPieces.Count - 1;
+          for Cnt := 0 to PiecesCnt do
+            if FByteLevelUseRegex then
+              ByteLevelPieces(DigitPieces[Cnt], Pieces)
+            else
+              Pieces.Add(DigitPieces[Cnt]);
+        finally
+          DigitPieces.Free;
+        end;
+      end
+      else
+      begin
+        Normalized := Seg;
+        if FAddPrefixSpace and (Length(Normalized) > 0) and
+          (Normalized[1] <> ' ') then
+          Normalized := ' ' + Normalized;
+        if FByteLevelUseRegex then
+          ByteLevelPieces(Normalized, Pieces)
+        else if Length(Normalized) > 0 then
+          // use_regex=false: NO GPT-2 regex split -- the whole segment is a
+          // single chunk fed straight to the byte-level alphabet + BPE.
+          Pieces.Add(Normalized);
+      end;
       PiecesCnt := Pieces.Count - 1;
       for Cnt := 0 to PiecesCnt do
       begin
