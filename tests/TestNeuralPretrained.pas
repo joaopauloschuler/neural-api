@@ -138,6 +138,7 @@ type
     procedure TestGPTNeoXSafeTensorsRoundTrip;
     procedure TestBloomSafeTensorsRoundTrip;
     procedure TestMambaSafeTensorsRoundTrip;
+    procedure TestFalconMambaSafeTensorsRoundTrip;
     procedure TestRWKVSafeTensorsRoundTrip;
     procedure TestT5SafeTensorsRoundTrip;
     procedure TestMarianSafeTensorsRoundTrip;
@@ -228,6 +229,7 @@ type
     procedure TestMixtralLogitParity;
     procedure TestRWKVLogitParity;
     procedure TestMambaLogitParity;
+    procedure TestFalconMambaLogitParity;
     procedure TestMamba2LogitParity;
     procedure TestRecurrentGemmaLogitParity;
     procedure TestJambaLogitParity;
@@ -2343,6 +2345,65 @@ begin
   end;
 end;
 
+// SaveMambaToSafeTensors round-trip for the falcon_mamba (inner-norm)
+// variant: the dt path never folded, so dt_proj.weight and the x_proj dt
+// rows round-trip RAW (no LU re-factorization) and the unit inner gains
+// carry no checkpoint tensor - the re-import must reproduce the logits.
+procedure TTestNeuralPretrained.TestFalconMambaSafeTensorsRoundTrip;
+var
+  NN, NN2: TNNet;
+  Config, Config2: TMambaConfig;
+  Input, Out1, Out2: TNNetVolume;
+  TmpPath: string;
+  i, s, SeqLen, Vocab: integer;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  TmpPath := GetTempDir(false) + 'cai_falcon_mamba_roundtrip_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  NN := BuildMambaFromSafeTensorsEx(
+    FixturePath('tiny_falcon_mamba.safetensors'), Config, {SeqLen=}8,
+    {pTrainable=}true, FixturePath('tiny_falcon_mamba_config.json'));
+  Input := TNNetVolume.Create;
+  Out1 := TNNetVolume.Create;
+  Out2 := TNNetVolume.Create;
+  NN2 := nil;
+  try
+    AssertTrue('inner RMSNorm mode', Config.InnerRMSNorm);
+    SaveMambaToSafeTensors(NN, Config, TmpPath);
+    NN2 := BuildMambaFromSafeTensorsEx(TmpPath, Config2, {SeqLen=}8,
+      {pTrainable=}true, FixturePath('tiny_falcon_mamba_config.json'));
+    SeqLen := 8;
+    Vocab := Config.VocabSize;
+    Input.ReSize(SeqLen, 1, 1);
+    MaxDiff := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to SeqLen - 1 do
+        Input[i, 0, 0] := (s * 5 + i * 3 + 1) mod Vocab;
+      NN.Compute(Input);
+      NN.GetOutput(Out1);
+      NN2.Compute(Input);
+      NN2.GetOutput(Out2);
+      AssertEquals('falcon_mamba round-trip output size',
+        Out1.Size, Out2.Size);
+      for i := 0 to Out1.Size - 1 do
+        if Abs(Out1.FData[i] - Out2.FData[i]) > MaxDiff then
+          MaxDiff := Abs(Out1.FData[i] - Out2.FData[i]);
+    end;
+    // F32, all tensors raw: the round-trip is near bit-exact.
+    AssertTrue('falcon_mamba safetensors round-trip: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    if FileExists(TmpPath) then DeleteFile(TmpPath);
+    Out2.Free;
+    Out1.Free;
+    Input.Free;
+    NN2.Free;
+    NN.Free;
+  end;
+end;
+
 // SaveRWKVToSafeTensors round-trip: import tiny_rwkv -> export -> re-import
 // and assert the logits match. F32; the only non-raw tensor is time_decay,
 // reconstructed by the FORWARD softplus (the exact inverse of LoadWKVDecay's
@@ -3209,10 +3270,12 @@ begin
     for i := 0 to OutTrain.Size - 1 do
       AssertEquals('post-build SetTrainable logit ' + IntToStr(i),
         OutTrain.FData[i], OutInfer.FData[i], 0);
-    AssertEquals('delta volume shrunk', 1,
-      NNTrain.Layers[1].Neurons[0].Delta.Size);
-    AssertEquals('inertia volume shrunk', 1,
-      NNTrain.Layers[1].Neurons[0].BackInertia.Size);
+    // SetTrainable(false) frees the training volumes outright (nil), it
+    // does not just shrink them - see TNNetNeuron.SetTrainable.
+    AssertTrue('delta volume freed',
+      NNTrain.Layers[1].Neurons[0].Delta = nil);
+    AssertTrue('inertia volume freed',
+      NNTrain.Layers[1].Neurons[0].BackInertia = nil);
   finally
     OutInfer.Free;
     OutTrain.Free;
@@ -8079,10 +8142,78 @@ begin
   end;
 end;
 
+// Verifies the FALCON-MAMBA import target (HF model_type "falcon_mamba",
+// architectures ["FalconMambaForCausalLM"], tiiuae/falcon-mamba-7b) - Mamba-1
+// plus a WEIGHTLESS per-vector RMSNorm on the dt / B / C selection vectors
+// between the x_proj split and the scan (rms_forward, config mixer_rms_eps),
+// mapped onto TNNetSelectiveSSM's Jamba inner-norm mode with unit gains and
+// the dt path UNFOLDED (the plain-Mamba W_d fold is invalid across the norm).
+// tests/fixtures/tiny_falcon_mamba.* is a pico randomly-initialized HF
+// FalconMambaForCausalLM (2 layers, hidden 8, d_inner 16, d_state 4,
+// dt_rank 2, conv_kernel 4, vocab 13, UNTIED head like the real 7B,
+// mixer_rms_eps pinned to the NON-default 1e-3). The generator
+// tools/falcon_mamba_tiny_fixture.py ASSERTS each quirk is non-vacuous by
+// re-running the float64 slow-path oracle with that single quirk disabled
+// (max logit |diff|s: inner RMSNorms 161.3, eps 1e-3-vs-1e-6 0.055,
+// dt softplus 6.9, d_state>1 5.8, untied head 7.6 - all above the 1e-4
+// parity gate) and that the W_d fold is mathematically WRONG here.
+// Reference logits come from HF transformers' CPU slow_forward in float64.
+// The BuildFromPretrained model_type "falcon_mamba" dispatch is covered too.
+procedure TTestNeuralPretrained.TestFalconMambaLogitParity;
+var
+  NN: TNNet;
+  Config: TMambaConfig;
+  LayerCnt, ScanCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildMambaFromSafeTensorsEx(
+    FixturePath('tiny_falcon_mamba.safetensors'), Config, {SeqLen=}8,
+    {pTrainable=}true, FixturePath('tiny_falcon_mamba_config.json'));
+  try
+    AssertEquals('model_type', 'falcon_mamba', Config.ModelType);
+    AssertTrue('inner RMSNorm mode', Config.InnerRMSNorm);
+    AssertEquals('mixer_rms_eps', 1e-3, Config.MixerRmsEps, 1e-9);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('d_inner (expand*hidden)', 16, Config.DInner);
+    AssertEquals('dt_rank', 2, Config.TimeStepRank);
+    AssertFalse('untied head (real falcon-mamba ships lm_head.weight)',
+      Config.TieWordEmbeddings);
+    // Every scan must be a TNNetSelectiveSSM built in the Jamba inner-norm
+    // mode (structure encoding d_state=4;innermode=1;dt_rank=2) - the plain
+    // folded scan would silently skip the dt/B/C norms.
+    ScanCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+      if NN.Layers[LayerCnt] is TNNetSelectiveSSM then
+      begin
+        Inc(ScanCnt);
+        AssertEquals('scan in Jamba inner-norm mode', 1,
+          Pos('TNNetSelectiveSSM:4;1;2;',
+            NN.Layers[LayerCnt].SaveStructureToString()));
+      end;
+    AssertEquals('TNNetSelectiveSSM count (1 per block)', 2, ScanCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_falcon_mamba_logits.json'), 8, Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "falcon_mamba" (architectures ["FalconMambaForCausalLM"]) onto the
+  // same path.
+  NN := BuildFromPretrained(FixturePath('tiny_falcon_mamba.safetensors'),
+    {SeqLen=}8, {pTrainable=}true,
+    FixturePath('tiny_falcon_mamba_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_falcon_mamba_logits.json'), 8, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
 // Verifies the MAMBA-2 / SSD import target (HF model_type "mamba2",
 // architectures ["Mamba2ForCausalLM"], the state-spaces/mamba2-* /
-// Falcon-Mamba / Codestral-Mamba family) - the multi-head state-space-duality
-// successor to Mamba-1. tests/fixtures/tiny_mamba2.* is a pico RANDOM model
+// Codestral-Mamba family; falcon-mamba is Mamba-1-based and covered above) -
+// the multi-head state-space-duality successor to Mamba-1. tests/fixtures/tiny_mamba2.* is a pico RANDOM model
 // (2 layers, hidden 8, d_inner 8, num_heads 2, head_dim 4, n_groups 1 <
 // num_heads, d_state 4, conv 4, vocab 13, tied head).
 // tools/make_pico_mamba2_fixture.py ASSERTS each quirk is non-vacuous via the

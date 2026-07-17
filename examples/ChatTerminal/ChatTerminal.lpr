@@ -20,6 +20,17 @@ turns + generation prompt), encodes it with the HF tokenizer
 (EncodeChat) and generates the assistant reply token by token, streaming the
 decoded text to stdout as it appears.
 
+--format raw is the escape hatch for BASE (non-instruct) checkpoints such
+as gpt2, mamba-130m or the pythias: no chat template at all. The REPL
+becomes a completion notebook over a single running transcript - each typed
+line is appended verbatim (no roles, no markup, no BOS) and the model
+continues it; the continuation is appended back, so the next turn extends
+the same document. Generation stops on the tokenizer's EOS id or
+--max-new-tokens only (there is no end-of-turn marker), so base models that
+never emit EOS run to the cap - pass a small --max-new-tokens. /system is
+ignored (there is no system role); /reset clears the transcript. Raw is
+never autodetected - explicit flag only. Coded by Claude (AI).
+
 Inference parameters map onto the existing decode toolbox (neuraldecode /
 neuralvolume): temperature and repetition/frequency/presence penalties run
 in the probability domain through a TNNetLogitsProcessorChain
@@ -64,7 +75,8 @@ quantized codes and per-row scales are uploaded ONCE as resident device
 buffers (cai_dot_product_int8), so int8 runs on the GPU too.
 
 REPL commands: /exit, /reset (clear history), /system <msg> (set the system
-prompt; raises on formats without a system role, e.g. gemma/mistral).
+prompt; raises on formats without a system role, e.g. gemma/mistral, and is
+ignored with a notice in --format raw).
 
 --stats prints per-turn timing to stderr (kept off stdout so piped model
 output stays clean): time-to-first-token (prefill + the first decode step)
@@ -107,7 +119,9 @@ Coded by Claude (AI).
 {$mode objfpc}{$H+}
 
 uses
-  {$IFDEF UNIX}cthreads, cmem,{$ENDIF}
+  // cmem is skipped in the Debug build mode: it enables Valgrind (-gv), and
+  // FPC then pulls in cmem itself, so naming it here is a duplicate.
+  {$IFDEF UNIX}cthreads, {$IFNDEF Debug}cmem,{$ENDIF}{$ENDIF}
   {$IFDEF OpenCL}neuralopencl,{$ENDIF}
   Classes, SysUtils, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralpretrained, neuralhftokenizer,
@@ -159,6 +173,13 @@ type
                                  // each turn (decode steps only); for picking the
                                  // next layer class to optimize (e.g. OpenCL)
     NoCacheReuse: boolean;       // force full re-prefill every turn (A/B + debug)
+    KVInt8: boolean;             // int8-quantized KV cache (~1/4 the KV RAM at
+                                 // long context; logits not bit-exact). Follows
+                                 // the weight mode (on with int8 weights, off
+                                 // with --fp32) unless --kv-int8/--kv-fp32
+                                 // picks explicitly - identical CPU/GPU.
+    KVInt8Set: boolean;          // --kv-int8/--kv-fp32 given: skip the
+                                 // follow-the-weights default
     Serial: boolean;             // serial layer loop; default is the parallel
                                  // layer-graph scheduler (ComputeParallel).
                                  // The parallel path also enables intra-layer
@@ -207,13 +228,23 @@ begin
   WriteLn('  --max-new-tokens N    reply length cap (default 8192)');
   WriteLn('  --seed N              RNG seed (default: randomize)');
   WriteLn('  --ctx N               context window (default min(model max,2048); mem ~O(ctx^2))');
-  WriteLn('  --format NAME         chatml|llama2|llama3|zephyr|gemma|phi3|mistral');
+  WriteLn('  --format NAME         chatml|llama2|llama3|zephyr|gemma|phi3|mistral|raw');
+  WriteLn('                        raw = no chat template: plain text completion for');
+  WriteLn('                        BASE models (gpt2, mamba-130m, ...); the model');
+  WriteLn('                        continues a running transcript of what you type.');
+  WriteLn('                        No end-of-turn marker - stops on EOS or the');
+  WriteLn('                        --max-new-tokens cap (use a small cap, e.g. 128)');
   WriteLn('  --system "msg"        initial system prompt');
   WriteLn('  --int8                int8 weight-only quantized inference (DEFAULT; less');
   WriteLn('                        RAM and faster on CPU and GPU: resident int8 codes)');
   WriteLn('  --fp32                full-precision weights (more RAM, slower)');
   WriteLn('  --low-memory          drop conv/linear weight cache; per-neuron forward (DEFAULT)');
   WriteLn('  --max-fast-memory     keep the concatenated weight cache (faster forward, more RAM)');
+  WriteLn('  --kv-int8             int8-quantized KV cache: ~1/4 the KV RAM at long context');
+  WriteLn('                        (per-row scales; slightly lossy logits, argmax stable).');
+  WriteLn('                        DEFAULT whenever the weights are int8; --fp32 weights');
+  WriteLn('                        default to the FP32 cache');
+  WriteLn('  --kv-fp32             keep the bit-exact FP32 KV cache with int8 weights');
   WriteLn('  --gpu                 OpenCL offload of conv/linear matmuls (DEFAULT when');
   WriteLn('                        built with -dOpenCL); --cpu forces CPU');
   WriteLn('  --cpu                 force CPU even when built with -dOpenCL');
@@ -265,6 +296,8 @@ begin
   Result.Stats := false;
   Result.Profile := false;
   Result.NoCacheReuse := false;
+  Result.KVInt8 := false;    // resolved after parsing: follows the weight mode
+  Result.KVInt8Set := false; // unless --kv-int8/--kv-fp32 picked explicitly
   Result.Serial := false; // parallel layer-graph forward by default (--serial)
   // OpenCL offload defaults ON when the binary is built with -dOpenCL (the
   // default compilation), OFF otherwise; --cpu forces CPU either way.
@@ -340,6 +373,16 @@ begin
     else if Arg = '--stats' then Opt.Stats := true
     else if Arg = '--profile' then Opt.Profile := true
     else if Arg = '--no-cache-reuse' then Opt.NoCacheReuse := true
+    else if Arg = '--kv-int8' then
+    begin
+      Opt.KVInt8 := true;
+      Opt.KVInt8Set := true;
+    end
+    else if Arg = '--kv-fp32' then
+    begin
+      Opt.KVInt8 := false;
+      Opt.KVInt8Set := true;
+    end
     else if Arg = '--serial' then Opt.Serial := true
     else if Arg = '--gpu' then Opt.Gpu := true
     else if Arg = '--cpu' then Opt.Gpu := false
@@ -441,6 +484,11 @@ begin
     end;
     Inc(ArgPos);
   end;
+  // The KV cache follows the weight mode unless picked explicitly: int8
+  // weights get the int8 KV cache (same accuracy philosophy, ~1/4 the KV
+  // RAM), --fp32 weights keep the bit-exact FP32 cache. Identical on CPU
+  // and GPU (the cached decode path is the same code).
+  if not Opt.KVInt8Set then Opt.KVInt8 := Opt.Int8;
   Result := true;
 end;
 
@@ -1020,6 +1068,33 @@ begin
     Args.Add('--max-fast-memory'); Args.Add('--low-memory');
     Check(ParseArgs(Args, Opt) and Opt.LowMemory, '--low-memory re-enables it');
 
+    // int8 KV cache follows the weight mode unless picked explicitly, in
+    // any flag order.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and Opt.KVInt8,
+      'kv-int8 on by default (int8 weights are the default)');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--fp32');
+    Check(ParseArgs(Args, Opt) and not Opt.KVInt8,
+      '--fp32 weights default to the FP32 KV cache');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--kv-fp32');
+    Check(ParseArgs(Args, Opt) and not Opt.KVInt8,
+      '--kv-fp32 opts out with int8 weights');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--kv-int8'); Args.Add('--fp32');
+    Check(ParseArgs(Args, Opt) and Opt.KVInt8,
+      'explicit --kv-int8 beats the --fp32 default in any order');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--fp32'); Args.Add('--kv-int8');
+    Check(ParseArgs(Args, Opt) and Opt.KVInt8,
+      'explicit --kv-int8 beats the --fp32 default in any order (2)');
+
     // OpenCL offload: --gpu/--cpu toggle, platform/device indices parse.
     // (The default depends on the -dOpenCL build define, so only toggles are
     // asserted here.)
@@ -1200,6 +1275,18 @@ begin
     // Format name round trip used by --format.
     Check(ChatFormatFromName('llama3') = cfLlama3, '--format name lookup');
     Check(ChatFormatFromName('nope') = cfUnknown, 'unknown format name');
+    // 'raw' is intercepted by main BEFORE ChatFormatFromName (it is a
+    // ChatTerminal mode, not a chat template); the library must keep NOT
+    // knowing it, and cfUnknown must keep meaning "no end-of-turn marker"
+    // (raw mode generation stops on EOS/--max-new-tokens only).
+    Check(ChatFormatFromName('raw') = cfUnknown,
+      'raw is not a library chat format');
+    Check(EndOfTurnMarker(cfUnknown) = '', 'no end marker without a format');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--format'); Args.Add('raw');
+    Check(ParseArgs(Args, Opt) and (Opt.FormatName = 'raw'),
+      '--format raw parses');
 
     // CommonPrefixLen: the KV-cache reuse diff. Drives how much of the prompt
     // is re-prefilled each turn (Reused = matching prefix, capped at Len-1).
@@ -1245,6 +1332,9 @@ var
   Penalty: TNNetTokenHistoryPenalty;
   GenCfg: TGenConfigDefaults;   // model's generation_config.json (if any)
   ReuseOK: boolean;             // KV-cache reuse sound for this architecture?
+  RawMode: boolean;             // --format raw: no chat template, the model
+                                // continues Transcript as plain text
+  Transcript: string;           // raw mode's running document (turns append)
   {$IFDEF OpenCL}
   GpuCL: TEasyOpenCL;           // platform/device handle for OpenCL offload
   {$ENDIF}
@@ -1286,8 +1376,23 @@ begin
   Tokenizer := TNeuralHFTokenizer.Create();
   Tokenizer.LoadFromFile(TokenizerFile);
 
+  // 'raw' is a ChatTerminal-level mode, not a chat template, so it is
+  // intercepted here and never reaches ChatFormatFromName (which returns
+  // cfUnknown for it). ChatFormat stays cfUnknown in raw mode - that also
+  // keeps EndOfTurnMarker() = '' (no stop marker, EOS/cap only).
   ChatFormat := cfUnknown;
-  if Opt.FormatName <> '' then
+  RawMode := LowerCase(Opt.FormatName) = 'raw';
+  if RawMode then
+  begin
+    WriteLn('[raw completion mode (--format raw) - no chat template; the',
+      ' model continues the transcript; stops on EOS or --max-new-tokens]');
+    if Opt.SystemPrompt <> '' then
+    begin
+      WriteLn('[--system ignored: no system role in raw mode]');
+      Opt.SystemPrompt := '';
+    end;
+  end
+  else if Opt.FormatName <> '' then
   begin
     ChatFormat := ChatFormatFromName(Opt.FormatName);
     if ChatFormat = cfUnknown then
@@ -1411,7 +1516,14 @@ begin
 
   SeqLen := Opt.CtxLen;
   VocabSize := NN.GetLastLayer().Output.Depth;
-  Session := TNNetStreamingDecoder.Create(NN, SeqLen);
+  // int8 KV cache is armed at construction so the FP32 K/V buffers are never
+  // allocated (a post-Create switch frees them, but the allocator arena may
+  // keep the pages). /reset and cache-reuse truncation keep the int8 mode
+  // (they only rewind the cache length).
+  Session := TNNetStreamingDecoder.Create(NN, SeqLen, Opt.KVInt8);
+  if Opt.KVInt8 then
+    WriteLn('[int8 KV cache (default with int8 weights) - ~1/4 the KV RAM, ',
+      'logits not bit-exact; --kv-fp32 opts out]');
   // Layer-graph parallel forward by default: independent layers of one token
   // step (e.g. an MHA block's sibling heads) run across cores. --serial keeps
   // the classic in-order layer loop. The compute path also drives intra-layer
@@ -1431,10 +1543,11 @@ begin
   ModelType := ReadModelType(IncludeTrailingPathDelimiter(Opt.ModelDir) +
     'config.json');
   if ModelType = '' then ModelType := 'unknown';
-  WriteLn('Model: ', ModelType, ', ', NN.CountWeights(), ' params, vocab ',
-    VocabSize, ', context ', SeqLen, ', chat format ',
-    ChatFormatName(ChatFormat), ', ',
-    BoolToStr(Opt.Int8, 'int8', 'fp32'), ' weights.');
+  Write('Model: ', ModelType, ', ', NN.CountWeights(), ' params, vocab ',
+    VocabSize, ', context ', SeqLen, ', chat format ');
+  if RawMode then Write('raw (completion)')
+  else Write(ChatFormatName(ChatFormat));
+  WriteLn(', ', BoolToStr(Opt.Int8, 'int8', 'fp32'), ' weights.');
   if Opt.NoCacheReuse then
     WriteLn('[KV-cache reuse OFF (--no-cache-reuse) - full re-prefill each turn]')
   else if ReuseOK then
@@ -1505,8 +1618,14 @@ begin
   else SetLength(MarkerIds, 0);
 
   SetLength(History, 0);
-  WriteLn('Type your message; /exit quits, /reset clears the history,');
-  WriteLn('/system <msg> sets the system prompt.');
+  Transcript := '';
+  if RawMode then
+    WriteLn('Type text to complete; /exit quits, /reset clears the transcript.')
+  else
+  begin
+    WriteLn('Type your message; /exit quits, /reset clears the history,');
+    WriteLn('/system <msg> sets the system prompt.');
+  end;
   while true do
   begin
     Write('> ');
@@ -1521,14 +1640,35 @@ begin
       else if Cmd = 'reset' then
       begin
         SetLength(History, 0);
-        WriteLn('[history cleared]');
+        Transcript := '';
+        if RawMode then WriteLn('[transcript cleared]')
+        else WriteLn('[history cleared]');
       end
       else if Cmd = 'system' then
       begin
-        Opt.SystemPrompt := Arg;
-        WriteLn('[system prompt set]');
+        if RawMode then
+          WriteLn('[no system role in raw mode - ignored]')
+        else
+        begin
+          Opt.SystemPrompt := Arg;
+          WriteLn('[system prompt set]');
+        end;
       end
       else WriteLn('[unknown command /', Cmd, ' - /exit, /reset, /system]');
+      continue;
+    end;
+    if RawMode then
+    begin
+      // Completion notebook: the typed line extends the running transcript
+      // verbatim and the reply extends it further, so each turn's token ids
+      // are a strict prefix-extension of the previous turn's - the KV-cache
+      // reuse diff (CommonPrefixLen) prefills only the new tail for free.
+      Transcript := Transcript + Line;
+      PromptIds := Tokenizer.Encode(Transcript);
+      Reply := GenerateReply(NN, Session, Tokenizer, PromptIds, Opt, SeqLen,
+        VocabSize, Chain, Sampler, MarkerIds, CachedTokens,
+        {CacheReuse=}ReuseOK and not Opt.NoCacheReuse);
+      Transcript := Transcript + Reply;
       continue;
     end;
     SetLength(History, Length(History) + 1);

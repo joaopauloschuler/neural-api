@@ -6234,6 +6234,21 @@ procedure SaveRWKVToSafeTensors(Net: TNNet; const Config: TRWKVConfig;
 // when use_bias, lm_head.weight when untied). BuildFromPretrained
 // dispatches model_type "mamba" here. Mamba has NO positional limit (and
 // no context_length config field): pSeqLen <= 0 defaults to 1024.
+//
+// FALCON-MAMBA (model_type "falcon_mamba": tiiuae/falcon-mamba-7b,
+// architectures ["FalconMambaForCausalLM"]) imports on this SAME path: it is
+// Mamba-1 plus a WEIGHTLESS per-vector RMSNorm on the dt / B / C selection
+// vectors between the x_proj split and the scan (config mixer_rms_eps,
+// default 1e-6 - HF FalconMambaRMSNorm, rms over dt_rank for dt and over
+// d_state for B/C). That norm sits between x_proj and dt_proj, so the W_d
+// fold above is INVALID; the scan leaf is built in TNNetSelectiveSSM's
+// Jamba inner-norm mode instead (CreateJambaInner - the identical math with
+// learned gains, see the JAMBA IMPORT section) with dt kept unfolded:
+//   - Neurons[0] <- dt_proj.weight RAW ([d_inner, dt_rank]);
+//   - Neurons[6] <- x_proj.weight rows [0:dt_rank] (x_proj_dt);
+//   - Neurons[7..9] <- 1.0 (the weightless HF norm == unit inner gains).
+// Tensor names and everything else match plain Mamba exactly. Forward-only
+// like the Jamba mixers (training the inner-norm mode is not wired).
 
 type
   TMambaConfig = record
@@ -6249,15 +6264,19 @@ type
     UseBias: boolean;             // use_bias - in/out_proj (default false)
     LayerNormEps: double;         // layer_norm_epsilon (default 1e-5)
     TieWordEmbeddings: boolean;   // tie_word_embeddings (default true)
-    ModelType: string;            // 'mamba'
+    InnerRMSNorm: boolean;        // falcon_mamba: weightless RMSNorm on dt/B/C
+    MixerRmsEps: double;          // mixer_rms_eps (falcon_mamba, default 1e-6)
+    ModelType: string;            // 'mamba' or 'falcon_mamba'
     Prefix: string;               // 'backbone.' or '' (detected from the file)
   end;
 
-// Reads a HF Mamba config.json (model_type "mamba"). Required: hidden_size,
-// num_hidden_layers, vocab_size. Defaults follow MambaConfig: state_size =
-// 16, time_step_rank = "auto" = ceil(hidden_size/16), expand = 2,
-// intermediate_size = expand*hidden_size, conv_kernel = 4, use_conv_bias
-// true, use_bias false, layer_norm_epsilon = 1e-5, tie_word_embeddings true.
+// Reads a HF Mamba config.json (model_type "mamba" or "falcon_mamba").
+// Required: hidden_size, num_hidden_layers, vocab_size. Defaults follow
+// MambaConfig: state_size = 16, time_step_rank = "auto" =
+// ceil(hidden_size/16), expand = 2, intermediate_size = expand*hidden_size,
+// conv_kernel = 4, use_conv_bias true, use_bias false, layer_norm_epsilon =
+// 1e-5, tie_word_embeddings true. "falcon_mamba" additionally reads
+// mixer_rms_eps (default 1e-6) and sets InnerRMSNorm.
 function ReadMambaConfigFromJSONFile(const FileName: string): TMambaConfig;
 
 function MambaConfigToString(const Config: TMambaConfig): string;
@@ -6294,16 +6313,20 @@ function BuildMambaFromSafeTensors(const FileName: string;
 // rank-<=dt_rank factorization of W_d (Gaussian elimination with partial
 // pivoting), emitting dt_proj.weight = L and x_proj.weight[0:dt_rank] = U
 // with L @ U = W_d - re-importing folds them back to the same W_d (bit-exact
-// in F32 up to single-precision rounding of the factor product). Tied LM
-// heads emit no lm_head.weight tensor (Config.TieWordEmbeddings).
+// in F32 up to single-precision rounding of the factor product). Inner-norm
+// (falcon_mamba) nets never folded, so their dt factors round-trip RAW (the
+// unit gains carry no checkpoint tensor). Tied LM heads emit no
+// lm_head.weight tensor (Config.TieWordEmbeddings).
 procedure SaveMambaToSafeTensors(Net: TNNet; const Config: TMambaConfig;
   const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
 
 // ====================== MAMBA-2 / SSD IMPORT ============================
 // BuildMamba2FromSafeTensors imports the Mamba-2 / State-Space Duality
 // family (HF model_type "mamba2", architectures ["Mamba2ForCausalLM"]:
-// state-spaces/mamba2-*, tiiuae/Falcon-Mamba-7B, mistralai/Mamba-Codestral-
-// 7B-v0.1) - the architecturally DISTINCT successor to the Mamba-1 importer.
+// state-spaces/mamba2-*, mistralai/Mamba-Codestral-7B-v0.1) - the
+// architecturally DISTINCT successor to the Mamba-1 importer. (NOTE:
+// tiiuae/falcon-mamba-7b is NOT mamba2 - it is Mamba-1-based, model_type
+// "falcon_mamba", and imports on the MAMBA path above.)
 // Mamba-2 is a MULTI-HEAD SSM: the state transition A is a single SCALAR
 // per head (A = -exp(A_log), A_log NumHeads-long), B/C are SHARED across the
 // heads of a group (n_groups, GQA-like), and an extra grouped gated RMSNorm
@@ -12021,9 +12044,9 @@ function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
 //     from the same directory unless ConfigFileName overrides it).
 // Supported model_types: gpt2 (n_head read from the config when present),
 // gpt_neo, gpt_neox, gptj, phi, llama, mistral, qwen2, qwen3, gemma,
-// gemma2, gemma3_text, rwkv, mamba, bloom, falcon (legacy RefinedWebModel /
-// RefinedWeb spellings accepted), bert, distilbert, roberta,
-// modernbert, deepseek_v2.
+// gemma2, gemma3_text, rwkv, mamba, falcon_mamba, bloom, falcon (legacy
+// RefinedWebModel / RefinedWeb spellings accepted), bert, distilbert,
+// roberta, modernbert, deepseek_v2.
 // Anything else
 // raises EPretrainedImportError listing the supported types. The explicit
 // builders stay public for callers that want a compile-time architecture
@@ -46805,11 +46828,15 @@ begin
         '" is not a JSON object.');
     Obj := TJSONObject(Root);
     ModelType := Obj.Get('model_type', 'mamba');
-    if ModelType <> 'mamba' then
+    if (ModelType <> 'mamba') and (ModelType <> 'falcon_mamba') then
       ImportError('Mamba import: config model_type is "' + ModelType +
-        '" - expected "mamba" (see BuildFromPretrained for the full ' +
-        'dispatch).');
+        '" - expected "mamba" or "falcon_mamba" (see BuildFromPretrained ' +
+        'for the full dispatch).');
     Result.ModelType := ModelType;
+    // falcon_mamba = Mamba-1 + a weightless RMSNorm on the dt/B/C selection
+    // vectors (mixer_rms_eps) - see the MAMBA IMPORT section.
+    Result.InnerRMSNorm := ModelType = 'falcon_mamba';
+    Result.MixerRmsEps := Obj.Get('mixer_rms_eps', 1.0e-6);
     Result.HiddenSize := RequiredInt('hidden_size');
     Result.NumLayers := RequiredInt('num_hidden_layers');
     Result.VocabSize := RequiredInt('vocab_size');
@@ -46853,7 +46880,7 @@ end;
 
 function MambaConfigToString(const Config: TMambaConfig): string;
 begin
-  Result := 'mamba config: layers=' + IntToStr(Config.NumLayers) +
+  Result := Config.ModelType + ' config: layers=' + IntToStr(Config.NumLayers) +
     ', hidden=' + IntToStr(Config.HiddenSize) +
     ', d_inner=' + IntToStr(Config.DInner) +
     ', d_state=' + IntToStr(Config.StateSize) +
@@ -46864,6 +46891,8 @@ begin
     ', conv_bias=' + BoolToStr(Config.UseConvBias, true) +
     ', bias=' + BoolToStr(Config.UseBias, true) +
     ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.InnerRMSNorm then
+    Result := Result + ', mixer_rms_eps=' + FloatToStr(Config.MixerRmsEps);
   if Config.Prefix <> '' then
     Result := Result + ', prefix="' + Config.Prefix + '"';
 end;
@@ -46996,16 +47025,38 @@ var
     try
       Reader.LoadTensorFlat(MixP + 'x_proj.weight', XW);
       Reader.LoadTensorFlat(MixP + 'dt_proj.weight', DtW);
-      // W_d = dt_proj.weight @ x_proj.weight[0:dt_rank] - the low-rank
-      // delta path folded exactly (double accumulation).
-      for d := 0 to DIM1 do
-        for j := 0 to DIM1 do
-        begin
-          Acc := 0;
+      if Config.InnerRMSNorm then
+      begin
+        // falcon_mamba: the weightless RMSNorm between x_proj and dt_proj
+        // forbids the W_d fold - the dt path stays UNFOLDED in the scan's
+        // Jamba inner-norm layout ([0] = dt_proj.weight, [6] = x_proj rows
+        // [0:dt_rank]) with the inner gains [7..9] at 1.0 (HF
+        // FalconMambaRMSNorm carries no weight).
+        for d := 0 to DIM1 do
           for r := 0 to RKM1 do
-            Acc := Acc + DtW.FData[d * RK + r] * XW.FData[r * DI + j];
-          Layer.FArrNeurons[0].Weights.FData[d * DI + j] := Acc;
-        end;
+            Layer.FArrNeurons[0].Weights.FData[d * RK + r] :=
+              DtW.FData[d * RK + r];
+        for r := 0 to RKM1 do
+          for j := 0 to DIM1 do
+            Layer.FArrNeurons[6].Weights.FData[r * DI + j] :=
+              XW.FData[r * DI + j];
+        Layer.FArrNeurons[7].Weights.Fill(1);
+        Layer.FArrNeurons[8].Weights.Fill(1);
+        Layer.FArrNeurons[9].Weights.Fill(1);
+      end
+      else
+      begin
+        // W_d = dt_proj.weight @ x_proj.weight[0:dt_rank] - the low-rank
+        // delta path folded exactly (double accumulation).
+        for d := 0 to DIM1 do
+          for j := 0 to DIM1 do
+          begin
+            Acc := 0;
+            for r := 0 to RKM1 do
+              Acc := Acc + DtW.FData[d * RK + r] * XW.FData[r * DI + j];
+            Layer.FArrNeurons[0].Weights.FData[d * DI + j] := Acc;
+          end;
+      end;
       // W_B / W_C: the next d_state + d_state x_proj rows (shared across
       // channels - TNNetSelectiveSSM's (NS,1,Depth) projections).
       for s := 0 to NSM1 do
@@ -47099,8 +47150,15 @@ begin
           Config.ConvKernel, {pCausal=}true, ConvBiasSuppress) );
         NN.AddLayer( TNNetSiLU.Create() );
         // (3) the selective scan (owns the delta/B/C projections + D skip).
-        Blocks[BlockCnt].Scan := NN.AddLayer(
-          TNNetSelectiveSSM.Create(Config.StateSize) );
+        // falcon_mamba's weightless dt/B/C RMSNorms need the unfolded
+        // Jamba inner-norm scan (unit gains); plain mamba folds dt.
+        if Config.InnerRMSNorm then
+          Blocks[BlockCnt].Scan := NN.AddLayer(
+            TNNetSelectiveSSM.CreateJambaInner(Config.StateSize,
+              Config.TimeStepRank, Config.MixerRmsEps) )
+        else
+          Blocks[BlockCnt].Scan := NN.AddLayer(
+            TNNetSelectiveSSM.Create(Config.StateSize) );
         ScanL := Blocks[BlockCnt].Scan;
         // (4) z path: SiLU gate, cell-multiplied into the scan output.
         NN.AddLayerAfter(
@@ -47348,67 +47406,89 @@ var
     NSM1 := NS - 1;
     DINSM1 := DI * NS - 1;
     try
-      // ---- exact rank-<=RK factorization of W_d (Neurons[0]) ----
-      SetLength(Wd, DI);
-      for a := 0 to DIM1 do
-      begin
-        SetLength(Wd[a], DI);
-        for b := 0 to DIM1 do
-          Wd[a][b] := Layer.FArrNeurons[0].Weights.FData[a * DI + b];
-      end;
-      SetLength(L, DI);
-      for a := 0 to DIM1 do
-      begin
-        SetLength(L[a], RK);
-        for r := 0 to RKM1 do L[a][r] := 0;
-      end;
-      SetLength(U, RK);
-      for r := 0 to RKM1 do
-      begin
-        SetLength(U[r], DI);
-        for b := 0 to DIM1 do U[r][b] := 0;
-      end;
-      SetLength(PivRow, RK);
-      // Column-by-column LU-style extraction: at step r pick the row with the
-      // largest residual entry in some pivot column, record it as U[r], and
-      // eliminate it from the remaining rows (multipliers -> L[*][r]).
-      for r := 0 to RKM1 do
-      begin
-        // pivot = row with the max-abs entry over the whole residual matrix.
-        pr := -1; maxv := 0;
-        for a := 0 to DIM1 do
-          for b := 0 to DIM1 do
-            if Abs(Wd[a][b]) > maxv then
-            begin
-              maxv := Abs(Wd[a][b]); pr := a;
-            end;
-        if pr < 0 then pr := r;          // residual already ~0: any row
-        PivRow[r] := pr;
-        for b := 0 to DIM1 do U[r][b] := Wd[pr][b];
-        // choose the pivot column = the largest-magnitude entry of U[r].
-        k := 0; piv := 0;
-        for b := 0 to DIM1 do
-          if Abs(U[r][b]) > Abs(piv) then begin piv := U[r][b]; k := b; end;
-        if piv = 0 then
-        begin
-          // U[r] is all zero: this rank slot contributes nothing.
-          for a := 0 to DIM1 do L[a][r] := 0;
-          continue;
-        end;
-        // eliminate the pivot column from every row.
-        for a := 0 to DIM1 do
-        begin
-          mult := Wd[a][k] / piv;
-          L[a][r] := mult;
-          for b := 0 to DIM1 do
-            Wd[a][b] := Wd[a][b] - mult * U[r][b];
-        end;
-      end;
-      // ---- assemble x_proj.weight [RK+2*NS, DI] ----
       XW.ReSize((RK + 2 * NS) * DI, 1, 1);
-      for r := 0 to RKM1 do
-        for b := 0 to DIM1 do
-          XW.FData[r * DI + b] := U[r][b];
+      DtW.ReSize(DI * RK, 1, 1);
+      if Config.InnerRMSNorm then
+      begin
+        // Inner-norm (falcon_mamba) scans never folded dt: [0] =
+        // dt_proj.weight and [6] = x_proj rows [0:dt_rank] round-trip RAW
+        // (the unit inner gains [7..9] carry no checkpoint tensor).
+        for r := 0 to RKM1 do
+          for b := 0 to DIM1 do
+            XW.FData[r * DI + b] :=
+              Layer.FArrNeurons[6].Weights.FData[r * DI + b];
+        for a := 0 to DIM1 do
+          for r := 0 to RKM1 do
+            DtW.FData[a * RK + r] :=
+              Layer.FArrNeurons[0].Weights.FData[a * RK + r];
+      end
+      else
+      begin
+        // ---- exact rank-<=RK factorization of W_d (Neurons[0]) ----
+        SetLength(Wd, DI);
+        for a := 0 to DIM1 do
+        begin
+          SetLength(Wd[a], DI);
+          for b := 0 to DIM1 do
+            Wd[a][b] := Layer.FArrNeurons[0].Weights.FData[a * DI + b];
+        end;
+        SetLength(L, DI);
+        for a := 0 to DIM1 do
+        begin
+          SetLength(L[a], RK);
+          for r := 0 to RKM1 do L[a][r] := 0;
+        end;
+        SetLength(U, RK);
+        for r := 0 to RKM1 do
+        begin
+          SetLength(U[r], DI);
+          for b := 0 to DIM1 do U[r][b] := 0;
+        end;
+        SetLength(PivRow, RK);
+        // Column-by-column LU-style extraction: at step r pick the row with
+        // the largest residual entry in some pivot column, record it as U[r],
+        // and eliminate it from the remaining rows (multipliers -> L[*][r]).
+        for r := 0 to RKM1 do
+        begin
+          // pivot = row with the max-abs entry over the whole residual matrix.
+          pr := -1; maxv := 0;
+          for a := 0 to DIM1 do
+            for b := 0 to DIM1 do
+              if Abs(Wd[a][b]) > maxv then
+              begin
+                maxv := Abs(Wd[a][b]); pr := a;
+              end;
+          if pr < 0 then pr := r;          // residual already ~0: any row
+          PivRow[r] := pr;
+          for b := 0 to DIM1 do U[r][b] := Wd[pr][b];
+          // choose the pivot column = the largest-magnitude entry of U[r].
+          k := 0; piv := 0;
+          for b := 0 to DIM1 do
+            if Abs(U[r][b]) > Abs(piv) then begin piv := U[r][b]; k := b; end;
+          if piv = 0 then
+          begin
+            // U[r] is all zero: this rank slot contributes nothing.
+            for a := 0 to DIM1 do L[a][r] := 0;
+            continue;
+          end;
+          // eliminate the pivot column from every row.
+          for a := 0 to DIM1 do
+          begin
+            mult := Wd[a][k] / piv;
+            L[a][r] := mult;
+            for b := 0 to DIM1 do
+              Wd[a][b] := Wd[a][b] - mult * U[r][b];
+          end;
+        end;
+        // dt rows of x_proj.weight = U; dt_proj.weight = L.
+        for r := 0 to RKM1 do
+          for b := 0 to DIM1 do
+            XW.FData[r * DI + b] := U[r][b];
+        for a := 0 to DIM1 do
+          for r := 0 to RKM1 do
+            DtW.FData[a * RK + r] := L[a][r];
+      end;
+      // ---- W_B / W_C rows of x_proj.weight [RK+2*NS, DI] ----
       for s := 0 to NSM1 do
         for b := 0 to DIM1 do
         begin
@@ -47419,11 +47499,6 @@ var
         end;
       Writer.AddTensorFlat(MixP + 'x_proj.weight', [RK + 2 * NS, DI],
         XW, pDType);
-      // ---- dt_proj.weight [DI, RK] = L ----
-      DtW.ReSize(DI * RK, 1, 1);
-      for a := 0 to DIM1 do
-        for r := 0 to RKM1 do
-          DtW.FData[a * RK + r] := L[a][r];
       Writer.AddTensorFlat(MixP + 'dt_proj.weight', [DI, RK], DtW, pDType);
       // ---- dt_proj.bias = b_d (Neurons[3]) ----
       Vec.ReSize(DI, 1, 1);
@@ -76499,11 +76574,13 @@ begin
     // logits out). See the RWKV-4 IMPORT section.
     Result := BuildRWKVFromSafeTensorsEx(WeightsPath, IgnoredRWKVConfig,
       pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
-  else if ModelType = 'mamba' then
+  else if (ModelType = 'mamba') or (ModelType = 'falcon_mamba') then
     // The second non-transformer route: Mamba (architectures
     // ["MambaForCausalLM"]), a selective-SSM mixer - causal-LM contract
     // like the decoder families ((SeqLen,1,1) ids in, (SeqLen,1,vocab)
-    // logits out). See the MAMBA IMPORT section.
+    // logits out). falcon_mamba (["FalconMambaForCausalLM"],
+    // tiiuae/falcon-mamba-7b) is Mamba-1 plus weightless dt/B/C RMSNorms
+    // and rides the same builder. See the MAMBA IMPORT section.
     Result := BuildMambaFromSafeTensorsEx(WeightsPath, IgnoredMambaConfig,
       pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if ModelType = 'mamba2' then
@@ -76726,8 +76803,8 @@ begin
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
       'model_types: gpt2, gpt_neo, gpt_neox, gptj, phi, phi3, llama, ' +
       'mistral, mixtral, qwen2, qwen3, gemma, gemma2, gemma3_text, rwkv, ' +
-      'mamba, bloom, falcon, bert, distilbert, roberta, modernbert, ' +
-      'deepseek_v2, olmo2, wav2vec2, hubert.');
+      'mamba, falcon_mamba, bloom, falcon, bert, distilbert, roberta, ' +
+      'modernbert, deepseek_v2, olmo2, wav2vec2, hubert.');
   end;
 end;
 

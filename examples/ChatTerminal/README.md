@@ -1,9 +1,16 @@
 # ChatTerminal: interactive chat REPL over any imported instruct checkpoint
 
 A terminal chat program for the checkpoints the generic importer dispatch
-(`BuildFromPretrained` in `neural/neuralpretrained.pas`) supports: qwen2, quen2.5.
-It is planned (coded) to support: quen3, gpt2, llama, mistral, /3, gemma/2/3, phi/phi3, gpt_neo(x), 
-gptj, cohere/cohere2, rwkv, mamba, bloom, deepseek_v2. Point it at a
+(`BuildFromPretrained` in `neural/neuralpretrained.pas`) supports: qwen2, qwen2.5, qwen3,
+qwen3_moe, mamba, gpt2, llama, mistral, phi3, olmoe (see the
+tested-checkpoint list below).
+It is planned (coded) to support: mixtral,
+gemma/2/3, recurrent_gemma, phi, gpt_oss, gpt_neo(x), gptj,
+gpt_bigcode, starcoder2, opt, cohere/cohere2, olmo2,
+granite/granitemoe, glm4, minicpm, bitnet, internlm2, falcon, rwkv,
+falcon_mamba, mamba2, nemotron_h, jamba, bloom, deepseek_v2,
+`.gguf` llama.cpp checkpoints and llama4/llama4_text (Llama 4 text-only —
+iRoPE + MoE, e.g. Llama-4-Scout; the vision tower is out of scope). Point it at a
 HuggingFace-style model directory (`config.json` + `model.safetensors` [or
 sharded index / pytorch_model.bin] + `tokenizer.json`
 [+ `tokenizer_config.json`]) and chat:
@@ -13,6 +20,26 @@ lazbuild neural-api/examples/ChatTerminal/ChatTerminal.lpi
 git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q2
 neural-api/bin/x86_64-linux/bin/ChatTerminal q2/ --gpu
 ```
+
+### Tested checkpoints
+
+The checkpoints actually verified through this REPL (what backs the
+"supports" list above; the llama path is additionally coded for Llama
+1/2/3 incl. the 3.1/3.2 `rope_scaling` "llama3" long-context ramp, but
+only the checkpoints below have been run):
+
+| Checkpoint | model_type |
+|---|---|
+| Qwen/Qwen2.5-{0.5B,1.5B,3B,7B,14B,32B}-Instruct | qwen2 |
+| Qwen/Qwen3-0.6B | qwen3 |
+| Qwen/Qwen3-30B-A3B-Thinking-2507 | qwen3_moe |
+| TinyLlama/TinyLlama-1.1B-Chat-v1.0 | llama |
+| mistralai/Mistral-7B-Instruct-v0.3 | mistral |
+| HuggingFaceTB/SmolLM2-1.7B-Instruct | llama |
+| microsoft/Phi-3-mini-4k-instruct | phi3 |
+| allenai/OLMoE-1B-7B-0125-Instruct | olmoe |
+| state-spaces/mamba-130m-hf | mamba |
+| openai-community/gpt2 | gpt2 |
 
 ### Multilingual generation (Cohere Command-R / Aya)
 
@@ -47,6 +74,27 @@ encodes it with the HF tokenizer (`EncodeChat`). The assistant reply
 **streams** to stdout as it decodes (delta printing with a BPE/UTF-8 prefix
 guard, flushed per token so piped output streams too).
 
+**`--format raw` — completion mode for base models.** BASE (non-instruct)
+checkpoints such as `gpt2`, `mamba-130m` or the pythias have no chat
+template; wrapping them in ChatML markup makes greedy decoding parrot the
+markup back (the model has never seen it). `--format raw` drops templates
+entirely: the REPL becomes a completion notebook over one running
+transcript — each typed line is appended verbatim (no roles, no markup, no
+BOS) and the model continues it; the continuation is appended back, so the
+next turn extends the same document (and reuses the KV cache, since each
+turn's token ids strictly extend the previous turn's). There is no
+end-of-turn marker: generation stops on the tokenizer's EOS id or at
+`--max-new-tokens` only, and base models rarely emit EOS — pass a small
+cap (e.g. `--max-new-tokens 128`). `/reset` clears the transcript;
+`/system` is ignored with a notice (there is no system role). Raw is never
+autodetected — explicit flag only.
+
+```
+ChatTerminal gpt2/ --format raw --greedy --max-new-tokens 25
+> Hello, I'm a language model,
+ not a programming language. I'm a language model. ...
+```
+
 ## Flags
 
 Sampling defaults resolve **per parameter** as: explicit flag >
@@ -70,11 +118,13 @@ draws uniformly. `--greedy` hard-overrides everything.
 | `--presence-penalty X` | presence penalty | 0 (off) |
 | `--max-new-tokens N` | reply length cap | 8192 |
 | `--seed N` | RNG seed (reproducible sampling) | randomize |
-| `--ctx N` | context window to build (`pSeqLen`) | model max |
-| `--format NAME` | `chatml`/`llama2`/`llama3`/`zephyr`/`gemma`/`phi3`/`mistral` override | autodetect |
+| `--ctx N` | context window to build (`pSeqLen`) — KV-cache memory grows ~O(ctx) | model max, capped at 2048 (the startup banner says so; raise explicitly with `--ctx`) |
+| `--format NAME` | `chatml`/`llama2`/`llama3`/`zephyr`/`gemma`/`phi3`/`mistral` override, or `raw` (see below) | autodetect |
 | `--system "msg"` | initial system prompt | none |
 | `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — less RAM **and** faster than fp32 on both CPU (fused AVX2 int8 kernels) and GPU: the quantized codes stay resident on the device (see below) | **on** |
-| `--fp32` | full-precision fp32 weights — more RAM, slower | off |
+| `--fp32` | full-precision fp32 weights — more RAM, slower. Also switches the KV-cache default to fp32 | off |
+| `--kv-int8` | int8-quantized KV cache (per-row scale = max\|row\|/127): ~1/4 the KV RAM at long context, identical on CPU and GPU. Slightly lossy logits (drift on the order of e-2, greedy argmax stable); the FP32 K/V buffers are never allocated | **on** whenever the weights are int8 |
+| `--kv-fp32` | keep the bit-exact FP32 KV cache while the weights stay int8 | off |
 | `--low-memory` | drop each conv/linear layer's concatenated weight cache (`FConcatedWeights`) and compute per-neuron straight from the weights — less RAM, somewhat slower forward (`pLowMemory`). **Overridden by `--gpu`** (see below) | **on** |
 | `--max-fast-memory` | keep the concatenated weight cache for a faster forward at the cost of more RAM — required for GPU offload | off |
 | `--gpu` | OpenCL offload of the conv/linear matmuls (only when built with `-dOpenCL`) — overrides `--low-memory` (see below) | **on** when built with `-dOpenCL`, else off |
@@ -87,18 +137,32 @@ draws uniformly. `--greedy` hard-overrides everything.
 | `--serial` | classic in-order serial layer loop, fully single-threaded, instead of the layer-graph parallel forward that also threads large conv/linear layers internally (see below) | parallel on |
 | `--selftest` | run the offline unit checks and exit | — |
 
-The model is always built with `pTrainable=false` (the REPL never
-trains; ~1/3 the memory). **Memory vs. speed** is controlled by two
-orthogonal axes on top of that: trainability gates the backprop buffers,
-while `--low-memory`/`--max-fast-memory` toggles the *forward* weight cache.
+The model is always built with `pTrainable=false` — the REPL never trains,
+so the per-layer error buffers and each neuron's optimizer-state volumes
+(delta/inertia) are freed outright, not just shrunk (on a multi-billion-
+parameter model the per-neuron object overhead alone is gigabytes).
+**Memory vs. speed** is controlled by two orthogonal axes on top of that:
+trainability gates the backprop buffers, while
+`--low-memory`/`--max-fast-memory` toggles the *forward* weight cache.
 Low memory is the default — each conv/linear layer drops its persistent
 concatenated weight cache and computes per-neuron from the raw weights
 (less resident RAM, a somewhat slower forward); `--max-fast-memory` keeps
 the cache for a faster forward at the cost of more RAM. Orthogonally, the
 weight storage is int8 by default — quantized at construction time (no FP32
-weight copy is ever allocated) and run through fused int8 kernels that are
-both smaller *and* faster than fp32 on CPU and GPU; `--fp32` opts back into
-full-precision storage.
+weight copy is ever allocated; large checkpoints stream row-by-row straight
+into the int8 codes, so loading never spikes to the FP32 size) and run
+through fused int8 kernels that are both smaller *and* faster than fp32 on
+CPU and GPU; `--fp32` opts back into full-precision storage.
+
+The decode-time KV cache follows the weight mode: with int8 weights (the
+default) each attention layer's K/V rows are quantized to int8 with a
+per-row scale as they are appended — ~1/4 the KV RAM, the full-size FP32
+K/V buffers are never allocated, and the fused int8 kernels read the codes
+directly. The drift is small (logits within ~e-2, greedy argmax stable —
+see `TestKVCacheInt8DriftWithinTolerance`) but decode is not bit-exact vs
+the FP32 cache; `--kv-fp32` opts back into the exact cache, and `--fp32`
+weights default to it. The KV cache behaves identically on CPU and GPU
+(the cached decode path is the same code).
 
 **OpenCL / GPU offload.** When the binary is built with `-dOpenCL` (the
 default compilation), the conv/linear matmuls are offloaded to the GPU by
@@ -164,7 +228,8 @@ divergent tail and prefills only the new tokens — so time-to-first-token
 stays roughly flat instead of growing with the transcript. This is correct
 regardless of tokenizer round-tripping (the diff always finds the true
 shared prefix; `/system` and `/reset` simply diverge earlier and re-prefill
-more). It applies to pure-attention models only: a recurrent (SSM/Mamba/RWKV)
+more), and it works the same with the int8 KV cache (truncation only
+rewinds the cache length). It applies to pure-attention models only: a recurrent (SSM/Mamba/RWKV)
 state cannot be truncated by position, so those fall back to a full
 re-prefill each turn. `--no-cache-reuse` forces the full re-prefill (use
 `--stats` to compare: watch `prompt N (reused K)` and TTFT).
@@ -173,10 +238,11 @@ re-prefill each turn. `--no-cache-reuse` forces the full re-prefill (use
 
 ```
 /exit            quit (EOF / Ctrl-D also exits cleanly)
-/reset           clear the conversation history
+/reset           clear the conversation history (the transcript in raw mode)
 /system <msg>    set the system prompt (formats without a system role,
                  e.g. gemma/mistral, raise a template error - the turn is
-                 dropped and the history stays consistent)
+                 dropped and the history stays consistent; ignored with a
+                 notice in --format raw)
 ```
 
 ## Sample session
@@ -204,7 +270,7 @@ comfortable range.
 
 ## Testing
 
-`--selftest` runs 54 offline checks (argument parsing, prompt assembly
+`--selftest` runs 75 offline checks (argument parsing, prompt assembly
 against the byte-exact ChatML render, end-of-turn markers, REPL command
 parsing, the KV-cache-reuse prefix diff) without needing any model files. For an end-to-end plumbing check,
 any directory with a pico-sized random checkpoint plus a tokenizer works —

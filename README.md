@@ -3,12 +3,12 @@
 
 **Everyone says Pascal died in the 90s.** Meanwhile, this Pascal library runs GPT-style transformers, Mixture-of-Experts, RWKV, xLSTM, spiking neurons, and normalizing flows, natively, with no Python nor CUDA lock-in. Your PyTorch project: 4GB of dependencies, a conda environment that breaks monthly. This: **compile to a single native binary with AVX**. This is deep learning the way systems programmers wish it worked.
 
-**And it actually runs the real thing.** Point the [`ChatTerminal`](examples/ChatTerminal) example at a HuggingFace Qwen2 or Qwen2.5 instruct checkpoint and chat with a genuine LLM in your terminal: **OpenCL-accelerated**, **no Python**, **no CUDA** — with more architectures landing all the time. Then hand a text prompt to [`MusicGenText`](examples/MusicGenText) and watch the *same library* turn *"lo-fi hip-hop with a mellow piano"* into actual audio — T5 encoder and MusicGen decoder. One native binary, from a 20-line CIFAR demo to a billion-parameter transformer.
+**And it actually runs the real thing.** Point the [`ChatTerminal`](examples/ChatTerminal) example at a HuggingFace instruct checkpoint — Qwen2.5 (0.5B up to 32B), Qwen3, Llama (TinyLlama, SmolLM2), Mistral 7B, Phi-3-mini or the OLMoE Mixture-of-Experts — and chat with a genuine LLM in your terminal: **OpenCL-accelerated**, **no Python**, **no CUDA** — with more architectures landing all the time. Then hand a text prompt to [`MusicGenText`](examples/MusicGenText) and watch the *same library* turn *"lo-fi hip-hop with a mellow piano"* into actual audio — T5 encoder and MusicGen decoder. One native binary, from a 20-line CIFAR demo to a billion-parameter transformer.
 
 CAI NEURAL API is a Pascal deep-learning library optimized for the AVX, AVX2 and AVX512 instruction sets and for OpenCL devices from AMD, Intel and NVIDIA. Tested on Windows and Linux.
 
 ## Highlights
-* 🗣️ **Run real LLMs, natively** — import a HuggingFace Qwen2/Qwen2.5 instruct checkpoint and chat from your terminal with [`ChatTerminal`](examples/ChatTerminal). No Python, no CUDA.
+* 🗣️ **Run real LLMs, natively** — import a HuggingFace instruct checkpoint (Qwen2.5/Qwen3, Llama, Mistral, Phi-3, OLMoE) and chat from your terminal with [`ChatTerminal`](examples/ChatTerminal). No Python, no CUDA.
 * 🎵 **Text-to-music** — turn a text prompt into audio with [`MusicGenText`](examples/MusicGenText) (T5 encoder + MusicGen decoder).
 * 🔊 **More audio** — separate a song into stems with [`MusicSourceSeparation`](examples/MusicSourceSeparation), or talk to an audio-aware model with [`Qwen2AudioChat`](examples/Qwen2AudioChat).
 * 🧠 **Modern architectures, built in** — GPT-style transformers, Mixture-of-Experts, RWKV, xLSTM, spiking neurons and normalizing flows, all as native Pascal layers.

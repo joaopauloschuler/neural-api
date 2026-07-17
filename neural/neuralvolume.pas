@@ -41,7 +41,7 @@ unit neuralvolume;
 
 interface
 
-uses {$IFDEF FPC}fgl,{$ELSE}Contnrs,Generics.Collections,{$ENDIF} classes, sysutils, pascoremath32, pascoremathhelperfuncs;
+uses {$IFDEF FPC}fgl,{$ELSE}Contnrs,Generics.Collections,{$ENDIF} classes, sysutils, pascoremath32, pascoremathtypes, pascoremathhelperfuncs;
 
 {$include neuralnetwork.inc}
 
@@ -541,8 +541,8 @@ type
       procedure PointwiseNorm(pNorms: TNNetVolume = nil);
       procedure PointwiseMul(pNorms: TNNetVolume);
       // VectorExp writes dst[0..N-1] := exp(src[0..N-1]). On an AVX2 build it
-      // uses an 8-wide polynomial approximation (AVXExp) with a scalar pcr_expf
-      // remainder; on a non-AVX build it is a plain pcr_expf loop. Buffers may
+      // uses an 8-wide polynomial approximation (AVXExp) with a scalar NeuralExp
+      // remainder; on a non-AVX build it is a plain NeuralExp loop. Buffers may
       // alias (dst = src) since the read happens before the write per lane/element.
       class procedure VectorExp(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
       // VectorSigmoid writes dst[0..N-1] := 1/(1+exp(-src)). AVX2-accelerated
@@ -1164,6 +1164,7 @@ type
   function ReLULeakyBound(x: TNeuralFloat): TNeuralFloat;
   function ReLULeakyBoundDerivative(x: TNeuralFloat): TNeuralFloat;
 
+  function NeuralExp(x: TNeuralFloat): TNeuralFloat; {$IFDEF FPC} inline; {$ENDIF}
   function Sigmoid(x: TNeuralFloat): TNeuralFloat;
   function SigmoidDerivative(x: TNeuralFloat): TNeuralFloat;
 
@@ -1322,7 +1323,7 @@ type
 
   {$IFDEF AVXANY}
   // AVXExp writes pDst[0..N-1] := exp(pSrc[0..N-1]) using an 8-wide AVX2
-  // polynomial approximation (scalar pcr_expf remainder for the N mod 8 tail).
+  // polynomial approximation (scalar NeuralExp remainder for the N mod 8 tail).
   // Declared at interface scope so the generic TVolume.PointwiseSoftMax may call
   // it (a generic template cannot reference an implementation-private symbol).
   // Implemented in the AVX32 / AVX64 asm blocks. Buffers may alias.
@@ -1668,7 +1669,7 @@ const
   cAVXLnHalf:  Single = 0.5;
   cAVXLnOne:   Single = 1.0;
   cAVXLnMinNorm: Integer = $00800000;       // smallest positive normal float bits
-  cAVXLnInvMant: Integer = $807fffff;       // sign + mantissa mask (clears exponent)
+  cAVXLnInvMant: uInt32  = $807fffff;       // sign + mantissa mask (clears exponent)
 
 // Constants for the AVX2 8-wide sin()/cos() approximation (AVXSinCos), Cephes
 // single-precision sinf/cosf. Range-reduce x by q = round(x * 4/pi); the low 3 bits
@@ -1782,6 +1783,122 @@ begin
   end;
 end;
 
+{ NeuralExp is a clone of pas-core-math's pcr_expf with two local changes.
+  pcr_expf itself cannot be called from code built with debug checks: its
+  bit-twiddling relies on intentional UInt64 wraparound, which raises
+  EIntOverflow for ordinary negative inputs when its unit is compiled with
+  -Co/-Cr (project-wide checks in Lazarus "Debug" build modes). The clone is
+  compiled with checks pushed off, and the x > 88.72 overflow branch builds
+  +Inf from its bit pattern instead of a deliberate Single overflow (which
+  traps under FPC's default unmasked SSE overflow exception). Every other
+  input returns the identical correctly-rounded pcr_expf result. }
+{$PUSH}
+{$Q-}{$R-}
+function NeuralExp(x: TNeuralFloat): TNeuralFloat;
+const
+  c_exp_0: Double = 0.69314718055994529;
+  c_exp_1: Double = 0.24022650695910072;
+  c_exp_2: Double = 0.055504108664026088;
+  c_exp_3: Double = 0.0096181291075005358;
+  c_exp_4: Double = 0.001333362331326638;
+  c_exp_5: Double = 0.00015403602972146417;
+  b_exp_0: Double = 1;
+  b_exp_1: Double = 0.69314718052023927;
+  b_exp_2: Double = 0.2402288551437867;
+  b_exp_3: Double = 0.055504596827996931;
+  tb_exp: array[0..63] of UInt64 = (
+    UInt64($3FF0000000000000), UInt64($3FF02C9A3E778061), UInt64($3FF059B0D3158574), UInt64($3FF0874518759BC8),
+    UInt64($3FF0B5586CF9890F), UInt64($3FF0E3EC32D3D1A2), UInt64($3FF11301D0125B51), UInt64($3FF1429AAEA92DE0),
+    UInt64($3FF172B83C7D517B), UInt64($3FF1A35BEB6FCB75), UInt64($3FF1D4873168B9AA), UInt64($3FF2063B88628CD6),
+    UInt64($3FF2387A6E756238), UInt64($3FF26B4565E27CDD), UInt64($3FF29E9DF51FDEE1), UInt64($3FF2D285A6E4030B),
+    UInt64($3FF306FE0A31B715), UInt64($3FF33C08B26416FF), UInt64($3FF371A7373AA9CB), UInt64($3FF3A7DB34E59FF7),
+    UInt64($3FF3DEA64C123422), UInt64($3FF4160A21F72E2A), UInt64($3FF44E086061892D), UInt64($3FF486A2B5C13CD0),
+    UInt64($3FF4BFDAD5362A27), UInt64($3FF4F9B2769D2CA7), UInt64($3FF5342B569D4F82), UInt64($3FF56F4736B527DA),
+    UInt64($3FF5AB07DD485429), UInt64($3FF5E76F15AD2148), UInt64($3FF6247EB03A5585), UInt64($3FF6623882552225),
+    UInt64($3FF6A09E667F3BCD), UInt64($3FF6DFB23C651A2F), UInt64($3FF71F75E8EC5F74), UInt64($3FF75FEB564267C9),
+    UInt64($3FF7A11473EB0187), UInt64($3FF7E2F336CF4E62), UInt64($3FF82589994CCE13), UInt64($3FF868D99B4492ED),
+    UInt64($3FF8ACE5422AA0DB), UInt64($3FF8F1AE99157736), UInt64($3FF93737B0CDC5E5), UInt64($3FF97D829FDE4E50),
+    UInt64($3FF9C49182A3F090), UInt64($3FFA0C667B5DE565), UInt64($3FFA5503B23E255D), UInt64($3FFA9E6B5579FDBF),
+    UInt64($3FFAE89F995AD3AD), UInt64($3FFB33A2B84F15FB), UInt64($3FFB7F76F2FB5E47), UInt64($3FFBCC1E904BC1D2),
+    UInt64($3FFC199BDD85529C), UInt64($3FFC67F12E57D14B), UInt64($3FFCB720DCEF9069), UInt64($3FFD072D4A07897C),
+    UInt64($3FFD5818DCFBA487), UInt64($3FFDA9E603DB3285), UInt64($3FFDFC97337B9B5F), UInt64($3FFE502EE78B3FF6),
+    UInt64($3FFEA4AFA2A490DA), UInt64($3FFEFA1BEE615A27), UInt64($3FFF50765B6E4540), UInt64($3FFFA7C1819E90D8));
+  k1_exp: Double = 1.4426950408889634;
+  k2_exp: Double = 105553116266496;
+  k6_exp: Double = 1.4012984643248171e-45;
+  k10_exp: Double = 0.5;
+  k11_exp: Double = 1.0;
+  k13_exp: Double = 0.0;
+  k14_exp: Double = 103.27892990343184;
+  k15_exp: Double = 1.0108231726433641e-45;
+  k16_exp: Double = 3.5032461608120427e-46;
+  k18_exp: Double = 1.45e-10;
+  k19_exp: Double = 1.442695040255785;
+  k20_exp: Double = 6.3317841895660438e-10;
+var
+  te: Tb32u32;
+  ux_exp: UInt32;
+  z_exp: Double;
+  a_exp: Double;
+  u_exp: Tb64u64;
+  sv: Tb64u64;
+  ia_exp, h_exp, h2_exp, r_exp: Double;
+  ub_exp: Single;
+  lb_exp: Single;
+  w_exp, s_exp: Double;
+begin
+  te.f := x;
+  //TODO: this is a hack to be fixed
+  if (te.u = UInt32($C16912CD)) then
+  begin
+    te.u := UInt32($34FD331B);
+    Result := te.f;
+    Exit;
+  end;
+  ux_exp := te.u shl 1;
+  z_exp := x;
+  a_exp := k1_exp * z_exp;
+  u_exp.f := a_exp + k2_exp;
+  if (ux_exp > $8562E42E) or (ux_exp < $6F93813E) then begin
+    if ux_exp < $6F93813E then begin  // |x| < 0x1.93813ep-16
+      Result := Single(k11_exp + z_exp*(k11_exp + z_exp*k10_exp)); Exit;
+    end;
+    if ux_exp >= UInt32($FF shl 24) then begin
+      if ux_exp > UInt32($FF shl 24) then begin Result := x + x; Exit; end;  // nan
+      if (te.u shr 31) <> 0 then Result := k13_exp else Result := x; Exit;  // +-inf
+    end;
+    if te.u > $C2CE8EC0 then begin  // x < -0x1.9d1d8p+6
+      if k6_exp + (z_exp + k14_exp)*k15_exp > k16_exp then
+        Result := Single(k6_exp + (z_exp + k14_exp)*k15_exp)
+      else
+        Result := Single(k16_exp); Exit;
+    end;
+    if ((te.u shr 31) = 0) and (te.u > $42B17217) then begin  // x > 0x1.62e42ep+6
+      // pcr_expf overflows Single(3.4e38*3.4e38) here on purpose; building the
+      // same +Inf from its bit pattern avoids the hardware SSE overflow trap.
+      te.u := UInt32($7F800000);
+      Result := te.f; Exit;
+    end;
+  end;
+  ia_exp := k2_exp - u_exp.f;
+  h_exp := a_exp + ia_exp;
+  sv.u := tb_exp[u_exp.u and $3F] + ((u_exp.u shr 6) shl 52);
+  h2_exp := h_exp * h_exp;
+  r_exp := ((b_exp_0 + h_exp*b_exp_1) + h2_exp*(b_exp_2 + h_exp*b_exp_3)) * sv.f;
+  ub_exp := Single(r_exp);
+  lb_exp := Single(r_exp - r_exp*k18_exp);
+  if ub_exp <> lb_exp then begin
+    h_exp := (k19_exp*z_exp + ia_exp) + k20_exp*z_exp;
+    s_exp := sv.f;
+    h2_exp := h_exp * h_exp;
+    w_exp := s_exp * h_exp;
+    r_exp := s_exp + w_exp*((c_exp_0 + h_exp*c_exp_1) + h2_exp*((c_exp_2 + h_exp*c_exp_3) + h2_exp*(c_exp_4 + h_exp*c_exp_5)));
+    ub_exp := Single(r_exp);
+  end;
+  Result := ub_exp;
+end;
+{$POP}
+
 // https://stackoverflow.com/questions/51976461/optimal-way-of-defining-a-numerically-stable-sigmoid-function-for-a-list-in-pyth
 function Sigmoid(x: TNeuralFloat): TNeuralFloat;
 var
@@ -1789,11 +1906,11 @@ var
 begin
   if x > 0 then
   begin
-    Result := 1 / ( 1 + pcr_expf(-x) )
+    Result := 1 / ( 1 + NeuralExp(-x) )
   end
   else
   begin
-    S := pcr_expf(x);
+    S := NeuralExp(x);
     Result := S / (1 + S);
   end;
 end;
@@ -3130,14 +3247,14 @@ end;
 
 function Swish(x: TNeuralFloat): TNeuralFloat;
 begin
-  Result := x / ( 1 + pcr_expf(-x) );
+  Result := x / ( 1 + NeuralExp(-x) );
 end;
 
 function SwishDerivative(x: TNeuralFloat): TNeuralFloat;
 var
   SigmoidValue, OutputValue: TNeuralFloat;
 begin
-  SigmoidValue := 1 / ( 1 + pcr_expf(-x) ); {Swish(x)}
+  SigmoidValue := 1 / ( 1 + NeuralExp(-x) ); {Swish(x)}
   OutputValue := x * SigmoidValue;
   Result :=  OutputValue + SigmoidValue * (1-OutputValue);
 end;
@@ -8093,7 +8210,7 @@ begin
           end;
         end;
       end;
-      // Single whole-volume exponentiation (parity with the scalar pcr_expf loop
+      // Single whole-volume exponentiation (parity with the scalar NeuralExp loop
       // within ~1e-6 relative error). Spatial spans are contiguous so the entire
       // FSizeX*FSizeY*FDepth range is one AVXExp call.
       AVXExp(TNeuralFloatArrPtr(@FData[0]),
@@ -8248,7 +8365,7 @@ var
 begin
   NM1 := N - 1;
   for I := 0 to NM1 do
-    pDst^[I] := pcr_expf(pSrc^[I]);
+    pDst^[I] := NeuralExp(pSrc^[I]);
 end;
 {$ENDIF}
 
@@ -12301,8 +12418,8 @@ begin
 end;
 
 { AVXExp (32-bit): dst[0..N-1] := exp(src[0..N-1]). 8-wide AVX2 body using only
-  ymm0..ymm7 (no extended regs in 32-bit), scalar pcr_expf remainder. Under
-  plain-AVX it degrades to a scalar pcr_expf loop. }
+  ymm0..ymm7 (no extended regs in 32-bit), scalar NeuralExp remainder. Under
+  plain-AVX it degrades to a scalar NeuralExp loop. }
 procedure AVXExp(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer);
 {$IFDEF AVX2}
 var
@@ -12360,7 +12477,7 @@ begin
        'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5','ymm6'];
   end;
   for I := localNumElements to NumElementsM1 do
-    pDst^[I] := pcr_expf(pSrc^[I]);
+    pDst^[I] := NeuralExp(pSrc^[I]);
 end;
 {$ELSE}
 var
@@ -12368,7 +12485,7 @@ var
 begin
   NumElementsM1 := NumElements - 1;
   for I := 0 to NumElementsM1 do
-    pDst^[I] := pcr_expf(pSrc^[I]);
+    pDst^[I] := NeuralExp(pSrc^[I]);
 end;
 {$ENDIF}
 
@@ -13847,8 +13964,8 @@ begin
 end;
 
 { AVXExp: dst[0..N-1] := exp(src[0..N-1]). 8-wide AVX2 polynomial body plus a
-  scalar pcr_expf remainder for the (N mod 8) tail. Under plain-AVX (no AVX2)
-  the whole thing degrades to a scalar pcr_expf loop. }
+  scalar NeuralExp remainder for the (N mod 8) tail. Under plain-AVX (no AVX2)
+  the whole thing degrades to a scalar NeuralExp loop. }
 procedure AVXExp(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer);
 {$IFDEF AVX2}
 var
@@ -13908,7 +14025,7 @@ begin
        'ymm10','ymm11','ymm12','ymm13','ymm14'];
   end;
   for I := localNumElements to NumElementsM1 do
-    pDst^[I] := pcr_expf(pSrc^[I]);
+    pDst^[I] := NeuralExp(pSrc^[I]);
 end;
 {$ELSE}
 var
@@ -13916,7 +14033,7 @@ var
 begin
   NumElementsM1 := NumElements - 1;
   for I := 0 to NumElementsM1 do
-    pDst^[I] := pcr_expf(pSrc^[I]);
+    pDst^[I] := NeuralExp(pSrc^[I]);
 end;
 {$ENDIF}
 

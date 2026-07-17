@@ -183,6 +183,17 @@ type
       // o200k_base / GPT-4o-family Split pattern (case-aware letter runs --
       // see SplitO200kPieces).
       FO200kPreTok: boolean;
+      // Digits pre-tokenizer BEFORE ByteLevel (StarCoder2/SantaCoder:
+      // Sequence[Digits, ByteLevel]): numeric codepoints are isolated on the
+      // RAW text ahead of the GPT-2 regex split. individual_digits=true ->
+      // every numeric codepoint is its own piece.
+      FDigitsPreTok: boolean;
+      FDigitsIndividual: boolean;
+      // Falcon-family 4-stage Sequence (Punctuation(Contiguous) -> ByteLevel
+      // -> Digits(individual=false) -> Split three-ASCII-digits), detected
+      // as a WHOLE and dispatched to SplitFalconMappedPieces: the digit
+      // stages run on the byte-MAPPED text, unlike the generic Digits path.
+      FFalconPreTok: boolean;
       // Metaspace pre-tokenizer (Llama-2 / Mistral SentencePiece-BPE)
       FMetaspacePreTok: boolean;
       FMSReplacement: string;     // usually U+2581
@@ -232,6 +243,10 @@ type
       procedure SplitDeepSeekPieces(const Segment: string;
         Pieces: TStringList);
       procedure SplitO200kPieces(const Segment: string;
+        Pieces: TStringList);
+      procedure SplitDigitsPieces(const Segment: string;
+        IndividualDigits: boolean; Pieces: TStringList);
+      procedure SplitFalconMappedPieces(const Segment: string;
         Pieces: TStringList);
       function MapPieceToByteLevel(const Piece: string): TStringList;
       function FindAddedToken(const Text: string; Position: integer;
@@ -376,6 +391,26 @@ type
 function HFDecodeUnicodeEscapes(const S: string): string;
 function HFParseJSONRaw(const S: string): TJSONData;
 
+// fpjson's TJSONObject stores member names in a TFPHashObjectList whose
+// keys are SHORTSTRINGS: every object key is silently truncated to its
+// first 255 bytes. Keys that share a 255-byte prefix then collide and
+// parsing raises EJSON "Duplicate object member" -- the GPT-NeoX tokenizer
+// lineage (mamba/mamba2, pythia, gpt-neox-20b, stablelm-alpha) carries
+// whitespace-run vocab keys up to 1024 bytes, and StarCoder2/GPT-2 have
+// 256..512-byte indentation keys that would silently alias even without
+// the exception.
+//   * HFShieldLongJSONKeys scans the (already escape-decoded) JSON text
+//     and replaces the content of every object KEY longer than 255 bytes
+//     with a short unique ASCII placeholder, recording
+//     '<placeholder>=<original unescaped key>' in ShieldedKeys.
+//   * HFUnshieldJSONKey maps a retrieved key back: the original for a
+//     placeholder, the key unchanged otherwise.
+// String VALUES have no length limit in fpjson, so only keys need this.
+function HFShieldLongJSONKeys(const S: string;
+  ShieldedKeys: TStrings): string;
+function HFUnshieldJSONKey(const Key: string;
+  ShieldedKeys: TStrings): string;
+
 implementation
 
 uses
@@ -406,6 +441,18 @@ const
     '[\p{Ll}\p{Lo}\p{M}]+(?i:''s|''t|''re|''ve|''m|''ll|''d)?|' +
     '[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+' +
     '[\p{Ll}\p{Lo}\p{M}]*(?i:''s|''t|''re|''ve|''m|''ll|''d)?|' +
+    '\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+';
+  // o200k_harmony (OpenAI gpt-oss tokenizer.json): identical to
+  // csO200kSplitPattern except the two LOWERCASE letter-run classes also
+  // carry \p{Lm}. Every \p{Lm} codepoint is non-ASCII, and the splitter's
+  // ASCII-case approximation already treats all non-ASCII letters as the
+  // lowercase class, so both patterns split identically -- dispatched to
+  // the same SplitO200kPieces.
+  csO200kHarmonySplitPattern =
+    '[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*' +
+    '[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:''s|''t|''re|''ve|''m|''ll|''d)?|' +
+    '[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+' +
+    '[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:''s|''t|''re|''ve|''m|''ll|''d)?|' +
     '\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+';
 
 // Compact CANONICAL Unicode tables (decomposition, composition, combining
@@ -1071,6 +1118,9 @@ begin
   FSplitDigitsMax := 1;
   FDeepSeekPreTok := false;
   FO200kPreTok := false;
+  FDigitsPreTok := false;
+  FDigitsIndividual := false;
+  FFalconPreTok := false;
   FMetaspacePreTok := false;
   FMSReplacement := csMetaspace;
   FMSPrependScheme := 'always';
@@ -1143,6 +1193,128 @@ begin
   Result := ParseJSONRaw(S);
 end;
 
+// Decodes the two-character escapes of a JSON string body to the bytes
+// fpjson would have produced (\uXXXX is already handled upstream by
+// DecodeUnicodeEscapes, so only \" \\ \/ \b \f \n \r \t remain).
+function UnescapeJSONStringBody(const S: string): string;
+var
+  Position, Total, OutPos: integer;
+  C: char;
+begin
+  Total := Length(S);
+  SetLength(Result, Total);
+  OutPos := 0;
+  Position := 1;
+  while Position <= Total do
+  begin
+    C := S[Position];
+    if (C = '\') and (Position < Total) then
+    begin
+      Inc(Position);
+      case S[Position] of
+        'b': C := #8;
+        'f': C := #12;
+        'n': C := #10;
+        'r': C := #13;
+        't': C := #9;
+        else C := S[Position]; // '"', '\', '/': the char itself
+      end;
+    end;
+    Inc(OutPos);
+    Result[OutPos] := C;
+    Inc(Position);
+  end;
+  SetLength(Result, OutPos);
+end;
+
+function HFShieldLongJSONKeys(const S: string;
+  ShieldedKeys: TStrings): string;
+const
+  // TFPHashObjectList (fpjson's member-name store) truncates shortstring
+  // keys to this many bytes.
+  csMaxHashKeyBytes = 255;
+var
+  SpanStart, SpanEnd: array of integer; // key-content byte spans, inclusive
+  SpanCnt: integer;
+  Position, Total, ContentStart, ContentEnd, Look: integer;
+  Cnt, Prev: integer;
+  Marker, Placeholder: string;
+begin
+  Result := S;
+  Total := Length(S);
+  SpanCnt := 0;
+  Position := 1;
+  while Position <= Total do
+  begin
+    if S[Position] = '"' then
+    begin
+      ContentStart := Position + 1;
+      Position := ContentStart;
+      while (Position <= Total) and (S[Position] <> '"') do
+        if S[Position] = '\' then Inc(Position, 2) else Inc(Position);
+      ContentEnd := Position - 1;
+      Inc(Position); // step past the closing quote
+      if ContentEnd - ContentStart + 1 > csMaxHashKeyBytes then
+      begin
+        // a string is an object KEY exactly when the next non-whitespace
+        // byte is ':' (a value is followed by ',', '}' or ']')
+        Look := Position;
+        while (Look <= Total) and (S[Look] in [' ', #9, #10, #13]) do
+          Inc(Look);
+        if (Look <= Total) and (S[Look] = ':') then
+        begin
+          if SpanCnt = Length(SpanStart) then
+          begin
+            SetLength(SpanStart, SpanCnt * 2 + 4);
+            SetLength(SpanEnd, SpanCnt * 2 + 4);
+          end;
+          SpanStart[SpanCnt] := ContentStart;
+          SpanEnd[SpanCnt] := ContentEnd;
+          Inc(SpanCnt);
+        end;
+      end;
+    end
+    else
+      Inc(Position);
+  end;
+  if SpanCnt = 0 then exit;
+  // grow the marker until it appears nowhere in the document, so a
+  // placeholder can never collide with a real key
+  Marker := '~neural.longkey.';
+  while Pos(Marker, S) > 0 do Marker := '~' + Marker;
+  Result := '';
+  Prev := 1;
+  for Cnt := 0 to SpanCnt - 1 do
+  begin
+    Placeholder := Marker + IntToStr(ShieldedKeys.Count) + '~';
+    ShieldedKeys.Add(Placeholder + '=' + UnescapeJSONStringBody(
+      Copy(S, SpanStart[Cnt], SpanEnd[Cnt] - SpanStart[Cnt] + 1)));
+    // spans are rare (a handful of whitespace-run vocab keys), so plain
+    // concatenation stays linear in practice
+    Result := Result + Copy(S, Prev, SpanStart[Cnt] - Prev) + Placeholder;
+    Prev := SpanEnd[Cnt] + 1;
+  end;
+  Result := Result + Copy(S, Prev, Total - Prev + 1);
+end;
+
+function HFUnshieldJSONKey(const Key: string;
+  ShieldedKeys: TStrings): string;
+var
+  Cnt, CntMax, EqPos: integer;
+  Entry: string;
+begin
+  Result := Key;
+  if (ShieldedKeys = nil) or (ShieldedKeys.Count = 0) then exit;
+  CntMax := ShieldedKeys.Count - 1;
+  for Cnt := 0 to CntMax do
+  begin
+    Entry := ShieldedKeys[Cnt];
+    EqPos := Pos('=', Entry);
+    if (EqPos - 1 = Length(Key)) and (Copy(Entry, 1, EqPos - 1) = Key) then
+      Exit(Copy(Entry, EqPos + 1, Length(Entry)));
+  end;
+end;
+
 procedure TNeuralHFTokenizer.DetectKeyMangling();
 var
   Probe: TJSONData;
@@ -1209,9 +1381,10 @@ var
   VocabCnt, VocabObjCnt, MergesCnt, AddedCnt: integer;
   VocabCntM1, VocabObjCntM1, AddedCntM1: integer;
   Score: double;
-  Left, Right, MergeStr, NormType, Content: string;
+  Left, Right, MergeStr, NormType, Content, Restored: string;
   SpacePos: integer;
   Node: TJSONData;
+  ShieldedKeys: TStringList;
 
   procedure AddNormalizer(NormObj: TJSONObject);
   var
@@ -1317,6 +1490,29 @@ var
     Result := HasNL and HasLetters and HasDigits and HasByteLevel;
   end;
 
+  // Detects the Falcon-family pre-tokenizer Sequence as a WHOLE:
+  //   Punctuation(Contiguous) -> ByteLevel(use_regex=true) ->
+  //   Digits(individual_digits=false) -> Split("[0-9][0-9][0-9]", Isolated)
+  // (falcon-7b/40b/rw and falcon-mamba all ship exactly this). Stage ORDER
+  // matters here: the digit isolation and three-digit chunking run on the
+  // byte-MAPPED text, which SplitFalconMappedPieces reproduces in one pass.
+  // Recursing child-by-child would both hit the unsupported standalone
+  // Punctuation kind and mis-order the digit stages.
+  function MatchesFalconSequence(Arr: TJSONArray): boolean;
+  begin
+    Result := (Arr.Count = 4) and
+      (Arr.Objects[0].Get('type', '') = 'Punctuation') and
+      (Arr.Objects[0].Get('behavior', '') = 'Contiguous') and
+      (Arr.Objects[1].Get('type', '') = 'ByteLevel') and
+      Arr.Objects[1].Get('use_regex', true) and
+      (not Arr.Objects[1].Get('add_prefix_space', false)) and
+      (Arr.Objects[2].Get('type', '') = 'Digits') and
+      (not Arr.Objects[2].Get('individual_digits', false)) and
+      (ChildRegex(Arr.Objects[3]) = '[0-9][0-9][0-9]') and
+      (Arr.Objects[3].Get('behavior', '') = 'Isolated') and
+      (not Arr.Objects[3].Get('invert', false));
+  end;
+
   procedure AddPreTokenizer(PreObj: TJSONObject);
   var
     Kind, Pattern: string;
@@ -1342,6 +1538,14 @@ var
         FAddPrefixSpace := false;
         Exit;
       end;
+      if MatchesFalconSequence(InnerArr) then
+      begin
+        FFalconPreTok := true;
+        FByteLevel := true;
+        FByteLevelUseRegex := false;
+        FAddPrefixSpace := false;
+        Exit;
+      end;
       InnerMax := InnerArr.Count - 1;
       for InnerCnt := 0 to InnerMax do
         AddPreTokenizer(InnerArr.Objects[InnerCnt]);
@@ -1359,6 +1563,19 @@ var
     else if Kind = 'BertPreTokenizer' then
       // whitespace split + isolated punctuation; keyed off FWordPiece in
       // EncodeSegment (BertPieces), nothing else to configure
+    else if Kind = 'Digits' then
+    begin
+      // Digits on the RAW text (StarCoder2/SantaCoder: Sequence[Digits,
+      // ByteLevel]). Only the digits-BEFORE-ByteLevel order is supported on
+      // this generic path -- the digits-AFTER order changes piece boundaries
+      // (the digit test then sees the byte-mapped text) and is only handled
+      // by the whole-sequence Falcon match above.
+      if FByteLevel then
+        raise EHFTokenizerError.Create(
+          'Unsupported pre_tokenizer order: Digits after ByteLevel');
+      FDigitsPreTok := true;
+      FDigitsIndividual := PreObj.Get('individual_digits', false);
+    end
     else if Kind = 'Metaspace' then
     begin
       // Llama-2/Mistral SentencePiece-BPE: space -> U+2581 replacement,
@@ -1403,8 +1620,11 @@ var
         FSplitDigitsMax := 3;
         FSplitPreTok := true;
       end
-      else if Pattern = csO200kSplitPattern then
-        // case-aware multi-alternation splitter (distinct from cl100k)
+      else if (Pattern = csO200kSplitPattern) or
+        (Pattern = csO200kHarmonySplitPattern) then
+        // case-aware multi-alternation splitter (distinct from cl100k);
+        // the harmony variant (gpt-oss) splits identically under the
+        // ASCII-case approximation
         FO200kPreTok := true
       else
         raise EHFTokenizerError.Create(
@@ -1497,9 +1717,15 @@ begin
     LoadSentencePieceModel(FileName);
     Exit;
   end;
-  // decode \uXXXX up front (see DecodeUnicodeEscapes) and parse raw
-  Root := ParseJSONRaw(DecodeUnicodeEscapes(RawJson));
+  // decode \uXXXX up front (see DecodeUnicodeEscapes), shield object keys
+  // longer than fpjson's 255-byte member-name limit (see
+  // HFShieldLongJSONKeys: GPT-NeoX-lineage vocabs carry whitespace-run
+  // keys up to 1024 bytes) and parse raw
+  ShieldedKeys := TStringList.Create();
+  Root := nil;
   try
+    Root := ParseJSONRaw(HFShieldLongJSONKeys(
+      DecodeUnicodeEscapes(RawJson), ShieldedKeys));
     if not (Root is TJSONObject) then
       raise EHFTokenizerError.Create('tokenizer.json: root is not an object');
     RootObj := TJSONObject(Root);
@@ -1562,7 +1788,14 @@ begin
       for Cnt := 0 to VocabObjCntM1 do
       begin
         TokenId := VocabObj.Items[Cnt].AsInteger;
-        Content := FixJSONKey(VocabObj.Names[Cnt]);
+        Content := VocabObj.Names[Cnt];
+        Restored := HFUnshieldJSONKey(Content, ShieldedKeys);
+        if Restored <> Content then
+          // shielded long key: raw bytes captured before fpjson, so the
+          // widestring-manager mangling FixJSONKey inverts never happened
+          Content := Restored
+        else
+          Content := FixJSONKey(Content);
         FVocab.AddObject(Content, TObject(PtrInt(TokenId)));
         FIdToToken[TokenId] := Content;
       end;
@@ -1639,11 +1872,18 @@ begin
     Node := RootObj.Find('pre_tokenizer');
     if (Node <> nil) and (Node is TJSONObject) then
       AddPreTokenizer(TJSONObject(Node));
+    // The generic Digits path is only wired into the ByteLevel branch of
+    // EncodeSegment; accepting it alongside any other pipeline would
+    // silently skip the digit isolation.
+    if FDigitsPreTok and (not FByteLevel) then
+      raise EHFTokenizerError.Create(
+        'Unsupported pre_tokenizer: Digits without ByteLevel');
     Node := RootObj.Find('decoder');
     if (Node <> nil) and (Node is TJSONObject) then
       AddDecoder(TJSONObject(Node));
   finally
     Root.Free;
+    ShieldedKeys.Free;
   end;
 end;
 
@@ -2493,6 +2733,160 @@ begin
         Idx := RunEnd + 1;
       end;
     end;
+  end;
+end;
+
+// The Digits pre-tokenizer: isolates \p{N} codepoints from everything else.
+// IndividualDigits=true -> every numeric codepoint is its own piece
+// (StarCoder2); false -> maximal numeric runs are single pieces (Falcon).
+procedure TNeuralHFTokenizer.SplitDigitsPieces(const Segment: string;
+  IndividualDigits: boolean; Pieces: TStringList);
+var
+  Position, RunStart, CPStart, SegLen: integer;
+  InDigits: boolean;
+begin
+  SegLen := Length(Segment);
+  Position := 1;
+  RunStart := 1;
+  InDigits := false;
+  while Position <= SegLen do
+  begin
+    CPStart := Position;
+    if IsNumberCP(NextCodePoint(Segment, Position)) then
+    begin
+      if (CPStart > RunStart) and (not InDigits) then
+      begin
+        Pieces.Add(Copy(Segment, RunStart, CPStart - RunStart));
+        RunStart := CPStart;
+      end;
+      InDigits := true;
+      if IndividualDigits then
+      begin
+        Pieces.Add(Copy(Segment, CPStart, Position - CPStart));
+        RunStart := Position;
+        InDigits := false;
+      end;
+    end
+    else
+    begin
+      if InDigits and (CPStart > RunStart) then
+      begin
+        Pieces.Add(Copy(Segment, RunStart, CPStart - RunStart));
+        RunStart := CPStart;
+      end;
+      InDigits := false;
+    end;
+  end;
+  if RunStart <= SegLen then
+    Pieces.Add(Copy(Segment, RunStart, SegLen - RunStart + 1));
+end;
+
+// Reproduces the Falcon-family pre-tokenizer Sequence in one pass:
+//   1. Punctuation(Contiguous): maximal punctuation runs isolated,
+//   2. ByteLevel(use_regex=true): GPT-2 regex split within each piece,
+//      then the bytes->unicode alphabet mapping,
+//   3. Digits(individual_digits=false): numeric-codepoint runs isolated on
+//      the MAPPED text -- self-mapped latin-1 bytes B2/B3/B9/BC/BD/BE render
+//      as numeric superscripts/fractions and split too, e.g. Cyrillic 'м'
+//      (D0 BC) becomes 'Ð' + '¼' exactly as HF does,
+//   4. Split("[0-9][0-9][0-9]", Isolated): ASCII digit runs chunked into
+//      threes left-to-right, remainder (1-2 digits) trailing.
+// Emits byte-MAPPED pieces: the caller BPEs them per codepoint WITHOUT a
+// MapPieceToByteLevel pass.
+procedure TNeuralHFTokenizer.SplitFalconMappedPieces(const Segment: string;
+  Pieces: TStringList);
+var
+  SubPieces, DigitRuns: TStringList;
+  Position, CPStart, RunStart, SegLen: integer;
+  InPunct, CPPunct: boolean;
+
+  // stage 4: cut every run of >=3 ASCII digits into leading triples; the
+  // gaps and the 1-2 digit remainders coalesce with what follows them.
+  procedure ChunkThreeDigits(const Piece: string);
+  var
+    BytePos, PieceStart, RunLen, PieceLen: integer;
+  begin
+    PieceLen := Length(Piece);
+    BytePos := 1;
+    PieceStart := 1;
+    while BytePos <= PieceLen do
+    begin
+      if Piece[BytePos] in ['0'..'9'] then
+      begin
+        RunLen := 1;
+        while (BytePos + RunLen <= PieceLen) and
+          (Piece[BytePos + RunLen] in ['0'..'9']) do
+          Inc(RunLen);
+        if RunLen >= 3 then
+        begin
+          if BytePos > PieceStart then
+            Pieces.Add(Copy(Piece, PieceStart, BytePos - PieceStart));
+          while RunLen >= 3 do
+          begin
+            Pieces.Add(Copy(Piece, BytePos, 3));
+            Inc(BytePos, 3);
+            Dec(RunLen, 3);
+          end;
+          PieceStart := BytePos;
+          Inc(BytePos, RunLen);
+        end
+        else
+          Inc(BytePos, RunLen);
+      end
+      else
+        Inc(BytePos);
+    end;
+    if PieceStart <= PieceLen then
+      Pieces.Add(Copy(Piece, PieceStart, PieceLen - PieceStart + 1));
+  end;
+
+  // stages 2-4 for one punctuation-stage piece
+  procedure EmitRun(const Run: string);
+  var
+    Cnt, SubCnt, ByteCnt, SubLen: integer;
+    Mapped: string;
+  begin
+    SubPieces.Clear;
+    ByteLevelPieces(Run, SubPieces);
+    for Cnt := 0 to SubPieces.Count - 1 do
+    begin
+      Mapped := '';
+      SubLen := Length(SubPieces[Cnt]);
+      for ByteCnt := 1 to SubLen do
+        Mapped := Mapped +
+          CodePointToUTF8(FByteToCP[Ord(SubPieces[Cnt][ByteCnt])]);
+      DigitRuns.Clear;
+      SplitDigitsPieces(Mapped, false, DigitRuns);
+      for SubCnt := 0 to DigitRuns.Count - 1 do
+        ChunkThreeDigits(DigitRuns[SubCnt]);
+    end;
+  end;
+
+begin
+  SegLen := Length(Segment);
+  SubPieces := TStringList.Create();
+  DigitRuns := TStringList.Create();
+  try
+    // stage 1: Punctuation(Contiguous) over the raw codepoints
+    Position := 1;
+    RunStart := 1;
+    InPunct := false;
+    while Position <= SegLen do
+    begin
+      CPStart := Position;
+      CPPunct := IsBertPunctuationCP(NextCodePoint(Segment, Position));
+      if (CPStart > RunStart) and (CPPunct <> InPunct) then
+      begin
+        EmitRun(Copy(Segment, RunStart, CPStart - RunStart));
+        RunStart := CPStart;
+      end;
+      InPunct := CPPunct;
+    end;
+    if RunStart <= SegLen then
+      EmitRun(Copy(Segment, RunStart, SegLen - RunStart + 1));
+  finally
+    DigitRuns.Free;
+    SubPieces.Free;
   end;
 end;
 
@@ -3383,7 +3777,7 @@ end;
 procedure TNeuralHFTokenizer.EncodeSegment(const Segment: string;
   Ids: TIntegerList; IsFirstSegment: boolean);
 var
-  Pieces, Symbols: TStringList;
+  Pieces, Symbols, DigitPieces: TStringList;
   Cnt, Position, RunStart, PieceStart, PiecesCnt, NormReplaceHi: integer;
   Normalized: string;
   Seg: string;
@@ -3485,6 +3879,35 @@ begin
       Pieces.Free;
     end;
   end
+  else if FFalconPreTok then
+  begin
+    // Falcon 4-stage Sequence: the splitter emits byte-MAPPED pieces (its
+    // digit stages run on the mapped text), so BPE consumes them per
+    // codepoint directly, with NO MapPieceToByteLevel pass.
+    Pieces := TStringList.Create();
+    try
+      SplitFalconMappedPieces(Seg, Pieces);
+      PiecesCnt := Pieces.Count - 1;
+      for Cnt := 0 to PiecesCnt do
+      begin
+        Symbols := TStringList.Create();
+        try
+          Position := 1;
+          while Position <= Length(Pieces[Cnt]) do
+          begin
+            RunStart := Position;
+            NextCodePoint(Pieces[Cnt], Position);
+            Symbols.Add(Copy(Pieces[Cnt], RunStart, Position - RunStart));
+          end;
+          BPEWord(Symbols, Ids);
+        finally
+          Symbols.Free;
+        end;
+      end;
+    finally
+      Pieces.Free;
+    end;
+  end
   else if FSplitPreTok then
   begin
     // Sequence[Split(cl100k-style), ByteLevel(use_regex=false)]:
@@ -3509,18 +3932,43 @@ begin
   end
   else if FByteLevel then
   begin
-    Normalized := Seg;
-    if FAddPrefixSpace and (Length(Normalized) > 0) and
-      (Normalized[1] <> ' ') then
-      Normalized := ' ' + Normalized;
     Pieces := TStringList.Create();
     try
-      if FByteLevelUseRegex then
-        ByteLevelPieces(Normalized, Pieces)
-      else if Length(Normalized) > 0 then
-        // use_regex=false: NO GPT-2 regex split -- the whole segment is a
-        // single chunk fed straight to the byte-level alphabet + BPE.
-        Pieces.Add(Normalized);
+      if FDigitsPreTok then
+      begin
+        // Digits stage FIRST on the raw text (HF order: Digits precedes
+        // ByteLevel, whose prefix space lands on the first digit-stage
+        // piece), then the GPT-2 regex within each piece -- regex matches
+        // never cross piece boundaries.
+        DigitPieces := TStringList.Create();
+        try
+          SplitDigitsPieces(Seg, FDigitsIndividual, DigitPieces);
+          if FAddPrefixSpace and (DigitPieces.Count > 0) and
+            (Copy(DigitPieces[0], 1, 1) <> ' ') then
+            DigitPieces[0] := ' ' + DigitPieces[0];
+          PiecesCnt := DigitPieces.Count - 1;
+          for Cnt := 0 to PiecesCnt do
+            if FByteLevelUseRegex then
+              ByteLevelPieces(DigitPieces[Cnt], Pieces)
+            else
+              Pieces.Add(DigitPieces[Cnt]);
+        finally
+          DigitPieces.Free;
+        end;
+      end
+      else
+      begin
+        Normalized := Seg;
+        if FAddPrefixSpace and (Length(Normalized) > 0) and
+          (Normalized[1] <> ' ') then
+          Normalized := ' ' + Normalized;
+        if FByteLevelUseRegex then
+          ByteLevelPieces(Normalized, Pieces)
+        else if Length(Normalized) > 0 then
+          // use_regex=false: NO GPT-2 regex split -- the whole segment is a
+          // single chunk fed straight to the byte-level alphabet + BPE.
+          Pieces.Add(Normalized);
+      end;
       PiecesCnt := Pieces.Count - 1;
       for Cnt := 0 to PiecesCnt do
       begin

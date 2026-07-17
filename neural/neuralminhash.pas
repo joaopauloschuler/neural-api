@@ -153,6 +153,10 @@ const
 
 { ---- base hashing ---- }
 
+// The FNV prime multiply wraps around UInt64 by design; checks stay off so
+// debug builds (-Co) do not raise EIntOverflow on it.
+{$PUSH}
+{$Q-}{$R-}
 function FNV1a64(const S: string): UInt64;
 const
   csOffset: UInt64 = 14695981039346656037;
@@ -168,6 +172,7 @@ begin
     Result := Result * csPrime;
   end;
 end;
+{$POP}
 
 // (a + b) mod p, with a,b already < p (< 2^61), so a+b < 2^62 never overflows.
 function AddModP(a, b: UInt64): UInt64; inline;
@@ -233,6 +238,11 @@ begin
   InitPermutations;
 end;
 
+// The splitmix64-style state updates and mixing multiplies below wrap around
+// UInt64 by design; checks stay off so debug builds (-Co) do not raise
+// EIntOverflow on them.
+{$PUSH}
+{$Q-}{$R-}
 procedure TNeuralMinHasher.InitPermutations;
 var
   I, NumHashesM1: integer;
@@ -263,6 +273,7 @@ begin
     FB[I] := R mod csP;
   end;
 end;
+{$POP}
 
 procedure TNeuralMinHasher.SetBands(AValue: integer);
 begin

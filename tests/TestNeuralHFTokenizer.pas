@@ -42,7 +42,10 @@ type
     procedure TestSplitCl100kParityWithHF;
     procedure TestSplitDeepSeekParityWithHF;
     procedure TestSplitO200kParityWithHF;
+    procedure TestSplitO200kHarmonyParityWithHF;
     procedure TestByteLevelNoRegexParityWithHF;
+    procedure TestDigitsByteLevelParityWithHF;
+    procedure TestFalconSequenceParityWithHF;
     procedure TestMetaspacePreTokenizerParityWithHF;
     procedure TestRejectsUnknownSplitPattern;
     procedure TestNFCComposesDecomposedInput;
@@ -56,6 +59,15 @@ type
     procedure TestMetaspaceSpecialTokenIds;
     procedure TestDecodeKeepsSpecialsWhenAsked;
     procedure TestRejectsNonBPEModel;
+    // fpjson's TJSONObject truncates member names to 255 bytes
+    // (shortstring-keyed hash), so GPT-NeoX-lineage whitespace-run vocab
+    // keys (mamba/pythia/gpt-neox/stablelm, up to 1024 bytes) used to
+    // collide and raise EJSON "Duplicate object member". The pre-parse
+    // long-key shield must load them intact, distinct and byte-exact.
+    procedure TestLongVocabKeysBypassFpjsonNameLimit;
+    // The shield/unshield helpers directly: keys with escapes are restored
+    // unescaped, long string VALUES are left alone, short keys untouched.
+    procedure TestShieldLongJSONKeysHelpers;
     procedure TestEncodeIntegerArrayHelper;
     procedure TestOffsetMappingRoundTrip;
     procedure TestOffsetMappingWordIds;
@@ -530,11 +542,40 @@ begin
   RunParityBattery('split_o200k');
 end;
 
+// o200k_harmony (OpenAI gpt-oss): the o200k pattern with \p{Lm} added to
+// the two lowercase letter-run classes. The pinned cases contain no \p{Lm}
+// codepoints, so the split_o200k expected ids hold for both patterns; what
+// this adds is the RECOGNIZER accepting the harmony literal (it used to
+// raise "Unsupported Split pre_tokenizer pattern" on gpt-oss-20b).
+procedure TTestNeuralHFTokenizer.TestSplitO200kHarmonyParityWithHF;
+begin
+  RunParityBattery('split_o200k_harmony');
+end;
+
 // STANDALONE ByteLevel(use_regex=false): the GPT-2 regex split must be
 // SKIPPED -- the whole segment is one chunk fed to the byte alphabet.
 procedure TTestNeuralHFTokenizer.TestByteLevelNoRegexParityWithHF;
 begin
   RunParityBattery('bytelevel_noregex');
+end;
+
+// StarCoder2/SantaCoder style Sequence[Digits(individual_digits=true),
+// ByteLevel(use_regex=true)]: every numeric codepoint isolated on the RAW
+// text before the GPT-2 regex split. Cases include ²/٣/१ numerals (the
+// \p{N} ranges IsNumberCP covers).
+procedure TTestNeuralHFTokenizer.TestDigitsByteLevelParityWithHF;
+begin
+  RunParityBattery('digits_bytelevel');
+end;
+
+// Falcon-family 4-stage Sequence (falcon-7b/40b/rw + falcon-mamba):
+// Punctuation(Contiguous) -> ByteLevel(use_regex=true) -> Digits(false) ->
+// Split("[0-9][0-9][0-9]", Isolated). The digit stages act on the
+// byte-MAPPED text -- the pinned cases include 'м' -> 'Ð'+'¼' (mapped byte
+// BC renders as the numeric ¼) and left-to-right 3-digit chunking.
+procedure TTestNeuralHFTokenizer.TestFalconSequenceParityWithHF;
+begin
+  RunParityBattery('falcon_seq');
 end;
 
 // Mistral / legacy=false Llama style Metaspace PRE_TOKENIZER
@@ -867,6 +908,81 @@ begin
     Tok.Free;
     SL.Free;
     DeleteFile(TempFile);
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestLongVocabKeysBypassFpjsonNameLimit;
+var
+  Tok: TNeuralHFTokenizer;
+  TempFile, LongA, LongB: string;
+  SL: TStringList;
+  Cnt: integer;
+begin
+  // 'Ġ' (U+0120, 2 UTF-8 bytes) is the byte-level surface of ' '. 128 and
+  // 129 of them are 256 and 258 bytes: both truncate to the same 255-byte
+  // shortstring, the exact collision the mamba-130m-hf vocab triggers.
+  LongA := '';
+  for Cnt := 1 to 128 do LongA := LongA + #$C4#$A0;
+  LongB := LongA + #$C4#$A0;
+  TempFile := GetTempDir(true) + 'long_key_tokenizer.json';
+  SL := TStringList.Create();
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    SL.Text := '{"model": {"type": "BPE", "vocab": {"a": 0, "' + LongA +
+      '": 1, "' + LongB + '": 2}, "merges": []}, ' +
+      '"pre_tokenizer": {"type": "ByteLevel"}, ' +
+      '"decoder": {"type": "ByteLevel"}}';
+    SL.SaveToFile(TempFile);
+    Tok.LoadFromFile(TempFile);
+    AssertEquals('short key survives the shield pass', 'a', Tok.Decode([0]));
+    AssertEquals('256-byte key decodes to 128 spaces',
+      StringOfChar(' ', 128), Tok.Decode([1]));
+    AssertEquals('258-byte key stays distinct: 129 spaces',
+      StringOfChar(' ', 129), Tok.Decode([2]));
+  finally
+    Tok.Free;
+    SL.Free;
+    DeleteFile(TempFile);
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestShieldLongJSONKeysHelpers;
+var
+  ShieldedKeys: TStringList;
+  LongKey, Shielded, Restored: string;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  Cnt: integer;
+begin
+  ShieldedKeys := TStringList.Create();
+  try
+    // 300-byte key carrying a \" escape: fpjson would truncate it; the
+    // shield must swap it for a placeholder and restore it UNESCAPED.
+    LongKey := '\"' + StringOfChar('x', 298);
+    Shielded := HFShieldLongJSONKeys(
+      '{"' + LongKey + '": 7, "short": 1, "v": "' +
+      StringOfChar('y', 300) + '"}', ShieldedKeys);
+    AssertEquals('exactly one key shielded', 1, ShieldedKeys.Count);
+    Root := HFParseJSONRaw(Shielded);
+    try
+      Obj := TJSONObject(Root);
+      AssertEquals('member count preserved', 3, Obj.Count);
+      Restored := '';
+      for Cnt := 0 to Obj.Count - 1 do
+        if Obj.Items[Cnt].JSONType = jtNumber then
+          if Obj.Items[Cnt].AsInteger = 7 then
+            Restored := HFUnshieldJSONKey(Obj.Names[Cnt], ShieldedKeys);
+      AssertEquals('long key restored unescaped',
+        '"' + StringOfChar('x', 298), Restored);
+      AssertEquals('short key passes through unshield unchanged',
+        'short', HFUnshieldJSONKey('short', ShieldedKeys));
+      AssertEquals('long string VALUE is not shielded',
+        StringOfChar('y', 300), Obj.Get('v', ''));
+    finally
+      Root.Free;
+    end;
+  finally
+    ShieldedKeys.Free;
   end;
 end;
 
