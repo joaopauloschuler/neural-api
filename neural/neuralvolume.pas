@@ -41,7 +41,7 @@ unit neuralvolume;
 
 interface
 
-uses {$IFDEF FPC}fgl,{$ELSE}Contnrs,Generics.Collections,{$ENDIF} classes, sysutils, pascoremath32, pascoremathhelperfuncs;
+uses {$IFDEF FPC}fgl,{$ELSE}Contnrs,Generics.Collections,{$ENDIF} classes, sysutils, pascoremath32, pascoremathtypes, pascoremathhelperfuncs;
 
 {$include neuralnetwork.inc}
 
@@ -1668,7 +1668,7 @@ const
   cAVXLnHalf:  Single = 0.5;
   cAVXLnOne:   Single = 1.0;
   cAVXLnMinNorm: Integer = $00800000;       // smallest positive normal float bits
-  cAVXLnInvMant: Integer = $807fffff;       // sign + mantissa mask (clears exponent)
+  cAVXLnInvMant: uInt32  = $807fffff;       // sign + mantissa mask (clears exponent)
 
 // Constants for the AVX2 8-wide sin()/cos() approximation (AVXSinCos), Cephes
 // single-precision sinf/cosf. Range-reduce x by q = round(x * 4/pi); the low 3 bits
