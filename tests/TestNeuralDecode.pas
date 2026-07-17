@@ -26,6 +26,8 @@ type
     function BuildTinyHybridLM(ContextLen: integer): TNNet;   // SSM + attention
     function BuildTinyGQALM(ContextLen: integer): TNNet;      // grouped-query
     function BuildTinyLearnedPosLM(ContextLen: integer): TNNet; // GPT-2 wpe
+    function BuildTinyMambaLM(ContextLen: integer): TNNet;    // conv+SelectiveSSM
+    function BuildTinyRWKVLM(ContextLen: integer): TNNet;     // TokenShift+WKV
     // Streams Toks token-at-a-time through Session and asserts every step's
     // output row matches the corresponding row of Full's causal forward.
     procedure AssertStreamMatchesFull(Full: TNNet;
@@ -184,6 +186,11 @@ type
     procedure TestStreamingDecoderGQAMatchesFullForward;
     procedure TestStreamingDecoderLearnedPosMatchesFullForward;
     procedure TestStreamingDecoderSSMMatchesFullForward;
+    // Whole recurrent BLOCKS through the session (TNNetRecurrentDecodeBase
+    // collection): a Mamba-style block (causal depthwise conv + selective
+    // SSM) and an RWKV-style block (token-shift + WKV).
+    procedure TestStreamingDecoderMambaBlockMatchesFullForward;
+    procedure TestStreamingDecoderRWKVBlockMatchesFullForward;
     procedure TestStreamingDecoderResetStartsFreshSequence;
     procedure TestStreamingDecoderTruncateToRollsBack;
     // Prefix-cache reuse / cache fork (Snapshot / RestoreSnapshot).
@@ -2689,6 +2696,33 @@ begin
   Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamVocab));
 end;
 
+function TTestNeuralDecode.BuildTinyMambaLM(ContextLen: integer): TNNet;
+begin
+  // The mamba block shape that matters for streaming: a CAUSAL depthwise conv
+  // feeding a selective SSM - BOTH carry recurrent state, so the session must
+  // arm both (TNNetRecurrentDecodeBase collection) or the streamed output
+  // silently diverges. No positional encoding: the recurrences carry order.
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, 1));
+  Result.AddLayer(TNNetEmbedding.Create(csStreamVocab, csStreamDim, 0, 0.02));
+  Result.AddLayer(TNNetDepthwiseConv1D.Create({KernelSize=}3, {pCausal=}true));
+  Result.AddLayer(TNNetSelectiveSSM.Create({pDState=}2));
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamVocab));
+end;
+
+function TTestNeuralDecode.BuildTinyRWKVLM(ContextLen: integer): TNNet;
+begin
+  // The RWKV time-mixing pair: TokenShift (per-class contract) + WKV
+  // (TNNetRecurrentDecodeBase) - the session must arm BOTH families.
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, 1));
+  Result.AddLayer(TNNetEmbedding.Create(csStreamVocab, csStreamDim, 0, 0.02));
+  Result.AddLayer(TNNetTokenShift.Create());
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(2 * csStreamDim)); // k|v pack
+  Result.AddLayer(TNNetWKV.Create());
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamVocab));
+end;
+
 function TTestNeuralDecode.BuildTinyGQALM(ContextLen: integer): TNNet;
 begin
   // Grouped-Query Attention mixer (4 query heads sharing 2 K/V heads). The
@@ -2869,6 +2903,95 @@ begin
     AssertEquals('no rope layers', 0, Session.RopeCount);
     Session.Reset();
     AssertStreamMatchesFull(Full, Session, Toks, 'ssm');
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestStreamingDecoderMambaBlockMatchesFullForward;
+const
+  SeqLen = 8;
+  Toks: array[0..7] of integer = (5, 2, 9, 9, 1, 7, 3, 10);
+  ToksB: array[0..7] of integer = (3, 11, 4, 6, 6, 2, 8, 1);
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  StepIn: TNNetVolume;
+  L, N, T: integer;
+  W: TNNetVolume;
+begin
+  RandSeed := 20260717;
+  Full := BuildTinyMambaLM(SeqLen);
+  Twin := BuildTinyMambaLM(1);
+  Session := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    // Non-trivial scan weights: the selective SSM's projections/decays start
+    // at InitDefault; randomize every neuron so dt/B/C genuinely select.
+    for L := 0 to Full.Layers.Count - 1 do
+      if Full.Layers[L] is TNNetSelectiveSSM then
+        for N := 0 to Full.Layers[L].Neurons.Count - 1 do
+        begin
+          W := Full.Layers[L].Neurons[N].Weights;
+          W.Randomize();
+          W.Sub(0.5);
+        end;
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    AssertEquals('conv + selective SSM collected', 2, Session.SSMCount);
+    AssertEquals('no attention layers', 0, Session.SDPACount);
+    Session.Reset();
+    AssertStreamMatchesFull(Full, Session, Toks, 'mamba block');
+    // Reset freshness: sequence B must stream exactly after polluting with A.
+    Session.Reset();
+    for T := 0 to SeqLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      Session.StepForward(StepIn, T);
+    end;
+    Session.Reset();
+    AssertStreamMatchesFull(Full, Session, ToksB, 'mamba block after reset');
+  finally
+    StepIn.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestStreamingDecoderRWKVBlockMatchesFullForward;
+const
+  SeqLen = 8;
+  Toks: array[0..7] of integer = (4, 8, 2, 11, 6, 1, 10, 3);
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  WKVFull: TNNetWKV;
+  i, D: integer;
+begin
+  RandSeed := 20260718;
+  Full := BuildTinyRWKVLM(SeqLen);
+  Twin := BuildTinyRWKVLM(1);
+  Session := nil;
+  try
+    // Non-trivial per-channel decay/bonus (defaults are uniform).
+    WKVFull := nil;
+    for i := 0 to Full.Layers.Count - 1 do
+      if Full.Layers[i] is TNNetWKV then WKVFull := TNNetWKV(Full.Layers[i]);
+    AssertTrue('WKV layer found in full net', WKVFull <> nil);
+    for D := 0 to csStreamDim - 1 do
+    begin
+      WKVFull.Neurons[0].Weights.FData[D] := (Random(2000) - 1000) / 1000;
+      WKVFull.Neurons[1].Weights.FData[D] := (Random(2000) - 1000) / 1000;
+    end;
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    AssertEquals('token-shift + WKV collected', 2, Session.SSMCount);
+    AssertEquals('no attention layers', 0, Session.SDPACount);
+    Session.Reset();
+    AssertStreamMatchesFull(Full, Session, Toks, 'rwkv block');
   finally
     Session.Free;
     Twin.Free;

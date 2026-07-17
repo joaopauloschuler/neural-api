@@ -1066,9 +1066,14 @@ type
   //     pMaxCacheLen) switches it onto the KV-cache path (pMaxCacheLen must
   //     cover the worst transient load: committed context + one whole
   //     window);
-  //   - every TNNetDiagonalSSM: BeginIncrementalDecode() switches it onto the
-  //     O(1)-per-step persisted-state path (no preallocation budget - the
-  //     entire past is one Depth-long state vector h);
+  //   - every recurrent FIXED-STATE layer: TNNetRecurrentDecodeBase
+  //     descendants (TNNetSelectiveSSM, TNNetWKV, causal
+  //     TNNetDepthwiseConv1D, ...) plus TNNetDiagonalSSM and TNNetTokenShift
+  //     (same contract, per-class - see TNNetRecurrentDecodeBase's note).
+  //     BeginIncrementalDecode() switches each onto the O(1)-per-step
+  //     persisted-state path (no preallocation budget - the entire past is a
+  //     fixed-size state). This is what lets a whole Mamba block (causal
+  //     conv + selective SSM) or an RWKV block (token-shift + WKV) stream;
   //   - every TNNetRotaryEmbedding: kept so PositionOffset can be advanced
   //     before each forward (below).
   // A net may contain any mix (attention-only, SSM-only, hybrid); the counts
@@ -1113,13 +1118,26 @@ type
     FNet: TNNet;
     FParallel: boolean;              // StepForward via TNNet.ComputeParallel
     FSDPAs: array of TNNetScaledDotProductAttention;
-    FSSMs: array of TNNetDiagonalSSM;
+    // Recurrent fixed-state layers: TNNetRecurrentDecodeBase descendants,
+    // TNNetDiagonalSSM and TNNetTokenShift (identical incremental-decode
+    // contract, three class families - dispatched by the State* helpers).
+    FSSMs: array of TNNetLayer;
     FRopes: array of TNNetRotaryEmbedding;
     FLearnedPos: array of TNNetLearnedPositionalEmbedding; // GPT-2-style wpe
     FHiddenLayer: TNNetLayer;        // lazily resolved last-hidden-state layer
     function GetSDPACount(): integer;
     function GetSSMCount(): integer;
     function GetRopeCount(): integer;
+    // Uniform dispatch over the recurrent-state class families (same contract,
+    // no common ancestor - see TNNetRecurrentDecodeBase's migration note).
+    class function IsRecurrentStateLayer(L: TNNetLayer): boolean;
+    class procedure StateBeginDecode(L: TNNetLayer);
+    class procedure StateEndDecode(L: TNNetLayer);
+    class procedure StateReset(L: TNNetLayer);
+    class procedure StateCapture(L: TNNetLayer; Dst: TNNetVolume;
+      out Steps: integer);
+    class procedure StateRestore(L: TNNetLayer; Src: TNNetVolume;
+      Steps: integer);
   public
     // pInt8KV = true arms the int8-quantized KV cache at construction: the
     // attention layers allocate the int8 code/scale storage directly and the
@@ -1213,6 +1231,9 @@ type
     // loop. Default False (serial). Coded by Claude (AI).
     property Parallel: boolean read FParallel write FParallel;
     property SDPACount: integer read GetSDPACount;
+    // Number of collected recurrent fixed-state layers (selective/diagonal
+    // SSM, WKV, token-shift, causal depthwise-conv state). Non-zero means the
+    // session state cannot be truncated by position (no KV-cache reuse).
     property SSMCount: integer read GetSSMCount;
     property RopeCount: integer read GetRopeCount;
   end;
@@ -4969,6 +4990,66 @@ end;
 
 { TNNetStreamingDecoder }
 
+// The three recurrent-state class families share the incremental-decode
+// contract (Begin/End/ResetState/CaptureState/RestoreState) but not a common
+// ancestor: TNNetRecurrentDecodeBase descendants carry it via the base,
+// TNNetDiagonalSSM / TNNetTokenShift per-class (they live under
+// TNNetChannelTransformBase - see the base class note in neuralnetwork.pas).
+// These helpers give the session ONE dispatch point per operation.
+// Coded by Claude (AI).
+class function TNNetStreamingDecoder.IsRecurrentStateLayer(L: TNNetLayer): boolean;
+begin
+  Result := (L is TNNetRecurrentDecodeBase) or (L is TNNetDiagonalSSM) or
+    (L is TNNetTokenShift);
+end;
+
+class procedure TNNetStreamingDecoder.StateBeginDecode(L: TNNetLayer);
+begin
+  if L is TNNetRecurrentDecodeBase then
+    TNNetRecurrentDecodeBase(L).BeginIncrementalDecode()
+  else if L is TNNetDiagonalSSM then
+    TNNetDiagonalSSM(L).BeginIncrementalDecode()
+  else TNNetTokenShift(L).BeginIncrementalDecode();
+end;
+
+class procedure TNNetStreamingDecoder.StateEndDecode(L: TNNetLayer);
+begin
+  if L is TNNetRecurrentDecodeBase then
+    TNNetRecurrentDecodeBase(L).EndIncrementalDecode()
+  else if L is TNNetDiagonalSSM then
+    TNNetDiagonalSSM(L).EndIncrementalDecode()
+  else TNNetTokenShift(L).EndIncrementalDecode();
+end;
+
+class procedure TNNetStreamingDecoder.StateReset(L: TNNetLayer);
+begin
+  if L is TNNetRecurrentDecodeBase then
+    TNNetRecurrentDecodeBase(L).ResetState()
+  else if L is TNNetDiagonalSSM then
+    TNNetDiagonalSSM(L).ResetState()
+  else TNNetTokenShift(L).ResetState();
+end;
+
+class procedure TNNetStreamingDecoder.StateCapture(L: TNNetLayer;
+  Dst: TNNetVolume; out Steps: integer);
+begin
+  if L is TNNetRecurrentDecodeBase then
+    TNNetRecurrentDecodeBase(L).CaptureState(Dst, Steps)
+  else if L is TNNetDiagonalSSM then
+    TNNetDiagonalSSM(L).CaptureState(Dst, Steps)
+  else TNNetTokenShift(L).CaptureState(Dst, Steps);
+end;
+
+class procedure TNNetStreamingDecoder.StateRestore(L: TNNetLayer;
+  Src: TNNetVolume; Steps: integer);
+begin
+  if L is TNNetRecurrentDecodeBase then
+    TNNetRecurrentDecodeBase(L).RestoreState(Src, Steps)
+  else if L is TNNetDiagonalSSM then
+    TNNetDiagonalSSM(L).RestoreState(Src, Steps)
+  else TNNetTokenShift(L).RestoreState(Src, Steps);
+end;
+
 constructor TNNetStreamingDecoder.Create(pNet: TNNet; pMaxCacheLen: integer;
   pInt8KV: boolean);
 var
@@ -4996,12 +5077,12 @@ begin
       FSDPAs[n] := TNNetScaledDotProductAttention(Layer);
       FSDPAs[n].BeginIncrementalDecode(pMaxCacheLen, pInt8KV);
     end;
-    if Layer is TNNetDiagonalSSM then
+    if IsRecurrentStateLayer(Layer) then
     begin
       n := Length(FSSMs);
       SetLength(FSSMs, n + 1);
-      FSSMs[n] := TNNetDiagonalSSM(Layer);
-      FSSMs[n].BeginIncrementalDecode();
+      FSSMs[n] := Layer;
+      StateBeginDecode(Layer);
     end;
     if Layer is TNNetRotaryEmbedding then
     begin
@@ -5031,7 +5112,7 @@ begin
   HiRope := High(FRopes);
   HiLearned := High(FLearnedPos);
   for i := 0 to HiSDPA do FSDPAs[i].EndIncrementalDecode();
-  for i := 0 to HiSSM do FSSMs[i].EndIncrementalDecode();
+  for i := 0 to HiSSM do StateEndDecode(FSSMs[i]);
   for i := 0 to HiRope do FRopes[i].PositionOffset := 0;
   for i := 0 to HiLearned do FLearnedPos[i].PositionOffset := 0;
   SetLength(FSDPAs, 0);
@@ -5048,7 +5129,7 @@ begin
   HiSDPA := High(FSDPAs);
   HiSSM := High(FSSMs);
   for i := 0 to HiSDPA do FSDPAs[i].ResetCache();
-  for i := 0 to HiSSM do FSSMs[i].ResetState();
+  for i := 0 to HiSSM do StateReset(FSSMs[i]);
 end;
 
 procedure TNNetStreamingDecoder.StepForward(InV: TNNetVolume; AbsPos: integer);
@@ -5138,7 +5219,7 @@ begin
   for i := 0 to HiSSM do
   begin
     Result.FH[i] := TNNetVolume.Create();
-    FSSMs[i].CaptureState(Result.FH[i], Result.FSteps[i]);
+    StateCapture(FSSMs[i], Result.FH[i], Result.FSteps[i]);
   end;
 end;
 
@@ -5164,7 +5245,7 @@ begin
     FSDPAs[i].RestoreCacheState(Snap.FK[i], Snap.FV[i],
       Snap.FLen[i], Snap.FSinks[i], Snap.FWindow[i]);
   for i := 0 to HiSSM do
-    FSSMs[i].RestoreState(Snap.FH[i], Snap.FSteps[i]);
+    StateRestore(FSSMs[i], Snap.FH[i], Snap.FSteps[i]);
 end;
 
 function TNNetStreamingDecoder.Output(): TNNetVolume;
