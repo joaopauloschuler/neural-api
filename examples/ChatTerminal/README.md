@@ -3,8 +3,15 @@
 A terminal chat program for the checkpoints the generic importer dispatch
 (`BuildFromPretrained` in `neural/neuralpretrained.pas`) supports: qwen2, qwen2.5, qwen3,
 mamba, gpt2.
-It is planned (coded) to support: llama, mistral, gemma/2/3, phi/phi3, gpt_neo(x), 
-gptj, cohere/cohere2, rwkv,  falcon_mamba, bloom, deepseek_v2. Point it at a
+It is planned (coded) to support: mistral, mixtral,
+qwen3_moe, gemma/2/3, recurrent_gemma, phi/phi3, gpt_oss, gpt_neo(x), gptj,
+gpt_bigcode, starcoder2, opt, cohere/cohere2, olmo2, olmoe,
+granite/granitemoe, glm4, minicpm, bitnet, internlm2, falcon, rwkv,
+falcon_mamba, mamba2, nemotron_h, jamba, bloom, deepseek_v2,
+llama (Llama 1/2/3 incl. the 3.1/3.2 `rope_scaling` "llama3" long-context
+ramp, TinyLlama; also `.gguf` llama.cpp checkpoints) and llama4/llama4_text
+(Llama 4 text-only — iRoPE + MoE, e.g. Llama-4-Scout; the vision tower is
+out of scope). Point it at a
 HuggingFace-style model directory (`config.json` + `model.safetensors` [or
 sharded index / pytorch_model.bin] + `tokenizer.json`
 [+ `tokenizer_config.json`]) and chat:
