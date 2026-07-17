@@ -2,16 +2,15 @@
 
 A terminal chat program for the checkpoints the generic importer dispatch
 (`BuildFromPretrained` in `neural/neuralpretrained.pas`) supports: qwen2, qwen2.5, qwen3,
-mamba, gpt2.
-It is planned (coded) to support: mistral, mixtral,
-qwen3_moe, gemma/2/3, recurrent_gemma, phi/phi3, gpt_oss, gpt_neo(x), gptj,
-gpt_bigcode, starcoder2, opt, cohere/cohere2, olmo2, olmoe,
+mamba, gpt2, llama, mistral, phi3, olmoe (see the tested-checkpoint list
+below).
+It is planned (coded) to support: mixtral,
+qwen3_moe, gemma/2/3, recurrent_gemma, phi, gpt_oss, gpt_neo(x), gptj,
+gpt_bigcode, starcoder2, opt, cohere/cohere2, olmo2,
 granite/granitemoe, glm4, minicpm, bitnet, internlm2, falcon, rwkv,
 falcon_mamba, mamba2, nemotron_h, jamba, bloom, deepseek_v2,
-llama (Llama 1/2/3 incl. the 3.1/3.2 `rope_scaling` "llama3" long-context
-ramp, TinyLlama; also `.gguf` llama.cpp checkpoints) and llama4/llama4_text
-(Llama 4 text-only — iRoPE + MoE, e.g. Llama-4-Scout; the vision tower is
-out of scope). Point it at a
+`.gguf` llama.cpp checkpoints and llama4/llama4_text (Llama 4 text-only —
+iRoPE + MoE, e.g. Llama-4-Scout; the vision tower is out of scope). Point it at a
 HuggingFace-style model directory (`config.json` + `model.safetensors` [or
 sharded index / pytorch_model.bin] + `tokenizer.json`
 [+ `tokenizer_config.json`]) and chat:
@@ -21,6 +20,25 @@ lazbuild neural-api/examples/ChatTerminal/ChatTerminal.lpi
 git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q2
 neural-api/bin/x86_64-linux/bin/ChatTerminal q2/ --gpu
 ```
+
+### Tested checkpoints
+
+The checkpoints actually verified through this REPL (what backs the
+"supports" list above; the llama path is additionally coded for Llama
+1/2/3 incl. the 3.1/3.2 `rope_scaling` "llama3" long-context ramp, but
+only the checkpoints below have been run):
+
+| Checkpoint | model_type |
+|---|---|
+| Qwen/Qwen2.5-{0.5B,1.5B,3B,7B,14B,32B}-Instruct | qwen2 |
+| Qwen/Qwen3-0.6B | qwen3 |
+| TinyLlama/TinyLlama-1.1B-Chat-v1.0 | llama |
+| mistralai/Mistral-7B-Instruct-v0.3 | mistral |
+| HuggingFaceTB/SmolLM2-1.7B-Instruct | llama |
+| microsoft/Phi-3-mini-4k-instruct | phi3 |
+| allenai/OLMoE-1B-7B-0125-Instruct | olmoe |
+| state-spaces/mamba-130m-hf | mamba |
+| openai-community/gpt2 | gpt2 |
 
 ### Multilingual generation (Cohere Command-R / Aya)
 
