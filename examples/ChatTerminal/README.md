@@ -2,10 +2,10 @@
 
 A terminal chat program for the checkpoints the generic importer dispatch
 (`BuildFromPretrained` in `neural/neuralpretrained.pas`) supports: qwen2, qwen2.5, qwen3,
-mamba, gpt2, llama, mistral, phi3, olmoe (see the tested-checkpoint list
-below).
+qwen3_moe, mamba, gpt2, llama, mistral, phi3, olmoe (see the
+tested-checkpoint list below).
 It is planned (coded) to support: mixtral,
-qwen3_moe, gemma/2/3, recurrent_gemma, phi, gpt_oss, gpt_neo(x), gptj,
+gemma/2/3, recurrent_gemma, phi, gpt_oss, gpt_neo(x), gptj,
 gpt_bigcode, starcoder2, opt, cohere/cohere2, olmo2,
 granite/granitemoe, glm4, minicpm, bitnet, internlm2, falcon, rwkv,
 falcon_mamba, mamba2, nemotron_h, jamba, bloom, deepseek_v2,
@@ -32,6 +32,7 @@ only the checkpoints below have been run):
 |---|---|
 | Qwen/Qwen2.5-{0.5B,1.5B,3B,7B,14B,32B}-Instruct | qwen2 |
 | Qwen/Qwen3-0.6B | qwen3 |
+| Qwen/Qwen3-30B-A3B-Thinking-2507 | qwen3_moe |
 | TinyLlama/TinyLlama-1.1B-Chat-v1.0 | llama |
 | mistralai/Mistral-7B-Instruct-v0.3 | mistral |
 | HuggingFaceTB/SmolLM2-1.7B-Instruct | llama |
