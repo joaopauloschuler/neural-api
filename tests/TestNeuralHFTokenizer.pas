@@ -42,6 +42,7 @@ type
     procedure TestSplitCl100kParityWithHF;
     procedure TestSplitDeepSeekParityWithHF;
     procedure TestSplitO200kParityWithHF;
+    procedure TestSplitO200kHarmonyParityWithHF;
     procedure TestByteLevelNoRegexParityWithHF;
     procedure TestDigitsByteLevelParityWithHF;
     procedure TestFalconSequenceParityWithHF;
@@ -539,6 +540,16 @@ end;
 procedure TTestNeuralHFTokenizer.TestSplitO200kParityWithHF;
 begin
   RunParityBattery('split_o200k');
+end;
+
+// o200k_harmony (OpenAI gpt-oss): the o200k pattern with \p{Lm} added to
+// the two lowercase letter-run classes. The pinned cases contain no \p{Lm}
+// codepoints, so the split_o200k expected ids hold for both patterns; what
+// this adds is the RECOGNIZER accepting the harmony literal (it used to
+// raise "Unsupported Split pre_tokenizer pattern" on gpt-oss-20b).
+procedure TTestNeuralHFTokenizer.TestSplitO200kHarmonyParityWithHF;
+begin
+  RunParityBattery('split_o200k_harmony');
 end;
 
 // STANDALONE ByteLevel(use_regex=false): the GPT-2 regex split must be

@@ -442,6 +442,18 @@ const
     '[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+' +
     '[\p{Ll}\p{Lo}\p{M}]*(?i:''s|''t|''re|''ve|''m|''ll|''d)?|' +
     '\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+';
+  // o200k_harmony (OpenAI gpt-oss tokenizer.json): identical to
+  // csO200kSplitPattern except the two LOWERCASE letter-run classes also
+  // carry \p{Lm}. Every \p{Lm} codepoint is non-ASCII, and the splitter's
+  // ASCII-case approximation already treats all non-ASCII letters as the
+  // lowercase class, so both patterns split identically -- dispatched to
+  // the same SplitO200kPieces.
+  csO200kHarmonySplitPattern =
+    '[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*' +
+    '[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:''s|''t|''re|''ve|''m|''ll|''d)?|' +
+    '[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+' +
+    '[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:''s|''t|''re|''ve|''m|''ll|''d)?|' +
+    '\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+';
 
 // Compact CANONICAL Unicode tables (decomposition, composition, combining
 // class) backing the NFD/NFC normalizers below. AUTO-GENERATED from Python
@@ -1608,8 +1620,11 @@ var
         FSplitDigitsMax := 3;
         FSplitPreTok := true;
       end
-      else if Pattern = csO200kSplitPattern then
-        // case-aware multi-alternation splitter (distinct from cl100k)
+      else if (Pattern = csO200kSplitPattern) or
+        (Pattern = csO200kHarmonySplitPattern) then
+        // case-aware multi-alternation splitter (distinct from cl100k);
+        // the harmony variant (gpt-oss) splits identically under the
+        // ASCII-case approximation
         FO200kPreTok := true
       else
         raise EHFTokenizerError.Create(
