@@ -172,6 +172,13 @@ type
     procedure TestSSMPrefillThenStepMatchesFullForward;
     procedure TestSSMResetStateStartsFreshSequence;
     procedure TestSSMDisabledPathUnchanged;
+    // Conv-state incremental decode on TNNetDepthwiseConv1D (causal K-1-row
+    // history buffer; the TNNetRecurrentDecodeBase contract).
+    procedure TestDepthwiseConv1DIncrementalMatchesFullForward;
+    procedure TestDepthwiseConv1DPrefillThenStepMatchesFullForward;
+    procedure TestDepthwiseConv1DCaptureRestoreResumesBitIdentical;
+    procedure TestDepthwiseConv1DResetStateStartsFreshSequence;
+    procedure TestDepthwiseConv1DDisabledPathUnchanged;
     // TNNetStreamingDecoder: the reusable incremental-decode session.
     procedure TestStreamingDecoderTransformerMatchesFullForward;
     procedure TestStreamingDecoderGQAMatchesFullForward;
@@ -2269,6 +2276,345 @@ begin
     // Enable then immediately disable: the next forward must be identical.
     SSM.BeginIncrementalDecode();
     SSM.EndIncrementalDecode();
+    NN.Compute(InV);
+    NN.GetOutput(OutAfter);
+    for T := 0 to SeqLen - 1 do
+      for D := 0 to Depth - 1 do
+        AssertEquals('pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          OutBefore[T, 0, D], OutAfter[T, 0, D], 0);
+  finally
+    OutAfter.Free;
+    OutBefore.Free;
+    InV.Free;
+    NN.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// TNNetDepthwiseConv1D conv-state incremental decode. A causal K-tap
+// depthwise conv streams with a persisted (K-1)-row input history (the
+// TNNetRecurrentDecodeBase contract). Taps accumulate in the same order as
+// the full sweep, so the streamed output must be BIT-IDENTICAL (tolerance 0).
+// ---------------------------------------------------------------------------
+
+// Shared setup: a width-W net Input(W,1,Depth) -> DepthwiseConv1D(K, causal)
+// with randomized per-channel kernels AND biases (bias coverage matters: the
+// decode path has its own bias accumulation).
+procedure RandomizeDepthwiseConv(Conv: TNNetDepthwiseConv1D;
+  KernelSize, Depth: integer);
+var
+  C, K: integer;
+begin
+  for C := 0 to Depth - 1 do
+  begin
+    for K := 0 to KernelSize - 1 do
+      Conv.Neurons[C].Weights.FData[K] := (Random(2000) - 1000) / 1000;
+    Conv.Neurons[C].BiasWeight := (Random(2000) - 1000) / 1000;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestDepthwiseConv1DIncrementalMatchesFullForward;
+const
+  SeqLen = 9;
+  Depth = 6;
+  KernelSize = 4;
+var
+  NNFull, NNStep: TNNet;
+  ConvFull, ConvStep: TNNetDepthwiseConv1D;
+  FullIn, StepIn, FullOut, StepOut: TNNetVolume;
+  T, D: integer;
+begin
+  RandSeed := 20260716;
+  NNFull := TNNet.Create();
+  NNStep := TNNet.Create();
+  FullIn := TNNetVolume.Create(SeqLen, 1, Depth);
+  StepIn := TNNetVolume.Create(1, 1, Depth);
+  FullOut := TNNetVolume.Create();
+  StepOut := TNNetVolume.Create();
+  try
+    NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, Depth));
+    ConvFull := TNNetDepthwiseConv1D.Create(KernelSize, {pCausal=}true);
+    NNFull.AddLayer(ConvFull);
+    NNStep.AddLayer(TNNetInput.Create(1, 1, Depth));
+    ConvStep := TNNetDepthwiseConv1D.Create(KernelSize, {pCausal=}true);
+    NNStep.AddLayer(ConvStep);
+    RandomizeDepthwiseConv(ConvFull, KernelSize, Depth);
+    ConvStep.CopyWeights(ConvFull);
+
+    FullIn.Randomize();
+    FullIn.Sub(0.5);
+    NNFull.Compute(FullIn);
+    NNFull.GetOutput(FullOut);
+
+    ConvStep.BeginIncrementalDecode();
+    AssertTrue('decode enabled after Begin', ConvStep.DecodeEnabled);
+    for T := 0 to SeqLen - 1 do
+    begin
+      for D := 0 to Depth - 1 do
+        StepIn[0, 0, D] := FullIn[T, 0, D];
+      NNStep.Compute(StepIn);
+      NNStep.GetOutput(StepOut);
+      AssertEquals('decode steps track tokens', T + 1, ConvStep.DecodeSteps);
+      for D := 0 to Depth - 1 do
+        AssertEquals('pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          FullOut[T, 0, D], StepOut[0, 0, D], 0);
+    end;
+    ConvStep.EndIncrementalDecode();
+    AssertTrue('decode disabled after End', not ConvStep.DecodeEnabled);
+  finally
+    StepOut.Free;
+    FullOut.Free;
+    StepIn.Free;
+    FullIn.Free;
+    NNStep.Free;
+    NNFull.Free;
+  end;
+end;
+
+// Multi-token prompt prefill: feed the first PrefillLen tokens in ONE
+// incremental forward (on a width-PrefillLen net) - the history sweep handles
+// any window size, including windows SHORTER than K-1 (PrefillLen=2 < K-1=3
+// exercises the shift-and-append branch when stepping afterwards).
+procedure TTestNeuralDecode.TestDepthwiseConv1DPrefillThenStepMatchesFullForward;
+const
+  SeqLen = 8;
+  PrefillLen = 2; // < K-1: the history advance must shift, not just overwrite
+  Depth = 4;
+  KernelSize = 4;
+var
+  NNFull, NNPre, NNStep: TNNet;
+  ConvFull, ConvPre, ConvStep: TNNetDepthwiseConv1D;
+  FullIn, PreIn, StepIn, FullOut, PreOut, StepOut: TNNetVolume;
+  Snap: TNNetVolume;
+  Steps, T, D: integer;
+begin
+  RandSeed := 31338;
+  NNFull := TNNet.Create();
+  NNPre := TNNet.Create();
+  NNStep := TNNet.Create();
+  FullIn := TNNetVolume.Create(SeqLen, 1, Depth);
+  PreIn := TNNetVolume.Create(PrefillLen, 1, Depth);
+  StepIn := TNNetVolume.Create(1, 1, Depth);
+  FullOut := TNNetVolume.Create();
+  PreOut := TNNetVolume.Create();
+  StepOut := TNNetVolume.Create();
+  Snap := TNNetVolume.Create();
+  try
+    NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, Depth));
+    ConvFull := TNNetDepthwiseConv1D.Create(KernelSize, {pCausal=}true);
+    NNFull.AddLayer(ConvFull);
+    NNPre.AddLayer(TNNetInput.Create(PrefillLen, 1, Depth));
+    ConvPre := TNNetDepthwiseConv1D.Create(KernelSize, {pCausal=}true);
+    NNPre.AddLayer(ConvPre);
+    NNStep.AddLayer(TNNetInput.Create(1, 1, Depth));
+    ConvStep := TNNetDepthwiseConv1D.Create(KernelSize, {pCausal=}true);
+    NNStep.AddLayer(ConvStep);
+    RandomizeDepthwiseConv(ConvFull, KernelSize, Depth);
+    ConvPre.CopyWeights(ConvFull);
+    ConvStep.CopyWeights(ConvFull);
+
+    FullIn.Randomize();
+    FullIn.Sub(0.5);
+    NNFull.Compute(FullIn);
+    NNFull.GetOutput(FullOut);
+
+    // Prefill PrefillLen tokens in one incremental forward.
+    ConvPre.BeginIncrementalDecode();
+    for T := 0 to PrefillLen - 1 do
+      for D := 0 to Depth - 1 do
+        PreIn[T, 0, D] := FullIn[T, 0, D];
+    NNPre.Compute(PreIn);
+    NNPre.GetOutput(PreOut);
+    AssertEquals('prefill decode steps', PrefillLen, ConvPre.DecodeSteps);
+    for T := 0 to PrefillLen - 1 do
+      for D := 0 to Depth - 1 do
+        AssertEquals('prefill pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          FullOut[T, 0, D], PreOut[T, 0, D], 0);
+
+    // Hand the state to the width-1 net and stream the rest of the sequence.
+    ConvStep.BeginIncrementalDecode();
+    ConvPre.CaptureState(Snap, Steps);
+    ConvStep.RestoreState(Snap, Steps);
+    for T := PrefillLen to SeqLen - 1 do
+    begin
+      for D := 0 to Depth - 1 do
+        StepIn[0, 0, D] := FullIn[T, 0, D];
+      NNStep.Compute(StepIn);
+      NNStep.GetOutput(StepOut);
+      for D := 0 to Depth - 1 do
+        AssertEquals('step pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          FullOut[T, 0, D], StepOut[0, 0, D], 0);
+    end;
+    AssertEquals('total decode steps', SeqLen, ConvStep.DecodeSteps);
+  finally
+    Snap.Free;
+    StepOut.Free;
+    PreOut.Free;
+    FullOut.Free;
+    StepIn.Free;
+    PreIn.Free;
+    FullIn.Free;
+    NNStep.Free;
+    NNPre.Free;
+    NNFull.Free;
+  end;
+end;
+
+// Snapshot / fork: capture mid-stream, keep streaming, then restore and
+// re-stream the same continuation - both runs must be bit-identical.
+procedure TTestNeuralDecode.TestDepthwiseConv1DCaptureRestoreResumesBitIdentical;
+const
+  SeqLen = 10;
+  ForkAt = 4;
+  Depth = 3;
+  KernelSize = 3;
+var
+  NN: TNNet;
+  Conv: TNNetDepthwiseConv1D;
+  StepIn, OutV, Seq, Snap: TNNetVolume;
+  FirstRun: array of TNeuralFloat;
+  Steps, T, D: integer;
+begin
+  RandSeed := 555001;
+  NN := TNNet.Create();
+  StepIn := TNNetVolume.Create(1, 1, Depth);
+  OutV := TNNetVolume.Create();
+  Seq := TNNetVolume.Create(SeqLen, 1, Depth);
+  Snap := TNNetVolume.Create();
+  SetLength(FirstRun, (SeqLen - ForkAt) * Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, Depth));
+    Conv := TNNetDepthwiseConv1D.Create(KernelSize, {pCausal=}true);
+    NN.AddLayer(Conv);
+    RandomizeDepthwiseConv(Conv, KernelSize, Depth);
+    Seq.Randomize();
+    Seq.Sub(0.5);
+
+    Conv.BeginIncrementalDecode();
+    Steps := 0;
+    for T := 0 to ForkAt - 1 do
+    begin
+      for D := 0 to Depth - 1 do
+        StepIn[0, 0, D] := Seq[T, 0, D];
+      NN.Compute(StepIn);
+    end;
+    Conv.CaptureState(Snap, Steps);
+    AssertEquals('captured step count', ForkAt, Steps);
+    // First continuation.
+    for T := ForkAt to SeqLen - 1 do
+    begin
+      for D := 0 to Depth - 1 do
+        StepIn[0, 0, D] := Seq[T, 0, D];
+      NN.Compute(StepIn);
+      NN.GetOutput(OutV);
+      for D := 0 to Depth - 1 do
+        FirstRun[(T - ForkAt) * Depth + D] := OutV[0, 0, D];
+    end;
+    // Restore and replay: must be bit-identical to the first continuation.
+    Conv.RestoreState(Snap, Steps);
+    AssertEquals('restored step count', ForkAt, Conv.DecodeSteps);
+    for T := ForkAt to SeqLen - 1 do
+    begin
+      for D := 0 to Depth - 1 do
+        StepIn[0, 0, D] := Seq[T, 0, D];
+      NN.Compute(StepIn);
+      NN.GetOutput(OutV);
+      for D := 0 to Depth - 1 do
+        AssertEquals('replay pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          FirstRun[(T - ForkAt) * Depth + D], OutV[0, 0, D], 0);
+    end;
+  finally
+    Snap.Free;
+    Seq.Free;
+    OutV.Free;
+    StepIn.Free;
+    NN.Free;
+  end;
+end;
+
+// ResetState must start a genuinely fresh sequence: streaming the same token
+// stream twice (with a ResetState in between) yields identical outputs.
+procedure TTestNeuralDecode.TestDepthwiseConv1DResetStateStartsFreshSequence;
+const
+  SeqLen = 6;
+  Depth = 3;
+  KernelSize = 4;
+var
+  NN: TNNet;
+  Conv: TNNetDepthwiseConv1D;
+  StepIn, OutV, Seq: TNNetVolume;
+  FirstRun: array of TNeuralFloat;
+  T, D, Pass: integer;
+begin
+  RandSeed := 90211;
+  NN := TNNet.Create();
+  StepIn := TNNetVolume.Create(1, 1, Depth);
+  OutV := TNNetVolume.Create();
+  Seq := TNNetVolume.Create(SeqLen, 1, Depth);
+  SetLength(FirstRun, SeqLen * Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, Depth));
+    Conv := TNNetDepthwiseConv1D.Create(KernelSize, {pCausal=}true);
+    NN.AddLayer(Conv);
+    RandomizeDepthwiseConv(Conv, KernelSize, Depth);
+    Seq.Randomize();
+    Seq.Sub(0.5);
+
+    Conv.BeginIncrementalDecode();
+    for Pass := 0 to 1 do
+    begin
+      if Pass = 1 then Conv.ResetState();
+      for T := 0 to SeqLen - 1 do
+      begin
+        for D := 0 to Depth - 1 do
+          StepIn[0, 0, D] := Seq[T, 0, D];
+        NN.Compute(StepIn);
+        NN.GetOutput(OutV);
+        if Pass = 0 then
+          for D := 0 to Depth - 1 do
+            FirstRun[T * Depth + D] := OutV[0, 0, D]
+        else
+          for D := 0 to Depth - 1 do
+            AssertEquals('pass 2 pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+              FirstRun[T * Depth + D], OutV[0, 0, D], 0);
+      end;
+    end;
+  finally
+    Seq.Free;
+    OutV.Free;
+    StepIn.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestDepthwiseConv1DDisabledPathUnchanged;
+const
+  SeqLen = 7;
+  Depth = 5;
+  KernelSize = 3;
+var
+  NN: TNNet;
+  Conv: TNNetDepthwiseConv1D;
+  InV, OutBefore, OutAfter: TNNetVolume;
+  T, D: integer;
+begin
+  RandSeed := 778;
+  NN := TNNet.Create();
+  InV := TNNetVolume.Create(SeqLen, 1, Depth);
+  OutBefore := TNNetVolume.Create();
+  OutAfter := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth));
+    Conv := TNNetDepthwiseConv1D.Create(KernelSize, {pCausal=}true);
+    NN.AddLayer(Conv);
+    RandomizeDepthwiseConv(Conv, KernelSize, Depth);
+    InV.Randomize();
+    InV.Sub(0.5);
+    NN.Compute(InV);
+    NN.GetOutput(OutBefore);
+    // Enable then immediately disable: the next forward must be identical.
+    Conv.BeginIncrementalDecode();
+    Conv.EndIncrementalDecode();
     NN.Compute(InV);
     NN.GetOutput(OutAfter);
     for T := 0 to SeqLen - 1 do
