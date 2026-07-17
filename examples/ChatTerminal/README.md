@@ -47,6 +47,27 @@ encodes it with the HF tokenizer (`EncodeChat`). The assistant reply
 **streams** to stdout as it decodes (delta printing with a BPE/UTF-8 prefix
 guard, flushed per token so piped output streams too).
 
+**`--format raw` — completion mode for base models.** BASE (non-instruct)
+checkpoints such as `gpt2`, `mamba-130m` or the pythias have no chat
+template; wrapping them in ChatML markup makes greedy decoding parrot the
+markup back (the model has never seen it). `--format raw` drops templates
+entirely: the REPL becomes a completion notebook over one running
+transcript — each typed line is appended verbatim (no roles, no markup, no
+BOS) and the model continues it; the continuation is appended back, so the
+next turn extends the same document (and reuses the KV cache, since each
+turn's token ids strictly extend the previous turn's). There is no
+end-of-turn marker: generation stops on the tokenizer's EOS id or at
+`--max-new-tokens` only, and base models rarely emit EOS — pass a small
+cap (e.g. `--max-new-tokens 128`). `/reset` clears the transcript;
+`/system` is ignored with a notice (there is no system role). Raw is never
+autodetected — explicit flag only.
+
+```
+ChatTerminal gpt2/ --format raw --greedy --max-new-tokens 25
+> Hello, I'm a language model,
+ not a programming language. I'm a language model. ...
+```
+
 ## Flags
 
 Sampling defaults resolve **per parameter** as: explicit flag >
@@ -71,7 +92,7 @@ draws uniformly. `--greedy` hard-overrides everything.
 | `--max-new-tokens N` | reply length cap | 8192 |
 | `--seed N` | RNG seed (reproducible sampling) | randomize |
 | `--ctx N` | context window to build (`pSeqLen`) — KV-cache memory grows ~O(ctx) | model max, capped at 2048 (the startup banner says so; raise explicitly with `--ctx`) |
-| `--format NAME` | `chatml`/`llama2`/`llama3`/`zephyr`/`gemma`/`phi3`/`mistral` override | autodetect |
+| `--format NAME` | `chatml`/`llama2`/`llama3`/`zephyr`/`gemma`/`phi3`/`mistral` override, or `raw` (see below) | autodetect |
 | `--system "msg"` | initial system prompt | none |
 | `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — less RAM **and** faster than fp32 on both CPU (fused AVX2 int8 kernels) and GPU: the quantized codes stay resident on the device (see below) | **on** |
 | `--fp32` | full-precision fp32 weights — more RAM, slower. Also switches the KV-cache default to fp32 | off |
@@ -190,10 +211,11 @@ re-prefill each turn. `--no-cache-reuse` forces the full re-prefill (use
 
 ```
 /exit            quit (EOF / Ctrl-D also exits cleanly)
-/reset           clear the conversation history
+/reset           clear the conversation history (the transcript in raw mode)
 /system <msg>    set the system prompt (formats without a system role,
                  e.g. gemma/mistral, raise a template error - the turn is
-                 dropped and the history stays consistent)
+                 dropped and the history stays consistent; ignored with a
+                 notice in --format raw)
 ```
 
 ## Sample session
