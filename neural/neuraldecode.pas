@@ -4701,6 +4701,10 @@ end;
 // One round of the splitmix64 finalizer - a fast, well-mixing 64-bit hash.
 // Used as the deterministic green-list PRNG so the partition is bit-identical
 // in the processor and in DetectWatermark.
+// The add/multiply steps wrap around UInt64 on purpose: checks stay off here
+// even in debug builds, where -Co would turn the wrap into EIntOverflow.
+{$PUSH}
+{$Q-}{$R-}
 function WatermarkSplitMix64(X: UInt64): UInt64;
 begin
   X := X + UInt64($9E3779B97F4A7C15);
@@ -4708,6 +4712,7 @@ begin
   X := (X xor (X shr 27)) * UInt64($94D049BB133111EB);
   Result := X xor (X shr 31);
 end;
+{$POP}
 
 constructor TNNetWatermarkLogitsProcessor.Create(pKey: UInt64;
   pGamma: TNeuralFloat = 0.25; pDelta: TNeuralFloat = 2.0);
@@ -4719,6 +4724,10 @@ begin
   FPrevToken := -1;
 end;
 
+// The XOR-fold and Seed+TokenId sum below wrap around UInt64 by design;
+// checks stay off so debug builds (-Co) do not raise EIntOverflow on them.
+{$PUSH}
+{$Q-}{$R-}
 class function TNNetWatermarkLogitsProcessor.IsGreen(pKey: UInt64;
   PrevToken, TokenId: integer; Gamma: TNeuralFloat): boolean;
 var
@@ -4736,6 +4745,7 @@ begin
   Frac := (H shr 11) * (1.0 / 9007199254740992.0); // 2^53
   Result := Frac < Gamma;
 end;
+{$POP}
 
 procedure TNNetWatermarkLogitsProcessor.Reset(
   const PromptTokens: array of integer);

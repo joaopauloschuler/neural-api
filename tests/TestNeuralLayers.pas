@@ -1094,9 +1094,10 @@ begin
 end;
 
 procedure TTestNeuralLayers.TestVectorExpScalarParity;
-// TNNetVolume.VectorExp must match the scalar pcr_expf loop (the parity
-// reference) within a tight relative tolerance on every build. On AVX2 builds
-// VectorExp uses an 8-wide polynomial; on scalar builds it IS the pcr_expf loop.
+// TNNetVolume.VectorExp must match the scalar NeuralExp loop (the parity
+// reference, bit-identical to pcr_expf; unlike pcr_expf it stays trap-free
+// when this test is compiled with overflow checks). On AVX2 builds VectorExp
+// uses an 8-wide polynomial; on scalar builds it IS the NeuralExp loop.
 // N=131 deliberately straddles the 8-wide body and the (N mod 8) scalar tail.
 const
   N = 131;
@@ -1115,7 +1116,7 @@ begin
     begin
       x := -30.0 + 60.0 * I / (N - 1);
       Src.FData[I] := x;
-      Ref.FData[I] := pcr_expf(x);
+      Ref.FData[I] := NeuralExp(x);
     end;
     TNNetVolume.VectorExp(Dst.DataPtr, Src.DataPtr, N);
     maxRel := 0;
@@ -1228,8 +1229,9 @@ begin
 end;
 
 procedure TTestNeuralLayers.TestVectorSinhScalarParity;
-// VectorSinh (sinh built on the AVX2 VectorExp) must match the scalar pcr_sinhf
-// reference within tolerance on every build. N=131 straddles the 8-wide exp body
+// VectorSinh (sinh built on the AVX2 VectorExp) must match a double-precision
+// sinh reference within tolerance on every build (pcr_sinhf itself cannot be
+// the reference: it traps when this test is compiled with overflow checks). N=131 straddles the 8-wide exp body
 // and the (N mod 8) scalar tail; range [-12,12] matches the SinhAct parity band.
 // A second pass with dst aliasing src guards against the buffer-aliasing bug that
 // was fixed in VectorTanh/VectorErf.
@@ -1240,6 +1242,12 @@ var
   Src, Dst: TNNetVolume;
   I: integer;
   x, e, denom, maxRel: TNeuralFloat;
+
+  function SinhRef(v: Double): Double;
+  begin
+    Result := (Exp(v) - Exp(-v)) * 0.5;
+  end;
+
 begin
   Src := TNNetVolume.Create(N, 1, 1);
   Dst := TNNetVolume.Create(N, 1, 1);
@@ -1252,12 +1260,12 @@ begin
     for I := 0 to N - 1 do
     begin
       x := Src.FData[I];
-      denom := Abs(pcr_sinhf(x));
+      denom := Abs(SinhRef(x));
       if denom < 1e-20 then denom := 1e-20;
-      e := Abs(Dst.FData[I] - pcr_sinhf(x)) / denom;
+      e := Abs(Dst.FData[I] - SinhRef(x)) / denom;
       if e > maxRel then maxRel := e;
     end;
-    AssertTrue('VectorSinh vs pcr_sinhf max rel err ' + FloatToStr(maxRel) +
+    AssertTrue('VectorSinh vs sinh reference max rel err ' + FloatToStr(maxRel) +
       ' must be < ' + FloatToStr(RelTol), maxRel < RelTol);
     // dst aliasing src.
     TNNetVolume.VectorSinh(Src.DataPtr, Src.DataPtr, N);
@@ -1266,12 +1274,12 @@ begin
     begin
       // Recompute the original x from the index (Src has been overwritten).
       x := -12.0 + 24.0 * I / (N - 1);
-      denom := Abs(pcr_sinhf(x));
+      denom := Abs(SinhRef(x));
       if denom < 1e-20 then denom := 1e-20;
-      e := Abs(Src.FData[I] - pcr_sinhf(x)) / denom;
+      e := Abs(Src.FData[I] - SinhRef(x)) / denom;
       if e > maxRel then maxRel := e;
     end;
-    AssertTrue('VectorSinh (aliased) vs pcr_sinhf max rel err ' + FloatToStr(maxRel) +
+    AssertTrue('VectorSinh (aliased) vs sinh reference max rel err ' + FloatToStr(maxRel) +
       ' must be < ' + FloatToStr(RelTol), maxRel < RelTol);
   finally
     Src.Free; Dst.Free;

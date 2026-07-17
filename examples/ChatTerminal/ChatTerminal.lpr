@@ -119,7 +119,9 @@ Coded by Claude (AI).
 {$mode objfpc}{$H+}
 
 uses
-  {$IFDEF UNIX}cthreads, cmem,{$ENDIF}
+  // cmem is skipped in the Debug build mode: it enables Valgrind (-gv), and
+  // FPC then pulls in cmem itself, so naming it here is a duplicate.
+  {$IFDEF UNIX}cthreads, {$IFNDEF Debug}cmem,{$ENDIF}{$ENDIF}
   {$IFDEF OpenCL}neuralopencl,{$ENDIF}
   Classes, SysUtils, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralpretrained, neuralhftokenizer,
