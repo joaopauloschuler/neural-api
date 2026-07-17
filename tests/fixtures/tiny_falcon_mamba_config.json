@@ -1,0 +1,21 @@
+{
+ "architectures": [
+  "FalconMambaForCausalLM"
+ ],
+ "model_type": "falcon_mamba",
+ "vocab_size": 13,
+ "hidden_size": 8,
+ "num_hidden_layers": 2,
+ "state_size": 4,
+ "time_step_rank": 2,
+ "expand": 2,
+ "conv_kernel": 4,
+ "use_bias": false,
+ "use_conv_bias": true,
+ "layer_norm_epsilon": 1e-05,
+ "mixer_rms_eps": 0.001,
+ "tie_word_embeddings": false,
+ "use_cache": true,
+ "bos_token_id": 0,
+ "eos_token_id": 0
+}
