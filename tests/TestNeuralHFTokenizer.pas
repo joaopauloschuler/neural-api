@@ -40,6 +40,9 @@ type
     procedure TestSentencePieceBPEModelParity;
     procedure TestSplitQwen2ParityWithHF;
     procedure TestSplitCl100kParityWithHF;
+    procedure TestSplitQwen35ParityWithHF;
+    procedure TestSplitQwen35AsciiMatchesQwen2;
+    procedure TestAcceptsQwen35SplitPattern;
     procedure TestSplitDeepSeekParityWithHF;
     procedure TestSplitO200kParityWithHF;
     procedure TestSplitO200kHarmonyParityWithHF;
@@ -523,6 +526,58 @@ end;
 procedure TTestNeuralHFTokenizer.TestSplitCl100kParityWithHF;
 begin
   RunParityBattery('split_cl100k');
+end;
+
+// Qwen3.5/3.6-style Split pattern: the Qwen2 pattern with [\p{L}\p{M}]+
+// letter runs (combining marks JOIN the run) and a \p{M}-excluding punct
+// class. The pinned cases cover ASCII, per-digit \p{N} splitting, and
+// combining marks over the scripts IsMarkCP/IsLetterCP cover exactly:
+// Devanagari vowel signs/virama (incl. the ccc=0 spacing signs), Hebrew
+// niqqud, Arabic harakat, and letter+U+0301 sequences with no precomposed
+// NFC form (x-acute) -- the fixture vocab carries merges that SPAN
+// letter<->mark boundaries, so isolating a mark changes the ids.
+procedure TTestNeuralHFTokenizer.TestSplitQwen35ParityWithHF;
+begin
+  RunParityBattery('split_qwen35');
+end;
+
+// Backward-compat pin: the qwen35_ascii fixture is the EXACT split_qwen2
+// fixture model (same vocab/merges) with only the Split pattern swapped to
+// the Qwen3.5 literal, and its cases were asserted id-identical to the
+// split_qwen2 cases at fixture-generation time. Passing here proves the
+// marks-join mode tokenizes ASCII byte-identically to the Qwen2 path.
+procedure TTestNeuralHFTokenizer.TestSplitQwen35AsciiMatchesQwen2;
+begin
+  RunParityBattery('split_qwen35_ascii');
+end;
+
+// The Qwen3.5/3.6 Split pattern literal must be ACCEPTED by the verbatim
+// pattern recognizer (companion to TestRejectsUnknownSplitPattern).
+procedure TTestNeuralHFTokenizer.TestAcceptsQwen35SplitPattern;
+var
+  Tok: TNeuralHFTokenizer;
+  TempFile: string;
+  SL: TStringList;
+begin
+  TempFile := GetTempDir(true) + 'qwen35_split_tokenizer.json';
+  SL := TStringList.Create();
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    SL.Text := '{"model": {"type": "BPE", "vocab": {"a": 0}, "merges": []},'
+      + ' "pre_tokenizer": {"type": "Split", "pattern":'
+      + ' {"Regex": "(?i:''s|''t|''re|''ve|''m|''ll|''d)'
+      + '|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}'
+      + '| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*'
+      + '|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},'
+      + ' "behavior": "Isolated", "invert": false}}';
+    SL.SaveToFile(TempFile);
+    Tok.LoadFromFile(TempFile); // must NOT raise
+    AssertEquals('vocab loaded', 1, Tok.GetVocabSize());
+  finally
+    Tok.Free;
+    SL.Free;
+    DeleteFile(TempFile);
+  end;
 end;
 
 // DeepSeek-V2/V2-Lite multi-Split+Digits pre_tokenizer Sequence. Cases are

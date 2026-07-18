@@ -177,6 +177,10 @@ type
       // Split pre-tokenizer (Qwen2 / Llama-3 cl100k-style pattern)
       FSplitPreTok: boolean;
       FSplitDigitsMax: integer;   // 1 (Qwen2 \p{N}) or 3 (cl100k \p{N}{1,3})
+      // Qwen3.5/3.6 variant of the Qwen2 pattern: letter runs are
+      // [\p{L}\p{M}]+ (combining marks JOIN the run) and the punct class
+      // excludes \p{M}. False = the legacy \p{L}-only classes.
+      FSplitMarksJoin: boolean;
       // DeepSeek-V2/V3 multi-Split+Digits pre-tokenizer (a distinct splitter
       // from the cl100k family -- see SplitDeepSeekPieces).
       FDeepSeekPreTok: boolean;
@@ -426,6 +430,12 @@ const
   csQwen2SplitPattern =
     '(?i:''s|''t|''re|''ve|''m|''ll|''d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|' +
     ' ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+';
+  // Qwen3.5/3.6: same as Qwen2 except (1) letter runs are [\p{L}\p{M}]+ --
+  // combining marks JOIN the letter run -- and (2) the punct class excludes
+  // \p{M}. Dispatched to SplitCl100kPieces with FSplitMarksJoin=true.
+  csQwen35SplitPattern =
+    '(?i:''s|''t|''re|''ve|''m|''ll|''d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|' +
+    '\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+';
   // Llama-3 / cl100k / GPT-4 style: digit runs capped at 3.
   csCl100kSplitPattern =
     '(?i:''s|''t|''re|''ve|''m|''ll|''d)|[^\r\n\p{L}\p{N}]?\p{L}+|' +
@@ -842,6 +852,24 @@ begin
     (not IsNumberCP(CP));
 end;
 
+// \p{M} (combining marks), used by the Qwen3.5 marks-join-letters Split
+// mode. NO new table: a positive Canonical_Combining_Class from the tabled
+// NFC data already identifies every reordering (Mn) mark; the ccc=0 marks
+// (spacing Mc vowel signs / Me enclosers) are approximated over the scripts
+// IsLetterCP covers -- the same approximation stance as IsLetterCP itself.
+function IsMarkCP(CP: cardinal): boolean;
+begin
+  Result := (NFCCombiningClass(CP) > 0) or
+    (CP = $488) or (CP = $489) or                // Cyrillic enclosing (Me)
+    ((CP >= $900) and (CP <= $903)) or           // Devanagari candrabindu..
+    ((CP >= $93A) and (CP <= $93B)) or           //   visarga, vowel signs
+    ((CP >= $93E) and (CP <= $94F)) or
+    ((CP >= $955) and (CP <= $957)) or
+    ((CP >= $962) and (CP <= $963)) or
+    ((CP >= $20DD) and (CP <= $20E0)) or         // enclosing symbols (Me)
+    ((CP >= $20E2) and (CP <= $20E4));
+end;
+
 // Punctuation for the BERT pre-tokenizer: HF treats every ASCII
 // non-alphanumeric printable as punctuation (33-47, 58-64, 91-96, 123-126)
 // plus Unicode category P. The category-P part is approximated over the
@@ -1116,6 +1144,7 @@ begin
   FByteLevelUseRegex := true;
   FSplitPreTok := false;
   FSplitDigitsMax := 1;
+  FSplitMarksJoin := false;
   FDeepSeekPreTok := false;
   FO200kPreTok := false;
   FDigitsPreTok := false;
@@ -1615,6 +1644,14 @@ var
         FSplitDigitsMax := 1;
         FSplitPreTok := true;
       end
+      else if Pattern = csQwen35SplitPattern then
+      begin
+        // Qwen2 pattern with [\p{L}\p{M}]+ letter runs (marks join) and a
+        // \p{M}-excluding punct class -- same splitter, marks-join mode.
+        FSplitDigitsMax := 1;
+        FSplitMarksJoin := true;
+        FSplitPreTok := true;
+      end
       else if Pattern = csCl100kSplitPattern then
       begin
         FSplitDigitsMax := 3;
@@ -1629,7 +1666,8 @@ var
       else
         raise EHFTokenizerError.Create(
           'Unsupported Split pre_tokenizer pattern (only the Qwen2, ' +
-          'Llama-3/cl100k and o200k patterns are recognized): ' + Pattern);
+          'Qwen3.5, Llama-3/cl100k and o200k patterns are recognized): ' +
+          Pattern);
     end
     else
       raise EHFTokenizerError.Create(
@@ -2895,6 +2933,11 @@ end;
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ |
 //   \p{N}{1,FSplitDigitsMax} | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ |
 //   \s+(?!\S) | \s+
+// FSplitMarksJoin=true selects the Qwen3.5/3.6 variant of the same
+// pattern: the letter run is [\p{L}\p{M}]+ (combining marks JOIN it, via
+// IsRunCP below) and the punct class is [^\s\p{L}\p{M}\p{N}] (IsPunctCP).
+// With FSplitMarksJoin=false both predicates reduce to IsLetterCP/
+// IsOtherCP, i.e. the legacy behavior byte-for-byte.
 // Hand-written ordered-alternation matcher (no regex engine), validated
 // against HF `tokenizers` Split(behavior=Isolated, invert=false).
 procedure TNeuralHFTokenizer.SplitCl100kPieces(const Segment: string;
@@ -2903,6 +2946,19 @@ var
   CPs: array of cardinal;
   CPStr: array of string;
   Total, Position, Idx, RunStart, RunEnd, LastNL, DigitCnt: integer;
+  MarksJoin: boolean;
+
+  // the letter-run class: \p{L}, or [\p{L}\p{M}] in marks-join mode
+  function IsRunCP(CP: cardinal): boolean;
+  begin
+    Result := IsLetterCP(CP) or (MarksJoin and IsMarkCP(CP));
+  end;
+
+  // the punct class: [^\s\p{L}\p{N}], minus \p{M} in marks-join mode
+  function IsPunctCP(CP: cardinal): boolean;
+  begin
+    Result := IsOtherCP(CP) and ((not MarksJoin) or (not IsMarkCP(CP)));
+  end;
 
   function Collect(StartIdx, EndIdx: integer): string;
   var
@@ -2942,6 +2998,7 @@ var
   end;
 
 begin
+  MarksJoin := FSplitMarksJoin; // hoisted field read (hot loop)
   // decode UTF-8 into codepoint arrays
   SetLength(CPs, Length(Segment));
   SetLength(CPStr, Length(Segment));
@@ -2969,14 +3026,15 @@ begin
       continue;
     end;
     // 2. [^\r\n\p{L}\p{N}]?\p{L}+  (optional ONE non-CR/LF non-letter
-    //    non-number char glued to a letter run)
-    if IsLetterCP(CPs[Idx]) or ((not IsNewlineCP(CPs[Idx])) and
+    //    non-number char glued to a letter run; marks-join mode widens the
+    //    run class to [\p{L}\p{M}])
+    if IsRunCP(CPs[Idx]) or ((not IsNewlineCP(CPs[Idx])) and
       (not IsNumberCP(CPs[Idx])) and (Idx + 1 < Total) and
-      IsLetterCP(CPs[Idx + 1])) then
+      IsRunCP(CPs[Idx + 1])) then
     begin
       RunEnd := Idx;
-      if not IsLetterCP(CPs[Idx]) then Inc(RunEnd); // the optional char
-      while (RunEnd + 1 < Total) and IsLetterCP(CPs[RunEnd + 1]) do
+      if not IsRunCP(CPs[Idx]) then Inc(RunEnd); // the optional char
+      while (RunEnd + 1 < Total) and IsRunCP(CPs[RunEnd + 1]) do
         Inc(RunEnd);
       Pieces.Add(Collect(Idx, RunEnd));
       Idx := RunEnd + 1;
@@ -2995,12 +3053,13 @@ begin
       Pieces.Add(Collect(Idx, RunEnd));
       Idx := RunEnd + 1;
     end
-    // 4.  ?[^\s\p{L}\p{N}]+[\r\n]*
-    else if IsOtherCP(CPs[Idx]) or ((CPs[Idx] = 32) and (Idx + 1 < Total)
-      and IsOtherCP(CPs[Idx + 1])) then
+    // 4.  ?[^\s\p{L}\p{N}]+[\r\n]*  (punct class excludes \p{M} in
+    //    marks-join mode)
+    else if IsPunctCP(CPs[Idx]) or ((CPs[Idx] = 32) and (Idx + 1 < Total)
+      and IsPunctCP(CPs[Idx + 1])) then
     begin
       RunEnd := Idx; // the optional leading space or the first punct char
-      while (RunEnd + 1 < Total) and IsOtherCP(CPs[RunEnd + 1]) do
+      while (RunEnd + 1 < Total) and IsPunctCP(CPs[RunEnd + 1]) do
         Inc(RunEnd);
       while (RunEnd + 1 < Total) and IsNewlineCP(CPs[RunEnd + 1]) do
         Inc(RunEnd);
