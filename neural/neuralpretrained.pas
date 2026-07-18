@@ -13431,7 +13431,15 @@ begin
         'checkpoint).');
     Result.ModelType := ModelType;
     Result.HiddenSize := RequiredInt('hidden_size');
-    Result.IntermediateSize := RequiredInt('intermediate_size');
+    // qwen3_5_moe (Qwen3.6-35B-A3B) is an ALL-MoE stack: its config has no
+    // dense-MLP intermediate_size at all (only moe_intermediate_size +
+    // shared_expert_intermediate_size), and no dense FFN is ever built
+    // (MoEDecoderSparseStep=1, MoEIntermediateSize>0). Every other family
+    // here requires the field.
+    if ModelType = 'qwen3_5_moe' then
+      Result.IntermediateSize := Obj.Get('intermediate_size', 0)
+    else
+      Result.IntermediateSize := RequiredInt('intermediate_size');
     Result.NumLayers := RequiredInt('num_hidden_layers');
     Result.NumHeads := RequiredInt('num_attention_heads');
     Result.VocabSize := RequiredInt('vocab_size');

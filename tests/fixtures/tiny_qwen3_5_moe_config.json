@@ -6,7 +6,6 @@
  "text_config": {
   "model_type": "qwen3_5_moe_text",
   "hidden_size": 8,
-  "intermediate_size": 12,
   "moe_intermediate_size": 5,
   "shared_expert_intermediate_size": 6,
   "num_experts": 4,

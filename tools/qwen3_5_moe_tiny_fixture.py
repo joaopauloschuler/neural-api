@@ -80,7 +80,6 @@ N_HEAD = 2
 N_KV_HEAD = 1
 HEAD_DIM = 8           # rotary_dim = 8 * 0.25 = 2 (even, partial rotary)
 D_MODEL = 8
-D_FF = 12              # dense intermediate_size (unused: every FFN is MoE)
 D_MOE_FF = 5           # moe_intermediate_size (routed expert width)
 D_SHARED_FF = 6        # shared_expert_intermediate_size (DISTINCT width)
 MAX_POS = 16
@@ -98,7 +97,8 @@ torch.manual_seed(20260719)
 text_cfg = {
     'model_type': 'qwen3_5_moe_text',
     'hidden_size': D_MODEL,
-    'intermediate_size': D_FF,
+    # NO 'intermediate_size': the real Qwen3.6-35B-A3B(-FP8) config omits it
+    # (every FFN is MoE) -- its absence here is the parse regression test.
     'moe_intermediate_size': D_MOE_FF,
     'shared_expert_intermediate_size': D_SHARED_FF,
     'num_experts': N_EXPERTS,
