@@ -14457,6 +14457,117 @@ begin
   end;
 end;
 
+type
+  { TInt8RowChunkFan }
+  // Fans the PER-ROW direct-int8 quant imports of ONE streamed row chunk
+  // over the shared neuralthread pool. Each chunk row r quantizes source
+  // elements [r*RowSize, (r+1)*RowSize) into its own target code row and
+  // scale slot (ImportInt8QuantRow touches nothing shared, and
+  // QuantizeInt8RowTolerant is pure), so the parallel result is
+  // bit-identical to the serial loop. The caller's sequential
+  // LoadTensorRowsFlat read stays on the calling thread - only the
+  // CPU-bound abs-max + quantize sweep fans out. Small chunks run inline
+  // (pool dispatch would dominate). Coded by Claude (AI).
+  TInt8RowChunkFan = class
+  private
+    FSrc: TNNetVolume;
+    FRowSize, FRowCount: integer;
+    // dense-linear path (RunLinear): chunk row r -> neuron FTargets[r]
+    FQLayer: TNNetLayerConcatedWeights;
+    FScale: TNeuralFloat;
+    FTargets: TNeuralIntegerArray;
+    // embedding path (RunEmbedding): chunk row r -> vocab row FBaseRow+r,
+    // imported into the embedding and (when tied) the LM head container
+    FEmb: TNNetEmbedding;
+    FHead: TNNetLayerConcatedWeights; // nil when untied
+    FBaseRow: integer;
+    FEmbScale, FHeadScale: TNeuralFloat;
+    procedure LinearJob(index, threadnum: integer);
+    procedure EmbeddingJob(index, threadnum: integer);
+    function ShouldFan: boolean;
+  public
+    procedure RunLinear(QLayer: TNNetLayerConcatedWeights; Src: TNNetVolume;
+      RowCount, RowSize: integer; const Targets: TNeuralIntegerArray;
+      Scale: TNeuralFloat);
+    procedure RunEmbedding(Emb: TNNetEmbedding;
+      Head: TNNetLayerConcatedWeights; Src: TNNetVolume;
+      BaseRow, RowCount, RowSize: integer;
+      EmbScale, HeadScale: TNeuralFloat);
+  end;
+
+function TInt8RowChunkFan.ShouldFan: boolean;
+const
+  // Below ~64K elements the pool dispatch costs more than the quant sweep.
+  cParallelQuantMinElements = 64 * 1024;
+begin
+  Result := (Int64(FRowCount) * FRowSize >= cParallelQuantMinElements) and
+    (NeuralDefaultThreadCount > 1);
+end;
+
+procedure TInt8RowChunkFan.LinearJob(index, threadnum: integer);
+var
+  StartPos, FinishPos, r: integer;
+begin
+  TNeuralThreadList.CalculateWorkingRange(index, threadnum, FRowCount,
+    StartPos, FinishPos);
+  for r := StartPos to FinishPos do
+    FQLayer.ImportInt8QuantRow(FTargets[r], FSrc, r * FRowSize, FScale);
+end;
+
+procedure TInt8RowChunkFan.EmbeddingJob(index, threadnum: integer);
+var
+  StartPos, FinishPos, r: integer;
+begin
+  TNeuralThreadList.CalculateWorkingRange(index, threadnum, FRowCount,
+    StartPos, FinishPos);
+  for r := StartPos to FinishPos do
+  begin
+    FEmb.ImportInt8QuantRow(FBaseRow + r, FSrc, r * FRowSize, FEmbScale);
+    if FHead <> nil then
+      FHead.ImportInt8QuantRow(FBaseRow + r, FSrc, r * FRowSize, FHeadScale);
+  end;
+end;
+
+procedure TInt8RowChunkFan.RunLinear(QLayer: TNNetLayerConcatedWeights;
+  Src: TNNetVolume; RowCount, RowSize: integer;
+  const Targets: TNeuralIntegerArray; Scale: TNeuralFloat);
+begin
+  FQLayer := QLayer;
+  FSrc := Src;
+  FRowCount := RowCount;
+  FRowSize := RowSize;
+  FTargets := Targets;
+  FScale := Scale;
+  if ShouldFan then
+  begin
+    CreateNeuralThreadListIfRequired();
+    fNTL.StartProc({$IFDEF FPC}@LinearJob{$ELSE}LinearJob{$ENDIF});
+  end
+  else
+    LinearJob(0, 1);
+end;
+
+procedure TInt8RowChunkFan.RunEmbedding(Emb: TNNetEmbedding;
+  Head: TNNetLayerConcatedWeights; Src: TNNetVolume;
+  BaseRow, RowCount, RowSize: integer; EmbScale, HeadScale: TNeuralFloat);
+begin
+  FEmb := Emb;
+  FHead := Head;
+  FSrc := Src;
+  FBaseRow := BaseRow;
+  FRowCount := RowCount;
+  FRowSize := RowSize;
+  FEmbScale := EmbScale;
+  FHeadScale := HeadScale;
+  if ShouldFan then
+  begin
+    CreateNeuralThreadListIfRequired();
+    fNTL.StartProc({$IFDEF FPC}@EmbeddingJob{$ELSE}EmbeddingJob{$ENDIF});
+  end
+  else
+    EmbeddingJob(0, 1);
+end;
+
 // Loads a HF nn.Linear weight [out, in] (bias-free, the Llama convention)
 // into a TNNetPointwiseConvLinear: HF computes y = x . W^T, so output
 // channel j IS row j: Neuron[NeuronBase + j].Weights[i] = W[j*in + i].
@@ -14496,6 +14607,8 @@ var
   QLayer: TNNetLayerConcatedWeights;
   DirectInt8: boolean;
   ChunkRows, RowsInChunk, RowCnt: integer;
+  ChunkTargets: TNeuralIntegerArray;
+  Fan: TInt8RowChunkFan;
 
   // Maps checkpoint row pRow (0-based within this OutDim slice) to its
   // neuron index: the rotate_half -> interleaved rotary reorder (restricted
@@ -14587,6 +14700,7 @@ begin
     EnsureWritableImportWeights(Layer);
   W := TNNetVolume.Create;
   B := nil;
+  Fan := nil;
   try
     if BiasName <> '' then
     begin
@@ -14602,6 +14716,8 @@ begin
       ChunkRows := (4 * 1024 * 1024) div (InDim * 4);
       if ChunkRows < 1 then ChunkRows := 1;
       if ChunkRows > OutDim then ChunkRows := OutDim;
+      SetLength(ChunkTargets, ChunkRows);
+      Fan := TInt8RowChunkFan.Create; // freed by the outer finally
       j := 0;
       while j < OutDim do
       begin
@@ -14609,16 +14725,20 @@ begin
         if j + RowsInChunk > OutDim then RowsInChunk := OutDim - j;
         Reader.LoadTensorRowsFlat(WName, SrcRowBase + j, RowsInChunk,
           InDim, W);
+        // Serial: the (cheap) permutation map and per-row bias; parallel:
+        // the abs-max + quantize sweep of every chunk row (disjoint target
+        // rows - MapTargetNeuron is injective).
         for RowCnt := 0 to RowsInChunk - 1 do
         begin
           TargetIdx := MapTargetNeuron(j + RowCnt);
-          QLayer.ImportInt8QuantRow(TargetIdx, W, RowCnt * InDim, Scale);
+          ChunkTargets[RowCnt] := TargetIdx;
           if B <> nil then
             Layer.FArrNeurons[TargetIdx].BiasWeight :=
               Scale * B.FData[SrcRowBase + j + RowCnt]
           else
             Layer.FArrNeurons[TargetIdx].BiasWeight := 0; // bias-free Linear
         end;
+        Fan.RunLinear(QLayer, W, RowsInChunk, InDim, ChunkTargets, Scale);
         Inc(j, RowsInChunk);
       end;
     end
@@ -14649,6 +14769,7 @@ begin
       end;
     end;
   finally
+    Fan.Free;
     B.Free;
     W.Free;
   end;
@@ -15525,7 +15646,8 @@ var
   EmbDirect: boolean;
   EmbFold: TNeuralFloat;
   QHeadCW: TNNetLayerConcatedWeights;
-  EmbChunkRows, EmbRowsInChunk, EmbRowCnt: integer;
+  EmbChunkRows, EmbRowsInChunk: integer;
+  EmbFan: TInt8RowChunkFan;
   Consumed: TStringList;
 
   procedure MarkConsumed(const TName: string);
@@ -16213,28 +16335,35 @@ begin
           if EmbChunkRows < 1 then EmbChunkRows := 1;
           if EmbChunkRows > Config.VocabSize then
             EmbChunkRows := Config.VocabSize;
-          j := 0;
-          while j < Config.VocabSize do
-          begin
-            EmbRowsInChunk := EmbChunkRows;
-            if j + EmbRowsInChunk > Config.VocabSize then
-              EmbRowsInChunk := Config.VocabSize - j;
-            Reader.LoadTensorRowsFlat(EmbName, j, EmbRowsInChunk,
-              Config.HiddenSize, Tmp);
-            for EmbRowCnt := 0 to EmbRowsInChunk - 1 do
+          EmbFan := TInt8RowChunkFan.Create;
+          try
+            j := 0;
+            while j < Config.VocabSize do
             begin
-              TNNetEmbedding(EmbeddingLayer).ImportInt8QuantRow(
-                j + EmbRowCnt, Tmp, EmbRowCnt * Config.HiddenSize, EmbFold);
+              EmbRowsInChunk := EmbChunkRows;
+              if j + EmbRowsInChunk > Config.VocabSize then
+                EmbRowsInChunk := Config.VocabSize - j;
+              Reader.LoadTensorRowsFlat(EmbName, j, EmbRowsInChunk,
+                Config.HiddenSize, Tmp);
+              // Chunk rows quantize in parallel into the embedding codes
+              // and - when tied (logits = (h . embed^T) / logits_scaling) -
+              // the LM head codes too: same codes, LogitScaleFold in the
+              // scale, bias-free.
               if Config.TieWordEmbeddings then
               begin
-                // Tied LM head: logits = (h . embed^T) / logits_scaling
-                // (same codes, LogitScaleFold in the scale, bias-free).
-                QHeadCW.ImportInt8QuantRow(j + EmbRowCnt, Tmp,
-                  EmbRowCnt * Config.HiddenSize, LogitScaleFold);
-                LMHead.FArrNeurons[j + EmbRowCnt].BiasWeight := 0;
-              end;
+                EmbFan.RunEmbedding(TNNetEmbedding(EmbeddingLayer), QHeadCW,
+                  Tmp, j, EmbRowsInChunk, Config.HiddenSize, EmbFold,
+                  LogitScaleFold);
+                for i := j to j + EmbRowsInChunk - 1 do
+                  LMHead.FArrNeurons[i].BiasWeight := 0;
+              end
+              else
+                EmbFan.RunEmbedding(TNNetEmbedding(EmbeddingLayer), nil,
+                  Tmp, j, EmbRowsInChunk, Config.HiddenSize, EmbFold, 1.0);
+              Inc(j, EmbRowsInChunk);
             end;
-            Inc(j, EmbRowsInChunk);
+          finally
+            EmbFan.Free;
           end;
           EmbeddingLayer.FlushWeightCache();
           MarkConsumed(EmbName);

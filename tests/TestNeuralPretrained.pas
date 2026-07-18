@@ -125,6 +125,7 @@ type
     procedure TestReaderReadsTinyFixture;
     procedure TestSafeTensorsWriterRoundTrip;
     procedure TestSafeTensorsWriterF16BF16RoundTrip;
+    procedure TestParallelHalfDecodeParity;
     procedure TestSafeTensorsWriterRejectsBadInput;
     procedure TestSaveLoadNNetToSafeTensors;
     procedure TestSaveLoadNNetToSafeTensorsF16;
@@ -1598,6 +1599,96 @@ begin
     Sidecar.SaveToFile(SidecarPath);
   finally
     Sidecar.Free;
+  end;
+end;
+
+// The F16/BF16 decode of LoadTensorFlat/LoadTensorRowsFlat fans out over
+// the shared neuralthread pool above 256K elements (DecodeHalfBuffer).
+// This test forces that branch with a 600x500 = 300000-element tensor in
+// both half dtypes and asserts the loaded values are BIT-identical to the
+// scalar DecodeF16/DecodeBF16 reference - range-partitioned decode must
+// not change a single element. A 530-row LoadTensorRowsFlat slice
+// (265000 elements, also above the threshold) checks the offset math of
+// the row-streamed variant against the same reference. On a single-core
+// host the parallel branch degrades to the inline loop and the assertions
+// still hold. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestParallelHalfDecodeParity;
+const
+  cRows = 600;
+  cCols = 500;
+  cCount = cRows * cCols;
+  cSliceFirstRow = 37;
+  cSliceRows = 530;
+var
+  Path: string;
+  Writer: TNNetSafeTensorsWriter;
+  Reader: TNNetSafeTensorsReader;
+  Src, Dst: TNNetVolume;
+  i, Mismatches: integer;
+  Expected: single;
+
+  function Value(pElement: integer): single;
+  begin
+    // Deterministic spread of magnitudes and signs; inexact in both half
+    // formats so the decode rounding is genuinely exercised.
+    Result := Sin(pElement * 0.001) * 3.7 + (pElement mod 97) * 0.013 - 0.6;
+  end;
+
+begin
+  Path := GetTempDir(false) + 'cai_st_parallel_decode.safetensors';
+  Src := TNNetVolume.Create;
+  Dst := TNNetVolume.Create;
+  Reader := nil;
+  try
+    Src.ReSize(cCount, 1, 1);
+    for i := 0 to cCount - 1 do
+      Src.FData[i] := Value(i);
+    Writer := TNNetSafeTensorsWriter.Create(Path);
+    try
+      Writer.AddTensorFlat('par.f16', [cRows, cCols], Src, stwF16);
+      Writer.AddTensorFlat('par.bf16', [cRows, cCols], Src, stwBF16);
+      Writer.SaveToFile;
+    finally
+      Writer.Free;
+    end;
+
+    Reader := TNNetSafeTensorsReader.Create(Path);
+
+    Reader.LoadTensorFlat('par.f16', Dst);
+    AssertEquals('f16 flat size', cCount, Dst.Size);
+    Mismatches := 0;
+    for i := 0 to cCount - 1 do
+    begin
+      Expected := DecodeF16(EncodeF16(Value(i)));
+      if Dst.FData[i] <> Expected then Inc(Mismatches);
+    end;
+    AssertEquals('f16 flat parallel decode mismatches', 0, Mismatches);
+
+    Reader.LoadTensorFlat('par.bf16', Dst);
+    AssertEquals('bf16 flat size', cCount, Dst.Size);
+    Mismatches := 0;
+    for i := 0 to cCount - 1 do
+    begin
+      Expected := DecodeBF16(EncodeBF16(Value(i)));
+      if Dst.FData[i] <> Expected then Inc(Mismatches);
+    end;
+    AssertEquals('bf16 flat parallel decode mismatches', 0, Mismatches);
+
+    Reader.LoadTensorRowsFlat('par.bf16', cSliceFirstRow, cSliceRows,
+      cCols, Dst);
+    AssertEquals('bf16 slice size', cSliceRows * cCols, Dst.Size);
+    Mismatches := 0;
+    for i := 0 to cSliceRows * cCols - 1 do
+    begin
+      Expected := DecodeBF16(EncodeBF16(Value(cSliceFirstRow * cCols + i)));
+      if Dst.FData[i] <> Expected then Inc(Mismatches);
+    end;
+    AssertEquals('bf16 row-slice parallel decode mismatches', 0, Mismatches);
+  finally
+    Reader.Free;
+    Dst.Free;
+    Src.Free;
+    DeleteFile(Path);
   end;
 end;
 
