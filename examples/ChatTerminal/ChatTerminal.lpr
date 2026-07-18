@@ -1341,7 +1341,8 @@ var
   GpuCL: TEasyOpenCL;           // platform/device handle for OpenCL offload
   {$ENDIF}
   Cnt, SeqLen, VocabSize: integer;
-  LoadStart: QWord;             // model-load wall clock (checkpoint + caches)
+  LoadStart: QWord;             // per-phase load wall clock (tokenizer,
+                                // checkpoint + caches, GPU weight upload)
   Line, Cmd, Arg, Reply, ModelType, Marker: string;
   TokenizerFile, TokenizerConfigFile: string;
 begin
@@ -1377,7 +1378,10 @@ begin
     Halt(1);
   end;
   Tokenizer := TNeuralHFTokenizer.Create();
+  LoadStart := GetTickCount64();
   Tokenizer.LoadFromFile(TokenizerFile);
+  WriteLn('Tokenizer loaded in ',
+    (GetTickCount64() - LoadStart) / 1000: 0: 1, 's.');
 
   // 'raw' is a ChatTerminal-level mode, not a chat template, so it is
   // intercepted here and never reaches ChatFormatFromName (which returns
@@ -1513,8 +1517,11 @@ begin
         GpuCL.SetCurrentDevice(GpuCL.Devices[Opt.GpuDevice]);
         WriteLn('[--gpu: OpenCL on ', GpuCL.PlatformNames[Opt.GpuPlatform],
           ' / ', GpuCL.DeviceNames[Opt.GpuDevice], ']');
+        LoadStart := GetTickCount64();
         NN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
           GpuCL.Devices[Opt.GpuDevice]);
+        WriteLn('GPU weights uploaded in ',
+          (GetTickCount64() - LoadStart) / 1000: 0: 1, 's.');
       end;
     end;
   end;
