@@ -21,14 +21,11 @@ git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q2
 neural-api/bin/x86_64-linux/bin/ChatTerminal q2/ --gpu
 ```
 
-### Tested checkpoints
+### Tested models
 
-The checkpoints actually verified through this REPL (what backs the
-"supports" list above; the llama path is additionally coded for Llama
-1/2/3 incl. the 3.1/3.2 `rope_scaling` "llama3" long-context ramp, but
-only the checkpoints below have been run):
+These models have been run/verified through this REPL:
 
-| Checkpoint | model_type |
+| Model | model_type |
 |---|---|
 | Qwen/Qwen2.5-{0.5B,1.5B,3B,7B,14B,32B}-Instruct | qwen2 |
 | Qwen/Qwen3-0.6B | qwen3 |
