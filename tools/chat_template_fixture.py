@@ -24,6 +24,17 @@ import os
 
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+
+# The authentic Qwen3.5/Qwen3.6 template (Qwen/Qwen3.6-27B and
+# Qwen3.6-35B-A3B ship the identical chat_template.jinja) is too large to
+# inline here, so the verbatim downloaded bytes are checked in next to the
+# generated fixture and read back.
+with open(os.path.join(ROOT, "tests", "fixtures",
+                       "qwen3_5_chat_template.jinja"),
+          encoding="utf-8") as _f:
+    QWEN3_5_TEMPLATE = _f.read()
+
 # (name, template, bos_token, eos_token) -- template strings verbatim from
 # the published tokenizer_config.json files.
 TEMPLATES = {
@@ -197,6 +208,31 @@ TEMPLATES = {
         "bos": "<s>",
         "eos": "<|endoftext|>",
     },
+    "qwen3_5": {
+        # Qwen/Qwen3.6-27B (== Qwen3.6-35B-A3B) chat_template.jinja,
+        # verbatim (see the module-level read above). ChatML framing with
+        # |trim'ed contents, a '<think>\n' generation-prompt suffix and
+        # think-block stripping for assistant history before the last user
+        # query.
+        "template": QWEN3_5_TEMPLATE,
+        "bos": "",
+        "eos": "<|im_end|>",
+        # think-handling cases specific to this template (appended to the
+        # shared CONVERSATIONS battery):
+        "extra_conversations": [
+            # earlier assistant turn carries a <think> block -> STRIPPED
+            ([{"role": "user", "content": "Hi!"},
+              {"role": "assistant", "content":
+               "<think>\nLet me think about greetings.\n</think>\n\n"
+               "Hello! How can I help?"},
+              {"role": "user", "content": "Tell me a joke."}], True),
+            # assistant turn AFTER the last user query -> reasoning KEPT,
+            # re-framed as <think>\n...\n</think>\n\n + content
+            ([{"role": "user", "content": "2+2?"},
+              {"role": "assistant", "content":
+               "<think>\nSimple arithmetic.\n</think>\n\n4"}], False),
+        ],
+    },
 }
 
 # (messages, add_generation_prompt) conversations; every (format x case)
@@ -239,15 +275,15 @@ def jinja_env():
 
 
 def main():
-    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-    out_path = os.path.join(root, "tests", "fixtures",
+    out_path = os.path.join(ROOT, "tests", "fixtures",
                             "chat_template_cases.json")
     env = jinja_env()
     out = {}
     for name, spec in TEMPLATES.items():
         compiled = env.from_string(spec["template"])
         cases = []
-        for messages, add_gen in CONVERSATIONS:
+        for messages, add_gen in (
+                CONVERSATIONS + spec.get("extra_conversations", [])):
             case = {"messages": messages, "add_generation_prompt": add_gen}
             try:
                 case["expected"] = compiled.render(

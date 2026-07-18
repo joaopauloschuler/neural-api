@@ -498,6 +498,7 @@ function EndOfTurnMarker(ChatFormat: TNeuralChatFormat): string;
 begin
   case ChatFormat of
     cfChatML:  Result := '<|im_end|>';
+    cfQwen3_5: Result := '<|im_end|>'; // Qwen3.5/3.6 ChatML variant
     cfLlama2:  Result := '</s>';
     cfLlama3:  Result := '<|eot_id|>';
     cfZephyr:  Result := '</s>';
@@ -1260,6 +1261,7 @@ begin
 
     // End-of-turn markers.
     Check(EndOfTurnMarker(cfChatML) = '<|im_end|>', 'ChatML end marker');
+    Check(EndOfTurnMarker(cfQwen3_5) = '<|im_end|>', 'Qwen3.5 end marker');
     Check(EndOfTurnMarker(cfLlama3) = '<|eot_id|>', 'Llama-3 end marker');
     Check(EndOfTurnMarker(cfGemma) = '<end_of_turn>', 'Gemma end marker');
     Check(EndOfTurnMarker(cfPhi3) = '<|end|>', 'Phi-3 end marker');

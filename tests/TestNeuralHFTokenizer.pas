@@ -133,6 +133,7 @@ type
     procedure TestMistralParityWithJinja;
     procedure TestDeepSeekParityWithJinja;
     procedure TestPhi4MiniParityWithJinja;
+    procedure TestQwen3_5ParityWithJinja;
     procedure TestDetectDeepSeekAndPhi4Mini;
     procedure TestLoadChatTemplateFromSiblingJinja;
     procedure TestDetectFormatOnAuthenticTemplates;
@@ -1829,6 +1830,15 @@ end;
 procedure TTestNeuralChat.TestDeepSeekParityWithJinja;
 begin
   RunChatBattery('deepseek');
+end;
+
+// Qwen3.5/Qwen3.6: ChatML framing with |trim'ed contents, the '<think>\n'
+// generation-prompt suffix and assistant-history think-stripping, pinned
+// byte for byte against the authentic Qwen3.6 chat_template.jinja render
+// (incl. the extra think-handling cases the generator appends).
+procedure TTestNeuralChat.TestQwen3_5ParityWithJinja;
+begin
+  RunChatBattery('qwen3_5');
 end;
 
 procedure TTestNeuralChat.TestPhi4MiniParityWithJinja;
