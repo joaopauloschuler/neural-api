@@ -1341,6 +1341,7 @@ var
   GpuCL: TEasyOpenCL;           // platform/device handle for OpenCL offload
   {$ENDIF}
   Cnt, SeqLen, VocabSize: integer;
+  LoadStart: QWord;             // model-load wall clock (checkpoint + caches)
   Line, Cmd, Arg, Reply, ModelType, Marker: string;
   TokenizerFile, TokenizerConfigFile: string;
 begin
@@ -1463,6 +1464,7 @@ begin
       ' more RAM, GPU compatible]');
 
   WriteLn('Loading ', Opt.ModelDir, ' ...');
+  LoadStart := GetTickCount64();
   // Built at INPUT WIDTH 1 (pSeqLen=1): streamed decode feeds one token per
   // forward and the KV cache (budget = CtxLen, set on the session below) holds
   // the context. SeqLen is the cache budget, NOT the built input width.
@@ -1475,6 +1477,8 @@ begin
   NN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
   for Cnt := 0 to NN.GetLastLayerIdx() do
     NN.Layers[Cnt].FlushWeightCache();
+  WriteLn('Model loaded in ',
+    (GetTickCount64() - LoadStart) / 1000: 0: 1, 's.');
 
   {$IFDEF OpenCL}
   // OpenCL offload of the conv/linear matmuls. Enabling it rebuilds each
