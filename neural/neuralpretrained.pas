@@ -914,6 +914,40 @@ type
     // other family leaves MRoPEEnabled false (ordinary 1-D RoPE).
     MRoPEEnabled: boolean;
     MRoPESectionT, MRoPESectionH, MRoPESectionW: integer;
+    // ---- Qwen3.5 / Qwen3.6 hybrid deltas (model_type qwen3_5 /
+    // qwen3_5_moe; all default off/0/empty for the other families) ----
+    LinearAttnLayers: array of boolean; // per-layer token-mixer type from the
+                               // config's layer_types: element i TRUE = layer
+                               // i is a "linear_attention" gated-DeltaNet
+                               // mixer, FALSE = "full_attention" (the
+                               // (L L L F)* pattern; also derivable from
+                               // full_attention_interval=4). Empty = every
+                               // layer is full attention (every other family)
+    LinearNumKHeads: integer;  // linear_num_key_heads (Hk, q/k heads)
+    LinearNumVHeads: integer;  // linear_num_value_heads (Hv; Hv mod Hk = 0,
+                               // q/k broadcast repeat_interleave-style)
+    LinearKeyHeadDim: integer; // linear_key_head_dim (Dk)
+    LinearValueHeadDim: integer; // linear_value_head_dim (Dv)
+    LinearConvKernel: integer; // linear_conv_kernel_dim: causal depthwise
+                               // conv width over the q|k|v slab (default 4)
+    AttnOutputGate: boolean;   // Qwen3.5 full-attention output gate: q_proj
+                               // is DOUBLE width (num_heads*head_dim*2, per
+                               // head interleaved [query(Dh)|gate(Dh)]) and
+                               // the concatenated head outputs are multiplied
+                               // by sigmoid(gate) BEFORE o_proj (HF
+                               // Qwen3_5Attention: attn * sigmoid(gate))
+    MoESharedExpertGate: boolean; // qwen2_moe/Qwen3.5-MoE shared-expert gate:
+                               // the always-on shared expert's output is
+                               // scaled by sigmoid(shared_expert_gate(x)) - a
+                               // [1, hidden] linear -> ONE sigmoid scalar per
+                               // token - before being added to the routed
+                               // output (HF Qwen3_5MoeSparseMoeBlock)
+    MoEQwen35FusedExperts: boolean; // Qwen3.5-MoE FUSED 3-D expert slabs:
+                               // mlp.experts.gate_up_proj [E, 2I, H] (per
+                               // expert gate rows 0..I-1 then up rows
+                               // I..2I-1 - the granitemoe input_linear
+                               // LAYOUT) and mlp.experts.down_proj [E, H, I],
+                               // with a plain mlp.gate.weight [E, H] router
     Prefix: string;            // tensor-name prefix ('model.' or '')
   end;
 
@@ -1246,6 +1280,51 @@ function BuildQwen3MoeFromSafeTensorsEx(const FileName: string;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildQwen3MoeFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// Qwen3.5 / Qwen3.6 hybrid text decoder (model_type "qwen3_5", e.g.
+// Qwen3.6-27B) and its MoE sibling (model_type "qwen3_5_moe", e.g.
+// Qwen3.6-35B-A3B). A pre-norm residual stack whose per-layer TOKEN MIXER
+// alternates by config layer_types (the (L L L F)* pattern):
+//   "full_attention"   - Qwen3 attention (per-head zero-centered q/k RMSNorm
+//       before RoPE, GQA, bias-free) + PARTIAL rotary
+//       (partial_rotary_factor 0.25 of head_dim 256, rope_theta 1e7) + a
+//       per-head OUTPUT GATE: q_proj is DOUBLE width ([query|gate] per
+//       head) and the concatenated head outputs are multiplied by
+//       sigmoid(gate) before o_proj;
+//   "linear_attention" - the gated-DeltaNet mixer (TNNetGatedDeltaNet):
+//       in_proj_qkv -> causal depthwise conv-4 + SiLU over the q|k|v slab
+//       (TNNetDepthwiseConv1D, conv-state decode), z/b/a side projections,
+//       the gated delta-rule recurrence with a PLAIN-gain gated RMSNorm
+//       read-out, out_proj. O(1) state per layer - no KV cache.
+// EVERY RMSNorm gain is ZERO-CENTERED (stored as w with gain 1 + w) EXCEPT
+// the DeltaNet gated norm linear_attn.norm.weight (plain). The MoE variant
+// replaces EVERY MLP with a sparse block: mlp.gate router -> softmax over
+// all num_experts -> top-k ALWAYS renormalized, FUSED 3-D expert slabs
+// (mlp.experts.gate_up_proj [E,2I,H] / down_proj [E,H,I]) PLUS an always-on
+// shared SwiGLU expert scaled by sigmoid(shared_expert_gate(x)).
+// Multimodal checkpoints (Qwen3_5ForConditionalGeneration) nest the text
+// backbone under "model.language_model." and ship a vision tower
+// (model.visual.*) plus an MTP head (mtp.*) - both are SKIPPED; the config's
+// text fields may sit top-level or nested under "text_config" (both
+// accepted). Thin wrappers over the Llama path that ASSERT the config's
+// model_type. Coded by Claude (AI).
+function BuildQwen35FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pTrainable: boolean = true;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildQwen35FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
+  pQuantizeInt8: boolean = false): TNNet;
+
+function BuildQwen35MoeFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pTrainable: boolean = true;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildQwen35MoeFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
@@ -12043,7 +12122,9 @@ function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
 //   - a .safetensors / .safetensors.index.json FILE (config.json is read
 //     from the same directory unless ConfigFileName overrides it).
 // Supported model_types: gpt2 (n_head read from the config when present),
-// gpt_neo, gpt_neox, gptj, phi, llama, mistral, qwen2, qwen3, gemma,
+// gpt_neo, gpt_neox, gptj, phi, llama, mistral, qwen2, qwen3, qwen3_moe,
+// qwen3_5, qwen3_5_moe (Qwen3.5/3.6 hybrid DeltaNet+attention text
+// decoders; vision tower and MTP head skipped), gemma,
 // gemma2, gemma3_text, rwkv, mamba, falcon_mamba, bloom, falcon (legacy
 // RefinedWebModel / RefinedWeb spellings accepted), bert, distilbert,
 // roberta, modernbert, deepseek_v2.
@@ -13263,6 +13344,9 @@ var
   ModelType, HiddenAct: string;
   HeadDimField, SlidingWindowField, FloatField: TJSONData;
   MoEMlpOnlyArr, ClipQKVField: TJSONData;
+  TextCfgField, LayerTypesArr: TJSONData;
+  LayerTypeStr: string;
+  FullAttnInterval: integer;
   i: integer;
   MoEMax: integer;
   DimModelBase: integer;
@@ -13307,9 +13391,27 @@ begin
         '" is not a JSON object.');
     Obj := TJSONObject(Root);
     ModelType := Obj.Get('model_type', 'llama');
+    // Qwen3.5 / Qwen3.6 (multimodal wrapper configs, e.g. Qwen3.6-27B /
+    // Qwen3.6-35B-A3B): the TEXT decoder fields live NESTED under
+    // "text_config" (top-level model_type qwen3_5 / qwen3_5_moe, inner
+    // model_type qwen3_5_text / qwen3_5_moe_text). Descend into the nested
+    // object when present (a flat text-only config is also accepted
+    // defensively) and normalize the *_text spellings to the dispatch names.
+    if (ModelType = 'qwen3_5') or (ModelType = 'qwen3_5_moe') or
+       (ModelType = 'qwen3_5_text') or (ModelType = 'qwen3_5_moe_text') then
+    begin
+      TextCfgField := Obj.Find('text_config');
+      if (TextCfgField <> nil) and (TextCfgField is TJSONObject) then
+        Obj := TJSONObject(TextCfgField);
+      if (ModelType = 'qwen3_5') or (ModelType = 'qwen3_5_text') then
+        ModelType := 'qwen3_5'
+      else
+        ModelType := 'qwen3_5_moe';
+    end;
     if (ModelType <> 'llama') and (ModelType <> 'mistral') and
        (ModelType <> 'qwen2') and (ModelType <> 'qwen3') and
        (ModelType <> 'qwen3_moe') and
+       (ModelType <> 'qwen3_5') and (ModelType <> 'qwen3_5_moe') and
        (ModelType <> 'gemma') and (ModelType <> 'gemma2') and
        (ModelType <> 'gemma3_text') and (ModelType <> 'phi3') and
        (ModelType <> 'olmo2') and (ModelType <> 'olmoe') and
@@ -13320,6 +13422,7 @@ begin
        (ModelType <> 'minicpm') then
       ImportError('Llama import: config model_type is "' + ModelType +
         '" - only "llama", "mistral", "qwen2", "qwen3", "qwen3_moe", ' +
+        '"qwen3_5", "qwen3_5_moe", ' +
         '"gemma", "gemma2", "gemma3_text", "phi3", "olmo2", "olmoe", ' +
         '"mixtral", "glm4", "granite", "granitemoe", "bitnet", ' +
         '"internlm2" and "minicpm" are supported here ' +
@@ -13409,6 +13512,16 @@ begin
     Result.AttentionMultiplier := 0; // 0 = use SDPA's default 1/sqrt(head_dim)
     Result.LogitsScaling := 1.0;
     Result.SharedIntermediateSize := 0; // granitemoe: no shared expert
+    // Qwen3.5 hybrid deltas: off/empty for every other family.
+    SetLength(Result.LinearAttnLayers, 0);
+    Result.LinearNumKHeads := 0;
+    Result.LinearNumVHeads := 0;
+    Result.LinearKeyHeadDim := 0;
+    Result.LinearValueHeadDim := 0;
+    Result.LinearConvKernel := 0;
+    Result.AttnOutputGate := False;
+    Result.MoESharedExpertGate := False;
+    Result.MoEQwen35FusedExperts := False;
     if ModelType = 'mixtral' then
     begin
       // Mixtral: a stock Mistral decoder (full MHA/GQA, RoPE, sliding
@@ -13545,6 +13658,154 @@ begin
         end;
         // use_sliding_window=true with sliding_window=null leaves
         // SlidingWindow=0 (full attention), matching HF's None fallback.
+      end;
+    end
+    else if (ModelType = 'qwen3_5') or (ModelType = 'qwen3_5_moe') then
+    begin
+      // Qwen3.5 / Qwen3.6 hybrid text decoder (HF modeling_qwen3_5 /
+      // modeling_qwen3_5_moe; Qwen3.6-27B dense, Qwen3.6-35B-A3B MoE): a
+      // pre-norm residual stack whose per-layer TOKEN MIXER alternates by
+      // config layer_types (pattern (L L L F)*):
+      //   "full_attention"   - the Qwen3 attention (per-head zero-centered
+      //       q/k RMSNorm BEFORE RoPE, GQA, bias-free, 1/sqrt(head_dim)
+      //       scaling) with TWO deltas: PARTIAL rotary (partial_rotary_factor
+      //       0.25 of head_dim 256) and a per-head OUTPUT GATE - q_proj is
+      //       double width ([query|gate] per head) and the concatenated head
+      //       outputs are multiplied by sigmoid(gate) before o_proj
+      //       (AttnOutputGate);
+      //   "linear_attention" - the gated-DeltaNet mixer (TNNetGatedDeltaNet):
+      //       in_proj_qkv -> causal depthwise conv-4 + SiLU over the q|k|v
+      //       slab, z/b/a side projections (NOT conv'd), the gated delta-rule
+      //       recurrence with a PLAIN-gain gated RMSNorm read-out, out_proj.
+      // EVERY RMSNorm gain in the checkpoint is ZERO-CENTERED (stored as the
+      // offset from 1, HF Qwen3_5RMSNorm computes (1 + w) * xhat ->
+      // RMSNormAddOne, the Gemma fold) EXCEPT the DeltaNet gated norm
+      // linear_attn.norm.weight (plain ones-init gain - loaded with NO
+      // offset by LoadQwen35DeltaNetWeights). The config's
+      // mrope_section/mrope_interleaved fields are a NO-OP for 1-D text
+      // positions (all three position streams are identical, so the
+      // interleaved merge reproduces plain partial RoPE bit-for-bit) - text
+      // import treats the rope as standard partial RoPE.
+      Result.QKVBias := Obj.Get('attention_bias', False);
+      if Result.QKVBias then
+        ImportError('Llama import: Qwen3.5 attention_bias=true (biases on ' +
+          'q/k/v AND o_proj) is not wired into this importer - every ' +
+          'released qwen3_5 checkpoint is bias-free.');
+      Result.QKNorm := True;
+      Result.RMSNormAddOne := True; // zero-centered RMSNorm gains (1 + w)
+      Result.AttnOutputGate := True;
+      if Result.HeadDim = 0 then Result.HeadDim := 256; // HF default
+      HiddenAct := Obj.Get('hidden_act', 'silu');
+      if HiddenAct <> 'silu' then
+        ImportError('Llama import: Qwen3.5 hidden_act "' + HiddenAct +
+          '" is not supported - every released qwen3_5 checkpoint uses ' +
+          '"silu" (SwiGLU MLP, SiLU conv activation, SiLU z gate).');
+      // transformers 5.x carries rope_theta / partial_rotary_factor inside
+      // the rope_parameters dict (rope_type "default"); honor a legacy
+      // top-level spelling too. HF defaults: theta 1e7, factor 0.25.
+      Result.RopeTheta := Obj.Get('rope_theta', 10000000.0);
+      Result.PartialRotaryFactor := Obj.Get('partial_rotary_factor', 0.25);
+      FloatField := Obj.Find('rope_parameters');
+      if (FloatField <> nil) and (FloatField is TJSONObject) then
+      begin
+        LayerTypeStr := TJSONObject(FloatField).Get('rope_type', 'default');
+        if LayerTypeStr <> 'default' then
+          ImportError('Llama import: Qwen3.5 rope_parameters rope_type "' +
+            LayerTypeStr + '" is not supported - every released qwen3_5 ' +
+            'checkpoint uses "default" (plain partial RoPE for text).');
+        Result.RopeTheta :=
+          TJSONObject(FloatField).Get('rope_theta', Result.RopeTheta);
+        Result.PartialRotaryFactor := TJSONObject(FloatField).Get(
+          'partial_rotary_factor', Result.PartialRotaryFactor);
+      end;
+      if (Result.PartialRotaryFactor <= 0) or
+         (Result.PartialRotaryFactor > 1) then
+        ImportError('Llama import: config partial_rotary_factor must be ' +
+          'in (0, 1], got ' + FloatToStr(Result.PartialRotaryFactor) + '.');
+      // Linear-attention (gated DeltaNet) geometry; HF defaults.
+      Result.LinearNumKHeads := Obj.Get('linear_num_key_heads', 16);
+      Result.LinearNumVHeads := Obj.Get('linear_num_value_heads', 32);
+      Result.LinearKeyHeadDim := Obj.Get('linear_key_head_dim', 128);
+      Result.LinearValueHeadDim := Obj.Get('linear_value_head_dim', 128);
+      Result.LinearConvKernel := Obj.Get('linear_conv_kernel_dim', 4);
+      if (Result.LinearNumKHeads < 1) or (Result.LinearNumVHeads < 1) or
+         (Result.LinearKeyHeadDim < 1) or (Result.LinearValueHeadDim < 1) or
+         (Result.LinearConvKernel < 1) then
+        ImportError('Llama import: Qwen3.5 linear_num_key_heads / ' +
+          'linear_num_value_heads / linear_key_head_dim / ' +
+          'linear_value_head_dim / linear_conv_kernel_dim must all be >= 1.');
+      if (Result.LinearNumVHeads mod Result.LinearNumKHeads) <> 0 then
+        ImportError('Llama import: Qwen3.5 linear_num_value_heads=' +
+          IntToStr(Result.LinearNumVHeads) + ' is not divisible by ' +
+          'linear_num_key_heads=' + IntToStr(Result.LinearNumKHeads) + '.');
+      // Per-layer mixer type: layer_types wins; absent falls back to HF
+      // __post_init__'s full_attention_interval rule (every Nth layer full,
+      // default 4 -> the (L L L F)* pattern).
+      SetLength(Result.LinearAttnLayers, Result.NumLayers);
+      LayerTypesArr := Obj.Find('layer_types');
+      if (LayerTypesArr <> nil) and (LayerTypesArr is TJSONArray) then
+      begin
+        if TJSONArray(LayerTypesArr).Count <> Result.NumLayers then
+          ImportError('Llama import: Qwen3.5 layer_types has ' +
+            IntToStr(TJSONArray(LayerTypesArr).Count) + ' entries but ' +
+            'num_hidden_layers=' + IntToStr(Result.NumLayers) + '.');
+        MoEMax := Result.NumLayers - 1;
+        for i := 0 to MoEMax do
+        begin
+          LayerTypeStr := TJSONArray(LayerTypesArr).Strings[i];
+          if LayerTypeStr = 'linear_attention' then
+            Result.LinearAttnLayers[i] := True
+          else if LayerTypeStr = 'full_attention' then
+            Result.LinearAttnLayers[i] := False
+          else
+            ImportError('Llama import: Qwen3.5 layer_types[' + IntToStr(i) +
+              '] is "' + LayerTypeStr + '" - only "linear_attention" and ' +
+              '"full_attention" are supported.');
+        end;
+      end
+      else
+      begin
+        FullAttnInterval := Obj.Get('full_attention_interval', 4);
+        if FullAttnInterval < 1 then
+          ImportError('Llama import: Qwen3.5 full_attention_interval must ' +
+            'be >= 1, got ' + IntToStr(FullAttnInterval) + '.');
+        MoEMax := Result.NumLayers - 1;
+        for i := 0 to MoEMax do
+          Result.LinearAttnLayers[i] := ((i + 1) mod FullAttnInterval) <> 0;
+      end;
+      if ModelType = 'qwen3_5_moe' then
+      begin
+        // Qwen3.5-MoE FFN (HF Qwen3_5MoeSparseMoeBlock; EVERY layer is MoE -
+        // no decoder_sparse_step / mlp_only_layers): a plain mlp.gate.weight
+        // router -> per-token softmax over ALL experts -> hard top-k with the
+        // survivors ALWAYS renormalized (norm_topk_prob behaviour hard-coded
+        // on in HF), feeding num_experts SwiGLU experts stored as FUSED 3-D
+        // slabs (MoEQwen35FusedExperts - the granitemoe layout under Qwen3.5
+        // names), PLUS an always-on shared SwiGLU expert scaled by
+        // sigmoid(shared_expert_gate(x)) (MoESharedExpertGate).
+        Result.IsMoE := True;
+        Result.MoEQwen35FusedExperts := True;
+        Result.MoESharedExpertGate := True;
+        Result.MoENormTopK := True; // HF renormalizes top-k unconditionally
+        Result.MoEDecoderSparseStep := 1; // uniform all-MoE stack
+        Result.NumLocalExperts := Obj.Get('num_experts', 256);
+        Result.MoEExpertsPerTok := Obj.Get('num_experts_per_tok', 8);
+        Result.MoEIntermediateSize := RequiredInt('moe_intermediate_size');
+        Result.SharedIntermediateSize :=
+          Obj.Get('shared_expert_intermediate_size', 512);
+        if Result.NumLocalExperts < 1 then
+          ImportError('Llama import: Qwen3.5-MoE num_experts must be >= 1, ' +
+            'got ' + IntToStr(Result.NumLocalExperts) + '.');
+        if (Result.MoEExpertsPerTok < 1) or
+           (Result.MoEExpertsPerTok > Result.NumLocalExperts) then
+          ImportError('Llama import: Qwen3.5-MoE num_experts_per_tok=' +
+            IntToStr(Result.MoEExpertsPerTok) + ' must be in [1, ' +
+            'num_experts=' + IntToStr(Result.NumLocalExperts) + '].');
+        if Result.SharedIntermediateSize < 1 then
+          ImportError('Llama import: Qwen3.5-MoE ' +
+            'shared_expert_intermediate_size must be >= 1 (the shared ' +
+            'expert is always on), got ' +
+            IntToStr(Result.SharedIntermediateSize) + '.');
       end;
     end
     else if (ModelType = 'gemma') or (ModelType = 'gemma2') or
@@ -14550,10 +14811,15 @@ end;
 // fold lands HERE (stored gain = Scale*(GainOffset+w)) because a scale
 // folded into W_q would be ERASED by the q-side RMSNorm; the scalar
 // commutes with RoPE (a rotation), so scaling the norm gain is exact.
+// RotaryDims (Qwen3.5 partial rotary) RESTRICTS the rotate_half permutation
+// to the first RotaryDims channels of the head - the pass-through tail keeps
+// its position, matching the q/k ROW permutation LoadLlamaLinearWeights
+// applies with the same RotaryDims. 0 = permute the full head (every
+// full-rotary family; identical to passing HeadDim).
 procedure LoadLlamaHeadRMSNormWeights(Reader: TNNetSafeTensorsReader;
   const NormLayers: array of TNNetLayer; const WName: string;
   HeadDim: integer; GainOffset: TNeuralFloat = 0;
-  Scale: TNeuralFloat = 1.0);
+  Scale: TNeuralFloat = 1.0; RotaryDims: integer = 0);
 var
   Tmp: TNNetVolume;
   HeadCnt, j, TargetIdx, HalfDim: integer;
@@ -14565,7 +14831,8 @@ begin
      (Reader.DimSize(WName, 0) <> HeadDim) then
     ImportError('Llama import: "' + WName + '" must have shape [' +
       IntToStr(HeadDim) + '], got ' + Reader.ShapeAsString(WName));
-  HalfDim := HeadDim div 2;
+  if RotaryDims <= 0 then RotaryDims := HeadDim;
+  HalfDim := RotaryDims div 2;
   Tmp := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(WName, Tmp);
@@ -14576,7 +14843,9 @@ begin
     begin
       for j := 0 to HeadDimM1 do
       begin
-        if j < HalfDim then
+        if j >= RotaryDims then
+          TargetIdx := j // partial-rotary pass-through tail: no permutation
+        else if j < HalfDim then
           TargetIdx := 2 * j
         else
           TargetIdx := 2 * (j - HalfDim) + 1;
@@ -14661,6 +14930,16 @@ type
     // always-on SwiGLU MLP whose output is summed with the routed output;
     // nil otherwise.
     SharedGateUp, SharedDown: TNNetLayer;
+    // Qwen3.5-MoE shared-expert gate (Config.MoESharedExpertGate): the
+    // [1, hidden] shared_expert_gate linear whose per-token sigmoid scales
+    // the shared expert output; nil otherwise.
+    SharedGate: TNNetLayer;
+    // Qwen3.5 "linear_attention" gated-DeltaNet mixer layers
+    // (Config.LinearAttnLayers[i] = True; see BuildQwen35DeltaNetBranch):
+    // in_proj_qkv / depthwise conv1d / in_proj_z / in_proj_b / in_proj_a /
+    // the TNNetGatedDeltaNet leaf / out_proj. nil on full-attention layers
+    // and for every other family.
+    LinQKV, LinConv, LinZ, LinB, LinA, LinDelta, LinOut: TNNetLayer;
   end;
 
 // Wires Mixtral's block_sparse_moe FFN from primitives onto MoESource (the
@@ -14702,6 +14981,7 @@ procedure BuildMixtralMoEBranch(NN: TNNet; var Block: TLlamaBlockLayers;
   pTrainable: boolean = true);
 var
   GateTopK, ExpertOut, GateE, GateEBroadcast, RoutedOut: TNNetLayer;
+  SharedOut: TNNetLayer;
   MoEBranches: array of TNNetLayer;
   ExpertCnt, ExpertWidth, NumLocalExpertsM1: integer;
 begin
@@ -14792,7 +15072,27 @@ begin
     NN.AddLayer( TNNetSwiGLU.Create() );
     Block.SharedDown := NN.AddLayer(
       TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
-    NN.AddLayer( TNNetSum.Create([RoutedOut, NN.GetLastLayer()]) );
+    SharedOut := NN.GetLastLayer();
+    // Qwen3.5-MoE / qwen2_moe shared-expert GATE (Config.MoESharedExpertGate):
+    // the shared expert output is scaled by sigmoid(shared_expert_gate(x)) -
+    // a [1, hidden] linear producing ONE logit per token, sigmoided and
+    // broadcast across d_model (HF Qwen3_5MoeSparseMoeBlock:
+    // F.sigmoid(shared_expert_gate(h)) * shared_expert(h)). Wired from
+    // existing primitives (linear -> TNNetSigmoid -> Replicate broadcast ->
+    // per-token TNNetCellMulByCell), the Nemotron-H-MoE convention - NO new
+    // layer. granitemoe (gate off) keeps the plain unscaled sum.
+    if Config.MoESharedExpertGate then
+    begin
+      Block.SharedGate := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(1).SetTrainable(pTrainable),
+        MoESource);
+      NN.AddLayer( TNNetSigmoid.Create() );
+      GateEBroadcast := NN.AddLayer(
+        TNNetDeepConcat.Replicate(Config.HiddenSize, NN.GetLastLayer()) );
+      SharedOut := NN.AddLayer(
+        TNNetCellMulByCell.Create(SharedOut, GateEBroadcast) );
+    end;
+    NN.AddLayer( TNNetSum.Create([RoutedOut, SharedOut]) );
   end;
 end;
 
@@ -14807,11 +15107,17 @@ end;
 // TNNetSwiGLU computes FIRSTHALF*silu(SECONDHALF), so the UP half loads into
 // expert neurons 0..I-1 and the GATE half into I..2I-1 (the same convention
 // as the dense fused gate_up). ResidualScale folds Granite's
-// residual_multiplier into the down (output_linear) rows. Coded by Claude (AI).
+// residual_multiplier into the down (output_linear) rows.
+// pInName/pOutName/pRouterName override the FULL tensor names: Qwen3.5-MoE
+// stores the IDENTICAL slab layout ([E, 2I, H] gate-then-up, [E, H, I] down,
+// [E, H] router) under mlp.experts.gate_up_proj / mlp.experts.down_proj /
+// mlp.gate.weight, so it reuses this loader with the names swapped ('' =
+// the granitemoe block_sparse_moe.* defaults). Coded by Claude (AI).
 procedure LoadGraniteMoEExperts(Reader: TNNetSafeTensorsReader;
   var Block: TLlamaBlockLayers; const BlockPrefix: string;
   NumExperts, HiddenSize, ExpertWidth: integer; ResidualScale: TNeuralFloat;
-  Consumed: TStringList);
+  Consumed: TStringList; const pInName: string = '';
+  const pOutName: string = ''; const pRouterName: string = '');
 var
   InName, OutName, RouterName: string;
   W: TNNetVolume;
@@ -14822,9 +15128,12 @@ begin
   NumExpertsM1 := NumExperts - 1;
   HiddenSizeM1 := HiddenSize - 1;
   ExpertWidthM1 := ExpertWidth - 1;
-  InName := BlockPrefix + 'block_sparse_moe.input_linear.weight';
-  OutName := BlockPrefix + 'block_sparse_moe.output_linear.weight';
-  RouterName := BlockPrefix + 'block_sparse_moe.router.layer.weight';
+  if pInName <> '' then InName := pInName
+  else InName := BlockPrefix + 'block_sparse_moe.input_linear.weight';
+  if pOutName <> '' then OutName := pOutName
+  else OutName := BlockPrefix + 'block_sparse_moe.output_linear.weight';
+  if pRouterName <> '' then RouterName := pRouterName
+  else RouterName := BlockPrefix + 'block_sparse_moe.router.layer.weight';
   // ---- router gate [E, H] (a plain bias-free nn.Linear over experts) ----
   if (Reader.DimCount(RouterName) <> 2) or
      (Reader.DimSize(RouterName, 0) <> NumExperts) or
@@ -15007,6 +15316,167 @@ begin
   end;
 end;
 
+// Per-layer full/linear-attention gate for the Qwen3.5 hybrid stack: layer
+// LayerIdx is a "linear_attention" gated-DeltaNet mixer iff the config's
+// layer_types said so (Config.LinearAttnLayers, the (L L L F)* pattern).
+// Empty = every layer is full attention (every other family - the original
+// behaviour is unchanged). Coded by Claude (AI).
+function LlamaLayerIsLinearAttn(const Config: TLlamaConfig;
+  LayerIdx: integer): boolean;
+begin
+  Result := (LayerIdx <= High(Config.LinearAttnLayers)) and
+    Config.LinearAttnLayers[LayerIdx];
+end;
+
+// Wires the Qwen3.5 "linear_attention" token mixer (HF Qwen3_5GatedDeltaNet)
+// onto Source (the input_layernorm output) from EXISTING primitives plus the
+// TNNetGatedDeltaNet leaf:
+//   u     = Source
+//   mixed = SiLU(causal depthwise conv-K(in_proj_qkv(u)))  [the q|k|v slab,
+//           conv_dim = 2*key_dim + value_dim; the conv is BIAS-FREE and
+//           reuses TNNetDepthwiseConv1D's conv-state incremental decode]
+//   z     = in_proj_z(u); b = in_proj_b(u); a = in_proj_a(u)  [NOT conv'd]
+//   mixer input = [ mixed(q|k|v) | z | b | a ]  (TNNetDeepConcat - exactly
+//           the channel order TNNetGatedDeltaNet's contract requires; q/k go
+//           in RAW, the leaf does the L2 norm + 1/sqrt(Dk) query scale and
+//           the repeat_interleave q/k head broadcast internally)
+//   out   = out_proj(TNNetGatedDeltaNet(mixer input))
+// The conv covers ONLY the q|k|v slab - z/b/a bypass it (HF applies conv1d
+// to mixed_qkv alone). Leaves out_proj as the last layer (the caller closes
+// the residual). Coded by Claude (AI).
+procedure BuildQwen35DeltaNetBranch(NN: TNNet; var Block: TLlamaBlockLayers;
+  Source: TNNetLayer; const Config: TLlamaConfig; pTrainable: boolean);
+var
+  KeyDim, ValueDim, ConvDim: integer;
+  ConvAct: TNNetLayer;
+begin
+  KeyDim := Config.LinearNumKHeads * Config.LinearKeyHeadDim;
+  ValueDim := Config.LinearNumVHeads * Config.LinearValueHeadDim;
+  ConvDim := 2 * KeyDim + ValueDim;
+  Block.LinQKV := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(ConvDim).SetTrainable(pTrainable),
+    Source);
+  Block.LinConv := NN.AddLayer( TNNetDepthwiseConv1D.Create(
+    Config.LinearConvKernel, {pCausal=}true, {pSuppressBias=}1) );
+  ConvAct := NN.AddLayer( TNNetSiLU.Create() );
+  Block.LinZ := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(ValueDim).SetTrainable(pTrainable),
+    Source);
+  Block.LinB := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Config.LinearNumVHeads).SetTrainable(pTrainable),
+    Source);
+  Block.LinA := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Config.LinearNumVHeads).SetTrainable(pTrainable),
+    Source);
+  NN.AddLayer( TNNetDeepConcat.Create(
+    [ConvAct, Block.LinZ, Block.LinB, Block.LinA]) );
+  Block.LinDelta := NN.AddLayer( TNNetGatedDeltaNet.Create(
+    Config.LinearNumKHeads, Config.LinearNumVHeads,
+    Config.LinearKeyHeadDim, Config.LinearValueHeadDim,
+    Config.RmsNormEps) );
+  Block.LinOut := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
+end;
+
+// Loads one Qwen3.5 linear_attn.* tensor set into the DeltaNet branch wired
+// by BuildQwen35DeltaNetBranch. The in_proj_{qkv,z,b,a} and out_proj weights
+// are plain bias-free nn.Linear rows (NO rotary permutation - the leaf
+// consumes the raw channel order); conv1d.weight is the depthwise
+// [conv_dim, 1, K] slab with NO bias (HF ships conv1d bias=False; the tap
+// order maps DIRECTLY onto TNNetDepthwiseConv1D's causal read, the Mamba
+// convention); A_log [Hv], dt_bias [Hv] and norm.weight [Dv] land in
+// TNNetGatedDeltaNet's Neurons[0..2]. The gated-norm gain is PLAIN
+// (ones-init, NOT zero-centered) - the ONLY non-zero-centered RMSNorm in the
+// checkpoint - so it loads with NO GainOffset regardless of
+// Config.RMSNormAddOne. Coded by Claude (AI).
+procedure LoadQwen35DeltaNetWeights(Reader: TNNetSafeTensorsReader;
+  var Block: TLlamaBlockLayers; const BlockPrefix: string;
+  const Config: TLlamaConfig; Consumed: TStringList);
+var
+  LinPrefix, TName: string;
+  KeyDim, ValueDim, ConvDim, d, kk: integer;
+  ConvDimM1, KernelM1: integer;
+  Tmp: TNNetVolume;
+
+  procedure LoadDeltaVector(NeuronIdx, Channels: integer;
+    const VName: string);
+  var
+    ch, ChannelsM1: integer;
+  begin
+    if not Reader.HasTensor(VName) then
+      ImportError('Llama import: missing tensor "' + VName + '".');
+    Reader.LoadTensorFlat(VName, Tmp);
+    if Tmp.Size <> Channels then
+      ImportError('Llama import: "' + VName + '" must carry ' +
+        IntToStr(Channels) + ' elements, got ' +
+        Reader.ShapeAsString(VName));
+    ChannelsM1 := Channels - 1;
+    for ch := 0 to ChannelsM1 do
+      Block.LinDelta.FArrNeurons[NeuronIdx].Weights.FData[ch] :=
+        Tmp.FData[ch];
+    Consumed.Add(VName);
+  end;
+
+begin
+  KeyDim := Config.LinearNumKHeads * Config.LinearKeyHeadDim;
+  ValueDim := Config.LinearNumVHeads * Config.LinearValueHeadDim;
+  ConvDim := 2 * KeyDim + ValueDim;
+  LinPrefix := BlockPrefix + 'linear_attn.';
+  LoadLlamaLinearWeights(Reader, Block.LinQKV,
+    LinPrefix + 'in_proj_qkv.weight', Config.HiddenSize, ConvDim);
+  Consumed.Add(LinPrefix + 'in_proj_qkv.weight');
+  LoadLlamaLinearWeights(Reader, Block.LinZ,
+    LinPrefix + 'in_proj_z.weight', Config.HiddenSize, ValueDim);
+  Consumed.Add(LinPrefix + 'in_proj_z.weight');
+  LoadLlamaLinearWeights(Reader, Block.LinB,
+    LinPrefix + 'in_proj_b.weight', Config.HiddenSize,
+    Config.LinearNumVHeads);
+  Consumed.Add(LinPrefix + 'in_proj_b.weight');
+  LoadLlamaLinearWeights(Reader, Block.LinA,
+    LinPrefix + 'in_proj_a.weight', Config.HiddenSize,
+    Config.LinearNumVHeads);
+  Consumed.Add(LinPrefix + 'in_proj_a.weight');
+  // conv1d.weight [conv_dim, 1, K] depthwise, NO bias. HF left-pads K-1
+  // zeros and truncates to seq_len: y[t] = sum_k w[k]*x[t-(K-1)+k] -
+  // exactly TNNetDepthwiseConv1D's causal read, so taps map directly.
+  TName := LinPrefix + 'conv1d.weight';
+  if not Reader.HasTensor(TName) then
+    ImportError('Llama import: missing tensor "' + TName + '".');
+  if (Reader.DimCount(TName) <> 3) or
+     (Reader.DimSize(TName, 0) <> ConvDim) or
+     (Reader.DimSize(TName, 1) <> 1) or
+     (Reader.DimSize(TName, 2) <> Config.LinearConvKernel) then
+    ImportError('Llama import: "' + TName + '" must have shape [' +
+      IntToStr(ConvDim) + ', 1, ' + IntToStr(Config.LinearConvKernel) +
+      '], got ' + Reader.ShapeAsString(TName));
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(TName, Tmp);
+    ConvDimM1 := ConvDim - 1;
+    KernelM1 := Config.LinearConvKernel - 1;
+    for d := 0 to ConvDimM1 do
+    begin
+      for kk := 0 to KernelM1 do
+        Block.LinConv.FArrNeurons[d].Weights.FData[kk] :=
+          Tmp.FData[d * Config.LinearConvKernel + kk];
+      Block.LinConv.FArrNeurons[d].BiasWeight := 0; // bias-free conv
+    end;
+    Block.LinConv.FlushWeightCache();
+    Consumed.Add(TName);
+    // TNNetGatedDeltaNet learnables: Neurons[0]=A_log (Hv), [1]=dt_bias
+    // (Hv), [2]=gated-norm gain (Dv, PLAIN - no zero-centered offset).
+    LoadDeltaVector(0, Config.LinearNumVHeads, LinPrefix + 'A_log');
+    LoadDeltaVector(1, Config.LinearNumVHeads, LinPrefix + 'dt_bias');
+    LoadDeltaVector(2, Config.LinearValueHeadDim, LinPrefix + 'norm.weight');
+    Block.LinDelta.FlushWeightCache();
+  finally
+    Tmp.Free;
+  end;
+  LoadLlamaLinearWeights(Reader, Block.LinOut,
+    LinPrefix + 'out_proj.weight', ValueDim, Config.HiddenSize);
+  Consumed.Add(LinPrefix + 'out_proj.weight');
+end;
+
 // The Llama builder core: builds the net and loads every weight from the
 // ALREADY-OPEN pReader (whose tensor table must use the HF tensor names).
 // Takes OWNERSHIP of pReader (frees it on every path). FileName is used in
@@ -15029,6 +15499,8 @@ var
   SliceChannels, RotChannels, PassChannels: array of integer;
   BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
   HeadDim, QWidth, KVWidth, RotaryDims, LayerWindow, i, j, d: integer;
+  QProjWidth: integer;
+  AttnConcat: TNNetLayer;
   RotaryHeadDimArg: integer;
   ReaderMax: integer;
   NumLayersM1, NumKVHeadsM1, NumHeadsM1, HeadDimM1, RotaryDimsM1: integer;
@@ -15111,10 +15583,11 @@ begin
           IntToStr(Length(Config.RopeScaling.LongFactors)) + ' entries but ' +
           'rotary_dim/2 = ' + IntToStr(RotaryDims div 2) +
           ' are required (one factor per rotated channel pair).');
-      if Config.QKNorm and (RotaryDims < HeadDim) then
-        ImportError('Llama import: internal error - partial rotary ' +
-          'combined with per-head q/k RMSNorm is not wired (no family ' +
-          'uses both).');
+      // Per-head q/k RMSNorm COMBINED with partial rotary (Qwen3.5:
+      // head_dim 256, rotary 64) is wired below: the head is sliced first,
+      // normed over the FULL head, then split into the rotary slice (RoPE)
+      // and the pass-through tail - the HF ordering (q_norm(q) then partial
+      // apply_rotary_pos_emb).
       if Config.QKNormFullWidth and (RotaryDims < HeadDim) then
         ImportError('Llama import: internal error - partial rotary ' +
           'combined with full-width q/k RMSNorm is not wired (no family ' +
@@ -15130,6 +15603,27 @@ begin
       QWidth := Config.NumHeads * HeadDim;
       KVWidth := Config.NumKVHeads * HeadDim;
       GroupSize := Config.NumHeads div Config.NumKVHeads;
+      // Config.AttnOutputGate (Qwen3.5): q_proj is DOUBLE width - queries in
+      // channels 0..QWidth-1 (feeding the per-head slices unchanged) and the
+      // per-head output gate in QWidth..2*QWidth-1 (see the gate wiring
+      // below). Every other family keeps the plain QWidth projection.
+      if Config.AttnOutputGate then QProjWidth := 2 * QWidth
+      else QProjWidth := QWidth;
+      if Length(Config.LinearAttnLayers) > 0 then
+      begin
+        if Length(Config.LinearAttnLayers) <> Config.NumLayers then
+          ImportError('Llama import: internal error - LinearAttnLayers has ' +
+            IntToStr(Length(Config.LinearAttnLayers)) + ' entries but ' +
+            'num_hidden_layers=' + IntToStr(Config.NumLayers) + '.');
+        if (Config.LinearNumKHeads < 1) or (Config.LinearNumVHeads < 1) or
+           (Config.LinearKeyHeadDim < 1) or
+           (Config.LinearValueHeadDim < 1) or
+           (Config.LinearConvKernel < 1) or
+           ((Config.LinearNumVHeads mod Config.LinearNumKHeads) <> 0) then
+          ImportError('Llama import: internal error - invalid Qwen3.5 ' +
+            'linear-attention geometry (heads/dims must be >= 1 with ' +
+            'Hv divisible by Hk).');
+      end;
       // The Granite multipliers default to 1.0 (no-op) in the JSON config
       // reader, but config builders that start from Default(TLlamaConfig)
       // (e.g. the GGUF path) leave them 0. Normalize a 0/unset multiplier to
@@ -15138,7 +15632,13 @@ begin
       if Config.ResidualMultiplier = 0 then Config.ResidualMultiplier := 1.0;
       if Config.LogitsScaling = 0 then Config.LogitsScaling := 1.0;
       // AttentionMultiplier 0 stays 0 = "use SDPA's default 1/sqrt(head_dim)".
-      if Reader.HasTensor('model.embed_tokens.weight') then
+      // Qwen3.5 / Qwen3.6 multimodal checkpoints nest the text backbone
+      // under "model.language_model." (Qwen3_5ForConditionalGeneration;
+      // lm_head.weight stays top-level); text-only exports use the plain
+      // "model." prefix like every other family.
+      if Reader.HasTensor('model.language_model.embed_tokens.weight') then
+        Config.Prefix := 'model.language_model.'
+      else if Reader.HasTensor('model.embed_tokens.weight') then
         Config.Prefix := 'model.'
       else if Reader.HasTensor('embed_tokens.weight') then
         Config.Prefix := ''
@@ -15277,8 +15777,17 @@ begin
             NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
           NormedSource := NN.GetLastLayer();
         end;
+        // Qwen3.5 hybrid stack: a "linear_attention" layer swaps the whole
+        // attention branch for the gated-DeltaNet mixer (no q/k/v, no RoPE,
+        // no KV cache - the mixer's state is O(1)); the residual close below
+        // is shared. Every other family takes the attention path always.
+        if LlamaLayerIsLinearAttn(Config, BlockCnt) then
+          BuildQwen35DeltaNetBranch(NN, Blocks[BlockCnt], NormedSource,
+            Config, pTrainable)
+        else
+        begin
         Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(QWidth).SetTrainable(pTrainable),
+          TNNetPointwiseConvLinear.Create(QProjWidth).SetTrainable(pTrainable),
           NormedSource);
         Blocks[BlockCnt].KProj := NN.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(KVWidth).SetTrainable(pTrainable),
@@ -15356,18 +15865,40 @@ begin
             // re-concatenated [rotated | pass-through]. The rotary slice
             // feeds a depth-RotaryDims TNNetRotaryEmbedding, so the
             // frequency schedule theta^(-2k/RotaryDims) matches HF's
-            // inv_freq over rotary_dim exactly. (QKNorm + partial rotary
-            // is rejected up front - no family combines them.)
-            for d := 0 to RotaryDimsM1 do
-              RotChannels[d] := KVHeadCnt * HeadDim + d;
-            for d := 0 to HeadDimMRotaryM1 do
-              PassChannels[d] := KVHeadCnt * HeadDim + RotaryDims + d;
-            RotSlice := NN.AddLayerAfter(
-              TNNetSplitChannels.Create(RotChannels), KSource);
-            RotSlice := NN.AddLayerAfter(
-              CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling), RotSlice);
-            PassSlice := NN.AddLayerAfter(
-              TNNetSplitChannels.Create(PassChannels), KSource);
+            // inv_freq over rotary_dim exactly.
+            // Config.QKNorm + partial rotary (Qwen3.5): the per-head
+            // RMSNorm spans the FULL head and precedes RoPE (HF:
+            // k_norm(k_proj) then partial apply_rotary_pos_emb), so the
+            // whole head is sliced FIRST, normed, and the rotary /
+            // pass-through slices are cut RELATIVE to the normed head.
+            if Config.QKNorm then
+            begin
+              KSlice := NN.AddLayerAfter(
+                TNNetSplitChannels.Create(SliceChannels), KSource);
+              Blocks[BlockCnt].KNorms[KVHeadCnt] := NN.AddLayerAfter(
+                TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable), KSlice);
+              KSlice := Blocks[BlockCnt].KNorms[KVHeadCnt];
+              RotSlice := NN.AddLayerAfter(
+                TNNetSplitChannels.Create(0, RotaryDims), KSlice);
+              RotSlice := NN.AddLayerAfter(
+                CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling), RotSlice);
+              PassSlice := NN.AddLayerAfter(
+                TNNetSplitChannels.Create(RotaryDims, HeadDim - RotaryDims),
+                KSlice);
+            end
+            else
+            begin
+              for d := 0 to RotaryDimsM1 do
+                RotChannels[d] := KVHeadCnt * HeadDim + d;
+              for d := 0 to HeadDimMRotaryM1 do
+                PassChannels[d] := KVHeadCnt * HeadDim + RotaryDims + d;
+              RotSlice := NN.AddLayerAfter(
+                TNNetSplitChannels.Create(RotChannels), KSource);
+              RotSlice := NN.AddLayerAfter(
+                CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling), RotSlice);
+              PassSlice := NN.AddLayerAfter(
+                TNNetSplitChannels.Create(PassChannels), KSource);
+            end;
             KRotated[KVHeadCnt] := NN.AddLayer(
               TNNetDeepConcat.Create([RotSlice, PassSlice]) );
           end
@@ -15409,17 +15940,36 @@ begin
             SliceChannels[d] := HeadCnt * HeadDim + d;
           if RotaryDims < HeadDim then
           begin
-            // Partial rotary on the Q head - same wiring as the K path.
-            for d := 0 to RotaryDimsM1 do
-              RotChannels[d] := HeadCnt * HeadDim + d;
-            for d := 0 to HeadDimMRotaryM1 do
-              PassChannels[d] := HeadCnt * HeadDim + RotaryDims + d;
-            RotSlice := NN.AddLayerAfter(
-              TNNetSplitChannels.Create(RotChannels), QSource);
-            RotSlice := NN.AddLayerAfter(
-              CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling), RotSlice);
-            PassSlice := NN.AddLayerAfter(
-              TNNetSplitChannels.Create(PassChannels), QSource);
+            // Partial rotary on the Q head - same wiring as the K path
+            // (including the Qwen3.5 full-head q_norm BEFORE the split).
+            if Config.QKNorm then
+            begin
+              QSlice := NN.AddLayerAfter(
+                TNNetSplitChannels.Create(SliceChannels), QSource);
+              Blocks[BlockCnt].QNorms[HeadCnt] := NN.AddLayerAfter(
+                TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable), QSlice);
+              QSlice := Blocks[BlockCnt].QNorms[HeadCnt];
+              RotSlice := NN.AddLayerAfter(
+                TNNetSplitChannels.Create(0, RotaryDims), QSlice);
+              RotSlice := NN.AddLayerAfter(
+                CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling), RotSlice);
+              PassSlice := NN.AddLayerAfter(
+                TNNetSplitChannels.Create(RotaryDims, HeadDim - RotaryDims),
+                QSlice);
+            end
+            else
+            begin
+              for d := 0 to RotaryDimsM1 do
+                RotChannels[d] := HeadCnt * HeadDim + d;
+              for d := 0 to HeadDimMRotaryM1 do
+                PassChannels[d] := HeadCnt * HeadDim + RotaryDims + d;
+              RotSlice := NN.AddLayerAfter(
+                TNNetSplitChannels.Create(RotChannels), QSource);
+              RotSlice := NN.AddLayerAfter(
+                CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling), RotSlice);
+              PassSlice := NN.AddLayerAfter(
+                TNNetSplitChannels.Create(PassChannels), QSource);
+            end;
             QSlice := NN.AddLayer(
               TNNetDeepConcat.Create([RotSlice, PassSlice]) );
           end
@@ -15466,7 +16016,23 @@ begin
               {pScoreSoftCap=}Config.AttnLogitSoftCap),
             HeadPack);
         end;
-        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        AttnConcat := NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        // Config.AttnOutputGate (Qwen3.5): the q_proj slab's SECOND half
+        // (channels QWidth..2*QWidth-1, loaded so gate row [h][d] sits at
+        // channel QWidth + h*HeadDim + d - aligned with head h's output
+        // channel h*HeadDim + d in the concat above) gates the attention
+        // output: attn := attn * sigmoid(gate) BEFORE o_proj (HF
+        // Qwen3_5Attention). TNNetCellMulByCell is the PER-TOKEN elementwise
+        // product (a channel-broadcast mul would be wrong - proven in
+        // TestQwen35AttnOutputGateWiring).
+        if Config.AttnOutputGate then
+        begin
+          NN.AddLayerAfter( TNNetSplitChannels.Create(QWidth, QWidth),
+            Blocks[BlockCnt].QProj );
+          NN.AddLayer( TNNetSigmoid.Create() );
+          NN.AddLayer( TNNetCellMulByCell.Create(AttnConcat,
+            NN.GetLastLayer()) );
+        end;
         // Config.BitNetSubLN (BitNet b1.58): the attn_sub_norm RMSNorm sits on
         // the concatenated head outputs BEFORE o_proj (HF BitNetAttention:
         // attn_output = attn_sub_norm(attn_output); o_proj(attn_output)) - the
@@ -15477,6 +16043,7 @@ begin
             NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
         Blocks[BlockCnt].OProj := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
+        end; // full-attention branch (vs the Qwen3.5 DeltaNet mixer above)
         // Config.SandwichNorm (Gemma-2) / Config.PostNormReordered (OLMo-2):
         // post-attention RMSNorm INSIDE the residual branch (HF
         // post_attention_layernorm normalizes the attention output BEFORE
@@ -15743,6 +16310,14 @@ begin
             NormGainOffset);
           MarkConsumed(BlockPrefix + 'input_layernorm.weight');
         end;
+        // Qwen3.5 hybrid: a linear_attention layer carries the linear_attn.*
+        // tensor set (in_proj_qkv/z/b/a, conv1d, A_log, dt_bias, norm,
+        // out_proj) instead of self_attn.*.
+        if LlamaLayerIsLinearAttn(Config, BlockCnt) then
+          LoadQwen35DeltaNetWeights(Reader, Blocks[BlockCnt], BlockPrefix,
+            Config, Consumed)
+        else
+        begin
         // q_proj/k_proj rows are PERMUTED per head for the rotate_half
         // convention (RotaryHeadDim); v_proj/o_proj load straight.
         // Config.QKVBias (Qwen2) loads q/k/v biases too - permuted along
@@ -15790,12 +16365,47 @@ begin
             RotaryHeadDimArg := 0
           else
             RotaryHeadDimArg := HeadDim;
-          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
-            BlockPrefix + 'self_attn.q_proj.weight',
-            Config.HiddenSize, QWidth, 0, -1, RotaryHeadDimArg, QBiasName,
-            QProjScale);
-          MarkConsumed(BlockPrefix + 'self_attn.q_proj.weight');
-          if QBiasName <> '' then MarkConsumed(QBiasName);
+          if Config.AttnOutputGate then
+          begin
+            // Qwen3.5 DOUBLE-width q_proj [2*num_heads*head_dim, hidden],
+            // PER-HEAD interleaved [query(Dh) | gate(Dh)] rows (HF chunks
+            // q_proj.view(-1, head_dim*2) in halves). Per head h, one slab
+            // slice per half (SrcRowBase/SrcRows):
+            //   query rows h*2Dh..h*2Dh+Dh-1  -> neurons h*Dh.. (with the
+            //     standard rotate_half permutation RESTRICTED to the
+            //     RotaryDims rotary slice - the qwen3 q-row path);
+            //   gate rows h*2Dh+Dh..(h+1)*2Dh-1 -> neurons QWidth + h*Dh..
+            //     STRAIGHT (no rotary permutation - the gate multiplies the
+            //     attention output, which lives in HF channel order).
+            TensorNameStr := BlockPrefix + 'self_attn.q_proj.weight';
+            for d := 0 to NumHeadsM1 do
+            begin
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+                TensorNameStr, Config.HiddenSize, HeadDim,
+                {NeuronBase=}d * HeadDim, {ExpectedNeurons=}2 * QWidth,
+                {RotaryHeadDim=}RotaryHeadDimArg, {BiasName=}'',
+                {Scale=}QProjScale, {RotaryDims=}RotaryDims,
+                {SrcRowBase=}d * 2 * HeadDim, {SrcRows=}2 * QWidth);
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+                TensorNameStr, Config.HiddenSize, HeadDim,
+                {NeuronBase=}QWidth + d * HeadDim,
+                {ExpectedNeurons=}2 * QWidth,
+                {RotaryHeadDim=}0, {BiasName=}'', {Scale=}1.0,
+                {RotaryDims=}0,
+                {SrcRowBase=}d * 2 * HeadDim + HeadDim,
+                {SrcRows=}2 * QWidth);
+            end;
+            MarkConsumed(TensorNameStr);
+          end
+          else
+          begin
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+              BlockPrefix + 'self_attn.q_proj.weight',
+              Config.HiddenSize, QWidth, 0, -1, RotaryHeadDimArg, QBiasName,
+              QProjScale, RotaryDims);
+            MarkConsumed(BlockPrefix + 'self_attn.q_proj.weight');
+            if QBiasName <> '' then MarkConsumed(QBiasName);
+          end;
           // Qwen3/Gemma-3 per-head q/k RMSNorm: one shared [head_dim] gain
           // per block, copied into every per-head norm (rotate_half-permuted
           // to match the permuted q/k channel order). Gemma-3's zero-centered
@@ -15804,13 +16414,16 @@ begin
           // above - a W_q fold would be erased by the norm).
           if Config.QKNorm then
           begin
+            // RotaryDims (Qwen3.5 partial rotary) restricts the gain
+            // permutation to the rotary slice, matching the q/k ROW loads;
+            // full-rotary families pass RotaryDims = HeadDim (identity).
             LoadLlamaHeadRMSNormWeights(Reader, Blocks[BlockCnt].QNorms,
               BlockPrefix + 'self_attn.q_norm.weight', HeadDim,
-              NormGainOffset, QScale);
+              NormGainOffset, QScale, RotaryDims);
             MarkConsumed(BlockPrefix + 'self_attn.q_norm.weight');
             LoadLlamaHeadRMSNormWeights(Reader, Blocks[BlockCnt].KNorms,
               BlockPrefix + 'self_attn.k_norm.weight', HeadDim,
-              NormGainOffset);
+              NormGainOffset, 1.0, RotaryDims);
             MarkConsumed(BlockPrefix + 'self_attn.k_norm.weight');
           end;
           // OLMo-2 full-width q/k RMSNorm: ONE [num_heads*head_dim] /
@@ -15833,7 +16446,8 @@ begin
           end;
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
             BlockPrefix + 'self_attn.k_proj.weight',
-            Config.HiddenSize, KVWidth, 0, -1, RotaryHeadDimArg, KBiasName);
+            Config.HiddenSize, KVWidth, 0, -1, RotaryHeadDimArg, KBiasName,
+            1.0, RotaryDims);
           MarkConsumed(BlockPrefix + 'self_attn.k_proj.weight');
           if KBiasName <> '' then MarkConsumed(KBiasName);
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
@@ -15849,6 +16463,7 @@ begin
           BlockPrefix + 'self_attn.o_proj.weight',
           QWidth, Config.HiddenSize, 0, -1, 0, '', Config.ResidualMultiplier);
         MarkConsumed(BlockPrefix + 'self_attn.o_proj.weight');
+        end; // full-attention tensor set (vs the Qwen3.5 linear_attn.* above)
         if Config.GLM4SandwichNorm then
         begin
           // GLM-4 four-norm sandwich (same WIRING as Gemma-2's sandwich,
@@ -15942,6 +16557,43 @@ begin
           // loads into neurons 0..I-1 and the GATE half into neurons I..2I-1.
           if Config.MoEIntermediateSize > 0 then i := Config.MoEIntermediateSize
           else i := Config.IntermediateSize;
+          if Config.MoEQwen35FusedExperts then
+          begin
+            // Qwen3.5-MoE: granitemoe's FUSED 3-D slab LAYOUT verbatim
+            // ([E, 2I, H] gate rows then up, [E, H, I] down, [E, H] router)
+            // under the Qwen3.5 names - the SAME loader, names overridden.
+            LoadGraniteMoEExperts(Reader, Blocks[BlockCnt], BlockPrefix,
+              Config.NumLocalExperts, Config.HiddenSize, i,
+              {ResidualScale=}1.0, Consumed,
+              BlockPrefix + 'mlp.experts.gate_up_proj',
+              BlockPrefix + 'mlp.experts.down_proj',
+              BlockPrefix + 'mlp.gate.weight');
+            // Always-on shared expert: SEPARATE 2-D SwiGLU projections
+            // (shared_expert.gate/up/down_proj) + the [1, hidden] sigmoid
+            // gate shared_expert_gate (see BuildMixtralMoEBranch).
+            TensorNameStr := BlockPrefix + 'mlp.shared_expert.';
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedGateUp,
+              TensorNameStr + 'up_proj.weight',
+              Config.HiddenSize, Config.SharedIntermediateSize,
+              0, 2 * Config.SharedIntermediateSize);
+            MarkConsumed(TensorNameStr + 'up_proj.weight');
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedGateUp,
+              TensorNameStr + 'gate_proj.weight',
+              Config.HiddenSize, Config.SharedIntermediateSize,
+              Config.SharedIntermediateSize,
+              2 * Config.SharedIntermediateSize);
+            MarkConsumed(TensorNameStr + 'gate_proj.weight');
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedDown,
+              TensorNameStr + 'down_proj.weight',
+              Config.SharedIntermediateSize, Config.HiddenSize);
+            MarkConsumed(TensorNameStr + 'down_proj.weight');
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedGate,
+              BlockPrefix + 'mlp.shared_expert_gate.weight',
+              Config.HiddenSize, 1);
+            MarkConsumed(BlockPrefix + 'mlp.shared_expert_gate.weight');
+            if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+            continue;
+          end;
           if Config.MoEGateUpTransposed then
           begin
             // Llama-4: TRANSPOSED fused 3-D expert slabs (gate_up_proj
@@ -16142,6 +16794,17 @@ begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
         if Pos('rotary_emb.inv_freq', TensorNameStr) > 0 then continue;
+        // Qwen3.5 / Qwen3.6 multimodal checkpoints: the vision tower
+        // (model.visual.*) and the multi-token-prediction head (mtp.*) are
+        // OUT OF SCOPE for the text decoder - HF's ForCausalLM route
+        // ignores them too (_keys_to_ignore_on_load_unexpected), so they
+        // are SKIPPED here, not errors.
+        if ((Config.ModelType = 'qwen3_5') or
+            (Config.ModelType = 'qwen3_5_moe')) and
+           ((Pos('model.visual.', TensorNameStr) = 1) or
+            (Pos('visual.', TensorNameStr) = 1) or
+            (Pos('model.mtp.', TensorNameStr) = 1) or
+            (Pos('mtp.', TensorNameStr) = 1)) then continue;
         ImportError('Llama import: unexpected tensor "' + TensorNameStr +
           '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
           ') in ' + FileName + ' - refusing a partial import.');
@@ -25953,6 +26616,44 @@ var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildQwen3MoeFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pTrainable, '', pQuantizeInt8);
+end;
+
+function BuildQwen35FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pTrainable: boolean = true;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+begin
+  Result := BuildLlamaFamilyFromSafeTensors(FileName, 'qwen3_5', Config,
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
+end;
+
+function BuildQwen35FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildQwen35FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pTrainable, '', pQuantizeInt8);
+end;
+
+function BuildQwen35MoeFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pTrainable: boolean = true;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+begin
+  Result := BuildLlamaFamilyFromSafeTensors(FileName, 'qwen3_5_moe', Config,
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
+end;
+
+function BuildQwen35MoeFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildQwen35MoeFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pTrainable, '', pQuantizeInt8);
 end;
 
@@ -76520,6 +77221,7 @@ begin
   else if (ModelType = 'llama') or (ModelType = 'mistral') or
           (ModelType = 'qwen2') or (ModelType = 'qwen3') or
           (ModelType = 'qwen3_moe') or
+          (ModelType = 'qwen3_5') or (ModelType = 'qwen3_5_moe') or
           (ModelType = 'gemma') or (ModelType = 'gemma2') or
           (ModelType = 'gemma3_text') or (ModelType = 'phi3') or
           (ModelType = 'olmo2') or (ModelType = 'olmoe') or
@@ -76553,6 +77255,13 @@ begin
     // (["GraniteMoeForCausalLM"]) raise the four Granite scalar multipliers
     // (embedding / residual / attention / logits), all load-time folds; the
     // MoE variant adds the fused 3-D expert slab.
+    // 'qwen3_5' (["Qwen3_5ForConditionalGeneration"], Qwen3.6-27B) /
+    // 'qwen3_5_moe' (["Qwen3_5MoeForConditionalGeneration"],
+    // Qwen3.6-35B-A3B) raise the hybrid layer_types stack (gated-DeltaNet
+    // "linear_attention" mixers interleaved with output-gated partial-rotary
+    // full attention) plus - for the MoE variant - the fused-expert +
+    // gated-shared-expert sparse FFN; the vision tower and MTP head are
+    // skipped (TEXT decoder only). See BuildQwen35FromSafeTensorsEx.
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
       pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if (ModelType = 'bert') or (ModelType = 'distilbert') or
