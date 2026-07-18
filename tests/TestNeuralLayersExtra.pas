@@ -150,6 +150,9 @@ type
     procedure TestDetectAnomalyForwardCatchesNaN;
     procedure TestDetectAnomalyBackwardCatchesNaN;
     procedure TestDetectAnomalyOffDoesNotRaise;
+
+    // Qwen3.5 attention output gate wiring proof: slice | sigmoid | cell-mul
+    procedure TestQwen35AttnOutputGateWiring;
   end;
 
 implementation
@@ -7029,6 +7032,116 @@ begin
   finally
     Probe.Free;
     NN.Free;
+  end;
+end;
+
+// Proof-of-wiring for the Qwen3.5/3.6 FULL-ATTENTION output gate. The HF
+// q_proj is DOUBLE width (out_features = num_heads * head_dim * 2) and its
+// flat output is PER-HEAD interleaved: [h0_query | h0_gate | h1_query |
+// h1_gate | ...]. After attention (before o_proj) HF computes
+//   attn_output := attn_output * sigmoid(gate)
+// where the gate comes from the SAME timestep's q_proj output (it does NOT
+// pass through attention). HF hard-codes sigmoid even though the 27B config
+// advertises output_gate_type "swish" (dead config field).
+//
+// The importer is expected to PERMUTE the q_proj rows at load time so that
+// query occupies channels [0..H*Dh) and gate occupies [H*Dh..2*H*Dh)
+// contiguously; the runtime graph is then two contiguous TNNetSplitChannels
+// slices + TNNetSigmoid + TNNetCellMulByCell (element-wise, so the gate is
+// applied PER TOKEN POSITION - TNNetChannelMulByLayer would wrongly broadcast
+// one gate over every position). This test builds that exact runtime graph on
+// a 3-token sequence (tokens on X, channels on depth, 2 heads * head_dim 2)
+// and checks every cell against a hand-computed x * sigmoid(g) reference. A
+// second pass proves the NO-permutation fallback: the arbitrary-channel-list
+// constructor TNNetSplitChannels.Create(pChannels) selecting the interleaved
+// HF gate channels directly must produce the same gated output.
+procedure TTestNeuralLayersExtra.TestQwen35AttnOutputGateWiring;
+const
+  Heads = 2; HeadDim = 2; C = Heads * HeadDim; // query width
+  T = 3;                                       // tokens (X axis)
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  InputLayer, QuerySlice, GateSlice, GateSig, Gated: TNNetLayer;
+  X, D, HFChan: integer;
+  QVal, GVal, Expected: TNeuralFloat;
+  StridedChannels: array [0..C - 1] of integer;
+  Head, DimInHead: integer;
+begin
+  // ---- pass 1: post-permutation layout (query slab | gate slab) ----
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(T, 1, 2 * C);
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(T, 1, 2 * C));
+    QuerySlice := NN.AddLayer(TNNetSplitChannels.Create(0, C));
+    GateSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(C, C), InputLayer);
+    GateSig := NN.AddLayer(TNNetSigmoid.Create());
+    Gated := NN.AddLayer(TNNetCellMulByCell.Create(QuerySlice, GateSig));
+
+    // distinct value per (token, channel) so a broadcast-over-positions bug
+    // or a channel-offset bug cannot cancel out
+    for X := 0 to T - 1 do
+      for D := 0 to 2 * C - 1 do
+        Input[X, 0, D] := 0.25 * (X + 1) - 0.1 * D;
+    NN.Compute(Input);
+
+    AssertEquals('gated output keeps token count', T, Gated.Output.SizeX);
+    AssertEquals('gated output keeps query width', C, Gated.Output.Depth);
+    for X := 0 to T - 1 do
+      for D := 0 to C - 1 do
+      begin
+        QVal := Input[X, 0, D];
+        GVal := Input[X, 0, C + D];
+        Expected := QVal * (1.0 / (1.0 + Exp(-GVal)));
+        AssertEquals('x*sigmoid(g) at token ' + IntToStr(X) +
+          ' channel ' + IntToStr(D), Expected, Gated.Output[X, 0, D], 1e-5);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+
+  // ---- pass 2: strided fallback on the RAW per-head interleaved layout ----
+  // HF flat channel r: head h = r div (2*Dh), offset o = r mod (2*Dh);
+  // o < Dh -> query, else gate. Select both halves with channel lists.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(T, 1, 2 * C);
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(T, 1, 2 * C));
+    for Head := 0 to Heads - 1 do
+      for DimInHead := 0 to HeadDim - 1 do
+        StridedChannels[Head * HeadDim + DimInHead] :=
+          Head * (2 * HeadDim) + DimInHead; // query channels
+    QuerySlice := NN.AddLayer(TNNetSplitChannels.Create(StridedChannels));
+    for Head := 0 to Heads - 1 do
+      for DimInHead := 0 to HeadDim - 1 do
+        StridedChannels[Head * HeadDim + DimInHead] :=
+          Head * (2 * HeadDim) + HeadDim + DimInHead; // gate channels
+    GateSlice := NN.AddLayerAfter(
+      TNNetSplitChannels.Create(StridedChannels), InputLayer);
+    GateSig := NN.AddLayer(TNNetSigmoid.Create());
+    Gated := NN.AddLayer(TNNetCellMulByCell.Create(QuerySlice, GateSig));
+
+    for X := 0 to T - 1 do
+      for D := 0 to 2 * C - 1 do
+        Input[X, 0, D] := 0.25 * (X + 1) - 0.1 * D;
+    NN.Compute(Input);
+
+    for X := 0 to T - 1 do
+      for D := 0 to C - 1 do
+      begin
+        Head := D div HeadDim;
+        DimInHead := D mod HeadDim;
+        HFChan := Head * (2 * HeadDim) + DimInHead;
+        QVal := Input[X, 0, HFChan];
+        GVal := Input[X, 0, HFChan + HeadDim];
+        Expected := QVal * (1.0 / (1.0 + Exp(-GVal)));
+        AssertEquals('strided x*sigmoid(g) at token ' + IntToStr(X) +
+          ' channel ' + IntToStr(D), Expected, Gated.Output[X, 0, D], 1e-5);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 

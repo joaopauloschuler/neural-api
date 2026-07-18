@@ -2,7 +2,7 @@
 
 A terminal chat program for the generic model importer dispatch
 (`BuildFromPretrained` in `neural/neuralpretrained.pas`). It supports: qwen2, qwen2.5, qwen3,
-qwen3_moe, mamba, gpt2, llama, mistral, phi3, olmoe (see the
+qwen3_moe, qwen3_5, mamba, gpt2, llama, mistral, phi3, olmoe (see the
 tested-models list below).
 It is planned (coded) to support: mixtral,
 gemma/2/3, recurrent_gemma, phi, gpt_oss, gpt_neo(x), gptj,
@@ -30,6 +30,7 @@ These models have been run/verified through this REPL:
 | Qwen/Qwen2.5-{0.5B,1.5B,3B,7B,14B,32B}-Instruct | qwen2 |
 | Qwen/Qwen3-0.6B | qwen3 |
 | Qwen/Qwen3-30B-A3B-Thinking-2507 | qwen3_moe |
+| Qwen/Qwen3.6-27B | qwen3_5 |
 | TinyLlama/TinyLlama-1.1B-Chat-v1.0 | llama |
 | mistralai/Mistral-7B-Instruct-v0.3 | mistral |
 | HuggingFaceTB/SmolLM2-1.7B-Instruct | llama |

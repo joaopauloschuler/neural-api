@@ -530,6 +530,9 @@ begin
     // QAT fake-quant: non-default qmax/momentum/running-stat/frozen so all four
     // packed FStruct/FFloatSt slots are exercised by the structure round-trip.
     376: begin AddImgInput(ANet); Exit(L('TNNetFakeQuantize', TNNetFakeQuantize.Create(63, 0.95, 1.25, 1))); end;
+    // GatedDeltaNet expects input depth 2*Hk*Dk + 2*Hv*Dv + 2*Hv ([q|k|v|z|b|a]).
+    // With (Hk=2, Hv=4, Dk=4, Dv=4): 2*8 + 2*16 + 8 = 56.
+    377: begin ANet.AddLayer(TNNetInput.Create(8, 1, 56, 1)); Exit(L('TNNetGatedDeltaNet', TNNetGatedDeltaNet.Create(2, 4, 4, 4))); end;
     else
       Result := False;
   end;

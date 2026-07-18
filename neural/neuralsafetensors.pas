@@ -34,7 +34,8 @@ unit neuralsafetensors;
 interface
 
 uses
-  Classes, SysUtils, fpjson, jsonparser, neuralvolume, neuralnetwork;
+  Classes, SysUtils, fpjson, jsonparser, neuralvolume, neuralnetwork,
+  neuralthread;
 
 type
   ESafeTensorsError = class(Exception);
@@ -65,10 +66,30 @@ type
     FDataStarts: array of Int64; // per shard: absolute offset of data section
     FDataSizes: array of Int64;  // per shard: byte length of data section
     FTensors: array of TSafeTensorInfo;
+    // In-flight state of one parallel F16/BF16 decode (DecodeHalfBuffer):
+    // the shared neuralthread pool splits FParDecodeCount elements among
+    // its workers via DecodeHalfJob. Valid only inside a DecodeHalfBuffer
+    // call; a reader is not usable from two threads at once anyway (the
+    // shard streams are shared/positioned), so one in-flight decode per
+    // reader is the existing contract. Coded by Claude (AI).
+    FParDecodeSrc: PWord;
+    FParDecodeDst: PSingle;
+    FParDecodeCount: integer;
+    FParDecodeBF16: boolean;
     function FindTensor(const pName: string): integer;
     // Allocates WITHOUT parsing anything - the subclass constructor fills
     // the fields itself (Create(pFileName) would parse as safetensors).
     constructor CreateBare;
+    procedure DecodeHalfJob(index, threadnum: integer);
+    // Decodes Count F16 (IsBF16=false) or BF16 (IsBF16=true) words at Src
+    // into singles at Dst - the hot loop of every checkpoint load. Large
+    // buffers fan out over the shared neuralthread pool (element ranges are
+    // disjoint, so the parallel result is bit-identical to the serial one);
+    // small buffers decode inline. The caller's sequential ReadBuffer stays
+    // on the calling thread, preserving the strictly sequential disk access
+    // pattern. Coded by Claude (AI).
+    procedure DecodeHalfBuffer(Src: PWord; Dst: PSingle; Count: integer;
+      IsBF16: boolean);
   private
     // Opens one .safetensors file, validates and parses its header and
     // appends its tensors (tagged with the new shard index) to FTensors.
@@ -799,14 +820,85 @@ begin
   Result := Result + ']';
 end;
 
+procedure TNNetSafeTensorsReader.DecodeHalfJob(index, threadnum: integer);
+var
+  StartPos, FinishPos, i: integer;
+  WordPtr: PWord;
+  DstPtr: PSingle;
+begin
+  TNeuralThreadList.CalculateWorkingRange(index, threadnum, FParDecodeCount,
+    StartPos, FinishPos);
+  if FinishPos < StartPos then exit;
+  WordPtr := FParDecodeSrc;
+  Inc(WordPtr, StartPos);
+  DstPtr := FParDecodeDst;
+  Inc(DstPtr, StartPos);
+  if FParDecodeBF16 then
+  begin
+    for i := StartPos to FinishPos do
+    begin
+      DstPtr^ := DecodeBF16(WordPtr^);
+      Inc(WordPtr);
+      Inc(DstPtr);
+    end;
+  end
+  else
+  begin
+    for i := StartPos to FinishPos do
+    begin
+      DstPtr^ := DecodeF16(WordPtr^);
+      Inc(WordPtr);
+      Inc(DstPtr);
+    end;
+  end;
+end;
+
+procedure TNNetSafeTensorsReader.DecodeHalfBuffer(Src: PWord; Dst: PSingle;
+  Count: integer; IsBF16: boolean);
+const
+  // Below this the pool dispatch costs more than it saves (a 256K-element
+  // fan-out is ~0.5 MB of raw halves - well past the crossover).
+  cParallelDecodeMinElements = 256 * 1024;
+var
+  i: integer;
+begin
+  if (Count >= cParallelDecodeMinElements) and
+     (NeuralDefaultThreadCount > 1) then
+  begin
+    CreateNeuralThreadListIfRequired();
+    FParDecodeSrc := Src;
+    FParDecodeDst := Dst;
+    FParDecodeCount := Count;
+    FParDecodeBF16 := IsBF16;
+    fNTL.StartProc({$IFDEF FPC}@DecodeHalfJob{$ELSE}DecodeHalfJob{$ENDIF});
+    exit;
+  end;
+  if IsBF16 then
+  begin
+    for i := 1 to Count do
+    begin
+      Dst^ := DecodeBF16(Src^);
+      Inc(Src);
+      Inc(Dst);
+    end;
+  end
+  else
+  begin
+    for i := 1 to Count do
+    begin
+      Dst^ := DecodeF16(Src^);
+      Inc(Src);
+      Inc(Dst);
+    end;
+  end;
+end;
+
 procedure TNNetSafeTensorsReader.LoadTensorFlat(const pName: string;
   Dest: TNNetVolume);
 var
   Info: TSafeTensorInfo;
   NumElements, i, MaxIdx: Int64;
   RawBytes: TBytes;
-  WordPtr: PWord;
-  SinglePtr: PSingle;
   Int64Ptr: PInt64;
 begin
   Info := GetInfo(pName);
@@ -826,32 +918,12 @@ begin
   FStreams[Info.Shard].Position := FDataStarts[Info.Shard] + Info.DataBegin;
   FStreams[Info.Shard].ReadBuffer(RawBytes[0], Length(RawBytes));
   if Info.DType = 'F32' then
-  begin
-    SinglePtr := PSingle(@RawBytes[0]);
-    for i := 0 to MaxIdx do
-    begin
-      Dest.FData[i] := SinglePtr^;
-      Inc(SinglePtr);
-    end;
-  end
-  else if Info.DType = 'F16' then
-  begin
-    WordPtr := PWord(@RawBytes[0]);
-    for i := 0 to MaxIdx do
-    begin
-      Dest.FData[i] := DecodeF16(WordPtr^);
-      Inc(WordPtr);
-    end;
-  end
-  else if Info.DType = 'BF16' then
-  begin
-    WordPtr := PWord(@RawBytes[0]);
-    for i := 0 to MaxIdx do
-    begin
-      Dest.FData[i] := DecodeBF16(WordPtr^);
-      Inc(WordPtr);
-    end;
-  end
+    // TNeuralFloat = single, so the stored bytes ARE the destination format
+    // (both little-endian, like every existing decode path assumes).
+    Move(RawBytes[0], Dest.FData[0], NumElements * SizeOf(Single))
+  else if (Info.DType = 'F16') or (Info.DType = 'BF16') then
+    DecodeHalfBuffer(PWord(@RawBytes[0]), PSingle(@Dest.FData[0]),
+      integer(NumElements), Info.DType = 'BF16')
   else // I64
   begin
     Int64Ptr := PInt64(@RawBytes[0]);
@@ -876,11 +948,9 @@ procedure TNNetSafeTensorsReader.LoadTensorRowsFlat(const pName: string;
   FirstRow, RowCount, RowSize: integer; Dest: TNNetVolume);
 var
   Info: TSafeTensorInfo;
-  NumElements, ElemBegin, ElemCount, i, MaxIdx: Int64;
+  NumElements, ElemBegin, ElemCount: Int64;
   DSize: integer;
   RawBytes: TBytes;
-  WordPtr: PWord;
-  SinglePtr: PSingle;
 begin
   Info := GetInfo(pName);
   if (Info.DType <> 'F32') and (Info.DType <> 'F16') and
@@ -903,38 +973,16 @@ begin
   ElemBegin := Int64(FirstRow) * RowSize;
   DSize := DTypeByteSize(Info.DType);
   Dest.ReSize(integer(ElemCount), 1, 1);
-  MaxIdx := ElemCount - 1;
   SetLength(RawBytes, ElemCount * DSize);
   FStreams[Info.Shard].Position := FDataStarts[Info.Shard] +
     Info.DataBegin + ElemBegin * DSize;
   FStreams[Info.Shard].ReadBuffer(RawBytes[0], Length(RawBytes));
   if Info.DType = 'F32' then
-  begin
-    SinglePtr := PSingle(@RawBytes[0]);
-    for i := 0 to MaxIdx do
-    begin
-      Dest.FData[i] := SinglePtr^;
-      Inc(SinglePtr);
-    end;
-  end
-  else if Info.DType = 'F16' then
-  begin
-    WordPtr := PWord(@RawBytes[0]);
-    for i := 0 to MaxIdx do
-    begin
-      Dest.FData[i] := DecodeF16(WordPtr^);
-      Inc(WordPtr);
-    end;
-  end
-  else // BF16
-  begin
-    WordPtr := PWord(@RawBytes[0]);
-    for i := 0 to MaxIdx do
-    begin
-      Dest.FData[i] := DecodeBF16(WordPtr^);
-      Inc(WordPtr);
-    end;
-  end;
+    // TNeuralFloat = single: raw bytes are already the destination format.
+    Move(RawBytes[0], Dest.FData[0], ElemCount * SizeOf(Single))
+  else // F16 / BF16 (dtype-checked above)
+    DecodeHalfBuffer(PWord(@RawBytes[0]), PSingle(@Dest.FData[0]),
+      integer(ElemCount), Info.DType = 'BF16');
 end;
 
 procedure TNNetSafeTensorsReader.LoadTensorRawBytes(const pName: string;

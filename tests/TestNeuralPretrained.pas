@@ -125,6 +125,7 @@ type
     procedure TestReaderReadsTinyFixture;
     procedure TestSafeTensorsWriterRoundTrip;
     procedure TestSafeTensorsWriterF16BF16RoundTrip;
+    procedure TestParallelHalfDecodeParity;
     procedure TestSafeTensorsWriterRejectsBadInput;
     procedure TestSaveLoadNNetToSafeTensors;
     procedure TestSaveLoadNNetToSafeTensorsF16;
@@ -219,6 +220,9 @@ type
     procedure TestLlama4LogitParity;
     procedure TestLlama4MoeLogitParity;
     procedure TestQwen3MoeWindowLogitParity;
+    procedure TestQwen35LogitParity;
+    procedure TestQwen35StreamedDecodeParity;
+    procedure TestQwen35MoeLogitParity;
     procedure TestGptOssLogitParity;
     procedure TestGptOssMXFP4LogitParity;
     procedure TestGemmaLogitParity;
@@ -1595,6 +1599,96 @@ begin
     Sidecar.SaveToFile(SidecarPath);
   finally
     Sidecar.Free;
+  end;
+end;
+
+// The F16/BF16 decode of LoadTensorFlat/LoadTensorRowsFlat fans out over
+// the shared neuralthread pool above 256K elements (DecodeHalfBuffer).
+// This test forces that branch with a 600x500 = 300000-element tensor in
+// both half dtypes and asserts the loaded values are BIT-identical to the
+// scalar DecodeF16/DecodeBF16 reference - range-partitioned decode must
+// not change a single element. A 530-row LoadTensorRowsFlat slice
+// (265000 elements, also above the threshold) checks the offset math of
+// the row-streamed variant against the same reference. On a single-core
+// host the parallel branch degrades to the inline loop and the assertions
+// still hold. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestParallelHalfDecodeParity;
+const
+  cRows = 600;
+  cCols = 500;
+  cCount = cRows * cCols;
+  cSliceFirstRow = 37;
+  cSliceRows = 530;
+var
+  Path: string;
+  Writer: TNNetSafeTensorsWriter;
+  Reader: TNNetSafeTensorsReader;
+  Src, Dst: TNNetVolume;
+  i, Mismatches: integer;
+  Expected: single;
+
+  function Value(pElement: integer): single;
+  begin
+    // Deterministic spread of magnitudes and signs; inexact in both half
+    // formats so the decode rounding is genuinely exercised.
+    Result := Sin(pElement * 0.001) * 3.7 + (pElement mod 97) * 0.013 - 0.6;
+  end;
+
+begin
+  Path := GetTempDir(false) + 'cai_st_parallel_decode.safetensors';
+  Src := TNNetVolume.Create;
+  Dst := TNNetVolume.Create;
+  Reader := nil;
+  try
+    Src.ReSize(cCount, 1, 1);
+    for i := 0 to cCount - 1 do
+      Src.FData[i] := Value(i);
+    Writer := TNNetSafeTensorsWriter.Create(Path);
+    try
+      Writer.AddTensorFlat('par.f16', [cRows, cCols], Src, stwF16);
+      Writer.AddTensorFlat('par.bf16', [cRows, cCols], Src, stwBF16);
+      Writer.SaveToFile;
+    finally
+      Writer.Free;
+    end;
+
+    Reader := TNNetSafeTensorsReader.Create(Path);
+
+    Reader.LoadTensorFlat('par.f16', Dst);
+    AssertEquals('f16 flat size', cCount, Dst.Size);
+    Mismatches := 0;
+    for i := 0 to cCount - 1 do
+    begin
+      Expected := DecodeF16(EncodeF16(Value(i)));
+      if Dst.FData[i] <> Expected then Inc(Mismatches);
+    end;
+    AssertEquals('f16 flat parallel decode mismatches', 0, Mismatches);
+
+    Reader.LoadTensorFlat('par.bf16', Dst);
+    AssertEquals('bf16 flat size', cCount, Dst.Size);
+    Mismatches := 0;
+    for i := 0 to cCount - 1 do
+    begin
+      Expected := DecodeBF16(EncodeBF16(Value(i)));
+      if Dst.FData[i] <> Expected then Inc(Mismatches);
+    end;
+    AssertEquals('bf16 flat parallel decode mismatches', 0, Mismatches);
+
+    Reader.LoadTensorRowsFlat('par.bf16', cSliceFirstRow, cSliceRows,
+      cCols, Dst);
+    AssertEquals('bf16 slice size', cSliceRows * cCols, Dst.Size);
+    Mismatches := 0;
+    for i := 0 to cSliceRows * cCols - 1 do
+    begin
+      Expected := DecodeBF16(EncodeBF16(Value(cSliceFirstRow * cCols + i)));
+      if Dst.FData[i] <> Expected then Inc(Mismatches);
+    end;
+    AssertEquals('bf16 row-slice parallel decode mismatches', 0, Mismatches);
+  finally
+    Reader.Free;
+    Dst.Free;
+    Src.Free;
+    DeleteFile(Path);
   end;
 end;
 
@@ -7841,6 +7935,228 @@ begin
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_qwen3_moe_window_logits.json'), Config.MaxPositions,
       Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the Qwen3.5/3.6 DENSE hybrid import (HF model_type "qwen3_5",
+// architectures ["Qwen3_5ForConditionalGeneration"], e.g. Qwen3.6-27B):
+// tests/fixtures/tiny_qwen3_5.* is a pico randomly-initialized
+// Qwen3_5ForCausalLM (8 layers covering the (L L L F) layer_types pattern
+// TWICE, hidden 8, 2 heads / 1 kv head, DECOUPLED head_dim 8 with PARTIAL
+// rotary 0.25 -> rotary_dim 2, DeltaNet Hk=2/Hv=4/Dk=Dv=4/conv-4) whose
+// safetensors mimics the REAL multimodal layout: text backbone under
+// "model.language_model.", top-level lm_head, PLUS dummy model.visual.* and
+// mtp.* tensors the importer must SKIP (their presence makes this the
+// negative skip test - an unskipped key raises "unexpected tensor"). The
+// config nests the text fields under "text_config". The generator
+// tools/qwen3_5_tiny_fixture.py ASSERTS the attention output gate and the
+// PLAIN (non-zero-centered) DeltaNet norm gain both move the logits, so the
+// float64 HF oracle genuinely pins both quirks. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35LogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+  LayerCnt, DeltaCnt, ConvCnt, SDPACnt, SigmoidCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5.safetensors'),
+    Config, {SeqLen=}0, {pTrainable=}true,
+    FixturePath('tiny_qwen3_5_config.json'));
+  try
+    AssertEquals('model_type', 'qwen3_5', Config.ModelType);
+    AssertEquals('layers', 8, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('kv_heads', 1, Config.NumKVHeads);
+    AssertEquals('head_dim', 8, Config.HeadDim);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertTrue('qk_norm', Config.QKNorm);
+    AssertTrue('zero-centered norms', Config.RMSNormAddOne);
+    AssertTrue('attention output gate', Config.AttnOutputGate);
+    AssertEquals('partial rotary', 0.25, Config.PartialRotaryFactor, 1e-9);
+    AssertEquals('linear k heads', 2, Config.LinearNumKHeads);
+    AssertEquals('linear v heads', 4, Config.LinearNumVHeads);
+    AssertEquals('linear k dim', 4, Config.LinearKeyHeadDim);
+    AssertEquals('linear v dim', 4, Config.LinearValueHeadDim);
+    AssertEquals('conv kernel', 4, Config.LinearConvKernel);
+    AssertEquals('hybrid pattern length', 8,
+      Length(Config.LinearAttnLayers));
+    AssertTrue('layer 0 linear', Config.LinearAttnLayers[0]);
+    AssertFalse('layer 3 full', Config.LinearAttnLayers[3]);
+    AssertFalse('layer 7 full', Config.LinearAttnLayers[7]);
+    AssertFalse('untied', Config.TieWordEmbeddings);
+    AssertEquals('multimodal prefix', 'model.language_model.', Config.Prefix);
+    // Structure: one gated-DeltaNet + one depthwise conv per linear layer
+    // (6), one SDPA per head per full-attention layer (2 layers * 2 heads).
+    DeltaCnt := 0;
+    ConvCnt := 0;
+    SDPACnt := 0;
+    SigmoidCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetGatedDeltaNet then
+        Inc(DeltaCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetDepthwiseConv1D then
+        Inc(ConvCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+        Inc(SDPACnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetSigmoid then Inc(SigmoidCnt);
+    end;
+    AssertEquals('one DeltaNet per linear layer', 6, DeltaCnt);
+    AssertEquals('one depthwise conv per linear layer', 6, ConvCnt);
+    AssertEquals('one SDPA per head per full layer', 4, SDPACnt);
+    AssertEquals('one output-gate sigmoid per full layer', 2, SigmoidCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_qwen3_5_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "qwen3_5" onto the same path (and skip the visual/mtp tensors too).
+  NN := BuildFromPretrained(FixturePath('tiny_qwen3_5.safetensors'),
+    {SeqLen=}0, {pTrainable=}true,
+    FixturePath('tiny_qwen3_5_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_qwen3_5_logits.json'), 16, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Incremental-decode parity through the FULL Qwen3.5 hybrid stack: the same
+// fixture net built at SeqLen=1 and driven token-by-token through
+// TNNetStreamingDecoder (KV-cached SDPA + conv-state TNNetDepthwiseConv1D +
+// TNNetGatedDeltaNet recurrent state + RoPE PositionOffset) must reproduce
+// every position of the full-sequence forward. This pins the streaming path
+// the ChatTerminal decode driver uses. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35StreamedDecodeParity;
+const
+  SeqLen = 16;
+var
+  Full, Twin: TNNet;
+  ConfigFull, ConfigTwin: TLlamaConfig;
+  Session: TNNetStreamingDecoder;
+  FullIn, StepIn, FullOut: TNNetVolume;
+  StepOut: TNNetVolume;
+  T, V, Vocab: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5.safetensors'),
+    ConfigFull, {SeqLen=}0, {pTrainable=}true,
+    FixturePath('tiny_qwen3_5_config.json'));
+  Twin := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5.safetensors'),
+    ConfigTwin, {SeqLen=}1, {pTrainable=}true,
+    FixturePath('tiny_qwen3_5_config.json'));
+  Session := nil;
+  FullIn := TNNetVolume.Create(SeqLen, 1, 1);
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  FullOut := TNNetVolume.Create();
+  try
+    Vocab := ConfigFull.VocabSize;
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    AssertTrue('recurrent-state layers collected', Session.SSMCount > 0);
+    AssertTrue('attention layers collected', Session.SDPACount > 0);
+    for T := 0 to SeqLen - 1 do
+      FullIn.FData[T] := (5 * T + 2) mod Vocab;
+    Full.Compute(FullIn);
+    Full.GetOutput(FullOut);
+    Session.Reset();
+    for T := 0 to SeqLen - 1 do
+    begin
+      StepIn.FData[0] := FullIn.FData[T];
+      Session.StepForward(StepIn, T);
+      StepOut := Session.Output();
+      AssertEquals('streamed logits width at ' + IntToStr(T),
+        Vocab, StepOut.Size);
+      for V := 0 to Vocab - 1 do
+        AssertEquals('streamed logit pos ' + IntToStr(T) + ' tok ' +
+          IntToStr(V), FullOut.FData[T * Vocab + V], StepOut.FData[V], 2e-4);
+    end;
+  finally
+    FullOut.Free;
+    StepIn.Free;
+    FullIn.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// Verifies the Qwen3.5/3.6-MoE hybrid import (HF model_type "qwen3_5_moe",
+// architectures ["Qwen3_5MoeForConditionalGeneration"], e.g.
+// Qwen3.6-35B-A3B): tests/fixtures/tiny_qwen3_5_moe.* is a pico randomly
+// initialized Qwen3_5MoeForCausalLM (4 layers, one (L L L F) pattern, the
+// tiny_qwen3_5 geometry) whose EVERY MLP is the sparse block: softmax-all ->
+// top-2 ALWAYS-renormalized router, 4 experts stored FUSED 3-D
+// (mlp.experts.gate_up_proj [E,2I,H] gate-then-up / down_proj [E,H,I],
+// width 5) PLUS the always-on shared SwiGLU expert (DISTINCT width 6)
+// scaled by sigmoid(shared_expert_gate(x)) - the generator
+// tools/qwen3_5_moe_tiny_fixture.py ASSERTS the gate moves the logits. The
+// safetensors keeps the FLAT text-only "model." prefix; the config nests
+// under "text_config" (both fixtures pin the nesting parse).
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35MoeLogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+  LayerCnt, GateCnt, SwiGLUCnt, DeltaCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildQwen35MoeFromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5_moe.safetensors'),
+    Config, {SeqLen=}0, {pTrainable=}true,
+    FixturePath('tiny_qwen3_5_moe_config.json'));
+  try
+    AssertEquals('model_type', 'qwen3_5_moe', Config.ModelType);
+    AssertEquals('layers', 4, Config.NumLayers);
+    AssertTrue('is_moe', Config.IsMoE);
+    AssertTrue('fused qwen3_5 experts', Config.MoEQwen35FusedExperts);
+    AssertTrue('gated shared expert', Config.MoESharedExpertGate);
+    AssertTrue('renorm top-k hard-coded on', Config.MoENormTopK);
+    AssertEquals('num_experts', 4, Config.NumLocalExperts);
+    AssertEquals('num_experts_per_tok', 2, Config.MoEExpertsPerTok);
+    AssertEquals('moe_intermediate_size', 5, Config.MoEIntermediateSize);
+    AssertEquals('shared_expert_intermediate_size', 6,
+      Config.SharedIntermediateSize);
+    AssertTrue('attention output gate', Config.AttnOutputGate);
+    AssertEquals('flat prefix', 'model.', Config.Prefix);
+    // Structure: one top-k router per layer; per layer 4 routed SwiGLU
+    // experts + 1 shared SwiGLU; one DeltaNet per linear layer (3).
+    GateCnt := 0;
+    SwiGLUCnt := 0;
+    DeltaCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetTopKGate then Inc(GateCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetSwiGLU then Inc(SwiGLUCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetGatedDeltaNet then
+        Inc(DeltaCnt);
+    end;
+    AssertEquals('one top-k router gate per layer', Config.NumLayers,
+      GateCnt);
+    AssertEquals('routed + shared SwiGLU per layer',
+      (Config.NumLocalExperts + 1) * Config.NumLayers, SwiGLUCnt);
+    AssertEquals('one DeltaNet per linear layer', 3, DeltaCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_qwen3_5_moe_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "qwen3_5_moe" (read from the nested wrapper config) onto the same path.
+  NN := BuildFromPretrained(FixturePath('tiny_qwen3_5_moe.safetensors'),
+    {SeqLen=}0, {pTrainable=}true,
+    FixturePath('tiny_qwen3_5_moe_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_qwen3_5_moe_logits.json'), 16, 13);
   finally
     NN.Free;
   end;

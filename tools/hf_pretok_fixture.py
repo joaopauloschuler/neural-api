@@ -36,6 +36,11 @@ QWEN2_PATTERN = (
 CL100K_PATTERN = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}"
     r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+# Qwen3.5/3.6: the Qwen2 pattern with [\p{L}\p{M}]+ letter runs (combining
+# marks JOIN the letter run) and a \p{M}-excluding punct class.
+QWEN35_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}"
+    r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
 # o200k_base / GPT-4o family (gpt-4o, gpt-4o-mini, o1/o3). The canonical
 # tiktoken o200k_base pat_str, ported to the HF `tokenizers` Split form.
 O200K_PATTERN = (
@@ -139,7 +144,7 @@ def dump_cases(tok, texts, extra):
     return cases
 
 
-def build_split(name, pattern):
+def build_split(name, pattern, extra_corpus=(), cases=None):
     path = os.path.join(FIXDIR, name)
     if not os.path.exists(path):
         tok = Tokenizer(models.BPE())
@@ -153,10 +158,74 @@ def build_split(name, pattern):
         trainer = trainers.BpeTrainer(
             vocab_size=400, special_tokens=["<|endoftext|>", "<|im_end|>"],
             initial_alphabet=pre_tokenizers.ByteLevel.alphabet())
-        tok.train_from_iterator(CORPUS, trainer)
+        tok.train_from_iterator(CORPUS + list(extra_corpus), trainer)
         tok.save(path)
     tok = Tokenizer.from_file(path)  # verify (re)load
-    return path, dump_cases(tok, CASES, ["x<|im_end|>y"])
+    return path, dump_cases(tok, cases if cases is not None else CASES,
+                            ["x<|im_end|>y"])
+
+
+# Qwen3.5 marks-join corpus/cases: ASCII plus combining marks --
+# Devanagari consonants+vowel signs/virama, Hebrew niqqud, Arabic harakat,
+# and Latin + combining acute (incl. x+U+0301 which has NO precomposed NFC
+# form). The corpus makes the trainer learn merges that SPAN letter<->mark
+# boundaries, so a splitter that (incorrectly) isolates marks produces
+# different ids. The Bengali/Gujarati/Thai entries pin the real-vocab
+# fuzzing regressions found against the actual Qwen3.6-27B tokenizer: the
+# pattern's ANY-char letter-run prefix ([^\r\n\p{L}\p{N}]?, e.g. '?s' after
+# a Bengali letter) and exotic-script \p{N} digits (a space before Gujarati
+# U+0AE8 must stay a standalone token) -- both require the EXACT Unicode
+# category tables (neuralunicodeclasses.inc), not a major-script subset.
+QWEN35_MARK_CORPUS = [
+    ("\u0928\u092E\u0938\u094D\u0924\u0947 "      # namaste
+     "\u0926\u0941\u0928\u093F\u092F\u093E "      # duniya
+     "\u0928\u092E\u0938\u094D\u0924\u0947"),
+    ("\u0939\u093F\u0928\u094D\u0926\u0940 "      # hindi
+     "\u092E\u0947\u0902 "                       # mein
+     "\u0939\u0948"),                             # hai
+    ("\u05E9\u05B8\u05C1\u05DC\u05D5\u05B9\u05DD "  # shalom
+     "\u05E2\u05D5\u05B9\u05DC\u05B8\u05DD "        # olam
+     "\u05E9\u05B8\u05C1\u05DC\u05D5\u05B9\u05DD"),
+    ("\u0645\u064E\u0631\u0652\u062D\u064E\u0628\u064B\u0627 "  # marhaban
+     "\u0628\u0650\u0643\u064F\u0645\u0652"),                    # bikum
+    "combining x\u0301 y\u0301 x\u0301x\u0301 letters",
+    "cafe\u0301 re\u0301sume\u0301 cafe\u0301 naive",
+    # real-vocab regression material (see comment above): Bengali letters
+    # followed by ?s / !s (teaches the '?s'-spanning merge), Gujarati
+    # digits, Thai letters
+    "\u09aa?s \u0995?s ?s !s \u09aa?s ?s",
+    "\u09aa\u09be\u09a8\u09bf \u09aa\u09be\u09a8\u09bf \u0995\u09b2",
+    "\u0ae7\u0ae8\u0ae9 \u0ae8 \u0ae7\u0ae8\u0ae9",
+    "\u0e2a\u0e27\u0e31\u0e2a\u0e14\u0e35 \u0e44\u0e17\u0e22 "
+    "\u0e2a\u0e27\u0e31\u0e2a\u0e14\u0e35",
+]
+
+QWEN35_CASES = CASES + [
+    "\u0928\u092E\u0938\u094D\u0924\u0947",                     # namaste
+    ("\u0928\u092E\u0938\u094D\u0924\u0947 "
+     "\u0926\u0941\u0928\u093F\u092F\u093E"),
+    "\u0939\u093F\u0928\u094D\u0926\u0940 123 \u0939\u0948",
+    ("\u05E9\u05B8\u05C1\u05DC\u05D5\u05B9\u05DD "
+     "\u05E2\u05D5\u05B9\u05DC\u05B8\u05DD"),
+    ("\u0645\u064E\u0631\u0652\u062D\u064E\u0628\u064B\u0627 "
+     "\u0628\u0650\u0643\u064F\u0645\u0652"),
+    "x\u0301 marks x\u0301x\u0301 join",
+    "cafe\u0301 and re\u0301sume\u0301",
+    "\u0967\u0968\u0969 and \u0663\u0664\u0665",
+    "mark after punct !\u0301 ok",
+    "1\u0301 digit then mark",
+    # real-vocab fuzzing regressions (Qwen3.6-27B): any-char letter-run
+    # prefix after an exotic-script letter, exotic \p{N} after space,
+    # exotic-script letters next to ASCII
+    "\u09aa?s",                                  # Bengali PA + '?s'
+    "\u8e5f\u09aa?s",                            # CJK + Bengali + '?s'
+    "\u0995?s and !s",                           # Bengali KA + '?s'
+    " \u0ae8",                                   # space + Gujarati digit 2
+    "\t) \u0ae8",                                # tab, paren, space, digit
+    "\u0ae7\u0ae8\u0ae9 then 5\u0ae8",           # Gujarati digit runs
+    "\u0e2a\u0e27\u0e31\u0e2a\u0e14\u0e35 Thai", # Thai swasdee
+    "\u09aa\u09be\u09a8\u09bf water",            # Bengali pani + ASCII
+]
 
 
 # DeepSeek cases: ASCII letters/digits/punct, whitespace (incl tabs/CR/LF)
@@ -430,11 +499,37 @@ def build_metaspace_pretok():
                                          "hello<s>not first segment"])
 
 
+# Qwen3.5 ASCII-equivalence fixture: the EXACT qwen2 fixture model (same
+# vocab/merges) with only the Split pattern swapped to QWEN35_PATTERN. On
+# the pinned ASCII cases the two patterns must split identically, so the
+# expected ids equal the split_qwen2 ids -- asserted here at generation
+# time; the Pascal test then pins OUR splitter to the same ids.
+def build_qwen35_ascii(qwen2_path):
+    path = os.path.join(FIXDIR, 'tiny_bpe_split_qwen35_ascii_tokenizer.json')
+    with open(qwen2_path) as f:
+        data = json.load(f)
+    data['pre_tokenizer']['pretokenizers'][0]['pattern']['Regex'] = \
+        QWEN35_PATTERN
+    with open(path, 'w') as f:
+        json.dump(data, f, ensure_ascii=False)
+    tok35 = Tokenizer.from_file(path)
+    tok2 = Tokenizer.from_file(qwen2_path)
+    for text in CASES:
+        assert tok35.encode(text, add_special_tokens=False).ids == \
+            tok2.encode(text, add_special_tokens=False).ids, \
+            'qwen35 pattern diverges from qwen2 on ASCII: %r' % text
+    return path, dump_cases(tok35, CASES, ["x<|im_end|>y"])
+
+
 def main():
     q_path, q_cases = build_split('tiny_bpe_split_qwen2_tokenizer.json',
                                   QWEN2_PATTERN)
     c_path, c_cases = build_split('tiny_bpe_split_cl100k_tokenizer.json',
                                   CL100K_PATTERN)
+    q35_path, q35_cases = build_split(
+        'tiny_bpe_split_qwen35_tokenizer.json', QWEN35_PATTERN,
+        extra_corpus=QWEN35_MARK_CORPUS, cases=QWEN35_CASES)
+    qa_path, qa_cases = build_qwen35_ascii(q_path)
     o_path, o_cases = build_o200k_split()
     d_path, d_cases = build_deepseek_split()
     b_path, b_cases = build_bytelevel_noregex()
@@ -448,6 +543,10 @@ def main():
                           "cases": q_cases}
     out["split_cl100k"] = {"tokenizer": os.path.basename(c_path),
                            "cases": c_cases}
+    out["split_qwen35"] = {"tokenizer": os.path.basename(q35_path),
+                           "cases": q35_cases}
+    out["split_qwen35_ascii"] = {"tokenizer": os.path.basename(qa_path),
+                                 "cases": qa_cases}
     out["split_o200k"] = {"tokenizer": os.path.basename(o_path),
                           "cases": o_cases}
     out["split_deepseek"] = {"tokenizer": os.path.basename(d_path),
@@ -462,8 +561,8 @@ def main():
                          "cases": f_cases}
     with open(cases_path, 'w') as f:
         json.dump(out, f, ensure_ascii=False, indent=1)
-    for p in (q_path, c_path, o_path, d_path, b_path, m_path, g_path,
-              f_path, cases_path):
+    for p in (q_path, c_path, q35_path, qa_path, o_path, d_path, b_path,
+              m_path, g_path, f_path, cases_path):
         print(p, os.path.getsize(p), 'bytes')
 
 

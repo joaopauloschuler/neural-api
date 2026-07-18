@@ -498,6 +498,7 @@ function EndOfTurnMarker(ChatFormat: TNeuralChatFormat): string;
 begin
   case ChatFormat of
     cfChatML:  Result := '<|im_end|>';
+    cfQwen3_5: Result := '<|im_end|>'; // Qwen3.5/3.6 ChatML variant
     cfLlama2:  Result := '</s>';
     cfLlama3:  Result := '<|eot_id|>';
     cfZephyr:  Result := '</s>';
@@ -1260,6 +1261,7 @@ begin
 
     // End-of-turn markers.
     Check(EndOfTurnMarker(cfChatML) = '<|im_end|>', 'ChatML end marker');
+    Check(EndOfTurnMarker(cfQwen3_5) = '<|im_end|>', 'Qwen3.5 end marker');
     Check(EndOfTurnMarker(cfLlama3) = '<|eot_id|>', 'Llama-3 end marker');
     Check(EndOfTurnMarker(cfGemma) = '<end_of_turn>', 'Gemma end marker');
     Check(EndOfTurnMarker(cfPhi3) = '<|end|>', 'Phi-3 end marker');
@@ -1339,6 +1341,8 @@ var
   GpuCL: TEasyOpenCL;           // platform/device handle for OpenCL offload
   {$ENDIF}
   Cnt, SeqLen, VocabSize: integer;
+  LoadStart: QWord;             // per-phase load wall clock (tokenizer,
+                                // checkpoint + caches, GPU weight upload)
   Line, Cmd, Arg, Reply, ModelType, Marker: string;
   TokenizerFile, TokenizerConfigFile: string;
 begin
@@ -1374,7 +1378,10 @@ begin
     Halt(1);
   end;
   Tokenizer := TNeuralHFTokenizer.Create();
+  LoadStart := GetTickCount64();
   Tokenizer.LoadFromFile(TokenizerFile);
+  WriteLn('Tokenizer loaded in ',
+    (GetTickCount64() - LoadStart) / 1000: 0: 1, 's.');
 
   // 'raw' is a ChatTerminal-level mode, not a chat template, so it is
   // intercepted here and never reaches ChatFormatFromName (which returns
@@ -1461,6 +1468,7 @@ begin
       ' more RAM, GPU compatible]');
 
   WriteLn('Loading ', Opt.ModelDir, ' ...');
+  LoadStart := GetTickCount64();
   // Built at INPUT WIDTH 1 (pSeqLen=1): streamed decode feeds one token per
   // forward and the KV cache (budget = CtxLen, set on the session below) holds
   // the context. SeqLen is the cache budget, NOT the built input width.
@@ -1473,6 +1481,8 @@ begin
   NN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
   for Cnt := 0 to NN.GetLastLayerIdx() do
     NN.Layers[Cnt].FlushWeightCache();
+  WriteLn('Model loaded in ',
+    (GetTickCount64() - LoadStart) / 1000: 0: 1, 's.');
 
   {$IFDEF OpenCL}
   // OpenCL offload of the conv/linear matmuls. Enabling it rebuilds each
@@ -1507,8 +1517,11 @@ begin
         GpuCL.SetCurrentDevice(GpuCL.Devices[Opt.GpuDevice]);
         WriteLn('[--gpu: OpenCL on ', GpuCL.PlatformNames[Opt.GpuPlatform],
           ' / ', GpuCL.DeviceNames[Opt.GpuDevice], ']');
+        LoadStart := GetTickCount64();
         NN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
           GpuCL.Devices[Opt.GpuDevice]);
+        WriteLn('GPU weights uploaded in ',
+          (GetTickCount64() - LoadStart) / 1000: 0: 1, 's.');
       end;
     end;
   end;
