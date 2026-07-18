@@ -637,6 +637,12 @@ type
     procedure TestDeltaNetWeightGradientCheck;
     procedure TestDeltaNetSerializationRoundTrip;
     procedure TestDeltaNetRecallSmokeTrain;
+    procedure TestGatedDeltaNetForwardReference;
+    procedure TestGatedDeltaNetDeltaNetDegenerateParity;
+    procedure TestGatedDeltaNetIncrementalDecodeEquivalence;
+    procedure TestGatedDeltaNetInputGradientCheck;
+    procedure TestGatedDeltaNetWeightGradientCheck;
+    procedure TestGatedDeltaNetSerializationRoundTrip;
     procedure TestLMUShapeInference;
     procedure TestLMUDiscretizationReference;
     procedure TestLMUInputGradientCheck;
@@ -37854,6 +37860,485 @@ begin
   RandSeed := 424242;
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetDeltaNet.Create(), 'DeltaNet', 4, 1, 3, 1e-5);
+end;
+
+// --- TNNetGatedDeltaNet (Qwen3.5 gated delta rule) ---------------------------
+
+// Deterministic moderate weights for the gated-delta-rule checks: A_log /
+// dt_bias away from 0 but small enough that softplus and the decay exp stay in
+// their smooth region, norm gain away from the all-ones default.
+procedure SeedGatedDeltaNet(L: TNNetGatedDeltaNet);
+var n, i: integer;
+begin
+  for n := 0 to 1 do
+    for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      L.Neurons[n].Weights.Raw[i] := Sin(n * 1.3 + i * 0.7) * 0.3;
+  for i := 0 to L.Neurons[2].Weights.Size - 1 do
+    L.Neurons[2].Weights.Raw[i] := 1.0 + Sin(i * 0.9) * 0.2;
+end;
+
+// Forward reference: a small brute-force implementation of the Qwen3.5 gated
+// delta rule (per-head L2-normalized q/k with eps INSIDE the sqrt, q scaled by
+// 1/sqrt(Dk), beta=sigmoid(b), g=-exp(A_log)*softplus(a+dt_bias), state decay
+// exp(g), delta write, gated RMSNorm read-out with a PLAIN shared gain) written
+// directly from the spec, compared against the layer on a tiny config.
+procedure TTestNeuralNumerical.TestGatedDeltaNetForwardReference;
+const
+  Hk = 1; Hv = 2; Dk = 4; Dv = 4; NT = 5;
+  InDepth = 2 * Hk * Dk + 2 * Hv * Dv + 2 * Hv; // 28
+  Eps = 1e-6;
+var
+  NN: TNNet;
+  L: TNNetGatedDeltaNet;
+  Input: TNNetVolume;
+  S: array[0..Hv * Dk * Dv - 1] of double;
+  qn: array[0..Dk - 1] of double;
+  kn: array[0..Dk - 1] of double;
+  ov, delta: array[0..Dv - 1] of double;
+  t, h, kh, d, e, i, qOff, kOff, vOff, zOff, bOff, aOff: integer;
+  sumq, betav, sp, g, dec, kv, msq, z, sig, expected: double;
+  maxErr, err: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  qOff := 0; kOff := Hk * Dk; vOff := 2 * Hk * Dk;
+  zOff := vOff + Hv * Dv; bOff := zOff + Hv * Dv; aOff := bOff + Hv;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(NT, 1, InDepth);
+  try
+    NN.AddLayer(TNNetInput.Create(NT, 1, InDepth, 1));
+    L := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+    NN.AddLayer(L);
+    // Shape / parameter-bank audit.
+    AssertEquals('GatedDeltaNet output SizeX', NT, L.Output.SizeX);
+    AssertEquals('GatedDeltaNet output Depth', Hv * Dv, L.Output.Depth);
+    AssertEquals('GatedDeltaNet neuron count', 3, L.Neurons.Count);
+    AssertEquals('GatedDeltaNet A_log size', Hv, L.Neurons[0].Weights.Size);
+    AssertEquals('GatedDeltaNet dt_bias size', Hv, L.Neurons[1].Weights.Size);
+    AssertEquals('GatedDeltaNet norm gain size', Dv, L.Neurons[2].Weights.Size);
+    SeedGatedDeltaNet(L);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 0.8 + Cos(i * 0.11) * 0.3;
+    NN.Compute(Input);
+    // Brute-force reference.
+    for i := 0 to Hv * Dk * Dv - 1 do S[i] := 0;
+    maxErr := 0;
+    for t := 0 to NT - 1 do
+      for h := 0 to Hv - 1 do
+      begin
+        kh := h div (Hv div Hk);
+        // q/k L2 norm (eps inside the squared sum), q scaled by 1/sqrt(Dk).
+        sumq := 0;
+        for d := 0 to Dk - 1 do
+          sumq := sumq + Sqr(Input[t, 0, qOff + kh * Dk + d]);
+        for d := 0 to Dk - 1 do
+          qn[d] := Input[t, 0, qOff + kh * Dk + d] / Sqrt(sumq + Eps) / Sqrt(Dk);
+        sumq := 0;
+        for d := 0 to Dk - 1 do
+          sumq := sumq + Sqr(Input[t, 0, kOff + kh * Dk + d]);
+        for d := 0 to Dk - 1 do
+          kn[d] := Input[t, 0, kOff + kh * Dk + d] / Sqrt(sumq + Eps);
+        // Gates.
+        betav := 1.0 / (1.0 + Exp(-Input[t, 0, bOff + h]));
+        sp := Ln(1.0 + Exp(Input[t, 0, aOff + h] + L.Neurons[1].Weights.Raw[h]));
+        g := -Exp(L.Neurons[0].Weights.Raw[h]) * sp;
+        dec := Exp(g);
+        // Gated delta-rule step on the head state.
+        for d := 0 to Dk - 1 do
+          for e := 0 to Dv - 1 do
+            S[(h * Dk + d) * Dv + e] := S[(h * Dk + d) * Dv + e] * dec;
+        for e := 0 to Dv - 1 do
+        begin
+          kv := 0;
+          for d := 0 to Dk - 1 do kv := kv + S[(h * Dk + d) * Dv + e] * kn[d];
+          delta[e] := (Input[t, 0, vOff + h * Dv + e] - kv) * betav;
+        end;
+        for d := 0 to Dk - 1 do
+          for e := 0 to Dv - 1 do
+            S[(h * Dk + d) * Dv + e] := S[(h * Dk + d) * Dv + e] + kn[d] * delta[e];
+        for e := 0 to Dv - 1 do
+        begin
+          ov[e] := 0;
+          for d := 0 to Dk - 1 do ov[e] := ov[e] + S[(h * Dk + d) * Dv + e] * qn[d];
+        end;
+        // Gated RMSNorm read-out.
+        msq := 0;
+        for e := 0 to Dv - 1 do msq := msq + Sqr(ov[e]);
+        msq := msq / Dv;
+        for e := 0 to Dv - 1 do
+        begin
+          z := Input[t, 0, zOff + h * Dv + e];
+          sig := 1.0 / (1.0 + Exp(-z));
+          expected := ov[e] / Sqrt(msq + Eps) *
+            L.Neurons[2].Weights.Raw[e] * (z * sig);
+          err := Abs(L.Output[t, 0, h * Dv + e] - expected);
+          if err > maxErr then maxErr := err;
+        end;
+      end;
+    WriteLn('GatedDeltaNet forward-reference max abs error: ', maxErr:0:8);
+    AssertTrue('GatedDeltaNet forward matches brute-force reference (< 1e-4)',
+      maxErr < 1e-4);
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+// Degenerate-parity: with A_log -> very negative, g = -exp(A_log)*softplus(.)
+// -> 0 so exp(g) -> 1 (NO decay), and with a single head fed unit-norm rows
+// as q=k=v (so the eps'd L2 norms are identities and TNNetDeltaNet's UNnormal-
+// ized q equals the normalized one), the recurrence reduces EXACTLY to the
+// classic TNNetDeltaNet (identity projections, w_beta=0, matching b_beta).
+// Only the read-out differs by construction, so the assert compares the gated
+// layer against RMSNorm(deltanet_out) * silu(z) with unit norm gain.
+procedure TTestNeuralNumerical.TestGatedDeltaNetDeltaNetDegenerateParity;
+const
+  DD = 3; NT = 4;
+  InDepth = 2 * DD + 2 * DD + 2; // Hk=Hv=1, Dk=Dv=DD -> 14
+  Eps = 1e-6;
+var
+  NNG, NND: TNNet;
+  LG: TNNetGatedDeltaNet;
+  LD: TNNetDeltaNet;
+  InG, InD: TNNetVolume;
+  t, d, i: integer;
+  nrm, msq, z, sig, expected: double;
+  x: array[0..DD - 1] of double;
+  maxErr, err: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NNG := TNNet.Create();
+  NND := TNNet.Create();
+  InG := TNNetVolume.Create(NT, 1, InDepth);
+  InD := TNNetVolume.Create(NT, 1, DD);
+  try
+    NNG.AddLayer(TNNetInput.Create(NT, 1, InDepth, 1));
+    LG := TNNetGatedDeltaNet.Create(1, 1, DD, DD);
+    NNG.AddLayer(LG);
+    NND.AddLayer(TNNetInput.Create(NT, 1, DD, 1));
+    LD := TNNetDeltaNet.Create();
+    NND.AddLayer(LD);
+    // Gated layer: no decay (A_log very negative), unit norm gain.
+    LG.Neurons[0].Weights.Fill(-20); // A_log -> exp(g) ~ 1
+    LG.Neurons[1].Weights.Fill(0);   // dt_bias
+    LG.Neurons[2].Weights.Fill(1);   // norm gain
+    // DeltaNet: identity projections, constant beta = sigmoid(-0.5).
+    LD.Neurons[0].Weights.Fill(0); LD.Neurons[1].Weights.Fill(0);
+    LD.Neurons[2].Weights.Fill(0);
+    for d := 0 to DD - 1 do
+    begin
+      LD.Neurons[0].Weights[d, 0, d] := 1;
+      LD.Neurons[1].Weights[d, 0, d] := 1;
+      LD.Neurons[2].Weights[d, 0, d] := 1;
+    end;
+    LD.Neurons[3].Weights.Fill(0);   // w_beta
+    LD.Neurons[4].Weights.Raw[0] := -0.5;
+    // Unit-norm input rows so normalize(x) = x for both layers.
+    for t := 0 to NT - 1 do
+    begin
+      nrm := 0;
+      for d := 0 to DD - 1 do
+      begin
+        x[d] := Sin(t * 1.7 + d * 0.9) + 0.3;
+        nrm := nrm + Sqr(x[d]);
+      end;
+      nrm := Sqrt(nrm);
+      for d := 0 to DD - 1 do
+      begin
+        x[d] := x[d] / nrm;
+        InD[t, 0, d] := x[d];
+        InG[t, 0, d] := x[d];             // q
+        InG[t, 0, DD + d] := x[d];         // k
+        InG[t, 0, 2 * DD + d] := x[d];     // v
+        InG[t, 0, 3 * DD + d] := 0.4 + 0.2 * t + 0.1 * d; // z (arbitrary gate)
+      end;
+      InG[t, 0, 4 * DD] := -0.5;           // b -> beta = sigmoid(-0.5)
+      InG[t, 0, 4 * DD + 1] := 0.3;        // a (irrelevant: A_log kills g)
+    end;
+    NND.Compute(InD);
+    NNG.Compute(InG);
+    maxErr := 0;
+    for t := 0 to NT - 1 do
+    begin
+      msq := 0;
+      for d := 0 to DD - 1 do msq := msq + Sqr(LD.Output[t, 0, d]);
+      msq := msq / DD;
+      for d := 0 to DD - 1 do
+      begin
+        z := InG[t, 0, 3 * DD + d];
+        sig := 1.0 / (1.0 + Exp(-z));
+        expected := LD.Output[t, 0, d] / Sqrt(msq + Eps) * (z * sig);
+        err := Abs(LG.Output[t, 0, d] - expected);
+        if err > maxErr then maxErr := err;
+      end;
+    end;
+    WriteLn('GatedDeltaNet vs DeltaNet degenerate parity max abs error: ',
+      maxErr:0:8);
+    AssertTrue('GatedDeltaNet reduces to TNNetDeltaNet without decay (< 1e-4)',
+      maxErr < 1e-4);
+  finally
+    InD.Free; InG.Free; NND.Free; NNG.Free;
+  end;
+end;
+
+// Headline correctness for the O(1)-per-step incremental decode path: feeding
+// a sequence token-by-token through the persisted-state forward must reproduce
+// the full-sequence scan BIT-CLOSE (same shared kernel, same order). Mirrors
+// TestWKVIncrementalDecodeEquivalence, including the CaptureState/RestoreState
+// fork.
+procedure TTestNeuralNumerical.TestGatedDeltaNetIncrementalDecodeEquivalence;
+const
+  Hk = 2; Hv = 4; Dk = 3; Dv = 3; SeqLen = 12;
+  InDepth = 2 * Hk * Dk + 2 * Hv * Dv + 2 * Hv; // 44
+  OutDepth = Hv * Dv;
+var
+  NNFull, NNInc: TNNet;
+  InFull, InInc: TNNetInput;
+  LFull, LInc: TNNetGatedDeltaNet;
+  t, d, n: integer;
+  maxErr, e: TNeuralFloat;
+  Snap: TNNetVolume;
+  Steps: integer;
+begin
+  RandSeed := 424242;
+  NNFull := TNNet.Create();
+  NNInc := TNNet.Create();
+  Snap := TNNetVolume.Create();
+  try
+    InFull := TNNetInput.Create(SeqLen, 1, InDepth, 1);
+    NNFull.AddLayer(InFull);
+    LFull := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+    NNFull.AddLayer(LFull);
+    // Second net with a SINGLE-token input (the decode-step shape) sharing the
+    // same weights so the two paths are weight-identical.
+    InInc := TNNetInput.Create(1, 1, InDepth, 1);
+    NNInc.AddLayer(InInc);
+    LInc := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+    NNInc.AddLayer(LInc);
+    // Perturb weights away from defaults, then copy into the incremental net.
+    for n := 0 to 2 do
+      for d := 0 to LFull.Neurons[n].Weights.Size - 1 do
+        LFull.Neurons[n].Weights.Raw[d] :=
+          LFull.Neurons[n].Weights.Raw[d] + 0.6 * (Random - 0.5);
+    for n := 0 to 2 do
+      LInc.Neurons[n].Weights.Copy(LFull.Neurons[n].Weights);
+    // Random packed q|k|v|z|b|a input sequence; the same rows feed both paths.
+    for t := 0 to SeqLen - 1 do
+      for d := 0 to InDepth - 1 do
+        InFull.Output[t, 0, d] := 1.5 * (Random - 0.5);
+    // Parallel/prefill path: full-sequence scan in one Compute().
+    NNFull.Compute(InFull.Output);
+    // Incremental path: one token at a time, state carried across calls.
+    LInc.BeginIncrementalDecode();
+    maxErr := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      for d := 0 to InDepth - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+      for d := 0 to OutDepth - 1 do
+      begin
+        e := Abs(LInc.Output[0, 0, d] - LFull.Output[t, 0, d]);
+        if e > maxErr then maxErr := e;
+      end;
+    end;
+    WriteLn('GatedDeltaNet incremental-decode vs full-scan max abs error: ',
+      maxErr:0:10);
+    AssertTrue('GatedDeltaNet incremental decode matches full scan (< 1e-5)',
+      maxErr < 1e-5);
+    // CaptureState/RestoreState fork: snapshot mid-way, advance, restore, and
+    // re-advance must reproduce the same outputs.
+    LInc.ResetState();
+    for t := 0 to 5 do
+    begin
+      for d := 0 to InDepth - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+    end;
+    LInc.CaptureState(Snap, Steps);
+    AssertEquals('GatedDeltaNet CaptureState step count', 6, Steps);
+    for t := 6 to SeqLen - 1 do
+    begin
+      for d := 0 to InDepth - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+    end;
+    LInc.RestoreState(Snap, Steps);
+    maxErr := 0;
+    for t := 6 to SeqLen - 1 do
+    begin
+      for d := 0 to InDepth - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+      for d := 0 to OutDepth - 1 do
+      begin
+        e := Abs(LInc.Output[0, 0, d] - LFull.Output[t, 0, d]);
+        if e > maxErr then maxErr := e;
+      end;
+    end;
+    AssertTrue('GatedDeltaNet restored-state tail matches full scan (< 1e-5)',
+      maxErr < 1e-5);
+    LInc.EndIncrementalDecode();
+  finally
+    Snap.Free;
+    NNInc.Free;
+    NNFull.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGatedDeltaNetInputGradientCheck;
+const
+  Hk = 1; Hv = 2; Dk = 2; Dv = 2; NT = 3;
+  InDepth = 2 * Hk * Dk + 2 * Hv * Dv + 2 * Hv; // 16
+  OutDepth = Hv * Dv;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  L: TNNetGatedDeltaNet;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(NT, 1, InDepth);
+  InputPlus := TNNetVolume.Create(NT, 1, InDepth);
+  Desired := TNNetVolume.Create(NT, 1, OutDepth);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(NT, 1, InDepth, 1));
+    L := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    // Bounded inputs keep the eps'd L2 norms, the sigmoid/softplus gates and
+    // the rank-1 write well-conditioned for the FD probe.
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 0.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.5;
+    SeedGatedDeltaNet(L);
+    // Cover every input channel: q, k (shared across value heads), v, z
+    // (silu gate), b (beta gate) and a (decay gate).
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('GatedDeltaNet input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('GatedDeltaNet input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGatedDeltaNetWeightGradientCheck;
+const
+  Hk = 1; Hv = 2; Dk = 2; Dv = 2; NT = 3;
+  InDepth = 2 * Hk * Dk + 2 * Hv * Dv + 2 * Hv; // 16
+  OutDepth = Hv * Dv;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  L: TNNetGatedDeltaNet;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..2] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(NT, 1, InDepth);
+  Desired := TNNetVolume.Create(NT, 1, OutDepth);
+  epsilon := 0.0001;
+  maxErr := 0;
+  Names[0] := 'A_log'; Names[1] := 'dt_bias'; Names[2] := 'norm_gain';
+  try
+    NN.AddLayer(TNNetInput.Create(NT, 1, InDepth, 1));
+    L := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 0.6 + 0.3;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.5;
+    SeedGatedDeltaNet(L);
+    // Cover all three tensors. The decay chain (dL/dDecay through exp/softplus
+    // into A_log and dt_bias) is the new BPTT-error-prone spot vs DeltaNet.
+    for n := 0 to 2 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('GatedDeltaNet weight gradient check ' + Names[n] +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('GatedDeltaNet weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGatedDeltaNetSerializationRoundTrip;
+begin
+  // GatedDeltaNet stores three learnable tensors (per-head A_log / dt_bias and
+  // the shared Dv-long norm gain) plus Hk/Hv/Dk/Dv in FStruct and eps in
+  // FFloatSt; the perturbed-weights helper exercises the constructor-arg
+  // reconstruction through the CreateLayer dispatch.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetGatedDeltaNet.Create(1, 2, 2, 2), 'GatedDeltaNet', 4, 1, 16, 1e-5);
 end;
 
 // --- TNNetTestTimeTraining (TTT-Linear / TTT-MLP) ----------------------------
