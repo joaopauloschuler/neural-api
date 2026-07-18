@@ -165,12 +165,17 @@ def build_split(name, pattern, extra_corpus=(), cases=None):
                             ["x<|im_end|>y"])
 
 
-# Qwen3.5 marks-join corpus/cases: ASCII plus combining marks over the
-# scripts the Pascal IsMarkCP/IsLetterCP tables cover EXACTLY -- Devanagari
-# consonants+vowel signs/virama, Hebrew niqqud, Arabic harakat, and Latin +
-# combining acute (incl. x+U+0301 which has NO precomposed NFC form). The
-# corpus makes the trainer learn merges that SPAN letter<->mark boundaries,
-# so a splitter that (incorrectly) isolates marks produces different ids.
+# Qwen3.5 marks-join corpus/cases: ASCII plus combining marks --
+# Devanagari consonants+vowel signs/virama, Hebrew niqqud, Arabic harakat,
+# and Latin + combining acute (incl. x+U+0301 which has NO precomposed NFC
+# form). The corpus makes the trainer learn merges that SPAN letter<->mark
+# boundaries, so a splitter that (incorrectly) isolates marks produces
+# different ids. The Bengali/Gujarati/Thai entries pin the real-vocab
+# fuzzing regressions found against the actual Qwen3.6-27B tokenizer: the
+# pattern's ANY-char letter-run prefix ([^\r\n\p{L}\p{N}]?, e.g. '?s' after
+# a Bengali letter) and exotic-script \p{N} digits (a space before Gujarati
+# U+0AE8 must stay a standalone token) -- both require the EXACT Unicode
+# category tables (neuralunicodeclasses.inc), not a major-script subset.
 QWEN35_MARK_CORPUS = [
     ("\u0928\u092E\u0938\u094D\u0924\u0947 "      # namaste
      "\u0926\u0941\u0928\u093F\u092F\u093E "      # duniya
@@ -185,6 +190,14 @@ QWEN35_MARK_CORPUS = [
      "\u0628\u0650\u0643\u064F\u0645\u0652"),                    # bikum
     "combining x\u0301 y\u0301 x\u0301x\u0301 letters",
     "cafe\u0301 re\u0301sume\u0301 cafe\u0301 naive",
+    # real-vocab regression material (see comment above): Bengali letters
+    # followed by ?s / !s (teaches the '?s'-spanning merge), Gujarati
+    # digits, Thai letters
+    "\u09aa?s \u0995?s ?s !s \u09aa?s ?s",
+    "\u09aa\u09be\u09a8\u09bf \u09aa\u09be\u09a8\u09bf \u0995\u09b2",
+    "\u0ae7\u0ae8\u0ae9 \u0ae8 \u0ae7\u0ae8\u0ae9",
+    "\u0e2a\u0e27\u0e31\u0e2a\u0e14\u0e35 \u0e44\u0e17\u0e22 "
+    "\u0e2a\u0e27\u0e31\u0e2a\u0e14\u0e35",
 ]
 
 QWEN35_CASES = CASES + [
@@ -201,6 +214,17 @@ QWEN35_CASES = CASES + [
     "\u0967\u0968\u0969 and \u0663\u0664\u0665",
     "mark after punct !\u0301 ok",
     "1\u0301 digit then mark",
+    # real-vocab fuzzing regressions (Qwen3.6-27B): any-char letter-run
+    # prefix after an exotic-script letter, exotic \p{N} after space,
+    # exotic-script letters next to ASCII
+    "\u09aa?s",                                  # Bengali PA + '?s'
+    "\u8e5f\u09aa?s",                            # CJK + Bengali + '?s'
+    "\u0995?s and !s",                           # Bengali KA + '?s'
+    " \u0ae8",                                   # space + Gujarati digit 2
+    "\t) \u0ae8",                                # tab, paren, space, digit
+    "\u0ae7\u0ae8\u0ae9 then 5\u0ae8",           # Gujarati digit runs
+    "\u0e2a\u0e27\u0e31\u0e2a\u0e14\u0e35 Thai", # Thai swasdee
+    "\u09aa\u09be\u09a8\u09bf water",            # Bengali pani + ASCII
 ]
 
 
