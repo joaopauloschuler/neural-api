@@ -567,13 +567,14 @@ end;
 function AssembleMessages(const SystemPrompt: string;
   const History: TChatMessages): TChatMessages;
 var
-  Cnt, Ofs: integer;
+  Cnt, Ofs, HighH: integer;
 begin
   Ofs := 0;
   if SystemPrompt <> '' then Ofs := 1;
   SetLength(Result, Length(History) + Ofs);
   if SystemPrompt <> '' then Result[0] := ChatMessage('system', SystemPrompt);
-  for Cnt := 0 to High(History) do Result[Cnt + Ofs] := History[Cnt];
+  HighH := High(History);
+  for Cnt := 0 to HighH do Result[Cnt + Ofs] := History[Cnt];
 end;
 
 // Stable in-place softmax of a probability row (the imported nets output raw
@@ -582,10 +583,11 @@ end;
 
 function ArgMaxRow(Row: TNNetVolume): integer;
 var
-  Cnt: integer;
+  Cnt, SizeM1: integer;
 begin
   Result := 0;
-  for Cnt := 1 to Row.Size - 1 do
+  SizeM1 := Row.Size - 1;
+  for Cnt := 1 to SizeM1 do
     if Row.FData[Cnt] > Row.FData[Result] then Result := Cnt;
 end;
 
@@ -593,12 +595,14 @@ end;
 function TailMatches(const Tokens: TNeuralIntegerArray; Len: integer;
   const Marker: TNeuralIntegerArray): boolean;
 var
-  Cnt, MLen: integer;
+  Cnt, MLen, MLenM1, Base: integer;
 begin
   MLen := Length(Marker);
   if (MLen = 0) or (Len < MLen) then exit(false);
-  for Cnt := 0 to MLen - 1 do
-    if Tokens[Len - MLen + Cnt] <> Marker[Cnt] then exit(false);
+  MLenM1 := MLen - 1;
+  Base := Len - MLen;
+  for Cnt := 0 to MLenM1 do
+    if Tokens[Base + Cnt] <> Marker[Cnt] then exit(false);
   Result := true;
 end;
 
@@ -868,7 +872,7 @@ var
   TokenizerFile, TokenizerConfigFile, Marker, Line: string;
   LoadStart: QWord;             // per-phase load wall clock (tokenizer,
                                 // checkpoint + caches, GPU weight upload)
-  Cnt: integer;
+  Cnt, LastIdx: integer;
 begin
   Result := false;
   ErrorMsg := '';
@@ -985,7 +989,8 @@ begin
   // honor --max-fast-memory by re-sweeping the layers, then flush each weight
   // cache so the concatenated-weight cache is (re)built or dropped to match.
   NN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
-  for Cnt := 0 to NN.GetLastLayerIdx() do
+  LastIdx := NN.GetLastLayerIdx();
+  for Cnt := 0 to LastIdx do
     NN.Layers[Cnt].FlushWeightCache();
   Notice(Format('Model loaded in %.1fs.',
     [(GetTickCount64() - LoadStart) / 1000]));
@@ -1160,6 +1165,7 @@ var
   InV, Output, Row: TNNetVolume;
   Len, GenLen, StepCnt, Cnt, NewToken: integer;
   Reused, PromptLen: integer;  // KV-cache reuse bookkeeping (and --stats)
+  LenM1, LenM2, MarkerLen, EmLen, DecLen: integer;
   Decoded, Emitted: string;
   // --stats timing (monotonic ms). TStart: before prefill; TFirst: when the
   // first reply token is produced (so TTFT covers prefill + first step);
@@ -1217,7 +1223,10 @@ begin
   else if GenOpt.TopP > 0 then Sampler := TNNetSamplerTopP.Create(GenOpt.TopP)
   else if GenOpt.MinP > 0 then Sampler := TNNetSamplerMinP.Create(GenOpt.MinP);
   SetLength(Tokens, SeqLen);
-  for Cnt := 0 to Len - 1 do Tokens[Cnt] := PromptIds[Cnt];
+  LenM1 := Len - 1;
+  LenM2 := Len - 2;
+  MarkerLen := Length(MarkerIds);
+  for Cnt := 0 to LenM1 do Tokens[Cnt] := PromptIds[Cnt];
   SetLength(Generated, 0);
   Emitted := '';
   InV := TNNetVolume.Create(1, 1, 1);
@@ -1253,7 +1262,7 @@ begin
       Reused := 0;
       Session.Reset(); // SSM state cannot be position-truncated; full reset
     end;
-    for Cnt := Reused to Len - 2 do
+    for Cnt := Reused to LenM2 do
     begin
       InV.FData[0] := Tokens[Cnt];
       Session.StepForward(InV, Cnt);
@@ -1274,7 +1283,7 @@ begin
       InV.FData[0] := Tokens[Len - 1];
       Session.StepForward(InV, Len - 1);
       Output := Session.Output(); // (1,1,vocab) -- the single logits row
-      for Cnt := 0 to VocabSize - 1 do Row.FData[Cnt] := Output.FData[Cnt];
+      Move(Output.FData[0], Row.FData[0], VocabSize * csNeuralFloatSize);
       RowSoftMax(Row);
       Chain.ProcessRow(Row);
       if Assigned(Sampler) then NewToken := Sampler.GetToken(Row)
@@ -1293,9 +1302,9 @@ begin
         LastFinishReason := 'stop';
         break;
       end;
-      if TailMatches(Generated, Length(Generated), MarkerIds) then
+      if TailMatches(Generated, GenLen + 1, MarkerIds) then
       begin
-        SetLength(Generated, Length(Generated) - Length(MarkerIds));
+        SetLength(Generated, GenLen + 1 - MarkerLen);
         LastFinishReason := 'stop';
         break;
       end;
@@ -1303,11 +1312,12 @@ begin
       // delta (BPE merges/UTF-8 multibyte pieces can rewrite the tail, so
       // only emit when the previous text is still a prefix).
       Decoded := Tokenizer.Decode(Generated, {SkipSpecialTokens=}true);
-      if (Length(Decoded) > Length(Emitted)) and
-        (Copy(Decoded, 1, Length(Emitted)) = Emitted) then
+      DecLen := Length(Decoded);
+      EmLen := Length(Emitted);
+      if (DecLen > EmLen) and
+        (Copy(Decoded, 1, EmLen) = Emitted) then
       begin
-        EmitToken(Copy(Decoded, Length(Emitted) + 1,
-          Length(Decoded) - Length(Emitted)));
+        EmitToken(Copy(Decoded, EmLen + 1, DecLen - EmLen));
         Emitted := Decoded;
       end;
     end;
@@ -1324,7 +1334,8 @@ begin
     // the final produced token (Tokens[Len-1]) was sampled but never fed, so
     // it is not.
     SetLength(CachedTokens, Len - 1);
-    for Cnt := 0 to Len - 2 do CachedTokens[Cnt] := Tokens[Cnt];
+    LenM2 := Len - 2;
+    for Cnt := 0 to LenM2 do CachedTokens[Cnt] := Tokens[Cnt];
     // Per-turn timing to stderr (keeps stdout = pure model output). TTFT =
     // prefill + first decode step; tok/s measures the steady-state decode of
     // the tokens AFTER the first, so prefill cost is excluded. prompt N (reused
