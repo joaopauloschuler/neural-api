@@ -11,6 +11,12 @@ chat:
 
   ChatTerminal /path/to/model --temperature 0.8 --top-p 0.9
 
+The heavy lifting (option parsing, model/tokenizer load, sampling-defaults
+resolution, KV-cache streamed generation) lives in the shared engine unit
+neural/neuralchatengine.pas (TChatEngine), which this REPL and the sibling
+ChatServer HTTP frontend both sit on. This file is the terminal-specific
+part: the REPL loop, /commands, and stdout streaming.
+
 The conversation is maintained as a multi-turn history rendered through the
 chat-template engine (neuralchat.pas): the chat format is fingerprinted from
 tokenizer_config.json's chat_template (DetectChatFormatFromConfigFile) and
@@ -122,86 +128,8 @@ uses
   // cmem is skipped in the Debug build mode: it enables Valgrind (-gv), and
   // FPC then pulls in cmem itself, so naming it here is a duplicate.
   {$IFDEF UNIX}cthreads, {$IFNDEF Debug}cmem,{$ENDIF}{$ENDIF}
-  {$IFDEF OpenCL}neuralopencl,{$ENDIF}
-  Classes, SysUtils, fpjson, jsonparser,
-  neuralvolume, neuralnetwork, neuralpretrained, neuralhftokenizer,
-  neuralchat, neuraldecode;
-
-const
-  // Default --ctx when the user gives none. Kept modest because build memory
-  // is O(ctx^2) (a SeqLen x SeqLen score buffer per head per layer); the full
-  // checkpoint context (e.g. 32768) would OOM at load. See the load path.
-  DefaultCtxCap = 2048;
-
-type
-  TChatOptions = record
-    ModelDir: string;
-    Int8: boolean;
-    LowMemory: boolean;          // true (default) = low-memory forward path
-                                 // (drops the concatenated weight cache);
-                                 // independent of trainability
-    CtxLen: integer;             // pSeqLen (0 = the model's full context)
-    MaxNewTokens: integer;
-    Temperature: TNeuralFloat;   // 1.0 = off
-    TopK: integer;               // 0 = off
-    WeightedTopK: boolean;       // true = weighted (HF) top-k, false = uniform
-    TopP: TNeuralFloat;          // 0 = off
-    MinP: TNeuralFloat;          // 0 = off
-    RepetitionPenalty: TNeuralFloat; // 1.0 = off
-    FrequencyPenalty: TNeuralFloat;  // 0 = off
-    PresencePenalty: TNeuralFloat;   // 0 = off
-    Greedy: boolean;             // --greedy: deterministic argmax - no sampler,
-                                 // no temperature, no penalties. Hard override:
-                                 // beats explicit sampling flags AND the model's
-                                 // generation_config.json (CPU/GPU parity and
-                                 // debugging mode)
-    // "Explicitly set on the command line" trackers. ApplySamplingDefaults
-    // fills a parameter from generation_config.json (or the built-in fallback)
-    // only when its flag was NOT given: CLI > generation_config > fallback.
-    TemperatureSet: boolean;
-    TopKSet: boolean;
-    TopPSet: boolean;
-    MinPSet: boolean;
-    RepPenaltySet: boolean;
-    Seed: integer;               // < 0 = Randomize
-    FormatName: string;          // '' = autodetect
-    SystemPrompt: string;
-    SelfTest: boolean;
-    ShowHelp: boolean;
-    Stats: boolean;              // per-turn timing to stderr (TTFT, tok/s)
-    Profile: boolean;            // per-layer-class forward timing to stderr after
-                                 // each turn (decode steps only); for picking the
-                                 // next layer class to optimize (e.g. OpenCL)
-    NoCacheReuse: boolean;       // force full re-prefill every turn (A/B + debug)
-    KVInt8: boolean;             // int8-quantized KV cache (~1/4 the KV RAM at
-                                 // long context; logits not bit-exact). Follows
-                                 // the weight mode (on with int8 weights, off
-                                 // with --fp32) unless --kv-int8/--kv-fp32
-                                 // picks explicitly - identical CPU/GPU.
-    KVInt8Set: boolean;          // --kv-int8/--kv-fp32 given: skip the
-                                 // follow-the-weights default
-    Serial: boolean;             // serial layer loop; default is the parallel
-                                 // layer-graph scheduler (ComputeParallel).
-                                 // The parallel path also enables intra-layer
-                                 // threading (big conv/linear layers split
-                                 // across the pool); --serial disables both.
-    Gpu: boolean;                // offload conv/linear matmuls via OpenCL
-    GpuPlatform: integer;        // OpenCL platform index (default 0)
-    GpuDevice: integer;          // OpenCL device index within the platform (0)
-    ErrorMsg: string;
-  end;
-
-  // Sampling-relevant fields of a HuggingFace generation_config.json, each
-  // with a presence flag (an absent field must not override anything).
-  // Filled by ReadGenerationConfig, consumed by ApplySamplingDefaults.
-  TGenConfigDefaults = record
-    Found: boolean;              // file existed and parsed
-    HasDoSample: boolean;        DoSample: boolean;
-    HasTemperature: boolean;     Temperature: TNeuralFloat;
-    HasTopP: boolean;            TopP: TNeuralFloat;
-    HasTopK: boolean;            TopK: integer;
-    HasRepetitionPenalty: boolean; RepetitionPenalty: TNeuralFloat;
-  end;
+  Classes, SysUtils,
+  neuralvolume, neuralchat, neuralchatengine;
 
 procedure PrintUsage();
 begin
@@ -211,318 +139,9 @@ begin
   WriteLn('index / pytorch_model.bin), tokenizer.json and (for chat-format');
   WriteLn('autodetection) tokenizer_config.json.');
   WriteLn;
-  WriteLn('Options:');
-  WriteLn('  Sampling defaults come from the model''s generation_config.json when');
-  WriteLn('  present; otherwise top-p 0.2 + repetition-penalty 1.05. Explicit');
-  WriteLn('  flags override the config; --greedy overrides everything.');
-  WriteLn('  --greedy              deterministic argmax: no sampler, no temperature,');
-  WriteLn('                        no penalties (CPU/GPU parity + debugging)');
-  WriteLn('  --temperature X       sampling temperature (1.0 = off)');
-  WriteLn('  --top-k N             top-k sampling (uniform draw among top K)');
-  WriteLn('  --weighted-top-k N    top-k sampling (HF: weighted draw among top K)');
-  WriteLn('  --top-p X             nucleus sampling (weighted draw)');
-  WriteLn('  --min-p X             min-p sampling (weighted draw)');
-  WriteLn('  --repetition-penalty X  CTRL repetition penalty (1.0 = off)');
-  WriteLn('  --frequency-penalty X   frequency penalty (default 0)');
-  WriteLn('  --presence-penalty X    presence penalty (default 0)');
-  WriteLn('  --max-new-tokens N    reply length cap (default 8192)');
-  WriteLn('  --seed N              RNG seed (default: randomize)');
-  WriteLn('  --ctx N               context window (default min(model max,2048); mem ~O(ctx^2))');
-  WriteLn('  --format NAME         chatml|llama2|llama3|zephyr|gemma|phi3|mistral|raw');
-  WriteLn('                        raw = no chat template: plain text completion for');
-  WriteLn('                        BASE models (gpt2, mamba-130m, ...); the model');
-  WriteLn('                        continues a running transcript of what you type.');
-  WriteLn('                        No end-of-turn marker - stops on EOS or the');
-  WriteLn('                        --max-new-tokens cap (use a small cap, e.g. 128)');
-  WriteLn('  --system "msg"        initial system prompt');
-  WriteLn('  --int8                int8 weight-only quantized inference (DEFAULT; less');
-  WriteLn('                        RAM and faster on CPU and GPU: resident int8 codes)');
-  WriteLn('  --fp32                full-precision weights (more RAM, slower)');
-  WriteLn('  --low-memory          drop conv/linear weight cache; per-neuron forward (DEFAULT)');
-  WriteLn('  --max-fast-memory     keep the concatenated weight cache (faster forward, more RAM)');
-  WriteLn('  --kv-int8             int8-quantized KV cache: ~1/4 the KV RAM at long context');
-  WriteLn('                        (per-row scales; slightly lossy logits, argmax stable).');
-  WriteLn('                        DEFAULT whenever the weights are int8; --fp32 weights');
-  WriteLn('                        default to the FP32 cache');
-  WriteLn('  --kv-fp32             keep the bit-exact FP32 KV cache with int8 weights');
-  WriteLn('  --gpu                 OpenCL offload of conv/linear matmuls (DEFAULT when');
-  WriteLn('                        built with -dOpenCL); --cpu forces CPU');
-  WriteLn('  --cpu                 force CPU even when built with -dOpenCL');
-  WriteLn('  --gpu-platform N      OpenCL platform index (default 0)');
-  WriteLn('  --gpu-device N        OpenCL device index within the platform (default 0)');
-  WriteLn('  --stats               per-turn timing to stderr (TTFT, decode tok/s)');
-  WriteLn('  --profile             per-layer-class forward timing to stderr after each');
-  WriteLn('                        turn (decode steps only); ranks classes to optimize.');
-  WriteLn('                        Also prints [sched]: layer-graph parallelism (graph');
-  WriteLn('                        width, parallel vs serial passes, peak in-flight)');
-  WriteLn('  --no-cache-reuse      re-prefill the whole prompt each turn (default:');
-  WriteLn('                        reuse the shared KV-cache prefix from last turn)');
-  WriteLn('  --serial              serial layer loop (default: layer-graph parallel');
-  WriteLn('                        forward across independent layers; the parallel');
-  WriteLn('                        path also threads large conv/linear layers');
-  WriteLn('                        internally, --serial runs fully single-threaded)');
-  WriteLn('  --selftest            run the offline unit checks and exit');
-  WriteLn('  --help                this text');
+  PrintChatOptionsHelp();
   WriteLn;
   WriteLn('REPL commands: /exit, /reset, /system <msg>');
-end;
-
-function DefaultChatOptions(): TChatOptions;
-begin
-  Result.ModelDir := '';
-  Result.Int8 := true; // int8 weights by default: less RAM, faster (--fp32 opts out)
-  Result.LowMemory := true; // low-memory forward path by default (drops weight cache)
-  Result.CtxLen := 0;
-  Result.MaxNewTokens := 8192;
-  Result.Temperature := 1.0;
-  Result.TopK := 0;
-  Result.WeightedTopK := false;
-  Result.TopP := 0;
-  Result.MinP := 0;
-  Result.RepetitionPenalty := 1.0;
-  Result.FrequencyPenalty := 0;
-  Result.PresencePenalty := 0;
-  Result.Greedy := false;
-  Result.TemperatureSet := false;
-  Result.TopKSet := false;
-  Result.TopPSet := false;
-  Result.MinPSet := false;
-  Result.RepPenaltySet := false;
-  Result.Seed := -1;
-  Result.FormatName := '';
-  Result.SystemPrompt := '';
-  Result.SelfTest := false;
-  Result.ShowHelp := false;
-  Result.Stats := false;
-  Result.Profile := false;
-  Result.NoCacheReuse := false;
-  Result.KVInt8 := false;    // resolved after parsing: follows the weight mode
-  Result.KVInt8Set := false; // unless --kv-int8/--kv-fp32 picked explicitly
-  Result.Serial := false; // parallel layer-graph forward by default (--serial)
-  // OpenCL offload defaults ON when the binary is built with -dOpenCL (the
-  // default compilation), OFF otherwise; --cpu forces CPU either way.
-  Result.Gpu := {$IFDEF OpenCL}true{$ELSE}false{$ENDIF};
-  Result.GpuPlatform := 0;
-  Result.GpuDevice := 0;
-  Result.ErrorMsg := '';
-end;
-
-// Parses the command line (already collected into Args). Returns false and
-// sets ErrorMsg on a bad flag/value. Kept pure (no ParamStr, no Halt) so
-// --selftest can exercise it.
-function ParseArgs(Args: TStringList; var Opt: TChatOptions): boolean;
-var
-  ArgPos: integer;
-
-  function NextValue(const FlagName: string; out Value: string): boolean;
-  begin
-    if ArgPos + 1 >= Args.Count then
-    begin
-      Opt.ErrorMsg := FlagName + ' needs a value';
-      exit(false);
-    end;
-    Inc(ArgPos);
-    Value := Args[ArgPos];
-    Result := true;
-  end;
-
-  function NextFloat(const FlagName: string; out Value: TNeuralFloat): boolean;
-  var
-    S: string;
-    Code: integer;
-    D: double;
-  begin
-    Result := NextValue(FlagName, S);
-    if not Result then exit;
-    Val(S, D, Code); // locale-independent, '.' decimal separator
-    if Code <> 0 then
-    begin
-      Opt.ErrorMsg := FlagName + ': not a number: ' + S;
-      exit(false);
-    end;
-    Value := D;
-  end;
-
-  function NextInt(const FlagName: string; out Value: integer): boolean;
-  var
-    S: string;
-  begin
-    Result := NextValue(FlagName, S);
-    if not Result then exit;
-    if not TryStrToInt(S, Value) then
-    begin
-      Opt.ErrorMsg := FlagName + ': not an integer: ' + S;
-      Result := false;
-    end;
-  end;
-
-var
-  Arg, SVal: string;
-  FVal: TNeuralFloat;
-  IVal: integer;
-begin
-  Opt := DefaultChatOptions();
-  ArgPos := 0;
-  while ArgPos < Args.Count do
-  begin
-    Arg := Args[ArgPos];
-    if Arg = '--int8' then Opt.Int8 := true
-    else if Arg = '--fp32' then Opt.Int8 := false
-    else if Arg = '--low-memory' then Opt.LowMemory := true
-    else if Arg = '--max-fast-memory' then Opt.LowMemory := false
-    else if Arg = '--stats' then Opt.Stats := true
-    else if Arg = '--profile' then Opt.Profile := true
-    else if Arg = '--no-cache-reuse' then Opt.NoCacheReuse := true
-    else if Arg = '--kv-int8' then
-    begin
-      Opt.KVInt8 := true;
-      Opt.KVInt8Set := true;
-    end
-    else if Arg = '--kv-fp32' then
-    begin
-      Opt.KVInt8 := false;
-      Opt.KVInt8Set := true;
-    end
-    else if Arg = '--serial' then Opt.Serial := true
-    else if Arg = '--gpu' then Opt.Gpu := true
-    else if Arg = '--cpu' then Opt.Gpu := false
-    else if Arg = '--gpu-platform' then
-    begin
-      if not NextInt(Arg, IVal) then exit(false);
-      Opt.GpuPlatform := IVal;
-    end
-    else if Arg = '--gpu-device' then
-    begin
-      if not NextInt(Arg, IVal) then exit(false);
-      Opt.GpuDevice := IVal;
-    end
-    else if Arg = '--selftest' then Opt.SelfTest := true
-    else if (Arg = '--help') or (Arg = '-h') then Opt.ShowHelp := true
-    else if Arg = '--greedy' then Opt.Greedy := true
-    else if Arg = '--temperature' then
-    begin
-      if not NextFloat(Arg, FVal) then exit(false);
-      Opt.Temperature := FVal;
-      Opt.TemperatureSet := true;
-    end
-    else if Arg = '--top-k' then
-    begin
-      if not NextInt(Arg, IVal) then exit(false);
-      Opt.TopK := IVal;
-      Opt.TopKSet := true;
-    end
-    else if Arg = '--weighted-top-k' then
-    begin
-      if not NextInt(Arg, IVal) then exit(false);
-      Opt.TopK := IVal;
-      Opt.WeightedTopK := true;
-      Opt.TopKSet := true;
-    end
-    else if Arg = '--top-p' then
-    begin
-      if not NextFloat(Arg, FVal) then exit(false);
-      Opt.TopP := FVal;
-      Opt.TopPSet := true;
-    end
-    else if Arg = '--min-p' then
-    begin
-      if not NextFloat(Arg, FVal) then exit(false);
-      Opt.MinP := FVal;
-      Opt.MinPSet := true;
-    end
-    else if Arg = '--repetition-penalty' then
-    begin
-      if not NextFloat(Arg, FVal) then exit(false);
-      Opt.RepetitionPenalty := FVal;
-      Opt.RepPenaltySet := true;
-    end
-    else if Arg = '--frequency-penalty' then
-    begin
-      if not NextFloat(Arg, FVal) then exit(false);
-      Opt.FrequencyPenalty := FVal;
-    end
-    else if Arg = '--presence-penalty' then
-    begin
-      if not NextFloat(Arg, FVal) then exit(false);
-      Opt.PresencePenalty := FVal;
-    end
-    else if Arg = '--max-new-tokens' then
-    begin
-      if not NextInt(Arg, IVal) then exit(false);
-      Opt.MaxNewTokens := IVal;
-    end
-    else if Arg = '--seed' then
-    begin
-      if not NextInt(Arg, IVal) then exit(false);
-      Opt.Seed := IVal;
-    end
-    else if Arg = '--ctx' then
-    begin
-      if not NextInt(Arg, IVal) then exit(false);
-      Opt.CtxLen := IVal;
-    end
-    else if Arg = '--format' then
-    begin
-      if not NextValue(Arg, SVal) then exit(false);
-      Opt.FormatName := SVal;
-    end
-    else if Arg = '--system' then
-    begin
-      if not NextValue(Arg, SVal) then exit(false);
-      Opt.SystemPrompt := SVal;
-    end
-    else if (Length(Arg) >= 2) and (Copy(Arg, 1, 2) = '--') then
-    begin
-      Opt.ErrorMsg := 'unknown flag: ' + Arg;
-      exit(false);
-    end
-    else if Opt.ModelDir = '' then Opt.ModelDir := Arg
-    else
-    begin
-      Opt.ErrorMsg := 'unexpected argument: ' + Arg;
-      exit(false);
-    end;
-    Inc(ArgPos);
-  end;
-  // The KV cache follows the weight mode unless picked explicitly: int8
-  // weights get the int8 KV cache (same accuracy philosophy, ~1/4 the KV
-  // RAM), --fp32 weights keep the bit-exact FP32 cache. Identical on CPU
-  // and GPU (the cached decode path is the same code).
-  if not Opt.KVInt8Set then Opt.KVInt8 := Opt.Int8;
-  Result := true;
-end;
-
-// The end-of-turn marker the assistant reply terminates with in each format
-// (the token-id stop sequence; trimmed from the reply when matched).
-function EndOfTurnMarker(ChatFormat: TNeuralChatFormat): string;
-begin
-  case ChatFormat of
-    cfChatML:  Result := '<|im_end|>';
-    cfQwen3_5: Result := '<|im_end|>'; // Qwen3.5/3.6 ChatML variant
-    cfLlama2:  Result := '</s>';
-    cfLlama3:  Result := '<|eot_id|>';
-    cfZephyr:  Result := '</s>';
-    cfGemma:   Result := '<end_of_turn>';
-    cfPhi3:    Result := '<|end|>';
-    cfMistral: Result := '</s>';
-  else
-    Result := '';
-  end;
-end;
-
-// Full conversation = optional system message + alternating user/assistant
-// History, rendered with the generation prompt so the model continues as
-// the assistant.
-function AssembleMessages(const SystemPrompt: string;
-  const History: TChatMessages): TChatMessages;
-var
-  Cnt, Ofs: integer;
-begin
-  Ofs := 0;
-  if SystemPrompt <> '' then Ofs := 1;
-  SetLength(Result, Length(History) + Ofs);
-  if SystemPrompt <> '' then Result[0] := ChatMessage('system', SystemPrompt);
-  for Cnt := 0 to High(History) do Result[Cnt + Ofs] := History[Cnt];
 end;
 
 // REPL line classification: returns true when Line is a /command and splits
@@ -544,426 +163,36 @@ begin
   Result := true;
 end;
 
-// Stable in-place softmax of a probability row (the imported nets output raw
-// logits; the processor chain and the samplers expect POST-SOFTMAX rows) is
-// now neuralvolume.RowSoftMax.
-
-function ArgMaxRow(Row: TNNetVolume): integer;
-var
-  Cnt: integer;
-begin
-  Result := 0;
-  for Cnt := 1 to Row.Size - 1 do
-    if Row.FData[Cnt] > Row.FData[Result] then Result := Cnt;
-end;
-
-// True when the tail of Tokens[0..Len-1] equals Marker.
-function TailMatches(const Tokens: TNeuralIntegerArray; Len: integer;
-  const Marker: TNeuralIntegerArray): boolean;
-var
-  Cnt, MLen: integer;
-begin
-  MLen := Length(Marker);
-  if (MLen = 0) or (Len < MLen) then exit(false);
-  for Cnt := 0 to MLen - 1 do
-    if Tokens[Len - MLen + Cnt] <> Marker[Cnt] then exit(false);
-  Result := true;
-end;
-
-// Length of the longest common prefix of two token-id sequences. Used by the
-// incremental KV-cache reuse: A is the sequence currently resident in the
-// cache (positions 0..High), B is this turn's freshly rendered prompt; the
-// cache can be kept up to this length and only B's tail re-prefilled.
-function CommonPrefixLen(const A, B: TNeuralIntegerArray): integer;
-var
-  N: integer;
-begin
-  Result := 0;
-  N := Length(A);
-  if Length(B) < N then N := Length(B);
-  while (Result < N) and (A[Result] = B[Result]) do Inc(Result);
-end;
-
-// Reads config.json's model_type for the one-line summary ('' on trouble).
-// fpjson gotcha: TJSONParser with options [] (GetJSON mangles non-ASCII).
-function ReadModelType(const ConfigFile: string): string;
-var
-  SL: TStringList;
-  Parser: TJSONParser;
-  Root: TJSONData;
-  Node: TJSONData;
-begin
-  Result := '';
-  if not FileExists(ConfigFile) then exit;
-  SL := TStringList.Create();
-  try
-    SL.LoadFromFile(ConfigFile);
-    Parser := TJSONParser.Create(SL.Text, []);
-    try
-      Root := Parser.Parse();
-      try
-        Node := Root.FindPath('model_type');
-        if Assigned(Node) then Result := Node.AsString;
-      finally
-        Root.Free;
-      end;
-    finally
-      Parser.Free;
-    end;
-  except
-    Result := '';
-  end;
-  SL.Free;
-end;
-
-// Reads an integer field from config.json (e.g. max_position_embeddings),
-// returning Default on any trouble. Same fpjson stance as ReadModelType.
-function ReadConfigInt(const ConfigFile, Field: string;
-  Default: integer): integer;
-var
-  SL: TStringList;
-  Parser: TJSONParser;
-  Root: TJSONData;
-  Node: TJSONData;
-begin
-  Result := Default;
-  if not FileExists(ConfigFile) then exit;
-  SL := TStringList.Create();
-  try
-    SL.LoadFromFile(ConfigFile);
-    Parser := TJSONParser.Create(SL.Text, []);
-    try
-      Root := Parser.Parse();
-      try
-        Node := Root.FindPath(Field);
-        if Assigned(Node) and (Node.JSONType = jtNumber) then
-          Result := Node.AsInteger;
-      finally
-        Root.Free;
-      end;
-    finally
-      Parser.Free;
-    end;
-  except
-    Result := Default;
-  end;
-  SL.Free;
-end;
-
-// Built-in fallback sampling defaults, used only for parameters that neither
-// an explicit flag nor the model's generation_config.json supplies. A tight
-// nucleus + a mild penalty: near-greedy stability, but the penalty prevents
-// the repetition loops pure greedy falls into on small models.
-const
-  csFallbackTopP = 0.2;
-  csFallbackRepetitionPenalty = 1.05;
-
-// Reads the sampling-relevant fields of the model's generation_config.json
-// (the checkpoint author's recommended decode settings). Absent file/fields
-// leave the presence flags false. Same fpjson stance as ReadModelType.
-function ReadGenerationConfig(const FileName: string): TGenConfigDefaults;
-var
-  SL: TStringList;
-  Parser: TJSONParser;
-  Root: TJSONData;
-  Node: TJSONData;
-begin
-  FillChar(Result, SizeOf(Result), 0);
-  if not FileExists(FileName) then exit;
-  SL := TStringList.Create();
-  try
-    try
-      SL.LoadFromFile(FileName);
-      Parser := TJSONParser.Create(SL.Text, []);
-      try
-        Root := Parser.Parse();
-        try
-          Result.Found := true;
-          Node := Root.FindPath('do_sample');
-          if Assigned(Node) and (Node.JSONType = jtBoolean) then
-          begin
-            Result.HasDoSample := true;
-            Result.DoSample := Node.AsBoolean;
-          end;
-          Node := Root.FindPath('temperature');
-          if Assigned(Node) and (Node.JSONType = jtNumber) then
-          begin
-            Result.HasTemperature := true;
-            Result.Temperature := Node.AsFloat;
-          end;
-          Node := Root.FindPath('top_p');
-          if Assigned(Node) and (Node.JSONType = jtNumber) then
-          begin
-            Result.HasTopP := true;
-            Result.TopP := Node.AsFloat;
-          end;
-          Node := Root.FindPath('top_k');
-          if Assigned(Node) and (Node.JSONType = jtNumber) then
-          begin
-            Result.HasTopK := true;
-            Result.TopK := Node.AsInteger;
-          end;
-          Node := Root.FindPath('repetition_penalty');
-          if Assigned(Node) and (Node.JSONType = jtNumber) then
-          begin
-            Result.HasRepetitionPenalty := true;
-            Result.RepetitionPenalty := Node.AsFloat;
-          end;
-        finally
-          Root.Free;
-        end;
-      finally
-        Parser.Free;
-      end;
-    except
-      FillChar(Result, SizeOf(Result), 0); // unreadable/bad JSON = no config
-    end;
-  finally
-    SL.Free;
-  end;
-end;
-
-// Resolves the effective sampling settings in Opt. Per parameter the
-// precedence is: explicit CLI flag > generation_config.json > built-in
-// fallback (csFallbackTopP / csFallbackRepetitionPenalty). --greedy is a hard
-// override of everything, including explicit sampling flags - it is the
-// deterministic argmax parity/debug mode. A config with do_sample=false means
-// the model author recommends greedy: it contributes greedy defaults (explicit
-// flags still override individually, matching the per-parameter rule).
-// Sampler choice from a config: top_p is preferred over top_k because this
-// library's plain top-k draws UNIFORMLY among the K most probable tokens; a
-// config top_k maps to the HF-style WEIGHTED top-k when no top_p is given.
-// Kept pure (no file access - the caller passes the parsed config) so
-// --selftest can exercise the precedence table.
-procedure ApplySamplingDefaults(var Opt: TChatOptions;
-  const Cfg: TGenConfigDefaults);
-var
-  CfgGreedy, UserSampler: boolean;
-begin
-  if Opt.Greedy then
-  begin
-    Opt.Temperature := 1.0;
-    Opt.TopK := 0;
-    Opt.WeightedTopK := false;
-    Opt.TopP := 0;
-    Opt.MinP := 0;
-    Opt.RepetitionPenalty := 1.0;
-    Opt.FrequencyPenalty := 0;
-    Opt.PresencePenalty := 0;
-    exit;
-  end;
-  CfgGreedy := Cfg.Found and Cfg.HasDoSample and (not Cfg.DoSample);
-  UserSampler := Opt.TopKSet or Opt.TopPSet or Opt.MinPSet;
-  if not Opt.TemperatureSet then
-  begin
-    // The fallback deliberately leaves temperature at 1.0 (off): with the
-    // tight fallback nucleus it would only reshape 1-3 candidates anyway.
-    if (not CfgGreedy) and Cfg.HasTemperature then
-      Opt.Temperature := Cfg.Temperature;
-  end;
-  if not Opt.RepPenaltySet then
-  begin
-    if CfgGreedy then Opt.RepetitionPenalty := 1.0
-    else if Cfg.HasRepetitionPenalty then
-      Opt.RepetitionPenalty := Cfg.RepetitionPenalty
-    else Opt.RepetitionPenalty := csFallbackRepetitionPenalty;
-  end;
-  if not UserSampler then
-  begin
-    if CfgGreedy then
-    begin
-      Opt.TopK := 0;
-      Opt.TopP := 0;
-      Opt.MinP := 0;
-    end
-    else if Cfg.HasTopP then Opt.TopP := Cfg.TopP
-    else if Cfg.HasTopK then
-    begin
-      Opt.TopK := Cfg.TopK;
-      Opt.WeightedTopK := true;
-    end
-    else Opt.TopP := csFallbackTopP;
-  end;
-end;
-
 // ---------------------------------------------------------------------------
-// Generation: one assistant reply, streamed to stdout as it decodes.
+// Streaming sinks: TChatEngine emits reply text and notices through events;
+// the REPL prints both straight to stdout (tokens unbuffered, notices as
+// lines) so the terminal behaves exactly like the pre-engine version.
 // ---------------------------------------------------------------------------
-// Full-recompute decode (one fixed-width forward per token, the GPT2Import
-// convention). Probability pipeline per step, matching the
-// TGenerationConfig order (penalty -> temperature -> sampler):
-//   logits row -> softmax -> Chain.ProcessRow -> Sampler/argmax.
-// Stops on EOS (tokenizer's eos id), on the end-of-turn marker token
-// sequence, or after Opt.MaxNewTokens. Returns the decoded reply (marker
-// trimmed); streamed printing flushes after every token so piped output
-// still streams.
-// CacheReuse: keep the KV cache across turns and only prefill the tail that
-// diverges from CachedTokens (the token-id sequence currently resident in the
-// cache, updated here in/out). When false, the cache is fully reset and the
-// whole prompt re-prefilled (the SSM/recurrent path, where the cache cannot be
-// truncated by position, and --no-cache-reuse).
-function GenerateReply(NN: TNNet; Session: TNNetStreamingDecoder;
-  Tokenizer: TNeuralHFTokenizer;
-  const PromptIds: TNeuralIntegerArray; const Opt: TChatOptions;
-  SeqLen, VocabSize: integer; Chain: TNNetLogitsProcessorChain;
-  Sampler: TNNetSamplerBase; const MarkerIds: TNeuralIntegerArray;
-  var CachedTokens: TNeuralIntegerArray; CacheReuse: boolean): string;
-var
-  Tokens: TNeuralIntegerArray;
-  Generated: TNeuralIntegerArray;
-  InV, Output, Row: TNNetVolume;
-  Len, GenLen, StepCnt, Cnt, NewToken: integer;
-  Reused, PromptLen: integer;  // KV-cache reuse bookkeeping (and --stats)
-  Decoded, Printed: string;
-  // --stats timing (monotonic ms). TStart: before prefill; TFirst: when the
-  // first reply token is produced (so TTFT covers prefill + first step);
-  // TEnd: after the decode loop. Produced counts emitted tokens.
-  TStart, TFirst, TEnd: QWord;
-  Produced: integer;
-  DecodeSecs: double;
+type
+  TStdoutSink = class(TObject)
+    procedure TokenOut(const S: string);
+    procedure NoticeOut(const S: string);
+    procedure ReplyDone();
+  end;
+
+procedure TStdoutSink.TokenOut(const S: string);
 begin
-  Result := '';
-  Len := Length(PromptIds);
-  if Len >= SeqLen then
-  begin
-    WriteLn('[context window full (', Len, ' >= ', SeqLen,
-      ' tokens) - /reset the conversation or rebuild with a larger --ctx]');
-    exit;
-  end;
-  SetLength(Tokens, SeqLen);
-  for Cnt := 0 to Len - 1 do Tokens[Cnt] := PromptIds[Cnt];
-  SetLength(Generated, 0);
-  Printed := '';
-  InV := TNNetVolume.Create(1, 1, 1);
-  Output := nil; // a reference into the net, returned by Session.Output()
-  Row := TNNetVolume.Create(VocabSize, 1, 1);
-  TStart := GetTickCount64();
-  TFirst := 0;
-  TEnd := 0;
-  Produced := 0;
-  PromptLen := Len;
-  try
-    Chain.Reset(PromptIds);
-    // Prefill the prompt token-at-a-time, reusing the KV-cache prefix shared
-    // with last turn when possible. Reused = length of the cached prefix that
-    // still matches this prompt; TruncateTo drops the divergent tail (Reused=0
-    // is a full reset). The LAST prompt token is fed as the first decode step's
-    // input, so the cache must not already hold it - cap reuse at Len-1.
-    if CacheReuse then
-    begin
-      Reused := CommonPrefixLen(CachedTokens, PromptIds);
-      if Reused > Len - 1 then Reused := Len - 1;
-      Session.TruncateTo(Reused);
-    end
-    else
-    begin
-      Reused := 0;
-      Session.Reset(); // SSM state cannot be position-truncated; full reset
-    end;
-    for Cnt := Reused to Len - 2 do
-    begin
-      InV.FData[0] := Tokens[Cnt];
-      Session.StepForward(InV, Cnt);
-    end;
-    // --profile: discard the one-shot prefill timings (and scheduler stats)
-    // so the per-layer-class report below reflects only the repeated
-    // single-token decode steps - the steady-state workload whose layer costs
-    // we want to rank for optimization.
-    if Opt.Profile then
-    begin
-      NN.ClearTime();
-      NN.ResetSchedulerStats();
-    end;
-    for StepCnt := 1 to Opt.MaxNewTokens do
-    begin
-      if Len >= SeqLen then break;
-      // One width-1 forward of the last committed token over the cached past.
-      InV.FData[0] := Tokens[Len - 1];
-      Session.StepForward(InV, Len - 1);
-      Output := Session.Output(); // (1,1,vocab) -- the single logits row
-      for Cnt := 0 to VocabSize - 1 do Row.FData[Cnt] := Output.FData[Cnt];
-      RowSoftMax(Row);
-      Chain.ProcessRow(Row);
-      if Assigned(Sampler) then NewToken := Sampler.GetToken(Row)
-      else NewToken := ArgMaxRow(Row);
-      Chain.Commit(NewToken);
-      Tokens[Len] := NewToken;
-      Inc(Len);
-      Inc(Produced);
-      if Produced = 1 then TFirst := GetTickCount64(); // TTFT boundary
-      GenLen := Length(Generated);
-      SetLength(Generated, GenLen + 1);
-      Generated[GenLen] := NewToken;
-      // EOS / end-of-turn checks BEFORE printing so markers never echo.
-      if (Tokenizer.EosId >= 0) and (NewToken = Tokenizer.EosId) then break;
-      if TailMatches(Generated, Length(Generated), MarkerIds) then
-      begin
-        SetLength(Generated, Length(Generated) - Length(MarkerIds));
-        break;
-      end;
-      // Streamed printing: decode the whole generated region and print the
-      // delta (BPE merges/UTF-8 multibyte pieces can rewrite the tail, so
-      // only print when the previous text is still a prefix).
-      Decoded := Tokenizer.Decode(Generated, {SkipSpecialTokens=}true);
-      if (Length(Decoded) > Length(Printed)) and
-        (Copy(Decoded, 1, Length(Printed)) = Printed) then
-      begin
-        Write(Copy(Decoded, Length(Printed) + 1,
-          Length(Decoded) - Length(Printed)));
-        Flush(System.Output);
-        Printed := Decoded;
-      end;
-    end;
-    Result := Tokenizer.Decode(Generated, {SkipSpecialTokens=}true);
-    // Anything the prefix-guard held back (or trimmed markers shortened).
-    if (Length(Result) > Length(Printed)) and
-      (Copy(Result, 1, Length(Printed)) = Printed) then
-      Write(Copy(Result, Length(Printed) + 1, Length(Result) - Length(Printed)));
-    WriteLn;
-    Flush(System.Output);
-    // Record the sequence now resident in the cache for next turn's prefix
-    // diff: every token that was FED is cached (positions 0..Len-2); the final
-    // produced token (Tokens[Len-1]) was sampled but never fed, so it is not.
-    SetLength(CachedTokens, Len - 1);
-    for Cnt := 0 to Len - 2 do CachedTokens[Cnt] := Tokens[Cnt];
-    // Per-turn timing to stderr (keeps stdout = pure model output). TTFT =
-    // prefill + first decode step; tok/s measures the steady-state decode of
-    // the tokens AFTER the first, so prefill cost is excluded. prompt N (reused
-    // K) shows how much of the prompt the KV-cache reuse skipped re-prefilling.
-    if Opt.Stats and (Produced > 0) then
-    begin
-      TEnd := GetTickCount64();
-      Write(StdErr, Format('[stats] %d tokens, TTFT %d ms, prompt %d (reused %d)',
-        [Produced, TFirst - TStart, PromptLen, Reused]));
-      if Produced > 1 then
-      begin
-        DecodeSecs := (TEnd - TFirst) / 1000.0;
-        if DecodeSecs > 0 then
-          Write(StdErr, Format(', decode %.1f tok/s',
-            [(Produced - 1) / DecodeSecs]));
-      end;
-      WriteLn(StdErr);
-      Flush(StdErr);
-    end;
-    // --profile: per-layer-class forward timing accumulated over this turn's
-    // decode steps (prefill was cleared above). Printed to stderr so stdout
-    // stays pure model output. Ranks layer classes by aggregate forward cost -
-    // the actionable signal for picking the next class to optimize (e.g. OpenCL).
-    if Opt.Profile and (Produced > 0) then
-    begin
-      WriteLn(StdErr);
-      Write(StdErr, TNNet.LayerClassTimingReport(NN));
-      // Layer-graph scheduler parallelism for this turn's decode steps: how
-      // wide the graph is, how often the parallel path ran vs the serial
-      // fallback, and how much overlap it actually achieved (peak in-flight,
-      // share of layers computed off the primary worker).
-      WriteLn(StdErr, '[sched] ', NN.SchedulerStatsReport());
-      Flush(StdErr);
-    end;
-  finally
-    Row.Free;
-    InV.Free;
-  end;
+  Write(S);
+  Flush(System.Output);
+end;
+
+procedure TStdoutSink.NoticeOut(const S: string);
+begin
+  WriteLn(S);
+end;
+
+// Fired after the last streamed token, before the --stats/--profile stderr
+// reports: terminate the reply line exactly where the pre-engine
+// ChatTerminal printed its newline.
+procedure TStdoutSink.ReplyDone();
+begin
+  WriteLn;
+  Flush(System.Output);
 end;
 
 // ---------------------------------------------------------------------------
@@ -1134,6 +363,23 @@ begin
     Args.Add('--no-cache-reuse');
     Check(ParseArgs(Args, Opt) and Opt.NoCacheReuse, '--no-cache-reuse parses');
 
+    // Server flags (shared parser; ChatServer uses them, the REPL ignores
+    // them): defaults + explicit values + the port range check.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and (Opt.Host = '127.0.0.1') and
+      (Opt.Port = 8080), 'host/port defaults (loopback:8080)');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--host'); Args.Add('0.0.0.0');
+    Args.Add('--port'); Args.Add('8000');
+    Check(ParseArgs(Args, Opt) and (Opt.Host = '0.0.0.0') and
+      (Opt.Port = 8000), '--host/--port parse');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--port'); Args.Add('70000');
+    Check(not ParseArgs(Args, Opt), 'out-of-range --port rejected');
+
     // --greedy and the explicit-flag trackers.
     Args.Clear;
     Args.Add('/tmp/model');
@@ -1277,8 +523,8 @@ begin
     // Format name round trip used by --format.
     Check(ChatFormatFromName('llama3') = cfLlama3, '--format name lookup');
     Check(ChatFormatFromName('nope') = cfUnknown, 'unknown format name');
-    // 'raw' is intercepted by main BEFORE ChatFormatFromName (it is a
-    // ChatTerminal mode, not a chat template); the library must keep NOT
+    // 'raw' is intercepted by TChatEngine.LoadModel BEFORE ChatFormatFromName
+    // (it is a frontend mode, not a chat template); the library must keep NOT
     // knowing it, and cfUnknown must keep meaning "no end-of-turn marker"
     // (raw mode generation stops on EOS/--max-new-tokens only).
     Check(ChatFormatFromName('raw') = cfUnknown,
@@ -1322,29 +568,14 @@ end;
 var
   Opt: TChatOptions;
   Args: TStringList;
-  NN: TNNet;
-  Session: TNNetStreamingDecoder;
-  Tokenizer: TNeuralHFTokenizer;
-  ChatFormat: TNeuralChatFormat;
+  Engine: TChatEngine;
+  Sink: TStdoutSink;
   History: TChatMessages;
   Msgs: TChatMessages;
-  PromptIds, MarkerIds, CachedTokens: TNeuralIntegerArray;
-  Chain: TNNetLogitsProcessorChain;
-  Sampler: TNNetSamplerBase;
-  Penalty: TNNetTokenHistoryPenalty;
-  GenCfg: TGenConfigDefaults;   // model's generation_config.json (if any)
-  ReuseOK: boolean;             // KV-cache reuse sound for this architecture?
-  RawMode: boolean;             // --format raw: no chat template, the model
-                                // continues Transcript as plain text
+  PromptIds: TNeuralIntegerArray;
   Transcript: string;           // raw mode's running document (turns append)
-  {$IFDEF OpenCL}
-  GpuCL: TEasyOpenCL;           // platform/device handle for OpenCL offload
-  {$ENDIF}
-  Cnt, SeqLen, VocabSize: integer;
-  LoadStart: QWord;             // per-phase load wall clock (tokenizer,
-                                // checkpoint + caches, GPU weight upload)
-  Line, Cmd, Arg, Reply, ModelType, Marker: string;
-  TokenizerFile, TokenizerConfigFile: string;
+  Cnt: integer;
+  Line, Cmd, Arg, Reply, ErrorMsg: string;
 begin
   Args := TStringList.Create();
   for Cnt := 1 to ParamCount do Args.Add(ParamStr(Cnt));
@@ -1369,270 +600,22 @@ begin
     Halt(0);
   end;
 
-  // Tokenizer + chat format.
-  TokenizerFile := IncludeTrailingPathDelimiter(Opt.ModelDir) +
-    'tokenizer.json';
-  if not FileExists(TokenizerFile) then
+  Sink := TStdoutSink.Create();
+  Engine := TChatEngine.Create();
+  Engine.OnToken := @Sink.TokenOut;
+  Engine.OnNotice := @Sink.NoticeOut;
+  Engine.OnReplyDone := @Sink.ReplyDone;
+  if not Engine.LoadModel(Opt, ErrorMsg) then
   begin
-    WriteLn('No tokenizer.json found in ', Opt.ModelDir);
+    WriteLn(ErrorMsg);
+    Engine.Free;
+    Sink.Free;
     Halt(1);
   end;
-  Tokenizer := TNeuralHFTokenizer.Create();
-  LoadStart := GetTickCount64();
-  Tokenizer.LoadFromFile(TokenizerFile);
-  WriteLn('Tokenizer loaded in ',
-    (GetTickCount64() - LoadStart) / 1000: 0: 1, 's.');
-
-  // 'raw' is a ChatTerminal-level mode, not a chat template, so it is
-  // intercepted here and never reaches ChatFormatFromName (which returns
-  // cfUnknown for it). ChatFormat stays cfUnknown in raw mode - that also
-  // keeps EndOfTurnMarker() = '' (no stop marker, EOS/cap only).
-  ChatFormat := cfUnknown;
-  RawMode := LowerCase(Opt.FormatName) = 'raw';
-  if RawMode then
-  begin
-    WriteLn('[raw completion mode (--format raw) - no chat template; the',
-      ' model continues the transcript; stops on EOS or --max-new-tokens]');
-    if Opt.SystemPrompt <> '' then
-    begin
-      WriteLn('[--system ignored: no system role in raw mode]');
-      Opt.SystemPrompt := '';
-    end;
-  end
-  else if Opt.FormatName <> '' then
-  begin
-    ChatFormat := ChatFormatFromName(Opt.FormatName);
-    if ChatFormat = cfUnknown then
-    begin
-      WriteLn('Unknown --format name: ', Opt.FormatName);
-      Halt(1);
-    end;
-  end
-  else
-  begin
-    TokenizerConfigFile := IncludeTrailingPathDelimiter(Opt.ModelDir) +
-      'tokenizer_config.json';
-    if FileExists(TokenizerConfigFile) then
-      ChatFormat := DetectChatFormatFromConfigFile(TokenizerConfigFile);
-    if ChatFormat = cfUnknown then
-    begin
-      WriteLn('[no chat template detected - defaulting to ChatML; override',
-        ' with --format]');
-      ChatFormat := cfChatML;
-    end;
-  end;
-
-  if Opt.Seed >= 0 then RandSeed := Opt.Seed
-  else Randomize;
-
-  // Default context window. KV-cache streamed decode (below) holds K/V for up
-  // to CtxLen tokens PER HEAD PER LAYER, so cache memory grows as O(CtxLen)
-  // (not the O(CtxLen^2) score buffers a full-recompute decode would allocate).
-  // Using the checkpoint's full max_position_embeddings (32768 for Qwen2.5)
-  // would still be large, so when the user gives no --ctx we cap the default at
-  // DefaultCtxCap (clamped to the model's own limit). Raise it with --ctx N
-  // if you have the RAM (the default int8 weights help there too).
-  if Opt.CtxLen <= 0 then
-  begin
-    Cnt := ReadConfigInt(IncludeTrailingPathDelimiter(Opt.ModelDir) +
-      'config.json', 'max_position_embeddings', DefaultCtxCap);
-    if (Cnt <= 0) or (Cnt > DefaultCtxCap) then Cnt := DefaultCtxCap;
-    Opt.CtxLen := Cnt;
-    WriteLn('[context not set - defaulting to ', Opt.CtxLen,
-      ' tokens; override with --ctx N (memory grows ~O(ctx^2))]');
-  end;
-
-  {$IFDEF OpenCL}
-  GpuCL := nil;
-  if Opt.Gpu and Opt.LowMemory then
-  begin
-    WriteLn('[--low-memory ignored: incompatible with --gpu]');
-    Opt.LowMemory := false;
-  end;
-  {$ENDIF}
-
-  // Model: generic architecture dispatch, inference-only, int8 by default.
-  // Weight precision. Int8 is the default (less RAM and faster on CPU and
-  // GPU); --fp32 opts into full-precision weights (more RAM, slower).
-  if Opt.Int8 then
-    WriteLn('[int8 weights (default) - less RAM, faster on CPU and GPU;',
-      ' on --gpu the codes stay resident on the device; --fp32 opts out]')
-  else
-    WriteLn('[--fp32: full-precision weights - more RAM, slower than int8]');
-  if Opt.LowMemory then
-    WriteLn('[low-memory forward (default) - concatenated weight cache dropped,',
-      ' per-neuron compute, not compatible with GPU,',
-      ' pass --max-fast-memory to keep the (faster) cache and/or use GPU.]')
-  else
-    WriteLn('[--max-fast-memory: concatenated weight cache kept - faster forward,',
-      ' more RAM, GPU compatible]');
-
-  WriteLn('Loading ', Opt.ModelDir, ' ...');
-  LoadStart := GetTickCount64();
-  // Built at INPUT WIDTH 1 (pSeqLen=1): streamed decode feeds one token per
-  // forward and the KV cache (budget = CtxLen, set on the session below) holds
-  // the context. SeqLen is the cache budget, NOT the built input width.
-  NN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}1,
-    {pTrainable=}false, '', {pQuantizeInt8=}Opt.Int8);
-  // Low-memory forward path, set independently of trainability. The importer
-  // built inference-only with low memory ON (SetTrainable's pLowMemory default);
-  // honor --max-fast-memory by re-sweeping the layers, then flush each weight
-  // cache so the concatenated-weight cache is (re)built or dropped to match.
-  NN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
-  for Cnt := 0 to NN.GetLastLayerIdx() do
-    NN.Layers[Cnt].FlushWeightCache();
-  WriteLn('Model loaded in ',
-    (GetTickCount64() - LoadStart) / 1000: 0: 1, 's.');
-
-  {$IFDEF OpenCL}
-  // OpenCL offload of the conv/linear matmuls. Enabling it rebuilds each
-  // accelerated layer's concatenated weight cache and turns its low-memory
-  // forward path off (the GPU kernel needs the cache), so --gpu effectively
-  // overrides --low-memory on those layers. With --int8 the layers instead
-  // arm the resident int8 device mode (cai_dot_product_int8): the quantized
-  // codes + per-row scales are uploaded once and stay on the device.
-  if Opt.Gpu then
-  begin
-    GpuCL := TEasyOpenCL.Create();
-    if GpuCL.GetPlatformCount() = 0 then
-    begin
-      WriteLn('[--gpu: no OpenCL platform found - falling back to CPU]');
-      FreeAndNil(GpuCL);
-    end
-    else
-    begin
-      if (Opt.GpuPlatform < 0) or
-        (Opt.GpuPlatform >= GpuCL.GetPlatformCount()) then Opt.GpuPlatform := 0;
-      GpuCL.SetCurrentPlatform(GpuCL.PlatformIds[Opt.GpuPlatform]);
-      if GpuCL.GetDeviceCount() = 0 then
-      begin
-        WriteLn('[--gpu: no OpenCL device on platform ',
-          GpuCL.PlatformNames[Opt.GpuPlatform], ' - falling back to CPU]');
-        FreeAndNil(GpuCL);
-      end
-      else
-      begin
-        if (Opt.GpuDevice < 0) or
-          (Opt.GpuDevice >= GpuCL.GetDeviceCount()) then Opt.GpuDevice := 0;
-        GpuCL.SetCurrentDevice(GpuCL.Devices[Opt.GpuDevice]);
-        WriteLn('[--gpu: OpenCL on ', GpuCL.PlatformNames[Opt.GpuPlatform],
-          ' / ', GpuCL.DeviceNames[Opt.GpuDevice], ']');
-        LoadStart := GetTickCount64();
-        NN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
-          GpuCL.Devices[Opt.GpuDevice]);
-        WriteLn('GPU weights uploaded in ',
-          (GetTickCount64() - LoadStart) / 1000: 0: 1, 's.');
-      end;
-    end;
-  end;
-  {$ENDIF}
-
-  SeqLen := Opt.CtxLen;
-  VocabSize := NN.GetLastLayer().Output.Depth;
-  // int8 KV cache is armed at construction so the FP32 K/V buffers are never
-  // allocated (a post-Create switch frees them, but the allocator arena may
-  // keep the pages). /reset and cache-reuse truncation keep the int8 mode
-  // (they only rewind the cache length).
-  Session := TNNetStreamingDecoder.Create(NN, SeqLen, Opt.KVInt8);
-  if Opt.KVInt8 then
-    WriteLn('[int8 KV cache (default with int8 weights) - ~1/4 the KV RAM, ',
-      'logits not bit-exact; --kv-fp32 opts out]');
-  // Layer-graph parallel forward by default: independent layers of one token
-  // step (e.g. an MHA block's sibling heads) run across cores. --serial keeps
-  // the classic in-order layer loop. The compute path also drives intra-layer
-  // threading automatically: ComputeParallel enables it (big WillThread
-  // conv/linear layers above the MinWork threshold split across the pool via
-  // worker 0), ComputeSerial runs fully single-threaded. No separate flag.
-  Session.Parallel := not Opt.Serial;
-  // Keep the scheduler's worker pool alive and HOT between decode steps (default
-  // policy: ~50% of the pool hot, worker 0 always) so each token's parallel
-  // forward reaches the workers without re-warming the pool every step.
-  if Session.Parallel then NN.StartThreadWorkers();
-  // KV-cache reuse across turns needs position-truncatable attention K/V and no
-  // recurrent (SSM) state to rewind. Pure-attention nets qualify; --no-cache-
-  // reuse forces the full re-prefill at the call site.
-  ReuseOK := (Session.SSMCount = 0) and (Session.SDPACount > 0);
-  SetLength(CachedTokens, 0);
-  ModelType := ReadModelType(IncludeTrailingPathDelimiter(Opt.ModelDir) +
-    'config.json');
-  if ModelType = '' then ModelType := 'unknown';
-  Write('Model: ', ModelType, ', ', NN.CountWeights(), ' params, vocab ',
-    VocabSize, ', context ', SeqLen, ', chat format ');
-  if RawMode then Write('raw (completion)')
-  else Write(ChatFormatName(ChatFormat));
-  WriteLn(', ', BoolToStr(Opt.Int8, 'int8', 'fp32'), ' weights.');
-  if Opt.NoCacheReuse then
-    WriteLn('[KV-cache reuse OFF (--no-cache-reuse) - full re-prefill each turn]')
-  else if ReuseOK then
-    WriteLn('[KV-cache reuse ON - only the new prompt tail is prefilled each turn]')
-  else
-    WriteLn('[KV-cache reuse N/A for this architecture (recurrent/SSM state)',
-      ' - full re-prefill each turn]');
-  if Opt.Serial then
-    WriteLn('[serial layer loop (--serial) - fully single-threaded]')
-  else
-    WriteLn('[layer-graph parallel forward (default) - independent layers and',
-      ' large conv/linear layers threaded; pass --serial for the serial loop]');
-
-  // Sampling defaults: explicit flag > the model's generation_config.json >
-  // built-in fallback (top-p 0.2 + repetition-penalty 1.05); --greedy
-  // overrides everything (deterministic argmax, the CPU/GPU parity mode).
-  GenCfg := ReadGenerationConfig(
-    IncludeTrailingPathDelimiter(Opt.ModelDir) + 'generation_config.json');
-  ApplySamplingDefaults(Opt, GenCfg);
-  if Opt.Greedy then
-    WriteLn('[sampling: greedy argmax (--greedy) - deterministic]')
-  else
-  begin
-    Write('[sampling:');
-    if Opt.TopK > 0 then
-      Write(' top-k ', Opt.TopK,
-        BoolToStr(Opt.WeightedTopK, ' weighted', ' uniform'))
-    else if Opt.TopP > 0 then Write(' top-p ', Opt.TopP:0:2)
-    else if Opt.MinP > 0 then Write(' min-p ', Opt.MinP:0:2)
-    else Write(' greedy argmax');
-    if Opt.Temperature <> 1.0 then
-      Write(', temperature ', Opt.Temperature:0:2);
-    if Opt.RepetitionPenalty <> 1.0 then
-      Write(', repetition-penalty ', Opt.RepetitionPenalty:0:2);
-    if GenCfg.Found then
-      WriteLn(' - flags > generation_config.json > fallback]')
-    else
-      WriteLn(' - flags > built-in fallback (no generation_config.json)]');
-  end;
-
-  // Distribution pipeline (TGenerationConfig order: penalty -> temperature
-  // -> sampler).
-  Chain := TNNetLogitsProcessorChain.Create();
-  Penalty := nil;
-  if (Opt.RepetitionPenalty <> 1.0) or (Opt.FrequencyPenalty <> 0) or
-    (Opt.PresencePenalty <> 0) then
-  begin
-    Penalty := TNNetTokenHistoryPenalty.Create(Opt.RepetitionPenalty,
-      Opt.FrequencyPenalty, Opt.PresencePenalty);
-    Chain.Add(TNNetPenaltyProcessor.Create(Penalty, {OwnsPenalty=}true),
-      {OwnsProcessor=}true);
-  end;
-  if Opt.Temperature <> 1.0 then
-    Chain.Add(TNNetTemperatureProcessor.Create(Opt.Temperature), true);
-  Sampler := nil;
-  if Opt.TopK > 0 then
-  begin
-    if Opt.WeightedTopK then Sampler := TNNetSamplerWeightedTopK.Create(Opt.TopK)
-    else Sampler := TNNetSamplerTopK.Create(Opt.TopK);
-  end
-  else if Opt.TopP > 0 then Sampler := TNNetSamplerTopP.Create(Opt.TopP)
-  else if Opt.MinP > 0 then Sampler := TNNetSamplerMinP.Create(Opt.MinP);
-
-  // End-of-turn marker as a token-id stop sequence (single id when the
-  // tokenizer has it as an added token, a multi-id sequence otherwise).
-  Marker := EndOfTurnMarker(ChatFormat);
-  if Marker <> '' then MarkerIds := Tokenizer.Encode(Marker)
-  else SetLength(MarkerIds, 0);
 
   SetLength(History, 0);
   Transcript := '';
-  if RawMode then
+  if Engine.RawMode then
     WriteLn('Type text to complete; /exit quits, /reset clears the transcript.')
   else
   begin
@@ -1654,45 +637,39 @@ begin
       begin
         SetLength(History, 0);
         Transcript := '';
-        if RawMode then WriteLn('[transcript cleared]')
+        if Engine.RawMode then WriteLn('[transcript cleared]')
         else WriteLn('[history cleared]');
       end
       else if Cmd = 'system' then
       begin
-        if RawMode then
+        if Engine.RawMode then
           WriteLn('[no system role in raw mode - ignored]')
         else
         begin
-          Opt.SystemPrompt := Arg;
+          Engine.Opt.SystemPrompt := Arg;
           WriteLn('[system prompt set]');
         end;
       end
       else WriteLn('[unknown command /', Cmd, ' - /exit, /reset, /system]');
       continue;
     end;
-    if RawMode then
+    if Engine.RawMode then
     begin
       // Completion notebook: the typed line extends the running transcript
       // verbatim and the reply extends it further, so each turn's token ids
       // are a strict prefix-extension of the previous turn's - the KV-cache
       // reuse diff (CommonPrefixLen) prefills only the new tail for free.
       Transcript := Transcript + Line;
-      PromptIds := Tokenizer.Encode(Transcript);
-      Reply := GenerateReply(NN, Session, Tokenizer, PromptIds, Opt, SeqLen,
-        VocabSize, Chain, Sampler, MarkerIds, CachedTokens,
-        {CacheReuse=}ReuseOK and not Opt.NoCacheReuse);
+      PromptIds := Engine.Tokenizer.Encode(Transcript);
+      Reply := Engine.GenerateFromIds(PromptIds, Engine.Opt);
       Transcript := Transcript + Reply;
       continue;
     end;
     SetLength(History, Length(History) + 1);
     History[High(History)] := ChatMessage('user', Line);
     try
-      Msgs := AssembleMessages(Opt.SystemPrompt, History);
-      PromptIds := EncodeChat(Tokenizer, ChatFormat, Msgs,
-        {AddGenerationPrompt=}true);
-      Reply := GenerateReply(NN, Session, Tokenizer, PromptIds, Opt, SeqLen,
-        VocabSize, Chain, Sampler, MarkerIds, CachedTokens,
-        {CacheReuse=}ReuseOK and not Opt.NoCacheReuse);
+      Msgs := AssembleMessages(Engine.Opt.SystemPrompt, History);
+      Reply := Engine.ChatReply(Msgs, Engine.Opt);
       SetLength(History, Length(History) + 1);
       History[High(History)] := ChatMessage('assistant', Reply);
     except
@@ -1706,12 +683,6 @@ begin
     end;
   end;
   WriteLn('Bye.');
-  Sampler.Free;
-  Chain.Free; // owns the processors, which own the penalty
-  Session.Free; // before NN.Free: Destroy ends incremental decode on NN's layers
-  Tokenizer.Free;
-  NN.Free;
-  {$IFDEF OpenCL}
-  GpuCL.Free; // after NN.Free; nil-safe when --gpu was off or fell back to CPU
-  {$ENDIF}
+  Engine.Free; // frees session (before the net), tokenizer, net, GPU handle
+  Sink.Free;
 end.

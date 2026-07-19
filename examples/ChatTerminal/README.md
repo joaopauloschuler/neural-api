@@ -266,9 +266,42 @@ full-recompute decode). Expect it to be CPU-slow on multi-billion-parameter
 checkpoints; small instruct models (0.5B-1B, `--ctx 512`) are the
 comfortable range.
 
+## ChatServer: the same engine over HTTP
+
+`ChatServer` (in this folder) is a minimal OpenAI-style HTTP server over the
+same shared engine (`neural/neuralchatengine.pas`, `TChatEngine`), so
+neural-api models can be called from any codebase that speaks the OpenAI
+REST shape. It takes the SAME command line as ChatTerminal plus `--host`
+(default `127.0.0.1`, loopback only) and `--port` (default `8080`):
+
+```
+$ ChatServer /path/to/model --temperature 0.7 --top-p 0.9 --port 8080
+...
+Serving model on http://127.0.0.1:8080/v1 (non-streaming; Ctrl+C stops)
+
+$ curl http://127.0.0.1:8080/v1/chat/completions \
+    -d '{"messages":[{"role":"user","content":"Hi!"}],"max_tokens":64}'
+```
+
+Endpoints: `POST /v1/chat/completions` (messages rendered through the
+model's chat template), `POST /v1/completions` (plain completion, no
+template - the `--format raw` path), `GET /v1/models`. Non-streaming only:
+`"stream": true` is rejected with a clear error (never a hanging SSE
+client), as is `"n"` other than 1. Request fields `temperature`, `top_p`,
+`top_k`, `min_p`, `repetition_penalty`, `frequency_penalty`,
+`presence_penalty` and `max_tokens`/`max_completion_tokens` override the
+launch defaults per request; absent fields fall back to them.
+
+Requests are handled strictly one at a time (one model, one KV-cache
+session; the non-threaded accept loop is the serialization). The KV-cache
+prefix reuse still applies across requests: a growing conversation re-sent
+in full each turn only prefills the new tail, so time-to-first-token stays
+roughly flat. `ChatServer --selftest` runs the offline request-parsing and
+parameter-overlay checks.
+
 ## Testing
 
-`--selftest` runs 75 offline checks (argument parsing, prompt assembly
+`--selftest` runs 82 offline checks (argument parsing, prompt assembly
 against the byte-exact ChatML render, end-of-turn markers, REPL command
 parsing, the KV-cache-reuse prefix diff) without needing any model files. For an end-to-end plumbing check,
 any directory with a pico-sized random checkpoint plus a tokenizer works —
