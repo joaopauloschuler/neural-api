@@ -1260,7 +1260,7 @@ const
   csMaxHashKeyBytes = 255;
 var
   SpanStart, SpanEnd: array of integer; // key-content byte spans, inclusive
-  SpanCnt: integer;
+  SpanCnt, SpanCntM1: integer;
   Position, Total, ContentStart, ContentEnd, Look: integer;
   Cnt, Prev: integer;
   Marker, Placeholder: string;
@@ -1309,7 +1309,8 @@ begin
   while Pos(Marker, S) > 0 do Marker := '~' + Marker;
   Result := '';
   Prev := 1;
-  for Cnt := 0 to SpanCnt - 1 do
+  SpanCntM1 := SpanCnt - 1;
+  for Cnt := 0 to SpanCntM1 do
   begin
     Placeholder := Marker + IntToStr(ShieldedKeys.Count) + '~';
     ShieldedKeys.Add(Placeholder + '=' + UnescapeJSONStringBody(
@@ -1325,17 +1326,18 @@ end;
 function HFUnshieldJSONKey(const Key: string;
   ShieldedKeys: TStrings): string;
 var
-  Cnt, CntMax, EqPos: integer;
+  Cnt, CntMax, EqPos, KeyLen: integer;
   Entry: string;
 begin
   Result := Key;
   if (ShieldedKeys = nil) or (ShieldedKeys.Count = 0) then exit;
   CntMax := ShieldedKeys.Count - 1;
+  KeyLen := Length(Key);
   for Cnt := 0 to CntMax do
   begin
     Entry := ShieldedKeys[Cnt];
     EqPos := Pos('=', Entry);
-    if (EqPos - 1 = Length(Key)) and (Copy(Entry, 1, EqPos - 1) = Key) then
+    if (EqPos - 1 = KeyLen) and (Copy(Entry, 1, EqPos - 1) = Key) then
       Exit(Copy(Entry, EqPos + 1, Length(Entry)));
   end;
 end;
@@ -2877,21 +2879,24 @@ var
   // stages 2-4 for one punctuation-stage piece
   procedure EmitRun(const Run: string);
   var
-    Cnt, SubCnt, ByteCnt, SubLen: integer;
-    Mapped: string;
+    Cnt, SubCnt, ByteCnt, SubLen, SubPiecesM1, DigitRunsM1: integer;
+    Mapped, Piece: string;
   begin
     SubPieces.Clear;
     ByteLevelPieces(Run, SubPieces);
-    for Cnt := 0 to SubPieces.Count - 1 do
+    SubPiecesM1 := SubPieces.Count - 1;
+    for Cnt := 0 to SubPiecesM1 do
     begin
       Mapped := '';
-      SubLen := Length(SubPieces[Cnt]);
+      Piece := SubPieces[Cnt];
+      SubLen := Length(Piece);
       for ByteCnt := 1 to SubLen do
         Mapped := Mapped +
-          CodePointToUTF8(FByteToCP[Ord(SubPieces[Cnt][ByteCnt])]);
+          CodePointToUTF8(FByteToCP[Ord(Piece[ByteCnt])]);
       DigitRuns.Clear;
       SplitDigitsPieces(Mapped, false, DigitRuns);
-      for SubCnt := 0 to DigitRuns.Count - 1 do
+      DigitRunsM1 := DigitRuns.Count - 1;
+      for SubCnt := 0 to DigitRunsM1 do
         ChunkThreeDigits(DigitRuns[SubCnt]);
     end;
   end;
@@ -2942,7 +2947,7 @@ var
   CPs: array of cardinal;
   CPStr: array of string;
   Total, Position, Idx, RunStart, RunEnd, LastNL, DigitCnt: integer;
-  MarksJoin: boolean;
+  MarksJoin, IdxIsRun: boolean;
 
   // the letter-run class: \p{L}, or [\p{L}\p{M}] in marks-join mode
   function IsRunCP(CP: cardinal): boolean;
@@ -3024,12 +3029,13 @@ begin
     // 2. [^\r\n\p{L}\p{N}]?\p{L}+  (optional ONE non-CR/LF non-letter
     //    non-number char glued to a letter run; marks-join mode widens the
     //    run class to [\p{L}\p{M}])
-    if IsRunCP(CPs[Idx]) or ((not IsNewlineCP(CPs[Idx])) and
+    IdxIsRun := IsRunCP(CPs[Idx]);
+    if IdxIsRun or ((not IsNewlineCP(CPs[Idx])) and
       (not IsNumberCP(CPs[Idx])) and (Idx + 1 < Total) and
       IsRunCP(CPs[Idx + 1])) then
     begin
       RunEnd := Idx;
-      if not IsRunCP(CPs[Idx]) then Inc(RunEnd); // the optional char
+      if not IdxIsRun then Inc(RunEnd); // the optional char
       while (RunEnd + 1 < Total) and IsRunCP(CPs[RunEnd + 1]) do
         Inc(RunEnd);
       Pieces.Add(Collect(Idx, RunEnd));
@@ -3834,8 +3840,9 @@ procedure TNeuralHFTokenizer.EncodeSegment(const Segment: string;
 var
   Pieces, Symbols, DigitPieces: TStringList;
   Cnt, Position, RunStart, PieceStart, PiecesCnt, NormReplaceHi: integer;
+  PieceLen: integer;
   Normalized: string;
-  Seg: string;
+  Seg, Piece: string;
 
   // BPEs Normalized[PieceFrom..PieceTo] (1-based bytes) over codepoints.
   procedure BPECodePoints(PieceFrom, PieceTo: integer);
@@ -3947,12 +3954,14 @@ begin
       begin
         Symbols := TStringList.Create();
         try
+          Piece := Pieces[Cnt];
+          PieceLen := Length(Piece);
           Position := 1;
-          while Position <= Length(Pieces[Cnt]) do
+          while Position <= PieceLen do
           begin
             RunStart := Position;
-            NextCodePoint(Pieces[Cnt], Position);
-            Symbols.Add(Copy(Pieces[Cnt], RunStart, Position - RunStart));
+            NextCodePoint(Piece, Position);
+            Symbols.Add(Copy(Piece, RunStart, Position - RunStart));
           end;
           BPEWord(Symbols, Ids);
         finally
