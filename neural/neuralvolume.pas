@@ -10526,7 +10526,7 @@ procedure TNNetGroupedVolume.GroupedDotProductsTiledInt8(Groups, NumAs, NumBs,
 var
   CntA, CntB: integer;
   GroupASize, VectorBSize, GroupIdVectorSize: integer;
-  RowBase: integer;
+  RowBase, BOfs, AOfs, InGroupLeft: integer;
   PtrA: TNeuralInt8ArrPtr;
   PtrB: TNeuralFloatArrPtr;
   // Tiling
@@ -10552,13 +10552,23 @@ begin
       for CntB := StartTileB to EndTileB do
       begin
         RowBase := CntB * NumAs;
+        BOfs := CntB * VectorBSize;
+        AOfs := StartTileA * VectorSize;
+        GroupIdVectorSize := (StartTileA div GroupASize) * VectorSize;
+        InGroupLeft := GroupASize - (StartTileA mod GroupASize);
         for CntA := StartTileA to EndTileA do
         begin
-          GroupIdVectorSize := (CntA div GroupASize) * VectorSize;
-          PtrA := Addr(Codes[CntA * VectorSize]);
-          PtrB := VBs.GetRawPtr(CntB * VectorBSize + GroupIdVectorSize);
+          PtrA := Addr(Codes[AOfs]);
+          PtrB := VBs.GetRawPtr(BOfs + GroupIdVectorSize);
           FData[RowBase + CntA] := DotProductInt8(PtrA, PtrB, VectorSize)
             * Scales[CntA];
+          Inc(AOfs, VectorSize);
+          Dec(InGroupLeft);
+          if InGroupLeft = 0 then
+          begin
+            Inc(GroupIdVectorSize, VectorSize);
+            InGroupLeft := GroupASize;
+          end;
         end;
       end;
     end;
