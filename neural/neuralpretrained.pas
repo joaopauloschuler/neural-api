@@ -14601,8 +14601,8 @@ procedure LoadLlamaLinearWeights(Reader: TNNetSafeTensorsReader;
   Scale: TNeuralFloat = 1.0; RotaryDims: integer = 0;
   SrcRowBase: integer = 0; SrcRows: integer = 0);
 var
-  W, B: TNNetVolume;
-  i, j, TargetIdx, HalfDim, SrcRow: integer;
+  W, B, WV: TNNetVolume;
+  i, j, TargetIdx, HalfDim, SrcRow, Base, Row: integer;
   OutDimM1, InDimM1: integer;
   QLayer: TNNetLayerConcatedWeights;
   DirectInt8: boolean;
@@ -14730,11 +14730,12 @@ begin
         // rows - MapTargetNeuron is injective).
         for RowCnt := 0 to RowsInChunk - 1 do
         begin
-          TargetIdx := MapTargetNeuron(j + RowCnt);
+          Row := j + RowCnt;
+          TargetIdx := MapTargetNeuron(Row);
           ChunkTargets[RowCnt] := TargetIdx;
           if B <> nil then
             Layer.FArrNeurons[TargetIdx].BiasWeight :=
-              Scale * B.FData[SrcRowBase + j + RowCnt]
+              Scale * B.FData[SrcRowBase + Row]
           else
             Layer.FArrNeurons[TargetIdx].BiasWeight := 0; // bias-free Linear
         end;
@@ -14759,9 +14760,10 @@ begin
             IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
             IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
             ' weights, expected ' + IntToStr(InDim) + '.');
+        Base := SrcRow * InDim;
+        WV := Layer.FArrNeurons[TargetIdx].Weights;
         for i := 0 to InDimM1 do
-          Layer.FArrNeurons[TargetIdx].Weights.FData[i] :=
-            Scale * W.FData[SrcRow * InDim + i];
+          WV.FData[i] := Scale * W.FData[Base + i];
         if B <> nil then
           Layer.FArrNeurons[TargetIdx].BiasWeight := Scale * B.FData[SrcRow]
         else
@@ -15523,9 +15525,9 @@ procedure LoadQwen35DeltaNetWeights(Reader: TNNetSafeTensorsReader;
   const Config: TLlamaConfig; Consumed: TStringList);
 var
   LinPrefix, TName: string;
-  KeyDim, ValueDim, ConvDim, d, kk: integer;
+  KeyDim, ValueDim, ConvDim, d, kk, Base: integer;
   ConvDimM1, KernelM1: integer;
-  Tmp: TNNetVolume;
+  Tmp, WV: TNNetVolume;
 
   procedure LoadDeltaVector(NeuronIdx, Channels: integer;
     const VName: string);
@@ -15585,9 +15587,10 @@ begin
     KernelM1 := Config.LinearConvKernel - 1;
     for d := 0 to ConvDimM1 do
     begin
+      Base := d * Config.LinearConvKernel;
+      WV := Block.LinConv.FArrNeurons[d].Weights;
       for kk := 0 to KernelM1 do
-        Block.LinConv.FArrNeurons[d].Weights.FData[kk] :=
-          Tmp.FData[d * Config.LinearConvKernel + kk];
+        WV.FData[kk] := Tmp.FData[Base + kk];
       Block.LinConv.FArrNeurons[d].BiasWeight := 0; // bias-free conv
     end;
     Block.LinConv.FlushWeightCache();
@@ -15628,7 +15631,8 @@ var
   SliceChannels, RotChannels, PassChannels: array of integer;
   BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
   HeadDim, QWidth, KVWidth, RotaryDims, LayerWindow, i, j, d: integer;
-  QProjWidth: integer;
+  QProjWidth, Base: integer;
+  WV: TNNetVolume;
   AttnConcat: TNNetLayer;
   RotaryHeadDimArg: integer;
   ReaderMax: integer;
@@ -16412,9 +16416,10 @@ begin
             HiddenSizeM1 := Config.HiddenSize - 1;
             for j := 0 to VocabSizeM1 do
             begin
+              Base := j * Config.HiddenSize;
+              WV := LMHead.FArrNeurons[j].Weights;
               for i := 0 to HiddenSizeM1 do
-                LMHead.FArrNeurons[j].Weights.FData[i] :=
-                  LogitScaleFold * Tmp.FData[j * Config.HiddenSize + i];
+                WV.FData[i] := LogitScaleFold * Tmp.FData[Base + i];
               LMHead.FArrNeurons[j].BiasWeight := 0;
             end;
             LMHead.FlushWeightCache();
@@ -30919,10 +30924,11 @@ procedure RunFlorence2Projector(const Config: TFlorence2Config;
 var
   C, H, W, HalfC, RestC, hh, ww, ch, NumCells, CellIdx, ProjDim, k: integer;
   HM1, WM1, CM1, NumCellsM1, ProjDimM1: integer;
+  colBase, rowBase, cellBase, kBase, TokBase, pos: integer;
   PosFeat: TNNetVolume;     // (H*W, 1, C) position-added flattened tokens
   Temporal: TNNetVolume;    // (C) the row-0 cosine vector
   SpatialMean: TNNetVolume; // (C)
-  Acc, Mean, Variance, Inv, NormVal, Eps, Val: TNeuralFloat;
+  Acc, Mean, Variance, Inv, NormVal, Eps, Val, TVal: TNeuralFloat;
 begin
   C := Config.FeatureChannels;
   H := Config.FeatureHeight;
@@ -30955,19 +30961,24 @@ begin
     // pos embed for cell (h,w) = cat(column_embeddings[w][:HalfC],
     //                                 row_embeddings[h][HalfC:]).
     for hh := 0 to HM1 do
+    begin
+      rowBase := hh * RestC;
       for ww := 0 to WM1 do
       begin
         CellIdx := hh * W + ww;
+        colBase := ww * HalfC;
+        cellBase := CellIdx * C;
         for ch := 0 to CM1 do
         begin
           Val := FeatureMap[ww, hh, ch];
           if ch < HalfC then
-            Val := Val + Projector.ColEmbed.FData[ww * HalfC + ch]
+            Val := Val + Projector.ColEmbed.FData[colBase + ch]
           else
-            Val := Val + Projector.RowEmbed.FData[hh * RestC + (ch - HalfC)];
-          PosFeat.FData[CellIdx * C + ch] := Val;
+            Val := Val + Projector.RowEmbed.FData[rowBase + (ch - HalfC)];
+          PosFeat.FData[cellBase + ch] := Val;
         end;
       end;
+    end;
 
     // temporal embed = cosine table row 0 (single frame).
     for ch := 0 to CM1 do
@@ -30978,8 +30989,9 @@ begin
     for ch := 0 to CM1 do
     begin
       Acc := 0;
+      TVal := Temporal.FData[ch];
       for CellIdx := 0 to NumCellsM1 do
-        Acc := Acc + PosFeat.FData[CellIdx * C + ch] + Temporal.FData[ch];
+        Acc := Acc + PosFeat.FData[CellIdx * C + ch] + TVal;
       SpatialMean.FData[ch] := Acc / NumCells;
     end;
 
@@ -30993,42 +31005,46 @@ begin
     // We inline it for both the spatial-mean row and the per-cell rows.
     for CellIdx := 0 to NumCells do
     begin
+      TokBase := CellIdx * ProjDim;
+      cellBase := (CellIdx - 1) * C;
       // Build the C-dim source vector for this token into SpatialMean? no -
       // use a local read. Project: out[k] = sum_ch src[ch]*ProjWeight[k][ch].
       for k := 0 to ProjDimM1 do
       begin
         Acc := 0;
+        kBase := k * C;
         if CellIdx = 0 then
         begin
           for ch := 0 to CM1 do
             Acc := Acc + SpatialMean.FData[ch] *
-              Projector.ProjWeight.FData[k * C + ch];
+              Projector.ProjWeight.FData[kBase + ch];
         end
         else
         begin
           for ch := 0 to CM1 do
-            Acc := Acc + (PosFeat.FData[(CellIdx - 1) * C + ch] +
-              Temporal.FData[ch]) * Projector.ProjWeight.FData[k * C + ch];
+            Acc := Acc + (PosFeat.FData[cellBase + ch] +
+              Temporal.FData[ch]) * Projector.ProjWeight.FData[kBase + ch];
         end;
-        VisualTokens.FData[CellIdx * ProjDim + k] := Acc;
+        VisualTokens.FData[TokBase + k] := Acc;
       end;
       // LayerNorm over the ProjDim depth of this token.
       Mean := 0;
       for k := 0 to ProjDimM1 do
-        Mean := Mean + VisualTokens.FData[CellIdx * ProjDim + k];
+        Mean := Mean + VisualTokens.FData[TokBase + k];
       Mean := Mean / ProjDim;
       Variance := 0;
       for k := 0 to ProjDimM1 do
       begin
-        NormVal := VisualTokens.FData[CellIdx * ProjDim + k] - Mean;
+        NormVal := VisualTokens.FData[TokBase + k] - Mean;
         Variance := Variance + NormVal * NormVal;
       end;
       Variance := Variance / ProjDim;
       Inv := 1.0 / Sqrt(Variance + Eps);
       for k := 0 to ProjDimM1 do
       begin
-        NormVal := (VisualTokens.FData[CellIdx * ProjDim + k] - Mean) * Inv;
-        VisualTokens.FData[CellIdx * ProjDim + k] :=
+        pos := TokBase + k;
+        NormVal := (VisualTokens.FData[pos] - Mean) * Inv;
+        VisualTokens.FData[pos] :=
           NormVal * Projector.NormGain.FData[k] + Projector.NormBias.FData[k];
       end;
     end;
@@ -34197,7 +34213,7 @@ procedure BarkApplyTrunkAndHead(SubModel: TBarkSubModel; Emb: TNNetVolume;
 var
   TrunkOut: TNNetVolume;
   Hidden, OutVocab, SeqLen, p, t, k: integer;
-  SeqLenM1, OutVocabM1, HiddenM1: integer;
+  SeqLenM1, OutVocabM1, HiddenM1, pBase, tBase: integer;
   Acc: TNeuralFloat;
   HW, HB: TNNetVolume;
 begin
@@ -34213,20 +34229,24 @@ begin
   OutVocabM1 := OutVocab - 1;
   HiddenM1 := Hidden - 1;
   for p := 0 to SeqLenM1 do
+  begin
+    pBase := p * Hidden;
     for t := 0 to OutVocabM1 do
     begin
       Acc := HB.FData[t];
+      tBase := t * Hidden;
       for k := 0 to HiddenM1 do
-        Acc := Acc + TrunkOut.FData[p * Hidden + k] * HW.FData[t * Hidden + k];
+        Acc := Acc + TrunkOut.FData[pBase + k] * HW.FData[tBase + k];
       Logits.FData[p * OutVocab + t] := Acc;
     end;
+  end;
 end;
 
 procedure TBarkSubModel.ComputeLogits(const TokenIds: array of integer;
   Logits: TNNetVolume);
 var
   Emb: TNNetVolume;
-  Hidden, p, k, tok, FSeqLenM1, HiddenM1: integer;
+  Hidden, p, k, tok, FSeqLenM1, HiddenM1, pBase, tokBase: integer;
 begin
   Hidden := FConfig.Hidden;
   if Length(TokenIds) <> FSeqLen then
@@ -34242,8 +34262,10 @@ begin
       if (tok < 0) or (tok >= FConfig.InVocab) then
         ImportError('Bark sub-model: token id ' + IntToStr(tok) +
           ' out of range [0,' + IntToStr(FConfig.InVocab) + ').');
+      pBase := p * Hidden;
+      tokBase := tok * Hidden;
       for k := 0 to HiddenM1 do
-        Emb.FData[p * Hidden + k] := FEmbed[0].FData[tok * Hidden + k];
+        Emb.FData[pBase + k] := FEmbed[0].FData[tokBase + k];
     end;
     BarkApplyTrunkAndHead(Self, Emb, 0, Logits);
   finally
@@ -34255,7 +34277,7 @@ procedure TBarkSubModel.ComputeFineLogits(const Codes: TNNetIntArr2D;
   CodebookIdx: integer; Logits: TNNetVolume);
 var
   Emb: TNNetVolume;
-  Hidden, p, k, c, code, FSeqLenM1, HiddenM1: integer;
+  Hidden, p, k, c, code, FSeqLenM1, HiddenM1, pBase, codeBase, pos: integer;
 begin
   Hidden := FConfig.Hidden;
   if FConfig.NCodesTotal <= 0 then
@@ -34281,15 +34303,19 @@ begin
         ImportError('Bark fine: row ' + IntToStr(p) + ' has ' +
           IntToStr(Length(Codes[p])) + ' codes, expected ' +
           IntToStr(FConfig.NCodesTotal) + '.');
+      pBase := p * Hidden;
       for c := 0 to CodebookIdx do
       begin
         code := Codes[p][c];
         if (code < 0) or (code >= FConfig.InVocab) then
           ImportError('Bark fine: code ' + IntToStr(code) +
             ' out of range [0,' + IntToStr(FConfig.InVocab) + ').');
+        codeBase := code * Hidden;
         for k := 0 to HiddenM1 do
-          Emb.FData[p * Hidden + k] :=
-            Emb.FData[p * Hidden + k] + FEmbed[c].FData[code * Hidden + k];
+        begin
+          pos := pBase + k;
+          Emb.FData[pos] := Emb.FData[pos] + FEmbed[c].FData[codeBase + k];
+        end;
       end;
     end;
     BarkApplyTrunkAndHead(Self, Emb, CodebookIdx - FConfig.NCodesGiven, Logits);
@@ -47846,8 +47872,9 @@ var
   // discretizations, see the MAMBA IMPORT section); D -> e.
   procedure LoadScanWeights(Layer: TNNetLayer; const MixP: string);
   var
-    XW, DtW: TNNetVolume;
+    XW, DtW, WV: TNNetVolume;
     d, s, r, j, NS, DI, RK, NSM1, DIM1, RKM1: integer;
+    dBase, xOff, idx, sBase, bBase, cBase: integer;
     Acc: double;
   begin
     NS := Config.StateSize;
@@ -47870,14 +47897,26 @@ var
         // Jamba inner-norm layout ([0] = dt_proj.weight, [6] = x_proj rows
         // [0:dt_rank]) with the inner gains [7..9] at 1.0 (HF
         // FalconMambaRMSNorm carries no weight).
+        WV := Layer.FArrNeurons[0].Weights;
         for d := 0 to DIM1 do
+        begin
+          dBase := d * RK;
           for r := 0 to RKM1 do
-            Layer.FArrNeurons[0].Weights.FData[d * RK + r] :=
-              DtW.FData[d * RK + r];
+          begin
+            idx := dBase + r;
+            WV.FData[idx] := DtW.FData[idx];
+          end;
+        end;
+        WV := Layer.FArrNeurons[6].Weights;
         for r := 0 to RKM1 do
+        begin
+          dBase := r * DI;
           for j := 0 to DIM1 do
-            Layer.FArrNeurons[6].Weights.FData[r * DI + j] :=
-              XW.FData[r * DI + j];
+          begin
+            idx := dBase + j;
+            WV.FData[idx] := XW.FData[idx];
+          end;
+        end;
         Layer.FArrNeurons[7].Weights.Fill(1);
         Layer.FArrNeurons[8].Weights.Fill(1);
         Layer.FArrNeurons[9].Weights.Fill(1);
@@ -47886,25 +47925,38 @@ var
       begin
         // W_d = dt_proj.weight @ x_proj.weight[0:dt_rank] - the low-rank
         // delta path folded exactly (double accumulation).
+        WV := Layer.FArrNeurons[0].Weights;
         for d := 0 to DIM1 do
+        begin
+          dBase := d * RK;
           for j := 0 to DIM1 do
           begin
             Acc := 0;
+            xOff := j;
             for r := 0 to RKM1 do
-              Acc := Acc + DtW.FData[d * RK + r] * XW.FData[r * DI + j];
-            Layer.FArrNeurons[0].Weights.FData[d * DI + j] := Acc;
+            begin
+              Acc := Acc + DtW.FData[dBase + r] * XW.FData[xOff];
+              Inc(xOff, DI);
+            end;
+            WV.FData[d * DI + j] := Acc;
           end;
+        end;
       end;
       // W_B / W_C: the next d_state + d_state x_proj rows (shared across
       // channels - TNNetSelectiveSSM's (NS,1,Depth) projections).
       for s := 0 to NSM1 do
+      begin
+        sBase := s * DI;
+        bBase := (RK + s) * DI;
+        cBase := (RK + NS + s) * DI;
         for j := 0 to DIM1 do
         begin
-          Layer.FArrNeurons[1].Weights.FData[s * DI + j] :=
-            XW.FData[(RK + s) * DI + j];
-          Layer.FArrNeurons[2].Weights.FData[s * DI + j] :=
-            XW.FData[(RK + NS + s) * DI + j];
+          Layer.FArrNeurons[1].Weights.FData[sBase + j] :=
+            XW.FData[bBase + j];
+          Layer.FArrNeurons[2].Weights.FData[sBase + j] :=
+            XW.FData[cBase + j];
         end;
+      end;
     finally
       DtW.Free;
       XW.Free;
@@ -48232,9 +48284,10 @@ var
     L: array of array of double;    // d_inner x dt_rank
     U: array of array of double;    // dt_rank x d_inner
     PivRow: array of integer;
-    XW, DtW, Vec: TNNetVolume;
+    XW, DtW, Vec, WV: TNNetVolume;
     a, b, c, s, r, k, pr, DIM1, RKM1, NSM1, DINSM1: integer;
-    piv, mult, maxv: double;
+    rBase, aBase, sBase, bBase, cBase, idx: integer;
+    piv, mult, maxv, av: double;
   begin
     XW := TNNetVolume.Create;     // x_proj.weight  [RK+2*NS, DI]
     DtW := TNNetVolume.Create;    // dt_proj.weight [DI, RK]
@@ -48251,14 +48304,26 @@ var
         // Inner-norm (falcon_mamba) scans never folded dt: [0] =
         // dt_proj.weight and [6] = x_proj rows [0:dt_rank] round-trip RAW
         // (the unit inner gains [7..9] carry no checkpoint tensor).
+        WV := Layer.FArrNeurons[6].Weights;
         for r := 0 to RKM1 do
+        begin
+          rBase := r * DI;
           for b := 0 to DIM1 do
-            XW.FData[r * DI + b] :=
-              Layer.FArrNeurons[6].Weights.FData[r * DI + b];
+          begin
+            idx := rBase + b;
+            XW.FData[idx] := WV.FData[idx];
+          end;
+        end;
+        WV := Layer.FArrNeurons[0].Weights;
         for a := 0 to DIM1 do
+        begin
+          aBase := a * RK;
           for r := 0 to RKM1 do
-            DtW.FData[a * RK + r] :=
-              Layer.FArrNeurons[0].Weights.FData[a * RK + r];
+          begin
+            idx := aBase + r;
+            DtW.FData[idx] := WV.FData[idx];
+          end;
+        end;
       end
       else
       begin
@@ -48292,10 +48357,13 @@ var
           pr := -1; maxv := 0;
           for a := 0 to DIM1 do
             for b := 0 to DIM1 do
-              if Abs(Wd[a][b]) > maxv then
+            begin
+              av := Abs(Wd[a][b]);
+              if av > maxv then
               begin
-                maxv := Abs(Wd[a][b]); pr := a;
+                maxv := av; pr := a;
               end;
+            end;
           if pr < 0 then pr := r;          // residual already ~0: any row
           PivRow[r] := pr;
           for b := 0 to DIM1 do U[r][b] := Wd[pr][b];
@@ -48320,21 +48388,32 @@ var
         end;
         // dt rows of x_proj.weight = U; dt_proj.weight = L.
         for r := 0 to RKM1 do
+        begin
+          rBase := r * DI;
           for b := 0 to DIM1 do
-            XW.FData[r * DI + b] := U[r][b];
+            XW.FData[rBase + b] := U[r][b];
+        end;
         for a := 0 to DIM1 do
+        begin
+          aBase := a * RK;
           for r := 0 to RKM1 do
-            DtW.FData[a * RK + r] := L[a][r];
+            DtW.FData[aBase + r] := L[a][r];
+        end;
       end;
       // ---- W_B / W_C rows of x_proj.weight [RK+2*NS, DI] ----
       for s := 0 to NSM1 do
+      begin
+        sBase := s * DI;
+        bBase := (RK + s) * DI;
+        cBase := (RK + NS + s) * DI;
         for b := 0 to DIM1 do
         begin
-          XW.FData[(RK + s) * DI + b] :=
-            Layer.FArrNeurons[1].Weights.FData[s * DI + b];       // W_B
-          XW.FData[(RK + NS + s) * DI + b] :=
-            Layer.FArrNeurons[2].Weights.FData[s * DI + b];       // W_C
+          XW.FData[bBase + b] :=
+            Layer.FArrNeurons[1].Weights.FData[sBase + b];       // W_B
+          XW.FData[cBase + b] :=
+            Layer.FArrNeurons[2].Weights.FData[sBase + b];       // W_C
         end;
+      end;
       Writer.AddTensorFlat(MixP + 'x_proj.weight', [RK + 2 * NS, DI],
         XW, pDType);
       Writer.AddTensorFlat(MixP + 'dt_proj.weight', [DI, RK], DtW, pDType);
