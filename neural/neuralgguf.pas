@@ -1343,7 +1343,7 @@ end;
 procedure DecodeGGMLSpan(TypeId: integer; Raw: PByte; ElemCnt: Int64;
   Outp: PSingle);
 var
-  i, BlockCnt, NumBlocksM1, ElemCntM1, Q8ElemsM1: Int64;
+  i, BlockCnt, NumBlocksM1, ElemCntM1, Q8ElemsM1, BlockOfs, OutBase: Int64;
   Scale: single;
   WordPtr: PWord;
   QuantPtr: PShortInt;
@@ -1351,7 +1351,7 @@ begin
   ElemCntM1 := ElemCnt - 1;
   case TypeId of
     GGML_TYPE_F32:
-      Move(Raw^, Outp^, ElemCnt * SizeOf(single));
+      Move(Raw^, Outp^, ElemCnt * csNeuralFloatSize);
     GGML_TYPE_F16:
     begin
       WordPtr := PWord(Raw);
@@ -1366,15 +1366,19 @@ begin
       // f16 scale d then 32 int8 quants per block; x = d * q.
       Q8ElemsM1 := GGUF_Q8_0_BLOCK_ELEMS - 1;
       NumBlocksM1 := (ElemCnt div GGUF_Q8_0_BLOCK_ELEMS) - 1;
+      BlockOfs := 0;
+      OutBase := 0;
       for BlockCnt := 0 to NumBlocksM1 do
       begin
-        Scale := DecodeF16(PWord(Raw + BlockCnt * GGUF_Q8_0_BLOCK_BYTES)^);
-        QuantPtr := PShortInt(Raw + BlockCnt * GGUF_Q8_0_BLOCK_BYTES + 2);
+        Scale := DecodeF16(PWord(Raw + BlockOfs)^);
+        QuantPtr := PShortInt(Raw + BlockOfs + 2);
         for i := 0 to Q8ElemsM1 do
         begin
-          Outp[BlockCnt * GGUF_Q8_0_BLOCK_ELEMS + i] := Scale * QuantPtr^;
+          Outp[OutBase + i] := Scale * QuantPtr^;
           Inc(QuantPtr);
         end;
+        Inc(BlockOfs, GGUF_Q8_0_BLOCK_BYTES);
+        Inc(OutBase, GGUF_Q8_0_BLOCK_ELEMS);
       end;
     end;
     GGML_TYPE_Q4_K:
@@ -1420,7 +1424,7 @@ procedure TNNetGGUFReader.LoadTensorRowsFlat(const pName: string;
 var
   Idx, GGMLType, HeadDim, HalfDim: integer;
   NumElements, ElemCount, InnerDim, RowBytes: Int64;
-  dr, r, RowInHead, SrcRow, RowCountM1: Int64;
+  dr, r, RowInHead, SrcRow, RowCountM1, TensorBase, DstOfs: Int64;
   RawBytes: TBytes;
 begin
   Idx := FindTensor(pName);
@@ -1490,6 +1494,8 @@ begin
     // row instead of shuffling a full-tensor copy.
     HalfDim := HeadDim div 2;
     SetLength(RawBytes, RowBytes);
+    TensorBase := FDataStarts[0] + FTensors[Idx].DataBegin;
+    DstOfs := 0;
     for dr := 0 to RowCountM1 do
     begin
       r := Int64(FirstRow) + dr;
@@ -1498,11 +1504,11 @@ begin
         SrcRow := (r - RowInHead) + 2 * RowInHead
       else
         SrcRow := (r - RowInHead) + 2 * (RowInHead - HalfDim) + 1;
-      FStreams[0].Position := FDataStarts[0] + FTensors[Idx].DataBegin +
-        SrcRow * RowBytes;
+      FStreams[0].Position := TensorBase + SrcRow * RowBytes;
       FStreams[0].ReadBuffer(RawBytes[0], Length(RawBytes));
       DecodeGGMLSpan(GGMLType, PByte(@RawBytes[0]), RowSize,
-        PSingle(@Dest.FData[dr * RowSize]));
+        PSingle(@Dest.FData[DstOfs]));
+      Inc(DstOfs, RowSize);
     end;
   end;
 end;
