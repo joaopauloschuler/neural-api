@@ -4,8 +4,9 @@ IntraLayerThreadingBench: validates the intra-layer threading decision.
 
   * Experiment A sweeps single-layer FC / pointwise / conv shapes from tiny to
     large - plus the token-wise transformer layers (SwiGLU / TokenRMSNorm /
-    RotaryEmbedding) and the channel-chunked TNNetDepthwiseConv1D (full-sweep
-    AND incremental-decode mode) at decode (seq=1) and prefill-like sequence
+    RotaryEmbedding), the channel-chunked TNNetDepthwiseConv1D and the k-head-
+    chunked TNNetGatedDeltaNet (both in full-sweep AND incremental-decode
+    mode) at decode (seq=1) and prefill-like sequence
     lengths - reports each shape's neuron count, whether it is eligible to chunk
     (the real ChunkEligible() verdict), the OFF-vs-ON speedup, and a bit-parity
     check (threaded output MUST equal serial output - only independent outputs
@@ -92,6 +93,10 @@ var
 //      6 = DepthwiseConv1D(input Ax1xB; A = seqLen, B = channels, C = kernel)
 //      7 = DepthwiseConv1D as 6 but in INCREMENTAL-DECODE mode (stateful
 //          history path - the kernel real decode steps run)
+//      8 = GatedDeltaNet(A = seqLen, B = Hk k-heads, C = Hv v-heads,
+//          D = head dim for BOTH Dk and Dv; input depth derived)
+//      9 = GatedDeltaNet as 8 but in INCREMENTAL-DECODE mode (in-place
+//          per-head state carry - the real autoregressive decode path)
 procedure AddA(const N: string; K, A, B, C, D: integer);
 var idx: integer;
 begin
@@ -121,12 +126,17 @@ begin
     6, 7:
        begin NN.AddLayer(TNNetInput.Create(S.A, 1, S.B));
              NN.AddLayer(TNNetDepthwiseConv1D.Create(S.C, {causal=}true)); end;
+    8, 9:
+       // Input depth layout [q|k|v|z|b|a] = 2*Hk*Dk + 2*Hv*Dv + 2*Hv (Dk=Dv=D).
+       begin NN.AddLayer(TNNetInput.Create(S.A, 1,
+               2 * S.B * S.D + 2 * S.C * S.D + 2 * S.C));
+             NN.AddLayer(TNNetGatedDeltaNet.Create(S.B, S.C, S.D, S.D)); end;
   end;
   NN.GetLastLayer().InitDefault();
-  // Kind 7 times the stateful decode kernel (history buffer + advance), the
-  // path a real autoregressive decode runs; causal mode is required for it.
-  if S.Kind = 7 then
-    TNNetDepthwiseConv1D(NN.GetLastLayer()).BeginIncrementalDecode();
+  // Kinds 7/9 time the stateful decode kernel (history/state carry), the path
+  // a real autoregressive decode runs.
+  if (S.Kind = 7) or (S.Kind = 9) then
+    TNNetRecurrentDecodeBase(NN.GetLastLayer()).BeginIncrementalDecode();
   Result := NN;
 end;
 
@@ -193,6 +203,17 @@ begin
   // per-chunk history advance) - what a real autoregressive decode step runs.
   AddA('DwDec s1 d2048 k4', 7, 1,   2048, 4, 0);
   AddA('DwDec s1 d8192 k4', 7, 1,   8192, 4, 0);
+  // GatedDeltaNet: A=seq, B=Hk, C=Hv, D=head dim (Dk=Dv). The chunk axis is
+  // the K-HEAD (Hk work items, each carrying Hv/Hk value heads), so seq=1
+  // decode has Hk-way parallelism. h16/32 d128 is the Qwen3-Next linear-
+  // attention geometry; h4/8 d64 probes the small end. s64 stays the largest
+  // full-sweep row: the training-mode FS cache is Seq*Hv*Dk*Dv floats.
+  AddA('GDN s1 h4/8 d64',    8, 1,  4,  8,  64);
+  AddA('GDN s1 h16/32 d128', 8, 1,  16, 32, 128);
+  AddA('GDN s64 h16/32 d128',8, 64, 16, 32, 128);
+  // Same layer on the stateful incremental-decode path (in-place FDecS carry).
+  AddA('GDNDec s1 h4/8 d64',    9, 1, 4,  8,  64);
+  AddA('GDNDec s1 h16/32 d128', 9, 1, 16, 32, 128);
 end;
 
 // One pass of the shape sweep for a given memory mode. LowMem toggles the
@@ -217,7 +238,7 @@ begin
   if LowMem then memtag := 'low-memory ON' else memtag := 'low-memory OFF';
   WriteLn('=== Experiment A: per-layer threading OFF vs ON  [', memtag, '] ===');
   WriteLn('Cores (NeuralDefaultThreadCount) = ', NeuralDefaultThreadCount(),
-    '   FC/PW/Conv/Dw: every size is chunk-eligible; ',
+    '   FC/PW/Conv/Dw/GDN: every size is chunk-eligible; ',
     'SwiGLU/RMSN/RoPE show their current verdict');
   WriteLn(Format('%-20s %8s %6s %9s %9s %8s %7s %9s',
     ['shape', 'neurons', 'elig?', 'off ms', 'on ms', 'speedup',
@@ -245,11 +266,13 @@ begin
     NN.SetTrainable(False, {pLowMemory=}LowMem);
     // Keep the worker pool alive/hot across the timed passes (default policy).
     NN.StartThreadWorkers();
-    // Stateful decode shape: the serial timing passes advanced the conv
-    // history, so restart from a zero history - OutSerial was snapshotted from
-    // the very first (fresh-state) pass, and the parity pass below must see
-    // the same state. The timed passes after it may advance state freely.
-    if S.Kind = 7 then TNNetDepthwiseConv1D(NN.GetLastLayer()).ResetState();
+    // Stateful decode shapes: the serial timing passes advanced the carried
+    // state (conv history / delta-rule state bank), so restart from zero -
+    // OutSerial was snapshotted from the very first (fresh-state) pass, and
+    // the parity pass below must see the same state. The timed passes after
+    // it may advance state freely.
+    if (S.Kind = 7) or (S.Kind = 9) then
+      TNNetRecurrentDecodeBase(NN.GetLastLayer()).ResetState();
     NN.Compute(MyIn, 0, {parallel=}true);
     maxdiff := 0;
     for i := 0 to OutSerial.Size - 1 do
