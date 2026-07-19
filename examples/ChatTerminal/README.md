@@ -277,17 +277,33 @@ REST shape. It takes the SAME command line as ChatTerminal plus `--host`
 ```
 $ ChatServer /path/to/model --temperature 0.7 --top-p 0.9 --port 8080
 ...
-Serving model on http://127.0.0.1:8080/v1 (non-streaming; Ctrl+C stops)
+Serving model on http://127.0.0.1:8080/v1 (SSE streaming with "stream":true; Ctrl+C stops)
 
 $ curl http://127.0.0.1:8080/v1/chat/completions \
     -d '{"messages":[{"role":"user","content":"Hi!"}],"max_tokens":64}'
+
+$ curl -N http://127.0.0.1:8080/v1/chat/completions \
+    -d '{"messages":[{"role":"user","content":"Hi!"}],"stream":true}'
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk", ... "delta":{"role":"assistant","content":""} ...}
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk", ... "delta":{"content":"Hello"} ...}
+...
+data: [DONE]
 ```
 
 Endpoints: `POST /v1/chat/completions` (messages rendered through the
 model's chat template), `POST /v1/completions` (plain completion, no
-template - the `--format raw` path), `GET /v1/models`. Non-streaming only:
-`"stream": true` is rejected with a clear error (never a hanging SSE
-client), as is `"n"` other than 1. Request fields `temperature`, `top_p`,
+template - the `--format raw` path), `GET /v1/models`. With
+`"stream": true` both POST endpoints stream the reply as OpenAI-style
+Server-Sent Events - one `data:` chunk per decoded token, a
+`finish_reason` chunk, then `data: [DONE]`.
+`"stream_options": {"include_usage": true}` appends the usage chunk.
+Only a literal JSON boolean is accepted for `stream` (a `"true"` string
+is a 400, never a mis-parsed hang), and `"n"` other than 1 is rejected.
+Response headers go out with the first token, so pre-generation failures
+(bad template, context overflow) are still ordinary JSON 400s; if the
+client disconnects mid-stream, generation aborts and the engine
+invalidates its KV cache so the next request decodes cleanly.
+Request fields `temperature`, `top_p`,
 `top_k`, `min_p`, `repetition_penalty`, `frequency_penalty`,
 `presence_penalty` and `max_tokens`/`max_completion_tokens` override the
 launch defaults per request; absent fields fall back to them.
