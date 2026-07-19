@@ -83,6 +83,9 @@ type
     // Normalization builders (use TNNetInstanceNorm internally)
     procedure TestAddAutoGroupedPointwiseConvUsesInstanceNorm;
     procedure TestAddAutoGroupedPointwiseConv2UsesInstanceNorm;
+    procedure TestAddAutoGroupedPointwiseConv2IdentityActFn;
+    procedure TestAddAutoGroupedPointwiseConv2DefaultActFn;
+    procedure TestAddAutoGroupedPointwiseConv2LinearParity;
     procedure TestAddChannelMovingNormUsesInstanceNorm;
     procedure TestAddMovingNormShapeAndForward;
     procedure TestAddWaveletPacketTransformShapeAndForward;
@@ -1829,6 +1832,188 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+function CountLayersOfClass(NN: TNNet; LayerClass: TClass): integer;
+var
+  i: integer;
+begin
+  Result := 0;
+  for i := 0 to NN.Layers.Count - 1 do
+    if NN.Layers[i] is LayerClass then Inc(Result);
+end;
+
+// Extracts the group count (FStruct[5]) from a grouped conv layer via its
+// serialized structure string: "ClassName:s0;s1;s2;s3;s4;s5;...::floats".
+function GetLayerGroupCount(Layer: TNNetLayer): integer;
+var
+  S: string;
+begin
+  S := Layer.SaveStructureToString();
+  S := Copy(S, Pos(':', S) + 1, Length(S));
+  Result := StrToInt(ExtractDelimited(6, S, [';']));
+end;
+
+procedure TTestNeuralLayersExtra.TestAddAutoGroupedPointwiseConv2IdentityActFn;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 16);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 16));
+    NN.AddAutoGroupedPointwiseConv2(TNNetGroupedPointwiseConvLinear,
+      {MinChannelsPerGroupCount=}4, {pNumFeatures=}16, {HasNormalization=}false,
+      {pSuppressBias=}0, {AlwaysIntergroup=}true);
+    // Sanity: the default build has a TNNetReLUL after the intergroup conv.
+    AssertTrue('pActFn=nil should add TNNetReLUL',
+      CountLayersOfClass(NN, TNNetReLUL) > 0);
+    NN.Free;
+
+    NN := TNNet.Create();
+    NN.AddLayer(TNNetInput.Create(4, 4, 16));
+    NN.AddAutoGroupedPointwiseConv2(TNNetGroupedPointwiseConvLinear,
+      {MinChannelsPerGroupCount=}4, {pNumFeatures=}16, {HasNormalization=}false,
+      {pSuppressBias=}0, {AlwaysIntergroup=}true, {HasIntergroup=}true,
+      {PrevLayer=}nil, {pActFn=}TNNetIdentity);
+
+    Input.RandomizeGaussian();
+    NN.Compute(Input);
+
+    AssertEquals('pActFn=TNNetIdentity must add no TNNetReLUL',
+      0, CountLayersOfClass(NN, TNNetReLUL));
+    AssertEquals('pActFn=TNNetIdentity output depth',
+      16, NN.GetLastLayer.Output.Depth);
+    AssertTrue('intergroup path should produce a TNNetSum',
+      CountLayersOfClass(NN, TNNetSum) > 0);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestAddAutoGroupedPointwiseConv2DefaultActFn;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 16);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 16));
+    // pActFn omitted: backward-compatible default must insert TNNetReLUL.
+    NN.AddAutoGroupedPointwiseConv2(TNNetGroupedPointwiseConvLinear,
+      {MinChannelsPerGroupCount=}4, {pNumFeatures=}16, {HasNormalization=}false);
+
+    Input.RandomizeGaussian();
+    NN.Compute(Input);
+
+    AssertTrue('default pActFn must keep TNNetReLUL',
+      CountLayersOfClass(NN, TNNetReLUL) > 0);
+    AssertEquals('default pActFn output depth',
+      16, NN.GetLastLayer.Output.Depth);
+    AssertTrue('intergroup path should produce a TNNetSum',
+      CountLayersOfClass(NN, TNNetSum) > 0);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestAddAutoGroupedPointwiseConv2LinearParity;
+var
+  NN: TNNet;
+  X1, X2, XSum, X2x: TNNetVolume;
+  Y1, Y2, YSum, Y2x: TNNetVolume;
+  FirstConv, SecondConv: TNNetLayer;
+  i, ConvSeen: integer;
+begin
+  NN := TNNet.Create();
+  X1 := TNNetVolume.Create(1, 1, 8);
+  X2 := TNNetVolume.Create(1, 1, 8);
+  XSum := TNNetVolume.Create(1, 1, 8);
+  X2x := TNNetVolume.Create(1, 1, 8);
+  Y1 := TNNetVolume.Create(1, 1, 16);
+  Y2 := TNNetVolume.Create(1, 1, 16);
+  YSum := TNNetVolume.Create(1, 1, 16);
+  Y2x := TNNetVolume.Create(1, 1, 16);
+  try
+    // Small analogue of an expanding (Qwen-like) projection with asymmetric
+    // group counts: input depth 8 -> 16 features, MinChannelsPerGroup 2 gives
+    // g1 = GetMaxAcceptableCommonDivisor(8,16, max 8 div 2=4) = 4 and
+    // g2 = GetMaxAcceptableCommonDivisor(16,16, max 16 div 2=8) = 8.
+    NN.AddLayer(TNNetInput.Create(1, 1, 8));
+    NN.AddAutoGroupedPointwiseConv2(TNNetGroupedPointwiseConvLinear,
+      {MinChannelsPerGroupCount=}2, {pNumFeatures=}16, {HasNormalization=}false,
+      {pSuppressBias=}1, {AlwaysIntergroup=}true, {HasIntergroup=}true,
+      {PrevLayer=}nil, {pActFn=}TNNetIdentity);
+
+    // Structure: exactly two grouped convs with the expected group counts.
+    FirstConv := nil;
+    SecondConv := nil;
+    ConvSeen := 0;
+    for i := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[i] is TNNetGroupedPointwiseConvLinear then
+      begin
+        Inc(ConvSeen);
+        if ConvSeen = 1 then FirstConv := NN.Layers[i]
+        else if ConvSeen = 2 then SecondConv := NN.Layers[i];
+      end;
+    end;
+    AssertEquals('block should contain two grouped pointwise convs',
+      2, ConvSeen);
+    AssertEquals('first conv group count (g1)',
+      4, GetLayerGroupCount(FirstConv));
+    AssertEquals('second conv group count (g2)',
+      8, GetLayerGroupCount(SecondConv));
+    AssertEquals('first conv output depth', 16, FirstConv.Output.Depth);
+    AssertEquals('second conv output depth', 16, SecondConv.Output.Depth);
+    AssertTrue('interleave layer present',
+      CountLayersOfClass(NN, TNNetInterleaveChannels) > 0);
+    AssertTrue('sum layer present', CountLayersOfClass(NN, TNNetSum) > 0);
+    AssertEquals('no activation layer', 0, CountLayersOfClass(NN, TNNetReLUL));
+    AssertEquals('no normalization layer', 0, CountInstanceNorm(NN));
+    AssertEquals('block output depth', 16, NN.GetLastLayer.Output.Depth);
+
+    // Numeric proof of linearity with the initialized random weights:
+    // y(x1+x2) = y(x1)+y(x2) and y(2*x1) = 2*y(x1) elementwise.
+    X1.RandomizeGaussian();
+    X2.RandomizeGaussian();
+    XSum.Copy(X1);
+    XSum.Add(X2);
+    X2x.Copy(X1);
+    X2x.Mul(2.0);
+
+    NN.Compute(X1);
+    NN.GetOutput(Y1);
+    NN.Compute(X2);
+    NN.GetOutput(Y2);
+    NN.Compute(XSum);
+    NN.GetOutput(YSum);
+    NN.Compute(X2x);
+    NN.GetOutput(Y2x);
+
+    AssertEquals('output size', 16, Y1.Size);
+    for i := 0 to Y1.Size - 1 do
+    begin
+      AssertEquals('additivity y(x1+x2)=y(x1)+y(x2) at ' + IntToStr(i),
+        Y1.Raw[i] + Y2.Raw[i], YSum.Raw[i], 1e-4);
+      AssertEquals('homogeneity y(2*x1)=2*y(x1) at ' + IntToStr(i),
+        2.0 * Y1.Raw[i], Y2x.Raw[i], 1e-4);
+    end;
+  finally
+    NN.Free;
+    X1.Free;
+    X2.Free;
+    XSum.Free;
+    X2x.Free;
+    Y1.Free;
+    Y2.Free;
+    YSum.Free;
+    Y2x.Free;
   end;
 end;
 
