@@ -909,16 +909,22 @@ end;
 - **One offset, two volumes** — folds in #3: same shape ⇒ `posV` indexes both
   `Prev` and `PrevErr`.
 
-**Be honest about the magnitude — measure before spreading this.** Here each
-`GetRawPtr` feeds a `MulAdd`/`DotProduct` over `FDk` elements; that vector kernel
-dominates, and the single removed multiply is lost in the noise. The transform is
-essentially free and correct, but do **not** expect a visible speedup when the
-per-iteration body is a length-`FDk` kernel. Strength-reducing `GetRawPtr` pays
-off where the inner body is *light* — scalar or very short-vector work, or a hot
-offset used many times per iteration — and where the multiply is a real fraction
-of the loop's cost. Treat this as the lowest-priority class of change in this
-guide: apply it when you are already rewriting the loop for #11, not as a standalone
-sweep.
+**Apply it everywhere the pattern occurs — every cycle counts.** The transform is
+always valid and essentially free, so apply it to *every* per-iteration
+`GetRawPtr(loopvar, …)` / `GetRawPos(loopvar, …)`, not only the ones with an
+obviously light inner body. The magnitude of the win does vary: where the inner
+body is *light* — scalar or short-vector work, or a hot offset used many times per
+iteration — the removed multiply is a real fraction of the loop's cost and the
+speedup is directly visible; where the inner body is a length-`FDk`
+`MulAdd`/`DotProduct` the vector kernel dominates and one removed multiply is a
+smaller slice. But "smaller" is not "zero": across the whole forward/backward pass
+these multiplies number in the millions, and this codebase is chasing the last few
+percent to beat a hand-tuned C/GGML (ollama/llama.cpp-class) baseline — so we take
+the cycles wherever the pattern appears. The only reason *not* to apply it at a
+given site is a correctness blocker (a non-constant step, a per-element scatter
+index — see the caveats), never "the body is too heavy to bother." Fold it in
+whenever you are already rewriting a loop for #11, and it is also worth a
+standalone sweep.
 
 **Caveats.** Same as #6: the induction step must be constant (`j` by 1 here), the
 seed must equal the first offset (`VOfs`, not `0`), and `posV` must advance
