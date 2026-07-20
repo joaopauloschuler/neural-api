@@ -136,6 +136,10 @@ type
                                  // The parallel path also enables intra-layer
                                  // threading (big conv/linear layers split
                                  // across the pool); --serial disables both.
+    NoFusedAttn: boolean;        // --no-fused-attn: build per-head attention
+                                 // (SplitChannels/SDPA/DeepConcat) instead of
+                                 // the fused TNNetFusedSDPA layer. Bit-identical
+                                 // output; a performance A/B knob only.
     Gpu: boolean;                // offload conv/linear matmuls via OpenCL
     GpuPlatform: integer;        // OpenCL platform index (default 0)
     GpuDevice: integer;          // OpenCL device index within the platform (0)
@@ -297,6 +301,8 @@ begin
   WriteLn('                        forward across independent layers; the parallel');
   WriteLn('                        path also threads large conv/linear layers');
   WriteLn('                        internally, --serial runs fully single-threaded)');
+  WriteLn('  --no-fused-attn       build per-head attention instead of the fused');
+  WriteLn('                        multi-head layer (bit-identical; performance A/B)');
   WriteLn('  --selftest            run the offline unit checks and exit');
   WriteLn('  --help                this text');
 end;
@@ -333,6 +339,7 @@ begin
   Result.KVInt8 := false;    // resolved after parsing: follows the weight mode
   Result.KVInt8Set := false; // unless --kv-int8/--kv-fp32 picked explicitly
   Result.Serial := false; // parallel layer-graph forward by default (--serial)
+  Result.NoFusedAttn := false; // fused multi-head attention on by default
   // OpenCL offload defaults ON when the binary is built with -dOpenCL (the
   // default compilation), OFF otherwise; --cpu forces CPU either way.
   Result.Gpu := {$IFDEF OpenCL}true{$ELSE}false{$ENDIF};
@@ -420,6 +427,7 @@ begin
       Opt.KVInt8Set := true;
     end
     else if Arg = '--serial' then Opt.Serial := true
+    else if Arg = '--no-fused-attn' then Opt.NoFusedAttn := true
     else if Arg = '--gpu' then Opt.Gpu := true
     else if Arg = '--cpu' then Opt.Gpu := false
     else if Arg = '--gpu-platform' then
@@ -977,6 +985,15 @@ begin
     Notice('[--max-fast-memory: concatenated weight cache kept - faster forward,' +
       ' more RAM, GPU compatible]');
 
+  // Fused multi-head attention A/B (bit-identical output, performance only).
+  // The global gates the importer's per-block fused-vs-per-head decision, so
+  // it must be set BEFORE BuildFromPretrained. Restored after the build so a
+  // second load in the same process is unaffected.
+  NeuralAllowFusedAttention := not Opt.NoFusedAttn;
+  if Opt.NoFusedAttn then
+    Notice('[--no-fused-attn: per-head attention wiring (SplitChannels/SDPA/' +
+      'DeepConcat) instead of the fused layer - bit-identical, A/B only]');
+
   Notice('Loading ' + Opt.ModelDir + ' ...');
   LoadStart := GetTickCount64();
   // Built at INPUT WIDTH 1 (pSeqLen=1): streamed decode feeds one token per
@@ -984,6 +1001,7 @@ begin
   // the context. SeqLen is the cache budget, NOT the built input width.
   NN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}1,
     {pTrainable=}false, '', {pQuantizeInt8=}Opt.Int8);
+  NeuralAllowFusedAttention := true; // restore the global default post-build
   // Low-memory forward path, set independently of trainability. The importer
   // built inference-only with low memory ON (SetTrainable's pLowMemory default);
   // honor --max-fast-memory by re-sweeping the layers, then flush each weight

@@ -12356,6 +12356,15 @@ function BuildGRUFromSafeTensors(const FileName, Prefix: string;
   InputSize, Hidden, NumLayers, SeqLen: integer;
   Bidirectional: boolean): TNNet;
 
+var
+  // Global A/B toggle for the fused multi-head attention layer
+  // (TNNetFusedSDPA). True (default) builds ONE fused attention layer per
+  // block wherever the architecture allows it; False forces the per-head
+  // SplitChannels/SDPA/DeepConcat wiring instead - bit-identical output, so
+  // this is purely a performance A/B (ChatTerminal's --no-fused-attn sets it
+  // False before BuildFromPretrained). Coded by Claude (AI).
+  NeuralAllowFusedAttention: boolean = true;
+
 implementation
 
 procedure ImportError(const Msg: string);
@@ -16024,7 +16033,8 @@ begin
         // op order), one shared KV cache per sub-layer, and the fused layer
         // is chunk-eligible over query heads for intra-layer threading. The
         // per-head fallback below remains for every excluded variant.
-        UseFusedAttn := ((not LayerUseRoPE) or DoHoistRoPE) and
+        UseFusedAttn := NeuralAllowFusedAttention and
+          ((not LayerUseRoPE) or DoHoistRoPE) and
           ((not Config.QKNorm) or DoTiledQKNorm) and
           (not Config.Llama4QKL2Norm) and
           (not (Config.AttnTempTuning and (not LayerUseRoPE))) and

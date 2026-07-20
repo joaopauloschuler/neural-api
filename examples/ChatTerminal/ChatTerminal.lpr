@@ -353,6 +353,16 @@ begin
     Args.Add('--serial');
     Check(ParseArgs(Args, Opt) and Opt.Serial, '--serial parses');
 
+    // Fused attention on by default; --no-fused-attn opts out (perf A/B).
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and not Opt.NoFusedAttn,
+      'fused attention on by default');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--no-fused-attn');
+    Check(ParseArgs(Args, Opt) and Opt.NoFusedAttn, '--no-fused-attn parses');
+
     // KV-cache reuse is on by default; --no-cache-reuse disables it.
     Args.Clear;
     Args.Add('/tmp/model');
