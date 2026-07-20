@@ -1556,7 +1556,7 @@ procedure TNNetSequencePacker.ApplyLossMask(WindowIdx: integer;
   Desired, Actual: TNNetVolume);
 var
   Pos, D: integer;
-  ContextM1, DepthM1: integer;
+  ContextM1, DepthM1, DesBase, ActBase: integer;
 begin
   RequirePacked();
   ContextM1 := FContextLen - 1;
@@ -1565,8 +1565,10 @@ begin
   begin
     if not IsTargetPredictable(WindowIdx, Pos) then
     begin
+      DesBase := Desired.GetRawPos(Pos, 0, 0);
+      ActBase := Actual.GetRawPos(Pos, 0, 0);
       for D := 0 to DepthM1 do
-        Desired[Pos, 0, D] := Actual[Pos, 0, D];
+        Desired.FData[DesBase + D] := Actual.FData[ActBase + D];
     end;
   end;
 end;
@@ -1779,14 +1781,18 @@ procedure TNNetMaskedLMCollator.ApplyLossMask(const Labels: TNeuralIntegerArray;
   Desired, Actual: TNNetVolume);
 var
   P, D: integer;
-  LabelsM1, DepthM1: integer;
+  LabelsM1, DepthM1, DesBase, ActBase: integer;
 begin
   LabelsM1 := Length(Labels) - 1;
   DepthM1 := Desired.Depth - 1;
   for P := 0 to LabelsM1 do
     if Labels[P] = csMaskedLMIgnoreLabel then
+    begin
+      DesBase := Desired.GetRawPos(P, 0, 0);
+      ActBase := Actual.GetRawPos(P, 0, 0);
       for D := 0 to DepthM1 do
-        Desired[P, 0, D] := Actual[P, 0, D];
+        Desired.FData[DesBase + D] := Actual.FData[ActBase + D];
+    end;
 end;
 
 { TNNetSpanCorruptionCollator }
@@ -2257,7 +2263,7 @@ procedure TNNetLengthGroupedBatcher.ApplyLossMask(BatchIdx, WithinIdx: integer;
   Desired, Actual: TNNetVolume);
 var
   SeqLen, Len, Pos, D: integer;
-  SeqM1, DepthM1: integer;
+  SeqM1, DepthM1, DesBase, ActBase: integer;
 begin
   RequireBuilt();
   SeqLen := BatchSeqLen(BatchIdx);
@@ -2268,8 +2274,12 @@ begin
   begin
     // Predictable iff a next real token exists: Pos in 0..Len-2.
     if Pos > Len - 2 then
+    begin
+      DesBase := Desired.GetRawPos(Pos, 0, 0);
+      ActBase := Actual.GetRawPos(Pos, 0, 0);
       for D := 0 to DepthM1 do
-        Desired[Pos, 0, D] := Actual[Pos, 0, D];
+        Desired.FData[DesBase + D] := Actual.FData[ActBase + D];
+    end;
   end;
 end;
 
@@ -3321,7 +3331,7 @@ var
   Work: TNNetVolume;
   ResizeW, ResizeH, OffX, OffY, X, Y, C, SrcX, SrcY: integer;
   Scale, Fx, Fy, V: TNeuralFloat;
-  ResizeWM1, ResizeHM1, CropM1: integer;
+  ResizeWM1, ResizeHM1, CropM1, WorkBase, SrcBase, DstBase: integer;
 begin
   if (Src = nil) or (Dst = nil) then
     raise Exception.Create('PreprocessImageForVisionModel: nil volume.');
@@ -3371,8 +3381,10 @@ begin
           SrcX := Trunc(Fx); SrcY := Trunc(Fy);
           if SrcX > Src.SizeX - 1 then SrcX := Src.SizeX - 1;
           if SrcY > Src.SizeY - 1 then SrcY := Src.SizeY - 1;
+          WorkBase := Work.GetRawPos(X, Y, 0);
+          SrcBase := Src.GetRawPos(SrcX, SrcY, 0);
           for C := 0 to 2 do
-            Work[X, Y, C] := Src[SrcX, SrcY, C];
+            Work.FData[WorkBase + C] := Src.FData[SrcBase + C];
         end;
     end
     else
@@ -3388,18 +3400,20 @@ begin
       begin
         SrcX := OffX + X;
         SrcY := OffY + Y;
+        DstBase := Dst.GetRawPos(X, Y, 0);
         // pad with zeros if the crop window exceeds the resized image
         if (SrcX < 0) or (SrcY < 0) or
            (SrcX > Work.SizeX - 1) or (SrcY > Work.SizeY - 1) then
         begin
-          for C := 0 to 2 do Dst[X, Y, C] := 0;
+          for C := 0 to 2 do Dst.FData[DstBase + C] := 0;
           continue;
         end;
         // ---- (3) rescale by 1/255 then per-channel normalize.
+        WorkBase := Work.GetRawPos(SrcX, SrcY, 0);
         for C := 0 to 2 do
         begin
-          V := Work[SrcX, SrcY, C] / 255.0;
-          Dst[X, Y, C] := (V - Mean[C]) / Std[C];
+          V := Work.FData[WorkBase + C] / 255.0;
+          Dst.FData[DstBase + C] := (V - Mean[C]) / Std[C];
         end;
       end;
   finally
@@ -3610,16 +3624,17 @@ end;
 procedure ConfusionWriteCSV(var CSVConfusion: TextFile; Vol: TNNetVolume; Digits: integer);
 var
   I, J: integer;
-  SizeYM1, DepthM1: integer;
+  SizeYM1, DepthM1, RowBase: integer;
 begin
   SizeYM1 := Vol.SizeY - 1;
   DepthM1 := Vol.Depth - 1;
   for I := 0 to SizeYM1 do
   begin
+    RowBase := Vol.GetRawPos(0, I, 0);
     for J := 0 to DepthM1 do
     begin
       if J > 0 then Write(CSVConfusion, ',');
-      Write(CSVConfusion, Round(Vol[0, I, J]):Digits);
+      Write(CSVConfusion, Round(Vol.FData[RowBase + J]):Digits);
     end;
     WriteLn(CSVConfusion);
   end;
@@ -3628,15 +3643,19 @@ end;
 procedure LoadTinyImageIntoNNetVolume(var TI: TTinyImage; Vol: TNNetVolume);
 var
   I, J: integer;
+  Pos, Stride: integer;
 begin
   Vol.ReSize(32,32,3);
+  Stride := Vol.GetRawPos(1, 0, 0);
   for I := 0 to 31 do
   begin
+    Pos := Vol.GetRawPos(0, I, 0);
     for J := 0 to 31 do
     begin
-      Vol[J, I, 0] := TI.R[I, J];
-      Vol[J, I, 1] := TI.G[I, J];
-      Vol[J, I, 2] := TI.B[I, J];
+      Vol.FData[Pos]     := TI.R[I, J];
+      Vol.FData[Pos + 1] := TI.G[I, J];
+      Vol.FData[Pos + 2] := TI.B[I, J];
+      Inc(Pos, Stride);
     end;
   end;
   Vol.Tag := TI.bLabel;
@@ -3645,15 +3664,19 @@ end;
 procedure LoadTinyImageIntoNNetVolume(var TI: TCifar100Image; Vol: TNNetVolume);
 var
   I, J: integer;
+  Pos, Stride: integer;
 begin
   Vol.ReSize(32,32,3);
+  Stride := Vol.GetRawPos(1, 0, 0);
   for I := 0 to 31 do
   begin
+    Pos := Vol.GetRawPos(0, I, 0);
     for J := 0 to 31 do
     begin
-      Vol[J, I, 0] := TI.R[I, J];
-      Vol[J, I, 1] := TI.G[I, J];
-      Vol[J, I, 2] := TI.B[I, J];
+      Vol.FData[Pos]     := TI.R[I, J];
+      Vol.FData[Pos + 1] := TI.G[I, J];
+      Vol.FData[Pos + 2] := TI.B[I, J];
+      Inc(Pos, Stride);
     end;
   end;
   Vol.Tags[0] := TI.bFineLabel;
@@ -3663,13 +3686,17 @@ end;
 procedure LoadTinyImageIntoNNetVolume(var TI: TMNistImage; Vol: TNNetVolume);
 var
   I, J: integer;
+  Pos, Stride: integer;
 begin
   Vol.ReSize(28, 28, 1);
+  Stride := Vol.GetRawPos(1, 0, 0);
   for I := 0 to 27 do
   begin
+    Pos := Vol.GetRawPos(0, I, 0);
     for J := 0 to 27 do
     begin
-      Vol[J, I, 0] := TI[I, J];
+      Vol.FData[Pos] := TI[I, J];
+      Inc(Pos, Stride);
     end;
   end;
 end;
@@ -3677,14 +3704,18 @@ end;
 procedure LoadNNetVolumeIntoTinyImage(Vol: TNNetVolume; var TI: TTinyImage);
 var
   I, J: integer;
+  Pos, Stride: integer;
 begin
+  Stride := Vol.GetRawPos(1, 0, 0);
   for I := 0 to 31 do
   begin
+    Pos := Vol.GetRawPos(0, I, 0);
     for J := 0 to 31 do
     begin
-      TI.R[I, J] := Vol.AsByte[J, I, 0];
-      TI.G[I, J] := Vol.AsByte[J, I, 1];
-      TI.B[I, J] := Vol.AsByte[J, I, 2];
+      TI.R[I, J] := RoundAsByte(Vol.FData[Pos]);
+      TI.G[I, J] := RoundAsByte(Vol.FData[Pos + 1]);
+      TI.B[I, J] := RoundAsByte(Vol.FData[Pos + 2]);
+      Inc(Pos, Stride);
     end;
   end;
   TI.bLabel := Vol.Tag;
@@ -3693,14 +3724,18 @@ end;
 procedure LoadNNetVolumeIntoTinyImage(Vol: TNNetVolume; var TI: TCifar100Image);
 var
   I, J: integer;
+  Pos, Stride: integer;
 begin
+  Stride := Vol.GetRawPos(1, 0, 0);
   for I := 0 to 31 do
   begin
+    Pos := Vol.GetRawPos(0, I, 0);
     for J := 0 to 31 do
     begin
-      TI.R[I, J] := Vol.AsByte[J, I, 0];
-      TI.G[I, J] := Vol.AsByte[J, I, 1];
-      TI.B[I, J] := Vol.AsByte[J, I, 2];
+      TI.R[I, J] := RoundAsByte(Vol.FData[Pos]);
+      TI.G[I, J] := RoundAsByte(Vol.FData[Pos + 1]);
+      TI.B[I, J] := RoundAsByte(Vol.FData[Pos + 2]);
+      Inc(Pos, Stride);
     end;
   end;
   TI.bCoarseLabel := Vol.Tags[0];
@@ -3711,14 +3746,18 @@ procedure LoadTinySingleChannelIntoNNetVolume(var SC: TTinySingleChannelImage;
   Vol: TNNetVolume);
 var
   I, J: integer;
+  Pos, YStride: integer;
 begin
   Vol.ReSize(32,32,1);
   Vol.Tag := SC.bLabel;
+  YStride := Vol.GetRawPos(0, 1, 0);
   for I := 0 to 31 do
   begin
+    Pos := Vol.GetRawPos(I, 0, 0);
     for J := 0 to 31 do
     begin
-      Vol[I, J, 0] := SC.Grey[I,J];
+      Vol.FData[Pos] := SC.Grey[I,J];
+      Inc(Pos, YStride);
     end;
   end;
 end;
@@ -4171,7 +4210,7 @@ var
   W, H, Dep, dx, dy, d, sx, sy: integer;
   cx, cy, ox, oy, fx, fy: TNeuralFloat;
   Src: TNNetVolume;
-  WM1, HM1, DepM1: integer;
+  WM1, HM1, DepM1, VBase, SrcBase: integer;
 begin
   W := V.SizeX; H := V.SizeY; Dep := V.Depth;
   if (W <= 0) or (H <= 0) then Exit;
@@ -4189,12 +4228,16 @@ begin
       fy := Mat[3] * ox + Mat[4] * oy + Mat[5] + cy;
       sx := Round(fx);
       sy := Round(fy);
-      for d := 0 to DepM1 do
+      VBase := V.GetRawPos(dx, dy, 0);
+      if (sx >= 0) and (sx < W) and (sy >= 0) and (sy < H) then
       begin
-        if (sx >= 0) and (sx < W) and (sy >= 0) and (sy < H)
-          then V[dx, dy, d] := Src[sx, sy, d]
-          else V[dx, dy, d] := 0.0; // neutral gray fill (pixel 128)
-      end;
+        SrcBase := Src.GetRawPos(sx, sy, 0);
+        for d := 0 to DepM1 do
+          V.FData[VBase + d] := Src.FData[SrcBase + d];
+      end
+      else
+        for d := 0 to DepM1 do
+          V.FData[VBase + d] := 0.0; // neutral gray fill (pixel 128)
     end;
   Src.Free;
 end;
@@ -4205,31 +4248,40 @@ procedure AugAutoContrast(V: TNNetVolume);
 var
   d, x, y: integer;
   lo, hi, p, scale: TNeuralFloat;
-  DepthM1, SizeYM1, SizeXM1: integer;
+  DepthM1, SizeYM1, SizeXM1, Pos, XStride: integer;
 begin
   // Per-channel min/max stretch to full 0..255 range (torchvision autocontrast).
   DepthM1 := V.Depth - 1;
   SizeYM1 := V.SizeY - 1;
   SizeXM1 := V.SizeX - 1;
+  XStride := V.GetRawPos(1, 0, 0);
   for d := 0 to DepthM1 do
   begin
     lo := 255; hi := 0;
     for y := 0 to SizeYM1 do
+    begin
+      Pos := V.GetRawPos(0, y, d);
       for x := 0 to SizeXM1 do
       begin
-        p := AugClampPixel(AugNeuronToPixel(V[x, y, d]));
+        p := AugClampPixel(AugNeuronToPixel(V.FData[Pos]));
         if p < lo then lo := p;
         if p > hi then hi := p;
+        Inc(Pos, XStride);
       end;
+    end;
     if hi <= lo then continue;
     scale := 255.0 / (hi - lo);
     for y := 0 to SizeYM1 do
+    begin
+      Pos := V.GetRawPos(0, y, d);
       for x := 0 to SizeXM1 do
       begin
-        p := AugClampPixel(AugNeuronToPixel(V[x, y, d]));
+        p := AugClampPixel(AugNeuronToPixel(V.FData[Pos]));
         p := (p - lo) * scale;
-        V[x, y, d] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
+        V.FData[Pos] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
+        Inc(Pos, XStride);
       end;
+    end;
   end;
 end;
 
@@ -4241,22 +4293,27 @@ var
   lut: array[0..255] of TNeuralFloat;
   cdfMin, denom, p: TNeuralFloat;
   acc: integer;
-  DepthM1, SizeYM1, SizeXM1: integer;
+  DepthM1, SizeYM1, SizeXM1, Pos, XStride: integer;
 begin
   // Per-channel histogram equalization (torchvision equalize).
   DepthM1 := V.Depth - 1;
   SizeYM1 := V.SizeY - 1;
   SizeXM1 := V.SizeX - 1;
+  XStride := V.GetRawPos(1, 0, 0);
   for d := 0 to DepthM1 do
   begin
     for i := 0 to 255 do hist[i] := 0;
     for y := 0 to SizeYM1 do
+    begin
+      Pos := V.GetRawPos(0, y, d);
       for x := 0 to SizeXM1 do
       begin
-        b := Round(AugClampPixel(AugNeuronToPixel(V[x, y, d])));
+        b := Round(AugClampPixel(AugNeuronToPixel(V.FData[Pos])));
         if b < 0 then b := 0; if b > 255 then b := 255;
         Inc(hist[b]);
+        Inc(Pos, XStride);
       end;
+    end;
     acc := 0;
     cdfMin := -1;
     for i := 0 to 255 do
@@ -4276,13 +4333,17 @@ begin
       for i := 0 to 255 do
         lut[i] := AugClampPixel(((cdf[i] - cdfMin) / denom) * 255.0);
     for y := 0 to SizeYM1 do
+    begin
+      Pos := V.GetRawPos(0, y, d);
       for x := 0 to SizeXM1 do
       begin
-        b := Round(AugClampPixel(AugNeuronToPixel(V[x, y, d])));
+        b := Round(AugClampPixel(AugNeuronToPixel(V.FData[Pos])));
         if b < 0 then b := 0; if b > 255 then b := 255;
         p := lut[b];
-        V[x, y, d] := AugClampNeuron(AugPixelToNeuron(p));
+        V.FData[Pos] := AugClampNeuron(AugPixelToNeuron(p));
+        Inc(Pos, XStride);
       end;
+    end;
   end;
 end;
 
@@ -4304,7 +4365,7 @@ procedure AugColor(V: TNNetVolume; Factor: TNeuralFloat);
 var
   W, H, Dep, x, y, d: integer;
   gray, p: TNeuralFloat;
-  WM1, HM1, DepM1: integer;
+  WM1, HM1, DepM1, Base: integer;
 begin
   // Saturation adjustment: blend each pixel toward its per-pixel grayscale.
   W := V.SizeX; H := V.SizeY; Dep := V.Depth;
@@ -4317,15 +4378,16 @@ begin
   for y := 0 to HM1 do
     for x := 0 to WM1 do
     begin
+      Base := V.GetRawPos(x, y, 0);
       gray := 0;
       for d := 0 to DepM1 do
-        gray := gray + AugClampPixel(AugNeuronToPixel(V[x, y, d]));
+        gray := gray + AugClampPixel(AugNeuronToPixel(V.FData[Base + d]));
       gray := gray / Dep;
       for d := 0 to DepM1 do
       begin
-        p := AugClampPixel(AugNeuronToPixel(V[x, y, d]));
+        p := AugClampPixel(AugNeuronToPixel(V.FData[Base + d]));
         p := Factor * p + (1.0 - Factor) * gray;
-        V[x, y, d] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
+        V.FData[Base + d] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
       end;
     end;
 end;
@@ -4348,7 +4410,7 @@ var
   Src: TNNetVolume;
   acc, wsum, p, smooth: TNeuralFloat;
   kw: TNeuralFloat;
-  WM1, HM1, DepM1: integer;
+  WM1, HM1, DepM1, CtrPos: integer;
 begin
   // Blend toward a 3x3 box-blurred image (torchvision uses a smoothing kernel;
   // a box blur is a close, dependency-free stand-in). Factor>1 sharpens.
@@ -4373,9 +4435,10 @@ begin
             wsum := wsum + kw;
           end;
         smooth := acc / wsum;
-        p := AugClampPixel(AugNeuronToPixel(Src[x, y, d]));
+        CtrPos := Src.GetRawPos(x, y, d);
+        p := AugClampPixel(AugNeuronToPixel(Src.FData[CtrPos]));
         p := Factor * p + (1.0 - Factor) * smooth;
-        V[x, y, d] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
+        V.FData[CtrPos] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
       end;
   Src.Free;
 end;
@@ -4573,7 +4636,7 @@ procedure NeuralRandomErasing(V: TNNetVolume;
 var
   W, H, Dep, area, x0, y0, ew, eh, x, y, d, attempt: integer;
   targetArea, aspect, logLo, logHi: TNeuralFloat;
-  YMax, XMax, DepM1: integer;
+  YMax, XMax, DepM1, Base: integer;
 begin
   if (V = nil) or (V.Size = 0) then Exit;
   if Random >= pProb then Exit;
@@ -4597,8 +4660,11 @@ begin
       DepM1 := Dep - 1;
       for y := y0 to YMax do
         for x := x0 to XMax do
+        begin
+          Base := V.GetRawPos(x, y, 0);
           for d := 0 to DepM1 do
-            V[x, y, d] := pFill;
+            V.FData[Base + d] := pFill;
+        end;
       Exit;
     end;
   end;

@@ -3592,6 +3592,7 @@ var
   MixLambda: TNeuralFloat;
   DidBatchMix: boolean;
   CutX0, CutY0, CutBoxW, CutBoxH, CutX, CutY, CutD, CutXMax, CutYMax: integer;
+  CutBase: integer;
 begin
   ImgInput := TNNetVolume.Create();
   ImgInputCp := TNNetVolume.Create();
@@ -3727,8 +3728,11 @@ begin
             DepthM1 := ImgInput.Depth - 1;
             for CutX := CutX0 to CutXMax do
               for CutY := CutY0 to CutYMax do
+              begin
+                CutBase := ImgInput.GetRawPos(CutX, CutY, 0);
                 for CutD := 0 to DepthM1 do
-                  ImgInput[CutX, CutY, CutD] := PartnerInput[CutX, CutY, CutD];
+                  ImgInput.FData[CutBase + CutD] := PartnerInput.FData[CutBase + CutD];
+              end;
           end;
           // True pasted-area fraction (clamped box may shrink at borders).
           MixLambda := 1.0 -

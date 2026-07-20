@@ -2221,7 +2221,7 @@ function ContrastiveCosine(A, B: TNNetVolume): TNeuralFloat; forward;
 function DecodeCTCGreedy(Scores: TNNetVolume; Blank: integer): TNeuralIntegerArray;
 var
   NumT, Vocab, ti, k, ArgMax, Prev, Count: integer;
-  NumTM1, VocabM1: integer;
+  NumTM1, VocabM1, base: integer;
   Best, V: TNeuralFloat;
   Path: TNeuralIntegerArray;
 begin
@@ -2235,10 +2235,11 @@ begin
   for ti := 0 to NumTM1 do
   begin
     ArgMax := 0;
-    Best := Scores[ti, 0, 0];
+    base := Scores.GetRawPos(ti, 0, 0);
+    Best := Scores.FData[base];
     for k := 1 to VocabM1 do
     begin
-      V := Scores[ti, 0, k];
+      V := Scores.FData[base + k];
       if V > Best then
       begin
         Best := V;
@@ -2273,7 +2274,7 @@ type
   end;
 var
   NumT, Vocab, ti, k, i, j, bi, LastSym: integer;
-  NumTM1, VocabM1, BeamsHi, BeamsHiM1, NextHi, IP1: integer;
+  NumTM1, VocabM1, BeamsHi, BeamsHiM1, NextHi, IP1, ScoreBase: integer;
   Beams, Next: array of TCTCBeam;
   Prob: array of double; // current frame probabilities
   BestIdx: integer;
@@ -2338,9 +2339,10 @@ begin
   for ti := 0 to NumTM1 do
   begin
     // Materialise this frame's probabilities (exp the log-probs if needed).
+    ScoreBase := Scores.GetRawPos(ti, 0, 0);
     for k := 0 to VocabM1 do
-      if LogInput then Prob[k] := Exp(Scores[ti, 0, k])
-      else Prob[k] := Scores[ti, 0, k];
+      if LogInput then Prob[k] := Exp(Scores.FData[ScoreBase + k])
+      else Prob[k] := Scores.FData[ScoreBase + k];
 
     SetLength(Next, 0);
     BeamsHi := High(Beams);
