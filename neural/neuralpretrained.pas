@@ -73997,16 +73997,14 @@ function DecodeDetrDetections(Output: TNNetVolume; NumLabels: integer;
 var
   LpMax: integer;
   q, c, BestCls, Cnt: integer;
-  MaxLogit, SumExp, Prob, BestProb: TNeuralFloat;
+  MaxLogit, SumExp, BestProb: TNeuralFloat;
   BoxBase, NumLabelsM1, qBase: integer;
-  expBuf: array of TNeuralFloat;
 begin
   SetLength(Result, Output.SizeX);
   Cnt := 0;
   BoxBase := NumLabels + 1;  // first box channel
   NumLabelsM1 := NumLabels - 1;
   LpMax := Output.SizeX - 1;
-  SetLength(expBuf, NumLabels + 1);  // #4: per-class exp, reused across the loops
   for q := 0 to LpMax do
   begin
     qBase := Output.GetRawPos(q, 0, 0);
@@ -74014,20 +74012,21 @@ begin
     MaxLogit := Output.FData[qBase];
     for c := 1 to NumLabels do
       if Output.FData[qBase + c] > MaxLogit then MaxLogit := Output.FData[qBase + c];
+    // best FOREGROUND class (exclude the no-object slot = NumLabels).
+    // argmax of softmax prob == argmax of the raw logit: Exp is monotonic and the
+    // /SumExp normalizer is a positive constant across classes, so the ranking is
+    // preserved (rule #14). Pick the winner on the raw logit inside the SumExp
+    // pass (no per-class Exp/divide), then compute its probability ONCE below for
+    // the score/threshold.
     SumExp := 0;
+    BestCls := 0;
     for c := 0 to NumLabels do
     begin
-      expBuf[c] := Exp(Output.FData[qBase + c] - MaxLogit);  // #4: cache once
-      SumExp := SumExp + expBuf[c];
+      SumExp := SumExp + Exp(Output.FData[qBase + c] - MaxLogit);
+      if (c <= NumLabelsM1) and
+         (Output.FData[qBase + c] > Output.FData[qBase + BestCls]) then BestCls := c;
     end;
-    // best FOREGROUND class (exclude the no-object slot = NumLabels).
-    BestCls := 0;
-    BestProb := -1;
-    for c := 0 to NumLabelsM1 do
-    begin
-      Prob := expBuf[c] / SumExp;  // #4: reuse cached exp instead of recomputing
-      if Prob > BestProb then begin BestProb := Prob; BestCls := c; end;
-    end;
+    BestProb := Exp(Output.FData[qBase + BestCls] - MaxLogit) / SumExp;
     if BestProb >= Threshold then
     begin
       Result[Cnt].ClassId := BestCls;
