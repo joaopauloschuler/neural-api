@@ -25594,8 +25594,9 @@ begin
   LabelCnt := NetOutput.Depth;
   Logits.ReSize(1, 1, LabelCnt);
   LabelCntM1 := LabelCnt - 1;
-  for ChanCnt := 0 to LabelCntM1 do
-    Logits.FData[ChanCnt] := NetOutput.FData[TokenPos * LabelCnt + ChanCnt];
+  // #13 + #5: contiguous copy of a loop-invariant source row (TokenPos*LabelCnt).
+  Move(NetOutput.FData[TokenPos * LabelCnt], Logits.FData[0],
+    LabelCnt * csNeuralFloatSize);
 end;
 
 function BuildBertForSequenceClassificationFromSafeTensorsEx(
@@ -73223,14 +73224,14 @@ begin
   SetLength(Result, K);
   KM1 := K - 1;
   hmStride := Heatmaps.GetRawPos(1, 0, 0);  // = Depth; elements between consecutive x
+  HeatYMax := Heatmaps.SizeY - 1;  // #5: invariant across c, hoisted out of the c loop
+  HeatXMax := Heatmaps.SizeX - 1;
   for c := 0 to KM1 do
   begin
     Best := Heatmaps[0, 0, c];
     Result[c].X := 0;
     Result[c].Y := 0;
     Result[c].Score := Best;
-    HeatYMax := Heatmaps.SizeY - 1;
-    HeatXMax := Heatmaps.SizeX - 1;
     for y := 0 to HeatYMax do
     begin
       hmPos := Heatmaps.GetRawPos(0, y, c);  // = the x = 0 offset for this (y, c)
@@ -73996,14 +73997,16 @@ function DecodeDetrDetections(Output: TNNetVolume; NumLabels: integer;
 var
   LpMax: integer;
   q, c, BestCls, Cnt: integer;
-  Logit, MaxLogit, SumExp, Prob, BestProb: TNeuralFloat;
+  MaxLogit, SumExp, Prob, BestProb: TNeuralFloat;
   BoxBase, NumLabelsM1, qBase: integer;
+  expBuf: array of TNeuralFloat;
 begin
   SetLength(Result, Output.SizeX);
   Cnt := 0;
   BoxBase := NumLabels + 1;  // first box channel
   NumLabelsM1 := NumLabels - 1;
   LpMax := Output.SizeX - 1;
+  SetLength(expBuf, NumLabels + 1);  // #4: per-class exp, reused across the loops
   for q := 0 to LpMax do
   begin
     qBase := Output.GetRawPos(q, 0, 0);
@@ -74013,14 +74016,16 @@ begin
       if Output.FData[qBase + c] > MaxLogit then MaxLogit := Output.FData[qBase + c];
     SumExp := 0;
     for c := 0 to NumLabels do
-      SumExp := SumExp + Exp(Output.FData[qBase + c] - MaxLogit);
+    begin
+      expBuf[c] := Exp(Output.FData[qBase + c] - MaxLogit);  // #4: cache once
+      SumExp := SumExp + expBuf[c];
+    end;
     // best FOREGROUND class (exclude the no-object slot = NumLabels).
     BestCls := 0;
     BestProb := -1;
     for c := 0 to NumLabelsM1 do
     begin
-      Logit := Output.FData[qBase + c];
-      Prob := Exp(Logit - MaxLogit) / SumExp;
+      Prob := expBuf[c] / SumExp;  // #4: reuse cached exp instead of recomputing
       if Prob > BestProb then begin BestProb := Prob; BestCls := c; end;
     end;
     if BestProb >= Threshold then
@@ -74814,8 +74819,9 @@ var
   q, c, p, NumPix, NumQueries, BestC: integer;
   NumQueriesM1, NumLabelsM1, NumPixM1: integer;
   clBase, mlPos, mlStride: integer;
-  MaxLogit, SumExp, prob, sg, acc, BestVal: TNeuralFloat;
+  MaxLogit, SumExp, prob, acc, BestVal: TNeuralFloat;
   ClsProb: array of TNeuralFloat;
+  Sig: array of TNeuralFloat;
 begin
   NumQueries := ClassLogits.SizeX;
   NumPix := MaskWidth * MaskHeight;
@@ -74841,19 +74847,23 @@ begin
         Exp(ClassLogits.FData[clBase + c] - MaxLogit) / SumExp;
   end;
   // per pixel: argmax_c sum_q clsprob[q,c] * sigmoid(mask[q,p]).
+  // #5/#11: sigmoid depends only on (q,p), not c -> precompute Sig[q] once per
+  // pixel, then the (c,q) loops only accumulate. Scratch allocated once.
+  SetLength(Sig, NumQueries);
   for p := 0 to NumPixM1 do
   begin
+    mlPos := p;  // = MaskLogits.GetRawPos(0, 0, p); the q = 0 offset
+    for q := 0 to NumQueriesM1 do
+    begin
+      Sig[q] := 1.0 / (1.0 + Exp(-MaskLogits.FData[mlPos]));
+      Inc(mlPos, mlStride);
+    end;
     BestC := 0; BestVal := -1;
     for c := 0 to NumLabelsM1 do
     begin
       acc := 0;
-      mlPos := p;  // = MaskLogits.GetRawPos(0, 0, p); the q = 0 offset
       for q := 0 to NumQueriesM1 do
-      begin
-        sg := 1.0 / (1.0 + Exp(-MaskLogits.FData[mlPos]));
-        acc := acc + ClsProb[q * NumLabels + c] * sg;
-        Inc(mlPos, mlStride);
-      end;
+        acc := acc + ClsProb[q * NumLabels + c] * Sig[q];
       if acc > BestVal then begin BestVal := acc; BestC := c; end;
     end;
     Result[p] := BestC;
@@ -75224,15 +75234,18 @@ function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
 var
   s, gx, gy, gw, side, b, k, cls, BestCls, Cnt, Cell, i2: integer;
   rm, nc, OutDim, Stride, cellBase: integer;
-  gwM1, ncM1, rmM1, HiCand, KeptIdxHi: integer;
+  gwM1, ncM1, rmM1, HiCand, KeptIdxHi, clsOfs, sideBase: integer;
   MaxLogit, SumExp, P, BestScore, Dist, Cx, Cy, L, Tp, R, Bp: TNeuralFloat;
   Dists: array[0..3] of TNeuralFloat;
+  expBuf: array of TNeuralFloat;
   Cand: TYoloDetectionArray;
   NX1, NY1, NX2, NY2, NScore: TNeuralFloatDynArr;
   NCls, KeptIdx: TNeuralIntegerArray;
 begin
   rm := Config.RegMax; nc := Config.NumClasses; OutDim := 4 * rm + nc;
   rmM1 := rm - 1; ncM1 := nc - 1;
+  clsOfs := 4 * rm;          // #5/#11: class-logit offset, invariant across cells
+  SetLength(expBuf, rm);     // #4: cached per-bin exp, reused between SumExp/Dist
   SetLength(Cand, 0);
   Cell := 0;
   for s := 0 to 2 do
@@ -75248,7 +75261,7 @@ begin
         cellBase := Output.GetRawPos(Cell, 0, 0);
         for cls := 0 to ncM1 do
         begin
-          P := 1.0 / (1.0 + Exp(-Output.FData[cellBase + 4 * rm + cls]));
+          P := 1.0 / (1.0 + Exp(-Output.FData[cellBase + clsOfs + cls]));
           if P > BestScore then begin BestScore := P; BestCls := cls; end;
         end;
         if BestScore >= ScoreThreshold then
@@ -75256,16 +75269,22 @@ begin
           // DFL: each of 4 sides = softmax over rm bins -> expected value.
           for side := 0 to 3 do
           begin
-            MaxLogit := Output.FData[cellBase + side * rm];
+            sideBase := cellBase + side * rm;  // #5/#11: hoisted out of the b loops
+            MaxLogit := Output.FData[sideBase];
             for b := 1 to rmM1 do
-              if Output.FData[cellBase + side * rm + b] > MaxLogit then
-                MaxLogit := Output.FData[cellBase + side * rm + b];
+              if Output.FData[sideBase + b] > MaxLogit then
+                MaxLogit := Output.FData[sideBase + b];
             SumExp := 0;
             for b := 0 to rmM1 do
-              SumExp := SumExp + Exp(Output.FData[cellBase + side * rm + b] - MaxLogit);
+            begin
+              // #4: exp computed once, cached for reuse in the Dist loop
+              expBuf[b] := Exp(Output.FData[sideBase + b] - MaxLogit);
+              SumExp := SumExp + expBuf[b];
+            end;
             Dist := 0;
             for b := 0 to rmM1 do
-              Dist := Dist + b * Exp(Output.FData[cellBase + side * rm + b] - MaxLogit) / SumExp;
+              Dist := Dist + b * expBuf[b];
+            Dist := Dist / SumExp;  // #5: single divide factored out of the loop
             Dists[side] := Dist;
           end;
           // ltrb distances from the cell centre (in grid units), -> xyxy.
