@@ -7345,8 +7345,9 @@ begin
     // Structure: 2 SDPA heads per layer; layers 0,1 sliding (Window=4),
     // layer 2 global (Window=0); NO score soft-cap anywhere and NO final
     // TNNetSoftCapping. RMSNorm count: 4 sandwich norms per block + the
-    // final norm + the per-head q/k norms (2 q + 1 k per block, MQA) =
-    // 3*4 + 1 + 3*3 = 22.
+    // final norm + the HEAD-TILED q/k norms (full-rotary QKNorm builds ONE
+    // TNNetHeadRMSNorm per q/k projection instead of per-head copies:
+    // 1 q + 1 k per block) = 3*4 + 1 + 3*2 = 19.
     SDPACnt := 0;
     RMSNormCnt := 0;
     SoftCapCnt := 0;
@@ -7369,7 +7370,7 @@ begin
       if NN.Layers[LayerCnt] is TNNetSoftCapping then Inc(SoftCapCnt);
     end;
     AssertEquals('SDPA head count', 6, SDPACnt);
-    AssertEquals('RMSNorm count (sandwich + final + per-head q/k)', 22,
+    AssertEquals('RMSNorm count (sandwich + final + tiled q/k)', 19,
       RMSNormCnt);
     AssertEquals('no final-logit TNNetSoftCapping', 0, SoftCapCnt);
     AssertLogitParityWithFixture(NN,

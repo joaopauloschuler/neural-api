@@ -15639,7 +15639,7 @@ var
   NumLayersM1, NumKVHeadsM1, NumHeadsM1, HeadDimM1, RotaryDimsM1: integer;
   HeadDimMRotaryM1, VocabSizeM1, HiddenSizeM1, NumLocalExpertsM1: integer;
   LayerIsLocal, LayerUseRoPE: boolean;
-  DoHoistRoPE: boolean;
+  DoHoistRoPE, DoTiledQKNorm: boolean;
   NormGainOffset, QScale, QProjScale, LayerTheta: TNeuralFloat;
   LogitScaleFold: TNeuralFloat;
   LayerRoPEScaling: TRoPEScalingConfig;
@@ -15952,10 +15952,36 @@ begin
         // Config.QKNorm (Qwen3, Gemma-3): per-head RMSNorm on each q/k
         // slice AFTER the projection and BEFORE RoPE (the HF
         // modeling_qwen3 AND modeling_gemma3 ordering, both verified:
-        // q_norm(q_proj(x)) then apply_rotary_pos_emb). One
-        // TNNetTokenRMSNorm copy per head; the shared [head_dim] gain is
-        // loaded into every copy below.
-        if Config.QKNorm then
+        // q_norm(q_proj(x)) then apply_rotary_pos_emb).
+        // OPTIMIZATION (Coded by Claude (AI)): when the rotary is full-width
+        // and nothing per-head-only is in play, ONE TNNetHeadRMSNorm on the
+        // WHOLE q/k projection replaces the NumHeads/NumKVHeads
+        // [SplitChannels -> TNNetTokenRMSNorm] copies - the head-tiled kernel
+        // normalizes each contiguous HeadDim slice with the shared gain,
+        // bit-identical per head - and, because the norm is now applied
+        // BEFORE the head split, it also unlocks the hoisted full-width RoPE
+        // below (same q_norm-then-rope order HF uses). Per-head fallback
+        // stays for partial rotary (Qwen3.5), M-RoPE (VL models) and
+        // Llama-4's post-RoPE QK-L2-norm.
+        DoTiledQKNorm := Config.QKNorm and (RotaryDims >= HeadDim) and
+          (not Config.MRoPEEnabled) and (not Config.Llama4QKL2Norm);
+        if DoTiledQKNorm then
+        begin
+          // Stored as 1-length QNorms/KNorms arrays: the shared-gain loader
+          // (LoadLlamaHeadRMSNormWeights) walks the array and the gain is
+          // HeadDim-long either way, so it works unchanged.
+          SetLength(Blocks[BlockCnt].QNorms, 1);
+          SetLength(Blocks[BlockCnt].KNorms, 1);
+          Blocks[BlockCnt].QNorms[0] := NN.AddLayerAfter(
+            TNNetHeadRMSNorm.Create(HeadDim, Config.RmsNormEps).SetTrainable(pTrainable),
+            QSource);
+          QSource := Blocks[BlockCnt].QNorms[0];
+          Blocks[BlockCnt].KNorms[0] := NN.AddLayerAfter(
+            TNNetHeadRMSNorm.Create(HeadDim, Config.RmsNormEps).SetTrainable(pTrainable),
+            KSource);
+          KSource := Blocks[BlockCnt].KNorms[0];
+        end
+        else if Config.QKNorm then
         begin
           SetLength(Blocks[BlockCnt].QNorms, Config.NumHeads);
           SetLength(Blocks[BlockCnt].KNorms, Config.NumKVHeads);
@@ -15974,7 +16000,8 @@ begin
         // per-head: CreateRoPELayerForConfig ignores the head dim for it, so a
         // hoisted layer would spread the per-head frequency schedule across the
         // whole projection width (wrong frequencies) - excluded explicitly.
-        DoHoistRoPE := LayerUseRoPE and (not Config.QKNorm) and
+        DoHoistRoPE := LayerUseRoPE and
+          ((not Config.QKNorm) or DoTiledQKNorm) and
           (not Config.Llama4QKL2Norm) and (RotaryDims >= HeadDim) and
           (not Config.MRoPEEnabled);
         if DoHoistRoPE then
@@ -16040,7 +16067,8 @@ begin
           begin
             KSlice := NN.AddLayerAfter(
               TNNetSplitChannels.Create(SliceChannels), KSource);
-            if Config.QKNorm then
+            // Skipped when DoTiledQKNorm normed the whole K projection above.
+            if Config.QKNorm and (not DoTiledQKNorm) then
             begin
               Blocks[BlockCnt].KNorms[KVHeadCnt] := NN.AddLayerAfter(
                 TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable), KSlice);
@@ -16111,7 +16139,8 @@ begin
           begin
             QSlice := NN.AddLayerAfter(
               TNNetSplitChannels.Create(SliceChannels), QSource);
-            if Config.QKNorm then
+            // Skipped when DoTiledQKNorm normed the whole Q projection above.
+            if Config.QKNorm and (not DoTiledQKNorm) then
             begin
               Blocks[BlockCnt].QNorms[HeadCnt] := NN.AddLayerAfter(
                 TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable), QSlice);
@@ -18271,6 +18300,7 @@ var
   V: TNNetVolume;
   BlockPrefix: string;
   NormsPerBlock: integer;
+  TiledQK: boolean;
 
   // Reads a bias-free [OutDim, InDim] PointwiseConvLinear back into a flat
   // row-major [OutDim*InDim] volume (neuron j weight i = W[j*InDim+i]).
@@ -18388,8 +18418,12 @@ begin
   HeadDimM1 := HeadDim - 1;
   HiddenSizeM1 := Config.HiddenSize - 1;
   IntSizeM1 := IntSize - 1;
-  // Per block: AttnNorm (1) + K-norms (NumKVHeads) + Q-norms (NumHeads) +
-  // MlpNorm (1), in that net order; plus one final norm.
+  // Per block, PER-HEAD layout: AttnNorm (1) + K-norms (NumKVHeads) +
+  // Q-norms (NumHeads) + MlpNorm (1), in that net order; plus one final norm.
+  // TILED layout (TNNetHeadRMSNorm, the head-tiled q/k norm the importer now
+  // builds for full-rotary QKNorm models): AttnNorm (1) + Q-norm (1, tiled) +
+  // K-norm (1, tiled) + MlpNorm (1) - note Q BEFORE K here, matching the
+  // build order. Detected from the net below so both layouts export.
   NormsPerBlock := 2 + Config.NumHeads + Config.NumKVHeads;
 
   // ---- collect linears and norms in net order. Linears per block are
@@ -18423,6 +18457,16 @@ begin
   if Embed = nil then
     ImportError('TNNet Qwen3 export: no TNNetEmbedding layer found - not a ' +
       'Qwen3 TNNet stack?');
+  // Tiled-layout detection: the head-tiled build has exactly one
+  // TNNetHeadRMSNorm per q/k projection instead of the per-head copies.
+  TiledQK := false;
+  for i := 0 to High(Norms) do
+    if Norms[i] is TNNetHeadRMSNorm then
+    begin
+      TiledQK := true;
+      break;
+    end;
+  if TiledQK then NormsPerBlock := 4;
   if Length(Linears) <> Config.NumLayers * 6 + 1 then
     ImportError('TNNet Qwen3 export: found ' + IntToStr(Length(Linears)) +
       ' linear projections, expected ' + IntToStr(Config.NumLayers * 6 + 1) +
@@ -18449,6 +18493,26 @@ begin
     for b := 0 to NumLayersM1 do
     begin
       BlockPrefix := 'model.layers.' + IntToStr(b) + '.';
+      if TiledQK then
+      begin
+        // Tiled norm group: base = b * 4.
+        //   [base]   = AttnNorm (input_layernorm)
+        //   [base+1] = Q-norm   (q_norm, tiled shared gain)
+        //   [base+2] = K-norm   (k_norm, tiled shared gain)
+        //   [base+3] = MlpNorm  (post_attention_ln)
+        DumpNorm(Norms[b * NormsPerBlock], Config.HiddenSize,
+          BlockPrefix + 'input_layernorm.weight');
+        DumpNorm(Norms[b * NormsPerBlock + 3], Config.HiddenSize,
+          BlockPrefix + 'post_attention_layernorm.weight');
+        // DumpHeadNorm reads the first HeadDim gains - exactly the tiled
+        // layer's whole (shared) gain vector, same de-permutation.
+        DumpHeadNorm(Norms[b * NormsPerBlock + 2],
+          BlockPrefix + 'self_attn.k_norm.weight');
+        DumpHeadNorm(Norms[b * NormsPerBlock + 1],
+          BlockPrefix + 'self_attn.q_norm.weight');
+      end
+      else
+      begin
       // Norm group for this block: base = b * NormsPerBlock.
       //   [base]                           = AttnNorm (input_layernorm)
       //   [base+1 .. +NumKVHeads]          = K-norms  (k_norm, shared gain)
@@ -18464,6 +18528,7 @@ begin
         BlockPrefix + 'self_attn.k_norm.weight');
       DumpHeadNorm(Norms[b * NormsPerBlock + 1 + Config.NumKVHeads],
         BlockPrefix + 'self_attn.q_norm.weight');
+      end;
 
       // Q/K/V/O = Linears[6*b .. 6*b+3]; GateUp/Down = Linears[6*b+4..+5].
       // The q/k neurons are in the interleaved-rotary layout the loader
