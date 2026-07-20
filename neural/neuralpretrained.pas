@@ -31028,7 +31028,7 @@ procedure RunFlorence2Projector(const Config: TFlorence2Config;
 var
   C, H, W, HalfC, RestC, hh, ww, ch, NumCells, CellIdx, ProjDim, k: integer;
   HM1, WM1, CM1, NumCellsM1, ProjDimM1: integer;
-  colBase, rowBase, cellBase, kBase, TokBase, pos: integer;
+  colBase, rowBase, cellBase, kBase, TokBase, pos, fmBase: integer;
   PosFeat: TNNetVolume;     // (H*W, 1, C) position-added flattened tokens
   Temporal: TNNetVolume;    // (C) the row-0 cosine vector
   SpatialMean: TNNetVolume; // (C)
@@ -31072,9 +31072,10 @@ begin
         CellIdx := hh * W + ww;
         colBase := ww * HalfC;
         cellBase := CellIdx * C;
+        fmBase := FeatureMap.GetRawPos(ww, hh, 0);
         for ch := 0 to CM1 do
         begin
-          Val := FeatureMap[ww, hh, ch];
+          Val := FeatureMap.FData[fmBase + ch];
           if ch < HalfC then
             Val := Val + Projector.ColEmbed.FData[colBase + ch]
           else
@@ -37409,6 +37410,7 @@ var
   CrossLeaves: array of TNNetCrossAttention;
   LeafCnt, LayerCnt, HeadCnt, EncFrames, AvgN: integer;
   i, j, h, GlobalIdx, LayersMax, HeadsHi, TextLenM1, EncFramesM1: integer;
+  rBase, lBase: integer;
   Leaf: TNNetCrossAttention;
   RowMax, SumExp, V: TNeuralFloat;
   FiltRow: array of TNeuralFloat;
@@ -37453,8 +37455,13 @@ begin
     GlobalIdx := LayerCnt * Config.DecoderHeads + HeadCnt;
     Leaf := CrossLeaves[GlobalIdx];
     for i := 0 to TextLenM1 do
+    begin
+      rBase := Result.GetRawPos(0, i, 0);
+      lBase := Leaf.AttentionWeights.GetRawPos(0, i, 0);
       for j := 0 to EncFramesM1 do
-        Result.Add(j, i, 0, Leaf.AttentionWeights[j, i, 0]);
+        Result.FData[rBase + j] :=
+          Result.FData[rBase + j] + Leaf.AttentionWeights.FData[lBase + j];
+    end;
     Inc(AvgN);
   end;
   if AvgN = 0 then
@@ -37472,9 +37479,10 @@ begin
     SetLength(FiltRow, EncFrames);
     for i := 0 to TextLenM1 do
     begin
-      for j := 0 to EncFramesM1 do FiltRow[j] := Result[j, i, 0];
+      rBase := Result.GetRawPos(0, i, 0);
+      for j := 0 to EncFramesM1 do FiltRow[j] := Result.FData[rBase + j];
       WhisperMedianFilterRow(FiltRow, EncFrames, MedianKernel);
-      for j := 0 to EncFramesM1 do Result[j, i, 0] := FiltRow[j];
+      for j := 0 to EncFramesM1 do Result.FData[rBase + j] := FiltRow[j];
     end;
   end;
 
@@ -37482,26 +37490,27 @@ begin
   //    map back into a distribution along the audio axis.
   for i := 0 to TextLenM1 do
   begin
-    RowMax := Result[0, i, 0];
+    rBase := Result.GetRawPos(0, i, 0);
+    RowMax := Result.FData[rBase];
     for j := 1 to EncFramesM1 do
-      if Result[j, i, 0] > RowMax then RowMax := Result[j, i, 0];
+      if Result.FData[rBase + j] > RowMax then RowMax := Result.FData[rBase + j];
     SumExp := 0;
     for j := 0 to EncFramesM1 do
     begin
-      V := Exp(Result[j, i, 0] - RowMax);
-      Result[j, i, 0] := V;
+      V := Exp(Result.FData[rBase + j] - RowMax);
+      Result.FData[rBase + j] := V;
       SumExp := SumExp + V;
     end;
     if SumExp > 0 then
       for j := 0 to EncFramesM1 do
-        Result[j, i, 0] := Result[j, i, 0] / SumExp;
+        Result.FData[rBase + j] := Result.FData[rBase + j] / SumExp;
   end;
 end;
 
 function WhisperDTW(Score: TNNetVolume;
   out PathTok, PathFrame: array of integer): integer;
 var
-  N, M, i, j, ti, fj, PathLen, ResultM1: integer;
+  N, M, i, j, ti, fj, PathLen, ResultM1, sBase: integer;
   Cost: array of array of Double;   // accumulated cost
   Trace: array of array of byte;    // 0=diag, 1=down(token), 2=right(frame)
   c0, c1, c2, Best: Double;
@@ -37521,6 +37530,8 @@ begin
   Cost[0][0] := 0;
   // Local cost = -Score (openai-whisper minimizes negative attention).
   for i := 1 to N do
+  begin
+    sBase := Score.GetRawPos(0, i - 1, 0);
     for j := 1 to M do
     begin
       c0 := Cost[i - 1][j - 1];  // diagonal
@@ -37529,9 +37540,10 @@ begin
       Best := c0; BestMove := 0;
       if c1 < Best then begin Best := c1; BestMove := 1; end;
       if c2 < Best then begin Best := c2; BestMove := 2; end;
-      Cost[i][j] := Best - Score[j - 1, i - 1, 0];
+      Cost[i][j] := Best - Score.FData[sBase + (j - 1)];
       Trace[i][j] := BestMove;
     end;
+  end;
   // Backtrace from (N,M) to (1,1), then collect into ascending order.
   SetLength(TmpTok, N + M);
   SetLength(TmpFrame, N + M);
@@ -37572,7 +37584,7 @@ var
   Score: TNNetVolume;
   PathTok, PathFrame: array of integer;
   PathLen, NText, t, k, WordCnt: integer;
-  ScoreXMax, NTextM1, PathLenM1: integer;
+  ScoreXMax, NTextM1, PathLenM1, dstBase, srcBase: integer;
   TokStartFrame, TokEndFrame: array of integer;
   TokAttnSum: array of TNeuralFloat;  // path-attention sum per token
   TokAttnCnt: array of integer;       // path steps per token
@@ -37619,8 +37631,12 @@ begin
       // Re-pack rows [TextStart..] to the top.
       ScoreXMax := Score.SizeX - 1;
       for t := 0 to NTextM1 do
+      begin
+        dstBase := Score.GetRawPos(0, t, 0);
+        srcBase := Score.GetRawPos(0, t + TextStart, 0);
         for k := 0 to ScoreXMax do
-          Score[k, t, 0] := Score[k, t + TextStart, 0];
+          Score.FData[dstBase + k] := Score.FData[srcBase + k];
+      end;
     end;
     // DTW on just the text rows.
     SetLength(PathTok, NText + Score.SizeX);
@@ -39074,8 +39090,10 @@ procedure LoadPyannoteLSTM(Reader: TNNetSafeTensorsReader;
   Consumed: TStringList);
 var
   Wih, Whh, Bih, Bhh: TNNetVolume;
+  Wg, Wrg, Wbg: TNNetVolume;
   g, o, i: integer;
   HiddenM1, InDimM1: integer;
+  gH, wgBase, wrgBase, wihBase, whhBase: integer;
   IhName, HhName, BihName, BhhName: string;
 begin
   HiddenM1 := Hidden - 1;
@@ -39114,17 +39132,22 @@ begin
     for g := 0 to 3 do
     begin
       // input projection -> Neurons[g]; recurrent projection -> Neurons[4+g].
+      Wg := Layer.FArrNeurons[g].Weights;
+      Wrg := Layer.FArrNeurons[4 + g].Weights;
+      Wbg := Layer.FArrNeurons[8 + g].Weights;
+      gH := g * Hidden;
       for o := 0 to HiddenM1 do
       begin
+        wgBase := Wg.GetRawPos(o, 0, 0);
+        wihBase := (gH + o) * InDim;
         for i := 0 to InDimM1 do
-          Layer.FArrNeurons[g].Weights[o, 0, i] :=
-            Wih.FData[(g * Hidden + o) * InDim + i];
+          Wg.FData[wgBase + i] := Wih.FData[wihBase + i];
+        wrgBase := Wrg.GetRawPos(o, 0, 0);
+        whhBase := (gH + o) * Hidden;
         for i := 0 to HiddenM1 do
-          Layer.FArrNeurons[4 + g].Weights[o, 0, i] :=
-            Whh.FData[(g * Hidden + o) * Hidden + i];
+          Wrg.FData[wrgBase + i] := Whh.FData[whhBase + i];
         // folded bias sum b_ih + b_hh -> Neurons[8+g].
-        Layer.FArrNeurons[8 + g].Weights.FData[o] :=
-          Bih.FData[g * Hidden + o] + Bhh.FData[g * Hidden + o];
+        Wbg.FData[o] := Bih.FData[gH + o] + Bhh.FData[gH + o];
       end;
     end;
   finally
@@ -44509,7 +44532,7 @@ procedure TNNetHiFiGAN.SynthesizeVolume(Mel: TNNetVolume;
 var
   Mel2D: TNNetFloatDynArr2D;
   Frames, Bands, c, t: integer;
-  BandsM1, FramesM1: integer;
+  BandsM1, FramesM1, melPos, melStride: integer;
 begin
   // The log-mel frontend produces (Frames, 1, Bands): SizeX=frames, Depth=bands.
   Frames := Mel.SizeX;
@@ -44520,10 +44543,16 @@ begin
   SetLength(Mel2D, Bands);
   BandsM1 := Bands - 1;
   FramesM1 := Frames - 1;
+  melStride := Mel.GetRawPos(1, 0, 0);  // = Bands; elements between consecutive t
   for c := 0 to BandsM1 do
   begin
     SetLength(Mel2D[c], Frames);
-    for t := 0 to FramesM1 do Mel2D[c][t] := Mel[t, 0, c];
+    melPos := c;  // = Mel.GetRawPos(0, 0, c); the t = 0 offset
+    for t := 0 to FramesM1 do
+    begin
+      Mel2D[c][t] := Mel.FData[melPos];
+      Inc(melPos, melStride);
+    end;
   end;
   Synthesize(Mel2D, Waveform);
 end;
@@ -56151,7 +56180,7 @@ function DecodeOwlViTDetections(VisionOutput, QueryEmbeds: TNNetVolume;
 var
   NumPatches, NumQueries, p, q, c, Cnt: integer;
   NumPatchesM1, NumQueriesM1, TextDimM1: integer;
-  ShiftBase, ScaleBase, BoxBase: integer;
+  ShiftBase, ScaleBase, BoxBase, voBase, qeBase: integer;
   Norm, Shift, ScaleRaw, ScaleVal, Cos, Logit, Score: TNeuralFloat;
   BiasCx, BiasCy, BiasW, BiasH: TNeuralFloat;
   ImgEmb: array of TNeuralFloat;
@@ -56171,24 +56200,26 @@ begin
   begin
     // L2-normalize the per-patch image_class_embeds (norm + 1e-6, as HF).
     Norm := 0;
+    voBase := VisionOutput.GetRawPos(p, 0, 0);
     for c := 0 to TextDimM1 do
     begin
-      ImgEmb[c] := VisionOutput[p, 0, c];
+      ImgEmb[c] := VisionOutput.FData[voBase + c];
       Norm := Norm + ImgEmb[c] * ImgEmb[c];
     end;
     Norm := Sqrt(Norm) + 1e-6;
     for c := 0 to TextDimM1 do
       ImgEmb[c] := ImgEmb[c] / Norm;
-    Shift := VisionOutput[p, 0, ShiftBase];
-    ScaleRaw := VisionOutput[p, 0, ScaleBase];
+    Shift := VisionOutput.FData[voBase + ShiftBase];
+    ScaleRaw := VisionOutput.FData[voBase + ScaleBase];
     // elu(x) + 1
     if ScaleRaw > 0 then ScaleVal := ScaleRaw + 1
     else ScaleVal := Exp(ScaleRaw); // (exp(x)-1)+1
     for q := 0 to NumQueriesM1 do
     begin
       Cos := 0;
+      qeBase := QueryEmbeds.GetRawPos(q, 0, 0);
       for c := 0 to TextDimM1 do
-        Cos := Cos + ImgEmb[c] * QueryEmbeds[q, 0, c];
+        Cos := Cos + ImgEmb[c] * QueryEmbeds.FData[qeBase + c];
       Logit := (Cos + Shift) * ScaleVal;
       Score := 1.0 / (1.0 + Exp(-Logit));
       if Score >= Threshold then
@@ -56198,13 +56229,13 @@ begin
         Result[Cnt].QueryIndex := q;
         Result[Cnt].Score := Score;
         Result[Cnt].Cx :=
-          1.0 / (1.0 + Exp(-(VisionOutput[p, 0, BoxBase + 0] + BiasCx)));
+          1.0 / (1.0 + Exp(-(VisionOutput.FData[voBase + BoxBase + 0] + BiasCx)));
         Result[Cnt].Cy :=
-          1.0 / (1.0 + Exp(-(VisionOutput[p, 0, BoxBase + 1] + BiasCy)));
+          1.0 / (1.0 + Exp(-(VisionOutput.FData[voBase + BoxBase + 1] + BiasCy)));
         Result[Cnt].W :=
-          1.0 / (1.0 + Exp(-(VisionOutput[p, 0, BoxBase + 2] + BiasW)));
+          1.0 / (1.0 + Exp(-(VisionOutput.FData[voBase + BoxBase + 2] + BiasW)));
         Result[Cnt].H :=
-          1.0 / (1.0 + Exp(-(VisionOutput[p, 0, BoxBase + 3] + BiasH)));
+          1.0 / (1.0 + Exp(-(VisionOutput.FData[voBase + BoxBase + 3] + BiasH)));
         Inc(Cnt);
       end;
     end;
@@ -63427,6 +63458,7 @@ procedure ClapBatchNormMelImage(Reader: TNNetSafeTensorsReader;
 var
   Gamma, Beta, Mean, Var_: TNNetVolume;
   f, Time, Mel, FreqRatio, Spec, hh, ww, c2, srcT, SpecM1: integer;
+  imgPos, imgStride: integer;
   Eps, Normed: TNeuralFloat;
   EncPrefix: string;
 begin
@@ -63469,7 +63501,10 @@ begin
     // At fr = 1 this is the plain freq<->time transpose (Image[W=t, H=f]).
     Image.ReSize(Spec, Spec, 1);
     SpecM1 := Spec - 1;
+    imgStride := Image.GetRawPos(0, 1, 0);  // = Spec; elements between consecutive hh
     for ww := 0 to SpecM1 do          // W = time // fr axis
+    begin
+      imgPos := ww;                   // = Image.GetRawPos(ww, 0, 0); the hh = 0 offset
       for hh := 0 to SpecM1 do        // H = freq * fr axis
       begin
         f := hh mod Mel;                // mel bin
@@ -63478,8 +63513,10 @@ begin
         Normed := (RawMel.FData[srcT * Mel + f] - Mean.FData[f]) /
           Sqrt(Var_.FData[f] + Eps);
         Normed := Normed * Gamma.FData[f] + Beta.FData[f];
-        Image[ww, hh, 0] := Normed;
+        Image.FData[imgPos] := Normed;
+        Inc(imgPos, imgStride);
       end;
+    end;
   finally
     Gamma.Free; Beta.Free; Mean.Free; Var_.Free;
   end;
@@ -63488,7 +63525,7 @@ end;
 procedure ClapSimilarityMatrix(const AudioEmbs, TextEmbs: array of TNNetVolume;
   LogitScaleA: TNeuralFloat; Matrix: TNNetVolume);
 var
-  i, j, Rows, Cols, RowsM1, ColsM1: integer;
+  i, j, Rows, Cols, RowsM1, ColsM1, mBase: integer;
   Scale: TNeuralFloat;
 begin
   Rows := Length(AudioEmbs);
@@ -63498,8 +63535,11 @@ begin
   Scale := Exp(LogitScaleA);
   Matrix.ReSize(Cols, Rows, 1);
   for i := 0 to RowsM1 do
+  begin
+    mBase := Matrix.GetRawPos(0, i, 0);
     for j := 0 to ColsM1 do
-      Matrix[j, i, 0] := Scale * ClipSimilarity(AudioEmbs[i], TextEmbs[j]);
+      Matrix.FData[mBase + j] := Scale * ClipSimilarity(AudioEmbs[i], TextEmbs[j]);
+  end;
 end;
 
 // ===========================================================================
@@ -64489,6 +64529,7 @@ var
   wx, wy, w: TNeuralFloat;  // feather weights
   StartsYHi, StartsXHi, TileLatentMinSizeM1, LatentDepthM1: integer;
   ImgTileWM1, OutChannelsM1: integer;
+  ltBase, latBase, resBase, doBase: integer;
 begin
   // The decoder's fixed-size TNNetInput defines the tile; the latent->image
   // scale is read from the first/last layer spatial sizes.
@@ -64553,9 +64594,12 @@ begin
       // Crop the latent tile.
       for ty := 0 to TileLatentMinSizeM1 do
         for tx := 0 to TileLatentMinSizeM1 do
+        begin
+          ltBase := LatTile.GetRawPos(tx, ty, 0);
+          latBase := Latent.GetRawPos(StartsX[nx] + tx, StartsY[nj] + ty, 0);
           for d := 0 to LatentDepthM1 do
-            LatTile[tx, ty, d] :=
-              Latent[StartsX[nx] + tx, StartsY[nj] + ty, d];
+            LatTile.FData[ltBase + d] := Latent.FData[latBase + d];
+        end;
 
       DecOut := VaeDecodeTile(Decoder, LatTile);
 
@@ -64578,9 +64622,11 @@ begin
           else
             wx := 1.0;
           w := wx * wy;
+          resBase := Result.GetRawPos(gx, gy, 0);
+          doBase := DecOut.GetRawPos(tx, ty, 0);
           for d := 0 to OutChannelsM1 do
-            Result[gx, gy, d] :=
-              Result[gx, gy, d] * (1.0 - w) + DecOut[tx, ty, d] * w;
+            Result.FData[resBase + d] :=
+              Result.FData[resBase + d] * (1.0 - w) + DecOut.FData[doBase + d] * w;
         end;
       end;
     end;
@@ -73170,12 +73216,13 @@ function DecodeViTPoseKeypoints(
   Heatmaps: TNNetVolume): TViTPoseKeypointArray;
 var
   c, x, y, K: integer;
-  HeatXMax, HeatYMax, KM1: integer;
+  HeatXMax, HeatYMax, KM1, hmPos, hmStride: integer;
   Val, Best: TNeuralFloat;
 begin
   K := Heatmaps.Depth;
   SetLength(Result, K);
   KM1 := K - 1;
+  hmStride := Heatmaps.GetRawPos(1, 0, 0);  // = Depth; elements between consecutive x
   for c := 0 to KM1 do
   begin
     Best := Heatmaps[0, 0, c];
@@ -73185,9 +73232,11 @@ begin
     HeatYMax := Heatmaps.SizeY - 1;
     HeatXMax := Heatmaps.SizeX - 1;
     for y := 0 to HeatYMax do
+    begin
+      hmPos := Heatmaps.GetRawPos(0, y, c);  // = the x = 0 offset for this (y, c)
       for x := 0 to HeatXMax do
       begin
-        Val := Heatmaps[x, y, c];
+        Val := Heatmaps.FData[hmPos];
         if Val > Best then
         begin
           Best := Val;
@@ -73195,7 +73244,9 @@ begin
           Result[c].Y := y;
           Result[c].Score := Val;
         end;
+        Inc(hmPos, hmStride);
       end;
+    end;
   end;
 end;
 
@@ -73946,7 +73997,7 @@ var
   LpMax: integer;
   q, c, BestCls, Cnt: integer;
   Logit, MaxLogit, SumExp, Prob, BestProb: TNeuralFloat;
-  BoxBase, NumLabelsM1: integer;
+  BoxBase, NumLabelsM1, qBase: integer;
 begin
   SetLength(Result, Output.SizeX);
   Cnt := 0;
@@ -73955,19 +74006,20 @@ begin
   LpMax := Output.SizeX - 1;
   for q := 0 to LpMax do
   begin
+    qBase := Output.GetRawPos(q, 0, 0);
     // softmax over the NumLabels+1 class logits.
-    MaxLogit := Output[q, 0, 0];
+    MaxLogit := Output.FData[qBase];
     for c := 1 to NumLabels do
-      if Output[q, 0, c] > MaxLogit then MaxLogit := Output[q, 0, c];
+      if Output.FData[qBase + c] > MaxLogit then MaxLogit := Output.FData[qBase + c];
     SumExp := 0;
     for c := 0 to NumLabels do
-      SumExp := SumExp + Exp(Output[q, 0, c] - MaxLogit);
+      SumExp := SumExp + Exp(Output.FData[qBase + c] - MaxLogit);
     // best FOREGROUND class (exclude the no-object slot = NumLabels).
     BestCls := 0;
     BestProb := -1;
     for c := 0 to NumLabelsM1 do
     begin
-      Logit := Output[q, 0, c];
+      Logit := Output.FData[qBase + c];
       Prob := Exp(Logit - MaxLogit) / SumExp;
       if Prob > BestProb then begin BestProb := Prob; BestCls := c; end;
     end;
@@ -73975,10 +74027,10 @@ begin
     begin
       Result[Cnt].ClassId := BestCls;
       Result[Cnt].Score := BestProb;
-      Result[Cnt].Cx := Output[q, 0, BoxBase + 0];
-      Result[Cnt].Cy := Output[q, 0, BoxBase + 1];
-      Result[Cnt].W := Output[q, 0, BoxBase + 2];
-      Result[Cnt].H := Output[q, 0, BoxBase + 3];
+      Result[Cnt].Cx := Output.FData[qBase + BoxBase + 0];
+      Result[Cnt].Cy := Output.FData[qBase + BoxBase + 1];
+      Result[Cnt].W := Output.FData[qBase + BoxBase + 2];
+      Result[Cnt].H := Output.FData[qBase + BoxBase + 3];
       Inc(Cnt);
     end;
   end;
@@ -74346,7 +74398,7 @@ procedure LoadM2FEmbeddingTable(Reader: TNNetSafeTensorsReader;
 var
   W: TNNetVolume;
   i, j: integer;
-  NM1, HM1: integer;
+  NM1, HM1, tBase, wBase: integer;
 begin
   if not Reader.HasTensor(WName) then
     ImportError('Mask2Former import: missing tensor "' + WName + '".');
@@ -74361,8 +74413,12 @@ begin
     NM1 := N - 1;
     HM1 := H - 1;
     for i := 0 to NM1 do
+    begin
+      tBase := Target.GetRawPos(i, 0, 0);
+      wBase := i * H;
       for j := 0 to HM1 do
-        Target[i, 0, j] := W.FData[i * H + j];
+        Target.FData[tBase + j] := W.FData[wBase + j];
+    end;
   finally
     W.Free;
   end;
@@ -74599,6 +74655,7 @@ procedure Mask2FormerMaskEinsum(MaskEmbed, MaskFeatures, Dest: TNNetVolume;
 var
   q, p, c, NumPix: integer;
   NumQueriesM1, NumPixM1, HiddenM1: integer;
+  meBase, destBase: integer;
   s: TNeuralFloat;
 begin
   NumPix := MaskW * MaskH;
@@ -74607,13 +74664,17 @@ begin
   NumPixM1 := NumPix - 1;
   HiddenM1 := Hidden - 1;
   for q := 0 to NumQueriesM1 do
+  begin
+    meBase := MaskEmbed.GetRawPos(q, 0, 0);
+    destBase := Dest.GetRawPos(q, 0, 0);
     for p := 0 to NumPixM1 do
     begin
       s := 0;
       for c := 0 to HiddenM1 do
-        s := s + MaskEmbed[q, 0, c] * MaskFeatures.FData[p * Hidden + c];
-      Dest[q, 0, p] := s;
+        s := s + MaskEmbed.FData[meBase + c] * MaskFeatures.FData[p * Hidden + c];
+      Dest.FData[destBase + p] := s;
     end;
+  end;
 end;
 
 // Builds the additive cross-attn mask bias [key=S, query=Q, 1] for one level
@@ -74626,6 +74687,7 @@ procedure Mask2FormerMaskBias(MaskLogits, Bias: TNNetVolume;
 var
   q, lx, ly, p, NumKeys, AllowedCnt: integer;
   NumQueriesM1, LevelHM1, LevelWM1, NumKeysM1: integer;
+  mlBase, biasQBase: integer;
   fx, fy, x0, y0, x1, y1: integer;
   gx, gy, wx, wy, v00, v01, v10, v11, val, sg: TNeuralFloat;
 const
@@ -74640,6 +74702,8 @@ begin
   for q := 0 to NumQueriesM1 do
   begin
     AllowedCnt := 0;
+    mlBase := MaskLogits.GetRawPos(q, 0, 0);
+    biasQBase := Bias.GetRawPos(0, q, 0);
     for ly := 0 to LevelHM1 do
       for lx := 0 to LevelWM1 do
       begin
@@ -74654,19 +74718,19 @@ begin
         if x1 < 0 then x1 := 0; if x1 > MaskW - 1 then x1 := MaskW - 1;
         if y0 < 0 then y0 := 0; if y0 > MaskH - 1 then y0 := MaskH - 1;
         if y1 < 0 then y1 := 0; if y1 > MaskH - 1 then y1 := MaskH - 1;
-        v00 := MaskLogits[q, 0, y0 * MaskW + x0];
-        v01 := MaskLogits[q, 0, y0 * MaskW + x1];
-        v10 := MaskLogits[q, 0, y1 * MaskW + x0];
-        v11 := MaskLogits[q, 0, y1 * MaskW + x1];
+        v00 := MaskLogits.FData[mlBase + y0 * MaskW + x0];
+        v01 := MaskLogits.FData[mlBase + y0 * MaskW + x1];
+        v10 := MaskLogits.FData[mlBase + y1 * MaskW + x0];
+        v11 := MaskLogits.FData[mlBase + y1 * MaskW + x1];
         val := v00 * (1 - wx) * (1 - wy) + v01 * wx * (1 - wy) +
                v10 * (1 - wx) * wy + v11 * wx * wy;
         sg := 1.0 / (1.0 + Exp(-val));
         p := ly * LevelW + lx;  // key index = row-major over the level grid
         if sg < 0.5 then
-          Bias[p, q, 0] := cNegInf
+          Bias.FData[biasQBase + p] := cNegInf
         else
         begin
-          Bias[p, q, 0] := 0;
+          Bias.FData[biasQBase + p] := 0;
           Inc(AllowedCnt);
         end;
         // silence unused fx/fy
@@ -74674,7 +74738,7 @@ begin
       end;
     // fallback: if the query masks ALL keys, unmask everything.
     if AllowedCnt = 0 then
-      for p := 0 to NumKeysM1 do Bias[p, q, 0] := 0;
+      for p := 0 to NumKeysM1 do Bias.FData[biasQBase + p] := 0;
   end;
 end;
 
@@ -74749,11 +74813,13 @@ function DecodeMask2FormerSemantic(ClassLogits, MaskLogits: TNNetVolume;
 var
   q, c, p, NumPix, NumQueries, BestC: integer;
   NumQueriesM1, NumLabelsM1, NumPixM1: integer;
+  clBase, mlPos, mlStride: integer;
   MaxLogit, SumExp, prob, sg, acc, BestVal: TNeuralFloat;
   ClsProb: array of TNeuralFloat;
 begin
   NumQueries := ClassLogits.SizeX;
   NumPix := MaskWidth * MaskHeight;
+  mlStride := MaskLogits.GetRawPos(1, 0, 0);  // elements between consecutive q
   SetLength(Result, NumPix);
   SetLength(ClsProb, NumQueries * NumLabels);
   NumQueriesM1 := NumQueries - 1;
@@ -74762,14 +74828,17 @@ begin
   // class probabilities: softmax over NumLabels+1, drop the no-object slot.
   for q := 0 to NumQueriesM1 do
   begin
-    MaxLogit := ClassLogits[q, 0, 0];
+    clBase := ClassLogits.GetRawPos(q, 0, 0);
+    MaxLogit := ClassLogits.FData[clBase];
     for c := 1 to NumLabels do
-      if ClassLogits[q, 0, c] > MaxLogit then MaxLogit := ClassLogits[q, 0, c];
+      if ClassLogits.FData[clBase + c] > MaxLogit then
+        MaxLogit := ClassLogits.FData[clBase + c];
     SumExp := 0;
     for c := 0 to NumLabels do
-      SumExp := SumExp + Exp(ClassLogits[q, 0, c] - MaxLogit);
+      SumExp := SumExp + Exp(ClassLogits.FData[clBase + c] - MaxLogit);
     for c := 0 to NumLabelsM1 do
-      ClsProb[q * NumLabels + c] := Exp(ClassLogits[q, 0, c] - MaxLogit) / SumExp;
+      ClsProb[q * NumLabels + c] :=
+        Exp(ClassLogits.FData[clBase + c] - MaxLogit) / SumExp;
   end;
   // per pixel: argmax_c sum_q clsprob[q,c] * sigmoid(mask[q,p]).
   for p := 0 to NumPixM1 do
@@ -74778,10 +74847,12 @@ begin
     for c := 0 to NumLabelsM1 do
     begin
       acc := 0;
+      mlPos := p;  // = MaskLogits.GetRawPos(0, 0, p); the q = 0 offset
       for q := 0 to NumQueriesM1 do
       begin
-        sg := 1.0 / (1.0 + Exp(-MaskLogits[q, 0, p]));
+        sg := 1.0 / (1.0 + Exp(-MaskLogits.FData[mlPos]));
         acc := acc + ClsProb[q * NumLabels + c] * sg;
+        Inc(mlPos, mlStride);
       end;
       if acc > BestVal then begin BestVal := acc; BestC := c; end;
     end;
@@ -75152,7 +75223,7 @@ function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
   ScoreThreshold: TNeuralFloat; IoUThreshold: TNeuralFloat): TYoloDetectionArray;
 var
   s, gx, gy, gw, side, b, k, cls, BestCls, Cnt, Cell, i2: integer;
-  rm, nc, OutDim, Stride: integer;
+  rm, nc, OutDim, Stride, cellBase: integer;
   gwM1, ncM1, rmM1, HiCand, KeptIdxHi: integer;
   MaxLogit, SumExp, P, BestScore, Dist, Cx, Cy, L, Tp, R, Bp: TNeuralFloat;
   Dists: array[0..3] of TNeuralFloat;
@@ -75174,9 +75245,10 @@ begin
       begin
         // class logits -> sigmoid; best class.
         BestCls := 0; BestScore := -1;
+        cellBase := Output.GetRawPos(Cell, 0, 0);
         for cls := 0 to ncM1 do
         begin
-          P := 1.0 / (1.0 + Exp(-Output[Cell, 0, 4 * rm + cls]));
+          P := 1.0 / (1.0 + Exp(-Output.FData[cellBase + 4 * rm + cls]));
           if P > BestScore then begin BestScore := P; BestCls := cls; end;
         end;
         if BestScore >= ScoreThreshold then
@@ -75184,16 +75256,16 @@ begin
           // DFL: each of 4 sides = softmax over rm bins -> expected value.
           for side := 0 to 3 do
           begin
-            MaxLogit := Output[Cell, 0, side * rm];
+            MaxLogit := Output.FData[cellBase + side * rm];
             for b := 1 to rmM1 do
-              if Output[Cell, 0, side * rm + b] > MaxLogit then
-                MaxLogit := Output[Cell, 0, side * rm + b];
+              if Output.FData[cellBase + side * rm + b] > MaxLogit then
+                MaxLogit := Output.FData[cellBase + side * rm + b];
             SumExp := 0;
             for b := 0 to rmM1 do
-              SumExp := SumExp + Exp(Output[Cell, 0, side * rm + b] - MaxLogit);
+              SumExp := SumExp + Exp(Output.FData[cellBase + side * rm + b] - MaxLogit);
             Dist := 0;
             for b := 0 to rmM1 do
-              Dist := Dist + b * Exp(Output[Cell, 0, side * rm + b] - MaxLogit) / SumExp;
+              Dist := Dist + b * Exp(Output.FData[cellBase + side * rm + b] - MaxLogit) / SumExp;
             Dists[side] := Dist;
           end;
           // ltrb distances from the cell centre (in grid units), -> xyxy.
@@ -75415,6 +75487,7 @@ var
   Work: TNNetVolume;
   ResizeW, ResizeH, OffX, OffY, X, Y, C, SrcX, SrcY: integer;
   ResizeWM1, ResizeHM1, CropWidthM1, CropHeightM1: integer;
+  workBase, srcBase, dstBase, wkBase: integer;
   Scale, Fx, Fy, V: TNeuralFloat;
 begin
   if (Src = nil) or (Dst = nil) then
@@ -75459,8 +75532,10 @@ begin
           SrcX := Trunc(Fx); SrcY := Trunc(Fy);
           if SrcX > Src.SizeX - 1 then SrcX := Src.SizeX - 1;
           if SrcY > Src.SizeY - 1 then SrcY := Src.SizeY - 1;
+          workBase := Work.GetRawPos(X, Y, 0);
+          srcBase := Src.GetRawPos(SrcX, SrcY, 0);
           for C := 0 to 2 do
-            Work[X, Y, C] := Src[SrcX, SrcY, C]; // nearest fallback edge
+            Work.FData[workBase + C] := Src.FData[srcBase + C]; // nearest fallback edge
         end;
     end
     else
@@ -75485,20 +75560,22 @@ begin
       begin
         SrcX := OffX + X;
         SrcY := OffY + Y;
+        dstBase := Dst.GetRawPos(X, Y, 0);
         // pad with zeros if the crop window exceeds the resized image
         if (SrcX < 0) or (SrcY < 0) or
            (SrcX > Work.SizeX - 1) or (SrcY > Work.SizeY - 1) then
         begin
-          for C := 0 to 2 do Dst[X, Y, C] := 0;
+          for C := 0 to 2 do Dst.FData[dstBase + C] := 0;
           continue;
         end;
+        wkBase := Work.GetRawPos(SrcX, SrcY, 0);
         for C := 0 to 2 do
         begin
-          V := Work[SrcX, SrcY, C];
+          V := Work.FData[wkBase + C];
           if Config.DoRescale then V := V * Config.RescaleFactor;
           if Config.DoNormalize then
             V := (V - Config.Mean[C]) / Config.Std[C];
-          Dst[X, Y, C] := V;
+          Dst.FData[dstBase + C] := V;
         end;
       end;
   finally
@@ -78262,6 +78339,7 @@ procedure DiTDenoise(Net: TNNet; const Config: TDiTConfig;
 var
   Output: TNNetVolume;
   x, y, c, LatentM1, InChM1: integer;
+  epsBase, outBase: integer;
 begin
   DiTNthInput(Net, 0).Output.CopyNoChecks(Latent);
   DiTConditioning(Net, t, ClassId);
@@ -78272,8 +78350,12 @@ begin
   InChM1 := Config.InChannels - 1;
   for x := 0 to LatentM1 do
     for y := 0 to LatentM1 do
+    begin
+      epsBase := EpsOut.GetRawPos(x, y, 0);
+      outBase := Output.GetRawPos(x, y, 0);
       for c := 0 to InChM1 do
-        EpsOut[x, y, c] := Output[x, y, c];
+        EpsOut.FData[epsBase + c] := Output.FData[outBase + c];
+    end;
 end;
 
 // ============================ VAR IMPORT ===================================
@@ -79343,6 +79425,7 @@ procedure PixArtDenoise(Net: TNNet; const Config: TPixArtConfig;
 var
   Output: TNNetVolume;
   x, y, c, SampleM1, InChM1: integer;
+  epsBase, outBase: integer;
 begin
   PixArtNthInput(Net, 0).Output.CopyNoChecks(Latent);
   PixArtConditioning(Net, t, TextStates);
@@ -79353,8 +79436,12 @@ begin
   InChM1 := Config.InChannels - 1;
   for x := 0 to SampleM1 do
     for y := 0 to SampleM1 do
+    begin
+      epsBase := EpsOut.GetRawPos(x, y, 0);
+      outBase := Output.GetRawPos(x, y, 0);
       for c := 0 to InChM1 do
-        EpsOut[x, y, c] := Output[x, y, c];
+        EpsOut.FData[epsBase + c] := Output.FData[outBase + c];
+    end;
 end;
 
 // ============================== MMDiT IMPORT ===============================
@@ -80070,7 +80157,8 @@ procedure DecodeCogVideoXVae(VaeNet: TNNet; const Config: TCogVideoXConfig;
 var
   T, HW, Clat, Vout, cell, ti, c: integer;
   HWM1, TM1, ClatM1, VoutM1: integer;
-  CellIn: TNNetVolume;
+  latBase, cinBase, doBase, outBase: integer;
+  CellIn, LastOut: TNNetVolume;
 begin
   T := Config.NumFrames;
   HW := Config.GridHeight * Config.GridWidth;
@@ -80088,12 +80176,21 @@ begin
     begin
       // gather this cell's temporal column (T frames, Clat channels).
       for ti := 0 to TM1 do
+      begin
+        cinBase := CellIn.GetRawPos(ti, 0, 0);
+        latBase := Latent.GetRawPos(ti, cell, 0);
         for c := 0 to ClatM1 do
-          CellIn.FData[ti * Clat + c] := Latent[ti, cell, c];
+          CellIn.FData[cinBase + c] := Latent.FData[latBase + c];
+      end;
       VaeNet.Compute(CellIn);
+      LastOut := VaeNet.GetLastLayer().Output;
       for ti := 0 to TM1 do
+      begin
+        doBase := DecodedOut.GetRawPos(ti, cell, 0);
+        outBase := LastOut.GetRawPos(ti, 0, 0);
         for c := 0 to VoutM1 do
-          DecodedOut[ti, cell, c] := VaeNet.GetLastLayer().Output[ti, 0, c];
+          DecodedOut.FData[doBase + c] := LastOut.FData[outBase + c];
+      end;
     end;
   finally
     CellIn.Free;
