@@ -18328,7 +18328,7 @@ end;
 function BuildQwen3MemTensorReader(Net: TNNet;
   const Config: TLlamaConfig): TNNetMemTensorReader;
 var
-  LpMax: integer;
+  LpMax, NormsHigh: integer;
   Reader: TNNetMemTensorReader;
   HeadDim, QWidth, KVWidth, HalfDim, IntSize: integer;
   b, j, c, h, k, i: integer;
@@ -18498,7 +18498,8 @@ begin
   // Tiled-layout detection: the head-tiled build has exactly one
   // TNNetHeadRMSNorm per q/k projection instead of the per-head copies.
   TiledQK := false;
-  for i := 0 to High(Norms) do
+  NormsHigh := High(Norms);
+  for i := 0 to NormsHigh do
     if Norms[i] is TNNetHeadRMSNorm then
     begin
       TiledQK := true;

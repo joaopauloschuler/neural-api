@@ -1465,7 +1465,7 @@ procedure AVXMulAddInt8Scalar(PtrA: TNeuralFloatArrPtr;
 var
   WPtr: pointer;
   localNumElements, MissedElements: integer;
-  i: integer;
+  i, NumElementsM1: integer;
 begin
   MissedElements := NumElements and 3;
   localNumElements := NumElements xor MissedElements;
@@ -1538,7 +1538,8 @@ begin
     'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm5', 'ymm6', 'ymm7'
   ];
   end;
-  for i := localNumElements to NumElements - 1 do
+  NumElementsM1 := NumElements - 1;
+  for i := localNumElements to NumElementsM1 do
     PtrA^[i] := PtrA^[i] + W * PtrCodes^[i];
 end;
 
@@ -1551,7 +1552,7 @@ procedure AVXMulAddInt8(PtrA, PtrB: TNeuralFloatArrPtr;
   PtrCodes: TNeuralInt8ArrPtr; NumElements: integer);
 var
   localNumElements, MissedElements: integer;
-  i: integer;
+  i, NumElementsM1: integer;
 begin
   MissedElements := NumElements and 3;
   localNumElements := NumElements xor MissedElements;
@@ -1624,7 +1625,8 @@ begin
     'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm6', 'ymm7'
   ];
   end;
-  for i := localNumElements to NumElements - 1 do
+  NumElementsM1 := NumElements - 1;
+  for i := localNumElements to NumElementsM1 do
     PtrA^[i] := PtrA^[i] + PtrCodes^[i] * PtrB^[i];
 end;
 {$ENDIF}
