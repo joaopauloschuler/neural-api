@@ -1134,3 +1134,85 @@ half; do not force the rest.
   **This is the one item in this list that is NOT a "don't do this" —**
   `GetRawPos(X, Y, 0)` is not a performance bug, so there is nothing to fix at
   existing sites; the short form is only a readability preference for new code.
+
+## 14. Rank on the cheapest order-equivalent quantity — skip transforms used only to compare
+
+Rules #1–#13 make a given computation *cheaper*. This one is different in kind: it
+**removes the computation entirely** when its result is used only to rank, compare,
+or `argmax`. Two facts do the work:
+
+- A **strictly monotonic** function preserves order: `f(a) > f(b) ⟺ a > b`. So if
+  you only need the *position* of the maximum (not the transformed value), take the
+  `argmax` of the cheap pre-image, not the transform.
+- **Multiplying/dividing every candidate by the same positive constant** preserves
+  order too. A normalizer that is identical across the candidates cancels out of any
+  comparison between them.
+
+The `argmax` of a softmax is the archetype: `softmax(L)_c = exp(L_c − M) / SumExp`.
+`exp` is strictly monotonic and `SumExp` is one positive constant shared by every
+class, so `argmax_c softmax(L)_c = argmax_c L_c` — the winning class is read
+straight off the raw logits, with **no `exp` and no divide**.
+
+**Anti-example — do NOT compute the transform per candidate just to rank**
+(`DecodeDetrDetections`, best foreground class; `L[c]` is `Output.FData[qBase + c]`):
+
+```pascal
+SumExp := 0;
+for c := 0 to NumLabels do SumExp := SumExp + Exp(L[c] - MaxLogit);
+BestCls := 0; BestProb := -1;
+for c := 0 to NumLabelsM1 do
+begin
+  Prob := Exp(L[c] - MaxLogit) / SumExp;   // NumLabels Exp + NumLabels divides, ONLY to rank
+  if Prob > BestProb then begin BestProb := Prob; BestCls := c; end;
+end;
+```
+
+**Do this — rank on the raw logit; compute the winner's value once:**
+
+```pascal
+// argmax of prob == argmax of logit (Exp monotonic; /SumExp a positive constant).
+SumExp := 0; BestCls := 0;
+for c := 0 to NumLabels do
+begin
+  SumExp := SumExp + Exp(L[c] - MaxLogit);                 // still needed: it is the score's denominator
+  if (c <= NumLabelsM1) and (L[c] > L[BestCls]) then BestCls := c;   // no Exp, no divide
+end;
+BestProb := Exp(L[BestCls] - MaxLogit) / SumExp;           // ONE Exp/divide — for the winner only
+```
+
+The per-class `exp`+divide loop is gone; the selection folds into the `SumExp` pass
+you were already running, and the probability is computed once for the class you
+actually return.
+
+**Keep the value only where the value is genuinely needed.** The point is not "never
+compute the probability" — here `BestProb` is still needed as the score and for the
+`>= Threshold` test, so it *is* computed, but **once for the winner** instead of once
+per candidate. Same shape elsewhere: a `sigmoid(x) > t` gate with constant `t` is
+`x > ln(t/(1−t))` (threshold on the pre-image — one `ln` at setup, none per element);
+a nearest-neighbour search compares **squared** distances and takes the one `sqrt`
+only on the reported minimum.
+
+**Why it matters**
+
+- **Fewer operations, not just cheaper ones** — unlike #13 (which vectorizes the
+  same work), this changes the operation *count*: `N` transcendentals/divides drop to
+  `O(1)`. When it applies it is the highest-leverage move in this guide.
+- **Often collapses a loop** — the ranking merges into an existing pass (the `SumExp`
+  accumulation above), removing a whole traversal.
+
+**Caveats — this one needs a correctness argument, so state it in a comment.**
+
+- **Monotonicity must actually hold, and in the right direction.** `exp`, `log`,
+  `sigmoid`, `softplus`, `x²` *for x ≥ 0* are increasing; `x²` over signed `x` is
+  **not** monotonic (don't rank signed values by their square). A decreasing
+  transform flips `argmax`↔`argmin`.
+- **The shared normalizer must truly be shared and positive.** `/SumExp` cancels only
+  because every class in one query divides by the *same* `SumExp`; a per-candidate or
+  possibly-negative divisor does not cancel.
+- **Preserve the original tie-breaking.** Keep the same strict/non-strict comparison
+  (`>` vs `>=`) the transformed version used, so that near-ties resolve to the same
+  index. (Float `exp` is monotonic non-decreasing, so two extremely close logits can
+  map to equal probabilities — but then either pick is equally correct, and matching
+  the original `>`/`>=` keeps behaviour identical.)
+- **This is an algebraic rewrite, not a mechanical one** — it is the one rule here a
+  pattern-matching sweep will not surface. It requires reading what a value is *for*.
