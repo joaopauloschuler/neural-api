@@ -15639,7 +15639,7 @@ var
   NumLayersM1, NumKVHeadsM1, NumHeadsM1, HeadDimM1, RotaryDimsM1: integer;
   HeadDimMRotaryM1, VocabSizeM1, HiddenSizeM1, NumLocalExpertsM1: integer;
   LayerIsLocal, LayerUseRoPE: boolean;
-  DoHoistRoPE, DoTiledQKNorm: boolean;
+  DoHoistRoPE, DoTiledQKNorm, UseFusedAttn: boolean;
   NormGainOffset, QScale, QProjScale, LayerTheta: TNeuralFloat;
   LogitScaleFold: TNeuralFloat;
   LayerRoPEScaling: TRoPEScalingConfig;
@@ -16013,6 +16013,33 @@ begin
             CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling, HeadDim),
             KSource);
         end;
+        // OPTIMIZATION (Coded by Claude (AI)): FUSED multi-head attention.
+        // When nothing per-head sits between the projections and the
+        // attention math (rotary hoisted or absent, q/k norm tiled or absent,
+        // no Llama-4 per-head QK-L2 / NoPE temperature, no M-RoPE, full
+        // rotary), ONE TNNetFusedSDPA over the packed [allQ|allK|allV]
+        // concat replaces the whole per-head forest: (Hq+2*Hkv)
+        // SplitChannels + Hq packs + Hq SDPA heads + the head concat become
+        // 1 DeepConcat + 1 layer. Bit-identical per head (same kernels, same
+        // op order), one shared KV cache per sub-layer, and the fused layer
+        // is chunk-eligible over query heads for intra-layer threading. The
+        // per-head fallback below remains for every excluded variant.
+        UseFusedAttn := ((not LayerUseRoPE) or DoHoistRoPE) and
+          ((not Config.QKNorm) or DoTiledQKNorm) and
+          (not Config.Llama4QKL2Norm) and
+          (not (Config.AttnTempTuning and (not LayerUseRoPE))) and
+          (not Config.MRoPEEnabled) and (RotaryDims >= HeadDim);
+        if UseFusedAttn then
+        begin
+          NN.AddLayer( TNNetDeepConcat.Create(
+            [QSource, KSource, Blocks[BlockCnt].VProj]) );
+          AttnConcat := NN.AddLayer( TNNetFusedSDPA.Create(
+            Config.NumHeads, Config.NumKVHeads, HeadDim, {CausalMask=}true,
+            {pWindow=}LayerWindow,
+            {pScoreSoftCap=}Config.AttnLogitSoftCap) );
+        end
+        else
+        begin
         // K is rotated ONCE per KV head; V is never rotated.
         for KVHeadCnt := 0 to NumKVHeadsM1 do
         begin
@@ -16180,6 +16207,7 @@ begin
             HeadPack);
         end;
         AttnConcat := NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        end; // per-head fallback (vs the fused multi-head branch above)
         // Config.AttnOutputGate (Qwen3.5): the q_proj slab's SECOND half
         // (channels QWidth..2*QWidth-1, loaded so gate row [h][d] sits at
         // channel QWidth + h*HeadDim + d - aligned with head h's output

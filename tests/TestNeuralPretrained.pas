@@ -6264,24 +6264,25 @@ begin
     AssertEquals('round-trip head_dim', Config.HeadDim, ConfigG.HeadDim);
     AssertEquals('round-trip vocab', Config.VocabSize, ConfigG.VocabSize);
     AssertTrue('round-trip tied head', ConfigG.TieWordEmbeddings);
-    // The local/global window must survive into the built SDPA heads: the
-    // first NumHeads SDPAs (layer 0) carry Window=SlidingWindow, the rest 0.
+    // The local/global window must survive into the built attention layers
+    // (now ONE fused multi-head layer per block): layer 0 carries
+    // Window=SlidingWindow, layer 1 is global.
     SDPACnt := 0;
     for i := 0 to NNG.Layers.Count - 1 do
-      if NNG.Layers[i].ClassType = TNNetScaledDotProductAttention then
+      if NNG.Layers[i].ClassType = TNNetFusedSDPA then
       begin
-        if SDPACnt < ConfigG.NumHeads then
-          AssertEquals('GGUF layer-0 SDPA head local window',
+        if SDPACnt = 0 then
+          AssertEquals('GGUF layer-0 fused attn local window',
             Config.SlidingWindow,
             TNNetScaledDotProductAttention(NNG.Layers[i]).Window)
         else
-          AssertEquals('GGUF layer-1 SDPA head global window', 0,
+          AssertEquals('GGUF layer-1 fused attn global window', 0,
             TNNetScaledDotProductAttention(NNG.Layers[i]).Window);
-        AssertEquals('GGUF SDPA score soft-cap', Config.AttnLogitSoftCap,
+        AssertEquals('GGUF fused attn score soft-cap', Config.AttnLogitSoftCap,
           TNNetScaledDotProductAttention(NNG.Layers[i]).ScoreSoftCap, 1e-6);
         Inc(SDPACnt);
       end;
-    AssertEquals('GGUF SDPA head count', 4, SDPACnt);
+    AssertEquals('GGUF fused attn count (1 per block)', 2, SDPACnt);
 
     SeqLen := ConfigG.MaxPositions;
     Vocab := ConfigG.VocabSize;
@@ -7232,8 +7233,8 @@ begin
     AssertEquals('final_logit_softcapping', 0.5,
       Config.FinalLogitSoftCap, 1e-6);
     AssertEquals('prefix', 'model.', Config.Prefix);
-    // Structure: SDPA heads alternate Window=4 (layer 0, the first
-    // NumHeads SDPAs) / Window=0 (layer 1) and ALL carry the attention
+    // Structure: attention (ONE fused multi-head layer per block) alternates
+    // Window=4 (layer 0) / Window=0 (layer 1) and both carry the attention
     // soft-cap; 4 sandwich RMSNorms per block + the final norm = 9; one
     // TNNetSoftCapping caps the LM-head logits.
     SDPACnt := 0;
@@ -7241,23 +7242,21 @@ begin
     SoftCapCnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
-      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then
       begin
         SDPA := TNNetScaledDotProductAttention(NN.Layers[LayerCnt]);
-        if SDPACnt < Config.NumHeads then
-          AssertEquals('layer-0 SDPA head ' + IntToStr(SDPACnt) +
-            ' window (local)', 4, SDPA.Window)
+        if SDPACnt = 0 then
+          AssertEquals('layer-0 fused attn window (local)', 4, SDPA.Window)
         else
-          AssertEquals('layer-1 SDPA head ' + IntToStr(SDPACnt) +
-            ' window (global)', 0, SDPA.Window);
-        AssertEquals('SDPA head ' + IntToStr(SDPACnt) + ' score soft-cap',
+          AssertEquals('layer-1 fused attn window (global)', 0, SDPA.Window);
+        AssertEquals('fused attn ' + IntToStr(SDPACnt) + ' score soft-cap',
           5.0, SDPA.ScoreSoftCap, 1e-6);
         Inc(SDPACnt);
       end;
       if NN.Layers[LayerCnt] is TNNetTokenRMSNorm then Inc(RMSNormCnt);
       if NN.Layers[LayerCnt] is TNNetSoftCapping then Inc(SoftCapCnt);
     end;
-    AssertEquals('SDPA head count', 4, SDPACnt);
+    AssertEquals('fused attn count (1 per block)', 2, SDPACnt);
     AssertEquals('sandwich RMSNorm count (4 per block + final)', 9,
       RMSNormCnt);
     AssertEquals('final-logit TNNetSoftCapping count', 1, SoftCapCnt);
@@ -7353,23 +7352,23 @@ begin
     SoftCapCnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
-      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then
       begin
         SDPA := TNNetScaledDotProductAttention(NN.Layers[LayerCnt]);
-        if SDPACnt < 2 * Config.NumHeads then
-          AssertEquals('layer-0/1 SDPA head ' + IntToStr(SDPACnt) +
+        if SDPACnt < 2 then
+          AssertEquals('layer-0/1 fused attn ' + IntToStr(SDPACnt) +
             ' window (local)', 4, SDPA.Window)
         else
-          AssertEquals('layer-2 SDPA head ' + IntToStr(SDPACnt) +
+          AssertEquals('layer-2 fused attn ' + IntToStr(SDPACnt) +
             ' window (global)', 0, SDPA.Window);
-        AssertEquals('SDPA head ' + IntToStr(SDPACnt) +
+        AssertEquals('fused attn ' + IntToStr(SDPACnt) +
           ' score soft-cap OFF', 0.0, SDPA.ScoreSoftCap, 1e-6);
         Inc(SDPACnt);
       end;
       if NN.Layers[LayerCnt] is TNNetTokenRMSNorm then Inc(RMSNormCnt);
       if NN.Layers[LayerCnt] is TNNetSoftCapping then Inc(SoftCapCnt);
     end;
-    AssertEquals('SDPA head count', 6, SDPACnt);
+    AssertEquals('fused attn count (1 per block)', 3, SDPACnt);
     AssertEquals('RMSNorm count (sandwich + final + tiled q/k)', 19,
       RMSNormCnt);
     AssertEquals('no final-logit TNNetSoftCapping', 0, SoftCapCnt);
@@ -7919,20 +7918,20 @@ begin
     // rejection); HF gates the window behind use_sliding_window, so the
     // config parse must surface SlidingWindow=3 (not 0 / full attention).
     AssertEquals('sliding_window honored', 3, Config.SlidingWindow);
-    // EVERY SDPA head (both all-MoE layers, every head) carries Window=3.
+    // EVERY attention sub-layer (now ONE fused multi-head layer per block)
+    // carries Window=3.
     SDPACnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
-      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then
       begin
         SDPA := TNNetScaledDotProductAttention(NN.Layers[LayerCnt]);
-        AssertEquals('SDPA head ' + IntToStr(SDPACnt) + ' window', 3,
+        AssertEquals('fused attn ' + IntToStr(SDPACnt) + ' window', 3,
           SDPA.Window);
         Inc(SDPACnt);
       end;
     end;
-    AssertEquals('SDPA heads = NumHeads * layers', Config.NumHeads * 2,
-      SDPACnt);
+    AssertEquals('fused attn layers = num layers', 2, SDPACnt);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_qwen3_moe_window_logits.json'), Config.MaxPositions,
       Config.VocabSize);
