@@ -315,6 +315,47 @@ end;
 (This eviction loop has further, larger problems beyond the repeated
 subexpression — see later recommendations.)
 
+**Worked example — the residual *left behind* by an offset-hoist.** Hoisting the
+base per #11 is not the finish line. A `base + D` combination can still be formed
+several times *within a single iteration*, and that is #4's job. In
+`TNNetGaussianReparameterize.Backpropagate` the bases are already hoisted, yet
+`basePrev0 + D` is formed four times and `basePrev0 + D + HalfDepth` twice per `D`:
+
+```pascal
+for D := 0 to MaxD do
+begin
+  g      := FOutputError.FData[baseErr0 + D];
+  logVar := FPrevLayer.FOutput.FData[basePrev0 + D + HalfDepth];
+  sigma  := NeuralExp(0.5 * logVar);
+  e      := FEps.FData[baseEps0 + D];
+  FPrevLayer.FOutputError.FData[basePrev0 + D] :=
+    FPrevLayer.FOutputError.FData[basePrev0 + D] + g;
+  FPrevLayer.FOutputError.FData[basePrev0 + D + HalfDepth] :=
+    FPrevLayer.FOutputError.FData[basePrev0 + D + HalfDepth] + g * 0.5 * sigma * e;
+end;
+```
+
+**Do this — name the two indices once:**
+
+```pascal
+for D := 0 to MaxD do
+begin
+  idx   := basePrev0 + D;             // #4: the (base + D) add, done once
+  idxHi := idx + HalfDepth;
+  g      := FOutputError.FData[baseErr0 + D];
+  logVar := FPrevLayer.FOutput.FData[idxHi];
+  sigma  := NeuralExp(0.5 * logVar);
+  e      := FEps.FData[baseEps0 + D];
+  FPrevLayer.FOutputError.FData[idx]   := FPrevLayer.FOutputError.FData[idx]   + g;
+  FPrevLayer.FOutputError.FData[idxHi] := FPrevLayer.FOutputError.FData[idxHi] + g * 0.5 * sigma * e;
+end;
+```
+
+The two writes stay scalar here — the `dlogvar` term has a per-element `sigma`
+and `e`, so it is *not* a #13 bulk candidate. (The `dmu` term `prevErr[idx] += g`
+alone *is* a pure accumulate and can be promoted per #13; see that rule's
+mixed-body split.)
+
 ## 5. Hoist loop-invariant computations out of the loop entirely
 
 Recommendation #4 removes a subexpression recomputed *within one iteration*.
@@ -370,6 +411,43 @@ behaviour, not just cost.
 > Note: a good optimizing compiler may hoist trivial invariants on its own, but
 > do not rely on it — hoisting explicitly guarantees the win, documents intent,
 > and often exposes further simplifications (e.g. a shared row-pointer).
+
+**Worked example — an invariant buried inside a per-element write.** The scalar
+`Coeff * E * InvT` is invariant across the whole `X/Y/D` nest, yet it is
+re-multiplied on every element:
+
+```pascal
+for X := 0 to MaxX do
+  for Y := 0 to MaxY do
+  begin
+    baseErr0 := FOutputError.GetRawPos(X, Y, 0);
+    for D := 0 to EM1 do
+    begin
+      GradScale := Coeff * E * FFBuf[D] * InvT;   // Coeff*E*InvT recomputed every D
+      FOutputError.FData[baseErr0 + D] := GradScale;
+    end;
+  end;
+```
+
+**Do this — hoist the invariant factor once; the inner loop becomes a pure scale:**
+
+```pascal
+kScale := Coeff * E * InvT;                        // #5: once for the whole call
+for X := 0 to MaxX do
+  for Y := 0 to MaxY do
+  begin
+    baseErr0 := FOutputError.GetRawPos(X, Y, 0);
+    for D := 0 to EM1 do
+      FOutputError.FData[baseErr0 + D] := kScale * FFBuf[D];
+  end;
+```
+
+With the invariant gone, the inner loop is `dst[D] := kScale * FFBuf[D]` — a
+uniform scale, so it is *also* a **rule #13** candidate: copy `FFBuf` into the
+output row, then `TNNetVolume.Mul(dstPtr, kScale, EM1 + 1)` in place (valid only
+because `FFBuf` is a plain contiguous buffer with no per-element transcendental).
+This is the common chain: **#5 exposes the invariant, #13 then vectorizes what is
+left.**
 
 ## 6. Replace loop multiplication with a running sum (strength reduction)
 
@@ -976,6 +1054,24 @@ TNNetVolume.Mul(outPtr, INV_SQRT_2, HalfDepth);  // AVX scale, in place
 (The very next lines of that same method already do exactly this for the erf ride
 via `TNNetVolume.VectorErf` — the scalar seed loop above it is the leftover.)
 
+**The most degenerate shape — a pure contiguous copy — is `Move`.** When the
+inner loop copies one run to another with no arithmetic at all:
+
+```pascal
+for D := 0 to MaxD do
+  FOutput.FData[baseOut0 + D] := FPrevLayer.FOutput.FData[basePrev0 + D];  // scalar copy
+```
+
+it is exactly a `memmove`:
+
+```pascal
+Move(FPrevLayer.FOutput.FData[basePrev0], FOutput.FData[baseOut0],
+  (MaxD + 1) * csNeuralFloatSize);   // one call; see #1 for the byte-size idiom
+```
+
+(or `FOutput.Copy(FPrevLayer.FOutput, MaxD + 1)`). This one *is* bit-exact — no
+float op happens — so there is never a reason to leave it as a scalar loop.
+
 **The one precondition: uniformity.** Promotion is valid only when *every* element
 runs the *same* op with *only* loop-invariant scalars. The moment the body carries
 a **per-element transcendental** (`NeuralExp(0.5*logVar)` recomputed each `D`) or a
@@ -996,6 +1092,14 @@ half; do not force the rest.
   which #11 spells out: a **gated** layer's `FOutput` is half the input depth, so
   its base differs and must be carried separately. Rule of thumb: share a base
   only after you have verified the shapes match; never assume it.
+
+  ```pascal
+  // anti — two calls when the volumes provably share a shape:
+  baseOut0 := FOutput.GetRawPos(X, Y, 0);
+  baseErr0 := FOutputError.GetRawPos(X, Y, 0);   // same dims ⇒ identical integer
+  // do — compute once, index both (ONLY after verifying the shapes match):
+  base0 := FOutput.GetRawPos(X, Y, 0);           // a gated layer would NOT qualify
+  ```
 - **A second pointer into the *same* volume at a constant depth = first pointer +
   that constant.** Instead of a second accessor call
   `bPtr := V.GetRawPtr(X, Y, HalfDepth)` next to `aPtr := V.GetRawPtr(X, Y, 0)`,
@@ -1004,6 +1108,16 @@ half; do not force the rest.
   in #11; in pointer form it needs an element-typed pointer (or `{$POINTERMATH ON}`)
   to write `aPtr + HalfDepth` — if that is not in scope, keep the index form rather
   than a redundant `GetRawPtr`.
+
+  ```pascal
+  // anti — a second accessor call for a constant-offset neighbour:
+  aPtr := FPrevLayer.FOutput.GetRawPtr(X, Y, 0);
+  bPtr := FPrevLayer.FOutput.GetRawPtr(X, Y, HalfDepth);   // same volume, +HalfDepth
+  // do — one call, then add the constant (element-typed ptr / {$POINTERMATH ON}):
+  aPtr := FPrevLayer.FOutput.GetRawPtr(X, Y, 0);
+  bPtr := aPtr + HalfDepth;
+  // if pointer math is not in scope, keep the index form: FData[base + HalfDepth]
+  ```
 - **`GetRawPos(x, y)` / `GetRawPtr(x, y)` already exist — prefer them over the
   `, 0` form.** The two-argument overloads (`neuralvolume.pas`) return
   `((FSizeX*y)+x)*FDepth`, i.e. exactly the three-argument call with `d = 0`. Codegen
@@ -1011,3 +1125,12 @@ half; do not force the rest.
   choice, not a speedup: `V.GetRawPos(X, Y)` states "row base" more plainly than
   `V.GetRawPos(X, Y, 0)`. Do not spend a churn commit flipping existing `, 0` call
   sites for this reason alone; use the short form in new code.
+
+  ```pascal
+  base := V.GetRawPos(X, Y, 0);   // fine — but the trailing 0 is noise
+  base := V.GetRawPos(X, Y);      // identical machine code; reads as "row base"
+  ```
+
+  **This is the one item in this list that is NOT a "don't do this" —**
+  `GetRawPos(X, Y, 0)` is not a performance bug, so there is nothing to fix at
+  existing sites; the short form is only a readability preference for new code.
