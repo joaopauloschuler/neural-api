@@ -451,3 +451,394 @@ The single seed multiply outside the loop replaces one multiply *per iteration*;
 - **Seed correctly.** The initial value must equal the product at the loop's
   first index (`FEvictSinks * FDk`, not `0`), or every subsequent offset is
   wrong.
+
+## 7. Bind a repeatedly-accessed list element to a local
+
+Indexing a list — `FNeurons[0]`, `FLayers[i]`, `Layer.Neurons[j]` — is **not** a
+field read. The `[]` default property routes through the list's `Items[]` getter
+(`GetItem`), which is a method call that indexes the backing storage (and, under
+FPC's `TFPGObjectList`, range-checks and type-casts). Every `FNeurons[0].X` in a
+loop pays that call again, even though the element reference never changes.
+
+When you touch the same element more than once — whether several times in one
+iteration or once per iteration across a loop — bind it to a local **once** and
+go through the local thereafter.
+
+**Do this:**
+
+```pascal
+Neuron0 := FNeurons[0];              // one list accessor call, up front
+for t := 0 to SeqLenM1 do
+begin
+  Logit := TNNetVolume.DotProduct(
+    Neuron0.FWeights.GetRawPtr(0, 0, 0), Prev.GetRawPtr(t, 0, 0),
+    FFeatures) + Neuron0.FBiasWeight;
+  ...
+end;
+```
+
+**Instead of** (from `TNNetForgetGateBias.Compute()`, `neuralnetwork.pas` — two
+`FNeurons[0]` list-accessor calls *per iteration*):
+
+```pascal
+for t := 0 to SeqLenM1 do
+begin
+  Logit := TNNetVolume.DotProduct(
+    FNeurons[0].FWeights.GetRawPtr(0, 0, 0), Prev.GetRawPtr(t, 0, 0),
+    FFeatures) + FNeurons[0].FBiasWeight;
+  ...
+end;
+```
+
+**Why it matters**
+
+- **Skips the accessor call** — `Neuron0` is a plain reference; `FNeurons[0]`
+  re-enters `GetItem` (call + index + optional range check/cast) on every use.
+- **Readability** — `Neuron0` names *which* element the whole loop operates on,
+  instead of repeating the list-lookup syntax at each site.
+- **Consistency** — mirrors #3 (skip the volume element accessor) and the array
+  mirror `FArrNeurons` this codebase already keeps for exactly this reason: a
+  "fast (array) mirror of the `FNeurons` list" to avoid the list getter in hot
+  paths.
+
+**Caveat.** The binding is valid only while the list membership is fixed. If the
+loop can add, remove, or reorder elements (or reallocate the list), the cached
+reference goes stale — only hoist when the element identity is stable for the
+binding's lifetime (it is, for the fixed per-layer neurons of a forward pass).
+
+## 8. Hoist invariant *method* and *property* results, not just arithmetic
+
+Recommendation #5 hoists loop-invariant *arithmetic* (`FDk * csNeuralFloatSize`).
+The same rule applies — and pays off more — when the invariant is a **method
+call or property getter** whose inputs are all constant across the loop. Such a
+call *looks* like real per-iteration work, which is exactly why it hides: the eye
+reads `GetRawPtr(0, 0, 0)` as "compute a pointer" and skips past the fact that
+`(0, 0, 0)` never changes, so the pointer never changes either.
+
+In the `TNNetForgetGateBias.Compute()` loop, `Neuron0.FWeights.GetRawPtr(0, 0, 0)`
+returns the base address of the weight row — **the same pointer every
+iteration** — and `Neuron0.FBiasWeight` is a fixed field read. Both are
+loop-invariant and belong *above* the loop:
+
+**Do this** (combining #7 and #8 — the fully hoisted loop):
+
+```pascal
+Neuron0     := FNeurons[0];                        // #7: list element, once
+WeightsPtr  := Neuron0.FWeights.GetRawPtr(0, 0, 0); // #8: invariant pointer, once
+Bias        := Neuron0.FBiasWeight;                 // #8: invariant field, once
+for t := 0 to SeqLenM1 do
+begin
+  Logit := TNNetVolume.DotProduct(WeightsPtr, Prev.GetRawPtr(t, 0, 0), FFeatures)
+           + Bias;
+  FVal  := Sigmoid(Logit);
+  FF.FData[t] := FVal;
+  RunF  := RunF + pcr_logf(FVal);
+  FLogF.FData[t] := RunF;
+end;
+```
+
+`Prev.GetRawPtr(t, 0, 0)` **stays inside** the loop — it depends on the induction
+variable `t`, so it is not invariant. Only the two arguments that do not depend
+on `t` are hoisted.
+
+**Why it matters**
+
+- **Removes a call per iteration, not just a recompute** — unlike a hoisted
+  arithmetic expression, hoisting a getter also removes the call overhead
+  (dispatch, argument setup, any inlined offset math) from every iteration.
+- **Exposes the intent** — `WeightsPtr` and `Bias` state plainly that these are
+  fixed for the whole loop, which the inline `GetRawPtr(0,0,0)`/`FBiasWeight`
+  spelling actively obscures.
+
+**How to spot it.** Look at the *arguments*: if a call's arguments contain none
+of the loop's induction variables (all literals or loop-invariant locals), its
+result is loop-invariant — hoist it. If any argument depends on the loop
+variable (like `t` above), it is not.
+
+**Caveat.** Only hoist when the call is *pure with respect to the loop* — its
+result must not depend on state the loop mutates. `GetRawPtr(0,0,0)` is safe here
+because the weights volume is neither resized nor reallocated inside the loop; if
+the loop could reallocate the backing buffer, the cached pointer would dangle.
+Same rule as #5: hoist cost, never behaviour.
+
+## 9. Bind the whole invariant access *chain*, above the outermost loop — worked example
+
+Rules #4, #7, and #8 compose. When an access *chain* like
+`FNeurons[0].FWeights` is invariant across a **nested** loop and appears more
+than once per iteration, all three apply at once:
+
+- **#7** — `FNeurons[0]` is a list-accessor call, not a field read.
+- **#4** — the chain appears twice per iteration (once on each side of the
+  assignment), so it is a repeated subexpression *within* one iteration.
+- **#8 / #5** — the chain contains none of the loop variables, so it is
+  loop-invariant; hoist it above the **outermost** loop it is invariant in, not
+  merely to the top of the inner loop.
+
+Bind the *entire* chain to one local, not just its first link. `FNeurons[0]`
+alone still leaves `.FWeights` (a field deref) repeated; `FNeurons[0].FWeights`
+as a single `W` collapses the whole thing.
+
+**Anti-example — do NOT follow this** (from `TNNetModernHopfield.InitDefault()`,
+`neuralnetwork.pas` — `FNeurons[0].FWeights` evaluated **twice per inner
+iteration**, i.e. `2 * FNumPatterns * FDim` times, though it never changes):
+
+```pascal
+for p := 0 to NumPatternsM1 do
+  for d := 0 to DimM1 do
+    FNeurons[0].FWeights[p, 0, d] :=
+      FNeurons[0].FWeights.RandomGaussianValue() * 0.1;
+```
+
+**Do this — bind the chain once, above both loops:**
+
+```pascal
+W := FNeurons[0].FWeights;              // list accessor + field deref, once total
+for p := 0 to NumPatternsM1 do
+  for d := 0 to DimM1 do
+    W[p, 0, d] := W.RandomGaussianValue() * 0.1;
+```
+
+Now the list getter runs once instead of `2 * FNumPatterns * FDim` times, and
+both the write target and the `RandomGaussianValue()` receiver go through the
+same local. (This exact chain recurs in many `InitDefault`/init routines in
+`neuralnetwork.pas` — the same one-line hoist applies to each.)
+
+**Why it matters**
+
+- **Collapses N² accessor calls to one** — the deeper the nest, the larger the
+  multiplier removed; an invariant lifted above the outer loop is gone from every
+  inner iteration.
+- **Readability** — `W` names the one volume the whole nest initialises, instead
+  of restating the `FNeurons[0].FWeights` path four times.
+
+**Note on the remaining `[p, 0, d]` write.** It still goes through the volume
+accessor (#3). Here that is fine: it is a lone write per cell with no reused
+offset (the `p, 0, d` slot is touched once), so per #3's own test — "does the
+offset get used at least twice?" — leave it as the accessor. This entry is about
+hoisting the invariant *chain*, not about rewriting the per-cell store.
+
+**Caveat.** As with #7, the binding assumes stable list membership and that the
+weights volume is not reallocated inside the loop — true for a one-shot
+initialiser like this. Hoist cost, never behaviour.
+
+## 10. In hot paths, index `FArrNeurons` (the array mirror), not `FNeurons` (the list)
+
+Rule #7 caches *one* repeatedly-accessed list element in a local. That does not
+help when the index **varies** each iteration — `FNeurons[3*h]`,
+`FNeurons[3*h+1]`, `FNeurons[3*h+2]` — because there is no single element to
+bind. For exactly this case the codebase keeps `FArrNeurons`: a
+`array of TNNetNeuron` holding the *same* `TNNetNeuron` references as `FNeurons`,
+but indexed as a plain array — no `Items[]`/`GetItem` method call, no
+property-getter bounds/cast overhead. Its own declaration comment calls it the
+"fast (array) mirror of the `FNeurons` list … indexed directly without the
+`TNNetNeuronList` method/bounds overhead." In hot compute/backprop loops, index
+the mirror.
+
+This example also recomputes `3 * h` three times per iteration — a repeated
+subexpression (#4). Compute the base index once; since `h` advances by 1 the base
+advances by a constant 3, so it is also a strength-reduction candidate (#6).
+
+**Anti-example — do NOT follow this** (from the head loop in
+`TNNetGroupedQueryAttention`-style `Compute()`/`Backpropagate()`,
+`neuralnetwork.pas` ~32346 / ~32445 — a `FNeurons` list accessor *and* a
+`3 * h` multiply, three of each per head):
+
+```pascal
+for h := 0 to HeadsM1 do
+begin
+  K1 := FNeurons[3 * h].FWeights;
+  K2 := FNeurons[3 * h + 1].FWeights;
+  V  := FNeurons[3 * h + 2].FWeights;
+  ...
+end;
+```
+
+**Do this — mirror index, base computed once:**
+
+```pascal
+for h := 0 to HeadsM1 do
+begin
+  i0 := 3 * h;                        // #4: one multiply, reused three ways
+  K1 := FArrNeurons[i0    ].FWeights; // #10: array mirror, no list getter
+  K2 := FArrNeurons[i0 + 1].FWeights;
+  V  := FArrNeurons[i0 + 2].FWeights;
+  ...
+end;
+```
+
+**Why it matters**
+
+- **No accessor call per element** — `FArrNeurons[i]` is a direct array read;
+  `FNeurons[i]` re-enters `GetItem` (call + index + optional range check/cast)
+  every time, and here the index differs each iteration so #7's bind-one-local
+  trick cannot remove it.
+- **One multiply, not three** — `i0 := 3 * h` computed once and reused for the
+  `+0/+1/+2` slots (#4); it can be carried as a running `+= 3` accumulator across
+  heads if you prefer (#6).
+- **Consistency** — this is the mirror's intended use; the safetensors/GGUF
+  loaders, savers, and several compute paths already read weights through
+  `FArrNeurons` for the same reason.
+
+**Precondition (rarely a concern in practice).** `FArrNeurons` is a snapshot of
+references built by `BuildArrNeurons` (and re-run lazily by the compute loops /
+at construction). Because it stores the *same* `TNNetNeuron` objects, edits to a
+neuron's weight *contents* are always visible through either view — and a layer's
+neurons are populated at construction and **do not normally change places**
+afterwards, so by the time any forward/backward pass runs, the mirror is current.
+The only situation that invalidates it is code that **adds, removes, or reorders**
+neurons after the mirror was built; such setup/mutation code should rerun
+`BuildArrNeurons` (the existing paths already do) or just use plain `FNeurons`.
+For the ordinary hot compute/backprop loop, `FArrNeurons` is simply the correct
+index.
+
+## 11. Hoist to the innermost loop level at which a value is still invariant
+
+Invariance is **relative to a particular loop**. A value can vary across an outer
+loop yet be constant across the inner one — a *partial* invariant. Rule #5 says
+"lift it to the outermost scope in which it is still invariant"; in a nested
+loop that scope is often *between* the loops: the outer loop's body, **before**
+the inner loop — not all the way out of both.
+
+The tell (from #8) still works, applied to the *inner* loop: look at the call's
+arguments and ask which loop's induction variable appears. If the inner index is
+absent, the value is inner-loop-invariant even when an outer index is present —
+so it belongs one level up.
+
+**Anti-example — do NOT follow this** (attention backprop head loop,
+`neuralnetwork.pas` ~31392 — `FOutputError.GetRawPtr(i, 0, QOfs)` is recomputed
+**twice per `j` iteration**, i.e. `2 * SeqLen` times per `i`, though its
+arguments are `i`, `0`, `QOfs` — none of them the inner variable `j`):
+
+```pascal
+for i := 0 to SeqLenM1 do
+begin
+  AttnRow := FAttn.GetRawPos(0, h * SeqLen + i, 0);   // already hoisted to the i level
+  for j := 0 to SeqLenM1 do
+  begin
+    A := FAttn.FData[AttnRow + j];
+    TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, VOfs),
+      FOutputError.GetRawPtr(i, 0, QOfs), A, FDk);          // invariant across j
+    FdAttnBuf[j] := TNNetVolume.DotProduct(
+      FOutputError.GetRawPtr(i, 0, QOfs), Prev.GetRawPtr(j, 0, VOfs), FDk); // again
+  end;
+end;
+```
+
+**Do this — hoist the `i`-only pointer to the outer body, beside `AttnRow`:**
+
+```pascal
+for i := 0 to SeqLenM1 do
+begin
+  AttnRow := FAttn.GetRawPos(0, h * SeqLen + i, 0);
+  dOutPtr := FOutputError.GetRawPtr(i, 0, QOfs);   // computed once per i, not per j
+  for j := 0 to SeqLenM1 do
+  begin
+    A := FAttn.FData[AttnRow + j];
+    TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, VOfs), dOutPtr, A, FDk);
+    FdAttnBuf[j] := TNNetVolume.DotProduct(
+      dOutPtr, Prev.GetRawPtr(j, 0, VOfs), FDk);
+  end;
+end;
+```
+
+`PrevErr.GetRawPtr(j, 0, VOfs)` and `Prev.GetRawPtr(j, 0, VOfs)` **stay inside**
+the inner loop — they carry `j`, so they are not inner-invariant. Only the
+`i`-indexed pointer moves up. This is the same discipline the code already
+applies to `AttnRow` (hoisted to the `i` level); the `dOut` pointer simply
+deserves the same.
+
+**Why it matters**
+
+- **Removes work from the whole inner loop** — an inner-invariant lifted one
+  level runs `SeqLen`× fewer times per `i` (and it was computed *twice* per
+  iteration here, so it also folds in #4).
+- **Multiplies through nesting** — the deeper the nest, the more iterations a
+  single correct hoist removes; a partial invariant left in place is the most
+  common missed hoist in nested numeric code.
+
+**How far to lift.** Place the binding at the *lowest* loop level whose body it
+is still invariant in: one that uses only outer indices goes just inside the
+outer loop; one that uses no loop index at all goes above every loop (#5/#8). Do
+not lift a value past a loop whose variable it actually depends on — that changes
+behaviour. (This same `GetRawPtr(i, 0, QOfs)` pattern recurs in the other
+attention backprop paths around ~30806 / ~33415 / ~38104 — the identical
+one-level hoist applies to each.)
+
+## 12. Strength-reduce a per-iteration `GetRawPtr(loopvar, …)` into a carried offset
+
+The pointer left *inside* the inner loop by #11 — `Prev.GetRawPtr(j, 0, VOfs)` —
+is itself a strength-reduction target (#6), because `GetRawPtr` hides a multiply.
+Recall the layout math (`neuralvolume.pas`):
+
+```pascal
+function TVolume.GetRawPos(x, y, d: integer): integer;
+begin  Result := ((FSizeX * y) + x) * FDepth + d;  end;
+
+function TVolume.GetRawPtr(x, y, d: integer): pointer;
+begin  Result := Addr(FData[GetRawPos(x, y, d)]);  end;
+```
+
+With `y = 0`, `GetRawPtr(j, 0, VOfs)` addresses flat element `j * FDepth + VOfs`.
+As `j` advances by 1 the offset advances by a **constant `FDepth`** — so the
+per-iteration multiply `j * FDepth` can be replaced by a carried offset stepped
+with `+=`. The step is exactly `GetRawPos(1, 0, 0)` (`= 1 * FDepth + 0 = FDepth`,
+and independent of `FSizeX` because `y = 0`), which is a self-documenting way to
+name the row stride without hardcoding `FDepth`. There is also a single-argument
+`GetRawPtr(x) = Addr(FData[x])` (no multiply) — the natural consumer of a carried
+flat offset.
+
+Because `Prev` and `PrevErr` are the same previous layer's output and error, they
+share one shape — so a **single** carried offset addresses both (rule #3's
+shared-offset point), and it seeds at `VOfs` (`= GetRawPos(0, 0, VOfs)`).
+
+**Anti-example — do NOT follow this** (`GetRawPtr(j, 0, VOfs)` recomputes
+`j * FDepth` every iteration, for two volumes):
+
+```pascal
+for j := 0 to SeqLenM1 do
+begin
+  A := FAttn.FData[AttnRow + j];
+  TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, VOfs), dOutPtr, A, FDk);
+  FdAttnBuf[j] := TNNetVolume.DotProduct(
+    dOutPtr, Prev.GetRawPtr(j, 0, VOfs), FDk);
+end;
+```
+
+**Do this — carry one offset, advance by the row stride:**
+
+```pascal
+RowStride := Prev.GetRawPos(1, 0, 0);   // = FDepth; elements between consecutive j
+posV      := VOfs;                       // = GetRawPos(0, 0, VOfs); the j = 0 offset
+for j := 0 to SeqLenM1 do
+begin
+  A := FAttn.FData[AttnRow + j];
+  TNNetVolume.MulAdd(PrevErr.GetRawPtr(posV), dOutPtr, A, FDk);   // one offset,
+  FdAttnBuf[j] := TNNetVolume.DotProduct(
+    dOutPtr, Prev.GetRawPtr(posV), FDk);                          // both volumes
+  Inc(posV, RowStride);                  // next j's offset, by addition (#6)
+end;
+```
+
+**Why it matters**
+
+- **Multiply → add** — the inner-loop address math drops from a multiply-add per
+  pointer to one shared `Inc`; `RowStride` and the seed are computed once.
+- **One offset, two volumes** — folds in #3: same shape ⇒ `posV` indexes both
+  `Prev` and `PrevErr`.
+
+**Be honest about the magnitude — measure before spreading this.** Here each
+`GetRawPtr` feeds a `MulAdd`/`DotProduct` over `FDk` elements; that vector kernel
+dominates, and the single removed multiply is lost in the noise. The transform is
+essentially free and correct, but do **not** expect a visible speedup when the
+per-iteration body is a length-`FDk` kernel. Strength-reducing `GetRawPtr` pays
+off where the inner body is *light* — scalar or very short-vector work, or a hot
+offset used many times per iteration — and where the multiply is a real fraction
+of the loop's cost. Treat this as the lowest-priority class of change in this
+guide: apply it when you are already rewriting the loop for #11, not as a standalone
+sweep.
+
+**Caveats.** Same as #6: the induction step must be constant (`j` by 1 here), the
+seed must equal the first offset (`VOfs`, not `0`), and `posV` must advance
+unconditionally in the loop body. And the two volumes may share one offset only
+while they genuinely share a shape — if `Prev` and `PrevErr` could ever differ in
+`FDepth`, carry two offsets.
