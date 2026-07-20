@@ -764,6 +764,89 @@ behaviour. (This same `GetRawPtr(i, 0, QOfs)` pattern recurs in the other
 attention backprop paths around ~30806 / ~33415 / ~38104 — the identical
 one-level hoist applies to each.)
 
+**Worked variant — split an offset into an inner-invariant base plus the inner
+index.** The hoist above lifted a whole *pointer*; the same logic applies to a
+raw *flat offset* whose innermost index is only *added* at the end. Because
+
+```pascal
+GetRawPos(X, Y, D) = ((FSizeX * Y) + X) * FDepth + D
+                   = GetRawPos(X, Y, 0) + D
+```
+
+the multiply-add `((FSizeX * Y) + X) * FDepth` is exactly `GetRawPos(X, Y, 0)` —
+which is **invariant across a `D` loop** — and the inner index enters as a bare
+`+ D`. So compute the base at `D = 0` once in the outer body and index
+`base + D` inside, instead of recomputing the whole offset (with its multiply)
+every `D`.
+
+**Anti-example — do NOT follow this** (`GetRawPos(X, Y, D)` recomputes
+`((FSizeX*Y)+X)*FDepth` on every `D`, though only the trailing `+ D` changes):
+
+```pascal
+for X := 0 to MaxX do
+  for Y := 0 to MaxY do
+    for D := 0 to MaxD do
+    begin
+      basePrev := FPrevLayer.FOutput.GetRawPos(X, Y, D);   // multiply-add every D
+      a := FPrevLayer.FOutput.FData[basePrev];
+      b := FPrevLayer.FOutput.FData[basePrev + HalfDepth];
+      // Exact Gaussian CDF: Phi(b) = 0.5*(1 + erf(b/sqrt(2))).
+      cdf := 0.5 * (1 + pcr_erff(b * INV_SQRT_2));
+      FOutput[X, Y, D] := a * (b * cdf);
+    end;
+```
+
+**Do this — hoist the base to `D = 0`, one level up, and add `D` inside — for
+the output volume too:**
+
+```pascal
+for X := 0 to MaxX do
+  for Y := 0 to MaxY do
+  begin
+    basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y, 0);   // = ((FSizeX*Y)+X)*FInDepth, once per (X,Y)
+    baseOut0  := FOutput.GetRawPos(X, Y, 0);              // FOutput's own base (different shape)
+    for D := 0 to MaxD do
+    begin
+      basePrev := basePrev0 + D;                          // just an add
+      a := FPrevLayer.FOutput.FData[basePrev];
+      b := FPrevLayer.FOutput.FData[basePrev + HalfDepth];
+      cdf := 0.5 * (1 + pcr_erff(b * INV_SQRT_2));
+      FOutput.FData[baseOut0 + D] := a * (b * cdf);       // store, no accessor
+    end;
+  end;
+```
+
+Now the `((FSizeX*Y)+X)*FDepth` multiply-add runs once per `(X, Y)` instead of
+once per `D` — on **both** sides. The read base is hit twice per iteration
+(`basePrev` and `basePrev + HalfDepth`), so direct `FData` is warranted by #3's
+"used twice" test outright. The *write* is a lone store, but it is still worth
+hoisting: the justification is #11, not #3 — the base multiply
+`((FSizeX*Y)+X)*FDepth` is **invariant across the whole `D` loop**, so lifting it
+turns every store's offset from a multiply-add into a plain `baseOut0 + D` add.
+That is a real per-iteration saving even for a single write, and it is *not* the
+#3 anti-pattern: the anti-pattern is calling `GetRawPos` **inline** at a
+single-use site (identical cost to the accessor); here the offset's expensive
+part is computed once *outside* the loop and only an add remains inside.
+
+**`FOutput` needs its own base — do not reuse `basePrev0`.** This is a gated
+activation: `FOutput` has half the input depth (`FInDepth = 2 * FDepth`), so its
+per-slot stride differs and `GetRawPos(X, Y, 0)` yields a different base. Rule
+#3's "reuse one base across same-shaped volumes" applies only when the shapes
+match — they do not here, so carry two bases. (If the layer *were* shape-
+preserving, one base would index both.)
+
+Since `D` advances by 1, both `basePrev` and `baseOut0 + D` advance by 1, so they
+can equally be carried with `Inc` per #12 — but `base0 + D` is often the clearest
+spelling and just as cheap.
+
+**Caveat — the bare `+ D` decomposition only works for the *depth* index.** `D`
+is the last term in `GetRawPos` with coefficient 1, which is why
+`GetRawPos(X, Y, D) = GetRawPos(X, Y, 0) + D`. If instead the *inner* loop varied
+`X`, one `X`-step moves the offset by `FDepth` (not 1); if it varied `Y`, by
+`FSizeX * FDepth`. In those cases the constant step is the row/plane stride and
+this becomes the carried-offset strength reduction of #12 (`Inc(pos, FDepth)`),
+not a plain `+ innerIndex`.
+
 ## 12. Strength-reduce a per-iteration `GetRawPtr(loopvar, …)` into a carried offset
 
 The pointer left *inside* the inner loop by #11 — `Prev.GetRawPtr(j, 0, VOfs)` —
