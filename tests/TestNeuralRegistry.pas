@@ -536,6 +536,10 @@ begin
 
     // Head-tiled RMSNorm (depth 16 = 4 heads x head_dim 4).
     378: begin AddSeqInput(ANet); Exit(L('TNNetHeadRMSNorm', TNNetHeadRMSNorm.Create(4, 1e-6))); end;
+
+    // Fused multi-head SDPA (GQA 2 q-heads / 1 kv-head, head_dim 4:
+    // packed depth (2 + 2*1)*4 = 16).
+    379: begin AddSeqInput(ANet); Exit(L('TNNetFusedSDPA', TNNetFusedSDPA.Create(2, 1, 4, {Causal=}true))); end;
     else
       Result := False;
   end;
