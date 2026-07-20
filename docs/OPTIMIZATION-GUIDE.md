@@ -931,3 +931,83 @@ seed must equal the first offset (`VOfs`, not `0`), and `posV` must advance
 unconditionally in the loop body. And the two volumes may share one offset only
 while they genuinely share a shape — if `Prev` and `PrevErr` could ever differ in
 `FDepth`, carry two offsets.
+
+## 13. Promote a degenerate elementwise inner loop to a `TNNetVolume` bulk method
+
+Rules #11 and #12 make the inner loop's *addressing* cheap. But once the base is
+hoisted, many inner loops turn out to be nothing more than a **uniform elementwise
+op over a contiguous run with loop-invariant scalar coefficients** — a copy, a
+scale, an accumulate. That whole loop is already implemented, once, as an
+AVX-vectorized primitive on `TNNetVolume`. Recognise the shape and **call the
+method** instead of hand-rolling a scalar `D` loop: you replace `N` scalar
+operations *plus* `N` bounds checks *plus* the loop overhead with a single kernel
+call. This is a bigger win than #11/#12 at the same site — it changes the
+instruction mix (scalar → SIMD), not just one multiply into an add.
+
+The primitives (all in `neuralvolume.pas`; pointer-form class methods are the ones
+that consume a hoisted `GetRawPtr`):
+
+| Inner loop (after #11 hoist) | Meaning | Call |
+| --- | --- | --- |
+| `dst[base+D] := src[base+D]` | contiguous copy | `Move(src.FData[base], dst.FData[base], N * csNeuralFloatSize)` (see #1) or `dst.Copy(src, N)` |
+| `dst[D] := src[D] * k` (`k` invariant) | scale-copy | `Move` then `TNNetVolume.Mul(dstPtr, k, N)` (in-place `*= k`) |
+| `dst[base+D] := dst[base+D] + src[base+D]` | accumulate | `TNNetVolume.Add(dstPtr, srcPtr, N)` |
+| `dst[base+D] := dst[base+D] + src[base+D] * k` | scaled accumulate | `TNNetVolume.MulAdd(dstPtr, srcPtr, k, N)` |
+| `dst[D] := dst[D] + a[D] * b[D]` | elementwise FMA | `TNNetVolume.MulAdd(dstPtr, aPtr, bPtr, N)` |
+| `acc := acc + a[D] * b[D]` | reduction | `TNNetVolume.DotProduct(aPtr, bPtr, N)` |
+
+**Anti-example — do NOT hand-roll a scalar map** (`neuralnetwork.pas` GEGLU, the
+`B/sqrt(2)` write):
+
+```pascal
+outPtr := FOutput.GetRawPtr(X, Y, 0);
+bPtr   := FPrevLayer.FOutput.GetRawPtr(X, Y, HalfDepth);
+for D := 0 to MaxD do
+  outPtr^[D] := bPtr^[D] * INV_SQRT_2;   // N scalar muls + N bound checks
+```
+
+**Do this — one vectorized call:**
+
+```pascal
+FOutput.Copy(FPrevLayer.FOutput, ... );          // or Move the B half in
+TNNetVolume.Mul(outPtr, INV_SQRT_2, HalfDepth);  // AVX scale, in place
+```
+
+(The very next lines of that same method already do exactly this for the erf ride
+via `TNNetVolume.VectorErf` — the scalar seed loop above it is the leftover.)
+
+**The one precondition: uniformity.** Promotion is valid only when *every* element
+runs the *same* op with *only* loop-invariant scalars. The moment the body carries
+a **per-element transcendental** (`NeuralExp(0.5*logVar)` recomputed each `D`) or a
+**data-dependent factor** (`g * 0.5 * sigma * e`, where `sigma` and `e` vary per
+`D`), it is not a uniform map and must stay scalar — *unless* you first
+materialise the varying factor into a contiguous temp and then fire one bulk call.
+A mixed body splits: in the VAE-reparam backward, the `dmu` branch
+`prevErr[base+D] += g` **is** a pure `TNNetVolume.Add(dstPtr, gPtr, N)`, while the
+`dlogvar` branch (per-element `sigma`, `e`) stays scalar. Promote the promotable
+half; do not force the rest.
+
+### Related micro-notes (came up in the same review)
+
+- **Equal dimensions ⇒ equal base — compute it once (flip side of #11).** If two
+  volumes have identical `FSizeX`/`FSizeY`/`FDepth`, then `GetRawPos(X, Y, 0)` is
+  the *same integer* for both, so one hoisted base indexes both (#12 already leans
+  on this: "same shape ⇒ one offset addresses both"). The trap is the reverse,
+  which #11 spells out: a **gated** layer's `FOutput` is half the input depth, so
+  its base differs and must be carried separately. Rule of thumb: share a base
+  only after you have verified the shapes match; never assume it.
+- **A second pointer into the *same* volume at a constant depth = first pointer +
+  that constant.** Instead of a second accessor call
+  `bPtr := V.GetRawPtr(X, Y, HalfDepth)` next to `aPtr := V.GetRawPtr(X, Y, 0)`,
+  the offset differs by a compile-time constant, so `bPtr` is just `aPtr` advanced
+  by `HalfDepth`. In index form this is the `FData[base + HalfDepth]` already shown
+  in #11; in pointer form it needs an element-typed pointer (or `{$POINTERMATH ON}`)
+  to write `aPtr + HalfDepth` — if that is not in scope, keep the index form rather
+  than a redundant `GetRawPtr`.
+- **`GetRawPos(x, y)` / `GetRawPtr(x, y)` already exist — prefer them over the
+  `, 0` form.** The two-argument overloads (`neuralvolume.pas`) return
+  `((FSizeX*y)+x)*FDepth`, i.e. exactly the three-argument call with `d = 0`. Codegen
+  is **identical** (the `+ 0` folds away and both inline), so this is a *readability*
+  choice, not a speedup: `V.GetRawPos(X, Y)` states "row base" more plainly than
+  `V.GetRawPos(X, Y, 0)`. Do not spend a churn commit flipping existing `, 0` call
+  sites for this reason alone; use the short form in new code.
