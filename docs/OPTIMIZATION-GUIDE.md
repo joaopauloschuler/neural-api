@@ -1119,21 +1119,30 @@ half; do not force the rest.
   // if pointer math is not in scope, keep the index form: FData[base + HalfDepth]
   ```
 - **`GetRawPos(x, y)` / `GetRawPtr(x, y)` already exist — prefer them over the
-  `, 0` form.** The two-argument overloads (`neuralvolume.pas`) return
-  `((FSizeX*y)+x)*FDepth`, i.e. exactly the three-argument call with `d = 0`. Codegen
-  is **identical** (the `+ 0` folds away and both inline), so this is a *readability*
-  choice, not a speedup: `V.GetRawPos(X, Y)` states "row base" more plainly than
-  `V.GetRawPos(X, Y, 0)`. Do not spend a churn commit flipping existing `, 0` call
-  sites for this reason alone; use the short form in new code.
+  `, 0` form; it is never more expensive and sometimes cheaper.** The two-argument
+  overloads (`neuralvolume.pas`) return `((FSizeX*y)+x)*FDepth`, i.e. the
+  three-argument call with `d = 0`. **The cost is not unconditionally identical** —
+  that depends on inlining. These accessors are declared `{$IFDEF Release} inline`:
+    - **Inlined (Release build):** the compiler folds the `+ 0` away, so
+      `GetRawPtr(n, 0, 0)` and `GetRawPtr(n, 0)` emit the same code — identical cost.
+    - **Not inlined (debug, or any build where `Release` is undefined):** each is a
+      real function *call*. The three-argument form pushes an extra argument and
+      executes the extra `+ d`, so `GetRawPtr(n, 0, 0)` is strictly *more* work than
+      `GetRawPtr(n, 0)`. It is **wrong** to call them equal-cost in general.
+
+  So the two-argument form is **never worse and sometimes better** — a real (if
+  small) win in non-inlined builds, free in inlined ones. Use it whenever `d = 0`.
 
   ```pascal
-  base := V.GetRawPos(X, Y, 0);   // fine — but the trailing 0 is noise
-  base := V.GetRawPos(X, Y);      // identical machine code; reads as "row base"
+  base := V.GetRawPos(X, Y, 0);   // extra +0 (and an extra arg when not inlined)
+  base := V.GetRawPos(X, Y);      // same result; cheaper when not inlined, equal when inlined
   ```
 
-  **This is the one item in this list that is NOT a "don't do this" —**
-  `GetRawPos(X, Y, 0)` is not a performance bug, so there is nothing to fix at
-  existing sites; the short form is only a readability preference for new code.
+  This is not a "don't do this" in the correctness sense, but — unlike the earlier
+  claim in older revisions of this note — it is a genuine micro-improvement, not
+  purely cosmetic. Prefer the short form in new and edited code; a standalone
+  churn-only flip of every existing site is still low priority (it only helps
+  non-inlined builds), but fold the switch in whenever you already touch the line.
 
 ## 14. Rank on the cheapest order-equivalent quantity — skip transforms used only to compare
 
@@ -1216,3 +1225,229 @@ only on the reported minimum.
   the original `>`/`>=` keeps behaviour identical.)
 - **This is an algebraic rewrite, not a mechanical one** — it is the one rule here a
   pattern-matching sweep will not surface. It requires reading what a value is *for*.
+
+## 15. Strength-reduce `*`/`div` by a compile-time power of two to `shl`/`shr`
+
+A multiply or divide by a constant power of two is a single bit-shift: `x * 2^k` is
+`x shl k`, `x div 2^k` is `x shr k` (for non-negative `x`). A shift is one cheap ALU
+op; the general `div` in particular is many cycles. In dimension arithmetic this
+recurs constantly — `pHeadDim div 2`, `div 4`, `* 8`.
+
+**Anti-example — do NOT write the arithmetic form for a constant power of two:**
+
+```pascal
+HalfD    := pHeadDim div 2;
+QuarterD := pHeadDim div 4;
+```
+
+**Do this:**
+
+```pascal
+HalfD    := pHeadDim shr 1;   // div 2
+QuarterD := pHeadDim shr 2;   // div 4
+```
+
+(and `x shl k` for `x * 2^k`).
+
+**Why not just trust the compiler?** For an **unsigned** operand FPC does reduce
+`div 2^k` to a shift. For a **signed** operand it legally cannot emit a bare `shr`:
+`div` truncates toward zero but an arithmetic right shift rounds toward −∞, so the
+compiler must add sign-correction (a conditional add of `2^k − 1` before shifting) —
+extra instructions on every use. Writing `shr` yourself skips that correction.
+
+**Caveats.**
+- **`shr` is only equal to `div 2^k` when the value is non-negative.** Dimensions,
+  sizes, counts, and offsets always are, so this is safe there. Do **not** blind-swap
+  `div`→`shr` on a value that can be negative (a signed delta, a coordinate that can
+  go negative) — the results differ for negatives.
+- **Only for a genuine compile-time power of two.** `div 3`, `div 6`, `div FDepth`
+  are not shifts; leave them (a `div` by a runtime value is not reducible here).
+- Same idea for `mod`: `x mod 2^k` on a non-negative `x` is `x and (2^k − 1)`.
+
+## 16. Use `NeuralExp` (the fast, trap-free exp), not the RTL `Exp`, in model math
+
+`neuralvolume.pas` provides `NeuralExp` — a table + polynomial `exp` (a 64-entry
+`2^(i/64)` LUT with a degree-5 minimax poly, the scalar sibling of the AVX
+`VectorExp`). Two reasons it is the right default in the network's forward/backward
+math:
+
+- **Faster** than the RTL `System.Exp` (which does a full accurate range-reduced
+  libm-style evaluation). The approximation is well within this codebase's tolerance
+  (see the no-bit-parity policy) and is already the convention — it is used in over a
+  hundred sites across `neuralnetwork.pas`.
+- **Overflow-trap-free.** `NeuralExp` is a `{$Q-}`/`{$R-}` clone, so a large argument
+  cannot raise a range/overflow exception under a debug (`-Criot`) build the way
+  `System.Exp` can. This has bitten real model runs on padded/degenerate rows.
+
+**Anti-example — RTL `Exp` in a hot activation / gate / softmax body:**
+
+```pascal
+sg := 1.0 / (1.0 + Exp(-x));          // sigmoid
+e  := Exp(logit[c] - MaxLogit);       // softmax term
+dec := Exp(-sp * pn);                 // gate decay
+```
+
+**Do this — the codebase's fast exp:**
+
+```pascal
+sg := 1.0 / (1.0 + NeuralExp(-x));
+e  := NeuralExp(logit[c] - MaxLogit);
+dec := NeuralExp(-sp * pn);
+```
+
+**Where NOT to swap.** `NeuralExp` is an *approximation*. Leave `System.Exp` in code
+where exactness is the point, not speed:
+- weight/activation **quantizer** scale computation and other numerically sensitive
+  setup that runs once (cost is irrelevant, accuracy matters),
+- importers / config / metric code outside the per-token or per-element path,
+- any site a comment explicitly marks as needing a stable/exact evaluation.
+When in doubt on a hot forward/backward path, prefer `NeuralExp`; on a
+once-per-model setup path, leave `Exp`. (The same applies to the other `Neural*` /
+`pcr_*` fast transcendentals versus their RTL equivalents.)
+
+## Appendix: the patterns agents miss most — extra worked examples
+
+These reinforce rules already stated; they are collected here because review keeps
+finding them un-applied. Same rules, more surface.
+
+### A. Repeated `(t * Stride) + d` index arithmetic — rule #4/#5 (MOST-MISSED)
+
+The single most-recurring miss. An index built from a loop variable and a stride is
+recomputed several times per iteration, and the `t * Stride` part is invariant across
+the inner loop.
+
+**Anti-example:**
+
+```pascal
+FDelta.FData[(t * Depth) + d] := sp;
+FBt.FData[(t * Depth) + d]    := acc;
+FCt.FData[(t * Depth) + d]    := hprev;
+FAt.FData[(t * Depth) + d]    := NeuralExp(-sp * FExpA.FData[d]);   // (see #16)
+```
+
+**Do this — one index for the group (`#4`), and hoist `t * Depth` to the `t` body
+(`#5`):**
+
+```pascal
+tDepth := t * Depth;          // #5: once per t, before the d loop
+...
+idx := tDepth + d;            // #4: once per (t, d)
+FDelta.FData[idx] := sp;
+FBt.FData[idx]    := acc;
+FCt.FData[idx]    := hprev;
+FAt.FData[idx]    := NeuralExp(-sp * FExpA.FData[d]);
+```
+
+Same for `(t * FNumHeads) + h`, and for a **nested** build like
+`hbase := ((t * Depth) + d) * NS` — hoist `tDepth := t * Depth` to the `t` body and
+reuse `idx := tDepth + d` before multiplying by `NS`. Whenever the same
+`loopvar * const` appears twice, it is this pattern.
+
+### B. Consecutive fixed depth slots — write through one base — rule #11/#4
+
+Writing a small fixed number of depth channels at `[p, 0, 0]`, `[p, 0, 1]`,
+`[p, 0, 2]` routes each through the `[]` accessor (a `GetRawPos` multiply-add each).
+
+**Anti-example:**
+
+```pascal
+FPhi[p, 0, 0] := 1.0;
+FPhi[p, 0, 1] := pn;
+FPhi[p, 0, 2] := pcr_sinf(2 * Pi * pn);
+```
+
+**Do this — one base, then `+0/+1/+2`:**
+
+```pascal
+b := FPhi.GetRawPos(p, 0);        // 2-arg form (#7); the row base
+FPhi.FData[b]     := 1.0;
+FPhi.FData[b + 1] := pn;
+FPhi.FData[b + 2] := pcr_sinf(2 * Pi * pn);
+```
+
+### C. Contiguous copies/accumulates are `Move` / `TNNetVolume` ops — rule #13
+
+Reviewers keep flagging plain element loops. Reflexively recognise them:
+
+```pascal
+// copy — rule #13:
+for c := 0 to DepthM1 do FOutput.FData[baseOut0 + c] := Prev.FData[basePrev0 + c];
+//   -> Move(Prev.FData[basePrev0], FOutput.FData[baseOut0], (DepthM1 + 1) * csNeuralFloatSize);
+
+// accumulate — rule #13:
+for c := 0 to DepthM1 do
+  PrevErr.FData[basePrevErr0 + c] := PrevErr.FData[basePrevErr0 + c] + FOutputError.FData[baseOutErr0 + c];
+//   -> TNNetVolume.Add(PrevErr.GetRawPtr(basePrevErr0), FOutputError.GetRawPtr(baseOutErr0), DepthM1 + 1);
+```
+
+**This applies to plain `array of TNeuralFloat` too, not only `TNNetVolume`.** Three
+parallel raw-array copies are three `Move`s:
+
+```pascal
+for i := 0 to nM1 do begin FPosT[i] := pPosT[i]; FPosH[i] := pPosH[i]; FPosW[i] := pPosW[i]; end;
+//   -> Move(pPosT[0], FPosT[0], n * SizeOf(TNeuralFloat));  (and FPosH, FPosW)  — n = nM1 + 1
+```
+
+A `dot` (`acc += W[k]*x[k]`) is `TNNetVolume.DotProduct`; a `mad`
+(`buf[k] += W[k]*s`, `s` invariant) is `TNNetVolume.MulAdd(buf, W, s, N)`; a
+`buf[k] := 0` fill is `FillChar`/`TVolume.Fill`. In one `HamiltonianCell` block the
+reviewer found all four in a dozen lines — a `Move`, a zero-fill, a `dot`, and a
+`mad` — none promoted. Read a scalar `for` over a contiguous run and ask *which
+primitive is this* before leaving it.
+
+### D. Elementwise math as a short op sequence — rule #13 (with scratch)
+
+A uniform elementwise formula built from `+ - *` and already-vectorized transcendentals
+can often be a short sequence of `TNNetVolume` ops over a scratch buffer:
+
+```pascal
+// tanh-approx GELU forward: out = SQRT_2_OVER_PI*(x + GELU_CONST*x^3)
+for OutputCnt := 0 to SizeM1 do
+begin
+  x := LocalPrevOutput.FData[OutputCnt];
+  FOutput.FData[OutputCnt] := SQRT_2_OVER_PI * (x + GELU_CONST * x*x*x);
+end;
+```
+
+is expressible as: copy `x`; cube via elementwise `Mul` into a scratch; `MulAdd`/`Mul`
+by the constants — worthwhile when the length is large and the ops are the AVX
+primitives. **Precondition is still #13's uniformity:** if the body mixes a
+per-element transcendental with data-dependent factors (e.g. a Swish backward
+`t + x*(1 - t*t)*dg`), promote only the uniform sub-parts and leave the rest scalar —
+do not force a single-call rewrite. If the scratch churn would exceed the scalar
+loop's cost (short runs), leave it; note the decision.
+
+### E. Reorder loops so the inner axis is contiguous — rule #13/#11
+
+When the inner loop strides by `Depth` (channel-outer) the accesses are cache-hostile
+and cannot be a bulk op; interchanging so the contiguous (depth) axis is innermost
+often exposes a `Move`/`Add`/`MulAdd` and removes per-element `GetRawPos`:
+
+```pascal
+for c := 0 to DepthM1 do
+  for t := 0 to FSeqLenM1 do
+    ... Prev[s, 0, c] ...      // strided by Depth in the inner body
+```
+
+Consider `for t ... for c ...` (or hoisting a per-`(t,c)` base) so the depth run is
+contiguous — but **only when it preserves the dependency structure** (watch
+accumulations like `GdH[p,0,c] += ...` whose order across `c`/`t` must stay correct).
+Reorder for locality, not blindly.
+
+### F. Initializer loops are not exempt — rules #2/#3/#11
+
+Setup/init code violates the guide too:
+
+```pascal
+Depth   := FNeurons[2].FWeights.SizeX;
+DepthM1 := Depth - 1;
+LpBnd68 := FNeurons[2].FWeights.Depth - 1;
+for c := 0 to DepthM1 do
+  for j := 0 to LpBnd68 do
+    FNeurons[2].FWeights[c, 0, j] := FNeurons[2].FWeights.RandomGaussianValue() * 0.1;
+```
+
+`FNeurons[2].FWeights` is re-resolved on every write (bind it to a local, #3/#7); the
+`[c, 0, j]` accessor recomputes `GetRawPos` per element when a hoisted base + `Move`-free
+inner write would do (#11). Cost is one-time, so this is low priority — but it is
+still a violation, and a reviewer will still flag it; apply the same reflexes.
