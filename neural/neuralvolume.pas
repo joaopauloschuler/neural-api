@@ -2914,8 +2914,7 @@ begin
           // CutA (a copy of SrcA) and SrcB share XY/depth geometry here, so a
           // single base indexes both FData arrays.
           PastePos := CutA.GetRawPos(X, Y, 0);
-          for D := 0 to DepthMax do
-            CutA.FData[PastePos + D] := SrcB.FData[PastePos + D];
+          Move(SrcB.FData[PastePos], CutA.FData[PastePos], (DepthMax + 1) * csNeuralFloatSize);
         end;
       // True pasted-area fraction after clamping.
       LambdaAdj := 1.0 - (BoxW * BoxH) / (W * H);
@@ -5896,10 +5895,7 @@ begin
       begin
         SelfBase := GetRawPos(I, J, 0);
         SrcBase := A.GetRawPos(I, J, 0);
-        for K := 0 to ADepthM1 do
-        begin
-          FData[SelfBase + K] := A.FData[SrcBase + K];
-        end;
+        Move(A.FData[SrcBase], FData[SelfBase], A.FDepth * csNeuralFloatSize);
       end;
     end;
   end;
@@ -5915,10 +5911,7 @@ begin
       begin
         SelfBase := GetRawPos(I, J, 0);
         SrcBase := B.GetRawPos(I, J, 0);
-        for K := 0 to BDepthM1 do
-        begin
-          FData[SelfBase + A.FDepth+K] := B.FData[SrcBase + K];
-        end;
+        Move(B.FData[SrcBase], FData[SelfBase + A.FDepth], B.FDepth * csNeuralFloatSize);
       end;
     end;
   end;
@@ -8690,14 +8683,7 @@ begin
             Inc(I);
           end;
           if TotalSum > 0 then
-          begin
-            I := StartPointPos;
-            for CountD := 0 to ChannelsPerGroupM1 do
-            begin
-              FData[I] := FData[I] / TotalSum;
-              Inc(I);
-            end;
-          end;
+            TNNetVolume.Mul(Addr(FData[StartPointPos]), 1.0 / TotalSum, ChannelsPerGroupM1 + 1);
         end;
       end;
     end;
@@ -9034,6 +9020,7 @@ var
   CntX, CntY, CntDepth: integer;
   EmbeddingSize: integer;
   RawPos, RowStride: integer;
+  IsEvenDepth: boolean;
 begin
   EmbeddingSize := FDepth;
   MaxX := FSizeX - 1;
@@ -9043,13 +9030,14 @@ begin
   for CntDepth := 0 to MaxDepth do
   begin
     divTerm := pcr_powf(n, (2 * (CntDepth div 2)) / EmbeddingSize);
+    IsEvenDepth := (CntDepth mod 2 = 0);
     for CntX := 0 to MaxX do
     begin
       RawPos := GetRawPos(CntX, 0, CntDepth);
       for CntY := 0 to MaxY do
       begin
         Position := CntY*FSizeX + CntX + PositionOffset;
-        if CntDepth mod 2 = 0
+        if IsEvenDepth
           then FData[RawPos] := pcr_sinf(Position / divTerm)
           else FData[RawPos] := pcr_cosf(Position / divTerm);
         Inc(RawPos, RowStride);
@@ -9618,19 +9606,19 @@ begin
 
   for CountX := 0 to MaxX do
   begin
+    MinIX := Max(CountX + iFrom,0);
+    MaxIX := Min(CountX + iTo, MaxX);
     for CountY := 0 to MaxY do
     begin
       iBase := GetRawPos(CountX, CountY, 0);
+      MinIY := Max(CountY + iFrom,0);
+      MaxIY := Min(CountY + iTo, MaxY);
       for CountD := 0 to MaxD do
       begin
-        MinIX := Max(CountX + iFrom,0);
-        MaxIX := Min(CountX + iTo, MaxX);
         iRawPos := iBase + CountD;
 
         for CountIX := MinIX to MaxIX do
         begin
-          MinIY := Max(CountY + iFrom,0);
-          MaxIY := Min(CountY + iTo, MaxY);
           for CountIY := MinIY to MaxIY do
           begin
             {$IFDEF FPC}
