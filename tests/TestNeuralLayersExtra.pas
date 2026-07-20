@@ -156,6 +156,11 @@ type
 
     // Qwen3.5 attention output gate wiring proof: slice | sigmoid | cell-mul
     procedure TestQwen35AttnOutputGateWiring;
+
+    // Head-tiled RMSNorm: one full-width layer vs the per-head
+    // SplitChannels -> TokenRMSNorm -> DeepConcat wiring it replaces
+    procedure TestHeadRMSNormForwardParity;
+    procedure TestHeadRMSNormBackwardParity;
   end;
 
 implementation
@@ -7327,6 +7332,151 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestHeadRMSNormForwardParity;
+const
+  SeqLen = 6; Heads = 4; HeadDim = 8; D = Heads * HeadDim; Eps = 1e-6;
+var
+  Tiled, PerHead: TNNet;
+  Input: TNNetVolume;
+  Gain: array[0..HeadDim - 1] of TNeuralFloat;
+  Src, Slice: TNNetLayer;
+  NormLayers: array[0..Heads - 1] of TNNetLayer;
+  h, i, t, c, HeadBase: integer;
+  MeanSqr, InvRMS, Expected: TNeuralFloat;
+begin
+  RandSeed := 20260719;
+  Tiled := TNNet.Create();
+  PerHead := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, D);
+  try
+    for i := 0 to HeadDim - 1 do Gain[i] := 0.5 + 0.1 * i;
+
+    Tiled.AddLayer(TNNetInput.Create(SeqLen, 1, D, 1));
+    Tiled.AddLayer(TNNetHeadRMSNorm.Create(HeadDim, Eps));
+    for i := 0 to HeadDim - 1 do
+      Tiled.GetLastLayer().Neurons[0].Weights.FData[i] := Gain[i];
+
+    // Reference: the exact per-head wiring the tiled layer replaces.
+    Src := PerHead.AddLayer(TNNetInput.Create(SeqLen, 1, D, 1));
+    for h := 0 to Heads - 1 do
+    begin
+      Slice := PerHead.AddLayerAfter(
+        TNNetSplitChannels.Create(h * HeadDim, HeadDim), Src);
+      NormLayers[h] := PerHead.AddLayerAfter(
+        TNNetTokenRMSNorm.Create(Eps), Slice);
+      for i := 0 to HeadDim - 1 do
+        NormLayers[h].Neurons[0].Weights.FData[i] := Gain[i];
+    end;
+    PerHead.AddLayer(TNNetDeepConcat.Create(
+      [NormLayers[0], NormLayers[1], NormLayers[2], NormLayers[3]]));
+
+    Input.Randomize();
+    Input.Sub(0.5);
+    Tiled.Compute(Input);
+    PerHead.Compute(Input);
+
+    AssertEquals('tiled output size',
+      SeqLen * D, Tiled.GetLastLayer().Output.Size);
+    for i := 0 to SeqLen * D - 1 do
+      AssertEquals('tiled vs per-head wiring at flat index ' + IntToStr(i),
+        PerHead.GetLastLayer().Output.FData[i],
+        Tiled.GetLastLayer().Output.FData[i], 1e-6);
+
+    // Independent math check against a scalar reference.
+    for t := 0 to SeqLen - 1 do
+      for h := 0 to Heads - 1 do
+      begin
+        HeadBase := t * D + h * HeadDim;
+        MeanSqr := 0;
+        for c := 0 to HeadDim - 1 do
+          MeanSqr := MeanSqr + Sqr(Input.FData[HeadBase + c]);
+        MeanSqr := MeanSqr / HeadDim;
+        InvRMS := 1 / Sqrt(MeanSqr + Eps);
+        for c := 0 to HeadDim - 1 do
+        begin
+          Expected := Input.FData[HeadBase + c] * InvRMS * Gain[c];
+          AssertEquals('scalar reference at token ' + IntToStr(t) +
+            ' head ' + IntToStr(h) + ' channel ' + IntToStr(c),
+            Expected, Tiled.GetLastLayer().Output.FData[HeadBase + c], 1e-4);
+        end;
+      end;
+  finally
+    Input.Free;
+    PerHead.Free;
+    Tiled.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestHeadRMSNormBackwardParity;
+const
+  SeqLen = 5; Heads = 3; HeadDim = 4; D = Heads * HeadDim; Eps = 1e-6;
+var
+  Tiled, PerHead: TNNet;
+  Input, Tgt: TNNetVolume;
+  Src, Slice: TNNetLayer;
+  NormLayers: array[0..Heads - 1] of TNNetLayer;
+  h, i: integer;
+  SummedDelta: TNeuralFloat;
+begin
+  RandSeed := 715517;
+  Tiled := TNNet.Create();
+  PerHead := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, D);
+  Tgt := TNNetVolume.Create(SeqLen, 1, D);
+  try
+    Tiled.AddLayer(TNNetInput.Create(SeqLen, 1, D, 1));
+    Tiled.AddLayer(TNNetHeadRMSNorm.Create(HeadDim, Eps));
+    Src := PerHead.AddLayer(TNNetInput.Create(SeqLen, 1, D, 1));
+    for h := 0 to Heads - 1 do
+    begin
+      Slice := PerHead.AddLayerAfter(
+        TNNetSplitChannels.Create(h * HeadDim, HeadDim), Src);
+      NormLayers[h] := PerHead.AddLayerAfter(
+        TNNetTokenRMSNorm.Create(Eps), Slice);
+    end;
+    PerHead.AddLayer(TNNetDeepConcat.Create(
+      [NormLayers[0], NormLayers[1], NormLayers[2]]));
+
+    Tiled.SetLearningRate(1.0, 0.0);
+    PerHead.SetLearningRate(1.0, 0.0);
+    Tiled.SetBatchUpdate(True);
+    PerHead.SetBatchUpdate(True);
+    Tiled.ClearDeltas();
+    PerHead.ClearDeltas();
+
+    Input.Randomize();
+    Input.Sub(0.5);
+    Tgt.Randomize();
+    Tgt.Sub(0.5);
+    Tiled.Compute(Input);
+    PerHead.Compute(Input);
+    Tiled.Backpropagate(Tgt);
+    PerHead.Backpropagate(Tgt);
+
+    // Shared-gain gradient: the tiled delta must equal the SUM of the
+    // per-head deltas (each per-head layer only saw its own head's tokens).
+    for i := 0 to HeadDim - 1 do
+    begin
+      SummedDelta := 0;
+      for h := 0 to Heads - 1 do
+        SummedDelta := SummedDelta + NormLayers[h].Neurons[0].Delta.FData[i];
+      AssertEquals('gain delta (sum over heads) at channel ' + IntToStr(i),
+        SummedDelta, Tiled.Layers[1].Neurons[0].Delta.FData[i], 1e-5);
+    end;
+
+    // The error handed back to the input must match the per-head wiring.
+    for i := 0 to SeqLen * D - 1 do
+      AssertEquals('input error at flat index ' + IntToStr(i),
+        PerHead.Layers[0].OutputError.FData[i],
+        Tiled.Layers[0].OutputError.FData[i], 1e-5);
+  finally
+    Tgt.Free;
+    Input.Free;
+    PerHead.Free;
+    Tiled.Free;
   end;
 end;
 

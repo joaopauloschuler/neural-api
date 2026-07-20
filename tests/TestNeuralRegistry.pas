@@ -533,6 +533,9 @@ begin
     // GatedDeltaNet expects input depth 2*Hk*Dk + 2*Hv*Dv + 2*Hv ([q|k|v|z|b|a]).
     // With (Hk=2, Hv=4, Dk=4, Dv=4): 2*8 + 2*16 + 8 = 56.
     377: begin ANet.AddLayer(TNNetInput.Create(8, 1, 56, 1)); Exit(L('TNNetGatedDeltaNet', TNNetGatedDeltaNet.Create(2, 4, 4, 4))); end;
+
+    // Head-tiled RMSNorm (depth 16 = 4 heads x head_dim 4).
+    378: begin AddSeqInput(ANet); Exit(L('TNNetHeadRMSNorm', TNNetHeadRMSNorm.Create(4, 1e-6))); end;
     else
       Result := False;
   end;

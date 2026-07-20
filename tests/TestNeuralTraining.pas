@@ -862,6 +862,11 @@ begin
   // delta rows, undo the scale, and assert the Gram matrix O O^T (Rows<=Cols
   // here) is close to the identity: diagonal ~1, off-diagonals small. This is
   // the orthogonality guarantee of the Newton-Schulz orthogonalizer.
+  // Pinned seed: the layer's weight init draws from the global RNG, and with
+  // an unlucky inherited RandSeed the accumulated gradient loses rank and the
+  // Gram diagonal drifts off 1 - the test's pass/fail must not depend on
+  // which tests ran before it.
+  RandSeed := 20260719;
   NN := TNNet.Create();
   Input := TNNetVolume.Create(8, 1, 1);
   Desired := TNNetVolume.Create(4, 1, 1);
