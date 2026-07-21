@@ -1521,7 +1521,8 @@ procedure TNNetSequencePacker.GetTrainingPair(WindowIdx: integer;
   pInput, pTarget: TNNetVolume);
 var
   Pos, Token: integer;
-  ContextM1, ContextM2: integer;
+  ContextM1, ContextM2, InputDepth: integer;
+  IsIdInput: boolean;
 begin
   RequirePacked();
   if pInput.SizeX <> FContextLen then
@@ -1533,12 +1534,14 @@ begin
   pInput.Fill(0);
   ContextM1 := FContextLen - 1;
   ContextM2 := FContextLen - 2;
+  InputDepth := pInput.Depth;
+  IsIdInput := (InputDepth = 1);
   for Pos := 0 to ContextM1 do
   begin
     Token := FWindows[WindowIdx][Pos];
-    if pInput.Depth = 1
-    then pInput[Pos, 0, 0] := Token              // token ids -> embedding
-    else if Token < pInput.Depth
+    if IsIdInput
+    then pInput.FData[Pos] := Token              // token ids -> embedding
+    else if Token < InputDepth
     then pInput[Pos, 0, Token] := 1;             // one-hot across depth
   end;
   pTarget.Fill(0);
@@ -1555,20 +1558,20 @@ end;
 procedure TNNetSequencePacker.ApplyLossMask(WindowIdx: integer;
   Desired, Actual: TNNetVolume);
 var
-  Pos, D: integer;
-  ContextM1, DepthM1, DesBase, ActBase: integer;
+  Pos: integer;
+  ContextM1, DepthM1, DesBase, ActBase, CopyBytes: integer;
 begin
   RequirePacked();
   ContextM1 := FContextLen - 1;
   DepthM1 := Desired.Depth - 1;
+  CopyBytes := (DepthM1 + 1) * csNeuralFloatSize;
   for Pos := 0 to ContextM1 do
   begin
     if not IsTargetPredictable(WindowIdx, Pos) then
     begin
       DesBase := Desired.GetRawPos(Pos, 0, 0);
       ActBase := Actual.GetRawPos(Pos, 0, 0);
-      for D := 0 to DepthM1 do
-        Desired.FData[DesBase + D] := Actual.FData[ActBase + D];
+      Move(Actual.FData[ActBase], Desired.FData[DesBase], CopyBytes);
     end;
   end;
 end;
@@ -1747,6 +1750,7 @@ procedure TNNetMaskedLMCollator.BuildTrainingPair(
 var
   Len, P: integer;
   LenM1: integer;
+  IsIdInput: boolean;
 begin
   Len := Length(CorruptedIds);
   if Length(Labels) <> Len then
@@ -1764,10 +1768,11 @@ begin
   pInput.Fill(0);
   pTarget.Fill(0);
   LenM1 := Len - 1;
+  IsIdInput := (pInput.Depth = 1);
   for P := 0 to LenM1 do
   begin
-    if pInput.Depth = 1 then
-      pInput[P, 0, 0] := CorruptedIds[P]            // token ids on the X axis
+    if IsIdInput then
+      pInput.FData[P] := CorruptedIds[P]            // token ids on the X axis
     else
       pInput[P, 0, CorruptedIds[P]] := 1;           // one-hot on the depth axis
     // Target: one-hot of the ORIGINAL id only at selected positions; ignored
@@ -1780,18 +1785,18 @@ end;
 procedure TNNetMaskedLMCollator.ApplyLossMask(const Labels: TNeuralIntegerArray;
   Desired, Actual: TNNetVolume);
 var
-  P, D: integer;
-  LabelsM1, DepthM1, DesBase, ActBase: integer;
+  P: integer;
+  LabelsM1, DepthM1, DesBase, ActBase, CopyBytes: integer;
 begin
   LabelsM1 := Length(Labels) - 1;
   DepthM1 := Desired.Depth - 1;
+  CopyBytes := (DepthM1 + 1) * csNeuralFloatSize;
   for P := 0 to LabelsM1 do
     if Labels[P] = csMaskedLMIgnoreLabel then
     begin
       DesBase := Desired.GetRawPos(P, 0, 0);
       ActBase := Actual.GetRawPos(P, 0, 0);
-      for D := 0 to DepthM1 do
-        Desired.FData[DesBase + D] := Actual.FData[ActBase + D];
+      Move(Actual.FData[ActBase], Desired.FData[DesBase], CopyBytes);
     end;
 end;
 
@@ -1968,6 +1973,7 @@ procedure TNNetSpanCorruptionCollator.BuildTrainingPair(
 var
   P: integer;
   SrcM1, TgtM1: integer;
+  IsSrcIdInput, IsTgtIdInput: boolean;
 begin
   if pSource.SizeX < Length(SourceIds) then
     raise Exception.Create(
@@ -1983,14 +1989,16 @@ begin
   pTarget.Fill(0);
   SrcM1 := Length(SourceIds) - 1;
   TgtM1 := Length(TargetIds) - 1;
+  IsSrcIdInput := (pSource.Depth = 1);
+  IsTgtIdInput := (pTarget.Depth = 1);
   for P := 0 to SrcM1 do
-    if pSource.Depth = 1 then
-      pSource[P, 0, 0] := SourceIds[P]
+    if IsSrcIdInput then
+      pSource.FData[P] := SourceIds[P]
     else
       pSource[P, 0, SourceIds[P]] := 1;
   for P := 0 to TgtM1 do
-    if pTarget.Depth = 1 then
-      pTarget[P, 0, 0] := TargetIds[P]
+    if IsTgtIdInput then
+      pTarget.FData[P] := TargetIds[P]
     else
       pTarget[P, 0, TargetIds[P]] := 1;
 end;
@@ -2224,6 +2232,7 @@ var
   Sample: TNeuralIntegerArray;
   SeqLen, Len, Pos, Token: integer;
   SeqM1, LenM2: integer;
+  IsIdInput: boolean;
 begin
   RequireBuilt();
   SeqLen := BatchSeqLen(BatchIdx);
@@ -2241,11 +2250,12 @@ begin
   pInput.Fill(0);
   SeqM1 := SeqLen - 1;
   LenM2 := Len - 2;
+  IsIdInput := (pInput.Depth = 1);
   for Pos := 0 to SeqM1 do
   begin
     if Pos < Len then Token := Sample[Pos] else Token := FPadToken;
-    if pInput.Depth = 1
-    then pInput[Pos, 0, 0] := Token
+    if IsIdInput
+    then pInput.FData[Pos] := Token
     else if (Token >= 0) and (Token < pInput.Depth)
     then pInput[Pos, 0, Token] := 1;
   end;
@@ -2262,14 +2272,15 @@ end;
 procedure TNNetLengthGroupedBatcher.ApplyLossMask(BatchIdx, WithinIdx: integer;
   Desired, Actual: TNNetVolume);
 var
-  SeqLen, Len, Pos, D: integer;
-  SeqM1, DepthM1, DesBase, ActBase: integer;
+  SeqLen, Len, Pos: integer;
+  SeqM1, DepthM1, DesBase, ActBase, CopyBytes: integer;
 begin
   RequireBuilt();
   SeqLen := BatchSeqLen(BatchIdx);
   Len := SampleLenOf(BatchIdx, WithinIdx);
   SeqM1 := SeqLen - 1;
   DepthM1 := Desired.Depth - 1;
+  CopyBytes := (DepthM1 + 1) * csNeuralFloatSize;
   for Pos := 0 to SeqM1 do
   begin
     // Predictable iff a next real token exists: Pos in 0..Len-2.
@@ -2277,8 +2288,7 @@ begin
     begin
       DesBase := Desired.GetRawPos(Pos, 0, 0);
       ActBase := Actual.GetRawPos(Pos, 0, 0);
-      for D := 0 to DepthM1 do
-        Desired.FData[DesBase + D] := Actual.FData[ActBase + D];
+      Move(Actual.FData[ActBase], Desired.FData[DesBase], CopyBytes);
     end;
   end;
 end;
@@ -3888,6 +3898,8 @@ var
   I, ImgIdx: integer;
   hit, miss: integer;
   pOutput, vOutput: TNNetVolume;
+  LocalImg: TNNetVolume;
+  LocalTag: integer;
   bIsSoftmax: boolean;
   CurrentLoss : TNeuralFloat;
   OutputValue: TNeuralFloat;
@@ -3928,13 +3940,16 @@ begin
       ImgIdx := Random(ImgVolumes.Count);
     end;
 
-    NN.Compute(ImgVolumes[ImgIdx]);
+    LocalImg := ImgVolumes[ImgIdx];
+
+    NN.Compute(LocalImg);
     NN.GetOutput(pOutput);
 
-    ImgVolumes[ImgIdx].FlipX();
+    LocalImg.FlipX();
     NN.AddOutput(pOutput);
 
-    if pOutput.GetClass() = ImgVolumes[ImgIdx].Tag then
+    LocalTag := LocalImg.Tag;
+    if pOutput.GetClass() = LocalTag then
     begin
       Inc(Hit);
     end
@@ -3945,18 +3960,18 @@ begin
 
     if (bIsSoftmax) then
     begin
-      vOutput.SetClassForSoftMax( ImgVolumes[ImgIdx].Tag );
+      vOutput.SetClassForSoftMax( LocalTag );
     end
     else
     begin
-      vOutput.SetClassForReLU( ImgVolumes[ImgIdx].Tag );
+      vOutput.SetClassForReLU( LocalTag );
     end;
 
     ErrorSum := ErrorSum + vOutput.SumDiff(pOutput);
 
     if (bIsSoftmax) then
     begin
-      OutputValue := pOutput.FData[ ImgVolumes[ImgIdx].Tag ];
+      OutputValue := pOutput.FData[ LocalTag ];
       if (OutputValue > 0) then
       begin
         CurrentLoss := -pcr_logf(OutputValue);
