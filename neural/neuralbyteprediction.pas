@@ -552,7 +552,7 @@ begin
 
   Best := 0;
   Result := 0;
-  for i := 0 to 9 do
+  for i := 0 to Hi do
   begin
     //Write(' ',PossibleStates[I]:6:4 );
     if ( PossibleStates[I] > Best ) then

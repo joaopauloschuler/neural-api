@@ -145,7 +145,7 @@ begin
 
   Vol.ReSize(MaxX + 1, MaxY + 1, 3);
 
-  for CountX := 0 to MaxY do
+  for CountX := 0 to MaxX do
   begin
     for CountY := 0 to MaxY do
     begin
