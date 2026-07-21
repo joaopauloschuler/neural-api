@@ -1381,6 +1381,38 @@ need a **scalar or an integer offset** — a plain local — and allocate nothin
 **If the only way you can see to apply an optimization is to allocate, the
 correct action is to NOT apply it.**
 
+## 18 TNNetVolume methods are faster than pure pascal equivalents
+The below TNNetVolume methods are faster than equivalent pure pascal implementations
+```pascal
+      procedure Fill(c: Single = 0); {$IFDEF Release} inline; {$ENDIF}
+      procedure Add(Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
+      class procedure Add(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer); overload; {$IFDEF Release} inline; {$ENDIF}
+      procedure Sub(Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
+      function DotProduct(Original: TNNetVolume): TNeuralFloat; overload; {$IFDEF Release} inline; {$ENDIF}
+      class function DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; overload; {$IFDEF Release} inline; {$ENDIF}
+      procedure Mul(Value: Single); overload; {$IFDEF Release} inline; {$ENDIF}
+      class procedure Mul(PtrA: TNeuralFloatArrPtr; MulOp: TNeuralFloat; pSize: integer); overload;
+      class procedure Mul(PtrA, PtrB: TNeuralFloatArrPtr; pSize: integer); overload; {$IFDEF Release} inline; {$ENDIF}
+      class procedure MaxElements(PtrA, PtrB: TNeuralFloatArrPtr; pSize: integer); overload; {$IFDEF Release} inline; {$ENDIF}
+      procedure MulAdd(Value: TNeuralFloat; Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
+      procedure MulAdd(Original1, Original2: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
+      procedure MulMulAdd(Value1, Value2: TNeuralFloat; Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
+      procedure MulAdd(Value: TNeuralFloat; PtrB: TNeuralFloatArrPtr); overload; {$IFDEF Release} inline; {$ENDIF}
+      class procedure MulAdd(PtrA, PtrB: TNeuralFloatArrPtr; Value: TNeuralFloat; pSize: integer); overload; {$IFDEF Release} inline; {$ENDIF}
+      class procedure MulAdd(PtrA, PtrB, PtrC: TNeuralFloatArrPtr; pSize: integer); overload; {$IFDEF Release} inline; {$ENDIF}
+      procedure Divi(Value: Single); overload; {$IFDEF Release} inline; {$ENDIF}
+      procedure Copy(Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
+      procedure CopyRelu(Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
+      procedure CopyPadding(Original: TNNetVolume; Padding: integer); overload;
+      procedure CopyPadding(Original: TNNetVolume; PaddingX, PaddingY: integer); {$IFDEF Release} inline; {$ENDIF} overload;
+      procedure CopyNoChecks(Original: TNNetVolume);
+      function GetSum(): TNeuralFloat; override;
+      function GetSumSqr(): TNeuralFloat; override;
+      function GetDistanceSqr(Original: TNNetVolume): TNeuralFloat;  overload; {$IFDEF Release} inline; {$ENDIF}
+      function GetDistance(Original: TNNetVolume): TNeuralFloat;  overload; {$IFDEF Release} inline; {$ENDIF}
+      function SumDiff(Original: TNNetVolume): TNeuralFloat; overload; {$IFDEF Release} inline; {$ENDIF}
+```
+
 ## Appendix: the patterns agents miss most — extra worked examples
 
 These reinforce rules already stated; they are collected here because review keeps
