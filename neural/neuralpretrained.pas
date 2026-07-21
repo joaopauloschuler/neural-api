@@ -40660,7 +40660,7 @@ end;
 // --- ELU activation (alpha = 1), elementwise. ---
 function EnCodecELU(X: TNeuralFloat): TNeuralFloat;
 begin
-  if X > 0 then Result := X else Result := Exp(X) - 1;
+  if X > 0 then Result := X else Result := NeuralExp(X) - 1;
 end;
 
 // Loads one weight-norm Conv1d (or ConvTranspose1d) stage from Reader,
@@ -41077,30 +41077,43 @@ type
 
 procedure TConvPatchGatherer.GatherEnCodec(t: integer; Dst: TNeuralFloatArrPtr);
 var i, k2: integer;
-    InChM1, KM1: integer;
+    InChM1, KM1, tS, iK: integer;
+    SrcRow: TNeuralFloatDynArr;
 begin
   InChM1 := InCh - 1;
   KM1 := K - 1;
+  tS := t * Stride;
   for i := 0 to InChM1 do
+  begin
+    iK := i * K;
+    SrcRow := Src[i];
     for k2 := 0 to KM1 do
-      Dst^[i * K + k2] := Src[i][t * Stride + k2 * Dil];
+      Dst^[iK + k2] := SrcRow[tS + k2 * Dil];
+  end;
 end;
 
 procedure TConvPatchGatherer.GatherHiFiGAN(t: integer; Dst: TNeuralFloatArrPtr);
 var i, k2, sp: integer;
-    InChM1, KM1: integer;
+    InChM1, KM1, tSP, iK, dstIdx: integer;
+    SrcRow: TNeuralFloatDynArr;
 begin
   InChM1 := InCh - 1;
   KM1 := K - 1;
+  tSP := t * Stride - Pad;
   for i := 0 to InChM1 do
+  begin
+    iK := i * K;
+    SrcRow := Src[i];
     for k2 := 0 to KM1 do
     begin
-      sp := t * Stride + k2 * Dil - Pad;
+      sp := tSP + k2 * Dil;
+      dstIdx := iK + k2;
       if (sp >= 0) and (sp < InLen) then
-        Dst^[i * K + k2] := Src[i][sp]
+        Dst^[dstIdx] := SrcRow[sp]
       else
-        Dst^[i * K + k2] := 0;
+        Dst^[dstIdx] := 0;
     end;
+  end;
 end;
 
 type
@@ -42562,6 +42575,7 @@ procedure TNNetMimi.RunTransformer(
   const Layers: array of TMimiTransformerLayer; var Sig: TMimiDblArr2D);
 var
   D, T, NH, NKV, Dh, FFN, L, h, t1, t2, dd, gidx, kvh, NRep, half: integer;
+  NHDh, hDh, kvhDh: integer;
   TM1, DM1, halfM1, DhM1, NHM1, NKVM1, FFNM1, NHDhM1, NKVDhM1, LayersM1: integer;
   Theta, Scaling, eps, m, v, e, denom, sc, mx, qr, kr: double;
   X, Hn, Q, Kk, Vv, Attn, Mlp1: array of array of double; // [T][feature]
@@ -42587,7 +42601,8 @@ begin
   NHM1 := NH - 1;
   NKVM1 := NKV - 1;
   FFNM1 := FFN - 1;
-  NHDhM1 := NH * Dh - 1;
+  NHDh := NH * Dh;
+  NHDhM1 := NHDh - 1;
   NKVDhM1 := NKV * Dh - 1;
   LayersM1 := Length(Layers) - 1;
   // X[t][d] row-major copy of the signal.
@@ -42687,6 +42702,8 @@ begin
     for h := 0 to NHM1 do
     begin
       kvh := h div NRep;
+      hDh := h * Dh;
+      kvhDh := kvh * Dh;
       for t1 := 0 to TM1 do
       begin
         // scores over keys 0..t1 (causal); sliding window optional.
@@ -42697,7 +42714,7 @@ begin
             Continue;
           sc := 0;
           for dd := 0 to DhM1 do
-            sc := sc + Q[t1][h * Dh + dd] * Kk[t2][kvh * Dh + dd];
+            sc := sc + Q[t1][hDh + dd] * Kk[t2][kvhDh + dd];
           sc := sc * Scaling;
           if sc > mx then mx := sc;
         end;
@@ -42709,15 +42726,15 @@ begin
             Continue;
           sc := 0;
           for dd := 0 to DhM1 do
-            sc := sc + Q[t1][h * Dh + dd] * Kk[t2][kvh * Dh + dd];
+            sc := sc + Q[t1][hDh + dd] * Kk[t2][kvhDh + dd];
           sc := sc * Scaling;
           e := Exp(sc - mx);
           denom := denom + e;
           for dd := 0 to DhM1 do
-            AccVec[dd] := AccVec[dd] + e * Vv[t2][kvh * Dh + dd];
+            AccVec[dd] := AccVec[dd] + e * Vv[t2][kvhDh + dd];
         end;
         for dd := 0 to DhM1 do
-          Attn[t1][h * Dh + dd] := AccVec[dd] / denom;
+          Attn[t1][hDh + dd] := AccVec[dd] / denom;
       end;
     end;
     // ---- output projection + LayerScale residual ----
@@ -42727,7 +42744,7 @@ begin
       begin
         sc := 0;
         for gidx := 0 to NHDhM1 do
-          sc := sc + Layers[L].Wo.Data[dd * (NH * Dh) + gidx] * Attn[t1][gidx];
+          sc := sc + Layers[L].Wo.Data[dd * NHDh + gidx] * Attn[t1][gidx];
         if Length(Layers[L].Bo) > 0 then sc := sc + Layers[L].Bo[dd];
         X[t1][dd] := X[t1][dd] + Layers[L].AttnScale[dd] * sc;
       end;
@@ -44347,9 +44364,11 @@ var
   InCh, OutCh, K, Stride, Dil, Pad, InLen, o, i, t, k2, src: integer;
   OutLen, FullLen, idx, val: integer;
   InChM1, OutChM1, KM1, InLenM1, OutLenM1: integer;
+  PatchLen, tSP, iK, wBase, oKInCh, tS, tInCh, wOfs: integer;
   Acc: TNeuralFloat;
   Patch: TNeuralFloatDynArr;
   InT, WT: TNeuralFloatDynArr;
+  InRow, OutRow: TNeuralFloatDynArr;
   {$IFDEF OpenCL}
   Gatherer: TConvPatchGatherer;
   InSigRef: TNNetFloatDynArr2D;
@@ -44403,21 +44422,31 @@ begin
     // (InCh*K >= csMinAvxSize on the wide synthesis stages). The SIMD
     // reassociation matches the EnCodec/LSTM AVX changes (parity < 1e-4, not
     // bit-identical to the prior k2-major scalar order). Coded by Claude (AI).
-    SetLength(Patch, InCh * K);
+    PatchLen := InCh * K;
+    SetLength(Patch, PatchLen);
     for t := 0 to OutLenM1 do
     begin
+      tSP := t * Stride - Pad;
       for i := 0 to InChM1 do
+      begin
+        iK := i * K;
+        InRow := InSig[i];
         for k2 := 0 to KM1 do
         begin
-          src := t * Stride + k2 * Dil - Pad; // implicit zero pad
+          src := tSP + k2 * Dil; // implicit zero pad
           if (src >= 0) and (src < InLen) then
-            Patch[i * K + k2] := InSig[i][src]
+            Patch[iK + k2] := InRow[src]
           else
-            Patch[i * K + k2] := 0;
+            Patch[iK + k2] := 0;
         end;
+      end;
+      wBase := 0;
       for o := 0 to OutChM1 do
+      begin
         OutSig[o][t] := Conv.B[o] +
-          TNNetVolume.DotProduct(Addr(Conv.W[o * InCh * K]), Addr(Patch[0]), InCh * K);
+          TNNetVolume.DotProduct(Addr(Conv.W[wBase]), Addr(Patch[0]), PatchLen);
+        Inc(wBase, PatchLen);
+      end;
     end;
   end
   else
@@ -44473,16 +44502,26 @@ begin
     end;
     {$ENDIF}
     for o := 0 to OutChM1 do
+    begin
+      OutRow := OutSig[o];
+      oKInCh := o * K * InCh;
       for t := 0 to InLenM1 do
+      begin
+        tS := t * Stride;
+        tInCh := t * InCh;
+        wOfs := oKInCh;
         for k2 := 0 to KM1 do
         begin
-          idx := t * Stride + k2;       // index into the FullLen buffer
+          idx := tS + k2;               // index into the FullLen buffer
           val := idx - Pad;             // index into the trimmed output
           if (val >= 0) and (val < OutLen) then
-            OutSig[o][val] := OutSig[o][val] +
+            OutRow[val] := OutRow[val] +
               TNNetVolume.DotProduct(
-                Addr(WT[(o * K + k2) * InCh]), Addr(InT[t * InCh]), InCh);
+                Addr(WT[wOfs]), Addr(InT[tInCh]), InCh);
+          Inc(wOfs, InCh);
         end;
+      end;
+    end;
   end;
 end;
 
@@ -44551,7 +44590,8 @@ begin
       begin
         SetLength(ResOne[c], Length(Sig[c]));
         SigTLen := Length(Sig[c]) - 1;
-        for t := 0 to SigTLen do ResOne[c][t] := Sig[c][t];
+        if SigTLen >= 0 then
+          Move(Sig[c][0], ResOne[c][0], (SigTLen + 1) * csNeuralFloatSize);
       end;
       LenResOne := Length(ResOne) - 1;
       if FConfig.ResblockType = 2 then
@@ -44574,8 +44614,8 @@ begin
           for c := 0 to LenResOne do
           begin
             ResOneTLen := Length(ResOne[c]) - 1;
-            for t := 0 to ResOneTLen do
-              ResOne[c][t] := ResOne[c][t] + Tmp2[c][t];
+            if ResOneTLen >= 0 then
+              TNNetVolume.Add(Addr(ResOne[c][0]), Addr(Tmp2[c][0]), ResOneTLen + 1);
           end;
           if dil = 0 then ; // (silence "unused" hint when no dilations)
         end;
@@ -44602,8 +44642,8 @@ begin
         for c := 0 to LenResOne do
         begin
           ResOneTLen := Length(ResOne[c]) - 1;
-          for t := 0 to ResOneTLen do
-            ResOne[c][t] := ResOne[c][t] + Tmp1[c][t];
+          if ResOneTLen >= 0 then
+            TNNetVolume.Add(Addr(ResOne[c][0]), Addr(Tmp1[c][0]), ResOneTLen + 1);
         end;
         if dil = 0 then ; // (silence "unused" hint when no dilations)
       end;
@@ -44616,15 +44656,16 @@ begin
         begin
           SetLength(ResSum[c], Length(ResOne[c]));
           ResOneTLen := Length(ResOne[c]) - 1;
-          for t := 0 to ResOneTLen do ResSum[c][t] := ResOne[c][t];
+          if ResOneTLen >= 0 then
+            Move(ResOne[c][0], ResSum[c][0], (ResOneTLen + 1) * csNeuralFloatSize);
         end;
       end
       else
         for c := 0 to LenResOne do
         begin
           ResOneTLen := Length(ResOne[c]) - 1;
-          for t := 0 to ResOneTLen do
-            ResSum[c][t] := ResSum[c][t] + ResOne[c][t];
+          if ResOneTLen >= 0 then
+            TNNetVolume.Add(Addr(ResSum[c][0]), Addr(ResOne[c][0]), ResOneTLen + 1);
         end;
     end;
     InvK := 1.0 / NumKernels;
@@ -44632,8 +44673,8 @@ begin
     for c := 0 to LenResSum do
     begin
       ResSumTLen := Length(ResSum[c]) - 1;
-      for t := 0 to ResSumTLen do
-        ResSum[c][t] := ResSum[c][t] * InvK;
+      if ResSumTLen >= 0 then
+        TNNetVolume.Mul(Addr(ResSum[c][0]), InvK, ResSumTLen + 1);
     end;
     Sig := ResSum;
   end;
@@ -44910,6 +44951,7 @@ var
   Half, c, t: integer;
   HalfM1: integer;
   InSigTLen: integer;
+  InRow, GateRow, OutRow: TNeuralFloatDynArr;
 begin
   Half := Length(InSig) div 2;
   SetLength(OutSig, Half);
@@ -44918,9 +44960,11 @@ begin
   begin
     SetLength(OutSig[c], Length(InSig[c]));
     InSigTLen := Length(InSig[c]) - 1;
+    InRow := InSig[c];
+    GateRow := InSig[Half + c];
+    OutRow := OutSig[c];
     for t := 0 to InSigTLen do
-      OutSig[c][t] := InSig[c][t] *
-        (1.0 / (1.0 + Exp(-InSig[Half + c][t])));
+      OutRow[t] := InRow[t] * (1.0 / (1.0 + NeuralExp(-GateRow[t])));
   end;
 end;
 
@@ -44998,12 +45042,17 @@ begin
       for j := 0 to HiddenM1 do
         g[k] := g[k] + Whh[baseR + j] * h[j];
     end;
+    // Gate nonlinearities over the contiguous quarter-blocks of g (i,f,g,o).
+    TNNetVolume.VectorSigmoid(Addr(g[0]), Addr(g[0]), Hidden);
+    TNNetVolume.VectorSigmoid(Addr(g[Hidden]), Addr(g[Hidden]), Hidden);
+    TNNetVolume.VectorTanh(Addr(g[2 * Hidden]), Addr(g[2 * Hidden]), Hidden);
+    TNNetVolume.VectorSigmoid(Addr(g[3 * Hidden]), Addr(g[3 * Hidden]), Hidden);
     for k := 0 to HiddenM1 do
     begin
-      gi := 1.0 / (1.0 + Exp(-g[k]));
-      gf := 1.0 / (1.0 + Exp(-g[Hidden + k]));
-      gg := Tanh(g[2 * Hidden + k]);
-      go := 1.0 / (1.0 + Exp(-g[3 * Hidden + k]));
+      gi := g[k];
+      gf := g[Hidden + k];
+      gg := g[2 * Hidden + k];
+      go := g[3 * Hidden + k];
       cstate[k] := gf * cstate[k] + gi * gg;
       h[k] := go * Tanh(cstate[k]);
       Outp[k][t0] := h[k];
@@ -45020,10 +45069,11 @@ var
   i, j, c, t, Tlen, InLen, L, src, ch: integer;
   Fwd, Bwd, Seq, Cat: TNNetFloatDynArr2D;
   Lin: TNNetFloatDynArr2D;
+  SkipBlk: TNNetFloatDynArr2D;
   Acc: TNeuralFloat;
   AudioChM1, InLenM1, LenSig, LSTMLayersM1: integer;
   FLinOutM1, TlenM1, FLinInM1, LM1, SourcesM1: integer;
-  SigTLen, LSTMHiddenM1: integer;
+  SigTLen, LSTMHiddenM1, cBase: integer;
 begin
   InLen := Length(Mix[0]);
   // ---- mixed waveform as channel-major Sig[channel][sample].
@@ -45084,12 +45134,13 @@ begin
   for c := 0 to FLinOutM1 do
   begin
     SetLength(Lin[c], Tlen);
-    for t := 0 to TlenM1 do
+    for t := 0 to TlenM1 do Lin[c][t] := FLinB[c];
+    if TlenM1 >= 0 then
     begin
-      Acc := FLinB[c];
+      cBase := c * FLinIn;
       for j := 0 to FLinInM1 do
-        Acc := Acc + FLinW[c * FLinIn + j] * Seq[j][t];
-      Lin[c][t] := Acc;
+        TNNetVolume.MulAdd(Addr(Lin[c][0]), Addr(Seq[j][0]),
+          FLinW[cBase + j], Tlen);
     end;
   end;
   Sig := Lin;
@@ -45103,9 +45154,10 @@ begin
     DemucsCenterTrim(Skips[FConfig.Depth - 1 - j], L);
     LenSig := Length(Sig) - 1;
     LM1 := L - 1;
-    for c := 0 to LenSig do
-      for t := 0 to LM1 do
-        Sig[c][t] := Sig[c][t] + Skips[FConfig.Depth - 1 - j][c][t];
+    SkipBlk := Skips[FConfig.Depth - 1 - j];
+    if LM1 >= 0 then
+      for c := 0 to LenSig do
+        TNNetVolume.Add(Addr(Sig[c][0]), Addr(SkipBlk[c][0]), L);
     RunHiFiGANConv(FDecConv1[j], Sig, Nxt);   // Conv1d -> 2*in, pad context/2
     DemucsGLU(Nxt, Gout);
     Sig := Gout;
@@ -45316,18 +45368,19 @@ end;
 procedure VitsDense(const W, B: TNeuralFloatDynArr; OutDim, InDim: integer;
   const X: TNeuralFloatDynArr; out Y: TNeuralFloatDynArr);
 var
-  o, i: integer;
-  OutDimM1, InDimM1: integer;
-  Acc: TNeuralFloat;
+  o: integer;
+  OutDimM1, oBase: integer;
 begin
   SetLength(Y, OutDim);
   OutDimM1 := OutDim - 1;
-  InDimM1 := InDim - 1;
+  oBase := 0;
   for o := 0 to OutDimM1 do
   begin
-    Acc := B[o];
-    for i := 0 to InDimM1 do Acc := Acc + W[o * InDim + i] * X[i];
-    Y[o] := Acc;
+    if InDim > 0 then
+      Y[o] := B[o] + TNNetVolume.DotProduct(Addr(W[oBase]), Addr(X[0]), InDim)
+    else
+      Y[o] := B[o];
+    Inc(oBase, InDim);
   end;
 end;
 
@@ -45363,6 +45416,7 @@ function VitsFusedActs(const InActs: TNNetFloatDynArr2D;
 var
   c, tt: integer;
   HM1, TM1: integer;
+  TanhRow, GateRow, ResRow: TNeuralFloatDynArr;
 begin
   SetLength(Result, H);
   HM1 := H - 1;
@@ -45370,9 +45424,12 @@ begin
   for c := 0 to HM1 do
   begin
     SetLength(Result[c], T);
+    TanhRow := InActs[c];
+    GateRow := InActs[H + c];
+    ResRow := Result[c];
     for tt := 0 to TM1 do
-      Result[c][tt] := Tanh(InActs[c][tt]) *
-        (1.0 / (1.0 + Exp(-InActs[H + c][tt])));
+      ResRow[tt] := Tanh(TanhRow[tt]) *
+        (1.0 / (1.0 + NeuralExp(-GateRow[tt])));
   end;
 end;
 
@@ -46115,14 +46172,17 @@ begin
     if L < NumLayers - 1 then
     begin
       // res_acts = ResSkip[0..H-1]; CUR += res_acts; outputs += ResSkip[H..].
-      for c := 0 to HM1 do
-        for t := 0 to TlenM1 do Cur[c][t] := Cur[c][t] + ResSkip[c][t];
-      for c := 0 to HM1 do
-        for t := 0 to TlenM1 do Outp[c][t] := Outp[c][t] + ResSkip[H + c][t];
+      if TlenM1 >= 0 then
+      begin
+        for c := 0 to HM1 do
+          TNNetVolume.Add(Addr(Cur[c][0]), Addr(ResSkip[c][0]), Tlen);
+        for c := 0 to HM1 do
+          TNNetVolume.Add(Addr(Outp[c][0]), Addr(ResSkip[H + c][0]), Tlen);
+      end;
     end
-    else
+    else if TlenM1 >= 0 then
       for c := 0 to HM1 do
-        for t := 0 to TlenM1 do Outp[c][t] := Outp[c][t] + ResSkip[c][t];
+        TNNetVolume.Add(Addr(Outp[c][0]), Addr(ResSkip[c][0]), Tlen);
   end;
 end;
 
@@ -46167,8 +46227,9 @@ procedure VitsDepthwiseConv(const Conv: THiFiGANConv;
   const InSig: TNNetFloatDynArr2D; out OutSig: TNNetFloatDynArr2D);
 var
   Ch, K, Dil, Pad, InLen, c, t, k2, src: integer;
-  ChM1, InLenM1, KM1: integer;
+  ChM1, InLenM1, KM1, wBase: integer;
   Acc: TNeuralFloat;
+  InRow: TNeuralFloatDynArr;
 begin
   Ch := Conv.OutCh;
   K := Conv.Kernel;
@@ -46182,6 +46243,8 @@ begin
   for c := 0 to ChM1 do
   begin
     SetLength(OutSig[c], InLen);
+    wBase := c * K;
+    InRow := InSig[c];
     for t := 0 to InLenM1 do
     begin
       Acc := Conv.B[c];
@@ -46189,7 +46252,7 @@ begin
       begin
         src := t + k2 * Dil - Pad;
         if (src >= 0) and (src < InLen) then
-          Acc := Acc + Conv.W[c * K + k2] * InSig[c][src];
+          Acc := Acc + Conv.W[wBase + k2] * InRow[src];
       end;
       OutSig[c][t] := Acc;
     end;
@@ -46230,8 +46293,9 @@ begin
       for c := 0 to ChM1 do Tmp[c][t] := VitsGELU(Col[c]);
     end;
     // residual: inputs = inputs + hidden_states.
-    for c := 0 to ChM1 do
-      for t := 0 to TlenM1 do Sig[c][t] := Sig[c][t] + Tmp[c][t];
+    if TlenM1 >= 0 then
+      for c := 0 to ChM1 do
+        TNNetVolume.Add(Addr(Sig[c][0]), Addr(Tmp[c][0]), Tlen);
   end;
 end;
 
