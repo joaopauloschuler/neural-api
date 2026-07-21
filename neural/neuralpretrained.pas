@@ -43451,39 +43451,19 @@ begin
     end;
     // For each (out-channel o, tap k2) the contraction over input channels i is
     // contiguous once the weight column W[i*Out*K + o*K + k2] is repacked in i.
-    // That column is t-INVARIANT, so pre-pack every (o,k2) column ONCE into WT
-    // laid out [(o*K + k2)*InCh + i] (as the EnCodec transpose does), instead of
-    // re-gathering it on every t.
     SetLength(Patch, InCh);   // InSig column over channels at time t
-    OCK := OutCh * K;
-    SetLength(WT, OutCh * K * InCh);
-    for o := 0 to OutChM1 do
-    begin
-      oK := o * K;
-      for k2 := 0 to KM1 do
-      begin
-        wOfs := (oK + k2) * InCh;
-        for i := 0 to InChM1 do
-          WT[wOfs + i] := Conv.W[i * OCK + oK + k2];
-      end;
-    end;
+    SetLength(WD, InCh);
     for t := 0 to InLenM1 do
     begin
       for i := 0 to InChM1 do Patch[i] := InSig[i][t];
-      tS := t * Stride;
-      wOfs := 0; // (o*K + k2)*InCh carried across the whole (o,k2) nest
       for o := 0 to OutChM1 do
-      begin
-        FullRow := Full[o];
-        idx := tS; // + k2*Dil, carried by Dil
         for k2 := 0 to KM1 do
         begin
-          FullRow[idx] := FullRow[idx] +
-            MimiDotProductD(@WT[wOfs], @Patch[0], InCh);
-          Inc(wOfs, InCh);
-          Inc(idx, Dil);
+          idx := t * Stride + k2 * Dil;
+          for i := 0 to InChM1 do
+            WD[i] := Conv.W[i * OutCh * K + o * K + k2];
+          Full[o][idx] := Full[o][idx] + MimiDotProductD(@WD[0], @Patch[0], InCh);
         end;
-      end;
     end;
     for o := 0 to OutChM1 do
       for t := 0 to FullLenM1 do Full[o][t] := Full[o][t] + Conv.B[o];

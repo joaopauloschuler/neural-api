@@ -5225,7 +5225,6 @@ var
   CountVolume, CountElement: integer;
   MaxVolume, MaxElement: integer;
   CurrPos: integer;
-  Vols: array of TNNetVolume;
 begin
   if (Count>0) then
   begin
@@ -5233,15 +5232,11 @@ begin
     MaxElement := Self[0].Size - 1;
     CurrPos := 0;
 
-    SetLength(Vols, Count);
-    for CountVolume := 0 to MaxVolume do
-      Vols[CountVolume] := Self[CountVolume];
-
     for CountElement := 0 to MaxElement do
     begin
       for CountVolume := 0 to MaxVolume do
       begin
-        V.FData[CurrPos] := Vols[CountVolume].FData[CountElement];
+        V.FData[CurrPos] := Self[CountVolume].FData[CountElement];
         CurrPos := CurrPos + 1;
       end;
     end;
