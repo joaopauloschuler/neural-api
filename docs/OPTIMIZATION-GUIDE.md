@@ -1135,6 +1135,9 @@ half; do not force the rest.
   // do — compute once, index both (ONLY after verifying the shapes match):
   base0 := FOutput.GetRawPos(X, Y, 0);           // a gated layer would NOT qualify
   ```
+
+### Constant-offset neighbour ⇒ first pointer + the constant
+
 - **A second pointer into the *same* volume at a constant depth = first pointer +
   that constant.** Instead of a second accessor call
   `bPtr := V.GetRawPtr(X, Y, HalfDepth)` next to `aPtr := V.GetRawPtr(X, Y, 0)`,
@@ -1154,9 +1157,10 @@ half; do not force the rest.
   // if pointer math is not in scope, keep the index form: FData[base + HalfDepth]
   ```
 
-### Use `GetRawPos(x, y)` instead of `GetRawPos(x, y, 0)` 
-- Use `GetRawPos(x, y)` / `GetRawPtr(x, y)` instead of `GetRawPos(x, y, 0)` / `GetRawPtr(x, y, 0)`
-as `GetRawPos(x, y)` / `GetRawPtr(x, y)` overloads are faster.
+### Use `GetRawPos(x, y)` instead of `GetRawPos(x, y, 0)`
+
+- Use `GetRawPos(x, y)` / `GetRawPtr(x, y)` instead of `GetRawPos(x, y, 0)` /
+  `GetRawPtr(x, y, 0)` — the two-argument overloads are faster.
 
 ## 14. Rank on the cheapest order-equivalent quantity — skip transforms used only to compare
 
@@ -1381,8 +1385,10 @@ need a **scalar or an integer offset** — a plain local — and allocate nothin
 **If the only way you can see to apply an optimization is to allocate, the
 correct action is to NOT apply it.**
 
-## 18 TNNetVolume methods are faster than pure pascal equivalents
-The below TNNetVolume methods are faster than equivalent pure pascal implementations
+## 18. TNNetVolume methods are faster than pure pascal equivalents
+
+The below `TNNetVolume` methods are faster than equivalent pure Pascal implementations:
+
 ```pascal
       procedure Fill(c: Single = 0); {$IFDEF Release} inline; {$ENDIF}
       procedure Add(Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
